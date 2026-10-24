@@ -27,14 +27,11 @@ rg --version >/dev/null
 # Match TODO, TODO-check-disable, and TODO-check-enable
 PATTERN="$KEYWORD|$KEYWORD-check-disable|$KEYWORD-check-enable"
 
-# Vendored dependencies have their own task-marker norms; enforce this only on
-# code we maintain.
-output=""
-
-# Discover non-merge commits relative to `main` (falling back to `HEAD` when on
-# `main` itself). Using `--no-merges` skips GitHub Actions' synthetic pull_request
-# merge commit (`Merge <head> into <base>`) while auditing every commit in a PR
-# or stack.
+# Discover all commits relative to `main` (falling back to `HEAD` when on `main`
+# itself). Do not pass `--no-merges`: on a GitHub `pull_request` checkout,
+# `HEAD` is a synthetic merge of `main` (`HEAD^1`) and the PR tip (`HEAD^2`), so
+# `origin/main..HEAD` traverses `HEAD^2` and audits every commit in the PR
+# (including authored merge commits) as well as the merged tree at `HEAD`.
 base_ref=""
 if git rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
   base_ref="origin/main"
@@ -44,34 +41,28 @@ fi
 
 commits=""
 if [ -n "$base_ref" ]; then
-  commits=$(git rev-list --no-merges "${base_ref}..HEAD" 2>/dev/null || true)
+  commits=$(git rev-list "${base_ref}..HEAD" 2>/dev/null || true)
 fi
 if [ -z "$commits" ]; then
-  commits=$(git rev-list --no-merges -n 1 HEAD 2>/dev/null || true)
+  commits=$(git rev-list -n 1 HEAD 2>/dev/null || true)
 fi
 
-if [ "$#" -gt 0 ] || [ -z "$commits" ] || [ -n "$(git status --porcelain 2>/dev/null || true)" ]; then
-  wt_output=$(rg -H -n -w --glob '!**/vendor/**' "$PATTERN" "$@" || true)
-  if [ -n "$wt_output" ]; then
-    output="$wt_output"
-  fi
-fi
-
-for commit in $commits; do
-  short_commit=$(git rev-parse --short=12 "$commit")
-  commit_msg_output=$(git log -1 --pretty=%B "$commit" 2>/dev/null | rg -n -w "$PATTERN" || true)
-  if [ -n "$commit_msg_output" ]; then
-    commit_msg_output=$(echo "$commit_msg_output" | sed "s/^/COMMIT_MESSAGE(${short_commit}):/")
-    output="${output:+$output$'\n'}$commit_msg_output"
+# Vendored dependencies have their own task-marker norms; enforce this only on
+# code we maintain.
+output=$({
+  if [ "$#" -gt 0 ] || [ -z "$commits" ] || [ -n "$(git status --porcelain 2>/dev/null || true)" ]; then
+    rg -H -n -w --glob '!**/vendor/**' "$PATTERN" "$@" || true
   fi
 
-  if [ "$#" -eq 0 ]; then
-    commit_tree_output=$(git grep -I -n -w -E "$PATTERN" "$commit" -- ':!**/vendor/**' 2>/dev/null | sed "s/^${commit}:/${short_commit}@/" || true)
-    if [ -n "$commit_tree_output" ]; then
-      output="${output:+$output$'\n'}$commit_tree_output"
-    fi
-  fi
-done
+  for commit in $commits; do
+    short_commit=$(git rev-parse --short=12 "$commit")
+    git log -1 --pretty=%B "$commit" 2>/dev/null \
+      | rg -n -w "$PATTERN" \
+      | sed "s/^/COMMIT_MESSAGE(${short_commit}):/" || true
+    git grep -I -n -w -E "$PATTERN" "$short_commit" -- "$@" ':!**/vendor/**' 2>/dev/null \
+      | sed "s/^${short_commit}:/${short_commit}@/" || true
+  done
+})
 
 if [ -z "$output" ]; then
   exit 0
@@ -81,7 +72,7 @@ fi
 # each file, we can maintain state. However, rg output might interleave files if
 # not sorted, but usually it's grouped. To be safe, we sort the output by
 # filename and line number.
-sorted_output=$(echo "$output" | sort -t: -k1,1 -k2,2n)
+sorted_output=$(echo "$output" | LC_ALL=C sort -t: -k1,1 -k2,2n)
 
 exit_code=0
 current_file=""
