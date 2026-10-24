@@ -1,0 +1,74 @@
+# Copyright 2022 The Fuchsia Authors
+#
+# Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+# <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+# license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+# This file may not be copied, modified, or distributed except according to
+# those terms.
+
+name: Build & Tests
+
+# Quote this key so YAML 1.1 parsers do not interpret it as a boolean.
+'on':
+  push:
+    branches:
+      - main
+  pull_request:
+  merge_group:
+  # Useful for manually testing changes to this workflow. Because we check for
+  # the merge queue by doing `github.event_name != 'pull_request'` rather than
+  # `github.event_name == 'merge_group'`, triggering via workflow dispatch has
+  # the effect of running all jobs, including those which would normally only be
+  # run in the merge queue.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-todo:
+    runs-on: ubuntu-latest
+    name: Check for todo comments
+    steps:
+      - name: Install ripgrep
+        run: |
+         sudo apt-get update
+         sudo apt-get install ripgrep
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run todo check
+        run: ./ci/check_todo.sh
+
+  # Used to signal to branch protections that all other jobs have succeeded.
+  all-jobs-succeed:
+      # WARNING: This name is load-bearing! It's how GitHub's settings UI configures which jobs
+      # to block on. DO NOT change this name without updating the settings UI to match.
+      name: All checks succeeded (ci.yml)
+      # Run even when a dependency fails, is skipped, or is cancelled, then
+      # inspect every result explicitly. A skipped required check counts as
+      # success in branch protection, so this aggregation must fail closed.
+      if: ${{ always() }}
+      runs-on: ubuntu-latest
+      needs: [check-todo]
+      steps:
+        - name: Reject workflow cancellation
+          if: ${{ cancelled() }}
+          run: exit 1
+
+        - name: Require every dependency to succeed
+          env:
+            NEEDS_JSON: ${{ toJSON(needs) }}
+          run: |
+            set -euo pipefail
+            jq -e '
+              type == "object" and length > 0 and
+              all(
+                to_entries[];
+                .value.result == "success"
+              )
+            ' <<< "$NEEDS_JSON"
