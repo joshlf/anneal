@@ -50,6 +50,14 @@ pub fn install(local_archive: Option<PathBuf>) -> Result<PathBuf, String> {
         .map_err(|e| format!("failed to install Anneal toolchain: {e}"))
 }
 
+/// Resolves the installed Anneal toolchain directory in the user-global cache
+/// without attempting installation.
+pub fn resolve_installed() -> Option<PathBuf> {
+    CONFIG
+        .resolve_installation_dir(exocrate::Location::UserGlobal)
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use std::process::Command;
