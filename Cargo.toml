@@ -12,3 +12,6 @@ members = [
     "trusted/cargo-anneal",
     "trusted/rustc-capture",
 ]
+
+[profile.dev]
+opt-level = 2
