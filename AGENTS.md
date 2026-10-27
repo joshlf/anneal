@@ -62,3 +62,33 @@ applies, follow all of them.
 | Structuring commits, drafting or revising commit messages, rebasing or amending commits, or managing GHerrit branches and stacks | [`source-control`](skills/source-control/SKILL.md), [`commit-message`](skills/commit-message/SKILL.md), [`authorship-disclosure`](skills/authorship-disclosure/SKILL.md), [`reader-oriented-explanation`](skills/reader-oriented-explanation/SKILL.md), [`williams-style`](skills/williams-style/SKILL.md) |
 | Preparing or updating Git commits, pull request descriptions, or other externally visible prose | [`authorship-disclosure`](skills/authorship-disclosure/SKILL.md) |
 | Designing, simplifying, or generalizing conceptual models, semantic interfaces, schemas, protocols, or instructions | [`model-refinement`](skills/model-refinement/SKILL.md) |
+
+## Architecture and trust boundary
+
+Anneal verifies Rust programs (including unsafe code) by extracting typed
+`Runtime(PostCleanup)` MIR and compiler facts via `anneal-rustc-capture` and
+checking the crate's `Trusted.CrateTheorem` (`VerificationResult` over every
+captured function's `Compiler.Verified` obligations) inside the Lean 4 kernel.
+
+Start with [`README.md`](README.md) for the repository map and
+[`agent_docs/development.md`](agent_docs/development.md) for the development and
+validation guide. Before placing or modifying code, check whether it belongs
+inside [`trusted/`](trusted/README.md) or outside it (`theory/`, `examples/`,
+`tests/`):
+
+- Only primitive semantic and theorem definitions required to state or gate
+  `Trusted.CrateTheorem` and `VerificationResult` (`trusted/lean/`) and
+  effectful components—the `.olean` kernel-environment inspector
+  (`trusted/audit/`), the CLI orchestrator and boundary/manifest audit runner
+  (`trusted/cargo-anneal/`), and the `rustc` MIR/attribute serializer and pure
+  proof-script generator (`trusted/rustc-capture/`)—belong in `trusted/`.
+- All code outside `trusted/` (`theory/`, `examples/`, `tests/`) must be pure,
+  effect-free Lean definitions and proofs checked by the Lean kernel.
+
+## Rust correspondence in `trusted/`
+
+Any code in [`trusted/`](trusted/README.md) that claims to model Rust semantics
+or extract `rustc` compiler structures must follow
+[`agent_docs/trusted-rust.md`](agent_docs/trusted-rust.md). Its comments must
+explain the correspondence and both quote and cite the applicable Rust
+documentation or compiler source at a pinned version.
