@@ -1,7 +1,10 @@
 //! CLI entrypoint for `cargo-anneal`.
 
 use std::env;
+use std::path::PathBuf;
 use std::process::ExitCode;
+
+use cargo_anneal::setup::{SetupOptions, run_setup};
 
 fn print_help() {
     println!(
@@ -12,11 +15,52 @@ USAGE:
     cargo anneal <SUBCOMMAND>
     cargo-anneal <SUBCOMMAND>
 
+SUBCOMMANDS:
+    setup [--local-archive <path>]    Install the pinned Anneal toolchain archive
+
 OPTIONS:
     -h, --help       Print help information
     -V, --version    Print version information",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+fn run_setup_cli(args: &[String]) -> ExitCode {
+    let mut local_archive: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--local-archive" => {
+                let Some(val) = args.get(i + 1) else {
+                    eprintln!("error: --local-archive requires a path");
+                    return ExitCode::from(2);
+                };
+                local_archive = Some(PathBuf::from(val));
+                i += 2;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "Usage: cargo anneal setup [--local-archive <path>]"
+                );
+                return ExitCode::SUCCESS;
+            }
+            other => {
+                eprintln!("error: unknown setup argument `{other}`");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    match run_setup(&SetupOptions { local_archive }) {
+        Ok(tc) => {
+            println!("Installed Anneal toolchain at {}", tc.root.display());
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -34,6 +78,7 @@ fn main() -> ExitCode {
             println!("cargo-anneal {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        Some("setup") => run_setup_cli(&args[1..]),
         Some(other) => {
             eprintln!("error: unknown subcommand `{other}`");
             print_help();
