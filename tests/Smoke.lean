@@ -549,6 +549,59 @@ def chooseMutCrate : Trusted.Crate where
 theorem verify_choose_mut_crate : Trusted.CrateTheorem chooseMutCrate :=
   Anneal.prove_choose_mut_ensures_crate "choose_mut"
 
+/-- Lowered `Runtime(PostCleanup)` MIR body for
+    `pub fn count_up(n: usize) -> usize { let mut i = 0; while i < n && i < 1000
+    { i += 1; } i }`. -/
+def countUpBody : Trusted.MirBody where
+  argTys := [.usize]
+  retTy := .usize
+  localCount := 8
+  blocks := [
+    { stmts := [
+        .assign ⟨2⟩ (.use (.constVal (.usize 0)))
+      ]
+      terminator := .goto ⟨1⟩ },
+    { stmts := [
+        .assign ⟨4⟩ (.use (.copy ⟨2⟩)),
+        .assign ⟨3⟩ (.binaryOp .lt (.move ⟨4⟩) (.copy ⟨1⟩))
+      ]
+      terminator := .switchInt (.move ⟨3⟩) ⟨5⟩ ⟨2⟩ },
+    { stmts := [
+        .assign ⟨6⟩ (.use (.copy ⟨2⟩)),
+        .assign ⟨5⟩ (.binaryOp .lt (.move ⟨6⟩) (.constVal (.usize 1000)))
+      ]
+      terminator := .switchInt (.move ⟨5⟩) ⟨5⟩ ⟨3⟩ },
+    { stmts := [
+        .assign ⟨7⟩ (.checkedBinaryOp .add (.copy ⟨2⟩) (.constVal (.usize 1)))
+      ]
+      terminator := .assertNotOverflow ⟨7⟩ ⟨4⟩ },
+    { stmts := [
+        .assign ⟨2⟩ (.proj0 ⟨7⟩)
+      ]
+      terminator := .goto ⟨1⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.use (.copy ⟨2⟩))
+      ]
+      terminator := .return_ }
+  ]
+
+/-- Captured `Trusted.Crate` for `count_up` with postcondition
+    `Trusted.EnsuresCountUp`. -/
+def countUpCrate : Trusted.Crate where
+  functions := [
+    { name := "count_up"
+      prog := countUpBody
+      specs := [Trusted.EnsuresCountUp] }
+  ]
+  tcb := [Trusted.TCBItem.rustcLowering "count_up" countUpBody]
+
+/-- Top-level `Trusted.CrateTheorem` for `countUpCrate`, whose statement
+    (`ci.type`) references only `Trusted` and locked foundation constants while
+    its proof term (`ci.value?`) discharges the obligation via the input-indexed
+    functional translation (`Anneal.prove_count_up_ensures_crate`). -/
+theorem verify_count_up_crate : Trusted.CrateTheorem countUpCrate :=
+  Anneal.prove_count_up_ensures_crate "count_up"
+
 /-!
 ## Non-Step-Based Axiomatic Event-Graph Toy Language
 

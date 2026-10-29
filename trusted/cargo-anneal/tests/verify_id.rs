@@ -864,3 +864,45 @@ fn rejects_incorrect_choose_mut_implementation() {
         "expected Lean audit rejection for wrong choose_mut body, got: {err}"
     );
 }
+
+#[test]
+fn verifies_count_up_end_to_end() {
+    let crate_dir = TempCrateDir::new(
+        "valid-count-up",
+        "// anneal:spec ensures(count_up(n))\n\
+         pub fn count_up(n: usize) -> usize {\n    \
+             let mut i = 0;\n    \
+             while i < n && i < 1000 {\n        \
+                 i += 1;\n    \
+             }\n    \
+             i\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "count_up");
+}
+
+#[test]
+fn rejects_incorrect_count_up_implementation() {
+    let crate_dir = TempCrateDir::new(
+        "wrong-count-up",
+        "// anneal:spec ensures(count_up(n))\n\
+         pub fn count_up(n: usize) -> usize {\n    \
+             let mut i = 0;\n    \
+             while i < n && i < 999 {\n        \
+                 i += 1;\n    \
+             }\n    \
+             i\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean audit rejection for wrong count_up body, got: {err}"
+    );
+}
