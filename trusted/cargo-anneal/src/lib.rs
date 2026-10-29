@@ -43,8 +43,12 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
 
-use crate::audit::{Checker, Json, ReleaseChannel};
+use crate::audit::{
+    Checker, Json, ReleaseChannel, load_crate_trust_policy,
+};
 
 /// Errors returned when `anneal-rustc-capture` rejects a target crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +180,183 @@ impl From<CaptureError> for VerifyError {
     }
 }
 
+/// Invoke `anneal-rustc-capture` on `crate_dir` without emitting `Proof.lean`.
+pub fn capture_crate(crate_dir: &Path) -> Result<CaptureOutput, CaptureError> {
+    capture_crate_with_options(crate_dir, false, &VerifyOptions::default())
+}
+
+/// Invoke `anneal-rustc-capture` on `crate_dir`, optionally emitting
+/// `.anneal/Proof.lean` when `emit_proof` is `true`.
+pub fn capture_crate_with_options(
+    crate_dir: &Path,
+    emit_proof: bool,
+    options: &VerifyOptions,
+) -> Result<CaptureOutput, CaptureError> {
+    let driver_bin = resolve_rustc_capture_bin(options)?;
+    let mut cmd = Command::new(&driver_bin);
+    if env::var_os("RUSTC").is_none() {
+        let driver_toolchain_root = driver_bin
+            .parent()
+            .and_then(Path::parent)
+            .filter(|root| root.join("rust/bin/rustc").is_file())
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                setup::resolve_installed()
+                    .filter(|root| root.join("rust/bin/rustc").is_file())
+            });
+        if let Some(tc_root) = driver_toolchain_root {
+            cmd.env("RUSTC", tc_root.join("rust/bin/rustc"));
+            let lib_var = if cfg!(target_os = "macos") {
+                "DYLD_LIBRARY_PATH"
+            } else {
+                "LD_LIBRARY_PATH"
+            };
+            cmd.env(lib_var, tc_root.join("rust/lib"));
+        }
+    }
+    if emit_proof {
+        cmd.arg("--emit-proof");
+    }
+    cmd.arg(crate_dir);
+    let output = cmd.output().map_err(|e| {
+        CaptureError::Io(format!(
+            "failed to invoke {}: {e}",
+            driver_bin.display()
+        ))
+    })?;
+
+    if !output.status.success() {
+        let stderr =
+            String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if let Some(msg) = stderr.strip_prefix("IO_ERROR: ") {
+            return Err(CaptureError::Io(msg.to_string()));
+        }
+        if let Some(msg) = stderr.strip_prefix("COMPILATION_FAILED: ") {
+            return Err(CaptureError::CompilationFailed(msg.to_string()));
+        }
+        if let Some(msg) = stderr.strip_prefix("UNSUPPORTED_MIR: ") {
+            return Err(CaptureError::UnsupportedMir(msg.to_string()));
+        }
+        return Err(CaptureError::Io(format!(
+            "anneal-rustc-capture exited with {:?}: {stderr}",
+            output.status.code()
+        )));
+    }
+
+    let canon_dir = crate_dir.canonicalize().map_err(|e| {
+        CaptureError::Io(format!("{}: {e}", crate_dir.display()))
+    })?;
+    let anneal_dir = canon_dir.join(".anneal");
+    let mir_lean_path = anneal_dir.join("Mir.lean");
+    let manifest_path = anneal_dir.join("CaptureManifest.json");
+    let manifest_text = fs::read_to_string(&manifest_path).map_err(|e| {
+        CaptureError::Io(format!(
+            "cannot read {}: {e}",
+            manifest_path.display()
+        ))
+    })?;
+    let manifest = Json::parse(&manifest_text).map_err(|e| {
+        CaptureError::Io(format!(
+            "malformed {}: {e}",
+            manifest_path.display()
+        ))
+    })?;
+    let functions = manifest
+        .get("targets")
+        .and_then(Json::as_arr)
+        .ok_or_else(|| {
+            CaptureError::Io(format!(
+                "missing targets array in {}",
+                manifest_path.display()
+            ))
+        })?
+        .iter()
+        .map(|entry| {
+            let def_id = entry
+                .get("def_id")
+                .and_then(Json::as_str)
+                .unwrap_or("");
+            let name = def_id.strip_prefix("crate::").unwrap_or(def_id);
+            CapturedFunctionSummary {
+                name: name.to_string(),
+            }
+        })
+        .collect();
+    let candidate_features = manifest
+        .get("candidate_features")
+        .and_then(Json::as_arr)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Json::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(CaptureOutput {
+        functions,
+        candidate_features,
+        mir_lean_path,
+        manifest_path,
+    })
+}
+
+/// Run the end-to-end Anneal verification pipeline on `crate_dir`.
+///
+/// First checks the crate's candidate-feature trust policy and
+/// extracts `.anneal/Mir.lean` and `.anneal/CaptureManifest.json` (and
+/// `.anneal/Proof.lean` unless `options.keep_proof` is set) via the
+/// `anneal-rustc-capture` subprocess, and finally runs
+/// [`audit::Checker::verify_crate_with_policy`] to check the proof in Lean's
+/// kernel.
+pub fn verify_crate(
+    crate_dir: &Path,
+    options: &VerifyOptions,
+) -> Result<CaptureOutput, VerifyError> {
+    let (capture, _report) = verify_crate_with_report(crate_dir, options)?;
+    Ok(capture)
+}
+
+/// Run the end-to-end Anneal verification pipeline on `crate_dir` and return
+/// both the [`CaptureOutput`] and the structured audit report JSON.
+pub fn verify_crate_with_report(
+    crate_dir: &Path,
+    options: &VerifyOptions,
+) -> Result<(CaptureOutput, Json), VerifyError> {
+    let channel = options.release_channel.unwrap_or_default();
+    let policy = load_crate_trust_policy(
+        crate_dir,
+        options.allow_candidate_features.as_deref(),
+    )
+    .map_err(|err| VerifyError::AuditRejected {
+        status_code: Some(err.code),
+        stdout: String::new(),
+        stderr: format!("Trusted check failed ({}): {}", err.phase, err.message),
+    })?;
+    if channel == ReleaseChannel::Stable {
+        return Err(VerifyError::Capture(
+            CaptureError::CandidateFeatureNotEnabled {
+                feature: "rustc_capture".to_string(),
+                reason: "stable release channel forbids candidate-trusted feature `rustc_capture`"
+                    .to_string(),
+            },
+        ));
+    }
+    if !policy.is_allowed(channel, "rustc_capture") {
+        return Err(VerifyError::Capture(
+            CaptureError::CandidateFeatureNotEnabled {
+                feature: "rustc_capture".to_string(),
+                reason: "opt in via `[package.metadata.anneal.trust-policy] allow-candidate-features = [\"rustc_capture\", ...]` in Cargo.toml or `--allow-candidate-features rustc_capture`"
+                    .to_string(),
+            },
+        ));
+    }
+    let capture =
+        capture_crate_with_options(crate_dir, !options.keep_proof, options)?;
+    let report = run_trusted_audit_report(crate_dir, options)?;
+    Ok((capture, report))
+}
+
 /// Run only the [`audit::Checker::verify_crate_with_policy`] gate against an
 /// already-captured `crate_dir` (used by tests that mutate `.anneal/` artifacts
 /// after capture to verify fail-closed audit behavior).
@@ -272,3 +453,96 @@ pub fn resolve_lean_bin(options: &VerifyOptions) -> Option<PathBuf> {
         .filter(|p| p.is_file())
 }
 
+/// Resolve the `anneal-rustc-capture` executable from `options`,
+/// `ANNEAL_RUSTC_CAPTURE_BIN`, the local Cargo workspace, the installed
+/// exocrate toolchain, or adjacent to the current executable.
+pub fn resolve_rustc_capture_bin(
+    options: &VerifyOptions,
+) -> Result<PathBuf, CaptureError> {
+    if let Some(bin) = &options.rustc_capture_bin {
+        return Ok(bin.clone());
+    }
+    if let Some(env_bin) = env::var_os("ANNEAL_RUSTC_CAPTURE_BIN") {
+        return Ok(PathBuf::from(env_bin));
+    }
+    if let Some(root) = &options.anneal_root
+        && let Some(tc_root) = root.parent().and_then(Path::parent)
+    {
+        let bundled = tc_root.join("bin/anneal-rustc-capture");
+        if bundled.is_file() {
+            return Ok(bundled);
+        }
+    }
+
+    static WORKSPACE_DRIVER: OnceLock<Result<PathBuf, String>> =
+        OnceLock::new();
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(workspace_root) =
+        manifest_dir.parent().and_then(Path::parent)
+    {
+        let driver_manifest =
+            workspace_root.join("trusted/rustc-capture/Cargo.toml");
+        if driver_manifest.is_file() {
+            return WORKSPACE_DRIVER
+                .get_or_init(|| build_workspace_driver(workspace_root))
+                .clone()
+                .map_err(CaptureError::Io);
+        }
+    }
+
+    if let Some(tc_root) = setup::resolve_installed() {
+        let bundled = tc_root.join("bin/anneal-rustc-capture");
+        if bundled.is_file() {
+            return Ok(bundled);
+        }
+    }
+
+    if let Ok(exe) = env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sibling = dir.join("anneal-rustc-capture");
+        if sibling.is_file() {
+            return Ok(sibling);
+        }
+        if let Some(parent_dir) = dir.parent() {
+            let parent_sibling = parent_dir.join("anneal-rustc-capture");
+            if parent_sibling.is_file() {
+                return Ok(parent_sibling);
+            }
+        }
+    }
+
+    Ok(PathBuf::from("anneal-rustc-capture"))
+}
+
+fn build_workspace_driver(workspace_root: &Path) -> Result<PathBuf, String> {
+    let cargo_bin = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo_bin)
+        .arg("build")
+        .arg("--quiet")
+        .arg("--manifest-path")
+        .arg(workspace_root.join("Cargo.toml"))
+        .arg("-p")
+        .arg("anneal-rustc-capture")
+        .arg("--bin")
+        .arg("anneal-rustc-capture")
+        .status()
+        .map_err(|e| {
+            format!("failed to build workspace anneal-rustc-capture: {e}")
+        })?;
+    if !status.success() {
+        return Err(
+            "cargo build -p anneal-rustc-capture exited with non-zero status"
+                .to_string(),
+        );
+    }
+    let bin = workspace_root.join("target/debug/anneal-rustc-capture");
+    if bin.is_file() {
+        Ok(bin)
+    } else {
+        Err(format!(
+            "expected workspace binary at {} after build",
+            bin.display()
+        ))
+    }
+}
