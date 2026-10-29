@@ -14,62 +14,237 @@ name: Build & Tests
     branches:
       - main
   pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
   merge_group:
-  # Useful for manually testing changes to this workflow. Because we check for
-  # the merge queue by doing `github.event_name != 'pull_request'` rather than
-  # `github.event_name == 'merge_group'`, triggering via workflow dispatch has
-  # the effect of running all jobs, including those which would normally only be
-  # run in the merge queue.
+    types: [checks_requested]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
+  ANNEAL_TOOLCHAIN_ARCHIVE: anneal-exocrate.tar.zst
+
 jobs:
-  check-todo:
+  static-checks:
     runs-on: ubuntu-latest
-    name: Check for todo comments
+    name: Static checks
     steps:
       - name: Install ripgrep
         run: |
-         sudo apt-get update
-         sudo apt-get install ripgrep
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@e847f25223456b3058e12f7fc9d777b6a6f25060 # v3.23.2
       - name: Run todo check
         run: ./ci/check_todo.sh
+      - name: Run job dependency check
+        run: ./ci/check_job_dependencies.sh
+      - name: Run GitHub Actions validator
+        run: ./ci/check_actions.sh
+      - name: Check Nix flake evaluation across all 4 platforms
+        run: ./ci/check_flake_eval.sh
+
+  build-exocrate:
+    runs-on: ubuntu-latest
+    name: Build exocrate toolchain archive
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore main Nix binary cache
+        id: restore_main_nix_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/nix-cache-main
+          key: anneal-main-nix-cache-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.nix', 'flake.lock', 'trusted/lean/**', 'trusted/audit/**', 'theory/**', 'trusted/rustc-capture/**', 'trusted/cargo-anneal/src/audit.rs', 'trusted/cargo-anneal/src/bin/build_verify_prefix.rs') }}
+
+      - name: Restore PR Nix binary cache
+        id: restore_pr_nix_cache
+        if: >-
+          github.event_name == 'pull_request' &&
+          steps.restore_main_nix_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/nix-cache-pr
+          key: anneal-pr-nix-cache-v1-${{ runner.os }}-${{ runner.arch }}-pr-${{ github.event.pull_request.number }}-${{ hashFiles('flake.nix', 'flake.lock', 'trusted/lean/**', 'trusted/audit/**', 'theory/**', 'trusted/rustc-capture/**', 'trusted/cargo-anneal/src/audit.rs', 'trusted/cargo-anneal/src/bin/build_verify_prefix.rs') }}
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@e847f25223456b3058e12f7fc9d777b6a6f25060 # v3.23.2
+
+      - name: Enable unprivileged user namespaces (Ubuntu 24.04)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Build and validate omnibus toolchain archive
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          nix_args=()
+          for cache in target/nix-cache-main target/nix-cache-pr; do
+            if [ -f "$cache/nix-cache-info" ]; then
+              nix_args+=(--extra-substituters "file://$PWD/$cache/?trusted=1")
+            fi
+          done
+
+          nix build "${nix_args[@]}" .#omnibus-archive-layout-check --no-link
+          nix build "${nix_args[@]}" .#omnibus-archive-ci --out-link "target/omnibus-link"
+          cp -f "$(readlink -f target/omnibus-link)" "target/$ANNEAL_TOOLCHAIN_ARCHIVE"
+          rm -f target/omnibus-link
+
+      - name: Re-enable unprivileged user namespace restriction (Ubuntu 24.04)
+        if: ${{ always() }}
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+
+      - name: Populate main Nix binary cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.restore_main_nix_cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p target/nix-cache-main
+          nix copy .#omnibus-archive-ci \
+            --to "file://$PWD/target/nix-cache-main/?compression=zstd&compression-level=1&trusted=1"
+
+      - name: Save main Nix binary cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.restore_main_nix_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/nix-cache-main
+          key: ${{ steps.restore_main_nix_cache.outputs.cache-primary-key }}
+
+      - name: Populate PR Nix binary cache
+        if: >-
+          github.event_name == 'pull_request' &&
+          steps.restore_main_nix_cache.outputs.cache-hit != 'true' &&
+          steps.restore_pr_nix_cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p target/nix-cache-pr
+          nix copy .#omnibus-archive-ci \
+            --to "file://$PWD/target/nix-cache-pr/?compression=zstd&compression-level=1&trusted=1"
+
+      - name: Save PR Nix binary cache
+        if: >-
+          github.event_name == 'pull_request' &&
+          steps.restore_main_nix_cache.outputs.cache-hit != 'true' &&
+          steps.restore_pr_nix_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/nix-cache-pr
+          key: ${{ steps.restore_pr_nix_cache.outputs.cache-primary-key }}
+
+      - name: Upload exocrate toolchain archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: anneal-exocrate-archive
+          path: target/${{ env.ANNEAL_TOOLCHAIN_ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  test-and-verify:
+    runs-on: ubuntu-latest
+    name: Trusted boundary & tests
+    needs: [build-exocrate]
+    timeout-minutes: 30
+    env:
+      __ANNEAL_LOCAL_DEV: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+
+      - name: Download exocrate toolchain archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: anneal-exocrate-archive
+          path: target
+
+      - name: Prepare log directory and install exocrate toolchain
+        run: |
+          mkdir -p "$RUNNER_TEMP/anneal-trusted-logs"
+          cargo run --locked -p cargo-anneal -- setup \
+            --local-archive "target/$ANNEAL_TOOLCHAIN_ARCHIVE"
+          rm -f "target/$ANNEAL_TOOLCHAIN_ARCHIVE"
+
+      - name: Check Trusted containment, statement-origin separation, and Cargo DAG
+        env:
+          TMPDIR: ${{ runner.temp }}/anneal-trusted-logs
+        run: |
+          cargo run --locked -p cargo-anneal -- audit-repo
+
+      - name: Test the boundary checker and regression fixtures
+        env:
+          TMPDIR: ${{ runner.temp }}/anneal-trusted-logs
+        run: |
+          cargo run --locked -p cargo-anneal -- audit-self-test
+
+      - name: Check and test Rust workspace
+        env:
+          TMPDIR: ${{ runner.temp }}/anneal-trusted-logs
+        run: |
+          cargo check --workspace --locked
+          cargo test --workspace --locked
+
+      - name: Verify clean working tree
+        run: |
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Preserve failure evidence
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: trusted-boundary-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/anneal-trusted-logs/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 1
 
   # Used to signal to branch protections that all other jobs have succeeded.
   all-jobs-succeed:
-      # WARNING: This name is load-bearing! It's how GitHub's settings UI configures which jobs
-      # to block on. DO NOT change this name without updating the settings UI to match.
-      name: All checks succeeded (ci.yml)
-      # Run even when a dependency fails, is skipped, or is cancelled, then
-      # inspect every result explicitly. A skipped required check counts as
-      # success in branch protection, so this aggregation must fail closed.
-      if: ${{ always() }}
-      runs-on: ubuntu-latest
-      needs: [check-todo]
-      steps:
-        - name: Reject workflow cancellation
-          if: ${{ cancelled() }}
-          run: exit 1
+    # WARNING: This name is load-bearing! It's how GitHub's settings UI configures which jobs
+    # to block on. DO NOT change this name without updating the settings UI to match.
+    name: All checks succeeded (ci.yml)
+    # Run even when a dependency fails, is skipped, or is cancelled, then
+    # inspect every result explicitly. A skipped required check counts as
+    # success in branch protection, so this aggregation must fail closed.
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    needs: [static-checks, build-exocrate, test-and-verify]
+    steps:
+      - name: Reject workflow cancellation
+        if: ${{ cancelled() }}
+        run: exit 1
 
-        - name: Require every dependency to succeed
-          env:
-            NEEDS_JSON: ${{ toJSON(needs) }}
-          run: |
-            set -euo pipefail
-            jq -e '
-              type == "object" and length > 0 and
-              all(
-                to_entries[];
-                .value.result == "success"
-              )
-            ' <<< "$NEEDS_JSON"
+      - name: Require every dependency to succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          jq -e '
+            type == "object" and length > 0 and
+            all(
+              to_entries[];
+              .value.result == "success"
+            )
+          ' <<< "$NEEDS_JSON"
