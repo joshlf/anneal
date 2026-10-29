@@ -72,10 +72,36 @@ def updateLocal (locals : Nat → Option MirVal) (target : Nat)
 def MirVal.hasTy (m : MemState) (v : MirVal) (ty : MirTy) : Prop :=
   match v, ty with
   | .usize _, .usize => True
+  | .bool _, .bool => True
   | .unit, .unit => True
   | .atomicLoc loc, .refAtomicUsize => m.visibleAtomicMsgs loc ≠ []
+  | .refMutLoc loc, .refMutUsize =>
+    ∃ n, m.naVal loc = some (.usize n) ∧
+      m.naWriteTs loc ≤ m.curView loc ∧
+      m.naReadTs loc ≤ m.curView loc
   | .ordering _, .atomicOrdering => True
   | _, _ => False
+
+/-- Parameter validity at argument index `k` (`1 ..= argTys.length`), combining
+    value validity (`MirVal.hasTy`) with Rust's mutable-reference exclusivity
+    requirement (`r[undefined.alias]`: a `&mut usize` parameter cannot alias
+    any preceding `&mut usize` parameter):
+
+    > "* Breaking the [pointer aliasing rules]. `Box<T>`, `&mut T`, and `&T`
+    > follow LLVM's scoped `noalias` model, except if the `&T` contains an
+    > [`UnsafeCell<U>`]. This means references and boxes cannot be dangling
+    > while they are live, and mutable references and boxes cannot be aliased"
+
+    Source: https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/behavior-considered-undefined.md#L48-L52 -/
+@[candidate mir_semantics]
+def argValidAt (m : MemState) (locals : Nat → Option MirVal) (k : Nat)
+    (v : MirVal) (ty : MirTy) : Prop :=
+  match ty with
+  | .refMutUsize =>
+    v.hasTy m .refMutUsize ∧
+      ∀ loc i, v = .refMutLoc loc → 1 ≤ i → i < k →
+        locals i ≠ some (.refMutLoc loc)
+  | _ => v.hasTy m ty
 
 /-- Entry initialization condition for function arguments and non-argument
     locals.
@@ -98,7 +124,7 @@ def MirVal.hasTy (m : MemState) (v : MirVal) (ty : MirTy) : Prop :=
 def argsMatchLocals (m : MemState) (argTys : List MirTy)
     (locals : Nat → Option MirVal) : Prop :=
   argTys.foldr
-    (fun ty rest k => (∃ v, locals k = some v ∧ v.hasTy m ty) ∧ rest (k + 1))
+    (fun ty rest k => (∃ v, locals k = some v ∧ argValidAt m locals k v ty) ∧ rest (k + 1))
     (fun k => ∀ j, k ≤ j → locals j = none)
     1
 
@@ -155,14 +181,31 @@ def evalOperand (locals : Nat → Option MirVal) (op : Operand) :
   | .constVal v =>
     some (v, locals)
 
+/-- Evaluate a binary comparison operator on two `MirVal.usize` values,
+    returning `some (.bool b)` on `.usize` inputs and `none` on type mismatch
+    (`r[undefined.invalid]`).
+
+    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L1060-L1110 -/
+@[candidate mir_semantics]
+def evalBinOp (op : BinOp) (v1 v2 : MirVal) : Option MirVal :=
+  match v1, v2 with
+  | .usize n1, .usize n2 =>
+    match op with
+    | .lt => some (.bool (decide (n1 < n2)))
+    | .le => some (.bool (decide (n1 ≤ n2)))
+    | .eq => some (.bool (decide (n1 = n2)))
+  | _, _ => none
+
 /-- Single-step operational evaluation of a MIR statement.
 
-    Models `Operand::Copy`, `Operand::Move`, `Rvalue::Use`,
-    `StatementKind::Assign`, `StatementKind::StorageLive`,
-    `StatementKind::StorageDead`, and `StatementKind::Nop` while preserving
-    `s.mem` unchanged.
+    Models `Operand::Copy`, `Operand::Move`, `Rvalue::Use`, dereference reads
+    `copy (*src)`, `Rvalue::BinaryOp`, `StatementKind::Assign` (to a local or
+    dereferenced place `(*dst) = op`), `StatementKind::StorageLive`,
+    `StatementKind::StorageDead`, and `StatementKind::Nop`.
 
-    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L305-L385 -/
+    Sources:
+    - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L305-L385
+    - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L975-L1005 -/
 @[candidate mir_semantics]
 def evalMirStmt (s : MirState) (stmt : Stmt) : StepResult MirState Unit MirVal :=
   match stmt with
@@ -174,6 +217,47 @@ def evalMirStmt (s : MirState) (stmt : Stmt) : StepResult MirState Unit MirVal :
         stmtIdx := s.stmtIdx + 1
       }
     | none => .failed .ub
+  | .assign dst (.deref src) =>
+    match s.locals src.index with
+    | some (.refMutLoc loc) =>
+      match s.mem.readNA loc with
+      | some (v, mem') =>
+        .step () { s with
+          locals := updateLocal s.locals dst.index (some v)
+          mem := mem'
+          stmtIdx := s.stmtIdx + 1
+        }
+      | none => .failed .ub
+    | _ => .failed .ub
+  | .assign dst (.binaryOp op lhs rhs) =>
+    match evalOperand s.locals lhs with
+    | none => .failed .ub
+    | some (v1, locals1) =>
+      match evalOperand locals1 rhs with
+      | none => .failed .ub
+      | some (v2, locals2) =>
+        match evalBinOp op v1 v2 with
+        | some res =>
+          .step () { s with
+            locals := updateLocal locals2 dst.index (some res)
+            stmtIdx := s.stmtIdx + 1
+          }
+        | none => .failed .ub
+  | .assignDeref dst op =>
+    match evalOperand s.locals op with
+    | none => .failed .ub
+    | some (v, locals1) =>
+      match locals1 dst.index with
+      | some (.refMutLoc loc) =>
+        match s.mem.writeNA loc v with
+        | some mem' =>
+          .step () { s with
+            locals := locals1
+            mem := mem'
+            stmtIdx := s.stmtIdx + 1
+          }
+        | none => .failed .ub
+      | _ => .failed .ub
   | .storageLive loc =>
     .step () { s with
       locals := updateLocal s.locals loc.index none
@@ -190,8 +274,9 @@ def evalMirStmt (s : MirState) (stmt : Stmt) : StepResult MirState Unit MirVal :
 /-- Single-step operational evaluation of a MIR basic-block terminator.
 
     Models `TerminatorKind::Return`, `TerminatorKind::Goto`,
-    `TerminatorKind::Unreachable`, and `TerminatorKind::Call` specialized to
-    `Atomic::<usize>::load`:
+    `TerminatorKind::Unreachable`, `TerminatorKind::Call` specialized to
+    `Atomic::<usize>::load`, and `TerminatorKind::SwitchInt` on boolean
+    discriminants:
     - `Terminator.return_` reads the return place `_0` (`s.locals 0`) and
       completes with `.terminated (.normal retVal)` if initialized, or triggers
       `.failed .ub` if `_0` is uninitialized (`r[undefined.invalid]`).
@@ -205,6 +290,9 @@ def evalMirStmt (s : MirState) (stmt : Stmt) : StepResult MirState Unit MirVal :
       it emits a demonic choice (`.choice .demonic`) over every visible message
       `msg ∈ head :: tail`, storing `MirVal.usize msg.bits` into `dst` and
       advancing `s.mem` via `s.mem.applyAtomicLoad ord msg`.
+    - `Terminator.switchInt discr falseTarget trueTarget` evaluates `discr` to a
+      `MirVal.bool b` and jumps to `falseTarget` when `b = false` (`0`) or
+      `trueTarget` when `b = true` (`otherwise`).
 
     > "Block has one successor; we continue execution there."
     >
@@ -256,6 +344,21 @@ def evalMirTerminator (s : MirState) (term : Terminator) :
                   stmtIdx := 0
                 })
         | _, _ => .failed .ub
+  | .switchInt discr falseTarget trueTarget =>
+    match evalOperand s.locals discr with
+    | some (.bool false, locals') =>
+      .step () { s with
+        locals := locals'
+        block := falseTarget.index
+        stmtIdx := 0
+      }
+    | some (.bool true, locals') =>
+      .step () { s with
+        locals := locals'
+        block := trueTarget.index
+        stmtIdx := 0
+      }
+    | _ => .failed .ub
 
 /-- Single-step transition function of a `MirBody`: executes the statement at
     `s.stmtIdx` in block `s.block`, or the block's terminator once all
@@ -315,6 +418,44 @@ def EnsuresAtomicLoad (argLocal : Nat) : MirLang.Behavior :=
         q.init.locals argLocal = some (.atomicLoc loc) ∧
         msg ∈ q.init.mem.visibleAtomicMsgs loc ∧
         ret = .usize msg.bits)
+
+/-- Postcondition specification for `pub fn max_assign(x: &mut usize, y: usize) -> usize`:
+    - `defined := True`: every finite execution prefix is free of UB and stuck
+      states (`MirLang.WellFormed`), and
+    - `val`: for any initial state where `_1` points to non-atomic location
+      `loc` holding `.usize x0` and `_2` holds `.usize y0`, any normal return
+      value `ret` equals `.usize (if decide (x0 < y0) then y0 else x0)`. -/
+@[candidate mir_semantics]
+def EnsuresMaxAssign : MirLang.Behavior :=
+  MirLang.Spec (fun q out =>
+    ∀ ret loc x0 y0,
+      out.outcome = .terminated (.normal ret) →
+      q.init.locals 1 = some (.refMutLoc loc) →
+      q.init.mem.naVal loc = some (.usize x0) →
+      q.init.locals 2 = some (.usize y0) →
+      ret = .usize (if decide (x0 < y0) then y0 else x0))
+
+/-- Postcondition specification for
+    `pub fn update_min(x: &mut usize, y: &mut usize, v: usize) -> usize`:
+    - `defined := True`: every finite execution prefix is free of UB and stuck
+      states (`MirLang.WellFormed`), and
+    - `val`: for any initial state where `_1` points to non-atomic location
+      `locX` holding `.usize x0`, `_2` points to non-atomic location `locY`
+      holding `.usize y0`, and `_3` holds `.usize v0`, any normal return value
+      `ret` (which reads `*x` after mutating the conditionally borrowed minimum
+      reference `r = if *x <= *y { &mut *x } else { &mut *y }` to `v`) equals
+      `.usize (if decide (x0 ≤ y0) then v0 else x0)`. -/
+@[candidate mir_semantics]
+def EnsuresUpdateMin : MirLang.Behavior :=
+  MirLang.Spec (fun q out =>
+    ∀ ret locX locY x0 y0 v0,
+      out.outcome = .terminated (.normal ret) →
+      q.init.locals 1 = some (.refMutLoc locX) →
+      q.init.mem.naVal locX = some (.usize x0) →
+      q.init.locals 2 = some (.refMutLoc locY) →
+      q.init.mem.naVal locY = some (.usize y0) →
+      q.init.locals 3 = some (.usize v0) →
+      ret = .usize (if decide (x0 ≤ y0) then v0 else x0))
 
 /-- Abstract type of compiled target artifacts produced by `rustc`. -/
 @[candidate mir_semantics]
