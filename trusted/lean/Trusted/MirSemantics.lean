@@ -648,6 +648,23 @@ def EnsuresAbsDiff : MirLang.Behavior :=
       q.init.locals 2 = some (.usize y0) →
       ret = .usize (if decide (y0 ≤ x0) then x0 - y0 else y0 - x0))
 
+/-- Postcondition specification for
+    `pub fn choose_mut<'a>(b: bool, x: &'a mut usize, y: &'a mut usize) -> &'a mut usize`:
+    - `defined := True`: every finite execution prefix is free of UB and stuck
+      states (`MirLang.WellFormed`), and
+    - `val`: for any initial state where `_1 = some (.bool b)`, `_2` points to
+      `locX` (`some (.refMutLoc locX)`), and `_3` points to `locY`
+      (`some (.refMutLoc locY)`), any normal return value `ret` equals
+      `.refMutLoc (if b then locX else locY)`. -/
+def EnsuresChooseMut : MirLang.Behavior :=
+  MirLang.Spec (fun q out =>
+    ∀ ret b locX locY,
+      out.outcome = .terminated (.normal ret) →
+      q.init.locals 1 = some (.bool b) →
+      q.init.locals 2 = some (.refMutLoc locX) →
+      q.init.locals 3 = some (.refMutLoc locY) →
+      ret = .refMutLoc (if b then locX else locY))
+
 /-- Abstract type of compiled target artifacts produced by `rustc`. -/
 structure TargetArtifact where
   private mk ::

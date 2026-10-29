@@ -3862,9 +3862,10 @@ noncomputable def computePlanAux :
       | none =>
         match bb.terminator with
         | .return_ =>
-          match activeJoin with
-          | some (joinedLid, _, _) => .endLoan joinedLid .ret
-          | none => .ret
+          match body.retTy, activeJoin with
+          | .refMutUsize, _ => .ret
+          | _, some (joinedLid, _, _) => .endLoan joinedLid .ret
+          | _, none => .ret
         | .goto target | .assertNotOverflow _ target =>
           .step (computePlanAux fuel body target.index 0 activeJoin)
         | .switchInt _ falseTarget trueTarget =>
@@ -6530,5 +6531,603 @@ theorem translatePure_unguardedSub_underflow_fails :
 theorem translatePure_unguardedSub_safe :
     translatePure (computePlan unguardedSubBody) unguardedSubBody [.usize 10, .usize 3] = .ok (.usize 7) :=
   rfl
+
+/-!
+## 14. Functions Returning `&'a mut usize` via Forward/Backward Lenses (`choose_mut`)
+-/
+
+/-- Execute `plan : TransPlan` up to `.ret` at a `Terminator.return_` point,
+    returning the terminal `SymState` with its active return borrow and backward
+    lens store intact. -/
+noncomputable def evalSymStateToReturn (plan : TransPlan) (body : MirBody) (sym : SymState) :
+    Option SymState :=
+  match plan with
+  | .ret =>
+    match body.blocks[sym.block]? with
+    | none => none
+    | some bb =>
+      match bb.stmts[sym.stmtIdx]?, bb.terminator with
+      | none, .return_ => some sym
+      | _, _ => none
+  | .step next =>
+    match evalSymStep body sym with
+    | some (false, sym') => evalSymStateToReturn next body sym'
+    | _ => none
+  | .endLoan lid next =>
+    match evalEndLoan sym lid with
+    | some sym' => evalSymStateToReturn next body sym'
+    | none => none
+  | .joinBorrow dstLocal falseSrc trueSrc joinBlock joinedLid afterJoin =>
+    match evalJoinBorrow body sym dstLocal falseSrc trueSrc joinBlock joinedLid with
+    | some symJoined => evalSymStateToReturn afterJoin body symJoined
+    | none => none
+  | _ => none
+
+/-- Extract the Aeneas **forward value** (`SymVal`) of a returned mutable
+    reference from a terminal `SymState` whose return place `_0` holds
+    `some (.borrow lid)`. -/
+def evalMutReturnFwd (sym : SymState) : Option SymVal :=
+  match sym.locals 0 with
+  | some (.borrow lid) =>
+    match sym.loans lid with
+    | some entry =>
+      if entry.active && !entry.frozen then some entry.curVal else none
+    | none => none
+  | _ => none
+
+/-- Look up the current `SymVal` of each active unfrozen loan in `lids`. -/
+noncomputable def lookupLoanCurVals (loans : Nat → Option LoanEntry) : List Nat → Option (List SymVal)
+  | [] => some []
+  | lid :: rest =>
+    match loans lid with
+    | some entry =>
+      if entry.active && !entry.frozen then
+        match lookupLoanCurVals loans rest with
+        | some restVals => some (entry.curVal :: restVals)
+        | none => none
+      else
+        none
+    | none => none
+
+/-- Execute the Aeneas **backward lens** (`SymVal → Option (List SymVal)`) on a
+    terminal `SymState` whose return place `_0` holds `some (.borrow lid)`:
+    writes `retNew` to the returned loan `lid`, ends `lid` via `evalEndLoan`
+    (propagating `entry.back retNew` to its parent parameter loans and
+    unfreezing them), and extracts the resulting values of `paramLids`. -/
+noncomputable def evalMutReturnBack (sym : SymState) (retNew : SymVal) (paramLids : List Nat) :
+    Option (List SymVal) :=
+  match sym.locals 0 with
+  | some (.borrow lid) =>
+    match sym.loans lid with
+    | some entry =>
+      if entry.active && !entry.frozen then
+        let symUpdated := {
+          sym with
+          loans := updateLoan sym.loans lid (some { entry with curVal := retNew })
+        }
+        match evalEndLoan symUpdated lid with
+        | some symEnded => lookupLoanCurVals symEnded.loans paramLids
+        | none => none
+      else
+        none
+    | none => none
+  | _ => none
+
+/-- Pure Aeneas **forward function** for a function returning `&'a mut usize`. -/
+noncomputable def translateMutReturnFwd (plan : TransPlan) (body : MirBody)
+    (args : List SymArg) : Option SymVal :=
+  match evalSymStateToReturn plan body (buildPureSymState args) with
+  | some symFinal => evalMutReturnFwd symFinal
+  | none => none
+
+/-- Pure Aeneas **backward function (lens)** for a function returning
+    `&'a mut usize`. -/
+noncomputable def translateMutReturnBack (plan : TransPlan) (body : MirBody)
+    (args : List SymArg) (retNew : SymVal) (paramLids : List Nat) : Option (List SymVal) :=
+  match evalSymStateToReturn plan body (buildPureSymState args) with
+  | some symFinal => evalMutReturnBack symFinal retNew paramLids
+  | none => none
+
+/-- Relational soundness of `evalMutReturnFwd` at a `Terminator.return_` point:
+    if `StateRel loanLoc sharedLoc sym conc` holds, `sym` is at a `return_`
+    terminator, and `evalMutReturnFwd sym = some svFwd` with
+    `svFwd.toScalarMirVal = some mvFwd`, then there exist `lid` and `locRet`
+    such that `sym.locals 0 = some (.borrow lid)`, `loanLoc lid = some locRet`,
+    `SafeAndReturns body conc (.refMutLoc locRet)` holds, and `conc.mem`
+    exclusively owns `mvFwd` at `locRet` (`OwnLoc conc.mem locRet mvFwd`). -/
+theorem evalMutReturnFwd_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
+    {body : MirBody} {sym : SymState} {conc : MirState}
+    {bb : BasicBlock} {svFwd : SymVal} {mvFwd : MirVal}
+    (hState : StateRel loanLoc sharedLoc sym conc)
+    (hbb : body.blocks[sym.block]? = some bb)
+    (hstmt : bb.stmts[sym.stmtIdx]? = none)
+    (hterm : bb.terminator = .return_)
+    (hFwd : evalMutReturnFwd sym = some svFwd)
+    (hsc : svFwd.toScalarMirVal = some mvFwd) :
+    ∃ lid locRet,
+      sym.locals 0 = some (.borrow lid) ∧
+      loanLoc lid = some locRet ∧
+      SafeAndReturns body conc (.refMutLoc locRet) ∧
+      OwnLoc conc.mem locRet mvFwd := by
+  unfold evalMutReturnFwd at hFwd
+  cases hloc0 : sym.locals 0 with
+  | none => rw [hloc0] at hFwd; cases hFwd
+  | some sv0 =>
+    rw [hloc0] at hFwd
+    cases sv0 with
+    | usize _ | bool _ | unit | tupleUsizeBool _ _ | refShared _ => cases hFwd
+    | borrow lid =>
+      dsimp at hFwd
+      cases hloan : sym.loans lid with
+      | none => rw [hloan] at hFwd; cases hFwd
+      | some entry =>
+        rw [hloan] at hFwd
+        dsimp at hFwd
+        cases hact : entry.active with
+        | false => rw [hact] at hFwd; cases hFwd
+        | true =>
+          rw [hact] at hFwd
+          cases hfrz : entry.frozen with
+          | true => rw [hfrz] at hFwd; cases hFwd
+          | false =>
+            rw [hfrz] at hFwd
+            dsimp at hFwd
+            injection hFwd with hsvFwd
+            subst hsvFwd
+            have ⟨mv0, hconc0, hval0⟩ := hState.localRel 0 (.borrow lid) hloc0
+            have ⟨locRet, hloanLoc, hmv0⟩ := hval0
+            subst hmv0
+            have ⟨⟨loc0, mv0', hloanLoc0, hsc0, hown0⟩, _⟩ :=
+              hState.loanRel.activeOwn lid entry hloan hact hfrz
+            rw [hloanLoc] at hloanLoc0
+            injection hloanLoc0 with hloc_eq
+            subst hloc_eq
+            rw [hsc] at hsc0
+            injection hsc0 with hmv_eq
+            subst hmv_eq
+            refine ⟨lid, locRet, rfl, hloanLoc, ?_, hown0⟩
+            refine SafeAndReturns.of_terminated ?_
+            unfold evalMirStep
+            rw [hState.block_eq, hbb]
+            dsimp
+            rw [hState.stmtIdx_eq, hstmt]
+            dsimp
+            rw [hterm]
+            dsimp [evalMirTerminator]
+            rw [hconc0]
+
+/-- Relational soundness of the backward lens step (`evalMutReturnBack`):
+    writing `mvNew` to `locRet` in `conc.mem` (`afterWriteNA conc.mem locRet mvNew`)
+    and ending `lid` via `evalEndLoan` preserves `StateRel`. -/
+theorem evalMutReturnBack_stateRel {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
+    {sym symEnded : SymState} {conc : MirState}
+    {lid : Nat} {entry : LoanEntry} {locRet : Nat}
+    {retNew : SymVal} {mvNew : MirVal}
+    (hState : StateRel loanLoc sharedLoc sym conc)
+    (hloan : sym.loans lid = some entry)
+    (hact : entry.active = true)
+    (hfrz : entry.frozen = false)
+    (hloc : loanLoc lid = some locRet)
+    (hscNew : retNew.toScalarMirVal = some mvNew)
+    (hEnd :
+      evalEndLoan
+        { sym with loans := updateLoan sym.loans lid (some { entry with curVal := retNew }) }
+        lid = some symEnded) :
+    StateRel loanLoc sharedLoc symEnded { conc with mem := afterWriteNA conc.mem locRet mvNew } := by
+  have ⟨⟨loc0, mvOld, hloc0, _, hownOld⟩, _⟩ :=
+    hState.loanRel.activeOwn lid entry hloan hact hfrz
+  rw [hloc] at hloc0
+  injection hloc0 with hloc_eq
+  subst hloc_eq
+  have hStateUpdated :
+      StateRel loanLoc sharedLoc
+        { sym with loans := updateLoan sym.loans lid (some { entry with curVal := retNew }) }
+        { conc with mem := afterWriteNA conc.mem locRet mvNew } := {
+    block_eq := hState.block_eq
+    stmtIdx_eq := hState.stmtIdx_eq
+    localBorrows := fun i lid' hi =>
+      loans_some_updateLoan lid { entry with curVal := retNew } (hState.localBorrows i lid' hi)
+    localRel := hState.localRel
+    loanRel := LoanRel.update_curVal hState.loanRel hloan hact hfrz hloc hownOld hscNew
+  }
+  exact evalEndLoan_sound hStateUpdated hEnd
+
+/-- Structural soundness of `evalSymStateToReturn`: if `evalSymStateToReturn plan body sym = some symFinal`
+    and `evalMutReturnFwd symFinal = some svFwd` with `svFwd.toScalarMirVal = some mvFwd`,
+    then from any related concrete state `conc`, execution is safe and terminates
+    normally with some `.refMutLoc locRet`. -/
+theorem evalSymStateToReturn_sound (plan : TransPlan) (body : MirBody) :
+    ∀ {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
+      {sym symFinal : SymState} {conc : MirState} {svFwd : SymVal} {mvFwd : MirVal},
+      StateRel loanLoc sharedLoc sym conc →
+      evalSymStateToReturn plan body sym = some symFinal →
+      evalMutReturnFwd symFinal = some svFwd →
+      svFwd.toScalarMirVal = some mvFwd →
+      ∃ locRet, SafeAndReturns body conc (.refMutLoc locRet) := by
+  induction plan with
+  | fail | branch _ _ =>
+    intro _ _ _ _ _ _ _ _ hEval _ _
+    cases hEval
+  | ret =>
+    intro _ _ sym symFinal conc svFwd mvFwd hState hEval hFwd hsc
+    unfold evalSymStateToReturn at hEval
+    cases hbb : body.blocks[sym.block]? with
+    | none => rw [hbb] at hEval; cases hEval
+    | some bb =>
+      rw [hbb] at hEval
+      dsimp at hEval
+      cases hstmt : bb.stmts[sym.stmtIdx]? with
+      | some _ => rw [hstmt] at hEval; cases hEval
+      | none =>
+        rw [hstmt] at hEval
+        cases hterm : bb.terminator with
+        | goto _ | unreachable | callAtomicLoad _ _ _ _ | switchInt _ _ _ | assertNotOverflow _ _ =>
+          rw [hterm] at hEval; cases hEval
+        | return_ =>
+          rw [hterm] at hEval
+          injection hEval with hsym
+          subst hsym
+          have ⟨_, locRet, _, _, hSafe, _⟩ :=
+            evalMutReturnFwd_sound hState hbb hstmt hterm hFwd hsc
+          exact ⟨locRet, hSafe⟩
+  | step next ih =>
+    intro _ _ sym symFinal conc svFwd mvFwd hState hEval hFwd hsc
+    unfold evalSymStateToReturn at hEval
+    cases hStep : evalSymStep body sym with
+    | none => rw [hStep] at hEval; cases hEval
+    | some p =>
+      cases p with
+      | mk ov sym' =>
+        rw [hStep] at hEval
+        cases ov with
+        | true => cases hEval
+        | false =>
+          dsimp at hEval
+          have ⟨conc', hConcStep, hState'⟩ := evalSymStep_sound hState hStep
+          have ⟨locRet, hSafe⟩ := ih hState' hEval hFwd hsc
+          exact ⟨locRet, SafeAndReturns.of_step hConcStep hSafe⟩
+  | endLoan lid next ih =>
+    intro _ _ sym symFinal conc svFwd mvFwd hState hEval hFwd hsc
+    unfold evalSymStateToReturn at hEval
+    cases hEnd : evalEndLoan sym lid with
+    | none => rw [hEnd] at hEval; cases hEval
+    | some sym' =>
+      rw [hEnd] at hEval
+      exact ih (evalEndLoan_sound hState hEnd) hEval hFwd hsc
+  | joinBorrow dstLocal falseSrc trueSrc joinBlock joinedLid afterJoin ihAfter =>
+    intro _ _ sym symFinal conc svFwd mvFwd hState hEval hFwd hsc
+    unfold evalSymStateToReturn at hEval
+    cases hJoin : evalJoinBorrow body sym dstLocal falseSrc trueSrc joinBlock joinedLid with
+    | none => rw [hJoin] at hEval; cases hEval
+    | some symJoined =>
+      rw [hJoin] at hEval
+      have ⟨loanLoc', concJoined, hStateJoined, hStepChain⟩ :=
+        evalJoinBorrow_sound hState hJoin
+      have ⟨locRet, hSafeJoined⟩ := ihAfter hStateJoined hEval hFwd hsc
+      exact ⟨locRet, hStepChain (.refMutLoc locRet) hSafeJoined⟩
+
+/-- Exact `Runtime(PostCleanup)` MIR body emitted by `rustc --edition=2024 --emit=mir`
+    for:
+    ```rust
+    pub fn choose_mut<'a>(b: bool, x: &'a mut usize, y: &'a mut usize) -> &'a mut usize {
+        if b { x } else { y }
+    }
+    ``` -/
+def chooseMutBody : MirBody where
+  argTys := [.bool, .refMutUsize, .refMutUsize]
+  retTy := .refMutUsize
+  localCount := 5
+  blocks := [
+    { stmts := []
+      terminator := .switchInt (.copy ⟨1⟩) ⟨2⟩ ⟨1⟩ },
+    { stmts := [
+        .assign ⟨4⟩ (.use (.copy ⟨2⟩))
+      ]
+      terminator := .goto ⟨3⟩ },
+    { stmts := [
+        .assign ⟨4⟩ (.use (.copy ⟨3⟩))
+      ]
+      terminator := .goto ⟨3⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.use (.copy ⟨4⟩))
+      ]
+      terminator := .return_ }
+  ]
+
+/-- `translateMutReturnFwd` on `chooseMutBody` with symbolic inputs `(b, x0, y0)`
+    reduces by `rfl` to `some (.usize (if b then x0 else y0))`. -/
+theorem translateMutReturnFwd_chooseMut (b : Bool) (x0 y0 : Nat) :
+    translateMutReturnFwd (computePlan chooseMutBody) chooseMutBody
+      [.bool b, .refMut x0, .refMut y0] =
+      some (.usize (if b then x0 else y0)) :=
+  rfl
+
+/-- `translateMutReturnBack` on `chooseMutBody` with symbolic inputs `(b, x0, y0)`
+    and caller writeback value `v` reduces by `rfl` to
+    `some [.usize (if b then v else x0), .usize (if b then y0 else v)]`. -/
+theorem translateMutReturnBack_chooseMut (b : Bool) (x0 y0 v : Nat) :
+    translateMutReturnBack (computePlan chooseMutBody) chooseMutBody
+      [.bool b, .refMut x0, .refMut y0] (.usize v) [2, 3] =
+      some [.usize (if b then v else x0), .usize (if b then y0 else v)] :=
+  rfl
+
+/-- Pure Aeneas forward function for `choose_mut`. -/
+def pureChooseMutFwd (b : Bool) (x0 y0 : Nat) : Nat :=
+  if b then x0 else y0
+
+/-- Pure Aeneas backward lens for `choose_mut`. -/
+def pureChooseMutBack (b : Bool) (x0 y0 v : Nat) : Nat × Nat :=
+  (if b then v else x0, if b then y0 else v)
+
+/-- Non-trivial lens property 1 (**Get-Put** law for `choose_mut`):
+    writing back the forward value read from `choose_mut` leaves `(x0, y0)`
+    unchanged. -/
+theorem pureChooseMut_get_put (b : Bool) (x0 y0 : Nat) :
+    pureChooseMutBack b x0 y0 (pureChooseMutFwd b x0 y0) = (x0, y0) := by
+  cases b <;> rfl
+
+/-- Non-trivial lens property 2 (**Put-Get** law for `choose_mut`):
+    reading via `pureChooseMutFwd` from the pair updated by `pureChooseMutBack`
+    with `v` yields `v`. -/
+theorem pureChooseMut_put_get (b : Bool) (x0 y0 v : Nat) :
+    let p := pureChooseMutBack b x0 y0 v
+    pureChooseMutFwd b p.1 p.2 = v := by
+  cases b <;> rfl
+
+/-- Non-trivial lens property 3 (**Put-Put** law for `choose_mut`):
+    writing `v1` and then `v2` via `pureChooseMutBack` is equivalent to writing
+    `v2` directly. -/
+theorem pureChooseMut_put_put (b : Bool) (x0 y0 v1 v2 : Nat) :
+    let p := pureChooseMutBack b x0 y0 v1
+    pureChooseMutBack b p.1 p.2 v2 = pureChooseMutBack b x0 y0 v2 := by
+  cases b <;> rfl
+
+/-- `chooseMutBody` satisfies `MirLang.WellFormed`, proved via
+    `evalSymStateToReturn_sound` on `computePlan chooseMutBody`. -/
+theorem chooseMutBody_satisfies_wellFormed :
+    MirLang.sem chooseMutBody ≤ MirLang.WellFormed := by
+  intro q _
+  refine ⟨?_, fun _ _ => True.intro⟩
+  intro hInit tr out hreach
+  have hSupp : allSupportedArgTys chooseMutBody.argTys = true := rfl
+  have ⟨args, hExt⟩ := extractSymArgs_of_initMirState hSupp hInit
+  have ⟨loanLoc, sharedLoc, hState⟩ := extractSymArgs_sound chooseMutBody.argTys q.init args hExt
+  unfold extractSymArgs at hExt
+  cases hblk : (q.init.block == 0 && q.init.stmtIdx == 0) with
+  | false => rw [hblk] at hExt; cases hExt
+  | true =>
+    rw [hblk] at hExt
+    dsimp [chooseMutBody, extractSymArgsAux] at hExt
+    cases h1 : q.init.locals 1 with
+    | none => rw [h1] at hExt; cases hExt
+    | some v1 =>
+      rw [h1] at hExt
+      cases v1 with
+      | usize _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
+      | bool b =>
+        dsimp at hExt
+        cases h2 : q.init.locals 2 with
+        | none => rw [h2] at hExt; cases hExt
+        | some v2 =>
+          rw [h2] at hExt
+          cases v2 with
+          | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
+          | refMutLoc locX =>
+            dsimp at hExt
+            cases hchk2 : (noAliasBefore q.init.locals locX 2 &&
+              decide (q.init.mem.naWriteTs locX ≤ q.init.mem.curView locX) &&
+              decide (q.init.mem.naReadTs locX ≤ q.init.mem.curView locX)) with
+            | false => rw [hchk2] at hExt; cases hExt
+            | true =>
+              rw [hchk2] at hExt
+              dsimp at hExt
+              cases hna2 : q.init.mem.naVal locX with
+              | none => rw [hna2] at hExt; cases hExt
+              | some mvX =>
+                rw [hna2] at hExt
+                cases mvX with
+                | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
+                | usize x0 =>
+                  dsimp at hExt
+                  cases h3 : q.init.locals 3 with
+                  | none => rw [h3] at hExt; cases hExt
+                  | some v3 =>
+                    rw [h3] at hExt
+                    cases v3 with
+                    | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                    | refMutLoc locY =>
+                      dsimp at hExt
+                      cases hchk3 : (noAliasBefore q.init.locals locY 3 &&
+                        decide (q.init.mem.naWriteTs locY ≤ q.init.mem.curView locY) &&
+                        decide (q.init.mem.naReadTs locY ≤ q.init.mem.curView locY)) with
+                      | false => rw [hchk3] at hExt; cases hExt
+                      | true =>
+                        rw [hchk3] at hExt
+                        dsimp at hExt
+                        cases hna3 : q.init.mem.naVal locY with
+                        | none => rw [hna3] at hExt; cases hExt
+                        | some mvY =>
+                          rw [hna3] at hExt
+                          cases mvY with
+                          | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
+                          | usize y0 =>
+                            dsimp at hExt
+                            injection hExt with hargs
+                            subst hargs
+                            have ⟨locRet, hSafe⟩ :=
+                              evalSymStateToReturn_sound (computePlan chooseMutBody) chooseMutBody
+                                hState rfl rfl (by dsimp [SymVal.toScalarMirVal]; rfl)
+                            exact (hSafe q.init q.steps tr out hreach).1
+
+/-- Deterministic 4-step execution of `chooseMutBody` from an initial `MirState`
+    where `_1 = some (.bool b)`, `_2 = some (.refMutLoc locX)`, and
+    `_3 = some (.refMutLoc locY)`. -/
+theorem chooseMutBody_safeAndReturns_of_locals {init : MirState}
+    {b : Bool} {locX locY : Nat}
+    (hblk : init.block = 0)
+    (hstmt : init.stmtIdx = 0)
+    (h1 : init.locals 1 = some (.bool b))
+    (h2 : init.locals 2 = some (.refMutLoc locX))
+    (h3 : init.locals 3 = some (.refMutLoc locY)) :
+    SafeAndReturns chooseMutBody init (.refMutLoc (if b then locX else locY)) := by
+  have h2' : updateLocal init.locals 4 (some (.refMutLoc locX)) 4 = some (.refMutLoc locX) := by
+    dsimp [updateLocal]
+  have h3' : updateLocal init.locals 4 (some (.refMutLoc locY)) 4 = some (.refMutLoc locY) := by
+    dsimp [updateLocal]
+  have h0X : updateLocal (updateLocal init.locals 4 (some (.refMutLoc locX))) 0 (some (.refMutLoc locX)) 0 =
+      some (.refMutLoc locX) := by
+    dsimp [updateLocal]
+  have h0Y : updateLocal (updateLocal init.locals 4 (some (.refMutLoc locY))) 0 (some (.refMutLoc locY)) 0 =
+      some (.refMutLoc locY) := by
+    dsimp [updateLocal]
+  cases b with
+  | false =>
+    have s1 : evalMirStep chooseMutBody init =
+        .step () { init with block := 2, stmtIdx := 0 } := by
+      unfold evalMirStep
+      rw [hblk, hstmt]
+      change evalMirTerminator init (.switchInt (.copy ⟨1⟩) ⟨2⟩ ⟨1⟩) = _
+      dsimp [evalMirTerminator, evalOperand]
+      rw [h1]
+    have s2 : evalMirStep chooseMutBody { init with block := 2, stmtIdx := 0 } =
+        .step () { init with locals := updateLocal init.locals 4 (some (.refMutLoc locY)), block := 2, stmtIdx := 1 } := by
+      unfold evalMirStep
+      change evalMirStmt { init with block := 2, stmtIdx := 0 } (.assign ⟨4⟩ (.use (.copy ⟨3⟩))) = _
+      dsimp [evalMirStmt, evalOperand]
+      rw [h3]
+    have s3 : evalMirStep chooseMutBody
+        { init with locals := updateLocal init.locals 4 (some (.refMutLoc locY)), block := 2, stmtIdx := 1 } =
+        .step () { init with locals := updateLocal init.locals 4 (some (.refMutLoc locY)), block := 3, stmtIdx := 0 } := by
+      rfl
+    have s4 : evalMirStep chooseMutBody
+        { init with locals := updateLocal init.locals 4 (some (.refMutLoc locY)), block := 3, stmtIdx := 0 } =
+        .step () {
+          init with
+          locals := updateLocal (updateLocal init.locals 4 (some (.refMutLoc locY))) 0 (some (.refMutLoc locY))
+          block := 3
+          stmtIdx := 1
+        } := by
+      unfold evalMirStep
+      change evalMirStmt
+        { init with locals := updateLocal init.locals 4 (some (.refMutLoc locY)), block := 3, stmtIdx := 0 }
+        (.assign ⟨0⟩ (.use (.copy ⟨4⟩))) = _
+      dsimp [evalMirStmt, evalOperand]
+      rw [h3']
+    have s5 : evalMirStep chooseMutBody
+        { init with
+          locals := updateLocal (updateLocal init.locals 4 (some (.refMutLoc locY))) 0 (some (.refMutLoc locY))
+          block := 3
+          stmtIdx := 1
+        } = .terminated (.normal (.refMutLoc locY)) := by
+      unfold evalMirStep
+      change evalMirTerminator
+        { init with
+          locals := updateLocal (updateLocal init.locals 4 (some (.refMutLoc locY))) 0 (some (.refMutLoc locY))
+          block := 3
+          stmtIdx := 1
+        } .return_ = _
+      dsimp [evalMirTerminator]
+      rw [h0Y]
+    exact SafeAndReturns.of_step s1
+      (SafeAndReturns.of_step s2
+        (SafeAndReturns.of_step s3
+          (SafeAndReturns.of_step s4
+            (SafeAndReturns.of_terminated s5))))
+  | true =>
+    have s1 : evalMirStep chooseMutBody init =
+        .step () { init with block := 1, stmtIdx := 0 } := by
+      unfold evalMirStep
+      rw [hblk, hstmt]
+      change evalMirTerminator init (.switchInt (.copy ⟨1⟩) ⟨2⟩ ⟨1⟩) = _
+      dsimp [evalMirTerminator, evalOperand]
+      rw [h1]
+    have s2 : evalMirStep chooseMutBody { init with block := 1, stmtIdx := 0 } =
+        .step () { init with locals := updateLocal init.locals 4 (some (.refMutLoc locX)), block := 1, stmtIdx := 1 } := by
+      unfold evalMirStep
+      change evalMirStmt { init with block := 1, stmtIdx := 0 } (.assign ⟨4⟩ (.use (.copy ⟨2⟩))) = _
+      dsimp [evalMirStmt, evalOperand]
+      rw [h2]
+    have s3 : evalMirStep chooseMutBody
+        { init with locals := updateLocal init.locals 4 (some (.refMutLoc locX)), block := 1, stmtIdx := 1 } =
+        .step () { init with locals := updateLocal init.locals 4 (some (.refMutLoc locX)), block := 3, stmtIdx := 0 } := by
+      rfl
+    have s4 : evalMirStep chooseMutBody
+        { init with locals := updateLocal init.locals 4 (some (.refMutLoc locX)), block := 3, stmtIdx := 0 } =
+        .step () {
+          init with
+          locals := updateLocal (updateLocal init.locals 4 (some (.refMutLoc locX))) 0 (some (.refMutLoc locX))
+          block := 3
+          stmtIdx := 1
+        } := by
+      unfold evalMirStep
+      change evalMirStmt
+        { init with locals := updateLocal init.locals 4 (some (.refMutLoc locX)), block := 3, stmtIdx := 0 }
+        (.assign ⟨0⟩ (.use (.copy ⟨4⟩))) = _
+      dsimp [evalMirStmt, evalOperand]
+      rw [h2']
+    have s5 : evalMirStep chooseMutBody
+        { init with
+          locals := updateLocal (updateLocal init.locals 4 (some (.refMutLoc locX))) 0 (some (.refMutLoc locX))
+          block := 3
+          stmtIdx := 1
+        } = .terminated (.normal (.refMutLoc locX)) := by
+      unfold evalMirStep
+      change evalMirTerminator
+        { init with
+          locals := updateLocal (updateLocal init.locals 4 (some (.refMutLoc locX))) 0 (some (.refMutLoc locX))
+          block := 3
+          stmtIdx := 1
+        } .return_ = _
+      dsimp [evalMirTerminator]
+      rw [h0X]
+    exact SafeAndReturns.of_step s1
+      (SafeAndReturns.of_step s2
+        (SafeAndReturns.of_step s3
+          (SafeAndReturns.of_step s4
+            (SafeAndReturns.of_terminated s5))))
+
+/-- `chooseMutBody` satisfies `EnsuresChooseMut`. -/
+theorem chooseMutBody_satisfies_ensures :
+    MirLang.sem chooseMutBody ≤ EnsuresChooseMut := by
+  intro q _
+  refine ⟨(chooseMutBody_satisfies_wellFormed q True.intro).1, ?_⟩
+  intro out hexec ret b locX locY hout h1 h2 h3
+  have hSafe :=
+    chooseMutBody_safeAndReturns_of_locals
+      hexec.1.1 hexec.1.2.1 h1 h2 h3
+  exact (hSafe q.init q.steps out.trace out.outcome hexec.2).2 ret hout
+
+theorem ensuresChooseMut_le_wellFormed :
+    EnsuresChooseMut ≤ MirLang.WellFormed :=
+  fun _ h => ⟨h, fun _ _ => True.intro⟩
+
+/-- End-to-end `CrateTheorem` witness for `choose_mut` with `EnsuresChooseMut`. -/
+theorem prove_choose_mut_ensures_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := chooseMutBody
+        specs := [EnsuresChooseMut]
+      }]
+      tcb := [.rustcLowering fnName chooseMutBody]
+    } :=
+  verify_single_fn_crate
+    fnName
+    chooseMutBody
+    EnsuresChooseMut
+    chooseMutBody_satisfies_ensures
+    ensuresChooseMut_le_wellFormed
+
+/-- End-to-end `CrateTheorem` witness for `choose_mut` with baseline `WellFormed`. -/
+theorem prove_choose_mut_wf_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := chooseMutBody
+        specs := []
+      }]
+      tcb := [.rustcLowering fnName chooseMutBody]
+    } :=
+  verify_single_fn_wf_crate fnName chooseMutBody chooseMutBody_satisfies_wellFormed
 
 end Anneal
