@@ -33,7 +33,7 @@
 //! no `build.rs`, no proc-macros, and no FFI or effectful dependencies).
 
 use crate::{
-    CapturedFunction, CapturedOperand, CapturedSpec, CapturedStmt,
+    CapturedFunction, CapturedOperand, CapturedSpec, CapturedStmt, CapturedTy,
 };
 
 /// Render a candidate `.anneal/Proof.lean` proof script for the captured
@@ -46,6 +46,22 @@ use crate::{
 /// body or specification, Lean rejects `rfl` and verification fails closed.
 pub fn render_proof_lean(functions: &[CapturedFunction]) -> String {
     let proof_term = match functions {
+        [func] if func.arg_tys == [CapturedTy::RefAtomicUsize] => {
+            match func.spec {
+                CapturedSpec::EnsuresAtomicLoad(1) => format!(
+                    "Anneal.prove_load_relaxed_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_load_relaxed_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_load_relaxed_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
         [func] => {
             let uses_move = func.blocks.first().is_some_and(|b| {
                 b.stmts.iter().any(|s| {
