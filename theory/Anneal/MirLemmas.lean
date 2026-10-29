@@ -104,6 +104,74 @@ theorem OwnLoc.readNA_eq {m : MemState} {loc : Nat} {v : MirVal}
   rw [hdec, hOwn.1]
   rfl
 
+/-- Performing a non-atomic read at `loc` preserves `OwnLoc` at every owned
+    location `loc'` (both `loc' = loc` and `loc' ≠ loc`). -/
+theorem OwnLoc.readNA_preserves {m : MemState} {loc loc' : Nat} {v' : MirVal}
+    (hOwn' : OwnLoc m loc' v') :
+    OwnLoc { m with naReadTs := View.bump m.naReadTs loc (m.curView loc) } loc' v' := by
+  refine ⟨hOwn'.1, hOwn'.2.1, ?_⟩
+  dsimp [View.bump]
+  cases hbeq : (loc' == loc) with
+  | false => exact hOwn'.2.2
+  | true =>
+    have heq : loc' = loc := of_decide_eq_true hbeq
+    subst heq
+    have hdec : decide (m.naReadTs loc' ≤ m.curView loc') = true :=
+      decide_eq_true hOwn'.2.2
+    rw [hdec]
+    exact Nat.le_refl _
+
+/-- Memory state resulting from a successful non-atomic write `m.writeNA loc v`. -/
+def afterWriteNA (m : MemState) (loc : Nat) (v : MirVal) : MemState :=
+  let nextTs := m.curView loc + 1
+  { m with
+    curView := View.bump m.curView loc nextTs
+    naVal := fun l => if l == loc then some v else m.naVal l
+    naWriteTs := View.bump m.naWriteTs loc nextTs
+    naReadTs := View.bump m.naReadTs loc nextTs }
+
+/-- Under `OwnLoc m loc v`, a non-atomic write `m.writeNA loc vNew` succeeds
+    deterministically without data-race failure and produces
+    `afterWriteNA m loc vNew`. -/
+theorem OwnLoc.writeNA_eq {m : MemState} {loc : Nat} {v : MirVal}
+    (hOwn : OwnLoc m loc v) (vNew : MirVal) :
+    m.writeNA loc vNew = some (afterWriteNA m loc vNew) := by
+  unfold MemState.writeNA afterWriteNA
+  have hw : decide (m.naWriteTs loc ≤ m.curView loc) = true :=
+    decide_eq_true hOwn.2.1
+  have hr : decide (m.naReadTs loc ≤ m.curView loc) = true :=
+    decide_eq_true hOwn.2.2
+  rw [hw, hr]
+  rfl
+
+/-- After writing `vNew` to an owned location `loc`, `OwnLoc` holds at `loc`
+    with the updated value `vNew`. -/
+theorem OwnLoc.afterWriteNA_self {m : MemState} {loc : Nat} {v : MirVal}
+    (hOwn : OwnLoc m loc v) (vNew : MirVal) :
+    OwnLoc (afterWriteNA m loc vNew) loc vNew := by
+  have hbeq : (loc == loc) = true := decide_eq_true rfl
+  have hcur : decide (m.curView loc ≤ m.curView loc + 1) = true :=
+    decide_eq_true (Nat.le_succ (m.curView loc))
+  have hw : decide (m.naWriteTs loc ≤ m.curView loc + 1) = true :=
+    decide_eq_true (Nat.le_trans hOwn.2.1 (Nat.le_succ (m.curView loc)))
+  have hr : decide (m.naReadTs loc ≤ m.curView loc + 1) = true :=
+    decide_eq_true (Nat.le_trans hOwn.2.2 (Nat.le_succ (m.curView loc)))
+  unfold OwnLoc afterWriteNA View.bump
+  dsimp
+  rw [hbeq, hcur, hw, hr]
+  exact ⟨rfl, Nat.le_refl _, Nat.le_refl _⟩
+
+/-- Writing `vNew` to `loc` preserves `OwnLoc` at every other location
+    `loc' ≠ loc`. -/
+theorem OwnLoc.afterWriteNA_other {m : MemState} {loc loc' : Nat} {v' : MirVal}
+    (hne : loc' ≠ loc) (hOwn' : OwnLoc m loc' v') (vNew : MirVal) :
+    OwnLoc (afterWriteNA m loc vNew) loc' v' := by
+  have hbeq : (loc' == loc) = false := decide_eq_false hne
+  unfold OwnLoc afterWriteNA View.bump
+  dsimp
+  rw [hbeq]
+  exact hOwn'
+
 /-- `OwnLoc` is preserved whenever the thread's coherence view advances in
     `Preorder View` (`m.curView ≤ v'`) without concurrent modification to `loc`. -/
 theorem OwnLoc.mono_view {m : MemState} {loc : Nat} {v : MirVal} {v' : View}
@@ -152,6 +220,55 @@ theorem evalMirStmt_not_choice (s : MirState) (stmt : Stmt)
       cases evalOperand s.locals op with
       | none => intro h; cases h
       | some p => intro h; cases h
+    | deref src =>
+      dsimp [evalMirStmt]
+      cases s.locals src.index with
+      | none => intro h; cases h
+      | some v =>
+        cases v with
+        | refMutLoc loc =>
+          dsimp
+          cases s.mem.readNA loc with
+          | none => intro h; cases h
+          | some p => intro h; cases h
+        | usize _ | bool _ | unit | atomicLoc _ | ordering _ =>
+          intro h; cases h
+    | binaryOp op lhs rhs =>
+      dsimp [evalMirStmt]
+      cases evalOperand s.locals lhs with
+      | none => intro h; cases h
+      | some p1 =>
+        cases p1 with
+        | mk v1 locals1 =>
+          dsimp
+          cases evalOperand locals1 rhs with
+          | none => intro h; cases h
+          | some p2 =>
+            cases p2 with
+            | mk v2 locals2 =>
+              dsimp
+              cases evalBinOp op v1 v2 with
+              | none => intro h; cases h
+              | some res => intro h; cases h
+  | assignDeref dst op =>
+    dsimp [evalMirStmt]
+    cases evalOperand s.locals op with
+    | none => intro h; cases h
+    | some p1 =>
+      cases p1 with
+      | mk v locals1 =>
+        dsimp
+        cases locals1 dst.index with
+        | none => intro h; cases h
+        | some dv =>
+          cases dv with
+          | refMutLoc loc =>
+            dsimp
+            cases s.mem.writeNA loc v with
+            | none => intro h; cases h
+            | some m' => intro h; cases h
+          | usize _ | bool _ | unit | atomicLoc _ | ordering _ =>
+            intro h; cases h
   | storageLive loc => intro h; cases h
   | storageDead loc => intro h; cases h
   | nop => intro h; cases h
@@ -168,6 +285,20 @@ theorem evalMirTerminator_choice_inhabited (s : MirState) (term : Terminator)
     | some v => intro h; cases h
   | goto target => intro h; cases h
   | unreachable => intro h; cases h
+  | switchInt discr falseTarget trueTarget =>
+    dsimp [evalMirTerminator]
+    cases evalOperand s.locals discr with
+    | none => intro h; cases h
+    | some p =>
+      cases p with
+      | mk v locals' =>
+        cases v with
+        | bool b =>
+          cases b with
+          | false => intro h; cases h
+          | true => intro h; cases h
+        | usize _ | unit | atomicLoc _ | refMutLoc _ | ordering _ =>
+          intro h; cases h
   | callAtomicLoad dst ptrOp ordOp target =>
     dsimp [evalMirTerminator]
     cases evalOperand s.locals ptrOp with
@@ -184,13 +315,17 @@ theorem evalMirTerminator_choice_inhabited (s : MirState) (term : Terminator)
             dsimp
             cases ptrVal with
             | usize _ => intro h; cases h
+            | bool _ => intro h; cases h
             | unit => intro h; cases h
+            | refMutLoc _ => intro h; cases h
             | ordering _ => intro h; cases h
             | atomicLoc loc =>
               cases ordVal with
               | usize _ => intro h; cases h
+              | bool _ => intro h; cases h
               | unit => intro h; cases h
               | atomicLoc _ => intro h; cases h
+              | refMutLoc _ => intro h; cases h
               | ordering ord =>
                 dsimp
                 cases s.mem.visibleAtomicMsgs loc with
@@ -537,7 +672,9 @@ theorem loadRelaxedBody_satisfies_ensures :
       have hty : v.hasTy init.mem .refAtomicUsize := hv.2
       cases v with
       | usize _ => cases hty
+      | bool _ => cases hty
       | unit => cases hty
+      | refMutLoc _ => cases hty
       | ordering _ => cases hty
       | atomicLoc loc =>
         have hvis : init.mem.visibleAtomicMsgs loc ≠ [] := hty

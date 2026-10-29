@@ -80,13 +80,19 @@ inductive AtomicOrdering where
   | relaxed
   | acquire
 
-/-- Minimal MIR type grammar (`usize`, `()`, `&Atomic<usize>`, and `Ordering`).
+/-- Minimal MIR type grammar (`usize`, `bool`, `()`, `&Atomic<usize>`,
+    `&mut usize`, and `Ordering`).
 
     - `MirTy.usize` models Rust's pointer-sized unsigned integer type `usize`:
 
       > "The `usize` type is an unsigned integer type with the same number of
       > bits as the platform's pointer type. It can represent every memory
       > address in the process."
+
+    - `MirTy.bool` models Rust's boolean type `bool` (`true` and `false`):
+
+      > "The boolean type, `bool`, represents a value, which could only be
+      > either `true` or `false`."
 
     - `MirTy.refAtomicUsize` models a shared reference `&AtomicUsize`
       (`&core::sync::atomic::Atomic<usize>`) to an atomic `usize` object:
@@ -96,21 +102,30 @@ inductive AtomicOrdering where
       > creating an `atomic_ref` in C++, with the `atomic_ref` being destroyed
       > when the lifetime of the shared reference ends."
 
+    - `MirTy.refMutUsize` models an exclusive mutable reference `&mut usize`:
+
+      > "Mutable references (`&mut T`), also called exclusive references, allow
+      > mutating the value they point to."
+
     - `MirTy.atomicOrdering` models `core::sync::atomic::Ordering`.
 
     Sources:
     - https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/numeric.md#L37-L38
+    - https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/boolean.md#L6-L7
+    - https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/pointer.md#L36-L38
     - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/sync/atomic.rs#L36-L42
     - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/sync/atomic.rs#L466-L527 -/
 @[candidate mir_ast]
 inductive MirTy where
   | usize
+  | bool
   | unit
   | refAtomicUsize
+  | refMutUsize
   | atomicOrdering
 
-/-- Initialized runtime scalar value (`usize`, `()`, `&AtomicUsize` location,
-    or `Ordering`).
+/-- Initialized runtime scalar value (`usize`, `bool`, `()`, `&AtomicUsize`
+    location, `&mut usize` location, or `Ordering`).
 
     In Rust, scalar values and references must be initialized and valid when
     produced; uninitialized locals are represented in `MirState` by
@@ -124,6 +139,9 @@ inductive MirTy where
     > must be initialized, i.e., must not be obtained from uninitialized
     > memory."
     >
+    > "* A `bool` must be initialized and have the value `0` (`false`) or `1`
+    > (`true`)."
+    >
     > "* A reference or [`Box<T>`] must be aligned and non-null, it cannot be
     > [dangling], and it must point to a valid value"
 
@@ -133,8 +151,10 @@ inductive MirTy where
 @[candidate mir_ast]
 inductive MirVal where
   | usize (bits : Nat)
+  | bool (b : Bool)
   | unit
   | atomicLoc (loc : Nat)
+  | refMutLoc (loc : Nat)
   | ordering (ord : AtomicOrdering)
 
 /-- MIR operand evaluated to produce a value in an `Rvalue` or terminator.
@@ -164,21 +184,47 @@ inductive Operand where
   | move (src : LocalId)
   | constVal (val : MirVal)
 
+/-- Binary comparison operators in `Rvalue.binaryOp`.
+
+    Corresponds to `rustc_middle::mir::BinOp` comparison variants (`Lt`, `Le`,
+    `Eq`):
+
+    > "Less than (`<`)"
+    > "Less than or equal to (`<=`)"
+    > "Equals (`==`)"
+
+    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L1060-L1110 -/
+@[candidate mir_ast]
+inductive BinOp where
+  | lt
+  | le
+  | eq
+
 /-- Right-hand side value computation of a MIR assignment statement.
 
-    Corresponds to `rustc_middle::mir::Rvalue::Use`:
+    Corresponds to `rustc_middle::mir::Rvalue` (`Use`, `Use(Copy(*src))`
+    dereference load, and `BinaryOp`):
 
     > "Yields the operand unchanged, except for a potential retag."
+    >
+    > "Dereference a pointer or reference."
+    >
+    > "Applies the binary operation to the two operands, producing a value of
+    > the appropriate result type."
 
-    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L1342-L1345 -/
+    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L975-L1005
+    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L1342-L1370 -/
 @[candidate mir_ast]
 inductive Rvalue where
   | use (op : Operand)
+  | deref (src : LocalId)
+  | binaryOp (op : BinOp) (lhs : Operand) (rhs : Operand)
 
 /-- Sequential statement inside a MIR basic block.
 
-    Corresponds to `rustc_middle::mir::StatementKind` (`Assign`, `StorageLive`,
-    `StorageDead`, and no-op statements):
+    Corresponds to `rustc_middle::mir::StatementKind` (`Assign` to a local place
+    or dereferenced place `(*dst) = op`, `StorageLive`, `StorageDead`, and
+    no-op statements):
 
     > "Assign statements roughly correspond to an assignment in Rust proper
     > (`x = ...`) except without the possibility of dropping the previous value
@@ -193,6 +239,7 @@ inductive Rvalue where
 @[candidate mir_ast]
 inductive Stmt where
   | assign (dst : LocalId) (rv : Rvalue)
+  | assignDeref (dst : LocalId) (op : Operand)
   | storageLive (loc : LocalId)
   | storageDead (loc : LocalId)
   | nop
@@ -200,9 +247,18 @@ inductive Stmt where
 /-- Control-flow transfer at the end of a MIR basic block.
 
     Corresponds to `rustc_middle::mir::TerminatorKind` (`Return`, `Goto`,
-    `Unreachable`, and `Call` specialized to `Atomic::<usize>::load`):
+    `Unreachable`, `Call` specialized to `Atomic::<usize>::load`, and
+    `SwitchInt` on boolean discriminants `[0: falseTarget, otherwise: trueTarget]`):
 
     > "Block has one successor; we continue execution there."
+    >
+    > "Switches based on the computed value.
+    >
+    > First, evaluates the `discr` operand. The type of this operand must be a
+    > signed or unsigned integer, `char`, or `bool`, and must match the given
+    > type. Then, if the list of switch targets contains the computed value,
+    > continues execution at the associated basic block. Otherwise, continues
+    > execution at the "otherwise" basic block."
     >
     > "Returns from the function.
     >
@@ -233,6 +289,7 @@ inductive Terminator where
   | goto (target : BlockId)
   | unreachable
   | callAtomicLoad (dst : LocalId) (ptr : Operand) (ord : Operand) (target : BlockId)
+  | switchInt (discr : Operand) (falseTarget : BlockId) (trueTarget : BlockId)
 
 /-- Basic block consisting of sequential statements and a single terminator.
 
