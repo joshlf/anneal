@@ -341,6 +341,21 @@ def evalMirStmt (s : MirState) (stmt : Stmt) : StepResult MirState Unit MirVal :
   | .nop =>
     .step () { s with stmtIdx := s.stmtIdx + 1 }
 
+/-- Evaluate a pure 2-argument `usize` callee (`add_bounded` or `abs_diff`)
+    according to its verified functional contract.
+
+    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L766-L808 -/
+@[candidate mir_semantics]
+def evalPureCallee2 (callee : PureCallee2) (v1 v2 : MirVal) : Option MirVal :=
+  match v1, v2 with
+  | .usize x0, .usize y0 =>
+    match callee with
+    | .addBounded =>
+      some (.usize (if decide (x0 ≤ 1000) && decide (y0 ≤ 1000) then x0 + y0 else 0))
+    | .absDiff =>
+      some (.usize (if decide (y0 ≤ x0) then x0 - y0 else y0 - x0))
+  | _, _ => none
+
 /-- Single-step operational evaluation of a MIR basic-block terminator.
 
     Models `TerminatorKind::Return`, `TerminatorKind::Goto`,
@@ -415,6 +430,21 @@ def evalMirTerminator (s : MirState) (term : Terminator) :
                   stmtIdx := 0
                 })
         | _, _ => .failed .ub
+  | .callPure2 dst callee arg1 arg2 target =>
+    match evalOperand s.locals arg1 with
+    | none => .failed .ub
+    | some (v1, locals1) =>
+      match evalOperand locals1 arg2 with
+      | none => .failed .ub
+      | some (v2, locals2) =>
+        match evalPureCallee2 callee v1 v2 with
+        | some res =>
+          .step () { s with
+            locals := updateLocal locals2 dst.index (some res)
+            block := target.index
+            stmtIdx := 0
+          }
+        | none => .failed .ub
   | .switchInt discr falseTarget trueTarget =>
     match evalOperand s.locals discr with
     | some (.bool false, locals') =>
@@ -728,6 +758,22 @@ def EnsuresCountUp : MirLang.Behavior :=
       out.outcome = .terminated (.normal ret) →
       q.init.locals 1 = some (.usize n0) →
       ret = .usize (if decide (n0 ≤ 1000) then n0 else 1000))
+
+/-- Postcondition specification for
+    `pub fn double_bounded(x: usize) -> usize { add_bounded(x, x) }`:
+    - `defined := True`: every finite execution prefix is free of UB, stuck
+      states, and overflow assertion failures (`MirLang.WellFormed`), and
+    - `val`: for any initial state where `_1 = some (.usize x0)`, any normal
+      return value `ret` equals
+      `.usize (if decide (x0 ≤ 1000) && decide (x0 ≤ 1000) then x0 + x0 else
+      0)`. -/
+@[candidate mir_semantics]
+def EnsuresDoubleBounded : MirLang.Behavior :=
+  MirLang.Spec (fun q out =>
+    ∀ ret x0,
+      out.outcome = .terminated (.normal ret) →
+      q.init.locals 1 = some (.usize x0) →
+      ret = .usize (if decide (x0 ≤ 1000) && decide (x0 ≤ 1000) then x0 + x0 else 0))
 
 /-- Abstract type of compiled target artifacts produced by `rustc`. -/
 @[candidate mir_semantics]
