@@ -750,3 +750,83 @@ fn rejects_incorrect_two_phase_reborrow_implementation() {
         "expected Lean audit rejection for wrong two_phase_reborrow body, got: {err}"
     );
 }
+
+#[test]
+fn verifies_add_bounded_end_to_end() {
+    let crate_dir = TempCrateDir::new(
+        "valid-add-bounded",
+        "// anneal:spec ensures(add_bounded(x, y))\n\
+         pub fn add_bounded(x: usize, y: usize) -> usize {\n    \
+             if x <= 1000 && y <= 1000 {\n        \
+                 x + y\n    \
+             } else {\n        \
+                 0\n    \
+             }\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "add_bounded");
+}
+
+#[test]
+fn rejects_unguarded_add_bounded_implementation() {
+    let crate_dir = TempCrateDir::new(
+        "wrong-add-bounded",
+        "// anneal:spec ensures(add_bounded(x, y))\n\
+         pub fn add_bounded(x: usize, y: usize) -> usize {\n    \
+             x + y\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean audit rejection for unguarded add_bounded body, got: {err}"
+    );
+}
+
+#[test]
+fn verifies_abs_diff_end_to_end() {
+    let crate_dir = TempCrateDir::new(
+        "valid-abs-diff",
+        "// anneal:spec ensures(abs_diff(x, y))\n\
+         pub fn abs_diff(x: usize, y: usize) -> usize {\n    \
+             if x >= y {\n        \
+                 x - y\n    \
+             } else {\n        \
+                 y - x\n    \
+             }\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "abs_diff");
+}
+
+#[test]
+fn rejects_incorrect_abs_diff_implementation() {
+    let crate_dir = TempCrateDir::new(
+        "wrong-abs-diff",
+        "// anneal:spec ensures(abs_diff(x, y))\n\
+         pub fn abs_diff(x: usize, y: usize) -> usize {\n    \
+             if x <= y {\n        \
+                 x - y\n    \
+             } else {\n        \
+                 y - x\n    \
+             }\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean audit rejection for wrong abs_diff body, got: {err}"
+    );
+}
