@@ -3,6 +3,8 @@ import Anneal
 namespace AnnealTests
 
 open Trusted.Refinement
+open Trusted.Effect
+open Trusted.ITree
 
 theorem smoke_claim : True := Anneal.trivial_witness
 
@@ -51,5 +53,22 @@ theorem layer1a_trust_policy_origin_check :
     (fun _ => ⟨Anneal.Refinement.monotone_id, fun _ _ => ⟨trivial, fun _ h => h⟩⟩)
     (fun _ _ _ => ⟨trivial, fun _ h => h⟩)
     (fun _ _ => ⟨trivial, fun _ _ => trivial⟩)
+
+/-- Layer 1B claim theorem whose statement references only `Trusted.Refinement`,
+`Trusted.Effect`, and `Trusted.ITree` (`toPartial` and `≤`), while its proof
+exercises `Anneal.ITree.WeakRef.toPartial_le`, `Anneal.ITree.WeakRef.refl`, and
+`Anneal.ITreeWP.dwlp_pure_adequacy`. -/
+theorem layer1b_itree_claim_origin_check :
+    (ITree.ret (E := FailE FailureKind) (7 : Nat)).toPartial ≤
+      (ITree.ret (E := FailE FailureKind) (7 : Nat)).toPartial ∧
+    TreeSafe (ITree.ret (E := FailE FailureKind) (7 : Nat)) :=
+  ⟨Anneal.ITree.WeakRef.toPartial_le (Anneal.ITree.WeakRef.refl _),
+   (Anneal.ITreeWP.dwlp_pure_adequacy
+     (ewp := Anneal.EffectWP.failWP PUnit FailureKind)
+     (t := ITree.ret (7 : Nat))
+     (post := fun r => r = 7)
+     ((Anneal.ITreeWP.DWLP.ret_iff
+       (Anneal.EffectWP.failWP PUnit FailureKind) 7 (fun r _ => r = 7)
+       PUnit.unit).mpr rfl)).1⟩
 
 end AnnealTests
