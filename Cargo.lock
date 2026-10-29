@@ -9,6 +9,3 @@ version = "0.1.0"
 [[package]]
 name = "cargo-anneal"
 version = "0.1.0"
-dependencies = [
- "anneal-rustc-capture",
-]

@@ -7,10 +7,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anneal_rustc_capture::{CaptureError, capture_crate};
 use cargo_anneal::{
-    VerifyError, VerifyOptions, render_proof_lean, run_trusted_audit,
-    verify_crate,
+    CaptureError, VerifyError, VerifyOptions, capture_crate,
+    capture_crate_with_options, run_trusted_audit, verify_crate,
 };
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -140,10 +139,12 @@ fn rejects_tampered_mir_lean_after_capture() {
          }\n",
     );
 
-    let output = capture_crate(&crate_dir.path).unwrap();
-    let proof_src = render_proof_lean(&output.functions);
-    fs::write(crate_dir.path.join(".anneal/Proof.lean"), proof_src.as_bytes())
-        .unwrap();
+    let output = capture_crate_with_options(
+        &crate_dir.path,
+        true,
+        &VerifyOptions::default(),
+    )
+    .unwrap();
 
     let mut mir_src = fs::read_to_string(&output.mir_lean_path).unwrap();
     mir_src.push_str("\n-- post-capture tampering\n");

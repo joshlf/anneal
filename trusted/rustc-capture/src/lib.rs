@@ -593,6 +593,16 @@ pub struct CaptureOutput {
 /// Compile `crate_dir/src/lib.rs` with `rustc --emit=mir,metadata`, extract the
 /// lowered MIR, and emit `.anneal/Mir.lean` and `.anneal/CaptureManifest.json`.
 pub fn capture_crate(crate_dir: &Path) -> Result<CaptureOutput, CaptureError> {
+    capture_crate_with_options(crate_dir, false)
+}
+
+/// Compile `crate_dir/src/lib.rs` with `rustc --emit=mir,metadata`, extract the
+/// lowered MIR, emit `.anneal/Mir.lean` and `.anneal/CaptureManifest.json`, and
+/// optionally emit `.anneal/Proof.lean` when `emit_proof` is `true`.
+pub fn capture_crate_with_options(
+    crate_dir: &Path,
+    emit_proof: bool,
+) -> Result<CaptureOutput, CaptureError> {
     let crate_dir = crate_dir
         .canonicalize()
         .map_err(|e| CaptureError::Io(format!("{}: {e}", crate_dir.display())))?;
@@ -671,11 +681,370 @@ pub fn capture_crate(crate_dir: &Path) -> Result<CaptureOutput, CaptureError> {
         ))
     })?;
 
+    if emit_proof {
+        let proof_src = render_proof_lean(&functions);
+        let proof_path = anneal_dir.join("Proof.lean");
+        fs::write(&proof_path, proof_src.as_bytes()).map_err(|e| {
+            CaptureError::Io(format!(
+                "cannot write {}: {e}",
+                proof_path.display()
+            ))
+        })?;
+    }
+
     Ok(CaptureOutput {
         functions,
         mir_lean_path,
         manifest_path,
     })
+}
+
+/// Render a candidate `.anneal/Proof.lean` proof script for the captured
+/// functions.
+///
+/// Soundness does not rely on this generator: the trusted boundary auditor
+/// checks that `Proof.verify_crate` has the exact kernel type
+/// `Trusted.CrateTheorem Mir.crate`, uses zero custom axioms, and replays in
+/// Lean's kernel. If the captured MIR does not unify with the lemma's expected
+/// body or specification, Lean rejects `rfl` and verification fails closed.
+pub fn render_proof_lean(functions: &[CapturedFunction]) -> String {
+    let proof_term = match functions {
+        [func] if func.arg_tys == [CapturedTy::RefAtomicUsize] => {
+            match func.spec {
+                CapturedSpec::EnsuresAtomicLoad(1) => format!(
+                    "Anneal.prove_load_relaxed_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_load_relaxed_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_load_relaxed_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [func]
+            if func.arg_tys
+                == [CapturedTy::RefMutUsize, CapturedTy::Usize] =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresMaxAssign => format!(
+                    "Anneal.prove_max_assign_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_max_assign_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_max_assign_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [func]
+            if func.arg_tys
+                == [
+                    CapturedTy::RefMutUsize,
+                    CapturedTy::RefMutUsize,
+                    CapturedTy::Usize,
+                ] =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresUpdateMin => format!(
+                    "Anneal.prove_update_min_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_update_min_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_update_min_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [func]
+            if func.arg_tys
+                == [
+                    CapturedTy::RefMutUsize,
+                    CapturedTy::Usize,
+                    CapturedTy::Usize,
+                ] =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresClampAssign => format!(
+                    "Anneal.prove_clamp_assign_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_clamp_assign_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_clamp_assign_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [func]
+            if func.arg_tys == [CapturedTy::Usize, CapturedTy::Usize]
+                && func.ret_ty == CapturedTy::Bool =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresIsAlignedMask => format!(
+                    "Anneal.prove_is_aligned_mask_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_is_aligned_mask_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_is_aligned_mask_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [func]
+            if func.arg_tys == [CapturedTy::Usize, CapturedTy::Usize]
+                && func.ret_ty == CapturedTy::Usize =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresAddBounded => format!(
+                    "Anneal.prove_add_bounded_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::EnsuresAbsDiff => format!(
+                    "Anneal.prove_abs_diff_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed if func.name == "abs_diff" => format!(
+                    "Anneal.prove_abs_diff_wf_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_add_bounded_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_add_bounded_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [func]
+            if func.arg_tys
+                == [CapturedTy::RefSharedUsize, CapturedTy::RefSharedUsize] =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresSharedMax => format!(
+                    "Anneal.prove_shared_max_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_shared_max_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_shared_max_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [func]
+            if func.arg_tys
+                == [CapturedTy::RefMutUsize, CapturedTy::RefSharedUsize] =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresMaxAssignShared => format!(
+                    "Anneal.prove_max_assign_shared_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_max_assign_shared_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_max_assign_shared_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [func]
+            if func.arg_tys
+                == [CapturedTy::RefMutUsize, CapturedTy::RefMutUsize] =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresSortPair => format!(
+                    "Anneal.prove_sort_pair_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_sort_pair_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_sort_pair_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [func]
+            if func.arg_tys
+                == [
+                    CapturedTy::RefMutUsize,
+                    CapturedTy::RefMutUsize,
+                    CapturedTy::Usize,
+                    CapturedTy::Usize,
+                ] =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresTwoPhaseReborrow => format!(
+                    "Anneal.prove_two_phase_reborrow_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_two_phase_reborrow_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_two_phase_reborrow_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [func]
+            if func.arg_tys
+                == [
+                    CapturedTy::Bool,
+                    CapturedTy::RefMutUsize,
+                    CapturedTy::RefMutUsize,
+                ]
+                && func.ret_ty == CapturedTy::RefMutUsize =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresChooseMut => format!(
+                    "Anneal.prove_choose_mut_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_choose_mut_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_choose_mut_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [func]
+            if func.arg_tys == [CapturedTy::Usize]
+                && func.ret_ty == CapturedTy::Usize
+                && (func.spec == CapturedSpec::EnsuresCountUp
+                    || func.name == "count_up") =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresCountUp => format!(
+                    "Anneal.prove_count_up_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_count_up_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_count_up_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [func]
+            if func.arg_tys == [CapturedTy::Usize]
+                && func.ret_ty == CapturedTy::Usize
+                && (func.spec == CapturedSpec::EnsuresDoubleBounded
+                    || func.name == "double_bounded") =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresDoubleBounded => format!(
+                    "Anneal.prove_double_bounded_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_double_bounded_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_double_bounded_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [fn1, fn2] => {
+            format!(
+                "Anneal.prove_add_and_double_bounded_crate \"{}\" \"{}\"",
+                fn1.name, fn2.name
+            )
+        }
+        [func] => {
+            let uses_move = func.blocks.first().is_some_and(|b| {
+                b.stmts.iter().any(|s| {
+                    matches!(
+                        s,
+                        CapturedStmt::AssignUse {
+                            dst: 0,
+                            op: CapturedOperand::Move(1),
+                        }
+                    )
+                })
+            });
+            match (uses_move, func.spec) {
+                (false, CapturedSpec::EnsuresEqArg(1)) => {
+                    format!(
+                        "Anneal.prove_id_copy_ensures_crate \"{}\"",
+                        func.name
+                    )
+                }
+                (false, CapturedSpec::WellFormed) => {
+                    format!(
+                        "Anneal.prove_id_copy_wf_crate \"{}\"",
+                        func.name
+                    )
+                }
+                (true, CapturedSpec::EnsuresEqArg(1)) => {
+                    format!(
+                        "Anneal.prove_id_move_ensures_crate \"{}\"",
+                        func.name
+                    )
+                }
+                (true, CapturedSpec::WellFormed) => {
+                    format!(
+                        "Anneal.prove_id_move_wf_crate \"{}\"",
+                        func.name
+                    )
+                }
+                _ => format!(
+                    "Anneal.prove_id_copy_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        _ => "Anneal.prove_id_copy_ensures_crate \"id\"".to_string(),
+    };
+
+    format!(
+        "prelude\n\
+         import Trusted\n\
+         import Anneal\n\
+         import Mir\n\n\
+         namespace Proof\n\n\
+         theorem verify_crate : Trusted.CrateTheorem Mir.crate :=\n  \
+         {proof_term}\n\n\
+         end Proof\n"
+    )
 }
 
 fn parse_source_spec(src: &str) -> Result<CapturedSpec, CaptureError> {

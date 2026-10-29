@@ -465,6 +465,7 @@ fn run_self_test_inner(
             *label,
             "implicit default Init"
                 | "foreign namespace spoof"
+                | "Std import"
                 | "evaluation sentinel"
         ) {
             let f = make_fixture(Some(src), false)?;
