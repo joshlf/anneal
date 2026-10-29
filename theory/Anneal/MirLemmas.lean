@@ -257,7 +257,7 @@ theorem evalMirStmt_not_choice (s : MirState) (stmt : Stmt)
           cases s.mem.readNA loc with
           | none => intro h; cases h
           | some p => intro h; cases h
-        | usize _ | bool _ | unit | atomicLoc _ | ordering _ =>
+        | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | ordering _ =>
           intro h; cases h
     | binaryOp op lhs rhs =>
       dsimp [evalMirStmt]
@@ -276,6 +276,35 @@ theorem evalMirStmt_not_choice (s : MirState) (stmt : Stmt)
               cases evalBinOp op v1 v2 with
               | none => intro h; cases h
               | some res => intro h; cases h
+    | checkedBinaryOp op lhs rhs =>
+      dsimp [evalMirStmt]
+      cases evalOperand s.locals lhs with
+      | none => intro h; cases h
+      | some p1 =>
+        cases p1 with
+        | mk v1 locals1 =>
+          dsimp
+          cases evalOperand locals1 rhs with
+          | none => intro h; cases h
+          | some p2 =>
+            cases p2 with
+            | mk v2 locals2 =>
+              dsimp
+              cases evalCheckedBinOp op v1 v2 with
+              | none => intro h; cases h
+              | some res => intro h; cases h
+    | proj0 src =>
+      dsimp [evalMirStmt]
+      cases s.locals src.index with
+      | none => intro h; cases h
+      | some v =>
+        cases v <;> intro h <;> cases h
+    | proj1 src =>
+      dsimp [evalMirStmt]
+      cases s.locals src.index with
+      | none => intro h; cases h
+      | some v =>
+        cases v <;> intro h <;> cases h
   | assignDeref dst op =>
     dsimp [evalMirStmt]
     cases evalOperand s.locals op with
@@ -293,7 +322,7 @@ theorem evalMirStmt_not_choice (s : MirState) (stmt : Stmt)
             cases s.mem.writeNA loc v with
             | none => intro h; cases h
             | some m' => intro h; cases h
-          | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ =>
+          | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | ordering _ =>
             intro h; cases h
   | storageLive loc => intro h; cases h
   | storageDead loc => intro h; cases h
@@ -323,8 +352,18 @@ theorem evalMirTerminator_choice_inhabited (s : MirState) (term : Terminator)
           cases b with
           | false => intro h; cases h
           | true => intro h; cases h
-        | usize _ | unit | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ =>
+        | usize _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ =>
           intro h; cases h
+  | assertNotOverflow tupleLocal target =>
+    dsimp [evalMirTerminator]
+    cases s.locals tupleLocal.index with
+    | none => intro h; cases h
+    | some v =>
+      cases v with
+      | tupleUsizeBool _ ov =>
+        cases ov <;> intro h <;> cases h
+      | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ =>
+        intro h; cases h
   | callAtomicLoad dst ptrOp ordOp target =>
     dsimp [evalMirTerminator]
     cases evalOperand s.locals ptrOp with
@@ -343,6 +382,7 @@ theorem evalMirTerminator_choice_inhabited (s : MirState) (term : Terminator)
             | usize _ => intro h; cases h
             | bool _ => intro h; cases h
             | unit => intro h; cases h
+            | tupleUsizeBool _ _ => intro h; cases h
             | refSharedLoc _ => intro h; cases h
             | refMutLoc _ => intro h; cases h
             | ordering _ => intro h; cases h
@@ -351,6 +391,7 @@ theorem evalMirTerminator_choice_inhabited (s : MirState) (term : Terminator)
               | usize _ => intro h; cases h
               | bool _ => intro h; cases h
               | unit => intro h; cases h
+              | tupleUsizeBool _ _ => intro h; cases h
               | atomicLoc _ => intro h; cases h
               | refSharedLoc _ => intro h; cases h
               | refMutLoc _ => intro h; cases h
@@ -702,6 +743,7 @@ theorem loadRelaxedBody_satisfies_ensures :
       | usize _ => cases hty
       | bool _ => cases hty
       | unit => cases hty
+      | tupleUsizeBool _ _ => cases hty
       | refSharedLoc _ => cases hty
       | refMutLoc _ => cases hty
       | ordering _ => cases hty

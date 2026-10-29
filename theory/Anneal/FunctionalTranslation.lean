@@ -190,12 +190,13 @@ theorem SafeAndReturns.of_terminated {body : MirBody} {s : MirState} {v : MirVal
 -/
 
 /-- Symbolic values in the functional translation: scalar values (`.usize`,
-    `.bool`, `.unit`), immutable shared reference values (`.refShared n`), and
-    active mutable borrow tokens (`.borrow loanId`). -/
+    `.bool`, `.unit`, `.tupleUsizeBool`), immutable shared reference values
+    (`.refShared n`), and active mutable borrow tokens (`.borrow loanId`). -/
 inductive SymVal where
   | usize (n : Nat)
   | bool (b : Bool)
   | unit
+  | tupleUsizeBool (val : Nat) (overflow : Bool)
   | refShared (n : Nat)
   | borrow (loanId : Nat)
 
@@ -205,12 +206,13 @@ def SymVal.toScalarMirVal : SymVal → Option MirVal
   | .usize n => some (.usize n)
   | .bool b => some (.bool b)
   | .unit => some .unit
+  | .tupleUsizeBool val ov => some (.tupleUsizeBool val ov)
   | .refShared _ => none
   | .borrow _ => none
 
 /-- Spine-preserving conditional merge on `SymVal`: pushes `if b then ... else ...`
-    inside `.usize`, `.bool`, and `.refShared` payloads so the outer `SymVal`
-    constructor tag remains exposed for subsequent pattern matching
+    inside `.usize`, `.bool`, `.tupleUsizeBool`, and `.refShared` payloads so the
+    outer `SymVal` constructor tag remains exposed for subsequent pattern matching
     (`toScalarMirVal`, dereference reads) during `rfl` reduction on symbolic
     inputs. -/
 def zipSymVal (b : Bool) (tVal fVal : SymVal) : SymVal :=
@@ -218,6 +220,8 @@ def zipSymVal (b : Bool) (tVal fVal : SymVal) : SymVal :=
   | .usize nt, .usize nf => .usize (if b then nt else nf)
   | .bool bt, .bool bf => .bool (if b then bt else bf)
   | .unit, .unit => .unit
+  | .tupleUsizeBool vt ovt, .tupleUsizeBool vf ovf =>
+    .tupleUsizeBool (if b then vt else vf) (if b then ovt else ovf)
   | .refShared nt, .refShared nf => .refShared (if b then nt else nf)
   | _, _ => if b then tVal else fVal
 
@@ -363,6 +367,16 @@ def evalSymBinOp (op : BinOp) (v1 v2 : SymVal) : Option SymVal :=
     | .bitXor => some (.usize (Nat.xor n1 n2))
   | _, _ => none
 
+/-- Evaluate a checked binary arithmetic operator on two symbolic `SymVal` operands. -/
+def evalSymCheckedBinOp (op : CheckedBinOp) (v1 v2 : SymVal) : Option SymVal :=
+  match v1, v2 with
+  | .usize n1, .usize n2 =>
+    match op with
+    | .add => some (.tupleUsizeBool (n1 + n2) (decide (usizeMax < n1 + n2)))
+    | .sub => some (.tupleUsizeBool (n1 - n2) (decide (n1 < n2)))
+    | .mul => some (.tupleUsizeBool (n1 * n2) (decide (usizeMax < n1 * n2)))
+  | _, _ => none
+
 /-- Symbolic evaluation of a single MIR `Stmt`. -/
 def evalSymStmt (sym : SymState) (stmt : Stmt) : Option SymState :=
   match stmt with
@@ -393,6 +407,22 @@ def evalSymStmt (sym : SymState) (stmt : Stmt) : Option SymState :=
           none
       | none => none
     | _ => none
+  | .assign dst (.proj0 src) =>
+    match sym.locals src.index with
+    | some (.tupleUsizeBool val _) =>
+      some { sym with
+        locals := updateSymLocal sym.locals dst.index (some (.usize val))
+        stmtIdx := sym.stmtIdx + 1
+      }
+    | _ => none
+  | .assign dst (.proj1 src) =>
+    match sym.locals src.index with
+    | some (.tupleUsizeBool _ ov) =>
+      some { sym with
+        locals := updateSymLocal sym.locals dst.index (some (.bool ov))
+        stmtIdx := sym.stmtIdx + 1
+      }
+    | _ => none
   | .assign dst (.binaryOp op lhs rhs) =>
     match evalSymOperand sym.locals lhs with
     | none => none
@@ -401,6 +431,20 @@ def evalSymStmt (sym : SymState) (stmt : Stmt) : Option SymState :=
       | none => none
       | some (v2, locals2) =>
         match evalSymBinOp op v1 v2 with
+        | some res =>
+          some { sym with
+            locals := updateSymLocal locals2 dst.index (some res)
+            stmtIdx := sym.stmtIdx + 1
+          }
+        | none => none
+  | .assign dst (.checkedBinaryOp op lhs rhs) =>
+    match evalSymOperand sym.locals lhs with
+    | none => none
+    | some (v1, locals1) =>
+      match evalSymOperand locals1 rhs with
+      | none => none
+      | some (v2, locals2) =>
+        match evalSymCheckedBinOp op v1 v2 with
         | some res =>
           some { sym with
             locals := updateSymLocal locals2 dst.index (some res)
@@ -438,16 +482,27 @@ def evalSymStmt (sym : SymState) (stmt : Stmt) : Option SymState :=
   | .nop =>
     some { sym with stmtIdx := sym.stmtIdx + 1 }
 
-/-- Execute one sequential statement or `Terminator.goto` step in `sym`. -/
-def evalSymStep (body : MirBody) (sym : SymState) : Option SymState :=
+/-- Execute one sequential statement, `Terminator.goto`, or
+    `Terminator.assertNotOverflow` step in `sym`, returning `(overflow, sym')`
+    where `overflow = false` for statements and `goto`, and `overflow = ov` for
+    `assertNotOverflow` on `.tupleUsizeBool _ ov`. -/
+def evalSymStep (body : MirBody) (sym : SymState) : Option (Bool × SymState) :=
   match body.blocks[sym.block]? with
   | none => none
   | some bb =>
     match bb.stmts[sym.stmtIdx]? with
-    | some stmt => evalSymStmt sym stmt
+    | some stmt =>
+      match evalSymStmt sym stmt with
+      | some sym' => some (false, sym')
+      | none => none
     | none =>
       match bb.terminator with
-      | .goto target => some { sym with block := target.index, stmtIdx := 0 }
+      | .goto target => some (false, { sym with block := target.index, stmtIdx := 0 })
+      | .assertNotOverflow tupleLocal target =>
+        match sym.locals tupleLocal.index with
+        | some (.tupleUsizeBool _ ov) =>
+          some (ov, { sym with block := target.index, stmtIdx := 0 })
+        | _ => none
       | _ => none
 
 /-- Execute `Terminator.return_` at the end of the current block, returning the
@@ -589,7 +644,8 @@ noncomputable def evalSymState (plan : TransPlan) (body : MirBody) (sym : SymSta
     | none => .fail
   | .step next =>
     match evalSymStep body sym with
-    | some sym' => evalSymState next body sym'
+    | some (ov, sym') =>
+      if ov then .fail else evalSymState next body sym'
     | none => .fail
   | .endLoan lid next =>
     match evalEndLoan sym lid with
@@ -746,6 +802,7 @@ def isSupportedArgTy : MirTy → Bool
   | .unit => true
   | .refSharedUsize => true
   | .refMutUsize => true
+  | .tupleUsizeBool => false
   | .refAtomicUsize => false
   | .atomicOrdering => false
 
@@ -793,6 +850,7 @@ def ValRel (loanLoc : Nat → Option Nat) (sharedLoc : Nat → Nat → Prop)
   | .usize n => mv = .usize n
   | .bool b => mv = .bool b
   | .unit => mv = .unit
+  | .tupleUsizeBool val ov => mv = .tupleUsizeBool val ov
   | .refShared n => ∃ loc, sharedLoc loc n ∧ mv = .refSharedLoc loc
   | .borrow lid => ∃ loc, loanLoc lid = some loc ∧ mv = .refMutLoc loc
 
@@ -804,6 +862,7 @@ theorem ValRel.of_toScalarMirVal (loanLoc : Nat → Option Nat)
   | usize n => injection h with heq; exact heq.symm
   | bool b => injection h with heq; exact heq.symm
   | unit => injection h with heq; exact heq.symm
+  | tupleUsizeBool val ov => injection h with heq; exact heq.symm
   | refShared _ => cases h
   | borrow _ => cases h
 
@@ -821,6 +880,9 @@ theorem ValRel.toScalarMirVal_eq {loanLoc : Nat → Option Nat}
     injection hScalar with h1
     exact Eq.trans hRel h1
   | unit =>
+    injection hScalar with h1
+    exact Eq.trans hRel h1
+  | tupleUsizeBool val ov =>
     injection hScalar with h1
     exact Eq.trans hRel h1
   | refShared _ => cases hScalar
@@ -932,7 +994,7 @@ theorem evalSymOperand_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat →
       injection hpair with hsv hloc
       subst hsv hloc
       exact ⟨.unit, concLocals, rfl, rfl, hRel⟩
-    | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ =>
+    | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ =>
       cases hEval
 
 theorem evalSymOperand_borrows {locals locals' : Nat → Option SymVal}
@@ -993,7 +1055,7 @@ theorem evalSymOperand_borrows {locals locals' : Nat → Option SymVal}
       injection hpair with hsv hloc
       subst hsv hloc
       exact ⟨(by intro _ h; cases h), hBorrows⟩
-    | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ =>
+    | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ =>
       cases hEval
 
 theorem localBorrows_update_some {locals : Nat → Option SymVal}
@@ -1045,10 +1107,10 @@ theorem evalSymBinOp_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → N
     (hBin : evalSymBinOp op sv1 sv2 = some res) :
     ∃ mres, evalBinOp op mv1 mv2 = some mres ∧ ValRel loanLoc sharedLoc res mres := by
   cases sv1 with
-  | bool _ | unit | refShared _ | borrow _ => cases hBin
+  | bool _ | unit | tupleUsizeBool _ _ | refShared _ | borrow _ => cases hBin
   | usize n1 =>
     cases sv2 with
-    | bool _ | unit | refShared _ | borrow _ => cases hBin
+    | bool _ | unit | tupleUsizeBool _ _ | refShared _ | borrow _ => cases hBin
     | usize n2 =>
       subst hVal1 hVal2
       cases op with
@@ -1088,6 +1150,34 @@ theorem evalSymBinOp_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → N
         injection hBin with hres
         subst hres
         exact ⟨.usize (Nat.xor n1 n2), rfl, rfl⟩
+
+/-- Soundness of symbolic checked binary arithmetic evaluation (`evalSymCheckedBinOp`). -/
+theorem evalSymCheckedBinOp_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
+    {op : CheckedBinOp} {sv1 sv2 res : SymVal} {mv1 mv2 : MirVal}
+    (hVal1 : ValRel loanLoc sharedLoc sv1 mv1)
+    (hVal2 : ValRel loanLoc sharedLoc sv2 mv2)
+    (hBin : evalSymCheckedBinOp op sv1 sv2 = some res) :
+    ∃ mres, evalCheckedBinOp op mv1 mv2 = some mres ∧ ValRel loanLoc sharedLoc res mres := by
+  cases sv1 with
+  | bool _ | unit | tupleUsizeBool _ _ | refShared _ | borrow _ => cases hBin
+  | usize n1 =>
+    cases sv2 with
+    | bool _ | unit | tupleUsizeBool _ _ | refShared _ | borrow _ => cases hBin
+    | usize n2 =>
+      subst hVal1 hVal2
+      cases op with
+      | add =>
+        injection hBin with hres
+        subst hres
+        exact ⟨.tupleUsizeBool (n1 + n2) (decide (usizeMax < n1 + n2)), rfl, rfl⟩
+      | sub =>
+        injection hBin with hres
+        subst hres
+        exact ⟨.tupleUsizeBool (n1 - n2) (decide (n1 < n2)), rfl, rfl⟩
+      | mul =>
+        injection hBin with hres
+        subst hres
+        exact ⟨.tupleUsizeBool (n1 * n2) (decide (usizeMax < n1 * n2)), rfl, rfl⟩
 
 /-- Invariant for an active joined loan `lid` (`entry.owners = [.loan falseLid, .loan trueLid]`):
     1. `falseLid ≠ trueLid`, `falseLid ≠ lid`, and `trueLid ≠ lid`,
@@ -1418,7 +1508,7 @@ theorem evalReturn_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat
     | none =>
       rw [hstmt] at hRet
       cases hterm : bb.terminator with
-      | goto _ | unreachable | callAtomicLoad _ _ _ _ | switchInt _ _ _ =>
+      | goto _ | unreachable | callAtomicLoad _ _ _ _ | switchInt _ _ _ | assertNotOverflow _ _ =>
         rw [hterm] at hRet; cases hRet
       | return_ =>
         rw [hterm] at hRet
@@ -1484,7 +1574,7 @@ theorem evalSymStmt_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Na
       | some svSrc =>
         rw [hsrc] at hStmt
         cases svSrc with
-        | usize _ | bool _ | unit => cases hStmt
+        | usize _ | bool _ | unit | tupleUsizeBool _ _ => cases hStmt
         | refShared n =>
           dsimp at hStmt
           injection hStmt with hsym'
@@ -1556,6 +1646,64 @@ theorem evalSymStmt_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Na
                       (ValRel.of_toScalarMirVal loanLoc sharedLoc hsc)
                     loanRel := LoanRel.of_readNA loc hState.loanRel
                   }
+    | proj0 src =>
+      dsimp [evalSymStmt] at hStmt
+      cases hsrc : sym.locals src.index with
+      | none => rw [hsrc] at hStmt; cases hStmt
+      | some svSrc =>
+        rw [hsrc] at hStmt
+        cases svSrc with
+        | usize _ | bool _ | unit | refShared _ | borrow _ => cases hStmt
+        | tupleUsizeBool val ov =>
+          dsimp at hStmt
+          injection hStmt with hsym'
+          subst hsym'
+          have ⟨mvSrc, hconcSrc, hvalSrc⟩ :=
+            hState.localRel src.index (.tupleUsizeBool val ov) hsrc
+          subst hvalSrc
+          refine ⟨{ conc with
+            locals := updateLocal conc.locals dst.index (some (.usize val))
+            stmtIdx := conc.stmtIdx + 1
+          }, ?_, ?_⟩
+          · dsimp [evalMirStmt]
+            rw [hconcSrc]
+          · exact {
+              block_eq := hState.block_eq
+              stmtIdx_eq := by dsimp; rw [hState.stmtIdx_eq]
+              localBorrows := localBorrows_update_some dst.index hState.localBorrows
+                (fun _ heq => by cases heq)
+              localRel := LocalRel.update_some hState.localRel dst.index rfl
+              loanRel := hState.loanRel
+            }
+    | proj1 src =>
+      dsimp [evalSymStmt] at hStmt
+      cases hsrc : sym.locals src.index with
+      | none => rw [hsrc] at hStmt; cases hStmt
+      | some svSrc =>
+        rw [hsrc] at hStmt
+        cases svSrc with
+        | usize _ | bool _ | unit | refShared _ | borrow _ => cases hStmt
+        | tupleUsizeBool val ov =>
+          dsimp at hStmt
+          injection hStmt with hsym'
+          subst hsym'
+          have ⟨mvSrc, hconcSrc, hvalSrc⟩ :=
+            hState.localRel src.index (.tupleUsizeBool val ov) hsrc
+          subst hvalSrc
+          refine ⟨{ conc with
+            locals := updateLocal conc.locals dst.index (some (.bool ov))
+            stmtIdx := conc.stmtIdx + 1
+          }, ?_, ?_⟩
+          · dsimp [evalMirStmt]
+            rw [hconcSrc]
+          · exact {
+              block_eq := hState.block_eq
+              stmtIdx_eq := by dsimp; rw [hState.stmtIdx_eq]
+              localBorrows := localBorrows_update_some dst.index hState.localBorrows
+                (fun _ heq => by cases heq)
+              localRel := LocalRel.update_some hState.localRel dst.index rfl
+              loanRel := hState.loanRel
+            }
     | binaryOp op lhs rhs =>
       dsimp [evalSymStmt] at hStmt
       cases hOp1 : evalSymOperand sym.locals lhs with
@@ -1590,10 +1738,68 @@ theorem evalSymStmt_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Na
                   intro lid heq
                   subst heq
                   cases v1 with
-                  | bool _ | unit | refShared _ | borrow _ => cases hBin
+                  | bool _ | unit | tupleUsizeBool _ _ | refShared _ | borrow _ => cases hBin
                   | usize _ =>
                     cases v2 with
-                    | bool _ | unit | refShared _ | borrow _ => cases hBin
+                    | bool _ | unit | tupleUsizeBool _ _ | refShared _ | borrow _ => cases hBin
+                    | usize _ =>
+                      cases op <;> cases hBin
+                refine ⟨{ conc with
+                  locals := updateLocal concLocals2 dst.index (some mres)
+                  stmtIdx := conc.stmtIdx + 1
+                }, ?_, ?_⟩
+                · dsimp [evalMirStmt]
+                  rw [hConcOp1]
+                  dsimp
+                  rw [hConcOp2]
+                  dsimp
+                  rw [hConcBin]
+                · exact {
+                    block_eq := hState.block_eq
+                    stmtIdx_eq := by dsimp; rw [hState.stmtIdx_eq]
+                    localBorrows := localBorrows_update_some dst.index hBor2.2
+                      (fun lid h => False.elim (hResNotBorrow lid h))
+                    localRel := LocalRel.update_some hLocRel2 dst.index hValRes
+                    loanRel := hState.loanRel
+                  }
+    | checkedBinaryOp op lhs rhs =>
+      dsimp [evalSymStmt] at hStmt
+      cases hOp1 : evalSymOperand sym.locals lhs with
+      | none => rw [hOp1] at hStmt; cases hStmt
+      | some p1 =>
+        cases p1 with
+        | mk v1 locals1 =>
+          rw [hOp1] at hStmt
+          dsimp at hStmt
+          cases hOp2 : evalSymOperand locals1 rhs with
+          | none => rw [hOp2] at hStmt; cases hStmt
+          | some p2 =>
+            cases p2 with
+            | mk v2 locals2 =>
+              rw [hOp2] at hStmt
+              dsimp at hStmt
+              cases hBin : evalSymCheckedBinOp op v1 v2 with
+              | none => rw [hBin] at hStmt; cases hStmt
+              | some res =>
+                rw [hBin] at hStmt
+                injection hStmt with hsym'
+                subst hsym'
+                have ⟨mv1, concLocals1, hConcOp1, hVal1, hLocRel1⟩ :=
+                  evalSymOperand_sound hState.localRel hOp1
+                have ⟨mv2, concLocals2, hConcOp2, hVal2, hLocRel2⟩ :=
+                  evalSymOperand_sound hLocRel1 hOp2
+                have ⟨mres, hConcBin, hValRes⟩ :=
+                  evalSymCheckedBinOp_sound hVal1 hVal2 hBin
+                have hBor1 := evalSymOperand_borrows hState.localBorrows hOp1
+                have hBor2 := evalSymOperand_borrows hBor1.2 hOp2
+                have hResNotBorrow : ∀ lid, res = .borrow lid → False := by
+                  intro lid heq
+                  subst heq
+                  cases v1 with
+                  | bool _ | unit | tupleUsizeBool _ _ | refShared _ | borrow _ => cases hBin
+                  | usize _ =>
+                    cases v2 with
+                    | bool _ | unit | tupleUsizeBool _ _ | refShared _ | borrow _ => cases hBin
                     | usize _ =>
                       cases op <;> cases hBin
                 refine ⟨{ conc with
@@ -1632,7 +1838,7 @@ theorem evalSymStmt_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Na
           | some svDst =>
             rw [hdst] at hStmt
             cases svDst with
-            | usize _ | bool _ | unit | refShared _ => cases hStmt
+            | usize _ | bool _ | unit | tupleUsizeBool _ _ | refShared _ => cases hStmt
             | borrow lid =>
               dsimp at hStmt
               cases hloan : sym.loans lid with
@@ -1738,11 +1944,12 @@ theorem evalSymStmt_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Na
       loanRel := hState.loanRel
     }
 
-/-- Soundness of `evalSymStep` (single statement or `Terminator.goto`). -/
+/-- Soundness of `evalSymStep` (single statement, `Terminator.goto`, or
+    `Terminator.assertNotOverflow` when `overflow = false`). -/
 theorem evalSymStep_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
     {body : MirBody} {sym sym' : SymState} {conc : MirState}
     (hState : StateRel loanLoc sharedLoc sym conc)
-    (hStep : evalSymStep body sym = some sym') :
+    (hStep : evalSymStep body sym = some (false, sym')) :
     ∃ conc',
       evalMirStep body conc = .step () conc' ∧
       StateRel loanLoc sharedLoc sym' conc' := by
@@ -1755,13 +1962,21 @@ theorem evalSymStep_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Na
     cases hstmt : bb.stmts[sym.stmtIdx]? with
     | some stmt =>
       rw [hstmt] at hStep
-      have ⟨conc', hConcStmt, hState'⟩ := evalSymStmt_sound hState hStep
-      refine ⟨conc', ?_, hState'⟩
-      unfold evalMirStep
-      rw [hState.block_eq, hbb]
-      dsimp
-      rw [hState.stmtIdx_eq, hstmt]
-      exact hConcStmt
+      dsimp at hStep
+      cases hSymStmt : evalSymStmt sym stmt with
+      | none => rw [hSymStmt] at hStep; cases hStep
+      | some sym1 =>
+        rw [hSymStmt] at hStep
+        injection hStep with hpair
+        injection hpair with _ hsym'
+        subst hsym'
+        have ⟨conc', hConcStmt, hState'⟩ := evalSymStmt_sound hState hSymStmt
+        refine ⟨conc', ?_, hState'⟩
+        unfold evalMirStep
+        rw [hState.block_eq, hbb]
+        dsimp
+        rw [hState.stmtIdx_eq, hstmt]
+        exact hConcStmt
     | none =>
       rw [hstmt] at hStep
       dsimp at hStep
@@ -1770,7 +1985,8 @@ theorem evalSymStep_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Na
         rw [hterm] at hStep; cases hStep
       | goto target =>
         rw [hterm] at hStep
-        injection hStep with hsym'
+        injection hStep with hpair
+        injection hpair with _ hsym'
         subst hsym'
         refine ⟨{ conc with block := target.index, stmtIdx := 0 }, ?_, ?_⟩
         · unfold evalMirStep
@@ -1787,6 +2003,39 @@ theorem evalSymStep_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Na
             localRel := hState.localRel
             loanRel := hState.loanRel
           }
+      | assertNotOverflow tupleLocal target =>
+        rw [hterm] at hStep
+        dsimp at hStep
+        cases hloc : sym.locals tupleLocal.index with
+        | none => rw [hloc] at hStep; cases hStep
+        | some sv =>
+          rw [hloc] at hStep
+          cases sv with
+          | usize _ | bool _ | unit | refShared _ | borrow _ => cases hStep
+          | tupleUsizeBool val ov =>
+            dsimp at hStep
+            injection hStep with hpair
+            injection hpair with hov hsym'
+            subst hov hsym'
+            have ⟨mv, hconcLoc, hVal⟩ :=
+              hState.localRel tupleLocal.index (.tupleUsizeBool val false) hloc
+            subst hVal
+            refine ⟨{ conc with block := target.index, stmtIdx := 0 }, ?_, ?_⟩
+            · unfold evalMirStep
+              rw [hState.block_eq, hbb]
+              dsimp
+              rw [hState.stmtIdx_eq, hstmt]
+              dsimp
+              rw [hterm]
+              dsimp [evalMirTerminator]
+              rw [hconcLoc]
+            · exact {
+                block_eq := rfl
+                stmtIdx_eq := rfl
+                localBorrows := hState.localBorrows
+                localRel := hState.localRel
+                loanRel := hState.loanRel
+              }
 
 /-- Soundness of `evalBranchStep` (`Terminator.switchInt`). -/
 theorem evalBranchStep_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
@@ -1808,7 +2057,7 @@ theorem evalBranchStep_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat →
     | none =>
       rw [hstmt] at hBranch
       cases hterm : bb.terminator with
-      | return_ | goto _ | unreachable | callAtomicLoad _ _ _ _ =>
+      | return_ | goto _ | unreachable | callAtomicLoad _ _ _ _ | assertNotOverflow _ _ =>
         rw [hterm] at hBranch; cases hBranch
       | switchInt discr falseTarget trueTarget =>
         rw [hterm] at hBranch
@@ -1820,7 +2069,7 @@ theorem evalBranchStep_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat →
           | mk sv locals' =>
             rw [hOp] at hBranch
             cases sv with
-            | usize _ | unit | refShared _ | borrow _ => cases hBranch
+            | usize _ | unit | tupleUsizeBool _ _ | refShared _ | borrow _ => cases hBranch
             | bool b =>
               dsimp at hBranch
               injection hBranch with htuple
@@ -2119,7 +2368,7 @@ theorem LocalRel.extend_fresh_loan {loanLoc : Nat → Option Nat} {sharedLoc : N
   have ⟨mv, hconc, hval⟩ := hRel i sv hlookup
   refine ⟨mv, hconc, ?_⟩
   cases sv with
-  | usize _ | bool _ | unit | refShared _ => exact hval
+  | usize _ | bool _ | unit | tupleUsizeBool _ _ | refShared _ => exact hval
   | borrow lid =>
     have ⟨loc, hloc, hmv⟩ := hval
     refine ⟨loc, ?_, hmv⟩
@@ -2145,14 +2394,14 @@ theorem matchBorrowArm_eq_some {bb : BasicBlock} {dst src joinBlk : Nat}
       | assignDeref _ _ | storageLive _ | storageDead _ | nop => cases h
       | assign dstPlace rv =>
         cases rv with
-        | deref _ | binaryOp _ _ _ => cases h
+        | deref _ | proj0 _ | proj1 _ | binaryOp _ _ _ | checkedBinaryOp _ _ _ => cases h
         | use op =>
           cases op with
           | move _ | constVal _ => cases h
           | copy srcPlace =>
             dsimp at h
             cases hterm : bb.terminator with
-            | return_ | unreachable | callAtomicLoad _ _ _ _ | switchInt _ _ _ =>
+            | return_ | unreachable | callAtomicLoad _ _ _ _ | switchInt _ _ _ | assertNotOverflow _ _ =>
               rw [hterm] at h; cases h
             | goto jBlk =>
               rw [hterm] at h
@@ -2191,7 +2440,7 @@ theorem evalJoinBorrow_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat →
       | none =>
         rw [hstmt] at hJoin
         cases hterm : bb.terminator with
-        | return_ | goto _ | unreachable | callAtomicLoad _ _ _ _ =>
+        | return_ | goto _ | unreachable | callAtomicLoad _ _ _ _ | assertNotOverflow _ _ =>
           rw [hterm] at hJoin; cases hJoin
         | switchInt discr falseTarget trueTarget =>
           rw [hterm] at hJoin
@@ -2203,7 +2452,7 @@ theorem evalJoinBorrow_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat →
             | mk svDiscr localsAfterDiscr =>
               rw [hOp] at hJoin
               cases svDiscr with
-              | usize _ | unit | refShared _ | borrow _ => cases hJoin
+              | usize _ | unit | tupleUsizeBool _ _ | refShared _ | borrow _ => cases hJoin
               | bool cond =>
                 dsimp at hJoin
                 cases hbbF : body.blocks[falseTarget.index]? with
@@ -2244,14 +2493,14 @@ theorem evalJoinBorrow_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat →
                                   | some svF =>
                                     rw [hsrcF] at hJoin
                                     cases svF with
-                                    | usize _ | bool _ | unit | refShared _ => cases hJoin
+                                    | usize _ | bool _ | unit | tupleUsizeBool _ _ | refShared _ => cases hJoin
                                     | borrow falseLid =>
                                       cases hsrcT : localsAfterDiscr trueSrc with
                                       | none => rw [hsrcT] at hJoin; cases hJoin
                                       | some svT =>
                                         rw [hsrcT] at hJoin
                                         cases svT with
-                                        | usize _ | bool _ | unit | refShared _ => cases hJoin
+                                        | usize _ | bool _ | unit | tupleUsizeBool _ _ | refShared _ => cases hJoin
                                         | borrow trueLid =>
                                           dsimp at hJoin
                                           cases hchk2 : (!(falseLid == trueLid) &&
@@ -2718,10 +2967,17 @@ theorem evalSymState_sound (plan : TransPlan) (body : MirBody) :
     unfold evalSymState at hEval
     cases hStep : evalSymStep body sym with
     | none => rw [hStep] at hEval; cases hEval
-    | some sym' =>
-      rw [hStep] at hEval
-      have ⟨conc', hConcStep, hState'⟩ := evalSymStep_sound hState hStep
-      exact SafeAndReturns.of_step hConcStep (ih hState' hEval)
+    | some p =>
+      cases p with
+      | mk ov sym' =>
+        rw [hStep] at hEval
+        dsimp at hEval
+        cases ov with
+        | true => cases hEval
+        | false =>
+          dsimp at hEval
+          have ⟨conc', hConcStep, hState'⟩ := evalSymStep_sound hState hStep
+          exact SafeAndReturns.of_step hConcStep (ih hState' hEval)
   | endLoan lid next ih =>
     intro _ _ sym conc ret hState hEval
     unfold evalSymState at hEval
@@ -2771,7 +3027,13 @@ theorem evalSymState_ne_inapplicable (plan : TransPlan) (body : MirBody) :
     unfold evalSymState
     cases evalSymStep body sym with
     | none => intro h; cases h
-    | some sym' => exact ih sym'
+    | some p =>
+      cases p with
+      | mk ov sym' =>
+        dsimp
+        cases ov with
+        | true => intro h; cases h
+        | false => exact ih sym'
   | endLoan lid next ih =>
     intro sym
     unfold evalSymState
@@ -2950,7 +3212,7 @@ theorem noAliasBefore_of_forall_ne (locals : Nat → Option MirVal) (loc : Nat) 
             have heq : loc' = loc := of_decide_eq_true hbeq
             subst heq
             exact False.elim (hnot_here.2 hloc)
-        | usize _ | bool _ | unit | atomicLoc _ | ordering _ => rfl
+        | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | ordering _ => rfl
     have hrec : noAliasBefore locals loc (j + 1) = true :=
       noAliasBefore_of_forall_ne locals loc (j + 1) (fun i hi1 hilt =>
         hne i hi1 (Nat.lt_trans hilt hj1_lt))
@@ -2985,7 +3247,7 @@ theorem noMutAliasBefore_of_forall_ne (locals : Nat → Option MirVal) (loc : Na
             have heq : loc' = loc := of_decide_eq_true hbeq
             subst heq
             exact False.elim (hnot_here hloc)
-        | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => rfl
+        | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | ordering _ => rfl
     have hrec : noMutAliasBefore locals loc (j + 1) = true :=
       noMutAliasBefore_of_forall_ne locals loc (j + 1) (fun i hi1 hilt =>
         hne i hi1 (Nat.lt_trans hilt hj1_lt))
@@ -3010,7 +3272,7 @@ theorem initLoanLoc_disjoint_shared (init : MirState) :
     | some mv =>
       rw [hlocM] at hLoan
       cases mv with
-      | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hLoan
+      | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | ordering _ => cases hLoan
       | refMutLoc locM =>
         dsimp at hLoan
         cases hnoA : noAliasBefore init.locals locM lid with
@@ -3061,14 +3323,14 @@ theorem extractSymArgsAux_spec :
     dsimp [extractSymArgsAux] at hExt
     have hIdxSucc1 : 1 ≤ idx + 1 := Nat.le_add_left 1 idx
     cases ty with
-    | refAtomicUsize | atomicOrdering => cases hExt
+    | tupleUsizeBool | refAtomicUsize | atomicOrdering => cases hExt
     | usize =>
       cases hloc : init.locals idx with
       | none => rw [hloc] at hExt; cases hExt
       | some mv =>
         rw [hloc] at hExt
         cases mv with
-        | bool _ | unit | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
+        | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
         | usize n =>
           dsimp at hExt
           cases hRest : extractSymArgsAux (idx + 1) restTys init with
@@ -3109,7 +3371,7 @@ theorem extractSymArgsAux_spec :
       | some mv =>
         rw [hloc] at hExt
         cases mv with
-        | usize _ | unit | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
+        | usize _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
         | bool b =>
           dsimp at hExt
           cases hRest : extractSymArgsAux (idx + 1) restTys init with
@@ -3150,7 +3412,7 @@ theorem extractSymArgsAux_spec :
       | some mv =>
         rw [hloc] at hExt
         cases mv with
-        | usize _ | bool _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
+        | usize _ | bool _ | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
         | unit =>
           dsimp at hExt
           cases hRest : extractSymArgsAux (idx + 1) restTys init with
@@ -3191,7 +3453,7 @@ theorem extractSymArgsAux_spec :
       | some mv =>
         rw [hloc] at hExt
         cases mv with
-        | usize _ | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+        | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
         | refSharedLoc loc =>
           dsimp at hExt
           cases hchk : (noMutAliasBefore init.locals loc idx &&
@@ -3205,7 +3467,7 @@ theorem extractSymArgsAux_spec :
             | some naMv =>
               rw [hna] at hExt
               cases naMv with
-              | bool _ | unit | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
+              | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
               | usize n =>
                 dsimp at hExt
                 cases hRest : extractSymArgsAux (idx + 1) restTys init with
@@ -3253,7 +3515,7 @@ theorem extractSymArgsAux_spec :
       | some mv =>
         rw [hloc] at hExt
         cases mv with
-        | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
+        | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
         | refMutLoc loc =>
           dsimp at hExt
           cases hchk : (noAliasBefore init.locals loc idx &&
@@ -3268,7 +3530,7 @@ theorem extractSymArgsAux_spec :
             | some naMv =>
               rw [hna] at hExt
               cases naMv with
-              | bool _ | unit | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
+              | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
               | usize n =>
                 dsimp at hExt
                 cases hRest : extractSymArgsAux (idx + 1) restTys init with
@@ -3403,10 +3665,10 @@ theorem extractSymArgsAux_of_argsMatchLocals :
     have ⟨restArgs, hRestExt⟩ :=
       extractSymArgsAux_of_argsMatchLocals restTys (idx + 1) init hsa.2 hRestFold
     cases ty with
-    | refAtomicUsize | atomicOrdering => cases hsa.1
+    | tupleUsizeBool | refAtomicUsize | atomicOrdering => cases hsa.1
     | usize =>
       cases v with
-      | bool _ | unit | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hvValid
+      | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hvValid
       | usize n =>
         refine ⟨.usize n :: restArgs, ?_⟩
         dsimp [extractSymArgsAux]
@@ -3415,7 +3677,7 @@ theorem extractSymArgsAux_of_argsMatchLocals :
         rw [hRestExt]
     | bool =>
       cases v with
-      | usize _ | unit | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hvValid
+      | usize _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hvValid
       | bool b =>
         refine ⟨.bool b :: restArgs, ?_⟩
         dsimp [extractSymArgsAux]
@@ -3424,7 +3686,7 @@ theorem extractSymArgsAux_of_argsMatchLocals :
         rw [hRestExt]
     | unit =>
       cases v with
-      | usize _ | bool _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hvValid
+      | usize _ | bool _ | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hvValid
       | unit =>
         refine ⟨.unit :: restArgs, ?_⟩
         dsimp [extractSymArgsAux]
@@ -3434,7 +3696,7 @@ theorem extractSymArgsAux_of_argsMatchLocals :
     | refSharedUsize =>
       have ⟨hHasTy, hdisj⟩ := hvValid
       cases v with
-      | usize _ | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hHasTy
+      | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | ordering _ => cases hHasTy
       | refSharedLoc loc =>
         have ⟨n, hna, hw⟩ := hHasTy
         have hnoMut : noMutAliasBefore init.locals loc idx = true :=
@@ -3453,7 +3715,7 @@ theorem extractSymArgsAux_of_argsMatchLocals :
     | refMutUsize =>
       have ⟨hHasTy, hdisj⟩ := hvValid
       cases v with
-      | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hHasTy
+      | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | ordering _ => cases hHasTy
       | refMutLoc loc =>
         have ⟨n, hna, hw, hr⟩ := hHasTy
         have hnoAlias : noAliasBefore init.locals loc idx = true :=
@@ -3557,8 +3819,8 @@ def operandAccessesLocal (op : Operand) (locIdx : Nat) : Bool :=
 def rvalueAccessesLocal (rv : Rvalue) (locIdx : Nat) : Bool :=
   match rv with
   | .use op => operandAccessesLocal op locIdx
-  | .deref src => src.index == locIdx
-  | .binaryOp _ lhs rhs =>
+  | .deref src | .proj0 src | .proj1 src => src.index == locIdx
+  | .binaryOp _ lhs rhs | .checkedBinaryOp _ lhs rhs =>
     operandAccessesLocal lhs locIdx || operandAccessesLocal rhs locIdx
 
 /-- Check whether `stmt : Stmt` reads from or writes to local `locIdx`.
@@ -3603,7 +3865,7 @@ noncomputable def computePlanAux :
           match activeJoin with
           | some (joinedLid, _, _) => .endLoan joinedLid .ret
           | none => .ret
-        | .goto target =>
+        | .goto target | .assertNotOverflow _ target =>
           .step (computePlanAux fuel body target.index 0 activeJoin)
         | .switchInt _ falseTarget trueTarget =>
           match activeJoin, body.blocks[falseTarget.index]?, body.blocks[trueTarget.index]? with
@@ -3940,7 +4202,7 @@ theorem translate_maxAssignBody_spec :
       | some mv1 =>
         rw [hloc1] at hExt
         cases mv1 with
-        | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
+        | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
         | refMutLoc loc1 =>
           dsimp at hExt
           cases hchk1 : (noAliasBefore init.locals loc1 1 &&
@@ -3955,7 +4217,7 @@ theorem translate_maxAssignBody_spec :
             | some naMv1 =>
               rw [hna1] at hExt
               cases naMv1 with
-              | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+              | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
               | usize x0' =>
                 dsimp at hExt
                 cases hloc2 : init.locals 2 with
@@ -3963,7 +4225,7 @@ theorem translate_maxAssignBody_spec :
                 | some mv2 =>
                   rw [hloc2] at hExt
                   cases mv2 with
-                  | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                  | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
                   | usize y0' =>
                     dsimp at hExt
                     injection hExt with hargs
@@ -4005,7 +4267,7 @@ theorem translate_updateMinBody_spec :
       | some mv1 =>
         rw [hloc1] at hExt
         cases mv1 with
-        | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
+        | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
         | refMutLoc loc1 =>
           dsimp at hExt
           cases hchk1 : (noAliasBefore init.locals loc1 1 &&
@@ -4020,7 +4282,7 @@ theorem translate_updateMinBody_spec :
             | some naMv1 =>
               rw [hna1] at hExt
               cases naMv1 with
-              | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+              | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
               | usize x0' =>
                 dsimp at hExt
                 cases hloc2 : init.locals 2 with
@@ -4028,7 +4290,7 @@ theorem translate_updateMinBody_spec :
                 | some mv2 =>
                   rw [hloc2] at hExt
                   cases mv2 with
-                  | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                  | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
                   | refMutLoc loc2 =>
                     dsimp at hExt
                     cases hchk2 : (noAliasBefore init.locals loc2 2 &&
@@ -4043,7 +4305,7 @@ theorem translate_updateMinBody_spec :
                       | some naMv2 =>
                         rw [hna2] at hExt
                         cases naMv2 with
-                        | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                        | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
                         | usize y0' =>
                           dsimp at hExt
                           cases hloc3 : init.locals 3 with
@@ -4051,7 +4313,7 @@ theorem translate_updateMinBody_spec :
                           | some mv3 =>
                             rw [hloc3] at hExt
                             cases mv3 with
-                            | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                            | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
                             | usize v0' =>
                               dsimp at hExt
                               injection hExt with hargs
@@ -4454,7 +4716,7 @@ theorem translate_clampAssignBody_spec :
       | some mv1 =>
         rw [hloc1] at hExt
         cases mv1 with
-        | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
+        | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
         | refMutLoc loc1 =>
           dsimp at hExt
           cases hchk1 : (noAliasBefore init.locals loc1 1 &&
@@ -4469,7 +4731,7 @@ theorem translate_clampAssignBody_spec :
             | some naMv1 =>
               rw [hna1] at hExt
               cases naMv1 with
-              | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+              | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
               | usize x0' =>
                 dsimp at hExt
                 cases hloc2 : init.locals 2 with
@@ -4477,7 +4739,7 @@ theorem translate_clampAssignBody_spec :
                 | some mv2 =>
                   rw [hloc2] at hExt
                   cases mv2 with
-                  | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                  | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
                   | usize lo' =>
                     dsimp at hExt
                     cases hloc3 : init.locals 3 with
@@ -4485,7 +4747,7 @@ theorem translate_clampAssignBody_spec :
                     | some mv3 =>
                       rw [hloc3] at hExt
                       cases mv3 with
-                      | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                      | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
                       | usize hi' =>
                         dsimp at hExt
                         injection hExt with hargs
@@ -4526,7 +4788,7 @@ theorem translate_isAlignedMaskBody_spec :
       | some mv1 =>
         rw [hloc1] at hExt
         cases mv1 with
-        | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+        | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
         | usize addr' =>
           dsimp at hExt
           cases hloc2 : init.locals 2 with
@@ -4534,7 +4796,7 @@ theorem translate_isAlignedMaskBody_spec :
           | some mv2 =>
             rw [hloc2] at hExt
             cases mv2 with
-            | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+            | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
             | usize mask' =>
               dsimp at hExt
               injection hExt with hargs
@@ -4850,7 +5112,7 @@ theorem translate_sharedMaxBody_spec :
       | some mv1 =>
         rw [hloc1] at hExt
         cases mv1 with
-        | usize _ | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+        | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
         | refSharedLoc loc1 =>
           dsimp at hExt
           cases hchk1 : (noMutAliasBefore init.locals loc1 1 &&
@@ -4864,7 +5126,7 @@ theorem translate_sharedMaxBody_spec :
             | some naMv1 =>
               rw [hna1] at hExt
               cases naMv1 with
-              | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+              | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
               | usize x0' =>
                 dsimp at hExt
                 cases hloc2 : init.locals 2 with
@@ -4872,7 +5134,7 @@ theorem translate_sharedMaxBody_spec :
                 | some mv2 =>
                   rw [hloc2] at hExt
                   cases mv2 with
-                  | usize _ | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+                  | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
                   | refSharedLoc loc2 =>
                     dsimp at hExt
                     cases hchk2 : (noMutAliasBefore init.locals loc2 2 &&
@@ -4886,7 +5148,7 @@ theorem translate_sharedMaxBody_spec :
                       | some naMv2 =>
                         rw [hna2] at hExt
                         cases naMv2 with
-                        | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                        | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
                         | usize y0' =>
                           dsimp at hExt
                           injection hExt with hargs
@@ -4927,7 +5189,7 @@ theorem translate_maxAssignSharedBody_spec :
       | some mv1 =>
         rw [hloc1] at hExt
         cases mv1 with
-        | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
+        | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
         | refMutLoc loc1 =>
           dsimp at hExt
           cases hchk1 : (noAliasBefore init.locals loc1 1 &&
@@ -4942,7 +5204,7 @@ theorem translate_maxAssignSharedBody_spec :
             | some naMv1 =>
               rw [hna1] at hExt
               cases naMv1 with
-              | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+              | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
               | usize x0' =>
                 dsimp at hExt
                 cases hloc2 : init.locals 2 with
@@ -4950,7 +5212,7 @@ theorem translate_maxAssignSharedBody_spec :
                 | some mv2 =>
                   rw [hloc2] at hExt
                   cases mv2 with
-                  | usize _ | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+                  | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
                   | refSharedLoc loc2 =>
                     dsimp at hExt
                     cases hchk2 : (noMutAliasBefore init.locals loc2 2 &&
@@ -4964,7 +5226,7 @@ theorem translate_maxAssignSharedBody_spec :
                       | some naMv2 =>
                         rw [hna2] at hExt
                         cases naMv2 with
-                        | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                        | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
                         | usize y0' =>
                           dsimp at hExt
                           injection hExt with hargs
@@ -5437,7 +5699,7 @@ theorem translate_sortPairBody_spec :
       | some mv1 =>
         rw [hloc1] at hExt
         cases mv1 with
-        | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
+        | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
         | refMutLoc loc1 =>
           dsimp at hExt
           cases hchk1 : (noAliasBefore init.locals loc1 1 &&
@@ -5452,7 +5714,7 @@ theorem translate_sortPairBody_spec :
             | some naMv1 =>
               rw [hna1] at hExt
               cases naMv1 with
-              | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+              | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
               | usize x0' =>
                 dsimp at hExt
                 cases hloc2 : init.locals 2 with
@@ -5460,7 +5722,7 @@ theorem translate_sortPairBody_spec :
                 | some mv2 =>
                   rw [hloc2] at hExt
                   cases mv2 with
-                  | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                  | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
                   | refMutLoc loc2 =>
                     dsimp at hExt
                     cases hchk2 : (noAliasBefore init.locals loc2 2 &&
@@ -5475,7 +5737,7 @@ theorem translate_sortPairBody_spec :
                       | some naMv2 =>
                         rw [hna2] at hExt
                         cases naMv2 with
-                        | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                        | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
                         | usize y0' =>
                           dsimp at hExt
                           injection hExt with hargs
@@ -5516,7 +5778,7 @@ theorem translate_twoPhaseReborrowBody_spec :
       | some mv1 =>
         rw [hloc1] at hExt
         cases mv1 with
-        | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
+        | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
         | refMutLoc loc1 =>
           dsimp at hExt
           cases hchk1 : (noAliasBefore init.locals loc1 1 &&
@@ -5531,7 +5793,7 @@ theorem translate_twoPhaseReborrowBody_spec :
             | some naMv1 =>
               rw [hna1] at hExt
               cases naMv1 with
-              | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+              | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
               | usize x0' =>
                 dsimp at hExt
                 cases hloc2 : init.locals 2 with
@@ -5539,7 +5801,7 @@ theorem translate_twoPhaseReborrowBody_spec :
                 | some mv2 =>
                   rw [hloc2] at hExt
                   cases mv2 with
-                  | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                  | usize _ | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
                   | refMutLoc loc2 =>
                     dsimp at hExt
                     cases hchk2 : (noAliasBefore init.locals loc2 2 &&
@@ -5554,7 +5816,7 @@ theorem translate_twoPhaseReborrowBody_spec :
                       | some naMv2 =>
                         rw [hna2] at hExt
                         cases naMv2 with
-                        | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                        | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
                         | usize y0' =>
                           dsimp at hExt
                           cases hloc3 : init.locals 3 with
@@ -5562,7 +5824,7 @@ theorem translate_twoPhaseReborrowBody_spec :
                           | some mv3 =>
                             rw [hloc3] at hExt
                             cases mv3 with
-                            | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                            | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
                             | usize a' =>
                               dsimp at hExt
                               cases hloc4 : init.locals 4 with
@@ -5570,7 +5832,7 @@ theorem translate_twoPhaseReborrowBody_spec :
                               | some mv4 =>
                                 rw [hloc4] at hExt
                                 cases mv4 with
-                                | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                                | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
                                 | usize b' =>
                                   dsimp at hExt
                                   injection hExt with hargs
@@ -5748,6 +6010,525 @@ theorem twoPhaseReborrowBadPlan_still_sound :
 theorem translatePure_twoPhaseReborrowBadPlan_fails (x0 y0 a b : Nat) :
     translatePure twoPhaseReborrowBadPlan twoPhaseReborrowBody
       [.refMut x0, .refMut y0, .usize a, .usize b] = .fail :=
+  rfl
+
+/-!
+## 13. Verification of `add_bounded` and `abs_diff` (Checked Arithmetic, Tuples `(usize, bool)`, Field Projections, and `assertNotOverflow`)
+-/
+
+/-- Exact `Runtime(PostCleanup)` MIR body emitted by `rustc --edition=2024 --emit=mir`
+    for:
+    ```rust
+    pub fn add_bounded(x: usize, y: usize) -> usize {
+        if x <= 1000 && y <= 1000 {
+            x + y
+        } else {
+            0
+        }
+    }
+    ```
+    - `_0: usize` (return place), `_1: usize` (`x`), `_2: usize` (`y`),
+      `_3: bool`, `_4: bool`, `_5: (usize, bool)`.
+    - `bb0`: `_3 = Le(copy _1, const 1000_usize); switchInt(move _3) -> [0: bb4, otherwise: bb1];`
+    - `bb1`: `_4 = Le(copy _2, const 1000_usize); switchInt(move _4) -> [0: bb4, otherwise: bb2];`
+    - `bb2`: `_5 = AddWithOverflow(copy _1, copy _2); assert(!move (_5.1: bool), ...) -> [success: bb3, unwind continue];`
+    - `bb3`: `_0 = move (_5.0: usize); goto -> bb5;`
+    - `bb4`: `_0 = const 0_usize; goto -> bb5;`
+    - `bb5`: `return;` -/
+def addBoundedBody : MirBody where
+  argTys := [.usize, .usize]
+  retTy := .usize
+  localCount := 6
+  blocks := [
+    { stmts := [
+        .assign ⟨3⟩ (.binaryOp .le (.copy ⟨1⟩) (.constVal (.usize 1000)))
+      ]
+      terminator := .switchInt (.move ⟨3⟩) ⟨4⟩ ⟨1⟩ },
+    { stmts := [
+        .assign ⟨4⟩ (.binaryOp .le (.copy ⟨2⟩) (.constVal (.usize 1000)))
+      ]
+      terminator := .switchInt (.move ⟨4⟩) ⟨4⟩ ⟨2⟩ },
+    { stmts := [
+        .assign ⟨5⟩ (.checkedBinaryOp .add (.copy ⟨1⟩) (.copy ⟨2⟩))
+      ]
+      terminator := .assertNotOverflow ⟨5⟩ ⟨3⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.proj0 ⟨5⟩)
+      ]
+      terminator := .goto ⟨5⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.use (.constVal (.usize 0)))
+      ]
+      terminator := .goto ⟨5⟩ },
+    { stmts := []
+      terminator := .return_ }
+  ]
+
+/-- Exact `Runtime(PostCleanup)` MIR body emitted by `rustc --edition=2024 --emit=mir`
+    for:
+    ```rust
+    pub fn abs_diff(x: usize, y: usize) -> usize {
+        if x >= y {
+            x - y
+        } else {
+            y - x
+        }
+    }
+    ```
+    - `_0: usize` (return place), `_1: usize` (`x`), `_2: usize` (`y`),
+      `_3: bool`, `_4: (usize, bool)`, `_5: (usize, bool)`.
+    - `bb0`: `_3 = Ge(copy _1, copy _2); switchInt(move _3) -> [0: bb3, otherwise: bb1];`
+    - `bb1`: `_4 = SubWithOverflow(copy _1, copy _2); assert(!move (_4.1: bool), ...) -> [success: bb2, unwind continue];`
+    - `bb2`: `_0 = move (_4.0: usize); goto -> bb5;`
+    - `bb3`: `_5 = SubWithOverflow(copy _2, copy _1); assert(!move (_5.1: bool), ...) -> [success: bb4, unwind continue];`
+    - `bb4`: `_0 = move (_5.0: usize); goto -> bb5;`
+    - `bb5`: `return;` -/
+def absDiffBody : MirBody where
+  argTys := [.usize, .usize]
+  retTy := .usize
+  localCount := 6
+  blocks := [
+    { stmts := [
+        .assign ⟨3⟩ (.binaryOp .ge (.copy ⟨1⟩) (.copy ⟨2⟩))
+      ]
+      terminator := .switchInt (.move ⟨3⟩) ⟨3⟩ ⟨1⟩ },
+    { stmts := [
+        .assign ⟨4⟩ (.checkedBinaryOp .sub (.copy ⟨1⟩) (.copy ⟨2⟩))
+      ]
+      terminator := .assertNotOverflow ⟨4⟩ ⟨2⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.proj0 ⟨4⟩)
+      ]
+      terminator := .goto ⟨5⟩ },
+    { stmts := [
+        .assign ⟨5⟩ (.checkedBinaryOp .sub (.copy ⟨2⟩) (.copy ⟨1⟩))
+      ]
+      terminator := .assertNotOverflow ⟨5⟩ ⟨4⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.proj0 ⟨5⟩)
+      ]
+      terminator := .goto ⟨5⟩ },
+    { stmts := []
+      terminator := .return_ }
+  ]
+
+/-- **First Futamura Projection for `add_bounded`**:
+    Evaluating `translatePure (computePlan addBoundedBody) addBoundedBody` on
+    universally quantified symbolic inputs `x0 y0 : Nat` reduces by kernel
+    `rfl` directly to the nested `zipAeneasRes` with the overflow check on the
+    guarded branch. -/
+theorem translatePure_addBounded_rfl (x0 y0 : Nat) :
+    translatePure (computePlan addBoundedBody) addBoundedBody [.usize x0, .usize y0] =
+      zipAeneasRes (decide (x0 ≤ 1000))
+        (zipAeneasRes (decide (y0 ≤ 1000))
+          (if decide (usizeMax < x0 + y0) then .fail else .ok (.usize (x0 + y0)))
+          (.ok (.usize 0)))
+        (.ok (.usize 0)) :=
+  rfl
+
+/-- Path-sensitive discharge of the overflow assertion in `add_bounded`:
+    whenever `x0 ≤ 1000` and `y0 ≤ 1000`, `x0 + y0 ≤ 2000 ≤ usizeMax`, so
+    `decide (usizeMax < x0 + y0) = false` and `translatePure` evaluates to
+    `.ok (.usize (if decide (x0 ≤ 1000) && decide (y0 ≤ 1000) then x0 + y0 else 0))`. -/
+theorem translatePure_addBounded_eq (x0 y0 : Nat) :
+    translatePure (computePlan addBoundedBody) addBoundedBody [.usize x0, .usize y0] =
+      .ok (.usize (if decide (x0 ≤ 1000) && decide (y0 ≤ 1000) then x0 + y0 else 0)) := by
+  rw [translatePure_addBounded_rfl]
+  rw [zipAeneasRes_eq_ite]
+  cases hx : decide (x0 ≤ 1000) with
+  | false => rfl
+  | true =>
+    rw [zipAeneasRes_eq_ite]
+    cases hy : decide (y0 ≤ 1000) with
+    | false => rfl
+    | true =>
+      have hxle : x0 ≤ 1000 := of_decide_eq_true hx
+      have hyle : y0 ≤ 1000 := of_decide_eq_true hy
+      have hsum : x0 + y0 ≤ 2000 := Nat.add_le_add hxle hyle
+      have h2000 : (2000 : Nat) ≤ usizeMax := by decide
+      have hle : x0 + y0 ≤ usizeMax := Nat.le_trans hsum h2000
+      have hov : decide (usizeMax < x0 + y0) = false :=
+        decide_eq_false (Nat.not_lt_of_ge hle)
+      rw [hov]
+      rfl
+
+/-- **First Futamura Projection for `abs_diff`**:
+    Evaluating `translatePure (computePlan absDiffBody) absDiffBody` on
+    universally quantified symbolic inputs `x0 y0 : Nat` reduces by kernel
+    `rfl` directly to `zipAeneasRes` over both guarded subtraction arms. -/
+theorem translatePure_absDiff_rfl (x0 y0 : Nat) :
+    translatePure (computePlan absDiffBody) absDiffBody [.usize x0, .usize y0] =
+      zipAeneasRes (decide (y0 ≤ x0))
+        (if decide (x0 < y0) then .fail else .ok (.usize (x0 - y0)))
+        (if decide (y0 < x0) then .fail else .ok (.usize (y0 - x0))) :=
+  rfl
+
+/-- Path-sensitive discharge of both underflow assertions in `abs_diff`:
+    - on the `y0 ≤ x0` branch, `decide (x0 < y0) = false`,
+    - on the `¬ (y0 ≤ x0)` branch, `x0 < y0` so `decide (y0 < x0) = false`. -/
+theorem translatePure_absDiff_eq (x0 y0 : Nat) :
+    translatePure (computePlan absDiffBody) absDiffBody [.usize x0, .usize y0] =
+      .ok (.usize (if decide (y0 ≤ x0) then x0 - y0 else y0 - x0)) := by
+  rw [translatePure_absDiff_rfl]
+  rw [zipAeneasRes_eq_ite]
+  cases h : decide (y0 ≤ x0) with
+  | true =>
+    have hle : y0 ≤ x0 := of_decide_eq_true h
+    have hov : decide (x0 < y0) = false := decide_eq_false (Nat.not_lt_of_ge hle)
+    rw [hov]
+    rfl
+  | false =>
+    have hgt : x0 < y0 := Nat.lt_of_not_le (of_decide_eq_false h)
+    have hov : decide (y0 < x0) = false := decide_eq_false (Nat.not_lt_of_gt hgt)
+    rw [hov]
+    rfl
+
+/-- Pure functional specification extracted from `addBoundedBody`. -/
+def pureAddBounded (x0 y0 : Nat) : Nat :=
+  if decide (x0 ≤ 1000) && decide (y0 ≤ 1000) then x0 + y0 else 0
+
+/-- Pure functional specification extracted from `absDiffBody`. -/
+def pureAbsDiff (x0 y0 : Nat) : Nat :=
+  if decide (y0 ≤ x0) then x0 - y0 else y0 - x0
+
+/-- Non-trivial property 1 (`add_bounded` global upper bound):
+    `pureAddBounded x0 y0 ≤ 2000` for all `x0, y0 : Nat`. -/
+theorem pureAddBounded_le_2000 (x0 y0 : Nat) :
+    pureAddBounded x0 y0 ≤ 2000 := by
+  unfold pureAddBounded
+  cases hx : decide (x0 ≤ 1000) with
+  | false => exact Nat.zero_le 2000
+  | true =>
+    cases hy : decide (y0 ≤ 1000) with
+    | false => exact Nat.zero_le 2000
+    | true =>
+      exact Nat.add_le_add (of_decide_eq_true hx) (of_decide_eq_true hy)
+
+/-- Non-trivial property 2 (`add_bounded` commutativity):
+    `pureAddBounded x0 y0 = pureAddBounded y0 x0`. -/
+theorem pureAddBounded_comm (x0 y0 : Nat) :
+    pureAddBounded x0 y0 = pureAddBounded y0 x0 := by
+  unfold pureAddBounded
+  cases decide (x0 ≤ 1000) <;> cases decide (y0 ≤ 1000) <;> dsimp
+  exact Nat.add_comm x0 y0
+
+/-- Non-trivial property 3 (`abs_diff` symmetry / commutativity):
+    `pureAbsDiff x0 y0 = pureAbsDiff y0 x0`. -/
+theorem pureAbsDiff_symm (x0 y0 : Nat) :
+    pureAbsDiff x0 y0 = pureAbsDiff y0 x0 := by
+  unfold pureAbsDiff
+  cases h1 : decide (y0 ≤ x0) with
+  | true =>
+    have hle1 : y0 ≤ x0 := of_decide_eq_true h1
+    cases h2 : decide (x0 ≤ y0) with
+    | true =>
+      have hle2 : x0 ≤ y0 := of_decide_eq_true h2
+      have heq : x0 = y0 := Nat.le_antisymm hle2 hle1
+      subst heq
+      rfl
+    | false => rfl
+  | false =>
+    have hgt : x0 < y0 := Nat.lt_of_not_le (of_decide_eq_false h1)
+    have h2 : decide (x0 ≤ y0) = true := decide_eq_true (Nat.le_of_lt hgt)
+    rw [h2]
+    rfl
+
+/-- Non-trivial property 4 (`abs_diff` self-annihilation):
+    `pureAbsDiff x0 x0 = 0`. -/
+theorem pureAbsDiff_self (x0 : Nat) :
+    pureAbsDiff x0 x0 = 0 := by
+  unfold pureAbsDiff
+  have h : decide (x0 ≤ x0) = true := decide_eq_true (Nat.le_refl x0)
+  rw [h]
+  exact Nat.sub_self x0
+
+/-- Non-trivial property 5 (`abs_diff` additive reconstruction of the maximum):
+    `min(x0, y0) + pureAbsDiff x0 y0 = max(x0, y0)`. -/
+theorem pureAbsDiff_add_min_eq_max (x0 y0 : Nat) :
+    (if decide (y0 ≤ x0) then y0 else x0) + pureAbsDiff x0 y0 =
+      (if decide (y0 ≤ x0) then x0 else y0) := by
+  unfold pureAbsDiff
+  cases h : decide (y0 ≤ x0) with
+  | true =>
+    dsimp
+    rw [Nat.add_comm]
+    exact Nat.sub_add_cancel (of_decide_eq_true h)
+  | false =>
+    dsimp
+    rw [Nat.add_comm]
+    exact Nat.sub_add_cancel (Nat.le_of_lt (Nat.lt_of_not_le (of_decide_eq_false h)))
+
+/-- Functional postcondition for `add_bounded` in `FuncLang`. -/
+def FuncPostAddBounded (init : MirState) (ret : MirVal) : Prop :=
+  ∀ x0 y0,
+    init.locals 1 = some (.usize x0) →
+    init.locals 2 = some (.usize y0) →
+    ret = .usize (if decide (x0 ≤ 1000) && decide (y0 ≤ 1000) then x0 + y0 else 0)
+
+/-- Functional postcondition for `abs_diff` in `FuncLang`. -/
+def FuncPostAbsDiff (init : MirState) (ret : MirVal) : Prop :=
+  ∀ x0 y0,
+    init.locals 1 = some (.usize x0) →
+    init.locals 2 = some (.usize y0) →
+    ret = .usize (if decide (y0 ≤ x0) then x0 - y0 else y0 - x0)
+
+/-- `translate addBoundedBody` satisfies `FuncLang.Spec FuncPostAddBounded`. -/
+theorem translate_addBoundedBody_spec :
+    FuncLang.sem (translate addBoundedBody) ≤ FuncLang.Spec FuncPostAddBounded := by
+  refine funcSem_le_spec (fun init => ?_)
+  unfold translate evalSym
+  have hSupp : allSupportedArgTys addBoundedBody.argTys = true := rfl
+  rw [hSupp]
+  dsimp
+  cases hExt : extractSymArgs addBoundedBody.argTys init with
+  | none =>
+    refine ⟨(by intro h; cases h), ?_⟩
+    intro ret hok
+    cases hok
+  | some args =>
+    unfold extractSymArgs at hExt
+    cases hblk : (init.block == 0 && init.stmtIdx == 0) with
+    | false => rw [hblk] at hExt; cases hExt
+    | true =>
+      rw [hblk] at hExt
+      dsimp [addBoundedBody, extractSymArgsAux] at hExt
+      cases hloc1 : init.locals 1 with
+      | none => rw [hloc1] at hExt; cases hExt
+      | some mv1 =>
+        rw [hloc1] at hExt
+        cases mv1 with
+        | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+        | usize x0' =>
+          dsimp at hExt
+          cases hloc2 : init.locals 2 with
+          | none => rw [hloc2] at hExt; cases hExt
+          | some mv2 =>
+            rw [hloc2] at hExt
+            cases mv2 with
+            | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+            | usize y0' =>
+              dsimp at hExt
+              injection hExt with hargs
+              subst hargs
+              dsimp
+              rw [translatePure_addBounded_eq x0' y0']
+              refine ⟨(by intro h; cases h), ?_⟩
+              intro ret hok x0 y0 hl1 hl2
+              injection hok with hret
+              rw [hloc1] at hl1; injection hl1 with h1_mv; injection h1_mv with h1; subst h1
+              rw [hloc2] at hl2; injection hl2 with h2_mv; injection h2_mv with h2; subst h2
+              exact hret.symm
+
+/-- `translate absDiffBody` satisfies `FuncLang.Spec FuncPostAbsDiff`. -/
+theorem translate_absDiffBody_spec :
+    FuncLang.sem (translate absDiffBody) ≤ FuncLang.Spec FuncPostAbsDiff := by
+  refine funcSem_le_spec (fun init => ?_)
+  unfold translate evalSym
+  have hSupp : allSupportedArgTys absDiffBody.argTys = true := rfl
+  rw [hSupp]
+  dsimp
+  cases hExt : extractSymArgs absDiffBody.argTys init with
+  | none =>
+    refine ⟨(by intro h; cases h), ?_⟩
+    intro ret hok
+    cases hok
+  | some args =>
+    unfold extractSymArgs at hExt
+    cases hblk : (init.block == 0 && init.stmtIdx == 0) with
+    | false => rw [hblk] at hExt; cases hExt
+    | true =>
+      rw [hblk] at hExt
+      dsimp [absDiffBody, extractSymArgsAux] at hExt
+      cases hloc1 : init.locals 1 with
+      | none => rw [hloc1] at hExt; cases hExt
+      | some mv1 =>
+        rw [hloc1] at hExt
+        cases mv1 with
+        | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+        | usize x0' =>
+          dsimp at hExt
+          cases hloc2 : init.locals 2 with
+          | none => rw [hloc2] at hExt; cases hExt
+          | some mv2 =>
+            rw [hloc2] at hExt
+            cases mv2 with
+            | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+            | usize y0' =>
+              dsimp at hExt
+              injection hExt with hargs
+              subst hargs
+              dsimp
+              rw [translatePure_absDiff_eq x0' y0']
+              refine ⟨(by intro h; cases h), ?_⟩
+              intro ret hok x0 y0 hl1 hl2
+              injection hok with hret
+              rw [hloc1] at hl1; injection hl1 with h1_mv; injection h1_mv with h1; subst h1
+              rw [hloc2] at hl2; injection hl2 with h2_mv; injection h2_mv with h2; subst h2
+              exact hret.symm
+
+/-- `π_func (FuncLang.Spec FuncPostAddBounded)` refines `EnsuresAddBounded`. -/
+theorem π_func_addBounded_le_ensures :
+    π_func (FuncLang.Spec FuncPostAddBounded) ≤ EnsuresAddBounded := by
+  refine Preorder.le_trans (π_func_spec_le FuncPostAddBounded) ?_
+  intro q _
+  refine ⟨True.intro, ?_⟩
+  intro out hpost ret x0 y0 hterm hl1 hl2
+  exact hpost ret hterm x0 y0 hl1 hl2
+
+/-- `π_func (FuncLang.Spec FuncPostAbsDiff)` refines `EnsuresAbsDiff`. -/
+theorem π_func_absDiff_le_ensures :
+    π_func (FuncLang.Spec FuncPostAbsDiff) ≤ EnsuresAbsDiff := by
+  refine Preorder.le_trans (π_func_spec_le FuncPostAbsDiff) ?_
+  intro q _
+  refine ⟨True.intro, ?_⟩
+  intro out hpost ret x0 y0 hterm hl1 hl2
+  exact hpost ret hterm x0 y0 hl1 hl2
+
+/-- `EnsuresAddBounded` refines baseline `MirLang.WellFormed`. -/
+theorem ensuresAddBounded_le_wellFormed :
+    EnsuresAddBounded ≤ MirLang.WellFormed :=
+  fun _ _ => ⟨True.intro, fun _ _ => True.intro⟩
+
+/-- `EnsuresAbsDiff` refines baseline `MirLang.WellFormed`. -/
+theorem ensuresAbsDiff_le_wellFormed :
+    EnsuresAbsDiff ≤ MirLang.WellFormed :=
+  fun _ _ => ⟨True.intro, fun _ _ => True.intro⟩
+
+/-- **Source MIR Correctness of `add_bounded`**:
+    `MirSem addBoundedBody ≤ EnsuresAddBounded`, transferred across `π_func` from
+    `translate_addBoundedBody_spec` via `translate_sound addBoundedBody`. -/
+theorem addBoundedBody_satisfies_ensures :
+    MirSem addBoundedBody ≤ EnsuresAddBounded :=
+  Preorder.le_trans
+    (Preorder.le_trans
+      (translate_sound addBoundedBody)
+      (monotone_π_func translate_addBoundedBody_spec))
+    π_func_addBounded_le_ensures
+
+/-- `addBoundedBody` satisfies baseline `MirLang.WellFormed`. -/
+theorem addBoundedBody_satisfies_wellFormed :
+    MirSem addBoundedBody ≤ MirLang.WellFormed :=
+  Preorder.le_trans addBoundedBody_satisfies_ensures ensuresAddBounded_le_wellFormed
+
+/-- **Source MIR Correctness of `abs_diff`**:
+    `MirSem absDiffBody ≤ EnsuresAbsDiff`, transferred across `π_func` from
+    `translate_absDiffBody_spec` via `translate_sound absDiffBody`. -/
+theorem absDiffBody_satisfies_ensures :
+    MirSem absDiffBody ≤ EnsuresAbsDiff :=
+  Preorder.le_trans
+    (Preorder.le_trans
+      (translate_sound absDiffBody)
+      (monotone_π_func translate_absDiffBody_spec))
+    π_func_absDiff_le_ensures
+
+/-- `absDiffBody` satisfies baseline `MirLang.WellFormed`. -/
+theorem absDiffBody_satisfies_wellFormed :
+    MirSem absDiffBody ≤ MirLang.WellFormed :=
+  Preorder.le_trans absDiffBody_satisfies_ensures ensuresAbsDiff_le_wellFormed
+
+/-- End-to-end `CrateTheorem` witness for `add_bounded` with `EnsuresAddBounded`. -/
+theorem prove_add_bounded_ensures_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := addBoundedBody
+        specs := [EnsuresAddBounded]
+      }]
+      tcb := [.rustcLowering fnName addBoundedBody]
+    } := by
+  refine ⟨(by intro h; cases h), ⟨⟨True.intro, True.intro⟩, ?_⟩, True.intro⟩
+  intro hAssumptions
+  have hVerFunc :
+      RustcCompiler.Verified addBoundedBody (π_func (FuncLang.Spec FuncPostAddBounded)) :=
+    verify_through_passes
+      translate_addBoundedBody_spec
+      (translate_sound addBoundedBody)
+      monotone_π_func
+      hAssumptions.1
+  have hVerEnsures : RustcCompiler.Verified addBoundedBody EnsuresAddBounded :=
+    Compiler.Verified.mono hVerFunc π_func_addBounded_le_ensures hAssumptions.1.1
+  exact Compiler.Verified.with_wellFormedOn
+    hVerEnsures
+    ensuresAddBounded_le_wellFormed
+    hAssumptions.1.1
+
+/-- End-to-end `CrateTheorem` witness for `add_bounded` with baseline `WellFormed`. -/
+theorem prove_add_bounded_wf_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := addBoundedBody
+        specs := []
+      }]
+      tcb := [.rustcLowering fnName addBoundedBody]
+    } :=
+  verify_single_fn_wf_crate fnName addBoundedBody addBoundedBody_satisfies_wellFormed
+
+/-- End-to-end `CrateTheorem` witness for `abs_diff` with `EnsuresAbsDiff`. -/
+theorem prove_abs_diff_ensures_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := absDiffBody
+        specs := [EnsuresAbsDiff]
+      }]
+      tcb := [.rustcLowering fnName absDiffBody]
+    } := by
+  refine ⟨(by intro h; cases h), ⟨⟨True.intro, True.intro⟩, ?_⟩, True.intro⟩
+  intro hAssumptions
+  have hVerFunc :
+      RustcCompiler.Verified absDiffBody (π_func (FuncLang.Spec FuncPostAbsDiff)) :=
+    verify_through_passes
+      translate_absDiffBody_spec
+      (translate_sound absDiffBody)
+      monotone_π_func
+      hAssumptions.1
+  have hVerEnsures : RustcCompiler.Verified absDiffBody EnsuresAbsDiff :=
+    Compiler.Verified.mono hVerFunc π_func_absDiff_le_ensures hAssumptions.1.1
+  exact Compiler.Verified.with_wellFormedOn
+    hVerEnsures
+    ensuresAbsDiff_le_wellFormed
+    hAssumptions.1.1
+
+/-- End-to-end `CrateTheorem` witness for `abs_diff` with baseline `WellFormed`. -/
+theorem prove_abs_diff_wf_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := absDiffBody
+        specs := []
+      }]
+      tcb := [.rustcLowering fnName absDiffBody]
+    } :=
+  verify_single_fn_wf_crate fnName absDiffBody absDiffBody_satisfies_wellFormed
+
+/-- **Overflow-Rejection Adequacy Canary (`unguardedSubBody`)**:
+    Exact MIR for an unguarded subtraction `pub fn unguarded_sub(x: usize, y: usize) -> usize { x - y }`.
+    - When `x0 < y0` (e.g., `x0 = 0, y0 = 1`), `SubWithOverflow` sets the
+      overflow bit `.1 = true`, so `Terminator.assertNotOverflow` fails closed
+      with `.fail` (`translatePure_unguardedSub_underflow_fails`), which is
+      rejected by `FuncLang.WellFormed`. -/
+def unguardedSubBody : MirBody where
+  argTys := [.usize, .usize]
+  retTy := .usize
+  localCount := 4
+  blocks := [
+    { stmts := [
+        .assign ⟨3⟩ (.checkedBinaryOp .sub (.copy ⟨1⟩) (.copy ⟨2⟩))
+      ]
+      terminator := .assertNotOverflow ⟨3⟩ ⟨1⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.proj0 ⟨3⟩)
+      ]
+      terminator := .return_ }
+  ]
+
+theorem translatePure_unguardedSub_underflow_fails :
+    translatePure (computePlan unguardedSubBody) unguardedSubBody [.usize 0, .usize 1] = .fail :=
+  rfl
+
+theorem translatePure_unguardedSub_safe :
+    translatePure (computePlan unguardedSubBody) unguardedSubBody [.usize 10, .usize 3] = .ok (.usize 7) :=
   rfl
 
 end Anneal

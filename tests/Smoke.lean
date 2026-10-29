@@ -389,6 +389,104 @@ def twoPhaseReborrowCrate : Trusted.Crate where
 theorem verify_two_phase_reborrow_crate : Trusted.CrateTheorem twoPhaseReborrowCrate :=
   Anneal.prove_two_phase_reborrow_ensures_crate "two_phase_reborrow"
 
+/-- Captured `MirBody` for
+    `pub fn add_bounded(x: usize, y: usize) -> usize { if x <= 1000 && y <= 1000 { x + y } else { 0 } }`
+    defined using only `Trusted.*` constructors (`ci.type` origin-clean). -/
+def addBoundedBody : Trusted.MirBody where
+  argTys := [.usize, .usize]
+  retTy := .usize
+  localCount := 6
+  blocks := [
+    { stmts := [
+        .assign ⟨3⟩ (.binaryOp .le (.copy ⟨1⟩) (.constVal (.usize 1000)))
+      ]
+      terminator := .switchInt (.move ⟨3⟩) ⟨4⟩ ⟨1⟩ },
+    { stmts := [
+        .assign ⟨4⟩ (.binaryOp .le (.copy ⟨2⟩) (.constVal (.usize 1000)))
+      ]
+      terminator := .switchInt (.move ⟨4⟩) ⟨4⟩ ⟨2⟩ },
+    { stmts := [
+        .assign ⟨5⟩ (.checkedBinaryOp .add (.copy ⟨1⟩) (.copy ⟨2⟩))
+      ]
+      terminator := .assertNotOverflow ⟨5⟩ ⟨3⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.proj0 ⟨5⟩)
+      ]
+      terminator := .goto ⟨5⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.use (.constVal (.usize 0)))
+      ]
+      terminator := .goto ⟨5⟩ },
+    { stmts := []
+      terminator := .return_ }
+  ]
+
+/-- Captured `Trusted.Crate` for `add_bounded` with postcondition
+    `Trusted.EnsuresAddBounded`. -/
+def addBoundedCrate : Trusted.Crate where
+  functions := [
+    { name := "add_bounded"
+      prog := addBoundedBody
+      specs := [Trusted.EnsuresAddBounded] }
+  ]
+  tcb := [Trusted.TCBItem.rustcLowering "add_bounded" addBoundedBody]
+
+/-- Top-level `Trusted.CrateTheorem` for `addBoundedCrate`, whose statement
+    (`ci.type`) references only `Trusted` and locked foundation constants while
+    its proof term (`ci.value?`) discharges the obligation via the plan-guided
+    functional translation (`Anneal.prove_add_bounded_ensures_crate`). -/
+theorem verify_add_bounded_crate : Trusted.CrateTheorem addBoundedCrate :=
+  Anneal.prove_add_bounded_ensures_crate "add_bounded"
+
+/-- Captured `MirBody` for
+    `pub fn abs_diff(x: usize, y: usize) -> usize { if x >= y { x - y } else { y - x } }`
+    defined using only `Trusted.*` constructors (`ci.type` origin-clean). -/
+def absDiffBody : Trusted.MirBody where
+  argTys := [.usize, .usize]
+  retTy := .usize
+  localCount := 6
+  blocks := [
+    { stmts := [
+        .assign ⟨3⟩ (.binaryOp .ge (.copy ⟨1⟩) (.copy ⟨2⟩))
+      ]
+      terminator := .switchInt (.move ⟨3⟩) ⟨3⟩ ⟨1⟩ },
+    { stmts := [
+        .assign ⟨4⟩ (.checkedBinaryOp .sub (.copy ⟨1⟩) (.copy ⟨2⟩))
+      ]
+      terminator := .assertNotOverflow ⟨4⟩ ⟨2⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.proj0 ⟨4⟩)
+      ]
+      terminator := .goto ⟨5⟩ },
+    { stmts := [
+        .assign ⟨5⟩ (.checkedBinaryOp .sub (.copy ⟨2⟩) (.copy ⟨1⟩))
+      ]
+      terminator := .assertNotOverflow ⟨5⟩ ⟨4⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.proj0 ⟨5⟩)
+      ]
+      terminator := .goto ⟨5⟩ },
+    { stmts := []
+      terminator := .return_ }
+  ]
+
+/-- Captured `Trusted.Crate` for `abs_diff` with postcondition
+    `Trusted.EnsuresAbsDiff`. -/
+def absDiffCrate : Trusted.Crate where
+  functions := [
+    { name := "abs_diff"
+      prog := absDiffBody
+      specs := [Trusted.EnsuresAbsDiff] }
+  ]
+  tcb := [Trusted.TCBItem.rustcLowering "abs_diff" absDiffBody]
+
+/-- Top-level `Trusted.CrateTheorem` for `absDiffCrate`, whose statement
+    (`ci.type`) references only `Trusted` and locked foundation constants while
+    its proof term (`ci.value?`) discharges the obligation via the plan-guided
+    functional translation (`Anneal.prove_abs_diff_ensures_crate`). -/
+theorem verify_abs_diff_crate : Trusted.CrateTheorem absDiffCrate :=
+  Anneal.prove_abs_diff_ensures_crate "abs_diff"
+
 /-!
 ## Non-Step-Based Axiomatic Event-Graph Toy Language
 

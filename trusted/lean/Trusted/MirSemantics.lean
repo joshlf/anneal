@@ -63,6 +63,7 @@ def MirVal.hasTy (m : MemState) (v : MirVal) (ty : MirTy) : Prop :=
   | .usize _, .usize => True
   | .bool _, .bool => True
   | .unit, .unit => True
+  | .tupleUsizeBool _ _, .tupleUsizeBool => True
   | .atomicLoc loc, .refAtomicUsize => m.visibleAtomicMsgs loc ≠ []
   | .refSharedLoc loc, .refSharedUsize =>
     ∃ n, m.naVal loc = some (.usize n) ∧
@@ -196,6 +197,26 @@ def evalBinOp (op : BinOp) (v1 v2 : MirVal) : Option MirVal :=
     | .bitXor => some (.usize (Nat.xor n1 n2))
   | _, _ => none
 
+/-- Maximum representable 64-bit `usize` value (`usize::MAX = 2^64 - 1`).
+
+    Source: https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/numeric.md#L37-L38 -/
+def usizeMax : Nat := 18446744073709551615
+
+/-- Evaluate a checked binary arithmetic operator (`AddWithOverflow`,
+    `SubWithOverflow`, `MulWithOverflow`) on two `MirVal.usize` values,
+    returning `some (.tupleUsizeBool val overflow)` on `.usize` inputs and
+    `none` on type mismatch.
+
+    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L1409-L1443 -/
+def evalCheckedBinOp (op : CheckedBinOp) (v1 v2 : MirVal) : Option MirVal :=
+  match v1, v2 with
+  | .usize n1, .usize n2 =>
+    match op with
+    | .add => some (.tupleUsizeBool (n1 + n2) (decide (usizeMax < n1 + n2)))
+    | .sub => some (.tupleUsizeBool (n1 - n2) (decide (n1 < n2)))
+    | .mul => some (.tupleUsizeBool (n1 * n2) (decide (usizeMax < n1 * n2)))
+  | _, _ => none
+
 /-- Single-step operational evaluation of a MIR statement.
 
     Models `Operand::Copy`, `Operand::Move`, `Rvalue::Use`, dereference reads
@@ -242,6 +263,36 @@ def evalMirStmt (s : MirState) (stmt : Stmt) : StepResult MirState Unit MirVal :
             stmtIdx := s.stmtIdx + 1
           }
         | none => .failed .ub
+  | .assign dst (.checkedBinaryOp op lhs rhs) =>
+    match evalOperand s.locals lhs with
+    | none => .failed .ub
+    | some (v1, locals1) =>
+      match evalOperand locals1 rhs with
+      | none => .failed .ub
+      | some (v2, locals2) =>
+        match evalCheckedBinOp op v1 v2 with
+        | some res =>
+          .step () { s with
+            locals := updateLocal locals2 dst.index (some res)
+            stmtIdx := s.stmtIdx + 1
+          }
+        | none => .failed .ub
+  | .assign dst (.proj0 src) =>
+    match s.locals src.index with
+    | some (.tupleUsizeBool val _) =>
+      .step () { s with
+        locals := updateLocal s.locals dst.index (some (.usize val))
+        stmtIdx := s.stmtIdx + 1
+      }
+    | _ => .failed .ub
+  | .assign dst (.proj1 src) =>
+    match s.locals src.index with
+    | some (.tupleUsizeBool _ ov) =>
+      .step () { s with
+        locals := updateLocal s.locals dst.index (some (.bool ov))
+        stmtIdx := s.stmtIdx + 1
+      }
+    | _ => .failed .ub
   | .assignDeref dst op =>
     match evalOperand s.locals op with
     | none => .failed .ub
@@ -356,6 +407,16 @@ def evalMirTerminator (s : MirState) (term : Terminator) :
         block := trueTarget.index
         stmtIdx := 0
       }
+    | _ => .failed .ub
+  | .assertNotOverflow tupleLocal target =>
+    match s.locals tupleLocal.index with
+    | some (.tupleUsizeBool _ false) =>
+      .step () { s with
+        block := target.index
+        stmtIdx := 0
+      }
+    | some (.tupleUsizeBool _ true) =>
+      .failed .contractViolation
     | _ => .failed .ub
 
 /-- Single-step transition function of a `MirBody`: executes the statement at
@@ -556,6 +617,36 @@ def EnsuresTwoPhaseReborrow : MirLang.Behavior :=
         (if decide ((if decide (x0 ≤ y0) then a else x0) ≤ (if decide (x0 ≤ y0) then y0 else a))
          then (if decide (x0 ≤ y0) then a else x0)
          else b))
+
+/-- Postcondition specification for
+    `pub fn add_bounded(x: usize, y: usize) -> usize`:
+    - `defined := True`: every finite execution prefix is free of UB, stuck
+      states, and overflow assertion failures (`MirLang.WellFormed`), and
+    - `val`: for any initial state where `_1 = some (.usize x0)` and
+      `_2 = some (.usize y0)`, any normal return value `ret` equals
+      `.usize (if decide (x0 ≤ 1000) && decide (y0 ≤ 1000) then x0 + y0 else 0)`. -/
+def EnsuresAddBounded : MirLang.Behavior :=
+  MirLang.Spec (fun q out =>
+    ∀ ret x0 y0,
+      out.outcome = .terminated (.normal ret) →
+      q.init.locals 1 = some (.usize x0) →
+      q.init.locals 2 = some (.usize y0) →
+      ret = .usize (if decide (x0 ≤ 1000) && decide (y0 ≤ 1000) then x0 + y0 else 0))
+
+/-- Postcondition specification for
+    `pub fn abs_diff(x: usize, y: usize) -> usize`:
+    - `defined := True`: every finite execution prefix is free of UB, stuck
+      states, and underflow assertion failures (`MirLang.WellFormed`), and
+    - `val`: for any initial state where `_1 = some (.usize x0)` and
+      `_2 = some (.usize y0)`, any normal return value `ret` equals
+      `.usize (if decide (y0 ≤ x0) then x0 - y0 else y0 - x0)`. -/
+def EnsuresAbsDiff : MirLang.Behavior :=
+  MirLang.Spec (fun q out =>
+    ∀ ret x0 y0,
+      out.outcome = .terminated (.normal ret) →
+      q.init.locals 1 = some (.usize x0) →
+      q.init.locals 2 = some (.usize y0) →
+      ret = .usize (if decide (y0 ≤ x0) then x0 - y0 else y0 - x0))
 
 /-- Abstract type of compiled target artifacts produced by `rustc`. -/
 structure TargetArtifact where
