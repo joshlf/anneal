@@ -30,20 +30,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check-todo:
+  static-checks:
     runs-on: ubuntu-latest
-    name: Check for todo comments
+    name: Static and workflow checks
     steps:
-      - name: Install ripgrep
+      - name: Install ripgrep and yq
         run: |
-         sudo apt-get update
-         sudo apt-get install ripgrep
+          sudo apt-get update
+          sudo apt-get install -y ripgrep jq
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
       - name: Run todo check
         run: ./ci/check_todo.sh
+      - name: Check job dependencies
+        run: ./ci/check_job_dependencies.sh
+      - name: Check GitHub Actions workflows
+        run: ./ci/check_actions.sh
 
   # Used to signal to branch protections that all other jobs have succeeded.
   all-jobs-succeed:
@@ -55,7 +61,7 @@ jobs:
       # success in branch protection, so this aggregation must fail closed.
       if: ${{ always() }}
       runs-on: ubuntu-latest
-      needs: [check-todo]
+      needs: [static-checks]
       steps:
         - name: Reject workflow cancellation
           if: ${{ cancelled() }}
