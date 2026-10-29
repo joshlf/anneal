@@ -75,6 +75,9 @@ def MirVal.hasTy (m : MemState) (v : MirVal) (ty : MirTy) : Prop :=
   | .bool _, .bool => True
   | .unit, .unit => True
   | .atomicLoc loc, .refAtomicUsize => m.visibleAtomicMsgs loc ≠ []
+  | .refSharedLoc loc, .refSharedUsize =>
+    ∃ n, m.naVal loc = some (.usize n) ∧
+      m.naWriteTs loc ≤ m.curView loc
   | .refMutLoc loc, .refMutUsize =>
     ∃ n, m.naVal loc = some (.usize n) ∧
       m.naWriteTs loc ≤ m.curView loc ∧
@@ -83,9 +86,11 @@ def MirVal.hasTy (m : MemState) (v : MirVal) (ty : MirTy) : Prop :=
   | _, _ => False
 
 /-- Parameter validity at argument index `k` (`1 ..= argTys.length`), combining
-    value validity (`MirVal.hasTy`) with Rust's mutable-reference exclusivity
-    requirement (`r[undefined.alias]`: a `&mut usize` parameter cannot alias
-    any preceding `&mut usize` parameter):
+    value validity (`MirVal.hasTy`) with Rust's reference aliasing rules
+    (`r[undefined.alias]`: a `&mut usize` parameter cannot alias any preceding
+    `&mut usize` or `&usize` parameter, and a `&usize` parameter cannot alias
+    any preceding `&mut usize` parameter, while `&usize` parameters may alias
+    each other):
 
     > "* Breaking the [pointer aliasing rules]. `Box<T>`, `&mut T`, and `&T`
     > follow LLVM's scoped `noalias` model, except if the `&T` contains an
@@ -100,6 +105,10 @@ def argValidAt (m : MemState) (locals : Nat → Option MirVal) (k : Nat)
   | .refMutUsize =>
     v.hasTy m .refMutUsize ∧
       ∀ loc i, v = .refMutLoc loc → 1 ≤ i → i < k →
+        locals i ≠ some (.refMutLoc loc) ∧ locals i ≠ some (.refSharedLoc loc)
+  | .refSharedUsize =>
+    v.hasTy m .refSharedUsize ∧
+      ∀ loc i, v = .refSharedLoc loc → 1 ≤ i → i < k →
         locals i ≠ some (.refMutLoc loc)
   | _ => v.hasTy m ty
 
@@ -226,7 +235,7 @@ def evalMirStmt (s : MirState) (stmt : Stmt) : StepResult MirState Unit MirVal :
     | none => .failed .ub
   | .assign dst (.deref src) =>
     match s.locals src.index with
-    | some (.refMutLoc loc) =>
+    | some (.refMutLoc loc) | some (.refSharedLoc loc) =>
       match s.mem.readNA loc with
       | some (v, mem') =>
         .step () { s with
@@ -498,6 +507,45 @@ def EnsuresIsAlignedMask : MirLang.Behavior :=
       q.init.locals 1 = some (.usize addr) →
       q.init.locals 2 = some (.usize mask) →
       ret = .bool (decide (Nat.land addr mask = 0)))
+
+/-- Postcondition specification for
+    `pub fn shared_max(x: &usize, y: &usize) -> usize`:
+    - `defined := True`: every finite execution prefix is free of UB and stuck
+      states (`MirLang.WellFormed`), including when `x` and `y` alias the same
+      memory location (`locX = locY`), and
+    - `val`: for any initial state where `_1` points to shared location `locX`
+      holding `.usize x0` and `_2` points to shared location `locY` holding
+      `.usize y0`, any normal return value `ret` equals
+      `.usize (if decide (x0 < y0) then y0 else x0)`. -/
+@[candidate mir_semantics]
+def EnsuresSharedMax : MirLang.Behavior :=
+  MirLang.Spec (fun q out =>
+    ∀ ret locX locY x0 y0,
+      out.outcome = .terminated (.normal ret) →
+      q.init.locals 1 = some (.refSharedLoc locX) →
+      q.init.mem.naVal locX = some (.usize x0) →
+      q.init.locals 2 = some (.refSharedLoc locY) →
+      q.init.mem.naVal locY = some (.usize y0) →
+      ret = .usize (if decide (x0 < y0) then y0 else x0))
+
+/-- Postcondition specification for
+    `pub fn max_assign_shared(dst: &mut usize, src: &usize) -> usize`:
+    - `defined := True`: every finite execution prefix is free of UB and stuck
+      states (`MirLang.WellFormed`), and
+    - `val`: for any initial state where `_1` points to mutable location `locDst`
+      holding `.usize d0` and `_2` points to shared location `locSrc` holding
+      `.usize s0`, any normal return value `ret` equals
+      `.usize (if decide (d0 < s0) then s0 else d0)`. -/
+@[candidate mir_semantics]
+def EnsuresMaxAssignShared : MirLang.Behavior :=
+  MirLang.Spec (fun q out =>
+    ∀ ret locDst locSrc d0 s0,
+      out.outcome = .terminated (.normal ret) →
+      q.init.locals 1 = some (.refMutLoc locDst) →
+      q.init.mem.naVal locDst = some (.usize d0) →
+      q.init.locals 2 = some (.refSharedLoc locSrc) →
+      q.init.mem.naVal locSrc = some (.usize s0) →
+      ret = .usize (if decide (d0 < s0) then s0 else d0))
 
 /-- Abstract type of compiled target artifacts produced by `rustc`. -/
 @[candidate mir_semantics]
