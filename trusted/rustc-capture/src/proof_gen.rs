@@ -299,6 +299,33 @@ pub fn render_proof_lean(functions: &[CapturedFunction]) -> String {
                 ),
             }
         }
+        [func]
+            if func.arg_tys == [CapturedTy::Usize]
+                && func.ret_ty == CapturedTy::Usize
+                && (func.spec == CapturedSpec::EnsuresDoubleBounded
+                    || func.name == "double_bounded") =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresDoubleBounded => format!(
+                    "Anneal.prove_double_bounded_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_double_bounded_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_double_bounded_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [fn1, fn2] => {
+            format!(
+                "Anneal.prove_add_and_double_bounded_crate \"{}\" \"{}\"",
+                fn1.name, fn2.name
+            )
+        }
         [func] => {
             let uses_move = func.blocks.first().is_some_and(|b| {
                 b.stmts.iter().any(|s| {

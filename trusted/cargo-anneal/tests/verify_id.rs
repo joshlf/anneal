@@ -907,3 +907,52 @@ fn rejects_incorrect_count_up_implementation() {
         "expected Lean audit rejection for wrong count_up body, got: {err}"
     );
 }
+
+#[test]
+fn verifies_interprocedural_double_bounded_end_to_end() {
+    let crate_dir = TempCrateDir::new(
+        "valid-double-bounded",
+        "// anneal:spec ensures(double_bounded(x))\n\
+         pub fn add_bounded(x: usize, y: usize) -> usize {\n    \
+             if x <= 1000 && y <= 1000 {\n        \
+                 x + y\n    \
+             } else {\n        \
+                 0\n    \
+             }\n\
+         }\n\n\
+         pub fn double_bounded(x: usize) -> usize {\n    \
+             add_bounded(x, x)\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 2);
+    assert_eq!(output.functions[0].name, "add_bounded");
+    assert_eq!(output.functions[1].name, "double_bounded");
+}
+
+#[test]
+fn rejects_incorrect_double_bounded_implementation() {
+    let crate_dir = TempCrateDir::new(
+        "wrong-double-bounded",
+        "// anneal:spec ensures(double_bounded(x))\n\
+         pub fn add_bounded(x: usize, y: usize) -> usize {\n    \
+             if x <= 1000 && y <= 1000 {\n        \
+                 x + y\n    \
+             } else {\n        \
+                 0\n    \
+             }\n\
+         }\n\n\
+         pub fn double_bounded(x: usize) -> usize {\n    \
+             add_bounded(x, 0)\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean audit rejection for wrong double_bounded body, got: {err}"
+    );
+}
