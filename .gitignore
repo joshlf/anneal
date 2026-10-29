@@ -1,6 +1,7 @@
 /target/
 **/target/
 /result*
+**/__pycache__/
 **/.lake/
 **/*.olean
 **/*.olean.server
