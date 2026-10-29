@@ -184,7 +184,7 @@ fn rejects_tampered_mir_lean_after_capture() {
          }\n",
     );
 
-    let _output = capture_crate_with_options(
+    let output = capture_crate_with_options(
         &crate_dir.path,
         true,
         &VerifyOptions::default(),
@@ -815,3 +815,145 @@ fn rejects_incorrect_count_up_implementation() {
         "expected Lean audit rejection for wrong count_up body, got: {err}"
     );
 }
+
+#[test]
+fn verifies_interprocedural_double_bounded_end_to_end() {
+    let crate_dir = TempCrateDir::new(
+        "valid-double-bounded",
+        "// anneal:spec ensures(double_bounded(x))\n\
+         pub fn add_bounded(x: usize, y: usize) -> usize {\n    \
+             if x <= 1000 && y <= 1000 {\n        \
+                 x + y\n    \
+             } else {\n        \
+                 0\n    \
+             }\n\
+         }\n\n\
+         pub fn double_bounded(x: usize) -> usize {\n    \
+             add_bounded(x, x)\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 2);
+    assert_eq!(output.functions[0].name, "add_bounded");
+    assert_eq!(output.functions[1].name, "double_bounded");
+}
+
+#[test]
+fn rejects_incorrect_double_bounded_implementation() {
+    let crate_dir = TempCrateDir::new(
+        "wrong-double-bounded",
+        "// anneal:spec ensures(double_bounded(x))\n\
+         pub fn add_bounded(x: usize, y: usize) -> usize {\n    \
+             if x <= 1000 && y <= 1000 {\n        \
+                 x + y\n    \
+             } else {\n        \
+                 0\n    \
+             }\n\
+         }\n\n\
+         pub fn double_bounded(x: usize) -> usize {\n    \
+             add_bounded(x, 0)\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean audit rejection for wrong double_bounded body, got: {err}"
+    );
+}
+
+#[test]
+fn rejects_candidate_features_by_default_without_opt_in() {
+    let crate_dir = TempCrateDir::new_without_policy(
+        "default-vetted-only",
+        "// anneal:spec ensures(ret == x)\n\
+         pub fn id(x: usize) -> usize {\n    \
+             x\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    match err {
+        VerifyError::Capture(CaptureError::CandidateFeatureNotEnabled {
+            feature,
+            ..
+        }) => {
+            assert_eq!(feature, "rustc_capture");
+        }
+        other => panic!(
+            "expected pre-execution CandidateFeatureNotEnabled for rustc_capture, got: {other}"
+        ),
+    }
+    assert!(
+        !crate_dir.path.join(".anneal/Mir.lean").exists(),
+        "rustc should not execute when candidate capture feature is not enabled"
+    );
+}
+
+#[test]
+fn rejects_candidate_features_on_stable_release_channel() {
+    let crate_dir = TempCrateDir::new(
+        "stable-channel-rejects-candidates",
+        "// anneal:spec ensures(ret == x)\n\
+         pub fn id(x: usize) -> usize {\n    \
+             x\n\
+         }\n",
+    );
+
+    let options = VerifyOptions {
+        release_channel: Some(ReleaseChannel::Stable),
+        ..VerifyOptions::default()
+    };
+    let err = verify_crate(&crate_dir.path, &options).unwrap_err();
+    match err {
+        VerifyError::Capture(CaptureError::CandidateFeatureNotEnabled {
+            feature,
+            reason,
+        }) => {
+            assert_eq!(feature, "rustc_capture");
+            assert!(reason.contains("stable release channel"));
+        }
+        other => panic!(
+            "expected CandidateFeatureNotEnabled on stable channel, got: {other}"
+        ),
+    }
+}
+
+#[test]
+fn verifies_via_cli_flag_and_emits_candidate_tcb_audit_section() {
+    let crate_dir = TempCrateDir::new_without_policy(
+        "cli-allow-candidates",
+        "// anneal:spec ensures(ret == x)\n\
+         pub fn id(x: usize) -> usize {\n    \
+             x\n\
+         }\n",
+    );
+
+    let bin = env!("CARGO_BIN_EXE_cargo-anneal");
+    let output = Command::new(bin)
+        .arg("anneal")
+        .arg("verify")
+        .arg("--allow-candidate-features")
+        .arg("*")
+        .arg(&crate_dir.path)
+        .output()
+        .expect("invoke cargo-anneal binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "expected `cargo-anneal anneal verify --allow-candidate-features '*'` to succeed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Candidate-Trusted TCB (Unvetted / Alpha):"),
+        "expected Candidate-Trusted TCB audit section in stdout, got: {stdout}"
+    );
+    assert!(stdout.contains("rustc_capture"));
+    assert!(stdout.contains("mir_semantics"));
+}
+
