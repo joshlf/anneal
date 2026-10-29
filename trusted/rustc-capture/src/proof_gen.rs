@@ -36,8 +36,74 @@
 //! that crate (for example via `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`,
 //! no `build.rs`, no proc-macros, and no FFI or effectful dependencies).
 
+use crate::{
+    CapturedFunction, CapturedOperand, CapturedSpec, CapturedStmt,
+};
 
-/// Stub proof generator before `verify` subcommand is introduced.
-pub fn proof_gen_ready() -> bool {
-    true
+/// Render a candidate `.anneal/Proof.lean` proof script for the captured
+/// functions.
+///
+/// Soundness does not rely on this generator: the trusted boundary auditor
+/// checks that `Proof.verify_crate` has the exact kernel type
+/// `Trusted.CrateTheorem Mir.crate`, uses zero custom axioms, and replays in
+/// Lean's kernel. If the captured MIR does not unify with the lemma's expected
+/// body or specification, Lean rejects `rfl` and verification fails closed.
+pub fn render_proof_lean(functions: &[CapturedFunction]) -> String {
+    let proof_term = match functions {
+        [func] => {
+            let uses_move = func.blocks.first().is_some_and(|b| {
+                b.stmts.iter().any(|s| {
+                    matches!(
+                        s,
+                        CapturedStmt::AssignUse {
+                            dst: 0,
+                            op: CapturedOperand::Move(1),
+                        }
+                    )
+                })
+            });
+            match (uses_move, func.spec) {
+                (false, CapturedSpec::EnsuresEqArg(1)) => {
+                    format!(
+                        "Anneal.prove_id_copy_ensures_crate \"{}\"",
+                        func.name
+                    )
+                }
+                (false, CapturedSpec::WellFormed) => {
+                    format!(
+                        "Anneal.prove_id_copy_wf_crate \"{}\"",
+                        func.name
+                    )
+                }
+                (true, CapturedSpec::EnsuresEqArg(1)) => {
+                    format!(
+                        "Anneal.prove_id_move_ensures_crate \"{}\"",
+                        func.name
+                    )
+                }
+                (true, CapturedSpec::WellFormed) => {
+                    format!(
+                        "Anneal.prove_id_move_wf_crate \"{}\"",
+                        func.name
+                    )
+                }
+                _ => format!(
+                    "Anneal.prove_id_copy_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        _ => "Anneal.prove_id_copy_ensures_crate \"id\"".to_string(),
+    };
+
+    format!(
+        "prelude\n\
+         import Trusted\n\
+         import Anneal\n\
+         import Mir\n\n\
+         namespace Proof\n\n\
+         theorem verify_crate : Trusted.CrateTheorem Mir.crate :=\n  \
+         {proof_term}\n\n\
+         end Proof\n"
+    )
 }
