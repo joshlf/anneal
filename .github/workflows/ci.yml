@@ -50,6 +50,13 @@ jobs:
         run: ./ci/check_job_dependencies.sh
       - name: Check GitHub Actions workflows
         run: ./ci/check_actions.sh
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@3b28e0d8c80c8cb6deaa3fbcefa2ab92a5d9ed7b # v22
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+      - name: Check Nix flake evaluation across all 4 platforms
+        run: ./ci/check_flake_eval.sh
 
   # Used to signal to branch protections that all other jobs have succeeded.
   all-jobs-succeed:

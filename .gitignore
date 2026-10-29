@@ -1,0 +1,11 @@
+/target/
+**/target/
+/result*
+**/__pycache__/
+**/.lake/
+**/*.olean
+**/*.olean.server
+**/*.olean.private
+**/*.ilean
+**/*.ir
+**/*.ir.sig
