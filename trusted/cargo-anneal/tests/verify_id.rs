@@ -390,3 +390,124 @@ fn rejects_incorrect_load_relaxed_implementation() {
         "expected Lean audit rejection for false atomic load spec, got: {err}"
     );
 }
+
+#[test]
+fn verifies_annotated_pub_fn_max_assign() {
+    let crate_dir = TempCrateDir::new(
+        "annotated-max-assign",
+        "// anneal:spec ensures(max_assign(x, y))\n\
+         pub fn max_assign(x: &mut usize, y: usize) -> usize {\n    \
+             if *x < y {\n        \
+                 *x = y;\n    \
+             }\n    \
+             *x\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "max_assign");
+
+    let mir_lean = fs::read_to_string(&output.mir_lean_path).unwrap();
+    assert!(mir_lean.contains("Trusted.EnsuresMaxAssign"));
+    assert!(mir_lean.contains("Trusted.Terminator.switchInt"));
+}
+
+#[test]
+fn verifies_unannotated_pub_fn_max_assign_well_formedness() {
+    let crate_dir = TempCrateDir::new(
+        "unannotated-max-assign",
+        "pub fn max_assign(x: &mut usize, y: usize) -> usize {\n    \
+             if *x < y {\n        \
+                 *x = y;\n    \
+             }\n    \
+             *x\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "max_assign");
+}
+
+#[test]
+fn rejects_incorrect_max_assign_implementation() {
+    let crate_dir = TempCrateDir::new(
+        "wrong-max-assign",
+        "// anneal:spec ensures(max_assign(x, y))\n\
+         pub fn max_assign(x: &mut usize, y: usize) -> usize {\n    \
+             if *x <= y {\n        \
+                 *x = y;\n    \
+             }\n    \
+             y\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean audit rejection for wrong max_assign body, got: {err}"
+    );
+}
+
+#[test]
+fn verifies_annotated_pub_fn_update_min() {
+    let crate_dir = TempCrateDir::new(
+        "annotated-update-min",
+        "// anneal:spec ensures(update_min(x, y, v))\n\
+         pub fn update_min(x: &mut usize, y: &mut usize, v: usize) -> usize {\n    \
+             let r = if *x <= *y { &mut *x } else { &mut *y };\n    \
+             *r = v;\n    \
+             *x\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "update_min");
+
+    let mir_lean = fs::read_to_string(&output.mir_lean_path).unwrap();
+    assert!(mir_lean.contains("Trusted.EnsuresUpdateMin"));
+    assert!(mir_lean.contains("Trusted.Terminator.switchInt"));
+}
+
+#[test]
+fn verifies_unannotated_pub_fn_update_min_well_formedness() {
+    let crate_dir = TempCrateDir::new(
+        "unannotated-update-min",
+        "pub fn update_min(x: &mut usize, y: &mut usize, v: usize) -> usize {\n    \
+             let r = if *x <= *y { &mut *x } else { &mut *y };\n    \
+             *r = v;\n    \
+             *x\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "update_min");
+}
+
+#[test]
+fn rejects_incorrect_update_min_implementation() {
+    let crate_dir = TempCrateDir::new(
+        "wrong-update-min",
+        "// anneal:spec ensures(update_min(x, y, v))\n\
+         pub fn update_min(x: &mut usize, y: &mut usize, v: usize) -> usize {\n    \
+             let r = if *x < *y { &mut *x } else { &mut *y };\n    \
+             *r = v;\n    \
+             *x\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean audit rejection for wrong update_min body, got: {err}"
+    );
+}
