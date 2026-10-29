@@ -15,7 +15,7 @@ use cargo_anneal::audit::{Checker, Json};
 use cargo_anneal::self_test::run_self_test;
 use cargo_anneal::{
     VerifyOptions, resolve_anneal_root, resolve_lean_bin,
-    run_trusted_audit_report,
+    run_trusted_audit_report, verify_crate,
 };
 
 fn main() -> ExitCode {
@@ -43,7 +43,7 @@ fn run(mut args: Vec<String>) -> Result<u8, (u8, String)> {
     let subcmd = subcmd.to_string();
     if !matches!(
         subcmd.as_str(),
-        "verify-crate" | "audit-repo" | "audit-self-test"
+        "verify" | "verify-crate" | "audit-repo" | "audit-self-test"
     ) {
         return Err((
             1,
@@ -57,6 +57,9 @@ fn run(mut args: Vec<String>) -> Result<u8, (u8, String)> {
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "--keep-proof" if subcmd == "verify" => {
+                options.keep_proof = true;
+            }
             "--lean" => {
                 let Some(path) = iter.next() else {
                     return Err((
@@ -93,7 +96,7 @@ fn run(mut args: Vec<String>) -> Result<u8, (u8, String)> {
                     format!("error: unrecognized flag `{flag}`\n{}", usage()),
                 ));
             }
-            pos if subcmd == "verify-crate" => {
+            pos if matches!(subcmd.as_str(), "verify" | "verify-crate") => {
                 if crate_dir.is_some() {
                     return Err((
                         1,
@@ -118,6 +121,19 @@ fn run(mut args: Vec<String>) -> Result<u8, (u8, String)> {
     }
 
     match subcmd.as_str() {
+        "verify" => {
+            let target_dir = crate_dir.unwrap_or_else(|| PathBuf::from("."));
+            let output = verify_crate(&target_dir, &options)
+                .map_err(|e| (1, format!("error: {e}")))?;
+            let fn_names: Vec<&str> =
+                output.functions.iter().map(|f| f.name.as_str()).collect();
+            println!(
+                "verified: crate at {} passed Trusted.CrateTheorem ({})",
+                target_dir.display(),
+                fn_names.join(", ")
+            );
+            Ok(0)
+        }
         "verify-crate" => {
             let Some(target_dir) = crate_dir else {
                 return Err((
@@ -255,5 +271,5 @@ fn run(mut args: Vec<String>) -> Result<u8, (u8, String)> {
 }
 
 fn usage() -> String {
-    "usage: cargo-anneal [anneal] <verify-crate|audit-repo|audit-self-test> [crate-dir] [--lean <path>] [--anneal-root <path>]".to_string()
+    "usage: cargo-anneal [anneal] <verify|verify-crate|audit-repo|audit-self-test> [crate-dir] [--lean <path>] [--anneal-root <path>] [--keep-proof]".to_string()
 }

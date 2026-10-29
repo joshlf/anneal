@@ -63,9 +63,13 @@ jobs:
           cargo run --locked -p cargo-anneal -- audit-self-test \
             --lean "$RUNNER_TEMP/anneal-lean/lean-4.34.1-darwin_aarch64/bin/lean"
 
-      - name: Check Rust workspace compilation
+      - name: Check and test Rust workspace
+        env:
+          ANNEAL_LEAN_BIN: ${{ runner.temp }}/anneal-lean/lean-4.34.1-darwin_aarch64/bin/lean
+          TMPDIR: ${{ runner.temp }}/anneal-trusted-logs
         run: |
           cargo check --workspace --locked
+          cargo test --workspace --locked
 
       - name: Verify clean working tree
         run: |
