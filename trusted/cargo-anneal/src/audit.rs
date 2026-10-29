@@ -1,0 +1,2160 @@
+// Copyright 2026 The Fuchsia Authors
+//
+// Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+// license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+// This file may not be copied, modified, or distributed except according to
+// those terms.
+
+//! Trusted boundary and `.olean` environment auditor for Anneal.
+//!
+//! This module implements the outer boundary gate that pairs with
+//! `trusted/audit/TrustedBoundary.lean`. It enforces four repository and
+//! per-invocation invariants without external dependencies or shell helpers:
+//!
+//! 1. `trusted/lean/` import and constant-origin containment against
+//!    `trusted/lean/foundation-lock.json` (Lean v4.34.1), plus `@[vetted]` vs.
+//!    `@[candidate <feature>]` non-contamination.
+//! 2. Module-level dependency separation across `theory/` and per-crate
+//!    `Mir.lean` (data-only; restricted to `foundation ++ trusted ++ #[Mir]`)
+//!    and `Proof.lean` (`Proof.verify_crate : Trusted.CrateTheorem Mir.crate`).
+//! 3. Zero custom axioms (`{Classical.choice, Quot.sound, propext}` only),
+//!    zero `sorryAx`/`isUnsafe`/`isPartial`/compiler overrides, and full
+//!    `base.toKernelEnv.replay`.
+//! 4. Cargo workspace DAG containment verifying that all workspace crates
+//!    reside under `trusted/` and that no crate depends on a path outside
+//!    `trusted/`.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::fmt::{self, Write as _};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
+
+/// Pinned Lean 4 toolchain identifier required by `foundation-lock.json`.
+pub const TOOLCHAIN: &str = "leanprover/lean4:v4.34.1";
+
+/// Compiled Lean artifact companion suffixes tracked by the foundation lock and
+/// module compiler.
+pub const PARTS: [&str; 5] = [
+    "olean",
+    "olean.server",
+    "olean.private",
+    "ir.sig",
+    "ir",
+];
+
+/// Subsystem candidate-trusted feature identifiers recognized by Anneal.
+pub const VALID_CANDIDATE_FEATURES: [&str; 6] = [
+    "refinement",
+    "step_result",
+    "memory",
+    "mir_ast",
+    "mir_semantics",
+    "rustc_capture",
+];
+
+/// Release channel governing whether candidate-trusted TCB features may be
+/// enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReleaseChannel {
+    /// Alpha release channel: candidate features are supported when explicitly
+    /// enabled by the target crate's trust policy or CLI flags, and default to
+    /// `VettedOnly` when omitted.
+    #[default]
+    Alpha,
+    /// Stable release channel: hard-locked to `VettedOnly`; candidate features
+    /// cannot be enabled.
+    Stable,
+}
+
+impl ReleaseChannel {
+    /// Parse `"alpha"` or `"stable"`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "alpha" => Ok(Self::Alpha),
+            "stable" => Ok(Self::Stable),
+            other => Err(format!(
+                "unknown release channel `{other}` (expected `alpha` or `stable`)"
+            )),
+        }
+    }
+}
+
+/// Per-crate candidate-feature trust policy.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CrateTrustPolicy {
+    /// When `true` (`allow-candidate-features = ["*"]`), all candidate features
+    /// in [`VALID_CANDIDATE_FEATURES`] are permitted on
+    /// [`ReleaseChannel::Alpha`].
+    pub allow_all: bool,
+    /// Explicitly named candidate features permitted on
+    /// [`ReleaseChannel::Alpha`].
+    pub allowed_features: BTreeSet<String>,
+}
+
+impl CrateTrustPolicy {
+    /// Default policy permitting only `@[vetted]` TCB declarations.
+    pub fn vetted_only() -> Self {
+        Self::default()
+    }
+
+    /// Parse and validate a list of candidate feature names (or `"*"`).
+    pub fn from_feature_list<I, S>(features: I) -> Result<Self, Failure>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut policy = Self::default();
+        for raw in features {
+            let feat = raw.as_ref().trim();
+            if feat == "*" {
+                policy.allow_all = true;
+            } else if VALID_CANDIDATE_FEATURES.contains(&feat) {
+                policy.allowed_features.insert(feat.to_string());
+            } else {
+                return Err(Failure::new(
+                    1,
+                    "candidate-policy",
+                    format!(
+                        "unknown candidate feature `{feat}` in allow-candidate-features"
+                    ),
+                ));
+            }
+        }
+        Ok(policy)
+    }
+
+    /// Merge another [`CrateTrustPolicy`] into `self`.
+    pub fn merge(&mut self, other: Self) {
+        self.allow_all |= other.allow_all;
+        self.allowed_features.extend(other.allowed_features);
+    }
+
+    /// Return `true` if `feature` is permitted under `channel` and `self`.
+    pub fn is_allowed(&self, channel: ReleaseChannel, feature: &str) -> bool {
+        match channel {
+            ReleaseChannel::Stable => false,
+            ReleaseChannel::Alpha => {
+                self.allow_all || self.allowed_features.contains(feature)
+            }
+        }
+    }
+}
+
+/// Resolve the target crate's [`CrateTrustPolicy`] from
+/// `[package.metadata.anneal.trust-policy] allow-candidate-features` in
+/// `crate_dir/Cargo.toml` and any explicit CLI/API override.
+pub fn load_crate_trust_policy(
+    crate_dir: &Path,
+    cli_override: Option<&[String]>,
+) -> Result<CrateTrustPolicy, Failure> {
+    let mut policy = CrateTrustPolicy::vetted_only();
+    let cargo_toml_path = crate_dir.join("Cargo.toml");
+    if cargo_toml_path.is_file() {
+        let text = fs::read_to_string(&cargo_toml_path).map_err(|e| {
+            Failure::new(
+                1,
+                "candidate-policy",
+                format!("cannot read {}: {e}", cargo_toml_path.display()),
+            )
+        })?;
+        let toml = parse_cargo_toml(&text).map_err(|e| {
+            Failure::new(
+                1,
+                "candidate-policy",
+                format!(
+                    "malformed Cargo.toml in {}: {e}",
+                    cargo_toml_path.display()
+                ),
+            )
+        })?;
+        let allow_val = toml
+            .get("package")
+            .and_then(|p| p.get("metadata"))
+            .and_then(|m| m.get("anneal"))
+            .and_then(|a| {
+                a.get("trust-policy")
+                    .and_then(|tp| tp.get("allow-candidate-features"))
+                    .or_else(|| a.get("allow-candidate-features"))
+            });
+        if let Some(val) = allow_val {
+            let arr = val.as_arr().ok_or_else(|| {
+                Failure::new(
+                    1,
+                    "candidate-policy",
+                    "allow-candidate-features in Cargo.toml must be an array of strings",
+                )
+            })?;
+            let mut names = Vec::with_capacity(arr.len());
+            for item in arr {
+                let s = item.as_str().ok_or_else(|| {
+                    Failure::new(
+                        1,
+                        "candidate-policy",
+                        "allow-candidate-features in Cargo.toml must contain only strings",
+                    )
+                })?;
+                names.push(s.to_string());
+            }
+            policy.merge(CrateTrustPolicy::from_feature_list(&names)?);
+        }
+    }
+    if let Some(cli_list) = cli_override {
+        policy.merge(CrateTrustPolicy::from_feature_list(cli_list)?);
+    }
+    Ok(policy)
+}
+
+static STAGE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, PartialEq, Eq)]
+struct VerifyPrefixKey {
+    checkout: PathBuf,
+    lean: PathBuf,
+    sources: BTreeMap<String, Vec<u8>>,
+}
+
+#[derive(Clone)]
+struct CachedArtifactFile {
+    rel_path: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct CachedVerifyPrefix {
+    key: VerifyPrefixKey,
+    report: Json,
+    compiled_artifacts_rel: BTreeMap<String, Vec<Vec<String>>>,
+    graph: BTreeMap<String, Json>,
+    modules: BTreeMap<String, PathBuf>,
+    theory_modules: BTreeMap<String, PathBuf>,
+    trust_declarations: Vec<Json>,
+    files: Vec<CachedArtifactFile>,
+}
+
+static VERIFY_PREFIX_CACHE: Mutex<Option<CachedVerifyPrefix>> =
+    Mutex::new(None);
+
+/// Structured audit failure distinguishing policy rejections (`code == 1`)
+/// from operational or environment failures (`code == 2`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    /// Process exit code (`1` for policy rejection, `2` for operational error).
+    pub code: i32,
+    /// Audit phase in which the failure occurred.
+    pub phase: String,
+    /// Human-readable diagnostic message.
+    pub message: String,
+}
+
+impl Failure {
+    /// Construct a new [`Failure`].
+    pub fn new(
+        code: i32,
+        phase: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            code,
+            phase: phase.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for Failure {}
+
+/// Minimal, deterministic JSON value representation used for
+/// `foundation-lock.json` and the `TrustedBoundary.lean` IPC protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Json {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(BTreeMap<String, Json>),
+}
+
+impl Json {
+    /// Parse a UTF-8 JSON document, rejecting trailing tokens or syntax errors.
+    pub fn parse(input: &str) -> Result<Self, String> {
+        let mut parser = JsonParser {
+            bytes: input.as_bytes(),
+            pos: 0,
+        };
+        let value = parser.parse_value()?;
+        parser.skip_ws();
+        if parser.pos != parser.bytes.len() {
+            return Err("trailing characters after JSON value".to_string());
+        }
+        Ok(value)
+    }
+
+    /// Serialize this JSON value in compact form with lexicographically sorted
+    /// object keys.
+    pub fn to_compact_string(&self) -> String {
+        let mut out = String::new();
+        self.write_compact(&mut out);
+        out
+    }
+
+    fn write_compact(&self, out: &mut String) {
+        match self {
+            Self::Null => out.push_str("null"),
+            Self::Bool(true) => out.push_str("true"),
+            Self::Bool(false) => out.push_str("false"),
+            Self::Int(n) => {
+                let _ = write!(out, "{n}");
+            }
+            Self::Str(s) => write_escaped_str(out, s),
+            Self::Arr(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    item.write_compact(out);
+                }
+                out.push(']');
+            }
+            Self::Obj(map) => {
+                out.push('{');
+                for (i, (k, v)) in map.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write_escaped_str(out, k);
+                    out.push(':');
+                    v.write_compact(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    /// Borrow as an object map.
+    pub fn as_obj(&self) -> Option<&BTreeMap<String, Json>> {
+        match self {
+            Self::Obj(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Mutably borrow as an object map.
+    pub fn as_obj_mut(&mut self) -> Option<&mut BTreeMap<String, Json>> {
+        match self {
+            Self::Obj(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Borrow as an array slice.
+    pub fn as_arr(&self) -> Option<&[Json]> {
+        match self {
+            Self::Arr(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// Borrow as a string slice.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Extract a boolean value.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// Extract an integer value.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Look up a field in an object.
+    pub fn get(&self, key: &str) -> Option<&Json> {
+        self.as_obj()?.get(key)
+    }
+}
+
+fn write_escaped_str(out: &mut String, s: &str) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn skip_ws(&mut self) {
+        while self.pos < self.bytes.len() {
+            match self.bytes[self.pos] {
+                b' ' | b'\t' | b'\n' | b'\r' => self.pos += 1,
+                _ => break,
+            }
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn parse_value(&mut self) -> Result<Json, String> {
+        self.skip_ws();
+        match self.peek() {
+            Some(b'n') => self.parse_literal(b"null", Json::Null),
+            Some(b't') => self.parse_literal(b"true", Json::Bool(true)),
+            Some(b'f') => self.parse_literal(b"false", Json::Bool(false)),
+            Some(b'"') => self.parse_string().map(Json::Str),
+            Some(b'[') => self.parse_array(),
+            Some(b'{') => self.parse_object(),
+            Some(b'-') | Some(b'0'..=b'9') => self.parse_number(),
+            Some(b) => Err(format!("unexpected byte `{}` in JSON", b as char)),
+            None => Err("unexpected end of JSON input".to_string()),
+        }
+    }
+
+    fn parse_literal(&mut self, lit: &[u8], val: Json) -> Result<Json, String> {
+        if self.bytes.get(self.pos..self.pos + lit.len()) == Some(lit) {
+            self.pos += lit.len();
+            Ok(val)
+        } else {
+            Err("invalid JSON literal".to_string())
+        }
+    }
+
+    fn parse_string(&mut self) -> Result<String, String> {
+        if self.peek() != Some(b'"') {
+            return Err("expected `\"` at start of string".to_string());
+        }
+        self.pos += 1;
+        let mut out = String::new();
+        while self.pos < self.bytes.len() {
+            let b = self.bytes[self.pos];
+            self.pos += 1;
+            match b {
+                b'"' => return Ok(out),
+                b'\\' => {
+                    let esc = *self
+                        .bytes
+                        .get(self.pos)
+                        .ok_or("unterminated string escape")?;
+                    self.pos += 1;
+                    match esc {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\x08'),
+                        b'f' => out.push('\x0c'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => {
+                            let hex = self
+                                .bytes
+                                .get(self.pos..self.pos + 4)
+                                .ok_or("short \\u escape")?;
+                            let hex_str = std::str::from_utf8(hex)
+                                .map_err(|_| "invalid \\u hex")?;
+                            let code = u32::from_str_radix(hex_str, 16)
+                                .map_err(|_| "invalid \\u hex digits")?;
+                            let ch = char::from_u32(code)
+                                .ok_or("invalid unicode scalar in \\u")?;
+                            out.push(ch);
+                            self.pos += 4;
+                        }
+                        _ => return Err("unsupported JSON escape".to_string()),
+                    }
+                }
+                c if c < 0x20 => {
+                    return Err("unescaped control character in string".into());
+                }
+                c => {
+                    self.pos -= 1;
+                    let rest = std::str::from_utf8(&self.bytes[self.pos..])
+                        .map_err(|_| "invalid UTF-8 in JSON string")?;
+                    let ch = rest.chars().next().unwrap();
+                    out.push(ch);
+                    self.pos += ch.len_utf8();
+                    let _ = c;
+                }
+            }
+        }
+        Err("unterminated JSON string".to_string())
+    }
+
+    fn parse_number(&mut self) -> Result<Json, String> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        while let Some(b'0'..=b'9') = self.peek() {
+            self.pos += 1;
+        }
+        if self.peek() == Some(b'.') {
+            self.pos += 1;
+            while let Some(b'0'..=b'9') = self.peek() {
+                self.pos += 1;
+            }
+        }
+        let s = std::str::from_utf8(&self.bytes[start..self.pos])
+            .map_err(|_| "invalid number UTF-8")?;
+        if let Ok(n) = s.parse::<i64>() {
+            Ok(Json::Int(n))
+        } else if let Ok(f) = s.parse::<f64>() {
+            Ok(Json::Int(f as i64))
+        } else {
+            Err(format!("invalid JSON number `{s}`"))
+        }
+    }
+
+    fn parse_array(&mut self) -> Result<Json, String> {
+        self.pos += 1;
+        self.skip_ws();
+        let mut items = Vec::new();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            return Ok(Json::Arr(items));
+        }
+        loop {
+            items.push(self.parse_value()?);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b']') => {
+                    self.pos += 1;
+                    return Ok(Json::Arr(items));
+                }
+                _ => return Err("expected `,` or `]` in array".to_string()),
+            }
+        }
+    }
+
+    fn parse_object(&mut self) -> Result<Json, String> {
+        self.pos += 1;
+        self.skip_ws();
+        let mut map = BTreeMap::new();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Ok(Json::Obj(map));
+        }
+        loop {
+            self.skip_ws();
+            let key = self.parse_string()?;
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                return Err("expected `:` after object key".to_string());
+            }
+            self.pos += 1;
+            let val = self.parse_value()?;
+            map.insert(key, val);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    return Ok(Json::Obj(map));
+                }
+                _ => return Err("expected `,` or `}` in object".to_string()),
+            }
+        }
+    }
+}
+
+/// Verify that `path` exists and is a regular file (not a symlink or
+/// directory).
+pub fn regular(path: &Path, phase: &str) -> Result<(), Failure> {
+    let meta = fs::symlink_metadata(path).map_err(|e| {
+        Failure::new(
+            2,
+            phase,
+            format!("cannot inspect {}: {e}", path.display()),
+        )
+    })?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(Failure::new(
+            1,
+            phase,
+            format!("expected a regular file: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn is_lean_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Minimal TOML parser supporting Cargo workspace and package manifests.
+fn parse_cargo_toml(text: &str) -> Result<Json, String> {
+    let mut root = BTreeMap::new();
+    let mut current_path: Vec<String> = Vec::new();
+    let mut lines = text.lines().peekable();
+
+    while let Some(raw_line) = lines.next() {
+        let line = strip_toml_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            let header = line[1..line.len() - 1].trim();
+            if header.is_empty() || header.starts_with('[') {
+                return Err("unsupported TOML table header".to_string());
+            }
+            current_path = header
+                .split('.')
+                .map(|p| p.trim().trim_matches('"').to_string())
+                .collect();
+            ensure_toml_table(&mut root, &current_path)?;
+            continue;
+        }
+        let Some((k_raw, v_raw)) = line.split_once('=') else {
+            return Err(format!("malformed TOML line `{line}`"));
+        };
+        let key = k_raw.trim().trim_matches('"').to_string();
+        if key.is_empty() {
+            return Err("empty TOML key".to_string());
+        }
+        let mut rhs = v_raw.trim().to_string();
+        if rhs.starts_with('[') && !rhs.ends_with(']') {
+            while let Some(next_raw) = lines.next() {
+                let next_clean = strip_toml_comment(next_raw).trim();
+                rhs.push(' ');
+                rhs.push_str(next_clean);
+                if next_clean.ends_with(']') {
+                    break;
+                }
+            }
+        }
+        let val = parse_toml_value(rhs.trim())?;
+        let table = ensure_toml_table(&mut root, &current_path)?;
+        table.insert(key, val);
+    }
+    Ok(Json::Obj(root))
+}
+
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_quotes {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+        } else if ch == '#' && !in_quotes {
+            return &line[..idx];
+        }
+    }
+    line
+}
+
+fn ensure_toml_table<'a>(
+    root: &'a mut BTreeMap<String, Json>,
+    path: &[String],
+) -> Result<&'a mut BTreeMap<String, Json>, String> {
+    let mut cur = root;
+    for segment in path {
+        let entry = cur
+            .entry(segment.clone())
+            .or_insert_with(|| Json::Obj(BTreeMap::new()));
+        cur = match entry {
+            Json::Obj(m) => m,
+            _ => return Err("TOML key collides with table".to_string()),
+        };
+    }
+    Ok(cur)
+}
+
+fn parse_toml_value(rhs: &str) -> Result<Json, String> {
+    if rhs == "true" {
+        return Ok(Json::Bool(true));
+    }
+    if rhs == "false" {
+        return Ok(Json::Bool(false));
+    }
+    if rhs.starts_with('"') && rhs.ends_with('"') && rhs.len() >= 2 {
+        return Json::parse(rhs);
+    }
+    if rhs.starts_with('[') && rhs.ends_with(']') {
+        let inner = rhs[1..rhs.len() - 1].trim();
+        if inner.is_empty() {
+            return Ok(Json::Arr(Vec::new()));
+        }
+        let mut items = Vec::new();
+        for part in split_top_level(inner, ',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                items.push(parse_toml_value(trimmed)?);
+            }
+        }
+        return Ok(Json::Arr(items));
+    }
+    if rhs.starts_with('{') && rhs.ends_with('}') {
+        let inner = rhs[1..rhs.len() - 1].trim();
+        let mut map = BTreeMap::new();
+        if !inner.is_empty() {
+            for part in split_top_level(inner, ',') {
+                let trimmed = part.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Some((k, v)) = trimmed.split_once('=') else {
+                    return Err("malformed TOML inline table entry".to_string());
+                };
+                map.insert(
+                    k.trim().trim_matches('"').to_string(),
+                    parse_toml_value(v.trim())?,
+                );
+            }
+        }
+        return Ok(Json::Obj(map));
+    }
+    if let Ok(n) = rhs.parse::<i64>() {
+        return Ok(Json::Int(n));
+    }
+    Err(format!("unsupported TOML value `{rhs}`"))
+}
+
+fn split_top_level(input: &str, sep: char) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let mut depth = 0usize;
+    for (idx, ch) in input.char_indices() {
+        if ch == '"' {
+            in_quotes = !in_quotes;
+        } else if !in_quotes {
+            if ch == '[' || ch == '{' {
+                depth += 1;
+            } else if ch == ']' || ch == '}' {
+                depth = depth.saturating_sub(1);
+            } else if ch == sep && depth == 0 {
+                out.push(&input[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+        }
+    }
+    out.push(&input[start..]);
+    out
+}
+
+/// Verify Cargo workspace DAG containment: all workspace crates must reside
+/// under `trusted/`, and no workspace crate may depend on a path outside
+/// `trusted/`.
+pub fn check_cargo_boundary(checkout: &Path) -> Result<(), Failure> {
+    let phase = "cargo-boundary";
+    let root_toml_path = checkout.join("Cargo.toml");
+    let trusted_toml_path = checkout.join("trusted/rustc-capture/Cargo.toml");
+    regular(&root_toml_path, phase)?;
+    regular(&trusted_toml_path, phase)?;
+
+    let root_text = fs::read_to_string(&root_toml_path).map_err(|e| {
+        Failure::new(1, phase, format!("malformed Cargo manifest: {e}"))
+    })?;
+    let root_toml = parse_cargo_toml(&root_text).map_err(|e| {
+        Failure::new(1, phase, format!("malformed Cargo manifest: {e}"))
+    })?;
+
+    let members = root_toml
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(Json::as_arr)
+        .ok_or_else(|| {
+            Failure::new(1, phase, "missing workspace.members in root Cargo.toml")
+        })?;
+
+    let checkout_canon = fs::canonicalize(checkout).map_err(|e| {
+        Failure::new(2, phase, format!("cannot canonicalize checkout: {e}"))
+    })?;
+
+    let mut has_rustc_capture = false;
+
+    for member_val in members {
+        let member = member_val.as_str().ok_or_else(|| {
+            Failure::new(1, phase, "non-string workspace member")
+        })?;
+        if !member.starts_with("trusted/") {
+            return Err(Failure::new(
+                1,
+                phase,
+                format!("workspace member outside trusted/: {member}"),
+            ));
+        }
+        if member == "trusted/rustc-capture" {
+            has_rustc_capture = true;
+        }
+        let member_toml_path = checkout.join(member).join("Cargo.toml");
+        regular(&member_toml_path, phase)?;
+        let member_text = fs::read_to_string(&member_toml_path).map_err(|e| {
+            Failure::new(
+                1,
+                phase,
+                format!("malformed member Cargo.toml in {member}: {e}"),
+            )
+        })?;
+        let member_toml = parse_cargo_toml(&member_text).map_err(|e| {
+            Failure::new(
+                1,
+                phase,
+                format!("malformed member Cargo.toml in {member}: {e}"),
+            )
+        })?;
+        let _pkg_name = member_toml
+            .get("package")
+            .and_then(|p| p.get("name"))
+            .and_then(Json::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Failure::new(
+                    1,
+                    phase,
+                    format!("missing package.name in {member}"),
+                )
+            })?;
+
+        let member_parent = member_toml_path.parent().unwrap();
+        let check_dep_table =
+            |table_opt: Option<&Json>, section: &str| -> Result<(), Failure> {
+                let Some(table_val) = table_opt else {
+                    return Ok(());
+                };
+                let table = table_val.as_obj().ok_or_else(|| {
+                    Failure::new(
+                        1,
+                        phase,
+                        format!("invalid {section} in {member}/Cargo.toml"),
+                    )
+                })?;
+                for (_dep_name, spec) in table {
+                    if let Some(spec_obj) = spec.as_obj()
+                        && let Some(dep_path) =
+                            spec_obj.get("path").and_then(Json::as_str)
+                    {
+                        let joined = member_parent.join(dep_path);
+                        let resolved =
+                            fs::canonicalize(&joined).unwrap_or(joined);
+                        let rel = resolved
+                            .strip_prefix(&checkout_canon)
+                            .map_err(|_| {
+                                Failure::new(
+                                    1,
+                                    phase,
+                                    format!(
+                                        "{member} path dependency escapes checkout: {dep_path}"
+                                    ),
+                                )
+                            })?;
+                        let rel_str = rel.to_string_lossy().replace('\\', "/");
+                        if !rel_str.starts_with("trusted/") {
+                            return Err(Failure::new(
+                                1,
+                                phase,
+                                format!(
+                                    "{member} path dependency points outside trusted/: {rel_str}"
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            };
+
+        for section in
+            ["dependencies", "dev-dependencies", "build-dependencies"]
+        {
+            check_dep_table(member_toml.get(section), section)?;
+        }
+        if let Some(targets) = member_toml.get("target").and_then(Json::as_obj)
+        {
+            for (cfg_name, cfg_table) in targets {
+                if let Some(cfg_obj) = cfg_table.as_obj() {
+                    for section in [
+                        "dependencies",
+                        "dev-dependencies",
+                        "build-dependencies",
+                    ] {
+                        let label = format!("target.{cfg_name}.{section}");
+                        check_dep_table(cfg_obj.get(section), &label)?;
+                    }
+                }
+            }
+        }
+    }
+    if !has_rustc_capture {
+        return Err(Failure::new(
+            1,
+            phase,
+            "trusted/rustc-capture missing from workspace.members",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Scan a Lean directory tree (`trusted/lean` with `"Trusted"` or `theory`
+/// with `"Anneal"`), rejecting symlinks and compiled artifacts in the source
+/// tree and returning the map from dot-separated module name to `.lean` path.
+pub fn scan_lean_tree(
+    root: &Path,
+    umbrella_prefix: &str,
+) -> Result<BTreeMap<String, PathBuf>, Failure> {
+    let meta = fs::symlink_metadata(root).map_err(|_| {
+        Failure::new(
+            1,
+            "snapshot",
+            format!("expected regular source directory: {}", root.display()),
+        )
+    })?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return Err(Failure::new(
+            1,
+            "snapshot",
+            format!("expected regular source directory: {}", root.display()),
+        ));
+    }
+
+    let mut modules = BTreeMap::new();
+    let mut queue = vec![root.to_path_buf()];
+
+    while let Some(dir) = queue.pop() {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&dir).map_err(|e| {
+            Failure::new(
+                2,
+                "snapshot",
+                format!("cannot read {}: {e}", dir.display()),
+            )
+        })? {
+            let entry = entry.map_err(|e| {
+                Failure::new(
+                    2,
+                    "snapshot",
+                    format!("cannot read {}: {e}", dir.display()),
+                )
+            })?;
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        let mut subdirs = Vec::new();
+        for name in names {
+            let path = dir.join(&name);
+            let rel_path = path.strip_prefix(root).unwrap();
+            let relative = rel_path.to_string_lossy().replace('\\', "/");
+            let entry_meta = fs::symlink_metadata(&path).map_err(|e| {
+                Failure::new(
+                    2,
+                    "snapshot",
+                    format!("cannot inspect {}: {e}", path.display()),
+                )
+            })?;
+            if entry_meta.file_type().is_dir()
+                && !entry_meta.file_type().is_symlink()
+            {
+                subdirs.push(path);
+                continue;
+            }
+            regular(&path, "snapshot")?;
+            if PARTS
+                .iter()
+                .any(|part| relative.ends_with(&format!(".{part}")))
+                || relative.ends_with(".ilean")
+            {
+                return Err(Failure::new(
+                    1,
+                    "snapshot",
+                    format!("compiled artifact in source root: {relative}"),
+                ));
+            }
+
+            if let Some(stem) = relative.strip_suffix(".lean") {
+                let components: Vec<&str> = stem.split('/').collect();
+                if components.first().copied() != Some(umbrella_prefix)
+                    || !components.iter().copied().all(is_lean_ident)
+                {
+                    return Err(Failure::new(
+                        1,
+                        "snapshot",
+                        format!("unmappable Lean source: {relative}"),
+                    ));
+                }
+                let module = components.join(".");
+                if modules.contains_key(&module) {
+                    return Err(Failure::new(
+                        1,
+                        "snapshot",
+                        format!("duplicate module: {module}"),
+                    ));
+                }
+                modules.insert(module, path);
+            }
+        }
+        subdirs.reverse();
+        queue.extend(subdirs);
+    }
+
+    if !modules.contains_key(umbrella_prefix) {
+        return Err(Failure::new(
+            1,
+            "snapshot",
+            format!("missing {umbrella_prefix}.lean umbrella"),
+        ));
+    }
+    Ok(modules)
+}
+
+/// Resolve the default pinned Lean 4.34.1 binary path when none is explicitly
+/// provided.
+pub fn default_lean_path() -> PathBuf {
+    if let Some(env_lean) = env::var_os("ANNEAL_LEAN_BIN") {
+        return PathBuf::from(env_lean);
+    }
+    if let Some(tc_root) = crate::setup::resolve_installed() {
+        let bundled = tc_root.join("lean/bin/lean");
+        if bundled.is_file() {
+            return bundled;
+        }
+    }
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/root"));
+    home.join(".elan/toolchains/leanprover--lean4---v4.34.1/bin/lean")
+}
+
+/// Stateful boundary and crate-verification auditor managing an isolated
+/// staging directory (`stage`).
+pub struct Checker {
+    pub checkout: PathBuf,
+    pub source: PathBuf,
+    pub lean: PathBuf,
+    pub stage: PathBuf,
+    pub phase: String,
+    pub execution_began: bool,
+    pub counter: usize,
+    pub environment: BTreeMap<String, String>,
+    pub artifacts: BTreeMap<String, Vec<Vec<String>>>,
+    pub graph: BTreeMap<String, Json>,
+    pub modules: BTreeMap<String, PathBuf>,
+    pub theory_modules: BTreeMap<String, PathBuf>,
+    pub inspector: PathBuf,
+    pub lock: Json,
+    pub version: String,
+    pub prefix: PathBuf,
+    pub foundation: Vec<String>,
+    pub trust_declarations: Vec<Json>,
+}
+
+impl Checker {
+    /// Create a new [`Checker`] with a fresh private staging directory.
+    pub fn new(
+        checkout: &Path,
+        lean: Option<&Path>,
+        temp_parent: Option<&Path>,
+    ) -> io::Result<Self> {
+        Self::new_with_env(checkout, lean, temp_parent, env::vars())
+    }
+
+    /// Create a new [`Checker`] filtering the supplied ambient environment.
+    pub fn new_with_env<I>(
+        checkout: &Path,
+        lean: Option<&Path>,
+        temp_parent: Option<&Path>,
+        ambient_env: I,
+    ) -> io::Result<Self>
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let checkout = fs::canonicalize(checkout)?;
+        let source = checkout.join("trusted/lean");
+        let lean_raw = match lean {
+            Some(p) => p.to_path_buf(),
+            None => default_lean_path(),
+        };
+        let lean = if lean_raw.is_absolute() {
+            lean_raw
+        } else {
+            env::current_dir()?.join(lean_raw)
+        };
+        let parent = match temp_parent {
+            Some(p) => p.to_path_buf(),
+            None => env::temp_dir(),
+        };
+        fs::create_dir_all(&parent)?;
+        let id = STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let stage = parent.join(format!(
+            "anneal-trusted-{}-{}-{}",
+            std::process::id(),
+            id,
+            Instant::now().elapsed().as_nanos()
+        ));
+        fs::create_dir_all(&stage)?;
+
+        let mut environment = BTreeMap::new();
+        for (k, v) in ambient_env {
+            if !k.starts_with("LEAN")
+                && !k.starts_with("LAKE")
+                && !k.starts_with("ELAN")
+                && !k.starts_with("DYLD_")
+            {
+                environment.insert(k, v);
+            }
+        }
+        environment.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+
+        Ok(Self {
+            checkout,
+            source,
+            lean,
+            stage,
+            phase: "admission".to_string(),
+            execution_began: false,
+            counter: 0,
+            environment,
+            artifacts: BTreeMap::new(),
+            graph: BTreeMap::new(),
+            modules: BTreeMap::new(),
+            theory_modules: BTreeMap::new(),
+            inspector: PathBuf::new(),
+            lock: Json::Obj(BTreeMap::new()),
+            version: String::new(),
+            prefix: PathBuf::new(),
+            foundation: Vec::new(),
+            trust_declarations: Vec::new(),
+        })
+    }
+
+    /// Execute `self.lean` with `arguments` in an isolated environment.
+    pub fn process(
+        &mut self,
+        label: &str,
+        arguments: &[String],
+    ) -> Result<String, Failure> {
+        self.phase = label.to_string();
+        self.counter += 1;
+        let output = Command::new(&self.lean)
+            .args(arguments)
+            .current_dir(&self.stage)
+            .env_clear()
+            .envs(&self.environment)
+            .output()
+            .map_err(|e| {
+                Failure::new(2, label, format!("could not execute Lean: {e}"))
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Failure::new(
+                2,
+                label,
+                format!(
+                    "Lean exited {:?}: {}",
+                    output.status.code(),
+                    stderr.trim()
+                ),
+            ));
+        }
+        String::from_utf8(output.stdout).map_err(|e| {
+            Failure::new(2, label, format!("invalid UTF-8 from Lean: {e}"))
+        })
+    }
+
+    /// Write a `<module>.setup.json` descriptor for `lean --setup`.
+    pub fn write_setup_json(
+        &self,
+        module: &str,
+        imports: &[Json],
+    ) -> Result<PathBuf, Failure> {
+        let mut import_arts = BTreeMap::new();
+        for (k, v) in &self.artifacts {
+            let groups: Vec<Json> = v
+                .iter()
+                .map(|g| Json::Arr(g.iter().cloned().map(Json::Str).collect()))
+                .collect();
+            import_arts.insert(k.clone(), Json::Arr(groups));
+        }
+        let mut setup_obj = BTreeMap::new();
+        setup_obj.insert("name".to_string(), Json::Str(module.to_string()));
+        setup_obj.insert("isModule".to_string(), Json::Bool(false));
+        setup_obj.insert("imports".to_string(), Json::Arr(imports.to_vec()));
+        setup_obj.insert("importArts".to_string(), Json::Obj(import_arts));
+        setup_obj.insert("dynlibs".to_string(), Json::Arr(Vec::new()));
+        setup_obj.insert("plugins".to_string(), Json::Arr(Vec::new()));
+        setup_obj.insert("options".to_string(), Json::Obj(BTreeMap::new()));
+
+        let setup_path = self.stage.join(format!("{module}.setup.json"));
+        fs::write(
+            &setup_path,
+            Json::Obj(setup_obj).to_compact_string().as_bytes(),
+        )
+        .map_err(|e| Failure::new(2, "setup", e.to_string()))?;
+        Ok(setup_path)
+    }
+
+    /// Invoke `TrustedBoundary.lean` in `mode` with `extra_fields`.
+    pub fn inspect(
+        &mut self,
+        mode: &str,
+        extra_fields: BTreeMap<String, Json>,
+    ) -> Result<Json, Failure> {
+        self.phase = mode.to_string();
+        let mut req = BTreeMap::new();
+        req.insert("mode".to_string(), Json::Str(mode.to_string()));
+        req.insert(
+            "sysroot".to_string(),
+            Json::Str(self.prefix.to_string_lossy().into_owned()),
+        );
+        let arts_arr: Vec<Json> = self
+            .artifacts
+            .iter()
+            .map(|(k, parts)| {
+                let parts_json: Vec<Json> = parts
+                    .iter()
+                    .map(|group| {
+                        Json::Arr(
+                            group.iter().cloned().map(Json::Str).collect(),
+                        )
+                    })
+                    .collect();
+                Json::Arr(vec![Json::Str(k.clone()), Json::Arr(parts_json)])
+            })
+            .collect();
+        req.insert("artifacts".to_string(), Json::Arr(arts_arr));
+        req.insert(
+            "foundation".to_string(),
+            Json::Arr(self.foundation.iter().cloned().map(Json::Str).collect()),
+        );
+        let default_graph = if mode == "preflight" {
+            self.lock
+                .get("graph")
+                .cloned()
+                .unwrap_or_else(|| Json::Obj(BTreeMap::new()))
+        } else {
+            Json::Obj(self.graph.clone())
+        };
+        req.insert("graph".to_string(), default_graph);
+        let axioms = self
+            .lock
+            .get("axioms")
+            .cloned()
+            .unwrap_or_else(|| Json::Arr(Vec::new()));
+        req.insert("axioms".to_string(), axioms);
+        for (k, v) in extra_fields {
+            req.insert(k, v);
+        }
+
+        self.counter += 1;
+        let stem = self
+            .stage
+            .join(format!("request-{:03}-{mode}", self.counter));
+        let request_path = PathBuf::from(format!("{}.json", stem.display()));
+        let result_path =
+            PathBuf::from(format!("{}.result.json", stem.display()));
+        fs::write(&request_path, Json::Obj(req).to_compact_string().as_bytes())
+            .map_err(|e| {
+                Failure::new(2, mode, format!("cannot write request: {e}"))
+            })?;
+
+        let args = vec![
+            "-j1".to_string(),
+            "-M2048".to_string(),
+            "--run".to_string(),
+            self.inspector.to_string_lossy().into_owned(),
+            request_path.to_string_lossy().into_owned(),
+            result_path.to_string_lossy().into_owned(),
+        ];
+        let output = Command::new(&self.lean)
+            .args(&args)
+            .current_dir(&self.stage)
+            .env_clear()
+            .envs(&self.environment)
+            .output()
+            .map_err(|e| {
+                Failure::new(2, mode, format!("could not execute Lean: {e}"))
+            })?;
+
+        if !output.status.success() {
+            if output.status.code() == Some(1)
+                && result_path.is_file()
+                && let Ok(text) = fs::read_to_string(&result_path)
+                && let Ok(resp) = Json::parse(&text)
+                && let Some(obj) = resp.as_obj()
+                && obj.len() == 3
+                && obj.get("ok").and_then(Json::as_bool) == Some(false)
+                && obj.get("category").and_then(Json::as_str) == Some("policy")
+                && let Some(msg) = obj
+                    .get("message")
+                    .and_then(Json::as_str)
+                    .filter(|s| !s.is_empty())
+            {
+                return Err(Failure::new(1, mode, msg));
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Failure::new(
+                2,
+                mode,
+                format!(
+                    "Lean exited {:?}: {}",
+                    output.status.code(),
+                    stderr.trim()
+                ),
+            ));
+        }
+
+        let resp_text = fs::read_to_string(&result_path).map_err(|e| {
+            Failure::new(
+                2,
+                mode,
+                format!("missing/malformed inspector result: {e}"),
+            )
+        })?;
+        let resp = Json::parse(&resp_text).map_err(|e| {
+            Failure::new(
+                2,
+                mode,
+                format!("missing/malformed inspector result: {e}"),
+            )
+        })?;
+        let Some(resp_obj) = resp.as_obj() else {
+            return Err(Failure::new(
+                2,
+                mode,
+                "unexpected inspector protocol response",
+            ));
+        };
+        if resp_obj.len() != 2
+            || resp_obj.get("ok").and_then(Json::as_bool) != Some(true)
+            || !resp_obj.get("result").is_some_and(|r| r.as_obj().is_some())
+        {
+            return Err(Failure::new(
+                2,
+                mode,
+                "unexpected inspector protocol response",
+            ));
+        }
+        Ok(resp_obj.get("result").unwrap().clone())
+    }
+
+    /// Snapshot `trusted/lean/`, stage `TrustedBoundary.lean`, and verify the
+    /// pinned Lean 4.34.1 binary and `Init.*` artifacts against
+    /// `foundation-lock.json`.
+    pub fn tool_admission(&mut self) -> Result<(), Failure> {
+        self.modules = scan_lean_tree(&self.source, "Trusted")?;
+
+        let inspector_src =
+            self.checkout.join("trusted/audit/TrustedBoundary.lean");
+        regular(&inspector_src, "tool-snapshot")?;
+        self.inspector = inspector_src;
+
+        let lock_text =
+            fs::read_to_string(self.source.join("foundation-lock.json"))
+                .map_err(|e| {
+                    Failure::new(
+                        2,
+                        "lock",
+                        format!("cannot read foundation lock: {e}"),
+                    )
+                })?;
+        let lock = Json::parse(&lock_text).map_err(|e| {
+            Failure::new(2, "lock", format!("cannot read foundation lock: {e}"))
+        })?;
+        let Some(lock_obj) = lock.as_obj() else {
+            return Err(Failure::new(
+                2,
+                "lock",
+                "unsupported lock/toolchain schema",
+            ));
+        };
+        if lock_obj.get("schema").and_then(Json::as_i64) != Some(1)
+            || lock_obj.get("toolchain").and_then(Json::as_str)
+                != Some(TOOLCHAIN)
+        {
+            return Err(Failure::new(
+                2,
+                "lock",
+                "unsupported lock/toolchain schema",
+            ));
+        }
+        self.lock = lock;
+
+        let toolchain_text =
+            fs::read_to_string(self.source.join("lean-toolchain")).map_err(
+                |e| {
+                    Failure::new(
+                        2,
+                        "lock",
+                        format!("cannot read lean-toolchain: {e}"),
+                    )
+                },
+            )?;
+        if toolchain_text.trim() != TOOLCHAIN {
+            return Err(Failure::new(
+                1,
+                "lock",
+                "lean-toolchain differs from lock",
+            ));
+        }
+
+        regular(&self.lean, "toolchain")?;
+        self.lean = fs::canonicalize(&self.lean).map_err(|e| {
+            Failure::new(2, "toolchain", format!("cannot resolve lean: {e}"))
+        })?;
+        let actual_version = self
+            .process("version", &["--version".to_string()])?
+            .trim()
+            .to_string();
+        if self
+            .lock
+            .get("distributions")
+            .and_then(|d| d.get(&actual_version))
+            .and_then(Json::as_str)
+            .is_none()
+        {
+            return Err(Failure::new(
+                2,
+                "toolchain",
+                format!(
+                    "Lean version/commit differs from lock: {actual_version}"
+                ),
+            ));
+        }
+        self.version = actual_version;
+
+        let prefix_raw = self
+            .process("prefix", &["--print-prefix".to_string()])?
+            .trim()
+            .to_string();
+        self.prefix = fs::canonicalize(&prefix_raw).map_err(|e| {
+            Failure::new(2, "toolchain", format!("cannot resolve prefix: {e}"))
+        })?;
+
+        let modules_map =
+            self.lock.get("modules").unwrap().as_obj().unwrap().clone();
+        let graph_map =
+            self.lock.get("graph").unwrap().as_obj().unwrap().clone();
+        self.foundation = modules_map.keys().cloned().collect();
+
+        for (module, record) in &modules_map {
+            let Some(rec_obj) = record.as_obj() else {
+                return Err(Failure::new(
+                    2,
+                    "lock",
+                    format!("incomplete artifact-part policy for {module}"),
+                ));
+            };
+            if rec_obj
+                .get("sourceSha256")
+                .and_then(Json::as_str)
+                .filter(|s| !s.is_empty())
+                .is_none()
+            {
+                return Err(Failure::new(
+                    2,
+                    "lock",
+                    format!("incomplete artifact-part policy for {module}"),
+                ));
+            };
+            let Some(parts_obj) = rec_obj.get("parts").and_then(Json::as_obj)
+            else {
+                return Err(Failure::new(
+                    2,
+                    "lock",
+                    format!("incomplete artifact-part policy for {module}"),
+                ));
+            };
+
+            let rel_mod = module.replace('.', "/");
+            let source_path =
+                self.prefix.join("src/lean").join(format!("{rel_mod}.lean"));
+            regular(&source_path, "foundation")?;
+
+            let mut available = BTreeMap::new();
+            for (part, expected_val) in parts_obj {
+                let relative = format!("{rel_mod}.{part}");
+                let installed = self.prefix.join("lib/lean").join(&relative);
+                if matches!(expected_val, Json::Null) {
+                    if fs::symlink_metadata(&installed).is_ok() {
+                        return Err(Failure::new(
+                            2,
+                            "foundation",
+                            format!("unexpected companion part: {relative}"),
+                        ));
+                    }
+                    continue;
+                }
+                if expected_val.as_str().filter(|s| !s.is_empty()).is_none() {
+                    return Err(Failure::new(
+                        2,
+                        "lock",
+                        format!("invalid part digest for {relative}"),
+                    ));
+                }
+                regular(&installed, "foundation")?;
+                available.insert(
+                    part.clone(),
+                    installed.to_string_lossy().into_owned(),
+                );
+            }
+
+            let olean_group: Vec<String> = PARTS[..3]
+                .iter()
+                .filter_map(|p| available.get(*p).cloned())
+                .collect();
+            let ir_group: Vec<String> = PARTS[3..]
+                .iter()
+                .filter_map(|p| available.get(*p).cloned())
+                .collect();
+            if olean_group.is_empty() {
+                return Err(Failure::new(
+                    2,
+                    "foundation",
+                    format!("missing olean for {module}"),
+                ));
+            }
+            self.artifacts
+                .insert(module.clone(), vec![olean_group, ir_group]);
+        }
+
+        self.graph = graph_map;
+        Ok(())
+    }
+
+    fn compile_lean_module(
+        &mut self,
+        module: &str,
+        src_path: &Path,
+        edge_list: Vec<Json>,
+        lib_subdir: &str,
+        warn_as_err: bool,
+    ) -> Result<(), Failure> {
+        let setup_path = self.write_setup_json(module, &edge_list)?;
+        let output = self
+            .stage
+            .join(lib_subdir)
+            .join(format!("{}.olean", module.replace('.', "/")));
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| Failure::new(2, "compile", e.to_string()))?;
+        }
+        let mut compile_args = vec![
+            "-j1".to_string(),
+            "-M2048".to_string(),
+            "-t0".to_string(),
+            "-DElab.async=false".to_string(),
+            "-Ddebug.skipKernelTC=false".to_string(),
+        ];
+        if warn_as_err {
+            compile_args.push("-DwarningAsError=true".to_string());
+        }
+        compile_args.extend([
+            "--setup".to_string(),
+            setup_path.to_string_lossy().into_owned(),
+            "-o".to_string(),
+            output.to_string_lossy().into_owned(),
+            src_path.to_string_lossy().into_owned(),
+        ]);
+        self.process(&format!("compile-{module}"), &compile_args)?;
+        self.record_compiled_artifacts(module, &output, edge_list)
+    }
+
+    fn record_compiled_artifacts(
+        &mut self,
+        module: &str,
+        output: &Path,
+        edge_list: Vec<Json>,
+    ) -> Result<(), Failure> {
+        let stem = output
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .strip_suffix("olean")
+            .unwrap()
+            .to_string();
+        let parent = output.parent().unwrap();
+        let mut available = BTreeMap::new();
+        for part in PARTS {
+            let artifact = parent.join(format!("{stem}{part}"));
+            if fs::symlink_metadata(&artifact).is_ok() {
+                regular(&artifact, "compile")?;
+                available.insert(
+                    part.to_string(),
+                    artifact.to_string_lossy().into_owned(),
+                );
+            }
+        }
+        if !available.contains_key("olean") {
+            return Err(Failure::new(
+                2,
+                "compile",
+                format!("compiler omitted output for {module}"),
+            ));
+        }
+        let olean_group: Vec<String> = PARTS[..3]
+            .iter()
+            .filter_map(|p| available.get(*p).cloned())
+            .collect();
+        let ir_group: Vec<String> = PARTS[3..]
+            .iter()
+            .filter_map(|p| available.get(*p).cloned())
+            .collect();
+        self.artifacts
+            .insert(module.to_string(), vec![olean_group, ir_group]);
+        self.graph.insert(module.to_string(), Json::Arr(edge_list));
+        Ok(())
+    }
+
+    fn run_audit_inspector(
+        &mut self,
+        has_crate: bool,
+    ) -> Result<Json, Failure> {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "trusted".to_string(),
+            Json::Arr(self.modules.keys().cloned().map(Json::Str).collect()),
+        );
+        fields.insert(
+            "theory".to_string(),
+            Json::Arr(
+                self.theory_modules
+                    .keys()
+                    .cloned()
+                    .map(Json::Str)
+                    .collect(),
+            ),
+        );
+        fields.insert("hasCrate".to_string(), Json::Bool(has_crate));
+        fields.insert(
+            "trustDeclarations".to_string(),
+            Json::Arr(self.trust_declarations.clone()),
+        );
+        self.inspect("audit", fields)
+    }
+
+    /// Run the repository boundary check (`trusted/lean/` plus `theory/` when
+    /// present).
+    pub fn run(&mut self) -> Result<Json, Failure> {
+        if self.checkout.join("Cargo.toml").exists() {
+            check_cargo_boundary(&self.checkout)?;
+        }
+        self.tool_admission()?;
+        self.theory_modules = if self.checkout.join("theory").exists() {
+            scan_lean_tree(&self.checkout.join("theory"), "Anneal")?
+        } else {
+            BTreeMap::new()
+        };
+
+        let mut sources: Vec<Json> = self
+            .modules
+            .iter()
+            .chain(self.theory_modules.iter())
+            .map(|(n, p)| {
+                Json::Arr(vec![
+                    Json::Str(n.clone()),
+                    Json::Str(p.to_string_lossy().into_owned()),
+                ])
+            })
+            .collect();
+        let mut pf_fields = BTreeMap::new();
+        pf_fields.insert("sources".to_string(), Json::Arr(std::mem::take(&mut sources)));
+        let pf_res = self.inspect("preflight", pf_fields)?;
+        let Some(headers) = pf_res.get("headers").and_then(Json::as_arr) else {
+            return Err(Failure::new(
+                2,
+                "preflight",
+                "incomplete source-header inventory",
+            ));
+        };
+
+        let mut imports_map: BTreeMap<String, Vec<Json>> = BTreeMap::new();
+        self.trust_declarations.clear();
+        for h in headers {
+            let mod_name = h
+                .get("module")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_string();
+            if self.modules.contains_key(&mod_name)
+                && let Some(decls) =
+                    h.get("trustDeclarations").and_then(Json::as_arr)
+            {
+                self.trust_declarations.extend(decls.iter().cloned());
+            }
+            let edges = h
+                .get("imports")
+                .and_then(Json::as_arr)
+                .unwrap()
+                .to_vec();
+            let is_trusted = self.modules.contains_key(&mod_name);
+            for edge in &edges {
+                let imp_mod = edge
+                    .get("module")
+                    .and_then(Json::as_str)
+                    .unwrap_or("");
+                let allowed = if is_trusted {
+                    self.artifacts.contains_key(imp_mod)
+                        || self.modules.contains_key(imp_mod)
+                } else {
+                    self.artifacts.contains_key(imp_mod)
+                        || self.modules.contains_key(imp_mod)
+                        || self.theory_modules.contains_key(imp_mod)
+                };
+                if !allowed {
+                    return Err(Failure::new(
+                        1,
+                        "preflight",
+                        format!("foreign/missing import {imp_mod} in {mod_name}"),
+                    ));
+                }
+            }
+            imports_map.insert(mod_name, edges);
+        }
+
+        let trusted_order = topo_sort_modules(
+            self.modules.keys().cloned().collect(),
+            &imports_map,
+            "Trusted import cycle",
+        )?;
+        let theory_order = topo_sort_modules(
+            self.theory_modules.keys().cloned().collect(),
+            &imports_map,
+            "Theory import cycle",
+        )?;
+
+        for (k, v) in &imports_map {
+            self.graph.insert(k.clone(), Json::Arr(v.clone()));
+        }
+
+        for module in &trusted_order {
+            let edge_list = imports_map[module].clone();
+            let raw_src_path = self.modules[module].clone();
+            self.execution_began = true;
+            self.compile_lean_module(
+                module,
+                &raw_src_path,
+                edge_list,
+                "lib",
+                false,
+            )?;
+        }
+
+        for module in &theory_order {
+            let edge_list = imports_map[module].clone();
+            let raw_src_path = self.theory_modules[module].clone();
+            self.execution_began = true;
+            self.compile_lean_module(
+                module,
+                &raw_src_path,
+                edge_list,
+                "theory-lib",
+                true,
+            )?;
+        }
+
+        let mut report = self.run_audit_inspector(false)?;
+
+        let rep_obj = report.as_obj_mut().unwrap();
+        rep_obj.insert(
+            "toolchain".to_string(),
+            Json::Str(self.version.clone()),
+        );
+        rep_obj.insert(
+            "guarantee".to_string(),
+            Json::Str(
+                "kernel dependency closure, module-origin separation, and Cargo DAG boundary"
+                    .to_string(),
+            ),
+        );
+
+        Ok(report)
+    }
+
+    /// Audit a captured crate's `Mir.lean` and `Proof.lean` at
+    /// `trustLevel := 0`.
+    pub fn verify_crate(&mut self, crate_dir: &Path) -> Result<Json, Failure> {
+        self.verify_crate_with_policy(crate_dir, None, None)
+    }
+
+    /// Audit a captured crate's `Mir.lean` and `Proof.lean` at
+    /// `trustLevel := 0`, enforcing `channel_override` and the target crate's
+    /// [`CrateTrustPolicy`].
+    pub fn verify_crate_with_policy(
+        &mut self,
+        crate_dir: &Path,
+        channel_override: Option<ReleaseChannel>,
+        cli_allowed_candidates: Option<&[String]>,
+    ) -> Result<Json, Failure> {
+        let crate_dir = fs::canonicalize(crate_dir).map_err(|e| {
+            Failure::new(
+                2,
+                "crate-input",
+                format!("cannot resolve {}: {e}", crate_dir.display()),
+            )
+        })?;
+        let channel = channel_override.unwrap_or_default();
+        let policy =
+            load_crate_trust_policy(&crate_dir, cli_allowed_candidates)?;
+        let anneal_dir = if crate_dir.join(".anneal/Mir.lean").exists() {
+            crate_dir.join(".anneal")
+        } else {
+            crate_dir.clone()
+        };
+        let mir_path = anneal_dir.join("Mir.lean");
+        let proof_path = anneal_dir.join("Proof.lean");
+        for p in [&mir_path, &proof_path] {
+            regular(p, "crate-input")?;
+        }
+
+        let mut report = self.load_or_build_verify_prefix()?;
+
+        let pf_sources = vec![
+            Json::Arr(vec![
+                Json::Str("Mir".to_string()),
+                Json::Str(mir_path.to_string_lossy().into_owned()),
+            ]),
+            Json::Arr(vec![
+                Json::Str("Proof".to_string()),
+                Json::Str(proof_path.to_string_lossy().into_owned()),
+            ]),
+        ];
+        let mut pf_fields = BTreeMap::new();
+        pf_fields.insert("sources".to_string(), Json::Arr(pf_sources));
+        let pf_res = self.inspect("preflight", pf_fields)?;
+        let Some(headers) = pf_res.get("headers").and_then(Json::as_arr) else {
+            return Err(Failure::new(
+                2,
+                "preflight",
+                "incomplete crate header observation",
+            ));
+        };
+
+        let mut header_edges: BTreeMap<String, Vec<Json>> = BTreeMap::new();
+        for h in headers {
+            let m = h
+                .get("module")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_string();
+            let edges = h
+                .get("imports")
+                .and_then(Json::as_arr)
+                .unwrap()
+                .to_vec();
+            header_edges.insert(m, edges);
+        }
+
+        let mut allowed_mir_imports: BTreeSet<String> =
+            self.foundation.iter().cloned().collect();
+        allowed_mir_imports.extend(self.modules.keys().cloned());
+
+        let mir_edges = header_edges.remove("Mir").unwrap_or_default();
+        if !mir_edges.iter().all(|e| {
+            e.get("module")
+                .and_then(Json::as_str)
+                .is_some_and(|m| allowed_mir_imports.contains(m))
+        }) {
+            return Err(Failure::new(
+                1,
+                "preflight",
+                "Mir.lean imports disallowed modules",
+            ));
+        }
+
+        let mut allowed_proof_imports = allowed_mir_imports;
+        allowed_proof_imports.extend(self.theory_modules.keys().cloned());
+        allowed_proof_imports.insert("Mir".to_string());
+
+        let proof_edges = header_edges.remove("Proof").unwrap_or_default();
+        if !proof_edges.iter().all(|e| {
+            e.get("module")
+                .and_then(Json::as_str)
+                .is_some_and(|m| allowed_proof_imports.contains(m))
+        }) {
+            return Err(Failure::new(
+                1,
+                "preflight",
+                "Proof.lean imports disallowed modules",
+            ));
+        }
+
+        for (module, src_file, edge_list) in [
+            ("Mir", &mir_path, mir_edges),
+            ("Proof", &proof_path, proof_edges),
+        ] {
+            self.compile_lean_module(
+                module,
+                src_file,
+                edge_list,
+                "crate-lib",
+                true,
+            )?;
+        }
+
+        let mut crate_audit = self.run_audit_inspector(true)?;
+
+        let mut active_candidates = BTreeSet::new();
+        if let Some(arr) =
+            crate_audit.get("candidateFeatures").and_then(Json::as_arr)
+        {
+            for item in arr {
+                if let Some(feat) = item.as_str() {
+                    active_candidates.insert(feat.to_string());
+                }
+            }
+        }
+
+        if channel == ReleaseChannel::Stable && !active_candidates.is_empty() {
+            let list: Vec<String> = active_candidates.into_iter().collect();
+            return Err(Failure::new(
+                1,
+                "candidate-policy",
+                format!(
+                    "stable release channel forbids candidate-trusted features, but verification used: {}",
+                    list.join(", ")
+                ),
+            ));
+        }
+
+        for feat in &active_candidates {
+            if !policy.is_allowed(channel, feat) {
+                return Err(Failure::new(
+                    1,
+                    "candidate-policy",
+                    format!(
+                        "candidate-trusted feature `{feat}` is not enabled; opt in via `[package.metadata.anneal.trust-policy] allow-candidate-features = [\"{feat}\"]` or `--allow-candidate-features {feat}`"
+                    ),
+                ));
+            }
+        }
+
+        let unused_candidates: Vec<Json> = policy
+            .allowed_features
+            .iter()
+            .filter(|f| !active_candidates.contains(*f))
+            .cloned()
+            .map(Json::Str)
+            .collect();
+        let active_candidates_json: Vec<Json> =
+            active_candidates.into_iter().map(Json::Str).collect();
+
+        if let Some(cv_obj) = crate_audit.as_obj_mut() {
+            cv_obj.insert(
+                "candidateFeatures".to_string(),
+                Json::Arr(active_candidates_json),
+            );
+            cv_obj.insert(
+                "unusedCandidateFeatures".to_string(),
+                Json::Arr(unused_candidates),
+            );
+        }
+
+        let rep_obj = report.as_obj_mut().unwrap();
+        rep_obj.insert("crateVerification".to_string(), crate_audit);
+        Ok(report)
+    }
+
+    fn load_or_build_verify_prefix(&mut self) -> Result<Json, Failure> {
+        let mut guard = VERIFY_PREFIX_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        if self.checkout.join("Cargo.toml").exists() {
+            check_cargo_boundary(&self.checkout)?;
+        }
+        let trusted_mods = scan_lean_tree(&self.source, "Trusted")?;
+        let theory_mods = if self.checkout.join("theory").exists() {
+            scan_lean_tree(&self.checkout.join("theory"), "Anneal")?
+        } else {
+            BTreeMap::new()
+        };
+        let inspector_src =
+            self.checkout.join("trusted/audit/TrustedBoundary.lean");
+        regular(&inspector_src, "tool-snapshot")?;
+
+        let mut sources = BTreeMap::new();
+        for p in trusted_mods
+            .values()
+            .chain(theory_mods.values())
+            .chain(std::iter::once(&inspector_src))
+        {
+            let bytes = fs::read(p).map_err(|e| {
+                Failure::new(
+                    2,
+                    "io",
+                    format!("cannot read {}: {e}", p.display()),
+                )
+            })?;
+            sources.insert(p.to_string_lossy().into_owned(), bytes);
+        }
+
+        let key = VerifyPrefixKey {
+            checkout: self.checkout.clone(),
+            lean: self.lean.clone(),
+            sources,
+        };
+
+        if let Some(cached) = guard
+            .as_ref()
+            .filter(|c| c.key == key)
+            .cloned()
+        {
+            drop(guard);
+            self.tool_admission()?;
+            self.execution_began = true;
+            for file in &cached.files {
+                let dest = self.stage.join(&file.rel_path);
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent).map_err(|e| {
+                        Failure::new(2, "compile", e.to_string())
+                    })?;
+                }
+                fs::write(&dest, &file.bytes)
+                    .map_err(|e| Failure::new(2, "compile", e.to_string()))?;
+            }
+            for (module, groups_rel) in &cached.compiled_artifacts_rel {
+                let groups_abs: Vec<Vec<String>> = groups_rel
+                    .iter()
+                    .map(|g| {
+                        g.iter()
+                            .map(|rel| {
+                                self.stage
+                                    .join(rel)
+                                    .to_string_lossy()
+                                    .into_owned()
+                            })
+                            .collect()
+                    })
+                    .collect();
+                self.artifacts.insert(module.clone(), groups_abs);
+            }
+            self.graph = cached.graph;
+            self.modules = cached.modules;
+            self.theory_modules = cached.theory_modules;
+            self.trust_declarations = cached.trust_declarations;
+            return Ok(cached.report);
+        }
+
+        let report = self.run()?;
+
+        let mut compiled_artifacts_rel = BTreeMap::new();
+        let mut files = Vec::new();
+        for (module, groups) in &self.artifacts {
+            if self.foundation.contains(module) {
+                continue;
+            }
+            let mut groups_rel = Vec::new();
+            for group in groups {
+                let mut g_rel = Vec::new();
+                for abs_str in group {
+                    let abs_path = Path::new(abs_str);
+                    let rel = abs_path
+                        .strip_prefix(&self.stage)
+                        .map_err(|e| Failure::new(2, "compile", e.to_string()))?
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let bytes = fs::read(abs_path).map_err(|e| {
+                        Failure::new(2, "compile", e.to_string())
+                    })?;
+                    files.push(CachedArtifactFile {
+                        rel_path: rel.clone(),
+                        bytes,
+                    });
+                    g_rel.push(rel);
+                }
+                groups_rel.push(g_rel);
+            }
+            compiled_artifacts_rel.insert(module.clone(), groups_rel);
+        }
+
+        *guard = Some(CachedVerifyPrefix {
+            key,
+            report: report.clone(),
+            compiled_artifacts_rel,
+            graph: self.graph.clone(),
+            modules: self.modules.clone(),
+            theory_modules: self.theory_modules.clone(),
+            trust_declarations: self.trust_declarations.clone(),
+            files,
+        });
+
+        Ok(report)
+    }
+}
+
+fn topo_sort_modules(
+    mut pending: BTreeSet<String>,
+    imports_map: &BTreeMap<String, Vec<Json>>,
+    cycle_msg: &str,
+) -> Result<Vec<String>, Failure> {
+    let mut order = Vec::new();
+    while !pending.is_empty() {
+        let ready: Vec<String> = pending
+            .iter()
+            .filter(|n| {
+                imports_map[*n].iter().all(|e| {
+                    let m = e.get("module").and_then(Json::as_str).unwrap();
+                    !pending.contains(m)
+                })
+            })
+            .cloned()
+            .collect();
+        if ready.is_empty() {
+            return Err(Failure::new(1, "preflight", cycle_msg));
+        }
+        for r in &ready {
+            pending.remove(r);
+        }
+        order.extend(ready);
+    }
+    Ok(order)
+}
