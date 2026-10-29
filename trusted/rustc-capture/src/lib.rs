@@ -44,20 +44,56 @@ pub enum CaptureError {
     UnsupportedMir(String),
 }
 
-/// Captured MIR type (`usize` or `()`).
+/// Captured atomic memory ordering for atomic load operations.
 ///
-/// Corresponds to `Trusted.MirTy` in `trusted/lean/Trusted/MirAst.lean` and
-/// Rust's `usize` type:
+/// Corresponds to `Trusted.AtomicOrdering` in
+/// `trusted/lean/Trusted/MirAst.lean`
+/// and `core::sync::atomic::Ordering` (`Ordering::Relaxed`,
+/// `Ordering::Acquire`):
+///
+/// > "No ordering constraints, only atomic operations. Corresponds to
+/// > [`memory_order_relaxed`] in C++20."
+/// >
+/// > "When coupled with a load, if the loaded value was written by a store
+/// > operation with [`Release`] (or stronger) ordering, then all subsequent
+/// > operations become ordered after that store."
+///
+/// Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/sync/atomic.rs#L466-L503
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapturedAtomicOrdering {
+    Relaxed,
+    Acquire,
+}
+
+impl CapturedAtomicOrdering {
+    fn to_lean(self) -> &'static str {
+        match self {
+            Self::Relaxed => "Trusted.AtomicOrdering.relaxed",
+            Self::Acquire => "Trusted.AtomicOrdering.acquire",
+        }
+    }
+}
+
+/// Captured MIR type (`usize`, `()`, `&Atomic<usize>`, or `Ordering`).
+///
+/// Corresponds to `Trusted.MirTy` in `trusted/lean/Trusted/MirAst.lean`,
+/// Rust's `usize` type, `&core::sync::atomic::Atomic<usize>`, and
+/// `core::sync::atomic::Ordering`:
 ///
 /// > "The `usize` type is an unsigned integer type with the same number of
 /// > bits as the platform's pointer type. It can represent every memory
 /// > address in the process."
 ///
-/// Source: https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/numeric.md#L37-L38
+/// Sources:
+/// - https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/numeric.md#L37-L38
+/// - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/sync/atomic.rs#L36-L42
+/// - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/sync/atomic.rs#L466-L527
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapturedTy {
     Usize,
     Unit,
+    RefAtomicUsize,
+    AtomicOrdering,
 }
 
 impl CapturedTy {
@@ -65,6 +101,8 @@ impl CapturedTy {
         match self {
             Self::Usize => "Trusted.MirTy.usize",
             Self::Unit => "Trusted.MirTy.unit",
+            Self::RefAtomicUsize => "Trusted.MirTy.refAtomicUsize",
+            Self::AtomicOrdering => "Trusted.MirTy.atomicOrdering",
         }
     }
 }
@@ -90,6 +128,7 @@ pub enum CapturedOperand {
     Copy(usize),
     Move(usize),
     ConstUsize(u128),
+    ConstOrdering(CapturedAtomicOrdering),
 }
 
 impl CapturedOperand {
@@ -99,6 +138,10 @@ impl CapturedOperand {
             Self::Move(local) => format!("(Trusted.Operand.move ⟨{local}⟩)"),
             Self::ConstUsize(bits) => format!(
                 "(Trusted.Operand.constVal (Trusted.MirVal.usize {bits}))"
+            ),
+            Self::ConstOrdering(ord) => format!(
+                "(Trusted.Operand.constVal (Trusted.MirVal.ordering {}))",
+                ord.to_lean()
             ),
         }
     }
@@ -146,7 +189,7 @@ impl CapturedStmt {
 /// Captured MIR basic-block terminator.
 ///
 /// Corresponds to `rustc_middle::mir::TerminatorKind` (`Return`, `Goto`,
-/// `Unreachable`):
+/// `Unreachable`, and `Call` specialized to `Atomic::<usize>::load`):
 ///
 /// > "Block has one successor; we continue execution there."
 /// >
@@ -155,13 +198,24 @@ impl CapturedStmt {
 /// > "Indicates a terminator that can never be reached.
 /// >
 /// > Executing this terminator is UB."
+/// >
+/// > "Roughly speaking, evaluates the `func` operand and the arguments, and
+/// > starts execution of the referred to function."
 ///
-/// Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L683-L731
+/// Sources:
+/// - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L683-L808
+/// - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/sync/atomic.rs#L2891-L2917
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapturedTerminator {
     Return,
     Goto(usize),
     Unreachable,
+    CallAtomicLoad {
+        dst: usize,
+        ptr: CapturedOperand,
+        ord: CapturedOperand,
+        target: usize,
+    },
 }
 
 impl CapturedTerminator {
@@ -170,6 +224,16 @@ impl CapturedTerminator {
             Self::Return => "Trusted.Terminator.return_".to_string(),
             Self::Goto(target) => format!("(Trusted.Terminator.goto ⟨{target}⟩)"),
             Self::Unreachable => "Trusted.Terminator.unreachable".to_string(),
+            Self::CallAtomicLoad {
+                dst,
+                ptr,
+                ord,
+                target,
+            } => format!(
+                "(Trusted.Terminator.callAtomicLoad ⟨{dst}⟩ {} {} ⟨{target}⟩)",
+                ptr.to_lean(),
+                ord.to_lean()
+            ),
         }
     }
 }
@@ -199,6 +263,9 @@ pub enum CapturedSpec {
     /// Postcondition `ensures(ret == <arg>)` (`specs := [Trusted.EnsuresEqArg
     /// 1]`).
     EnsuresEqArg(usize),
+    /// Weak-memory atomic load postcondition `ensures(atomic_load(a))`
+    /// (`specs := [Trusted.EnsuresAtomicLoad 1]`).
+    EnsuresAtomicLoad(usize),
 }
 
 impl CapturedSpec {
@@ -207,6 +274,9 @@ impl CapturedSpec {
             Self::WellFormed => "[]".to_string(),
             Self::EnsuresEqArg(local) => {
                 format!("[Trusted.EnsuresEqArg {local}]")
+            }
+            Self::EnsuresAtomicLoad(local) => {
+                format!("[Trusted.EnsuresAtomicLoad {local}]")
             }
         }
     }
@@ -336,6 +406,7 @@ fn parse_source_spec(src: &str) -> Result<CapturedSpec, CaptureError> {
             let clause = rest.trim();
             let parsed = match clause {
                 "ensures(ret == x)" => CapturedSpec::EnsuresEqArg(1),
+                "ensures(atomic_load(a))" => CapturedSpec::EnsuresAtomicLoad(1),
                 "well_formed" => CapturedSpec::WellFormed,
                 other => {
                     return Err(CaptureError::UnsupportedMir(format!(
@@ -595,6 +666,12 @@ fn parse_ty(ty_str: &str) -> Result<CapturedTy, CaptureError> {
     match ty_str {
         "usize" => Ok(CapturedTy::Usize),
         "()" => Ok(CapturedTy::Unit),
+        "&Atomic<usize>"
+        | "&std::sync::atomic::AtomicUsize"
+        | "&core::sync::atomic::AtomicUsize" => Ok(CapturedTy::RefAtomicUsize),
+        "std::sync::atomic::Ordering" | "core::sync::atomic::Ordering" => {
+            Ok(CapturedTy::AtomicOrdering)
+        }
         other => Err(CaptureError::UnsupportedMir(format!(
             "unsupported MIR type `{other}`"
         ))),
@@ -643,12 +720,75 @@ fn parse_stmt_or_terminator(line: &str) -> Result<StmtOrTerm, CaptureError> {
     }
     if let Some((lhs, rhs)) = stmt.split_once('=') {
         let dst = parse_local_token(lhs.trim())?;
-        let op = parse_operand(rhs.trim())?;
+        let rhs_trimmed = rhs.trim();
+        if let Some(call_term) = parse_atomic_load_call(dst, rhs_trimmed)? {
+            return Ok(StmtOrTerm::Term(call_term));
+        }
+        let op = parse_operand(rhs_trimmed)?;
         return Ok(StmtOrTerm::Stmt(CapturedStmt::AssignUse { dst, op }));
     }
     Err(CaptureError::UnsupportedMir(format!(
         "unsupported MIR statement or terminator: `{line}`"
     )))
+}
+
+fn parse_atomic_load_call(
+    dst: usize,
+    rhs: &str,
+) -> Result<Option<CapturedTerminator>, CaptureError> {
+    let Some((call_part, target_part)) = rhs.split_once("->") else {
+        return Ok(None);
+    };
+    let call_trimmed = call_part.trim();
+    let args_inner = call_trimmed
+        .strip_prefix("Atomic::<usize>::load(")
+        .or_else(|| {
+            call_trimmed.strip_prefix("std::sync::atomic::Atomic::<usize>::load(")
+        })
+        .or_else(|| {
+            call_trimmed.strip_prefix("core::sync::atomic::Atomic::<usize>::load(")
+        })
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or_else(|| {
+            CaptureError::UnsupportedMir(format!(
+                "unsupported MIR Call callee: `{call_trimmed}`"
+            ))
+        })?;
+    let (ptr_str, ord_str) = args_inner.split_once(',').ok_or_else(|| {
+        CaptureError::UnsupportedMir(format!(
+            "expected two arguments in Atomic::<usize>::load, found `{args_inner}`"
+        ))
+    })?;
+    let ptr = parse_operand(ptr_str.trim())?;
+    let ord = parse_operand(ord_str.trim())?;
+
+    let bracket_inner = target_part
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| {
+            CaptureError::UnsupportedMir(format!(
+                "malformed Call target list `{target_part}`"
+            ))
+        })?;
+    let return_entry = bracket_inner
+        .split(',')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .strip_prefix("return:")
+        .ok_or_else(|| {
+            CaptureError::UnsupportedMir(format!(
+                "missing `return: bb<n>` in Call target list `{target_part}`"
+            ))
+        })?;
+    let target = parse_bb_index(return_entry.trim())?;
+    Ok(Some(CapturedTerminator::CallAtomicLoad {
+        dst,
+        ptr,
+        ord,
+        target,
+    }))
 }
 
 fn parse_operand(rhs: &str) -> Result<CapturedOperand, CaptureError> {
@@ -657,6 +797,25 @@ fn parse_operand(rhs: &str) -> Result<CapturedOperand, CaptureError> {
     }
     if let Some(local_str) = rhs.strip_prefix("move ") {
         return Ok(CapturedOperand::Move(parse_local_token(local_str.trim())?));
+    }
+    match rhs {
+        "std::sync::atomic::Ordering::Relaxed"
+        | "core::sync::atomic::Ordering::Relaxed"
+        | "const std::sync::atomic::Ordering::Relaxed"
+        | "const core::sync::atomic::Ordering::Relaxed" => {
+            return Ok(CapturedOperand::ConstOrdering(
+                CapturedAtomicOrdering::Relaxed,
+            ));
+        }
+        "std::sync::atomic::Ordering::Acquire"
+        | "core::sync::atomic::Ordering::Acquire"
+        | "const std::sync::atomic::Ordering::Acquire"
+        | "const core::sync::atomic::Ordering::Acquire" => {
+            return Ok(CapturedOperand::ConstOrdering(
+                CapturedAtomicOrdering::Acquire,
+            ));
+        }
+        _ => {}
     }
     if let Some(const_str) = rhs.strip_prefix("const ") {
         if let Some(num_str) = const_str.trim().strip_suffix("_usize") {
@@ -777,6 +936,62 @@ fn id(_1: usize) -> usize {
                 }],
                 terminator: CapturedTerminator::Return,
             }]
+        );
+    }
+
+    #[test]
+    fn parses_rustc_load_relaxed_mir() {
+        let sample = "\
+// WARNING: This output format is intended for human consumers only
+fn load_relaxed(_1: &Atomic<usize>) -> usize {
+    debug a => _1;
+    let mut _0: usize;
+    let mut _2: std::sync::atomic::Ordering;
+
+    bb0: {
+        _2 = std::sync::atomic::Ordering::Relaxed;
+        _0 = Atomic::<usize>::load(copy _1, move _2) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+";
+        let fns = parse_emitted_mir(
+            sample,
+            CapturedSpec::EnsuresAtomicLoad(1),
+        )
+        .unwrap();
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].name, "load_relaxed");
+        assert_eq!(fns[0].arg_tys, vec![CapturedTy::RefAtomicUsize]);
+        assert_eq!(fns[0].ret_ty, CapturedTy::Usize);
+        assert_eq!(fns[0].local_count, 3);
+        assert_eq!(
+            fns[0].blocks,
+            vec![
+                CapturedBlock {
+                    index: 0,
+                    stmts: vec![CapturedStmt::AssignUse {
+                        dst: 2,
+                        op: CapturedOperand::ConstOrdering(
+                            CapturedAtomicOrdering::Relaxed,
+                        ),
+                    }],
+                    terminator: CapturedTerminator::CallAtomicLoad {
+                        dst: 0,
+                        ptr: CapturedOperand::Copy(1),
+                        ord: CapturedOperand::Move(2),
+                        target: 1,
+                    },
+                },
+                CapturedBlock {
+                    index: 1,
+                    stmts: vec![],
+                    terminator: CapturedTerminator::Return,
+                },
+            ]
         );
     }
 }
