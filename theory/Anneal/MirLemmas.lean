@@ -368,6 +368,23 @@ theorem evalMirTerminator_choice_inhabited (s : MirState) (term : Terminator)
     | some v => intro h; cases h
   | goto target => intro h; cases h
   | unreachable => intro h; cases h
+  | callPure2 dst callee arg1 arg2 target =>
+    dsimp [evalMirTerminator]
+    cases evalOperand s.locals arg1 with
+    | none => intro h; cases h
+    | some p1 =>
+      cases p1 with
+      | mk v1 locals1 =>
+        dsimp
+        cases evalOperand locals1 arg2 with
+        | none => intro h; cases h
+        | some p2 =>
+          cases p2 with
+          | mk v2 locals2 =>
+            dsimp
+            cases evalPureCallee2 callee v1 v2 with
+            | none => intro h; cases h
+            | some res => intro h; cases h
   | switchInt discr falseTarget trueTarget =>
     dsimp [evalMirTerminator]
     cases evalOperand s.locals discr with
