@@ -106,6 +106,7 @@ pub enum CapturedTy {
     Bool,
     Unit,
     RefMutUsize,
+    RefSharedUsize,
     RefAtomicUsize,
     AtomicOrdering,
 }
@@ -117,6 +118,7 @@ impl CapturedTy {
             Self::Bool => "Trusted.MirTy.bool",
             Self::Unit => "Trusted.MirTy.unit",
             Self::RefMutUsize => "Trusted.MirTy.refMutUsize",
+            Self::RefSharedUsize => "Trusted.MirTy.refSharedUsize",
             Self::RefAtomicUsize => "Trusted.MirTy.refAtomicUsize",
             Self::AtomicOrdering => "Trusted.MirTy.atomicOrdering",
         }
@@ -384,6 +386,12 @@ pub enum CapturedSpec {
     /// Functional specification for `is_aligned_mask(addr, mask)`
     /// (`specs := [Trusted.EnsuresIsAlignedMask]`).
     EnsuresIsAlignedMask,
+    /// Functional specification for `shared_max(x, y)`
+    /// (`specs := [Trusted.EnsuresSharedMax]`).
+    EnsuresSharedMax,
+    /// Functional specification for `max_assign_shared(dst, src)`
+    /// (`specs := [Trusted.EnsuresMaxAssignShared]`).
+    EnsuresMaxAssignShared,
 }
 
 impl CapturedSpec {
@@ -403,6 +411,12 @@ impl CapturedSpec {
             }
             Self::EnsuresIsAlignedMask => {
                 "[Trusted.EnsuresIsAlignedMask]".to_string()
+            }
+            Self::EnsuresSharedMax => {
+                "[Trusted.EnsuresSharedMax]".to_string()
+            }
+            Self::EnsuresMaxAssignShared => {
+                "[Trusted.EnsuresMaxAssignShared]".to_string()
             }
         }
     }
@@ -568,6 +582,10 @@ fn parse_source_spec(src: &str) -> Result<CapturedSpec, CaptureError> {
                 }
                 "ensures(is_aligned_mask(addr, mask))" => {
                     CapturedSpec::EnsuresIsAlignedMask
+                }
+                "ensures(shared_max(x, y))" => CapturedSpec::EnsuresSharedMax,
+                "ensures(max_assign_shared(dst, src))" => {
+                    CapturedSpec::EnsuresMaxAssignShared
                 }
                 "well_formed" => CapturedSpec::WellFormed,
                 other => {
@@ -840,6 +858,7 @@ fn parse_ty(ty_str: &str) -> Result<CapturedTy, CaptureError> {
         "bool" => Ok(CapturedTy::Bool),
         "()" => Ok(CapturedTy::Unit),
         "&mut usize" => Ok(CapturedTy::RefMutUsize),
+        "&usize" => Ok(CapturedTy::RefSharedUsize),
         "&Atomic<usize>"
         | "&std::sync::atomic::AtomicUsize"
         | "&core::sync::atomic::AtomicUsize" => Ok(CapturedTy::RefAtomicUsize),
@@ -1535,6 +1554,58 @@ fn update_min(_1: &mut usize, _2: &mut usize, _3: usize) -> usize {
         );
         assert_eq!(fns[0].ret_ty, CapturedTy::Usize);
         assert_eq!(fns[0].local_count, 8);
+        assert_eq!(fns[0].blocks.len(), 4);
+    }
+
+    #[test]
+    fn parses_rustc_shared_max_mir() {
+        let sample = "\
+// WARNING: This output format is intended for human consumers only
+fn shared_max(_1: &usize, _2: &usize) -> usize {
+    debug x => _1;
+    debug y => _2;
+    let mut _0: usize;
+    let _3: &usize;
+    let mut _4: bool;
+    let mut _5: usize;
+    let mut _6: usize;
+    scope 1 {
+        debug r => _3;
+    }
+
+    bb0: {
+        _5 = copy (*_1);
+        _6 = copy (*_2);
+        _4 = Lt(move _5, move _6);
+        switchInt(move _4) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _3 = copy _2;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _3 = copy _1;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _0 = copy (*_3);
+        return;
+    }
+}
+";
+        let fns = parse_emitted_mir(sample, CapturedSpec::EnsuresSharedMax)
+            .unwrap();
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].name, "shared_max");
+        assert_eq!(
+            fns[0].arg_tys,
+            vec![CapturedTy::RefSharedUsize, CapturedTy::RefSharedUsize]
+        );
+        assert_eq!(fns[0].ret_ty, CapturedTy::Usize);
+        assert_eq!(fns[0].local_count, 7);
         assert_eq!(fns[0].blocks.len(), 4);
     }
 }
