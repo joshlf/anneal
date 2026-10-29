@@ -140,6 +140,81 @@ def updateMinCrate : Trusted.Crate where
 theorem verify_update_min_crate : Trusted.CrateTheorem updateMinCrate :=
   Anneal.prove_update_min_ensures_crate "update_min"
 
+/-- Captured `MirBody` for
+    `pub fn clamp_assign(x: &mut usize, lo: usize, hi: usize) -> usize { if *x < lo { *x = lo; } else if *x > hi { *x = hi; } *x }`
+    defined using only `Trusted.*` constructors (`ci.type` origin-clean). -/
+def clampAssignBody : Trusted.MirBody where
+  argTys := [.refMutUsize, .usize, .usize]
+  retTy := .usize
+  localCount := 8
+  blocks := [
+    { stmts := [
+        .assign ⟨5⟩ (.deref ⟨1⟩),
+        .assign ⟨4⟩ (.binaryOp .lt (.move ⟨5⟩) (.copy ⟨2⟩))
+      ]
+      terminator := .switchInt (.move ⟨4⟩) ⟨2⟩ ⟨1⟩ },
+    { stmts := [.assignDeref ⟨1⟩ (.copy ⟨2⟩)]
+      terminator := .goto ⟨4⟩ },
+    { stmts := [
+        .assign ⟨7⟩ (.deref ⟨1⟩),
+        .assign ⟨6⟩ (.binaryOp .gt (.move ⟨7⟩) (.copy ⟨3⟩))
+      ]
+      terminator := .switchInt (.move ⟨6⟩) ⟨4⟩ ⟨3⟩ },
+    { stmts := [.assignDeref ⟨1⟩ (.copy ⟨3⟩)]
+      terminator := .goto ⟨4⟩ },
+    { stmts := [.assign ⟨0⟩ (.deref ⟨1⟩)]
+      terminator := .return_ }
+  ]
+
+/-- Captured `Trusted.Crate` for `clamp_assign` with postcondition
+    `Trusted.EnsuresClampAssign`. -/
+def clampAssignCrate : Trusted.Crate where
+  functions := [
+    { name := "clamp_assign"
+      prog := clampAssignBody
+      specs := [Trusted.EnsuresClampAssign] }
+  ]
+  tcb := [Trusted.TCBItem.rustcLowering "clamp_assign" clampAssignBody]
+
+/-- Top-level `Trusted.CrateTheorem` for `clampAssignCrate`, whose statement
+    (`ci.type`) references only `Trusted` and locked foundation constants while
+    its proof term (`ci.value?`) discharges the obligation via the plan-guided
+    functional translation (`Anneal.prove_clamp_assign_ensures_crate`). -/
+theorem verify_clamp_assign_crate : Trusted.CrateTheorem clampAssignCrate :=
+  Anneal.prove_clamp_assign_ensures_crate "clamp_assign"
+
+/-- Captured `MirBody` for
+    `pub fn is_aligned_mask(addr: usize, mask: usize) -> bool { (addr & mask) == 0 }`
+    defined using only `Trusted.*` constructors (`ci.type` origin-clean). -/
+def isAlignedMaskBody : Trusted.MirBody where
+  argTys := [.usize, .usize]
+  retTy := .bool
+  localCount := 4
+  blocks := [
+    { stmts := [
+        .assign ⟨3⟩ (.binaryOp .bitAnd (.copy ⟨1⟩) (.copy ⟨2⟩)),
+        .assign ⟨0⟩ (.binaryOp .eq (.move ⟨3⟩) (.constVal (.usize 0)))
+      ]
+      terminator := .return_ }
+  ]
+
+/-- Captured `Trusted.Crate` for `is_aligned_mask` with postcondition
+    `Trusted.EnsuresIsAlignedMask`. -/
+def isAlignedMaskCrate : Trusted.Crate where
+  functions := [
+    { name := "is_aligned_mask"
+      prog := isAlignedMaskBody
+      specs := [Trusted.EnsuresIsAlignedMask] }
+  ]
+  tcb := [Trusted.TCBItem.rustcLowering "is_aligned_mask" isAlignedMaskBody]
+
+/-- Top-level `Trusted.CrateTheorem` for `isAlignedMaskCrate`, whose statement
+    (`ci.type`) references only `Trusted` and locked foundation constants while
+    its proof term (`ci.value?`) discharges the obligation via the plan-guided
+    functional translation (`Anneal.prove_is_aligned_mask_ensures_crate`). -/
+theorem verify_is_aligned_mask_crate : Trusted.CrateTheorem isAlignedMaskCrate :=
+  Anneal.prove_is_aligned_mask_ensures_crate "is_aligned_mask"
+
 /-!
 ## Non-Step-Based Axiomatic Event-Graph Toy Language
 

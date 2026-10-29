@@ -341,7 +341,7 @@ def evalSymOperand (locals : Nat → Option SymVal) (op : Operand) :
     | some sv => some (sv, locals)
     | none => none
 
-/-- Evaluate a binary comparison operator on two symbolic `SymVal` operands. -/
+/-- Evaluate a binary comparison or bitwise operator on two symbolic `SymVal` operands. -/
 def evalSymBinOp (op : BinOp) (v1 v2 : SymVal) : Option SymVal :=
   match v1, v2 with
   | .usize n1, .usize n2 =>
@@ -349,6 +349,12 @@ def evalSymBinOp (op : BinOp) (v1 v2 : SymVal) : Option SymVal :=
     | .lt => some (.bool (decide (n1 < n2)))
     | .le => some (.bool (decide (n1 ≤ n2)))
     | .eq => some (.bool (decide (n1 = n2)))
+    | .ne => some (.bool (decide (n1 ≠ n2)))
+    | .gt => some (.bool (decide (n2 < n1)))
+    | .ge => some (.bool (decide (n2 ≤ n1)))
+    | .bitAnd => some (.usize (Nat.land n1 n2))
+    | .bitOr => some (.usize (Nat.lor n1 n2))
+    | .bitXor => some (.usize (Nat.xor n1 n2))
   | _, _ => none
 
 /-- Symbolic evaluation of a single MIR `Stmt`. -/
@@ -986,7 +992,7 @@ theorem loans_some_updateLoan {loans : Nat → Option LoanEntry}
   | false => exact h
   | true => exact ⟨e', rfl⟩
 
-/-- Soundness of symbolic binary comparison evaluation (`evalSymBinOp`). -/
+/-- Soundness of symbolic binary comparison and bitwise evaluation (`evalSymBinOp`). -/
 theorem evalSymBinOp_sound {loanLoc : Nat → Option Nat}
     {op : BinOp} {sv1 sv2 res : SymVal} {mv1 mv2 : MirVal}
     (hVal1 : ValRel loanLoc sv1 mv1)
@@ -1013,6 +1019,30 @@ theorem evalSymBinOp_sound {loanLoc : Nat → Option Nat}
         injection hBin with hres
         subst hres
         exact ⟨.bool (decide (n1 = n2)), rfl, rfl⟩
+      | ne =>
+        injection hBin with hres
+        subst hres
+        exact ⟨.bool (decide (n1 ≠ n2)), rfl, rfl⟩
+      | gt =>
+        injection hBin with hres
+        subst hres
+        exact ⟨.bool (decide (n2 < n1)), rfl, rfl⟩
+      | ge =>
+        injection hBin with hres
+        subst hres
+        exact ⟨.bool (decide (n2 ≤ n1)), rfl, rfl⟩
+      | bitAnd =>
+        injection hBin with hres
+        subst hres
+        exact ⟨.usize (Nat.land n1 n2), rfl, rfl⟩
+      | bitOr =>
+        injection hBin with hres
+        subst hres
+        exact ⟨.usize (Nat.lor n1 n2), rfl, rfl⟩
+      | bitXor =>
+        injection hBin with hres
+        subst hres
+        exact ⟨.usize (Nat.xor n1 n2), rfl, rfl⟩
 
 /-- Invariant for an active joined loan `lid` (`entry.owners = [.loan falseLid, .loan trueLid]`):
     1. `falseLid ≠ trueLid`, `falseLid ≠ lid`, and `trueLid ≠ lid`,
@@ -3855,5 +3885,434 @@ theorem updateMinBadPlan_rejected_by_wellFormed :
   intro hwf
   have ⟨hdef, _⟩ := hwf sampleUpdateMinInit True.intro
   exact hdef rfl
+
+/-!
+## 10. Verification of `clamp_assign` and `is_aligned_mask` (Extended Comparisons and Bitwise Operations)
+-/
+
+/-- Exact `Runtime(PostCleanup)` MIR body emitted by `rustc --edition=2024 --emit=mir`
+    for:
+    ```rust
+    pub fn clamp_assign(x: &mut usize, lo: usize, hi: usize) -> usize {
+        if *x < lo {
+            *x = lo;
+        } else if *x > hi {
+            *x = hi;
+        }
+        *x
+    }
+    ``` -/
+def clampAssignBody : MirBody where
+  argTys := [.refMutUsize, .usize, .usize]
+  retTy := .usize
+  localCount := 8
+  blocks := [
+    { stmts := [
+        .assign ⟨5⟩ (.deref ⟨1⟩),
+        .assign ⟨4⟩ (.binaryOp .lt (.move ⟨5⟩) (.copy ⟨2⟩))
+      ]
+      terminator := .switchInt (.move ⟨4⟩) ⟨2⟩ ⟨1⟩ },
+    { stmts := [
+        .assignDeref ⟨1⟩ (.copy ⟨2⟩)
+      ]
+      terminator := .goto ⟨4⟩ },
+    { stmts := [
+        .assign ⟨7⟩ (.deref ⟨1⟩),
+        .assign ⟨6⟩ (.binaryOp .gt (.move ⟨7⟩) (.copy ⟨3⟩))
+      ]
+      terminator := .switchInt (.move ⟨6⟩) ⟨4⟩ ⟨3⟩ },
+    { stmts := [
+        .assignDeref ⟨1⟩ (.copy ⟨3⟩)
+      ]
+      terminator := .goto ⟨4⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.deref ⟨1⟩)
+      ]
+      terminator := .return_ }
+  ]
+
+/-- Exact `Runtime(PostCleanup)` MIR body emitted by `rustc --edition=2024 --emit=mir`
+    for:
+    ```rust
+    pub fn is_aligned_mask(addr: usize, mask: usize) -> bool {
+        (addr & mask) == 0
+    }
+    ``` -/
+def isAlignedMaskBody : MirBody where
+  argTys := [.usize, .usize]
+  retTy := .bool
+  localCount := 4
+  blocks := [
+    { stmts := [
+        .assign ⟨3⟩ (.binaryOp .bitAnd (.copy ⟨1⟩) (.copy ⟨2⟩)),
+        .assign ⟨0⟩ (.binaryOp .eq (.move ⟨3⟩) (.constVal (.usize 0)))
+      ]
+      terminator := .return_ }
+  ]
+
+/-- **First Futamura Projection for `clamp_assign`**:
+    Evaluating `translatePure (computePlan clampAssignBody) clampAssignBody` on
+    universally quantified symbolic inputs `x0 lo hi : Nat` reduces by kernel
+    `rfl` directly to `.ok (.usize (if decide (x0 < lo) then lo else if decide (hi < x0) then hi else x0))`. -/
+theorem translatePure_clampAssign_rfl (x0 lo hi : Nat) :
+    translatePure (computePlan clampAssignBody) clampAssignBody [.refMut x0, .usize lo, .usize hi] =
+      .ok (.usize (if decide (x0 < lo) then lo else if decide (hi < x0) then hi else x0)) :=
+  rfl
+
+/-- **First Futamura Projection for `is_aligned_mask`**:
+    Evaluating `translatePure (computePlan isAlignedMaskBody) isAlignedMaskBody`
+    on universally quantified symbolic inputs `addr mask : Nat` reduces by
+    kernel `rfl` directly to `.ok (.bool (decide (Nat.land addr mask = 0)))`. -/
+theorem translatePure_isAlignedMask_rfl (addr mask : Nat) :
+    translatePure (computePlan isAlignedMaskBody) isAlignedMaskBody [.usize addr, .usize mask] =
+      .ok (.bool (decide (Nat.land addr mask = 0))) :=
+  rfl
+
+/-- Pure functional specification extracted from `clampAssignBody`. -/
+def pureClampAssign (x0 lo hi : Nat) : Nat :=
+  if decide (x0 < lo) then lo else if decide (hi < x0) then hi else x0
+
+/-- Pure functional specification extracted from `isAlignedMaskBody`. -/
+def pureIsAlignedMask (addr mask : Nat) : Bool :=
+  decide (Nat.land addr mask = 0)
+
+/-- Non-trivial property 1 (`clamp_assign` lower bound when `lo ≤ hi`):
+    Whenever `lo ≤ hi`, `lo ≤ pureClampAssign x0 lo hi`. -/
+theorem pureClampAssign_ge_lo (x0 lo hi : Nat) (h : lo ≤ hi) :
+    lo ≤ pureClampAssign x0 lo hi := by
+  unfold pureClampAssign
+  cases h1 : decide (x0 < lo) with
+  | true => exact Nat.le_refl lo
+  | false =>
+    have hnot1 : ¬ (x0 < lo) := of_decide_eq_false h1
+    cases decide (hi < x0) with
+    | true => exact h
+    | false => exact Nat.le_of_not_lt hnot1
+
+/-- Non-trivial property 2 (`clamp_assign` upper bound when `lo ≤ hi`):
+    Whenever `lo ≤ hi`, `pureClampAssign x0 lo hi ≤ hi`. -/
+theorem pureClampAssign_le_hi (x0 lo hi : Nat) (h : lo ≤ hi) :
+    pureClampAssign x0 lo hi ≤ hi := by
+  unfold pureClampAssign
+  cases decide (x0 < lo) with
+  | true => exact h
+  | false =>
+    cases h2 : decide (hi < x0) with
+    | true => exact Nat.le_refl hi
+    | false => exact Nat.le_of_not_lt (of_decide_eq_false h2)
+
+/-- Non-trivial property 3 (`clamp_assign` identity inside `[lo, hi]`):
+    Whenever `lo ≤ x0` and `x0 ≤ hi`, `pureClampAssign x0 lo hi = x0`. -/
+theorem pureClampAssign_eq_self_of_in_bounds (x0 lo hi : Nat)
+    (hlo : lo ≤ x0) (hhi : x0 ≤ hi) :
+    pureClampAssign x0 lo hi = x0 := by
+  unfold pureClampAssign
+  have h1 : decide (x0 < lo) = false := decide_eq_false (Nat.not_lt_of_ge hlo)
+  have h2 : decide (hi < x0) = false := decide_eq_false (Nat.not_lt_of_ge hhi)
+  rw [h1, h2]
+  rfl
+
+/-- Non-trivial property 4 (`clamp_assign` idempotence when `lo ≤ hi`):
+    Clamping an already-clamped value to `[lo, hi]` is a no-op. -/
+theorem pureClampAssign_idempotent (x0 lo hi : Nat) (h : lo ≤ hi) :
+    pureClampAssign (pureClampAssign x0 lo hi) lo hi = pureClampAssign x0 lo hi :=
+  pureClampAssign_eq_self_of_in_bounds
+    (pureClampAssign x0 lo hi) lo hi
+    (pureClampAssign_ge_lo x0 lo hi h)
+    (pureClampAssign_le_hi x0 lo hi h)
+
+/-- Non-trivial property 5 (`is_aligned_mask` exact characterization of alignment):
+    `pureIsAlignedMask addr mask = true` if and only if all masked low bits of
+    `addr` are zero (`Nat.land addr mask = 0`). -/
+theorem pureIsAlignedMask_eq_true_iff (addr mask : Nat) :
+    pureIsAlignedMask addr mask = true ↔ Nat.land addr mask = 0 := by
+  unfold pureIsAlignedMask
+  exact ⟨of_decide_eq_true, decide_eq_true⟩
+
+/-- Non-trivial property 6 (`is_aligned_mask` exact characterization of misalignment):
+    `pureIsAlignedMask addr mask = false` if and only if at least one masked bit
+    of `addr` is non-zero (`Nat.land addr mask ≠ 0`). -/
+theorem pureIsAlignedMask_eq_false_iff (addr mask : Nat) :
+    pureIsAlignedMask addr mask = false ↔ Nat.land addr mask ≠ 0 := by
+  unfold pureIsAlignedMask
+  exact ⟨of_decide_eq_false, decide_eq_false⟩
+
+/-- Non-trivial property 7 (`is_aligned_mask` power-of-two boundary witnesses):
+    `4096` is page-aligned (`mask = 4095`), whereas `4098` is not. -/
+theorem pureIsAlignedMask_page_examples :
+    pureIsAlignedMask 4096 4095 = true ∧ pureIsAlignedMask 4098 4095 = false :=
+  ⟨rfl, rfl⟩
+
+/-- Functional postcondition for `clamp_assign` in `FuncLang`. -/
+def FuncPostClampAssign (init : MirState) (ret : MirVal) : Prop :=
+  ∀ loc x0 lo hi,
+    init.locals 1 = some (.refMutLoc loc) →
+    init.mem.naVal loc = some (.usize x0) →
+    init.locals 2 = some (.usize lo) →
+    init.locals 3 = some (.usize hi) →
+    ret = .usize (if decide (x0 < lo) then lo else if decide (hi < x0) then hi else x0)
+
+/-- Functional postcondition for `is_aligned_mask` in `FuncLang`. -/
+def FuncPostIsAlignedMask (init : MirState) (ret : MirVal) : Prop :=
+  ∀ addr mask,
+    init.locals 1 = some (.usize addr) →
+    init.locals 2 = some (.usize mask) →
+    ret = .bool (decide (Nat.land addr mask = 0))
+
+/-- `translate clampAssignBody` satisfies `FuncLang.Spec FuncPostClampAssign`. -/
+theorem translate_clampAssignBody_spec :
+    FuncLang.sem (translate clampAssignBody) ≤ FuncLang.Spec FuncPostClampAssign := by
+  refine funcSem_le_spec (fun init => ?_)
+  unfold translate evalSym
+  have hSupp : allSupportedArgTys clampAssignBody.argTys = true := rfl
+  rw [hSupp]
+  dsimp
+  cases hExt : extractSymArgs clampAssignBody.argTys init with
+  | none =>
+    refine ⟨(by intro h; cases h), ?_⟩
+    intro ret hok
+    cases hok
+  | some args =>
+    unfold extractSymArgs at hExt
+    cases hblk : (init.block == 0 && init.stmtIdx == 0) with
+    | false => rw [hblk] at hExt; cases hExt
+    | true =>
+      rw [hblk] at hExt
+      dsimp [clampAssignBody, extractSymArgsAux] at hExt
+      cases hloc1 : init.locals 1 with
+      | none => rw [hloc1] at hExt; cases hExt
+      | some mv1 =>
+        rw [hloc1] at hExt
+        cases mv1 with
+        | usize _ | bool _ | unit | atomicLoc _ | ordering _ => cases hExt
+        | refMutLoc loc1 =>
+          dsimp at hExt
+          cases hchk1 : (noAliasBefore init.locals loc1 1 &&
+            decide (init.mem.naWriteTs loc1 ≤ init.mem.curView loc1) &&
+            decide (init.mem.naReadTs loc1 ≤ init.mem.curView loc1)) with
+          | false => rw [hchk1] at hExt; cases hExt
+          | true =>
+            rw [hchk1] at hExt
+            dsimp at hExt
+            cases hna1 : init.mem.naVal loc1 with
+            | none => rw [hna1] at hExt; cases hExt
+            | some naMv1 =>
+              rw [hna1] at hExt
+              cases naMv1 with
+              | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+              | usize x0' =>
+                dsimp at hExt
+                cases hloc2 : init.locals 2 with
+                | none => rw [hloc2] at hExt; cases hExt
+                | some mv2 =>
+                  rw [hloc2] at hExt
+                  cases mv2 with
+                  | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+                  | usize lo' =>
+                    dsimp at hExt
+                    cases hloc3 : init.locals 3 with
+                    | none => rw [hloc3] at hExt; cases hExt
+                    | some mv3 =>
+                      rw [hloc3] at hExt
+                      cases mv3 with
+                      | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+                      | usize hi' =>
+                        dsimp at hExt
+                        injection hExt with hargs
+                        subst hargs
+                        dsimp
+                        rw [translatePure_clampAssign_rfl x0' lo' hi']
+                        refine ⟨(by intro h; cases h), ?_⟩
+                        intro ret hok loc x0 lo hi hl1 hm1 hl2 hl3
+                        injection hok with hret
+                        rw [hloc1] at hl1; injection hl1 with h1_mv; injection h1_mv with h1; subst h1
+                        rw [hna1] at hm1; injection hm1 with hx_mv; injection hx_mv with hx; subst hx
+                        rw [hloc2] at hl2; injection hl2 with h2_mv; injection h2_mv with h2; subst h2
+                        rw [hloc3] at hl3; injection hl3 with h3_mv; injection h3_mv with h3; subst h3
+                        exact hret.symm
+
+/-- `translate isAlignedMaskBody` satisfies `FuncLang.Spec FuncPostIsAlignedMask`. -/
+theorem translate_isAlignedMaskBody_spec :
+    FuncLang.sem (translate isAlignedMaskBody) ≤ FuncLang.Spec FuncPostIsAlignedMask := by
+  refine funcSem_le_spec (fun init => ?_)
+  unfold translate evalSym
+  have hSupp : allSupportedArgTys isAlignedMaskBody.argTys = true := rfl
+  rw [hSupp]
+  dsimp
+  cases hExt : extractSymArgs isAlignedMaskBody.argTys init with
+  | none =>
+    refine ⟨(by intro h; cases h), ?_⟩
+    intro ret hok
+    cases hok
+  | some args =>
+    unfold extractSymArgs at hExt
+    cases hblk : (init.block == 0 && init.stmtIdx == 0) with
+    | false => rw [hblk] at hExt; cases hExt
+    | true =>
+      rw [hblk] at hExt
+      dsimp [isAlignedMaskBody, extractSymArgsAux] at hExt
+      cases hloc1 : init.locals 1 with
+      | none => rw [hloc1] at hExt; cases hExt
+      | some mv1 =>
+        rw [hloc1] at hExt
+        cases mv1 with
+        | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+        | usize addr' =>
+          dsimp at hExt
+          cases hloc2 : init.locals 2 with
+          | none => rw [hloc2] at hExt; cases hExt
+          | some mv2 =>
+            rw [hloc2] at hExt
+            cases mv2 with
+            | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+            | usize mask' =>
+              dsimp at hExt
+              injection hExt with hargs
+              subst hargs
+              dsimp
+              rw [translatePure_isAlignedMask_rfl addr' mask']
+              refine ⟨(by intro h; cases h), ?_⟩
+              intro ret hok addr mask hl1 hl2
+              injection hok with hret
+              rw [hloc1] at hl1; injection hl1 with h1_mv; injection h1_mv with h1; subst h1
+              rw [hloc2] at hl2; injection hl2 with h2_mv; injection h2_mv with h2; subst h2
+              exact hret.symm
+
+/-- `π_func (FuncLang.Spec FuncPostClampAssign)` refines `EnsuresClampAssign`. -/
+theorem π_func_clampAssign_le_ensures :
+    π_func (FuncLang.Spec FuncPostClampAssign) ≤ EnsuresClampAssign := by
+  refine Preorder.le_trans (π_func_spec_le FuncPostClampAssign) ?_
+  intro q _
+  refine ⟨True.intro, ?_⟩
+  intro out hpost ret loc x0 lo hi hterm hl1 hm1 hl2 hl3
+  exact hpost ret hterm loc x0 lo hi hl1 hm1 hl2 hl3
+
+/-- `π_func (FuncLang.Spec FuncPostIsAlignedMask)` refines `EnsuresIsAlignedMask`. -/
+theorem π_func_isAlignedMask_le_ensures :
+    π_func (FuncLang.Spec FuncPostIsAlignedMask) ≤ EnsuresIsAlignedMask := by
+  refine Preorder.le_trans (π_func_spec_le FuncPostIsAlignedMask) ?_
+  intro q _
+  refine ⟨True.intro, ?_⟩
+  intro out hpost ret addr mask hterm hl1 hl2
+  exact hpost ret hterm addr mask hl1 hl2
+
+/-- `EnsuresClampAssign` refines baseline `MirLang.WellFormed`. -/
+theorem ensuresClampAssign_le_wellFormed :
+    EnsuresClampAssign ≤ MirLang.WellFormed :=
+  fun _ _ => ⟨True.intro, fun _ _ => True.intro⟩
+
+/-- `EnsuresIsAlignedMask` refines baseline `MirLang.WellFormed`. -/
+theorem ensuresIsAlignedMask_le_wellFormed :
+    EnsuresIsAlignedMask ≤ MirLang.WellFormed :=
+  fun _ _ => ⟨True.intro, fun _ _ => True.intro⟩
+
+/-- **Source MIR Correctness of `clamp_assign`**:
+    `MirSem clampAssignBody ≤ EnsuresClampAssign`, transferred across `π_func`
+    from `translate_clampAssignBody_spec` via `translate_sound clampAssignBody`. -/
+theorem clampAssignBody_satisfies_ensures :
+    MirSem clampAssignBody ≤ EnsuresClampAssign :=
+  Preorder.le_trans
+    (Preorder.le_trans
+      (translate_sound clampAssignBody)
+      (monotone_π_func translate_clampAssignBody_spec))
+    π_func_clampAssign_le_ensures
+
+/-- `clampAssignBody` satisfies baseline `MirLang.WellFormed`. -/
+theorem clampAssignBody_satisfies_wellFormed :
+    MirSem clampAssignBody ≤ MirLang.WellFormed :=
+  Preorder.le_trans clampAssignBody_satisfies_ensures ensuresClampAssign_le_wellFormed
+
+/-- **Source MIR Correctness of `is_aligned_mask`**:
+    `MirSem isAlignedMaskBody ≤ EnsuresIsAlignedMask`, transferred across
+    `π_func` from `translate_isAlignedMaskBody_spec` via
+    `translate_sound isAlignedMaskBody`. -/
+theorem isAlignedMaskBody_satisfies_ensures :
+    MirSem isAlignedMaskBody ≤ EnsuresIsAlignedMask :=
+  Preorder.le_trans
+    (Preorder.le_trans
+      (translate_sound isAlignedMaskBody)
+      (monotone_π_func translate_isAlignedMaskBody_spec))
+    π_func_isAlignedMask_le_ensures
+
+/-- `isAlignedMaskBody` satisfies baseline `MirLang.WellFormed`. -/
+theorem isAlignedMaskBody_satisfies_wellFormed :
+    MirSem isAlignedMaskBody ≤ MirLang.WellFormed :=
+  Preorder.le_trans isAlignedMaskBody_satisfies_ensures ensuresIsAlignedMask_le_wellFormed
+
+/-- End-to-end `CrateTheorem` witness for `clamp_assign` with `EnsuresClampAssign`. -/
+theorem prove_clamp_assign_ensures_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := clampAssignBody
+        specs := [EnsuresClampAssign]
+      }]
+      tcb := [.rustcLowering fnName clampAssignBody]
+    } := by
+  refine ⟨(by intro h; cases h), ⟨⟨True.intro, True.intro⟩, ?_⟩, True.intro⟩
+  intro hAssumptions
+  have hVerFunc :
+      RustcCompiler.Verified clampAssignBody (π_func (FuncLang.Spec FuncPostClampAssign)) :=
+    verify_through_passes
+      translate_clampAssignBody_spec
+      (translate_sound clampAssignBody)
+      monotone_π_func
+      hAssumptions.1
+  have hVerEnsures : RustcCompiler.Verified clampAssignBody EnsuresClampAssign :=
+    Compiler.Verified.mono hVerFunc π_func_clampAssign_le_ensures hAssumptions.1.1
+  exact Compiler.Verified.with_wellFormedOn
+    hVerEnsures
+    ensuresClampAssign_le_wellFormed
+    hAssumptions.1.1
+
+/-- End-to-end `CrateTheorem` witness for `clamp_assign` with baseline `WellFormed`. -/
+theorem prove_clamp_assign_wf_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := clampAssignBody
+        specs := []
+      }]
+      tcb := [.rustcLowering fnName clampAssignBody]
+    } :=
+  verify_single_fn_wf_crate fnName clampAssignBody clampAssignBody_satisfies_wellFormed
+
+/-- End-to-end `CrateTheorem` witness for `is_aligned_mask` with `EnsuresIsAlignedMask`. -/
+theorem prove_is_aligned_mask_ensures_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := isAlignedMaskBody
+        specs := [EnsuresIsAlignedMask]
+      }]
+      tcb := [.rustcLowering fnName isAlignedMaskBody]
+    } := by
+  refine ⟨(by intro h; cases h), ⟨⟨True.intro, True.intro⟩, ?_⟩, True.intro⟩
+  intro hAssumptions
+  have hVerFunc :
+      RustcCompiler.Verified isAlignedMaskBody (π_func (FuncLang.Spec FuncPostIsAlignedMask)) :=
+    verify_through_passes
+      translate_isAlignedMaskBody_spec
+      (translate_sound isAlignedMaskBody)
+      monotone_π_func
+      hAssumptions.1
+  have hVerEnsures : RustcCompiler.Verified isAlignedMaskBody EnsuresIsAlignedMask :=
+    Compiler.Verified.mono hVerFunc π_func_isAlignedMask_le_ensures hAssumptions.1.1
+  exact Compiler.Verified.with_wellFormedOn
+    hVerEnsures
+    ensuresIsAlignedMask_le_wellFormed
+    hAssumptions.1.1
+
+/-- End-to-end `CrateTheorem` witness for `is_aligned_mask` with baseline `WellFormed`. -/
+theorem prove_is_aligned_mask_wf_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := isAlignedMaskBody
+        specs := []
+      }]
+      tcb := [.rustcLowering fnName isAlignedMaskBody]
+    } :=
+  verify_single_fn_wf_crate fnName isAlignedMaskBody isAlignedMaskBody_satisfies_wellFormed
 
 end Anneal

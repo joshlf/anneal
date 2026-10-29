@@ -169,20 +169,32 @@ inductive Operand where
   | move (src : LocalId)
   | constVal (val : MirVal)
 
-/-- Binary comparison operators in `Rvalue.binaryOp`.
+/-- Binary comparison and bitwise operators in `Rvalue.binaryOp`.
 
-    Corresponds to `rustc_middle::mir::BinOp` comparison variants (`Lt`, `Le`,
-    `Eq`):
+    Corresponds to `rustc_middle::mir::BinOp` comparison and bitwise variants
+    (`Lt`, `Le`, `Eq`, `Ne`, `Gt`, `Ge`, `BitAnd`, `BitOr`, `BitXor`):
 
-    > "Less than (`<`)"
-    > "Less than or equal to (`<=`)"
-    > "Equals (`==`)"
+    > "The `<` operator (less than)"
+    > "The `<=` operator (less than or equal to)"
+    > "The `==` operator (equality)"
+    > "The `!=` operator (not equal to)"
+    > "The `>=` operator (greater than or equal to)"
+    > "The `>` operator (greater than)"
+    > "The `^` operator (bitwise xor)"
+    > "The `&` operator (bitwise and)"
+    > "The `|` operator (bitwise or)"
 
-    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L1060-L1110 -/
+    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L1409-L1443 -/
 inductive BinOp where
   | lt
   | le
   | eq
+  | ne
+  | gt
+  | ge
+  | bitAnd
+  | bitOr
+  | bitXor
 
 /-- Right-hand side value computation of a MIR assignment statement.
 

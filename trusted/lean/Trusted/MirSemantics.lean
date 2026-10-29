@@ -166,11 +166,12 @@ def evalOperand (locals : Nat → Option MirVal) (op : Operand) :
   | .constVal v =>
     some (v, locals)
 
-/-- Evaluate a binary comparison operator on two `MirVal.usize` values,
-    returning `some (.bool b)` on `.usize` inputs and `none` on type mismatch
+/-- Evaluate a binary comparison or bitwise operator on two `MirVal.usize`
+    values, returning `some (.bool b)` for comparisons or `some (.usize n)` for
+    bitwise operations on `.usize` inputs, and `none` on type mismatch
     (`r[undefined.invalid]`).
 
-    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L1060-L1110 -/
+    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L1409-L1443 -/
 def evalBinOp (op : BinOp) (v1 v2 : MirVal) : Option MirVal :=
   match v1, v2 with
   | .usize n1, .usize n2 =>
@@ -178,6 +179,12 @@ def evalBinOp (op : BinOp) (v1 v2 : MirVal) : Option MirVal :=
     | .lt => some (.bool (decide (n1 < n2)))
     | .le => some (.bool (decide (n1 ≤ n2)))
     | .eq => some (.bool (decide (n1 = n2)))
+    | .ne => some (.bool (decide (n1 ≠ n2)))
+    | .gt => some (.bool (decide (n2 < n1)))
+    | .ge => some (.bool (decide (n2 ≤ n1)))
+    | .bitAnd => some (.usize (Nat.land n1 n2))
+    | .bitOr => some (.usize (Nat.lor n1 n2))
+    | .bitXor => some (.usize (Nat.xor n1 n2))
   | _, _ => none
 
 /-- Single-step operational evaluation of a MIR statement.
@@ -430,6 +437,39 @@ def EnsuresUpdateMin : MirLang.Behavior :=
       q.init.mem.naVal locY = some (.usize y0) →
       q.init.locals 3 = some (.usize v0) →
       ret = .usize (if decide (x0 ≤ y0) then v0 else x0))
+
+/-- Postcondition specification for
+    `pub fn clamp_assign(x: &mut usize, lo: usize, hi: usize) -> usize`:
+    - `defined := True`: every finite execution prefix is free of UB and stuck
+      states (`MirLang.WellFormed`), and
+    - `val`: for any initial state where `_1` points to non-atomic location
+      `loc` holding `.usize x0`, `_2` holds `.usize lo`, and `_3` holds
+      `.usize hi`, any normal return value `ret` equals
+      `.usize (if decide (x0 < lo) then lo else if decide (hi < x0) then hi else x0)`. -/
+def EnsuresClampAssign : MirLang.Behavior :=
+  MirLang.Spec (fun q out =>
+    ∀ ret loc x0 lo hi,
+      out.outcome = .terminated (.normal ret) →
+      q.init.locals 1 = some (.refMutLoc loc) →
+      q.init.mem.naVal loc = some (.usize x0) →
+      q.init.locals 2 = some (.usize lo) →
+      q.init.locals 3 = some (.usize hi) →
+      ret = .usize (if decide (x0 < lo) then lo else if decide (hi < x0) then hi else x0))
+
+/-- Postcondition specification for
+    `pub fn is_aligned_mask(addr: usize, mask: usize) -> bool`:
+    - `defined := True`: every finite execution prefix is free of UB and stuck
+      states (`MirLang.WellFormed`), and
+    - `val`: for any initial state where `_1` holds `.usize addr` and `_2`
+      holds `.usize mask`, any normal return value `ret` equals
+      `.bool (decide (Nat.land addr mask = 0))`. -/
+def EnsuresIsAlignedMask : MirLang.Behavior :=
+  MirLang.Spec (fun q out =>
+    ∀ ret addr mask,
+      out.outcome = .terminated (.normal ret) →
+      q.init.locals 1 = some (.usize addr) →
+      q.init.locals 2 = some (.usize mask) →
+      ret = .bool (decide (Nat.land addr mask = 0)))
 
 /-- Abstract type of compiled target artifacts produced by `rustc`. -/
 structure TargetArtifact where
