@@ -151,6 +151,33 @@ pub fn render_proof_lean(functions: &[CapturedFunction]) -> String {
             }
         }
         [func]
+            if func.arg_tys == [CapturedTy::Usize, CapturedTy::Usize]
+                && func.ret_ty == CapturedTy::Usize =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresAddBounded => format!(
+                    "Anneal.prove_add_bounded_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::EnsuresAbsDiff => format!(
+                    "Anneal.prove_abs_diff_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed if func.name == "abs_diff" => format!(
+                    "Anneal.prove_abs_diff_wf_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_add_bounded_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_add_bounded_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [func]
             if func.arg_tys
                 == [CapturedTy::RefSharedUsize, CapturedTy::RefSharedUsize] =>
         {

@@ -162,6 +162,7 @@ pub enum CapturedTy {
     Usize,
     Bool,
     Unit,
+    TupleUsizeBool,
     RefMutUsize,
     RefSharedUsize,
     RefAtomicUsize,
@@ -174,10 +175,39 @@ impl CapturedTy {
             Self::Usize => "Trusted.MirTy.usize",
             Self::Bool => "Trusted.MirTy.bool",
             Self::Unit => "Trusted.MirTy.unit",
+            Self::TupleUsizeBool => "Trusted.MirTy.tupleUsizeBool",
             Self::RefMutUsize => "Trusted.MirTy.refMutUsize",
             Self::RefSharedUsize => "Trusted.MirTy.refSharedUsize",
             Self::RefAtomicUsize => "Trusted.MirTy.refAtomicUsize",
             Self::AtomicOrdering => "Trusted.MirTy.atomicOrdering",
+        }
+    }
+}
+
+/// Captured MIR checked binary arithmetic operator (`AddWithOverflow`,
+/// `SubWithOverflow`, `MulWithOverflow`).
+///
+/// Corresponds to `Trusted.CheckedBinOp` in `trusted/lean/Trusted/MirAst.lean`
+/// and `rustc_middle::mir::BinOp`:
+///
+/// > "The `+` operator (addition) with overflow check"
+/// > "The `-` operator (subtraction) with overflow check"
+/// > "The `*` operator (multiplication) with overflow check"
+///
+/// Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L1409-L1443
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapturedCheckedBinOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+impl CapturedCheckedBinOp {
+    fn to_lean(self) -> &'static str {
+        match self {
+            Self::Add => "Trusted.CheckedBinOp.add",
+            Self::Sub => "Trusted.CheckedBinOp.sub",
+            Self::Mul => "Trusted.CheckedBinOp.mul",
         }
     }
 }
@@ -297,6 +327,20 @@ pub enum CapturedStmt {
         lhs: CapturedOperand,
         rhs: CapturedOperand,
     },
+    AssignCheckedBinOp {
+        dst: usize,
+        op: CapturedCheckedBinOp,
+        lhs: CapturedOperand,
+        rhs: CapturedOperand,
+    },
+    AssignProj0 {
+        dst: usize,
+        src: usize,
+    },
+    AssignProj1 {
+        dst: usize,
+        src: usize,
+    },
     AssignDerefStore {
         dst: usize,
         op: CapturedOperand,
@@ -321,6 +365,18 @@ impl CapturedStmt {
                 op.to_lean(),
                 lhs.to_lean(),
                 rhs.to_lean()
+            ),
+            Self::AssignCheckedBinOp { dst, op, lhs, rhs } => format!(
+                "Trusted.Stmt.assign ⟨{dst}⟩ (Trusted.Rvalue.checkedBinaryOp {} {} {})",
+                op.to_lean(),
+                lhs.to_lean(),
+                rhs.to_lean()
+            ),
+            Self::AssignProj0 { dst, src } => format!(
+                "Trusted.Stmt.assign ⟨{dst}⟩ (Trusted.Rvalue.proj0 ⟨{src}⟩)"
+            ),
+            Self::AssignProj1 { dst, src } => format!(
+                "Trusted.Stmt.assign ⟨{dst}⟩ (Trusted.Rvalue.proj1 ⟨{src}⟩)"
             ),
             Self::AssignDerefStore { dst, op } => format!(
                 "Trusted.Stmt.assignDeref ⟨{dst}⟩ {}",
@@ -375,6 +431,10 @@ pub enum CapturedTerminator {
         ord: CapturedOperand,
         target: usize,
     },
+    AssertNotOverflow {
+        tuple_local: usize,
+        target: usize,
+    },
 }
 
 impl CapturedTerminator {
@@ -400,6 +460,12 @@ impl CapturedTerminator {
                 "(Trusted.Terminator.callAtomicLoad ⟨{dst}⟩ {} {} ⟨{target}⟩)",
                 ptr.to_lean(),
                 ord.to_lean()
+            ),
+            Self::AssertNotOverflow {
+                tuple_local,
+                target,
+            } => format!(
+                "(Trusted.Terminator.assertNotOverflow ⟨{tuple_local}⟩ ⟨{target}⟩)"
             ),
         }
     }
@@ -455,6 +521,12 @@ pub enum CapturedSpec {
     /// Functional specification for `two_phase_reborrow(x, y, a, b)`
     /// (`specs := [Trusted.EnsuresTwoPhaseReborrow]`).
     EnsuresTwoPhaseReborrow,
+    /// Functional specification for `add_bounded(x, y)`
+    /// (`specs := [Trusted.EnsuresAddBounded]`).
+    EnsuresAddBounded,
+    /// Functional specification for `abs_diff(x, y)`
+    /// (`specs := [Trusted.EnsuresAbsDiff]`).
+    EnsuresAbsDiff,
 }
 
 impl CapturedSpec {
@@ -486,6 +558,12 @@ impl CapturedSpec {
             }
             Self::EnsuresTwoPhaseReborrow => {
                 "[Trusted.EnsuresTwoPhaseReborrow]".to_string()
+            }
+            Self::EnsuresAddBounded => {
+                "[Trusted.EnsuresAddBounded]".to_string()
+            }
+            Self::EnsuresAbsDiff => {
+                "[Trusted.EnsuresAbsDiff]".to_string()
             }
         }
     }
@@ -689,6 +767,12 @@ fn parse_source_spec(src: &str) -> Result<CapturedSpec, CaptureError> {
                 "ensures(sort_pair(x, y))" => CapturedSpec::EnsuresSortPair,
                 "ensures(two_phase_reborrow(x, y, a, b))" => {
                     CapturedSpec::EnsuresTwoPhaseReborrow
+                }
+                "ensures(add_bounded(x, y))" => {
+                    CapturedSpec::EnsuresAddBounded
+                }
+                "ensures(abs_diff(x, y))" => {
+                    CapturedSpec::EnsuresAbsDiff
                 }
                 "well_formed" => CapturedSpec::WellFormed,
                 other => {
@@ -960,6 +1044,7 @@ fn parse_ty(ty_str: &str) -> Result<CapturedTy, CaptureError> {
         "usize" => Ok(CapturedTy::Usize),
         "bool" => Ok(CapturedTy::Bool),
         "()" => Ok(CapturedTy::Unit),
+        "(usize, bool)" => Ok(CapturedTy::TupleUsizeBool),
         "&mut usize" => Ok(CapturedTy::RefMutUsize),
         "&usize" => Ok(CapturedTy::RefSharedUsize),
         "&Atomic<usize>"
@@ -997,6 +1082,9 @@ fn parse_stmt_or_terminator(line: &str) -> Result<StmtOrTerm, CaptureError> {
     }
     if let Some(switch_term) = parse_switch_int(stmt)? {
         return Ok(StmtOrTerm::Term(switch_term));
+    }
+    if let Some(assert_term) = parse_assert_not_overflow(stmt)? {
+        return Ok(StmtOrTerm::Term(assert_term));
     }
     if stmt == "nop" {
         return Ok(StmtOrTerm::Stmt(CapturedStmt::Nop));
@@ -1045,6 +1133,14 @@ fn parse_stmt_or_terminator(line: &str) -> Result<StmtOrTerm, CaptureError> {
                 dst,
                 src,
             }));
+        }
+        if let Some(proj_stmt) = parse_tuple_proj_rvalue(dst, rhs_trimmed)? {
+            return Ok(StmtOrTerm::Stmt(proj_stmt));
+        }
+        if let Some(checked_stmt) =
+            parse_checked_binop_rvalue(dst, rhs_trimmed)?
+        {
+            return Ok(StmtOrTerm::Stmt(checked_stmt));
         }
         if let Some(binop_stmt) = parse_binop_rvalue(dst, rhs_trimmed)? {
             return Ok(StmtOrTerm::Stmt(binop_stmt));
@@ -1110,6 +1206,119 @@ fn parse_switch_int(
         discr,
         false_target,
         true_target,
+    }))
+}
+
+fn parse_assert_not_overflow(
+    stmt: &str,
+) -> Result<Option<CapturedTerminator>, CaptureError> {
+    let Some(rest) = stmt.strip_prefix("assert(") else {
+        return Ok(None);
+    };
+    let (args_part, targets_part) = rest
+        .rsplit_once(") ->")
+        .or_else(|| rest.rsplit_once(")->"))
+        .ok_or_else(|| {
+            CaptureError::UnsupportedMir(format!(
+                "malformed assert terminator `{stmt}`"
+            ))
+        })?;
+    let cond_str = args_part
+        .split(',')
+        .next()
+        .unwrap_or("")
+        .trim();
+    let local_str = cond_str
+        .strip_prefix("!move (")
+        .or_else(|| cond_str.strip_prefix("!copy ("))
+        .and_then(|s| s.strip_suffix(".1: bool)"))
+        .ok_or_else(|| {
+            CaptureError::UnsupportedMir(format!(
+                "expected `!move (_<n>.1: bool)` in assert terminator, found `{cond_str}`"
+            ))
+        })?;
+    let tuple_local = parse_local_token(local_str.trim())?;
+    let bracket_inner = targets_part
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| {
+            CaptureError::UnsupportedMir(format!(
+                "malformed assert target list `{targets_part}`"
+            ))
+        })?;
+    let success_entry = bracket_inner
+        .split(',')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .strip_prefix("success:")
+        .ok_or_else(|| {
+            CaptureError::UnsupportedMir(format!(
+                "missing `success: bb<n>` in assert target list `{targets_part}`"
+            ))
+        })?;
+    let target = parse_bb_index(success_entry.trim())?;
+    Ok(Some(CapturedTerminator::AssertNotOverflow {
+        tuple_local,
+        target,
+    }))
+}
+
+fn parse_tuple_proj_rvalue(
+    dst: usize,
+    rhs: &str,
+) -> Result<Option<CapturedStmt>, CaptureError> {
+    let Some(inner) = rhs
+        .strip_prefix("move (")
+        .or_else(|| rhs.strip_prefix("copy ("))
+        .and_then(|s| s.strip_suffix(')'))
+    else {
+        return Ok(None);
+    };
+    if let Some(local_str) = inner.strip_suffix(".0: usize") {
+        let src = parse_local_token(local_str.trim())?;
+        return Ok(Some(CapturedStmt::AssignProj0 { dst, src }));
+    }
+    if let Some(local_str) = inner.strip_suffix(".1: bool") {
+        let src = parse_local_token(local_str.trim())?;
+        return Ok(Some(CapturedStmt::AssignProj1 { dst, src }));
+    }
+    Err(CaptureError::UnsupportedMir(format!(
+        "unsupported tuple projection rvalue `{rhs}`"
+    )))
+}
+
+fn parse_checked_binop_rvalue(
+    dst: usize,
+    rhs: &str,
+) -> Result<Option<CapturedStmt>, CaptureError> {
+    let (op, rest) = if let Some(r) = rhs.strip_prefix("AddWithOverflow(") {
+        (CapturedCheckedBinOp::Add, r)
+    } else if let Some(r) = rhs.strip_prefix("SubWithOverflow(") {
+        (CapturedCheckedBinOp::Sub, r)
+    } else if let Some(r) = rhs.strip_prefix("MulWithOverflow(") {
+        (CapturedCheckedBinOp::Mul, r)
+    } else {
+        return Ok(None);
+    };
+    let args_inner = rest.strip_suffix(')').ok_or_else(|| {
+        CaptureError::UnsupportedMir(format!(
+            "unclosed checked binary operator rvalue `{rhs}`"
+        ))
+    })?;
+    let (lhs_str, rhs_str) = args_inner.split_once(',').ok_or_else(|| {
+        CaptureError::UnsupportedMir(format!(
+            "expected two operands in checked binary operator `{rhs}`"
+        ))
+    })?;
+    let lhs = parse_operand(lhs_str.trim())?;
+    let rhs_op = parse_operand(rhs_str.trim())?;
+    Ok(Some(CapturedStmt::AssignCheckedBinOp {
+        dst,
+        op,
+        lhs,
+        rhs: rhs_op,
     }))
 }
 
@@ -1761,5 +1970,60 @@ fn sort_pair(_1: &mut usize, _2: &mut usize) -> usize {
         assert_eq!(fns[0].ret_ty, CapturedTy::Usize);
         assert_eq!(fns[0].local_count, 8);
         assert_eq!(fns[0].blocks.len(), 3);
+    }
+
+    #[test]
+    fn parses_rustc_add_bounded_mir() {
+        let sample = "\
+// WARNING: This output format is intended for human consumers only
+fn add_bounded(_1: usize, _2: usize) -> usize {
+    debug x => _1;
+    debug y => _2;
+    let mut _0: usize;
+    let mut _3: bool;
+    let mut _4: bool;
+    let mut _5: (usize, bool);
+
+    bb0: {
+        _3 = Le(copy _1, const 1000_usize);
+        switchInt(move _3) -> [0: bb4, otherwise: bb1];
+    }
+
+    bb1: {
+        _4 = Le(copy _2, const 1000_usize);
+        switchInt(move _4) -> [0: bb4, otherwise: bb2];
+    }
+
+    bb2: {
+        _5 = AddWithOverflow(copy _1, copy _2);
+        assert(!move (_5.1: bool), \"attempt to compute `{} + {}`, which would overflow\", copy _1, copy _2) -> [success: bb3, unwind continue];
+    }
+
+    bb3: {
+        _0 = move (_5.0: usize);
+        goto -> bb5;
+    }
+
+    bb4: {
+        _0 = const 0_usize;
+        goto -> bb5;
+    }
+
+    bb5: {
+        return;
+    }
+}
+";
+        let fns = parse_emitted_mir(sample, CapturedSpec::EnsuresAddBounded)
+            .unwrap();
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].name, "add_bounded");
+        assert_eq!(
+            fns[0].arg_tys,
+            vec![CapturedTy::Usize, CapturedTy::Usize]
+        );
+        assert_eq!(fns[0].ret_ty, CapturedTy::Usize);
+        assert_eq!(fns[0].local_count, 6);
+        assert_eq!(fns[0].blocks.len(), 6);
     }
 }

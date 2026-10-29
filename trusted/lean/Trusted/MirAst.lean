@@ -113,11 +113,16 @@ inductive AtomicOrdering where
       > "Mutable references (`&mut T`), also called exclusive references, allow
       > mutating the value they point to."
 
+    - `MirTy.tupleUsizeBool` models the `(usize, bool)` tuple returned by
+      checked arithmetic operations (`AddWithOverflow`, `SubWithOverflow`,
+      `MulWithOverflow`).
+
     - `MirTy.atomicOrdering` models `core::sync::atomic::Ordering`.
 
     Sources:
     - https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/numeric.md#L37-L38
     - https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/boolean.md#L6-L7
+    - https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/tuple.md#L6-L10
     - https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/pointer.md#L12-L38
     - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/sync/atomic.rs#L36-L42
     - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/sync/atomic.rs#L466-L527 -/
@@ -126,13 +131,15 @@ inductive MirTy where
   | usize
   | bool
   | unit
+  | tupleUsizeBool
   | refAtomicUsize
   | refSharedUsize
   | refMutUsize
   | atomicOrdering
 
-/-- Initialized runtime scalar value (`usize`, `bool`, `()`, `&AtomicUsize`
-    location, `&usize` location, `&mut usize` location, or `Ordering`).
+/-- Initialized runtime scalar or pair value (`usize`, `bool`, `()`,
+    `(usize, bool)`, `&AtomicUsize` location, `&usize` location, `&mut usize`
+    location, or `Ordering`).
 
     In Rust, scalar values and references must be initialized and valid when
     produced; uninitialized locals are represented in `MirState` by
@@ -160,6 +167,7 @@ inductive MirVal where
   | usize (bits : Nat)
   | bool (b : Bool)
   | unit
+  | tupleUsizeBool (val : Nat) (overflow : Bool)
   | atomicLoc (loc : Nat)
   | refSharedLoc (loc : Nat)
   | refMutLoc (loc : Nat)
@@ -220,10 +228,28 @@ inductive BinOp where
   | bitOr
   | bitXor
 
+/-- Checked binary arithmetic operators in `Rvalue.checkedBinaryOp` producing a
+    `(usize, bool)` pair (`MirVal.tupleUsizeBool`).
+
+    Corresponds to `rustc_middle::mir::BinOp` checked arithmetic variants
+    (`AddWithOverflow`, `SubWithOverflow`, `MulWithOverflow`):
+
+    > "The `+` operator (addition) with overflow check"
+    > "The `-` operator (subtraction) with overflow check"
+    > "The `*` operator (multiplication) with overflow check"
+
+    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L1409-L1443 -/
+@[candidate mir_ast]
+inductive CheckedBinOp where
+  | add
+  | sub
+  | mul
+
 /-- Right-hand side value computation of a MIR assignment statement.
 
     Corresponds to `rustc_middle::mir::Rvalue` (`Use`, `Use(Copy(*src))`
-    dereference load, and `BinaryOp`):
+    dereference load, `BinaryOp`, checked arithmetic `BinaryOp`, and tuple
+    field projection loads `_src.0` / `_src.1`):
 
     > "Yields the operand unchanged, except for a potential retag."
     >
@@ -239,6 +265,9 @@ inductive Rvalue where
   | use (op : Operand)
   | deref (src : LocalId)
   | binaryOp (op : BinOp) (lhs : Operand) (rhs : Operand)
+  | checkedBinaryOp (op : CheckedBinOp) (lhs : Operand) (rhs : Operand)
+  | proj0 (src : LocalId)
+  | proj1 (src : LocalId)
 
 /-- Sequential statement inside a MIR basic block.
 
@@ -310,6 +339,7 @@ inductive Terminator where
   | unreachable
   | callAtomicLoad (dst : LocalId) (ptr : Operand) (ord : Operand) (target : BlockId)
   | switchInt (discr : Operand) (falseTarget : BlockId) (trueTarget : BlockId)
+  | assertNotOverflow (tupleLocal : LocalId) (target : BlockId)
 
 /-- Basic block consisting of sequential statements and a single terminator.
 
