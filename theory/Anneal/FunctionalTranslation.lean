@@ -377,6 +377,18 @@ def evalSymCheckedBinOp (op : CheckedBinOp) (v1 v2 : SymVal) : Option SymVal :=
     | .mul => some (.tupleUsizeBool (n1 * n2) (decide (usizeMax < n1 * n2)))
   | _, _ => none
 
+/-- Evaluate a pure 2-argument `usize` callee (`PureCallee2`) on two symbolic
+    `SymVal` operands. -/
+def evalSymPureCallee2 (callee : PureCallee2) (v1 v2 : SymVal) : Option SymVal :=
+  match v1, v2 with
+  | .usize x0, .usize y0 =>
+    match callee with
+    | .addBounded =>
+      some (.usize (if decide (x0 ≤ 1000) && decide (y0 ≤ 1000) then x0 + y0 else 0))
+    | .absDiff =>
+      some (.usize (if decide (y0 ≤ x0) then x0 - y0 else y0 - x0))
+  | _, _ => none
+
 /-- Symbolic evaluation of a single MIR `Stmt`. -/
 def evalSymStmt (sym : SymState) (stmt : Stmt) : Option SymState :=
   match stmt with
@@ -503,6 +515,22 @@ def evalSymStep (body : MirBody) (sym : SymState) : Option (Bool × SymState) :=
         | some (.tupleUsizeBool _ ov) =>
           some (ov, { sym with block := target.index, stmtIdx := 0 })
         | _ => none
+      | .callPure2 dst callee arg1 arg2 target =>
+        match evalSymOperand sym.locals arg1 with
+        | none => none
+        | some (v1, locals1) =>
+          match evalSymOperand locals1 arg2 with
+          | none => none
+          | some (v2, locals2) =>
+            match evalSymPureCallee2 callee v1 v2 with
+            | some res =>
+              some (false, {
+                sym with
+                locals := updateSymLocal locals2 dst.index (some res)
+                block := target.index
+                stmtIdx := 0
+              })
+            | none => none
       | _ => none
 
 /-- Execute `Terminator.return_` at the end of the current block, returning the
@@ -1179,6 +1207,31 @@ theorem evalSymCheckedBinOp_sound {loanLoc : Nat → Option Nat} {sharedLoc : Na
         subst hres
         exact ⟨.tupleUsizeBool (n1 * n2) (decide (usizeMax < n1 * n2)), rfl, rfl⟩
 
+theorem evalSymPureCallee2_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
+    {callee : PureCallee2} {v1 v2 res : SymVal} {mv1 mv2 : MirVal}
+    (hVal1 : ValRel loanLoc sharedLoc v1 mv1)
+    (hVal2 : ValRel loanLoc sharedLoc v2 mv2)
+    (hCall : evalSymPureCallee2 callee v1 v2 = some res) :
+    ∃ mres,
+      evalPureCallee2 callee mv1 mv2 = some mres ∧
+      ValRel loanLoc sharedLoc res mres := by
+  cases v1 with
+  | bool _ | unit | tupleUsizeBool _ _ | refShared _ | borrow _ => cases hCall
+  | usize x0 =>
+    cases v2 with
+    | bool _ | unit | tupleUsizeBool _ _ | refShared _ | borrow _ => cases hCall
+    | usize y0 =>
+      subst hVal1 hVal2
+      cases callee with
+      | addBounded =>
+        injection hCall with hres
+        subst hres
+        exact ⟨.usize (if decide (x0 ≤ 1000) && decide (y0 ≤ 1000) then x0 + y0 else 0), rfl, rfl⟩
+      | absDiff =>
+        injection hCall with hres
+        subst hres
+        exact ⟨.usize (if decide (y0 ≤ x0) then x0 - y0 else y0 - x0), rfl, rfl⟩
+
 /-- Invariant for an active joined loan `lid` (`entry.owners = [.loan falseLid, .loan trueLid]`):
     1. `falseLid ≠ trueLid`, `falseLid ≠ lid`, and `trueLid ≠ lid`,
     2. `loans falseLid` and `loans trueLid` are present, frozen, and have
@@ -1508,7 +1561,8 @@ theorem evalReturn_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat
     | none =>
       rw [hstmt] at hRet
       cases hterm : bb.terminator with
-      | goto _ | unreachable | callAtomicLoad _ _ _ _ | switchInt _ _ _ | assertNotOverflow _ _ =>
+      | goto _ | unreachable | callAtomicLoad _ _ _ _ | switchInt _ _ _
+      | assertNotOverflow _ _ | callPure2 _ _ _ _ _ =>
         rw [hterm] at hRet; cases hRet
       | return_ =>
         rw [hterm] at hRet
@@ -2036,6 +2090,73 @@ theorem evalSymStep_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Na
                 localRel := hState.localRel
                 loanRel := hState.loanRel
               }
+      | callPure2 dst callee arg1 arg2 target =>
+        rw [hterm] at hStep
+        dsimp at hStep
+        cases hOp1 : evalSymOperand sym.locals arg1 with
+        | none => rw [hOp1] at hStep; cases hStep
+        | some p1 =>
+          cases p1 with
+          | mk v1 locals1 =>
+            rw [hOp1] at hStep
+            dsimp at hStep
+            cases hOp2 : evalSymOperand locals1 arg2 with
+            | none => rw [hOp2] at hStep; cases hStep
+            | some p2 =>
+              cases p2 with
+              | mk v2 locals2 =>
+                rw [hOp2] at hStep
+                dsimp at hStep
+                cases hCall : evalSymPureCallee2 callee v1 v2 with
+                | none => rw [hCall] at hStep; cases hStep
+                | some res =>
+                  rw [hCall] at hStep
+                  injection hStep with hpair
+                  injection hpair with _ hsym'
+                  subst hsym'
+                  have ⟨mv1, concLocals1, hConcOp1, hVal1, hLocRel1⟩ :=
+                    evalSymOperand_sound hState.localRel hOp1
+                  have ⟨mv2, concLocals2, hConcOp2, hVal2, hLocRel2⟩ :=
+                    evalSymOperand_sound hLocRel1 hOp2
+                  have ⟨mres, hConcCall, hValRes⟩ :=
+                    evalSymPureCallee2_sound hVal1 hVal2 hCall
+                  have hBor1 := evalSymOperand_borrows hState.localBorrows hOp1
+                  have hBor2 := evalSymOperand_borrows hBor1.2 hOp2
+                  have hResNotBorrow : ∀ lid, res = .borrow lid → False := by
+                    intro lid heq
+                    subst heq
+                    cases v1 with
+                    | bool _ | unit | tupleUsizeBool _ _ | refShared _ | borrow _ => cases hCall
+                    | usize _ =>
+                      cases v2 with
+                      | bool _ | unit | tupleUsizeBool _ _ | refShared _ | borrow _ => cases hCall
+                      | usize _ =>
+                        cases callee <;> cases hCall
+                  refine ⟨{ conc with
+                    locals := updateLocal concLocals2 dst.index (some mres)
+                    block := target.index
+                    stmtIdx := 0
+                  }, ?_, ?_⟩
+                  · unfold evalMirStep
+                    rw [hState.block_eq, hbb]
+                    dsimp
+                    rw [hState.stmtIdx_eq, hstmt]
+                    dsimp
+                    rw [hterm]
+                    dsimp [evalMirTerminator]
+                    rw [hConcOp1]
+                    dsimp
+                    rw [hConcOp2]
+                    dsimp
+                    rw [hConcCall]
+                  · exact {
+                      block_eq := rfl
+                      stmtIdx_eq := rfl
+                      localBorrows := localBorrows_update_some dst.index hBor2.2
+                        (fun lid h => False.elim (hResNotBorrow lid h))
+                      localRel := LocalRel.update_some hLocRel2 dst.index hValRes
+                      loanRel := hState.loanRel
+                    }
 
 /-- Soundness of `evalBranchStep` (`Terminator.switchInt`). -/
 theorem evalBranchStep_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
@@ -2057,7 +2178,8 @@ theorem evalBranchStep_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat →
     | none =>
       rw [hstmt] at hBranch
       cases hterm : bb.terminator with
-      | return_ | goto _ | unreachable | callAtomicLoad _ _ _ _ | assertNotOverflow _ _ =>
+      | return_ | goto _ | unreachable | callAtomicLoad _ _ _ _
+      | assertNotOverflow _ _ | callPure2 _ _ _ _ _ =>
         rw [hterm] at hBranch; cases hBranch
       | switchInt discr falseTarget trueTarget =>
         rw [hterm] at hBranch
@@ -2401,7 +2523,8 @@ theorem matchBorrowArm_eq_some {bb : BasicBlock} {dst src joinBlk : Nat}
           | copy srcPlace =>
             dsimp at h
             cases hterm : bb.terminator with
-            | return_ | unreachable | callAtomicLoad _ _ _ _ | switchInt _ _ _ | assertNotOverflow _ _ =>
+            | return_ | unreachable | callAtomicLoad _ _ _ _ | switchInt _ _ _
+            | assertNotOverflow _ _ | callPure2 _ _ _ _ _ =>
               rw [hterm] at h; cases h
             | goto jBlk =>
               rw [hterm] at h
@@ -2440,7 +2563,8 @@ theorem evalJoinBorrow_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat →
       | none =>
         rw [hstmt] at hJoin
         cases hterm : bb.terminator with
-        | return_ | goto _ | unreachable | callAtomicLoad _ _ _ _ | assertNotOverflow _ _ =>
+        | return_ | goto _ | unreachable | callAtomicLoad _ _ _ _
+        | assertNotOverflow _ _ | callPure2 _ _ _ _ _ =>
           rw [hterm] at hJoin; cases hJoin
         | switchInt discr falseTarget trueTarget =>
           rw [hterm] at hJoin
@@ -3866,7 +3990,7 @@ noncomputable def computePlanAux :
           | .refMutUsize, _ => .ret
           | _, some (joinedLid, _, _) => .endLoan joinedLid .ret
           | _, none => .ret
-        | .goto target | .assertNotOverflow _ target =>
+        | .goto target | .assertNotOverflow _ target | .callPure2 _ _ _ _ target =>
           .step (computePlanAux fuel body target.index 0 activeJoin)
         | .switchInt _ falseTarget trueTarget =>
           match activeJoin, body.blocks[falseTarget.index]?, body.blocks[trueTarget.index]? with
@@ -6761,7 +6885,8 @@ theorem evalSymStateToReturn_sound (plan : TransPlan) (body : MirBody) :
       | none =>
         rw [hstmt] at hEval
         cases hterm : bb.terminator with
-        | goto _ | unreachable | callAtomicLoad _ _ _ _ | switchInt _ _ _ | assertNotOverflow _ _ =>
+        | goto _ | unreachable | callAtomicLoad _ _ _ _ | switchInt _ _ _
+        | assertNotOverflow _ _ | callPure2 _ _ _ _ _ =>
           rw [hterm] at hEval; cases hEval
         | return_ =>
           rw [hterm] at hEval
@@ -7782,5 +7907,267 @@ theorem prove_count_up_wf_crate (fnName : String) :
       tcb := [.rustcLowering fnName countUpBody]
     } :=
   verify_single_fn_wf_crate fnName countUpBody countUpBody_satisfies_wellFormed
+
+/-!
+## 16. Interprocedural Function Calls (`Terminator.callPure2`) and Multi-Function Crate Verification (`double_bounded`)
+
+In this section we verify interprocedural composition of crate-local functions:
+```rust
+pub fn add_bounded(x: usize, y: usize) -> usize {
+    if x <= 1000 && y <= 1000 {
+        x + y
+    } else {
+        0
+    }
+}
+
+pub fn double_bounded(x: usize) -> usize {
+    add_bounded(x, x)
+}
+```
+1. **Callee Contract Adequacy (`evalPureCallee2_addBounded_eq_translatePure`,
+   `evalPureCallee2_absDiff_eq_translatePure`)**:
+   We prove that the operational summary `evalPureCallee2` for `.addBounded` and
+   `.absDiff` agrees identically with the verified `translatePure` semantics of
+   `addBoundedBody` and `absDiffBody`.
+2. **Caller Verification (`doubleBoundedBody`)**:
+   `translatePure (computePlan doubleBoundedBody) doubleBoundedBody [.usize x0]`
+   evaluates by `rfl` to `.ok (.usize (if decide (x0 ≤ 1000) && decide (x0 ≤ 1000) then x0 + x0 else 0))`.
+3. **Multi-Function `CrateTheorem` (`prove_add_and_double_bounded_crate`)**:
+   We discharge `CrateTheorem` simultaneously over the two-function crate
+   `[add_bounded, double_bounded]`.
+-/
+
+/-- Callee contract adequacy for `PureCallee2.addBounded`: `evalPureCallee2 .addBounded`
+    matches the verified functional translation `translatePure` of `addBoundedBody`. -/
+theorem evalPureCallee2_addBounded_eq_translatePure (x0 y0 : Nat) :
+    (evalPureCallee2 .addBounded (.usize x0) (.usize y0)).map AeneasRes.ok =
+      some (translatePure (computePlan addBoundedBody) addBoundedBody [.usize x0, .usize y0]) := by
+  rw [translatePure_addBounded_eq x0 y0]
+  rfl
+
+/-- Callee contract adequacy for `PureCallee2.absDiff`: `evalPureCallee2 .absDiff`
+    matches the verified functional translation `translatePure` of `absDiffBody`. -/
+theorem evalPureCallee2_absDiff_eq_translatePure (x0 y0 : Nat) :
+    (evalPureCallee2 .absDiff (.usize x0) (.usize y0)).map AeneasRes.ok =
+      some (translatePure (computePlan absDiffBody) absDiffBody [.usize x0, .usize y0]) := by
+  rw [translatePure_absDiff_eq x0 y0]
+  rfl
+
+/-- Exact `Runtime(PostCleanup)` MIR body emitted by `rustc --edition=2024 --emit=mir`
+    for:
+    ```rust
+    pub fn double_bounded(x: usize) -> usize {
+        add_bounded(x, x)
+    }
+    ``` -/
+def doubleBoundedBody : MirBody where
+  argTys := [.usize]
+  retTy := .usize
+  localCount := 2
+  blocks := [
+    { stmts := []
+      terminator := .callPure2 ⟨0⟩ .addBounded (.copy ⟨1⟩) (.copy ⟨1⟩) ⟨1⟩ },
+    { stmts := []
+      terminator := .return_ }
+  ]
+
+/-- `translatePure` on `doubleBoundedBody` reduces by `rfl` to
+    `.ok (.usize (if decide (x0 ≤ 1000) && decide (x0 ≤ 1000) then x0 + x0 else 0))`. -/
+theorem translatePure_doubleBounded_eq (x0 : Nat) :
+    translatePure (computePlan doubleBoundedBody) doubleBoundedBody [.usize x0] =
+      .ok (.usize (if decide (x0 ≤ 1000) && decide (x0 ≤ 1000) then x0 + x0 else 0)) :=
+  rfl
+
+/-- Pure functional model of `double_bounded`. -/
+def pureDoubleBounded (x0 : Nat) : Nat :=
+  if decide (x0 ≤ 1000) && decide (x0 ≤ 1000) then x0 + x0 else 0
+
+/-- Non-trivial property 1 (**Doubling under bound**): when `x0 ≤ 1000`,
+    `pureDoubleBounded x0 = 2 * x0`. -/
+theorem pureDoubleBounded_eq_two_mul {x0 : Nat} (hx : x0 ≤ 1000) :
+    pureDoubleBounded x0 = 2 * x0 := by
+  unfold pureDoubleBounded
+  have hdec : decide (x0 ≤ 1000) = true := decide_eq_true hx
+  rw [hdec]
+  dsimp
+  exact (Nat.two_mul x0).symm
+
+/-- Non-trivial property 2 (**Global upper bound**): `pureDoubleBounded x0 ≤ 2000`
+    for all `x0 : Nat`. -/
+theorem pureDoubleBounded_le_2000 (x0 : Nat) :
+    pureDoubleBounded x0 ≤ 2000 := by
+  unfold pureDoubleBounded
+  cases hx : decide (x0 ≤ 1000) with
+  | false =>
+    dsimp
+    exact Nat.zero_le 2000
+  | true =>
+    dsimp
+    have hle : x0 ≤ 1000 := of_decide_eq_true hx
+    exact Nat.add_le_add hle hle
+
+/-- Non-trivial property 3 (**Parity**): `pureDoubleBounded x0 % 2 = 0` for all
+    `x0 : Nat`. -/
+theorem pureDoubleBounded_even (x0 : Nat) :
+    pureDoubleBounded x0 % 2 = 0 := by
+  unfold pureDoubleBounded
+  cases hx : decide (x0 ≤ 1000) with
+  | false =>
+    dsimp
+  | true =>
+    dsimp
+    rw [← Nat.two_mul x0]
+    exact Nat.mul_mod_right 2 x0
+
+/-- `translate doubleBoundedBody` refines `EnsuresDoubleBounded` under `π_func`. -/
+theorem doubleBounded_func_refines_ensures :
+    π_func (FuncLang.sem (translate doubleBoundedBody)) ≤ EnsuresDoubleBounded := by
+  intro q _
+  have hSupp : allSupportedArgTys doubleBoundedBody.argTys = true := rfl
+  refine ⟨?_, ?_⟩
+  · unfold π_func FuncLang translate evalSym
+    dsimp
+    rw [hSupp]
+    dsimp
+    cases hExt : extractSymArgs doubleBoundedBody.argTys q.init with
+    | none => intro h; cases h
+    | some args =>
+      dsimp
+      unfold extractSymArgs at hExt
+      cases hblk : (q.init.block == 0 && q.init.stmtIdx == 0) with
+      | false => rw [hblk] at hExt; cases hExt
+      | true =>
+        rw [hblk] at hExt
+        dsimp [doubleBoundedBody, extractSymArgsAux] at hExt
+        cases h1 : q.init.locals 1 with
+        | none => rw [h1] at hExt; cases hExt
+        | some v1 =>
+          rw [h1] at hExt
+          cases v1 with
+          | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
+          | usize x0 =>
+            dsimp at hExt
+            injection hExt with hargs
+            subst hargs
+            rw [translatePure_doubleBounded_eq x0]
+            intro h; cases h
+  · intro out ⟨_, hOutProp⟩ ret x0 hout h1
+    have hPost : translate doubleBoundedBody q.init = .ok ret := hOutProp ret hout
+    unfold translate evalSym at hPost
+    rw [hSupp] at hPost
+    dsimp at hPost
+    cases hExt : extractSymArgs doubleBoundedBody.argTys q.init with
+    | none => rw [hExt] at hPost; cases hPost
+    | some args =>
+      rw [hExt] at hPost
+      dsimp at hPost
+      unfold extractSymArgs at hExt
+      cases hblk : (q.init.block == 0 && q.init.stmtIdx == 0) with
+      | false => rw [hblk] at hExt; cases hExt
+      | true =>
+        rw [hblk] at hExt
+        dsimp [doubleBoundedBody, extractSymArgsAux] at hExt
+        rw [h1] at hExt
+        dsimp at hExt
+        injection hExt with hargs
+        subst hargs
+        rw [translatePure_doubleBounded_eq x0] at hPost
+        injection hPost with hret
+        exact hret.symm
+
+/-- `doubleBoundedBody` satisfies `EnsuresDoubleBounded`, proved by composing
+    `translate_sound doubleBoundedBody` with `doubleBounded_func_refines_ensures`. -/
+theorem doubleBoundedBody_satisfies_ensures :
+    MirLang.sem doubleBoundedBody ≤ EnsuresDoubleBounded :=
+  Preorder.le_trans
+    (translate_sound doubleBoundedBody)
+    doubleBounded_func_refines_ensures
+
+theorem ensuresDoubleBounded_le_wellFormed :
+    EnsuresDoubleBounded ≤ MirLang.WellFormed :=
+  fun _ h => ⟨h, fun _ _ => True.intro⟩
+
+/-- `doubleBoundedBody` satisfies `MirLang.WellFormed`. -/
+theorem doubleBoundedBody_satisfies_wellFormed :
+    MirLang.sem doubleBoundedBody ≤ MirLang.WellFormed :=
+  Preorder.le_trans doubleBoundedBody_satisfies_ensures ensuresDoubleBounded_le_wellFormed
+
+/-- End-to-end `CrateTheorem` witness for `double_bounded` with `EnsuresDoubleBounded`. -/
+theorem prove_double_bounded_ensures_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := doubleBoundedBody
+        specs := [EnsuresDoubleBounded]
+      }]
+      tcb := [.rustcLowering fnName doubleBoundedBody]
+    } :=
+  verify_single_fn_crate
+    fnName
+    doubleBoundedBody
+    EnsuresDoubleBounded
+    doubleBoundedBody_satisfies_ensures
+    ensuresDoubleBounded_le_wellFormed
+
+/-- End-to-end `CrateTheorem` witness for `double_bounded` with baseline `WellFormed`. -/
+theorem prove_double_bounded_wf_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := doubleBoundedBody
+        specs := []
+      }]
+      tcb := [.rustcLowering fnName doubleBoundedBody]
+    } :=
+  verify_single_fn_wf_crate fnName doubleBoundedBody doubleBoundedBody_satisfies_wellFormed
+
+/-- Generic two-function `CrateTheorem` discharge for a crate containing two
+    verified functions `(fnName1, body1, [spec1])` and `(fnName2, body2, [spec2])`. -/
+theorem verify_two_fn_crate
+    (fnName1 : String) (body1 : MirBody) (spec1 : MirLang.Behavior)
+    (fnName2 : String) (body2 : MirBody) (spec2 : MirLang.Behavior)
+    (h_proof1 : MirSem body1 ≤ spec1)
+    (h_spec1_wf : spec1 ≤ MirLang.WellFormed)
+    (h_proof2 : MirSem body2 ≤ spec2)
+    (h_spec2_wf : spec2 ≤ MirLang.WellFormed) :
+    CrateTheorem {
+      functions := [
+        { name := fnName1, prog := body1, specs := [spec1] },
+        { name := fnName2, prog := body2, specs := [spec2] }
+      ]
+      tcb := [
+        .rustcLowering fnName1 body1,
+        .rustcLowering fnName2 body2
+      ]
+    } := by
+  refine ⟨(by intro h; cases h), ⟨⟨⟨True.intro, True.intro, True.intro⟩, ?_⟩, ⟨⟨True.intro, True.intro, True.intro⟩, ?_⟩, True.intro⟩⟩
+  · intro hAssumptions
+    exact Compiler.Verified.with_wellFormedOn
+      (Compiler.SoundOn.verify hAssumptions.1 h_proof1)
+      h_spec1_wf hAssumptions.1.1
+  · intro hAssumptions
+    exact Compiler.Verified.with_wellFormedOn
+      (Compiler.SoundOn.verify hAssumptions.2.1 h_proof2)
+      h_spec2_wf hAssumptions.2.1.1
+
+/-- Multi-function `CrateTheorem` witness verifying both `add_bounded` and
+    `double_bounded` in a single crate. -/
+theorem prove_add_and_double_bounded_crate (fnAdd fnDouble : String) :
+    CrateTheorem {
+      functions := [
+        { name := fnAdd, prog := addBoundedBody, specs := [EnsuresAddBounded] },
+        { name := fnDouble, prog := doubleBoundedBody, specs := [EnsuresDoubleBounded] }
+      ]
+      tcb := [
+        .rustcLowering fnAdd addBoundedBody,
+        .rustcLowering fnDouble doubleBoundedBody
+      ]
+    } :=
+  verify_two_fn_crate
+    fnAdd addBoundedBody EnsuresAddBounded
+    fnDouble doubleBoundedBody EnsuresDoubleBounded
+    addBoundedBody_satisfies_ensures ensuresAddBounded_le_wellFormed
+    doubleBoundedBody_satisfies_ensures ensuresDoubleBounded_le_wellFormed
 
 end Anneal

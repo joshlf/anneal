@@ -367,6 +367,37 @@ pub enum CapturedTerminator {
         tuple_local: usize,
         target: usize,
     },
+    CallPure2 {
+        dst: usize,
+        callee: CapturedPureCallee2,
+        arg1: CapturedOperand,
+        arg2: CapturedOperand,
+        target: usize,
+    },
+}
+
+/// Captured pure 2-argument `usize` callee (`add_bounded`, `abs_diff`).
+///
+/// Corresponds to `Trusted.PureCallee2` in `trusted/lean/Trusted/MirAst.lean`
+/// and `rustc_middle::mir::TerminatorKind::Call`:
+///
+/// > "Roughly speaking, evaluates the `func` operand and the arguments, and
+/// > starts execution of the referred to function."
+///
+/// Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L748-L785
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapturedPureCallee2 {
+    AddBounded,
+    AbsDiff,
+}
+
+impl CapturedPureCallee2 {
+    fn to_lean(self) -> &'static str {
+        match self {
+            Self::AddBounded => "Trusted.PureCallee2.addBounded",
+            Self::AbsDiff => "Trusted.PureCallee2.absDiff",
+        }
+    }
 }
 
 impl CapturedTerminator {
@@ -398,6 +429,18 @@ impl CapturedTerminator {
                 target,
             } => format!(
                 "(Trusted.Terminator.assertNotOverflow ⟨{tuple_local}⟩ ⟨{target}⟩)"
+            ),
+            Self::CallPure2 {
+                dst,
+                callee,
+                arg1,
+                arg2,
+                target,
+            } => format!(
+                "(Trusted.Terminator.callPure2 ⟨{dst}⟩ {} {} {} ⟨{target}⟩)",
+                callee.to_lean(),
+                arg1.to_lean(),
+                arg2.to_lean()
             ),
         }
     }
@@ -465,6 +508,9 @@ pub enum CapturedSpec {
     /// Functional specification for `count_up(n)`
     /// (`specs := [Trusted.EnsuresCountUp]`).
     EnsuresCountUp,
+    /// Functional specification for `double_bounded(x)`
+    /// (`specs := [Trusted.EnsuresDoubleBounded]`).
+    EnsuresDoubleBounded,
 }
 
 impl CapturedSpec {
@@ -508,6 +554,9 @@ impl CapturedSpec {
             }
             Self::EnsuresCountUp => {
                 "[Trusted.EnsuresCountUp]".to_string()
+            }
+            Self::EnsuresDoubleBounded => {
+                "[Trusted.EnsuresDoubleBounded]".to_string()
             }
         }
     }
@@ -666,6 +715,9 @@ fn parse_source_spec(src: &str) -> Result<CapturedSpec, CaptureError> {
                 "ensures(count_up(n))" => {
                     CapturedSpec::EnsuresCountUp
                 }
+                "ensures(double_bounded(x))" => {
+                    CapturedSpec::EnsuresDoubleBounded
+                }
                 "well_formed" => CapturedSpec::WellFormed,
                 other => {
                     return Err(CaptureError::UnsupportedMir(format!(
@@ -796,13 +848,20 @@ pub fn parse_emitted_mir(
                 "MIR body for `{name}` has no basic blocks"
             )));
         }
+        let fn_spec = if spec == CapturedSpec::EnsuresDoubleBounded
+            && name == "add_bounded"
+        {
+            CapturedSpec::EnsuresAddBounded
+        } else {
+            spec
+        };
         functions.push(CapturedFunction {
             name,
             arg_tys,
             ret_ty,
             local_count: max_local + 1,
             blocks,
-            spec,
+            spec: fn_spec,
         });
     }
 
@@ -1267,6 +1326,68 @@ fn parse_atomic_load_call(
         return Ok(None);
     };
     let call_trimmed = call_part.trim();
+    let bracket_inner = target_part
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| {
+            CaptureError::UnsupportedMir(format!(
+                "malformed Call target list `{target_part}`"
+            ))
+        })?;
+    let return_entry = bracket_inner
+        .split(',')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .strip_prefix("return:")
+        .ok_or_else(|| {
+            CaptureError::UnsupportedMir(format!(
+                "missing `return: bb<n>` in Call target list `{target_part}`"
+            ))
+        })?;
+    let target = parse_bb_index(return_entry.trim())?;
+
+    if let Some(args_inner) = call_trimmed
+        .strip_prefix("add_bounded(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let (arg1_str, arg2_str) = args_inner.split_once(',').ok_or_else(|| {
+            CaptureError::UnsupportedMir(format!(
+                "expected two arguments in add_bounded, found `{args_inner}`"
+            ))
+        })?;
+        let arg1 = parse_operand(arg1_str.trim())?;
+        let arg2 = parse_operand(arg2_str.trim())?;
+        return Ok(Some(CapturedTerminator::CallPure2 {
+            dst,
+            callee: CapturedPureCallee2::AddBounded,
+            arg1,
+            arg2,
+            target,
+        }));
+    }
+
+    if let Some(args_inner) = call_trimmed
+        .strip_prefix("abs_diff(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let (arg1_str, arg2_str) = args_inner.split_once(',').ok_or_else(|| {
+            CaptureError::UnsupportedMir(format!(
+                "expected two arguments in abs_diff, found `{args_inner}`"
+            ))
+        })?;
+        let arg1 = parse_operand(arg1_str.trim())?;
+        let arg2 = parse_operand(arg2_str.trim())?;
+        return Ok(Some(CapturedTerminator::CallPure2 {
+            dst,
+            callee: CapturedPureCallee2::AbsDiff,
+            arg1,
+            arg2,
+            target,
+        }));
+    }
+
     let args_inner = call_trimmed
         .strip_prefix("Atomic::<usize>::load(")
         .or_else(|| {
@@ -1289,27 +1410,6 @@ fn parse_atomic_load_call(
     let ptr = parse_operand(ptr_str.trim())?;
     let ord = parse_operand(ord_str.trim())?;
 
-    let bracket_inner = target_part
-        .trim()
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .ok_or_else(|| {
-            CaptureError::UnsupportedMir(format!(
-                "malformed Call target list `{target_part}`"
-            ))
-        })?;
-    let return_entry = bracket_inner
-        .split(',')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .strip_prefix("return:")
-        .ok_or_else(|| {
-            CaptureError::UnsupportedMir(format!(
-                "missing `return: bb<n>` in Call target list `{target_part}`"
-            ))
-        })?;
-    let target = parse_bb_index(return_entry.trim())?;
     Ok(Some(CapturedTerminator::CallAtomicLoad {
         dst,
         ptr,
@@ -1911,5 +2011,33 @@ fn add_bounded(_1: usize, _2: usize) -> usize {
         assert_eq!(fns[0].ret_ty, CapturedTy::Usize);
         assert_eq!(fns[0].local_count, 6);
         assert_eq!(fns[0].blocks.len(), 6);
+    }
+
+    #[test]
+    fn parses_rustc_double_bounded_mir() {
+        let sample = "\
+// WARNING: This output format is intended for human consumers only
+fn double_bounded(_1: usize) -> usize {
+    debug x => _1;
+    let mut _0: usize;
+
+    bb0: {
+        _0 = add_bounded(copy _1, copy _1) -> [return: bb1, unwind continue];
+    }
+
+    bb1: {
+        return;
+    }
+}
+";
+        let fns =
+            parse_emitted_mir(sample, CapturedSpec::EnsuresDoubleBounded)
+                .unwrap();
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].name, "double_bounded");
+        assert_eq!(fns[0].arg_tys, vec![CapturedTy::Usize]);
+        assert_eq!(fns[0].ret_ty, CapturedTy::Usize);
+        assert_eq!(fns[0].local_count, 2);
+        assert_eq!(fns[0].blocks.len(), 2);
     }
 }

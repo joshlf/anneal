@@ -274,11 +274,17 @@ inductive Stmt where
   | storageDead (loc : LocalId)
   | nop
 
+/-- Pure 2-argument `usize` callee in `Terminator.callPure2`. -/
+inductive PureCallee2 where
+  | addBounded
+  | absDiff
+
 /-- Control-flow transfer at the end of a MIR basic block.
 
     Corresponds to `rustc_middle::mir::TerminatorKind` (`Return`, `Goto`,
-    `Unreachable`, `Call` specialized to `Atomic::<usize>::load`, and
-    `SwitchInt` on boolean discriminants `[0: falseTarget, otherwise: trueTarget]`):
+    `Unreachable`, `Call` specialized to `Atomic::<usize>::load` or pure
+    crate-local callees, and `SwitchInt` on boolean discriminants
+    `[0: falseTarget, otherwise: trueTarget]`):
 
     > "Block has one successor; we continue execution there."
     >
@@ -318,6 +324,7 @@ inductive Terminator where
   | goto (target : BlockId)
   | unreachable
   | callAtomicLoad (dst : LocalId) (ptr : Operand) (ord : Operand) (target : BlockId)
+  | callPure2 (dst : LocalId) (callee : PureCallee2) (arg1 : Operand) (arg2 : Operand) (target : BlockId)
   | switchInt (discr : Operand) (falseTarget : BlockId) (trueTarget : BlockId)
   | assertNotOverflow (tupleLocal : LocalId) (target : BlockId)
 

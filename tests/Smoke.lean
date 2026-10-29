@@ -579,6 +579,39 @@ def countUpCrate : Trusted.Crate where
 theorem verify_count_up_crate : Trusted.CrateTheorem countUpCrate :=
   Anneal.prove_count_up_ensures_crate "count_up"
 
+/-- Lowered `Runtime(PostCleanup)` MIR body for
+    `pub fn double_bounded(x: usize) -> usize { add_bounded(x, x) }`. -/
+def doubleBoundedBody : Trusted.MirBody where
+  argTys := [.usize]
+  retTy := .usize
+  localCount := 2
+  blocks := [
+    { stmts := []
+      terminator := .callPure2 ⟨0⟩ .addBounded (.copy ⟨1⟩) (.copy ⟨1⟩) ⟨1⟩ },
+    { stmts := []
+      terminator := .return_ }
+  ]
+
+/-- Captured two-function `Trusted.Crate` for `[add_bounded, double_bounded]`. -/
+def doubleBoundedCrate : Trusted.Crate where
+  functions := [
+    { name := "add_bounded"
+      prog := addBoundedBody
+      specs := [Trusted.EnsuresAddBounded] },
+    { name := "double_bounded"
+      prog := doubleBoundedBody
+      specs := [Trusted.EnsuresDoubleBounded] }
+  ]
+  tcb := [
+    Trusted.TCBItem.rustcLowering "add_bounded" addBoundedBody,
+    Trusted.TCBItem.rustcLowering "double_bounded" doubleBoundedBody
+  ]
+
+/-- Top-level `Trusted.CrateTheorem` for `doubleBoundedCrate`, verifying both
+    `add_bounded` and `double_bounded` in a single multi-function crate. -/
+theorem verify_double_bounded_crate : Trusted.CrateTheorem doubleBoundedCrate :=
+  Anneal.prove_add_and_double_bounded_crate "add_bounded" "double_bounded"
+
 /-!
 ## Non-Step-Based Axiomatic Event-Graph Toy Language
 
