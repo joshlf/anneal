@@ -65,6 +65,48 @@ pub fn render_proof_lean(functions: &[CapturedFunction]) -> String {
                 ),
             }
         }
+        [func]
+            if func.arg_tys
+                == [CapturedTy::RefMutUsize, CapturedTy::Usize] =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresMaxAssign => format!(
+                    "Anneal.prove_max_assign_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_max_assign_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_max_assign_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [func]
+            if func.arg_tys
+                == [
+                    CapturedTy::RefMutUsize,
+                    CapturedTy::RefMutUsize,
+                    CapturedTy::Usize,
+                ] =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresUpdateMin => format!(
+                    "Anneal.prove_update_min_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_update_min_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_update_min_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
         [func] => {
             let uses_move = func.blocks.first().is_some_and(|b| {
                 b.stmts.iter().any(|s| {
