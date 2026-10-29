@@ -350,6 +350,76 @@ def downstreamAudit (j : Json) (env : Environment) : IO Json := do
     ("localTestAxioms", toJson localTestAxioms.size),
     ("replay", toJson true)]
 
+/-- Audit a captured crate's `Mir` and `Proof` modules for `cargo anneal verify`:
+    1. Verify that `Mir` contains only data declarations (no `axiom` or `theorem`
+       declarations) and depends only on `foundation ++ trusted ++ #[`Mir]`.
+    2. Verify that `Mir.crate` is a `.defnInfo` constant with exact kernel type
+       `Trusted.Crate`.
+    3. Verify that `Proof.verify_crate` is a `.thmInfo` constant whose kernel
+       type `ci.type` is literally the AST application
+       `Expr.app (Expr.const ``Trusted.CrateTheorem []) (Expr.const ``Mir.crate [])`.
+    4. Enforce Statement (`ci.type`) vs. Proof (`ci.value?`) Origin Separation on
+       `Proof.verify_crate` (unfolding `Mir`), confirm zero custom axioms in its
+       transitive closure, and replay all declarations in `base.toKernelEnv.replay`. -/
+def verifyCrateAudit (j : Json) (env : Environment) : IO Json := do
+  let foundation ← names j "foundation"
+  let trusted ← names j "trusted"
+  let theory ← names j "theory"
+  let axiomPolicy ← field (α := Array (String × String)) j "axioms"
+  let crateModules : Array Name := #[`Mir, `Proof]
+  let allowedForMir := foundation ++ trusted ++ #[`Mir]
+  let allowedAll := foundation ++ trusted ++ theory ++ crateModules
+  let lookup n := match env.checked.get.find? n with
+    | some ci => pure ci | none => fail s!"missing dependency declaration {n}"
+  let mut replayLocals : Std.HashMap Name ConstantInfo := {}
+  let mut seenModules : NameSet := {}
+  for m in env.header.modules, data in env.header.moduleData do
+    unless allowedAll.contains m.module do fail s!"foreign module {m.module}"
+    if crateModules.contains m.module then
+      seenModules := seenModules.insert m.module
+    for ci in data.constants do
+      if foundation.contains m.module then
+        unless foundation.contains (← origin env ci.name) do fail s!"inventory origin mismatch {ci.name}"
+      else
+        unless (← origin env ci.name) == m.module do fail s!"inventory origin mismatch {ci.name}"
+      if trusted.contains m.module || theory.contains m.module || crateModules.contains m.module then
+        if ci.isUnsafe || ci.isPartial then fail s!"unsafe/partial declaration {ci.name} in {m.module}"
+        if ci.isAxiom then fail s!"axiom declaration {ci.name} in {m.module}"
+        replayLocals := replayLocals.insert ci.name ci
+      if m.module == `Mir then
+        if kind ci == "theorem" then fail s!"Mir module must contain only data declarations, found theorem {ci.name}"
+        checkStatementOrigins lookup (origin env) (theory ++ #[`Proof]) #[`Mir] ci.name ci.type
+        let _ ← closure lookup (origin env) allowedForMir axiomPolicy #[ci.name]
+      else if m.module == `Proof then
+        let _ ← closure lookup (origin env) allowedAll axiomPolicy #[ci.name]
+  for reqMod in crateModules do
+    unless seenModules.contains reqMod do fail s!"missing required crate verification module {reqMod}"
+  let some mirCrateCi := env.checked.get.find? `Mir.crate
+    | fail "missing required declaration Mir.crate in Mir"
+  unless (← origin env `Mir.crate) == `Mir do fail "Mir.crate must originate in module Mir"
+  unless kind mirCrateCi == "definition" do fail s!"Mir.crate must be a definition, found {kind mirCrateCi}"
+  let expectedCrateType := Expr.const `Trusted.Crate []
+  unless mirCrateCi.type == expectedCrateType do
+    fail s!"Mir.crate has type {mirCrateCi.type}, expected Trusted.Crate"
+  let some proofCi := env.checked.get.find? `Proof.verify_crate
+    | fail "missing required theorem Proof.verify_crate in Proof"
+  unless (← origin env `Proof.verify_crate) == `Proof do fail "Proof.verify_crate must originate in module Proof"
+  unless kind proofCi == "theorem" do fail s!"Proof.verify_crate must be a theorem, found {kind proofCi}"
+  let expectedTheoremType := Expr.app (Expr.const `Trusted.CrateTheorem []) (Expr.const `Mir.crate [])
+  unless proofCi.type == expectedTheoremType do
+    fail s!"Proof.verify_crate has type {proofCi.type}, expected Trusted.CrateTheorem Mir.crate"
+  checkStatementOrigins lookup (origin env) (theory ++ #[`Proof]) #[`Mir] proofCi.name proofCi.type
+  let (reachedAxioms, visited) ← closure lookup (origin env) allowedAll axiomPolicy #[`Proof.verify_crate]
+  let base ← importEnv j foundation
+  let _ ← base.toKernelEnv.replay replayLocals
+  return Json.mkObj [
+    ("verifiedTheorem", toJson "Proof.verify_crate"),
+    ("expectedType", toJson "Trusted.CrateTheorem Mir.crate"),
+    ("replayedDeclarations", toJson replayLocals.size),
+    ("reachableDeclarations", toJson visited),
+    ("axioms", toJson reachedAxioms),
+    ("replay", toJson true)]
+
 def graphTests : IO Json := do
   let hidden := `Foreign.onlyInRule
   let recInfo : ConstantInfo := .recInfo {
@@ -439,6 +509,11 @@ def run (j : Json) : IO Json := do
     let testModules ← names j "testModules"
     let env ← importEnv j (foundation ++ trusted ++ theory ++ examples ++ claimModules ++ testModules)
     return ← downstreamAudit j env
+  if mode == "verify-crate" then
+    let trusted ← names j "trusted"
+    let theory ← names j "theory"
+    let env ← importEnv j (foundation ++ trusted ++ theory ++ #[`Mir, `Proof])
+    return ← verifyCrateAudit j env
   throw <| IO.userError s!"unknown inspector mode {mode}"
 
 end TrustedBoundary

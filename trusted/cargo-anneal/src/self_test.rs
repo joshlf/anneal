@@ -1,7 +1,7 @@
 //! Bounded regression fixtures for the `trusted/audit` boundary gate and
 //! `TrustedBoundary.lean` inspector.
 //!
-//! Exercises all 14 positive and negative fixture groups covering foundation
+//! Exercises all 15 positive and negative fixture groups covering foundation
 //! lock containment, syntax preflight rejections, complete inventory discovery,
 //! cycle detection, symlink and artifact freshness, subprocess protocol faults,
 //! statement (`ci.type`) vs. proof (`ci.value?`) origin separation, file-local
@@ -25,7 +25,7 @@ use crate::audit::{
 
 static SUITE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// Run all 14 bounded regression fixture groups against `checkout` and `lean`.
+/// Run all 15 bounded regression fixture groups against `checkout` and `lean`.
 pub fn run_self_test(checkout: &Path, lean: Option<&Path>) -> i32 {
     let suite_id = SUITE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let suite = env::temp_dir().join(format!(
@@ -1249,6 +1249,118 @@ fn run_self_test_inner(
     let _ = fs::remove_dir_all(&manifest_dir);
     done(
         "CaptureManifest.json compilation_succeeded and SHA-256 integrity checks",
+        &mut disposable,
+    )?;
+
+    // Group 15: End-to-end `verify_crate` gate (exact `Proof.verify_crate : Trusted.CrateTheorem Mir.crate` check).
+    let mut setup_verify_crate_fixture =
+        |mir_source: &str,
+         proof_source: &str|
+         -> Result<(PathBuf, PathBuf, Vec<DownstreamTarget>), String> {
+            let root = make_fixture(
+                Some(&format!(
+                    "{header}namespace Trusted\nstructure Crate where tag : Nat\ndef CrateTheorem (_ : Crate) : Prop := True\nend Trusted\n"
+                )),
+                false,
+            )?;
+            fs::create_dir_all(root.join("theory")).map_err(|e| e.to_string())?;
+            fs::write(
+                root.join("theory/Anneal.lean"),
+                b"prelude\nimport Trusted\nnamespace Anneal\ntheorem prove_crate (c : Trusted.Crate) : Trusted.CrateTheorem c := True.intro\nend Anneal\n",
+            )
+            .map_err(|e| e.to_string())?;
+            let crate_dir = root.join("sample-crate");
+            fs::create_dir_all(crate_dir.join("src"))
+                .map_err(|e| e.to_string())?;
+            fs::create_dir_all(crate_dir.join(".anneal"))
+                .map_err(|e| e.to_string())?;
+            let rs_p = crate_dir.join("src/lib.rs");
+            let mir_p = crate_dir.join(".anneal/Mir.lean");
+            let proof_p = crate_dir.join(".anneal/Proof.lean");
+            fs::write(&rs_p, b"pub fn id(x: usize) -> usize { x }\n")
+                .map_err(|e| e.to_string())?;
+            fs::write(&mir_p, mir_source.as_bytes())
+                .map_err(|e| e.to_string())?;
+            fs::write(&proof_p, proof_source.as_bytes())
+                .map_err(|e| e.to_string())?;
+            let manifest_json = format!(
+                r#"{{"schema":1,"compilation_succeeded":true,"rust_sources":[["src/lib.rs","{}"]],"targets":[{{"def_id":"crate::id","mir_module_path":".anneal/Mir.lean","mir_module_sha256":"{}"}}]}}"#,
+                digest(&rs_p).map_err(|e| e.to_string())?,
+                digest(&mir_p).map_err(|e| e.to_string())?
+            );
+            fs::write(
+                crate_dir.join(".anneal/CaptureManifest.json"),
+                manifest_json.as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+            let targets = vec![DownstreamTarget::new(
+                "Anneal",
+                "theory/Anneal.lean",
+                &["Trusted"],
+                "theory",
+            )];
+            Ok((root, crate_dir, targets))
+        };
+
+    // 15a. Valid crate verification.
+    let (r15a, c15a, t15a) = setup_verify_crate_fixture(
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0 }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
+    )?;
+    let mut chk15a =
+        Checker::new(&r15a, lean, Some(suite)).map_err(|e| e.to_string())?;
+    let rep15a = chk15a
+        .verify_crate(&c15a, Some(&t15a))
+        .map_err(|e| e.to_string())?;
+    let cv15a = rep15a.get("crateVerification").unwrap();
+    if cv15a.get("verifiedTheorem").and_then(Json::as_str)
+        != Some("Proof.verify_crate")
+        || cv15a.get("replay") != Some(&Json::Bool(true))
+    {
+        return Err("15a failed".to_string());
+    }
+    let _ = fs::remove_dir_all(chk15a.stage.join("foundation"));
+    disposable.push(chk15a.stage);
+
+    // 15b. Wrong theorem type (`theorem verify_crate : True`).
+    let (r15b, c15b, t15b) = setup_verify_crate_fixture(
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0 }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : True := True.intro\nend Proof\n",
+    )?;
+    let mut chk15b =
+        Checker::new(&r15b, lean, Some(suite)).map_err(|e| e.to_string())?;
+    let err15b = chk15b.verify_crate(&c15b, Some(&t15b)).unwrap_err();
+    if err15b.code != 1
+        || err15b.phase != "verify-crate"
+        || !err15b
+            .message
+            .contains("expected Trusted.CrateTheorem Mir.crate")
+    {
+        return Err(format!("15b unexpected error: {err15b}"));
+    }
+    let _ = fs::remove_dir_all(chk15b.stage.join("foundation"));
+    disposable.push(chk15b.stage);
+
+    // 15c. Theorem declared inside `Mir.lean`.
+    let (r15c, c15c, t15c) = setup_verify_crate_fixture(
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0 }\ntheorem sneaky : True := True.intro\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
+    )?;
+    let mut chk15c =
+        Checker::new(&r15c, lean, Some(suite)).map_err(|e| e.to_string())?;
+    let err15c = chk15c.verify_crate(&c15c, Some(&t15c)).unwrap_err();
+    if err15c.code != 1
+        || err15c.phase != "verify-crate"
+        || !err15c
+            .message
+            .contains("Mir module must contain only data declarations")
+    {
+        return Err(format!("15c unexpected error: {err15c}"));
+    }
+    let _ = fs::remove_dir_all(chk15c.stage.join("foundation"));
+    disposable.push(chk15c.stage);
+    done(
+        "verify-crate mode enforces Mir data-only rule and exact Proof.verify_crate : Trusted.CrateTheorem Mir.crate",
         &mut disposable,
     )?;
 

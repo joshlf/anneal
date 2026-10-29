@@ -27,6 +27,7 @@ use std::io;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -51,6 +52,24 @@ pub const MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 static STAGE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Clone)]
+struct CachedArtifactFile {
+    rel_path: String,
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+#[derive(Clone)]
+struct CachedVerifyPrefix {
+    key_fingerprint: String,
+    report: Json,
+    compiled_artifacts_rel: BTreeMap<String, Vec<Vec<String>>>,
+    graph: BTreeMap<String, Json>,
+    files: Vec<CachedArtifactFile>,
+}
+
+static VERIFY_PREFIX_CACHE: Mutex<Option<CachedVerifyPrefix>> =
+    Mutex::new(None);
 
 /// A downstream Lean module target audited after `trusted/lean/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2886,6 +2905,549 @@ impl Checker {
         Ok(report)
     }
 
+    /// Audit a captured crate's `CaptureManifest.json`, `Mir.lean`, and
+    /// `Proof.lean` at `trustLevel := 0`.
+    pub fn verify_crate(
+        &mut self,
+        crate_dir: &Path,
+        targets: Option<&[DownstreamTarget]>,
+    ) -> Result<Json, Failure> {
+        let crate_dir = fs::canonicalize(crate_dir).map_err(|e| {
+            Failure::new(
+                2,
+                "crate-input",
+                format!("cannot resolve {}: {e}", crate_dir.display()),
+            )
+        })?;
+        let anneal_dir =
+            if crate_dir.join(".anneal/CaptureManifest.json").exists() {
+                crate_dir.join(".anneal")
+            } else {
+                crate_dir.clone()
+            };
+        let manifest_path = anneal_dir.join("CaptureManifest.json");
+        let mir_path = anneal_dir.join("Mir.lean");
+        let proof_path = anneal_dir.join("Proof.lean");
+        for p in [&manifest_path, &mir_path, &proof_path] {
+            regular(p, "crate-input")?;
+        }
+        let manifest = verify_capture_manifest(&manifest_path, &crate_dir)?;
+        let mir_canon = fs::canonicalize(&mir_path).map_err(|e| {
+            Failure::new(2, "manifest", format!("cannot resolve Mir.lean: {e}"))
+        })?;
+        let has_mir_target = manifest
+            .get("targets")
+            .and_then(Json::as_arr)
+            .is_some_and(|arr| {
+                arr.iter().any(|t| {
+                    t.get("mir_module_path")
+                        .and_then(Json::as_str)
+                        .and_then(|rel| fs::canonicalize(crate_dir.join(rel)).ok())
+                        .is_some_and(|p| p == mir_canon)
+                })
+            });
+        if !has_mir_target {
+            return Err(Failure::new(
+                1,
+                "manifest",
+                "Mir.lean is not recorded in CaptureManifest.json targets",
+            ));
+        }
+
+        let mut crate_hashes = BTreeMap::new();
+        for p in [&manifest_path, &mir_path, &proof_path] {
+            crate_hashes.insert(p.clone(), digest(p)?);
+        }
+
+        let default_targets;
+        let all_targets = match targets {
+            Some(t) => t,
+            None => {
+                default_targets = default_downstream_targets();
+                &default_targets
+            }
+        };
+        let theory_targets: Vec<&DownstreamTarget> = all_targets
+            .iter()
+            .filter(|t| t.role == "theory")
+            .collect();
+        let theory_names: Vec<String> =
+            theory_targets.iter().map(|t| t.module.clone()).collect();
+
+        let staged_mir = self.stage.join("crate-source/Mir.lean");
+        let staged_proof = self.stage.join("crate-source/Proof.lean");
+        fs::create_dir_all(staged_mir.parent().unwrap())
+            .map_err(|e| Failure::new(2, "crate-input", e.to_string()))?;
+        fs::copy(&mir_path, &staged_mir)
+            .map_err(|e| Failure::new(2, "crate-input", e.to_string()))?;
+        fs::copy(&proof_path, &staged_proof)
+            .map_err(|e| Failure::new(2, "crate-input", e.to_string()))?;
+        if digest(&staged_mir)? != crate_hashes[&mir_path]
+            || digest(&staged_proof)? != crate_hashes[&proof_path]
+        {
+            return Err(Failure::new(
+                2,
+                "crate-input",
+                "crate Lean files changed while copying",
+            ));
+        }
+
+        let mut theory_hashes = BTreeMap::new();
+        let mut theory_copies = BTreeMap::new();
+        for t in &theory_targets {
+            let full = self.checkout.join(&t.path);
+            regular(&full, "theory-input")?;
+            let sha = digest(&full)?;
+            let dest = self.stage.join("theory-source").join(&t.path);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    Failure::new(2, "theory-input", e.to_string())
+                })?;
+            }
+            fs::copy(&full, &dest).map_err(|e| {
+                Failure::new(2, "theory-input", e.to_string())
+            })?;
+            if digest(&dest)? != sha {
+                return Err(Failure::new(
+                    2,
+                    "theory-input",
+                    format!("source changed while copying {}", t.path),
+                ));
+            }
+            theory_hashes.insert(full, sha);
+            theory_copies.insert(t.module.clone(), dest);
+        }
+
+        let mut report = if targets.is_none() {
+            self.load_or_build_verify_prefix(&theory_targets, &theory_copies, &theory_hashes)?
+        } else {
+            let rep = self.run_with_targets(false, targets)?;
+            self.compile_theory_prefix(&theory_targets, &theory_copies, &theory_hashes)?;
+            rep
+        };
+
+        let pf_sources = vec![
+            Json::Arr(vec![
+                Json::Str("Mir".to_string()),
+                Json::Str(staged_mir.to_string_lossy().into_owned()),
+            ]),
+            Json::Arr(vec![
+                Json::Str("Proof".to_string()),
+                Json::Str(staged_proof.to_string_lossy().into_owned()),
+            ]),
+        ];
+
+        let expected_pf_len = pf_sources.len();
+        let mut pf_fields = BTreeMap::new();
+        pf_fields.insert(
+            "graph".to_string(),
+            self.lock.get("graph").unwrap().clone(),
+        );
+        pf_fields.insert("sources".to_string(), Json::Arr(pf_sources));
+        let pf_res = self.inspect("preflight", pf_fields)?;
+        let Some(headers) = pf_res.get("headers").and_then(Json::as_arr) else {
+            return Err(Failure::new(
+                2,
+                "preflight",
+                "incomplete theory/crate header observation",
+            ));
+        };
+        if headers.len() != expected_pf_len {
+            return Err(Failure::new(
+                2,
+                "preflight",
+                "incomplete theory/crate header observation",
+            ));
+        }
+
+        let mut header_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for h in headers {
+            let m = h
+                .get("module")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_string();
+            let imps: Vec<String> = h
+                .get("imports")
+                .and_then(Json::as_arr)
+                .unwrap()
+                .iter()
+                .filter_map(|e| {
+                    e.get("module").and_then(Json::as_str).map(str::to_string)
+                })
+                .collect();
+            header_map.insert(m, imps);
+        }
+
+        let mut allowed_mir_imports: BTreeSet<String> =
+            self.foundation.iter().cloned().collect();
+        allowed_mir_imports.extend(self.modules.keys().cloned());
+
+        let mir_imports = header_map.get("Mir").cloned().unwrap_or_default();
+        if !mir_imports.iter().all(|m| allowed_mir_imports.contains(m)) {
+            return Err(Failure::new(
+                1,
+                "preflight",
+                format!("Mir.lean imports disallowed modules: {mir_imports:?}"),
+            ));
+        }
+
+        let mut allowed_proof_imports = allowed_mir_imports.clone();
+        allowed_proof_imports.extend(theory_names.iter().cloned());
+        allowed_proof_imports.insert("Mir".to_string());
+
+        let proof_imports =
+            header_map.get("Proof").cloned().unwrap_or_default();
+        if !proof_imports
+            .iter()
+            .all(|m| allowed_proof_imports.contains(m))
+        {
+            return Err(Failure::new(
+                1,
+                "preflight",
+                format!(
+                    "Proof.lean imports disallowed modules: {proof_imports:?}"
+                ),
+            ));
+        }
+
+        let compile_plan = vec![
+            ("Mir".to_string(), staged_mir, mir_imports),
+            ("Proof".to_string(), staged_proof, proof_imports),
+        ];
+
+        for (module, src_file, imports) in compile_plan {
+            self.freshness()?;
+            let edge_list: Vec<Json> = imports
+                .iter()
+                .map(|name| {
+                    let mut m = BTreeMap::new();
+                    m.insert("module".to_string(), Json::Str(name.clone()));
+                    m.insert("importAll".to_string(), Json::Bool(false));
+                    m.insert("isExported".to_string(), Json::Bool(true));
+                    m.insert("isMeta".to_string(), Json::Bool(false));
+                    Json::Obj(m)
+                })
+                .collect();
+            let mut setup_fields = BTreeMap::new();
+            setup_fields
+                .insert("module".to_string(), Json::Str(module.clone()));
+            setup_fields
+                .insert("imports".to_string(), Json::Arr(edge_list.clone()));
+            let setup = self.inspect("setup", setup_fields)?;
+            let setup_path = self.stage.join(format!("{module}.setup.json"));
+            fs::write(&setup_path, setup.to_compact_string().as_bytes())
+                .map_err(|e| Failure::new(2, "setup", e.to_string()))?;
+
+            let output = self
+                .stage
+                .join("crate-lib")
+                .join(format!("{}.olean", module.replace('.', "/")));
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| Failure::new(2, "compile", e.to_string()))?;
+            }
+            let compile_args = vec![
+                "-j1".to_string(),
+                "-M2048".to_string(),
+                "-t0".to_string(),
+                "-DElab.async=false".to_string(),
+                "-Ddebug.skipKernelTC=false".to_string(),
+                "-DwarningAsError=true".to_string(),
+                "--setup".to_string(),
+                setup_path.to_string_lossy().into_owned(),
+                "-o".to_string(),
+                output.to_string_lossy().into_owned(),
+                src_file.to_string_lossy().into_owned(),
+            ];
+            self.process(&format!("compile-{module}"), &compile_args)?;
+            self.record_compiled_artifacts(&module, &output, edge_list)?;
+        }
+
+        self.freshness()?;
+        for (path, expected) in theory_hashes.iter().chain(crate_hashes.iter())
+        {
+            if digest(path)? != *expected {
+                return Err(Failure::new(
+                    2,
+                    "freshness",
+                    format!(
+                        "input changed during verify-crate check: {}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+
+        let mut vc_fields = BTreeMap::new();
+        vc_fields.insert(
+            "trusted".to_string(),
+            Json::Arr(self.modules.keys().cloned().map(Json::Str).collect()),
+        );
+        vc_fields.insert(
+            "theory".to_string(),
+            Json::Arr(theory_names.into_iter().map(Json::Str).collect()),
+        );
+        let crate_audit = self.inspect("verify-crate", vc_fields)?;
+        let rep_obj = report.as_obj_mut().unwrap();
+        rep_obj.insert("crateVerification".to_string(), crate_audit);
+        rep_obj.insert("manifest".to_string(), manifest);
+        fs::write(
+            self.stage.join("report.json"),
+            report.to_pretty_string().as_bytes(),
+        )
+        .map_err(|e| Failure::new(2, "verify-crate", e.to_string()))?;
+        self.budget()?;
+        Ok(report)
+    }
+
+    fn compile_theory_prefix(
+        &mut self,
+        theory_targets: &[&DownstreamTarget],
+        theory_copies: &BTreeMap<String, PathBuf>,
+        theory_hashes: &BTreeMap<PathBuf, String>,
+    ) -> Result<(), Failure> {
+        let mut pf_sources = Vec::new();
+        for t in theory_targets {
+            pf_sources.push(Json::Arr(vec![
+                Json::Str(t.module.clone()),
+                Json::Str(
+                    theory_copies[&t.module].to_string_lossy().into_owned(),
+                ),
+            ]));
+        }
+        let expected_pf_len = pf_sources.len();
+        let mut pf_fields = BTreeMap::new();
+        pf_fields.insert(
+            "graph".to_string(),
+            self.lock.get("graph").unwrap().clone(),
+        );
+        pf_fields.insert("sources".to_string(), Json::Arr(pf_sources));
+        let pf_res = self.inspect("preflight", pf_fields)?;
+        let Some(headers) = pf_res.get("headers").and_then(Json::as_arr) else {
+            return Err(Failure::new(
+                2,
+                "preflight",
+                "incomplete theory/crate header observation",
+            ));
+        };
+        if headers.len() != expected_pf_len {
+            return Err(Failure::new(
+                2,
+                "preflight",
+                "incomplete theory/crate header observation",
+            ));
+        }
+
+        for t in theory_targets {
+            self.freshness()?;
+            let edge_list: Vec<Json> = t
+                .imports
+                .iter()
+                .map(|name| {
+                    let mut m = BTreeMap::new();
+                    m.insert("module".to_string(), Json::Str(name.clone()));
+                    m.insert("importAll".to_string(), Json::Bool(false));
+                    m.insert("isExported".to_string(), Json::Bool(true));
+                    m.insert("isMeta".to_string(), Json::Bool(false));
+                    Json::Obj(m)
+                })
+                .collect();
+            let mut setup_fields = BTreeMap::new();
+            setup_fields
+                .insert("module".to_string(), Json::Str(t.module.clone()));
+            setup_fields
+                .insert("imports".to_string(), Json::Arr(edge_list.clone()));
+            let setup = self.inspect("setup", setup_fields)?;
+            let setup_path = self.stage.join(format!("{}.setup.json", t.module));
+            fs::write(&setup_path, setup.to_compact_string().as_bytes())
+                .map_err(|e| Failure::new(2, "setup", e.to_string()))?;
+
+            let output = self
+                .stage
+                .join("crate-lib")
+                .join(format!("{}.olean", t.module.replace('.', "/")));
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| Failure::new(2, "compile", e.to_string()))?;
+            }
+            let compile_args = vec![
+                "-j1".to_string(),
+                "-M2048".to_string(),
+                "-t0".to_string(),
+                "-DElab.async=false".to_string(),
+                "-Ddebug.skipKernelTC=false".to_string(),
+                "-DwarningAsError=true".to_string(),
+                "--setup".to_string(),
+                setup_path.to_string_lossy().into_owned(),
+                "-o".to_string(),
+                output.to_string_lossy().into_owned(),
+                theory_copies[&t.module].to_string_lossy().into_owned(),
+            ];
+            self.process(&format!("compile-{}", t.module), &compile_args)?;
+            self.record_compiled_artifacts(&t.module, &output, edge_list)?;
+        }
+
+        self.freshness()?;
+        for (path, expected) in theory_hashes {
+            if digest(path)? != *expected {
+                return Err(Failure::new(
+                    2,
+                    "freshness",
+                    format!(
+                        "input changed during verify-crate check: {}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn load_or_build_verify_prefix(
+        &mut self,
+        theory_targets: &[&DownstreamTarget],
+        theory_copies: &BTreeMap<String, PathBuf>,
+        theory_hashes: &BTreeMap<PathBuf, String>,
+    ) -> Result<Json, Failure> {
+        let mut guard = VERIFY_PREFIX_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let cargo_hashes = if self.checkout.join("Cargo.toml").exists() {
+            check_cargo_boundary(&self.checkout)?
+        } else {
+            BTreeMap::new()
+        };
+        let (initial, _) = snapshot(&self.source)?;
+        let inspector_src =
+            self.checkout.join("trusted/audit/TrustedBoundary.lean");
+        regular(&inspector_src, "tool-snapshot")?;
+        let inspector_sha = digest(&inspector_src)?;
+
+        let mut key_obj = BTreeMap::new();
+        key_obj.insert(
+            "checkout".to_string(),
+            Json::Str(self.checkout.to_string_lossy().into_owned()),
+        );
+        key_obj.insert(
+            "lean".to_string(),
+            Json::Str(self.lean.to_string_lossy().into_owned()),
+        );
+        key_obj.insert("initial".to_string(), Json::Obj(initial));
+        key_obj.insert("inspector".to_string(), Json::Str(inspector_sha));
+        let cargo_json: BTreeMap<String, Json> = cargo_hashes
+            .iter()
+            .map(|(k, v)| (k.clone(), Json::Str(v.clone())))
+            .collect();
+        key_obj.insert("cargo".to_string(), Json::Obj(cargo_json));
+        let theory_json: BTreeMap<String, Json> = theory_hashes
+            .iter()
+            .map(|(k, v)| {
+                (k.to_string_lossy().into_owned(), Json::Str(v.clone()))
+            })
+            .collect();
+        key_obj.insert("theory".to_string(), Json::Obj(theory_json));
+        let key_fingerprint = fingerprint(&Json::Obj(key_obj));
+
+        if let Some(cached) = guard
+            .as_ref()
+            .filter(|c| c.key_fingerprint == key_fingerprint)
+            .cloned()
+        {
+            drop(guard);
+            self.tool_admission()?;
+            self.execution_began = true;
+            for file in &cached.files {
+                if sha256_hex(&file.bytes) != file.sha256 {
+                    return Err(Failure::new(
+                        2,
+                        "freshness",
+                        "in-memory cached artifact digest mismatch",
+                    ));
+                }
+                let dest = self.stage.join(&file.rel_path);
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent).map_err(|e| {
+                        Failure::new(2, "compile", e.to_string())
+                    })?;
+                }
+                fs::write(&dest, &file.bytes)
+                    .map_err(|e| Failure::new(2, "compile", e.to_string()))?;
+                let dest_str = dest.to_string_lossy().into_owned();
+                self.expected_artifacts
+                    .insert(dest_str, file.sha256.clone());
+            }
+            for (module, groups_rel) in &cached.compiled_artifacts_rel {
+                let groups_abs: Vec<Vec<String>> = groups_rel
+                    .iter()
+                    .map(|g| {
+                        g.iter()
+                            .map(|rel| {
+                                self.stage
+                                    .join(rel)
+                                    .to_string_lossy()
+                                    .into_owned()
+                            })
+                            .collect()
+                    })
+                    .collect();
+                self.artifacts.insert(module.clone(), groups_abs);
+            }
+            self.graph = cached.graph;
+            self.freshness()?;
+            return Ok(cached.report);
+        }
+
+        let report = self.run_with_targets(false, None)?;
+        self.compile_theory_prefix(
+            theory_targets,
+            theory_copies,
+            theory_hashes,
+        )?;
+
+        let mut compiled_artifacts_rel = BTreeMap::new();
+        let mut files = Vec::new();
+        for (module, groups) in &self.artifacts {
+            if self.foundation.contains(module) {
+                continue;
+            }
+            let mut groups_rel = Vec::new();
+            for group in groups {
+                let mut g_rel = Vec::new();
+                for abs_str in group {
+                    let abs_path = Path::new(abs_str);
+                    let rel = abs_path
+                        .strip_prefix(&self.stage)
+                        .map_err(|e| Failure::new(2, "compile", e.to_string()))?
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let bytes = fs::read(abs_path).map_err(|e| {
+                        Failure::new(2, "compile", e.to_string())
+                    })?;
+                    let sha256 = sha256_hex(&bytes);
+                    files.push(CachedArtifactFile {
+                        rel_path: rel.clone(),
+                        bytes,
+                        sha256,
+                    });
+                    g_rel.push(rel);
+                }
+                groups_rel.push(g_rel);
+            }
+            compiled_artifacts_rel.insert(module.clone(), groups_rel);
+        }
+
+        *guard = Some(CachedVerifyPrefix {
+            key_fingerprint,
+            report: report.clone(),
+            compiled_artifacts_rel,
+            graph: self.graph.clone(),
+            files,
+        });
+
+        Ok(report)
+    }
 }
 
 fn dir_byte_size(root: &Path) -> io::Result<u64> {

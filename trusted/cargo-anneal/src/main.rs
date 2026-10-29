@@ -15,6 +15,7 @@ use cargo_anneal::audit::{Checker, Json};
 use cargo_anneal::self_test::run_self_test;
 use cargo_anneal::{
     VerifyOptions, resolve_anneal_root, resolve_lean_bin,
+    run_trusted_audit_report,
 };
 
 fn main() -> ExitCode {
@@ -42,7 +43,7 @@ fn run(mut args: Vec<String>) -> Result<u8, (u8, String)> {
     let subcmd = subcmd.to_string();
     if !matches!(
         subcmd.as_str(),
-        "audit-repo" | "audit-self-test"
+        "verify-crate" | "audit-repo" | "audit-self-test"
     ) {
         return Err((
             1,
@@ -50,6 +51,7 @@ fn run(mut args: Vec<String>) -> Result<u8, (u8, String)> {
         ));
     }
 
+    let mut crate_dir: Option<PathBuf> = None;
     let mut options = VerifyOptions::default();
     let mut iter = args.into_iter().skip(1);
 
@@ -91,6 +93,18 @@ fn run(mut args: Vec<String>) -> Result<u8, (u8, String)> {
                     format!("error: unrecognized flag `{flag}`\n{}", usage()),
                 ));
             }
+            pos if subcmd == "verify-crate" => {
+                if crate_dir.is_some() {
+                    return Err((
+                        1,
+                        format!(
+                            "error: unexpected positional argument `{pos}`\n{}",
+                            usage()
+                        ),
+                    ));
+                }
+                crate_dir = Some(PathBuf::from(pos));
+            }
             pos => {
                 return Err((
                     1,
@@ -104,6 +118,55 @@ fn run(mut args: Vec<String>) -> Result<u8, (u8, String)> {
     }
 
     match subcmd.as_str() {
+        "verify-crate" => {
+            let Some(target_dir) = crate_dir else {
+                return Err((
+                    2,
+                    format!(
+                        "error: `verify-crate` requires a crate directory\n{}",
+                        usage()
+                    ),
+                ));
+            };
+            let report = run_trusted_audit_report(&target_dir, &options)
+                .map_err(|e| (1, e.to_string()))?;
+            let cv = report.get("crateVerification").unwrap();
+            let targets: Vec<&str> = report
+                .get("manifest")
+                .and_then(|m| m.get("targets"))
+                .and_then(Json::as_arr)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| t.get("def_id")?.as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let verified_thm = cv
+                .get("verifiedTheorem")
+                .and_then(Json::as_str)
+                .unwrap_or("");
+            let expected_ty = cv
+                .get("expectedType")
+                .and_then(Json::as_str)
+                .unwrap_or("");
+            let replayed = cv
+                .get("replayedDeclarations")
+                .and_then(Json::as_i64)
+                .unwrap_or(0);
+            let axioms = cv
+                .get("axioms")
+                .map(Json::to_compact_string)
+                .unwrap_or_else(|| "[]".to_string());
+            println!(
+                "VERIFIED: {verified_thm} : {expected_ty}\n\
+                 Targets: {}\n\
+                 TCB audit log: rustcLowering Permitted ({} item(s))\n\
+                 {replayed} replayed declarations; axioms={axioms}",
+                targets.join(", "),
+                targets.len()
+            );
+            Ok(0)
+        }
         "audit-repo" => {
             let checkout = resolve_anneal_root(&options)
                 .map_err(|e| (2, e.to_string()))?;
@@ -192,5 +255,5 @@ fn run(mut args: Vec<String>) -> Result<u8, (u8, String)> {
 }
 
 fn usage() -> String {
-    "usage: cargo-anneal [anneal] <audit-repo|audit-self-test> [--lean <path>] [--anneal-root <path>]".to_string()
+    "usage: cargo-anneal [anneal] <verify-crate|audit-repo|audit-self-test> [crate-dir] [--lean <path>] [--anneal-root <path>]".to_string()
 }
