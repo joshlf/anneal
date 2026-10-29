@@ -757,15 +757,31 @@ fn valid_graph(value: &Json) -> bool {
         .all(|(k, v)| !k.is_empty() && valid_imports(v))
 }
 
-/// Minimal TOML parser supporting Cargo workspace and package manifests.
+/// Minimal TOML parser supporting Cargo workspace and package manifests,
+/// including `[[...]]` array-of-tables headers (such as
+/// `[[package.metadata.exocrate]]` and `[[bin]]`).
 fn parse_cargo_toml(text: &str) -> Result<Json, String> {
     let mut root = BTreeMap::new();
     let mut current_path: Vec<String> = Vec::new();
+    let mut current_is_array_item = false;
     let mut lines = text.lines().peekable();
 
     while let Some(raw_line) = lines.next() {
         let line = strip_toml_comment(raw_line).trim();
         if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("[[") && line.ends_with("]]") && line.len() >= 4 {
+            let header = line[2..line.len() - 2].trim();
+            if header.is_empty() || header.starts_with('[') {
+                return Err("unsupported TOML table header".to_string());
+            }
+            current_path = header
+                .split('.')
+                .map(|p| p.trim().trim_matches('"').to_string())
+                .collect();
+            current_is_array_item = true;
+            append_toml_array_table(&mut root, &current_path)?;
             continue;
         }
         if line.starts_with('[') && line.ends_with(']') {
@@ -777,6 +793,7 @@ fn parse_cargo_toml(text: &str) -> Result<Json, String> {
                 .split('.')
                 .map(|p| p.trim().trim_matches('"').to_string())
                 .collect();
+            current_is_array_item = false;
             ensure_toml_table(&mut root, &current_path)?;
             continue;
         }
@@ -799,10 +816,53 @@ fn parse_cargo_toml(text: &str) -> Result<Json, String> {
             }
         }
         let val = parse_toml_value(rhs.trim())?;
-        let table = ensure_toml_table(&mut root, &current_path)?;
+        let table = if current_is_array_item {
+            last_toml_array_table(&mut root, &current_path)?
+        } else {
+            ensure_toml_table(&mut root, &current_path)?
+        };
         table.insert(key, val);
     }
     Ok(Json::Obj(root))
+}
+
+fn append_toml_array_table<'a>(
+    root: &'a mut BTreeMap<String, Json>,
+    path: &[String],
+) -> Result<&'a mut BTreeMap<String, Json>, String> {
+    let Some((last, parents)) = path.split_last() else {
+        return Err("empty TOML array-of-tables path".to_string());
+    };
+    let parent_table = ensure_toml_table(root, parents)?;
+    let entry = parent_table
+        .entry(last.clone())
+        .or_insert_with(|| Json::Arr(Vec::new()));
+    let arr = match entry {
+        Json::Arr(a) => a,
+        _ => return Err("TOML array-of-tables collides with non-array".to_string()),
+    };
+    arr.push(Json::Obj(BTreeMap::new()));
+    match arr.last_mut().unwrap() {
+        Json::Obj(m) => Ok(m),
+        _ => unreachable!(),
+    }
+}
+
+fn last_toml_array_table<'a>(
+    root: &'a mut BTreeMap<String, Json>,
+    path: &[String],
+) -> Result<&'a mut BTreeMap<String, Json>, String> {
+    let Some((last, parents)) = path.split_last() else {
+        return Err("empty TOML array-of-tables path".to_string());
+    };
+    let parent_table = ensure_toml_table(root, parents)?;
+    let Some(Json::Arr(arr)) = parent_table.get_mut(last) else {
+        return Err("missing TOML array-of-tables target".to_string());
+    };
+    match arr.last_mut() {
+        Some(Json::Obj(m)) => Ok(m),
+        _ => Err("empty TOML array-of-tables target".to_string()),
+    }
 }
 
 fn strip_toml_comment(line: &str) -> &str {
@@ -3433,31 +3493,38 @@ impl Checker {
             self.checkout.join("trusted/audit/TrustedBoundary.lean");
         regular(&inspector_src, "tool-snapshot")?;
         let inspector_sha = digest(&inspector_src)?;
+        regular(&self.lean, "toolchain")?;
+        let lean_sha = digest(&self.lean)?;
 
         let mut key_obj = BTreeMap::new();
-        key_obj.insert(
-            "checkout".to_string(),
-            Json::Str(self.checkout.to_string_lossy().into_owned()),
-        );
-        key_obj.insert(
-            "lean".to_string(),
-            Json::Str(self.lean.to_string_lossy().into_owned()),
-        );
+        key_obj.insert("leanSha256".to_string(), Json::Str(lean_sha));
         key_obj.insert("initial".to_string(), Json::Obj(initial));
         key_obj.insert("inspector".to_string(), Json::Str(inspector_sha));
+        let mut theory_json = BTreeMap::new();
+        for t in theory_targets {
+            let full = self.checkout.join(&t.path);
+            if let Some(sha) = theory_hashes.get(&full) {
+                theory_json.insert(t.path.clone(), Json::Str(sha.clone()));
+            }
+        }
+        key_obj.insert("theory".to_string(), Json::Obj(theory_json));
+        let content_fingerprint = fingerprint(&Json::Obj(key_obj.clone()));
+
         let cargo_json: BTreeMap<String, Json> = cargo_hashes
             .iter()
             .map(|(k, v)| (k.clone(), Json::Str(v.clone())))
             .collect();
         key_obj.insert("cargo".to_string(), Json::Obj(cargo_json));
-        let theory_json: BTreeMap<String, Json> = theory_hashes
-            .iter()
-            .map(|(k, v)| {
-                (k.to_string_lossy().into_owned(), Json::Str(v.clone()))
-            })
-            .collect();
-        key_obj.insert("theory".to_string(), Json::Obj(theory_json));
         let key_fingerprint = fingerprint(&Json::Obj(key_obj));
+
+        if guard.as_ref().is_none_or(|c| c.key_fingerprint != key_fingerprint)
+            && let Some(disk_cached) = self.try_load_precompiled_prefix(
+                &content_fingerprint,
+                &key_fingerprint,
+            )?
+        {
+            *guard = Some(disk_cached);
+        }
 
         if let Some(cached) = guard
             .as_ref()
@@ -3556,6 +3623,312 @@ impl Checker {
         });
 
         Ok(report)
+    }
+
+    fn try_load_precompiled_prefix(
+        &self,
+        expected_content_fingerprint: &str,
+        key_fingerprint: &str,
+    ) -> Result<Option<CachedVerifyPrefix>, Failure> {
+        let prefix_dir = self.checkout.join("precompiled-prefix");
+        let manifest_path = prefix_dir.join("prefix-manifest.json");
+        if !manifest_path.is_file() {
+            return Ok(None);
+        }
+        let text = fs::read_to_string(&manifest_path).map_err(|e| {
+            Failure::new(
+                2,
+                "precompiled-prefix",
+                format!("cannot read {}: {e}", manifest_path.display()),
+            )
+        })?;
+        let manifest = Json::parse(&text).map_err(|e| {
+            Failure::new(
+                2,
+                "precompiled-prefix",
+                format!("malformed {}: {e}", manifest_path.display()),
+            )
+        })?;
+        let Some(fp) = manifest
+            .get("contentFingerprint")
+            .and_then(Json::as_str)
+        else {
+            return Ok(None);
+        };
+        if fp != expected_content_fingerprint {
+            return Ok(None);
+        }
+        let Some(report) = manifest.get("report").cloned() else {
+            return Ok(None);
+        };
+        let Some(graph) = manifest
+            .get("graph")
+            .and_then(Json::as_obj)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let Some(arts_obj) = manifest
+            .get("compiledArtifactsRel")
+            .and_then(Json::as_obj)
+        else {
+            return Ok(None);
+        };
+        let mut compiled_artifacts_rel = BTreeMap::new();
+        for (m, groups_val) in arts_obj {
+            let Some(groups_arr) = groups_val.as_arr() else {
+                return Ok(None);
+            };
+            let mut groups = Vec::new();
+            for g_val in groups_arr {
+                let Some(g_arr) = g_val.as_arr() else {
+                    return Ok(None);
+                };
+                let mut g = Vec::new();
+                for s_val in g_arr {
+                    let Some(s) = s_val.as_str() else {
+                        return Ok(None);
+                    };
+                    g.push(s.to_string());
+                }
+                groups.push(g);
+            }
+            compiled_artifacts_rel.insert(m.clone(), groups);
+        }
+
+        let Some(files_arr) = manifest.get("files").and_then(Json::as_arr)
+        else {
+            return Ok(None);
+        };
+        let mut files = Vec::new();
+        for item in files_arr {
+            let Some(rel_path) = item.get("relPath").and_then(Json::as_str)
+            else {
+                return Ok(None);
+            };
+            let Some(expected_sha) = item.get("sha256").and_then(Json::as_str)
+            else {
+                return Ok(None);
+            };
+            let file_path = prefix_dir.join(rel_path);
+            regular(&file_path, "precompiled-prefix")?;
+            let bytes = fs::read(&file_path).map_err(|e| {
+                Failure::new(
+                    2,
+                    "precompiled-prefix",
+                    format!("cannot read {}: {e}", file_path.display()),
+                )
+            })?;
+            let actual_sha = sha256_hex(&bytes);
+            if actual_sha != expected_sha {
+                return Err(Failure::new(
+                    2,
+                    "precompiled-prefix",
+                    format!(
+                        "precompiled prefix artifact digest mismatch for {rel_path}"
+                    ),
+                ));
+            }
+            files.push(CachedArtifactFile {
+                rel_path: rel_path.to_string(),
+                bytes,
+                sha256: actual_sha,
+            });
+        }
+
+        Ok(Some(CachedVerifyPrefix {
+            key_fingerprint: key_fingerprint.to_string(),
+            report,
+            compiled_artifacts_rel,
+            graph,
+            files,
+        }))
+    }
+
+    /// Build and audit the `Trusted` + `Anneal` verification prefix and persist
+    /// the compiled `.olean`/`.ir` artifacts and `prefix-manifest.json` into
+    /// `output_dir` (defaulting to `<checkout>/precompiled-prefix`).
+    pub fn write_verify_prefix(
+        &mut self,
+        output_dir: &Path,
+    ) -> Result<PathBuf, Failure> {
+        let default_targets = default_downstream_targets();
+        let theory_targets: Vec<&DownstreamTarget> = default_targets
+            .iter()
+            .filter(|t| t.role == "theory")
+            .collect();
+
+        let mut theory_hashes = BTreeMap::new();
+        let mut theory_copies = BTreeMap::new();
+        for t in &theory_targets {
+            let full = self.checkout.join(&t.path);
+            regular(&full, "theory-input")?;
+            let sha = digest(&full)?;
+            let dest = self.stage.join("theory-source").join(&t.path);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    Failure::new(2, "theory-input", e.to_string())
+                })?;
+            }
+            fs::copy(&full, &dest).map_err(|e| {
+                Failure::new(2, "theory-input", e.to_string())
+            })?;
+            if digest(&dest)? != sha {
+                return Err(Failure::new(
+                    2,
+                    "theory-input",
+                    format!("source changed while copying {}", t.path),
+                ));
+            }
+            theory_hashes.insert(full, sha);
+            theory_copies.insert(t.module.clone(), dest);
+        }
+
+        let (initial, _) = snapshot(&self.source)?;
+        let inspector_src =
+            self.checkout.join("trusted/audit/TrustedBoundary.lean");
+        regular(&inspector_src, "tool-snapshot")?;
+        let inspector_sha = digest(&inspector_src)?;
+        regular(&self.lean, "toolchain")?;
+        let lean_sha = digest(&self.lean)?;
+
+        let mut content_key = BTreeMap::new();
+        content_key.insert("leanSha256".to_string(), Json::Str(lean_sha));
+        content_key.insert("initial".to_string(), Json::Obj(initial));
+        content_key.insert("inspector".to_string(), Json::Str(inspector_sha));
+        let mut theory_json = BTreeMap::new();
+        for t in &theory_targets {
+            let full = self.checkout.join(&t.path);
+            if let Some(sha) = theory_hashes.get(&full) {
+                theory_json.insert(t.path.clone(), Json::Str(sha.clone()));
+            }
+        }
+        content_key.insert("theory".to_string(), Json::Obj(theory_json));
+        let content_fingerprint = fingerprint(&Json::Obj(content_key));
+
+        let report = self.load_or_build_verify_prefix(
+            &theory_targets,
+            &theory_copies,
+            &theory_hashes,
+        )?;
+        let guard = VERIFY_PREFIX_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cached = guard.as_ref().ok_or_else(|| {
+            Failure::new(
+                2,
+                "precompiled-prefix",
+                "verify prefix cache empty after build",
+            )
+        })?;
+
+        fs::create_dir_all(output_dir).map_err(|e| {
+            Failure::new(
+                2,
+                "precompiled-prefix",
+                format!("cannot create {}: {e}", output_dir.display()),
+            )
+        })?;
+
+        let mut files_json = Vec::new();
+        for file in &cached.files {
+            let dest = output_dir.join(&file.rel_path);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    Failure::new(2, "precompiled-prefix", e.to_string())
+                })?;
+            }
+            fs::write(&dest, &file.bytes).map_err(|e| {
+                Failure::new(2, "precompiled-prefix", e.to_string())
+            })?;
+            let mut item = BTreeMap::new();
+            item.insert("relPath".to_string(), Json::Str(file.rel_path.clone()));
+            item.insert("sha256".to_string(), Json::Str(file.sha256.clone()));
+            files_json.push(Json::Obj(item));
+        }
+
+        let mut arts_json = BTreeMap::new();
+        for (m, groups) in &cached.compiled_artifacts_rel {
+            let groups_arr: Vec<Json> = groups
+                .iter()
+                .map(|g| {
+                    Json::Arr(g.iter().cloned().map(Json::Str).collect())
+                })
+                .collect();
+            arts_json.insert(m.clone(), Json::Arr(groups_arr));
+        }
+
+        let mut manifest_obj = BTreeMap::new();
+        manifest_obj.insert("schema".to_string(), Json::Int(1));
+        manifest_obj.insert(
+            "contentFingerprint".to_string(),
+            Json::Str(content_fingerprint),
+        );
+        manifest_obj.insert("report".to_string(), report);
+        manifest_obj.insert(
+            "compiledArtifactsRel".to_string(),
+            Json::Obj(arts_json),
+        );
+        manifest_obj.insert(
+            "graph".to_string(),
+            Json::Obj(cached.graph.clone()),
+        );
+        manifest_obj.insert("files".to_string(), Json::Arr(files_json));
+
+        let manifest_path = output_dir.join("prefix-manifest.json");
+        fs::write(
+            &manifest_path,
+            Json::Obj(manifest_obj).to_pretty_string().as_bytes(),
+        )
+        .map_err(|e| Failure::new(2, "precompiled-prefix", e.to_string()))?;
+
+        Ok(manifest_path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_cargo_toml_with_exocrate_array_of_tables() {
+        let toml_src = r#"
+[package]
+name = "cargo-anneal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+exocrate = "0.2.0"
+
+[[package.metadata.exocrate]]
+os = "linux"
+arch = "x86_64"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+url = "https://example.com/linux-x86_64.tar.zst"
+
+[[package.metadata.exocrate]]
+os = "macos"
+arch = "aarch64"
+sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+url = "https://example.com/macos-aarch64.tar.zst"
+"#;
+        let parsed = parse_cargo_toml(toml_src).unwrap();
+        let exocrate_arr = parsed
+            .get("package")
+            .and_then(|p| p.get("metadata"))
+            .and_then(|m| m.get("exocrate"))
+            .and_then(Json::as_arr)
+            .unwrap();
+        assert_eq!(exocrate_arr.len(), 2);
+        assert_eq!(
+            exocrate_arr[0].get("os").and_then(Json::as_str),
+            Some("linux")
+        );
+        assert_eq!(
+            exocrate_arr[1].get("arch").and_then(Json::as_str),
+            Some("aarch64")
+        );
     }
 }
 

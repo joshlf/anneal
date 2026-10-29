@@ -43,7 +43,11 @@ fn run(mut args: Vec<String>) -> Result<u8, (u8, String)> {
     let subcmd = subcmd.to_string();
     if !matches!(
         subcmd.as_str(),
-        "verify" | "verify-crate" | "audit-repo" | "audit-self-test"
+        "verify"
+            | "verify-crate"
+            | "audit-repo"
+            | "audit-self-test"
+            | "build-verify-prefix"
     ) {
         return Err((
             1,
@@ -96,7 +100,10 @@ fn run(mut args: Vec<String>) -> Result<u8, (u8, String)> {
                     format!("error: unrecognized flag `{flag}`\n{}", usage()),
                 ));
             }
-            pos if matches!(subcmd.as_str(), "verify" | "verify-crate") => {
+            pos if matches!(
+                subcmd.as_str(),
+                "verify" | "verify-crate" | "build-verify-prefix"
+            ) => {
                 if crate_dir.is_some() {
                     return Err((
                         1,
@@ -266,10 +273,28 @@ fn run(mut args: Vec<String>) -> Result<u8, (u8, String)> {
             let rc = run_self_test(&checkout, lean.as_deref());
             Ok(rc as u8)
         }
+        "build-verify-prefix" => {
+            let checkout = resolve_anneal_root(&options)
+                .map_err(|e| (2, e.to_string()))?;
+            let lean = resolve_lean_bin(&options);
+            let out_dir = crate_dir
+                .unwrap_or_else(|| checkout.join("precompiled-prefix"));
+            let mut checker = Checker::new(&checkout, lean.as_deref(), None)
+                .map_err(|e| (2, format!("error: {e}")))?;
+            let manifest_path = checker
+                .write_verify_prefix(&out_dir)
+                .map_err(|e| (e.code as u8, format!("error: {e}")))?;
+            let _ = fs::remove_dir_all(&checker.stage);
+            println!(
+                "built precompiled verify prefix at {}",
+                manifest_path.display()
+            );
+            Ok(0)
+        }
         _ => unreachable!(),
     }
 }
 
 fn usage() -> String {
-    "usage: cargo-anneal [anneal] <verify|verify-crate|audit-repo|audit-self-test> [crate-dir] [--lean <path>] [--anneal-root <path>] [--keep-proof]".to_string()
+    "usage: cargo-anneal [anneal] <verify|verify-crate|audit-repo|audit-self-test|build-verify-prefix> [crate-dir] [--lean <path>] [--anneal-root <path>] [--keep-proof]".to_string()
 }

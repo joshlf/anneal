@@ -14,7 +14,9 @@
     ]
   ],
   "distributions": {
+    "Lean (version 4.34.1, aarch64-unknown-linux-gnu, commit 5045d0056413266e57c625dcd7c365b10e377c52, Release)": "79fb1d26fa5a39385d59fdc48a711a14b0710ca6480271acce99b4d177cea085",
     "Lean (version 4.34.1, arm64-apple-darwin24.6.0, commit 5045d0056413266e57c625dcd7c365b10e377c52, Release)": "1b370cfcbf44e80d1b004ab1b1ab9a4c73951f9f7c242140bcff9bc577576554",
+    "Lean (version 4.34.1, x86_64-apple-darwin24.6.0, commit 5045d0056413266e57c625dcd7c365b10e377c52, Release)": "998f0cc2a5a754cc66df1f33b85e1447528737ff15012db35d8c501754b02f1e",
     "Lean (version 4.34.1, x86_64-unknown-linux-gnu, commit 5045d0056413266e57c625dcd7c365b10e377c52, Release)": "e8baaa71855a616dc351028f3ad2200051b0671f423a1696a100e809302d5550"
   },
   "graph": {
