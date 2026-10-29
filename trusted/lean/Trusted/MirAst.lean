@@ -69,7 +69,7 @@ inductive AtomicOrdering where
   | acquire
 
 /-- Minimal MIR type grammar (`usize`, `bool`, `()`, `&Atomic<usize>`,
-    `&mut usize`, and `Ordering`).
+    `&usize`, `&mut usize`, and `Ordering`).
 
     - `MirTy.usize` models Rust's pointer-sized unsigned integer type `usize`:
 
@@ -90,6 +90,12 @@ inductive AtomicOrdering where
       > creating an `atomic_ref` in C++, with the `atomic_ref` being destroyed
       > when the lifetime of the shared reference ends."
 
+    - `MirTy.refSharedUsize` models an immutable shared reference `&usize`:
+
+      > "Shared references (`&T`) point to memory which is owned by some other
+      > value. When a shared reference to a value is created, it prevents
+      > direct mutation of the value."
+
     - `MirTy.refMutUsize` models an exclusive mutable reference `&mut usize`:
 
       > "Mutable references (`&mut T`), also called exclusive references, allow
@@ -100,7 +106,7 @@ inductive AtomicOrdering where
     Sources:
     - https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/numeric.md#L37-L38
     - https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/boolean.md#L6-L7
-    - https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/pointer.md#L36-L38
+    - https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/pointer.md#L12-L38
     - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/sync/atomic.rs#L36-L42
     - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/sync/atomic.rs#L466-L527 -/
 inductive MirTy where
@@ -108,11 +114,12 @@ inductive MirTy where
   | bool
   | unit
   | refAtomicUsize
+  | refSharedUsize
   | refMutUsize
   | atomicOrdering
 
 /-- Initialized runtime scalar value (`usize`, `bool`, `()`, `&AtomicUsize`
-    location, `&mut usize` location, or `Ordering`).
+    location, `&usize` location, `&mut usize` location, or `Ordering`).
 
     In Rust, scalar values and references must be initialized and valid when
     produced; uninitialized locals are represented in `MirState` by
@@ -140,6 +147,7 @@ inductive MirVal where
   | bool (b : Bool)
   | unit
   | atomicLoc (loc : Nat)
+  | refSharedLoc (loc : Nat)
   | refMutLoc (loc : Nat)
   | ordering (ord : AtomicOrdering)
 

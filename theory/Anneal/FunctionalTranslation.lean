@@ -190,29 +190,35 @@ theorem SafeAndReturns.of_terminated {body : MirBody} {s : MirState} {v : MirVal
 -/
 
 /-- Symbolic values in the functional translation: scalar values (`.usize`,
-    `.bool`, `.unit`) and active mutable borrow tokens (`.borrow loanId`). -/
+    `.bool`, `.unit`), immutable shared reference values (`.refShared n`), and
+    active mutable borrow tokens (`.borrow loanId`). -/
 inductive SymVal where
   | usize (n : Nat)
   | bool (b : Bool)
   | unit
+  | refShared (n : Nat)
   | borrow (loanId : Nat)
 
-/-- Convert a scalar `SymVal` to its runtime `MirVal` (`none` for `.borrow`). -/
+/-- Convert a scalar `SymVal` to its runtime `MirVal` (`none` for `.refShared`
+    and `.borrow`). -/
 def SymVal.toScalarMirVal : SymVal → Option MirVal
   | .usize n => some (.usize n)
   | .bool b => some (.bool b)
   | .unit => some .unit
+  | .refShared _ => none
   | .borrow _ => none
 
 /-- Spine-preserving conditional merge on `SymVal`: pushes `if b then ... else ...`
-    inside `.usize` and `.bool` payloads so the outer `SymVal` constructor tag
-    remains exposed for subsequent pattern matching (`toScalarMirVal`) during
-    `rfl` reduction on symbolic inputs. -/
+    inside `.usize`, `.bool`, and `.refShared` payloads so the outer `SymVal`
+    constructor tag remains exposed for subsequent pattern matching
+    (`toScalarMirVal`, dereference reads) during `rfl` reduction on symbolic
+    inputs. -/
 def zipSymVal (b : Bool) (tVal fVal : SymVal) : SymVal :=
   match tVal, fVal with
   | .usize nt, .usize nf => .usize (if b then nt else nf)
   | .bool bt, .bool bf => .bool (if b then bt else bf)
   | .unit, .unit => .unit
+  | .refShared nt, .refShared nf => .refShared (if b then nt else nf)
   | _, _ => if b then tVal else fVal
 
 theorem zipSymVal_eq_ite (b : Bool) (tVal fVal : SymVal) :
@@ -370,6 +376,11 @@ def evalSymStmt (sym : SymState) (stmt : Stmt) : Option SymState :=
     | none => none
   | .assign dst (.deref src) =>
     match sym.locals src.index with
+    | some (.refShared n) =>
+      some { sym with
+        locals := updateSymLocal sym.locals dst.index (some (.usize n))
+        stmtIdx := sym.stmtIdx + 1
+      }
     | some (.borrow lid) =>
       match sym.loans lid with
       | some entry =>
@@ -602,12 +613,14 @@ noncomputable def evalSymState (plan : TransPlan) (body : MirBody) (sym : SymSta
 -/
 
 /-- Pure argument value passed to a translated Rust function: either a scalar
-    (`usize`, `bool`, `unit`) or the initial referent value of a `&mut usize`
+    (`usize`, `bool`, `unit`), the referent value of an immutable `&usize`
+    parameter (`refShared n`), or the initial referent value of a `&mut usize`
     parameter (`refMut n`). -/
 inductive SymArg where
   | usize (n : Nat)
   | bool (b : Bool)
   | unit
+  | refShared (n : Nat)
   | refMut (n : Nat)
 
 /-- Empty symbolic local store (`fun _ => none`). -/
@@ -635,6 +648,7 @@ noncomputable def buildPureSymStateAux (idx : Nat) : List SymArg →
     | .usize n => (updateSymLocal locals idx (some (.usize n)), loans, nextIdx)
     | .bool b => (updateSymLocal locals idx (some (.bool b)), loans, nextIdx)
     | .unit => (updateSymLocal locals idx (some .unit), loans, nextIdx)
+    | .refShared n => (updateSymLocal locals idx (some (.refShared n)), loans, nextIdx)
     | .refMut n =>
       (updateSymLocal locals idx (some (.borrow idx)),
        updateLoan loans idx (some (rootLoanEntry n)),
@@ -658,19 +672,31 @@ noncomputable def translatePure (plan : TransPlan) (body : MirBody) (args : List
   evalSymState plan body (buildPureSymState args)
 
 /-- Computable check that no parameter slot `1 ≤ i < k` in `locals` holds
-    `.refMutLoc loc`. -/
+    `.refMutLoc loc` or `.refSharedLoc loc`. -/
 noncomputable def noAliasBefore (locals : Nat → Option MirVal) (loc : Nat) : Nat → Bool
   | 0 => true
   | 1 => true
   | j + 2 =>
     (match locals (j + 1) with
      | some (.refMutLoc loc') => !(loc' == loc)
+     | some (.refSharedLoc loc') => !(loc' == loc)
      | _ => true) &&
     noAliasBefore locals loc (j + 1)
 
+/-- Computable check that no parameter slot `1 ≤ i < k` in `locals` holds
+    `.refMutLoc loc`. -/
+noncomputable def noMutAliasBefore (locals : Nat → Option MirVal) (loc : Nat) : Nat → Bool
+  | 0 => true
+  | 1 => true
+  | j + 2 =>
+    (match locals (j + 1) with
+     | some (.refMutLoc loc') => !(loc' == loc)
+     | _ => true) &&
+    noMutAliasBefore locals loc (j + 1)
+
 /-- Extract the pure `List SymArg` argument vector from a concrete `MirState`
-    according to `argTys`, checking parameter type validity, `OwnLoc` ownership,
-    and pairwise `&mut` non-aliasing (`noAliasBefore`). -/
+    according to `argTys`, checking parameter type validity, `OwnLoc` / `ReadOwnLoc`
+    ownership, and `&mut` non-aliasing (`noAliasBefore`, `noMutAliasBefore`). -/
 noncomputable def extractSymArgsAux (idx : Nat) : List MirTy → MirState → Option (List SymArg)
   | [], _ => some []
   | ty :: restTys, init =>
@@ -687,6 +713,17 @@ noncomputable def extractSymArgsAux (idx : Nat) : List MirTy → MirState → Op
       match extractSymArgsAux (idx + 1) restTys init with
       | some restArgs => some (.unit :: restArgs)
       | none => none
+    | .refSharedUsize, some (.refSharedLoc loc) =>
+      if noMutAliasBefore init.locals loc idx &&
+         decide (init.mem.naWriteTs loc ≤ init.mem.curView loc) then
+        match init.mem.naVal loc with
+        | some (.usize n) =>
+          match extractSymArgsAux (idx + 1) restTys init with
+          | some restArgs => some (.refShared n :: restArgs)
+          | none => none
+        | _ => none
+      else
+        none
     | .refMutUsize, some (.refMutLoc loc) =>
       if noAliasBefore init.locals loc idx &&
          decide (init.mem.naWriteTs loc ≤ init.mem.curView loc) &&
@@ -702,11 +739,12 @@ noncomputable def extractSymArgsAux (idx : Nat) : List MirTy → MirState → Op
     | _, _ => none
 
 /-- Check whether a `MirTy` parameter type is supported by pure functional
-    translation (`.usize`, `.bool`, `.unit`, `.refMutUsize`). -/
+    translation (`.usize`, `.bool`, `.unit`, `.refSharedUsize`, `.refMutUsize`). -/
 def isSupportedArgTy : MirTy → Bool
   | .usize => true
   | .bool => true
   | .unit => true
+  | .refSharedUsize => true
   | .refMutUsize => true
   | .refAtomicUsize => false
   | .atomicOrdering => false
@@ -747,26 +785,32 @@ noncomputable def evalSym (plan : TransPlan) (body : MirBody) (init : MirState) 
 -/
 
 /-- Value correspondence between a symbolic `SymVal` and a concrete `MirVal`
-    under concrete loan-location map `loanLoc : Nat → Option Nat`. -/
-def ValRel (loanLoc : Nat → Option Nat) (sv : SymVal) (mv : MirVal) : Prop :=
+    under concrete loan-location map `loanLoc : Nat → Option Nat` and
+    shared-reference relation `sharedLoc : Nat → Nat → Prop`. -/
+def ValRel (loanLoc : Nat → Option Nat) (sharedLoc : Nat → Nat → Prop)
+    (sv : SymVal) (mv : MirVal) : Prop :=
   match sv with
   | .usize n => mv = .usize n
   | .bool b => mv = .bool b
   | .unit => mv = .unit
+  | .refShared n => ∃ loc, sharedLoc loc n ∧ mv = .refSharedLoc loc
   | .borrow lid => ∃ loc, loanLoc lid = some loc ∧ mv = .refMutLoc loc
 
 theorem ValRel.of_toScalarMirVal (loanLoc : Nat → Option Nat)
+    (sharedLoc : Nat → Nat → Prop)
     {sv : SymVal} {mv : MirVal} (h : sv.toScalarMirVal = some mv) :
-    ValRel loanLoc sv mv := by
+    ValRel loanLoc sharedLoc sv mv := by
   cases sv with
   | usize n => injection h with heq; exact heq.symm
   | bool b => injection h with heq; exact heq.symm
   | unit => injection h with heq; exact heq.symm
+  | refShared _ => cases h
   | borrow _ => cases h
 
 theorem ValRel.toScalarMirVal_eq {loanLoc : Nat → Option Nat}
+    {sharedLoc : Nat → Nat → Prop}
     {sv : SymVal} {mv mv' : MirVal}
-    (hRel : ValRel loanLoc sv mv)
+    (hRel : ValRel loanLoc sharedLoc sv mv)
     (hScalar : sv.toScalarMirVal = some mv') :
     mv = mv' := by
   cases sv with
@@ -779,6 +823,7 @@ theorem ValRel.toScalarMirVal_eq {loanLoc : Nat → Option Nat}
   | unit =>
     injection hScalar with h1
     exact Eq.trans hRel h1
+  | refShared _ => cases hScalar
   | borrow _ => cases hScalar
 
 theorem SymVal.not_borrow_of_toScalarMirVal {sv : SymVal} {mv : MirVal}
@@ -789,15 +834,15 @@ theorem SymVal.not_borrow_of_toScalarMirVal {sv : SymVal} {mv : MirVal}
   cases hScalar
 
 /-- Local store correspondence between `sym.locals` and `conc.locals`. -/
-def LocalRel (loanLoc : Nat → Option Nat)
+def LocalRel (loanLoc : Nat → Option Nat) (sharedLoc : Nat → Nat → Prop)
     (symLocals : Nat → Option SymVal) (concLocals : Nat → Option MirVal) : Prop :=
-  ∀ i sv, symLocals i = some sv → ∃ mv, concLocals i = some mv ∧ ValRel loanLoc sv mv
+  ∀ i sv, symLocals i = some sv → ∃ mv, concLocals i = some mv ∧ ValRel loanLoc sharedLoc sv mv
 
-theorem LocalRel.update_some {loanLoc : Nat → Option Nat}
+theorem LocalRel.update_some {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
     {symLocals : Nat → Option SymVal} {concLocals : Nat → Option MirVal}
-    (hRel : LocalRel loanLoc symLocals concLocals)
-    (dst : Nat) {sv : SymVal} {mv : MirVal} (hVal : ValRel loanLoc sv mv) :
-    LocalRel loanLoc (updateSymLocal symLocals dst (some sv))
+    (hRel : LocalRel loanLoc sharedLoc symLocals concLocals)
+    (dst : Nat) {sv : SymVal} {mv : MirVal} (hVal : ValRel loanLoc sharedLoc sv mv) :
+    LocalRel loanLoc sharedLoc (updateSymLocal symLocals dst (some sv))
       (updateLocal concLocals dst (some mv)) := by
   intro i sv' hlookup
   unfold updateSymLocal at hlookup
@@ -812,10 +857,10 @@ theorem LocalRel.update_some {loanLoc : Nat → Option Nat}
     subst heq
     exact ⟨mv, rfl, hVal⟩
 
-theorem LocalRel.update_none {loanLoc : Nat → Option Nat}
+theorem LocalRel.update_none {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
     {symLocals : Nat → Option SymVal} {concLocals : Nat → Option MirVal}
-    (hRel : LocalRel loanLoc symLocals concLocals) (dst : Nat) :
-    LocalRel loanLoc (updateSymLocal symLocals dst none)
+    (hRel : LocalRel loanLoc sharedLoc symLocals concLocals) (dst : Nat) :
+    LocalRel loanLoc sharedLoc (updateSymLocal symLocals dst none)
       (updateLocal concLocals dst none) := by
   intro i sv' hlookup
   unfold updateSymLocal at hlookup
@@ -829,16 +874,16 @@ theorem LocalRel.update_none {loanLoc : Nat → Option Nat}
     cases hlookup
 
 /-- Soundness of symbolic operand evaluation (`evalSymOperand`). -/
-theorem evalSymOperand_sound {loanLoc : Nat → Option Nat}
+theorem evalSymOperand_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
     {symLocals symLocals' : Nat → Option SymVal}
     {concLocals : Nat → Option MirVal}
     {op : Operand} {sv : SymVal}
-    (hRel : LocalRel loanLoc symLocals concLocals)
+    (hRel : LocalRel loanLoc sharedLoc symLocals concLocals)
     (hEval : evalSymOperand symLocals op = some (sv, symLocals')) :
     ∃ mv concLocals',
       evalOperand concLocals op = some (mv, concLocals') ∧
-      ValRel loanLoc sv mv ∧
-      LocalRel loanLoc symLocals' concLocals' := by
+      ValRel loanLoc sharedLoc sv mv ∧
+      LocalRel loanLoc sharedLoc symLocals' concLocals' := by
   cases op with
   | copy src =>
     dsimp [evalSymOperand] at hEval
@@ -887,7 +932,7 @@ theorem evalSymOperand_sound {loanLoc : Nat → Option Nat}
       injection hpair with hsv hloc
       subst hsv hloc
       exact ⟨.unit, concLocals, rfl, rfl, hRel⟩
-    | atomicLoc _ | refMutLoc _ | ordering _ =>
+    | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ =>
       cases hEval
 
 theorem evalSymOperand_borrows {locals locals' : Nat → Option SymVal}
@@ -948,7 +993,7 @@ theorem evalSymOperand_borrows {locals locals' : Nat → Option SymVal}
       injection hpair with hsv hloc
       subst hsv hloc
       exact ⟨(by intro _ h; cases h), hBorrows⟩
-    | atomicLoc _ | refMutLoc _ | ordering _ =>
+    | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ =>
       cases hEval
 
 theorem localBorrows_update_some {locals : Nat → Option SymVal}
@@ -993,17 +1038,17 @@ theorem loans_some_updateLoan {loans : Nat → Option LoanEntry}
   | true => exact ⟨e', rfl⟩
 
 /-- Soundness of symbolic binary comparison and bitwise evaluation (`evalSymBinOp`). -/
-theorem evalSymBinOp_sound {loanLoc : Nat → Option Nat}
+theorem evalSymBinOp_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
     {op : BinOp} {sv1 sv2 res : SymVal} {mv1 mv2 : MirVal}
-    (hVal1 : ValRel loanLoc sv1 mv1)
-    (hVal2 : ValRel loanLoc sv2 mv2)
+    (hVal1 : ValRel loanLoc sharedLoc sv1 mv1)
+    (hVal2 : ValRel loanLoc sharedLoc sv2 mv2)
     (hBin : evalSymBinOp op sv1 sv2 = some res) :
-    ∃ mres, evalBinOp op mv1 mv2 = some mres ∧ ValRel loanLoc res mres := by
+    ∃ mres, evalBinOp op mv1 mv2 = some mres ∧ ValRel loanLoc sharedLoc res mres := by
   cases sv1 with
-  | bool _ | unit | borrow _ => cases hBin
+  | bool _ | unit | refShared _ | borrow _ => cases hBin
   | usize n1 =>
     cases sv2 with
-    | bool _ | unit | borrow _ => cases hBin
+    | bool _ | unit | refShared _ | borrow _ => cases hBin
     | usize n2 =>
       subst hVal1 hVal2
       cases op with
@@ -1047,18 +1092,18 @@ theorem evalSymBinOp_sound {loanLoc : Nat → Option Nat}
 /-- Invariant for an active joined loan `lid` (`entry.owners = [.loan falseLid, .loan trueLid]`):
     1. `falseLid ≠ trueLid`, `falseLid ≠ lid`, and `trueLid ≠ lid`,
     2. `loans falseLid` and `loans trueLid` are present, frozen, and have
-       `owners = []`,
+      `owners = []`,
     3. `loanLoc falseLid = some locFalse`, `loanLoc trueLid = some locTrue`, and
-       `locFalse ≠ locTrue`,
+      `locFalse ≠ locTrue`,
     4. At the inactive branch's location (`locTrue` when `loc = locFalse`, or
-       `locFalse` when `loc = locTrue`), `OwnLoc mem` holds with the inactive
-       parent's original value (`mvTrueOrig` or `mvFalseOrig`),
+      `locFalse` when `loc = locTrue`), `OwnLoc mem` holds with the inactive
+      parent's original value (`mvTrueOrig` or `mvFalseOrig`),
     5. Every other active unfrozen loan `otherLid ≠ lid` has a location
-       `locOther` distinct from both `locFalse` and `locTrue`, and has
-       `otherEntry.owners = []`,
+      `locOther` distinct from both `locFalse` and `locTrue`, and has
+      `otherEntry.owners = []`,
     6. Applying `entry.back v` to any scalar `v` (`v.toScalarMirVal = some mv`)
-       yields `[vFalse, vTrue]` matching `(mv, mvTrueOrig)` when `loc = locFalse`
-       and `(mvFalseOrig, mv)` when `loc = locTrue`. -/
+      yields `[vFalse, vTrue]` matching `(mv, mvTrueOrig)` when `loc = locFalse`
+      and `(mvFalseOrig, mv)` when `loc = locTrue`. -/
 def JoinInv (loanLoc : Nat → Option Nat)
     (loans : Nat → Option LoanEntry) (mem : MemState)
     (lid : Nat) (entry : LoanEntry) (falseLid trueLid : Nat) : Prop :=
@@ -1097,13 +1142,16 @@ def JoinInv (loanLoc : Nat → Option Nat)
 
 /-- Loan and memory correspondence between `sym` and `conc.mem`:
     1. Every active unfrozen loan `lid` holds a scalar `curVal` (`mv`) and owns
-       its concrete location `loc` in `conc.mem` (`OwnLoc conc.mem loc mv`),
-       and either has `entry.owners = []` or satisfies `JoinInv`.
+      its concrete location `loc` in `conc.mem` (`OwnLoc conc.mem loc mv`),
+      and either has `entry.owners = []` or satisfies `JoinInv`.
     2. Distinct active unfrozen loans map to distinct concrete locations in
-       `conc.mem`.
+      `conc.mem`.
     3. When `sym.hasActiveJoin = false`, every active unfrozen loan is a root
-       loan (`entry.owners = []`). -/
-structure LoanRel (loanLoc : Nat → Option Nat)
+      loan (`entry.owners = []`).
+    4. Every shared reference location `loc` in `sharedLoc loc n` satisfies
+      `ReadOwnLoc conc.mem loc (.usize n)` and is disjoint from every mutable
+      loan location in `loanLoc`. -/
+structure LoanRel (loanLoc : Nat → Option Nat) (sharedLoc : Nat → Nat → Prop)
     (loans : Nat → Option LoanEntry) (hasActiveJoin : Bool) (mem : MemState) : Prop where
   activeOwn :
     ∀ lid entry,
@@ -1133,15 +1181,24 @@ structure LoanRel (loanLoc : Nat → Option Nat)
         entry.active = true →
         entry.frozen = false →
         entry.owners = []
+  sharedOwn :
+    ∀ loc n, sharedLoc loc n → ReadOwnLoc mem loc (.usize n)
+  disjointShared :
+    ∀ lid locMut locShared n,
+      loanLoc lid = some locMut →
+      sharedLoc locShared n →
+      locMut ≠ locShared
 
 /-- Full simulation relation linking a symbolic state `sym : SymState` and a
-    concrete state `conc : MirState` under loan-location map `loanLoc`. -/
-structure StateRel (loanLoc : Nat → Option Nat) (sym : SymState) (conc : MirState) : Prop where
+    concrete state `conc : MirState` under loan-location map `loanLoc` and
+    shared-reference relation `sharedLoc`. -/
+structure StateRel (loanLoc : Nat → Option Nat) (sharedLoc : Nat → Nat → Prop)
+    (sym : SymState) (conc : MirState) : Prop where
   block_eq : conc.block = sym.block
   stmtIdx_eq : conc.stmtIdx = sym.stmtIdx
   localBorrows : ∀ i lid, sym.locals i = some (.borrow lid) → ∃ e, sym.loans lid = some e
-  localRel : LocalRel loanLoc sym.locals conc.locals
-  loanRel : LoanRel loanLoc sym.loans sym.hasActiveJoin conc.mem
+  localRel : LocalRel loanLoc sharedLoc sym.locals conc.locals
+  loanRel : LoanRel loanLoc sharedLoc sym.loans sym.hasActiveJoin conc.mem
 
 
 /-!
@@ -1165,34 +1222,38 @@ theorem JoinInv.of_ownLoc_mono {loanLoc : Nat → Option Nat}
   | inl h => exact Or.inl ⟨h.1, hMono locTrue mvTrueOrig h.2⟩
   | inr h => exact Or.inr ⟨h.1, hMono locFalse mvFalseOrig h.2⟩
 
-theorem LoanRel.of_ownLoc_mono {loanLoc : Nat → Option Nat}
-    {loans : Nat → Option LoanEntry} {hasActiveJoin : Bool} {mem mem' : MemState}
-    (hMono : ∀ l v, OwnLoc mem l v → OwnLoc mem' l v)
-    (hLoan : LoanRel loanLoc loans hasActiveJoin mem) :
-    LoanRel loanLoc loans hasActiveJoin mem' where
+theorem LoanRel.of_readNA {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
+    {loans : Nat → Option LoanEntry} {hasActiveJoin : Bool} {mem : MemState}
+    (locRead : Nat)
+    (hLoan : LoanRel loanLoc sharedLoc loans hasActiveJoin mem) :
+    LoanRel loanLoc sharedLoc loans hasActiveJoin
+      { mem with naReadTs := View.bump mem.naReadTs locRead (mem.curView locRead) } where
   activeOwn lid entry hlookup hact hfrz := by
     have ⟨⟨loc, mv, hloc, hsc, hown⟩, hkind⟩ :=
       hLoan.activeOwn lid entry hlookup hact hfrz
-    refine ⟨⟨loc, mv, hloc, hsc, hMono loc mv hown⟩, ?_⟩
+    refine ⟨⟨loc, mv, hloc, hsc, OwnLoc.readNA_preserves hown⟩, ?_⟩
     cases hkind with
     | inl hroot => exact Or.inl hroot
     | inr hjoin =>
       have ⟨falseLid, trueLid, howners, hinv⟩ := hjoin
-      exact Or.inr ⟨falseLid, trueLid, howners, JoinInv.of_ownLoc_mono hMono hinv⟩
+      exact Or.inr ⟨falseLid, trueLid, howners,
+        JoinInv.of_ownLoc_mono (fun _ _ h => OwnLoc.readNA_preserves h) hinv⟩
   disjointActive := hLoan.disjointActive
   noJoinOwners := hLoan.noJoinOwners
+  sharedOwn loc n hsh := ReadOwnLoc.readNA_preserves (hLoan.sharedOwn loc n hsh)
+  disjointShared := hLoan.disjointShared
 
-theorem LoanRel.update_curVal {loanLoc : Nat → Option Nat}
+theorem LoanRel.update_curVal {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
     {loans : Nat → Option LoanEntry} {hasActiveJoin : Bool} {mem : MemState}
     {lid loc : Nat} {entry : LoanEntry} {mvOld mvNew : MirVal} {sv : SymVal}
-    (hLoan : LoanRel loanLoc loans hasActiveJoin mem)
+    (hLoan : LoanRel loanLoc sharedLoc loans hasActiveJoin mem)
     (hlookup : loans lid = some entry)
     (hact : entry.active = true)
     (hfrz : entry.frozen = false)
     (hloc : loanLoc lid = some loc)
     (hOwnOld : OwnLoc mem loc mvOld)
     (hScalarNew : sv.toScalarMirVal = some mvNew) :
-    LoanRel loanLoc (updateLoan loans lid (some { entry with curVal := sv }))
+    LoanRel loanLoc sharedLoc (updateLoan loans lid (some { entry with curVal := sv }))
       hasActiveJoin (afterWriteNA mem loc mvNew) where
   activeOwn lid' entry' hlookup' hact' hfrz' := by
     unfold updateLoan at hlookup'
@@ -1333,11 +1394,17 @@ theorem LoanRel.update_curVal {loanLoc : Nat → Option Nat}
     | false =>
       rw [hbeq] at hlookup'
       exact hLoan.noJoinOwners hno lid' entry' hlookup' hact' hfrz'
+  sharedOwn locShared n hsh :=
+    ReadOwnLoc.afterWriteNA_other
+      (hLoan.disjointShared lid loc locShared n hloc hsh).symm
+      (hLoan.sharedOwn locShared n hsh)
+      mvNew
+  disjointShared := hLoan.disjointShared
 
 /-- Soundness of `evalReturn`. -/
-theorem evalReturn_sound {loanLoc : Nat → Option Nat}
+theorem evalReturn_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
     {body : MirBody} {sym : SymState} {conc : MirState} {mv : MirVal}
-    (hState : StateRel loanLoc sym conc)
+    (hState : StateRel loanLoc sharedLoc sym conc)
     (hRet : evalReturn body sym = some mv) :
     SafeAndReturns body conc mv := by
   unfold evalReturn at hRet
@@ -1374,13 +1441,13 @@ theorem evalReturn_sound {loanLoc : Nat → Option Nat}
           rw [hconc0]
 
 /-- Soundness of symbolic single-statement execution (`evalSymStmt`). -/
-theorem evalSymStmt_sound {loanLoc : Nat → Option Nat}
+theorem evalSymStmt_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
     {sym sym' : SymState} {conc : MirState} {stmt : Stmt}
-    (hState : StateRel loanLoc sym conc)
+    (hState : StateRel loanLoc sharedLoc sym conc)
     (hStmt : evalSymStmt sym stmt = some sym') :
     ∃ conc',
       evalMirStmt conc stmt = .step () conc' ∧
-      StateRel loanLoc sym' conc' := by
+      StateRel loanLoc sharedLoc sym' conc' := by
   cases stmt with
   | assign dst rv =>
     cases rv with
@@ -1418,6 +1485,32 @@ theorem evalSymStmt_sound {loanLoc : Nat → Option Nat}
         rw [hsrc] at hStmt
         cases svSrc with
         | usize _ | bool _ | unit => cases hStmt
+        | refShared n =>
+          dsimp at hStmt
+          injection hStmt with hsym'
+          subst hsym'
+          have ⟨mvSrc, hconcSrc, hvalSrc⟩ := hState.localRel src.index (.refShared n) hsrc
+          have ⟨loc, hshLoc, hmvSrc⟩ := hvalSrc
+          subst hmvSrc
+          have hReadOwn := hState.loanRel.sharedOwn loc n hshLoc
+          have hRead := ReadOwnLoc.readNA_eq hReadOwn
+          refine ⟨{ conc with
+            locals := updateLocal conc.locals dst.index (some (.usize n))
+            mem := { conc.mem with naReadTs := View.bump conc.mem.naReadTs loc (conc.mem.curView loc) }
+            stmtIdx := conc.stmtIdx + 1
+          }, ?_, ?_⟩
+          · dsimp [evalMirStmt]
+            rw [hconcSrc]
+            dsimp
+            rw [hRead]
+          · exact {
+              block_eq := hState.block_eq
+              stmtIdx_eq := by dsimp; rw [hState.stmtIdx_eq]
+              localBorrows := localBorrows_update_some dst.index hState.localBorrows
+                (fun _ heq => by cases heq)
+              localRel := LocalRel.update_some hState.localRel dst.index rfl
+              loanRel := LoanRel.of_readNA loc hState.loanRel
+            }
         | borrow lid =>
           dsimp at hStmt
           cases hloan : sym.loans lid with
@@ -1460,9 +1553,8 @@ theorem evalSymStmt_sound {loanLoc : Nat → Option Nat}
                     localBorrows := localBorrows_update_some dst.index hState.localBorrows
                       (fun lid' heq => False.elim (SymVal.not_borrow_of_toScalarMirVal hsc lid' heq))
                     localRel := LocalRel.update_some hState.localRel dst.index
-                      (ValRel.of_toScalarMirVal loanLoc hsc)
-                    loanRel := LoanRel.of_ownLoc_mono
-                      (fun _ _ h => OwnLoc.readNA_preserves h) hState.loanRel
+                      (ValRel.of_toScalarMirVal loanLoc sharedLoc hsc)
+                    loanRel := LoanRel.of_readNA loc hState.loanRel
                   }
     | binaryOp op lhs rhs =>
       dsimp [evalSymStmt] at hStmt
@@ -1498,10 +1590,10 @@ theorem evalSymStmt_sound {loanLoc : Nat → Option Nat}
                   intro lid heq
                   subst heq
                   cases v1 with
-                  | bool _ | unit | borrow _ => cases hBin
+                  | bool _ | unit | refShared _ | borrow _ => cases hBin
                   | usize _ =>
                     cases v2 with
-                    | bool _ | unit | borrow _ => cases hBin
+                    | bool _ | unit | refShared _ | borrow _ => cases hBin
                     | usize _ =>
                       cases op <;> cases hBin
                 refine ⟨{ conc with
@@ -1540,7 +1632,7 @@ theorem evalSymStmt_sound {loanLoc : Nat → Option Nat}
           | some svDst =>
             rw [hdst] at hStmt
             cases svDst with
-            | usize _ | bool _ | unit => cases hStmt
+            | usize _ | bool _ | unit | refShared _ => cases hStmt
             | borrow lid =>
               dsimp at hStmt
               cases hloan : sym.loans lid with
@@ -1647,13 +1739,13 @@ theorem evalSymStmt_sound {loanLoc : Nat → Option Nat}
     }
 
 /-- Soundness of `evalSymStep` (single statement or `Terminator.goto`). -/
-theorem evalSymStep_sound {loanLoc : Nat → Option Nat}
+theorem evalSymStep_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
     {body : MirBody} {sym sym' : SymState} {conc : MirState}
-    (hState : StateRel loanLoc sym conc)
+    (hState : StateRel loanLoc sharedLoc sym conc)
     (hStep : evalSymStep body sym = some sym') :
     ∃ conc',
       evalMirStep body conc = .step () conc' ∧
-      StateRel loanLoc sym' conc' := by
+      StateRel loanLoc sharedLoc sym' conc' := by
   unfold evalSymStep at hStep
   cases hbb : body.blocks[sym.block]? with
   | none => rw [hbb] at hStep; cases hStep
@@ -1697,14 +1789,14 @@ theorem evalSymStep_sound {loanLoc : Nat → Option Nat}
           }
 
 /-- Soundness of `evalBranchStep` (`Terminator.switchInt`). -/
-theorem evalBranchStep_sound {loanLoc : Nat → Option Nat}
+theorem evalBranchStep_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
     {body : MirBody} {sym symFalse symTrue : SymState}
     {conc : MirState} {cond : Bool}
-    (hState : StateRel loanLoc sym conc)
+    (hState : StateRel loanLoc sharedLoc sym conc)
     (hBranch : evalBranchStep body sym = some (cond, symFalse, symTrue)) :
     ∃ concNext,
       evalMirStep body conc = .step () concNext ∧
-      StateRel loanLoc (if cond then symTrue else symFalse) concNext := by
+      StateRel loanLoc sharedLoc (if cond then symTrue else symFalse) concNext := by
   unfold evalBranchStep at hBranch
   cases hbb : body.blocks[sym.block]? with
   | none => rw [hbb] at hBranch; cases hBranch
@@ -1728,7 +1820,7 @@ theorem evalBranchStep_sound {loanLoc : Nat → Option Nat}
           | mk sv locals' =>
             rw [hOp] at hBranch
             cases sv with
-            | usize _ | unit | borrow _ => cases hBranch
+            | usize _ | unit | refShared _ | borrow _ => cases hBranch
             | bool b =>
               dsimp at hBranch
               injection hBranch with htuple
@@ -1787,11 +1879,11 @@ theorem evalBranchStep_sound {loanLoc : Nat → Option Nat}
     unfreezes its parent loans `[.loan falseLid, .loan trueLid]` via
     `entry.back entry.curVal` and preserves `StateRel` with zero concrete
     machine steps. -/
-theorem evalEndLoan_sound {loanLoc : Nat → Option Nat}
+theorem evalEndLoan_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
     {sym sym' : SymState} {conc : MirState} {lid : Nat}
-    (hState : StateRel loanLoc sym conc)
+    (hState : StateRel loanLoc sharedLoc sym conc)
     (hEnd : evalEndLoan sym lid = some sym') :
-    StateRel loanLoc sym' conc := by
+    StateRel loanLoc sharedLoc sym' conc := by
   unfold evalEndLoan at hEnd
   cases hloan : sym.loans lid with
   | none => rw [hloan] at hEnd; cases hEnd
@@ -1994,6 +2086,8 @@ theorem evalEndLoan_sound {loanLoc : Nat → Option Nat}
                   | inr hO =>
                     have ⟨_, _, hneL, horig⟩ := hO
                     exact (hother l e hneL horig ha hf).1
+              sharedOwn := hState.loanRel.sharedOwn
+              disjointShared := hState.loanRel.disjointShared
             }
           }
 
@@ -2012,20 +2106,20 @@ theorem loanLoc_update_eq_of_some {loanLoc : Nat → Option Nat}
       rw [hNone] at he
       cases he
 
-theorem LocalRel.extend_fresh_loan {loanLoc : Nat → Option Nat}
+theorem LocalRel.extend_fresh_loan {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
     {loans : Nat → Option LoanEntry}
     {symLocals : Nat → Option SymVal} {concLocals : Nat → Option MirVal}
     {joinedLid : Nat} (locJoined : Nat)
     (hNone : loans joinedLid = none)
     (hBorrows : ∀ i lid, symLocals i = some (.borrow lid) → ∃ e, loans lid = some e)
-    (hRel : LocalRel loanLoc symLocals concLocals) :
-    LocalRel (fun l => if l == joinedLid then some locJoined else loanLoc l)
+    (hRel : LocalRel loanLoc sharedLoc symLocals concLocals) :
+    LocalRel (fun l => if l == joinedLid then some locJoined else loanLoc l) sharedLoc
       symLocals concLocals := by
   intro i sv hlookup
   have ⟨mv, hconc, hval⟩ := hRel i sv hlookup
   refine ⟨mv, hconc, ?_⟩
   cases sv with
-  | usize _ | bool _ | unit => exact hval
+  | usize _ | bool _ | unit | refShared _ => exact hval
   | borrow lid =>
     have ⟨loc, hloc, hmv⟩ := hval
     refine ⟨loc, ?_, hmv⟩
@@ -2073,13 +2167,13 @@ theorem matchBorrowArm_eq_some {bb : BasicBlock} {dst src joinBlk : Nat}
 /-- Soundness of `evalJoinBorrow`: executing a diamond conditional reborrow
     advances the concrete machine in 3 deterministic steps to `joinBlock` and
     establishes `StateRel` with the newly allocated joined loan `joinedLid`. -/
-theorem evalJoinBorrow_sound {loanLoc : Nat → Option Nat}
+theorem evalJoinBorrow_sound {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
     {body : MirBody} {sym symJoined : SymState} {conc : MirState}
     {dstLocal falseSrc trueSrc joinBlock joinedLid : Nat}
-    (hState : StateRel loanLoc sym conc)
+    (hState : StateRel loanLoc sharedLoc sym conc)
     (hJoin : evalJoinBorrow body sym dstLocal falseSrc trueSrc joinBlock joinedLid = some symJoined) :
     ∃ loanLoc' concJoined,
-      StateRel loanLoc' symJoined concJoined ∧
+      StateRel loanLoc' sharedLoc symJoined concJoined ∧
       ∀ ret, SafeAndReturns body concJoined ret → SafeAndReturns body conc ret := by
   unfold evalJoinBorrow at hJoin
   cases hhas : sym.hasActiveJoin with
@@ -2109,7 +2203,7 @@ theorem evalJoinBorrow_sound {loanLoc : Nat → Option Nat}
             | mk svDiscr localsAfterDiscr =>
               rw [hOp] at hJoin
               cases svDiscr with
-              | usize _ | unit | borrow _ => cases hJoin
+              | usize _ | unit | refShared _ | borrow _ => cases hJoin
               | bool cond =>
                 dsimp at hJoin
                 cases hbbF : body.blocks[falseTarget.index]? with
@@ -2150,14 +2244,14 @@ theorem evalJoinBorrow_sound {loanLoc : Nat → Option Nat}
                                   | some svF =>
                                     rw [hsrcF] at hJoin
                                     cases svF with
-                                    | usize _ | bool _ | unit => cases hJoin
+                                    | usize _ | bool _ | unit | refShared _ => cases hJoin
                                     | borrow falseLid =>
                                       cases hsrcT : localsAfterDiscr trueSrc with
                                       | none => rw [hsrcT] at hJoin; cases hJoin
                                       | some svT =>
                                         rw [hsrcT] at hJoin
                                         cases svT with
-                                        | usize _ | bool _ | unit => cases hJoin
+                                        | usize _ | bool _ | unit | refShared _ => cases hJoin
                                         | borrow trueLid =>
                                           dsimp at hJoin
                                           cases hchk2 : (!(falseLid == trueLid) &&
@@ -2500,7 +2594,7 @@ theorem evalJoinBorrow_sound {loanLoc : Nat → Option Nat}
                                                             localRel := LocalRel.update_some
                                                               (LocalRel.extend_fresh_loan locJoined hloanJ hBorAfter hLocRelAfter)
                                                               dstLocal
-                                                              (show ValRel loanLoc' (.borrow joinedLid) (.refMutLoc locJoined) from
+                                                              (show ValRel loanLoc' sharedLoc (.borrow joinedLid) (.refMutLoc locJoined) from
                                                                 ⟨locJoined, hloanLocJ, rfl⟩)
                                                             loanRel := {
                                                               activeOwn := by
@@ -2578,21 +2672,39 @@ theorem evalJoinBorrow_sound {loanLoc : Nat → Option Nat}
                                                                     exact hState.loanRel.disjointActive l1 l2 e1 e2 loc1 loc2
                                                                       hne12 horig1 ha1 hf1 horig2 ha2 hf2 hloc1 hloc2
                                                               noJoinOwners := fun hbad => by cases hbad
+                                                              sharedOwn := hState.loanRel.sharedOwn
+                                                              disjointShared := by
+                                                                intro l locMut locShared n hlocM hsh
+                                                                dsimp [loanLoc'] at hlocM
+                                                                cases hbJ : (l == joinedLid) with
+                                                                | true =>
+                                                                  rw [hbJ] at hlocM
+                                                                  injection hlocM with hlocM_eq
+                                                                  subst hlocM_eq
+                                                                  cases cond with
+                                                                  | false =>
+                                                                    exact hState.loanRel.disjointShared falseLid locFalse locShared n hlocF hsh
+                                                                  | true =>
+                                                                    exact hState.loanRel.disjointShared trueLid locTrue locShared n hlocT hsh
+                                                                | false =>
+                                                                  rw [hbJ] at hlocM
+                                                                  exact hState.loanRel.disjointShared l locMut locShared n hlocM hsh
                                                             }
                                                           }
 
 /-- Soundness of `evalSymState` by structural induction on `plan : TransPlan`. -/
 theorem evalSymState_sound (plan : TransPlan) (body : MirBody) :
-    ∀ {loanLoc : Nat → Option Nat} {sym : SymState} {conc : MirState} {ret : MirVal},
-      StateRel loanLoc sym conc →
+    ∀ {loanLoc : Nat → Option Nat} {sharedLoc : Nat → Nat → Prop}
+      {sym : SymState} {conc : MirState} {ret : MirVal},
+      StateRel loanLoc sharedLoc sym conc →
       evalSymState plan body sym = .ok ret →
       SafeAndReturns body conc ret := by
   induction plan with
   | fail =>
-    intro _ _ _ _ _ hEval
+    intro _ _ _ _ _ _ hEval
     cases hEval
   | ret =>
-    intro _ sym conc ret hState hEval
+    intro _ _ sym conc ret hState hEval
     unfold evalSymState at hEval
     cases hRet : evalReturn body sym with
     | none => rw [hRet] at hEval; cases hEval
@@ -2602,7 +2714,7 @@ theorem evalSymState_sound (plan : TransPlan) (body : MirBody) :
       subst hmv
       exact evalReturn_sound hState hRet
   | step next ih =>
-    intro _ sym conc ret hState hEval
+    intro _ _ sym conc ret hState hEval
     unfold evalSymState at hEval
     cases hStep : evalSymStep body sym with
     | none => rw [hStep] at hEval; cases hEval
@@ -2611,7 +2723,7 @@ theorem evalSymState_sound (plan : TransPlan) (body : MirBody) :
       have ⟨conc', hConcStep, hState'⟩ := evalSymStep_sound hState hStep
       exact SafeAndReturns.of_step hConcStep (ih hState' hEval)
   | endLoan lid next ih =>
-    intro _ sym conc ret hState hEval
+    intro _ _ sym conc ret hState hEval
     unfold evalSymState at hEval
     cases hEnd : evalEndLoan sym lid with
     | none => rw [hEnd] at hEval; cases hEval
@@ -2619,7 +2731,7 @@ theorem evalSymState_sound (plan : TransPlan) (body : MirBody) :
       rw [hEnd] at hEval
       exact ih (evalEndLoan_sound hState hEnd) hEval
   | branch falsePlan truePlan ihFalse ihTrue =>
-    intro _ sym conc ret hState hEval
+    intro _ _ sym conc ret hState hEval
     unfold evalSymState at hEval
     cases hBr : evalBranchStep body sym with
     | none => rw [hBr] at hEval; cases hEval
@@ -2635,7 +2747,7 @@ theorem evalSymState_sound (plan : TransPlan) (body : MirBody) :
       | true =>
         exact SafeAndReturns.of_step hConcStep (ihTrue hStateNext hEval)
   | joinBorrow dstLocal falseSrc trueSrc joinBlock joinedLid afterJoin ihAfter =>
-    intro _ sym conc ret hState hEval
+    intro _ _ sym conc ret hState hEval
     unfold evalSymState at hEval
     cases hJoin : evalJoinBorrow body sym dstLocal falseSrc trueSrc joinBlock joinedLid with
     | none => rw [hJoin] at hEval; cases hEval
@@ -2685,11 +2797,23 @@ theorem evalSymState_ne_inapplicable (plan : TransPlan) (body : MirBody) :
     | none => intro h; cases h
     | some symJoined => exact ihAfter symJoined
 
-/-- Canonical root loan-location mapping extracted from `init.locals`. -/
-def initLoanLoc (init : MirState) (lid : Nat) : Option Nat :=
-  match init.locals lid with
-  | some (.refMutLoc loc) => some loc
-  | _ => none
+/-- Canonical root loan-location mapping extracted from `init.locals`, guarded
+    by `1 ≤ lid` and `noAliasBefore init.locals loc lid`. -/
+noncomputable def initLoanLoc (init : MirState) (lid : Nat) : Option Nat :=
+  if decide (1 ≤ lid) then
+    match init.locals lid with
+    | some (.refMutLoc loc) =>
+      if noAliasBefore init.locals loc lid then some loc else none
+    | _ => none
+  else
+    none
+
+/-- Canonical shared-reference location predicate extracted from `init`. -/
+def initSharedLoc (init : MirState) (loc n : Nat) : Prop :=
+  ∃ idx, 1 ≤ idx ∧
+    init.locals idx = some (.refSharedLoc loc) ∧
+    noMutAliasBefore init.locals loc idx = true ∧
+    ReadOwnLoc init.mem loc (.usize n)
 
 theorem noAliasBefore_ne {locals : Nat → Option MirVal} {loc loc' : Nat} :
     ∀ {k i : Nat},
@@ -2704,6 +2828,7 @@ theorem noAliasBefore_ne {locals : Nat → Option MirVal} {loc loc' : Nat} :
     unfold noAliasBefore at hno
     cases hok : (match locals (j + 1) with
       | some (.refMutLoc loc'') => !(loc'' == loc)
+      | some (.refSharedLoc loc'') => !(loc'' == loc)
       | _ => true) with
     | false =>
       rw [hok] at hno
@@ -2723,14 +2848,123 @@ theorem noAliasBefore_ne {locals : Nat → Option MirVal} {loc loc' : Nat} :
       | inr hlt =>
         exact noAliasBefore_ne hi1 hlt hno hloc
 
+theorem noAliasBefore_ne_shared {locals : Nat → Option MirVal} {loc loc' : Nat} :
+    ∀ {k i : Nat},
+      1 ≤ i →
+      i < k →
+      noAliasBefore locals loc k = true →
+      locals i = some (.refSharedLoc loc') →
+      loc' ≠ loc
+  | 0, _, _, hilt, _, _ => False.elim (Nat.not_lt_zero _ hilt)
+  | 1, _, hi1, hilt, _, _ => False.elim (Nat.not_lt_of_ge hi1 hilt)
+  | j + 2, i, hi1, hilt, hno, hloc => by
+    unfold noAliasBefore at hno
+    cases hok : (match locals (j + 1) with
+      | some (.refMutLoc loc'') => !(loc'' == loc)
+      | some (.refSharedLoc loc'') => !(loc'' == loc)
+      | _ => true) with
+    | false =>
+      rw [hok] at hno
+      cases hno
+    | true =>
+      rw [hok] at hno
+      cases Nat.eq_or_lt_of_le (Nat.le_of_lt_succ hilt) with
+      | inl heq =>
+        subst heq
+        rw [hloc] at hok
+        dsimp at hok
+        cases hbeq : (loc' == loc) with
+        | false => exact of_decide_eq_false hbeq
+        | true =>
+          rw [hbeq] at hok
+          cases hok
+      | inr hlt =>
+        exact noAliasBefore_ne_shared hi1 hlt hno hloc
+
+theorem noMutAliasBefore_ne {locals : Nat → Option MirVal} {loc loc' : Nat} :
+    ∀ {k i : Nat},
+      1 ≤ i →
+      i < k →
+      noMutAliasBefore locals loc k = true →
+      locals i = some (.refMutLoc loc') →
+      loc' ≠ loc
+  | 0, _, _, hilt, _, _ => False.elim (Nat.not_lt_zero _ hilt)
+  | 1, _, hi1, hilt, _, _ => False.elim (Nat.not_lt_of_ge hi1 hilt)
+  | j + 2, i, hi1, hilt, hno, hloc => by
+    unfold noMutAliasBefore at hno
+    cases hok : (match locals (j + 1) with
+      | some (.refMutLoc loc'') => !(loc'' == loc)
+      | _ => true) with
+    | false =>
+      rw [hok] at hno
+      cases hno
+    | true =>
+      rw [hok] at hno
+      cases Nat.eq_or_lt_of_le (Nat.le_of_lt_succ hilt) with
+      | inl heq =>
+        subst heq
+        rw [hloc] at hok
+        dsimp at hok
+        cases hbeq : (loc' == loc) with
+        | false => exact of_decide_eq_false hbeq
+        | true =>
+          rw [hbeq] at hok
+          cases hok
+      | inr hlt =>
+        exact noMutAliasBefore_ne hi1 hlt hno hloc
+
 theorem noAliasBefore_of_forall_ne (locals : Nat → Option MirVal) (loc : Nat) :
     ∀ (k : Nat),
-      (∀ i, 1 ≤ i → i < k → locals i ≠ some (.refMutLoc loc)) →
+      (∀ i, 1 ≤ i → i < k →
+        locals i ≠ some (.refMutLoc loc) ∧ locals i ≠ some (.refSharedLoc loc)) →
       noAliasBefore locals loc k = true
   | 0, _ => rfl
   | 1, _ => rfl
   | j + 2, hne => by
     unfold noAliasBefore
+    have hj1_le : 1 ≤ j + 1 := Nat.le_add_left 1 j
+    have hj1_lt : j + 1 < j + 2 := Nat.lt_succ_self (j + 1)
+    have hnot_here := hne (j + 1) hj1_le hj1_lt
+    have hokHere :
+        (match locals (j + 1) with
+         | some (.refMutLoc loc') => !(loc' == loc)
+         | some (.refSharedLoc loc') => !(loc' == loc)
+         | _ => true) = true := by
+      cases hloc : locals (j + 1) with
+      | none => rfl
+      | some mv =>
+        cases mv with
+        | refMutLoc loc' =>
+          dsimp
+          cases hbeq : (loc' == loc) with
+          | false => rfl
+          | true =>
+            have heq : loc' = loc := of_decide_eq_true hbeq
+            subst heq
+            exact False.elim (hnot_here.1 hloc)
+        | refSharedLoc loc' =>
+          dsimp
+          cases hbeq : (loc' == loc) with
+          | false => rfl
+          | true =>
+            have heq : loc' = loc := of_decide_eq_true hbeq
+            subst heq
+            exact False.elim (hnot_here.2 hloc)
+        | usize _ | bool _ | unit | atomicLoc _ | ordering _ => rfl
+    have hrec : noAliasBefore locals loc (j + 1) = true :=
+      noAliasBefore_of_forall_ne locals loc (j + 1) (fun i hi1 hilt =>
+        hne i hi1 (Nat.lt_trans hilt hj1_lt))
+    rw [hokHere, hrec]
+    rfl
+
+theorem noMutAliasBefore_of_forall_ne (locals : Nat → Option MirVal) (loc : Nat) :
+    ∀ (k : Nat),
+      (∀ i, 1 ≤ i → i < k → locals i ≠ some (.refMutLoc loc)) →
+      noMutAliasBefore locals loc k = true
+  | 0, _ => rfl
+  | 1, _ => rfl
+  | j + 2, hne => by
+    unfold noMutAliasBefore
     have hj1_le : 1 ≤ j + 1 := Nat.le_add_left 1 j
     have hj1_lt : j + 1 < j + 2 := Nat.lt_succ_self (j + 1)
     have hnot_here : locals (j + 1) ≠ some (.refMutLoc loc) :=
@@ -2751,22 +2985,62 @@ theorem noAliasBefore_of_forall_ne (locals : Nat → Option MirVal) (loc : Nat) 
             have heq : loc' = loc := of_decide_eq_true hbeq
             subst heq
             exact False.elim (hnot_here hloc)
-        | usize _ | bool _ | unit | atomicLoc _ | ordering _ => rfl
-    have hrec : noAliasBefore locals loc (j + 1) = true :=
-      noAliasBefore_of_forall_ne locals loc (j + 1) (fun i hi1 hilt =>
+        | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => rfl
+    have hrec : noMutAliasBefore locals loc (j + 1) = true :=
+      noMutAliasBefore_of_forall_ne locals loc (j + 1) (fun i hi1 hilt =>
         hne i hi1 (Nat.lt_trans hilt hj1_lt))
     rw [hokHere, hrec]
     rfl
 
+theorem initLoanLoc_disjoint_shared (init : MirState) :
+    ∀ lid locMut locShared n,
+      initLoanLoc init lid = some locMut →
+      initSharedLoc init locShared n →
+      locMut ≠ locShared := by
+  intro lid locMut locShared n hLoan hShared
+  unfold initLoanLoc at hLoan
+  cases hpos : decide (1 ≤ lid) with
+  | false => rw [hpos] at hLoan; cases hLoan
+  | true =>
+    rw [hpos] at hLoan
+    dsimp at hLoan
+    have hlid1 : 1 ≤ lid := of_decide_eq_true hpos
+    cases hlocM : init.locals lid with
+    | none => rw [hlocM] at hLoan; cases hLoan
+    | some mv =>
+      rw [hlocM] at hLoan
+      cases mv with
+      | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hLoan
+      | refMutLoc locM =>
+        dsimp at hLoan
+        cases hnoA : noAliasBefore init.locals locM lid with
+        | false => rw [hnoA] at hLoan; cases hLoan
+        | true =>
+          rw [hnoA] at hLoan
+          injection hLoan with hlocM_eq
+          subst hlocM_eq
+          have ⟨idx, hidx1, hlocS, hnoMutS, _⟩ := hShared
+          have hneIdx : lid ≠ idx := by
+            intro heq
+            subst heq
+            rw [hlocM] at hlocS
+            cases hlocS
+          cases Nat.lt_or_gt_of_ne hneIdx with
+          | inl hlt =>
+            exact noMutAliasBefore_ne hlid1 hlt hnoMutS hlocM
+          | inr hgt =>
+            exact (noAliasBefore_ne_shared hidx1 hgt hnoA hlocS).symm
+
 theorem extractSymArgsAux_spec :
     ∀ (tys : List MirTy) (idx : Nat) (init : MirState) (args : List SymArg),
+      1 ≤ idx →
       extractSymArgsAux idx tys init = some args →
       let (locals, loans, _) := buildPureSymStateAux idx args
       (∀ i, i < idx → locals i = none ∧ loans i = none) ∧
       (∀ i sv, locals i = some sv →
         idx ≤ i ∧
         (∀ lid, sv = .borrow lid → ∃ e, loans lid = some e) ∧
-        ∃ mv, init.locals i = some mv ∧ ValRel (initLoanLoc init) sv mv) ∧
+        ∃ mv, init.locals i = some mv ∧ ValRel (initLoanLoc init) (initSharedLoc init) sv mv) ∧
       (∀ lid entry, loans lid = some entry →
         idx ≤ lid ∧
         entry.owners = [] ∧
@@ -2778,13 +3052,14 @@ theorem extractSymArgsAux_spec :
           entry.curVal = .usize n ∧
           OwnLoc init.mem loc (.usize n) ∧
           noAliasBefore init.locals loc lid = true)
-  | [], idx, _, args, hExt => by
+  | [], idx, _, args, _, hExt => by
     injection hExt with hargs
     subst hargs
     dsimp [buildPureSymStateAux, emptySymLocals, emptySymLoans]
     exact ⟨fun _ _ => ⟨rfl, rfl⟩, (by intro _ _ h; cases h), (by intro _ _ h; cases h)⟩
-  | ty :: restTys, idx, init, args, hExt => by
+  | ty :: restTys, idx, init, args, hIdx1, hExt => by
     dsimp [extractSymArgsAux] at hExt
+    have hIdxSucc1 : 1 ≤ idx + 1 := Nat.le_add_left 1 idx
     cases ty with
     | refAtomicUsize | atomicOrdering => cases hExt
     | usize =>
@@ -2793,7 +3068,7 @@ theorem extractSymArgsAux_spec :
       | some mv =>
         rw [hloc] at hExt
         cases mv with
-        | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+        | bool _ | unit | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
         | usize n =>
           dsimp at hExt
           cases hRest : extractSymArgsAux (idx + 1) restTys init with
@@ -2802,7 +3077,7 @@ theorem extractSymArgsAux_spec :
             rw [hRest] at hExt
             injection hExt with hargs
             subst hargs
-            have ih := extractSymArgsAux_spec restTys (idx + 1) init restArgs hRest
+            have ih := extractSymArgsAux_spec restTys (idx + 1) init restArgs hIdxSucc1 hRest
             dsimp [buildPureSymStateAux]
             dsimp at ih
             refine ⟨?_, ?_, ?_⟩
@@ -2834,7 +3109,7 @@ theorem extractSymArgsAux_spec :
       | some mv =>
         rw [hloc] at hExt
         cases mv with
-        | usize _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+        | usize _ | unit | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
         | bool b =>
           dsimp at hExt
           cases hRest : extractSymArgsAux (idx + 1) restTys init with
@@ -2843,7 +3118,7 @@ theorem extractSymArgsAux_spec :
             rw [hRest] at hExt
             injection hExt with hargs
             subst hargs
-            have ih := extractSymArgsAux_spec restTys (idx + 1) init restArgs hRest
+            have ih := extractSymArgsAux_spec restTys (idx + 1) init restArgs hIdxSucc1 hRest
             dsimp [buildPureSymStateAux]
             dsimp at ih
             refine ⟨?_, ?_, ?_⟩
@@ -2875,7 +3150,7 @@ theorem extractSymArgsAux_spec :
       | some mv =>
         rw [hloc] at hExt
         cases mv with
-        | usize _ | bool _ | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+        | usize _ | bool _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
         | unit =>
           dsimp at hExt
           cases hRest : extractSymArgsAux (idx + 1) restTys init with
@@ -2884,7 +3159,7 @@ theorem extractSymArgsAux_spec :
             rw [hRest] at hExt
             injection hExt with hargs
             subst hargs
-            have ih := extractSymArgsAux_spec restTys (idx + 1) init restArgs hRest
+            have ih := extractSymArgsAux_spec restTys (idx + 1) init restArgs hIdxSucc1 hRest
             dsimp [buildPureSymStateAux]
             dsimp at ih
             refine ⟨?_, ?_, ?_⟩
@@ -2910,13 +3185,75 @@ theorem extractSymArgsAux_spec :
             · intro lid entry hloan
               have ⟨hle, hrest⟩ := ih.2.2 lid entry hloan
               exact ⟨Nat.le_of_succ_le hle, hrest⟩
+    | refSharedUsize =>
+      cases hloc : init.locals idx with
+      | none => rw [hloc] at hExt; cases hExt
+      | some mv =>
+        rw [hloc] at hExt
+        cases mv with
+        | usize _ | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+        | refSharedLoc loc =>
+          dsimp at hExt
+          cases hchk : (noMutAliasBefore init.locals loc idx &&
+            decide (init.mem.naWriteTs loc ≤ init.mem.curView loc)) with
+          | false => rw [hchk] at hExt; cases hExt
+          | true =>
+            rw [hchk] at hExt
+            dsimp at hExt
+            cases hna : init.mem.naVal loc with
+            | none => rw [hna] at hExt; cases hExt
+            | some naMv =>
+              rw [hna] at hExt
+              cases naMv with
+              | bool _ | unit | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
+              | usize n =>
+                dsimp at hExt
+                cases hRest : extractSymArgsAux (idx + 1) restTys init with
+                | none => rw [hRest] at hExt; cases hExt
+                | some restArgs =>
+                  rw [hRest] at hExt
+                  injection hExt with hargs
+                  subst hargs
+                  have hca := Eq.mp (Bool.and_eq_true _ _) hchk
+                  have hnoMut : noMutAliasBefore init.locals loc idx = true := hca.1
+                  have hwLe : init.mem.naWriteTs loc ≤ init.mem.curView loc := of_decide_eq_true hca.2
+                  have hReadOwn : ReadOwnLoc init.mem loc (.usize n) := ⟨hna, hwLe⟩
+                  have hInitShared : initSharedLoc init loc n :=
+                    ⟨idx, hIdx1, hloc, hnoMut, hReadOwn⟩
+                  have ih := extractSymArgsAux_spec restTys (idx + 1) init restArgs hIdxSucc1 hRest
+                  dsimp [buildPureSymStateAux]
+                  dsimp at ih
+                  refine ⟨?_, ?_, ?_⟩
+                  · intro i hilt
+                    have hne : i ≠ idx := Nat.ne_of_lt hilt
+                    have hb : (i == idx) = false := decide_eq_false hne
+                    unfold updateSymLocal
+                    rw [hb]
+                    exact ih.1 i (Nat.lt_trans hilt (Nat.lt_succ_self idx))
+                  · intro i sv hlookup
+                    unfold updateSymLocal at hlookup
+                    cases hb : (i == idx) with
+                    | true =>
+                      rw [hb] at hlookup
+                      injection hlookup with hsv
+                      have hi_eq : i = idx := of_decide_eq_true hb
+                      subst hi_eq hsv
+                      exact ⟨Nat.le_refl _, (by intro _ h; cases h),
+                        ⟨MirVal.refSharedLoc loc, hloc, loc, hInitShared, rfl⟩⟩
+                    | false =>
+                      rw [hb] at hlookup
+                      have ⟨hle, hbor, hval⟩ := ih.2.1 i sv hlookup
+                      exact ⟨Nat.le_of_succ_le hle, hbor, hval⟩
+                  · intro lid entry hloan
+                    have ⟨hle, hrest⟩ := ih.2.2 lid entry hloan
+                    exact ⟨Nat.le_of_succ_le hle, hrest⟩
     | refMutUsize =>
       cases hloc : init.locals idx with
       | none => rw [hloc] at hExt; cases hExt
       | some mv =>
         rw [hloc] at hExt
         cases mv with
-        | usize _ | bool _ | unit | atomicLoc _ | ordering _ => cases hExt
+        | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
         | refMutLoc loc =>
           dsimp at hExt
           cases hchk : (noAliasBefore init.locals loc idx &&
@@ -2931,7 +3268,7 @@ theorem extractSymArgsAux_spec :
             | some naMv =>
               rw [hna] at hExt
               cases naMv with
-              | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+              | bool _ | unit | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
               | usize n =>
                 dsimp at hExt
                 cases hRest : extractSymArgsAux (idx + 1) restTys init with
@@ -2948,8 +3285,14 @@ theorem extractSymArgsAux_spec :
                   have hOwn : OwnLoc init.mem loc (.usize n) := ⟨hna, hwLe, hrLe⟩
                   have hInitLoan : initLoanLoc init idx = some loc := by
                     unfold initLoanLoc
+                    have hpos : decide (1 ≤ idx) = true := decide_eq_true hIdx1
+                    rw [hpos]
+                    dsimp
                     rw [hloc]
-                  have ih := extractSymArgsAux_spec restTys (idx + 1) init restArgs hRest
+                    dsimp
+                    rw [hnoAlias]
+                    rfl
+                  have ih := extractSymArgsAux_spec restTys (idx + 1) init restArgs hIdxSucc1 hRest
                   dsimp [buildPureSymStateAux]
                   dsimp at ih
                   refine ⟨?_, ?_, ?_⟩
@@ -2996,10 +3339,10 @@ theorem extractSymArgsAux_spec :
                       exact ⟨Nat.le_of_succ_le hle, hrest⟩
 
 /-- Soundness of `extractSymArgs`: whenever `extractSymArgs argTys init = some args`,
-    `StateRel (initLoanLoc init) (buildPureSymState args) init` holds. -/
+    `StateRel (initLoanLoc init) (initSharedLoc init) (buildPureSymState args) init` holds. -/
 theorem extractSymArgs_sound (argTys : List MirTy) (init : MirState) (args : List SymArg)
     (hExt : extractSymArgs argTys init = some args) :
-    ∃ loanLoc, StateRel loanLoc (buildPureSymState args) init := by
+    ∃ loanLoc sharedLoc, StateRel loanLoc sharedLoc (buildPureSymState args) init := by
   unfold extractSymArgs at hExt
   cases hblk : (init.block == 0 && init.stmtIdx == 0) with
   | false => rw [hblk] at hExt; cases hExt
@@ -3008,10 +3351,10 @@ theorem extractSymArgs_sound (argTys : List MirTy) (init : MirState) (args : Lis
     have hba := Eq.mp (Bool.and_eq_true _ _) hblk
     have hblock : init.block = 0 := of_decide_eq_true hba.1
     have hstmtIdx : init.stmtIdx = 0 := of_decide_eq_true hba.2
-    have hSpec := extractSymArgsAux_spec argTys 1 init args hExt
+    have hSpec := extractSymArgsAux_spec argTys 1 init args (Nat.le_refl 1) hExt
     unfold buildPureSymState
     dsimp at hSpec ⊢
-    refine ⟨initLoanLoc init, {
+    refine ⟨initLoanLoc init, initSharedLoc init, {
       block_eq := hblock
       stmtIdx_eq := hstmtIdx
       localBorrows := fun i lid hi => (hSpec.2.1 i (.borrow lid) hi).2.1 lid rfl
@@ -3039,6 +3382,8 @@ theorem extractSymArgs_sound (argTys : List MirTy) (init : MirState) (args : Lis
         noJoinOwners := by
           intro _ lid entry hl _ _
           exact (hSpec.2.2 lid entry hl).2.1
+        sharedOwn := fun _ _ ⟨_, _, _, _, hReadOwn⟩ => hReadOwn
+        disjointShared := initLoanLoc_disjoint_shared init
       }
     }⟩
 
@@ -3061,7 +3406,7 @@ theorem extractSymArgsAux_of_argsMatchLocals :
     | refAtomicUsize | atomicOrdering => cases hsa.1
     | usize =>
       cases v with
-      | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hvValid
+      | bool _ | unit | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hvValid
       | usize n =>
         refine ⟨.usize n :: restArgs, ?_⟩
         dsimp [extractSymArgsAux]
@@ -3070,7 +3415,7 @@ theorem extractSymArgsAux_of_argsMatchLocals :
         rw [hRestExt]
     | bool =>
       cases v with
-      | usize _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hvValid
+      | usize _ | unit | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hvValid
       | bool b =>
         refine ⟨.bool b :: restArgs, ?_⟩
         dsimp [extractSymArgsAux]
@@ -3079,17 +3424,36 @@ theorem extractSymArgsAux_of_argsMatchLocals :
         rw [hRestExt]
     | unit =>
       cases v with
-      | usize _ | bool _ | atomicLoc _ | refMutLoc _ | ordering _ => cases hvValid
+      | usize _ | bool _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hvValid
       | unit =>
         refine ⟨.unit :: restArgs, ?_⟩
         dsimp [extractSymArgsAux]
         rw [hvLoc]
         dsimp
         rw [hRestExt]
+    | refSharedUsize =>
+      have ⟨hHasTy, hdisj⟩ := hvValid
+      cases v with
+      | usize _ | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hHasTy
+      | refSharedLoc loc =>
+        have ⟨n, hna, hw⟩ := hHasTy
+        have hnoMut : noMutAliasBefore init.locals loc idx = true :=
+          noMutAliasBefore_of_forall_ne init.locals loc idx (fun i hi1 hilt => hdisj loc i rfl hi1 hilt)
+        have hwDec : decide (init.mem.naWriteTs loc ≤ init.mem.curView loc) = true :=
+          decide_eq_true hw
+        refine ⟨.refShared n :: restArgs, ?_⟩
+        dsimp [extractSymArgsAux]
+        rw [hvLoc]
+        dsimp
+        rw [hnoMut, hwDec]
+        dsimp
+        rw [hna]
+        dsimp
+        rw [hRestExt]
     | refMutUsize =>
       have ⟨hHasTy, hdisj⟩ := hvValid
       cases v with
-      | usize _ | bool _ | unit | atomicLoc _ | ordering _ => cases hHasTy
+      | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hHasTy
       | refMutLoc loc =>
         have ⟨n, hna, hw, hr⟩ := hHasTy
         have hnoAlias : noAliasBefore init.locals loc idx = true :=
@@ -3156,7 +3520,7 @@ theorem evalSym_sound (plan : TransPlan) (body : MirBody) :
       | inapplicable =>
         exact False.elim (evalSymState_ne_inapplicable plan body (buildPureSymState args) hRes)
       | ok ret =>
-        have ⟨loanLoc, hState⟩ := extractSymArgs_sound body.argTys q.init args hExt
+        have ⟨loanLoc, sharedLoc, hState⟩ := extractSymArgs_sound body.argTys q.init args hExt
         have hSafe : SafeAndReturns body q.init ret :=
           evalSymState_sound plan body hState hRes
         have hMirDef : (MirLang.sem body q).defined :=
@@ -3211,7 +3575,7 @@ def stmtAccessesLocal (stmt : Stmt) (locIdx : Nat) : Bool :=
 /-- Fuel-bounded untrusted CFG and NLL loan-termination planner.
     - Detects diamond borrow joins (`matchBorrowArm` on both targets of a
       `switchInt` assigning the same destination local and jumping to the same
-      join block) and emits `.joinBorrow`.
+      join block) for `&mut usize` parameters and emits `.joinBorrow`.
     - Tracks `activeJoin : Option (Nat × Nat × Nat)` (`some (joinedLid, falseSrc, trueSrc)`)
       and emits `.endLoan joinedLid` immediately before the first statement in
       the join block that accesses either frozen parent local (`falseSrc` or
@@ -3246,11 +3610,17 @@ noncomputable def computePlanAux :
           | none, some bbFalse, some bbTrue =>
             match matchBorrowArm bbFalse, matchBorrowArm bbTrue with
             | some (dstF, srcF, joinF), some (dstT, srcT, joinT) =>
-              if dstF == dstT && joinF == joinT then
-                let joinedLid := body.argTys.length + 1
-                .joinBorrow dstF srcF srcT joinF joinedLid
-                  (computePlanAux fuel body joinF 0 (some (joinedLid, srcF, srcT)))
-              else
+              match body.argTys[srcF - 1]?, body.argTys[srcT - 1]? with
+              | some .refMutUsize, some .refMutUsize =>
+                if dstF == dstT && joinF == joinT then
+                  let joinedLid := body.argTys.length + 1
+                  .joinBorrow dstF srcF srcT joinF joinedLid
+                    (computePlanAux fuel body joinF 0 (some (joinedLid, srcF, srcT)))
+                else
+                  .branch
+                    (computePlanAux fuel body falseTarget.index 0 none)
+                    (computePlanAux fuel body trueTarget.index 0 none)
+              | _, _ =>
                 .branch
                   (computePlanAux fuel body falseTarget.index 0 none)
                   (computePlanAux fuel body trueTarget.index 0 none)
@@ -3570,7 +3940,7 @@ theorem translate_maxAssignBody_spec :
       | some mv1 =>
         rw [hloc1] at hExt
         cases mv1 with
-        | usize _ | bool _ | unit | atomicLoc _ | ordering _ => cases hExt
+        | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
         | refMutLoc loc1 =>
           dsimp at hExt
           cases hchk1 : (noAliasBefore init.locals loc1 1 &&
@@ -3585,7 +3955,7 @@ theorem translate_maxAssignBody_spec :
             | some naMv1 =>
               rw [hna1] at hExt
               cases naMv1 with
-              | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+              | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
               | usize x0' =>
                 dsimp at hExt
                 cases hloc2 : init.locals 2 with
@@ -3593,7 +3963,7 @@ theorem translate_maxAssignBody_spec :
                 | some mv2 =>
                   rw [hloc2] at hExt
                   cases mv2 with
-                  | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+                  | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
                   | usize y0' =>
                     dsimp at hExt
                     injection hExt with hargs
@@ -3635,7 +4005,7 @@ theorem translate_updateMinBody_spec :
       | some mv1 =>
         rw [hloc1] at hExt
         cases mv1 with
-        | usize _ | bool _ | unit | atomicLoc _ | ordering _ => cases hExt
+        | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
         | refMutLoc loc1 =>
           dsimp at hExt
           cases hchk1 : (noAliasBefore init.locals loc1 1 &&
@@ -3650,7 +4020,7 @@ theorem translate_updateMinBody_spec :
             | some naMv1 =>
               rw [hna1] at hExt
               cases naMv1 with
-              | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+              | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
               | usize x0' =>
                 dsimp at hExt
                 cases hloc2 : init.locals 2 with
@@ -3658,7 +4028,7 @@ theorem translate_updateMinBody_spec :
                 | some mv2 =>
                   rw [hloc2] at hExt
                   cases mv2 with
-                  | usize _ | bool _ | unit | atomicLoc _ | ordering _ => cases hExt
+                  | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
                   | refMutLoc loc2 =>
                     dsimp at hExt
                     cases hchk2 : (noAliasBefore init.locals loc2 2 &&
@@ -3673,7 +4043,7 @@ theorem translate_updateMinBody_spec :
                       | some naMv2 =>
                         rw [hna2] at hExt
                         cases naMv2 with
-                        | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+                        | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
                         | usize y0' =>
                           dsimp at hExt
                           cases hloc3 : init.locals 3 with
@@ -3681,7 +4051,7 @@ theorem translate_updateMinBody_spec :
                           | some mv3 =>
                             rw [hloc3] at hExt
                             cases mv3 with
-                            | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+                            | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
                             | usize v0' =>
                               dsimp at hExt
                               injection hExt with hargs
@@ -4084,7 +4454,7 @@ theorem translate_clampAssignBody_spec :
       | some mv1 =>
         rw [hloc1] at hExt
         cases mv1 with
-        | usize _ | bool _ | unit | atomicLoc _ | ordering _ => cases hExt
+        | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
         | refMutLoc loc1 =>
           dsimp at hExt
           cases hchk1 : (noAliasBefore init.locals loc1 1 &&
@@ -4099,7 +4469,7 @@ theorem translate_clampAssignBody_spec :
             | some naMv1 =>
               rw [hna1] at hExt
               cases naMv1 with
-              | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+              | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
               | usize x0' =>
                 dsimp at hExt
                 cases hloc2 : init.locals 2 with
@@ -4107,7 +4477,7 @@ theorem translate_clampAssignBody_spec :
                 | some mv2 =>
                   rw [hloc2] at hExt
                   cases mv2 with
-                  | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+                  | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
                   | usize lo' =>
                     dsimp at hExt
                     cases hloc3 : init.locals 3 with
@@ -4115,7 +4485,7 @@ theorem translate_clampAssignBody_spec :
                     | some mv3 =>
                       rw [hloc3] at hExt
                       cases mv3 with
-                      | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+                      | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
                       | usize hi' =>
                         dsimp at hExt
                         injection hExt with hargs
@@ -4156,7 +4526,7 @@ theorem translate_isAlignedMaskBody_spec :
       | some mv1 =>
         rw [hloc1] at hExt
         cases mv1 with
-        | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+        | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
         | usize addr' =>
           dsimp at hExt
           cases hloc2 : init.locals 2 with
@@ -4164,7 +4534,7 @@ theorem translate_isAlignedMaskBody_spec :
           | some mv2 =>
             rw [hloc2] at hExt
             cases mv2 with
-            | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+            | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
             | usize mask' =>
               dsimp at hExt
               injection hExt with hargs
@@ -4314,5 +4684,488 @@ theorem prove_is_aligned_mask_wf_crate (fnName : String) :
       tcb := [.rustcLowering fnName isAlignedMaskBody]
     } :=
   verify_single_fn_wf_crate fnName isAlignedMaskBody isAlignedMaskBody_satisfies_wellFormed
+
+/-!
+## 11. Verification of `shared_max` and `max_assign_shared` (Shared References `&usize` and Read-Only Aliasing)
+-/
+
+/-- Exact `Runtime(PostCleanup)` MIR body emitted by `rustc --edition=2024 --emit=mir`
+    for:
+    ```rust
+    pub fn shared_max(x: &usize, y: &usize) -> usize {
+        let r = if *x < *y { y } else { x };
+        *r
+    }
+    ```
+    - `_0: usize` (return place), `_1: &usize` (`x`), `_2: &usize` (`y`),
+      `_3: &usize` (`r`), `_4: bool`, `_5: usize`, `_6: usize`.
+    - `bb0`: `_5 = copy (*_1); _6 = copy (*_2); _4 = Lt(move _5, move _6); switchInt(move _4) -> [0: bb2, otherwise: bb1];`
+    - `bb1`: `_3 = copy _2; goto -> bb3;`
+    - `bb2`: `_3 = copy _1; goto -> bb3;`
+    - `bb3`: `_0 = copy (*_3); return;` -/
+def sharedMaxBody : MirBody where
+  argTys := [.refSharedUsize, .refSharedUsize]
+  retTy := .usize
+  localCount := 7
+  blocks := [
+    { stmts := [
+        .assign ⟨5⟩ (.deref ⟨1⟩),
+        .assign ⟨6⟩ (.deref ⟨2⟩),
+        .assign ⟨4⟩ (.binaryOp .lt (.move ⟨5⟩) (.move ⟨6⟩))
+      ]
+      terminator := .switchInt (.move ⟨4⟩) ⟨2⟩ ⟨1⟩ },
+    { stmts := [
+        .assign ⟨3⟩ (.use (.copy ⟨2⟩))
+      ]
+      terminator := .goto ⟨3⟩ },
+    { stmts := [
+        .assign ⟨3⟩ (.use (.copy ⟨1⟩))
+      ]
+      terminator := .goto ⟨3⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.deref ⟨3⟩)
+      ]
+      terminator := .return_ }
+  ]
+
+/-- Exact `Runtime(PostCleanup)` MIR body emitted by `rustc --edition=2024 --emit=mir`
+    for:
+    ```rust
+    pub fn max_assign_shared(dst: &mut usize, src: &usize) -> usize {
+        if *dst < *src {
+            *dst = *src;
+        }
+        *dst
+    }
+    ```
+    - `_0: usize` (return place), `_1: &mut usize` (`dst`), `_2: &usize` (`src`),
+      `_3: bool`, `_4: usize`, `_5: usize`, `_6: usize`.
+    - `bb0`: `_4 = copy (*_1); _5 = copy (*_2); _3 = Lt(move _4, move _5); switchInt(move _3) -> [0: bb2, otherwise: bb1];`
+    - `bb1`: `_6 = copy (*_2); (*_1) = move _6; goto -> bb2;`
+    - `bb2`: `_0 = copy (*_1); return;` -/
+def maxAssignSharedBody : MirBody where
+  argTys := [.refMutUsize, .refSharedUsize]
+  retTy := .usize
+  localCount := 7
+  blocks := [
+    { stmts := [
+        .assign ⟨4⟩ (.deref ⟨1⟩),
+        .assign ⟨5⟩ (.deref ⟨2⟩),
+        .assign ⟨3⟩ (.binaryOp .lt (.move ⟨4⟩) (.move ⟨5⟩))
+      ]
+      terminator := .switchInt (.move ⟨3⟩) ⟨2⟩ ⟨1⟩ },
+    { stmts := [
+        .assign ⟨6⟩ (.deref ⟨2⟩),
+        .assignDeref ⟨1⟩ (.move ⟨6⟩)
+      ]
+      terminator := .goto ⟨2⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.deref ⟨1⟩)
+      ]
+      terminator := .return_ }
+  ]
+
+/-- **First Futamura Projection for `shared_max`**:
+    Evaluating `translatePure (computePlan sharedMaxBody) sharedMaxBody` on
+    universally quantified symbolic inputs `x0 y0 : Nat` reduces by kernel
+    `rfl` directly to `.ok (.usize (if decide (x0 < y0) then y0 else x0))`. -/
+theorem translatePure_sharedMax_rfl (x0 y0 : Nat) :
+    translatePure (computePlan sharedMaxBody) sharedMaxBody [.refShared x0, .refShared y0] =
+      .ok (.usize (if decide (x0 < y0) then y0 else x0)) :=
+  rfl
+
+/-- **First Futamura Projection for `max_assign_shared`**:
+    Evaluating `translatePure (computePlan maxAssignSharedBody) maxAssignSharedBody`
+    on universally quantified symbolic inputs `x0 y0 : Nat` reduces by kernel
+    `rfl` directly to `.ok (.usize (if decide (x0 < y0) then y0 else x0))`. -/
+theorem translatePure_maxAssignShared_rfl (x0 y0 : Nat) :
+    translatePure (computePlan maxAssignSharedBody) maxAssignSharedBody [.refMut x0, .refShared y0] =
+      .ok (.usize (if decide (x0 < y0) then y0 else x0)) :=
+  rfl
+
+/-- Pure functional specification extracted from `sharedMaxBody`. -/
+def pureSharedMax (x0 y0 : Nat) : Nat :=
+  if decide (x0 < y0) then y0 else x0
+
+/-- Pure functional specification extracted from `maxAssignSharedBody`. -/
+def pureMaxAssignShared (x0 y0 : Nat) : Nat :=
+  if decide (x0 < y0) then y0 else x0
+
+/-- Non-trivial property 1 (`shared_max` and `max_assign_shared` coincide with `pureMaxAssign`): -/
+theorem pureSharedMax_eq_pureMaxAssign (x0 y0 : Nat) :
+    pureSharedMax x0 y0 = pureMaxAssign x0 y0 ∧
+    pureMaxAssignShared x0 y0 = pureMaxAssign x0 y0 :=
+  ⟨rfl, rfl⟩
+
+/-- Non-trivial property 2 (`shared_max` commutativity): -/
+theorem pureSharedMax_comm (x0 y0 : Nat) :
+    pureSharedMax x0 y0 = pureSharedMax y0 x0 :=
+  pureMaxAssign_comm x0 y0
+
+/-- Non-trivial property 3 (`shared_max` aliased idempotence `shared_max(&a, &a)`): -/
+theorem pureSharedMax_idempotent (x0 : Nat) :
+    pureSharedMax x0 x0 = x0 :=
+  pureMaxAssign_idempotent x0
+
+/-- Functional postcondition for `shared_max` in `FuncLang`. -/
+def FuncPostSharedMax (init : MirState) (ret : MirVal) : Prop :=
+  ∀ locX locY x0 y0,
+    init.locals 1 = some (.refSharedLoc locX) →
+    init.mem.naVal locX = some (.usize x0) →
+    init.locals 2 = some (.refSharedLoc locY) →
+    init.mem.naVal locY = some (.usize y0) →
+    ret = .usize (if decide (x0 < y0) then y0 else x0)
+
+/-- Functional postcondition for `max_assign_shared` in `FuncLang`. -/
+def FuncPostMaxAssignShared (init : MirState) (ret : MirVal) : Prop :=
+  ∀ locDst locSrc x0 y0,
+    init.locals 1 = some (.refMutLoc locDst) →
+    init.mem.naVal locDst = some (.usize x0) →
+    init.locals 2 = some (.refSharedLoc locSrc) →
+    init.mem.naVal locSrc = some (.usize y0) →
+    ret = .usize (if decide (x0 < y0) then y0 else x0)
+
+/-- `translate sharedMaxBody` satisfies `FuncLang.Spec FuncPostSharedMax`. -/
+theorem translate_sharedMaxBody_spec :
+    FuncLang.sem (translate sharedMaxBody) ≤ FuncLang.Spec FuncPostSharedMax := by
+  refine funcSem_le_spec (fun init => ?_)
+  unfold translate evalSym
+  have hSupp : allSupportedArgTys sharedMaxBody.argTys = true := rfl
+  rw [hSupp]
+  dsimp
+  cases hExt : extractSymArgs sharedMaxBody.argTys init with
+  | none =>
+    refine ⟨(by intro h; cases h), ?_⟩
+    intro ret hok
+    cases hok
+  | some args =>
+    unfold extractSymArgs at hExt
+    cases hblk : (init.block == 0 && init.stmtIdx == 0) with
+    | false => rw [hblk] at hExt; cases hExt
+    | true =>
+      rw [hblk] at hExt
+      dsimp [sharedMaxBody, extractSymArgsAux] at hExt
+      cases hloc1 : init.locals 1 with
+      | none => rw [hloc1] at hExt; cases hExt
+      | some mv1 =>
+        rw [hloc1] at hExt
+        cases mv1 with
+        | usize _ | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+        | refSharedLoc loc1 =>
+          dsimp at hExt
+          cases hchk1 : (noMutAliasBefore init.locals loc1 1 &&
+            decide (init.mem.naWriteTs loc1 ≤ init.mem.curView loc1)) with
+          | false => rw [hchk1] at hExt; cases hExt
+          | true =>
+            rw [hchk1] at hExt
+            dsimp at hExt
+            cases hna1 : init.mem.naVal loc1 with
+            | none => rw [hna1] at hExt; cases hExt
+            | some naMv1 =>
+              rw [hna1] at hExt
+              cases naMv1 with
+              | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+              | usize x0' =>
+                dsimp at hExt
+                cases hloc2 : init.locals 2 with
+                | none => rw [hloc2] at hExt; cases hExt
+                | some mv2 =>
+                  rw [hloc2] at hExt
+                  cases mv2 with
+                  | usize _ | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+                  | refSharedLoc loc2 =>
+                    dsimp at hExt
+                    cases hchk2 : (noMutAliasBefore init.locals loc2 2 &&
+                      decide (init.mem.naWriteTs loc2 ≤ init.mem.curView loc2)) with
+                    | false => rw [hchk2] at hExt; cases hExt
+                    | true =>
+                      rw [hchk2] at hExt
+                      dsimp at hExt
+                      cases hna2 : init.mem.naVal loc2 with
+                      | none => rw [hna2] at hExt; cases hExt
+                      | some naMv2 =>
+                        rw [hna2] at hExt
+                        cases naMv2 with
+                        | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                        | usize y0' =>
+                          dsimp at hExt
+                          injection hExt with hargs
+                          subst hargs
+                          dsimp
+                          rw [translatePure_sharedMax_rfl x0' y0']
+                          refine ⟨(by intro h; cases h), ?_⟩
+                          intro ret hok locX locY x0 y0 hl1 hm1 hl2 hm2
+                          injection hok with hret
+                          rw [hloc1] at hl1; injection hl1 with h1_mv; injection h1_mv with h1; subst h1
+                          rw [hna1] at hm1; injection hm1 with hx_mv; injection hx_mv with hx; subst hx
+                          rw [hloc2] at hl2; injection hl2 with h2_mv; injection h2_mv with h2; subst h2
+                          rw [hna2] at hm2; injection hm2 with hy_mv; injection hy_mv with hy; subst hy
+                          exact hret.symm
+
+/-- `translate maxAssignSharedBody` satisfies `FuncLang.Spec FuncPostMaxAssignShared`. -/
+theorem translate_maxAssignSharedBody_spec :
+    FuncLang.sem (translate maxAssignSharedBody) ≤ FuncLang.Spec FuncPostMaxAssignShared := by
+  refine funcSem_le_spec (fun init => ?_)
+  unfold translate evalSym
+  have hSupp : allSupportedArgTys maxAssignSharedBody.argTys = true := rfl
+  rw [hSupp]
+  dsimp
+  cases hExt : extractSymArgs maxAssignSharedBody.argTys init with
+  | none =>
+    refine ⟨(by intro h; cases h), ?_⟩
+    intro ret hok
+    cases hok
+  | some args =>
+    unfold extractSymArgs at hExt
+    cases hblk : (init.block == 0 && init.stmtIdx == 0) with
+    | false => rw [hblk] at hExt; cases hExt
+    | true =>
+      rw [hblk] at hExt
+      dsimp [maxAssignSharedBody, extractSymArgsAux] at hExt
+      cases hloc1 : init.locals 1 with
+      | none => rw [hloc1] at hExt; cases hExt
+      | some mv1 =>
+        rw [hloc1] at hExt
+        cases mv1 with
+        | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
+        | refMutLoc loc1 =>
+          dsimp at hExt
+          cases hchk1 : (noAliasBefore init.locals loc1 1 &&
+            decide (init.mem.naWriteTs loc1 ≤ init.mem.curView loc1) &&
+            decide (init.mem.naReadTs loc1 ≤ init.mem.curView loc1)) with
+          | false => rw [hchk1] at hExt; cases hExt
+          | true =>
+            rw [hchk1] at hExt
+            dsimp at hExt
+            cases hna1 : init.mem.naVal loc1 with
+            | none => rw [hna1] at hExt; cases hExt
+            | some naMv1 =>
+              rw [hna1] at hExt
+              cases naMv1 with
+              | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+              | usize x0' =>
+                dsimp at hExt
+                cases hloc2 : init.locals 2 with
+                | none => rw [hloc2] at hExt; cases hExt
+                | some mv2 =>
+                  rw [hloc2] at hExt
+                  cases mv2 with
+                  | usize _ | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+                  | refSharedLoc loc2 =>
+                    dsimp at hExt
+                    cases hchk2 : (noMutAliasBefore init.locals loc2 2 &&
+                      decide (init.mem.naWriteTs loc2 ≤ init.mem.curView loc2)) with
+                    | false => rw [hchk2] at hExt; cases hExt
+                    | true =>
+                      rw [hchk2] at hExt
+                      dsimp at hExt
+                      cases hna2 : init.mem.naVal loc2 with
+                      | none => rw [hna2] at hExt; cases hExt
+                      | some naMv2 =>
+                        rw [hna2] at hExt
+                        cases naMv2 with
+                        | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                        | usize y0' =>
+                          dsimp at hExt
+                          injection hExt with hargs
+                          subst hargs
+                          dsimp
+                          rw [translatePure_maxAssignShared_rfl x0' y0']
+                          refine ⟨(by intro h; cases h), ?_⟩
+                          intro ret hok locDst locSrc x0 y0 hl1 hm1 hl2 hm2
+                          injection hok with hret
+                          rw [hloc1] at hl1; injection hl1 with h1_mv; injection h1_mv with h1; subst h1
+                          rw [hna1] at hm1; injection hm1 with hx_mv; injection hx_mv with hx; subst hx
+                          rw [hloc2] at hl2; injection hl2 with h2_mv; injection h2_mv with h2; subst h2
+                          rw [hna2] at hm2; injection hm2 with hy_mv; injection hy_mv with hy; subst hy
+                          exact hret.symm
+
+/-- `π_func (FuncLang.Spec FuncPostSharedMax)` refines `EnsuresSharedMax`. -/
+theorem π_func_sharedMax_le_ensures :
+    π_func (FuncLang.Spec FuncPostSharedMax) ≤ EnsuresSharedMax := by
+  refine Preorder.le_trans (π_func_spec_le FuncPostSharedMax) ?_
+  intro q _
+  refine ⟨True.intro, ?_⟩
+  intro out hpost ret locX locY x0 y0 hterm hl1 hm1 hl2 hm2
+  exact hpost ret hterm locX locY x0 y0 hl1 hm1 hl2 hm2
+
+/-- `π_func (FuncLang.Spec FuncPostMaxAssignShared)` refines `EnsuresMaxAssignShared`. -/
+theorem π_func_maxAssignShared_le_ensures :
+    π_func (FuncLang.Spec FuncPostMaxAssignShared) ≤ EnsuresMaxAssignShared := by
+  refine Preorder.le_trans (π_func_spec_le FuncPostMaxAssignShared) ?_
+  intro q _
+  refine ⟨True.intro, ?_⟩
+  intro out hpost ret locDst locSrc x0 y0 hterm hl1 hm1 hl2 hm2
+  exact hpost ret hterm locDst locSrc x0 y0 hl1 hm1 hl2 hm2
+
+/-- `EnsuresSharedMax` refines baseline `MirLang.WellFormed`. -/
+theorem ensuresSharedMax_le_wellFormed :
+    EnsuresSharedMax ≤ MirLang.WellFormed :=
+  fun _ _ => ⟨True.intro, fun _ _ => True.intro⟩
+
+/-- `EnsuresMaxAssignShared` refines baseline `MirLang.WellFormed`. -/
+theorem ensuresMaxAssignShared_le_wellFormed :
+    EnsuresMaxAssignShared ≤ MirLang.WellFormed :=
+  fun _ _ => ⟨True.intro, fun _ _ => True.intro⟩
+
+/-- **Source MIR Correctness of `shared_max`**:
+    `MirSem sharedMaxBody ≤ EnsuresSharedMax`, transferred across `π_func` from
+    `translate_sharedMaxBody_spec` via `translate_sound sharedMaxBody`. -/
+theorem sharedMaxBody_satisfies_ensures :
+    MirSem sharedMaxBody ≤ EnsuresSharedMax :=
+  Preorder.le_trans
+    (Preorder.le_trans
+      (translate_sound sharedMaxBody)
+      (monotone_π_func translate_sharedMaxBody_spec))
+    π_func_sharedMax_le_ensures
+
+/-- `sharedMaxBody` satisfies baseline `MirLang.WellFormed`. -/
+theorem sharedMaxBody_satisfies_wellFormed :
+    MirSem sharedMaxBody ≤ MirLang.WellFormed :=
+  Preorder.le_trans sharedMaxBody_satisfies_ensures ensuresSharedMax_le_wellFormed
+
+/-- **Source MIR Correctness of `max_assign_shared`**:
+    `MirSem maxAssignSharedBody ≤ EnsuresMaxAssignShared`, transferred across
+    `π_func` from `translate_maxAssignSharedBody_spec` via
+    `translate_sound maxAssignSharedBody`. -/
+theorem maxAssignSharedBody_satisfies_ensures :
+    MirSem maxAssignSharedBody ≤ EnsuresMaxAssignShared :=
+  Preorder.le_trans
+    (Preorder.le_trans
+      (translate_sound maxAssignSharedBody)
+      (monotone_π_func translate_maxAssignSharedBody_spec))
+    π_func_maxAssignShared_le_ensures
+
+/-- `maxAssignSharedBody` satisfies baseline `MirLang.WellFormed`. -/
+theorem maxAssignSharedBody_satisfies_wellFormed :
+    MirSem maxAssignSharedBody ≤ MirLang.WellFormed :=
+  Preorder.le_trans maxAssignSharedBody_satisfies_ensures ensuresMaxAssignShared_le_wellFormed
+
+/-- End-to-end `CrateTheorem` witness for `shared_max` with `EnsuresSharedMax`. -/
+theorem prove_shared_max_ensures_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := sharedMaxBody
+        specs := [EnsuresSharedMax]
+      }]
+      tcb := [.rustcLowering fnName sharedMaxBody]
+    } := by
+  refine ⟨(by intro h; cases h), ⟨⟨True.intro, True.intro⟩, ?_⟩, True.intro⟩
+  intro hAssumptions
+  have hVerFunc :
+      RustcCompiler.Verified sharedMaxBody (π_func (FuncLang.Spec FuncPostSharedMax)) :=
+    verify_through_passes
+      translate_sharedMaxBody_spec
+      (translate_sound sharedMaxBody)
+      monotone_π_func
+      hAssumptions.1
+  have hVerEnsures : RustcCompiler.Verified sharedMaxBody EnsuresSharedMax :=
+    Compiler.Verified.mono hVerFunc π_func_sharedMax_le_ensures hAssumptions.1.1
+  exact Compiler.Verified.with_wellFormedOn
+    hVerEnsures
+    ensuresSharedMax_le_wellFormed
+    hAssumptions.1.1
+
+/-- End-to-end `CrateTheorem` witness for `shared_max` with baseline `WellFormed`. -/
+theorem prove_shared_max_wf_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := sharedMaxBody
+        specs := []
+      }]
+      tcb := [.rustcLowering fnName sharedMaxBody]
+    } :=
+  verify_single_fn_wf_crate fnName sharedMaxBody sharedMaxBody_satisfies_wellFormed
+
+/-- End-to-end `CrateTheorem` witness for `max_assign_shared` with `EnsuresMaxAssignShared`. -/
+theorem prove_max_assign_shared_ensures_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := maxAssignSharedBody
+        specs := [EnsuresMaxAssignShared]
+      }]
+      tcb := [.rustcLowering fnName maxAssignSharedBody]
+    } := by
+  refine ⟨(by intro h; cases h), ⟨⟨True.intro, True.intro⟩, ?_⟩, True.intro⟩
+  intro hAssumptions
+  have hVerFunc :
+      RustcCompiler.Verified maxAssignSharedBody (π_func (FuncLang.Spec FuncPostMaxAssignShared)) :=
+    verify_through_passes
+      translate_maxAssignSharedBody_spec
+      (translate_sound maxAssignSharedBody)
+      monotone_π_func
+      hAssumptions.1
+  have hVerEnsures : RustcCompiler.Verified maxAssignSharedBody EnsuresMaxAssignShared :=
+    Compiler.Verified.mono hVerFunc π_func_maxAssignShared_le_ensures hAssumptions.1.1
+  exact Compiler.Verified.with_wellFormedOn
+    hVerEnsures
+    ensuresMaxAssignShared_le_wellFormed
+    hAssumptions.1.1
+
+/-- End-to-end `CrateTheorem` witness for `max_assign_shared` with baseline `WellFormed`. -/
+theorem prove_max_assign_shared_wf_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := maxAssignSharedBody
+        specs := []
+      }]
+      tcb := [.rustcLowering fnName maxAssignSharedBody]
+    } :=
+  verify_single_fn_wf_crate fnName maxAssignSharedBody maxAssignSharedBody_satisfies_wellFormed
+
+/-- **Aliasing Adequacy Canary Pair (`shared_max(&a, &a)` vs `max_assign_shared(&mut a, &a)`)**:
+    1. When two `&usize` parameters alias the same memory location `0`
+       (`sampleSharedAliasedInit`), `translate sharedMaxBody` accepts the state
+       and evaluates to `.ok (.usize 42)`.
+    2. When a `&mut usize` parameter and a `&usize` parameter alias the same
+       memory location `0` (`sampleMutSharedAliasedInit`),
+       `extractSymArgs maxAssignSharedBody.argTys` rejects the ill-typed state
+       with `none`, and `translate maxAssignSharedBody` vacuously returns `.ok .unit`
+       outside the `argsValid` domain. -/
+def sampleSharedAliasedInit : MirState where
+  locals := fun
+    | 1 => some (.refSharedLoc 0)
+    | 2 => some (.refSharedLoc 0)
+    | _ => none
+  mem := {
+    curView := fun _ => 0
+    naVal := fun
+      | 0 => some (.usize 42)
+      | _ => none
+    naWriteTs := fun _ => 0
+    naReadTs := fun _ => 0
+    atomicMsgs := []
+  }
+  block := 0
+  stmtIdx := 0
+
+def sampleMutSharedAliasedInit : MirState where
+  locals := fun
+    | 1 => some (.refMutLoc 0)
+    | 2 => some (.refSharedLoc 0)
+    | _ => none
+  mem := {
+    curView := fun _ => 0
+    naVal := fun
+      | 0 => some (.usize 42)
+      | _ => none
+    naWriteTs := fun _ => 0
+    naReadTs := fun _ => 0
+    atomicMsgs := []
+  }
+  block := 0
+  stmtIdx := 0
+
+theorem sharedMax_aliased_accepted :
+    translate sharedMaxBody sampleSharedAliasedInit = .ok (.usize 42) :=
+  rfl
+
+theorem maxAssignShared_aliased_rejected :
+    extractSymArgs maxAssignSharedBody.argTys sampleMutSharedAliasedInit = none :=
+  rfl
 
 end Anneal

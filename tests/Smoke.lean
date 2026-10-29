@@ -215,6 +215,85 @@ def isAlignedMaskCrate : Trusted.Crate where
 theorem verify_is_aligned_mask_crate : Trusted.CrateTheorem isAlignedMaskCrate :=
   Anneal.prove_is_aligned_mask_ensures_crate "is_aligned_mask"
 
+/-- Captured `MirBody` for
+    `pub fn shared_max(x: &usize, y: &usize) -> usize { let r = if *x < *y { y } else { x }; *r }`
+    defined using only `Trusted.*` constructors (`ci.type` origin-clean). -/
+def sharedMaxBody : Trusted.MirBody where
+  argTys := [.refSharedUsize, .refSharedUsize]
+  retTy := .usize
+  localCount := 7
+  blocks := [
+    { stmts := [
+        .assign ⟨5⟩ (.deref ⟨1⟩),
+        .assign ⟨6⟩ (.deref ⟨2⟩),
+        .assign ⟨4⟩ (.binaryOp .lt (.move ⟨5⟩) (.move ⟨6⟩))
+      ]
+      terminator := .switchInt (.move ⟨4⟩) ⟨2⟩ ⟨1⟩ },
+    { stmts := [.assign ⟨3⟩ (.use (.copy ⟨2⟩))]
+      terminator := .goto ⟨3⟩ },
+    { stmts := [.assign ⟨3⟩ (.use (.copy ⟨1⟩))]
+      terminator := .goto ⟨3⟩ },
+    { stmts := [.assign ⟨0⟩ (.deref ⟨3⟩)]
+      terminator := .return_ }
+  ]
+
+/-- Captured `Trusted.Crate` for `shared_max` with postcondition
+    `Trusted.EnsuresSharedMax`. -/
+def sharedMaxCrate : Trusted.Crate where
+  functions := [
+    { name := "shared_max"
+      prog := sharedMaxBody
+      specs := [Trusted.EnsuresSharedMax] }
+  ]
+  tcb := [Trusted.TCBItem.rustcLowering "shared_max" sharedMaxBody]
+
+/-- Top-level `Trusted.CrateTheorem` for `sharedMaxCrate`, whose statement
+    (`ci.type`) references only `Trusted` and locked foundation constants while
+    its proof term (`ci.value?`) discharges the obligation via the plan-guided
+    functional translation (`Anneal.prove_shared_max_ensures_crate`). -/
+theorem verify_shared_max_crate : Trusted.CrateTheorem sharedMaxCrate :=
+  Anneal.prove_shared_max_ensures_crate "shared_max"
+
+/-- Captured `MirBody` for
+    `pub fn max_assign_shared(dst: &mut usize, src: &usize) -> usize { if *dst < *src { *dst = *src; } *dst }`
+    defined using only `Trusted.*` constructors (`ci.type` origin-clean). -/
+def maxAssignSharedBody : Trusted.MirBody where
+  argTys := [.refMutUsize, .refSharedUsize]
+  retTy := .usize
+  localCount := 7
+  blocks := [
+    { stmts := [
+        .assign ⟨4⟩ (.deref ⟨1⟩),
+        .assign ⟨5⟩ (.deref ⟨2⟩),
+        .assign ⟨3⟩ (.binaryOp .lt (.move ⟨4⟩) (.move ⟨5⟩))
+      ]
+      terminator := .switchInt (.move ⟨3⟩) ⟨2⟩ ⟨1⟩ },
+    { stmts := [
+        .assign ⟨6⟩ (.deref ⟨2⟩),
+        .assignDeref ⟨1⟩ (.move ⟨6⟩)
+      ]
+      terminator := .goto ⟨2⟩ },
+    { stmts := [.assign ⟨0⟩ (.deref ⟨1⟩)]
+      terminator := .return_ }
+  ]
+
+/-- Captured `Trusted.Crate` for `max_assign_shared` with postcondition
+    `Trusted.EnsuresMaxAssignShared`. -/
+def maxAssignSharedCrate : Trusted.Crate where
+  functions := [
+    { name := "max_assign_shared"
+      prog := maxAssignSharedBody
+      specs := [Trusted.EnsuresMaxAssignShared] }
+  ]
+  tcb := [Trusted.TCBItem.rustcLowering "max_assign_shared" maxAssignSharedBody]
+
+/-- Top-level `Trusted.CrateTheorem` for `maxAssignSharedCrate`, whose statement
+    (`ci.type`) references only `Trusted` and locked foundation constants while
+    its proof term (`ci.value?`) discharges the obligation via the plan-guided
+    functional translation (`Anneal.prove_max_assign_shared_ensures_crate`). -/
+theorem verify_max_assign_shared_crate : Trusted.CrateTheorem maxAssignSharedCrate :=
+  Anneal.prove_max_assign_shared_ensures_crate "max_assign_shared"
+
 /-!
 ## Non-Step-Based Axiomatic Event-Graph Toy Language
 
