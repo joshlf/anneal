@@ -830,3 +830,37 @@ fn rejects_incorrect_abs_diff_implementation() {
         "expected Lean audit rejection for wrong abs_diff body, got: {err}"
     );
 }
+
+#[test]
+fn verifies_choose_mut_end_to_end() {
+    let crate_dir = TempCrateDir::new(
+        "valid-choose-mut",
+        "// anneal:spec ensures(choose_mut(b, x, y))\n\
+         pub fn choose_mut<'a>(b: bool, x: &'a mut usize, y: &'a mut usize) -> &'a mut usize {\n    \
+             if b { x } else { y }\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "choose_mut");
+}
+
+#[test]
+fn rejects_incorrect_choose_mut_implementation() {
+    let crate_dir = TempCrateDir::new(
+        "wrong-choose-mut",
+        "// anneal:spec ensures(choose_mut(b, x, y))\n\
+         pub fn choose_mut<'a>(b: bool, x: &'a mut usize, y: &'a mut usize) -> &'a mut usize {\n    \
+             if !b { x } else { y }\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean audit rejection for wrong choose_mut body, got: {err}"
+    );
+}

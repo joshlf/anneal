@@ -508,6 +508,47 @@ def absDiffCrate : Trusted.Crate where
 theorem verify_abs_diff_crate : Trusted.CrateTheorem absDiffCrate :=
   Anneal.prove_abs_diff_ensures_crate "abs_diff"
 
+/-- Lowered `Runtime(PostCleanup)` MIR body for
+    `pub fn choose_mut<'a>(b: bool, x: &'a mut usize, y: &'a mut usize) -> &'a
+    mut usize`. -/
+def chooseMutBody : Trusted.MirBody where
+  argTys := [.bool, .refMutUsize, .refMutUsize]
+  retTy := .refMutUsize
+  localCount := 5
+  blocks := [
+    { stmts := []
+      terminator := .switchInt (.copy ⟨1⟩) ⟨2⟩ ⟨1⟩ },
+    { stmts := [
+        .assign ⟨4⟩ (.use (.copy ⟨2⟩))
+      ]
+      terminator := .goto ⟨3⟩ },
+    { stmts := [
+        .assign ⟨4⟩ (.use (.copy ⟨3⟩))
+      ]
+      terminator := .goto ⟨3⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.use (.copy ⟨4⟩))
+      ]
+      terminator := .return_ }
+  ]
+
+/-- Captured `Trusted.Crate` for `choose_mut` with postcondition
+    `Trusted.EnsuresChooseMut`. -/
+def chooseMutCrate : Trusted.Crate where
+  functions := [
+    { name := "choose_mut"
+      prog := chooseMutBody
+      specs := [Trusted.EnsuresChooseMut] }
+  ]
+  tcb := [Trusted.TCBItem.rustcLowering "choose_mut" chooseMutBody]
+
+/-- Top-level `Trusted.CrateTheorem` for `chooseMutCrate`, whose statement
+    (`ci.type`) references only `Trusted` and locked foundation constants while
+    its proof term (`ci.value?`) discharges the obligation via the plan-guided
+    functional translation (`Anneal.prove_choose_mut_ensures_crate`). -/
+theorem verify_choose_mut_crate : Trusted.CrateTheorem chooseMutCrate :=
+  Anneal.prove_choose_mut_ensures_crate "choose_mut"
+
 /-!
 ## Non-Step-Based Axiomatic Event-Graph Toy Language
 
