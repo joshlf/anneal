@@ -530,6 +530,9 @@ pub enum CapturedSpec {
     /// Functional specification for `choose_mut(b, x, y)`
     /// (`specs := [Trusted.EnsuresChooseMut]`).
     EnsuresChooseMut,
+    /// Functional specification for `count_up(n)`
+    /// (`specs := [Trusted.EnsuresCountUp]`).
+    EnsuresCountUp,
 }
 
 impl CapturedSpec {
@@ -570,6 +573,9 @@ impl CapturedSpec {
             }
             Self::EnsuresChooseMut => {
                 "[Trusted.EnsuresChooseMut]".to_string()
+            }
+            Self::EnsuresCountUp => {
+                "[Trusted.EnsuresCountUp]".to_string()
             }
         }
     }
@@ -782,6 +788,9 @@ fn parse_source_spec(src: &str) -> Result<CapturedSpec, CaptureError> {
                 }
                 "ensures(choose_mut(b, x, y))" => {
                     CapturedSpec::EnsuresChooseMut
+                }
+                "ensures(count_up(n))" => {
+                    CapturedSpec::EnsuresCountUp
                 }
                 "well_formed" => CapturedSpec::WellFormed,
                 other => {

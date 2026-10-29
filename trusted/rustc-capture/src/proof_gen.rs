@@ -282,6 +282,27 @@ pub fn render_proof_lean(functions: &[CapturedFunction]) -> String {
                 ),
             }
         }
+        [func]
+            if func.arg_tys == [CapturedTy::Usize]
+                && func.ret_ty == CapturedTy::Usize
+                && (func.spec == CapturedSpec::EnsuresCountUp
+                    || func.name == "count_up") =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresCountUp => format!(
+                    "Anneal.prove_count_up_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_count_up_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_count_up_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
         [func] => {
             let uses_move = func.blocks.first().is_some_and(|b| {
                 b.stmts.iter().any(|s| {

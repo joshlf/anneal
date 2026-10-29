@@ -702,6 +702,21 @@ def EnsuresChooseMut : MirLang.Behavior :=
       q.init.locals 3 = some (.refMutLoc locY) →
       ret = .refMutLoc (if b then locX else locY))
 
+/-- Postcondition specification for
+    `pub fn count_up(n: usize) -> usize`:
+    - `defined := True`: every finite execution prefix is free of UB, stuck
+      states, and overflow assertion failures (`MirLang.WellFormed`), and
+    - `val`: for any initial state where `_1 = some (.usize n0)`, any normal
+      return value `ret` equals
+      `.usize (if decide (n0 ≤ 1000) then n0 else 1000)`. -/
+@[candidate mir_semantics]
+def EnsuresCountUp : MirLang.Behavior :=
+  MirLang.Spec (fun q out =>
+    ∀ ret n0,
+      out.outcome = .terminated (.normal ret) →
+      q.init.locals 1 = some (.usize n0) →
+      ret = .usize (if decide (n0 ≤ 1000) then n0 else 1000))
+
 /-- Abstract type of compiled target artifacts produced by `rustc`. -/
 @[candidate mir_semantics]
 structure TargetArtifact where
