@@ -8,7 +8,7 @@ those terms. -->
 
 # Trusted boundary in GitHub Actions
 
-The `Trusted boundary` job runs the production boundary gate, its 12-group
+The `Trusted boundary` job runs the production boundary gate, its 14-group
 regression suite, and `cargo test --workspace --locked` on every pull request
 (including GHerrit PRs targeting another PR branch), on pushes to `main`, and on
 merge-queue groups. PR retargeting triggers a new check of the updated merge
@@ -33,7 +33,7 @@ Lean 4.34.1 release and `trusted/lean/foundation-lock.json` across Linux
      enforcing pure syntax preflight, Statement (`ci.type`) vs. Proof
      (`ci.value?`) Origin Separation, axiom containment, and kernel replay.
 2. `cargo run --locked -p cargo-anneal -- audit-self-test`:
-   Runs all 12 positive and negative regression fixture groups in
+   Runs all 14 positive and negative regression fixture groups in
    [`trusted/cargo-anneal/src/self_test.rs`](../trusted/cargo-anneal/README.md).
 3. `cargo test --workspace --locked` and
    `cargo publish --dry-run -p cargo-anneal`:
