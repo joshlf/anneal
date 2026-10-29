@@ -149,6 +149,44 @@ pub fn render_proof_lean(functions: &[CapturedFunction]) -> String {
                 ),
             }
         }
+        [func]
+            if func.arg_tys
+                == [CapturedTy::RefSharedUsize, CapturedTy::RefSharedUsize] =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresSharedMax => format!(
+                    "Anneal.prove_shared_max_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_shared_max_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_shared_max_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [func]
+            if func.arg_tys
+                == [CapturedTy::RefMutUsize, CapturedTy::RefSharedUsize] =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresMaxAssignShared => format!(
+                    "Anneal.prove_max_assign_shared_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_max_assign_shared_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_max_assign_shared_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
         [func] => {
             let uses_move = func.blocks.first().is_some_and(|b| {
                 b.stmts.iter().any(|s| {

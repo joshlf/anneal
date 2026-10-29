@@ -111,17 +111,40 @@ def OwnLoc (m : MemState) (loc : Nat) (v : MirVal) : Prop :=
   m.naWriteTs loc ≤ m.curView loc ∧
   m.naReadTs loc ≤ m.curView loc
 
+/-- Read-only shared non-atomic ownership predicate (`&usize`):
+    non-atomic location `loc` holds initialized value `v`, and its last write
+    timestamp is visible in the active thread's `curView` (permitting arbitrary
+    aliasing reads at `loc`). -/
+def ReadOwnLoc (m : MemState) (loc : Nat) (v : MirVal) : Prop :=
+  m.naVal loc = some v ∧
+  m.naWriteTs loc ≤ m.curView loc
+
+/-- Under `ReadOwnLoc m loc v`, a non-atomic read at `loc` is completely
+    deterministic, never triggers a data-race failure, and returns `v`. -/
+theorem ReadOwnLoc.readNA_eq {m : MemState} {loc : Nat} {v : MirVal}
+    (hRead : ReadOwnLoc m loc v) :
+    m.readNA loc =
+      some (v, { m with naReadTs := View.bump m.naReadTs loc (m.curView loc) }) := by
+  unfold MemState.readNA
+  have hdec : decide (m.naWriteTs loc ≤ m.curView loc) = true :=
+    decide_eq_true hRead.2
+  rw [hdec, hRead.1]
+  rfl
+
+/-- Performing a non-atomic read at `loc` preserves `ReadOwnLoc` at every
+    shared location `loc'` (both `loc' = loc` and `loc' ≠ loc`). -/
+theorem ReadOwnLoc.readNA_preserves {m : MemState} {loc loc' : Nat} {v' : MirVal}
+    (hRead' : ReadOwnLoc m loc' v') :
+    ReadOwnLoc { m with naReadTs := View.bump m.naReadTs loc (m.curView loc) } loc' v' :=
+  hRead'
+
 /-- Under `OwnLoc m loc v`, a non-atomic read at `loc` is completely
     deterministic, never triggers a data-race failure, and returns `v`. -/
 theorem OwnLoc.readNA_eq {m : MemState} {loc : Nat} {v : MirVal}
     (hOwn : OwnLoc m loc v) :
     m.readNA loc =
-      some (v, { m with naReadTs := View.bump m.naReadTs loc (m.curView loc) }) := by
-  unfold MemState.readNA
-  have hdec : decide (m.naWriteTs loc ≤ m.curView loc) = true :=
-    decide_eq_true hOwn.2.1
-  rw [hdec, hOwn.1]
-  rfl
+      some (v, { m with naReadTs := View.bump m.naReadTs loc (m.curView loc) }) :=
+  ReadOwnLoc.readNA_eq ⟨hOwn.1, hOwn.2.1⟩
 
 /-- Performing a non-atomic read at `loc` preserves `OwnLoc` at every owned
     location `loc'` (both `loc' = loc` and `loc' ≠ loc`). -/
@@ -190,6 +213,17 @@ theorem OwnLoc.afterWriteNA_other {m : MemState} {loc loc' : Nat} {v' : MirVal}
   rw [hbeq]
   exact hOwn'
 
+/-- Writing `vNew` to `loc` preserves `ReadOwnLoc` at every other location
+    `loc' ≠ loc`. -/
+theorem ReadOwnLoc.afterWriteNA_other {m : MemState} {loc loc' : Nat} {v' : MirVal}
+    (hne : loc' ≠ loc) (hRead' : ReadOwnLoc m loc' v') (vNew : MirVal) :
+    ReadOwnLoc (afterWriteNA m loc vNew) loc' v' := by
+  have hbeq : (loc' == loc) = false := decide_eq_false hne
+  unfold ReadOwnLoc afterWriteNA View.bump
+  dsimp
+  rw [hbeq]
+  exact hRead'
+
 /-- `OwnLoc` is preserved whenever the thread's coherence view advances in
     `Preorder View` (`m.curView ≤ v'`) without concurrent modification to
     `loc`. -/
@@ -246,7 +280,7 @@ theorem evalMirStmt_not_choice (s : MirState) (stmt : Stmt)
       | none => intro h; cases h
       | some v =>
         cases v with
-        | refMutLoc loc =>
+        | refMutLoc loc | refSharedLoc loc =>
           dsimp
           cases s.mem.readNA loc with
           | none => intro h; cases h
@@ -287,7 +321,7 @@ theorem evalMirStmt_not_choice (s : MirState) (stmt : Stmt)
             cases s.mem.writeNA loc v with
             | none => intro h; cases h
             | some m' => intro h; cases h
-          | usize _ | bool _ | unit | atomicLoc _ | ordering _ =>
+          | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ =>
             intro h; cases h
   | storageLive loc => intro h; cases h
   | storageDead loc => intro h; cases h
@@ -317,7 +351,7 @@ theorem evalMirTerminator_choice_inhabited (s : MirState) (term : Terminator)
           cases b with
           | false => intro h; cases h
           | true => intro h; cases h
-        | usize _ | unit | atomicLoc _ | refMutLoc _ | ordering _ =>
+        | usize _ | unit | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ =>
           intro h; cases h
   | callAtomicLoad dst ptrOp ordOp target =>
     dsimp [evalMirTerminator]
@@ -337,6 +371,7 @@ theorem evalMirTerminator_choice_inhabited (s : MirState) (term : Terminator)
             | usize _ => intro h; cases h
             | bool _ => intro h; cases h
             | unit => intro h; cases h
+            | refSharedLoc _ => intro h; cases h
             | refMutLoc _ => intro h; cases h
             | ordering _ => intro h; cases h
             | atomicLoc loc =>
@@ -345,6 +380,7 @@ theorem evalMirTerminator_choice_inhabited (s : MirState) (term : Terminator)
               | bool _ => intro h; cases h
               | unit => intro h; cases h
               | atomicLoc _ => intro h; cases h
+              | refSharedLoc _ => intro h; cases h
               | refMutLoc _ => intro h; cases h
               | ordering ord =>
                 dsimp
@@ -697,6 +733,7 @@ theorem loadRelaxedBody_satisfies_ensures :
       | usize _ => cases hty
       | bool _ => cases hty
       | unit => cases hty
+      | refSharedLoc _ => cases hty
       | refMutLoc _ => cases hty
       | ordering _ => cases hty
       | atomicLoc loc =>
