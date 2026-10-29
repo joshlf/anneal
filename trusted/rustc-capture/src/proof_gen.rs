@@ -258,6 +258,30 @@ pub fn render_proof_lean(functions: &[CapturedFunction]) -> String {
                 ),
             }
         }
+        [func]
+            if func.arg_tys
+                == [
+                    CapturedTy::Bool,
+                    CapturedTy::RefMutUsize,
+                    CapturedTy::RefMutUsize,
+                ]
+                && func.ret_ty == CapturedTy::RefMutUsize =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresChooseMut => format!(
+                    "Anneal.prove_choose_mut_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_choose_mut_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_choose_mut_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
         [func] => {
             let uses_move = func.blocks.first().is_some_and(|b| {
                 b.stmts.iter().any(|s| {
