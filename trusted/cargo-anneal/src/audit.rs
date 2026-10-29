@@ -365,9 +365,20 @@ pub fn default_downstream_targets() -> Vec<DownstreamTarget> {
             "theory",
         ),
         DownstreamTarget::new(
+            "Anneal.MirLemmas",
+            "theory/Anneal/MirLemmas.lean",
+            &["Trusted", "Anneal.Refinement", "Anneal.StepResult"],
+            "theory",
+        ),
+        DownstreamTarget::new(
             "Anneal",
             "theory/Anneal.lean",
-            &["Trusted", "Anneal.Refinement", "Anneal.StepResult"],
+            &[
+                "Trusted",
+                "Anneal.Refinement",
+                "Anneal.StepResult",
+                "Anneal.MirLemmas",
+            ],
             "theory",
         ),
         DownstreamTarget::new(
