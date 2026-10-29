@@ -470,6 +470,9 @@ pub enum CapturedSpec {
     /// Functional specification for `abs_diff(x, y)`
     /// (`specs := [Trusted.EnsuresAbsDiff]`).
     EnsuresAbsDiff,
+    /// Functional specification for `choose_mut(b, x, y)`
+    /// (`specs := [Trusted.EnsuresChooseMut]`).
+    EnsuresChooseMut,
 }
 
 impl CapturedSpec {
@@ -507,6 +510,9 @@ impl CapturedSpec {
             }
             Self::EnsuresAbsDiff => {
                 "[Trusted.EnsuresAbsDiff]".to_string()
+            }
+            Self::EnsuresChooseMut => {
+                "[Trusted.EnsuresChooseMut]".to_string()
             }
         }
     }
@@ -686,6 +692,9 @@ fn parse_source_spec(src: &str) -> Result<CapturedSpec, CaptureError> {
                 }
                 "ensures(abs_diff(x, y))" => {
                     CapturedSpec::EnsuresAbsDiff
+                }
+                "ensures(choose_mut(b, x, y))" => {
+                    CapturedSpec::EnsuresChooseMut
                 }
                 "well_formed" => CapturedSpec::WellFormed,
                 other => {
