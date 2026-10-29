@@ -664,3 +664,89 @@ fn rejects_incorrect_max_assign_shared_implementation() {
         "expected Lean audit rejection for wrong max_assign_shared body, got: {err}"
     );
 }
+
+#[test]
+fn verifies_sort_pair_end_to_end() {
+    let crate_dir = TempCrateDir::new(
+        "valid-sort-pair",
+        "// anneal:spec ensures(sort_pair(x, y))\n\
+         pub fn sort_pair(x: &mut usize, y: &mut usize) -> usize {\n    \
+             if *x > *y {\n        \
+                 let tmp = *x;\n        \
+                 *x = *y;\n        \
+                 *y = tmp;\n    \
+             }\n    \
+             *x\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "sort_pair");
+}
+
+#[test]
+fn rejects_incorrect_sort_pair_implementation() {
+    let crate_dir = TempCrateDir::new(
+        "wrong-sort-pair",
+        "// anneal:spec ensures(sort_pair(x, y))\n\
+         pub fn sort_pair(x: &mut usize, y: &mut usize) -> usize {\n    \
+             if *x < *y {\n        \
+                 let tmp = *x;\n        \
+                 *x = *y;\n        \
+                 *y = tmp;\n    \
+             }\n    \
+             *x\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean audit rejection for wrong sort_pair body, got: {err}"
+    );
+}
+
+#[test]
+fn verifies_two_phase_reborrow_end_to_end() {
+    let crate_dir = TempCrateDir::new(
+        "valid-two-phase-reborrow",
+        "// anneal:spec ensures(two_phase_reborrow(x, y, a, b))\n\
+         pub fn two_phase_reborrow(x: &mut usize, y: &mut usize, a: usize, b: usize) -> usize {\n    \
+             let r1 = if *x <= *y { &mut *x } else { &mut *y };\n    \
+             *r1 = a;\n    \
+             let r2 = if *x <= *y { &mut *y } else { &mut *x };\n    \
+             *r2 = b;\n    \
+             *x\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "two_phase_reborrow");
+}
+
+#[test]
+fn rejects_incorrect_two_phase_reborrow_implementation() {
+    let crate_dir = TempCrateDir::new(
+        "wrong-two-phase-reborrow",
+        "// anneal:spec ensures(two_phase_reborrow(x, y, a, b))\n\
+         pub fn two_phase_reborrow(x: &mut usize, y: &mut usize, a: usize, b: usize) -> usize {\n    \
+             let r1 = if *x <= *y { &mut *x } else { &mut *y };\n    \
+             *r1 = a;\n    \
+             let r2 = if *x <= *y { &mut *x } else { &mut *y };\n    \
+             *r2 = b;\n    \
+             *x\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean audit rejection for wrong two_phase_reborrow body, got: {err}"
+    );
+}
