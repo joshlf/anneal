@@ -6,90 +6,162 @@
 // This file may not be copied, modified, or distributed except according to
 // those terms.
 
-//! CLI entrypoint for `cargo-anneal`.
-
-mod setup;
+//! Trusted CLI entry point (`cargo-anneal`).
+//!
+//! Supports both direct invocation (`cargo-anneal <subcommand>`) and Cargo
+//! subcommand invocation (`cargo anneal <subcommand>`). All effectful stages—
+//! `rustc` MIR capture (`anneal-rustc-capture`), repository boundary auditing
+//! ([`cargo_anneal::audit`]), and kernel verification—execute inside
+//! `trusted/`.
 
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-fn print_help() {
-    println!(
-        "\
-cargo-anneal {}
+use clap::error::ErrorKind;
+use clap::{Parser, Subcommand};
 
-USAGE:
-    cargo anneal <SUBCOMMAND>
-    cargo-anneal <SUBCOMMAND>
+use cargo_anneal::audit::{Checker, Json};
+use cargo_anneal::setup;
+use cargo_anneal::{VerifyOptions, resolve_anneal_root, resolve_lean_bin};
 
-SUBCOMMANDS:
-    setup [--local-archive <path>]    Install the pinned Anneal toolchain archive
-
-OPTIONS:
-    -h, --help       Print help information
-    -V, --version    Print version information",
-        env!("CARGO_PKG_VERSION")
-    );
+#[derive(Parser)]
+#[command(
+    name = "cargo-anneal",
+    version,
+    about = "Deductive verification CLI and trusted-boundary auditor for Anneal"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
 }
 
-fn run_setup_cli(args: &[String]) -> ExitCode {
-    let mut local_archive: Option<PathBuf> = None;
-    let mut iter = args.iter().map(String::as_str);
-    while let Some(arg) = iter.next() {
-        match arg {
-            "--local-archive" => {
-                let Some(val) = iter.next() else {
-                    eprintln!("error: --local-archive requires a path");
-                    return ExitCode::from(2);
-                };
-                local_archive = Some(PathBuf::from(val));
-            }
-            "--help" | "-h" => {
-                println!(
-                    "Usage: cargo anneal setup [--local-archive <path>]"
-                );
-                return ExitCode::SUCCESS;
-            }
-            other => {
-                eprintln!("error: unknown setup argument `{other}`");
-                return ExitCode::from(2);
-            }
-        }
-    }
-
-    match setup::install(local_archive) {
-        Ok(root) => {
-            println!("Installed Anneal toolchain at {}", root.display());
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            eprintln!("error: {err}");
-            ExitCode::from(1)
-        }
-    }
+#[derive(Subcommand)]
+enum Commands {
+    /// Install the pinned Anneal Rust and Lean 4 toolchain bundle.
+    Setup {
+        /// Optional path to a local toolchain archive.
+        #[arg(long)]
+        local_archive: Option<PathBuf>,
+    },
+    /// Audit the Anneal repository's `trusted/` and `theory/` boundaries.
+    AuditRepo {
+        /// Absolute path to the Lean 4 binary.
+        #[arg(long)]
+        lean: Option<PathBuf>,
+        /// Path to the Anneal repository root.
+        #[arg(long)]
+        anneal_root: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
-    let mut args: Vec<String> = env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("anneal") {
-        args.remove(0);
+    match run(env::args().collect()) {
+        Ok(code) => ExitCode::from(code),
+        Err((code, msg)) => {
+            eprintln!("{msg}");
+            ExitCode::from(code)
+        }
+    }
+}
+
+fn validate_lean_path(lean: Option<PathBuf>) -> Result<Option<PathBuf>, (u8, String)> {
+    if let Some(ref pb) = lean
+        && !pb.is_absolute()
+    {
+        return Err((2, "error: --lean must be absolute".to_string()));
+    }
+    Ok(lean)
+}
+
+fn run(mut raw_args: Vec<String>) -> Result<u8, (u8, String)> {
+    if raw_args.get(1).map(String::as_str) == Some("anneal") {
+        raw_args.remove(1);
     }
 
-    match args.first().map(String::as_str) {
-        None | Some("--help") | Some("-h") | Some("help") => {
-            print_help();
-            ExitCode::SUCCESS
+    let cli = match Cli::try_parse_from(raw_args) {
+        Ok(c) => c,
+        Err(e) => {
+            if matches!(
+                e.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                print!("{e}");
+                return Ok(0);
+            }
+            return Err((2, e.to_string().trim_end().to_string()));
         }
-        Some("--version") | Some("-V") => {
-            println!("cargo-anneal {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
-        }
-        Some("setup") => run_setup_cli(&args[1..]),
-        Some(other) => {
-            eprintln!("error: unknown subcommand `{other}`");
-            print_help();
-            ExitCode::from(2)
+    };
+
+    match cli.command {
+        Commands::Setup { local_archive } => match setup::install(local_archive)
+        {
+            Ok(root) => {
+                println!("Installed Anneal toolchain at {}", root.display());
+                Ok(0)
+            }
+            Err(err) => Err((1, format!("error: {err}"))),
+        },
+        Commands::AuditRepo { lean, anneal_root } => {
+            let lean_bin = validate_lean_path(lean)?;
+            let options = VerifyOptions {
+                anneal_root,
+                lean_bin,
+            };
+            let checkout = resolve_anneal_root(&options)
+                .map_err(|e| (2, e.to_string()))?;
+            let lean = resolve_lean_bin(&options);
+            let mut checker = Checker::new(&checkout, lean.as_deref())
+                .map_err(|e| {
+                    (
+                        2,
+                        format!(
+                            "Trusted check could not create its private temporary directory: {e}"
+                        ),
+                    )
+                })?;
+            match checker.run() {
+                Ok(report) => {
+                    let guarantee = report
+                        .get("guarantee")
+                        .and_then(Json::as_str)
+                        .unwrap_or("");
+                    let k_decls = report
+                        .get("kernelDeclarations")
+                        .and_then(Json::as_i64)
+                        .unwrap_or(0);
+                    let replayed = report
+                        .get("replayedDeclarations")
+                        .and_then(Json::as_i64)
+                        .unwrap_or(0);
+                    let axioms = report
+                        .get("axioms")
+                        .and_then(|v| serde_json::to_string(v).ok())
+                        .unwrap_or_else(|| "[]".to_string());
+                    let tc = report
+                        .get("toolchain")
+                        .and_then(Json::as_str)
+                        .unwrap_or("");
+                    println!(
+                        "PASS: {guarantee}\n\
+                         {} Trusted modules; {} Theory modules; \
+                         {k_decls} Trusted kernel declarations; \
+                         {replayed} total replayed declarations; \
+                         axioms={axioms}\n\
+                         {tc}",
+                        checker.modules.len(),
+                        checker.theory_modules.len()
+                    );
+                    Ok(0)
+                }
+                Err(err) => {
+                    let msg = format!(
+                        "Trusted check failed ({}): {}\nTarget execution began: {}\nRetry only after resolving/reobserving the reported failure.",
+                        err.phase, err.message, checker.execution_began
+                    );
+                    Err((err.code as u8, msg))
+                }
+            }
         }
     }
 }
