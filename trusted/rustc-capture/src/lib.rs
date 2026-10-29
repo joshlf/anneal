@@ -103,7 +103,9 @@ impl CapturedAtomicOrdering {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapturedTy {
     Usize,
+    Bool,
     Unit,
+    RefMutUsize,
     RefAtomicUsize,
     AtomicOrdering,
 }
@@ -112,9 +114,40 @@ impl CapturedTy {
     fn to_lean(self) -> &'static str {
         match self {
             Self::Usize => "Trusted.MirTy.usize",
+            Self::Bool => "Trusted.MirTy.bool",
             Self::Unit => "Trusted.MirTy.unit",
+            Self::RefMutUsize => "Trusted.MirTy.refMutUsize",
             Self::RefAtomicUsize => "Trusted.MirTy.refAtomicUsize",
             Self::AtomicOrdering => "Trusted.MirTy.atomicOrdering",
+        }
+    }
+}
+
+/// Captured MIR binary comparison operator (`Lt`, `Le`, `Eq`).
+///
+/// Corresponds to `Trusted.BinOp` in `trusted/lean/Trusted/MirAst.lean` and
+/// `rustc_middle::mir::BinOp` (`BinOp::Lt`, `BinOp::Le`, `BinOp::Eq`):
+///
+/// > "The `<` operator (less than)"
+/// >
+/// > "The `<=` operator (less than or equal to)"
+/// >
+/// > "The `==` operator (equality)"
+///
+/// Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L1409-L1443
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapturedBinOp {
+    Lt,
+    Le,
+    Eq,
+}
+
+impl CapturedBinOp {
+    fn to_lean(self) -> &'static str {
+        match self {
+            Self::Lt => "Trusted.BinOp.lt",
+            Self::Le => "Trusted.BinOp.le",
+            Self::Eq => "Trusted.BinOp.eq",
         }
     }
 }
@@ -174,7 +207,24 @@ impl CapturedOperand {
 /// Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L305-L385
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapturedStmt {
-    AssignUse { dst: usize, op: CapturedOperand },
+    AssignUse {
+        dst: usize,
+        op: CapturedOperand,
+    },
+    AssignDerefLoad {
+        dst: usize,
+        src: usize,
+    },
+    AssignBinOp {
+        dst: usize,
+        op: CapturedBinOp,
+        lhs: CapturedOperand,
+        rhs: CapturedOperand,
+    },
+    AssignDerefStore {
+        dst: usize,
+        op: CapturedOperand,
+    },
     StorageLive(usize),
     StorageDead(usize),
     Nop,
@@ -185,6 +235,19 @@ impl CapturedStmt {
         match self {
             Self::AssignUse { dst, op } => format!(
                 "Trusted.Stmt.assign ⟨{dst}⟩ (Trusted.Rvalue.use {})",
+                op.to_lean()
+            ),
+            Self::AssignDerefLoad { dst, src } => format!(
+                "Trusted.Stmt.assign ⟨{dst}⟩ (Trusted.Rvalue.deref ⟨{src}⟩)"
+            ),
+            Self::AssignBinOp { dst, op, lhs, rhs } => format!(
+                "Trusted.Stmt.assign ⟨{dst}⟩ (Trusted.Rvalue.binaryOp {} {} {})",
+                op.to_lean(),
+                lhs.to_lean(),
+                rhs.to_lean()
+            ),
+            Self::AssignDerefStore { dst, op } => format!(
+                "Trusted.Stmt.assignDeref ⟨{dst}⟩ {}",
                 op.to_lean()
             ),
             Self::StorageLive(loc) => {
@@ -201,9 +264,12 @@ impl CapturedStmt {
 /// Captured MIR basic-block terminator.
 ///
 /// Corresponds to `rustc_middle::mir::TerminatorKind` (`Return`, `Goto`,
-/// `Unreachable`, and `Call` specialized to `Atomic::<usize>::load`):
+/// `SwitchInt`, `Unreachable`, and `Call` specialized to
+/// `Atomic::<usize>::load`):
 ///
 /// > "Block has one successor; we continue execution there."
+/// >
+/// > "Switches based on the computed value."
 /// >
 /// > "Returns from the function."
 /// >
@@ -221,6 +287,11 @@ impl CapturedStmt {
 pub enum CapturedTerminator {
     Return,
     Goto(usize),
+    SwitchInt {
+        discr: CapturedOperand,
+        false_target: usize,
+        true_target: usize,
+    },
     Unreachable,
     CallAtomicLoad {
         dst: usize,
@@ -235,6 +306,14 @@ impl CapturedTerminator {
         match self {
             Self::Return => "Trusted.Terminator.return_".to_string(),
             Self::Goto(target) => format!("(Trusted.Terminator.goto ⟨{target}⟩)"),
+            Self::SwitchInt {
+                discr,
+                false_target,
+                true_target,
+            } => format!(
+                "(Trusted.Terminator.switchInt {} ⟨{false_target}⟩ ⟨{true_target}⟩)",
+                discr.to_lean()
+            ),
             Self::Unreachable => "Trusted.Terminator.unreachable".to_string(),
             Self::CallAtomicLoad {
                 dst,
@@ -276,6 +355,12 @@ pub enum CapturedSpec {
     /// Weak-memory atomic load postcondition `ensures(atomic_load(a))`
     /// (`specs := [Trusted.EnsuresAtomicLoad 1]`).
     EnsuresAtomicLoad(usize),
+    /// Functional specification for `max_assign(x, y)`
+    /// (`specs := [Trusted.EnsuresMaxAssign]`).
+    EnsuresMaxAssign,
+    /// Functional specification for `update_min(x, y, v)`
+    /// (`specs := [Trusted.EnsuresUpdateMin]`).
+    EnsuresUpdateMin,
 }
 
 impl CapturedSpec {
@@ -288,6 +373,8 @@ impl CapturedSpec {
             Self::EnsuresAtomicLoad(local) => {
                 format!("[Trusted.EnsuresAtomicLoad {local}]")
             }
+            Self::EnsuresMaxAssign => "[Trusted.EnsuresMaxAssign]".to_string(),
+            Self::EnsuresUpdateMin => "[Trusted.EnsuresUpdateMin]".to_string(),
         }
     }
 }
@@ -445,6 +532,8 @@ fn parse_source_spec(src: &str) -> Result<CapturedSpec, CaptureError> {
             let parsed = match clause {
                 "ensures(ret == x)" => CapturedSpec::EnsuresEqArg(1),
                 "ensures(atomic_load(a))" => CapturedSpec::EnsuresAtomicLoad(1),
+                "ensures(max_assign(x, y))" => CapturedSpec::EnsuresMaxAssign,
+                "ensures(update_min(x, y, v))" => CapturedSpec::EnsuresUpdateMin,
                 "well_formed" => CapturedSpec::WellFormed,
                 other => {
                     return Err(CaptureError::UnsupportedMir(format!(
@@ -486,6 +575,7 @@ pub fn parse_emitted_mir(
         let (name, arg_tys, ret_ty) = parse_fn_header(fn_rest)?;
         let mut max_local = arg_tys.len();
         let mut blocks = Vec::new();
+        let mut scope_depth: usize = 0;
 
         loop {
             let Some(body_raw) = lines.next() else {
@@ -497,11 +587,20 @@ pub fn parse_emitted_mir(
             if body_line.is_empty()
                 || body_line.starts_with("//")
                 || body_line.starts_with("debug ")
-                || body_line.starts_with("scope ")
             {
                 continue;
             }
+            if body_line.starts_with("scope ") {
+                if body_line.ends_with('{') && !body_line.ends_with("{}") {
+                    scope_depth += 1;
+                }
+                continue;
+            }
             if body_line == "}" {
+                if scope_depth > 0 {
+                    scope_depth -= 1;
+                    continue;
+                }
                 break;
             }
             if let Some(decl_rest) = body_line.strip_prefix("let ") {
@@ -703,7 +802,9 @@ fn parse_bb_index(token: &str) -> Result<usize, CaptureError> {
 fn parse_ty(ty_str: &str) -> Result<CapturedTy, CaptureError> {
     match ty_str {
         "usize" => Ok(CapturedTy::Usize),
+        "bool" => Ok(CapturedTy::Bool),
         "()" => Ok(CapturedTy::Unit),
+        "&mut usize" => Ok(CapturedTy::RefMutUsize),
         "&Atomic<usize>"
         | "&std::sync::atomic::AtomicUsize"
         | "&core::sync::atomic::AtomicUsize" => Ok(CapturedTy::RefAtomicUsize),
@@ -737,6 +838,9 @@ fn parse_stmt_or_terminator(line: &str) -> Result<StmtOrTerm, CaptureError> {
         let target = parse_bb_index(target_str.trim())?;
         return Ok(StmtOrTerm::Term(CapturedTerminator::Goto(target)));
     }
+    if let Some(switch_term) = parse_switch_int(stmt)? {
+        return Ok(StmtOrTerm::Term(switch_term));
+    }
     if stmt == "nop" {
         return Ok(StmtOrTerm::Stmt(CapturedStmt::Nop));
     }
@@ -757,10 +861,36 @@ fn parse_stmt_or_terminator(line: &str) -> Result<StmtOrTerm, CaptureError> {
         )));
     }
     if let Some((lhs, rhs)) = stmt.split_once('=') {
-        let dst = parse_local_token(lhs.trim())?;
+        let lhs_trimmed = lhs.trim();
         let rhs_trimmed = rhs.trim();
+        if let Some(deref_inner) = lhs_trimmed
+            .strip_prefix("(*")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            let dst = parse_local_token(deref_inner.trim())?;
+            let op = parse_operand(rhs_trimmed)?;
+            return Ok(StmtOrTerm::Stmt(CapturedStmt::AssignDerefStore {
+                dst,
+                op,
+            }));
+        }
+        let dst = parse_local_token(lhs_trimmed)?;
         if let Some(call_term) = parse_atomic_load_call(dst, rhs_trimmed)? {
             return Ok(StmtOrTerm::Term(call_term));
+        }
+        if let Some(deref_src) = rhs_trimmed
+            .strip_prefix("copy (*")
+            .or_else(|| rhs_trimmed.strip_prefix("move (*"))
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            let src = parse_local_token(deref_src.trim())?;
+            return Ok(StmtOrTerm::Stmt(CapturedStmt::AssignDerefLoad {
+                dst,
+                src,
+            }));
+        }
+        if let Some(binop_stmt) = parse_binop_rvalue(dst, rhs_trimmed)? {
+            return Ok(StmtOrTerm::Stmt(binop_stmt));
         }
         let op = parse_operand(rhs_trimmed)?;
         return Ok(StmtOrTerm::Stmt(CapturedStmt::AssignUse { dst, op }));
@@ -768,6 +898,95 @@ fn parse_stmt_or_terminator(line: &str) -> Result<StmtOrTerm, CaptureError> {
     Err(CaptureError::UnsupportedMir(format!(
         "unsupported MIR statement or terminator: `{line}`"
     )))
+}
+
+fn parse_switch_int(
+    stmt: &str,
+) -> Result<Option<CapturedTerminator>, CaptureError> {
+    let Some(rest) = stmt.strip_prefix("switchInt(") else {
+        return Ok(None);
+    };
+    let (discr_str, targets_part) = rest
+        .split_once(") ->")
+        .or_else(|| rest.split_once(")->"))
+        .ok_or_else(|| {
+            CaptureError::UnsupportedMir(format!(
+                "malformed switchInt terminator `{stmt}`"
+            ))
+        })?;
+    let discr = parse_operand(discr_str.trim())?;
+    let bracket_inner = targets_part
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| {
+            CaptureError::UnsupportedMir(format!(
+                "malformed switchInt target list `{targets_part}`"
+            ))
+        })?;
+    let (first_arm, second_arm) =
+        bracket_inner.split_once(',').ok_or_else(|| {
+            CaptureError::UnsupportedMir(format!(
+                "expected two switchInt arms `[0: bbF, otherwise: bbT]`, found `{bracket_inner}`"
+            ))
+        })?;
+    let false_bb_str = first_arm
+        .trim()
+        .strip_prefix("0:")
+        .or_else(|| first_arm.trim().strip_prefix("false:"))
+        .ok_or_else(|| {
+            CaptureError::UnsupportedMir(format!(
+                "expected `0: bb<n>` in switchInt, found `{first_arm}`"
+            ))
+        })?;
+    let true_bb_str = second_arm
+        .trim()
+        .strip_prefix("otherwise:")
+        .ok_or_else(|| {
+            CaptureError::UnsupportedMir(format!(
+                "expected `otherwise: bb<n>` in switchInt, found `{second_arm}`"
+            ))
+        })?;
+    let false_target = parse_bb_index(false_bb_str.trim())?;
+    let true_target = parse_bb_index(true_bb_str.trim())?;
+    Ok(Some(CapturedTerminator::SwitchInt {
+        discr,
+        false_target,
+        true_target,
+    }))
+}
+
+fn parse_binop_rvalue(
+    dst: usize,
+    rhs: &str,
+) -> Result<Option<CapturedStmt>, CaptureError> {
+    let (op, rest) = if let Some(r) = rhs.strip_prefix("Lt(") {
+        (CapturedBinOp::Lt, r)
+    } else if let Some(r) = rhs.strip_prefix("Le(") {
+        (CapturedBinOp::Le, r)
+    } else if let Some(r) = rhs.strip_prefix("Eq(") {
+        (CapturedBinOp::Eq, r)
+    } else {
+        return Ok(None);
+    };
+    let args_inner = rest.strip_suffix(')').ok_or_else(|| {
+        CaptureError::UnsupportedMir(format!(
+            "unclosed binary operator rvalue `{rhs}`"
+        ))
+    })?;
+    let (lhs_str, rhs_str) = args_inner.split_once(',').ok_or_else(|| {
+        CaptureError::UnsupportedMir(format!(
+            "expected two operands in binary operator `{rhs}`"
+        ))
+    })?;
+    let lhs = parse_operand(lhs_str.trim())?;
+    let rhs_op = parse_operand(rhs_str.trim())?;
+    Ok(Some(CapturedStmt::AssignBinOp {
+        dst,
+        op,
+        lhs,
+        rhs: rhs_op,
+    }))
 }
 
 fn parse_atomic_load_call(
@@ -1171,5 +1390,104 @@ fn load_relaxed(_1: &Atomic<usize>) -> usize {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parses_rustc_max_assign_mir() {
+        let sample = "\
+// WARNING: This output format is intended for human consumers only
+fn max_assign(_1: &mut usize, _2: usize) -> usize {
+    debug x => _1;
+    debug y => _2;
+    let mut _0: usize;
+    let mut _3: bool;
+    let mut _4: usize;
+
+    bb0: {
+        _4 = copy (*_1);
+        _3 = Lt(move _4, copy _2);
+        switchInt(move _3) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        (*_1) = copy _2;
+        goto -> bb2;
+    }
+
+    bb2: {
+        _0 = copy (*_1);
+        return;
+    }
+}
+";
+        let fns = parse_emitted_mir(sample, CapturedSpec::EnsuresMaxAssign)
+            .unwrap();
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].name, "max_assign");
+        assert_eq!(
+            fns[0].arg_tys,
+            vec![CapturedTy::RefMutUsize, CapturedTy::Usize]
+        );
+        assert_eq!(fns[0].ret_ty, CapturedTy::Usize);
+        assert_eq!(fns[0].local_count, 5);
+        assert_eq!(fns[0].blocks.len(), 3);
+    }
+
+    #[test]
+    fn parses_rustc_update_min_mir() {
+        let sample = "\
+// WARNING: This output format is intended for human consumers only
+fn update_min(_1: &mut usize, _2: &mut usize, _3: usize) -> usize {
+    debug x => _1;
+    debug y => _2;
+    debug v => _3;
+    let mut _0: usize;
+    let _4: &mut usize;
+    let mut _5: bool;
+    let mut _6: usize;
+    let mut _7: usize;
+    scope 1 {
+        debug r => _4;
+    }
+
+    bb0: {
+        _6 = copy (*_1);
+        _7 = copy (*_2);
+        _5 = Le(move _6, move _7);
+        switchInt(move _5) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _4 = copy _1;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _4 = copy _2;
+        goto -> bb3;
+    }
+
+    bb3: {
+        (*_4) = copy _3;
+        _0 = copy (*_1);
+        return;
+    }
+}
+";
+        let fns = parse_emitted_mir(sample, CapturedSpec::EnsuresUpdateMin)
+            .unwrap();
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].name, "update_min");
+        assert_eq!(
+            fns[0].arg_tys,
+            vec![
+                CapturedTy::RefMutUsize,
+                CapturedTy::RefMutUsize,
+                CapturedTy::Usize
+            ]
+        );
+        assert_eq!(fns[0].ret_ty, CapturedTy::Usize);
+        assert_eq!(fns[0].local_count, 8);
+        assert_eq!(fns[0].blocks.len(), 4);
     }
 }
