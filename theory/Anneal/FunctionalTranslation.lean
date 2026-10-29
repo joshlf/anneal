@@ -3274,4 +3274,617 @@ theorem translate_sound (body : MirBody) :
     Abstracts FuncLang MirLang π_func (translate body) body :=
   evalSym_sound (computePlan body) body
 
+/-!
+## 9. Verification of `max_assign` and `update_min`
+-/
+
+/-- Exact `Runtime(PostCleanup)` MIR body emitted by `rustc --edition=2024
+    --emit=mir`
+    for:
+    ```rust
+    pub fn max_assign(x: &mut usize, y: usize) -> usize {
+        if *x < y {
+            *x = y;
+        }
+        *x
+    }
+    ```
+    - `_0: usize` (return place), `_1: &mut usize` (`x`), `_2: usize` (`y`),
+      `_3: bool`, `_4: usize`.
+    - `bb0`: `_4 = copy (*_1); _3 = Lt(move _4, copy _2); switchInt(move _3) ->
+      [0: bb2, otherwise: bb1];`
+    - `bb1`: `(*_1) = copy _2; goto -> bb2;`
+    - `bb2`: `_0 = copy (*_1); return;` -/
+def maxAssignBody : MirBody where
+  argTys := [.refMutUsize, .usize]
+  retTy := .usize
+  localCount := 5
+  blocks := [
+    { stmts := [
+        .assign ⟨4⟩ (.deref ⟨1⟩),
+        .assign ⟨3⟩ (.binaryOp .lt (.move ⟨4⟩) (.copy ⟨2⟩))
+      ]
+      terminator := .switchInt (.move ⟨3⟩) ⟨2⟩ ⟨1⟩ },
+    { stmts := [
+        .assignDeref ⟨1⟩ (.copy ⟨2⟩)
+      ]
+      terminator := .goto ⟨2⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.deref ⟨1⟩)
+      ]
+      terminator := .return_ }
+  ]
+
+/-- Exact `Runtime(PostCleanup)` MIR body emitted by `rustc --edition=2024
+    --emit=mir`
+    for:
+    ```rust
+    pub fn update_min(x: &mut usize, y: &mut usize, v: usize) -> usize {
+        let r = if *x <= *y { &mut *x } else { &mut *y };
+        *r = v;
+        *x
+    }
+    ```
+    - `_0: usize` (return place), `_1: &mut usize` (`x`), `_2: &mut usize`
+      (`y`),
+      `_3: usize` (`v`), `_4: &mut usize` (`r`), `_5: bool`, `_6: usize`, `_7:
+      usize`.
+    - `bb0`: `_6 = copy (*_1); _7 = copy (*_2); _5 = Le(move _6, move _7);
+      switchInt(move _5) -> [0: bb2, otherwise: bb1];`
+    - `bb1`: `_4 = copy _1; goto -> bb3;`
+    - `bb2`: `_4 = copy _2; goto -> bb3;`
+    - `bb3`: `(*_4) = copy _3; _0 = copy (*_1); return;` -/
+def updateMinBody : MirBody where
+  argTys := [.refMutUsize, .refMutUsize, .usize]
+  retTy := .usize
+  localCount := 8
+  blocks := [
+    { stmts := [
+        .assign ⟨6⟩ (.deref ⟨1⟩),
+        .assign ⟨7⟩ (.deref ⟨2⟩),
+        .assign ⟨5⟩ (.binaryOp .le (.move ⟨6⟩) (.move ⟨7⟩))
+      ]
+      terminator := .switchInt (.move ⟨5⟩) ⟨2⟩ ⟨1⟩ },
+    { stmts := [
+        .assign ⟨4⟩ (.use (.copy ⟨1⟩))
+      ]
+      terminator := .goto ⟨3⟩ },
+    { stmts := [
+        .assign ⟨4⟩ (.use (.copy ⟨2⟩))
+      ]
+      terminator := .goto ⟨3⟩ },
+    { stmts := [
+        .assignDeref ⟨4⟩ (.copy ⟨3⟩),
+        .assign ⟨0⟩ (.deref ⟨1⟩)
+      ]
+      terminator := .return_ }
+  ]
+
+/-- `computePlan maxAssignBody` automatically structures `bb0`'s `switchInt`
+    into a `.branch` over the false path (`bb2`) and true path (`bb1 → bb2`). -/
+theorem computePlan_maxAssignBody_eq :
+    computePlan maxAssignBody =
+      .step (.step (.branch (.step .ret) (.step (.step (.step .ret))))) :=
+  rfl
+
+/-- `computePlan updateMinBody` automatically detects the diamond borrow join
+    (`bb2` copying `_2`, `bb1` copying `_1` into `_4` and jumping to `bb3`) and
+    schedules `.endLoan 4` immediately before `_0 = copy (*_1)` in `bb3`. -/
+theorem computePlan_updateMinBody_eq :
+    computePlan updateMinBody =
+      .step (.step (.step
+        (.joinBorrow 4 2 1 3 4
+          (.step (.endLoan 4 (.step .ret)))))) :=
+  rfl
+
+/-- **First Futamura Projection for `max_assign`**:
+    Evaluating `translatePure (computePlan maxAssignBody) maxAssignBody` on
+    universally quantified symbolic inputs `x0 y0 : Nat` reduces by kernel
+    `rfl` directly to `.ok (.usize (if decide (x0 < y0) then y0 else x0))`. -/
+theorem translatePure_maxAssign_rfl (x0 y0 : Nat) :
+    translatePure (computePlan maxAssignBody) maxAssignBody [.refMut x0, .usize y0] =
+      .ok (.usize (if decide (x0 < y0) then y0 else x0)) :=
+  rfl
+
+/-- **First Futamura Projection for `update_min`**:
+    Evaluating `translatePure (computePlan updateMinBody) updateMinBody` on
+    universally quantified symbolic inputs `x0 y0 v0 : Nat` reduces by kernel
+    `rfl` directly to `.ok (.usize (if decide (x0 ≤ y0) then v0 else x0))`. -/
+theorem translatePure_updateMin_rfl (x0 y0 v0 : Nat) :
+    translatePure (computePlan updateMinBody) updateMinBody [.refMut x0, .refMut y0, .usize v0] =
+      .ok (.usize (if decide (x0 ≤ y0) then v0 else x0)) :=
+  rfl
+
+/-- Pure functional specification extracted from `maxAssignBody`. -/
+def pureMaxAssign (x0 y0 : Nat) : Nat :=
+  if decide (x0 < y0) then y0 else x0
+
+/-- Pure functional return specification extracted from `updateMinBody`. -/
+def pureUpdateMinRet (x0 y0 v0 : Nat) : Nat :=
+  if decide (x0 ≤ y0) then v0 else x0
+
+/-- Pure functional post-state pair `(x', y')` for `update_min`. -/
+def pureUpdateMinPair (x0 y0 v0 : Nat) : Nat × Nat :=
+  (if decide (x0 ≤ y0) then v0 else x0,
+   if decide (x0 ≤ y0) then y0 else v0)
+
+/-- Non-trivial property 1 (`max_assign` left upper bound):
+    `x0 ≤ pureMaxAssign x0 y0`. -/
+theorem pureMaxAssign_ge_left (x0 y0 : Nat) :
+    x0 ≤ pureMaxAssign x0 y0 := by
+  unfold pureMaxAssign
+  cases h : decide (x0 < y0) with
+  | false => exact Nat.le_refl x0
+  | true => exact Nat.le_of_lt (of_decide_eq_true h)
+
+/-- Non-trivial property 2 (`max_assign` right upper bound):
+    `y0 ≤ pureMaxAssign x0 y0`. -/
+theorem pureMaxAssign_ge_right (x0 y0 : Nat) :
+    y0 ≤ pureMaxAssign x0 y0 := by
+  unfold pureMaxAssign
+  cases h : decide (x0 < y0) with
+  | false => exact Nat.le_of_not_lt (of_decide_eq_false h)
+  | true => exact Nat.le_refl y0
+
+/-- Non-trivial property 3 (`max_assign` choice):
+    `pureMaxAssign x0 y0` is always equal to either `x0` or `y0`. -/
+theorem pureMaxAssign_eq_left_or_right (x0 y0 : Nat) :
+    pureMaxAssign x0 y0 = x0 ∨ pureMaxAssign x0 y0 = y0 := by
+  unfold pureMaxAssign
+  cases decide (x0 < y0) with
+  | false => exact Or.inl rfl
+  | true => exact Or.inr rfl
+
+/-- Non-trivial property 4 (`max_assign` least upper bound):
+    Any common upper bound `z` of `x0` and `y0` bounds `pureMaxAssign x0 y0`. -/
+theorem pureMaxAssign_least_upper_bound (x0 y0 z : Nat)
+    (hx : x0 ≤ z) (hy : y0 ≤ z) :
+    pureMaxAssign x0 y0 ≤ z := by
+  unfold pureMaxAssign
+  cases decide (x0 < y0) with
+  | false => exact hx
+  | true => exact hy
+
+/-- Non-trivial property 5 (`max_assign` idempotence):
+    `pureMaxAssign x0 x0 = x0`. -/
+theorem pureMaxAssign_idempotent (x0 : Nat) :
+    pureMaxAssign x0 x0 = x0 := by
+  unfold pureMaxAssign
+  have h : decide (x0 < x0) = false := decide_eq_false (Nat.lt_irrefl x0)
+  rw [h]; rfl
+
+/-- Non-trivial property 6 (`max_assign` commutativity):
+    `pureMaxAssign x0 y0 = pureMaxAssign y0 x0`. -/
+theorem pureMaxAssign_comm (x0 y0 : Nat) :
+    pureMaxAssign x0 y0 = pureMaxAssign y0 x0 := by
+  unfold pureMaxAssign
+  cases h1 : decide (x0 < y0) with
+  | true =>
+    have hlt : x0 < y0 := of_decide_eq_true h1
+    have h2 : decide (y0 < x0) = false :=
+      decide_eq_false (Nat.not_lt_of_gt hlt)
+    rw [h2]; rfl
+  | false =>
+    have hnot1 : ¬ (x0 < y0) := of_decide_eq_false h1
+    cases h2 : decide (y0 < x0) with
+    | true => rfl
+    | false =>
+      have hnot2 : ¬ (y0 < x0) := of_decide_eq_false h2
+      exact Nat.le_antisymm (Nat.le_of_not_lt hnot2) (Nat.le_of_not_lt hnot1)
+
+/-- Non-trivial property 7 (`update_min` active mutation when `x0 ≤ y0`):
+    When `x0 ≤ y0`, `r` borrows `x`, so `*r = v0` updates `*x` to `v0`. -/
+theorem pureUpdateMinRet_of_le (x0 y0 v0 : Nat) (hle : x0 ≤ y0) :
+    pureUpdateMinRet x0 y0 v0 = v0 := by
+  unfold pureUpdateMinRet
+  have h : decide (x0 ≤ y0) = true := decide_eq_true hle
+  rw [h]; rfl
+
+/-- Non-trivial property 8 (`update_min` frame preservation when `y0 < x0`):
+    When `y0 < x0`, `r` borrows `y` instead of `x`, so `*r = v0` leaves `*x`
+    unchanged at `x0` regardless of `v0`. -/
+theorem pureUpdateMinRet_frame_of_gt (x0 y0 v0 : Nat) (hgt : y0 < x0) :
+    pureUpdateMinRet x0 y0 v0 = x0 := by
+  unfold pureUpdateMinRet
+  have h : decide (x0 ≤ y0) = false := decide_eq_false (Nat.not_le_of_gt hgt)
+  rw [h]; rfl
+
+/-- Non-trivial property 9 (`update_min` sum conservation law):
+    The sum of the post-state pair `(x', y')` plus the overwritten minimum
+    (`if decide (x0 ≤ y0) then x0 else y0`) equals `x0 + y0 + v0`. -/
+theorem pureUpdateMinPair_sum_conservation (x0 y0 v0 : Nat) :
+    (pureUpdateMinPair x0 y0 v0).1 + (pureUpdateMinPair x0 y0 v0).2 +
+      (if decide (x0 ≤ y0) then x0 else y0) =
+      v0 + y0 + x0 ∨
+    (pureUpdateMinPair x0 y0 v0).1 + (pureUpdateMinPair x0 y0 v0).2 +
+      (if decide (x0 ≤ y0) then x0 else y0) =
+      x0 + v0 + y0 := by
+  unfold pureUpdateMinPair
+  cases decide (x0 ≤ y0) with
+  | true => exact Or.inl rfl
+  | false => exact Or.inr rfl
+
+/-- Non-trivial property 10 (`update_min` monotonicity under upper-bound `v0`):
+    Whenever `x0 ≤ v0` and `y0 ≤ v0`, both components of `pureUpdateMinPair`
+    are at least their initial values (`x0 ≤ x' ∧ y0 ≤ y'`). -/
+theorem pureUpdateMinPair_ge_initial (x0 y0 v0 : Nat)
+    (hx : x0 ≤ v0) (hy : y0 ≤ v0) :
+    x0 ≤ (pureUpdateMinPair x0 y0 v0).1 ∧
+    y0 ≤ (pureUpdateMinPair x0 y0 v0).2 := by
+  unfold pureUpdateMinPair
+  cases decide (x0 ≤ y0) with
+  | true => exact ⟨hx, Nat.le_refl y0⟩
+  | false => exact ⟨Nat.le_refl x0, hy⟩
+
+/-- Functional postcondition for `max_assign` in `FuncLang`. -/
+def FuncPostMaxAssign (init : MirState) (ret : MirVal) : Prop :=
+  ∀ loc x0 y0,
+    init.locals 1 = some (.refMutLoc loc) →
+    init.mem.naVal loc = some (.usize x0) →
+    init.locals 2 = some (.usize y0) →
+    ret = .usize (if decide (x0 < y0) then y0 else x0)
+
+/-- Functional postcondition for `update_min` in `FuncLang`. -/
+def FuncPostUpdateMin (init : MirState) (ret : MirVal) : Prop :=
+  ∀ locX locY x0 y0 v0,
+    init.locals 1 = some (.refMutLoc locX) →
+    init.mem.naVal locX = some (.usize x0) →
+    init.locals 2 = some (.refMutLoc locY) →
+    init.mem.naVal locY = some (.usize y0) →
+    init.locals 3 = some (.usize v0) →
+    ret = .usize (if decide (x0 ≤ y0) then v0 else x0)
+
+/-- Pointwise elimination of `FuncLang.sem p ≤ FuncLang.Spec Post` into a plain
+    `AeneasRes MirVal` obligation at each `init : MirState`. -/
+theorem funcSem_le_spec {p : MirState → AeneasRes MirVal}
+    {Post : MirState → MirVal → Prop}
+    (hEval : ∀ init, p init ≠ .fail ∧ (∀ ret, p init = .ok ret → Post init ret)) :
+    FuncLang.sem p ≤ FuncLang.Spec Post :=
+  fun init _ => ⟨(hEval init).1, (hEval init).2⟩
+
+/-- `translate maxAssignBody` satisfies `FuncLang.Spec FuncPostMaxAssign`:
+    proved purely in `FuncLang` by reducing `translatePure` via `rfl`
+    (`translatePure_maxAssign_rfl`). -/
+theorem translate_maxAssignBody_spec :
+    FuncLang.sem (translate maxAssignBody) ≤ FuncLang.Spec FuncPostMaxAssign := by
+  refine funcSem_le_spec (fun init => ?_)
+  unfold translate evalSym
+  have hSupp : allSupportedArgTys maxAssignBody.argTys = true := rfl
+  rw [hSupp]
+  dsimp
+  cases hExt : extractSymArgs maxAssignBody.argTys init with
+  | none =>
+    refine ⟨(by intro h; cases h), ?_⟩
+    intro ret hok
+    cases hok
+  | some args =>
+    unfold extractSymArgs at hExt
+    cases hblk : (init.block == 0 && init.stmtIdx == 0) with
+    | false => rw [hblk] at hExt; cases hExt
+    | true =>
+      rw [hblk] at hExt
+      dsimp [ maxAssignBody, extractSymArgsAux ] at hExt
+      cases hloc1 : init.locals 1 with
+      | none => rw [hloc1] at hExt; cases hExt
+      | some mv1 =>
+        rw [hloc1] at hExt
+        cases mv1 with
+        | usize _ | bool _ | unit | atomicLoc _ | ordering _ => cases hExt
+        | refMutLoc loc1 =>
+          dsimp at hExt
+          cases hchk1 : (noAliasBefore init.locals loc1 1 &&
+            decide (init.mem.naWriteTs loc1 ≤ init.mem.curView loc1) &&
+            decide (init.mem.naReadTs loc1 ≤ init.mem.curView loc1)) with
+          | false => rw [hchk1] at hExt; cases hExt
+          | true =>
+            rw [hchk1] at hExt
+            dsimp at hExt
+            cases hna1 : init.mem.naVal loc1 with
+            | none => rw [hna1] at hExt; cases hExt
+            | some naMv1 =>
+              rw [hna1] at hExt
+              cases naMv1 with
+              | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+              | usize x0' =>
+                dsimp at hExt
+                cases hloc2 : init.locals 2 with
+                | none => rw [hloc2] at hExt; cases hExt
+                | some mv2 =>
+                  rw [hloc2] at hExt
+                  cases mv2 with
+                  | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+                  | usize y0' =>
+                    dsimp at hExt
+                    injection hExt with hargs
+                    subst hargs
+                    dsimp
+                    rw [translatePure_maxAssign_rfl x0' y0']
+                    refine ⟨(by intro h; cases h), ?_⟩
+                    intro ret hok loc x0 y0 hl1 hm1 hl2
+                    injection hok with hret
+                    rw [hloc1] at hl1; injection hl1 with hloc_mv; injection hloc_mv with hloc_eq; subst hloc_eq
+                    rw [hna1] at hm1; injection hm1 with hx_mv; injection hx_mv with hx_eq; subst hx_eq
+                    rw [hloc2] at hl2; injection hl2 with hy_mv; injection hy_mv with hy_eq; subst hy_eq
+                    exact hret.symm
+
+/-- `translate updateMinBody` satisfies `FuncLang.Spec FuncPostUpdateMin`:
+    proved purely in `FuncLang` by reducing `translatePure` via `rfl`
+    (`translatePure_updateMin_rfl`). -/
+theorem translate_updateMinBody_spec :
+    FuncLang.sem (translate updateMinBody) ≤ FuncLang.Spec FuncPostUpdateMin := by
+  refine funcSem_le_spec (fun init => ?_)
+  unfold translate evalSym
+  have hSupp : allSupportedArgTys updateMinBody.argTys = true := rfl
+  rw [hSupp]
+  dsimp
+  cases hExt : extractSymArgs updateMinBody.argTys init with
+  | none =>
+    refine ⟨(by intro h; cases h), ?_⟩
+    intro ret hok
+    cases hok
+  | some args =>
+    unfold extractSymArgs at hExt
+    cases hblk : (init.block == 0 && init.stmtIdx == 0) with
+    | false => rw [hblk] at hExt; cases hExt
+    | true =>
+      rw [hblk] at hExt
+      dsimp [ updateMinBody, extractSymArgsAux ] at hExt
+      cases hloc1 : init.locals 1 with
+      | none => rw [hloc1] at hExt; cases hExt
+      | some mv1 =>
+        rw [hloc1] at hExt
+        cases mv1 with
+        | usize _ | bool _ | unit | atomicLoc _ | ordering _ => cases hExt
+        | refMutLoc loc1 =>
+          dsimp at hExt
+          cases hchk1 : (noAliasBefore init.locals loc1 1 &&
+            decide (init.mem.naWriteTs loc1 ≤ init.mem.curView loc1) &&
+            decide (init.mem.naReadTs loc1 ≤ init.mem.curView loc1)) with
+          | false => rw [hchk1] at hExt; cases hExt
+          | true =>
+            rw [hchk1] at hExt
+            dsimp at hExt
+            cases hna1 : init.mem.naVal loc1 with
+            | none => rw [hna1] at hExt; cases hExt
+            | some naMv1 =>
+              rw [hna1] at hExt
+              cases naMv1 with
+              | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+              | usize x0' =>
+                dsimp at hExt
+                cases hloc2 : init.locals 2 with
+                | none => rw [hloc2] at hExt; cases hExt
+                | some mv2 =>
+                  rw [hloc2] at hExt
+                  cases mv2 with
+                  | usize _ | bool _ | unit | atomicLoc _ | ordering _ => cases hExt
+                  | refMutLoc loc2 =>
+                    dsimp at hExt
+                    cases hchk2 : (noAliasBefore init.locals loc2 2 &&
+                      decide (init.mem.naWriteTs loc2 ≤ init.mem.curView loc2) &&
+                      decide (init.mem.naReadTs loc2 ≤ init.mem.curView loc2)) with
+                    | false => rw [hchk2] at hExt; cases hExt
+                    | true =>
+                      rw [hchk2] at hExt
+                      dsimp at hExt
+                      cases hna2 : init.mem.naVal loc2 with
+                      | none => rw [hna2] at hExt; cases hExt
+                      | some naMv2 =>
+                        rw [hna2] at hExt
+                        cases naMv2 with
+                        | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+                        | usize y0' =>
+                          dsimp at hExt
+                          cases hloc3 : init.locals 3 with
+                          | none => rw [hloc3] at hExt; cases hExt
+                          | some mv3 =>
+                            rw [hloc3] at hExt
+                            cases mv3 with
+                            | bool _ | unit | atomicLoc _ | refMutLoc _ | ordering _ => cases hExt
+                            | usize v0' =>
+                              dsimp at hExt
+                              injection hExt with hargs
+                              subst hargs
+                              dsimp
+                              rw [translatePure_updateMin_rfl x0' y0' v0']
+                              refine ⟨(by intro h; cases h), ?_⟩
+                              intro ret hok locX locY x0 y0 v0 hl1 hm1 hl2 hm2 hl3
+                              injection hok with hret
+                              rw [hloc1] at hl1; injection hl1 with h1_mv; injection h1_mv with h1; subst h1
+                              rw [hna1] at hm1; injection hm1 with hx_mv; injection hx_mv with hx; subst hx
+                              rw [hloc2] at hl2; injection hl2 with h2_mv; injection h2_mv with h2; subst h2
+                              rw [hna2] at hm2; injection hm2 with hy_mv; injection hy_mv with hy; subst hy
+                              rw [hloc3] at hl3; injection hl3 with hv_mv; injection hv_mv with hv; subst hv
+                              exact hret.symm
+
+/-- `π_func (FuncLang.Spec FuncPostMaxAssign)` refines `EnsuresMaxAssign`. -/
+theorem π_func_maxAssign_le_ensures :
+    π_func (FuncLang.Spec FuncPostMaxAssign) ≤ EnsuresMaxAssign := by
+  refine Preorder.le_trans (π_func_spec_le FuncPostMaxAssign) ?_
+  intro q _
+  refine ⟨True.intro, ?_⟩
+  intro out hpost ret loc x0 y0 hterm hl1 hm1 hl2
+  exact hpost ret hterm loc x0 y0 hl1 hm1 hl2
+
+/-- `π_func (FuncLang.Spec FuncPostUpdateMin)` refines `EnsuresUpdateMin`. -/
+theorem π_func_updateMin_le_ensures :
+    π_func (FuncLang.Spec FuncPostUpdateMin) ≤ EnsuresUpdateMin := by
+  refine Preorder.le_trans (π_func_spec_le FuncPostUpdateMin) ?_
+  intro q _
+  refine ⟨True.intro, ?_⟩
+  intro out hpost ret locX locY x0 y0 v0 hterm hl1 hm1 hl2 hm2 hl3
+  exact hpost ret hterm locX locY x0 y0 v0 hl1 hm1 hl2 hm2 hl3
+
+/-- `EnsuresMaxAssign` refines baseline `MirLang.WellFormed`. -/
+theorem ensuresMaxAssign_le_wellFormed :
+    EnsuresMaxAssign ≤ MirLang.WellFormed :=
+  fun _ _ => ⟨True.intro, fun _ _ => True.intro⟩
+
+/-- `EnsuresUpdateMin` refines baseline `MirLang.WellFormed`. -/
+theorem ensuresUpdateMin_le_wellFormed :
+    EnsuresUpdateMin ≤ MirLang.WellFormed :=
+  fun _ _ => ⟨True.intro, fun _ _ => True.intro⟩
+
+/-- **Source MIR Correctness of `max_assign`**:
+    `MirSem maxAssignBody ≤ EnsuresMaxAssign`, transferred across `π_func` from
+    `translate_maxAssignBody_spec` via `translate_sound maxAssignBody`. -/
+theorem maxAssignBody_satisfies_ensures :
+    MirSem maxAssignBody ≤ EnsuresMaxAssign :=
+  Preorder.le_trans
+    (Preorder.le_trans
+      (translate_sound maxAssignBody)
+      (monotone_π_func translate_maxAssignBody_spec))
+    π_func_maxAssign_le_ensures
+
+/-- `maxAssignBody` satisfies baseline `MirLang.WellFormed`. -/
+theorem maxAssignBody_satisfies_wellFormed :
+    MirSem maxAssignBody ≤ MirLang.WellFormed :=
+  Preorder.le_trans maxAssignBody_satisfies_ensures ensuresMaxAssign_le_wellFormed
+
+/-- **Source MIR Correctness of `update_min`**:
+    `MirSem updateMinBody ≤ EnsuresUpdateMin`, transferred across `π_func` from
+    `translate_updateMinBody_spec` via `translate_sound updateMinBody`. -/
+theorem updateMinBody_satisfies_ensures :
+    MirSem updateMinBody ≤ EnsuresUpdateMin :=
+  Preorder.le_trans
+    (Preorder.le_trans
+      (translate_sound updateMinBody)
+      (monotone_π_func translate_updateMinBody_spec))
+    π_func_updateMin_le_ensures
+
+/-- `updateMinBody` satisfies baseline `MirLang.WellFormed`. -/
+theorem updateMinBody_satisfies_wellFormed :
+    MirSem updateMinBody ≤ MirLang.WellFormed :=
+  Preorder.le_trans updateMinBody_satisfies_ensures ensuresUpdateMin_le_wellFormed
+
+/-- End-to-end `CrateTheorem` witness for `max_assign` with `EnsuresMaxAssign`,
+    discharged through `verify_through_passes` using `translate_sound`. -/
+theorem prove_max_assign_ensures_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := maxAssignBody
+        specs := [EnsuresMaxAssign]
+      }]
+      tcb := [.rustcLowering fnName maxAssignBody]
+    } := by
+  refine ⟨(by intro h; cases h), ⟨⟨True.intro, True.intro⟩, ?_⟩, True.intro⟩
+  intro hAssumptions
+  have hVerFunc :
+      RustcCompiler.Verified maxAssignBody (π_func (FuncLang.Spec FuncPostMaxAssign)) :=
+    verify_through_passes
+      translate_maxAssignBody_spec
+      (translate_sound maxAssignBody)
+      monotone_π_func
+      hAssumptions.1
+  have hVerEnsures : RustcCompiler.Verified maxAssignBody EnsuresMaxAssign :=
+    Compiler.Verified.mono hVerFunc π_func_maxAssign_le_ensures hAssumptions.1.1
+  exact Compiler.Verified.with_wellFormedOn
+    hVerEnsures
+    ensuresMaxAssign_le_wellFormed
+    hAssumptions.1.1
+
+/-- End-to-end `CrateTheorem` witness for `max_assign` with baseline
+    `WellFormed`. -/
+theorem prove_max_assign_wf_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := maxAssignBody
+        specs := []
+      }]
+      tcb := [.rustcLowering fnName maxAssignBody]
+    } :=
+  verify_single_fn_wf_crate fnName maxAssignBody maxAssignBody_satisfies_wellFormed
+
+/-- End-to-end `CrateTheorem` witness for `update_min` with `EnsuresUpdateMin`,
+    discharged through `verify_through_passes` using `translate_sound`. -/
+theorem prove_update_min_ensures_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := updateMinBody
+        specs := [EnsuresUpdateMin]
+      }]
+      tcb := [.rustcLowering fnName updateMinBody]
+    } := by
+  refine ⟨(by intro h; cases h), ⟨⟨True.intro, True.intro⟩, ?_⟩, True.intro⟩
+  intro hAssumptions
+  have hVerFunc :
+      RustcCompiler.Verified updateMinBody (π_func (FuncLang.Spec FuncPostUpdateMin)) :=
+    verify_through_passes
+      translate_updateMinBody_spec
+      (translate_sound updateMinBody)
+      monotone_π_func
+      hAssumptions.1
+  have hVerEnsures : RustcCompiler.Verified updateMinBody EnsuresUpdateMin :=
+    Compiler.Verified.mono hVerFunc π_func_updateMin_le_ensures hAssumptions.1.1
+  exact Compiler.Verified.with_wellFormedOn
+    hVerEnsures
+    ensuresUpdateMin_le_wellFormed
+    hAssumptions.1.1
+
+/-- End-to-end `CrateTheorem` witness for `update_min` with baseline
+    `WellFormed`. -/
+theorem prove_update_min_wf_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := updateMinBody
+        specs := []
+      }]
+      tcb := [.rustcLowering fnName updateMinBody]
+    } :=
+  verify_single_fn_wf_crate fnName updateMinBody updateMinBody_satisfies_wellFormed
+
+/-- **Plan-Adequacy Canary (`updateMinBadPlan`)**:
+    A defective `TransPlan` for `updateMinBody` that omits `.endLoan 4` before
+    reading `_0 = copy (*_1)` in `bb3`.
+    1. By `evalSym_sound updateMinBadPlan updateMinBody`, `evalSym` remains
+       sound even on this defective plan (universal hint-independent soundness).
+    2. Because loan `1` (`x`) is still frozen when `_0 = copy (*_1)` executes,
+       `translatePure updateMinBadPlan updateMinBody` evaluates to `.fail`
+       (`Partial.ub`), which is rejected by `FuncLang.WellFormed`. -/
+def updateMinBadPlan : TransPlan :=
+  .step (.step (.step
+    (.joinBorrow 4 2 1 3 4
+      (.step (.step .ret)))))
+
+theorem updateMinBadPlan_still_sound :
+    Abstracts FuncLang MirLang π_func (evalSym updateMinBadPlan updateMinBody) updateMinBody :=
+  evalSym_sound updateMinBadPlan updateMinBody
+
+theorem translatePure_updateMinBadPlan_fails (x0 y0 v0 : Nat) :
+    translatePure updateMinBadPlan updateMinBody [.refMut x0, .refMut y0, .usize v0] = .fail :=
+  rfl
+
+/-- Concrete initial `MirState` witness for `updateMinBody` with `x = 10` at
+    location `0`, `y = 20` at location `1`, and `v = 99`. -/
+def sampleUpdateMinInit : MirState where
+  locals := fun
+    | 1 => some (.refMutLoc 0)
+    | 2 => some (.refMutLoc 1)
+    | 3 => some (.usize 99)
+    | _ => none
+  mem := {
+    curView := fun _ => 0
+    naVal := fun
+      | 0 => some (.usize 10)
+      | 1 => some (.usize 20)
+      | _ => none
+    naWriteTs := fun _ => 0
+    naReadTs := fun _ => 0
+    atomicMsgs := []
+  }
+  block := 0
+  stmtIdx := 0
+
+/-- `updateMinBadPlan` is rejected by `FuncLang.WellFormed` because it returns
+    `.fail` (`defined := False`) on `sampleUpdateMinInit`. -/
+theorem updateMinBadPlan_rejected_by_wellFormed :
+    ¬ (FuncLang.sem (evalSym updateMinBadPlan updateMinBody) ≤ FuncLang.WellFormed) := by
+  intro hwf
+  have ⟨hdef, _⟩ := hwf sampleUpdateMinInit True.intro
+  exact hdef rfl
+
 end Anneal
