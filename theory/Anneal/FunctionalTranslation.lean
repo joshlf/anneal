@@ -7130,4 +7130,657 @@ theorem prove_choose_mut_wf_crate (fnName : String) :
     } :=
   verify_single_fn_wf_crate fnName chooseMutBody chooseMutBody_satisfies_wellFormed
 
+/-!
+## 15. Input-Indexed `SymPlan` and Verification of `while` Loops (`count_up`)
+
+To verify functions containing `while` loops whose iteration count depends on runtime
+scalar arguments (such as `pub fn count_up(n: usize) -> usize`), we generalize static
+plans `plan : TransPlan` to input-indexed plans `SymPlan := List SymArg → TransPlan`.
+Because `evalSymState_sound` already holds for every `plan : TransPlan` and every
+symbolic argument vector `args : List SymArg`, `evalSymWith_sound` follows by
+instantiating `evalSymState_sound (symPlan args) body` at the extracted argument
+vector `args`.
+-/
+
+/-- Input-indexed translation plan (`SymPlan`): maps a symbolic argument vector
+    `args : List SymArg` to a finite `TransPlan`, enabling unbounded input-dependent
+    loop unrolling while reusing `evalSymState_sound`. -/
+def SymPlan := List SymArg → TransPlan
+
+/-- Pure shallow functional evaluator parameterized by an input-indexed
+    `symPlan : SymPlan`. -/
+noncomputable def translatePureWith (symPlan : SymPlan) (body : MirBody)
+    (args : List SymArg) : AeneasRes MirVal :=
+  translatePure (symPlan args) body args
+
+/-- Input-indexed functional evaluator `evalSymWith : SymPlan → MirBody → FuncLang.Prog`
+    lifting `translatePureWith` to `MirState` via `extractSymArgs`. -/
+noncomputable def evalSymWith (symPlan : SymPlan) (body : MirBody) (init : MirState) :
+    AeneasRes MirVal :=
+  if allSupportedArgTys body.argTys then
+    match extractSymArgs body.argTys init with
+    | some args => translatePureWith symPlan body args
+    | none => .inapplicable
+  else
+    .fail
+
+/-- **Universal Input-Indexed Soundness Theorem (`evalSymWith_sound`)**:
+    For **every** input-indexed plan `symPlan : SymPlan` and **every** MIR body
+    `body : MirBody`, `evalSymWith symPlan body` is a sound functional
+    abstraction of `body`
+    (`Abstracts FuncLang MirLang π_func (evalSymWith symPlan body) body`). -/
+theorem evalSymWith_sound (symPlan : SymPlan) (body : MirBody) :
+    Abstracts FuncLang MirLang π_func (evalSymWith symPlan body) body := by
+  intro q hdef
+  have hne : evalSymWith symPlan body q.init ≠ .fail := hdef
+  unfold evalSymWith at hne
+  cases hSupp : allSupportedArgTys body.argTys with
+  | false =>
+    rw [hSupp] at hne
+    exact False.elim (hne rfl)
+  | true =>
+    rw [hSupp] at hne
+    dsimp at hne
+    cases hExt : extractSymArgs body.argTys q.init with
+    | none =>
+      have hNotInit : ¬ initMirState body q.init := by
+        intro hInit
+        have ⟨args, hSome⟩ := extractSymArgs_of_initMirState hSupp hInit
+        rw [hExt] at hSome
+        cases hSome
+      refine ⟨fun hInit => False.elim (hNotInit hInit), ?_⟩
+      intro out hexec
+      exact False.elim (hNotInit hexec.1)
+    | some args =>
+      rw [hExt] at hne
+      dsimp [translatePureWith] at hne
+      cases hRes : translatePure (symPlan args) body args with
+      | fail =>
+        rw [hRes] at hne
+        exact False.elim (hne rfl)
+      | inapplicable =>
+        exact False.elim (evalSymState_ne_inapplicable (symPlan args) body (buildPureSymState args) hRes)
+      | ok ret =>
+        have ⟨loanLoc, sharedLoc, hState⟩ := extractSymArgs_sound body.argTys q.init args hExt
+        have hSafe : SafeAndReturns body q.init ret :=
+          evalSymState_sound (symPlan args) body hState hRes
+        have hMirDef : (MirLang.sem body q).defined :=
+          fun _ tr out hreach => (hSafe q.init q.steps tr out hreach).1
+        refine ⟨hMirDef, ?_⟩
+        intro out hexec
+        have h := hSafe q.init q.steps out.trace out.outcome hexec.2
+        refine ⟨h.1, ?_⟩
+        intro r hr
+        have hr_eq : r = ret := h.2 r hr
+        subst hr_eq
+        change evalSymWith symPlan body q.init = .ok r
+        unfold evalSymWith
+        rw [hSupp]
+        dsimp
+        rw [hExt]
+        exact hRes
+
+/-- Exact `Runtime(PostCleanup)` MIR body emitted by `rustc --edition=2024 --emit=mir`
+    for:
+    ```rust
+    pub fn count_up(n: usize) -> usize {
+        let mut i = 0;
+        while i < n && i < 1000 {
+            i += 1;
+        }
+        i
+    }
+    ``` -/
+def countUpBody : MirBody where
+  argTys := [.usize]
+  retTy := .usize
+  localCount := 8
+  blocks := [
+    { stmts := [
+        .assign ⟨2⟩ (.use (.constVal (.usize 0)))
+      ]
+      terminator := .goto ⟨1⟩ },
+    { stmts := [
+        .assign ⟨4⟩ (.use (.copy ⟨2⟩)),
+        .assign ⟨3⟩ (.binaryOp .lt (.move ⟨4⟩) (.copy ⟨1⟩))
+      ]
+      terminator := .switchInt (.move ⟨3⟩) ⟨5⟩ ⟨2⟩ },
+    { stmts := [
+        .assign ⟨6⟩ (.use (.copy ⟨2⟩)),
+        .assign ⟨5⟩ (.binaryOp .lt (.move ⟨6⟩) (.constVal (.usize 1000)))
+      ]
+      terminator := .switchInt (.move ⟨5⟩) ⟨5⟩ ⟨3⟩ },
+    { stmts := [
+        .assign ⟨7⟩ (.checkedBinaryOp .add (.copy ⟨2⟩) (.constVal (.usize 1)))
+      ]
+      terminator := .assertNotOverflow ⟨7⟩ ⟨4⟩ },
+    { stmts := [
+        .assign ⟨2⟩ (.proj0 ⟨7⟩)
+      ]
+      terminator := .goto ⟨1⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.use (.copy ⟨2⟩))
+      ]
+      terminator := .return_ }
+  ]
+
+/-- Loop-unrolling `TransPlan` for `count_up` starting at loop header `bb1`
+    with fuel `k`. -/
+noncomputable def countUpLoopPlan : Nat → TransPlan
+  | 0 => .fail
+  | k + 1 =>
+    .step (.step (.branch
+      (.step .ret)
+      (.step (.step (.branch
+        (.step .ret)
+        (.step (.step (.step (.step (countUpLoopPlan k))))))))))
+
+/-- Input-indexed `SymPlan` for `count_up`: steps through `bb0` (2 steps) and
+    invokes `countUpLoopPlan (n + 1)` at `bb1`. -/
+noncomputable def countUpSymPlan : SymPlan
+  | [.usize n] => .step (.step (countUpLoopPlan (n + 1)))
+  | _ => .fail
+
+/-- Symbolic loop invariant at the entry of loop header `bb1` (`block = 1, stmtIdx = 0`)
+    for `count_up`. -/
+structure CountUpLoopInv (i n : Nat) (sym : SymState) : Prop where
+  block_eq : sym.block = 1
+  stmtIdx_eq : sym.stmtIdx = 0
+  local1 : sym.locals 1 = some (.usize n)
+  local2 : sym.locals 2 = some (.usize i)
+
+/-- Symbolic local environment after executing `bb1` (`_4 = copy _2; _3 = Lt(move _4, copy _1); switchInt(move _3)`). -/
+noncomputable def countUpLocalsAfterBb1 (locals : Nat → Option SymVal) (i n : Nat) :
+    Nat → Option SymVal :=
+  updateSymLocal
+    (updateSymLocal
+      (updateSymLocal
+        (updateSymLocal locals 4 (some (.usize i)))
+        4 none)
+      3 (some (.bool (decide (i < n)))))
+    3 none
+
+/-- Symbolic local environment after executing `bb2` (`_6 = copy _2; _5 = Lt(move _6, const 1000); switchInt(move _5)`). -/
+noncomputable def countUpLocalsAfterBb2 (locals : Nat → Option SymVal) (i : Nat) :
+    Nat → Option SymVal :=
+  updateSymLocal
+    (updateSymLocal
+      (updateSymLocal
+        (updateSymLocal locals 6 (some (.usize i)))
+        6 none)
+      5 (some (.bool (decide (i < 1000)))))
+    5 none
+
+/-- Symbolic local environment after executing `bb3 -> bb4` (`_7 = AddWithOverflow(copy _2, 1); _2 = move (_7.0)`). -/
+noncomputable def countUpLocalsAfterBb4 (locals : Nat → Option SymVal) (i : Nat) :
+    Nat → Option SymVal :=
+  updateSymLocal
+    (updateSymLocal locals 7 (some (.tupleUsizeBool (i + 1) false)))
+    2 (some (.usize (i + 1)))
+
+theorem evalSymState_step_of_some {body : MirBody} {sym sym' : SymState} {next : TransPlan}
+    (h : evalSymStep body sym = some (false, sym')) :
+    evalSymState (.step next) body sym = evalSymState next body sym' := by
+  change
+    (match evalSymStep body sym with
+     | some (ov, sym') => if ov then .fail else evalSymState next body sym'
+     | none => .fail) = evalSymState next body sym'
+  rw [h]
+  rfl
+
+theorem evalSymState_branch_of_some {body : MirBody} {sym symF symT : SymState}
+    {cond : Bool} {falsePlan truePlan : TransPlan}
+    (h : evalBranchStep body sym = some (cond, symF, symT)) :
+    evalSymState (.branch falsePlan truePlan) body sym =
+      if cond then evalSymState truePlan body symT else evalSymState falsePlan body symF := by
+  change
+    (match evalBranchStep body sym with
+     | some (cond, symFalse, symTrue) =>
+       zipAeneasRes cond (evalSymState truePlan body symTrue) (evalSymState falsePlan body symFalse)
+     | none => .fail) = _
+  rw [h]
+  dsimp
+  exact zipAeneasRes_eq_ite cond (evalSymState truePlan body symT) (evalSymState falsePlan body symF)
+
+theorem evalSymState_ret_of_some {body : MirBody} {sym : SymState} {mv : MirVal}
+    (h : evalReturn body sym = some mv) :
+    evalSymState .ret body sym = .ok mv := by
+  unfold evalSymState
+  rw [h]
+
+theorem evalSymState_countUp_bb1 {i n : Nat} {sym : SymState}
+    (hInv : CountUpLoopInv i n sym)
+    (falsePlan truePlan : TransPlan) :
+    evalSymState (.step (.step (.branch falsePlan truePlan))) countUpBody sym =
+      if decide (i < n) then
+        evalSymState truePlan countUpBody
+          { sym with locals := countUpLocalsAfterBb1 sym.locals i n, block := 2, stmtIdx := 0 }
+      else
+        evalSymState falsePlan countUpBody
+          { sym with locals := countUpLocalsAfterBb1 sym.locals i n, block := 5, stmtIdx := 0 } := by
+  cases sym with
+  | mk locals loans nextLoan hasActiveJoin block stmtIdx =>
+    have hblk := hInv.block_eq
+    have hstmt := hInv.stmtIdx_eq
+    have h1 := hInv.local1
+    have h2 := hInv.local2
+    dsimp at hblk hstmt h1 h2
+    subst hblk hstmt
+    let sym0 : SymState := {
+      locals := locals
+      loans := loans
+      nextLoan := nextLoan
+      hasActiveJoin := hasActiveJoin
+      block := 1
+      stmtIdx := 0
+    }
+    let locals1 := updateSymLocal locals 4 (some (.usize i))
+    let sym1 : SymState := { sym0 with locals := locals1, stmtIdx := 1 }
+    let locals2 := updateSymLocal (updateSymLocal locals1 4 none) 3 (some (.bool (decide (i < n))))
+    let sym2 : SymState := { sym0 with locals := locals2, stmtIdx := 2 }
+    have s1 : evalSymStep countUpBody sym0 = some (false, sym1) := by
+      change (match evalSymStmt sym0 (.assign ⟨4⟩ (.use (.copy ⟨2⟩))) with
+        | some sym' => some (false, sym')
+        | none => none) = _
+      dsimp [sym0, sym1, locals1, evalSymStmt, evalSymOperand]
+      rw [h2]
+    have s2 : evalSymStep countUpBody sym1 = some (false, sym2) := by
+      have h1' : (updateSymLocal locals1 4 none) 1 = some (.usize n) := h1
+      have h4 : locals1 4 = some (.usize i) := rfl
+      change (match evalSymStmt sym1 (.assign ⟨3⟩ (.binaryOp .lt (.move ⟨4⟩) (.copy ⟨1⟩))) with
+        | some sym' => some (false, sym')
+        | none => none) = _
+      dsimp [sym1, sym0, sym2, locals2, evalSymStmt, evalSymOperand]
+      rw [h4]
+      dsimp
+      rw [h1']
+      rfl
+    have s3 : evalBranchStep countUpBody sym2 =
+        some (decide (i < n),
+          { sym0 with locals := countUpLocalsAfterBb1 locals i n, block := 5, stmtIdx := 0 },
+          { sym0 with locals := countUpLocalsAfterBb1 locals i n, block := 2, stmtIdx := 0 }) :=
+      rfl
+    change evalSymState (.step (.step (.branch falsePlan truePlan))) countUpBody sym0 = _
+    rw [evalSymState_step_of_some s1, evalSymState_step_of_some s2, evalSymState_branch_of_some s3]
+
+theorem evalSymState_countUp_bb5 {i : Nat} {sym : SymState}
+    (hblk : sym.block = 5)
+    (hstmt : sym.stmtIdx = 0)
+    (h2 : sym.locals 2 = some (.usize i)) :
+    evalSymState (.step .ret) countUpBody sym = .ok (.usize i) := by
+  cases sym with
+  | mk locals loans nextLoan hasActiveJoin block stmtIdx =>
+    dsimp at hblk hstmt h2
+    subst hblk hstmt
+    let sym0 : SymState := {
+      locals := locals
+      loans := loans
+      nextLoan := nextLoan
+      hasActiveJoin := hasActiveJoin
+      block := 5
+      stmtIdx := 0
+    }
+    let locals1 := updateSymLocal locals 0 (some (.usize i))
+    let sym1 : SymState := { sym0 with locals := locals1, stmtIdx := 1 }
+    have s1 : evalSymStep countUpBody sym0 = some (false, sym1) := by
+      change (match evalSymStmt sym0 (.assign ⟨0⟩ (.use (.copy ⟨2⟩))) with
+        | some sym' => some (false, sym')
+        | none => none) = _
+      dsimp [sym0, sym1, locals1, evalSymStmt, evalSymOperand]
+      rw [h2]
+    have s2 : evalReturn countUpBody sym1 = some (.usize i) := rfl
+    change evalSymState (.step .ret) countUpBody sym0 = _
+    rw [evalSymState_step_of_some s1, evalSymState_ret_of_some s2]
+
+theorem evalSymState_countUp_bb2 {i : Nat} {sym : SymState}
+    (hblk : sym.block = 2)
+    (hstmt : sym.stmtIdx = 0)
+    (h2 : sym.locals 2 = some (.usize i))
+    (falsePlan truePlan : TransPlan) :
+    evalSymState (.step (.step (.branch falsePlan truePlan))) countUpBody sym =
+      if decide (i < 1000) then
+        evalSymState truePlan countUpBody
+          { sym with locals := countUpLocalsAfterBb2 sym.locals i, block := 3, stmtIdx := 0 }
+      else
+        evalSymState falsePlan countUpBody
+          { sym with locals := countUpLocalsAfterBb2 sym.locals i, block := 5, stmtIdx := 0 } := by
+  cases sym with
+  | mk locals loans nextLoan hasActiveJoin block stmtIdx =>
+    dsimp at hblk hstmt h2
+    subst hblk hstmt
+    let sym0 : SymState := {
+      locals := locals
+      loans := loans
+      nextLoan := nextLoan
+      hasActiveJoin := hasActiveJoin
+      block := 2
+      stmtIdx := 0
+    }
+    let locals1 := updateSymLocal locals 6 (some (.usize i))
+    let sym1 : SymState := { sym0 with locals := locals1, stmtIdx := 1 }
+    let locals2 := updateSymLocal (updateSymLocal locals1 6 none) 5 (some (.bool (decide (i < 1000))))
+    let sym2 : SymState := { sym0 with locals := locals2, stmtIdx := 2 }
+    have s1 : evalSymStep countUpBody sym0 = some (false, sym1) := by
+      change (match evalSymStmt sym0 (.assign ⟨6⟩ (.use (.copy ⟨2⟩))) with
+        | some sym' => some (false, sym')
+        | none => none) = _
+      dsimp [sym0, sym1, locals1, evalSymStmt, evalSymOperand]
+      rw [h2]
+    have s2 : evalSymStep countUpBody sym1 = some (false, sym2) := rfl
+    have s3 : evalBranchStep countUpBody sym2 =
+        some (decide (i < 1000),
+          { sym0 with locals := countUpLocalsAfterBb2 locals i, block := 5, stmtIdx := 0 },
+          { sym0 with locals := countUpLocalsAfterBb2 locals i, block := 3, stmtIdx := 0 }) :=
+      rfl
+    change evalSymState (.step (.step (.branch falsePlan truePlan))) countUpBody sym0 = _
+    rw [evalSymState_step_of_some s1, evalSymState_step_of_some s2, evalSymState_branch_of_some s3]
+
+theorem countUp_add_one_no_overflow {i : Nat} (hi : i < 1000) :
+    decide (usizeMax < i + 1) = false := by
+  apply decide_eq_false
+  have h1000 : 1000 ≤ usizeMax := by decide
+  exact Nat.not_lt.mpr (Nat.le_trans hi h1000)
+
+theorem evalSymState_countUp_bb3_bb4 {i n : Nat} {sym : SymState}
+    (hblk : sym.block = 3)
+    (hstmt : sym.stmtIdx = 0)
+    (h1 : sym.locals 1 = some (.usize n))
+    (h2 : sym.locals 2 = some (.usize i))
+    (hi : i < 1000)
+    (restPlan : TransPlan) :
+    ∃ sym',
+      CountUpLoopInv (i + 1) n sym' ∧
+      evalSymState (.step (.step (.step (.step restPlan)))) countUpBody sym =
+        evalSymState restPlan countUpBody sym' := by
+  cases sym with
+  | mk locals loans nextLoan hasActiveJoin block stmtIdx =>
+    dsimp at hblk hstmt h1 h2
+    subst hblk hstmt
+    have hov : decide (usizeMax < i + 1) = false := countUp_add_one_no_overflow hi
+    let sym0 : SymState := {
+      locals := locals
+      loans := loans
+      nextLoan := nextLoan
+      hasActiveJoin := hasActiveJoin
+      block := 3
+      stmtIdx := 0
+    }
+    let locals1 := updateSymLocal locals 7 (some (.tupleUsizeBool (i + 1) false))
+    let sym1 : SymState := { sym0 with locals := locals1, stmtIdx := 1 }
+    let sym2 : SymState := { sym0 with locals := locals1, block := 4, stmtIdx := 0 }
+    let locals2 := countUpLocalsAfterBb4 locals i
+    let sym3 : SymState := { sym0 with locals := locals2, block := 4, stmtIdx := 1 }
+    let sym4 : SymState := { sym0 with locals := locals2, block := 1, stmtIdx := 0 }
+    have s1 : evalSymStep countUpBody sym0 = some (false, sym1) := by
+      change (match evalSymStmt sym0 (.assign ⟨7⟩ (.checkedBinaryOp .add (.copy ⟨2⟩) (.constVal (.usize 1)))) with
+        | some sym' => some (false, sym')
+        | none => none) = _
+      dsimp [sym0, sym1, locals1, evalSymStmt, evalSymOperand,
+        evalSymConst, evalSymCheckedBinOp, updateSymLocal]
+      rw [h2]
+      dsimp [evalSymCheckedBinOp]
+      rw [hov]
+    have s2 : evalSymStep countUpBody sym1 = some (false, sym2) := rfl
+    have s3 : evalSymStep countUpBody sym2 = some (false, sym3) := rfl
+    have s4 : evalSymStep countUpBody sym3 = some (false, sym4) := rfl
+    refine ⟨sym4, ⟨rfl, rfl, h1, rfl⟩, ?_⟩
+    change evalSymState (.step (.step (.step (.step restPlan)))) countUpBody sym0 = _
+    rw [evalSymState_step_of_some s1, evalSymState_step_of_some s2,
+      evalSymState_step_of_some s3, evalSymState_step_of_some s4]
+
+/-- Inductive loop invariant proof for `countUpLoopPlan`: from any symbolic state
+    `sym` at `bb1` satisfying `CountUpLoopInv i n sym` with `i ≤ n`, `i ≤ 1000`,
+    and `n - i ≤ k`, `evalSymState (countUpLoopPlan (k + 1)) countUpBody sym`
+    evaluates to `.ok (.usize (if decide (n ≤ 1000) then n else 1000))`. -/
+theorem evalSymState_countUpLoopPlan :
+    ∀ (k i n : Nat) (sym : SymState),
+      CountUpLoopInv i n sym →
+      i ≤ n →
+      i ≤ 1000 →
+      n - i ≤ k →
+      evalSymState (countUpLoopPlan (k + 1)) countUpBody sym =
+        .ok (.usize (if decide (n ≤ 1000) then n else 1000))
+  | k, i, n, sym, hInv, hi_le_n, hi_le_1000, hsub_le_k => by
+    unfold countUpLoopPlan
+    rw [evalSymState_countUp_bb1 hInv]
+    cases h1 : decide (i < n) with
+    | false =>
+      dsimp
+      have hge : n ≤ i := Nat.not_lt.mp (of_decide_eq_false h1)
+      have hi_eq_n : i = n := Nat.le_antisymm hi_le_n hge
+      subst hi_eq_n
+      have hdec : decide (i ≤ 1000) = true := decide_eq_true hi_le_1000
+      rw [hdec]
+      dsimp
+      exact evalSymState_countUp_bb5 rfl rfl hInv.local2
+    | true =>
+      dsimp
+      have hilt : i < n := of_decide_eq_true h1
+      let symBb2 : SymState := {
+        sym with
+        locals := countUpLocalsAfterBb1 sym.locals i n
+        block := 2
+        stmtIdx := 0
+      }
+      have h2_bb2 : symBb2.locals 2 = some (.usize i) := hInv.local2
+      rw [evalSymState_countUp_bb2 (sym := symBb2) rfl rfl h2_bb2]
+      cases h2 : decide (i < 1000) with
+      | false =>
+        dsimp
+        have hge1000 : 1000 ≤ i := Nat.not_lt.mp (of_decide_eq_false h2)
+        have hi_eq_1000 : i = 1000 := Nat.le_antisymm hi_le_1000 hge1000
+        subst hi_eq_1000
+        have hnot_le : decide (n ≤ 1000) = false :=
+          decide_eq_false (Nat.not_le.mpr hilt)
+        rw [hnot_le]
+        dsimp
+        exact evalSymState_countUp_bb5 rfl rfl hInv.local2
+      | true =>
+        dsimp
+        have hi1000 : i < 1000 := of_decide_eq_true h2
+        cases k with
+        | zero =>
+          have hpos : 0 < n - i := Nat.sub_pos_of_lt hilt
+          exact False.elim (Nat.not_lt.mpr hsub_le_k hpos)
+        | succ k' =>
+          let symBb3 : SymState := {
+            symBb2 with
+            locals := countUpLocalsAfterBb2 symBb2.locals i
+            block := 3
+            stmtIdx := 0
+          }
+          have h1_bb3 : symBb3.locals 1 = some (.usize n) := hInv.local1
+          have h2_bb3 : symBb3.locals 2 = some (.usize i) := hInv.local2
+          have ⟨symNext, hInvNext, hStepEq⟩ :=
+            evalSymState_countUp_bb3_bb4 (sym := symBb3) rfl rfl h1_bb3 h2_bb3 hi1000
+              (countUpLoopPlan (k' + 1))
+          rw [hStepEq]
+          have hsub_le_k' : n - (i + 1) ≤ k' := by
+            have hle : n ≤ (k' + 1) + i := Nat.le_add_of_sub_le hsub_le_k
+            rw [Nat.add_right_comm k' 1 i] at hle
+            exact Nat.sub_le_of_le_add hle
+          exact evalSymState_countUpLoopPlan k' (i + 1) n symNext hInvNext
+            hilt hi1000 hsub_le_k'
+
+/-- `translatePureWith countUpSymPlan countUpBody [.usize n0]` evaluates to
+    `.ok (.usize (if decide (n0 ≤ 1000) then n0 else 1000))` for all `n0 : Nat`. -/
+theorem translatePureWith_countUp_eq (n0 : Nat) :
+    translatePureWith countUpSymPlan countUpBody [.usize n0] =
+      .ok (.usize (if decide (n0 ≤ 1000) then n0 else 1000)) := by
+  unfold translatePureWith translatePure countUpSymPlan
+  let sym0 := buildPureSymState [.usize n0]
+  let sym1 : SymState := {
+    sym0 with
+    locals := updateSymLocal sym0.locals 2 (some (.usize 0))
+    stmtIdx := 1
+  }
+  let sym2 : SymState := {
+    sym0 with
+    locals := updateSymLocal sym0.locals 2 (some (.usize 0))
+    block := 1
+    stmtIdx := 0
+  }
+  have s1 : evalSymStep countUpBody sym0 = some (false, sym1) := rfl
+  have s2 : evalSymStep countUpBody sym1 = some (false, sym2) := rfl
+  change evalSymState (.step (.step (countUpLoopPlan (n0 + 1)))) countUpBody sym0 = _
+  rw [evalSymState_step_of_some s1, evalSymState_step_of_some s2]
+  have hInv : CountUpLoopInv 0 n0 sym2 := ⟨rfl, rfl, rfl, rfl⟩
+  exact evalSymState_countUpLoopPlan n0 0 n0 sym2 hInv
+    (Nat.zero_le n0) (Nat.zero_le 1000)
+    (by rw [Nat.sub_zero]; exact Nat.le_refl n0)
+
+/-- Concrete `rfl` sanity checks on `translatePureWith countUpSymPlan countUpBody`. -/
+theorem translatePureWith_countUp_zero :
+    translatePureWith countUpSymPlan countUpBody [.usize 0] = .ok (.usize 0) :=
+  rfl
+
+theorem translatePureWith_countUp_five :
+    translatePureWith countUpSymPlan countUpBody [.usize 5] = .ok (.usize 5) :=
+  rfl
+
+/-- Pure functional model of `count_up`. -/
+def pureCountUp (n0 : Nat) : Nat :=
+  if decide (n0 ≤ 1000) then n0 else 1000
+
+/-- Non-trivial property 1 (**Upper bound**): `pureCountUp n0 ≤ 1000`. -/
+theorem pureCountUp_le_1000 (n0 : Nat) :
+    pureCountUp n0 ≤ 1000 := by
+  unfold pureCountUp
+  cases h : decide (n0 ≤ 1000) with
+  | false => exact Nat.le_refl 1000
+  | true => exact of_decide_eq_true h
+
+/-- Non-trivial property 2 (**Contraction**): `pureCountUp n0 ≤ n0`. -/
+theorem pureCountUp_le_self (n0 : Nat) :
+    pureCountUp n0 ≤ n0 := by
+  unfold pureCountUp
+  cases h : decide (n0 ≤ 1000) with
+  | false =>
+    exact Nat.le_of_lt (Nat.not_le.mp (of_decide_eq_false h))
+  | true =>
+    exact Nat.le_refl n0
+
+/-- Non-trivial property 3 (**Idempotence**): `pureCountUp (pureCountUp n0) = pureCountUp n0`. -/
+theorem pureCountUp_idempotent (n0 : Nat) :
+    pureCountUp (pureCountUp n0) = pureCountUp n0 := by
+  have hle : pureCountUp n0 ≤ 1000 := pureCountUp_le_1000 n0
+  unfold pureCountUp at *
+  have hdec : decide ((if decide (n0 ≤ 1000) then n0 else 1000) ≤ 1000) = true :=
+    decide_eq_true hle
+  rw [hdec]
+  rfl
+
+/-- Non-trivial property 4 (**Monotonicity**): `a ≤ b → pureCountUp a ≤ pureCountUp b`. -/
+theorem pureCountUp_mono {a b : Nat} (hab : a ≤ b) :
+    pureCountUp a ≤ pureCountUp b := by
+  unfold pureCountUp
+  cases ha : decide (a ≤ 1000) <;> cases hb : decide (b ≤ 1000) <;> dsimp
+  · exact Nat.le_refl 1000
+  · exact Nat.le_trans (Nat.le_of_lt (Nat.not_le.mp (of_decide_eq_false ha))) hab
+  · exact of_decide_eq_true ha
+  · exact hab
+
+/-- `evalSymWith countUpSymPlan countUpBody` refines `EnsuresCountUp` under `π_func`. -/
+theorem countUp_func_refines_ensures :
+    π_func (FuncLang.sem (evalSymWith countUpSymPlan countUpBody)) ≤ EnsuresCountUp := by
+  intro q _
+  have hSupp : allSupportedArgTys countUpBody.argTys = true := rfl
+  refine ⟨?_, ?_⟩
+  · unfold π_func FuncLang evalSymWith
+    dsimp
+    rw [hSupp]
+    dsimp
+    cases hExt : extractSymArgs countUpBody.argTys q.init with
+    | none => intro h; cases h
+    | some args =>
+      dsimp
+      unfold extractSymArgs at hExt
+      cases hblk : (q.init.block == 0 && q.init.stmtIdx == 0) with
+      | false => rw [hblk] at hExt; cases hExt
+      | true =>
+        rw [hblk] at hExt
+        dsimp [countUpBody, extractSymArgsAux] at hExt
+        cases h1 : q.init.locals 1 with
+        | none => rw [h1] at hExt; cases hExt
+        | some v1 =>
+          rw [h1] at hExt
+          cases v1 with
+          | bool _ | unit | tupleUsizeBool _ _ | atomicLoc _ | refSharedLoc _ | refMutLoc _ | ordering _ => cases hExt
+          | usize n0 =>
+            dsimp at hExt
+            injection hExt with hargs
+            subst hargs
+            rw [translatePureWith_countUp_eq n0]
+            intro h; cases h
+  · intro out ⟨_, hOutProp⟩ ret n0 hout h1
+    have hPost : evalSymWith countUpSymPlan countUpBody q.init = .ok ret := hOutProp ret hout
+    unfold evalSymWith at hPost
+    rw [hSupp] at hPost
+    dsimp at hPost
+    cases hExt : extractSymArgs countUpBody.argTys q.init with
+    | none => rw [hExt] at hPost; cases hPost
+    | some args =>
+      rw [hExt] at hPost
+      dsimp at hPost
+      unfold extractSymArgs at hExt
+      cases hblk : (q.init.block == 0 && q.init.stmtIdx == 0) with
+      | false => rw [hblk] at hExt; cases hExt
+      | true =>
+        rw [hblk] at hExt
+        dsimp [countUpBody, extractSymArgsAux] at hExt
+        rw [h1] at hExt
+        dsimp at hExt
+        injection hExt with hargs
+        subst hargs
+        rw [translatePureWith_countUp_eq n0] at hPost
+        injection hPost with hret
+        exact hret.symm
+
+/-- `countUpBody` satisfies `EnsuresCountUp`, proved by composing
+    `evalSymWith_sound countUpSymPlan countUpBody` with
+    `countUp_func_refines_ensures`. -/
+theorem countUpBody_satisfies_ensures :
+    MirLang.sem countUpBody ≤ EnsuresCountUp :=
+  Preorder.le_trans
+    (evalSymWith_sound countUpSymPlan countUpBody)
+    countUp_func_refines_ensures
+
+theorem ensuresCountUp_le_wellFormed :
+    EnsuresCountUp ≤ MirLang.WellFormed :=
+  fun _ h => ⟨h, fun _ _ => True.intro⟩
+
+/-- `countUpBody` satisfies `MirLang.WellFormed`. -/
+theorem countUpBody_satisfies_wellFormed :
+    MirLang.sem countUpBody ≤ MirLang.WellFormed :=
+  Preorder.le_trans countUpBody_satisfies_ensures ensuresCountUp_le_wellFormed
+
+/-- End-to-end `CrateTheorem` witness for `count_up` with `EnsuresCountUp`. -/
+theorem prove_count_up_ensures_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := countUpBody
+        specs := [EnsuresCountUp]
+      }]
+      tcb := [.rustcLowering fnName countUpBody]
+    } :=
+  verify_single_fn_crate
+    fnName
+    countUpBody
+    EnsuresCountUp
+    countUpBody_satisfies_ensures
+    ensuresCountUp_le_wellFormed
+
+/-- End-to-end `CrateTheorem` witness for `count_up` with baseline `WellFormed`. -/
+theorem prove_count_up_wf_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := countUpBody
+        specs := []
+      }]
+      tcb := [.rustcLowering fnName countUpBody]
+    } :=
+  verify_single_fn_wf_crate fnName countUpBody countUpBody_satisfies_wellFormed
+
 end Anneal
