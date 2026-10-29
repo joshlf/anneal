@@ -419,3 +419,81 @@ fn rejects_incorrect_update_min_implementation() {
         "expected Lean audit rejection for wrong update_min body, got: {err}"
     );
 }
+
+#[test]
+fn verifies_clamp_assign_end_to_end() {
+    let crate_dir = TempCrateDir::new(
+        "valid-clamp-assign",
+        "// anneal:spec ensures(clamp_assign(x, lo, hi))\n\
+         pub fn clamp_assign(x: &mut usize, lo: usize, hi: usize) -> usize {\n    \
+             if *x < lo {\n        \
+                 *x = lo;\n    \
+             } else if *x > hi {\n        \
+                 *x = hi;\n    \
+             }\n    \
+             *x\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "clamp_assign");
+}
+
+#[test]
+fn rejects_incorrect_clamp_assign_implementation() {
+    let crate_dir = TempCrateDir::new(
+        "wrong-clamp-assign",
+        "// anneal:spec ensures(clamp_assign(x, lo, hi))\n\
+         pub fn clamp_assign(x: &mut usize, lo: usize, hi: usize) -> usize {\n    \
+             if *x <= lo {\n        \
+                 *x = lo;\n    \
+             } else if *x > hi {\n        \
+                 *x = hi;\n    \
+             }\n    \
+             *x\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean audit rejection for wrong clamp_assign body, got: {err}"
+    );
+}
+
+#[test]
+fn verifies_is_aligned_mask_end_to_end() {
+    let crate_dir = TempCrateDir::new(
+        "valid-is-aligned-mask",
+        "// anneal:spec ensures(is_aligned_mask(addr, mask))\n\
+         pub fn is_aligned_mask(addr: usize, mask: usize) -> bool {\n    \
+             (addr & mask) == 0\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "is_aligned_mask");
+}
+
+#[test]
+fn rejects_incorrect_is_aligned_mask_implementation() {
+    let crate_dir = TempCrateDir::new(
+        "wrong-is-aligned-mask",
+        "// anneal:spec ensures(is_aligned_mask(addr, mask))\n\
+         pub fn is_aligned_mask(addr: usize, mask: usize) -> bool {\n    \
+             (addr | mask) == 0\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean audit rejection for wrong is_aligned_mask body, got: {err}"
+    );
+}

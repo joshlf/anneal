@@ -108,6 +108,48 @@ pub fn render_proof_lean(functions: &[CapturedFunction]) -> String {
                 ),
             }
         }
+        [func]
+            if func.arg_tys
+                == [
+                    CapturedTy::RefMutUsize,
+                    CapturedTy::Usize,
+                    CapturedTy::Usize,
+                ] =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresClampAssign => format!(
+                    "Anneal.prove_clamp_assign_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_clamp_assign_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_clamp_assign_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [func]
+            if func.arg_tys == [CapturedTy::Usize, CapturedTy::Usize]
+                && func.ret_ty == CapturedTy::Bool =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresIsAlignedMask => format!(
+                    "Anneal.prove_is_aligned_mask_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_is_aligned_mask_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_is_aligned_mask_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
         [func] => {
             let uses_move = func.blocks.first().is_some_and(|b| {
                 b.stmts.iter().any(|s| {
