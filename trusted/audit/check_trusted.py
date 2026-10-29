@@ -31,9 +31,13 @@ MAX_BYTES = 512 * 1024 * 1024
 # Each entry is (module_name, relative_path, direct_imports, role)
 # where role is "theory", "examples", "claim", or "test".
 DOWNSTREAM_TARGETS = [
-    ("Anneal", "theory/Anneal.lean", ["Trusted"], "theory"),
+    ("Anneal.Refinement", "theory/Anneal/Refinement.lean", ["Trusted"], "theory"),
+    ("Anneal", "theory/Anneal.lean", ["Trusted", "Anneal.Refinement"], "theory"),
     ("Smoke", "examples/Smoke.lean", ["Anneal"], "examples"),
+    ("ToyYDiagram", "examples/refinement/ToyYDiagram.lean", ["Anneal.Refinement"], "examples"),
     ("SmokeTest", "tests/Smoke.lean", ["Anneal"], "claim"),
+    ("AxiomaticYDiagram", "tests/refinement/AxiomaticYDiagram.lean", ["Anneal.Refinement"], "test"),
+    ("ConcreteYDiagram", "tests/refinement/ConcreteYDiagram.lean", ["Anneal.Refinement", "ToyYDiagram"], "test"),
 ]
 
 
