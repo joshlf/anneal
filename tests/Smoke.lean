@@ -62,6 +62,84 @@ def loadRelaxedCrate : Trusted.Crate where
 theorem verify_load_relaxed_crate : Trusted.CrateTheorem loadRelaxedCrate :=
   Anneal.prove_load_relaxed_ensures_crate "load_relaxed"
 
+/-- Captured `MirBody` for
+    `pub fn max_assign(x: &mut usize, y: usize) -> usize { if *x < y { *x = y; } *x }`
+    defined using only `Trusted.*` constructors (`ci.type` origin-clean). -/
+def maxAssignBody : Trusted.MirBody where
+  argTys := [.refMutUsize, .usize]
+  retTy := .usize
+  localCount := 5
+  blocks := [
+    { stmts := [
+        .assign ⟨4⟩ (.deref ⟨1⟩),
+        .assign ⟨3⟩ (.binaryOp .lt (.move ⟨4⟩) (.copy ⟨2⟩))
+      ]
+      terminator := .switchInt (.move ⟨3⟩) ⟨2⟩ ⟨1⟩ },
+    { stmts := [.assignDeref ⟨1⟩ (.copy ⟨2⟩)]
+      terminator := .goto ⟨2⟩ },
+    { stmts := [.assign ⟨0⟩ (.deref ⟨1⟩)]
+      terminator := .return_ }
+  ]
+
+/-- Captured `Trusted.Crate` for `max_assign` with postcondition
+    `Trusted.EnsuresMaxAssign`. -/
+def maxAssignCrate : Trusted.Crate where
+  functions := [
+    { name := "max_assign"
+      prog := maxAssignBody
+      specs := [Trusted.EnsuresMaxAssign] }
+  ]
+  tcb := [Trusted.TCBItem.rustcLowering "max_assign" maxAssignBody]
+
+/-- Top-level `Trusted.CrateTheorem` for `maxAssignCrate`, whose statement
+    (`ci.type`) references only `Trusted` and locked foundation constants while
+    its proof term (`ci.value?`) discharges the obligation via the plan-guided
+    functional translation (`Anneal.prove_max_assign_ensures_crate`). -/
+theorem verify_max_assign_crate : Trusted.CrateTheorem maxAssignCrate :=
+  Anneal.prove_max_assign_ensures_crate "max_assign"
+
+/-- Captured `MirBody` for
+    `pub fn update_min(x: &mut usize, y: &mut usize, v: usize) -> usize { let r = if *x <= *y { &mut *x } else { &mut *y }; *r = v; *x }`
+    defined using only `Trusted.*` constructors (`ci.type` origin-clean). -/
+def updateMinBody : Trusted.MirBody where
+  argTys := [.refMutUsize, .refMutUsize, .usize]
+  retTy := .usize
+  localCount := 8
+  blocks := [
+    { stmts := [
+        .assign ⟨6⟩ (.deref ⟨1⟩),
+        .assign ⟨7⟩ (.deref ⟨2⟩),
+        .assign ⟨5⟩ (.binaryOp .le (.move ⟨6⟩) (.move ⟨7⟩))
+      ]
+      terminator := .switchInt (.move ⟨5⟩) ⟨2⟩ ⟨1⟩ },
+    { stmts := [.assign ⟨4⟩ (.use (.copy ⟨1⟩))]
+      terminator := .goto ⟨3⟩ },
+    { stmts := [.assign ⟨4⟩ (.use (.copy ⟨2⟩))]
+      terminator := .goto ⟨3⟩ },
+    { stmts := [
+        .assignDeref ⟨4⟩ (.copy ⟨3⟩),
+        .assign ⟨0⟩ (.deref ⟨1⟩)
+      ]
+      terminator := .return_ }
+  ]
+
+/-- Captured `Trusted.Crate` for `update_min` with postcondition
+    `Trusted.EnsuresUpdateMin`. -/
+def updateMinCrate : Trusted.Crate where
+  functions := [
+    { name := "update_min"
+      prog := updateMinBody
+      specs := [Trusted.EnsuresUpdateMin] }
+  ]
+  tcb := [Trusted.TCBItem.rustcLowering "update_min" updateMinBody]
+
+/-- Top-level `Trusted.CrateTheorem` for `updateMinCrate`, whose statement
+    (`ci.type`) references only `Trusted` and locked foundation constants while
+    its proof term (`ci.value?`) discharges the obligation via the plan-guided
+    functional translation (`Anneal.prove_update_min_ensures_crate`). -/
+theorem verify_update_min_crate : Trusted.CrateTheorem updateMinCrate :=
+  Anneal.prove_update_min_ensures_crate "update_min"
+
 /-!
 ## Non-Step-Based Axiomatic Event-Graph Toy Language
 
