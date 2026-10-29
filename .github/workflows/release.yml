@@ -1,0 +1,411 @@
+# Copyright 2026 The Fuchsia Authors
+#
+# Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+# <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+# license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+# This file may not be copied, modified, or distributed except according to
+# those terms.
+
+name: Anneal Release
+
+'on':
+  push:
+    branches:
+      - main
+    paths:
+      - 'trusted/cargo-anneal/Cargo.toml'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'cargo-anneal version to release'
+        required: true
+      branch:
+        description: 'Branch to update'
+        required: true
+        default: 'main'
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  check-version:
+    name: Check if version was updated
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    if: github.repository == 'joshlf/anneal' && github.event_name != 'workflow_dispatch'
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Determine if version was updated
+        id: check
+        run: |
+          set -eo pipefail
+          CUR_VER=$(cargo metadata -q --format-version 1 | jq -r '.packages[] | select(.name == "cargo-anneal").version')
+
+          git checkout -q HEAD^
+          PREV_VER=$(cargo metadata -q --format-version 1 | jq -r '.packages[] | select(.name == "cargo-anneal").version')
+          git checkout -q -
+
+          if [ "$CUR_VER" != "$PREV_VER" ]; then
+            echo "Version change detected: $PREV_VER -> $CUR_VER"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "version=$CUR_VER" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version unchanged ($CUR_VER)."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    name: Release to crates.io and GitHub
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true' && github.event_name != 'pull_request' && github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Smoke-test remote exocrate toolchain installation
+        env:
+          __ANNEAL_LOCAL_DEV: "1"
+        run: |
+          set -eo pipefail
+          cargo run --locked -p cargo-anneal -- setup
+          cargo test --workspace --locked
+
+      - name: Authenticate with crates.io
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+
+      - name: Publish cargo-anneal
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -eo pipefail
+          cargo publish -p cargo-anneal --registry crates-io
+
+      - name: Create git tag
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eo pipefail
+          TAG="v$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" "$TAG"
+
+      - name: Create GitHub Release
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eo pipefail
+          TAG="v$VERSION"
+          gh release create "$TAG" --generate-notes
+
+  prepare-release-source:
+    name: Prepare release source patch
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      base_sha: ${{ steps.prepare.outputs.base_sha }}
+      short_base_sha: ${{ steps.prepare.outputs.short_base_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.branch }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Prepare version bump patch
+        id: prepare
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -eo pipefail
+          BASE_SHA="$(git rev-parse HEAD)"
+          SHORT_BASE_SHA="${BASE_SHA:0:12}"
+
+          ./ci/release_version.sh "$VERSION"
+
+          python3 ci/check_release_pr_files.py \
+            --context "Release version bump" \
+            --include-untracked \
+            --allowed Cargo.lock \
+            --allowed trusted/cargo-anneal/Cargo.toml \
+            --required trusted/cargo-anneal/Cargo.toml
+
+          git diff --binary > anneal-release-source.patch
+          if [ ! -s anneal-release-source.patch ]; then
+            echo "::error::Release version bump produced an empty patch."
+            exit 1
+          fi
+
+          echo "base_sha=${BASE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "short_base_sha=${SHORT_BASE_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release source patch
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: anneal-release-source-patch
+          path: anneal-release-source.patch
+          if-no-files-found: error
+          retention-days: 1
+
+  create-release:
+    name: Create toolchain artifact release
+    needs: prepare-release-source
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag_name: ${{ steps.tag.outputs.tag_name }}
+    steps:
+      - name: Create Release
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.event.inputs.version }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          BASE_SHA: ${{ needs.prepare-release-source.outputs.base_sha }}
+          SHORT_BASE_SHA: ${{ needs.prepare-release-source.outputs.short_base_sha }}
+        run: |
+          set -eo pipefail
+          TAG_NAME="anneal-toolchains-v${VERSION}-${GITHUB_RUN_ID}-${SHORT_BASE_SHA}"
+          gh release create "$TAG_NAME" \
+            --repo "$GH_REPO" \
+            --target "$BASE_SHA" \
+            --title "$TAG_NAME" \
+            --notes "Machine-generated Anneal toolchain artifacts for cargo-anneal ${VERSION}, built from ${BASE_SHA} after applying the generated release version-bump patch." \
+            --draft \
+            --prerelease \
+            --latest=false
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+  publish-artifacts:
+    name: Publish toolchain artifact (${{ matrix.target }})
+    needs: [prepare-release-source, create-release]
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      actions: read
+      contents: write
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+            nix_system: x86_64-linux
+            cargo_os: linux
+            cargo_arch: x86_64
+          - os: ubuntu-24.04-arm
+            target: linux-aarch64
+            nix_system: aarch64-linux
+            cargo_os: linux
+            cargo_arch: aarch64
+          - os: macos-15
+            target: macos-x86_64
+            nix_system: x86_64-darwin
+            cargo_os: macos
+            cargo_arch: x86_64
+          - os: macos-15
+            target: macos-aarch64
+            nix_system: aarch64-darwin
+            cargo_os: macos
+            cargo_arch: aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare-release-source.outputs.base_sha }}
+          persist-credentials: false
+
+      - name: Download release source patch
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: anneal-release-source-patch
+          path: .
+
+      - name: Apply release source patch
+        run: |
+          set -eo pipefail
+          git apply --check anneal-release-source.patch
+          git apply anneal-release-source.patch
+
+      - name: Free up disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/share/boost
+
+      - name: Install Rosetta for Intel macOS builds
+        if: matrix.nix_system == 'x86_64-darwin'
+        run: sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@e847f25223456b3058e12f7fc9d777b6a6f25060 # v3.23.2
+
+      - name: Enable unprivileged user namespaces (Ubuntu 24.04)
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Build and publish toolchain artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.create-release.outputs.tag_name }}
+          TARGET: ${{ matrix.target }}
+          NIX_SYSTEM: ${{ matrix.nix_system }}
+          CARGO_OS: ${{ matrix.cargo_os }}
+          CARGO_ARCH: ${{ matrix.cargo_arch }}
+        run: |
+          set -eo pipefail
+          ARCHIVE_NAME="anneal-toolchain-${TARGET}.tar.zst"
+          MAX_GITHUB_RELEASE_ASSET_SIZE=2147483647
+          mkdir -p target/release-download-check target/release-metadata
+
+          nix build .#omnibus-archive-layout-check --system "$NIX_SYSTEM" --no-link
+          nix build .#omnibus-archive-ci --system "$NIX_SYSTEM" --out-link "target/link-${ARCHIVE_NAME}"
+          cp -f "$(readlink -f "target/link-${ARCHIVE_NAME}")" "target/${ARCHIVE_NAME}"
+          rm -f "target/link-${ARCHIVE_NAME}"
+          ARCHIVE_SIZE="$(python3 -c 'import os, sys; print(os.path.getsize(sys.argv[1]))' "target/${ARCHIVE_NAME}")"
+          printf 'Built %s (%s bytes)\n' "$ARCHIVE_NAME" "$ARCHIVE_SIZE"
+          if [ "$ARCHIVE_SIZE" -gt "$MAX_GITHUB_RELEASE_ASSET_SIZE" ]; then
+            echo "::error::${ARCHIVE_NAME} is ${ARCHIVE_SIZE} bytes, which exceeds GitHub's ${MAX_GITHUB_RELEASE_ASSET_SIZE}-byte release asset limit."
+            exit 1
+          fi
+
+          gh release upload "$TAG_NAME" "target/${ARCHIVE_NAME}" --repo "$GH_REPO" --clobber
+          gh release download "$TAG_NAME" \
+            --repo "$GH_REPO" \
+            --pattern "$ARCHIVE_NAME" \
+            --dir target/release-download-check \
+            --clobber
+          cmp "target/${ARCHIVE_NAME}" "target/release-download-check/${ARCHIVE_NAME}"
+
+          url="https://github.com/${GH_REPO}/releases/download/${TAG_NAME}/${ARCHIVE_NAME}"
+          python3 ci/collect_release_archive_metadata.py \
+            --archive "target/release-download-check/${ARCHIVE_NAME}" \
+            --target "$TARGET" \
+            --os "$CARGO_OS" \
+            --arch "$CARGO_ARCH" \
+            --url "$url" \
+            --out "target/release-metadata/${TARGET}.json"
+
+      - name: Restore AppArmor restriction
+        if: always() && runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+
+      - name: Upload toolchain metadata
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: anneal-toolchain-metadata-${{ matrix.target }}
+          path: target/release-metadata/${{ matrix.target }}.json
+          if-no-files-found: error
+          retention-days: 1
+
+  release-version-action:
+    name: Open Anneal release PR
+    needs: [prepare-release-source, create-release, publish-artifacts]
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare-release-source.outputs.base_sha }}
+          persist-credentials: false
+
+      - name: Download release source patch
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: anneal-release-source-patch
+          path: .
+
+      - name: Apply release source patch
+        run: |
+          set -eo pipefail
+          git apply --check anneal-release-source.patch
+          git apply anneal-release-source.patch
+
+      - name: Download toolchain metadata
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: anneal-toolchain-metadata-*
+          path: target/release-metadata
+          merge-multiple: true
+
+      - name: Update exocrate metadata and verify packaging
+        env:
+          TAG_NAME: ${{ needs.create-release.outputs.tag_name }}
+        run: |
+          set -eo pipefail
+          python3 ci/update_exocrate_metadata.py \
+            --cargo-toml trusted/cargo-anneal/Cargo.toml \
+            --metadata-dir target/release-metadata \
+            --expected-release-tag "$TAG_NAME" \
+            --require-all
+
+          rm -f anneal-release-source.patch
+          rm -rf target/release-metadata
+
+          python3 ci/check_release_pr_files.py \
+            --context "Release workflow" \
+            --include-untracked \
+            --allowed Cargo.lock \
+            --allowed trusted/cargo-anneal/Cargo.toml \
+            --required trusted/cargo-anneal/Cargo.toml
+
+          cargo publish --dry-run -p cargo-anneal --allow-dirty
+
+      - name: Create release pull request
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          commit-message: "Release cargo-anneal ${{ github.event.inputs.version }}"
+          title: "Release cargo-anneal ${{ github.event.inputs.version }}"
+          base: ${{ github.event.inputs.branch }}
+          branch: anneal-release-${{ github.event.inputs.version }}
+          add-paths: |
+            Cargo.lock
+            trusted/cargo-anneal/Cargo.toml
+          token: ${{ github.token }}
+
+      - name: Publish toolchain artifact release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.create-release.outputs.tag_name }}
+        run: |
+          set -eo pipefail
+          gh release edit "$TAG_NAME" --repo "$GH_REPO" --draft=false
