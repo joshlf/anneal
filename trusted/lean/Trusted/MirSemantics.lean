@@ -421,6 +421,45 @@ def EnsuresAtomicLoad (argLocal : Nat) : MirLang.Behavior :=
         msg ∈ q.init.mem.visibleAtomicMsgs loc ∧
         ret = .usize msg.bits)
 
+/-- Postcondition specification for `pub fn max_assign(x: &mut usize, y: usize)
+    -> usize`:
+    - `defined := True`: every finite execution prefix is free of UB and stuck
+      states (`MirLang.WellFormed`), and
+    - `val`: for any initial state where `_1` points to non-atomic location
+      `loc` holding `.usize x0` and `_2` holds `.usize y0`, any normal return
+      value `ret` equals `.usize (if decide (x0 < y0) then y0 else x0)`. -/
+@[candidate mir_semantics]
+def EnsuresMaxAssign : MirLang.Behavior :=
+  MirLang.Spec (fun q out =>
+    ∀ ret loc x0 y0,
+      out.outcome = .terminated (.normal ret) →
+      q.init.locals 1 = some (.refMutLoc loc) →
+      q.init.mem.naVal loc = some (.usize x0) →
+      q.init.locals 2 = some (.usize y0) →
+      ret = .usize (if decide (x0 < y0) then y0 else x0))
+
+/-- Postcondition specification for
+    `pub fn update_min(x: &mut usize, y: &mut usize, v: usize) -> usize`:
+    - `defined := True`: every finite execution prefix is free of UB and stuck
+      states (`MirLang.WellFormed`), and
+    - `val`: for any initial state where `_1` points to non-atomic location
+      `locX` holding `.usize x0`, `_2` points to non-atomic location `locY`
+      holding `.usize y0`, and `_3` holds `.usize v0`, any normal return value
+      `ret` (which reads `*x` after mutating the conditionally borrowed minimum
+      reference `r = if *x <= *y { &mut *x } else { &mut *y }` to `v`) equals
+      `.usize (if decide (x0 ≤ y0) then v0 else x0)`. -/
+@[candidate mir_semantics]
+def EnsuresUpdateMin : MirLang.Behavior :=
+  MirLang.Spec (fun q out =>
+    ∀ ret locX locY x0 y0 v0,
+      out.outcome = .terminated (.normal ret) →
+      q.init.locals 1 = some (.refMutLoc locX) →
+      q.init.mem.naVal locX = some (.usize x0) →
+      q.init.locals 2 = some (.refMutLoc locY) →
+      q.init.mem.naVal locY = some (.usize y0) →
+      q.init.locals 3 = some (.usize v0) →
+      ret = .usize (if decide (x0 ≤ y0) then v0 else x0))
+
 /-- Abstract type of compiled target artifacts produced by `rustc`. -/
 @[candidate mir_semantics]
 structure TargetArtifact where
