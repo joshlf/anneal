@@ -111,16 +111,21 @@ impl CapturedTy {
     }
 }
 
-/// Captured MIR binary comparison operator (`Lt`, `Le`, `Eq`).
+/// Captured MIR binary comparison or bitwise operator (`Lt`, `Le`, `Eq`, `Ne`,
+/// `Gt`, `Ge`, `BitAnd`, `BitOr`, `BitXor`).
 ///
 /// Corresponds to `Trusted.BinOp` in `trusted/lean/Trusted/MirAst.lean` and
-/// `rustc_middle::mir::BinOp` (`BinOp::Lt`, `BinOp::Le`, `BinOp::Eq`):
+/// `rustc_middle::mir::BinOp`:
 ///
 /// > "The `<` operator (less than)"
-/// >
 /// > "The `<=` operator (less than or equal to)"
-/// >
 /// > "The `==` operator (equality)"
+/// > "The `!=` operator (not equal to)"
+/// > "The `>=` operator (greater than or equal to)"
+/// > "The `>` operator (greater than)"
+/// > "The `^` operator (bitwise xor)"
+/// > "The `&` operator (bitwise and)"
+/// > "The `|` operator (bitwise or)"
 ///
 /// Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L1409-L1443
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +133,12 @@ pub enum CapturedBinOp {
     Lt,
     Le,
     Eq,
+    Ne,
+    Gt,
+    Ge,
+    BitAnd,
+    BitOr,
+    BitXor,
 }
 
 impl CapturedBinOp {
@@ -136,6 +147,12 @@ impl CapturedBinOp {
             Self::Lt => "Trusted.BinOp.lt",
             Self::Le => "Trusted.BinOp.le",
             Self::Eq => "Trusted.BinOp.eq",
+            Self::Ne => "Trusted.BinOp.ne",
+            Self::Gt => "Trusted.BinOp.gt",
+            Self::Ge => "Trusted.BinOp.ge",
+            Self::BitAnd => "Trusted.BinOp.bitAnd",
+            Self::BitOr => "Trusted.BinOp.bitOr",
+            Self::BitXor => "Trusted.BinOp.bitXor",
         }
     }
 }
@@ -351,6 +368,12 @@ pub enum CapturedSpec {
     /// Functional specification for `update_min(x, y, v)`
     /// (`specs := [Trusted.EnsuresUpdateMin]`).
     EnsuresUpdateMin,
+    /// Functional specification for `clamp_assign(x, lo, hi)`
+    /// (`specs := [Trusted.EnsuresClampAssign]`).
+    EnsuresClampAssign,
+    /// Functional specification for `is_aligned_mask(addr, mask)`
+    /// (`specs := [Trusted.EnsuresIsAlignedMask]`).
+    EnsuresIsAlignedMask,
 }
 
 impl CapturedSpec {
@@ -365,6 +388,12 @@ impl CapturedSpec {
             }
             Self::EnsuresMaxAssign => "[Trusted.EnsuresMaxAssign]".to_string(),
             Self::EnsuresUpdateMin => "[Trusted.EnsuresUpdateMin]".to_string(),
+            Self::EnsuresClampAssign => {
+                "[Trusted.EnsuresClampAssign]".to_string()
+            }
+            Self::EnsuresIsAlignedMask => {
+                "[Trusted.EnsuresIsAlignedMask]".to_string()
+            }
         }
     }
 }
@@ -496,6 +525,12 @@ fn parse_source_spec(src: &str) -> Result<CapturedSpec, CaptureError> {
                 "ensures(atomic_load(a))" => CapturedSpec::EnsuresAtomicLoad(1),
                 "ensures(max_assign(x, y))" => CapturedSpec::EnsuresMaxAssign,
                 "ensures(update_min(x, y, v))" => CapturedSpec::EnsuresUpdateMin,
+                "ensures(clamp_assign(x, lo, hi))" => {
+                    CapturedSpec::EnsuresClampAssign
+                }
+                "ensures(is_aligned_mask(addr, mask))" => {
+                    CapturedSpec::EnsuresIsAlignedMask
+                }
                 "well_formed" => CapturedSpec::WellFormed,
                 other => {
                     return Err(CaptureError::UnsupportedMir(format!(
@@ -928,6 +963,18 @@ fn parse_binop_rvalue(
         (CapturedBinOp::Le, r)
     } else if let Some(r) = rhs.strip_prefix("Eq(") {
         (CapturedBinOp::Eq, r)
+    } else if let Some(r) = rhs.strip_prefix("Ne(") {
+        (CapturedBinOp::Ne, r)
+    } else if let Some(r) = rhs.strip_prefix("Gt(") {
+        (CapturedBinOp::Gt, r)
+    } else if let Some(r) = rhs.strip_prefix("Ge(") {
+        (CapturedBinOp::Ge, r)
+    } else if let Some(r) = rhs.strip_prefix("BitAnd(") {
+        (CapturedBinOp::BitAnd, r)
+    } else if let Some(r) = rhs.strip_prefix("BitOr(") {
+        (CapturedBinOp::BitOr, r)
+    } else if let Some(r) = rhs.strip_prefix("BitXor(") {
+        (CapturedBinOp::BitXor, r)
     } else {
         return Ok(None);
     };
