@@ -333,3 +333,59 @@ fn verifies_via_cli_flag_and_emits_candidate_tcb_audit_section() {
     assert!(stdout.contains("rustc_capture"));
     assert!(stdout.contains("mir_semantics"));
 }
+
+#[test]
+fn verifies_annotated_pub_fn_load_relaxed() {
+    let crate_dir = TempCrateDir::new(
+        "annotated-load-relaxed",
+        "use core::sync::atomic::{AtomicUsize, Ordering};\n\n\
+         // anneal:spec ensures(atomic_load(a))\n\
+         pub fn load_relaxed(a: &AtomicUsize) -> usize {\n    \
+             a.load(Ordering::Relaxed)\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "load_relaxed");
+
+    let mir_lean = fs::read_to_string(&output.mir_lean_path).unwrap();
+    assert!(mir_lean.contains("Trusted.EnsuresAtomicLoad 1"));
+    assert!(mir_lean.contains("Trusted.Terminator.callAtomicLoad"));
+}
+
+#[test]
+fn verifies_unannotated_pub_fn_load_relaxed_well_formedness() {
+    let crate_dir = TempCrateDir::new(
+        "unannotated-load-relaxed",
+        "use core::sync::atomic::{AtomicUsize, Ordering};\n\n\
+         pub fn load_relaxed(a: &AtomicUsize) -> usize {\n    \
+             a.load(Ordering::Relaxed)\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "load_relaxed");
+}
+
+#[test]
+fn rejects_incorrect_load_relaxed_implementation() {
+    let crate_dir = TempCrateDir::new(
+        "wrong-load-relaxed",
+        "use core::sync::atomic::AtomicUsize;\n\n\
+         // anneal:spec ensures(atomic_load(a))\n\
+         pub fn load_relaxed(_a: &AtomicUsize) -> usize {\n    \
+             0\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean audit rejection for false atomic load spec, got: {err}"
+    );
+}
