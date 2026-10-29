@@ -259,6 +259,11 @@ theorem ensuresEqArg_le_wellFormed (argLocal : Nat) :
     EnsuresEqArg argLocal ≤ MirLang.WellFormed :=
   spec_le_wellFormed _
 
+/-- Postcondition `EnsuresAtomicLoad argLocal` refines `MirLang.WellFormed`. -/
+theorem ensuresAtomicLoad_le_wellFormed (argLocal : Nat) :
+    EnsuresAtomicLoad argLocal ≤ MirLang.WellFormed :=
+  spec_le_wellFormed _
+
 /-- Canonical `Runtime(PostCleanup)` MIR body for `pub fn id(x: usize) -> usize
     { x }`
     using `Operand.copy`:
@@ -509,6 +514,217 @@ theorem idMoveBody_satisfies_wellFormed :
     MirSem idMoveBody ≤ MirLang.WellFormed :=
   Preorder.le_trans idMoveBody_satisfies_ensures (ensuresEqArg_le_wellFormed 1)
 
+/-- Canonical `Runtime(PostCleanup)` MIR body for
+    `pub fn load_relaxed(a: &AtomicUsize) -> usize { a.load(Ordering::Relaxed)
+    }`:
+    ```text
+    bb0: {
+        _2 = std::sync::atomic::Ordering::Relaxed;
+        _0 = Atomic::<usize>::load(copy _1, move _2) -> [return: bb1, unwind continue];
+    }
+    bb1: {
+        return;
+    }
+    ``` -/
+def loadRelaxedBody : MirBody where
+  argTys := [.refAtomicUsize]
+  retTy := .usize
+  localCount := 3
+  blocks := [
+    { stmts := [.assign ⟨2⟩ (.use (.constVal (.ordering .relaxed)))]
+      terminator := .callAtomicLoad ⟨0⟩ (.copy ⟨1⟩) (.move ⟨2⟩) ⟨1⟩ },
+    { stmts := []
+      terminator := .return_ }
+  ]
+
+/-- `loadRelaxedBody` satisfies `EnsuresAtomicLoad 1`: every reachable prefix
+    is safe (including across the demonic weak-memory choice in `bb0`), and any
+    normal return value equals `MirVal.usize msg.bits` for some visible message
+    `msg ∈ init.mem.visibleAtomicMsgs loc` at `_1`'s atomic location. -/
+theorem loadRelaxedBody_satisfies_ensures :
+    MirSem loadRelaxedBody ≤ EnsuresAtomicLoad 1 := by
+  refine behaviorOf_le_pure (M := MirMachine) ?_
+  intro q out hpfx
+  cases q with
+  | mk init steps =>
+  cases out with
+  | mk trace outcome =>
+    have hinit := hpfx.1
+    have hreach := hpfx.2
+    have hb : init.block = 0 := hinit.1
+    have hs : init.stmtIdx = 0 := hinit.2.1
+    have harg : ∃ v, init.locals 1 = some v ∧ v.hasTy init.mem .refAtomicUsize :=
+      hinit.2.2.2.1
+    cases harg with
+    | intro v hv =>
+      have hv1 : init.locals 1 = some v := hv.1
+      have hty : v.hasTy init.mem .refAtomicUsize := hv.2
+      cases v with
+      | usize _ => cases hty
+      | unit => cases hty
+      | ordering _ => cases hty
+      | atomicLoc loc =>
+        have hvis : init.mem.visibleAtomicMsgs loc ≠ [] := hty
+        let s1 : MirState := { init with
+          locals := updateLocal init.locals 2 (some (.ordering .relaxed))
+          block := 0
+          stmtIdx := 1
+        }
+        have hstep0 : evalMirStep loadRelaxedBody init = StepResult.step () s1 := by
+          unfold evalMirStep loadRelaxedBody
+          rw [hb, hs]
+          change (StepResult.step (State := MirState) (Obs := Unit) (Val := MirVal) () { init with
+            locals := updateLocal init.locals 2 (some (.ordering .relaxed))
+            stmtIdx := init.stmtIdx + 1
+          }) = StepResult.step () s1
+          unfold s1
+          rw [hb, hs]
+        cases hreach with
+        | zero =>
+          exact ⟨True.intro, fun _ h => by cases h⟩
+        | step n _ s1' obs tr out h1 h2 =>
+          have h1' : StepResult.step obs s1' = evalMirStep loadRelaxedBody init := h1
+          rw [hstep0] at h1'
+          injection h1' with _ hs1'
+          subst hs1'
+          cases hlist : init.mem.visibleAtomicMsgs loc with
+          | nil =>
+            exact False.elim (hvis hlist)
+          | cons head tail =>
+            let localsAfterMove := updateLocal (updateLocal init.locals 2 (some (.ordering .relaxed))) 2 none
+            let branches : MirState → Prop := fun s' =>
+              ∃ msg, msg ∈ (head :: tail) ∧
+                s' = {
+                  locals := updateLocal localsAfterMove 0 (some (.usize msg.bits))
+                  mem := init.mem.applyAtomicLoad .relaxed msg
+                  block := 1
+                  stmtIdx := 0
+                }
+            have hptr : evalOperand s1.locals (.copy ⟨1⟩) = some (.atomicLoc loc, s1.locals) := by
+              unfold evalOperand s1 updateLocal
+              change (match init.locals 1 with | some v => some (v, _) | none => none) = _
+              rw [hv1]
+            have hstep1 : evalMirStep loadRelaxedBody s1 = StepResult.choice .demonic branches := by
+              unfold evalMirStep loadRelaxedBody
+              change evalMirTerminator s1 (.callAtomicLoad ⟨0⟩ (.copy ⟨1⟩) (.move ⟨2⟩) ⟨1⟩) = _
+              dsimp only [evalMirTerminator]
+              rw [hptr]
+              change (match init.mem.visibleAtomicMsgs loc with
+                | [] => StepResult.failed FailureKind.ub
+                | head' :: tail' =>
+                  StepResult.choice (State := MirState) (Obs := Unit) (Val := MirVal) .demonic (fun s' =>
+                    ∃ msg, msg ∈ (head' :: tail') ∧
+                      s' = {
+                        locals := updateLocal localsAfterMove 0 (some (.usize msg.bits))
+                        mem := init.mem.applyAtomicLoad .relaxed msg
+                        block := 1
+                        stmtIdx := 0
+                      })) = StepResult.choice .demonic branches
+              rw [hlist]
+            cases h2 with
+            | zero =>
+              exact ⟨True.intro, fun _ h => by cases h⟩
+            | step _ _ _ _ _ _ hbad _ =>
+              have hbad' : _ = evalMirStep loadRelaxedBody s1 := hbad
+              rw [hstep1] at hbad'
+              cases hbad'
+            | choice m kind _ s2 brs tr2 out2 hch hbr h3 =>
+              have hch' : StepResult.choice kind brs = evalMirStep loadRelaxedBody s1 := hch
+              rw [hstep1] at hch'
+              injection hch' with _ hbrs
+              subst hbrs
+              cases hbr with
+              | intro msg hmsg =>
+                have hmem : msg ∈ head :: tail := hmsg.1
+                have hs2 : s2 = {
+                    locals := updateLocal localsAfterMove 0 (some (.usize msg.bits))
+                    mem := init.mem.applyAtomicLoad .relaxed msg
+                    block := 1
+                    stmtIdx := 0
+                  } := hmsg.2
+                subst hs2
+                have hstep2 :
+                    evalMirStep loadRelaxedBody {
+                      locals := updateLocal localsAfterMove 0 (some (.usize msg.bits))
+                      mem := init.mem.applyAtomicLoad .relaxed msg
+                      block := 1
+                      stmtIdx := 0
+                    } = StepResult.terminated (TerminationKind.normal (.usize msg.bits)) := by
+                  rfl
+                cases h3 with
+                | zero =>
+                  exact ⟨True.intro, fun _ h => by cases h⟩
+                | step _ _ _ _ _ _ hbad _ =>
+                  have hbad' : _ = evalMirStep loadRelaxedBody _ := hbad
+                  rw [hstep2] at hbad'
+                  cases hbad'
+                | choice _ _ _ _ _ _ _ hbad _ _ =>
+                  have hbad' : _ = evalMirStep loadRelaxedBody _ := hbad
+                  rw [hstep2] at hbad'
+                  cases hbad'
+                | emptyChoice _ _ _ _ hbad _ =>
+                  have hbad' : _ = evalMirStep loadRelaxedBody _ := hbad
+                  rw [hstep2] at hbad'
+                  cases hbad'
+                | terminated _ _ term hterm =>
+                  have hterm' : StepResult.terminated term = evalMirStep loadRelaxedBody _ := hterm
+                  rw [hstep2] at hterm'
+                  injection hterm' with hterm_eq
+                  subst hterm_eq
+                  refine ⟨True.intro, ?_⟩
+                  intro ret hret
+                  injection hret with hterm_ret
+                  injection hterm_ret with hret_eq
+                  subst hret_eq
+                  refine ⟨loc, msg, hv1, ?_, rfl⟩
+                  rw [hlist]
+                  exact hmem
+                | failed _ _ _ hbad =>
+                  have hbad' : _ = evalMirStep loadRelaxedBody _ := hbad
+                  rw [hstep2] at hbad'
+                  cases hbad'
+                | noStep _ _ hnostep =>
+                  exact False.elim (hnostep ⟨_, hstep2.symm⟩)
+            | emptyChoice _ kind _ brs hch hempty =>
+              have hch' : StepResult.choice kind brs = evalMirStep loadRelaxedBody s1 := hch
+              rw [hstep1] at hch'
+              injection hch' with _ hbrs
+              subst hbrs
+              exact False.elim (hempty ⟨_, ⟨head, List.Mem.head tail, rfl⟩⟩)
+            | terminated _ _ _ hbad =>
+              have hbad' : _ = evalMirStep loadRelaxedBody s1 := hbad
+              rw [hstep1] at hbad'
+              cases hbad'
+            | failed _ _ _ hbad =>
+              have hbad' : _ = evalMirStep loadRelaxedBody s1 := hbad
+              rw [hstep1] at hbad'
+              cases hbad'
+            | noStep _ _ hnostep =>
+              exact False.elim (hnostep ⟨_, hstep1.symm⟩)
+        | choice _ _ _ _ _ _ _ h1 _ _ =>
+          have h1' : _ = evalMirStep loadRelaxedBody init := h1
+          rw [hstep0] at h1'
+          cases h1'
+        | emptyChoice _ _ _ _ h1 _ =>
+          have h1' : _ = evalMirStep loadRelaxedBody init := h1
+          rw [hstep0] at h1'
+          cases h1'
+        | terminated _ _ _ h1 =>
+          have h1' : _ = evalMirStep loadRelaxedBody init := h1
+          rw [hstep0] at h1'
+          cases h1'
+        | failed _ _ _ h1 =>
+          have h1' : _ = evalMirStep loadRelaxedBody init := h1
+          rw [hstep0] at h1'
+          cases h1'
+        | noStep _ _ hnostep =>
+          exact False.elim (hnostep ⟨_, hstep0.symm⟩)
+
+/-- `loadRelaxedBody` satisfies baseline `MirLang.WellFormed`. -/
+theorem loadRelaxedBody_satisfies_wellFormed :
+    MirSem loadRelaxedBody ≤ MirLang.WellFormed :=
+  Preorder.le_trans loadRelaxedBody_satisfies_ensures (ensuresAtomicLoad_le_wellFormed 1)
+
 /-- Generic single-function `CrateTheorem` discharge for an unannotated safe
     function (`specs := []`) via `Compiler.SoundOn.verify`: given
     `h_wf : MirSem body ≤ MirLang.WellFormed`, proves `CrateTheorem` for the
@@ -584,6 +800,25 @@ theorem prove_id_move_wf_crate (fnName : String) :
       tcb := [TCBItem.rustcLowering fnName idMoveBody]
     } :=
   verify_single_fn_wf_crate fnName idMoveBody idMoveBody_satisfies_wellFormed
+
+/-- Ready-to-apply `CrateTheorem` witness for `pub fn load_relaxed`
+    (`specs := [EnsuresAtomicLoad 1]`). -/
+theorem prove_load_relaxed_ensures_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{ name := fnName, prog := loadRelaxedBody, specs := [EnsuresAtomicLoad 1] }]
+      tcb := [TCBItem.rustcLowering fnName loadRelaxedBody]
+    } :=
+  verify_single_fn_crate fnName loadRelaxedBody (EnsuresAtomicLoad 1)
+    loadRelaxedBody_satisfies_ensures (ensuresAtomicLoad_le_wellFormed 1)
+
+/-- Ready-to-apply `CrateTheorem` witness for unannotated `pub fn load_relaxed`
+    (`specs := []`). -/
+theorem prove_load_relaxed_wf_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{ name := fnName, prog := loadRelaxedBody, specs := [] }]
+      tcb := [TCBItem.rustcLowering fnName loadRelaxedBody]
+    } :=
+  verify_single_fn_wf_crate fnName loadRelaxedBody loadRelaxedBody_satisfies_wellFormed
 
 /-!
 ## 4. Positive and Negative Rust Adequacy Canaries
@@ -738,5 +973,89 @@ theorem canary_wrong_id_violates_ensures :
     injection hpost with hval'
     injection hval' with hnum
     cases hnum
+
+/-- MIR body that accepts `_1 : &AtomicUsize` (`MirTy.refAtomicUsize`) and
+    returns constant `0` instead of loading from `_1`. -/
+def wrongAtomicReturnZeroBody : MirBody where
+  argTys := [.refAtomicUsize]
+  retTy := .usize
+  localCount := 2
+  blocks := [
+    { stmts := [.assign ⟨0⟩ (.use (.constVal (.usize 0)))]
+      terminator := .return_ }
+  ]
+
+/-- Negative adequacy canary for weak-memory atomic loads: returning constant
+    `0`
+    without reading `_1` violates `EnsuresAtomicLoad 1` when location `0`'s only
+    visible modification-order message has `bits = 1`. -/
+theorem canary_wrong_atomic_load_violates_ensures :
+    ¬ (MirSem wrongAtomicReturnZeroBody ≤ EnsuresAtomicLoad 1) := by
+  intro hEns
+  let msg0 : AtomicMsg := { loc := 0, ts := 0, bits := 1, relView := View.bot }
+  let mem0 : MemState := { MemState.empty with atomicMsgs := [msg0] }
+  let locals0 : Nat → Option MirVal :=
+    updateLocal (fun _ => none) 1 (some (.atomicLoc 0))
+  let s0 : MirState := {
+    locals := locals0
+    mem := mem0
+    block := 0
+    stmtIdx := 0
+  }
+  let s1 : MirState := {
+    locals := updateLocal locals0 0 (some (.usize 0))
+    mem := mem0
+    block := 0
+    stmtIdx := 1
+  }
+  have hrest : ∀ j, 2 ≤ j → locals0 j = none := by
+    intro j hj
+    cases j with
+    | zero => cases hj
+    | succ k =>
+      cases k with
+      | zero =>
+        cases hj with
+        | step hle => cases hle
+      | succ m => rfl
+  have hvis : mem0.visibleAtomicMsgs 0 ≠ [] := by
+    intro hnil
+    cases hnil
+  have hinit : initMirState wrongAtomicReturnZeroBody s0 :=
+    ⟨rfl, rfl, rfl, ⟨⟨MirVal.atomicLoc 0, rfl, hvis⟩, hrest⟩⟩
+  have hreach1 : ReachesPrefix MirMachine wrongAtomicReturnZeroBody s0 1 s1 []
+      (PrefixOutcome.terminated (TerminationKind.normal (MirVal.usize 0))) :=
+    ReachesPrefix.terminated 0 s1 (TerminationKind.normal (MirVal.usize 0)) rfl
+  have hreach2 : ReachesPrefix MirMachine wrongAtomicReturnZeroBody s0 2 s0 [()]
+      (PrefixOutcome.terminated (TerminationKind.normal (MirVal.usize 0))) :=
+    ReachesPrefix.step 1 s0 s1 () []
+      (PrefixOutcome.terminated (TerminationKind.normal (MirVal.usize 0))) rfl hreach1
+  let q : ExecQuery MirState := { init := s0, steps := 2 }
+  let out : ExecOut Unit MirVal := {
+    trace := [()]
+    outcome := PrefixOutcome.terminated (TerminationKind.normal (MirVal.usize 0))
+  }
+  cases hEns q True.intro with
+  | intro hdef hval =>
+    have hpfx : (MirSem wrongAtomicReturnZeroBody q).val hdef out := ⟨hinit, hreach2⟩
+    have hpost := hval out hpfx (MirVal.usize 0) rfl
+    cases hpost with
+    | intro loc hpost2 =>
+      cases hpost2 with
+      | intro msg hprops =>
+        have hloc : q.init.locals 1 = some (MirVal.atomicLoc 0) := rfl
+        have hloc_eq := hprops.1
+        rw [hloc] at hloc_eq
+        injection hloc_eq with hval'
+        injection hval' with hloc0
+        subst hloc0
+        have hmem : msg ∈ [msg0] := hprops.2.1
+        cases hmem with
+        | head =>
+          have hret := hprops.2.2
+          injection hret with hbits
+          cases hbits
+        | tail _ htail =>
+          cases htail
 
 end Anneal
