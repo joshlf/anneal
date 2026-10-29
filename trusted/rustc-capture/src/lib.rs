@@ -381,6 +381,12 @@ pub enum CapturedSpec {
     /// Functional specification for `max_assign_shared(dst, src)`
     /// (`specs := [Trusted.EnsuresMaxAssignShared]`).
     EnsuresMaxAssignShared,
+    /// Functional specification for `sort_pair(x, y)`
+    /// (`specs := [Trusted.EnsuresSortPair]`).
+    EnsuresSortPair,
+    /// Functional specification for `two_phase_reborrow(x, y, a, b)`
+    /// (`specs := [Trusted.EnsuresTwoPhaseReborrow]`).
+    EnsuresTwoPhaseReborrow,
 }
 
 impl CapturedSpec {
@@ -406,6 +412,12 @@ impl CapturedSpec {
             }
             Self::EnsuresMaxAssignShared => {
                 "[Trusted.EnsuresMaxAssignShared]".to_string()
+            }
+            Self::EnsuresSortPair => {
+                "[Trusted.EnsuresSortPair]".to_string()
+            }
+            Self::EnsuresTwoPhaseReborrow => {
+                "[Trusted.EnsuresTwoPhaseReborrow]".to_string()
             }
         }
     }
@@ -547,6 +559,10 @@ fn parse_source_spec(src: &str) -> Result<CapturedSpec, CaptureError> {
                 "ensures(shared_max(x, y))" => CapturedSpec::EnsuresSharedMax,
                 "ensures(max_assign_shared(dst, src))" => {
                     CapturedSpec::EnsuresMaxAssignShared
+                }
+                "ensures(sort_pair(x, y))" => CapturedSpec::EnsuresSortPair,
+                "ensures(two_phase_reborrow(x, y, a, b))" => {
+                    CapturedSpec::EnsuresTwoPhaseReborrow
                 }
                 "well_formed" => CapturedSpec::WellFormed,
                 other => {
@@ -1562,5 +1578,56 @@ fn shared_max(_1: &usize, _2: &usize) -> usize {
         assert_eq!(fns[0].ret_ty, CapturedTy::Usize);
         assert_eq!(fns[0].local_count, 7);
         assert_eq!(fns[0].blocks.len(), 4);
+    }
+
+    #[test]
+    fn parses_rustc_sort_pair_mir() {
+        let sample = "\
+// WARNING: This output format is intended for human consumers only
+fn sort_pair(_1: &mut usize, _2: &mut usize) -> usize {
+    debug x => _1;
+    debug y => _2;
+    let mut _0: usize;
+    let mut _3: bool;
+    let mut _4: usize;
+    let mut _5: usize;
+    let _6: usize;
+    let mut _7: usize;
+    scope 1 {
+        debug tmp => _6;
+    }
+
+    bb0: {
+        _4 = copy (*_1);
+        _5 = copy (*_2);
+        _3 = Gt(move _4, move _5);
+        switchInt(move _3) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _6 = copy (*_1);
+        _7 = copy (*_2);
+        (*_1) = move _7;
+        (*_2) = copy _6;
+        goto -> bb2;
+    }
+
+    bb2: {
+        _0 = copy (*_1);
+        return;
+    }
+}
+";
+        let fns = parse_emitted_mir(sample, CapturedSpec::EnsuresSortPair)
+            .unwrap();
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].name, "sort_pair");
+        assert_eq!(
+            fns[0].arg_tys,
+            vec![CapturedTy::RefMutUsize, CapturedTy::RefMutUsize]
+        );
+        assert_eq!(fns[0].ret_ty, CapturedTy::Usize);
+        assert_eq!(fns[0].local_count, 8);
+        assert_eq!(fns[0].blocks.len(), 3);
     }
 }

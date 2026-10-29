@@ -352,6 +352,49 @@ pub fn render_proof_lean(functions: &[CapturedFunction]) -> String {
                 ),
             }
         }
+        [func]
+            if func.arg_tys
+                == [CapturedTy::RefMutUsize, CapturedTy::RefMutUsize] =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresSortPair => format!(
+                    "Anneal.prove_sort_pair_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_sort_pair_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_sort_pair_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
+        [func]
+            if func.arg_tys
+                == [
+                    CapturedTy::RefMutUsize,
+                    CapturedTy::RefMutUsize,
+                    CapturedTy::Usize,
+                    CapturedTy::Usize,
+                ] =>
+        {
+            match func.spec {
+                CapturedSpec::EnsuresTwoPhaseReborrow => format!(
+                    "Anneal.prove_two_phase_reborrow_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_two_phase_reborrow_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_two_phase_reborrow_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
         [func] => {
             let uses_move = func.blocks.first().is_some_and(|b| {
                 b.stmts.iter().any(|s| {

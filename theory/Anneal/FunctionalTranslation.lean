@@ -3613,7 +3613,7 @@ noncomputable def computePlanAux :
               match body.argTys[srcF - 1]?, body.argTys[srcT - 1]? with
               | some .refMutUsize, some .refMutUsize =>
                 if dstF == dstT && joinF == joinT then
-                  let joinedLid := body.argTys.length + 1
+                  let joinedLid := dstF
                   .joinBorrow dstF srcF srcT joinF joinedLid
                     (computePlanAux fuel body joinF 0 (some (joinedLid, srcF, srcT)))
                 else
@@ -5166,6 +5166,588 @@ theorem sharedMax_aliased_accepted :
 
 theorem maxAssignShared_aliased_rejected :
     extractSymArgs maxAssignSharedBody.argTys sampleMutSharedAliasedInit = none :=
+  rfl
+
+/-!
+## 12. Verification of `sort_pair` and `two_phase_reborrow` (In-Place Conditional Swap and Multi-Phase Sequential Reborrows)
+-/
+
+/-- Exact `Runtime(PostCleanup)` MIR body emitted by `rustc --edition=2024 --emit=mir`
+    for:
+    ```rust
+    pub fn sort_pair(x: &mut usize, y: &mut usize) -> usize {
+        if *x > *y {
+            let tmp = *x;
+            *x = *y;
+            *y = tmp;
+        }
+        *x
+    }
+    ```
+    - `_0: usize` (return place), `_1: &mut usize` (`x`), `_2: &mut usize` (`y`),
+      `_3: bool`, `_4: usize`, `_5: usize`, `_6: usize` (`tmp`), `_7: usize`.
+    - `bb0`: `_4 = copy (*_1); _5 = copy (*_2); _3 = Gt(move _4, move _5); switchInt(move _3) -> [0: bb2, otherwise: bb1];`
+    - `bb1`: `_6 = copy (*_1); _7 = copy (*_2); (*_1) = move _7; (*_2) = copy _6; goto -> bb2;`
+    - `bb2`: `_0 = copy (*_1); return;` -/
+def sortPairBody : MirBody where
+  argTys := [.refMutUsize, .refMutUsize]
+  retTy := .usize
+  localCount := 8
+  blocks := [
+    { stmts := [
+        .assign ⟨4⟩ (.deref ⟨1⟩),
+        .assign ⟨5⟩ (.deref ⟨2⟩),
+        .assign ⟨3⟩ (.binaryOp .gt (.move ⟨4⟩) (.move ⟨5⟩))
+      ]
+      terminator := .switchInt (.move ⟨3⟩) ⟨2⟩ ⟨1⟩ },
+    { stmts := [
+        .assign ⟨6⟩ (.deref ⟨1⟩),
+        .assign ⟨7⟩ (.deref ⟨2⟩),
+        .assignDeref ⟨1⟩ (.move ⟨7⟩),
+        .assignDeref ⟨2⟩ (.copy ⟨6⟩)
+      ]
+      terminator := .goto ⟨2⟩ },
+    { stmts := [
+        .assign ⟨0⟩ (.deref ⟨1⟩)
+      ]
+      terminator := .return_ }
+  ]
+
+/-- Exact `Runtime(PostCleanup)` MIR body emitted by `rustc --edition=2024 --emit=mir`
+    for:
+    ```rust
+    pub fn two_phase_reborrow(x: &mut usize, y: &mut usize, a: usize, b: usize) -> usize {
+        let r1 = if *x <= *y { &mut *x } else { &mut *y };
+        *r1 = a;
+        let r2 = if *x <= *y { &mut *y } else { &mut *x };
+        *r2 = b;
+        *x
+    }
+    ```
+    - `_0: usize` (return place), `_1: &mut usize` (`x`), `_2: &mut usize` (`y`),
+      `_3: usize` (`a`), `_4: usize` (`b`), `_5: &mut usize` (`r1`), `_6: bool`,
+      `_7: usize`, `_8: usize`, `_9: &mut usize` (`r2`), `_10: bool`,
+      `_11: usize`, `_12: usize`.
+    - `bb0`: `_7 = copy (*_1); _8 = copy (*_2); _6 = Le(move _7, move _8); switchInt(move _6) -> [0: bb2, otherwise: bb1];`
+    - `bb1`: `_5 = copy _1; goto -> bb3;`
+    - `bb2`: `_5 = copy _2; goto -> bb3;`
+    - `bb3`: `(*_5) = copy _3; _11 = copy (*_1); _12 = copy (*_2); _10 = Le(move _11, move _12); switchInt(move _10) -> [0: bb5, otherwise: bb4];`
+    - `bb4`: `_9 = copy _2; goto -> bb6;`
+    - `bb5`: `_9 = copy _1; goto -> bb6;`
+    - `bb6`: `(*_9) = copy _4; _0 = copy (*_1); return;` -/
+def twoPhaseReborrowBody : MirBody where
+  argTys := [.refMutUsize, .refMutUsize, .usize, .usize]
+  retTy := .usize
+  localCount := 13
+  blocks := [
+    { stmts := [
+        .assign ⟨7⟩ (.deref ⟨1⟩),
+        .assign ⟨8⟩ (.deref ⟨2⟩),
+        .assign ⟨6⟩ (.binaryOp .le (.move ⟨7⟩) (.move ⟨8⟩))
+      ]
+      terminator := .switchInt (.move ⟨6⟩) ⟨2⟩ ⟨1⟩ },
+    { stmts := [
+        .assign ⟨5⟩ (.use (.copy ⟨1⟩))
+      ]
+      terminator := .goto ⟨3⟩ },
+    { stmts := [
+        .assign ⟨5⟩ (.use (.copy ⟨2⟩))
+      ]
+      terminator := .goto ⟨3⟩ },
+    { stmts := [
+        .assignDeref ⟨5⟩ (.copy ⟨3⟩),
+        .assign ⟨11⟩ (.deref ⟨1⟩),
+        .assign ⟨12⟩ (.deref ⟨2⟩),
+        .assign ⟨10⟩ (.binaryOp .le (.move ⟨11⟩) (.move ⟨12⟩))
+      ]
+      terminator := .switchInt (.move ⟨10⟩) ⟨5⟩ ⟨4⟩ },
+    { stmts := [
+        .assign ⟨9⟩ (.use (.copy ⟨2⟩))
+      ]
+      terminator := .goto ⟨6⟩ },
+    { stmts := [
+        .assign ⟨9⟩ (.use (.copy ⟨1⟩))
+      ]
+      terminator := .goto ⟨6⟩ },
+    { stmts := [
+        .assignDeref ⟨9⟩ (.copy ⟨4⟩),
+        .assign ⟨0⟩ (.deref ⟨1⟩)
+      ]
+      terminator := .return_ }
+  ]
+
+/-- `computePlan twoPhaseReborrowBody` automatically detects both sequential
+    diamond borrow joins (`_5` at `bb3` and `_9` at `bb6`) and schedules
+    `.endLoan 5` before `_11 = copy (*_1)` in `bb3` and `.endLoan 9` before
+    `_0 = copy (*_1)` in `bb6`. -/
+theorem computePlan_twoPhaseReborrowBody_eq :
+    computePlan twoPhaseReborrowBody =
+      .step (.step (.step
+        (.joinBorrow 5 2 1 3 5
+          (.step (.endLoan 5
+            (.step (.step (.step
+              (.joinBorrow 9 1 2 6 9
+                (.step (.endLoan 9 (.step .ret)))))))))))) :=
+  rfl
+
+/-- **First Futamura Projection for `sort_pair`**:
+    Evaluating `translatePure (computePlan sortPairBody) sortPairBody` on
+    universally quantified symbolic inputs `x0 y0 : Nat` reduces by kernel
+    `rfl` directly to `.ok (.usize (if decide (y0 < x0) then y0 else x0))`. -/
+theorem translatePure_sortPair_rfl (x0 y0 : Nat) :
+    translatePure (computePlan sortPairBody) sortPairBody [.refMut x0, .refMut y0] =
+      .ok (.usize (if decide (y0 < x0) then y0 else x0)) :=
+  rfl
+
+/-- **First Futamura Projection for `two_phase_reborrow`**:
+    Evaluating `translatePure (computePlan twoPhaseReborrowBody) twoPhaseReborrowBody`
+    on universally quantified symbolic inputs `x0 y0 a b : Nat` reduces by
+    kernel `rfl` directly to the nested two-stage expression. -/
+theorem translatePure_twoPhaseReborrow_rfl (x0 y0 a b : Nat) :
+    translatePure (computePlan twoPhaseReborrowBody) twoPhaseReborrowBody
+      [.refMut x0, .refMut y0, .usize a, .usize b] =
+      .ok (.usize
+        (if decide ((if decide (x0 ≤ y0) then a else x0) ≤ (if decide (x0 ≤ y0) then y0 else a))
+         then (if decide (x0 ≤ y0) then a else x0)
+         else b)) :=
+  rfl
+
+/-- Pure functional return specification extracted from `sortPairBody`. -/
+def pureSortPair (x0 y0 : Nat) : Nat :=
+  if decide (y0 < x0) then y0 else x0
+
+/-- Pure functional post-state pair `(x', y')` for `sort_pair`. -/
+def pureSortPairPost (x0 y0 : Nat) : Nat × Nat :=
+  (if decide (y0 < x0) then y0 else x0,
+   if decide (y0 < x0) then x0 else y0)
+
+/-- Pure functional return specification extracted from `twoPhaseReborrowBody`. -/
+def pureTwoPhaseReborrow (x0 y0 a b : Nat) : Nat :=
+  if decide ((if decide (x0 ≤ y0) then a else x0) ≤ (if decide (x0 ≤ y0) then y0 else a))
+  then (if decide (x0 ≤ y0) then a else x0)
+  else b
+
+/-- Non-trivial property 1 (`sort_pair` left lower bound): -/
+theorem pureSortPair_le_left (x0 y0 : Nat) :
+    pureSortPair x0 y0 ≤ x0 := by
+  unfold pureSortPair
+  cases h : decide (y0 < x0) with
+  | true => exact Nat.le_of_lt (of_decide_eq_true h)
+  | false => exact Nat.le_refl x0
+
+/-- Non-trivial property 2 (`sort_pair` right lower bound): -/
+theorem pureSortPair_le_right (x0 y0 : Nat) :
+    pureSortPair x0 y0 ≤ y0 := by
+  unfold pureSortPair
+  cases h : decide (y0 < x0) with
+  | true => exact Nat.le_refl y0
+  | false => exact Nat.le_of_not_lt (of_decide_eq_false h)
+
+/-- Non-trivial property 3 (`sort_pair` post-state ordering `x' ≤ y'`): -/
+theorem pureSortPairPost_ordered (x0 y0 : Nat) :
+    (pureSortPairPost x0 y0).1 ≤ (pureSortPairPost x0 y0).2 := by
+  unfold pureSortPairPost
+  cases h : decide (y0 < x0) with
+  | true => exact Nat.le_of_lt (of_decide_eq_true h)
+  | false => exact Nat.le_of_not_lt (of_decide_eq_false h)
+
+/-- Non-trivial property 4 (`sort_pair` permutation conservation): -/
+theorem pureSortPairPost_perm (x0 y0 : Nat) :
+    pureSortPairPost x0 y0 = (x0, y0) ∨ pureSortPairPost x0 y0 = (y0, x0) := by
+  unfold pureSortPairPost
+  cases decide (y0 < x0) with
+  | true => exact Or.inr rfl
+  | false => exact Or.inl rfl
+
+/-- Non-trivial property 5 (`two_phase_reborrow` disjoint-target regime when `x0 ≤ y0` and `a ≤ y0`):
+    Phase 1 mutates `*x := a` via `r1`, `.endLoan 5` writes `a` back to `x`,
+    and Phase 2 observes `a ≤ y0` so `r2` borrows `y` (`*y := b`), preserving
+    `*x = a`. -/
+theorem pureTwoPhaseReborrow_when_a_le_y0 (x0 y0 a b : Nat)
+    (hxy : x0 ≤ y0) (hay : a ≤ y0) :
+    pureTwoPhaseReborrow x0 y0 a b = a := by
+  unfold pureTwoPhaseReborrow
+  have h1 : decide (x0 ≤ y0) = true := decide_eq_true hxy
+  have h2 : decide (a ≤ y0) = true := decide_eq_true hay
+  rw [h1]
+  change (if decide (a ≤ y0) = true then a else b) = a
+  rw [h2]
+  rfl
+
+/-- Non-trivial property 6 (`two_phase_reborrow` same-target re-mutation regime when `x0 ≤ y0` and `y0 < a`):
+    Phase 1 mutates `*x := a` via `r1`, `.endLoan 5` writes `a` back to `x`,
+    and Phase 2 observes `y0 < a` (`¬(a ≤ y0)`), so `r2` reborrows `x` a
+    second time and overwrites `*x := b`! -/
+theorem pureTwoPhaseReborrow_when_y0_lt_a (x0 y0 a b : Nat)
+    (hxy : x0 ≤ y0) (hya : y0 < a) :
+    pureTwoPhaseReborrow x0 y0 a b = b := by
+  unfold pureTwoPhaseReborrow
+  have h1 : decide (x0 ≤ y0) = true := decide_eq_true hxy
+  have h2 : decide (a ≤ y0) = false := decide_eq_false (Nat.not_le_of_gt hya)
+  rw [h1]
+  change (if decide (a ≤ y0) = true then a else b) = b
+  rw [h2]
+  rfl
+
+/-- Functional postcondition for `sort_pair` in `FuncLang`. -/
+def FuncPostSortPair (init : MirState) (ret : MirVal) : Prop :=
+  ∀ locX locY x0 y0,
+    init.locals 1 = some (.refMutLoc locX) →
+    init.mem.naVal locX = some (.usize x0) →
+    init.locals 2 = some (.refMutLoc locY) →
+    init.mem.naVal locY = some (.usize y0) →
+    ret = .usize (if decide (y0 < x0) then y0 else x0)
+
+/-- Functional postcondition for `two_phase_reborrow` in `FuncLang`. -/
+def FuncPostTwoPhaseReborrow (init : MirState) (ret : MirVal) : Prop :=
+  ∀ locX locY x0 y0 a b,
+    init.locals 1 = some (.refMutLoc locX) →
+    init.mem.naVal locX = some (.usize x0) →
+    init.locals 2 = some (.refMutLoc locY) →
+    init.mem.naVal locY = some (.usize y0) →
+    init.locals 3 = some (.usize a) →
+    init.locals 4 = some (.usize b) →
+    ret = .usize
+      (if decide ((if decide (x0 ≤ y0) then a else x0) ≤ (if decide (x0 ≤ y0) then y0 else a))
+       then (if decide (x0 ≤ y0) then a else x0)
+       else b)
+
+/-- `translate sortPairBody` satisfies `FuncLang.Spec FuncPostSortPair`. -/
+theorem translate_sortPairBody_spec :
+    FuncLang.sem (translate sortPairBody) ≤ FuncLang.Spec FuncPostSortPair := by
+  refine funcSem_le_spec (fun init => ?_)
+  unfold translate evalSym
+  have hSupp : allSupportedArgTys sortPairBody.argTys = true := rfl
+  rw [hSupp]
+  dsimp
+  cases hExt : extractSymArgs sortPairBody.argTys init with
+  | none =>
+    refine ⟨(by intro h; cases h), ?_⟩
+    intro ret hok
+    cases hok
+  | some args =>
+    unfold extractSymArgs at hExt
+    cases hblk : (init.block == 0 && init.stmtIdx == 0) with
+    | false => rw [hblk] at hExt; cases hExt
+    | true =>
+      rw [hblk] at hExt
+      dsimp [sortPairBody, extractSymArgsAux] at hExt
+      cases hloc1 : init.locals 1 with
+      | none => rw [hloc1] at hExt; cases hExt
+      | some mv1 =>
+        rw [hloc1] at hExt
+        cases mv1 with
+        | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
+        | refMutLoc loc1 =>
+          dsimp at hExt
+          cases hchk1 : (noAliasBefore init.locals loc1 1 &&
+            decide (init.mem.naWriteTs loc1 ≤ init.mem.curView loc1) &&
+            decide (init.mem.naReadTs loc1 ≤ init.mem.curView loc1)) with
+          | false => rw [hchk1] at hExt; cases hExt
+          | true =>
+            rw [hchk1] at hExt
+            dsimp at hExt
+            cases hna1 : init.mem.naVal loc1 with
+            | none => rw [hna1] at hExt; cases hExt
+            | some naMv1 =>
+              rw [hna1] at hExt
+              cases naMv1 with
+              | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+              | usize x0' =>
+                dsimp at hExt
+                cases hloc2 : init.locals 2 with
+                | none => rw [hloc2] at hExt; cases hExt
+                | some mv2 =>
+                  rw [hloc2] at hExt
+                  cases mv2 with
+                  | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                  | refMutLoc loc2 =>
+                    dsimp at hExt
+                    cases hchk2 : (noAliasBefore init.locals loc2 2 &&
+                      decide (init.mem.naWriteTs loc2 ≤ init.mem.curView loc2) &&
+                      decide (init.mem.naReadTs loc2 ≤ init.mem.curView loc2)) with
+                    | false => rw [hchk2] at hExt; cases hExt
+                    | true =>
+                      rw [hchk2] at hExt
+                      dsimp at hExt
+                      cases hna2 : init.mem.naVal loc2 with
+                      | none => rw [hna2] at hExt; cases hExt
+                      | some naMv2 =>
+                        rw [hna2] at hExt
+                        cases naMv2 with
+                        | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                        | usize y0' =>
+                          dsimp at hExt
+                          injection hExt with hargs
+                          subst hargs
+                          dsimp
+                          rw [translatePure_sortPair_rfl x0' y0']
+                          refine ⟨(by intro h; cases h), ?_⟩
+                          intro ret hok locX locY x0 y0 hl1 hm1 hl2 hm2
+                          injection hok with hret
+                          rw [hloc1] at hl1; injection hl1 with h1_mv; injection h1_mv with h1; subst h1
+                          rw [hna1] at hm1; injection hm1 with hx_mv; injection hx_mv with hx; subst hx
+                          rw [hloc2] at hl2; injection hl2 with h2_mv; injection h2_mv with h2; subst h2
+                          rw [hna2] at hm2; injection hm2 with hy_mv; injection hy_mv with hy; subst hy
+                          exact hret.symm
+
+/-- `translate twoPhaseReborrowBody` satisfies `FuncLang.Spec FuncPostTwoPhaseReborrow`. -/
+theorem translate_twoPhaseReborrowBody_spec :
+    FuncLang.sem (translate twoPhaseReborrowBody) ≤ FuncLang.Spec FuncPostTwoPhaseReborrow := by
+  refine funcSem_le_spec (fun init => ?_)
+  unfold translate evalSym
+  have hSupp : allSupportedArgTys twoPhaseReborrowBody.argTys = true := rfl
+  rw [hSupp]
+  dsimp
+  cases hExt : extractSymArgs twoPhaseReborrowBody.argTys init with
+  | none =>
+    refine ⟨(by intro h; cases h), ?_⟩
+    intro ret hok
+    cases hok
+  | some args =>
+    unfold extractSymArgs at hExt
+    cases hblk : (init.block == 0 && init.stmtIdx == 0) with
+    | false => rw [hblk] at hExt; cases hExt
+    | true =>
+      rw [hblk] at hExt
+      dsimp [twoPhaseReborrowBody, extractSymArgsAux] at hExt
+      cases hloc1 : init.locals 1 with
+      | none => rw [hloc1] at hExt; cases hExt
+      | some mv1 =>
+        rw [hloc1] at hExt
+        cases mv1 with
+        | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
+        | refMutLoc loc1 =>
+          dsimp at hExt
+          cases hchk1 : (noAliasBefore init.locals loc1 1 &&
+            decide (init.mem.naWriteTs loc1 ≤ init.mem.curView loc1) &&
+            decide (init.mem.naReadTs loc1 ≤ init.mem.curView loc1)) with
+          | false => rw [hchk1] at hExt; cases hExt
+          | true =>
+            rw [hchk1] at hExt
+            dsimp at hExt
+            cases hna1 : init.mem.naVal loc1 with
+            | none => rw [hna1] at hExt; cases hExt
+            | some naMv1 =>
+              rw [hna1] at hExt
+              cases naMv1 with
+              | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+              | usize x0' =>
+                dsimp at hExt
+                cases hloc2 : init.locals 2 with
+                | none => rw [hloc2] at hExt; cases hExt
+                | some mv2 =>
+                  rw [hloc2] at hExt
+                  cases mv2 with
+                  | usize _ | bool _ | unit | atomicLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                  | refMutLoc loc2 =>
+                    dsimp at hExt
+                    cases hchk2 : (noAliasBefore init.locals loc2 2 &&
+                      decide (init.mem.naWriteTs loc2 ≤ init.mem.curView loc2) &&
+                      decide (init.mem.naReadTs loc2 ≤ init.mem.curView loc2)) with
+                    | false => rw [hchk2] at hExt; cases hExt
+                    | true =>
+                      rw [hchk2] at hExt
+                      dsimp at hExt
+                      cases hna2 : init.mem.naVal loc2 with
+                      | none => rw [hna2] at hExt; cases hExt
+                      | some naMv2 =>
+                        rw [hna2] at hExt
+                        cases naMv2 with
+                        | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                        | usize y0' =>
+                          dsimp at hExt
+                          cases hloc3 : init.locals 3 with
+                          | none => rw [hloc3] at hExt; cases hExt
+                          | some mv3 =>
+                            rw [hloc3] at hExt
+                            cases mv3 with
+                            | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                            | usize a' =>
+                              dsimp at hExt
+                              cases hloc4 : init.locals 4 with
+                              | none => rw [hloc4] at hExt; cases hExt
+                              | some mv4 =>
+                                rw [hloc4] at hExt
+                                cases mv4 with
+                                | bool _ | unit | atomicLoc _ | refMutLoc _ | refSharedLoc _ | ordering _ => cases hExt
+                                | usize b' =>
+                                  dsimp at hExt
+                                  injection hExt with hargs
+                                  subst hargs
+                                  dsimp
+                                  rw [translatePure_twoPhaseReborrow_rfl x0' y0' a' b']
+                                  refine ⟨(by intro h; cases h), ?_⟩
+                                  intro ret hok locX locY x0 y0 a b hl1 hm1 hl2 hm2 hl3 hl4
+                                  injection hok with hret
+                                  rw [hloc1] at hl1; injection hl1 with h1_mv; injection h1_mv with h1; subst h1
+                                  rw [hna1] at hm1; injection hm1 with hx_mv; injection hx_mv with hx; subst hx
+                                  rw [hloc2] at hl2; injection hl2 with h2_mv; injection h2_mv with h2; subst h2
+                                  rw [hna2] at hm2; injection hm2 with hy_mv; injection hy_mv with hy; subst hy
+                                  rw [hloc3] at hl3; injection hl3 with ha_mv; injection ha_mv with ha; subst ha
+                                  rw [hloc4] at hl4; injection hl4 with hb_mv; injection hb_mv with hb; subst hb
+                                  exact hret.symm
+
+/-- `π_func (FuncLang.Spec FuncPostSortPair)` refines `EnsuresSortPair`. -/
+theorem π_func_sortPair_le_ensures :
+    π_func (FuncLang.Spec FuncPostSortPair) ≤ EnsuresSortPair := by
+  refine Preorder.le_trans (π_func_spec_le FuncPostSortPair) ?_
+  intro q _
+  refine ⟨True.intro, ?_⟩
+  intro out hpost ret locX locY x0 y0 hterm hl1 hm1 hl2 hm2
+  exact hpost ret hterm locX locY x0 y0 hl1 hm1 hl2 hm2
+
+/-- `π_func (FuncLang.Spec FuncPostTwoPhaseReborrow)` refines `EnsuresTwoPhaseReborrow`. -/
+theorem π_func_twoPhaseReborrow_le_ensures :
+    π_func (FuncLang.Spec FuncPostTwoPhaseReborrow) ≤ EnsuresTwoPhaseReborrow := by
+  refine Preorder.le_trans (π_func_spec_le FuncPostTwoPhaseReborrow) ?_
+  intro q _
+  refine ⟨True.intro, ?_⟩
+  intro out hpost ret locX locY x0 y0 a b hterm hl1 hm1 hl2 hm2 hl3 hl4
+  exact hpost ret hterm locX locY x0 y0 a b hl1 hm1 hl2 hm2 hl3 hl4
+
+/-- `EnsuresSortPair` refines baseline `MirLang.WellFormed`. -/
+theorem ensuresSortPair_le_wellFormed :
+    EnsuresSortPair ≤ MirLang.WellFormed :=
+  fun _ _ => ⟨True.intro, fun _ _ => True.intro⟩
+
+/-- `EnsuresTwoPhaseReborrow` refines baseline `MirLang.WellFormed`. -/
+theorem ensuresTwoPhaseReborrow_le_wellFormed :
+    EnsuresTwoPhaseReborrow ≤ MirLang.WellFormed :=
+  fun _ _ => ⟨True.intro, fun _ _ => True.intro⟩
+
+/-- **Source MIR Correctness of `sort_pair`**:
+    `MirSem sortPairBody ≤ EnsuresSortPair`, transferred across `π_func` from
+    `translate_sortPairBody_spec` via `translate_sound sortPairBody`. -/
+theorem sortPairBody_satisfies_ensures :
+    MirSem sortPairBody ≤ EnsuresSortPair :=
+  Preorder.le_trans
+    (Preorder.le_trans
+      (translate_sound sortPairBody)
+      (monotone_π_func translate_sortPairBody_spec))
+    π_func_sortPair_le_ensures
+
+/-- `sortPairBody` satisfies baseline `MirLang.WellFormed`. -/
+theorem sortPairBody_satisfies_wellFormed :
+    MirSem sortPairBody ≤ MirLang.WellFormed :=
+  Preorder.le_trans sortPairBody_satisfies_ensures ensuresSortPair_le_wellFormed
+
+/-- **Source MIR Correctness of `two_phase_reborrow`**:
+    `MirSem twoPhaseReborrowBody ≤ EnsuresTwoPhaseReborrow`, transferred across
+    `π_func` from `translate_twoPhaseReborrowBody_spec` via
+    `translate_sound twoPhaseReborrowBody`. -/
+theorem twoPhaseReborrowBody_satisfies_ensures :
+    MirSem twoPhaseReborrowBody ≤ EnsuresTwoPhaseReborrow :=
+  Preorder.le_trans
+    (Preorder.le_trans
+      (translate_sound twoPhaseReborrowBody)
+      (monotone_π_func translate_twoPhaseReborrowBody_spec))
+    π_func_twoPhaseReborrow_le_ensures
+
+/-- `twoPhaseReborrowBody` satisfies baseline `MirLang.WellFormed`. -/
+theorem twoPhaseReborrowBody_satisfies_wellFormed :
+    MirSem twoPhaseReborrowBody ≤ MirLang.WellFormed :=
+  Preorder.le_trans twoPhaseReborrowBody_satisfies_ensures ensuresTwoPhaseReborrow_le_wellFormed
+
+/-- End-to-end `CrateTheorem` witness for `sort_pair` with `EnsuresSortPair`. -/
+theorem prove_sort_pair_ensures_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := sortPairBody
+        specs := [EnsuresSortPair]
+      }]
+      tcb := [.rustcLowering fnName sortPairBody]
+    } := by
+  refine ⟨(by intro h; cases h), ⟨⟨True.intro, True.intro⟩, ?_⟩, True.intro⟩
+  intro hAssumptions
+  have hVerFunc :
+      RustcCompiler.Verified sortPairBody (π_func (FuncLang.Spec FuncPostSortPair)) :=
+    verify_through_passes
+      translate_sortPairBody_spec
+      (translate_sound sortPairBody)
+      monotone_π_func
+      hAssumptions.1
+  have hVerEnsures : RustcCompiler.Verified sortPairBody EnsuresSortPair :=
+    Compiler.Verified.mono hVerFunc π_func_sortPair_le_ensures hAssumptions.1.1
+  exact Compiler.Verified.with_wellFormedOn
+    hVerEnsures
+    ensuresSortPair_le_wellFormed
+    hAssumptions.1.1
+
+/-- End-to-end `CrateTheorem` witness for `sort_pair` with baseline `WellFormed`. -/
+theorem prove_sort_pair_wf_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := sortPairBody
+        specs := []
+      }]
+      tcb := [.rustcLowering fnName sortPairBody]
+    } :=
+  verify_single_fn_wf_crate fnName sortPairBody sortPairBody_satisfies_wellFormed
+
+/-- End-to-end `CrateTheorem` witness for `two_phase_reborrow` with `EnsuresTwoPhaseReborrow`. -/
+theorem prove_two_phase_reborrow_ensures_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := twoPhaseReborrowBody
+        specs := [EnsuresTwoPhaseReborrow]
+      }]
+      tcb := [.rustcLowering fnName twoPhaseReborrowBody]
+    } := by
+  refine ⟨(by intro h; cases h), ⟨⟨True.intro, True.intro⟩, ?_⟩, True.intro⟩
+  intro hAssumptions
+  have hVerFunc :
+      RustcCompiler.Verified twoPhaseReborrowBody (π_func (FuncLang.Spec FuncPostTwoPhaseReborrow)) :=
+    verify_through_passes
+      translate_twoPhaseReborrowBody_spec
+      (translate_sound twoPhaseReborrowBody)
+      monotone_π_func
+      hAssumptions.1
+  have hVerEnsures : RustcCompiler.Verified twoPhaseReborrowBody EnsuresTwoPhaseReborrow :=
+    Compiler.Verified.mono hVerFunc π_func_twoPhaseReborrow_le_ensures hAssumptions.1.1
+  exact Compiler.Verified.with_wellFormedOn
+    hVerEnsures
+    ensuresTwoPhaseReborrow_le_wellFormed
+    hAssumptions.1.1
+
+/-- End-to-end `CrateTheorem` witness for `two_phase_reborrow` with baseline `WellFormed`. -/
+theorem prove_two_phase_reborrow_wf_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := twoPhaseReborrowBody
+        specs := []
+      }]
+      tcb := [.rustcLowering fnName twoPhaseReborrowBody]
+    } :=
+  verify_single_fn_wf_crate fnName twoPhaseReborrowBody twoPhaseReborrowBody_satisfies_wellFormed
+
+/-- **Multi-Phase Reborrow Plan-Adequacy Canary (`twoPhaseReborrowBadPlan`)**:
+    A defective `TransPlan` for `twoPhaseReborrowBody` that omits `.endLoan 5`
+    between Phase 1 (`r1`) and Phase 2 (`r2`), leaving loans `1` and `2` frozen
+    when `_11 = copy (*_1)` executes in `bb3`.
+    - `evalSym_sound` still holds unconditionally (`twoPhaseReborrowBadPlan_still_sound`),
+    - `translatePure twoPhaseReborrowBadPlan twoPhaseReborrowBody` fails closed
+      with `.fail` (`translatePure_twoPhaseReborrowBadPlan_fails`). -/
+def twoPhaseReborrowBadPlan : TransPlan :=
+  .step (.step (.step
+    (.joinBorrow 5 2 1 3 5
+      (.step (.step (.step (.step
+        (.joinBorrow 9 1 2 6 9
+          (.step (.endLoan 9 (.step .ret)))))))))))
+
+theorem twoPhaseReborrowBadPlan_still_sound :
+    Abstracts FuncLang MirLang π_func
+      (evalSym twoPhaseReborrowBadPlan twoPhaseReborrowBody)
+      twoPhaseReborrowBody :=
+  evalSym_sound twoPhaseReborrowBadPlan twoPhaseReborrowBody
+
+theorem translatePure_twoPhaseReborrowBadPlan_fails (x0 y0 a b : Nat) :
+    translatePure twoPhaseReborrowBadPlan twoPhaseReborrowBody
+      [.refMut x0, .refMut y0, .usize a, .usize b] = .fail :=
   rfl
 
 end Anneal

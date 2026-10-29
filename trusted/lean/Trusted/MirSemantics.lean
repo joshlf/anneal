@@ -517,6 +517,46 @@ def EnsuresMaxAssignShared : MirLang.Behavior :=
       q.init.mem.naVal locSrc = some (.usize s0) →
       ret = .usize (if decide (d0 < s0) then s0 else d0))
 
+/-- Postcondition specification for
+    `pub fn sort_pair(x: &mut usize, y: &mut usize) -> usize`:
+    - `defined := True`: every finite execution prefix is free of UB and stuck
+      states (`MirLang.WellFormed`), and
+    - `val`: for any initial state where `_1` points to `locX` holding
+      `.usize x0` and `_2` points to `locY` holding `.usize y0`, any normal
+      return value `ret` equals `.usize (if decide (y0 < x0) then y0 else x0)`. -/
+def EnsuresSortPair : MirLang.Behavior :=
+  MirLang.Spec (fun q out =>
+    ∀ ret locX locY x0 y0,
+      out.outcome = .terminated (.normal ret) →
+      q.init.locals 1 = some (.refMutLoc locX) →
+      q.init.mem.naVal locX = some (.usize x0) →
+      q.init.locals 2 = some (.refMutLoc locY) →
+      q.init.mem.naVal locY = some (.usize y0) →
+      ret = .usize (if decide (y0 < x0) then y0 else x0))
+
+/-- Postcondition specification for
+    `pub fn two_phase_reborrow(x: &mut usize, y: &mut usize, a: usize, b: usize) -> usize`:
+    - `defined := True`: every finite execution prefix is free of UB and stuck
+      states (`MirLang.WellFormed`), and
+    - `val`: for any initial state where `_1` points to `locX` holding
+      `.usize x0`, `_2` points to `locY` holding `.usize y0`, `_3 = some (.usize a)`,
+      and `_4 = some (.usize b)`, any normal return value `ret` equals
+      `.usize (if decide ((if decide (x0 ≤ y0) then a else x0) ≤ (if decide (x0 ≤ y0) then y0 else a)) then (if decide (x0 ≤ y0) then a else x0) else b)`. -/
+def EnsuresTwoPhaseReborrow : MirLang.Behavior :=
+  MirLang.Spec (fun q out =>
+    ∀ ret locX locY x0 y0 a b,
+      out.outcome = .terminated (.normal ret) →
+      q.init.locals 1 = some (.refMutLoc locX) →
+      q.init.mem.naVal locX = some (.usize x0) →
+      q.init.locals 2 = some (.refMutLoc locY) →
+      q.init.mem.naVal locY = some (.usize y0) →
+      q.init.locals 3 = some (.usize a) →
+      q.init.locals 4 = some (.usize b) →
+      ret = .usize
+        (if decide ((if decide (x0 ≤ y0) then a else x0) ≤ (if decide (x0 ≤ y0) then y0 else a))
+         then (if decide (x0 ≤ y0) then a else x0)
+         else b))
+
 /-- Abstract type of compiled target artifacts produced by `rustc`. -/
 structure TargetArtifact where
   private mk ::

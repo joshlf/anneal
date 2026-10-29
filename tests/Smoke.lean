@@ -294,6 +294,101 @@ def maxAssignSharedCrate : Trusted.Crate where
 theorem verify_max_assign_shared_crate : Trusted.CrateTheorem maxAssignSharedCrate :=
   Anneal.prove_max_assign_shared_ensures_crate "max_assign_shared"
 
+/-- Captured `MirBody` for
+    `pub fn sort_pair(x: &mut usize, y: &mut usize) -> usize { if *x > *y { let tmp = *x; *x = *y; *y = tmp; } *x }`
+    defined using only `Trusted.*` constructors (`ci.type` origin-clean). -/
+def sortPairBody : Trusted.MirBody where
+  argTys := [.refMutUsize, .refMutUsize]
+  retTy := .usize
+  localCount := 8
+  blocks := [
+    { stmts := [
+        .assign ⟨4⟩ (.deref ⟨1⟩),
+        .assign ⟨5⟩ (.deref ⟨2⟩),
+        .assign ⟨3⟩ (.binaryOp .gt (.move ⟨4⟩) (.move ⟨5⟩))
+      ]
+      terminator := .switchInt (.move ⟨3⟩) ⟨2⟩ ⟨1⟩ },
+    { stmts := [
+        .assign ⟨6⟩ (.deref ⟨1⟩),
+        .assign ⟨7⟩ (.deref ⟨2⟩),
+        .assignDeref ⟨1⟩ (.move ⟨7⟩),
+        .assignDeref ⟨2⟩ (.copy ⟨6⟩)
+      ]
+      terminator := .goto ⟨2⟩ },
+    { stmts := [.assign ⟨0⟩ (.deref ⟨1⟩)]
+      terminator := .return_ }
+  ]
+
+/-- Captured `Trusted.Crate` for `sort_pair` with postcondition
+    `Trusted.EnsuresSortPair`. -/
+def sortPairCrate : Trusted.Crate where
+  functions := [
+    { name := "sort_pair"
+      prog := sortPairBody
+      specs := [Trusted.EnsuresSortPair] }
+  ]
+  tcb := [Trusted.TCBItem.rustcLowering "sort_pair" sortPairBody]
+
+/-- Top-level `Trusted.CrateTheorem` for `sortPairCrate`, whose statement
+    (`ci.type`) references only `Trusted` and locked foundation constants while
+    its proof term (`ci.value?`) discharges the obligation via the plan-guided
+    functional translation (`Anneal.prove_sort_pair_ensures_crate`). -/
+theorem verify_sort_pair_crate : Trusted.CrateTheorem sortPairCrate :=
+  Anneal.prove_sort_pair_ensures_crate "sort_pair"
+
+/-- Captured `MirBody` for
+    `pub fn two_phase_reborrow(x: &mut usize, y: &mut usize, a: usize, b: usize) -> usize { let r1 = if *x <= *y { &mut *x } else { &mut *y }; *r1 = a; let r2 = if *x <= *y { &mut *y } else { &mut *x }; *r2 = b; *x }`
+    defined using only `Trusted.*` constructors (`ci.type` origin-clean). -/
+def twoPhaseReborrowBody : Trusted.MirBody where
+  argTys := [.refMutUsize, .refMutUsize, .usize, .usize]
+  retTy := .usize
+  localCount := 13
+  blocks := [
+    { stmts := [
+        .assign ⟨7⟩ (.deref ⟨1⟩),
+        .assign ⟨8⟩ (.deref ⟨2⟩),
+        .assign ⟨6⟩ (.binaryOp .le (.move ⟨7⟩) (.move ⟨8⟩))
+      ]
+      terminator := .switchInt (.move ⟨6⟩) ⟨2⟩ ⟨1⟩ },
+    { stmts := [.assign ⟨5⟩ (.use (.copy ⟨1⟩))]
+      terminator := .goto ⟨3⟩ },
+    { stmts := [.assign ⟨5⟩ (.use (.copy ⟨2⟩))]
+      terminator := .goto ⟨3⟩ },
+    { stmts := [
+        .assignDeref ⟨5⟩ (.copy ⟨3⟩),
+        .assign ⟨11⟩ (.deref ⟨1⟩),
+        .assign ⟨12⟩ (.deref ⟨2⟩),
+        .assign ⟨10⟩ (.binaryOp .le (.move ⟨11⟩) (.move ⟨12⟩))
+      ]
+      terminator := .switchInt (.move ⟨10⟩) ⟨5⟩ ⟨4⟩ },
+    { stmts := [.assign ⟨9⟩ (.use (.copy ⟨2⟩))]
+      terminator := .goto ⟨6⟩ },
+    { stmts := [.assign ⟨9⟩ (.use (.copy ⟨1⟩))]
+      terminator := .goto ⟨6⟩ },
+    { stmts := [
+        .assignDeref ⟨9⟩ (.copy ⟨4⟩),
+        .assign ⟨0⟩ (.deref ⟨1⟩)
+      ]
+      terminator := .return_ }
+  ]
+
+/-- Captured `Trusted.Crate` for `two_phase_reborrow` with postcondition
+    `Trusted.EnsuresTwoPhaseReborrow`. -/
+def twoPhaseReborrowCrate : Trusted.Crate where
+  functions := [
+    { name := "two_phase_reborrow"
+      prog := twoPhaseReborrowBody
+      specs := [Trusted.EnsuresTwoPhaseReborrow] }
+  ]
+  tcb := [Trusted.TCBItem.rustcLowering "two_phase_reborrow" twoPhaseReborrowBody]
+
+/-- Top-level `Trusted.CrateTheorem` for `twoPhaseReborrowCrate`, whose statement
+    (`ci.type`) references only `Trusted` and locked foundation constants while
+    its proof term (`ci.value?`) discharges the obligation via the plan-guided
+    functional translation (`Anneal.prove_two_phase_reborrow_ensures_crate`). -/
+theorem verify_two_phase_reborrow_crate : Trusted.CrateTheorem twoPhaseReborrowCrate :=
+  Anneal.prove_two_phase_reborrow_ensures_crate "two_phase_reborrow"
+
 /-!
 ## Non-Step-Based Axiomatic Event-Graph Toy Language
 
