@@ -589,3 +589,79 @@ fn rejects_incorrect_is_aligned_mask_implementation() {
         "expected Lean audit rejection for wrong is_aligned_mask body, got: {err}"
     );
 }
+
+#[test]
+fn verifies_shared_max_end_to_end() {
+    let crate_dir = TempCrateDir::new(
+        "valid-shared-max",
+        "// anneal:spec ensures(shared_max(x, y))\n\
+         pub fn shared_max(x: &usize, y: &usize) -> usize {\n    \
+             let r = if *x < *y { y } else { x };\n    \
+             *r\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "shared_max");
+}
+
+#[test]
+fn rejects_incorrect_shared_max_implementation() {
+    let crate_dir = TempCrateDir::new(
+        "wrong-shared-max",
+        "// anneal:spec ensures(shared_max(x, y))\n\
+         pub fn shared_max(x: &usize, y: &usize) -> usize {\n    \
+             let r = if *x <= *y { x } else { y };\n    \
+             *r\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean audit rejection for wrong shared_max body, got: {err}"
+    );
+}
+
+#[test]
+fn verifies_max_assign_shared_end_to_end() {
+    let crate_dir = TempCrateDir::new(
+        "valid-max-assign-shared",
+        "// anneal:spec ensures(max_assign_shared(dst, src))\n\
+         pub fn max_assign_shared(dst: &mut usize, src: &usize) -> usize {\n    \
+             if *dst < *src {\n        \
+                 *dst = *src;\n    \
+             }\n    \
+             *dst\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "max_assign_shared");
+}
+
+#[test]
+fn rejects_incorrect_max_assign_shared_implementation() {
+    let crate_dir = TempCrateDir::new(
+        "wrong-max-assign-shared",
+        "// anneal:spec ensures(max_assign_shared(dst, src))\n\
+         pub fn max_assign_shared(dst: &mut usize, src: &usize) -> usize {\n    \
+             if *dst > *src {\n        \
+                 *dst = *src;\n    \
+             }\n    \
+             *dst\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean audit rejection for wrong max_assign_shared body, got: {err}"
+    );
+}
