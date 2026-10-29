@@ -302,6 +302,22 @@ def EnsuresEqArg (argLocal : Nat) : MirLang.Behavior :=
     ∀ ret, out.outcome = .terminated (.normal ret) →
       q.init.locals argLocal = some ret)
 
+/-- Postcondition specification for a safe atomic load from `&AtomicUsize`
+    argument `argLocal` (`1` for the first parameter `_1`):
+    - `defined := True`: every finite execution prefix is free of UB and stuck
+      states (`MirLang.WellFormed`), and
+    - `val`: any normal return value `ret` equals `MirVal.usize msg.bits` for
+      some modification-order message `msg` at `argLocal`'s atomic location that
+      was visible in `q.init.mem`. -/
+@[candidate mir_semantics]
+def EnsuresAtomicLoad (argLocal : Nat) : MirLang.Behavior :=
+  MirLang.Spec (fun q out =>
+    ∀ ret, out.outcome = .terminated (.normal ret) →
+      ∃ loc msg,
+        q.init.locals argLocal = some (.atomicLoc loc) ∧
+        msg ∈ q.init.mem.visibleAtomicMsgs loc ∧
+        ret = .usize msg.bits)
+
 /-- Abstract type of compiled target artifacts produced by `rustc`. -/
 @[candidate mir_semantics]
 structure TargetArtifact where
