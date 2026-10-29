@@ -86,9 +86,21 @@ impl DownstreamTarget {
 pub fn default_downstream_targets() -> Vec<DownstreamTarget> {
     vec![
         DownstreamTarget::new(
+            "Anneal.Refinement",
+            "theory/Anneal/Refinement.lean",
+            &["Trusted"],
+            "theory",
+        ),
+        DownstreamTarget::new(
+            "Anneal.StepResult",
+            "theory/Anneal/StepResult.lean",
+            &["Trusted", "Anneal.Refinement"],
+            "theory",
+        ),
+        DownstreamTarget::new(
             "Anneal",
             "theory/Anneal.lean",
-            &["Trusted"],
+            &["Trusted", "Anneal.Refinement", "Anneal.StepResult"],
             "theory",
         ),
         DownstreamTarget::new(
