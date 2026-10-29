@@ -1,37 +1,16 @@
 //! Trusted `rustc` capture serializer (`trusted/rustc-capture`).
 //!
 //! This crate sits inside `trusted/` and may not depend on any workspace crate
-//! outside `trusted/`. It defines the `CaptureManifest` handshake consumed by
-//! `trusted/audit/` and will host the mechanical `rustc_driver` MIR and
-//! attribute serializer (#99, #103).
+//! outside `trusted/`. It defines the `CaptureManifest` and
+//! `UnitCaptureManifest` handshakes consumed by `trusted/audit/` and
+//! `crates/cargo-anneal`, and hosts the version-scoped `rustc_driver` MIR,
+//! layout, and specification attribute serializer (#99, #103).
 
-/// A single captured item and its generated `Mir/<Item>.lean` module digest.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CapturedTarget {
-    /// Canonical item identifier (`DefId` path) within the crate.
-    pub def_id: String,
-    /// Relative path to the read-only generated `Mir/<Item>.lean` module.
-    pub mir_module_path: String,
-    /// SHA-256 hex digest of the generated `Mir/<Item>.lean` file.
-    pub mir_module_sha256: String,
-}
+pub mod lean_emit;
+pub mod manifest;
 
-/// Cryptographic handshake written by `anneal-rustc-capture` and verified by
-/// `trusted/audit/` before accepting compiled `.olean` proofs (#103 §5).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CaptureManifest {
-    /// Schema version of the capture manifest.
-    pub schema: u32,
-    /// True only after `rustc` completes compilation of the crate (including
-    /// post-monomorphization checks) with zero errors (#99 §3).
-    pub compilation_succeeded: bool,
-    /// Relative path and SHA-256 hex digest of every `.rs` input file.
-    pub rust_sources: Vec<(String, String)>,
-    /// Verification targets extracted for this compilation unit.
-    pub targets: Vec<CapturedTarget>,
-}
-
-impl CaptureManifest {
-    /// Current manifest schema version.
-    pub const SCHEMA_VERSION: u32 = 1;
-}
+pub use manifest::{
+    ANNEAL_CAPTURE_DIR_ENV, ANNEAL_CAPTURE_FILTER_ENV, CaptureManifest, CapturedItemKind,
+    CapturedTarget, MIR_DIALECT_V2026_06_01, RUSTC_COMMIT_SHA, RUSTC_VERSION_STRING,
+    UnitCaptureManifest, UnitTargetRecord, sha256_hex,
+};
