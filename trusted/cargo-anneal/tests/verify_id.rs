@@ -819,3 +819,30 @@ fn rejects_incorrect_double_bounded_implementation() {
         "expected Lean audit rejection for wrong double_bounded body, got: {err}"
     );
 }
+
+#[test]
+fn verifies_crate_using_installed_exocrate_toolchain_when_present() {
+    let Some(tc) = cargo_anneal::setup::resolve_installed_toolchain() else {
+        return;
+    };
+
+    let crate_dir = TempCrateDir::new(
+        "exocrate-toolchain-id",
+        "// anneal:spec ensures(ret == x)\n\
+         pub fn id(x: usize) -> usize {\n    \
+             x\n\
+         }\n",
+    );
+
+    let options = VerifyOptions {
+        anneal_root: Some(tc.anneal_share_root()),
+        lean_bin: Some(tc.lean_bin()),
+        rustc_capture_bin: Some(tc.rustc_capture_bin()),
+        keep_proof: false,
+    };
+
+    let output = verify_crate(&crate_dir.path, &options)
+        .expect("verify_crate using installed exocrate toolchain");
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "id");
+}

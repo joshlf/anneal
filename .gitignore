@@ -1,4 +1,6 @@
 /target/
+**/target/
+/result*
 **/.lake/
 **/*.olean
 **/*.olean.server

@@ -760,7 +760,7 @@ fn valid_graph(value: &Json) -> bool {
 /// Minimal TOML parser supporting Cargo workspace and package manifests,
 /// including `[[...]]` array-of-tables headers (such as
 /// `[[package.metadata.exocrate]]` and `[[bin]]`).
-fn parse_cargo_toml(text: &str) -> Result<Json, String> {
+pub fn parse_cargo_toml(text: &str) -> Result<Json, String> {
     let mut root = BTreeMap::new();
     let mut current_path: Vec<String> = Vec::new();
     let mut current_is_array_item = false;
@@ -1510,6 +1510,7 @@ pub struct Checker {
     pub version: String,
     pub prefix: PathBuf,
     pub foundation: Vec<String>,
+    pub precompiled_prefix_dir: Option<PathBuf>,
     pub timeout_duration: Duration,
     pub max_bytes: u64,
 }
@@ -1595,6 +1596,8 @@ impl Checker {
             version: String::new(),
             prefix: PathBuf::new(),
             foundation: Vec::new(),
+            precompiled_prefix_dir: env::var_os("ANNEAL_PRECOMPILED_PREFIX_DIR")
+                .map(PathBuf::from),
             timeout_duration: Duration::from_secs(60),
             max_bytes: MAX_BYTES,
         })
@@ -3630,7 +3633,15 @@ impl Checker {
         expected_content_fingerprint: &str,
         key_fingerprint: &str,
     ) -> Result<Option<CachedVerifyPrefix>, Failure> {
-        let prefix_dir = self.checkout.join("precompiled-prefix");
+        let checkout_prefix = self.checkout.join("precompiled-prefix");
+        let prefix_dir =
+            if checkout_prefix.join("prefix-manifest.json").is_file() {
+                checkout_prefix
+            } else if let Some(fallback) = &self.precompiled_prefix_dir {
+                fallback.clone()
+            } else {
+                return Ok(None);
+            };
         let manifest_path = prefix_dir.join("prefix-manifest.json");
         if !manifest_path.is_file() {
             return Ok(None);

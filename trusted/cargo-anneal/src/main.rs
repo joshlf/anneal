@@ -13,6 +13,7 @@ use std::process::ExitCode;
 
 use cargo_anneal::audit::{Checker, Json};
 use cargo_anneal::self_test::run_self_test;
+use cargo_anneal::setup::{SetupOptions, run_setup};
 use cargo_anneal::{
     VerifyOptions, resolve_anneal_root, resolve_lean_bin,
     run_trusted_audit_report, verify_crate,
@@ -43,7 +44,8 @@ fn run(mut args: Vec<String>) -> Result<u8, (u8, String)> {
     let subcmd = subcmd.to_string();
     if !matches!(
         subcmd.as_str(),
-        "verify"
+        "setup"
+            | "verify"
             | "verify-crate"
             | "audit-repo"
             | "audit-self-test"
@@ -57,10 +59,21 @@ fn run(mut args: Vec<String>) -> Result<u8, (u8, String)> {
 
     let mut crate_dir: Option<PathBuf> = None;
     let mut options = VerifyOptions::default();
+    let mut setup_options = SetupOptions::default();
     let mut iter = args.into_iter().skip(1);
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "--local-archive" if subcmd == "setup" => {
+                let Some(path) = iter.next() else {
+                    return Err((
+                        2,
+                        "error: --local-archive requires a path argument"
+                            .to_string(),
+                    ));
+                };
+                setup_options.local_archive = Some(PathBuf::from(path));
+            }
             "--keep-proof" if subcmd == "verify" => {
                 options.keep_proof = true;
             }
@@ -128,6 +141,15 @@ fn run(mut args: Vec<String>) -> Result<u8, (u8, String)> {
     }
 
     match subcmd.as_str() {
+        "setup" => {
+            let tc = run_setup(&setup_options)
+                .map_err(|e| (1, format!("error: {e}")))?;
+            println!(
+                "installed Anneal toolchain at {}",
+                tc.root.display()
+            );
+            Ok(0)
+        }
         "verify" => {
             let target_dir = crate_dir.unwrap_or_else(|| PathBuf::from("."));
             let output = verify_crate(&target_dir, &options)
@@ -296,5 +318,5 @@ fn run(mut args: Vec<String>) -> Result<u8, (u8, String)> {
 }
 
 fn usage() -> String {
-    "usage: cargo-anneal [anneal] <verify|verify-crate|audit-repo|audit-self-test|build-verify-prefix> [crate-dir] [--lean <path>] [--anneal-root <path>] [--keep-proof]".to_string()
+    "usage: cargo-anneal [anneal] <setup|verify|verify-crate|audit-repo|audit-self-test|build-verify-prefix> [crate-dir] [--local-archive <path>] [--lean <path>] [--anneal-root <path>] [--keep-proof]".to_string()
 }

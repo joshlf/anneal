@@ -26,6 +26,7 @@
 
 pub mod audit;
 pub mod self_test;
+pub mod setup;
 
 use std::env;
 use std::fmt;
@@ -158,6 +159,23 @@ pub fn capture_crate_with_options(
 ) -> Result<CaptureOutput, CaptureError> {
     let driver_bin = resolve_rustc_capture_bin(options)?;
     let mut cmd = Command::new(&driver_bin);
+    if env::var_os("RUSTC").is_none() {
+        let driver_toolchain_root = driver_bin
+            .parent()
+            .and_then(Path::parent)
+            .filter(|root| root.join("rust/bin/rustc").is_file())
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                setup::resolve_installed_toolchain()
+                    .filter(|tc| tc.rustc_bin().is_file())
+                    .map(|tc| tc.root)
+            });
+        if let Some(tc_root) = driver_toolchain_root {
+            let tc = setup::Toolchain { root: tc_root };
+            cmd.env("RUSTC", tc.rustc_bin());
+            cmd.env(setup::rust_library_path_env_var(), tc.rust_lib());
+        }
+    }
     if emit_proof {
         cmd.arg("--emit-proof");
     }
@@ -274,6 +292,14 @@ pub fn run_trusted_audit_report(
             "Trusted check could not create its private temporary directory: {e}"
         ))
     })?;
+    if checker.precompiled_prefix_dir.is_none()
+        && let Some(tc) = setup::resolve_installed_toolchain()
+    {
+        let tc_prefix = tc.anneal_share_root().join("precompiled-prefix");
+        if tc_prefix.join("prefix-manifest.json").is_file() {
+            checker.precompiled_prefix_dir = Some(tc_prefix);
+        }
+    }
 
     match checker.verify_crate(crate_dir, None) {
         Ok(report) => {
@@ -297,8 +323,9 @@ pub fn run_trusted_audit_report(
     }
 }
 
-/// Resolve the Anneal repository root from `options`, `ANNEAL_ROOT`, or
-/// `CARGO_MANIFEST_DIR`.
+/// Resolve the Anneal repository or bundled exocrate `share/anneal` root from
+/// `options`, `ANNEAL_ROOT`, `CARGO_MANIFEST_DIR`, or the installed exocrate
+/// toolchain.
 pub fn resolve_anneal_root(options: &VerifyOptions) -> Result<PathBuf, VerifyError> {
     if let Some(root) = &options.anneal_root {
         return Ok(root.clone());
@@ -307,30 +334,42 @@ pub fn resolve_anneal_root(options: &VerifyOptions) -> Result<PathBuf, VerifyErr
         return Ok(PathBuf::from(env_root));
     }
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .ok_or_else(|| {
-            VerifyError::Io(
-                "cannot determine Anneal repository root from CARGO_MANIFEST_DIR"
-                    .to_string(),
-            )
-        })
+    if let Some(workspace_root) = manifest_dir.parent().and_then(Path::parent)
+        && workspace_root
+            .join("trusted/lean/foundation-lock.json")
+            .is_file()
+    {
+        return Ok(workspace_root.to_path_buf());
+    }
+    if let Some(tc) = setup::resolve_installed_toolchain() {
+        let share_root = tc.anneal_share_root();
+        if share_root.join("trusted/lean/foundation-lock.json").is_file() {
+            return Ok(share_root);
+        }
+    }
+    Err(VerifyError::Io(
+        "Anneal toolchain is not installed; run `cargo anneal setup` first"
+            .to_string(),
+    ))
 }
 
-/// Resolve the optional explicit Lean binary override from `options` or
-/// `ANNEAL_LEAN_BIN`.
+/// Resolve the optional explicit Lean binary override from `options`,
+/// `ANNEAL_LEAN_BIN`, or the installed exocrate toolchain.
 pub fn resolve_lean_bin(options: &VerifyOptions) -> Option<PathBuf> {
     if let Some(lean) = &options.lean_bin {
         return Some(lean.clone());
     }
-    env::var_os("ANNEAL_LEAN_BIN").map(PathBuf::from)
+    if let Some(env_lean) = env::var_os("ANNEAL_LEAN_BIN") {
+        return Some(PathBuf::from(env_lean));
+    }
+    setup::resolve_installed_toolchain()
+        .map(|tc| tc.lean_bin())
+        .filter(|p| p.is_file())
 }
 
 /// Resolve the `anneal-rustc-capture` executable from `options`,
-/// `ANNEAL_RUSTC_CAPTURE_BIN`, adjacent to the current executable, or the local
-/// Cargo workspace.
+/// `ANNEAL_RUSTC_CAPTURE_BIN`, the local Cargo workspace, the installed
+/// exocrate toolchain, or adjacent to the current executable.
 pub fn resolve_rustc_capture_bin(
     options: &VerifyOptions,
 ) -> Result<PathBuf, CaptureError> {
@@ -339,6 +378,14 @@ pub fn resolve_rustc_capture_bin(
     }
     if let Some(env_bin) = env::var_os("ANNEAL_RUSTC_CAPTURE_BIN") {
         return Ok(PathBuf::from(env_bin));
+    }
+    if let Some(root) = &options.anneal_root
+        && let Some(tc_root) = root.parent().and_then(Path::parent)
+    {
+        let bundled = tc_root.join("bin/anneal-rustc-capture");
+        if bundled.is_file() {
+            return Ok(bundled);
+        }
     }
 
     static WORKSPACE_DRIVER: OnceLock<Result<PathBuf, String>> =
@@ -354,6 +401,13 @@ pub fn resolve_rustc_capture_bin(
                 .get_or_init(|| build_workspace_driver(workspace_root))
                 .clone()
                 .map_err(CaptureError::Io);
+        }
+    }
+
+    if let Some(tc) = setup::resolve_installed_toolchain() {
+        let bundled = tc.rustc_capture_bin();
+        if bundled.is_file() {
+            return Ok(bundled);
         }
     }
 
