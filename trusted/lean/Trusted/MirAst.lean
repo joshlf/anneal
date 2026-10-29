@@ -15,7 +15,8 @@ import Trusted.Refinement
 
 This module defines the minimal owned representation of `rustc`'s
 `MirPhase::Runtime(RuntimePhase::PostCleanup)` Mid-level Intermediate
-Representation (MIR) required for the end-to-end verification slice.
+Representation (MIR) required for the end-to-end verification slice and
+atomic weak-memory loads.
 
 Every declaration in this file that models a `rustc` MIR construct or Rust
 type/value concept cites its normative source at the repository's pinned
@@ -57,25 +58,63 @@ structure LocalId where
 structure BlockId where
   index : Nat
 
-/-- Minimal MIR type grammar (`usize` and `()`).
+/-- Atomic memory ordering for atomic load operations.
 
-    `MirTy.usize` models Rust's pointer-sized unsigned integer type `usize`:
+    Corresponds to `core::sync::atomic::Ordering` variants valid on atomic
+    loads (`Ordering::Relaxed` and `Ordering::Acquire`):
 
-    > "The `usize` type is an unsigned integer type with the same number of
-    > bits as the platform's pointer type. It can represent every memory
-    > address in the process."
+    > "Memory orderings specify the way atomic operations synchronize memory.
+    > In its weakest [`Ordering::Relaxed`], only the memory directly touched by
+    > the operation is synchronized."
+    >
+    > "No ordering constraints, only atomic operations. Corresponds to
+    > [`memory_order_relaxed`] in C++20."
+    >
+    > "When coupled with a load, if the loaded value was written by a store
+    > operation with [`Release`] (or stronger) ordering, then all subsequent
+    > operations become ordered after that store."
 
-    Source: https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/numeric.md#L37-L38 -/
+    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/sync/atomic.rs#L450-L503 -/
+@[candidate mir_ast]
+inductive AtomicOrdering where
+  | relaxed
+  | acquire
+
+/-- Minimal MIR type grammar (`usize`, `()`, `&Atomic<usize>`, and `Ordering`).
+
+    - `MirTy.usize` models Rust's pointer-sized unsigned integer type `usize`:
+
+      > "The `usize` type is an unsigned integer type with the same number of
+      > bits as the platform's pointer type. It can represent every memory
+      > address in the process."
+
+    - `MirTy.refAtomicUsize` models a shared reference `&AtomicUsize`
+      (`&core::sync::atomic::Atomic<usize>`) to an atomic `usize` object:
+
+      > "The end result is *almost* equivalent to saying that creating a
+      > *shared reference* to one of the Rust atomic types corresponds to
+      > creating an `atomic_ref` in C++, with the `atomic_ref` being destroyed
+      > when the lifetime of the shared reference ends."
+
+    - `MirTy.atomicOrdering` models `core::sync::atomic::Ordering`.
+
+    Sources:
+    - https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/numeric.md#L37-L38
+    - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/sync/atomic.rs#L36-L42
+    - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/sync/atomic.rs#L466-L527 -/
 @[candidate mir_ast]
 inductive MirTy where
   | usize
   | unit
+  | refAtomicUsize
+  | atomicOrdering
 
-/-- Initialized runtime scalar value .
+/-- Initialized runtime scalar value (`usize`, `()`, `&AtomicUsize` location,
+    or `Ordering`).
 
-    In Rust, scalar values such as integers must be initialized when produced;
-    uninitialized locals are represented in `MirState` by `Option.none` rather
-    than a `MirVal` constructor:
+    In Rust, scalar values and references must be initialized and valid when
+    produced; uninitialized locals are represented in `MirState` by
+    `Option.none` rather than a `MirVal` constructor:
 
     > "The Rust compiler assumes that all values produced during program
     > execution are "valid", and producing an invalid value is hence immediate
@@ -84,12 +123,19 @@ inductive MirTy where
     > "* An integer (`i*`/`u*`), floating point value (`f*`), or raw pointer
     > must be initialized, i.e., must not be obtained from uninitialized
     > memory."
+    >
+    > "* A reference or [`Box<T>`] must be aligned and non-null, it cannot be
+    > [dangling], and it must point to a valid value"
 
-    Source: https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/behavior-considered-undefined.md#L114-L132 -/
+    Sources:
+    - https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/behavior-considered-undefined.md#L114-L147
+    - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/sync/atomic.rs#L466-L527 -/
 @[candidate mir_ast]
 inductive MirVal where
   | usize (bits : Nat)
   | unit
+  | atomicLoc (loc : Nat)
+  | ordering (ord : AtomicOrdering)
 
 /-- MIR operand evaluated to produce a value in an `Rvalue` or terminator.
 
@@ -154,7 +200,7 @@ inductive Stmt where
 /-- Control-flow transfer at the end of a MIR basic block.
 
     Corresponds to `rustc_middle::mir::TerminatorKind` (`Return`, `Goto`,
-    `Unreachable`):
+    `Unreachable`, and `Call` specialized to `Atomic::<usize>::load`):
 
     > "Block has one successor; we continue execution there."
     >
@@ -168,13 +214,25 @@ inductive Stmt where
     > "Indicates a terminator that can never be reached.
     >
     > Executing this terminator is UB."
+    >
+    > "Roughly speaking, evaluates the `func` operand and the arguments, and
+    > starts execution of the referred to function. The operand types must
+    > match the argument types of the function. The return place type must
+    > match the return type."
+    >
+    > "Loads a value from the atomic integer. `load` takes an [`Ordering`]
+    > argument which describes the memory ordering of this operation. Possible
+    > values are [`SeqCst`], [`Acquire`] and [`Relaxed`]."
 
-    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L683-L731 -/
+    Sources:
+    - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L683-L808
+    - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/sync/atomic.rs#L2891-L2917 -/
 @[candidate mir_ast]
 inductive Terminator where
   | return_
   | goto (target : BlockId)
   | unreachable
+  | callAtomicLoad (dst : LocalId) (ptr : Operand) (ord : Operand) (target : BlockId)
 
 /-- Basic block consisting of sequential statements and a single terminator.
 

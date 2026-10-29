@@ -12,26 +12,150 @@ import Anneal.Refinement
 import Anneal.StepResult
 
 /-!
-# Untrusted MIR Meta-Theorems, `id` Verification Lemmas, and Adequacy Canaries
+# Untrusted MIR Meta-Theorems, Weak-Memory Helpers, and Adequacy Canaries
 
-This module proves the structural non-vacuity properties (`TotalStep`,
-`InhabitedDemonic`) of `Trusted.MirMachine`, the verification lemmas for the
-`pub fn id(x: usize) -> usize { x }` vertical slice discharging
-`Trusted.CrateTheorem` via `Anneal.verify_through_passes`, and the positive and
-negative Rust adequacy canaries:
-
-1. `canary_safe_infinite_loop`: a pure infinite loop (`bb0: { goto -> bb0; }`)
-   satisfies `MirSem loopBody ≤ MirLang.WellFormed`.
-2. `canary_uninit_return_violates_wellFormed`: returning an uninitialized `_0`
-   violates `MirLang.WellFormed` (`¬ (MirSem uninitReturnBody ≤
-   MirLang.WellFormed)`).
-3. `canary_wrong_id_violates_ensures`: returning `0` instead of `x` violates
-   `EnsuresEqArg 1` (`¬ (MirSem wrongReturnZeroBody ≤ EnsuresEqArg 1)`).
+This module proves:
+1. Structural non-vacuity properties (`TotalStep`, `InhabitedDemonic`) of
+   `Trusted.MirMachine`, including non-vacuity of the demonic choice emitted by
+   `Terminator.callAtomicLoad`.
+2. Partial-order lemmas for `Trusted.View` (`View.le_bump`, `View.le_join_left`,
+   `View.le_join_right`, `applyAtomicLoad_curView_mono`) and the `OwnLoc`
+   ownership abstraction showing that non-atomic reads/writes are deterministic
+   and preserved across view advances and release-acquire synchronization.
+3. Verification lemmas for `pub fn id(x: usize) -> usize { x }` and
+   `pub fn load_relaxed(a: &AtomicUsize) -> usize { a.load(Ordering::Relaxed) }`
+   discharging `Trusted.CrateTheorem` via `Anneal.verify_through_passes`.
+4. Positive and negative Rust adequacy canaries.
 -/
 
 namespace Anneal
 
 open Trusted
+
+/-!
+## 1. View Partial Order and Non-Atomic Ownership Helpers (`OwnLoc`)
+-/
+
+/-- When `a ≤ b`, `max a b = b`. -/
+theorem nat_max_eq_right {a b : Nat} (h : a ≤ b) : max a b = b := by
+  change (if a ≤ b then b else a) = b
+  split
+  · rfl
+  · next hnot => exact False.elim (hnot h)
+
+/-- When `¬ a ≤ b`, `max a b = a`. -/
+theorem nat_max_eq_left {a b : Nat} (h : ¬ a ≤ b) : max a b = a := by
+  change (if a ≤ b then b else a) = a
+  split
+  · next hle => exact False.elim (h hle)
+  · rfl
+
+/-- Left upper-bound property of `max` on `Nat` (`a ≤ max a b`). -/
+theorem nat_le_max_left (a b : Nat) : a ≤ max a b :=
+  if h : a ≤ b then by
+    rw [nat_max_eq_right h]
+    exact h
+  else by
+    rw [nat_max_eq_left h]
+    exact Nat.le_refl a
+
+/-- Right upper-bound property of `max` on `Nat` (`b ≤ max a b`). -/
+theorem nat_le_max_right (a b : Nat) : b ≤ max a b :=
+  if h : a ≤ b then by
+    rw [nat_max_eq_right h]
+    exact Nat.le_refl b
+  else by
+    rw [nat_max_eq_left h]
+    exact Nat.le_of_not_le h
+
+/-- Bumping a coherence view at `(loc, ts)` is inflationary in `Preorder View`
+    (`v ≤ View.bump v loc ts`). -/
+theorem View.le_bump (v : View) (loc : Nat) (ts : Timestamp) :
+    v ≤ View.bump v loc ts := by
+  intro l
+  unfold View.bump
+  cases l == loc with
+  | false => exact Nat.le_refl _
+  | true => exact nat_le_max_left (v l) ts
+
+/-- Left upper-bound property of `View.join` in `Preorder View`
+    (`v₁ ≤ View.join v₁ v₂`). -/
+theorem View.le_join_left (v₁ v₂ : View) :
+    v₁ ≤ View.join v₁ v₂ :=
+  fun l => nat_le_max_left (v₁ l) (v₂ l)
+
+/-- Right upper-bound property of `View.join` in `Preorder View`
+    (`v₂ ≤ View.join v₁ v₂`). -/
+theorem View.le_join_right (v₁ v₂ : View) :
+    v₂ ≤ View.join v₁ v₂ :=
+  fun l => nat_le_max_right (v₁ l) (v₂ l)
+
+/-- Any atomic load (`.relaxed` or `.acquire`) monotonically advances the
+    active thread's coherence view in `Preorder View`
+    (`m.curView ≤ (m.applyAtomicLoad ord msg).curView`). -/
+theorem applyAtomicLoad_curView_mono (m : MemState) (ord : AtomicOrdering) (msg : AtomicMsg) :
+    m.curView ≤ (m.applyAtomicLoad ord msg).curView := by
+  cases ord with
+  | relaxed =>
+    exact View.le_bump m.curView msg.loc msg.ts
+  | acquire =>
+    exact Preorder.le_trans
+      (View.le_bump m.curView msg.loc msg.ts)
+      (View.le_join_left (View.bump m.curView msg.loc msg.ts) msg.relView)
+
+/-- Single-threaded / lock-synchronized non-atomic ownership predicate:
+    non-atomic location `loc` holds initialized value `v`, and its last write
+    and read timestamps are both visible in the active thread's `curView`. -/
+def OwnLoc (m : MemState) (loc : Nat) (v : MirVal) : Prop :=
+  m.naVal loc = some v ∧
+  m.naWriteTs loc ≤ m.curView loc ∧
+  m.naReadTs loc ≤ m.curView loc
+
+/-- Under `OwnLoc m loc v`, a non-atomic read at `loc` is completely
+    deterministic, never triggers a data-race failure, and returns `v`. -/
+theorem OwnLoc.readNA_eq {m : MemState} {loc : Nat} {v : MirVal}
+    (hOwn : OwnLoc m loc v) :
+    m.readNA loc =
+      some (v, { m with naReadTs := View.bump m.naReadTs loc (m.curView loc) }) := by
+  unfold MemState.readNA
+  have hdec : decide (m.naWriteTs loc ≤ m.curView loc) = true :=
+    decide_eq_true hOwn.2.1
+  rw [hdec, hOwn.1]
+  rfl
+
+/-- `OwnLoc` is preserved whenever the thread's coherence view advances in
+    `Preorder View` (`m.curView ≤ v'`) without concurrent modification to
+    `loc`. -/
+theorem OwnLoc.mono_view {m : MemState} {loc : Nat} {v : MirVal} {v' : View}
+    (hOwn : OwnLoc m loc v) (hle : m.curView ≤ v') :
+    OwnLoc { m with curView := v' } loc v :=
+  ⟨hOwn.1, Nat.le_trans hOwn.2.1 (hle loc), Nat.le_trans hOwn.2.2 (hle loc)⟩
+
+/-- Any atomic load preserves `OwnLoc` on non-atomic locations. -/
+theorem OwnLoc.preserved_by_atomic_load {m : MemState} {loc : Nat} {v : MirVal}
+    (ord : AtomicOrdering) (msg : AtomicMsg) (hOwn : OwnLoc m loc v) :
+    OwnLoc (m.applyAtomicLoad ord msg) loc v := by
+  have hmono := applyAtomicLoad_curView_mono m ord msg
+  cases ord with
+  | relaxed => exact OwnLoc.mono_view hOwn hmono
+  | acquire => exact OwnLoc.mono_view hOwn hmono
+
+/-- Release-Acquire ownership transfer (e.g., across a `Mutex` unlock/lock): if
+    a `Release` message `msg` captured a view `msg.relView` that dominates
+    `loc`'s non-atomic write/read timestamps, performing an `Acquire` load of
+    `msg` establishes `OwnLoc` in the acquiring thread. -/
+theorem OwnLoc.transfer_acquire {m : MemState} {loc : Nat} {v : MirVal}
+    (msg : AtomicMsg)
+    (hVal : m.naVal loc = some v)
+    (hWrite : m.naWriteTs loc ≤ msg.relView loc)
+    (hRead : m.naReadTs loc ≤ msg.relView loc) :
+    OwnLoc (m.applyAtomicLoad .acquire msg) loc v := by
+  have hjoin := View.le_join_right (View.bump m.curView msg.loc msg.ts) msg.relView loc
+  exact ⟨hVal, Nat.le_trans hWrite hjoin, Nat.le_trans hRead hjoin⟩
+
+/-!
+## 2. Structural Non-Vacuity (`TotalStep` and `InhabitedDemonic`)
+-/
 
 /-- `MirMachine` is total: every `(body, s)` pair steps to `evalMirStep body
     s`. -/
@@ -45,26 +169,18 @@ theorem evalMirStmt_not_choice (s : MirState) (stmt : Stmt)
   | assign dst rv =>
     cases rv with
     | use op =>
-      cases op with
-      | copy src =>
-        dsimp [evalMirStmt]
-        cases s.locals src.index with
-        | none => intro h; cases h
-        | some v => intro h; cases h
-      | move src =>
-        dsimp [evalMirStmt]
-        cases s.locals src.index with
-        | none => intro h; cases h
-        | some v => intro h; cases h
-      | constVal v =>
-        intro h; cases h
+      dsimp [evalMirStmt]
+      cases evalOperand s.locals op with
+      | none => intro h; cases h
+      | some p => intro h; cases h
   | storageLive loc => intro h; cases h
   | storageDead loc => intro h; cases h
   | nop => intro h; cases h
 
-theorem evalMirTerminator_not_choice (s : MirState) (term : Terminator)
+theorem evalMirTerminator_choice_inhabited (s : MirState) (term : Terminator)
     (kind : ChoiceKind) (branches : MirState → Prop) :
-    StepResult.choice kind branches ≠ evalMirTerminator s term := by
+    StepResult.choice kind branches = evalMirTerminator s term →
+    ∃ s', branches s' := by
   cases term with
   | return_ =>
     dsimp [evalMirTerminator]
@@ -73,8 +189,48 @@ theorem evalMirTerminator_not_choice (s : MirState) (term : Terminator)
     | some v => intro h; cases h
   | goto target => intro h; cases h
   | unreachable => intro h; cases h
+  | callAtomicLoad dst ptrOp ordOp target =>
+    dsimp [evalMirTerminator]
+    cases evalOperand s.locals ptrOp with
+    | none => intro h; cases h
+    | some p1 =>
+      cases p1 with
+      | mk ptrVal locals1 =>
+        dsimp
+        cases evalOperand locals1 ordOp with
+        | none => intro h; cases h
+        | some p2 =>
+          cases p2 with
+          | mk ordVal locals2 =>
+            dsimp
+            cases ptrVal with
+            | usize _ => intro h; cases h
+            | unit => intro h; cases h
+            | ordering _ => intro h; cases h
+            | atomicLoc loc =>
+              cases ordVal with
+              | usize _ => intro h; cases h
+              | unit => intro h; cases h
+              | atomicLoc _ => intro h; cases h
+              | ordering ord =>
+                dsimp
+                cases s.mem.visibleAtomicMsgs loc with
+                | nil => intro h; cases h
+                | cons head tail =>
+                  intro h
+                  injection h with _ hbranches
+                  subst hbranches
+                  refine ⟨{
+                    locals := updateLocal locals2 dst.index (some (.usize head.bits))
+                    mem := s.mem.applyAtomicLoad ord head
+                    block := target.index
+                    stmtIdx := 0
+                  }, ?_⟩
+                  exact ⟨head, List.Mem.head tail, rfl⟩
 
-/-- `MirMachine` has no empty choice nodes (`evalMirStep` is deterministic). -/
+/-- `MirMachine` has no empty choice nodes: whenever `evalMirStep` emits
+    `.choice`, `visibleAtomicMsgs` is of the form `head :: tail`, so `head`
+    provides an inhabited transition branch. -/
 theorem mirMachine_inhabited : InhabitedDemonic MirMachine := by
   intro body s kind branches hstep
   have h : StepResult.choice kind branches = evalMirStep body s := hstep
@@ -89,10 +245,14 @@ theorem mirMachine_inhabited : InhabitedDemonic MirMachine := by
     cases bb.stmts[s.stmtIdx]? with
     | none =>
       intro h
-      exact False.elim (evalMirTerminator_not_choice s bb.terminator kind branches h)
+      exact evalMirTerminator_choice_inhabited s bb.terminator kind branches h
     | some stmt =>
       intro h
       exact False.elim (evalMirStmt_not_choice s stmt kind branches h)
+
+/-!
+## 3. Verification Lemmas for `pub fn id` and `pub fn load_relaxed`
+-/
 
 /-- Postcondition `EnsuresEqArg argLocal` refines `MirLang.WellFormed`. -/
 theorem ensuresEqArg_le_wellFormed (argLocal : Nat) :
@@ -149,27 +309,27 @@ theorem idCopyBody_satisfies_ensures :
     have hreach := hpfx.2
     have hb : init.block = 0 := hinit.1
     have hs : init.stmtIdx = 0 := hinit.2.1
-    have harg : ∃ v, init.locals 1 = some v ∧ v.hasTy .usize :=
+    have harg : ∃ v, init.locals 1 = some v ∧ v.hasTy init.mem .usize :=
       hinit.2.2.2.1
     cases harg with
     | intro v hv =>
       have hv1 : init.locals 1 = some v := hv.1
       have hstep0 :
           evalMirStep idCopyBody init =
-            StepResult.step () {
+            StepResult.step () { init with
               locals := updateLocal init.locals 0 (some v)
               block := 0
               stmtIdx := 1
             } := by
         unfold evalMirStep idCopyBody
         rw [hb, hs]
-        change (match init.locals 1 with
-          | some v => StepResult.step (State := MirState) (Obs := Unit) (Val := MirVal) () {
-              locals := updateLocal init.locals 0 (some v)
-              block := init.block
+        change (match evalOperand init.locals (.copy ⟨1⟩) with
+          | some (v, locals') => StepResult.step (State := MirState) (Obs := Unit) (Val := MirVal) () { init with
+              locals := updateLocal locals' 0 (some v)
               stmtIdx := init.stmtIdx + 1
             }
           | none => StepResult.failed FailureKind.ub) = _
+        dsimp [evalOperand]
         rw [hv1, hb, hs]
       cases hreach with
       | zero =>
@@ -180,7 +340,7 @@ theorem idCopyBody_satisfies_ensures :
         injection h1' with _ hs'
         subst hs'
         have hstep1 :
-            evalMirStep idCopyBody {
+            evalMirStep idCopyBody { init with
               locals := updateLocal init.locals 0 (some v)
               block := 0
               stmtIdx := 1
@@ -256,27 +416,27 @@ theorem idMoveBody_satisfies_ensures :
     have hreach := hpfx.2
     have hb : init.block = 0 := hinit.1
     have hs : init.stmtIdx = 0 := hinit.2.1
-    have harg : ∃ v, init.locals 1 = some v ∧ v.hasTy .usize :=
+    have harg : ∃ v, init.locals 1 = some v ∧ v.hasTy init.mem .usize :=
       hinit.2.2.2.1
     cases harg with
     | intro v hv =>
       have hv1 : init.locals 1 = some v := hv.1
       have hstep0 :
           evalMirStep idMoveBody init =
-            StepResult.step () {
+            StepResult.step () { init with
               locals := updateLocal (updateLocal init.locals 1 none) 0 (some v)
               block := 0
               stmtIdx := 1
             } := by
         unfold evalMirStep idMoveBody
         rw [hb, hs]
-        change (match init.locals 1 with
-          | some v => StepResult.step (State := MirState) (Obs := Unit) (Val := MirVal) () {
-              locals := updateLocal (updateLocal init.locals 1 none) 0 (some v)
-              block := init.block
+        change (match evalOperand init.locals (.move ⟨1⟩) with
+          | some (v, locals') => StepResult.step (State := MirState) (Obs := Unit) (Val := MirVal) () { init with
+              locals := updateLocal locals' 0 (some v)
               stmtIdx := init.stmtIdx + 1
             }
           | none => StepResult.failed FailureKind.ub) = _
+        dsimp [evalOperand]
         rw [hv1, hb, hs]
       cases hreach with
       | zero =>
@@ -287,7 +447,7 @@ theorem idMoveBody_satisfies_ensures :
         injection h1' with _ hs'
         subst hs'
         have hstep1 :
-            evalMirStep idMoveBody {
+            evalMirStep idMoveBody { init with
               locals := updateLocal (updateLocal init.locals 1 none) 0 (some v)
               block := 0
               stmtIdx := 1
@@ -426,7 +586,7 @@ theorem prove_id_move_wf_crate (fnName : String) :
   verify_single_fn_wf_crate fnName idMoveBody idMoveBody_satisfies_wellFormed
 
 /-!
-## Positive and Negative Rust Adequacy Canaries
+## 4. Positive and Negative Rust Adequacy Canaries
 -/
 
 /-- Pure infinite loop MIR body (`bb0: { goto -> bb0; }`). -/
@@ -503,7 +663,12 @@ def uninitReturnBody : MirBody where
 theorem canary_uninit_return_violates_wellFormed :
     ¬ (MirSem uninitReturnBody ≤ MirLang.WellFormed) := by
   intro hWF
-  let s0 : MirState := { locals := fun _ => none, block := 0, stmtIdx := 0 }
+  let s0 : MirState := {
+    locals := fun _ => none
+    mem := MemState.empty
+    block := 0
+    stmtIdx := 0
+  }
   have hinit : initMirState uninitReturnBody s0 :=
     ⟨rfl, rfl, rfl, fun _ _ => rfl⟩
   have hfail : ReachesPrefix MirMachine uninitReturnBody s0 1 s0 [] (PrefixOutcome.failed FailureKind.ub) :=
@@ -528,9 +693,15 @@ theorem canary_wrong_id_violates_ensures :
   intro hEns
   let locals0 : Nat → Option MirVal :=
     updateLocal (fun _ => none) 1 (some (.usize 1))
-  let s0 : MirState := { locals := locals0, block := 0, stmtIdx := 0 }
+  let s0 : MirState := {
+    locals := locals0
+    mem := MemState.empty
+    block := 0
+    stmtIdx := 0
+  }
   let s1 : MirState := {
     locals := updateLocal locals0 0 (some (.usize 0))
+    mem := MemState.empty
     block := 0
     stmtIdx := 1
   }
