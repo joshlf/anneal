@@ -9,7 +9,7 @@
 //! Bounded regression fixtures for the `trusted/audit` boundary gate and
 //! `TrustedBoundary.lean` inspector.
 //!
-//! Exercises all 12 positive and negative fixture groups covering foundation
+//! Exercises all 14 positive and negative fixture groups covering foundation
 //! lock containment, syntax preflight rejections, complete inventory discovery,
 //! cycle detection, symlink and foundation integrity, subprocess protocol
 //! faults, statement (`ci.type`) vs. proof (`ci.value?`) origin separation,
@@ -27,13 +27,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::audit::{
-    Checker, DownstreamTarget, Failure, Json, MAX_BYTES, PARTS, TOOLCHAIN, check_cargo_boundary, default_lean_path, digest,
+    Checker, DownstreamTarget, Failure, Json, MAX_BYTES, PARTS, ReleaseChannel,
+    TOOLCHAIN, check_cargo_boundary, default_lean_path, digest,
     verify_capture_manifest,
 };
 
 static SUITE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// Run all 12 bounded regression fixture groups against `checkout` and `lean`.
+/// Run all 14 bounded regression fixture groups against `checkout` and `lean`.
 pub fn run_self_test(checkout: &Path, lean: Option<&Path>) -> i32 {
     let suite_id = SUITE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let suite = env::temp_dir().join(format!(
@@ -1129,6 +1130,314 @@ end Trusted\n";
     let _ = fs::remove_dir_all(&manifest_dir);
     done(
         "CaptureManifest.json compilation_succeeded and SHA-256 integrity checks",
+        &mut disposable,
+    )?;
+
+    // Group 13: End-to-end `verify_crate` gate (exact `Proof.verify_crate : Trusted.CrateTheorem Mir.crate` check).
+    let r15 = make_fixture(
+        Some(&format!(
+            "{header_with_macro}namespace Trusted\n@[vetted] structure Crate where tag : Nat\n@[vetted] def CrateTheorem (_ : Crate) : Prop := True\nend Trusted\n"
+        )),
+        false,
+    )?;
+    fs::create_dir_all(r15.join("theory")).map_err(|e| e.to_string())?;
+    fs::write(
+        r15.join("theory/Anneal.lean"),
+        b"prelude\nimport Trusted\nnamespace Anneal\ntheorem prove_crate (c : Trusted.Crate) : Trusted.CrateTheorem c := True.intro\nend Anneal\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let t15 = vec![DownstreamTarget::new(
+        "Anneal",
+        "theory/Anneal.lean",
+        &["Trusted"],
+        "theory",
+    )];
+    let setup_verify_crate_fixture =
+        |sub: &str,
+         mir_source: &str,
+         proof_source: &str|
+         -> Result<PathBuf, String> {
+            let crate_dir = r15.join(sub);
+            fs::create_dir_all(crate_dir.join("src"))
+                .map_err(|e| e.to_string())?;
+            fs::create_dir_all(crate_dir.join(".anneal"))
+                .map_err(|e| e.to_string())?;
+            let rs_p = crate_dir.join("src/lib.rs");
+            let mir_p = crate_dir.join(".anneal/Mir.lean");
+            let proof_p = crate_dir.join(".anneal/Proof.lean");
+            fs::write(&rs_p, b"pub fn id(x: usize) -> usize { x }\n")
+                .map_err(|e| e.to_string())?;
+            fs::write(&mir_p, mir_source.as_bytes())
+                .map_err(|e| e.to_string())?;
+            fs::write(&proof_p, proof_source.as_bytes())
+                .map_err(|e| e.to_string())?;
+            let manifest_json = format!(
+                r#"{{"schema":1,"compilation_succeeded":true,"rust_sources":[["src/lib.rs","{}"]],"targets":[{{"def_id":"crate::id","mir_module_path":".anneal/Mir.lean","mir_module_sha256":"{}"}}]}}"#,
+                digest(&rs_p).map_err(|e| e.to_string())?,
+                digest(&mir_p).map_err(|e| e.to_string())?
+            );
+            fs::write(
+                crate_dir.join(".anneal/CaptureManifest.json"),
+                manifest_json.as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(crate_dir)
+        };
+
+    // 15a. Valid crate verification.
+    let c15a = setup_verify_crate_fixture(
+        "crate-15a",
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0 }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
+    )?;
+    let mut chk15a =
+        Checker::new(&r15, lean, Some(suite)).map_err(|e| e.to_string())?;
+    let rep15a = chk15a
+        .verify_crate(&c15a, Some(&t15))
+        .map_err(|e| e.to_string())?;
+    let cv15a = rep15a.get("crateVerification").unwrap();
+    if cv15a.get("verifiedTheorem").and_then(Json::as_str)
+        != Some("Proof.verify_crate")
+        || cv15a.get("replay") != Some(&Json::Bool(true))
+    {
+        return Err("15a failed".to_string());
+    }
+    disposable.push(chk15a.stage);
+
+    // 15b. Wrong theorem type (`theorem verify_crate : True`).
+    let c15b = setup_verify_crate_fixture(
+        "crate-15b",
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0 }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : True := True.intro\nend Proof\n",
+    )?;
+    let mut chk15b =
+        Checker::new(&r15, lean, Some(suite)).map_err(|e| e.to_string())?;
+    let err15b = chk15b.verify_crate(&c15b, Some(&t15)).unwrap_err();
+    if err15b.code != 1
+        || err15b.phase != "verify-crate"
+        || !err15b
+            .message
+            .contains("expected Trusted.CrateTheorem Mir.crate")
+    {
+        return Err(format!("15b unexpected error: {err15b}"));
+    }
+    disposable.push(chk15b.stage);
+
+    // 15c. Theorem declared inside `Mir.lean`.
+    let c15c = setup_verify_crate_fixture(
+        "crate-15c",
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0 }\ntheorem sneaky : True := True.intro\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
+    )?;
+    let mut chk15c =
+        Checker::new(&r15, lean, Some(suite)).map_err(|e| e.to_string())?;
+    let err15c = chk15c.verify_crate(&c15c, Some(&t15)).unwrap_err();
+    if err15c.code != 1
+        || err15c.phase != "verify-crate"
+        || !err15c
+            .message
+            .contains("Mir module must contain only data declarations")
+    {
+        return Err(format!("15c unexpected error: {err15c}"));
+    }
+    disposable.push(chk15c.stage);
+    done(
+        "verify-crate mode enforces Mir data-only rule and exact Proof.verify_crate : Trusted.CrateTheorem Mir.crate",
+        &mut disposable,
+    )?;
+
+    // Group 14: Vetted vs. Candidate Trusted non-contamination (`@[vetted]` vs `@[candidate <feat>]`)
+    // and per-crate candidate policy enforcement.
+    let f16a = make_fixture(
+        Some(&format!(
+            "{header_with_macro}namespace Trusted\n@[candidate mir_semantics] def candHelper : Prop := True\n@[vetted] def badVetted : Prop := candHelper\nend Trusted\n"
+        )),
+        false,
+    )?;
+    let err16a = checked(
+        &f16a,
+        Some(1),
+        Some("audit"),
+        Some(true),
+        false,
+        None,
+        &mut disposable,
+    )?
+    .unwrap_err();
+    if !err16a
+        .message
+        .contains("references candidate:mir_semantics declaration Trusted.candHelper without a Trusted.candidate guard")
+    {
+        return Err(format!("16a unexpected error: {err16a}"));
+    }
+
+    let trusted16b = format!(
+        "{header_with_macro}namespace Trusted\n\
+         @[vetted] def candidate (_feature : String) {{α : Sort u}} (x : α) : α := x\n\
+         @[vetted] inductive Crate where\n  \
+           | base : Crate\n  \
+           | @[candidate mir_semantics] ext : Crate\n\
+         @[candidate mir_semantics] def evalExt : Prop := True\n\
+         @[vetted] def CrateTheorem (c : Crate) : Prop :=\n  \
+           match c with\n  \
+           | .base => True\n  \
+           | .ext => Trusted.candidate \"mir_semantics\" evalExt\n\
+         end Trusted\n"
+    );
+    let r16b = make_fixture(Some(&trusted16b), false)?;
+    fs::create_dir_all(r16b.join("theory")).map_err(|e| e.to_string())?;
+    fs::write(
+        r16b.join("theory/Anneal.lean"),
+        b"prelude\nimport Trusted\nnamespace Anneal\ntheorem prove_base : Trusted.CrateTheorem Trusted.Crate.base := True.intro\ntheorem prove_ext : Trusted.CrateTheorem Trusted.Crate.ext := True.intro\nend Anneal\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let t16b = vec![DownstreamTarget::new(
+        "Anneal",
+        "theory/Anneal.lean",
+        &["Trusted"],
+        "theory",
+    )];
+
+    // 16b-1: Crate using only `@[vetted]` constructor `base` passes default VettedOnly and Stable.
+    let c16b_base = r16b.join("crate-base");
+    fs::create_dir_all(c16b_base.join("src")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(c16b_base.join(".anneal")).map_err(|e| e.to_string())?;
+    let rs16_base = c16b_base.join("src/lib.rs");
+    let mir16_base = c16b_base.join(".anneal/Mir.lean");
+    let proof16_base = c16b_base.join(".anneal/Proof.lean");
+    fs::write(&rs16_base, b"pub fn id(x: usize) -> usize { x }\n")
+        .map_err(|e| e.to_string())?;
+    fs::write(
+        &mir16_base,
+        b"prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := Trusted.Crate.base\nend Mir\n",
+    )
+    .map_err(|e| e.to_string())?;
+    fs::write(
+        &proof16_base,
+        b"prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_base\nend Proof\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let man16_base = format!(
+        r#"{{"schema":1,"compilation_succeeded":true,"rust_sources":[["src/lib.rs","{}"]],"targets":[{{"def_id":"crate::id","mir_module_path":".anneal/Mir.lean","mir_module_sha256":"{}"}}]}}"#,
+        digest(&rs16_base).map_err(|e| e.to_string())?,
+        digest(&mir16_base).map_err(|e| e.to_string())?
+    );
+    fs::write(
+        c16b_base.join(".anneal/CaptureManifest.json"),
+        man16_base.as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
+    let mut chk16b_base =
+        Checker::new(&r16b, lean, Some(suite)).map_err(|e| e.to_string())?;
+    let rep16b_base = chk16b_base
+        .verify_crate_with_policy(
+            &c16b_base,
+            Some(&t16b),
+            Some(ReleaseChannel::Stable),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    if rep16b_base
+        .get("crateVerification")
+        .and_then(|cv| cv.get("candidateFeatures"))
+        != Some(&Json::Arr(Vec::new()))
+    {
+        return Err("16b-1 expected empty candidateFeatures".to_string());
+    }
+    disposable.push(chk16b_base.stage);
+
+    // 16b-2: Crate using `@[candidate mir_semantics]` constructor `ext` is rejected by default
+    // VettedOnly policy, accepted on Alpha when enabled, and rejected on Stable even when enabled.
+    let c16b_ext = r16b.join("crate-ext");
+    fs::create_dir_all(c16b_ext.join("src")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(c16b_ext.join(".anneal")).map_err(|e| e.to_string())?;
+    let rs16_ext = c16b_ext.join("src/lib.rs");
+    let mir16_ext = c16b_ext.join(".anneal/Mir.lean");
+    let proof16_ext = c16b_ext.join(".anneal/Proof.lean");
+    fs::write(&rs16_ext, b"pub fn id(x: usize) -> usize { x }\n")
+        .map_err(|e| e.to_string())?;
+    fs::write(
+        &mir16_ext,
+        b"prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := Trusted.Crate.ext\nend Mir\n",
+    )
+    .map_err(|e| e.to_string())?;
+    fs::write(
+        &proof16_ext,
+        b"prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_ext\nend Proof\n",
+    )
+    .map_err(|e| e.to_string())?;
+    let man16_ext = format!(
+        r#"{{"schema":1,"compilation_succeeded":true,"rust_sources":[["src/lib.rs","{}"]],"targets":[{{"def_id":"crate::id","mir_module_path":".anneal/Mir.lean","mir_module_sha256":"{}"}}]}}"#,
+        digest(&rs16_ext).map_err(|e| e.to_string())?,
+        digest(&mir16_ext).map_err(|e| e.to_string())?
+    );
+    fs::write(
+        c16b_ext.join(".anneal/CaptureManifest.json"),
+        man16_ext.as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let mut chk16b_ext1 =
+        Checker::new(&r16b, lean, Some(suite)).map_err(|e| e.to_string())?;
+    let err16b_ext1 = chk16b_ext1
+        .verify_crate(&c16b_ext, Some(&t16b))
+        .unwrap_err();
+    if err16b_ext1.code != 1
+        || err16b_ext1.phase != "candidate-policy"
+        || !err16b_ext1
+            .message
+            .contains("candidate-trusted feature `mir_semantics` is not enabled")
+    {
+        return Err(format!("16b-2 default rejection failed: {err16b_ext1}"));
+    }
+    disposable.push(chk16b_ext1.stage);
+
+    let mut chk16b_ext2 =
+        Checker::new(&r16b, lean, Some(suite)).map_err(|e| e.to_string())?;
+    let allow_list = vec!["mir_semantics".to_string(), "memory".to_string()];
+    let rep16b_ext2 = chk16b_ext2
+        .verify_crate_with_policy(
+            &c16b_ext,
+            Some(&t16b),
+            Some(ReleaseChannel::Alpha),
+            Some(&allow_list),
+        )
+        .map_err(|e| e.to_string())?;
+    let cv16b_ext2 = rep16b_ext2.get("crateVerification").unwrap();
+    if cv16b_ext2.get("candidateFeatures")
+        != Some(&Json::Arr(vec![Json::Str("mir_semantics".to_string())]))
+        || cv16b_ext2.get("unusedCandidateFeatures")
+            != Some(&Json::Arr(vec![Json::Str("memory".to_string())]))
+    {
+        return Err(format!(
+            "16b-2 alpha opt-in report mismatch: {}",
+            cv16b_ext2.to_compact_string()
+        ));
+    }
+    disposable.push(chk16b_ext2.stage);
+
+    let mut chk16b_ext3 =
+        Checker::new(&r16b, lean, Some(suite)).map_err(|e| e.to_string())?;
+    let allow_all = vec!["*".to_string()];
+    let err16b_ext3 = chk16b_ext3
+        .verify_crate_with_policy(
+            &c16b_ext,
+            Some(&t16b),
+            Some(ReleaseChannel::Stable),
+            Some(&allow_all),
+        )
+        .unwrap_err();
+    if err16b_ext3.code != 1
+        || err16b_ext3.phase != "candidate-policy"
+        || !err16b_ext3
+            .message
+            .contains("stable release channel forbids candidate-trusted features")
+    {
+        return Err(format!("16b-2 stable rejection failed: {err16b_ext3}"));
+    }
+    disposable.push(chk16b_ext3.stage);
+    done(
+        "@[vetted] vs @[candidate] non-contamination, guarded match dispatch, and per-crate trust policy",
         &mut disposable,
     )?;
 
