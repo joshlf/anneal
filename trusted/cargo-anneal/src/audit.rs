@@ -390,6 +390,17 @@ pub fn default_downstream_targets() -> Vec<DownstreamTarget> {
             "theory",
         ),
         DownstreamTarget::new(
+            "Anneal.FunctionalTranslation",
+            "theory/Anneal/FunctionalTranslation.lean",
+            &[
+                "Trusted",
+                "Anneal.Refinement",
+                "Anneal.StepResult",
+                "Anneal.MirLemmas",
+            ],
+            "theory",
+        ),
+        DownstreamTarget::new(
             "Anneal",
             "theory/Anneal.lean",
             &[
@@ -397,6 +408,7 @@ pub fn default_downstream_targets() -> Vec<DownstreamTarget> {
                 "Anneal.Refinement",
                 "Anneal.StepResult",
                 "Anneal.MirLemmas",
+                "Anneal.FunctionalTranslation",
             ],
             "theory",
         ),
