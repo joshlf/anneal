@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 
 use anneal_rustc_capture::{
     CaptureError, CaptureOutput, CapturedFunction, CapturedOperand,
-    CapturedSpec, CapturedStmt, capture_crate,
+    CapturedSpec, CapturedStmt, CapturedTy, capture_crate,
 };
 
 use crate::audit::{Checker, Json};
@@ -214,6 +214,22 @@ pub fn resolve_lean_bin(options: &VerifyOptions) -> Option<PathBuf> {
 /// body or specification, Lean rejects `rfl` and verification fails closed.
 pub fn render_proof_lean(functions: &[CapturedFunction]) -> String {
     let proof_term = match functions {
+        [func] if func.arg_tys == [CapturedTy::RefAtomicUsize] => {
+            match func.spec {
+                CapturedSpec::EnsuresAtomicLoad(1) => format!(
+                    "Anneal.prove_load_relaxed_ensures_crate \"{}\"",
+                    func.name
+                ),
+                CapturedSpec::WellFormed => format!(
+                    "Anneal.prove_load_relaxed_wf_crate \"{}\"",
+                    func.name
+                ),
+                _ => format!(
+                    "Anneal.prove_load_relaxed_ensures_crate \"{}\"",
+                    func.name
+                ),
+            }
+        }
         [func] => {
             let uses_move = func.blocks.first().is_some_and(|b| {
                 b.stmts.iter().any(|s| {
