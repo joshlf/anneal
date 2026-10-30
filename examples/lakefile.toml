@@ -1,5 +1,5 @@
 name = "AnnealExamples"
-defaultTargets = ["Smoke", "ToyYDiagram"]
+defaultTargets = ["Smoke", "ToyYDiagram", "ToyMachine", "ToyCFG"]
 
 [[lean_lib]]
 name = "Trusted"
@@ -18,3 +18,13 @@ roots = ["Smoke"]
 name = "ToyYDiagram"
 srcDir = "refinement"
 roots = ["ToyYDiagram"]
+
+[[lean_lib]]
+name = "ToyMachine"
+srcDir = "step-result"
+roots = ["ToyMachine"]
+
+[[lean_lib]]
+name = "ToyCFG"
+srcDir = "pass"
+roots = ["ToyCFG"]
