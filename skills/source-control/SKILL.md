@@ -24,7 +24,7 @@ stack rules. Combine it with:
   [`williams-style`](../williams-style/SKILL.md) for explanation selection and
   prose style; and
 - [`authorship-disclosure`](../authorship-disclosure/SKILL.md) for Git commit
-  trailers and pull-request prose disclosures.
+  trailers.
 
 ## Structure and size commits for review
 
@@ -131,17 +131,15 @@ a local stack of commits with chained Pull Requests on GitHub.
    final trailer block alongside `gherrit-pr-id`. Recompute the trailer
    qualifier when amending, rebasing, or squashing.
 
-### Pushing and PR description verification
+### Pushing and PR descriptions
 
 Push only when authorized. On a managed branch, `git push` invokes GHerrit's
 `pre-push` hook, which pushes each commit to its phantom branch (`G...`), tags
 the patch version (`refs/tags/gherrit/<id>/v<N>`), creates or updates one Pull
 Request per commit, and regenerates PR descriptions from commit messages.
 
-Because PR descriptions are separately presented prose under
-[`authorship-disclosure`](../authorship-disclosure/SKILL.md) and GHerrit
-regenerates them on push, inspect the resulting PR descriptions on GitHub after
-pushing. Ensure the required visible prose notice (such as
-`*Authored by an AI agent acting on <user>'s behalf.*`) is present at the top of
-the PR body while preserving GHerrit's injected stack navigation table and HTML
-metadata comments.
+Do not manually edit GHerrit-managed PR descriptions on GitHub; let GHerrit own
+the PR body. Because GHerrit populates each PR description directly from the
+commit message (including its `Agent-authored-by` trailer), the commit's own
+[`authorship-disclosure`](../authorship-disclosure/SKILL.md) trailer is
+sufficient—do not add a separate prose disclosure notice to the PR body.
