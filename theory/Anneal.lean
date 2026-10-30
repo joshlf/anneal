@@ -11,6 +11,9 @@ import Anneal.BitValidity
 import Anneal.UnsafeObligations
 import Anneal.SepLogic
 import Anneal.Rustc.V2026_06_01.Lower
+import Anneal.Rustc.V2026_06_01.SymbolicEval
+import Anneal.Rustc.V2026_06_01.SymReflect
+import Anneal.FunctionalTranslation
 
 namespace Anneal
 
