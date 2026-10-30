@@ -1,0 +1,637 @@
+# ==============================================================================
+# Anneal <-> Miri Differential Testing Suite Manifest
+# ==============================================================================
+#
+# Upstream Miri reference:
+#   Public repositories:
+#     - https://github.com/rust-lang/rust (subtree `src/tools/miri/tests`)
+#     - https://github.com/rust-lang/miri (subtree `tests`)
+#   Pinned rustc / Miri commit: 14210df0e27ccd7d9e6a05b8085cbd438e4bbc65
+#                               (rustc 1.98.0-nightly 2026-05-31)
+#
+# POLICY ON `known_anneal_bug` ENTRIES (READ CAREFULLY):
+#   Every `[tests.known_anneal_bug]` block in this manifest documents an
+#   UNFIXED BUG in Anneal's MIR-in-Lean operational semantics
+#   (`Trusted.Rustc.V2026_06_01.MirSemantics`) or MIR capture pipeline.
+#
+#   These disagreements are bugs in Anneal, NOT "disagreements we have decided
+#   to admit permanently". They are recorded solely as a two-way regression
+#   ratchet:
+#     1. Every test WITHOUT `known_anneal_bug` must agree 100% between Miri
+#        and Anneal (`TotalVerificationResult` for `pass`,
+#        `verifySafePanicMirPointBounded` for `panic`, and
+#        `refuteMirPointByStrictUB` for `ub`, which rejects `FailureKind.unsupported`).
+#     2. Every test WITH `known_anneal_bug` is checked against its exact
+#        `observed_anneal_tag` in the Lean 4 kernel. When an Anneal bug is fixed,
+#        the `known_anneal_bug` theorem fails to type-check until the entry is
+#        removed from this manifest, ratcheting the open bug count down toward 0.
+
+schema_version = 1
+rustc_commit = "14210df0e27ccd7d9e6a05b8085cbd438e4bbc65"
+rustc_version = "rustc 1.98.0-nightly (14210df0e 2026-05-31)"
+upstream_repo_url = "https://github.com/rust-lang/rust"
+upstream_tests_subtree = "src/tools/miri/tests"
+miri_flags = ["-Zmiri-tree-borrows"]
+capture_rustflags = ["-Zmir-opt-level=0", "-C", "debug-assertions=off", "-C", "overflow-checks=on", "--cfg", "anodized_embed_specs"]
+
+[[tests]]
+name = "pass_integer_arith_basic"
+category = "scalar_arithmetic"
+upstream_path = "tests/pass/integer-ops.rs"
+miri_verdict = "pass:scalar:16:4"
+fuel = 128
+
+[[tests]]
+name = "pass_signed_arith_neg_div_rem"
+category = "scalar_arithmetic"
+upstream_path = "tests/pass/integer-ops.rs"
+miri_verdict = "pass:scalar:73:4"
+fuel = 128
+
+[[tests]]
+name = "pass_bitwise_and_or_xor_not"
+category = "scalar_arithmetic"
+upstream_path = "tests/pass/binops.rs"
+miri_verdict = "pass:scalar:0:4"
+fuel = 128
+
+[[tests]]
+name = "pass_shifts_u32_i32"
+category = "scalar_arithmetic"
+upstream_path = "tests/pass/integer-ops.rs"
+miri_verdict = "pass:scalar:16:4"
+fuel = 128
+
+[[tests]]
+name = "pass_comparisons_and_eq"
+category = "scalar_arithmetic"
+upstream_path = "tests/pass/binops.rs"
+miri_verdict = "pass:scalar:4:4"
+fuel = 128
+
+[[tests]]
+name = "pass_unchecked_arith_in_bounds"
+category = "scalar_arithmetic"
+upstream_path = "tests/pass/intrinsics/integer.rs"
+miri_verdict = "pass:scalar:75:4"
+fuel = 128
+
+[[tests]]
+name = "pass_exact_div_valid"
+category = "scalar_arithmetic"
+upstream_path = "tests/pass/intrinsics/integer.rs"
+miri_verdict = "pass:scalar:12:4"
+fuel = 128
+[tests.known_anneal_bug]
+status = "open_bug"
+bug_class = "incompleteness_unmodeled_intrinsic_or_call"
+observed_anneal_tag = "externalCall:core::intrinsics::exact_div"
+suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators"
+summary = "core::intrinsics::exact_div is emitted as a Call terminator rather than lowered to BinOp.div and is not yet interpreted natively by evalCallTerminator."
+
+[[tests]]
+name = "pass_int_widening_and_truncating_casts"
+category = "scalar_arithmetic"
+upstream_path = "tests/pass/casts.rs"
+miri_verdict = "pass:scalar:30:4"
+fuel = 128
+
+[[tests]]
+name = "panic_checked_add_overflow"
+category = "scalar_arithmetic"
+upstream_path = "tests/panic/mir-validation.rs"
+miri_verdict = "panic"
+fuel = 128
+
+[[tests]]
+name = "panic_checked_sub_underflow"
+category = "scalar_arithmetic"
+upstream_path = "tests/panic/mir-validation.rs"
+miri_verdict = "panic"
+fuel = 128
+
+[[tests]]
+name = "panic_checked_mul_overflow"
+category = "scalar_arithmetic"
+upstream_path = "tests/panic/mir-validation.rs"
+miri_verdict = "panic"
+fuel = 128
+
+[[tests]]
+name = "panic_div_by_zero_u32"
+category = "scalar_arithmetic"
+upstream_path = "tests/panic/div-by-zero-2.rs"
+miri_verdict = "panic"
+fuel = 128
+
+[[tests]]
+name = "panic_rem_by_zero_i32"
+category = "scalar_arithmetic"
+upstream_path = "tests/panic/div-by-zero-2.rs"
+miri_verdict = "panic"
+fuel = 128
+
+[[tests]]
+name = "panic_signed_div_min_neg_one"
+category = "scalar_arithmetic"
+upstream_path = "tests/panic/div-by-zero-2.rs"
+miri_verdict = "panic"
+fuel = 128
+
+[[tests]]
+name = "panic_shl_overflow_u32"
+category = "scalar_arithmetic"
+upstream_path = "tests/panic/overflowing-lsh-neg.rs"
+miri_verdict = "panic"
+fuel = 128
+
+[[tests]]
+name = "panic_shr_overflow_i32"
+category = "scalar_arithmetic"
+upstream_path = "tests/panic/overflowing-rsh-1.rs"
+miri_verdict = "panic"
+fuel = 128
+
+[[tests]]
+name = "ub_unchecked_add_overflow_u32"
+category = "scalar_arithmetic"
+upstream_path = "tests/fail/intrinsics/unchecked_add1.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_unchecked_add_overflow_i32"
+category = "scalar_arithmetic"
+upstream_path = "tests/fail/intrinsics/unchecked_add2.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_unchecked_sub_underflow_u32"
+category = "scalar_arithmetic"
+upstream_path = "tests/fail/intrinsics/unchecked_sub1.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_unchecked_mul_overflow_u16"
+category = "scalar_arithmetic"
+upstream_path = "tests/fail/intrinsics/unchecked_mul1.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_unchecked_shl_overflow"
+category = "scalar_arithmetic"
+upstream_path = "tests/fail/intrinsics/unchecked_shl.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_unchecked_shr_overflow"
+category = "scalar_arithmetic"
+upstream_path = "tests/fail/intrinsics/unchecked_shr.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_unchecked_div_by_zero"
+category = "scalar_arithmetic"
+upstream_path = "tests/fail/intrinsics/div-by-zero.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_unchecked_div_signed_min_overflow"
+category = "scalar_arithmetic"
+upstream_path = "tests/fail/intrinsics/unchecked_div1.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_unchecked_rem_by_zero"
+category = "scalar_arithmetic"
+upstream_path = "tests/fail/intrinsics/rem-by-zero.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_exact_div_non_multiple"
+category = "scalar_arithmetic"
+upstream_path = "tests/fail/intrinsics/exact_div1.rs"
+miri_verdict = "ub"
+fuel = 128
+[tests.known_anneal_bug]
+status = "open_bug"
+bug_class = "incompleteness_unmodeled_intrinsic_or_call"
+observed_anneal_tag = "externalCall:core::intrinsics::exact_div"
+suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators"
+summary = "core::intrinsics::exact_div is not yet modeled in evalCallTerminator, so non-multiple division halts on externalCall instead of faulting with FailureKind.ub."
+
+[[tests]]
+name = "pass_bool_transmute_valid"
+category = "type_validity_and_transmute"
+upstream_path = "tests/pass/bools.rs"
+miri_verdict = "pass:scalar:10:1"
+fuel = 128
+
+[[tests]]
+name = "pass_char_transmute_valid"
+category = "type_validity_and_transmute"
+upstream_path = "tests/pass/char.rs"
+miri_verdict = "pass:scalar:955:4"
+fuel = 128
+
+[[tests]]
+name = "pass_enum_discriminant_valid"
+category = "type_validity_and_transmute"
+upstream_path = "tests/pass/c_enums.rs"
+miri_verdict = "pass:scalar:30:1"
+fuel = 128
+
+[[tests]]
+name = "pass_transmute_u32_byte_array_le"
+category = "type_validity_and_transmute"
+upstream_path = "tests/pass/integer-ops.rs"
+miri_verdict = "pass:scalar:5:1"
+fuel = 128
+
+[[tests]]
+name = "pass_transmute_pair_to_array"
+category = "type_validity_and_transmute"
+upstream_path = "tests/pass/tuples.rs"
+miri_verdict = "pass:scalar:42:4"
+fuel = 128
+
+[[tests]]
+name = "ub_transmute_invalid_bool"
+category = "type_validity_and_transmute"
+upstream_path = "tests/fail/validity/invalid_bool.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_transmute_invalid_char_surrogate"
+category = "type_validity_and_transmute"
+upstream_path = "tests/fail/validity/invalid_char.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_transmute_invalid_char_out_of_range"
+category = "type_validity_and_transmute"
+upstream_path = "tests/fail/validity/invalid_char.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_transmute_invalid_enum_tag"
+category = "type_validity_and_transmute"
+upstream_path = "tests/fail/validity/invalid_enum_tag.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_transmute_invalid_bool_through_ptr"
+category = "type_validity_and_transmute"
+upstream_path = "tests/fail/validity/transmute_through_ptr.rs"
+miri_verdict = "ub"
+fuel = 128
+[tests.known_anneal_bug]
+status = "open_bug"
+bug_class = "soundness_false_negative"
+observed_anneal_tag = "pass:scalar:3:1"
+suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Places"
+summary = "Writing 3u8 through a *mut u8 pointer cast from &mut bool stores an out-of-range scalar (3) into the bool local without re-validating bool scalar range [0, 1] on write or subsequent typed read."
+
+[[tests]]
+name = "pass_uninit_union_write_then_read"
+category = "uninit_and_padding"
+upstream_path = "tests/pass/partially-uninit.rs"
+miri_verdict = "pass:scalar:99:4"
+fuel = 128
+[tests.known_anneal_bug]
+status = "open_bug"
+bug_class = "completeness_false_positive_ub"
+observed_anneal_tag = "ub"
+suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Statements"
+summary = "Union Rvalue.aggregate (.adt ...) initializes a single-field unit aggregate, and writing to another union variant field (slot.value: u32) via writeProjectedValue fails with FailureKind.ub."
+
+[[tests]]
+name = "pass_copy_nonoverlapping_uninit_bytes_to_uninit"
+category = "uninit_and_padding"
+upstream_path = "tests/pass/move-uninit-primval.rs"
+miri_verdict = "pass:scalar:5:4"
+fuel = 128
+[tests.known_anneal_bug]
+status = "open_bug"
+bug_class = "completeness_false_positive_ub"
+observed_anneal_tag = "ub"
+suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Places"
+summary = "Union storage for Uninit<[u8; 4]> is represented as a 1-field unit aggregate rather than raw byte/variant storage, causing copy_nonoverlapping and field assignment on union fields to fault with FailureKind.ub."
+
+[[tests]]
+name = "ub_read_uninit_u32"
+category = "uninit_and_padding"
+upstream_path = "tests/fail/validity/uninit_integer.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_read_uninit_bool"
+category = "uninit_and_padding"
+upstream_path = "tests/fail/validity/invalid_bool_uninit.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_read_uninit_byte_from_array"
+category = "uninit_and_padding"
+upstream_path = "tests/fail/uninit/uninit_byte_read.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_read_struct_padding_byte"
+category = "uninit_and_padding"
+upstream_path = "tests/fail/uninit/padding-struct.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "pass_array_index_and_mutation"
+category = "places_projections_and_pointers"
+upstream_path = "tests/pass/arrays.rs"
+miri_verdict = "pass:scalar:45:4"
+fuel = 128
+
+[[tests]]
+name = "pass_nested_struct_projection"
+category = "places_projections_and_pointers"
+upstream_path = "tests/pass/tuples.rs"
+miri_verdict = "pass:scalar:22:4"
+fuel = 128
+
+[[tests]]
+name = "pass_tuple_field_swap"
+category = "places_projections_and_pointers"
+upstream_path = "tests/pass/tuples.rs"
+miri_verdict = "pass:scalar:14:4"
+fuel = 128
+
+[[tests]]
+name = "pass_ref_array_elem_temp_index"
+category = "places_projections_and_pointers"
+upstream_path = "tests/pass/arrays.rs"
+miri_verdict = "pass:scalar:30:4"
+fuel = 128
+[tests.known_anneal_bug]
+status = "open_bug"
+bug_class = "completeness_false_positive_ub"
+observed_anneal_tag = "ub"
+suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Statements"
+summary = "Rvalue.ref and Rvalue.rawPtr record the unevaluated ProjectionElem.index tmpLocal in BorrowEntry.targetProjection instead of resolving the concrete index value at borrow creation time; when StorageDead(tmpLocal) executes before the reference is dereferenced, readPlace faults with FailureKind.ub."
+
+[[tests]]
+name = "pass_ptr_offset_within_array"
+category = "places_projections_and_pointers"
+upstream_path = "tests/pass/ptr_offset.rs"
+miri_verdict = "pass:scalar:300:4"
+fuel = 128
+[tests.known_anneal_bug]
+status = "open_bug"
+bug_class = "completeness_wrong_return_value"
+observed_anneal_tag = "pass:scalar:100:4"
+suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Places"
+summary = "BinOp.offset updates ProvenancePtr.offsetBytes without updating BorrowEntry.targetProjection, and readPlace ignores ptr.offsetBytes when dereferencing ProvenancePtr, reading field 0 (100) instead of field 1 (300)."
+
+[[tests]]
+name = "pass_subslice_pattern_extract"
+category = "places_projections_and_pointers"
+upstream_path = "tests/pass/subslice_array.rs"
+miri_verdict = "pass:scalar:30:4"
+fuel = 128
+
+[[tests]]
+name = "panic_array_index_out_of_bounds"
+category = "places_projections_and_pointers"
+upstream_path = "tests/panic/oob_subslice.rs"
+miri_verdict = "panic"
+fuel = 128
+
+[[tests]]
+name = "ub_deref_null_ptr_read"
+category = "places_projections_and_pointers"
+upstream_path = "tests/fail/dangling_pointers/null_pointer_deref.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_deref_null_ptr_write"
+category = "places_projections_and_pointers"
+upstream_path = "tests/fail/dangling_pointers/null_pointer_write.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_deref_dead_local_ptr"
+category = "places_projections_and_pointers"
+upstream_path = "tests/fail/dangling_pointers/storage_dead_dangling.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_ptr_offset_oob_read"
+category = "places_projections_and_pointers"
+upstream_path = "tests/fail/dangling_pointers/out_of_bounds_read.rs"
+miri_verdict = "ub"
+fuel = 128
+[tests.known_anneal_bug]
+status = "open_bug"
+bug_class = "soundness_false_negative"
+observed_anneal_tag = "pass:scalar:10:4"
+suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Places"
+summary = "BinOp.offset does not check allocation bounds and readPlace ignores ProvenancePtr.offsetBytes, returning field 0 (10) instead of faulting with FailureKind.ub on an out-of-bounds pointer read."
+
+[[tests]]
+name = "ub_ptr_offset_oob_write"
+category = "places_projections_and_pointers"
+upstream_path = "tests/fail/dangling_pointers/out_of_bounds_write.rs"
+miri_verdict = "ub"
+fuel = 128
+[tests.known_anneal_bug]
+status = "open_bug"
+bug_class = "soundness_false_negative"
+observed_anneal_tag = "pass:unit"
+suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Places"
+summary = "BinOp.offset does not check allocation bounds and writePlaceValue ignores ProvenancePtr.offsetBytes, overwriting field 0 instead of faulting with FailureKind.ub on an out-of-bounds pointer write."
+
+[[tests]]
+name = "ub_ptr_offset_negative_before_start"
+category = "places_projections_and_pointers"
+upstream_path = "tests/fail/intrinsics/ptr_offset_out_of_bounds_neg.rs"
+miri_verdict = "ub"
+fuel = 128
+[tests.known_anneal_bug]
+status = "open_bug"
+bug_class = "soundness_false_negative"
+observed_anneal_tag = "pass:scalar:10:4"
+suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Operands"
+summary = "BinOp.offset wraps negative isize offsets in unsigned modular arithmetic without checking allocation bounds, and readPlace ignores ProvenancePtr.offsetBytes instead of faulting with FailureKind.ub."
+
+[[tests]]
+name = "ub_unaligned_ptr_read_u32"
+category = "places_projections_and_pointers"
+upstream_path = "tests/fail/unaligned_pointers/unaligned_ptr1.rs"
+miri_verdict = "ub"
+fuel = 128
+[tests.known_anneal_bug]
+status = "open_bug"
+bug_class = "soundness_false_negative"
+observed_anneal_tag = "pass:scalar:67305985:4"
+suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Places"
+summary = "readPlace ignores ProvenancePtr.offsetBytes (1 byte) and does not check pointer alignment against the target type layout alignment (4 bytes for u32), returning field 0 instead of faulting with FailureKind.ub."
+
+[[tests]]
+name = "pass_assume_true"
+category = "intrinsics"
+upstream_path = "tests/pass/intrinsics/intrinsics.rs"
+miri_verdict = "pass:scalar:12:4"
+fuel = 128
+
+[[tests]]
+name = "pass_copy_nonoverlapping_disjoint_locals"
+category = "intrinsics"
+upstream_path = "tests/pass/tree_borrows/copy-nonoverlapping.rs"
+miri_verdict = "pass:scalar:77:4"
+fuel = 128
+
+[[tests]]
+name = "pass_copy_nonoverlapping_zero_count"
+category = "intrinsics"
+upstream_path = "tests/pass/tree_borrows/copy-nonoverlapping.rs"
+miri_verdict = "pass:scalar:50:4"
+fuel = 128
+
+[[tests]]
+name = "ub_assume_false"
+category = "intrinsics"
+upstream_path = "tests/fail/intrinsics/assume.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_copy_nonoverlapping_overlapping"
+category = "intrinsics"
+upstream_path = "tests/fail/intrinsics/copy_overlapping.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_unreachable_executed"
+category = "intrinsics"
+upstream_path = "tests/fail/unreachable.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "pass_tb_reserved_mut_allow_parent_read"
+category = "tree_borrows"
+upstream_path = "tests/pass/tree_borrows/reserved.rs"
+miri_verdict = "pass:scalar:10:4"
+fuel = 128
+
+[[tests]]
+name = "pass_tb_shared_reborrow_coexistence"
+category = "tree_borrows"
+upstream_path = "tests/pass/tree_borrows/reborrow-is-read.rs"
+miri_verdict = "pass:scalar:50:4"
+fuel = 128
+
+[[tests]]
+name = "pass_tb_unsafe_cell_shared_mutation"
+category = "tree_borrows"
+upstream_path = "tests/pass/both_borrows/interior_mutability.rs"
+miri_verdict = "pass:scalar:42:4"
+fuel = 128
+[tests.known_anneal_bug]
+status = "open_bug"
+bug_class = "completeness_false_positive_ub"
+observed_anneal_tag = "ub"
+suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Memory"
+summary = "BorrowKind.shared unconditionally assigns Tree Borrows Permission.frozen without checking whether the pointee type contains UnsafeCell (!Freeze), rejecting valid interior-mutable writes with FailureKind.ub."
+
+[[tests]]
+name = "ub_tb_use_frozen_mut_after_parent_read"
+category = "tree_borrows"
+upstream_path = "tests/fail/both_borrows/outdated_local.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_tb_write_through_shared_ref_cast_mut"
+category = "tree_borrows"
+upstream_path = "tests/fail/both_borrows/shr_frozen_violation1.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_tb_conflicting_active_mut_borrows"
+category = "tree_borrows"
+upstream_path = "tests/fail/both_borrows/aliasing_mut1.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "ub_tb_parent_write_disables_shared_ref"
+category = "tree_borrows"
+upstream_path = "tests/fail/tree_borrows/parent_read_freezes_raw_mut.rs"
+miri_verdict = "ub"
+fuel = 128
+
+[[tests]]
+name = "pass_while_loop_sum"
+category = "control_flow_and_calls"
+upstream_path = "tests/pass/loops.rs"
+miri_verdict = "pass:scalar:10:4"
+fuel = 128
+
+[[tests]]
+name = "pass_match_switch_int_branch"
+category = "control_flow_and_calls"
+upstream_path = "tests/pass/enums.rs"
+miri_verdict = "pass:scalar:300:4"
+fuel = 128
+
+[[tests]]
+name = "pass_short_circuit_and_or"
+category = "control_flow_and_calls"
+upstream_path = "tests/pass/bools.rs"
+miri_verdict = "pass:scalar:10:4"
+fuel = 128
+
+[[tests]]
+name = "pass_direct_fn_call"
+category = "control_flow_and_calls"
+upstream_path = "tests/pass/calls.rs"
+miri_verdict = "pass:scalar:42:4"
+fuel = 128
+[tests.known_anneal_bug]
+status = "open_bug"
+bug_class = "incompleteness_unmodeled_intrinsic_or_call"
+observed_anneal_tag = "externalCall:miri_diff_corpus::helper_add_ten"
+suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Memory"
+summary = "initMachineState initializes emptyMemory with callees = [], and single-item verification does not automatically link intra-crate callee bodies (helper_add_ten) into Memory.callees."
+
+[[tests]]
+name = "panic_explicit_macro"
+category = "control_flow_and_calls"
+upstream_path = "tests/panic/panic1.rs"
+miri_verdict = "panic"
+fuel = 128
+[tests.known_anneal_bug]
+status = "open_bug"
+bug_class = "incompleteness_unmodeled_intrinsic_or_call"
+observed_anneal_tag = "externalCall:core::fmt::Arguments::<'a>::from_str"
+suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators"
+summary = "Explicit panic!(...) lowers to core::fmt::Arguments::from_str followed by diverging core::panicking::panic_fmt (target = none), which are not yet modeled as panicking terminators in evalCallTerminator."
