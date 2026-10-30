@@ -25,18 +25,13 @@ exocrate::config! {
 }
 
 exocrate::parse_remote_archive! {
-    const REMOTE_ARCHIVE: RemoteArchive = "Cargo.toml" [
-        (linux, x86_64),
-        (linux, aarch64),
-        (macos, x86_64),
-        (macos, aarch64),
-    ];
+    const REMOTE_ARCHIVE: RemoteArchive = "Cargo.toml";
 }
 
 /// Installs or resolves the Anneal toolchain archive in the user-global cache.
 ///
 /// Uses `local_archive` when set, falling back to the remote archive recorded
-/// in `[package.metadata.exocrate.<os>.<arch>]` for the current platform.
+/// in `[[package.metadata.exocrate]]` for the current platform.
 pub fn install(local_archive: Option<PathBuf>) -> Result<PathBuf, String> {
     let source = match local_archive {
         Some(path) => exocrate::Source::Local(path),
@@ -47,6 +42,7 @@ pub fn install(local_archive: Option<PathBuf>) -> Result<PathBuf, String> {
             exocrate::Location::UserGlobal,
             source,
         )
+        .map(|(dir, _)| dir)
         .map_err(|e| format!("failed to install Anneal toolchain: {e}"))
 }
 
