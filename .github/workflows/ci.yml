@@ -51,12 +51,16 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: stable
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@e847f25223456b3058e12f7fc9d777b6a6f25060 # v3.23.2
       - name: Run todo check
         run: ./ci/check_todo.sh
       - name: Run job dependency check
         run: ./ci/check_job_dependencies.sh
       - name: Run GitHub Actions validator
         run: ./ci/check_actions.sh
+      - name: Check Nix flake evaluation across all platforms
+        run: ./ci/check_flake_eval.sh
 
   # Used to signal to branch protections that all other jobs have succeeded.
   all-jobs-succeed:
