@@ -14,10 +14,11 @@ import Trusted.StepResult
 import Trusted.MirAst
 
 /-!
-# Trusted MIR Operational Semantics (`Trusted/MirSemantics.lean`)
+# Trusted MIR Semantics and Crate Theorem (`Trusted/MirSemantics.lean`)
 
 This module defines the small-step operational semantics `MirSem` for the
-minimal MIR fragment (`Trusted/MirAst.lean`).
+minimal MIR fragment (`Trusted/MirAst.lean`) and the top-level crate
+verification obligation `Trusted.CrateTheorem`.
 
 Every declaration in this file that models a Rust execution rule explains the
 correspondence and both quotes and cites the normative Rust Reference or `rustc`
@@ -25,10 +26,10 @@ documentation at the repository's pinned revisions
 (`rust-lang/reference@82da570bafd9efed421bdbae0f8603ede8dd308b` and
 `rust-lang/rust@58cf8f9c35b355199727627d07ae34a4e2846d67`).
 
-This module belongs to `trusted/lean/` and contains only definitions and
-structures (zero theorems). All proofs (`TotalStep`, `InhabitedDemonic`,
-adequacy canaries, and `id` verification lemmas) live in
-`theory/Anneal/MirLemmas.lean`.
+This module belongs to `trusted/lean/` and contains only definitions,
+structures, inductives, and opaque interfaces (zero theorems). All proofs
+(`TotalStep`, `InhabitedDemonic`, adequacy canaries, and `id` verification
+lemmas) live in `theory/Anneal/MirLemmas.lean`.
 -/
 
 namespace Trusted
@@ -269,5 +270,112 @@ def EnsuresEqArg (argLocal : Nat) : MirLang.Behavior :=
   MirLang.Spec (fun q out =>
     ∀ ret, out.outcome = .terminated (.normal ret) →
       q.init.locals argLocal = some ret)
+
+/-- Abstract type of compiled target artifacts produced by `rustc`.
+
+    Its constructor is marked `private` so external modules can only obtain a
+    `TargetArtifact` through the opaque `rustc` lowering function. -/
+@[candidate mir_semantics]
+structure TargetArtifact where
+  private mk ::
+  unit : Unit
+
+/-- Abstract `rustc` lowering from a `MirBody` to a `TargetArtifact`.
+
+    Declared `opaque` so that proofs cannot unfold target compilation and must
+    instead discharge target refinement via the audited `TCBItem.rustcLowering`
+    assumption in the crate's TCB list. -/
+@[candidate mir_semantics]
+opaque rustc : MirBody → TargetArtifact := fun _ => { unit := () }
+
+/-- Abstract operational behavior of a compiled `TargetArtifact`.
+
+    Declared `opaque` so that no theorem can rely on an implementation artifact
+    of `TargetSem`; any property of `TargetSem (rustc body)` must be derived
+    from `RustcCompiler.SoundOn body` and `MirSem body`. -/
+@[candidate mir_semantics]
+opaque TargetSem :
+    TargetArtifact → ExecQuery MirState → Partial (ExecOut Unit MirVal → Prop) :=
+  fun _ _ => Partial.ub
+
+/-- Target language of compiled `TargetArtifact`s. -/
+@[candidate mir_semantics]
+def TargetLang : Language where
+  Prog := TargetArtifact
+  Query := ExecQuery MirState
+  Out := ExecOut Unit MirVal
+  sem := TargetSem
+
+/-- Abstract compiler behavior mapping from MIR behaviors to target behaviors.
+
+    Declared `opaque` so that monotonicity (`Monotone π_c`) comes solely from
+    `RustcCompiler.SoundOn` via `TCBItem.rustcLowering`. -/
+@[candidate mir_semantics]
+opaque π_c : MirLang.Behavior → TargetLang.Behavior :=
+  fun b => b
+
+/-- `rustc` compiler lowering from `MirLang` to `TargetLang` under `π_c`. -/
+@[candidate mir_semantics]
+def RustcCompiler : Compiler MirLang TargetLang where
+  compile := rustc
+  π := π_c
+
+/-- Audited assumption category in a crate's Trusted Computing Base. -/
+@[candidate mir_semantics]
+inductive TCBItem where
+  /-- Standard compiler lowering assumption for a function: `RustcCompiler` is
+      sound on `body` (`RustcCompiler.SoundOn body`). Tagged with
+      `@[candidate rustc_capture]` because this assumption is emitted by the
+      `anneal-rustc-capture` pipeline when lowering a captured function. -/
+  | @[candidate rustc_capture] rustcLowering (fnName : String) (body : MirBody)
+  /-- Explicit user-supplied axiom assumption (`#[anneal::axiom]`). -/
+  | userAxiom (name : String) (prop : Prop)
+
+/-- Semantic meaning of each Rust `TCBItem` as a `TrustedAssumption`. -/
+@[candidate mir_semantics]
+instance instTrustedAssumptionTCBItem : TrustedAssumption TCBItem where
+  meaning
+    | .rustcLowering _ body => RustcCompiler.SoundOn body
+    | .userAxiom _ prop => prop
+
+/-- Default trust policy: standard `rustc` lowering assumptions are permitted;
+    unapproved user axioms are rejected (`False`). -/
+@[candidate mir_semantics]
+def defaultTrustPolicy : TrustPolicy TCBItem where
+  isAllowed
+    | .rustcLowering _ _ => True
+    | .userAxiom _ _ => False
+
+/-- Captured MIR function pairing its identifier (`name`), lowered `MirBody`
+    (`prog`), caller safety precondition (`pre`, defaulting to `fun _ => True`
+    for safe functions), and additional specifications (`specs`, defaulting to
+    `[]`). -/
+@[candidate mir_semantics]
+structure CapturedFn where
+  name : String
+  prog : MirBody
+  pre : ExecQuery MirState → Prop := fun _ => True
+  specs : List MirLang.Behavior := []
+
+/-- Captured Rust crate bundling its functions and TCB audit log. -/
+@[candidate mir_semantics]
+structure Crate where
+  functions : List CapturedFn
+  tcb : List TCBItem
+
+/-- Top-level theorem required of every verified Rust crate:
+    1. The crate contains at least one captured function (`c.functions ≠ []`).
+    2. Every captured function `fn ∈ c.functions` satisfies
+       `VerificationResultOn RustcCompiler defaultTrustPolicy c.tcb fn.prog
+       fn.pre fn.specs`
+       —proving that `c.tcb` complies with `defaultTrustPolicy` and, assuming
+       the meaning of every item in `c.tcb`, proving
+       `RustcCompiler.Verified fn.prog` on the non-empty specification list
+       `MirLang.WellFormedOn fn.pre :: fn.specs`. -/
+@[candidate mir_semantics]
+def CrateTheorem (c : Crate) : Prop :=
+  c.functions ≠ [] ∧
+  AllHold (c.functions.map (fun fn =>
+    VerificationResultOn RustcCompiler defaultTrustPolicy c.tcb fn.prog fn.pre fn.specs))
 
 end Trusted

@@ -15,9 +15,10 @@ import Anneal.StepResult
 # MIR Meta-Theorems, `id` Verification Lemmas, and Adequacy Canaries
 
 This module proves the structural non-vacuity properties (`TotalStep`,
-`InhabitedDemonic`) of `Trusted.MirMachine`, the source-level verification
-lemmas for `pub fn id(x: usize) -> usize { x }`, and the positive and negative
-Rust adequacy canaries:
+`InhabitedDemonic`) of `Trusted.MirMachine`, the verification lemmas for the
+`pub fn id(x: usize) -> usize { x }` vertical slice discharging
+`Trusted.CrateTheorem` via `Compiler.SoundOn.verify`, and the positive and
+negative Rust adequacy canaries:
 
 1. `canary_safe_infinite_loop`: a pure infinite loop (`bb0: { goto -> bb0; }`)
    satisfies `MirSem loopBody ≤ MirLang.WellFormed`.
@@ -345,6 +346,81 @@ theorem idMoveBody_satisfies_ensures :
 theorem idMoveBody_satisfies_wellFormed :
     MirSem idMoveBody ≤ MirLang.WellFormed :=
   Preorder.le_trans idMoveBody_satisfies_ensures (ensuresEqArg_le_wellFormed 1)
+
+/-- Generic single-function `CrateTheorem` discharge for an unannotated safe
+    function (`specs := []`) via `Compiler.SoundOn.verify`: given
+    `h_wf : MirSem body ≤ MirLang.WellFormed`, proves `CrateTheorem` for the
+    single-function crate containing `(fnName, body)` with TCB entry
+    `TCBItem.rustcLowering fnName body`. -/
+theorem verify_single_fn_wf_crate
+    (fnName : String) (body : MirBody)
+    (h_wf : MirSem body ≤ MirLang.WellFormed) :
+    CrateTheorem {
+      functions := [{ name := fnName, prog := body, specs := [] }]
+      tcb := [TCBItem.rustcLowering fnName body]
+    } := by
+  refine ⟨(by intro h; cases h), ⟨⟨True.intro, True.intro⟩, ?_⟩, True.intro⟩
+  intro hAssumptions
+  exact ⟨Compiler.SoundOn.verify hAssumptions.1 h_wf, True.intro⟩
+
+/-- Generic single-function `CrateTheorem` discharge via
+    `Compiler.SoundOn.verify` and `Compiler.Verified.with_wellFormedOn`: given
+    a proof `h_proof : MirSem body ≤ spec` and
+    `h_spec_wf : spec ≤ MirLang.WellFormed`, proves `CrateTheorem` for the
+    single-function crate containing `(fnName, body, [spec])` with TCB entry
+    `TCBItem.rustcLowering fnName body`. -/
+theorem verify_single_fn_crate
+    (fnName : String) (body : MirBody)
+    (spec : MirLang.Behavior)
+    (h_proof : MirSem body ≤ spec)
+    (h_spec_wf : spec ≤ MirLang.WellFormed) :
+    CrateTheorem {
+      functions := [{ name := fnName, prog := body, specs := [spec] }]
+      tcb := [TCBItem.rustcLowering fnName body]
+    } := by
+  refine ⟨(by intro h; cases h), ⟨⟨True.intro, True.intro⟩, ?_⟩, True.intro⟩
+  intro hAssumptions
+  exact Compiler.Verified.with_wellFormedOn
+    (Compiler.SoundOn.verify hAssumptions.1 h_proof)
+    h_spec_wf hAssumptions.1.1
+
+/-- Ready-to-apply `CrateTheorem` witness for `pub fn id` (`Operand.copy`,
+    `specs := [EnsuresEqArg 1]`). -/
+theorem prove_id_copy_ensures_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{ name := fnName, prog := idCopyBody, specs := [EnsuresEqArg 1] }]
+      tcb := [TCBItem.rustcLowering fnName idCopyBody]
+    } :=
+  verify_single_fn_crate fnName idCopyBody (EnsuresEqArg 1)
+    idCopyBody_satisfies_ensures (ensuresEqArg_le_wellFormed 1)
+
+/-- Ready-to-apply `CrateTheorem` witness for unannotated `pub fn id`
+    (`Operand.copy`, `specs := []`). -/
+theorem prove_id_copy_wf_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{ name := fnName, prog := idCopyBody, specs := [] }]
+      tcb := [TCBItem.rustcLowering fnName idCopyBody]
+    } :=
+  verify_single_fn_wf_crate fnName idCopyBody idCopyBody_satisfies_wellFormed
+
+/-- Ready-to-apply `CrateTheorem` witness for `pub fn id` (`Operand.move`,
+    `specs := [EnsuresEqArg 1]`). -/
+theorem prove_id_move_ensures_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{ name := fnName, prog := idMoveBody, specs := [EnsuresEqArg 1] }]
+      tcb := [TCBItem.rustcLowering fnName idMoveBody]
+    } :=
+  verify_single_fn_crate fnName idMoveBody (EnsuresEqArg 1)
+    idMoveBody_satisfies_ensures (ensuresEqArg_le_wellFormed 1)
+
+/-- Ready-to-apply `CrateTheorem` witness for unannotated `pub fn id`
+    (`Operand.move`, `specs := []`). -/
+theorem prove_id_move_wf_crate (fnName : String) :
+    CrateTheorem {
+      functions := [{ name := fnName, prog := idMoveBody, specs := [] }]
+      tcb := [TCBItem.rustcLowering fnName idMoveBody]
+    } :=
+  verify_single_fn_wf_crate fnName idMoveBody idMoveBody_satisfies_wellFormed
 
 /-!
 ## Positive and Negative Rust Adequacy Canaries
