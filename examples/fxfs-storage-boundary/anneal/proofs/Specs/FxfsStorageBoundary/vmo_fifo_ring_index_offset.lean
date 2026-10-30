@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsStorageBoundary.vmo_fifo_ring_index_offset
 import Obligations.FxfsStorageBoundary.vmo_fifo_ring_index_offset

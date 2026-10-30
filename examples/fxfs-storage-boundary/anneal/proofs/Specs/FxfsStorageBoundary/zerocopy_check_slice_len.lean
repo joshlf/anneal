@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsStorageBoundary.zerocopy_check_slice_len
 import Obligations.FxfsStorageBoundary.zerocopy_check_slice_len

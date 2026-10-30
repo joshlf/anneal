@@ -39,6 +39,12 @@ pub struct AuthoredItemModules {
     /// behavioral-equivalence surface (`StatefulEquivItemSpec` /
     /// `StatefulEquivVerificationResult`).
     pub is_equiv: bool,
+    /// Whether the authored specification or proof targets the modular
+    /// rely–guarantee surface (`ModularItemSpec` / `ModularVerificationResult`).
+    pub is_modular: bool,
+    /// Whether the authored specification or proof targets the scoped
+    /// UB-exception surface (`UbExceptionItemSpec` / `UbExceptionVerificationResult`).
+    pub is_ub_exception: bool,
 }
 
 /// A captured subject item paired with its canonical `<Item>` module path and
@@ -431,6 +437,28 @@ pub fn render_obligations_module_with_options(
     ));
 
     out.push_str(&format!(
+        "/-- Low-priority default `ModularItemSpec` instance for `{def_id}`. -/\n"
+    ));
+    out.push_str(&format!(
+        "instance (priority := low) defaultModularSpec :\n    \
+           ModularItemSpec \"{def_id}\" where\n  \
+           envAssumed := fun _ => True\n  \
+           pre := fun args _ => defaultPre args\n  \
+           post := fun args _ ret _ => defaultPost args ret\n\n"
+    ));
+
+    out.push_str(&format!(
+        "/-- Low-priority default `UbExceptionItemSpec` instance for `{def_id}`. -/\n"
+    ));
+    out.push_str(&format!(
+        "instance (priority := low) defaultUbExceptionSpec :\n    \
+           UbExceptionItemSpec \"{def_id}\" where\n  \
+           pre := fun args _ => defaultPre args\n  \
+           strictSafetyPre := fun _ _ => False\n  \
+           post := fun args _ ret _ => defaultPost args ret\n\n"
+    ));
+
+    out.push_str(&format!(
         "/-- Refine `defaultSpec` by conjoining additional Lean `extraPre` and\n    \
             `extraPost` clauses while preserving `rustRequires` and `rustEnsures`. -/\n\
          @[instance_reducible]\n         def refineSpec\n    \
@@ -493,6 +521,28 @@ pub fn render_obligations_module_with_options(
              StatefulEquivItemSpec \"{def_id}\" where\n  \
            specBody := specBody\n  \
            pre args m := And (rustRequires args) (extraPre args m)\n  \
+           post args m0 ret m1 := And (rustEnsures args ret) (extraPost args m0 ret m1)\n\n\
+         /-- Refine `defaultModularSpec` by supplying `envAssumed` and conjoining\n    \
+             additional stateful Lean `extraPre` and `extraPost` clauses while\n    \
+             preserving `rustRequires` and `rustEnsures`. -/\n\
+         @[instance_reducible]\n         def refineModularSpec\n    \
+             (envAssumed : ExternalCallHandler → Prop)\n    \
+             (extraPre : List Value → Memory → Prop)\n    \
+             (extraPost : List Value → Memory → Value → Memory → Prop) :\n    \
+             ModularItemSpec \"{def_id}\" where\n  \
+           envAssumed := envAssumed\n  \
+           pre args m := And (rustRequires args) (extraPre args m)\n  \
+           post args m0 ret m1 := And (rustEnsures args ret) (extraPost args m0 ret m1)\n\n\
+         /-- Refine `defaultUbExceptionSpec` by supplying the strict-safety subdomain\n    \
+             `strictSafetyPre` and conjoining additional stateful Lean `extraPre` and\n    \
+             `extraPost` clauses while preserving `rustRequires` and `rustEnsures`. -/\n\
+         @[instance_reducible]\n         def refineUbExceptionSpec\n    \
+             (strictSafetyPre : List Value → Memory → Prop)\n    \
+             (extraPre : List Value → Memory → Prop)\n    \
+             (extraPost : List Value → Memory → Value → Memory → Prop) :\n    \
+             UbExceptionItemSpec \"{def_id}\" where\n  \
+           pre args m := And (rustRequires args) (extraPre args m)\n  \
+           strictSafetyPre := strictSafetyPre\n  \
            post args m0 ret m1 := And (rustEnsures args ret) (extraPost args m0 ret m1)\n\n"
     ));
 
@@ -540,6 +590,24 @@ pub fn render_obligations_module_with_options(
     out.push_str(&format!(
         "def equivClaim [spec : StatefulEquivItemSpec \"{def_id}\"] : StatefulEquivClaim :=\n  \
            {{ implBody := Mir.{item}.body, specBody := spec.specBody, pre := spec.pre, post := spec.post }}\n\n"
+    ));
+
+    out.push_str(&format!(
+        "/-- Canonical modular verification claim for `{def_id}` synthesized\n    \
+            from `ModularItemSpec \"{def_id}\"`. -/\n"
+    ));
+    out.push_str(&format!(
+        "def modularClaim [spec : ModularItemSpec \"{def_id}\"] : ModularClaim :=\n  \
+           {{ body := Mir.{item}.body, envAssumed := spec.envAssumed, pre := spec.pre, post := spec.post }}\n\n"
+    ));
+
+    out.push_str(&format!(
+        "/-- Canonical scoped UB-exception verification claim for `{def_id}` synthesized\n    \
+            from `UbExceptionItemSpec \"{def_id}\"`. -/\n"
+    ));
+    out.push_str(&format!(
+        "def ubExceptionClaim [spec : UbExceptionItemSpec \"{def_id}\"] : UbExceptionClaim :=\n  \
+           {{ body := Mir.{item}.body, pre := spec.pre, strictSafetyPre := spec.strictSafetyPre, post := spec.post }}\n\n"
     ));
 
     out.push_str(&format!("end Obligations.{item}\n"));
@@ -602,7 +670,23 @@ pub fn render_verify_module_with_options(
     ));
 
     if authored.has_proof {
-        if authored.is_equiv {
+        if authored.is_ub_exception {
+            out.push_str(&format!(
+                "/-- Kernel-checked scoped UB-exception verification certificate for `{def_id}`. -/\n\
+                 theorem verified : UbExceptionVerificationResult Obligations.{item}.ubExceptionClaim :=\n  \
+                   Proof.{item}.verified\n\n\
+                 /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
+                 abbrev Certificate : Prop := UbExceptionVerificationResult Obligations.{item}.ubExceptionClaim\n\n"
+            ));
+        } else if authored.is_modular {
+            out.push_str(&format!(
+                "/-- Kernel-checked modular verification certificate for `{def_id}`. -/\n\
+                 theorem verified : ModularVerificationResult Obligations.{item}.modularClaim :=\n  \
+                   Proof.{item}.verified\n\n\
+                 /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
+                 abbrev Certificate : Prop := ModularVerificationResult Obligations.{item}.modularClaim\n\n"
+            ));
+        } else if authored.is_equiv {
             out.push_str(&format!(
                 "/-- Kernel-checked behavioral-equivalence verification certificate for `{def_id}`. -/\n\
                  theorem verified : StatefulEquivVerificationResult Obligations.{item}.equivClaim :=\n  \
@@ -806,7 +890,31 @@ pub fn render_proof_template_with_options(
          open Anneal.FunctionalTranslation\n\n"
     ));
 
-    if authored.is_equiv {
+    if authored.is_ub_exception {
+        out.push_str(&format!(
+            "/-!\n\
+             Durable scoped UB-exception proof module for `{def_id}`.\n\n\
+             Replace `sorry` below with a kernel-checked proof discharging\n\
+             `Obligations.{item}.ubExceptionClaim`.\n\
+             -/\n\n\
+             /-- Scoped UB-exception verification proof discharging `Obligations.{item}.ubExceptionClaim`. -/\n\
+             theorem verified : UbExceptionVerificationResult Obligations.{item}.ubExceptionClaim := by\n  \
+               sorry\n\n\
+             end Proof.{item}\n"
+        ));
+    } else if authored.is_modular {
+        out.push_str(&format!(
+            "/-!\n\
+             Durable modular proof module for `{def_id}`.\n\n\
+             Replace `sorry` below with a kernel-checked proof discharging\n\
+             `Obligations.{item}.modularClaim`.\n\
+             -/\n\n\
+             /-- Modular verification proof discharging `Obligations.{item}.modularClaim`. -/\n\
+             theorem verified : ModularVerificationResult Obligations.{item}.modularClaim := by\n  \
+               sorry\n\n\
+             end Proof.{item}\n"
+        ));
+    } else if authored.is_equiv {
         out.push_str(&format!(
             "/-!\n\
              Durable behavioral-equivalence proof module for `{def_id}`.\n\n\
@@ -1191,6 +1299,39 @@ mod tests {
         assert!(obligations.contains("def refineEquivSpec"));
         assert!(obligations.contains("def equivClaim [spec : StatefulEquivItemSpec \"my_crate::math::inc\"] : StatefulEquivClaim :="));
         assert!(obligations.contains("def totalClaim [spec : TotalItemSpec \"my_crate::math::inc\"] : TotalClaim :="));
+        assert!(obligations.contains("def refineModularSpec"));
+        assert!(obligations.contains("def refineUbExceptionSpec"));
+        assert!(obligations.contains("def modularClaim [spec : ModularItemSpec \"my_crate::math::inc\"] : ModularClaim :="));
+        assert!(obligations.contains("def ubExceptionClaim [spec : UbExceptionItemSpec \"my_crate::math::inc\"] : UbExceptionClaim :="));
+
+        let verify_modular = render_verify_module_with_options(
+            bundle,
+            AuthoredItemModules {
+                has_specs: true,
+                has_proof: true,
+                is_modular: true,
+                ..AuthoredItemModules::default()
+            },
+        );
+        assert!(verify_modular.contains(
+            "theorem verified : ModularVerificationResult Obligations.MyCrate.math.inc.modularClaim :=\n  Proof.MyCrate.math.inc.verified"
+        ));
+
+        let verify_ub_exc = render_verify_module_with_options(
+            bundle,
+            AuthoredItemModules {
+                has_specs: true,
+                has_proof: true,
+                is_ub_exception: true,
+                ..AuthoredItemModules::default()
+            },
+        );
+        assert!(verify_ub_exc.contains(
+            "theorem verified : UbExceptionVerificationResult Obligations.MyCrate.math.inc.ubExceptionClaim :=\n  Proof.MyCrate.math.inc.verified"
+        ));
+        assert!(verify_ub_exc.contains(
+            "abbrev Certificate : Prop := UbExceptionVerificationResult Obligations.MyCrate.math.inc.ubExceptionClaim"
+        ));
 
         let verify_equiv = render_verify_module_with_options(
             bundle,

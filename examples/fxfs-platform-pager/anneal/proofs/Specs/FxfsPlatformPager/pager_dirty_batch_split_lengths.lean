@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsPlatformPager.pager_dirty_batch_split_lengths
 import Obligations.FxfsPlatformPager.pager_dirty_batch_split_lengths

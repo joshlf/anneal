@@ -195,13 +195,38 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
         None
     };
 
-    let is_equiv = spec_text.as_deref().is_some_and(|text| {
-        text.contains("StatefulEquivItemSpec") || text.contains("refineEquivSpec")
-    }) || proof_text.as_deref().is_some_and(|text| {
-        text.contains("equivClaim") || text.contains("StatefulEquivVerificationResult")
+    let spec_is_ub_exception = spec_text.as_deref().is_some_and(|text| {
+        text.contains("UbExceptionItemSpec") || text.contains("refineUbExceptionSpec")
+    });
+    let spec_is_modular = spec_text.as_deref().is_some_and(|text| {
+        text.contains("ModularItemSpec") || text.contains("refineModularSpec")
     });
 
-    let is_total = !is_equiv
+    let is_ub_exception = !spec_is_modular
+        && (spec_is_ub_exception
+            || proof_text.as_deref().is_some_and(|text| {
+                text.contains("UbExceptionVerificationResult")
+                    || (text.contains("ubExceptionClaim")
+                        && !text.contains("ModularVerificationResult"))
+            }));
+
+    let is_modular = !is_ub_exception
+        && (spec_is_modular
+            || proof_text.as_deref().is_some_and(|text| {
+                text.contains("modularClaim") || text.contains("ModularVerificationResult")
+            }));
+
+    let is_equiv = !is_ub_exception
+        && !is_modular
+        && (spec_text.as_deref().is_some_and(|text| {
+            text.contains("StatefulEquivItemSpec") || text.contains("refineEquivSpec")
+        }) || proof_text.as_deref().is_some_and(|text| {
+            text.contains("equivClaim") || text.contains("StatefulEquivVerificationResult")
+        }));
+
+    let is_total = !is_ub_exception
+        && !is_modular
+        && !is_equiv
         && (spec_text.as_deref().is_some_and(|text| {
             text.contains("TotalItemSpec") || text.contains("refineTotalSpec")
         }) || proof_text.as_deref().is_some_and(|text| {
@@ -222,9 +247,15 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
         has_legacy_specs_defs,
         has_assumptions: assumptions_path.is_file(),
         has_proof,
-        is_stateful: !is_equiv && !is_total && (spec_is_stateful || proof_is_stateful),
+        is_stateful: !is_ub_exception
+            && !is_modular
+            && !is_equiv
+            && !is_total
+            && (spec_is_stateful || proof_is_stateful),
         is_total,
         is_equiv,
+        is_modular,
+        is_ub_exception,
     }
 }
 

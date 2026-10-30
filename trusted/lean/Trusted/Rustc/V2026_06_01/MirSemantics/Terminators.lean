@@ -339,6 +339,18 @@ def evalTerminator
           MirStepNode.extCall
             { defPath := defPath, args := argVals, memory := s.memory }
             (resumeExternalCall s locals' destination targetBb unwind)
+  -- Diverging call (`target == Option.none`, return type `!`):
+  -- `core::hint::unreachable_unchecked` (`library/core/src/hint.rs` at commit
+  -- `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65` and The Rust Reference 1.98.0,
+  -- "Behavior considered undefined",
+  -- <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>):
+  -- "Informs the compiler that this point in the code is not reachable,
+  -- enabling further optimizations. Reaching this function is completely
+  -- undefined behavior."
+  | .call func _ _ .none _ =>
+    match extractCalleeDefPath? func with
+    | .some "core::hint::unreachable_unchecked" => MirStepNode.fail .ub
+    | _ => MirStepNode.unsupported
   | .tailCall func argOps =>
     match extractCalleeDefPath? func with
     | .none => MirStepNode.unsupported

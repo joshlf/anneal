@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsPlatformPager.pager_query_vmo_stats_assume_init
 import Obligations.FxfsPlatformPager.pager_query_vmo_stats_assume_init

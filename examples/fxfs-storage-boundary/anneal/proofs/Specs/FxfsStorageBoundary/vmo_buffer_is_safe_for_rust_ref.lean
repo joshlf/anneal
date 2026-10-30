@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsStorageBoundary.vmo_buffer_is_safe_for_rust_ref
 import Obligations.FxfsStorageBoundary.vmo_buffer_is_safe_for_rust_ref
