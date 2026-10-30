@@ -33,7 +33,7 @@ This module proves the foundational algebraic properties that fall out of
 3. **Transitive pass composition (`pass_trans`, `Compiles.comp`,
    `Abstracts.comp`), cross-pass verification (`Compiler.SoundOn.verify`,
    `verify_through_passes`), and specification weakening
-   (`Compiler.Verified.mono`):**
+   (`Compiler.Verified.mono`, `Compiler.Verified.with_wellFormedOn`):**
    Because `Partial` internalizes definedness into `≤`, composing compiler
    passes (`Compiles`) and verifier abstractions (`Abstracts`) reduces directly
    to `Preorder.le_trans` and `Monotone`.
@@ -270,5 +270,19 @@ theorem Compiler.Verified.mono
   ⟨Preorder.le_trans h_ver.1 h_le,
    h_ver.2.1,
    Preorder.le_trans h_ver.2.2 (h_mono h_le)⟩
+
+/-- Combine a proof of `C.Verified s spec` with `spec ≤ L_src.WellFormedOn pre`
+    to discharge
+    `AllHold ((L_src.WellFormedOn pre :: [spec]).map (C.Verified s))`
+    in `VerificationResultOn`. -/
+theorem Compiler.Verified.with_wellFormedOn
+    {L_src L_tgt : Language}
+    {C : Compiler L_src L_tgt}
+    {s : L_src.Prog} {pre : L_src.Query → Prop} {spec : L_src.Behavior}
+    (h_ver : C.Verified s spec)
+    (h_wf : spec ≤ L_src.WellFormedOn pre)
+    (h_mono : Monotone C.π) :
+    AllHold ((L_src.WellFormedOn pre :: [spec]).map (C.Verified s)) :=
+  ⟨Compiler.Verified.mono h_ver h_wf h_mono, h_ver, True.intro⟩
 
 end Anneal
