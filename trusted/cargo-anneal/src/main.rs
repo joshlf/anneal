@@ -6,90 +6,192 @@
 // This file may not be copied, modified, or distributed except according to
 // those terms.
 
-//! CLI entrypoint for `cargo-anneal`.
-
-mod setup;
+//! Trusted CLI entry point (`cargo-anneal`).
+//!
+//! Supports both direct invocation (`cargo-anneal <subcommand>`) and Cargo
+//! subcommand invocation (`cargo anneal <subcommand>`). All effectful stages—
+//! `rustc` MIR capture (`anneal-rustc-capture`) and kernel verification
+//! (`anneal-audit`)—execute inside `trusted/`.
 
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-fn print_help() {
-    println!(
-        "\
-cargo-anneal {}
+use clap::error::ErrorKind;
+use clap::{Parser, Subcommand};
 
-USAGE:
-    cargo anneal <SUBCOMMAND>
-    cargo-anneal <SUBCOMMAND>
+use cargo_anneal::setup;
+use cargo_anneal::{
+    Json, ReleaseChannel, VerifyOptions, verify_crate_with_report,
+};
 
-SUBCOMMANDS:
-    setup [--local-archive <path>]    Install the pinned Anneal toolchain archive
-
-OPTIONS:
-    -h, --help       Print help information
-    -V, --version    Print version information",
-        env!("CARGO_PKG_VERSION")
-    );
+#[derive(Parser)]
+#[command(
+    name = "cargo-anneal",
+    version,
+    about = "Deductive verification CLI for Anneal"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
 }
 
-fn run_setup_cli(args: &[String]) -> ExitCode {
-    let mut local_archive: Option<PathBuf> = None;
-    let mut iter = args.iter().map(String::as_str);
-    while let Some(arg) = iter.next() {
-        match arg {
-            "--local-archive" => {
-                let Some(val) = iter.next() else {
-                    eprintln!("error: --local-archive requires a path");
-                    return ExitCode::from(2);
-                };
-                local_archive = Some(PathBuf::from(val));
-            }
-            "--help" | "-h" => {
-                println!(
-                    "Usage: cargo anneal setup [--local-archive <path>]"
-                );
-                return ExitCode::SUCCESS;
-            }
-            other => {
-                eprintln!("error: unknown setup argument `{other}`");
-                return ExitCode::from(2);
-            }
-        }
-    }
-
-    match setup::install(local_archive) {
-        Ok(root) => {
-            println!("Installed Anneal toolchain at {}", root.display());
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            eprintln!("error: {err}");
-            ExitCode::from(1)
-        }
-    }
+#[derive(Subcommand)]
+enum Commands {
+    /// Install the pinned Anneal Rust and Lean 4 toolchain bundle.
+    Setup {
+        /// Optional path to a local toolchain archive.
+        #[arg(long)]
+        local_archive: Option<PathBuf>,
+    },
+    /// Capture MIR and verify a Rust crate in the Lean 4 kernel.
+    Verify {
+        /// Target crate directory (defaults to `.`).
+        crate_dir: Option<PathBuf>,
+        /// Preserve an existing `.anneal/Proof.lean` instead of regenerating it.
+        #[arg(long)]
+        keep_proof: bool,
+        /// Comma-separated candidate-trusted features to allow (or `*`).
+        #[arg(long, value_delimiter = ',')]
+        allow_candidate_features: Option<Vec<String>>,
+        /// Release channel override (`alpha` or `stable`).
+        #[arg(long)]
+        release_channel: Option<String>,
+        /// Absolute path to the Lean 4 binary.
+        #[arg(long)]
+        lean: Option<PathBuf>,
+        /// Path to the Anneal repository root.
+        #[arg(long)]
+        anneal_root: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
-    let mut args: Vec<String> = env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("anneal") {
-        args.remove(0);
+    match run(env::args().collect()) {
+        Ok(code) => ExitCode::from(code),
+        Err((code, msg)) => {
+            eprintln!("{msg}");
+            ExitCode::from(code)
+        }
+    }
+}
+
+fn emit_unused_candidate_warnings(report: &Json) {
+    if let Some(unused) = report
+        .get("crateVerification")
+        .and_then(|cv| cv.get("unusedCandidateFeatures"))
+        .and_then(Json::as_array)
+    {
+        for item in unused {
+            if let Some(feat) = item.as_str() {
+                eprintln!(
+                    "warning: candidate-trusted feature `{feat}` in `allow-candidate-features` was not used during verification (it may be unused or may have graduated to @[vetted])"
+                );
+            }
+        }
+    }
+}
+
+fn active_candidate_features(report: &Json) -> Vec<String> {
+    report
+        .get("crateVerification")
+        .and_then(|cv| cv.get("candidateFeatures"))
+        .and_then(Json::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn validate_lean_path(lean: Option<PathBuf>) -> Result<Option<PathBuf>, (u8, String)> {
+    if let Some(ref pb) = lean
+        && !pb.is_absolute()
+    {
+        return Err((2, "error: --lean must be absolute".to_string()));
+    }
+    Ok(lean)
+}
+
+fn run(mut raw_args: Vec<String>) -> Result<u8, (u8, String)> {
+    if raw_args.get(1).map(String::as_str) == Some("anneal") {
+        raw_args.remove(1);
     }
 
-    match args.first().map(String::as_str) {
-        None | Some("--help") | Some("-h") | Some("help") => {
-            print_help();
-            ExitCode::SUCCESS
+    let cli = match Cli::try_parse_from(raw_args) {
+        Ok(c) => c,
+        Err(e) => {
+            if matches!(
+                e.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                print!("{e}");
+                return Ok(0);
+            }
+            return Err((2, e.to_string().trim_end().to_string()));
         }
-        Some("--version") | Some("-V") => {
-            println!("cargo-anneal {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
-        }
-        Some("setup") => run_setup_cli(&args[1..]),
-        Some(other) => {
-            eprintln!("error: unknown subcommand `{other}`");
-            print_help();
-            ExitCode::from(2)
+    };
+
+    match cli.command {
+        Commands::Setup { local_archive } => match setup::install(local_archive)
+        {
+            Ok(root) => {
+                println!("Installed Anneal toolchain at {}", root.display());
+                Ok(0)
+            }
+            Err(err) => Err((1, format!("error: {err}"))),
+        },
+        Commands::Verify {
+            crate_dir,
+            keep_proof,
+            allow_candidate_features,
+            release_channel,
+            lean,
+            anneal_root,
+        } => {
+            let lean_bin = validate_lean_path(lean)?;
+            let release_channel = match release_channel {
+                Some(raw) => Some(
+                    ReleaseChannel::parse(&raw)
+                        .map_err(|e| (2, format!("error: {e}")))?,
+                ),
+                None => None,
+            };
+            let allow_candidate_features = allow_candidate_features.map(|list| {
+                list.into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            });
+            let options = VerifyOptions {
+                anneal_root,
+                lean_bin,
+                rustc_capture_bin: None,
+                keep_proof,
+                release_channel,
+                allow_candidate_features,
+            };
+            let target_dir = crate_dir.unwrap_or_else(|| PathBuf::from("."));
+            let (output, report) =
+                verify_crate_with_report(&target_dir, &options)
+                    .map_err(|e| (1, format!("error: {e}")))?;
+            emit_unused_candidate_warnings(&report);
+            let fn_names: Vec<&str> =
+                output.functions.iter().map(|f| f.name.as_str()).collect();
+            println!(
+                "verified: crate at {} passed Trusted.CrateTheorem ({})",
+                target_dir.display(),
+                fn_names.join(", ")
+            );
+            let candidates = active_candidate_features(&report);
+            if !candidates.is_empty() {
+                println!(
+                    "Candidate-Trusted TCB (Unvetted / Alpha): {}",
+                    candidates.join(", ")
+                );
+            }
+            Ok(0)
         }
     }
 }
