@@ -1,0 +1,15 @@
+name = "AnnealExamples"
+defaultTargets = ["Smoke"]
+
+[[lean_lib]]
+name = "Trusted"
+srcDir = "../trusted/lean"
+
+[[lean_lib]]
+name = "Anneal"
+srcDir = "../theory"
+
+[[lean_lib]]
+name = "Smoke"
+srcDir = "."
+roots = ["Smoke"]

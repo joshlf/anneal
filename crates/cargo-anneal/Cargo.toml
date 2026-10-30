@@ -1,0 +1,8 @@
+[package]
+name = "cargo-anneal"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anneal-rustc-capture = { path = "../../trusted/rustc-capture" }
