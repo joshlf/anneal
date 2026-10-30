@@ -1,0 +1,18 @@
+/target/
+**/.lake/
+**/*.olean
+**/*.olean.server
+**/*.olean.private
+**/*.ilean
+**/*.ir
+**/*.ir.sig
+__pycache__/
+*.pyc
+# Build and verification artifacts that running `cargo anneal` inside example
+# crates (examples/tutor*/, examples/wireframe-demo/) leaves behind.
+/examples/tutor*/target/
+/examples/tutor*/.anneal/
+/examples/tutor*/Cargo.lock
+/examples/wireframe-demo/target/
+/examples/wireframe-demo/.anneal/
+/examples/wireframe-demo/Cargo.lock
