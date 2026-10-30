@@ -8,6 +8,8 @@
 
 //! Trusted CLI orchestration library for `cargo-anneal`.
 
+pub mod setup;
+
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -22,15 +24,21 @@ pub struct VerifyOptions {
     pub rustc_capture_bin: Option<PathBuf>,
 }
 
-/// Resolves the Anneal repository root from `options.anneal_root`, the
-/// `ANNEAL_ROOT` environment variable, or the workspace ancestor of
-/// `CARGO_MANIFEST_DIR`.
+/// Resolves the Anneal foundation root from `options.anneal_root`, the
+/// `ANNEAL_ROOT` environment variable, an installed `exocrate` toolchain, or
+/// the workspace ancestor of `CARGO_MANIFEST_DIR`.
 pub fn resolve_anneal_root(options: &VerifyOptions) -> Result<PathBuf, String> {
     if let Some(root) = &options.anneal_root {
         return Ok(root.clone());
     }
     if let Some(env_root) = env::var_os("ANNEAL_ROOT") {
         return Ok(PathBuf::from(env_root));
+    }
+    if let Some(tc) = setup::resolve_installed_toolchain() {
+        let share_root = tc.anneal_share_root();
+        if share_root.is_dir() {
+            return Ok(share_root);
+        }
     }
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
@@ -43,21 +51,39 @@ pub fn resolve_anneal_root(options: &VerifyOptions) -> Result<PathBuf, String> {
         })
 }
 
-/// Resolves an explicit Lean binary override from `options.lean_bin` or the
-/// `ANNEAL_LEAN_BIN` environment variable.
+/// Resolves the Lean binary from `options.lean_bin`, the `ANNEAL_LEAN_BIN`
+/// environment variable, or an installed `exocrate` toolchain.
 pub fn resolve_lean_bin(options: &VerifyOptions) -> Option<PathBuf> {
     if let Some(lean) = &options.lean_bin {
         return Some(lean.clone());
     }
-    env::var_os("ANNEAL_LEAN_BIN").map(PathBuf::from)
+    if let Some(env_lean) = env::var_os("ANNEAL_LEAN_BIN") {
+        return Some(PathBuf::from(env_lean));
+    }
+    if let Some(tc) = setup::resolve_installed_toolchain() {
+        let bin = tc.lean_bin();
+        if bin.is_file() {
+            return Some(bin);
+        }
+    }
+    None
 }
 
-/// Resolves an explicit `anneal-rustc-capture` binary override from
-/// `options.rustc_capture_bin` or the `ANNEAL_RUSTC_CAPTURE_BIN` environment
-/// variable.
+/// Resolves the `anneal-rustc-capture` binary from `options.rustc_capture_bin`,
+/// the `ANNEAL_RUSTC_CAPTURE_BIN` environment variable, or an installed
+/// `exocrate` toolchain.
 pub fn resolve_rustc_capture_bin(options: &VerifyOptions) -> Option<PathBuf> {
     if let Some(bin) = &options.rustc_capture_bin {
         return Some(bin.clone());
     }
-    env::var_os("ANNEAL_RUSTC_CAPTURE_BIN").map(PathBuf::from)
+    if let Some(env_bin) = env::var_os("ANNEAL_RUSTC_CAPTURE_BIN") {
+        return Some(PathBuf::from(env_bin));
+    }
+    if let Some(tc) = setup::resolve_installed_toolchain() {
+        let bin = tc.rustc_capture_bin();
+        if bin.is_file() {
+            return Some(bin);
+        }
+    }
+    None
 }
