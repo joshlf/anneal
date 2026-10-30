@@ -59,6 +59,8 @@ jobs:
         run: ./ci/check_job_dependencies.sh
       - name: Run GitHub Actions validator
         run: ./ci/check_actions.sh
+      - name: Run release manifest helper unit tests
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s ci -p 'test_*.py'
       - name: Check Nix flake evaluation across all platforms
         run: ./ci/check_flake_eval.sh
 
