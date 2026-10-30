@@ -168,7 +168,17 @@ def evalCopySingleDirect
   match overlaps with
   | true => MirStepNode.fail .ub
   | false =>
-    match get? locals₃ srcEntry.targetLocal with
+    let srcRootSlot : Option LocalSlot :=
+      match get? locals₃ srcEntry.targetLocal with
+      | .some slot => .some slot
+      | .none =>
+        match get? s.memory.callerLocals srcEntry.targetLocal with
+        | .some slot => .some slot
+        | .none =>
+          get?
+            s.memory.callerLocals
+            (Nat.sub srcEntry.targetLocal (length locals₃))
+    match srcRootSlot with
     | .some (.init srcRootVal) =>
       match
         readProjectedValue
@@ -226,8 +236,6 @@ def evalCopySingleDirect
               dstPlace
               finalVal
           with
-          | .ub => MirStepNode.fail .ub
-          | .unsupported => MirStepNode.unsupported
           | .ok locals₄ =>
             let borrows' :=
               invalidateConflictingBorrows
@@ -239,6 +247,107 @@ def evalCopySingleDirect
                 s
                 locals₄
                 { s.memory with borrows := borrows' })
+          | .unsupported => MirStepNode.unsupported
+          | .ub =>
+            match get? locals₃ dstPlace.local_ with
+            | .some _ => MirStepNode.fail .ub
+            | .none =>
+              let callerIdx :=
+                match get? s.memory.callerLocals dstPlace.local_ with
+                | .some _ => dstPlace.local_
+                | .none => Nat.sub dstPlace.local_ (length locals₃)
+              let coerceToCallerDst (oldVal : Value) : Value :=
+                match oldVal, finalVal with
+                | .aggregate 0 dstElems, .scalar sc =>
+                  match
+                    Bool.and
+                      (Bool.not (Nat.beq sc.sizeBytes 1))
+                      (Nat.ble sc.sizeBytes (length dstElems))
+                  with
+                  | false => finalVal
+                  | true =>
+                    match
+                      encodeUntypedValueToBytes defaultCodecFuel finalVal
+                    with
+                    | .none => finalVal
+                    | .some bs =>
+                      match
+                        decodeArrayChunksWith
+                          (fun chunk =>
+                            decodeValueFromBytes
+                              defaultCodecFuel
+                              layouts
+                              { kind := .uint .u8, layoutIdx := 0 }
+                              chunk)
+                          1
+                          (length bs)
+                          bs
+                      with
+                      | .some copiedBytes =>
+                        .aggregate 0 (spliceValues copiedBytes 0 dstElems)
+                      | .none => finalVal
+                | _, _ => finalVal
+              let callerWriteRes : PlaceWriteResult :=
+                match dstPlace.projection with
+                | .nil =>
+                  match get? s.memory.callerLocals callerIdx with
+                  | .some .dead => .ub
+                  | .some (.init oldVal) =>
+                    let coercedVal := coerceToCallerDst oldVal
+                    match
+                      set? s.memory.callerLocals callerIdx (.init coercedVal)
+                    with
+                    | .some callerLocals' => .ok callerLocals'
+                    | .none => .ub
+                  | .some .uninit =>
+                    match
+                      set? s.memory.callerLocals callerIdx (.init finalVal)
+                    with
+                    | .some callerLocals' => .ok callerLocals'
+                    | .none => .ub
+                  | .none => .ub
+                | .deref :: _ => .ub
+                | proj :: rest =>
+                  match get? s.memory.callerLocals callerIdx with
+                  | .some (.init rootVal) =>
+                    let coercedVal :=
+                      match
+                        readProjectedValue locals₃ rootVal (proj :: rest)
+                      with
+                      | .ok oldSubVal => coerceToCallerDst oldSubVal
+                      | _ => finalVal
+                    match
+                      writeProjectedValue
+                        locals₃
+                        rootVal
+                        (proj :: rest)
+                        coercedVal
+                    with
+                    | .ok rootVal' =>
+                      match
+                        set? s.memory.callerLocals callerIdx (.init rootVal')
+                      with
+                      | .some callerLocals' => .ok callerLocals'
+                      | .none => .ub
+                    | .ub => .ub
+                    | .unsupported => .unsupported
+                  | _ => .ub
+              match callerWriteRes with
+              | .ub => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
+              | .ok callerLocals' =>
+                let borrows' :=
+                  invalidateConflictingBorrows
+                    s.memory.borrows
+                    dstEntry.targetLocal
+                    (.some dstPtr.tag)
+                MirStepNode.step
+                  (advanceStmt
+                    s
+                    locals₃
+                    { s.memory with
+                      borrows := borrows'
+                      callerLocals := callerLocals' })
     | _ => MirStepNode.fail .ub
 
 /--
@@ -290,67 +399,107 @@ def evalCopyNonOverlappingWithCount
               dstEntry
               locals₃
           | false =>
-            match
-              get? locals₃ srcEntry.targetLocal,
-              get? locals₃ dstEntry.targetLocal
-            with
+            let srcRootSlot : Option LocalSlot :=
+              match get? locals₃ srcEntry.targetLocal with
+              | .some slot => .some slot
+              | .none =>
+                match get? s.memory.callerLocals srcEntry.targetLocal with
+                | .some slot => .some slot
+                | .none =>
+                  get?
+                    s.memory.callerLocals
+                    (Nat.sub srcEntry.targetLocal (length locals₃))
+            let dstRootSlot : Option LocalSlot :=
+              match get? locals₃ dstEntry.targetLocal with
+              | .some slot => .some slot
+              | .none =>
+                match get? s.memory.callerLocals dstEntry.targetLocal with
+                | .some slot => .some slot
+                | .none =>
+                  get?
+                    s.memory.callerLocals
+                    (Nat.sub dstEntry.targetLocal (length locals₃))
+            match srcRootSlot, dstRootSlot with
             | .some (.init srcRootVal), .some (.init dstRootVal) =>
-              match
-                readProjectedValue
-                  locals₃
-                  srcRootVal
-                  srcEntry.targetProjection,
-                readProjectedValue
-                  locals₃
-                  dstRootVal
-                  dstEntry.targetProjection
-              with
-              | .ok (.aggregate 0 srcElems),
-                .ok (.aggregate 0 dstElems) =>
-                let inBounds :=
-                  Bool.and
-                    (Nat.ble (Nat.add srcStart n) (length srcElems))
-                    (Nat.ble (Nat.add dstStart n) (length dstElems))
-                match inBounds with
-                | false => MirStepNode.fail .ub
-                | true =>
-                  let sameContainer :=
-                    Bool.and
-                      (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
-                      (projectionsOverlap
-                        srcEntry.targetProjection
-                        dstEntry.targetProjection)
-                  let disjoint :=
-                    match Nat.beq srcPtr.tag dstPtr.tag with
-                    | true => false
-                    | false =>
-                      match sameContainer with
-                      | false => true
-                      | true =>
-                        Bool.or
-                          (Nat.ble (Nat.add srcStart n) dstStart)
-                          (Nat.ble (Nat.add dstStart n) srcStart)
-                  match disjoint with
-                  | false => MirStepNode.fail .ub
-                  | true =>
-                    let copiedSlice :=
-                      takeValues n (dropValues srcStart srcElems)
-                    let dstElems' :=
-                      spliceValues copiedSlice dstStart dstElems
-                    let dstPlace : Place := {
-                      local_ := dstEntry.targetLocal
-                      projection := dstEntry.targetProjection
-                    }
-                    match
-                      writePlaceValue
-                        locals₃
-                        s.memory.borrows
-                        dstPlace
-                        (.aggregate 0 dstElems')
-                    with
+              let dstPlace : Place := {
+                local_ := dstEntry.targetLocal
+                projection := dstEntry.targetProjection
+              }
+              let dstLocalPlaceTy : Option Ty :=
+                match get? locals₃ dstPlace.local_ with
+                | .some _ => placeTy localDecls layouts dstPlace
+                | .none => .none
+              let dstIsAdt : Bool :=
+                match dstLocalPlaceTy with
+                | .some { kind := .adt _ _, .. } => true
+                | _ => false
+              let writeDstVal (newVal : Value) : MirStepNode :=
+                match
+                  writePlaceValue
+                    locals₃
+                    s.memory.borrows
+                    dstPlace
+                    newVal
+                with
+                | .ok locals₄ =>
+                  let borrows' :=
+                    invalidateConflictingBorrows
+                      s.memory.borrows
+                      dstEntry.targetLocal
+                      (.some dstPtr.tag)
+                  MirStepNode.step
+                    (advanceStmt
+                      s
+                      locals₄
+                      { s.memory with borrows := borrows' })
+                | .unsupported => MirStepNode.unsupported
+                | .ub =>
+                  match get? locals₃ dstPlace.local_ with
+                  | .some _ => MirStepNode.fail .ub
+                  | .none =>
+                    let callerIdx :=
+                      match get? s.memory.callerLocals dstPlace.local_ with
+                      | .some _ => dstPlace.local_
+                      | .none => Nat.sub dstPlace.local_ (length locals₃)
+                    let callerWriteRes : PlaceWriteResult :=
+                      match dstPlace.projection with
+                      | .nil =>
+                        match get? s.memory.callerLocals callerIdx with
+                        | .some .dead => .ub
+                        | .some _ =>
+                          match
+                            set? s.memory.callerLocals callerIdx (.init newVal)
+                          with
+                          | .some callerLocals' => .ok callerLocals'
+                          | .none => .ub
+                        | .none => .ub
+                      | .deref :: _ => .ub
+                      | proj :: rest =>
+                        match get? s.memory.callerLocals callerIdx with
+                        | .some (.init rootVal) =>
+                          match
+                            writeProjectedValue
+                              locals₃
+                              rootVal
+                              (proj :: rest)
+                              newVal
+                          with
+                          | .ok rootVal' =>
+                            match
+                              set?
+                                s.memory.callerLocals
+                                callerIdx
+                                (.init rootVal')
+                            with
+                            | .some callerLocals' => .ok callerLocals'
+                            | .none => .ub
+                          | .ub => .ub
+                          | .unsupported => .unsupported
+                        | _ => .ub
+                    match callerWriteRes with
                     | .ub => MirStepNode.fail .ub
                     | .unsupported => MirStepNode.unsupported
-                    | .ok locals₄ =>
+                    | .ok callerLocals' =>
                       let borrows' :=
                         invalidateConflictingBorrows
                           s.memory.borrows
@@ -359,9 +508,13 @@ def evalCopyNonOverlappingWithCount
                       MirStepNode.step
                         (advanceStmt
                           s
-                          locals₄
-                          { s.memory with borrows := borrows' })
-              | .ok srcSubVal, .ok _ =>
+                          locals₃
+                          { s.memory with
+                            borrows := borrows'
+                            callerLocals := callerLocals' })
+              let copyViaBytes
+                  (srcSubVal dstSubVal : Value) :
+                  MirStepNode :=
                 let overlaps :=
                   match Nat.beq srcPtr.tag dstPtr.tag with
                   | true => true
@@ -387,57 +540,143 @@ def evalCopyNonOverlappingWithCount
                         .some
                           (.aggregate 0
                             (takeValues n (dropValues srcStart srcElems)))
-                      | false => .none
+                      | false =>
+                        match Nat.beq srcStart 0 with
+                        | true => .some srcSubVal
+                        | false => .none
                     | _ => .some srcSubVal
-                  let dstPlace : Place := {
-                    local_ := dstEntry.targetLocal
-                    projection := dstEntry.targetProjection
-                  }
                   let dstTargetTyOpt : Option Ty :=
-                    match placeTy localDecls layouts dstPlace with
+                    match dstLocalPlaceTy with
                     | .some t => .some t
                     | .none => operandPointeeTy localDecls layouts dst
-                  match srcSliceVal, dstTargetTyOpt with
-                  | .some sVal, .some dstPt =>
-                    match
-                      encodeUntypedValueToBytes defaultCodecFuel sVal,
-                      rigidTyByteSize layouts dstPt
-                    with
-                    | .some bs, .some dstBytes =>
-                      match Nat.beq (length bs) dstBytes with
-                      | false => MirStepNode.unsupported
-                      | true =>
-                        match
-                          decodeValueFromBytes
-                            defaultCodecFuel
-                            layouts
-                            dstPt
-                            bs
-                        with
-                        | .none => MirStepNode.fail .ub
-                        | .some decodedVal =>
+                  match srcSliceVal with
+                  | .none => MirStepNode.fail .ub
+                  | .some sVal =>
+                    match encodeUntypedValueToBytes defaultCodecFuel sVal with
+                    | .none => MirStepNode.unsupported
+                    | .some bs =>
+                      let spliceBytesToDstArray : Option Value :=
+                        match Bool.not dstIsAdt, dstSubVal with
+                        | true, .aggregate 0 dstElems =>
                           match
-                            writePlaceValue
-                              locals₃
-                              s.memory.borrows
-                              dstPlace
-                              decodedVal
+                            Nat.ble
+                              (Nat.add dstStart (length bs))
+                              (length dstElems)
                           with
-                          | .ub => MirStepNode.fail .ub
-                          | .unsupported => MirStepNode.unsupported
-                          | .ok locals₄ =>
-                            let borrows' :=
-                              invalidateConflictingBorrows
-                                s.memory.borrows
-                                dstEntry.targetLocal
-                                (.some dstPtr.tag)
-                            MirStepNode.step
-                              (advanceStmt
-                                s
-                                locals₄
-                                { s.memory with borrows := borrows' })
-                    | _, _ => MirStepNode.unsupported
-                  | _, _ => MirStepNode.fail .ub
+                          | false => .none
+                          | true =>
+                            match
+                              decodeArrayChunksWith
+                                (fun chunk =>
+                                  decodeValueFromBytes
+                                    defaultCodecFuel
+                                    layouts
+                                    { kind := .uint .u8, layoutIdx := 0 }
+                                    chunk)
+                                1
+                                (length bs)
+                                bs
+                            with
+                            | .some copiedBytes =>
+                              .some
+                                (.aggregate 0
+                                  (spliceValues copiedBytes dstStart dstElems))
+                            | .none => .none
+                        | _, _ => .none
+                      let preferSplicedArray : Bool :=
+                        match dstLocalPlaceTy, dstSubVal with
+                        | .none, .aggregate 0 _ => true
+                        | _, _ => false
+                      match preferSplicedArray, spliceBytesToDstArray with
+                      | true, .some splicedVal => writeDstVal splicedVal
+                      | _, _ =>
+                        match dstTargetTyOpt with
+                        | .some dstPt =>
+                          match rigidTyByteSize layouts dstPt with
+                          | .some dstBytes =>
+                            match Nat.beq (length bs) dstBytes with
+                            | true =>
+                              match
+                                decodeValueFromBytes
+                                  defaultCodecFuel
+                                  layouts
+                                  dstPt
+                                  bs
+                              with
+                              | .some decodedVal => writeDstVal decodedVal
+                              | .none =>
+                                match spliceBytesToDstArray with
+                                | .some splicedVal => writeDstVal splicedVal
+                                | .none => MirStepNode.fail .ub
+                            | false =>
+                              match spliceBytesToDstArray with
+                              | .some splicedVal => writeDstVal splicedVal
+                              | .none => MirStepNode.unsupported
+                          | .none =>
+                            match spliceBytesToDstArray with
+                            | .some splicedVal => writeDstVal splicedVal
+                            | .none => MirStepNode.unsupported
+                        | .none =>
+                          match spliceBytesToDstArray with
+                          | .some splicedVal => writeDstVal splicedVal
+                          | .none => MirStepNode.fail .ub
+              match
+                readProjectedValue
+                  locals₃
+                  srcRootVal
+                  srcEntry.targetProjection,
+                readProjectedValue
+                  locals₃
+                  dstRootVal
+                  dstEntry.targetProjection
+              with
+              | .ok (.aggregate 0 srcElems),
+                .ok (.aggregate 0 dstElems) =>
+                let inBounds :=
+                  Bool.and
+                    (Bool.not dstIsAdt)
+                    (Bool.and
+                      (Nat.ble (Nat.add srcStart n) (length srcElems))
+                      (Nat.ble (Nat.add dstStart n) (length dstElems)))
+                match inBounds with
+                | false =>
+                  match
+                    Bool.and
+                      (Nat.beq dstStart 0)
+                      (Nat.ble (Nat.add srcStart n) (length srcElems))
+                  with
+                  | true =>
+                    copyViaBytes
+                      (.aggregate 0 srcElems)
+                      (.aggregate 0 dstElems)
+                  | false => MirStepNode.fail .ub
+                | true =>
+                  let sameContainer :=
+                    Bool.and
+                      (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
+                      (projectionsOverlap
+                        srcEntry.targetProjection
+                        dstEntry.targetProjection)
+                  let disjoint :=
+                    match Nat.beq srcPtr.tag dstPtr.tag with
+                    | true => false
+                    | false =>
+                      match sameContainer with
+                      | false => true
+                      | true =>
+                        Bool.or
+                          (Nat.ble (Nat.add srcStart n) dstStart)
+                          (Nat.ble (Nat.add dstStart n) srcStart)
+                  match disjoint with
+                  | false => MirStepNode.fail .ub
+                  | true =>
+                    let copiedSlice :=
+                      takeValues n (dropValues srcStart srcElems)
+                    let dstElems' :=
+                      spliceValues copiedSlice dstStart dstElems
+                    writeDstVal (.aggregate 0 dstElems')
+              | .ok srcSubVal, .ok dstSubVal =>
+                copyViaBytes srcSubVal dstSubVal
               | _, _ => MirStepNode.fail .ub
             | _, _ => MirStepNode.fail .ub
       | _, _ => MirStepNode.fail .ub

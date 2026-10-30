@@ -1,0 +1,10 @@
+[package]
+name = "fxfs_tier1"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anneal-spec = { path = "../../crates/anneal-spec" }
