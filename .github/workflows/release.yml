@@ -250,9 +250,15 @@ jobs:
               assert digest.startswith("sha256:"), f"missing sha256 digest for {asset['name']}: {digest!r}"
               sha256 = digest.removeprefix("sha256:")
               url = asset["browser_download_url"]
-              header = re.escape(f"[package.metadata.exocrate.{os_name}.{arch}]")
+              pattern = (
+                  rf'(?m)^(\[\[package\.metadata\.exocrate\]\]\n'
+                  rf'os\s*=\s*"{re.escape(os_name)}"\n'
+                  rf'arch\s*=\s*"{re.escape(arch)}"\n'
+                  rf'sha256\s*=\s*)"[^"]*"(\n'
+                  rf'url\s*=\s*)"[^"]*"'
+              )
               text, n = re.subn(
-                  rf'(?m)^({header}\nsha256\s*=\s*)"[^"]*"(\nurl\s*=\s*)"[^"]*"',
+                  pattern,
                   rf'\g<1>"{sha256}"\g<2>"{url}"',
                   text,
                   count=1,

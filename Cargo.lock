@@ -142,9 +142,9 @@ dependencies = [
 
 [[package]]
 name = "exocrate"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94fa3b9e1e5396e05d348c1b836a0f5c777b89c3233b5834edf6fd3ed306b191"
+checksum = "39f392e0ba262cd121a08ff116f89c26b8fab680af8cb07ab5c36a0b1ec158d9"
 dependencies = [
  "dirs",
  "fs2",
@@ -153,6 +153,7 @@ dependencies = [
  "sha2-const",
  "tar",
  "tempfile",
+ "toml_const",
  "ureq",
  "zstd",
 ]
