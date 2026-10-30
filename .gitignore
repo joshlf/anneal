@@ -9,10 +9,13 @@
 __pycache__/
 *.pyc
 # Build and verification artifacts that running `cargo anneal` inside example
-# crates (examples/tutor*/, examples/wireframe-demo/) leaves behind.
+# crates (examples/tutor*/, examples/wireframe-demo/, examples/fxfs-*/) leaves behind.
 /examples/tutor*/target/
 /examples/tutor*/.anneal/
 /examples/tutor*/Cargo.lock
 /examples/wireframe-demo/target/
 /examples/wireframe-demo/.anneal/
 /examples/wireframe-demo/Cargo.lock
+/examples/fxfs-*/target/
+/examples/fxfs-*/.anneal/
+/examples/fxfs-*/Cargo.lock

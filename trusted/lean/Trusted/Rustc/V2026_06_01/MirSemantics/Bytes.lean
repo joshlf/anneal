@@ -732,6 +732,109 @@ def decodeFieldsByLayoutIdxs
           | .none => .none
 
 /--
+Select and encode a union field from `fieldVals` into a buffer of `totalSize`
+bytes at offset `0`, preferring the first field whose encoded byte length
+matches `totalSize` (such as the initialized payload field `value:
+ManuallyDrop<T>` in `MaybeUninit<T>`), and otherwise writing the first encodable
+field at offset `0`.
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1649-L1650>
+
+> "/// All fields start at no offset. The `usize` is the field count.
+> Union(NonZeroUsize),"
+-/
+@[reducible]
+def encodeUnionFieldsWith
+    (encodeFallback : Value → Option (List AbstractByte))
+    (totalSize : Nat)
+    (fieldVals : List Value) :
+    Option (List AbstractByte) :=
+  let rec findFullSize : List Value → Option (List AbstractByte)
+    | .nil => .none
+    | fv :: rest =>
+      match encodeFallback fv with
+      | .some fBytes =>
+        match Nat.beq (length fBytes) totalSize with
+        | true =>
+          writeAbstractBytesAt (replicateUninitBytes totalSize) 0 fBytes
+        | false => findFullSize rest
+      | .none => findFullSize rest
+  match findFullSize fieldVals with
+  | .some bs => .some bs
+  | .none =>
+    match fieldVals with
+    | firstField :: _ =>
+      match encodeFallback firstField with
+      | .some fBytes =>
+        writeAbstractBytesAt (replicateUninitBytes totalSize) 0 fBytes
+      | .none => .none
+    | .nil => .none
+
+/--
+Decode every union field in `fieldLayoutIdxs` (`TypeLayout.fieldLayouts`) from
+byte offset `0` of `bytes`, where all union fields overlap
+(`FieldsShape.union`).
+
+Zero-sized union fields (such as `uninit: ()` at field `0` of `MaybeUninit<T>`)
+decode to `Value.unit`, full-sized union fields (such as `value:
+ManuallyDrop<T>` at field `1` of `MaybeUninit<T>`) decode via `payloadVal` or
+`decodeByLayout`, and smaller non-zero union fields decode from the prefix slice
+`[0 .. fl.size.bytes)`.
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1649-L1650>
+
+> "/// All fields start at no offset. The `usize` is the field count.
+> Union(NonZeroUsize),"
+-/
+@[reducible]
+def decodeUnionFieldsByLayoutIdxs
+    (decodeByLayout : Nat → List AbstractByte → Option Value)
+    (layouts : LayoutTable)
+    (bytes : List AbstractByte)
+    (totalSize : Nat)
+    (payloadVal : Value) :
+    List Nat → List Value
+  | .nil => .nil
+  | fIdx :: fRest =>
+    let fieldVal : Value :=
+      match LayoutTable.lookup layouts fIdx with
+      | .none => payloadVal
+      | .some fl =>
+        match Nat.beq fl.size.bytes 0 with
+        | true => .unit
+        | false =>
+          match Nat.beq fl.size.bytes totalSize with
+          | true =>
+            match payloadVal with
+            | .unit =>
+              match decodeByLayout fIdx bytes with
+              | .some v => v
+              | .none => .unit
+            | v => v
+          | false =>
+            match sliceAbstractBytes bytes 0 fl.size.bytes with
+            | .none => .unit
+            | .some fSlice =>
+              match decodeByLayout fIdx fSlice with
+              | .some v => v
+              | .none =>
+                match decodeScalarBytes fSlice false with
+                | .some (sv, _) => .scalar sv
+                | .none => .unit
+    fieldVal ::
+      decodeUnionFieldsByLayoutIdxs
+        decodeByLayout
+        layouts
+        bytes
+        totalSize
+        payloadVal
+        fRest
+
+/--
 Decode a list of aggregate fields from `bytes` using the byte span between
 consecutive offsets in `offsets` up to `totalSize`.
 -/
@@ -1043,14 +1146,8 @@ def encodeValueToBytes :
               match Nat.beq sv.sizeBytes l.size.bytes with
               | true => encodeScalarBytes sv .none
               | false => .none
-            | .union _, .aggregate _ (firstField :: _) =>
-              match encodeFallback firstField with
-              | .some fBytes =>
-                writeAbstractBytesAt
-                  (replicateUninitBytes l.size.bytes)
-                  0
-                  fBytes
-              | .none => .none
+            | .union _, .aggregate _ fieldVals =>
+              encodeUnionFieldsWith encodeFallback l.size.bytes fieldVals
             | _, _ => .none
           | .multiple tagLayout tagField variantShapes =>
             match v with
@@ -1442,13 +1539,60 @@ def decodeValueFromBytes :
                   match decodeScalarBytes bytes false with
                   | .some (sv, _) => .some (.scalar sv)
                   | .none => .none
-            | .union _ =>
-              match l.backendRepr with
-              | .scalar (.union pk) =>
-                match decodeScalarLayoutBytes (.union pk) bytes with
-                | .some v0 => .some (.aggregate variantIdx (v0 :: .nil))
-                | .none => .some (.aggregate variantIdx (.unit :: .nil))
-              | _ => .some (.aggregate variantIdx (.unit :: .nil))
+            | .union fieldCount =>
+              let byArg : Option Value :=
+                match args with
+                | argKind :: .nil =>
+                  decodeValueFromBytes
+                    fuel'
+                    layouts
+                    { kind := argKind, layoutIdx := 0 }
+                    bytes
+                | _ => .none
+              let payloadVal : Value :=
+                match byArg with
+                | .some v0 => v0
+                | .none =>
+                  match l.backendRepr with
+                  | .scalar (.union pk) =>
+                    match decodeScalarLayoutBytes (.union pk) bytes with
+                    | .some v0 => v0
+                    | .none => .unit
+                  | .scalar s0 =>
+                    match decodeScalarLayoutBytes s0 bytes with
+                    | .some v0 => v0
+                    | .none => .unit
+                  | _ =>
+                    match decodeScalarBytes bytes false with
+                    | .some (sv, _) => .scalar sv
+                    | .none => .unit
+              match l.fieldLayouts with
+              | fHead :: fTail =>
+                let decodeByLayout :=
+                  fun (fIdx : Nat) (bs : List AbstractByte) =>
+                    decodeValueFromBytes
+                      fuel'
+                      layouts
+                      { kind := .adt "" .nil, layoutIdx := fIdx }
+                      bs
+                let vals :=
+                  decodeUnionFieldsByLayoutIdxs
+                    decodeByLayout
+                    layouts
+                    bytes
+                    l.size.bytes
+                    payloadVal
+                    (fHead :: fTail)
+                .some (.aggregate variantIdx vals)
+              | .nil =>
+                let numFields :=
+                  match Nat.beq fieldCount 0 with
+                  | true => 1
+                  | false => fieldCount
+                .some
+                  (.aggregate
+                    variantIdx
+                    (replicateValue numFields payloadVal))
             | .array stride count =>
               match
                 decodeArrayChunksWith
