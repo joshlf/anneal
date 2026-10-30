@@ -1,4 +1,12 @@
-/target/
+# Exclude git bundle temp files
+/tmp/
+# Existing stuff
+__pycache__/
+/tests/miri-diff/corpus/.anneal/
+/tests/miri-diff/corpus/Cargo.lock
+
+target/
+/result*
 **/.lake/
 **/*.olean
 **/*.olean.server
@@ -6,22 +14,3 @@
 **/*.ilean
 **/*.ir
 **/*.ir.sig
-__pycache__/
-*.pyc
-# Build and verification artifacts that running `cargo anneal` inside example
-# crates (examples/tutor*/, examples/wireframe-demo/, examples/fxfs-*/) leaves behind.
-/examples/tutor*/target/
-/examples/tutor*/.anneal/
-/examples/tutor*/Cargo.lock
-/examples/wireframe-demo/target/
-/examples/wireframe-demo/.anneal/
-/examples/wireframe-demo/Cargo.lock
-
-/examples/fxfs-*/target/
-/examples/fxfs-*/.anneal/
-/examples/fxfs-*/Cargo.lock
-
-/tests/miri-diff/corpus/target/
-/tests/miri-diff/corpus/.anneal/
-/tests/miri-diff/corpus/Cargo.lock
-
