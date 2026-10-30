@@ -5,7 +5,12 @@ guaranteeing that an agent can satisfy a verification task only by supplying a
 kernel-checked Lean 4 proof of the locked specification. This document describes
 the threat model for autonomous proof authoring, the four-layer defense-in-depth
 architecture that enforces the boundary, and the `cargo anneal` CLI workflow
-used with the portable [`anneal-prove` skill](../skills/anneal-prove/SKILL.md).
+used with the portable [`anneal-prove` skill](../skills/anneal-prove/SKILL.md)
+and [`anneal-lsp` skill](../skills/anneal-lsp/SKILL.md). For configuring MCP
+servers, `PreToolUse`/`PostToolUse` hooks, and OS-level `bwrap` sandboxes, see
+[**Agent harness setup and anti-cheating configuration**](agent-harness-setup.md).
+For adopting Anneal in a Rust project and reviewing verification pull requests,
+see the [**Project owner guide**](project-owner-guide.md).
 
 ## Threat model: four cheating vectors in autonomous proof authoring
 

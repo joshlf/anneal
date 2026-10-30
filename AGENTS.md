@@ -66,8 +66,11 @@ boundary, run validation checks, and maintain the GHerrit stack.
 ## Agentic proof construction workflow
 
 When discharging per-item Lean 4 proof obligations for a Rust crate with
-`cargo anneal`, follow [the agent proof construction workflow](docs/agent-proof-workflow.md)
-and load the [`anneal-prove` skill](skills/anneal-prove/SKILL.md). In locked
+`cargo anneal`, follow [the agent proof construction workflow](docs/agent-proof-workflow.md),
+[the agent harness setup guide](docs/agent-harness-setup.md), and
+[the project owner guide](docs/project-owner-guide.md), and load the
+[`anneal-prove` skill](skills/anneal-prove/SKILL.md) and
+[`anneal-lsp` skill](skills/anneal-lsp/SKILL.md). In locked
 verification sessions (`cargo anneal lock-specs` followed by
 `cargo anneal agent-verify`), only `anneal/proofs/Proof/<Crate>/<Item>.lean` is
 writable; specification overrides (`anneal/proofs/Specs/**`), assumption modules
