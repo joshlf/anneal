@@ -26,24 +26,37 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
+
 jobs:
-  check-todo:
+  static-checks:
     runs-on: ubuntu-latest
-    name: Check for todo comments
+    name: Static checks
     steps:
       - name: Install ripgrep
         run: |
-         sudo apt-get update
-         sudo apt-get install ripgrep
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
       - name: Run todo check
         run: ./ci/check_todo.sh
+      - name: Run job dependency check
+        run: ./ci/check_job_dependencies.sh
+      - name: Run GitHub Actions validator
+        run: ./ci/check_actions.sh
 
   # Used to signal to branch protections that all other jobs have succeeded.
   all-jobs-succeed:
@@ -55,7 +68,7 @@ jobs:
       # success in branch protection, so this aggregation must fail closed.
       if: ${{ always() }}
       runs-on: ubuntu-latest
-      needs: [check-todo]
+      needs: [static-checks]
       steps:
         - name: Reject workflow cancellation
           if: ${{ cancelled() }}
