@@ -126,6 +126,12 @@ pub fn resolve_rustc_wrapper(config: &CaptureDriverConfig) -> PathBuf {
             }
         }
     }
+    if let Some(toolchain_root) = crate::setup::resolve_installed_toolchain() {
+        let candidate = toolchain_root.join("bin").join(&exe_name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
     PathBuf::from("anneal-rustc-capture")
 }
 

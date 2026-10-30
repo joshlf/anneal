@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Anneal Lean 4 InfoView</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <script src="/preload.js"></script>
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand">
+      <span class="turnstile-badge">⊢</span>
+      <span>Anneal Lean 4 InfoView</span>
+    </div>
+    <div style="display:flex; gap:6px; align-items:center;">
+      <span id="daemon-pill" class="pill">Connecting…</span>
+      <button class="btn secondary small" id="refresh-btn" title="Refresh state">↻</button>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="infoview">Live InfoView</button>
+    <button class="tab-btn" data-tab="sandbox">Multi-Attempt</button>
+    <button class="tab-btn" data-tab="obligations">Obligations</button>
+    <button class="tab-btn" data-tab="workers">Workers</button>
+  </div>
+
+  <!-- TAB 1: LIVE INFOVIEW -->
+  <section id="tab-infoview">
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Active Proof File</span>
+        <span id="status-pill" class="pill">Idle</span>
+      </div>
+      <div id="active-file-box" class="muted">
+        No Lean 4 file queried yet. Edit a <code>.lean</code> file, call <code>lean_goal</code>, or inspect one below:
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <input type="text" id="inspect-file" placeholder="/path/to/crate/anneal/proofs/Proof/Crate/Item.lean" />
+        <input type="number" id="inspect-line" value="5" min="1" style="width:68px;" title="1-based line" />
+        <button class="btn small" id="inspect-btn">Goal</button>
+        <button class="btn secondary small" id="audit-btn" title="Run Anneal TrustedBoundary audit preview">Audit</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Tactic &amp; Term Goals</span>
+        <span id="goal-latency" class="muted"></span>
+      </div>
+      <div id="goals-container" class="muted">No active goals.</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Compiler Diagnostics</span>
+        <span id="diag-count" class="muted">0</span>
+      </div>
+      <div id="diags-container" class="muted">No diagnostics.</div>
+    </div>
+
+    <div class="card" id="audit-card">
+      <div class="card-header">
+        <span class="card-title">Anneal Kernel &amp; Spec-Lock Audit Preview</span>
+      </div>
+      <div id="audit-container" class="muted">Click <b>Audit</b> or run <code>anneal_audit_preview</code> to inspect kernel <code>#print axioms</code> and statement isolation.</div>
+    </div>
+  </section>
+
+  <!-- TAB 2: IN-MEMORY MULTI-ATTEMPT SANDBOX -->
+  <section id="tab-sandbox" class="hidden">
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">In-Memory Tactic Sandbox (0 Disk Writes)</span>
+      </div>
+      <p class="muted" style="margin-top:0;">
+        Tests candidate tactics via warm <code>lake serve</code> <code>didChange</code> overlays (~12–25 ms each) without modifying disk or tripping <code>.anneal/spec-lock.json</code>.
+      </p>
+      <div class="row">
+        <input type="text" id="ma-file" placeholder="Absolute .lean file path" />
+        <input type="number" id="ma-line" value="1" min="1" style="width:74px;" />
+      </div>
+      <textarea id="ma-tactics" rows="4" placeholder="One candidate tactic per line, e.g.:&#10;rfl&#10;simp&#10;omega&#10;exact ⟨rfl, rfl⟩"></textarea>
+      <div class="row" style="margin-top:8px; justify-content:space-between;">
+        <button class="btn" id="ma-run-btn">▶ Test Tactics in Memory</button>
+        <span id="ma-status" class="muted"></span>
+      </div>
+      <div id="ma-results"></div>
+    </div>
+  </section>
+
+  <!-- TAB 3: ANNEAL CRATE OBLIGATIONS -->
+  <section id="tab-obligations" class="hidden">
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Anneal Verification Obligations</span>
+        <button class="btn secondary small" id="ob-load-btn">Load</button>
+      </div>
+      <div class="row">
+        <input type="text" id="ob-workspace" placeholder="Optional crate directory (auto-detects .anneal/ if blank)" />
+      </div>
+      <div class="row">
+        <input type="text" id="ob-query" placeholder="Filter by Rust DefId or item name (e.g. BigEndianU16)" />
+      </div>
+      <div id="ob-summary" class="muted" style="margin:6px 0;"></div>
+      <div id="ob-list"></div>
+    </div>
+  </section>
+
+  <!-- TAB 4: LSP WORKER POOL -->
+  <section id="tab-workers" class="hidden">
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Warm LSP Worker Pool</span>
+        <button class="btn secondary small" id="restart-all-btn">Restart All</button>
+      </div>
+      <div id="workers-meta" class="muted" style="margin-bottom:8px;"></div>
+      <div id="workers-list" class="muted">No warm workers spawned yet.</div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Recent Daemon Activity</span>
+      </div>
+      <div id="events-list" class="muted">No activity yet.</div>
+    </div>
+  </section>
+
+  <script>
+    const apiFetch = (url, opts = {}) => (window.sidecar?.fetch ? window.sidecar.fetch(url, opts) : fetch(url, opts));
+
+    function esc(s) {
+      return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    function openInAuxFileTab(absPath) {
+      if (window.sidecar?.ui?.toggleAuxPane && absPath) {
+        window.sidecar.ui.toggleAuxPane({ tabType: 'fileView', uri: 'file://' + absPath });
+      }
+    }
+
+    async function sendToAgent(promptText) {
+      if (window.sidecar?.agent?.sendMessage) {
+        await window.sidecar.agent.sendMessage(promptText);
+      }
+    }
+
+    // Tab switching
+    document.querySelectorAll('.tab-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        const target = btn.dataset.tab;
+        ['infoview', 'sandbox', 'obligations', 'workers'].forEach((t) => {
+          document.getElementById('tab-' + t).classList.toggle('hidden', t !== target);
+        });
+        if (target === 'obligations' && !document.getElementById('ob-list').innerHTML) {
+          loadObligations();
+        }
+      });
+    });
+
+    function renderState(resp) {
+      const daemonPill = document.getElementById('daemon-pill');
+      if (!resp?.ok) {
+        daemonPill.textContent = 'Daemon Offline';
+        daemonPill.className = 'pill err';
+        return;
+      }
+      const st = resp.result;
+      daemonPill.textContent = `PID ${st.daemon_pid} · ${st.workers.length} worker(s)`;
+      daemonPill.className = 'pill ok';
+
+      const iv = st.infoview || {};
+      const statusPill = document.getElementById('status-pill');
+      const statusMap = {
+        verified_clean: ['✓ Clean (0 errors, 0 sorry)', 'pill ok'],
+        open_goals: [`Open Goals (${iv.sorry_count || 0} sorry)`, 'pill warn'],
+        error: ['Compiler Error', 'pill err'],
+        elaborating: ['Elaborating…', 'pill warn'],
+        idle: ['Idle', 'pill'],
+      };
+      const [sLabel, sCls] = statusMap[iv.status] || ['Idle', 'pill'];
+      statusPill.textContent = sLabel;
+      statusPill.className = sCls;
+
+      if (iv.active_file) {
+        document.getElementById('active-file-box').innerHTML =
+          `<div><span class="file-link mono" id="open-active-file">${esc(iv.active_file)}</span></div>` +
+          `<div class="muted" style="margin-top:3px;">Lake root: <span class="mono">${esc(iv.lake_root || '')}</span> · Updated ${esc(iv.updated_at || '')}</div>`;
+        document.getElementById('open-active-file')?.addEventListener('click', () => openInAuxFileTab(iv.active_file));
+        const inpFile = document.getElementById('inspect-file');
+        if (!inpFile.value) inpFile.value = iv.active_file;
+        const maFile = document.getElementById('ma-file');
+        if (!maFile.value) maFile.value = iv.active_file;
+      }
+
+      document.getElementById('goal-latency').textContent = iv.elapsed_ms != null ? `${iv.elapsed_ms} ms` : '';
+
+      const goalsEl = document.getElementById('goals-container');
+      const goals = iv.goals || [];
+      if (!goals.length) {
+        goalsEl.innerHTML = iv.status === 'verified_clean'
+          ? '<span style="color:#22c55e;">✓ No remaining proof goals!</span>'
+          : '<span class="muted">No open goals captured for current selection.</span>';
+      } else {
+        goalsEl.innerHTML = goals.map((g) => {
+          const gBlocks = (g.goals && g.goals.length ? g.goals : ['(no tactic goal)'])
+            .map((gt) => `<pre class="goal-box">${esc(gt)}</pre>`).join('');
+          return `<div style="margin-bottom:8px;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <span class="mono" style="font-weight:600;">${esc(g.label || 'Goal')}</span>
+              <button class="btn secondary small try-line-btn" data-line="${g.line || 1}">Try Tactics →</button>
+            </div>
+            ${gBlocks}
+          </div>`;
+        }).join('');
+        goalsEl.querySelectorAll('.try-line-btn').forEach((b) => {
+          b.addEventListener('click', () => {
+            document.getElementById('ma-file').value = iv.active_file || '';
+            document.getElementById('ma-line').value = b.dataset.line || '1';
+            document.querySelector('[data-tab="sandbox"]').click();
+          });
+        });
+      }
+
+      const diags = iv.diagnostics || [];
+      document.getElementById('diag-count').textContent = `${diags.length} item(s)`;
+      const diagsEl = document.getElementById('diags-container');
+      if (!diags.length) {
+        diagsEl.innerHTML = '<span class="muted">0 compiler diagnostics.</span>';
+      } else {
+        diagsEl.innerHTML = diags.map((d) =>
+          `<div class="diag-item ${esc(d.severity)}">
+            <div style="display:flex; justify-content:space-between;">
+              <strong>[${esc(d.severity.toUpperCase())}] L${d.line}:${d.column}</strong>
+              <button class="btn secondary small ask-fix-btn" data-line="${d.line}" data-msg="${esc(d.message)}">Ask Agent</button>
+            </div>
+            <div class="mono" style="margin-top:4px; white-space:pre-wrap;">${esc(d.message)}</div>
+          </div>`
+        ).join('');
+        diagsEl.querySelectorAll('.ask-fix-btn').forEach((b) => {
+          b.addEventListener('click', () => {
+            sendToAgent(`Please fix the Lean 4 diagnostic in \`${iv.active_file}\` at line ${b.dataset.line}: ${b.dataset.msg}`);
+          });
+        });
+      }
+
+      if (iv.audit) {
+        const a = iv.audit;
+        document.getElementById('audit-container').innerHTML =
+          `<div style="margin-bottom:4px;"><span class="pill ${a.passed ? 'ok' : 'err'}">${a.passed ? '✓ Audit Preview Passed' : '✗ Issues Detected'}</span> ` +
+          `<span class="mono">${esc(a.theorem || '')}</span></div>` +
+          `<div class="muted">Statement isolation: <b>${a.statement_origin_clean ? 'Clean' : 'Anneal.* leak!'}</b> · ` +
+          `Spec lock: <b>${a.spec_locked ? 'Locked' : 'Unlocked'}</b></div>` +
+          `<pre class="goal-box">${esc(a.axioms_report || '')}</pre>`;
+      }
+
+      // Workers tab
+      document.getElementById('workers-meta').innerHTML =
+        `Daemon uptime: <b>${st.uptime_s}s</b> · Rust engine: <b>${st.rust_analyzer_available ? 'rust-analyzer LSP' : 'cargo check --offline JSON + static indexer'}</b>`;
+      const wList = document.getElementById('workers-list');
+      if (!st.workers.length) {
+        wList.innerHTML = '<span class="muted">No warm workers currently active (spawned lazily on first query).</span>';
+      } else {
+        wList.innerHTML = st.workers.map((w) =>
+          `<div class="attempt-row">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <span class="pill ${w.alive ? 'ok' : 'err'}">${esc(w.kind)} · PID ${w.pid || '-'}</span>
+              <span class="mono">${w.rss_mb} MB RSS · ${w.open_files} doc(s)</span>
+            </div>
+            <div class="mono" style="margin-top:4px; word-break:break-all;">${esc(w.root)}</div>
+            <div class="muted" style="margin-top:3px; display:flex; justify-content:space-between; align-items:center;">
+              <span>bwrap read-only sandbox: <b>${w.sandboxed_bwrap ? 'ON' : 'OFF'}</b> · idle ${w.idle_s}s</span>
+              <button class="btn secondary small restart-one-btn" data-root="${esc(w.root)}">Restart</button>
+            </div>
+          </div>`
+        ).join('');
+        wList.querySelectorAll('.restart-one-btn').forEach((b) => {
+          b.addEventListener('click', async () => {
+            await apiFetch('/api/restart_worker', { method: 'POST', body: JSON.stringify({ root: b.dataset.root }) });
+            await refreshState();
+          });
+        });
+      }
+
+      const evs = iv.recent_events || [];
+      document.getElementById('events-list').innerHTML = evs.length
+        ? evs.map((e) => `<div class="muted mono" style="margin-bottom:3px;">[${esc(e.ts)}] ${esc(e.label)} — ${esc(e.file)} (${e.elapsed_ms} ms, ${e.errors} err, ${e.sorrys} sorry)</div>`).join('')
+        : '<span class="muted">No events recorded yet.</span>';
+    }
+
+    async function refreshState() {
+      try {
+        const res = await apiFetch('/api/state');
+        const json = await res.json();
+        renderState(json);
+      } catch (_err) {
+        renderState({ ok: false });
+      }
+    }
+
+    document.getElementById('refresh-btn').addEventListener('click', refreshState);
+
+    document.getElementById('inspect-btn').addEventListener('click', async () => {
+      const file = document.getElementById('inspect-file').value.trim();
+      const line = Number(document.getElementById('inspect-line').value || 1);
+      if (!file) return;
+      document.getElementById('status-pill').textContent = 'Querying…';
+      await apiFetch('/api/inspect_goal', { method: 'POST', body: JSON.stringify({ file, line }) });
+      await refreshState();
+    });
+
+    document.getElementById('audit-btn').addEventListener('click', async () => {
+      const file = document.getElementById('inspect-file').value.trim();
+      if (!file) return;
+      document.getElementById('status-pill').textContent = 'Auditing…';
+      await apiFetch('/api/audit', { method: 'POST', body: JSON.stringify({ file }) });
+      await refreshState();
+    });
+
+    document.getElementById('ma-run-btn').addEventListener('click', async () => {
+      const file = document.getElementById('ma-file').value.trim();
+      const line = Number(document.getElementById('ma-line').value || 1);
+      const tactics = document.getElementById('ma-tactics').value.split('\n').map((s) => s.trim()).filter(Boolean);
+      if (!file || !tactics.length) return;
+      const statusEl = document.getElementById('ma-status');
+      statusEl.textContent = `Testing ${tactics.length} candidate(s)…`;
+      const res = await apiFetch('/api/multi_attempt', {
+        method: 'POST',
+        body: JSON.stringify({ file, line, tactics }),
+      });
+      const data = await res.json();
+      statusEl.textContent = '';
+      const attempts = data?.result?.attempts || [];
+      const container = document.getElementById('ma-results');
+      if (!data?.ok) {
+        container.innerHTML = `<div class="diag-item">${esc(data?.error || 'Failed')}</div>`;
+        return;
+      }
+      container.innerHTML = attempts.map((a) => {
+        const cls = a.closes_goal ? 'ok' : (a.ok_step ? 'warn' : 'err');
+        const lbl = a.closes_goal ? '✓ CLOSES GOAL' : (a.ok_step ? `${a.remaining_goals.length} subgoal(s)` : '✗ Error');
+        const detail = a.errors?.length
+          ? a.errors[0].message
+          : (a.remaining_goals?.length ? a.remaining_goals[0] : 'Goal discharged!');
+        return `<div class="attempt-row">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <code class="mono">${esc(a.tactic)}</code>
+            <div style="display:flex; gap:6px; align-items:center;">
+              <span class="pill ${cls}">${esc(lbl)} · ${a.elapsed_ms}ms</span>
+              <button class="btn secondary small send-tac-btn" data-tac="${esc(a.tactic)}">Send to Agent</button>
+            </div>
+          </div>
+          <pre class="goal-box">${esc(detail)}</pre>
+        </div>`;
+      }).join('');
+      container.querySelectorAll('.send-tac-btn').forEach((b) => {
+        b.addEventListener('click', () => {
+          sendToAgent(`At \`${file}:${line}\`, tactic \`${b.dataset.tac}\` succeeded in the InfoView sandbox. Please apply and verify it.`);
+        });
+      });
+    });
+
+    async function loadObligations() {
+      const workspace = document.getElementById('ob-workspace').value.trim();
+      const query = document.getElementById('ob-query').value.trim();
+      const params = new URLSearchParams({ workspace, query });
+      const res = await apiFetch('/api/obligations?' + params.toString());
+      const data = await res.json();
+      const r = data?.result || {};
+      const items = r.items || [];
+      document.getElementById('ob-summary').innerHTML = r.crate_root
+        ? `Crate: <span class="mono">${esc(r.crate_root)}</span> · <b>${r.locked ? '🔒 Spec-Locked' : '🔓 Unlocked'}</b> · ${items.length} item(s)`
+        : esc(r.text || 'No crate found.');
+      const listEl = document.getElementById('ob-list');
+      listEl.innerHTML = items.map((it) => {
+        const badgeCls = !it.proof_exists ? 'err' : (it.proof_sorrys === 0 ? 'ok' : 'warn');
+        const badgeTxt = !it.proof_exists ? 'Missing Proof' : (it.proof_sorrys === 0 ? '✓ 0 sorry' : `${it.proof_sorrys} sorry`);
+        return `<div class="attempt-row">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span class="mono" style="font-weight:600;">${esc(it.suffix)}</span>
+            <span class="pill ${badgeCls}">${esc(badgeTxt)}</span>
+          </div>
+          <div class="muted" style="margin-top:3px;">${it.is_stateful ? 'Stateful' : 'Stateless'} · ${esc(it.def_id || '')}</div>
+          <div style="margin-top:6px; display:flex; gap:6px;">
+            ${it.proof_exists ? `<button class="btn secondary small ob-check-btn" data-file="${esc(it.proof_file)}">Inspect in InfoView</button>` : ''}
+            <button class="btn secondary small ob-prove-btn" data-suffix="${esc(it.suffix)}" data-proof="${esc(it.proof_file)}">Ask Agent to Prove</button>
+          </div>
+        </div>`;
+      }).join('');
+      listEl.querySelectorAll('.ob-check-btn').forEach((b) => {
+        b.addEventListener('click', async () => {
+          document.getElementById('inspect-file').value = b.dataset.file;
+          document.querySelector('[data-tab="infoview"]').click();
+          await apiFetch('/api/diagnostics', { method: 'POST', body: JSON.stringify({ file: b.dataset.file }) });
+          await refreshState();
+        });
+      });
+      listEl.querySelectorAll('.ob-prove-btn').forEach((b) => {
+        b.addEventListener('click', () => {
+          sendToAgent(`Please inspect and discharge the Anneal verification obligation \`${b.dataset.suffix}\` at \`${b.dataset.proof}\` using the warm Lean 4 LSP tools.`);
+        });
+      });
+    }
+
+    document.getElementById('ob-load-btn').addEventListener('click', loadObligations);
+
+    document.getElementById('restart-all-btn').addEventListener('click', async () => {
+      await apiFetch('/api/restart_worker', { method: 'POST', body: JSON.stringify({ root: 'all' }) });
+      await refreshState();
+    });
+
+    // Auto-seed workspace path from host if available
+    if (window.sidecar?.onWorkspaceChange) {
+      window.sidecar.onWorkspaceChange((uris) => {
+        if (uris?.length && !document.getElementById('ob-workspace').value) {
+          const p = uris[0].replace(/^file:\/\//, '');
+          if (p) {
+            document.getElementById('ob-workspace').value = p;
+          }
+        }
+      });
+    }
+
+    refreshState();
+    setInterval(() => {
+      if (!document.hidden) refreshState();
+    }, 2500);
+  </script>
+</body>
+</html>

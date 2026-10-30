@@ -397,6 +397,14 @@ pub fn scaffold_workspace_with_config(
         }
 
         let mut authored = detect_authored_item_modules(&proofs_root, &bundle.item_rel_path);
+        if !authored.is_ub_exception
+            && !authored.is_modular
+            && bundle.rust_equiv_target_module_suffix().is_some()
+        {
+            authored.is_equiv = true;
+            authored.is_total = false;
+            authored.is_stateful = false;
+        }
 
         let proof_path = proof_root.join(&bundle.item_rel_path);
         if proof_path.exists() {
@@ -417,6 +425,14 @@ pub fn scaffold_workspace_with_config(
             })?;
             report.created_proof_files.push(proof_path);
             authored = detect_authored_item_modules(&proofs_root, &bundle.item_rel_path);
+            if !authored.is_ub_exception
+                && !authored.is_modular
+                && bundle.rust_equiv_target_module_suffix().is_some()
+            {
+                authored.is_equiv = true;
+                authored.is_total = false;
+                authored.is_stateful = false;
+            }
         }
 
         let obligation_path = obligations_root.join(&bundle.item_rel_path);
@@ -560,7 +576,25 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
             .map_err(|err| format!("failed to read {}: {}", verify_path.display(), err))?;
         let def_id = extract_def_id_comment(&verify_text).unwrap_or_else(|| suffix.clone());
 
-        let authored = detect_authored_item_modules(&proofs_root, &rel_path);
+        let mut authored = detect_authored_item_modules(&proofs_root, &rel_path);
+        let obligation_path = obligations_root.join(&rel_path);
+        let ob_text_opt = if obligation_path.is_file() {
+            Some(fs::read_to_string(&obligation_path).map_err(|err| {
+                format!("failed to read {}: {}", obligation_path.display(), err)
+            })?)
+        } else {
+            None
+        };
+        if !authored.is_ub_exception
+            && !authored.is_modular
+            && ob_text_opt
+                .as_deref()
+                .is_some_and(|t| t.contains("instance rustEquivSpec : StatefulEquivItemSpec"))
+        {
+            authored.is_equiv = true;
+            authored.is_total = false;
+            authored.is_stateful = false;
+        }
         if authored.has_specs {
             specs_roots.insert(format!("Specs.{suffix}"));
         }
@@ -599,10 +633,7 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
         write_if_changed(verify_path, &new_verify)?;
         refreshed_bundles.push(synthetic_bundle);
 
-        let obligation_path = obligations_root.join(&rel_path);
-        if obligation_path.is_file() {
-            let ob_text = fs::read_to_string(&obligation_path)
-                .map_err(|err| format!("failed to read {}: {}", obligation_path.display(), err))?;
+        if let Some(ob_text) = ob_text_opt {
             let updated_ob = update_obligations_legacy_spec_bridge(
                 &ob_text,
                 &suffix,
@@ -995,6 +1026,19 @@ fn resolve_lean_library_paths(config: &ScaffoldConfig) -> (String, String) {
             repo_root.join("trusted/lean").to_string_lossy().into_owned(),
             repo_root.join("theory").to_string_lossy().into_owned(),
         );
+    }
+
+    if let Some(toolchain_root) = crate::setup::resolve_installed_toolchain() {
+        let share_anneal = toolchain_root.join("share/anneal");
+        if share_anneal.join("trusted/lean").is_dir() && share_anneal.join("theory").is_dir() {
+            return (
+                share_anneal
+                    .join("trusted/lean")
+                    .to_string_lossy()
+                    .into_owned(),
+                share_anneal.join("theory").to_string_lossy().into_owned(),
+            );
+        }
     }
 
     ("../trusted/lean".to_string(), "../theory".to_string())

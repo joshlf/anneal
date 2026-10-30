@@ -73,6 +73,42 @@ pub struct SubjectObligationBundle {
     pub external_specs: Vec<UnitTargetRecord>,
 }
 
+impl SubjectObligationBundle {
+    /// Return true when this subject was annotated with `#[spec(safe_total, ...)]`
+    /// or `#[spec(total: true, ...)]` in Rust.
+    pub fn has_rust_safe_total_attr(&self) -> bool {
+        self.external_specs.iter().any(|ext| {
+            ext.target
+                .def_id
+                .contains("__ANNEAL_EXT_SPEC_TARGET___anneal_attr_safe_total_")
+        })
+    }
+
+    /// Return the sibling reference function's Lean module suffix `<Crate>.<ref_fn>`
+    /// when this subject was annotated with `#[spec(equivalent_to: <ref_fn>, ...)]`.
+    pub fn rust_equiv_target_module_suffix(&self) -> Option<String> {
+        const PREFIX: &str = "__ANNEAL_EXT_SPEC_TARGET___anneal_attr_equiv_";
+        const SEP: &str = "__for__";
+        for ext in &self.external_specs {
+            let def_id = &ext.target.def_id;
+            if let Some(idx) = def_id.find(PREFIX) {
+                let after = &def_id[idx + PREFIX.len()..];
+                if let Some(sep_idx) = after.find(SEP) {
+                    let ref_ident = sanitize_lean_ident(&after[..sep_idx]);
+                    if !ref_ident.is_empty() {
+                        if let Some((module_prefix, _)) = self.item_module_suffix.rsplit_once('.') {
+                            return Some(format!("{module_prefix}.{ref_ident}"));
+                        } else {
+                            return Some(ref_ident);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Derive the canonical dotted `<Item>` module suffix from a
 /// `UnitTargetRecord`.
 ///
@@ -291,6 +327,12 @@ pub fn render_obligations_module_with_options(
                 out.push_str(&format!("import Mir.{ext_suffix}\n"));
             }
         }
+    }
+    if let Some(ref_suffix) = bundle.rust_equiv_target_module_suffix()
+        && ref_suffix != *item
+        && imported_companions.insert(ref_suffix.clone())
+    {
+        out.push_str(&format!("import Mir.{ref_suffix}\n"));
     }
 
     if authored.has_legacy_specs_defs {
@@ -545,6 +587,38 @@ pub fn render_obligations_module_with_options(
            strictSafetyPre := strictSafetyPre\n  \
            post args m0 ret m1 := And (rustEnsures args ret) (extraPost args m0 ret m1)\n\n"
     ));
+
+    if !authored.has_specs {
+        if bundle.has_rust_safe_total_attr() {
+            out.push_str(&format!(
+                "/-- Safe-function total-safety `ItemSpec` instance lowered from\n    \
+                    `#[spec(safe_total, ...)]` for `{def_id}` (`#125`). -/\n\
+                 instance rustSafeTotalSpec : ItemSpec \"{def_id}\" :=\n  \
+                   refineSafeSpec\n    \
+                     (fun args => Trusted.Sequence.length args = Mir.{item}.body.argCount)\n    \
+                     (fun _ => True)\n    \
+                     (fun _ _ => True)\n\n\
+                 /-- Safe-function total-safety `StatefulItemSpec` instance lowered from\n    \
+                     `#[spec(safe_total, ...)]` for `{def_id}` (`#125`). -/\n\
+                 instance rustSafeTotalStatefulSpec : StatefulItemSpec \"{def_id}\" :=\n  \
+                   refineSafeStatefulSpec\n    \
+                     (fun args _ => Trusted.Sequence.length args = Mir.{item}.body.argCount)\n    \
+                     (fun _ _ => True)\n    \
+                     (fun _ _ _ _ => True)\n\n"
+            ));
+        }
+        if let Some(ref_suffix) = bundle.rust_equiv_target_module_suffix() {
+            out.push_str(&format!(
+                "/-- Program-to-program behavioral-equivalence `StatefulEquivItemSpec`\n    \
+                    instance lowered from `#[spec(equivalent_to: ...)]` for `{def_id}`. -/\n\
+                 instance rustEquivSpec : StatefulEquivItemSpec \"{def_id}\" :=\n  \
+                   refineEquivSpec\n    \
+                     Mir.{ref_suffix}.body\n    \
+                     (fun _ _ => True)\n    \
+                     (fun _ _ _ _ => True)\n\n"
+            ));
+        }
+    }
 
     if authored.has_legacy_specs_defs {
         out.push_str(&format!(
@@ -1356,5 +1430,54 @@ mod tests {
         assert!(crate_verify.contains("import Verify.MyCrate.math.inc"));
         assert!(crate_verify.contains("certificate := Verify.MyCrate.math.inc.Certificate"));
         assert!(crate_verify.contains("theorem verified : CrateVerificationResult crateClaim :="));
+    }
+
+    #[test]
+    fn renders_rust_safe_total_and_equiv_attribute_specs() {
+        let mut records = sample_records();
+        records.push(UnitTargetRecord {
+            target: CapturedTarget {
+                def_id: "my_crate::math::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_safe_total_inc"
+                    .to_string(),
+                mir_module_path: String::new(),
+                mir_module_sha256: String::new(),
+            },
+            lean_module_name: String::new(),
+            item_kind: CapturedItemKind::ExternalSpec,
+            associated_subject_def_id: Some("my_crate::math::inc".to_string()),
+        });
+        records.push(UnitTargetRecord {
+            target: CapturedTarget {
+                def_id: "my_crate::math::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_equiv_inc_ref__for__inc"
+                    .to_string(),
+                mir_module_path: String::new(),
+                mir_module_sha256: String::new(),
+            },
+            lean_module_name: String::new(),
+            item_kind: CapturedItemKind::ExternalSpec,
+            associated_subject_def_id: Some("my_crate::math::inc".to_string()),
+        });
+
+        let bundles = group_subject_obligations(&records);
+        assert_eq!(bundles.len(), 1);
+        let bundle = &bundles[0];
+        assert!(bundle.has_rust_safe_total_attr());
+        assert_eq!(
+            bundle.rust_equiv_target_module_suffix().as_deref(),
+            Some("MyCrate.math.inc_ref")
+        );
+
+        let obligations = render_obligations_module(bundle);
+        assert!(obligations.contains("import Mir.MyCrate.math.inc_ref"));
+        assert!(obligations.contains(
+            "instance rustSafeTotalSpec : ItemSpec \"my_crate::math::inc\" :=\n  \
+               refineSafeSpec\n    \
+                 (fun args => Trusted.Sequence.length args = Mir.MyCrate.math.inc.body.argCount)"
+        ));
+        assert!(obligations.contains(
+            "instance rustEquivSpec : StatefulEquivItemSpec \"my_crate::math::inc\" :=\n  \
+               refineEquivSpec\n    \
+                 Mir.MyCrate.math.inc_ref.body"
+        ));
     }
 }

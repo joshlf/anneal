@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1E3A8A"/>
+      <stop offset="55%" stop-color="#2563EB"/>
+      <stop offset="100%" stop-color="#0D9488"/>
+    </linearGradient>
+    <linearGradient id="acc" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#FDE047"/>
+      <stop offset="100%" stop-color="#38BDF8"/>
+    </linearGradient>
+  </defs>
+  <!-- 10% outer margin: 26..230 -->
+  <rect x="26" y="26" width="204" height="204" rx="44" fill="url(#bg)" stroke="#93C5FD" stroke-width="6"/>
+  <!-- Turnstile symbol (⊢) representing Lean 4 proof state -->
+  <path d="M74 78 V178 M74 128 H130" stroke="#FFFFFF" stroke-width="18" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <!-- Lambda / Verification checkmark fusion -->
+  <path d="M138 92 L162 156 L192 98" stroke="url(#acc)" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <circle cx="192" cy="170" r="11" fill="#4ADE80"/>
+</svg>

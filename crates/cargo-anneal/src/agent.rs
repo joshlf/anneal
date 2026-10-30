@@ -327,6 +327,18 @@ pub fn lock_workspace_specs_with_mutable(
     records: &[UnitTargetRecord],
     mutable_patterns: &[String],
 ) -> Result<PathBuf, String> {
+    lock_workspace_specs_with_options(workspace_root, records, mutable_patterns, None)
+}
+
+/// Lock workspace specifications into `.anneal/spec-lock.json` and optionally
+/// mirror the signed manifest to `external_lock_file` (outside the agent's
+/// writable workspace).
+pub fn lock_workspace_specs_with_options(
+    workspace_root: &Path,
+    records: &[UnitTargetRecord],
+    mutable_patterns: &[String],
+    external_lock_file: Option<&Path>,
+) -> Result<PathBuf, String> {
     let mut mutable_set = std::collections::BTreeSet::new();
     for raw_pat in mutable_patterns {
         for pat in raw_pat.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -373,13 +385,34 @@ pub fn lock_workspace_specs_with_mutable(
 
     let lock_path = workspace_root.join(SPEC_LOCK_REL_PATH);
     let json = manifest.to_json_string();
-    fs::write(&lock_path, json).map_err(|err| {
+    fs::write(&lock_path, &json).map_err(|err| {
         format!(
             "failed to write spec-lock manifest {}: {}",
             lock_path.display(),
             err
         )
     })?;
+
+    if let Some(ext_path) = external_lock_file {
+        if let Some(parent) = ext_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "failed to create external lock directory {}: {}",
+                    parent.display(),
+                    err
+                )
+            })?;
+        }
+        fs::write(ext_path, &json).map_err(|err| {
+            format!(
+                "failed to write external spec-lock manifest {}: {}",
+                ext_path.display(),
+                err
+            )
+        })?;
+    }
 
     Ok(lock_path)
 }
@@ -391,34 +424,96 @@ pub fn verify_spec_lock(
     workspace_root: &Path,
     current_records: &[UnitTargetRecord],
 ) -> Result<SpecLockManifest, String> {
-    let lock_path = workspace_root.join(SPEC_LOCK_REL_PATH);
-    if !lock_path.is_file() {
-        return Err(format!(
-            "missing spec-lock manifest at {}; run `cargo anneal lock-specs` before running locked verification",
-            lock_path.display()
-        ));
-    }
+    verify_spec_lock_with_options(workspace_root, current_records, None, None)
+}
 
-    let raw = fs::read_to_string(&lock_path).map_err(|err| {
-        format!(
-            "failed to read spec-lock manifest {}: {}",
-            lock_path.display(),
-            err
+/// Verify specification lock against `.anneal/spec-lock.json`, an external
+/// `--lock-file <PATH>` stored outside the agent's writable directory, or a
+/// Git-committed `--lock-git-ref <REV>` (`HEAD`, `origin/main`, etc.).
+pub fn verify_spec_lock_with_options(
+    workspace_root: &Path,
+    current_records: &[UnitTargetRecord],
+    external_lock_file: Option<&Path>,
+    lock_git_ref: Option<&str>,
+) -> Result<SpecLockManifest, String> {
+    let workspace_lock_path = workspace_root.join(SPEC_LOCK_REL_PATH);
+    let (raw, source_desc) = if let Some(git_ref) = lock_git_ref {
+        let git_raw = load_spec_lock_from_git_ref(workspace_root, git_ref)?;
+        if workspace_lock_path.is_file() {
+            let on_disk_raw = fs::read_to_string(&workspace_lock_path).map_err(|err| {
+                format!(
+                    "failed to read spec-lock manifest {}: {}",
+                    workspace_lock_path.display(),
+                    err
+                )
+            })?;
+            if sha256_hex(on_disk_raw.as_bytes()) != sha256_hex(git_raw.as_bytes()) {
+                return Err(format!(
+                    "spec-lock violation: on-disk {} was modified relative to git ref '{git_ref}' (re-running `cargo anneal lock-specs` during locked verification is forbidden)",
+                    workspace_lock_path.display()
+                ));
+            }
+        }
+        (
+            git_raw,
+            format!("{git_ref}:{}", workspace_lock_path.display()),
         )
-    })?;
+    } else if let Some(ext_path) = external_lock_file {
+        if !ext_path.is_file() {
+            return Err(format!(
+                "missing external spec-lock manifest at {}",
+                ext_path.display()
+            ));
+        }
+        let ext_raw = fs::read_to_string(ext_path).map_err(|err| {
+            format!(
+                "failed to read external spec-lock manifest {}: {}",
+                ext_path.display(),
+                err
+            )
+        })?;
+        if workspace_lock_path.is_file() {
+            let on_disk_raw = fs::read_to_string(&workspace_lock_path).map_err(|err| {
+                format!(
+                    "failed to read spec-lock manifest {}: {}",
+                    workspace_lock_path.display(),
+                    err
+                )
+            })?;
+            if sha256_hex(on_disk_raw.as_bytes()) != sha256_hex(ext_raw.as_bytes()) {
+                return Err(format!(
+                    "spec-lock violation: on-disk {} differs from external lock file {} (re-running `cargo anneal lock-specs` during locked verification is forbidden)",
+                    workspace_lock_path.display(),
+                    ext_path.display()
+                ));
+            }
+        }
+        (ext_raw, ext_path.display().to_string())
+    } else {
+        if !workspace_lock_path.is_file() {
+            return Err(format!(
+                "missing spec-lock manifest at {}; run `cargo anneal lock-specs` before running locked verification",
+                workspace_lock_path.display()
+            ));
+        }
+        let on_disk = fs::read_to_string(&workspace_lock_path).map_err(|err| {
+            format!(
+                "failed to read spec-lock manifest {}: {}",
+                workspace_lock_path.display(),
+                err
+            )
+        })?;
+        (on_disk, workspace_lock_path.display().to_string())
+    };
+
     let manifest = SpecLockManifest::from_json_str(&raw).map_err(|err| {
-        format!(
-            "malformed spec-lock manifest {}: {}",
-            lock_path.display(),
-            err
-        )
+        format!("malformed spec-lock manifest {source_desc}: {err}")
     })?;
 
     if manifest.schema != SPEC_LOCK_SCHEMA_V1 {
         return Err(format!(
-            "unsupported schema '{}' in {} (expected '{}')",
+            "unsupported schema '{}' in {source_desc} (expected '{}')",
             manifest.schema,
-            lock_path.display(),
             SPEC_LOCK_SCHEMA_V1
         ));
     }
@@ -446,6 +541,199 @@ pub fn verify_spec_lock(
     check_specs_non_vacuous_with_records(workspace_root, current_records)?;
 
     Ok(manifest)
+}
+
+fn load_spec_lock_from_git_ref(workspace_root: &Path, git_ref: &str) -> Result<String, String> {
+    let toplevel_out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .map_err(|err| format!("failed to invoke git rev-parse: {err}"))?;
+    if !toplevel_out.status.success() {
+        return Err(format!(
+            "git rev-parse --show-toplevel failed in {}: {}",
+            workspace_root.display(),
+            String::from_utf8_lossy(&toplevel_out.stderr).trim()
+        ));
+    }
+    let git_root = PathBuf::from(String::from_utf8_lossy(&toplevel_out.stdout).trim());
+    let abs_ws = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let abs_git = git_root
+        .canonicalize()
+        .unwrap_or_else(|_| git_root.clone());
+    let ws_rel = abs_ws.strip_prefix(&abs_git).unwrap_or(Path::new(""));
+    let lock_git_path = if ws_rel.as_os_str().is_empty() {
+        SPEC_LOCK_REL_PATH.to_string()
+    } else {
+        let prefix = ws_rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        format!("{prefix}/{SPEC_LOCK_REL_PATH}")
+    };
+    let spec = format!("{git_ref}:{lock_git_path}");
+    let show_out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&git_root)
+        .arg("show")
+        .arg(&spec)
+        .output()
+        .map_err(|err| format!("failed to invoke git show {spec}: {err}"))?;
+    if !show_out.status.success() {
+        return Err(format!(
+            "failed to read spec-lock from git ref '{spec}': {}",
+            String::from_utf8_lossy(&show_out.stderr).trim()
+        ));
+    }
+    String::from_utf8(show_out.stdout)
+        .map_err(|err| format!("invalid UTF-8 in git ref '{spec}': {err}"))
+}
+
+/// Run an external agent or shell command (`command_args`) inside an OS-level
+/// read-only filesystem sandbox (`bwrap` when available on Linux) that permits
+/// writes only to `anneal/proofs/Proof/**` (and `src/**` when `mutable_subjects`
+/// is non-empty in `.anneal/spec-lock.json`), while mounting
+/// `.anneal/spec-lock.json`, `anneal/proofs/Specs/**`,
+/// `anneal/proofs/Assumptions/**`, and `Cargo.toml` strictly read-only.
+///
+/// Re-verifies `.anneal/spec-lock.json` and `Specs/**` / `Assumptions/**` digests
+/// against a pre-execution snapshot before returning.
+pub fn run_agent_sandbox(
+    workspace_root: &Path,
+    external_lock_file: Option<&Path>,
+    command_args: &[String],
+) -> Result<(), String> {
+    if command_args.is_empty() {
+        return Err(
+            "missing command for `cargo anneal agent-sandbox -- <COMMAND> [ARGS...]`".to_string(),
+        );
+    }
+    let abs_ws = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let lock_path = external_lock_file
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| abs_ws.join(SPEC_LOCK_REL_PATH));
+    if !lock_path.is_file() {
+        return Err(format!(
+            "missing spec-lock manifest at {}; run `cargo anneal lock-specs` before `agent-sandbox`",
+            lock_path.display()
+        ));
+    }
+    let pre_lock_raw = fs::read_to_string(&lock_path)
+        .map_err(|err| format!("failed to read {}: {err}", lock_path.display()))?;
+    let manifest = SpecLockManifest::from_json_str(&pre_lock_raw)?;
+
+    let proof_dir = abs_ws.join("anneal/proofs/Proof");
+    fs::create_dir_all(&proof_dir)
+        .map_err(|err| format!("failed to create {}: {err}", proof_dir.display()))?;
+    let lake_dir = abs_ws.join(".anneal/.lake");
+    fs::create_dir_all(&lake_dir)
+        .map_err(|err| format!("failed to create {}: {err}", lake_dir.display()))?;
+    let target_dir = abs_ws.join("target");
+    fs::create_dir_all(&target_dir)
+        .map_err(|err| format!("failed to create {}: {err}", target_dir.display()))?;
+
+    let has_bwrap = std::process::Command::new("bwrap")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+
+    let status = if has_bwrap {
+        let mut cmd = std::process::Command::new("bwrap");
+        cmd.arg("--ro-bind")
+            .arg("/")
+            .arg("/")
+            .arg("--dev")
+            .arg("/dev")
+            .arg("--proc")
+            .arg("/proc")
+            .arg("--bind")
+            .arg("/tmp")
+            .arg("/tmp")
+            .arg("--bind")
+            .arg(&proof_dir)
+            .arg(&proof_dir)
+            .arg("--bind")
+            .arg(&lake_dir)
+            .arg(&lake_dir)
+            .arg("--bind")
+            .arg(&target_dir)
+            .arg(&target_dir);
+        if !manifest.mutable_subjects.is_empty() {
+            let src_dir = abs_ws.join("src");
+            if src_dir.is_dir() {
+                cmd.arg("--bind").arg(&src_dir).arg(&src_dir);
+            }
+        }
+        // Explicitly bind-mount protected specification and lock files read-only.
+        let ws_lock = abs_ws.join(SPEC_LOCK_REL_PATH);
+        if ws_lock.is_file() {
+            cmd.arg("--ro-bind").arg(&ws_lock).arg(&ws_lock);
+        }
+        for ro_rel in ["anneal/proofs/Specs", "anneal/proofs/Assumptions", "Cargo.toml"] {
+            let p = abs_ws.join(ro_rel);
+            if p.exists() {
+                cmd.arg("--ro-bind").arg(&p).arg(&p);
+            }
+        }
+        cmd.arg("--chdir").arg(&abs_ws).arg("--");
+        for arg in command_args {
+            cmd.arg(arg);
+        }
+        cmd.status()
+            .map_err(|err| format!("failed to execute bwrap sandbox: {err}"))?
+    } else {
+        let mut cmd = std::process::Command::new(&command_args[0]);
+        cmd.args(&command_args[1..]).current_dir(&abs_ws);
+        cmd.status()
+            .map_err(|err| format!("failed to execute '{}': {err}", command_args[0]))?
+    };
+
+    // Re-verify lockfile and locked directories against the pre-sandbox snapshot.
+    let ws_lock_path = abs_ws.join(SPEC_LOCK_REL_PATH);
+    if !ws_lock_path.is_file() {
+        return Err(format!(
+            "spec-lock violation: {} was deleted during agent execution",
+            ws_lock_path.display()
+        ));
+    }
+    let post_lock_raw = fs::read_to_string(&ws_lock_path)
+        .map_err(|err| format!("failed to read {}: {err}", ws_lock_path.display()))?;
+    if sha256_hex(post_lock_raw.as_bytes()) != sha256_hex(pre_lock_raw.as_bytes()) {
+        return Err(format!(
+            "spec-lock violation: {} was modified during agent execution",
+            ws_lock_path.display()
+        ));
+    }
+    let post_specs = collect_locked_file_digests(&abs_ws, "anneal/proofs/Specs")?;
+    verify_file_digests_match(
+        "Specs",
+        "anneal/proofs/Specs",
+        &manifest.locked_specs_files,
+        &post_specs,
+    )?;
+    let post_assumptions = collect_locked_file_digests(&abs_ws, "anneal/proofs/Assumptions")?;
+    verify_file_digests_match(
+        "Assumptions",
+        "anneal/proofs/Assumptions",
+        &manifest.locked_assumptions_files,
+        &post_assumptions,
+    )?;
+
+    if !status.success() {
+        return Err(format!(
+            "sandboxed agent command exited with non-zero status: {status}"
+        ));
+    }
+    Ok(())
 }
 
 fn build_sorted_locked_records(records: &[UnitTargetRecord]) -> Vec<LockedUnitRecord> {
@@ -701,6 +989,12 @@ pub fn check_specs_non_vacuous_with_records(
                     spec_rel.display()
                 ));
             }
+            if let Some(weakening) = detect_tautological_ensures_weakening(&stripped_spec) {
+                return Err(format!(
+                    "spec override in {} trivializes the Rust #[spec] `ensures` clause via `{weakening}`",
+                    spec_rel.display()
+                ));
+            }
         }
 
         // Check 5: When both `Specs/<Item>.lean` and `Proof/<Item>.lean` exist
@@ -803,9 +1097,49 @@ fn detect_vacuous_precondition(lean_src: &str) -> Option<&'static str> {
         "refineStatefulSpec (fun _ _ => False)",
         "refineSafeStatefulSpec (fun _ _ => False)",
         "refineTotalSpec (fun _ _ => False)",
+        "∧ False",
+        "False ∧",
+        "And False",
+        "=> 0 = 1",
+        "=> 1 = 0",
+        ":= 0 = 1",
+        ":= 1 = 0",
+        "=> true = false",
+        "=> false = true",
+        ":= true = false",
+        ":= false = true",
+        "=> ¬ True",
+        "=> ¬True",
+        "=> Not True",
+        ":= ¬ True",
+        ":= Not True",
     ];
 
     for &pattern in FORBIDDEN_PATTERNS {
+        if collapsed.contains(pattern) {
+            return Some(pattern);
+        }
+    }
+    None
+}
+
+fn detect_tautological_ensures_weakening(stripped_lean_src: &str) -> Option<&'static str> {
+    let collapsed = stripped_lean_src
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    const WEAKENING_PATTERNS: &[&str] = &[
+        "∨ True",
+        "True ∨",
+        "Or True",
+        "rustEnsures args ret → True",
+        "rustEnsures args ret -> True",
+        "defaultPost args ret → True",
+        "defaultPost args ret -> True",
+    ];
+
+    for &pattern in WEAKENING_PATTERNS {
         if collapsed.contains(pattern) {
             return Some(pattern);
         }
@@ -1574,6 +1908,138 @@ mod tests {
         let other_err = verify_spec_lock(&ws, &edited_other)
             .expect_err("modifying non-designated subject must fail");
         assert!(other_err.contains("demo::helper"));
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn verify_spec_lock_with_external_file_and_git_ref_rejects_on_disk_tampering() {
+        let ws = unique_temp_dir("external-and-git-lock");
+        let records = sample_records();
+        let ext_lock = ws.join("external-lock.json");
+
+        let written = lock_workspace_specs_with_options(&ws, &records, &[], Some(&ext_lock))
+            .expect("write external lock");
+        assert!(written.is_file());
+        assert!(ext_lock.is_file());
+
+        // Also write the workspace `.anneal/spec-lock.json` so we can test tampering.
+        let ws_lock = lock_workspace_specs(&ws, &records).expect("write ws lock");
+
+        // Tamper with `.anneal/spec-lock.json` on disk (simulating an agent overwriting it).
+        let mut tampered_records = records.clone();
+        tampered_records[1].target.mir_module_sha256 = "f".repeat(64);
+        let tampered_manifest = SpecLockManifest {
+            schema: SPEC_LOCK_SCHEMA_V1.to_string(),
+            locked_records: tampered_records
+                .iter()
+                .map(LockedUnitRecord::from_unit_record)
+                .collect(),
+            locked_specs_files: Vec::new(),
+            locked_assumptions_files: Vec::new(),
+            mutable_subjects: Vec::new(),
+        };
+        fs::write(&ws_lock, tampered_manifest.to_json_string()).expect("overwrite ws lock");
+
+        // External `--lock-file` must detect that `.anneal/spec-lock.json` on disk was tampered!
+        let ext_err = verify_spec_lock_with_options(&ws, &tampered_records, Some(&ext_lock), None)
+            .expect_err("external lock must reject tampered on-disk lockfile");
+        assert!(
+            ext_err.contains("differs from external lock file"),
+            "unexpected ext_err: {ext_err}"
+        );
+
+        // Restore `.anneal/spec-lock.json` and commit it in a temporary Git repo to test `--lock-git-ref HEAD`.
+        fs::copy(&ext_lock, &ws_lock).expect("restore ws lock");
+        let _ = fs::remove_file(&ext_lock);
+
+        let init_status = std::process::Command::new("git").arg("init").current_dir(&ws).status();
+        if init_status.map(|s| s.success()).unwrap_or(false) {
+            let _ = std::process::Command::new("git")
+                .args(["config", "user.email", "test@example.com"])
+                .current_dir(&ws)
+                .status();
+            let _ = std::process::Command::new("git")
+                .args(["config", "user.name", "Test"])
+                .current_dir(&ws)
+                .status();
+            let _ = std::process::Command::new("git")
+                .args(["add", ".anneal/spec-lock.json"])
+                .current_dir(&ws)
+                .status();
+            let commit_ok = std::process::Command::new("git")
+                .args(["commit", "-m", "lock"])
+                .current_dir(&ws)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if commit_ok {
+                verify_spec_lock_with_options(&ws, &records, None, Some("HEAD"))
+                    .expect("clean git HEAD lock must pass");
+                fs::write(&ws_lock, tampered_manifest.to_json_string())
+                    .expect("tamper ws lock after commit");
+                let git_err =
+                    verify_spec_lock_with_options(&ws, &tampered_records, None, Some("HEAD"))
+                        .expect_err("git HEAD lock must reject tampered on-disk lockfile");
+                assert!(
+                    git_err.contains("modified relative to git ref 'HEAD'"),
+                    "unexpected git_err: {git_err}"
+                );
+            }
+        }
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn check_specs_non_vacuous_rejects_arithmetic_and_tautological_ensures_weakening() {
+        let ws = unique_temp_dir("semantic-weakening");
+        let specs_dir = ws.join("anneal/proofs/Specs/Demo");
+        fs::create_dir_all(&specs_dir).expect("create Specs/Demo");
+
+        let mut records = sample_records();
+        records.push(UnitTargetRecord {
+            target: CapturedTarget {
+                def_id: "demo::__anodized_fn_ensures_add".to_string(),
+                mir_module_path: "Mir/Demo/__anodized_fn_ensures_add.lean".to_string(),
+                mir_module_sha256: "3".repeat(64),
+            },
+            lean_module_name: "Mir.Demo.__anodized_fn_ensures_add".to_string(),
+            item_kind: CapturedItemKind::InlineSpecEnsures,
+            associated_subject_def_id: Some("demo::add".to_string()),
+        });
+
+        let spec_file = specs_dir.join("add.lean");
+
+        for bad_pre in [
+            "instance : ItemSpec \"demo::add\" where\n  pre _ := 0 = 1\n  post args ret := Obligations.Demo.add.rustEnsures args ret\n",
+            "instance : ItemSpec \"demo::add\" where\n  pre _ := ¬ True\n  post args ret := Obligations.Demo.add.rustEnsures args ret\n",
+            "instance : ItemSpec \"demo::add\" where\n  pre args := Obligations.Demo.add.rustRequires args ∧ False\n  post args ret := Obligations.Demo.add.rustEnsures args ret\n",
+            "instance : ItemSpec \"demo::add\" :=\n  Obligations.Demo.add.refineSpec (fun _ => False) (fun _ _ => True)\n",
+        ] {
+            fs::write(&spec_file, bad_pre).expect("write bad pre");
+            let err = check_specs_non_vacuous_with_records(&ws, &records)
+                .expect_err("must reject vacuous precondition");
+            assert!(
+                err.contains("vacuous specification precondition rejected"),
+                "expected vacuous precondition error for:\n{bad_pre}\ngot: {err}"
+            );
+        }
+
+        // Rejects tautological disjunction weakening `rustEnsures`:
+        fs::write(
+            &spec_file,
+            "instance : ItemSpec \"demo::add\" where\n  \
+               pre args := Obligations.Demo.add.rustRequires args\n  \
+               post args ret := Obligations.Demo.add.rustEnsures args ret ∨ True\n",
+        )
+        .expect("write tautological ensures spec");
+        let taut_err = check_specs_non_vacuous_with_records(&ws, &records)
+            .expect_err("must reject tautological ensures weakening");
+        assert!(
+            taut_err.contains("trivializes the Rust #[spec] `ensures` clause via"),
+            "unexpected tautological error: {taut_err}"
+        );
 
         let _ = fs::remove_dir_all(&ws);
     }

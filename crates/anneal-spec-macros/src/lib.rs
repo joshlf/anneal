@@ -149,10 +149,172 @@ pub fn unsafe_impl(args: TokenStream, input: TokenStream) -> TokenStream {
     }
 }
 
+/// Anneal-specific specification extension clauses extracted from `#[spec(...)]`
+/// before forwarding the remaining `anodized` contract clauses to `SpecFields`.
+#[derive(Default)]
+struct AnnealSpecExtensions {
+    /// Whether `safe_total` (`safe_total: true` or `total: true`) was requested
+    /// on the function contract so `Obligations.<Item>` synthesizes a
+    /// `refineSafeSpec` instance enforcing `MirNoUB` across all well-formed
+    /// inputs while guarding `rustEnsures` behind `rustRequires`.
+    is_safe_total: bool,
+    /// Optional reference function identifier from `equivalent_to: <path>` or
+    /// `equivalent_to = <path>` so `Obligations.<Item>` synthesizes a
+    /// `StatefulEquivItemSpec` instance against `Mir.<Crate>.<ref_fn>.body`.
+    equivalent_to_ident: Option<Ident>,
+    /// Remaining `anodized` specification clauses.
+    remaining_args: TokenStream2,
+}
+
+fn is_top_level_comma(tt: &TokenTree) -> bool {
+    matches!(tt, TokenTree::Punct(p) if p.as_char() == ',')
+}
+
+fn is_colon_or_eq(tt: &TokenTree) -> bool {
+    matches!(tt, TokenTree::Punct(p) if p.as_char() == ':' || p.as_char() == '=')
+}
+
+fn extract_anneal_spec_extensions(args: TokenStream2) -> Result<AnnealSpecExtensions> {
+    let tokens: Vec<TokenTree> = args.into_iter().collect();
+    let mut ext = AnnealSpecExtensions::default();
+    let mut out_tokens: Vec<TokenTree> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    let mut at_clause_start = true;
+
+    while i < tokens.len() {
+        if at_clause_start && let TokenTree::Ident(ref kw) = tokens[i] {
+            let kw_str = kw.to_string();
+            let mut end_idx = i + 1;
+            while end_idx < tokens.len() && !is_top_level_comma(&tokens[end_idx]) {
+                end_idx += 1;
+            }
+            let clause_body = &tokens[i + 1..end_idx];
+
+            if kw_str == "safe_total" {
+                if clause_body.is_empty() {
+                    ext.is_safe_total = true;
+                } else if clause_body.len() == 2
+                    && is_colon_or_eq(&clause_body[0])
+                    && let TokenTree::Ident(ref val) = clause_body[1]
+                    && (val == "true" || val == "false")
+                {
+                    ext.is_safe_total = val == "true";
+                } else {
+                    return Err(Error::new(
+                        kw.span(),
+                        "expected `safe_total` or `safe_total: true` / `safe_total: false`",
+                    ));
+                }
+                i = if end_idx < tokens.len() {
+                    end_idx + 1
+                } else {
+                    if out_tokens.last().is_some_and(is_top_level_comma) {
+                        out_tokens.pop();
+                    }
+                    end_idx
+                };
+                at_clause_start = true;
+                continue;
+            } else if kw_str == "total" && !clause_body.is_empty() && is_colon_or_eq(&clause_body[0])
+            {
+                if clause_body.len() == 2
+                    && let TokenTree::Ident(ref val) = clause_body[1]
+                    && (val == "true" || val == "false")
+                {
+                    ext.is_safe_total = val == "true";
+                } else {
+                    return Err(Error::new(
+                        kw.span(),
+                        "expected `total: true` or `total: false`",
+                    ));
+                }
+                i = if end_idx < tokens.len() {
+                    end_idx + 1
+                } else {
+                    if out_tokens.last().is_some_and(is_top_level_comma) {
+                        out_tokens.pop();
+                    }
+                    end_idx
+                };
+                at_clause_start = true;
+                continue;
+            } else if kw_str == "equivalent_to" {
+                if clause_body.is_empty() || !is_colon_or_eq(&clause_body[0]) {
+                    return Err(Error::new(
+                        kw.span(),
+                        "expected `equivalent_to: <fn_path>` or `equivalent_to = <fn_path>`",
+                    ));
+                }
+                let path_stream: TokenStream2 = clause_body[1..].iter().cloned().collect();
+                let path: Path = syn::parse2(path_stream).map_err(|_| {
+                    Error::new(
+                        kw.span(),
+                        "expected function path after `equivalent_to:`",
+                    )
+                })?;
+                let Some(last_seg) = path.segments.last() else {
+                    return Err(Error::new(
+                        kw.span(),
+                        "expected non-empty function path after `equivalent_to:`",
+                    ));
+                };
+                ext.equivalent_to_ident = Some(last_seg.ident.clone());
+                i = if end_idx < tokens.len() {
+                    end_idx + 1
+                } else {
+                    if out_tokens.last().is_some_and(is_top_level_comma) {
+                        out_tokens.pop();
+                    }
+                    end_idx
+                };
+                at_clause_start = true;
+                continue;
+            }
+        }
+
+        at_clause_start = is_top_level_comma(&tokens[i]);
+        out_tokens.push(tokens[i].clone());
+        i += 1;
+    }
+
+    ext.remaining_args = out_tokens.into_iter().collect();
+    Ok(ext)
+}
+
 fn expand_embed_spec(args: TokenStream2, input: TokenStream2) -> Result<TokenStream2> {
-    let spec_fields: SpecFields = syn::parse2(args)?;
+    let ext = extract_anneal_spec_extensions(args)?;
+    let spec_fields: SpecFields = syn::parse2(ext.remaining_args)?;
     let mut item: Item = syn::parse2(input)?;
     normalize_nested_spec_attrs(&mut item);
+
+    let mut extra_marker_consts = TokenStream2::new();
+    if let Item::Fn(ref func) = item {
+        let fn_ident = &func.sig.ident;
+        let fn_name_str = fn_ident.to_string();
+        if ext.is_safe_total {
+            let marker_ident = format_ident!(
+                "__ANNEAL_EXT_SPEC_TARGET___anneal_attr_safe_total_{}",
+                fn_ident
+            );
+            extra_marker_consts.extend(quote! {
+                #[doc(hidden)]
+                #[allow(non_upper_case_globals, dead_code)]
+                pub const #marker_ident: &str = #fn_name_str;
+            });
+        }
+        if let Some(ref equiv_ident) = ext.equivalent_to_ident {
+            let marker_ident = format_ident!(
+                "__ANNEAL_EXT_SPEC_TARGET___anneal_attr_equiv_{}__for__{}",
+                equiv_ident,
+                fn_ident
+            );
+            extra_marker_consts.extend(quote! {
+                #[doc(hidden)]
+                #[allow(non_upper_case_globals, dead_code)]
+                pub const #marker_ident: &str = #fn_name_str;
+            });
+        }
+    }
 
     let raw_tokens = match item {
         Item::Fn(mut func) => func
@@ -196,7 +358,15 @@ fn expand_embed_spec(args: TokenStream2, input: TokenStream2) -> Result<TokenStr
         _ => Err(make_item_error(&item, "<unknown>")),
     }?;
 
-    rewrite_anodized_root_paths(raw_tokens)
+    let rewritten = rewrite_anodized_root_paths(raw_tokens)?;
+    if extra_marker_consts.is_empty() {
+        Ok(rewritten)
+    } else {
+        Ok(quote! {
+            #extra_marker_consts
+            #rewritten
+        })
+    }
 }
 
 /// Parsed arguments to `#[external_spec(for = <path>, ...)]`.
@@ -1301,5 +1471,57 @@ mod tests {
             impl_expanded
                 .contains("__anodized_fn_ensures___anneal_unsafe_impl_Zeroable_for_NonZeroBounded")
         );
+    }
+
+    #[test]
+    fn embed_spec_supports_safe_total_and_equivalent_to_extensions() {
+        let safe_args = quote! {
+            safe_total,
+            requires: (b & 1) == b,
+            ensures: |ret| ret == (b == 1),
+        };
+        let safe_input = quote! {
+            pub fn parse_flag(b: u8) -> bool {
+                b == 1
+            }
+        };
+        let safe_expanded = expand_embed_spec(safe_args, safe_input.clone())
+            .expect("safe_total should expand")
+            .to_string();
+        assert!(safe_expanded.contains(
+            "__ANNEAL_EXT_SPEC_TARGET___anneal_attr_safe_total_parse_flag"
+        ));
+        assert!(safe_expanded.contains("__anodized_fn_requires_parse_flag"));
+        assert!(safe_expanded.contains("__anodized_fn_ensures_parse_flag"));
+
+        let total_bool_args = quote! {
+            total: true,
+            requires: (b & 1) == b,
+        };
+        let total_bool_expanded = expand_embed_spec(total_bool_args, safe_input)
+            .expect("total: true should expand")
+            .to_string();
+        assert!(total_bool_expanded.contains(
+            "__ANNEAL_EXT_SPEC_TARGET___anneal_attr_safe_total_parse_flag"
+        ));
+
+        let equiv_args = quote! {
+            equivalent_to: crate::checksum_safe,
+            requires: true,
+            ensures: |ret| ret == ret,
+        };
+        let equiv_input = quote! {
+            pub fn checksum_fast(buf: &[u8; 8]) -> u32 {
+                buf[0] as u32
+            }
+        };
+        let equiv_expanded = expand_embed_spec(equiv_args, equiv_input)
+            .expect("equivalent_to should expand")
+            .to_string();
+        assert!(equiv_expanded.contains(
+            "__ANNEAL_EXT_SPEC_TARGET___anneal_attr_equiv_checksum_safe__for__checksum_fast"
+        ));
+        assert!(equiv_expanded.contains("__anodized_fn_requires_checksum_fast"));
+        assert!(equiv_expanded.contains("__anodized_fn_ensures_checksum_fast"));
     }
 }

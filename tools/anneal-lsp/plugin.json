@@ -1,0 +1,13 @@
+{
+  "name": "anneal-lean",
+  "displayName": "Anneal Lean 4 & Rust LSP",
+  "version": "0.1.0",
+  "author": "Anneal Team",
+  "description": "Warm Lean 4 (lake serve) and Rust semantic MCP tools, spec-lock & zero-turn goal hooks, and a live Lean 4 InfoView AuxPane for Anneal verification workspaces.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Inspect open proof goals and test candidate tactics in memory with lean_multi_attempt",
+    "Bridge a Rust item to its generated MIR, Obligations, Specs, and Proof modules",
+    "Run anneal_audit_preview on a Proof module to verify kernel axioms and statement isolation"
+  ]
+}

@@ -171,3 +171,41 @@ fn integration_invariant_and_unsafe_impl_attributes() {
     assert!(__anodized_fn_requires___anneal_unsafe_impl_TrustedNonZero_for_NonZeroCounter());
     assert!(__anodized_fn_ensures___anneal_unsafe_impl_TrustedNonZero_for_NonZeroCounter(true));
 }
+
+#[spec(
+    safe_total,
+    requires: (flag & 1) == flag,
+    ensures: |ret| ret == (flag == 1),
+)]
+fn parse_bit_flag(flag: u8) -> bool {
+    flag == 1
+}
+
+#[spec(
+    equivalent_to: midpoint,
+    requires: [a <= 1_000, b <= 1_000, a <= b],
+    ensures: |mid| in_closed_range(mid, a, b),
+)]
+fn midpoint_fast(a: u32, b: u32) -> u32 {
+    (a & b) + ((a ^ b) >> 1)
+}
+
+#[test]
+fn integration_safe_total_and_equivalent_to_spec_extensions() {
+    assert!(parse_bit_flag(1));
+    assert!(!parse_bit_flag(2));
+    assert_eq!(
+        __ANNEAL_EXT_SPEC_TARGET___anneal_attr_safe_total_parse_bit_flag,
+        "parse_bit_flag"
+    );
+    assert!(__anodized_fn_requires_parse_bit_flag(1));
+    assert!(!__anodized_fn_requires_parse_bit_flag(2));
+
+    assert_eq!(midpoint_fast(10, 20), 15);
+    assert_eq!(
+        __ANNEAL_EXT_SPEC_TARGET___anneal_attr_equiv_midpoint__for__midpoint_fast,
+        "midpoint_fast"
+    );
+    assert!(__anodized_fn_requires_midpoint_fast(10, 20));
+    assert!(__anodized_fn_ensures_midpoint_fast(10, 20, 15));
+}

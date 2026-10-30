@@ -1,0 +1,39 @@
+{
+  "mcpServers": {
+    "lsp": {
+      "command": "python3",
+      "args": [
+        "-u",
+        "${PLUGIN_ROOT}/server/anneal_lsp_mcp.py"
+      ],
+      "env": {
+        "ANNEAL_LSP_SOCKET": "/tmp/anneal-lean-lsp.sock",
+        "ANNEAL_LSP_MAX_WORKERS": "4",
+        "ANNEAL_LSP_IDLE_TTL_SECONDS": "900",
+        "ANNEAL_LSP_MEMORY_MAX": "48G",
+        "PLUGIN_DATA": "${PLUGIN_DATA}"
+      },
+      "timeoutSeconds": 180,
+      "tools": {
+        "lean_goal": {
+          "eager": true
+        },
+        "lean_diagnostics": {
+          "eager": true
+        },
+        "lean_multi_attempt": {
+          "eager": true
+        },
+        "lean_hover": {
+          "eager": true
+        },
+        "anneal_audit_preview": {
+          "eager": true
+        },
+        "anneal_item_bridge": {
+          "eager": true
+        }
+      }
+    }
+  }
+}

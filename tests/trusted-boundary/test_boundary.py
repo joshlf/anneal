@@ -537,6 +537,45 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         (root / "trusted/lean/locks/unexpected.txt").write_text("bad\n")
         checked(root, expected=1, phase="snapshot", executed=False)
         done("per-toolchain lock directory resolution and snapshot validation")
+
+        # Group 17: Provisional native_decide (--allow-provisional-native) in verify-audit.
+        # Verify that `Proof.*` modules using `native_decide` are rejected when
+        # `--allow-provisional-native=false` and classified as `ProvisionalNative`
+        # when `--allow-provisional-native=true`, while `Specs.*` modules using
+        # `native_decide` are always rejected.
+        prov_checker = runner.Checker(fixture(), lean, temp_parent=suite)
+        prov_checker.tool_admission()
+        proof_src = prov_checker.stage / "ProofNative.lean"
+        proof_src.write_text("prelude\nimport Init.Core\ntheorem verified : True := by native_decide\n")
+        spec_src = prov_checker.stage / "SpecNative.lean"
+        spec_src.write_text("prelude\nimport Init.Core\ntheorem spec_bad : True := by native_decide\n")
+        # 17a. Default preflight (allowProvisionalNative=false) rejects Proof.Demo.foo with native_decide.
+        try:
+            prov_checker.inspect("preflight", sources=[("Proof.Demo.foo", str(proof_src))])
+        except runner.Failure as error:
+            assert error.code == 1 and "nativeDecide" in str(error) and "--provisional" in str(error)
+        else:
+            raise AssertionError("Proof.Demo.foo with native_decide was accepted without --allow-provisional-native")
+        # 17b. With allowProvisionalNative=True, Proof.Demo.foo with native_decide is permitted in preflight.
+        prov_res = prov_checker.inspect(
+            "preflight",
+            sources=[("Proof.Demo.foo", str(proof_src))],
+            allowProvisionalNative=True,
+        )
+        assert [h["module"] for h in prov_res["headers"]] == ["Proof.Demo.foo"]
+        # 17c. Even with allowProvisionalNative=True, Specs.Demo.foo with native_decide is rejected.
+        try:
+            prov_checker.inspect(
+                "preflight",
+                sources=[("Specs.Demo.foo", str(spec_src))],
+                allowProvisionalNative=True,
+            )
+        except runner.Failure as error:
+            assert error.code == 1 and "nativeDecide" in str(error)
+        else:
+            raise AssertionError("Specs.Demo.foo with native_decide was accepted under allowProvisionalNative=True")
+        shutil.rmtree(prov_checker.stage)
+        done("provisional native_decide rejected by default and scoped to Proof.* in preflight")
     except BaseException as error:
         (suite / "failure.traceback").write_text(traceback.format_exc())
         print(f"SELF-TEST FAILED: {error}\nPreserved fixture sources/raw logs: {suite}", file=sys.stderr)

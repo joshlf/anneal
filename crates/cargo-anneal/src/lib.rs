@@ -23,6 +23,7 @@ pub mod agent;
 pub mod driver;
 pub mod obligations;
 pub mod scaffold;
+pub mod setup;
 
 use std::env;
 use std::fs;
@@ -34,8 +35,9 @@ use anneal_rustc_capture::{CaptureManifest, CapturedItemKind, UnitTargetRecord};
 pub use agent::{
     LockedFileDigest, LockedUnitRecord, SPEC_LOCK_REL_PATH, SPEC_LOCK_SCHEMA_V1,
     SpecLockManifest, check_specs_non_vacuous, check_specs_non_vacuous_with_records,
-    lock_workspace_specs, lock_workspace_specs_with_mutable, parse_spec_lock_manifest,
-    render_agent_context, serialize_spec_lock_manifest, verify_spec_lock,
+    lock_workspace_specs, lock_workspace_specs_with_mutable, lock_workspace_specs_with_options,
+    parse_spec_lock_manifest, render_agent_context, run_agent_sandbox,
+    serialize_spec_lock_manifest, verify_spec_lock, verify_spec_lock_with_options,
 };
 pub use driver::{
     ANNEAL_CAPTURE_FILTER_ENV, ANODIZED_EMBED_SPECS_CFG, CaptureDriverConfig,
@@ -79,6 +81,14 @@ pub enum CliSubcommand {
     /// `.anneal/generated/`, and run `lake build` plus the `TrustedBoundary`
     /// anti-cheat audit.
     AgentVerify,
+    /// Run a proof-authoring agent command inside an OS-level `bwrap`
+    /// read-only sandbox where only `anneal/proofs/Proof/`, `target/`,
+    /// `.anneal/.lake/`, and `/tmp` (plus `src/` when `mutable_subjects` is
+    /// non-empty) are mounted writable.
+    AgentSandbox,
+    /// Install or resolve the pinned Anneal omnibus toolchain archive under
+    /// `~/.anneal/toolchain/` (`cargo anneal setup [--local-archive <PATH>]`).
+    Setup,
     /// Print CLI usage instructions.
     Help,
     /// Print the `cargo-anneal` package version.
@@ -115,10 +125,25 @@ pub struct CliOptions {
     /// declared in `Assumptions.<Item>` modules (classified as
     /// `VerificationStatus::VerifiedConditional`).
     pub allow_assumptions: bool,
+    /// When true, allow `Proof.<Item>` modules to use `native_decide` during
+    /// provisional exploration (classified as
+    /// `VerificationStatus::ProvisionalNative`).
+    pub allow_provisional_native: bool,
     /// When true (or when `subcommand == CliSubcommand::AgentVerify`), enforce
     /// `.anneal/spec-lock.json` and regenerate `.anneal/generated/` before
     /// running Lake.
     pub locked_specs: bool,
+    /// Optional external lockfile path (`--lock-file <PATH>`) for `lock-specs`,
+    /// `agent-verify`, `verify --locked-specs`, or `agent-sandbox`, allowing a
+    /// harness to store the trusted lock outside the agent's writable directory.
+    pub lock_file: Option<PathBuf>,
+    /// Optional Git revision (`--lock-git-ref <REV>`, e.g. `HEAD`) from which
+    /// `.anneal/spec-lock.json` is loaded during `agent-verify` / `verify
+    /// --locked-specs`, preventing an agent from overwriting the on-disk lockfile.
+    pub lock_git_ref: Option<String>,
+    /// Optional local `.tar.zst` archive path (`--local-archive <PATH>`) for
+    /// `cargo anneal setup`.
+    pub local_archive: Option<PathBuf>,
     /// Optional item filter (`--item <filter>`) restricting `agent-context` or
     /// `verify` targets by `def_id` or `item_module_suffix`.
     pub item_filter: Option<String>,
@@ -129,7 +154,8 @@ pub struct CliOptions {
     /// Optional comma-separated pattern filter restricting captured items via
     /// `ANNEAL_CAPTURE_FILTER`.
     pub filter: Option<String>,
-    /// Extra arguments forwarded to `cargo check` after `--`.
+    /// Extra arguments forwarded to `cargo check` (or command arguments for
+    /// `agent-sandbox`) after `--`.
     pub extra_cargo_args: Vec<String>,
 }
 
@@ -153,6 +179,13 @@ pub enum VerificationStatus {
         /// Any `Assumptions.*` axioms reached in the transitive constant closure
         /// of `Verify.<Item>.verified`.
         assumptions: Vec<String>,
+    },
+    /// `Verify.<Item>.verified` was checked under `--provisional` /
+    /// `--allow-provisional-native` and relies on `native_decide` trust axioms.
+    ProvisionalNative {
+        /// Names of native decide axioms or `Assumptions.*` axioms reached in
+        /// the transitive constant closure of `Verify.<Item>.verified`.
+        axioms: Vec<String>,
     },
 }
 
@@ -198,6 +231,9 @@ pub struct VerifyConfig {
     pub anneal_repo_root: Option<PathBuf>,
     /// Whether conditional proofs reaching `Assumptions.*` axioms are permitted.
     pub allow_assumptions: bool,
+    /// Whether provisional proofs using `native_decide` in `Proof.*` modules
+    /// are permitted (`VerificationStatus::ProvisionalNative`).
+    pub allow_provisional_native: bool,
     /// Optional comma-separated item filter restricting `lake build` and
     /// `TrustedBoundary` auditing to matching `Verify.<Item>` modules.
     pub item_filter: Option<String>,
@@ -211,6 +247,7 @@ impl VerifyConfig {
             workspace_root: workspace_root.into(),
             anneal_repo_root: None,
             allow_assumptions: false,
+            allow_provisional_native: false,
             item_filter: None,
         }
     }
@@ -219,6 +256,12 @@ impl VerifyConfig {
     /// permitted.
     pub fn with_allow_assumptions(mut self, allow_assumptions: bool) -> Self {
         self.allow_assumptions = allow_assumptions;
+        self
+    }
+
+    /// Configure whether provisional proofs using `native_decide` are permitted.
+    pub fn with_allow_provisional_native(mut self, allow_provisional_native: bool) -> Self {
+        self.allow_provisional_native = allow_provisional_native;
         self
     }
 
@@ -317,7 +360,11 @@ where
     let mut init_specs = false;
     let mut init_proofs = false;
     let mut allow_assumptions = false;
+    let mut allow_provisional_native = false;
     let mut locked_specs = false;
+    let mut lock_file: Option<PathBuf> = None;
+    let mut lock_git_ref: Option<String> = None;
+    let mut local_archive: Option<PathBuf> = None;
     let mut item_filter_patterns: Vec<String> = Vec::new();
     let mut allow_impl_edit_patterns: Vec<String> = Vec::new();
     let mut filter_patterns: Vec<String> = Vec::new();
@@ -358,6 +405,14 @@ where
             "agent-verify" if subcommand.is_none() => {
                 subcommand = Some(CliSubcommand::AgentVerify);
                 locked_specs = true;
+                i += 1;
+            }
+            "agent-sandbox" if subcommand.is_none() => {
+                subcommand = Some(CliSubcommand::AgentSandbox);
+                i += 1;
+            }
+            "setup" if subcommand.is_none() => {
+                subcommand = Some(CliSubcommand::Setup);
                 i += 1;
             }
             "--workspace-root" => {
@@ -515,8 +570,76 @@ where
                 allow_assumptions = true;
                 i += 1;
             }
+            "--provisional" | "--allow-provisional-native" => {
+                allow_provisional_native = true;
+                i += 1;
+            }
             "--locked-specs" => {
                 locked_specs = true;
+                i += 1;
+            }
+            "--lock-file" => {
+                i += 1;
+                let val = slice
+                    .get(i)
+                    .ok_or_else(|| "missing value for --lock-file".to_string())?;
+                let trimmed = val.trim();
+                if trimmed.is_empty() {
+                    return Err("missing value for --lock-file".to_string());
+                }
+                lock_file = Some(PathBuf::from(trimmed));
+                locked_specs = true;
+                i += 1;
+            }
+            s if s.starts_with("--lock-file=") => {
+                let val = s["--lock-file=".len()..].trim();
+                if val.is_empty() {
+                    return Err("missing value for --lock-file".to_string());
+                }
+                lock_file = Some(PathBuf::from(val));
+                locked_specs = true;
+                i += 1;
+            }
+            "--lock-git-ref" => {
+                i += 1;
+                let val = slice
+                    .get(i)
+                    .ok_or_else(|| "missing value for --lock-git-ref".to_string())?;
+                let trimmed = val.trim();
+                if trimmed.is_empty() {
+                    return Err("missing value for --lock-git-ref".to_string());
+                }
+                lock_git_ref = Some(trimmed.to_string());
+                locked_specs = true;
+                i += 1;
+            }
+            s if s.starts_with("--lock-git-ref=") => {
+                let val = s["--lock-git-ref=".len()..].trim();
+                if val.is_empty() {
+                    return Err("missing value for --lock-git-ref".to_string());
+                }
+                lock_git_ref = Some(val.to_string());
+                locked_specs = true;
+                i += 1;
+            }
+            "--local-archive" => {
+                i += 1;
+                let val = slice
+                    .get(i)
+                    .ok_or_else(|| "missing value for --local-archive".to_string())?;
+                let trimmed = val.trim();
+                if trimmed.is_empty() {
+                    return Err("missing value for --local-archive".to_string());
+                }
+                local_archive = Some(PathBuf::from(trimmed));
+                i += 1;
+            }
+            s if s.starts_with("--local-archive=") => {
+                let val = s["--local-archive=".len()..].trim();
+                if val.is_empty() {
+                    return Err("missing value for --local-archive".to_string());
+                }
+                local_archive = Some(PathBuf::from(val));
                 i += 1;
             }
             "--" => {
@@ -526,7 +649,7 @@ where
             other => {
                 if subcommand.is_none() {
                     return Err(format!(
-                        "unknown subcommand '{other}' (expected 'extract', 'scaffold', 'verify', 'check', 'lock-specs', 'agent-context', or 'agent-verify')"
+                        "unknown subcommand '{other}' (expected 'extract', 'scaffold', 'verify', 'check', 'lock-specs', 'agent-context', 'agent-verify', 'agent-sandbox', or 'setup')"
                     ));
                 }
                 extra_cargo_args.push(other.to_string());
@@ -558,6 +681,12 @@ where
     let resolved_anneal_root = anneal_repo_root
         .as_deref()
         .map(|r| normalize_path_against(&default_root, r));
+    let resolved_lock_file = lock_file
+        .as_deref()
+        .map(|lf| normalize_path_against(&default_root, lf));
+    let resolved_local_archive = local_archive
+        .as_deref()
+        .map(|la| normalize_path_against(&default_root, la));
 
     let item_filter = if item_filter_patterns.is_empty() {
         None
@@ -586,7 +715,11 @@ where
         init_specs,
         init_proofs,
         allow_assumptions,
+        allow_provisional_native,
         locked_specs,
+        lock_file: resolved_lock_file,
+        lock_git_ref,
+        local_archive: resolved_local_archive,
         item_filter,
         allow_impl_edit,
         filter,
@@ -598,14 +731,17 @@ where
 pub fn cli_usage() -> &'static str {
     "Usage: cargo anneal <SUBCOMMAND> [OPTIONS] [-- <CARGO_ARGS>...]\n\n\
      Subcommands:\n  \
+       setup          Install the pinned Anneal toolchain archive under ~/.anneal/toolchain/\n  \
        extract        Capture MIR via anneal-rustc-capture and aggregate CaptureManifest.json\n  \
        scaffold       Generate .anneal/generated/ modules and ensure anneal/proofs/ exists\n  \
        verify         Extract, scaffold, build with Lake, and audit the TrustedBoundary\n  \
        check          Alias for 'verify'\n  \
        lock-specs     Lock MIR digests, Specs/**, and Assumptions/** in .anneal/spec-lock.json\n  \
        agent-context  Render structured Markdown context for an AI proof-authoring agent\n  \
-       agent-verify   Enforce .anneal/spec-lock.json, regenerate .anneal/generated/, and verify\n\n\
+       agent-verify   Enforce .anneal/spec-lock.json, regenerate .anneal/generated/, and verify\n  \
+       agent-sandbox  Run an agent command inside a bwrap read-only sandbox (-- <COMMAND>...)\n\n\
      Options:\n  \
+       --local-archive <PATH>  Install 'setup' from a local .tar.zst toolchain archive\n  \
        --workspace-root <DIR>  Target Cargo workspace root\n  \
        --manifest-path <PATH>  Path to Cargo.toml\n  \
        --units-dir <DIR>       Directory for per-unit capture artifacts\n  \
@@ -618,7 +754,10 @@ pub fn cli_usage() -> &'static str {
        --init-specs            Create starter anneal/proofs/Specs/<Item>.lean templates\n  \
        --init-proofs           Create starter anneal/proofs/Proof/<Item>.lean templates\n  \
        --allow-assumptions     Permit conditional proofs that depend on Assumptions.<Item> axioms\n  \
+       --provisional           Permit provisional Proof.<Item> proofs using native_decide\n  \
        --locked-specs          Enforce .anneal/spec-lock.json before running Lake\n  \
+       --lock-file <PATH>      Read or write spec-lock manifest at <PATH> (outside workspace)\n  \
+       --lock-git-ref <REV>    Verify .anneal/spec-lock.json against Git revision <REV> (e.g. HEAD)\n  \
        -h, --help              Print help\n  \
        -V, --version           Print version\n"
 }
@@ -766,6 +905,7 @@ pub fn render_verification_report(report: &VerificationReport) -> String {
     let mut unconditional_count = 0usize;
     let mut conditional_count = 0usize;
     let mut ub_exception_count = 0usize;
+    let mut provisional_count = 0usize;
     let mut out = String::new();
     out.push_str("Anneal Verification Summary:\n");
     for item in &report.items {
@@ -794,17 +934,31 @@ pub fn render_verification_report(report: &VerificationReport) -> String {
                     ));
                 }
             }
+            VerificationStatus::ProvisionalNative { axioms } => {
+                provisional_count += 1;
+                if axioms.is_empty() {
+                    out.push_str(&format!(
+                        "  {}: PROVISIONAL_NATIVE\n",
+                        item.verify_module
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  {}: PROVISIONAL_NATIVE [{}]\n",
+                        item.verify_module,
+                        axioms.join(", ")
+                    ));
+                }
+            }
         }
     }
-    if ub_exception_count == 0 {
-        out.push_str(&format!(
-            "  Totals: {unconditional_count} unconditional, {conditional_count} conditional\n"
-        ));
-    } else {
-        out.push_str(&format!(
-            "  Totals: {unconditional_count} unconditional, {conditional_count} conditional, {ub_exception_count} ub_exception\n"
-        ));
+    let mut totals = format!("{unconditional_count} unconditional, {conditional_count} conditional");
+    if ub_exception_count > 0 {
+        totals.push_str(&format!(", {ub_exception_count} ub_exception"));
     }
+    if provisional_count > 0 {
+        totals.push_str(&format!(", {provisional_count} provisional_native"));
+    }
+    out.push_str(&format!("  Totals: {totals}\n"));
     out.push_str("  TrustedBoundary kernel replay: PASS\n");
     out
 }
@@ -853,10 +1007,11 @@ pub fn execute_cli(options: &CliOptions) -> Result<(), String> {
                 .as_deref()
                 .map(|s| vec![s.to_string()])
                 .unwrap_or_default();
-            let lock_path = lock_workspace_specs_with_mutable(
+            let lock_path = lock_workspace_specs_with_options(
                 &options.workspace_root,
                 &records,
                 &mutable_patterns,
+                options.lock_file.as_deref(),
             )?;
             let report = render_lock_specs_report(&options.workspace_root, &lock_path)?;
             print!("{report}");
@@ -885,6 +1040,19 @@ pub fn execute_cli(options: &CliOptions) -> Result<(), String> {
             print!("{}", render_verification_report(&report));
             Ok(())
         }
+        CliSubcommand::AgentSandbox => {
+            run_agent_sandbox(
+                &options.workspace_root,
+                options.lock_file.as_deref(),
+                &options.extra_cargo_args,
+            )?;
+            Ok(())
+        }
+        CliSubcommand::Setup => {
+            let root = setup::install(options.local_archive.clone())?;
+            println!("Installed Anneal toolchain at {}", root.display());
+            Ok(())
+        }
     }
 }
 
@@ -897,7 +1065,12 @@ pub fn verify_workspace_with_options(options: &CliOptions) -> Result<Verificatio
         options.locked_specs || options.subcommand == CliSubcommand::AgentVerify;
 
     let (locked_manifest, has_locked_ub_exceptions) = if enforce_lock {
-        let lock = verify_spec_lock(&options.workspace_root, &records)?;
+        let lock = verify_spec_lock_with_options(
+            &options.workspace_root,
+            &records,
+            options.lock_file.as_deref(),
+            options.lock_git_ref.as_deref(),
+        )?;
         let has_ub_exc = lock.locked_specs_files.iter().any(|entry| {
             fs::read_to_string(options.workspace_root.join(&entry.rel_path))
                 .ok()
@@ -960,6 +1133,7 @@ pub fn verify_workspace_with_options(options: &CliOptions) -> Result<Verificatio
         workspace_root: options.workspace_root.clone(),
         anneal_repo_root: options.anneal_repo_root.clone(),
         allow_assumptions: effective_allow_assumptions,
+        allow_provisional_native: options.allow_provisional_native,
         item_filter: options.item_filter.clone(),
     };
     let report = verify_workspace_with_config(&verify_cfg)?;
@@ -1067,6 +1241,7 @@ pub fn verify_workspace_with_config(config: &VerifyConfig) -> Result<Verificatio
         &workspace_root,
         anneal_repo_root.as_deref(),
         config.allow_assumptions,
+        config.allow_provisional_native,
         config.item_filter.as_deref(),
         &matched_targets,
     )
@@ -1195,6 +1370,7 @@ fn run_trusted_boundary_verify_audit(
     workspace_root: &Path,
     anneal_repo_root: Option<&Path>,
     allow_assumptions: bool,
+    allow_provisional_native: bool,
     item_filter: Option<&str>,
     verify_modules: &[String],
 ) -> Result<VerificationReport, String> {
@@ -1255,6 +1431,10 @@ fn run_trusted_boundary_verify_audit(
         .arg(format!(
             "--allow-assumptions={}",
             if allow_assumptions { "true" } else { "false" }
+        ))
+        .arg(format!(
+            "--allow-provisional-native={}",
+            if allow_provisional_native { "true" } else { "false" }
         ))
         .arg(format!("--verify-modules={}", verify_modules.join(",")));
     if item_filter.is_none() && generated_root.join("CrateVerify.lean").is_file() {
@@ -1320,6 +1500,17 @@ fn run_trusted_boundary_verify_audit(
                     .map(String::from)
                     .collect();
                 VerificationStatus::VerifiedUbException { assumptions }
+            }
+            "ProvisionalNative" => {
+                let axioms = parts
+                    .get(2)
+                    .copied()
+                    .unwrap_or("")
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
+                VerificationStatus::ProvisionalNative { axioms }
             }
             other => {
                 return Err(format!(
@@ -1395,6 +1586,13 @@ fn resolve_trusted_boundary_lean(
         }
     }
 
+    if let Some(toolchain_root) = setup::resolve_installed_toolchain() {
+        let candidate = toolchain_root.join("share/anneal/trusted/audit/TrustedBoundary.lean");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
     Err(format!(
         "could not locate trusted/audit/TrustedBoundary.lean from {}",
         workspace_root.display()
@@ -1406,6 +1604,12 @@ fn resolve_lake_binary() -> PathBuf {
         && !lake_env.trim().is_empty()
     {
         return PathBuf::from(lake_env);
+    }
+    if let Some(toolchain_root) = setup::resolve_installed_toolchain() {
+        let bundled = toolchain_root.join("lean/bin/lake");
+        if bundled.is_file() {
+            return bundled;
+        }
     }
     if let Ok(home) = env::var("HOME") {
         let pinned = PathBuf::from(home)
@@ -1602,6 +1806,45 @@ mod tests {
         assert!(init_specs_opts.init_specs);
         assert!(init_specs_opts.init_proofs);
         assert!(cli_usage().contains("--init-specs"));
+
+        let hardened_opts = parse_cli_args([
+            "cargo-anneal",
+            "anneal",
+            "agent-verify",
+            "--lock-file=/tmp/external-lock.json",
+            "--lock-git-ref=HEAD",
+            "--provisional",
+        ])
+        .expect("parse agent-verify with --lock-file, --lock-git-ref, --provisional");
+        assert_eq!(hardened_opts.subcommand, CliSubcommand::AgentVerify);
+        assert_eq!(
+            hardened_opts.lock_file,
+            Some(PathBuf::from("/tmp/external-lock.json"))
+        );
+        assert_eq!(hardened_opts.lock_git_ref.as_deref(), Some("HEAD"));
+        assert!(hardened_opts.allow_provisional_native);
+
+        let sandbox_opts = parse_cli_args([
+            "cargo-anneal",
+            "anneal",
+            "agent-sandbox",
+            "--lock-file",
+            "/tmp/external-lock.json",
+            "--",
+            "bash",
+            "-c",
+            "echo ok",
+        ])
+        .expect("parse agent-sandbox");
+        assert_eq!(sandbox_opts.subcommand, CliSubcommand::AgentSandbox);
+        assert_eq!(
+            sandbox_opts.lock_file,
+            Some(PathBuf::from("/tmp/external-lock.json"))
+        );
+        assert_eq!(
+            sandbox_opts.extra_cargo_args,
+            vec!["bash".to_string(), "-c".to_string(), "echo ok".to_string()]
+        );
     }
 
     #[test]
@@ -1786,6 +2029,19 @@ mod tests {
         assert!(verify_report.contains("Verify.Demo.ext: CONDITIONAL [Assumptions.Demo.ext.ax]"));
         assert!(verify_report.contains("Totals: 1 unconditional, 1 conditional"));
         assert!(verify_report.contains("TrustedBoundary kernel replay: PASS"));
+
+        let provisional_report = render_verification_report(&VerificationReport {
+            items: vec![ItemVerificationReport {
+                verify_module: "Verify.Demo.native".to_string(),
+                status: VerificationStatus::ProvisionalNative {
+                    axioms: vec!["Proof.Demo.native.verified._native.native_decide.ax_1_1".to_string()],
+                },
+            }],
+        });
+        assert!(provisional_report.contains(
+            "Verify.Demo.native: PROVISIONAL_NATIVE [Proof.Demo.native.verified._native.native_decide.ax_1_1]"
+        ));
+        assert!(provisional_report.contains("Totals: 0 unconditional, 0 conditional, 1 provisional_native"));
     }
 
     #[test]

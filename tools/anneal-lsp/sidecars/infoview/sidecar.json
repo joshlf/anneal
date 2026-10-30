@@ -1,0 +1,18 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "restart_policy": "always",
+  "display_name": "Anneal Lean 4 InfoView",
+  "description": "Live Lean 4 tactic proof state, multi-attempt tactic sandbox, Anneal obligation scoreboard, and LSP worker pool monitor.",
+  "has_web_ui": true,
+  "ui_config": {
+    "display_name": "Anneal Lean 4 InfoView",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "Lean 4 InfoView"
+      }
+    ]
+  }
+}

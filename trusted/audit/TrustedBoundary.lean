@@ -92,17 +92,24 @@ def inspectAttribute (s : Syntax) : IO Unit := do
           k != `Lean.Parser.Attr.ext && k != `Lean.Parser.Attr.grind then
     fail s!"unsupported attribute form {k}"
 
+def isNativeDecideAxiom (n : Name) : Bool :=
+  n == `Lean.ofReduceBool || n == `Lean.ofReduceNat ||
+  (n.toString.splitOn "._native.").length > 1
+
 -- Admission of syntax is a versioned cooperative policy, not a Lean sandbox.
 -- A term `unsafe t` can generate a *safe* opaque kernel choice body with a
 -- different native implemented_by function. isUnsafe alone does not catch it.
-partial def inspectSyntax (s : Syntax) (allowAxioms : Bool := false) : IO Unit := do
+partial def inspectSyntax (s : Syntax) (allowAxioms : Bool := false)
+    (allowProvisionalNative : Bool := false) : IO Unit := do
   let k := s.getKind
   if [``Parser.Command.unsafe, ``Parser.Command.partial, ``Parser.Command.meta,
       ``Parser.Command.example, ``Parser.Command.coinductive,
       ``Parser.Term.unsafe,
-      `Lean.byElab, `Lean.Parser.Tactic.runTac,
-      `Lean.Parser.Tactic.nativeDecide].contains k then
+      `Lean.byElab, `Lean.Parser.Tactic.runTac].contains k then
     fail s!"unsupported source form {k}"
+  if k == `Lean.Parser.Tactic.nativeDecide then
+    unless allowProvisionalNative do
+      fail s!"unsupported source form {k} (provisional native evaluation requires --provisional)"
   if k == ``Parser.Command.axiom then
     unless allowAxioms do
       fail s!"unsupported source form {k} (axioms are only permitted in Assumptions.* modules)"
@@ -120,27 +127,28 @@ partial def inspectSyntax (s : Syntax) (allowAxioms : Bool := false) : IO Unit :
   if k == ``Parser.Command.eraseAttr then
     unless allowedAttributeNames.contains s[1].getId do fail s!"unsupported attribute removal {s[1].getId}"
   if k == `Lean.Parser.Tactic.decide then
-    if identWithin s `native || atomWithin s "native" then
+    if (identWithin s `native || atomWithin s "native") && !allowProvisionalNative then
       fail "native decide configuration is unsupported"
-  for child in s.getArgs do inspectSyntax child allowAxioms
+  for child in s.getArgs do inspectSyntax child allowAxioms allowProvisionalNative
 
-partial def inspectCommand (s : Syntax) (allowAxioms : Bool := false) : IO Unit := do
+partial def inspectCommand (s : Syntax) (allowAxioms : Bool := false)
+    (allowProvisionalNative : Bool := false) : IO Unit := do
   unless commandKinds.contains s.getKind do fail s!"unsupported command {s.getKind}"
-  inspectSyntax s allowAxioms
+  inspectSyntax s allowAxioms allowProvisionalNative
   if s.isOfKind ``Parser.Command.in then
     unless s.getArgs.size == 3 do fail "unsupported command-wrapper shape"
-    inspectCommand s[0] allowAxioms
-    inspectCommand s[2] allowAxioms
+    inspectCommand s[0] allowAxioms allowProvisionalNative
+    inspectCommand s[2] allowAxioms allowProvisionalNative
   if s.isOfKind ``Parser.Command.mutual then
     unless s.getArgs.size == 3 do fail "unsupported mutual-block shape"
-    for child in s[1].getArgs do inspectCommand child allowAxioms
+    for child in s[1].getArgs do inspectCommand child allowAxioms allowProvisionalNative
 
 partial def collectIdents (s : Syntax) (acc : Array Name := #[]) : Array Name :=
   let acc := if s.isIdent then acc.push s.getId else acc
   s.getArgs.foldl (fun a c => collectIdents c a) acc
 
 def inspectSource (parserEnv : Environment) (moduleName : Name) (path : System.FilePath)
-    (allowedAxiomModules : Array Name := #[]) : IO Json := do
+    (allowedAxiomModules : Array Name := #[]) (allowProvisionalNative : Bool := false) : IO Json := do
   let text ← IO.FS.readFile path
   let ctx := Parser.mkInputContext text path.toString
   let (header, initial, log) ← Parser.parseHeader ctx
@@ -156,6 +164,8 @@ def inspectSource (parserEnv : Environment) (moduleName : Name) (path : System.F
       fail "import modifiers are unsupported"
   let allowAxioms :=
     moduleName.toString.startsWith "Assumptions." || allowedAxiomModules.contains moduleName
+  let allowModProvisional :=
+    allowProvisionalNative && moduleName.toString.startsWith "Proof."
   let mut pEnv := parserEnv
   let mut state := initial
   let mut messages := log
@@ -167,7 +177,7 @@ def inspectSource (parserEnv : Environment) (moduleName : Name) (path : System.F
     if messages.hasErrors || state.recovering then fail s!"command parser error in {moduleName}"
     if stx.isOfKind ``Parser.Command.eoi then break
     if state.pos <= previous then throw <| IO.userError "parser made no progress"
-    inspectCommand stx allowAxioms
+    inspectCommand stx allowAxioms allowModProvisional
     if stx.isOfKind ``Parser.Command.open || stx.isOfKind ``Parser.Command.openScoped then
       for id in collectIdents stx do
         pEnv := Parser.parserExtension.activateScoped pEnv id
@@ -527,6 +537,9 @@ def verifyAudit (j : Json) : IO Json := do
   let allowAssumptions ← match j.getObjValAs? Bool "allowAssumptions" with
     | .ok b => pure b
     | .error _ => pure false
+  let allowProvisionalNative ← match j.getObjValAs? Bool "allowProvisionalNative" with
+    | .ok b => pure b
+    | .error _ => pure false
   let sources ← match j.getObjValAs? (Array (String × String)) "sources" with
     | .ok s => pure s
     | .error _ => pure #[]
@@ -535,7 +548,7 @@ def verifyAudit (j : Json) : IO Json := do
     let parserEnv ← importModules #[{ module := `Init }, { module := `Std }] {}
       (trustLevel := 0) (plugins := #[]) (loadExts := true) (level := .private)
     for (modStr, srcPath) in sources do
-      let _ ← inspectSource parserEnv modStr.toName srcPath
+      let _ ← inspectSource parserEnv modStr.toName srcPath #[] allowProvisionalNative
   let verifyModules ← names j "verifyModules"
   if verifyModules.isEmpty then fail "verifyModules must not be empty"
   let crateRollupMods ← match j.getObjValAs? (Array String) "crateRollupModules" with
@@ -586,7 +599,10 @@ def verifyAudit (j : Json) : IO Json := do
           if ci.isAxiom then
             if ci.name == `sorryAx then
               fail s!"incomplete proof (sorryAx) in {m.module}"
-            unless isAssumptionsMod m.module do
+            else if isNativeDecideAxiom ci.name then
+              unless allowProvisionalNative && m.module.toString.startsWith "Proof." do
+                fail s!"unapproved native_decide axiom {ci.name} in {m.module} (provisional native evaluation requires --provisional)"
+            else unless isAssumptionsMod m.module do
               fail s!"unapproved axiom declaration {ci.name} in {m.module} (axioms are only permitted in Assumptions.*)"
           replayLocals := replayLocals.insert ci.name ci
   let edgesOf ← mkCachedDeclarationEdges
@@ -621,13 +637,14 @@ def verifyAudit (j : Json) : IO Json := do
     let mut visited : NameSet := {}
     let mut visitedNonWorkspace : NameSet := {}
     let mut reachedAssumptions : NameSet := {}
+    let mut reachedProvisional : NameSet := {}
     while !pending.isEmpty do
       let n := pending.head!
       pending := pending.tail!
       if !visited.contains n && !cleanNonWorkspace.contains n then
         visited := visited.insert n
         let modName ← origin env n
-        if !isWorkspaceMod modName then
+        if !isWorkspaceMod modName && !isNativeDecideAxiom n then
           visitedNonWorkspace := visitedNonWorkspace.insert n
         let depCi ← lookup n
         if depCi.isUnsafe || depCi.isPartial then
@@ -639,7 +656,11 @@ def verifyAudit (j : Json) : IO Json := do
             isFoundationMod modName &&
             (n == `propext || n == `Quot.sound || n == `Classical.choice)
           if !isFoundational then
-            if isAssumptionsMod modName then
+            if isNativeDecideAxiom n then
+              unless allowProvisionalNative do
+                fail s!"{thmName} depends on provisional native_decide axiom {n} from {modName} (provisional native evaluation requires --provisional)"
+              reachedProvisional := reachedProvisional.insert n
+            else if isAssumptionsMod modName then
               unless allowAssumptions do
                 fail s!"{thmName} depends on assumption axiom {n} from {modName} (conditional verification requires allow_assumptions)"
               reachedAssumptions := reachedAssumptions.insert n
@@ -649,17 +670,22 @@ def verifyAudit (j : Json) : IO Json := do
     cleanNonWorkspace := cleanNonWorkspace ++ visitedNonWorkspace
     let itemSuffix := (verifyMod.toString.drop 7).toString
     let sortedAssumptions := (reachedAssumptions.toArray.qsort Name.lt).map Name.toString
+    let sortedProvisional := (reachedProvisional.toArray.qsort Name.lt).map Name.toString
     let status :=
-      if isUbException then "VerifiedUbException"
+      if !sortedProvisional.isEmpty then "ProvisionalNative"
+      else if isUbException then "VerifiedUbException"
       else if sortedAssumptions.isEmpty then "VerifiedUnconditional"
       else "VerifiedConditional"
-    let assumptionsCsv := String.intercalate "," sortedAssumptions.toList
+    let combinedDeps :=
+      if !sortedProvisional.isEmpty then sortedProvisional ++ sortedAssumptions
+      else sortedAssumptions
+    let assumptionsCsv := String.intercalate "," combinedDeps.toList
     IO.println s!"VERIFY_AUDIT_ITEM\t{verifyMod}\t{status}\t{assumptionsCsv}"
     itemReports := itemReports.push <| Json.mkObj [
       ("item", toJson itemSuffix),
       ("theorem", toJson thmName.toString),
       ("status", toJson status),
-      ("assumptions", toJson sortedAssumptions)
+      ("assumptions", toJson combinedDeps)
     ]
   for rollupMod in crateRollupMods do
     let thmName := rollupMod.str "verified"
@@ -681,7 +707,7 @@ def verifyAudit (j : Json) : IO Json := do
       if !visited.contains n && !cleanNonWorkspace.contains n then
         visited := visited.insert n
         let modName ← origin env n
-        if !isWorkspaceMod modName then
+        if !isWorkspaceMod modName && !isNativeDecideAxiom n then
           visitedNonWorkspace := visitedNonWorkspace.insert n
         let depCi ← lookup n
         if depCi.isUnsafe || depCi.isPartial then
@@ -693,7 +719,10 @@ def verifyAudit (j : Json) : IO Json := do
             isFoundationMod modName &&
             (n == `propext || n == `Quot.sound || n == `Classical.choice)
           if !isFoundational then
-            if isAssumptionsMod modName then
+            if isNativeDecideAxiom n then
+              unless allowProvisionalNative do
+                fail s!"{thmName} depends on provisional native_decide axiom {n} from {modName} (provisional native evaluation requires --provisional)"
+            else if isAssumptionsMod modName then
               unless allowAssumptions do
                 fail s!"{thmName} depends on assumption axiom {n} from {modName} (conditional verification requires allow_assumptions)"
             else
@@ -714,6 +743,7 @@ def runVerifyAuditCli (rest : List String) : IO Json := do
   let leanPathStr := (← IO.getEnv "LEAN_PATH").getD ""
   let sp := System.SearchPath.parse leanPathStr
   let mut allowAssumptions := false
+  let mut allowProvisionalNative := false
   let mut verifyModules : Array Json := #[]
   let mut crateRollupModules : Array Json := #[]
   let mut sources : Array Json := #[]
@@ -722,6 +752,10 @@ def runVerifyAuditCli (rest : List String) : IO Json := do
       allowAssumptions := true
     else if arg == "--allow-assumptions=false" then
       allowAssumptions := false
+    else if arg == "--allow-provisional-native=true" then
+      allowProvisionalNative := true
+    else if arg == "--allow-provisional-native=false" then
+      allowProvisionalNative := false
     else if arg.startsWith "--verify-modules=" then
       let csv := (arg.drop 17).toString
       for m in csv.splitOn "," do
@@ -744,6 +778,7 @@ def runVerifyAuditCli (rest : List String) : IO Json := do
     ("sysroot", toJson sysroot.toString),
     ("searchPath", toJson (sp.map (·.toString)).toArray),
     ("allowAssumptions", toJson allowAssumptions),
+    ("allowProvisionalNative", toJson allowProvisionalNative),
     ("verifyModules", .arr verifyModules),
     ("crateRollupModules", .arr crateRollupModules),
     ("sources", .arr sources)
@@ -772,6 +807,9 @@ def run (j : Json) : IO Json := do
     let allowedAxiomMods ← match j.getObjValAs? (Array String) "allowedAxiomModules" with
       | .ok arr => pure (arr.map String.toName)
       | .error _ => pure #[]
+    let allowProvisionalNative := match j.getObjValAs? Bool "allowProvisionalNative" with
+      | .ok b => b
+      | .error _ => false
     let mut needsStd := false
     for (_, p) in sources do
       let txt ← IO.FS.readFile p
@@ -779,7 +817,8 @@ def run (j : Json) : IO Json := do
     let parserRoots := (if needsStd then #[`Init, `Std] else #[`Init]) ++
       foundation.filter (!isStdlibMod ·)
     let parserEnv ← importEnv j parserRoots true
-    let headers ← sources.mapM fun (n, p) => inspectSource parserEnv n.toName p allowedAxiomMods
+    let headers ← sources.mapM fun (n, p) =>
+      inspectSource parserEnv n.toName p allowedAxiomMods allowProvisionalNative
     return Json.mkObj [("headers", .arr headers), ("graph", graphFor fEnv foundation)]
   if mode == "audit" then
     let trusted ← names j "trusted"
