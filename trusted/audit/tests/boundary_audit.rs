@@ -20,7 +20,7 @@ use serde_json::json;
 
 use anneal_audit::{
     Checker, Failure, Json, PARTS, ReleaseChannel, check_cargo_boundary,
-    default_lean_path,
+    default_lean_path, sha256_file,
 };
 
 const HEADER: &str = "prelude\nimport Init.NotationExtra\n";
@@ -305,13 +305,19 @@ fn admits_lock_only_foundation_growth() {
             .join("lib/lean")
             .join(format!("Init/Data/PLift.{part}"));
         if p.exists() {
-            extra_parts.insert(part.to_string(), json!("present"));
+            let digest = sha256_file(&p, "foundation").unwrap();
+            extra_parts.insert(part.to_string(), json!(digest));
         } else {
             extra_parts.insert(part.to_string(), Json::Null);
         }
     }
+    let src_digest = sha256_file(
+        &prefix.join("src/lean/Init/Data/PLift.lean"),
+        "foundation",
+    )
+    .unwrap();
     lock["modules"][extra] = json!({
-        "sourceSha256": "present",
+        "sourceSha256": src_digest,
         "parts": extra_parts,
     });
     lock["graph"][extra] = json!([{
@@ -456,6 +462,74 @@ fn rejects_forbidden_syntax_and_attributes_without_executing_eval() {
             format!("{HEADER}@[vetted, candidate mir_ast] def x : Nat := 0\n"),
         ),
         ("malformed recovery", format!("{HEADER}def broken : :=\n")),
+        (
+            "decide +kernel",
+            format!("{HEADER}@[vetted] theorem x : True := by decide +kernel\n"),
+        ),
+        (
+            "decideBang",
+            format!("{HEADER}@[vetted] theorem x : True := by decide!\n"),
+        ),
+        (
+            "bv_decide",
+            format!("{HEADER}@[vetted] theorem x : True := by bv_decide\n"),
+        ),
+        (
+            "rfl'",
+            format!("{HEADER}@[vetted] theorem x : True := by rfl'\n"),
+        ),
+        (
+            "grind set_option",
+            format!(
+                "{HEADER}@[vetted] theorem x : True := by grind => set_option debug.skipKernelTC true\n"
+            ),
+        ),
+        (
+            "include_str",
+            format!(
+                "{HEADER}@[vetted] def x : String := include_str \"Trusted.lean\"\n"
+            ),
+        ),
+        (
+            "noncomputable section",
+            format!("{HEADER}noncomputable section\n"),
+        ),
+        (
+            "_root_ escape",
+            format!(
+                "{HEADER}namespace Trusted\n@[vetted] def _root_.Spoof : Nat := 0\nend Trusted\n"
+            ),
+        ),
+        (
+            "mismatched end",
+            format!("{HEADER}namespace A\nnamespace B\nend A\n"),
+        ),
+        (
+            "section inside in-command",
+            format!("{HEADER}section S in\n@[vetted] def x : Nat := 0\n"),
+        ),
+        (
+            "namespace inside in-command",
+            format!("{HEADER}namespace A in\n@[vetted] def x : Nat := 0\n"),
+        ),
+        (
+            "reserved helper _eq_1",
+            format!("{HEADER}@[vetted] def _eq_1 : Nat := 0\n"),
+        ),
+        (
+            "reserved helper match_1",
+            format!("{HEADER}@[vetted] def match_1 : Nat := 0\n"),
+        ),
+        (
+            "reserved helper rec",
+            format!("{HEADER}namespace Foo\n@[vetted] def rec : Nat := 0\nend Foo\n"),
+        ),
+        (
+            "class inductive vetted ctor on candidate",
+            format!(
+                "{HEADER}@[candidate mir_ast]\nclass inductive Bad where\n  | @[vetted] mk : Bad\n"
+            ),
+        ),
     ];
 
     let mut checker = Checker::new(&base_fix.root, None).unwrap();
@@ -545,6 +619,87 @@ fn rejects_symlinks_stale_oleans_and_unexpected_foundation_companions() {
         Some(2),
         Some("foundation"),
         Some(false),
+    );
+
+    // Tampered foundation `sourceSha256` or `parts.olean` digest is rejected.
+    let mut f_bad_sha = TempFixture::new(None);
+    let lp_sha = f_bad_sha.root.join("trusted/lean/foundation-lock.json");
+    let mut l_sha: Json =
+        serde_json::from_str(&fs::read_to_string(&lp_sha).unwrap()).unwrap();
+    l_sha["modules"]["Init.Prelude"]["parts"]["olean"] =
+        json!("0000000000000000000000000000000000000000000000000000000000000000");
+    fs::write(&lp_sha, serde_json::to_vec(&l_sha).unwrap()).unwrap();
+    let err_sha = f_bad_sha
+        .check_expected(Some(2), Some("foundation"), Some(false))
+        .unwrap_err();
+    assert!(
+        err_sha
+            .message
+            .contains("foundation artifact SHA-256 mismatch for Init/Prelude.olean"),
+        "unexpected error: {err_sha}"
+    );
+
+    // Missing umbrella `Trusted.lean` (only `Trusted/Sub.lean` exists) is
+    // rejected.
+    let mut f_missing_root = TempFixture::new(None);
+    fs::remove_file(f_missing_root.root.join("trusted/lean/Trusted.lean"))
+        .unwrap();
+    fs::create_dir_all(f_missing_root.root.join("trusted/lean/Trusted"))
+        .unwrap();
+    fs::write(
+        f_missing_root.root.join("trusted/lean/Trusted/Sub.lean"),
+        HEADER.as_bytes(),
+    )
+    .unwrap();
+    let err_missing_root = f_missing_root
+        .check_expected(Some(1), Some("snapshot"), Some(false))
+        .unwrap_err();
+    assert!(
+        err_missing_root
+            .message
+            .contains("missing Trusted.lean umbrella"),
+        "unexpected error: {err_missing_root}"
+    );
+
+    // Non-`.lean` file in `trusted/lean/` is rejected.
+    let mut f_non_lean = TempFixture::new(None);
+    fs::write(f_non_lean.root.join("trusted/lean/notes.txt"), b"unexpected")
+        .unwrap();
+    let err_non_lean = f_non_lean
+        .check_expected(Some(1), Some("snapshot"), Some(false))
+        .unwrap_err();
+    assert!(
+        err_non_lean
+            .message
+            .contains("unexpected non-Lean file in source tree: notes.txt"),
+        "unexpected error: {err_non_lean}"
+    );
+
+    // `Checker::new_with_env` strips untrusted dynamic-linker and tool env
+    // vars.
+    let f_env = TempFixture::new(None);
+    let chk_env = Checker::new_with_env(
+        &f_env.root,
+        None,
+        vec![
+            ("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string()),
+            ("LD_LIBRARY_PATH".to_string(), "/tmp".to_string()),
+            ("RUSTC_WRAPPER".to_string(), "/tmp/evil".to_string()),
+            ("HOME".to_string(), "/tmp/home".to_string()),
+            ("PATH".to_string(), "/tmp/evil-bin".to_string()),
+        ],
+    )
+    .unwrap();
+    assert!(!chk_env.environment.contains_key("LD_PRELOAD"));
+    assert!(!chk_env.environment.contains_key("LD_LIBRARY_PATH"));
+    assert!(!chk_env.environment.contains_key("RUSTC_WRAPPER"));
+    assert_eq!(
+        chk_env.environment.get("HOME").map(String::as_str),
+        Some("/tmp/home")
+    );
+    assert_eq!(
+        chk_env.environment.get("PATH").map(String::as_str),
+        Some("/usr/bin:/bin")
     );
 }
 
@@ -667,6 +822,99 @@ fn rejects_cargo_workspace_members_and_path_deps_outside_trusted() {
             "trusted/rustc-capture path dependency points outside trusted/: crates/untrusted-helper"
         )
     );
+
+    // Restore valid member `Cargo.toml` and test `.cargo/config.toml` and
+    // `rust-toolchain.toml` rejection at the repository root.
+    fs::copy(
+        checkout.join("trusted/rustc-capture/Cargo.toml"),
+        fix.root.join("trusted/rustc-capture/Cargo.toml"),
+    )
+    .unwrap();
+    fs::create_dir_all(fix.root.join(".cargo")).unwrap();
+    fs::write(
+        fix.root.join(".cargo/config.toml"),
+        b"[build]\nrustc-wrapper = \"evil\"\n",
+    )
+    .unwrap();
+    let err_cargo_cfg = fix
+        .check_expected(Some(1), Some("cargo-boundary"), Some(false))
+        .unwrap_err();
+    assert!(
+        err_cargo_cfg
+            .message
+            .contains("forbidden Cargo/toolchain override at repository root: .cargo")
+    );
+    fs::remove_dir_all(fix.root.join(".cargo")).unwrap();
+
+    fs::write(
+        fix.root.join("rust-toolchain.toml"),
+        b"[toolchain]\nchannel = \"nightly\"\n",
+    )
+    .unwrap();
+    let err_toolchain = fix
+        .check_expected(Some(1), Some("cargo-boundary"), Some(false))
+        .unwrap_err();
+    assert!(
+        err_toolchain
+            .message
+            .contains("forbidden Cargo/toolchain override at repository root: rust-toolchain.toml")
+    );
+    fs::remove_file(fix.root.join("rust-toolchain.toml")).unwrap();
+
+    // Disallowed `[patch.crates-io]` or `[workspace.dependencies]` in root
+    // `Cargo.toml`.
+    fs::write(
+        fix.root.join("Cargo.toml"),
+        b"[workspace]\nresolver = \"2\"\nmembers = [\"trusted/rustc-capture\"]\n[patch.crates-io]\nserde = { path = \"crates/untrusted-helper\" }\n",
+    )
+    .unwrap();
+    let err_patch = fix
+        .check_expected(Some(1), Some("cargo-boundary"), Some(false))
+        .unwrap_err();
+    assert!(
+        err_patch
+            .message
+            .contains("root Cargo.toml may contain only [workspace]"),
+        "unexpected error: {err_patch}"
+    );
+    fs::copy(checkout.join("Cargo.toml"), fix.root.join("Cargo.toml")).unwrap();
+
+    // Untrusted `git+` source in `Cargo.lock`.
+    fs::write(
+        fix.root.join("Cargo.lock"),
+        b"version = 4\n[[package]]\nname = \"evil\"\nversion = \"0.1.0\"\nsource = \"git+https://example.com/evil.git#deadbeef\"\n",
+    )
+    .unwrap();
+    let err_lock = fix
+        .check_expected(Some(1), Some("cargo-boundary"), Some(false))
+        .unwrap_err();
+    assert!(
+        err_lock
+            .message
+            .contains("untrusted dependency source in Cargo.lock for evil")
+    );
+    fs::remove_file(fix.root.join("Cargo.lock")).unwrap();
+
+    // `trusted/root-manifest.sha256` verification and mismatch detection.
+    fs::copy(checkout.join("flake.nix"), fix.root.join("flake.nix")).unwrap();
+    fs::copy(checkout.join("flake.lock"), fix.root.join("flake.lock")).unwrap();
+    fs::copy(
+        checkout.join("trusted/root-manifest.sha256"),
+        fix.root.join("trusted/root-manifest.sha256"),
+    )
+    .unwrap();
+    check_cargo_boundary(&fix.root).unwrap();
+
+    fs::write(fix.root.join("flake.nix"), b"{ }\n").unwrap();
+    let err_manifest = fix
+        .check_expected(Some(1), Some("cargo-boundary"), Some(false))
+        .unwrap_err();
+    assert!(
+        err_manifest
+            .message
+            .contains("root TCB manifest digest mismatch for flake.nix"),
+        "unexpected error: {err_manifest}"
+    );
 }
 
 /// Verifies that `verify_crate` accepts a valid `(Mir, Proof)` pair proving
@@ -768,6 +1016,76 @@ fn enforces_crate_verification_mir_crate_and_exact_theorem_type() {
             .message
             .contains("Mir.lean imports disallowed modules")
     );
+
+    // 5. `Mir.crate` with universe parameters (`def crate.{u}`) is rejected.
+    let c_mir_univ = write_crate(
+        &fix.root,
+        "crate-mir-univ",
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate.{u} : Trusted.Crate := let _ : Sort (u + 1) := PUnit.{u + 1}; { tag := 0 }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate.{0} := Anneal.prove_crate Mir.crate.{0}\nend Proof\n",
+    );
+    let mut chk_mir_univ = Checker::new(&fix.root, None).unwrap();
+    let err_mir_univ = chk_mir_univ.verify_crate(&c_mir_univ).unwrap_err();
+    assert_eq!(err_mir_univ.code, 1);
+    assert_eq!(err_mir_univ.phase, "audit");
+    assert!(
+        err_mir_univ
+            .message
+            .contains("Mir.crate must not have universe parameters"),
+        "unexpected error: {err_mir_univ}"
+    );
+
+    // 6. `Mir.crate` reaching `Classical.choice` is rejected.
+    let c_mir_ax = write_crate(
+        &fix.root,
+        "crate-mir-ax",
+        "prelude\nimport Trusted\nnamespace Mir\nnoncomputable def crate : Trusted.Crate := { tag := Classical.choice ⟨0⟩ }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
+    );
+    let mut chk_mir_ax = Checker::new(&fix.root, None).unwrap();
+    let err_mir_ax = chk_mir_ax.verify_crate(&c_mir_ax).unwrap_err();
+    assert_eq!(err_mir_ax.code, 1);
+    assert_eq!(err_mir_ax.phase, "audit");
+    assert!(
+        err_mir_ax
+            .message
+            .contains("unapproved axiom Classical.choice from Init.Prelude"),
+        "unexpected error: {err_mir_ax}"
+    );
+
+    // 7. `--prefix-cache-dir` validates `keySha256` and `artifactDigests`,
+    // falling back to a clean rebuild if a cached `.olean` is tampered with.
+    let cache_dir = fix.root.join("prefix-cache");
+    let mut chk_build_cache = Checker::new(&fix.root, None).unwrap();
+    chk_build_cache.build_prefix_cache(&cache_dir).unwrap();
+    fs::write(cache_dir.join("Anneal.olean"), b"corrupted olean").unwrap();
+    let mut chk_use_cache = Checker::new(&fix.root, None).unwrap();
+    chk_use_cache.set_prefix_cache_dir(Some(cache_dir));
+    let rep_rebuilt = chk_use_cache.verify_crate(&c_ok).unwrap();
+    assert_eq!(
+        rep_rebuilt
+            .get("crateVerification")
+            .and_then(|cv| cv.get("replay")),
+        Some(&json!(true))
+    );
+
+    // 8. `theory/Anneal.lean` attempting to declare a constant inside the
+    // reserved `Trusted` namespace is rejected during `"audit"`.
+    fs::write(
+        fix.root.join("theory/Anneal.lean"),
+        b"prelude\nimport Trusted\nnamespace Trusted\ndef Spoof : Nat := 0\nend Trusted\n",
+    )
+    .unwrap();
+    let mut chk_spoof = Checker::new(&fix.root, None).unwrap();
+    let err_spoof = chk_spoof.run().unwrap_err();
+    assert_eq!(err_spoof.code, 1);
+    assert_eq!(err_spoof.phase, "audit");
+    assert!(
+        err_spoof
+            .message
+            .contains("non-Trusted module Anneal cannot declare constant Trusted.Spoof in Trusted namespace"),
+        "unexpected error: {err_spoof}"
+    );
 }
 
 /// Verifies `@[vetted]` vs. `@[candidate]` non-contamination and
@@ -799,25 +1117,67 @@ fn enforces_vetted_vs_candidate_non_contamination_and_trust_policy() {
     let trusted_src = format!(
         "{hm}namespace Trusted\n\
          @[vetted] def candidate (_feature : String) {{α : Sort u}} (x : α) : α := x\n\
+         @[candidate mir_semantics] inductive ExtPayload where\n  \
+           | mk : ExtPayload\n\
          @[vetted] inductive Crate where\n  \
            | base : Crate\n  \
-           | @[candidate mir_semantics] ext : Crate\n\
-         @[candidate mir_semantics] def evalExt : Prop := True\n\
+           | other : Crate\n  \
+           | @[candidate mir_semantics] ext (p : ExtPayload) : Crate\n\
+         @[candidate mir_semantics] def evalExt (_ : ExtPayload) : Prop := True\n\
          @[vetted] def CrateTheorem (c : Crate) : Prop :=\n  \
            match c with\n  \
-           | .base => True\n  \
-           | .ext => Trusted.candidate \"mir_semantics\" evalExt\n\
+           | .ext p => Trusted.candidate \"mir_semantics\" (evalExt p)\n  \
+           | _ => True\n\
          end Trusted\n"
     );
     let fix = TempFixture::new(Some(&trusted_src));
     fs::create_dir_all(fix.root.join("theory")).unwrap();
     fs::write(
         fix.root.join("theory/Anneal.lean"),
-        b"prelude\nimport Trusted\nnamespace Anneal\ntheorem prove_base : Trusted.CrateTheorem Trusted.Crate.base := True.intro\ntheorem prove_ext : Trusted.CrateTheorem Trusted.Crate.ext := True.intro\nend Anneal\n",
+        b"prelude\nimport Trusted\nnamespace Anneal\ntheorem prove_crate (c : Trusted.Crate) : Trusted.CrateTheorem c :=\n  match c with\n  | .base => True.intro\n  | .other => True.intro\n  | .ext _ => True.intro\nend Anneal\n",
     )
     .unwrap();
 
-    // 1. Crate using only `@[vetted]` constructor `base` passes on Stable.
+    // Scoped guard placement negative checks (where helper, base arm, wildcard
+    // arm, and top-level unguarded Trusted.candidate).
+    for (label, bad_decl) in [
+        (
+            "guard in where helper",
+            "@[vetted] def bad (c : Crate) : Prop := helper c where helper (_ : Crate) : Prop := Trusted.candidate \"mir_semantics\" (evalExt ExtPayload.mk)",
+        ),
+        (
+            "guard in vetted arm",
+            "@[vetted] def bad (c : Crate) : Prop := match c with | .base => Trusted.candidate \"mir_semantics\" (evalExt ExtPayload.mk) | _ => True",
+        ),
+        (
+            "guard in wildcard arm",
+            "@[vetted] def bad (c : Crate) : Prop := match c with | .ext p => Trusted.candidate \"mir_semantics\" (evalExt p) | _ => Trusted.candidate \"mir_semantics\" (evalExt ExtPayload.mk)",
+        ),
+        (
+            "direct unbranched guard",
+            "@[vetted] def bad : Prop := Trusted.candidate \"mir_semantics\" (evalExt ExtPayload.mk)",
+        ),
+    ] {
+        let mut f_bad = TempFixture::new(Some(&format!(
+            "{trusted_src}\nnamespace Trusted\n{bad_decl}\nend Trusted\n"
+        )));
+        let err_bad = f_bad
+            .check_expected(Some(1), Some("audit"), Some(true))
+            .expect_err(&format!("expected audit rejection for {label}"));
+        assert!(
+            err_bad
+                .message
+                .contains("is only permitted inside a candidate:mir_semantics eliminator minor premise")
+                || err_bad
+                    .message
+                    .contains("without a Trusted.candidate guard"),
+            "unexpected error for {label}: {err_bad}"
+        );
+    }
+
+    // 1. Crate using only `@[vetted]` constructor `base` (and general dependent
+    // theorem `Anneal.prove_crate Mir.crate`) passes on Stable with zero active
+    // candidate features.
     let c_base = fix.root.join("crate-base");
     fs::create_dir_all(c_base.join("src")).unwrap();
     fs::create_dir_all(c_base.join(".anneal")).unwrap();
@@ -830,7 +1190,7 @@ fn enforces_vetted_vs_candidate_non_contamination_and_trust_policy() {
     .unwrap();
     fs::write(
         c_base.join(".anneal/Proof.lean"),
-        b"prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_base\nend Proof\n",
+        b"prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
     )
     .unwrap();
     let mut chk_base = Checker::new(&fix.root, None).unwrap();
@@ -854,12 +1214,12 @@ fn enforces_vetted_vs_candidate_non_contamination_and_trust_policy() {
         .unwrap();
     fs::write(
         c_ext.join(".anneal/Mir.lean"),
-        b"prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := Trusted.Crate.ext\nend Mir\n",
+        b"prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := Trusted.Crate.ext Trusted.ExtPayload.mk\nend Mir\n",
     )
     .unwrap();
     fs::write(
         c_ext.join(".anneal/Proof.lean"),
-        b"prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_ext\nend Proof\n",
+        b"prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
     )
     .unwrap();
 
