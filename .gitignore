@@ -16,6 +16,12 @@ __pycache__/
 /examples/wireframe-demo/target/
 /examples/wireframe-demo/.anneal/
 /examples/wireframe-demo/Cargo.lock
+
 /examples/fxfs-*/target/
 /examples/fxfs-*/.anneal/
 /examples/fxfs-*/Cargo.lock
+
+/tests/miri-diff/corpus/target/
+/tests/miri-diff/corpus/.anneal/
+/tests/miri-diff/corpus/Cargo.lock
+

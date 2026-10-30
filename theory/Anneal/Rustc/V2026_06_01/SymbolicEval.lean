@@ -2669,6 +2669,7 @@ theorem verifyStatefulEquivMirSym
   · rw [← wpMirNoCallSym_eq_wpMirNoCallBounded]
     exact h_spec args mem h_pre
 
+
 /-! ## 14. Single-Pass Symbolic Evaluators for Scoped UB Exceptions & Modular Call Contracts -/
 
 /-- Direct `Prop`-valued node evaluator matching `mirUbWaivedWP` on `MirStepNode`. -/
@@ -2955,6 +2956,586 @@ theorem verifyModularContractMirSym
     (fun args mem h_pre => ?_)
   rw [wpMirModularBounded, ← wpMirExecModularSym_eq_wpCoalBounded]
   exact h_wp args mem h_pre
+
+/-! ## 10. Differential Testing Outcome Classifiers & Strict UB / Panic Refutation Combinators -/
+
+/--
+Fine-grained bounded execution verdict for differential testing against Miri.
+
+Unlike `reachesFaultExecBounded` (which conflates `FailureKind.ub` and
+`FailureKind.unsupported`), `MirDiffVerdict` separates genuine Undefined
+Behavior (`.ub`) from fail-closed unmodeled constructs (`.unsupported`),
+unresolved external calls (`.externalCall`), safe unwinding (`.panic`),
+process abort (`.abort`), normal termination (`.normal`), and fuel exhaustion
+(`.outOfFuel`).
+-/
+inductive MirDiffVerdict : Type where
+  | normal (retVal : Value) (mem : Memory)
+  | panic
+  | abort
+  | ub
+  | unsupported
+  | externalCall (defPath : DefPath)
+  | outOfFuel
+
+/--
+Decidable, printable projection of `MirDiffVerdict` for `#eval` reporting and
+equality checks in differential test suites.
+-/
+inductive MirDiffTag : Type where
+  | normalUnit
+  | normalScalar (bits : Nat) (sizeBytes : Nat)
+  | normalOther
+  | panic
+  | abort
+  | ub
+  | unsupported
+  | externalCall (defPath : DefPath)
+  | outOfFuel
+  deriving DecidableEq, Repr
+
+/-- Project a `MirDiffVerdict` to its decidable `MirDiffTag`. -/
+def MirDiffVerdict.toTag : MirDiffVerdict → MirDiffTag
+  | .normal .unit _ => .normalUnit
+  | .normal (.scalar sc) _ => .normalScalar sc.bits sc.sizeBytes
+  | .normal _ _ => .normalOther
+  | .panic => .panic
+  | .abort => .abort
+  | .ub => .ub
+  | .unsupported => .unsupported
+  | .externalCall defPath => .externalCall defPath
+  | .outOfFuel => .outOfFuel
+
+/--
+Evaluate `body` from `st : MirExecState` for up to `fuel` steps, classifying the
+terminal outcome or fault into a `MirDiffVerdict`.
+-/
+def evalMirDiffExecBounded
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState) : MirDiffVerdict :=
+  match fuel with
+  | 0 => .outOfFuel
+  | fuel' + 1 =>
+    match stepMirState body st with
+    | .ret (.normal (retVal, mem)) => .normal retVal mem
+    | .ret .panic => .panic
+    | .ret .abort => .abort
+    | .tau st' => evalMirDiffExecBounded fuel' body st'
+    | .vis (.inl (.fail .ub)) _ => .ub
+    | .vis (.inl (.fail .unsupported)) _ => .unsupported
+    | .vis (.inl (.fail .outOfFuel)) _ => .outOfFuel
+    | .vis (.inr (.inl _)) k => evalMirDiffExecBounded fuel' body (k PUnit.unit)
+    | .vis (.inr (.inr (.call req))) _ => .externalCall req.defPath
+
+/--
+Evaluate `body` starting from `s : MachineState` for up to `fuel` steps and
+return its `MirDiffVerdict`.
+-/
+def evalMirDiffBounded
+    (fuel : Nat) (body : CapturedMir) (s : MachineState) : MirDiffVerdict :=
+  evalMirDiffExecBounded fuel body (.running s)
+
+/--
+Evaluate `body` starting from `s : MachineState` for up to `fuel` steps and
+return its decidable `MirDiffTag`.
+-/
+def evalMirDiffTagBounded
+    (fuel : Nat) (body : CapturedMir) (s : MachineState) : MirDiffTag :=
+  (evalMirDiffBounded fuel body s).toTag
+
+/--
+Computable bounded strict-UB detector over `MirExecState`: returns `true` only
+when `body` reaches an explicit Undefined Behavior fault (`FailureKind.ub`)
+within `fuel` steps along `.tau` and `MirObsE` transitions.
+
+Crucially, `reachesStrictUBExecBounded` returns `false` on
+`FailureKind.unsupported`, ensuring that differential tests against Miri `fail/`
+suites never mistake an unimplemented MIR feature for a successful UB detection.
+-/
+def reachesStrictUBExecBounded
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState) : Bool :=
+  match fuel with
+  | 0 => false
+  | fuel' + 1 =>
+    match stepMirState body st with
+    | .ret _ => false
+    | .tau st' => reachesStrictUBExecBounded fuel' body st'
+    | .vis (.inl (.fail .ub)) _ => true
+    | .vis (.inl (.fail .unsupported)) _ => false
+    | .vis (.inl (.fail .outOfFuel)) _ => false
+    | .vis (.inr (.inl _)) k =>
+      reachesStrictUBExecBounded fuel' body (k PUnit.unit)
+    | .vis (.inr (.inr _)) _ => false
+
+/-- Computable bounded strict-UB detector starting from `s : MachineState`. -/
+def reachesStrictUBBounded
+    (fuel : Nat) (body : CapturedMir) (s : MachineState) : Bool :=
+  reachesStrictUBExecBounded fuel body (.running s)
+
+/--
+Every strict-UB detection (`reachesStrictUBExecBounded`) is also a fault
+detection (`reachesFaultExecBounded`).
+-/
+theorem reachesFaultExecBounded_of_reachesStrictUBExecBounded
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (h_ub : reachesStrictUBExecBounded fuel body st = true) :
+    reachesFaultExecBounded fuel body st = true := by
+  induction fuel generalizing st with
+  | zero => nomatch h_ub
+  | succ fuel' ih =>
+    unfold reachesStrictUBExecBounded at h_ub
+    unfold reachesFaultExecBounded
+    cases h_step : stepMirState body st with
+    | ret _ =>
+      simp only [h_step] at h_ub
+      nomatch h_ub
+    | tau st' =>
+      simp only [h_step] at h_ub ⊢
+      exact ih st' h_ub
+    | vis i k =>
+      rcases i with f | (e | c)
+      · rfl
+      · simp only [h_step] at h_ub ⊢
+        exact ih (k PUnit.unit) h_ub
+      · simp only [h_step] at h_ub
+        nomatch h_ub
+
+/--
+If `reachesStrictUBBounded fuel body s = true`, then `mirTree body s` violates
+`TreeSafe` by reaching `FailureKind.ub`.
+-/
+theorem reachesStrictUBBounded_not_treeSafe
+    (fuel : Nat) (body : CapturedMir) (s : MachineState)
+    (h_ub : reachesStrictUBBounded fuel body s = true) :
+    ¬ TreeSafe (mirTree body s) :=
+  reachesFaultBounded_not_treeSafe fuel body s
+    (reachesFaultExecBounded_of_reachesStrictUBExecBounded fuel body (.running s) h_ub)
+
+/--
+Refute a stateless `c : Claim` (`¬ c.holds`) by exhibiting a concrete input
+`args` satisfying `c.pre args` whose bounded execution specifically hits
+`FailureKind.ub` (and not `.unsupported`) within `fuel` steps.
+-/
+theorem refuteClaimByStrictUB
+    (c : Claim)
+    (fuel : Nat)
+    (args : List Value)
+    (h_pre : c.pre args)
+    (h_ub :
+      reachesStrictUBBounded fuel c.body (initMachineState c.body args) = true := by
+      rfl) :
+    ¬ c.holds :=
+  refuteClaimByBoundedUB c fuel args h_pre
+    (reachesFaultExecBounded_of_reachesStrictUBExecBounded
+      fuel c.body (.running (initMachineState c.body args)) h_ub)
+
+/--
+Refute a stateful `c : StatefulClaim` (`¬ c.holds`) by exhibiting a concrete
+`(args, mem)` satisfying `c.pre args mem` whose bounded execution specifically
+hits `FailureKind.ub` (and not `.unsupported`) within `fuel` steps.
+-/
+theorem refuteStatefulClaimByStrictUB
+    (c : StatefulClaim)
+    (fuel : Nat)
+    (args : List Value)
+    (mem : Memory)
+    (h_pre : c.pre args mem)
+    (h_ub :
+      reachesStrictUBBounded fuel c.body
+        (initMachineStateWithMemory c.body args mem) = true := by
+      rfl) :
+    ¬ c.holds :=
+  refuteStatefulClaimByBoundedUB c fuel args mem h_pre
+    (reachesFaultExecBounded_of_reachesStrictUBExecBounded
+      fuel c.body (.running (initMachineStateWithMemory c.body args mem)) h_ub)
+
+/--
+Refute a total-correctness `c : TotalClaim` (`¬ c.holds`) by exhibiting a
+concrete `(args, mem)` satisfying `c.pre args mem` whose bounded execution
+specifically hits `FailureKind.ub` (and not `.unsupported`) within `fuel` steps.
+-/
+theorem refuteTotalClaimByStrictUB
+    (c : TotalClaim)
+    (fuel : Nat)
+    (args : List Value)
+    (mem : Memory)
+    (h_pre : c.pre args mem)
+    (h_ub :
+      reachesStrictUBBounded fuel c.body
+        (initMachineStateWithMemory c.body args mem) = true := by
+      rfl) :
+    ¬ c.holds :=
+  refuteTotalClaimByBoundedUB c fuel args mem h_pre
+    (reachesFaultExecBounded_of_reachesStrictUBExecBounded
+      fuel c.body (.running (initMachineStateWithMemory c.body args mem)) h_ub)
+
+/--
+Computable bounded panic detector over `MirExecState`: returns `true` when
+`body` reaches `.ret .panic` within `fuel` steps along `.tau` and `MirObsE`
+transitions without hitting any fault.
+-/
+def reachesPanicExecBounded
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState) : Bool :=
+  match fuel with
+  | 0 => false
+  | fuel' + 1 =>
+    match stepMirState body st with
+    | .ret .panic => true
+    | .ret (.normal _) => false
+    | .ret .abort => false
+    | .tau st' => reachesPanicExecBounded fuel' body st'
+    | .vis (.inl _) _ => false
+    | .vis (.inr (.inl _)) k => reachesPanicExecBounded fuel' body (k PUnit.unit)
+    | .vis (.inr (.inr _)) _ => false
+
+/-- Computable bounded panic detector starting from `s : MachineState`. -/
+def reachesPanicBounded
+    (fuel : Nat) (body : CapturedMir) (s : MachineState) : Bool :=
+  reachesPanicExecBounded fuel body (.running s)
+
+/--
+Soundness of `reachesPanicExecBounded`: if `reachesPanicExecBounded fuel body st`
+returns `true`, then `ITree.cofix (stepMirState body) st` reaches `.ret .panic`
+along some finite event trace `tr`.
+-/
+theorem reachesPanicExecBounded_reachesRet
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (h_panic : reachesPanicExecBounded fuel body st = true) :
+    ∃ tr, ReachesRet (ITree.cofix (stepMirState body) st) tr .panic := by
+  induction fuel generalizing st with
+  | zero => nomatch h_panic
+  | succ fuel' ih =>
+    unfold reachesPanicExecBounded at h_panic
+    have h_obs :
+        (ITree.cofix (stepMirState body) st).observe =
+          (stepMirState body st).map (ITree.cofix (stepMirState body)) :=
+      ITree.observe_cofix (stepMirState body) st
+    cases h_step : stepMirState body st with
+    | ret out =>
+      cases out with
+      | normal _ =>
+        simp only [h_step] at h_panic
+        nomatch h_panic
+      | panic =>
+        rw [h_step] at h_obs
+        dsimp only [ITreeF.map] at h_obs
+        exact ⟨[], _, Reaches.refl _, h_obs⟩
+      | abort =>
+        simp only [h_step] at h_panic
+        nomatch h_panic
+    | tau st' =>
+      simp only [h_step] at h_panic
+      rw [h_step] at h_obs
+      dsimp only [ITreeF.map] at h_obs
+      rcases ih st' h_panic with ⟨tr, u, h_reach, h_u⟩
+      exact ⟨tr, u, Reaches.tau h_obs h_reach, h_u⟩
+    | vis i k =>
+      rcases i with f | (e | c)
+      · simp only [h_step] at h_panic
+        nomatch h_panic
+      · simp only [h_step] at h_panic
+        rw [h_step] at h_obs
+        dsimp only [ITreeF.map] at h_obs
+        rcases ih (k PUnit.unit) h_panic with ⟨tr, u, h_reach, h_u⟩
+        exact ⟨⟨.inr (.inl e), PUnit.unit⟩ :: tr, u,
+          Reaches.vis h_obs False.elim PUnit.unit h_reach, h_u⟩
+      · simp only [h_step] at h_panic
+        nomatch h_panic
+
+/--
+If `reachesPanicBounded fuel body s = true`, then `mirTree body s` reaches
+`.ret .panic` along some finite event trace `tr`.
+-/
+theorem reachesPanicBounded_reachesRet
+    (fuel : Nat) (body : CapturedMir) (s : MachineState)
+    (h_panic : reachesPanicBounded fuel body s = true) :
+    ∃ tr, ReachesRet (mirTree body s) tr .panic :=
+  reachesPanicExecBounded_reachesRet fuel body (.running s) h_panic
+
+/--
+Refute a total-correctness `c : TotalClaim` (`¬ c.holds`) by exhibiting a
+concrete `(args, mem)` satisfying `c.pre args mem` whose bounded execution
+cleanly unwinds to `.ret .panic` within `fuel` steps.
+-/
+theorem refuteTotalClaimByBoundedPanic
+    (c : TotalClaim)
+    (fuel : Nat)
+    (args : List Value)
+    (mem : Memory)
+    (h_pre : c.pre args mem)
+    (h_panic :
+      reachesPanicBounded fuel c.body
+        (initMachineStateWithMemory c.body args mem) = true := by
+      rfl) :
+    ¬ c.holds := by
+  intro h_holds
+  rcases reachesPanicBounded_reachesRet fuel c.body
+    (initMachineStateWithMemory c.body args mem) h_panic with ⟨tr, h_ret⟩
+  rcases (h_holds args mem h_pre).2.2.2 tr .panic h_ret with
+    ⟨_, _, h_eq, _⟩
+  nomatch h_eq
+
+/--
+If `reachesPanicExecBounded fuel body st = true`, then `wpCoalBounded` holds
+under `mirDefaultWP` with vacuous normal-return postcondition
+`(∀ retVal mem', out = .normal (retVal, mem') → False)`, certifying that the
+panic execution path is completely UB-free (`TreeSafe`).
+-/
+theorem wpCoalBounded_of_reachesPanicExecBounded
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (h_panic : reachesPanicExecBounded fuel body st = true) :
+    wpCoalBounded fuel mirDefaultWP (stepMirState body)
+      (fun out _ => ∀ retVal mem', out = .normal (retVal, mem') → False)
+      st PUnit.unit := by
+  induction fuel generalizing st with
+  | zero => nomatch h_panic
+  | succ fuel' ih =>
+    unfold reachesPanicExecBounded at h_panic
+    unfold wpCoalBounded
+    cases h_step : stepMirState body st with
+    | ret out =>
+      cases out with
+      | normal _ =>
+        simp only [h_step] at h_panic
+        nomatch h_panic
+      | panic =>
+        intro _ _ h_eq
+        nomatch h_eq
+      | abort =>
+        simp only [h_step] at h_panic
+        nomatch h_panic
+    | tau st' =>
+      simp only [h_step] at h_panic ⊢
+      exact ih st' h_panic
+    | vis i k =>
+      rcases i with f | (e | c)
+      · simp only [h_step] at h_panic
+        nomatch h_panic
+      · simp only [h_step] at h_panic ⊢
+        cases e
+        exact ih (k PUnit.unit) h_panic
+      · simp only [h_step] at h_panic
+        nomatch h_panic
+
+/--
+If `reachesPanicBounded fuel body s = true`, then `wpMirBounded` holds with
+postcondition `∀ retVal mem', out = .normal (retVal, mem') → False`.
+-/
+theorem wpMirBounded_of_reachesPanicBounded
+    (fuel : Nat) (body : CapturedMir) (s : MachineState)
+    (h_panic : reachesPanicBounded fuel body s = true) :
+    wpMirBounded fuel body s
+      (fun out => ∀ retVal mem', out = .normal (retVal, mem') → False) :=
+  wpCoalBounded_of_reachesPanicExecBounded fuel body (.running s) h_panic
+
+/--
+Certify a Miri `panic` test at `(args, mem)`: proves both
+1. `StatefulVerificationResult` with `post := False` (certifying that execution
+   unwinds without Undefined Behavior and never returns normally), and
+2. `¬ TotalClaim.holds` (refuting total correctness because execution panics).
+-/
+theorem verifySafePanicMirPointBounded
+    (body : CapturedMir)
+    (fuel : Nat)
+    (args : List Value)
+    (mem : Memory)
+    (h_panic :
+      reachesPanicBounded fuel body
+        (initMachineStateWithMemory body args mem) = true := by
+      rfl) :
+    StatefulVerificationResult
+      { body := body
+        pre := fun a m => a = args ∧ m = mem
+        post := fun _ _ _ _ => False } ∧
+    ¬ ({ body := body
+         pre := fun a m => a = args ∧ m = mem
+         post := fun _ _ _ _ => True } : TotalClaim).holds := by
+  refine ⟨?_, ?_⟩
+  · refine verifyStatefulMirBounded _ fuel ?_
+    rintro a m ⟨rfl, rfl⟩
+    exact wpMirBounded_of_reachesPanicBounded fuel body
+      (initMachineStateWithMemory body a m) h_panic
+  · exact refuteTotalClaimByBoundedPanic
+      { body := body
+        pre := fun a m => a = args ∧ m = mem
+        post := fun _ _ _ _ => True }
+      fuel args mem ⟨rfl, rfl⟩ h_panic
+
+/--
+If `(evalMirDiffExecBounded fuel body st).toTag = .normalUnit`, then
+`wpCoalBounded` holds under `mirDefaultWP` with postcondition `.normal (.unit, mem')`.
+-/
+theorem wpCoalBounded_of_evalMirDiffExecBounded_normalUnit
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (h_ok : (evalMirDiffExecBounded fuel body st).toTag = .normalUnit) :
+    wpCoalBounded fuel mirDefaultWP (stepMirState body)
+      (fun out _ => ∃ retVal mem', out = .normal (retVal, mem') ∧ retVal = .unit)
+      st PUnit.unit := by
+  induction fuel generalizing st with
+  | zero => nomatch h_ok
+  | succ fuel' ih =>
+    unfold evalMirDiffExecBounded at h_ok
+    unfold wpCoalBounded
+    cases h_step : stepMirState body st with
+    | ret out =>
+      cases out with
+      | normal p =>
+        rcases p with ⟨rv, m⟩
+        simp only [h_step] at h_ok ⊢
+        cases rv with
+        | unit => exact ⟨.unit, m, rfl, rfl⟩
+        | scalar _ => nomatch h_ok
+        | ptr _ _ => nomatch h_ok
+        | aggregate _ _ => nomatch h_ok
+      | panic =>
+        simp only [h_step] at h_ok
+        nomatch h_ok
+      | abort =>
+        simp only [h_step] at h_ok
+        nomatch h_ok
+    | tau st' =>
+      simp only [h_step] at h_ok ⊢
+      exact ih st' h_ok
+    | vis i k =>
+      rcases i with f | (e | c)
+      · rcases f with ⟨fk⟩
+        cases fk <;> (simp only [h_step, MirDiffVerdict.toTag] at h_ok; nomatch h_ok)
+      · simp only [h_step] at h_ok ⊢
+        cases e
+        exact ih (k PUnit.unit) h_ok
+      · rcases c with ⟨req⟩
+        simp only [h_step, MirDiffVerdict.toTag] at h_ok
+        nomatch h_ok
+
+/--
+If `(evalMirDiffExecBounded fuel body st).toTag = .normalScalar bits sizeBytes`,
+then `wpCoalBounded` holds under `mirDefaultWP` with postcondition
+`.normal (.scalar ⟨bits, sizeBytes⟩, mem')`.
+-/
+theorem wpCoalBounded_of_evalMirDiffExecBounded_normalScalar
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (bits sizeBytes : Nat)
+    (h_ok :
+      (evalMirDiffExecBounded fuel body st).toTag =
+        .normalScalar bits sizeBytes) :
+    wpCoalBounded fuel mirDefaultWP (stepMirState body)
+      (fun out _ =>
+        ∃ retVal mem',
+          out = .normal (retVal, mem') ∧
+          retVal = .scalar { bits := bits, sizeBytes := sizeBytes })
+      st PUnit.unit := by
+  induction fuel generalizing st with
+  | zero => nomatch h_ok
+  | succ fuel' ih =>
+    unfold evalMirDiffExecBounded at h_ok
+    unfold wpCoalBounded
+    cases h_step : stepMirState body st with
+    | ret out =>
+      cases out with
+      | normal p =>
+        rcases p with ⟨rv, m⟩
+        simp only [h_step] at h_ok ⊢
+        cases rv with
+        | unit => nomatch h_ok
+        | scalar sc =>
+          rcases sc with ⟨b, sz⟩
+          dsimp only [MirDiffVerdict.toTag] at h_ok
+          injection h_ok with h_b h_sz
+          subst h_b
+          subst h_sz
+          exact ⟨.scalar { bits := b, sizeBytes := sz }, m, rfl, rfl⟩
+        | ptr _ _ => nomatch h_ok
+        | aggregate _ _ => nomatch h_ok
+      | panic =>
+        simp only [h_step] at h_ok
+        nomatch h_ok
+      | abort =>
+        simp only [h_step] at h_ok
+        nomatch h_ok
+    | tau st' =>
+      simp only [h_step] at h_ok ⊢
+      exact ih st' h_ok
+    | vis i k =>
+      rcases i with f | (e | c)
+      · rcases f with ⟨fk⟩
+        cases fk <;> (simp only [h_step, MirDiffVerdict.toTag] at h_ok; nomatch h_ok)
+      · simp only [h_step] at h_ok ⊢
+        cases e
+        exact ih (k PUnit.unit) h_ok
+      · rcases c with ⟨req⟩
+        simp only [h_step, MirDiffVerdict.toTag] at h_ok
+        nomatch h_ok
+
+/--
+Certify a Miri `pass` test returning `()` at `(args, mem)`: proves
+`TotalVerificationResult` via `evalMirDiffTagBounded ... = .normalUnit`.
+-/
+theorem verifyTotalMirUnitPointBounded
+    (body : CapturedMir)
+    (fuel : Nat)
+    (args : List Value)
+    (mem : Memory)
+    (h_ok :
+      evalMirDiffTagBounded fuel body
+        (initMachineStateWithMemory body args mem) = .normalUnit := by
+      rfl) :
+    TotalVerificationResult
+      { body := body
+        pre := fun a m => a = args ∧ m = mem
+        post := fun _ _ retVal _ => retVal = .unit } := by
+  refine verifyTotalMirBounded _ fuel ?_
+  rintro a m ⟨rfl, rfl⟩
+  exact wpCoalBounded_of_evalMirDiffExecBounded_normalUnit
+    fuel body (.running (initMachineStateWithMemory body a m)) h_ok
+
+/--
+Certify a Miri `pass` test returning `.scalar ⟨bits, sizeBytes⟩` at `(args, mem)`:
+proves `TotalVerificationResult` via
+`evalMirDiffTagBounded ... = .normalScalar bits sizeBytes`.
+-/
+theorem verifyTotalMirScalarPointBounded
+    (body : CapturedMir)
+    (fuel : Nat)
+    (args : List Value)
+    (mem : Memory)
+    (bits sizeBytes : Nat)
+    (h_ok :
+      evalMirDiffTagBounded fuel body
+        (initMachineStateWithMemory body args mem) =
+          .normalScalar bits sizeBytes := by
+      rfl) :
+    TotalVerificationResult
+      { body := body
+        pre := fun a m => a = args ∧ m = mem
+        post := fun _ _ retVal _ =>
+          retVal = .scalar { bits := bits, sizeBytes := sizeBytes } } := by
+  refine verifyTotalMirBounded _ fuel ?_
+  rintro a m ⟨rfl, rfl⟩
+  exact wpCoalBounded_of_evalMirDiffExecBounded_normalScalar
+    fuel body (.running (initMachineStateWithMemory body a m))
+    bits sizeBytes h_ok
+
+/--
+Certify a Miri `fail` (Undefined Behavior) test at `(args, mem)`: proves that
+both `StatefulClaim.holds` and `TotalClaim.holds` are refuted by reaching
+`FailureKind.ub` (and specifically NOT `FailureKind.unsupported`).
+-/
+theorem refuteMirPointByStrictUB
+    (body : CapturedMir)
+    (fuel : Nat)
+    (args : List Value)
+    (mem : Memory)
+    (h_ub :
+      reachesStrictUBBounded fuel body
+        (initMachineStateWithMemory body args mem) = true := by
+      rfl) :
+    ¬ ({ body := body
+         pre := fun a m => a = args ∧ m = mem
+         post := fun _ _ _ _ => True } : StatefulClaim).holds ∧
+    ¬ ({ body := body
+         pre := fun a m => a = args ∧ m = mem
+         post := fun _ _ _ _ => True } : TotalClaim).holds :=
+  ⟨refuteStatefulClaimByStrictUB _ fuel args mem ⟨rfl, rfl⟩ h_ub,
+   refuteTotalClaimByStrictUB _ fuel args mem ⟨rfl, rfl⟩ h_ub⟩
 
 end Anneal.Rustc.V2026_06_01.SymbolicEval
 
