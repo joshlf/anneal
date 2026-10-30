@@ -133,11 +133,55 @@ abbrev mirModularWP
   (failWP PUnit FailureKind).sum
     ((obsIgnoreWP PUnit MirObs).sum (contractCallWP PUnit C))
 
+/-- Proposition holding iff a `FailReq FailureKind` is a waived `.ub` fault. -/
+def isWaivedUbFailReq : FailReq FailureKind → Prop
+  | .fail .ub => True
+  | .fail .unsupported => False
+  | .fail .outOfFuel => False
+
+/--
+Fault transformer for `MirFailE` that waives `.fail .ub` (`wp _ _ _ := True`)
+while still rejecting `.fail .unsupported` (`wp _ _ _ := False`).
+Used by `UbExceptionVerificationResult` to verify that every non-faulting
+normal return path of a UB-exempted item satisfies its postcondition across all
+`pre` inputs, even on inputs where another execution path triggers `.fail .ub`.
+-/
+def waiveUbFailWP (S : Type) : StateEffectWP S MirFailE where
+  wp i _ _ := isWaivedUbFailReq i
+  mono _ h := h
+
+instance (S : Type) : StateEffectWP.Conjunctive (waiveUbFailWP S) where
+  conj h₁ _ := h₁
+
+/--
+UB-waiving predicate transformer for `MirEffect`: `.fail .ub` evaluates to
+`True`, `.fail .unsupported` evaluates to `False`, `MirObs` emissions step
+cleanly, and unresolved `MirCallE` requests quantify demonically over all
+`MirCallAns` responses.
+-/
+abbrev mirUbWaivedWP : EffectWP MirEffect :=
+  (waiveUbFailWP PUnit).sum
+    ((obsIgnoreWP PUnit MirObs).sum
+      (unconstrainedCallWP PUnit MirCallReq (fun _ => MirCallAns)))
+
+/-- Convert a `MirCallContract` (`Trusted.VerificationResult`) into an `EffectWP.CallContract`. -/
+def _root_.Trusted.VerificationResult.MirCallContract.toCallContract
+    (C : MirCallContract) : CallContract MirCallReq (fun _ => MirCallAns) where
+  pre := C.pre
+  post := C.post
+
 /-- Fuel-bounded coalgebra stepping on `stepMirState body` under `mirDefaultWP`. -/
 def wpMirBounded
     (fuel : Nat) (body : CapturedMir) (s : MachineState)
     (post : MirOutcome → Prop) : Prop :=
   wpCoalBounded fuel mirDefaultWP (stepMirState body)
+    (fun out _ => post out) (.running s) PUnit.unit
+
+/-- Fuel-bounded coalgebra stepping on `stepMirState body` under `mirUbWaivedWP`. -/
+def wpMirUbWaivedBounded
+    (fuel : Nat) (body : CapturedMir) (s : MachineState)
+    (post : MirOutcome → Prop) : Prop :=
+  wpCoalBounded fuel mirUbWaivedWP (stepMirState body)
     (fun out _ => post out) (.running s) PUnit.unit
 
 /-- Fuel-bounded coalgebra stepping on `stepMirState body` under `mirNoCallWP`. -/
@@ -383,6 +427,207 @@ theorem verifyModularMirBounded
   verifyModularByDWLP C body pre post
     (fun args mem h_pre => dwlp_cofix_of_wpCoalBounded (h_wp args mem h_pre))
 
+private theorem dwlp_ubWaived_reaches
+    {t u : ITree MirEffect MirOutcome} {tr : List (Event MirEffect)}
+    {Q : MirOutcome → PUnit → Prop}
+    (h_reach : Reaches t tr u)
+    (h_dwlp : DWLP mirUbWaivedWP t Q PUnit.unit) :
+    DWLP mirUbWaivedWP u Q PUnit.unit := by
+  induction h_reach with
+  | refl => exact h_dwlp
+  | tau ht _ ih =>
+    rw [DWLP.unfold_eq, ht] at h_dwlp; exact ih h_dwlp
+  | @vis _ _ i k _ hv _ o _ ih =>
+    rw [DWLP.unfold_eq, hv] at h_dwlp
+    cases i with
+    | inl f => cases f; nomatch o
+    | inr rest =>
+      cases rest with
+      | inl obs => cases obs; cases o; exact ih h_dwlp
+      | inr call => cases call; exact ih (h_dwlp o)
+
+/--
+Adequacy of `DWLP mirUbWaivedWP` on normal/returning paths: even when `.fail .ub`
+branches are waived (`wp _ _ _ := True`), any completed `ReachesRet t tr out`
+path cannot pass through a fault node (`MirFailE.O _ = PEmpty`), so `post out`
+holds on every return `out`.
+-/
+theorem dwlp_ubWaived_reachesRet
+    {t : ITree MirEffect MirOutcome} {post : MirOutcome → Prop}
+    (h_dwlp : DWLP mirUbWaivedWP t (fun out _ => post out) PUnit.unit) :
+    ∀ tr out, ReachesRet t tr out → post out := by
+  intro tr out ⟨u, h_reach, h_ret⟩
+  have hu := dwlp_ubWaived_reaches h_reach h_dwlp
+  rw [DWLP.unfold_eq, h_ret] at hu
+  exact hu
+
+/--
+Prove a scoped `UbExceptionVerificationResult c` constructively (with zero
+axioms) from:
+1. `DWLP mirDefaultWP` on the strict-safety subdomain
+   `c.pre args mem ∧ c.strictSafetyPre args mem`
+2. `DWLP mirUbWaivedWP` across the full caller domain `c.pre args mem`.
+-/
+theorem verifyUbExceptionByDWLP
+    (c : UbExceptionClaim)
+    (h_strict :
+      ∀ args mem,
+        c.pre args mem →
+        c.strictSafetyPre args mem →
+        DWLP mirDefaultWP (mirStatefulTree c.body args mem)
+          (fun out _ =>
+            ∀ retVal mem',
+              out = .normal (retVal, mem') → c.post args mem retVal mem')
+          PUnit.unit)
+    (h_waived :
+      ∀ args mem,
+        c.pre args mem →
+        DWLP mirUbWaivedWP (mirStatefulTree c.body args mem)
+          (fun out _ =>
+            ∀ retVal mem',
+              out = .normal (retVal, mem') → c.post args mem retVal mem')
+          PUnit.unit) :
+    UbExceptionVerificationResult c := by
+  refine ⟨⟨?_, ?_⟩⟩
+  · intro args mem ⟨h_pre, h_s⟩
+    have h_adeq := dwlp_pure_adequacy (h_strict args mem h_pre h_s)
+    exact ⟨h_adeq.1, fun outPair h_ret _ retVal mem' h_out =>
+      h_adeq.2 outPair.1 outPair.2 h_ret retVal mem' h_out⟩
+  · intro args mem h_pre tr retVal mem' h_ret
+    exact dwlp_ubWaived_reachesRet (h_waived args mem h_pre)
+      tr (.normal (retVal, mem')) h_ret retVal mem' rfl
+
+/--
+Prove a scoped `UbExceptionVerificationResult c` from fuel-bounded
+`wpMirBounded` (on `c.pre ∧ c.strictSafetyPre`) and `wpMirUbWaivedBounded`
+(on `c.pre`).
+-/
+theorem verifyUbExceptionMirBounded
+    (c : UbExceptionClaim) (fuel : Nat)
+    (h_strict :
+      ∀ args mem,
+        c.pre args mem →
+        c.strictSafetyPre args mem →
+        wpMirBounded fuel c.body (initMachineStateWithMemory c.body args mem)
+          (fun out =>
+            ∀ retVal mem',
+              out = .normal (retVal, mem') → c.post args mem retVal mem'))
+    (h_waived :
+      ∀ args mem,
+        c.pre args mem →
+        wpMirUbWaivedBounded fuel c.body (initMachineStateWithMemory c.body args mem)
+          (fun out =>
+            ∀ retVal mem',
+              out = .normal (retVal, mem') → c.post args mem retVal mem')) :
+    UbExceptionVerificationResult c :=
+  verifyUbExceptionByDWLP c
+    (fun args mem h_pre h_s =>
+      dwlp_cofix_of_wpCoalBounded (h_strict args mem h_pre h_s))
+    (fun args mem h_pre =>
+      dwlp_cofix_of_wpCoalBounded (h_waived args mem h_pre))
+
+/--
+Completeness of `DWLP mirClosedWP` with respect to `TreeSafe` and `ReachesRet`:
+any `t : ITree MirClosedEffect R` that is `TreeSafe` and satisfies `Q r .unit`
+on all `ReachesRet` returns satisfies `DWLP mirClosedWP t Q PUnit.unit`.
+-/
+theorem dwlp_mirClosedWP_of_treeSafe_reachesRet
+    {R : Type} {t : ITree MirClosedEffect R} {Q : R → PUnit → Prop}
+    (h_safe : TreeSafe t)
+    (h_ret : ∀ tr r, ReachesRet t tr r → Q r PUnit.unit) :
+    DWLP mirClosedWP t Q PUnit.unit := by
+  refine DWLP.coinduct
+    (fun u _ => TreeSafe u ∧ ∀ tr r, ReachesRet u tr r → Q r PUnit.unit)
+    ?_ ⟨h_safe, h_ret⟩
+  intro u _ ⟨hu_safe, hu_ret⟩
+  cases h_obs : u.observe with
+  | ret r =>
+    exact hu_ret [] r ⟨u, .refl u, h_obs⟩
+  | tau u' =>
+    refine ⟨?_, ?_⟩
+    · intro tr w hw
+      exact hu_safe tr w (.tau h_obs hw)
+    · intro tr r ⟨w, hw, hw_ret⟩
+      exact hu_ret tr r ⟨w, .tau h_obs hw, hw_ret⟩
+  | vis i k =>
+    cases i with
+    | inl f =>
+      cases f with
+      | fail fk =>
+        exact False.elim
+          (hu_safe [] u (.refl u) ⟨u, .inl (.fail fk), k, .refl u, h_obs, trivial⟩)
+    | inr obs =>
+      cases obs with
+      | emit ev =>
+        have h_nf : ¬ FaultEffect.isFault (E := MirClosedEffect) (.inr (.emit ev)) :=
+          not_false
+        refine ⟨?_, ?_⟩
+        · intro tr w hw
+          exact hu_safe (⟨.inr (.emit ev), .unit⟩ :: tr) w
+            (.vis h_obs h_nf .unit hw)
+        · intro tr r ⟨w, hw, hw_ret⟩
+          exact hu_ret (⟨.inr (.emit ev), .unit⟩ :: tr) r
+            ⟨w, .vis h_obs h_nf .unit hw, hw_ret⟩
+
+/--
+Convert a trusted `MirCallContract.holdsOn C h` rely hypothesis into
+`envSatisfiesContract C.toCallContract h`.
+-/
+theorem envSatisfiesContract_of_holdsOn
+    (C : MirCallContract) (h : ExternalCallHandler)
+    (h_on : C.holdsOn h) :
+    envSatisfiesContract C.toCallContract h := by
+  intro req Q h_pre h_post_imp
+  rcases h_on req h_pre with ⟨h_safe, h_ret⟩
+  exact dwlp_mirClosedWP_of_treeSafe_reachesRet h_safe
+    (fun tr ans h_r => h_post_imp ans (h_ret tr ans h_r))
+
+/--
+Prove a `ModularVerificationResult` against `C.holdsOn` (`MirCallContract`) from
+`DWLP (mirModularWP C.toCallContract)`.
+-/
+theorem verifyModularContractByDWLP
+    (C : MirCallContract)
+    (body : CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (h_dwlp :
+      ∀ args mem,
+        pre args mem →
+        DWLP (mirModularWP C.toCallContract) (mirStatefulTree body args mem)
+          (fun out _ =>
+            ∀ retVal mem',
+              out = .normal (retVal, mem') → post args mem retVal mem')
+          PUnit.unit) :
+    ModularVerificationResult
+      { body, envAssumed := C.holdsOn, pre, post } :=
+  ⟨fun h h_on =>
+    (verifyModularByDWLP C.toCallContract body pre post h_dwlp).proof
+      h (envSatisfiesContract_of_holdsOn C h h_on)⟩
+
+/--
+Prove a `ModularVerificationResult` against `C.holdsOn` (`MirCallContract`) from
+fuel-bounded `wpMirModularBounded`.
+-/
+theorem verifyModularContractMirBounded
+    (C : MirCallContract)
+    (body : CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ args mem,
+        pre args mem →
+        wpMirModularBounded fuel C.toCallContract body
+          (initMachineStateWithMemory body args mem)
+          (fun out =>
+            ∀ retVal mem',
+              out = .normal (retVal, mem') → post args mem retVal mem')) :
+    ModularVerificationResult
+      { body, envAssumed := C.holdsOn, pre, post } :=
+  verifyModularContractByDWLP C body pre post
+    (fun args mem h_pre => dwlp_cofix_of_wpCoalBounded (h_wp args mem h_pre))
+
 /-! ## 3. Horizontal Caller–Callee Linking via `ITree.interp` -/
 
 /--
@@ -514,6 +759,97 @@ theorem linkVerifiedMirCallee
     (linkCalleeHandler calleeBody fallback)
     (envSatisfiesContract_linkCalleeHandler
       C calleeBody fallback h_callee h_fallback)
+
+/--
+Idealized UB-exception call handler for a scoped `c : UbExceptionClaim`:
+routes calls matching `c.body.defPath` to a deterministic specification witness
+`excModel req.args req.memory` (isolating callers from the exempted callee's
+internal `.fail .ub` outside `c.strictSafetyPre` while preserving the callee's
+normal-return postcondition `c.post`).
+-/
+def ubExceptionModelHandler
+    (c : UbExceptionClaim)
+    (excModel : List Value → Memory → Value × Memory)
+    (fallback : ExternalCallHandler) : ExternalCallHandler :=
+  fun req =>
+    if req.defPath = c.body.defPath then
+      let out := excModel req.args req.memory
+      .ret (.returned out.1 out.2)
+    else
+      fallback req
+
+/--
+Establish `c.callContract.holdsOn (ubExceptionModelHandler c excModel fallback)`
+from a verified `UbExceptionVerificationResult c` and a postcondition-compliant
+model witness `excModel`.
+-/
+theorem holdsOn_ubExceptionModelHandler
+    {c : UbExceptionClaim}
+    (h_callee : UbExceptionVerificationResult c)
+    (excModel : List Value → Memory → Value × Memory)
+    (fallback : ExternalCallHandler)
+    (h_model :
+      ∀ args mem,
+        c.pre args mem →
+        (∀ tr retVal mem',
+          ReachesRet (mirStatefulTree c.body args mem) tr (.normal (retVal, mem')) →
+          c.post args mem retVal mem') →
+        c.post args mem (excModel args mem).1 (excModel args mem).2) :
+    c.callContract.holdsOn (ubExceptionModelHandler c excModel fallback) := by
+  intro req ⟨h_path, h_pre⟩
+  simp only [ubExceptionModelHandler, h_path, ↓reduceIte]
+  have h_dwlp :
+      DWLP mirClosedWP
+        (.ret (.returned (excModel req.args req.memory).1 (excModel req.args req.memory).2))
+        (fun ans _ => c.callContract.post req ans)
+        PUnit.unit :=
+    DWLP.ret ⟨(excModel req.args req.memory).1, (excModel req.args req.memory).2,
+      rfl, h_model req.args req.memory h_pre (h_callee.proof.2 req.args req.memory h_pre)⟩
+  exact dwlp_pure_adequacy h_dwlp
+
+/--
+Horizontal caller–callee linking theorem for a scoped UB-exception callee:
+links a caller verified via `ModularVerificationResult` against
+`c.callContract.holdsOn` with a callee verified via
+`UbExceptionVerificationResult c`, certifying that:
+1. The caller is `TreeSafe` and satisfies `post` across all `pre` under
+   `ubExceptionModelHandler c excModel fallback`, and
+2. The exempted callee itself is strictly `TreeSafe` on `c.pre ∧ c.strictSafetyPre`.
+-/
+theorem linkUbExceptionCallee
+    {c : UbExceptionClaim}
+    {callerBody : CapturedMir}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (h_caller :
+      ModularVerificationResult
+        { body := callerBody
+          envAssumed := c.callContract.holdsOn
+          pre := pre
+          post := post })
+    (h_callee : UbExceptionVerificationResult c)
+    (excModel : List Value → Memory → Value × Memory)
+    (fallback : ExternalCallHandler)
+    (h_model :
+      ∀ args mem,
+        c.pre args mem →
+        (∀ tr retVal mem',
+          ReachesRet (mirStatefulTree c.body args mem) tr (.normal (retVal, mem')) →
+          c.post args mem retVal mem') →
+        c.post args mem (excModel args mem).1 (excModel args mem).2) :
+    ((fun args mem =>
+      (mirHandledTree callerBody args mem
+        (ubExceptionModelHandler c excModel fallback)).toPartial) ≤
+      MirClosedStatefulContractSpec pre pre post) ∧
+    MirStatefulContractHoldsWithSafety
+      c.body
+      (fun args mem => c.pre args mem ∧ c.strictSafetyPre args mem)
+      c.pre
+      c.post :=
+  ⟨h_caller.proof
+    (ubExceptionModelHandler c excModel fallback)
+    (holdsOn_ubExceptionModelHandler h_callee excModel fallback h_model),
+   h_callee.proof.1⟩
 
 /-! ## 4. Program-to-Program Behavioral Equivalence & Whole-Crate Rollup -/
 

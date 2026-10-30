@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsStorageBoundary.ff1_block_tail_offset
 import Obligations.FxfsStorageBoundary.ff1_block_tail_offset

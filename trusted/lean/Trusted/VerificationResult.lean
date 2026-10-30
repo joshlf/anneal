@@ -251,6 +251,33 @@ def MirClosedStatefulContractSpec
       ∀ retVal mem',
         outPair.2 = .normal (retVal, mem') → post args mem retVal mem'
 
+/-- Rely–guarantee call contract over `MirCallReq` and `MirCallAns`. -/
+structure MirCallContract : Type where
+  pre : MirCallReq → Prop := fun _ => True
+  post : MirCallReq → MirCallAns → Prop := fun _ _ => True
+
+/--
+Semantic rely predicate stating that an `ExternalCallHandler` `h` implements
+`C : MirCallContract` over `MirClosedEffect`: for every request satisfying
+`C.pre req`, `h req` is `TreeSafe` and every normal return satisfies
+`C.post req ans`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "It is the programmer’s responsibility when writing unsafe code to ensure that
+> any safe code interacting with the unsafe code cannot trigger these
+> behaviors. unsafe code that satisfies this property for any safe client is
+> called sound; if unsafe code can be misused by safe code to exhibit
+> undefined behavior, it is unsound."
+-/
+def MirCallContract.holdsOn
+    (C : MirCallContract) (h : ExternalCallHandler) : Prop :=
+  ∀ req : MirCallReq,
+    C.pre req →
+    TreeSafe (h req) ∧
+    ∀ tr ans, ReachesRet (h req) tr ans → C.post req ans
+
 /-- Modular claim parameterized by an explicit rely predicate `envAssumed`. -/
 structure ModularClaim : Type 1 where
   body : CapturedMir
@@ -268,6 +295,16 @@ def ModularClaim.holds (c : ModularClaim) : Prop :=
 /-- Audited kernel verification certificate for `c : ModularClaim`. -/
 structure ModularVerificationResult (c : ModularClaim) : Prop where
   proof : c.holds
+
+/-- Typeclass associating Rust item `defId` with its modular contract. -/
+class ModularItemSpec (defId : String) : Type 1 where
+  envAssumed : ExternalCallHandler → Prop := fun _ => True
+  pre : List Value → Memory → Prop := fun _ _ => True
+  post : List Value → Memory → Value → Memory → Prop := fun _ _ _ _ => True
+
+/-- Typeclass packaging a `ModularVerificationResult c` for `defId`. -/
+class ModularItemProof (defId : String) (c : ModularClaim) : Prop where
+  verified : ModularVerificationResult c
 
 /-! ## 4. Trace-Aware Claims (`TraceClaim`, `TraceVerificationResult`) -/
 
@@ -433,7 +470,94 @@ class StatefulEquivItemSpec (defId : String) : Type 1 where
 class StatefulEquivItemProof (defId : String) (c : StatefulEquivClaim) : Prop where
   verified : StatefulEquivVerificationResult c
 
-/-! ## 7. Specification Non-Vacuity Obligations (`NonVacuousPre`, `NonVacuousStatefulPre`) -/
+/-! ## 7. Scoped UB-Exception Claims (`UbExceptionClaim`, `UbExceptionVerificationResult`) -/
+
+/--
+Scoped verification-exception claim for a captured Rust item that is known to
+potentially exhibit undefined behavior outside a restricted subdomain
+`strictSafetyPre` (for example, an intentional zero-copy `&[u8]` borrow over a
+concurrently mutable hardware or pager VMO where `strictSafetyPre` requires the
+VMO to be exclusively owned/trusted, while callers invoke it across a broader
+precondition `pre`).
+
+Unlike an unconstrained `axiom` asserting `StatefulVerificationResult` (which
+would assert `TreeSafe` on inputs where `mirStatefulTree` deterministically
+steps to `.fail .ub`, introducing `False` into the Lean kernel),
+`UbExceptionClaim` is proved **constructively with zero axioms** by
+establishing two obligations:
+1. **Strict Safety on `pre ∧ strictSafetyPre`**: Under the restricted
+   subdomain `c.pre args mem ∧ c.strictSafetyPre args mem`, `c.body` is
+   completely UB-free (`TreeSafe`) and every normal return satisfies `c.post`
+   (`MirStatefulContractHoldsWithSafety`).
+2. **Normal-Return Postcondition Across All `pre`**: Across the full caller
+   precondition `c.pre args mem` (even when `¬ c.strictSafetyPre args mem`
+   and a UB fault may occur), every non-faulting normal return
+   `ReachesRet (mirStatefulTree c.body args mem) tr (.normal (retVal, mem'))`
+   still satisfies `c.post args mem retVal mem'` (and no `.fail .unsupported`
+   is reached under `mirUbWaivedWP`).
+
+`TrustedBoundary.lean` treats `UbExceptionVerificationResult` as an explicit
+conditional verification exception (gated behind `--allow-assumptions` /
+`--allow-ub-exceptions` and surfaced in the audit summary). Callers isolate
+themselves from the exempted callee's potential `.fail .ub` by verifying
+against `c.callContract.holdsOn` via `ModularVerificationResult` and linking
+via `linkUbExceptionCallee`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "It is the programmer’s responsibility when writing unsafe code to ensure that
+> any safe code interacting with the unsafe code cannot trigger these
+> behaviors. unsafe code that satisfies this property for any safe client is
+> called sound; if unsafe code can be misused by safe code to exhibit
+> undefined behavior, it is unsound."
+-/
+structure UbExceptionClaim : Type 1 where
+  body : CapturedMir
+  pre : List Value → Memory → Prop
+  strictSafetyPre : List Value → Memory → Prop := fun _ _ => False
+  post : List Value → Memory → Value → Memory → Prop
+
+/-- Proposition denoted by `c : UbExceptionClaim`. -/
+def UbExceptionClaim.holds (c : UbExceptionClaim) : Prop :=
+  MirStatefulContractHoldsWithSafety
+    c.body
+    (fun args mem => c.pre args mem ∧ c.strictSafetyPre args mem)
+    c.pre
+    c.post ∧
+  ∀ args mem,
+    c.pre args mem →
+    ∀ tr retVal mem',
+      ReachesRet (mirStatefulTree c.body args mem) tr (.normal (retVal, mem')) →
+      c.post args mem retVal mem'
+
+/--
+Modular call contract exported by `c : UbExceptionClaim` to callers: callers
+must establish `c.pre req.args req.memory` at the call site and may rely on
+`c.post req.args req.memory retVal mem'` upon normal return.
+-/
+def UbExceptionClaim.callContract (c : UbExceptionClaim) : MirCallContract where
+  pre req := req.defPath = c.body.defPath ∧ c.pre req.args req.memory
+  post req ans :=
+    ∃ retVal mem',
+      ans = .returned retVal mem' ∧
+      c.post req.args req.memory retVal mem'
+
+/-- Audited kernel verification certificate for `c : UbExceptionClaim`. -/
+structure UbExceptionVerificationResult (c : UbExceptionClaim) : Prop where
+  proof : c.holds
+
+/-- Typeclass associating Rust item `defId` with its scoped UB-exception contract. -/
+class UbExceptionItemSpec (defId : String) : Type 1 where
+  pre : List Value → Memory → Prop := fun _ _ => True
+  strictSafetyPre : List Value → Memory → Prop := fun _ _ => False
+  post : List Value → Memory → Value → Memory → Prop := fun _ _ _ _ => True
+
+/-- Typeclass packaging a `UbExceptionVerificationResult c` for `defId`. -/
+class UbExceptionItemProof (defId : String) (c : UbExceptionClaim) : Prop where
+  verified : UbExceptionVerificationResult c
+
+/-! ## 8. Specification Non-Vacuity Obligations (`NonVacuousPre`, `NonVacuousStatefulPre`) -/
 
 /-- Witness obligation asserting that a stateless precondition `pre` is satisfiable. -/
 def NonVacuousPre (pre : List Value → Prop) : Prop :=
@@ -443,7 +567,7 @@ def NonVacuousPre (pre : List Value → Prop) : Prop :=
 def NonVacuousStatefulPre (pre : List Value → Memory → Prop) : Prop :=
   ∃ args mem, pre args mem
 
-/-! ## 8. Whole-Crate Verification Rollup (`CrateItemEntry`, `CrateClaim`, `CrateVerificationResult`) -/
+/-! ## 9. Whole-Crate Verification Rollup (`CrateItemEntry`, `CrateClaim`, `CrateVerificationResult`) -/
 
 /-- Per-item entry in a whole-crate verification rollup manifest. -/
 structure CrateItemEntry : Type 1 where

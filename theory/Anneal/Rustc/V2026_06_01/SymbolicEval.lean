@@ -2669,5 +2669,292 @@ theorem verifyStatefulEquivMirSym
   · rw [← wpMirNoCallSym_eq_wpMirNoCallBounded]
     exact h_spec args mem h_pre
 
+/-! ## 14. Single-Pass Symbolic Evaluators for Scoped UB Exceptions & Modular Call Contracts -/
+
+/-- Direct `Prop`-valued node evaluator matching `mirUbWaivedWP` on `MirStepNode`. -/
+@[reducible]
+def evalNodeUbWaivedWP
+    (cont : MirExecState → Prop) (post : MirOutcome → Prop) :
+    MirStepNode → Prop
+  | .ret out => post out
+  | .tau st' => cont st'
+  | .vis (.inl f) _ => isWaivedUbFailReq f
+  | .vis (.inr (.inl _)) k => cont (k PUnit.unit)
+  | .vis (.inr (.inr (.call _))) k => ∀ ans : MirCallAns, cont (k ans)
+
+theorem evalNodeUbWaivedWP_eq
+    (cont : MirExecState → Prop) (post : MirOutcome → Prop)
+    (node : MirStepNode) :
+    evalNodeUbWaivedWP cont post node =
+      match node with
+      | .ret out => post out
+      | .tau st' => cont st'
+      | .vis i k => mirUbWaivedWP.wp i (fun o _ => cont (k o)) PUnit.unit := by
+  cases node with
+  | ret _ => rfl
+  | tau _ => rfl
+  | vis i _ =>
+    rcases i with f | (e | c)
+    · cases f; rfl
+    · cases e; rfl
+    · cases c; rfl
+
+/-- Structural `Prop`-valued UB-waived evaluator over `SymTree MirStepNode`. -/
+def evalSymNodeTreeUbWaived
+    (cont : MirExecState → Prop) (post : MirOutcome → Prop) :
+    SymTree MirStepNode → Prop
+  | .leaf (.ret out) => post out
+  | .leaf (.tau st') => cont st'
+  | .leaf (.vis (.inl f) _) => isWaivedUbFailReq f
+  | .leaf (.vis (.inr (.inl _)) k) => cont (k PUnit.unit)
+  | .leaf (.vis (.inr (.inr (.call _))) k) => ∀ ans : MirCallAns, cont (k ans)
+  | .branch c t1 t2 =>
+    match c with
+    | true => evalSymNodeTreeUbWaived cont post t1
+    | false => evalSymNodeTreeUbWaived cont post t2
+
+theorem evalSymNodeTreeUbWaived_eq
+    (cont : MirExecState → Prop) (post : MirOutcome → Prop)
+    (t : SymTree MirStepNode) :
+    evalSymNodeTreeUbWaived cont post t = evalNodeUbWaivedWP cont post t.eval := by
+  induction t with
+  | leaf node =>
+    cases node with
+    | ret _ => rfl
+    | tau _ => rfl
+    | vis i _ =>
+      rcases i with f | (e | c)
+      · cases f; rfl
+      · cases e; rfl
+      · cases c; rfl
+  | branch c _ _ ih1 ih2 =>
+    cases c
+    · exact ih2
+    · exact ih1
+
+/-- Single-pass fuel-bounded UB-waived symbolic WP over `MirExecState`. -/
+def wpMirExecUbWaivedSym
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (post : MirOutcome → Prop) : Prop :=
+  match fuel with
+  | 0 => False
+  | fuel' + 1 =>
+    evalSymNodeTreeUbWaived
+      (fun st' => wpMirExecUbWaivedSym fuel' body st' post)
+      post
+      (stepMirExecSymTree body st)
+
+/-- Single-pass fuel-bounded UB-waived symbolic WP over `MachineState`. -/
+def wpMirUbWaivedSym
+    (fuel : Nat) (body : CapturedMir) (s : MachineState)
+    (post : MirOutcome → Prop) : Prop :=
+  wpMirExecUbWaivedSym fuel body (.running s) post
+
+theorem wpMirExecUbWaivedSym_eq_wpCoalBounded
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (post : MirOutcome → Prop) :
+    wpMirExecUbWaivedSym fuel body st post =
+      wpCoalBounded fuel mirUbWaivedWP (stepMirState body)
+        (fun out _ => post out) st PUnit.unit := by
+  induction fuel generalizing st with
+  | zero => rfl
+  | succ fuel' ih =>
+    unfold wpMirExecUbWaivedSym wpCoalBounded
+    rw [evalSymNodeTreeUbWaived_eq, stepMirExecSymTree_eval, evalNodeUbWaivedWP_eq]
+    cases stepMirState body st with
+    | ret _ => rfl
+    | tau st' => exact ih st'
+    | vis i k =>
+      rcases i with f | (e | c)
+      · cases f; rfl
+      · cases e; exact ih (k PUnit.unit)
+      · cases c
+        dsimp only []
+        congr 1
+        funext ans u
+        cases u
+        exact ih (k ans)
+
+/-- Exact equality between single-pass `wpMirUbWaivedSym` and `Lower.wpMirUbWaivedBounded`. -/
+theorem wpMirUbWaivedSym_eq_wpMirUbWaivedBounded
+    (fuel : Nat) (body : CapturedMir) (s : MachineState)
+    (post : MirOutcome → Prop) :
+    wpMirUbWaivedSym fuel body s post = wpMirUbWaivedBounded fuel body s post :=
+  wpMirExecUbWaivedSym_eq_wpCoalBounded fuel body (.running s) post
+
+/--
+Discharge a `UbExceptionVerificationResult c` via single-pass symbolic evaluation
+(`wpMirSym` on the strict safety domain `c.pre ∧ c.strictSafetyPre`, and
+`wpMirUbWaivedSym` across `c.pre`).
+-/
+theorem verifyUbExceptionMirSym
+    (c : UbExceptionClaim)
+    (fuel : Nat)
+    (h_strict :
+      ∀ (args : List Value) (mem : Memory),
+        c.pre args mem →
+        c.strictSafetyPre args mem →
+        wpMirSym fuel c.body
+          (initMachineStateWithMemory c.body args mem)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              c.post args mem retVal mem'))
+    (h_waived :
+      ∀ (args : List Value) (mem : Memory),
+        c.pre args mem →
+        wpMirUbWaivedSym fuel c.body
+          (initMachineStateWithMemory c.body args mem)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              c.post args mem retVal mem')) :
+    UbExceptionVerificationResult c := by
+  refine verifyUbExceptionMirBounded c fuel
+    (fun args mem h_pre h_sp => ?_)
+    (fun args mem h_pre => ?_)
+  · rw [← wpMirSym_eq_wpMirBounded]
+    exact h_strict args mem h_pre h_sp
+  · rw [← wpMirUbWaivedSym_eq_wpMirUbWaivedBounded]
+    exact h_waived args mem h_pre
+
+/-- Direct `Prop`-valued node evaluator matching `mirModularWP contract.toCallContract`. -/
+@[reducible]
+def evalNodeModularWP
+    (contract : MirCallContract)
+    (cont : MirExecState → Prop) (post : MirOutcome → Prop) :
+    MirStepNode → Prop
+  | .ret out => post out
+  | .tau st' => cont st'
+  | .vis (.inl _) _ => False
+  | .vis (.inr (.inl _)) k => cont (k PUnit.unit)
+  | .vis (.inr (.inr (.call req))) k =>
+    contract.pre req ∧
+      ∀ ans : MirCallAns, contract.post req ans → cont (k ans)
+
+theorem evalNodeModularWP_eq
+    (contract : MirCallContract)
+    (cont : MirExecState → Prop) (post : MirOutcome → Prop)
+    (node : MirStepNode) :
+    evalNodeModularWP contract cont post node =
+      match node with
+      | .ret out => post out
+      | .tau st' => cont st'
+      | .vis i k =>
+        (mirModularWP contract.toCallContract).wp i
+          (fun o _ => cont (k o)) PUnit.unit := by
+  cases node with
+  | ret _ => rfl
+  | tau _ => rfl
+  | vis i _ =>
+    rcases i with f | (e | c)
+    · cases f; rfl
+    · cases e; rfl
+    · cases c; rfl
+
+/-- Structural `Prop`-valued modular call-contract evaluator over `SymTree MirStepNode`. -/
+def evalSymNodeTreeModular
+    (contract : MirCallContract)
+    (cont : MirExecState → Prop) (post : MirOutcome → Prop) :
+    SymTree MirStepNode → Prop
+  | .leaf (.ret out) => post out
+  | .leaf (.tau st') => cont st'
+  | .leaf (.vis (.inl _) _) => False
+  | .leaf (.vis (.inr (.inl _)) k) => cont (k PUnit.unit)
+  | .leaf (.vis (.inr (.inr (.call req))) k) =>
+    contract.pre req ∧
+      ∀ ans : MirCallAns, contract.post req ans → cont (k ans)
+  | .branch c t1 t2 =>
+    match c with
+    | true => evalSymNodeTreeModular contract cont post t1
+    | false => evalSymNodeTreeModular contract cont post t2
+
+theorem evalSymNodeTreeModular_eq
+    (contract : MirCallContract)
+    (cont : MirExecState → Prop) (post : MirOutcome → Prop)
+    (t : SymTree MirStepNode) :
+    evalSymNodeTreeModular contract cont post t =
+      evalNodeModularWP contract cont post t.eval := by
+  induction t with
+  | leaf node =>
+    cases node with
+    | ret _ => rfl
+    | tau _ => rfl
+    | vis i _ =>
+      rcases i with f | (e | c) <;> rfl
+  | branch c _ _ ih1 ih2 =>
+    cases c
+    · exact ih2
+    · exact ih1
+
+/-- Single-pass fuel-bounded modular symbolic WP over `MirExecState`. -/
+def wpMirExecModularSym
+    (contract : MirCallContract)
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (post : MirOutcome → Prop) : Prop :=
+  match fuel with
+  | 0 => False
+  | fuel' + 1 =>
+    evalSymNodeTreeModular contract
+      (fun st' => wpMirExecModularSym contract fuel' body st' post)
+      post
+      (stepMirExecSymTree body st)
+
+/-- Single-pass fuel-bounded modular symbolic WP over `MachineState`. -/
+def wpMirModularSym
+    (contract : MirCallContract)
+    (fuel : Nat) (body : CapturedMir) (s : MachineState)
+    (post : MirOutcome → Prop) : Prop :=
+  wpMirExecModularSym contract fuel body (.running s) post
+
+theorem wpMirExecModularSym_eq_wpCoalBounded
+    (contract : MirCallContract)
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (post : MirOutcome → Prop) :
+    wpMirExecModularSym contract fuel body st post =
+      wpCoalBounded fuel (mirModularWP contract.toCallContract)
+        (stepMirState body) (fun out _ => post out) st PUnit.unit := by
+  induction fuel generalizing st with
+  | zero => rfl
+  | succ fuel' ih =>
+    unfold wpMirExecModularSym wpCoalBounded
+    rw [evalSymNodeTreeModular_eq, stepMirExecSymTree_eval, evalNodeModularWP_eq]
+    cases stepMirState body st with
+    | ret _ => rfl
+    | tau st' => exact ih st'
+    | vis i k =>
+      rcases i with f | (e | c)
+      · cases f; rfl
+      · cases e; exact ih (k PUnit.unit)
+      · rcases c with ⟨req⟩
+        dsimp only []
+        simp only [ih]
+
+/--
+Discharge a `ModularVerificationResult` for `body` under `contract.holdsOn` via
+single-pass symbolic evaluation (`wpMirModularSym`).
+-/
+theorem verifyModularContractMirSym
+    (contract : MirCallContract)
+    (body : CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        wpMirModularSym contract fuel body
+          (initMachineStateWithMemory body args mem)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              post args mem retVal mem')) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := contract.holdsOn
+        pre := pre
+        post := post } := by
+  refine verifyModularContractMirBounded contract body pre post fuel
+    (fun args mem h_pre => ?_)
+  rw [wpMirModularBounded, ← wpMirExecModularSym_eq_wpCoalBounded]
+  exact h_wp args mem h_pre
+
 end Anneal.Rustc.V2026_06_01.SymbolicEval
 

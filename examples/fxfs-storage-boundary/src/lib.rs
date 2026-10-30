@@ -106,3 +106,74 @@ pub fn zerocopy_check_slice_len(byte_len: usize, elem_size: usize) -> usize {
 pub unsafe fn ff1_block_tail_offset(d: usize) -> usize {
     unsafe { 16usize.unchecked_sub(d) }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 0 Bug 1 Operationalized via Scoped UB Exception + Modular Caller Isolation
+// (`src/storage/fxfs/src/object_store/data_object_handle.rs:386, 584` and
+//  `src/storage/lib/storage_device/src/buffer.rs:146-152`)
+// ---------------------------------------------------------------------------
+
+/// Models `storage_device::buffer::PtrSlice::as_ref_unchecked`
+/// (`src/storage/lib/storage_device/src/buffer.rs:146-152`) invoked by
+/// `DataObjectHandle::verify_data` (`src/storage/fxfs/src/object_store/data_object_handle.rs:386`):
+/// constructs a `&[u8]` of length `len` at `offset` within a VMO buffer of size
+/// `vmo_size` without checking `trusted`.
+///
+/// Under Rust/MIR semantics, forming `&[u8]` over an untrusted device-shared VMO
+/// (`!trusted`) is immediate UB (`unreachable_unchecked()`), while under
+/// `trusted && offset <= vmo_size && len <= vmo_size - offset` it safely returns
+/// the slice end offset `offset + len`.
+///
+/// Verified via `UbExceptionVerificationResult`:
+/// - `pre`: `offset <= vmo_size && len <= vmo_size - offset`
+/// - `strictSafetyPre`: `trusted == true` (100% `TreeSafe` on `pre ∧ strictSafetyPre`)
+/// - `post`: `ret == offset + len` on all normal returns across `pre`.
+#[inline(never)]
+#[anneal_spec::spec(
+    requires: offset <= vmo_size && len <= vmo_size - offset,
+    ensures: |ref ret| *ret == offset + len,
+)]
+pub unsafe fn vmo_buffer_as_ref_unchecked(
+    vmo_size: usize,
+    offset: usize,
+    len: usize,
+    trusted: bool,
+) -> usize {
+    let _ = vmo_size;
+    if !trusted {
+        unsafe { core::hint::unreachable_unchecked() };
+    }
+    offset + len
+}
+
+/// Models `DataObjectHandle::verify_data`
+/// (`src/storage/fxfs/src/object_store/data_object_handle.rs:373-395`) calling
+/// `unsafe { buffer.as_ptr_slice().as_ref_unchecked() }` without landing a Phase 0
+/// bounce-buffer fix (i.e., even when `trusted == false`):
+/// checks that `offset <= vmo_size` and `len <= vmo_size - offset`, then invokes
+/// `vmo_buffer_as_ref_unchecked(vmo_size, offset, len, trusted)` and returns the
+/// verified slice end offset `Some(slice_end)`.
+///
+/// Verified via `ModularVerificationResult` against
+/// `Obligations.FxfsStorageBoundary.vmo_buffer_as_ref_unchecked.ubExceptionClaim.callContract.holdsOn`
+/// and linked via `linkUbExceptionCallee`.
+#[anneal_spec::spec(
+    requires: true,
+    ensures: |ref ret| true,
+)]
+pub fn data_object_handle_verify_data_unfixed(
+    vmo_size: usize,
+    offset: usize,
+    len: usize,
+    trusted: bool,
+) -> Option<usize> {
+    if offset > vmo_size {
+        return None;
+    }
+    let rem = vmo_size - offset;
+    if len > rem {
+        return None;
+    }
+    let slice_end = unsafe { vmo_buffer_as_ref_unchecked(vmo_size, offset, len, trusted) };
+    Some(slice_end)
+}
