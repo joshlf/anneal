@@ -5,6 +5,12 @@ import Anneal.ITree
 import Anneal.Pass
 import Anneal.EffectWP
 import Anneal.ITreeWP
+import Anneal.Scalars
+import Anneal.Memory
+import Anneal.BitValidity
+import Anneal.UnsafeObligations
+import Anneal.SepLogic
+import Anneal.Rustc.V2026_06_01.Lower
 
 namespace Anneal
 
