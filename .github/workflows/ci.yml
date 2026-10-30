@@ -66,7 +66,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/nix-cache
-          key: anneal-nix-cache-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock', 'trusted/lean/**', 'trusted/rustc-capture/**') }}
+          key: anneal-nix-cache-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock', 'trusted/lean/**', 'trusted/audit/**', 'trusted/rustc-capture/**', 'theory/**') }}
 
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@e847f25223456b3058e12f7fc9d777b6a6f25060 # v3.23.2
@@ -129,6 +129,10 @@ jobs:
           cargo run --locked -p cargo-anneal -- setup \
             --local-archive target/anneal-exocrate.tar.zst
           rm -f target/anneal-exocrate.tar.zst
+
+      - name: Audit repository trusted boundary
+        run: |
+          cargo run --locked -p anneal-audit
 
       - name: Test Rust workspace and crate packaging
         run: |
