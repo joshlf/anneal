@@ -95,12 +95,28 @@ Never reference definitions from `Anneal.*` (`theory/`) in the theorem statement
 (`ci.type`); `Anneal.*` lemmas belong exclusively inside the proof term
 (`ci.value?`).
 
-### 3. Iterate on a single proof file with `lake env lean`
+### 3. Iterate on a single proof file (`anneal-lean_lsp` or `lake env lean`)
 
-After creating a new `Proof/<Crate>/<Item>.lean` file (or before the first
-single-file check), ensure `.anneal/lakefile.toml` registers the `Proof` library
-root, then run `lake env lean` inside `.anneal/` for sub-second feedback on that
-file without rebuilding the entire workspace:
+When the `anneal-lean_lsp` MCP server (`anneal-lsp` skill) is active, editing a
+`*.lean` file automatically runs warm `lake serve` diagnostics (~15–300 ms) via
+the `PostToolUse` hook and appends compiler errors and open `sorry` goals to the
+tool output:
+
+- **Below the complexity threshold** (routine arithmetic `omega`, standard
+  `#[spec]` pin combinators, or known 1-block `rfl` templates): Write the
+  complete proof directly via `edit_file` and let the hook verify it in the same
+  turn; do not waste a pre-edit turn calling `lean_diagnostics` or
+  `lean_multi_attempt`.
+- **Above the complexity threshold** (multi-step `wpMirSym` branches,
+  `bitwiseOrBits`, or stateful `Memory` / Tree Borrows goals): Write a wildcard
+  `change ... _` + `sorry` via `edit_file` and inspect the WHNF goal with
+  `lean_goal` (~15 ms). Cap `lean_multi_attempt` at 1–2 probes per subgoal
+  (never micro-looping to guess `dsimp` lists).
+
+When iterating from the CLI without `anneal-lean_lsp`, ensure
+`.anneal/lakefile.toml` registers the `Proof` library root, then run
+`lake env lean` inside `.anneal/` for single-file feedback without rebuilding
+the entire workspace:
 
 ```bash
 (cd .anneal && lake env lean ../anneal/proofs/Proof/<Crate>/<Item>.lean)
@@ -201,7 +217,68 @@ obligations for `TryFromBytes`, `FromZeros`, `FromBytes`, `IntoBytes`, or
   `IsTryFromBytes`, and `transmute_sound_of_into_from_bytes` to compose layout
   and bit-validity lemmas across fields and wrapper types.
 
-### 5. Run locked end-to-end verification
+### 5. Avoid Lean 4 kernel reduction bottlenecks on non-trivial MIR
+
+Because `TrustedBoundary` forbids `native_decide` (`Lean.ofReduceBool`), Lean's
+kernel reducer (`whnf`) must symbolically reduce every MIR step. When a proof
+hits `maxHeartbeats`, `maxRecDepth`, or multi-second `rw`/`dsimp` stalls, read
+[`references/proof-scaling-and-bottlenecks.md`](references/proof-scaling-and-bottlenecks.md)
+and apply these nine rules:
+
+1. **Pre-project basic blocks (`BlockCtx` + `itemBB0..itemBBn`):** Never include
+   `Mir.<Crate>.<Item>.body` in a `dsimp` set across a multi-block CFG; unfolding
+   `body` duplicates the entire basic-block list into every step state. Define
+   top-level `itemBBk` constants and `O(1)` `rfl` lookup lemmas
+   (`lookupBlock itemCtx k = some itemBBk`).
+2. **Short-circuit symbolic bit-loops (`bitwiseAndBitsFast`):** Never unfold
+   recursive `bitwiseAndBits` / `bitwiseOrBits` over a symbolic `b : Nat` (which
+   unrolls 8–64 nested `Nat.div · 2` trees and stalls kernel unification for
+   `100s+`). Rewrite masks using closed-form arithmetic (`b % 2`, `b % 256`,
+   `lo * 256 + hi`) or a fast-path wrapper proved equal to `bitwiseAndBits`.
+3. **Shield large symbolic states from `rw` (`Hold` barrier):** Wrap large
+   weakest-precondition terms in `private structure Hold (P : Prop) : Prop where val : P`
+   so `rw` does not traverse the full symbolic execution AST before `dsimp only`
+   collapses it.
+4. **Factor `#[anneal_spec::spec]` companions into boundary lemmas:** Prove
+   standalone `wpReq_inversion` (extracting pure arithmetic bounds from
+   `MirBoolPredicateHolds __anodized_fn_requires_*`) and `ensures_holds`
+   (discharging `MirBoolPredicateHolds __anodized_fn_ensures_*` from arithmetic
+   bounds) instead of stepping all three MIR bodies inside one proof block.
+5. **Substitute concrete `fuel` only after destructuring `Memory` (`verified_at_fuel`):**
+   In loop proofs (`runCfgSteps ctx state fuel`), parameterize by
+   `(fuel : Nat) (h_fuel : fuel = N)`, `rcases` and `subst` all `Memory` fields
+   first (`activeCallee = none`, `callerLocals`, `borrows`), and `subst h_fuel`
+   last so kernel `whnf` never unfolds `N` steps over an abstract `mem : Memory`.
+6. **Never run `trace.profiler.threshold 1` on symbolic MIR proofs:** Low
+   profiler thresholds format huge nested MIR ASTs at thousands of elaborator
+   nodes, producing hundreds of megabytes of output and multi-hour stalls. Use
+   in-memory `lean_multi_attempt` / `lean_goal` (when `anneal-lean_lsp` is
+   available), or keep `trace.profiler.threshold >= 100` with
+   `set_option pp.deepTerms false` and `timeout 30s`.
+7. **Step `wpMirSym` with top-down `change` and tight `fuel` bounds—never
+   bottom-up `dsimp`:** Passing `wpMirExecSym` and `stepMirExecSymTree` to
+   `dsimp` unfolds continuation lambdas (`fun st' => wpMirExecSym fuel' ...`)
+   bottom-up over an abstract state `st'`, and including
+   `Trusted.Sequence.length` in `dsimp` corrupts implicit `Decidable` instances
+   inside `@ite`. Use top-down `change` (which evaluates `wpMirSym` lazily in
+   weak-head normal form) and pass tight `fuel` bounds (`#statements + 2`,
+   typically `4`–`6`) on straight-line blocks.
+8. **Escape `whnf` timeouts on `bitwiseOrBits` and stateful `Memory` via
+   wildcard `change ... _` + projection `dsimp`:** Spelling out `bitwiseOrBits 32`
+   or an explicit post-state `Memory` record inside `change` forces `isDefEq` to
+   unify `32` against `{ ... }.sizeBytes.mul 8` and unfolds 32 recursive levels
+   of `bitwiseOrBits`. Instead, write `change match (4294967296 : Nat).ble _ with
+   | true => False | false => claim.post _ _ _ _`, run `dsimp only [advanceStmt,
+   <claim>]` to collapse record projections to `32` and the concrete `Memory`
+   literal without unfolding `bitwiseOrBits`, and then `rw` the shift and
+   bitwise lemmas.
+9. **Follow the interactive LSP threshold heuristic:** Write routine arithmetic
+   and known combinator proofs directly via `edit_file` (relying on the
+   automatic `PostToolUse` hook), cap `lean_multi_attempt` at 1–2 probes per
+   subgoal, and switch immediately to wildcard `change ... _` + `lean_goal` and
+   `lean_local_search` on stateful or bitwise MIR goals.
+
+### 6. Run locked end-to-end verification
 
 Once `lake env lean` succeeds on every target proof file, run `agent-verify`
 from the workspace root:
