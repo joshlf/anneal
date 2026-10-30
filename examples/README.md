@@ -47,7 +47,7 @@ so you can open, run, and diff the code the chapter refers to:
 
 ## End-to-end user-journey showcase (`examples/wireframe-demo/`)
 
-`wireframe-demo/` is a self-contained zero-copy binary packet
+[`wireframe-demo/`](wireframe-demo/) is a self-contained zero-copy binary packet
 and frame codec crate demonstrating four end-to-end human and agent workflows:
 bootstrapping verification on safe Rust, refuting and repairing an `unsafe`
 undefined-behavior bug, keeping code authors and reviewers in check via locked
