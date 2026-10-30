@@ -928,6 +928,12 @@ def readProjectedValue
     match get? fields idx with
     | .some fieldVal => readProjectedValue locals fieldVal rest
     | .none => .ub
+  | .scalar sc, .field .zero _ :: rest =>
+    readProjectedValue locals (.scalar sc) rest
+  | .ptr p sz, .field .zero _ :: rest =>
+    readProjectedValue locals (.ptr p sz) rest
+  | .unit, .field .zero _ :: rest =>
+    readProjectedValue locals .unit rest
   | _, .field _ _ :: _ => .ub
   | .aggregate actualVariant fields, .downcast _ variantIdx :: rest =>
     match Nat.beq actualVariant variantIdx with
@@ -994,6 +1000,12 @@ def writeProjectedValue
       | .ub => .ub
       | .unsupported => .unsupported
     | .none => .ub
+  | .scalar sc, .field .zero _ :: rest, newVal =>
+    writeProjectedValue locals (.scalar sc) rest newVal
+  | .ptr p sz, .field .zero _ :: rest, newVal =>
+    writeProjectedValue locals (.ptr p sz) rest newVal
+  | .unit, .field .zero _ :: rest, newVal =>
+    writeProjectedValue locals .unit rest newVal
   | _, .field _ _ :: _, _ => .ub
   | .aggregate actualVariant fields,
     .downcast _ variantIdx :: rest,
