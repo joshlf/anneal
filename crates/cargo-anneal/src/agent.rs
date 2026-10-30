@@ -348,6 +348,7 @@ pub fn lock_workspace_specs_with_mutable(
     }
 
     let locked_records = build_sorted_locked_records(records);
+    check_specs_non_vacuous_with_records(workspace_root, records)?;
     let locked_specs_files =
         collect_locked_file_digests(workspace_root, "anneal/proofs/Specs")?;
     let locked_assumptions_files =
@@ -790,6 +791,16 @@ fn detect_vacuous_precondition(lean_src: &str) -> Option<&'static str> {
         "def pre (args : List Value) (mem : Memory) : Prop := False",
         "def pre : List Value → Prop := fun _ => False",
         "def pre : List Value -> Prop := fun _ => False",
+        "safetyPre := fun _ => False",
+        "safetyPre := fun _ _ => False",
+        "safetyPre := False",
+        "safetyPre _ := False",
+        "safetyPre _ _ := False",
+        "refineSpec (fun _ => False)",
+        "refineSafeSpec (fun _ => False)",
+        "refineStatefulSpec (fun _ _ => False)",
+        "refineSafeStatefulSpec (fun _ _ => False)",
+        "refineTotalSpec (fun _ _ => False)",
     ];
 
     for &pattern in FORBIDDEN_PATTERNS {
@@ -1404,6 +1415,7 @@ mod tests {
 
         let spec_file = specs_dir.join("add.lean");
         let proof_file = proof_dir.join("add.lean");
+        let _ = lock_workspace_specs(&ws, &records).expect("lock specs");
 
         // Check 4: Rejects `Specs/Demo/add.lean` when it drops `rustEnsures`
         // (even if `rustEnsures` is mentioned inside a comment).
@@ -1415,7 +1427,10 @@ mod tests {
                post _ _ := True\n",
         )
         .expect("write spec dropping ensures");
-        let _ = lock_workspace_specs(&ws, &records).expect("lock specs");
+        assert!(
+            lock_workspace_specs(&ws, &records).is_err(),
+            "lock_workspace_specs must also reject spec dropping rustEnsures"
+        );
         let drop_err =
             check_specs_non_vacuous(&ws).expect_err("must reject spec dropping rustEnsures");
         assert!(
