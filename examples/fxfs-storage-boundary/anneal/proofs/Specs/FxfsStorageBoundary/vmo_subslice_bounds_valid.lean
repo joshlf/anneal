@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsStorageBoundary.vmo_subslice_bounds_valid
 import Obligations.FxfsStorageBoundary.vmo_subslice_bounds_valid

@@ -602,14 +602,20 @@ def verifyAudit (j : Json) : IO Json := do
     unless kind ci == "theorem" do
       fail s!"{thmName} must be a theorem declaration (found {kind ci})"
     let headConst := ci.type.getAppFn
+    let isUbException :=
+      headConst.isConstOf `Trusted.VerificationResult.UbExceptionVerificationResult
     unless headConst.isConstOf `Trusted.VerificationResult.VerificationResult ||
            headConst.isConstOf `Trusted.VerificationResult.StatefulVerificationResult ||
            headConst.isConstOf `Trusted.VerificationResult.ModularVerificationResult ||
            headConst.isConstOf `Trusted.VerificationResult.TraceVerificationResult ||
            headConst.isConstOf `Trusted.VerificationResult.TotalVerificationResult ||
            headConst.isConstOf `Trusted.VerificationResult.StatefulEquivVerificationResult ||
+           isUbException ||
            headConst.isConstOf `Trusted.VerificationResult.CrateVerificationResult do
       fail s!"{thmName} statement must be a Trusted.VerificationResult certificate type"
+    if isUbException then
+      unless allowAssumptions do
+        fail s!"{thmName} is a scoped UB exception (UbExceptionVerificationResult) (conditional verification requires allow_assumptions)"
     checkStatementOrigins lookup (origin env) theoryMods workspaceMods thmName ci.type edgesOf
     let mut pending := [thmName]
     let mut visited : NameSet := {}
@@ -644,7 +650,8 @@ def verifyAudit (j : Json) : IO Json := do
     let itemSuffix := (verifyMod.toString.drop 7).toString
     let sortedAssumptions := (reachedAssumptions.toArray.qsort Name.lt).map Name.toString
     let status :=
-      if sortedAssumptions.isEmpty then "VerifiedUnconditional"
+      if isUbException then "VerifiedUbException"
+      else if sortedAssumptions.isEmpty then "VerifiedUnconditional"
       else "VerifiedConditional"
     let assumptionsCsv := String.intercalate "," sortedAssumptions.toList
     IO.println s!"VERIFY_AUDIT_ITEM\t{verifyMod}\t{status}\t{assumptionsCsv}"

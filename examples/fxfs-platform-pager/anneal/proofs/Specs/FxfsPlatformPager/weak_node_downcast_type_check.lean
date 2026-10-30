@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsPlatformPager.weak_node_downcast_type_check
 import Obligations.FxfsPlatformPager.weak_node_downcast_type_check

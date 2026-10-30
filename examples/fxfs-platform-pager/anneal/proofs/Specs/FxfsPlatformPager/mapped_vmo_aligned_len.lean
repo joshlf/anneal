@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsPlatformPager.mapped_vmo_aligned_len
 import Obligations.FxfsPlatformPager.mapped_vmo_aligned_len

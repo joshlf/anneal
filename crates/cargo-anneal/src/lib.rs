@@ -147,6 +147,13 @@ pub enum VerificationStatus {
         /// transitive constant closure of `Verify.<Item>.verified`.
         assumptions: Vec<String>,
     },
+    /// `Verify.<Item>.verified` is a scoped UB-exception certificate
+    /// (`UbExceptionVerificationResult`).
+    VerifiedUbException {
+        /// Any `Assumptions.*` axioms reached in the transitive constant closure
+        /// of `Verify.<Item>.verified`.
+        assumptions: Vec<String>,
+    },
 }
 
 /// Per-item verification audit entry returned by `verify_workspace`.
@@ -504,7 +511,7 @@ where
                 init_proofs = true;
                 i += 1;
             }
-            "--allow-assumptions" => {
+            "--allow-assumptions" | "--allow-ub-exceptions" => {
                 allow_assumptions = true;
                 i += 1;
             }
@@ -758,6 +765,7 @@ pub fn render_lock_specs_report(
 pub fn render_verification_report(report: &VerificationReport) -> String {
     let mut unconditional_count = 0usize;
     let mut conditional_count = 0usize;
+    let mut ub_exception_count = 0usize;
     let mut out = String::new();
     out.push_str("Anneal Verification Summary:\n");
     for item in &report.items {
@@ -774,11 +782,29 @@ pub fn render_verification_report(report: &VerificationReport) -> String {
                     assumptions.join(", ")
                 ));
             }
+            VerificationStatus::VerifiedUbException { assumptions } => {
+                ub_exception_count += 1;
+                if assumptions.is_empty() {
+                    out.push_str(&format!("  {}: UB_EXCEPTION\n", item.verify_module));
+                } else {
+                    out.push_str(&format!(
+                        "  {}: UB_EXCEPTION [{}]\n",
+                        item.verify_module,
+                        assumptions.join(", ")
+                    ));
+                }
+            }
         }
     }
-    out.push_str(&format!(
-        "  Totals: {unconditional_count} unconditional, {conditional_count} conditional\n"
-    ));
+    if ub_exception_count == 0 {
+        out.push_str(&format!(
+            "  Totals: {unconditional_count} unconditional, {conditional_count} conditional\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "  Totals: {unconditional_count} unconditional, {conditional_count} conditional, {ub_exception_count} ub_exception\n"
+        ));
+    }
     out.push_str("  TrustedBoundary kernel replay: PASS\n");
     out
 }
@@ -870,9 +896,19 @@ pub fn verify_workspace_with_options(options: &CliOptions) -> Result<Verificatio
     let enforce_lock =
         options.locked_specs || options.subcommand == CliSubcommand::AgentVerify;
 
-    let locked_manifest = if enforce_lock {
+    let (locked_manifest, has_locked_ub_exceptions) = if enforce_lock {
         let lock = verify_spec_lock(&options.workspace_root, &records)?;
-        if lock.locked_assumptions_files.is_empty() && options.allow_assumptions {
+        let has_ub_exc = lock.locked_specs_files.iter().any(|entry| {
+            fs::read_to_string(options.workspace_root.join(&entry.rel_path))
+                .ok()
+                .is_some_and(|txt| {
+                    txt.contains("UbExceptionItemSpec") || txt.contains("refineUbExceptionSpec")
+                })
+        });
+        if lock.locked_assumptions_files.is_empty()
+            && !has_ub_exc
+            && options.allow_assumptions
+        {
             return Err(
                 "spec-lock violation: --allow-assumptions is forbidden because .anneal/spec-lock.json locks zero Assumptions files"
                     .to_string(),
@@ -881,9 +917,9 @@ pub fn verify_workspace_with_options(options: &CliOptions) -> Result<Verificatio
         let generated_dir = options.workspace_root.join(".anneal/generated");
         let _ = fs::remove_dir_all(generated_dir.join("Obligations"));
         let _ = fs::remove_dir_all(generated_dir.join("Verify"));
-        Some(lock)
+        (Some(lock), has_ub_exc)
     } else {
-        None
+        (None, false)
     };
 
     let scaffold_cfg = ScaffoldConfig {
@@ -910,8 +946,14 @@ pub fn verify_workspace_with_options(options: &CliOptions) -> Result<Verificatio
     }
 
     let effective_allow_assumptions = match &locked_manifest {
-        Some(lock) if lock.locked_assumptions_files.is_empty() => false,
-        _ => options.allow_assumptions,
+        Some(lock) => {
+            if !lock.locked_assumptions_files.is_empty() {
+                options.allow_assumptions
+            } else {
+                has_locked_ub_exceptions
+            }
+        }
+        None => options.allow_assumptions,
     };
 
     let verify_cfg = VerifyConfig {
@@ -1267,6 +1309,17 @@ fn run_trusted_boundary_verify_audit(
                     .map(String::from)
                     .collect();
                 VerificationStatus::VerifiedConditional { assumptions }
+            }
+            "VerifiedUbException" => {
+                let assumptions = parts
+                    .get(2)
+                    .copied()
+                    .unwrap_or("")
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
+                VerificationStatus::VerifiedUbException { assumptions }
             }
             other => {
                 return Err(format!(

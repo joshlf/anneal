@@ -690,6 +690,8 @@ pub fn check_specs_non_vacuous_with_records(
                 "refineSafeStatefulSpec",
                 "refineTotalSpec",
                 "refineEquivSpec",
+                "refineModularSpec",
+                "refineUbExceptionSpec",
             ]
             .iter()
             .any(|ident| stripped_spec.contains(ident));
