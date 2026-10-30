@@ -38,10 +38,11 @@ Apply these rules to all work in this repository:
 <!-- TODO-check-enable -->
 - **Prose and comment wrapping:** Wrap prose in code comments and Markdown
   files at 80 columns from the left margin when practical, including any
-  comment prefix (`//`, `///`, `//!`). Do not wrap Markdown tables, ASCII
-  diagrams, long URLs, code blocks, or trailing inline comments when wrapping
-  would impair readability. Indent wrapped bullet continuation lines by two
-  spaces, and put a blank line between paragraphs and after section headings.
+  comment prefix (`//`, `///`, `//!`, `--`, `/--`, `/-!`). Do not wrap Markdown
+  tables, ASCII diagrams, long URLs, code blocks, or trailing inline comments
+  when wrapping would impair readability. Indent wrapped bullet continuation
+  lines by two spaces, and put a blank line between paragraphs and after section
+  headings.
 - **Pre-commit validation:** Run `./ci/check_todo.sh` (along with any build or
   test checks applicable to the changed files) before finishing a task or
   committing.
@@ -58,7 +59,7 @@ applies, follow all of them.
 | Activity | Required skills |
 | :--- | :--- |
 | Writing, revising, or reviewing any technical prose (documentation, code comments, commit messages, PR descriptions, or issue bodies) | [`reader-oriented-explanation`](skills/reader-oriented-explanation/SKILL.md), [`williams-style`](skills/williams-style/SKILL.md) |
-| Adding, revising, or reviewing explanatory inline (`//`) or documentation (`///`, `//!`) code comments | [`comment-guidelines`](skills/comment-guidelines/SKILL.md), [`reader-oriented-explanation`](skills/reader-oriented-explanation/SKILL.md), [`williams-style`](skills/williams-style/SKILL.md) |
+| Adding, revising, or reviewing explanatory inline (`//`, `--`) or documentation (`///`, `//!`, `/--`, `/-!`) code comments | [`comment-guidelines`](skills/comment-guidelines/SKILL.md), [`reader-oriented-explanation`](skills/reader-oriented-explanation/SKILL.md), [`williams-style`](skills/williams-style/SKILL.md) |
 | Structuring commits, drafting or revising commit messages, rebasing or amending commits, or managing GHerrit branches and stacks | [`source-control`](skills/source-control/SKILL.md), [`commit-message`](skills/commit-message/SKILL.md), [`authorship-disclosure`](skills/authorship-disclosure/SKILL.md), [`reader-oriented-explanation`](skills/reader-oriented-explanation/SKILL.md), [`williams-style`](skills/williams-style/SKILL.md) |
 | Preparing or updating Git commits, pull request descriptions, or other externally visible prose | [`authorship-disclosure`](skills/authorship-disclosure/SKILL.md) |
 | Designing, simplifying, or generalizing conceptual models, semantic interfaces, schemas, protocols, or instructions | [`model-refinement`](skills/model-refinement/SKILL.md) |
@@ -83,7 +84,15 @@ invariant. Before placing or modifying code, check whether it belongs inside
 - All code outside `trusted/` (`theory/`) must be pure, effect-free Lean
   definitions and proofs checked by the Lean kernel.
 
-## Rust correspondence in `trusted/`
+## Commenting in `trusted/`
+
+Because auditing `trusted/` alone must suffice to verify that Anneal upholds
+[`PRINCIPLES.md`](PRINCIPLES.md), all code in `trusted/` will undergo careful
+human review. Human understanding is therefore paramount in `trusted/`: comment
+liberally using [`comment-guidelines`](skills/comment-guidelines/SKILL.md) (and
+its companion writing skills in the table above) so a human auditor can verify
+the design rationale, invariants, assumptions, contracts, and subtle semantic or
+implementation choices without reconstructing unstated context.
 
 Any code in `trusted/` that claims to model Rust semantics or extract `rustc`
 compiler structures must explain the correspondence in its comments and both
