@@ -1,0 +1,383 @@
+# The Anneal Tutor as an executable workflow.
+#
+# `tutor_workflow.py` creates a disposable directory that mirrors an Anneal
+# checkout (`crates/`, `trusted/`, and `theory/` are symlinked read-only) and
+# runs the steps below, in order, against copies of the chapter crates
+# `examples/tutor-ch1/` .. `examples/tutor-ch4/` and `examples/tutor/`. A step
+# without `run` introduces a chapter crate: the driver checks that the committed
+# crate equals the previous chapter's crate (`derive_from`) plus the file
+# operations the step declares, then copies the committed crate into the mirror.
+# Every other step runs one `cargo anneal` subcommand in its crate and records
+# the exit status, stdout, stderr, and a snapshot of the crate's files. The
+# chapters in `docs/tutor/` transclude those records through
+# `<!-- tutor: ... -->` directives (see README.md), so every command, report,
+# error message, and file listing in the tutorial comes from this run, and
+# `diff -r` between two consecutive chapter crates shows exactly the edits the
+# chapter describes.
+#
+# Step fields:
+#   id               Name referenced by `<!-- tutor: ... step=<id> -->`.
+#   chapter          Chapter that introduces the step (for readers only).
+#   note             Why the step exists and what the chapter shows with it.
+#   crate            Checkout-relative crate the step introduces or runs in.
+#   derive_from      On a crate step: the previous chapter's crate; the committed
+#                    `crate` must equal it plus this step's file operations.
+#   remove / write / append
+#                    File operations, relative to the crate. On a crate step they
+#                    document (and are checked as) the delta from `derive_from`;
+#                    on a probe step they are applied before the command and
+#                    rolled back afterwards. `write` sources are `fixture` (under
+#                    fixtures/) or `from` (checkout-relative; `path` defaults to
+#                    the location inside the source's crate).
+#   run              Arguments after `cargo anneal`. Omit on crate steps.
+#   cwd              "root" (default) executes the Flavour A form from the
+#                    mirrored checkout root with `--manifest-path <crate>/Cargo.toml`;
+#                    "crate" executes the Flavour B form inside the crate.
+#   expect           "success" (exit status 0, default) or "failure" (non-zero).
+#   stdout_contains  Substrings the (path-normalized) stdout must contain.
+#   stderr_contains  Substrings the (path-normalized) stderr must contain.
+#   probe            Restore `Cargo.toml`, `src/`, `anneal/`, and
+#                    `.anneal/spec-lock.json` after the step, so a demonstration
+#                    of a failure or an optional feature does not leak into the
+#                    steps that follow.
+
+# ---------------------------------------------------------------------------
+# Chapter 1: Basic Tool Usage & Interpreting Outputs — examples/tutor-ch1/
+# ---------------------------------------------------------------------------
+
+[[step]]
+id = "ch1-crate"
+chapter = 1
+crate = "examples/tutor-ch1"
+note = "A crate with one zero-argument function and no dependencies."
+
+[[step]]
+id = "ch1-extract"
+chapter = 1
+crate = "examples/tutor-ch1"
+run = "extract"
+stdout_contains = [
+  "Total MIR targets: 1",
+  "frame_tutor::magic_version -> Mir.FrameTutor.magic_version",
+]
+
+[[step]]
+id = "ch1-scaffold"
+chapter = 1
+crate = "examples/tutor-ch1"
+note = "Generates Mir, Obligations, and Verify modules; creates nothing under anneal/proofs/."
+run = "scaffold"
+stdout_contains = [
+  "Mir: 1, Obligations: 1, Verify: 1",
+  "created Specs: 0, preserved Specs: 0, created Proof: 0, preserved Proof: 0",
+]
+
+[[step]]
+id = "ch1-verify"
+chapter = 1
+crate = "examples/tutor-ch1"
+note = "`defaultProof` discharges `magic_version` with no authored files."
+run = "verify"
+stdout_contains = [
+  "Verify.FrameTutor.magic_version: UNCONDITIONAL",
+  "Totals: 1 unconditional, 0 conditional",
+  "TrustedBoundary kernel replay: PASS",
+]
+
+[[step]]
+id = "ch1-advance-offset-verify-fails"
+chapter = 1
+crate = "examples/tutor-ch1"
+probe = true
+note = "The edit Section 6 invites: an unannotated function that can panic on overflow fails the panic-forbidding `WP` check."
+append = [{ path = "src/lib.rs", text = "\npub fn advance_offset(offset: u8) -> u8 {\n    offset + 4\n}\n" }]
+run = "verify"
+expect = "failure"
+stdout_contains = ["Type mismatch", "True.intro"]
+stderr_contains = ["lake build failed"]
+
+# ---------------------------------------------------------------------------
+# Chapter 2: Adding Specifications in Rust — examples/tutor-ch2/
+# ---------------------------------------------------------------------------
+
+[[step]]
+id = "ch2-wpsafe-only"
+chapter = 2
+crate = "examples/tutor-ch1"
+probe = true
+note = "Approach 1: prove UB-freedom across non-overflowing and panicking u8 inputs with WPSafe and no Rust #[spec] contract."
+append = [{ path = "src/lib.rs", text = "\npub fn advance_offset(offset: u8) -> u8 {\n    offset + 4\n}\n" }]
+write = [
+  { path = "anneal/proofs/Specs/FrameTutor/advance_offset.lean", fixture = "ch2/Specs-advance_offset-wpsafe.lean" },
+  { path = "anneal/proofs/Proof/FrameTutor/advance_offset.lean", fixture = "ch2/Proof-advance_offset-wpsafe.lean" },
+]
+run = "verify"
+stdout_contains = [
+  "Verify.FrameTutor.advance_offset: UNCONDITIONAL",
+  "Verify.FrameTutor.magic_version: UNCONDITIONAL",
+  "Totals: 2 unconditional, 0 conditional",
+  "TrustedBoundary kernel replay: PASS",
+]
+
+[[step]]
+id = "ch2-crate"
+chapter = 2
+crate = "examples/tutor-ch2"
+derive_from = "examples/tutor-ch1"
+note = "Add the anneal-spec dependency and replace src/lib.rs with annotated safe functions, a `#[model]` helper, and an `#[invariant]` newtype."
+write = [
+  { from = "examples/tutor-ch2/Cargo.toml" },
+  { from = "examples/tutor-ch2/src/lib.rs" },
+]
+
+[[step]]
+id = "ch2-extract"
+chapter = 2
+crate = "examples/tutor-ch2"
+run = "extract"
+stdout_contains = ["Subject items: 4", "requires: 3, ensures: 3, qualifiers: 3"]
+
+[[step]]
+id = "ch2-scaffold"
+chapter = 2
+crate = "examples/tutor-ch2"
+cwd = "crate"
+run = "scaffold"
+stdout_contains = ["Obligations: 4, Verify: 4"]
+
+# ---------------------------------------------------------------------------
+# Chapter 3: Explicit Assumptions & Incremental Adoption — examples/tutor-ch3/
+# ---------------------------------------------------------------------------
+
+[[step]]
+id = "ch3-crate"
+chapter = 3
+crate = "examples/tutor-ch3"
+derive_from = "examples/tutor-ch2"
+note = "Narrow the crate to two items and defer `pin_magic` to a scoped axiom."
+write = [
+  { from = "examples/tutor-ch3/src/lib.rs" },
+  { from = "examples/tutor-ch3/anneal/proofs/Assumptions/FrameTutor/pin_magic.lean" },
+  { from = "examples/tutor-ch3/anneal/proofs/Proof/FrameTutor/pin_magic.lean" },
+]
+
+[[step]]
+id = "ch3-verify-strict"
+chapter = 3
+crate = "examples/tutor-ch3"
+note = "Default verification rejects the assumption by name."
+run = "verify"
+expect = "failure"
+stderr_contains = ["Assumptions.FrameTutor.pin_magic.assumed_pin_magic"]
+
+[[step]]
+id = "ch3-verify-allow-assumptions"
+chapter = 3
+crate = "examples/tutor-ch3"
+run = "verify --allow-assumptions"
+stdout_contains = [
+  "Verify.FrameTutor.magic_version: UNCONDITIONAL",
+  "Verify.FrameTutor.pin_magic: CONDITIONAL [Assumptions.FrameTutor.pin_magic.assumed_pin_magic]",
+  "Totals: 1 unconditional, 1 conditional",
+]
+
+# ---------------------------------------------------------------------------
+# Chapter 4: Completing a Manual Proof Workflow — examples/tutor-ch4/
+# ---------------------------------------------------------------------------
+
+[[step]]
+id = "ch4-init-templates"
+chapter = 4
+crate = "examples/tutor-ch3"
+probe = true
+note = "Before writing proofs, starter templates are created only for items without authored files; `pin_magic`'s proof in the Chapter 3 crate is preserved."
+run = "scaffold --init-specs --init-proofs"
+stdout_contains = ["preserved Proof: 1"]
+
+[[step]]
+id = "ch4-crate"
+chapter = 4
+crate = "examples/tutor-ch4"
+derive_from = "examples/tutor-ch3"
+note = "Restore the four safe items from Chapter 2, replace the assumption with kernel-checked proofs, and specify `advance_offset`."
+remove = ["anneal/proofs/Assumptions/FrameTutor/pin_magic.lean"]
+write = [
+  { from = "examples/tutor-ch2/src/lib.rs" },
+  { from = "examples/tutor/anneal/proofs/Proof/FrameTutor/pin_magic.lean" },
+  { from = "examples/tutor/anneal/proofs/Proof/FrameTutor/total_frame_len.lean" },
+  { from = "examples/tutor/anneal/proofs/Specs/FrameTutor/advance_offset.lean" },
+  { from = "examples/tutor/anneal/proofs/Proof/FrameTutor/advance_offset.lean" },
+]
+
+[[step]]
+id = "ch4-verify"
+chapter = 4
+crate = "examples/tutor-ch4"
+run = "verify"
+stdout_contains = [
+  "Totals: 4 unconditional, 0 conditional",
+  "TrustedBoundary kernel replay: PASS",
+]
+
+# ---------------------------------------------------------------------------
+# Chapter 5: Working with `unsafe` Code — examples/tutor/ (the committed crate)
+# ---------------------------------------------------------------------------
+
+[[step]]
+id = "ch5-crate"
+chapter = 5
+crate = "examples/tutor"
+derive_from = "examples/tutor-ch4"
+note = "Add the unsafe items with their stateful specifications and proofs, plus the `unsafe impl` contract."
+write = [
+  { from = "examples/tutor/src/lib.rs" },
+  { from = "examples/tutor/anneal/proofs/Specs/FrameTutor/read_version_ref.lean" },
+  { from = "examples/tutor/anneal/proofs/Proof/FrameTutor/read_version_ref.lean" },
+  { from = "examples/tutor/anneal/proofs/Specs/FrameTutor/write_version_mut.lean" },
+  { from = "examples/tutor/anneal/proofs/Proof/FrameTutor/write_version_mut.lean" },
+  { from = "examples/tutor/anneal/proofs/Proof/FrameTutor/__anneal_unsafe_impl_WireHeader_for_FrameLen.lean" },
+]
+
+[[step]]
+id = "ch5-verify"
+chapter = 5
+crate = "examples/tutor"
+run = "verify"
+stdout_contains = ["Totals: 7 unconditional, 0 conditional"]
+
+# ---------------------------------------------------------------------------
+# Chapter 6: Guided Agentic Proof Workflow — examples/tutor/
+# ---------------------------------------------------------------------------
+
+[[step]]
+id = "ch6-extract"
+chapter = 6
+crate = "examples/tutor"
+run = "extract"
+stdout_contains = ["Subject items: 6", "unsafe_trait_impl: 1"]
+
+[[step]]
+id = "ch6-scaffold"
+chapter = 6
+crate = "examples/tutor"
+cwd = "crate"
+run = "scaffold"
+stdout_contains = ["Obligations: 7, Verify: 7", "preserved Specs: 3", "preserved Proof: 6"]
+
+[[step]]
+id = "ch6-lock-specs"
+chapter = 6
+crate = "examples/tutor"
+run = "lock-specs"
+stdout_contains = ["Locked Specs files: 3", "Locked Assumptions files: 0", "Non-vacuity check: PASS"]
+
+[[step]]
+id = "ch6-agent-context"
+chapter = 6
+crate = "examples/tutor"
+cwd = "crate"
+run = "agent-context --item read_version_ref"
+stdout_contains = [
+  "frame_tutor::read_version_ref",
+  'StatefulItemSpec "frame_tutor::read_version_ref"',
+  "def body : CapturedMir :=",
+]
+
+[[step]]
+id = "ch6-agent-verify"
+chapter = 6
+crate = "examples/tutor"
+run = "agent-verify"
+stdout_contains = ["Totals: 7 unconditional, 0 conditional", "TrustedBoundary kernel replay: PASS"]
+
+# Anti-cheating safeguards. Each probe tampers with the locked workspace, runs
+# the command the chapter names, and is rolled back before the next step. The
+# tampered files live under fixtures/ch6/ so the chapter can show them.
+
+[[step]]
+id = "ch6-safeguard-1-modified-spec"
+chapter = 6
+crate = "examples/tutor"
+probe = true
+note = "Safeguard 1: editing a locked Specs file after lock-specs."
+append = [{ path = "anneal/proofs/Specs/FrameTutor/read_version_ref.lean", text = "\n-- unauthorized spec mutation\n" }]
+run = "agent-verify"
+expect = "failure"
+stderr_contains = ["spec-lock violation: locked Specs file 'anneal/proofs/Specs/FrameTutor/read_version_ref.lean' was modified"]
+
+[[step]]
+id = "ch6-safeguard-1-added-spec"
+chapter = 6
+crate = "examples/tutor"
+probe = true
+note = "Safeguard 1: adding a Specs file after lock-specs."
+write = [{ path = "anneal/proofs/Specs/FrameTutor/pin_magic.lean", fixture = "ch6/Specs-pin_magic-unlocked.lean" }]
+run = "agent-verify"
+expect = "failure"
+stderr_contains = ["spec-lock violation: unlocked Specs file 'anneal/proofs/Specs/FrameTutor/pin_magic.lean' was added"]
+
+[[step]]
+id = "ch6-safeguard-2-added-assumption"
+chapter = 6
+crate = "examples/tutor"
+probe = true
+note = "Safeguard 2: adding an Assumptions file after lock-specs locked zero assumptions."
+write = [{ path = "anneal/proofs/Assumptions/FrameTutor/pin_magic.lean", from = "examples/tutor-ch3/anneal/proofs/Assumptions/FrameTutor/pin_magic.lean" }]
+run = "agent-verify"
+expect = "failure"
+stderr_contains = ["spec-lock violation: unlocked Assumptions file 'anneal/proofs/Assumptions/FrameTutor/pin_magic.lean' was added"]
+
+[[step]]
+id = "ch6-safeguard-3-vacuous-spec"
+chapter = 6
+crate = "examples/tutor"
+probe = true
+note = "Safeguard 3: a `pre := fun _ => False` override is rejected when locking."
+write = [{ path = "anneal/proofs/Specs/FrameTutor/pin_magic.lean", fixture = "ch6/Specs-pin_magic-vacuous.lean" }]
+run = "lock-specs"
+expect = "failure"
+stderr_contains = ["vacuous specification precondition rejected in anneal/proofs/Specs/FrameTutor/pin_magic.lean"]
+
+[[step]]
+id = "ch6-safeguard-4-dropped-ensures"
+chapter = 6
+crate = "examples/tutor"
+probe = true
+note = "Safeguard 4: an override that drops the Rust `ensures` clause is rejected when locking."
+write = [{ path = "anneal/proofs/Specs/FrameTutor/advance_offset.lean", fixture = "ch6/Specs-advance_offset-drops-ensures.lean" }]
+run = "lock-specs"
+expect = "failure"
+stderr_contains = ["drops the Rust #[spec] `ensures` clause"]
+
+[[step]]
+id = "ch6-safeguard-5-missing-import"
+chapter = 6
+crate = "examples/tutor"
+probe = true
+note = "Safeguard 5: a proof that omits `import Specs.<Item>` is rejected before Lake runs."
+write = [{ path = "anneal/proofs/Proof/FrameTutor/read_version_ref.lean", fixture = "ch6/Proof-read_version_ref-no-import.lean" }]
+run = "agent-verify"
+expect = "failure"
+stderr_contains = ["missing `import Specs.FrameTutor.read_version_ref` in anneal/proofs/Proof/FrameTutor/read_version_ref.lean"]
+
+[[step]]
+id = "ch6-safeguard-5-sorry"
+chapter = 6
+crate = "examples/tutor"
+probe = true
+note = "Safeguard 5: `sorry` compiles under Lake but fails the kernel-replay audit."
+write = [{ path = "anneal/proofs/Proof/FrameTutor/pin_magic.lean", fixture = "ch6/Proof-pin_magic-sorry.lean" }]
+run = "agent-verify"
+expect = "failure"
+stderr_contains = ["sorryAx"]
+
+[[step]]
+id = "ch6-safeguard-5-axiom"
+chapter = 6
+crate = "examples/tutor"
+probe = true
+note = "Safeguard 5: an `axiom` inside Proof.* is rejected by the source inspector."
+write = [{ path = "anneal/proofs/Proof/FrameTutor/pin_magic.lean", fixture = "ch6/Proof-pin_magic-axiom.lean" }]
+run = "agent-verify"
+expect = "failure"
+stderr_contains = ["axiom"]
