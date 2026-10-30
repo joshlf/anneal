@@ -9,5 +9,6 @@
 [workspace]
 resolver = "2"
 members = [
+    "trusted/cargo-anneal",
     "trusted/rustc-capture",
 ]
