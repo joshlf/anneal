@@ -1,5 +1,5 @@
 name = "AnnealExamples"
-defaultTargets = ["Smoke"]
+defaultTargets = ["Smoke", "ToyYDiagram"]
 
 [[lean_lib]]
 name = "Trusted"
@@ -13,3 +13,8 @@ srcDir = "../theory"
 name = "Smoke"
 srcDir = "."
 roots = ["Smoke"]
+
+[[lean_lib]]
+name = "ToyYDiagram"
+srcDir = "refinement"
+roots = ["ToyYDiagram"]
