@@ -16,33 +16,55 @@ import Trusted.MirAst
 /-!
 # Trusted MIR Semantics and Crate Theorem (`Trusted/MirSemantics.lean`)
 
-This module defines the small-step operational semantics `MirSem` for the
-minimal MIR fragment (`Trusted/MirAst.lean`) and the top-level crate
+This module defines the small-step operational semantics `MirSem` for the MIR
+fragment in `Trusted/MirAst.lean`, Post-Monomorphization Error (PME) admission
+(`RequiresConst`, `ConstSucceeds`, `MonoAdmitted`), the library representation
+invariant and API boundary contract (`AdtInv`, `MirVal.satisfiesInv`,
+`AdmissibleAdtInv`, `FnKind`, `UnsafeImplObligation`), and the top-level crate
 verification obligation `Trusted.CrateTheorem`.
 
-Every declaration in this file that models a Rust execution rule explains the
-correspondence and both quotes and cites the normative Rust Reference or `rustc`
-documentation at the repository's pinned revisions
-(`rust-lang/reference@82da570bafd9efed421bdbae0f8603ede8dd308b` and
+Every declaration in this file that models a Rust execution rule or library
+soundness obligation explains the correspondence and both quotes and cites the
+normative Rust Reference or `rustc` documentation at the repository's pinned
+revisions (`rust-lang/reference@82da570bafd9efed421bdbae0f8603ede8dd308b` and
 `rust-lang/rust@58cf8f9c35b355199727627d07ae34a4e2846d67`).
 
 This module belongs to `trusted/lean/` and contains only definitions,
 structures, inductives, and opaque interfaces (zero theorems). All proofs
-(`TotalStep`, `InhabitedDemonic`, adequacy canaries, and `id` verification
-lemmas) live in `theory/Anneal/MirLemmas.lean`.
+(`TotalStep`, `InhabitedDemonic`, adequacy canaries, PME extraction lemmas, and
+library verification theorems) live in `theory/Anneal/MirLemmas.lean`.
 -/
 
 namespace Trusted
 
-/-- Instantaneous execution state of a `MirBody`, recording the contents of
-    each local slot (`none` when uninitialized or deallocated, `some v` when
-    holding an initialized `MirVal`), the active basic block index, and the
-    statement index within that basic block. -/
+/-- Saved caller activation frame pushed onto `MirState.stack` by a static
+    `Terminator.call1` and popped by the callee's `Terminator.return_`. -/
+@[candidate mir_semantics]
+structure StackFrame where
+  callerBody : MirBody
+  callerLocals : Nat → Option MirVal
+  callerTySizes : Nat → Nat := fun _ => 0
+  retDst : LocalId
+  retBlock : Nat
+
+/-- Instantaneous execution state of a `MirBody`, recording:
+    - `locals`: the contents of each local slot (`none` when uninitialized or
+      deallocated, `some v` when holding an initialized `MirVal`),
+    - `block`: the active basic block index,
+    - `stmtIdx`: the statement index within that basic block,
+    - `tySizes`: the monomorphization environment mapping each type parameter
+      index (`MirTy.param idx`) to its concrete byte size,
+    - `curBody`: `none` when executing the root `MirBody`, or `some callee` when
+      executing inside a static `Terminator.call1` frame, and
+    - `stack`: saved caller activation frames. -/
 @[candidate mir_semantics]
 structure MirState where
   locals : Nat → Option MirVal
   block : Nat
   stmtIdx : Nat
+  tySizes : Nat → Nat := fun _ => 0
+  curBody : Option MirBody := none
+  stack : List StackFrame := []
 
 /-- Update local slot `target` in a local store `locals`, leaving all other
     local indices unchanged. -/
@@ -51,11 +73,72 @@ def updateLocal (locals : Nat → Option MirVal) (target : Nat)
     (val : Option MirVal) : Nat → Option MirVal :=
   fun i => if i == target then val else locals i
 
-/-- Dynamic type-validity relation matching an initialized `MirVal` against a
-    `MirTy`.
+/-- Byte size of a `MirTy` under a monomorphization type-size assignment
+    `tySizes` (`core::mem::size_of::<T>()`):
+    - `usize`, single-field `usize` wrapper ADTs, and thin shared references
+      (`&T`) are 8 bytes on a 64-bit target,
+    - `bool` is 1 byte (`r[type.bool.layout]`),
+    - `()` is 0 bytes, and
+    - `MirTy.param idx` has byte size `tySizes idx`.
+
+    > "The size of a value is the offset in bytes between successive elements
+    > in an array with that item type including alignment padding."
+
+    Source: https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/type-layout.md#L16-L18 -/
+@[candidate mir_semantics]
+def evalTyByteSize (tySizes : Nat → Nat) (ty : MirTy) : Nat :=
+  match ty with
+  | .usize => 8
+  | .bool => 1
+  | .unit => 0
+  | .adt _ => 8
+  | .param idx => tySizes idx
+  | .ref _ => 8
+
+/-- Substitute concrete call-site `typeArgs` into the caller's type-size
+    environment `tySizes`: parameter index `idx` resolves to
+    `evalTyByteSize tySizes ty` when `typeArgs[idx]? = some ty`, and falls back
+    to `tySizes idx` when `typeArgs` is empty or `idx` is beyond
+    `typeArgs.length`. -/
+@[candidate mir_semantics]
+def substTySizes (tySizes : Nat → Nat) (typeArgs : List MirTy)
+    (idx : Nat) : Nat :=
+  match typeArgs[idx]? with
+  | some ty => evalTyByteSize tySizes ty
+  | none => tySizes idx
+
+/-- Library-level representation invariant on user-defined ADT values
+    (`AdtInv`): assigns a semantic validity predicate to each ADT identifier
+    `adtId` and inner field value `MirVal`.
+
+    Corresponds to Rust's distinction between language-level validity invariants
+    and library-level safety invariants required for sound interaction with safe
+    downstream code:
+
+    > "`unsafe` code may trust that *safe* code cannot violate library-level
+    > invariants when interacting only through the public safe API."
+
+    Source: https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/unsafety.md#L1-L35 -/
+@[candidate mir_semantics]
+abbrev AdtInv := Nat → MirVal → Prop
+
+/-- Default ADT representation invariant permitting any language-valid inner
+    field value (`fun _ _ => True`). -/
+@[candidate mir_semantics]
+def defaultAdtInv : AdtInv :=
+  fun _ _ => True
+
+/-- Parameterized value-validity relation matching an initialized `MirVal`
+    against a `MirTy` under `tySizes` and ADT representation invariant `adtInv`:
+    - When `adtInv = defaultAdtInv`, `v.satisfiesInv defaultAdtInv tySizes ty`
+      is language-level type validity (`MirVal.hasTy`).
+    - When `adtInv` is a crate's custom ADT invariant, `v.satisfiesInv adtInv
+      tySizes ty` additionally enforces `adtInv tyId (.usize n)` on `.adt tyId`
+      values while automatically preserving language validity on all primitive
+      scalars, references, and generic byte parameters.
 
     Corresponds to Rust's value validity requirement that every produced scalar
-    value be initialized and match its static type:
+    or aggregate value be initialized and match its static type layout:
 
     > "The Rust compiler assumes that all values produced during program
     > execution are "valid", and producing an invalid value is hence immediate
@@ -63,18 +146,31 @@ def updateLocal (locals : Nat → Option MirVal) (target : Nat)
 
     Source: https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/behavior-considered-undefined.md#L114-L117 -/
 @[candidate mir_semantics]
-def MirVal.hasTy (v : MirVal) (ty : MirTy) : Prop :=
-  match v, ty with
-  | .usize _, .usize => True
+def MirVal.satisfiesInv (adtInv : AdtInv) (tySizes : Nat → Nat)
+    (v : MirVal) (ty : MirTy) : Prop :=
+  match ty, v with
+  | .usize, .usize _ => True
+  | .bool, .bool _ => True
   | .unit, .unit => True
+  | .adt tyId, .adt vId (.usize n) => vId = tyId ∧ adtInv tyId (.usize n)
+  | .param idx, .bytes sz _ => sz = tySizes idx
+  | .ref _, .ref _ => True
   | _, _ => False
 
+/-- Dynamic language-level type-validity relation (`V_lang`) matching an
+    initialized `MirVal` against a `MirTy` under `tySizes`
+    (`v.satisfiesInv defaultAdtInv tySizes ty`). -/
+@[candidate mir_semantics]
+abbrev MirVal.hasTy (tySizes : Nat → Nat) (v : MirVal) (ty : MirTy) : Prop :=
+  v.satisfiesInv defaultAdtInv tySizes ty
+
 /-- Entry initialization condition for function arguments and non-argument
-    locals.
+    locals under `adtInv` and `tySizes`.
 
     Starting at local `1` at function entry, each parameter type in `argTys`
-    holds an initialized `MirVal` matching its `MirTy`, while remaining locals
-    start uninitialized (`none`):
+    holds an initialized `MirVal` satisfying `v.satisfiesInv adtInv tySizes ty`,
+    while remaining locals past `1 + argTys.length` start uninitialized
+    (`none`):
 
     > "Starting at local 1, `arg_count` locals will be provided by the caller
     > and can be assumed to be initialized."
@@ -87,18 +183,30 @@ def MirVal.hasTy (v : MirVal) (ty : MirTy) : Prop :=
     - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/mod.rs#L245-L249
     - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L366-L368 -/
 @[candidate mir_semantics]
-def argsMatchLocals (argTys : List MirTy) (locals : Nat → Option MirVal) : Prop :=
+def argsMatchInv (adtInv : AdtInv) (tySizes : Nat → Nat)
+    (argTys : List MirTy) (locals : Nat → Option MirVal) : Prop :=
   -- Fold across `argTys` starting at local index `k = 1`: each parameter slot
-  -- `k` must hold `some v` with `v.hasTy ty`, and every index `j` past the last
-  -- parameter (`1 + argTys.length ≤ j`) must be `none`.
+  -- `k` must hold `some v` with `v.satisfiesInv adtInv tySizes ty`, and every
+  -- index `j` past the last parameter (`1 + argTys.length ≤ j`) must be `none`.
   argTys.foldr
-    (fun ty rest k => (∃ v, locals k = some v ∧ v.hasTy ty) ∧ rest (k + 1))
+    (fun ty rest k =>
+      (∃ v, locals k = some v ∧ v.satisfiesInv adtInv tySizes ty) ∧
+      rest (k + 1))
     (fun k => ∀ j, k ≤ j → locals j = none)
     1
 
-/-- Entry state predicate for a `MirBody`: execution starts at basic block `0`,
-    statement `0`, with the return place `_0` uninitialized and argument locals
-    `1 ..= argTys.length` initialized to type-valid values.
+/-- Language-level argument initialization condition (`argsMatchInv
+    defaultAdtInv`). -/
+@[candidate mir_semantics]
+abbrev argsMatchLocals (tySizes : Nat → Nat) (argTys : List MirTy)
+    (locals : Nat → Option MirVal) : Prop :=
+  argsMatchInv defaultAdtInv tySizes argTys locals
+
+/-- Structural entry state predicate for a `MirBody` (prior to
+    Post-Monomorphization Error admission): execution starts at basic block `0`,
+    statement `0`, at the root frame (`curBody = none`, `stack = []`), with the
+    return place `_0` uninitialized and argument locals `1 ..= argTys.length`
+    initialized to language-valid values.
 
     Corresponds to function body entry in the Rust Reference and `rustc` MIR:
 
@@ -108,20 +216,53 @@ def argsMatchLocals (argTys : List MirTy) (locals : Nat → Option MirVal) : Pro
 
     Source: https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/items/functions.md#L114-L116 -/
 @[candidate mir_semantics]
-def initMirState (body : MirBody) (s : MirState) : Prop :=
+def initEntryState (body : MirBody) (s : MirState) : Prop :=
   s.block = 0 ∧
   s.stmtIdx = 0 ∧
+  s.curBody = none ∧
+  s.stack = [] ∧
   s.locals 0 = none ∧
-  argsMatchLocals body.argTys s.locals
+  argsMatchLocals s.tySizes body.argTys s.locals
+
+/-- Evaluate a MIR `Operand`, returning the loaded `MirVal` and the updated
+    local store (or `none` if the operand reads an uninitialized local).
+
+    - `Operand.copy` preserves the source local (`r[expr.move.copy]`).
+    - `Operand.move` deinitializes the source local
+      (`r[expr.move.deinitialization]`).
+    - `Operand.constVal` yields its constant directly. -/
+@[candidate mir_semantics]
+def evalOperand (locals : Nat → Option MirVal) (op : Operand) :
+    Option (MirVal × (Nat → Option MirVal)) :=
+  match op with
+  | .copy src =>
+    match locals src.index with
+    | some v => some (v, locals)
+    | none => none
+  | .move src =>
+    match locals src.index with
+    | some v => some (v, updateLocal locals src.index none)
+    | none => none
+  | .constVal v => some (v, locals)
+
+/-- Evaluate a binary comparison `BinOp` on two initialized `MirVal`
+    operands. -/
+@[candidate mir_semantics]
+def evalBinOp (op : BinOp) (lhs rhs : MirVal) : Option MirVal :=
+  match op, lhs, rhs with
+  | .eq, .usize a, .usize b => some (.bool (decide (a = b)))
+  | .eq, .bool a, .bool b => some (.bool (decide (a = b)))
+  | .eq, .unit, .unit => some (.bool true)
+  | _, _, _ => none
 
 /-- Single-step operational evaluation of a MIR statement.
 
-    Models `Operand::Copy`, `Operand::Move`, `Rvalue::Use`,
+    Models `Operand::Copy`, `Operand::Move`, `Rvalue::Use`, `Rvalue::BinaryOp`,
+    `Rvalue::Aggregate`, field projection, shared borrow/reborrow,
     `StatementKind::Assign`, `StatementKind::StorageLive`,
     `StatementKind::StorageDead`, and `StatementKind::Nop`:
-    - Reading an uninitialized local via `Operand.copy` or `Operand.move`
-      triggers immediate Undefined Behavior (`.failed`), matching
-      `r[undefined.invalid]` and `r[undefined.validity.scalar]`.
+    - Reading an uninitialized local triggers immediate Undefined Behavior
+      (`.failed`), matching `r[undefined.invalid]`.
     - `Operand.copy` preserves the source local, whereas `Operand.move`
       deinitializes the source local before storing the value into `dst`,
       matching `r[expr.move.copy]` and `r[expr.move.deinitialization]`:
@@ -145,64 +286,135 @@ def initMirState (body : MirBody) (s : MirState) : Prop :=
 def evalMirStmt (s : MirState) (stmt : Stmt) : StepResult MirState Empty MirVal :=
   match stmt with
   | .assign dst (.use op) =>
-    match op with
-    | .copy src =>
-      -- `Copy` reads `src` without deinitializing it; reading an uninitialized
-      -- local (`none`) is immediate UB.
-      match s.locals src.index with
-      | some v =>
-        .silent {
-          locals := updateLocal s.locals dst.index (some v)
-          block := s.block
-          stmtIdx := s.stmtIdx + 1
-        }
-      | none => .failed
-    | .move src =>
-      -- `Move` reads `src`, deinitializes `src` (`none`), and writes `v` to
-      -- `dst`. Deinitializing `src` before writing `dst` ensures that a
-      -- self-move (`_x = move _x`) still leaves `_x` initialized with `v`.
-      match s.locals src.index with
-      | some v =>
-        let deinitLocals := updateLocal s.locals src.index none
-        .silent {
-          locals := updateLocal deinitLocals dst.index (some v)
-          block := s.block
-          stmtIdx := s.stmtIdx + 1
-        }
-      | none => .failed
-    | .constVal v =>
-      .silent {
-        locals := updateLocal s.locals dst.index (some v)
-        block := s.block
+    match evalOperand s.locals op with
+    | some (v, locals') =>
+      .silent { s with
+        locals := updateLocal locals' dst.index (some v)
         stmtIdx := s.stmtIdx + 1
       }
+    | none => .failed
+  | .assign dst (.binaryOp op lhs rhs) =>
+    match evalOperand s.locals lhs with
+    | some (v1, locals1) =>
+      match evalOperand locals1 rhs with
+      | some (v2, locals2) =>
+        match evalBinOp op v1 v2 with
+        | some outVal =>
+          .silent { s with
+            locals := updateLocal locals2 dst.index (some outVal)
+            stmtIdx := s.stmtIdx + 1
+          }
+        | none => .failed
+      | none => .failed
+    | none => .failed
+  | .assign dst (.aggregate adtId op) =>
+    match evalOperand s.locals op with
+    | some (v, locals') =>
+      .silent { s with
+        locals := updateLocal locals' dst.index (some (.adt adtId v))
+        stmtIdx := s.stmtIdx + 1
+      }
+    | none => .failed
+  | .assign dst (.field0 src) =>
+    match s.locals src.index with
+    | some (.adt _ inner) =>
+      .silent { s with
+        locals := updateLocal s.locals dst.index (some inner)
+        stmtIdx := s.stmtIdx + 1
+      }
+    | _ => .failed
+  | .assign dst (.ref src) =>
+    match s.locals src.index with
+    | some _ =>
+      .silent { s with
+        locals := updateLocal s.locals dst.index (some (.ref src))
+        stmtIdx := s.stmtIdx + 1
+      }
+    | none => .failed
+  | .assign dst (.reborrow src) =>
+    match s.locals src.index with
+    | some (.ref target) =>
+      match s.locals target.index with
+      | some _ =>
+        .silent { s with
+          locals := updateLocal s.locals dst.index (some (.ref target))
+          stmtIdx := s.stmtIdx + 1
+        }
+      | none => .failed
+    | _ => .failed
   | .storageLive loc =>
     -- Entering a live storage range starts `loc` in an uninitialized state.
-    .silent {
+    .silent { s with
       locals := updateLocal s.locals loc.index none
-      block := s.block
       stmtIdx := s.stmtIdx + 1
     }
   | .storageDead loc =>
     -- Ending a live storage range deallocates/deinitializes `loc`.
-    .silent {
+    .silent { s with
       locals := updateLocal s.locals loc.index none
-      block := s.block
       stmtIdx := s.stmtIdx + 1
     }
   | .nop =>
     .silent { s with stmtIdx := s.stmtIdx + 1 }
 
+/-- Operational evaluation of `core::mem::transmute_copy::<srcTy, dstTy>(&src)`:
+    requires `srcTy` and `dstTy` to have equal byte size under `tySizes` and
+    `argVal` to be a valid reference `.ref target` to an initialized byte value
+    of size `evalTyByteSize tySizes srcTy`; otherwise returns `none` (immediate
+    Undefined Behavior).
+
+    Corresponds to `core::mem::transmute_copy` in the Rust standard library:
+
+    > "It is undefined behavior to call this function if `Src` is smaller than
+    > `Dst` (`size_of::<Src>() < size_of::<Dst>()`)."
+
+    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/mem/mod.rs#L1180-L1209 -/
+@[candidate mir_semantics]
+def evalTransmuteCopy (tySizes : Nat → Nat) (locals : Nat → Option MirVal)
+    (srcTy dstTy : MirTy) (argVal : MirVal) : Option MirVal :=
+  let srcSz := evalTyByteSize tySizes srcTy
+  let dstSz := evalTyByteSize tySizes dstTy
+  if decide (srcSz = dstSz) then
+    match argVal with
+    | .ref target =>
+      match locals target.index with
+      | some (.bytes vSz bits) =>
+        if decide (vSz = srcSz) then
+          some (.bytes dstSz bits)
+        else
+          none
+      | _ => none
+    | _ => none
+  else
+    none
+
 /-- Single-step operational evaluation of a MIR basic-block terminator.
 
-    Models `TerminatorKind::Return`, `TerminatorKind::Goto`, and
-    `TerminatorKind::Unreachable`:
-    - `Terminator.return_` reads the return place `_0` (`s.locals 0`) and
-      completes with `.terminated (.normal retVal)` if initialized, or triggers
-      `.failed` if `_0` is uninitialized (`r[undefined.invalid]`).
+    Models `TerminatorKind::Return`, `TerminatorKind::Goto`,
+    `TerminatorKind::Unreachable`, `TerminatorKind::SwitchInt`, and
+    `TerminatorKind::Call` (`panic`, `size_of`, `transmute_copy`, and static
+    single-argument calls):
+    - `Terminator.return_` reads the return place `_0` (`s.locals 0`). At the
+      root frame (`s.stack = []`), it completes with
+      `.terminated (.normal retVal)` if initialized (or `.failed` if
+      uninitialized). Inside a callee frame (`frame :: restStack`), it pops
+      `frame`, restores `frame.callerTySizes`, writes `retVal` to `frame.retDst`
+      in `frame.callerLocals`, and resumes at `frame.retBlock`.
     - `Terminator.goto target` transfers control to statement `0` of
       `target.index`.
-    - `Terminator.unreachable` triggers immediate `.failed`:
+    - `Terminator.unreachable` triggers immediate `.failed`.
+    - `Terminator.panic` terminates execution via unwinding
+      (`.terminated .unwind`).
+    - `Terminator.switchInt discr falseTarget trueTarget` branches on a boolean
+      discriminant (`false` -> `falseTarget`; `true` -> `trueTarget`).
+    - `Terminator.callSizeOf dst ty target` writes `evalTyByteSize s.tySizes ty`
+      to `dst` and jumps to `target`.
+    - `Terminator.callTransmuteCopy dst srcTy dstTy op target` evaluates
+      `evalTransmuteCopy`, writing the transmuted value to `dst` or failing with
+      `.failed` if the byte sizes disagree.
+    - `Terminator.call1 dst callee arg target typeArgs` evaluates `arg`,
+      substitutes `typeArgs` into `s.tySizes` via `substTySizes`, and pushes a
+      `StackFrame` to execute `callee` at block `0`, statement `0`.
 
     > "Block has one successor; we continue execution there."
     >
@@ -214,51 +426,240 @@ def evalMirStmt (s : MirState) (stmt : Stmt) : StepResult MirState Empty MirVal 
     >
     > Executing this terminator is UB."
 
-    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L684-L731 -/
+    Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L684-L798 -/
 @[candidate mir_semantics]
-def evalMirTerminator (s : MirState) (term : Terminator) :
-    StepResult MirState Empty MirVal :=
+def evalMirTerminator (activeBody : MirBody) (s : MirState)
+    (term : Terminator) : StepResult MirState Empty MirVal :=
   match term with
   | .return_ =>
     match s.locals 0 with
-    | some retVal => .terminated (.normal retVal)
     | none => .failed
+    | some retVal =>
+      match s.stack with
+      | [] => .terminated (.normal retVal)
+      | frame :: restStack =>
+        .silent {
+          locals := updateLocal frame.callerLocals frame.retDst.index (some retVal)
+          block := frame.retBlock
+          stmtIdx := 0
+          tySizes := frame.callerTySizes
+          curBody := if restStack.isEmpty then none else some frame.callerBody
+          stack := restStack
+        }
   | .goto target =>
     .silent { s with block := target.index, stmtIdx := 0 }
   | .unreachable =>
     .failed
+  | .panic =>
+    .terminated .unwind
+  | .switchInt discr falseTarget trueTarget =>
+    match evalOperand s.locals discr with
+    | some (.bool false, locals') =>
+      .silent { s with locals := locals', block := falseTarget.index, stmtIdx := 0 }
+    | some (.bool true, locals') =>
+      .silent { s with locals := locals', block := trueTarget.index, stmtIdx := 0 }
+    | _ => .failed
+  | .callSizeOf dst ty target =>
+    let sz := evalTyByteSize s.tySizes ty
+    .silent { s with
+      locals := updateLocal s.locals dst.index (some (.usize sz))
+      block := target.index
+      stmtIdx := 0
+    }
+  | .callTransmuteCopy dst srcTy dstTy op target =>
+    match evalOperand s.locals op with
+    | some (argVal, locals') =>
+      match evalTransmuteCopy s.tySizes locals' srcTy dstTy argVal with
+      | some outVal =>
+        .silent { s with
+          locals := updateLocal locals' dst.index (some outVal)
+          block := target.index
+          stmtIdx := 0
+        }
+      | none => .failed
+    | none => .failed
+  | .call1 dst callee arg target typeArgs =>
+    match evalOperand s.locals arg with
+    | some (argVal, callerLocals') =>
+      let calleeLocals : Nat → Option MirVal :=
+        updateLocal (fun _ => none) 1 (some argVal)
+      let frame : StackFrame := {
+        callerBody := activeBody
+        callerLocals := callerLocals'
+        callerTySizes := s.tySizes
+        retDst := dst
+        retBlock := target.index
+      }
+      .silent {
+        locals := calleeLocals
+        block := 0
+        stmtIdx := 0
+        tySizes := substTySizes s.tySizes typeArgs
+        curBody := some callee
+        stack := frame :: s.stack
+      }
+    | none => .failed
 
 /-- Single-step transition function of a `MirBody`: executes the statement at
-    `s.stmtIdx` in block `s.block`, or the block's terminator once all
-    statements in `s.block` have completed. Jumping to an out-of-bounds basic
-    block index triggers `.failed`. -/
+    `s.stmtIdx` in block `s.block` of the active `MirBody` (`s.curBody.getD
+    rootBody`), or the block's terminator once all statements in `s.block` have
+    completed. Jumping to an out-of-bounds basic block index triggers
+    `.failed`. -/
 @[candidate mir_semantics]
-def evalMirStep (body : MirBody) (s : MirState) :
+def evalMirStep (rootBody : MirBody) (s : MirState) :
     StepResult MirState Empty MirVal :=
-  match body.blocks[s.block]? with
+  let active := s.curBody.getD rootBody
+  match active.blocks[s.block]? with
   | none => .failed
   | some bb =>
     match bb.stmts[s.stmtIdx]? with
     | some stmt => evalMirStmt s stmt
-    | none => evalMirTerminator s bb.terminator
+    | none => evalMirTerminator active s bb.terminator
+
+/-- Relational step transition of a `MirBody` (`r = evalMirStep body s`). -/
+@[candidate mir_semantics]
+abbrev MirStep (body : MirBody) (s : MirState)
+    (r : StepResult MirState Empty MirVal) : Prop :=
+  r = evalMirStep body s
+
+/-!
+## Post-Monomorphization Error (PME) Admission
+-/
+
+/-- Inductive reachability of compile-time constant `(tySizes', c)` obligations
+    required for monomorphization of `(tySizes, body)` (`Body::required_consts`
+    collected across `body` and its static `Terminator.call1` callees under
+    their substituted `typeArgs`).
+
+    Corresponds to `collect_used_items` and `required_consts` evaluation in
+    `rustc_monomorphize::collector`:
+
+    > "Constants that are required to evaluate successfully for this `Body`
+    > to be well-formed. Wait until monomorphization to evaluate them."
+    >
+    > "Collect all monomorphized items reachable from the root and evaluate
+    > their `required_consts`."
+
+    Sources:
+    - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/mod.rs#L279-L285
+    - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_monomorphize/src/collector.rs#L1185-L1207 -/
+@[candidate mir_semantics]
+inductive RequiresConst :
+    (Nat → Nat) → MirBody → (Nat → Nat) → MirBody → Prop where
+  /-- Direct PME constant in `body.requiredConsts` under `tySizes`. -/
+  | direct {tySizes : Nat → Nat} {body c : MirBody} :
+      c ∈ body.requiredConsts →
+      RequiresConst tySizes body tySizes c
+  /-- Transitive PME constant required by a constant `c'` in
+      `body.requiredConsts`. -/
+  | nested {tySizes tySizes' : Nat → Nat} {body c' c : MirBody} :
+      c' ∈ body.requiredConsts →
+      RequiresConst tySizes c' tySizes' c →
+      RequiresConst tySizes body tySizes' c
+  /-- Transitive PME constant required by a static `Terminator.call1` callee
+      in `body.blocks`, evaluated under the substituted type-size environment
+      `substTySizes tySizes typeArgs`. -/
+  | call1 {tySizes tySizes' : Nat → Nat} {body callee c : MirBody}
+      {bb : BasicBlock} {dst : LocalId} {arg : Operand} {target : BlockId}
+      {typeArgs : List MirTy} :
+      bb ∈ body.blocks →
+      bb.terminator = .call1 dst callee arg target typeArgs →
+      RequiresConst (substTySizes tySizes typeArgs) callee tySizes' c →
+      RequiresConst tySizes body tySizes' c
+
+/-- Compile-Time Function Evaluation (CTFE) success predicate for a constant
+    `MirBody` `c` under monomorphization type sizes `tySizes`: there exists a
+    valid structural entry state `s₀` (`initEntryState c s₀`) with
+    `s₀.tySizes = tySizes` from which `MirStep` reaches normal termination
+    `.terminated (.normal v)` in `n` steps.
+
+    If `c` panics (`.terminated .unwind`), triggers UB (`.failed`), or
+    diverges, `ConstSucceeds tySizes c` is `False` and `rustc` rejects the
+    monomorphization with a Post-Monomorphization Error (`E0080`):
+
+    > "A constant expression is evaluated at compile time. If evaluation fails
+    > (for example, due to a panic or integer overflow), compilation fails."
+
+    Source: https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/const_eval.md#L1-L25 -/
+@[candidate mir_semantics]
+def ConstSucceeds (tySizes : Nat → Nat) (c : MirBody) : Prop :=
+  ∃ (s₀ : MirState) (n : Nat) (tr : List Empty) (v : MirVal),
+    s₀.tySizes = tySizes ∧
+    initEntryState c s₀ ∧
+    ReachesPrefix MirStep c n s₀ tr (.terminated (.normal v))
+
+/-- Monomorphization admission predicate for `body` under `tySizes`: every
+    compile-time constant `(tySizes', c)` satisfying
+    `RequiresConst tySizes body tySizes' c` (including those of static
+    `Terminator.call1` callees under their substituted `typeArgs`) evaluates to
+    normal completion without panicking or triggering UB. -/
+@[candidate mir_semantics]
+def MonoAdmitted (tySizes : Nat → Nat) (body : MirBody) : Prop :=
+  ∀ tySizes' c, RequiresConst tySizes body tySizes' c → ConstSucceeds tySizes' c
+
+/-- Full initial state predicate of `MirMachine` for `body`: `s` is a valid
+    structural entry state (`initEntryState body s`) and `body` is admitted by
+    monomorphization under `s.tySizes` (`MonoAdmitted s.tySizes body`).
+
+    When a monomorphization fails a Post-Monomorphization Error
+    (`¬ MonoAdmitted s.tySizes body`), `initMirState body s` is `False`, so
+    `EventualBehaviorOf MirMachine body` at `s` has `defined := True` and
+    `val := ∅` (the bottom element `⊥` of `Partial (Out → Prop)`), accurately
+    modeling that a rejected monomorphization has no runtime execution in either
+    `MirLang` or `TargetLang`. -/
+@[candidate mir_semantics]
+def initMirState (body : MirBody) (s : MirState) : Prop :=
+  initEntryState body s ∧ MonoAdmitted s.tySizes body
 
 /-- Small-step operational machine for `MirBody`. -/
 @[candidate mir_semantics]
 def MirMachine : SmallStepMachine MirBody MirState Empty MirVal where
   initState := initMirState
-  step body s r := r = evalMirStep body s
+  step := MirStep
 
 /-- Operational language of Rust MIR (`MirMachine.toLanguage`). -/
 @[candidate mir_semantics]
 def MirLang : Language (EventualOut Empty MirVal) :=
   MirMachine.toLanguage
 
-/-- Operational behavior of a `MirBody`: the state-indexed eventual behavior
+/-- Operational behavior of a `MirBody`: the state-indexed partial behavior
     (`MirState → Partial (EventualOut Empty MirVal → Prop)`) induced by
     `MirMachine`. -/
 @[candidate mir_semantics]
 abbrev MirSem (body : MirBody) : MirLang.Behavior :=
   MirLang.sem body
+
+/-!
+## Library Representation Invariants and Boundary Promises
+-/
+
+/-- Admissibility of an ADT representation invariant `adtInv` for a crate's ADT
+    declarations `adts` (`r[expr.struct.safety]`): for any ADT `decl ∈ adts`
+    whose fields are all `pubSafe` (and not `#[non_exhaustive]`), every `usize`
+    field value `n` must satisfy `adtInv decl.id (.usize n)`—preventing a
+    library from claiming a restricted invariant on a struct that safe
+    downstream code can construct directly via struct literal syntax.
+
+    Because `MirVal.satisfiesInv` enforces language-level validity and open
+    primitive/parameter invariants structurally for all non-ADT types,
+    `AdmissibleAdtInv` needs only this single field-encapsulation clause.
+
+    Source: https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/expressions/struct-expr.md#L58-L65 -/
+@[candidate mir_semantics]
+def AdmissibleAdtInv (adts : List AdtDecl) (adtInv : AdtInv) : Prop :=
+  ∀ decl, decl ∈ adts → decl.allFieldsPubSafe = true →
+    ∀ n, adtInv decl.id (.usize n)
+
+/-- Mandatory postcondition specification for public library functions: on every
+    initial state `s` satisfying `pre s`, the function is free of UB
+    (`defined := pre s`) and any normal return value `ret` satisfies
+    `ret.satisfiesInv adtInv s.tySizes retTy`. -/
+@[candidate mir_semantics]
+def EnsuresRetLibInv (adtInv : AdtInv) (retTy : MirTy)
+    (pre : MirState → Prop) : MirLang.Behavior :=
+  MirLang.SpecOn pre (fun s out =>
+    ∀ tr ret, out = .terminated tr (.normal ret) →
+      ret.satisfiesInv adtInv s.tySizes retTy)
 
 /-- Postcondition specification for a safe function asserting that:
     - `defined := True`: every finite execution prefix is free of UB and stuck
@@ -284,7 +685,7 @@ structure TargetArtifact where
 
     Declared `opaque` so that proofs cannot unfold target compilation and must
     instead discharge target refinement via the audited `TCBItem.rustcLowering`
-    assumption in the crate's TCB list. -/
+    waiver in the crate's TCB list. -/
 @[candidate mir_semantics]
 opaque rustc : MirBody → TargetArtifact := fun _ => { unit := () }
 
@@ -299,13 +700,14 @@ opaque TargetSem :
     TargetArtifact → MirState → Partial (EventualOut Empty MirVal → Prop) :=
   fun _ _ => Partial.ub
 
-/-- Target language of compiled `TargetArtifact`s, sharing the observable
-    eventual outcome spine `EventualOut Empty MirVal` with `MirLang`. -/
+/-- Target language of compiled `TargetArtifact`s sharing the observable spine
+    `EventualOut Empty MirVal` with `MirLang`. -/
 @[candidate mir_semantics]
 def TargetLang : Language (EventualOut Empty MirVal) :=
   Language.mkSimple TargetArtifact MirState (EventualOut Empty MirVal) TargetSem
 
-/-- Spine-preserving `BehaviorCodec` connecting `MirLang` and `TargetLang`. -/
+/-- Canonical spine-preserving representation codec between `MirLang` and
+    `TargetLang`. -/
 @[candidate mir_semantics]
 def rustcCodec : BehaviorCodec MirLang TargetLang where
   encodeQuery s := s
@@ -314,27 +716,29 @@ def rustcCodec : BehaviorCodec MirLang TargetLang where
   decodeOut o   := some o
   decodeQuery_encodeQuery _ := rfl
   decodeOut_encodeOut _     := rfl
-  obs_decodeOut _ _ h       := by cases h; rfl
+  obs_decodeOut o₂ _ h      :=
+    congrArg (fun x => match x with | some v => v | none => o₂) h
 
-/-- Audited obligation identifier in a crate's `VerificationResult`. -/
+/-- Audited obligation identifier in a crate's verification unit. -/
 @[candidate mir_semantics]
 inductive TCBItem where
-  /-- Standard compiler lowering obligation for a function: `rustc` lowering is
-      sound on `body` (`Compiles MirLang TargetLang rustcCodec body (rustc
-      body)`). Tagged with `@[candidate rustc_capture]` because this waiver is
-      emitted by the `anneal-rustc-capture` pipeline when lowering a captured
-      function. -/
+  /-- Standard compiler lowering obligation for a function: `rustc` lowers
+      `body` soundly under `rustcCodec`
+      (`Compiles MirLang TargetLang rustcCodec body (rustc body)`). Tagged with
+      `@[candidate rustc_capture]` because this waiver is emitted by the
+      `anneal-rustc-capture` pipeline when lowering a captured function. -/
   | @[candidate rustc_capture] rustcLowering (fnName : String) (body : MirBody)
-  /-- Source-level MIR verification obligation for `fnName`: disallowed in
-      `defaultTrustPolicy` so it can never be waived and must always be proven
-      constructively via `Or.inr`. -/
+  /-- Behavioral verification obligation for a captured function `fnName`:
+      `MirSem body` refines its baseline UB-freedom obligation and all effective
+      specifications. Disallowed in `defaultTrustPolicy` so it can never be
+      waived. -/
   | fnVerified (fnName : String) (body : MirBody)
   /-- Explicit user-supplied axiom assumption (`#[anneal::axiom]`). -/
   | userAxiom (name : String) (prop : Prop)
 
 /-- Default trust policy: standard `rustc` lowering waivers are permitted;
-    function verification obligations and unapproved user axioms are rejected
-    (`False`). -/
+    function verification obligations and unapproved user axioms cannot be
+    waived (`False`). -/
 @[candidate mir_semantics]
 def defaultTrustPolicy : TrustPolicy TCBItem where
   isAllowed
@@ -342,47 +746,137 @@ def defaultTrustPolicy : TrustPolicy TCBItem where
     | .fnVerified _ _ => False
     | .userAxiom _ _ => False
 
+/-- Rust visibility and safety role of a captured function, determining what the
+    function may assume at entry and what it must guarantee to downstream
+    callers (`r[unsafety]`):
+    - `pubSafe traitLaws`: a public safe function (`pub fn`). Cannot attach an
+      unchecked caller precondition; must be UB-free and preserve `adtInv` on
+      every monomorphization-admitted call whose arguments satisfy `adtInv` and
+      whose generic `unsafe trait` bounds (`traitLaws`) hold.
+    - `pubUnsafe traitLaws safetyPre`: a public unsafe function
+      (`pub unsafe fn`). May additionally assume its documented `# Safety`
+      precondition `safetyPre`.
+    - `priv pre`: a crate-private function (`fn`). Not callable by downstream
+      crates; may use an internal precondition `pre` discharged at internal
+      call sites.
+
+    Source: https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/unsafety.md#L1-L35 -/
+@[candidate mir_semantics]
+inductive FnKind where
+  | pubSafe (traitLaws : Prop := True)
+  | pubUnsafe (traitLaws : Prop := True) (safetyPre : MirState → Prop)
+  | priv (pre : MirState → Prop := fun _ => True)
+
 /-- Captured MIR function pairing its identifier (`name`), lowered `MirBody`
-    (`prog`), caller safety precondition (`pre`, defaulting to `fun _ => True`
-    for safe functions), and additional specifications (`specs`, defaulting to
-    `[]`). -/
+    (`prog`), visibility/safety role (`kind`, defaulting to `.pubSafe True`),
+    and additional functional specifications (`specs`, defaulting to `[]`). -/
 @[candidate mir_semantics]
 structure CapturedFn where
   name : String
   prog : MirBody
-  pre : MirState → Prop := fun _ => True
+  kind : FnKind := .pubSafe True
   specs : List MirLang.Behavior := []
 
-/-- Proof obligations generated for a captured function `fn`:
-    1. `.rustcLowering fn.name fn.prog`: target compilation refinement
-       `Compiles MirLang TargetLang rustcCodec fn.prog (rustc fn.prog)`
-       (permitted to be waived in `c.tcb` by `defaultTrustPolicy`), and
-    2. `.fnVerified fn.name fn.prog`: source-level MIR verification of baseline
-       `MirLang.WellFormedOn fn.pre` together with `fn.specs` (disallowed in
-       `defaultTrustPolicy` so it must be proven constructively). -/
+/-- Canonical entry precondition of `fn` under the crate's ADT representation
+    invariant `adtInv`:
+    1. For `pubSafe`, generic `unsafe trait` laws hold and all arguments satisfy
+       `adtInv` (`argsMatchInv adtInv`).
+    2. For `pubUnsafe`, generic `unsafe trait` laws hold, all arguments satisfy
+       `adtInv`, and the caller satisfies `safetyPre s`.
+    3. For `priv`, the internal precondition `internalPre s` holds.
+
+    Note that Post-Monomorphization Error admission (`MonoAdmitted`) is already
+    enforced on the left-hand side of refinement inside `initMirState`
+    (`MirMachine.initState`), so `effectivePre` governs only caller-side
+    invariant and safety obligations. -/
 @[candidate mir_semantics]
-def CapturedFn.obligations (fn : CapturedFn) : List (Obligation TCBItem) :=
+def CapturedFn.effectivePre (adtInv : AdtInv) (fn : CapturedFn)
+    (s : MirState) : Prop :=
+  match fn.kind with
+  | .pubSafe traitLaws =>
+    traitLaws ∧
+    argsMatchInv adtInv s.tySizes fn.prog.argTys s.locals
+  | .pubUnsafe traitLaws safetyPre =>
+    traitLaws ∧
+    argsMatchInv adtInv s.tySizes fn.prog.argTys s.locals ∧
+    safetyPre s
+  | .priv internalPre =>
+    internalPre s
+
+/-- Canonical specification list of `fn` under `adtInv`: public functions
+    (`.pubSafe` and `.pubUnsafe`) automatically require `EnsuresRetLibInv` in
+    addition to user-supplied `fn.specs`. -/
+@[candidate mir_semantics]
+def CapturedFn.effectiveSpecs (adtInv : AdtInv) (fn : CapturedFn) :
+    List MirLang.Behavior :=
+  let pre := fn.effectivePre adtInv
+  match fn.kind with
+  | .pubSafe _ | .pubUnsafe _ _ =>
+    EnsuresRetLibInv adtInv fn.prog.retTy pre :: fn.specs
+  | .priv _ =>
+    fn.specs
+
+/-- Per-function obligation inventory under `adtInv`:
+    1. `.rustcLowering fn.name fn.prog`: `rustc` lowers `fn.prog` soundly to
+       `TargetLang` (`Compiles MirLang TargetLang rustcCodec fn.prog (rustc
+       fn.prog)`), and
+    2. `.fnVerified fn.name fn.prog`: `MirSem fn.prog` refines baseline
+       well-formedness `MirLang.WellFormedOn (fn.effectivePre adtInv)` and
+       every specification in `fn.effectiveSpecs adtInv`. -/
+@[candidate mir_semantics]
+def CapturedFn.obligations (adtInv : AdtInv) (fn : CapturedFn) :
+    List (Obligation TCBItem) :=
   [
     Obligation.compiles (.rustcLowering fn.name fn.prog)
       MirLang TargetLang rustcCodec fn.prog (rustc fn.prog),
     Obligation.wellFormedAndSpecsOn (.fnVerified fn.name fn.prog)
-      MirLang fn.pre fn.specs fn.prog
+      MirLang (fn.effectivePre adtInv) (fn.effectiveSpecs adtInv) fn.prog
   ]
 
-/-- Captured Rust crate bundling its functions and TCB audit log. -/
+/-- Proof obligation for an `unsafe impl` of an `unsafe trait` (or `unsafe impl
+    Copy`/`Clone` for a type with `unsafe` fields): under the `impl`'s generic
+    `where` bounds and PME admission (`whereBounds`), the crate's representation
+    invariant `adtInv` satisfies the trait's semantic law `traitLaw adtInv`.
+
+    Source: https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/items/implementations.md#L120-L135 -/
+@[candidate mir_semantics]
+structure UnsafeImplObligation where
+  implName : String
+  whereBounds : Prop := True
+  traitLaw : AdtInv → Prop
+
+/-- Captured Rust crate bundling its ADT declarations (`adts`), ADT
+    representation invariant (`adtInv`, defaulting to `defaultAdtInv`),
+    `unsafe impl` obligations (`unsafeImpls`), captured functions (`functions`),
+    and TCB waiver list (`tcb`). -/
 @[candidate mir_semantics]
 structure Crate where
+  adts : List AdtDecl := []
+  adtInv : AdtInv := defaultAdtInv
+  unsafeImpls : List UnsafeImplObligation := []
   functions : List CapturedFn
   tcb : List TCBItem
 
 /-- Top-level theorem required of every verified Rust crate:
     1. The crate contains at least one captured function (`c.functions ≠ []`).
-    2. Every captured function `fn ∈ c.functions` satisfies
-       `VerificationResult defaultTrustPolicy c.tcb fn.obligations`. -/
+    2. The crate's ADT representation invariant is admissible (`AdmissibleAdtInv
+       c.adts c.adtInv`): it respects public-safe struct field construction.
+    3. Every `unsafe impl` in `c.unsafeImpls` satisfies its `unsafe trait` law
+       relative to `c.adtInv`.
+    4. Every captured function `fn ∈ c.functions` satisfies
+       `VerificationResult defaultTrustPolicy c.tcb (fn.obligations c.adtInv)`
+       —checking that every waiver in `c.tcb` complies with
+       `defaultTrustPolicy` and every obligation in `fn.obligations c.adtInv`
+       either is listed in `c.tcb` (`Or.inl`, permitted only for
+       `.rustcLowering`) or holds constructively (`Or.inr`, required for
+       `.fnVerified`), with zero antecedent implications (`→`) that could
+       contaminate sibling obligations. -/
 @[candidate mir_semantics]
 def CrateTheorem (c : Crate) : Prop :=
   c.functions ≠ [] ∧
+  AdmissibleAdtInv c.adts c.adtInv ∧
+  AllHold (c.unsafeImpls.map (fun u => u.whereBounds → u.traitLaw c.adtInv)) ∧
   AllHold (c.functions.map (fun fn =>
-    VerificationResult defaultTrustPolicy c.tcb fn.obligations))
+    VerificationResult defaultTrustPolicy c.tcb (fn.obligations c.adtInv)))
 
 end Trusted
