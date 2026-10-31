@@ -10,3 +10,4 @@ prelude
 import Init.NotationExtra
 import Trusted.Attributes
 import Trusted.Refinement
+import Trusted.StepResult
