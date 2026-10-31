@@ -6,25 +6,50 @@
 // This file may not be copied, modified, or distributed except according to
 // those terms.
 
-//! CLI entrypoint for `anneal-rustc-capture`.
+//! Standalone CLI entry point for `anneal-rustc-capture`.
+//!
+//! Invoked as a subprocess by `cargo-anneal` to compile a target crate, extract
+//! its lowered MIR into `.anneal/Mir.lean`, print captured function names to
+//! stdout, and optionally emit a candidate `.anneal/Proof.lean`.
 
-use std::env;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
+use anneal_rustc_capture::{CaptureError, capture_crate_with_options};
+use clap::Parser;
+
+#[derive(Debug, Parser)]
+#[command(name = "anneal-rustc-capture", version, about)]
+struct Cli {
+    /// Also synthesize a candidate `.anneal/Proof.lean` script.
+    #[arg(long)]
+    emit_proof: bool,
+
+    /// Path to the target Rust crate directory.
+    crate_dir: PathBuf,
+}
+
 fn main() -> ExitCode {
-    for arg in env::args().skip(1) {
-        match arg.as_str() {
-            "--help" | "-h" => {
-                println!("Usage: anneal-rustc-capture [--version] <crate-dir>");
-                return ExitCode::SUCCESS;
+    let cli = Cli::parse();
+
+    match capture_crate_with_options(&cli.crate_dir, cli.emit_proof) {
+        Ok(output) => {
+            for func in &output.functions {
+                println!("{}", func.name);
             }
-            "--version" | "-V" => {
-                println!("anneal-rustc-capture {}", env!("CARGO_PKG_VERSION"));
-                return ExitCode::SUCCESS;
-            }
-            _ => {}
+            ExitCode::SUCCESS
+        }
+        Err(CaptureError::Io(msg)) => {
+            eprintln!("IO_ERROR: {msg}");
+            ExitCode::from(1)
+        }
+        Err(CaptureError::CompilationFailed(msg)) => {
+            eprintln!("COMPILATION_FAILED: {msg}");
+            ExitCode::from(1)
+        }
+        Err(CaptureError::UnsupportedMir(msg)) => {
+            eprintln!("UNSUPPORTED_MIR: {msg}");
+            ExitCode::from(1)
         }
     }
-    eprintln!("anneal-rustc-capture: MIR capture not yet implemented");
-    ExitCode::from(1)
 }
