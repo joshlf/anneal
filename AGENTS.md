@@ -76,3 +76,14 @@ verification sessions (`cargo anneal lock-specs` followed by
 writable; specification overrides (`anneal/proofs/Specs/**`), assumption modules
 (`anneal/proofs/Assumptions/**`), and generated assembly (`.anneal/**`) are
 locked and audited.
+
+## Commenting in `trusted/`
+
+Because auditing `trusted/` alone must suffice to verify that Anneal upholds
+[`PRINCIPLES.md`](PRINCIPLES.md), all code in `trusted/` will undergo careful
+human review. Human understanding is therefore paramount in `trusted/`: comment
+liberally using `comment-guidelines` (and its companion writing skills) so a
+human auditor can verify the design rationale, invariants, assumptions, contracts,
+and subtle semantic or implementation choices without reconstructing unstated context.
+Include Lean comment markers (`--`, `/--`, `/-!`) alongside Rust comment markers
+(`//`, `///`, `//!`).
