@@ -327,3 +327,184 @@ fn verifies_via_cli_flag_and_emits_candidate_tcb_audit_section() {
     assert!(stdout.contains("rustc_capture"));
     assert!(stdout.contains("mir_semantics"));
 }
+
+#[test]
+fn verifies_library_crate_with_assoc_const_pme_and_wrapper() {
+    let crate_dir = TempCrateDir::new(
+        "assoc-const-pme-lib",
+        "pub trait SizeEq<Src, Dst> {\n    \
+             const ASSERT: ();\n\
+         }\n\
+         impl<Src, Dst> SizeEq<Src, Dst> for () {\n    \
+             const ASSERT: () = assert!(core::mem::size_of::<Src>() == core::mem::size_of::<Dst>());\n\
+         }\n\
+         pub fn transmute_checked<Src: Copy, Dst: Copy>(x: Src) -> Dst {\n    \
+             let () = <() as SizeEq<Src, Dst>>::ASSERT;\n    \
+             unsafe { core::mem::transmute_copy(&x) }\n\
+         }\n\
+         pub fn outer_transmute<Src: Copy, Dst: Copy>(x: Src) -> Dst {\n    \
+             transmute_checked::<Src, Dst>(x)\n\
+         }\n",
+    );
+
+    let bin = env!("CARGO_BIN_EXE_cargo-anneal");
+    let output = Command::new(bin)
+        .arg("anneal")
+        .arg("verify")
+        .arg(&crate_dir.path)
+        .output()
+        .expect("invoke cargo-anneal binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "expected PME library crate verification to succeed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let mir_lean =
+        fs::read_to_string(crate_dir.path.join(".anneal/Mir.lean")).unwrap();
+    assert!(mir_lean.contains("def pme_assert_const_body : Trusted.MirBody"));
+    assert!(mir_lean.contains("requiredConsts := [pme_assert_const_body]"));
+    assert!(mir_lean.contains("Trusted.Terminator.call1 ⟨0⟩ transmute_checked_body"));
+}
+
+#[test]
+fn verifies_library_crate_with_inline_const_pme() {
+    let crate_dir = TempCrateDir::new(
+        "inline-const-pme-lib",
+        "pub fn inline_const_transmute<Src: Copy, Dst: Copy>(x: Src) -> Dst {\n    \
+             let () = const { assert!(core::mem::size_of::<Src>() == core::mem::size_of::<Dst>()) };\n    \
+             unsafe { core::mem::transmute_copy(&x) }\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 1);
+    assert_eq!(output.functions[0].name, "inline_const_transmute");
+    let mir_lean = fs::read_to_string(&output.mir_lean_path).unwrap();
+    assert!(mir_lean.contains("requiredConsts := [pme_assert_const_body]"));
+}
+
+#[test]
+fn rejects_transmute_without_pme_assertion() {
+    let crate_dir = TempCrateDir::new(
+        "transmute-without-pme",
+        "pub fn transmute_unchecked<Src: Copy, Dst: Copy>(x: Src) -> Dst {\n    \
+             unsafe { core::mem::transmute_copy(&x) }\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean kernel rejection when PME size assertion is omitted, got: {err}"
+    );
+}
+
+#[test]
+fn verifies_nonzero_library_crate_with_safe_and_unsafe_apis() {
+    let crate_dir = TempCrateDir::new(
+        "nonzero-lib",
+        "#[repr(transparent)]\n\
+         pub struct NonZeroUsize {\n    \
+             val: usize,\n\
+         }\n\
+         pub fn make_nonzero(x: usize) -> NonZeroUsize {\n    \
+             if x == 0 {\n        \
+                 NonZeroUsize { val: 1 }\n    \
+             } else {\n        \
+                 NonZeroUsize { val: x }\n    \
+             }\n\
+         }\n\
+         pub unsafe fn new_unchecked(x: usize) -> NonZeroUsize {\n    \
+             NonZeroUsize { val: x }\n\
+         }\n\
+         pub fn get_unchecked_nonzero(x: NonZeroUsize) -> usize {\n    \
+             if x.val == 0 {\n        \
+                 unsafe { core::hint::unreachable_unchecked() }\n    \
+             } else {\n        \
+                 x.val\n    \
+             }\n\
+         }\n",
+    );
+
+    let output =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap();
+    assert_eq!(output.functions.len(), 3);
+
+    let mir_lean = fs::read_to_string(&output.mir_lean_path).unwrap();
+    assert!(mir_lean.contains("access := Trusted.FieldAccess.priv"));
+    assert!(mir_lean.contains("adtInv := nonZeroAdtInv"));
+    assert!(mir_lean.contains(
+        "kind := Trusted.FnKind.pubUnsafe True newUncheckedSafetyPre"
+    ));
+}
+
+#[test]
+fn rejects_nonzero_library_when_safe_fn_violates_invariant() {
+    let crate_dir = TempCrateDir::new(
+        "nonzero-buggy-zero",
+        "#[repr(transparent)]\n\
+         pub struct NonZeroUsize {\n    \
+             val: usize,\n\
+         }\n\
+         pub fn make_nonzero(_x: usize) -> NonZeroUsize {\n    \
+             NonZeroUsize { val: 0 }\n\
+         }\n\
+         pub unsafe fn new_unchecked(x: usize) -> NonZeroUsize {\n    \
+             NonZeroUsize { val: x }\n\
+         }\n\
+         pub fn get_unchecked_nonzero(x: NonZeroUsize) -> usize {\n    \
+             if x.val == 0 {\n        \
+                 unsafe { core::hint::unreachable_unchecked() }\n    \
+             } else {\n        \
+                 x.val\n    \
+             }\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean kernel rejection when safe constructor returns 0, got: {err}"
+    );
+}
+
+#[test]
+fn rejects_nonzero_library_when_field_is_pub_safe() {
+    let crate_dir = TempCrateDir::new(
+        "nonzero-pub-field",
+        "#[repr(transparent)]\n\
+         pub struct NonZeroUsize {\n    \
+             pub val: usize,\n\
+         }\n\
+         pub fn make_nonzero(x: usize) -> NonZeroUsize {\n    \
+             if x == 0 {\n        \
+                 NonZeroUsize { val: 1 }\n    \
+             } else {\n        \
+                 NonZeroUsize { val: x }\n    \
+             }\n\
+         }\n\
+         pub unsafe fn new_unchecked(x: usize) -> NonZeroUsize {\n    \
+             NonZeroUsize { val: x }\n\
+         }\n\
+         pub fn get_unchecked_nonzero(x: NonZeroUsize) -> usize {\n    \
+             if x.val == 0 {\n        \
+                 unsafe { core::hint::unreachable_unchecked() }\n    \
+             } else {\n        \
+                 x.val\n    \
+             }\n\
+         }\n",
+    );
+
+    let err =
+        verify_crate(&crate_dir.path, &VerifyOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, VerifyError::AuditRejected { .. }),
+        "expected Lean kernel rejection when NonZeroUsize field is pubSafe, got: {err}"
+    );
+}
