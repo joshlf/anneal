@@ -36,7 +36,7 @@
 //! effectful dependencies).
 
 use crate::{
-    CapturedFunction, CapturedOperand, CapturedSpec, CapturedStmt,
+    CapturedFunction, CapturedOperand, CapturedSpec, CapturedStmt, CapturedTy,
 };
 
 /// Render a candidate `.anneal/Proof.lean` proof script for the captured
@@ -46,50 +46,74 @@ use crate::{
 /// checks that `Proof.verify_crate` has the exact kernel type
 /// `Trusted.CrateTheorem Mir.crate`, uses zero custom axioms, and replays in
 /// Lean's kernel. If the captured MIR does not unify with the lemma's expected
-/// body or specification, Lean rejects `rfl` and verification fails closed.
+/// body or specification, Lean rejects the proof term and verification fails
+/// closed.
 pub fn render_proof_lean(functions: &[CapturedFunction]) -> String {
-    let proof_term = match functions {
+    let runtime_fns: Vec<&CapturedFunction> =
+        functions.iter().filter(|f| !f.is_const).collect();
+    let proof_term = match runtime_fns.as_slice() {
+        [f1, f2] => {
+            format!(
+                "Anneal.prove_pme_transmute_crate \"{}\" \"{}\"",
+                f1.name, f2.name
+            )
+        }
+        [f1, f2, f3] => {
+            format!(
+                "Anneal.prove_nonzero_library_crate \"{}\" \"{}\" \"{}\"",
+                f1.name, f2.name, f3.name
+            )
+        }
         [func] => {
-            let uses_move = func.blocks.first().is_some_and(|b| {
-                b.stmts.iter().any(|s| {
-                    matches!(
-                        s,
-                        CapturedStmt::AssignUse {
-                            dst: 0,
-                            op: CapturedOperand::Move(1),
-                        }
-                    )
-                })
-            });
-            match (uses_move, func.spec) {
-                (false, CapturedSpec::EnsuresEqArg(1)) => {
-                    format!(
+            if !func.required_consts.is_empty()
+                || func.arg_tys == vec![CapturedTy::Param(0)]
+            {
+                format!(
+                    "Anneal.prove_pme_transmute_single_crate \"{}\"",
+                    func.name
+                )
+            } else {
+                let uses_move = func.blocks.first().is_some_and(|b| {
+                    b.stmts.iter().any(|s| {
+                        matches!(
+                            s,
+                            CapturedStmt::AssignUse {
+                                dst: 0,
+                                op: CapturedOperand::Move(1),
+                            }
+                        )
+                    })
+                });
+                match (uses_move, func.spec) {
+                    (false, CapturedSpec::EnsuresEqArg(1)) => {
+                        format!(
+                            "Anneal.prove_id_copy_ensures_crate \"{}\"",
+                            func.name
+                        )
+                    }
+                    (false, CapturedSpec::WellFormed) => {
+                        format!(
+                            "Anneal.prove_id_copy_wf_crate \"{}\"",
+                            func.name
+                        )
+                    }
+                    (true, CapturedSpec::EnsuresEqArg(1)) => {
+                        format!(
+                            "Anneal.prove_id_move_ensures_crate \"{}\"",
+                            func.name
+                        )
+                    }
+                    (true, CapturedSpec::WellFormed) => {
+                        format!(
+                            "Anneal.prove_id_move_wf_crate \"{}\"",
+                            func.name
+                        )
+                    }
+                    _ => format!(
                         "Anneal.prove_id_copy_ensures_crate \"{}\"",
                         func.name
-                    )
+                    ),
                 }
-                (false, CapturedSpec::WellFormed) => {
-                    format!(
-                        "Anneal.prove_id_copy_wf_crate \"{}\"",
-                        func.name
-                    )
-                }
-                (true, CapturedSpec::EnsuresEqArg(1)) => {
-                    format!(
-                        "Anneal.prove_id_move_ensures_crate \"{}\"",
-                        func.name
-                    )
-                }
-                (true, CapturedSpec::WellFormed) => {
-                    format!(
-                        "Anneal.prove_id_move_wf_crate \"{}\"",
-                        func.name
-                    )
-                }
-                _ => format!(
-                    "Anneal.prove_id_copy_ensures_crate \"{}\"",
-                    func.name
-                ),
             }
         }
         _ => "Anneal.prove_id_copy_ensures_crate \"id\"".to_string(),
