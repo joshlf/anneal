@@ -83,9 +83,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 /// JSON value representation used for `foundation-lock.json` and the
@@ -136,9 +139,10 @@ pub enum ReleaseChannel {
     Stable,
 }
 
-impl ReleaseChannel {
-    /// Parse `"alpha"` or `"stable"`.
-    pub fn parse(s: &str) -> Result<Self, String> {
+impl FromStr for ReleaseChannel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "alpha" => Ok(Self::Alpha),
             "stable" => Ok(Self::Stable),
@@ -146,6 +150,13 @@ impl ReleaseChannel {
                 "unknown release channel `{other}` (expected `alpha` or `stable`)"
             )),
         }
+    }
+}
+
+impl ReleaseChannel {
+    /// Parse `"alpha"` or `"stable"`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        s.parse()
     }
 }
 
@@ -211,6 +222,40 @@ impl CrateTrustPolicy {
     }
 }
 
+#[derive(Deserialize, Default)]
+struct CrateCargoManifest {
+    #[serde(default)]
+    package: Option<CrateCargoPackage>,
+}
+
+#[derive(Deserialize, Default)]
+struct CrateCargoPackage {
+    #[serde(default)]
+    metadata: Option<CrateCargoMetadata>,
+}
+
+#[derive(Deserialize, Default)]
+struct CrateCargoMetadata {
+    #[serde(default)]
+    anneal: Option<CrateAnnealMetadata>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+struct CrateAnnealMetadata {
+    #[serde(default)]
+    trust_policy: Option<CrateTrustPolicyToml>,
+    #[serde(default)]
+    allow_candidate_features: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+struct CrateTrustPolicyToml {
+    #[serde(default)]
+    allow_candidate_features: Option<Vec<String>>,
+}
+
 /// Resolve the target crate's [`CrateTrustPolicy`] from
 /// `[package.metadata.anneal.trust-policy] allow-candidate-features` in
 /// `crate_dir/Cargo.toml` and any explicit CLI/API override.
@@ -224,7 +269,8 @@ pub fn load_crate_trust_policy(
 ) -> Result<CrateTrustPolicy, Failure> {
     let mut policy = CrateTrustPolicy::vetted_only();
     let cargo_toml_path = crate_dir.join("Cargo.toml");
-    if cargo_toml_path.is_file() {
+    if fs::symlink_metadata(&cargo_toml_path).is_ok() {
+        regular(&cargo_toml_path, "candidate-policy")?;
         let text = fs::read_to_string(&cargo_toml_path).map_err(|e| {
             Failure::new(
                 1,
@@ -232,7 +278,7 @@ pub fn load_crate_trust_policy(
                 format!("cannot read {}: {e}", cargo_toml_path.display()),
             )
         })?;
-        let toml: toml::Value = toml::from_str(&text).map_err(|e| {
+        let manifest: CrateCargoManifest = toml::from_str(&text).map_err(|e| {
             Failure::new(
                 1,
                 "candidate-policy",
@@ -242,34 +288,16 @@ pub fn load_crate_trust_policy(
                 ),
             )
         })?;
-        let allow_val = toml
-            .get("package")
-            .and_then(|p| p.get("metadata"))
-            .and_then(|m| m.get("anneal"))
+        let allow_names = manifest
+            .package
+            .and_then(|p| p.metadata)
+            .and_then(|m| m.anneal)
             .and_then(|a| {
-                a.get("trust-policy")
-                    .and_then(|tp| tp.get("allow-candidate-features"))
-                    .or_else(|| a.get("allow-candidate-features"))
+                a.trust_policy
+                    .and_then(|tp| tp.allow_candidate_features)
+                    .or(a.allow_candidate_features)
             });
-        if let Some(val) = allow_val {
-            let arr = val.as_array().ok_or_else(|| {
-                Failure::new(
-                    1,
-                    "candidate-policy",
-                    "allow-candidate-features in Cargo.toml must be an array of strings",
-                )
-            })?;
-            let mut names = Vec::with_capacity(arr.len());
-            for item in arr {
-                let s = item.as_str().ok_or_else(|| {
-                    Failure::new(
-                        1,
-                        "candidate-policy",
-                        "allow-candidate-features in Cargo.toml must contain only strings",
-                    )
-                })?;
-                names.push(s.to_string());
-            }
+        if let Some(names) = allow_names {
             policy.merge(CrateTrustPolicy::from_feature_list(&names)?);
         }
     }
@@ -286,6 +314,7 @@ pub fn load_crate_trust_policy(
 struct VerifyPrefixKey {
     checkout: PathBuf,
     lean: PathBuf,
+    key_sha256: String,
     sources: BTreeMap<String, Vec<u8>>,
 }
 
@@ -306,8 +335,6 @@ struct CachedVerifyPrefix {
     report: Json,
     compiled_artifacts_rel: BTreeMap<String, Vec<Vec<String>>>,
     graph: serde_json::Map<String, Json>,
-    modules: BTreeMap<String, PathBuf>,
-    theory_modules: BTreeMap<String, PathBuf>,
     trust_declarations: Vec<Json>,
     files: Vec<CachedArtifactFile>,
 }
@@ -364,6 +391,64 @@ pub fn regular(path: &Path, phase: &str) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Compute the lowercase hex-encoded FIPS 180-4 SHA-256 digest of `data`.
+pub fn sha256_bytes(data: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(data))
+}
+
+/// Verify that `path` is a regular file and return its lowercase hex SHA-256
+/// digest.
+pub fn sha256_file(path: &Path, phase: &str) -> Result<String, Failure> {
+    regular(path, phase)?;
+    let bytes = fs::read(path).map_err(|e| {
+        Failure::new(
+            2,
+            phase,
+            format!("cannot read {}: {e}", path.display()),
+        )
+    })?;
+    Ok(sha256_bytes(&bytes))
+}
+
+/// Copy a regular source file `src` to `dst`, creating parent directories as
+/// needed, and return the SHA-256 digest of the copied bytes.
+fn stage_regular_file(
+    src: &Path,
+    dst: &Path,
+    phase: &str,
+) -> Result<String, Failure> {
+    regular(src, phase)?;
+    let bytes = fs::read(src).map_err(|e| {
+        Failure::new(
+            2,
+            phase,
+            format!("cannot read {}: {e}", src.display()),
+        )
+    })?;
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            Failure::new(
+                2,
+                phase,
+                format!("cannot create {}: {e}", parent.display()),
+            )
+        })?;
+    }
+    fs::write(dst, &bytes).map_err(|e| {
+        Failure::new(
+            2,
+            phase,
+            format!("cannot write {}: {e}", dst.display()),
+        )
+    })?;
+    Ok(sha256_bytes(&bytes))
+}
+
+/// Return `true` if `s` is a 64-character ASCII hex digest.
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Return `true` if `s` is a valid ASCII Lean module identifier component.
 fn is_lean_ident(s: &str) -> bool {
     let mut chars = s.chars();
@@ -374,9 +459,133 @@ fn is_lean_ident(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Verify Cargo workspace DAG containment: all workspace crates must reside
-/// under `trusted/`, and no workspace crate may depend on a path outside
-/// `trusted/`.
+/// Reject `.cargo*`, `rust-toolchain*`, and `.gitmodules` overrides at the
+/// repository root (including case-insensitive directory entries).
+fn reject_cargo_toolchain_overrides(checkout: &Path) -> Result<(), Failure> {
+    let phase = "cargo-boundary";
+    for forbidden in [
+        ".cargo",
+        ".cargo/config",
+        ".cargo/config.toml",
+        "rust-toolchain",
+        "rust-toolchain.toml",
+        ".gitmodules",
+    ] {
+        if fs::symlink_metadata(checkout.join(forbidden)).is_ok() {
+            return Err(Failure::new(
+                1,
+                phase,
+                format!("forbidden Cargo/toolchain override at repository root: {forbidden}"),
+            ));
+        }
+    }
+    if let Ok(entries) = fs::read_dir(checkout) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if name == ".cargo"
+                || name == ".gitmodules"
+                || name == "rust-toolchain"
+                || name.starts_with("rust-toolchain.")
+            {
+                return Err(Failure::new(
+                    1,
+                    phase,
+                    format!(
+                        "forbidden Cargo/toolchain override at repository root: {}",
+                        entry.file_name().to_string_lossy()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject `.cargo*` and `rust-toolchain*` overrides at `checkout`, and run
+/// [`check_cargo_boundary`] whenever any Cargo or root-manifest TCB file is
+/// present.
+fn check_checkout_cargo_hygiene(checkout: &Path) -> Result<(), Failure> {
+    reject_cargo_toolchain_overrides(checkout)?;
+    if ["Cargo.toml", "Cargo.lock", "trusted/root-manifest.sha256", "trusted/rustc-capture"]
+        .iter()
+        .any(|rel| fs::symlink_metadata(checkout.join(rel)).is_ok())
+    {
+        check_cargo_boundary(checkout)?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CargoLockFile {
+    version: Option<i64>,
+    #[serde(default)]
+    package: Vec<CargoLockPackage>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CargoLockPackage {
+    name: String,
+    #[allow(dead_code)]
+    version: String,
+    source: Option<String>,
+    checksum: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    dependencies: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootCargoManifest {
+    workspace: RootCargoWorkspace,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootCargoWorkspace {
+    members: Vec<String>,
+    resolver: Option<String>,
+}
+
+/// Verify that a relative target path inside a workspace member `Cargo.toml`
+/// does not use `..` or an absolute path to escape the member directory.
+fn validate_member_target_path(
+    member: &str,
+    section: &str,
+    target_table: &toml::map::Map<String, toml::Value>,
+) -> Result<(), Failure> {
+    if let Some(path_val) = target_table.get("path") {
+        let Some(p) = path_val.as_str() else {
+            return Err(Failure::new(
+                1,
+                "cargo-boundary",
+                format!("invalid {section}.path in {member}/Cargo.toml"),
+            ));
+        };
+        let path = Path::new(p);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(Failure::new(
+                1,
+                "cargo-boundary",
+                format!(
+                    "{member} target {section}.path escapes member directory: {p}"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Verify Cargo workspace DAG containment, root Cargo/toolchain hygiene,
+/// `Cargo.lock` dependency provenance, and `trusted/root-manifest.sha256` (when
+/// present): all workspace crates must reside under `trusted/`, and no
+/// workspace crate may depend on a path outside `workspace.members`.
 ///
 /// Unlike Lean modules in `theory/`, which are restricted to pure definitions
 /// and checked by the Lean 4 kernel, Rust crates can execute arbitrary code at
@@ -385,45 +594,112 @@ fn is_lean_ident(s: &str) -> bool {
 /// effectful TCB and must live inside `trusted/`.
 pub fn check_cargo_boundary(checkout: &Path) -> Result<(), Failure> {
     let phase = "cargo-boundary";
+    reject_cargo_toolchain_overrides(checkout)?;
     let root_toml_path = checkout.join("Cargo.toml");
     let trusted_toml_path = checkout.join("trusted/rustc-capture/Cargo.toml");
     regular(&root_toml_path, phase)?;
     regular(&trusted_toml_path, phase)?;
 
+    let manifest_path = checkout.join("trusted/root-manifest.sha256");
+    if fs::symlink_metadata(&manifest_path).is_ok() {
+        regular(&manifest_path, phase)?;
+        let manifest_text = fs::read_to_string(&manifest_path).map_err(|e| {
+            Failure::new(1, phase, format!("cannot read root-manifest.sha256: {e}"))
+        })?;
+        let mut seen_manifest_paths = BTreeSet::new();
+        for raw_line in manifest_text.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((expected_hex, rel_path)) = line.split_once("  ") else {
+                return Err(Failure::new(
+                    1,
+                    phase,
+                    format!("malformed line in root-manifest.sha256: {line}"),
+                ));
+            };
+            if !is_sha256_hex(expected_hex)
+                || !Path::new(rel_path)
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+                || !seen_manifest_paths.insert(rel_path.to_string())
+            {
+                return Err(Failure::new(
+                    1,
+                    phase,
+                    format!("invalid or duplicate entry in root-manifest.sha256: {line}"),
+                ));
+            }
+            let actual_hex = sha256_file(&checkout.join(rel_path), phase).map_err(
+                |e| Failure::new(1, phase, e.message),
+            )?;
+            if !actual_hex.eq_ignore_ascii_case(expected_hex) {
+                return Err(Failure::new(
+                    1,
+                    phase,
+                    format!(
+                        "root TCB manifest digest mismatch for {rel_path}: expected {expected_hex}, got {actual_hex}"
+                    ),
+                ));
+            }
+        }
+        for required_rel in ["Cargo.toml", "Cargo.lock", "flake.nix", "flake.lock"] {
+            if !seen_manifest_paths.contains(required_rel) {
+                return Err(Failure::new(
+                    1,
+                    phase,
+                    format!("root-manifest.sha256 missing required entry: {required_rel}"),
+                ));
+            }
+        }
+    }
+
     let root_text = fs::read_to_string(&root_toml_path).map_err(|e| {
         Failure::new(1, phase, format!("malformed Cargo manifest: {e}"))
     })?;
-    let root_toml: toml::Value = toml::from_str(&root_text).map_err(|e| {
-        Failure::new(1, phase, format!("malformed Cargo manifest: {e}"))
-    })?;
-
-    let members = root_toml
-        .get("workspace")
-        .and_then(|w| w.get("members"))
-        .and_then(toml::Value::as_array)
-        .ok_or_else(|| {
-            Failure::new(1, phase, "missing workspace.members in root Cargo.toml")
+    let root_manifest: RootCargoManifest =
+        toml::from_str(&root_text).map_err(|e| {
+            Failure::new(
+                1,
+                phase,
+                format!("root Cargo.toml may contain only [workspace]: {e}"),
+            )
         })?;
+    if root_manifest.workspace.resolver.as_deref() != Some("2") {
+        return Err(Failure::new(
+            1,
+            phase,
+            "root [workspace] resolver must be \"2\"",
+        ));
+    }
 
     let checkout_canon = fs::canonicalize(checkout).map_err(|e| {
         Failure::new(2, phase, format!("cannot canonicalize checkout: {e}"))
     })?;
 
-    let mut has_rustc_capture = false;
+    let member_set: BTreeSet<String> =
+        root_manifest.workspace.members.iter().cloned().collect();
+    if !member_set.contains("trusted/rustc-capture") {
+        return Err(Failure::new(
+            1,
+            phase,
+            "trusted/rustc-capture missing from workspace.members",
+        ));
+    }
 
-    for member_val in members {
-        let member = member_val.as_str().ok_or_else(|| {
-            Failure::new(1, phase, "non-string workspace member")
-        })?;
-        if !member.starts_with("trusted/") {
+    let mut member_pkg_names = BTreeSet::new();
+
+    for member in &root_manifest.workspace.members {
+        let is_clean_rel = Path::new(member)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !is_clean_rel || !member.starts_with("trusted/") {
             return Err(Failure::new(
                 1,
                 phase,
                 format!("workspace member outside trusted/: {member}"),
             ));
-        }
-        if member == "trusted/rustc-capture" {
-            has_rustc_capture = true;
         }
         let member_toml_path = checkout.join(member).join("Cargo.toml");
         regular(&member_toml_path, phase)?;
@@ -442,9 +718,18 @@ pub fn check_cargo_boundary(checkout: &Path) -> Result<(), Failure> {
                     format!("malformed member Cargo.toml in {member}: {e}"),
                 )
             })?;
-        let _pkg_name = member_toml
+        let pkg_table = member_toml
             .get("package")
-            .and_then(|p| p.get("name"))
+            .and_then(toml::Value::as_table)
+            .ok_or_else(|| {
+                Failure::new(
+                    1,
+                    phase,
+                    format!("missing [package] in {member}/Cargo.toml"),
+                )
+            })?;
+        let pkg_name = pkg_table
+            .get("name")
             .and_then(toml::Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
@@ -454,11 +739,35 @@ pub fn check_cargo_boundary(checkout: &Path) -> Result<(), Failure> {
                     format!("missing package.name in {member}"),
                 )
             })?;
+        member_pkg_names.insert(pkg_name.to_string());
+
+        if pkg_table.contains_key("build") || pkg_table.contains_key("workspace") {
+            return Err(Failure::new(
+                1,
+                phase,
+                format!(
+                    "disallowed package.build or package.workspace in {member}/Cargo.toml"
+                ),
+            ));
+        }
+
+        if let Some(lib_table) = member_toml.get("lib").and_then(toml::Value::as_table) {
+            validate_member_target_path(member, "lib", lib_table)?;
+        }
+        for target_sec in ["bin", "example", "test", "bench"] {
+            if let Some(arr) = member_toml.get(target_sec).and_then(toml::Value::as_array) {
+                for item in arr {
+                    if let Some(tbl) = item.as_table() {
+                        validate_member_target_path(member, target_sec, tbl)?;
+                    }
+                }
+            }
+        }
 
         let member_parent = member_toml_path.parent().unwrap();
         // Canonicalize each `path` dependency before checking its prefix
         // against `checkout_canon` so `..` segments or symlinks cannot escape
-        // `trusted/`.
+        // `trusted/` or target a crate outside `workspace.members`.
         let check_dep_table = |table_opt: Option<&toml::Value>,
                                section: &str|
          -> Result<(), Failure> {
@@ -472,33 +781,68 @@ pub fn check_cargo_boundary(checkout: &Path) -> Result<(), Failure> {
                     format!("invalid {section} in {member}/Cargo.toml"),
                 )
             })?;
-            for (_dep_name, spec) in table {
-                if let Some(spec_obj) = spec.as_table()
-                    && let Some(dep_path) =
-                        spec_obj.get("path").and_then(toml::Value::as_str)
-                {
-                    let joined = member_parent.join(dep_path);
-                    let resolved = fs::canonicalize(&joined).unwrap_or(joined);
-                    let rel = resolved
-                        .strip_prefix(&checkout_canon)
-                        .map_err(|_| {
-                            Failure::new(
-                                1,
-                                phase,
-                                format!(
-                                    "{member} path dependency escapes checkout: {dep_path}"
-                                ),
-                            )
-                        })?;
-                    let rel_str = rel.to_string_lossy().replace('\\', "/");
-                    if !rel_str.starts_with("trusted/") {
+            for (dep_name, spec) in table {
+                if let Some(spec_obj) = spec.as_table() {
+                    if spec_obj.contains_key("git") || spec_obj.contains_key("registry") {
                         return Err(Failure::new(
                             1,
                             phase,
                             format!(
-                                "{member} path dependency points outside trusted/: {rel_str}"
+                                "disallowed git or custom-registry dependency {dep_name} in {member}/Cargo.toml"
                             ),
                         ));
+                    }
+                    if let Some(path_val) = spec_obj.get("path") {
+                        let Some(dep_path) = path_val.as_str() else {
+                            return Err(Failure::new(
+                                1,
+                                phase,
+                                format!(
+                                    "non-string path dependency {dep_name} in {member}/Cargo.toml"
+                                ),
+                            ));
+                        };
+                        let joined = member_parent.join(dep_path);
+                        let resolved = fs::canonicalize(&joined).map_err(|_| {
+                            Failure::new(
+                                1,
+                                phase,
+                                format!(
+                                    "{member} path dependency target does not exist: {dep_path}"
+                                ),
+                            )
+                        })?;
+                        let rel = resolved
+                            .strip_prefix(&checkout_canon)
+                            .map_err(|_| {
+                                Failure::new(
+                                    1,
+                                    phase,
+                                    format!(
+                                        "{member} path dependency escapes checkout: {dep_path}"
+                                    ),
+                                )
+                            })?;
+                        let rel_str = rel.to_string_lossy().replace('\\', "/");
+                        if !rel_str.starts_with("trusted/") {
+                            return Err(Failure::new(
+                                1,
+                                phase,
+                                format!(
+                                    "{member} path dependency points outside trusted/: {rel_str}"
+                                ),
+                            ));
+                        }
+                        if !member_set.contains(&rel_str) {
+                            return Err(Failure::new(
+                                1,
+                                phase,
+                                format!(
+                                    "{member} path dependency points to non-member crate: {rel_str}"
+                                ),
+                            ));
+                        }
+                        regular(&resolved.join("Cargo.toml"), phase)?;
                     }
                 }
             }
@@ -530,29 +874,73 @@ pub fn check_cargo_boundary(checkout: &Path) -> Result<(), Failure> {
             }
         }
     }
-    if !has_rustc_capture {
-        return Err(Failure::new(
-            1,
-            phase,
-            "trusted/rustc-capture missing from workspace.members",
-        ));
+
+    let lock_path = checkout.join("Cargo.lock");
+    if fs::symlink_metadata(&lock_path).is_ok() {
+        regular(&lock_path, phase)?;
+        let lock_text = fs::read_to_string(&lock_path).map_err(|e| {
+            Failure::new(1, phase, format!("cannot read Cargo.lock: {e}"))
+        })?;
+        let lock_file: CargoLockFile = toml::from_str(&lock_text).map_err(|e| {
+            Failure::new(1, phase, format!("malformed Cargo.lock: {e}"))
+        })?;
+        if lock_file.version != Some(4) {
+            return Err(Failure::new(
+                1,
+                phase,
+                "Cargo.lock must have version = 4",
+            ));
+        }
+        for pkg in &lock_file.package {
+            let pkg_name = pkg.name.as_str();
+            if let Some(src) = pkg.source.as_deref() {
+                if src != "registry+https://github.com/rust-lang/crates.io-index" {
+                    return Err(Failure::new(
+                        1,
+                        phase,
+                        format!(
+                            "untrusted dependency source in Cargo.lock for {pkg_name}: {src}"
+                        ),
+                    ));
+                }
+                if !pkg.checksum.as_deref().is_some_and(is_sha256_hex) {
+                    return Err(Failure::new(
+                        1,
+                        phase,
+                        format!("missing or invalid checksum in Cargo.lock for {pkg_name}"),
+                    ));
+                }
+            } else {
+                if pkg.checksum.is_some() || !member_pkg_names.contains(pkg_name) {
+                    return Err(Failure::new(
+                        1,
+                        phase,
+                        format!(
+                            "untrusted local package without source in Cargo.lock: {pkg_name}"
+                        ),
+                    ));
+                }
+            }
+        }
     }
 
     Ok(())
 }
 
 /// Scan a Lean directory tree (`trusted/lean` with `"Trusted"` or `theory`
-/// with `"Anneal"`), rejecting symlinks and compiled artifacts in the source
-/// tree and returning the map from dot-separated module name to `.lean` path.
+/// with `"Anneal"`), rejecting symlinks, non-`.lean` files, and compiled
+/// artifacts in the source tree and returning the map from dot-separated module
+/// name to `.lean` path.
 ///
 /// Enforces three filesystem-level invariants:
 /// 1. `root` and every directory or file beneath it must be a real directory or
 ///    regular file (never a symlink), preventing symlink indirection outside
 ///    the audited tree.
 /// 2. No compiled Lean artifacts (`.olean`, `.olean.server`, `.olean.private`,
-///    `.ir.sig`, `.ir`, or `.ilean`) may exist in the source tree, ensuring
-///    that every project module is freshly compiled inside the isolated staging
-///    directory after passing `"preflight"`.
+///    `.ir.sig`, `.ir`, or `.ilean`) or unrecognized non-`.lean` files may
+///    exist in the source tree, ensuring that every project module is freshly
+///    compiled inside the isolated staging directory after passing
+///    `"preflight"`.
 /// 3. Every `.lean` file path must map to `<umbrella_prefix>(.<ident>)*`, and
 ///    `<umbrella_prefix>.lean` must exist, binding `trusted/lean/` to the
 ///    `Trusted` namespace root and `theory/` to the `Anneal` namespace root.
@@ -590,6 +978,13 @@ pub fn scan_lean_tree(
             )
         })?;
         let path = entry.path().to_path_buf();
+        if entry.file_type().is_symlink() {
+            return Err(Failure::new(
+                1,
+                "snapshot",
+                format!("unexpected symlink in source tree: {}", path.display()),
+            ));
+        }
         if entry.file_type().is_dir() {
             continue;
         }
@@ -629,10 +1024,20 @@ pub fn scan_lean_tree(
                 ));
             }
             modules.insert(module, path);
+        } else if !(umbrella_prefix == "Trusted"
+            && (relative == "lean-toolchain" || relative == "foundation-lock.json"))
+        {
+            return Err(Failure::new(
+                1,
+                "snapshot",
+                format!("unexpected non-Lean file in source tree: {relative}"),
+            ));
         }
     }
 
-    if !modules.is_empty() && !modules.contains_key(umbrella_prefix) {
+    if (umbrella_prefix == "Trusted" || !modules.is_empty())
+        && !modules.contains_key(umbrella_prefix)
+    {
         return Err(Failure::new(
             1,
             "snapshot",
@@ -642,46 +1047,55 @@ pub fn scan_lean_tree(
     Ok(modules)
 }
 
+/// Pinned SHA-256 digests of the official Lean 4.34.1 `bin/lean` binaries from
+/// `trusted/lean/foundation-lock.json`.
+const LOCKED_LEAN_SHA256: [&str; 4] = [
+    "79fb1d26fa5a39385d59fdc48a711a14b0710ca6480271acce99b4d177cea085",
+    "1b370cfcbf44e80d1b004ab1b1ab9a4c73951f9f7c242140bcff9bc577576554",
+    "998f0cc2a5a754cc66df1f33b85e1447528737ff15012db35d8c501754b02f1e",
+    "e8baaa71855a616dc351028f3ad2200051b0671f423a1696a100e809302d5550",
+];
+
 /// Resolve the default pinned Lean 4.34.1 binary path when none is explicitly
-/// provided.
+/// provided, selecting a candidate binary whose SHA-256 matches
+/// `LOCKED_LEAN_SHA256`.
 pub fn default_lean_path() -> PathBuf {
-    if let Some(env_lean) = env::var_os("ANNEAL_LEAN_BIN") {
-        return PathBuf::from(env_lean);
-    }
-    if let Ok(exe) = env::current_exe()
-        && let Some(tc_root) = exe.parent().and_then(Path::parent)
-    {
-        let bundled = tc_root.join("lean/bin/lean");
-        if bundled.is_file() {
-            return bundled;
-        }
-    }
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/root"));
+    let mut candidate_paths = Vec::new();
     for base in dirs::cache_dir()
         .into_iter()
         .chain(std::iter::once(home.clone()))
     {
         let tc_base = base.join(".anneal/toolchain");
         if let Ok(entries) = fs::read_dir(&tc_base) {
-            let mut candidates: Vec<(std::time::SystemTime, PathBuf)> =
-                entries
-                    .filter_map(Result::ok)
-                    .map(|e| e.path().join("lean/bin/lean"))
-                    .filter(|p| p.is_file())
-                    .map(|p| {
-                        let mtime = fs::metadata(&p)
-                            .and_then(|m| m.modified())
-                            .unwrap_or(std::time::UNIX_EPOCH);
-                        (mtime, p)
-                    })
-                    .collect();
-            candidates.sort_by(|a, b| b.0.cmp(&a.0));
-            if let Some((_, best)) = candidates.into_iter().next() {
-                return best;
-            }
+            let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = entries
+                .filter_map(Result::ok)
+                .map(|e| e.path().join("lean/bin/lean"))
+                .filter(|p| p.is_file())
+                .map(|p| {
+                    let mtime = fs::metadata(&p)
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::UNIX_EPOCH);
+                    (mtime, p)
+                })
+                .collect();
+            dirs.sort_by(|a, b| b.0.cmp(&a.0));
+            candidate_paths.extend(dirs.into_iter().map(|(_, p)| p));
         }
     }
-    home.join(".elan/toolchains/leanprover--lean4---v4.34.1/bin/lean")
+    let elan_lean =
+        home.join(".elan/toolchains/leanprover--lean4---v4.34.1/bin/lean");
+    if elan_lean.is_file() {
+        candidate_paths.push(elan_lean.clone());
+    }
+    for cand in &candidate_paths {
+        if let Ok(digest) = sha256_file(cand, "toolchain")
+            && LOCKED_LEAN_SHA256.contains(&digest.as_str())
+        {
+            return cand.clone();
+        }
+    }
+    candidate_paths.into_iter().next().unwrap_or(elan_lean)
 }
 
 /// Stateful boundary and crate-verification auditor managing an isolated
@@ -716,19 +1130,80 @@ pub struct Checker {
     pub prefix_cache_dir: Option<PathBuf>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InspectorErrResponse {
+    ok: bool,
+    category: String,
+    message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InspectorOkResponse {
+    ok: bool,
+    result: serde_json::Map<String, Json>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FoundationModuleRecord {
+    #[serde(rename = "sourceSha256")]
+    source_sha256: String,
+    parts: BTreeMap<String, Option<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FoundationLock {
+    schema: i64,
+    toolchain: String,
+    distributions: BTreeMap<String, String>,
+    modules: BTreeMap<String, FoundationModuleRecord>,
+    graph: serde_json::Map<String, Json>,
+    axioms: Vec<(String, String)>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreflightHeader {
+    module: String,
+    imports: Vec<Json>,
+    #[serde(default)]
+    trust_declarations: Vec<Json>,
+}
+
+#[derive(Deserialize)]
+struct PreflightResult {
+    headers: Vec<PreflightHeader>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrefixMetadata {
+    key_sha256: String,
+    artifact_digests: BTreeMap<String, String>,
+    report: Json,
+    compiled_artifacts_rel: BTreeMap<String, Vec<Vec<String>>>,
+    graph: serde_json::Map<String, Json>,
+    modules: BTreeMap<String, String>,
+    theory_modules: BTreeMap<String, String>,
+    trust_declarations: Vec<Json>,
+}
+
 impl Checker {
     /// Create a new [`Checker`] with a fresh private staging directory.
     pub fn new(checkout: &Path, lean: Option<&Path>) -> io::Result<Self> {
         Self::new_with_env(checkout, lean, env::vars())
     }
 
-    /// Create a new [`Checker`] filtering the supplied ambient environment.
+    /// Create a new [`Checker`] using a closed environment allowlist.
     ///
-    /// Strips all `LEAN*`, `LAKE*`, `ELAN*`, and `DYLD_*` environment variables
-    /// and pins `PATH` to `/usr/bin:/bin` so ambient search paths
-    /// (`LEAN_PATH`, `LEAN_SRC_PATH`), toolchain overrides (`ELAN_TOOLCHAIN`),
-    /// or dynamic library preloading (`DYLD_INSERT_LIBRARIES`) cannot influence
-    /// child `lean` invocations.
+    /// Retains only `HOME`, `TMPDIR`, `LANG`, and `LC_ALL` from `ambient_env`
+    /// and pins `PATH` to `/usr/bin:/bin` so ambient search paths (`LEAN_PATH`,
+    /// `LEAN_SRC_PATH`), toolchain overrides (`ELAN_TOOLCHAIN`), or dynamic
+    /// linker preloading (`LD_PRELOAD`, `LD_LIBRARY_PATH`,
+    /// `DYLD_INSERT_LIBRARIES`) cannot influence child `lean` invocations.
     pub fn new_with_env<I>(
         checkout: &Path,
         lean: Option<&Path>,
@@ -755,11 +1230,7 @@ impl Checker {
 
         let mut environment = BTreeMap::new();
         for (k, v) in ambient_env {
-            if !k.starts_with("LEAN")
-                && !k.starts_with("LAKE")
-                && !k.starts_with("ELAN")
-                && !k.starts_with("DYLD_")
-            {
+            if matches!(k.as_str(), "HOME" | "TMPDIR" | "LANG" | "LC_ALL") {
                 environment.insert(k, v);
             }
         }
@@ -931,17 +1402,13 @@ impl Checker {
             if output.status.code() == Some(1)
                 && result_path.is_file()
                 && let Ok(text) = fs::read_to_string(&result_path)
-                && let Ok(resp) = serde_json::from_str::<Json>(&text)
-                && let Some(obj) = resp.as_object()
-                && obj.len() == 3
-                && obj.get("ok").and_then(Json::as_bool) == Some(false)
-                && obj.get("category").and_then(Json::as_str) == Some("policy")
-                && let Some(msg) = obj
-                    .get("message")
-                    .and_then(Json::as_str)
-                    .filter(|s| !s.is_empty())
+                && let Ok(resp) =
+                    serde_json::from_str::<InspectorErrResponse>(&text)
+                && !resp.ok
+                && resp.category == "policy"
+                && resp.message.starts_with("policy:")
             {
-                return Err(Failure::new(1, mode, msg));
+                return Err(Failure::new(1, mode, resp.message));
             }
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Failure::new(
@@ -962,79 +1429,134 @@ impl Checker {
                 format!("missing/malformed inspector result: {e}"),
             )
         })?;
-        let resp: Json = serde_json::from_str(&resp_text).map_err(|e| {
-            Failure::new(
-                2,
-                mode,
-                format!("missing/malformed inspector result: {e}"),
-            )
-        })?;
-        let Some(resp_obj) = resp.as_object() else {
-            return Err(Failure::new(
-                2,
-                mode,
-                "unexpected inspector protocol response",
-            ));
-        };
-        if resp_obj.len() != 2
-            || resp_obj.get("ok").and_then(Json::as_bool) != Some(true)
-            || !resp_obj
-                .get("result")
-                .is_some_and(|r| r.as_object().is_some())
-        {
+        let resp: InspectorOkResponse =
+            serde_json::from_str(&resp_text).map_err(|_| {
+                Failure::new(2, mode, "unexpected inspector protocol response")
+            })?;
+        if !resp.ok {
             return Err(Failure::new(
                 2,
                 mode,
                 "unexpected inspector protocol response",
             ));
         }
-        Ok(resp_obj.get("result").unwrap().clone())
+        Ok(Json::Object(resp.result))
     }
 
-    /// Snapshot `trusted/lean/`, stage `TrustedBoundary.lean`, and verify the
-    /// pinned Lean 4.34.1 binary and `Init.*` artifacts against
-    /// `foundation-lock.json`.
+    /// Scan `root` via [`scan_lean_tree`] and copy every discovered `.lean`
+    /// file into `self.stage.join(stage_subdir)` via [`stage_regular_file`].
+    fn scan_and_stage_tree(
+        &self,
+        root: &Path,
+        umbrella_prefix: &str,
+        stage_subdir: &str,
+    ) -> Result<BTreeMap<String, PathBuf>, Failure> {
+        let raw_modules = scan_lean_tree(root, umbrella_prefix)?;
+        let mut staged_modules = BTreeMap::new();
+        for (mod_name, raw_path) in raw_modules {
+            let staged_path = self
+                .stage
+                .join(stage_subdir)
+                .join(format!("{}.lean", mod_name.replace('.', "/")));
+            stage_regular_file(&raw_path, &staged_path, "snapshot")?;
+            staged_modules.insert(mod_name, staged_path);
+        }
+        Ok(staged_modules)
+    }
+
+    /// Scan and stage `theory/` (when present) into `self.stage/src/theory`.
+    fn stage_theory_modules(&mut self) -> Result<(), Failure> {
+        let theory_dir = self.checkout.join("theory");
+        self.theory_modules = if fs::symlink_metadata(&theory_dir).is_ok() {
+            self.scan_and_stage_tree(&theory_dir, "Anneal", "src/theory")?
+        } else {
+            BTreeMap::new()
+        };
+        Ok(())
+    }
+
+    /// Wipe and recreate `self.stage` and reset per-run staging state so a
+    /// reused [`Checker`] or failed disk-cache probe never leaves stale files
+    /// or metadata in `self.stage`.
+    fn reset_stage(&mut self) -> Result<(), Failure> {
+        if self.stage.exists() {
+            fs::remove_dir_all(&self.stage).map_err(|e| {
+                Failure::new(
+                    2,
+                    "snapshot",
+                    format!("cannot clean {}: {e}", self.stage.display()),
+                )
+            })?;
+        }
+        fs::create_dir_all(&self.stage).map_err(|e| {
+            Failure::new(
+                2,
+                "snapshot",
+                format!("cannot recreate {}: {e}", self.stage.display()),
+            )
+        })?;
+        self.artifacts.clear();
+        self.graph.clear();
+        self.modules.clear();
+        self.theory_modules.clear();
+        self.trust_declarations.clear();
+        self.execution_began = false;
+        Ok(())
+    }
+
+    /// Snapshot and stage `trusted/lean/` and `TrustedBoundary.lean`, and
+    /// verify the pinned Lean 4.34.1 binary and `Init.*` artifacts by SHA-256
+    /// digest against `foundation-lock.json`.
     ///
     /// Specifically checks:
-    /// 1. `trusted/lean/foundation-lock.json` has `schema == 1` and
-    ///    `toolchain == "leanprover/lean4:v4.34.1"`, matching
-    ///    `trusted/lean/lean-toolchain`.
-    /// 2. `self.lean --version` matches one of the locked `distributions`
-    ///    entries (which pin the exact upstream Lean 4.34.1 commit).
+    /// 1. `trusted/lean/foundation-lock.json` has `schema == 1`,
+    ///    `toolchain == "leanprover/lean4:v4.34.1"` (matching
+    ///    `trusted/lean/lean-toolchain`), valid SHA-256 `distributions`,
+    ///    matching `modules` and `graph` keys, and complete 5-part `PARTS`
+    ///    tables *before* spawning `self.lean`.
+    /// 2. `self.lean`'s SHA-256 digest matches one of the locked
+    ///    `distributions` entries *before* executing `self.lean --version`, and
+    ///    `self.lean --version` maps to that exact SHA-256 digest.
     /// 3. Every `Init.*` module in `foundation-lock.json` has a regular `.lean`
-    ///    source file under `<prefix>/src/lean/` and its `.olean`/`.ir`
-    ///    companion parts under `<prefix>/lib/lean/` match the lock's
-    ///    presence/absence table (`null` parts must not exist on disk).
+    ///    source file under `<prefix>/src/lean/` matching `sourceSha256`, and
+    ///    its `.olean`/`.ir` companion parts under `<prefix>/lib/lean/` match
+    ///    the lock's SHA-256 digests (`null` parts must not exist on disk).
     pub fn tool_admission(&mut self) -> Result<(), Failure> {
-        self.modules = scan_lean_tree(&self.source, "Trusted")?;
+        self.modules =
+            self.scan_and_stage_tree(&self.source, "Trusted", "src/trusted")?;
 
         let inspector_src =
             self.checkout.join("trusted/audit/TrustedBoundary.lean");
-        regular(&inspector_src, "tool-snapshot")?;
-        self.inspector = inspector_src;
+        let staged_inspector = self.stage.join("src/TrustedBoundary.lean");
+        stage_regular_file(&inspector_src, &staged_inspector, "tool-snapshot")?;
+        self.inspector = staged_inspector;
 
-        let lock_text =
-            fs::read_to_string(self.source.join("foundation-lock.json"))
-                .map_err(|e| {
-                    Failure::new(
-                        2,
-                        "lock",
-                        format!("cannot read foundation lock: {e}"),
-                    )
-                })?;
-        let lock: Json = serde_json::from_str(&lock_text).map_err(|e| {
-            Failure::new(2, "lock", format!("cannot read foundation lock: {e}"))
-        })?;
-        let Some(lock_obj) = lock.as_object() else {
-            return Err(Failure::new(
+        let lock_path = self.source.join("foundation-lock.json");
+        regular(&lock_path, "lock")?;
+        let lock_text = fs::read_to_string(&lock_path).map_err(|e| {
+            Failure::new(
                 2,
                 "lock",
-                "unsupported lock/toolchain schema",
-            ));
-        };
-        if lock_obj.get("schema").and_then(Json::as_i64) != Some(1)
-            || lock_obj.get("toolchain").and_then(Json::as_str)
-                != Some(TOOLCHAIN)
+                format!("cannot read foundation lock: {e}"),
+            )
+        })?;
+        let parsed_lock: FoundationLock =
+            serde_json::from_str(&lock_text).map_err(|e| {
+                Failure::new(
+                    2,
+                    "lock",
+                    format!("cannot read foundation lock: {e}"),
+                )
+            })?;
+        if parsed_lock.schema != 1
+            || parsed_lock.toolchain != TOOLCHAIN
+            || parsed_lock.distributions.is_empty()
+            || !parsed_lock
+                .distributions
+                .values()
+                .all(|s| is_sha256_hex(s))
+            || parsed_lock.modules.is_empty()
+            || !parsed_lock.modules.keys().eq(parsed_lock.graph.keys())
         {
             return Err(Failure::new(
                 2,
@@ -1042,18 +1564,49 @@ impl Checker {
                 "unsupported lock/toolchain schema",
             ));
         }
-        self.lock = lock;
-
-        let toolchain_text =
-            fs::read_to_string(self.source.join("lean-toolchain")).map_err(
-                |e| {
-                    Failure::new(
+        for (module, record) in &parsed_lock.modules {
+            if !is_sha256_hex(&record.source_sha256)
+                || record.parts.len() != PARTS.len()
+                || !PARTS.iter().all(|p| record.parts.contains_key(*p))
+                || !record
+                    .parts
+                    .get("olean")
+                    .and_then(Option::as_deref)
+                    .is_some_and(is_sha256_hex)
+            {
+                return Err(Failure::new(
+                    2,
+                    "lock",
+                    format!("incomplete artifact-part policy for {module}"),
+                ));
+            }
+            for expected_opt in record.parts.values() {
+                if let Some(sha) = expected_opt.as_deref()
+                    && !is_sha256_hex(sha)
+                {
+                    return Err(Failure::new(
                         2,
                         "lock",
-                        format!("cannot read lean-toolchain: {e}"),
-                    )
-                },
-            )?;
+                        format!("invalid part digest in {module}"),
+                    ));
+                }
+            }
+        }
+        self.lock = json!({
+            "graph": &parsed_lock.graph,
+            "axioms": &parsed_lock.axioms,
+        });
+
+        let toolchain_path = self.source.join("lean-toolchain");
+        regular(&toolchain_path, "lock")?;
+        let toolchain_text =
+            fs::read_to_string(&toolchain_path).map_err(|e| {
+                Failure::new(
+                    2,
+                    "lock",
+                    format!("cannot read lean-toolchain: {e}"),
+                )
+            })?;
         if toolchain_text.trim() != TOOLCHAIN {
             return Err(Failure::new(
                 1,
@@ -1062,21 +1615,31 @@ impl Checker {
             ));
         }
 
-        regular(&self.lean, "toolchain")?;
+        let lean_sha = sha256_file(&self.lean, "toolchain")?;
         self.lean = fs::canonicalize(&self.lean).map_err(|e| {
             Failure::new(2, "toolchain", format!("cannot resolve lean: {e}"))
         })?;
+        if !parsed_lock
+            .distributions
+            .values()
+            .any(|s| s.eq_ignore_ascii_case(&lean_sha))
+        {
+            return Err(Failure::new(
+                2,
+                "toolchain",
+                format!(
+                    "Lean binary SHA-256 differs from lock: {lean_sha}"
+                ),
+            ));
+        }
+
         let actual_version = self
             .process("version", &["--version".to_string()])?
             .trim()
             .to_string();
-        if self
-            .lock
-            .get("distributions")
-            .and_then(|d| d.get(&actual_version))
-            .and_then(Json::as_str)
-            .is_none()
-        {
+        let Some(expected_lean_sha) =
+            parsed_lock.distributions.get(&actual_version)
+        else {
             return Err(Failure::new(
                 2,
                 "toolchain",
@@ -1084,7 +1647,16 @@ impl Checker {
                     "Lean version/commit differs from lock: {actual_version}"
                 ),
             ));
-        }
+        };
+        if !expected_lean_sha.eq_ignore_ascii_case(&lean_sha) {
+            return Err(Failure::new(
+                2,
+                "toolchain",
+                format!(
+                    "Lean binary SHA-256 mismatch for {actual_version}: expected {expected_lean_sha}, got {lean_sha}"
+                ),
+            ));
+        };
         self.version = actual_version;
 
         let prefix_raw = self
@@ -1095,60 +1667,34 @@ impl Checker {
             Failure::new(2, "toolchain", format!("cannot resolve prefix: {e}"))
         })?;
 
-        let modules_map = self
-            .lock
-            .get("modules")
-            .unwrap()
-            .as_object()
-            .unwrap()
-            .clone();
-        let graph_map =
-            self.lock.get("graph").unwrap().as_object().unwrap().clone();
-        self.foundation = modules_map.keys().cloned().collect();
+        self.foundation = parsed_lock.modules.keys().cloned().collect();
 
-        for (module, record) in &modules_map {
-            let Some(rec_obj) = record.as_object() else {
-                return Err(Failure::new(
-                    2,
-                    "lock",
-                    format!("incomplete artifact-part policy for {module}"),
-                ));
-            };
-            if rec_obj
-                .get("sourceSha256")
-                .and_then(Json::as_str)
-                .filter(|s| !s.is_empty())
-                .is_none()
-            {
-                return Err(Failure::new(
-                    2,
-                    "lock",
-                    format!("incomplete artifact-part policy for {module}"),
-                ));
-            };
-            let Some(parts_obj) =
-                rec_obj.get("parts").and_then(Json::as_object)
-            else {
-                return Err(Failure::new(
-                    2,
-                    "lock",
-                    format!("incomplete artifact-part policy for {module}"),
-                ));
-            };
-
+        for (module, record) in &parsed_lock.modules {
+            let expected_source_sha = &record.source_sha256;
             let rel_mod = module.replace('.', "/");
             let source_path =
                 self.prefix.join("src/lean").join(format!("{rel_mod}.lean"));
-            regular(&source_path, "foundation")?;
+            let actual_source_sha = sha256_file(&source_path, "foundation")?;
+            if !actual_source_sha.eq_ignore_ascii_case(expected_source_sha) {
+                return Err(Failure::new(
+                    2,
+                    "foundation",
+                    format!(
+                        "foundation source SHA-256 mismatch for {module}: expected {expected_source_sha}, got {actual_source_sha}"
+                    ),
+                ));
+            }
 
             let mut available = BTreeMap::new();
-            for (part, expected_val) in parts_obj {
+            for part in PARTS {
                 let relative = format!("{rel_mod}.{part}");
                 let installed = self.prefix.join("lib/lean").join(&relative);
+                let expected_opt =
+                    record.parts.get(part).and_then(Option::as_deref);
                 // Verify that companion parts marked `null` in the lock (such
                 // as `.olean.private`) do not exist on disk where Lean might
                 // load them alongside `.olean`.
-                if expected_val.is_null() {
+                let Some(expected_part_sha) = expected_opt else {
                     if fs::symlink_metadata(&installed).is_ok() {
                         return Err(Failure::new(
                             2,
@@ -1157,17 +1703,19 @@ impl Checker {
                         ));
                     }
                     continue;
-                }
-                if expected_val.as_str().filter(|s| !s.is_empty()).is_none() {
+                };
+                let actual_part_sha = sha256_file(&installed, "foundation")?;
+                if !actual_part_sha.eq_ignore_ascii_case(expected_part_sha) {
                     return Err(Failure::new(
                         2,
-                        "lock",
-                        format!("invalid part digest for {relative}"),
+                        "foundation",
+                        format!(
+                            "foundation artifact SHA-256 mismatch for {relative}: expected {expected_part_sha}, got {actual_part_sha}"
+                        ),
                     ));
                 }
-                regular(&installed, "foundation")?;
                 available.insert(
-                    part.clone(),
+                    part.to_string(),
                     installed.to_string_lossy().into_owned(),
                 );
             }
@@ -1191,7 +1739,7 @@ impl Checker {
                 .insert(module.clone(), vec![olean_group, ir_group]);
         }
 
-        self.graph = graph_map;
+        self.graph = parsed_lock.graph;
         Ok(())
     }
 
@@ -1315,33 +1863,12 @@ impl Checker {
         self.inspect("audit", fields)
     }
 
-    /// Run the repository boundary check (`trusted/lean/` plus `theory/` when
-    /// present).
-    ///
-    /// Executes the full repository audit pipeline:
-    /// 1. [`check_cargo_boundary`] (when `Cargo.toml` is present).
-    /// 2. [`Self::tool_admission`] and [`scan_lean_tree`] on `theory/`.
-    /// 3. Phase 1 (`"preflight"`) via `TrustedBoundary.lean` to validate syntax
-    ///    and attributes across all `Trusted.*` and `Anneal.*` sources before
-    ///    compiling any file, and to enforce that `Trusted.*` imports only
-    ///    `foundation ++ trusted` while `Anneal.*` imports only `foundation ++
-    ///    trusted ++ theory`.
-    /// 4. Topological sorting (`topo_sort_modules`) and sequential `--setup`
-    ///    compilation of `Trusted.*` and `Anneal.*`.
-    /// 5. Phase 2 (`"audit"`) via `TrustedBoundary.lean` to check declaration
-    ///    inventories, `@[vetted]` vs. `@[candidate]` non-contamination,
-    ///    dependency closures, zero custom axioms, and full kernel replay.
-    pub fn run(&mut self) -> Result<Json, Failure> {
-        if self.checkout.join("Cargo.toml").exists() {
-            check_cargo_boundary(&self.checkout)?;
-        }
-        self.tool_admission()?;
-        self.theory_modules = if self.checkout.join("theory").exists() {
-            scan_lean_tree(&self.checkout.join("theory"), "Anneal")?
-        } else {
-            BTreeMap::new()
-        };
-
+    /// Run Phase 1 (`"preflight"`) over all staged `Trusted.*` and `Anneal.*`
+    /// repository sources, populating `self.trust_declarations` and
+    /// `self.graph` and returning the validated module-import map.
+    fn preflight_repo_modules(
+        &mut self,
+    ) -> Result<BTreeMap<String, Vec<Json>>, Failure> {
         let sources: Vec<Json> = self
             .modules
             .iter()
@@ -1350,34 +1877,24 @@ impl Checker {
             .collect();
         let mut pf_fields = BTreeMap::new();
         pf_fields.insert("sources".to_string(), Json::Array(sources));
-        let pf_res = self.inspect("preflight", pf_fields)?;
-        let Some(headers) = pf_res.get("headers").and_then(Json::as_array) else {
-            return Err(Failure::new(
-                2,
-                "preflight",
-                "incomplete source-header inventory",
-            ));
-        };
+        let pf_res: PreflightResult =
+            serde_json::from_value(self.inspect("preflight", pf_fields)?)
+                .map_err(|_| {
+                    Failure::new(
+                        2,
+                        "preflight",
+                        "incomplete source-header inventory",
+                    )
+                })?;
 
         let mut imports_map: BTreeMap<String, Vec<Json>> = BTreeMap::new();
         self.trust_declarations.clear();
-        for h in headers {
-            let mod_name = h
-                .get("module")
-                .and_then(Json::as_str)
-                .unwrap_or("")
-                .to_string();
-            if self.modules.contains_key(&mod_name)
-                && let Some(decls) =
-                    h.get("trustDeclarations").and_then(Json::as_array)
-            {
-                self.trust_declarations.extend(decls.iter().cloned());
+        for h in pf_res.headers {
+            let mod_name = h.module;
+            if self.modules.contains_key(&mod_name) {
+                self.trust_declarations.extend(h.trust_declarations);
             }
-            let edges = h
-                .get("imports")
-                .and_then(Json::as_array)
-                .unwrap()
-                .to_vec();
+            let edges = h.imports;
             let is_trusted = self.modules.contains_key(&mod_name);
             // Enforce module-import direction before invoking the compiler:
             // `Trusted` modules may import only `foundation` or `Trusted`,
@@ -1406,6 +1923,54 @@ impl Checker {
             imports_map.insert(mod_name, edges);
         }
 
+        let expected_count = self.modules.len() + self.theory_modules.len();
+        if imports_map.len() != expected_count
+            || !self.modules.keys().all(|m| imports_map.contains_key(m))
+            || !self
+                .theory_modules
+                .keys()
+                .all(|m| imports_map.contains_key(m))
+        {
+            return Err(Failure::new(
+                2,
+                "preflight",
+                "incomplete source-header inventory",
+            ));
+        }
+
+        for (k, v) in &imports_map {
+            self.graph.insert(k.clone(), Json::Array(v.clone()));
+        }
+
+        Ok(imports_map)
+    }
+
+    /// Run the repository boundary check (`trusted/lean/` plus `theory/` when
+    /// present).
+    ///
+    /// Executes the full repository audit pipeline:
+    /// 1. [`check_checkout_cargo_hygiene`] (and [`check_cargo_boundary`] when
+    ///    Cargo/manifest files are present).
+    /// 2. [`Self::tool_admission`] and [`scan_lean_tree`] on `theory/`, staging
+    ///    all `.lean` sources into `self.stage/src/` before inspection.
+    /// 3. Phase 1 (`"preflight"`) via `TrustedBoundary.lean` to validate syntax
+    ///    and attributes across all staged `Trusted.*` and `Anneal.*` sources
+    ///    before compiling any file, and to enforce that `Trusted.*` imports
+    ///    only `foundation ++ trusted` while `Anneal.*` imports only
+    ///    `foundation ++ trusted ++ theory`.
+    /// 4. Topological sorting (`topo_sort_modules`) and sequential `--setup`
+    ///    compilation of the staged `Trusted.*` and `Anneal.*` files.
+    /// 5. Phase 2 (`"audit"`) via `TrustedBoundary.lean` to check declaration
+    ///    inventories, `@[vetted]` vs. `@[candidate]` non-contamination,
+    ///    dependency closures, zero custom axioms, and full kernel replay.
+    pub fn run(&mut self) -> Result<Json, Failure> {
+        check_checkout_cargo_hygiene(&self.checkout)?;
+        self.reset_stage()?;
+        self.tool_admission()?;
+        self.stage_theory_modules()?;
+
+        let imports_map = self.preflight_repo_modules()?;
+
         let trusted_order = topo_sort_modules(
             self.modules.keys().cloned().collect(),
             &imports_map,
@@ -1417,17 +1982,13 @@ impl Checker {
             "Theory import cycle",
         )?;
 
-        for (k, v) in &imports_map {
-            self.graph.insert(k.clone(), Json::Array(v.clone()));
-        }
-
         for module in &trusted_order {
             let edge_list = imports_map[module].clone();
-            let raw_src_path = self.modules[module].clone();
+            let staged_src_path = self.modules[module].clone();
             self.execution_began = true;
             self.compile_lean_module(
                 module,
-                &raw_src_path,
+                &staged_src_path,
                 edge_list,
                 "lib",
                 false,
@@ -1436,11 +1997,11 @@ impl Checker {
 
         for module in &theory_order {
             let edge_list = imports_map[module].clone();
-            let raw_src_path = self.theory_modules[module].clone();
+            let staged_src_path = self.theory_modules[module].clone();
             self.execution_began = true;
             self.compile_lean_module(
                 module,
-                &raw_src_path,
+                &staged_src_path,
                 edge_list,
                 "theory-lib",
                 true,
@@ -1474,13 +2035,14 @@ impl Checker {
     ///
     /// Executes the per-crate verification pipeline on top of the audited
     /// repository prefix (`load_or_build_verify_prefix`):
-    /// 1. Runs Phase 1 (`"preflight"`) on `.anneal/Mir.lean` and
-    ///    `.anneal/Proof.lean` and checks import containment before compiling
-    ///    either file: `Mir.lean` may import only `foundation ++ trusted`
-    ///    (never `Anneal` or `Proof`), while `Proof.lean` may import
-    ///    `foundation ++ trusted ++ theory ++ {Mir}`.
-    /// 2. Compiles `Mir` and `Proof` via `compile_lean_module` with
-    ///    `-DwarningAsError=true`.
+    /// 1. Stages `.anneal/Mir.lean` and `.anneal/Proof.lean` into
+    ///    `self.stage/src/crate/`, runs Phase 1 (`"preflight"`), and checks
+    ///    import containment before compiling either file: `Mir.lean` may
+    ///    import only `foundation ++ trusted` (never `Anneal` or `Proof`),
+    ///    while `Proof.lean` may import `foundation ++ trusted ++ theory ++
+    ///    {Mir}`.
+    /// 2. Compiles the staged `Mir` and `Proof` files via
+    ///    `compile_lean_module` with `-DwarningAsError=true`.
     /// 3. Runs Phase 2 (`"audit"` with `hasCrate = true`), which verifies in
     ///    the compiled `.olean` environment that `Mir.crate : Trusted.Crate`,
     ///    `Proof.verify_crate : Trusted.CrateTheorem Mir.crate`, zero custom
@@ -1497,6 +2059,23 @@ impl Checker {
         channel_override: Option<ReleaseChannel>,
         cli_allowed_candidates: Option<&[String]>,
     ) -> Result<Json, Failure> {
+        let crate_meta = fs::symlink_metadata(crate_dir).map_err(|e| {
+            Failure::new(
+                2,
+                "crate-input",
+                format!("cannot resolve {}: {e}", crate_dir.display()),
+            )
+        })?;
+        if crate_meta.file_type().is_symlink() {
+            return Err(Failure::new(
+                1,
+                "crate-input",
+                format!(
+                    "symlinked crate path is forbidden: {}",
+                    crate_dir.display()
+                ),
+            ));
+        }
         let crate_dir = fs::canonicalize(crate_dir).map_err(|e| {
             Failure::new(
                 2,
@@ -1504,21 +2083,42 @@ impl Checker {
                 format!("cannot resolve {}: {e}", crate_dir.display()),
             )
         })?;
+        let (crate_root, anneal_dir) = if crate_dir
+            .file_name()
+            .is_some_and(|n| n == ".anneal")
+            && let Some(parent) = crate_dir.parent()
+        {
+            (parent.to_path_buf(), crate_dir.clone())
+        } else if let Ok(meta) = fs::symlink_metadata(crate_dir.join(".anneal"))
+        {
+            if meta.file_type().is_symlink() {
+                return Err(Failure::new(
+                    1,
+                    "crate-input",
+                    format!(
+                        "symlinked .anneal directory is forbidden: {}",
+                        crate_dir.join(".anneal").display()
+                    ),
+                ));
+            }
+            (crate_dir.clone(), crate_dir.join(".anneal"))
+        } else {
+            (crate_dir.clone(), crate_dir.clone())
+        };
         let channel = channel_override.unwrap_or_default();
         let policy =
-            load_crate_trust_policy(&crate_dir, cli_allowed_candidates)?;
-        let anneal_dir = if crate_dir.join(".anneal/Mir.lean").exists() {
-            crate_dir.join(".anneal")
-        } else {
-            crate_dir.clone()
-        };
-        let mir_path = anneal_dir.join("Mir.lean");
-        let proof_path = anneal_dir.join("Proof.lean");
-        for p in [&mir_path, &proof_path] {
-            regular(p, "crate-input")?;
-        }
+            load_crate_trust_policy(&crate_root, cli_allowed_candidates)?;
+        let raw_mir_path = anneal_dir.join("Mir.lean");
+        let raw_proof_path = anneal_dir.join("Proof.lean");
+        regular(&raw_mir_path, "crate-input")?;
+        regular(&raw_proof_path, "crate-input")?;
 
         let mut report = self.load_or_build_verify_prefix()?;
+
+        let mir_path = self.stage.join("src/crate/Mir.lean");
+        let proof_path = self.stage.join("src/crate/Proof.lean");
+        stage_regular_file(&raw_mir_path, &mir_path, "crate-input")?;
+        stage_regular_file(&raw_proof_path, &proof_path, "crate-input")?;
 
         let pf_sources = json!([
             ["Mir", mir_path.to_string_lossy()],
@@ -1526,35 +2126,33 @@ impl Checker {
         ]);
         let mut pf_fields = BTreeMap::new();
         pf_fields.insert("sources".to_string(), pf_sources);
-        let pf_res = self.inspect("preflight", pf_fields)?;
-        let Some(headers) = pf_res.get("headers").and_then(Json::as_array) else {
+        let pf_res: PreflightResult =
+            serde_json::from_value(self.inspect("preflight", pf_fields)?)
+                .map_err(|_| {
+                    Failure::new(
+                        2,
+                        "preflight",
+                        "incomplete crate header observation",
+                    )
+                })?;
+
+        let mut header_edges: BTreeMap<String, Vec<Json>> = pf_res
+            .headers
+            .into_iter()
+            .map(|h| (h.module, h.imports))
+            .collect();
+
+        let mut allowed_mir_imports: BTreeSet<String> =
+            self.foundation.iter().cloned().collect();
+        allowed_mir_imports.extend(self.modules.keys().cloned());
+
+        let Some(mir_edges) = header_edges.remove("Mir") else {
             return Err(Failure::new(
                 2,
                 "preflight",
                 "incomplete crate header observation",
             ));
         };
-
-        let mut header_edges: BTreeMap<String, Vec<Json>> = BTreeMap::new();
-        for h in headers {
-            let m = h
-                .get("module")
-                .and_then(Json::as_str)
-                .unwrap_or("")
-                .to_string();
-            let edges = h
-                .get("imports")
-                .and_then(Json::as_array)
-                .unwrap()
-                .to_vec();
-            header_edges.insert(m, edges);
-        }
-
-        let mut allowed_mir_imports: BTreeSet<String> =
-            self.foundation.iter().cloned().collect();
-        allowed_mir_imports.extend(self.modules.keys().cloned());
-
-        let mir_edges = header_edges.remove("Mir").unwrap_or_default();
         if !mir_edges.iter().all(|e| {
             e.get("module")
                 .and_then(Json::as_str)
@@ -1571,7 +2169,13 @@ impl Checker {
         allowed_proof_imports.extend(self.theory_modules.keys().cloned());
         allowed_proof_imports.insert("Mir".to_string());
 
-        let proof_edges = header_edges.remove("Proof").unwrap_or_default();
+        let Some(proof_edges) = header_edges.remove("Proof") else {
+            return Err(Failure::new(
+                2,
+                "preflight",
+                "incomplete crate header observation",
+            ));
+        };
         if !proof_edges.iter().all(|e| {
             e.get("module")
                 .and_then(Json::as_str)
@@ -1657,27 +2261,80 @@ impl Checker {
         Ok(report)
     }
 
-    /// Load the audited `Trusted` and `Anneal` `.olean` artifacts into
-    /// `self.stage` from [`VERIFY_PREFIX_CACHE`] when the repository sources
-    /// and toolchain are unchanged, or run [`Self::run`] from scratch and
-    /// populate the cache.
-    ///
-    /// Even on a cache hit, [`check_cargo_boundary`], [`scan_lean_tree`] (which
-    /// rejects symlinks and stray compiled artifacts in `trusted/lean/` and
-    /// `theory/`), and [`Self::tool_admission`] (which re-verifies the `lean`
-    /// binary and `foundation-lock.json`) are always executed first.
     /// Configure an optional pre-built repository prefix cache directory.
     pub fn set_prefix_cache_dir(&mut self, dir: Option<PathBuf>) {
         self.prefix_cache_dir = dir;
     }
 
+    /// Compute the [`VerifyPrefixKey`] for the current checkout and toolchain,
+    /// enforcing Cargo and source-tree hygiene before consulting any cache.
+    fn compute_verify_prefix_key(&self) -> Result<VerifyPrefixKey, Failure> {
+        check_checkout_cargo_hygiene(&self.checkout)?;
+        let trusted_mods = scan_lean_tree(&self.source, "Trusted")?;
+        let theory_dir = self.checkout.join("theory");
+        let theory_mods = if fs::symlink_metadata(&theory_dir).is_ok() {
+            scan_lean_tree(&theory_dir, "Anneal")?
+        } else {
+            BTreeMap::new()
+        };
+        let inspector_src =
+            self.checkout.join("trusted/audit/TrustedBoundary.lean");
+        regular(&inspector_src, "tool-snapshot")?;
+        let lock_src = self.source.join("foundation-lock.json");
+        regular(&lock_src, "lock")?;
+        let toolchain_src = self.source.join("lean-toolchain");
+        regular(&toolchain_src, "lock")?;
+        let lean_sha = sha256_file(&self.lean, "toolchain")?;
+
+        let mut sources = BTreeMap::new();
+        for p in trusted_mods
+            .values()
+            .chain(theory_mods.values())
+            .chain([&inspector_src, &lock_src, &toolchain_src])
+        {
+            let bytes = fs::read(p).map_err(|e| {
+                Failure::new(
+                    2,
+                    "io",
+                    format!("cannot read {}: {e}", p.display()),
+                )
+            })?;
+            let rel = p
+                .strip_prefix(&self.checkout)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            sources.insert(rel, bytes);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(lean_sha.as_bytes());
+        hasher.update([0]);
+        for (rel, bytes) in &sources {
+            hasher.update(rel.as_bytes());
+            hasher.update([0]);
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+        let key_sha256 = format!("{:x}", hasher.finalize());
+
+        Ok(VerifyPrefixKey {
+            checkout: self.checkout.clone(),
+            lean: self.lean.clone(),
+            key_sha256,
+            sources,
+        })
+    }
+
     /// Audit the repository and populate `dest_dir` with the compiled `Trusted`
     /// and `Anneal` `.olean`/`.ir` prefix and `prefix-metadata.json`.
     pub fn build_prefix_cache(&mut self, dest_dir: &Path) -> Result<Json, Failure> {
+        let key = self.compute_verify_prefix_key()?;
         let report = self.run()?;
         fs::create_dir_all(dest_dir)
             .map_err(|e| Failure::new(2, "compile", e.to_string()))?;
         let mut compiled_artifacts_rel = BTreeMap::new();
+        let mut artifact_digests = BTreeMap::new();
         for (module, groups) in &self.artifacts {
             if self.foundation.contains(module) {
                 continue;
@@ -1693,13 +2350,9 @@ impl Checker {
                         .to_string_lossy()
                         .replace('\\', "/");
                     let dest_file = dest_dir.join(&rel);
-                    if let Some(parent) = dest_file.parent() {
-                        fs::create_dir_all(parent).map_err(|e| {
-                            Failure::new(2, "compile", e.to_string())
-                        })?;
-                    }
-                    fs::copy(abs_path, &dest_file)
-                        .map_err(|e| Failure::new(2, "compile", e.to_string()))?;
+                    let digest =
+                        stage_regular_file(abs_path, &dest_file, "compile")?;
+                    artifact_digests.insert(rel.clone(), digest);
                     g_rel.push(rel);
                 }
                 groups_rel.push(g_rel);
@@ -1716,14 +2369,16 @@ impl Checker {
             .iter()
             .map(|(k, v)| (k.clone(), v.to_string_lossy().into_owned()))
             .collect();
-        let meta = json!({
-            "report": report,
-            "compiledArtifactsRel": compiled_artifacts_rel,
-            "graph": self.graph,
-            "modules": modules_json,
-            "theoryModules": theory_json,
-            "trustDeclarations": self.trust_declarations,
-        });
+        let meta = PrefixMetadata {
+            key_sha256: key.key_sha256,
+            artifact_digests,
+            report: report.clone(),
+            compiled_artifacts_rel,
+            graph: self.graph.clone(),
+            modules: modules_json,
+            theory_modules: theory_json,
+            trust_declarations: self.trust_declarations.clone(),
+        };
         fs::write(
             dest_dir.join("prefix-metadata.json"),
             serde_json::to_vec(&meta).unwrap(),
@@ -1733,72 +2388,92 @@ impl Checker {
     }
 
     fn load_or_build_verify_prefix(&mut self) -> Result<Json, Failure> {
+        let key = self.compute_verify_prefix_key()?;
+
         if let Some(cache_dir) = self.prefix_cache_dir.clone() {
             let meta_path = cache_dir.join("prefix-metadata.json");
-            if meta_path.is_file() {
-                if self.checkout.join("Cargo.toml").exists() {
-                    check_cargo_boundary(&self.checkout)?;
-                }
+            if fs::symlink_metadata(&meta_path).is_ok()
+                && regular(&meta_path, "compile").is_ok()
+                && let Ok(meta_text) = fs::read_to_string(&meta_path)
+                && let Ok(meta) =
+                    serde_json::from_str::<PrefixMetadata>(&meta_text)
+                && meta.key_sha256 == key.key_sha256
+            {
+                self.reset_stage()?;
                 self.tool_admission()?;
+                self.stage_theory_modules()?;
+                let _ = self.preflight_repo_modules()?;
                 self.execution_began = true;
-                let meta_text = fs::read_to_string(&meta_path)
-                    .map_err(|e| Failure::new(2, "compile", e.to_string()))?;
-                let meta: Json = serde_json::from_str(&meta_text)
-                    .map_err(|e| Failure::new(2, "compile", e.to_string()))?;
-                let rel_map = meta
-                    .get("compiledArtifactsRel")
-                    .and_then(Json::as_object)
-                    .ok_or_else(|| {
-                        Failure::new(2, "compile", "invalid prefix cache metadata")
-                    })?;
-                for (module, groups_val) in rel_map {
-                    let groups_arr = groups_val.as_array().unwrap();
+                let expected_modules: BTreeSet<String> = self
+                    .modules
+                    .keys()
+                    .chain(self.theory_modules.keys())
+                    .cloned()
+                    .collect();
+                let actual_modules: BTreeSet<String> =
+                    meta.compiled_artifacts_rel.keys().cloned().collect();
+                let mut valid_disk_cache = actual_modules == expected_modules;
+                let mut staged_artifacts = BTreeMap::new();
+                'outer: for (module, groups_rel) in &meta.compiled_artifacts_rel
+                {
+                    if !valid_disk_cache {
+                        break;
+                    }
+                    let lib_dir = if self.modules.contains_key(module) {
+                        "lib"
+                    } else {
+                        "theory-lib"
+                    };
+                    let expected_stem =
+                        format!("{lib_dir}/{}", module.replace('.', "/"));
+                    if groups_rel.is_empty()
+                        || !groups_rel[0]
+                            .contains(&format!("{expected_stem}.olean"))
+                    {
+                        valid_disk_cache = false;
+                        break;
+                    }
                     let mut groups_abs = Vec::new();
-                    for g in groups_arr {
+                    for g_rel in groups_rel {
                         let mut g_abs = Vec::new();
-                        for rel_val in g.as_array().unwrap() {
-                            let rel = rel_val.as_str().unwrap();
+                        for rel in g_rel {
+                            let is_expected_rel = PARTS.iter().any(|part| {
+                                *rel == format!("{expected_stem}.{part}")
+                            });
+                            let Some(expected_digest) =
+                                meta.artifact_digests.get(rel).map(String::as_str)
+                            else {
+                                valid_disk_cache = false;
+                                break 'outer;
+                            };
+                            if !is_expected_rel || !is_sha256_hex(expected_digest)
+                            {
+                                valid_disk_cache = false;
+                                break 'outer;
+                            }
                             let src_file = cache_dir.join(rel);
                             let dest_file = self.stage.join(rel);
-                            if let Some(parent) = dest_file.parent() {
-                                fs::create_dir_all(parent).map_err(|e| {
-                                    Failure::new(2, "compile", e.to_string())
-                                })?;
+                            let Ok(actual_digest) =
+                                stage_regular_file(&src_file, &dest_file, "compile")
+                            else {
+                                valid_disk_cache = false;
+                                break 'outer;
+                            };
+                            if !actual_digest.eq_ignore_ascii_case(expected_digest) {
+                                valid_disk_cache = false;
+                                break 'outer;
                             }
-                            fs::copy(&src_file, &dest_file).map_err(|e| {
-                                Failure::new(2, "compile", e.to_string())
-                            })?;
                             g_abs.push(dest_file.to_string_lossy().into_owned());
                         }
                         groups_abs.push(g_abs);
                     }
-                    self.artifacts.insert(module.clone(), groups_abs);
+                    staged_artifacts.insert(module.clone(), groups_abs);
                 }
-                self.graph = meta
-                    .get("graph")
-                    .and_then(Json::as_object)
-                    .unwrap()
-                    .clone();
-                self.modules = meta
-                    .get("modules")
-                    .and_then(Json::as_object)
-                    .unwrap()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), PathBuf::from(v.as_str().unwrap())))
-                    .collect();
-                self.theory_modules = meta
-                    .get("theoryModules")
-                    .and_then(Json::as_object)
-                    .unwrap()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), PathBuf::from(v.as_str().unwrap())))
-                    .collect();
-                self.trust_declarations = meta
-                    .get("trustDeclarations")
-                    .and_then(Json::as_array)
-                    .unwrap()
-                    .clone();
-                return Ok(meta.get("report").unwrap().clone());
+                if valid_disk_cache {
+                    self.artifacts.extend(staged_artifacts);
+                    return Ok(meta.report);
+                }
+                self.reset_stage()?;
             }
         }
 
@@ -1806,48 +2481,15 @@ impl Checker {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
-        if self.checkout.join("Cargo.toml").exists() {
-            check_cargo_boundary(&self.checkout)?;
-        }
-        let trusted_mods = scan_lean_tree(&self.source, "Trusted")?;
-        let theory_mods = if self.checkout.join("theory").exists() {
-            scan_lean_tree(&self.checkout.join("theory"), "Anneal")?
-        } else {
-            BTreeMap::new()
-        };
-        let inspector_src =
-            self.checkout.join("trusted/audit/TrustedBoundary.lean");
-        regular(&inspector_src, "tool-snapshot")?;
-
-        let mut sources = BTreeMap::new();
-        for p in trusted_mods
-            .values()
-            .chain(theory_mods.values())
-            .chain(std::iter::once(&inspector_src))
-        {
-            let bytes = fs::read(p).map_err(|e| {
-                Failure::new(
-                    2,
-                    "io",
-                    format!("cannot read {}: {e}", p.display()),
-                )
-            })?;
-            sources.insert(p.to_string_lossy().into_owned(), bytes);
-        }
-
-        let key = VerifyPrefixKey {
-            checkout: self.checkout.clone(),
-            lean: self.lean.clone(),
-            sources,
-        };
-
         if let Some(cached) = guard
             .as_ref()
             .filter(|c| c.key == key)
             .cloned()
         {
             drop(guard);
+            self.reset_stage()?;
             self.tool_admission()?;
+            self.stage_theory_modules()?;
             self.execution_began = true;
             for file in &cached.files {
                 let dest = self.stage.join(&file.rel_path);
@@ -1876,8 +2518,6 @@ impl Checker {
                 self.artifacts.insert(module.clone(), groups_abs);
             }
             self.graph = cached.graph;
-            self.modules = cached.modules;
-            self.theory_modules = cached.theory_modules;
             self.trust_declarations = cached.trust_declarations;
             return Ok(cached.report);
         }
@@ -1919,8 +2559,6 @@ impl Checker {
             report: report.clone(),
             compiled_artifacts_rel,
             graph: self.graph.clone(),
-            modules: self.modules.clone(),
-            theory_modules: self.theory_modules.clone(),
             trust_declarations: self.trust_declarations.clone(),
             files,
         });

@@ -43,12 +43,12 @@ struct Cli {
 
     /// Comma-separated candidate-trusted features to allow during
     /// `--verify-crate` (or `*`).
-    #[arg(long)]
-    allow_candidate_features: Option<String>,
+    #[arg(long, value_delimiter = ',')]
+    allow_candidate_features: Option<Vec<String>>,
 
     /// Release channel override (`alpha` or `stable`) for `--verify-crate`.
     #[arg(long)]
-    release_channel: Option<String>,
+    release_channel: Option<ReleaseChannel>,
 
     /// Absolute path to the Lean 4 binary.
     #[arg(long)]
@@ -73,16 +73,8 @@ fn resolve_checkout(explicit: Option<PathBuf>) -> Result<PathBuf, (u8, String)> 
     if let Some(root) = explicit {
         return Ok(root);
     }
-    if let Some(env_root) = env::var_os("ANNEAL_ROOT") {
-        return Ok(PathBuf::from(env_root));
-    }
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    if let Some(workspace_root) = manifest_dir.parent().and_then(Path::parent)
-        && workspace_root
-            .join("trusted/lean/foundation-lock.json")
-            .is_file()
-    {
-        return Ok(workspace_root.to_path_buf());
+    if Path::new("trusted/lean/foundation-lock.json").is_file() {
+        return Ok(PathBuf::from("."));
     }
     if let Ok(exe) = env::current_exe()
         && let Some(tc_root) = exe.parent().and_then(Path::parent)
@@ -91,6 +83,14 @@ fn resolve_checkout(explicit: Option<PathBuf>) -> Result<PathBuf, (u8, String)> 
         if share_root.join("trusted/lean/foundation-lock.json").is_file() {
             return Ok(share_root);
         }
+    }
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(workspace_root) = manifest_dir.parent().and_then(Path::parent)
+        && workspace_root
+            .join("trusted/lean/foundation-lock.json")
+            .is_file()
+    {
+        return Ok(workspace_root.to_path_buf());
     }
     Ok(PathBuf::from("."))
 }
@@ -140,25 +140,11 @@ fn run(raw_args: Vec<String>) -> Result<u8, (u8, String)> {
     }
 
     if let Some(crate_dir) = cli.verify_crate {
-        let release_channel = match cli.release_channel {
-            Some(raw) => Some(
-                ReleaseChannel::parse(&raw)
-                    .map_err(|e| (2, format!("error: {e}")))?,
-            ),
-            None => None,
-        };
-        let allow_candidate_features: Option<Vec<String>> =
-            cli.allow_candidate_features.map(|raw| {
-                raw.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            });
         checker.set_prefix_cache_dir(cli.prefix_cache_dir);
         match checker.verify_crate_with_policy(
             &crate_dir,
-            release_channel,
-            allow_candidate_features.as_deref(),
+            cli.release_channel,
+            cli.allow_candidate_features.as_deref(),
         ) {
             Ok(report) => {
                 println!(
