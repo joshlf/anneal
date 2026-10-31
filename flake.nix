@@ -65,6 +65,14 @@
               ./trusted/rustc-capture
             ];
           };
+
+          auditSourceFiles = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              ./Cargo.lock
+              ./trusted/audit
+            ];
+          };
         in
         {
           # Download and unpack the multi-component Rust toolchain as a
@@ -180,6 +188,19 @@
             cargoLock.lockFile = ./Cargo.lock;
           };
 
+          anneal-audit = pkgs.rustPlatform.buildRustPackage {
+            pname = "anneal-audit";
+            version = "0.1.0";
+            src = auditSourceFiles;
+            sourceRoot = "source/trusted/audit";
+            doCheck = false;
+            postUnpack = ''
+              cp "$sourceRoot/../../Cargo.lock" "$sourceRoot/Cargo.lock"
+              chmod +w "$sourceRoot/Cargo.lock"
+            '';
+            cargoLock.lockFile = ./Cargo.lock;
+          };
+
           omnibus-archive = pkgs.stdenv.mkDerivation {
             pname = "anneal-toolchain-omnibus";
             version = "0.1.0";
@@ -199,7 +220,10 @@
             rustToolchain = self.packages.${system}.rust-toolchain;
             leanToolchain = self.packages.${system}.lean-toolchain;
             rustcCapture = self.packages.${system}.rustc-capture;
+            annealAudit = self.packages.${system}.anneal-audit;
             leanFoundation = ./trusted/lean;
+            trustedAudit = ./trusted/audit;
+            annealTheory = ./theory;
 
             buildPhase = ''
               set -euo pipefail
@@ -212,29 +236,39 @@
               cp -r "$rustToolchain"/* "$TMPDIR/dist_staging/rust/"
               cp -r "$leanToolchain"/* "$TMPDIR/dist_staging/lean/"
               cp "$rustcCapture/bin/anneal-rustc-capture" "$TMPDIR/dist_staging/bin/"
+              cp "$annealAudit/bin/anneal-audit" "$TMPDIR/dist_staging/bin/"
               cp -r "$leanFoundation" "$TMPDIR/dist_staging/share/anneal/trusted/lean"
+              cp -r "$trustedAudit" "$TMPDIR/dist_staging/share/anneal/trusted/audit"
+              cp -r "$annealTheory" "$TMPDIR/dist_staging/share/anneal/theory"
 
               chmod -R u+w "$TMPDIR/dist_staging"
               rm -rf "$TMPDIR/dist_staging/rust/share/doc"
 
               ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
-                # Point the Nix-built `anneal-rustc-capture` binary at the
-                # standard Linux dynamic linker used by upstream `rustc` and
-                # relative `$ORIGIN` RPATHs. `rust/` and `lean/` are unpacked
-                # directly from upstream release archives with `dontPatchELF`.
+                # Point the Nix-built `anneal-rustc-capture` and `anneal-audit`
+                # binaries at the standard Linux dynamic linker used by
+                # upstream `rustc` and relative `$ORIGIN` RPATHs. `rust/` and
+                # `lean/` are unpacked directly from upstream release archives
+                # with `dontPatchELF`.
                 patchelf \
                   --set-interpreter "$(patchelf --print-interpreter "$rustToolchain/bin/rustc")" \
                   --set-rpath '$ORIGIN/../rust/lib' \
                   "$TMPDIR/dist_staging/bin/anneal-rustc-capture"
+                patchelf \
+                  --set-interpreter "$(patchelf --print-interpreter "$rustToolchain/bin/rustc")" \
+                  "$TMPDIR/dist_staging/bin/anneal-audit"
               ''}
 
               for path in \
                 bin/anneal-rustc-capture \
+                bin/anneal-audit \
                 lean/bin/lean \
                 rust/bin/cargo \
                 rust/bin/rustc \
                 share/anneal/trusted/lean/foundation-lock.json \
-                share/anneal/trusted/lean/lean-toolchain; do
+                share/anneal/trusted/lean/lean-toolchain \
+                share/anneal/trusted/audit/TrustedBoundary.lean \
+                share/anneal/theory/Anneal.lean; do
                 if [ ! -f "$TMPDIR/dist_staging/$path" ]; then
                   echo "ERROR: expected archive entry missing: $path" >&2
                   exit 1
