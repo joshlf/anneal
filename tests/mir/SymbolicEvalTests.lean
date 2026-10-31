@@ -707,4 +707,75 @@ theorem clampReqMir_pre_nonVacuous :
     clampReqMir
     [.scalar { bits := 5, sizeBytes := 1 }]
 
+/-! ## 6. Differential Testing Verdict & Strict UB / Safe Panic Combinator Tests -/
+
+/--
+Certifies Miri `pass` agreement on `addBoundedMir` at `(10_u8, 20_u8) -> 30_u8`
+via `verifyTotalMirScalarPointBounded`.
+-/
+theorem addBounded_diff_pass_verified :
+    TotalVerificationResult
+      { body := addBoundedMir
+        pre := fun a m =>
+          a = [.scalar { bits := 10, sizeBytes := 1 },
+               .scalar { bits := 20, sizeBytes := 1 }] ∧
+          m = emptyMemory
+        post := fun _ _ retVal _ =>
+          retVal = .scalar { bits := 30, sizeBytes := 1 } } :=
+  verifyTotalMirScalarPointBounded
+    addBoundedMir
+    8
+    [.scalar { bits := 10, sizeBytes := 1 },
+     .scalar { bits := 20, sizeBytes := 1 }]
+    emptyMemory
+    30
+    1
+
+/--
+Certifies Miri `panic` agreement on `advanceOffsetSymMir` at `255_u8` (`255 + 4`
+overflows `u8` and unwinds via `TerminatorKind.assert`): proves both UB-freedom
+(`StatefulVerificationResult` with `post := False`) and `¬ TotalClaim.holds`.
+-/
+theorem advanceOffset_diff_panic_verified :
+    StatefulVerificationResult
+      { body := advanceOffsetSymMir
+        pre := fun a m =>
+          a = [.scalar { bits := 255, sizeBytes := 1 }] ∧ m = emptyMemory
+        post := fun _ _ _ _ => False } ∧
+    ¬ ({ body := advanceOffsetSymMir
+         pre := fun a m =>
+           a = [.scalar { bits := 255, sizeBytes := 1 }] ∧ m = emptyMemory
+         post := fun _ _ _ _ => True } : TotalClaim).holds :=
+  verifySafePanicMirPointBounded
+    advanceOffsetSymMir
+    8
+    [.scalar { bits := 255, sizeBytes := 1 }]
+    emptyMemory
+
+/--
+Certifies Miri `fail` (Undefined Behavior) agreement on `uncheckedAddU8Mir` at
+`(200_u8, 100_u8)` via `refuteMirPointByStrictUB`, proving that the fault is
+specifically `FailureKind.ub` (not `.unsupported`) and refuting both
+`StatefulClaim.holds` and `TotalClaim.holds`.
+-/
+theorem uncheckedAdd_diff_strict_ub_refuted :
+    ¬ ({ body := uncheckedAddU8Mir
+         pre := fun a m =>
+           a = [.scalar { bits := 200, sizeBytes := 1 },
+                .scalar { bits := 100, sizeBytes := 1 }] ∧
+           m = emptyMemory
+         post := fun _ _ _ _ => True } : StatefulClaim).holds ∧
+    ¬ ({ body := uncheckedAddU8Mir
+         pre := fun a m =>
+           a = [.scalar { bits := 200, sizeBytes := 1 },
+                .scalar { bits := 100, sizeBytes := 1 }] ∧
+           m = emptyMemory
+         post := fun _ _ _ _ => True } : TotalClaim).holds :=
+  refuteMirPointByStrictUB
+    uncheckedAddU8Mir
+    8
+    [.scalar { bits := 200, sizeBytes := 1 },
+     .scalar { bits := 100, sizeBytes := 1 }]
+    emptyMemory
+
 end Anneal.Rustc.V2026_06_01.SymbolicEvalTests

@@ -21,6 +21,7 @@
 
 pub mod agent;
 pub mod driver;
+pub mod miri_diff;
 pub mod obligations;
 pub mod scaffold;
 
@@ -42,6 +43,12 @@ pub use driver::{
     aggregate_unit_manifests, build_cargo_check_command, invoke_cargo_capture, merge_rustflags,
     parse_capture_manifest, parse_unit_capture_manifest, resolve_rustc_wrapper, run_cargo_capture,
     serialize_unit_capture_manifest,
+};
+pub use miri_diff::{
+    KnownAnnealBugSpec, MiriDiffConfig, MiriDiffManifest, MiriDiffReport, MiriDiffTestEntry,
+    MiriDiffVerdictSpec, load_miri_diff_manifest, parse_miri_diff_manifest,
+    render_miri_diff_crate_verify_module, render_miri_diff_report, render_miri_diff_verify_module,
+    run_miri_diff_suite, stage_miri_diff_workspace,
 };
 pub use obligations::{
     AuthoredItemModules, SubjectObligationBundle, derive_item_module_suffix,
@@ -1149,7 +1156,7 @@ pub fn build_lake_build_command(lake_bin: &Path, dot_anneal_dir: &Path) -> Comma
     cmd
 }
 
-fn run_trusted_boundary_verify_audit(
+pub(crate) fn run_trusted_boundary_verify_audit(
     workspace_root: &Path,
     anneal_repo_root: Option<&Path>,
     allow_assumptions: bool,
