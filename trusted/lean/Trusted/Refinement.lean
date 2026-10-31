@@ -11,14 +11,14 @@ import Init.NotationExtra
 import Trusted.Attributes
 
 /-!
-# Refinement Preorder, Partial Behaviors, Languages, and Passes
+# Refinement Preorder, Partial Behaviors, and Verification Envelope
 
 Anneal models program behaviors and specifications using a single refinement
 preorder (`b₁ ≤ b₂`, read "`b₁` refines `b₂`" or "`b₁` permits no more
 behaviors than `b₂`"). This module defines that preorder, the `Partial` type
 constructor that distinguishes defined behavior from Undefined Behavior (UB),
-and the carriers for languages, specifications, compilation passes, and
-verification passes.
+the carriers for languages and compilers, and the top-level verification
+envelope.
 
 ## 1. Set Inclusion, Compilation, and Verification
 
@@ -134,11 +134,68 @@ properties fall out without extra axioms or guarded-refinement wrappers:
    and `Abstracts` are plain inequalities `≤`, composing multi-stage compiler or
    verifier pipelines requires only `Preorder.le_trans` and `Monotone`.
 
+## 4. Verification Guarantees and Explicit Trust (`PRINCIPLES.md`)
+
+This structure directly realizes the verification guarantees and trust rules in
+`PRINCIPLES.md`:
+
+- **Separating safety preconditions (`pre`) from functional requirements
+  (`specs`) and library conditionality:**
+  Consider a safe Rust function
+  `fn binary_search<T: Ord>(slice: &[T], target: &T) -> Option<usize>`.
+  Its functional correctness requires `slice` to be sorted, but because
+  `binary_search` is a safe function, it must never exhibit UB—even when called
+  with an unsorted slice. `VerificationResultOn` enforces this separation
+  structurally by requiring `C.Verified prog` on every element of the non-empty
+  specification list `L_src.WellFormedOn pre :: specs`:
+  - **Baseline safety for binaries and libraries (`L_src.WellFormedOn pre` and
+    `L_src.WellFormed`):**
+    The head obligation `C.Verified prog (L_src.WellFormedOn pre)` governs when
+    the program is required to be free of UB in both source and compiled target:
+    - For a **binary (whole program)**, `pre` captures any declared input and
+      environmental conditions on the outside world (`L_src.WellFormed` when all
+      valid initial environments are already scoped by `L_src.Query` or
+      `L_src.sem`).
+    - For a **library API**, `pre` captures the permitted calling context: for a
+      safe API whose type- and invariant-valid inputs are scoped by
+      `L_src.Query` or `L_src.sem`, `pre` is `fun _ => True`
+      (`L_src.WellFormed`, `VerificationResult`); when type/library invariants
+      or an `unsafe` API's explicit `# Safety` preconditions are stated as a
+      predicate `safety(q)`, `pre` is `safety`, requiring UB-freedom on all
+      queries satisfying `safety(q)`.
+  - **Additional functional guarantees (`specs`):** Each `spec ∈ specs` states
+    an additional guarantee `C.Verified prog spec`. Functional preconditions
+    (`requires`) can be encoded inside `(spec q).val` via `L.SpecOn pre` /
+    `L.Spec`
+    (`defined := pre q`, `val := fun _ out => sorted q → correct q out`)
+    or in `(spec q).defined` via `L.SpecOn sorted` (`defined := sorted q`,
+    `val := fun _ out => correct q out`, which evaluates to `Partial.ub` when
+    `¬ sorted q`). Because `L_src.WellFormedOn pre` is always proved alongside
+    `specs`, even an unsatisfiable functional precondition (such as
+    `x > 0 && x < 0`, where `spec = fun _ => Partial.ub`) only makes that
+    additional guarantee vacuously true (`ub_top`) and can never weaken the
+    baseline `C.Verified prog (L_src.WellFormedOn pre)` obligation.
+- **Verifying both source MIR and compiled target:**
+  `Compiler.Verified C s spec` requires `L_src.sem s ≤ spec`,
+  `Compiles L_src L_tgt C.π s (C.compile s)`, and
+  `L_tgt.sem (C.compile s) ≤ C.π spec`. Applied to
+  `L_src.WellFormedOn pre :: specs`, this ensures both source MIR and compiled
+  machine code satisfy baseline UB-freedom (`L_src.WellFormedOn pre`) and every
+  claimed `spec ∈ specs`, preventing a benign target binary from masking demonic
+  UB in the source program.
+- **Explicit, policy-gated TCB accounting (`PRINCIPLES.md`):**
+  `VerificationResultOn` pairs `AllHold (assumptions.map policy.isAllowed)` with
+  the implication `AllHold (assumptions.map TrustedAssumption.meaning) →
+  AllHold ((L_src.WellFormedOn pre :: specs).map (C.Verified prog))`, so every
+  compiler or user assumption is audited against `TrustPolicy` in the theorem
+  statement itself.
+
 This module belongs to `trusted/lean/` and contains only definitions, classes,
 structures, inductives, and instances (zero theorems). All derived lemmas and
 composition theorems (`pass_trans`, `Compiles.comp`, `Abstracts.comp`,
-`Compiler.SoundOn.verify`, `verify_through_passes`, and
-`Compiler.Verified.mono`) live in `theory/Anneal/Refinement.lean`.
+`Compiler.SoundOn.verify`, `verify_through_passes`, `Compiler.Verified.mono`,
+and `Compiler.Verified.with_wellFormedOn`) live in
+`theory/Anneal/Refinement.lean`.
 -/
 
 namespace Trusted
@@ -354,5 +411,63 @@ def Compiler.Verified {L_src L_tgt : Language}
   L_src.sem s ≤ spec ∧
   Compiles L_src L_tgt C.π s (C.compile s) ∧
   L_tgt.sem (C.compile s) ≤ C.π spec
+
+/-- An assumption recorded in a verification unit's Trusted Computing Base,
+    equipped with its intrinsic semantic meaning as a `Prop`. -/
+@[candidate refinement]
+class TrustedAssumption (A : Type) where
+  meaning : A → Prop
+
+/-- A policy governing which trusted assumptions of type `A` are permitted. -/
+@[candidate refinement]
+structure TrustPolicy (A : Type) where
+  isAllowed : A → Prop
+
+/-- Conjunction of a list of propositions. -/
+@[candidate refinement]
+def AllHold (props : List Prop) : Prop :=
+  props.foldr (· ∧ ·) True
+
+/-- Top-level verification envelope for a source program `prog : L_src.Prog`,
+    safety precondition `pre : L_src.Query → Prop`, and additional
+    specifications `specs : List L_src.Behavior` under compiler
+    `C : Compiler L_src L_tgt`:
+    1. Every assumption in `assumptions` is permitted by `policy`
+       (`AllHold (assumptions.map policy.isAllowed)`).
+    2. Assuming the semantic meaning of every assumption in `assumptions` holds
+       (`AllHold (assumptions.map TrustedAssumption.meaning)`), `prog` satisfies
+       `C.Verified prog` for the non-empty specification list
+       `L_src.WellFormedOn pre :: specs`—proving baseline UB-freedom on `pre`
+       (`C.Verified prog (L_src.WellFormedOn pre)`) alongside every additional
+       specification `spec ∈ specs`. -/
+@[candidate refinement]
+def VerificationResultOn
+    {L_src L_tgt : Language}
+    {A : Type} [TrustedAssumption A]
+    (C : Compiler L_src L_tgt)
+    (policy : TrustPolicy A)
+    (assumptions : List A)
+    (prog : L_src.Prog)
+    (pre : L_src.Query → Prop)
+    (specs : List L_src.Behavior) : Prop :=
+  AllHold (assumptions.map policy.isAllowed) ∧
+  (AllHold (assumptions.map TrustedAssumption.meaning) →
+    AllHold ((L_src.WellFormedOn pre :: specs).map (C.Verified prog)))
+
+/-- Top-level verification envelope for a source program `prog : L_src.Prog`
+    whose baseline UB-freedom obligation holds across all `L_src.Query`
+    (`pre := fun _ => True`, so `L_src.WellFormedOn pre` is `L_src.WellFormed`),
+    together with additional specifications `specs : List L_src.Behavior` under
+    compiler `C : Compiler L_src L_tgt`. -/
+@[candidate refinement]
+abbrev VerificationResult
+    {L_src L_tgt : Language}
+    {A : Type} [TrustedAssumption A]
+    (C : Compiler L_src L_tgt)
+    (policy : TrustPolicy A)
+    (assumptions : List A)
+    (prog : L_src.Prog)
+    (specs : List L_src.Behavior := []) : Prop :=
+  VerificationResultOn C policy assumptions prog (fun _ => True) specs
 
 end Trusted
