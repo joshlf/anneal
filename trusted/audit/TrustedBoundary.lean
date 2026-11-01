@@ -22,15 +22,16 @@ mechanical trust-boundary enforcement, paired with the Rust orchestrator in
 Anneal's soundness promise is that `cargo anneal verify` and
 `cargo anneal audit-repo` never report that a crate or repository is verified
 unless the Lean 4 kernel has checked a proof of `Trusted.CrateTheorem Mir.crate`
-that depends only on sound axioms (`{Classical.choice, Quot.sound, propext}`)
+that depends only on constructive foundation axioms (`{Quot.sound, propext}`)
 and on TCB components permitted by the active release channel and crate trust
 policy.
 
 Code in an Anneal verification run falls into four categories:
 
 1. **Foundation (`Init.*` locked by `trusted/lean/foundation-lock.json`):**
-   The pinned Lean 4.34.1 prelude and core library modules. Only the three
-   standard axioms listed in `foundation-lock.json` are permitted; `sorryAx`
+   The pinned Lean 4.34.1 prelude and core library modules. Only the two
+   constructive foundation axioms listed in `foundation-lock.json`
+   (`{Quot.sound, propext}`) are permitted; `Classical.choice`, `sorryAx`,
    and all non-locked modules (`Std`, `Lean`, etc.) are excluded.
 2. **Vetted TCB (`trusted/lean/`, marked `@[vetted]`):**
    Primitive semantic definitions and theorem envelopes audited against the
@@ -92,8 +93,10 @@ inspector operates in two isolated phases:
        is an axiom-free definition originating in `Mir` and `Proof.verify_crate
        : Trusted.CrateTheorem Mir.crate` is a theorem originating in `Proof`.
      - Every reachable axiom across all non-foundation declarations belongs to
-       the locked `foundation` axiom allowlist (`{Classical.choice, Quot.sound,
-       propext}`).
+       the locked `foundation` axiom allowlist (`{Quot.sound, propext}`).
+     - Every `Trusted.EmittedArtifact.mk` application in `Mir.crate`'s closure
+       is extracted with literal `path` and `expected` fields so `audit.rs`
+       can verify on-disk byte identity against `expected`.
   4. **Active candidate feature reachability
      (`collectActiveCandidateFeatures`):**
      Traverses the crate's dependency closure (`Mir` and `Proof`), releasing a
@@ -363,7 +366,7 @@ partial def inspectSyntax (allowTrustAttrs : Bool) (s : Syntax) : IO Unit := do
   if k == ``Parser.Command.eraseAttr then
     unless allowedAttributeNames.contains s[1].getId do fail s!"unsupported attribute removal {s[1].getId}"
   if k == `Lean.Parser.Tactic.decide then
-    unless s[1].getArgs.isEmpty do
+    unless s[1].getArgs.all (·.getArgs.isEmpty) do
       fail "decide configuration is unsupported"
   if k == `Lean.Parser.Term.letRecDecl then
     let inner := s[2][0]
@@ -966,7 +969,7 @@ def origin (env : Environment) (n : Name) : IO Name := do
 /-- Compute the transitive kernel dependency closure of `roots` and verify that
     every reachable axiom `n` (`ci.isAxiom`) with defining module `m ←
     provenance n` appears in the locked `foundation` axiom allowlist `axioms`
-    (`{Classical.choice, Quot.sound, propext}`). -/
+    (`{Quot.sound, propext}`). -/
 def closure (lookup : Name → IO ConstantInfo) (provenance : Name → IO Name)
     (axioms : Array (String × String)) (roots : Array Name) : IO (Array Name × Nat) := do
   let mut pending := roots.toList
@@ -984,6 +987,65 @@ def closure (lookup : Name → IO ConstantInfo) (provenance : Name → IO Name)
         reachedAxioms := reachedAxioms.insert n
       pending := (← declarationEdges ci).toList ++ pending
   return (reachedAxioms.toArray.qsort Name.lt, visited.size)
+
+/-- Extract all `(path, expected)` pairs from `Trusted.EmittedArtifact.mk`
+    applications reachable in `Mir` from `roots` (`#[Mir.crate]`).
+
+    Enforces that `Trusted.EmittedArtifact` and `Trusted.EmittedArtifact.mk`
+    originate in `Trusted`, that every reference to `Trusted.EmittedArtifact.mk`
+    in `Mir.crate`'s closure is a full 3-argument application, and that both
+    `path` (`args[0]`) and `expected` (`args[2]`) are string literals so
+    `audit.rs` can compare the physical file at `path` byte-for-byte against
+    `expected` on disk. -/
+def extractEmittedArtifacts (lookup : Name → IO ConstantInfo)
+    (provenance : Name → IO Name)
+    (trustedLocals : Std.HashMap Name ConstantInfo)
+    (roots : Array Name) : IO (Array (String × String)) := do
+  let mut pending := roots.toList
+  let mut visited : NameSet := {}
+  let mut artifacts : Array (String × String) := #[]
+  while !pending.isEmpty do
+    let n := pending.head!
+    pending := pending.tail!
+    if !visited.contains n then
+      visited := visited.insert n
+      let m ← provenance n
+      let ci ← lookup n
+      if m == `Mir then
+        let mut exprPending : List Expr := [ci.type]
+        if let some val := ci.value? (allowOpaque := true) then
+          exprPending := val :: exprPending
+        let mut exprSeen : Std.HashSet Expr := {}
+        while !exprPending.isEmpty do
+          let x := exprPending.head!
+          exprPending := exprPending.tail!
+          if !exprSeen.contains x then
+            exprSeen := exprSeen.insert x
+            let fn := x.getAppFn
+            if fn.isConstOf `Trusted.EmittedArtifact.mk then
+              unless trustedLocals.contains `Trusted.EmittedArtifact &&
+                  trustedLocals.contains `Trusted.EmittedArtifact.mk do
+                fail "Trusted.EmittedArtifact must originate in a Trusted module"
+              let args := x.getAppArgs
+              unless args.size == 3 do
+                fail "partially or over-applied Trusted.EmittedArtifact.mk in Mir.crate"
+              let .lit (.strVal path) := args[0]!
+                | fail "Trusted.EmittedArtifact path and expected fields in Mir.crate must be string literals"
+              let .lit (.strVal expected) := args[2]!
+                | fail "Trusted.EmittedArtifact path and expected fields in Mir.crate must be string literals"
+              artifacts := artifacts.push (path, expected)
+              exprPending := args.toList ++ exprPending
+            else
+              match x with
+              | .app a b | .forallE _ a b _ | .lam _ a b _ =>
+                exprPending := a :: b :: exprPending
+              | .letE _ t v b _ =>
+                exprPending := t :: v :: b :: exprPending
+              | .proj _ _ b | .mdata _ b =>
+                exprPending := b :: exprPending
+              | _ => pure ()
+        pending := (← declarationEdges ci).toList ++ pending
+  return artifacts
 
 /-- Parse the `"trustDeclarations"` table produced by `"preflight"` into a map
     from `Name` to trust status (`"vetted"` or `"candidate:<feature>"`),
@@ -1053,9 +1115,8 @@ def classifyTrustedConstant (declMap : Std.HashMap Name String) (cName : Name) :
          `allowedInInductHelperOwners` for `feat` and whose
          `Trusted.candidate "<feat>"` bodies (`guarded[feat]`) reference only
          `vetted` or `candidate:<feat>` constants. When the declaration itself
-         belongs to `Trusted.*` (`selfStatus`), all unguarded dependencies in
-         `typeEdges` and `valEdges` (plus `ci.all`) must be `"vetted"` or
-         `selfStatus`. -/
+         is `@[vetted]`, all unguarded dependencies in `typeEdges` and
+         `valEdges` (plus `ci.all`) must be `"vetted"`. -/
 def checkTrustedNonContamination (locals : Std.HashMap Name ConstantInfo)
     (trustedLocals : Std.HashMap Name ConstantInfo)
     (statusMap : Std.HashMap Name String)
@@ -1153,13 +1214,13 @@ def checkTrustedNonContamination (locals : Std.HashMap Name ConstantInfo)
       let _ ← extractScopedEdges {} {} ci.type
       if let some val := ci.value? (allowOpaque := true) then
         let _ ← extractScopedEdges {} {} val
-      if let some selfStatus := statusMap.get? cName then
+      if statusMap.get? cName == some "vetted" then
         for dep in (← declarationEdges ci) do
           if let some depStatus := statusMap.get? dep then
             let depOwner := ownerMap.getD dep dep
-            if depStatus != "vetted" && depStatus != selfStatus &&
-                !(selfStatus == "vetted" && allowedInInductHelperOwners.contains depOwner) then
-              fail s!"{selfStatus} helper {cName} references {depStatus} declaration {dep} without a Trusted.candidate guard"
+            if depStatus != "vetted" &&
+                !allowedInInductHelperOwners.contains depOwner then
+              fail s!"vetted helper {cName} references {depStatus} declaration {dep} without a Trusted.candidate guard"
     else if !isCompilerEqThm locals cName ci then
       let typeEdges ← extractScopedEdges {} {} ci.type
       let valEdges ←
@@ -1180,15 +1241,15 @@ def checkTrustedNonContamination (locals : Std.HashMap Name ConstantInfo)
           if let some depStatus := statusMap.get? dep then
             if depStatus != "vetted" && depStatus != expectedStatus then
               fail s!"Trusted.candidate \"{feat}\" branch in {cName} references {dep} ({depStatus})"
-      if let some selfStatus := statusMap.get? cName then
+      if statusMap.get? cName == some "vetted" then
         for dep in typeEdges.unguarded do
           if let some depStatus := statusMap.get? dep then
-            if depStatus != "vetted" && depStatus != selfStatus then
-              fail s!"{selfStatus} declaration {cName} references {depStatus} declaration {dep} in its type"
+            if depStatus != "vetted" then
+              fail s!"vetted declaration {cName} references {depStatus} declaration {dep} in its type"
         for dep in valEdges.unguarded ++ NameSet.ofList ci.all do
           if let some depStatus := statusMap.get? dep then
-            if depStatus != "vetted" && depStatus != selfStatus then
-              fail s!"{selfStatus} declaration {cName} references {depStatus} declaration {dep} without a Trusted.candidate guard"
+            if depStatus != "vetted" then
+              fail s!"vetted declaration {cName} references {depStatus} declaration {dep} without a Trusted.candidate guard"
       let owner := ownerMap.getD cName userName
       let mut guardedFeats := ownerGuardedFeats.getD owner {}
       for (feat, _) in valEdges.guarded do
@@ -1211,14 +1272,15 @@ def checkTrustedNonContamination (locals : Std.HashMap Name ConstantInfo)
       let owner := ownerMap.getD cName parentUser
       let guardedFeats := ownerGuardedFeats.getD owner {}
       let selfStatus := statusMap.getD cName "vetted"
-      for dep in (← declarationEdges ci) do
-        if let some depStatus := statusMap.get? dep then
-          let depOwner := ownerMap.getD dep dep
-          if depStatus != "vetted" && depStatus != selfStatus &&
-              !allowedInInductHelperOwners.contains depOwner then
-            let feat := (depStatus.drop 10).toString
-            unless depStatus.startsWith "candidate:" && guardedFeats.contains feat do
-              fail s!"{selfStatus} equational theorem {cName} references {dep} ({depStatus})"
+      if selfStatus == "vetted" then
+        for dep in (← declarationEdges ci) do
+          if let some depStatus := statusMap.get? dep then
+            let depOwner := ownerMap.getD dep dep
+            if depStatus != "vetted" &&
+                !allowedInInductHelperOwners.contains depOwner then
+              let feat := (depStatus.drop 10).toString
+              unless depStatus.startsWith "candidate:" && guardedFeats.contains feat do
+                fail s!"vetted equational theorem {cName} references {dep} ({depStatus})"
   return (autoHelpers, allowedInInductHelperOwners, elimStatuses, scopedMap)
 
 /-- Compute the sorted list of candidate-trusted features (`@[candidate
@@ -1469,7 +1531,9 @@ def audit (j : Json) (env : Environment) (foundation : Array Name)
       let expectedCrateType := Expr.const `Trusted.Crate []
       unless mirCrateCi.type == expectedCrateType do
         fail s!"Mir.crate has type {mirCrateCi.type}, expected Trusted.Crate"
-      let _ ← closure lookup (origin env) #[] #[`Mir.crate]
+      let _ ← closure lookup (origin env) axiomPolicy #[`Mir.crate]
+      let emittedArtifacts ←
+        extractEmittedArtifacts lookup (origin env) trustedLocals #[`Mir.crate]
       let some proofCi := env.checked.get.find? `Proof.verify_crate
         | fail "missing required theorem Proof.verify_crate in Proof"
       unless (← origin env `Proof.verify_crate) == `Proof do fail "Proof.verify_crate must originate in module Proof"
@@ -1490,6 +1554,7 @@ def audit (j : Json) (env : Environment) (foundation : Array Name)
         ("reachableDeclarations", toJson crateVisited),
         ("axioms", toJson crateAxioms),
         ("candidateFeatures", toJson candidateFeatures),
+        ("emittedArtifacts", toJson emittedArtifacts),
         ("replay", toJson true)]
   -- Replay all non-foundation constants from scratch in a clean kernel
   -- environment containing only `foundation` (`Init.*`).

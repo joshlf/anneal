@@ -73,7 +73,8 @@
 //! 5. **Zero custom axioms, kernel replay, and candidate-feature gating
 //!    ([`Checker::verify_crate_with_policy`]):** All non-foundation constants
 //!    are replayed from scratch through `base.toKernelEnv.replay` with only
-//!    `{Classical.choice, Quot.sound, propext}` permitted, and any candidate
+//!    `{Quot.sound, propext}` permitted, every `Trusted.EmittedArtifact` in
+//!    `Mir.crate` is verified byte-for-byte against disk, and any candidate
 //!    features reached by `Mir` or `Proof` are checked against the active
 //!    [`ReleaseChannel`] and [`CrateTrustPolicy`].
 
@@ -457,6 +458,103 @@ fn is_lean_ident(s: &str) -> bool {
     };
     first.is_ascii_alphabetic()
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Verify on disk that every `(rel_path, expected)` pair extracted from
+/// `Trusted.EmittedArtifact.mk` applications in `Mir.crate` resolves to a
+/// regular file inside `crate_root` whose raw bytes match `expected`
+/// byte-for-byte.
+fn verify_emitted_artifacts(
+    crate_root: &Path,
+    artifacts: &[(String, String)],
+) -> Result<(), Failure> {
+    let phase = "artifact-check";
+    for (rel_path, expected) in artifacts {
+        if rel_path.is_empty() || rel_path.contains('\\') {
+            return Err(Failure::new(
+                1,
+                phase,
+                format!("invalid emitted artifact path: {rel_path}"),
+            ));
+        }
+        let rel = Path::new(rel_path);
+        let components: Vec<std::path::Component<'_>> =
+            rel.components().collect();
+        if components.is_empty() {
+            return Err(Failure::new(
+                1,
+                phase,
+                format!("invalid emitted artifact path: {rel_path}"),
+            ));
+        }
+        let mut cur = crate_root.to_path_buf();
+        for (idx, comp) in components.iter().enumerate() {
+            let std::path::Component::Normal(seg) = comp else {
+                return Err(Failure::new(
+                    1,
+                    phase,
+                    format!(
+                        "emitted artifact path must be a normalized crate-relative path: {rel_path}"
+                    ),
+                ));
+            };
+            cur.push(seg);
+            let meta = fs::symlink_metadata(&cur).map_err(|e| {
+                Failure::new(
+                    1,
+                    phase,
+                    format!(
+                        "missing or unreadable emitted artifact {rel_path}: {e}"
+                    ),
+                )
+            })?;
+            if meta.file_type().is_symlink() {
+                return Err(Failure::new(
+                    1,
+                    phase,
+                    format!(
+                        "symlinked emitted artifact path is forbidden: {rel_path}"
+                    ),
+                ));
+            }
+            let is_last = idx + 1 == components.len();
+            if is_last && !meta.file_type().is_file() {
+                return Err(Failure::new(
+                    1,
+                    phase,
+                    format!(
+                        "emitted artifact is not a regular file: {rel_path}"
+                    ),
+                ));
+            }
+            if !is_last && !meta.file_type().is_dir() {
+                return Err(Failure::new(
+                    1,
+                    phase,
+                    format!(
+                        "invalid directory component in emitted artifact path: {rel_path}"
+                    ),
+                ));
+            }
+        }
+        let actual_bytes = fs::read(&cur).map_err(|e| {
+            Failure::new(
+                1,
+                phase,
+                format!("cannot read emitted artifact {rel_path}: {e}"),
+            )
+        })?;
+        if actual_bytes != expected.as_bytes() {
+            return Err(Failure::new(
+                1,
+                phase,
+                format!(
+                    "emitted artifact {rel_path} on disk does not match expected contents in Mir.crate"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Reject `.cargo*`, `rust-toolchain*`, and `.gitmodules` overrides at the
@@ -2202,6 +2300,44 @@ impl Checker {
         }
 
         let mut crate_audit = self.run_audit_inspector(true)?;
+
+        let mut emitted_artifacts: Vec<(String, String)> = Vec::new();
+        if let Some(arr) =
+            crate_audit.get("emittedArtifacts").and_then(Json::as_array)
+        {
+            for item in arr {
+                let pair = item.as_array().ok_or_else(|| {
+                    Failure::new(
+                        2,
+                        "audit",
+                        "malformed emittedArtifacts entry in audit report",
+                    )
+                })?;
+                if pair.len() != 2 {
+                    return Err(Failure::new(
+                        2,
+                        "audit",
+                        "malformed emittedArtifacts pair in audit report",
+                    ));
+                }
+                let path = pair[0].as_str().ok_or_else(|| {
+                    Failure::new(
+                        2,
+                        "audit",
+                        "non-string path in emittedArtifacts",
+                    )
+                })?;
+                let expected = pair[1].as_str().ok_or_else(|| {
+                    Failure::new(
+                        2,
+                        "audit",
+                        "non-string expected contents in emittedArtifacts",
+                    )
+                })?;
+                emitted_artifacts.push((path.to_string(), expected.to_string()));
+            }
+        }
+        verify_emitted_artifacts(&crate_root, &emitted_artifacts)?;
 
         let mut active_candidates = BTreeSet::new();
         if let Some(arr) =

@@ -265,7 +265,7 @@ fn audits_positive_fixture_under_hostile_ambient_paths() {
         .filter_map(Json::as_str)
         .collect();
     let expected_axioms: BTreeSet<&str> =
-        ["Classical.choice", "Quot.sound", "propext"]
+        ["Quot.sound", "propext"]
             .into_iter()
             .collect();
     assert!(inferred_deps.iter().any(|n| n.contains("instWrap")));
@@ -977,7 +977,7 @@ fn rejects_cargo_workspace_members_and_path_deps_outside_trusted() {
 fn enforces_crate_verification_mir_crate_and_exact_theorem_type() {
     let hm = header_with_macro();
     let fix = TempFixture::new(Some(&format!(
-        "{hm}namespace Trusted\n@[vetted] structure Crate where tag : Nat\n@[vetted] def CrateTheorem (_ : Crate) : Prop := True\nend Trusted\n"
+        "{hm}namespace Trusted\n@[vetted] structure EmittedArtifact where\n  path : String\n  contents : String\n  expected : String\n@[vetted] structure Crate where\n  tag : Nat\n  artifacts : List EmittedArtifact := []\n@[vetted] def CrateTheorem (_ : Crate) : Prop := True\nend Trusted\n"
     )));
     fs::create_dir_all(fix.root.join("theory")).unwrap();
     fs::write(
@@ -1087,11 +1087,12 @@ fn enforces_crate_verification_mir_crate_and_exact_theorem_type() {
         "unexpected error: {err_mir_univ}"
     );
 
-    // 6. `Mir.crate` reaching `Classical.choice` is rejected.
+    // 6. `Mir.crate` or `Proof.verify_crate` reaching `Classical.choice` is
+    // rejected.
     let c_mir_ax = write_crate(
         &fix.root,
         "crate-mir-ax",
-        "prelude\nimport Trusted\nnamespace Mir\nnoncomputable def crate : Trusted.Crate := { tag := Classical.choice ⟨0⟩ }\nend Mir\n",
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := let _ : True := Classical.choice ⟨True.intro⟩; { tag := 0 }\nend Mir\n",
         "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
     );
     let mut chk_mir_ax = Checker::new(&fix.root, None).unwrap();
@@ -1103,6 +1104,94 @@ fn enforces_crate_verification_mir_crate_and_exact_theorem_type() {
             .message
             .contains("unapproved axiom Classical.choice from Init.Prelude"),
         "unexpected error: {err_mir_ax}"
+    );
+
+    let c_proof_choice = write_crate(
+        &fix.root,
+        "crate-proof-choice",
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0 }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := let _ : Nat := Classical.choice ⟨0⟩; Anneal.prove_crate Mir.crate\nend Proof\n",
+    );
+    let mut chk_proof_choice = Checker::new(&fix.root, None).unwrap();
+    let err_proof_choice =
+        chk_proof_choice.verify_crate(&c_proof_choice).unwrap_err();
+    assert_eq!(err_proof_choice.code, 1);
+    assert_eq!(err_proof_choice.phase, "audit");
+    assert!(
+        err_proof_choice
+            .message
+            .contains("unapproved axiom Classical.choice from Init.Prelude"),
+        "unexpected error: {err_proof_choice}"
+    );
+
+    // 6b. `Trusted.EmittedArtifact` on-disk byte verification: matching file
+    // succeeds; drifted file, `..` path traversal, and non-literal `expected`
+    // in `Mir.crate` are rejected.
+    let c_art = write_crate(
+        &fix.root,
+        "crate-art",
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0, artifacts := [{ path := \"src/lib.rs\", contents := \"pub fn id(x: usize) -> usize { x }\\n\", expected := \"pub fn id(x: usize) -> usize { x }\\n\" }] }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
+    );
+    let mut chk_art_ok = Checker::new(&fix.root, None).unwrap();
+    let rep_art_ok = chk_art_ok.verify_crate(&c_art).unwrap();
+    assert_eq!(
+        rep_art_ok
+            .get("crateVerification")
+            .and_then(|cv| cv.get("emittedArtifacts")),
+        Some(&json!([[
+            "src/lib.rs",
+            "pub fn id(x: usize) -> usize { x }\n"
+        ]]))
+    );
+
+    fs::write(c_art.join("src/lib.rs"), b"pub fn id(x: usize) -> usize { 0 }\n")
+        .unwrap();
+    let mut chk_art_drift = Checker::new(&fix.root, None).unwrap();
+    let err_art_drift = chk_art_drift.verify_crate(&c_art).unwrap_err();
+    assert_eq!(err_art_drift.code, 1);
+    assert_eq!(err_art_drift.phase, "artifact-check");
+    assert!(
+        err_art_drift
+            .message
+            .contains("emitted artifact src/lib.rs on disk does not match expected contents in Mir.crate"),
+        "unexpected error: {err_art_drift}"
+    );
+
+    let c_art_traversal = write_crate(
+        &fix.root,
+        "crate-art-traversal",
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0, artifacts := [{ path := \"../crate-ok/src/lib.rs\", contents := \"x\", expected := \"x\" }] }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
+    );
+    let mut chk_art_traversal = Checker::new(&fix.root, None).unwrap();
+    let err_art_traversal =
+        chk_art_traversal.verify_crate(&c_art_traversal).unwrap_err();
+    assert_eq!(err_art_traversal.code, 1);
+    assert_eq!(err_art_traversal.phase, "artifact-check");
+    assert!(
+        err_art_traversal
+            .message
+            .contains("emitted artifact path must be a normalized crate-relative path"),
+        "unexpected error: {err_art_traversal}"
+    );
+
+    let c_art_nonlit = write_crate(
+        &fix.root,
+        "crate-art-nonlit",
+        "prelude\nimport Trusted\nnamespace Mir\ndef dynStr : String := \"x\"\ndef crate : Trusted.Crate := { tag := 0, artifacts := [{ path := \"src/lib.rs\", contents := \"x\", expected := dynStr }] }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
+    );
+    let mut chk_art_nonlit = Checker::new(&fix.root, None).unwrap();
+    let err_art_nonlit =
+        chk_art_nonlit.verify_crate(&c_art_nonlit).unwrap_err();
+    assert_eq!(err_art_nonlit.code, 1);
+    assert_eq!(err_art_nonlit.phase, "audit");
+    assert!(
+        err_art_nonlit
+            .message
+            .contains("Trusted.EmittedArtifact path and expected fields in Mir.crate must be string literals"),
+        "unexpected error: {err_art_nonlit}"
     );
 
     // 7. `--prefix-cache-dir` validates `keySha256` and `artifactDigests`,
