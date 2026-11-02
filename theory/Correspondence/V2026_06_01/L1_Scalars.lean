@@ -610,18 +610,61 @@ theorem signExtendBits_characterization (bits srcBytes dstBytes : Nat) :
     simp [signExtendBits, hgt, hneg]
 
 /--
-**Theorem L1.27 (`l1_exact_div_gap_witnessed`)**:
-Certifies that the sole L1 gap (`GAP-MR-0004`, `core::intrinsics::exact_div`)
-is formally registered in `GeneratedGaps` at layer `L1_Scalars` with a kernel
-`by decide` divergence witness.
+**Theorem L1.27 (`evalExactDiv_corresponds`)**:
+Universal characterization of `MirSemantics.{evalExactDiv,evalScalarExactDiv}` and
+correspondence with MiniRust `S2026_05_Matched.Generated.Ops.eval_bin_op_int .DivExact`:
+1. Divisor `0` is rejected with `.none` (`evalScalarExactDiv` returns `.ub`, matching
+   `eval_bin_op_int .DivExact (Int.ofNat a) 0 _ = .error (.ub "division by zero")`);
+2. Non-zero unsigned divisor `b` (`wrapScalarBits b (scalarModulus (sz + 1)) ≠ 0`) with
+   non-zero remainder is rejected with `.none` (`evalScalarExactDiv` returns `.ub`);
+3. Non-zero unsigned divisor `b` with zero remainder (`Nat.beq (Nat.mod ca cb) 0 = true`)
+   returns `.some ⟨Nat.div ca cb, sz + 1⟩` (`evalScalarExactDiv` returns `.ok (.scalar ⟨Nat.div ca cb, sz + 1⟩) locals mem`).
+-/
+theorem evalExactDiv_corresponds
+    (a b sz : Nat) (locals : List LocalSlot) (mem : Memory) (isSigned : Bool) :
+    let modulus := scalarModulus (sz + 1)
+    let ca := wrapScalarBits a modulus
+    let cb := wrapScalarBits b modulus
+    evalExactDiv ⟨a, sz + 1⟩ ⟨0, sz + 1⟩ isSigned = .none ∧
+    evalScalarExactDiv ⟨a, sz + 1⟩ ⟨0, sz + 1⟩ locals mem isSigned = .ub ∧
+    eval_bin_op_int .DivExact (Int.ofNat a) 0 { signed := .Unsigned, size := ⟨sz + 1⟩ } =
+      .error (.ub "division by zero") ∧
+    (Nat.beq cb 0 = false →
+      Nat.beq (ca % cb) 0 = false →
+      evalExactDiv ⟨a, sz + 1⟩ ⟨b, sz + 1⟩ false = .none ∧
+      evalScalarExactDiv ⟨a, sz + 1⟩ ⟨b, sz + 1⟩ locals mem false = .ub) ∧
+    (Nat.beq cb 0 = false →
+      Nat.beq (ca % cb) 0 = true →
+      evalExactDiv ⟨a, sz + 1⟩ ⟨b, sz + 1⟩ false = .some ⟨ca / cb, sz + 1⟩ ∧
+      evalScalarExactDiv ⟨a, sz + 1⟩ ⟨b, sz + 1⟩ locals mem false =
+        .ok (.scalar ⟨ca / cb, sz + 1⟩) locals mem) := by
+  have h_zero_wrap : wrapScalarBits 0 (scalarModulus (sz + 1)) = 0 := by
+    rw [wrapScalarBits_eq_mod]
+    simp
+  refine ⟨?_, ?_, rfl, ?_, ?_⟩
+  · simp [evalExactDiv, Nat.beq_refl, h_zero_wrap]
+  · simp [evalScalarExactDiv, evalExactDiv, Nat.beq_refl, h_zero_wrap]
+  · intro h_bnz h_rem
+    constructor <;>
+      simp [evalScalarExactDiv, evalExactDiv, Nat.beq_refl, h_bnz, h_rem]
+  · intro h_bnz h_rem
+    constructor <;>
+      simp [evalScalarExactDiv, evalExactDiv, Nat.beq_refl, h_bnz, h_rem]
+
+/--
+**Theorem L1.28 (`l1_exact_div_gap_witnessed`)**:
+Certifies that the remediated L1 gap (`GAP-MR-0004`, `core::intrinsics::exact_div`)
+is closed in `GeneratedGaps` at layer `L1_Scalars` with a kernel `by decide`
+`VerifiedRemediationWitness` and `activeBugGaps .V2026_06_01 .S2026_05_Matched = []`.
 -/
 theorem l1_exact_div_gap_witnessed :
     gapLayer .GAP_MR_0004 = .L1_Scalars ∧
-    VerifiedDivergenceWitness
+    !gapIsOpen .GAP_MR_0004 = true ∧
+    activeBugGaps .V2026_06_01 .S2026_05_Matched = [] ∧
+    VerifiedRemediationWitness
       (evalAnnealV2026_06_01 .exactDivIntrinsicCall defaultFixtureState)
       (evalMiniRustSnapshot .S2026_05_Matched .exactDivIntrinsicCall)
-      .unsupported
       .normalUnit :=
-  ⟨rfl, witness_GAP_MR_0004⟩
+  ⟨rfl, rfl, by decide, witness_GAP_MR_0004⟩
 
 end Correspondence.V2026_06_01.L1_Scalars

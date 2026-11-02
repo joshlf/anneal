@@ -62,10 +62,19 @@ def gapMiriDiffCrossRef : GapId → Option String
 
 /-! ## 2. Scoped Active Gap Queries Across `(AnnealVer × MiniRustSnap)` -/
 
-/-- Whether gap `g` is active for `(ver, snap)`. -/
+/-- Whether gap `id` is currently open (`false` when `status == "closed"`, `true` when `status == "open"` or `"active"`). -/
 @[reducible]
-def isGapActive (ver : AnnealVer) (snap : MiniRustSnap) (g : GapId) : Bool :=
-  match ver, g with
+def gapIsOpen : GapId → Bool
+  | .GAP_MR_0001 => false
+  | .GAP_MR_0002 => false
+  | .GAP_MR_0003 => false
+  | .GAP_MR_0004 => false
+  | .GAP_EPOCH_0001 => true
+
+/-- Whether gap `id` applies to `(ver, snap)`. -/
+@[reducible]
+def gapAppliesTo (id : GapId) (ver : AnnealVer) (snap : MiniRustSnap) : Bool :=
+  match ver, id with
   | .V2026_06_01, .GAP_MR_0001 => true
   | .V2026_06_01, .GAP_MR_0002 => true
   | .V2026_06_01, .GAP_MR_0003 => true
@@ -76,10 +85,20 @@ def isGapActive (ver : AnnealVer) (snap : MiniRustSnap) (g : GapId) : Bool :=
     | .S2026_07_BleedingEdge => true
   | .V2026_12_01, _ => false
 
-/-- All open bug/feature gaps (`isBug = true`) active for `(ver, snap)`. -/
+/-- Whether gap `g` is active for `(ver, snap)`. -/
+@[reducible]
+def isGapActive (ver : AnnealVer) (snap : MiniRustSnap) (g : GapId) : Bool :=
+  gapIsOpen g && gapAppliesTo g ver snap
+
+/-- All open bug/feature gaps (`gapIsOpen id && (gapKind id).isAnnealBug`) active for `(ver, snap)`. -/
 @[reducible]
 def activeBugGaps (ver : AnnealVer) (snap : MiniRustSnap) : List GapId :=
-  allGapIds.filter (fun g => isGapActive ver snap g && (gapKind g).isBug)
+  allGapIds.filter (fun id => gapIsOpen id && (gapKind id).isAnnealBug && gapAppliesTo id ver snap)
+
+/-- All closed remediated bug/feature gaps (`!gapIsOpen id && (gapKind id).isAnnealBug`) for `(ver, snap)`. -/
+@[reducible]
+def closedBugGaps (ver : AnnealVer) (snap : MiniRustSnap) : List GapId :=
+  allGapIds.filter (fun id => !gapIsOpen id && (gapKind id).isAnnealBug && gapAppliesTo id ver snap)
 
 /-- All intentional epoch divergences (`isEpochDivergence = true`) active for `(ver, snap)`. -/
 @[reducible]
@@ -144,11 +163,13 @@ theorem matched_snapshot_has_zero_epoch_divergences :
   decide
 
 /--
-Monotonic ratchet ceiling check: active open bugs on `V2026_06_01` do not exceed
-the configured ceiling (`4`).
+Monotonic ratchet ceiling check: active open bugs on `V2026_06_01` have been
+ratcheted down to `0`, with all `4` historical bug gaps closed.
 -/
 theorem active_bug_count_within_ratchet_ceiling :
-    (activeBugGaps .V2026_06_01 .S2026_05_Matched).length ≤ 4 := by
+    activeBugGaps .V2026_06_01 .S2026_05_Matched = [] ∧
+    (activeBugGaps .V2026_06_01 .S2026_05_Matched).length ≤ 0 ∧
+    (closedBugGaps .V2026_06_01 .S2026_05_Matched).length = 4 := by
   decide
 
 end Correspondence

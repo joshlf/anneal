@@ -732,11 +732,34 @@ def decodeFieldsByLayoutIdxs
           | .none => .none
 
 /--
-Select and encode a union field from `fieldVals` into a buffer of `totalSize`
-bytes at offset `0`, preferring the first field whose encoded byte length
-matches `totalSize` (such as the initialized payload field `value:
-ManuallyDrop<T>` in `MaybeUninit<T>`), and otherwise writing the first encodable
-field at offset `0`.
+Encode union fields `fieldVals` into a shared storage buffer of `totalSize`
+bytes at offset `0` (`FieldsShape.union`).
+
+1-to-1 with overlapping union field storage in Rust (`FieldsShape::Union`):
+- When `firstField` encodes to `firstBytes` of full union size
+  (`length firstBytes == totalSize`), writes `firstBytes` at offset `0` over an
+  uninitialized `totalSize`-byte buffer.
+- When `firstField` encodes to `firstBytes` of zero size (`length firstBytes ==
+  0`, such as `uninit: ()` at field `0` of `MaybeUninit<T>`), preserves any
+  full-size backing field in `rest` (via `findFullSize rest`), or otherwise
+  returns `replicateUninitBytes totalSize`.
+- When `firstField` encodes to a smaller non-zero active variant
+  (`0 < length firstBytes < totalSize`), overlays `firstBytes` at offset `0`
+  onto `baseBuf` (taken from `findFullSize rest` if a full-size backing field
+  is present, or `replicateUninitBytes totalSize` otherwise), preserving
+  trailing bytes `[length firstBytes .. totalSize)` from the backing union
+  storage.
+
+Reference (The Rust Reference, "Unions"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html>
+
+> "The key property of unions is that all fields of a union share common
+> storage. As a result, writes to one field of a union can overwrite its other
+> fields, and size of a union is determined by the size of its largest field."
+>
+> "Unions have no notion of an “active field”. Instead, every union access just
+> interprets the storage as the type of the field used for the access. Reading a
+> union field reads the bits of the union at the field’s type."
 
 Reference (`compiler/rustc_abi/src/lib.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -761,16 +784,31 @@ def encodeUnionFieldsWith
           writeAbstractBytesAt (replicateUninitBytes totalSize) 0 fBytes
         | false => findFullSize rest
       | .none => findFullSize rest
-  match findFullSize fieldVals with
-  | .some bs => .some bs
-  | .none =>
-    match fieldVals with
-    | firstField :: _ =>
-      match encodeFallback firstField with
-      | .some fBytes =>
-        writeAbstractBytesAt (replicateUninitBytes totalSize) 0 fBytes
-      | .none => .none
-    | .nil => .none
+  match fieldVals with
+  | .nil => .none
+  | firstField :: rest =>
+    match encodeFallback firstField with
+    | .some firstBytes =>
+      match Nat.beq (length firstBytes) totalSize with
+      | true =>
+        match findFullSize (firstField :: rest) with
+        | .some bs => .some bs
+        | .none =>
+          writeAbstractBytesAt (replicateUninitBytes totalSize) 0 firstBytes
+      | false =>
+        match Nat.beq (length firstBytes) 0 with
+        | true =>
+          match findFullSize rest with
+          | .some bs => .some bs
+          | .none =>
+            writeAbstractBytesAt (replicateUninitBytes totalSize) 0 firstBytes
+        | false =>
+          let baseBuf :=
+            match findFullSize rest with
+            | .some bs => bs
+            | .none => replicateUninitBytes totalSize
+          writeAbstractBytesAt baseBuf 0 firstBytes
+    | .none => findFullSize rest
 
 /--
 Decode every union field in `fieldLayoutIdxs` (`TypeLayout.fieldLayouts`) from

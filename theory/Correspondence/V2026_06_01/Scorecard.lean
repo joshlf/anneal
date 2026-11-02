@@ -162,6 +162,74 @@ structure CorrespondenceScorecard : Prop where
     activeEpochDivergences .V2026_06_01 .S2026_07_BleedingEdge = [.GAP_EPOCH_0001]
 
 /--
+Per-cell `(AnnealVer × MiniRustSnap × SemanticLayer)` correspondence matrix entry
+reflected into Lean 4 (`correspondence_matrix.toml`).
+-/
+structure ScorecardCell : Type where
+  annealVersion : AnnealVer
+  minirustSnapshot : MiniRustSnap
+  layer : SemanticLayer
+  expectedTier : ExpectedTier
+  maxOpenBugs : Nat
+  deriving DecidableEq, Repr
+
+/--
+Machine-checked `V2026_06_01` correspondence matrix table (`v2026_06_01_scorecard`)
+ratcheting all 6 layers (`L1_Scalars`..`L6_WholeMachine`) of `V2026_06_01` × `S2026_05_Matched`
+to `ExpectedTier.ExactUnconditional` with `maxOpenBugs := 0`, and `V2026_06_01` × `S2026_07_BleedingEdge`
+to `ExpectedTier.ExactUnconditional` on `L1`, `L2`, `L3`, `L5` and `ExpectedTier.EpochDeltaOnly`
+on `L4`, `L6` with `maxOpenBugs := 0`.
+-/
+@[reducible]
+def v2026_06_01_scorecard : List ScorecardCell :=
+  [ { annealVersion := .V2026_06_01, minirustSnapshot := .S2026_05_Matched, layer := .L1_Scalars, expectedTier := .ExactUnconditional, maxOpenBugs := 0 }
+  , { annealVersion := .V2026_06_01, minirustSnapshot := .S2026_05_Matched, layer := .L2_BytesAndLayout, expectedTier := .ExactUnconditional, maxOpenBugs := 0 }
+  , { annealVersion := .V2026_06_01, minirustSnapshot := .S2026_05_Matched, layer := .L3_PlacesAndBasicMem, expectedTier := .ExactUnconditional, maxOpenBugs := 0 }
+  , { annealVersion := .V2026_06_01, minirustSnapshot := .S2026_05_Matched, layer := .L4_TreeBorrows, expectedTier := .ExactUnconditional, maxOpenBugs := 0 }
+  , { annealVersion := .V2026_06_01, minirustSnapshot := .S2026_05_Matched, layer := .L5_ControlAndCalls, expectedTier := .ExactUnconditional, maxOpenBugs := 0 }
+  , { annealVersion := .V2026_06_01, minirustSnapshot := .S2026_05_Matched, layer := .L6_WholeMachine, expectedTier := .ExactUnconditional, maxOpenBugs := 0 }
+  , { annealVersion := .V2026_06_01, minirustSnapshot := .S2026_07_BleedingEdge, layer := .L1_Scalars, expectedTier := .ExactUnconditional, maxOpenBugs := 0 }
+  , { annealVersion := .V2026_06_01, minirustSnapshot := .S2026_07_BleedingEdge, layer := .L2_BytesAndLayout, expectedTier := .ExactUnconditional, maxOpenBugs := 0 }
+  , { annealVersion := .V2026_06_01, minirustSnapshot := .S2026_07_BleedingEdge, layer := .L3_PlacesAndBasicMem, expectedTier := .ExactUnconditional, maxOpenBugs := 0 }
+  , { annealVersion := .V2026_06_01, minirustSnapshot := .S2026_07_BleedingEdge, layer := .L4_TreeBorrows, expectedTier := .EpochDeltaOnly, maxOpenBugs := 0 }
+  , { annealVersion := .V2026_06_01, minirustSnapshot := .S2026_07_BleedingEdge, layer := .L5_ControlAndCalls, expectedTier := .ExactUnconditional, maxOpenBugs := 0 }
+  , { annealVersion := .V2026_06_01, minirustSnapshot := .S2026_07_BleedingEdge, layer := .L6_WholeMachine, expectedTier := .EpochDeltaOnly, maxOpenBugs := 0 }
+  ]
+
+/--
+Certifies that `V2026_06_01` × `S2026_05_Matched` has `0` open bug gaps, `4` closed
+remediated bug gaps, and `maxOpenBugs = 0` across every scorecard cell.
+-/
+theorem scorecard_matched_open_bugs_ratchet :
+    activeBugGaps .V2026_06_01 .S2026_05_Matched = [] ∧
+    (activeBugGaps .V2026_06_01 .S2026_05_Matched).length = 0 ∧
+    closedBugGaps .V2026_06_01 .S2026_05_Matched =
+      [.GAP_MR_0001, .GAP_MR_0002, .GAP_MR_0003, .GAP_MR_0004] ∧
+    (closedBugGaps .V2026_06_01 .S2026_05_Matched).length = 4 ∧
+    (v2026_06_01_scorecard.all (fun c => c.maxOpenBugs == 0)) = true := by
+  decide
+
+/--
+Certifies that `V2026_06_01` × `S2026_07_BleedingEdge` has `0` open bug gaps and
+differs from `S2026_05_Matched` solely by `GAP_EPOCH_0001`.
+-/
+theorem scorecard_bleeding_edge_epoch_delta :
+    activeBugGaps .V2026_06_01 .S2026_07_BleedingEdge = [] ∧
+    activeEpochDivergences .V2026_06_01 .S2026_05_Matched = [] ∧
+    activeEpochDivergences .V2026_06_01 .S2026_07_BleedingEdge = [.GAP_EPOCH_0001] := by
+  decide
+
+/--
+Certifies that all 6 layers (`L1_Scalars`..`L6_WholeMachine`) of `V2026_06_01` × `S2026_05_Matched`
+have `expectedTier = .ExactUnconditional` and `maxOpenBugs = 0`.
+-/
+theorem scorecard_layer_tiers_verified :
+    (v2026_06_01_scorecard.filter (fun c => c.minirustSnapshot == .S2026_05_Matched)).length = 6 ∧
+    ((v2026_06_01_scorecard.filter (fun c => c.minirustSnapshot == .S2026_05_Matched)).all
+      (fun c => c.expectedTier == .ExactUnconditional && c.maxOpenBugs == 0)) = true := by
+  decide
+
+/--
 **Top-Level Rollup Certificate (`all_correspondence_slices_verified`)**:
 Constructs a complete proof of `CorrespondenceScorecard` using only standard
 Lean 4 kernel foundations (`propext`, `Quot.sound`).
@@ -190,5 +258,26 @@ theorem all_correspondence_slices_verified : CorrespondenceScorecard where
     ⟨mir_stepMirState_simulation,
      mir_whole_machine_guarded_refines⟩
   epoch_matrix_separation := matched_snapshot_has_zero_epoch_divergences
+
+/--
+**Complete `V2026_06_01` Correspondence Certificate (`v2026_06_01_correspondence_certificate`)**:
+Combines `CorrespondenceScorecard`, unconditional `S2026_05_Matched` fixture equivalence,
+all 4 closed remediation witnesses (`GAP-MR-0001`..`GAP-MR-0004`), `0` open bug ratchet,
+and `ExactUnconditional` tier verification across all 6 layers (`L1`–`L6`).
+-/
+theorem v2026_06_01_correspondence_certificate :
+    CorrespondenceScorecard ∧
+    (∀ prog : FixtureProg,
+      evalAnnealV2026_06_01 prog defaultFixtureState =
+        evalMiniRustSnapshot .S2026_05_Matched prog) ∧
+    activeBugGaps .V2026_06_01 .S2026_05_Matched = [] ∧
+    (closedBugGaps .V2026_06_01 .S2026_05_Matched).length = 4 ∧
+    ((v2026_06_01_scorecard.filter (fun c => c.minirustSnapshot == .S2026_05_Matched)).all
+      (fun c => c.expectedTier == .ExactUnconditional && c.maxOpenBugs == 0)) = true :=
+  ⟨all_correspondence_slices_verified,
+   all_matched_fixtures_agree_unconditionally,
+   scorecard_matched_open_bugs_ratchet.1,
+   scorecard_matched_open_bugs_ratchet.2.2.2.1,
+   scorecard_layer_tiers_verified.2⟩
 
 end Correspondence.V2026_06_01.Scorecard

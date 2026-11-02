@@ -818,18 +818,18 @@ theorem enum_multiple_discriminant_tag_corresponds
 
 /--
 **Theorem L2.21 (`l2_union_gap_witnessed`)**:
-Certifies that the L2 union variant storage discrepancy (`GAP-MR-0002`,
+Certifies that the remediated L2 union variant storage discrepancy (`GAP-MR-0002`,
 cross-referenced to `pass_uninit_union_write_then_read` in `tests/miri-diff/manifest.toml`)
-is formally registered with a kernel `by decide` divergence witness.
+is closed with a kernel `by decide` `VerifiedRemediationWitness`.
 -/
 theorem l2_union_gap_witnessed :
     gapLayer .GAP_MR_0002 = .L2_BytesAndLayout ∧
     gapMiriDiffCrossRef .GAP_MR_0002 = some "pass_uninit_union_write_then_read" ∧
-    VerifiedDivergenceWitness
+    !gapIsOpen .GAP_MR_0002 = true ∧
+    VerifiedRemediationWitness
       (evalAnnealV2026_06_01 .unionVariantWriteRead defaultFixtureState)
       (evalMiniRustSnapshot .S2026_05_Matched .unionVariantWriteRead)
-      .ub
       .normalUnit :=
-  ⟨rfl, rfl, witness_GAP_MR_0002⟩
+  ⟨rfl, rfl, rfl, witness_GAP_MR_0002⟩
 
 end Correspondence.V2026_06_01.L2_BytesAndLayout

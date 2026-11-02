@@ -730,11 +730,18 @@ pub fn lint_correspondence_gaps_with_vendor_root(
             return Err(format!("duplicate gap id '{id}' in correspondence_gaps.toml"));
         }
 
-        // Reject stale / already-closed gap entries (`MUT-04`).
+        // Reject stale / invalid status gap entries (`MUT-04`).
         let status_lower = gap.status.trim().to_ascii_lowercase();
-        if matches!(
+        if gap.kind.is_anneal_bug() {
+            if !matches!(status_lower.as_str(), "open" | "closed") {
+                return Err(format!(
+                    "stale gap entry '{id}' has status '{}': bug gaps must have status = \"open\" or status = \"closed\"",
+                    gap.status
+                ));
+            }
+        } else if matches!(
             status_lower.as_str(),
-            "closed" | "fixed" | "resolved" | "stale" | "obsolete" | "removed"
+            "fixed" | "resolved" | "stale" | "obsolete" | "removed"
         ) {
             return Err(format!(
                 "stale gap entry '{id}' has status '{}' (fixed or stale entries must be deleted so the ratchet tightens)",
@@ -764,7 +771,11 @@ pub fn lint_correspondence_gaps_with_vendor_root(
         // Reject non-divergent / stale verdict pairs where Anneal already matches MiniRust (`MUT-04`).
         let anneal_v = gap.expected_anneal_verdict.trim();
         let minirust_v = gap.expected_minirust_verdict.trim();
-        if !anneal_v.is_empty() && !minirust_v.is_empty() && anneal_v == minirust_v {
+        if status_lower == "open"
+            && !anneal_v.is_empty()
+            && !minirust_v.is_empty()
+            && anneal_v == minirust_v
+        {
             return Err(format!(
                 "stale gap entry '{id}': expected_anneal_verdict ('{anneal_v}') equals expected_minirust_verdict ('{minirust_v}'); remove the fixed entry"
             ));
@@ -813,10 +824,17 @@ pub fn lint_correspondence_gaps_with_vendor_root(
         }
 
         match gap.kind {
-            GapKind::AnnealSoundnessBug => soundness_bug_count += 1,
-            GapKind::AnnealFalsePositiveUb => false_positive_ub_count += 1,
-            GapKind::AnnealUnmodeledFeature => unmodeled_feature_count += 1,
-            GapKind::IntentionalEpochDivergence => epoch_divergence_count += 1,
+            GapKind::AnnealSoundnessBug if status_lower == "open" => soundness_bug_count += 1,
+            GapKind::AnnealFalsePositiveUb if status_lower == "open" => {
+                false_positive_ub_count += 1
+            }
+            GapKind::AnnealUnmodeledFeature if status_lower == "open" => {
+                unmodeled_feature_count += 1
+            }
+            GapKind::IntentionalEpochDivergence if status_lower != "closed" => {
+                epoch_divergence_count += 1
+            }
+            _ => {}
         }
     }
 
@@ -1439,6 +1457,9 @@ pub fn run_correspondence_bugs_cli(cmd: &CorrespondenceBugsSubcommand) -> Result
 }
 
 fn gap_applies_to_cell(gap: &CorrespondenceGapEntry, cell: &CorrespondenceMatrixCell) -> bool {
+    if gap.status.trim().eq_ignore_ascii_case("closed") {
+        return false;
+    }
     let ver_match = cell.anneal_version == "*"
         || gap.anneal_versions.is_empty()
         || gap

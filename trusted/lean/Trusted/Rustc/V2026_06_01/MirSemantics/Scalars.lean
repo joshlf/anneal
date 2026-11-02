@@ -1064,6 +1064,137 @@ def evalScalarBinOp
         | _ => .unsupported
 
 /--
+Half-modulus `256 ^ sizeBytes / 2 = 2 ^ (8 * sizeBytes - 1)` separating
+non-negative (`[0, half)`) and negative (`[half, 2 * half)`) two's-complement
+bit patterns of byte width `sizeBytes`.
+
+1-to-1 with the two's-complement sign threshold `2 ^ (N - 1)` for an `N`-bit
+signed integer in Rust.
+
+Reference (The Rust Reference, "Numeric types — Integer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html#integer-types>
+
+> "Signed integer types with two's complement representation:
+>
+> Type   Minimum            Maximum
+> i8     -(2^7)             2^7-1
+> i16    -(2^15)            2^15-1
+> i32    -(2^31)            2^31-1
+> i64    -(2^63)            2^63-1
+> i128   -(2^127)           2^127-1"
+-/
+@[reducible]
+def signedHalfModulus (sizeBytes : Nat) : Nat :=
+  Nat.div (scalarModulus sizeBytes) 2
+
+/--
+Evaluate exact integer division `core::intrinsics::exact_div(lhs, rhs)` over
+two equal-width non-zero `ScalarInt` operands, returning `.none` on undefined
+behavior (`rhs == 0`, signed overflow `MIN / -1`, or non-zero remainder
+`lhs % rhs != 0`).
+
+1-to-1 with `core::intrinsics::exact_div` (`IntBinOp::DivExact` in MiniRust):
+when `isSigned = false`, checks `b != 0` and `a % b == 0` and returns `a / b`;
+when `isSigned = true`, additionally rejects `a == INT_MIN && b == -1`, checks
+that `|a| % |b| == 0`, and returns the two's-complement quotient `lhs / rhs`.
+
+Reference (`core::intrinsics::exact_div`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.exact_div.html>
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1932-L1939>
+
+> "/// Performs an exact division, resulting in undefined behavior where
+> /// `x % y != 0` or `y == 0` or `x == T::MIN && y == -1`
+> ///
+> /// This intrinsic does not have a stable counterpart.
+> #[rustc_intrinsic_const_stable_indirect]
+> #[rustc_nounwind]
+> #[rustc_intrinsic]
+> pub const unsafe fn exact_div<T: Copy>(x: T, y: T) -> T;"
+-/
+@[reducible]
+def evalExactDiv
+    (lhs rhs : ScalarInt)
+    (isSigned : Bool := false) :
+    Option ScalarInt :=
+  match
+    Bool.and
+      (Nat.beq lhs.sizeBytes rhs.sizeBytes)
+      (Bool.not (Nat.beq lhs.sizeBytes 0))
+  with
+  | false => .none
+  | true =>
+    let modulus := scalarModulus lhs.sizeBytes
+    let a := wrapScalarBits lhs.bits modulus
+    let b := wrapScalarBits rhs.bits modulus
+    match Nat.beq b 0 with
+    | true => .none
+    | false =>
+      match isSigned with
+      | false =>
+        match Nat.beq (Nat.mod a b) 0 with
+        | false => .none
+        | true => .some ⟨Nat.div a b, lhs.sizeBytes⟩
+      | true =>
+        let half := signedHalfModulus lhs.sizeBytes
+        match Bool.and (Nat.beq a half) (Nat.beq b (Nat.sub modulus 1)) with
+        | true => .none
+        | false =>
+          let negA := Nat.ble half a
+          let negB := Nat.ble half b
+          let magA :=
+            match negA with
+            | false => a
+            | true => wrapScalarBits (Nat.sub modulus a) modulus
+          let magB :=
+            match negB with
+            | false => b
+            | true => wrapScalarBits (Nat.sub modulus b) modulus
+          match Nat.beq (Nat.mod magA magB) 0 with
+          | false => .none
+          | true =>
+            let quotMag := Nat.div magA magB
+            let resBits :=
+              match negA, negB with
+              | false, false => quotMag
+              | true, true => quotMag
+              | _, _ => wrapScalarBits (Nat.sub modulus quotMag) modulus
+            .some ⟨resBits, lhs.sizeBytes⟩
+
+/--
+Lift `evalExactDiv` to an `RvalueEvalResult`, returning
+`.ok (.scalar q) locals mem` when exact division succeeds and `.ub` when
+`evalExactDiv` returns `.none`.
+
+1-to-1 with the operational outcome of `core::intrinsics::exact_div` in MIR
+evaluation.
+
+Reference (`core::intrinsics::exact_div`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.exact_div.html>
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1932-L1939>
+
+> "/// Performs an exact division, resulting in undefined behavior where
+> /// `x % y != 0` or `y == 0` or `x == T::MIN && y == -1`
+> ///
+> /// This intrinsic does not have a stable counterpart."
+-/
+@[reducible]
+def evalScalarExactDiv
+    (lhs rhs : ScalarInt)
+    (locals : List LocalSlot)
+    (mem : Memory := {})
+    (isSigned : Bool := false) :
+    RvalueEvalResult :=
+  match evalExactDiv lhs rhs isSigned with
+  | .some q => .ok (.scalar q) locals mem
+  | .none => .ub
+
+/--
 Target byte width for integer cast targets (`CastKind.intToInt`) on a 64-bit
 target (`usize` and `isize` have byte width `8`).
 

@@ -973,6 +973,32 @@ def readProjectedValue
   | _, _ :: _ => .unsupported
 
 /--
+Update the `Value` at index `idx` in `fields`, extending `fields` with
+`.unit` padding elements when `idx` exceeds the current list length (for
+example, when writing a non-zero field index of a union aggregate
+previously initialized via field `0`).
+
+Reference (The Rust Reference, "Union types"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
+
+> "Unions have no notion of an \"active field\". Instead, every union access
+> just interprets the storage as the type of the field used for the access."
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1135-L1165>
+
+> "- [`Field`](ProjectionElem::Field): `Field` projections take their parent
+>   place and create a place referring to one of the fields of the type."
+-/
+@[reducible]
+def setOrExtendFields : List Value → Nat → Value → List Value
+  | .nil, .zero, v => v :: .nil
+  | .nil, .succ n, v => .unit :: setOrExtendFields .nil n v
+  | _ :: rest, .zero, v => v :: rest
+  | hd :: rest, .succ n, v => hd :: setOrExtendFields rest n v
+
+/--
 Update the value at a sequence of `.field`, `.downcast`, `.index`,
 `.constantIndex`, and `.opaqueCast` projections inside an initialized `Value`.
 
@@ -999,7 +1025,15 @@ def writeProjectedValue
         | .none => .ub
       | .ub => .ub
       | .unsupported => .unsupported
-    | .none => .ub
+    | .none =>
+      match writeProjectedValue locals .unit rest newVal with
+      | .ok updatedFieldVal =>
+        .ok
+          (.aggregate
+            variantIdx
+            (setOrExtendFields fields idx updatedFieldVal))
+      | .ub => .ub
+      | .unsupported => .unsupported
   | .scalar sc, .field .zero _ :: rest, newVal =>
     writeProjectedValue locals (.scalar sc) rest newVal
   | .ptr p sz, .field .zero _ :: rest, newVal =>
@@ -1730,6 +1764,151 @@ def evalByteCast
             | .none => .ub
 
 /--
+Resolve dynamic `.index idxLocal` projection elements against the current
+`locals` state at borrow creation time, converting each `.index idxLocal`
+whose index local holds an initialized `.scalar sc` into
+`.constantIndex sc.bits 0 false` so subsequent dereferences do not depend on
+whether the temporary index local remains live.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1166-L1185>
+
+> "- [`Index`](ProjectionElem::Index): `Index` projections take their parent
+>   place and create a place referring to an element of an array or slice,
+>   indexed by the given `Local`. Note that the `Local` must be initialized
+>   before the projection is used."
+
+Reference (The Rust Reference, "Array and slice indexing expressions"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/array-expr.html#array-and-slice-indexing-expressions>
+
+> "Array and slice-typed values can be indexed by writing a
+> square-bracket-enclosed expression of type usize (the index) after them."
+-/
+@[reducible]
+def resolveBorrowProjectionElems
+    (locals : List LocalSlot) :
+    List ProjectionElem → Option (List ProjectionElem)
+  | .nil => .some .nil
+  | .index idxLocal :: rest =>
+    match get? locals idxLocal with
+    | .some (.init (.scalar sc)) =>
+      match resolveBorrowProjectionElems locals rest with
+      | .some rest' => .some (.constantIndex sc.bits 0 false :: rest')
+      | .none => .none
+    | _ => .none
+  | elem :: rest =>
+    match resolveBorrowProjectionElems locals rest with
+    | .some rest' => .some (elem :: rest')
+    | .none => .none
+
+/--
+Determine whether a monomorphized `RigidTy` is `Freeze` (contains no
+`UnsafeCell` interior mutability or raw pointer), using structural recursion
+with `fuel`.
+
+Returns `false` (`!Freeze`) for `.rawPtr`, for `core::cell::UnsafeCell` /
+`std::cell::UnsafeCell`, and for any `.adt`, `.tuple`, `.array`, or `.slice`
+whose type arguments or element types contain a `!Freeze` component; returns
+`true` (`Freeze`) otherwise.
+Modeling choice: Because `RigidTy.adt` carries generic `args` rather than full
+field declarations, `rigidTyIsFreeze` recurses structurally on `args` and also
+classifies `.rawPtr` as `!Freeze` so raw-pointer wrapper cells (such as `Cell`
+or custom interior-mutable wrappers) conservatively receive `.reserved`.
+
+Reference (The Rust Reference, "Interior mutability"):
+<https://doc.rust-lang.org/1.98.0/reference/interior-mutability.html>
+
+> "Shared references in Rust disallow mutation by default, and &mut is called an
+> exclusive reference. However, there are situations where it would be helpful
+> to mutate data behind a shared reference. This is known as interior mutability
+> in Rust, in contrast with exterior mutability, which happens through &mut or
+> directly on a value.
+>
+> All interior mutability in Rust is enabled by the UnsafeCell<T> type, which is
+> defined in the standard library. Any type that contains an UnsafeCell<T> (with
+> the exception of types that only contain it behind a pointer, such as
+> &UnsafeCell<T> or *const UnsafeCell<T>) is considered to have interior
+> mutability."
+-/
+@[reducible]
+def rigidTyIsFreeze : Nat → RigidTy → Bool
+  | .zero, _ => true
+  | .succ _, .rawPtr _ _ => false
+  | .succ fuel, .adt defPath args =>
+    match
+      Bool.or
+        (stringEq defPath "core::cell::UnsafeCell")
+        (stringEq defPath "std::cell::UnsafeCell")
+    with
+    | true => false
+    | false =>
+      match args with
+      | .nil => true
+      | arg :: restArgs =>
+        Bool.and
+          (rigidTyIsFreeze fuel arg)
+          (rigidTyIsFreeze fuel (.tuple restArgs))
+  | .succ fuel, .tuple fields =>
+    match fields with
+    | .nil => true
+    | f :: restFields =>
+      Bool.and
+        (rigidTyIsFreeze fuel f)
+        (rigidTyIsFreeze fuel (.tuple restFields))
+  | .succ fuel, .array elem _ => rigidTyIsFreeze fuel elem
+  | .succ fuel, .slice elem => rigidTyIsFreeze fuel elem
+  | .succ _, _ => true
+
+/--
+Determine whether a `Ty` is `Freeze` (contains no `UnsafeCell` interior
+mutability or raw pointer) by inspecting `ty.kind` with fuel `16`.
+
+Reference (The Rust Reference, "Interior mutability"):
+<https://doc.rust-lang.org/1.98.0/reference/interior-mutability.html>
+
+> "All interior mutability in Rust is enabled by the UnsafeCell<T> type, which
+> is defined in the standard library."
+-/
+@[reducible]
+def tyIsFreeze (ty : Ty) : Bool :=
+  rigidTyIsFreeze 16 ty.kind
+
+/--
+Determine the initial Tree Borrows permission for a shared borrow (`&place`)
+based on whether `place`'s resolved type in `localDecls` and `layouts` is
+`Freeze`.
+
+When `placeTy localDecls layouts place` resolves to a `!Freeze` type (such as
+`core::cell::UnsafeCell<T>`), a shared borrow starts in
+`TreeBorrowPerm.reserved` instead of `TreeBorrowPerm.frozen` so interior
+mutation through `&UnsafeCell<T>` is permitted; when `place` is `Freeze` (or
+when `localDecls` is omitted / does not declare a type for `place`), the shared
+borrow defaults to `TreeBorrowPerm.frozen`.
+
+Reference (The Rust Reference, "Interior mutability"):
+<https://doc.rust-lang.org/1.98.0/reference/interior-mutability.html>
+
+> "Shared references in Rust disallow mutation by default, and &mut is called an
+> exclusive reference. However, there are situations where it would be helpful
+> to mutate data behind a shared reference. This is known as interior mutability
+> in Rust, in contrast with exterior mutability, which happens through &mut or
+> directly on a value."
+-/
+@[reducible]
+def sharedBorrowPerm
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (place : Place) :
+    TreeBorrowPerm :=
+  match placeTy localDecls layouts place with
+  | .some ty =>
+    match tyIsFreeze ty with
+    | true => TreeBorrowPerm.frozen
+    | false => TreeBorrowPerm.reserved
+  | .none => TreeBorrowPerm.frozen
+
+/--
 Evaluate an `Rvalue` in `locals` and `mem`, using `localDecls` and `layouts` to
 resolve operand types, signedness, and byte layouts for `Rvalue.binaryOp`,
 `Rvalue.unaryOp`, `Rvalue.cast`, and `Rvalue.aggregate`.
@@ -1795,7 +1974,7 @@ def evalRvalue
   | .ref borrowKind place =>
     let perm :=
       match borrowKind with
-      | .shared => TreeBorrowPerm.frozen
+      | .shared => sharedBorrowPerm localDecls layouts place
       | .mut false => TreeBorrowPerm.active
       | .mut true => TreeBorrowPerm.reserved
     match place.projection with
@@ -1808,23 +1987,26 @@ def evalRvalue
           | .disabled, _ => .ub
           | .frozen, .mut _ => .ub
           | _, _ =>
-            let tag := mem.nextTag
-            let fullProj :=
-              match parentEntry.targetProjection with
-              | .nil => restProj
-              | ph :: pt => ph :: appendProjections pt restProj
-            let entry : BorrowEntry := {
-              tag := tag
-              targetLocal := parentEntry.targetLocal
-              targetProjection := fullProj
-              perm := perm
-            }
-            let mem' := {
-              mem with
-              borrows := entry :: mem.borrows
-              nextTag := Nat.add tag 1
-            }
-            .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
+            match resolveBorrowProjectionElems locals restProj with
+            | .none => .ub
+            | .some resolvedRest =>
+              let tag := mem.nextTag
+              let fullProj :=
+                match parentEntry.targetProjection with
+                | .nil => resolvedRest
+                | ph :: pt => ph :: appendProjections pt resolvedRest
+              let entry : BorrowEntry := {
+                tag := tag
+                targetLocal := parentEntry.targetLocal
+                targetProjection := fullProj
+                perm := perm
+              }
+              let mem' := {
+                mem with
+                borrows := entry :: mem.borrows
+                nextTag := Nat.add tag 1
+              }
+              .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
         | .none => .ub
       | _ => .ub
     | _ =>
@@ -1832,19 +2014,22 @@ def evalRvalue
       | .none => .ub
       | .some .dead => .ub
       | .some _ =>
-        let tag := mem.nextTag
-        let entry : BorrowEntry := {
-          tag := tag
-          targetLocal := place.local_
-          targetProjection := place.projection
-          perm := perm
-        }
-        let mem' := {
-          mem with
-          borrows := entry :: mem.borrows
-          nextTag := Nat.add tag 1
-        }
-        .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
+        match resolveBorrowProjectionElems locals place.projection with
+        | .none => .ub
+        | .some resolvedProj =>
+          let tag := mem.nextTag
+          let entry : BorrowEntry := {
+            tag := tag
+            targetLocal := place.local_
+            targetProjection := resolvedProj
+            perm := perm
+          }
+          let mem' := {
+            mem with
+            borrows := entry :: mem.borrows
+            nextTag := Nat.add tag 1
+          }
+          .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
   | .rawPtr mutability place =>
     let perm :=
       match mutability with
@@ -1860,23 +2045,26 @@ def evalRvalue
           | .disabled, _ => .ub
           | .frozen, .mut => .ub
           | _, _ =>
-            let tag := mem.nextTag
-            let fullProj :=
-              match parentEntry.targetProjection with
-              | .nil => restProj
-              | ph :: pt => ph :: appendProjections pt restProj
-            let entry : BorrowEntry := {
-              tag := tag
-              targetLocal := parentEntry.targetLocal
-              targetProjection := fullProj
-              perm := perm
-            }
-            let mem' := {
-              mem with
-              borrows := entry :: mem.borrows
-              nextTag := Nat.add tag 1
-            }
-            .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
+            match resolveBorrowProjectionElems locals restProj with
+            | .none => .ub
+            | .some resolvedRest =>
+              let tag := mem.nextTag
+              let fullProj :=
+                match parentEntry.targetProjection with
+                | .nil => resolvedRest
+                | ph :: pt => ph :: appendProjections pt resolvedRest
+              let entry : BorrowEntry := {
+                tag := tag
+                targetLocal := parentEntry.targetLocal
+                targetProjection := fullProj
+                perm := perm
+              }
+              let mem' := {
+                mem with
+                borrows := entry :: mem.borrows
+                nextTag := Nat.add tag 1
+              }
+              .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
         | .none => .ub
       | _ => .ub
     | _ =>
@@ -1884,19 +2072,22 @@ def evalRvalue
       | .none => .ub
       | .some .dead => .ub
       | .some _ =>
-        let tag := mem.nextTag
-        let entry : BorrowEntry := {
-          tag := tag
-          targetLocal := place.local_
-          targetProjection := place.projection
-          perm := perm
-        }
-        let mem' := {
-          mem with
-          borrows := entry :: mem.borrows
-          nextTag := Nat.add tag 1
-        }
-        .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
+        match resolveBorrowProjectionElems locals place.projection with
+        | .none => .ub
+        | .some resolvedProj =>
+          let tag := mem.nextTag
+          let entry : BorrowEntry := {
+            tag := tag
+            targetLocal := place.local_
+            targetProjection := resolvedProj
+            perm := perm
+          }
+          let mem' := {
+            mem with
+            borrows := entry :: mem.borrows
+            nextTag := Nat.add tag 1
+          }
+          .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
   | .len place =>
     match evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals with
     | .ok (.aggregate 0 elems) locals' =>

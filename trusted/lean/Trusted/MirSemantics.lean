@@ -33,6 +33,7 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   emptyLayoutTable pointeeTyOf elemTyOf resolveProjectedTy placeTy operandTy
   tyIsSigned placeIsSigned operandIsSigned evalUnaryNot signedOverflowAdd
   signedOverflowSub signedOverflowMul evalSignedDiv evalSignedRem
+  signedHalfModulus evalExactDiv evalScalarExactDiv
   evalScalarBinOp intCastTargetBytes ScalarVal AbstractByte mergeByteProvenance
   encodeLittleEndianBytes encodeScalarBytes decodeLittleEndianBytes
   decodeScalarBytes replicateUninitBytes takeAbstractBytes dropAbstractBytes
@@ -42,12 +43,15 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   scalarLayoutByteWidth decodeScalarLayoutBytes rigidTyKindByteSize
   tupleFieldsByteSize rigidTyByteSize encodeListWith decodeArrayChunksWith
   encodeUntypedValueToBytes encodeFieldsAtOffsetsWith encodeSeqFieldsWith
+  encodeUnionFieldsWith
   decodeFieldsAtOffsetsWith decodeFieldsBySpan decodeSeqFieldsWith
   defaultCodecFuel encodeValueToBytes decodeValueFromBytes lookupBorrow
   updateBorrowPerm invalidateConflictingBorrows lookupGlobalAlloc
   readLittleEndianBytes readGlobalScalar tyScalarBytes evalConstValue
-  dropValues takeValues extractSubslice readProjectedValue writeProjectedValue
+  dropValues takeValues extractSubslice readProjectedValue
+  setOrExtendFields writeProjectedValue
   sliceConstElemKind evalOperand evalOperands writePlaceValue evalByteCast
+  resolveBorrowProjectionElems rigidTyIsFreeze tyIsFreeze sharedBorrowPerm
   evalRvalue evalRvalueWithMemory advanceStmt projectionsOverlap appendValues
   spliceValues sameRigidTyShape operandPointeeTy evalCopySingleDirect
   evalCopyNonOverlappingWithCount evalCopyNonOverlapping

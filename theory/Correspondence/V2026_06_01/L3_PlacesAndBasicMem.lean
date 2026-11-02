@@ -116,7 +116,8 @@ theorem mir_readProjectedValue_field_aggregate
 Universal characterization of `.field idx ty` on `.aggregate vIdx fields` in
 `MirSemantics.writeProjectedValue`:
 1. In-bounds field with valid nested write and `set?` updates field `idx` in place;
-2. Out-of-bounds field (`get? fields idx = none`) faults with `.ub`.
+2. Out-of-bounds union variant field (`get? fields idx = none`) with valid nested write
+   extends `fields` via `setOrExtendFields fields idx updatedFieldVal`.
 -/
 theorem mir_writeProjectedValue_field_aggregate
     (locals : List LocalSlot) (vIdx idx : Nat) (fields fields' : List Value)
@@ -127,12 +128,14 @@ theorem mir_writeProjectedValue_field_aggregate
       writeProjectedValue locals (.aggregate vIdx fields) (.field idx ty :: rest) newVal =
         .ok (.aggregate vIdx fields')) ∧
     (get? fields idx = none →
-      writeProjectedValue locals (.aggregate vIdx fields) (.field idx ty :: rest) newVal = .ub) := by
+      writeProjectedValue locals .unit rest newVal = .ok updatedFieldVal →
+      writeProjectedValue locals (.aggregate vIdx fields) (.field idx ty :: rest) newVal =
+        .ok (.aggregate vIdx (setOrExtendFields fields idx updatedFieldVal))) := by
   constructor
   · intro h_get h_rec h_set
     simp [writeProjectedValue, h_get, h_rec, h_set]
-  · intro h_oob
-    simp [writeProjectedValue, h_oob]
+  · intro h_oob h_rec
+    simp [writeProjectedValue, h_oob, h_rec]
 
 /--
 **Theorem L3.6 (`mir_readPlace_deref_live_borrow`)**:
@@ -366,32 +369,38 @@ theorem mir_resolveProjectedTy_and_placeTy_characterization
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /--
-**Theorem L3.15 (`mir_dynamic_index_borrow_after_storage_dead_is_ub`)**:
-Universal root-cause theorem for `GAP-MR-0003` proved directly over
+**Theorem L3.15 (`mir_dynamic_index_borrow_after_storage_dead_corresponds`)**:
+Universal remediation theorem for `GAP-MR-0003` proved directly over
 `Trusted.Rustc.V2026_06_01.MirSemantics.{evalRvalue,readProjectedValue}`:
 For EVERY array `elems : List Value`, EVERY initial index scalar `idxSc : ScalarVal`,
+EVERY in-bounds element `elemVal : Value` (`get? elems idxSc.bits = some elemVal`),
 and EVERY memory state `mem : Memory`, evaluating `Rvalue.ref .shared` on
-`{ local_ := 0, projection := [.index 1] }` records the unevaluated projection
-`[.index 1]` in the newly allocated `BorrowEntry`, and subsequent projection read
-after `StorageDead(1)` (`localsAfterDead = [.init (.aggregate 0 elems), .dead]`)
-unconditionally returns `ProjReadResult.ub`.
+`{ local_ := 0, projection := [.index 1] }` resolves `[.index 1]` at borrow creation
+time to `[.constantIndex idxSc.bits 0 false]`, and subsequent projection read after
+`StorageDead(1)` (`localsAfterDead = [.init (.aggregate 0 elems), .dead]`) succeeds
+with `ProjReadResult.ok elemVal`.
 -/
-theorem mir_dynamic_index_borrow_after_storage_dead_is_ub
-    (elems : List Value) (idxSc : ScalarVal) (mem : Memory) :
+theorem mir_dynamic_index_borrow_after_storage_dead_corresponds
+    (elems : List Value) (idxSc : ScalarVal) (elemVal : Value) (mem : Memory)
+    (h_in : get? elems idxSc.bits = some elemVal) :
     let arrVal := Value.aggregate 0 elems
     let localsAtBorrow : List LocalSlot := [.init arrVal, .init (.scalar idxSc)]
     let expectedEntry : BorrowEntry := {
       tag := mem.nextTag
       targetLocal := 0
-      targetProjection := [.index 1]
+      targetProjection := [.constantIndex idxSc.bits 0 false]
       perm := .frozen
     }
     evalRvalue localsAtBorrow (.ref .shared { local_ := 0, projection := [.index 1] }) mem =
       .ok (.ptr { allocId := mem.nextTag, offsetBytes := 0 } 8)
         localsAtBorrow
         { mem with borrows := expectedEntry :: mem.borrows, nextTag := Nat.add mem.nextTag 1 } ∧
-    readProjectedValue [.init arrVal, .dead] arrVal expectedEntry.targetProjection = .ub := by
-  exact ⟨rfl, rfl⟩
+    readProjectedValue [.init arrVal, .dead] arrVal expectedEntry.targetProjection = .ok elemVal := by
+  constructor
+  · rfl
+  · have h_ble0 : Nat.ble 0 (length elems) = true :=
+      Nat.ble_eq.mpr (Nat.zero_le (length elems))
+    simp [readProjectedValue, h_ble0, h_in]
 
 /-! ## 2. MiniRust `BasicMemory` State Machine (`Generated.Ops`) & Algebraic Bisection -/
 
@@ -506,14 +515,16 @@ theorem memory_interface_bisection {AState : Type}
     | ok ast' =>
       simp
 
-theorem l3_dynamic_index_borrow_gap_witnessed :
+theorem l3_index_borrow_gap_witnessed :
     gapLayer .GAP_MR_0003 = .L3_PlacesAndBasicMem ∧
     gapMiriDiffCrossRef .GAP_MR_0003 = some "pass_ref_array_elem_temp_index" ∧
-    VerifiedDivergenceWitness
+    !gapIsOpen .GAP_MR_0003 = true ∧
+    VerifiedRemediationWitness
       (evalAnnealV2026_06_01 .dynamicArrayIndexBorrow defaultFixtureState)
       (evalMiniRustSnapshot .S2026_05_Matched .dynamicArrayIndexBorrow)
-      .ub
       .normalUnit :=
-  ⟨rfl, rfl, witness_GAP_MR_0003⟩
+  ⟨rfl, rfl, rfl, witness_GAP_MR_0003⟩
+
+abbrev l3_dynamic_index_borrow_gap_witnessed := l3_index_borrow_gap_witnessed
 
 end Correspondence.V2026_06_01.L3_PlacesAndBasicMem

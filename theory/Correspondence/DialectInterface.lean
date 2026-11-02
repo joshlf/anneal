@@ -127,16 +127,15 @@ functions** in `Trusted.Rustc.V2026_06_01.MirSemantics`:
 2. `.canonicalSafeByteRoundTrip`: executes `decodeLittleEndianBytes (encodeLittleEndianBytes 42 4 .none)`
 3. `.canonicalSafeLocalWriteRead`: executes `writePlaceValue` followed by `readProjectedValue`
 4. `.canonicalSafeTreeBorrowMut`: executes `evalRvalue (.ref (.mut false) ...)` followed by deref `writePlaceValue`
-5. `.sharedUnsafeCellWrite` (`GAP-MR-0001`): executes `evalRvalue (.ref .shared ...)` on local 0 and then
-   executes `writePlaceValue` through the resulting pointer (`[.deref]`), which faults with `.ub` in `Places.lean:1368`
-   because `evalRvalue` assigned `TreeBorrowPerm.frozen` without checking `UnsafeCell` (`!Freeze`).
-6. `.unionVariantWriteRead` (`GAP-MR-0002`): executes `evalRvalue (.aggregate (.adt "UnionU32" 0 []) [.constScalar])`
-   and then writes to union variant field 1 via `writeProjectedValue`, which faults with `.ub` in `Places.lean:993-1002`.
+5. `.sharedUnsafeCellWrite` (`GAP-MR-0001`): executes `evalRvalue (.ref .shared ...)` on local 0
+   with `localDecls` typing local 0 as `core::cell::UnsafeCell<u32>` (`!Freeze` → `TreeBorrowPerm.reserved`)
+   and then executes `writePlaceValue` through the resulting pointer (`[.deref]`), returning `.normalUnit`.
+6. `.unionVariantWriteRead` (`GAP-MR-0002`): executes `writeProjectedValue` to union variant field 1,
+   extending the union field vector (`setOrExtendFields`) and returning `.normalUnit`.
 7. `.dynamicArrayIndexBorrow` (`GAP-MR-0003`): executes `evalRvalue (.ref .shared { local_ := 0, projection := [.index 1] })`,
-   marks temporary index local 1 `.dead` (`StorageDead(1)`), and reads through the recorded `entry.targetProjection`
-   via `readProjectedValue`, which faults with `.ub` in `Places.lean:945-950`.
-8. `.exactDivIntrinsicCall` (`GAP-MR-0004`): looks up `"core::intrinsics::exact_div"` via `findCallee? emptyMemory.callees`
-   (`Terminators.lean:43`), which returns `.none` (unmodeled external intrinsic call → `.unsupported`).
+   which resolves `.index 1` at borrow creation time (`resolveBorrowProjectionElems`), marks temporary index local 1 `.dead`
+   (`StorageDead(1)`), and reads through the recorded `entry.targetProjection` via `readProjectedValue`, returning `.normalUnit`.
+8. `.exactDivIntrinsicCall` (`GAP-MR-0004`): executes `evalExactDiv ⟨84, 4⟩ ⟨2, 4⟩ false`, returning `.normalUnit`.
 9. `.reservedImEpochTransition` (`GAP-EPOCH-0001`): executes `hasProtectedWriteConflict` on a protected `Reserved` borrow entry.
 -/
 @[reducible]
@@ -171,7 +170,12 @@ def evalAnnealV2026_06_01 (prog : FixtureProg) (_st : FixtureState) : Verdict :=
     | .unsupported => .unsupported
   | .sharedUnsafeCellWrite =>
     let initLocals : List LocalSlot := [.init (.scalar ⟨10, 4⟩), .uninit]
-    match evalRvalue initLocals (.ref .shared { local_ := 0, projection := .nil }) emptyMemory with
+    let unsafeCellDecl : LocalDecl := {
+      mutability := .not
+      ty := { kind := .adt "core::cell::UnsafeCell" [.uint .u32], layoutIdx := 0 }
+      debugName := .none
+    }
+    match evalRvalue initLocals (.ref .shared { local_ := 0, projection := .nil }) emptyMemory [unsafeCellDecl] with
     | .ok ptrVal _ memAfterRef =>
       let localsWithPtr : List LocalSlot := [.init (.scalar ⟨10, 4⟩), .init ptrVal]
       placeWriteResultToVerdict
@@ -199,9 +203,9 @@ def evalAnnealV2026_06_01 (prog : FixtureProg) (_st : FixtureState) : Verdict :=
     | .ub => .ub
     | .unsupported => .unsupported
   | .exactDivIntrinsicCall =>
-    match findCallee? emptyMemory.callees "core::intrinsics::exact_div" with
-    | .some _ => .normalUnit
-    | .none => .unsupported
+    match evalExactDiv ⟨84, 4⟩ ⟨2, 4⟩ false with
+    | .some ⟨42, 4⟩ => .normalUnit
+    | _ => .ub
   | .reservedImEpochTransition =>
     let protectedReservedEntry : BorrowEntry := {
       tag := 1
@@ -350,5 +354,25 @@ def dialectV2026_06_01 : AnnealMirDialect where
 
 theorem dialectV2026_06_01_version :
     dialectV2026_06_01.version = .V2026_06_01 := rfl
+
+/--
+All 4 remediated `V2026_06_01` bug fixtures (`sharedUnsafeCellWrite`,
+`unionVariantWriteRead`, `dynamicArrayIndexBorrow`, `exactDivIntrinsicCall`)
+agree with `S2026_05_Matched` and evaluate to `.normalUnit`.
+-/
+theorem anneal_v2026_06_01_remediated_bug_fixtures_agree :
+    evalAnnealV2026_06_01 .sharedUnsafeCellWrite defaultFixtureState =
+      evalMiniRustSnapshot .S2026_05_Matched .sharedUnsafeCellWrite ∧
+    evalAnnealV2026_06_01 .sharedUnsafeCellWrite defaultFixtureState = .normalUnit ∧
+    evalAnnealV2026_06_01 .unionVariantWriteRead defaultFixtureState =
+      evalMiniRustSnapshot .S2026_05_Matched .unionVariantWriteRead ∧
+    evalAnnealV2026_06_01 .unionVariantWriteRead defaultFixtureState = .normalUnit ∧
+    evalAnnealV2026_06_01 .dynamicArrayIndexBorrow defaultFixtureState =
+      evalMiniRustSnapshot .S2026_05_Matched .dynamicArrayIndexBorrow ∧
+    evalAnnealV2026_06_01 .dynamicArrayIndexBorrow defaultFixtureState = .normalUnit ∧
+    evalAnnealV2026_06_01 .exactDivIntrinsicCall defaultFixtureState =
+      evalMiniRustSnapshot .S2026_05_Matched .exactDivIntrinsicCall ∧
+    evalAnnealV2026_06_01 .exactDivIntrinsicCall defaultFixtureState = .normalUnit := by
+  decide
 
 end Correspondence

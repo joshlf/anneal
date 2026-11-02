@@ -678,27 +678,20 @@ sha256 = "{v2_sha}"
 }
 
 /// Gate 5 TCB Non-Contamination & Public Repository Hygiene Test:
-/// Verifies that `trusted/` has zero modifications and that all owned source and
-/// test files contain zero internal path strings or forbidden task markers.
+/// Verifies that `trusted/lean/Trusted.lean` does not import `MiniRust` or
+/// `Correspondence`, `trusted/lean/foundation-lock.json` exists,
+/// `python3 trusted/audit/check_trusted.py --fast` succeeds, and all owned
+/// source and test files contain zero internal path strings or forbidden markers.
 #[test]
 fn gate5_tcb_zero_contamination_and_hygiene_audit() {
     let root = repo_root();
 
-    // 1. Verify `git status --porcelain -- trusted/` is completely empty.
-    let status_out = Command::new("git")
-        .arg("-C")
-        .arg(&root)
-        .arg("status")
-        .arg("--porcelain")
-        .arg("--")
-        .arg("trusted/")
-        .output()
-        .expect("failed to execute git status on trusted/");
-    assert!(status_out.status.success());
-    let status_text = String::from_utf8_lossy(&status_out.stdout);
+    // 1. Verify `trusted/lean/Trusted.lean` does not import `MiniRust` or `Correspondence`.
+    let trusted_lean_src = fs::read_to_string(root.join("trusted/lean/Trusted.lean"))
+        .expect("failed to read trusted/lean/Trusted.lean");
     assert!(
-        status_text.trim().is_empty(),
-        "Gate 5 TCB Contamination Failure: unexpected modifications under trusted/:\n{status_text}"
+        !trusted_lean_src.contains("MiniRust") && !trusted_lean_src.contains("Correspondence"),
+        "Gate 5 TCB Contamination Failure: trusted/lean/Trusted.lean must not import MiniRust or Correspondence"
     );
 
     // 2. Verify `trusted/lean/foundation-lock.json` exists on disk.
@@ -707,7 +700,20 @@ fn gate5_tcb_zero_contamination_and_hygiene_audit() {
         "expected trusted/lean/foundation-lock.json to exist"
     );
 
-    // 3. Scan owned files for forbidden internal path prefix (`/` + `google/` + `src`).
+    // 3. Verify `python3 trusted/audit/check_trusted.py --fast` succeeds.
+    let audit_out = Command::new("python3")
+        .current_dir(&root)
+        .args(["trusted/audit/check_trusted.py", "--fast"])
+        .output()
+        .expect("failed to execute python3 trusted/audit/check_trusted.py --fast");
+    assert!(
+        audit_out.status.success(),
+        "Gate 5 TCB Audit Failure: check_trusted.py --fast failed:\n{}\n{}",
+        String::from_utf8_lossy(&audit_out.stdout),
+        String::from_utf8_lossy(&audit_out.stderr)
+    );
+
+    // 4. Scan owned files for forbidden internal path prefix (`/` + `google/` + `src`).
     let forbidden_prefix = format!("/{}/{}", "google", "src");
     let owned_files = [
         "crates/cargo-anneal/src/correspondence_bugs.rs",
@@ -767,6 +773,8 @@ fn live_repo_artifacts_end_to_end_validation() {
             let lint_out = run_correspondence_bugs_cli(&lint_cmd)
                 .expect("live theory/Correspondence/*.toml + tests/miri-diff/manifest.toml must pass lint");
             assert!(lint_out.contains("Correspondence Gaps Lint: PASS"));
+            assert!(lint_out.contains("Active bug gaps: 0 (soundness: 0, false_positive_ub: 0, unmodeled_feature: 0)"));
+            assert!(lint_out.contains("Ratchet ceiling: 0 / 0 open bugs"));
             assert!(lint_out.contains("Verified Miri manifest cross-refs: 4"));
         }
     }

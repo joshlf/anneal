@@ -438,14 +438,13 @@ theorem mir_attachBorrowProtector_and_hasProtectedWriteConflict
 
 /--
 **Theorem L4.10 (`mir_shared_ref_always_assigns_frozen_and_rejects_write`)**:
-Universal root-cause theorem for `GAP-MR-0001` proved directly over
-`Trusted.Rustc.V2026_06_01.MirSemantics.{evalRvalue,writePlaceValue}`:
-For EVERY initialized root value `initVal : Value`, EVERY write value `newVal : Value`,
-and EVERY memory state `mem : Memory`, taking a shared reference
-`Rvalue.ref .shared { local_ := 0, projection := .nil }` via `evalRvalue` unconditionally
-allocates a `BorrowEntry` with `perm := .frozen` (ignoring whether the pointee type
-contains `UnsafeCell`), and writing `newVal` through that pointer via `writePlaceValue`
-unconditionally returns `PlaceWriteResult.ub`.
+For `Freeze` (or untyped default `localDecls = .nil`) places, taking a shared reference
+`Rvalue.ref .shared { local_ := 0, projection := .nil }` via `evalRvalue` allocates a
+`BorrowEntry` with `perm := .frozen`, and writing `newVal` through that pointer via
+`writePlaceValue` returns `PlaceWriteResult.ub`.
+Conversely, when `localDecls` types local 0 as `core::cell::UnsafeCell<u32>` (`!Freeze`),
+`sharedBorrowPerm` returns `TreeBorrowPerm.reserved` and writing `newVal` through that
+pointer succeeds with `.ok [.init newVal, .init ptrVal]`.
 -/
 theorem mir_shared_ref_always_assigns_frozen_and_rejects_write
     (initVal newVal : Value) (mem : Memory) :
@@ -456,19 +455,40 @@ theorem mir_shared_ref_always_assigns_frozen_and_rejects_write
       targetProjection := .nil
       perm := .frozen
     }
+    let reservedEntry : BorrowEntry := {
+      tag := mem.nextTag
+      targetLocal := 0
+      targetProjection := .nil
+      perm := .reserved
+    }
+    let unsafeCellDecl : LocalDecl := {
+      mutability := .not
+      ty := { kind := .adt "core::cell::UnsafeCell" [.uint .u32], layoutIdx := 0 }
+      debugName := .none
+    }
     let ptrVal : Value := .ptr { allocId := mem.nextTag, offsetBytes := 0 } 8
-    let memAfterRef : Memory := {
+    let memAfterFreezeRef : Memory := {
       mem with
       borrows := frozenEntry :: mem.borrows
       nextTag := Nat.add mem.nextTag 1
     }
+    let memAfterUnsafeCellRef : Memory := {
+      mem with
+      borrows := reservedEntry :: mem.borrows
+      nextTag := Nat.add mem.nextTag 1
+    }
     evalRvalue initLocals (.ref .shared { local_ := 0, projection := .nil }) mem =
-      .ok ptrVal initLocals memAfterRef ∧
-    writePlaceValue [.init initVal, .init ptrVal] memAfterRef.borrows
-      { local_ := 1, projection := [.deref] } newVal = .ub := by
-  constructor
-  · rfl
+      .ok ptrVal initLocals memAfterFreezeRef ∧
+    writePlaceValue [.init initVal, .init ptrVal] memAfterFreezeRef.borrows
+      { local_ := 1, projection := [.deref] } newVal = .ub ∧
+    evalRvalue initLocals (.ref .shared { local_ := 0, projection := .nil }) mem [unsafeCellDecl] =
+      .ok ptrVal initLocals memAfterUnsafeCellRef ∧
+    writePlaceValue [.init initVal, .init ptrVal] memAfterUnsafeCellRef.borrows
+      { local_ := 1, projection := [.deref] } newVal = .ok [.init newVal, .init ptrVal] := by
+  refine ⟨rfl, ?_, rfl, ?_⟩
   · simp [writePlaceValue, lookupBorrow, Trusted.Sequence.get?, ProvenancePtr.tag, Nat.beq_refl]
+  · simp [writePlaceValue, lookupBorrow, Trusted.Sequence.get?, Trusted.Sequence.set?,
+      ProvenancePtr.tag, Nat.beq_refl]
 
 /-! ## 4. Full Read/Write/Protector Automaton Across `S2026_05_Matched` & `S2026_07_BleedingEdge` -/
 
@@ -694,15 +714,24 @@ theorem protected_live_tag_foreign_write_is_ub
   | frozen => rfl
   | disabled => exact absurd rfl h_live
 
+theorem l4_shared_unsafecell_gap_witnessed :
+    gapLayer .GAP_MR_0001 = .L4_TreeBorrows ∧
+    gapMiriDiffCrossRef .GAP_MR_0001 = some "pass_tb_unsafe_cell_shared_mutation" ∧
+    !gapIsOpen .GAP_MR_0001 = true ∧
+    VerifiedRemediationWitness
+      (evalAnnealV2026_06_01 .sharedUnsafeCellWrite defaultFixtureState)
+      (evalMiniRustSnapshot .S2026_05_Matched .sharedUnsafeCellWrite)
+      .normalUnit :=
+  ⟨rfl, rfl, rfl, witness_GAP_MR_0001⟩
+
 theorem shared_borrow_unsafe_cell_non_correspondence (snap : MiniRustSnap) :
     annealStepTreeBorrowPerm .frozen .childLocal .write false =
       .error (.ub "tree borrows invalid local access") ∧
     mrStepTreeBorrowPerm snap true .frozen .childLocal .write false =
       .ok .frozen ∧
-    VerifiedDivergenceWitness
+    VerifiedRemediationWitness
       (evalAnnealV2026_06_01 .sharedUnsafeCellWrite defaultFixtureState)
       (evalMiniRustSnapshot .S2026_05_Matched .sharedUnsafeCellWrite)
-      .ub
       .normalUnit := by
   refine ⟨rfl, ?_, witness_GAP_MR_0001⟩
   cases snap <;> rfl

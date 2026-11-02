@@ -1093,6 +1093,43 @@ theorem concretizeSymSlot_eq_of_not_dead
     | uninit => exact Or.inl rfl
     | init v => exact Or.inr ⟨v, rfl⟩
 
+/-- Resolve static (non-`.deref`, non-`.index`) borrow projection elements. -/
+def resolveSymBorrowProjectionElems :
+    List ProjectionElem → Option (List ProjectionElem)
+  | .nil => .some .nil
+  | .deref :: _ => .none
+  | .index _ :: _ => .none
+  | elem :: rest =>
+    match resolveSymBorrowProjectionElems rest with
+    | .some rest' => .some (elem :: rest')
+    | .none => .none
+
+theorem resolveSymBorrowProjectionElems_sound
+    (locals : List LocalSlot)
+    (projs resolved : List ProjectionElem)
+    (h : resolveSymBorrowProjectionElems projs = .some resolved) :
+    resolveBorrowProjectionElems locals projs = .some resolved := by
+  induction projs generalizing resolved with
+  | nil =>
+    injection h with hEq
+    subst hEq
+    rfl
+  | cons pHead pTail ih =>
+    cases pHead with
+    | deref | index _ => nomatch h
+    | field _ _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+      dsimp only [resolveSymBorrowProjectionElems] at h
+      dsimp only [resolveBorrowProjectionElems]
+      cases hRest : resolveSymBorrowProjectionElems pTail with
+      | none =>
+        rw [hRest] at h
+        nomatch h
+      | some rest' =>
+        rw [hRest] at h
+        injection h with hEq
+        subst hEq
+        rw [ih rest' hRest]
+
 /-- Evaluate an `Rvalue` that produces a `SymVal`. -/
 def evalSymRvalueConcrete
     (slots : List SymSlot)
@@ -1114,7 +1151,7 @@ def evalSymRvalueConcrete
   | .ref borrowKind place =>
     let perm :=
       match borrowKind with
-      | .shared => TreeBorrowPerm.frozen
+      | .shared => sharedBorrowPerm localDecls layouts place
       | .mut false => TreeBorrowPerm.active
       | .mut true => TreeBorrowPerm.reserved
     match place.projection with
@@ -1124,17 +1161,20 @@ def evalSymRvalueConcrete
       | .none => .none
       | .some (.concrete .dead) => .none
       | .some _ =>
-        let entry : BorrowEntry := {
-          tag := nextTag
-          targetLocal := place.local_
-          targetProjection := place.projection
-          perm := perm
-        }
-        .some
-          (.concrete (.ptr { allocId := nextTag, offsetBytes := 0 } 8),
-           slots,
-           entry :: borrows,
-           Nat.add nextTag 1)
+        match resolveSymBorrowProjectionElems place.projection with
+        | .none => .none
+        | .some resolvedProj =>
+          let entry : BorrowEntry := {
+            tag := nextTag
+            targetLocal := place.local_
+            targetProjection := resolvedProj
+            perm := perm
+          }
+          .some
+            (.concrete (.ptr { allocId := nextTag, offsetBytes := 0 } 8),
+             slots,
+             entry :: borrows,
+             Nat.add nextTag 1)
   | .binaryOp op lhsOp rhsOp =>
     match evalSymOperand slots lhsOp borrows with
     | .some (.concrete (.scalar lhs), slots₁) =>
@@ -1273,8 +1313,8 @@ theorem evalSymRvalueConcrete_sound
     | mk loc proj =>
       cases proj with
       | nil =>
-        dsimp only [evalSymRvalueConcrete] at h
-        dsimp only [evalRvalue]
+        dsimp only [evalSymRvalueConcrete, resolveSymBorrowProjectionElems] at h
+        dsimp only [evalRvalue, resolveBorrowProjectionElems]
         rw [get?_concretizeSymSlots args slots loc]
         cases hGet : get? slots loc with
         | none =>
@@ -1294,9 +1334,19 @@ theorem evalSymRvalueConcrete_sound
       | cons pHead pTail =>
         cases pHead with
         | deref => nomatch h
-        | field _ _ | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
-          dsimp only [evalSymRvalueConcrete] at h
-          dsimp only [evalRvalue]
+        | index _ =>
+          dsimp only [evalSymRvalueConcrete, resolveSymBorrowProjectionElems] at h
+          cases hGet : get? slots loc with
+          | none =>
+            rw [hGet] at h
+            nomatch h
+          | some sSlot =>
+            rw [hGet] at h
+            have ⟨_, hOk⟩ := symSlot_not_dead_of_match_some h
+            nomatch hOk
+        | field _ _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+          dsimp only [evalSymRvalueConcrete, resolveSymBorrowProjectionElems] at h
+          dsimp only [evalRvalue, resolveBorrowProjectionElems]
           rw [get?_concretizeSymSlots args slots loc]
           cases hGet : get? slots loc with
           | none =>
@@ -1305,14 +1355,21 @@ theorem evalSymRvalueConcrete_sound
           | some sSlot =>
             rw [hGet] at h
             have ⟨hNotDead, hOk⟩ := symSlot_not_dead_of_match_some h
-            injection hOk with hTup
-            injection hTup with hV hRest1
-            injection hRest1 with hS hRest2
-            injection hRest2 with hB hT
-            subst hV; subst hS; subst hB; subst hT
-            dsimp only
-            rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
-              (rw [hSlot]; rfl)
+            cases hRes : resolveSymBorrowProjectionElems pTail with
+            | none =>
+              rw [hRes] at hOk
+              nomatch hOk
+            | some rest' =>
+              rw [hRes] at hOk
+              injection hOk with hTup
+              injection hTup with hV hRest1
+              injection hRest1 with hS hRest2
+              injection hRest2 with hB hT
+              subst hV; subst hS; subst hB; subst hT
+              rw [resolveSymBorrowProjectionElems_sound (concretizeSymSlots args slots) pTail rest' hRes]
+              dsimp only
+              rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+                (rw [hSlot]; rfl)
   | binaryOp op lhsOp rhsOp =>
     dsimp only [evalSymRvalueConcrete] at h
     dsimp only [evalRvalue]

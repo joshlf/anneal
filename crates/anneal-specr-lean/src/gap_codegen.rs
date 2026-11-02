@@ -455,11 +455,14 @@ fn validate_registry_and_matrix_inner(
             errors.push(format!("duplicate gap id `{}`", g.id));
         }
 
-        match g.kind {
-            GapKind::AnnealSoundnessBug => soundness_bug_count += 1,
-            GapKind::AnnealFalsePositiveUb => false_positive_ub_count += 1,
-            GapKind::AnnealUnmodeledFeature => unmodeled_feature_count += 1,
-            GapKind::IntentionalEpochDivergence => epoch_divergence_count += 1,
+        let is_closed = g.status.trim().eq_ignore_ascii_case("closed");
+        if !is_closed {
+            match g.kind {
+                GapKind::AnnealSoundnessBug => soundness_bug_count += 1,
+                GapKind::AnnealFalsePositiveUb => false_positive_ub_count += 1,
+                GapKind::AnnealUnmodeledFeature => unmodeled_feature_count += 1,
+                GapKind::IntentionalEpochDivergence => epoch_divergence_count += 1,
+            }
         }
 
         let gp = g.guard_predicate.trim();
@@ -531,7 +534,8 @@ fn validate_registry_and_matrix_inner(
             .gaps
             .iter()
             .filter(|g| {
-                g.anneal_versions.iter().any(|v| v == &cell.anneal_version)
+                !g.status.trim().eq_ignore_ascii_case("closed")
+                    && g.anneal_versions.iter().any(|v| v == &cell.anneal_version)
                     && g.minirust_snapshots.iter().any(|s| s == &cell.minirust_snapshot)
                     && (cell.layer == "*" || g.layer == cell.layer)
             })
@@ -661,7 +665,70 @@ pub fn emit_generated_gaps_lean(registry: &GapRegistry, matrix: &CorrespondenceM
     s.push_str(&format!("def totalGapCount : Nat := {}\n", registry.gaps.len()));
     s.push_str(&format!("def matrixCellCount : Nat := {}\n\n", matrix.cells.len()));
 
+    s.push_str("def gapIsOpen : GapId → Bool\n");
+    if registry.gaps.is_empty() {
+        s.push_str("  | .noneRegistered => false\n\n");
+    } else {
+        for g in &registry.gaps {
+            let is_open = !g.status.trim().eq_ignore_ascii_case("closed");
+            s.push_str(&format!("  | .{} => {}\n", g.lean_ctor_ident(), is_open));
+        }
+        s.push('\n');
+    }
+
+    s.push_str("def activeBugGaps (ver : AnnealVer) (snap : MiniRustSnap) : List GapId :=\n");
+    s.push_str("  allGapIds.filter (fun id => gapIsOpen id && (gapKind id).isAnnealBug && gapAppliesTo id ver snap)\n\n");
+
+    s.push_str("def closedBugGaps (ver : AnnealVer) (snap : MiniRustSnap) : List GapId :=\n");
+    s.push_str("  allGapIds.filter (fun id => !gapIsOpen id && (gapKind id).isAnnealBug && gapAppliesTo id ver snap)\n\n");
+
     s.push_str("theorem registered_gap_count_exact : registeredGaps.length = totalGapCount := rfl\n\n");
+    s.push_str("end Correspondence\n");
+    s
+}
+
+/// Deterministically emits self-contained Lean 4 source code for `GeneratedGapWitnesses.lean`
+/// from a `GapRegistry`, emitting `VerifiedRemediationWitness` theorems when `status == "closed"`
+/// and `VerifiedDivergenceWitness` theorems when `status != "closed"`.
+#[must_use]
+pub fn emit_generated_gap_witnesses_lean(registry: &GapRegistry) -> String {
+    let mut s = String::with_capacity(8192);
+    s.push_str("import Correspondence.Framework\n");
+    s.push_str("import Correspondence.DialectInterface\n");
+    s.push_str("import Correspondence.GeneratedGaps\n\n");
+    s.push_str("namespace Correspondence\n\n");
+    s.push_str("@[reducible]\n");
+    s.push_str("def VerifiedRemediationWitness (annealEval minirustEval expectedVerdict : Verdict) : Prop :=\n");
+    s.push_str("  annealEval = expectedVerdict ∧ minirustEval = expectedVerdict ∧ annealEval = minirustEval\n\n");
+    s.push_str("instance instDecidableVerifiedRemediationWitness (a m ev : Verdict) :\n");
+    s.push_str("    Decidable (VerifiedRemediationWitness a m ev) :=\n");
+    s.push_str("  inferInstanceAs (Decidable (a = ev ∧ m = ev ∧ a = m))\n\n");
+
+    for g in &registry.gaps {
+        let ctor = g.lean_ctor_ident();
+        let fixture = g
+            .witness_fixture
+            .rsplit('.')
+            .next()
+            .unwrap_or(g.witness_fixture.as_str())
+            .trim();
+        let snap = g
+            .minirust_snapshots
+            .first()
+            .map_or("S2026_05_Matched", String::as_str);
+        let anneal_v = g.expected_anneal_verdict.trim();
+        let minirust_v = g.expected_minirust_verdict.trim();
+        if g.status.trim().eq_ignore_ascii_case("closed") {
+            s.push_str(&format!(
+                "theorem witness_{ctor} :\n    VerifiedRemediationWitness\n      (evalAnnealV2026_06_01 .{fixture} defaultFixtureState)\n      (evalMiniRustSnapshot .{snap} .{fixture})\n      .{minirust_v} := by\n  decide\n\n"
+            ));
+        } else {
+            s.push_str(&format!(
+                "theorem witness_{ctor} :\n    VerifiedDivergenceWitness\n      (evalAnnealV2026_06_01 .{fixture} defaultFixtureState)\n      (evalMiniRustSnapshot .{snap} .{fixture})\n      .{anneal_v}\n      .{minirust_v} := by\n  decide\n\n"
+            ));
+        }
+    }
+
     s.push_str("end Correspondence\n");
     s
 }

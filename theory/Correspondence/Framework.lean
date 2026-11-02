@@ -32,7 +32,7 @@ inductive AnnealVer : Type where
   | V2026_06_01
   /-- Planned follow-up MIR model absorbing post-2026-05 Tree Borrows relaxations. -/
   | V2026_12_01
-  deriving DecidableEq, Repr
+  deriving DecidableEq, BEq, Repr
 
 /-- Mechanically ingested upstream MiniRust snapshots. -/
 inductive MiniRustSnap : Type where
@@ -40,7 +40,7 @@ inductive MiniRustSnap : Type where
   | S2026_05_Matched
   /-- Upstream MiniRust bleeding-edge snapshot tracking `master` HEAD. -/
   | S2026_07_BleedingEdge
-  deriving DecidableEq, Repr
+  deriving DecidableEq, BEq, Repr
 
 /-- Horizontal semantic slices of the correspondence proof architecture. -/
 inductive SemanticLayer : Type where
@@ -48,7 +48,9 @@ inductive SemanticLayer : Type where
   | L2_BytesAndLayout
   | L3_PlacesAndBasicMem
   | L4_TreeBorrows
-  deriving DecidableEq, Repr
+  | L5_ControlAndCalls
+  | L6_WholeMachine
+  deriving DecidableEq, BEq, Repr
 
 /-- Formal correspondence expectation tiers in `correspondence_matrix.toml`. -/
 inductive ExpectedTier : Type where
@@ -58,7 +60,7 @@ inductive ExpectedTier : Type where
   | EpochDeltaOnly
   /-- Bounded bug ratchet (`activeBugGaps.length ≤ maxOpenBugs`) with kernel witnesses. -/
   | GuardedRatchet
-  deriving DecidableEq, Repr
+  deriving DecidableEq, BEq, Repr
 
 /-! ## 2. Four-Way Formal Non-Correspondence Taxonomy -/
 
@@ -86,6 +88,11 @@ def isBug : GapKind → Bool
   | .anneal_false_positive_ub => true
   | .anneal_unmodeled_feature => true
   | .intentional_epoch_divergence => false
+
+/-- Alias for `GapKind.isBug` used by generated gap ratchet queries. -/
+@[reducible]
+def isAnnealBug : GapKind → Bool :=
+  isBug
 
 /-- Whether this class blocks a declaration from carrying `@[vetted]`. -/
 @[reducible]

@@ -3,66 +3,75 @@ import Correspondence.DialectInterface
 import Correspondence.GeneratedGaps
 
 /-!
-# `Correspondence.GeneratedGapWitnesses` — Self-Invalidating Kernel Divergence Witnesses
+# `Correspondence.GeneratedGapWitnesses` — Kernel Divergence & Remediation Witnesses
 
-Implements the two-way non-correspondence ratchet:
+Implements the two-way non-correspondence and remediation ratchet:
 
-Every single entry in `theory/Correspondence/correspondence_gaps.toml` MUST have
-a kernel-checked `by decide` theorem proving `VerifiedDivergenceWitness`. The
-moment the underlying bug in Anneal is fixed so that Anneal and MiniRust agree,
-`by decide` deterministically fails to compile until the stale gap entry is
-removed from `correspondence_gaps.toml`.
+- Every open or active entry in `theory/Correspondence/correspondence_gaps.toml`
+  carries a kernel-checked `by decide` theorem proving `VerifiedDivergenceWitness`.
+- Every closed remediated entry (`status = "closed"`) carries a kernel-checked
+  `by decide` theorem proving `VerifiedRemediationWitness`, certifying that Anneal
+  and MiniRust now agree on the remediated verdict.
 -/
 
 namespace Correspondence
 
-/-! ## 1. Individual Mandatory Divergence Witnesses (`by decide`) -/
+/--
+Decidable predicate asserting that Anneal and MiniRust both evaluate to the
+remediated `expectedVerdict` and agree with each other.
+-/
+@[reducible]
+def VerifiedRemediationWitness (annealEval minirustEval expectedVerdict : Verdict) : Prop :=
+  annealEval = expectedVerdict ∧ minirustEval = expectedVerdict ∧ annealEval = minirustEval
 
-/-- `GAP-MR-0001` (`anneal_soundness_bug`, `L4_TreeBorrows`):
-    `BorrowKind.shared` over `UnsafeCell` freezes permission in Anneal (`ub`) while
-    MiniRust permits interior-mutable write (`normalUnit`). -/
+instance instDecidableVerifiedRemediationWitness
+    (a m ev : Verdict) : Decidable (VerifiedRemediationWitness a m ev) :=
+  inferInstanceAs (Decidable (a = ev ∧ m = ev ∧ a = m))
+
+/-! ## 1. Individual Mandatory Remediation & Divergence Witnesses (`by decide`) -/
+
+/-- `GAP-MR-0001` (`anneal_soundness_bug`, `L4_TreeBorrows`, `status = "closed"`):
+    `BorrowKind.shared` over `UnsafeCell` initializes `TreeBorrowPerm.reserved` in Anneal
+    so both Anneal and MiniRust permit interior-mutable write (`normalUnit`). -/
 theorem witness_GAP_MR_0001 :
-    VerifiedDivergenceWitness
+    VerifiedRemediationWitness
       (evalAnnealV2026_06_01 .sharedUnsafeCellWrite defaultFixtureState)
       (evalMiniRustSnapshot .S2026_05_Matched .sharedUnsafeCellWrite)
-      .ub
       .normalUnit := by
   decide
 
-/-- `GAP-MR-0002` (`anneal_false_positive_ub`, `L2_BytesAndLayout`):
-    Union cross-variant write followed by read faults as `ub` in Anneal while
-    stepping cleanly (`normalUnit`) in MiniRust. -/
+/-- `GAP-MR-0002` (`anneal_false_positive_ub`, `L2_BytesAndLayout`, `status = "closed"`):
+    Union cross-variant write followed by read steps cleanly (`normalUnit`) in both
+    Anneal and MiniRust. -/
 theorem witness_GAP_MR_0002 :
-    VerifiedDivergenceWitness
+    VerifiedRemediationWitness
       (evalAnnealV2026_06_01 .unionVariantWriteRead defaultFixtureState)
       (evalMiniRustSnapshot .S2026_05_Matched .unionVariantWriteRead)
-      .ub
       .normalUnit := by
   decide
 
-/-- `GAP-MR-0003` (`anneal_false_positive_ub`, `L3_PlacesAndBasicMem`):
-    Dynamic array index borrow after `StorageDead` of temporary index local
-    faults as `ub` in Anneal while stepping cleanly (`normalUnit`) in MiniRust. -/
+/-- `GAP-MR-0003` (`anneal_false_positive_ub`, `L3_PlacesAndBasicMem`, `status = "closed"`):
+    Dynamic array index borrow resolves `.index` at borrow creation time so dereferencing
+    after `StorageDead` of the temporary index local steps cleanly (`normalUnit`) in both
+    Anneal and MiniRust. -/
 theorem witness_GAP_MR_0003 :
-    VerifiedDivergenceWitness
+    VerifiedRemediationWitness
       (evalAnnealV2026_06_01 .dynamicArrayIndexBorrow defaultFixtureState)
       (evalMiniRustSnapshot .S2026_05_Matched .dynamicArrayIndexBorrow)
-      .ub
       .normalUnit := by
   decide
 
-/-- `GAP-MR-0004` (`anneal_unmodeled_feature`, `L1_Scalars`):
-    `core::intrinsics::exact_div` halts as `.unsupported` in Anneal while
-    evaluating inline (`normalUnit`) in MiniRust. -/
+/-- `GAP-MR-0004` (`anneal_unmodeled_feature`, `L1_Scalars`, `status = "closed"`):
+    `core::intrinsics::exact_div` evaluates inline via `evalExactDiv` (`normalUnit`) in both
+    Anneal and MiniRust. -/
 theorem witness_GAP_MR_0004 :
-    VerifiedDivergenceWitness
+    VerifiedRemediationWitness
       (evalAnnealV2026_06_01 .exactDivIntrinsicCall defaultFixtureState)
       (evalMiniRustSnapshot .S2026_05_Matched .exactDivIntrinsicCall)
-      .unsupported
       .normalUnit := by
   decide
 
-/-- `GAP-EPOCH-0001` (`intentional_epoch_divergence`, `L4_TreeBorrows`):
+/-- `GAP-EPOCH-0001` (`intentional_epoch_divergence`, `L4_TreeBorrows`, `status = "active"`):
     Agrees on `S2026_05_Matched` (`ub = ub`), while diverging as documented on
     `S2026_07_BleedingEdge` (`ub` vs. `normalUnit`). -/
 theorem witness_GAP_EPOCH_0001 :
@@ -75,10 +84,20 @@ theorem witness_GAP_EPOCH_0001 :
       .normalUnit := by
   decide
 
-/-! ## 2. Universal Guarded Agreement Theorem Across All Fixtures & Snapshots -/
+/-! ## 2. Universal Unconditional Matched Agreement & Guarded Multi-Snapshot Agreement -/
 
 /--
-Outside the active gaps for `(V2026_06_01, snap)`, Anneal `V2026_06_01` and
+On `S2026_05_Matched`, Anneal `V2026_06_01` and MiniRust `S2026_05_Matched` produce
+**100% identical verdicts unconditionally** across EVERY `prog : FixtureProg`!
+-/
+theorem all_matched_fixtures_agree_unconditionally (prog : FixtureProg) :
+    evalAnnealV2026_06_01 prog defaultFixtureState =
+      evalMiniRustSnapshot .S2026_05_Matched prog := by
+  cases prog <;> decide
+
+/--
+Outside the active gaps for `(V2026_06_01, snap)` (which is `[]` on `S2026_05_Matched`
+and `[.GAP_EPOCH_0001]` on `S2026_07_BleedingEdge`), Anneal `V2026_06_01` and
 MiniRust snapshot `snap` produce **100% identical verdicts** on every fixture,
 across BOTH `S2026_05_Matched` and `S2026_07_BleedingEdge`!
 -/
