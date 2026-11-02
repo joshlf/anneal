@@ -1,0 +1,107 @@
+# ==============================================================================
+# Anneal <-> MiniRust Multi-Version Expected Correspondence Matrix
+# ==============================================================================
+#
+# Axes:
+#   1. `anneal_version`    : Versioned MIR dialect in `trusted/lean/Trusted/Rustc/V*`
+#   2. `minirust_snapshot` : Mechanically ingested snapshot in `theory/MiniRust/Snapshots/S*`
+#   3. `layer`             : Horizontal semantic slice (`L1_Scalars` .. `L4_TreeBorrows`)
+#
+# Formal Tiers (`expected_tier`):
+#   - `ExactUnconditional` : Zero bug gaps and zero epoch divergences (`active_gaps = []`)
+#   - `EpochDeltaOnly`     : Zero bug gaps; only documented `GAP-EPOCH-*` version deltas
+#   - `GuardedRatchet`     : Monotonically non-increasing bug ceiling (`<= max_open_bugs`)
+
+schema_version = 1
+default_anneal_version = "V2026_06_01"
+matched_snapshot = "S2026_05_Matched"
+bleeding_edge_snapshot = "S2026_07_BleedingEdge"
+global_max_open_bugs = 4
+
+# ------------------------------------------------------------------------------
+# Pairing 1: V2026_06_01 vs. S2026_05_Matched (Target: ExactUnconditional)
+# ------------------------------------------------------------------------------
+
+[[cells]]
+anneal_version = "V2026_06_01"
+minirust_snapshot = "S2026_05_Matched"
+layer = "L1_Scalars"
+expected_tier = "GuardedRatchet"
+target_tier = "ExactUnconditional"
+max_open_bugs = 1
+allowed_epoch_gaps = []
+proof_module = "Correspondence.V2026_06_01.L1_Scalars"
+
+[[cells]]
+anneal_version = "V2026_06_01"
+minirust_snapshot = "S2026_05_Matched"
+layer = "L2_BytesAndLayout"
+expected_tier = "GuardedRatchet"
+target_tier = "ExactUnconditional"
+max_open_bugs = 1
+allowed_epoch_gaps = []
+proof_module = "Correspondence.V2026_06_01.L2_BytesAndLayout"
+
+[[cells]]
+anneal_version = "V2026_06_01"
+minirust_snapshot = "S2026_05_Matched"
+layer = "L3_PlacesAndBasicMem"
+expected_tier = "GuardedRatchet"
+target_tier = "ExactUnconditional"
+max_open_bugs = 1
+allowed_epoch_gaps = []
+proof_module = "Correspondence.V2026_06_01.L3_PlacesAndBasicMem"
+
+[[cells]]
+anneal_version = "V2026_06_01"
+minirust_snapshot = "S2026_05_Matched"
+layer = "L4_TreeBorrows"
+expected_tier = "GuardedRatchet"
+target_tier = "ExactUnconditional"
+max_open_bugs = 1
+allowed_epoch_gaps = []
+proof_module = "Correspondence.V2026_06_01.L4_TreeBorrows"
+
+# ------------------------------------------------------------------------------
+# Pairing 2: V2026_06_01 vs. S2026_07_BleedingEdge (Target: EpochDeltaOnly)
+# ------------------------------------------------------------------------------
+
+[[cells]]
+anneal_version = "V2026_06_01"
+minirust_snapshot = "S2026_07_BleedingEdge"
+layer = "L1_Scalars"
+expected_tier = "GuardedRatchet"
+target_tier = "EpochDeltaOnly"
+max_open_bugs = 1
+allowed_epoch_gaps = []
+proof_module = "Correspondence.V2026_06_01.L1_Scalars"
+
+[[cells]]
+anneal_version = "V2026_06_01"
+minirust_snapshot = "S2026_07_BleedingEdge"
+layer = "L2_BytesAndLayout"
+expected_tier = "GuardedRatchet"
+target_tier = "EpochDeltaOnly"
+max_open_bugs = 1
+allowed_epoch_gaps = []
+proof_module = "Correspondence.V2026_06_01.L2_BytesAndLayout"
+
+[[cells]]
+anneal_version = "V2026_06_01"
+minirust_snapshot = "S2026_07_BleedingEdge"
+layer = "L3_PlacesAndBasicMem"
+expected_tier = "GuardedRatchet"
+target_tier = "EpochDeltaOnly"
+max_open_bugs = 1
+allowed_epoch_gaps = []
+proof_module = "Correspondence.V2026_06_01.L3_PlacesAndBasicMem"
+
+[[cells]]
+anneal_version = "V2026_06_01"
+minirust_snapshot = "S2026_07_BleedingEdge"
+layer = "L4_TreeBorrows"
+expected_tier = "GuardedRatchet"
+target_tier = "EpochDeltaOnly"
+max_open_bugs = 1
+allowed_epoch_gaps = ["GAP-EPOCH-0001"]
+proof_module = "Correspondence.V2026_06_01.L4_TreeBorrows"

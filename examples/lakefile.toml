@@ -10,6 +10,14 @@ name = "Anneal"
 srcDir = "../theory"
 
 [[lean_lib]]
+name = "MiniRust"
+srcDir = "../theory"
+
+[[lean_lib]]
+name = "Correspondence"
+srcDir = "../theory"
+
+[[lean_lib]]
 name = "Smoke"
 srcDir = "."
 roots = ["Smoke"]

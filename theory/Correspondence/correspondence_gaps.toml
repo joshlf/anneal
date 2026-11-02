@@ -1,0 +1,110 @@
+# ==============================================================================
+# Anneal <-> MiniRust Formal Non-Correspondence Registry & Two-Way Bug Ratchet
+# ==============================================================================
+#
+# Policy:
+#   Every entry in this file declares one of four mutually exclusive classes:
+#     1. `anneal_soundness_bug`         - Anneal steps where MiniRust raises UB or disagrees on value
+#     2. `anneal_false_positive_ub`     - Anneal conservatively raises UB where MiniRust steps cleanly
+#     3. `anneal_unmodeled_feature`     - Anneal emits unsupported/externalCall for an unmodeled feature
+#     4. `intentional_epoch_divergence` - Documented semantic delta between pinned rustc and newer MiniRust
+#
+#   Nothing in `lake build`, `cargo test`, `minirust-sync`, or default CI ever files
+#   GitHub issues automatically. Issue formatting/filing is strictly opt-in via
+#   `cargo anneal correspondence-bugs`.
+
+schema_version = 1
+github_repo = "joshlf/anneal"
+default_labels = ["source:minirust-correspondence", "area:mir-semantics"]
+max_open_bugs = 4
+
+[[gaps]]
+id = "GAP-MR-0001"
+kind = "anneal_soundness_bug"
+severity = "P1"
+status = "open"
+title = "Shared borrow (`BorrowKind.shared`) over `UnsafeCell` freezes permission instead of preserving interior mutability"
+anneal_versions = ["V2026_06_01"]
+minirust_snapshots = ["S2026_05_Matched", "S2026_07_BleedingEdge"]
+layer = "L4_TreeBorrows"
+anneal_decl = "Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue"
+anneal_file = "trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Places.lean"
+minirust_source = "spec/mem/tree_borrows/reborrow_settings.md:1-90"
+miri_diff_cross_ref = "pass_tb_unsafe_cell_shared_mutation"
+guard_predicate = "isSharedBorrowOfUnsafeCell st body"
+witness_fixture = "Correspondence.Fixtures.sharedUnsafeCellWrite"
+expected_anneal_verdict = "ub"
+expected_minirust_verdict = "normalUnit"
+
+[[gaps]]
+id = "GAP-MR-0002"
+kind = "anneal_false_positive_ub"
+severity = "P2"
+status = "open"
+title = "Union aggregate initialization stores single-variant unit value and rejects cross-variant field writes as UB"
+anneal_versions = ["V2026_06_01"]
+minirust_snapshots = ["S2026_05_Matched", "S2026_07_BleedingEdge"]
+layer = "L2_BytesAndLayout"
+anneal_decl = "Trusted.Rustc.V2026_06_01.MirSemantics.writeProjectedValue"
+anneal_file = "trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Places.lean"
+minirust_source = "spec/lang/types.md:120-210"
+miri_diff_cross_ref = "pass_uninit_union_write_then_read"
+guard_predicate = "isUnionVariantReinterpretWrite st body"
+witness_fixture = "Correspondence.Fixtures.unionVariantWriteRead"
+expected_anneal_verdict = "ub"
+expected_minirust_verdict = "normalUnit"
+
+[[gaps]]
+id = "GAP-MR-0003"
+kind = "anneal_false_positive_ub"
+severity = "P2"
+status = "open"
+title = "Dynamic array index borrow records unevaluated `ProjectionElem.index` local instead of concrete index at borrow creation"
+anneal_versions = ["V2026_06_01"]
+minirust_snapshots = ["S2026_05_Matched", "S2026_07_BleedingEdge"]
+layer = "L3_PlacesAndBasicMem"
+anneal_decl = "Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue"
+anneal_file = "trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Places.lean"
+minirust_source = "spec/lang/step/expressions.md:98-136"
+miri_diff_cross_ref = "pass_ref_array_elem_temp_index"
+guard_predicate = "isDynamicArrayIndexBorrowAfterStorageDead st body"
+witness_fixture = "Correspondence.Fixtures.dynamicArrayIndexBorrow"
+expected_anneal_verdict = "ub"
+expected_minirust_verdict = "normalUnit"
+
+[[gaps]]
+id = "GAP-MR-0004"
+kind = "anneal_unmodeled_feature"
+severity = "P2"
+status = "open"
+title = "Unmodeled `core::intrinsics::exact_div` intrinsic emits external call instead of inline exact division semantics"
+anneal_versions = ["V2026_06_01"]
+minirust_snapshots = ["S2026_05_Matched", "S2026_07_BleedingEdge"]
+layer = "L1_Scalars"
+anneal_decl = "Trusted.Rustc.V2026_06_01.MirSemantics.evalScalarBinOp"
+anneal_file = "trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean"
+minirust_source = "spec/lang/step/intrinsics.md:64-92"
+miri_diff_cross_ref = "pass_exact_div_valid"
+guard_predicate = "isExactDivIntrinsicCall st body"
+witness_fixture = "Correspondence.Fixtures.exactDivIntrinsicCall"
+expected_anneal_verdict = "unsupported"
+expected_minirust_verdict = "normalUnit"
+
+[[gaps]]
+id = "GAP-EPOCH-0001"
+kind = "intentional_epoch_divergence"
+severity = "none"
+status = "active_version_skew"
+title = "Post-2026-05 Tree Borrows `Reserved` interior-mutability foreign read transition relaxation in bleeding-edge MiniRust"
+anneal_versions = ["V2026_06_01"]
+minirust_snapshots = ["S2026_07_BleedingEdge"]
+layer = "L4_TreeBorrows"
+anneal_decl = "Trusted.Rustc.V2026_06_01.MirSemantics.updateBorrowPerm"
+anneal_file = "trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Places.lean"
+minirust_source = "spec/mem/tree_borrows/state_machine.md:1-75"
+rationale_citation = "Upstream minirust/minirust@d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed refined Reserved interior-mutability foreign-read handling after rustc 14210df0e27ccd7d9e6a05b8085cbd438e4bbc65 (2026-05-31); slated for Trusted.Rustc.V2026_12_01."
+target_anneal_version = "V2026_12_01"
+guard_predicate = "isPostMay2026ReservedImAccess st body"
+witness_fixture = "Correspondence.Fixtures.reservedImEpochTransition"
+expected_anneal_verdict = "ub"
+expected_minirust_verdict = "normalUnit"
