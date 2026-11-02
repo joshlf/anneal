@@ -8,3 +8,4 @@
 
 prelude
 import Anneal.Refinement
+import Anneal.StepResult
