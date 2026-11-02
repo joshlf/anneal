@@ -15,9 +15,10 @@ import Anneal.StepResult
 # MIR Meta-Theorems, `id` Verification Lemmas, and Adequacy Canaries
 
 This module proves the structural non-vacuity properties (`TotalStep`,
-`InhabitedDemonic`) of `Trusted.MirMachine`, the source-level verification
-lemmas for `pub fn id(x: usize) -> usize { x }`, and the positive and negative
-Rust adequacy canaries:
+`InhabitedDemonic`) of `Trusted.MirMachine`, the verification lemmas for the
+`pub fn id(x: usize) -> usize { x }` vertical slice discharging
+`Trusted.CrateTheorem` via `VerificationResult`, and the positive and
+negative Rust adequacy canaries:
 
 1. `canary_safe_infinite_loop`: a pure infinite loop (`bb0: { goto -> bb0; }`)
    satisfies `MirSem loopBody ≤ MirLang.WellFormed`.
@@ -263,19 +264,18 @@ theorem execNormal_reaches {body : MirBody} {s : MirState}
   | normal hterm hp =>
     exact ⟨1, _, .terminated 0 _ (.normal _) hterm.symm, hp⟩
 
-/-- Discharge the baseline `MirLang.Verified pre (fun _ _ => True) body ∧
-    MirSem body ≤ MirLang.WellFormedOn pre` obligation from `ExecNormal`. -/
+/-- Discharge the baseline `MirLang.Verified pre (fun _ _ => True) body`
+    obligation from `ExecNormal`. -/
 theorem execNormal_verified {body : MirBody} {pre : MirState → Prop}
     (h_pre_init : ∀ s, pre s → initMirState body s)
     (h_inh : ∃ s₀, pre s₀)
     (h_exec : ∀ s, pre s → ExecNormal body s (fun _ => True)) :
-    MirLang.Verified pre (fun _ _ => True) body ∧
-      MirSem body ≤ MirLang.WellFormedOn pre := by
+    MirLang.Verified pre (fun _ _ => True) body := by
   have h_wf : MirSem body ≤ MirLang.WellFormedOn pre := by
     refine (eventualBehaviorOf_le_wellFormedOn_iff (M := MirMachine)).mpr ?_
     intro s n tr out hpre _ hreach
     exact (execNormal_safeAndEnsures (h_exec s hpre) hreach).1
-  refine ⟨⟨Or.inl h_inh, ?_, ?_⟩, h_wf⟩
+  refine ⟨Or.inl h_inh, ?_, ?_⟩
   · intro s hpre
     have hinit : initMirState body s := h_pre_init s hpre
     have hdef : (MirSem body s).defined := (h_wf s hpre).1
@@ -454,6 +454,134 @@ theorem idMoveBody_execNormal (s : MirState)
         dsimp [evalMirStmt, s₀]
         rw [hv1]
       exact .step hstep0 (.normal rfl True.intro)
+
+/-- Generic single-function `CrateTheorem` discharge for an unannotated safe
+    function (`specs := []`): given an inhabited initial state and `ExecNormal`
+    termination from every `initMirState`, proves `CrateTheorem` for the
+    single-function crate containing `(fnName, body)`. -/
+theorem verify_single_fn_wf_crate
+    (fnName : String) (body : MirBody)
+    {src : String}
+    (h_inh : ∃ s₀, initMirState body s₀)
+    (h_exec : ∀ s, initMirState body s → ExecNormal body s (fun _ => True)) :
+    CrateTheorem {
+      functions := [{ name := fnName, prog := body, specs := [] }]
+      tcb := [TCBItem.rustcLowering fnName body]
+      artifacts := [{ path := "src/lib.rs", contents := src, expected := src }]
+    } := by
+  have h_inh_eff : ∃ s₀, initMirState body s₀ ∧ True := by
+    cases h_inh with
+    | intro s₀ hs₀ => exact ⟨s₀, hs₀, True.intro⟩
+  have h_ver :=
+    execNormal_verified (body := body)
+      (pre := fun s => initMirState body s ∧ True)
+      (fun _ h => h.1)
+      h_inh_eff
+      (fun s h => h_exec s h.1)
+  refine ⟨(by intro h; cases h), ⟨True.intro, True.intro⟩,
+    ⟨{ path := "src/lib.rs", contents := src, expected := src }, .head _, rfl⟩,
+    ⟨rfl, True.intro⟩, ?_, True.intro⟩
+  refine ⟨(by intro h; cases h),
+    ⟨⟨(by intro h; cases h), True.intro⟩, True.intro, True.intro⟩,
+    ⟨True.intro, True.intro⟩,
+    ⟨True.intro, True.intro⟩,
+    Or.inl (.head _),
+    Or.inr ⟨h_ver, True.intro⟩,
+    True.intro⟩
+
+/-- Generic single-function `CrateTheorem` discharge: given an inhabited
+    initial state, `ExecNormal` termination from every `initMirState`, and
+    `h_proof : MirSem body ≤ spec`, proves `CrateTheorem` for the
+    single-function crate containing `(fnName, body, [spec])`. -/
+theorem verify_single_fn_crate
+    (fnName : String) (body : MirBody)
+    (spec : MirLang.Behavior)
+    {src : String}
+    (h_inh : ∃ s₀, initMirState body s₀)
+    (h_exec : ∀ s, initMirState body s → ExecNormal body s (fun _ => True))
+    (h_proof : MirSem body ≤ spec) :
+    CrateTheorem {
+      functions := [{ name := fnName, prog := body, specs := [spec] }]
+      tcb := [TCBItem.rustcLowering fnName body]
+      artifacts := [{ path := "src/lib.rs", contents := src, expected := src }]
+    } := by
+  have h_inh_eff : ∃ s₀, initMirState body s₀ ∧ True := by
+    cases h_inh with
+    | intro s₀ hs₀ => exact ⟨s₀, hs₀, True.intro⟩
+  have h_ver :=
+    execNormal_verified (body := body)
+      (pre := fun s => initMirState body s ∧ True)
+      (fun _ h => h.1)
+      h_inh_eff
+      (fun s h => h_exec s h.1)
+  refine ⟨(by intro h; cases h), ⟨True.intro, True.intro⟩,
+    ⟨{ path := "src/lib.rs", contents := src, expected := src }, .head _, rfl⟩,
+    ⟨rfl, True.intro⟩, ?_, True.intro⟩
+  refine ⟨(by intro h; cases h),
+    ⟨⟨(by intro h; cases h), True.intro⟩, True.intro, True.intro⟩,
+    ⟨True.intro, True.intro⟩,
+    ⟨True.intro, True.intro⟩,
+    Or.inl (.head _),
+    Or.inr ⟨h_ver, h_proof, True.intro⟩,
+    True.intro⟩
+
+/-- Ready-to-apply `CrateTheorem` witness for `pub fn id` (`Operand.copy`,
+    `specs := [EnsuresEqArg 1]`). -/
+theorem prove_id_copy_ensures_crate (fnName : String) {src : String} :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := idCopyBody
+        specs := [EnsuresEqArg 1]
+      }]
+      tcb := [TCBItem.rustcLowering fnName idCopyBody]
+      artifacts := [{ path := "src/lib.rs", contents := src, expected := src }]
+    } :=
+  verify_single_fn_crate fnName idCopyBody (EnsuresEqArg 1) (src := src)
+    ⟨singleArgUsizeInitState, singleArgUsizeInitState_init rfl⟩
+    idCopyBody_execNormal
+    idCopyBody_satisfies_ensures
+
+/-- Ready-to-apply `CrateTheorem` witness for unannotated `pub fn id`
+    (`Operand.copy`, `specs := []`). -/
+theorem prove_id_copy_wf_crate (fnName : String) {src : String} :
+    CrateTheorem {
+      functions := [{ name := fnName, prog := idCopyBody, specs := [] }]
+      tcb := [TCBItem.rustcLowering fnName idCopyBody]
+      artifacts := [{ path := "src/lib.rs", contents := src, expected := src }]
+    } :=
+  verify_single_fn_wf_crate fnName idCopyBody (src := src)
+    ⟨singleArgUsizeInitState, singleArgUsizeInitState_init rfl⟩
+    idCopyBody_execNormal
+
+/-- Ready-to-apply `CrateTheorem` witness for `pub fn id` (`Operand.move`,
+    `specs := [EnsuresEqArg 1]`). -/
+theorem prove_id_move_ensures_crate (fnName : String) {src : String} :
+    CrateTheorem {
+      functions := [{
+        name := fnName
+        prog := idMoveBody
+        specs := [EnsuresEqArg 1]
+      }]
+      tcb := [TCBItem.rustcLowering fnName idMoveBody]
+      artifacts := [{ path := "src/lib.rs", contents := src, expected := src }]
+    } :=
+  verify_single_fn_crate fnName idMoveBody (EnsuresEqArg 1) (src := src)
+    ⟨singleArgUsizeInitState, singleArgUsizeInitState_init rfl⟩
+    idMoveBody_execNormal
+    idMoveBody_satisfies_ensures
+
+/-- Ready-to-apply `CrateTheorem` witness for unannotated `pub fn id`
+    (`Operand.move`, `specs := []`). -/
+theorem prove_id_move_wf_crate (fnName : String) {src : String} :
+    CrateTheorem {
+      functions := [{ name := fnName, prog := idMoveBody, specs := [] }]
+      tcb := [TCBItem.rustcLowering fnName idMoveBody]
+      artifacts := [{ path := "src/lib.rs", contents := src, expected := src }]
+    } :=
+  verify_single_fn_wf_crate fnName idMoveBody (src := src)
+    ⟨singleArgUsizeInitState, singleArgUsizeInitState_init rfl⟩
+    idMoveBody_execNormal
 
 /-!
 ## Positive and Negative Rust Adequacy Canaries

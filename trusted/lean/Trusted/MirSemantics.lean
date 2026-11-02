@@ -14,10 +14,11 @@ import Trusted.StepResult
 import Trusted.MirAst
 
 /-!
-# Trusted MIR Operational Semantics (`Trusted/MirSemantics.lean`)
+# Trusted MIR Semantics and Crate Theorem (`Trusted/MirSemantics.lean`)
 
 This module defines the small-step operational semantics `MirSem` for the
-minimal MIR fragment (`Trusted/MirAst.lean`).
+minimal MIR fragment (`Trusted/MirAst.lean`) and the top-level crate
+verification obligation `Trusted.CrateTheorem`.
 
 Every declaration in this file that models a Rust execution rule explains the
 correspondence and both quotes and cites the normative Rust Reference or `rustc`
@@ -25,10 +26,10 @@ documentation at the repository's pinned revisions
 (`rust-lang/reference@82da570bafd9efed421bdbae0f8603ede8dd308b` and
 `rust-lang/rust@58cf8f9c35b355199727627d07ae34a4e2846d67`).
 
-This module belongs to `trusted/lean/` and contains only definitions and
-structures (zero theorems). All proofs (`TotalStep`, `InhabitedDemonic`,
-adequacy canaries, and `id` verification lemmas) live in
-`theory/Anneal/MirLemmas.lean`.
+This module belongs to `trusted/lean/` and contains only definitions,
+structures, inductives, and opaque interfaces (zero theorems). All proofs
+(`TotalStep`, `InhabitedDemonic`, adequacy canaries, and `id` verification
+lemmas) live in `theory/Anneal/MirLemmas.lean`.
 -/
 
 namespace Trusted
@@ -269,5 +270,158 @@ def EnsuresEqArg (argLocal : Nat) : MirLang.Behavior :=
   MirLang.Spec (fun s out =>
     ∀ tr ret, out = .terminated tr (.normal ret) →
       s.locals argLocal = some ret)
+
+/-- Abstract type of compiled target artifacts produced by `rustc`.
+
+    Its constructor is marked `private` so external modules can only obtain a
+    `TargetArtifact` through the opaque `rustc` lowering function. -/
+@[candidate mir_semantics]
+structure TargetArtifact where
+  private mk ::
+  unit : Unit
+
+/-- Abstract `rustc` lowering from a `MirBody` to a `TargetArtifact`.
+
+    Declared `opaque` so that proofs cannot unfold target compilation and must
+    instead discharge target refinement via the audited `TCBItem.rustcLowering`
+    assumption in the crate's TCB list. -/
+@[candidate mir_semantics]
+opaque rustc : MirBody → TargetArtifact := fun _ => { unit := () }
+
+/-- Abstract operational behavior of a compiled `TargetArtifact`.
+
+    Declared `opaque` so that no theorem can rely on an implementation artifact
+    of `TargetSem`; any property of `TargetSem (rustc body)` must be derived
+    from `Compiles MirLang TargetLang rustcCodec body (rustc body)` and
+    `MirSem body`. -/
+@[candidate mir_semantics]
+opaque TargetSem :
+    TargetArtifact → MirState → Partial (EventualOut Empty MirVal → Prop) :=
+  fun _ _ => Partial.ub
+
+/-- Target language of compiled `TargetArtifact`s, sharing the observable
+    eventual outcome spine `EventualOut Empty MirVal` with `MirLang`. -/
+@[candidate mir_semantics]
+def TargetLang : Language (EventualOut Empty MirVal) :=
+  Language.mkSimple TargetArtifact MirState (EventualOut Empty MirVal) TargetSem
+
+/-- Spine-preserving `BehaviorCodec` connecting `MirLang` and `TargetLang`. -/
+@[candidate mir_semantics]
+def rustcCodec : BehaviorCodec MirLang TargetLang where
+  encodeQuery s := s
+  decodeQuery s := s
+  encodeOut o   := o
+  decodeOut o   := some o
+  decodeQuery_encodeQuery _ := rfl
+  decodeOut_encodeOut _     := rfl
+  obs_decodeOut _ _ h       := by cases h; rfl
+
+/-- Audited obligation identifier in a crate's `VerificationResult`. -/
+@[candidate mir_semantics]
+inductive TCBItem where
+  /-- Standard compiler lowering obligation for a function: `rustc` lowering is
+      sound on `body` (`ProductiveCompiles MirLang TargetLang rustcCodec body
+      (rustc body)`). Tagged with `@[candidate rustc_capture]` because this
+      waiver is emitted by the `anneal-rustc-capture` pipeline when lowering a
+      captured function. -/
+  | @[candidate rustc_capture] rustcLowering (fnName : String) (body : MirBody)
+  /-- Non-waivable target compilation obligation when `c.tcb` does not waive
+      `.rustcLowering`. -/
+  | fnCompiles (fnName : String) (body : MirBody)
+  /-- Source-level MIR verification obligation for `fnName`: disallowed in
+      `defaultTrustPolicy` so it can never be waived and must always be proven
+      constructively via `Or.inr`. -/
+  | fnVerified (fnName : String) (body : MirBody)
+  /-- Explicit user-supplied axiom assumption (`#[anneal::axiom]`). -/
+  | userAxiom (name : String) (prop : Prop)
+
+/-- Default trust policy: standard `rustc` lowering waivers are permitted (under
+    the `rustc_capture` candidate feature guard); function compilation/
+    verification obligations and unapproved user axioms are rejected
+    (`False`). -/
+@[candidate mir_semantics]
+def defaultTrustPolicy : TrustPolicy TCBItem where
+  isAllowed
+    | .rustcLowering _ _ => Trusted.candidate "rustc_capture" True
+    | _ => False
+
+/-- Select the compilation obligation identifier from the head of `c.tcb`,
+    wrapping `.rustcLowering` in `Trusted.candidate "rustc_capture"` so crates
+    that do not use `rustcLowering` do not activate
+    `candidate:rustc_capture`. -/
+@[candidate mir_semantics]
+def TCBItem.compileIdFromItem (fnName : String) (body : MirBody) :
+    TCBItem → TCBItem
+  | .rustcLowering _ _ =>
+    Trusted.candidate "rustc_capture" (.rustcLowering fnName body)
+  | _ => .fnCompiles fnName body
+
+/-- Select the compilation obligation identifier for `(fnName, body)` given the
+    crate's `tcb` waiver list. -/
+@[candidate mir_semantics]
+def TCBItem.compileId (fnName : String) (body : MirBody) :
+    List TCBItem → TCBItem
+  | item :: _ => TCBItem.compileIdFromItem fnName body item
+  | [] => .fnCompiles fnName body
+
+/-- Captured MIR function pairing its identifier (`name`), lowered `MirBody`
+    (`prog`), caller safety precondition (`pre`, defaulting to `fun _ => True`
+    for safe functions), and additional specifications (`specs`, defaulting to
+    `[]`). -/
+@[candidate mir_semantics]
+structure CapturedFn where
+  name : String
+  prog : MirBody
+  pre : MirState → Prop := fun _ => True
+  specs : List MirLang.Behavior := []
+
+/-- Effective entry precondition for `fn`: conjoins structural entry-state
+    validity (`initMirState fn.prog s`) with the caller precondition
+    `fn.pre s`. -/
+@[candidate mir_semantics]
+def CapturedFn.effectivePre (fn : CapturedFn) (s : MirState) : Prop :=
+  initMirState fn.prog s ∧ fn.pre s
+
+/-- Proof obligations generated for a captured function `fn`:
+    1. `TCBItem.compileId fn.name fn.prog tcb`: target compilation refinement
+       `ProductiveCompiles` for `rustcCodec` and `rustc fn.prog` (permitted to
+       be waived in `c.tcb` by `defaultTrustPolicy`), and
+    2. `.fnVerified fn.name fn.prog`: source-level MIR verification of baseline
+       `MirLang.WellFormedOn fn.effectivePre` together with `fn.specs`
+       (disallowed in `defaultTrustPolicy` so it must be proven
+       constructively). -/
+@[candidate mir_semantics]
+def CapturedFn.obligations (fn : CapturedFn) (tcb : List TCBItem := []) :
+    List (Obligation TCBItem) :=
+  [
+    Obligation.compiles (TCBItem.compileId fn.name fn.prog tcb)
+      MirLang TargetLang rustcCodec fn.prog (rustc fn.prog),
+    Obligation.wellFormedAndSpecsOn (.fnVerified fn.name fn.prog)
+      MirLang fn.effectivePre fn.specs fn.prog
+  ]
+
+/-- Captured Rust crate bundling its functions, TCB audit log, and
+    `.olean`-bound source artifacts. -/
+@[candidate mir_semantics]
+structure Crate where
+  functions : List CapturedFn
+  tcb : List TCBItem
+  artifacts : List EmittedArtifact := []
+
+/-- Top-level theorem required of every verified Rust crate:
+    1. The crate contains at least one captured function (`c.functions ≠ []`).
+    2. Captured function names are pairwise distinct (`NoDupIds`).
+    3. `c.artifacts` includes `"src/lib.rs"` and every artifact satisfies
+       `EmittedArtifact.holds`.
+    4. Every captured function `fn ∈ c.functions` satisfies
+       `VerificationResult defaultTrustPolicy c.tcb (fn.obligations c.tcb)`. -/
+@[candidate mir_semantics]
+def CrateTheorem (c : Crate) : Prop :=
+  c.functions ≠ [] ∧
+  NoDupIds (c.functions.map CapturedFn.name) ∧
+  (∃ a, a ∈ c.artifacts ∧ a.path = "src/lib.rs") ∧
+  AllHold (c.artifacts.map EmittedArtifact.holds) ∧
+  AllHold (c.functions.map (fun fn =>
+    VerificationResult defaultTrustPolicy c.tcb (fn.obligations c.tcb)))
 
 end Trusted
