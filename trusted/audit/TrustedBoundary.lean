@@ -62,7 +62,7 @@ def commandKinds : List Name := [
   ``Parser.Command.end, ``Parser.Command.universe, ``Parser.Command.variable,
   ``Parser.Command.open, ``Parser.Command.openScoped, ``Parser.Command.export,
   ``Parser.Command.mutual, ``Parser.Command.in, ``Parser.Command.attribute,
-  ``Parser.Command.moduleDoc, ``Parser.Command.set_option,
+  ``Parser.Command.moduleDoc, ``Parser.Command.set_option, ``Parser.Command.deriving,
   `Lean.Parser.Command.notation, `Lean.Parser.Command.mixfix]
 
 def isAllowedOptionName (opt : Name) : Bool :=
