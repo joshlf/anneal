@@ -67,6 +67,7 @@
     { "path": "spec/lang/well-formed.md", "sha256": "4aef03dfaa6b8e12128951143bb2a0b98c1de2dd8f5c2a762ffeef334b6d0bcb", "bytes": 44369, "blocks": 4, "declarations": 23 }
   ],
   "output_files": [
-    { "path": "Generated/SpecIndex.lean", "sha256": "d6d2284eb85b8cf327a6b4ab719330c1946941592172fc98c606c9ef4f3af3eb", "bytes": 226070 }
+    { "path": "Generated/SpecIndex.lean", "sha256": "d6d2284eb85b8cf327a6b4ab719330c1946941592172fc98c606c9ef4f3af3eb", "bytes": 226070 },
+    { "path": "Generated/Ops.lean", "sha256": "e7b2c4c1cde0f77541cd387c3874d108d9467adc8096b426797e65b3d57fb864", "bytes": 42910 }
   ]
 }

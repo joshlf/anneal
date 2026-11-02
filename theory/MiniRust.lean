@@ -1,6 +1,8 @@
 import MiniRust.LibSpecr
 import MiniRust.Snapshots.S2026_05_Matched.Generated.SpecIndex
+import MiniRust.Snapshots.S2026_05_Matched.Generated.Ops
 import MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.SpecIndex
+import MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops
 
 /-!
 # `MiniRust` — Top-Level Entry Point for Mechanized MiniRust Specifications

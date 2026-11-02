@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::extractor::{ExtractedSnapshot, SpecDomain};
+use crate::ops_emit::render_ops_lean;
 use crate::sha256::{sha256_file, sha256_hex};
 use crate::specr_ast::{SpecrItem, escape_lean_ident};
 use crate::type_env::TypeEnvironment;
@@ -17,6 +18,9 @@ pub struct EmittedSnapshotArtifacts {
     pub spec_index_lean_path: PathBuf,
     pub spec_index_lean_content: String,
     pub spec_index_sha256: String,
+    pub ops_lean_path: PathBuf,
+    pub ops_lean_content: String,
+    pub ops_lean_sha256: String,
     pub snapshot_lock_json_path: PathBuf,
     pub snapshot_lock_json_content: String,
     pub snapshot_lock_sha256: String,
@@ -420,8 +424,8 @@ pub fn render_snapshot_lock_json(
     j
 }
 
-/// Emits `Generated/SpecIndex.lean` and `snapshot-lock.json` under `output_snapshot_dir`
-/// for the given `(snapshot, env)`.
+/// Emits `Generated/SpecIndex.lean`, `Generated/Ops.lean`, and `snapshot-lock.json`
+/// under `output_snapshot_dir` for the given `(snapshot, env)`.
 pub fn emit_snapshot_to_dir(
     snapshot: &ExtractedSnapshot,
     env: &TypeEnvironment,
@@ -438,11 +442,25 @@ pub fn emit_snapshot_to_dir(
     fs::write(&spec_index_path, spec_index_bytes)
         .map_err(|e| format!("failed writing {}: {e}", spec_index_path.display()))?;
 
-    let output_entries = vec![(
-        "Generated/SpecIndex.lean".to_string(),
-        spec_index_sha.clone(),
-        spec_index_bytes.len(),
-    )];
+    let ops_lean_content = render_ops_lean(snapshot, env);
+    let ops_lean_bytes = ops_lean_content.as_bytes();
+    let ops_lean_sha = sha256_hex(ops_lean_bytes);
+    let ops_lean_path = gen_dir.join("Ops.lean");
+    fs::write(&ops_lean_path, ops_lean_bytes)
+        .map_err(|e| format!("failed writing {}: {e}", ops_lean_path.display()))?;
+
+    let output_entries = vec![
+        (
+            "Generated/SpecIndex.lean".to_string(),
+            spec_index_sha.clone(),
+            spec_index_bytes.len(),
+        ),
+        (
+            "Generated/Ops.lean".to_string(),
+            ops_lean_sha.clone(),
+            ops_lean_bytes.len(),
+        ),
+    ];
 
     let lock_json_content = render_snapshot_lock_json(snapshot, env, &output_entries);
     let lock_json_bytes = lock_json_content.as_bytes();
@@ -457,6 +475,9 @@ pub fn emit_snapshot_to_dir(
         spec_index_lean_path: spec_index_path,
         spec_index_lean_content: spec_index_content,
         spec_index_sha256: spec_index_sha,
+        ops_lean_path,
+        ops_lean_content,
+        ops_lean_sha256: ops_lean_sha,
         snapshot_lock_json_path: lock_json_path,
         snapshot_lock_json_content: lock_json_content,
         snapshot_lock_sha256: lock_json_sha,

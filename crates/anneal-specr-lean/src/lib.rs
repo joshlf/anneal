@@ -5,6 +5,7 @@ pub mod ast_diff;
 pub mod extractor;
 pub mod gap_codegen;
 pub mod lean_emit;
+pub mod ops_emit;
 pub mod sha256;
 pub mod specr_ast;
 pub mod type_env;
