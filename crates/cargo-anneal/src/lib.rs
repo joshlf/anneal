@@ -1135,9 +1135,16 @@ pub fn verify_workspace_with_options(options: &CliOptions) -> Result<Verificatio
         check_specs_non_vacuous_with_records(&options.workspace_root, &records)?;
     }
 
+    let has_locked_rust_trusted = locked_manifest.as_ref().is_some_and(|lock| {
+        lock.locked_records.iter().any(|r| {
+            r.def_id
+                .contains("__ANNEAL_EXT_SPEC_TARGET___anneal_attr_trusted_")
+        })
+    });
+
     let effective_allow_assumptions = match &locked_manifest {
         Some(lock) => {
-            if !lock.locked_assumptions_files.is_empty() {
+            if !lock.locked_assumptions_files.is_empty() || has_locked_rust_trusted {
                 options.allow_assumptions
             } else {
                 has_locked_ub_exceptions
@@ -1157,6 +1164,7 @@ pub fn verify_workspace_with_options(options: &CliOptions) -> Result<Verificatio
 
     if let Some(ref lock) = locked_manifest
         && lock.locked_assumptions_files.is_empty()
+        && !has_locked_rust_trusted
     {
         for item in &report.items {
             if let VerificationStatus::VerifiedConditional { ref assumptions } = item.status {
@@ -2012,6 +2020,7 @@ mod tests {
         let scaffold_report = render_scaffold_report(&ScaffoldReport {
             generated_mir_files: vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")],
             generated_obligation_files: vec![PathBuf::from("o")],
+            generated_assumption_files: Vec::new(),
             generated_verify_files: vec![PathBuf::from("v")],
             created_spec_files: vec![PathBuf::from("s1")],
             preserved_spec_files: Vec::new(),

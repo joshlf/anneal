@@ -177,4 +177,62 @@ mod tests {
         assert!(__anodized_fn_ensures___anneal_unsafe_impl_SafeByteRepr_for_BoundedRange(true));
         assert!(!__anodized_fn_ensures___anneal_unsafe_impl_SafeByteRepr_for_BoundedRange(false));
     }
+
+    #[spec(
+        trusted,
+        requires: x < 1_000,
+        ensures: |out| out == x + 1,
+    )]
+    fn trusted_inc_u32(x: u32) -> u32 {
+        x + 1
+    }
+
+    #[spec(
+        trusted: true,
+        requires: x > 0,
+        ensures: |out| out == x - 1,
+    )]
+    fn trusted_explicit_dec_u32(x: u32) -> u32 {
+        x - 1
+    }
+
+    #[spec(
+        assumed,
+        requires: x <= 10,
+        ensures: |out| out == x * 2,
+    )]
+    fn assumed_double_u32(x: u32) -> u32 {
+        x * 2
+    }
+
+    #[test]
+    fn trusted_and_assumed_spec_qualifiers_emit_markers_and_companions() {
+        assert_eq!(trusted_inc_u32(7), 8);
+        assert_eq!(
+            __ANNEAL_EXT_SPEC_TARGET___anneal_attr_trusted_trusted_inc_u32,
+            "trusted_inc_u32"
+        );
+        assert!(__anodized_fn_requires_trusted_inc_u32(7));
+        assert!(!__anodized_fn_requires_trusted_inc_u32(1_000));
+        assert!(__anodized_fn_ensures_trusted_inc_u32(7, 8));
+        assert!(!__anodized_fn_ensures_trusted_inc_u32(7, 9));
+
+        assert_eq!(trusted_explicit_dec_u32(5), 4);
+        assert_eq!(
+            __ANNEAL_EXT_SPEC_TARGET___anneal_attr_trusted_trusted_explicit_dec_u32,
+            "trusted_explicit_dec_u32"
+        );
+        assert!(__anodized_fn_requires_trusted_explicit_dec_u32(5));
+        assert!(!__anodized_fn_requires_trusted_explicit_dec_u32(0));
+        assert!(__anodized_fn_ensures_trusted_explicit_dec_u32(5, 4));
+
+        assert_eq!(assumed_double_u32(6), 12);
+        assert_eq!(
+            __ANNEAL_EXT_SPEC_TARGET___anneal_attr_trusted_assumed_double_u32,
+            "assumed_double_u32"
+        );
+        assert!(__anodized_fn_requires_assumed_double_u32(6));
+        assert!(!__anodized_fn_requires_assumed_double_u32(11));
+        assert!(__anodized_fn_ensures_assumed_double_u32(6, 12));
+    }
 }

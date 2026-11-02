@@ -27,6 +27,9 @@ pub struct AuthoredItemModules {
     pub has_legacy_specs_defs: bool,
     /// Whether `anneal/proofs/Assumptions/<Item>.lean` exists on disk.
     pub has_assumptions: bool,
+    /// Whether `.anneal/generated/Assumptions/<Item>.lean` was generated from
+    /// `#[anneal_spec::spec(trusted, ...)]` in Rust.
+    pub has_generated_assumptions: bool,
     /// Whether `anneal/proofs/Proof/<Item>.lean` exists on disk.
     pub has_proof: bool,
     /// Whether the authored specification or proof targets the stateful
@@ -45,6 +48,19 @@ pub struct AuthoredItemModules {
     /// Whether the authored specification or proof targets the scoped
     /// UB-exception surface (`UbExceptionItemSpec` / `UbExceptionVerificationResult`).
     pub is_ub_exception: bool,
+}
+
+/// Reference to a sibling verified callee invoked by a subject's MIR body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CalleeContractRef {
+    /// Canonical `def_id` of the callee (for example, `"my_crate::leaf"`).
+    pub def_id: String,
+    /// Dotted Lean module suffix `<Callee>` (for example, `"MyCrate.leaf"`).
+    pub item_module_suffix: String,
+    /// Optional inline `requires` companion module suffix `<CalleeReq>`.
+    pub req_module_suffix: Option<String>,
+    /// Optional inline `ensures` companion module suffix `<CalleeEns>`.
+    pub ens_module_suffix: Option<String>,
 }
 
 /// A captured subject item paired with its canonical `<Item>` module path and
@@ -71,9 +87,22 @@ pub struct SubjectObligationBundle {
     /// External sidecar specification records (`#[external_spec]`) linked to
     /// this subject via `associated_subject_def_id`.
     pub external_specs: Vec<UnitTargetRecord>,
+    /// Sibling verified callees referenced via `.fnDef "<callee_def_id>"` in
+    /// this subject's captured MIR body.
+    pub called_callees: Vec<CalleeContractRef>,
 }
 
 impl SubjectObligationBundle {
+    /// Return true when this subject was annotated with `#[spec(trusted, ...)]`
+    /// or `#[spec(assumed, ...)]` in Rust.
+    pub fn has_rust_trusted_attr(&self) -> bool {
+        self.external_specs.iter().any(|ext| {
+            ext.target
+                .def_id
+                .contains("__ANNEAL_EXT_SPEC_TARGET___anneal_attr_trusted_")
+        })
+    }
+
     /// Return true when this subject was annotated with `#[spec(safe_total, ...)]`
     /// or `#[spec(total: true, ...)]` in Rust.
     pub fn has_rust_safe_total_attr(&self) -> bool {
@@ -212,6 +241,7 @@ pub fn group_subject_obligations(records: &[UnitTargetRecord]) -> Vec<SubjectObl
                     inline_ensures: Vec::new(),
                     inline_qualifiers: Vec::new(),
                     external_specs: Vec::new(),
+                    called_callees: Vec::new(),
                 },
             );
         }
@@ -335,6 +365,15 @@ pub fn render_obligations_module_with_options(
         out.push_str(&format!("import Mir.{ref_suffix}\n"));
     }
 
+    let mut imported_obligations: BTreeSet<String> = BTreeSet::new();
+    for callee in &bundle.called_callees {
+        if callee.item_module_suffix != *item
+            && imported_obligations.insert(callee.item_module_suffix.clone())
+        {
+            out.push_str(&format!("import Obligations.{}\n", callee.item_module_suffix));
+        }
+    }
+
     if authored.has_legacy_specs_defs {
         out.push_str(&format!("import Specs.{item}\n"));
     }
@@ -447,6 +486,18 @@ pub fn render_obligations_module_with_options(
     out.push_str("abbrev rustEnsures : List Value → Value → Prop := defaultPost\n\n");
 
     out.push_str(&format!(
+        "/-- Canonical external call contract for `{def_id}` lowered from\n    \
+            `defaultPre` and `defaultPost` so modular callers can assume this\n    \
+            callee's Rust `#[spec]` contract at `MirCallE` call sites. -/\n\
+         def defaultCallContract : MirCallContract where\n  \
+           pre req :=\n    \
+             And (req.defPath = \"{def_id}\") (defaultPre req.args)\n  \
+           post req ans :=\n    \
+             ∃ retVal,\n      \
+               And (ans = .returned retVal req.memory) (defaultPost req.args retVal)\n\n"
+    ));
+
+    out.push_str(&format!(
         "/-- Low-priority default `ItemSpec` instance for `{def_id}`.\n    \
             An authored normal-priority `ItemSpec` instance in `Specs.{item}`\n    \
             automatically overrides this instance via Lean typeclass\n    \
@@ -474,9 +525,19 @@ pub fn render_obligations_module_with_options(
     out.push_str(&format!(
         "instance (priority := low) defaultTotalSpec :\n    \
            TotalItemSpec \"{def_id}\" where\n  \
-           pre := fun args _ => defaultPre args\n  \
+           pre := fun args mem =>\n    \
+             And (defaultPre args) (mem = (initMachineState Mir.{item}.body args).memory)\n  \
            post := fun args _ ret _ => defaultPost args ret\n\n"
     ));
+
+    let default_env_assumed = if let Some(callee) = bundle.called_callees.first() {
+        format!(
+            "Obligations.{}.defaultCallContract.holdsOn",
+            callee.item_module_suffix
+        )
+    } else {
+        "fun _ => True".to_string()
+    };
 
     out.push_str(&format!(
         "/-- Low-priority default `ModularItemSpec` instance for `{def_id}`. -/\n"
@@ -484,8 +545,9 @@ pub fn render_obligations_module_with_options(
     out.push_str(&format!(
         "instance (priority := low) defaultModularSpec :\n    \
            ModularItemSpec \"{def_id}\" where\n  \
-           envAssumed := fun _ => True\n  \
-           pre := fun args _ => defaultPre args\n  \
+           envAssumed := {default_env_assumed}\n  \
+           pre := fun args mem =>\n    \
+             And (defaultPre args) (mem = (initMachineState Mir.{item}.body args).memory)\n  \
            post := fun args _ ret _ => defaultPost args ret\n\n"
     ));
 
@@ -688,6 +750,36 @@ pub fn render_obligations_module_with_options(
     out
 }
 
+/// Render the disposable `.anneal/generated/Assumptions/<Item>.lean` module
+/// for a subject annotated with `#[anneal_spec::spec(trusted, ...)]` (or
+/// `assumed`) in Rust when no user-authored `anneal/proofs/Assumptions/<Item>.lean`
+/// exists on disk.
+pub fn render_generated_assumptions_module(
+    bundle: &SubjectObligationBundle,
+    authored: AuthoredItemModules,
+) -> String {
+    let item = &bundle.item_module_suffix;
+    let def_id = &bundle.subject.target.def_id;
+    let claim_ty = if bundle.has_rust_safe_total_attr() || authored.is_total {
+        format!(
+            "Trusted.VerificationResult.TotalVerificationResult Obligations.{item}.totalClaim"
+        )
+    } else {
+        format!("Trusted.VerificationResult.VerificationResult Obligations.{item}.claim")
+    };
+
+    format!(
+        "import Trusted\n\
+         import Obligations.{item}\n\n\
+         namespace Assumptions.{item}\n\n\
+         /-- Conditional axiom generated from `#[anneal_spec::spec(trusted, ...)]`\n    \
+             for `{def_id}` in Rust. -/\n\
+         axiom rust_trusted_contract :\n  \
+           {claim_ty}\n\n\
+         end Assumptions.{item}\n"
+    )
+}
+
 /// Render the disposable `.anneal/generated/Verify/<Item>.lean` module for
 /// `bundle` assuming an authored `Proof.<Item>` module is present.
 pub fn render_verify_module(bundle: &SubjectObligationBundle) -> String {
@@ -704,28 +796,55 @@ pub fn render_verify_module(bundle: &SubjectObligationBundle) -> String {
 /// `bundle` and `authored`.
 ///
 /// Only imports `Specs.<Item>`, `Assumptions.<Item>`, and `Proof.<Item>` when
-/// those authored files exist on disk under `anneal/proofs/`. When
-/// `Proof.<Item>` does not exist on disk, emits a `priority := low`
-/// `defaultProof` instance of `ItemProof` attempting bounded `WP` discharge.
+/// those authored (or generated-assumption) files exist on disk. When
+/// `Proof.<Item>` does not exist on disk, emits either a conditional
+/// certificate referencing `Assumptions.<Item>.rust_trusted_contract` (for
+/// `#[spec(trusted, ...)]`) or a `priority := low` `defaultProof` instance
+/// attempting automatic symbolic reflection and bounded `WP` discharge.
 pub fn render_verify_module_with_options(
     bundle: &SubjectObligationBundle,
     authored: AuthoredItemModules,
 ) -> String {
     let item = &bundle.item_module_suffix;
     let def_id = &bundle.subject.target.def_id;
+    let uses_rust_trusted_contract = !authored.has_proof
+        && !authored.has_assumptions
+        && (bundle.has_rust_trusted_attr() || authored.has_generated_assumptions);
     let mut out = String::new();
 
     out.push_str(&format!("-- @anneal-def-id: {def_id}\n"));
     out.push_str("import Trusted\n");
-    if !authored.has_proof {
+    if !authored.has_proof && !uses_rust_trusted_contract {
         out.push_str("import Anneal\n");
     }
     out.push_str(&format!("import Mir.{item}\n"));
     out.push_str(&format!("import Obligations.{item}\n"));
+    if !authored.has_proof && !uses_rust_trusted_contract && !authored.has_specs {
+        let mut imported_callee_mir: BTreeSet<String> = BTreeSet::new();
+        for callee in &bundle.called_callees {
+            if callee.item_module_suffix != *item
+                && imported_callee_mir.insert(callee.item_module_suffix.clone())
+            {
+                out.push_str(&format!("import Mir.{}\n", callee.item_module_suffix));
+            }
+            if let Some(ref req_suf) = callee.req_module_suffix
+                && req_suf != item
+                && imported_callee_mir.insert(req_suf.clone())
+            {
+                out.push_str(&format!("import Mir.{req_suf}\n"));
+            }
+            if let Some(ref ens_suf) = callee.ens_module_suffix
+                && ens_suf != item
+                && imported_callee_mir.insert(ens_suf.clone())
+            {
+                out.push_str(&format!("import Mir.{ens_suf}\n"));
+            }
+        }
+    }
     if authored.has_specs {
         out.push_str(&format!("import Specs.{item}\n"));
     }
-    if authored.has_assumptions {
+    if authored.has_assumptions || uses_rust_trusted_contract {
         out.push_str(&format!("import Assumptions.{item}\n"));
     }
     if authored.has_proof {
@@ -793,17 +912,194 @@ pub fn render_verify_module_with_options(
                  abbrev Certificate : Prop := VerificationResult Obligations.{item}.claim\n\n"
             ));
         }
+    } else if uses_rust_trusted_contract {
+        if bundle.has_rust_safe_total_attr() || authored.is_total {
+            out.push_str(&format!(
+                "/-- Conditional total-correctness certificate for `{def_id}` backed by\n    \
+                    `#[anneal_spec::spec(trusted, ...)]` in `Assumptions.{item}`. -/\n\
+                 theorem verified : TotalVerificationResult Obligations.{item}.totalClaim :=\n  \
+                   Assumptions.{item}.rust_trusted_contract\n\n\
+                 /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
+                 abbrev Certificate : Prop := TotalVerificationResult Obligations.{item}.totalClaim\n\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "/-- Conditional verification certificate for `{def_id}` backed by\n    \
+                    `#[anneal_spec::spec(trusted, ...)]` in `Assumptions.{item}`. -/\n\
+                 theorem verified : VerificationResult Obligations.{item}.claim :=\n  \
+                   Assumptions.{item}.rust_trusted_contract\n\n\
+                 /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
+                 abbrev Certificate : Prop := VerificationResult Obligations.{item}.claim\n\n"
+            ));
+        }
+    } else if !authored.has_specs
+        && let Some(callee) = bundle.called_callees.first()
+        && let Some(ref callee_ens_suffix) = callee.ens_module_suffix
+    {
+        let opt_subject_req = if bundle.inline_requires.len() == 1 {
+            let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
+            format!("(Option.some Mir.{req_suf}.body)")
+        } else {
+            "Option.none".to_string()
+        };
+        let opt_subject_ens = if bundle.inline_ensures.len() == 1 {
+            let ens_suf = derive_item_module_suffix(&bundle.inline_ensures[0]);
+            format!("(Option.some Mir.{ens_suf}.body)")
+        } else {
+            "Option.none".to_string()
+        };
+        let opt_callee_req = if let Some(ref callee_req_suf) = callee.req_module_suffix {
+            format!("(Option.some Mir.{callee_req_suf}.body)")
+        } else {
+            "Option.none".to_string()
+        };
+        let callee_item = &callee.item_module_suffix;
+        let callee_def_id = &callee.def_id;
+        let mut branches = format!(
+            "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustModularContractAuto\n          \
+                     Obligations.{callee_item}.defaultCallContract\n          \
+                     Mir.{item}.body\n          \
+                     Obligations.{item}.defaultModularSpec.pre\n          \
+                     Obligations.{item}.defaultModularSpec.post\n          \
+                     64 64\n          \
+                     {opt_subject_req}\n          \
+                     {opt_subject_ens}\n          \
+                     \"{callee_def_id}\"\n          \
+                     Mir.{callee_item}.body.argCount\n          \
+                     {opt_callee_req}\n          \
+                     Mir.{callee_ens_suffix}.body\n"
+        );
+        if bundle.inline_requires.len() == 1 {
+            let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
+            branches.push_str(&format!(
+                "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustModularBoundedRange1Auto\n          \
+                         Obligations.{callee_item}.defaultCallContract\n          \
+                         Mir.{item}.body\n          \
+                         Obligations.{item}.defaultModularSpec.pre\n          \
+                         Obligations.{item}.defaultModularSpec.post\n          \
+                         64 64\n          \
+                         Mir.{req_suf}.body\n          \
+                         {opt_subject_ens}\n          \
+                         \"{callee_def_id}\"\n          \
+                         Mir.{callee_item}.body.argCount\n          \
+                         {opt_callee_req}\n          \
+                         Mir.{callee_ens_suffix}.body\n"
+            ));
+        }
+        out.push_str(&format!(
+            "/-- Low-priority fallback `ModularItemProof` instance attempting\n    \
+                automatic call-graph contract reflection when no authored\n    \
+                `Proof.{item}` module exists on disk. -/\n\
+             instance (priority := low) defaultModularProof :\n    \
+                 ModularItemProof \"{def_id}\" Obligations.{item}.modularClaim where\n  \
+               verified := by\n    \
+                 first\n\
+             {branches}\n\
+             /-- Kernel-checked modular verification certificate for `{def_id}`. -/\n\
+             theorem verified : ModularVerificationResult Obligations.{item}.modularClaim :=\n  \
+               (inferInstance : ModularItemProof \"{def_id}\" Obligations.{item}.modularClaim).verified\n\n\
+             /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
+             abbrev Certificate : Prop := ModularVerificationResult Obligations.{item}.modularClaim\n\n"
+        ));
+    } else if !authored.has_specs && (bundle.has_rust_safe_total_attr() || authored.is_total) {
+        let opt_req = if bundle.inline_requires.len() == 1 {
+            let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
+            format!("(Option.some Mir.{req_suf}.body)")
+        } else {
+            "Option.none".to_string()
+        };
+        let opt_ens = if bundle.inline_ensures.len() == 1 {
+            let ens_suf = derive_item_module_suffix(&bundle.inline_ensures[0]);
+            format!("(Option.some Mir.{ens_suf}.body)")
+        } else {
+            "Option.none".to_string()
+        };
+        let mut branches = String::new();
+        if bundle.inline_requires.len() <= 1 && bundle.inline_ensures.len() <= 1 {
+            branches.push_str(&format!(
+                "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalPinnedContractAuto\n          \
+                         Obligations.{item}.totalClaim 64 64 {opt_req} {opt_ens}\n"
+            ));
+        }
+        if bundle.inline_requires.len() == 1 && bundle.inline_ensures.len() <= 1 {
+            let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
+            branches.push_str(&format!(
+                "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalBoundedRange1Auto\n          \
+                         Obligations.{item}.totalClaim 64 64 Mir.{req_suf}.body {opt_ens}\n"
+            ));
+        }
+        branches.push_str(&format!(
+            "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.verifyTotalMirSym\n          \
+                     Obligations.{item}.totalClaim 64 (by\n            \
+                       intro _ _ _\n            \
+                       first\n            \
+                       | exact True.intro\n            \
+                       | simp; try omega)\n"
+        ));
+        out.push_str(&format!(
+            "/-- Low-priority fallback `TotalItemProof` instance attempting\n    \
+                bounded symbolic reflection and `DWP` discharge when no authored\n    \
+                `Proof.{item}` module exists on disk. -/\n\
+             instance (priority := low) defaultProof :\n    \
+                 TotalItemProof \"{def_id}\" Obligations.{item}.totalClaim where\n  \
+               verified := by\n    \
+                 first\n\
+             {branches}\n\
+             /-- Kernel-checked total-correctness verification certificate for `{def_id}`. -/\n\
+             theorem verified : TotalVerificationResult Obligations.{item}.totalClaim :=\n  \
+               (inferInstance : TotalItemProof \"{def_id}\" Obligations.{item}.totalClaim).verified\n\n\
+             /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
+             abbrev Certificate : Prop := TotalVerificationResult Obligations.{item}.totalClaim\n\n"
+        ));
     } else {
+        let opt_req = if bundle.inline_requires.len() == 1 {
+            let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
+            format!("(Option.some Mir.{req_suf}.body)")
+        } else {
+            "Option.none".to_string()
+        };
+        let opt_ens = if bundle.inline_ensures.len() == 1 {
+            let ens_suf = derive_item_module_suffix(&bundle.inline_ensures[0]);
+            format!("(Option.some Mir.{ens_suf}.body)")
+        } else {
+            "Option.none".to_string()
+        };
+        let mut branches = String::new();
+        if !authored.has_specs
+            && bundle.inline_requires.len() <= 1
+            && bundle.inline_ensures.len() <= 1
+        {
+            branches.push_str(&format!(
+                "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustPinnedContractAuto\n          \
+                         Obligations.{item}.claim 64 64 {opt_req} {opt_ens}\n"
+            ));
+        }
+        if !authored.has_specs
+            && bundle.inline_requires.len() == 1
+            && bundle.inline_ensures.len() <= 1
+        {
+            let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
+            branches.push_str(&format!(
+                "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustBoundedRange1Auto\n          \
+                         Obligations.{item}.claim 64 64 Mir.{req_suf}.body {opt_ens}\n"
+            ));
+        }
+        branches.push_str(&format!(
+            "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.verifyByWP Obligations.{item}.claim 64 (by\n          \
+                     intro _ _\n          \
+                     first\n          \
+                     | exact True.intro\n          \
+                     | simp; try omega)\n"
+        ));
         out.push_str(&format!(
             "/-- Low-priority fallback `ItemProof` instance attempting bounded\n    \
                 `WP` discharge when no authored `Proof.{item}` module exists on\n    \
                 disk. -/\n\
              instance (priority := low) defaultProof :\n    \
                  ItemProof \"{def_id}\" Obligations.{item}.claim where\n  \
-               verified :=\n    \
-                 Anneal.Rustc.V2026_06_01.SymbolicEval.verifyByWP Obligations.{item}.claim 64 (by\n      \
-                   intro _ _\n      \
-                   exact True.intro)\n\n\
+               verified := by\n    \
+                 first\n\
+             {branches}\n\
              /-- Kernel-checked verification certificate for `{def_id}`. -/\n\
              theorem verified : VerificationResult Obligations.{item}.claim :=\n  \
                (inferInstance : ItemProof \"{def_id}\" Obligations.{item}.claim).verified\n\n\
@@ -1185,6 +1481,7 @@ mod tests {
                 item_kind: CapturedItemKind::ExternalSpec,
                 associated_subject_def_id: Some("my_crate::math::id".to_string()),
             }],
+            called_callees: Vec::new(),
         };
 
         let empty_obligations = render_obligations_module(&empty_bundle);
@@ -1230,6 +1527,7 @@ mod tests {
             inline_ensures: Vec::new(),
             inline_qualifiers: Vec::new(),
             external_specs: Vec::new(),
+            called_callees: Vec::new(),
         };
 
         let multi_obligations = render_obligations_module(&multi_bundle);
@@ -1478,6 +1776,107 @@ mod tests {
             "instance rustEquivSpec : StatefulEquivItemSpec \"my_crate::math::inc\" :=\n  \
                refineEquivSpec\n    \
                  Mir.MyCrate.math.inc_ref.body"
+        ));
+    }
+
+    #[test]
+    fn renders_rust_trusted_assumptions_and_modular_default_proofs() {
+        let mut records = sample_records();
+        records.push(UnitTargetRecord {
+            target: CapturedTarget {
+                def_id: "my_crate::math::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_trusted_inc"
+                    .to_string(),
+                mir_module_path: String::new(),
+                mir_module_sha256: String::new(),
+            },
+            lean_module_name: String::new(),
+            item_kind: CapturedItemKind::ExternalSpec,
+            associated_subject_def_id: Some("my_crate::math::inc".to_string()),
+        });
+
+        let bundles = group_subject_obligations(&records);
+        assert_eq!(bundles.len(), 1);
+        let bundle = &bundles[0];
+        assert!(bundle.has_rust_trusted_attr());
+
+        let generated_assumptions =
+            render_generated_assumptions_module(bundle, AuthoredItemModules::default());
+        assert!(generated_assumptions.contains("import Obligations.MyCrate.math.inc"));
+        assert!(generated_assumptions.contains(
+            "axiom rust_trusted_contract :\n  \
+               Trusted.VerificationResult.VerificationResult Obligations.MyCrate.math.inc.claim"
+        ));
+
+        let generated_total_assumptions = render_generated_assumptions_module(
+            bundle,
+            AuthoredItemModules {
+                is_total: true,
+                ..AuthoredItemModules::default()
+            },
+        );
+        assert!(generated_total_assumptions.contains(
+            "axiom rust_trusted_contract :\n  \
+               Trusted.VerificationResult.TotalVerificationResult Obligations.MyCrate.math.inc.totalClaim"
+        ));
+
+        let verify_trusted =
+            render_verify_module_with_options(bundle, AuthoredItemModules::default());
+        assert!(verify_trusted.contains("import Assumptions.MyCrate.math.inc"));
+        assert!(verify_trusted.contains(
+            "theorem verified : VerificationResult Obligations.MyCrate.math.inc.claim :=\n  \
+               Assumptions.MyCrate.math.inc.rust_trusted_contract"
+        ));
+
+        let mut caller_bundle = sample_records();
+        let mut caller_bundles = group_subject_obligations(&caller_bundle);
+        let caller = &mut caller_bundles[0];
+        caller.called_callees.push(CalleeContractRef {
+            def_id: "my_crate::math::leaf".to_string(),
+            item_module_suffix: "MyCrate.math.leaf".to_string(),
+            req_module_suffix: Some("MyCrate.math.__anodized_fn_requires_leaf".to_string()),
+            ens_module_suffix: Some("MyCrate.math.__anodized_fn_ensures_leaf".to_string()),
+        });
+
+        let caller_obligations = render_obligations_module(caller);
+        assert!(caller_obligations.contains("import Obligations.MyCrate.math.leaf"));
+        assert!(caller_obligations.contains("def defaultCallContract : MirCallContract where"));
+        assert!(caller_obligations.contains(
+            "envAssumed := Obligations.MyCrate.math.leaf.defaultCallContract.holdsOn"
+        ));
+
+        let caller_verify =
+            render_verify_module_with_options(caller, AuthoredItemModules::default());
+        assert!(caller_verify.contains("import Mir.MyCrate.math.leaf"));
+        assert!(caller_verify.contains("import Mir.MyCrate.math.__anodized_fn_requires_leaf"));
+        assert!(caller_verify.contains("import Mir.MyCrate.math.__anodized_fn_ensures_leaf"));
+        assert!(caller_verify.contains("defaultModularProof"));
+        assert!(caller_verify.contains("dischargeRustModularContractAuto"));
+        assert!(caller_verify.contains("dischargeRustModularBoundedRange1Auto"));
+        assert!(caller_verify.contains(
+            "theorem verified : ModularVerificationResult Obligations.MyCrate.math.inc.modularClaim :=\n  \
+               (inferInstance : ModularItemProof \"my_crate::math::inc\" Obligations.MyCrate.math.inc.modularClaim).verified"
+        ));
+
+        caller_bundle.push(UnitTargetRecord {
+            target: CapturedTarget {
+                def_id: "my_crate::math::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_safe_total_inc"
+                    .to_string(),
+                mir_module_path: String::new(),
+                mir_module_sha256: String::new(),
+            },
+            lean_module_name: String::new(),
+            item_kind: CapturedItemKind::ExternalSpec,
+            associated_subject_def_id: Some("my_crate::math::inc".to_string()),
+        });
+        let total_bundles = group_subject_obligations(&caller_bundle);
+        let total_verify =
+            render_verify_module_with_options(&total_bundles[0], AuthoredItemModules::default());
+        assert!(total_verify.contains("instance (priority := low) defaultProof :\n    TotalItemProof"));
+        assert!(total_verify.contains("dischargeRustTotalPinnedContractAuto"));
+        assert!(total_verify.contains("dischargeRustTotalBoundedRange1Auto"));
+        assert!(total_verify.contains(
+            "theorem verified : TotalVerificationResult Obligations.MyCrate.math.inc.totalClaim :=\n  \
+               (inferInstance : TotalItemProof \"my_crate::math::inc\" Obligations.MyCrate.math.inc.totalClaim).verified"
         ));
     }
 }

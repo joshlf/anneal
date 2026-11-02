@@ -28,10 +28,10 @@ use anneal_rustc_capture::lean_emit::render_mir_module_header;
 use anneal_rustc_capture::{CapturedItemKind, CapturedTarget, UnitTargetRecord, sha256_hex};
 
 use crate::obligations::{
-    AuthoredItemModules, SubjectObligationBundle, derive_item_module_suffix,
+    AuthoredItemModules, CalleeContractRef, SubjectObligationBundle, derive_item_module_suffix,
     group_subject_obligations, module_suffix_to_rel_path, render_crate_verify_module,
-    render_obligations_module_with_options, render_proof_template_with_options,
-    render_specs_template, render_verify_module_with_options,
+    render_generated_assumptions_module, render_obligations_module_with_options,
+    render_proof_template_with_options, render_specs_template, render_verify_module_with_options,
 };
 
 /// Pinned Lean 4 toolchain identifier written to `.anneal/lean-toolchain`.
@@ -115,6 +115,9 @@ pub struct ScaffoldReport {
     pub generated_mir_files: Vec<PathBuf>,
     /// Paths to `.anneal/generated/Obligations/<Item>.lean` modules written.
     pub generated_obligation_files: Vec<PathBuf>,
+    /// Paths to `.anneal/generated/Assumptions/<Item>.lean` modules written for
+    /// `#[spec(trusted, ...)]` items.
+    pub generated_assumption_files: Vec<PathBuf>,
     /// Paths to `.anneal/generated/Verify/<Item>.lean` modules written.
     pub generated_verify_files: Vec<PathBuf>,
     /// Paths to `anneal/proofs/Specs/<Item>.lean` files newly created on this
@@ -246,6 +249,7 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
         has_specs,
         has_legacy_specs_defs,
         has_assumptions: assumptions_path.is_file(),
+        has_generated_assumptions: false,
         has_proof,
         is_stateful: !is_ub_exception
             && !is_modular
@@ -256,6 +260,37 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
         is_equiv,
         is_modular,
         is_ub_exception,
+    }
+}
+
+/// Populate `bundle.called_callees` for each subject bundle by scanning its
+/// placed `.anneal/generated/Mir/<Item>.lean` file for `.fnDef "<callee_def_id>"`
+/// constants matching sibling verified bundles in the crate.
+fn populate_called_callees(mir_root: &Path, bundles: &mut [SubjectObligationBundle]) {
+    let callee_candidates: Vec<CalleeContractRef> = bundles
+        .iter()
+        .map(|b| CalleeContractRef {
+            def_id: b.subject.target.def_id.clone(),
+            item_module_suffix: b.item_module_suffix.clone(),
+            req_module_suffix: b.inline_requires.first().map(derive_item_module_suffix),
+            ens_module_suffix: b.inline_ensures.first().map(derive_item_module_suffix),
+        })
+        .collect();
+
+    for bundle in bundles.iter_mut() {
+        let mir_path = mir_root.join(&bundle.item_rel_path);
+        let Ok(mir_text) = fs::read_to_string(&mir_path) else {
+            continue;
+        };
+        for cand in &callee_candidates {
+            if cand.def_id == bundle.subject.target.def_id {
+                continue;
+            }
+            let needle = format!(".fnDef \"{}\"", cand.def_id);
+            if mir_text.contains(&needle) {
+                bundle.called_callees.push(cand.clone());
+            }
+        }
     }
 }
 
@@ -373,7 +408,9 @@ pub fn scaffold_workspace_with_config(
         report.generated_mir_files.push(dest_mir_path);
     }
 
-    let bundles = group_subject_obligations(&sorted_records);
+    let mut bundles = group_subject_obligations(&sorted_records);
+    populate_called_callees(&mir_root, &mut bundles);
+    let generated_assumptions_root = generated_dir.join("Assumptions");
 
     for bundle in &bundles {
         let spec_path = specs_root.join(&bundle.item_rel_path);
@@ -435,6 +472,15 @@ pub fn scaffold_workspace_with_config(
             }
         }
 
+        if bundle.has_rust_trusted_attr() && !authored.has_assumptions && !authored.has_proof {
+            authored.has_generated_assumptions = true;
+            let gen_assumptions_path = generated_assumptions_root.join(&bundle.item_rel_path);
+            let gen_assumptions_contents =
+                render_generated_assumptions_module(bundle, authored);
+            write_if_changed(&gen_assumptions_path, &gen_assumptions_contents)?;
+            report.generated_assumption_files.push(gen_assumptions_path);
+        }
+
         let obligation_path = obligations_root.join(&bundle.item_rel_path);
         let obligation_contents = render_obligations_module_with_options(bundle, authored);
         write_if_changed(&obligation_path, &obligation_contents)?;
@@ -450,6 +496,7 @@ pub fn scaffold_workspace_with_config(
         .generated_mir_files
         .iter()
         .chain(&report.generated_obligation_files)
+        .chain(&report.generated_assumption_files)
         .chain(&report.generated_verify_files)
         .cloned()
         .collect();
@@ -488,7 +535,7 @@ fn prune_stale_generated_modules(
     generated_dir: &Path,
     keep: &BTreeSet<PathBuf>,
 ) -> Result<(), String> {
-    for category in ["Mir", "Obligations", "Verify"] {
+    for category in ["Mir", "Obligations", "Assumptions", "Verify"] {
         let category_root = generated_dir.join(category);
         let mut files = Vec::new();
         collect_lean_files_recursive(&category_root, &mut files)?;
@@ -561,8 +608,10 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
     verify_files.sort();
 
     let mir_root = generated_dir.join("Mir");
+    let generated_assumptions_root = generated_dir.join("Assumptions");
     let mut specs_roots = BTreeSet::new();
     let mut assumptions_roots = BTreeSet::new();
+    let mut generated_assumptions_roots = BTreeSet::new();
     let mut proof_roots = BTreeSet::new();
     let mut refreshed_bundles = Vec::with_capacity(verify_files.len());
 
@@ -577,6 +626,11 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
         let def_id = extract_def_id_comment(&verify_text).unwrap_or_else(|| suffix.clone());
 
         let mut authored = detect_authored_item_modules(&proofs_root, &rel_path);
+        let gen_assumptions_path = generated_assumptions_root.join(&rel_path);
+        if gen_assumptions_path.is_file() && !authored.has_assumptions && !authored.has_proof {
+            authored.has_generated_assumptions = true;
+            generated_assumptions_roots.insert(format!("Assumptions.{suffix}"));
+        }
         let obligation_path = obligations_root.join(&rel_path);
         let ob_text_opt = if obligation_path.is_file() {
             Some(fs::read_to_string(&obligation_path).map_err(|err| {
@@ -627,10 +681,18 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
             inline_ensures: Vec::new(),
             inline_qualifiers: Vec::new(),
             external_specs: Vec::new(),
+            called_callees: Vec::new(),
         };
 
-        let new_verify = render_verify_module_with_options(&synthetic_bundle, authored);
-        write_if_changed(verify_path, &new_verify)?;
+        let should_rerender_verify = authored.has_proof
+            || authored.has_specs
+            || authored.has_assumptions
+            || verify_text.contains(&format!("import Proof.{suffix}"))
+            || verify_text.contains(&format!("import Specs.{suffix}"));
+        if should_rerender_verify {
+            let new_verify = render_verify_module_with_options(&synthetic_bundle, authored);
+            write_if_changed(verify_path, &new_verify)?;
+        }
         refreshed_bundles.push(synthetic_bundle);
 
         if let Some(ob_text) = ob_text_opt {
@@ -658,6 +720,7 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
         &lakefile_text,
         &specs_roots,
         &assumptions_roots,
+        &generated_assumptions_roots,
         &proof_roots,
     );
     write_if_changed(&lakefile_path, &updated_lakefile)?;
@@ -741,6 +804,7 @@ fn update_lakefile_authored_libs(
     lakefile_text: &str,
     specs_roots: &BTreeSet<String>,
     assumptions_roots: &BTreeSet<String>,
+    generated_assumptions_roots: &BTreeSet<String>,
     proof_roots: &BTreeSet<String>,
 ) -> String {
     let mut kept_blocks = Vec::new();
@@ -751,6 +815,7 @@ fn update_lakefile_authored_libs(
         }
         if trimmed.contains("name = \"Specs\"")
             || trimmed.contains("name = \"Assumptions\"")
+            || trimmed.contains("name = \"GeneratedAssumptions\"")
             || trimmed.contains("name = \"Proof\"")
         {
             continue;
@@ -782,6 +847,12 @@ fn update_lakefile_authored_libs(
         insert_blocks.push(format!(
             "[[lean_lib]]\nname = \"Assumptions\"\nsrcDir = \"../anneal/proofs\"\nroots = [{}]",
             format_roots(assumptions_roots)
+        ));
+    }
+    if !generated_assumptions_roots.is_empty() {
+        insert_blocks.push(format!(
+            "[[lean_lib]]\nname = \"GeneratedAssumptions\"\nsrcDir = \"generated\"\nroots = [{}]",
+            format_roots(generated_assumptions_roots)
         ));
     }
     if !proof_roots.is_empty() {
@@ -865,6 +936,7 @@ pub fn render_lakefile_toml(
 
     let mut specs_roots = BTreeSet::new();
     let mut assumptions_roots = BTreeSet::new();
+    let mut generated_assumptions_roots = BTreeSet::new();
     let mut obligations_roots = BTreeSet::new();
     let mut proof_roots = BTreeSet::new();
     let mut verify_roots = BTreeSet::new();
@@ -876,6 +948,8 @@ pub fn render_lakefile_toml(
         }
         if authored.has_assumptions {
             assumptions_roots.insert(format!("Assumptions.{item}"));
+        } else if bundle.has_rust_trusted_attr() && !authored.has_proof {
+            generated_assumptions_roots.insert(format!("Assumptions.{item}"));
         }
         obligations_roots.insert(format!("Obligations.{item}"));
         if authored.has_proof {
@@ -936,6 +1010,7 @@ pub fn render_lakefile_toml(
         &base_lakefile,
         &specs_roots,
         &assumptions_roots,
+        &generated_assumptions_roots,
         &proof_roots,
     )
 }

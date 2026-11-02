@@ -209,3 +209,29 @@ fn integration_safe_total_and_equivalent_to_spec_extensions() {
     assert!(__anodized_fn_requires_midpoint_fast(10, 20));
     assert!(__anodized_fn_ensures_midpoint_fast(10, 20, 15));
 }
+
+#[spec(
+    trusted,
+    safe_total,
+    requires: val <= 50,
+    ensures: |out| out == val + 10,
+)]
+fn trusted_safe_total_offset(val: u32) -> u32 {
+    val.wrapping_add(10)
+}
+
+#[test]
+fn integration_trusted_and_safe_total_combined_extensions() {
+    assert_eq!(trusted_safe_total_offset(25), 35);
+    assert_eq!(
+        __ANNEAL_EXT_SPEC_TARGET___anneal_attr_trusted_trusted_safe_total_offset,
+        "trusted_safe_total_offset"
+    );
+    assert_eq!(
+        __ANNEAL_EXT_SPEC_TARGET___anneal_attr_safe_total_trusted_safe_total_offset,
+        "trusted_safe_total_offset"
+    );
+    assert!(__anodized_fn_requires_trusted_safe_total_offset(25));
+    assert!(!__anodized_fn_requires_trusted_safe_total_offset(51));
+    assert!(__anodized_fn_ensures_trusted_safe_total_offset(25, 35));
+}

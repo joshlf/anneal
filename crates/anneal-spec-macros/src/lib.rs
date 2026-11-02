@@ -158,6 +158,12 @@ struct AnnealSpecExtensions {
     /// `refineSafeSpec` instance enforcing `MirNoUB` across all well-formed
     /// inputs while guarding `rustEnsures` behind `rustRequires`.
     is_safe_total: bool,
+    /// Whether `trusted` (`trusted: true` or `assumed` / `assumed: true`) was
+    /// requested on the function contract so `cargo-anneal` synthesizes a
+    /// conditional assumption module `.anneal/generated/Assumptions/<Item>.lean`
+    /// (`Assumptions.<Item>.rust_trusted_contract`) without requiring an
+    /// authored `.lean` file under `anneal/proofs/`.
+    is_trusted: bool,
     /// Optional reference function identifier from `equivalent_to: <path>` or
     /// `equivalent_to = <path>` so `Obligations.<Item>` synthesizes a
     /// `StatefulEquivItemSpec` instance against `Mir.<Crate>.<ref_fn>.body`.
@@ -238,6 +244,33 @@ fn extract_anneal_spec_extensions(args: TokenStream2) -> Result<AnnealSpecExtens
                 };
                 at_clause_start = true;
                 continue;
+            } else if kw_str == "trusted" || kw_str == "assumed" {
+                if clause_body.is_empty() {
+                    ext.is_trusted = true;
+                } else if clause_body.len() == 2
+                    && is_colon_or_eq(&clause_body[0])
+                    && let TokenTree::Ident(ref val) = clause_body[1]
+                    && (val == "true" || val == "false")
+                {
+                    ext.is_trusted = val == "true";
+                } else {
+                    return Err(Error::new(
+                        kw.span(),
+                        format!(
+                            "expected `{kw_str}` or `{kw_str}: true` / `{kw_str}: false`"
+                        ),
+                    ));
+                }
+                i = if end_idx < tokens.len() {
+                    end_idx + 1
+                } else {
+                    if out_tokens.last().is_some_and(is_top_level_comma) {
+                        out_tokens.pop();
+                    }
+                    end_idx
+                };
+                at_clause_start = true;
+                continue;
             } else if kw_str == "equivalent_to" {
                 if clause_body.is_empty() || !is_colon_or_eq(&clause_body[0]) {
                     return Err(Error::new(
@@ -294,6 +327,17 @@ fn expand_embed_spec(args: TokenStream2, input: TokenStream2) -> Result<TokenStr
         if ext.is_safe_total {
             let marker_ident = format_ident!(
                 "__ANNEAL_EXT_SPEC_TARGET___anneal_attr_safe_total_{}",
+                fn_ident
+            );
+            extra_marker_consts.extend(quote! {
+                #[doc(hidden)]
+                #[allow(non_upper_case_globals, dead_code)]
+                pub const #marker_ident: &str = #fn_name_str;
+            });
+        }
+        if ext.is_trusted {
+            let marker_ident = format_ident!(
+                "__ANNEAL_EXT_SPEC_TARGET___anneal_attr_trusted_{}",
                 fn_ident
             );
             extra_marker_consts.extend(quote! {
