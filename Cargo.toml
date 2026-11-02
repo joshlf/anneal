@@ -5,4 +5,5 @@ members = [
     "crates/cargo-anneal",
     "crates/anneal-spec",
     "crates/anneal-spec-macros",
+    "crates/anneal-specr-lean",
 ]

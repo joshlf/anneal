@@ -1,0 +1,18 @@
+[package]
+name = "anneal-specr-lean"
+version = "0.1.0-alpha.1"
+edition = "2024"
+description = "Mechanical specr-lang to Lean 4 transpiler, AST diff engine, and correspondence ratchet code generator for upstream MiniRust specifications."
+license = "BSD-2-Clause OR Apache-2.0 OR MIT"
+repository = "https://github.com/joshlf/anneal"
+publish = false
+
+[lib]
+name = "anneal_specr_lean"
+path = "src/lib.rs"
+
+[[bin]]
+name = "anneal-specr-lean"
+path = "src/main.rs"
+
+[dependencies]
