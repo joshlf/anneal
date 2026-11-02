@@ -1,0 +1,222 @@
+# Hermetic ITree Differential Trace Suite Manifest (`tests/itree-diff/manifest.toml`)
+#
+# Maps each of the 30 curated seed functions in `tests/itree-diff/corpus/src/lib.rs`
+# to its category, inlined helpers (`inlined_callees`), external callees (`ext_callees`),
+# metamorphic check policy (`check_inline_vs_ext_duality`), and expected verdict.
+
+[suite]
+name = "anneal-itree-diff-v1"
+crate_name = "itree_diff_corpus"
+min_category_1_to_5_pass_rate = 1.0
+min_overall_pass_rate = 0.966
+default_step_fuel = 128
+
+# ---------------------------------------------------------------------------
+# Category 1: Multi-argument scalar & bitwise functions (5)
+# ---------------------------------------------------------------------------
+
+[[tests.pass]]
+name = "clamp_u32_range"
+category = "cat1_scalar_bitwise"
+inlined_callees = []
+ext_callees = []
+
+[[tests.pass]]
+name = "rotate_xor_mix"
+category = "cat1_scalar_bitwise"
+inlined_callees = []
+ext_callees = []
+
+[[tests.pass]]
+name = "checked_affine_step"
+category = "cat1_scalar_bitwise"
+inlined_callees = []
+ext_callees = []
+
+[[tests.pass]]
+name = "signed_abs_diff"
+category = "cat1_scalar_bitwise"
+inlined_callees = []
+ext_callees = []
+
+[[tests.pass]]
+name = "bitfield_extract"
+category = "cat1_scalar_bitwise"
+inlined_callees = []
+ext_callees = []
+
+# ---------------------------------------------------------------------------
+# Category 2: Structs, tuples & enums with inter-field padding (5)
+# ---------------------------------------------------------------------------
+
+[[tests.pass]]
+name = "repr_c_padded_header"
+category = "cat2_padded_aggregates"
+inlined_callees = []
+ext_callees = []
+
+[[tests.pass]]
+name = "nested_tuple_struct_sum"
+category = "cat2_padded_aggregates"
+inlined_callees = []
+ext_callees = []
+
+[[tests.pass]]
+name = "c_like_enum_dispatch"
+category = "cat2_padded_aggregates"
+inlined_callees = []
+ext_callees = []
+
+[[tests.pass]]
+name = "option_u32_map_or"
+category = "cat2_padded_aggregates"
+inlined_callees = []
+ext_callees = []
+
+[[tests.pass]]
+name = "result_u16_unwrap_or"
+category = "cat2_padded_aggregates"
+inlined_callees = []
+ext_callees = []
+
+# ---------------------------------------------------------------------------
+# Category 3: Branching & loop CFGs (`switchInt` + erased branches) (5)
+# ---------------------------------------------------------------------------
+
+[[tests.pass]]
+name = "match_four_way_tag"
+category = "cat3_branch_loop_cfg"
+inlined_callees = []
+ext_callees = []
+
+[[tests.pass]]
+name = "short_circuit_guard_chain"
+category = "cat3_branch_loop_cfg"
+inlined_callees = []
+ext_callees = []
+
+[[tests.pass]]
+name = "while_loop_accumulate"
+category = "cat3_branch_loop_cfg"
+inlined_callees = []
+ext_callees = []
+step_fuel = 256
+
+[[tests.pass]]
+name = "early_return_search_4"
+category = "cat3_branch_loop_cfg"
+inlined_callees = []
+ext_callees = []
+
+[[tests.pass]]
+name = "nested_if_else_matrix"
+category = "cat3_branch_loop_cfg"
+inlined_callees = []
+ext_callees = []
+
+# ---------------------------------------------------------------------------
+# Category 4: Single & multi-step external calls (`MirCallE`) (5)
+# ---------------------------------------------------------------------------
+
+[[tests.pass]]
+name = "call_once_and_postprocess"
+category = "cat4_ext_calls"
+inlined_callees = []
+ext_callees = ["ext_transform_u32"]
+
+[[tests.pass]]
+name = "call_twice_sequential"
+category = "cat4_ext_calls"
+inlined_callees = []
+ext_callees = ["ext_transform_u32"]
+
+[[tests.pass]]
+name = "call_in_branch_arms"
+category = "cat4_ext_calls"
+inlined_callees = []
+ext_callees = ["ext_transform_u32", "ext_combine_u32"]
+
+[[tests.pass]]
+name = "call_in_bounded_loop_3x"
+category = "cat4_ext_calls"
+inlined_callees = []
+ext_callees = ["ext_transform_u32"]
+
+[[tests.pass]]
+name = "callee_panic_unwind_recovery"
+category = "cat4_ext_calls"
+inlined_callees = []
+ext_callees = ["ext_may_panic_u32"]
+
+# ---------------------------------------------------------------------------
+# Category 5: Metamorphic Inlining Duality (`inlinedCallees` vs `MirCallE`) (5)
+# ---------------------------------------------------------------------------
+
+[[tests.pass]]
+name = "pipeline_two_helpers"
+category = "cat5_metamorphic_duality"
+inlined_callees = ["helper_add_const", "helper_xor_fold"]
+ext_callees = []
+check_inline_vs_ext_duality = true
+
+[[tests.pass]]
+name = "diamond_helper_dag"
+category = "cat5_metamorphic_duality"
+inlined_callees = ["helper_add_const", "helper_xor_fold"]
+ext_callees = []
+check_inline_vs_ext_duality = true
+
+[[tests.pass]]
+name = "conditional_helper_dispatch"
+category = "cat5_metamorphic_duality"
+inlined_callees = ["helper_add_const", "helper_xor_fold"]
+ext_callees = []
+check_inline_vs_ext_duality = true
+
+[[tests.pass]]
+name = "stateful_counter_pair"
+category = "cat5_metamorphic_duality"
+inlined_callees = ["helper_step_counter"]
+ext_callees = []
+check_inline_vs_ext_duality = true
+
+[[tests.pass]]
+name = "recursive_depth_2_unroll"
+category = "cat5_metamorphic_duality"
+inlined_callees = ["helper_depth_step"]
+ext_callees = []
+check_inline_vs_ext_duality = true
+
+# ---------------------------------------------------------------------------
+# Category 6: References, pointers & `ShadowProvenanceTable` metadata (5)
+# ---------------------------------------------------------------------------
+
+[[tests.pass]]
+name = "ref_u32_passthrough"
+category = "cat6_refs_and_provenance"
+inlined_callees = []
+ext_callees = []
+
+[[tests.pass]]
+name = "pair_of_refs_select"
+category = "cat6_refs_and_provenance"
+inlined_callees = []
+ext_callees = []
+
+[[tests.pass]]
+name = "struct_field_ref_project"
+category = "cat6_refs_and_provenance"
+inlined_callees = []
+ext_callees = []
+
+[[tests.pass]]
+name = "raw_const_ptr_identity"
+category = "cat6_refs_and_provenance"
+inlined_callees = []
+ext_callees = []
+
+[[tests.pass]]
+name = "slice_len_and_ptr_meta"
+category = "cat6_refs_and_provenance"
+inlined_callees = []
+ext_callees = []
