@@ -84,6 +84,19 @@ theorem witness_GAP_EPOCH_0001 :
       .normalUnit := by
   decide
 
+/-- `GAP-EPOCH-0002` (`intentional_epoch_divergence`, `L4_TreeBorrows`):
+    `V2026_08_01` agrees unconditionally on `S2026_07_BleedingEdge` (`normalUnit = normalUnit`),
+    while diverging as documented against historical snapshot `S2026_05_Matched` (`normalUnit` vs. `ub`). -/
+theorem witness_GAP_EPOCH_0002 :
+    evalAnnealV2026_08_01 .reservedImEpochTransition defaultFixtureState =
+      evalMiniRustSnapshot .S2026_07_BleedingEdge .reservedImEpochTransition ∧
+    VerifiedDivergenceWitness
+      (evalAnnealV2026_08_01 .reservedImEpochTransition defaultFixtureState)
+      (evalMiniRustSnapshot .S2026_05_Matched .reservedImEpochTransition)
+      .normalUnit
+      .ub := by
+  decide
+
 /-! ## 2. Universal Unconditional Matched Agreement & Guarded Multi-Snapshot Agreement -/
 
 /--
@@ -109,6 +122,32 @@ theorem all_non_gap_fixtures_agree_exact
         defaultFixtureState
         prog = false) :
     evalAnnealV2026_06_01 prog defaultFixtureState = evalMiniRustSnapshot snap prog := by
+  cases snap <;> cases prog <;> revert h_no_gap <;> decide
+
+/--
+Against `S2026_07_BleedingEdge`, Anneal `V2026_08_01` agrees **unconditionally**
+on **100% of fixtures** (`L1`–`L6`, including all 4 closed `GAP-MR-*` fixtures and
+`.reservedImEpochTransition`), with zero active bug gaps and zero epoch divergences!
+-/
+theorem all_v2026_08_01_s2026_07_fixtures_agree_unconditional
+    (prog : FixtureProg) :
+    evalAnnealV2026_08_01 prog defaultFixtureState =
+      evalMiniRustSnapshot .S2026_07_BleedingEdge prog := by
+  cases prog <;> decide
+
+/--
+Outside the active gaps for `(V2026_08_01, snap)` (which is `[]` on `S2026_07_BleedingEdge`
+and `[.GAP_EPOCH_0002]` on `S2026_05_Matched`), Anneal `V2026_08_01` and MiniRust
+snapshot `snap` produce **100% identical verdicts** on every fixture!
+-/
+theorem all_v2026_08_01_non_gap_fixtures_agree_exact
+    (snap : MiniRustSnap) (prog : FixtureProg)
+    (h_no_gap :
+      hitsAnyGap
+        (activeBugGaps .V2026_08_01 snap ++ activeEpochDivergences .V2026_08_01 snap)
+        defaultFixtureState
+        prog = false) :
+    evalAnnealV2026_08_01 prog defaultFixtureState = evalMiniRustSnapshot snap prog := by
   cases snap <;> cases prog <;> revert h_no_gap <;> decide
 
 end Correspondence

@@ -4,6 +4,20 @@ import Trusted.Rustc.V2026_06_01.MirSemantics.Bytes
 import Trusted.Rustc.V2026_06_01.MirSemantics.State
 import Trusted.Rustc.V2026_06_01.MirSemantics.Places
 import Trusted.Rustc.V2026_06_01.MirSemantics.Terminators
+import Trusted.Rustc.V2026_08_01.Layout
+import Trusted.Rustc.V2026_08_01.MirAst.Types
+import Trusted.Rustc.V2026_08_01.MirAst.Places
+import Trusted.Rustc.V2026_08_01.MirAst.Statements
+import Trusted.Rustc.V2026_08_01.MirAst.Terminators
+import Trusted.Rustc.V2026_08_01.MirAst.Body
+import Trusted.Rustc.V2026_08_01.MirSemantics.State
+import Trusted.Rustc.V2026_08_01.MirSemantics.Scalars
+import Trusted.Rustc.V2026_08_01.MirSemantics.Bytes
+import Trusted.Rustc.V2026_08_01.MirSemantics.Places
+import Trusted.Rustc.V2026_08_01.MirSemantics.Statements
+import Trusted.Rustc.V2026_08_01.MirSemantics.Terminators
+import Trusted.Rustc.V2026_08_01.MirSemantics.Eval
+import Trusted.Rustc.V2026_08_01.MirSemantics.Machine
 import MiniRust.LibSpecr
 import MiniRust.Snapshots.S2026_05_Matched.Generated.Ops
 import MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops
@@ -28,8 +42,6 @@ genuinely alters `evalAnnealV2026_06_01` and breaks `by decide` in `GeneratedGap
 namespace Correspondence
 
 open Trusted.Refinement
-open Trusted.Rustc.V2026_06_01.MirAst
-open Trusted.Rustc.V2026_06_01.MirSemantics
 open MiniRust.LibSpecr
 
 /--
@@ -88,6 +100,11 @@ structure FixtureState : Type where
 @[reducible]
 def defaultFixtureState : FixtureState :=
   { initialFuel := 128, checkOverflow := true }
+
+section V2026_06_01
+
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
 
 /-- Convert a real `RvalueEvalResult` from `Trusted.Rustc.V2026_06_01.MirSemantics` into a `Verdict`. -/
 @[reducible]
@@ -217,6 +234,8 @@ def evalAnnealV2026_06_01 (prog : FixtureProg) (_st : FixtureState) : Verdict :=
     match hasProtectedWriteConflict [protectedReservedEntry] [1] 0 (.some 2) .nil with
     | true => .ub
     | false => .normalUnit
+
+end V2026_06_01
 
 /--
 Evaluate a `FixtureProg` under upstream MiniRust snapshot `snap : MiniRustSnap`
@@ -374,5 +393,171 @@ theorem anneal_v2026_06_01_remediated_bug_fixtures_agree :
       evalMiniRustSnapshot .S2026_05_Matched .exactDivIntrinsicCall ∧
     evalAnnealV2026_06_01 .exactDivIntrinsicCall defaultFixtureState = .normalUnit := by
   decide
+
+section V2026_08_01
+
+open Trusted.Rustc.V2026_08_01.MirAst
+open Trusted.Rustc.V2026_08_01.MirSemantics
+
+/-- Convert a real `RvalueEvalResult` from `Trusted.Rustc.V2026_08_01.MirSemantics` into a `Verdict`. -/
+@[reducible]
+def rvalueResultToVerdictV08 : RvalueEvalResult → Verdict
+  | .ok (.scalar sc) _ _ => .normalScalar sc.bits
+  | .ok _ _ _ => .normalUnit
+  | .ub => .ub
+  | .unsupported => .unsupported
+
+/-- Convert a real `PlaceWriteResult` from `Trusted.Rustc.V2026_08_01.MirSemantics` into a `Verdict`. -/
+@[reducible]
+def placeWriteResultToVerdictV08 : PlaceWriteResult → Verdict
+  | .ok _ => .normalUnit
+  | .ub => .ub
+  | .unsupported => .unsupported
+
+/-- Convert a real `ProjReadResult` from `Trusted.Rustc.V2026_08_01.MirSemantics` into a `Verdict`. -/
+@[reducible]
+def projReadResultToVerdictV08 : ProjReadResult → Verdict
+  | .ok (.scalar sc) => .normalScalar sc.bits
+  | .ok _ => .normalUnit
+  | .ub => .ub
+  | .unsupported => .unsupported
+
+/-- Convert a real `ProjWriteResult` from `Trusted.Rustc.V2026_08_01.MirSemantics` into a `Verdict`. -/
+@[reducible]
+def projWriteResultToVerdictV08 : ProjWriteResult → Verdict
+  | .ok _ => .normalUnit
+  | .ub => .ub
+  | .unsupported => .unsupported
+
+/-- Convert a real `MirStepNode` from `Trusted.Rustc.V2026_08_01.MirSemantics` into a `Verdict`. -/
+@[reducible]
+def stepNodeToVerdictV08 : MirStepNode → Verdict
+  | .tau _ => .normalUnit
+  | .ret (.normal _) => .normalUnit
+  | .ret .panic => .panic
+  | .vis (.inl (.fail .ub)) _ => .ub
+  | _ => .unsupported
+
+/--
+Evaluate a `FixtureProg` by directly invoking the **actual operational semantics
+functions** in `Trusted.Rustc.V2026_08_01.MirSemantics`:
+
+1. `.canonicalSafeScalarAdd`: executes `V2026_08_01.MirSemantics.evalScalarBinOp .add ⟨12, 4⟩ ⟨30, 4⟩`
+2. `.canonicalSafeByteRoundTrip`: executes `V2026_08_01.MirSemantics.decodeLittleEndianBytes`
+3. `.canonicalSafeLocalWriteRead`: executes `V2026_08_01.MirSemantics.writePlaceValue` followed by `readProjectedValue`
+4. `.canonicalSafeTreeBorrowMut`: executes `V2026_08_01.MirSemantics.evalRvalue (.ref (.mut false) ...)` followed by deref `writePlaceValue`
+5. `.sharedUnsafeCellWrite`: passes `localDecls` with `core::cell::UnsafeCell<u32>` at local 0 to `V2026_08_01.MirSemantics.evalRvalue`, so `placeIsFreeze` is `false` (`TreeBorrowPerm.reserved`) and `writePlaceValue` returns `.ok` (`.normalUnit`).
+6. `.unionVariantWriteRead`: calls `V2026_08_01.MirSemantics.writeProjectedValue` and `readProjectedValue` on `.field 1 u32Ty` (returns `.normalUnit`).
+7. `.dynamicArrayIndexBorrow`: calls `V2026_08_01.MirSemantics.evalRvalue` on `.ref .shared { local_ := 0, projection := [.index 1] }`, then `readProjectedValue` after `.dead` on local 1 (returns `.normalUnit`).
+8. `.exactDivIntrinsicCall`: calls `V2026_08_01.MirSemantics.evalTerminator` on `"core::intrinsics::exact_div"` with `24, 2` and `target = .some 1` (`stepNodeToVerdictV08` maps `.tau _` to `.normalUnit`).
+9. `.reservedImEpochTransition`: calls `V2026_08_01.MirSemantics.protectedReborrowHasInitWrite (V2026_08_01.MirSemantics.initProtectedReborrowPerm true false true)` (`true => .normalUnit`).
+-/
+@[reducible]
+def evalAnnealV2026_08_01 (prog : FixtureProg) (_st : FixtureState) : Verdict :=
+  match prog with
+  | .canonicalSafeScalarAdd =>
+    rvalueResultToVerdictV08 (evalScalarBinOp .add ⟨12, 4⟩ ⟨30, 4⟩ .nil emptyMemory false)
+  | .canonicalSafeByteRoundTrip =>
+    match decodeLittleEndianBytes (encodeLittleEndianBytes 42 4 .none) with
+    | .some (bits, _) => .normalScalar bits
+    | .none => .ub
+  | .canonicalSafeLocalWriteRead =>
+    match writePlaceValue [.uninit] .nil { local_ := 0, projection := .nil } (.scalar ⟨7, 4⟩) with
+    | .ok locals' =>
+      match locals' with
+      | .init v :: _ =>
+        match readProjectedValue locals' v .nil with
+        | .ok _ => .normalUnit
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | _ => .ub
+    | .ub => .ub
+    | .unsupported => .unsupported
+  | .canonicalSafeTreeBorrowMut =>
+    let initLocals : List LocalSlot := [.init (.scalar ⟨10, 4⟩), .uninit]
+    match evalRvalue initLocals (.ref (.mut false) { local_ := 0, projection := .nil }) emptyMemory with
+    | .ok ptrVal _ memAfterRef =>
+      let localsWithPtr : List LocalSlot := [.init (.scalar ⟨10, 4⟩), .init ptrVal]
+      placeWriteResultToVerdictV08
+        (writePlaceValue localsWithPtr memAfterRef.borrows { local_ := 1, projection := [.deref] } (.scalar ⟨42, 4⟩))
+    | .ub => .ub
+    | .unsupported => .unsupported
+  | .sharedUnsafeCellWrite =>
+    let unsafeCellRigid : RigidTy := .adt "core::cell::UnsafeCell" [.uint .u32]
+    let unsafeCellTy : Ty := { kind := unsafeCellRigid, layoutIdx := 0 }
+    let ptrTy : Ty := { kind := .ref .not unsafeCellRigid, layoutIdx := 0 }
+    let localDecls : List LocalDecl := [
+      { mutability := .not, ty := unsafeCellTy, debugName := .none },
+      { mutability := .mut, ty := ptrTy, debugName := .none }
+    ]
+    let initLocals : List LocalSlot := [.init (.scalar ⟨10, 4⟩), .uninit]
+    match evalRvalue initLocals (.ref .shared { local_ := 0, projection := .nil }) emptyMemory localDecls with
+    | .ok ptrVal _ memAfterRef =>
+      let localsWithPtr : List LocalSlot := [.init (.scalar ⟨10, 4⟩), .init ptrVal]
+      placeWriteResultToVerdictV08
+        (writePlaceValue localsWithPtr memAfterRef.borrows { local_ := 1, projection := [.deref] } (.scalar ⟨42, 4⟩))
+    | .ub => .ub
+    | .unsupported => .unsupported
+  | .unionVariantWriteRead =>
+    let unionVal : Value := .aggregate 0 [.unit]
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+    match writeProjectedValue [.init unionVal] unionVal [.field 1 u32Ty] (.scalar ⟨99, 4⟩) with
+    | .ok updatedVal =>
+      match readProjectedValue [.init updatedVal] updatedVal [.field 1 u32Ty] with
+      | .ok _ => .normalUnit
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .ub => .ub
+    | .unsupported => .unsupported
+  | .dynamicArrayIndexBorrow =>
+    let arrVal : Value := .aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨30, 4⟩]
+    let localsAtBorrow : List LocalSlot := [.init arrVal, .init (.scalar ⟨1, 8⟩)]
+    match evalRvalue localsAtBorrow (.ref .shared { local_ := 0, projection := [.index 1] }) emptyMemory with
+    | .ok _ _ memAfterRef =>
+      match memAfterRef.borrows with
+      | entry :: _ =>
+        let localsAfterStorageDead : List LocalSlot := [.init arrVal, .dead]
+        match readProjectedValue localsAfterStorageDead arrVal entry.targetProjection with
+        | .ok _ => .normalUnit
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | .nil => .ub
+    | .ub => .ub
+    | .unsupported => .unsupported
+  | .exactDivIntrinsicCall =>
+    let fnTy : Ty := { kind := .fnDef "core::intrinsics::exact_div" .nil, layoutIdx := 0 }
+    let funcOp : Operand := .constant { ty := fnTy, val := .zeroSized }
+    let argOps : List Operand := [
+      .copy { local_ := 1, projection := .nil },
+      .copy { local_ := 2, projection := .nil }
+    ]
+    let dest : Place := { local_ := 0, projection := .nil }
+    let term : Terminator := { kind := .call funcOp argOps dest (.some 1) .unreachable, span := "" }
+    let initState : MachineState := {
+      frame := {
+        blockIdx := 0
+        stmtIdx := 0
+        locals := [.uninit, .init (.scalar ⟨24, 4⟩), .init (.scalar ⟨2, 4⟩)]
+      }
+      memory := emptyMemory
+    }
+    stepNodeToVerdictV08 (evalTerminator initState term .none)
+  | .reservedImEpochTransition =>
+    match protectedReborrowHasInitWrite (initProtectedReborrowPerm true false true) with
+    | true => .normalUnit
+    | false => .ub
+
+/-- Canonical `AnnealMirDialect` instance for `Trusted.Rustc.V2026_08_01`. -/
+def dialectV2026_08_01 : AnnealMirDialect where
+  version := .V2026_08_01
+  rustcCommit := "d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed"
+  Prog := FixtureProg
+  State := FixtureState
+  evalVerdict := evalAnnealV2026_08_01
+
+theorem dialectV2026_08_01_version :
+    dialectV2026_08_01.version = .V2026_08_01 := rfl
+
+end V2026_08_01
 
 end Correspondence

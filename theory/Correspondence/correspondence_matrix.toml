@@ -146,3 +146,167 @@ target_tier = "EpochDeltaOnly"
 max_open_bugs = 0
 allowed_epoch_gaps = []
 proof_module = "Correspondence.V2026_06_01.L6_WholeMachine"
+
+# ------------------------------------------------------------------------------
+# Pairing 3: V2026_08_01 vs. S2026_07_BleedingEdge (Target: ExactUnconditional)
+# ------------------------------------------------------------------------------
+
+[[cells]]
+anneal_version = "V2026_08_01"
+minirust_snapshot = "S2026_07_BleedingEdge"
+layer = "L1_Scalars"
+expected_tier = "ExactUnconditional"
+target_tier = "ExactUnconditional"
+status = "exact_unconditional"
+max_open_bugs = 0
+allowed_epoch_gaps = []
+gap_ids = []
+proof_module = "Correspondence.V2026_08_01.L1_Scalars"
+theorem = "Correspondence.V2026_08_01.L1_Scalars.mir_evalExactDiv_unsigned_corresponds"
+
+[[cells]]
+anneal_version = "V2026_08_01"
+minirust_snapshot = "S2026_07_BleedingEdge"
+layer = "L2_BytesAndLayout"
+expected_tier = "ExactUnconditional"
+target_tier = "ExactUnconditional"
+status = "exact_unconditional"
+max_open_bugs = 0
+allowed_epoch_gaps = []
+gap_ids = []
+proof_module = "Correspondence.V2026_08_01.L2_BytesAndLayout"
+theorem = "Correspondence.V2026_08_01.L2_BytesAndLayout.mir_union_cross_variant_write_read_corresponds"
+
+[[cells]]
+anneal_version = "V2026_08_01"
+minirust_snapshot = "S2026_07_BleedingEdge"
+layer = "L3_PlacesAndBasicMem"
+expected_tier = "ExactUnconditional"
+target_tier = "ExactUnconditional"
+status = "exact_unconditional"
+max_open_bugs = 0
+allowed_epoch_gaps = []
+gap_ids = []
+proof_module = "Correspondence.V2026_08_01.L3_PlacesAndBasicMem"
+theorem = "Correspondence.V2026_08_01.L3_PlacesAndBasicMem.mir_dynamic_index_borrow_resolved_at_creation_survives_storage_dead"
+
+[[cells]]
+anneal_version = "V2026_08_01"
+minirust_snapshot = "S2026_07_BleedingEdge"
+layer = "L4_TreeBorrows"
+expected_tier = "ExactUnconditional"
+target_tier = "ExactUnconditional"
+status = "exact_unconditional"
+max_open_bugs = 0
+allowed_epoch_gaps = []
+gap_ids = []
+proof_module = "Correspondence.V2026_08_01.L4_TreeBorrows"
+theorem = "Correspondence.V2026_08_01.L4_TreeBorrows.mir_protected_reborrow_init_write_matches_s2026_07"
+
+[[cells]]
+anneal_version = "V2026_08_01"
+minirust_snapshot = "S2026_07_BleedingEdge"
+layer = "L5_ControlAndCalls"
+expected_tier = "ExactUnconditional"
+target_tier = "ExactUnconditional"
+status = "exact_unconditional"
+max_open_bugs = 0
+allowed_epoch_gaps = []
+gap_ids = []
+proof_module = "Correspondence.V2026_08_01.L5_ControlAndCalls"
+theorem = "Correspondence.V2026_08_01.L5_ControlAndCalls.mir_evalTerminator_exact_div_intrinsic_corresponds"
+
+[[cells]]
+anneal_version = "V2026_08_01"
+minirust_snapshot = "S2026_07_BleedingEdge"
+layer = "L6_WholeMachine"
+expected_tier = "ExactUnconditional"
+target_tier = "ExactUnconditional"
+status = "exact_unconditional"
+max_open_bugs = 0
+allowed_epoch_gaps = []
+gap_ids = []
+proof_module = "Correspondence.V2026_08_01.L6_WholeMachine"
+theorem = "Correspondence.V2026_08_01.L6_WholeMachine.mir_whole_machine_unconditional_refines_s2026_07"
+
+# ------------------------------------------------------------------------------
+# Pairing 4: V2026_08_01 vs. S2026_05_Matched (Target: EpochDeltaOnly)
+# ------------------------------------------------------------------------------
+
+[[cells]]
+anneal_version = "V2026_08_01"
+minirust_snapshot = "S2026_05_Matched"
+layer = "L1_Scalars"
+expected_tier = "ExactUnconditional"
+target_tier = "ExactUnconditional"
+status = "exact_unconditional"
+max_open_bugs = 0
+allowed_epoch_gaps = []
+gap_ids = []
+proof_module = "Correspondence.V2026_08_01.L1_Scalars"
+theorem = "Correspondence.V2026_08_01.L1_Scalars.mir_evalExactDiv_unsigned_corresponds"
+
+[[cells]]
+anneal_version = "V2026_08_01"
+minirust_snapshot = "S2026_05_Matched"
+layer = "L2_BytesAndLayout"
+expected_tier = "ExactUnconditional"
+target_tier = "ExactUnconditional"
+status = "exact_unconditional"
+max_open_bugs = 0
+allowed_epoch_gaps = []
+gap_ids = []
+proof_module = "Correspondence.V2026_08_01.L2_BytesAndLayout"
+theorem = "Correspondence.V2026_08_01.L2_BytesAndLayout.mir_union_cross_variant_write_read_corresponds"
+
+[[cells]]
+anneal_version = "V2026_08_01"
+minirust_snapshot = "S2026_05_Matched"
+layer = "L3_PlacesAndBasicMem"
+expected_tier = "ExactUnconditional"
+target_tier = "ExactUnconditional"
+status = "exact_unconditional"
+max_open_bugs = 0
+allowed_epoch_gaps = []
+gap_ids = []
+proof_module = "Correspondence.V2026_08_01.L3_PlacesAndBasicMem"
+theorem = "Correspondence.V2026_08_01.L3_PlacesAndBasicMem.mir_dynamic_index_borrow_resolved_at_creation_survives_storage_dead"
+
+[[cells]]
+anneal_version = "V2026_08_01"
+minirust_snapshot = "S2026_05_Matched"
+layer = "L4_TreeBorrows"
+expected_tier = "EpochDeltaOnly"
+target_tier = "EpochDeltaOnly"
+status = "epoch_delta_only"
+max_open_bugs = 0
+allowed_epoch_gaps = ["GAP-EPOCH-0002"]
+gap_ids = ["GAP-EPOCH-0002"]
+proof_module = "Correspondence.V2026_08_01.L4_TreeBorrows"
+theorem = "Correspondence.V2026_08_01.L4_TreeBorrows.mir_protected_reborrow_epoch_delta_s2026_05"
+
+[[cells]]
+anneal_version = "V2026_08_01"
+minirust_snapshot = "S2026_05_Matched"
+layer = "L5_ControlAndCalls"
+expected_tier = "ExactUnconditional"
+target_tier = "ExactUnconditional"
+status = "exact_unconditional"
+max_open_bugs = 0
+allowed_epoch_gaps = []
+gap_ids = []
+proof_module = "Correspondence.V2026_08_01.L5_ControlAndCalls"
+theorem = "Correspondence.V2026_08_01.L5_ControlAndCalls.mir_evalTerminator_exact_div_intrinsic_corresponds"
+
+[[cells]]
+anneal_version = "V2026_08_01"
+minirust_snapshot = "S2026_05_Matched"
+layer = "L6_WholeMachine"
+expected_tier = "ExactUnconditional"
+target_tier = "ExactUnconditional"
+status = "exact_unconditional"
+max_open_bugs = 0
+allowed_epoch_gaps = []
+gap_ids = []
+proof_module = "Correspondence.V2026_08_01.L6_WholeMachine"
+theorem = "Correspondence.V2026_08_01.L6_WholeMachine.mir_whole_machine_guarded_refines"

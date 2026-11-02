@@ -182,16 +182,20 @@ pub struct CorrespondenceGapsRegistry {
 /// `theory/Correspondence/correspondence_matrix.toml`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CorrespondenceMatrixCell {
-    /// Anneal MIR version identifier (for example, `"V2026_06_01"`).
+    /// Anneal MIR version identifier (for example, `"V2026_06_01"` or `"V2026_08_01"`).
     pub anneal_version: String,
-    /// MiniRust snapshot identifier (for example, `"S2026_05_Matched"`).
+    /// MiniRust snapshot identifier (for example, `"S2026_05_Matched"` or `"S2026_07_BleedingEdge"`).
     pub minirust_snapshot: String,
     /// Horizontal correspondence slice (for example, `"L4_TreeBorrows"` or `"*"`).
     pub layer: String,
     /// Expected correspondence tier for this cell.
     pub expected_tier: ExpectedTier,
+    /// Optional status string (`"exact_unconditional"`, `"epoch_delta_only"`, `"guarded_ratchet"`).
+    pub status: Option<String>,
     /// Optional per-cell ratchet ceiling on active bug entries (`GuardedRatchet`).
     pub max_open_bugs: Option<usize>,
+    /// Optional explicit gap IDs associated with this cell.
+    pub gap_ids: Vec<String>,
 }
 
 /// Parsed `theory/Correspondence/correspondence_matrix.toml` specification.
@@ -555,9 +559,11 @@ pub fn parse_correspondence_matrix(toml_text: &str) -> Result<CorrespondenceMatr
             .remove("minirust_snapshot")
             .unwrap_or_else(|| "*".to_string());
         let layer = current.remove("layer").unwrap_or_else(|| "*".to_string());
+        let status = current.remove("status").filter(|v| !v.trim().is_empty());
         let tier_raw = current
             .remove("expected_tier")
             .or_else(|| current.remove("tier"))
+            .or_else(|| status.clone())
             .ok_or_else(|| {
                 format!(
                     "missing 'expected_tier' in matrix cell ({anneal_version}, {minirust_snapshot}, {layer})"
@@ -572,13 +578,19 @@ pub fn parse_correspondence_matrix(toml_text: &str) -> Result<CorrespondenceMatr
             ),
             _ => None,
         };
+        let gap_ids = match current.remove("gap_ids") {
+            Some(v) if !v.trim().is_empty() => parse_string_list_value(&v, "gap_ids")?,
+            _ => Vec::new(),
+        };
         current.clear();
         cells.push(CorrespondenceMatrixCell {
             anneal_version,
             minirust_snapshot,
             layer,
             expected_tier,
+            status,
             max_open_bugs,
+            gap_ids,
         });
         Ok(())
     };

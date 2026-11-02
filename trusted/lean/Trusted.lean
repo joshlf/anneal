@@ -6,6 +6,7 @@ import Trusted.Sequence
 import Trusted.Layout
 import Trusted.MirAst
 import Trusted.MirSemantics
+import Trusted.Rustc.V2026_08_01.MirSemantics.Machine
 import Trusted.VerificationResult
 
 namespace Trusted

@@ -30,9 +30,18 @@ open MiniRust.LibSpecr
 inductive AnnealVer : Type where
   /-- Pinned `rustc 1.98.0-nightly (14210df0e 2026-05-31)` MIR model. -/
   | V2026_06_01
+  /-- Refined MIR model targeting `S2026_07_BleedingEdge` (`d821c6e3a3d3`, 2026-07-31) with all 4 bug gaps closed. -/
+  | V2026_08_01
   /-- Planned follow-up MIR model absorbing post-2026-05 Tree Borrows relaxations. -/
   | V2026_12_01
-  deriving DecidableEq, BEq, Repr
+  deriving DecidableEq, BEq, Repr, Inhabited
+
+/-- Canonical string identifier for each `AnnealVer`. -/
+@[reducible]
+def AnnealVer.asString : AnnealVer → String
+  | .V2026_06_01 => "V2026_06_01"
+  | .V2026_08_01 => "V2026_08_01"
+  | .V2026_12_01 => "V2026_12_01"
 
 /-- Mechanically ingested upstream MiniRust snapshots. -/
 inductive MiniRustSnap : Type where

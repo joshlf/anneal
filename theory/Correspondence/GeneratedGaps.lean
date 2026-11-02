@@ -26,12 +26,14 @@ inductive GapId : Type where
   | GAP_MR_0004
   /-- `GAP-EPOCH-0001`: Post-2026-05 `Reserved` interior-mutability read relaxation (`L4_TreeBorrows`). -/
   | GAP_EPOCH_0001
+  /-- `GAP-EPOCH-0002`: `V2026_08_01` protected mutable reborrow initial write vs. `S2026_05_Matched` read (`L4_TreeBorrows`). -/
+  | GAP_EPOCH_0002
   deriving DecidableEq, Repr
 
 /-- Complete list of all registered gap IDs. -/
 @[reducible]
 def allGapIds : List GapId :=
-  [.GAP_MR_0001, .GAP_MR_0002, .GAP_MR_0003, .GAP_MR_0004, .GAP_EPOCH_0001]
+  [.GAP_MR_0001, .GAP_MR_0002, .GAP_MR_0003, .GAP_MR_0004, .GAP_EPOCH_0001, .GAP_EPOCH_0002]
 
 /-- Formal 4-way taxonomy class for each `GapId`. -/
 @[reducible]
@@ -41,6 +43,7 @@ def gapKind : GapId → GapKind
   | .GAP_MR_0003 => .anneal_false_positive_ub
   | .GAP_MR_0004 => .anneal_unmodeled_feature
   | .GAP_EPOCH_0001 => .intentional_epoch_divergence
+  | .GAP_EPOCH_0002 => .intentional_epoch_divergence
 
 /-- Semantic slice owning each `GapId`. -/
 @[reducible]
@@ -50,6 +53,7 @@ def gapLayer : GapId → SemanticLayer
   | .GAP_MR_0003 => .L3_PlacesAndBasicMem
   | .GAP_MR_0004 => .L1_Scalars
   | .GAP_EPOCH_0001 => .L4_TreeBorrows
+  | .GAP_EPOCH_0002 => .L4_TreeBorrows
 
 /-- Cross-reference into `tests/miri-diff/manifest.toml` when applicable. -/
 @[reducible]
@@ -59,6 +63,7 @@ def gapMiriDiffCrossRef : GapId → Option String
   | .GAP_MR_0003 => some "pass_ref_array_elem_temp_index"
   | .GAP_MR_0004 => some "pass_exact_div_valid"
   | .GAP_EPOCH_0001 => none
+  | .GAP_EPOCH_0002 => none
 
 /-! ## 2. Scoped Active Gap Queries Across `(AnnealVer × MiniRustSnap)` -/
 
@@ -70,6 +75,7 @@ def gapIsOpen : GapId → Bool
   | .GAP_MR_0003 => false
   | .GAP_MR_0004 => false
   | .GAP_EPOCH_0001 => true
+  | .GAP_EPOCH_0002 => true
 
 /-- Whether gap `id` applies to `(ver, snap)`. -/
 @[reducible]
@@ -83,6 +89,12 @@ def gapAppliesTo (id : GapId) (ver : AnnealVer) (snap : MiniRustSnap) : Bool :=
     match snap with
     | .S2026_05_Matched => false
     | .S2026_07_BleedingEdge => true
+  | .V2026_06_01, .GAP_EPOCH_0002 => false
+  | .V2026_08_01, .GAP_EPOCH_0002 =>
+    match snap with
+    | .S2026_05_Matched => true
+    | .S2026_07_BleedingEdge => false
+  | .V2026_08_01, _ => false
   | .V2026_12_01, _ => false
 
 /-- Whether gap `g` is active for `(ver, snap)`. -/
@@ -117,6 +129,7 @@ def hitsGap (g : GapId) (st : FixtureState) (prog : FixtureProg) : Bool :=
   | .GAP_MR_0003, .dynamicArrayIndexBorrow => true
   | .GAP_MR_0004, .exactDivIntrinsicCall => true
   | .GAP_EPOCH_0001, .reservedImEpochTransition => true
+  | .GAP_EPOCH_0002, .reservedImEpochTransition => true
   | _, _ => false
 
 /-- Combined guard predicate testing whether any gap in `gaps` fires on `(st, prog)`. -/

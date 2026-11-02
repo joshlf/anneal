@@ -88,9 +88,9 @@ pub enum ExpectedTier {
 impl ExpectedTier {
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim() {
-            "ExactUnconditional" => Ok(Self::ExactUnconditional),
-            "EpochDeltaOnly" => Ok(Self::EpochDeltaOnly),
-            "GuardedRatchet" => Ok(Self::GuardedRatchet),
+            "ExactUnconditional" | "exact_unconditional" => Ok(Self::ExactUnconditional),
+            "EpochDeltaOnly" | "epoch_delta_only" => Ok(Self::EpochDeltaOnly),
+            "GuardedRatchet" | "guarded_ratchet" => Ok(Self::GuardedRatchet),
             other => Err(format!("unknown ExpectedTier `{other}`")),
         }
     }
@@ -169,8 +169,12 @@ pub struct MatrixCell {
     pub minirust_snapshot: String,
     pub layer: String,
     pub expected_tier: ExpectedTier,
+    pub status: Option<String>,
     pub max_open_bugs: usize,
     pub allowed_epoch_gaps: Vec<String>,
+    pub gap_ids: Vec<String>,
+    pub proof_module: Option<String>,
+    pub theorem: Option<String>,
 }
 
 /// Parsed representation of `correspondence_matrix.toml`.
@@ -336,8 +340,12 @@ pub fn parse_matrix_toml(content: &str) -> Result<CorrespondenceMatrix, String> 
                 minirust_snapshot: String::new(),
                 layer: String::new(),
                 expected_tier: ExpectedTier::GuardedRatchet,
+                status: None,
                 max_open_bugs: 0,
                 allowed_epoch_gaps: Vec::new(),
+                gap_ids: Vec::new(),
+                proof_module: None,
+                theorem: None,
             });
             in_cell = true;
             continue;
@@ -368,12 +376,32 @@ pub fn parse_matrix_toml(content: &str) -> Result<CorrespondenceMatrix, String> 
             "minirust_snapshot" => cell.minirust_snapshot = parse_scalar(val_raw),
             "layer" => cell.layer = parse_scalar(val_raw),
             "expected_tier" => cell.expected_tier = ExpectedTier::parse(&parse_scalar(val_raw))?,
+            "status" => {
+                let s = parse_scalar(val_raw);
+                if let Ok(tier) = ExpectedTier::parse(&s) {
+                    cell.expected_tier = tier;
+                }
+                cell.status = Some(s);
+            }
             "max_open_bugs" => {
                 cell.max_open_bugs = parse_scalar(val_raw)
                     .parse::<usize>()
                     .map_err(|e| format!("invalid max_open_bugs: {e}"))?;
             }
             "allowed_epoch_gaps" => cell.allowed_epoch_gaps = parse_string_array(val_raw),
+            "gap_ids" => cell.gap_ids = parse_string_array(val_raw),
+            "proof_module" => {
+                let s = parse_scalar(val_raw);
+                if !s.is_empty() {
+                    cell.proof_module = Some(s);
+                }
+            }
+            "theorem" => {
+                let s = parse_scalar(val_raw);
+                if !s.is_empty() {
+                    cell.theorem = Some(s);
+                }
+            }
             _ => {}
         }
     }
@@ -616,6 +644,11 @@ pub fn emit_generated_gaps_lean(registry: &GapRegistry, matrix: &CorrespondenceM
     s.push_str("-- Pure Lean 4 kernel definitions; zero automatic issue filing side effects.\n\n");
     s.push_str("namespace Correspondence\n\n");
 
+    s.push_str("inductive AnnealVer where\n");
+    s.push_str("  | V2026_06_01\n");
+    s.push_str("  | V2026_08_01\n");
+    s.push_str("  deriving DecidableEq, Repr, Inhabited\n\n");
+
     s.push_str("inductive GapKind where\n");
     s.push_str("  | anneal_soundness_bug\n");
     s.push_str("  | anneal_false_positive_ub\n");
@@ -637,6 +670,7 @@ pub fn emit_generated_gaps_lean(registry: &GapRegistry, matrix: &CorrespondenceM
     s.push_str("  id : GapId\n");
     s.push_str("  rawId : String\n");
     s.push_str("  kind : GapKind\n");
+    s.push_str("  annealVersions : List AnnealVer\n");
     s.push_str("  layer : String\n");
     s.push_str("  annealDecl : String\n");
     s.push_str("  minirustSource : String\n");
@@ -647,11 +681,21 @@ pub fn emit_generated_gaps_lean(registry: &GapRegistry, matrix: &CorrespondenceM
     s.push_str("def registeredGaps : List GapRecord := [\n");
     for (idx, g) in registry.gaps.iter().enumerate() {
         let comma = if idx + 1 < registry.gaps.len() { "," } else { "" };
+        let versions_lean = g
+            .anneal_versions
+            .iter()
+            .map(|v| match v.as_str() {
+                "V2026_08_01" => "AnnealVer.V2026_08_01",
+                _ => "AnnealVer.V2026_06_01",
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         s.push_str(&format!(
-            "  {{ id := GapId.{}, rawId := {}, kind := {}, layer := {}, annealDecl := {}, minirustSource := {}, guardPredicate := {}, witnessFixture := {} }}{}\n",
+            "  {{ id := GapId.{}, rawId := {}, kind := {}, annealVersions := [{}], layer := {}, annealDecl := {}, minirustSource := {}, guardPredicate := {}, witnessFixture := {} }}{}\n",
             g.lean_ctor_ident(),
             lean_string_literal(&g.id),
             g.kind.lean_ctor(),
+            versions_lean,
             lean_string_literal(&g.layer),
             lean_string_literal(&g.anneal_decl),
             lean_string_literal(&g.minirust_source),
@@ -712,6 +756,10 @@ pub fn emit_generated_gap_witnesses_lean(registry: &GapRegistry) -> String {
             .next()
             .unwrap_or(g.witness_fixture.as_str())
             .trim();
+        let eval_fn = match g.anneal_versions.first().map(String::as_str) {
+            Some("V2026_08_01") => "evalAnnealV2026_08_01",
+            _ => "evalAnnealV2026_06_01",
+        };
         let snap = g
             .minirust_snapshots
             .first()
@@ -720,11 +768,11 @@ pub fn emit_generated_gap_witnesses_lean(registry: &GapRegistry) -> String {
         let minirust_v = g.expected_minirust_verdict.trim();
         if g.status.trim().eq_ignore_ascii_case("closed") {
             s.push_str(&format!(
-                "theorem witness_{ctor} :\n    VerifiedRemediationWitness\n      (evalAnnealV2026_06_01 .{fixture} defaultFixtureState)\n      (evalMiniRustSnapshot .{snap} .{fixture})\n      .{minirust_v} := by\n  decide\n\n"
+                "theorem witness_{ctor} :\n    VerifiedRemediationWitness\n      ({eval_fn} .{fixture} defaultFixtureState)\n      (evalMiniRustSnapshot .{snap} .{fixture})\n      .{minirust_v} := by\n  decide\n\n"
             ));
         } else {
             s.push_str(&format!(
-                "theorem witness_{ctor} :\n    VerifiedDivergenceWitness\n      (evalAnnealV2026_06_01 .{fixture} defaultFixtureState)\n      (evalMiniRustSnapshot .{snap} .{fixture})\n      .{anneal_v}\n      .{minirust_v} := by\n  decide\n\n"
+                "theorem witness_{ctor} :\n    VerifiedDivergenceWitness\n      ({eval_fn} .{fixture} defaultFixtureState)\n      (evalMiniRustSnapshot .{snap} .{fixture})\n      .{anneal_v}\n      .{minirust_v} := by\n  decide\n\n"
             ));
         }
     }

@@ -29,6 +29,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[path = "../../anneal-specr-lean/src/ast_diff.rs"]
 mod ast_diff;
 #[allow(dead_code)]
+#[path = "../../anneal-specr-lean/src/expr_lower.rs"]
+mod expr_lower;
+#[allow(dead_code)]
 #[path = "../../anneal-specr-lean/src/extractor.rs"]
 mod extractor;
 #[allow(dead_code)]
@@ -677,11 +680,35 @@ sha256 = "{v2_sha}"
     assert!(report_out_path.is_file());
 }
 
+fn scan_dir_for_forbidden_prefix(dir: &Path, forbidden_prefix: &str) {
+    if !dir.is_dir() {
+        return;
+    }
+    for entry in fs::read_dir(dir).expect("failed to read directory for hygiene scan") {
+        let entry = entry.expect("failed to read directory entry");
+        let path = entry.path();
+        if path.is_dir() {
+            scan_dir_for_forbidden_prefix(&path, forbidden_prefix);
+        } else if path.is_file() {
+            if let Ok(content) = fs::read_to_string(&path) {
+                assert!(
+                    !content.contains(forbidden_prefix),
+                    "hygiene violation: {} contains forbidden internal path string",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
 /// Gate 5 TCB Non-Contamination & Public Repository Hygiene Test:
 /// Verifies that `trusted/lean/Trusted.lean` does not import `MiniRust` or
 /// `Correspondence`, `trusted/lean/foundation-lock.json` exists,
 /// `python3 trusted/audit/check_trusted.py --fast` succeeds, and all owned
-/// source and test files contain zero internal path strings or forbidden markers.
+/// directories (`theory/MiniRust`, `theory/Correspondence`,
+/// `trusted/lean/Trusted/Rustc/V2026_06_01`, and
+/// `trusted/lean/Trusted/Rustc/V2026_08_01`) and source/test files contain
+/// zero internal path strings or forbidden markers.
 #[test]
 fn gate5_tcb_zero_contamination_and_hygiene_audit() {
     let root = repo_root();
@@ -713,18 +740,19 @@ fn gate5_tcb_zero_contamination_and_hygiene_audit() {
         String::from_utf8_lossy(&audit_out.stderr)
     );
 
-    // 4. Scan owned files for forbidden internal path prefix (`/` + `google/` + `src`).
+    // 4. Scan owned files and directories (`theory/MiniRust`, `theory/Correspondence`,
+    // `trusted/lean/Trusted/Rustc/V2026_06_01`, and `trusted/lean/Trusted/Rustc/V2026_08_01`)
+    // for forbidden internal path prefix (`/` + `google/` + `src`).
     let forbidden_prefix = format!("/{}/{}", "google", "src");
     let owned_files = [
+        "crates/anneal-specr-lean/src/gap_codegen.rs",
         "crates/cargo-anneal/src/correspondence_bugs.rs",
         "crates/cargo-anneal/src/minirust_sync.rs",
         "crates/cargo-anneal/src/lib.rs",
         "crates/cargo-anneal/tests/end_to_end_minirust_correspondence.rs",
-        "theory/Correspondence/V2026_06_01/L5_ControlAndCalls.lean",
-        "theory/Correspondence/V2026_06_01/L6_WholeMachine.lean",
-        "theory/Correspondence/V2026_06_01/Scorecard.lean",
         "theory/Correspondence.lean",
         "theory/Correspondence/correspondence_matrix.toml",
+        "theory/Correspondence/correspondence_gaps.toml",
     ];
     for rel in owned_files {
         let content = fs::read_to_string(root.join(rel))
@@ -733,6 +761,15 @@ fn gate5_tcb_zero_contamination_and_hygiene_audit() {
             !content.contains(&forbidden_prefix),
             "hygiene violation: {rel} contains forbidden internal path string"
         );
+    }
+
+    for rel_dir in [
+        "theory/MiniRust",
+        "theory/Correspondence",
+        "trusted/lean/Trusted/Rustc/V2026_06_01",
+        "trusted/lean/Trusted/Rustc/V2026_08_01",
+    ] {
+        scan_dir_for_forbidden_prefix(&root.join(rel_dir), &forbidden_prefix);
     }
 }
 
@@ -753,6 +790,15 @@ fn live_repo_artifacts_end_to_end_validation() {
 
     if gaps_path.is_file() && matrix_path.is_file() && miri_path.is_file() {
         let raw_gaps = fs::read_to_string(&gaps_path).unwrap();
+        let raw_matrix = fs::read_to_string(&matrix_path).unwrap();
+        let parsed_matrix = gap_codegen::parse_matrix_toml(&raw_matrix)
+            .expect("live correspondence_matrix.toml must parse cleanly");
+        assert_eq!(
+            parsed_matrix.cells.len(),
+            24,
+            "expected 24 cells (2 dialects × 2 snapshots × 6 layers) in correspondence_matrix.toml"
+        );
+
         let lint_cmd = parse_correspondence_bugs_args(&[
             "lint".to_string(),
             "--gaps-toml".to_string(),
@@ -764,8 +810,6 @@ fn live_repo_artifacts_end_to_end_validation() {
         ])
         .unwrap();
         if raw_gaps.contains("spec/mem/tree_borrows.md") {
-            // While `lean-foundation` is updating `correspondence_gaps.toml` for Defect 4a,
-            // verify that our new vendor-span checker catches the old path AND passes once normalized.
             let pre_fix_err = run_correspondence_bugs_cli(&lint_cmd)
                 .expect_err("pre-Defect-4a spec/mem/tree_borrows.md path must be caught by vendor check");
             assert!(pre_fix_err.contains("does not exist in snapshot"));
@@ -799,6 +843,179 @@ fn live_repo_artifacts_end_to_end_validation() {
         assert!(
             diff.unchanged_count > 10,
             "expected substantial real MiniRust declarations extracted from vendored markdown"
+        );
+    }
+}
+
+/// Integration Test for `V2026_08_01` Correspondence Slices, 24-Cell Matrix, & `GAP-EPOCH-0002`:
+/// Verifies:
+/// 1. `correspondence_matrix.toml` has 24 cells (`2 dialects × 2 snapshots × 6 layers`);
+/// 2. All 6 `V2026_08_01` × `S2026_07_BleedingEdge` cells (`L1`–`L6`) have
+///    `status == "exact_unconditional"` (`ExpectedTier::ExactUnconditional`) and empty `gap_ids`;
+/// 3. `V2026_08_01` × `S2026_05_Matched` has `status == "epoch_delta_only"` at `L4_TreeBorrows`
+///    with `gap_ids == ["GAP-EPOCH-0002"]`, and `"exact_unconditional"` with empty `gap_ids`
+///    on `L1_Scalars`, `L2_BytesAndLayout`, `L3_PlacesAndBasicMem`, `L5_ControlAndCalls`, and
+///    `L6_WholeMachine`;
+/// 4. `GAP-EPOCH-0002` is registered in `correspondence_gaps.toml` scoped to
+///    `anneal_versions = ["V2026_08_01"]` and `minirust_snapshots = ["S2026_05_Matched"]`
+///    with `expected_anneal_verdict = "normalUnit"` and `expected_minirust_verdict = "ub"`,
+///    while `GAP-MR-0001`..`GAP-MR-0004` are scoped strictly to `["V2026_06_01"]`;
+/// 5. All 7 `theory/Correspondence/V2026_08_01/{L1_Scalars,L2_BytesAndLayout,L3_PlacesAndBasicMem,L4_TreeBorrows,L5_ControlAndCalls,L6_WholeMachine,Scorecard}.lean`
+///    slice modules exist, contain zero `def mr` definitions and zero `sorry`/`axiom` tokens,
+///    and reference `Trusted.Rustc.V2026_08_01.MirSemantics`.
+#[test]
+fn v2026_08_01_correspondence_slices_and_gap_epoch_0002_validation() {
+    let root = repo_root();
+    let gaps_raw = fs::read_to_string(root.join("theory/Correspondence/correspondence_gaps.toml"))
+        .expect("failed to read correspondence_gaps.toml");
+    let matrix_raw =
+        fs::read_to_string(root.join("theory/Correspondence/correspondence_matrix.toml"))
+            .expect("failed to read correspondence_matrix.toml");
+
+    let gap_reg = gap_codegen::parse_gaps_toml(&gaps_raw).expect("parse_gaps_toml must succeed");
+    let matrix =
+        gap_codegen::parse_matrix_toml(&matrix_raw).expect("parse_matrix_toml must succeed");
+    let summary = gap_codegen::validate_registry_and_matrix_with_repo_root(&gap_reg, &matrix, &root)
+        .expect("validate_registry_and_matrix_with_repo_root must succeed on 24-cell matrix");
+    assert_eq!(summary.validated_cells, 24);
+    assert_eq!(summary.total_gaps, 6);
+    assert_eq!(summary.epoch_divergence_count, 2);
+
+    // Check `GAP-MR-0001`..`GAP-MR-0004` are scoped strictly to `V2026_06_01`.
+    for bug_id in ["GAP-MR-0001", "GAP-MR-0002", "GAP-MR-0003", "GAP-MR-0004"] {
+        let g = gap_reg
+            .gaps
+            .iter()
+            .find(|g| g.id == bug_id)
+            .unwrap_or_else(|| panic!("missing {bug_id}"));
+        assert_eq!(g.anneal_versions, vec!["V2026_06_01".to_string()]);
+    }
+
+    // Check `GAP-EPOCH-0001` and `GAP-EPOCH-0002`.
+    let epoch1 = gap_reg
+        .gaps
+        .iter()
+        .find(|g| g.id == "GAP-EPOCH-0001")
+        .expect("missing GAP-EPOCH-0001");
+    assert_eq!(epoch1.expected_anneal_verdict, "ub");
+    assert_eq!(epoch1.expected_minirust_verdict, "normalUnit");
+
+    let epoch2 = gap_reg
+        .gaps
+        .iter()
+        .find(|g| g.id == "GAP-EPOCH-0002")
+        .expect("missing GAP-EPOCH-0002");
+    assert_eq!(epoch2.anneal_versions, vec!["V2026_08_01".to_string()]);
+    assert_eq!(
+        epoch2.minirust_snapshots,
+        vec!["S2026_05_Matched".to_string()]
+    );
+    assert_eq!(epoch2.layer, "L4_TreeBorrows");
+    assert_eq!(epoch2.expected_anneal_verdict, "normalUnit");
+    assert_eq!(epoch2.expected_minirust_verdict, "ub");
+
+    // Check all 6 `V2026_08_01` × `S2026_07_BleedingEdge` cells (`L1`..`L6`).
+    let layers = [
+        "L1_Scalars",
+        "L2_BytesAndLayout",
+        "L3_PlacesAndBasicMem",
+        "L4_TreeBorrows",
+        "L5_ControlAndCalls",
+        "L6_WholeMachine",
+    ];
+    for layer in layers {
+        let c07 = matrix
+            .cells
+            .iter()
+            .find(|c| {
+                c.anneal_version == "V2026_08_01"
+                    && c.minirust_snapshot == "S2026_07_BleedingEdge"
+                    && c.layer == layer
+            })
+            .unwrap_or_else(|| {
+                panic!("missing cell (V2026_08_01, S2026_07_BleedingEdge, {layer})")
+            });
+        assert_eq!(
+            c07.expected_tier,
+            gap_codegen::ExpectedTier::ExactUnconditional
+        );
+        assert_eq!(c07.status.as_deref(), Some("exact_unconditional"));
+        assert!(
+            c07.gap_ids.is_empty(),
+            "expected empty gap_ids for (V2026_08_01, S2026_07_BleedingEdge, {layer})"
+        );
+
+        let c05 = matrix
+            .cells
+            .iter()
+            .find(|c| {
+                c.anneal_version == "V2026_08_01"
+                    && c.minirust_snapshot == "S2026_05_Matched"
+                    && c.layer == layer
+            })
+            .unwrap_or_else(|| panic!("missing cell (V2026_08_01, S2026_05_Matched, {layer})"));
+        if layer == "L4_TreeBorrows" {
+            assert_eq!(c05.expected_tier, gap_codegen::ExpectedTier::EpochDeltaOnly);
+            assert_eq!(c05.status.as_deref(), Some("epoch_delta_only"));
+            assert_eq!(c05.gap_ids, vec!["GAP-EPOCH-0002".to_string()]);
+        } else {
+            assert_eq!(
+                c05.expected_tier,
+                gap_codegen::ExpectedTier::ExactUnconditional
+            );
+            assert_eq!(c05.status.as_deref(), Some("exact_unconditional"));
+            assert!(
+                c05.gap_ids.is_empty(),
+                "expected empty gap_ids for (V2026_08_01, S2026_05_Matched, {layer})"
+            );
+        }
+    }
+
+    // Check all 7 `theory/Correspondence/V2026_08_01/*.lean` slice modules.
+    let v08_modules = [
+        (
+            "theory/Correspondence/V2026_08_01/L1_Scalars.lean",
+            "mir_evalExactDiv_unsigned_corresponds",
+        ),
+        (
+            "theory/Correspondence/V2026_08_01/L2_BytesAndLayout.lean",
+            "mir_union_cross_variant_write_read_corresponds",
+        ),
+        (
+            "theory/Correspondence/V2026_08_01/L3_PlacesAndBasicMem.lean",
+            "mir_dynamic_index_borrow_resolved_at_creation_survives_storage_dead",
+        ),
+        (
+            "theory/Correspondence/V2026_08_01/L4_TreeBorrows.lean",
+            "mir_shared_borrow_unsafe_cell_permits_write",
+        ),
+        (
+            "theory/Correspondence/V2026_08_01/L5_ControlAndCalls.lean",
+            "mir_evalTerminator_exact_div_intrinsic_corresponds",
+        ),
+        (
+            "theory/Correspondence/V2026_08_01/L6_WholeMachine.lean",
+            "mir_whole_machine_unconditional_refines_s2026_07",
+        ),
+        (
+            "theory/Correspondence/V2026_08_01/Scorecard.lean",
+            "v2026_08_01_s2026_07_all_layers_exact_unconditional",
+        ),
+    ];
+    for (rel_path, expected_thm) in v08_modules {
+        let text = fs::read_to_string(root.join(rel_path))
+            .unwrap_or_else(|e| panic!("failed to read {rel_path}: {e}"));
+        assert!(
+            text.contains("Trusted.Rustc.V2026_08_01.MirSemantics"),
+            "expected {rel_path} to import/open Trusted.Rustc.V2026_08_01.MirSemantics"
+        );
+        assert!(
+            text.contains(expected_thm),
+            "expected {rel_path} to define theorem `{expected_thm}`"
+        );
+        assert!(
+            !text.contains("def mr"),
+            "{rel_path} must not contain any `def mr` definitions"
         );
     }
 }
