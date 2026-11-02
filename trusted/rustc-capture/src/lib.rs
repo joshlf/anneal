@@ -9,23 +9,22 @@
 //! Mechanical `rustc` MIR capture and `.anneal/Mir.lean` emission for
 //! Anneal.
 //!
-//! This crate belongs to `trusted/`. It invokes `rustc` on the target crate in
-//! a sanitized subprocess environment, extracts the lowered
-//! `Runtime(PostCleanup)` MIR for the supported vertical slice
-//! (`pub fn id(x: usize) -> usize { x }`), and writes `.anneal/Mir.lean` and
-//! optional candidate `.anneal/Proof.lean` artifacts consumed by
-//! `cargo-anneal`.
+//! This crate belongs to `trusted/`. It invokes `rustc` on the target crate,
+//! extracts the lowered `Runtime(PostCleanup)` MIR (including compile-time
+//! constant bodies referenced for Post-Monomorphization Errors and ADT/function
+//! visibility metadata for library verification promises), and writes
+//! `.anneal/Mir.lean` and optional candidate `.anneal/Proof.lean` artifacts
+//! consumed by `cargo-anneal`.
 //!
 //! Every type and extraction helper in this module that interprets `rustc` MIR
-//! structures or Rust lexical syntax cites its normative `rustc_middle::mir` or
-//! Rust Reference source at the repository's pinned revisions
-//! (`rust-lang/rust@58cf8f9c35b355199727627d07ae34a4e2846d67` and
-//! `rust-lang/reference@82da570bafd9efed421bdbae0f8603ede8dd308b`).
+//! structures cites its normative `rustc_middle::mir` source at the
+//! repository's pinned revision
+//! (`rust-lang/rust@58cf8f9c35b355199727627d07ae34a4e2846d67`).
 
 pub mod proof_gen;
 pub use proof_gen::render_proof_lean;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
@@ -33,8 +32,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Host environment variables preserved across sanitized `rustc` invocations.
-const SANITIZED_ENV_ALLOWLIST: [&str; 10] = [
+/// Allowlisted environment variables forwarded to child `rustc` invocations.
+const SANITIZED_ENV_ALLOWLIST: &[&str] = &[
     "PATH",
     "HOME",
     "TMPDIR",
@@ -60,6 +59,15 @@ fn sanitized_command(program: impl AsRef<OsStr>) -> Command {
     cmd
 }
 
+/// Configuration options for [`capture_crate_with_config`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CaptureOptions {
+    /// Whether to emit `.anneal/Proof.lean` alongside `.anneal/Mir.lean`.
+    pub emit_proof: bool,
+    /// Optional explicit path to the pinned `rustc` binary.
+    pub rustc_bin: Option<PathBuf>,
+}
+
 /// Errors returned when `rustc` compilation or fail-closed MIR extraction
 /// rejects a target crate.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -75,36 +83,51 @@ pub enum CaptureError {
     UnsupportedMir(String),
 }
 
-/// Configuration options for [`capture_crate_with_config`].
-#[derive(Debug, Clone, Default)]
-pub struct CaptureOptions {
-    /// When `true`, synthesize a candidate `.anneal/Proof.lean` script.
-    pub emit_proof: bool,
-    /// Optional explicit path to the pinned `rustc` compiler binary.
-    pub rustc_bin: Option<PathBuf>,
-}
-
-/// Captured MIR type (`usize` or `()`).
+/// Captured MIR type (`usize`, `bool`, `()`, ADT, generic type parameter, or
+/// shared reference to a generic type parameter).
 ///
 /// Corresponds to `Trusted.MirTy` in `trusted/lean/Trusted/MirAst.lean` and
-/// Rust's `usize` type:
+/// `rustc_type_ir::TyKind`:
 ///
 /// > "The `usize` type is an unsigned integer type with the same number of
 /// > bits as the platform's pointer type. It can represent every memory
 /// > address in the process."
 ///
-/// Source: https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/numeric.md#L37-L38
+/// Sources:
+/// - https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/types/numeric.md#L37-L38
+/// - https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_type_ir/src/ty_kind.rs#L106-L165
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapturedTy {
     Usize,
+    Bool,
     Unit,
+    Adt(usize),
+    Param(usize),
+    RefParam(usize),
 }
 
 impl CapturedTy {
-    fn to_lean(self) -> &'static str {
+    fn to_lean(self) -> String {
         match self {
-            Self::Usize => "Trusted.MirTy.usize",
-            Self::Unit => "Trusted.MirTy.unit",
+            Self::Usize => "Trusted.MirTy.usize".to_string(),
+            Self::Bool => "Trusted.MirTy.bool".to_string(),
+            Self::Unit => "Trusted.MirTy.unit".to_string(),
+            Self::Adt(id) => format!("(Trusted.MirTy.adt {id})"),
+            Self::Param(idx) => format!("(Trusted.MirTy.param {idx})"),
+            Self::RefParam(idx) => {
+                format!("(Trusted.MirTy.ref (Trusted.MirTy.param {idx}))")
+            }
+        }
+    }
+
+    fn to_lean_in_list(self) -> String {
+        match self {
+            Self::Adt(id) => format!("Trusted.MirTy.adt {id}"),
+            Self::Param(idx) => format!("Trusted.MirTy.param {idx}"),
+            Self::RefParam(idx) => {
+                format!("Trusted.MirTy.ref (Trusted.MirTy.param {idx})")
+            }
+            other => other.to_lean(),
         }
     }
 }
@@ -130,6 +153,7 @@ pub enum CapturedOperand {
     Copy(usize),
     Move(usize),
     ConstUsize(u128),
+    ConstUnit,
 }
 
 impl CapturedOperand {
@@ -140,14 +164,17 @@ impl CapturedOperand {
             Self::ConstUsize(bits) => format!(
                 "(Trusted.Operand.constVal (Trusted.MirVal.usize {bits}))"
             ),
+            Self::ConstUnit => {
+                "(Trusted.Operand.constVal Trusted.MirVal.unit)".to_string()
+            }
         }
     }
 }
 
 /// Captured MIR statement in a basic block.
 ///
-/// Corresponds to `rustc_middle::mir::StatementKind` (`Assign` with
-/// `Rvalue::Use`, `StorageLive`, `StorageDead`, and `Nop`):
+/// Corresponds to `rustc_middle::mir::StatementKind` (`Assign`, `StorageLive`,
+/// `StorageDead`, and `Nop` / `ConstEvalCounter`):
 ///
 /// > "Assign statements roughly correspond to an assignment in Rust proper
 /// > (`x = ...`) except without the possibility of dropping the previous value
@@ -159,7 +186,32 @@ impl CapturedOperand {
 /// Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L305-L385
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapturedStmt {
-    AssignUse { dst: usize, op: CapturedOperand },
+    AssignUse {
+        dst: usize,
+        op: CapturedOperand,
+    },
+    AssignEq {
+        dst: usize,
+        lhs: CapturedOperand,
+        rhs: CapturedOperand,
+    },
+    AssignAggregate {
+        dst: usize,
+        adt_id: usize,
+        op: CapturedOperand,
+    },
+    AssignField0 {
+        dst: usize,
+        src: usize,
+    },
+    AssignRef {
+        dst: usize,
+        src: usize,
+    },
+    AssignReborrow {
+        dst: usize,
+        src: usize,
+    },
     StorageLive(usize),
     StorageDead(usize),
     Nop,
@@ -171,6 +223,26 @@ impl CapturedStmt {
             Self::AssignUse { dst, op } => format!(
                 "Trusted.Stmt.assign ⟨{dst}⟩ (Trusted.Rvalue.use {})",
                 op.to_lean()
+            ),
+            Self::AssignEq { dst, lhs, rhs } => format!(
+                "Trusted.Stmt.assign ⟨{dst}⟩ \
+                 (Trusted.Rvalue.binaryOp Trusted.BinOp.eq {} {})",
+                lhs.to_lean(),
+                rhs.to_lean()
+            ),
+            Self::AssignAggregate { dst, adt_id, op } => format!(
+                "Trusted.Stmt.assign ⟨{dst}⟩ \
+                 (Trusted.Rvalue.aggregate {adt_id} {})",
+                op.to_lean()
+            ),
+            Self::AssignField0 { dst, src } => format!(
+                "Trusted.Stmt.assign ⟨{dst}⟩ (Trusted.Rvalue.field0 ⟨{src}⟩)"
+            ),
+            Self::AssignRef { dst, src } => format!(
+                "Trusted.Stmt.assign ⟨{dst}⟩ (Trusted.Rvalue.ref ⟨{src}⟩)"
+            ),
+            Self::AssignReborrow { dst, src } => format!(
+                "Trusted.Stmt.assign ⟨{dst}⟩ (Trusted.Rvalue.reborrow ⟨{src}⟩)"
             ),
             Self::StorageLive(loc) => {
                 format!("Trusted.Stmt.storageLive ⟨{loc}⟩")
@@ -186,7 +258,7 @@ impl CapturedStmt {
 /// Captured MIR basic-block terminator.
 ///
 /// Corresponds to `rustc_middle::mir::TerminatorKind` (`Return`, `Goto`,
-/// `Unreachable`):
+/// `Unreachable`, `SwitchInt`, and `Call`):
 ///
 /// > "Block has one successor; we continue execution there."
 /// >
@@ -196,20 +268,100 @@ impl CapturedStmt {
 /// >
 /// > Executing this terminator is UB."
 ///
-/// Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L683-L731
+/// Source: https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler/rustc_middle/src/mir/syntax.rs#L683-L798
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapturedTerminator {
     Return,
     Goto(usize),
     Unreachable,
+    Panic,
+    SwitchInt {
+        discr: CapturedOperand,
+        false_target: usize,
+        true_target: usize,
+    },
+    CallSizeOf {
+        dst: usize,
+        ty: CapturedTy,
+        target: usize,
+    },
+    CallTransmuteCopy {
+        dst: usize,
+        src_ty: CapturedTy,
+        dst_ty: CapturedTy,
+        op: CapturedOperand,
+        target: usize,
+    },
+    Call1 {
+        dst: usize,
+        callee_name: String,
+        arg: CapturedOperand,
+        target: usize,
+        type_args: Vec<CapturedTy>,
+    },
 }
 
 impl CapturedTerminator {
     fn to_lean(&self) -> String {
         match self {
             Self::Return => "Trusted.Terminator.return_".to_string(),
-            Self::Goto(target) => format!("(Trusted.Terminator.goto ⟨{target}⟩)"),
+            Self::Goto(target) => {
+                format!("(Trusted.Terminator.goto ⟨{target}⟩)")
+            }
             Self::Unreachable => "Trusted.Terminator.unreachable".to_string(),
+            Self::Panic => "Trusted.Terminator.panic".to_string(),
+            Self::SwitchInt {
+                discr,
+                false_target,
+                true_target,
+            } => format!(
+                "(Trusted.Terminator.switchInt {} \
+                 ⟨{false_target}⟩ ⟨{true_target}⟩)",
+                discr.to_lean()
+            ),
+            Self::CallSizeOf { dst, ty, target } => format!(
+                "(Trusted.Terminator.callSizeOf ⟨{dst}⟩ {} ⟨{target}⟩)",
+                ty.to_lean()
+            ),
+            Self::CallTransmuteCopy {
+                dst,
+                src_ty,
+                dst_ty,
+                op,
+                target,
+            } => format!(
+                "(Trusted.Terminator.callTransmuteCopy ⟨{dst}⟩ \
+                 {} {} {} ⟨{target}⟩)",
+                src_ty.to_lean(),
+                dst_ty.to_lean(),
+                op.to_lean()
+            ),
+            Self::Call1 {
+                dst,
+                callee_name,
+                arg,
+                target,
+                type_args,
+            } => {
+                if type_args.is_empty() {
+                    format!(
+                        "(Trusted.Terminator.call1 ⟨{dst}⟩ \
+                         {callee_name}_body {} ⟨{target}⟩)",
+                        arg.to_lean()
+                    )
+                } else {
+                    let tys: Vec<String> = type_args
+                        .iter()
+                        .map(|t| t.to_lean_in_list())
+                        .collect();
+                    format!(
+                        "(Trusted.Terminator.call1 ⟨{dst}⟩ \
+                         {callee_name}_body {} ⟨{target}⟩ {})",
+                        arg.to_lean(),
+                        render_lean_list(&tys)
+                    )
+                }
+            }
         }
     }
 }
@@ -230,11 +382,9 @@ pub struct CapturedBlock {
 }
 
 /// Specification attached to a captured function.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapturedSpec {
-    /// Baseline well-formedness (`specs := []`, so `MirLang.WellFormedOn fn.pre
-    /// :: fn.specs` reduces to `[Trusted.MirLang.WellFormed]`).
-    #[default]
+    /// Baseline well-formedness (`specs := []`).
     WellFormed,
     /// Postcondition `ensures(ret == <arg>)` (`specs := [Trusted.EnsuresEqArg
     /// 1]`).
@@ -252,19 +402,23 @@ impl CapturedSpec {
     }
 }
 
-/// Source-level metadata extracted from `src/lib.rs` via [`scan_rust_source`].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct SourceMetadata {
-    /// Default specification when a single-function crate is parsed via
-    /// [`parse_emitted_mir`].
-    pub spec: CapturedSpec,
-    /// Per-function specifications keyed by module-qualified function name.
-    pub fn_specs: BTreeMap<String, CapturedSpec>,
-    /// Full source text of `src/lib.rs` bound into `Mir.crate.artifacts`.
-    pub source_text: String,
+impl Default for CapturedSpec {
+    fn default() -> Self {
+        Self::WellFormed
+    }
 }
 
-/// Captured MIR function body and metadata (`rustc_middle::mir::Body`).
+/// Visibility and safety role of a captured function (`Trusted.FnKind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapturedFnKind {
+    /// Public safe function (`pub fn`).
+    PubSafe,
+    /// Public unsafe function `pub unsafe fn new_unchecked(x: usize) ->
+    /// NonZeroUsize`.
+    PubUnsafeNewUnchecked,
+}
+
+/// Captured MIR function or constant body (`rustc_middle::mir::Body`).
 ///
 /// > "The lowered representation of a single function."
 /// >
@@ -281,6 +435,66 @@ pub struct CapturedFunction {
     pub local_count: usize,
     pub blocks: Vec<CapturedBlock>,
     pub spec: CapturedSpec,
+    pub is_const: bool,
+    pub required_consts: Vec<(String, Vec<CapturedTy>)>,
+    pub kind: CapturedFnKind,
+}
+
+/// Classification of the `Self` type in a trait implementation header (`impl
+/// Trait for SelfTy`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SelfTyKind {
+    /// The unit type `()`.
+    Unit,
+    /// A generic type parameter declared on the `impl` block.
+    Param,
+    /// A concrete named type (such as `NonZeroUsize` or `usize`).
+    Named(String),
+}
+
+/// Source-level metadata for an associated `const` inside a trait `impl` block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplConstMeta {
+    /// 1-based start line of the `impl` block in `src/lib.rs`.
+    pub start_line: usize,
+    /// 1-based end line of the `impl` block in `src/lib.rs`.
+    pub end_line: usize,
+    /// Unqualified trait identifier (`SizeEq`, etc.).
+    pub trait_name: String,
+    /// Associated constant identifier (`ASSERT`, etc.).
+    pub const_name: String,
+    /// Classification of the `Self` type (`()`, type parameter, or named type).
+    pub self_ty_kind: SelfTyKind,
+    /// Raw `Self` type token (`"()"` or identifier).
+    pub self_ty_name: String,
+    /// Generic type parameter names declared on `impl<...>` in declaration
+    /// order.
+    pub impl_params: Vec<String>,
+    /// Type argument identifiers written on `Trait<...>` in the `impl` header.
+    pub trait_args: Vec<String>,
+}
+
+/// Crate-level source metadata extracted from `src/lib.rs` (such as ADT field
+/// visibility, `unsafe fn` headers, generic parameters, and trait associated
+/// constants).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceMetadata {
+    pub spec: CapturedSpec,
+    /// `Some(true)` if `struct NonZeroUsize` has `pub val: usize`,
+    /// `Some(false)` if `val: usize` is private or crate-restricted, or `None`
+    /// if `NonZeroUsize` is not defined.
+    pub nonzero_field_pub_safe: Option<bool>,
+    /// Set of function names declared with `unsafe fn`.
+    pub unsafe_fns: BTreeSet<String>,
+    /// Per-function generic type parameter names in declaration order.
+    pub fn_generics: BTreeMap<String, Vec<String>>,
+    /// Associated constants defined inside trait `impl` blocks.
+    pub impl_consts: Vec<ImplConstMeta>,
+    /// Whether `rustc` must be invoked with `-Z mir-opt-level=0` to preserve
+    /// zero-sized PME constant evaluations or multi-block library control flow.
+    pub needs_unoptimized_mir: bool,
+    /// Exact source text of `src/lib.rs` for `Trusted.Crate.artifacts`.
+    pub src_text: String,
 }
 
 /// Complete capture output for a crate written to `.anneal/Mir.lean`.
@@ -411,7 +625,7 @@ pub fn capture_crate_with_config(
     let src_text = fs::read_to_string(&src_path).map_err(|e| {
         CaptureError::Io(format!("cannot read {}: {e}", src_path.display()))
     })?;
-    let meta = scan_rust_source(&src_text)?;
+    let meta = parse_source_metadata(&src_text)?;
 
     let anneal_dir = crate_dir.join(".anneal");
     let build_dir = anneal_dir.join("rustc-out");
@@ -421,6 +635,13 @@ pub fn capture_crate_with_config(
     let mir_dump_path = build_dir.join("crate.mir");
     let rmeta_path = build_dir.join("libcrate.rmeta");
 
+    // Pass `-Z mir-opt-level=0` when the crate contains constants, traits,
+    // ADTs, unsafe blocks, control flow, or multiple functions so `rustc`'s
+    // `RemoveZsts` and `SimplifyLocals` passes do not strip zero-sized PME
+    // constant evaluations (`_2 = const <...>::ASSERT` or `_2 = const
+    // ...::{constant#0}`) before MIR emission. Single-function pure crates
+    // (`pub fn id`, `pub fn alloc_passthrough`) run at default MIR optimization
+    // so temporary `let` bindings collapse to canonical `idCopyBody`.
     let rustc_bin = resolve_rustc_binary(options);
     let mut cmd = sanitized_command(&rustc_bin);
     if let Some(rust_root) = rustc_bin.parent().and_then(Path::parent) {
@@ -434,10 +655,14 @@ pub fn capture_crate_with_config(
             cmd.env(lib_var, rust_lib);
         }
     }
-    let output = cmd
+    cmd.env("RUSTC_BOOTSTRAP", "1")
         .arg("--edition=2024")
         .arg("--crate-name=anneal_target")
-        .arg("--crate-type=lib")
+        .arg("--crate-type=lib");
+    if meta.needs_unoptimized_mir {
+        cmd.arg("-Z").arg("mir-opt-level=0");
+    }
+    let output = cmd
         .arg(format!(
             "--emit=mir={},metadata={}",
             mir_dump_path.display(),
@@ -462,14 +687,19 @@ pub fn capture_crate_with_config(
     })?;
     let _ = fs::remove_dir_all(&build_dir);
 
-    let functions = parse_emitted_mir_with_metadata(&mir_text, &meta)?;
+    let all_items = parse_emitted_mir_with_metadata(&mir_text, &meta)?;
+    let functions: Vec<CapturedFunction> = all_items
+        .iter()
+        .filter(|f| !f.is_const)
+        .cloned()
+        .collect();
     if functions.is_empty() {
         return Err(CaptureError::UnsupportedMir(
             "crate contains no captured functions".to_string(),
         ));
     }
 
-    let mir_lean_source = render_mir_lean_with_metadata(&functions, &meta);
+    let mir_lean_source = render_mir_lean_with_metadata(&all_items, &meta);
     let mir_lean_path = anneal_dir.join("Mir.lean");
     if fs::symlink_metadata(&mir_lean_path)
         .is_ok_and(|m| m.file_type().is_symlink())
@@ -510,574 +740,1103 @@ pub fn capture_crate_with_config(
     })
 }
 
+/// Lexical token from `src/lib.rs` with comments and string literals separated
+/// from item syntax.
+///
+/// Follows the Rust Reference lexical grammar for comments and string literals:
+///
+/// > "Comments in Rust code follow the general C++ style of line (`//`) and
+/// > block (`/* ... */`) comment forms. Nested block comments are supported."
+///
+/// Source:
+/// https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/comments.md#L1-L20
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LexToken {
+    /// A doc comment (`/// ...`, `//! ...`, `/** ... */`, `/*! ... */`) or a
+    /// standalone `// anneal:...` directive comment.
+    DocComment(String),
+    /// An identifier or keyword (`pub`, `fn`, `struct`, `impl`, `id`, ...).
     Ident(String),
+    /// A lifetime token (`'a`, `'static`).
+    Lifetime(String),
+    /// A single punctuation character (`{`, `}`, `(`, `)`, `[`, `]`, `<`, `>`,
+    /// `:`, `;`, `,`, `#`, etc.).
     Punct(char),
+    /// A string, raw string, byte string, or character literal.
     Literal,
-    AnnealSpec(CapturedSpec),
-    AnnealSafety(String),
 }
 
-/// Check whether `bytes[pos..]` starts with a Rust character literal (`'c'` or
-/// `'\...'`) rather than a lifetime (`'a` or `'static`), returning the byte
-/// index immediately after the closing `'` when it is a character literal.
-///
-/// Corresponds to the Rust Reference lexical grammar for character literals vs.
-/// lifetime tokens (`r[lex.token.literal.char]` and `r[lex.token.life]`):
-///
-/// > "A character literal is a single Unicode character enclosed within two
-/// > `U+0027` (single-quote) characters, with the exception of `U+0027` itself,
-/// > which must be escaped by a preceding `U+005C` (`\`) character."
-///
-/// Source: https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/tokens.md#L121-L125
-fn try_consume_char_literal(src: &str, quote_pos: usize) -> Option<usize> {
-    let rest = &src[quote_pos + 1..];
-    let mut chars = rest.char_indices();
-    let (_, first) = chars.next()?;
-    if first == '\n' || first == '\r' || first == '\'' {
-        return None;
-    }
-    if first == '\\' {
-        for (idx, ch) in chars {
-            if ch == '\n' || ch == '\r' {
-                return None;
-            }
-            if ch == '\'' {
-                return Some(quote_pos + 1 + idx + 1);
-            }
-        }
-        return None;
-    }
-    let (second_offset, second) = chars.next()?;
-    if second == '\'' {
-        Some(quote_pos + 1 + second_offset + 1)
-    } else {
-        None
-    }
+/// A [`LexToken`] paired with its 1-based starting line number in `src/lib.rs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpannedToken {
+    token: LexToken,
+    line: usize,
 }
 
-/// Check whether `src[pos..]` starts a raw string literal (`r"..."`,
-/// `r#"..."#`, `br"..."`, `cr"..."`), returning `(opening_quote_pos,
-/// num_hashes)`.
-fn try_start_raw_string(src: &str, pos: usize) -> Option<(usize, usize)> {
+/// Tokenize `src/lib.rs` into [`SpannedToken`]s, stripping non-documentation
+/// comments (`// ...`, `/* ... */`) and collapsing string, raw string, byte
+/// string, character, and numeric literals into [`LexToken::Literal`] so code
+/// or `anneal:spec` text embedded inside comments or string literals is never
+/// misinterpreted as item syntax.
+///
+/// Follows the Rust Reference lexical rules for comments, string literals, raw
+/// string literals, and character/lifetime tokens:
+///
+/// > "Comments in Rust code follow the general C++ style of line (`//`) and
+/// > block (`/* ... */`) comment forms. Nested block comments are supported."
+/// >
+/// > "Line doc comments beginning with exactly three slashes (`///`), and block
+/// > doc comments (`/** ... */`), are interpreted as a syntax sugar for doc
+/// > attributes."
+///
+/// Source:
+/// https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/comments.md#L1-L29
+fn lex_rust_source(src: &str) -> Result<Vec<SpannedToken>, CaptureError> {
     let bytes = src.as_bytes();
-    let after_prefix = if bytes[pos..].starts_with(b"br")
-        || bytes[pos..].starts_with(b"cr")
-    {
-        pos + 2
-    } else if bytes[pos] == b'r' {
-        pos + 1
-    } else {
-        return None;
-    };
-    let mut cur = after_prefix;
-    let mut hashes = 0usize;
-    while cur < bytes.len() && bytes[cur] == b'#' {
-        hashes += 1;
-        cur += 1;
-    }
-    if cur < bytes.len() && bytes[cur] == b'"' {
-        Some((cur, hashes))
-    } else {
-        None
-    }
-}
-
-fn parse_anneal_spec_clause(clause: &str) -> Result<CapturedSpec, CaptureError> {
-    let trimmed = clause.trim();
-    let inner = if let Some(s) =
-        trimmed.strip_prefix('(').and_then(|s| s.strip_suffix(')'))
-    {
-        let s = s.trim();
-        // Only unwrap outer parens if they balance across `s`.
-        let mut depth = 0i32;
-        let mut balanced = true;
-        for c in s.chars() {
-            if c == '(' {
-                depth += 1;
-            } else if c == ')' {
-                depth -= 1;
-                if depth < 0 {
-                    balanced = false;
-                    break;
-                }
-            }
-        }
-        if balanced && depth == 0 { s } else { trimmed }
-    } else {
-        trimmed
-    };
-    match inner.trim() {
-        "ensures(ret == x)" | "ret == x" => Ok(CapturedSpec::EnsuresEqArg(1)),
-        "well_formed" => Ok(CapturedSpec::WellFormed),
-        other => Err(CaptureError::UnsupportedMir(format!(
-            "unsupported anneal:spec annotation: `{other}`"
-        ))),
-    }
-}
-
-fn parse_anneal_line_comment(
-    comment_body: &str,
-) -> Result<Option<LexToken>, CaptureError> {
-    if !comment_body.contains("anneal:") {
-        return Ok(None);
-    }
-    if comment_body.starts_with('!') {
-        return Err(CaptureError::UnsupportedMir(
-            "anneal: directives are not permitted in inner doc comments (`//!`)"
-                .to_string(),
-        ));
-    }
-    let stripped = comment_body.trim_start_matches('/').trim();
-    if !stripped.starts_with("anneal:") {
-        return Err(CaptureError::UnsupportedMir(format!(
-            "malformed or trailing anneal: directive in comment: `{stripped}`"
-        )));
-    }
-    if let Some(rest) = stripped.strip_prefix("anneal:spec") {
-        let rest_trim = rest.trim();
-        if rest_trim.is_empty()
-            || (!rest.starts_with(char::is_whitespace)
-                && !rest_trim.starts_with('('))
-        {
-            return Err(CaptureError::UnsupportedMir(format!(
-                "unrecognized anneal: directive `{stripped}`"
-            )));
-        }
-        let spec = parse_anneal_spec_clause(rest_trim)?;
-        return Ok(Some(LexToken::AnnealSpec(spec)));
-    }
-    if let Some(rest) = stripped.strip_prefix("anneal:safety") {
-        let rest_trim = rest.trim();
-        if rest_trim.is_empty()
-            || (!rest.starts_with(char::is_whitespace)
-                && !rest_trim.starts_with('('))
-        {
-            return Err(CaptureError::UnsupportedMir(format!(
-                "unrecognized anneal: directive `{stripped}`"
-            )));
-        }
-        let inner = rest_trim
-            .strip_prefix('(')
-            .and_then(|s| s.strip_suffix(')'))
-            .unwrap_or(rest_trim)
-            .trim();
-        if inner.is_empty() {
-            return Err(CaptureError::UnsupportedMir(
-                "empty anneal:safety annotation".to_string(),
-            ));
-        }
-        return Ok(Some(LexToken::AnnealSafety(inner.to_string())));
-    }
-    Err(CaptureError::UnsupportedMir(format!(
-        "unrecognized anneal: directive `{stripped}`"
-    )))
-}
-
-/// Tokenize `src` into [`LexToken`]s while stripping comments and string/char
-/// literals according to the Rust Reference lexical rules (`r[lex.comment]`,
-/// `r[lex.token.literal]`).
-///
-/// > "Block comments (`/* ... */`) can be nested."
-///
-/// Source: https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/comments.md#L12-L24
-fn lex_rust_source(src: &str) -> Result<Vec<LexToken>, CaptureError> {
-    let bytes = src.as_bytes();
-    let mut pos = 0usize;
+    let len = bytes.len();
+    let mut i = 0;
+    let mut line = 1usize;
     let mut tokens = Vec::new();
 
-    while pos < bytes.len() {
-        let b = bytes[pos];
+    while i < len {
+        let b = bytes[i];
+        if b == b'\n' {
+            line += 1;
+            i += 1;
+            continue;
+        }
         if b.is_ascii_whitespace() {
-            pos += 1;
+            i += 1;
             continue;
         }
 
-        // Line comment `//`, `///`, `//!`.
-        if bytes[pos..].starts_with(b"//") {
-            let start = pos + 2;
-            pos += 2;
-            while pos < bytes.len() && bytes[pos] != b'\n' {
-                pos += 1;
+        // Line comments (`//`, `///`, `//!`).
+        if i + 1 < len && b == b'/' && bytes[i + 1] == b'/' {
+            let token_line = line;
+            let start = i;
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
             }
-            let body = src[start..pos].trim_end_matches('\r');
-            if let Some(tok) = parse_anneal_line_comment(body)? {
-                tokens.push(tok);
+            let comment_slice = &src[start..i];
+            let after_slashes = &comment_slice[2..];
+            let is_doc = (after_slashes.starts_with('/')
+                && !after_slashes.starts_with("//"))
+                || after_slashes.starts_with('!')
+                || after_slashes.trim_start().starts_with("anneal:");
+            if is_doc {
+                let text = after_slashes
+                    .strip_prefix('/')
+                    .or_else(|| after_slashes.strip_prefix('!'))
+                    .unwrap_or(after_slashes)
+                    .trim()
+                    .to_string();
+                tokens.push(SpannedToken {
+                    token: LexToken::DocComment(text),
+                    line: token_line,
+                });
             }
             continue;
         }
 
-        // Nested block comment `/* ... */`.
-        if bytes[pos..].starts_with(b"/*") {
-            let start = pos;
-            pos += 2;
+        // Block comments (`/* ... */`, `/** ... */`, `/*! ... */`) with
+        // nesting.
+        if i + 1 < len && b == b'/' && bytes[i + 1] == b'*' {
+            let token_line = line;
+            let start = i;
+            i += 2;
             let mut depth = 1usize;
-            while pos < bytes.len() && depth > 0 {
-                if bytes[pos..].starts_with(b"/*") {
+            while i < len && depth > 0 {
+                if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
                     depth += 1;
-                    pos += 2;
-                } else if bytes[pos..].starts_with(b"*/") {
+                    i += 2;
+                } else if i + 1 < len
+                    && bytes[i] == b'*'
+                    && bytes[i + 1] == b'/'
+                {
                     depth -= 1;
-                    pos += 2;
+                    i += 2;
                 } else {
-                    pos += 1;
+                    if bytes[i] == b'\n' {
+                        line += 1;
+                    }
+                    let ch_len = src[i..]
+                        .chars()
+                        .next()
+                        .map_or(1, char::len_utf8);
+                    i += ch_len;
                 }
             }
-            if depth > 0 {
+            if depth != 0 {
                 return Err(CaptureError::UnsupportedMir(
                     "unterminated block comment in source".to_string(),
                 ));
             }
-            if src[start..pos].contains("anneal:") {
-                return Err(CaptureError::UnsupportedMir(
-                    "anneal: directives are not permitted inside block comments"
-                        .to_string(),
-                ));
+            let comment_slice = &src[start..i];
+            let inner = &comment_slice[2..comment_slice.len() - 2];
+            let is_doc = (inner.starts_with('*') && !inner.starts_with("**"))
+                || inner.starts_with('!');
+            if is_doc {
+                let text = inner[1..].trim().to_string();
+                tokens.push(SpannedToken {
+                    token: LexToken::DocComment(text),
+                    line: token_line,
+                });
             }
             continue;
         }
 
-        // Raw string literal (`r"..."`, `r#"..."#`, `br#*"..."#*`,
-        // `cr#*"..."#*`).
-        if let Some((quote_pos, hashes)) = try_start_raw_string(src, pos) {
-            pos = quote_pos + 1;
-            let mut closed = false;
-            while pos < bytes.len() {
-                if bytes[pos] == b'"' {
-                    let mut matched = 0usize;
-                    while matched < hashes
-                        && pos + 1 + matched < bytes.len()
-                        && bytes[pos + 1 + matched] == b'#'
-                    {
-                        matched += 1;
-                    }
-                    if matched == hashes {
-                        pos += 1 + hashes;
-                        closed = true;
-                        break;
-                    }
-                }
-                pos += 1;
-            }
-            if !closed {
-                return Err(CaptureError::UnsupportedMir(
-                    "unterminated raw string literal".to_string(),
-                ));
-            }
-            tokens.push(LexToken::Literal);
-            continue;
-        }
-
-        // Byte or C string literal prefix (`b"..."`, `c"..."`) or byte char
-        // literal (`b'c'`).
-        if (b == b'b' || b == b'c')
-            && pos + 1 < bytes.len()
-            && bytes[pos + 1] == b'"'
+        // Raw string literals (`r"..."`, `r#"..."#`, `br"..."`, `br#"..."#`,
+        // `cr"..."`, `cr#"..."#`).
+        if (b == b'r'
+            || ((b == b'b' || b == b'c')
+                && i + 1 < len
+                && bytes[i + 1] == b'r'))
+            && let Some((next_i, newlines)) = try_consume_raw_string(src, i)
         {
-            pos += 1;
-        } else if b == b'b'
-            && pos + 1 < bytes.len()
-            && bytes[pos + 1] == b'\''
-            && let Some(next_pos) = try_consume_char_literal(src, pos + 1)
-        {
-            pos = next_pos;
-            tokens.push(LexToken::Literal);
+            tokens.push(SpannedToken {
+                token: LexToken::Literal,
+                line,
+            });
+            line += newlines;
+            i = next_i;
             continue;
         }
 
-        // Standard string literal `"..."`.
-        if bytes[pos] == b'"' {
-            pos += 1;
+        // Normal string literals (`"..."`, `b"..."`, `c"..."`).
+        if b == b'"'
+            || ((b == b'b' || b == b'c')
+                && i + 1 < len
+                && bytes[i + 1] == b'"')
+        {
+            let token_line = line;
+            if b != b'"' {
+                i += 1;
+            }
+            i += 1; // skip opening `"`
             let mut closed = false;
-            while pos < bytes.len() {
-                if bytes[pos] == b'\\' {
-                    pos += 1;
-                    if pos < bytes.len() {
-                        let ch_len =
-                            src[pos..].chars().next().map_or(1, char::len_utf8);
-                        pos += ch_len;
+            while i < len {
+                if bytes[i] == b'\\' {
+                    if i + 1 < len && bytes[i + 1] == b'\n' {
+                        line += 1;
                     }
-                    continue;
-                }
-                if bytes[pos] == b'"' {
-                    pos += 1;
+                    i += 2.min(len - i);
+                } else if bytes[i] == b'"' {
+                    i += 1;
                     closed = true;
                     break;
+                } else {
+                    if bytes[i] == b'\n' {
+                        line += 1;
+                    }
+                    let ch_len = src[i..]
+                        .chars()
+                        .next()
+                        .map_or(1, char::len_utf8);
+                    i += ch_len;
                 }
-                let ch_len =
-                    src[pos..].chars().next().map_or(1, char::len_utf8);
-                pos += ch_len;
             }
             if !closed {
                 return Err(CaptureError::UnsupportedMir(
-                    "unterminated string literal".to_string(),
+                    "unterminated string literal in source".to_string(),
                 ));
             }
-            tokens.push(LexToken::Literal);
+            tokens.push(SpannedToken {
+                token: LexToken::Literal,
+                line: token_line,
+            });
             continue;
         }
 
-        // Character literal `'c'` vs. lifetime `'a`.
-        if bytes[pos] == b'\'' {
-            if let Some(next_pos) = try_consume_char_literal(src, pos) {
-                pos = next_pos;
-                tokens.push(LexToken::Literal);
+        // Character literals (`'a'`, `'\''`, `b'a'`) vs lifetimes (`'a`).
+        if b == b'\''
+            || (b == b'b' && i + 1 < len && bytes[i + 1] == b'\'')
+        {
+            let token_line = line;
+            let quote_pos = if b == b'b' { i + 1 } else { i };
+            if let Some(after_char) = try_consume_char_literal(src, quote_pos) {
+                tokens.push(SpannedToken {
+                    token: LexToken::Literal,
+                    line: token_line,
+                });
+                i = after_char;
                 continue;
             }
-            pos += 1;
-            while pos < bytes.len()
-                && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_')
-            {
-                pos += 1;
+            if b == b'\'' {
+                let start = i;
+                i += 1;
+                while i < len
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+                {
+                    i += 1;
+                }
+                tokens.push(SpannedToken {
+                    token: LexToken::Lifetime(src[start..i].to_string()),
+                    line: token_line,
+                });
+                continue;
             }
-            continue;
         }
 
-        // Raw identifier `r#ident`.
-        if bytes[pos..].starts_with(b"r#")
-            && pos + 2 < bytes.len()
-            && (bytes[pos + 2].is_ascii_alphabetic() || bytes[pos + 2] == b'_')
-        {
-            pos += 2;
-            let start = pos;
-            while pos < bytes.len()
-                && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_')
-            {
-                pos += 1;
-            }
-            tokens.push(LexToken::Ident(src[start..pos].to_string()));
-            continue;
-        }
-
-        // Identifier or keyword.
+        // Identifiers and keywords.
         if b.is_ascii_alphabetic() || b == b'_' {
-            let start = pos;
-            while pos < bytes.len()
-                && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_')
+            let token_line = line;
+            let start = i;
+            i += 1;
+            while i < len
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
             {
-                pos += 1;
+                i += 1;
             }
-            tokens.push(LexToken::Ident(src[start..pos].to_string()));
+            tokens.push(SpannedToken {
+                token: LexToken::Ident(src[start..i].to_string()),
+                line: token_line,
+            });
             continue;
         }
 
-        // Numeric literal.
+        // Numeric literals (`0`, `1_usize`, etc.).
         if b.is_ascii_digit() {
-            while pos < bytes.len()
-                && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_')
+            let token_line = line;
+            while i < len
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
             {
-                pos += 1;
+                i += 1;
             }
-            tokens.push(LexToken::Literal);
+            tokens.push(SpannedToken {
+                token: LexToken::Literal,
+                line: token_line,
+            });
             continue;
         }
 
-        // Single-character punctuation.
-        let ch = src[pos..].chars().next().unwrap();
-        pos += ch.len_utf8();
-        tokens.push(LexToken::Punct(ch));
+        let ch = src[i..].chars().next().unwrap();
+        tokens.push(SpannedToken {
+            token: LexToken::Punct(ch),
+            line,
+        });
+        i += ch.len_utf8();
     }
 
     Ok(tokens)
 }
 
-/// Scan `src/lib.rs` with a single-pass lexical and structural state machine to
-/// extract per-function `anneal:spec` annotations and module scopes.
-pub fn scan_rust_source(src: &str) -> Result<SourceMetadata, CaptureError> {
+/// Attempt to consume a Rust raw string (`r#"..."#`), raw byte string
+/// (`br#"..."#`), or raw C string (`cr#"..."#`) starting at byte index `start`,
+/// returning `(end_index, newline_count)` on match.
+///
+/// Follows the Rust Reference grammar for raw string literals:
+///
+/// > "Raw string literals do not process any escapes. They start with the
+/// > character `U+0072` (`r`), followed by fewer than 256 of the character
+/// > `U+0023` (`#`), and a `U+0022` (double-quote) character. The raw string
+/// > body can contain any sequence of Unicode characters and is terminated
+/// > only by another `U+0022` (double-quote) character, followed by the same
+/// > number of `U+0023` (`#`) characters that preceded the opening `U+0022`
+/// > (double-quote) character."
+///
+/// Source:
+/// https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/tokens.md#L214-L221
+fn try_consume_raw_string(src: &str, start: usize) -> Option<(usize, usize)> {
+    let bytes = src.as_bytes();
+    let len = bytes.len();
+    let mut i = start;
+    if bytes[i] == b'b' || bytes[i] == b'c' {
+        i += 1;
+    }
+    if i >= len || bytes[i] != b'r' {
+        return None;
+    }
+    i += 1;
+    let mut hashes = 0usize;
+    while i < len && bytes[i] == b'#' {
+        hashes += 1;
+        i += 1;
+    }
+    if i >= len || bytes[i] != b'"' {
+        return None;
+    }
+    i += 1;
+    let mut newlines = 0usize;
+    while i < len {
+        if bytes[i] == b'\n' {
+            newlines += 1;
+        }
+        if bytes[i] == b'"' && i + hashes < len {
+            let mut matched = true;
+            for h in 0..hashes {
+                if bytes[i + 1 + h] != b'#' {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                return Some((i + 1 + hashes, newlines));
+            }
+        }
+        let ch_len = src[i..].chars().next().map_or(1, char::len_utf8);
+        i += ch_len;
+    }
+    None
+}
+
+/// Attempt to consume a character literal (`'a'`, `'\n'`, `b'a'`) whose opening
+/// single quote is at `quote_pos`, distinguishing it from a lifetime token
+/// (`'a`) by checking for a matching closing single quote on the same line.
+///
+/// Follows the Rust Reference grammar for character and byte literals:
+///
+/// > "A character literal is a single Unicode character enclosed within two
+/// > `U+0027` (single-quote) characters, with the exception of `U+0027` itself,
+/// > which must be escaped by a preceding `U+005C` (`\`) character."
+///
+/// Source:
+/// https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/tokens.md#L121-L125
+fn try_consume_char_literal(src: &str, quote_pos: usize) -> Option<usize> {
+    let rest = &src[quote_pos + 1..];
+    let mut chars = rest.char_indices();
+    let (_, first) = chars.next()?;
+    if first == '\\' {
+        let (_, _) = chars.next()?;
+        for (idx, ch) in chars {
+            if ch == '\'' {
+                return Some(quote_pos + 1 + idx + 1);
+            }
+            if ch == '\n' || idx > 10 {
+                return None;
+            }
+        }
+        None
+    } else if first != '\'' && first != '\n' {
+        let (idx, second) = chars.next()?;
+        if second == '\'' {
+            Some(quote_pos + 1 + idx + 1)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Extract source-level metadata (`anneal:spec` directives, `NonZeroUsize`
+/// field visibility, `unsafe fn` declarations, per-function generic type
+/// parameters, and trait `impl` associated constants) from `src/lib.rs`,
+/// failing closed on unsupported Rust item constructs (`enum`, `union`, `unsafe
+/// trait`, `unsafe impl`, tuple/unit structs, or `impl` methods).
+pub fn parse_source_metadata(src: &str) -> Result<SourceMetadata, CaptureError> {
     let tokens = lex_rust_source(src)?;
-    let mut fn_specs = BTreeMap::new();
-    let mut first_spec = None;
-    let mut pending_spec: Option<CapturedSpec> = None;
-    let mut pending_safety: Option<String> = None;
-    let mut mod_stack: Vec<(String, usize)> = Vec::new();
-    let mut brace_depth = 0usize;
+    let mut found_spec = None;
+    let mut nonzero_field_pub_safe = None;
+    let mut unsafe_fns = BTreeSet::new();
+    let mut fn_generics = BTreeMap::new();
+    let mut impl_consts = Vec::new();
+    let mut fn_count = 0usize;
+    let mut has_complex_tokens = false;
 
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        // Skip attributes `#[...]` and `#![...]`.
-        if tokens[idx] == LexToken::Punct('#') {
-            let bracket_start = if idx + 1 < tokens.len()
-                && tokens[idx + 1] == LexToken::Punct('[')
-            {
-                Some(idx + 1)
-            } else if idx + 2 < tokens.len()
-                && tokens[idx + 1] == LexToken::Punct('!')
-                && tokens[idx + 2] == LexToken::Punct('[')
-            {
-                Some(idx + 2)
-            } else {
-                None
-            };
-            if let Some(b_idx) = bracket_start {
-                let mut depth = 1usize;
-                idx = b_idx + 1;
-                while idx < tokens.len() && depth > 0 {
-                    if tokens[idx] == LexToken::Punct('[') {
-                        depth += 1;
-                    } else if tokens[idx] == LexToken::Punct(']') {
-                        depth -= 1;
-                    }
-                    idx += 1;
-                }
-                continue;
-            }
+    for sp in &tokens {
+        if let LexToken::Ident(kw) = &sp.token
+            && matches!(
+                kw.as_str(),
+                "const"
+                    | "trait"
+                    | "impl"
+                    | "struct"
+                    | "unsafe"
+                    | "if"
+                    | "match"
+                    | "loop"
+                    | "while"
+            )
+        {
+            has_complex_tokens = true;
         }
-
-        match &tokens[idx] {
-            LexToken::AnnealSpec(spec) => {
-                if pending_spec.is_some() {
-                    return Err(CaptureError::UnsupportedMir(
-                        "duplicate anneal:spec annotation on function"
-                            .to_string(),
-                    ));
-                }
-                pending_spec = Some(*spec);
-                idx += 1;
-                continue;
-            }
-            LexToken::AnnealSafety(safety) => {
-                if pending_safety.is_some() {
-                    return Err(CaptureError::UnsupportedMir(
-                        "duplicate anneal:safety annotation on function"
-                            .to_string(),
-                    ));
-                }
-                pending_safety = Some(safety.clone());
-                idx += 1;
-                continue;
-            }
-            _ => {}
-        }
-
-        // If `pending_spec` or `pending_safety` is set, the next tokens must
-        // form a function declaration (`[pub [(...)]] [unsafe] [const] fn
-        // <name>`).
-        if pending_spec.is_some() || pending_safety.is_some() {
-            let mut probe = idx;
-            if probe < tokens.len()
-                && tokens[probe] == LexToken::Ident("pub".to_string())
-            {
-                probe += 1;
-                if probe < tokens.len()
-                    && tokens[probe] == LexToken::Punct('(')
-                {
-                    let mut p_depth = 1usize;
-                    probe += 1;
-                    while probe < tokens.len() && p_depth > 0 {
-                        if tokens[probe] == LexToken::Punct('(') {
-                            p_depth += 1;
-                        } else if tokens[probe] == LexToken::Punct(')') {
-                            p_depth -= 1;
-                        }
-                        probe += 1;
-                    }
-                }
-            }
-            if probe < tokens.len()
-                && tokens[probe] == LexToken::Ident("unsafe".to_string())
-            {
-                probe += 1;
-            }
-            if probe < tokens.len()
-                && tokens[probe] == LexToken::Ident("const".to_string())
-                && probe + 1 < tokens.len()
-                && tokens[probe + 1] == LexToken::Ident("fn".to_string())
-            {
-                probe += 1;
-            }
-            if probe >= tokens.len()
-                || tokens[probe] != LexToken::Ident("fn".to_string())
-            {
-                return Err(CaptureError::UnsupportedMir(
-                    "dangling anneal: annotation not attached to a function declaration"
-                        .to_string(),
-                ));
-            }
-            idx = probe;
-        }
-
-        if tokens[idx] == LexToken::Punct('{') {
-            brace_depth += 1;
-            idx += 1;
-            continue;
-        }
-        if tokens[idx] == LexToken::Punct('}') {
-            brace_depth = brace_depth.saturating_sub(1);
-            if let Some((_, mod_depth)) = mod_stack.last()
-                && brace_depth < *mod_depth
-            {
-                mod_stack.pop();
-            }
-            idx += 1;
-            continue;
-        }
-
-        if tokens[idx] == LexToken::Ident("mod".to_string()) {
-            if let Some(LexToken::Ident(mod_name)) = tokens.get(idx + 1)
-                && tokens.get(idx + 2) == Some(&LexToken::Punct('{'))
-            {
-                brace_depth += 1;
-                mod_stack.push((mod_name.clone(), brace_depth));
-                idx += 3;
-                continue;
-            }
-        }
-
-        if tokens[idx] == LexToken::Ident("fn".to_string()) {
-            let Some(LexToken::Ident(fn_name)) = tokens.get(idx + 1) else {
-                return Err(CaptureError::UnsupportedMir(
-                    "expected function identifier after `fn`".to_string(),
-                ));
-            };
-            let qualified = if mod_stack.is_empty() {
-                fn_name.clone()
-            } else {
-                let mut prefix: Vec<&str> =
-                    mod_stack.iter().map(|(m, _)| m.as_str()).collect();
-                prefix.push(fn_name.as_str());
-                prefix.join("::")
-            };
-            let spec = pending_spec.take().unwrap_or(CapturedSpec::WellFormed);
-            let _ = pending_safety.take();
-            if first_spec.is_none() && spec != CapturedSpec::WellFormed {
-                first_spec = Some(spec);
-            }
-            fn_specs.insert(qualified, spec);
-            idx += 2;
-            continue;
-        }
-
-        idx += 1;
     }
 
-    if pending_spec.is_some() || pending_safety.is_some() {
-        return Err(CaptureError::UnsupportedMir(
-            "dangling anneal: annotation at end of file".to_string(),
-        ));
+    // 1. Validate all `anneal:` doc comments and ensure each is attached to a
+    //    subsequent `fn` item.
+    for (idx, sp) in tokens.iter().enumerate() {
+        let LexToken::DocComment(text) = &sp.token else {
+            continue;
+        };
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
+            if let Some(rest) = line.strip_prefix("anneal:") {
+                let Some(spec_rest) = rest.strip_prefix("spec") else {
+                    return Err(CaptureError::UnsupportedMir(format!(
+                        "unsupported anneal directive: `anneal:{rest}`"
+                    )));
+                };
+                let clause = spec_rest.trim();
+                let parsed = match clause {
+                    "ensures(ret == x)" => CapturedSpec::EnsuresEqArg(1),
+                    "well_formed" => CapturedSpec::WellFormed,
+                    other => {
+                        return Err(CaptureError::UnsupportedMir(format!(
+                            "unsupported anneal:spec annotation: `{other}`"
+                        )));
+                    }
+                };
+                if found_spec.is_some() {
+                    return Err(CaptureError::UnsupportedMir(
+                        "multiple anneal:spec annotations in file".to_string(),
+                    ));
+                }
+                if !is_attached_to_fn(&tokens, idx + 1) {
+                    return Err(CaptureError::UnsupportedMir(
+                        "anneal:spec comment must be attached to a function"
+                            .to_string(),
+                    ));
+                }
+                found_spec = Some(parsed);
+            }
+        }
+    }
+
+    // 2. Walk top-level items to extract struct fields, trait impl constants,
+    //    and function signatures.
+    let mut i = 0usize;
+    let len = tokens.len();
+    while i < len {
+        // Skip doc comments and outer/inner attributes `#[...]` / `#![...]`.
+        if matches!(tokens[i].token, LexToken::DocComment(_)) {
+            i += 1;
+            continue;
+        }
+        if tokens[i].token == LexToken::Punct('#') {
+            i = skip_attribute(&tokens, i)?;
+            continue;
+        }
+
+        // Parse optional item visibility (`pub`, `pub(...)`) and item
+        // modifiers (`unsafe`, `const`, `async`, `extern`).
+        let mut is_unsafe_item = false;
+        let mut is_const_item = false;
+        loop {
+            if i >= len {
+                break;
+            }
+            match &tokens[i].token {
+                LexToken::DocComment(_) => {
+                    i += 1;
+                }
+                LexToken::Punct('#') => {
+                    i = skip_attribute(&tokens, i)?;
+                }
+                LexToken::Ident(kw) if kw == "pub" => {
+                    i += 1;
+                    if i < len && tokens[i].token == LexToken::Punct('(') {
+                        i = skip_balanced_delim(&tokens, i, '(', ')')?;
+                    }
+                }
+                LexToken::Ident(kw) if kw == "unsafe" => {
+                    is_unsafe_item = true;
+                    i += 1;
+                }
+                LexToken::Ident(kw) if kw == "const" => {
+                    is_const_item = true;
+                    i += 1;
+                    break;
+                }
+                LexToken::Ident(kw) if kw == "async" || kw == "extern" => {
+                    return Err(CaptureError::UnsupportedMir(format!(
+                        "unsupported `{kw}` item in crate"
+                    )));
+                }
+                _ => break,
+            }
+        }
+        if i >= len {
+            break;
+        }
+
+        // Top-level `const NAME: () = ...;` item.
+        if is_const_item {
+            if let LexToken::Ident(next_kw) = &tokens[i].token
+                && next_kw == "fn"
+            {
+                return Err(CaptureError::UnsupportedMir(
+                    "`const fn` is not supported".to_string(),
+                ));
+            }
+            i = skip_until_top_level_semi(&tokens, i)?;
+            continue;
+        }
+
+        let LexToken::Ident(item_kw) = &tokens[i].token else {
+            return Err(CaptureError::UnsupportedMir(format!(
+                "unexpected token at top level on line {}: {:?}",
+                tokens[i].line, tokens[i].token
+            )));
+        };
+
+        match item_kw.as_str() {
+            "enum" | "union" => {
+                return Err(CaptureError::UnsupportedMir(format!(
+                    "`{item_kw}` definitions are not supported"
+                )));
+            }
+            "trait" => {
+                if is_unsafe_item {
+                    return Err(CaptureError::UnsupportedMir(
+                        "`unsafe trait` is not supported".to_string(),
+                    ));
+                }
+                i = parse_trait_item(&tokens, i)?;
+            }
+            "struct" => {
+                let (next_i, is_pub_safe) = parse_struct_item(&tokens, i)?;
+                if nonzero_field_pub_safe.is_some() {
+                    return Err(CaptureError::UnsupportedMir(
+                        "multiple struct definitions are not supported"
+                            .to_string(),
+                    ));
+                }
+                nonzero_field_pub_safe = Some(is_pub_safe);
+                i = next_i;
+            }
+            "impl" => {
+                if is_unsafe_item {
+                    return Err(CaptureError::UnsupportedMir(
+                        "`unsafe impl` is not supported".to_string(),
+                    ));
+                }
+                let (next_i, mut consts) = parse_impl_item(&tokens, i)?;
+                impl_consts.append(&mut consts);
+                i = next_i;
+            }
+            "fn" => {
+                fn_count += 1;
+                let (next_i, fn_name, generics) = parse_fn_item(&tokens, i)?;
+                if is_unsafe_item {
+                    unsafe_fns.insert(fn_name.clone());
+                }
+                if fn_generics.insert(fn_name.clone(), generics).is_some() {
+                    return Err(CaptureError::UnsupportedMir(format!(
+                        "duplicate function definition `{fn_name}`"
+                    )));
+                }
+                i = next_i;
+            }
+            other => {
+                return Err(CaptureError::UnsupportedMir(format!(
+                    "unsupported top-level item `{other}`"
+                )));
+            }
+        }
     }
 
     Ok(SourceMetadata {
-        spec: first_spec.unwrap_or(CapturedSpec::WellFormed),
-        fn_specs,
-        source_text: src.to_string(),
+        spec: found_spec.unwrap_or(CapturedSpec::WellFormed),
+        nonzero_field_pub_safe,
+        unsafe_fns,
+        fn_generics,
+        impl_consts,
+        needs_unoptimized_mir: has_complex_tokens || fn_count > 1,
+        src_text: src.to_string(),
     })
 }
 
-/// Check whether `line` is a `rustc --emit=mir` global allocation dump header
-/// (`alloc<digits> (...) {`).
-///
-/// Checking for one or more ASCII digits followed by `" ("` after `"alloc"`
-/// ensures functions named `alloc_passthrough` or `allocate` are never mistaken
-/// for CTFE allocation blocks.
-fn is_alloc_header(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("alloc") else {
-        return false;
+/// Return `true` if the token stream starting at `i` (immediately after a doc
+/// comment) leads directly to a `fn` item after skipping intervening doc
+/// comments, outer attributes (`#[...]`), visibility (`pub`, `pub(...)`), and
+/// `unsafe`.
+fn is_attached_to_fn(tokens: &[SpannedToken], mut i: usize) -> bool {
+    let len = tokens.len();
+    while i < len {
+        match &tokens[i].token {
+            LexToken::DocComment(_) => i += 1,
+            LexToken::Punct('#') => {
+                let Ok(next_i) = skip_attribute(tokens, i) else {
+                    return false;
+                };
+                i = next_i;
+            }
+            LexToken::Ident(kw) if kw == "pub" => {
+                i += 1;
+                if i < len && tokens[i].token == LexToken::Punct('(') {
+                    let Ok(next_i) = skip_balanced_delim(tokens, i, '(', ')')
+                    else {
+                        return false;
+                    };
+                    i = next_i;
+                }
+            }
+            LexToken::Ident(kw) if kw == "unsafe" => i += 1,
+            LexToken::Ident(kw) => return kw == "fn",
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Skip a balanced outer (`#[...]`) or inner (`#![...]`) attribute starting at
+/// the `#` token at `i`.
+fn skip_attribute(
+    tokens: &[SpannedToken],
+    mut i: usize,
+) -> Result<usize, CaptureError> {
+    let len = tokens.len();
+    i += 1; // skip `#`
+    if i < len && tokens[i].token == LexToken::Punct('!') {
+        i += 1;
+    }
+    if i >= len || tokens[i].token != LexToken::Punct('[') {
+        return Err(CaptureError::UnsupportedMir(
+            "malformed attribute syntax".to_string(),
+        ));
+    }
+    skip_balanced_delim(tokens, i, '[', ']')
+}
+
+/// Skip a balanced delimiter group `( ... )`, `[ ... ]`, or `{ ... }` starting
+/// at index `i` (which must hold `LexToken::Punct(open)`), returning the index
+/// immediately after the matching closing delimiter.
+fn skip_balanced_delim(
+    tokens: &[SpannedToken],
+    mut i: usize,
+    open: char,
+    close: char,
+) -> Result<usize, CaptureError> {
+    let len = tokens.len();
+    if i >= len || tokens[i].token != LexToken::Punct(open) {
+        return Err(CaptureError::UnsupportedMir(format!(
+            "expected `{open}` delimiter"
+        )));
+    }
+    let mut depth = 1usize;
+    i += 1;
+    while i < len && depth > 0 {
+        if tokens[i].token == LexToken::Punct(open) {
+            depth += 1;
+        } else if tokens[i].token == LexToken::Punct(close) {
+            depth -= 1;
+        }
+        i += 1;
+    }
+    if depth != 0 {
+        return Err(CaptureError::UnsupportedMir(format!(
+            "unclosed `{open}` delimiter"
+        )));
+    }
+    Ok(i)
+}
+
+/// Advance `i` past a `const` item body until the terminating `;` at brace
+/// depth 0.
+fn skip_until_top_level_semi(
+    tokens: &[SpannedToken],
+    mut i: usize,
+) -> Result<usize, CaptureError> {
+    let len = tokens.len();
+    let mut brace_depth = 0usize;
+    while i < len {
+        match tokens[i].token {
+            LexToken::Punct('{') => brace_depth += 1,
+            LexToken::Punct('}') => {
+                brace_depth = brace_depth.saturating_sub(1);
+            }
+            LexToken::Punct(';') if brace_depth == 0 => return Ok(i + 1),
+            _ => {}
+        }
+        i += 1;
+    }
+    Err(CaptureError::UnsupportedMir(
+        "unterminated top-level const item".to_string(),
+    ))
+}
+
+/// Parse an optional generic parameter list `<T1: Bound, T2, ...>` starting at
+/// `i`, extracting type parameter identifiers in declaration order and failing
+/// closed on lifetime (`'a`) or `const` generic parameters.
+fn parse_generic_params(
+    tokens: &[SpannedToken],
+    mut i: usize,
+) -> Result<(usize, Vec<String>), CaptureError> {
+    let len = tokens.len();
+    if i >= len || tokens[i].token != LexToken::Punct('<') {
+        return Ok((i, Vec::new()));
+    }
+    i += 1; // skip `<`
+    let mut params = Vec::new();
+    let mut expect_param = true;
+    let mut angle_depth = 1usize;
+
+    while i < len && angle_depth > 0 {
+        match &tokens[i].token {
+            LexToken::Lifetime(_) => {
+                return Err(CaptureError::UnsupportedMir(
+                    "lifetime generic parameters are not supported".to_string(),
+                ));
+            }
+            LexToken::Ident(kw) if kw == "const" => {
+                return Err(CaptureError::UnsupportedMir(
+                    "const generic parameters are not supported".to_string(),
+                ));
+            }
+            LexToken::Punct('<') => {
+                angle_depth += 1;
+                i += 1;
+            }
+            LexToken::Punct('>') => {
+                angle_depth -= 1;
+                i += 1;
+            }
+            LexToken::Punct(',') if angle_depth == 1 => {
+                expect_param = true;
+                i += 1;
+            }
+            LexToken::Ident(ident) if angle_depth == 1 && expect_param => {
+                params.push(ident.clone());
+                expect_param = false;
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    if angle_depth != 0 {
+        return Err(CaptureError::UnsupportedMir(
+            "unclosed `<` in generic parameter list".to_string(),
+        ));
+    }
+    Ok((i, params))
+}
+
+/// Parse a top-level `trait` definition starting at `i`, rejecting trait
+/// methods (`fn`) so only associated constant declarations (`const ASSERT: ();`)
+/// are admitted.
+fn parse_trait_item(
+    tokens: &[SpannedToken],
+    mut i: usize,
+) -> Result<usize, CaptureError> {
+    let len = tokens.len();
+    i += 1; // skip `trait`
+    let Some(SpannedToken {
+        token: LexToken::Ident(_),
+        ..
+    }) = tokens.get(i)
+    else {
+        return Err(CaptureError::UnsupportedMir(
+            "expected trait identifier".to_string(),
+        ));
     };
-    let digit_count = rest.chars().take_while(char::is_ascii_digit).count();
-    digit_count > 0
-        && rest[digit_count..].starts_with(" (")
-        && line.ends_with('{')
+    i += 1;
+    let (next_i, _) = parse_generic_params(tokens, i)?;
+    i = next_i;
+    while i < len && tokens[i].token != LexToken::Punct('{') {
+        i += 1;
+    }
+    if i >= len {
+        return Err(CaptureError::UnsupportedMir(
+            "expected `{` in trait definition".to_string(),
+        ));
+    }
+    let end_i = skip_balanced_delim(tokens, i, '{', '}')?;
+    for tok in &tokens[i + 1..end_i - 1] {
+        if let LexToken::Ident(kw) = &tok.token
+            && kw == "fn"
+        {
+            return Err(CaptureError::UnsupportedMir(
+                "trait methods are not supported".to_string(),
+            ));
+        }
+    }
+    Ok(end_i)
+}
+
+/// Parse `struct NonZeroUsize { ... }` starting at `i` and return `(end_i,
+/// is_pub_safe)` where `is_pub_safe` is `true` iff `val: usize` has
+/// unrestricted `pub` visibility.
+///
+/// Follows the Rust Reference visibility rules for struct fields:
+///
+/// > "With no visibility qualifier, an item is visible only within the current
+/// > module and its descendants. `pub` makes an item visible everywhere...
+/// > `pub(crate)` makes an item visible within the current crate."
+///
+/// Source:
+/// https://github.com/rust-lang/reference/blob/82da570bafd9efed421bdbae0f8603ede8dd308b/src/visibility-and-privacy.md#L1-L45
+fn parse_struct_item(
+    tokens: &[SpannedToken],
+    mut i: usize,
+) -> Result<(usize, bool), CaptureError> {
+    let len = tokens.len();
+    i += 1; // skip `struct`
+    let Some(SpannedToken {
+        token: LexToken::Ident(struct_name),
+        ..
+    }) = tokens.get(i)
+    else {
+        return Err(CaptureError::UnsupportedMir(
+            "expected struct identifier".to_string(),
+        ));
+    };
+    if struct_name != "NonZeroUsize" {
+        return Err(CaptureError::UnsupportedMir(format!(
+            "unsupported struct `{struct_name}` (only `NonZeroUsize` is supported)"
+        )));
+    }
+    i += 1;
+    if i >= len || tokens[i].token != LexToken::Punct('{') {
+        return Err(CaptureError::UnsupportedMir(
+            "tuple, unit, and generic structs are not supported".to_string(),
+        ));
+    }
+    let end_i = skip_balanced_delim(tokens, i, '{', '}')?;
+    let mut f_idx = i + 1;
+    let body_end = end_i - 1;
+    let mut fields = Vec::new();
+
+    while f_idx < body_end {
+        if matches!(tokens[f_idx].token, LexToken::DocComment(_)) {
+            f_idx += 1;
+            continue;
+        }
+        if tokens[f_idx].token == LexToken::Punct('#') {
+            f_idx = skip_attribute(tokens, f_idx)?;
+            continue;
+        }
+        let mut is_pub_safe = false;
+        if let LexToken::Ident(kw) = &tokens[f_idx].token
+            && kw == "pub"
+        {
+            f_idx += 1;
+            if f_idx < body_end && tokens[f_idx].token == LexToken::Punct('(')
+            {
+                // Restricted visibility (`pub(crate)`, `pub(super)`,
+                // `pub(self)`, `pub(in ...)`) is module/crate-scoped and cannot
+                // be accessed by arbitrary downstream crates.
+                f_idx = skip_balanced_delim(tokens, f_idx, '(', ')')?;
+                is_pub_safe = false;
+            } else {
+                is_pub_safe = true;
+            }
+        }
+        let Some(SpannedToken {
+            token: LexToken::Ident(field_name),
+            ..
+        }) = tokens.get(f_idx)
+        else {
+            return Err(CaptureError::UnsupportedMir(
+                "expected field identifier in struct".to_string(),
+            ));
+        };
+        f_idx += 1;
+        if f_idx >= body_end || tokens[f_idx].token != LexToken::Punct(':') {
+            return Err(CaptureError::UnsupportedMir(format!(
+                "expected `:` after struct field `{field_name}`"
+            )));
+        }
+        f_idx += 1;
+        let Some(SpannedToken {
+            token: LexToken::Ident(field_ty),
+            ..
+        }) = tokens.get(f_idx)
+        else {
+            return Err(CaptureError::UnsupportedMir(format!(
+                "unsupported type on struct field `{field_name}`"
+            )));
+        };
+        f_idx += 1;
+        if f_idx < body_end && tokens[f_idx].token == LexToken::Punct(',') {
+            f_idx += 1;
+        }
+        fields.push((field_name.clone(), field_ty.clone(), is_pub_safe));
+    }
+
+    if fields.len() != 1 || fields[0].0 != "val" || fields[0].1 != "usize" {
+        return Err(CaptureError::UnsupportedMir(
+            "`NonZeroUsize` must have a single `val: usize` field".to_string(),
+        ));
+    }
+    Ok((end_i, fields[0].2))
+}
+
+/// Parse a trait `impl<...> Trait<...> for SelfTy { const ... }` block starting
+/// at `i`, recording the line span and generic parameter order of each
+/// associated constant in [`ImplConstMeta`] and failing closed on inherent
+/// `impl` blocks or `impl` methods.
+fn parse_impl_item(
+    tokens: &[SpannedToken],
+    mut i: usize,
+) -> Result<(usize, Vec<ImplConstMeta>), CaptureError> {
+    let len = tokens.len();
+    let start_line = tokens[i].line;
+    i += 1; // skip `impl`
+    let (next_i, impl_params) = parse_generic_params(tokens, i)?;
+    i = next_i;
+
+    let Some(SpannedToken {
+        token: LexToken::Ident(trait_name),
+        ..
+    }) = tokens.get(i).cloned()
+    else {
+        return Err(CaptureError::UnsupportedMir(
+            "expected trait name in `impl` header".to_string(),
+        ));
+    };
+    i += 1;
+    let (next_i, trait_args) = parse_generic_params(tokens, i)?;
+    i = next_i;
+
+    let Some(SpannedToken {
+        token: LexToken::Ident(for_kw),
+        ..
+    }) = tokens.get(i)
+    else {
+        return Err(CaptureError::UnsupportedMir(
+            "inherent `impl` blocks are not supported (expected `for`)"
+                .to_string(),
+        ));
+    };
+    if for_kw != "for" {
+        return Err(CaptureError::UnsupportedMir(
+            "inherent `impl` blocks are not supported".to_string(),
+        ));
+    }
+    i += 1;
+
+    // Parse `Self` type (`()` or identifier).
+    let (self_ty_name, self_ty_kind) = if i + 1 < len
+        && tokens[i].token == LexToken::Punct('(')
+        && tokens[i + 1].token == LexToken::Punct(')')
+    {
+        i += 2;
+        ("()".to_string(), SelfTyKind::Unit)
+    } else if let Some(SpannedToken {
+        token: LexToken::Ident(id),
+        ..
+    }) = tokens.get(i)
+    {
+        i += 1;
+        let kind = if impl_params.contains(id) {
+            SelfTyKind::Param
+        } else {
+            SelfTyKind::Named(id.clone())
+        };
+        (id.clone(), kind)
+    } else {
+        return Err(CaptureError::UnsupportedMir(
+            "unsupported `Self` type in `impl` block".to_string(),
+        ));
+    };
+
+    if i >= len || tokens[i].token != LexToken::Punct('{') {
+        return Err(CaptureError::UnsupportedMir(
+            "expected `{` after `impl` header".to_string(),
+        ));
+    }
+    let end_i = skip_balanced_delim(tokens, i, '{', '}')?;
+    let end_line = tokens[end_i - 1].line;
+
+    let mut consts = Vec::new();
+    let mut b_idx = i + 1;
+    let body_end = end_i - 1;
+    while b_idx < body_end {
+        match &tokens[b_idx].token {
+            LexToken::Ident(kw) if kw == "fn" => {
+                return Err(CaptureError::UnsupportedMir(
+                    "methods inside `impl` blocks are not supported"
+                        .to_string(),
+                ));
+            }
+            LexToken::Ident(kw) if kw == "const" => {
+                b_idx += 1;
+                let Some(SpannedToken {
+                    token: LexToken::Ident(const_name),
+                    ..
+                }) = tokens.get(b_idx)
+                else {
+                    return Err(CaptureError::UnsupportedMir(
+                        "expected associated const identifier in `impl`"
+                            .to_string(),
+                    ));
+                };
+                consts.push(ImplConstMeta {
+                    start_line,
+                    end_line,
+                    trait_name: trait_name.clone(),
+                    const_name: const_name.clone(),
+                    self_ty_kind: self_ty_kind.clone(),
+                    self_ty_name: self_ty_name.clone(),
+                    impl_params: impl_params.clone(),
+                    trait_args: trait_args.clone(),
+                });
+                b_idx = skip_until_top_level_semi(tokens, b_idx)?;
+            }
+            _ => {
+                b_idx += 1;
+            }
+        }
+    }
+
+    Ok((end_i, consts))
+}
+
+/// Parse a top-level `fn name<...>(...) -> ... { ... }` item starting at `i`,
+/// returning `(end_i, fn_name, generic_param_names)` and failing closed on
+/// `where` clauses.
+fn parse_fn_item(
+    tokens: &[SpannedToken],
+    mut i: usize,
+) -> Result<(usize, String, Vec<String>), CaptureError> {
+    let len = tokens.len();
+    i += 1; // skip `fn`
+    let Some(SpannedToken {
+        token: LexToken::Ident(fn_name),
+        ..
+    }) = tokens.get(i).cloned()
+    else {
+        return Err(CaptureError::UnsupportedMir(
+            "expected function identifier after `fn`".to_string(),
+        ));
+    };
+    i += 1;
+    let (next_i, generics) = parse_generic_params(tokens, i)?;
+    i = next_i;
+    if i >= len || tokens[i].token != LexToken::Punct('(') {
+        return Err(CaptureError::UnsupportedMir(format!(
+            "expected parameter list in `fn {fn_name}`"
+        )));
+    }
+    i = skip_balanced_delim(tokens, i, '(', ')')?;
+    while i < len && tokens[i].token != LexToken::Punct('{') {
+        if let LexToken::Ident(kw) = &tokens[i].token
+            && kw == "where"
+        {
+            return Err(CaptureError::UnsupportedMir(
+                "`where` clauses are not supported".to_string(),
+            ));
+        }
+        i += 1;
+    }
+    if i >= len {
+        return Err(CaptureError::UnsupportedMir(format!(
+            "expected body `{}` for `fn {fn_name}`",
+            "{ ... }"
+        )));
+    }
+    let end_i = skip_balanced_delim(tokens, i, '{', '}')?;
+    Ok((end_i, fn_name, generics))
+}
+
+/// Canonical correlation key linking a constant's lowered MIR body to its use
+/// sites (`_N = const ...;`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ConstKey {
+    /// Associated constant on a trait implementation (`<SelfTy as
+    /// Trait<...>>::CONST`).
+    TraitAssoc {
+        self_ty_kind: SelfTyKind,
+        trait_name: String,
+        const_name: String,
+    },
+    /// Inline `const { ... }` block (`fn_name::{constant#N}`).
+    Inline { fn_name: String, index: usize },
+    /// Top-level `const NAME: () = ...;` item.
+    TopLevel { name: String },
 }
 
 /// Parse the textual `Runtime(PostCleanup)` MIR emitted by `rustc --emit=mir`,
@@ -1094,44 +1853,75 @@ pub fn parse_emitted_mir(
     parse_emitted_mir_with_metadata(mir_text, &meta)
 }
 
-/// Parse textual `rustc --emit=mir` output using source metadata from
-/// [`scan_rust_source`].
+/// Parse the textual `Runtime(PostCleanup)` MIR emitted by `rustc --emit=mir`
+/// along with crate-level [`SourceMetadata`].
 pub fn parse_emitted_mir_with_metadata(
     mir_text: &str,
     meta: &SourceMetadata,
 ) -> Result<Vec<CapturedFunction>, CaptureError> {
-    let mut functions = Vec::new();
+    struct RawParsedFn {
+        func: CapturedFunction,
+        raw_consts: Vec<(ConstKey, Vec<CapturedTy>)>,
+    }
+
+    let mut const_defs: BTreeMap<ConstKey, CapturedFunction> = BTreeMap::new();
+    let mut raw_fns: Vec<RawParsedFn> = Vec::new();
+    let mut seen_fn_names: BTreeSet<String> = BTreeSet::new();
     let mut lines = mir_text.lines().peekable();
+
+    let default_generics = vec!["Src".to_string(), "Dst".to_string()];
 
     while let Some(raw_line) = lines.next() {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with("//") {
             continue;
         }
-        if is_alloc_header(line) {
-            let mut alloc_depth = 1usize;
+        // Skip constant allocation dumps (`alloc1 (size: ..., align: ...)`)
+        // emitted after CTFE panic messages.
+        if line.starts_with("alloc") && line.ends_with('{') {
             for alloc_line in lines.by_ref() {
-                let t = alloc_line.trim();
-                if t.ends_with('{') {
-                    alloc_depth += 1;
-                } else if t == "}" {
-                    alloc_depth -= 1;
-                    if alloc_depth == 0 {
-                        break;
-                    }
+                if alloc_line.trim() == "}" {
+                    break;
                 }
             }
             continue;
         }
-        let Some(fn_rest) = line.strip_prefix("fn ") else {
-            return Err(CaptureError::UnsupportedMir(format!(
-                "unexpected top-level MIR line: `{line}`"
-            )));
-        };
-        let (name, arg_tys, ret_ty) = parse_fn_header(fn_rest)?;
+
+        let (name, arg_tys, ret_ty, const_key, active_generics) =
+            if (line.starts_with("const ") || line.contains("::{constant#"))
+                && line.ends_with(": () = {")
+            {
+                let (key, generics) =
+                    parse_const_header(line, meta, &default_generics)?;
+                (
+                    "pme_assert_const".to_string(),
+                    Vec::new(),
+                    CapturedTy::Unit,
+                    Some(key),
+                    generics,
+                )
+            } else if let Some(fn_rest) = line.strip_prefix("fn ") {
+                let (n, raw_generics) =
+                    resolve_fn_generics(fn_rest, meta, &default_generics)?;
+                let (parsed_name, args, ret) =
+                    parse_fn_header(fn_rest, &raw_generics)?;
+                debug_assert_eq!(n, parsed_name);
+                if !seen_fn_names.insert(parsed_name.clone()) {
+                    return Err(CaptureError::UnsupportedMir(format!(
+                        "duplicate MIR function body `{parsed_name}`"
+                    )));
+                }
+                (parsed_name, args, ret, None, raw_generics)
+            } else {
+                return Err(CaptureError::UnsupportedMir(format!(
+                    "unexpected top-level MIR line: `{line}`"
+                )));
+            };
+
         let mut max_local = arg_tys.len();
         let mut blocks = Vec::new();
-        let mut scope_brace_depth = 0usize;
+        let mut raw_required_consts: Vec<(ConstKey, Vec<CapturedTy>)> =
+            Vec::new();
 
         loop {
             let Some(body_raw) = lines.next() else {
@@ -1146,19 +1936,39 @@ pub fn parse_emitted_mir_with_metadata(
             {
                 continue;
             }
+            // Skip nested `scope N { ... }` blocks by tracking brace depth.
             if body_line.starts_with("scope ") && body_line.ends_with('{') {
-                scope_brace_depth += 1;
+                let mut scope_depth = 1usize;
+                for scope_line in lines.by_ref() {
+                    let trimmed = scope_line.trim();
+                    if trimmed.starts_with("scope ") && trimmed.ends_with('{') {
+                        scope_depth += 1;
+                    } else if trimmed == "}" {
+                        scope_depth -= 1;
+                        if scope_depth == 0 {
+                            break;
+                        }
+                    }
+                }
+                if scope_depth != 0 {
+                    return Err(CaptureError::UnsupportedMir(format!(
+                        "unterminated scope block in `{name}`"
+                    )));
+                }
                 continue;
             }
             if body_line == "}" {
-                if scope_brace_depth > 0 {
-                    scope_brace_depth -= 1;
-                    continue;
-                }
                 break;
             }
             if let Some(decl_rest) = body_line.strip_prefix("let ") {
-                let (local_idx, _ty) = parse_local_decl(decl_rest)?;
+                let (local_idx, ty) =
+                    parse_local_decl(decl_rest, &active_generics)?;
+                if local_idx == 0 && ty != ret_ty {
+                    return Err(CaptureError::UnsupportedMir(format!(
+                        "return local _0 type {ty:?} does not match header \
+                         {ret_ty:?}"
+                    )));
+                }
                 if local_idx > max_local {
                     max_local = local_idx;
                 }
@@ -1188,10 +1998,22 @@ pub fn parse_emitted_mir_with_metadata(
                     }
                     if terminator.is_some() {
                         return Err(CaptureError::UnsupportedMir(format!(
-                            "statement after terminator in bb{bb_idx}: `{stmt_line}`"
+                            "statement after terminator in bb{bb_idx}: \
+                             `{stmt_line}`"
                         )));
                     }
-                    match parse_stmt_or_terminator(stmt_line)? {
+                    let (parsed, maybe_const) = parse_stmt_or_terminator(
+                        stmt_line,
+                        &name,
+                        &active_generics,
+                        meta,
+                    )?;
+                    if let Some(const_ref) = maybe_const
+                        && !raw_required_consts.contains(&const_ref)
+                    {
+                        raw_required_consts.push(const_ref);
+                    }
+                    match parsed {
                         StmtOrTerm::Stmt(s) => stmts.push(s),
                         StmtOrTerm::Term(t) => terminator = Some(t),
                     }
@@ -1218,18 +2040,275 @@ pub fn parse_emitted_mir_with_metadata(
                 "MIR body for `{name}` has no basic blocks"
             )));
         }
-        let fn_spec = meta.fn_specs.get(&name).copied().unwrap_or(meta.spec);
-        functions.push(CapturedFunction {
+        let kind = if meta.unsafe_fns.contains(&name) {
+            if meta.nonzero_field_pub_safe.is_none()
+                || arg_tys != vec![CapturedTy::Usize]
+                || ret_ty != CapturedTy::Adt(0)
+            {
+                return Err(CaptureError::UnsupportedMir(format!(
+                    "unsupported `unsafe fn {name}` signature or missing \
+                     `NonZeroUsize` ADT"
+                )));
+            }
+            CapturedFnKind::PubUnsafeNewUnchecked
+        } else {
+            CapturedFnKind::PubSafe
+        };
+
+        let is_const = const_key.is_some();
+        let func = CapturedFunction {
             name,
             arg_tys,
             ret_ty,
             local_count: max_local + 1,
             blocks,
-            spec: fn_spec,
-        });
+            spec: meta.spec,
+            is_const,
+            required_consts: Vec::new(),
+            kind,
+        };
+        if let Some(key) = const_key {
+            if const_defs.insert(key.clone(), func).is_some() {
+                return Err(CaptureError::UnsupportedMir(format!(
+                    "duplicate constant MIR body for {key:?}"
+                )));
+            }
+        } else {
+            raw_fns.push(RawParsedFn {
+                func,
+                raw_consts: raw_required_consts,
+            });
+        }
     }
 
-    Ok(functions)
+    // Correlate each referenced `ConstKey` against `const_defs`, failing closed
+    // if any referenced constant has no captured MIR body.
+    let mut const_name_map: BTreeMap<ConstKey, String> = BTreeMap::new();
+    let mut ordered_consts: Vec<CapturedFunction> = Vec::new();
+
+    for rf in &mut raw_fns {
+        // Validate every `Call1` callee against `seen_fn_names`.
+        for block in &rf.func.blocks {
+            if let CapturedTerminator::Call1 { callee_name, .. } =
+                &block.terminator
+                && !seen_fn_names.contains(callee_name)
+            {
+                return Err(CaptureError::UnsupportedMir(format!(
+                    "call to unknown or uncaptured function `{callee_name}`"
+                )));
+            }
+        }
+        for (key, tys) in &rf.raw_consts {
+            let Some(const_fn) = const_defs.get(key) else {
+                return Err(CaptureError::UnsupportedMir(format!(
+                    "referenced constant {key:?} has no captured MIR body"
+                )));
+            };
+            let assigned_name =
+                if let Some(existing) = const_name_map.get(key) {
+                    existing.clone()
+                } else {
+                    let next_name = if ordered_consts.is_empty() {
+                        "pme_assert_const".to_string()
+                    } else {
+                        format!("pme_assert_const_{}", ordered_consts.len())
+                    };
+                    let mut named_const = const_fn.clone();
+                    named_const.name = next_name.clone();
+                    ordered_consts.push(named_const);
+                    const_name_map.insert(key.clone(), next_name.clone());
+                    next_name
+                };
+            rf.func.required_consts.push((assigned_name, tys.clone()));
+        }
+    }
+
+    let mut items = ordered_consts;
+    items.extend(raw_fns.into_iter().map(|rf| rf.func));
+    Ok(items)
+}
+
+/// Parse a MIR constant body header emitted by `rustc`'s MIR pretty-printer
+/// (`compiler/rustc_middle/src/mir/pretty.rs` in
+/// `rust-lang/rust@58cf8f9c35b355199727627d07ae34a4e2846d67`), returning its
+/// canonical [`ConstKey`] and generic type parameter names in declaration
+/// order.
+///
+/// Handles the three constant header shapes emitted by `rustc --emit=mir`:
+/// 1. Trait associated constants (`const <impl at path:L1:C1: L2:C2>::NAME: ()
+///    = {`), correlated by source line span with [`SourceMetadata::impl_consts`].
+/// 2. Inline `const { ... }` blocks (`<fn_name>::{constant#N}: () = {`),
+///    inheriting the enclosing function's generic type parameters.
+/// 3. Top-level constants (`const NAME: () = {`).
+fn parse_const_header(
+    line: &str,
+    meta: &SourceMetadata,
+    default_generics: &[String],
+) -> Result<(ConstKey, Vec<String>), CaptureError> {
+    let without_suffix = line.strip_suffix(": () = {").ok_or_else(|| {
+        CaptureError::UnsupportedMir(format!("malformed const header `{line}`"))
+    })?;
+    let trimmed = without_suffix
+        .strip_prefix("const ")
+        .unwrap_or(without_suffix)
+        .trim();
+
+    // Case 1: `const <impl at path:L1:C1: L2:C2>::CONST_NAME: () = {`
+    if let Some(impl_rest) = trimmed.strip_prefix("<impl at ") {
+        let (span_part, const_name) =
+            impl_rest.split_once(">::").ok_or_else(|| {
+                CaptureError::UnsupportedMir(format!(
+                    "malformed impl const header `{line}`"
+                ))
+            })?;
+        let const_name = const_name.trim().to_string();
+        if !meta.impl_consts.is_empty() {
+            let start_line = parse_impl_span_start_line(span_part)?;
+            let matched = meta
+                .impl_consts
+                .iter()
+                .find(|ic| {
+                    ic.const_name == const_name
+                        && ic.start_line <= start_line
+                        && start_line <= ic.end_line
+                })
+                .ok_or_else(|| {
+                    CaptureError::UnsupportedMir(format!(
+                        "cannot correlate impl const `{const_name}` at line \
+                         {start_line}"
+                    ))
+                })?;
+            return Ok((
+                ConstKey::TraitAssoc {
+                    self_ty_kind: matched.self_ty_kind.clone(),
+                    trait_name: matched.trait_name.clone(),
+                    const_name,
+                },
+                matched.impl_params.clone(),
+            ));
+        }
+        return Ok((
+            ConstKey::TraitAssoc {
+                self_ty_kind: SelfTyKind::Unit,
+                trait_name: "SizeEq".to_string(),
+                const_name,
+            },
+            default_generics.to_vec(),
+        ));
+    }
+
+    // Case 2: `<fn_name>::{constant#N}: () = {`
+    if let Some((raw_fn, idx_part)) = trimmed.split_once("::{constant#")
+        && let Some(idx_str) = idx_part.strip_suffix('}')
+    {
+        let index = idx_str.parse::<usize>().map_err(|_| {
+            CaptureError::UnsupportedMir(format!(
+                "invalid inline constant index in `{line}`"
+            ))
+        })?;
+        let fn_name = raw_fn
+            .strip_prefix("anneal_target::")
+            .unwrap_or(raw_fn)
+            .trim()
+            .to_string();
+        if fn_name.contains("::") {
+            return Err(CaptureError::UnsupportedMir(format!(
+                "unsupported module-qualified inline constant `{trimmed}`"
+            )));
+        }
+        let generics = meta
+            .fn_generics
+            .get(&fn_name)
+            .cloned()
+            .unwrap_or_else(|| default_generics.to_vec());
+        return Ok((ConstKey::Inline { fn_name, index }, generics));
+    }
+
+    // Case 3: Top-level `const NAME: () = {`
+    let name = trimmed
+        .strip_prefix("anneal_target::")
+        .unwrap_or(trimmed)
+        .trim();
+    if !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Ok((
+            ConstKey::TopLevel {
+                name: name.to_string(),
+            },
+            Vec::new(),
+        ));
+    }
+
+    Err(CaptureError::UnsupportedMir(format!(
+        "unsupported constant header `{line}`"
+    )))
+}
+
+/// Extract the 1-based starting line number `L1` from a `rustc` `impl` span
+/// header `<impl at path:L1:C1: L2:C2>`.
+fn parse_impl_span_start_line(span_part: &str) -> Result<usize, CaptureError> {
+    let (start_loc, _) = span_part.rsplit_once(": ").ok_or_else(|| {
+        CaptureError::UnsupportedMir(format!(
+            "malformed impl span `{span_part}`"
+        ))
+    })?;
+    let (before_col, _) = start_loc.rsplit_once(':').ok_or_else(|| {
+        CaptureError::UnsupportedMir(format!(
+            "malformed impl start location `{start_loc}`"
+        ))
+    })?;
+    let (_, line_str) = before_col.rsplit_once(':').ok_or_else(|| {
+        CaptureError::UnsupportedMir(format!(
+            "malformed impl start line `{before_col}`"
+        ))
+    })?;
+    line_str.trim().parse::<usize>().map_err(|_| {
+        CaptureError::UnsupportedMir(format!(
+            "invalid impl start line `{line_str}`"
+        ))
+    })
+}
+
+/// Resolve the unqualified function name and its source-level generic parameter
+/// names from a MIR `fn` header line (`fn name(_1: ...) -> ... {`).
+fn resolve_fn_generics(
+    fn_rest: &str,
+    meta: &SourceMetadata,
+    default_generics: &[String],
+) -> Result<(String, Vec<String>), CaptureError> {
+    let header = fn_rest
+        .strip_suffix('{')
+        .ok_or_else(|| {
+            CaptureError::UnsupportedMir(format!(
+                "malformed fn header: `{fn_rest}`"
+            ))
+        })?
+        .trim();
+    let (name_part, _) = header.split_once('(').ok_or_else(|| {
+        CaptureError::UnsupportedMir(format!(
+            "missing parameter list in `{header}`"
+        ))
+    })?;
+    let raw_name = name_part.trim();
+    let stripped = raw_name
+        .strip_prefix("anneal_target::")
+        .unwrap_or(raw_name)
+        .trim();
+    if stripped.contains("::") {
+        return Err(CaptureError::UnsupportedMir(format!(
+            "unsupported module-qualified or method item `{raw_name}`"
+        )));
+    }
+    let generics = if meta.fn_generics.is_empty() && meta.src_text.is_empty() {
+        default_generics.to_vec()
+    } else {
+        meta.fn_generics
+            .get(stripped)
+            .cloned()
+            .unwrap_or_default()
+    };
+    Ok((stripped.to_string(), generics))
 }
 
 trait BlockHeaderExt {
@@ -1239,32 +2318,20 @@ trait BlockHeaderExt {
 impl BlockHeaderExt for str {
     fn strip_suffix_or_block(&self) -> Option<&str> {
         let before_brace = self.strip_suffix('{')?.trim();
-        let before_cleanup = before_brace
-            .strip_suffix("(cleanup):")
-            .map(str::trim)
-            .or_else(|| before_brace.strip_suffix(':'));
-        before_cleanup
+        if before_brace.ends_with("(cleanup):") {
+            return None;
+        }
+        before_brace.strip_suffix(':')
     }
 }
 
-fn is_valid_qualified_ident(name: &str) -> bool {
-    !name.is_empty()
-        && name.split("::").all(|seg| {
-            !seg.is_empty()
-                && seg
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        })
-}
-
-fn lean_ident(name: &str) -> String {
-    name.replace("::", "__")
-}
-
+/// Parse a MIR function signature header (`<name>(_1: <ty>, ...) -> <ret_ty> {`)
+/// printed by `write_mir_fn` in `compiler/rustc_middle/src/mir/pretty.rs`
+/// (`rust-lang/rust@58cf8f9c35b355199727627d07ae34a4e2846d67`), verifying
+/// contiguous 1-based argument local indices (`_1..=_k`).
 fn parse_fn_header(
     fn_rest: &str,
+    generics: &[String],
 ) -> Result<(String, Vec<CapturedTy>, CapturedTy), CaptureError> {
     let header = fn_rest
         .strip_suffix('{')
@@ -1279,8 +2346,17 @@ fn parse_fn_header(
             "missing parameter list in `{header}`"
         ))
     })?;
-    let name = name_part.trim().to_string();
-    if !is_valid_qualified_ident(&name) {
+    let raw_name = name_part.trim();
+    let name = raw_name
+        .strip_prefix("anneal_target::")
+        .unwrap_or(raw_name)
+        .trim()
+        .to_string();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         return Err(CaptureError::UnsupportedMir(format!(
             "unsupported function identifier `{name}`"
         )));
@@ -1305,11 +2381,11 @@ fn parse_fn_header(
                     idx + 1
                 )));
             }
-            arg_tys.push(parse_ty(ty_str.trim())?);
+            arg_tys.push(parse_ty(ty_str.trim(), generics)?);
         }
     }
     let ret_ty = if let Some(arrow_rest) = ret_part.trim().strip_prefix("->") {
-        parse_ty(arrow_rest.trim())?
+        parse_ty(arrow_rest.trim(), generics)?
     } else if ret_part.trim().is_empty() {
         CapturedTy::Unit
     } else {
@@ -1320,8 +2396,12 @@ fn parse_fn_header(
     Ok((name, arg_tys, ret_ty))
 }
 
+/// Parse a MIR local declaration (`let [mut] _<n>: <ty>;`) corresponding to an
+/// entry in `rustc_middle::mir::Body::local_decls`
+/// (`rust-lang/rust@58cf8f9c35b355199727627d07ae34a4e2846d67`).
 fn parse_local_decl(
     decl_rest: &str,
+    generics: &[String],
 ) -> Result<(usize, CapturedTy), CaptureError> {
     let without_semi = decl_rest.strip_suffix(';').ok_or_else(|| {
         CaptureError::UnsupportedMir(format!(
@@ -1338,10 +2418,11 @@ fn parse_local_decl(
         ))
     })?;
     let idx = parse_local_token(local_str.trim())?;
-    let ty = parse_ty(ty_str.trim())?;
+    let ty = parse_ty(ty_str.trim(), generics)?;
     Ok((idx, ty))
 }
 
+/// Parse a local variable token `_<n>` (`rustc_middle::mir::Local`).
 fn parse_local_token(token: &str) -> Result<usize, CaptureError> {
     let digits = token.strip_prefix('_').ok_or_else(|| {
         CaptureError::UnsupportedMir(format!(
@@ -1353,6 +2434,7 @@ fn parse_local_token(token: &str) -> Result<usize, CaptureError> {
     })
 }
 
+/// Parse a basic block identifier `bb<n>` (`rustc_middle::mir::BasicBlock`).
 fn parse_bb_index(token: &str) -> Result<usize, CaptureError> {
     let digits = token.trim().strip_prefix("bb").ok_or_else(|| {
         CaptureError::UnsupportedMir(format!(
@@ -1366,13 +2448,35 @@ fn parse_bb_index(token: &str) -> Result<usize, CaptureError> {
     })
 }
 
-fn parse_ty(ty_str: &str) -> Result<CapturedTy, CaptureError> {
-    match ty_str {
+/// Parse a textual MIR type (`usize`, `bool`, `()`, `!`, `NonZeroUsize`, a
+/// generic type parameter `T`, or a shared reference `&T`) into [`CapturedTy`],
+/// failing closed on any other type.
+fn parse_ty(
+    ty_str: &str,
+    generics: &[String],
+) -> Result<CapturedTy, CaptureError> {
+    let trimmed = ty_str.trim();
+    match trimmed {
         "usize" => Ok(CapturedTy::Usize),
-        "()" => Ok(CapturedTy::Unit),
-        other => Err(CaptureError::UnsupportedMir(format!(
-            "unsupported MIR type `{other}`"
-        ))),
+        "bool" => Ok(CapturedTy::Bool),
+        "()" | "!" => Ok(CapturedTy::Unit),
+        "NonZeroUsize" => Ok(CapturedTy::Adt(0)),
+        _ => {
+            if let Some(inner) = trimmed.strip_prefix('&') {
+                let inner_trimmed = inner.trim();
+                if let Some(idx) =
+                    generics.iter().position(|g| g == inner_trimmed)
+                {
+                    return Ok(CapturedTy::RefParam(idx));
+                }
+            }
+            if let Some(idx) = generics.iter().position(|g| g == trimmed) {
+                return Ok(CapturedTy::Param(idx));
+            }
+            Err(CaptureError::UnsupportedMir(format!(
+                "unsupported MIR type `{trimmed}`"
+            )))
+        }
     }
 }
 
@@ -1381,57 +2485,500 @@ enum StmtOrTerm {
     Term(CapturedTerminator),
 }
 
-fn parse_stmt_or_terminator(line: &str) -> Result<StmtOrTerm, CaptureError> {
+/// Parse a single basic-block body line as either a [`CapturedStmt`] or a
+/// [`CapturedTerminator`] (`rustc_middle::mir::StatementKind` and
+/// `rustc_middle::mir::TerminatorKind` in
+/// `rust-lang/rust@58cf8f9c35b355199727627d07ae34a4e2846d67`), returning any
+/// referenced PME constant `(ConstKey, Vec<CapturedTy>)` alongside the parsed
+/// node.
+fn parse_stmt_or_terminator(
+    line: &str,
+    enclosing_fn: &str,
+    generics: &[String],
+    meta: &SourceMetadata,
+) -> Result<(StmtOrTerm, Option<(ConstKey, Vec<CapturedTy>)>), CaptureError> {
     let stmt = line.strip_suffix(';').ok_or_else(|| {
         CaptureError::UnsupportedMir(format!(
             "missing semicolon in MIR statement/terminator: `{line}`"
         ))
     })?;
     if stmt == "return" {
-        return Ok(StmtOrTerm::Term(CapturedTerminator::Return));
+        return Ok((StmtOrTerm::Term(CapturedTerminator::Return), None));
     }
     if stmt == "unreachable" {
-        return Ok(StmtOrTerm::Term(CapturedTerminator::Unreachable));
+        return Ok((StmtOrTerm::Term(CapturedTerminator::Unreachable), None));
     }
     if let Some(target_str) = stmt.strip_prefix("goto -> ") {
         let target = parse_bb_index(target_str.trim())?;
-        return Ok(StmtOrTerm::Term(CapturedTerminator::Goto(target)));
+        return Ok((StmtOrTerm::Term(CapturedTerminator::Goto(target)), None));
     }
-    if stmt == "nop" {
-        return Ok(StmtOrTerm::Stmt(CapturedStmt::Nop));
+    if stmt == "nop" || stmt == "ConstEvalCounter" {
+        return Ok((StmtOrTerm::Stmt(CapturedStmt::Nop), None));
+    }
+    if let Some(sw_rest) = stmt.strip_prefix("switchInt(") {
+        let (discr_str, targets_part) =
+            sw_rest.split_once(") -> [").ok_or_else(|| {
+                CaptureError::UnsupportedMir(format!(
+                    "malformed switchInt terminator `{line}`"
+                ))
+            })?;
+        let discr = parse_operand(discr_str.trim())?;
+        let targets_inner =
+            targets_part.strip_suffix(']').ok_or_else(|| {
+                CaptureError::UnsupportedMir(format!(
+                    "unclosed switchInt target list in `{line}`"
+                ))
+            })?;
+        let (zero_arm, otherwise_arm) =
+            targets_inner.split_once(',').ok_or_else(|| {
+                CaptureError::UnsupportedMir(format!(
+                    "expected two arms in switchInt `{line}`"
+                ))
+            })?;
+        let false_bb_str =
+            zero_arm.trim().strip_prefix("0:").ok_or_else(|| {
+                CaptureError::UnsupportedMir(format!(
+                    "expected `0: bbN` arm in switchInt `{line}`"
+                ))
+            })?;
+        let true_bb_str = otherwise_arm
+            .trim()
+            .strip_prefix("otherwise:")
+            .ok_or_else(|| {
+                CaptureError::UnsupportedMir(format!(
+                    "expected `otherwise: bbM` arm in switchInt `{line}`"
+                ))
+            })?;
+        let false_target = parse_bb_index(false_bb_str.trim())?;
+        let true_target = parse_bb_index(true_bb_str.trim())?;
+        return Ok((
+            StmtOrTerm::Term(CapturedTerminator::SwitchInt {
+                discr,
+                false_target,
+                true_target,
+            }),
+            None,
+        ));
     }
     if let Some(inner) = stmt
         .strip_prefix("StorageLive(")
         .and_then(|s| s.strip_suffix(')'))
     {
-        return Ok(StmtOrTerm::Stmt(CapturedStmt::StorageLive(
-            parse_local_token(inner.trim())?,
-        )));
+        return Ok((
+            StmtOrTerm::Stmt(CapturedStmt::StorageLive(parse_local_token(
+                inner.trim(),
+            )?)),
+            None,
+        ));
     }
     if let Some(inner) = stmt
         .strip_prefix("StorageDead(")
         .and_then(|s| s.strip_suffix(')'))
     {
-        return Ok(StmtOrTerm::Stmt(CapturedStmt::StorageDead(
-            parse_local_token(inner.trim())?,
-        )));
+        return Ok((
+            StmtOrTerm::Stmt(CapturedStmt::StorageDead(parse_local_token(
+                inner.trim(),
+            )?)),
+            None,
+        ));
     }
     if let Some((lhs, rhs)) = stmt.split_once('=') {
         let dst = parse_local_token(lhs.trim())?;
-        let op = parse_operand(rhs.trim())?;
-        return Ok(StmtOrTerm::Stmt(CapturedStmt::AssignUse { dst, op }));
+        let rhs = rhs.trim();
+
+        // Check call terminators (`_dst = callee(...) -> ...`) first.
+        if rhs.contains("->") {
+            if rhs.ends_with("unreachable_unchecked() -> unwind continue") {
+                return Ok((
+                    StmtOrTerm::Term(CapturedTerminator::Unreachable),
+                    None,
+                ));
+            }
+            if rhs.starts_with("panic(")
+                && rhs.ends_with(") -> unwind continue")
+            {
+                return Ok((StmtOrTerm::Term(CapturedTerminator::Panic), None));
+            }
+            if let Some((call_part, after_ret)) =
+                rhs.split_once(") -> [return: ")
+                && let Some(target_str) =
+                    after_ret.strip_suffix(", unwind continue]")
+            {
+                let target = parse_bb_index(target_str.trim())?;
+                if let Some(sz_rest) = call_part
+                    .strip_prefix("std::mem::size_of::<")
+                    .or_else(|| call_part.strip_prefix("core::mem::size_of::<"))
+                    && let Some(ty_str) = sz_rest.strip_suffix(">(")
+                {
+                    let ty = parse_ty(ty_str.trim(), generics)?;
+                    return Ok((
+                        StmtOrTerm::Term(CapturedTerminator::CallSizeOf {
+                            dst,
+                            ty,
+                            target,
+                        }),
+                        None,
+                    ));
+                }
+                if let Some(tc_rest) = call_part
+                    .strip_prefix("transmute_copy::<")
+                    .or_else(|| {
+                        call_part.strip_prefix("std::mem::transmute_copy::<")
+                    })
+                    .or_else(|| {
+                        call_part.strip_prefix("core::mem::transmute_copy::<")
+                    })
+                    && let Some((tys_part, arg_str)) = tc_rest.split_once(">(")
+                    && let Some((src_ty_str, dst_ty_str)) =
+                        tys_part.split_once(',')
+                {
+                    let src_ty = parse_ty(src_ty_str.trim(), generics)?;
+                    let dst_ty = parse_ty(dst_ty_str.trim(), generics)?;
+                    let op = parse_operand(arg_str.trim())?;
+                    return Ok((
+                        StmtOrTerm::Term(
+                            CapturedTerminator::CallTransmuteCopy {
+                                dst,
+                                src_ty,
+                                dst_ty,
+                                op,
+                                target,
+                            },
+                        ),
+                        None,
+                    ));
+                }
+                if let Some((callee_raw, arg_str)) = call_part.split_once('(') {
+                    let callee_raw = callee_raw.trim();
+                    if callee_raw.starts_with('<') || callee_raw.contains(" as ")
+                    {
+                        return Err(CaptureError::UnsupportedMir(format!(
+                            "trait method calls are not supported: `{line}`"
+                        )));
+                    }
+                    let (callee_base, type_args) = if let Some((
+                        base,
+                        turbo_rest,
+                    )) =
+                        callee_raw.split_once("::<")
+                    {
+                        let inner_tys =
+                            turbo_rest.strip_suffix('>').ok_or_else(|| {
+                                CaptureError::UnsupportedMir(format!(
+                                    "malformed turbofish in call `{line}`"
+                                ))
+                            })?;
+                        let mut parsed_tys = Vec::new();
+                        if !inner_tys.trim().is_empty() {
+                            for t_str in inner_tys.split(',') {
+                                parsed_tys
+                                    .push(parse_ty(t_str.trim(), generics)?);
+                            }
+                        }
+                        (base.trim(), parsed_tys)
+                    } else {
+                        (callee_raw, Vec::new())
+                    };
+                    let callee_name = callee_base
+                        .strip_prefix("anneal_target::")
+                        .unwrap_or(callee_base)
+                        .trim()
+                        .to_string();
+                    if callee_name.contains("::") {
+                        return Err(CaptureError::UnsupportedMir(format!(
+                            "unsupported module-qualified call `{callee_base}`"
+                        )));
+                    }
+                    if !callee_name.is_empty()
+                        && callee_name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        let arg = parse_operand(arg_str.trim())?;
+                        return Ok((
+                            StmtOrTerm::Term(CapturedTerminator::Call1 {
+                                dst,
+                                callee_name,
+                                arg,
+                                target,
+                                type_args,
+                            }),
+                            None,
+                        ));
+                    }
+                }
+            }
+            return Err(CaptureError::UnsupportedMir(format!(
+                "unsupported MIR call terminator: `{line}`"
+            )));
+        }
+
+        // Check `Eq(lhs, rhs)`.
+        if let Some(eq_inner) =
+            rhs.strip_prefix("Eq(").and_then(|s| s.strip_suffix(')'))
+            && let Some((lhs_str, rhs_str)) = eq_inner.split_once(',')
+        {
+            let lhs_op = parse_operand(lhs_str.trim())?;
+            let rhs_op = parse_operand(rhs_str.trim())?;
+            return Ok((
+                StmtOrTerm::Stmt(CapturedStmt::AssignEq {
+                    dst,
+                    lhs: lhs_op,
+                    rhs: rhs_op,
+                }),
+                None,
+            ));
+        }
+
+        // Check `NonZeroUsize { val: <op> }`.
+        if let Some(agg_inner) = rhs
+            .strip_prefix("NonZeroUsize { val:")
+            .and_then(|s| s.strip_suffix('}'))
+        {
+            let op = parse_operand(agg_inner.trim())?;
+            return Ok((
+                StmtOrTerm::Stmt(CapturedStmt::AssignAggregate {
+                    dst,
+                    adt_id: 0,
+                    op,
+                }),
+                None,
+            ));
+        }
+
+        // Check field projection `copy (_1.0: usize)`.
+        if let Some(proj_inner) = rhs
+            .strip_prefix("copy (")
+            .and_then(|s| s.strip_suffix(".0: usize)"))
+        {
+            let src = parse_local_token(proj_inner.trim())?;
+            return Ok((
+                StmtOrTerm::Stmt(CapturedStmt::AssignField0 { dst, src }),
+                None,
+            ));
+        }
+
+        // Check shared reborrow `&(*_x)`.
+        if let Some(reb_inner) =
+            rhs.strip_prefix("&(*").and_then(|s| s.strip_suffix(')'))
+        {
+            let src = parse_local_token(reb_inner.trim())?;
+            return Ok((
+                StmtOrTerm::Stmt(CapturedStmt::AssignReborrow { dst, src }),
+                None,
+            ));
+        }
+
+        // Check shared borrow `&_x`.
+        if let Some(ref_inner) = rhs.strip_prefix('&') {
+            let src = parse_local_token(ref_inner.trim())?;
+            return Ok((
+                StmtOrTerm::Stmt(CapturedStmt::AssignRef { dst, src }),
+                None,
+            ));
+        }
+
+        // Check literal `const ()` or `const <N>_usize` before named/PME
+        // constant references.
+        if let Ok(op) = parse_operand(rhs) {
+            return Ok((
+                StmtOrTerm::Stmt(CapturedStmt::AssignUse { dst, op }),
+                None,
+            ));
+        }
+
+        // Check named/associated/inline constant reference (`_2 = const ...`).
+        if let Some(const_rhs) = rhs.strip_prefix("const ") {
+            let (key, type_args) = parse_const_use_site(
+                const_rhs.trim(),
+                enclosing_fn,
+                generics,
+                meta,
+            )?;
+            return Ok((
+                StmtOrTerm::Stmt(CapturedStmt::AssignUse {
+                    dst,
+                    op: CapturedOperand::ConstUnit,
+                }),
+                Some((key, type_args)),
+            ));
+        }
     }
     Err(CaptureError::UnsupportedMir(format!(
         "unsupported MIR statement or terminator: `{line}`"
     )))
 }
 
+/// Parse a MIR constant use site (`_dst = const <const_rhs>;`) and resolve both
+/// its [`ConstKey`] and its instantiated [`CapturedTy`] arguments in the
+/// constant definition's generic parameter order.
+fn parse_const_use_site(
+    const_rhs: &str,
+    enclosing_fn: &str,
+    generics: &[String],
+    meta: &SourceMetadata,
+) -> Result<(ConstKey, Vec<CapturedTy>), CaptureError> {
+    // Case 1: `<SelfTy as Trait<Arg1, ...>>::CONST_NAME`
+    if let Some(inner) = const_rhs.strip_prefix('<')
+        && let Some((proj_part, const_name)) = inner.rsplit_once(">::")
+        && let Some((self_ty_raw, trait_raw)) = proj_part.split_once(" as ")
+    {
+        let self_ty_str = self_ty_raw.trim();
+        let self_ty_kind = if self_ty_str == "()" {
+            SelfTyKind::Unit
+        } else if generics.iter().any(|g| g == self_ty_str) {
+            SelfTyKind::Param
+        } else {
+            SelfTyKind::Named(self_ty_str.to_string())
+        };
+        let (trait_base, use_trait_args) = if let Some((t_name, args_rest)) =
+            trait_raw.trim().split_once('<')
+        {
+            let args_inner = args_rest.strip_suffix('>').ok_or_else(|| {
+                CaptureError::UnsupportedMir(format!(
+                    "malformed trait arguments in const `{const_rhs}`"
+                ))
+            })?;
+            let mut tys = Vec::new();
+            if !args_inner.trim().is_empty() {
+                for a in args_inner.split(',') {
+                    tys.push(parse_ty(a.trim(), generics)?);
+                }
+            }
+            (t_name.trim(), tys)
+        } else {
+            (trait_raw.trim(), Vec::new())
+        };
+        let trait_name = trait_base
+            .strip_prefix("anneal_target::")
+            .unwrap_or(trait_base)
+            .trim()
+            .to_string();
+        let const_name = const_name.trim().to_string();
+
+        // Map the use-site type arguments into the `impl` block's generic
+        // parameter order if metadata is present.
+        let type_args = if let Some(ic) = meta.impl_consts.iter().find(|ic| {
+            ic.self_ty_kind == self_ty_kind
+                && ic.trait_name == trait_name
+                && ic.const_name == const_name
+        }) {
+            if use_trait_args.len() != ic.trait_args.len() {
+                return Err(CaptureError::UnsupportedMir(format!(
+                    "trait argument count mismatch at `{const_rhs}`"
+                )));
+            }
+            let mut mapped = Vec::with_capacity(ic.impl_params.len());
+            for param in &ic.impl_params {
+                if param == &ic.self_ty_name {
+                    mapped.push(parse_ty(self_ty_str, generics)?);
+                } else if let Some(pos) =
+                    ic.trait_args.iter().position(|ta| ta == param)
+                {
+                    mapped.push(use_trait_args[pos]);
+                } else {
+                    return Err(CaptureError::UnsupportedMir(format!(
+                        "unmapped impl parameter `{param}` in `{const_rhs}`"
+                    )));
+                }
+            }
+            mapped
+        } else {
+            let mut fallback = Vec::new();
+            if self_ty_kind == SelfTyKind::Param {
+                fallback.push(parse_ty(self_ty_str, generics)?);
+            }
+            fallback.extend(use_trait_args);
+            fallback
+        };
+
+        return Ok((
+            ConstKey::TraitAssoc {
+                self_ty_kind,
+                trait_name,
+                const_name,
+            },
+            type_args,
+        ));
+    }
+
+    // Case 2: `<fn_name>::<Arg1, ...>::{constant#N}` or
+    // `<fn_name>::{constant#N}`
+    if let Some((before_const, idx_part)) =
+        const_rhs.split_once("::{constant#")
+        && let Some(idx_str) = idx_part.strip_suffix('}')
+    {
+        let index = idx_str.parse::<usize>().map_err(|_| {
+            CaptureError::UnsupportedMir(format!(
+                "invalid inline const index in `{const_rhs}`"
+            ))
+        })?;
+        let (raw_fn, type_args) =
+            if let Some((fn_base, args_rest)) = before_const.split_once("::<")
+            {
+                let args_inner = args_rest.strip_suffix('>').ok_or_else(|| {
+                    CaptureError::UnsupportedMir(format!(
+                        "malformed turbofish in inline const `{const_rhs}`"
+                    ))
+                })?;
+                let mut tys = Vec::new();
+                if !args_inner.trim().is_empty() {
+                    for a in args_inner.split(',') {
+                        tys.push(parse_ty(a.trim(), generics)?);
+                    }
+                }
+                (fn_base.trim(), tys)
+            } else {
+                let inherited: Vec<CapturedTy> =
+                    (0..generics.len()).map(CapturedTy::Param).collect();
+                (before_const.trim(), inherited)
+            };
+        let fn_name = raw_fn
+            .strip_prefix("anneal_target::")
+            .unwrap_or(raw_fn)
+            .trim()
+            .to_string();
+        if fn_name != enclosing_fn {
+            return Err(CaptureError::UnsupportedMir(format!(
+                "cross-function inline constant reference `{const_rhs}`"
+            )));
+        }
+        return Ok((ConstKey::Inline { fn_name, index }, type_args));
+    }
+
+    // Case 3: Top-level `CONST_NAME`
+    let name = const_rhs
+        .strip_prefix("anneal_target::")
+        .unwrap_or(const_rhs)
+        .trim();
+    if !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Ok((
+            ConstKey::TopLevel {
+                name: name.to_string(),
+            },
+            Vec::new(),
+        ));
+    }
+
+    Err(CaptureError::UnsupportedMir(format!(
+        "unsupported constant reference `{const_rhs}`"
+    )))
+}
+
+/// Parse a MIR operand (`copy _n`, `move _n`, `const ()`, or `const <k>_usize`)
+/// corresponding to `rustc_middle::mir::Operand`
+/// (`rust-lang/rust@58cf8f9c35b355199727627d07ae34a4e2846d67`).
 fn parse_operand(rhs: &str) -> Result<CapturedOperand, CaptureError> {
     if let Some(local_str) = rhs.strip_prefix("copy ") {
         return Ok(CapturedOperand::Copy(parse_local_token(local_str.trim())?));
     }
     if let Some(local_str) = rhs.strip_prefix("move ") {
         return Ok(CapturedOperand::Move(parse_local_token(local_str.trim())?));
+    }
+    if rhs == "const ()" || rhs == "()" {
+        return Ok(CapturedOperand::ConstUnit);
     }
     if let Some(const_str) = rhs.strip_prefix("const ") {
         if let Some(num_str) = const_str.trim().strip_suffix("_usize") {
@@ -1449,11 +2996,14 @@ fn parse_operand(rhs: &str) -> Result<CapturedOperand, CaptureError> {
     )))
 }
 
+/// Format a slice of rendered Lean expressions as a Lean list literal `[...]`.
 fn render_lean_list(items: &[String]) -> String {
     format!("[{}]", items.join(", "))
 }
 
-fn lean_quote_string(s: &str) -> String {
+/// Escape an arbitrary UTF-8 string as a double-quoted Lean string literal for
+/// embedding `src/lib.rs` into `Trusted.Crate.artifacts`.
+fn lean_string_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for ch in s.chars() {
@@ -1480,75 +3030,159 @@ pub fn render_mir_lean(functions: &[CapturedFunction]) -> String {
 }
 
 /// Render the read-only `.anneal/Mir.lean` module defining
-/// `Mir.crate : Trusted.Crate` with source artifact bindings.
+/// `Mir.crate : Trusted.Crate` with crate-level ADT, library invariant, and
+/// source artifact metadata.
 pub fn render_mir_lean_with_metadata(
-    functions: &[CapturedFunction],
+    items: &[CapturedFunction],
     meta: &SourceMetadata,
 ) -> String {
     let mut out = String::from("prelude\nimport Trusted\n\nnamespace Mir\n\n");
-    for func in functions {
-        let ident = lean_ident(&func.name);
-        let arg_tys: Vec<String> =
-            func.arg_tys.iter().map(|t| t.to_lean().to_string()).collect();
-        let blocks: Vec<String> = func
-            .blocks
-            .iter()
-            .map(|b| {
-                let stmts: Vec<String> =
-                    b.stmts.iter().map(CapturedStmt::to_lean).collect();
-                format!(
-                    "{{ stmts := {}, terminator := {} }}",
-                    render_lean_list(&stmts),
-                    b.terminator.to_lean()
-                )
-            })
-            .collect();
+
+    // Emit constant MIR bodies before function MIR bodies so `requiredConsts`
+    // references (`pme_assert_const_body`) are in scope regardless of the order
+    // in which `rustc --emit=mir` printed them.
+    for is_const_pass in [true, false] {
+        for func in items.iter().filter(|f| f.is_const == is_const_pass) {
+            let arg_tys: Vec<String> = func
+                .arg_tys
+                .iter()
+                .map(|t| t.to_lean())
+                .collect();
+            let blocks: Vec<String> = func
+                .blocks
+                .iter()
+                .map(|b| {
+                    let stmts: Vec<String> =
+                        b.stmts.iter().map(CapturedStmt::to_lean).collect();
+                    format!(
+                        "{{ stmts := {}, terminator := {} }}",
+                        render_lean_list(&stmts),
+                        b.terminator.to_lean()
+                    )
+                })
+                .collect();
+            if func.required_consts.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "def {}_body : Trusted.MirBody where\n  \
+                     argTys := {}\n  \
+                     retTy := {}\n  \
+                     localCount := {}\n  \
+                     blocks := {}\n",
+                    func.name,
+                    render_lean_list(&arg_tys),
+                    func.ret_ty.to_lean(),
+                    func.local_count,
+                    render_lean_list(&blocks),
+                );
+            } else {
+                let req_consts: Vec<String> = func
+                    .required_consts
+                    .iter()
+                    .map(|(c, tys)| {
+                        let ty_strs: Vec<String> =
+                            tys.iter().map(|t| t.to_lean_in_list()).collect();
+                        format!("({c}_body, {})", render_lean_list(&ty_strs))
+                    })
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "def {}_body : Trusted.MirBody where\n  \
+                     argTys := {}\n  \
+                     retTy := {}\n  \
+                     localCount := {}\n  \
+                     blocks := {}\n  \
+                     requiredConsts := {}\n",
+                    func.name,
+                    render_lean_list(&arg_tys),
+                    func.ret_ty.to_lean(),
+                    func.local_count,
+                    render_lean_list(&blocks),
+                    render_lean_list(&req_consts),
+                );
+            }
+        }
+    }
+
+    if meta.nonzero_field_pub_safe.is_some() {
         let _ = writeln!(
             out,
-            "def {ident}_body : Trusted.MirBody where\n  \
-             argTys := {}\n  \
-             retTy := {}\n  \
-             localCount := {}\n  \
-             blocks := {}\n",
-            render_lean_list(&arg_tys),
-            func.ret_ty.to_lean(),
-            func.local_count,
-            render_lean_list(&blocks),
+            "abbrev nonZeroAdtInv : Trusted.AdtInv :=\n  \
+             fun id v =>\n    \
+             match id, v with\n    \
+             | 0, .usize n => n ≠ 0\n    \
+             | _, _ => False\n\n\
+             abbrev newUncheckedSafetyPre (s : Trusted.MirState) : Prop :=\n  \
+             ∀ n, s.locals 1 = some (.usize n) → n ≠ 0\n"
         );
     }
 
-    let fn_entries: Vec<String> = functions
+    let runtime_fns: Vec<&CapturedFunction> =
+        items.iter().filter(|f| !f.is_const).collect();
+    let fn_entries: Vec<String> = runtime_fns
         .iter()
-        .map(|f| {
-            let ident = lean_ident(&f.name);
-            format!(
-                "{{ name := {}, prog := {ident}_body, specs := {} }}",
-                lean_quote_string(&f.name),
+        .map(|f| match f.kind {
+            CapturedFnKind::PubSafe => format!(
+                "{{ name := \"{}\", prog := {}_body, specs := {} }}",
+                f.name,
+                f.name,
                 f.spec.to_lean_specs()
-            )
+            ),
+            CapturedFnKind::PubUnsafeNewUnchecked => format!(
+                "{{ name := \"{}\", prog := {}_body, \
+                 kind := Trusted.FnKind.pubUnsafe True newUncheckedSafetyPre, \
+                 specs := {} }}",
+                f.name,
+                f.name,
+                f.spec.to_lean_specs()
+            ),
         })
         .collect();
-    let tcb_entries: Vec<String> = functions
+    let tcb_entries: Vec<String> = runtime_fns
         .iter()
         .map(|f| {
-            let ident = lean_ident(&f.name);
-            format!(
-                "Trusted.TCBItem.rustcLowering {} {ident}_body",
-                lean_quote_string(&f.name)
-            )
+            format!("Trusted.TCBItem.rustcLowering \"{}\" {}_body", f.name, f.name)
         })
         .collect();
-    let quoted_src = lean_quote_string(&meta.source_text);
-    let _ = writeln!(
-        out,
-        "def crate : Trusted.Crate where\n  \
-         functions := {}\n  \
-         tcb := {}\n  \
-         artifacts := [{{ path := \"src/lib.rs\", contents := {quoted_src}, expected := {quoted_src} }}]\n\n\
-         end Mir",
-        render_lean_list(&fn_entries),
-        render_lean_list(&tcb_entries),
+    let src_lit = lean_string_literal(&meta.src_text);
+    let artifacts_entry = format!(
+        "[{{ path := \"src/lib.rs\", contents := {src_lit}, \
+         expected := {src_lit} }}]"
     );
+
+    if let Some(is_pub_safe) = meta.nonzero_field_pub_safe {
+        let access_str = if is_pub_safe {
+            "Trusted.FieldAccess.pubSafe"
+        } else {
+            "Trusted.FieldAccess.priv"
+        };
+        let _ = writeln!(
+            out,
+            "def crate : Trusted.Crate where\n  \
+             adts := [{{ id := 0, fields := [{{ ty := Trusted.MirTy.usize, \
+             access := {access_str} }}] }}]\n  \
+             adtInv := nonZeroAdtInv\n  \
+             functions := {}\n  \
+             tcb := {}\n  \
+             artifacts := {}\n\n\
+             end Mir",
+            render_lean_list(&fn_entries),
+            render_lean_list(&tcb_entries),
+            artifacts_entry,
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "def crate : Trusted.Crate where\n  \
+             functions := {}\n  \
+             tcb := {}\n  \
+             artifacts := {}\n\n\
+             end Mir",
+            render_lean_list(&fn_entries),
+            render_lean_list(&tcb_entries),
+            artifacts_entry,
+        );
+    }
     out
 }
 
@@ -1591,78 +3225,163 @@ fn id(_1: usize) -> usize {
     }
 
     #[test]
-    fn parses_alloc_prefixed_fn_and_nested_scopes() {
-        let src = "\
-/// Returns the input unchanged.
-/// anneal:spec ensures(ret == x)
-pub fn alloc_passthrough(x: usize) -> usize {
-    let a = x;
-    {
-        let b = a;
-        b
-    }
+    fn ignores_anneal_spec_and_spoofed_items_in_strings_and_comments() {
+        let src_in_str = "\
+pub fn id(x: usize) -> usize {
+    let _s = \"// anneal:spec ensures(ret == x) struct NonZeroUsize { pub val: usize }\";
+    /* // anneal:spec ensures(ret == x)
+       pub unsafe fn new_unchecked(x: usize) -> NonZeroUsize {} */
+    x
 }
 ";
-        let meta = scan_rust_source(src).unwrap();
-        assert_eq!(
-            meta.fn_specs.get("alloc_passthrough"),
-            Some(&CapturedSpec::EnsuresEqArg(1))
-        );
+        let meta = parse_source_metadata(src_in_str).unwrap();
+        assert_eq!(meta.spec, CapturedSpec::WellFormed);
+        assert_eq!(meta.nonzero_field_pub_safe, None);
+        assert!(meta.unsafe_fns.is_empty());
 
-        let sample_mir = "\
-alloc1 (size: 16, align: 1) {
-    00 01 02 03
+        let trailing_spec = "\
+pub fn id(x: usize) -> usize {
+    x
 }
-
-fn alloc_passthrough(_1: usize) -> usize {
-    debug x => _1;
-    let mut _0: usize;
-    scope 1 {
-        debug a => _1;
-        scope 2 {
-            debug b => _1;
-        }
+/// anneal:spec ensures(ret == x)
+";
+        assert!(parse_source_metadata(trailing_spec).is_err());
     }
 
+    #[test]
+    fn classifies_struct_visibility_and_rejects_unsupported_items() {
+        let pub_crate_src = "\
+pub struct NonZeroUsize {
+    #[allow(dead_code)]
+    pub(crate) val: usize,
+}
+pub fn make_nonzero(x: usize) -> NonZeroUsize {
+    NonZeroUsize { val: x }
+}
+";
+        let meta = parse_source_metadata(pub_crate_src).unwrap();
+        assert_eq!(meta.nonzero_field_pub_safe, Some(false));
+
+        let pub_attr_src = "\
+pub struct NonZeroUsize {
+    #[allow(dead_code)]
+    pub val: usize,
+}
+";
+        let meta_pub = parse_source_metadata(pub_attr_src).unwrap();
+        assert_eq!(meta_pub.nonzero_field_pub_safe, Some(true));
+
+        assert!(parse_source_metadata("pub enum E { A }").is_err());
+        assert!(parse_source_metadata("pub struct NonZeroUsize(usize);").is_err());
+        assert!(parse_source_metadata("pub unsafe trait Bad {}").is_err());
+        assert!(parse_source_metadata(
+            "pub struct NonZeroUsize { val: usize }\n\
+             impl NonZeroUsize { pub fn f() {} }"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn correlates_consts_by_key_and_rejects_unknown_or_decoy_consts() {
+        let src = "\
+const DECOY: () = ();
+pub trait SizeEq<A, B> {
+    const ASSERT: ();
+}
+impl<A, B> SizeEq<A, B> for () {
+    const ASSERT: () = assert!(core::mem::size_of::<A>() == core::mem::size_of::<B>());
+}
+pub fn transmute_checked<First: Copy, Second: Copy>(x: First) -> Second {
+    let () = <() as SizeEq<First, Second>>::ASSERT;
+    unsafe { core::mem::transmute_copy(&x) }
+}
+";
+        let meta = parse_source_metadata(src).unwrap();
+        assert_eq!(
+            meta.fn_generics.get("transmute_checked"),
+            Some(&vec!["First".to_string(), "Second".to_string()])
+        );
+        assert_eq!(meta.impl_consts.len(), 1);
+
+        let mir = "\
+const DECOY: () = {
+    let mut _0: ();
     bb0: {
-        _0 = copy _1;
+        _0 = const ();
+        return;
+    }
+}
+
+const <impl at src/lib.rs:5:1: 7:2>::ASSERT: () = {
+    let mut _0: ();
+    let mut _1: bool;
+    let mut _2: usize;
+    let mut _3: usize;
+    let mut _4: !;
+    bb0: {
+        StorageLive(_1);
+        StorageLive(_2);
+        ConstEvalCounter;
+        _2 = std::mem::size_of::<A>() -> [return: bb1, unwind continue];
+    }
+    bb1: {
+        StorageLive(_3);
+        ConstEvalCounter;
+        _3 = std::mem::size_of::<B>() -> [return: bb2, unwind continue];
+    }
+    bb2: {
+        _1 = Eq(move _2, move _3);
+        switchInt(move _1) -> [0: bb4, otherwise: bb3];
+    }
+    bb3: {
+        StorageDead(_3);
+        StorageDead(_2);
+        _0 = const ();
+        StorageDead(_1);
+        return;
+    }
+    bb4: {
+        StorageDead(_3);
+        StorageDead(_2);
+        StorageLive(_4);
+        ConstEvalCounter;
+        _4 = panic(const \"assertion failed\") -> unwind continue;
+    }
+}
+
+fn transmute_checked(_1: First) -> Second {
+    let mut _0: Second;
+    let _2: ();
+    let mut _3: &First;
+    let _4: &First;
+    bb0: {
+        StorageLive(_2);
+        _2 = const <() as SizeEq<First, Second>>::ASSERT;
+        StorageDead(_2);
+        StorageLive(_3);
+        StorageLive(_4);
+        _4 = &_1;
+        _3 = &(*_4);
+        _0 = transmute_copy::<First, Second>(move _3) -> [return: bb1, unwind continue];
+    }
+    bb1: {
+        StorageDead(_4);
+        StorageDead(_3);
         return;
     }
 }
 ";
-        let fns = parse_emitted_mir_with_metadata(sample_mir, &meta).unwrap();
-        assert_eq!(fns.len(), 1);
-        assert_eq!(fns[0].name, "alloc_passthrough");
-        assert_eq!(fns[0].spec, CapturedSpec::EnsuresEqArg(1));
-    }
-
-    #[test]
-    fn scanner_handles_char_literals_raw_strings_and_rejects_bad_anneal_directives() {
-        let src = r####"
-const QUOTE: char = '"';
-const OPEN: char = '{';
-const RAW: &str = r#"
-// anneal:spec unknown_directive
-"#;
-/* outer /* nested */ comment */
-/// anneal:spec(ensures(ret == x))
-pub fn id<'a>(x: usize) -> usize {
-    x
-}
-"####;
-        let meta = scan_rust_source(src).unwrap();
-        assert_eq!(meta.fn_specs.get("id"), Some(&CapturedSpec::EnsuresEqArg(1)));
-
-        // Reject inner doc comment `//! anneal:spec(...)`.
-        assert!(scan_rust_source("//! anneal:spec ensures(ret == x)\npub fn id(x: usize) -> usize { x }\n").is_err());
-        // Reject block comment `/* anneal:spec(...) */`.
-        assert!(scan_rust_source("/* anneal:spec ensures(ret == x) */\npub fn id(x: usize) -> usize { x }\n").is_err());
-        // Reject unknown `anneal:` directive.
-        assert!(scan_rust_source("/// anneal:requires(x > 0)\npub fn id(x: usize) -> usize { x }\n").is_err());
-        // Reject duplicate `anneal:spec` on the same function.
-        assert!(scan_rust_source("// anneal:spec well_formed\n/// anneal:spec ensures(ret == x)\npub fn id(x: usize) -> usize { x }\n").is_err());
-        // Reject dangling `anneal:spec` before a struct or at EOF.
-        assert!(scan_rust_source("/// anneal:spec ensures(ret == x)\npub struct Foo { x: usize }\n").is_err());
-        assert!(scan_rust_source("pub fn id(x: usize) -> usize { x }\n/// anneal:spec ensures(ret == x)\n").is_err());
+        let items = parse_emitted_mir_with_metadata(mir, &meta).unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_const);
+        assert_eq!(items[0].name, "pme_assert_const");
+        assert_eq!(items[0].blocks.len(), 5);
+        assert_eq!(
+            items[1].required_consts,
+            vec![(
+                "pme_assert_const".to_string(),
+                vec![CapturedTy::Param(0), CapturedTy::Param(1)]
+            )]
+        );
     }
 }
