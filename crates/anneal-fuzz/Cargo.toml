@@ -16,4 +16,8 @@ proc-macro2 = "1.0.107"
 name = "miri-fuzz"
 path = "src/bin/miri_fuzz.rs"
 
+[[bin]]
+name = "itree-fuzz"
+path = "src/bin/itree_fuzz.rs"
+
 [workspace]
