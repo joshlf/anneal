@@ -12,4 +12,8 @@ quote = "1.0.47"
 prettyplease = "0.2.37"
 proc-macro2 = "1.0.107"
 
+[[bin]]
+name = "miri-fuzz"
+path = "src/bin/miri_fuzz.rs"
+
 [workspace]
