@@ -20,7 +20,9 @@
 //!    `Assumptions.<Item>` axioms.
 
 pub mod agent;
+pub mod correspondence_bugs;
 pub mod driver;
+pub mod minirust_sync;
 pub mod miri_diff;
 pub mod obligations;
 pub mod scaffold;
@@ -41,12 +43,30 @@ pub use agent::{
     parse_spec_lock_manifest, render_agent_context, run_agent_sandbox,
     serialize_spec_lock_manifest, verify_spec_lock, verify_spec_lock_with_options,
 };
+pub use correspondence_bugs::{
+    CorrespondenceBugsSubcommand, CorrespondenceGapEntry, CorrespondenceGapsRegistry,
+    CorrespondenceMatrix, CorrespondenceMatrixCell, ExpectedTier, FileIssueOptions,
+    FileIssueOutcome, FormattedGitHubIssue, GapKind, LintReport, MiriDiffCrossCheckReport,
+    cross_check_miri_diff, file_github_issue, format_github_issue, is_vacuous_guard_predicate,
+    lint_correspondence_gaps, lint_correspondence_gaps_with_vendor_root,
+    load_correspondence_gaps, load_correspondence_matrix,
+    parse_correspondence_bugs_args, parse_correspondence_gaps, parse_correspondence_matrix,
+    run_correspondence_bugs_cli,
+};
 pub use driver::{
     ANNEAL_CAPTURE_FILTER_ENV, ANODIZED_EMBED_SPECS_CFG, CaptureDriverConfig,
     aggregate_unit_manifests, build_cargo_check_command, invoke_cargo_capture,
     load_captured_unit_records, merge_rustflags, parse_capture_manifest,
     parse_unit_capture_manifest, resolve_rustc_wrapper, run_cargo_capture,
     serialize_unit_capture_manifest,
+};
+pub use minirust_sync::{
+    DeclChangeKind, DeclDiffEntry, ExtractedSpecDecl, LockVerificationReport, LockedSpecFile,
+    MiniRustSyncSubcommand, SnapshotDiffReport, SnapshotLockEntry, SpecDeclKind,
+    UpstreamMiniRustLock, diff_snapshot_directories, extract_snapshot_declarations,
+    load_upstream_lock, parse_minirust_sync_args, parse_upstream_lock,
+    render_snapshot_diff_markdown, render_sync_status_report, run_minirust_sync_cli,
+    verify_upstream_lock,
 };
 pub use miri_diff::{
     KnownAnnealBugSpec, MiriDiffConfig, MiriDiffManifest, MiriDiffReport, MiriDiffTestEntry,
@@ -111,6 +131,12 @@ pub enum CliSubcommand {
     /// `anneal-spec`, `anneal-rustc-capture`, and `cargo-anneal` with bundled
     /// `lean-root/`) for vendoring into Fuchsia's `//third_party/rust_crates`.
     VendorFuchsia,
+    /// Manage non-correspondence gap registry validation, Markdown issue
+    /// rendering, and opt-in manual issue filing (`cargo anneal correspondence-bugs`).
+    CorrespondenceBugs,
+    /// Verify upstream MiniRust lockfiles, diff snapshots, and render sync
+    /// status reports offline (`cargo anneal minirust-sync`).
+    MiniRustSync,
     /// Print CLI usage instructions.
     Help,
     /// Print the `cargo-anneal` package version.
@@ -455,6 +481,16 @@ where
                 subcommand = Some(CliSubcommand::VendorFuchsia);
                 i += 1;
             }
+            "correspondence-bugs" if subcommand.is_none() => {
+                subcommand = Some(CliSubcommand::CorrespondenceBugs);
+                extra_cargo_args.extend(slice[i + 1..].iter().cloned());
+                break;
+            }
+            "minirust-sync" if subcommand.is_none() => {
+                subcommand = Some(CliSubcommand::MiniRustSync);
+                extra_cargo_args.extend(slice[i + 1..].iter().cloned());
+                break;
+            }
             "--workspace-root" => {
                 i += 1;
                 let val = slice
@@ -709,7 +745,7 @@ where
             other => {
                 if subcommand.is_none() {
                     return Err(format!(
-                        "unknown subcommand '{other}' (expected 'extract', 'scaffold', 'verify', 'check', 'lock-specs', 'agent-context', 'agent-verify', 'agent-sandbox', 'setup', or 'vendor-fuchsia')"
+                        "unknown subcommand '{other}' (expected 'extract', 'scaffold', 'verify', 'check', 'lock-specs', 'agent-context', 'agent-verify', 'agent-sandbox', 'setup', 'vendor-fuchsia', 'correspondence-bugs', or 'minirust-sync')"
                     ));
                 }
                 extra_cargo_args.push(other.to_string());
@@ -795,16 +831,18 @@ where
 pub fn cli_usage() -> &'static str {
     "Usage: cargo anneal <SUBCOMMAND> [OPTIONS] [-- <CARGO_ARGS>...]\n\n\
      Subcommands:\n  \
-       setup           Install the pinned Anneal toolchain archive under ~/.anneal/toolchain/\n  \
-       vendor-fuchsia  Stage workspace crates + lean-root/ for Fuchsia //third_party/rust_crates\n  \
-       extract         Capture MIR via anneal-rustc-capture and aggregate CaptureManifest.json\n  \
-       scaffold        Generate .anneal/generated/ modules and ensure anneal/proofs/ exists\n  \
-       verify          Extract, scaffold, build with Lake, and audit the TrustedBoundary\n  \
-       check           Alias for 'verify'\n  \
-       lock-specs      Lock MIR digests, Specs/**, and Assumptions/** in .anneal/spec-lock.json\n  \
-       agent-context   Render structured Markdown context for an AI proof-authoring agent\n  \
-       agent-verify    Enforce .anneal/spec-lock.json, regenerate .anneal/generated/, and verify\n  \
-       agent-sandbox   Run an agent command inside a bwrap read-only sandbox (-- <COMMAND>...)\n\n\
+       setup               Install the pinned Anneal toolchain archive under ~/.anneal/toolchain/\n  \
+       vendor-fuchsia      Stage workspace crates + lean-root/ for Fuchsia //third_party/rust_crates\n  \
+       extract             Capture MIR via anneal-rustc-capture and aggregate CaptureManifest.json\n  \
+       scaffold            Generate .anneal/generated/ modules and ensure anneal/proofs/ exists\n  \
+       verify              Extract, scaffold, build with Lake, and audit the TrustedBoundary\n  \
+       check               Alias for 'verify'\n  \
+       lock-specs          Lock MIR digests, Specs/**, and Assumptions/** in .anneal/spec-lock.json\n  \
+       agent-context       Render structured Markdown context for an AI proof-authoring agent\n  \
+       agent-verify        Enforce .anneal/spec-lock.json, regenerate .anneal/generated/, and verify\n  \
+       agent-sandbox       Run an agent command inside a bwrap read-only sandbox (-- <COMMAND>...)\n  \
+       correspondence-bugs Offline non-correspondence gap linter & opt-in manual issue formatter/filer\n  \
+       minirust-sync       Offline upstream MiniRust lock verifier, snapshot differ, and status reporter\n\n\
      Options:\n  \
        --local-archive <PATH>  Install 'setup' from a local .tar.zst toolchain archive\n  \
        --out-dir <DIR>         Output directory for 'vendor-fuchsia'\n  \
@@ -1133,6 +1171,18 @@ pub fn execute_cli(options: &CliOptions) -> Result<(), String> {
             for dir in &staged {
                 println!("Vendored {}", dir.display());
             }
+            Ok(())
+        }
+        CliSubcommand::CorrespondenceBugs => {
+            let sub = correspondence_bugs::parse_correspondence_bugs_args(&options.extra_cargo_args)?;
+            let out = correspondence_bugs::run_correspondence_bugs_cli(&sub)?;
+            print!("{out}");
+            Ok(())
+        }
+        CliSubcommand::MiniRustSync => {
+            let sub = minirust_sync::parse_minirust_sync_args(&options.extra_cargo_args)?;
+            let out = minirust_sync::run_minirust_sync_cli(&sub)?;
+            print!("{out}");
             Ok(())
         }
     }
