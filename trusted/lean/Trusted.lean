@@ -12,18 +12,14 @@ import Trusted.Attributes
 import Trusted.Refinement
 import Trusted.CoInd
 import Trusted.Effect
-import Trusted.Specs
-import Trusted.Verify
-import Trusted.Machine
-import Trusted.Values
-import Trusted.Memory
-import Trusted.CFG
-import Trusted.Statements
-import Trusted.Function
-import Trusted.Semantics
-import Trusted.Rustc
-import Trusted.Mir
-import Trusted.Obligation
+import Trusted.ITree
+import Trusted.Sequence
+import Trusted.Layout
+import Trusted.MirAst
+import Trusted.MirSemantics
+import Trusted.VerificationResult
+
+namespace Trusted
 
 /-!
 # Trusted (TCB) Index (`Trusted.lean`)
