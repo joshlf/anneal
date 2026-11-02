@@ -5,6 +5,8 @@ import Trusted.Rustc.V2026_06_01.MirSemantics.State
 import Trusted.Rustc.V2026_06_01.MirSemantics.Places
 import Trusted.Rustc.V2026_06_01.MirSemantics.Terminators
 import MiniRust.LibSpecr
+import MiniRust.Snapshots.S2026_05_Matched.Generated.Ops
+import MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops
 import Correspondence.Framework
 
 /-!
@@ -213,27 +215,130 @@ def evalAnnealV2026_06_01 (prog : FixtureProg) (_st : FixtureState) : Verdict :=
     | false => .normalUnit
 
 /--
-Evaluate a `FixtureProg` under upstream MiniRust snapshot `snap : MiniRustSnap`.
+Evaluate a `FixtureProg` under upstream MiniRust snapshot `snap : MiniRustSnap`
+by directly invoking the mechanically extracted operational functions in
+`MiniRust.Snapshots.S2026_05_Matched.Generated.Ops` and
+`MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops`.
 -/
 @[reducible]
 def evalMiniRustSnapshot (snap : MiniRustSnap) (prog : FixtureProg) : Verdict :=
-  match prog with
-  | .canonicalSafeScalarAdd =>
-    .normalScalar ((12 + 30) % (256 ^ 4))
-  | .canonicalSafeByteRoundTrip =>
-    match decodeLittleEndianBytes (encodeLittleEndianBytes 42 4 .none) with
-    | .some (bits, _) => .normalScalar bits
-    | .none => .ub
-  | .canonicalSafeLocalWriteRead => .normalUnit
-  | .canonicalSafeTreeBorrowMut => .normalUnit
-  | .sharedUnsafeCellWrite => .normalUnit
-  | .unionVariantWriteRead => .normalUnit
-  | .dynamicArrayIndexBorrow => .normalUnit
-  | .exactDivIntrinsicCall => .normalUnit
-  | .reservedImEpochTransition =>
-    match snap with
-    | .S2026_05_Matched => .ub
-    | .S2026_07_BleedingEdge => .normalUnit
+  match snap with
+  | .S2026_05_Matched =>
+    open MiniRust.Snapshots.S2026_05_Matched.Generated.Ops in
+    match prog with
+    | .canonicalSafeScalarAdd =>
+      match eval_bin_op_int .Add 12 30 { signed := .Unsigned, size := ⟨4⟩ } with
+      | .ok v => .normalScalar v.toNat
+      | .error _ => .ub
+    | .canonicalSafeByteRoundTrip =>
+      match decode_int_le (encode_int_le 42 4 .none) with
+      | .some (bits, _) => .normalScalar bits
+      | .none => .ub
+    | .canonicalSafeLocalWriteRead =>
+      let initMem : BasicMemory := {
+        allocs := [{ id := 0, align := ⟨2⟩, size := 4, live := true, bytes := [0, 0, 0, 0] }]
+        nextAllocId := 1
+      }
+      match basicMemStore initMem { allocId := 0, offset := 0 } ⟨2⟩ [7, 0, 0, 0] with
+      | .ok mem' =>
+        match basicMemLoad mem' { allocId := 0, offset := 0 } ⟨2⟩ 4 with
+        | .ok _ => .normalUnit
+        | .error _ => .ub
+      | .error _ => .ub
+    | .canonicalSafeTreeBorrowMut =>
+      let p0 := reborrow_permission true .No true true false
+      match p0.transition .Write .Local with
+      | .ok _ => .normalUnit
+      | .error _ => .ub
+    | .sharedUnsafeCellWrite =>
+      let p0 := reborrow_permission false .No true false false
+      match p0.transition .Write .Local with
+      | .ok _ => .normalUnit
+      | .error _ => .ub
+    | .unionVariantWriteRead =>
+      match encode_union_chunks 4 [(0, encode_int_le 99 4 .none)] with
+      | .some bs =>
+        match decode_union_chunks bs [(0, 4)] with
+        | .some _ => .normalUnit
+        | .none => .ub
+      | .none => .ub
+    | .dynamicArrayIndexBorrow =>
+      match mrProjectIndexOffset 0 4 1 2 with
+      | .ok off =>
+        let mem : BasicMemory := {
+          allocs := [{ id := 0, align := ⟨2⟩, size := 8, live := true, bytes := [10, 0, 0, 0, 30, 0, 0, 0] }]
+          nextAllocId := 1
+        }
+        match basicMemLoad mem { allocId := 0, offset := off } ⟨2⟩ 4 with
+        | .ok _ => .normalUnit
+        | .error _ => .ub
+      | .error _ => .ub
+    | .exactDivIntrinsicCall =>
+      match eval_bin_op_int .DivExact 24 2 { signed := .Unsigned, size := ⟨4⟩ } with
+      | .ok _ => .normalUnit
+      | .error _ => .ub
+    | .reservedImEpochTransition =>
+      match (reborrow_permission true .Strong true false true).init_access with
+      | .some .Write => .normalUnit
+      | _ => .ub
+  | .S2026_07_BleedingEdge =>
+    open MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops in
+    match prog with
+    | .canonicalSafeScalarAdd =>
+      match eval_bin_op_int .Add 12 30 { signed := .Unsigned, size := ⟨4⟩ } with
+      | .ok v => .normalScalar v.toNat
+      | .error _ => .ub
+    | .canonicalSafeByteRoundTrip =>
+      match decode_int_le (encode_int_le 42 4 .none) with
+      | .some (bits, _) => .normalScalar bits
+      | .none => .ub
+    | .canonicalSafeLocalWriteRead =>
+      let initMem : BasicMemory := {
+        allocs := [{ id := 0, align := ⟨2⟩, size := 4, live := true, bytes := [0, 0, 0, 0] }]
+        nextAllocId := 1
+      }
+      match basicMemStore initMem { allocId := 0, offset := 0 } ⟨2⟩ [7, 0, 0, 0] with
+      | .ok mem' =>
+        match basicMemLoad mem' { allocId := 0, offset := 0 } ⟨2⟩ 4 with
+        | .ok _ => .normalUnit
+        | .error _ => .ub
+      | .error _ => .ub
+    | .canonicalSafeTreeBorrowMut =>
+      let p0 := reborrow_permission true .No true true false
+      match p0.transition .Write .Local with
+      | .ok _ => .normalUnit
+      | .error _ => .ub
+    | .sharedUnsafeCellWrite =>
+      let p0 := reborrow_permission false .No true false false
+      match p0.transition .Write .Local with
+      | .ok _ => .normalUnit
+      | .error _ => .ub
+    | .unionVariantWriteRead =>
+      match encode_union_chunks 4 [(0, encode_int_le 99 4 .none)] with
+      | .some bs =>
+        match decode_union_chunks bs [(0, 4)] with
+        | .some _ => .normalUnit
+        | .none => .ub
+      | .none => .ub
+    | .dynamicArrayIndexBorrow =>
+      match mrProjectIndexOffset 0 4 1 2 with
+      | .ok off =>
+        let mem : BasicMemory := {
+          allocs := [{ id := 0, align := ⟨2⟩, size := 8, live := true, bytes := [10, 0, 0, 0, 30, 0, 0, 0] }]
+          nextAllocId := 1
+        }
+        match basicMemLoad mem { allocId := 0, offset := off } ⟨2⟩ 4 with
+        | .ok _ => .normalUnit
+        | .error _ => .ub
+      | .error _ => .ub
+    | .exactDivIntrinsicCall =>
+      match eval_bin_op_int .DivExact 24 2 { signed := .Unsigned, size := ⟨4⟩ } with
+      | .ok _ => .normalUnit
+      | .error _ => .ub
+    | .reservedImEpochTransition =>
+      match (reborrow_permission true .Strong true false true).init_access with
+      | .some .Write => .normalUnit
+      | _ => .ub
 
 /-- Canonical `AnnealMirDialect` instance for `Trusted.Rustc.V2026_06_01`. -/
 def dialectV2026_06_01 : AnnealMirDialect where
