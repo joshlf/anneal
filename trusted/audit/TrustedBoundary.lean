@@ -22,15 +22,16 @@ mechanical trust-boundary enforcement, paired with the Rust orchestrator in
 Anneal's soundness promise is that `cargo anneal verify` and
 `cargo anneal audit-repo` never report that a crate or repository is verified
 unless the Lean 4 kernel has checked a proof of `Trusted.CrateTheorem Mir.crate`
-that depends only on sound axioms (`{Classical.choice, Quot.sound, propext}`)
+that depends only on constructive foundation axioms (`{Quot.sound, propext}`)
 and on TCB components permitted by the active release channel and crate trust
 policy.
 
 Code in an Anneal verification run falls into four categories:
 
 1. **Foundation (`Init.*` locked by `trusted/lean/foundation-lock.json`):**
-   The pinned Lean 4.34.1 prelude and core library modules. Only the three
-   standard axioms listed in `foundation-lock.json` are permitted; `sorryAx`
+   The pinned Lean 4.34.1 prelude and core library modules. Only the two
+   constructive foundation axioms listed in `foundation-lock.json`
+   (`{Quot.sound, propext}`) are permitted; `Classical.choice`, `sorryAx`,
    and all non-locked modules (`Std`, `Lean`, etc.) are excluded.
 2. **Vetted TCB (`trusted/lean/`, marked `@[vetted]`):**
    Primitive semantic definitions and theorem envelopes audited against the
@@ -92,8 +93,10 @@ inspector operates in two isolated phases:
        is an axiom-free definition originating in `Mir` and `Proof.verify_crate
        : Trusted.CrateTheorem Mir.crate` is a theorem originating in `Proof`.
      - Every reachable axiom across all non-foundation declarations belongs to
-       the locked `foundation` axiom allowlist (`{Classical.choice, Quot.sound,
-       propext}`).
+       the locked `foundation` axiom allowlist (`{Quot.sound, propext}`).
+     - Every `Trusted.EmittedArtifact.mk` application in `Mir.crate`'s closure
+       is extracted with literal `path` and `expected` fields so `audit.rs`
+       can verify on-disk byte identity against `expected`.
   4. **Active candidate feature reachability
      (`collectActiveCandidateFeatures`):**
      Traverses the crate's dependency closure (`Mir` and `Proof`), releasing a
@@ -363,7 +366,7 @@ partial def inspectSyntax (allowTrustAttrs : Bool) (s : Syntax) : IO Unit := do
   if k == ``Parser.Command.eraseAttr then
     unless allowedAttributeNames.contains s[1].getId do fail s!"unsupported attribute removal {s[1].getId}"
   if k == `Lean.Parser.Tactic.decide then
-    unless s[1].getArgs.isEmpty do
+    unless s[1].getArgs.all (·.getArgs.isEmpty) do
       fail "decide configuration is unsupported"
   if k == `Lean.Parser.Term.letRecDecl then
     let inner := s[2][0]
@@ -592,6 +595,68 @@ partial def expressionEdges (e : Expr) : IO NameSet := do
       | _ => pure ()
   return result
 
+/-- Build a lookup table mapping both normalized user names
+    (`(privateToUserName? cName).getD cName`) and raw constant names (`cName`)
+    to their raw constant name in `locals`, so compiler-generated equational
+    theorems (which drop the outer `_private.<mod>.0.` prefix) can resolve back
+    to their owning declaration in `locals`. -/
+def buildNormToRaw (locals : Std.HashMap Name ConstantInfo) :
+    Std.HashMap Name Name := Id.run do
+  let mut m : Std.HashMap Name Name := {}
+  for (cName, _) in locals do
+    let u := (privateToUserName? cName).getD cName
+    m := (m.insert u cName).insert cName cName
+  return m
+
+/-- Return `true` if `s` is non-empty and consists solely of ASCII digits. -/
+def isAllDigits (s : String) : Bool :=
+  !s.isEmpty && s.all Char.isDigit
+
+/-- Return `true` if `s` is a compiler-generated equational, unfolding, or
+    congruence theorem suffix (`eq_def`, `_eq_def`, `_unfold`, `_sunfold`,
+    `_congr_simp`, `eq_<N>`, `_eq_<N>`, `_cstage<N>`). -/
+def isEqThmSuffix (s : String) : Bool :=
+  s == "eq_def" || s == "_eq_def" || s == "_unfold" || s == "_sunfold" ||
+  s == "_congr_simp" ||
+  (s.startsWith "_eq_" && isAllDigits (s.drop 4).toString) ||
+  (s.startsWith "eq_" && isAllDigits (s.drop 3).toString) ||
+  (s.startsWith "_cstage" && isAllDigits (s.drop 7).toString)
+
+/-- Return `true` if `s` is an intermediate compiler-generated auxiliary owner
+    suffix (`_unary`, `_mutual`, `match_<N>`, `_sparseCasesOn_<N>`,
+    `_proof_<N>`) that may sit between a declaration and its equational
+    theorem suffix. -/
+def isAuxOwnerSuffix (s : String) : Bool :=
+  s == "_unary" || s == "_mutual" ||
+  (s.startsWith "match_" && isAllDigits (s.drop 6).toString) ||
+  (s.startsWith "_sparseCasesOn_" && isAllDigits (s.drop 15).toString) ||
+  (s.startsWith "_proof_" && isAllDigits (s.drop 7).toString)
+
+/-- Resolve a compiler-generated equational theorem `cName` back to its raw
+    owning declaration name in `locals` via `normToRaw`, peeling equational
+    suffixes (`isEqThmSuffix`) and intermediate auxiliary suffixes
+    (`isAuxOwnerSuffix`). -/
+def resolveEqOwner (normToRaw : Std.HashMap Name Name) (cName : Name) :
+    Option Name := Id.run do
+  let mut cur := (privateToUserName? cName).getD cName
+  let mut sawEqSuffix := false
+  while !cur.isAnonymous do
+    match cur with
+    | .str p s =>
+      if isEqThmSuffix s then
+        sawEqSuffix := true
+        cur := p
+      else if sawEqSuffix && isAuxOwnerSuffix s then
+        cur := p
+      else
+        break
+    | _ => break
+  if !sawEqSuffix || cur.isAnonymous then
+    return none
+  match normToRaw.get? cur with
+  | some rawOwner => if rawOwner != cName then some rawOwner else none
+  | none => none
+
 /-- Return `true` if `u` is a compiler-generated `.match_N` or
     `._sparseCasesOn_N` splitter constant. -/
 def isMatcherSplitter (u : Name) : Bool :=
@@ -608,20 +673,15 @@ def isUnderMatcherSplitter (u : Name) (ci : ConstantInfo) : Bool :=
   | _ => false
 
 /-- Return `true` if `cName` is a compiler-generated equational or unfolding
-    theorem (`_eq_N`, `eq_N`, `_congr_simp`, `_unfold`) attached to a compiled
-    declaration in `locals`. -/
-def isCompilerEqThm (locals : Std.HashMap Name ConstantInfo) (cName : Name)
+    theorem (`_eq_N`, `eq_N`, `eq_def`, `_congr_simp`, `_unfold`) attached to a
+    compiled declaration in `locals`. -/
+def isCompilerEqThm (normToRaw : Std.HashMap Name Name) (cName : Name)
     (ci : ConstantInfo) : Bool :=
-  let u := (privateToUserName? cName).getD cName
-  match u with
-  | .str p s =>
-    !p.isAnonymous && locals.contains cName.getPrefix && ci.isTheorem &&
-      (s.startsWith "_eq_" || s.startsWith "eq_" || s.startsWith "_congr_" || s.startsWith "_unfold")
-  | _ => false
+  ci.isTheorem && (resolveEqOwner normToRaw cName).isSome
 
 /-- Return `true` if `u` is one of Lean's compiler-generated inductive recursor,
     constructor-index, no-confusion, or `SizeOf` helpers for an extensible
-    `@[vetted]` inductive in `extensibleInducts`. -/
+    inductive in `extensibleInducts`. -/
 def isExtensibleInductHelper (extensibleInducts : NameSet) (u : Name) : Bool :=
   match u with
   | .str p s =>
@@ -643,40 +703,48 @@ def composeParamCtx (outer inner : String) : String :=
   else if inner == "vetted" || inner == outer then outer
   else "conflict"
 
-/-- Derive per-parameter trust statuses (`"vetted"` or `"candidate:<feat>"`) for
-    eliminators of extensible `@[vetted]` inductives (`I.rec`, `I.recOn`,
-    `I.casesOn`) and compiler-generated matcher splitters (`.match_N` and
-    `._sparseCasesOn_N`).
+/-- Count the number of leading `.forallE` binders in `e`. -/
+def countForalls (e : Expr) : Nat := Id.run do
+  let mut cur := e
+  let mut n := 0
+  while cur.isForall do
+    let .forallE _ _ body _ := cur | break
+    n := n + 1
+    cur := body
+  return n
 
-    For `I.rec`, `I.recOn`, and `I.casesOn`, a parameter in the `.forallE`
-    telescope of `ci.type` whose stripped return type applies the motive to a
-    constructor `ctorName` of `I` receives `statusMap[ctorName]`. For `.match_N`
-    and `._sparseCasesOn_N` splitters, parameter `p` receives status
-    `"candidate:<feat>"` if and only if `p` is referenced in the splitter's body
-    and every occurrence of `p` lies inside a `"candidate:<feat>"` minor-premise
-    argument of an eliminator or `ctorElim` call. -/
+/-- Derive per-parameter trust statuses (`"vetted"` or `"candidate:<feat>"`) for
+    eliminators of extensible inductives (`I.rec`, `I.recOn`, `I.casesOn`) and
+    compiler-generated matcher splitters (`.match_N` and `._sparseCasesOn_N`).
+
+    For `I.rec`, `I.recOn`, and `I.casesOn`, minor-premise positions are
+    determined directly from `InductiveVal` (`iv.numParams`, `iv.numIndices`,
+    and `iv.ctors`), where minor premise `j` corresponds to `iv.ctors[j]` and
+    receives `statusMap[iv.ctors[j]]`. For `.match_N` and `._sparseCasesOn_N`
+    splitters, the splitter body is eta-expanded to match the `.forallE` arity
+    of `ci.type` when `val` has fewer leading lambdas than `ci.type` has
+    `.forallE` binders; parameter `p` receives status `"candidate:<feat>"` if
+    and only if `p` is referenced in the expanded body and every occurrence of
+    `p` lies inside a `"candidate:<feat>"` minor-premise argument of an
+    eliminator or `ctorElim` call. -/
 def deriveEliminatorParamStatuses (locals : Std.HashMap Name ConstantInfo)
     (statusMap : Std.HashMap Name String) (extensibleInducts : NameSet) :
     Std.HashMap Name (Array String) := Id.run do
   let mut result : Std.HashMap Name (Array String) := {}
-  for (cName, ci) in locals do
+  for (cName, _) in locals do
     let u := (privateToUserName? cName).getD cName
     if let .str indName suffix := u then
       if extensibleInducts.contains indName && ["rec", "recOn", "casesOn"].contains suffix then
         if let some (.inductInfo iv) := locals.get? indName then
-          let ctorSet : NameSet := .ofList iv.ctors
-          let mut cur := ci.type
-          let mut statuses : Array String := #[]
-          while cur.isForall do
-            let .forallE _ dom body _ := cur | break
-            let retDom := dom.getForallBody
-            let mut st := "vetted"
-            if let some lastArg := retDom.getAppArgs.back? then
-              if let .const ctorName _ := lastArg.getAppFn then
-                if ctorSet.contains ctorName then
-                  st := statusMap.getD ctorName "vetted"
-            statuses := statuses.push st
-            cur := body
+          let totalParams := iv.numParams + 1 + iv.numIndices + 1 + iv.ctors.length
+          let minorStart :=
+            if suffix == "rec" then iv.numParams + 1
+            else iv.numParams + iv.numIndices + 2
+          let mut statuses : Array String := Array.replicate totalParams "vetted"
+          for j in [:iv.ctors.length] do
+            let ctorName := iv.ctors[j]!
+            let st := statusMap.getD ctorName "vetted"
+            statuses := statuses.set! (minorStart + j) st
           result := result.insert cName statuses
   let mut changed := true
   while changed do
@@ -685,8 +753,17 @@ def deriveEliminatorParamStatuses (locals : Std.HashMap Name ConstantInfo)
       let u := (privateToUserName? cName).getD cName
       if isMatcherSplitter u && !result.contains cName then
         if let some val := ci.value? (allowOpaque := true) then
-          let numParams := val.getNumHeadLambdas
-          let body := val.getLambdaBody
+          let numForalls := countForalls ci.type
+          let numLambdas := val.getNumHeadLambdas
+          let numParams := if numForalls > numLambdas then numForalls else numLambdas
+          let rawBody := val.getLambdaBody
+          let body :=
+            if numLambdas < numForalls then
+              let k := numForalls - numLambdas
+              let lifted := rawBody.liftLooseBVars 0 k
+              (List.range k).foldl (fun acc i => .app acc (.bvar (k - 1 - i))) lifted
+            else
+              rawBody
           let mut paramStates : Array (Option String) := Array.replicate numParams none
           let mut conflict : Array Bool := Array.replicate numParams false
           let mut pending : List (Nat × String × Expr) := [(0, "vetted", body)]
@@ -927,10 +1004,48 @@ def declarationEdges (ci : ConstantInfo) : IO NameSet := do
   | _ => pure ()
   return result
 
+/-- Return `true` if a declaration with module origin `orig` and trust status
+    `selfStatus` may reference a dependency with trust status `depStatus`
+    outside a `Trusted.candidate` guard.
+
+    Crate declarations (`Mir` and `Proof`) may reference any feature directly
+    (with candidate reachability tracked in Pass 4); `@[vetted]` and `theory/`
+    declarations (`selfStatus == "vetted"`) may reference only `"vetted"`
+    declarations unguarded; and `@[candidate <feat>]` declarations may reference
+    only `"vetted"` or same-feature (`depStatus == selfStatus`) declarations
+    unguarded. -/
+def allowedUnguardedDep (orig : Name) (selfStatus depStatus : String) : Bool :=
+  if orig == `Mir || orig == `Proof then
+    true
+  else if depStatus == "vetted" then
+    true
+  else if selfStatus.startsWith "candidate:" && selfStatus == depStatus then
+    true
+  else if orig == `Trusted.StepResult &&
+      selfStatus == "candidate:step_result" &&
+      depStatus == "candidate:refinement" then
+    true
+  else if orig == `Trusted.MirAst &&
+      selfStatus == "candidate:mir_ast" &&
+      (depStatus == "candidate:refinement" ||
+       depStatus == "candidate:step_result") then
+    true
+  else if orig == `Trusted.MirSemantics &&
+      (selfStatus == "candidate:mir_semantics" ||
+       selfStatus == "candidate:rustc_capture") &&
+      (depStatus == "candidate:refinement" ||
+       depStatus == "candidate:step_result" ||
+       depStatus == "candidate:mir_ast" ||
+       depStatus == "candidate:mir_semantics") then
+    true
+  else
+    false
+
 /-- Return `true` if `rootExpr` contains any `.letE _ t v _ _` binding whose
-    type `t` or value `v` references a non-`"vetted"` constant in
-    `statusMap`. -/
-def hasNonVettedLetE (statusMap : Std.HashMap Name String) (rootExpr : Expr) : IO Bool := do
+    type `t` or value `v` references a constant in `statusMap` disallowed
+    unguarded for `(orig, selfStatus)`. -/
+def hasNonVettedLetE (orig : Name) (selfStatus : String)
+    (statusMap : Std.HashMap Name String) (rootExpr : Expr) : IO Bool := do
   let mut pending := [rootExpr]
   let mut seen : Std.HashSet Expr := {}
   while !pending.isEmpty do
@@ -943,7 +1058,7 @@ def hasNonVettedLetE (statusMap : Std.HashMap Name String) (rootExpr : Expr) : I
         pending := a :: b :: pending
       | .letE _ t v b _ =>
         for dep in (← expressionEdges t) ++ (← expressionEdges v) do
-          if (statusMap.getD dep "vetted") != "vetted" then
+          if !allowedUnguardedDep orig selfStatus (statusMap.getD dep "vetted") then
             return true
         pending := t :: v :: b :: pending
       | .proj _ _ b | .mdata _ b => pending := b :: pending
@@ -966,7 +1081,7 @@ def origin (env : Environment) (n : Name) : IO Name := do
 /-- Compute the transitive kernel dependency closure of `roots` and verify that
     every reachable axiom `n` (`ci.isAxiom`) with defining module `m ←
     provenance n` appears in the locked `foundation` axiom allowlist `axioms`
-    (`{Classical.choice, Quot.sound, propext}`). -/
+    (`{Quot.sound, propext}`). -/
 def closure (lookup : Name → IO ConstantInfo) (provenance : Name → IO Name)
     (axioms : Array (String × String)) (roots : Array Name) : IO (Array Name × Nat) := do
   let mut pending := roots.toList
@@ -984,6 +1099,126 @@ def closure (lookup : Name → IO ConstantInfo) (provenance : Name → IO Name)
         reachedAxioms := reachedAxioms.insert n
       pending := (← declarationEdges ci).toList ++ pending
   return (reachedAxioms.toArray.qsort Name.lt, visited.size)
+
+/-- Extract and verify all `(path, expected)` pairs from the `artifacts` list
+    field of `Mir.crate`.
+
+    When `Trusted.EmittedArtifact.mk` is present in `trustedLocals`:
+    1. Verifies that `Trusted.EmittedArtifact` and `Trusted.EmittedArtifact.mk`
+       originate in `Trusted`, and that `Mir.crate` reduces to a full
+       `Trusted.Crate.mk` constructor application.
+    2. Walks the literal `List.cons`/`List.nil` spine of `Mir.crate`'s final
+       (`artifacts`) field (unfolding any `Mir`-local constant aliases),
+       requiring every element to be a 3-argument `Trusted.EmittedArtifact.mk
+       path contents expected` application where `path`, `contents`, and
+       `expected` are string literals and `contents == expected`.
+    3. Rejects any reference to `Trusted.EmittedArtifact.mk` in `Mir` or `Proof`
+       outside that spine (such as dead `let` bindings or non-`artifacts`
+       fields), and requires at least one `Trusted.EmittedArtifact` to be
+       emitted. -/
+def extractEmittedArtifacts (lookup : Name → IO ConstantInfo)
+    (provenance : Name → IO Name)
+    (locals : Std.HashMap Name ConstantInfo)
+    (trustedLocals : Std.HashMap Name ConstantInfo)
+    (mirCrateCi : ConstantInfo) : IO (Array (String × String)) := do
+  if !trustedLocals.contains `Trusted.EmittedArtifact.mk then
+    return #[]
+  unless trustedLocals.contains `Trusted.EmittedArtifact do
+    fail "Trusted.EmittedArtifact must originate in a Trusted module"
+  let some (.ctorInfo cv) := trustedLocals.get? `Trusted.Crate.mk
+    | fail "Trusted.Crate.mk must originate in a Trusted module"
+  let some crateVal := mirCrateCi.value? (allowOpaque := true)
+    | fail "Mir.crate is missing a definition body"
+  let checkNoArtifactMk (e : Expr) : IO Unit := do
+    if (← expressionEdges e).contains `Trusted.EmittedArtifact.mk then
+      fail "Mir.crate contains unverified Trusted.EmittedArtifact.mk outside its artifacts list spine"
+  checkNoArtifactMk mirCrateCi.type
+  let mut spineConsts : NameSet := NameSet.empty.insert `Mir.crate
+  let mut curExpr := crateVal.consumeMData
+  while curExpr.isConst do
+    let cName := curExpr.constName!
+    if (← provenance cName) == `Mir && !spineConsts.contains cName then
+      spineConsts := spineConsts.insert cName
+      let ci ← lookup cName
+      checkNoArtifactMk ci.type
+      if let some v := ci.value? (allowOpaque := true) then
+        curExpr := v.consumeMData
+      else
+        break
+    else
+      break
+  let fn := curExpr.getAppFn.consumeMData
+  let args := curExpr.getAppArgs
+  unless fn.isConstOf `Trusted.Crate.mk && args.size == cv.numParams + cv.numFields &&
+      cv.numFields >= 1 do
+    checkNoArtifactMk curExpr
+    fail "Mir.crate must reduce to a Trusted.Crate.mk constructor application"
+  for i in [:args.size - 1] do
+    checkNoArtifactMk args[i]!
+  let mut artifacts : Array (String × String) := #[]
+  let mut spineCur := args.back!.consumeMData
+  let mut done := false
+  while !done do
+    while spineCur.isConst do
+      let cName := spineCur.constName!
+      if (← provenance cName) == `Mir && !spineConsts.contains cName then
+        spineConsts := spineConsts.insert cName
+        let ci ← lookup cName
+        checkNoArtifactMk ci.type
+        if let some v := ci.value? (allowOpaque := true) then
+          spineCur := v.consumeMData
+        else
+          break
+      else
+        break
+    let sFn := spineCur.getAppFn.consumeMData
+    let sArgs := spineCur.getAppArgs
+    if sFn.isConstOf ``List.nil && sArgs.size == 1 then
+      checkNoArtifactMk sArgs[0]!
+      done := true
+    else if sFn.isConstOf ``List.cons && sArgs.size == 3 then
+      checkNoArtifactMk sArgs[0]!
+      let mut elemCur := sArgs[1]!.consumeMData
+      while elemCur.isConst do
+        let cName := elemCur.constName!
+        if (← provenance cName) == `Mir && !spineConsts.contains cName then
+          spineConsts := spineConsts.insert cName
+          let ci ← lookup cName
+          checkNoArtifactMk ci.type
+          if let some v := ci.value? (allowOpaque := true) then
+            elemCur := v.consumeMData
+          else
+            break
+        else
+          break
+      let eFn := elemCur.getAppFn.consumeMData
+      let eArgs := elemCur.getAppArgs
+      unless eFn.isConstOf `Trusted.EmittedArtifact.mk do
+        checkNoArtifactMk elemCur
+        fail "Mir.crate artifacts list elements must be Trusted.EmittedArtifact.mk applications"
+      unless eArgs.size == 3 do
+        fail "partially or over-applied Trusted.EmittedArtifact.mk in Mir.crate"
+      let .lit (.strVal path) := eArgs[0]!.consumeMData
+        | fail "Trusted.EmittedArtifact path and expected fields in Mir.crate must be string literals"
+      let .lit (.strVal contents) := eArgs[1]!.consumeMData
+        | fail "Trusted.EmittedArtifact path and expected fields in Mir.crate must be string literals"
+      let .lit (.strVal expected) := eArgs[2]!.consumeMData
+        | fail "Trusted.EmittedArtifact path and expected fields in Mir.crate must be string literals"
+      unless contents == expected do
+        fail "Mir.crate contains an EmittedArtifact whose contents and expected literals differ"
+      artifacts := artifacts.push (path, expected)
+      spineCur := sArgs[2]!.consumeMData
+    else
+      checkNoArtifactMk spineCur
+      fail "Mir.crate artifacts field must be a literal List of Trusted.EmittedArtifact.mk applications"
+  for (cName, ci) in locals do
+    let m ← provenance cName
+    if (m == `Mir || m == `Proof) && !spineConsts.contains cName then
+      if (← declarationEdges ci).contains `Trusted.EmittedArtifact.mk then
+        fail "Mir.crate contains unverified Trusted.EmittedArtifact.mk outside its artifacts list spine"
+  if artifacts.isEmpty then
+    fail "Mir.crate must emit at least one Trusted.EmittedArtifact"
+  return artifacts
 
 /-- Parse the `"trustDeclarations"` table produced by `"preflight"` into a map
     from `Name` to trust status (`"vetted"` or `"candidate:<feature>"`),
@@ -1019,87 +1254,94 @@ def classifyTrustedConstant (declMap : Std.HashMap Name String) (cName : Name) :
 
 /-- Enforce the non-contamination boundary between `@[vetted]` and
     `@[candidate <feature>]` declarations across all compiled `locals`, and
-    return `(autoHelpers, allowedInInductHelperOwners, elimStatuses, scopedMap)`
-    for candidate feature reachability.
+    return `(autoHelpers, allowedInInductHelperOwners, elimStatuses, scopedMap,
+    eqThmCandidateFeats)` for candidate feature reachability.
 
-    1. **Candidate constructors of `@[vetted]` inductives:**
-       If constructor `cName` of a `@[vetted]` inductive `v.induct` has status
-       `candidate:<feat>`, its field types (`ci.type`) may reference only
-       `vetted` declarations or `candidate:<feat>` inductive types and
+    1. **Candidate constructors of extensible inductives:**
+       If constructor `cName` of an inductive `v.induct` has status
+       `ctorStatus == "candidate:<feat>"` with `ctorStatus != indStatus`, its
+       field types (`ci.type`) may reference only dependencies permitted by
+       `allowedUnguardedDep` for `indStatus` or `ctorStatus` inductive types and
        constructors (never a different candidate feature or a non-inductive
        candidate declaration) and may not use `Trusted.candidate`. `v.induct`
        is recorded in `extensibleInducts`, and `cName` together with any
-       `candidate:<feat>` inductive owners in `ci.type` are added to
+       `ctorStatus` inductive owners in `ci.type` are added to
        `allowedInInductHelperOwners`.
     2. **Eliminator parameter statuses (`deriveEliminatorParamStatuses`):**
        Assigns per-parameter trust statuses to `I.rec`, `I.recOn`, `I.casesOn`,
        and compiler-generated `.match_N` / `._sparseCasesOn_N` splitters, and
        verifies across every eliminator's `.forallE` type telescope that
-       non-`vetted` constants appear only inside `"candidate:<feat>"`
-       minor-premise parameter domains (and belong to
-       `allowedInInductHelperOwners` for `<feat>`).
-    3. **Unified scoped-edge check (`extractScopedEdges`):**
-       - Extensible inductives, their compiler-generated inductive helpers
-         (`isExtensibleInductHelper`), and extensible-inductive matcher
-         splitters (`autoHelpers`) may not use `Trusted.candidate`, may not
-         contain non-`vetted` `.letE` bindings, and may reference only `vetted`
-         constants or declarations whose owner is in
-         `allowedInInductHelperOwners`.
-       - Every other non-equational-theorem declaration in `locals` (whether
-         `@[vetted]`, `@[candidate <feat>]`, `theory/`, `Mir`, or `Proof`) must
-         have a guard-free type (`extractScopedEdges {} {} ci.type`) and a
-         well-scoped body (`extractScopedEdges elimStatuses {} val`) whose minor
-         premise binder domains (`binderDoms[feat]`) reference only `vetted` or
-         `allowedInInductHelperOwners` for `feat` and whose
-         `Trusted.candidate "<feat>"` bodies (`guarded[feat]`) reference only
-         `vetted` or `candidate:<feat>` constants. When the declaration itself
-         belongs to `Trusted.*` (`selfStatus`), all unguarded dependencies in
-         `typeEdges` and `valEdges` (plus `ci.all`) must be `"vetted"` or
-         `selfStatus`. -/
+       dependencies not permitted unguarded for the eliminator's own status
+       appear only inside `"candidate:<feat>"` minor-premise parameter domains
+       (and belong to `allowedInInductHelperOwners` for `<feat>`).
+    3. **Unified scoped-edge and equational-theorem check (`extractScopedEdges`):**
+       - Computes `eqThmCandidateFeats` for every compiler-generated equational
+         theorem (`isCompilerEqThm normToRaw`), attributing to the equational
+         theorem its owner's candidate status, guarded features, unguarded
+         candidate dependencies, and direct candidate dependencies.
+       - Verifies that extensible inductives, their compiler-generated inductive
+         helpers (`isExtensibleInductHelper`), and extensible-inductive matcher
+         splitters (`autoHelpers`) do not use `Trusted.candidate`, do not
+         contain disallowed `.letE` bindings, and reference only dependencies
+         permitted unguarded or belonging to `allowedInInductHelperOwners`.
+       - Verifies that every other non-equational-theorem declaration in
+         `locals` has a guard-free type (`extractScopedEdges {} {} ci.type`) and
+         a well-scoped body (`extractScopedEdges elimStatuses {} val`) whose
+         minor-premise binder domains (`binderDoms[feat]`), guarded branches
+         (`guarded[feat]`), and unguarded `Trusted` dependencies respect
+         `effFeatsOf` (including references through compiler equational
+         theorems). -/
 def checkTrustedNonContamination (locals : Std.HashMap Name ConstantInfo)
     (trustedLocals : Std.HashMap Name ConstantInfo)
+    (origMap : Std.HashMap Name Name)
     (statusMap : Std.HashMap Name String)
-    (ownerMap : Std.HashMap Name Name) :
-    IO (NameSet × NameSet × Std.HashMap Name (Array String) × Std.HashMap Name ScopedEdges) := do
-  -- Pass 1: Index `@[candidate <feat>]` constructors of `@[vetted]` inductives
-  -- and validate that their field types reference only `@[vetted]` declarations
-  -- or `@[candidate <feat>]` inductive types.
+    (ownerMap : Std.HashMap Name Name)
+    (normToRaw : Std.HashMap Name Name) :
+    IO (NameSet × NameSet × Std.HashMap Name (Array String) ×
+        Std.HashMap Name ScopedEdges × Std.HashMap Name (Std.HashSet String)) := do
+  -- Pass 1: Index `@[candidate <feat>]` constructors whose status differs from
+  -- their parent inductive `v.induct` and validate that their field types
+  -- reference only dependencies allowed for `indStatus` or `ctorStatus`
+  -- inductive types.
   let mut extensibleInducts : NameSet := {}
   let mut allowedInInductHelperOwners : NameSet := {}
   for (cName, ci) in trustedLocals do
     if let .ctorInfo v := ci then
       let _ ← extractScopedEdges {} {} ci.type
-      if statusMap.get? v.induct == some "vetted" then
-        let ctorStatus := statusMap.getD cName "vetted"
-        if ctorStatus.startsWith "candidate:" then
-          extensibleInducts := extensibleInducts.insert v.induct
-          allowedInInductHelperOwners := allowedInInductHelperOwners.insert cName
-          for dep in (← expressionEdges ci.type) do
-            if let some depStatus := statusMap.get? dep then
-              if depStatus != "vetted" && depStatus != ctorStatus then
-                fail s!"candidate constructor {cName} ({ctorStatus}) of vetted inductive {v.induct} references {dep} ({depStatus}) in its type"
-              if depStatus == ctorStatus then
-                let depOwner := ownerMap.getD dep dep
-                match trustedLocals.get? depOwner with
-                | some (.inductInfo iv) =>
-                  allowedInInductHelperOwners := allowedInInductHelperOwners.insert depOwner
-                  for ctor in iv.ctors do
-                    allowedInInductHelperOwners := allowedInInductHelperOwners.insert ctor
-                | some (.ctorInfo cv) =>
-                  allowedInInductHelperOwners :=
-                    (allowedInInductHelperOwners.insert depOwner).insert cv.induct
-                | _ =>
-                  fail s!"candidate constructor {cName} ({ctorStatus}) of vetted inductive {v.induct} references non-inductive declaration {dep} in its type"
+      let orig := origMap.getD cName .anonymous
+      let indStatus := statusMap.getD v.induct "vetted"
+      let ctorStatus := statusMap.getD cName indStatus
+      if ctorStatus.startsWith "candidate:" && ctorStatus != indStatus then
+        extensibleInducts := extensibleInducts.insert v.induct
+        allowedInInductHelperOwners := allowedInInductHelperOwners.insert cName
+        for dep in (← expressionEdges ci.type) do
+          if let some depStatus := statusMap.get? dep then
+            if !allowedUnguardedDep orig indStatus depStatus && depStatus != ctorStatus then
+              fail s!"candidate constructor {cName} ({ctorStatus}) of inductive {v.induct} ({indStatus}) references {dep} ({depStatus}) in its type"
+            if !allowedUnguardedDep orig indStatus depStatus && depStatus == ctorStatus then
+              let depOwner := ownerMap.getD dep dep
+              match trustedLocals.get? depOwner with
+              | some (.inductInfo iv) =>
+                allowedInInductHelperOwners := allowedInInductHelperOwners.insert depOwner
+                for ctor in iv.ctors do
+                  allowedInInductHelperOwners := allowedInInductHelperOwners.insert ctor
+              | some (.ctorInfo cv) =>
+                allowedInInductHelperOwners :=
+                  (allowedInInductHelperOwners.insert depOwner).insert cv.induct
+              | _ =>
+                fail s!"candidate constructor {cName} ({ctorStatus}) of inductive {v.induct} ({indStatus}) references non-inductive declaration {dep} in its type"
   let elimStatuses := deriveEliminatorParamStatuses locals statusMap extensibleInducts
   for (elimName, paramStatuses) in elimStatuses do
     if let some elimCi := locals.get? elimName then
+      let orig := origMap.getD elimName .anonymous
+      let selfStatus := statusMap.getD elimName "vetted"
       let _ ← extractScopedEdges {} {} elimCi.type
       let mut cur := elimCi.type
       for pStatus in paramStatuses do
         if let .forallE _ dom body _ := cur then
           for dep in (← extractScopedEdges {} {} dom (checkClosed := false)).unguarded do
             if let some depStatus := statusMap.get? dep then
-              if depStatus != "vetted" then
+              if !allowedUnguardedDep orig selfStatus depStatus then
                 let depOwner := ownerMap.getD dep dep
                 if !(pStatus.startsWith "candidate:" && depStatus == pStatus &&
                     allowedInInductHelperOwners.contains depOwner) then
@@ -1107,14 +1349,17 @@ def checkTrustedNonContamination (locals : Std.HashMap Name ConstantInfo)
           cur := body
       for dep in (← extractScopedEdges {} {} cur (checkClosed := false)).unguarded do
         if let some depStatus := statusMap.get? dep then
-          if depStatus != "vetted" then
+          if !allowedUnguardedDep orig selfStatus depStatus then
             fail s!"eliminator {elimName} return type references {dep} ({depStatus})"
-  -- Pass 2: Verify every non-equational-theorem declaration in `locals` and
-  -- record `scopedMap` and guarded features per owner.
+  -- Pass 2: Extract scoped edges for every non-equational-theorem declaration
+  -- in `locals` and record `scopedMap` and guarded features per owner.
   let mut autoHelpers : NameSet := {}
   let mut scopedMap : Std.HashMap Name ScopedEdges := {}
+  let mut valEdgesMap : Std.HashMap Name (ScopedEdges × ScopedEdges) := {}
   let mut ownerGuardedFeats : Std.HashMap Name (Std.HashSet String) := {}
   for (cName, ci) in locals do
+    let orig := origMap.getD cName .anonymous
+    let selfStatus := statusMap.getD cName "vetted"
     let userName := (privateToUserName? cName).getD cName
     let isInductOrRec :=
       (ci.isInductive && extensibleInducts.contains cName)
@@ -1133,18 +1378,19 @@ def checkTrustedNonContamination (locals : Std.HashMap Name ConstantInfo)
           pure deps
       let touchesExtInduct :=
         (deps ++ parentDeps).toList.any (extensibleInducts.contains ·)
-      let allVetted :=
-        deps.toList.all fun dep => (statusMap.getD dep "vetted") == "vetted"
+      let allAllowed :=
+        deps.toList.all fun dep =>
+          allowedUnguardedDep orig selfStatus (statusMap.getD dep "vetted")
       let onlyAllowedNonVetted :=
-        allVetted ||
+        allAllowed ||
           (elimStatuses.contains parentName &&
             deps.toList.all fun dep =>
-              (statusMap.getD dep "vetted") == "vetted" ||
+              allowedUnguardedDep orig selfStatus (statusMap.getD dep "vetted") ||
                 allowedInInductHelperOwners.contains (ownerMap.getD dep dep))
-      let badTypeLet ← hasNonVettedLetE statusMap ci.type
+      let badTypeLet ← hasNonVettedLetE orig selfStatus statusMap ci.type
       let badValLet ←
         match ci.value? (allowOpaque := true) with
-        | some val => hasNonVettedLetE statusMap val
+        | some val => hasNonVettedLetE orig selfStatus statusMap val
         | none => pure false
       if touchesExtInduct && onlyAllowedNonVetted && !badTypeLet && !badValLet then
         isExtSplitter := true
@@ -1153,47 +1399,21 @@ def checkTrustedNonContamination (locals : Std.HashMap Name ConstantInfo)
       let _ ← extractScopedEdges {} {} ci.type
       if let some val := ci.value? (allowOpaque := true) then
         let _ ← extractScopedEdges {} {} val
-      if let some selfStatus := statusMap.get? cName then
-        for dep in (← declarationEdges ci) do
-          if let some depStatus := statusMap.get? dep then
-            let depOwner := ownerMap.getD dep dep
-            if depStatus != "vetted" && depStatus != selfStatus &&
-                !(selfStatus == "vetted" && allowedInInductHelperOwners.contains depOwner) then
-              fail s!"{selfStatus} helper {cName} references {depStatus} declaration {dep} without a Trusted.candidate guard"
-    else if !isCompilerEqThm locals cName ci then
+    else if !isCompilerEqThm normToRaw cName ci then
       let typeEdges ← extractScopedEdges {} {} ci.type
       let valEdges ←
         match ci.value? (allowOpaque := true) with
         | some val => extractScopedEdges elimStatuses {} val
         | none => pure {}
-      for (feat, domDeps) in valEdges.binderDoms do
-        let expectedStatus := s!"candidate:{feat}"
-        for dep in domDeps do
-          if let some depStatus := statusMap.get? dep then
-            let depOwner := ownerMap.getD dep dep
-            if depStatus != "vetted" &&
-                !(depStatus == expectedStatus && allowedInInductHelperOwners.contains depOwner) then
-              fail s!"declaration {cName} references {dep} ({depStatus}) in minor-premise binder domain"
-      for (feat, bodyDeps) in valEdges.guarded do
-        let expectedStatus := s!"candidate:{feat}"
-        for dep in bodyDeps do
-          if let some depStatus := statusMap.get? dep then
-            if depStatus != "vetted" && depStatus != expectedStatus then
-              fail s!"Trusted.candidate \"{feat}\" branch in {cName} references {dep} ({depStatus})"
-      if let some selfStatus := statusMap.get? cName then
-        for dep in typeEdges.unguarded do
-          if let some depStatus := statusMap.get? dep then
-            if depStatus != "vetted" && depStatus != selfStatus then
-              fail s!"{selfStatus} declaration {cName} references {depStatus} declaration {dep} in its type"
-        for dep in valEdges.unguarded ++ NameSet.ofList ci.all do
-          if let some depStatus := statusMap.get? dep then
-            if depStatus != "vetted" && depStatus != selfStatus then
-              fail s!"{selfStatus} declaration {cName} references {depStatus} declaration {dep} without a Trusted.candidate guard"
+      valEdgesMap := valEdgesMap.insert cName (typeEdges, valEdges)
       let owner := ownerMap.getD cName userName
       let mut guardedFeats := ownerGuardedFeats.getD owner {}
+      let mut rawGuardedFeats := ownerGuardedFeats.getD cName {}
       for (feat, _) in valEdges.guarded do
         guardedFeats := guardedFeats.insert feat
-      ownerGuardedFeats := ownerGuardedFeats.insert owner guardedFeats
+        rawGuardedFeats := rawGuardedFeats.insert feat
+      ownerGuardedFeats :=
+        (ownerGuardedFeats.insert owner guardedFeats).insert cName rawGuardedFeats
       let extraDeps ←
         if (ci.value? (allowOpaque := true)).isSome then
           pure (NameSet.ofList ci.all)
@@ -1203,54 +1423,132 @@ def checkTrustedNonContamination (locals : Std.HashMap Name ConstantInfo)
         valEdges with
         unguarded := typeEdges.unguarded ++ valEdges.unguarded ++ extraDeps
       }
-  -- Pass 3: Verify compiler-generated equational theorems (`_eq_N`, `eq_N`,
-  -- `_congr_simp`, `_unfold`) against their owner's guarded feature set.
+  -- Pass 3: Compute candidate feature sets for compiler-generated equational
+  -- theorems (`_eq_N`, `eq_N`, `eq_def`, `_congr_simp`, `_unfold`) and verify
+  -- both equational theorems and non-equational declarations against
+  -- `effFeatsOf`.
+  let mut eqThmCandidateFeats : Std.HashMap Name (Std.HashSet String) := {}
   for (cName, ci) in locals do
-    if isCompilerEqThm locals cName ci then
-      let parentUser := (privateToUserName? cName.getPrefix).getD cName.getPrefix
-      let owner := ownerMap.getD cName parentUser
-      let guardedFeats := ownerGuardedFeats.getD owner {}
+    if isCompilerEqThm normToRaw cName ci then
+      let rawOwner := (resolveEqOwner normToRaw cName).getD cName.getPrefix
+      let ownerUser :=
+        ownerMap.getD rawOwner ((privateToUserName? rawOwner).getD rawOwner)
+      let mut feats : Std.HashSet String := {}
+      let ownerStatus := statusMap.getD rawOwner "vetted"
+      if ownerStatus.startsWith "candidate:" then
+        feats := feats.insert (ownerStatus.drop 10).toString
+      for f in ownerGuardedFeats.getD ownerUser {} do
+        feats := feats.insert f
+      for f in ownerGuardedFeats.getD rawOwner {} do
+        feats := feats.insert f
+      if let some edges := scopedMap.get? rawOwner then
+        for uDep in edges.unguarded do
+          let uSt := statusMap.getD uDep "vetted"
+          if uSt.startsWith "candidate:" then
+            feats := feats.insert (uSt.drop 10).toString
+      let guardedFeats := feats
+      let orig := origMap.getD cName .anonymous
       let selfStatus := statusMap.getD cName "vetted"
       for dep in (← declarationEdges ci) do
-        if let some depStatus := statusMap.get? dep then
-          let depOwner := ownerMap.getD dep dep
-          if depStatus != "vetted" && depStatus != selfStatus &&
+        let depStatus := statusMap.getD dep "vetted"
+        let depOwner := ownerMap.getD dep dep
+        if depStatus.startsWith "candidate:" then
+          let feat := (depStatus.drop 10).toString
+          if !allowedInInductHelperOwners.contains depOwner then
+            feats := feats.insert feat
+          if !allowedUnguardedDep orig selfStatus depStatus &&
               !allowedInInductHelperOwners.contains depOwner then
-            let feat := (depStatus.drop 10).toString
-            unless depStatus.startsWith "candidate:" && guardedFeats.contains feat do
-              fail s!"{selfStatus} equational theorem {cName} references {dep} ({depStatus})"
-  return (autoHelpers, allowedInInductHelperOwners, elimStatuses, scopedMap)
+            unless guardedFeats.contains feat do
+              fail s!"equational theorem {cName} ({selfStatus}) references {dep} ({depStatus})"
+      eqThmCandidateFeats := eqThmCandidateFeats.insert cName feats
+  let effFeatsOf (dep : Name) : Std.HashSet String :=
+    if let some eqFeats := eqThmCandidateFeats.get? dep then
+      eqFeats
+    else
+      let st := statusMap.getD dep "vetted"
+      if st.startsWith "candidate:" then
+        Std.HashSet.emptyWithCapacity.insert (st.drop 10).toString
+      else
+        {}
+  for cName in autoHelpers do
+    if let some ci := locals.get? cName then
+      let orig := origMap.getD cName .anonymous
+      let selfStatus := statusMap.getD cName "vetted"
+      if trustedLocals.contains cName then
+        for dep in (← declarationEdges ci) do
+          let depOwner := ownerMap.getD dep dep
+          for depFeat in effFeatsOf dep do
+            let depStatus := s!"candidate:{depFeat}"
+            if !allowedUnguardedDep orig selfStatus depStatus &&
+                !allowedInInductHelperOwners.contains depOwner then
+              fail s!"helper {cName} ({selfStatus}) references {depStatus} declaration {dep} without a Trusted.candidate guard"
+  for (cName, (typeEdges, valEdges)) in valEdgesMap do
+    if let some ci := locals.get? cName then
+      let orig := origMap.getD cName .anonymous
+      let selfStatus := statusMap.getD cName "vetted"
+      for (feat, domDeps) in valEdges.binderDoms do
+        for dep in domDeps do
+          if eqThmCandidateFeats.contains dep then
+            fail s!"declaration {cName} references equational theorem {dep} in minor-premise binder domain"
+          let depOwner := ownerMap.getD dep dep
+          for depFeat in effFeatsOf dep do
+            let depStatus := s!"candidate:{depFeat}"
+            if !allowedUnguardedDep orig selfStatus depStatus &&
+                !(depFeat == feat && allowedInInductHelperOwners.contains depOwner) then
+              fail s!"declaration {cName} references {dep} ({depStatus}) in minor-premise binder domain"
+      for (feat, bodyDeps) in valEdges.guarded do
+        for dep in bodyDeps do
+          for depFeat in effFeatsOf dep do
+            let depStatus := s!"candidate:{depFeat}"
+            if depFeat != feat && !allowedUnguardedDep orig selfStatus depStatus then
+              fail s!"Trusted.candidate \"{feat}\" branch in {cName} references {dep} ({depStatus})"
+      if trustedLocals.contains cName then
+        for dep in typeEdges.unguarded do
+          for depFeat in effFeatsOf dep do
+            let depStatus := s!"candidate:{depFeat}"
+            if !allowedUnguardedDep orig selfStatus depStatus then
+              fail s!"declaration {cName} ({selfStatus}) references {depStatus} declaration {dep} in its type"
+        for dep in valEdges.unguarded ++ NameSet.ofList ci.all do
+          for depFeat in effFeatsOf dep do
+            let depStatus := s!"candidate:{depFeat}"
+            if !allowedUnguardedDep orig selfStatus depStatus then
+              fail s!"declaration {cName} ({selfStatus}) references {depStatus} declaration {dep} without a Trusted.candidate guard"
+  return (autoHelpers, allowedInInductHelperOwners, elimStatuses, scopedMap, eqThmCandidateFeats)
 
 /-- Compute the sorted list of candidate-trusted features (`@[candidate
     <feat>]`) actively reached by a crate's verification closure (`roots`,
-    comprising all declarations in `Mir` and `Proof`).
+    comprising all non-equational declarations in `Mir` and `Proof`).
 
     Why reachability is demand-driven across `Trusted.candidate "<feat>"`
     guards:
-    - A `@[vetted]` or `theory/` definition or theorem may pattern-match on a
-      `@[vetted]` inductive that has both `@[vetted]` constructors and
+    - A `@[vetted]` or `theory/` definition or theorem may pattern-match on an
+      extensible inductive that has both `@[vetted]` constructors and
       `@[candidate <feat>]` constructors (with the latter arms wrapped in
       `Trusted.candidate "<feat>" body`).
     - When `collectActiveCandidateFeatures` visits a declaration in `scopedMap`,
       it immediately traverses `edges.unguarded`, while deferring
       `edges.deferred` subexpressions (`(feat, subExpr)`) unless `feat` is in
-      `activeFeats`. When visiting an extensible inductive, recursor, or
-      verified extensible-inductive matcher splitter in `autoHelpers`, it skips
+      `activeFeats`. Even when a visited declaration is itself `@[candidate
+      <featA>]`, its body is traversed via `scopedMap` (rather than blindly
+      taking `declarationEdges ci`) so that a guarded `Trusted.candidate
+      "<featB>"` branch inside it does not prematurely activate `<featB>`.
+    - When visiting an extensible inductive, recursor, or verified
+      extensible-inductive matcher splitter in `autoHelpers`, it skips
       declarations whose owner is in `allowedInInductHelperOwners` so that
       merely mentioning or matching on the inductive type does not activate its
       candidate constructors.
-    - If `Mir`, `Proof`, or any already-active dependency directly references a
-      `candidate:<feat>` constructor or declaration, `<feat>` is inserted into
-      `activeFeats`, releasing all deferred `<feat>` branch expressions (which
-      are themselves traversed via `extractScopedEdges elimStatuses activeFeats`
-      so nested guards for other features remain deferred until those features
-      become active). -/
+    - When visiting a compiler-generated equational theorem (`isCompilerEqThm`),
+      all candidate features in `eqThmCandidateFeats[n]` are activated and its
+      owning declaration is enqueued, ensuring that rewriting with `foo._eq_1`
+      activates the guarded candidate features of `foo`. -/
 def collectActiveCandidateFeatures (lookup : Name → IO ConstantInfo)
     (provenance : Name → IO Name) (trusted : Array Name)
     (statusMap : Std.HashMap Name String) (ownerMap : Std.HashMap Name Name)
+    (normToRaw : Std.HashMap Name Name)
     (autoHelpers : NameSet) (allowedInInductHelperOwners : NameSet)
     (elimStatuses : Std.HashMap Name (Array String))
     (scopedMap : Std.HashMap Name ScopedEdges)
+    (eqThmCandidateFeats : Std.HashMap Name (Std.HashSet String))
     (roots : Array Name) : IO (Array String) := do
   let mut pending := roots.toList
   let mut pendingExprs : List Expr := []
@@ -1285,11 +1583,22 @@ def collectActiveCandidateFeatures (lookup : Name → IO ConstantInfo)
               deferred := deferred.erase feat
               for b in bodies do
                 pendingExprs := b :: pendingExprs
-          pending := (← declarationEdges ci).toList ++ pending
-        else if autoHelpers.contains n then
+        if autoHelpers.contains n then
           for dep in (← declarationEdges ci) do
             if !allowedInInductHelperOwners.contains (ownerMap.getD dep dep) then
               pending := dep :: pending
+        else if isCompilerEqThm normToRaw n ci then
+          for eqFeat in eqThmCandidateFeats.getD n {} do
+            if !activeFeats.contains eqFeat then
+              activeFeats := activeFeats.insert eqFeat
+              if let some bodies := deferred.get? eqFeat then
+                deferred := deferred.erase eqFeat
+                for b in bodies do
+                  pendingExprs := b :: pendingExprs
+          if let some rawOwner := resolveEqOwner normToRaw n then
+            pending := rawOwner :: pending
+          for dep in (← declarationEdges ci) do
+            pending := dep :: pending
         else if let some edges := scopedMap.get? n then
           pending := edges.unguarded.toList ++ pending
           for (feat, subExpr) in edges.deferred do
@@ -1300,8 +1609,7 @@ def collectActiveCandidateFeatures (lookup : Name → IO ConstantInfo)
               deferred := deferred.insert feat (prev.push subExpr)
         else
           for dep in (← declarationEdges ci) do
-            if !allowedInInductHelperOwners.contains (ownerMap.getD dep dep) then
-              pending := dep :: pending
+            pending := dep :: pending
   return activeFeats.toArray.qsort (· < ·)
 
 /-- Verify module allowlists, declaration provenance, and the absence of axioms
@@ -1414,6 +1722,8 @@ def audit (j : Json) (env : Environment) (foundation : Array Name)
   let (locals, extraNames) ← verifyAndCollectLocals env foundation trusted allowedAll
   let lookup n := match env.checked.get.find? n with
     | some ci => pure ci | none => fail s!"missing dependency declaration {n}"
+  let normToRaw := buildNormToRaw locals
+  let mut origMap : Std.HashMap Name Name := {}
   let mut trustedLocals : Std.HashMap Name ConstantInfo := {}
   let mut statusMap : Std.HashMap Name String := {}
   let mut ownerMap : Std.HashMap Name Name := {}
@@ -1425,6 +1735,7 @@ def audit (j : Json) (env : Environment) (foundation : Array Name)
   for (cName, ci) in locals do
     allLocalRoots := allLocalRoots.push cName
     let orig ← origin env cName
+    origMap := origMap.insert cName orig
     if trusted.contains orig then
       let (trustStatus, ownerName) ← classifyTrustedConstant declMap cName
       let userName := (privateToUserName? cName).getD cName
@@ -1438,13 +1749,13 @@ def audit (j : Json) (env : Environment) (foundation : Array Name)
         ("name", toJson cName), ("module", toJson orig), ("kind", toJson (kind ci)),
         ("trustStatus", toJson trustStatus),
         ("dependencies", toJson ((← declarationEdges ci).toArray.qsort Name.lt))]
-    else if orig == `Mir || orig == `Proof then
+    else if (orig == `Mir || orig == `Proof) && !isCompilerEqThm normToRaw cName ci then
       crateRoots := crateRoots.push cName
   for (declKey, _) in declMap do
     unless matchedDeclKeys.contains declKey do
       fail s!"unmatched trust declaration {declKey}"
-  let (autoHelpers, allowedInInductHelperOwners, elimStatuses, scopedMap) ←
-    checkTrustedNonContamination locals trustedLocals statusMap ownerMap
+  let (autoHelpers, allowedInInductHelperOwners, elimStatuses, scopedMap, eqThmCandidateFeats) ←
+    checkTrustedNonContamination locals trustedLocals origMap statusMap ownerMap normToRaw
   let (allAxioms, allVisited) ← closure lookup (origin env) axiomPolicy allLocalRoots
   let report ←
     if !hasCrate then
@@ -1469,7 +1780,7 @@ def audit (j : Json) (env : Environment) (foundation : Array Name)
       let expectedCrateType := Expr.const `Trusted.Crate []
       unless mirCrateCi.type == expectedCrateType do
         fail s!"Mir.crate has type {mirCrateCi.type}, expected Trusted.Crate"
-      let _ ← closure lookup (origin env) #[] #[`Mir.crate]
+      let _ ← closure lookup (origin env) axiomPolicy #[`Mir.crate]
       let some proofCi := env.checked.get.find? `Proof.verify_crate
         | fail "missing required theorem Proof.verify_crate in Proof"
       unless (← origin env `Proof.verify_crate) == `Proof do fail "Proof.verify_crate must originate in module Proof"
@@ -1479,10 +1790,13 @@ def audit (j : Json) (env : Environment) (foundation : Array Name)
       let expectedTheoremType := Expr.app (Expr.const `Trusted.CrateTheorem []) (Expr.const `Mir.crate [])
       unless proofCi.type == expectedTheoremType do
         fail s!"Proof.verify_crate has type {proofCi.type}, expected Trusted.CrateTheorem Mir.crate"
+      let emittedArtifacts ←
+        extractEmittedArtifacts lookup (origin env) locals trustedLocals mirCrateCi
       let (crateAxioms, crateVisited) ← closure lookup (origin env) axiomPolicy #[`Proof.verify_crate]
       let candidateFeatures ←
         collectActiveCandidateFeatures lookup (origin env) trusted statusMap
-          ownerMap autoHelpers allowedInInductHelperOwners elimStatuses scopedMap crateRoots
+          ownerMap normToRaw autoHelpers allowedInInductHelperOwners
+          elimStatuses scopedMap eqThmCandidateFeats crateRoots
       pure <| Json.mkObj [
         ("verifiedTheorem", toJson "Proof.verify_crate"),
         ("expectedType", toJson "Trusted.CrateTheorem Mir.crate"),
@@ -1490,6 +1804,7 @@ def audit (j : Json) (env : Environment) (foundation : Array Name)
         ("reachableDeclarations", toJson crateVisited),
         ("axioms", toJson crateAxioms),
         ("candidateFeatures", toJson candidateFeatures),
+        ("emittedArtifacts", toJson emittedArtifacts),
         ("replay", toJson true)]
   -- Replay all non-foundation constants from scratch in a clean kernel
   -- environment containing only `foundation` (`Init.*`).

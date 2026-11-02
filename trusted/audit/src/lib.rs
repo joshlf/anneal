@@ -73,7 +73,8 @@
 //! 5. **Zero custom axioms, kernel replay, and candidate-feature gating
 //!    ([`Checker::verify_crate_with_policy`]):** All non-foundation constants
 //!    are replayed from scratch through `base.toKernelEnv.replay` with only
-//!    `{Classical.choice, Quot.sound, propext}` permitted, and any candidate
+//!    `{Quot.sound, propext}` permitted, every `Trusted.EmittedArtifact` in
+//!    `Mir.crate` is verified byte-for-byte against disk, and any candidate
 //!    features reached by `Mir` or `Proof` are checked against the active
 //!    [`ReleaseChannel`] and [`CrateTrustPolicy`].
 
@@ -459,6 +460,112 @@ fn is_lean_ident(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Verify on disk that every `(rel_path, expected)` pair extracted from
+/// `Trusted.EmittedArtifact.mk` applications in `Mir.crate` resolves to a
+/// regular file inside `crate_root` whose raw bytes match `expected`
+/// byte-for-byte.
+fn verify_emitted_artifacts(
+    crate_root: &Path,
+    artifacts: &[(String, String)],
+) -> Result<(), Failure> {
+    let phase = "artifact-check";
+    for (rel_path, expected) in artifacts {
+        if rel_path.is_empty() || rel_path.contains('\\') {
+            return Err(Failure::new(
+                1,
+                phase,
+                format!("invalid emitted artifact path: {rel_path}"),
+            ));
+        }
+        let rel = Path::new(rel_path);
+        let components: Vec<std::path::Component<'_>> =
+            rel.components().collect();
+        if components.is_empty() {
+            return Err(Failure::new(
+                1,
+                phase,
+                format!("invalid emitted artifact path: {rel_path}"),
+            ));
+        }
+        let mut cur = crate_root.to_path_buf();
+        for (idx, comp) in components.iter().enumerate() {
+            let std::path::Component::Normal(seg) = comp else {
+                return Err(Failure::new(
+                    1,
+                    phase,
+                    format!(
+                        "emitted artifact path must be a normalized crate-relative path: {rel_path}"
+                    ),
+                ));
+            };
+            cur.push(seg);
+            let meta = fs::symlink_metadata(&cur).map_err(|e| {
+                Failure::new(
+                    1,
+                    phase,
+                    format!(
+                        "missing or unreadable emitted artifact {rel_path}: {e}"
+                    ),
+                )
+            })?;
+            if meta.file_type().is_symlink() {
+                return Err(Failure::new(
+                    1,
+                    phase,
+                    format!(
+                        "symlinked emitted artifact path is forbidden: {rel_path}"
+                    ),
+                ));
+            }
+            let is_last = idx + 1 == components.len();
+            if is_last && !meta.file_type().is_file() {
+                return Err(Failure::new(
+                    1,
+                    phase,
+                    format!(
+                        "emitted artifact is not a regular file: {rel_path}"
+                    ),
+                ));
+            }
+            if !is_last && !meta.file_type().is_dir() {
+                return Err(Failure::new(
+                    1,
+                    phase,
+                    format!(
+                        "invalid directory component in emitted artifact path: {rel_path}"
+                    ),
+                ));
+            }
+        }
+        let actual_bytes = fs::read(&cur).map_err(|e| {
+            Failure::new(
+                1,
+                phase,
+                format!("cannot read emitted artifact {rel_path}: {e}"),
+            )
+        })?;
+        if actual_bytes != expected.as_bytes() {
+            return Err(Failure::new(
+                1,
+                phase,
+                format!(
+                    "emitted artifact {rel_path} on disk does not match expected contents in Mir.crate"
+                ),
+            ));
+        }
+    }
+    if !artifacts.is_empty()
+        && !artifacts.iter().any(|(rel, _)| rel == "src/lib.rs")
+    {
+        return Err(Failure::new(
+            1,
+            phase,
+            "Mir.crate emittedArtifacts must include src/lib.rs",
+        ));
+    }
+    Ok(())
+}
+
 /// Reject `.cargo*`, `rust-toolchain*`, and `.gitmodules` overrides at the
 /// repository root (including case-insensitive directory entries).
 fn reject_cargo_toolchain_overrides(checkout: &Path) -> Result<(), Failure> {
@@ -506,9 +613,16 @@ fn reject_cargo_toolchain_overrides(checkout: &Path) -> Result<(), Failure> {
 /// present.
 fn check_checkout_cargo_hygiene(checkout: &Path) -> Result<(), Failure> {
     reject_cargo_toolchain_overrides(checkout)?;
-    if ["Cargo.toml", "Cargo.lock", "trusted/root-manifest.sha256", "trusted/rustc-capture"]
-        .iter()
-        .any(|rel| fs::symlink_metadata(checkout.join(rel)).is_ok())
+    if [
+        "Cargo.toml",
+        "Cargo.lock",
+        "trusted/root-manifest.sha256",
+        "trusted/rustc-capture",
+        "trusted/audit",
+        "trusted/cargo-anneal",
+    ]
+    .iter()
+    .any(|rel| fs::symlink_metadata(checkout.join(rel)).is_ok())
     {
         check_cargo_boundary(checkout)?;
     }
@@ -583,9 +697,9 @@ fn validate_member_target_path(
 }
 
 /// Verify Cargo workspace DAG containment, root Cargo/toolchain hygiene,
-/// `Cargo.lock` dependency provenance, and `trusted/root-manifest.sha256` (when
-/// present): all workspace crates must reside under `trusted/`, and no
-/// workspace crate may depend on a path outside `workspace.members`.
+/// `Cargo.lock` dependency provenance, and `trusted/root-manifest.sha256`: all
+/// workspace crates must reside under `trusted/`, and no workspace crate may
+/// depend on a path outside `workspace.members`.
 ///
 /// Unlike Lean modules in `theory/`, which are restricted to pure definitions
 /// and checked by the Lean 4 kernel, Rust crates can execute arbitrary code at
@@ -599,61 +713,6 @@ pub fn check_cargo_boundary(checkout: &Path) -> Result<(), Failure> {
     let trusted_toml_path = checkout.join("trusted/rustc-capture/Cargo.toml");
     regular(&root_toml_path, phase)?;
     regular(&trusted_toml_path, phase)?;
-
-    let manifest_path = checkout.join("trusted/root-manifest.sha256");
-    if fs::symlink_metadata(&manifest_path).is_ok() {
-        regular(&manifest_path, phase)?;
-        let manifest_text = fs::read_to_string(&manifest_path).map_err(|e| {
-            Failure::new(1, phase, format!("cannot read root-manifest.sha256: {e}"))
-        })?;
-        let mut seen_manifest_paths = BTreeSet::new();
-        for raw_line in manifest_text.lines() {
-            let line = raw_line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((expected_hex, rel_path)) = line.split_once("  ") else {
-                return Err(Failure::new(
-                    1,
-                    phase,
-                    format!("malformed line in root-manifest.sha256: {line}"),
-                ));
-            };
-            if !is_sha256_hex(expected_hex)
-                || !Path::new(rel_path)
-                    .components()
-                    .all(|c| matches!(c, std::path::Component::Normal(_)))
-                || !seen_manifest_paths.insert(rel_path.to_string())
-            {
-                return Err(Failure::new(
-                    1,
-                    phase,
-                    format!("invalid or duplicate entry in root-manifest.sha256: {line}"),
-                ));
-            }
-            let actual_hex = sha256_file(&checkout.join(rel_path), phase).map_err(
-                |e| Failure::new(1, phase, e.message),
-            )?;
-            if !actual_hex.eq_ignore_ascii_case(expected_hex) {
-                return Err(Failure::new(
-                    1,
-                    phase,
-                    format!(
-                        "root TCB manifest digest mismatch for {rel_path}: expected {expected_hex}, got {actual_hex}"
-                    ),
-                ));
-            }
-        }
-        for required_rel in ["Cargo.toml", "Cargo.lock", "flake.nix", "flake.lock"] {
-            if !seen_manifest_paths.contains(required_rel) {
-                return Err(Failure::new(
-                    1,
-                    phase,
-                    format!("root-manifest.sha256 missing required entry: {required_rel}"),
-                ));
-            }
-        }
-    }
 
     let root_text = fs::read_to_string(&root_toml_path).map_err(|e| {
         Failure::new(1, phase, format!("malformed Cargo manifest: {e}"))
@@ -924,6 +983,59 @@ pub fn check_cargo_boundary(checkout: &Path) -> Result<(), Failure> {
         }
     }
 
+    let manifest_path = checkout.join("trusted/root-manifest.sha256");
+    regular(&manifest_path, phase)
+        .map_err(|e| Failure::new(1, phase, e.message))?;
+    let manifest_text = fs::read_to_string(&manifest_path).map_err(|e| {
+        Failure::new(1, phase, format!("cannot read root-manifest.sha256: {e}"))
+    })?;
+    let mut seen_manifest_paths = BTreeSet::new();
+    for raw_line in manifest_text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((expected_hex, rel_path)) = line.split_once("  ") else {
+            return Err(Failure::new(
+                1,
+                phase,
+                format!("malformed line in root-manifest.sha256: {line}"),
+            ));
+        };
+        if !is_sha256_hex(expected_hex)
+            || !Path::new(rel_path)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            || !seen_manifest_paths.insert(rel_path.to_string())
+        {
+            return Err(Failure::new(
+                1,
+                phase,
+                format!("invalid or duplicate entry in root-manifest.sha256: {line}"),
+            ));
+        }
+        let actual_hex = sha256_file(&checkout.join(rel_path), phase)
+            .map_err(|e| Failure::new(1, phase, e.message))?;
+        if !actual_hex.eq_ignore_ascii_case(expected_hex) {
+            return Err(Failure::new(
+                1,
+                phase,
+                format!(
+                    "root TCB manifest digest mismatch for {rel_path}: expected {expected_hex}, got {actual_hex}"
+                ),
+            ));
+        }
+    }
+    for required_rel in ["Cargo.toml", "Cargo.lock", "flake.nix", "flake.lock"] {
+        if !seen_manifest_paths.contains(required_rel) {
+            return Err(Failure::new(
+                1,
+                phase,
+                format!("root-manifest.sha256 missing required entry: {required_rel}"),
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -1098,6 +1210,27 @@ pub fn default_lean_path() -> PathBuf {
     candidate_paths.into_iter().next().unwrap_or(elan_lean)
 }
 
+/// Resolve the Lean 4.34.1 binary for `checkout`, preferring the sibling
+/// `<tc_root>/lean/bin/lean` or `<tc_root>/bin/lean` when `checkout` is a
+/// packaged `<tc_root>/share/anneal` tree and falling back to
+/// [`default_lean_path`].
+pub fn resolve_lean_binary(checkout: &Path) -> PathBuf {
+    if checkout.ends_with("share/anneal")
+        && let Some(tc_root) = checkout.parent().and_then(Path::parent)
+    {
+        for rel in ["lean/bin/lean", "bin/lean"] {
+            let cand = tc_root.join(rel);
+            if cand.is_file()
+                && let Ok(digest) = sha256_file(&cand, "toolchain")
+                && LOCKED_LEAN_SHA256.contains(&digest.as_str())
+            {
+                return cand;
+            }
+        }
+    }
+    default_lean_path()
+}
+
 /// Stateful boundary and crate-verification auditor managing an isolated
 /// staging directory (`stage`, owned by `_stage_dir`).
 ///
@@ -1216,7 +1349,7 @@ impl Checker {
         let source = checkout.join("trusted/lean");
         let lean_raw = match lean {
             Some(p) => p.to_path_buf(),
-            None => default_lean_path(),
+            None => resolve_lean_binary(&checkout),
         };
         let lean = if lean_raw.is_absolute() {
             lean_raw
@@ -2202,6 +2335,44 @@ impl Checker {
         }
 
         let mut crate_audit = self.run_audit_inspector(true)?;
+
+        let mut emitted_artifacts: Vec<(String, String)> = Vec::new();
+        if let Some(arr) =
+            crate_audit.get("emittedArtifacts").and_then(Json::as_array)
+        {
+            for item in arr {
+                let pair = item.as_array().ok_or_else(|| {
+                    Failure::new(
+                        2,
+                        "audit",
+                        "malformed emittedArtifacts entry in audit report",
+                    )
+                })?;
+                if pair.len() != 2 {
+                    return Err(Failure::new(
+                        2,
+                        "audit",
+                        "malformed emittedArtifacts pair in audit report",
+                    ));
+                }
+                let path = pair[0].as_str().ok_or_else(|| {
+                    Failure::new(
+                        2,
+                        "audit",
+                        "non-string path in emittedArtifacts",
+                    )
+                })?;
+                let expected = pair[1].as_str().ok_or_else(|| {
+                    Failure::new(
+                        2,
+                        "audit",
+                        "non-string expected contents in emittedArtifacts",
+                    )
+                })?;
+                emitted_artifacts.push((path.to_string(), expected.to_string()));
+            }
+        }
+        verify_emitted_artifacts(&crate_root, &emitted_artifacts)?;
 
         let mut active_candidates = BTreeSet::new();
         if let Some(arr) =

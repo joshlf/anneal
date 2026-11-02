@@ -1,10 +1,6 @@
 {
   "axioms": [
     [
-      "Classical.choice",
-      "Init.Prelude"
-    ],
-    [
       "Quot.sound",
       "Init.Prelude"
     ],

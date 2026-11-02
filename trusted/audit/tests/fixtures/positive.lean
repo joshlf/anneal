@@ -77,8 +77,6 @@ opaque sealed : Box := Box.mk (helper 7)
 @[vetted, simp] theorem helper_eq (n : Nat) : Eq (helper n) n := by rfl
 
 @[vetted]
-noncomputable def chosen : Nat := Classical.choice ⟨0⟩
-@[vetted]
 theorem extensionality (p q : Prop) (h : p ↔ q) : Eq p q := propext h
 @[vetted]
 theorem quotient_sound (r : Nat → Nat → Prop) (a b : Nat) (h : r a b) :
