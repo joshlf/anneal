@@ -22,6 +22,7 @@ open Anneal.BitValidity
 open Anneal.UnsafeObligations
 open Anneal.SepLogic
 open Anneal.Rustc.V2026_06_01.Lower
+open Anneal.Rustc.V2026_06_01.TraceCheck
 
 /-!
 Worked vertical slices of Rust `Runtime(PostCleanup)` MIR verification over
@@ -792,5 +793,55 @@ theorem example_unsafe_pointer_and_slice_obligations :
     ⟨⟨hSplit, validSliceSplit_disjoint hSplit⟩,
      ⟨hUnalign, evalPtrOffset_zero_of_unalignRawPtrSafe hUnalign⟩,
      ⟨hArray, evalPtrOffset_end_of_validArrayToSliceCast hArray⟩⟩
+
+/-! ## 9. Runtime Trace Replay & Fuzzing Triage Diagnostics (`TraceReplayDiag`) -/
+
+@[reducible]
+def rawAdd42Trace : RawByteTrace where
+  rawArgs := [[20, 0, 0, 0], [22, 0, 0, 0]]
+  initMem := emptyMemory
+  inlinedCallees := []
+  events := []
+  outcome := .normal [42, 0, 0, 0]
+
+@[reducible]
+def rawAddTamperedOutcomeTrace : RawByteTrace :=
+  { rawAdd42Trace with outcome := .normal [99, 0, 0, 0] }
+
+@[reducible]
+def rawAddOverflowUbTrace : RawByteTrace where
+  rawArgs := [[255, 255, 255, 255], [1, 0, 0, 0]]
+  initMem := emptyMemory
+  inlinedCallees := []
+  events := []
+  outcome := .normal [0, 0, 0, 0]
+
+theorem example_trace_replay_diag_and_soundness :
+    (∃ obsTrace tr out,
+      decodeRawByteTrace addU32UncheckedMirBody [] [] rawAdd42Trace = some obsTrace ∧
+      MatchesObservedEvents obsTrace.events tr ∧
+      MatchesObservedOutcome obsTrace.outcome out ∧
+      ReachesRet
+        (mirStatefulTree addU32UncheckedMirBody obsTrace.args
+          { obsTrace.initMem with callees := obsTrace.inlinedCallees })
+        tr out) ∧
+    (diagnoseRawByteTraceFullBounded 8 addU32UncheckedMirBody [] [] rawAdd42Trace).isOk = true ∧
+    (diagnoseRawByteTraceFullBounded 8 addU32UncheckedMirBody [] [] rawAdd42Trace).tagName = "ok" ∧
+    (match diagnoseRawByteTraceFullBounded 8 addU32UncheckedMirBody [] [] rawAddTamperedOutcomeTrace with
+     | .outcomeMismatch (.normal (.scalar ⟨42, 4⟩, _)) (.normal (.scalar ⟨99, 4⟩)) => true
+     | _ => false) = true ∧
+    (diagnoseRawByteTraceFullBounded 8 addU32UncheckedMirBody [] [] rawAddTamperedOutcomeTrace).tagName =
+      "outcome_mismatch" ∧
+    diagnoseRawByteTraceFullBounded 8 addU32UncheckedMirBody [] [] rawAddOverflowUbTrace =
+      .stepFaulted .ub 0 0 ∧
+    diagnoseRawByteTraceFullBounded 1 addU32UncheckedMirBody [] [] rawAdd42Trace =
+      .outOfFuel 0 1 :=
+  ⟨checkRawByteTraceFullBounded_sound 8 addU32UncheckedMirBody [] [] rawAdd42Trace rfl,
+   rfl,
+   rfl,
+   rfl,
+   rfl,
+   rfl,
+   rfl⟩
 
 end AnnealExamples.MirVerification

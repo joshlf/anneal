@@ -25,6 +25,7 @@ pub mod miri_diff;
 pub mod obligations;
 pub mod scaffold;
 pub mod setup;
+pub mod trace_observer;
 
 use std::env;
 use std::fs;
@@ -63,6 +64,15 @@ pub use scaffold::{
     LEAN_TOOLCHAIN, ScaffoldConfig, ScaffoldReport, detect_authored_item_modules,
     refresh_workspace_assembly, render_lakefile_toml, scaffold_init_proof_templates,
     scaffold_init_spec_templates, scaffold_workspace, scaffold_workspace_with_config,
+};
+pub use trace_observer::{
+    BatchTraceEvalCase, RawByteTraceJson, RawCallEventJson, RawOutcomeJson, RawTraceEventJson,
+    RecordedEvent, RecordedOutcome, RecordedRawTrace, RecordedShadowAlloc, ShadowAllocEntryJson,
+    TraceCheckModuleConfig, TraceObserverSpec, TraceRecorder,
+    render_batch_trace_eval_lean_module, render_raw_byte_trace_lean,
+    render_raw_byte_trace_lean_def, render_raw_outcome_lean,
+    render_shadow_provenance_table_lean, render_tampered_outcome_diag_lean_snippet,
+    render_trace_check_lean_module, render_trace_diag_eval_lean_snippet, value_as_raw_bytes,
 };
 
 /// Top-level subcommand selected on the `cargo anneal` command line.
@@ -1244,7 +1254,7 @@ pub fn verify_workspace_with_config(config: &VerifyConfig) -> Result<Verificatio
     } else {
         run_lake_verify(&dot_anneal)?;
     }
-    run_trusted_boundary_verify_audit(
+    run_trusted_boundary_verify_audit_with_options(
         &workspace_root,
         anneal_repo_root.as_deref(),
         config.allow_assumptions,
@@ -1374,6 +1384,23 @@ pub fn build_lake_build_command(lake_bin: &Path, dot_anneal_dir: &Path) -> Comma
 }
 
 pub(crate) fn run_trusted_boundary_verify_audit(
+    workspace_root: &Path,
+    anneal_repo_root: Option<&Path>,
+    allow_assumptions: bool,
+    item_filter: Option<&str>,
+    verify_modules: &[String],
+) -> Result<VerificationReport, String> {
+    run_trusted_boundary_verify_audit_with_options(
+        workspace_root,
+        anneal_repo_root,
+        allow_assumptions,
+        false,
+        item_filter,
+        verify_modules,
+    )
+}
+
+pub(crate) fn run_trusted_boundary_verify_audit_with_options(
     workspace_root: &Path,
     anneal_repo_root: Option<&Path>,
     allow_assumptions: bool,
