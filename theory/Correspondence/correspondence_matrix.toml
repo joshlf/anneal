@@ -5,7 +5,7 @@
 # Axes:
 #   1. `anneal_version`    : Versioned MIR dialect in `trusted/lean/Trusted/Rustc/V*`
 #   2. `minirust_snapshot` : Mechanically ingested snapshot in `theory/MiniRust/Snapshots/S*`
-#   3. `layer`             : Horizontal semantic slice (`L1_Scalars` .. `L4_TreeBorrows`)
+#   3. `layer`             : Horizontal semantic slice (`L1_Scalars` .. `L6_WholeMachine`)
 #
 # Formal Tiers (`expected_tier`):
 #   - `ExactUnconditional` : Zero bug gaps and zero epoch divergences (`active_gaps = []`)
@@ -62,6 +62,26 @@ max_open_bugs = 1
 allowed_epoch_gaps = []
 proof_module = "Correspondence.V2026_06_01.L4_TreeBorrows"
 
+[[cells]]
+anneal_version = "V2026_06_01"
+minirust_snapshot = "S2026_05_Matched"
+layer = "L5_ControlAndCalls"
+expected_tier = "ExactUnconditional"
+target_tier = "ExactUnconditional"
+max_open_bugs = 0
+allowed_epoch_gaps = []
+proof_module = "Correspondence.V2026_06_01.L5_ControlAndCalls"
+
+[[cells]]
+anneal_version = "V2026_06_01"
+minirust_snapshot = "S2026_05_Matched"
+layer = "L6_WholeMachine"
+expected_tier = "ExactUnconditional"
+target_tier = "ExactUnconditional"
+max_open_bugs = 0
+allowed_epoch_gaps = []
+proof_module = "Correspondence.V2026_06_01.L6_WholeMachine"
+
 # ------------------------------------------------------------------------------
 # Pairing 2: V2026_06_01 vs. S2026_07_BleedingEdge (Target: EpochDeltaOnly)
 # ------------------------------------------------------------------------------
@@ -105,3 +125,23 @@ target_tier = "EpochDeltaOnly"
 max_open_bugs = 1
 allowed_epoch_gaps = ["GAP-EPOCH-0001"]
 proof_module = "Correspondence.V2026_06_01.L4_TreeBorrows"
+
+[[cells]]
+anneal_version = "V2026_06_01"
+minirust_snapshot = "S2026_07_BleedingEdge"
+layer = "L5_ControlAndCalls"
+expected_tier = "EpochDeltaOnly"
+target_tier = "EpochDeltaOnly"
+max_open_bugs = 0
+allowed_epoch_gaps = []
+proof_module = "Correspondence.V2026_06_01.L5_ControlAndCalls"
+
+[[cells]]
+anneal_version = "V2026_06_01"
+minirust_snapshot = "S2026_07_BleedingEdge"
+layer = "L6_WholeMachine"
+expected_tier = "EpochDeltaOnly"
+target_tier = "EpochDeltaOnly"
+max_open_bugs = 0
+allowed_epoch_gaps = []
+proof_module = "Correspondence.V2026_06_01.L6_WholeMachine"

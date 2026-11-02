@@ -25,6 +25,37 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[allow(dead_code)]
+#[path = "../../anneal-specr-lean/src/ast_diff.rs"]
+mod ast_diff;
+#[allow(dead_code)]
+#[path = "../../anneal-specr-lean/src/extractor.rs"]
+mod extractor;
+#[allow(dead_code)]
+#[path = "../../anneal-specr-lean/src/gap_codegen.rs"]
+mod gap_codegen;
+#[allow(dead_code)]
+#[path = "../../anneal-specr-lean/src/lean_emit.rs"]
+mod lean_emit;
+#[allow(dead_code)]
+#[path = "../../anneal-specr-lean/src/ops_emit.rs"]
+mod ops_emit;
+#[allow(dead_code)]
+#[path = "../../anneal-specr-lean/src/sha256.rs"]
+mod sha256;
+#[allow(dead_code)]
+#[path = "../../anneal-specr-lean/src/specr_ast.rs"]
+mod specr_ast;
+#[allow(dead_code)]
+#[path = "../../anneal-specr-lean/src/type_env.rs"]
+mod type_env;
+
+mod anneal_specr_lean {
+    pub use crate::extractor::extract_snapshot;
+    pub use crate::lean_emit::emit_snapshot_to_dir;
+    pub use crate::type_env::TypeEnvironment;
+}
+
 use anneal_rustc_capture::sha256_hex;
 use cargo_anneal::{
     CliSubcommand, DeclChangeKind, FileIssueOptions, FileIssueOutcome, cross_check_miri_diff,
@@ -683,6 +714,11 @@ fn gate5_tcb_zero_contamination_and_hygiene_audit() {
         "crates/cargo-anneal/src/minirust_sync.rs",
         "crates/cargo-anneal/src/lib.rs",
         "crates/cargo-anneal/tests/end_to_end_minirust_correspondence.rs",
+        "theory/Correspondence/V2026_06_01/L5_ControlAndCalls.lean",
+        "theory/Correspondence/V2026_06_01/L6_WholeMachine.lean",
+        "theory/Correspondence/V2026_06_01/Scorecard.lean",
+        "theory/Correspondence.lean",
+        "theory/Correspondence/correspondence_matrix.toml",
     ];
     for rel in owned_files {
         let content = fs::read_to_string(root.join(rel))
@@ -937,6 +973,181 @@ fn mut_invalid_minirust_source_span_rejected() {
     .expect_err("minirust_source end line exceeding file line count must be rejected");
     assert!(err4.contains("exceeds file line count (10)"), "{err4}");
 }
+
+fn copy_dir_recursive(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).expect("failed to create destination directory");
+    for entry in fs::read_dir(src).expect("failed to read source directory") {
+        let entry = entry.expect("failed to read directory entry");
+        let ty = entry.file_type().expect("failed to read entry file type");
+        let dst_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_path);
+        } else {
+            fs::copy(entry.path(), &dst_path).expect("failed to copy file");
+        }
+    }
+}
+
+/// End-to-End Upstream `.md` Mutation Proof-Breakage Test:
+/// Verifies that:
+/// 1. Copying `theory/MiniRust/vendor/S2026_05_Matched` to an isolated temporary directory,
+/// 2. Mutating `PermissionUnprot::Unique => ret(PermissionUnprot::Frozen)` to
+///    `PermissionUnprot::Unique => ret(PermissionUnprot::Disabled)` in
+///    `spec/mem/tree_borrows/state_machine_unprotected.md` AND mutating
+///    `Add => left + right` to `Add => left - right` in `spec/lang/step/operators.md`,
+/// 3. Running `anneal_specr_lean::extract_snapshot` + `TypeEnvironment::build` +
+///    `emit_snapshot_to_dir` into a temporary snapshot directory,
+/// 4. Produces a generated `Ops.lean` file that differs from the unmutated `Ops.lean`
+///    in the exact translated Lean definitions (`PermissionUnprot.foreign_read` and
+///    `eval_int_bin_op`), and
+/// 5. Running `lake env lean` on a Lean proof snippet that asserts the unmutated
+///    correspondence theorem against the mutated `Ops.lean` module fails with a
+///    Lean 4 kernel type/proof error (while succeeding against the unmutated `Ops.lean`).
+#[test]
+fn e2e_upstream_md_mutation_changes_generated_ops_and_breaks_lean_proof() {
+    let root = repo_root();
+    let overlay = TempOverlayDir::new("e2e-upstream-md-mutation");
+
+    // 1. Copy `theory/MiniRust/vendor/S2026_05_Matched` into an isolated temp directory.
+    let real_vendor = root.join("theory/MiniRust/vendor/S2026_05_Matched");
+    let mutated_vendor = overlay.path().join("vendor/S2026_05_Matched");
+    copy_dir_recursive(&real_vendor, &mutated_vendor);
+
+    // Emit baseline (unmutated) snapshot into `snap_unmutated` for comparison.
+    let commit_sha = "5f78e227bbe30ae9fb5e1286a772d91a92e3622a";
+    let unmutated_snap_dir = overlay.path().join("snap_unmutated");
+    let unmutated_extracted =
+        anneal_specr_lean::extract_snapshot(&real_vendor, "S2026_05_Matched", commit_sha)
+            .expect("baseline extract_snapshot must succeed");
+    let unmutated_env = anneal_specr_lean::TypeEnvironment::build(&unmutated_extracted);
+    let unmutated_emitted = anneal_specr_lean::emit_snapshot_to_dir(
+        &unmutated_extracted,
+        &unmutated_env,
+        &unmutated_snap_dir,
+    )
+    .expect("baseline emit_snapshot_to_dir must succeed");
+    let unmutated_ops = fs::read_to_string(&unmutated_emitted.ops_lean_path)
+        .expect("failed to read unmutated Ops.lean");
+
+    // 2. Mutate `spec/mem/tree_borrows/state_machine_unprotected.md` and `spec/lang/step/operators.md`.
+    let tb_unprot_path = mutated_vendor.join("spec/mem/tree_borrows/state_machine_unprotected.md");
+    let tb_unprot_orig =
+        fs::read_to_string(&tb_unprot_path).expect("failed to read state_machine_unprotected.md");
+    assert!(
+        tb_unprot_orig.contains("PermissionUnprot::Unique => ret(PermissionUnprot::Frozen)"),
+        "expected foreign_read rule in state_machine_unprotected.md"
+    );
+    let tb_unprot_mutated = tb_unprot_orig.replacen(
+        "PermissionUnprot::Unique => ret(PermissionUnprot::Frozen)",
+        "PermissionUnprot::Unique => ret(PermissionUnprot::Disabled)",
+        1,
+    );
+    fs::write(&tb_unprot_path, &tb_unprot_mutated)
+        .expect("failed to write mutated state_machine_unprotected.md");
+
+    let ops_md_path = mutated_vendor.join("spec/lang/step/operators.md");
+    let ops_md_orig = fs::read_to_string(&ops_md_path).expect("failed to read operators.md");
+    assert!(
+        ops_md_orig.contains("Add => left + right"),
+        "expected Add => left + right in operators.md"
+    );
+    let ops_md_mutated = ops_md_orig.replacen("Add => left + right", "Add => left - right", 1);
+    fs::write(&ops_md_path, &ops_md_mutated).expect("failed to write mutated operators.md");
+
+    // 3. Run `extract_snapshot` + `TypeEnvironment::build` + `emit_snapshot_to_dir` on the mutated vendor directory.
+    let mutated_snap_dir = overlay.path().join("snap_mutated");
+    let mutated_extracted =
+        anneal_specr_lean::extract_snapshot(&mutated_vendor, "S2026_05_Matched", commit_sha)
+            .expect("mutated extract_snapshot must succeed");
+    let mutated_env = anneal_specr_lean::TypeEnvironment::build(&mutated_extracted);
+    let mutated_emitted = anneal_specr_lean::emit_snapshot_to_dir(
+        &mutated_extracted,
+        &mutated_env,
+        &mutated_snap_dir,
+    )
+    .expect("mutated emit_snapshot_to_dir must succeed");
+    let mutated_ops =
+        fs::read_to_string(&mutated_emitted.ops_lean_path).expect("failed to read mutated Ops.lean");
+
+    // 4. Verify that `Ops.lean` differs in the exact translated Lean definitions
+    // (`PermissionUnprot.foreign_read` and `eval_int_bin_op`).
+    assert_ne!(
+        unmutated_ops, mutated_ops,
+        "mutating upstream .md files must change generated Ops.lean"
+    );
+    assert!(
+        unmutated_ops.contains("| .Unique => .ok .Frozen")
+            && mutated_ops.contains("| .Unique => .ok .Disabled"),
+        "PermissionUnprot.foreign_read in mutated Ops.lean must translate Unique => .ok .Disabled"
+    );
+    assert!(
+        unmutated_ops.contains("| .Add => .ok (left + right)")
+            && mutated_ops.contains("| .Add => .ok (left - right)"),
+        "eval_int_bin_op in mutated Ops.lean must translate .Add => .ok (left - right)"
+    );
+
+    // 5. Run `lake env lean` on a Lean proof snippet asserting the unmutated correspondence
+    // theorems against both the unmutated `Ops.lean` (must pass) and the mutated `Ops.lean`
+    // (must fail with a Lean 4 kernel type/proof error).
+    let proof_assertions = r#"
+section MutationBreakageCheck
+open MiniRust.LibSpecr
+open MiniRust.Snapshots.S2026_05_Matched.Generated.Ops
+
+theorem correspondence_foreign_read_unique :
+    PermissionUnprot.foreign_read .Unique = .ok .Frozen := rfl
+
+theorem correspondence_eval_int_bin_op_add (a b : SpecrInt) (ty : IntType) :
+    eval_int_bin_op .Add a b ty = .ok (a + b) := rfl
+
+end MutationBreakageCheck
+"#;
+
+    let unmutated_check_file = overlay.write_file(
+        "UnmutatedProofCheck.lean",
+        &format!("{unmutated_ops}\n{proof_assertions}"),
+    );
+    let mutated_check_file = overlay.write_file(
+        "MutatedProofCheck.lean",
+        &format!("{mutated_ops}\n{proof_assertions}"),
+    );
+
+    let examples_dir = root.join("examples");
+    let unmutated_lean_out = Command::new("lake")
+        .current_dir(&examples_dir)
+        .args(["env", "lean"])
+        .arg(&unmutated_check_file)
+        .output()
+        .expect("failed to invoke `lake env lean` on UnmutatedProofCheck.lean");
+    assert!(
+        unmutated_lean_out.status.success(),
+        "unmutated Ops.lean proof check must pass `lake env lean`, stderr:\n{}\nstdout:\n{}",
+        String::from_utf8_lossy(&unmutated_lean_out.stderr),
+        String::from_utf8_lossy(&unmutated_lean_out.stdout)
+    );
+
+    let mutated_lean_out = Command::new("lake")
+        .current_dir(&examples_dir)
+        .args(["env", "lean"])
+        .arg(&mutated_check_file)
+        .output()
+        .expect("failed to invoke `lake env lean` on MutatedProofCheck.lean");
+    assert!(
+        !mutated_lean_out.status.success(),
+        "mutated Ops.lean MUST break the Lean correspondence proof under `lake env lean`"
+    );
+    let combined_diag = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&mutated_lean_out.stdout),
+        String::from_utf8_lossy(&mutated_lean_out.stderr)
+    );
+    let diag_lower = combined_diag.to_ascii_lowercase();
+    assert!(
+        diag_lower.contains("type mismatch") && diag_lower.contains("not a definitional equality"),
+        "expected Lean kernel `Type mismatch` / `Not a definitional equality` diagnostic on mutated Ops.lean, got:\n{combined_diag}"
+    );
+}
+
 
 
 
