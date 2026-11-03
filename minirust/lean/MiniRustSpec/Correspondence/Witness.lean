@@ -33,8 +33,17 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
     related initial machine.
 * `retUninit`: the MIR of a function returning an uninitialized `_0`.
   Anneal's semantics faults with UB (`retUninit_anneal_ub`), hence MiniRust
-  raises UB (`retUninit_minirust_ub` via `run_ub`), which a direct computation
-  confirms (`retUninit_minirust_direct`).
+  raises UB (`retUninit_minirust_ub` via `run_ub`, and
+  `retUninit_minirust_ub_from_start` via `run_ub_from_start`), which a direct
+  computation confirms (`retUninit_minirust_direct`).
+* `negMention`: the MIR of a function exercising `PlaceMention(_0)` (while `_0`
+  is still uninitialized), wrapping `UnaryOp(Neg)` (`_0 = -_1`), and an
+  `Unreachable` branch when `_1 == 0`:
+  - for `_1 = 5`: returns `2^32 - 5 = 4294967291` (`negMention5_minirust_ret_from_start`,
+    verified against `negMention5_minirust_direct`);
+  - for `_1 = 0`: computes `-0 = 0` and takes the `Unreachable` terminator,
+    raising UB (`negMention0_minirust_ub_from_start`, verified against
+    `negMention0_minirust_direct`).
 -/
 
 namespace MiniRustSpec.Correspondence.Witness
@@ -260,6 +269,34 @@ theorem sumTo_minirust_direct :
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAlloc with data := scalarBytes u32 6 }, [1]) := rfl
 
+/-- Whole-execution return starting at `f.start` (including `minimize`'s
+init block), via `run_ret_from_start`. -/
+theorem sumTo_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n sumToMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 6 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    run_ret_from_start sumTo_inFragment sumTo_translate ctx0 sumToS0 sumToM0 sumToMInit
+      sumTo_rel rfl rfl ⟨rfl, rfl, rfl⟩ sumTo_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [sumTo] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  have hbits : bits = 6 := by
+    simp [itOf, intTypeOf, intTyBytes, u32Decl, u32Ty] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctx0, itOf, intTypeOf, intTyBytes, u32Decl, u32Ty, u32]
+
+/-- Direct 17-step run from `f.start` (init block + 16 MIR steps). -/
+theorem sumTo_minirust_direct_from_start :
+    (Interp.steps 17 sumToMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 6 }, [1]) := rfl
+
 /-! ## Returning an uninitialized `_0` -/
 
 /-- MIR of a function whose only block returns without writing `_0`. -/
@@ -334,6 +371,182 @@ theorem retUninit_minirust_ub : ∃ (n : Nat) (msg : String), Interp.steps n ret
 /-- Direct computation: MiniRust's first step is UB. -/
 theorem retUninit_minirust_direct :
     ∃ msg, Interp.step retUninitM0 = .error (.ub msg) :=
+  ⟨_, rfl⟩
+
+def retUninitMInit : Mach := machine retUninit retUninitFn retUninitS0.frame.locals retUninitFn.start
+
+/-- Whole-execution UB starting at `f.start` (including `minimize`'s init
+block), via `run_ub_from_start`. -/
+theorem retUninit_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n retUninitMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := retUninit_anneal_ub
+  exact run_ub_from_start retUninit_inFragment retUninit_translate ctx0 retUninitS0
+    retUninitM0 retUninitMInit retUninit_rel rfl rfl ⟨rfl, rfl, rfl⟩ hr hf
+
+/-! ## `PlaceMention`, `UnaryOp(Neg)`, and `Unreachable` -/
+
+/-- MIR of a function exercising `PlaceMention(_0)` (while `_0` is still
+uninitialized), wrapping integer negation `_0 = Neg(copy _1)`, and an
+`Unreachable` terminator on the `_1 == 0` branch. -/
+def negMention : CapturedMir where
+  defPath := "witness::neg_mention"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.placeMention (local_ 0)),
+        mkStmt (.assign (local_ 0) (.unaryOp .neg (.copy (local_ 1))))],
+      terminator := mkTerm (.switchInt (.copy (local_ 1)) { branches := [(0, 2)], otherwise := 1 }),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false },
+    { statements := [], terminator := mkTerm .unreachable, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem negMention_inFragment : inFragment negMention = true := by decide
+
+def negMentionFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .PlaceMention (.Local (localName 0)),
+      .Assign (.Local (localName 0)) (.UnOp (.Int .Neg) (.Load (.Local (localName 1))))],
+      .Switch (.Load (.Local (localName 1))) ⟨[(0, bbName 2)]⟩ (bbName 1), .Regular⟩),
+    (bbName 1, ⟨[], .Return, .Regular⟩),
+    (bbName 2, ⟨[], .Unreachable, .Regular⟩),
+    (bbName 3, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 3
+  implicit_writes := true
+
+theorem negMention_translate : translateFn negMention = some negMentionFn := rfl
+
+def negMention5S0 : MachineState := initMachineState negMention [.scalar ⟨5, 4⟩]
+def negMention5M0 : Mach := machine negMention negMentionFn negMention5S0.frame.locals (bbName 0)
+def negMention5MInit : Mach := machine negMention negMentionFn negMention5S0.frame.locals negMentionFn.start
+
+theorem negMention5_rel : StateRel negMention negMentionFn ctx0 negMention5S0 negMention5M0 where
+  threads := rfl
+  active := rfl
+  allocs := rfl
+  blk := by decide
+  stmt := by intro bb hbb; simp [negMention5S0, initMachineState] at hbb ⊢
+  nlocals := by decide
+  slots := by
+    intro i d slot hd hs
+    have hloc : negMention5S0.frame.locals = [.uninit, .init (.scalar ⟨5, 4⟩)] := rfl
+    rw [hloc] at hs
+    match i, hd, hs with
+    | 0, hd, hs => simp [negMention] at hd; subst hd; simp at hs; subst hs; trivial
+    | 1, hd, hs =>
+      simp [negMention] at hd; subst hd
+      simp at hs; subst hs
+      exact ⟨rfl, by decide⟩
+    | _ + 2, hd, _ => simp [negMention] at hd
+  addrs := by
+    intro i d hd
+    match i, hd with
+    | 0, hd => simp [negMention] at hd; subst hd; decide
+    | 1, hd => simp [negMention] at hd; subst hd; decide
+    | _ + 2, hd => simp [negMention] at hd
+  ret := by
+    intro d hd
+    simp [negMention] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+  borrows := rfl
+  callStack := rfl
+  activeCallee := rfl
+  protectors := rfl
+  callerLocals := rfl
+
+def negMention5Trace : List (Event MirEffect) :=
+  [⟨.inr (.inl (.emit (.event 5))), PUnit.unit⟩]
+
+theorem negMention5_anneal_ret :
+    ReachesRet (mirTree negMention negMention5S0) negMention5Trace
+      (.normal (.scalar ⟨4294967291, 4⟩, negMention5S0.memory)) :=
+  runA_sound negMention 10 _ _ _ rfl
+
+theorem negMention5_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n negMention5MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 4294967291 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    run_ret_from_start negMention_inFragment negMention_translate ctx0 negMention5S0
+      negMention5M0 negMention5MInit negMention5_rel rfl rfl ⟨rfl, rfl, rfl⟩ negMention5_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [negMention] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  have hbits : bits = 4294967291 := by
+    simp [itOf, intTypeOf, intTyBytes, u32Decl, u32Ty] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctx0, itOf, intTypeOf, intTyBytes, u32Decl, u32Ty, u32]
+
+theorem negMention5_minirust_direct :
+    (Interp.steps 5 negMention5MInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 4294967291 }, [1]) := rfl
+
+def negMention0S0 : MachineState := initMachineState negMention [.scalar ⟨0, 4⟩]
+def negMention0M0 : Mach := machine negMention negMentionFn negMention0S0.frame.locals (bbName 0)
+def negMention0MInit : Mach := machine negMention negMentionFn negMention0S0.frame.locals negMentionFn.start
+
+theorem negMention0_rel : StateRel negMention negMentionFn ctx0 negMention0S0 negMention0M0 where
+  threads := rfl
+  active := rfl
+  allocs := rfl
+  blk := by decide
+  stmt := by intro bb hbb; simp [negMention0S0, initMachineState] at hbb ⊢
+  nlocals := by decide
+  slots := by
+    intro i d slot hd hs
+    have hloc : negMention0S0.frame.locals = [.uninit, .init (.scalar ⟨0, 4⟩)] := rfl
+    rw [hloc] at hs
+    match i, hd, hs with
+    | 0, hd, hs => simp [negMention] at hd; subst hd; simp at hs; subst hs; trivial
+    | 1, hd, hs =>
+      simp [negMention] at hd; subst hd
+      simp at hs; subst hs
+      exact ⟨rfl, by decide⟩
+    | _ + 2, hd, _ => simp [negMention] at hd
+  addrs := by
+    intro i d hd
+    match i, hd with
+    | 0, hd => simp [negMention] at hd; subst hd; decide
+    | 1, hd => simp [negMention] at hd; subst hd; decide
+    | _ + 2, hd => simp [negMention] at hd
+  ret := by
+    intro d hd
+    simp [negMention] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+  borrows := rfl
+  callStack := rfl
+  activeCallee := rfl
+  protectors := rfl
+  callerLocals := rfl
+
+theorem negMention0_anneal_ub :
+    ∃ tr u, Reaches (mirTree negMention negMention0S0) tr u ∧ FaultNow u :=
+  faultsA_sound negMention 10 _ (by decide)
+
+theorem negMention0_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n negMention0MInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := negMention0_anneal_ub
+  exact run_ub_from_start negMention_inFragment negMention_translate ctx0 negMention0S0
+    negMention0M0 negMention0MInit negMention0_rel rfl rfl ⟨rfl, rfl, rfl⟩ hr hf
+
+theorem negMention0_minirust_direct :
+    ∃ msg, Interp.steps 5 negMention0MInit = .error (.ub msg) :=
   ⟨_, rfl⟩
 
 end MiniRustSpec.Correspondence.Witness

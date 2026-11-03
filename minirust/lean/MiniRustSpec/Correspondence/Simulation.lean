@@ -199,7 +199,7 @@ theorem evalReturn_callee {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     simp only [evalReturn, hact, ok_bind, thread1, List.getLast?_cons_cons, List.getLast?_singleton,
       listSet, h.shape.active, h.shape.threads]
     simp [calleeFrame, hspec.1, mapIndex, hloc0, layout_eq _ hgood, LayoutStrategy.expect_align,
-      hlocPtr, thread1]
+      hlocPtr]
     rfl
   constructor
   · intro sc hsc
@@ -254,22 +254,24 @@ theorem evalReturn_callee {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
 
 theorem translateStatement_some {st : MirAst.Statement} {st' : Gen.Statement}
     (h : translateStatement st = some st') :
-    ∃ i rv e, st.kind = .assign ⟨i, []⟩ rv ∧ translateRvalue rv = some e ∧
-      st' = .Assign (.Local (localName i)) e := by
+    (∃ i rv e, st.kind = .assign ⟨i, []⟩ rv ∧ translateRvalue rv = some e ∧
+      st' = .Assign (.Local (localName i)) e) ∨
+    (∃ i, st.kind = .placeMention ⟨i, []⟩ ∧ st' = .PlaceMention (.Local (localName i))) := by
   obtain ⟨kind, span⟩ := st
   simp only [translateStatement] at h ⊢
   match kind, h with
   | .assign ⟨i, []⟩ rv, h =>
     cases he : translateRvalue rv with
     | none => simp [he] at h
-    | some e => simp [he] at h; exact ⟨i, rv, e, rfl, he, h.symm⟩
+    | some e => simp [he] at h; exact .inl ⟨i, rv, e, rfl, he, h.symm⟩
   | .assign ⟨_, _ :: _⟩ _, h => simp at h
   | .setDiscriminant _ _, h => simp at h
   | .deinit _, h => simp at h
   | .storageLive _, h => simp at h
   | .storageDead _, h => simp at h
   | .retag _ _, h => simp at h
-  | .placeMention _, h => simp at h
+  | .placeMention ⟨i, []⟩, h => simp at h; exact .inr ⟨i, rfl, h.symm⟩
+  | .placeMention ⟨_, _ :: _⟩, h => simp at h
   | .intrinsic _, h => simp at h
   | .coverage, h => simp at h
   | .constEvalCounter, h => simp at h
@@ -282,6 +284,7 @@ theorem translateTerminator_some {decls : List LocalDecl} {t : MirAst.Terminator
     (∃ discr targets v it, t.kind = .switchInt discr targets ∧ translateOperand discr = some v ∧
       operandIntType decls discr = some it ∧
       tt = .Switch v (switchCases it targets.branches) (bbName targets.otherwise)) ∨
+    (t.kind = .unreachable ∧ tt = .Unreachable) ∨
     (t.kind = .return_ ∧ tt = .Return) := by
   obtain ⟨kind, span⟩ := t
   simp only [translateTerminator] at h ⊢
@@ -296,10 +299,10 @@ theorem translateTerminator_some {decls : List LocalDecl} {t : MirAst.Terminator
       | some it =>
         simp [hv, hit] at h
         exact .inr (.inl ⟨discr, targets, v, it, rfl, hv, hit, h.symm⟩)
-  | .return_, h => simp at h; exact .inr (.inr ⟨rfl, h.symm⟩)
+  | .unreachable, h => simp at h; exact .inr (.inr (.inl ⟨rfl, h.symm⟩))
+  | .return_, h => simp at h; exact .inr (.inr (.inr ⟨rfl, h.symm⟩))
   | .unwindResume, h => simp at h
   | .unwindTerminate, h => simp at h
-  | .unreachable, h => simp at h
   | .drop _ _ _, h => simp at h
   | .call _ _ _ _ _, h => simp at h
   | .tailCall _ _, h => simp at h
@@ -419,62 +422,88 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
     obtain ⟨st', hst', htst⟩ := hstspec _ st hst
     rw [stepMirFn_stmt body s bb st hrel.activeCallee hphase hbb hst]
     have hok := hstmts st (List.mem_of_getElem? hst)
-    obtain ⟨i, rv, e, hkind, he, rfl⟩ := translateStatement_some hst'
-    obtain ⟨kind, span⟩ := st
-    simp only at hkind
-    subst hkind
-    simp only [statementOk] at hok
-    cases hdi : body.localDecls[i]? with
-    | none => simp [hdi] at hok
-    | some d =>
-      have hit := (hspec.2.1 i d hdi).1
-      have hok' : rvalueOk body.localDecls (itOf d) rv = true := by
-        simpa [hdi, hit] using hok
-      have hgood := hframe.decl_good i d hdi
-      obtain ⟨hMok, hMnone⟩ := evalStatement_assign hframe i d hdi rv hok' e he
-      obtain ⟨hAok, hAnone⟩ := evalStmt_assign s body.localDecls body.layouts i rv span hslotsA
-        hrel.nlocals d hdi (Nat.ne_of_gt hgood.pos) hok' hrel.borrows hrel.protectors
-      cases hr : rvBits s.frame.locals (itOf d) rv with
-      | none =>
-        rw [hAnone hr]
-        obtain ⟨msg, hmsg⟩ := hMnone hr
-        exact StepRel.ub' msg (by simp [hne, listIndex_nat _ _ _ htst, hmsg])
-      | some r =>
-        rw [hAok r hr]
-        obtain ⟨m3, hm3, h3⟩ := hMok r hr
-        obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3.shape
-        refine StepRel.tau' m4 (by simp [hne, listIndex_nat _ _ _ htst, hm3, hm4, check_after h4]) ?_
-        have hstmt' : ∀ bb', body.basicBlocks[s.frame.blockIdx]? = some bb' →
-            s.frame.stmtIdx + 1 ≤ bb'.statements.length := by
-          intro bb' hbb'
-          rw [hbb] at hbb'
-          cases hbb'
-          exact hlt
-        have hn' : (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩))).length =
-            body.localDecls.length := by
-          simp [hrel.nlocals]
-        exact {
-          threads := h4.threads
-          active := h4.active
-          allocs := h4.allocs
-          blk := hrel.blk
-          stmt := hstmt'
-          nlocals := hn'
-          slots := h3.slots
-          addrs := hrel.addrs
-          ret := hrel.ret
-          borrows := rfl
-          callStack := hrel.callStack
-          activeCallee := hrel.activeCallee
-          protectors := hrel.protectors
-          callerLocals := hrel.callerLocals }
+    have hstmt' : ∀ bb', body.basicBlocks[s.frame.blockIdx]? = some bb' →
+        s.frame.stmtIdx + 1 ≤ bb'.statements.length := by
+      intro bb' hbb'
+      rw [hbb] at hbb'
+      cases hbb'
+      exact hlt
+    rcases translateStatement_some hst' with ⟨i, rv, e, hkind, he, rfl⟩ | ⟨i, hkind, rfl⟩
+    · ------------------------------------------------------------ assign
+      obtain ⟨kind, span⟩ := st
+      simp only at hkind
+      subst hkind
+      simp only [statementOk] at hok
+      cases hdi : body.localDecls[i]? with
+      | none => simp [hdi] at hok
+      | some d =>
+        have hit := (hspec.2.1 i d hdi).1
+        have hok' : rvalueOk body.localDecls (itOf d) rv = true := by
+          simpa [hdi, hit] using hok
+        have hgood := hframe.decl_good i d hdi
+        obtain ⟨hMok, hMnone⟩ := evalStatement_assign hframe i d hdi rv hok' e he
+        obtain ⟨hAok, hAnone⟩ := evalStmt_assign s body.localDecls body.layouts i rv span hslotsA
+          hrel.nlocals d hdi (Nat.ne_of_gt hgood.pos) hok' hrel.borrows hrel.protectors
+        cases hr : rvBits s.frame.locals (itOf d) rv with
+        | none =>
+          rw [hAnone hr]
+          obtain ⟨msg, hmsg⟩ := hMnone hr
+          exact StepRel.ub' msg (by simp [hne, listIndex_nat _ _ _ htst, hmsg])
+        | some r =>
+          rw [hAok r hr]
+          obtain ⟨m3, hm3, h3⟩ := hMok r hr
+          obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3.shape
+          refine StepRel.tau' m4 (by simp [hne, listIndex_nat _ _ _ htst, hm3, hm4, check_after h4]) ?_
+          have hn' : (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩))).length =
+              body.localDecls.length := by
+            simp [hrel.nlocals]
+          exact {
+            threads := h4.threads
+            active := h4.active
+            allocs := h4.allocs
+            blk := hrel.blk
+            stmt := hstmt'
+            nlocals := hn'
+            slots := h3.slots
+            addrs := hrel.addrs
+            ret := hrel.ret
+            borrows := rfl
+            callStack := hrel.callStack
+            activeCallee := hrel.activeCallee
+            protectors := hrel.protectors
+            callerLocals := hrel.callerLocals }
+    · ------------------------------------------------------------ placeMention
+      obtain ⟨kind, span⟩ := st
+      simp only at hkind
+      subst hkind
+      have hi : i < body.localDecls.length := by simpa [statementOk] using hok
+      have hM := evalStatement_placeMention hframe i hi
+      have hA := evalStmt_placeMention s body.localDecls body.layouts i span hslotsA hrel.nlocals hi
+      rw [hA]
+      obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee hframe.shape
+      refine StepRel.tau' m4 (by simp [hne, listIndex_nat _ _ _ htst, hM, hm4, check_after h4]) ?_
+      exact {
+        threads := h4.threads
+        active := h4.active
+        allocs := h4.allocs
+        blk := hrel.blk
+        stmt := hstmt'
+        nlocals := hrel.nlocals
+        slots := hrel.slots
+        addrs := hrel.addrs
+        ret := hrel.ret
+        borrows := hrel.borrows
+        callStack := hrel.callStack
+        activeCallee := hrel.activeCallee
+        protectors := hrel.protectors
+        callerLocals := hrel.callerLocals }
   · ----------------------------------------------------------------- terminator
     have heq : s.frame.stmtIdx = bb.statements.length := by omega
     have hif : ((s.frame.stmtIdx : Nat) : Int) = (tb.statements.length : Int) := by rw [hlen, heq]
     rw [stepMirFn_term body s bb hrel.activeCallee hphase hbb heq]
     simp only [hif, ↓reduceIte]
     rcases translateTerminator_some htermspec with
-      ⟨t, hk, htt⟩ | ⟨discr, targets, v, it, hk, hv, hit, htt⟩ | ⟨hk, htt⟩
+      ⟨t, hk, htt⟩ | ⟨discr, targets, v, it, hk, hv, hit, htt⟩ | ⟨hk, htt⟩ | ⟨hk, htt⟩
     · -------------------------------------------------------------- goto
       have ht : t < body.basicBlocks.length := by
         simpa [terminatorOk, hk] using hterm
@@ -518,6 +547,11 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
           rw [hlookup]
           exact hm4
         exact StepRel.emit' _ m4 rfl (by simp [hM, check_after h4]) (hrel.goto _ htgt h4)
+    · -------------------------------------------------------------- unreachable
+      have hA : evalTerminator s bb.terminator (some body) = MirStepNode.fail .ub := by
+        simp [MirSemantics.evalTerminator, hk]
+      rw [hA]
+      exact StepRel.ub' "reached unreachable code" (by simp [htt, Interp.evalTerminator, ub])
     · -------------------------------------------------------------- return
       have hn0 : 0 < body.localDecls.length := by omega
       obtain ⟨d0, hd0⟩ : ∃ d, body.localDecls[0]? = some d := ⟨_, List.getElem?_eq_getElem hn0⟩
@@ -544,5 +578,40 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
           rw [← hsz]
         exact StepRel.ret' m' (by simp [htt, Interp.evalTerminator, hm', check_after hs'])
           ⟨sc.bits, r0, a0, d0, hd0, hv, hp, hr0, hs'.threads, hs'.allocs⟩
+
+/-! ## Entry block (`f.start`) -/
+
+/-- Stepping the `minimize` entry block (`f.start = bbName body.basicBlocks.length`,
+whose body is `initBlock = Goto(bb0)`) jumps to `bb0` in one step while
+preserving all allocations and locals. -/
+theorem step_initBlock {body : CapturedMir} {f : Gen.Function} (hf : translateFn body = some f)
+    {ctx : Ctx} {mInit : Mach} {allocs : List Gen.Allocation}
+    (hshape : Shape mInit ctx
+      [ctx.caller, calleeFrame f ctx body.localDecls.length body.basicBlocks.length 0] allocs) :
+    ∃ m0, Interp.step mInit = .ok m0 ∧
+      Shape m0 ctx [ctx.caller, calleeFrame f ctx body.localDecls.length 0 0] allocs := by
+  obtain ⟨_, hinit⟩ := translateFn_start body f hf
+  obtain ⟨m0, hm0, h0⟩ := jumpToBlock_callee (resetPick_shape hshape) 0
+  refine ⟨m0, ?_, h0⟩
+  rw [step_callee hshape initBlock hinit]
+  simp [initBlock, Interp.evalTerminator, hm0, check_after h0]
+
+/-- If `s` is at the start of `bb0` (`blockIdx = 0`, `stmtIdx = 0`) and related
+to a machine at `bb0`, then a machine `mInit` at `f.start`
+(`bbName body.basicBlocks.length`) steps in one step to a machine related to
+`s`. -/
+theorem step_start {body : CapturedMir} {f : Gen.Function} (hf : translateFn body = some f)
+    {ctx : Ctx} {s : MachineState} {m0 mInit : Mach} (hrel : StateRel body f ctx s m0)
+    (hb0 : s.frame.blockIdx = 0) (hs0 : s.frame.stmtIdx = 0)
+    (hinit : Shape mInit ctx
+      [ctx.caller, calleeFrame f ctx body.localDecls.length body.basicBlocks.length 0]
+      (ctx.base ++ localAllocs ctx body.localDecls s.frame.locals)) :
+    ∃ m', Interp.step mInit = .ok m' ∧ StateRel body f ctx s m' := by
+  obtain ⟨m', hm', hshape'⟩ := step_initBlock hf hinit
+  refine ⟨m', hm', ?_⟩
+  have hgoto : gotoState s 0 = s := by
+    cases s; rename_i fr mem; cases fr; simp [gotoState] at hb0 hs0 ⊢; exact ⟨hb0.symm, hs0.symm⟩
+  rw [← hgoto]
+  exact hrel.goto 0 (hb0 ▸ hrel.blk) hshape'
 
 end MiniRustSpec.Correspondence

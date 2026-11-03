@@ -66,6 +66,8 @@ pub fn builtin(name: &str) -> Option<(&'static str, usize)> {
         "Mutability" => ("LibSpecr.Mutability", 0),
         "DynWrite" => ("LibSpecr.DynWrite", 0),
         "PhantomData" => ("LibSpecr.PhantomData", 1),
+        "Nondet" => ("LibSpecr.Nondet", 1),
+        "NdResult" => ("LibSpecr.NdResult", 2),
         _ => return None,
     })
 }

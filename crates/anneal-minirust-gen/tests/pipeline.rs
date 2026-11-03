@@ -243,7 +243,8 @@ fn item_kinds_match_independent_parse() {
 }
 
 /// Every opaque node reported in `coverage.json` is visible as an opaque
-/// constructor in the generated Lean, and vice versa.
+/// constructor in the generated Lean, and vice versa; in the pinned snapshot,
+/// both opaque AST nodes and skipped shallow data types are zero.
 #[test]
 fn opaque_nodes_are_reported() {
     let g = pipeline::generate(&layout()).unwrap();
@@ -258,4 +259,9 @@ fn opaque_nodes_are_reported() {
         }
     }
     assert_eq!(opaque, opaque_in_lean, "opaque node count");
+    assert!(
+        cov.contains("\"shallow_types\": {\"translated\": 100, \"candidates\": 100,"),
+        "expected 100/100 shallow data types translated"
+    );
+    assert!(!cov.contains("not translated:"), "expected zero skipped shallow data types");
 }

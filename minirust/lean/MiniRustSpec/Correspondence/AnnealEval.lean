@@ -73,7 +73,7 @@ theorem evalOperand_frag (decls : List LocalDecl) (locals : List LocalSlot)
     simp only [translateOperand, hty] at he
     match hv : c.val, he with
     | .scalar (.int ⟨bits, sz⟩), he =>
-      simp only [hv] at he
+      simp only at he
       split at he
       · next hc =>
         obtain ⟨hsz, _⟩ := hc
@@ -160,11 +160,29 @@ theorem opBits_lt (decls : List LocalDecl) (locals : List LocalSlot) (hslots : S
     simp only [opBits] at hb
     match hv : c.val, he, hb with
     | .scalar (.int ⟨bits', sz⟩), he, hb =>
-      simp only [hv] at he hb
+      simp only at he hb
       simp at hb; subst hb
       split at he
       · next hc => obtain ⟨hsz, hlt⟩ := hc; subst hsz; exact hlt
       · simp at he
+
+theorem wrap_neg_eq_toNat (x sz : Nat) (hx : x < 2 ^ (8 * sz)) :
+    let m := MirSemantics.scalarModulus sz
+    MirSemantics.wrapScalarBits (m - MirSemantics.wrapScalarBits x m) m =
+      ((- (x : Int)) % 2 ^ (8 * sz)).toNat := by
+  dsimp only
+  have hm := scalarModulus_eq sz
+  have hpos : 0 < 2 ^ (8 * sz) := Nat.two_pow_pos _
+  have hp : ((2 : Nat) ^ (8 * sz) : Int) = 2 ^ (8 * sz) := by push_cast; rfl
+  simp only [wrapScalarBits_eq, hm, Nat.mod_eq_of_lt hx]
+  by_cases hx0 : x = 0
+  · subst hx0; simp
+  · have hlt : 2 ^ (8 * sz) - x < 2 ^ (8 * sz) := by omega
+    rw [Nat.mod_eq_of_lt hlt]
+    have : (- (x : Int)) % 2 ^ (8 * sz) = (- (x : Int)) + 2 ^ (8 * sz) := by
+      rw [Int.emod_eq_add_self_emod, Int.emod_eq_of_lt (by omega) (by omega)]
+    rw [this]
+    omega
 
 theorem evalRvalue_frag (decls : List LocalDecl) (locals : List LocalSlot)
     (hslots : SlotsOk decls locals) (hn : locals.length = decls.length)
@@ -181,6 +199,24 @@ theorem evalRvalue_frag (decls : List LocalDecl) (locals : List LocalSlot)
     refine ⟨fun r hr => ?_, fun h => ?_⟩
     · simp [evalRvalue, hsome r hr]
     · simp [evalRvalue, hnone h]
+  | .unaryOp .neg op, hok =>
+    simp only [rvalueOk] at hok
+    obtain ⟨ha, hanone⟩ :=
+      evalOperand_frag decls locals hslots hn it op hok mem.borrows mem.globals layouts mem.callerLocals
+    have hbeq : Nat.beq it.size.bytes 0 = false := by
+      cases h : Nat.beq it.size.bytes 0
+      · rfl
+      · exact absurd (Nat.eq_of_beq_eq_true h) hsz
+    cases hxo : opBits locals op with
+    | none =>
+      refine ⟨fun r hr => by simp [rvBits, hxo] at hr, fun _ => ?_⟩
+      simp [evalRvalue, hanone hxo]
+    | some x =>
+      refine ⟨fun r hr => ?_, fun h => by simp [rvBits, hxo] at h⟩
+      simp [rvBits, hxo] at hr
+      subst hr
+      have hx := opBits_lt decls locals hslots it op hok x hxo
+      simp [evalRvalue, ha x hxo, hbeq, Nat.sub_eq, wrap_neg_eq_toNat x _ hx]
   | .binaryOp op a b, hok =>
     simp only [rvalueOk, Bool.and_eq_true] at hok
     obtain ⟨⟨hop, hoka⟩, hokb⟩ := hok
@@ -230,6 +266,23 @@ theorem evalStmt_assign (s : MachineState) (decls : List LocalDecl) (layouts : L
     | uninit => simp [MirStepNode.step]
     | init v => simp [MirStepNode.step]
   · simp [evalStmt, hnone h]
+
+theorem evalStmt_placeMention (s : MachineState) (decls : List LocalDecl) (layouts : Layout.LayoutTable)
+    (i : Nat) (span : String) (hslots : SlotsOk decls s.frame.locals)
+    (hn : s.frame.locals.length = decls.length) (hi : i < decls.length) :
+    evalStmt s ⟨.placeMention ⟨i, []⟩, span⟩ decls layouts =
+      .tau (.running (advanceStmt s s.frame.locals)) := by
+  have hil : i < s.frame.locals.length := by rw [hn]; exact hi
+  obtain ⟨d, hd⟩ : ∃ d, decls[i]? = some d := ⟨decls[i], by simp [hi]⟩
+  have hs : s.frame.locals[i]? = some s.frame.locals[i] := by simp [hil]
+  have hslot := hslots i d _ hd hs
+  have hlive : s.frame.locals[i] ≠ .dead := by
+    intro h; rw [h] at hslot; exact hslot
+  simp only [evalStmt, get?, hs]
+  cases hsl : s.frame.locals[i] with
+  | dead => exact absurd hsl hlive
+  | uninit => simp [MirStepNode.step]
+  | init v => simp [MirStepNode.step]
 
 theorem stepMirFn_stmt (body : CapturedMir) (s : MachineState) (bb : BasicBlockData)
     (stmt : MirAst.Statement) (hcallee : s.memory.activeCallee = none)

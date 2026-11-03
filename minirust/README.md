@@ -111,9 +111,8 @@ blocks (all parsed), 250 items (135 `impl`, 39 `enum`, 37 `struct`, 12 `fn`,
 11 `type`, 7 `macro`, 6 `use`, 3 `trait`) containing 300 functions and
 methods; 47 931 syntax nodes translated structurally and 20 opaquely (13
 attribute argument lists such as `#[specr::argmatch(statement)]`, 7 macro
-bodies that are not expression lists); 99 of 100 data types shallowly
-embedded (`NdResult` is an alias of a type defined in `libspecr`, outside the
-spec).
+bodies that are not expression lists); 100 of 100 data types shallowly
+embedded (0 skipped).
 
 The generated model is not executable: the deep embedding is syntax. The
 executable meaning of the fragment is `Interp.lean`.
@@ -122,9 +121,10 @@ executable meaning of the fragment is `Interp.lean`.
 
 `Interp.lean` transcribes, against the *generated* types, the specr-lang
 functions needed to run the fragment below on `Machine<BasicMemory<x86_64>>`:
-`Machine::step` (single enabled thread), `Statement::Assign`,
-`PlaceExpr::Local`, `ValueExpr::{Constant, Load, BinOp}` with
-`IntBinOp::{Add, Sub, Mul}`, `Terminator::{Goto, Switch, Return}` including
+`Machine::step` (single enabled thread), `Statement::{Assign, PlaceMention}`,
+`PlaceExpr::Local`, `ValueExpr::{Constant, Load, UnOp, BinOp}` with
+`IntUnOp::Neg` and `IntBinOp::{Add, Sub, Mul}`,
+`Terminator::{Goto, Switch, Return, Unreachable}` including
 frame teardown and both stack-pop actions, the representation relation for
 `Int` and `Bool`, `Type::layout`, `BasicMemory`'s `check_ptr`, `load`, `store`,
 and `deallocate`, and `ConcurrentMemory`'s access log and data-race check.
@@ -136,7 +136,7 @@ marks elided code). Effects are
 (a panic in the spec, which upstream calls a spec bug), and
 `Stop.unsupported` (outside the interpreted fragment; never silently wrong).
 
-`Anchors.lean` lists the 32 upstream items that `Interp.lean` transcribes,
+`Anchors.lean` lists the 36 upstream items that `Interp.lean` transcribes,
 each with its name, line, and token hash, and proves by `decide` that the
 generated model contains them unchanged. Re-pinning MiniRust therefore breaks
 the build until every affected transcription is re-reviewed.
@@ -153,11 +153,12 @@ restricted to the fragment checked by `inFragment`:
 * the body is `Runtime(PostCleanup)` MIR and declares only the return place
   and the arguments, all of integer type (`u8`..`u128`, `i8`..`i128`,
   `usize`, `isize`);
-* statements are `_i = Use(op)` or `_i = BinaryOp(Add | Sub | Mul, op, op)`,
+* statements are `_i = Use(op)`, `_i = UnaryOp(Neg, op)`,
+  `_i = BinaryOp(Add | Sub | Mul, op, op)`, or `PlaceMention(_i)`,
   with `op` a projection-free `copy _j` or an integer constant of `_i`'s type;
 * terminators are `Goto`, `SwitchInt` on an integer `copy _j` with distinct
-  in-range values, and `Return`; all targets are blocks of the body; no
-  cleanup blocks.
+  in-range values, `Return`, and `Unreachable`; all targets are blocks of the
+  body; no cleanup blocks.
 
 ### States
 
@@ -189,9 +190,14 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
   the caller (`ReturnRel`); Anneal UB matches MiniRust UB (`throw_ub!`, never a
   spec panic, deadlock, or unsupported construct); every other Anneal outcome,
   including `unsupported`, is impossible.
-* `run_ret`, `run_ub` (`Run.lean`): lifted to Anneal's interaction tree
-  `mirTree body s` and the trusted predicates `ReachesRet` / `Reaches` +
-  `FaultNow`: if Anneal returns `v` (or can reach UB), then MiniRust performs
+* `step_initBlock`, `step_start` (`Simulation.lean`): proves for every
+  translated function `f` that `minimize`'s synthesized entry block
+  (`f.start = bbName body.basicBlocks.length`) steps in 1 step (`Goto bb0`) to
+  the `bb0` state related by `StateRel`.
+* `run_ret`, `run_ub`, `run_ret_from_start`, `run_ub_from_start` (`Run.lean`):
+  lifted to Anneal's interaction tree `mirTree body s` and the trusted
+  predicates `ReachesRet` / `Reaches` + `FaultNow`: if Anneal returns `v` (or
+  can reach UB), then MiniRust started either at `bb0` or at `f.start` performs
   the corresponding return (or raises UB) within finitely many steps.
 * `steps_error` (`Run.lean`): conversely, if MiniRust stops with *any* error
   within `n` steps of related states, the error is UB and Anneal can reach UB,
@@ -206,14 +212,25 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
 * `sumTo`, the MIR of a `u32` loop with `switchInt`, wrapping `Add`/`Sub`,
   constants, and `Goto`: Anneal returns `6` for `n = 3`
   (`sumTo_anneal_ret`); the initial states are related (`sumTo_rel`); the
-  theorem then yields a MiniRust return writing the bytes of `6u32`
-  (`sumTo_minirust_ret`), which agrees with a direct 16-step run of the
-  interpretation (`sumTo_minirust_direct`). `sumTo_translate` spells out the
+  theorem then yields a MiniRust return writing the bytes of `6u32` both from
+  `bb0` (`sumTo_minirust_ret`) and from `f.start`
+  (`sumTo_minirust_ret_from_start`), which agrees with direct 16-step and
+  17-step runs of the interpretation (`sumTo_minirust_direct`,
+  `sumTo_minirust_direct_from_start`). `sumTo_translate` spells out the
   translated MiniRust function, and `sumTo_init_step` steps `minimize`'s init
   block into the related initial machine.
 * `retUninit`, a body returning an uninitialized `_0`: Anneal faults
-  (`retUninit_anneal_ub`), hence MiniRust raises UB (`retUninit_minirust_ub`),
-  as a direct run confirms (`retUninit_minirust_direct`).
+  (`retUninit_anneal_ub`), hence MiniRust raises UB both from `bb0`
+  (`retUninit_minirust_ub`) and from `f.start`
+  (`retUninit_minirust_ub_from_start`), as a direct run confirms
+  (`retUninit_minirust_direct`).
+* `negMention`, a body exercising `PlaceMention(_0)` (while `_0` is still
+  uninitialized), wrapping integer negation `_0 = Neg(copy _1)`, and an
+  `Unreachable` terminator on the `_1 == 0` branch: for `_1 = 5`, returns
+  `4294967291` (`negMention5_minirust_ret_from_start`, confirmed by
+  `negMention5_minirust_direct`); for `_1 = 0`, computes `-0 = 0` and takes
+  the `Unreachable` branch to raise UB (`negMention0_minirust_ub_from_start`,
+  confirmed by `negMention0_minirust_direct`).
 
 ### Gaps
 

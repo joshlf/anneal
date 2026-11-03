@@ -40,19 +40,26 @@ elab "#assert_standard_axioms " ids:ident* : command => do
 open MiniRustSpec.Correspondence in
 #assert_standard_axioms
   step_correspondence
+  step_initBlock
+  step_start
   reaches_rel
   run_ret
+  run_ret_from_start
   run_ub
+  run_ub_from_start
   steps_error
   runA_sound
   faultsA_sound
   evalReturn_callee
   evalStatement_assign
+  evalStatement_placeMention
   evalValue_operand
   evalStmt_assign
+  evalStmt_placeMention
   evalOperand_frag
   switch_lookup
   translateFn_spec
+  translateFn_start
 
 open MiniRustSpec.Correspondence.Witness in
 #assert_standard_axioms
@@ -63,12 +70,25 @@ open MiniRustSpec.Correspondence.Witness in
   sumTo_anneal_ret
   sumTo_minirust_ret
   sumTo_minirust_direct
+  sumTo_minirust_ret_from_start
+  sumTo_minirust_direct_from_start
   retUninit_inFragment
   retUninit_translate
   retUninit_rel
   retUninit_anneal_ub
   retUninit_minirust_ub
   retUninit_minirust_direct
+  retUninit_minirust_ub_from_start
+  negMention_inFragment
+  negMention_translate
+  negMention5_rel
+  negMention5_anneal_ret
+  negMention5_minirust_ret_from_start
+  negMention5_minirust_direct
+  negMention0_rel
+  negMention0_anneal_ub
+  negMention0_minirust_ub_from_start
+  negMention0_minirust_direct
 
 #assert_standard_axioms MiniRustSpec.Anchors.anchors_ok
 

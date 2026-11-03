@@ -113,7 +113,7 @@
     "Visibility::Inherited": {"structural": 492, "opaque": 0},
     "Visibility::Public": {"structural": 170, "opaque": 0}
   },
-  "shallow_types": {"translated": 99, "candidates": 100, "items": [
+  "shallow_types": {"translated": 100, "candidates": 100, "items": [
     {"file": "spec/lang/machine.md", "line": 11, "item": "Machine", "kind": "struct", "status": "translated"},
     {"file": "spec/lang/machine.md", "line": 54, "item": "StackFrame", "kind": "struct", "status": "translated"},
     {"file": "spec/lang/machine.md", "line": 77, "item": "StackPopAction", "kind": "enum", "status": "translated"},
@@ -210,7 +210,7 @@
     {"file": "spec/prelude/main.md", "line": 12, "item": "Offset", "kind": "type alias", "status": "translated"},
     {"file": "spec/prelude/main.md", "line": 17, "item": "Result", "kind": "type alias", "status": "translated"},
     {"file": "spec/prelude/main.md", "line": 21, "item": "TerminationInfo", "kind": "enum", "status": "translated"},
-    {"file": "spec/prelude/main.md", "line": 78, "item": "NdResult", "kind": "type alias", "status": "not translated: `libspecr :: NdResult < T , TerminationInfo >` is defined outside the specification and has no Lean counterpart"},
+    {"file": "spec/prelude/main.md", "line": 78, "item": "NdResult", "kind": "type alias", "status": "translated"},
     {"file": "spec/prelude/target.md", "line": 9, "item": "Target", "kind": "trait (class)", "status": "translated"},
     {"file": "spec/prelude/target.md", "line": 32, "item": "x86_64", "kind": "struct", "status": "translated"},
     {"file": "spec/prelude/target.md", "line": 35, "item": "instTargetx86_64", "kind": "trait impl (instance)", "status": "translated"}

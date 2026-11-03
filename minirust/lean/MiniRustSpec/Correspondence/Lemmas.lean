@@ -141,4 +141,42 @@ theorem translateFn_spec (body : CapturedMir) (f : Gen.Function) (h : translateF
         apply mapGet_append_of_some
         simpa using hget
 
+theorem translateBlocks_append_get (decls : List LocalDecl) (k : Nat) (bbs : List BasicBlockData)
+    (B : List (Gen.BbName × Gen.BasicBlock)) (h : translateBlocks decls k bbs = some B)
+    (m : Nat) (hm : k + bbs.length ≤ m) :
+    mapGet ⟨B ++ [(bbName m, initBlock)]⟩ (bbName m) = some initBlock := by
+  induction bbs generalizing k B with
+  | nil => simp [translateBlocks] at h; subst h; simp [mapGet_cons]
+  | cons bb bbs ih =>
+    simp only [translateBlocks, Option.bind_eq_bind] at h
+    cases htb : translateBlock decls bb with
+    | none => simp [htb] at h
+    | some tb =>
+      cases hrest : translateBlocks decls (k + 1) bbs with
+      | none => simp [htb, hrest] at h
+      | some rest =>
+        simp [htb, hrest] at h
+        subst h
+        rw [List.cons_append, mapGet_cons]
+        split
+        · next heq => rw [bbName_inj] at heq; simp at hm; omega
+        · exact ih (k + 1) rest hrest (by simp at hm; omega)
+
+/-- `translateFn` sets `f.start` to `bbName body.basicBlocks.length` and maps
+that name to `initBlock` (`Goto(bb0)`). -/
+theorem translateFn_start (body : CapturedMir) (f : Gen.Function) (h : translateFn body = some f) :
+    f.start = bbName body.basicBlocks.length ∧
+    mapGet f.blocks (bbName body.basicBlocks.length) = some initBlock := by
+  simp only [translateFn, Option.bind_eq_bind] at h
+  cases hL : translateLocals 0 body.localDecls with
+  | none => simp [hL] at h
+  | some L =>
+    cases hB : translateBlocks body.localDecls 0 body.basicBlocks with
+    | none => simp [hL, hB] at h
+    | some B =>
+      simp [hL, hB] at h
+      subst h
+      exact ⟨rfl, translateBlocks_append_get body.localDecls 0 body.basicBlocks B hB
+        body.basicBlocks.length (by omega)⟩
+
 end MiniRustSpec.Correspondence

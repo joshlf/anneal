@@ -142,6 +142,24 @@ theorem run_ret {body : CapturedMir} {f : Gen.Function} (hfrag : inFragment body
     obtain ⟨m'', hm'', hret⟩ := hsr
     exact ⟨n + 1, s', m'', by rw [steps_add, hsteps]; simp [Interp.steps, hm''], hret⟩
 
+/-- **Returns from `f.start`.** Starting MiniRust at the `minimize` entry
+block (`f.start = bbName body.basicBlocks.length`) steps through `initBlock`
+into `bb0` and then matches Anneal's return from `s` (`blockIdx = 0`,
+`stmtIdx = 0`). -/
+theorem run_ret_from_start {body : CapturedMir} {f : Gen.Function} (hfrag : inFragment body = true)
+    (hf : translateFn body = some f) (ctx : Ctx) (s : MachineState) (m0 mInit : Mach)
+    (hrel : StateRel body f ctx s m0) (hb0 : s.frame.blockIdx = 0) (hs0 : s.frame.stmtIdx = 0)
+    (hinit : Shape mInit ctx
+      [ctx.caller, calleeFrame f ctx body.localDecls.length body.basicBlocks.length 0]
+      (ctx.base ++ localAllocs ctx body.localDecls s.frame.locals))
+    {tr : List (Event MirEffect)} {v : Value} {mem : MirSemantics.Memory}
+    (hret : ReachesRet (mirTree body s) tr (.normal (v, mem))) :
+    ∃ (n : Nat) (s' : MachineState) (m' : Mach),
+      Interp.steps n mInit = .ok m' ∧ ReturnRel body ctx s' v m' := by
+  obtain ⟨m1, hm1, hrel1⟩ := step_start hf hrel hb0 hs0 hinit
+  obtain ⟨n, s', m', hsteps, hret'⟩ := run_ret hfrag hf ctx s m1 hrel1 hret
+  exact ⟨n + 1, s', m', by simp [Interp.steps, hm1, hsteps], hret'⟩
+
 /-- **UB.** If Anneal's semantics of `body` from `s` can reach UB (along any
 trace of branch observations), MiniRust, started from a related machine,
 raises UB after finitely many steps. -/
@@ -180,6 +198,23 @@ theorem run_ub {body : CapturedMir} {f : Gen.Function} (hfrag : inFragment body 
           refine ⟨n1 + n2 + 1, msg, ?_⟩
           rw [steps_add, steps_add, h1]
           simp [h2, Interp.steps, hmsg]
+
+/-- **UB from `f.start`.** Starting MiniRust at the `minimize` entry block
+(`f.start = bbName body.basicBlocks.length`) steps through `initBlock` into
+`bb0` and then raises UB whenever Anneal's semantics from `s` (`blockIdx = 0`,
+`stmtIdx = 0`) can reach UB. -/
+theorem run_ub_from_start {body : CapturedMir} {f : Gen.Function} (hfrag : inFragment body = true)
+    (hf : translateFn body = some f) (ctx : Ctx) (s : MachineState) (m0 mInit : Mach)
+    (hrel : StateRel body f ctx s m0) (hb0 : s.frame.blockIdx = 0) (hs0 : s.frame.stmtIdx = 0)
+    (hinit : Shape mInit ctx
+      [ctx.caller, calleeFrame f ctx body.localDecls.length body.basicBlocks.length 0]
+      (ctx.base ++ localAllocs ctx body.localDecls s.frame.locals))
+    {tr : List (Event MirEffect)} {u : ITree MirEffect MirOutcome}
+    (hreach : Reaches (mirTree body s) tr u) (hfault : FaultNow u) :
+    ∃ (n : Nat) (msg : String), Interp.steps n mInit = .error (.ub msg) := by
+  obtain ⟨m1, hm1, hrel1⟩ := step_start hf hrel hb0 hs0 hinit
+  obtain ⟨n, msg, hsteps⟩ := run_ub hfrag hf ctx s m1 hrel1 hreach hfault
+  exact ⟨n + 1, msg, by simp [Interp.steps, hm1, hsteps]⟩
 
 /-- **Errors.** If MiniRust stops with an error `e` within `n` steps of a
 related machine, then `e` is UB and Anneal's semantics can reach UB, or

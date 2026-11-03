@@ -1314,6 +1314,9 @@ Source: `spec/prelude/main.md:17` (MiniRust `d821c6e3`).
 -/
 abbrev Result (T : Type := Unit) : Type := (Except TerminationInfo T)
 
+/-- Source: `spec/prelude/main.md:78` (MiniRust `d821c6e3`). -/
+abbrev NdResult (T : Type := Unit) : Type := (LibSpecr.NdResult T TerminationInfo)
+
 /--
 Shallow class: associated types only. Omitted (deep embedding only): const `PTR_SIZE`, const `PTR_ALIGN`, const `INT_MAX_ALIGN`, const `ENDIANNESS`, const `MAX_ATOMIC_SIZE`, fn `valid_size`.
 

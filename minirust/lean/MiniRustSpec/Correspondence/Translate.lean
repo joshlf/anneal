@@ -29,12 +29,12 @@ The translation is defined only on the fragment checked by `inFragment`:
 
 * the body declares exactly the return place and the arguments
   (`localDecls.length = argCount + 1`), all of integer type;
-* statements are `_i = Use(copy _j)`, `_i = Use(const c)`, or
-  `_i = BinaryOp(op, a, b)` with `op ∈ {Add, Sub, Mul}`, where every operand
-  is `copy _j` (no projections) or an integer constant, all of the destination's
-  type;
-* terminators are `Goto`, `SwitchInt` on an integer `copy _j`, or `Return`, and
-  every jump target is a block of the body;
+* statements are `_i = Use(copy _j)`, `_i = Use(const c)`,
+  `_i = UnaryOp(Neg, a)`, `_i = BinaryOp(op, a, b)` with `op ∈ {Add, Sub, Mul}`,
+  where every operand is `copy _j` (no projections) or an integer constant, all
+  of the destination's type, or `PlaceMention(_i)`;
+* terminators are `Goto`, `SwitchInt` on an integer `copy _j`, `Unreachable`, or
+  `Return`, and every jump target is a block of the body;
 * no block is a cleanup block.
 
 `Operand::Move` is excluded on purpose: `minimize` translates it exactly like
@@ -129,28 +129,54 @@ def translateBinOp : MirAst.BinOp → Option Gen.IntBinOp
   | .mul => some .Mul
   | _ => none
 
-/-- `minimize`'s rvalue translation for `Use` and `BinaryOp`. -/
+/-- `minimize`'s rvalue translation for `Use`, `UnaryOp(Neg)`, and `BinaryOp`
+(`tooling/minimize/src/rvalue.rs`):
+> "match rv {
+>      smir::Rvalue::Use(operand) => self.translate_operand_smir(operand, span),
+>      smir::Rvalue::BinaryOp(bin_op, l, r) => {
+>          ..
+>          let l = self.translate_operand_smir(l, span);
+>          let r = self.translate_operand_smir(r, span);
+>          ..
+>      }
+>      ..
+>      smir::Rvalue::UnaryOp(unop, operand) => {
+>          let ty_smir = operand.ty(&self.locals_smir).unwrap();
+>          let ty = self.translate_ty_smir(ty_smir, span);
+>          let operand = self.translate_operand_smir(operand, span);
+>          use smir::UnOp::*;
+>          match (unop, ty) {
+>              (Neg, Type::Int(_)) => build::neg(operand),"
+where `build::neg(x)` is `ValueExpr::UnOp { operator: UnOp::Int(IntUnOp::Neg), operand: x }`. -/
 def translateRvalue : MirAst.Rvalue → Option Gen.ValueExpr
   | .use op => translateOperand op
+  | .unaryOp .neg op => do
+    pure (.UnOp (.Int .Neg) (← translateOperand op))
   | .binaryOp op l r => do
     let iop ← translateBinOp op
     pure (.BinOp (.Int iop) (← translateOperand l) (← translateOperand r))
   | _ => none
 
-/-- `minimize`'s statement translation for assignments to a projection-free
-place (`tooling/minimize/src/bb.rs`):
+/-- `minimize`'s statement translation for assignments and `PlaceMention` on a
+projection-free place (`tooling/minimize/src/bb.rs`):
 > "rs::StatementKind::Assign(operands) => {
 >      let (place, rval) = &**operands;
 >      let destination = self.translate_place(place, span);
 >      ..
 >      let source = self.translate_rvalue(rval, span);
 >      Statement::Assign { destination, source }
+>  }
+>  ..
+>  rs::StatementKind::PlaceMention(place) => {
+>      let place = self.translate_place(place, span);
+>      Statement::PlaceMention(place)
 >  }"
 where the elided part special-cases two pointer-provenance casts, which are
 outside the fragment. -/
 def translateStatement (s : MirAst.Statement) : Option Gen.Statement :=
   match s.kind with
   | .assign ⟨i, []⟩ rv => (translateRvalue rv).map (fun src => .Assign (.Local (localName i)) src)
+  | .placeMention ⟨i, []⟩ => some (.PlaceMention (.Local (localName i)))
   | _ => none
 
 /-- `minimize`'s switch cases for a discriminant of type `it`:
@@ -175,7 +201,8 @@ def switchCases (it : Gen.IntType) (branches : List (Nat × Nat)) : Map Int Gen.
 >      let fallback_block = targets.otherwise();
 >      let fallback = self.bb_name_map[&fallback_block];
 >      Terminator::Switch { value, cases, fallback }
->  }"
+>  }
+>  rs::TerminatorKind::Unreachable => Terminator::Unreachable,"
 restricted to integer-typed `switchInt` discriminants (for `bool`, `minimize`
 inserts a transmute to `u8`, which is outside this fragment). -/
 def translateTerminator (decls : List MirAst.LocalDecl) (t : MirAst.Terminator) :
@@ -186,6 +213,7 @@ def translateTerminator (decls : List MirAst.LocalDecl) (t : MirAst.Terminator) 
     let v ← translateOperand discr
     let it ← operandIntType decls discr
     pure (.Switch v (switchCases it targets.branches) (bbName targets.otherwise))
+  | .unreachable => some .Unreachable
   | .return_ => some .Return
   | _ => none
 
@@ -277,6 +305,7 @@ def operandOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) (op : MirAst.Op
 /-- Fragment rvalues of integer type `it`. -/
 def rvalueOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rvalue → Bool
   | .use op => operandOk decls it op
+  | .unaryOp .neg op => operandOk decls it op
   | .binaryOp op a b => (translateBinOp op).isSome && operandOk decls it a && operandOk decls it b
   | _ => false
 
@@ -287,6 +316,7 @@ def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement) : Bool :=
     match decls[i]? >>= fun d => intTypeOf d.ty with
     | none => false
     | some it => rvalueOk decls it rv
+  | .placeMention ⟨i, []⟩ => decide (i < decls.length)
   | _ => false
 
 /-- Fragment terminators; jump targets must be blocks of the body and
@@ -303,6 +333,7 @@ def terminatorOk (decls : List MirAst.LocalDecl) (nblocks : Nat) (t : MirAst.Ter
       (targets.branches.map Prod.fst).Nodup &&
       decide (targets.otherwise < nblocks)
     | _, _ => false
+  | .unreachable => true
   | .return_ => true
   | _ => false
 

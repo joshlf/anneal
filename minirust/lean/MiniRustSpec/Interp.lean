@@ -666,6 +666,47 @@ def evalConstant : Constant → Interp Val
   | .Bool b => pure (.Bool b)
   | _ => unsupported "eval_constant for a pointer constant"
 
+/-- `Machine::eval_int_un_op` for `Neg` (`spec/lang/step/operators.md`):
+> "fn eval_int_un_op(op: IntUnOp, operand: Int, operand_ty: IntType) -> Result<Int> {
+>     use IntUnOp::*;
+>     ret(match op {
+>         // Put the result into the right range (in case of overflow).
+>         Neg => operand_ty.bring_in_bounds(-operand),
+>         ..
+>     })
+> }" -/
+def evalIntUnOp (op : IntUnOp) (operand : Int) (operandTy : IntType) : Interp Int :=
+  match op with
+  | .Neg => pure (IntType.bring_in_bounds operandTy (-operand))
+  | _ => unsupported "eval_int_un_op for an operator other than Neg"
+
+/-- `Machine::eval_un_op` for `UnOp::Int`:
+> "fn eval_un_op(&self, UnOp::Int(op): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
+>     let Type::Int(int_ty) = op_ty else { panic!(\"non-integer input to integer operation\") };
+>     let Value::Int(operand) = operand else { panic!(\"non-integer input to integer operation\") };
+>     let ret_ty = match op {
+>         IntUnOp::CountOnes => IntType { signed: Unsigned, size: Size::from_bytes(4).unwrap() },
+>         _ => int_ty,
+>     };
+>     let result = Value::Int(Self::eval_int_un_op(op, operand, int_ty)?);
+>     // Sanity-check that the result of `eval_int_un_op` is in-bounds.
+>     self.check_value(result, Type::Int(ret_ty))
+>         .expect(\"sanity check: result of UnOp::Int does not fit in the return type\");
+>     ret((result, Type::Int(ret_ty)))
+> }" -/
+def evalUnOp (op : UnOp) (arg : Val × «Type») : Interp (Val × «Type») :=
+  match op, arg with
+  | .Int op, (.Int operand, .Int intTy) => do
+    let retTy := match op with
+      | .CountOnes => ⟨.Unsigned, ⟨4⟩⟩
+      | _ => intTy
+    let result : Val := .Int (← evalIntUnOp op operand intTy)
+    match checkValue result (.Int retTy) with
+    | .ok () => pure (result, .Int retTy)
+    | .error _ => specPanic "sanity check: result of UnOp::Int does not fit in the return type"
+  | .Int _, _ => specPanic "non-integer input to integer operation"
+  | _, _ => unsupported "eval_un_op for a non-Int operator"
+
 /-- `Machine::eval_int_bin_op` for the wrapping arithmetic operators:
 > "Add => left + right,
 >  ..
@@ -696,7 +737,7 @@ def evalBinOp (op : BinOp) (l : Val × «Type») (r : Val × «Type») : Interp 
   | .Int _, _, _ => specPanic "non-integer input to integer operation"
   | _, _, _ => unsupported "eval_bin_op for a non-Int operator"
 
-/-- `Machine::eval_value` for `Constant`, `Load`, and `BinOp`:
+/-- `Machine::eval_value` for `Constant`, `Load`, `UnOp`, and `BinOp`:
 > "fn eval_value(&mut self, ValueExpr::Constant(constant, ty): ValueExpr) -> .. {
 >     ret((self.eval_constant(constant)?, ty))
 > }
@@ -708,6 +749,11 @@ def evalBinOp (op : BinOp) (l : Val × «Type») (r : Val × «Type») : Interp 
 >     ret((v, ty))
 > }
 > ..
+> fn eval_value(&mut self, ValueExpr::UnOp { operator, operand }: ValueExpr) -> .. {
+>     ..
+>     let operand = self.eval_value(operand)?;
+>     ret(self.eval_un_op(operator, operand)?)
+> }
 > fn eval_value(&mut self, ValueExpr::BinOp { operator, left, right }: ValueExpr) -> .. {
 >     ..
 >     let left = self.eval_value(left)?;
@@ -720,6 +766,9 @@ def evalValue (m : Mach) : ValueExpr → Interp ((Val × «Type») × Mach)
     let (place, ty) ← evalPlace m source
     let (v, m) ← placeLoad m place ty
     pure ((v, ty), m)
+  | .UnOp operator operand => do
+    let (arg, m) ← evalValue m operand
+    pure (← evalUnOp operator arg, m)
   | .BinOp operator left right => do
     let (l, m) ← evalValue m left
     let (r, m) ← evalValue m right
@@ -728,17 +777,27 @@ def evalValue (m : Mach) : ValueExpr → Interp ((Val × «Type») × Mach)
 
 /-! ## Statements (`spec/lang/step/statements.md`) -/
 
-/-- `Machine::eval_statement` for `Statement::Assign`:
-> "let (place, ty) = self.eval_place(destination)?;
->  let (val, _) = self.eval_value(source)?;
->  self.place_store(place, val, ty)?;
->  ret(())" -/
+/-- `Machine::eval_statement` for `Statement::Assign` and `Statement::PlaceMention`:
+> "fn eval_statement(&mut self, Statement::Assign { destination, source }: Statement) -> NdResult {
+>     let (place, ty) = self.eval_place(destination)?;
+>     let (val, _) = self.eval_value(source)?;
+>     self.place_store(place, val, ty)?;
+>     ret(())
+> }
+> ..
+> fn eval_statement(&mut self, Statement::PlaceMention(place): Statement) -> NdResult {
+>     self.eval_place(place)?;
+>     ret(())
+> }" -/
 def evalStatement (m : Mach) : Statement → Interp Mach
   | .Assign destination source => do
     let (place, ty) ← evalPlace m destination
     let ((val, _), m) ← evalValue m source
     placeStore m place val ty
-  | _ => unsupported "eval_statement for a statement other than Assign"
+  | .PlaceMention place => do
+    let _ ← evalPlace m place
+    pure m
+  | _ => unsupported "eval_statement for a statement other than Assign/PlaceMention"
 
 /-! ## Terminators (`spec/lang/step/terminators.md`) -/
 
@@ -855,7 +914,7 @@ def evalReturn (m : Mach) : Interp Mach := do
       | some nb => jumpToBlock m nb
       | none => ub "return from a function where caller did not specify next block"
 
-/-- `Machine::eval_terminator` for `Goto`, `Switch`, and `Return`:
+/-- `Machine::eval_terminator` for `Goto`, `Switch`, `Unreachable`, and `Return`:
 > "fn eval_terminator(&mut self, Terminator::Goto(block_name): Terminator) -> NdResult {
 >     self.jump_to_block(block_name)?;
 >     ret(())
@@ -866,6 +925,10 @@ def evalReturn (m : Mach) : Interp Mach := do
 >     let next = cases.get(value).unwrap_or(fallback);
 >     self.jump_to_block(next)?;
 >     ret(())
+> }
+> ..
+> fn eval_terminator(&mut self, Terminator::Unreachable: Terminator) -> NdResult {
+>     throw_ub!(\"reached unreachable code\");
 > }" -/
 def evalTerminator (m : Mach) : Terminator → Interp Mach
   | .Goto blockName => jumpToBlock m blockName
@@ -874,8 +937,9 @@ def evalTerminator (m : Mach) : Terminator → Interp Mach
     match v with
     | .Int i => jumpToBlock m ((mapGet cases i).getD fallback)
     | _ => specPanic "switch on a non-integer"
+  | .Unreachable => ub "reached unreachable code"
   | .Return => evalReturn m
-  | _ => unsupported "eval_terminator for a terminator other than Goto/Switch/Return"
+  | _ => unsupported "eval_terminator for a terminator other than Goto/Switch/Unreachable/Return"
 
 /-! ## The step function (`spec/lang/machine.md`) -/
 

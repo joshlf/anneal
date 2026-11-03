@@ -98,4 +98,12 @@ structure PhantomData (T : Type) : Type where
 structure DynWrite : Type where
   written : List String
 
+/-- `libspecr::Nondet<T>`: the non-determinism monad wrapper (`pub struct Nondet<T>(pub T);`). -/
+structure Nondet (T : Type) : Type where
+  val : T
+  deriving DecidableEq
+
+/-- `libspecr::NdResult<T, E>`: `Result<Nondet<T>, E>`. -/
+abbrev NdResult (T : Type := Unit) (E : Type := Empty) : Type := Except E (Nondet T)
+
 end MiniRustSpec.LibSpecr

@@ -394,7 +394,7 @@ theorem FrameOk.decl_good {body : CapturedMir} {f : Gen.Function} {ctx : Ctx} {l
   intTypeOf_good ((translateFn_spec body f h.hf).2.1 i d hd).1
 
 theorem FrameOk.localAllocs_get {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
-    {locals : List LocalSlot} {m : Mach} {blk stmt : Nat} (h : FrameOk body f ctx locals m blk stmt)
+    {locals : List LocalSlot} {m : Mach} {blk stmt : Nat} (_h : FrameOk body f ctx locals m blk stmt)
     (i : Nat) (d : LocalDecl) (slot : LocalSlot) (hd : body.localDecls[i]? = some d)
     (hs : locals[i]? = some slot) :
     (localAllocs ctx body.localDecls locals)[i]? =
@@ -454,7 +454,7 @@ theorem evalValue_operand {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     simp only [translateOperand, hty] at he
     match hv : c.val, he with
     | .scalar (.int ⟨bits, sz⟩), he =>
-      simp only [hv] at he
+      simp only at he
       split at he
       · next hc =>
         simp only [Option.some.injEq] at he
@@ -471,6 +471,9 @@ theorem evalValue_operand {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
 `none` when evaluating it is UB. -/
 def rvBits (locals : List LocalSlot) (it : Gen.IntType) : Rvalue → Option Nat
   | .use op => opBits locals op
+  | .unaryOp .neg op => do
+    let x ← opBits locals op
+    pure ((- (x : Int)) % 2 ^ (8 * it.size.bytes)).toNat
   | .binaryOp op a b => do
     let iop ← translateBinOp op
     let x ← opBits locals a
@@ -501,6 +504,17 @@ theorem bringInBounds_intArith (op : MirAst.BinOp) (iop : Gen.IntBinOp)
     rw [intFromBits_emod y it hy, Int.emod_eq_of_lt (by omega) (by exact_mod_cast hy)]
   exact intArith_emod op iop hop _ _ _ _ _ hx' hy'
 
+theorem intFromBits_zero (it : Gen.IntType) : intFromBits 0 it = 0 := by
+  rcases it with ⟨s, sz⟩
+  cases s <;> simp [intFromBits, Nat.two_pow_pos]
+
+theorem bringInBounds_neg (it : Gen.IntType) (hgood : GoodSize it.size.bytes)
+    (x : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) :
+    IntType.bring_in_bounds it (- intFromBits x it) =
+      intFromBits ((- (x : Int)) % 2 ^ (8 * it.size.bytes)).toNat it := by
+  have h := bringInBounds_intArith .sub .Sub rfl it hgood 0 x (Nat.two_pow_pos _) hx
+  simpa [intArith, intFromBits_zero] using h
+
 /-- Evaluating a translated fragment rvalue. -/
 theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     {locals : List LocalSlot} {m : Mach} {blk stmt : Nat} (h : FrameOk body f ctx locals m blk stmt)
@@ -516,6 +530,36 @@ theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     simp only [rvalueOk] at hok
     simp only [translateRvalue] at he
     exact evalValue_operand h it op hok e he
+  | .unaryOp .neg op, hok, he =>
+    simp only [rvalueOk] at hok
+    simp only [translateRvalue, Option.bind_eq_bind] at he
+    cases heo : translateOperand op with
+    | none => simp [heo] at he
+    | some eo =>
+      simp [heo] at he
+      subst he
+      obtain ⟨haok, hanone⟩ := evalValue_operand h it op hok eo heo
+      cases hxo : opBits locals op with
+      | none =>
+        refine ⟨fun r hr => by simp [rvBits, hxo] at hr, fun _ => ?_⟩
+        obtain ⟨msg, hmsg⟩ := hanone hxo
+        exact ⟨msg, by simp [evalValue, hmsg]⟩
+      | some x =>
+        obtain ⟨hx, m1, hm1, h1⟩ := haok x hxo
+        refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits, hxo] at hnone⟩
+        simp [rvBits, hxo] at hr
+        subst hr
+        have hpos := two_pow_pos (8 * it.size.bytes)
+        have hlt : ((- (x : Int)) % 2 ^ (8 * it.size.bytes)).toNat < 2 ^ (8 * it.size.bytes) := by
+          have h0 := Int.emod_nonneg (- (x : Int)) (Int.ne_of_gt hpos)
+          have hlt' := Int.emod_lt_of_pos (- (x : Int)) hpos
+          have : (((- (x : Int)) % 2 ^ (8 * it.size.bytes)).toNat : Int) < 2 ^ (8 * it.size.bytes) := by
+            rw [Int.toNat_of_nonneg h0]; exact hlt'
+          exact_mod_cast this
+        have hrep := canRepresent_intFromBits it _ hgood hlt
+        refine ⟨hlt, m1, ?_, h1⟩
+        simp [evalValue, hm1, evalUnOp, evalIntUnOp, bringInBounds_neg it hgood x hx,
+          checkValue, hrep]
   | .binaryOp op a b, hok, he =>
     simp only [rvalueOk, Bool.and_eq_true] at hok
     obtain ⟨⟨hop, hoka⟩, hokb⟩ := hok
@@ -634,6 +678,16 @@ theorem evalStatement_assign {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
   · obtain ⟨msg, hmsg⟩ := hrnone hnone
     exact ⟨msg, by simp [evalStatement, hplace, hmsg]⟩
 
+/-- `Machine::eval_statement` on a translated fragment `PlaceMention`. -/
+theorem evalStatement_placeMention {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {locals : List LocalSlot} {m : Mach} {blk stmt : Nat} (h : FrameOk body f ctx locals m blk stmt)
+    (i : Nat) (hi : i < body.localDecls.length) :
+    evalStatement m (.PlaceMention (.Local (localName i))) = .ok m := by
+  obtain ⟨d, _, hd, _⟩ := h.slot_exists i hi
+  have hspec := (translateFn_spec body f h.hf).2.1 i d hd
+  have hplace := evalPlace_local h.shape i hi _ hspec.2
+  simp [evalStatement, hplace]
+
 /-! ## `Switch` -/
 
 theorem intFromBits_inj (it : Gen.IntType) (a b : Nat) (ha : a < 2 ^ (8 * it.size.bytes))
@@ -667,7 +721,7 @@ theorem switch_lookup (it : Gen.IntType) (bits : Nat) (hb : bits < 2 ^ (8 * it.s
         cases h : Nat.beq bits v
         · rfl
         · exact absurd (Nat.eq_of_beq_eq_true h).symm hvb
-      simp only [hne, if_false, hbeq]
+      simp only [hne, ite_false, hbeq]
       exact ih'
 
 /-! ## `Return` -/
@@ -694,7 +748,7 @@ theorem killAt_cons (L : List Gen.Allocation) (i : Nat) (is : List Nat) (a : Gen
   by_cases hij : i = j
   · subst hij
     simp [hi, hni, List.getElem?_set_self (List.getElem?_eq_some_iff.mp hi).1]
-  · simp [List.getElem?_set_ne hij, hij, Ne.symm hij]
+  · simp [List.getElem?_set_ne hij, Ne.symm hij]
 
 theorem killAt_range (L : List Gen.Allocation) : killAt L (List.range L.length) = L.map kill := by
   apply List.ext_getElem?
@@ -785,13 +839,12 @@ theorem typedStore_base {m : Mach} {ctx : Ctx} {frames : List Frame} {L : List G
   have hck : checkValue (.Int v) (.Int it) = .ok () := by simp [checkValue, hv]
   have hne : scalarBytes it (v % 2 ^ (8 * it.size.bytes)).toNat ≠ [] :=
     List.ne_nil_of_length_pos (by omega)
-  have hget : (ctx.base ++ L)[r]? = some a := by rw [List.getElem?_append_left hri]; exact hr
   have hdrop : a.data.drop it.size.bytes = [] := List.drop_eq_nil_of_le (by omega)
   have hrlt : r < ctx.base.length + L.length := by omega
   simp only [typedStore, hck, encode_int it v hgood hv, CM.store, BM.store, hal, BM.check_ptr, hp,
     listIndex, h.allocs]
   obtain ⟨signed, size⟩ := it
-  simp [hne, hget, hlive, haddr, Allocation.size, hlen, hblen, writeSubsliceAtIndex, listSet, withMem,
+  simp [hne, hlive, haddr, Allocation.size, hlen, hblen, writeSubsliceAtIndex, listSet, withMem,
     hdrop, List.set_append_left _ _ hri, hri, hrlt, hai]
 
 end MiniRustSpec.Correspondence
