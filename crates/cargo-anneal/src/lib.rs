@@ -24,6 +24,7 @@ pub mod correspondence_bugs;
 pub mod driver;
 pub mod minirust_sync;
 pub mod miri_diff;
+pub mod miri_oracle;
 pub mod obligations;
 pub mod scaffold;
 pub mod setup;
@@ -73,6 +74,16 @@ pub use miri_diff::{
     MiriDiffVerdictSpec, load_miri_diff_manifest, parse_miri_diff_manifest,
     render_miri_diff_crate_verify_module, render_miri_diff_report, render_miri_diff_verify_module,
     run_miri_diff_suite, stage_miri_diff_workspace,
+};
+pub use miri_oracle::{
+    ALLOW_MISSING_MIRI_ENV, AnnealOracleConfig, AnnealOutcome, ComparisonVerdict,
+    DEFAULT_CAPTURE_RUSTFLAGS, DEFAULT_MIRI_FLAGS, DEFAULT_ORACLE_FUEL, DifftestOracleConfig,
+    DifftestOracleReport, DivergenceKind, ItemOracleReport, MiriOracleConfig, MiriOutcome,
+    MiriToolchain, NotComparedReason, OracleItemSpec, SourcePos, SourceSpan,
+    compare_miri_and_anneal, confirm_anneal_outcomes_in_kernel, discover_zero_arg_pub_fns,
+    parse_anneal_probe_output, parse_miri_process_output, render_anneal_confirm_module,
+    render_anneal_probe_module, render_miri_driver_source, run_anneal_oracle,
+    run_difftest_oracle_pipeline, run_miri_oracle, source_files_match,
 };
 pub use obligations::{
     AuthoredItemModules, SubjectObligationBundle, derive_item_module_suffix,
@@ -2059,7 +2070,7 @@ fn resolve_trusted_boundary_lean(
     ))
 }
 
-fn resolve_lake_binary() -> PathBuf {
+pub(crate) fn resolve_lake_binary() -> PathBuf {
     if let Ok(lake_env) = env::var("LAKE")
         && !lake_env.trim().is_empty()
     {
