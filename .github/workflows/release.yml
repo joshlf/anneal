@@ -13,11 +13,14 @@ name: Anneal Release
     branches:
       - main
     paths:
+      - 'crates/anneal-spec-macros/Cargo.toml'
+      - 'crates/anneal-spec/Cargo.toml'
+      - 'trusted/rustc-capture/Cargo.toml'
       - 'crates/cargo-anneal/Cargo.toml'
   workflow_dispatch:
     inputs:
       version:
-        description: 'cargo-anneal version to release'
+        description: 'Anneal workspace version to release'
         required: true
       branch:
         description: 'Branch to update'
@@ -52,6 +55,13 @@ jobs:
         run: |
           set -euo pipefail
           CUR_VER=$(cargo metadata --no-deps -q --format-version 1 | jq -r '.packages[] | select(.name == "cargo-anneal").version')
+          for pkg in anneal-spec-macros anneal-spec anneal-rustc-capture cargo-anneal; do
+            PKG_VER=$(cargo metadata --no-deps -q --format-version 1 | jq -r --arg pkg "$pkg" '.packages[] | select(.name == $pkg).version')
+            if [ "$PKG_VER" != "$CUR_VER" ]; then
+              echo "Version mismatch across workspace crates: $pkg is $PKG_VER, expected $CUR_VER" >&2
+              exit 1
+            fi
+          done
 
           git checkout -q HEAD^
           PREV_VER=$(cargo metadata --no-deps -q --format-version 1 | jq -r '.packages[] | select(.name == "cargo-anneal").version')
@@ -91,12 +101,14 @@ jobs:
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
 
-      - name: Publish cargo-anneal
+      - name: Publish workspace crates in topological order
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           set -euo pipefail
-          cargo publish -p cargo-anneal --registry crates-io
+          for pkg in anneal-spec-macros anneal-spec anneal-rustc-capture cargo-anneal; do
+            cargo publish -p "$pkg" --registry crates-io
+          done
 
       - name: Create GitHub Release
         env:
@@ -234,44 +246,58 @@ jobs:
 
           version = os.environ["VERSION"]
           assets = {a["name"]: a for a in json.loads(os.environ["ASSETS_JSON"])}
-          path = pathlib.Path("crates/cargo-anneal/Cargo.toml")
-          text = path.read_text(encoding="utf-8")
-          text, n = re.subn(
-              r'(?m)^(\[package\]\n(?:[^\[]*\n)*?version\s*=\s*)"[^"]*"',
-              rf'\g<1>"{version}"',
-              text,
-              count=1,
-          )
-          assert n == 1
-
-          for os_name, arch in [("linux", "x86_64"), ("linux", "aarch64"), ("macos", "x86_64"), ("macos", "aarch64")]:
-              asset = assets[f"anneal-toolchain-{os_name}-{arch}.tar.zst"]
-              digest = asset.get("digest") or ""
-              assert digest.startswith("sha256:"), f"missing sha256 digest for {asset['name']}: {digest!r}"
-              sha256 = digest.removeprefix("sha256:")
-              url = asset["browser_download_url"]
-              pattern = (
-                  rf'(?m)^(\[\[package\.metadata\.exocrate\]\]\n'
-                  rf'os\s*=\s*"{re.escape(os_name)}"\n'
-                  rf'arch\s*=\s*"{re.escape(arch)}"\n'
-                  rf'sha256\s*=\s*)"[^"]*"(\n'
-                  rf'url\s*=\s*)"[^"]*"'
-              )
+          manifest_paths = [
+              pathlib.Path("crates/anneal-spec-macros/Cargo.toml"),
+              pathlib.Path("crates/anneal-spec/Cargo.toml"),
+              pathlib.Path("trusted/rustc-capture/Cargo.toml"),
+              pathlib.Path("crates/cargo-anneal/Cargo.toml"),
+          ]
+          for path in manifest_paths:
+              text = path.read_text(encoding="utf-8")
               text, n = re.subn(
-                  pattern,
-                  rf'\g<1>"{sha256}"\g<2>"{url}"',
+                  r'(?m)^(\[package\]\n(?:[^\[]*\n)*?version\s*=\s*)"[^"]*"',
+                  rf'\g<1>"{version}"',
                   text,
                   count=1,
               )
-              assert n == 1
-
-          parsed = tomllib.loads(text)
-          assert parsed["package"]["version"] == version
-          path.write_text(text, encoding="utf-8")
+              assert n == 1, f"failed to update package version in {path}"
+              text = re.sub(
+                  r'(?m)^((?:anneal-spec-macros|anneal-rustc-capture)\s*=\s*\{\s*version\s*=\s*)"[^"]*"',
+                  rf'\g<1>"{version}"',
+                  text,
+              )
+              if path == pathlib.Path("crates/cargo-anneal/Cargo.toml"):
+                  for os_name, arch in [("linux", "x86_64"), ("linux", "aarch64"), ("macos", "x86_64"), ("macos", "aarch64")]:
+                      asset = assets[f"anneal-toolchain-{os_name}-{arch}.tar.zst"]
+                      digest = asset.get("digest") or ""
+                      assert digest.startswith("sha256:"), f"missing sha256 digest for {asset['name']}: {digest!r}"
+                      sha256 = digest.removeprefix("sha256:")
+                      url = asset["browser_download_url"]
+                      pattern = (
+                          rf'(?m)^(\[\[package\.metadata\.exocrate\]\]\n'
+                          rf'os\s*=\s*"{re.escape(os_name)}"\n'
+                          rf'arch\s*=\s*"{re.escape(arch)}"\n'
+                          rf'sha256\s*=\s*)"[^"]*"(\n'
+                          rf'url\s*=\s*)"[^"]*"'
+                      )
+                      text, n = re.subn(
+                          pattern,
+                          rf'\g<1>"{sha256}"\g<2>"{url}"',
+                          text,
+                          count=1,
+                      )
+                      assert n == 1
+              parsed = tomllib.loads(text)
+              assert parsed["package"]["version"] == version
+              path.write_text(text, encoding="utf-8")
           EOF
 
-          cargo update -p cargo-anneal --precise "$VERSION"
-          cargo publish --dry-run -p cargo-anneal --allow-dirty
+          for pkg in anneal-spec-macros anneal-spec anneal-rustc-capture cargo-anneal; do
+            cargo update -p "$pkg" --precise "$VERSION"
+          done
+          for pkg in anneal-spec-macros anneal-spec anneal-rustc-capture cargo-anneal; do
+            cargo publish --dry-run --no-verify -p "$pkg" --allow-dirty
+          done
 
       - name: Create release pull request
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
@@ -282,5 +308,8 @@ jobs:
           branch: anneal-release-${{ github.event.inputs.version }}
           add-paths: |
             Cargo.lock
+            crates/anneal-spec-macros/Cargo.toml
+            crates/anneal-spec/Cargo.toml
+            trusted/rustc-capture/Cargo.toml
             crates/cargo-anneal/Cargo.toml
           token: ${{ github.token }}

@@ -43,8 +43,9 @@ pub use agent::{
 };
 pub use driver::{
     ANNEAL_CAPTURE_FILTER_ENV, ANODIZED_EMBED_SPECS_CFG, CaptureDriverConfig,
-    aggregate_unit_manifests, build_cargo_check_command, invoke_cargo_capture, merge_rustflags,
-    parse_capture_manifest, parse_unit_capture_manifest, resolve_rustc_wrapper, run_cargo_capture,
+    aggregate_unit_manifests, build_cargo_check_command, invoke_cargo_capture,
+    load_captured_unit_records, merge_rustflags, parse_capture_manifest,
+    parse_unit_capture_manifest, resolve_rustc_wrapper, run_cargo_capture,
     serialize_unit_capture_manifest,
 };
 pub use miri_diff::{
@@ -106,6 +107,10 @@ pub enum CliSubcommand {
     /// Install or resolve the pinned Anneal omnibus toolchain archive under
     /// `~/.anneal/toolchain/` (`cargo anneal setup [--local-archive <PATH>]`).
     Setup,
+    /// Stage all 4 Anneal workspace crates (`anneal-spec-macros`,
+    /// `anneal-spec`, `anneal-rustc-capture`, and `cargo-anneal` with bundled
+    /// `lean-root/`) for vendoring into Fuchsia's `//third_party/rust_crates`.
+    VendorFuchsia,
     /// Print CLI usage instructions.
     Help,
     /// Print the `cargo-anneal` package version.
@@ -161,6 +166,9 @@ pub struct CliOptions {
     /// Optional local `.tar.zst` archive path (`--local-archive <PATH>`) for
     /// `cargo anneal setup`.
     pub local_archive: Option<PathBuf>,
+    /// Optional output directory (`--out-dir <DIR>`) for
+    /// `cargo anneal vendor-fuchsia`.
+    pub out_dir: Option<PathBuf>,
     /// Optional item filter (`--item <filter>`) restricting `agent-context` or
     /// `verify` targets by `def_id` or `item_module_suffix`.
     pub item_filter: Option<String>,
@@ -243,6 +251,9 @@ impl VerificationReport {
 pub struct VerifyConfig {
     /// Root directory of the target Rust workspace or crate.
     pub workspace_root: PathBuf,
+    /// Optional directory containing pre-captured `UnitCaptureManifest.json`
+    /// and `Mir/` files for Cargo-free GN/Bazel verification.
+    pub units_dir: Option<PathBuf>,
     /// Optional explicit path to the Anneal repository root containing
     /// `trusted/audit/TrustedBoundary.lean`.
     pub anneal_repo_root: Option<PathBuf>,
@@ -262,11 +273,18 @@ impl VerifyConfig {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
         Self {
             workspace_root: workspace_root.into(),
+            units_dir: None,
             anneal_repo_root: None,
             allow_assumptions: false,
             allow_provisional_native: false,
             item_filter: None,
         }
+    }
+
+    /// Set a pre-captured `units_dir` for Cargo-free GN/Bazel verification.
+    pub fn with_units_dir(mut self, units_dir: impl Into<PathBuf>) -> Self {
+        self.units_dir = Some(units_dir.into());
+        self
     }
 
     /// Configure whether conditional proofs reaching `Assumptions.*` axioms are
@@ -382,6 +400,7 @@ where
     let mut lock_file: Option<PathBuf> = None;
     let mut lock_git_ref: Option<String> = None;
     let mut local_archive: Option<PathBuf> = None;
+    let mut out_dir: Option<PathBuf> = None;
     let mut item_filter_patterns: Vec<String> = Vec::new();
     let mut allow_impl_edit_patterns: Vec<String> = Vec::new();
     let mut filter_patterns: Vec<String> = Vec::new();
@@ -430,6 +449,10 @@ where
             }
             "setup" if subcommand.is_none() => {
                 subcommand = Some(CliSubcommand::Setup);
+                i += 1;
+            }
+            "vendor-fuchsia" if subcommand.is_none() => {
+                subcommand = Some(CliSubcommand::VendorFuchsia);
                 i += 1;
             }
             "--workspace-root" => {
@@ -571,7 +594,7 @@ where
                 filter_patterns.push(val.to_string());
                 i += 1;
             }
-            "--from-units" => {
+            "--from-units" | "--skip-capture" => {
                 from_existing_units = true;
                 i += 1;
             }
@@ -659,6 +682,26 @@ where
                 local_archive = Some(PathBuf::from(val));
                 i += 1;
             }
+            "--out-dir" => {
+                i += 1;
+                let val = slice
+                    .get(i)
+                    .ok_or_else(|| "missing value for --out-dir".to_string())?;
+                let trimmed = val.trim();
+                if trimmed.is_empty() {
+                    return Err("missing value for --out-dir".to_string());
+                }
+                out_dir = Some(PathBuf::from(trimmed));
+                i += 1;
+            }
+            s if s.starts_with("--out-dir=") => {
+                let val = s["--out-dir=".len()..].trim();
+                if val.is_empty() {
+                    return Err("missing value for --out-dir".to_string());
+                }
+                out_dir = Some(PathBuf::from(val));
+                i += 1;
+            }
             "--" => {
                 extra_cargo_args.extend(slice[i + 1..].iter().cloned());
                 break;
@@ -666,7 +709,7 @@ where
             other => {
                 if subcommand.is_none() {
                     return Err(format!(
-                        "unknown subcommand '{other}' (expected 'extract', 'scaffold', 'verify', 'check', 'lock-specs', 'agent-context', 'agent-verify', 'agent-sandbox', or 'setup')"
+                        "unknown subcommand '{other}' (expected 'extract', 'scaffold', 'verify', 'check', 'lock-specs', 'agent-context', 'agent-verify', 'agent-sandbox', 'setup', or 'vendor-fuchsia')"
                     ));
                 }
                 extra_cargo_args.push(other.to_string());
@@ -704,6 +747,9 @@ where
     let resolved_local_archive = local_archive
         .as_deref()
         .map(|la| normalize_path_against(&default_root, la));
+    let resolved_out_dir = out_dir
+        .as_deref()
+        .map(|od| normalize_path_against(&default_root, od));
 
     let item_filter = if item_filter_patterns.is_empty() {
         None
@@ -737,6 +783,7 @@ where
         lock_file: resolved_lock_file,
         lock_git_ref,
         local_archive: resolved_local_archive,
+        out_dir: resolved_out_dir,
         item_filter,
         allow_impl_edit,
         filter,
@@ -748,17 +795,19 @@ where
 pub fn cli_usage() -> &'static str {
     "Usage: cargo anneal <SUBCOMMAND> [OPTIONS] [-- <CARGO_ARGS>...]\n\n\
      Subcommands:\n  \
-       setup          Install the pinned Anneal toolchain archive under ~/.anneal/toolchain/\n  \
-       extract        Capture MIR via anneal-rustc-capture and aggregate CaptureManifest.json\n  \
-       scaffold       Generate .anneal/generated/ modules and ensure anneal/proofs/ exists\n  \
-       verify         Extract, scaffold, build with Lake, and audit the TrustedBoundary\n  \
-       check          Alias for 'verify'\n  \
-       lock-specs     Lock MIR digests, Specs/**, and Assumptions/** in .anneal/spec-lock.json\n  \
-       agent-context  Render structured Markdown context for an AI proof-authoring agent\n  \
-       agent-verify   Enforce .anneal/spec-lock.json, regenerate .anneal/generated/, and verify\n  \
-       agent-sandbox  Run an agent command inside a bwrap read-only sandbox (-- <COMMAND>...)\n\n\
+       setup           Install the pinned Anneal toolchain archive under ~/.anneal/toolchain/\n  \
+       vendor-fuchsia  Stage workspace crates + lean-root/ for Fuchsia //third_party/rust_crates\n  \
+       extract         Capture MIR via anneal-rustc-capture and aggregate CaptureManifest.json\n  \
+       scaffold        Generate .anneal/generated/ modules and ensure anneal/proofs/ exists\n  \
+       verify          Extract, scaffold, build with Lake, and audit the TrustedBoundary\n  \
+       check           Alias for 'verify'\n  \
+       lock-specs      Lock MIR digests, Specs/**, and Assumptions/** in .anneal/spec-lock.json\n  \
+       agent-context   Render structured Markdown context for an AI proof-authoring agent\n  \
+       agent-verify    Enforce .anneal/spec-lock.json, regenerate .anneal/generated/, and verify\n  \
+       agent-sandbox   Run an agent command inside a bwrap read-only sandbox (-- <COMMAND>...)\n\n\
      Options:\n  \
        --local-archive <PATH>  Install 'setup' from a local .tar.zst toolchain archive\n  \
+       --out-dir <DIR>         Output directory for 'vendor-fuchsia'\n  \
        --workspace-root <DIR>  Target Cargo workspace root\n  \
        --manifest-path <PATH>  Path to Cargo.toml\n  \
        --units-dir <DIR>       Directory for per-unit capture artifacts\n  \
@@ -768,6 +817,7 @@ pub fn cli_usage() -> &'static str {
        --allow-impl-edit <PAT> Allow designated subject body edits in 'lock-specs'\n  \
        --filter <PATTERN>      Comma-separated item filter (passed via ANNEAL_CAPTURE_FILTER)\n  \
        --from-units            Use existing UnitCaptureManifest.json files without cargo check\n  \
+       --skip-capture          Alias for '--from-units' (Cargo-free GN/Bazel verification)\n  \
        --init-specs            Create starter anneal/proofs/Specs/<Item>.lean templates\n  \
        --init-proofs           Create starter anneal/proofs/Proof/<Item>.lean templates\n  \
        --allow-assumptions     Permit conditional proofs that depend on Assumptions.<Item> axioms\n  \
@@ -1070,6 +1120,21 @@ pub fn execute_cli(options: &CliOptions) -> Result<(), String> {
             println!("Installed Anneal toolchain at {}", root.display());
             Ok(())
         }
+        CliSubcommand::VendorFuchsia => {
+            let out_dir = options.out_dir.as_deref().ok_or_else(|| {
+                "vendor-fuchsia requires --out-dir <DIR>".to_string()
+            })?;
+            let repo_root = options
+                .anneal_repo_root
+                .clone()
+                .or_else(default_anneal_repo_root)
+                .unwrap_or_else(|| options.workspace_root.clone());
+            let staged = vendor_fuchsia_crates(&repo_root, out_dir)?;
+            for dir in &staged {
+                println!("Vendored {}", dir.display());
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1155,6 +1220,7 @@ pub fn verify_workspace_with_options(options: &CliOptions) -> Result<Verificatio
 
     let verify_cfg = VerifyConfig {
         workspace_root: options.workspace_root.clone(),
+        units_dir: Some(options.units_dir.clone()),
         anneal_repo_root: options.anneal_repo_root.clone(),
         allow_assumptions: effective_allow_assumptions,
         allow_provisional_native: options.allow_provisional_native,
@@ -1221,8 +1287,23 @@ fn run_extract_phase(
     ),
     String,
 > {
-    if options.from_existing_units {
-        aggregate_unit_manifests(&options.units_dir)
+    let default_units = options
+        .workspace_root
+        .join("target")
+        .join("anneal")
+        .join("units");
+    let has_cargo_manifest = options
+        .manifest_path
+        .as_ref()
+        .is_some_and(|mp| mp.is_file())
+        || options.workspace_root.join("Cargo.toml").is_file();
+    let use_precaptured_units = options.from_existing_units
+        || (options.subcommand != CliSubcommand::Extract
+            && driver::has_captured_unit_manifests(&options.units_dir)
+            && (!has_cargo_manifest || options.units_dir != default_units));
+
+    if use_precaptured_units {
+        load_captured_unit_records(&options.units_dir)
     } else {
         let driver_cfg = CaptureDriverConfig {
             workspace_root: options.workspace_root.clone(),
@@ -1254,6 +1335,22 @@ pub fn verify_workspace_with_config(config: &VerifyConfig) -> Result<Verificatio
         .anneal_repo_root
         .as_deref()
         .map(|r| normalize_path_against(&base_dir, r));
+    if let Some(ref raw_units_dir) = config.units_dir {
+        let units_dir = normalize_path_against(&base_dir, raw_units_dir);
+        if !workspace_root.join(".anneal/generated/Verify").is_dir()
+            && driver::has_captured_unit_manifests(&units_dir)
+        {
+            let (_manifest, records) = load_captured_unit_records(&units_dir)?;
+            let scaffold_cfg = ScaffoldConfig {
+                workspace_root: workspace_root.clone(),
+                units_dir: Some(units_dir),
+                anneal_repo_root: anneal_repo_root.clone(),
+                init_spec_templates: false,
+                init_proof_templates: false,
+            };
+            scaffold_workspace_with_config(&scaffold_cfg, &records)?;
+        }
+    }
     refresh_workspace_assembly(&workspace_root)?;
     let dot_anneal = workspace_root.join(".anneal");
     let matched_targets = resolve_filtered_verify_modules(&workspace_root, config.item_filter.as_deref())?;
@@ -1587,6 +1684,283 @@ fn collect_lean_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()
     Ok(())
 }
 
+/// Resolve the Anneal Lean root directory containing `trusted/lean`,
+/// `trusted/audit`, and `theory` in priority order:
+/// 1. `ANNEAL_REPO_ROOT` (or `ANNEAL_ROOT`) environment variable,
+/// 2. `<CARGO_MANIFEST_DIR>/lean-root` (vendored Fuchsia `cargo-anneal-<ver>`),
+/// 3. `<current_exe_dir>/../share/anneal` or `<current_exe_dir>/lean-root`,
+/// 4. `<CARGO_MANIFEST_DIR>/../..` (Anneal Git repository checkout),
+/// 5. `<installed_toolchain>/share/anneal`.
+pub fn default_anneal_repo_root() -> Option<PathBuf> {
+    let base_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let is_valid_lean_root = |dir: &Path| -> bool {
+        dir.join("trusted/lean").is_dir() && dir.join("theory").is_dir()
+    };
+
+    for env_key in ["ANNEAL_REPO_ROOT", "ANNEAL_ROOT"] {
+        if let Ok(env_root) = env::var(env_key)
+            && !env_root.trim().is_empty()
+        {
+            let candidate = normalize_path_against(&base_dir, Path::new(env_root.trim()));
+            if is_valid_lean_root(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let vendored_lean_root = manifest_dir.join("lean-root");
+    if is_valid_lean_root(&vendored_lean_root) {
+        return Some(vendored_lean_root);
+    }
+
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(exe_dir) = current_exe.parent()
+    {
+        if let Some(exe_parent) = exe_dir.parent() {
+            let share_anneal = exe_parent.join("share/anneal");
+            if is_valid_lean_root(&share_anneal) {
+                return Some(share_anneal);
+            }
+        }
+        let exe_lean_root = exe_dir.join("lean-root");
+        if is_valid_lean_root(&exe_lean_root) {
+            return Some(exe_lean_root);
+        }
+    }
+
+    if let Some(repo_root) = manifest_dir.parent().and_then(|p| p.parent())
+        && is_valid_lean_root(repo_root)
+    {
+        return Some(repo_root.to_path_buf());
+    }
+
+    if let Some(toolchain_root) = setup::resolve_installed_toolchain() {
+        let share_anneal = toolchain_root.join("share/anneal");
+        if is_valid_lean_root(&share_anneal) {
+            return Some(share_anneal);
+        }
+    }
+
+    None
+}
+
+/// Stage all 4 Anneal workspace crates (`anneal-spec-macros-<ver>`,
+/// `anneal-spec-<ver>`, `anneal-rustc-capture-<ver>`, and `cargo-anneal-<ver>`
+/// with bundled `lean-root/`) into `out_dir` for vendoring into Fuchsia's
+/// `//third_party/rust_crates`.
+pub fn vendor_fuchsia_crates(
+    anneal_repo_root: &Path,
+    out_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let base_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let repo_root = normalize_path_against(&base_dir, anneal_repo_root);
+    let dest_root = normalize_path_against(&base_dir, out_dir);
+    fs::create_dir_all(&dest_root).map_err(|err| {
+        format!(
+            "failed to create vendor output directory {}: {}",
+            dest_root.display(),
+            err
+        )
+    })?;
+
+    let ver = env!("CARGO_PKG_VERSION");
+    let crates: [(&str, &str); 4] = [
+        ("anneal-spec-macros", "crates/anneal-spec-macros"),
+        ("anneal-spec", "crates/anneal-spec"),
+        ("anneal-rustc-capture", "trusted/rustc-capture"),
+        ("cargo-anneal", "crates/cargo-anneal"),
+    ];
+
+    let mut staged_dirs = Vec::with_capacity(crates.len());
+    for (crate_name, rel_crate_dir) in crates {
+        let src_crate_dir = repo_root.join(rel_crate_dir);
+        let dst_crate_dir = dest_root.join(format!("{crate_name}-{ver}"));
+        if dst_crate_dir.exists() {
+            fs::remove_dir_all(&dst_crate_dir).map_err(|err| {
+                format!(
+                    "failed to clean existing vendored crate {}: {}",
+                    dst_crate_dir.display(),
+                    err
+                )
+            })?;
+        }
+        fs::create_dir_all(&dst_crate_dir).map_err(|err| {
+            format!(
+                "failed to create vendored crate directory {}: {}",
+                dst_crate_dir.display(),
+                err
+            )
+        })?;
+
+        let raw_toml = fs::read_to_string(src_crate_dir.join("Cargo.toml")).map_err(|err| {
+            format!(
+                "failed to read {}/Cargo.toml: {}",
+                src_crate_dir.display(),
+                err
+            )
+        })?;
+        let rewritten_toml = raw_toml
+            .replace(
+                "path = \"../anneal-spec-macros\"",
+                &format!("path = \"../anneal-spec-macros-{ver}\""),
+            )
+            .replace(
+                "path = \"../../trusted/rustc-capture\"",
+                &format!("path = \"../anneal-rustc-capture-{ver}\""),
+            );
+        fs::write(dst_crate_dir.join("Cargo.toml"), rewritten_toml).map_err(|err| {
+            format!(
+                "failed to write {}/Cargo.toml: {}",
+                dst_crate_dir.display(),
+                err
+            )
+        })?;
+
+        copy_dir_filtered_recursive(&src_crate_dir.join("src"), &dst_crate_dir.join("src"))?;
+
+        for license_name in ["LICENSE-BSD", "LICENSE-APACHE", "LICENSE-MIT"] {
+            let src_lic = repo_root.join(license_name);
+            if src_lic.is_file() {
+                fs::copy(&src_lic, dst_crate_dir.join(license_name)).map_err(|err| {
+                    format!(
+                        "failed to copy {} into {}: {}",
+                        src_lic.display(),
+                        dst_crate_dir.display(),
+                        err
+                    )
+                })?;
+            }
+        }
+
+        if crate_name == "cargo-anneal" {
+            let lean_root_dst = dst_crate_dir.join("lean-root");
+            copy_dir_filtered_recursive(
+                &repo_root.join("trusted/lean"),
+                &lean_root_dst.join("trusted/lean"),
+            )?;
+            copy_dir_filtered_recursive(
+                &repo_root.join("trusted/audit"),
+                &lean_root_dst.join("trusted/audit"),
+            )?;
+            copy_dir_filtered_recursive(
+                &repo_root.join("theory"),
+                &lean_root_dst.join("theory"),
+            )?;
+            for rel_file in ["examples/lakefile.toml", "examples/lean-toolchain", "lean-toolchain"] {
+                let src_file = repo_root.join(rel_file);
+                if src_file.is_file() {
+                    let dst_file = lean_root_dst.join(rel_file);
+                    if let Some(parent) = dst_file.parent() {
+                        fs::create_dir_all(parent).map_err(|err| {
+                            format!("failed to create {}: {}", parent.display(), err)
+                        })?;
+                    }
+                    fs::copy(&src_file, &dst_file).map_err(|err| {
+                        format!("failed to copy {}: {}", src_file.display(), err)
+                    })?;
+                    if rel_file == "examples/lean-toolchain"
+                        && !lean_root_dst.join("lean-toolchain").is_file()
+                    {
+                        fs::copy(&src_file, lean_root_dst.join("lean-toolchain")).map_err(
+                            |err| format!("failed to copy {}: {}", src_file.display(), err),
+                        )?;
+                    }
+                }
+            }
+        }
+
+        write_cargo_checksum_json(&dst_crate_dir)?;
+        staged_dirs.push(dst_crate_dir);
+    }
+
+    Ok(staged_dirs)
+}
+
+fn copy_dir_filtered_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    if !src.is_dir() {
+        return Err(format!("source directory does not exist: {}", src.display()));
+    }
+    fs::create_dir_all(dst)
+        .map_err(|err| format!("failed to create directory {}: {}", dst.display(), err))?;
+    let mut entries: Vec<PathBuf> = fs::read_dir(src)
+        .map_err(|err| format!("failed to read directory {}: {}", src.display(), err))?
+        .filter_map(|e| e.ok().map(|d| d.path()))
+        .collect();
+    entries.sort();
+    for entry in entries {
+        let Some(name) = entry.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if matches!(name, ".lake" | "target" | "__pycache__" | ".git") {
+            continue;
+        }
+        let dst_path = dst.join(name);
+        if entry.is_dir() {
+            copy_dir_filtered_recursive(&entry, &dst_path)?;
+        } else if entry.is_file() {
+            fs::copy(&entry, &dst_path).map_err(|err| {
+                format!(
+                    "failed to copy {} to {}: {}",
+                    entry.display(),
+                    dst_path.display(),
+                    err
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_all_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+        .map_err(|err| format!("failed to read directory {}: {}", dir.display(), err))?
+        .filter_map(|e| e.ok().map(|d| d.path()))
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            collect_all_files_recursive(&path, out)?;
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn write_cargo_checksum_json(crate_dir: &Path) -> Result<(), String> {
+    let checksum_path = crate_dir.join(".cargo-checksum.json");
+    if checksum_path.exists() {
+        let _ = fs::remove_file(&checksum_path);
+    }
+    let mut files = Vec::new();
+    collect_all_files_recursive(crate_dir, &mut files)?;
+    files.sort();
+
+    let mut entries = Vec::with_capacity(files.len());
+    for file in files {
+        let rel = file
+            .strip_prefix(crate_dir)
+            .map_err(|err| format!("failed to strip prefix: {err}"))?;
+        let rel_slash = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let bytes = fs::read(&file)
+            .map_err(|err| format!("failed to read {}: {}", file.display(), err))?;
+        let digest = anneal_rustc_capture::sha256_hex(&bytes);
+        let escaped = anneal_rustc_capture::manifest::escape_json(&rel_slash);
+        entries.push(format!("\"{escaped}\":\"{digest}\""));
+    }
+    let json = format!("{{\"files\":{{{}}},\"package\":null}}\n", entries.join(","));
+    fs::write(&checksum_path, json)
+        .map_err(|err| format!("failed to write {}: {}", checksum_path.display(), err))
+}
+
 fn resolve_trusted_boundary_lean(
     workspace_root: &Path,
     anneal_repo_root: Option<&Path>,
@@ -1600,13 +1974,15 @@ fn resolve_trusted_boundary_lean(
         }
     }
 
-    if let Ok(env_root) = env::var("ANNEAL_ROOT")
-        && !env_root.trim().is_empty()
-    {
-        let abs_env_root = normalize_path_against(&base_dir, Path::new(env_root.trim()));
-        let candidate = abs_env_root.join("trusted/audit/TrustedBoundary.lean");
-        if candidate.is_file() {
-            return Ok(candidate);
+    for env_key in ["ANNEAL_REPO_ROOT", "ANNEAL_ROOT"] {
+        if let Ok(env_root) = env::var(env_key)
+            && !env_root.trim().is_empty()
+        {
+            let abs_env_root = normalize_path_against(&base_dir, Path::new(env_root.trim()));
+            let candidate = abs_env_root.join("trusted/audit/TrustedBoundary.lean");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
         }
     }
 
@@ -1620,16 +1996,8 @@ fn resolve_trusted_boundary_lean(
         current = dir.parent();
     }
 
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    if let Some(repo_root) = manifest_dir.parent().and_then(|p| p.parent()) {
+    if let Some(repo_root) = default_anneal_repo_root() {
         let candidate = repo_root.join("trusted/audit/TrustedBoundary.lean");
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-
-    if let Some(toolchain_root) = setup::resolve_installed_toolchain() {
-        let candidate = toolchain_root.join("share/anneal/trusted/audit/TrustedBoundary.lean");
         if candidate.is_file() {
             return Ok(candidate);
         }

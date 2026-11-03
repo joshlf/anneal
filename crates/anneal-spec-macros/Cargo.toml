@@ -1,7 +1,10 @@
 [package]
 name = "anneal-spec-macros"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
+description = "Procedural macro implementation for Anneal specification attributes."
+license = "BSD-2-Clause OR Apache-2.0 OR MIT"
+repository = "https://github.com/joshlf/anneal"
 publish = false
 
 [lib]

@@ -508,7 +508,11 @@ pub fn scaffold_workspace_with_config(
             let _ = fs::remove_file(&crate_verify_path);
         }
     } else {
-        let crate_name = infer_crate_name(&config.workspace_root, &bundles);
+        let crate_name = infer_crate_name(
+            &config.workspace_root,
+            config.units_dir.as_deref(),
+            &bundles,
+        );
         let crate_verify_contents = render_crate_verify_module(&crate_name, &bundles);
         write_if_changed(&crate_verify_path, &crate_verify_contents)?;
     }
@@ -709,7 +713,12 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
     refreshed_bundles.sort_by(|a, b| a.subject.target.def_id.cmp(&b.subject.target.def_id));
     let crate_verify_path = generated_dir.join("CrateVerify.lean");
     if !refreshed_bundles.is_empty() {
-        let crate_name = infer_crate_name(workspace_root, &refreshed_bundles);
+        let default_units = workspace_root.join("target").join("anneal").join("units");
+        let crate_name = infer_crate_name(
+            workspace_root,
+            default_units.is_dir().then_some(default_units.as_path()),
+            &refreshed_bundles,
+        );
         let crate_verify_contents = render_crate_verify_module(&crate_name, &refreshed_bundles);
         write_if_changed(&crate_verify_path, &crate_verify_contents)?;
     }
@@ -1015,7 +1024,11 @@ pub fn render_lakefile_toml(
     )
 }
 
-fn infer_crate_name(workspace_root: &Path, bundles: &[SubjectObligationBundle]) -> String {
+fn infer_crate_name(
+    workspace_root: &Path,
+    units_dir: Option<&Path>,
+    bundles: &[SubjectObligationBundle],
+) -> String {
     let cargo_toml = workspace_root.join("Cargo.toml");
     if let Ok(raw) = fs::read_to_string(&cargo_toml) {
         let mut in_package = false;
@@ -1035,6 +1048,17 @@ fn infer_crate_name(workspace_root: &Path, bundles: &[SubjectObligationBundle]) 
                 }
             }
         }
+    }
+    if let Some(u_dir) = units_dir
+        && let Some(from_units) = crate::driver::infer_crate_name_from_units_dir(u_dir)
+    {
+        return from_units;
+    }
+    let default_units = workspace_root.join("target").join("anneal").join("units");
+    if let Some(from_default_units) =
+        crate::driver::infer_crate_name_from_units_dir(&default_units)
+    {
+        return from_default_units;
     }
     if let Some(first) = bundles.first()
         && let Some(seg) = first.subject.target.def_id.split("::").next()
@@ -1059,16 +1083,21 @@ fn resolve_lean_library_paths(config: &ScaffoldConfig) -> (String, String) {
         return (trusted, theory);
     }
 
-    if let Ok(env_root) = std::env::var("ANNEAL_ROOT")
-        && !env_root.trim().is_empty()
-    {
-        let abs_env_root = crate::normalize_path_against(&base_dir, Path::new(env_root.trim()));
-        let trusted = abs_env_root
-            .join("trusted/lean")
-            .to_string_lossy()
-            .into_owned();
-        let theory = abs_env_root.join("theory").to_string_lossy().into_owned();
-        return (trusted, theory);
+    for env_key in ["ANNEAL_REPO_ROOT", "ANNEAL_ROOT"] {
+        if let Ok(env_root) = std::env::var(env_key)
+            && !env_root.trim().is_empty()
+        {
+            let abs_env_root =
+                crate::normalize_path_against(&base_dir, Path::new(env_root.trim()));
+            if abs_env_root.join("trusted/lean").is_dir() && abs_env_root.join("theory").is_dir() {
+                let trusted = abs_env_root
+                    .join("trusted/lean")
+                    .to_string_lossy()
+                    .into_owned();
+                let theory = abs_env_root.join("theory").to_string_lossy().into_owned();
+                return (trusted, theory);
+            }
+        }
     }
 
     let abs_workspace_root = crate::normalize_path_against(&base_dir, &config.workspace_root);
@@ -1092,28 +1121,11 @@ fn resolve_lean_library_paths(config: &ScaffoldConfig) -> (String, String) {
         depth += 1;
     }
 
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    if let Some(repo_root) = manifest_dir.parent().and_then(|p| p.parent())
-        && repo_root.join("trusted/lean").is_dir()
-        && repo_root.join("theory").is_dir()
-    {
+    if let Some(repo_root) = crate::default_anneal_repo_root() {
         return (
             repo_root.join("trusted/lean").to_string_lossy().into_owned(),
             repo_root.join("theory").to_string_lossy().into_owned(),
         );
-    }
-
-    if let Some(toolchain_root) = crate::setup::resolve_installed_toolchain() {
-        let share_anneal = toolchain_root.join("share/anneal");
-        if share_anneal.join("trusted/lean").is_dir() && share_anneal.join("theory").is_dir() {
-            return (
-                share_anneal
-                    .join("trusted/lean")
-                    .to_string_lossy()
-                    .into_owned(),
-                share_anneal.join("theory").to_string_lossy().into_owned(),
-            );
-        }
     }
 
     ("../trusted/lean".to_string(), "../theory".to_string())

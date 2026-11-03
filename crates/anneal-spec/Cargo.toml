@@ -1,9 +1,12 @@
 [package]
 name = "anneal-spec"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
+description = "User-facing specification attributes and logic primitives for Anneal."
+license = "BSD-2-Clause OR Apache-2.0 OR MIT"
+repository = "https://github.com/joshlf/anneal"
 publish = false
 
 [dependencies]
 anodized = "0.7.0"
-anneal-spec-macros = { path = "../anneal-spec-macros" }
+anneal-spec-macros = { version = "0.1.0-alpha.1", path = "../anneal-spec-macros" }

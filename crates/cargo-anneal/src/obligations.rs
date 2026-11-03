@@ -1024,7 +1024,9 @@ pub fn render_verify_module_with_options(
         if bundle.inline_requires.len() == 1 && bundle.inline_ensures.len() <= 1 {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
             branches.push_str(&format!(
-                "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalBoundedRange1Auto\n          \
+                "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalSymRange1Auto\n          \
+                         Obligations.{item}.totalClaim 64 64 Mir.{req_suf}.body {opt_ens}\n      \
+                       | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustTotalBoundedRange1Auto\n          \
                          Obligations.{item}.totalClaim 64 64 Mir.{req_suf}.body {opt_ens}\n"
             ));
         }
@@ -1080,7 +1082,9 @@ pub fn render_verify_module_with_options(
         {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
             branches.push_str(&format!(
-                "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustBoundedRange1Auto\n          \
+                "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustSymRange1Auto\n          \
+                         Obligations.{item}.claim 64 64 Mir.{req_suf}.body {opt_ens}\n      \
+                       | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustBoundedRange1Auto\n          \
                          Obligations.{item}.claim 64 64 Mir.{req_suf}.body {opt_ens}\n"
             ));
         }

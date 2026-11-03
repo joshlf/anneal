@@ -35,4 +35,4 @@ sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 url = "https://example.com/macos-aarch64.tar.zst"
 
 [dependencies]
-anneal-rustc-capture = { path = "../../trusted/rustc-capture" }
+anneal-rustc-capture = { version = "0.1.0-alpha.1", path = "../../trusted/rustc-capture" }

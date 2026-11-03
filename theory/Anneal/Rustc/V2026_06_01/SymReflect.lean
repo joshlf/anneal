@@ -3375,26 +3375,37 @@ theorem evalScalarBinOp_unsignedUpperBound_eq
     rfl
   | _ => nomatch hOp
 
+/-- Compute the tight inclusive unsigned upper bound on `lhs` for `op` against `rhs`. -/
+@[simp, reducible]
+def tightUnsignedUpperBoundBits (op : BinOp) (b : Nat) : Nat :=
+  match op with
+  | .lt => Nat.pred b
+  | _ => b
+
 theorem ble_of_evalUnsignedUpperBoundCmp
     (op : BinOp)
     (a b : Nat)
     (hOp : isUnsignedUpperBoundOp op = true)
     (hCmp : evalUnsignedUpperBoundCmp op a b = true) :
-    a ≤ b := by
+    a ≤ tightUnsignedUpperBoundBits op b := by
   cases op with
   | eq =>
-    dsimp only [evalUnsignedUpperBoundCmp] at hCmp
+    dsimp only [evalUnsignedUpperBoundCmp, tightUnsignedUpperBoundBits] at hCmp ⊢
     exact Nat.le_of_eq (Nat.eq_of_beq_eq_true hCmp)
   | lt =>
-    dsimp only [evalUnsignedUpperBoundCmp] at hCmp
-    cases hBle : Nat.ble b a with
-    | true =>
-      rw [hBle] at hCmp
+    dsimp only [evalUnsignedUpperBoundCmp, tightUnsignedUpperBoundBits] at hCmp ⊢
+    cases b with
+    | zero =>
       nomatch hCmp
-    | false =>
-      exact Nat.le_of_lt ((nat_ble_eq_false_iff b a).1 hBle)
+    | succ k =>
+      cases hBle : Nat.ble (.succ k) a with
+      | true =>
+        rw [hBle] at hCmp
+        nomatch hCmp
+      | false =>
+        exact Nat.le_of_lt_succ ((nat_ble_eq_false_iff (.succ k) a).1 hBle)
   | le =>
-    dsimp only [evalUnsignedUpperBoundCmp] at hCmp
+    dsimp only [evalUnsignedUpperBoundCmp, tightUnsignedUpperBoundBits] at hCmp ⊢
     exact Nat.le_of_ble_eq_true hCmp
   | _ => nomatch hOp
 
@@ -3419,7 +3430,11 @@ def symExtractUpperBound1Stmt
           | .some (sv₂, slots₂) =>
             match sv₂ with
             | .concrete (.scalar sc) =>
-              match symFinishPinEq st dstLoc slots₂ 0 sc with
+              let tightSc : ScalarInt := {
+                bits := tightUnsignedUpperBoundBits op sc.bits
+                sizeBytes := sc.sizeBytes
+              }
+              match symFinishPinEq st dstLoc slots₂ 0 tightSc with
               | .some (_, scOut, _, stFalse) => .some (scOut, stFalse)
               | .none => .none
             | _ => .none
@@ -3539,7 +3554,11 @@ theorem symExtractUpperBound1_sound
                                     | unit | ptr _ _ | aggregate _ _ => nomatch hExt
                                     | scalar sc0 =>
                                       dsimp only at hExt
-                                      cases hFin : symFinishPinEq st dstLoc slots2 0 sc0 with
+                                      let tightSc : ScalarInt := {
+                                        bits := tightUnsignedUpperBoundBits op sc0.bits
+                                        sizeBytes := sc0.sizeBytes
+                                      }
+                                      cases hFin : symFinishPinEq st dstLoc slots2 0 tightSc with
                                       | none =>
                                         rw [hFin] at hExt
                                         nomatch hExt
@@ -3607,7 +3626,7 @@ theorem symExtractUpperBound1_sound
                                                         hOp hActSz0 hSzEq] at hHold
                                                       have ⟨_, hScEq, hBranch⟩ :=
                                                         symFinishPinEq_branch_ok_sound
-                                                          fuel body args st dstLoc slots2 0 sc0
+                                                          fuel body args st dstLoc slots2 0 tightSc
                                                           idxOut scOut stTrue stFalseOut
                                                           (evalUnsignedUpperBoundCmp op actualSc.bits sc0.bits)
                                                           hFin hHold
@@ -4099,6 +4118,1184 @@ theorem dischargeRustTotalBoundedRange1Auto
             ⟨rv, m', h_out,
               h_post argsB (initMachineState c.body argsB).memory rv m' h_ens⟩)
           h_wp
+
+/-- Direct node evaluator over `MirStepNode` for sufficient bounded boolean predicate evaluation. -/
+def evalMirBoolExecTrueBounded : Nat → CapturedMir → MirExecState → Prop
+  | .zero, _, _ => False
+  | .succ fuel, body, st =>
+    evalNodeWP
+      (evalMirBoolExecTrueBounded fuel body)
+      (mirSafePost (fun retVal _ => retVal = .scalar { bits := 1, sizeBytes := 1 }))
+      (stepMirState body st)
+
+/-- Sufficient bounded boolean predicate evaluation over `MachineState`. -/
+def evalMirBoolTrueBounded (fuel : Nat) (body : CapturedMir) (s : MachineState) : Prop :=
+  evalMirBoolExecTrueBounded fuel body (.running s)
+
+/-- Bounded step-node sufficiency matching `evalMirBoolTrueBounded (.succ fuel)`. -/
+def stepResultTrueBounded (fuel : Nat) (body : CapturedMir) (r : MirStepNode) : Prop :=
+  evalNodeWP
+    (evalMirBoolExecTrueBounded fuel body)
+    (mirSafePost (fun retVal _ => retVal = .scalar { bits := 1, sizeBytes := 1 }))
+    r
+
+theorem wpMirExecSym_of_evalMirBoolExecTrueBounded
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (h : evalMirBoolExecTrueBounded fuel body st) :
+    wpMirExecSym fuel body st
+      (mirSafePost (fun retVal _ => retVal = .scalar { bits := 1, sizeBytes := 1 })) := by
+  induction fuel generalizing st with
+  | zero => exact False.elim h
+  | succ fuel' ih =>
+    unfold evalMirBoolExecTrueBounded at h
+    unfold wpMirExecSym
+    rw [evalSymNodeTree_eq, stepMirExecSymTree_eval]
+    cases hStep : stepMirState body st with
+    | ret out =>
+      rw [hStep] at h
+      exact h
+    | tau st' =>
+      rw [hStep] at h
+      exact ih st' h
+    | vis i k =>
+      rw [hStep] at h
+      rcases i with f | (e | c)
+      · exact False.elim h
+      · cases e
+        exact ih (k PUnit.unit) h
+      · cases c
+        intro ans
+        exact ih (k ans) (h ans)
+
+theorem mirBoolPredicateHolds_of_evalMirBoolTrueBounded
+    (fuel : Nat) (specBody : CapturedMir) (args : List Value)
+    (h : evalMirBoolTrueBounded fuel specBody (initMachineState specBody args)) :
+    MirBoolPredicateHolds specBody args :=
+  mirBoolPredicateHolds_of_wpMirSym fuel specBody args
+    (wpMirExecSym_of_evalMirBoolExecTrueBounded fuel specBody
+      (.running (initMachineState specBody args)) h)
+
+theorem get?_some_of_blt_length :
+    ∀ (args : List Value) (idx : Nat),
+      Nat.blt idx (length args) = true →
+      ∃ v, get? args idx = .some v
+  | .nil, _, h => nomatch h
+  | v :: _, .zero, _ => ⟨v, rfl⟩
+  | _ :: rest, .succ idx, h => get?_some_of_blt_length rest idx h
+
+/-- Check that any symbolic argument index written by `symStepStmtConcrete` is `< argCount`. -/
+def symStepStmtInBounds
+    (argCount : Nat)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (st : SymState)
+    (stmt : Statement) :
+    Bool :=
+  match stmt.kind with
+  | .assign ⟨_, .nil⟩ rv =>
+    match evalSymRvalueConcrete st.slots st.borrows st.nextTag localDecls layouts rv with
+    | .some (sv, _, _, _) =>
+      match sv with
+      | .concrete _ => true
+      | .symArg idx => Nat.blt idx argCount
+      | .symPair0 _ idx => Nat.blt idx argCount
+      | .symGuarded _ idx => Nat.blt idx argCount
+    | .none => false
+  | _ => true
+
+theorem symStepStmtConcrete_step_of_inBounds
+    (body : CapturedMir)
+    (args : List Value)
+    (st st' : SymState)
+    (stmt : Statement)
+    (hLen : length args = body.argCount)
+    (hInB : symStepStmtInBounds body.argCount body.localDecls body.layouts st stmt = true)
+    (h : symStepStmtConcrete body.localDecls body.layouts st stmt = .some st') :
+    evalStmt (concretizeSymState body args st) stmt body.localDecls body.layouts =
+      MirStepNode.step (concretizeSymState body args st') := by
+  cases stmt with
+  | mk kind _ =>
+    cases kind with
+    | nop | coverage | constEvalCounter =>
+      injection h with hEq
+      subst hEq
+      rfl
+    | placeMention place =>
+      dsimp only [symStepStmtConcrete] at h
+      dsimp only [evalStmt, concretizeSymState]
+      rw [get?_concretizeSymSlots args st.slots place.local_]
+      cases hGet : get? st.slots place.local_ with
+      | none =>
+        rw [hGet] at h
+        nomatch h
+      | some sSlot =>
+        rw [hGet] at h
+        have ⟨hNotDead, hOk⟩ := symSlot_not_dead_of_match_some h
+        injection hOk with hEq
+        subst hEq
+        dsimp only
+        rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+          (rw [hSlot]; rfl)
+    | storageLive loc =>
+      dsimp only [symStepStmtConcrete] at h
+      dsimp only [evalStmt, concretizeSymState]
+      rw [get?_concretizeSymSlots args st.slots loc]
+      cases hGet : get? st.slots loc with
+      | none =>
+        rw [hGet] at h
+        nomatch h
+      | some sSlot =>
+        rw [hGet] at h
+        dsimp only at h ⊢
+        rw [set?_concretizeSymSlots_concrete args .uninit st.slots loc]
+        cases hSet : set? st.slots loc (.concrete .uninit) with
+        | none =>
+          rw [hSet] at h
+          nomatch h
+        | some slots' =>
+          rw [hSet] at h
+          injection h with hEq
+          subst hEq
+          rfl
+    | storageDead loc =>
+      dsimp only [symStepStmtConcrete] at h
+      dsimp only [evalStmt, concretizeSymState]
+      rw [get?_concretizeSymSlots args st.slots loc]
+      cases hGet : get? st.slots loc with
+      | none =>
+        rw [hGet] at h
+        nomatch h
+      | some sSlot =>
+        rw [hGet] at h
+        dsimp only at h ⊢
+        rw [set?_concretizeSymSlots_concrete args .dead st.slots loc]
+        cases hSet : set? st.slots loc (.concrete .dead) with
+        | none =>
+          rw [hSet] at h
+          nomatch h
+        | some slots' =>
+          rw [hSet] at h
+          injection h with hEq
+          subst hEq
+          rfl
+    | assign dst rv =>
+      cases dst with
+      | mk dstLoc dstProj =>
+        cases dstProj with
+        | cons _ _ => nomatch h
+        | nil =>
+          dsimp only [symStepStmtConcrete] at h
+          dsimp only [symStepStmtInBounds] at hInB
+          dsimp only [evalStmt, concretizeSymState]
+          cases hRv : evalSymRvalueConcrete st.slots st.borrows st.nextTag body.localDecls body.layouts rv with
+          | none =>
+            rw [hRv] at h
+            nomatch h
+          | some tup =>
+            rw [hRv] at h hInB
+            cases tup with
+            | mk sv rest1 =>
+              cases rest1 with
+              | mk slots1 rest2 =>
+                cases rest2 with
+                | mk borrows1 nextTag1 =>
+                  dsimp only at h hInB
+                  rw [evalSymRvalueConcrete_sound
+                    args st.slots (concretizeSymMemory body st) body.localDecls body.layouts
+                    rv sv slots1 borrows1 nextTag1 hRv]
+                  dsimp only [concretizeSymMemory]
+                  cases hGet : get? slots1 dstLoc with
+                  | none =>
+                    rw [hGet] at h
+                    nomatch h
+                  | some sSlot =>
+                    rw [hGet] at h
+                    have ⟨hNotDead, hOk⟩ := symSlot_not_dead_of_match_some h
+                    cases sv with
+                    | concrete val =>
+                      dsimp only [concretizeSymRvalueResult] at hOk ⊢
+                      rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
+                      cases hSet : set? slots1 dstLoc (.concrete (.init val)) with
+                      | none =>
+                        rw [hSet] at hOk
+                        nomatch hOk
+                      | some slots2 =>
+                        rw [hSet] at hOk
+                        injection hOk with hEq
+                        subst hEq
+                        rw [set?_concretizeSymSlots_concrete args (.init val) slots1 dstLoc, hSet]
+                        dsimp only
+                        rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+                          (rw [hSlot]; rfl)
+                    | symArg valIdx =>
+                      dsimp only at hOk hInB
+                      cases hSet : set? slots1 dstLoc (.symArg valIdx) with
+                      | none =>
+                        rw [hSet] at hOk
+                        nomatch hOk
+                      | some slots2 =>
+                        rw [hSet] at hOk
+                        injection hOk with hEq
+                        subst hEq
+                        dsimp only [concretizeSymRvalueResult]
+                        cases hArgVal : get? args valIdx with
+                        | none =>
+                          rcases get?_some_of_blt_length args valIdx (hLen.symm ▸ hInB) with ⟨_, hSome⟩
+                          rw [hArgVal] at hSome
+                          nomatch hSome
+                        | some val =>
+                          dsimp only
+                          rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
+                          have hSetSym := set?_concretizeSymSlots args (.symArg valIdx) slots1 dstLoc
+                          dsimp only [concretizeSymSlot] at hSetSym
+                          rw [hArgVal, hSet] at hSetSym
+                          rw [hSetSym]
+                          dsimp only
+                          rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+                            (rw [hSlot]; rfl)
+                    | symPair0 v0 valIdx =>
+                      dsimp only at hOk hInB
+                      cases hSet : set? slots1 dstLoc (.symPair0 v0 valIdx) with
+                      | none =>
+                        rw [hSet] at hOk
+                        nomatch hOk
+                      | some slots2 =>
+                        rw [hSet] at hOk
+                        injection hOk with hEq
+                        subst hEq
+                        dsimp only [concretizeSymRvalueResult]
+                        cases hArgVal : get? args valIdx with
+                        | none =>
+                          rcases get?_some_of_blt_length args valIdx (hLen.symm ▸ hInB) with ⟨_, hSome⟩
+                          rw [hArgVal] at hSome
+                          nomatch hSome
+                        | some val =>
+                          dsimp only
+                          rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
+                          have hSetSym := set?_concretizeSymSlots args (.symPair0 v0 valIdx) slots1 dstLoc
+                          dsimp only [concretizeSymSlot] at hSetSym
+                          rw [hArgVal, hSet] at hSetSym
+                          rw [hSetSym]
+                          dsimp only
+                          rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+                            (rw [hSlot]; rfl)
+                    | symGuarded v0 valIdx =>
+                      dsimp only at hOk hInB
+                      cases hSet : set? slots1 dstLoc (.concrete (.init v0)) with
+                      | none =>
+                        rw [hSet] at hOk
+                        nomatch hOk
+                      | some slots2 =>
+                        rw [hSet] at hOk
+                        injection hOk with hEq
+                        subst hEq
+                        dsimp only [concretizeSymRvalueResult]
+                        cases hArgVal : get? args valIdx with
+                        | none =>
+                          rcases get?_some_of_blt_length args valIdx (hLen.symm ▸ hInB) with ⟨_, hSome⟩
+                          rw [hArgVal] at hSome
+                          nomatch hSome
+                        | some _ =>
+                          dsimp only
+                          rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
+                          rw [set?_concretizeSymSlots_concrete args (.init v0) slots1 dstLoc, hSet]
+                          dsimp only
+                          rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+                            (rw [hSlot]; rfl)
+    | _ => nomatch h
+
+/-- Execute one concrete symbolic step of `body` from `st`, requiring any symbolic
+argument indices to be `< body.argCount`. -/
+def symStepConcreteInBounds (body : CapturedMir) (st : SymState) : Option SymState :=
+  match body.phase with
+  | .other _ => .none
+  | _ =>
+    match get? body.basicBlocks st.blockIdx with
+    | .none => .none
+    | .some bb =>
+      match get? bb.statements st.stmtIdx with
+      | .some stmt =>
+        match symStepStmtInBounds body.argCount body.localDecls body.layouts st stmt with
+        | true => symStepStmtConcrete body.localDecls body.layouts st stmt
+        | false => .none
+      | .none =>
+        match Nat.beq st.stmtIdx (length bb.statements) with
+        | true => symStepTermConcrete st bb.terminator
+        | false => .none
+
+theorem symStepConcreteInBounds_true_sound
+    (fuel : Nat)
+    (body : CapturedMir)
+    (args : List Value)
+    (st st' : SymState)
+    (hLen : length args = body.argCount)
+    (h : symStepConcreteInBounds body st = .some st')
+    (hTrue : evalMirBoolTrueBounded fuel body (concretizeSymState body args st')) :
+    evalMirBoolTrueBounded (.succ fuel) body (concretizeSymState body args st) := by
+  dsimp only [symStepConcreteInBounds] at h
+  change stepResultTrueBounded fuel body (stepMirFn body (concretizeSymState body args st))
+  cases hPhase : body.phase with
+  | other _ =>
+    rw [hPhase] at h
+    nomatch h
+  | runtimePostCleanup | runtimeOptimized =>
+    have hNotOther : ∀ msg, body.phase ≠ .other msg := by
+      intro msg hm; rw [hPhase] at hm; nomatch hm
+    rw [hPhase] at h
+    dsimp only at h
+    cases hBb : get? body.basicBlocks st.blockIdx with
+    | none =>
+      rw [hBb] at h
+      nomatch h
+    | some bb =>
+      rw [hBb] at h
+      dsimp only at h
+      cases hStmt : get? bb.statements st.stmtIdx with
+      | some stmt =>
+        rw [hStmt] at h
+        dsimp only at h
+        cases hInB : symStepStmtInBounds body.argCount body.localDecls body.layouts st stmt with
+        | false =>
+          rw [hInB] at h
+          nomatch h
+        | true =>
+          rw [hInB] at h
+          dsimp only at h
+          rw [stepMirFn_concretize_stmt body args st bb stmt hNotOther hBb hStmt]
+          rw [symStepStmtConcrete_step_of_inBounds body args st st' stmt hLen hInB h]
+          exact hTrue
+      | none =>
+        rw [hStmt] at h
+        dsimp only at h
+        cases hLenBb : Nat.beq st.stmtIdx (length bb.statements) with
+        | false =>
+          rw [hLenBb] at h
+          nomatch h
+        | true =>
+          rw [hLenBb] at h
+          dsimp only at h
+          rw [stepMirFn_concretize_term body args st bb hNotOther hBb hStmt hLenBb]
+          rcases symStepTermConcrete_sound body args st st' bb.terminator h with hTerm | ⟨ev, hTerm⟩
+          · rw [hTerm]
+            exact hTrue
+          · rw [hTerm]
+            cases ev <;> exact hTrue
+
+/-- Check whether `st` is at a `Return` terminator with local `0` holding
+`.scalar ⟨1, 1⟩` (`true`). -/
+def symIsReturnTrue (body : CapturedMir) (st : SymState) : Bool :=
+  match body.phase with
+  | .other _ => false
+  | _ =>
+    match get? body.basicBlocks st.blockIdx with
+    | .none => false
+    | .some bb =>
+      match get? bb.statements st.stmtIdx with
+      | .some _ => false
+      | .none =>
+        match Nat.beq st.stmtIdx (length bb.statements) with
+        | false => false
+        | true =>
+          match bb.terminator.kind with
+          | .return_ =>
+            match get? st.slots 0 with
+            | .some (.concrete (.init (.scalar ⟨1, 1⟩))) => true
+            | _ => false
+          | _ => false
+
+theorem symIsReturnTrue_sound
+    (fuel : Nat)
+    (body : CapturedMir)
+    (args : List Value)
+    (st : SymState)
+    (h : symIsReturnTrue body st = true) :
+    evalMirBoolTrueBounded (.succ fuel) body (concretizeSymState body args st) := by
+  dsimp only [symIsReturnTrue] at h
+  change stepResultTrueBounded fuel body (stepMirFn body (concretizeSymState body args st))
+  cases hPhase : body.phase with
+  | other _ =>
+    rw [hPhase] at h
+    nomatch h
+  | runtimePostCleanup | runtimeOptimized =>
+    have hNotOther : ∀ msg, body.phase ≠ .other msg := by
+      intro msg hm; rw [hPhase] at hm; nomatch hm
+    rw [hPhase] at h
+    dsimp only at h
+    cases hBb : get? body.basicBlocks st.blockIdx with
+    | none =>
+      rw [hBb] at h
+      nomatch h
+    | some bb =>
+      rw [hBb] at h
+      dsimp only at h
+      cases hStmt : get? bb.statements st.stmtIdx with
+      | some _ =>
+        rw [hStmt] at h
+        nomatch h
+      | none =>
+        rw [hStmt] at h
+        dsimp only at h
+        cases hLen : Nat.beq st.stmtIdx (length bb.statements) with
+        | false =>
+          rw [hLen] at h
+          nomatch h
+        | true =>
+          rw [hLen] at h
+          dsimp only at h
+          rw [stepMirFn_concretize_term body args st bb hNotOther hBb hStmt hLen]
+          cases hTerm : bb.terminator with
+          | mk tKind _ =>
+            rw [hTerm] at h
+            dsimp only at h
+            cases tKind with
+            | return_ =>
+              dsimp only at h
+              dsimp only [evalTerminator, concretizeSymState, concretizeSymMemory]
+              rw [get?_concretizeSymSlots args st.slots 0]
+              cases hGet0 : get? st.slots 0 with
+              | none =>
+                rw [hGet0] at h
+                nomatch h
+              | some sSlot0 =>
+                rw [hGet0] at h
+                cases sSlot0 with
+                | symArg _ | symPair0 _ _ => nomatch h
+                | concrete cSlot0 =>
+                  cases cSlot0 with
+                  | dead | uninit => nomatch h
+                  | init retVal =>
+                    cases retVal with
+                    | unit | ptr _ _ | aggregate _ _ => nomatch h
+                    | scalar sc =>
+                      cases sc with
+                      | mk bits sz =>
+                        cases bits with
+                        | zero => nomatch h
+                        | succ b' =>
+                          cases b' with
+                          | succ _ => nomatch h
+                          | zero =>
+                            cases sz with
+                            | zero => nomatch h
+                            | succ sz' =>
+                              cases sz' with
+                              | succ _ => nomatch h
+                              | zero =>
+                                rfl
+            | _ => nomatch h
+
+/-- Check whether concrete symbolic execution from `st` reaches `Return` with
+`true` (`.scalar ⟨1, 1⟩`) within `fuel` steps. -/
+def checkSymReturnsTrue : Nat → CapturedMir → SymState → Bool
+  | .zero, _, _ => false
+  | .succ fuel, body, st =>
+    match symStepConcreteInBounds body st with
+    | .some st' => checkSymReturnsTrue fuel body st'
+    | .none => symIsReturnTrue body st
+
+theorem checkSymReturnsTrue_sound :
+    ∀ (fuel : Nat) (body : CapturedMir) (args : List Value) (st : SymState),
+      length args = body.argCount →
+      checkSymReturnsTrue fuel body st = true →
+      evalMirBoolTrueBounded fuel body (concretizeSymState body args st)
+  | .zero, _, _, _, _, hCheck => nomatch hCheck
+  | .succ fuel, body, args, st, hLen, hCheck => by
+    dsimp only [checkSymReturnsTrue] at hCheck
+    cases hStep : symStepConcreteInBounds body st with
+    | some st' =>
+      rw [hStep] at hCheck
+      exact symStepConcreteInBounds_true_sound
+        fuel body args st st' hLen hStep
+        (checkSymReturnsTrue_sound fuel body args st' hLen hCheck)
+    | none =>
+      rw [hStep] at hCheck
+      exact symIsReturnTrue_sound fuel body args st hCheck
+
+/-- Check whether `op` and RHS bits `b` form a valid non-empty unsigned upper bound
+comparison (`ret <= b`, or `ret < b` with `b > 0`). -/
+def isUnsignedEnsuresUpperOp (op : BinOp) (b : Nat) : Bool :=
+  match op with
+  | .le => true
+  | .lt => Bool.not (Nat.beq b 0)
+  | _ => false
+
+theorem isUnsignedUpperBoundOp_of_ensuresUpper
+    {op : BinOp} {b : Nat}
+    (h : isUnsignedEnsuresUpperOp op b = true) :
+    isUnsignedUpperBoundOp op = true := by
+  cases op with
+  | le | lt => rfl
+  | _ => nomatch h
+
+theorem evalUnsignedUpperBoundCmp_eq_true_of_ble
+    (op : BinOp)
+    (a b : Nat)
+    (hOp : isUnsignedEnsuresUpperOp op b = true)
+    (hBle : a ≤ tightUnsignedUpperBoundBits op b) :
+    evalUnsignedUpperBoundCmp op a b = true := by
+  cases op with
+  | le =>
+    dsimp only [evalUnsignedUpperBoundCmp, tightUnsignedUpperBoundBits] at hBle ⊢
+    exact (nat_ble_eq_true_iff a b).2 hBle
+  | lt =>
+    dsimp only [isUnsignedEnsuresUpperOp, evalUnsignedUpperBoundCmp, tightUnsignedUpperBoundBits] at hOp hBle ⊢
+    cases b with
+    | zero => nomatch hOp
+    | succ k =>
+      dsimp only [Nat.pred] at hBle
+      rw [(nat_ble_eq_false_iff (.succ k) a).2 (Nat.lt_succ_of_le hBle)]
+      rfl
+  | _ => nomatch hOp
+
+/-- Complete an `ensures` upper-bound comparison at `dstLoc` by setting `dstLoc` to `true` (`⟨1, 1⟩`). -/
+def symFinishEnsTrue
+    (st : SymState)
+    (dstLoc : Local)
+    (slots₂ : List SymSlot)
+    (expectedSc : ScalarInt) :
+    Option (ScalarInt × SymState) :=
+  match Nat.beq expectedSc.sizeBytes 0 with
+  | true => .none
+  | false =>
+    match get? slots₂ dstLoc with
+    | .none => .none
+    | .some (.concrete .dead) => .none
+    | .some _ =>
+      match set? slots₂ dstLoc (.concrete (.init (.scalar ⟨1, 1⟩))) with
+      | .some slotsTrue =>
+        let borrows' := invalidateConflictingBorrows st.borrows dstLoc .none
+        let stTrue : SymState := {
+          st with
+          stmtIdx := Nat.add st.stmtIdx 1
+          slots := slotsTrue
+          borrows := borrows'
+        }
+        .some (expectedSc, stTrue)
+      | .none => .none
+
+theorem symFinishEnsTrue_ok_sound
+    (fuel : Nat)
+    (body : CapturedMir)
+    (args : List Value)
+    (st : SymState)
+    (dstLoc : Local)
+    (slots₂ : List SymSlot)
+    (expectedSc scOut : ScalarInt)
+    (stTrue : SymState)
+    (hFin : symFinishEnsTrue st dstLoc slots₂ expectedSc = .some (scOut, stTrue))
+    (hTrue : evalMirBoolTrueBounded fuel body (concretizeSymState body args stTrue)) :
+    scOut = expectedSc ∧
+      stepResultTrueBounded fuel body
+        (evalAssignNilRvalueStep
+          (concretizeSymState body args st)
+          dstLoc
+          (.ok (.scalar ⟨1, 1⟩) (concretizeSymSlots args slots₂) (concretizeSymMemory body st))) := by
+  dsimp only [symFinishEnsTrue] at hFin
+  cases hExpSz0 : Nat.beq expectedSc.sizeBytes 0 with
+  | true =>
+    rw [hExpSz0] at hFin
+    nomatch hFin
+  | false =>
+    rw [hExpSz0] at hFin
+    dsimp only at hFin
+    cases hGetDst : get? slots₂ dstLoc with
+    | none =>
+      rw [hGetDst] at hFin
+      nomatch hFin
+    | some dstSlot =>
+      rw [hGetDst] at hFin
+      have ⟨hNotDead, hOk⟩ := symSlot_not_dead_of_match_some hFin
+      cases hSetT : set? slots₂ dstLoc (.concrete (.init (.scalar ⟨1, 1⟩))) with
+      | none =>
+        rw [hSetT] at hOk
+        nomatch hOk
+      | some slotsTrue =>
+        rw [hSetT] at hOk
+        injection hOk with hPair
+        injection hPair with hSc hStT
+        subst hSc; subst hStT
+        refine ⟨rfl, ?_⟩
+        dsimp only [evalAssignNilRvalueStep, concretizeSymMemory]
+        rw [get?_concretizeSymSlots args slots₂ dstLoc, hGetDst]
+        dsimp only
+        have hGoal2 :
+          stepResultTrueBounded fuel body
+            (match set? (concretizeSymSlots args slots₂) dstLoc (.init (.scalar ⟨1, 1⟩)) with
+             | .some locals₂ =>
+               let borrows₂ := invalidateConflictingBorrows st.borrows dstLoc .none
+               .step (advanceStmt (concretizeSymState body args st) locals₂ {
+                 nextAllocId := length body.allocations
+                 globals := body.allocations
+                 borrows := borrows₂
+                 nextTag := st.nextTag
+               })
+             | .none => .fail .ub) := by
+          rw [set?_concretizeSymSlots_concrete args (.init (.scalar ⟨1, 1⟩)) slots₂ dstLoc, hSetT]
+          exact hTrue
+        rcases concretizeSymSlot_eq_of_not_dead args dstSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+          (rw [hSlot]; exact hGoal2)
+
+/-- Extract a 2-argument `ensures` upper bound `(boundSc, stTrue)` from `stmt`
+when `stmt` compares `.symArg 1` (`ret`) against `.concrete (.scalar sc)` via
+`<=` or `<`. -/
+def symExtractEnsuresUpperBound1Stmt
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (st : SymState)
+    (stmt : Statement) :
+    Option (ScalarInt × SymState) :=
+  match stmt.kind with
+  | .assign ⟨dstLoc, .nil⟩ (.binaryOp op lhsOp rhsOp) =>
+    match evalSymOperand st.slots lhsOp st.borrows with
+    | .some (sv₁, slots₁) =>
+      match sv₁ with
+      | .symArg (.succ .zero) =>
+        match evalSymOperand slots₁ rhsOp st.borrows with
+        | .some (sv₂, slots₂) =>
+          match sv₂ with
+          | .concrete (.scalar sc) =>
+            match
+              isUnsignedEnsuresUpperOp op sc.bits,
+              operandIsSigned localDecls lhsOp layouts,
+              Nat.beq sc.sizeBytes 0
+            with
+            | true, false, false =>
+              let tightSc : ScalarInt := {
+                bits := tightUnsignedUpperBoundBits op sc.bits
+                sizeBytes := sc.sizeBytes
+              }
+              symFinishEnsTrue st dstLoc slots₂ tightSc
+            | _, _, _ => .none
+          | _ => .none
+        | .none => .none
+      | _ => .none
+    | .none => .none
+  | _ => .none
+
+/-- Extract a 2-argument `ensures` upper bound from the current statement of `body` at `st`. -/
+def symExtractEnsuresUpperBound1
+    (body : CapturedMir)
+    (st : SymState) :
+    Option (ScalarInt × SymState) :=
+  match body.phase with
+  | .other _ => .none
+  | _ =>
+    match get? body.basicBlocks st.blockIdx with
+    | .none => .none
+    | .some bb =>
+      match get? bb.statements st.stmtIdx with
+      | .some stmt => symExtractEnsuresUpperBound1Stmt body.localDecls body.layouts st stmt
+      | .none => .none
+
+theorem symExtractEnsuresUpperBound1_sound
+    (fuel : Nat)
+    (body : CapturedMir)
+    (args : List Value)
+    (st : SymState)
+    (boundSc : ScalarInt)
+    (stTrue : SymState)
+    (r : Nat)
+    (hLen : length args = body.argCount)
+    (hExt : symExtractEnsuresUpperBound1 body st = .some (boundSc, stTrue))
+    (hTrue : checkSymReturnsTrue fuel body stTrue = true)
+    (hArg1 : get? args 1 = .some (.scalar { bits := r, sizeBytes := boundSc.sizeBytes }))
+    (hBle : r ≤ boundSc.bits) :
+    evalMirBoolTrueBounded (.succ fuel) body (concretizeSymState body args st) := by
+  dsimp only [symExtractEnsuresUpperBound1] at hExt
+  change stepResultTrueBounded fuel body (stepMirFn body (concretizeSymState body args st))
+  cases hPhase : body.phase with
+  | other _ =>
+    rw [hPhase] at hExt
+    nomatch hExt
+  | runtimePostCleanup | runtimeOptimized =>
+    have hNotOther : ∀ msg, body.phase ≠ .other msg := by
+      intro msg hm; rw [hPhase] at hm; nomatch hm
+    rw [hPhase] at hExt
+    dsimp only at hExt
+    cases hBb : get? body.basicBlocks st.blockIdx with
+    | none =>
+      rw [hBb] at hExt
+      nomatch hExt
+    | some bb =>
+      rw [hBb] at hExt
+      dsimp only at hExt
+      cases hStmt : get? bb.statements st.stmtIdx with
+      | none =>
+        rw [hStmt] at hExt
+        nomatch hExt
+      | some stmt =>
+        rw [hStmt] at hExt
+        dsimp only at hExt
+        rw [stepMirFn_concretize_stmt body args st bb stmt hNotOther hBb hStmt]
+        cases stmt with
+        | mk kind span =>
+          cases kind with
+          | assign dst rv =>
+            cases dst with
+            | mk dstLoc dstProj =>
+              cases dstProj with
+              | cons _ _ => nomatch hExt
+              | nil =>
+                cases rv with
+                | binaryOp op lhsOp rhsOp =>
+                  dsimp only [symExtractEnsuresUpperBound1Stmt] at hExt
+                  cases hLhs : evalSymOperand st.slots lhsOp st.borrows with
+                  | none =>
+                    rw [hLhs] at hExt
+                    nomatch hExt
+                  | some pair1 =>
+                    rw [hLhs] at hExt
+                    cases pair1 with
+                    | mk sv1 slots1 =>
+                      cases sv1 with
+                      | concrete _ | symPair0 _ _ | symGuarded _ _ => nomatch hExt
+                      | symArg idx0 =>
+                        cases idx0 with
+                        | zero => nomatch hExt
+                        | succ idx1 =>
+                          cases idx1 with
+                          | succ _ => nomatch hExt
+                          | zero =>
+                            dsimp only at hExt
+                            cases hRhs : evalSymOperand slots1 rhsOp st.borrows with
+                            | none =>
+                              rw [hRhs] at hExt
+                              nomatch hExt
+                            | some pair2 =>
+                              rw [hRhs] at hExt
+                              cases pair2 with
+                              | mk sv2 slots2 =>
+                                cases sv2 with
+                                | symArg _ | symPair0 _ _ | symGuarded _ _ => nomatch hExt
+                                | concrete v2 =>
+                                  cases v2 with
+                                  | unit | ptr _ _ | aggregate _ _ => nomatch hExt
+                                  | scalar sc0 =>
+                                    dsimp only at hExt
+                                    cases hOp : isUnsignedEnsuresUpperOp op sc0.bits with
+                                    | false =>
+                                      rw [hOp] at hExt
+                                      nomatch hExt
+                                    | true =>
+                                      rw [hOp] at hExt
+                                      cases hSig : operandIsSigned body.localDecls lhsOp body.layouts with
+                                      | true =>
+                                        rw [hSig] at hExt
+                                        nomatch hExt
+                                      | false =>
+                                        rw [hSig] at hExt
+                                        cases hSz0 : Nat.beq sc0.sizeBytes 0 with
+                                        | true =>
+                                          rw [hSz0] at hExt
+                                          nomatch hExt
+                                        | false =>
+                                          rw [hSz0] at hExt
+                                          dsimp only at hExt
+                                          let tightSc : ScalarInt := {
+                                            bits := tightUnsignedUpperBoundBits op sc0.bits
+                                            sizeBytes := sc0.sizeBytes
+                                          }
+                                          have ⟨hScEq, hStepTrue⟩ :=
+                                            symFinishEnsTrue_ok_sound
+                                              fuel body args st dstLoc slots2 tightSc boundSc stTrue
+                                              hExt
+                                              (checkSymReturnsTrue_sound fuel body args stTrue hLen hTrue)
+                                          subst hScEq
+                                          rw [evalStmt_assign_nil_eq]
+                                          dsimp only [evalRvalue, concretizeSymState, concretizeSymMemory]
+                                          rw [evalSymOperand_sound
+                                            args st.slots lhsOp st.borrows body.allocations body.layouts
+                                            (.symArg 1) slots1 hLhs]
+                                          dsimp only [concretizeSymReadResult]
+                                          rw [hArg1]
+                                          dsimp only
+                                          rw [evalSymOperand_sound
+                                            args slots1 rhsOp st.borrows body.allocations body.layouts
+                                            (.concrete (.scalar sc0)) slots2 hRhs]
+                                          dsimp only [concretizeSymReadResult]
+                                          rw [hSig]
+                                          have hUbOp : isUnsignedUpperBoundOp op = true :=
+                                            isUnsignedUpperBoundOp_of_ensuresUpper hOp
+                                          have hSzEq : Nat.beq sc0.sizeBytes sc0.sizeBytes = true :=
+                                            Nat.beq_refl sc0.sizeBytes
+                                          rw [evalScalarBinOp_unsignedUpperBound_eq
+                                            op
+                                            { bits := r, sizeBytes := sc0.sizeBytes }
+                                            sc0
+                                            (concretizeSymSlots args slots2)
+                                            { nextAllocId := length body.allocations
+                                              globals := body.allocations
+                                              borrows := st.borrows
+                                              nextTag := st.nextTag }
+                                            hUbOp hSz0 hSzEq]
+                                          rw [evalUnsignedUpperBoundCmp_eq_true_of_ble op r sc0.bits hOp hBle]
+                                          exact hStepTrue
+                | _ => nomatch hExt
+          | _ => nomatch hExt
+
+/-- Check that `body` from `st` is satisfied whenever `arg 1` (`ret`) has
+`sizeBytes = boundSc.sizeBytes` and `bits ≤ boundSc.bits`. -/
+def checkSymEnsuresUpperBound1Loop :
+    Nat → CapturedMir → SymState → ScalarInt → Bool
+  | .zero, _, _, _ => false
+  | .succ fuel, body, st, boundSc =>
+    match symStepConcreteInBounds body st with
+    | .some st' => checkSymEnsuresUpperBound1Loop fuel body st' boundSc
+    | .none =>
+      match symExtractEnsuresUpperBound1 body st with
+      | .some (scOut, stTrue) =>
+        Bool.and
+          (Bool.and
+            (Nat.beq scOut.bits boundSc.bits)
+            (Nat.beq scOut.sizeBytes boundSc.sizeBytes))
+          (checkSymReturnsTrue fuel body stTrue)
+      | .none => false
+
+theorem checkSymEnsuresUpperBound1Loop_sound :
+    ∀ (fuel : Nat)
+      (body : CapturedMir)
+      (args : List Value)
+      (st : SymState)
+      (boundSc : ScalarInt)
+      (r : Nat),
+      length args = body.argCount →
+      checkSymEnsuresUpperBound1Loop fuel body st boundSc = true →
+      get? args 1 = .some (.scalar { bits := r, sizeBytes := boundSc.sizeBytes }) →
+      r ≤ boundSc.bits →
+      evalMirBoolTrueBounded fuel body (concretizeSymState body args st)
+  | .zero, _, _, _, _, _, _, hCheck, _, _ => nomatch hCheck
+  | .succ fuel, body, args, st, boundSc, r, hLen, hCheck, hArg1, hBle => by
+    dsimp only [checkSymEnsuresUpperBound1Loop] at hCheck
+    cases hStep : symStepConcreteInBounds body st with
+    | some st' =>
+      rw [hStep] at hCheck
+      exact symStepConcreteInBounds_true_sound
+        fuel body args st st' hLen hStep
+        (checkSymEnsuresUpperBound1Loop_sound
+          fuel body args st' boundSc r hLen hCheck hArg1 hBle)
+    | none =>
+      rw [hStep] at hCheck
+      cases hExt : symExtractEnsuresUpperBound1 body st with
+      | none =>
+        rw [hExt] at hCheck
+        nomatch hCheck
+      | some pair =>
+        rw [hExt] at hCheck
+        cases pair with
+        | mk scOut stTrue =>
+          dsimp only at hCheck
+          cases hBitsEq : Nat.beq scOut.bits boundSc.bits with
+          | false =>
+            rw [hBitsEq] at hCheck
+            nomatch hCheck
+          | true =>
+            rw [hBitsEq] at hCheck
+            cases hSzEq : Nat.beq scOut.sizeBytes boundSc.sizeBytes with
+            | false =>
+              rw [hSzEq] at hCheck
+              nomatch hCheck
+            | true =>
+              rw [hSzEq] at hCheck
+              dsimp only [Bool.and] at hCheck
+              have hScEq : scOut = boundSc :=
+                scalarInt_eq_of_parts
+                  (Nat.eq_of_beq_eq_true hBitsEq)
+                  (Nat.eq_of_beq_eq_true hSzEq)
+              subst hScEq
+              exact symExtractEnsuresUpperBound1_sound
+                fuel body args st scOut stTrue r hLen hExt hCheck hArg1 hBle
+
+/-- Check that `ensBody` is a 2-argument predicate `[x, ret]` satisfied whenever
+`ret` has `sizeBytes = boundSc.sizeBytes` and `bits ≤ boundSc.bits`. -/
+def checkMirEnsuresUpperBound1
+    (fuel : Nat)
+    (ensBody : CapturedMir)
+    (boundSc : ScalarInt) :
+    Bool :=
+  Bool.and
+    (Nat.beq ensBody.argCount 2)
+    (checkSymEnsuresUpperBound1Loop fuel ensBody (initSymState ensBody) boundSc)
+
+theorem checkMirEnsuresUpperBound1_sound
+    (fuel : Nat)
+    (ensBody : CapturedMir)
+    (boundSc : ScalarInt)
+    (v0 : Value)
+    (r : Nat)
+    (h_check : checkMirEnsuresUpperBound1 fuel ensBody boundSc = true)
+    (h_ble : r ≤ boundSc.bits) :
+    MirBoolPredicateHolds
+      ensBody
+      [v0, .scalar { bits := r, sizeBytes := boundSc.sizeBytes }] := by
+  dsimp only [checkMirEnsuresUpperBound1] at h_check
+  cases hArg2 : Nat.beq ensBody.argCount 2 with
+  | false =>
+    rw [hArg2] at h_check
+    nomatch h_check
+  | true =>
+    rw [hArg2] at h_check
+    dsimp only [Bool.and] at h_check
+    let args : List Value := [v0, .scalar { bits := r, sizeBytes := boundSc.sizeBytes }]
+    have hLen : length args = ensBody.argCount :=
+      Eq.symm (Nat.eq_of_beq_eq_true hArg2)
+    apply mirBoolPredicateHolds_of_evalMirBoolTrueBounded fuel ensBody args
+    rw [← concretizeSymState_initSymState ensBody args hLen]
+    exact checkSymEnsuresUpperBound1Loop_sound
+      fuel ensBody args (initSymState ensBody) boundSc r hLen h_check rfl h_ble
+
+/-- Fast AST scan for the first unsigned upper-bound constant comparison in `stmts`. -/
+def peekStmtsUpperBound : List Statement → Option ScalarInt
+  | .nil => .none
+  | stmt :: rest =>
+    match stmt.kind with
+    | .assign _ (.binaryOp op _ (.constant { val := .scalar (.int sc), .. })) =>
+      match isUnsignedUpperBoundOp op with
+      | true =>
+        .some {
+          bits := tightUnsignedUpperBoundBits op sc.bits
+          sizeBytes := sc.sizeBytes
+        }
+      | false => peekStmtsUpperBound rest
+    | _ => peekStmtsUpperBound rest
+
+/-- Fast AST scan for the unsigned upper bound constant in `body`'s entry block (`bb0`). -/
+def peekMirUpperBound (body : CapturedMir) : ScalarInt :=
+  match body.basicBlocks with
+  | bb0 :: _ =>
+    match peekStmtsUpperBound bb0.statements with
+    | .some sc => sc
+    | .none => { bits := 0, sizeBytes := 0 }
+  | .nil => { bits := 0, sizeBytes := 0 }
+
+/-- Upper-bound bit value extracted by `peekMirUpperBound`. -/
+def peekMirUpperBoundBits (body : CapturedMir) : Nat :=
+  (peekMirUpperBound body).bits
+
+/-- Scalar width in bytes extracted by `peekMirUpperBound`. -/
+def peekMirUpperBoundSz (body : CapturedMir) : Nat :=
+  (peekMirUpperBound body).sizeBytes
+
+/-- Pure arithmetic postcondition over `retVal` sufficient for `OptMirBoolPredicateHolds optEnsBody`. -/
+def symOptEnsuresUpperPost (optEnsBody : Option CapturedMir) : Value → Memory → Prop :=
+  match optEnsBody with
+  | .some ensBody =>
+    fun retVal _ =>
+      match retVal with
+      | .scalar retSc =>
+        retSc.sizeBytes = peekMirUpperBoundSz ensBody ∧
+          retSc.bits ≤ peekMirUpperBoundBits ensBody
+      | _ => False
+  | .none => fun _ _ => True
+
+/-- Check whether `optEnsBody` is either `.none` or a valid 2-argument unsigned
+upper-bound `ensures` companion. -/
+def checkOptMirEnsuresUpperBound1
+    (specFuel : Nat)
+    (optEnsBody : Option CapturedMir) :
+    Bool :=
+  match optEnsBody with
+  | .some ensBody =>
+    checkMirEnsuresUpperBound1 specFuel ensBody (peekMirUpperBound ensBody)
+  | .none => true
+
+theorem optMirBoolPredicateHolds_of_symOptEnsuresUpperPost
+    (specFuel : Nat)
+    (optEnsBody : Option CapturedMir)
+    (v0 retVal : Value)
+    (mem' : Memory)
+    (h_ens_check : checkOptMirEnsuresUpperBound1 specFuel optEnsBody = true)
+    (h_post : symOptEnsuresUpperPost optEnsBody retVal mem') :
+    OptMirBoolPredicateHolds optEnsBody [v0, retVal] := by
+  cases optEnsBody with
+  | none => exact True.intro
+  | some ensBody =>
+    dsimp only [checkOptMirEnsuresUpperBound1] at h_ens_check
+    dsimp only [symOptEnsuresUpperPost] at h_post
+    cases retVal with
+    | unit | ptr _ _ | aggregate _ _ => exact False.elim h_post
+    | scalar retSc =>
+      rcases retSc with ⟨rBits, rSz⟩
+      rcases h_post with ⟨hSz, hBle⟩
+      dsimp only at hSz hBle
+      subst hSz
+      exact checkMirEnsuresUpperBound1_sound
+        specFuel ensBody (peekMirUpperBound ensBody) v0 rBits h_ens_check hBle
+
+/-- Closed-term checker that `reqBody` and `optEnsBody` are valid 1-argument
+unsigned upper-bound companions for `subjectBody`. -/
+def checkMirAutoSymRange1Bound
+    (specFuel : Nat)
+    (subjectBody reqBody : CapturedMir)
+    (optEnsBody : Option CapturedMir) :
+    Bool :=
+  Bool.and
+    (Bool.and
+      (Nat.beq subjectBody.argCount 1)
+      (checkMirUpperBound1 specFuel reqBody (peekMirUpperBound reqBody)))
+    (checkOptMirEnsuresUpperBound1 specFuel optEnsBody)
+
+/-- One-call bound-independent symbolic range discharge combinator for
+1-argument unsigned `Claim`s with an inequality precondition
+(`requires: x < K` or `x <= K`) of arbitrary magnitude `K`. -/
+theorem dischargeRustSymRange1Auto
+    (c : Claim)
+    (subjectFuel specFuel : Nat)
+    (reqBody : CapturedMir)
+    (optEnsBody : Option CapturedMir)
+    (h_pre :
+      ∀ args : List Value,
+        c.pre args →
+        And
+          (Trusted.Sequence.length args = c.body.argCount)
+          (MirBoolPredicateHolds reqBody args) := by
+      intro _ h; exact h)
+    (h_bound :
+      checkMirAutoSymRange1Bound specFuel c.body reqBody optEnsBody = true := by rfl)
+    (h_sym :
+      ∀ (b : Nat),
+        b ≤ peekMirUpperBoundBits reqBody →
+        wpMirSym subjectFuel c.body
+          (initMachineState c.body
+            [.scalar { bits := b, sizeBytes := peekMirUpperBoundSz reqBody }])
+          (mirNormalPost (symOptEnsuresUpperPost optEnsBody)) := by
+      intro b hBle
+      (conv at hBle => rhs; whnf)
+      (conv => arg 3; arg 2; arg 1; arg 1; arg 2; whnf)
+      (repeat' ((conv => whnf); split))
+      all_goals (conv => whnf)
+      all_goals
+        try (refine ⟨?_, ?_⟩
+             · (conv => lhs; whnf); (conv => rhs; whnf); try rfl
+             · (conv => rhs; whnf); simp_all; try omega)
+      all_goals
+        try (simp_all; try omega))
+    (h_post :
+      ∀ (args : List Value) (ret : Value),
+        OptMirBoolPredicateHolds optEnsBody (args ++ [ret]) →
+        c.post args ret := by
+      intro _ _ h
+      first
+      | exact h
+      | exact True.intro) :
+    VerificationResult c := by
+  refine verifyMirNoPanicSym c subjectFuel (fun args hp => ?_)
+  rcases h_pre args hp with ⟨h_len_body, h_req⟩
+  dsimp only [checkMirAutoSymRange1Bound] at h_bound
+  cases hArg1 : Nat.beq c.body.argCount 1 with
+  | false =>
+    rw [hArg1] at h_bound
+    nomatch h_bound
+  | true =>
+    rw [hArg1] at h_bound
+    cases hReqUb : checkMirUpperBound1 specFuel reqBody (peekMirUpperBound reqBody) with
+    | false =>
+      rw [hReqUb] at h_bound
+      nomatch h_bound
+    | true =>
+      rw [hReqUb] at h_bound
+      dsimp only [Bool.and] at h_bound
+      have h_len1 : length args = 1 :=
+        Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArg1)
+      rcases checkMirUpperBound1_sound
+        specFuel reqBody (peekMirUpperBound reqBody) args hReqUb h_len1 h_req with ⟨b, hBle, hArgs⟩
+      subst hArgs
+      let v0 : Value := .scalar { bits := b, sizeBytes := peekMirUpperBoundSz reqBody }
+      exact wpMirSym_mono
+        (fun out ho => by
+          cases out with
+          | normal p =>
+            rcases p with ⟨retVal, mem'⟩
+            exact h_post [v0] retVal
+              (optMirBoolPredicateHolds_of_symOptEnsuresUpperPost
+                specFuel optEnsBody v0 retVal mem' h_bound ho)
+          | panic => exact False.elim ho
+          | abort => exact False.elim ho)
+        (h_sym b hBle)
+
+/-- One-call bound-independent symbolic range discharge combinator for
+1-argument unsigned `TotalClaim`s (`#[spec(safe_total, ...)]`) with an
+inequality precondition (`requires: x < K` or `x <= K`) of arbitrary magnitude `K`. -/
+theorem dischargeRustTotalSymRange1Auto
+    (c : TotalClaim)
+    (subjectFuel specFuel : Nat)
+    (reqBody : CapturedMir)
+    (optEnsBody : Option CapturedMir)
+    (h_pre :
+      ∀ (args : List Value) (mem : Memory),
+        c.pre args mem →
+        And
+          (And
+            (Trusted.Sequence.length args = c.body.argCount)
+            (MirBoolPredicateHolds reqBody args))
+          (mem = (initMachineState c.body args).memory) := by
+      intro _ _ h; exact h)
+    (h_bound :
+      checkMirAutoSymRange1Bound specFuel c.body reqBody optEnsBody = true := by rfl)
+    (h_sym :
+      ∀ (b : Nat),
+        b ≤ peekMirUpperBoundBits reqBody →
+        wpMirSym subjectFuel c.body
+          (initMachineState c.body
+            [.scalar { bits := b, sizeBytes := peekMirUpperBoundSz reqBody }])
+          (mirNormalPost (symOptEnsuresUpperPost optEnsBody)) := by
+      intro b hBle
+      (conv at hBle => rhs; whnf)
+      (conv => arg 3; arg 2; arg 1; arg 1; arg 2; whnf)
+      (repeat' ((conv => whnf); split))
+      all_goals (conv => whnf)
+      all_goals
+        try (refine ⟨?_, ?_⟩
+             · (conv => lhs; whnf); (conv => rhs; whnf); try rfl
+             · (conv => rhs; whnf); simp_all; try omega)
+      all_goals
+        try (simp_all; try omega))
+    (h_post :
+      ∀ (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory),
+        OptMirBoolPredicateHolds optEnsBody (args ++ [ret]) →
+        c.post args mem ret mem' := by
+      intro _ _ _ _ h
+      first
+      | exact h
+      | exact True.intro) :
+    TotalVerificationResult c := by
+  refine verifyTotalMirSym c subjectFuel (fun args mem hp => ?_)
+  rcases h_pre args mem hp with ⟨⟨h_len_body, h_req⟩, h_mem⟩
+  subst h_mem
+  dsimp only [checkMirAutoSymRange1Bound] at h_bound
+  cases hArg1 : Nat.beq c.body.argCount 1 with
+  | false =>
+    rw [hArg1] at h_bound
+    nomatch h_bound
+  | true =>
+    rw [hArg1] at h_bound
+    cases hReqUb : checkMirUpperBound1 specFuel reqBody (peekMirUpperBound reqBody) with
+    | false =>
+      rw [hReqUb] at h_bound
+      nomatch h_bound
+    | true =>
+      rw [hReqUb] at h_bound
+      dsimp only [Bool.and] at h_bound
+      have h_len1 : length args = 1 :=
+        Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArg1)
+      rcases checkMirUpperBound1_sound
+        specFuel reqBody (peekMirUpperBound reqBody) args hReqUb h_len1 h_req with ⟨b, hBle, hArgs⟩
+      subst hArgs
+      let v0 : Value := .scalar { bits := b, sizeBytes := peekMirUpperBoundSz reqBody }
+      change
+        wpMirSym subjectFuel c.body
+          (initMachineState c.body [v0])
+          (mirNormalPost (c.post [v0] (initMachineState c.body [v0]).memory))
+      exact wpMirSym_mono
+        (fun out ho => by
+          cases out with
+          | normal p =>
+            rcases p with ⟨retVal, mem'⟩
+            exact h_post [v0] (initMachineState c.body [v0]).memory retVal mem'
+              (optMirBoolPredicateHolds_of_symOptEnsuresUpperPost
+                specFuel optEnsBody v0 retVal mem' h_bound ho)
+          | panic => exact False.elim ho
+          | abort => exact False.elim ho)
+        (h_sym b hBle)
 
 /-! ### Compositional Modular Call-Graph Contract Reflection (`dischargeRustModularContractAuto`) -/
 

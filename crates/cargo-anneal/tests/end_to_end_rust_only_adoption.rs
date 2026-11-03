@@ -28,7 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cargo_anneal::{
     CaptureDriverConfig, ScaffoldConfig, VerificationStatus, VerifyConfig,
     render_verification_report, run_cargo_capture, scaffold_workspace_with_config,
-    verify_workspace_with_config,
+    vendor_fuchsia_crates, verify_workspace_with_config,
 };
 
 fn unique_temp_dir(label: &str) -> PathBuf {
@@ -155,8 +155,8 @@ pub fn read_and_offset(port: u32) -> u32 {
 }
 
 #[anneal_spec::spec(
-    requires: x < 8,
-    ensures: |ret: u32| ret <= 8,
+    requires: x < 1000,
+    ensures: |ret: u32| ret <= 1000,
 )]
 pub fn clamp_add_one(x: u32) -> u32 {
     x + 1
@@ -277,8 +277,8 @@ pub fn read_and_offset(port: u32) -> u32 {
 }
 
 #[anneal_spec::spec(
-    requires: x < 8,
-    ensures: |ret: u32| ret <= 8,
+    requires: x < 1000,
+    ensures: |ret: u32| ret <= 1000,
 )]
 pub fn clamp_add_one(x: u32) -> u32 {
     x + 1
@@ -330,5 +330,65 @@ pub fn safe_inc_bounded(x: u32) -> u32 {
     assert!(stage3_summary.contains("Totals: 4 unconditional, 0 conditional"));
     assert!(stage3_summary.contains("TrustedBoundary kernel replay: PASS"));
 
+    // =========================================================================
+    // Stage 4: Cargo-free GN/Bazel `--units-dir` verification mode in a
+    // standalone target directory WITHOUT `Cargo.toml`, consuming pre-captured
+    // `UnitCaptureManifest` records directly from `driver_cfg.units_dir`.
+    // =========================================================================
+    let gn_target_dir = unique_temp_dir("gn-units-dir-only");
+    assert!(!gn_target_dir.join("Cargo.toml").exists());
+    let gn_report = verify_workspace_with_config(
+        &VerifyConfig::new(&gn_target_dir)
+            .with_units_dir(&driver_cfg.units_dir)
+            .with_anneal_repo_root(&checkout_root),
+    )
+    .expect("Stage 4 Cargo-free --units-dir verify_workspace_with_config must succeed");
+    assert_eq!(
+        gn_report.status_for("Verify.RustOnlyPkg.clamp_add_one"),
+        Some(&VerificationStatus::VerifiedUnconditional)
+    );
+    let gn_summary = render_verification_report(&gn_report);
+    assert!(gn_summary.contains("Totals: 4 unconditional, 0 conditional"));
+
+    let _ = fs::remove_dir_all(&gn_target_dir);
     let _ = fs::remove_dir_all(&temp_crate);
+}
+
+#[test]
+fn vendor_fuchsia_crates_stages_self_contained_bundle() {
+    let checkout_root = anneal_checkout_root();
+    let vendor_dir = unique_temp_dir("vendor-fuchsia");
+
+    let vendored = vendor_fuchsia_crates(&checkout_root, &vendor_dir)
+        .expect("vendor_fuchsia_crates must succeed");
+    assert_eq!(vendored.len(), 4);
+
+    for crate_name in [
+        "anneal-spec-macros-0.1.0-alpha.1",
+        "anneal-spec-0.1.0-alpha.1",
+        "anneal-rustc-capture-0.1.0-alpha.1",
+        "cargo-anneal-0.1.0-alpha.1",
+    ] {
+        let crate_dir = vendor_dir.join(crate_name);
+        assert!(crate_dir.join("Cargo.toml").is_file(), "missing Cargo.toml in {crate_name}");
+        assert!(crate_dir.join("LICENSE-BSD").is_file(), "missing LICENSE-BSD in {crate_name}");
+        assert!(
+            crate_dir.join("LICENSE-APACHE").is_file(),
+            "missing LICENSE-APACHE in {crate_name}"
+        );
+        assert!(crate_dir.join("LICENSE-MIT").is_file(), "missing LICENSE-MIT in {crate_name}");
+        let checksum_json = fs::read_to_string(crate_dir.join(".cargo-checksum.json"))
+            .expect("read .cargo-checksum.json");
+        assert!(checksum_json.contains("\"package\":null"));
+        assert!(checksum_json.contains("\"Cargo.toml\":"));
+    }
+
+    let lean_root = vendor_dir.join("cargo-anneal-0.1.0-alpha.1/lean-root");
+    assert!(lean_root.join("trusted/lean").is_dir());
+    assert!(lean_root.join("trusted/audit/check_trusted.py").is_file());
+    assert!(lean_root.join("theory/Anneal").is_dir());
+    assert!(lean_root.join("examples/lakefile.toml").is_file());
+    assert!(lean_root.join("lean-toolchain").is_file());
+
+    let _ = fs::remove_dir_all(&vendor_dir);
 }

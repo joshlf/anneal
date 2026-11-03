@@ -1084,7 +1084,6 @@ pub fn run_miri_diff_suite(config: &MiriDiffConfig) -> Result<MiriDiffReport, St
         &corpus_root,
         anneal_repo_root.as_deref(),
         false,
-        false,
         None,
         &certificate_modules,
     )?;

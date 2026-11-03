@@ -9,6 +9,8 @@
 //! `__anneal_unsafe_impl_*`) resolve when a crate brings `anneal_spec::*`
 //! into scope or links `anodized` directly (`#103` §3.2).
 
+#![no_std]
+
 pub use anodized::{self, __, arithmetic, logic, result, types};
 pub use anneal_spec_macros::{
     embed_spec, external_spec, invariant, model, spec, unsafe_impl, unsafe_trait,

@@ -411,6 +411,53 @@ pub fn aggregate_unit_manifests(
     Ok((root_manifest, unit_records))
 }
 
+/// Load pre-captured `UnitCaptureManifest.json` files from `units_dir` (for
+/// Cargo-free GN/Bazel builds where `anneal-rustc-capture` has already run)
+/// without invoking `cargo check`.
+pub fn load_captured_unit_records(
+    units_dir: &Path,
+) -> Result<(CaptureManifest, Vec<UnitTargetRecord>), String> {
+    aggregate_unit_manifests(units_dir)
+}
+
+/// Return `true` if `units_dir` contains at least one `UnitCaptureManifest.json`
+/// or `CaptureManifest.json` artifact.
+pub fn has_captured_unit_manifests(units_dir: &Path) -> bool {
+    if !units_dir.is_dir() {
+        return false;
+    }
+    let mut unit_paths = Vec::new();
+    let _ = collect_files_named(units_dir, "UnitCaptureManifest.json", &mut unit_paths);
+    if !unit_paths.is_empty() {
+        return true;
+    }
+    let mut fallback_paths = Vec::new();
+    let _ = collect_files_named(units_dir, "CaptureManifest.json", &mut fallback_paths);
+    let root_manifest_path = units_dir.join("CaptureManifest.json");
+    fallback_paths.retain(|p| p != &root_manifest_path);
+    !fallback_paths.is_empty()
+}
+
+/// Inspect `UnitCaptureManifest.json` files under `units_dir` and return the
+/// first non-empty `crate_name` recorded by `anneal-rustc-capture`.
+pub fn infer_crate_name_from_units_dir(units_dir: &Path) -> Option<String> {
+    if !units_dir.is_dir() {
+        return None;
+    }
+    let mut unit_paths = Vec::new();
+    collect_files_named(units_dir, "UnitCaptureManifest.json", &mut unit_paths).ok()?;
+    unit_paths.sort();
+    for path in unit_paths {
+        let content = fs::read_to_string(&path).ok()?;
+        let unit = parse_unit_capture_manifest(&content).ok()?;
+        let trimmed = unit.crate_name.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.replace('-', "_"));
+        }
+    }
+    None
+}
+
 /// Drop unit manifests that a later compilation of the same crate superseded.
 ///
 /// Cargo names each compilation unit after its crate and a metadata hash, so a

@@ -778,4 +778,74 @@ theorem uncheckedAdd_diff_strict_ub_refuted :
      .scalar { bits := 100, sizeBytes := 1 }]
     emptyMemory
 
+/-! ## 12. Bound-Independent Symbolic Range Reflection (`dischargeRustSymRange1Auto`) -/
+
+private def u32CheckedTupleTy : Ty :=
+  { kind := .tuple [.uint .u32, .bool], layoutIdx := 0 }
+
+/-- `pub fn clamp_add_one(x: u32) -> u32 { x + 1 }` with `requires: x < 1000`
+and `ensures: |ret: u32| ret <= 1000`. -/
+def clampAddOneMir : CapturedMir :=
+  mkMirBody "sym_test::clamp_add_one" 1
+    [ mkDecl .mut u32MirTy
+    , mkDecl .not u32MirTy
+    , mkDecl .mut u32CheckedTupleTy ]
+    [ { statements :=
+          [ mkStmt (.storageLive 2)
+          , mkStmt (.assign { local_ := 2, projection := [] }
+              (.binaryOp .addWithOverflow
+                (.copy { local_ := 1, projection := [] })
+                (u32ConstOperand 1))) ]
+        terminator :=
+          mkTerm (.assert
+            (.move { local_ := 2, projection := [.field 1 boolMirTy] })
+            false
+            1
+            .continue_)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.assign { local_ := 0, projection := [] }
+              (.use (.copy { local_ := 2, projection := [.field 0 u32MirTy] })))
+          , mkStmt (.storageDead 2) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+def clampAddOneReq1000Mir : CapturedMir :=
+  mkMirBody "sym_test::__anodized_fn_requires_clamp_add_one" 1
+    [mkDecl .mut boolMirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [ mkStmt (.assign { local_ := 0, projection := [] }
+              (.binaryOp .lt
+                (.copy { local_ := 1, projection := [] })
+                (u32ConstOperand 1000))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+    (.requires "sym_test::clamp_add_one")
+
+def clampAddOneEns1000Mir : CapturedMir :=
+  mkMirBody "sym_test::__anodized_fn_ensures_clamp_add_one" 2
+    [mkDecl .mut boolMirTy, mkDecl .not u32MirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [ mkStmt (.assign { local_ := 0, projection := [] }
+              (.binaryOp .le
+                (.copy { local_ := 2, projection := [] })
+                (u32ConstOperand 1000))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+    (.ensures "sym_test::clamp_add_one")
+
+def clampAddOne1000Claim : Claim where
+  body := clampAddOneMir
+  pre args :=
+    Trusted.Sequence.length args = 1 ∧
+      MirBoolPredicateHolds clampAddOneReq1000Mir args
+  post args ret :=
+    MirBoolPredicateHolds clampAddOneEns1000Mir (args ++ [ret])
+
+theorem clampAddOne1000_verified : VerificationResult clampAddOne1000Claim := by
+  exact dischargeRustSymRange1Auto
+    clampAddOne1000Claim 16 16
+    clampAddOneReq1000Mir
+    (.some clampAddOneEns1000Mir)
+
 end Anneal.Rustc.V2026_06_01.SymbolicEvalTests
