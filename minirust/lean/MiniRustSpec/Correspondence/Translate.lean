@@ -140,22 +140,30 @@ def translateUnOp : MirAst.UnOp → Option Gen.IntUnOp
 >  (Mul, Type::Int(_)) => build::mul(l, r),
 >  (Div, Type::Int(_)) => build::div(l, r),
 >  (Rem, Type::Int(_)) => build::rem(l, r),
+>  (Shl, Type::Int(_)) => build::shl(l, r),
+>  (Shr, Type::Int(_)) => build::shr(l, r),
 >  ..
 >  (AddUnchecked, Type::Int(_)) => build::add_unchecked(l, r),
 >  (SubUnchecked, Type::Int(_)) => build::sub_unchecked(l, r),
->  (MulUnchecked, Type::Int(_)) => build::mul_unchecked(l, r),"
+>  (MulUnchecked, Type::Int(_)) => build::mul_unchecked(l, r),
+>  (ShlUnchecked, Type::Int(_)) => build::shl_unchecked(l, r),
+>  (ShrUnchecked, Type::Int(_)) => build::shr_unchecked(l, r),"
 where `build::add(l, r)` is `ValueExpr::BinOp { operator: BinOp::Int(IntBinOp::Add), .. }`
-(and analogously for `Sub`, `Mul`, `Div`, `Rem`, `AddUnchecked`, `SubUnchecked`,
-and `MulUnchecked`). -/
+(and analogously for `Sub`, `Mul`, `Div`, `Rem`, `Shl`, `Shr`, `AddUnchecked`,
+`SubUnchecked`, `MulUnchecked`, `ShlUnchecked`, and `ShrUnchecked`). -/
 def translateBinOp : MirAst.BinOp → Option Gen.IntBinOp
   | .add => some .Add
   | .sub => some .Sub
   | .mul => some .Mul
   | .div => some .Div
   | .rem => some .Rem
+  | .shl => some .Shl
+  | .shr => some .Shr
   | .addUnchecked => some .AddUnchecked
   | .subUnchecked => some .SubUnchecked
   | .mulUnchecked => some .MulUnchecked
+  | .shlUnchecked => some .ShlUnchecked
+  | .shrUnchecked => some .ShrUnchecked
   | _ => none
 
 /-- `minimize`'s rvalue translation for `Use`, `UnaryOp(Neg | Not)` on

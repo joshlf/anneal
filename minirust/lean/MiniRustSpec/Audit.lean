@@ -77,6 +77,8 @@ open MiniRustSpec.Correspondence in
   runA_sound
   runA_noUB
   faultsA_sound
+  treeSafe_of_step_inv
+  noRet_of_step_inv
   treeSafe_of_tau_inv
   noRet_of_tau_inv
   evalReturn_callee
@@ -95,6 +97,11 @@ open MiniRustSpec.Correspondence in
   signedOverflowMul_eq
   evalSignedDiv_spec
   evalSignedRem_spec
+  shift_offset_eq
+  unchecked_shift_oob_iff
+  shiftLeftBits_intFromBits
+  shiftRightUnsigned_intFromBits
+  arithmeticShrBits_intFromBits
   castBits_eq_toNat
   switch_lookup
   translateFn_spec
@@ -191,6 +198,31 @@ open MiniRustSpec.Correspondence.Witness in
   uncheckedAddUb_minirust_ub_from_start
   uncheckedAddUb_minirust_direct
   uncheckedAddUb_outcome
+  branchSpinLoop_inFragment
+  branchSpinLoop_translate
+  branchSpinLoop1_noUB
+  branchSpinLoop1_diverges
+  branchSpinLoop1_minirust_diverges_rel
+  shiftI8_inFragment
+  shiftI8_translate
+  shiftOk_anneal_ret
+  shiftOk_noUB
+  shiftOk_minirust_ret_from_start
+  shiftOk_minirust_direct
+  shrUncheckedGe8Ub_anneal_ub
+  shrUncheckedGe8Ub_minirust_ub_from_start
+  shrUncheckedGe8Ub_minirust_direct
+  shrUncheckedNegUb_anneal_ub
+  shrUncheckedNegUb_minirust_ub_from_start
+  shrUncheckedNegUb_minirust_direct
+  shlUncheckedI8_inFragment
+  shlUncheckedI8_translate
+  shlUncheckedGe8Ub_anneal_ub
+  shlUncheckedGe8Ub_minirust_ub_from_start
+  shlUncheckedGe8Ub_minirust_direct
+  shlUncheckedNegUb_anneal_ub
+  shlUncheckedNegUb_minirust_ub_from_start
+  shlUncheckedNegUb_minirust_direct
 
 #assert_standard_axioms MiniRustSpec.Anchors.anchors_ok
 

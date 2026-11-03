@@ -398,6 +398,18 @@ def intBinEval (iop : Gen.IntBinOp) (l r : Int) (it : Gen.IntType) : Option Int 
     if r = 0 then none
     else if IntType.can_represent it (Int.tdiv l r) then some (Int.tmod l r)
     else none
+  | .Shl =>
+    let bits : Int := Size.bits it.size
+    some (l * (2 : Int) ^ (r % bits).toNat)
+  | .Shr =>
+    let bits : Int := Size.bits it.size
+    some (l / (2 : Int) ^ (r % bits).toNat)
+  | .ShlUnchecked =>
+    let bits : Int := Size.bits it.size
+    if r < 0 ∨ r ≥ bits then none else some (l * (2 : Int) ^ r.toNat)
+  | .ShrUnchecked =>
+    let bits : Int := Size.bits it.size
+    if r < 0 ∨ r ≥ bits then none else some (l / (2 : Int) ^ r.toNat)
   | _ => none
 
 theorem evalIntBinOp_spec (op : MirAst.BinOp) (iop : Gen.IntBinOp)
@@ -405,7 +417,7 @@ theorem evalIntBinOp_spec (op : MirAst.BinOp) (iop : Gen.IntBinOp)
     (∀ z, intBinEval iop l r it = some z → evalIntBinOp iop l r it = .ok z) ∧
     (intBinEval iop l r it = none → ∃ msg, evalIntBinOp iop l r it = .error (.ub msg)) := by
   match op, hop with
-  | .add, hop | .sub, hop | .mul, hop =>
+  | .add, hop | .sub, hop | .mul, hop | .shl, hop | .shr, hop =>
     simp [translateBinOp] at hop; subst hop; simp [intBinEval, evalIntBinOp]
   | .addUnchecked, hop =>
     simp [translateBinOp] at hop; subst hop
@@ -428,6 +440,12 @@ theorem evalIntBinOp_spec (op : MirAst.BinOp) (iop : Gen.IntBinOp)
     · simp [intBinEval, evalIntBinOp, hr0, ub]
     · cases hrep : IntType.can_represent it (Int.tdiv l r) <;>
         simp [intBinEval, evalIntBinOp, hr0, hrep, ub]
+  | .shlUnchecked, hop =>
+    simp [translateBinOp] at hop; subst hop
+    by_cases hoob : r < 0 ∨ r ≥ Size.bits it.size <;> simp [intBinEval, evalIntBinOp, hoob, ub]
+  | .shrUnchecked, hop =>
+    simp [translateBinOp] at hop; subst hop
+    by_cases hoob : r < 0 ∨ r ≥ Size.bits it.size <;> simp [intBinEval, evalIntBinOp, hoob, ub]
 
 /-- Hypotheses describing a callee frame related to Anneal locals `locals`. -/
 structure FrameOk (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (locals : List LocalSlot)

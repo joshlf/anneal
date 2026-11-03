@@ -942,8 +942,17 @@ theorem runA_noUB (body : CapturedMir) (fuel : Nat) :
                 rw [hk]
                 exact ih s' p.1 p.2 hrun
 
-theorem tauStar_of_tau_inv {body : CapturedMir} {Inv : MachineState → Prop}
-    (hstep : ∀ s, Inv s → ∃ s', stepMirFn body s = .tau (.running s') ∧ Inv s')
+/-- One-step invariant condition for a diverging loop: each step from a state
+satisfying `Inv` either takes a silent `.tau` transition to a state satisfying
+`Inv` or emits a branch observation `.emit ev` whose continuation is a state
+satisfying `Inv`. -/
+def SafeContinue (body : CapturedMir) (Inv : MachineState → Prop) (s : MachineState) : Prop :=
+  (∃ s', stepMirFn body s = .tau (.running s') ∧ Inv s') ∨
+  (∃ ev k s', stepMirFn body s = .vis (.inr (.inl (.emit ev))) k ∧
+    k PUnit.unit = .running s' ∧ Inv s')
+
+theorem tauStar_of_step_inv {body : CapturedMir} {Inv : MachineState → Prop}
+    (hstep : ∀ s, Inv s → SafeContinue body Inv s)
     {t u : ITree MirEffect MirOutcome} (htau : TauStar t u) :
     ∀ s, t = mirTree body s → Inv s → ∃ s', u = mirTree body s' ∧ Inv s' := by
   induction htau with
@@ -953,65 +962,114 @@ theorem tauStar_of_tau_inv {body : CapturedMir} {Inv : MachineState → Prop}
   | step hobs _ ih =>
     intro s ht hinv
     subst ht
-    obtain ⟨s1, hs1, hinv1⟩ := hstep s hinv
-    have hobs' := mirTree_observe body s
-    rw [hs1, ITreeF.map] at hobs'
-    rw [hobs'] at hobs
-    injection hobs with hnext
-    exact ih s1 hnext.symm hinv1
+    rcases hstep s hinv with ⟨s1, hs1, hinv1⟩ | ⟨ev, k, s1, hs1, _, _⟩
+    · have hobs' := mirTree_observe body s
+      rw [hs1, ITreeF.map] at hobs'
+      rw [hobs'] at hobs
+      injection hobs with hnext
+      exact ih s1 hnext.symm hinv1
+    · have hobs' := mirTree_observe body s
+      rw [hs1] at hobs'
+      simp only [ITreeF.map] at hobs'
+      rw [hobs'] at hobs
+      cases hobs
 
-theorem reaches_of_tau_inv {body : CapturedMir} {Inv : MachineState → Prop}
-    (hstep : ∀ s, Inv s → ∃ s', stepMirFn body s = .tau (.running s') ∧ Inv s')
+theorem reaches_of_step_inv {body : CapturedMir} {Inv : MachineState → Prop}
+    (hstep : ∀ s, Inv s → SafeContinue body Inv s)
     {t u : ITree MirEffect MirOutcome} {tr : List (Event MirEffect)} (hr : Reaches t tr u) :
-    ∀ s, t = mirTree body s → Inv s → tr = [] ∧ ∃ s', u = mirTree body s' ∧ Inv s' := by
+    ∀ s, t = mirTree body s → Inv s → ∃ s', u = mirTree body s' ∧ Inv s' := by
   induction hr with
   | refl t =>
     intro s ht hinv
-    exact ⟨rfl, s, ht, hinv⟩
+    exact ⟨s, ht, hinv⟩
   | tau hobs _ ih =>
     intro s ht hinv
     subst ht
-    obtain ⟨s1, hs1, hinv1⟩ := hstep s hinv
-    have hobs' := mirTree_observe body s
-    rw [hs1, ITreeF.map] at hobs'
-    rw [hobs'] at hobs
-    injection hobs with hnext
-    exact ih s1 hnext.symm hinv1
-  | vis hobs _ _ _ _ =>
+    rcases hstep s hinv with ⟨s1, hs1, hinv1⟩ | ⟨ev, k, s1, hs1, _, _⟩
+    · have hobs' := mirTree_observe body s
+      rw [hs1, ITreeF.map] at hobs'
+      rw [hobs'] at hobs
+      injection hobs with hnext
+      exact ih s1 hnext.symm hinv1
+    · have hobs' := mirTree_observe body s
+      rw [hs1] at hobs'
+      simp only [ITreeF.map] at hobs'
+      rw [hobs'] at hobs
+      cases hobs
+  | vis hobs _ o _ ih =>
     intro s ht hinv
     subst ht
-    obtain ⟨s1, hs1, _⟩ := hstep s hinv
-    have hobs' := mirTree_observe body s
-    rw [hs1, ITreeF.map] at hobs'
-    rw [hobs'] at hobs
-    cases hobs
+    rcases hstep s hinv with ⟨s1, hs1, _⟩ | ⟨ev, k, s1, hs1, hk1, hinv1⟩
+    · have hobs' := mirTree_observe body s
+      rw [hs1, ITreeF.map] at hobs'
+      rw [hobs'] at hobs
+      cases hobs
+    · have hobs' := mirTree_observe body s
+      rw [hs1] at hobs'
+      simp only [ITreeF.map] at hobs'
+      rw [hobs'] at hobs
+      injection hobs with hi hk
+      subst hi
+      have hk' := eq_of_heq hk
+      subst hk'
+      cases o
+      have ht' : ITree.cofix (stepMirState body) (k PUnit.unit) = mirTree body s1 := by
+        rw [hk1]; rfl
+      exact ih s1 ht' hinv1
+
+/-- Invariant-based all-prefix UB-freedom (`MirNoUBTree`) for diverging loops
+that may take silent `.tau` steps and emit branch observations (`.emit`). -/
+theorem treeSafe_of_step_inv {body : CapturedMir} {Inv : MachineState → Prop}
+    (hstep : ∀ s, Inv s → SafeContinue body Inv s)
+    {s : MachineState} (hinv : Inv s) : MirNoUBTree (mirTree body s) := by
+  intro tr u hr ⟨w, i, k, htau, hw, hflt⟩
+  obtain ⟨s1, rfl, hinv1⟩ := reaches_of_step_inv hstep hr s rfl hinv
+  obtain ⟨s2, rfl, hinv2⟩ := tauStar_of_step_inv hstep htau s1 rfl hinv1
+  rcases hstep s2 hinv2 with ⟨s3, hs3, _⟩ | ⟨ev, k0, s3, hs3, _, _⟩
+  · have hobs := mirTree_observe body s2
+    rw [hs3, ITreeF.map] at hobs
+    rw [hobs] at hw
+    cases hw
+  · have hobs := mirTree_observe body s2
+    rw [hs3] at hobs
+    simp only [ITreeF.map] at hobs
+    rw [hobs] at hw
+    injection hw with hi _
+    subst hi
+    exact hflt
+
+/-- Invariant-based non-termination (`¬ ReachesRet`) for diverging loops that
+may take silent `.tau` steps and emit branch observations (`.emit`). -/
+theorem noRet_of_step_inv {body : CapturedMir} {Inv : MachineState → Prop}
+    (hstep : ∀ s, Inv s → SafeContinue body Inv s)
+    {s : MachineState} (hinv : Inv s) (tr : List (Event MirEffect)) (o : MirOutcome) :
+    ¬ ReachesRet (mirTree body s) tr o := by
+  rintro ⟨u, hr, hu⟩
+  obtain ⟨s1, rfl, hinv1⟩ := reaches_of_step_inv hstep hr s rfl hinv
+  rcases hstep s1 hinv1 with ⟨s2, hs2, _⟩ | ⟨ev, k0, s2, hs2, _, _⟩
+  · have hobs := mirTree_observe body s1
+    rw [hs2, ITreeF.map] at hobs
+    rw [hobs] at hu
+    cases hu
+  · have hobs := mirTree_observe body s1
+    rw [hs2] at hobs
+    simp only [ITreeF.map] at hobs
+    rw [hobs] at hu
+    cases hu
 
 /-- Invariant-based all-prefix UB-freedom (`MirNoUBTree`) for diverging
 silent-step loops. -/
 theorem treeSafe_of_tau_inv {body : CapturedMir} {Inv : MachineState → Prop}
     (hstep : ∀ s, Inv s → ∃ s', stepMirFn body s = .tau (.running s') ∧ Inv s')
-    {s : MachineState} (hinv : Inv s) : MirNoUBTree (mirTree body s) := by
-  intro tr u hr ⟨w, i, k, htau, hw, _⟩
-  obtain ⟨_, s1, rfl, hinv1⟩ := reaches_of_tau_inv hstep hr s rfl hinv
-  obtain ⟨s2, rfl, hinv2⟩ := tauStar_of_tau_inv hstep htau s1 rfl hinv1
-  obtain ⟨s3, hs3, _⟩ := hstep s2 hinv2
-  have hobs := mirTree_observe body s2
-  rw [hs3, ITreeF.map] at hobs
-  rw [hobs] at hw
-  cases hw
+    {s : MachineState} (hinv : Inv s) : MirNoUBTree (mirTree body s) :=
+  treeSafe_of_step_inv (fun s hs => Or.inl (hstep s hs)) hinv
 
 /-- Invariant-based non-termination (`¬ ReachesRet`) for diverging silent-step
 loops. -/
 theorem noRet_of_tau_inv {body : CapturedMir} {Inv : MachineState → Prop}
     (hstep : ∀ s, Inv s → ∃ s', stepMirFn body s = .tau (.running s') ∧ Inv s')
     {s : MachineState} (hinv : Inv s) (tr : List (Event MirEffect)) (o : MirOutcome) :
-    ¬ ReachesRet (mirTree body s) tr o := by
-  rintro ⟨u, hr, hu⟩
-  obtain ⟨_, s1, rfl, hinv1⟩ := reaches_of_tau_inv hstep hr s rfl hinv
-  obtain ⟨s2, hs2, _⟩ := hstep s1 hinv1
-  have hobs := mirTree_observe body s1
-  rw [hs2, ITreeF.map] at hobs
-  rw [hobs] at hu
-  cases hu
+    ¬ ReachesRet (mirTree body s) tr o :=
+  noRet_of_step_inv (fun s hs => Or.inl (hstep s hs)) hinv tr o
 
 end MiniRustSpec.Correspondence

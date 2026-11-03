@@ -1349,4 +1349,281 @@ theorem uncheckedAddUb_outcome (n : Nat) :
   mirCall_outcome uncheckedArithI8_inFragment uncheckedArithI8_translate ctxI8_3 (ctxI8_ok3 rfl)
     [.scalar ⟨10, 1⟩, .scalar ⟨2, 1⟩] (by decide) uncheckedAddUbMInit rfl rfl rfl n
 
+/-! ## Observable-step diverging loop (`branchSpinLoop`) -/
+
+/-- MIR (`Runtime(PostCleanup)`) of a conditional loop
+```rust
+fn branch_spin_loop(x: u32) -> u32 {
+    while x != 0 {}
+    x
+}
+```
+Unlike `spinLoop`, every iteration executes a `switchInt` terminator and
+emits a visible `.emit` branch event in Anneal's interaction tree, exercising
+`treeSafe_of_step_inv` and `noRet_of_step_inv`. -/
+def branchSpinLoop : CapturedMir where
+  defPath := "witness::branch_spin_loop"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.switchInt (.copy (local_ 1))
+        { branches := [(0, 1)], otherwise := 0 }),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.use (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem branchSpinLoop_inFragment : inFragment branchSpinLoop = true := by decide
+
+def branchSpinLoopFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[], .Switch (.Load (.Local (localName 1))) ⟨[(0, bbName 1)]⟩ (bbName 0), .Regular⟩),
+    (bbName 1, ⟨[.Assign (.Local (localName 0)) (.Load (.Local (localName 1)))],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 2
+  implicit_writes := true
+
+theorem branchSpinLoop_translate : translateFn branchSpinLoop = some branchSpinLoopFn := rfl
+
+def branchSpinLoop1S0 : MachineState := initMachineState branchSpinLoop [.scalar ⟨1, 4⟩]
+def branchSpinLoop1MInit : Mach :=
+  machine branchSpinLoop branchSpinLoopFn branchSpinLoop1S0.frame.locals branchSpinLoopFn.start
+
+theorem branchSpinLoop1_step_self :
+    ∀ s, s = branchSpinLoop1S0 → SafeContinue branchSpinLoop (· = branchSpinLoop1S0) s := by
+  rintro s rfl
+  exact Or.inr ⟨.event 1, _, branchSpinLoop1S0, rfl, rfl, rfl⟩
+
+/-- `branchSpinLoop(1)` is UB-free across its infinite interaction tree, even
+though every iteration emits a visible `.emit (.event 1)` branch observation. -/
+theorem branchSpinLoop1_noUB : MirNoUBTree (mirCallTree branchSpinLoop [.scalar ⟨1, 4⟩]) :=
+  treeSafe_of_step_inv branchSpinLoop1_step_self rfl
+
+/-- `branchSpinLoop(1)` never reaches a return outcome along any trace. -/
+theorem branchSpinLoop1_diverges (tr : List (Event MirEffect)) (o : MirOutcome) :
+    ¬ ReachesRet (mirCallTree branchSpinLoop [.scalar ⟨1, 4⟩]) tr o :=
+  noRet_of_step_inv branchSpinLoop1_step_self rfl tr o
+
+/-- Therefore MiniRust started at `f.start` steps forever in `StateRel` with an
+Anneal state reachable via `Reaches` along the growing branch-observation trace. -/
+theorem branchSpinLoop1_minirust_diverges_rel (n : Nat) :
+    ∃ s' m' tr, Interp.steps (n + 1) branchSpinLoop1MInit = .ok m' ∧
+      StateRel branchSpinLoop branchSpinLoopFn ctx0 s' m' ∧
+      Reaches (mirCallTree branchSpinLoop [.scalar ⟨1, 4⟩]) tr (mirTree branchSpinLoop s') :=
+  mirCall_diverges_rel branchSpinLoop_inFragment branchSpinLoop_translate ctx0 (ctx0_ok2 rfl)
+    [.scalar ⟨1, 4⟩] (by decide) branchSpinLoop1MInit rfl rfl rfl
+    branchSpinLoop1_noUB branchSpinLoop1_diverges n
+
+/-! ## Wrapping and unchecked shifts (`Shl`, `Shr`, `ShlUnchecked`, `ShrUnchecked`) -/
+
+/-- MIR (`Runtime(PostCleanup)`) of
+```rust
+fn shift_i8(mut a: i8, s: i8) -> i8 {
+    a = a >> -6i8;              // bb0: _1 = Shr(copy _1, const -6i8)   -- (-6).rem_euclid(8) = 2
+    a = a << -7i8;              //      _1 = Shl(copy _1, const -7i8)   -- (-7).rem_euclid(8) = 1
+    a = unchecked_shr(a, s);    //      _1 = ShrUnchecked(copy _1, copy _2)
+    unchecked_shl(a, s)         //      _0 = ShlUnchecked(copy _1, copy _2); return
+}
+```
+where `-6i8` has bit pattern `250` and `-7i8` has bit pattern `249`. -/
+def shiftI8 : CapturedMir where
+  defPath := "witness::shift_i8"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [i8Decl, i8Decl, i8Decl]
+  basicBlocks := [{
+    statements := [
+      mkStmt (.assign (local_ 1) (.binaryOp .shr (.copy (local_ 1)) (constI8 250))),
+      mkStmt (.assign (local_ 1) (.binaryOp .shl (.copy (local_ 1)) (constI8 249))),
+      mkStmt (.assign (local_ 1) (.binaryOp .shrUnchecked (.copy (local_ 1)) (.copy (local_ 2)))),
+      mkStmt (.assign (local_ 0) (.binaryOp .shlUnchecked (.copy (local_ 1)) (.copy (local_ 2))))],
+    terminator := mkTerm .return_,
+    isCleanup := false }]
+  fnAbi := fnAbiI8 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem shiftI8_inFragment : inFragment shiftI8 = true := by decide
+
+def shiftI8Fn : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i8)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 1))
+        (.BinOp (.Int .Shr) (.Load (.Local (localName 1))) (.Constant (.Int (-6)) (.Int i8))),
+      .Assign (.Local (localName 1))
+        (.BinOp (.Int .Shl) (.Load (.Local (localName 1))) (.Constant (.Int (-7)) (.Int i8))),
+      .Assign (.Local (localName 1))
+        (.BinOp (.Int .ShrUnchecked) (.Load (.Local (localName 1))) (.Load (.Local (localName 2)))),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .ShlUnchecked) (.Load (.Local (localName 1))) (.Load (.Local (localName 2))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem shiftI8_translate : translateFn shiftI8 = some shiftI8Fn := rfl
+
+/-- Input `(-64i8, 3i8)` (bits `192`, `3`):
+`-64i8 >> -6i8 = -64i8 >> 2 = -16i8` (bits `240`),
+`-16i8 << -7i8 = -16i8 << 1 = -32i8` (bits `224`),
+`unchecked_shr(-32i8, 3i8) = -4i8` (bits `252`),
+`unchecked_shl(-4i8, 3i8) = -32i8` (bits `224`). -/
+def shiftOkS0 : MachineState := initMachineState shiftI8 [.scalar ⟨192, 1⟩, .scalar ⟨3, 1⟩]
+def shiftOkMInit : Mach :=
+  machineWithCtx ctxI8_3 shiftI8 shiftI8Fn shiftOkS0.frame.locals shiftI8Fn.start
+
+theorem shiftOk_anneal_ret :
+    ReachesRet (mirCallTree shiftI8 [.scalar ⟨192, 1⟩, .scalar ⟨3, 1⟩]) []
+      (.normal (.scalar ⟨224, 1⟩, shiftOkS0.memory)) :=
+  runA_sound shiftI8 10 _ _ _ rfl
+
+theorem shiftOk_noUB :
+    MirNoUBTree (mirCallTree shiftI8 [.scalar ⟨192, 1⟩, .scalar ⟨3, 1⟩]) :=
+  runA_noUB shiftI8 10 _ _ _ rfl
+
+theorem shiftOk_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n shiftOkMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 224 } ∧
+      m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret shiftI8_inFragment shiftI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+      [.scalar ⟨192, 1⟩, .scalar ⟨3, 1⟩] (by decide) shiftOkMInit rfl rfl rfl shiftOk_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [shiftI8] at hd; subst hd
+  simp [retPtr, ctxI8_3] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_3] at hr; subst hr
+  have hbits : bits = 224 := by
+    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxI8_3, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+
+theorem shiftOk_minirust_direct :
+    (Interp.steps 6 shiftOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 224 }, [1]) := rfl
+
+/-- `ShrUnchecked` UB when `s = 8i8` (`s >= bits`). -/
+def shrUncheckedGe8UbS0 : MachineState := initMachineState shiftI8 [.scalar ⟨192, 1⟩, .scalar ⟨8, 1⟩]
+def shrUncheckedGe8UbMInit : Mach :=
+  machineWithCtx ctxI8_3 shiftI8 shiftI8Fn shrUncheckedGe8UbS0.frame.locals shiftI8Fn.start
+
+theorem shrUncheckedGe8Ub_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree shiftI8 [.scalar ⟨192, 1⟩, .scalar ⟨8, 1⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound shiftI8 6 _ (by decide)
+
+theorem shrUncheckedGe8Ub_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n shrUncheckedGe8UbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := shrUncheckedGe8Ub_anneal_ub
+  exact mirCall_ub shiftI8_inFragment shiftI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+    [.scalar ⟨192, 1⟩, .scalar ⟨8, 1⟩] (by decide) shrUncheckedGe8UbMInit rfl rfl rfl hr hf
+
+theorem shrUncheckedGe8Ub_minirust_direct :
+    Interp.steps 4 shrUncheckedGe8UbMInit = .error (.ub "overflow in unchecked shift") := rfl
+
+/-- `ShrUnchecked` UB when `s = -1i8` (bits `255`, `s < 0`). -/
+def shrUncheckedNegUbS0 : MachineState := initMachineState shiftI8 [.scalar ⟨192, 1⟩, .scalar ⟨255, 1⟩]
+def shrUncheckedNegUbMInit : Mach :=
+  machineWithCtx ctxI8_3 shiftI8 shiftI8Fn shrUncheckedNegUbS0.frame.locals shiftI8Fn.start
+
+theorem shrUncheckedNegUb_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree shiftI8 [.scalar ⟨192, 1⟩, .scalar ⟨255, 1⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound shiftI8 6 _ (by decide)
+
+theorem shrUncheckedNegUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n shrUncheckedNegUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := shrUncheckedNegUb_anneal_ub
+  exact mirCall_ub shiftI8_inFragment shiftI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+    [.scalar ⟨192, 1⟩, .scalar ⟨255, 1⟩] (by decide) shrUncheckedNegUbMInit rfl rfl rfl hr hf
+
+theorem shrUncheckedNegUb_minirust_direct :
+    Interp.steps 4 shrUncheckedNegUbMInit = .error (.ub "overflow in unchecked shift") := rfl
+
+/-- Standalone `ShlUnchecked` body `fn shl_unchecked_i8(a: i8, s: i8) -> i8 { unchecked_shl(a, s) }`
+to witness both `s >= 8` and `s < 0` UB on `ShlUnchecked`. -/
+def shlUncheckedI8 : CapturedMir where
+  defPath := "witness::shl_unchecked_i8"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [i8Decl, i8Decl, i8Decl]
+  basicBlocks := [{
+    statements := [
+      mkStmt (.assign (local_ 0) (.binaryOp .shlUnchecked (.copy (local_ 1)) (.copy (local_ 2))))],
+    terminator := mkTerm .return_,
+    isCleanup := false }]
+  fnAbi := fnAbiI8 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem shlUncheckedI8_inFragment : inFragment shlUncheckedI8 = true := by decide
+
+def shlUncheckedI8Fn : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i8)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .ShlUnchecked) (.Load (.Local (localName 1))) (.Load (.Local (localName 2))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem shlUncheckedI8_translate : translateFn shlUncheckedI8 = some shlUncheckedI8Fn := rfl
+
+def shlUncheckedGe8UbS0 : MachineState := initMachineState shlUncheckedI8 [.scalar ⟨1, 1⟩, .scalar ⟨8, 1⟩]
+def shlUncheckedGe8UbMInit : Mach :=
+  machineWithCtx ctxI8_3 shlUncheckedI8 shlUncheckedI8Fn shlUncheckedGe8UbS0.frame.locals shlUncheckedI8Fn.start
+
+theorem shlUncheckedGe8Ub_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree shlUncheckedI8 [.scalar ⟨1, 1⟩, .scalar ⟨8, 1⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound shlUncheckedI8 5 _ (by decide)
+
+theorem shlUncheckedGe8Ub_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n shlUncheckedGe8UbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := shlUncheckedGe8Ub_anneal_ub
+  exact mirCall_ub shlUncheckedI8_inFragment shlUncheckedI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+    [.scalar ⟨1, 1⟩, .scalar ⟨8, 1⟩] (by decide) shlUncheckedGe8UbMInit rfl rfl rfl hr hf
+
+theorem shlUncheckedGe8Ub_minirust_direct :
+    Interp.steps 2 shlUncheckedGe8UbMInit = .error (.ub "overflow in unchecked shift") := rfl
+
+def shlUncheckedNegUbS0 : MachineState := initMachineState shlUncheckedI8 [.scalar ⟨1, 1⟩, .scalar ⟨255, 1⟩]
+def shlUncheckedNegUbMInit : Mach :=
+  machineWithCtx ctxI8_3 shlUncheckedI8 shlUncheckedI8Fn shlUncheckedNegUbS0.frame.locals shlUncheckedI8Fn.start
+
+theorem shlUncheckedNegUb_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree shlUncheckedI8 [.scalar ⟨1, 1⟩, .scalar ⟨255, 1⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound shlUncheckedI8 5 _ (by decide)
+
+theorem shlUncheckedNegUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n shlUncheckedNegUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := shlUncheckedNegUb_anneal_ub
+  exact mirCall_ub shlUncheckedI8_inFragment shlUncheckedI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+    [.scalar ⟨1, 1⟩, .scalar ⟨255, 1⟩] (by decide) shlUncheckedNegUbMInit rfl rfl rfl hr hf
+
+theorem shlUncheckedNegUb_minirust_direct :
+    Interp.steps 2 shlUncheckedNegUbMInit = .error (.ub "overflow in unchecked shift") := rfl
+
 end MiniRustSpec.Correspondence.Witness

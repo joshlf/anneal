@@ -103,17 +103,16 @@ structure PhantomData (T : Type) : Type where
 structure DynWrite : Type where
   written : List String
 
-/-- `libspecr::Nondet<T>`: the opaque non-determinism monad.
+/-- `libspecr::Nondet<T>`: the opaque non-determinism monad (`spec/prelude/main.md`):
 
 > "/// We leave the encoding of the non-determinism monad opaque.
-> pub use libspecr::Nondet;" (`spec/prelude/main.md`) -/
+> pub use libspecr::Nondet;" -/
 opaque Nondet : Type → Type
 
 /-- `libspecr::NdResult<T, E>`: the combined non-determinism and fallibility
-monad `Nondet<Result<T, E>>`.
+monad `Nondet<Result<T, E>>` (`README.md`):
 
-> "The combined monad `Nondet<Result<T>>` is abbreviated `NdResult<T>`"
-(`README.md`) -/
+> "The combined monad `Nondet<Result<T>>` is abbreviated `NdResult<T>`" -/
 abbrev NdResult (T : Type := Unit) (E : Type := Empty) : Type := Nondet (Except E T)
 
 end MiniRustSpec.LibSpecr

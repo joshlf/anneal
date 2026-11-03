@@ -156,7 +156,7 @@ restricted to the fragment checked by `inFragment`:
   and the arguments, all of integer type (`u8`..`u128`, `i8`..`i128`,
   `usize`, `isize`);
 * statements are `_i = Use(op)`, `_i = UnaryOp(Neg | Not, op)`,
-  `_i = BinaryOp(Add | Sub | Mul | Div | Rem | AddUnchecked | SubUnchecked | MulUnchecked, op, op)`,
+  `_i = BinaryOp(Add | Sub | Mul | Div | Rem | Shl | Shr | AddUnchecked | SubUnchecked | MulUnchecked | ShlUnchecked | ShrUnchecked, op, op)`,
   `_i = Cast(CastKind::IntToInt, op, targetTy)`, or `PlaceMention(_i)`,
   with `op` a projection-free `copy _j` or an integer constant (of `_i`'s type
   for `Use`/`UnaryOp`/`BinaryOp`, or of any integer type for `Cast(IntToInt)`);
@@ -221,12 +221,14 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
   `mirNoUB_progress`, `mirNoUB_progress_from_start`, `mirCall_progress`,
   `mirNoUB_diverges_steps_ok`, `mirNoUB_diverges_from_start`,
   `mirNoUB_diverges_rel_from_start`, `mirCall_diverges_steps_ok`,
-  `mirCall_diverges_rel`, `treeSafe_of_tau_inv`, `noRet_of_tau_inv`
-  (`Run.lean`): total `n`-step outcome trichotomy and forward progress for all
-  `n : Nat` (either still running in lockstep `StateRel`, already returned via
-  `ReturnRel` in `k ≤ n` steps, or stopped with `.ub` matching `FaultNow`),
-  specializing under `MirNoUBTree` and non-termination to prove that diverging
-  UB-free loops step forever in lockstep `StateRel` + `Reaches`.
+  `mirCall_diverges_rel`, `treeSafe_of_step_inv`, `noRet_of_step_inv`,
+  `treeSafe_of_tau_inv`, `noRet_of_tau_inv` (`Run.lean`): total `n`-step
+  outcome trichotomy and forward progress for all `n : Nat` (either still
+  running in lockstep `StateRel`, already returned via `ReturnRel` in `k ≤ n`
+  steps, or stopped with `.ub` matching `FaultNow`), specializing under
+  `MirNoUBTree` and non-termination to prove that diverging UB-free loops
+  (both silent-step and branch-observing) step forever in lockstep
+  `StateRel` + `Reaches`.
 
 ### Witnesses
 
@@ -286,6 +288,19 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   (`64i8 * -2i8 = -128i8`, `-128i8 - (-2i8) = -126i8`, `-126i8 + 127i8 = 1i8`
   via `mirCall_ret` and `MirNoUBTree`) and faulting on each operator's signed
   overflow UB (`mirCall_ub`, `mirCall_outcome`, and direct `Interp.steps` checks).
+* `branchSpinLoop`, a conditional `while x != 0 {}` loop that emits a visible
+  `.emit` branch event on every `switchInt` iteration, proved UB-free via
+  `treeSafe_of_step_inv` (`branchSpinLoop1_noUB`), non-terminating via
+  `noRet_of_step_inv` (`branchSpinLoop1_diverges`), and lockstep-diverging in
+  `StateRel` + `Reaches` via `mirCall_diverges_rel`
+  (`branchSpinLoop1_minirust_diverges_rel`).
+* `shiftI8` and `shlUncheckedI8`, signed `i8` bodies exercising two's-complement
+  arithmetic right shift `Shr` on a negative operand with a negative shift count
+  wrapped via `.rem_euclid(8)` (`-64i8 >> -6i8 = -64i8 >> 2 = -16i8`), wrapping
+  left shift `Shl` (`-16i8 << -7i8 = -16i8 << 1 = -32i8`), `ShrUnchecked` and
+  `ShlUnchecked` on valid shift counts (`shiftOk_minirust_ret_from_start`,
+  `shiftOk_noUB`, `shiftOk_minirust_direct`), and all four unchecked-shift UB
+  paths (`s >= bits` and `s < 0` for both `ShrUnchecked` and `ShlUnchecked`).
 
 ### Gaps
 

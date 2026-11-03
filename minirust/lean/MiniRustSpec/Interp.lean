@@ -743,8 +743,8 @@ def evalUnOp (op : UnOp) (arg : Val × «Type») : Interp (Val × «Type») :=
   | .Cast castOp, arg => evalCastOp castOp arg
   | _, _ => unsupported "eval_un_op for an operator outside UnOp::Int and UnOp::Cast"
 
-/-- `Machine::eval_int_bin_op` for wrapping, unchecked, and division/remainder
-integer arithmetic (`spec/lang/step/operators.md`):
+/-- `Machine::eval_int_bin_op` for wrapping, unchecked, division/remainder,
+and shift integer arithmetic (`spec/lang/step/operators.md`):
 > "Add => left + right,
 >  AddUnchecked => {
 >      let result = left + right;
@@ -800,10 +800,32 @@ integer arithmetic (`spec/lang/step/operators.md`):
 >          throw_ub!(\"overflow in remainder\");
 >      }
 >      left % right
+>  }
+>  Shl | Shr => {
+>      let bits = left_ty.size.bits();
+>      let offset = right.rem_euclid(bits);
+>      match op {
+>          Shl => left << offset,
+>          Shr => left >> offset,
+>          _ => panic!(),
+>      }
+>  }
+>  ShlUnchecked | ShrUnchecked => {
+>      let bits = left_ty.size.bits();
+>      if right < 0 || right >= bits {
+>          throw_ub!(\"overflow in unchecked shift\");
+>      }
+>      match op {
+>          ShlUnchecked => left << right,
+>          ShrUnchecked => left >> right,
+>          _ => panic!(),
+>      }
 >  }"
 On `libspecr::Int` (`num_bigint::BigInt`), Rust's `/` and `%` round toward zero
-(`Int.tdiv` and `Int.tmod`), whereas Euclidean remainder is written
-`.rem_euclid(..)` in the adjacent shift arm. -/
+(`Int.tdiv` and `Int.tmod`), whereas Euclidean remainder `.rem_euclid(bits)` for
+`bits > 0` is Lean's `right % bits` (`Int.emod`), and two's-complement bit
+shifts `left << k` and `left >> k` for `k ≥ 0` are `left * 2 ^ k` and Euclidean
+floor division `left / 2 ^ k` (`Int.ediv`). -/
 def evalIntBinOp (op : IntBinOp) (left right : Int) (leftTy : IntType) : Interp Int :=
   match op with
   | .Add => pure (left + right)
@@ -838,7 +860,23 @@ def evalIntBinOp (op : IntBinOp) (left right : Int) (leftTy : IntType) : Interp 
     if right = 0 then ub "modulus of remainder is zero"
     else if !IntType.can_represent leftTy (Int.tdiv left right) then ub "overflow in remainder"
     else pure (Int.tmod left right)
-  | _ => unsupported "eval_int_bin_op for a shift or bitwise operator"
+  | .Shl =>
+    let bits : Int := Size.bits leftTy.size
+    let offset : Nat := (right % bits).toNat
+    pure (left * (2 : Int) ^ offset)
+  | .Shr =>
+    let bits : Int := Size.bits leftTy.size
+    let offset : Nat := (right % bits).toNat
+    pure (left / (2 : Int) ^ offset)
+  | .ShlUnchecked =>
+    let bits : Int := Size.bits leftTy.size
+    if right < 0 ∨ right ≥ bits then ub "overflow in unchecked shift"
+    else pure (left * (2 : Int) ^ right.toNat)
+  | .ShrUnchecked =>
+    let bits : Int := Size.bits leftTy.size
+    if right < 0 ∨ right ≥ bits then ub "overflow in unchecked shift"
+    else pure (left / (2 : Int) ^ right.toNat)
+  | _ => unsupported "eval_int_bin_op for a bitwise operator"
 
 /-- `Machine::eval_bin_op` for `BinOp::Int` (`spec/lang/step/operators.md`):
 > "let Type::Int(int_ty) = l_ty else { panic!(\"non-integer input to integer operation\") };

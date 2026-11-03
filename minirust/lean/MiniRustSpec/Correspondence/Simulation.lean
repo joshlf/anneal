@@ -443,7 +443,7 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
         have hgood := hframe.decl_good i d hdi
         obtain ⟨hMok, hMnone⟩ := evalStatement_assign hframe i d hdi rv hok' e he
         obtain ⟨hAok, hAnone⟩ := evalStmt_assign s body.localDecls body.layouts i rv span hslotsA
-          hrel.nlocals d hdi (Nat.ne_of_gt hgood.pos) hok' hrel.borrows hrel.protectors
+          hrel.nlocals d hdi hgood hok' hrel.borrows hrel.protectors
         cases hr : rvBits body.localDecls s.frame.locals (itOf d) rv with
         | none =>
           rw [hAnone hr]
