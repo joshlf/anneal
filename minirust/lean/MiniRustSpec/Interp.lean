@@ -668,21 +668,46 @@ def evalConstant : Constant → Interp Val
   | .Bool b => pure (.Bool b)
   | _ => unsupported "eval_constant for a pointer constant"
 
-/-- `Machine::eval_int_un_op` for `Neg` (`spec/lang/step/operators.md`):
+/-- `Machine::eval_int_un_op` for `Neg` and `BitNot` (`spec/lang/step/operators.md`):
 > "fn eval_int_un_op(op: IntUnOp, operand: Int, operand_ty: IntType) -> Result<Int> {
 >     use IntUnOp::*;
 >     ret(match op {
 >         // Put the result into the right range (in case of overflow).
 >         Neg => operand_ty.bring_in_bounds(-operand),
+>         // Put the result into the right range (in case of a unsigned numbers, which `!`
+>         // makes negative by inverting all the leading zeros).
+>         BitNot => operand_ty.bring_in_bounds(!operand),
 >         ..
 >     })
-> }" -/
+> }"
+On mathematical integers (`libspecr::Int` / `num_bigint::BigInt`), two's-complement
+bitwise complement `!x` is `-x - 1`. -/
 def evalIntUnOp (op : IntUnOp) (operand : Int) (operandTy : IntType) : Interp Int :=
   match op with
   | .Neg => pure (IntType.bring_in_bounds operandTy (-operand))
-  | _ => unsupported "eval_int_un_op for an operator other than Neg"
+  | .BitNot => pure (IntType.bring_in_bounds operandTy (-operand - 1))
+  | _ => unsupported "eval_int_un_op for CountOnes"
 
-/-- `Machine::eval_un_op` for `UnOp::Int`:
+/-- `Machine::eval_cast_op` for `CastOp::IntToInt` (`spec/lang/step/operators.md`):
+> "fn eval_cast_op(&self, cast_op: CastOp, (operand, old_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
+>     use CastOp::*;
+>     match cast_op {
+>         IntToInt(int_ty) => {
+>             let Value::Int(operand) = operand else { panic!(\"non-integer input to int-to-int cast\") };
+>             let result = int_ty.bring_in_bounds(operand);
+>             ret((Value::Int(result), Type::Int(int_ty)))
+>         }
+>         ..
+>     }
+> }" -/
+def evalCastOp (castOp : CastOp) (arg : Val × «Type») : Interp (Val × «Type») :=
+  match castOp, arg with
+  | .IntToInt intTy, (.Int operand, _) =>
+    pure (.Int (IntType.bring_in_bounds intTy operand), .Int intTy)
+  | .IntToInt _, _ => specPanic "non-integer input to int-to-int cast"
+  | .Transmute _, _ => unsupported "eval_cast_op for CastOp::Transmute"
+
+/-- `Machine::eval_un_op` for `UnOp::Int` and `UnOp::Cast`:
 > "fn eval_un_op(&self, UnOp::Int(op): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
 >     let Type::Int(int_ty) = op_ty else { panic!(\"non-integer input to integer operation\") };
 >     let Value::Int(operand) = operand else { panic!(\"non-integer input to integer operation\") };
@@ -695,6 +720,10 @@ def evalIntUnOp (op : IntUnOp) (operand : Int) (operandTy : IntType) : Interp In
 >     self.check_value(result, Type::Int(ret_ty))
 >         .expect(\"sanity check: result of UnOp::Int does not fit in the return type\");
 >     ret((result, Type::Int(ret_ty)))
+> }
+> ..
+> fn eval_un_op(&self, UnOp::Cast(cast_op): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
+>     ret(self.eval_cast_op(cast_op, (operand, op_ty))?)
 > }" -/
 def evalUnOp (op : UnOp) (arg : Val × «Type») : Interp (Val × «Type») :=
   match op, arg with
@@ -707,7 +736,8 @@ def evalUnOp (op : UnOp) (arg : Val × «Type») : Interp (Val × «Type») :=
     | .ok () => pure (result, .Int retTy)
     | .error _ => specPanic "sanity check: result of UnOp::Int does not fit in the return type"
   | .Int _, _ => specPanic "non-integer input to integer operation"
-  | _, _ => unsupported "eval_un_op for a non-Int operator"
+  | .Cast castOp, arg => evalCastOp castOp arg
+  | _, _ => unsupported "eval_un_op for an operator outside UnOp::Int and UnOp::Cast"
 
 /-- `Machine::eval_int_bin_op` for the wrapping arithmetic operators:
 > "Add => left + right,

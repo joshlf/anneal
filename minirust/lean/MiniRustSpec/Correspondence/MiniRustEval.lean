@@ -359,6 +359,26 @@ def opBits (locals : List LocalSlot) : Operand → Option Nat
     | _ => none
   | _ => none
 
+/-- The arithmetic of `eval_int_un_op` for the fragment unary operators. -/
+def intUnArith : Gen.IntUnOp → Int → Int
+  | .Neg, x => -x
+  | .BitNot, x => -x - 1
+  | _, _ => 0
+
+theorem evalIntUnOp_eq (uop : MirAst.UnOp) (iuop : Gen.IntUnOp)
+    (huop : translateUnOp uop = some iuop) (x : Int) (it : Gen.IntType) :
+    evalIntUnOp iuop x it = .ok (IntType.bring_in_bounds it (intUnArith iuop x)) := by
+  cases uop <;> simp [translateUnOp] at huop <;> subst huop <;> rfl
+
+theorem intUnArith_emod (uop : MirAst.UnOp) (iuop : Gen.IntUnOp)
+    (huop : translateUnOp uop = some iuop) (x x' m : Int) (hx : x % m = x' % m) :
+    intUnArith iuop x % m = intUnArith iuop x' % m := by
+  cases uop <;> simp [translateUnOp] at huop <;> subst huop <;> simp only [intUnArith]
+  · rw [show -x - 1 = -1 - x by omega, show -x' - 1 = -1 - x' by omega,
+      Int.sub_emod, hx, ← Int.sub_emod]
+  · rw [show -x = 0 - x by omega, show -x' = 0 - x' by omega,
+      Int.sub_emod, hx, ← Int.sub_emod]
+
 /-- The arithmetic of `eval_int_bin_op` for the fragment operators. -/
 def intArith : Gen.IntBinOp → Int → Int → Int
   | .Add, x, y => x + y
@@ -469,34 +489,53 @@ theorem evalValue_operand {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
 
 /-- The bit pattern an Anneal fragment rvalue of type `it` evaluates to, or
 `none` when evaluating it is UB. -/
-def rvBits (locals : List LocalSlot) (it : Gen.IntType) : Rvalue → Option Nat
+def rvBits (decls : List LocalDecl) (locals : List LocalSlot) (it : Gen.IntType) : Rvalue → Option Nat
   | .use op => opBits locals op
-  | .unaryOp .neg op => do
+  | .unaryOp uop op => do
+    let iuop ← translateUnOp uop
     let x ← opBits locals op
-    pure ((- (x : Int)) % 2 ^ (8 * it.size.bytes)).toNat
+    pure (intUnArith iuop x % 2 ^ (8 * it.size.bytes)).toNat
   | .binaryOp op a b => do
     let iop ← translateBinOp op
     let x ← opBits locals a
     let y ← opBits locals b
     pure (intArith iop x y % 2 ^ (8 * it.size.bytes)).toNat
+  | .cast .intToInt op _ => do
+    let srcIt ← operandIntType decls op
+    let x ← opBits locals op
+    pure (intFromBits x srcIt % 2 ^ (8 * it.size.bytes)).toNat
   | _ => none
+
+theorem bringInBounds_eq_intFromBits (it : Gen.IntType) (hgood : GoodSize it.size.bytes) (z : Int) :
+    IntType.bring_in_bounds it z = intFromBits (z % 2 ^ (8 * it.size.bytes)).toNat it := by
+  have hn : 0 < 8 * it.size.bytes := by have := hgood.pos; omega
+  have hn' : 0 < Size.bits it.size := by simpa [Size.bits] using hn
+  obtain ⟨hl, hr⟩ := bringInBounds_window z it.signed it.size hn'
+  have heq := eq_intFromBits _ it hn (by simpa [Size.bits] using hl) (by simpa [Size.bits] using hr)
+  unfold IntType.bring_in_bounds
+  rw [heq]
+  congr 2
+  simpa [Size.bits] using bringInBounds_emod z it.signed it.size
+
+theorem bringInBounds_intUnArith (uop : MirAst.UnOp) (iuop : Gen.IntUnOp)
+    (huop : translateUnOp uop = some iuop) (it : Gen.IntType) (hgood : GoodSize it.size.bytes)
+    (x : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) :
+    IntType.bring_in_bounds it (intUnArith iuop (intFromBits x it)) =
+      intFromBits (intUnArith iuop x % 2 ^ (8 * it.size.bytes)).toNat it := by
+  rw [bringInBounds_eq_intFromBits it hgood]
+  congr 2
+  have hpos := two_pow_pos (8 * it.size.bytes)
+  have hx' : intFromBits x it % 2 ^ (8 * it.size.bytes) = (x : Int) % 2 ^ (8 * it.size.bytes) := by
+    rw [intFromBits_emod x it hx, Int.emod_eq_of_lt (by omega) (by exact_mod_cast hx)]
+  exact intUnArith_emod uop iuop huop _ _ _ hx'
 
 theorem bringInBounds_intArith (op : MirAst.BinOp) (iop : Gen.IntBinOp)
     (hop : translateBinOp op = some iop) (it : Gen.IntType) (hgood : GoodSize it.size.bytes)
     (x y : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * it.size.bytes)) :
     IntType.bring_in_bounds it (intArith iop (intFromBits x it) (intFromBits y it)) =
       intFromBits (intArith iop x y % 2 ^ (8 * it.size.bytes)).toNat it := by
-  have hn : 0 < 8 * it.size.bytes := by have := hgood.pos; omega
-  have hn' : 0 < Size.bits it.size := by simpa [Size.bits] using hn
-  obtain ⟨hl, hr⟩ := bringInBounds_window (intArith iop (intFromBits x it) (intFromBits y it))
-    it.signed it.size hn'
-  have heq := eq_intFromBits _ it hn (by simpa [Size.bits] using hl) (by simpa [Size.bits] using hr)
-  unfold IntType.bring_in_bounds
-  rw [heq]
+  rw [bringInBounds_eq_intFromBits it hgood]
   congr 2
-  have := bringInBounds_emod (intArith iop (intFromBits x it) (intFromBits y it)) it.signed it.size
-  simp only [Size.bits] at this
-  rw [this]
   have hpos := two_pow_pos (8 * it.size.bytes)
   have hx' : intFromBits x it % 2 ^ (8 * it.size.bytes) = (x : Int) % 2 ^ (8 * it.size.bytes) := by
     rw [intFromBits_emod x it hx, Int.emod_eq_of_lt (by omega) (by exact_mod_cast hx)]
@@ -504,35 +543,26 @@ theorem bringInBounds_intArith (op : MirAst.BinOp) (iop : Gen.IntBinOp)
     rw [intFromBits_emod y it hy, Int.emod_eq_of_lt (by omega) (by exact_mod_cast hy)]
   exact intArith_emod op iop hop _ _ _ _ _ hx' hy'
 
-theorem intFromBits_zero (it : Gen.IntType) : intFromBits 0 it = 0 := by
-  rcases it with ⟨s, sz⟩
-  cases s <;> simp [intFromBits, Nat.two_pow_pos]
-
-theorem bringInBounds_neg (it : Gen.IntType) (hgood : GoodSize it.size.bytes)
-    (x : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) :
-    IntType.bring_in_bounds it (- intFromBits x it) =
-      intFromBits ((- (x : Int)) % 2 ^ (8 * it.size.bytes)).toNat it := by
-  have h := bringInBounds_intArith .sub .Sub rfl it hgood 0 x (Nat.two_pow_pos _) hx
-  simpa [intArith, intFromBits_zero] using h
-
 /-- Evaluating a translated fragment rvalue. -/
 theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     {locals : List LocalSlot} {m : Mach} {blk stmt : Nat} (h : FrameOk body f ctx locals m blk stmt)
     (it : Gen.IntType) (hgood : GoodSize it.size.bytes) (rv : Rvalue)
     (hok : rvalueOk body.localDecls it rv = true) (e : Gen.ValueExpr) (he : translateRvalue rv = some e) :
-    (∀ r, rvBits locals it rv = some r →
+    (∀ r, rvBits body.localDecls locals it rv = some r →
       r < 2 ^ (8 * it.size.bytes) ∧
       ∃ m', evalValue m e = .ok ((.Int (intFromBits r it), .Int it), m') ∧
         FrameOk body f ctx locals m' blk stmt) ∧
-    (rvBits locals it rv = none → ∃ msg, evalValue m e = .error (.ub msg)) := by
+    (rvBits body.localDecls locals it rv = none → ∃ msg, evalValue m e = .error (.ub msg)) := by
   match rv, hok, he with
   | .use op, hok, he =>
     simp only [rvalueOk] at hok
     simp only [translateRvalue] at he
     exact evalValue_operand h it op hok e he
-  | .unaryOp .neg op, hok, he =>
-    simp only [rvalueOk] at hok
-    simp only [translateRvalue, Option.bind_eq_bind] at he
+  | .unaryOp uop op, hok, he =>
+    simp only [rvalueOk, Bool.and_eq_true] at hok
+    obtain ⟨huop, hok⟩ := hok
+    obtain ⟨iuop, hiuop⟩ := Option.isSome_iff_exists.mp huop
+    simp only [translateRvalue, hiuop, Option.bind_eq_bind] at he
     cases heo : translateOperand op with
     | none => simp [heo] at he
     | some eo =>
@@ -541,25 +571,27 @@ theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
       obtain ⟨haok, hanone⟩ := evalValue_operand h it op hok eo heo
       cases hxo : opBits locals op with
       | none =>
-        refine ⟨fun r hr => by simp [rvBits, hxo] at hr, fun _ => ?_⟩
+        refine ⟨fun r hr => by simp [rvBits, hiuop, hxo] at hr, fun _ => ?_⟩
         obtain ⟨msg, hmsg⟩ := hanone hxo
         exact ⟨msg, by simp [evalValue, hmsg]⟩
       | some x =>
         obtain ⟨hx, m1, hm1, h1⟩ := haok x hxo
-        refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits, hxo] at hnone⟩
-        simp [rvBits, hxo] at hr
+        refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits, hiuop, hxo] at hnone⟩
+        simp [rvBits, hiuop, hxo] at hr
         subst hr
         have hpos := two_pow_pos (8 * it.size.bytes)
-        have hlt : ((- (x : Int)) % 2 ^ (8 * it.size.bytes)).toNat < 2 ^ (8 * it.size.bytes) := by
-          have h0 := Int.emod_nonneg (- (x : Int)) (Int.ne_of_gt hpos)
-          have hlt' := Int.emod_lt_of_pos (- (x : Int)) hpos
-          have : (((- (x : Int)) % 2 ^ (8 * it.size.bytes)).toNat : Int) < 2 ^ (8 * it.size.bytes) := by
+        have hlt : (intUnArith iuop x % 2 ^ (8 * it.size.bytes)).toNat < 2 ^ (8 * it.size.bytes) := by
+          have h0 := Int.emod_nonneg (intUnArith iuop x) (Int.ne_of_gt hpos)
+          have hlt' := Int.emod_lt_of_pos (intUnArith iuop x) hpos
+          have : (((intUnArith iuop x % 2 ^ (8 * it.size.bytes)).toNat : Int)) < 2 ^ (8 * it.size.bytes) := by
             rw [Int.toNat_of_nonneg h0]; exact hlt'
           exact_mod_cast this
         have hrep := canRepresent_intFromBits it _ hgood hlt
         refine ⟨hlt, m1, ?_, h1⟩
-        simp [evalValue, hm1, evalUnOp, evalIntUnOp, bringInBounds_neg it hgood x hx,
-          checkValue, hrep]
+        have hbring := bringInBounds_intUnArith uop iuop hiuop it hgood x hx
+        have heval := evalIntUnOp_eq uop iuop hiuop (intFromBits x it) it
+        cases uop <;> simp [translateUnOp] at hiuop <;> subst hiuop <;>
+          simp [evalValue, hm1, evalUnOp, heval, hbring, checkValue, hrep]
   | .binaryOp op a b, hok, he =>
     simp only [rvalueOk, Bool.and_eq_true] at hok
     obtain ⟨⟨hop, hoka⟩, hokb⟩ := hok
@@ -601,6 +633,39 @@ theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
               exact_mod_cast this
             · simp [evalValue, hm1, hm2, evalBinOp, evalIntBinOp_eq op iop hiop,
                 bringInBounds_intArith op iop hiop it hgood x y hx hy]
+  | .cast .intToInt op targetTy, hok, he =>
+    simp only [rvalueOk, Bool.and_eq_true, decide_eq_true_eq] at hok
+    obtain ⟨htgt, hsrc⟩ := hok
+    cases hsrcIt : operandIntType body.localDecls op with
+    | none => simp [hsrcIt] at hsrc
+    | some srcIt =>
+      simp only [hsrcIt] at hsrc
+      simp only [translateRvalue, htgt, Option.bind_eq_bind] at he
+      cases heo : translateOperand op with
+      | none => simp [heo] at he
+      | some eo =>
+        simp [heo] at he
+        subst he
+        obtain ⟨haok, hanone⟩ := evalValue_operand h srcIt op hsrc eo heo
+        cases hxo : opBits locals op with
+        | none =>
+          refine ⟨fun r hr => by simp [rvBits, hsrcIt, hxo] at hr, fun _ => ?_⟩
+          obtain ⟨msg, hmsg⟩ := hanone hxo
+          exact ⟨msg, by simp [evalValue, hmsg]⟩
+        | some x =>
+          obtain ⟨_, m1, hm1, h1⟩ := haok x hxo
+          refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits, hsrcIt, hxo] at hnone⟩
+          simp [rvBits, hsrcIt, hxo] at hr
+          subst hr
+          have hpos := two_pow_pos (8 * it.size.bytes)
+          have hlt : (intFromBits x srcIt % 2 ^ (8 * it.size.bytes)).toNat < 2 ^ (8 * it.size.bytes) := by
+            have h0 := Int.emod_nonneg (intFromBits x srcIt) (Int.ne_of_gt hpos)
+            have hlt' := Int.emod_lt_of_pos (intFromBits x srcIt) hpos
+            have : (((intFromBits x srcIt % 2 ^ (8 * it.size.bytes)).toNat : Int)) < 2 ^ (8 * it.size.bytes) := by
+              rw [Int.toNat_of_nonneg h0]; exact hlt'
+            exact_mod_cast this
+          refine ⟨hlt, m1, ?_, h1⟩
+          simp [evalValue, hm1, evalUnOp, evalCastOp, bringInBounds_eq_intFromBits it hgood]
 
 /-! ## Frames and control flow -/
 
@@ -634,10 +699,10 @@ theorem evalStatement_assign {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d) (rv : Rvalue)
     (hok : rvalueOk body.localDecls (itOf d) rv = true) (e : Gen.ValueExpr)
     (he : translateRvalue rv = some e) :
-    (∀ r, rvBits locals (itOf d) rv = some r →
+    (∀ r, rvBits body.localDecls locals (itOf d) rv = some r →
       ∃ m', evalStatement m (.Assign (.Local (localName i)) e) = .ok m' ∧
         FrameOk body f ctx (locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩))) m' blk stmt) ∧
-    (rvBits locals (itOf d) rv = none →
+    (rvBits body.localDecls locals (itOf d) rv = none →
       ∃ msg, evalStatement m (.Assign (.Local (localName i)) e) = .error (.ub msg)) := by
   have hi : i < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
   have hgood := h.decl_good i d hd

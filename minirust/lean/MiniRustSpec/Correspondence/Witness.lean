@@ -723,4 +723,175 @@ theorem signedEdgeOne_minirust_direct :
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAllocI8 with data := scalarBytes i8 2 }, [1]) := rfl
 
+/-! ## Cross-width `Cast(IntToInt)` (sign-extension & truncation) and `UnaryOp(Not)` (`BitNot`) -/
+
+def fnAbiI8ToU32 : FnAbi :=
+  { args := [{ layout := i8Layout, mode := .direct }],
+    ret := { layout := u32Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+theorem ctx0_ok_u32_i8 {body : CapturedMir} (h : body.localDecls = [u32Decl, i8Decl]) :
+    CtxOk body ctx0 where
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | _ + 2, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MIR (`Runtime(PostCleanup)`) of
+```rust
+fn cast_bitnot(mut x: i8) -> u32 {
+    x = !x;                  // bb0: _1 = Not(copy _1)
+    let w = x as u32;        //      _0 = Cast(IntToInt, copy _1, u32)
+    match x {                //      switchInt(copy _1) -> [-5i8: bb1, otherwise: bb2]
+        -5 => {
+            let _t = w as i8; // bb1: _1 = Cast(IntToInt, copy _0, i8)
+            !w                //      _0 = Not(copy _0); return
+        }
+        _ => unreachable!(), // bb2: unreachable
+    }
+}
+```
+For `x = 4i8` (bits `4`), `!4i8 = -5i8` (bits `251`), sign-extending `-5i8 as u32`
+yields `4294967291u32` (`0xFFFFFFFB`), narrowing `4294967291u32 as i8` truncates
+back to `-5i8` (bits `251`), and `!4294967291u32 = 4u32`. -/
+def castBitNot : CapturedMir where
+  defPath := "witness::cast_bitnot"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, i8Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 1) (.unaryOp .not (.copy (local_ 1)))),
+        mkStmt (.assign (local_ 0) (.cast .intToInt (.copy (local_ 1)) u32Ty))],
+      terminator := mkTerm (.switchInt (.copy (local_ 1))
+        { branches := [(251, 1)], otherwise := 2 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 1) (.cast .intToInt (.copy (local_ 0)) i8Ty)),
+        mkStmt (.assign (local_ 0) (.unaryOp .not (.copy (local_ 0))))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [], terminator := mkTerm .unreachable, isCleanup := false }]
+  fnAbi := fnAbiI8ToU32
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem castBitNot_inFragment : inFragment castBitNot = true := by decide
+
+def castBitNotFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int i8)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 1)) (.UnOp (.Int .BitNot) (.Load (.Local (localName 1)))),
+      .Assign (.Local (localName 0)) (.UnOp (.Cast (.IntToInt u32)) (.Load (.Local (localName 1))))],
+      .Switch (.Load (.Local (localName 1))) ⟨[(-5, bbName 1)]⟩ (bbName 2), .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 1)) (.UnOp (.Cast (.IntToInt i8)) (.Load (.Local (localName 0)))),
+      .Assign (.Local (localName 0)) (.UnOp (.Int .BitNot) (.Load (.Local (localName 0))))],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[], .Unreachable, .Regular⟩),
+    (bbName 3, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 3
+  implicit_writes := true
+
+theorem castBitNot_translate : translateFn castBitNot = some castBitNotFn := rfl
+
+def castBitNot4S0 : MachineState := initMachineState castBitNot [.scalar ⟨4, 1⟩]
+def castBitNot4MInit : Mach :=
+  machine castBitNot castBitNotFn castBitNot4S0.frame.locals castBitNotFn.start
+
+def castBitNot4Trace : List (Event MirEffect) :=
+  [⟨.inr (.inl (.emit (.event 251))), PUnit.unit⟩]
+
+theorem castBitNot4_anneal_ret :
+    ReachesRet (mirCallTree castBitNot [.scalar ⟨4, 1⟩]) castBitNot4Trace
+      (.normal (.scalar ⟨4, 4⟩, castBitNot4S0.memory)) :=
+  runA_sound castBitNot 10 _ _ _ rfl
+
+theorem castBitNot4_noUB : MirNoUBTree (mirCallTree castBitNot [.scalar ⟨4, 1⟩]) :=
+  runA_noUB castBitNot 10 _ _ _ rfl
+
+theorem castBitNot4_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n castBitNot4MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 4 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret castBitNot_inFragment castBitNot_translate ctx0 (ctx0_ok_u32_i8 rfl)
+      [.scalar ⟨4, 1⟩] (by decide) castBitNot4MInit rfl rfl rfl castBitNot4_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [castBitNot] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  have hbits : bits = 4 := by
+    simp [itOf, intTypeOf, intTyBytes, u32Decl, u32Ty] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctx0, itOf, intTypeOf, intTyBytes, u32Decl, u32Ty, u32]
+
+theorem castBitNot4_minirust_direct :
+    (Interp.steps 7 castBitNot4MInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 4 }, [1]) := rfl
+
+/-! ## Diverging UB-free loop (`spinLoop`) -/
+
+/-- MIR of a diverging loop `fn spin_loop() -> u32 { loop {} }`. -/
+def spinLoop : CapturedMir where
+  defPath := "witness::spin_loop"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u32Decl]
+  basicBlocks := [{ statements := [], terminator := mkTerm (.goto 0), isCleanup := false }]
+  fnAbi := fnAbi 0
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem spinLoop_inFragment : inFragment spinLoop = true := by decide
+
+def spinLoopFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[(bbName 0, ⟨[], .Goto (bbName 0), .Regular⟩),
+              (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem spinLoop_translate : translateFn spinLoop = some spinLoopFn := rfl
+
+def spinLoopS0 : MachineState := initMachineState spinLoop []
+def spinLoopMInit : Mach := machine spinLoop spinLoopFn spinLoopS0.frame.locals spinLoopFn.start
+
+theorem spinLoop_step_self :
+    ∀ s, s = spinLoopS0 → ∃ s', stepMirFn spinLoop s = .tau (.running s') ∧ s' = spinLoopS0 := by
+  rintro s rfl
+  exact ⟨spinLoopS0, rfl, rfl⟩
+
+/-- `spinLoop` is UB-free across its infinite interaction tree. -/
+theorem spinLoop_noUB : MirNoUBTree (mirCallTree spinLoop []) :=
+  treeSafe_of_tau_inv spinLoop_step_self rfl
+
+/-- `spinLoop` never reaches a return outcome. -/
+theorem spinLoop_diverges (tr : List (Event MirEffect)) (o : MirOutcome) :
+    ¬ ReachesRet (mirCallTree spinLoop []) tr o :=
+  noRet_of_tau_inv spinLoop_step_self rfl tr o
+
+/-- Therefore MiniRust started at `f.start` succeeds for every step count `n : Nat`. -/
+theorem spinLoop_minirust_steps_ok (n : Nat) :
+    ∃ m', Interp.steps n spinLoopMInit = .ok m' :=
+  mirCall_diverges_steps_ok spinLoop_inFragment spinLoop_translate ctx0 (ctx0_ok1 rfl) []
+    (by decide) spinLoopMInit rfl rfl rfl spinLoop_noUB spinLoop_diverges n
+
 end MiniRustSpec.Correspondence.Witness

@@ -66,7 +66,7 @@ fn squash(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-fn corpus() -> String {
+fn corpus() -> Vec<(String, String)> {
     let lock = anneal_minirust_gen::lock::parse(&std::fs::read_to_string(minirust_dir().join("minirust.lock.toml")).unwrap()).unwrap();
     let commit = lock.get("upstream", "commit").unwrap().to_string();
     let vroot = minirust_dir().join("vendor").join(commit);
@@ -74,12 +74,14 @@ fn corpus() -> String {
     walk(&vroot.join("spec"), &mut files);
     walk(&vroot.join("tooling").join("minimize").join("src"), &mut files);
     files.push(vroot.join("README.md"));
-    let mut text = String::new();
-    for f in files {
-        text.push_str(&std::fs::read_to_string(&f).unwrap());
-        text.push('\n');
-    }
-    squash(&strip_line_comments(&text))
+    files
+        .into_iter()
+        .map(|f| {
+            let rel = f.strip_prefix(&vroot).unwrap().to_string_lossy().replace('\\', "/");
+            let text = std::fs::read_to_string(&f).unwrap();
+            (rel, squash(&strip_line_comments(&text)))
+        })
+        .collect()
 }
 
 /// Every block quote of `lean`: its first line number and the quoted text.
@@ -108,20 +110,45 @@ fn quotes(lean: &str) -> Vec<(usize, String)> {
         .collect()
 }
 
-/// The first piece of `quote` that does not occur (in order) in `corpus`.
-fn missing_piece(corpus: &str, quote: &str) -> Option<String> {
-    let mut pos = 0;
-    for piece in strip_line_comments(quote).split("..") {
-        let piece = squash(piece);
-        if piece.chars().count() < 4 {
-            continue;
+/// Checks that `quote` occurs in order within at least one single vendored file.
+/// If no single vendored file matches all pieces of `quote` in order, returns
+/// the first unmatched piece from the file that matched the longest prefix.
+fn missing_piece(corpus: &[(String, String)], quote: &str) -> Option<String> {
+    let pieces: Vec<String> = strip_line_comments(quote)
+        .split("..")
+        .map(squash)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if pieces.is_empty() {
+        return Some("<empty quote>".to_string());
+    }
+    let mut best_matched = 0usize;
+    let mut best_missing: Option<String> = None;
+    for (_path, file_text) in corpus {
+        let mut pos = 0;
+        let mut matched = 0;
+        let mut failed = None;
+        for piece in &pieces {
+            match file_text[pos..].find(piece.as_str()) {
+                Some(j) => {
+                    pos += j + piece.len();
+                    matched += 1;
+                }
+                None => {
+                    failed = Some(piece.clone());
+                    break;
+                }
+            }
         }
-        match corpus[pos..].find(&piece) {
-            Some(j) => pos += j + piece.len(),
-            None => return Some(piece),
+        if failed.is_none() {
+            return None;
+        }
+        if matched >= best_matched {
+            best_matched = matched;
+            best_missing = failed;
         }
     }
-    None
+    best_missing.or_else(|| pieces.into_iter().next())
 }
 
 #[test]
@@ -158,6 +185,14 @@ fn fabricated_quotations_are_rejected() {
     assert_eq!(missing_piece(&corpus, "Add => left + right, .. Sub => left - right,"), None);
     // Altered operator.
     assert!(missing_piece(&corpus, "Add => left - right,").is_some());
+    // Fabricated short token (< 4 chars) between elisions.
+    assert!(missing_piece(&corpus, "Add => left + right, .. ??? .. Sub => left - right,").is_some());
+    // Cross-file splice (operators.md followed by terminators.md).
+    assert!(missing_piece(
+        &corpus,
+        "Add => left + right, .. fn eval_terminator(&mut self, Terminator::Goto(block_name): Terminator) -> NdResult"
+    )
+    .is_some());
     // Reordered pieces (each occurs exactly once upstream, `Goto` first).
     assert_eq!(
         missing_piece(

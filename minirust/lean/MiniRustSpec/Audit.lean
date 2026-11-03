@@ -57,21 +57,33 @@ open MiniRustSpec.Correspondence in
   run_ub_from_start
   steps_error
   steps_error_from_start
+  steps_outcome
   mirNoUB_safe
   mirNoUB_safe_from_start
+  mirNoUB_progress
+  mirNoUB_progress_from_start
+  mirNoUB_diverges_steps_ok
+  mirNoUB_diverges_from_start
   mirCall_ret
   mirCall_ub
   mirCall_noUB
+  mirCall_progress
+  mirCall_diverges_steps_ok
   runA_sound
   runA_noUB
   faultsA_sound
+  treeSafe_of_tau_inv
+  noRet_of_tau_inv
   evalReturn_callee
   evalStatement_assign
   evalStatement_placeMention
   evalValue_operand
+  evalValue_rvalue
   evalStmt_assign
   evalStmt_placeMention
   evalOperand_frag
+  evalRvalue_frag
+  castBits_eq_toNat
   switch_lookup
   translateFn_spec
   translateFn_start
@@ -115,6 +127,17 @@ open MiniRustSpec.Correspondence.Witness in
   signedEdgeOne_anneal_ret
   signedEdgeOne_minirust_ret_from_start
   signedEdgeOne_minirust_direct
+  castBitNot_inFragment
+  castBitNot_translate
+  castBitNot4_anneal_ret
+  castBitNot4_noUB
+  castBitNot4_minirust_ret_from_start
+  castBitNot4_minirust_direct
+  spinLoop_inFragment
+  spinLoop_translate
+  spinLoop_noUB
+  spinLoop_diverges
+  spinLoop_minirust_steps_ok
 
 #assert_standard_axioms MiniRustSpec.Anchors.anchors_ok
 

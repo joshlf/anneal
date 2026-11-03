@@ -30,9 +30,12 @@ The translation is defined only on the fragment checked by `inFragment`:
 * the body declares exactly the return place and the arguments
   (`localDecls.length = argCount + 1`), all of integer type;
 * statements are `_i = Use(copy _j)`, `_i = Use(const c)`,
-  `_i = UnaryOp(Neg, a)`, `_i = BinaryOp(op, a, b)` with `op ∈ {Add, Sub, Mul}`,
-  where every operand is `copy _j` (no projections) or an integer constant, all
-  of the destination's type, or `PlaceMention(_i)`;
+  `_i = UnaryOp(uop, a)` with `uop ∈ {Neg, Not}`,
+  `_i = BinaryOp(op, a, b)` with `op ∈ {Add, Sub, Mul}`,
+  `_i = Cast(IntToInt, a, targetTy)` (casting an operand `a` of any integer
+  type `srcIt` to the destination local's integer type `it`),
+  where every operand is `copy _j` (no projections) or an integer constant,
+  or `PlaceMention(_i)`;
 * terminators are `Goto`, `SwitchInt` on an integer `copy _j`, `Unreachable`, or
   `Return`, and every jump target is a block of the body;
 * no block is a cleanup block.
@@ -118,6 +121,16 @@ def translateOperand : MirAst.Operand → Option Gen.ValueExpr
     | _, _ => none
   | _ => none
 
+/-- `minimize`'s unary-operator translation for integer operands:
+> "(Neg, Type::Int(_)) => build::neg(operand),
+>  (Not, Type::Int(_)) => build::bit_not(operand),"
+where `build::neg(x)` is `ValueExpr::UnOp { operator: UnOp::Int(IntUnOp::Neg), operand: x }`
+and `build::bit_not(x)` is `ValueExpr::UnOp { operator: UnOp::Int(IntUnOp::BitNot), operand: x }`. -/
+def translateUnOp : MirAst.UnOp → Option Gen.IntUnOp
+  | .neg => some .Neg
+  | .not => some .BitNot
+  | _ => none
+
 /-- `minimize`'s binary-operator translation for integer operands:
 > "(Add, Type::Int(_)) => build::add(l, r),
 >  (Sub, Type::Int(_)) => build::sub(l, r),
@@ -129,7 +142,8 @@ def translateBinOp : MirAst.BinOp → Option Gen.IntBinOp
   | .mul => some .Mul
   | _ => none
 
-/-- `minimize`'s rvalue translation for `Use`, `UnaryOp(Neg)`, and `BinaryOp`
+/-- `minimize`'s rvalue translation for `Use`, `UnaryOp(Neg | Not)` on
+integers, `BinaryOp`, and `Cast(CastKind::IntToInt)` on integers
 (`tooling/minimize/src/rvalue.rs`):
 > "match rv {
 >      smir::Rvalue::Use(operand) => self.translate_operand_smir(operand, span),
@@ -146,15 +160,43 @@ def translateBinOp : MirAst.BinOp → Option Gen.IntBinOp
 >          let operand = self.translate_operand_smir(operand, span);
 >          use smir::UnOp::*;
 >          match (unop, ty) {
->              (Neg, Type::Int(_)) => build::neg(operand),"
-where `build::neg(x)` is `ValueExpr::UnOp { operator: UnOp::Int(IntUnOp::Neg), operand: x }`. -/
+>              (Neg, Type::Int(_)) => build::neg(operand),
+>              (Not, Type::Int(_)) => build::bit_not(operand),
+>              ..
+>          }
+>      }
+>      ..
+>      smir::Rvalue::Cast(cast_kind, operand, cast_ty) => {
+>          match cast_kind {
+>              smir::CastKind::IntToInt => {
+>                  ..
+>                  let operand = self.translate_operand_smir(operand, span);
+>                  let Type::Int(int_ty) = self.translate_ty_smir(*cast_ty, span) else {
+>                      rs::span_bug!(span, \"Attempting to IntToInt-Cast to non-int type!\");
+>                  };
+>                  let operand = match operand_ty {
+>                      Type::Int(_) => operand,
+>                      ..
+>                  };
+>                  ValueExpr::UnOp {
+>                      operator: UnOp::Cast(CastOp::IntToInt(int_ty)),
+>                      operand: GcCow::new(operand),
+>                  }
+>              }"
+where `build::neg(x)` is `ValueExpr::UnOp { operator: UnOp::Int(IntUnOp::Neg), operand: x }`
+and `build::bit_not(x)` is `ValueExpr::UnOp { operator: UnOp::Int(IntUnOp::BitNot), operand: x }`. -/
 def translateRvalue : MirAst.Rvalue → Option Gen.ValueExpr
   | .use op => translateOperand op
-  | .unaryOp .neg op => do
-    pure (.UnOp (.Int .Neg) (← translateOperand op))
+  | .unaryOp uop op => do
+    let iuop ← translateUnOp uop
+    pure (.UnOp (.Int iuop) (← translateOperand op))
   | .binaryOp op l r => do
     let iop ← translateBinOp op
     pure (.BinOp (.Int iop) (← translateOperand l) (← translateOperand r))
+  | .cast .intToInt op targetTy => do
+    let intTy ← intTypeOf targetTy
+    let operand ← translateOperand op
+    pure (.UnOp (.Cast (.IntToInt intTy)) operand)
   | _ => none
 
 /-- `minimize`'s statement translation for assignments and `PlaceMention` on a
@@ -305,8 +347,13 @@ def operandOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) (op : MirAst.Op
 /-- Fragment rvalues of integer type `it`. -/
 def rvalueOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rvalue → Bool
   | .use op => operandOk decls it op
-  | .unaryOp .neg op => operandOk decls it op
+  | .unaryOp uop op => (translateUnOp uop).isSome && operandOk decls it op
   | .binaryOp op a b => (translateBinOp op).isSome && operandOk decls it a && operandOk decls it b
+  | .cast .intToInt op targetTy =>
+    decide (intTypeOf targetTy = some it) &&
+    match operandIntType decls op with
+    | some srcIt => operandOk decls srcIt op
+    | none => false
   | _ => false
 
 /-- Fragment statements, type-checked against the destination's type. -/
