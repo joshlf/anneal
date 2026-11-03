@@ -4,7 +4,6 @@ Read this file before changing the repository. It is the entry point for agent
 and contributor work throughout this tree; read any more specific instructions
 in the directory you change as well.
 
-## Understand the architecture and trust boundary
 ## Project principles
 
 Before designing, modifying, or reviewing repository artifacts, read and
@@ -58,6 +57,7 @@ applies, follow all of them.
 | Preparing or updating Git commits, pull request descriptions, or other externally visible prose | [`authorship-disclosure`](skills/authorship-disclosure/SKILL.md) |
 | Designing, simplifying, or generalizing conceptual models, semantic interfaces, schemas, protocols, or instructions | [`model-refinement`](skills/model-refinement/SKILL.md) |
 | Coordinating multi-agent conceptual model refinement across theories, software designs, schemas, protocols, or instructions | [`swarm-model-refinement`](skills/swarm-model-refinement/SKILL.md), [`model-refinement`](skills/model-refinement/SKILL.md) |
+| Creating, revising, evaluating, or retiring agent skills or maintainer guidance | [`skill-authorship`](skills/skill-authorship/SKILL.md), [`model-refinement`](skills/model-refinement/SKILL.md) |
 | Running $N$-round adversarial implementation, critique, and repair between two frontier models in shared git worktree(s) | [`adversarial-rounds`](skills/adversarial-rounds/SKILL.md) |
 | Orchestrating multi-tier supervisor and leaf agent workflows across worktrees with quota-aware model pools and hardware-matched `lake`/`lean` bounds | [`hierarchical-supervision`](skills/hierarchical-supervision/SKILL.md), [`adversarial-rounds`](skills/adversarial-rounds/SKILL.md) |
 | Leading or directing ambiguous engineering efforts, recovering requirements, developing or evaluating architecture, or recovering technical understanding after context loss | [`tech-lead`](skills/tech-lead/SKILL.md), [`reader-oriented-explanation`](skills/reader-oriented-explanation/SKILL.md), [`williams-style`](skills/williams-style/SKILL.md) |
