@@ -165,13 +165,19 @@ jobs:
           restore-keys: |
             lake-artifacts-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Run end-to-end pipeline and demo user journeys
+      - name: Run end-to-end pipeline, demo user journeys, and Miri differential suite
         env:
           LAKE: ${{ runner.temp }}/anneal-lean/lean-4.34.1-darwin_aarch64/bin/lake
           LAKE_CACHE_DIR: ${{ runner.temp }}/anneal-lake-cache
+          ANNEAL_ALLOW_MISSING_MIRI: "1"
         run: |
           cargo test -p cargo-anneal --test end_to_end_pipeline --locked
           cargo test -p cargo-anneal --test end_to_end_demo_journeys --locked
+          cargo test -p cargo-anneal --test end_to_end_miri_diff --locked
+          python3 tests/miri-diff/sync_miri_suite.py
+          if [ -d "$HOME/.cache/miri/lib/rustlib" ]; then
+            python3 tests/miri-diff/sync_miri_suite.py --eval-miri
+          fi
 
       - name: Verify clean working tree
         run: |

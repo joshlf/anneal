@@ -15,7 +15,8 @@ Every test in [`corpus/src/lib.rs`](corpus/src/lib.rs) is a self-contained,
 1. **Upstream Miri Oracle (`miri -Zmiri-tree-borrows`)**:
    Executed via [`corpus/examples/miri_eval.rs`](corpus/examples/miri_eval.rs)
    and [`sync_miri_suite.py`](sync_miri_suite.py), recording the reference
-   verdict (`pass:unit`, `pass:scalar:<bits>:<sizeBytes>`, `panic`, or `ub`).
+   verdict (`pass:unit`, `pass:scalar:<bits>:<sizeBytes>`, `panic`, or `ub`)
+   and, for every `ub` test, the fault source position (`miri_ub_span`).
 2. **Anneal MIR-in-Lean Kernel Verification (`cargo_anneal::miri_diff`)**:
    Captures `Runtime(PostCleanup)` MIR from `corpus/` using Miri-matching
    compiler flags (`-Zmir-opt-level=0 -C debug-assertions=off -C overflow-checks=on`)
@@ -31,7 +32,9 @@ Every test in [`corpus/src/lib.rs`](corpus/src/lib.rs) is a self-contained,
      while refuting total normal termination.
    - **`ub` (`¬ StatefulClaim.holds ∧ ¬ TotalClaim.holds`)**: Proved via
      `refuteMirPointByStrictUB`, which requires
-     `reachesStrictUBBounded = true` (`MirOutcome.fault .ub`). Neither
+     `reachesStrictUBBounded = true` (`MirOutcome.fault .ub`), and checked
+     via `MiriOracleProbe.lean` (`probeMirDiffExecBounded`) to ensure Anneal's
+     active MIR statement span contains `miri_ub_span`. Neither
      `FailureKind.unsupported` nor `FailureKind.outOfFuel` satisfies
      `reachesStrictUBBounded`, preventing model gaps from masquerading as UB
      detections.
@@ -50,15 +53,19 @@ Lean 4 kernel replay at `trustLevel := 0`).
 `known_anneal_bug` entries act strictly as a two-way regression ratchet:
 
 1. **No silent regressions**: Any test without a `known_anneal_bug` block must
-   agree 100% between Miri and Anneal.
+   agree 100% between Miri and Anneal (including UB fault source location).
 2. **Automatic ratchet on bug fixes**: For every test with a `known_anneal_bug`
    block, `cargo_anneal::miri_diff` emits a `known_anneal_bug_ratchet` theorem
-   asserting that `evalMirDiffTagBounded` equals the exact current
-   `observed_anneal_tag` (`by rfl`). As soon as an Anneal bug is fixed so that
-   Anneal agrees with Miri, `known_anneal_bug_ratchet` fails to compile until
-   the `known_anneal_bug` block is deleted from `manifest.toml`, ratcheting the
-   open bug count down toward zero. Also, `parse_miri_diff_manifest` rejects any
-   `known_anneal_bug` whose `observed_anneal_tag` already matches `miri_verdict`.
+   asserting that `evalMirDiffTagBounded` (or `probeMirDiffExecBounded` when
+   `observed_anneal_ub_span` is recorded) equals the exact current
+   `observed_anneal_tag` (and `observed_anneal_ub_span`) (`by rfl`). As soon as
+   an Anneal bug is fixed so that Anneal agrees with Miri,
+   `known_anneal_bug_ratchet` fails to compile until the `known_anneal_bug`
+   block is deleted from `manifest.toml`, ratcheting the open bug count down
+   toward zero. Also, `parse_miri_diff_manifest` rejects any `known_anneal_bug`
+   whose `observed_anneal_tag` already matches `miri_verdict` (or whose
+   `ub_location_mismatch` `observed_anneal_ub_span` already contains
+   `miri_ub_span`).
 
 ### Summary of Open Anneal Bugs Exposed by the Suite
 
@@ -67,9 +74,10 @@ Lean 4 kernel replay at `trustLevel := 0`).
 | Soundness (false negative on UB) | `MirSemantics.Places` / `Operands` | `ub_ptr_offset_oob_read`, `ub_ptr_offset_oob_write`, `ub_ptr_offset_negative_before_start`, `ub_unaligned_ptr_read_u32` | `BinOp.offset` updates `ProvenancePtr.offsetBytes` without checking allocation bounds or negative wrapping, and `readPlace`/`writePlaceValue` ignore `ptr.offsetBytes` and pointer alignment. |
 | Soundness (false negative on UB) | `MirSemantics.Places` | `ub_transmute_invalid_bool_through_ptr` | Writing `3u8` through `*mut u8` cast from `&mut bool` stores an out-of-range scalar into the `bool` local without re-checking `[0, 1]` validity on write or subsequent read. |
 | Completeness (wrong return value) | `MirSemantics.Places` | `pass_ptr_offset_within_array` | `readPlace` ignores `ProvenancePtr.offsetBytes` after `BinOp.offset`, reading field 0 instead of field 1. |
-| Completeness (false-positive UB) | `MirSemantics.Statements` / `Places` | `pass_ref_array_elem_temp_index` | `Rvalue.ref` / `Rvalue.rawPtr` stores unevaluated `ProjectionElem.index tmpLocal` in `BorrowEntry.targetProjection` instead of resolving the index value at borrow creation; `StorageDead(tmpLocal)` then invalidates dereferencing. |
-| Completeness (false-positive UB) | `MirSemantics.Statements` / `Places` | `pass_uninit_union_write_then_read`, `pass_copy_nonoverlapping_uninit_bytes_to_uninit` | Union `Rvalue.aggregate (.adt ...)` initializes a 1-field `.unit` aggregate instead of union storage, causing writes/reads to other union fields to fault with `.ub`. |
+| Completeness (false-positive UB) | `MirSemantics.Places` | `pass_copy_nonoverlapping_uninit_bytes_to_uninit` | Union storage for `Uninit<[u8; 4]>` is represented as a 1-field `.unit` aggregate rather than union byte storage, causing `copy_nonoverlapping` on union fields to fault with `.ub`. |
 | Completeness (false-positive UB) | `MirSemantics.Memory` | `pass_tb_unsafe_cell_shared_mutation` | `BorrowKind.shared` unconditionally assigns Tree Borrows `Permission.frozen` without checking for `UnsafeCell` (`!Freeze` interior mutability). |
+| Completeness (false-positive UB) | `MirSemantics.Places` | `tb_child_write_then_parent_read`, `tb_child_write_then_parent_write`, `safe_reborrow_then_parent_write` | `updateBorrowPerm` disables every other borrow on write (including ancestors), causing subsequent legal parent reads or writes to fault with `.ub`. |
+| UB location mismatch (faults early) | `MirSemantics.Places` | `ub_tb_use_frozen_mut_after_parent_read`, `ub_tb_conflicting_active_mut_borrows` | Because `updateBorrowPerm` disables ancestor tags when a child writes, Anneal faults one statement early on the legal parent access instead of faulting on the subsequent illegal child access as Miri does. |
 | Incompleteness (unmodeled intrinsic / call) | `MirSemantics.Terminators` / `Memory` | `pass_exact_div_valid`, `ub_exact_div_non_multiple`, `pass_direct_fn_call`, `panic_explicit_macro` | `core::intrinsics::exact_div` and `core::panicking::panic_fmt` are not yet interpreted in `evalCallTerminator`, and `initMachineState` leaves `Memory.callees` empty by default. |
 
 ## Running the Suite

@@ -1,3 +1,11 @@
+// Copyright 2026 The Fuchsia Authors
+//
+// Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+// license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+// This file may not be copied, modified, or distributed except according to
+// those terms.
+
 //! Differential testing harness comparing upstream Miri verdicts against
 //! Anneal's MIR-in-Lean operational semantics (`Trusted.Rustc.V2026_06_01.MirSemantics`).
 //!
@@ -5,7 +13,9 @@
 //! captures MIR from the corpus crate (`tests/miri-diff/corpus`) using the
 //! Miri-matching compiler flags recorded in the manifest, generates Lean 4
 //! proof and refutation obligations for every test entry, compiles them with
-//! Lake, and runs `trusted/audit/TrustedBoundary.lean` in `verify-audit` mode.
+//! Lake, runs `trusted/audit/TrustedBoundary.lean` in `verify-audit` mode, and
+//! verifies location-aware Undefined Behavior fault spans via the shared Anneal
+//! oracle (`cargo_anneal::miri_oracle`).
 //!
 //! ## Policy on `known_anneal_bug` Entries
 //!
@@ -21,10 +31,13 @@
 //!      (`StatefulVerificationResult` with `post := False` and `¬ TotalClaim.holds`).
 //!    - `ub`: refuted via `refuteMirPointByStrictUB`
 //!      (`¬ StatefulClaim.holds ∧ ¬ TotalClaim.holds` from
-//!      `reachesStrictUBBounded = true`, which rejects `FailureKind.unsupported`).
+//!      `reachesStrictUBBounded = true`, which rejects `FailureKind.unsupported`),
+//!      AND verified via `probeMirDiffExecBounded` to fault at a statement or
+//!      terminator span containing `miri_ub_span`.
 //! 2. Every test with `known_anneal_bug` must match its exact recorded
-//!    `observed_anneal_tag` via `evalMirDiffTagBounded ... = ... := by rfl`.
-//!    As soon as an Anneal bug is fixed so that Anneal agrees with Miri, the
+//!    `observed_anneal_tag` (and `observed_anneal_ub_span`, when present) via
+//!    `by rfl` in the Lean 4 kernel. As soon as an Anneal bug is fixed so that
+//!    Anneal agrees with Miri (in both tag and UB fault location), the
 //!    `known_anneal_bug_ratchet` theorem fails to type-check until the entry
 //!    is removed from `manifest.toml`.
 
@@ -32,15 +45,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anneal_rustc_capture::{ANNEAL_CAPTURE_DIR_ENV, CapturedItemKind, UnitTargetRecord};
 
 use crate::driver::{
     ANNEAL_CAPTURE_FILTER_ENV, CaptureDriverConfig, aggregate_unit_manifests, resolve_rustc_wrapper,
 };
+use crate::miri_oracle::{
+    ComparisonVerdict, MiriOutcome, OracleItemSpec, SourcePos, SourceSpan, compare_miri_and_anneal,
+    parse_anneal_probe_output, render_anneal_probe_module,
+};
 use crate::obligations::{derive_item_module_suffix, module_suffix_to_rel_path};
 use crate::scaffold::{ScaffoldConfig, scaffold_workspace_with_config};
-use crate::{normalize_path_against, run_lake_verify, run_trusted_boundary_verify_audit};
+use crate::{
+    normalize_path_against, resolve_lake_binary, run_lake_verify,
+    run_trusted_boundary_verify_audit,
+};
 
 /// Expected Miri or observed Anneal outcome tag for a zero-argument differential
 /// test entry.
@@ -163,10 +184,13 @@ pub struct KnownAnnealBugSpec {
     pub status: String,
     /// Classification of the divergence (`soundness_false_negative`,
     /// `completeness_false_positive_ub`, `completeness_wrong_return_value`,
-    /// or `incompleteness_unmodeled_intrinsic_or_call`).
+    /// `incompleteness_unmodeled_intrinsic_or_call`, or `ub_location_mismatch`).
     pub bug_class: String,
     /// Current `MirDiffTag` produced by Anneal on this test.
     pub observed_anneal_tag: MiriDiffVerdictSpec,
+    /// Optional statement/terminator span where Anneal raises `FailureKind.ub`
+    /// (required when `bug_class == "ub_location_mismatch"`).
+    pub observed_anneal_ub_span: Option<SourceSpan>,
     /// Anneal component where the root cause resides.
     pub suspected_component: String,
     /// Human-readable root-cause explanation of the bug.
@@ -185,6 +209,9 @@ pub struct MiriDiffTestEntry {
     pub upstream_path: String,
     /// Reference Miri verdict.
     pub miri_verdict: MiriDiffVerdictSpec,
+    /// Reference Miri Undefined Behavior fault position (`<file>:<line>:<col>`),
+    /// required whenever `miri_verdict == MiriDiffVerdictSpec::Ub`.
+    pub miri_ub_span: Option<SourcePos>,
     /// Step fuel bound passed to `evalMirDiffBounded` / `reachesStrictUBBounded`.
     pub fuel: u32,
     /// Optional unfixed Anneal bug annotation for tests that do not yet match
@@ -307,6 +334,31 @@ pub fn parse_miri_diff_manifest(toml_text: &str) -> Result<MiriDiffManifest, Str
             .ok_or_else(|| format!("missing 'miri_verdict' in [[tests]] entry '{name}'"))?;
         let miri_verdict = MiriDiffVerdictSpec::parse(&miri_verdict_raw)
             .map_err(|e| format!("in test '{name}': {e}"))?;
+        let miri_ub_span = match current_test.remove("miri_ub_span") {
+            Some(raw_pos) => {
+                if miri_verdict != MiriDiffVerdictSpec::Ub {
+                    return Err(format!(
+                        "test '{name}' has miri_ub_span '{raw_pos}' but miri_verdict is '{}'",
+                        miri_verdict.as_tag_str()
+                    ));
+                }
+                let pos = SourcePos::parse_rustc_pos(&raw_pos).ok_or_else(|| {
+                    format!(
+                        "invalid miri_ub_span '{raw_pos}' in test '{name}'; \
+                         expected '<file>:<line>:<col>'"
+                    )
+                })?;
+                Some(pos)
+            }
+            None => {
+                if miri_verdict == MiriDiffVerdictSpec::Ub {
+                    return Err(format!(
+                        "missing 'miri_ub_span' in [[tests]] entry '{name}' with miri_verdict = \"ub\""
+                    ));
+                }
+                None
+            }
+        };
         let fuel_raw = current_test
             .remove("fuel")
             .ok_or_else(|| format!("missing 'fuel' in [[tests]] entry '{name}'"))?;
@@ -334,7 +386,54 @@ pub fn parse_miri_diff_manifest(toml_text: &str) -> Result<MiriDiffManifest, Str
             })?;
             let observed_anneal_tag = MiriDiffVerdictSpec::parse(&observed_raw)
                 .map_err(|e| format!("in known_anneal_bug for '{name}': {e}"))?;
-            if observed_anneal_tag == miri_verdict {
+            let observed_anneal_ub_span =
+                if let Some(raw_span) = current_bug.remove("observed_anneal_ub_span") {
+                    if observed_anneal_tag != MiriDiffVerdictSpec::Ub {
+                        return Err(format!(
+                            "known_anneal_bug for '{name}' has observed_anneal_ub_span '{raw_span}' \
+                             but observed_anneal_tag is '{}' (expected 'ub')",
+                            observed_anneal_tag.as_tag_str()
+                        ));
+                    }
+                    let span = SourceSpan::parse_anneal_span(&raw_span).ok_or_else(|| {
+                        format!(
+                            "invalid observed_anneal_ub_span '{raw_span}' in known_anneal_bug \
+                             for '{name}'; expected '<file>:<sline>:<scol>: <eline>:<ecol>'"
+                        )
+                    })?;
+                    Some(span)
+                } else {
+                    None
+                };
+
+            if bug_class == "ub_location_mismatch" {
+                let (
+                    MiriDiffVerdictSpec::Ub,
+                    MiriDiffVerdictSpec::Ub,
+                    Some(miri_pos),
+                    Some(anneal_span),
+                ) = (
+                    &miri_verdict,
+                    &observed_anneal_tag,
+                    miri_ub_span.as_ref(),
+                    observed_anneal_ub_span.as_ref(),
+                )
+                else {
+                    return Err(format!(
+                        "known_anneal_bug for '{name}' with bug_class = \"ub_location_mismatch\" \
+                         requires miri_verdict = \"ub\", observed_anneal_tag = \"ub\", \
+                         miri_ub_span, and observed_anneal_ub_span"
+                    ));
+                };
+                if anneal_span.contains_pos(miri_pos) {
+                    return Err(format!(
+                        "known_anneal_bug for '{name}' has observed_anneal_ub_span ({}) \
+                         containing miri_ub_span ({}); remove the stale ub_location_mismatch entry",
+                        anneal_span.display_short(),
+                        miri_pos.display_short()
+                    ));
+                }
+            } else if observed_anneal_tag == miri_verdict {
                 return Err(format!(
                     "known_anneal_bug for '{name}' has observed_anneal_tag equal to miri_verdict ({}); remove the stale bug entry",
                     miri_verdict.as_tag_str()
@@ -354,12 +453,18 @@ pub fn parse_miri_diff_manifest(toml_text: &str) -> Result<MiriDiffManifest, Str
                     "known_anneal_bug for '{name}' must have non-empty suspected_component and summary"
                 ));
             }
+            if let Some(unknown_key) = current_bug.keys().next() {
+                return Err(format!(
+                    "unknown key '{unknown_key}' in [tests.known_anneal_bug] for '{name}'"
+                ));
+            }
             current_bug.clear();
             *has_bug_section = false;
             Some(KnownAnnealBugSpec {
                 status,
                 bug_class,
                 observed_anneal_tag,
+                observed_anneal_ub_span,
                 suspected_component,
                 summary,
             })
@@ -367,12 +472,18 @@ pub fn parse_miri_diff_manifest(toml_text: &str) -> Result<MiriDiffManifest, Str
             None
         };
 
+        if let Some(unknown_key) = current_test.keys().next() {
+            return Err(format!(
+                "unknown key '{unknown_key}' in [[tests]] entry '{name}'"
+            ));
+        }
         current_test.clear();
         tests.push(MiriDiffTestEntry {
             name,
             category,
             upstream_path,
             miri_verdict,
+            miri_ub_span,
             fuel,
             known_anneal_bug,
         });
@@ -638,6 +749,65 @@ pub fn render_miri_diff_verify_module(
 
     if let Some(ref bug) = entry.known_anneal_bug {
         let tag_expr = bug.observed_anneal_tag.to_lean_mir_diff_tag();
+        if let Some(ref ub_span) = bug.observed_anneal_ub_span {
+            let escaped_span = ub_span
+                .display_short()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
+            out.push_str(&format!(
+                "-- @anneal-miri-diff-kind: known_anneal_bug\n\
+                 -- UNFIXED ANNEAL BUG ({} in `{}`):\n\
+                 -- {}\n\
+                 -- Reference Miri verdict: `{}`\n\
+                 -- Observed Anneal tag:    `{}`\n\
+                 -- Observed Anneal UB span: `{}`\n\
+                 open Trusted.Sequence\n\n\
+                 def activeSpan (body : CapturedMir) (st : MirExecState) : String :=\n  \
+                   let raw :=\n    \
+                     match st with\n    \
+                     | .running s =>\n      \
+                       let cur := s.memory.activeCallee.getD body\n      \
+                       match get? cur.basicBlocks s.frame.blockIdx with\n      \
+                       | some bb =>\n        \
+                         match get? bb.statements s.frame.stmtIdx with\n        \
+                         | some stmt => stmt.span\n        \
+                         | none => bb.terminator.span\n      \
+                       | none => \"none\"\n    \
+                     | _ => \"none\"\n  \
+                   if raw == \"\" || raw == \"<dummy>\" then \"none\" else raw\n\n\
+                 def probeMirDiffExecBounded\n    \
+                     (fuel : Nat) (body : CapturedMir) (st : MirExecState) :\n    \
+                     MirDiffTag × String :=\n  \
+                   match fuel with\n  \
+                   | 0 => (.outOfFuel, activeSpan body st)\n  \
+                   | fuel' + 1 =>\n    \
+                     match stepMirState body st with\n    \
+                     | .ret (.normal (.unit, _)) => (.normalUnit, \"none\")\n    \
+                     | .ret (.normal (.scalar sc, _)) => (.normalScalar sc.bits sc.sizeBytes, \"none\")\n    \
+                     | .ret (.normal (_, _)) => (.normalOther, \"none\")\n    \
+                     | .ret .panic => (.panic, activeSpan body st)\n    \
+                     | .ret .abort => (.abort, activeSpan body st)\n    \
+                     | .tau st' => probeMirDiffExecBounded fuel' body st'\n    \
+                     | .vis (.inl (.fail .ub)) _ => (.ub, activeSpan body st)\n    \
+                     | .vis (.inl (.fail .unsupported)) _ => (.unsupported, activeSpan body st)\n    \
+                     | .vis (.inl (.fail .outOfFuel)) _ => (.outOfFuel, activeSpan body st)\n    \
+                     | .vis (.inr (.inl _)) k => probeMirDiffExecBounded fuel' body (k PUnit.unit)\n    \
+                     | .vis (.inr (.inr (.call req))) _ => (.externalCall req.defPath, activeSpan body st)\n\n\
+                 theorem known_anneal_bug_ratchet :\n    \
+                     probeMirDiffExecBounded {fuel} Mir.{item}.body\n      \
+                       (.running (initMachineStateWithMemory Mir.{item}.body [] emptyMemory)) =\n      \
+                     ({tag_expr}, \"{escaped_span}\") := by\n  \
+                   rfl\n\n\
+                 end Verify.{item}\n",
+                bug.bug_class,
+                bug.suspected_component,
+                bug.summary,
+                entry.miri_verdict.as_tag_str(),
+                bug.observed_anneal_tag.as_tag_str(),
+                ub_span.display_short()
+            ));
+            return Ok((out, false));
+        }
         out.push_str(&format!(
             "-- @anneal-miri-diff-kind: known_anneal_bug\n\
              -- UNFIXED ANNEAL BUG ({} in `{}`):\n\
@@ -1066,8 +1236,8 @@ pub fn stage_miri_diff_workspace(
 
 /// Run the full Miri differential test suite: load `manifest.toml`, capture MIR
 /// from the corpus crate, generate Lean proof/refutation/ratchet modules,
-/// compile them with Lake, and run `TrustedBoundary.lean` in `verify-audit`
-/// mode.
+/// compile them with Lake, run `TrustedBoundary.lean` in `verify-audit` mode,
+/// and verify location-aware UB spans via the shared Anneal oracle.
 pub fn run_miri_diff_suite(config: &MiriDiffConfig) -> Result<MiriDiffReport, String> {
     let manifest = load_miri_diff_manifest(&config.manifest_path)?;
     let (report, certificate_modules) = stage_miri_diff_workspace(config, &manifest)?;
@@ -1088,7 +1258,131 @@ pub fn run_miri_diff_suite(config: &MiriDiffConfig) -> Result<MiriDiffReport, St
         &certificate_modules,
     )?;
 
+    let crate_camel = certificate_modules
+        .first()
+        .and_then(|m| m.strip_prefix("Verify."))
+        .and_then(|s| s.split('.').next())
+        .unwrap_or("MiriDiffCorpus");
+    verify_miri_diff_ub_locations(&dot_anneal, crate_camel, &manifest)?;
+
     Ok(report)
+}
+
+/// Evaluate `MiriOracleProbe.lean` via `lake env lean` inside `dot_anneal` and
+/// verify that every `known_anneal_bug` entry with `observed_anneal_ub_span`
+/// matches Anneal's fault span and every non-bug `ub` entry's Anneal fault span
+/// contains `miri_ub_span`.
+pub fn verify_miri_diff_ub_locations(
+    dot_anneal: &Path,
+    crate_camel: &str,
+    manifest: &MiriDiffManifest,
+) -> Result<(), String> {
+    let mut probe_items = Vec::new();
+    for entry in &manifest.tests {
+        let needs_ub_probe = entry.miri_verdict == MiriDiffVerdictSpec::Ub
+            || entry
+                .known_anneal_bug
+                .as_ref()
+                .is_some_and(|b| b.observed_anneal_ub_span.is_some());
+        if needs_ub_probe {
+            probe_items.push(OracleItemSpec::with_fuel(&entry.name, entry.fuel));
+        }
+    }
+    if probe_items.is_empty() {
+        return Ok(());
+    }
+
+    let oracle_dir = dot_anneal.join("oracle");
+    fs::create_dir_all(&oracle_dir)
+        .map_err(|err| format!("failed to create {}: {}", oracle_dir.display(), err))?;
+    let probe_path = oracle_dir.join("MiriOracleProbe.lean");
+    let probe_src = render_anneal_probe_module(crate_camel, &probe_items);
+    fs::write(&probe_path, &probe_src)
+        .map_err(|err| format!("failed to write {}: {}", probe_path.display(), err))?;
+
+    let lake_bin = resolve_lake_binary();
+    let probe_out = Command::new(&lake_bin)
+        .current_dir(dot_anneal)
+        .arg("env")
+        .arg("lean")
+        .arg("oracle/MiriOracleProbe.lean")
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to execute '{} env lean oracle/MiriOracleProbe.lean': {}",
+                lake_bin.display(),
+                err
+            )
+        })?;
+    if !probe_out.status.success() {
+        let stdout = String::from_utf8_lossy(&probe_out.stdout);
+        let stderr = String::from_utf8_lossy(&probe_out.stderr);
+        return Err(format!(
+            "Lean UB span probe failed in {} ({}):\n{}\n{}",
+            dot_anneal.display(),
+            probe_out.status,
+            stdout,
+            stderr
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&probe_out.stdout);
+    let parsed = parse_anneal_probe_output(&stdout)?;
+
+    for entry in &manifest.tests {
+        if let Some(ref bug) = entry.known_anneal_bug {
+            if let Some(ref expected_span) = bug.observed_anneal_ub_span {
+                let Some(outcome) = parsed.get(&entry.name) else {
+                    return Err(format!(
+                        "missing Anneal probe output for known_anneal_bug test '{}'",
+                        entry.name
+                    ));
+                };
+                if outcome.span() != Some(expected_span) {
+                    return Err(format!(
+                        "known_anneal_bug UB span mismatch for '{}': manifest records '{}', \
+                         Anneal produced '{:?}'",
+                        entry.name,
+                        expected_span.display_short(),
+                        outcome.span()
+                    ));
+                }
+            }
+            continue;
+        }
+
+        if entry.miri_verdict == MiriDiffVerdictSpec::Ub {
+            let Some(ref miri_pos) = entry.miri_ub_span else {
+                return Err(format!(
+                    "missing miri_ub_span on UB test '{}'",
+                    entry.name
+                ));
+            };
+            let Some(anneal_outcome) = parsed.get(&entry.name) else {
+                return Err(format!(
+                    "missing Anneal probe output for UB test '{}'",
+                    entry.name
+                ));
+            };
+            let miri_outcome = MiriOutcome::Ub {
+                pos: Some(miri_pos.clone()),
+                message: String::new(),
+            };
+            let verdict = compare_miri_and_anneal(&miri_outcome, anneal_outcome);
+            if verdict != ComparisonVerdict::Agree {
+                return Err(format!(
+                    "UB location mismatch on '{}': Miri faulted at '{}', \
+                     Anneal produced '{}' (verdict: {:?})",
+                    entry.name,
+                    miri_pos.display_short(),
+                    anneal_outcome.summary_tag(),
+                    verdict
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Render a deterministic human-readable summary of a completed Miri

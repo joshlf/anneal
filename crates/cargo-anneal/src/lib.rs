@@ -73,7 +73,7 @@ pub use miri_diff::{
     KnownAnnealBugSpec, MiriDiffConfig, MiriDiffManifest, MiriDiffReport, MiriDiffTestEntry,
     MiriDiffVerdictSpec, load_miri_diff_manifest, parse_miri_diff_manifest,
     render_miri_diff_crate_verify_module, render_miri_diff_report, render_miri_diff_verify_module,
-    run_miri_diff_suite, stage_miri_diff_workspace,
+    run_miri_diff_suite, stage_miri_diff_workspace, verify_miri_diff_ub_locations,
 };
 pub use miri_oracle::{
     ALLOW_MISSING_MIRI_ENV, AnnealOracleConfig, AnnealOutcome, ComparisonVerdict,
