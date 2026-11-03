@@ -58,17 +58,22 @@ open MiniRustSpec.Correspondence in
   steps_error
   steps_error_from_start
   steps_outcome
+  steps_outcome_from_start
   mirNoUB_safe
   mirNoUB_safe_from_start
   mirNoUB_progress
   mirNoUB_progress_from_start
   mirNoUB_diverges_steps_ok
   mirNoUB_diverges_from_start
+  mirNoUB_diverges_rel_from_start
   mirCall_ret
   mirCall_ub
   mirCall_noUB
   mirCall_progress
   mirCall_diverges_steps_ok
+  mirCall_diverges_rel
+  mirCall_steps_error
+  mirCall_outcome
   runA_sound
   runA_noUB
   faultsA_sound
@@ -79,10 +84,17 @@ open MiniRustSpec.Correspondence in
   evalStatement_placeMention
   evalValue_operand
   evalValue_rvalue
+  evalIntBinOp_spec
   evalStmt_assign
   evalStmt_placeMention
   evalOperand_frag
   evalRvalue_frag
+  evalScalarBinOp_frag
+  signedOverflowAdd_eq
+  signedOverflowSub_eq
+  signedOverflowMul_eq
+  evalSignedDiv_spec
+  evalSignedRem_spec
   castBits_eq_toNat
   switch_lookup
   translateFn_spec
@@ -138,6 +150,47 @@ open MiniRustSpec.Correspondence.Witness in
   spinLoop_noUB
   spinLoop_diverges
   spinLoop_minirust_steps_ok
+  spinLoop_minirust_diverges_rel
+  divRemI8_inFragment
+  divRemI8_translate
+  divRemNeg7_anneal_ret
+  divRemNeg7_noUB
+  divRemNeg7_minirust_ret_from_start
+  divRemNeg7_minirust_direct
+  divRemMinOne_anneal_ret
+  divRemMinOne_minirust_ret_from_start
+  divRemMinOne_minirust_direct
+  divByZero_anneal_ub
+  divByZero_minirust_ub_from_start
+  divByZero_minirust_direct
+  divByZero_converse_error
+  divMinNeg1_anneal_ub
+  divMinNeg1_minirust_ub_from_start
+  divMinNeg1_minirust_direct
+  remOnlyI8_inFragment
+  remOnlyI8_translate
+  remByZero_anneal_ub
+  remByZero_minirust_ub_from_start
+  remByZero_minirust_direct
+  remMinNeg1_anneal_ub
+  remMinNeg1_minirust_ub_from_start
+  remMinNeg1_minirust_direct
+  uncheckedArithI8_inFragment
+  uncheckedArithI8_translate
+  uncheckedOk_anneal_ret
+  uncheckedOk_noUB
+  uncheckedOk_minirust_ret_from_start
+  uncheckedOk_minirust_direct
+  uncheckedMulUb_anneal_ub
+  uncheckedMulUb_minirust_ub_from_start
+  uncheckedMulUb_minirust_direct
+  uncheckedSubUb_anneal_ub
+  uncheckedSubUb_minirust_ub_from_start
+  uncheckedSubUb_minirust_direct
+  uncheckedAddUb_anneal_ub
+  uncheckedAddUb_minirust_ub_from_start
+  uncheckedAddUb_minirust_direct
+  uncheckedAddUb_outcome
 
 #assert_standard_axioms MiniRustSpec.Anchors.anchors_ok
 

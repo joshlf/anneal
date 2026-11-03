@@ -31,7 +31,8 @@ The translation is defined only on the fragment checked by `inFragment`:
   (`localDecls.length = argCount + 1`), all of integer type;
 * statements are `_i = Use(copy _j)`, `_i = Use(const c)`,
   `_i = UnaryOp(uop, a)` with `uop ∈ {Neg, Not}`,
-  `_i = BinaryOp(op, a, b)` with `op ∈ {Add, Sub, Mul}`,
+  `_i = BinaryOp(op, a, b)` with
+  `op ∈ {Add, Sub, Mul, Div, Rem, AddUnchecked, SubUnchecked, MulUnchecked}`,
   `_i = Cast(IntToInt, a, targetTy)` (casting an operand `a` of any integer
   type `srcIt` to the destination local's integer type `it`),
   where every operand is `copy _j` (no projections) or an integer constant,
@@ -121,7 +122,8 @@ def translateOperand : MirAst.Operand → Option Gen.ValueExpr
     | _, _ => none
   | _ => none
 
-/-- `minimize`'s unary-operator translation for integer operands:
+/-- `minimize`'s unary-operator translation for integer operands
+(`tooling/minimize/src/rvalue.rs`):
 > "(Neg, Type::Int(_)) => build::neg(operand),
 >  (Not, Type::Int(_)) => build::bit_not(operand),"
 where `build::neg(x)` is `ValueExpr::UnOp { operator: UnOp::Int(IntUnOp::Neg), operand: x }`
@@ -131,15 +133,29 @@ def translateUnOp : MirAst.UnOp → Option Gen.IntUnOp
   | .not => some .BitNot
   | _ => none
 
-/-- `minimize`'s binary-operator translation for integer operands:
+/-- `minimize`'s binary-operator translation for integer operands
+(`tooling/minimize/src/rvalue.rs`):
 > "(Add, Type::Int(_)) => build::add(l, r),
 >  (Sub, Type::Int(_)) => build::sub(l, r),
->  (Mul, Type::Int(_)) => build::mul(l, r),"
-where `build::add(l, r)` is `ValueExpr::BinOp { operator: BinOp::Int(IntBinOp::Add), .. }`. -/
+>  (Mul, Type::Int(_)) => build::mul(l, r),
+>  (Div, Type::Int(_)) => build::div(l, r),
+>  (Rem, Type::Int(_)) => build::rem(l, r),
+>  ..
+>  (AddUnchecked, Type::Int(_)) => build::add_unchecked(l, r),
+>  (SubUnchecked, Type::Int(_)) => build::sub_unchecked(l, r),
+>  (MulUnchecked, Type::Int(_)) => build::mul_unchecked(l, r),"
+where `build::add(l, r)` is `ValueExpr::BinOp { operator: BinOp::Int(IntBinOp::Add), .. }`
+(and analogously for `Sub`, `Mul`, `Div`, `Rem`, `AddUnchecked`, `SubUnchecked`,
+and `MulUnchecked`). -/
 def translateBinOp : MirAst.BinOp → Option Gen.IntBinOp
   | .add => some .Add
   | .sub => some .Sub
   | .mul => some .Mul
+  | .div => some .Div
+  | .rem => some .Rem
+  | .addUnchecked => some .AddUnchecked
+  | .subUnchecked => some .SubUnchecked
+  | .mulUnchecked => some .MulUnchecked
   | _ => none
 
 /-- `minimize`'s rvalue translation for `Use`, `UnaryOp(Neg | Not)` on
@@ -221,7 +237,8 @@ def translateStatement (s : MirAst.Statement) : Option Gen.Statement :=
   | .placeMention ⟨i, []⟩ => some (.PlaceMention (.Local (localName i)))
   | _ => none
 
-/-- `minimize`'s switch cases for a discriminant of type `it`:
+/-- `minimize`'s switch cases for a discriminant of type `it`
+(`tooling/minimize/src/bb.rs`):
 > "let cases = targets
 >      .iter()
 >      .map(|(value, target)| {
@@ -267,7 +284,8 @@ def translateBlock (decls : List MirAst.LocalDecl) (bb : MirAst.BasicBlockData) 
   let term ← translateTerminator decls bb.terminator
   pure ⟨stmts, term, .Regular⟩
 
-/-- `minimize`'s local-type map, one entry per MIR local in index order:
+/-- `minimize`'s local-type map, one entry per MIR local in index order
+(`tooling/minimize/src/function.rs`):
 > "for (id, local_name) in &self.local_name_map {
 >      let local_decl = &self.body.local_decls[*id];
 >      let span = local_decl.source_info.span;

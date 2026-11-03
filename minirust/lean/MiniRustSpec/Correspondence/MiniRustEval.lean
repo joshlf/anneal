@@ -379,24 +379,55 @@ theorem intUnArith_emod (uop : MirAst.UnOp) (iuop : Gen.IntUnOp)
   · rw [show -x = 0 - x by omega, show -x' = 0 - x' by omega,
       Int.sub_emod, hx, ← Int.sub_emod]
 
-/-- The arithmetic of `eval_int_bin_op` for the fragment operators. -/
-def intArith : Gen.IntBinOp → Int → Int → Int
-  | .Add, x, y => x + y
-  | .Sub, x, y => x - y
-  | .Mul, x, y => x * y
-  | _, _, _ => 0
+/-- Partial integer evaluation of `eval_int_bin_op` for the fragment binary
+operators: returns `some z` when `evalIntBinOp iop l r it = .ok z` and `none`
+when `evalIntBinOp` raises UB (`throw_ub!`). -/
+def intBinEval (iop : Gen.IntBinOp) (l r : Int) (it : Gen.IntType) : Option Int :=
+  match iop with
+  | .Add => some (l + r)
+  | .Sub => some (l - r)
+  | .Mul => some (l * r)
+  | .AddUnchecked => if IntType.can_represent it (l + r) then some (l + r) else none
+  | .SubUnchecked => if IntType.can_represent it (l - r) then some (l - r) else none
+  | .MulUnchecked => if IntType.can_represent it (l * r) then some (l * r) else none
+  | .Div =>
+    if r = 0 then none
+    else if IntType.can_represent it (Int.tdiv l r) then some (Int.tdiv l r)
+    else none
+  | .Rem =>
+    if r = 0 then none
+    else if IntType.can_represent it (Int.tdiv l r) then some (Int.tmod l r)
+    else none
+  | _ => none
 
-theorem evalIntBinOp_eq (op : MirAst.BinOp) (iop : Gen.IntBinOp) (hop : translateBinOp op = some iop)
-    (x y : Int) (it : Gen.IntType) : evalIntBinOp iop x y it = .ok (intArith iop x y) := by
-  cases op <;> simp [translateBinOp] at hop <;> subst hop <;> rfl
-
-theorem intArith_emod (op : MirAst.BinOp) (iop : Gen.IntBinOp) (hop : translateBinOp op = some iop)
-    (x y x' y' m : Int) (hx : x % m = x' % m) (hy : y % m = y' % m) :
-    intArith iop x y % m = intArith iop x' y' % m := by
-  cases op <;> simp [translateBinOp] at hop <;> subst hop <;> simp only [intArith]
-  · rw [Int.add_emod, hx, hy, ← Int.add_emod]
-  · rw [Int.sub_emod, hx, hy, ← Int.sub_emod]
-  · rw [Int.mul_emod, hx, hy, ← Int.mul_emod]
+theorem evalIntBinOp_spec (op : MirAst.BinOp) (iop : Gen.IntBinOp)
+    (hop : translateBinOp op = some iop) (l r : Int) (it : Gen.IntType) :
+    (∀ z, intBinEval iop l r it = some z → evalIntBinOp iop l r it = .ok z) ∧
+    (intBinEval iop l r it = none → ∃ msg, evalIntBinOp iop l r it = .error (.ub msg)) := by
+  match op, hop with
+  | .add, hop | .sub, hop | .mul, hop =>
+    simp [translateBinOp] at hop; subst hop; simp [intBinEval, evalIntBinOp]
+  | .addUnchecked, hop =>
+    simp [translateBinOp] at hop; subst hop
+    cases hrep : IntType.can_represent it (l + r) <;> simp [intBinEval, evalIntBinOp, hrep, ub]
+  | .subUnchecked, hop =>
+    simp [translateBinOp] at hop; subst hop
+    cases hrep : IntType.can_represent it (l - r) <;> simp [intBinEval, evalIntBinOp, hrep, ub]
+  | .mulUnchecked, hop =>
+    simp [translateBinOp] at hop; subst hop
+    cases hrep : IntType.can_represent it (l * r) <;> simp [intBinEval, evalIntBinOp, hrep, ub]
+  | .div, hop =>
+    simp [translateBinOp] at hop; subst hop
+    by_cases hr0 : r = 0
+    · simp [intBinEval, evalIntBinOp, hr0, ub]
+    · cases hrep : IntType.can_represent it (Int.tdiv l r) <;>
+        simp [intBinEval, evalIntBinOp, hr0, hrep, ub]
+  | .rem, hop =>
+    simp [translateBinOp] at hop; subst hop
+    by_cases hr0 : r = 0
+    · simp [intBinEval, evalIntBinOp, hr0, ub]
+    · cases hrep : IntType.can_represent it (Int.tdiv l r) <;>
+        simp [intBinEval, evalIntBinOp, hr0, hrep, ub]
 
 /-- Hypotheses describing a callee frame related to Anneal locals `locals`. -/
 structure FrameOk (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (locals : List LocalSlot)
@@ -499,7 +530,8 @@ def rvBits (decls : List LocalDecl) (locals : List LocalSlot) (it : Gen.IntType)
     let iop ← translateBinOp op
     let x ← opBits locals a
     let y ← opBits locals b
-    pure (intArith iop x y % 2 ^ (8 * it.size.bytes)).toNat
+    let z ← intBinEval iop (intFromBits x it) (intFromBits y it) it
+    pure (z % 2 ^ (8 * it.size.bytes)).toNat
   | .cast .intToInt op _ => do
     let srcIt ← operandIntType decls op
     let x ← opBits locals op
@@ -528,20 +560,6 @@ theorem bringInBounds_intUnArith (uop : MirAst.UnOp) (iuop : Gen.IntUnOp)
   have hx' : intFromBits x it % 2 ^ (8 * it.size.bytes) = (x : Int) % 2 ^ (8 * it.size.bytes) := by
     rw [intFromBits_emod x it hx, Int.emod_eq_of_lt (by omega) (by exact_mod_cast hx)]
   exact intUnArith_emod uop iuop huop _ _ _ hx'
-
-theorem bringInBounds_intArith (op : MirAst.BinOp) (iop : Gen.IntBinOp)
-    (hop : translateBinOp op = some iop) (it : Gen.IntType) (hgood : GoodSize it.size.bytes)
-    (x y : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * it.size.bytes)) :
-    IntType.bring_in_bounds it (intArith iop (intFromBits x it) (intFromBits y it)) =
-      intFromBits (intArith iop x y % 2 ^ (8 * it.size.bytes)).toNat it := by
-  rw [bringInBounds_eq_intFromBits it hgood]
-  congr 2
-  have hpos := two_pow_pos (8 * it.size.bytes)
-  have hx' : intFromBits x it % 2 ^ (8 * it.size.bytes) = (x : Int) % 2 ^ (8 * it.size.bytes) := by
-    rw [intFromBits_emod x it hx, Int.emod_eq_of_lt (by omega) (by exact_mod_cast hx)]
-  have hy' : intFromBits y it % 2 ^ (8 * it.size.bytes) = (y : Int) % 2 ^ (8 * it.size.bytes) := by
-    rw [intFromBits_emod y it hy, Int.emod_eq_of_lt (by omega) (by exact_mod_cast hy)]
-  exact intArith_emod op iop hop _ _ _ _ _ hx' hy'
 
 /-- Evaluating a translated fragment rvalue. -/
 theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
@@ -620,19 +638,27 @@ theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
             obtain ⟨msg, hmsg⟩ := hbnone hyb
             exact ⟨msg, by simp [evalValue, hm1, hmsg]⟩
           | some y =>
-            obtain ⟨hy, m2, hm2, h2⟩ := hbok y hyb
-            refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits, hiop, hxa, hyb] at hnone⟩
-            simp [rvBits, hiop, hxa, hyb] at hr
-            subst hr
-            have hpos := two_pow_pos (8 * it.size.bytes)
-            refine ⟨?_, m2, ?_, h2⟩
-            · have h0 := Int.emod_nonneg (intArith iop x y) (Int.ne_of_gt hpos)
-              have h1 := Int.emod_lt_of_pos (intArith iop x y) hpos
-              have : ((intArith iop x y % 2 ^ (8 * it.size.bytes)).toNat : Int) < 2 ^ (8 * it.size.bytes) := by
-                rw [Int.toNat_of_nonneg h0]; exact h1
-              exact_mod_cast this
-            · simp [evalValue, hm1, hm2, evalBinOp, evalIntBinOp_eq op iop hiop,
-                bringInBounds_intArith op iop hiop it hgood x y hx hy]
+            obtain ⟨_, m2, hm2, h2⟩ := hbok y hyb
+            obtain ⟨hevalOk, hevalNone⟩ :=
+              evalIntBinOp_spec op iop hiop (intFromBits x it) (intFromBits y it) it
+            cases hz : intBinEval iop (intFromBits x it) (intFromBits y it) it with
+            | none =>
+              refine ⟨fun r hr => by simp [rvBits, hiop, hxa, hyb, hz] at hr, fun _ => ?_⟩
+              obtain ⟨msg, hmsg⟩ := hevalNone hz
+              exact ⟨msg, by simp [evalValue, hm1, hm2, evalBinOp, hmsg]⟩
+            | some z =>
+              refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits, hiop, hxa, hyb, hz] at hnone⟩
+              simp [rvBits, hiop, hxa, hyb, hz] at hr
+              subst hr
+              have hpos := two_pow_pos (8 * it.size.bytes)
+              refine ⟨?_, m2, ?_, h2⟩
+              · have h0 := Int.emod_nonneg z (Int.ne_of_gt hpos)
+                have hlt := Int.emod_lt_of_pos z hpos
+                have : ((z % 2 ^ (8 * it.size.bytes)).toNat : Int) < 2 ^ (8 * it.size.bytes) := by
+                  rw [Int.toNat_of_nonneg h0]; exact hlt
+                exact_mod_cast this
+              · simp [evalValue, hm1, hm2, evalBinOp, hevalOk z hz,
+                  bringInBounds_eq_intFromBits it hgood z]
   | .cast .intToInt op targetTy, hok, he =>
     simp only [rvalueOk, Bool.and_eq_true, decide_eq_true_eq] at hok
     obtain ⟨htgt, hsrc⟩ := hok

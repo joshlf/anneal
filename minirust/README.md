@@ -123,14 +123,16 @@ executable meaning of the fragment is `Interp.lean`.
 functions needed to run the fragment below on `Machine<BasicMemory<x86_64>>`:
 `Machine::step` (single enabled thread), `Statement::{Assign, PlaceMention}`,
 `PlaceExpr::Local`, `ValueExpr::{Constant, Load, UnOp, BinOp}` with
-`IntUnOp::{Neg, BitNot}`, `CastOp::IntToInt`, and `IntBinOp::{Add, Sub, Mul}`,
+`IntUnOp::{Neg, BitNot}`, `CastOp::IntToInt`, and
+`IntBinOp::{Add, AddUnchecked, Sub, SubUnchecked, Mul, MulUnchecked, Div, DivExact, Rem}`,
 `Terminator::{Goto, Switch, Return, Unreachable}` including
 frame teardown and both stack-pop actions, the representation relation for
 `Int` and `Bool`, `Type::layout`, `BasicMemory`'s `check_ptr`, `load`, `store`,
 and `deallocate`, and `ConcurrentMemory`'s access log and data-race check.
-Every definition quotes the upstream code it transcribes, and
-`crates/anneal-minirust-gen/tests/quotes.rs` checks every such quotation
-within a single vendored source file (ignoring only whitespace and `//`
+Every definition quotes the upstream code it transcribes and cites its exact
+vendored source file, and `crates/anneal-minirust-gen/tests/quotes.rs` parses
+every Lean doc comment (`/-! ... -/` and `/-- ... -/`) and checks each quoted
+substring against its cited vendored file (ignoring only whitespace and `//`
 comments; `..` marks elided code). Effects are
 `Except Stop` with `Stop.ub` (`throw_ub!`), `Stop.deadlock`, `Stop.specPanic`
 (a panic in the spec, which upstream calls a spec bug), and
@@ -154,7 +156,7 @@ restricted to the fragment checked by `inFragment`:
   and the arguments, all of integer type (`u8`..`u128`, `i8`..`i128`,
   `usize`, `isize`);
 * statements are `_i = Use(op)`, `_i = UnaryOp(Neg | Not, op)`,
-  `_i = BinaryOp(Add | Sub | Mul, op, op)`,
+  `_i = BinaryOp(Add | Sub | Mul | Div | Rem | AddUnchecked | SubUnchecked | MulUnchecked, op, op)`,
   `_i = Cast(CastKind::IntToInt, op, targetTy)`, or `PlaceMention(_i)`,
   with `op` a projection-free `copy _j` or an integer constant (of `_i`'s type
   for `Use`/`UnaryOp`/`BinaryOp`, or of any integer type for `Cast(IntToInt)`);
@@ -205,23 +207,26 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
   trees `mirTree body s` and `mirCallTree body args`: if Anneal returns `v` (or
   can reach UB), then MiniRust started either at `bb0` or at `f.start` performs
   the corresponding return (or raises UB) within finitely many steps.
-* `steps_error`, `steps_error_from_start` (`Run.lean`): conversely, if MiniRust
-  stops with *any* error within `n` steps from `StateRel` or `StartRel`, either
-  the error is UB and Anneal can reach UB, or MiniRust already completed the
-  callee's return (`ReturnRel`, matching an Anneal `ReachesRet`) in `k < n`
-  steps and only errored later inside the unmodeled caller frame.
+* `steps_error`, `steps_error_from_start`, `mirCall_steps_error` (`Run.lean`):
+  conversely, if MiniRust stops with *any* error within `n` steps from
+  `StateRel`, `StartRel`, or `mirCallTree body args`, either the error is UB and
+  Anneal can reach UB, or MiniRust already completed the callee's return
+  (`ReturnRel`, matching an Anneal `ReachesRet`) in `k < n` steps and only
+  errored later inside the unmodeled caller frame.
 * `mirNoUB_safe`, `mirNoUB_safe_from_start`, `mirCall_noUB`, `runA_noUB`
   (`Run.lean`): if Anneal's interaction tree satisfies `MirNoUBTree`
   (`TreeSafe`), MiniRust never stops with any error (`.ub`, `.specPanic`,
   `.deadlock`, or `.unsupported`) anywhere during the callee's execution.
-* `steps_outcome`, `mirNoUB_progress`, `mirNoUB_progress_from_start`,
-  `mirCall_progress`, `mirNoUB_diverges_steps_ok`, `mirNoUB_diverges_from_start`,
-  `mirCall_diverges_steps_ok`, `treeSafe_of_tau_inv`, `noRet_of_tau_inv`
+* `steps_outcome`, `steps_outcome_from_start`, `mirCall_outcome`,
+  `mirNoUB_progress`, `mirNoUB_progress_from_start`, `mirCall_progress`,
+  `mirNoUB_diverges_steps_ok`, `mirNoUB_diverges_from_start`,
+  `mirNoUB_diverges_rel_from_start`, `mirCall_diverges_steps_ok`,
+  `mirCall_diverges_rel`, `treeSafe_of_tau_inv`, `noRet_of_tau_inv`
   (`Run.lean`): total `n`-step outcome trichotomy and forward progress for all
   `n : Nat` (either still running in lockstep `StateRel`, already returned via
   `ReturnRel` in `k ≤ n` steps, or stopped with `.ub` matching `FaultNow`),
   specializing under `MirNoUBTree` and non-termination to prove that diverging
-  UB-free loops step forever (`∀ n, ∃ m', Interp.steps n mInit = .ok m'`).
+  UB-free loops step forever in lockstep `StateRel` + `Reaches`.
 
 ### Witnesses
 
@@ -266,9 +271,21 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   (`castBitNot4_minirust_ret_from_start`) and a direct 7-step run
   (`castBitNot4_minirust_direct`).
 * `spinLoop`, a diverging `loop {}` body exercising `treeSafe_of_tau_inv`
-  (`spinLoop_noUB`), `noRet_of_tau_inv` (`spinLoop_diverges`), and
-  `mirCall_diverges_steps_ok` (`spinLoop_minirust_steps_ok : ∀ n, ∃ m',
-  Interp.steps n spinLoopMInit = .ok m'`).
+  (`spinLoop_noUB`), `noRet_of_tau_inv` (`spinLoop_diverges`),
+  `mirCall_diverges_steps_ok` (`spinLoop_minirust_steps_ok`), and lockstep
+  `mirCall_diverges_rel` (`spinLoop_minirust_diverges_rel`, preserving
+  `StateRel` and `Reaches` for all `n : Nat`).
+* `divRemI8` and `remOnlyI8`, signed `i8` bodies exercising truncating-toward-zero
+  `Div` and `Rem` (`-7i8 / 3i8 = -2i8` and `-7i8 % 3i8 = -1i8`, plus the non-UB
+  signed boundary `-128i8 / 1i8 = -128i8`), all four division and remainder UB
+  paths (`-7i8 / 0i8`, `-128i8 / -1i8`, `-7i8 % 0i8`, `-128i8 % -1i8` via
+  `mirCall_ub` and direct checks of MiniRust's `throw_ub!` messages), and
+  converse error soundness (`divByZero_converse_error` via `mirCall_steps_error`).
+* `uncheckedArithI8`, a signed `i8` body exercising `MulUnchecked`,
+  `SubUnchecked`, and `AddUnchecked` both succeeding at the `i8::MIN` boundary
+  (`64i8 * -2i8 = -128i8`, `-128i8 - (-2i8) = -126i8`, `-126i8 + 127i8 = 1i8`
+  via `mirCall_ret` and `MirNoUBTree`) and faulting on each operator's signed
+  overflow UB (`mirCall_ub`, `mirCall_outcome`, and direct `Interp.steps` checks).
 
 ### Gaps
 
@@ -290,8 +307,8 @@ These are deliberate and are the first things to lift:
   visible leakage event; MiniRust has no counterpart, so `StepRel` matches it
   with an ordinary MiniRust step.
 * **Integers only.** No `bool` discriminants (`minimize` inserts a transmute),
-  no pointers, references, aggregates, non-integer casts, comparisons, checked
-  or unchecked arithmetic, calls, drops, or assertions.
+  no pointers, references, aggregates, non-integer casts, comparisons, bitwise
+  or shift binary operators, checked arithmetic, calls, drops, or assertions.
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.

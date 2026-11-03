@@ -40,8 +40,10 @@ here.
   (`spec/lang/step/statements.md`).
 * `PlaceExpr::Local` (`spec/lang/step/expressions.md`).
 * `ValueExpr::Constant` for `Constant::Int`/`Constant::Bool`, `ValueExpr::Load`,
-  `ValueExpr::UnOp` with `UnOp::Int(IntUnOp::Neg)`, and `ValueExpr::BinOp` with
-  `BinOp::Int` (`IntBinOp::{Add, Sub, Mul}`) (`spec/lang/step/expressions.md`,
+  `ValueExpr::UnOp` with `UnOp::Int` (`IntUnOp::{Neg, BitNot}`) and
+  `UnOp::Cast(CastOp::IntToInt)`, and `ValueExpr::BinOp` with `BinOp::Int`
+  (`IntBinOp::{Add, AddUnchecked, Sub, SubUnchecked, Mul, MulUnchecked, Div,
+  DivExact, Rem}`) (`spec/lang/step/expressions.md`,
   `spec/lang/step/operators.md`).
 * `Terminator::Goto`, `Terminator::Switch`, `Terminator::Unreachable`, and
   `Terminator::Return` (`spec/lang/step/terminators.md`), including frame
@@ -592,9 +594,9 @@ def mutateCurFrame (m : Mach) (f : Frame → Frame) : Interp Mach := do
     let threads ← listSet m.threads m.active_thread t' "mutate_at"
     pure { m with threads := threads }
 
-/-- `StackFrame::jump_to_block`:
+/-- `StackFrame::jump_to_block` (`spec/lang/machine.md`):
 > "self.next_block = b; self.next_stmt = Int::ZERO;"
-and `Machine::jump_to_block`:
+and `Machine::jump_to_block` (`spec/lang/step/terminators.md`):
 > "self.try_mutate_cur_frame(|frame, _mem| { frame.jump_to_block(block); ret(()) })" -/
 def jumpToBlock (m : Mach) (b : BbName) : Interp Mach :=
   mutateCurFrame m (fun fr => { fr with next_block := b, next_stmt := 0 })
@@ -668,6 +670,8 @@ def evalConstant : Constant → Interp Val
   | .Bool b => pure (.Bool b)
   | _ => unsupported "eval_constant for a pointer constant"
 
+/-! ## Operators (`spec/lang/step/operators.md`) -/
+
 /-- `Machine::eval_int_un_op` for `Neg` and `BitNot` (`spec/lang/step/operators.md`):
 > "fn eval_int_un_op(op: IntUnOp, operand: Int, operand_ty: IntType) -> Result<Int> {
 >     use IntUnOp::*;
@@ -707,7 +711,7 @@ def evalCastOp (castOp : CastOp) (arg : Val × «Type») : Interp (Val × «Type
   | .IntToInt _, _ => specPanic "non-integer input to int-to-int cast"
   | .Transmute _, _ => unsupported "eval_cast_op for CastOp::Transmute"
 
-/-- `Machine::eval_un_op` for `UnOp::Int` and `UnOp::Cast`:
+/-- `Machine::eval_un_op` for `UnOp::Int` and `UnOp::Cast` (`spec/lang/step/operators.md`):
 > "fn eval_un_op(&self, UnOp::Int(op): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
 >     let Type::Int(int_ty) = op_ty else { panic!(\"non-integer input to integer operation\") };
 >     let Value::Int(operand) = operand else { panic!(\"non-integer input to integer operation\") };
@@ -739,20 +743,104 @@ def evalUnOp (op : UnOp) (arg : Val × «Type») : Interp (Val × «Type») :=
   | .Cast castOp, arg => evalCastOp castOp arg
   | _, _ => unsupported "eval_un_op for an operator outside UnOp::Int and UnOp::Cast"
 
-/-- `Machine::eval_int_bin_op` for the wrapping arithmetic operators:
+/-- `Machine::eval_int_bin_op` for wrapping, unchecked, and division/remainder
+integer arithmetic (`spec/lang/step/operators.md`):
 > "Add => left + right,
->  ..
+>  AddUnchecked => {
+>      let result = left + right;
+>      if !left_ty.can_represent(result) {
+>          throw_ub!(\"overflow in unchecked add\");
+>      }
+>      result
+>  }
 >  Sub => left - right,
->  ..
->  Mul => left * right," -/
-def evalIntBinOp (op : IntBinOp) (left right : Int) (_leftTy : IntType) : Interp Int :=
+>  SubUnchecked => {
+>      let result = left - right;
+>      if !left_ty.can_represent(result) {
+>          throw_ub!(\"overflow in unchecked sub\");
+>      }
+>      result
+>  }
+>  Mul => left * right,
+>  MulUnchecked => {
+>      let result = left * right;
+>      if !left_ty.can_represent(result) {
+>          throw_ub!(\"overflow in unchecked mul\");
+>      }
+>      result
+>  }
+>  Div => {
+>      if right == 0 {
+>          throw_ub!(\"division by zero\");
+>      }
+>      let result = left / right;
+>      if !left_ty.can_represent(result) { // `int::MIN / -1` is UB
+>          throw_ub!(\"overflow in division\");
+>      }
+>      result
+>  }
+>  DivExact => {
+>      if right == 0 {
+>          throw_ub!(\"division by zero\");
+>      }
+>      let result = left / right;
+>      if !left_ty.can_represent(result) { // `int::MIN / -1` is UB
+>          throw_ub!(\"overflow in division\");
+>      }
+>      if left % right != 0 {
+>          throw_ub!(\"non-zero remainder in exact division\");
+>      }
+>      result
+>  }
+>  Rem => {
+>      if right == 0 {
+>          throw_ub!(\"modulus of remainder is zero\");
+>      }
+>      if !left_ty.can_represent(left / right) { // `int::MIN % -1` is UB
+>          throw_ub!(\"overflow in remainder\");
+>      }
+>      left % right
+>  }"
+On `libspecr::Int` (`num_bigint::BigInt`), Rust's `/` and `%` round toward zero
+(`Int.tdiv` and `Int.tmod`), whereas Euclidean remainder is written
+`.rem_euclid(..)` in the adjacent shift arm. -/
+def evalIntBinOp (op : IntBinOp) (left right : Int) (leftTy : IntType) : Interp Int :=
   match op with
   | .Add => pure (left + right)
+  | .AddUnchecked =>
+    let result := left + right
+    if !IntType.can_represent leftTy result then ub "overflow in unchecked add"
+    else pure result
   | .Sub => pure (left - right)
+  | .SubUnchecked =>
+    let result := left - right
+    if !IntType.can_represent leftTy result then ub "overflow in unchecked sub"
+    else pure result
   | .Mul => pure (left * right)
-  | _ => unsupported "eval_int_bin_op for an operator other than Add/Sub/Mul"
+  | .MulUnchecked =>
+    let result := left * right
+    if !IntType.can_represent leftTy result then ub "overflow in unchecked mul"
+    else pure result
+  | .Div =>
+    if right = 0 then ub "division by zero"
+    else
+      let result := Int.tdiv left right
+      if !IntType.can_represent leftTy result then ub "overflow in division"
+      else pure result
+  | .DivExact =>
+    if right = 0 then ub "division by zero"
+    else
+      let result := Int.tdiv left right
+      if !IntType.can_represent leftTy result then ub "overflow in division"
+      else if Int.tmod left right ≠ 0 then ub "non-zero remainder in exact division"
+      else pure result
+  | .Rem =>
+    if right = 0 then ub "modulus of remainder is zero"
+    else if !IntType.can_represent leftTy (Int.tdiv left right) then ub "overflow in remainder"
+    else pure (Int.tmod left right)
+  | _ => unsupported "eval_int_bin_op for a shift or bitwise operator"
 
-/-- `Machine::eval_bin_op` for `BinOp::Int`:
+/-- `Machine::eval_bin_op` for `BinOp::Int` (`spec/lang/step/operators.md`):
 > "let Type::Int(int_ty) = l_ty else { panic!(\"non-integer input to integer operation\") };
 >  let Value::Int(left) = left else { panic!(..) };
 >  let Value::Int(right) = right else { panic!(..) };
@@ -768,6 +856,8 @@ def evalBinOp (op : BinOp) (l : Val × «Type») (r : Val × «Type») : Interp 
     pure (.Int (IntType.bring_in_bounds intTy result), .Int intTy)
   | .Int _, _, _ => specPanic "non-integer input to integer operation"
   | _, _, _ => unsupported "eval_bin_op for a non-Int operator"
+
+/-! ## Value expressions (`spec/lang/step/expressions.md`) -/
 
 /-- `Machine::eval_value` for `Constant`, `Load`, `UnOp`, and `BinOp`:
 > "fn eval_value(&mut self, ValueExpr::Constant(constant, ty): ValueExpr) -> .. {
@@ -833,7 +923,7 @@ def evalStatement (m : Mach) : Statement → Interp Mach
 
 /-! ## Terminators (`spec/lang/step/terminators.md`) -/
 
-/-- `StackFrame::storage_dead`:
+/-- `StackFrame::storage_dead` (`spec/lang/step/statements.md`):
 > "let pointee_size = self.func.locals[local].layout::<M::T>().expect_size(..);
 >  let pointee_align = self.func.locals[local].layout::<M::T>().expect_align(..);
 >  if let Some(ptr) = self.locals.remove(local) {
@@ -900,7 +990,8 @@ def terminateActiveThread (m : Mach) : Interp Mach := do
       let sync := woken.foldl (fun s i => setInsert s (Int.ofNat i)) m.synchronized_threads
       pure { m with threads := threads, synchronized_threads := sync }
 
-/-- `Machine::eval_terminator` for `Terminator::Return`:
+/-- `Machine::eval_terminator` for `Terminator::Return`
+(`spec/lang/step/terminators.md`):
 > "let mut frame = self.mutate_cur_stack(|stack| stack.pop().unwrap());
 >  let callee_ty = frame.func.locals[frame.func.ret];
 >  let align = callee_ty.layout::<M::T>().expect_align(..);

@@ -50,6 +50,19 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
   `-1`), signed underflow wrapping (`-128i8 + (-1i8) = 127i8`), signed
   negative-by-negative `Mul` (`(-1i8) * (-2i8) = 2i8`), and end-to-end
   `MirNoUBTree` safety transfer (`signedEdgeMin_minirust_noUB`).
+* `castBitNot`: mixed-width (`i8` and `u32`) `UnaryOp(Not)` (`BitNot`) and
+  signed-widening / unsigned-narrowing `Cast(IntToInt)`.
+* `spinLoop`: diverging UB-free loop exercising `mirCall_diverges_steps_ok` and
+  lockstep `mirCall_diverges_rel` (`StateRel` + `Reaches` preserved for all `n`).
+* `divRemI8` and `remOnlyI8`: signed `i8` truncating-toward-zero `Div` and `Rem`
+  (`-7 / 3 = -2`, `-7 % 3 = -1`, `i8::MIN / 1 = -128`) plus all four division
+  and remainder UB conditions (`x / 0`, `i8::MIN / -1`, `x % 0`, `i8::MIN % -1`)
+  and converse `mirCall_steps_error`.
+* `uncheckedArithI8`: signed `i8` `MulUnchecked`, `SubUnchecked`, and
+  `AddUnchecked` both succeeding at the `i8::MIN` boundary (`64 * -2 = -128`,
+  `-128 - (-2) = -126`, `-126 + 127 = 1`) and triggering each operator's
+  signed overflow UB (`mirCall_ub`, `mirCall_outcome`, and direct checks of
+  MiniRust's `throw_ub!` messages).
 -/
 
 namespace MiniRustSpec.Correspondence.Witness
@@ -893,5 +906,447 @@ theorem spinLoop_minirust_steps_ok (n : Nat) :
     ∃ m', Interp.steps n spinLoopMInit = .ok m' :=
   mirCall_diverges_steps_ok spinLoop_inFragment spinLoop_translate ctx0 (ctx0_ok1 rfl) []
     (by decide) spinLoopMInit rfl rfl rfl spinLoop_noUB spinLoop_diverges n
+
+/-- Stronger lockstep divergence witness via `mirCall_diverges_rel`: for every
+`n : Nat`, `n + 1` MiniRust steps from `f.start` stay in `StateRel` with an
+Anneal state reachable via `Reaches (mirCallTree spinLoop [])`. -/
+theorem spinLoop_minirust_diverges_rel (n : Nat) :
+    ∃ s' m' tr, Interp.steps (n + 1) spinLoopMInit = .ok m' ∧
+      StateRel spinLoop spinLoopFn ctx0 s' m' ∧
+      Reaches (mirCallTree spinLoop []) tr (mirTree spinLoop s') :=
+  mirCall_diverges_rel spinLoop_inFragment spinLoop_translate ctx0 (ctx0_ok1 rfl) []
+    (by decide) spinLoopMInit rfl rfl rfl spinLoop_noUB spinLoop_diverges n
+
+/-! ## Signed `Div` and `Rem` (truncation toward zero and all 4 UB conditions) -/
+
+def ctxI8_3 : Ctx :=
+  { caller := callerFrameI8, payloads := [], base := [retAllocI8], addrs := [128, 256, 384],
+    nextBlock := bbName 7, unwindBlock := none, retPtr := retPtr }
+
+theorem ctxI8_ok3 {body : CapturedMir} (h : body.localDecls = [i8Decl, i8Decl, i8Decl]) :
+    CtxOk body ctxI8_3 where
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | 2, hd => simp at hd; subst hd; decide
+    | _ + 3, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MIR (`Runtime(PostCleanup)`) of
+```rust
+fn div_rem_i8(mut a: i8, b: i8) -> i8 {
+    let q = a / b;   // bb0: _0 = Div(copy _1, copy _2)
+    a = a % b;       //      _1 = Rem(copy _1, copy _2)
+    match q {        //      switchInt(copy _0) -> [-2i8: bb1, otherwise: bb2]
+        -2 => a,     // bb1: _0 = Use(copy _1); return
+        _  => q,     // bb2: return
+    }
+}
+```
+where `-2i8` has bit pattern `254`. -/
+def divRemI8 : CapturedMir where
+  defPath := "witness::div_rem_i8"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [i8Decl, i8Decl, i8Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .div (.copy (local_ 1)) (.copy (local_ 2)))),
+        mkStmt (.assign (local_ 1) (.binaryOp .rem (.copy (local_ 1)) (.copy (local_ 2))))],
+      terminator := mkTerm (.switchInt (.copy (local_ 0))
+        { branches := [(254, 1)], otherwise := 2 }),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.use (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem divRemI8_inFragment : inFragment divRemI8 = true := by decide
+
+def divRemI8Fn : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i8)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Div) (.Load (.Local (localName 1))) (.Load (.Local (localName 2)))),
+      .Assign (.Local (localName 1))
+        (.BinOp (.Int .Rem) (.Load (.Local (localName 1))) (.Load (.Local (localName 2))))],
+      .Switch (.Load (.Local (localName 0))) ⟨[(-2, bbName 1)]⟩ (bbName 2), .Regular⟩),
+    (bbName 1, ⟨[.Assign (.Local (localName 0)) (.Load (.Local (localName 1)))],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[], .Return, .Regular⟩),
+    (bbName 3, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 3
+  implicit_writes := true
+
+theorem divRemI8_translate : translateFn divRemI8 = some divRemI8Fn := rfl
+
+/-- Input `(-7i8, 3i8)` (bits `249`, `3`): truncating division gives `-7 / 3 = -2`
+(bits `254`, taking `bb1`), and truncating remainder gives `-7 % 3 = -1`
+(bits `255`), returned in `_0`. -/
+def divRemNeg7S0 : MachineState := initMachineState divRemI8 [.scalar ⟨249, 1⟩, .scalar ⟨3, 1⟩]
+def divRemNeg7MInit : Mach :=
+  machineWithCtx ctxI8_3 divRemI8 divRemI8Fn divRemNeg7S0.frame.locals divRemI8Fn.start
+
+def divRemNeg7Trace : List (Event MirEffect) :=
+  [⟨.inr (.inl (.emit (.event 254))), PUnit.unit⟩]
+
+theorem divRemNeg7_anneal_ret :
+    ReachesRet (mirCallTree divRemI8 [.scalar ⟨249, 1⟩, .scalar ⟨3, 1⟩]) divRemNeg7Trace
+      (.normal (.scalar ⟨255, 1⟩, divRemNeg7S0.memory)) :=
+  runA_sound divRemI8 10 _ _ _ rfl
+
+theorem divRemNeg7_noUB : MirNoUBTree (mirCallTree divRemI8 [.scalar ⟨249, 1⟩, .scalar ⟨3, 1⟩]) :=
+  runA_noUB divRemI8 10 _ _ _ rfl
+
+theorem divRemNeg7_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n divRemNeg7MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 255 } ∧
+      m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret divRemI8_inFragment divRemI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+      [.scalar ⟨249, 1⟩, .scalar ⟨3, 1⟩] (by decide) divRemNeg7MInit rfl rfl rfl divRemNeg7_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [divRemI8] at hd; subst hd
+  simp [retPtr, ctxI8_3] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_3] at hr; subst hr
+  have hbits : bits = 255 := by
+    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxI8_3, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+
+theorem divRemNeg7_minirust_direct :
+    (Interp.steps 6 divRemNeg7MInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 255 }, [1]) := rfl
+
+/-- Non-UB signed boundary `(-128i8, 1i8)` (`i8::MIN / 1 = -128i8`, bits `128`). -/
+def divRemMinOneS0 : MachineState := initMachineState divRemI8 [.scalar ⟨128, 1⟩, .scalar ⟨1, 1⟩]
+def divRemMinOneMInit : Mach :=
+  machineWithCtx ctxI8_3 divRemI8 divRemI8Fn divRemMinOneS0.frame.locals divRemI8Fn.start
+
+def divRemMinOneTrace : List (Event MirEffect) :=
+  [⟨.inr (.inl (.emit (.event 128))), PUnit.unit⟩]
+
+theorem divRemMinOne_anneal_ret :
+    ReachesRet (mirCallTree divRemI8 [.scalar ⟨128, 1⟩, .scalar ⟨1, 1⟩]) divRemMinOneTrace
+      (.normal (.scalar ⟨128, 1⟩, divRemMinOneS0.memory)) :=
+  runA_sound divRemI8 10 _ _ _ rfl
+
+theorem divRemMinOne_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n divRemMinOneMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 128 } ∧
+      m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret divRemI8_inFragment divRemI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+      [.scalar ⟨128, 1⟩, .scalar ⟨1, 1⟩] (by decide) divRemMinOneMInit rfl rfl rfl divRemMinOne_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [divRemI8] at hd; subst hd
+  simp [retPtr, ctxI8_3] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_3] at hr; subst hr
+  have hbits : bits = 128 := by
+    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxI8_3, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+
+theorem divRemMinOne_minirust_direct :
+    (Interp.steps 5 divRemMinOneMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 128 }, [1]) := rfl
+
+/-- Division-by-zero UB (`-7i8 / 0i8`) via `mirCall_ub`, `mirCall_steps_error`,
+and direct check of MiniRust's `"division by zero"` message. -/
+def divByZeroS0 : MachineState := initMachineState divRemI8 [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩]
+def divByZeroMInit : Mach :=
+  machineWithCtx ctxI8_3 divRemI8 divRemI8Fn divByZeroS0.frame.locals divRemI8Fn.start
+
+theorem divByZero_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree divRemI8 [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound divRemI8 5 _ (by decide)
+
+theorem divByZero_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n divByZeroMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := divByZero_anneal_ub
+  exact mirCall_ub divRemI8_inFragment divRemI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+    [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩] (by decide) divByZeroMInit rfl rfl rfl hr hf
+
+theorem divByZero_minirust_direct :
+    Interp.steps 2 divByZeroMInit = .error (.ub "division by zero") := rfl
+
+/-- Converse `mirCall_steps_error` witness: MiniRust's 2-step error on
+`divByZeroMInit` implies Anneal `mirCallTree` reaches `FaultNow` (or already
+returned, which is ruled out on `divByZero`). -/
+theorem divByZero_converse_error :
+    (∃ msg, Stop.ub "division by zero" = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree divRemI8 [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩]) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 2 ∧ Interp.steps k divByZeroMInit = .ok mRet ∧
+      ReturnRel divRemI8 ctxI8_3 s' v mRet ∧
+      ReachesRet (mirCallTree divRemI8 [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩]) tr (.normal (v, mem))) :=
+  mirCall_steps_error divRemI8_inFragment divRemI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+    [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩] (by decide) divByZeroMInit rfl rfl rfl
+    divByZero_minirust_direct
+
+/-- Signed division overflow UB (`i8::MIN / -1`, bits `128` and `255`). -/
+def divMinNeg1S0 : MachineState := initMachineState divRemI8 [.scalar ⟨128, 1⟩, .scalar ⟨255, 1⟩]
+def divMinNeg1MInit : Mach :=
+  machineWithCtx ctxI8_3 divRemI8 divRemI8Fn divMinNeg1S0.frame.locals divRemI8Fn.start
+
+theorem divMinNeg1_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree divRemI8 [.scalar ⟨128, 1⟩, .scalar ⟨255, 1⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound divRemI8 5 _ (by decide)
+
+theorem divMinNeg1_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n divMinNeg1MInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := divMinNeg1_anneal_ub
+  exact mirCall_ub divRemI8_inFragment divRemI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+    [.scalar ⟨128, 1⟩, .scalar ⟨255, 1⟩] (by decide) divMinNeg1MInit rfl rfl rfl hr hf
+
+theorem divMinNeg1_minirust_direct :
+    Interp.steps 2 divMinNeg1MInit = .error (.ub "overflow in division") := rfl
+
+/-- Standalone `Rem` body (`_0 = Rem(copy _1, copy _2); return`) so `Rem`'s own
+zero-divisor and `i8::MIN % -1` UB branches execute without `Div` faulting first. -/
+def remOnlyI8 : CapturedMir where
+  defPath := "witness::rem_only_i8"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [i8Decl, i8Decl, i8Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .rem (.copy (local_ 1)) (.copy (local_ 2))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem remOnlyI8_inFragment : inFragment remOnlyI8 = true := by decide
+
+def remOnlyI8Fn : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i8)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Rem) (.Load (.Local (localName 1))) (.Load (.Local (localName 2))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem remOnlyI8_translate : translateFn remOnlyI8 = some remOnlyI8Fn := rfl
+
+def remByZeroS0 : MachineState := initMachineState remOnlyI8 [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩]
+def remByZeroMInit : Mach :=
+  machineWithCtx ctxI8_3 remOnlyI8 remOnlyI8Fn remByZeroS0.frame.locals remOnlyI8Fn.start
+
+theorem remByZero_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree remOnlyI8 [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound remOnlyI8 5 _ (by decide)
+
+theorem remByZero_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n remByZeroMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := remByZero_anneal_ub
+  exact mirCall_ub remOnlyI8_inFragment remOnlyI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+    [.scalar ⟨249, 1⟩, .scalar ⟨0, 1⟩] (by decide) remByZeroMInit rfl rfl rfl hr hf
+
+theorem remByZero_minirust_direct :
+    Interp.steps 2 remByZeroMInit = .error (.ub "modulus of remainder is zero") := rfl
+
+def remMinNeg1S0 : MachineState := initMachineState remOnlyI8 [.scalar ⟨128, 1⟩, .scalar ⟨255, 1⟩]
+def remMinNeg1MInit : Mach :=
+  machineWithCtx ctxI8_3 remOnlyI8 remOnlyI8Fn remMinNeg1S0.frame.locals remOnlyI8Fn.start
+
+theorem remMinNeg1_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree remOnlyI8 [.scalar ⟨128, 1⟩, .scalar ⟨255, 1⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound remOnlyI8 5 _ (by decide)
+
+theorem remMinNeg1_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n remMinNeg1MInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := remMinNeg1_anneal_ub
+  exact mirCall_ub remOnlyI8_inFragment remOnlyI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+    [.scalar ⟨128, 1⟩, .scalar ⟨255, 1⟩] (by decide) remMinNeg1MInit rfl rfl rfl hr hf
+
+theorem remMinNeg1_minirust_direct :
+    Interp.steps 2 remMinNeg1MInit = .error (.ub "overflow in remainder") := rfl
+
+/-! ## Unchecked arithmetic (`MulUnchecked`, `SubUnchecked`, `AddUnchecked`) -/
+
+/-- MIR (`Runtime(PostCleanup)`) of
+```rust
+unsafe fn unchecked_arith_i8(a: i8, b: i8) -> i8 {
+    let p = a.unchecked_mul(b);   // bb0: _0 = MulUnchecked(copy _1, copy _2)
+    let d = p.unchecked_sub(b);   //      _0 = SubUnchecked(copy _0, copy _2)
+    d.unchecked_add(127)          //      _0 = AddUnchecked(copy _0, const 127i8); return
+}
+```
+Exercises all three unchecked operators both succeeding at the `i8::MIN`
+boundary and faulting with UB on signed overflow. -/
+def uncheckedArithI8 : CapturedMir where
+  defPath := "witness::unchecked_arith_i8"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [i8Decl, i8Decl, i8Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .mulUnchecked (.copy (local_ 1)) (.copy (local_ 2)))),
+        mkStmt (.assign (local_ 0) (.binaryOp .subUnchecked (.copy (local_ 0)) (.copy (local_ 2)))),
+        mkStmt (.assign (local_ 0) (.binaryOp .addUnchecked (.copy (local_ 0)) (constI8 127)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem uncheckedArithI8_inFragment : inFragment uncheckedArithI8 = true := by decide
+
+def uncheckedArithI8Fn : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i8)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .MulUnchecked) (.Load (.Local (localName 1))) (.Load (.Local (localName 2)))),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .SubUnchecked) (.Load (.Local (localName 0))) (.Load (.Local (localName 2)))),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .AddUnchecked) (.Load (.Local (localName 0))) (.Constant (.Int 127) (.Int i8)))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem uncheckedArithI8_translate : translateFn uncheckedArithI8 = some uncheckedArithI8Fn := rfl
+
+/-- Boundary success `(64i8, -2i8)` (bits `64`, `254`):
+`64 * -2 = -128` (`i8::MIN`), `-128 - (-2) = -126`, `-126 + 127 = 1`. -/
+def uncheckedOkS0 : MachineState := initMachineState uncheckedArithI8 [.scalar ⟨64, 1⟩, .scalar ⟨254, 1⟩]
+def uncheckedOkMInit : Mach :=
+  machineWithCtx ctxI8_3 uncheckedArithI8 uncheckedArithI8Fn uncheckedOkS0.frame.locals uncheckedArithI8Fn.start
+
+theorem uncheckedOk_anneal_ret :
+    ReachesRet (mirCallTree uncheckedArithI8 [.scalar ⟨64, 1⟩, .scalar ⟨254, 1⟩]) []
+      (.normal (.scalar ⟨1, 1⟩, uncheckedOkS0.memory)) :=
+  runA_sound uncheckedArithI8 10 _ _ _ rfl
+
+theorem uncheckedOk_noUB :
+    MirNoUBTree (mirCallTree uncheckedArithI8 [.scalar ⟨64, 1⟩, .scalar ⟨254, 1⟩]) :=
+  runA_noUB uncheckedArithI8 10 _ _ _ rfl
+
+theorem uncheckedOk_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n uncheckedOkMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 1 } ∧
+      m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret uncheckedArithI8_inFragment uncheckedArithI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+      [.scalar ⟨64, 1⟩, .scalar ⟨254, 1⟩] (by decide) uncheckedOkMInit rfl rfl rfl uncheckedOk_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [uncheckedArithI8] at hd; subst hd
+  simp [retPtr, ctxI8_3] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_3] at hr; subst hr
+  have hbits : bits = 1 := by
+    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxI8_3, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+
+theorem uncheckedOk_minirust_direct :
+    (Interp.steps 5 uncheckedOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 1 }, [1]) := rfl
+
+/-- `MulUnchecked` overflow `(-64i8, -2i8)` (`+128` overflows `i8`). -/
+def uncheckedMulUbS0 : MachineState := initMachineState uncheckedArithI8 [.scalar ⟨192, 1⟩, .scalar ⟨254, 1⟩]
+def uncheckedMulUbMInit : Mach :=
+  machineWithCtx ctxI8_3 uncheckedArithI8 uncheckedArithI8Fn uncheckedMulUbS0.frame.locals uncheckedArithI8Fn.start
+
+theorem uncheckedMulUb_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree uncheckedArithI8 [.scalar ⟨192, 1⟩, .scalar ⟨254, 1⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound uncheckedArithI8 5 _ (by decide)
+
+theorem uncheckedMulUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n uncheckedMulUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := uncheckedMulUb_anneal_ub
+  exact mirCall_ub uncheckedArithI8_inFragment uncheckedArithI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+    [.scalar ⟨192, 1⟩, .scalar ⟨254, 1⟩] (by decide) uncheckedMulUbMInit rfl rfl rfl hr hf
+
+theorem uncheckedMulUb_minirust_direct :
+    Interp.steps 2 uncheckedMulUbMInit = .error (.ub "overflow in unchecked mul") := rfl
+
+/-- `SubUnchecked` overflow `(-64i8, 2i8)` (`-64 * 2 = -128` succeeds, then
+`-128 - 2 = -130` overflows `i8`). -/
+def uncheckedSubUbS0 : MachineState := initMachineState uncheckedArithI8 [.scalar ⟨192, 1⟩, .scalar ⟨2, 1⟩]
+def uncheckedSubUbMInit : Mach :=
+  machineWithCtx ctxI8_3 uncheckedArithI8 uncheckedArithI8Fn uncheckedSubUbS0.frame.locals uncheckedArithI8Fn.start
+
+theorem uncheckedSubUb_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree uncheckedArithI8 [.scalar ⟨192, 1⟩, .scalar ⟨2, 1⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound uncheckedArithI8 5 _ (by decide)
+
+theorem uncheckedSubUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n uncheckedSubUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := uncheckedSubUb_anneal_ub
+  exact mirCall_ub uncheckedArithI8_inFragment uncheckedArithI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+    [.scalar ⟨192, 1⟩, .scalar ⟨2, 1⟩] (by decide) uncheckedSubUbMInit rfl rfl rfl hr hf
+
+theorem uncheckedSubUb_minirust_direct :
+    Interp.steps 3 uncheckedSubUbMInit = .error (.ub "overflow in unchecked sub") := rfl
+
+/-- `AddUnchecked` overflow `(10i8, 2i8)` (`10 * 2 = 20`, `20 - 2 = 18`, then
+`18 + 127 = 145` overflows `i8`), plus a witness of `mirCall_outcome`. -/
+def uncheckedAddUbS0 : MachineState := initMachineState uncheckedArithI8 [.scalar ⟨10, 1⟩, .scalar ⟨2, 1⟩]
+def uncheckedAddUbMInit : Mach :=
+  machineWithCtx ctxI8_3 uncheckedArithI8 uncheckedArithI8Fn uncheckedAddUbS0.frame.locals uncheckedArithI8Fn.start
+
+theorem uncheckedAddUb_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree uncheckedArithI8 [.scalar ⟨10, 1⟩, .scalar ⟨2, 1⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound uncheckedArithI8 5 _ (by decide)
+
+theorem uncheckedAddUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n uncheckedAddUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := uncheckedAddUb_anneal_ub
+  exact mirCall_ub uncheckedArithI8_inFragment uncheckedArithI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+    [.scalar ⟨10, 1⟩, .scalar ⟨2, 1⟩] (by decide) uncheckedAddUbMInit rfl rfl rfl hr hf
+
+theorem uncheckedAddUb_minirust_direct :
+    Interp.steps 4 uncheckedAddUbMInit = .error (.ub "overflow in unchecked add") := rfl
+
+theorem uncheckedAddUb_outcome (n : Nat) :
+    (∃ s' m' tr, Interp.steps (n + 1) uncheckedAddUbMInit = .ok m' ∧
+      StateRel uncheckedArithI8 uncheckedArithI8Fn ctxI8_3 s' m' ∧
+      Reaches (mirCallTree uncheckedArithI8 [.scalar ⟨10, 1⟩, .scalar ⟨2, 1⟩]) tr
+        (mirTree uncheckedArithI8 s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ n + 1 ∧ Interp.steps k uncheckedAddUbMInit = .ok mRet ∧
+      ReturnRel uncheckedArithI8 ctxI8_3 s' v mRet ∧
+      ReachesRet (mirCallTree uncheckedArithI8 [.scalar ⟨10, 1⟩, .scalar ⟨2, 1⟩]) tr (.normal (v, mem))) ∨
+    (∃ msg, Interp.steps (n + 1) uncheckedAddUbMInit = .error (.ub msg) ∧
+      ∃ tr u, Reaches (mirCallTree uncheckedArithI8 [.scalar ⟨10, 1⟩, .scalar ⟨2, 1⟩]) tr u ∧ FaultNow u) :=
+  mirCall_outcome uncheckedArithI8_inFragment uncheckedArithI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+    [.scalar ⟨10, 1⟩, .scalar ⟨2, 1⟩] (by decide) uncheckedAddUbMInit rfl rfl rfl n
 
 end MiniRustSpec.Correspondence.Witness
