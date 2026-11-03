@@ -42,6 +42,11 @@ audited):
   (`Name::from_internal`), which we represent as a `Nat`.
 * `DynWrite` is the output sink of `PrintStdout`/`PrintStderr`; we record the
   sequence of written strings.
+* `Nondet` is an opaque type constructor (`Type → Type`), matching upstream's
+  `spec/prelude/main.md`, which leaves the encoding of the non-determinism
+  monad opaque rather than collapsing it to a deterministic value wrapper.
+* `NdResult T E` is `Nondet (Except E T)` (`Nondet<Result<T, E>>`), matching
+  upstream's `README.md` so non-deterministic choices sit outside fallibility.
 -/
 
 namespace MiniRustSpec.LibSpecr
@@ -98,12 +103,17 @@ structure PhantomData (T : Type) : Type where
 structure DynWrite : Type where
   written : List String
 
-/-- `libspecr::Nondet<T>`: the non-determinism monad wrapper (`pub struct Nondet<T>(pub T);`). -/
-structure Nondet (T : Type) : Type where
-  val : T
-  deriving DecidableEq
+/-- `libspecr::Nondet<T>`: the opaque non-determinism monad.
 
-/-- `libspecr::NdResult<T, E>`: `Result<Nondet<T>, E>`. -/
-abbrev NdResult (T : Type := Unit) (E : Type := Empty) : Type := Except E (Nondet T)
+> "/// We leave the encoding of the non-determinism monad opaque.
+> pub use libspecr::Nondet;" (`spec/prelude/main.md`) -/
+opaque Nondet : Type → Type
+
+/-- `libspecr::NdResult<T, E>`: the combined non-determinism and fallibility
+monad `Nondet<Result<T, E>>`.
+
+> "The combined monad `Nondet<Result<T>>` is abbreviated `NdResult<T>`"
+(`README.md`) -/
+abbrev NdResult (T : Type := Unit) (E : Type := Empty) : Type := Nondet (Except E T)
 
 end MiniRustSpec.LibSpecr

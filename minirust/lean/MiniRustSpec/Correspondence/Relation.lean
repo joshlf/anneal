@@ -149,6 +149,58 @@ structure StateRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : Mach
   protectors : s.memory.activeProtectors = []
   callerLocals : s.memory.callerLocals = []
 
+/-- Initial-entry relation at MiniRust's `f.start` (`minimize`'s synthesized
+entry block `bbName body.basicBlocks.length`) and Anneal's entry point
+(`blockIdx = 0`, `stmtIdx = 0`). One `Machine::step` executes `initBlock`
+(`Goto(bb0)`) and lands in `StateRel`, without requiring a phantom `bb0`
+machine. -/
+structure StartRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : MachineState)
+    (mInit : Mach) : Prop where
+  threads : mInit.threads =
+    [thread1 ctx [ctx.caller,
+      { calleeFrame f ctx body.localDecls.length 0 0 with next_block := f.start }]]
+  active : mInit.active_thread = 0
+  allocs : mInit.mem.memory.allocations = ctx.base ++ localAllocs ctx body.localDecls s.frame.locals
+  blk0 : s.frame.blockIdx = 0
+  stmt0 : s.frame.stmtIdx = 0
+  hasBlocks : 0 < body.basicBlocks.length
+  nlocals : s.frame.locals.length = body.localDecls.length
+  slots : ∀ (i : Nat) d slot, body.localDecls[i]? = some d → s.frame.locals[i]? = some slot →
+    SlotOk (itOf d) slot
+  addrs : ∀ (i : Nat) d, body.localDecls[i]? = some d →
+    ctx.addrs.getD i 0 % ((itOf d).size.bytes : Int) = 0
+  ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (itOf d)
+  borrows : s.memory.borrows = []
+  callStack : s.memory.callStack = []
+  activeCallee : s.memory.activeCallee = none
+  protectors : s.memory.activeProtectors = []
+  callerLocals : s.memory.callerLocals = []
+
+/-- Well-formed caller context for executing `body`: every callee local address
+is aligned for its integer type, and the caller's return place is a live,
+aligned allocation of `_0`'s byte size. -/
+structure CtxOk (body : CapturedMir) (ctx : Ctx) : Prop where
+  addrs : ∀ (i : Nat) d, body.localDecls[i]? = some d →
+    ctx.addrs.getD i 0 % ((itOf d).size.bytes : Int) = 0
+  ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (itOf d)
+
+/-- Decidable well-typedness of an incoming argument `v` for integer parameter
+type `it`. -/
+def argOk (it : Gen.IntType) : Value → Bool
+  | .scalar sc => decide (sc.sizeBytes = it.size.bytes) && decide (sc.bits < 2 ^ (8 * it.size.bytes))
+  | _ => false
+
+/-- Decidable well-typedness of argument values `args` against parameter
+declarations `decls` (`_1 .. _argCount`). -/
+def argsOkAux : List LocalDecl → List Value → Bool
+  | [], [] => true
+  | d :: ds, v :: vs => argOk (itOf d) v && argsOkAux ds vs
+  | _, _ => false
+
+/-- Decidable well-typedness of `args` for `mirCallTree body args`. -/
+def argsOk (body : CapturedMir) (args : List Value) : Bool :=
+  argsOkAux body.localDecls.tail args
+
 /-- The MiniRust machine after the callee returned value `v` from state `s`:
 the callee frame is gone, the caller continues at `nextBlock`, the return
 place holds the encoding of `v`, and every callee allocation is dead. -/

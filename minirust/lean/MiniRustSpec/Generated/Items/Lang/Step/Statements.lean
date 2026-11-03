@@ -63,7 +63,7 @@ def impl_Machine__eval_statement_0 : Item :=
                   (Ty.path none (Path.mk false [(PathSegment.mk "M" PathArguments.none)])))]))]))
     [
       (ImplItem.fn
-        [(Attr.mk true "specr::argmatch" (AttrMeta.list "statement"))]
+        [(Attr.mk true "specr::argmatch" (AttrMeta.list [(MetaItem.mk "statement" AttrMeta.path)]))]
         Visibility.inherited
         false
         (Signature.mk

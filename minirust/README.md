@@ -96,8 +96,8 @@ parses it with `syn`, and emits:
   syntax tree constructor for constructor. Each file's module ends with
   `items : List SourceItem` recording item name, source line, and the SHA-256
   of the item's token stream. The only lossy constructors are the explicit
-  `verbatim`/`tokens`/`AttrMeta.list` ones, and every use of them is counted
-  as *opaque* in `coverage.json`;
+  `verbatim`/`tokens`/`AttrMeta.listTokens` ones, and every use of them is
+  counted as *opaque* in `coverage.json`;
 * a **shallow embedding** of the spec's data types: every `struct`, `enum`,
   and `type` alias becomes a Lean `structure`, `inductive`, or `abbrev`; traits
   become classes of their associated types, and trait impls become instances.
@@ -109,10 +109,10 @@ parses it with `syn`, and emits:
 Coverage at the pinned commit (`coverage.json`): 27 spec files, 141 Rust
 blocks (all parsed), 250 items (135 `impl`, 39 `enum`, 37 `struct`, 12 `fn`,
 11 `type`, 7 `macro`, 6 `use`, 3 `trait`) containing 300 functions and
-methods; 47 931 syntax nodes translated structurally and 20 opaquely (13
-attribute argument lists such as `#[specr::argmatch(statement)]`, 7 macro
-bodies that are not expression lists); 100 of 100 data types shallowly
-embedded (0 skipped).
+methods; 47 957 syntax nodes translated structurally and 7 opaquely (99.985%
+structural: 26 of 27 spec files have 0 opaque nodes, and the 7 opaque nodes are
+exclusively the 7 `macro_rules! throw*` declarative macro bodies in
+`spec/prelude/main.md`); 100 of 100 data types shallowly embedded (0 skipped).
 
 The generated model is not executable: the deep embedding is syntax. The
 executable meaning of the fragment is `Interp.lean`.
@@ -162,18 +162,20 @@ restricted to the fragment checked by `inFragment`:
 
 ### States
 
-`Correspondence/Relation.lean` defines `StateRel body f ctx s m`: the MiniRust
-machine has one enabled thread whose stack is `[caller, callee]`; the callee
-runs `f` at the same program point as Anneal's frame; every MIR local `_i` is
-a live MiniRust local pointing to its own `Stack` allocation whose bytes are
-the encoding of Anneal's slot (`Uninit` bytes for an uninitialized slot,
+`Correspondence/Relation.lean` defines `StateRel body f ctx s m` (for execution
+within MIR blocks) and `StartRel body f ctx s mInit` (for entry at `minimize`'s
+synthesized `f.start` block without requiring a phantom `bb0` machine): the
+MiniRust machine has one enabled thread whose stack is `[caller, callee]`; the
+callee runs `f` at the corresponding program point; every MIR local `_i` is a
+live MiniRust local pointing to its own `Stack` allocation whose bytes are the
+encoding of Anneal's slot (`Uninit` bytes for an uninitialized slot,
 little-endian bytes for an initialized scalar); the caller's return place is a
-live, large-enough, aligned allocation; and Anneal's memory has no borrows,
-protectors, call stack, or caller-owned referents. `ctx` fixes everything the
-callee does not determine: caller frame, unwind payloads, the allocations
-below the callee's locals, the locals' addresses (arbitrary, subject only to
-alignment, so every MiniRust address choice is covered), and the caller's
-continuation.
+live, large-enough, aligned allocation (`CtxOk`); and Anneal's memory has no
+borrows, protectors, call stack, or caller-owned referents. `ctx` fixes
+everything the callee does not determine: caller frame, unwind payloads, the
+allocations below the callee's locals, the locals' addresses (arbitrary,
+subject only to alignment, so every MiniRust address choice is covered), and
+the caller's continuation.
 
 ### Theorems
 
@@ -190,18 +192,26 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
   the caller (`ReturnRel`); Anneal UB matches MiniRust UB (`throw_ub!`, never a
   spec panic, deadlock, or unsupported construct); every other Anneal outcome,
   including `unsupported`, is impossible.
-* `step_initBlock`, `step_start` (`Simulation.lean`): proves for every
-  translated function `f` that `minimize`'s synthesized entry block
-  (`f.start = bbName body.basicBlocks.length`) steps in 1 step (`Goto bb0`) to
-  the `bb0` state related by `StateRel`.
-* `run_ret`, `run_ub`, `run_ret_from_start`, `run_ub_from_start` (`Run.lean`):
-  lifted to Anneal's interaction tree `mirTree body s` and the trusted
-  predicates `ReachesRet` / `Reaches` + `FaultNow`: if Anneal returns `v` (or
+* `step_initBlock`, `step_start`, `initMachineState_startRel`
+  (`Simulation.lean`): proves for every translated function `f` that
+  `initMachineState body args` (with `argsOk body args = true` and `CtxOk body ctx`)
+  satisfies `StartRel` at `f.start`, and that `minimize`'s synthesized entry
+  block (`f.start = bbName body.basicBlocks.length`) steps in 1 step (`Goto bb0`)
+  to `StateRel`.
+* `run_ret`, `run_ub`, `run_ret_from_start`, `run_ub_from_start`,
+  `mirCall_ret`, `mirCall_ub` (`Run.lean`): lifted to Anneal's interaction
+  trees `mirTree body s` and `mirCallTree body args`: if Anneal returns `v` (or
   can reach UB), then MiniRust started either at `bb0` or at `f.start` performs
   the corresponding return (or raises UB) within finitely many steps.
-* `steps_error` (`Run.lean`): conversely, if MiniRust stops with *any* error
-  within `n` steps of related states, the error is UB and Anneal can reach UB,
-  or Anneal returned before.
+* `steps_error`, `steps_error_from_start` (`Run.lean`): conversely, if MiniRust
+  stops with *any* error within `n` steps from `StateRel` or `StartRel`, either
+  the error is UB and Anneal can reach UB, or MiniRust already completed the
+  callee's return (`ReturnRel`, matching an Anneal `ReachesRet`) in `k < n`
+  steps and only errored later inside the unmodeled caller frame.
+* `mirNoUB_safe`, `mirNoUB_safe_from_start`, `mirCall_noUB`, `runA_noUB`
+  (`Run.lean`): if Anneal's interaction tree satisfies `MirNoUBTree`
+  (`TreeSafe`), MiniRust never stops with any error (`.ub`, `.specPanic`,
+  `.deadlock`, or `.unsupported`) anywhere during the callee's execution.
 
 ### Witnesses
 
@@ -211,17 +221,15 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
 
 * `sumTo`, the MIR of a `u32` loop with `switchInt`, wrapping `Add`/`Sub`,
   constants, and `Goto`: Anneal returns `6` for `n = 3`
-  (`sumTo_anneal_ret`); the initial states are related (`sumTo_rel`); the
-  theorem then yields a MiniRust return writing the bytes of `6u32` both from
-  `bb0` (`sumTo_minirust_ret`) and from `f.start`
-  (`sumTo_minirust_ret_from_start`), which agrees with direct 16-step and
-  17-step runs of the interpretation (`sumTo_minirust_direct`,
-  `sumTo_minirust_direct_from_start`). `sumTo_translate` spells out the
-  translated MiniRust function, and `sumTo_init_step` steps `minimize`'s init
-  block into the related initial machine.
+  (`sumTo_anneal_ret`, `sumTo_noUB`); the initial states are related
+  (`sumTo_rel`); the theorem then yields a MiniRust return writing the bytes of
+  `6u32` both from `bb0` (`sumTo_minirust_ret`) and from `f.start` via
+  `mirCall_ret` (`sumTo_minirust_ret_from_start`), which agrees with direct
+  16-step and 17-step runs (`sumTo_minirust_direct`,
+  `sumTo_minirust_direct_from_start`).
 * `retUninit`, a body returning an uninitialized `_0`: Anneal faults
   (`retUninit_anneal_ub`), hence MiniRust raises UB both from `bb0`
-  (`retUninit_minirust_ub`) and from `f.start`
+  (`retUninit_minirust_ub`) and from `f.start` via `mirCall_ub`
   (`retUninit_minirust_ub_from_start`), as a direct run confirms
   (`retUninit_minirust_direct`).
 * `negMention`, a body exercising `PlaceMention(_0)` (while `_0` is still
@@ -231,6 +239,14 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `negMention5_minirust_direct`); for `_1 = 0`, computes `-0 = 0` and takes
   the `Unreachable` branch to raise UB (`negMention0_minirust_ub_from_start`,
   confirmed by `negMention0_minirust_direct`).
+* `signedEdge`, a signed `i8` body exercising two's-complement sign-bit
+  decoding (`intFromBits`), `i8::MIN` (`-128i8`, bits `128`) wrapping negation
+  (`-(-128i8) = -128i8`), negative `switchInt` branch keys (`-128`, `-1`),
+  signed underflow wrapping (`-128i8 + (-1i8) = 127i8`), signed
+  negative-by-negative `Mul` (`(-1i8) * (-2i8) = 2i8`), and end-to-end
+  `MirNoUBTree` safety transfer (`signedEdgeMin_minirust_noUB`), confirmed by
+  direct 5-step runs (`signedEdgeMin_minirust_direct`,
+  `signedEdgeOne_minirust_direct`).
 
 ### Gaps
 

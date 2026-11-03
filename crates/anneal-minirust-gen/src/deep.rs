@@ -120,20 +120,24 @@ impl Emitter {
         }
     }
 
-    fn attr(&mut self, a: &syn::Attribute) -> Term {
-        let outer = matches!(a.style, syn::AttrStyle::Outer);
-        let path = tokens_of(a.path()).replace(' ', "");
-        let args = match &a.meta {
+    fn meta_args(&mut self, m: &syn::Meta) -> Term {
+        match m {
             syn::Meta::Path(_) => {
                 self.cov.hit("Attribute::Path");
                 Term::atom("AttrMeta.path")
             }
             syn::Meta::List(l) => {
-                // Attribute arguments (`#[specr::argmatch(x)]`, `#[allow(..)]`)
-                // are tool directives, not specr-lang expressions; we keep their
-                // tokens verbatim and count them as opaque.
-                self.cov.opaque("Attribute::List");
-                ctor("AttrMeta.list", vec![Term::str(&l.tokens.to_string())])
+                match l.parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated) {
+                    Ok(nested) => {
+                        self.cov.hit("Attribute::List");
+                        let items = nested.iter().map(|nm| self.meta_item(nm)).collect();
+                        ctor("AttrMeta.list", vec![Term::List(items)])
+                    }
+                    Err(_) => {
+                        self.cov.opaque("Attribute::List");
+                        ctor("AttrMeta.listTokens", vec![Term::str(&l.tokens.to_string())])
+                    }
+                }
             }
             syn::Meta::NameValue(nv) => {
                 self.cov.hit("Attribute::NameValue");
@@ -143,7 +147,19 @@ impl Emitter {
                 };
                 ctor("AttrMeta.nameValue", vec![Term::str(&value)])
             }
-        };
+        }
+    }
+
+    fn meta_item(&mut self, m: &syn::Meta) -> Term {
+        let path = tokens_of(m.path()).replace(' ', "");
+        let args = self.meta_args(m);
+        ctor("MetaItem.mk", vec![Term::str(&path), args])
+    }
+
+    fn attr(&mut self, a: &syn::Attribute) -> Term {
+        let outer = matches!(a.style, syn::AttrStyle::Outer);
+        let path = tokens_of(a.path()).replace(' ', "");
+        let args = self.meta_args(&a.meta);
         ctor("Attr.mk", vec![Term::bool(outer), Term::str(&path), args])
     }
 

@@ -37,18 +37,33 @@ elab "#assert_standard_axioms " ids:ident* : command => do
         throwError "{n} depends on the non-standard axiom {a}"
     logInfo m!"{n} depends on axioms: {axs.toList}"
 
+open MiniRustSpec.LibSpecr in
+#assert_standard_axioms
+  Nondet
+  NdResult
+
+#assert_standard_axioms MiniRustSpec.Gen.NdResult
+
 open MiniRustSpec.Correspondence in
 #assert_standard_axioms
   step_correspondence
   step_initBlock
   step_start
+  initMachineState_startRel
   reaches_rel
   run_ret
   run_ret_from_start
   run_ub
   run_ub_from_start
   steps_error
+  steps_error_from_start
+  mirNoUB_safe
+  mirNoUB_safe_from_start
+  mirCall_ret
+  mirCall_ub
+  mirCall_noUB
   runA_sound
+  runA_noUB
   faultsA_sound
   evalReturn_callee
   evalStatement_assign
@@ -68,6 +83,7 @@ open MiniRustSpec.Correspondence.Witness in
   sumTo_init_step
   sumTo_rel
   sumTo_anneal_ret
+  sumTo_noUB
   sumTo_minirust_ret
   sumTo_minirust_direct
   sumTo_minirust_ret_from_start
@@ -81,14 +97,24 @@ open MiniRustSpec.Correspondence.Witness in
   retUninit_minirust_ub_from_start
   negMention_inFragment
   negMention_translate
-  negMention5_rel
+  negMention5_startRel
   negMention5_anneal_ret
   negMention5_minirust_ret_from_start
   negMention5_minirust_direct
-  negMention0_rel
+  negMention0_startRel
   negMention0_anneal_ub
   negMention0_minirust_ub_from_start
   negMention0_minirust_direct
+  signedEdge_inFragment
+  signedEdge_translate
+  signedEdgeMin_anneal_ret
+  signedEdgeMin_noUB
+  signedEdgeMin_minirust_ret_from_start
+  signedEdgeMin_minirust_noUB
+  signedEdgeMin_minirust_direct
+  signedEdgeOne_anneal_ret
+  signedEdgeOne_minirust_ret_from_start
+  signedEdgeOne_minirust_direct
 
 #assert_standard_axioms MiniRustSpec.Anchors.anchors_ok
 

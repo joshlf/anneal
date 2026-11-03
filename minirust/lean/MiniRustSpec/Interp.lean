@@ -36,14 +36,16 @@ here.
   (`spec/lang/machine.md`). The daemonic thread choice `pick(..)` then has a
   unique solution; with more than one enabled thread we report
   `Stop.unsupported` instead of resolving the choice.
-* `Statement::Assign` (`spec/lang/step/statements.md`).
+* `Statement::Assign` and `Statement::PlaceMention`
+  (`spec/lang/step/statements.md`).
 * `PlaceExpr::Local` (`spec/lang/step/expressions.md`).
 * `ValueExpr::Constant` for `Constant::Int`/`Constant::Bool`, `ValueExpr::Load`,
-  and `ValueExpr::BinOp` with `BinOp::Int` (`spec/lang/step/expressions.md`,
+  `ValueExpr::UnOp` with `UnOp::Int(IntUnOp::Neg)`, and `ValueExpr::BinOp` with
+  `BinOp::Int` (`IntBinOp::{Add, Sub, Mul}`) (`spec/lang/step/expressions.md`,
   `spec/lang/step/operators.md`).
-* `Terminator::Goto`, `Terminator::Switch`, and `Terminator::Return`
-  (`spec/lang/step/terminators.md`), including frame teardown, `storage_dead`
-  of every local, and both stack-pop actions.
+* `Terminator::Goto`, `Terminator::Switch`, `Terminator::Unreachable`, and
+  `Terminator::Return` (`spec/lang/step/terminators.md`), including frame
+  teardown, `storage_dead` of every local, and both stack-pop actions.
 * The representation relation for `Type::Int` and `Type::Bool`
   (`spec/lang/representation.md`), `Type::layout` for those types
   (`spec/lang/types.md`), and `BasicMemory`'s `load`, `store`, `deallocate`,

@@ -77,7 +77,7 @@ def impl_Machine__eval_value_0 : Item :=
             "doc"
             (AttrMeta.nameValue
               " Calling this with a non-well-formed expression or it returning a non-well-formed value is a spec bug.")),
-          (Attr.mk true "specr::argmatch" (AttrMeta.list "val"))]
+          (Attr.mk true "specr::argmatch" (AttrMeta.list [(MetaItem.mk "val" AttrMeta.path)]))]
         Visibility.inherited
         false
         (Signature.mk
@@ -2250,7 +2250,7 @@ def impl_Machine__eval_place_0 : Item :=
             true
             "doc"
             (AttrMeta.nameValue " Like a raw pointer, the result can be misaligned or null!")),
-          (Attr.mk true "specr::argmatch" (AttrMeta.list "place"))]
+          (Attr.mk true "specr::argmatch" (AttrMeta.list [(MetaItem.mk "place" AttrMeta.path)]))]
         Visibility.inherited
         false
         (Signature.mk

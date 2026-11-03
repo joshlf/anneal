@@ -596,22 +596,123 @@ theorem step_initBlock {body : CapturedMir} {f : Gen.Function} (hf : translateFn
   rw [step_callee hshape initBlock hinit]
   simp [initBlock, Interp.evalTerminator, hm0, check_after h0]
 
-/-- If `s` is at the start of `bb0` (`blockIdx = 0`, `stmtIdx = 0`) and related
-to a machine at `bb0`, then a machine `mInit` at `f.start`
-(`bbName body.basicBlocks.length`) steps in one step to a machine related to
-`s`. -/
+/-- From `StartRel` (Anneal at `(0, 0)` and MiniRust at `f.start`), one
+`Machine::step` executes `minimize`'s `initBlock` (`Goto(bb0)`) and lands in
+`StateRel`. -/
 theorem step_start {body : CapturedMir} {f : Gen.Function} (hf : translateFn body = some f)
-    {ctx : Ctx} {s : MachineState} {m0 mInit : Mach} (hrel : StateRel body f ctx s m0)
-    (hb0 : s.frame.blockIdx = 0) (hs0 : s.frame.stmtIdx = 0)
-    (hinit : Shape mInit ctx
+    {ctx : Ctx} {s : MachineState} {mInit : Mach} (hstart : StartRel body f ctx s mInit) :
+    ∃ m0, Interp.step mInit = .ok m0 ∧ StateRel body f ctx s m0 := by
+  obtain ⟨hfstart, _⟩ := translateFn_start body f hf
+  have hframe : { calleeFrame f ctx body.localDecls.length 0 0 with next_block := f.start } =
+      calleeFrame f ctx body.localDecls.length body.basicBlocks.length 0 := by
+    simp [calleeFrame, hfstart]
+  have hshape : Shape mInit ctx
       [ctx.caller, calleeFrame f ctx body.localDecls.length body.basicBlocks.length 0]
-      (ctx.base ++ localAllocs ctx body.localDecls s.frame.locals)) :
-    ∃ m', Interp.step mInit = .ok m' ∧ StateRel body f ctx s m' := by
-  obtain ⟨m', hm', hshape'⟩ := step_initBlock hf hinit
-  refine ⟨m', hm', ?_⟩
-  have hgoto : gotoState s 0 = s := by
-    cases s; rename_i fr mem; cases fr; simp [gotoState] at hb0 hs0 ⊢; exact ⟨hb0.symm, hs0.symm⟩
-  rw [← hgoto]
-  exact hrel.goto 0 (hb0 ▸ hrel.blk) hshape'
+      (ctx.base ++ localAllocs ctx body.localDecls s.frame.locals) :=
+    ⟨hframe ▸ hstart.threads, hstart.active, hstart.allocs⟩
+  obtain ⟨m0, hm0, h0⟩ := step_initBlock hf hshape
+  refine ⟨m0, hm0, {
+    threads := by simpa [hstart.blk0, hstart.stmt0] using h0.threads
+    active := h0.active
+    allocs := h0.allocs
+    blk := by rw [hstart.blk0]; exact hstart.hasBlocks
+    stmt := fun _ _ => by rw [hstart.stmt0]; exact Nat.zero_le _
+    nlocals := hstart.nlocals
+    slots := hstart.slots
+    addrs := hstart.addrs
+    ret := hstart.ret
+    borrows := hstart.borrows
+    callStack := hstart.callStack
+    activeCallee := hstart.activeCallee
+    protectors := hstart.protectors
+    callerLocals := hstart.callerLocals
+  }⟩
+
+theorem initLocalsAux_one_spec (ds : List LocalDecl) (vs : List Value)
+    (h : argsOkAux ds vs = true) :
+    (initLocalsAux 1 ds vs).length = ds.length ∧
+    ∀ (k : Nat) d slot, ds[k]? = some d → (initLocalsAux 1 ds vs)[k]? = some slot →
+      SlotOk (itOf d) slot := by
+  induction ds generalizing vs with
+  | nil =>
+    cases vs with
+    | nil => simp [initLocalsAux]
+    | cons _ _ => simp [argsOkAux] at h
+  | cons d ds ih =>
+    cases vs with
+    | nil => simp [argsOkAux] at h
+    | cons v vs =>
+      simp only [argsOkAux, Bool.and_eq_true] at h
+      obtain ⟨hv, hvs⟩ := h
+      obtain ⟨hlen, hslots⟩ := ih vs hvs
+      have hvslot : SlotOk (itOf d) (.init v) := by
+        cases v <;> simp [argOk, SlotOk] at hv ⊢
+        exact hv
+      have hcons : initLocalsAux 1 (d :: ds) (v :: vs) = .init v :: initLocalsAux 1 ds vs := rfl
+      rw [hcons]
+      refine ⟨by simp [hlen], fun k d' slot' hd' hs' => ?_⟩
+      cases k with
+      | zero =>
+        simp at hd' hs'
+        subst hd'; subst hs'
+        exact hvslot
+      | succ k =>
+        simp at hd' hs'
+        exact hslots k d' slot' hd' hs'
+
+/-- General entry-state bridge: for any fragment `body`, well-typed `args`, and
+well-formed caller context `ctx`, Anneal's `initMachineState body args`
+(the initial state of `mirCallTree body args`) satisfies `StartRel` against any
+MiniRust machine positioned at `f.start` with matching stack and local
+allocations. -/
+theorem initMachineState_startRel {body : CapturedMir} {f : Gen.Function}
+    (hfrag : inFragment body = true) (ctx : Ctx) (hctx : CtxOk body ctx)
+    (args : List Value) (hargs : argsOk body args = true) (mInit : Mach)
+    (hthreads : mInit.threads =
+      [thread1 ctx [ctx.caller,
+        { calleeFrame f ctx body.localDecls.length 0 0 with next_block := f.start }]])
+    (hactive : mInit.active_thread = 0)
+    (hallocs : mInit.mem.memory.allocations =
+      ctx.base ++ localAllocs ctx body.localDecls (initMachineState body args).frame.locals) :
+    StartRel body f ctx (initMachineState body args) mInit := by
+  have hbne : body.basicBlocks ≠ [] := by
+    simp only [inFragment, Bool.and_eq_true, decide_eq_true_eq] at hfrag
+    exact hfrag.1.1.2
+  obtain ⟨_, hdeclLen, _⟩ := inFragment_spec body hfrag
+  cases hdecls : body.localDecls with
+  | nil => simp [hdecls] at hdeclLen
+  | cons d0 ds =>
+    have hargs' : argsOkAux ds args = true := by simpa [argsOk, hdecls] using hargs
+    obtain ⟨hlen, hslots⟩ := initLocalsAux_one_spec ds args hargs'
+    have hinit : (initMachineState body args).frame.locals = .uninit :: initLocalsAux 1 ds args := by
+      simp [initMachineState, hdecls, initLocalsAux]
+    refine {
+      threads := hthreads
+      active := hactive
+      allocs := hallocs
+      blk0 := rfl
+      stmt0 := rfl
+      hasBlocks := by cases hbbs : body.basicBlocks with | nil => exact absurd hbbs hbne | cons _ _ => simp
+      nlocals := by simp [hinit, hdecls, hlen]
+      slots := by
+        intro i d slot hd hs
+        rw [hdecls] at hd
+        rw [hinit] at hs
+        cases i with
+        | zero =>
+          simp at hd hs
+          subst hd; subst hs
+          trivial
+        | succ k =>
+          simp at hd hs
+          exact hslots k d slot hd hs
+      addrs := hctx.addrs
+      ret := hctx.ret
+      borrows := rfl
+      callStack := rfl
+      activeCallee := rfl
+      protectors := rfl
+      callerLocals := rfl
+    }
 
 end MiniRustSpec.Correspondence

@@ -243,8 +243,9 @@ fn item_kinds_match_independent_parse() {
 }
 
 /// Every opaque node reported in `coverage.json` is visible as an opaque
-/// constructor in the generated Lean, and vice versa; in the pinned snapshot,
-/// both opaque AST nodes and skipped shallow data types are zero.
+/// constructor in the generated Lean, and vice versa. In the pinned snapshot,
+/// the only opaque AST nodes are the 7 `macro_rules!` bodies (`do yeet ..`) in
+/// `spec/prelude/main.md`, and skipped shallow data types are zero (100/100).
 #[test]
 fn opaque_nodes_are_reported() {
     let g = pipeline::generate(&layout()).unwrap();
@@ -254,11 +255,13 @@ fn opaque_nodes_are_reported() {
     let mut opaque_in_lean = 0;
     for (rel, text) in &g.files {
         if rel.starts_with("lean/MiniRustSpec/Generated/Items/") {
-            opaque_in_lean +=
-                text.matches("AttrMeta.list").count() + text.matches("MacroBody.tokens").count() + text.matches(".verbatim").count();
+            opaque_in_lean += text.matches("AttrMeta.listTokens").count()
+                + text.matches("MacroBody.tokens").count()
+                + text.matches(".verbatim").count();
         }
     }
     assert_eq!(opaque, opaque_in_lean, "opaque node count");
+    assert_eq!(opaque, 7, "expected only the 7 macro_rules! bodies in spec/prelude/main.md to be opaque");
     assert!(
         cov.contains("\"shallow_types\": {\"translated\": 100, \"candidates\": 100,"),
         "expected 100/100 shallow data types translated"

@@ -53,7 +53,7 @@ def impl_Type__decode_0 : Item :=
             "doc"
             (AttrMeta.nameValue
               " Assumes `self` is well formed and `bytes.len()` matches the types size (violating this is a spec bug).")),
-          (Attr.mk true "specr::argmatch" (AttrMeta.list "self"))]
+          (Attr.mk true "specr::argmatch" (AttrMeta.list [(MetaItem.mk "self" AttrMeta.path)]))]
         Visibility.inherited
         false
         (Signature.mk
@@ -149,7 +149,7 @@ def impl_Type__decode_0 : Item :=
             "doc"
             (AttrMeta.nameValue
               " Assumes `self` is well formed and `val` is well-formed for this type (violating this is a spec bug)..")),
-          (Attr.mk true "specr::argmatch" (AttrMeta.list "self"))]
+          (Attr.mk true "specr::argmatch" (AttrMeta.list [(MetaItem.mk "self" AttrMeta.path)]))]
         Visibility.inherited
         false
         (Signature.mk
@@ -7537,7 +7537,7 @@ def impl_Machine__typed_store : Item :=
 /-- `spec/lang/representation.md:642` -/
 def trait_DefinedRelation : Item :=
   (Item.trait
-    [(Attr.mk true "allow" (AttrMeta.list "unused"))]
+    [(Attr.mk true "allow" (AttrMeta.list [(MetaItem.mk "unused" AttrMeta.path)]))]
     Visibility.inherited
     false
     false

@@ -101,7 +101,7 @@ def trait_Target : Item :=
 /-- `spec/prelude/target.md:32` -/
 def struct_x86_64 : Item :=
   (Item.struct
-    [(Attr.mk true "allow" (AttrMeta.list "non_camel_case_types"))]
+    [(Attr.mk true "allow" (AttrMeta.list [(MetaItem.mk "non_camel_case_types" AttrMeta.path)]))]
     Visibility.pub
     "x86_64"
     (Generics.mk [] [])

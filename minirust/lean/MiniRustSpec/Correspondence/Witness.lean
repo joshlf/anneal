@@ -44,6 +44,12 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
   - for `_1 = 0`: computes `-0 = 0` and takes the `Unreachable` terminator,
     raising UB (`negMention0_minirust_ub_from_start`, verified against
     `negMention0_minirust_direct`).
+* `signedEdge`: the MIR of a signed `i8` function exercising two's-complement
+  sign-bit decoding (`intFromBits`), `i8::MIN` (`-128i8`, bits `128`) wrapping
+  negation (`-(-128i8) = -128i8`), negative `switchInt` branch keys (`-128`,
+  `-1`), signed underflow wrapping (`-128i8 + (-1i8) = 127i8`), signed
+  negative-by-negative `Mul` (`(-1i8) * (-2i8) = 2i8`), and end-to-end
+  `MirNoUBTree` safety transfer (`signedEdgeMin_minirust_noUB`).
 -/
 
 namespace MiniRustSpec.Correspondence.Witness
@@ -171,19 +177,43 @@ def ctx0 : Ctx :=
 def emptyProg : Gen.Program :=
   { functions := ⟨[]⟩, start := ⟨⟨0⟩⟩, globals := ⟨[]⟩, traits := ⟨[]⟩, vtables := ⟨[]⟩ }
 
-/-- A MiniRust machine running `fn` with Anneal locals `locals` at the given
-callee program counter. -/
-def machine (body : CapturedMir) (fn : Gen.Function) (locals : List LocalSlot) (blk : Gen.BbName) :
-    Mach :=
+/-- A MiniRust machine running `fn` under caller context `ctx` with Anneal
+locals `locals` at the given callee program counter. -/
+def machineWithCtx (ctx : Ctx) (body : CapturedMir) (fn : Gen.Function) (locals : List LocalSlot)
+    (blk : Gen.BbName) : Mach :=
   { prog := emptyProg,
-    mem := { memory := { allocations := ctx0.base ++ localAllocs ctx0 body.localDecls locals,
+    mem := { memory := { allocations := ctx.base ++ localAllocs ctx body.localDecls locals,
                          _phantom := {} },
              accesses := [] },
     intptrcast := ⟨⟨[]⟩⟩,
-    threads := [thread1 ctx0 [ctx0.caller,
-      { calleeFrame fn ctx0 body.localDecls.length 0 0 with next_block := blk }]],
+    threads := [thread1 ctx [ctx.caller,
+      { calleeFrame fn ctx body.localDecls.length 0 0 with next_block := blk }]],
     active_thread := 0, synchronized_threads := ⟨[]⟩, locks := [], global_ptrs := ⟨[]⟩,
     fn_ptrs := ⟨[]⟩, vtable_ptrs := ⟨[]⟩, stdout := ⟨[]⟩, stderr := ⟨[]⟩ }
+
+def machine : CapturedMir → Gen.Function → List LocalSlot → Gen.BbName → Mach :=
+  machineWithCtx ctx0
+
+theorem ctx0_ok1 {body : CapturedMir} (h : body.localDecls = [u32Decl]) : CtxOk body ctx0 where
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | _ + 1, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem ctx0_ok2 {body : CapturedMir} (h : body.localDecls = [u32Decl, u32Decl]) : CtxOk body ctx0 where
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | _ + 2, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
 
 /-! ## `sum_to(3)` -/
 
@@ -241,6 +271,10 @@ theorem sumTo_anneal_ret :
     ReachesRet (mirTree sumTo sumToS0) sumToTrace (.normal (.scalar ⟨6, 4⟩, sumToS0.memory)) :=
   runA_sound sumTo 20 _ _ _ rfl
 
+/-- Anneal's interaction tree for `sum_to(3)` is UB-free (`MirNoUBTree`). -/
+theorem sumTo_noUB : MirNoUBTree (mirCallTree sumTo [.scalar ⟨3, 4⟩]) :=
+  runA_noUB sumTo 20 _ _ _ rfl
+
 /-- Therefore MiniRust, started from the related machine, performs a return
 whose return place holds the little-endian bytes of `6u32`. -/
 theorem sumTo_minirust_ret :
@@ -270,14 +304,14 @@ theorem sumTo_minirust_direct :
       some (some { retAlloc with data := scalarBytes u32 6 }, [1]) := rfl
 
 /-- Whole-execution return starting at `f.start` (including `minimize`'s
-init block), via `run_ret_from_start`. -/
+init block), directly via `mirCall_ret` without any phantom `bb0` machine. -/
 theorem sumTo_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n sumToMInit = .ok m' ∧
       m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 6 } ∧
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
-    run_ret_from_start sumTo_inFragment sumTo_translate ctx0 sumToS0 sumToM0 sumToMInit
-      sumTo_rel rfl rfl ⟨rfl, rfl, rfl⟩ sumTo_anneal_ret
+    mirCall_ret sumTo_inFragment sumTo_translate ctx0 (ctx0_ok2 rfl) [.scalar ⟨3, 4⟩]
+      (by decide) sumToMInit rfl rfl rfl sumTo_anneal_ret
   obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
   simp [sumTo] at hd; subst hd
   simp [retPtr, ctx0] at hp
@@ -376,12 +410,12 @@ theorem retUninit_minirust_direct :
 def retUninitMInit : Mach := machine retUninit retUninitFn retUninitS0.frame.locals retUninitFn.start
 
 /-- Whole-execution UB starting at `f.start` (including `minimize`'s init
-block), via `run_ub_from_start`. -/
+block), directly via `mirCall_ub`. -/
 theorem retUninit_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n retUninitMInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := retUninit_anneal_ub
-  exact run_ub_from_start retUninit_inFragment retUninit_translate ctx0 retUninitS0
-    retUninitM0 retUninitMInit retUninit_rel rfl rfl ⟨rfl, rfl, rfl⟩ hr hf
+  exact mirCall_ub retUninit_inFragment retUninit_translate ctx0 (ctx0_ok1 rfl) []
+    (by decide) retUninitMInit rfl rfl rfl hr hf
 
 /-! ## `PlaceMention`, `UnaryOp(Neg)`, and `Unreachable` -/
 
@@ -427,42 +461,12 @@ def negMentionFn : Gen.Function where
 theorem negMention_translate : translateFn negMention = some negMentionFn := rfl
 
 def negMention5S0 : MachineState := initMachineState negMention [.scalar ⟨5, 4⟩]
-def negMention5M0 : Mach := machine negMention negMentionFn negMention5S0.frame.locals (bbName 0)
 def negMention5MInit : Mach := machine negMention negMentionFn negMention5S0.frame.locals negMentionFn.start
 
-theorem negMention5_rel : StateRel negMention negMentionFn ctx0 negMention5S0 negMention5M0 where
-  threads := rfl
-  active := rfl
-  allocs := rfl
-  blk := by decide
-  stmt := by intro bb hbb; simp [negMention5S0, initMachineState] at hbb ⊢
-  nlocals := by decide
-  slots := by
-    intro i d slot hd hs
-    have hloc : negMention5S0.frame.locals = [.uninit, .init (.scalar ⟨5, 4⟩)] := rfl
-    rw [hloc] at hs
-    match i, hd, hs with
-    | 0, hd, hs => simp [negMention] at hd; subst hd; simp at hs; subst hs; trivial
-    | 1, hd, hs =>
-      simp [negMention] at hd; subst hd
-      simp at hs; subst hs
-      exact ⟨rfl, by decide⟩
-    | _ + 2, hd, _ => simp [negMention] at hd
-  addrs := by
-    intro i d hd
-    match i, hd with
-    | 0, hd => simp [negMention] at hd; subst hd; decide
-    | 1, hd => simp [negMention] at hd; subst hd; decide
-    | _ + 2, hd => simp [negMention] at hd
-  ret := by
-    intro d hd
-    simp [negMention] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
-  borrows := rfl
-  callStack := rfl
-  activeCallee := rfl
-  protectors := rfl
-  callerLocals := rfl
+theorem negMention5_startRel :
+    StartRel negMention negMentionFn ctx0 negMention5S0 negMention5MInit :=
+  initMachineState_startRel negMention_inFragment ctx0 (ctx0_ok2 rfl) [.scalar ⟨5, 4⟩]
+    (by decide) negMention5MInit rfl rfl rfl
 
 def negMention5Trace : List (Event MirEffect) :=
   [⟨.inr (.inl (.emit (.event 5))), PUnit.unit⟩]
@@ -478,7 +482,7 @@ theorem negMention5_minirust_ret_from_start :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     run_ret_from_start negMention_inFragment negMention_translate ctx0 negMention5S0
-      negMention5M0 negMention5MInit negMention5_rel rfl rfl ⟨rfl, rfl, rfl⟩ negMention5_anneal_ret
+      negMention5MInit negMention5_startRel negMention5_anneal_ret
   obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
   simp [negMention] at hd; subst hd
   simp [retPtr, ctx0] at hp
@@ -498,42 +502,12 @@ theorem negMention5_minirust_direct :
       some (some { retAlloc with data := scalarBytes u32 4294967291 }, [1]) := rfl
 
 def negMention0S0 : MachineState := initMachineState negMention [.scalar ⟨0, 4⟩]
-def negMention0M0 : Mach := machine negMention negMentionFn negMention0S0.frame.locals (bbName 0)
 def negMention0MInit : Mach := machine negMention negMentionFn negMention0S0.frame.locals negMentionFn.start
 
-theorem negMention0_rel : StateRel negMention negMentionFn ctx0 negMention0S0 negMention0M0 where
-  threads := rfl
-  active := rfl
-  allocs := rfl
-  blk := by decide
-  stmt := by intro bb hbb; simp [negMention0S0, initMachineState] at hbb ⊢
-  nlocals := by decide
-  slots := by
-    intro i d slot hd hs
-    have hloc : negMention0S0.frame.locals = [.uninit, .init (.scalar ⟨0, 4⟩)] := rfl
-    rw [hloc] at hs
-    match i, hd, hs with
-    | 0, hd, hs => simp [negMention] at hd; subst hd; simp at hs; subst hs; trivial
-    | 1, hd, hs =>
-      simp [negMention] at hd; subst hd
-      simp at hs; subst hs
-      exact ⟨rfl, by decide⟩
-    | _ + 2, hd, _ => simp [negMention] at hd
-  addrs := by
-    intro i d hd
-    match i, hd with
-    | 0, hd => simp [negMention] at hd; subst hd; decide
-    | 1, hd => simp [negMention] at hd; subst hd; decide
-    | _ + 2, hd => simp [negMention] at hd
-  ret := by
-    intro d hd
-    simp [negMention] at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
-  borrows := rfl
-  callStack := rfl
-  activeCallee := rfl
-  protectors := rfl
-  callerLocals := rfl
+theorem negMention0_startRel :
+    StartRel negMention negMentionFn ctx0 negMention0S0 negMention0MInit :=
+  initMachineState_startRel negMention_inFragment ctx0 (ctx0_ok2 rfl) [.scalar ⟨0, 4⟩]
+    (by decide) negMention0MInit rfl rfl rfl
 
 theorem negMention0_anneal_ub :
     ∃ tr u, Reaches (mirTree negMention negMention0S0) tr u ∧ FaultNow u :=
@@ -543,10 +517,210 @@ theorem negMention0_minirust_ub_from_start :
     ∃ (n : Nat) (msg : String), Interp.steps n negMention0MInit = .error (.ub msg) := by
   obtain ⟨tr, u, hr, hf⟩ := negMention0_anneal_ub
   exact run_ub_from_start negMention_inFragment negMention_translate ctx0 negMention0S0
-    negMention0M0 negMention0MInit negMention0_rel rfl rfl ⟨rfl, rfl, rfl⟩ hr hf
+    negMention0MInit negMention0_startRel hr hf
 
 theorem negMention0_minirust_direct :
     ∃ msg, Interp.steps 5 negMention0MInit = .error (.ub msg) :=
   ⟨_, rfl⟩
+
+/-! ## Signed two's-complement corner cases (`i8::MIN`, negative `switchInt`, `MirNoUBTree`) -/
+
+def i8Ty : Ty := { kind := .int .i8, layoutIdx := 0 }
+def i8Decl : LocalDecl := { mutability := .mut, ty := i8Ty, debugName := none }
+def i8 : Gen.IntType := ⟨.Signed, ⟨1⟩⟩
+def constI8 (bits : Nat) : Operand := .constant { ty := i8Ty, val := .scalar (.int ⟨bits, 1⟩) }
+
+def i8Layout : TypeLayout :=
+  { size := { bytes := 1 }, align := { bytes := 1 }, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false }
+
+def fnAbiI8 (nargs : Nat) : FnAbi :=
+  { args := List.replicate nargs { layout := i8Layout, mode := .direct },
+    ret := { layout := i8Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+def retAllocI8 : Gen.Allocation :=
+  { data := [.Uninit], addr := 64, align := ⟨1⟩, kind := .Stack, live := true, extra := () }
+
+def callerFnI8 : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[]⟩
+  start := bbName 0
+  implicit_writes := true
+
+def callerFrameI8 : Frame :=
+  { func := callerFnI8, locals := ⟨[(localName 0, retPtr)]⟩, stack_pop_action := .BottomOfStack,
+    next_block := bbName 0, next_stmt := 0, extra := () }
+
+def ctxI8 : Ctx :=
+  { caller := callerFrameI8, payloads := [], base := [retAllocI8], addrs := [128, 256],
+    nextBlock := bbName 7, unwindBlock := none, retPtr := retPtr }
+
+theorem ctxI8_ok2 {body : CapturedMir} (h : body.localDecls = [i8Decl, i8Decl]) :
+    CtxOk body ctxI8 where
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | _ + 2, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MIR (`Runtime(PostCleanup)`) of
+```rust
+fn signed_edge(x: i8) -> i8 {
+    let y = x.wrapping_neg(); // bb0: _0 = Neg(copy _1); switchInt(copy _0) -> [-128i8: bb1, -1i8: bb2, _: bb3]
+    match y {
+        -128 => y.wrapping_add(-1), // bb1: _0 = Add(copy _0, const -1i8); return  (-> 127i8)
+        -1   => y.wrapping_mul(-2), // bb2: _0 = Mul(copy _0, const -2i8); return  (-> 2i8)
+        _    => y,                  // bb3: return
+    }
+}
+```
+where `-128i8` has bit pattern `128`, `-1i8` has bit pattern `255`, and `-2i8`
+has bit pattern `254`. -/
+def signedEdge : CapturedMir where
+  defPath := "witness::signed_edge"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [i8Decl, i8Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.assign (local_ 0) (.unaryOp .neg (.copy (local_ 1))))],
+      terminator := mkTerm (.switchInt (.copy (local_ 0))
+        { branches := [(128, 1), (255, 2)], otherwise := 3 }),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.binaryOp .add (.copy (local_ 0)) (constI8 255)))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.binaryOp .mul (.copy (local_ 0)) (constI8 254)))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem signedEdge_inFragment : inFragment signedEdge = true := by decide
+
+def signedEdgeFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 0)) (.UnOp (.Int .Neg) (.Load (.Local (localName 1))))],
+      .Switch (.Load (.Local (localName 0))) ⟨[(-128, bbName 1), (-1, bbName 2)]⟩ (bbName 3),
+      .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 0))) (.Constant (.Int (-1)) (.Int i8)))],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Mul) (.Load (.Local (localName 0))) (.Constant (.Int (-2)) (.Int i8)))],
+      .Return, .Regular⟩),
+    (bbName 3, ⟨[], .Return, .Regular⟩),
+    (bbName 4, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 4
+  implicit_writes := true
+
+theorem signedEdge_translate : translateFn signedEdge = some signedEdgeFn := rfl
+
+/-- Input `x = -128i8` (`i8::MIN`, bits `128`): `-(-128i8)` overflows signed
+`i8` and wraps back to `-128i8`, takes the `-128` `switchInt` arm, and
+`-128i8 + (-1i8)` underflows signed `i8` and wraps to `127i8` (`i8::MAX`). -/
+def signedEdgeMinS0 : MachineState := initMachineState signedEdge [.scalar ⟨128, 1⟩]
+def signedEdgeMinMInit : Mach :=
+  machineWithCtx ctxI8 signedEdge signedEdgeFn signedEdgeMinS0.frame.locals signedEdgeFn.start
+
+def signedEdgeMinTrace : List (Event MirEffect) :=
+  [⟨.inr (.inl (.emit (.event 128))), PUnit.unit⟩]
+
+theorem signedEdgeMin_anneal_ret :
+    ReachesRet (mirCallTree signedEdge [.scalar ⟨128, 1⟩]) signedEdgeMinTrace
+      (.normal (.scalar ⟨127, 1⟩, signedEdgeMinS0.memory)) :=
+  runA_sound signedEdge 10 _ _ _ rfl
+
+theorem signedEdgeMin_noUB : MirNoUBTree (mirCallTree signedEdge [.scalar ⟨128, 1⟩]) :=
+  runA_noUB signedEdge 10 _ _ _ rfl
+
+theorem signedEdgeMin_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n signedEdgeMinMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 127 } ∧
+      m'.threads = [thread1 ctxI8 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret signedEdge_inFragment signedEdge_translate ctxI8 (ctxI8_ok2 rfl)
+      [.scalar ⟨128, 1⟩] (by decide) signedEdgeMinMInit rfl rfl rfl signedEdgeMin_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [signedEdge] at hd; subst hd
+  simp [retPtr, ctxI8] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8] at hr; subst hr
+  have hbits : bits = 127 := by
+    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxI8, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+
+/-- End-to-end `MirNoUBTree` safety transfer: any error within `n` MiniRust
+steps from `f.start` occurs strictly after `k < n` steps at which MiniRust has
+already completed the callee's return (`ReturnRel`). -/
+theorem signedEdgeMin_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n signedEdgeMinMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k signedEdgeMinMInit = .ok mRet ∧
+      ReturnRel signedEdge ctxI8 s' v mRet ∧
+      ReachesRet (mirCallTree signedEdge [.scalar ⟨128, 1⟩]) tr (.normal (v, mem)) :=
+  mirCall_noUB signedEdge_inFragment signedEdge_translate ctxI8 (ctxI8_ok2 rfl)
+    [.scalar ⟨128, 1⟩] (by decide) signedEdgeMinMInit rfl rfl rfl signedEdgeMin_noUB herr
+
+theorem signedEdgeMin_minirust_direct :
+    (Interp.steps 5 signedEdgeMinMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 127 }, [1]) := rfl
+
+/-- Input `x = 1i8` (bits `1`): `-(1i8) = -1i8` (bits `255`), takes the `-1`
+`switchInt` arm, and `(-1i8) * (-2i8) = 2i8` (bits `2`). -/
+def signedEdgeOneS0 : MachineState := initMachineState signedEdge [.scalar ⟨1, 1⟩]
+def signedEdgeOneMInit : Mach :=
+  machineWithCtx ctxI8 signedEdge signedEdgeFn signedEdgeOneS0.frame.locals signedEdgeFn.start
+
+def signedEdgeOneTrace : List (Event MirEffect) :=
+  [⟨.inr (.inl (.emit (.event 255))), PUnit.unit⟩]
+
+theorem signedEdgeOne_anneal_ret :
+    ReachesRet (mirCallTree signedEdge [.scalar ⟨1, 1⟩]) signedEdgeOneTrace
+      (.normal (.scalar ⟨2, 1⟩, signedEdgeOneS0.memory)) :=
+  runA_sound signedEdge 10 _ _ _ rfl
+
+theorem signedEdgeOne_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n signedEdgeOneMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 2 } ∧
+      m'.threads = [thread1 ctxI8 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret signedEdge_inFragment signedEdge_translate ctxI8 (ctxI8_ok2 rfl)
+      [.scalar ⟨1, 1⟩] (by decide) signedEdgeOneMInit rfl rfl rfl signedEdgeOne_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [signedEdge] at hd; subst hd
+  simp [retPtr, ctxI8] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8] at hr; subst hr
+  have hbits : bits = 2 := by
+    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxI8, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+
+theorem signedEdgeOne_minirust_direct :
+    (Interp.steps 5 signedEdgeOneMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 2 }, [1]) := rfl
 
 end MiniRustSpec.Correspondence.Witness

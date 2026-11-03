@@ -3522,7 +3522,7 @@ def impl_ValueExpr__check_wf : Item :=
     (Ty.path none (Path.mk false [(PathSegment.mk "ValueExpr" PathArguments.none)]))
     [
       (ImplItem.fn
-        [(Attr.mk true "allow" (AttrMeta.list "unused_braces"))]
+        [(Attr.mk true "allow" (AttrMeta.list [(MetaItem.mk "unused_braces" AttrMeta.path)]))]
         Visibility.inherited
         false
         (Signature.mk

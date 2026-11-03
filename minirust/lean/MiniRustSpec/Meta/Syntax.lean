@@ -28,8 +28,8 @@ correspondence is constructor-for-variant with `syn` (2.x):
   `syn::Expr::Match`, `Expr.letCond` for `syn::Expr::Let`, ...).
 * Spans, punctuation tokens, and `//` comments are not represented. `///` doc
   comments appear as `#[doc = ...]` attributes, as in `syn`.
-* `verbatim` constructors (and `MacroBody.tokens`, `AttrMeta.list`) carry the
-  source tokens of a node the translator did not decompose. The translator
+* `verbatim` constructors (and `MacroBody.tokens`, `AttrMeta.listTokens`) carry
+  the source tokens of a node the translator did not decompose. The translator
   counts every such node as *opaque* in `minirust/coverage.json`; there is no
   other lossy path.
 -/
@@ -82,20 +82,26 @@ inductive Visibility : Type where
   | inherited
   deriving DecidableEq
 
-/-- Attribute arguments (`syn::Meta`). `list` keeps tool-directive tokens such
-as `specr::argmatch(statement)` verbatim (counted as opaque). -/
+mutual
+/-- Nested attribute metadata (`syn::Meta`): `path`, `path(meta, ...)`, or
+`path = value`. -/
+inductive MetaItem : Type where
+  | mk (path : String) (args : AttrMeta)
+/-- Attribute arguments (`syn::Meta`). `list` holds comma-separated nested
+`MetaItem`s (`#[derive(Default)]`, `#[allow(unused)]`, `#[specr::argmatch(x)]`);
+`listTokens` keeps non-`Meta` token streams verbatim (counted as opaque). -/
 inductive AttrMeta : Type where
   | path
-  | list (tokens : String)
+  | list (items : List MetaItem)
+  | listTokens (tokens : String)
   | nameValue (value : String)
-  deriving DecidableEq
+end
 
 /-- An attribute (`syn::Attribute`); `outer` is `#[..]` versus `#![..]`. -/
 structure Attr : Type where
   outer : Bool
   path : String
   args : AttrMeta
-  deriving DecidableEq
 
 /-- Macro delimiters (`syn::MacroDelimiter`). -/
 inductive MacroDelimiter : Type where

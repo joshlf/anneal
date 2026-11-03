@@ -96,7 +96,7 @@ def struct_TreeBorrowsParams : Item :=
         true
         "doc"
         (AttrMeta.nameValue " Global parameters controlling Tree Borrows behavior.")),
-      (Attr.mk true "derive" (AttrMeta.list "Default"))]
+      (Attr.mk true "derive" (AttrMeta.list [(MetaItem.mk "Default" AttrMeta.path)]))]
     Visibility.pub
     "TreeBorrowsParams"
     (Generics.mk [] [])
