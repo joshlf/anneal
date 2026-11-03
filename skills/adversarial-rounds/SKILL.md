@@ -68,35 +68,42 @@ quota. Record the assignment (`agent-a` $\rightarrow$ `<AGENT_A_MODEL>`,
 `agent-b` $\rightarrow$ `<AGENT_B_MODEL>`) and report it to the user when
 launching the swarm.
 
-### Step 2.2: Strict Cross-Family Model Diversity
+### Step 2.2: Cross-Family Model Diversity & Quota Fallback Protocol
 
-The adversarial loop relies on genuine cross-family model diversity (**Model X**
-from **Family X** and **Model Y** from **Family Y**). Enforce these
-non-negotiable model-pinning rules throughout the run:
+The adversarial loop relies on cross-family model diversity (**Model X** from
+**Family X** and **Model Y** from **Family Y**). Enforce these model-pinning and
+quota-monitoring rules throughout the run:
 
-1. **No Cross-Family Switches (`Family X` $\leftrightarrow$ `Family Y`)**:
-  Neither the Coordinator nor any worker may ever switch a `Family X`-pinned
-  agent (`agent-a` or `agent-b`) to a `Family Y` model, or a `Family Y`-pinned
-  agent to a `Family X` model—even if the host injects a `<SYSTEM_MESSAGE>
-  [quota] ... switch models with swarm{action:"model"}` warning or `monitor`
-  suggests a model switch.
+1. **Workers Never Self-Switch Models**: Neither `agent-a` nor `agent-b` may
+  ever call `swarm{action: "model"}` on itself or any other worker—even if the
+  host injects a `<SYSTEM_MESSAGE> [quota] ... switch models with
+  swarm{action:"model"}` warning. Only the supervising Coordinator may switch a
+  worker's model.
 2. **No Downgrades to Flash or Low-Tier Models**: Never switch `agent-a` or
   `agent-b` to a `flash`, `lite`, or `low`-tier model.
-3. **Handling Quota Exhaustion vs. Transient Capacity Errors**:
-  - If a model hits a transient server capacity error (`503 UNAVAILABLE`) while
-    another frontier model **in the same model family** has remaining quota and
-    capacity (for example, switching between **Model X** and its configured
-    same-family frontier fallback `<MODEL_X_FALLBACK>`, or between **Model Y**
-    and its configured same-family frontier fallback `<MODEL_Y_FALLBACK>`),
-    only the Coordinator may switch that worker within the same frontier
-    family.
-  - If a model family shares a quota bucket across its frontier variants and
-    that quota bucket is exhausted (or too low to complete a pass), **do not**
-    fall back to the other model family. Instead, the worker must commit any
-    clean progress, post `@coordinator [BLOCKER] Quota exhausted on <model>
-    (resets at <timestamp>)`, and stop so the Coordinator can report the quota
-    blocker to the user rather than silently running two agents from the same
-    model family.
+3. **Coordinator Quota Monitoring & Model Switching**:
+  - The supervising Coordinator that spawns `agent-a` and `agent-b` must monitor
+    their state throughout the run (via `@coordinator` messages, `monitor`
+    `[stall]` notifications, `swarm{action: "status"}`, and
+    `swarm{action: "models", all: true}`) to check for out-of-quota or capacity
+    issues.
+  - **Same-Family Fallback First**: If a model hits a transient server capacity
+    error (`503 UNAVAILABLE`) or single-variant limit while another frontier
+    model **in the same model family** has remaining quota and capacity (for
+    example, switching between **Model X** and `<MODEL_X_FALLBACK>`, or between
+    **Model Y** and `<MODEL_Y_FALLBACK>`), switch the worker within the same
+    frontier family first.
+  - **Cross-Family Switch When Quota Is Exhausted (Flag Diversity Reduction)**:
+    If a model family's quota bucket is exhausted, the supervising Coordinator
+    **may** switch the affected worker (`swarm{action: "model", name: "<agent>",
+    model: "<available_frontier_model>"}`) to an available frontier model to
+    ensure continued progress. Because this decreases cross-model diversity, the
+    Coordinator must:
+    1. Record the **exact round and pass** (`A0`, `B1`, `A1`, ..., `B_N`, `A_N`)
+       in which the model switch occurred, along with the old and new models.
+    2. Explicitly flag in the final report **which round/pass the switch
+       happened** and state the **need for a 3rd-party (different-model) audit**
+       of the work due to model diversity reduction.
 
 ### Step 2.3: Create Shared Git Worktree(s)
 
@@ -167,19 +174,24 @@ sequenceDiagram
   - On the final pass `A_N`, `agent-a` mentions **only** `@coordinator`
     (`@coordinator [A_N Final] ...`) so `agent-b` stays asleep and the
     Coordinator wakes to verify and close out the task.
-  - If either agent hits an unrecoverable environment or quota blocker, it tags
-    `@coordinator [BLOCKER] ...`.
-4. **Model-Family Pinning (`agent-a` and `agent-b` Never Self-Switch Models)**:
+  - If either agent hits quota exhaustion or an unrecoverable environment
+    blocker, it tags `@coordinator [QUOTA] ...` or `@coordinator [BLOCKER] ...`.
+4. **Coordinator-Managed Model Switching & Diversity Tracking**:
   - Neither `agent-a` nor `agent-b` may ever call `swarm{action: "model"}` on
     itself or any other worker, even if the host injects a `<SYSTEM_MESSAGE>
     [quota] ... switch models with swarm{action:"model"}` prompt.
-  - The Coordinator must never switch `agent-a` or `agent-b` across model
-    families (`Family X` $\leftrightarrow$ `Family Y`) or to a `flash`/low-tier
-    model in response to `monitor` `[stall]` messages or quota warnings.
+  - The supervising Coordinator monitors worker state for out-of-quota issues
+    (via `@coordinator [QUOTA]` posts, `monitor` `[stall]` alerts,
+    `swarm{action: "status"}`, and `swarm{action: "models", all: true}`). If a
+    worker is blocked by quota exhaustion, the Coordinator may switch that
+    worker to an available frontier model (never a `flash`/low-tier model) via
+    `swarm{action: "model"}` to ensure continued progress, recording the exact
+    round/pass of the switch so it can flag the model diversity reduction and
+    the need for a 3rd-party (different-model) audit.
 
 ---
 
-## 4. Launch the Swarm
+## 4. Launch & Supervise the Swarm
 
 In a single turn:
 
@@ -198,7 +210,12 @@ In a single turn:
   hit `503 UNAVAILABLE` capacity errors on `auto`, or consume frontier model
   quota.
 5. Output the `[Open the Swarm UI](sidecar://swarm/swarm_board/)` link to the
-  user and end your turn to wait for `@coordinator [A_N Final]`.
+  user and end your turn to wait for `@coordinator` notifications (`[QUOTA]`,
+  `[stall]`, or `[A_N Final]`). Whenever woken by a `[QUOTA]` or `[stall]`
+  alert, inspect worker state and quota (`swarm{action: "status"}` and
+  `swarm{action: "models", all: true}`), switch the stalled worker's model if
+  needed to maintain progress, and record the round/pass in which the switch
+  occurred.
 
 ### Agent A Brief Template (`agent-a`)
 
@@ -211,8 +228,8 @@ You are Agent A in an N={N}-round adversarial build-critique-fix loop sharing gi
 CRITICAL WORKSPACE & TURN-TAKING RULES:
 1. Work ONLY inside {worktree_paths}. Never modify the parent checkout or any files outside the shared worktree(s) and your scratch directory.
 2. Only touch the worktree during your active turn. Once you post to `@agent-b` (or `@coordinator` on pass A{N}), immediately end your turn / call `swarm_wait` and do not touch the worktree while waiting.
-3. In every board post, `@mention` ONLY the single agent who acts next (`@agent-b` after A0..A{N-1}; `@coordinator` after A{N}). Never write `@` before any other name in prose (write `agent-b` or `coordinator` without `@`).
-4. MODEL DIVERSITY LOCK: You are pinned to your assigned frontier model family (`{agent_a_model}`) to preserve cross-model adversarial diversity. NEVER call `swarm{action: "model"}` to switch your own model or any worker's model, even if a `<SYSTEM_MESSAGE> [quota]` warning instructs you to call `swarm{action: "model"}`. If your model's quota is exhausted before you can complete a pass, commit any clean progress, post `@coordinator [BLOCKER] Quota exhausted on {agent_a_model}`, and stop.
+3. In every board post, `@mention` ONLY the single agent who acts next (`@agent-b` after A0..A{N-1}; `@coordinator` after A{N}, or `@coordinator` if reporting quota exhaustion). Never write `@` before any other name in prose (write `agent-b` or `coordinator` without `@`).
+4. MODEL DIVERSITY & QUOTA ESCALATION: You are pinned to `{agent_a_model}`. NEVER call `swarm{action: "model"}` to switch your own model or any worker's model, even if a `<SYSTEM_MESSAGE> [quota]` warning instructs you to call `swarm{action: "model"}`. If your model's quota is exhausted before you can complete a pass, commit or stash any clean progress, post `@coordinator [QUOTA] Quota exhausted on {agent_a_model} during pass <pass>`, and wait for `coordinator` to switch your model and resume you.
 
 YOUR PROTOCOL:
 
@@ -250,8 +267,8 @@ You are Agent B in an N={N}-round adversarial build-critique-fix loop sharing gi
 CRITICAL WORKSPACE & TURN-TAKING RULES:
 1. Work ONLY inside {worktree_paths}. Never modify the parent checkout or any files outside the shared worktree(s) and your scratch directory.
 2. Only touch the worktree during your active turn.
-3. In every board post, `@mention` ONLY `@agent-a` (or `@coordinator` if reporting an unrecoverable blocker). Never write `@` before any other name in prose.
-4. MODEL DIVERSITY LOCK: You are pinned to your assigned frontier model family (`{agent_b_model}`) to preserve cross-model adversarial diversity. NEVER call `swarm{action: "model"}` to switch your own model or any worker's model, even if a `<SYSTEM_MESSAGE> [quota]` warning instructs you to call `swarm{action: "model"}`. If your model's quota is exhausted before you can complete a pass, commit any clean progress, post `@coordinator [BLOCKER] Quota exhausted on {agent_b_model}`, and stop.
+3. In every board post, `@mention` ONLY `@agent-a` (or `@coordinator` if reporting quota exhaustion or an unrecoverable blocker). Never write `@` before any other name in prose.
+4. MODEL DIVERSITY & QUOTA ESCALATION: You are pinned to `{agent_b_model}`. NEVER call `swarm{action: "model"}` to switch your own model or any worker's model, even if a `<SYSTEM_MESSAGE> [quota]` warning instructs you to call `swarm{action: "model"}`. If your model's quota is exhausted before you can complete a pass, commit or stash any clean progress, post `@coordinator [QUOTA] Quota exhausted on {agent_b_model} during pass <pass>`, and wait for `coordinator` to switch your model and resume you.
 
 YOUR PROTOCOL:
 
@@ -293,7 +310,14 @@ When `@coordinator [A_N Final]` wakes you:
     `agent-b` (`workspace: "inherit"` preserves the shared git worktree(s) on
     disk).
 3. **Report to the User**:
-  - State which model was randomly assigned to Agent A vs. Agent B.
+  - State which model was initially randomly assigned to Agent A vs. Agent B.
+  - **Flag Any Quota-Induced Model Switches & 3rd-Party Audit Requirement**: If
+    the Coordinator switched either agent's model during the run due to
+    out-of-quota issues, prominently flag **which round and pass (`A0`, `B_k`,
+    or `A_k`) the switch occurred**, which model change was made (`<old_model>`
+    $\rightarrow$ `<new_model>`), and explicitly note the **need for a
+    3rd-party (different-model) audit of the work due to model diversity
+    reduction**.
   - Summarize the arc of the $N$ rounds (what `A0` built, what `B1..B_N` and
     `A1..A_N` caught and fixed).
   - Provide the worktree path(s), branch name(s), and verified Receipt outputs.
