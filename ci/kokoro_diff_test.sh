@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Copyright 2026 The Fuchsia Authors
 #
-# Use of this source code is governed by a BSD-style license that can be
-# found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
+# Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+# <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+# license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+# This file may not be copied, modified, or distributed except according to
+# those terms.
 
 # Option B (Kokoro V2 Instances) entrypoint for continuous Anneal differential
 # testing campaigns.
@@ -13,6 +16,11 @@
 # harnesses or campaign runner (`scripts/run_diff_test_campaign.py`):
 # point the Kokoro V2 `.cfg` build_file at `anneal/ci/kokoro_diff_test.sh` and
 # set `ANNEAL_DIFF_TEST_GCS_BUCKET` if using GCS state sync.
+#
+# The campaign runner exits 3 when it performed no oracle comparison, which is
+# every run: the harnesses only generate and compile candidates. This script
+# syncs state even when the runner fails, then exits with the runner's status,
+# so the job fails instead of passing an unevaluated run.
 
 set -euo pipefail
 
@@ -35,15 +43,18 @@ if [[ -n "${ANNEAL_DIFF_TEST_GCS_BUCKET:-}" ]]; then
     "${STATE_DIR}/" || true
 fi
 
+status=0
 python3 "${REPO_ROOT}/scripts/run_diff_test_campaign.py" \
   --profile "${PROFILE}" \
   --state-dir "${STATE_DIR}" \
   --x20-uri "" \
   --junit-xml "${JUNIT_XML}" \
-  | tee "${REPORT_MD}"
+  | tee "${REPORT_MD}" || status=$?
 
 if [[ -n "${ANNEAL_DIFF_TEST_GCS_BUCKET:-}" ]]; then
   gcloud storage rsync --recursive \
     "${STATE_DIR}/" \
     "gs://${ANNEAL_DIFF_TEST_GCS_BUCKET}/differential-testing/"
 fi
+
+exit "${status}"

@@ -1,7 +1,12 @@
-//! Core differential-testing engine, source auto-instrumenter, MIR-guided
-//! layout-aware input generator, Miri/ITree AST mutators, and deterministic
-//! counterexample shrinker for the Anneal dual differential-testing
-//! infrastructure.
+//! Building blocks intended for differential testing of Anneal: AST mutators
+//! that generate candidate programs, a source instrumenter that records
+//! external-call traces, layout-aware input builders, and a counterexample
+//! shrinker.
+//!
+//! Nothing in this crate runs Miri, Anneal's Lean model, or the generated
+//! programs, so nothing here compares Anneal with another oracle. The
+//! `miri-difftest` and `itree-difftest` binaries only generate and compile
+//! candidates, and report `"oracle_comparison": "not_performed"`.
 
 pub mod input_gen;
 pub mod instrument;
