@@ -50,3 +50,10 @@ Crates in `crates/` are kept outside the TCB by two architectural invariants:
   `LAKE_RESTORE_ARTIFACTS=true`, unless already set in the environment), so the
   `Trusted` and `Anneal` libraries compile once per Lean toolchain rather than
   once per verified crate.
+- **`crates/anneal-minirust-gen`:**
+  Mechanical translator from the pinned, vendored upstream MiniRust
+  specification (`minirust/vendor/`) to Lean 4
+  (`minirust/lean/MiniRustSpec/Generated*`) with a coverage report
+  (`minirust/coverage.json`); see [`minirust/README.md`](../minirust/README.md).
+  Its output feeds the MiniRust correspondence development only, not
+  `cargo anneal verify`.
