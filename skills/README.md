@@ -20,6 +20,7 @@ for configuring Claude Code, Gemini CLI, Jetski, and Codex to load these skills.
 | [`anneal-prove`](anneal-prove/SKILL.md) | Repository-owned | Interactive and symbolic Lean 4 proof construction (`wpMirSym`, `runCfgSteps`, `SymReflect`, and kernel proof-scaling patterns) |
 | [`anneal-lsp`](anneal-lsp/SKILL.md) | Repository-owned | Warm `lake serve` LSP MCP workflow (`lean_goal`, `lean_multi_attempt`, `anneal_audit_preview`) and two-regime threshold heuristic |
 | [`anneal-doc-audit`](anneal-doc-audit/SKILL.md) | Repository-owned | CLI command, tutorial directive, and report output verification across `docs/` and `examples/` |
+| [`adversarial-rounds`](adversarial-rounds/SKILL.md) | Repository-owned | $N$-round adversarial implementation, critique, and repair between two randomly assigned frontier models (`opus-5.5-max` and `gemini-launch-candidate-high`) over shared git worktree(s) |
 | [`authorship-disclosure`](authorship-disclosure/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | [`authorship_disclosure/` at `b563468a8148df117283494915cee5b6561cc47f`](https://github.com/joshlf/skills/tree/b563468a8148df117283494915cee5b6561cc47f/authorship_disclosure) |
 | [`comment-guidelines`](comment-guidelines/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | [`comment_guidelines/` at `b563468a8148df117283494915cee5b6561cc47f`](https://github.com/joshlf/skills/tree/b563468a8148df117283494915cee5b6561cc47f/comment_guidelines) |
 | [`commit-message`](commit-message/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | [`commit-message/` at `b563468a8148df117283494915cee5b6561cc47f`](https://github.com/joshlf/skills/tree/b563468a8148df117283494915cee5b6561cc47f/commit-message) |
@@ -32,5 +33,6 @@ for configuring Claude Code, Gemini CLI, Jetski, and Codex to load these skills.
 
 Keep the vendored `joshlf/skills` packages unmodified so they can be updated
 cleanly from upstream; place Anneal-specific conventions in repository-owned
-files (`AGENTS.md`, `skills/anneal-prove/`, `skills/anneal-lsp/`,
-`skills/anneal-doc-audit/`, and `skills/source-control/`).
+files (`AGENTS.md`, `skills/adversarial-rounds/`, `skills/anneal-prove/`,
+`skills/anneal-lsp/`, `skills/anneal-doc-audit/`, and
+`skills/source-control/`).
