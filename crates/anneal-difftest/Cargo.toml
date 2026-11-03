@@ -1,5 +1,5 @@
 [package]
-name = "anneal-fuzz"
+name = "anneal-difftest"
 version = "0.1.0"
 edition = "2024"
 publish = false
@@ -13,11 +13,11 @@ prettyplease = "0.2.37"
 proc-macro2 = "1.0.107"
 
 [[bin]]
-name = "miri-fuzz"
-path = "src/bin/miri_fuzz.rs"
+name = "miri-difftest"
+path = "src/bin/miri_difftest.rs"
 
 [[bin]]
-name = "itree-fuzz"
-path = "src/bin/itree_fuzz.rs"
+name = "itree-difftest"
+path = "src/bin/itree_difftest.rs"
 
 [workspace]

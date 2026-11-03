@@ -794,7 +794,7 @@ theorem example_unsafe_pointer_and_slice_obligations :
      ⟨hUnalign, evalPtrOffset_zero_of_unalignRawPtrSafe hUnalign⟩,
      ⟨hArray, evalPtrOffset_end_of_validArrayToSliceCast hArray⟩⟩
 
-/-! ## 9. Runtime Trace Replay & Fuzzing Triage Diagnostics (`TraceReplayDiag`) -/
+/-! ## 9. Runtime Trace Replay & Differential-Testing Triage Diagnostics (`TraceReplayDiag`) -/
 
 @[reducible]
 def rawAdd42Trace : RawByteTrace where

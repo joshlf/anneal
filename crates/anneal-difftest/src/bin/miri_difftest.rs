@@ -1,4 +1,4 @@
-//! Milestone 4: `miri-fuzz` CLI Harness Binary (`cargo run --bin miri-fuzz`).
+//! Milestone 4: `miri-difftest` CLI Harness Binary (`cargo run --bin miri-difftest`).
 //!
 //! Exercises Miri-strength structure-aware AST mutation (`generate_miri_batch`),
 //! MIR-guided layout-aware byte input generation (`MirInputDictionary` +
@@ -18,12 +18,12 @@ use std::time::Instant;
 
 use arbitrary::Unstructured;
 
-use anneal_fuzz::input_gen::{
+use anneal_difftest::input_gen::{
     FieldLayout, LayoutAwareByteBuilder, LayoutSpec, MirInputDictionary, PaddingFillPattern,
     ScalarLayout,
 };
-use anneal_fuzz::mutators_miri::{GeneratedMiriCandidate, generate_miri_batch};
-use anneal_fuzz::shrink::{ShrinkOutcome, shrink_bytes};
+use anneal_difftest::mutators_miri::{GeneratedMiriCandidate, generate_miri_batch};
+use anneal_difftest::shrink::{ShrinkOutcome, shrink_bytes};
 
 /// Canonical Miri-strength seed corpus covering integer arithmetic/shifts, struct field
 /// projections, raw pointer in-bounds offset round-trips, Tree Borrows shared/mutable
@@ -66,7 +66,7 @@ pub fn seed_stride_index(idx: u32, stride: u32) -> u32 {
 "#,
 ];
 
-/// Canonical 5-bucket verdict classification for `miri-fuzz`.
+/// Canonical 5-bucket verdict classification for `miri-difftest`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MiriVerdictBucket {
     Pass,
@@ -96,9 +96,9 @@ impl MiriVerdictBucket {
     }
 }
 
-/// CLI configuration for `miri-fuzz`.
+/// CLI configuration for `miri-difftest`.
 #[derive(Debug, Clone)]
-pub struct MiriFuzzArgs {
+pub struct MiriDiffTestArgs {
     pub batches: usize,
     pub batch_size: usize,
     pub seed: u64,
@@ -106,7 +106,7 @@ pub struct MiriFuzzArgs {
     pub output_json: Option<PathBuf>,
 }
 
-impl Default for MiriFuzzArgs {
+impl Default for MiriDiffTestArgs {
     fn default() -> Self {
         Self {
             batches: 2,
@@ -133,8 +133,8 @@ fn parse_u64_or_hex(raw: &str) -> Result<u64, String> {
     }
 }
 
-fn parse_cli_args() -> Result<MiriFuzzArgs, String> {
-    let mut cfg = MiriFuzzArgs::default();
+fn parse_cli_args() -> Result<MiriDiffTestArgs, String> {
+    let mut cfg = MiriDiffTestArgs::default();
     let args: Vec<String> = env::args().skip(1).collect();
     let mut i = 0usize;
     while i < args.len() {
@@ -170,7 +170,7 @@ fn parse_cli_args() -> Result<MiriFuzzArgs, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: miri-fuzz [--batches N] [--batch-size B] [--seed S] [--findings-dir DIR] [--output-json PATH]"
+                    "Usage: miri-difftest [--batches N] [--batch-size B] [--seed S] [--findings-dir DIR] [--output-json PATH]"
                 );
                 std::process::exit(0);
             }
@@ -202,7 +202,7 @@ fn resolve_rustc_bin() -> String {
 fn compile_rust_snippet(label: &str, source: &str) -> bool {
     let rustc_bin = resolve_rustc_bin();
     let tmp_dir = env::temp_dir().join(format!(
-        "anneal_miri_fuzz_{}_{}",
+        "anneal_miri_difftest_{}_{}",
         std::process::id(),
         label
     ));
@@ -561,7 +561,7 @@ fn main() {
     }
 
     let json_report = format!(
-        "{{\n  \"harness\": \"miri-fuzz\",\n  \"seed\": \"0x{:08x}\",\n  \"batches\": {},\n  \"batch_size\": {},\n  \"total_candidates\": {},\n  \"compiled_candidates\": {},\n  \"compile_pass_rate_pct\": {:.2},\n  \"agreement_rate_pct\": {:.2},\n  \"padding_checks_passed\": {},\n  \"verdict_buckets\": {{\n    \"Pass\": {},\n    \"Panic\": {},\n    \"StrictUB\": {},\n    \"CompileRejected\": {},\n    \"Unsupported\": {}\n  }},\n  \"per_mutator_buckets\": {{\n{}\n  }},\n  \"shrinker_verification\": {{\n    \"succeeded\": {},\n    \"original_len\": {},\n    \"minimized_len\": {},\n    \"reduction_ratio\": {:.4},\n    \"predicate_evaluations\": {}\n  }},\n  \"elapsed_ms\": {:.2}\n}}\n",
+        "{{\n  \"harness\": \"miri-difftest\",\n  \"seed\": \"0x{:08x}\",\n  \"batches\": {},\n  \"batch_size\": {},\n  \"total_candidates\": {},\n  \"compiled_candidates\": {},\n  \"compile_pass_rate_pct\": {:.2},\n  \"agreement_rate_pct\": {:.2},\n  \"padding_checks_passed\": {},\n  \"verdict_buckets\": {{\n    \"Pass\": {},\n    \"Panic\": {},\n    \"StrictUB\": {},\n    \"CompileRejected\": {},\n    \"Unsupported\": {}\n  }},\n  \"per_mutator_buckets\": {{\n{}\n  }},\n  \"shrinker_verification\": {{\n    \"succeeded\": {},\n    \"original_len\": {},\n    \"minimized_len\": {},\n    \"reduction_ratio\": {:.4},\n    \"predicate_evaluations\": {}\n  }},\n  \"elapsed_ms\": {:.2}\n}}\n",
         args.seed,
         args.batches,
         args.batch_size,
@@ -609,7 +609,7 @@ fn main() {
     }
 
     // 6. Print crisp Markdown calibration report.
-    println!("# `miri-fuzz` Milestone 4 Calibration Report\n");
+    println!("# `miri-difftest` Milestone 4 Calibration Report\n");
     println!(
         "- **Seed**: `0x{:08x}` (`{}` batches × `{}` candidates = `{}` total)",
         args.seed, args.batches, args.batch_size, total_candidates

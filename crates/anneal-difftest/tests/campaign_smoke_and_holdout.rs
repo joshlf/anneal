@@ -3,10 +3,10 @@
 //! Structured in strict accordance with `skills/swarm-model-refinement/SKILL.md`
 //! Invariant 3 (*Mechanical Information Isolation & Discovery vs. Blind Holdout Split*):
 //! - **Exposed Discovery Gates**:
-//!   - [`m4_miri_fuzz_5_batch_calibration_gate`]: 5 batches × 32 candidates = 160 Miri
+//!   - [`m4_miri_difftest_5_batch_calibration_gate`]: 5 batches × 32 candidates = 160 Miri
 //!     candidates at seed `0x5EED_0001`, batch-compiled under `rustc --edition=2024`,
 //!     asserting compilation validity rate `>= 90%`.
-//!   - [`m5_itree_fuzz_5_batch_calibration_gate`]: 5 batches × 32 candidates = 160 safe
+//!   - [`m5_itree_difftest_5_batch_calibration_gate`]: 5 batches × 32 candidates = 160 safe
 //!     ITree candidates at seed `0x5EED_0002`, asserting `0%` `unsafe` tokens, batch-compiled
 //!     under `rustc --edition=2024 -D warnings` at both `-C opt-level=0` and `-C opt-level=2`,
 //!     asserting compilation validity rate `>= 95%` and `MirObsPathSet` multi-path coverage.
@@ -15,7 +15,7 @@
 //!     unexposed blind holdout seed (`0x484F_4C44`) plus adversarial edge-case inputs
 //!     (empty byte slice `&[]`, single byte `&[0xFF]`, struct with multiple non-adjacent
 //!     padding gaps, and `PanicOnCall(0)` immediate unwind on call `#0`) across both CLI
-//!     harnesses (`miri-fuzz` and `itree-fuzz`) and verifies deterministic shrinker termination.
+//!     harnesses (`miri-difftest` and `itree-difftest`) and verifies deterministic shrinker termination.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -24,16 +24,16 @@ use std::process::{Command, Stdio};
 
 use arbitrary::Unstructured;
 
-use anneal_fuzz::input_gen::{
+use anneal_difftest::input_gen::{
     EnvScheduleGenerator, EnvStrategy, FieldLayout, LayoutAwareByteBuilder, LayoutSpec,
     MirInputDictionary, MirObsPathSet, PaddingFillPattern, ScalarLayout,
 };
-use anneal_fuzz::instrument::{
+use anneal_difftest::instrument::{
     EnvAction, EnvSchedule, RecordedEvent, RecordedOutcome, TraceRecorder, instrument_source,
 };
-use anneal_fuzz::mutators_itree::{contains_unsafe_token, generate_itree_batch};
-use anneal_fuzz::mutators_miri::generate_miri_batch;
-use anneal_fuzz::shrink::{shrink_bytes, shrink_mutation_chain};
+use anneal_difftest::mutators_itree::{contains_unsafe_token, generate_itree_batch};
+use anneal_difftest::mutators_miri::generate_miri_batch;
+use anneal_difftest::shrink::{shrink_bytes, shrink_mutation_chain};
 
 fn resolve_rustc_bin() -> String {
     if let Ok(r) = std::env::var("RUSTC")
@@ -111,7 +111,7 @@ fn make_seed_bytes(seed: u64, step: u64) -> [u8; 32] {
 }
 
 #[test]
-fn m4_miri_fuzz_5_batch_calibration_gate() {
+fn m4_miri_difftest_5_batch_calibration_gate() {
     const BASE_SEED: u64 = 0x5EED_0001;
     const NUM_BATCHES: usize = 5;
     const BATCH_SIZE: usize = 32;
@@ -208,7 +208,7 @@ pub fn signed_window(v: i32, limit: i32) -> i32 {
 }
 
 #[test]
-fn m5_itree_fuzz_5_batch_calibration_gate() {
+fn m5_itree_difftest_5_batch_calibration_gate() {
     const BASE_SEED: u64 = 0x5EED_0002;
     const NUM_BATCHES: usize = 5;
     const BATCH_SIZE: usize = 32;
@@ -570,7 +570,7 @@ fn blind_holdout_stitcher_unseen_seed_0x484f4c44() {
 
     // -------------------------------------------------------------------------
     // End-to-End Holdout Execution of BOTH Compiled CLI Harness Binaries:
-    // `miri-fuzz` and `itree-fuzz` with unseen seed `0x484F_4C44`!
+    // `miri-difftest` and `itree-difftest` with unseen seed `0x484F_4C44`!
     // -------------------------------------------------------------------------
     let holdout_dir = std::env::temp_dir().join(format!(
         "anneal_holdout_0x484f4c44_{}",
@@ -581,7 +581,7 @@ fn blind_holdout_stitcher_unseen_seed_0x484f4c44() {
     let itree_json_path = holdout_dir.join("itree_holdout.json");
     let findings_path = holdout_dir.join("findings");
 
-    let miri_bin = env!("CARGO_BIN_EXE_miri-fuzz");
+    let miri_bin = env!("CARGO_BIN_EXE_miri-difftest");
     let miri_out = Command::new(miri_bin)
         .args([
             "--batches",
@@ -596,18 +596,18 @@ fn blind_holdout_stitcher_unseen_seed_0x484f4c44() {
         .arg("--output-json")
         .arg(&miri_json_path)
         .output()
-        .expect("failed to execute `miri-fuzz` binary");
+        .expect("failed to execute `miri-difftest` binary");
     assert!(
         miri_out.status.success(),
-        "`miri-fuzz` failed on blind holdout seed 0x484F4C44:\n{}",
+        "`miri-difftest` failed on blind holdout seed 0x484F4C44:\n{}",
         String::from_utf8_lossy(&miri_out.stderr)
     );
     let miri_json = fs::read_to_string(&miri_json_path).expect("miri_holdout.json must exist");
-    assert!(miri_json.contains("\"harness\": \"miri-fuzz\""));
+    assert!(miri_json.contains("\"harness\": \"miri-difftest\""));
     assert!(miri_json.contains("\"compile_pass_rate_pct\": 100.00"));
     assert!(miri_json.contains("\"agreement_rate_pct\": 100.00"));
 
-    let itree_bin = env!("CARGO_BIN_EXE_itree-fuzz");
+    let itree_bin = env!("CARGO_BIN_EXE_itree-difftest");
     let itree_out = Command::new(itree_bin)
         .args([
             "--batches",
@@ -622,14 +622,14 @@ fn blind_holdout_stitcher_unseen_seed_0x484f4c44() {
         ])
         .arg(&itree_json_path)
         .output()
-        .expect("failed to execute `itree-fuzz` binary");
+        .expect("failed to execute `itree-difftest` binary");
     assert!(
         itree_out.status.success(),
-        "`itree-fuzz` failed on blind holdout seed 0x484F4C44:\n{}",
+        "`itree-difftest` failed on blind holdout seed 0x484F4C44:\n{}",
         String::from_utf8_lossy(&itree_out.stderr)
     );
     let itree_json = fs::read_to_string(&itree_json_path).expect("itree_holdout.json must exist");
-    assert!(itree_json.contains("\"harness\": \"itree-fuzz\""));
+    assert!(itree_json.contains("\"harness\": \"itree-difftest\""));
     assert!(itree_json.contains("\"unsafe_token_violations\": 0"));
     assert!(itree_json.contains("\"compile_pass_rate_pct\": 100.00"));
     assert!(itree_json.contains("\"metamorphic_parity_rate_pct\": 100.00"));

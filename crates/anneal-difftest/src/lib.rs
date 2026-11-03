@@ -1,6 +1,7 @@
-//! Core fuzzing engine, source auto-instrumenter, MIR-guided layout-aware input
-//! generator, Miri/ITree AST mutators, and deterministic counterexample shrinker
-//! for the Anneal dual-fuzzer infrastructure.
+//! Core differential-testing engine, source auto-instrumenter, MIR-guided
+//! layout-aware input generator, Miri/ITree AST mutators, and deterministic
+//! counterexample shrinker for the Anneal dual differential-testing
+//! infrastructure.
 
 pub mod input_gen;
 pub mod instrument;

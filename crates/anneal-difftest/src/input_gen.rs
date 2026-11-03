@@ -8,8 +8,8 @@
 //! - [`LayoutAwareByteBuilder`]: materializes byte buffers for arbitrary [`LayoutSpec`]s
 //!   with an 80% dictionary-boundary / 20% uniform [`arbitrary::Unstructured`] bias,
 //!   deterministic non-zero padding noise (`0xA5`, `0x5A`, `0xFF`, or seeded non-zero PRNG),
-//!   and configurable `validity_fault_rate_pct` (e.g. 5% for negative `miri-fuzz` testing
-//!   vs. 0% for safe `itree-fuzz` testing).
+//!   and configurable `validity_fault_rate_pct` (e.g. 5% for negative `miri-difftest` testing
+//!   vs. 0% for safe `itree-difftest` testing).
 //! - [`EnvScheduleGenerator`]: synthesizes reactive `inputs-over-time` [`EnvSchedule`]s
 //!   per external callee (constant, monotonic counter, alternating `Ok`/`Err`,
 //!   dictionary-drawn values, and `PanicOnCall(k)` unwinding injection).
@@ -843,7 +843,7 @@ pub struct LayoutAwareByteBuilder<'a> {
     pub dictionary_bias_pct: u8,
     /// Probability (`0..=100`) of injecting an invalid niche/discriminant bit pattern (`bool = 2`,
     /// surrogate `char = 0xD800`, out-of-range scalar validity, invalid enum tag).
-    /// Set to `5` for negative `miri-fuzz` testing and `0` for safe `itree-fuzz` testing.
+    /// Set to `5` for negative `miri-difftest` testing and `0` for safe `itree-difftest` testing.
     pub validity_fault_rate_pct: u8,
     /// Non-zero fill pattern written to all inter-field and trailing padding bytes.
     pub padding_pattern: PaddingFillPattern,
@@ -1021,7 +1021,7 @@ impl<'a> LayoutAwareByteBuilder<'a> {
         let bits = scalar.bit_width();
         let mask = width_mask(bits);
 
-        // Optional negative bit-validity fault injection (`miri-fuzz` mode).
+        // Optional negative bit-validity fault injection (`miri-difftest` mode).
         if self.validity_fault_rate_pct > 0 && rng.roll_percent() < self.validity_fault_rate_pct {
             if scalar.is_bool {
                 // Invalid `bool` bit pattern (`2`..=`255`).

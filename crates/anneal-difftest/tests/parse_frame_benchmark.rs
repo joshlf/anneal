@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 
 use arbitrary::Unstructured;
 
-use anneal_fuzz::input_gen::{
+use anneal_difftest::input_gen::{
     FieldLayout, LayoutAwareByteBuilder, LayoutSpec, MirInputDictionary, MirObsPathSet,
     ScalarLayout,
 };
-use anneal_fuzz::instrument::{EnvAction, TraceRecorder};
+use anneal_difftest::instrument::{EnvAction, TraceRecorder};
 
 /// ABI-explicit frame header with inter-field alignment padding between scalar fields:
 /// - `magic: u32` at offset 0..4
@@ -225,7 +225,7 @@ fn milestone_3_parse_frame_discovers_all_6_paths_in_le_250_inputs_under_5ms() {
     let dict = MirInputDictionary::from_rust_source(PARSE_FRAME_RUST_SOURCE)
         .expect("parse_frame source should parse cleanly");
     let builder = LayoutAwareByteBuilder::new(&dict);
-    let env_gen = anneal_fuzz::input_gen::EnvScheduleGenerator::new(&dict)
+    let env_gen = anneal_difftest::input_gen::EnvScheduleGenerator::new(&dict)
         .with_horizon_steps(2)
         .with_panic_injection_pct(30);
 
@@ -257,7 +257,7 @@ fn milestone_3_parse_frame_discovers_all_6_paths_in_le_250_inputs_under_5ms() {
 
         let payload_len = builder.draw_u32(Some("payload_len"), &mut u);
         let sched = if mir_paths.entries().keys().any(|k| k.is_panic) {
-            anneal_fuzz::input_gen::EnvScheduleGenerator::new(&dict)
+            anneal_difftest::input_gen::EnvScheduleGenerator::new(&dict)
                 .with_horizon_steps(2)
                 .with_panic_injection_pct(0)
                 .generate_schedule(&["ext_crc32"], &mut u)

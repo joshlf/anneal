@@ -24,7 +24,7 @@ open Anneal.ITreeWP
 open Anneal.Rustc.V2026_06_01.Lower
 
 /-!
-Executable trace-consistency checking, fuzzing-triage diagnostics
+Executable trace-consistency checking, differential-testing triage diagnostics
 (`TraceReplayDiag`), and byte-level runtime observer decoding for
 `Trusted.Rustc.V2026_06_01` interaction trees (`mirTree`, `mirStatefulTree`,
 and `mirObsErasedStatefulTree`).
@@ -62,7 +62,7 @@ coinductive `MIR -> ITree` operational model along two axes:
      `AbstractByte.init` sequences annotated with abstract `(allocId, tag)`
      provenance and relative byte offset `addr - baseAddr`.
 
-3. **Structured Fuzzing-Triage Diagnostics (`TraceReplayDiag`)**:
+3. **Structured Differential-Testing Triage Diagnostics (`TraceReplayDiag`)**:
    - Pinpoints exact argument/event/outcome byte-decoding failures, operational
      faults (`FailureKind`, `blockIdx`, `stmtIdx`), unexpected external calls,
      call argument mismatches, `switchInt` branch tag mismatches, unconsumed
@@ -1669,11 +1669,12 @@ theorem checkRawByteTraceObsErasedBounded_sound
       ⟨tr, out, h_evs, h_out, h_reach⟩
     exact ⟨obsTrace, tr, out, rfl, h_evs, h_out, h_reach⟩
 
-/-! ## 7. Fuzzing-Triage Diagnostic Replay (`TraceReplayDiag`) -/
+/-! ## 7. Differential-Testing Triage Diagnostic Replay (`TraceReplayDiag`) -/
 
 /--
 Computable diagnostic classification returned by `diagnoseObservedTraceBounded`
-and `diagnoseRawByteTraceBounded` for fuzzing and counterexample triage.
+and `diagnoseRawByteTraceBounded` for differential testing and counterexample
+triage.
 -/
 inductive TraceReplayDiag where
   | ok (tr : List (Event MirEffect)) (out : MirOutcome)
@@ -1695,7 +1696,10 @@ def TraceReplayDiag.isOk : TraceReplayDiag → Bool
   | .ok _ _ => true
   | _ => false
 
-/-- Concise, stable machine-readable tag name for fuzzing triage reports. -/
+/--
+Concise, stable machine-readable tag name for differential-testing triage
+reports.
+-/
 @[reducible]
 def TraceReplayDiag.tagName : TraceReplayDiag → String
   | .ok _ _ => "ok"

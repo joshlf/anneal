@@ -1,4 +1,4 @@
-//! Milestone 5: `itree-fuzz` CLI Harness Binary (`cargo run --bin itree-fuzz`).
+//! Milestone 5: `itree-difftest` CLI Harness Binary (`cargo run --bin itree-difftest`).
 //!
 //! Exercises ITree-strength strictly safe-Rust AST mutation (`generate_itree_batch`
 //! with a hard `0%` `unsafe` token gate), source-to-source auto-instrumentation
@@ -18,12 +18,12 @@ use std::time::Instant;
 
 use arbitrary::Unstructured;
 
-use anneal_fuzz::input_gen::{
+use anneal_difftest::input_gen::{
     EnvScheduleGenerator, FieldLayout, LayoutAwareByteBuilder, LayoutSpec, MirInputDictionary,
     MirObsPathSet, PaddingFillPattern, ScalarLayout,
 };
-use anneal_fuzz::instrument::{EnvAction, TraceRecorder, instrument_source};
-use anneal_fuzz::mutators_itree::{
+use anneal_difftest::instrument::{EnvAction, TraceRecorder, instrument_source};
+use anneal_difftest::mutators_itree::{
     GeneratedItreeCandidate, contains_unsafe_token, generate_itree_batch,
 };
 
@@ -67,9 +67,9 @@ pub fn kernel_step(magic: u32, payload_len: u32) -> u32 {
 "#,
 ];
 
-/// CLI configuration for `itree-fuzz`.
+/// CLI configuration for `itree-difftest`.
 #[derive(Debug, Clone)]
-pub struct ItreeFuzzArgs {
+pub struct ItreeDiffTestArgs {
     pub batches: usize,
     pub batch_size: usize,
     pub inputs_per_fn: usize,
@@ -77,7 +77,7 @@ pub struct ItreeFuzzArgs {
     pub output_json: Option<PathBuf>,
 }
 
-impl Default for ItreeFuzzArgs {
+impl Default for ItreeDiffTestArgs {
     fn default() -> Self {
         Self {
             batches: 2,
@@ -104,8 +104,8 @@ fn parse_u64_or_hex(raw: &str) -> Result<u64, String> {
     }
 }
 
-fn parse_cli_args() -> Result<ItreeFuzzArgs, String> {
-    let mut cfg = ItreeFuzzArgs::default();
+fn parse_cli_args() -> Result<ItreeDiffTestArgs, String> {
+    let mut cfg = ItreeDiffTestArgs::default();
     let args: Vec<String> = env::args().skip(1).collect();
     let mut i = 0usize;
     while i < args.len() {
@@ -143,7 +143,7 @@ fn parse_cli_args() -> Result<ItreeFuzzArgs, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: itree-fuzz [--batches N] [--batch-size B] [--inputs-per-fn K] [--seed S] [--output-json PATH]"
+                    "Usage: itree-difftest [--batches N] [--batch-size B] [--inputs-per-fn K] [--seed S] [--output-json PATH]"
                 );
                 std::process::exit(0);
             }
@@ -175,7 +175,7 @@ fn resolve_rustc_bin() -> String {
 fn compile_rust_strict_opt(label: &str, opt_level: &str, source: &str) -> bool {
     let rustc_bin = resolve_rustc_bin();
     let tmp_dir = env::temp_dir().join(format!(
-        "anneal_itree_fuzz_{}_{}_o{}",
+        "anneal_itree_difftest_{}_{}_o{}",
         std::process::id(),
         label,
         opt_level
@@ -657,7 +657,7 @@ fn main() {
     }
 
     let json_report = format!(
-        "{{\n  \"harness\": \"itree-fuzz\",\n  \"seed\": \"0x{:08x}\",\n  \"batches\": {},\n  \"batch_size\": {},\n  \"inputs_per_fn\": {},\n  \"total_candidates\": {},\n  \"unsafe_token_violations\": {},\n  \"opt_level_0_compiled\": {},\n  \"opt_level_2_compiled\": {},\n  \"opt_o0_o2_parity_count\": {},\n  \"instrumented_compiled\": {},\n  \"compile_pass_rate_pct\": {:.2},\n  \"total_inputs_evaluated\": {},\n  \"metamorphic_parity_passes\": {},\n  \"metamorphic_parity_rate_pct\": {:.2},\n  \"distinct_mir_obs_paths\": {},\n  \"mutator_applications\": {{\n{}\n  }},\n  \"elapsed_ms\": {:.2}\n}}\n",
+        "{{\n  \"harness\": \"itree-difftest\",\n  \"seed\": \"0x{:08x}\",\n  \"batches\": {},\n  \"batch_size\": {},\n  \"inputs_per_fn\": {},\n  \"total_candidates\": {},\n  \"unsafe_token_violations\": {},\n  \"opt_level_0_compiled\": {},\n  \"opt_level_2_compiled\": {},\n  \"opt_o0_o2_parity_count\": {},\n  \"instrumented_compiled\": {},\n  \"compile_pass_rate_pct\": {:.2},\n  \"total_inputs_evaluated\": {},\n  \"metamorphic_parity_passes\": {},\n  \"metamorphic_parity_rate_pct\": {:.2},\n  \"distinct_mir_obs_paths\": {},\n  \"mutator_applications\": {{\n{}\n  }},\n  \"elapsed_ms\": {:.2}\n}}\n",
         args.seed,
         args.batches,
         args.batch_size,
@@ -686,7 +686,7 @@ fn main() {
         fs::write(out_path, &json_report).expect("failed to write --output-json file");
     }
 
-    println!("# `itree-fuzz` Milestone 5 Calibration Report\n");
+    println!("# `itree-difftest` Milestone 5 Calibration Report\n");
     println!(
         "- **Seed**: `0x{:08x}` (`{}` batches × `{}` candidates × `{}` inputs/fn = `{}` executions)",
         args.seed, args.batches, args.batch_size, args.inputs_per_fn, total_inputs_evaluated

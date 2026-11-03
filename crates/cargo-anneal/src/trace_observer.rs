@@ -115,8 +115,8 @@ pub enum RecordedEvent {
     },
 }
 
-/// Structured call-boundary event representation for interchange across fuzzing
-/// and trace serialization pipelines.
+/// Structured call-boundary event representation for interchange across
+/// differential-testing and trace serialization pipelines.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawCallEventJson {
     /// Rust `DefPath` of the callee.

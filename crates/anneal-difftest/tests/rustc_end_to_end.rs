@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 fn assert_compiles_cleanly_with_rustc(label: &str, rust_source: &str) {
     let rustc_bin = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let tmp_dir = std::env::temp_dir().join(format!(
-        "anneal_fuzz_verify_{}_{}",
+        "anneal_difftest_verify_{}_{}",
         std::process::id(),
         label
     ));
@@ -68,12 +68,13 @@ pub fn kernel_step(a: u32, b: u32) -> u32 {
 
     // 1. Verify Milestone 1 instrumented module compiles cleanly with `rustc -D warnings`.
     let instrumented =
-        anneal_fuzz::instrument_source(seed_program, "kernel_step", &["ext_oracle"])
+        anneal_difftest::instrument_source(seed_program, "kernel_step", &["ext_oracle"])
             .expect("instrument_source should succeed");
     assert_compiles_cleanly_with_rustc("milestone_1_instrumented", &instrumented);
 
     // 2. Verify Milestone 4 Miri batch candidates compile cleanly with `rustc -D warnings`.
-    let miri_batch = anneal_fuzz::generate_miri_batch(&[seed_program], 6, 0x1122_3344_5566_7788);
+    let miri_batch =
+        anneal_difftest::generate_miri_batch(&[seed_program], 6, 0x1122_3344_5566_7788);
     assert_eq!(miri_batch.len(), 6);
     for cand in &miri_batch {
         assert_compiles_cleanly_with_rustc(
@@ -84,10 +85,11 @@ pub fn kernel_step(a: u32, b: u32) -> u32 {
 
     // 3. Verify Milestone 5 ITree batch candidates compile cleanly with `#![forbid(unsafe_code)]`
     // and `rustc -D warnings`.
-    let itree_batch = anneal_fuzz::generate_itree_batch(&[seed_program], 6, 0x8877_6655_4433_2211);
+    let itree_batch =
+        anneal_difftest::generate_itree_batch(&[seed_program], 6, 0x8877_6655_4433_2211);
     assert_eq!(itree_batch.len(), 6);
     for cand in &itree_batch {
-        assert!(!anneal_fuzz::contains_unsafe_token(&cand.source));
+        assert!(!anneal_difftest::contains_unsafe_token(&cand.source));
         let strict_safe_src = format!("#![forbid(unsafe_code)]\n{}", cand.source);
         assert_compiles_cleanly_with_rustc(
             &format!("milestone_5_itree_{}", cand.id),
