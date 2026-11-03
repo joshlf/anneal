@@ -262,6 +262,10 @@ into `LayoutTable.entries` (`R-TY-01`), so operational semantics never guesses a
 type's size, alignment, or field offsets from `RigidTy` alone.
 -/
 inductive RigidTy : Type where
+  /-- Generic type parameter `T` at index `idx` (`ty::Param`). -/
+  | param (idx : Nat) (name : String) : RigidTy
+  /-- Associated type alias `<T as Trait>::Assoc` (`ty::Alias`). -/
+  | alias (defPath : DefPath) (args : List RigidTy) : RigidTy
   /-- Boolean (`bool`). -/
   | bool : RigidTy
   /-- Unicode scalar value (`char`). -/
@@ -590,5 +594,38 @@ inductive ContractRole : Type where
   | externalSpec (subjectDefPath : DefPath) : ContractRole
   /-- Pure specification model function (`#[anneal::model]`). -/
   | model : ContractRole
+
+
+/--
+Generic type parameter definition.
+-/
+structure GenericParamDef : Type where
+  /-- 0-based index of the parameter. -/
+  idx : Nat
+  /-- Name of the generic parameter. -/
+  name : String
+
+/--
+Trait reference `<T as Trait>`.
+-/
+structure TraitRef : Type where
+  /-- Canonical path of the trait. -/
+  defPath : DefPath
+  /-- Type arguments to the trait. -/
+  args : List RigidTy
+
+/--
+Trait implementation entry `impl Trait for T`.
+-/
+structure TraitImplEntry : Type where
+  /-- Implemented trait reference. -/
+  traitRef : TraitRef
+  /-- Canonical path of the `impl` block. -/
+  implPath : DefPath
+
+/--
+Type substitution list mapping `idx` to a type and its layout.
+-/
+abbrev TypeSubst : Type := List (RigidTy × TypeLayout)
 
 end Trusted.Rustc.V2026_08_01.MirAst

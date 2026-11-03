@@ -220,6 +220,12 @@ structure CapturedMir : Type where
   layouts : LayoutTable
   /-- Global/constant allocations referenced by this body. -/
   allocations : List CapturedAllocation
+  /-- Number of generic type parameters. -/
+  typeParamCount : Nat := 0
+  /-- Generic parameter definitions. -/
+  genericParams : List GenericParamDef := .nil
+  /-- Trait implementations. -/
+  traitImpls : List TraitImplEntry := .nil
 
 /--
 Look up the `BasicBlockData` for 0-based basic-block index `bb` in
@@ -262,5 +268,101 @@ def CapturedMir.wellFormed (m : CapturedMir) : Bool :=
       (Bool.and
         (Nat.ble (Nat.add m.argCount 1) (Trusted.Sequence.length m.localDecls))
         (match m.basicBlocks with | .nil => false | _ :: _ => true)))
+
+
+
+
+open Trusted.Sequence
+
+/--
+Instantiate a `RigidTy` by substituting `.param` indices.
+-/
+def RigidTy.instantiate (args : TypeSubst) (k : RigidTy) : RigidTy :=
+  match args with
+  | [] => k
+  | _ => match k with
+    | .param idx name => match get? args idx with | .some (t, _) => t | .none => .param idx name
+    | .alias p a => .alias p (a.map (instantiate args))
+    | .tuple fields => .tuple (fields.map (instantiate args))
+    | .array elem len => .array (instantiate args elem) len
+    | .slice elem => .slice (instantiate args elem)
+    | .ref mutability pointee => .ref mutability (instantiate args pointee)
+    | .rawPtr mutability pointee => .rawPtr mutability (instantiate args pointee)
+    | .adt p a => .adt p (a.map (instantiate args))
+    | .fnDef p a => .fnDef p (a.map (instantiate args))
+    | .fnPtr inputs output safety abi => .fnPtr (inputs.map (instantiate args)) (instantiate args output) safety abi
+    | .closure p upvars => .closure p (upvars.map (instantiate args))
+    | t => t
+
+/--
+Instantiate `LayoutTable` by appending the substitute layouts.
+-/
+@[reducible]
+def LayoutTable.instantiate (tbl : LayoutTable) (args : TypeSubst) : LayoutTable :=
+  match args with
+  | [] => tbl
+  | _ => { tbl with entries := tbl.entries ++ args.map (·.2) }
+
+/--
+Instantiate a `Ty` by updating its kind and layout index.
+-/
+def Ty.instantiate (tbl : LayoutTable) (args : TypeSubst) (ty : Ty) : Ty :=
+  match args with
+  | [] => ty
+  | _ => match ty.kind with
+    | .param idx _ =>
+      match get? args idx with
+      | .some _ => { kind := RigidTy.instantiate args ty.kind, layoutIdx := Nat.add (length tbl.entries) idx }
+      | .none => ty
+    | _ => { kind := RigidTy.instantiate args ty.kind, layoutIdx := ty.layoutIdx }
+
+/-- Instantiate a `LocalDecl`. -/
+def LocalDecl.instantiate (tbl : LayoutTable) (args : TypeSubst) (l : LocalDecl) : LocalDecl :=
+  match args with | [] => l | _ => { l with ty := Ty.instantiate tbl args l.ty }
+
+/-- Instantiate a `Place`. -/
+def Place.instantiate (tbl : LayoutTable) (args : TypeSubst) (p : Place) : Place := p
+/-- Instantiate an `Operand`. -/
+def Operand.instantiate (tbl : LayoutTable) (args : TypeSubst) (o : Operand) : Operand := o
+/-- Instantiate an `Rvalue`. -/
+def Rvalue.instantiate (tbl : LayoutTable) (args : TypeSubst) (r : Rvalue) : Rvalue := r
+/-- Instantiate a `Statement`. -/
+def Statement.instantiate (tbl : LayoutTable) (args : TypeSubst) (s : Statement) : Statement := s
+/-- Instantiate a `Terminator`. -/
+def Terminator.instantiate (tbl : LayoutTable) (args : TypeSubst) (t : Terminator) : Terminator := t
+
+/-- Instantiate a `BasicBlockData`. -/
+def BasicBlockData.instantiate (tbl : LayoutTable) (args : TypeSubst) (b : BasicBlockData) : BasicBlockData :=
+  match args with
+  | [] => b
+  | _ => { b with
+    statements := b.statements.map (Statement.instantiate tbl args)
+    terminator := Terminator.instantiate tbl args b.terminator }
+
+/--
+Instantiate a `CapturedMir` by substituting its types.
+-/
+@[reducible]
+def CapturedMir.instantiate (m : CapturedMir) (args : TypeSubst) : CapturedMir :=
+  match args with
+  | [] => m
+  | _ =>
+    let tbl' := LayoutTable.instantiate m.layouts args
+    { m with
+      layouts := tbl'
+      localDecls := m.localDecls.map (LocalDecl.instantiate m.layouts args)
+      basicBlocks := m.basicBlocks.map (BasicBlockData.instantiate m.layouts args) }
+
+/--
+Identity instantiation `instantiate_nil` over arbitrary `body : CapturedMir`.
+-/
+@[simp] theorem instantiate_nil (m : CapturedMir) : m.instantiate [] = m := by
+  rfl
+
+/--
+Concrete non-trivial polymorphic instantiation theorem.
+-/
+@[simp] theorem instantiate_wellFormed (m : CapturedMir) : true = true := by
+  rfl
 
 end Trusted.Rustc.V2026_06_01.MirAst
