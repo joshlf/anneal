@@ -3,16 +3,22 @@
 //!
 //! Translates parsed `SpecrItem` declarations (enums, structs, and executable
 //! functions/methods) from `TypeEnvironment` into executable Lean 4 definitions
-//! under `MiniRust.Snapshots.<Snap>.Generated.Ops`, preserving exact `@specr-source`
+//! under `MiniRust.Snapshots.<Snap>.Generated.Ops`, preserving `@specr-source`
 //! line spans and `@specr-body-sha256` provenance.
 
+use std::collections::BTreeSet;
+
+use crate::expr_lower::{
+    emit_general_lowered_items, lower_specr_enum_to_lean, lower_specr_fn_to_lean,
+    lower_specr_struct_to_lean,
+};
 use crate::extractor::ExtractedSnapshot;
 use crate::lean_emit::{lean_snapshot_namespace, lean_string_literal};
 use crate::specr_ast::{SpecrItem, VariantPayload, escape_lean_ident, normalize_whitespace};
 use crate::type_env::TypeEnvironment;
 
 /// Deterministically renders the executable Lean 4 `Generated/Ops.lean` module
-/// for `(snapshot, env)` by translating parsed `SpecrItem` declarations in `env.items`.
+/// for `(snapshot, env)` from `SpecrItem` declarations in `env.items`.
 #[must_use]
 pub fn render_ops_lean(snapshot: &ExtractedSnapshot, env: &TypeEnvironment) -> String {
     let ns_snap = lean_snapshot_namespace(&snapshot.snapshot_id);
@@ -25,12 +31,20 @@ pub fn render_ops_lean(snapshot: &ExtractedSnapshot, env: &TypeEnvironment) -> S
         "-- Upstream snapshot: {} @ {}\n",
         snapshot.snapshot_id, snapshot.git_sha
     ));
-    s.push_str("-- AST-translated from `env.items` by `crates/anneal-specr-lean/src/ops_emit.rs`.\n\n");
+    s.push_str(
+        "-- AST-translated from `env.items` by `crates/anneal-specr-lean/src/ops_emit.rs`.\n\n",
+    );
     s.push_str(&format!(
         "namespace MiniRust.Snapshots.{ns_snap}.Generated.Ops\n\n"
     ));
     s.push_str("open MiniRust.LibSpecr\n\n");
     s.push_str("deriving instance DecidableEq for Except\n\n");
+    s.push_str("deriving instance Inhabited for Align, Size, Offset, Endianness, SpecrMap, SpecrSet, TerminationInfo\n\n");
+    s.push_str("instance {α : Type} : Inhabited (NdComp α) where\n  default := .ret (.error .machineStop)\n\n");
+    s.push_str("instance : Min Align where\n  min a₁ a₂ := ⟨Nat.min a₁.exp a₂.exp⟩\n\n");
+    s.push_str("instance : Max Align where\n  max a₁ a₂ := ⟨Nat.max a₁.exp a₂.exp⟩\n\n");
+    s.push_str("instance : Min Size where\n  min s₁ s₂ := ⟨Nat.min s₁.bytes s₂.bytes⟩\n\n");
+    s.push_str("instance : Max Size where\n  max s₁ s₂ := ⟨Nat.max s₁.bytes s₂.bytes⟩\n\n");
 
     // =========================================================================
     // 1. Core Enums & Structs (AST-translated from `env.items`)
@@ -41,7 +55,7 @@ pub fn render_ops_lean(snapshot: &ExtractedSnapshot, env: &TypeEnvironment) -> S
     s.push_str("inductive Signedness : Type where\n");
     s.push_str("  | Signed\n");
     s.push_str("  | Unsigned\n");
-    s.push_str("  deriving DecidableEq, Repr\n\n");
+    s.push_str("  deriving Inhabited, DecidableEq, Repr\n\n");
 
     emit_enum_from_env(
         &mut s,
@@ -249,13 +263,13 @@ pub fn render_ops_lean(snapshot: &ExtractedSnapshot, env: &TypeEnvironment) -> S
     emit_l1_scalars(&mut s, env, sha);
 
     // =========================================================================
-    // 3. L2 Bytes & Layout (`spec/mem/interface.md` & `spec/lang/representation.md`)
+    // 3. L2 Bytes & Layout (`interface.md` & `representation.md`)
     // =========================================================================
     s.push_str("/-! ## 3. L2 Abstract Bytes & Representation Relation (`spec/mem/interface.md`, `spec/lang/representation.md`) -/\n\n");
     emit_l2_bytes_and_layout(&mut s, env, sha);
 
     // =========================================================================
-    // 4. L3 Places & BasicMemory (`spec/mem/basic.md` & `spec/lang/step/expressions.md`)
+    // 4. L3 Places & BasicMemory (`basic.md` & `expressions.md`)
     // =========================================================================
     s.push_str("/-! ## 4. L3 Places & `BasicMemory` Semantics (`spec/mem/basic.md`, `spec/lang/step/expressions.md`) -/\n\n");
     emit_l3_places_and_basic_mem(&mut s, env, sha);
@@ -267,15 +281,131 @@ pub fn render_ops_lean(snapshot: &ExtractedSnapshot, env: &TypeEnvironment) -> S
     emit_l4_tree_borrows(&mut s, env, sha);
 
     // =========================================================================
-    // 6. L5 & L6 Control, Calls, & Machine (`spec/lang/step/terminators.md` & `spec/lang/machine.md`)
+    // 6. L5 & L6 Control, Calls, & Machine (`terminators.md` & `machine.md`)
     // =========================================================================
     s.push_str("/-! ## 6. L5 & L6 Control Flow, Calls, & Machine Step (`spec/lang/step/terminators.md`, `spec/lang/machine.md`) -/\n\n");
     emit_l5_l6_control_and_machine(&mut s, env, sha);
 
-    s.push_str(&format!(
-        "end MiniRust.Snapshots.{ns_snap}.Generated.Ops\n"
-    ));
+    // =========================================================================
+    // 7. General-Purpose AST-Lowered Declarations (`expr_lower.rs`)
+    // =========================================================================
+    s.push_str("/-! ## 7. General-Purpose AST-Lowered Specr Declarations -/\n\n");
+    let already_emitted = build_already_emitted_set();
+    emit_general_lowered_items(&mut s, env, &already_emitted);
+
+    s.push_str(&format!("end MiniRust.Snapshots.{ns_snap}.Generated.Ops\n"));
     s
+}
+
+fn build_already_emitted_set() -> BTreeSet<String> {
+    [
+        // LibSpecr built-ins
+        "Endianness",
+        "TerminationInfo",
+        "Size",
+        "Align",
+        "Offset",
+        "Signedness",
+        "SpecrInt",
+        "Int",
+        "Nat",
+        "Bool",
+        "UInt8",
+        "String",
+        "Unit",
+        "Option",
+        "Except",
+        "Result",
+        "NdResult",
+        "NdComp",
+        "List",
+        "Set",
+        "Map",
+        "SpecrSet",
+        "SpecrMap",
+        // Section 1: Core types
+        "IntUnOp",
+        "IntBinOp",
+        "IntBinOpWithOverflow",
+        "RelOp",
+        "IntType",
+        "AllocationKind",
+        "AccessKind",
+        "NodeRelation",
+        "Protected",
+        "Protected::yes",
+        "PermissionUnprot",
+        "PermissionProt",
+        "Permission",
+        "TreeBorrowsParams",
+        "ThreadState",
+        // Section 2: L1 Scalars
+        "IntType::can_represent",
+        "can_represent",
+        "IntType::bring_in_bounds",
+        "bring_in_bounds",
+        "Machine::eval_count_ones",
+        "eval_count_ones",
+        "Machine::eval_int_un_op",
+        "eval_int_un_op",
+        "Machine::eval_int_bin_op",
+        "eval_int_bin_op",
+        "Machine::eval_bin_op",
+        "eval_bin_op",
+        "Machine::eval_rel_op",
+        "eval_rel_op",
+        // Section 3: L2 Bytes & Layout
+        "MrAbstractByte",
+        "AbstractByte::data",
+        "AbstractByte::provenance_frag",
+        "AbstractByte::DefinedRelation::le_defined",
+        "DefinedRelation::le_defined",
+        "Type::decode",
+        "Type::encode",
+        "decode_discriminant",
+        // Section 4: L3 Places & BasicMemory
+        "AllocId",
+        "MrPointer",
+        "MrAllocation",
+        "BasicMemory",
+        "BasicMemory::check_ptr",
+        "BasicMemory::load",
+        "BasicMemory::store",
+        "BasicMemory::deallocate",
+        "Machine::eval_place",
+        // Section 5: L4 Tree Borrows
+        "PermissionUnprot::local_read",
+        "PermissionUnprot::local_write",
+        "PermissionUnprot::foreign_read",
+        "PermissionUnprot::foreign_write",
+        "PermissionUnprot::transition",
+        "PermissionUnprot::init_access",
+        "PermissionUnprot::prevents_deallocation",
+        "PermissionProt::local_read",
+        "PermissionProt::local_write",
+        "PermissionProt::foreign_read",
+        "PermissionProt::foreign_write",
+        "PermissionProt::transition",
+        "PermissionProt::init_access",
+        "PermissionProt::unprotect",
+        "PermissionProt::prevents_deallocation",
+        "Permission::transition",
+        "Permission::init_access",
+        "Permission::unprotect",
+        "Permission::prevents_deallocation",
+        "ReborrowSettings::new",
+        // Section 6: L5 & L6 Control, Calls, & Machine
+        "StackPopAction",
+        "MrStackFrame",
+        "StackFrame::jump_to_block",
+        "Machine::step",
+        "Machine::eval_terminator",
+        "Machine::fn_from_ptr",
+        "MrUnwindOutcome",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 fn find_item<'a>(env: &'a TypeEnvironment, candidates: &[&str]) -> Option<&'a SpecrItem> {
@@ -340,6 +470,14 @@ fn emit_enum_from_env(
     fallback_variants: &[(&str, &[(&str, &str)])],
 ) {
     let item = find_item(env, candidates);
+    if lean_name != "ThreadState"
+        && let Some(it) = item
+        && !it.variants.is_empty()
+        && let Ok(lowered) = lower_specr_enum_to_lean(it, Some(lean_name))
+    {
+        s.push_str(&lowered);
+        return;
+    }
     emit_provenance(s, item, fallback_loc, git_sha);
     s.push_str(&format!("inductive {lean_name} : Type where\n"));
     if let Some(it) = item
@@ -379,7 +517,7 @@ fn emit_enum_from_env(
             s.push_str(&format!("  | {vname}{args}\n"));
         }
     }
-    s.push_str("  deriving DecidableEq, Repr\n\n");
+    s.push_str("  deriving Inhabited, DecidableEq, Repr\n\n");
 }
 
 fn emit_struct_from_env(
@@ -392,39 +530,39 @@ fn emit_struct_from_env(
     fallback_fields: &[(&str, &str)],
 ) {
     let item = find_item(env, candidates);
-    emit_provenance(s, item, fallback_loc, git_sha);
-    s.push_str(&format!("structure {lean_name} : Type where\n"));
     if let Some(it) = item
         && !it.fields.is_empty()
+        && let Ok(lowered) = lower_specr_struct_to_lean(it, Some(lean_name))
     {
-        for (idx, f) in it.fields.iter().enumerate() {
-            let fname = escape_lean_ident(&f.name);
-            let (_, lty) = map_specr_type_to_lean(&f.ty, idx);
-            s.push_str(&format!("  {fname} : {lty}\n"));
-        }
-    } else {
-        for (fname, fty) in fallback_fields {
-            s.push_str(&format!("  {fname} : {fty}\n"));
-        }
+        s.push_str(&lowered);
+        return;
     }
-    s.push_str("  deriving DecidableEq, Repr\n\n");
+    emit_provenance(s, item, fallback_loc, git_sha);
+    s.push_str(&format!("structure {lean_name} : Type where\n"));
+    for (fname, fty) in fallback_fields {
+        s.push_str(&format!("  {fname} : {fty}\n"));
+    }
+    s.push_str("  deriving Inhabited, DecidableEq, Repr\n\n");
 }
 
 fn emit_protected_yes(s: &mut String, env: &TypeEnvironment, git_sha: &str) {
     let item = find_item(env, &["Protected::yes"]);
-    emit_provenance(s, item, "spec/mem/tree_borrows/tree.md:22-24", git_sha);
-    let op = if let Some(it) = item
-        && it.body_canonical.contains("==")
-        && !it.body_canonical.contains("!=")
+    if let Some(it) = item
+        && let Ok(lowered) = lower_specr_fn_to_lean(it, env, None)
     {
-        "=="
-    } else {
-        "!="
-    };
+        let adapted = lowered
+            .replacen("def Protected_yes", "def Protected.yes", 1)
+            .replacen(
+                "abbrev Protected.yes := Protected_yes",
+                "abbrev Protected_yes := Protected.yes",
+                1,
+            );
+        s.push_str(&adapted);
+        return;
+    }
+    emit_provenance(s, item, "spec/mem/tree_borrows/tree.md:22-24", git_sha);
     s.push_str("@[reducible]\n");
-    s.push_str(&format!(
-        "def Protected.yes (self : Protected) : Bool :=\n  self {op} .No\n\n"
-    ));
+    s.push_str("def Protected.yes (self : Protected) : Bool :=\n  self != .No\n\n");
 }
 
 /// Finds the matching closing delimiter starting from `open_pos`.
@@ -470,7 +608,8 @@ fn find_matching_delim(src: &str, open_pos: usize) -> Option<usize> {
     None
 }
 
-/// Extracts top-level `(pattern, rhs)` arms from the first `match ... { ... }` block in `body`.
+/// Extracts top-level `(pattern, rhs)` arms from the first `match ... { ... }`
+/// block in `body`.
 fn parse_first_match_arms(body: &str) -> Vec<(String, String)> {
     let Some(match_pos) = body.find("match ") else {
         return Vec::new();
@@ -612,8 +751,8 @@ fn extract_throw_ub_msg(src: &str, default_msg: &str) -> String {
     default_msg.to_string()
 }
 
-/// Extracts the binary arithmetic operator (`+`, `-`, `*`, `/`, `%`) applied to `left` and `right`
-/// inside an AST expression snippet `rhs`.
+/// Extracts the binary arithmetic operator (`+`, `-`, `*`, `/`, `%`) applied to
+/// `left` and `right` inside an AST expression snippet `rhs`.
 fn extract_left_right_arith_op<'a>(rhs: &str, default_op: &'a str) -> &'a str {
     for (needle, op) in [
         ("left + right", "+"),
@@ -652,7 +791,7 @@ fn emit_l1_scalars(s: &mut String, env: &TypeEnvironment, git_sha: &str) {
     s.push_str("  | .Unsigned => Int.ofNat wrapped\n");
     s.push_str("  | .Signed => SpecrInt.toSigned wrapped self.size.bits\n\n");
 
-    // 3. `eval_count_ones` (from `Machine::eval_count_ones` in `spec/lang/step/operators.md`)
+    // 3. `eval_count_ones` (from `Machine::eval_count_ones` in `operators.md`)
     let count_ones_item = find_item(env, &["Machine::eval_count_ones"]);
     emit_provenance(
         s,
@@ -670,12 +809,7 @@ fn emit_l1_scalars(s: &mut String, env: &TypeEnvironment, git_sha: &str) {
 
     // 4. `eval_int_un_op` (AST-translated from `Machine::eval_int_un_op`)
     let un_op_item = find_item(env, &["Machine::eval_int_un_op"]);
-    emit_provenance(
-        s,
-        un_op_item,
-        "spec/lang/step/operators.md:20-31",
-        git_sha,
-    );
+    emit_provenance(s, un_op_item, "spec/lang/step/operators.md:20-31", git_sha);
     let mut neg_expr = "operand_ty.bring_in_bounds (-operand)".to_string();
     let mut bitnot_expr = "operand_ty.bring_in_bounds (-operand - 1)".to_string();
     let mut count_ones_expr = "eval_count_ones operand operand_ty".to_string();
@@ -702,7 +836,7 @@ fn emit_l1_scalars(s: &mut String, env: &TypeEnvironment, git_sha: &str) {
     s.push_str(&format!("  | .BitNot => .ok ({bitnot_expr})\n"));
     s.push_str(&format!("  | .CountOnes => .ok ({count_ones_expr})\n\n"));
 
-    // 5. Bitwise helpers over unsigned bit representations (`mrBitAnd`, `mrBitOr`, `mrBitXor`)
+    // 5. Bitwise helpers over unsigned bit representations (`mrBitAnd`, etc.)
     s.push_str("def mrBitAnd : Nat → Nat → Nat → Nat\n");
     s.push_str("  | 0, _, _ => 0\n");
     s.push_str("  | k + 1, a, b =>\n");
@@ -721,7 +855,7 @@ fn emit_l1_scalars(s: &mut String, env: &TypeEnvironment, git_sha: &str) {
     s.push_str("    let bit := if (a % 2) == (b % 2) then 0 else 1\n");
     s.push_str("    bit + 2 * mrBitXor k (a / 2) (b / 2)\n\n");
 
-    // 6. `eval_int_bin_op` (AST-translated from `Machine::eval_int_bin_op` in `spec/lang/step/operators.md`)
+    // 6. `eval_int_bin_op` (AST-translated from `Machine::eval_int_bin_op`)
     let bin_op_item = find_item(env, &["Machine::eval_int_bin_op"]);
     emit_provenance(
         s,
@@ -922,12 +1056,7 @@ fn emit_l1_scalars(s: &mut String, env: &TypeEnvironment, git_sha: &str) {
 
     // 8. `eval_rel_op_bool` & `eval_cmp_int` (from `Machine::eval_rel_op`)
     let rel_item = find_item(env, &["Machine::eval_rel_op"]);
-    emit_provenance(
-        s,
-        rel_item,
-        "spec/lang/step/operators.md:322-340",
-        git_sha,
-    );
+    emit_provenance(s, rel_item, "spec/lang/step/operators.md:322-340", git_sha);
     s.push_str("@[reducible]\n");
     s.push_str("def eval_rel_op_bool (rel : RelOp) (left right : SpecrInt) : Bool :=\n");
     s.push_str("  match rel with\n");
@@ -1061,7 +1190,9 @@ fn emit_l1_scalars(s: &mut String, env: &TypeEnvironment, git_sha: &str) {
     s.push_str("  (a / (2 ^ shift)) % (256 ^ sizeBytes)\n\n");
 
     s.push_str("@[reducible]\n");
-    s.push_str("def mrShrUncheckedUnsigned (a b sizeBytes : Nat) : Except TerminationInfo Nat :=\n");
+    s.push_str(
+        "def mrShrUncheckedUnsigned (a b sizeBytes : Nat) : Except TerminationInfo Nat :=\n",
+    );
     s.push_str("  let numBits := sizeBytes * 8\n");
     s.push_str("  if decide (numBits ≤ b) then\n");
     s.push_str(&format!(
@@ -1199,7 +1330,8 @@ fn emit_l2_bytes_and_layout(s: &mut String, env: &TypeEnvironment, git_sha: &str
     s.push_str("      some (b.toBitVec.toNat + 256 * highBits, mergeMrProvenance prov restProv)\n");
     s.push_str("    | none => none\n\n");
 
-    // Composite representation helpers (`Tuple`, `Array`, `Union`, `Enum` from `spec/lang/representation.md:248-434`)
+    // Composite representation helpers (`Tuple`, `Array`, `Union`, `Enum` from
+    // `spec/lang/representation.md:248-434`)
     emit_provenance(
         s,
         type_decode_item,
@@ -1247,7 +1379,9 @@ fn emit_l2_bytes_and_layout(s: &mut String, env: &TypeEnvironment, git_sha: &str
     s.push_str("def decode_tuple_fields (bytes : List MrAbstractByte) : List (Nat × Nat) → Option (List (List MrAbstractByte))\n");
     s.push_str("  | [] => some []\n");
     s.push_str("  | (off, len) :: rest =>\n");
-    s.push_str("    match subslice_with_length bytes off len, decode_tuple_fields bytes rest with\n");
+    s.push_str(
+        "    match subslice_with_length bytes off len, decode_tuple_fields bytes rest with\n",
+    );
     s.push_str("    | some slice, some restSlices => some (slice :: restSlices)\n");
     s.push_str("    | _, _ => none\n\n");
 
@@ -1330,7 +1464,9 @@ fn emit_l3_places_and_basic_mem(s: &mut String, env: &TypeEnvironment, git_sha: 
     s.push_str("  deriving DecidableEq, Repr\n\n");
 
     s.push_str("@[reducible]\n");
-    s.push_str("def BasicMemory.findAlloc (mem : BasicMemory) (id : AllocId) : Option MrAllocation :=\n");
+    s.push_str(
+        "def BasicMemory.findAlloc (mem : BasicMemory) (id : AllocId) : Option MrAllocation :=\n",
+    );
     s.push_str("  mem.allocs.find? (fun a => a.id == id)\n\n");
 
     let check_ptr_item = find_item(env, &["BasicMemory::check_ptr"]);
@@ -1382,7 +1518,9 @@ fn emit_l3_places_and_basic_mem(s: &mut String, env: &TypeEnvironment, git_sha: 
     s.push_str("    if !alloc.live then\n");
     s.push_str("      .error (.ub \"double-free\")\n");
     s.push_str("    else if ptr.offset != 0 then\n");
-    s.push_str("      .error (.ub \"deallocating with pointer not to the beginning of its allocation\")\n");
+    s.push_str(
+        "      .error (.ub \"deallocating with pointer not to the beginning of its allocation\")\n",
+    );
     s.push_str("    else if alloc.size != expectedSize then\n");
     s.push_str("      .error (.ub \"deallocating with incorrect size information\")\n");
     s.push_str("    else if alloc.align != reqAlign then\n");
@@ -1467,7 +1605,7 @@ fn translate_init_access_rhs(rhs: &str) -> String {
 }
 
 fn emit_l4_tree_borrows(s: &mut String, env: &TypeEnvironment, git_sha: &str) {
-    // 1. `PermissionUnprot` methods AST-translated from `state_machine_unprotected.md`
+    // 1. `PermissionUnprot` methods from `state_machine_unprotected.md`
     for (method_name, fallback_span, default_arms) in [
         (
             "local_read",
@@ -1584,7 +1722,9 @@ fn emit_l4_tree_borrows(s: &mut String, env: &TypeEnvironment, git_sha: &str) {
         ]
     };
     s.push_str("@[reducible]\n");
-    s.push_str("def PermissionUnprot.init_access (self : PermissionUnprot) : Option AccessKind :=\n");
+    s.push_str(
+        "def PermissionUnprot.init_access (self : PermissionUnprot) : Option AccessKind :=\n",
+    );
     s.push_str("  match self with\n");
     for (pat, rhs) in unprot_init_arms {
         s.push_str(&format!("  | {pat} => {rhs}\n"));
@@ -1611,7 +1751,7 @@ fn emit_l4_tree_borrows(s: &mut String, env: &TypeEnvironment, git_sha: &str) {
         "def PermissionUnprot.prevents_deallocation (_self : PermissionUnprot) : Bool :=\n  {unprot_dealloc_val}\n\n"
     ));
 
-    // 2. `PermissionProt` methods AST-translated from `state_machine_protected.md`
+    // 2. `PermissionProt` methods from `state_machine_protected.md`
     let prot_lr = find_item(env, &["PermissionProt::local_read"]);
     emit_provenance(
         s,
@@ -1706,9 +1846,9 @@ fn emit_l4_tree_borrows(s: &mut String, env: &TypeEnvironment, git_sha: &str) {
     s.push_str("  | .Foreign, .Read => self.foreign_read\n");
     s.push_str("  | .Foreign, .Write => self.foreign_write\n\n");
 
-    // `PermissionProt.init_access`: AST-parsed from `state_machine_protected.md:90-98`!
+    // `PermissionProt.init_access`: parsed from `state_machine_protected.md`.
     // In `S2026_05_Matched`: `Cell => None, _ => Some(AccessKind::Read)`
-    // In `S2026_07_BleedingEdge`: `Cell => None, Unique => Some(AccessKind::Write), _ => Some(AccessKind::Read)`
+    // In `S2026_07_BleedingEdge`: `Unique => Some(AccessKind::Write)`, etc.
     let prot_init = find_item(env, &["PermissionProt::init_access"]);
     emit_provenance(
         s,
@@ -1845,7 +1985,8 @@ fn emit_l4_tree_borrows(s: &mut String, env: &TypeEnvironment, git_sha: &str) {
     s.push_str("  | .Unprot p => p.prevents_deallocation\n");
     s.push_str("  | .Prot p => p.prevents_deallocation\n\n");
 
-    // 4. `reborrow_permission` AST-translated from `ReborrowSettings::new` in `reborrow_settings.md`
+    // 4. `reborrow_permission` from `ReborrowSettings::new` in
+    // `reborrow_settings.md`
     let reborrow_item = find_item(env, &["ReborrowSettings::new"]);
     emit_provenance(
         s,
@@ -1863,7 +2004,9 @@ fn emit_l4_tree_borrows(s: &mut String, env: &TypeEnvironment, git_sha: &str) {
         s.push_str("    (is_mutable : Bool) (prot : Protected) (inside : Bool) (frozen : Bool) (implicit_writes : Bool) :\n");
         s.push_str("    Permission :=\n");
         s.push_str("  let implicit_writes_enabled := prot.yes && implicit_writes\n");
-        s.push_str("  let mk_perm (unprot : PermissionUnprot) (p : PermissionProt) : Permission :=\n");
+        s.push_str(
+            "  let mk_perm (unprot : PermissionUnprot) (p : PermissionProt) : Permission :=\n",
+        );
         s.push_str("    if prot.yes then .Prot p else .Unprot unprot\n");
         s.push_str("  if !is_mutable then\n");
         s.push_str("    if frozen then\n");
@@ -1880,7 +2023,9 @@ fn emit_l4_tree_borrows(s: &mut String, env: &TypeEnvironment, git_sha: &str) {
         s.push_str("def reborrow_permission\n");
         s.push_str("    (is_mutable : Bool) (prot : Protected) (_inside : Bool) (frozen : Bool) (_implicit_writes : Bool) :\n");
         s.push_str("    Permission :=\n");
-        s.push_str("  let mk_perm (unprot : PermissionUnprot) (p : PermissionProt) : Permission :=\n");
+        s.push_str(
+            "  let mk_perm (unprot : PermissionUnprot) (p : PermissionProt) : Permission :=\n",
+        );
         s.push_str("    if prot.yes then .Prot p else .Unprot unprot\n");
         s.push_str("  if !is_mutable then\n");
         s.push_str("    if frozen then\n");
@@ -1893,7 +2038,8 @@ fn emit_l4_tree_borrows(s: &mut String, env: &TypeEnvironment, git_sha: &str) {
         s.push_str("    mk_perm .ReservedIm (.Reserved false false)\n\n");
     }
 
-    // 5. `reborrow_init_and_foreign_read`: evaluates initial access followed by foreign read on a reborrowed tag
+    // 5. `reborrow_init_and_foreign_read`: evaluates initial access followed
+    // by foreign read on a reborrowed tag
     s.push_str("@[reducible]\n");
     s.push_str("def reborrow_init_and_foreign_read\n");
     s.push_str("    (is_mutable : Bool) (prot : Protected) (inside : Bool) (frozen : Bool) (implicit_writes : Bool) :\n");
@@ -1964,7 +2110,9 @@ fn emit_l5_l6_control_and_machine(s: &mut String, env: &TypeEnvironment, git_sha
     let jump_item = find_item(env, &["StackFrame::jump_to_block"]);
     emit_provenance(s, jump_item, "spec/lang/machine.md:298-301", git_sha);
     s.push_str("@[reducible]\n");
-    s.push_str("def MrStackFrame.jump_to_block (frame : MrStackFrame) (b : Nat) : MrStackFrame :=\n");
+    s.push_str(
+        "def MrStackFrame.jump_to_block (frame : MrStackFrame) (b : Nat) : MrStackFrame :=\n",
+    );
     s.push_str("  { frame with blockIdx := b, stmtIdx := 0 }\n\n");
 
     let step_item = find_item(env, &["Machine::step"]);
@@ -2030,7 +2178,9 @@ fn emit_l5_l6_control_and_machine(s: &mut String, env: &TypeEnvironment, git_sha
 
     emit_provenance(s, step_item, "spec/lang/machine.md:221-233", git_sha);
     let dispatch_cmp = if let Some(it) = step_item
-        && it.body_canonical.contains("frame.next_stmt != block.statements.len()")
+        && it
+            .body_canonical
+            .contains("frame.next_stmt != block.statements.len()")
     {
         "!="
     } else {

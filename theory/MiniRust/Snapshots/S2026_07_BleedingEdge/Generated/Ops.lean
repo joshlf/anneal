@@ -10,141 +10,160 @@ open MiniRust.LibSpecr
 
 deriving instance DecidableEq for Except
 
+deriving instance Inhabited for Align, Size, Offset, Endianness, SpecrMap, SpecrSet, TerminationInfo
+
+instance {α : Type} : Inhabited (NdComp α) where
+  default := .ret (.error .machineStop)
+
+instance : Min Align where
+  min a₁ a₂ := ⟨Nat.min a₁.exp a₂.exp⟩
+
+instance : Max Align where
+  max a₁ a₂ := ⟨Nat.max a₁.exp a₂.exp⟩
+
+instance : Min Size where
+  min s₁ s₂ := ⟨Nat.min s₁.bytes s₂.bytes⟩
+
+instance : Max Size where
+  max s₁ s₂ := ⟨Nat.max s₁.bytes s₂.bytes⟩
+
 /-! ## 1. Core Syntax, Type, Memory, Tree Borrows, & Machine Data Types -/
 
 /-- Integer signedness (`libspecr::Signedness`). -/
 inductive Signedness : Type where
   | Signed
   | Unsigned
-  deriving DecidableEq, Repr
+  deriving Inhabited, DecidableEq, Repr
 
--- @specr-source: spec/lang/syntax.md:52-54 @ d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed
+-- @specr-source: spec/lang/syntax.md:52..54 (IntUnOp)
 -- @specr-body-sha256: aa4f7357b11e6a9f796c38cdbab23ccff793368d1eec79fc0da280d4f1ae7a5b
 inductive IntUnOp : Type where
-  | Neg
-  | BitNot
-  | CountOnes
-  deriving DecidableEq, Repr
+  | Neg : IntUnOp
+  | BitNot : IntUnOp
+  | CountOnes : IntUnOp
+  deriving Inhabited, DecidableEq, Repr
 
--- @specr-source: spec/lang/syntax.md:66-81 @ d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed
+-- @specr-source: spec/lang/syntax.md:66..81 (IntBinOp)
 -- @specr-body-sha256: 3aa04f1af14aa2a333349c529e8092082c987aec0b80115243acc53c0f36bcf4
 inductive IntBinOp : Type where
-  | Add
-  | AddUnchecked
-  | Sub
-  | SubUnchecked
-  | Mul
-  | MulUnchecked
-  | Div
-  | DivExact
-  | Rem
-  | Shl
-  | ShlUnchecked
-  | Shr
-  | ShrUnchecked
-  | BitAnd
-  | BitOr
-  | BitXor
-  deriving DecidableEq, Repr
+  | Add : IntBinOp
+  | AddUnchecked : IntBinOp
+  | Sub : IntBinOp
+  | SubUnchecked : IntBinOp
+  | Mul : IntBinOp
+  | MulUnchecked : IntBinOp
+  | Div : IntBinOp
+  | DivExact : IntBinOp
+  | Rem : IntBinOp
+  | Shl : IntBinOp
+  | ShlUnchecked : IntBinOp
+  | Shr : IntBinOp
+  | ShrUnchecked : IntBinOp
+  | BitAnd : IntBinOp
+  | BitOr : IntBinOp
+  | BitXor : IntBinOp
+  deriving Inhabited, DecidableEq, Repr
 
--- @specr-source: spec/lang/syntax.md:81-83 @ d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed
+-- @specr-source: spec/lang/syntax.md:81..83 (IntBinOpWithOverflow)
 -- @specr-body-sha256: 9be481d913beca293c47b53e8c1d7480ac91336fb27eecaf5a1a32bdc1e9fc73
 inductive IntBinOpWithOverflow : Type where
-  | Add
-  | Sub
-  | Mul
-  deriving DecidableEq, Repr
+  | Add : IntBinOpWithOverflow
+  | Sub : IntBinOpWithOverflow
+  | Mul : IntBinOpWithOverflow
+  deriving Inhabited, DecidableEq, Repr
 
--- @specr-source: spec/lang/syntax.md:83-87 @ d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed
+-- @specr-source: spec/lang/syntax.md:83..87 (RelOp)
 -- @specr-body-sha256: bbe3a5979b4a402d23b879a22cdf8a9e945cf0f96ea5e1ef9de9d33003043eec
 inductive RelOp : Type where
-  | Lt
-  | Gt
-  | Le
-  | Ge
-  | Eq
-  | Ne
-  | Cmp
-  deriving DecidableEq, Repr
+  | Lt : RelOp
+  | Gt : RelOp
+  | Le : RelOp
+  | Ge : RelOp
+  | Eq : RelOp
+  | Ne : RelOp
+  | Cmp : RelOp
+  deriving Inhabited, DecidableEq, Repr
 
--- @specr-source: spec/lang/types.md:37-38 @ d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed
+-- @specr-source: spec/lang/types.md:37..38 (IntType)
 -- @specr-body-sha256: ae70fd01ca80d340a1e6591740d70f92fae326a09dbd4e368b190533f7efacf8
 structure IntType : Type where
   signed : Signedness
   size : Size
-  deriving DecidableEq, Repr
+  deriving Inhabited, DecidableEq, Repr
 
--- @specr-source: spec/mem/interface.md:59-60 @ d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed
+-- @specr-source: spec/mem/interface.md:59..60 (AllocationKind)
 -- @specr-body-sha256: faa2bb7fd0b663680545639548981af44cabcd5b81e46cfef391e4afe8fd0fc4
 inductive AllocationKind : Type where
-  | Stack
-  | Heap
-  | Global
-  | Function
-  | VTable
-  deriving DecidableEq, Repr
+  | Stack : AllocationKind
+  | Heap : AllocationKind
+  | Global : AllocationKind
+  | Function : AllocationKind
+  | VTable : AllocationKind
+  deriving Inhabited, DecidableEq, Repr
 
--- @specr-source: spec/mem/tree_borrows/tree.md:60-63 @ d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed
+-- @specr-source: spec/mem/tree_borrows/tree.md:60..63 (AccessKind)
 -- @specr-body-sha256: 8103e2aa1b1b8edaea87f0e8a37cd83a8526ff2e474e98e42c92b5cb1eed79a7
 inductive AccessKind : Type where
-  | Read
-  | Write
-  deriving DecidableEq, Repr
+  | Read : AccessKind
+  | Write : AccessKind
+  deriving Inhabited, DecidableEq, Repr
 
--- @specr-source: spec/mem/tree_borrows/tree.md:51-54 @ d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed
+-- @specr-source: spec/mem/tree_borrows/tree.md:51..54 (NodeRelation)
 -- @specr-body-sha256: 36957fdbb78238f841baf7d56498906832c6bd257e4ec4bc4a87c25b3b1cf42c
 inductive NodeRelation : Type where
-  | Local
-  | Foreign
-  deriving DecidableEq, Repr
+  | Local : NodeRelation
+  | Foreign : NodeRelation
+  deriving Inhabited, DecidableEq, Repr
 
--- @specr-source: spec/mem/tree_borrows/tree.md:14-18 @ d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed
+-- @specr-source: spec/mem/tree_borrows/tree.md:14..18 (Protected)
 -- @specr-body-sha256: 36c5059f309f3091dee1b59e1aa3f2d71abb56c532db2c40e2682624bd57bb1c
 inductive Protected : Type where
-  | Strong
-  | Weak
-  | No
-  deriving DecidableEq, Repr
+  | Strong : Protected
+  | Weak : Protected
+  | No : Protected
+  deriving Inhabited, DecidableEq, Repr
 
--- @specr-source: spec/mem/tree_borrows/tree.md:21-21 @ d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed
+-- @specr-source: spec/mem/tree_borrows/tree.md:21..21 (Protected::yes)
 -- @specr-body-sha256: 5dd42891e4a07a84cfc449c894f10018c2fd1ea5c49dde5515ce4cf76a3809c4
 @[reducible]
 def Protected.yes (self : Protected) : Bool :=
-  self != .No
+  (self != Protected.No)
 
--- @specr-source: spec/mem/tree_borrows/state_machine_unprotected.md:6-9 @ d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed
+abbrev Protected_yes := Protected.yes
+
+-- @specr-source: spec/mem/tree_borrows/state_machine_unprotected.md:6..9 (PermissionUnprot)
 -- @specr-body-sha256: 3cf33c96e3aad164000cb904ae1ba09a2e622aa758ce915bc3edfac9addd0831
 inductive PermissionUnprot : Type where
-  | Cell
-  | Reserved
-  | ReservedIm
-  | Unique
-  | Frozen
-  | Disabled
-  deriving DecidableEq, Repr
+  | Cell : PermissionUnprot
+  | Reserved : PermissionUnprot
+  | ReservedIm : PermissionUnprot
+  | Unique : PermissionUnprot
+  | Frozen : PermissionUnprot
+  | Disabled : PermissionUnprot
+  deriving Inhabited, DecidableEq, Repr
 
--- @specr-source: spec/mem/tree_borrows/state_machine_protected.md:7-10 @ d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed
+-- @specr-source: spec/mem/tree_borrows/state_machine_protected.md:7..10 (PermissionProt)
 -- @specr-body-sha256: 5dc9372e7d26c7da9c46c0ceedd98147ace076c0b82a4ed45789307d84d650bd
 inductive PermissionProt : Type where
-  | Cell
-  | Reserved (had_local_read : Bool) (had_foreign_read : Bool)
-  | Unique
-  | Frozen (had_local_read : Bool)
-  | Disabled
-  deriving DecidableEq, Repr
+  | Cell : PermissionProt
+  | Reserved (had_local_read : Bool) (had_foreign_read : Bool) : PermissionProt
+  | Unique : PermissionProt
+  | Frozen (had_local_read : Bool) : PermissionProt
+  | Disabled : PermissionProt
+  deriving Inhabited, DecidableEq, Repr
 
--- @specr-source: spec/mem/tree_borrows/state_machine.md:11-14 @ d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed
+-- @specr-source: spec/mem/tree_borrows/state_machine.md:11..14 (Permission)
 -- @specr-body-sha256: b7ffb2f9911409645e2de835da58dc37f9ba85ed8344ce613c7c0feb0f342d97
 inductive Permission : Type where
-  | Unprot (p : PermissionUnprot)
-  | Prot (p : PermissionProt)
-  deriving DecidableEq, Repr
+  | Unprot (arg_0 : PermissionUnprot) : Permission
+  | Prot (arg_0 : PermissionProt) : Permission
+  deriving Inhabited, DecidableEq, Repr
 
--- @specr-source: spec/mem/tree_borrows/memory.md:53-55 @ d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed
+-- @specr-source: spec/mem/tree_borrows/memory.md:53..55 (TreeBorrowsParams)
 -- @specr-body-sha256: e18920c232df023941c8c68e6950fe0639080aa9fd00960d6f975c7df11980fa
 structure TreeBorrowsParams : Type where
   implicit_writes : Bool
-  deriving DecidableEq, Repr
+  deriving Inhabited, DecidableEq, Repr
 
 -- @specr-source: spec/lang/machine.md:101-105 @ d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed
 -- @specr-body-sha256: abb8eafb9b5cf73175ff9af203e6701ee3fe59a0f93df5bb8533708e98aa3b0c
@@ -153,7 +172,7 @@ inductive ThreadState : Type where
   | BlockedOnJoin (tid : Nat)
   | BlockedOnLock (lid : Nat)
   | Terminated
-  deriving DecidableEq, Repr
+  deriving Inhabited, DecidableEq, Repr
 
 /-! ## 2. L1 Scalar & Arithmetic Semantics (`spec/lang/types.md`, `spec/lang/step/operators.md`) -/
 
@@ -1054,5 +1073,175 @@ def mrApplyUnwindAction (unwind_block : Option Nat) (is_terminate is_unreachable
 @[reducible]
 def mrStepDispatchIsTerminator (next_stmt stmt_len : Nat) : Bool :=
   next_stmt == stmt_len
+
+/-! ## 7. General-Purpose AST-Lowered Specr Declarations -/
+
+-- @specr-source: spec/prelude/target.md:32..33 (x86_64)
+-- @specr-body-sha256: 8ca910b762f39c45b0853d8853277881cb06841e20093f618151ae44d680c9fd
+structure x86_64 : Type where
+  mk ::
+  deriving Inhabited, DecidableEq, Repr
+
+-- @specr-source: spec/mem/concurrent.md:10..11 (Atomicity)
+-- @specr-body-sha256: 33bb11c47d69c866b830d8e542f4db3095d1029361eb78d7b25a930998b7ce61
+inductive Atomicity : Type where
+  | Atomic : Atomicity
+  | None : Atomicity
+  deriving Inhabited, DecidableEq, Repr
+
+-- @specr-source: spec/mem/concurrent.md:11..14 (AccessType)
+-- @specr-body-sha256: a5152f4e1d67172e6467d7c4a6bd8563f07475dbc53e0265d4a25eb6eabc042e
+inductive AccessType : Type where
+  | Store : AccessType
+  | Load : AccessType
+  deriving Inhabited, DecidableEq, Repr
+
+-- @specr-source: spec/mem/concurrent.md:131..131 (ThreadId)
+-- @specr-body-sha256: f77e777772cd7c14c6cd18fb5d92f37eb9d6321dc57c2957101b6f9ff9080af7
+abbrev ThreadId : Type := SpecrInt
+
+-- @specr-source: spec/mem/pointer.md:22..22 (Address)
+-- @specr-body-sha256: 82ead93fe04a74b348e74bd4aeb5876f229a62cb8cdcd42bb259549803b6bd5f
+abbrev Address : Type := SpecrInt
+
+-- @specr-source: spec/mem/pointer.md:77..79 (TupleHeadLayout)
+-- @specr-body-sha256: 3555aea2a65700687a82383bb771774ca6c715cda940f12878129b7912d1c05e
+structure TupleHeadLayout : Type where
+  end_ : Offset
+  align : Align
+  packed_align : Option (Align)
+  deriving Inhabited, DecidableEq, Repr
+
+-- @specr-source: spec/mem/tree_borrows/memory.md:38..38 (ChildId)
+-- @specr-body-sha256: a090086f1261d3068f02ff44a31171bd6bb6a9aa7927a6674e194918646b7516
+abbrev ChildId : Type := SpecrInt
+
+-- @specr-source: spec/mem/tree_borrows/memory.md:38..38 (Path)
+-- @specr-body-sha256: fa7d66fde967a8e014942c893e9175e9be508a828a252ad59243ed7ca9e2ea52
+abbrev Path : Type := List (ChildId)
+
+-- @specr-source: spec/mem/tree_borrows/memory.md:47..47 (TreeBorrowsProvenance)
+-- @specr-body-sha256: 830fb2dd2944e077aa97e3229fae78dd3bbe6d492d3fd46841d6cd094e4c5fce
+abbrev TreeBorrowsProvenance : Type := (AllocId × Path)
+
+-- @specr-source: spec/mem/tree_borrows/memory.md:67..68 (TreeBorrowsFrameExtra)
+-- @specr-body-sha256: a64379c7a9372b8da072b16422023831d27413d0aa86d6c147300fcc262ed1be
+structure TreeBorrowsFrameExtra : Type where
+  protectors : List (TreeBorrowsProvenance)
+  deriving Inhabited, DecidableEq, Repr
+
+-- @specr-source: spec/mem/tree_borrows/reborrow_settings.md:7..9 (ReborrowSettings)
+-- @specr-body-sha256: f4746db5080876704c6c0ed3d91a0dfefe585fc59417c8949f6504832b1458ef
+structure ReborrowSettings : Type where
+  inside : List (Permission)
+  outside : Permission
+  protected_ : Protected
+  deriving Inhabited, DecidableEq, Repr
+
+-- @specr-source: spec/lang/syntax.md:327..328 (CallingConvention)
+-- @specr-body-sha256: 1140472b4b32cdc070f82ed476d82a0195879059f7fde408ad3665f78f6891bd
+inductive CallingConvention : Type where
+  | Rust : CallingConvention
+  | C : CallingConvention
+  deriving Inhabited, DecidableEq, Repr
+
+-- @specr-source: spec/lang/syntax.md:328..331 (IntrinsicLockOp)
+-- @specr-body-sha256: fb1dd19009806a9b4146c0295a3b810059a5e2e87f432cd974716d954482b5a7
+inductive IntrinsicLockOp : Type where
+  | Acquire : IntrinsicLockOp
+  | Release : IntrinsicLockOp
+  | Create : IntrinsicLockOp
+  deriving Inhabited, DecidableEq, Repr
+
+-- @specr-source: spec/lang/syntax.md:331..341 (IntrinsicOp)
+-- @specr-body-sha256: 4d2a0ede8e4ca5603c04f270ef56aaf4d05d7b6426a52f1fc2d414720672747e
+inductive IntrinsicOp : Type where
+  | Abort : IntrinsicOp
+  | Assume : IntrinsicOp
+  | Exit : IntrinsicOp
+  | PrintStdout : IntrinsicOp
+  | PrintStderr : IntrinsicOp
+  | Allocate : IntrinsicOp
+  | Deallocate : IntrinsicOp
+  | Spawn : IntrinsicOp
+  | Join : IntrinsicOp
+  | RawEq : IntrinsicOp
+  | AtomicStore : IntrinsicOp
+  | AtomicLoad : IntrinsicOp
+  | AtomicCompareExchange : IntrinsicOp
+  | AtomicFetchAndOp (arg_0 : IntBinOp) : IntrinsicOp
+  | Lock (arg_0 : IntrinsicLockOp) : IntrinsicOp
+  | PointerExposeProvenance : IntrinsicOp
+  | PointerWithExposedProvenance : IntrinsicOp
+  | GetUnwindPayload : IntrinsicOp
+  deriving Inhabited, DecidableEq, Repr
+
+-- @specr-source: spec/lang/syntax.md:471..473 (BbKind)
+-- @specr-body-sha256: bd68be1b2a027cd0c5b497de0451e040f88013ae61c42b9148c2c0a4e528b89f
+inductive BbKind : Type where
+  | Regular : BbKind
+  | Cleanup : BbKind
+  | Catch : BbKind
+  | Terminate : BbKind
+  deriving Inhabited, DecidableEq, Repr
+
+-- @specr-source: spec/lang/step/locks.md:9..12 (LockState)
+-- @specr-body-sha256: ae0b08d5103ca1683fe1b4ec47309567bc966051148a2d98c1bc47dd9add4efe
+inductive LockState : Type where
+  | Unlocked : LockState
+  | LockedBy (arg_0 : ThreadId) : LockState
+  deriving Inhabited, DecidableEq, Repr
+
+-- @specr-source: spec/lang/step/locks.md:14..14 (LockId)
+-- @specr-body-sha256: 60772fdf4b522b35b883396b6590965e187498f99da703c5c3567143ea02f733
+abbrev LockId : Type := SpecrInt
+
+-- @specr-source: spec/mem/concurrent.md:14..19 (Access)
+-- @specr-body-sha256: 2e9662e4a546c7e94381afb6e647dfd8b25bd24fd3828be59648c202047214e0
+structure Access : Type where
+  ty : AccessType
+  atomicity : Atomicity
+  addr : Address
+  len : Size
+  deriving Inhabited, DecidableEq, Repr
+
+-- @specr-source: spec/mem/tree_borrows/state_machine.md:44..51 (Permission::matches_protector)
+-- @specr-body-sha256: fa3ea07651236d42fa8c2bd21515148dec745bfe77f5a31986e22400b92ea579
+@[reducible]
+def Permission_matches_protector (self : Permission) (protected_ : Protected) : Bool :=
+  if (protected_.yes) then
+    (match self with | (.Prot _) => true | _ => false)
+  else
+    (match self with | (.Unprot _) => true | _ => false)
+
+abbrev Permission.matches_protector := Permission_matches_protector
+
+-- @specr-source: spec/lang/types.md:201..204 (TupleHeadLayout::capped_tail_align)
+-- @specr-body-sha256: ab947fd4debe06d23361cb8acef3b6f13fce02f96d12e404f3f337a059be6430
+@[reducible]
+def TupleHeadLayout_capped_tail_align (self : TupleHeadLayout) (tail_align : Align) : Align :=
+  match self.packed_align with
+  | (some packed_align) => (min tail_align packed_align)
+  | none => tail_align
+
+abbrev TupleHeadLayout.capped_tail_align := TupleHeadLayout_capped_tail_align
+
+-- @specr-source: spec/lang/representation.md:482..483 (ensure_else_ub)
+-- @specr-body-sha256: 0b7249502c88a1d7c26824e01c63bb470925f1e20584de6efbb465ad8477668b
+@[reducible]
+def ensure_else_ub (b : Bool) (msg : String) : Except TerminationInfo (Unit) :=
+  if (!b) then
+    (.error (.ub msg))
+  else
+    (.ok ())
+
+-- @specr-source: spec/lang/well-formed.md:12..15 (ensure_wf)
+-- @specr-body-sha256: 0c83b0bdf8cc64db91b333aea611b1ecb303f4160dd85232f540fc6701eac0cb
+@[reducible]
+def ensure_wf (b : Bool) (msg : String) : Except TerminationInfo (Unit) :=
+  if (!b) then
+    (.error (.illFormed msg))
+  else
+    (.ok ())
 
 end MiniRust.Snapshots.S2026_07_BleedingEdge.Generated.Ops

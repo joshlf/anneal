@@ -68,6 +68,6 @@
   ],
   "output_files": [
     { "path": "Generated/SpecIndex.lean", "sha256": "8f9bf7f21c3969197d057fe940d1609dd9805fad8caae3839b06776a967be5f8", "bytes": 224022 },
-    { "path": "Generated/Ops.lean", "sha256": "9343b334985a54ff7cd8035667e8869d8de25d132ad46392cccfbb59d2ad79a7", "bytes": 42459 }
+    { "path": "Generated/Ops.lean", "sha256": "252831a6256286d6dc521bdca70e4b76fa602241f4c1647bd9763466324f9420", "bytes": 50343 }
   ]
 }

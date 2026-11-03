@@ -86,7 +86,8 @@ fn gate1_deterministic_extraction_and_exact_line_provenance() {
     let vendor_matched = root.join("theory/MiniRust/vendor/S2026_05_Matched");
     let sha_matched = "5f78e227bbe30ae9fb5e1286a772d91a92e3622a";
 
-    // Run full extraction + AST resolution + Lean rendering twice and verify 100% byte identity.
+    // Run full extraction + AST resolution + Lean rendering twice and verify
+    // 100% byte identity.
     let snap_run1 = extract_snapshot(&vendor_matched, "S2026_05_Matched", sha_matched)
         .expect("extract S2026_05_Matched run 1");
     let env_run1 = TypeEnvironment::build(&snap_run1);
@@ -97,16 +98,27 @@ fn gate1_deterministic_extraction_and_exact_line_provenance() {
     let env_run2 = TypeEnvironment::build(&snap_run2);
     let lean_run2 = render_spec_index_lean(&snap_run2, &env_run2);
 
-    assert_eq!(snap_run1, snap_run2, "snapshot extraction must be 100% deterministic");
-    assert_eq!(env_run1, env_run2, "TypeEnvironment resolution must be 100% deterministic");
-    assert_eq!(lean_run1, lean_run2, "emitted Lean 4 module must be byte-for-byte identical");
+    assert_eq!(
+        snap_run1, snap_run2,
+        "snapshot extraction must be 100% deterministic"
+    );
+    assert_eq!(
+        env_run1, env_run2,
+        "TypeEnvironment resolution must be 100% deterministic"
+    );
+    assert_eq!(
+        lean_run1, lean_run2,
+        "emitted Lean 4 module must be byte-for-byte identical"
+    );
 
-    // Verify exact chapter count, code block count, and declaration count on real S2026_05_Matched.
+    // Verify exact chapter count, code block count, and declaration count on
+    // real S2026_05_Matched.
     assert_eq!(snap_run1.chapters.len(), 27);
     assert_eq!(snap_run1.total_blocks, 140);
     assert_eq!(env_run1.items.len(), 408);
 
-    // Verify 100% exact 1-based line-range accuracy (`start_line..=end_line`) against raw `.md` files!
+    // Verify 100% exact 1-based line-range accuracy (`start_line..=end_line`)
+    // against raw `.md` files!
     for chapter in &snap_run1.chapters {
         let md_path = vendor_matched.join(&chapter.rel_path);
         let raw_md = fs::read_to_string(&md_path).expect("read raw markdown chapter");
@@ -125,7 +137,8 @@ fn gate1_deterministic_extraction_and_exact_line_provenance() {
                 let expected_slice =
                     md_lines[block.span.start_line - 1..block.span.end_line].join("\n");
                 assert_eq!(
-                    block.source, expected_slice,
+                    block.source,
+                    expected_slice,
                     "extracted block source mismatch at {}",
                     block.span.format_provenance()
                 );
@@ -133,7 +146,8 @@ fn gate1_deterministic_extraction_and_exact_line_provenance() {
         }
     }
 
-    // Verify every single parsed declaration has valid 1-based provenance and appears in `@specr-source`.
+    // Verify every single parsed declaration has valid 1-based provenance and
+    // appears in `@specr-source`.
     for item in &env_run1.items {
         assert!(item.span.start_line >= 1);
         assert!(item.span.end_line >= item.span.start_line);
@@ -160,7 +174,8 @@ fn gate1_domain_classification_gc_cow_effects_and_mutual_recursion() {
     assert_eq!(snap.total_blocks, 141);
     assert_eq!(env.items.len(), 412);
 
-    // Every major MiniRust semantic chapter domain must be populated with real declarations.
+    // Every major MiniRust semantic chapter domain must be populated with real
+    // declarations.
     for required_domain in [
         SpecDomain::Syntax,
         SpecDomain::Values,
@@ -182,16 +197,27 @@ fn gate1_domain_classification_gc_cow_effects_and_mutual_recursion() {
     }
 
     // Verify all major item kinds are extracted and classified.
-    assert_eq!(env.stats.struct_count, 37, "exact struct count on S2026_07_BleedingEdge");
-    assert!(env.stats.enum_count >= 25, "expected >= 25 enums, got {}", env.stats.enum_count);
-    assert!(env.stats.fn_count > 0, "expected free functions in MiniRust spec");
+    assert_eq!(
+        env.stats.struct_count, 37,
+        "exact struct count on S2026_07_BleedingEdge"
+    );
+    assert!(
+        env.stats.enum_count >= 25,
+        "expected >= 25 enums, got {}",
+        env.stats.enum_count
+    );
+    assert!(
+        env.stats.fn_count > 0,
+        "expected free functions in MiniRust spec"
+    );
     assert!(
         env.stats.impl_method_count >= 200,
         "expected >= 200 impl methods, got {}",
         env.stats.impl_method_count
     );
 
-    // Verify `GcCow<T>` detection and mutual recursion detection across nominal types (`Type`, `Value`).
+    // Verify `GcCow<T>` detection and mutual recursion detection across nominal
+    // types (`Type`, `Value`).
     assert!(
         env.stats.gc_cow_item_count > 0,
         "expected GcCow<T> declarations in MiniRust spec"
@@ -202,18 +228,23 @@ fn gate1_domain_classification_gc_cow_effects_and_mutual_recursion() {
     );
     assert!(!env.mutual_recursion_groups.is_empty());
 
-    // Verify explicit effect classification across Pure, Option, FallibleResult, and NondetResult.
+    // Verify explicit effect classification across Pure, Option,
+    // FallibleResult, and NondetResult.
     assert!(env.stats.pure_count > 0);
     assert!(env.stats.option_effect_count > 0);
     assert!(env.stats.fallible_result_count > 0);
     assert!(env.stats.nondet_result_count > 0);
 
     // Spot-check key iconic declarations across MiniRust domains.
-    let fn_struct = env.get("Function").expect("Function struct in spec/lang/syntax.md");
+    let fn_struct = env
+        .get("Function")
+        .expect("Function struct in spec/lang/syntax.md");
     assert_eq!(fn_struct.kind, ItemKind::Struct);
     assert!(fn_struct.fields.iter().any(|f| f.name == "implicit_writes"));
 
-    let machine_new = env.get("Machine::new").expect("Machine::new in spec/lang/machine.md");
+    let machine_new = env
+        .get("Machine::new")
+        .expect("Machine::new in spec/lang/machine.md");
     assert_eq!(machine_new.kind, ItemKind::ImplMethod);
     assert_eq!(machine_new.effect, EffectLevel::NondetResult);
 }
@@ -225,20 +256,28 @@ fn gate1_generated_lean_hygiene_and_snapshot_lock_tamper_detection() {
     let forbidden_corp_path = ["/google/", "src"].concat();
 
     for (snap_id, vendor_rel) in [
-        ("S2026_05_Matched", "theory/MiniRust/vendor/S2026_05_Matched"),
-        ("S2026_07_BleedingEdge", "theory/MiniRust/vendor/S2026_07_BleedingEdge"),
+        (
+            "S2026_05_Matched",
+            "theory/MiniRust/vendor/S2026_05_Matched",
+        ),
+        (
+            "S2026_07_BleedingEdge",
+            "theory/MiniRust/vendor/S2026_07_BleedingEdge",
+        ),
     ] {
         let gen_dir = root.join(format!("theory/MiniRust/Snapshots/{snap_id}"));
         let vendor_dir = root.join(vendor_rel);
 
-        // 1. Verify on-disk `snapshot-lock.json` round-trips cleanly against every `.md` and `.lean`.
+        // 1. Verify on-disk `snapshot-lock.json` round-trips cleanly against
+        // every `.md` and `.lean`.
         let lock_check = verify_snapshot_lock(&gen_dir, &vendor_dir)
             .expect("on-disk snapshot-lock.json must pass SHA-256 verification");
         assert_eq!(lock_check.snapshot_id, snap_id);
         assert_eq!(lock_check.verified_input_files, 27);
         assert_eq!(lock_check.verified_output_files, 2);
 
-        // 2. Audit generated `SpecIndex.lean` and `Ops.lean` for strict proof & repository hygiene.
+        // 2. Audit generated `SpecIndex.lean` and `Ops.lean` for strict proof
+        // and repository hygiene.
         for rel_lean in ["Generated/SpecIndex.lean", "Generated/Ops.lean"] {
             let lean_path = gen_dir.join(rel_lean);
             let lean_src = fs::read_to_string(&lean_path).expect("read generated Lean module");
@@ -270,8 +309,8 @@ fn gate1_generated_lean_hygiene_and_snapshot_lock_tamper_detection() {
         }
     }
 
-    // 3. Verify tamper detection in an isolated ephemeral temp directory: modifying even 1 byte
-    // in a generated `.lean` file or input `.md` file MUST fail `verify_snapshot_lock`.
+    // 3. Verify tamper detection in an isolated ephemeral temp directory:
+    // modifying even 1 byte in a generated `.lean` or `.md` file MUST fail.
     let tmp = make_ephemeral_temp_dir("tamper_check");
     let mini_vendor = tmp.join("vendor");
     let mini_out = tmp.join("snap_out");
@@ -310,7 +349,8 @@ fn gate1_generated_lean_hygiene_and_snapshot_lock_tamper_detection() {
 
 #[test]
 fn gate1_summary_md_order_and_gap_codegen_four_classes_pure_offline() {
-    // 1. Verify `SUMMARY.md` chapter order parsing preserves exact link sequence.
+    // 1. Verify `SUMMARY.md` chapter order parsing preserves exact link
+    // sequence.
     let sample_summary = r#"
 # Summary
 
@@ -331,8 +371,8 @@ fn gate1_summary_md_order_and_gap_codegen_four_classes_pure_offline() {
         ]
     );
 
-    // 2. Verify `gap_codegen` parses, validates, and emits clean Lean 4 + Markdown payloads
-    // across all 4 formal non-correspondence classes with zero I/O or network calls.
+    // 2. Verify `gap_codegen` parses, validates, and emits clean Lean 4 +
+    // Markdown payloads across all 4 formal non-correspondence classes.
     let sample_gaps_toml = r#"
 schema_version = 1
 github_repo = "joshlf/anneal"
@@ -455,22 +495,26 @@ allowed_epoch_gaps = ["GAP-EPOCH-0001"]
     assert!(!emitted_lean.contains("sorry"));
     assert!(!emitted_lean.contains("native_decide"));
 
-    // Verify Defect 4b regression check: out-of-bounds line range in `minirust_source`
-    // is caught by `validate_registry_and_matrix_with_repo_root`.
+    // Verify Defect 4b regression check: out-of-bounds line range in
+    // `minirust_source` is caught by repo-root validation.
     let mut bad_registry = registry.clone();
     bad_registry.gaps[0].minirust_source = "spec/lang/values.md:10-9999".to_string();
-    let span_errs = validate_registry_and_matrix_with_repo_root(&bad_registry, &matrix, &repo_root())
-        .expect_err("out-of-bounds minirust_source line range must be rejected");
+    let span_errs =
+        validate_registry_and_matrix_with_repo_root(&bad_registry, &matrix, &repo_root())
+            .expect_err("out-of-bounds minirust_source line range must be rejected");
     assert!(span_errs.iter().any(|e| e.contains("exceeds total_lines")));
 
     let issue = render_github_issue_markdown(&registry.gaps[0], "joshlf/anneal");
     assert!(issue.title.contains("GAP-MR-0001"));
-    assert!(issue.markdown_body.contains("Trusted.Rustc.V2026_06_01.MirSemantics.evalRefRvalue"));
+    assert!(
+        issue
+            .markdown_body
+            .contains("Trusted.Rustc.V2026_06_01.MirSemantics.evalRefRvalue")
+    );
     assert_eq!(issue.fingerprint.len(), 64);
 
-    // Verify Defect 1 regression check: `anneal_unmodeled_feature` is counted in `is_bug_gap()`
-    // (aligning with `theory/Correspondence/Framework.lean` `GapKind.isBug`) AND is rejected by
-    // `ExpectedTier::ExactUnconditional`.
+    // Verify Defect 1 regression check: `anneal_unmodeled_feature` is counted
+    // in `is_bug_gap()` AND is rejected by `ExpectedTier::ExactUnconditional`.
     assert!(GapKind::AnnealUnmodeledFeature.is_bug_gap());
     let strict_matrix = parse_matrix_toml(
         r#"
@@ -485,8 +529,9 @@ max_open_bugs = 0
 "#,
     )
     .expect("parse strict matrix");
-    let errs = validate_registry_and_matrix(&registry, &strict_matrix)
-        .expect_err("ExactUnconditional must reject anneal_unmodeled_feature gap on L5_ControlAndCalls");
+    let errs = validate_registry_and_matrix(&registry, &strict_matrix).expect_err(
+        "ExactUnconditional must reject anneal_unmodeled_feature gap on L5_ControlAndCalls",
+    );
     assert!(errs.iter().any(|e| e.contains("ExactUnconditional")));
 }
 
@@ -533,9 +578,9 @@ fn gate1_upstream_md_mutation_changes_emitted_ops_lean() {
     );
 
     // Copy vendor directory and mutate two upstream `.md` files:
-    // 1. `Add => left + right` -> `Add => left - right` in `spec/lang/step/operators.md`
-    // 2. `PermissionUnprot::Unique => ret(PermissionUnprot::Frozen)` ->
-    //    `PermissionUnprot::Unique => ret(PermissionUnprot::Disabled)` in `spec/mem/tree_borrows/state_machine_unprotected.md`
+    // 1. `Add => left + right` -> `Add => left - right` in `operators.md`
+    // 2. `Unique => ret(Frozen)` -> `Unique => ret(Disabled)` in
+    //    `state_machine_unprotected.md`
     let mut_vendor = tmp.join("vendor_mut");
     copy_dir_recursive(&vendor_matched, &mut_vendor);
 
@@ -560,8 +605,7 @@ fn gate1_upstream_md_mutation_changes_emitted_ops_lean() {
         "PermissionUnprot::Unique => ret(PermissionUnprot::Disabled),",
         1,
     );
-    fs::write(&unprot_md_path, unprot_md_mut)
-        .expect("write mutated state_machine_unprotected.md");
+    fs::write(&unprot_md_path, unprot_md_mut).expect("write mutated state_machine_unprotected.md");
 
     let mut_out = tmp.join("mut_out");
     let mut_snap = extract_snapshot(&mut_vendor, "S2026_05_Matched", sha_matched)
@@ -791,7 +835,7 @@ fn gate1_executable_behavioral_equivalence_500_plus_vectors() {
     let mut assertions: Vec<String> = Vec::with_capacity(650);
 
     // =========================================================================
-    // 1. L1 Scalar & Arithmetic Vectors (IntType, UnOp, BinOp, Overflow, RelOp, Bit Ops)
+    // 1. L1 Scalar & Arithmetic Vectors (IntType, UnOp, BinOp, RelOp, Bit Ops)
     // =========================================================================
     let int_types = [
         (false, 1u32, "{ signed := .Unsigned, size := ⟨1⟩ }"),
@@ -974,7 +1018,7 @@ fn gate1_executable_behavioral_equivalence_500_plus_vectors() {
                 lean_except_int(rem_res)
             ));
 
-            // Shl, Shr, ShlUnchecked, ShrUnchecked (test non-negative right operands)
+            // Shl, Shr, ShlUnchecked, ShrUnchecked (non-negative rhs)
             if r >= 0 {
                 let offset = (r as u32) % bits;
                 let shl_val = l * (1i64 << offset);
@@ -1081,7 +1125,13 @@ fn gate1_executable_behavioral_equivalence_500_plus_vectors() {
             lean_int(r),
             l != r
         ));
-        let cmp_v = if l < r { -1 } else if l == r { 0 } else { 1 };
+        let cmp_v = if l < r {
+            -1
+        } else if l == r {
+            0
+        } else {
+            1
+        };
         assertions.push(format!(
             "Ops05.eval_cmp_int {} {} = {}",
             lean_int(l),
@@ -1116,9 +1166,8 @@ fn gate1_executable_behavioral_equivalence_500_plus_vectors() {
     assertions.push("Ops05.MrAbstractByte.data .uninit = none".to_string());
     assertions.push("Ops05.MrAbstractByte.data (.init 42 (some (1, 2))) = some 42".to_string());
     assertions.push("Ops05.MrAbstractByte.provenance .uninit = none".to_string());
-    assertions.push(
-        "Ops05.MrAbstractByte.provenance (.init 42 (some (1, 2))) = some (1, 2)".to_string(),
-    );
+    assertions
+        .push("Ops05.MrAbstractByte.provenance (.init 42 (some (1, 2))) = some (1, 2)".to_string());
     assertions.push("Ops05.MrAbstractByte.le_defined .uninit (.init 99 none) = true".to_string());
     assertions.push(
         "Ops05.MrAbstractByte.le_defined (.init 7 none) (.init 7 (some (1, 0))) = true".to_string(),
@@ -1152,8 +1201,7 @@ fn gate1_executable_behavioral_equivalence_500_plus_vectors() {
     // =========================================================================
     // 3. L3 Places & BasicMemory Vectors
     // =========================================================================
-    let sample_mem =
-        "{ allocs := [{ id := 0, align := Align.four, size := 8, live := true, bytes := [1, 2, 3, 4, 5, 6, 7, 8] }], nextAllocId := 1 }";
+    let sample_mem = "{ allocs := [{ id := 0, align := Align.four, size := 8, live := true, bytes := [1, 2, 3, 4, 5, 6, 7, 8] }], nextAllocId := 1 }";
     assertions.push(format!(
         "Ops05.basicMemLoad {sample_mem} {{ allocId := 0, offset := 0 }} Align.four 4 = .ok [1, 2, 3, 4]"
     ));
@@ -1196,7 +1244,7 @@ fn gate1_executable_behavioral_equivalence_500_plus_vectors() {
     );
 
     // =========================================================================
-    // 4. L4 Tree Borrows Exhaustive State Machine & Reborrow Vectors (Ops05 & Ops07)
+    // 4. L4 Tree Borrows Exhaustive State Machine & Reborrow Vectors
     // =========================================================================
     let unprot_states = [
         RefPermUnprot::Cell,
@@ -1280,7 +1328,8 @@ fn gate1_executable_behavioral_equivalence_500_plus_vectors() {
         }
     }
 
-    // Exhaustive `reborrow_permission` across all 48 boolean/enum combinations in BOTH snapshots
+    // Exhaustive `reborrow_permission` across all 48 boolean/enum combinations
+    // in BOTH snapshots
     for &is_mutable in &[false, true] {
         for &(prot_yes, prot_lean) in &[(true, ".Strong"), (true, ".Weak"), (false, ".No")] {
             for &inside in &[false, true] {
@@ -1314,7 +1363,7 @@ fn gate1_executable_behavioral_equivalence_500_plus_vectors() {
                             "Ops05.reborrow_permission {is_mutable} {prot_lean} {inside} {frozen} {implicit_writes} = {exp05}"
                         ));
 
-                        // S2026_07_BleedingEdge: implicit_writes_enabled && inside -> .Prot .Unique
+                        // S2026_07_BleedingEdge: implicit_writes && inside
                         let exp07 = if is_mutable && prot_yes && implicit_writes && inside {
                             "(.Prot .Unique)"
                         } else {
@@ -1349,12 +1398,9 @@ fn gate1_executable_behavioral_equivalence_500_plus_vectors() {
     );
     assertions.push("Ops05.mrLookupSwitchTarget 2 [(1, 10), (2, 20), (3, 30)] 99 = 20".to_string());
     assertions.push("Ops05.mrLookupSwitchTarget 8 [(1, 10), (2, 20), (3, 30)] 99 = 99".to_string());
-    assertions.push(
-        "Ops05.mrFindCalleeById [(\"f\", 11), (\"g\", 22)] \"g\" = some 22".to_string(),
-    );
-    assertions.push(
-        "Ops05.mrFindCalleeById [(\"f\", 11), (\"g\", 22)] \"h\" = none".to_string(),
-    );
+    assertions
+        .push("Ops05.mrFindCalleeById [(\"f\", 11), (\"g\", 22)] \"g\" = some 22".to_string());
+    assertions.push("Ops05.mrFindCalleeById [(\"f\", 11), (\"g\", 22)] \"h\" = none".to_string());
     assertions.push("Ops05.mrApplyUnwindAction (some 3) false false = .cleanup 3".to_string());
     assertions.push("Ops05.mrApplyUnwindAction none false false = .panic".to_string());
     assertions.push("Ops05.mrApplyUnwindAction (some 3) true false = .abort".to_string());
@@ -1366,7 +1412,8 @@ fn gate1_executable_behavioral_equivalence_500_plus_vectors() {
         assertions.len()
     );
 
-    // Emit temporary Lean harness and run `lake env lean` to kernel-verify all 520+ vectors
+    // Emit temporary Lean harness and run `lake env lean` to kernel-verify all
+    // 520+ vectors
     let tmp = make_ephemeral_temp_dir("behavioral_equiv_500");
     let lean_harness_path = tmp.join("BehavioralEquiv500.lean");
     let mut lean_src = String::with_capacity(64 * 1024);
@@ -1424,5 +1471,214 @@ fn gate1_executable_behavioral_equivalence_500_plus_vectors() {
         assertions.len(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn gate1_general_purpose_unseen_specr_items_lowered_and_executed_in_lean() {
+    let root = repo_root();
+    let src_dir = root.join("crates/anneal-specr-lean/src");
+    let unseen_idents = [
+        "VaultPhase",
+        "PhaseReady",
+        "PhaseShared",
+        "PhaseSealed",
+        "VaultEpoch",
+        "VaultState",
+        "step_phase",
+        "classify_vault_pair",
+        "advance_vault",
+    ];
+    for entry in fs::read_dir(&src_dir).expect("read crates/anneal-specr-lean/src") {
+        let p = entry.expect("dir entry").path();
+        if p.extension().and_then(|e| e.to_str()) == Some("rs") {
+            let content = fs::read_to_string(&p).expect("read compiler source");
+            for ident in &unseen_idents {
+                assert!(
+                    !content.contains(ident),
+                    "unseen holdout identifier `{ident}` must NOT appear in {}",
+                    p.display()
+                );
+            }
+        }
+    }
+
+    let vendor_matched = root.join("theory/MiniRust/vendor/S2026_05_Matched");
+    let sha_matched = "5f78e227bbe30ae9fb5e1286a772d91a92e3622a";
+    let tmp = make_ephemeral_temp_dir("unseen_holdout");
+    let unseen_vendor = tmp.join("vendor_unseen");
+    copy_dir_recursive(&vendor_matched, &unseen_vendor);
+
+    let unseen_md = r#"# Unseen Holdout Specification
+
+```rust
+pub enum VaultPhase {
+    PhaseReady,
+    PhaseShared(Int),
+    PhaseSealed { holder: Int, immutable: bool },
+}
+
+pub type VaultEpoch = Int;
+
+pub struct VaultState {
+    pub phase: VaultPhase,
+    pub epoch: VaultEpoch,
+    pub quota: Int,
+}
+
+impl VaultPhase {
+    pub fn step_phase(self, caller: Int, write_req: bool) -> Result<VaultPhase> {
+        if caller < 0 {
+            throw_ub!("negative caller id");
+        }
+        ret(match self {
+            VaultPhase::PhaseReady => if write_req {
+                VaultPhase::PhaseSealed { holder: caller, immutable: false }
+            } else {
+                VaultPhase::PhaseShared(1)
+            },
+            VaultPhase::PhaseShared(count) if !write_req => VaultPhase::PhaseShared(count + 1),
+            VaultPhase::PhaseShared(_) => VaultPhase::PhaseSealed { holder: caller, immutable: true },
+            VaultPhase::PhaseSealed { holder, immutable: true } if holder != caller => throw_ub!("sealed conflict"),
+            VaultPhase::PhaseSealed { holder: _, immutable: true } if write_req => throw_ill_formed!("cannot write immutable seal"),
+            VaultPhase::PhaseSealed { .. } => VaultPhase::PhaseSealed { holder: caller, immutable: false },
+        })
+    }
+}
+
+pub fn classify_vault_pair(phase: VaultPhase, mask: Int) -> (Int, bool) {
+    match phase {
+        VaultPhase::PhaseReady | VaultPhase::PhaseSealed { immutable: true, .. } => (mask & 3, false),
+        VaultPhase::PhaseShared(n) if n > 5 => ((n << 1) + (mask >> 1), true),
+        VaultPhase::PhaseShared(n) => ((n << 1) + (mask ^ 1), (mask | 1) > 0 && n >= 1),
+        VaultPhase::PhaseSealed { holder, immutable: false } => (holder - (mask % 4), (0..4).all(|k| k >= 0) && !false),
+    }
+}
+
+pub fn advance_vault(state: VaultState, caller: Int, write_req: bool, bonus: Int) -> Result<VaultState> {
+    if state.quota <= 0 {
+        throw_ill_formed!("exhausted quota");
+    } else if bonus < 0 {
+        throw_ub!("negative bonus");
+    }
+    let next_phase = state.phase.step_phase(caller, write_req)?;
+    let (delta, active) = classify_vault_pair(next_phase, bonus);
+    let next_quota = if active { state.quota + delta } else { state.quota - 1 };
+    ret(VaultState {
+        phase: next_phase,
+        epoch: state.epoch + 1,
+        quota: next_quota,
+    })
+}
+```
+"#;
+    fs::write(unseen_vendor.join("spec/mem/unseen_vault.md"), unseen_md)
+        .expect("write unseen_vault.md");
+
+    let snap = extract_snapshot(&unseen_vendor, "S2026_05_Matched", sha_matched)
+        .expect("extract unseen snapshot");
+    let env = TypeEnvironment::build(&snap);
+    let out_dir = tmp.join("out_unseen");
+    let emitted = emit_snapshot_to_dir(&snap, &env, &out_dir).expect("emit unseen snapshot");
+    let ops = &emitted.ops_lean_content;
+
+    assert!(ops.contains("inductive VaultPhase : Type where"));
+    assert!(ops.contains("structure VaultState : Type where"));
+    assert!(ops.contains("abbrev VaultEpoch : Type := SpecrInt"));
+    assert!(ops.contains("def VaultPhase_step_phase"));
+    assert!(ops.contains("def classify_vault_pair"));
+    assert!(ops.contains("def advance_vault"));
+
+    let mut vectors: Vec<String> = Vec::new();
+    for caller in [-2i64, -1, 0, 1, 5, 9] {
+        for write_req in [false, true] {
+            let exp_ready = if caller < 0 {
+                "(.error (.ub \"negative caller id\"))".to_string()
+            } else if write_req {
+                format!("(.ok (.PhaseSealed ({caller} : Int) false))")
+            } else {
+                "(.ok (.PhaseShared (1 : Int)))".to_string()
+            };
+            vectors.push(format!(
+                "VaultPhase_step_phase .PhaseReady ({caller} : Int) {write_req} = {exp_ready}"
+            ));
+            for n in [1i64, 3, 7] {
+                let exp_shared = if caller < 0 {
+                    "(.error (.ub \"negative caller id\"))".to_string()
+                } else if !write_req {
+                    format!("(.ok (.PhaseShared ({} : Int)))", n + 1)
+                } else {
+                    format!("(.ok (.PhaseSealed ({caller} : Int) true))")
+                };
+                vectors.push(format!(
+                    "VaultPhase_step_phase (.PhaseShared ({n} : Int)) ({caller} : Int) {write_req} = {exp_shared}"
+                ));
+            }
+        }
+    }
+    vectors.push(
+        "VaultPhase_step_phase (.PhaseSealed 4 true) 7 false = (.error (.ub \"sealed conflict\"))"
+            .to_string(),
+    );
+    vectors.push(
+        "VaultPhase_step_phase (.PhaseSealed 4 true) 4 true = (.error (.illFormed \"cannot write immutable seal\"))"
+            .to_string(),
+    );
+    vectors.push(
+        "VaultPhase_step_phase (.PhaseSealed 4 true) 4 false = (.ok (.PhaseSealed 4 false))"
+            .to_string(),
+    );
+    vectors.push(
+        "advance_vault { phase := .PhaseReady, epoch := 10, quota := 0 } 1 false 2 = (.error (.illFormed \"exhausted quota\"))"
+            .to_string(),
+    );
+    vectors.push(
+        "advance_vault { phase := .PhaseReady, epoch := 10, quota := 5 } (-1) false 2 = (.error (.ub \"negative caller id\"))"
+            .to_string(),
+    );
+    for (bonus, exp_q) in [(0i64, 8i64), (1, 7), (2, 10), (3, 9)] {
+        vectors.push(format!(
+            "advance_vault {{ phase := .PhaseReady, epoch := 10, quota := 5 }} 1 false ({bonus} : Int) = (.ok {{ phase := (.PhaseShared 1), epoch := 11, quota := ({exp_q} : Int) }})"
+        ));
+    }
+    vectors.push(
+        "advance_vault { phase := .PhaseReady, epoch := 10, quota := 5 } 1 false (-3) = (.error (.ub \"negative bonus\"))"
+            .to_string(),
+    );
+    vectors.push("classify_vault_pair (.PhaseShared 6) 4 = ((14 : Int), true)".to_string());
+    assert!(
+        vectors.len() >= 54,
+        "expected >= 50 unseen vectors, got {}",
+        vectors.len()
+    );
+
+    let mut harness = ops.clone();
+    harness.push_str("\nopen MiniRust.Snapshots.S2026_05_Matched.Generated.Ops in\n");
+    for (idx, v) in vectors.iter().enumerate() {
+        harness.push_str(&format!(
+            "open MiniRust.Snapshots.S2026_05_Matched.Generated.Ops in\ntheorem unseen_vec_{idx:03} : {v} := by decide\n"
+        ));
+    }
+    let harness_path = tmp.join("UnseenHoldoutCheck.lean");
+    fs::write(&harness_path, &harness).expect("write UnseenHoldoutCheck.lean");
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let augmented_path =
+        format!("{home}/.cargo/bin:{home}/.elan/bin:{home}/.local/bin:{current_path}");
+    let out = std::process::Command::new("lake")
+        .args(["env", "lean"])
+        .arg(&harness_path)
+        .current_dir(root.join("examples"))
+        .env("PATH", &augmented_path)
+        .output()
+        .expect("run lake env lean on UnseenHoldoutCheck.lean");
+    let _ = fs::remove_dir_all(&tmp);
+    assert!(
+        out.status.success(),
+        "Lean 4 execution of {} unseen specr vectors failed!\nstdout:\n{}\nstderr:\n{}",
+        vectors.len(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 }

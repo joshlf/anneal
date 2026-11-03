@@ -2,6 +2,7 @@
 //! and correspondence gap code generator for upstream MiniRust specifications.
 
 pub mod ast_diff;
+pub mod expr_lower;
 pub mod extractor;
 pub mod gap_codegen;
 pub mod lean_emit;
