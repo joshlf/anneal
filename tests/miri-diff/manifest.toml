@@ -82,12 +82,6 @@ category = "scalar_arithmetic"
 upstream_path = "tests/pass/intrinsics/integer.rs"
 miri_verdict = "pass:scalar:12:4"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "incompleteness_unmodeled_intrinsic_or_call"
-observed_anneal_tag = "externalCall:core::intrinsics::exact_div"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators"
-summary = "core::intrinsics::exact_div is emitted as a Call terminator rather than lowered to BinOp.div and is not yet interpreted natively by evalCallTerminator."
 
 [[tests]]
 name = "pass_int_widening_and_truncating_casts"
@@ -221,12 +215,6 @@ category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/exact_div1.rs"
 miri_verdict = "ub"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "incompleteness_unmodeled_intrinsic_or_call"
-observed_anneal_tag = "externalCall:core::intrinsics::exact_div"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators"
-summary = "core::intrinsics::exact_div is not yet modeled in evalCallTerminator, so non-multiple division halts on externalCall instead of faulting with FailureKind.ub."
 
 [[tests]]
 name = "pass_bool_transmute_valid"
@@ -310,12 +298,6 @@ category = "uninit_and_padding"
 upstream_path = "tests/pass/partially-uninit.rs"
 miri_verdict = "pass:scalar:99:4"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "completeness_false_positive_ub"
-observed_anneal_tag = "ub"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Statements"
-summary = "Union Rvalue.aggregate (.adt ...) initializes a single-field unit aggregate, and writing to another union variant field (slot.value: u32) via writeProjectedValue fails with FailureKind.ub."
 
 [[tests]]
 name = "pass_copy_nonoverlapping_uninit_bytes_to_uninit"
@@ -385,12 +367,6 @@ category = "places_projections_and_pointers"
 upstream_path = "tests/pass/arrays.rs"
 miri_verdict = "pass:scalar:30:4"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "completeness_false_positive_ub"
-observed_anneal_tag = "ub"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Statements"
-summary = "Rvalue.ref and Rvalue.rawPtr record the unevaluated ProjectionElem.index tmpLocal in BorrowEntry.targetProjection instead of resolving the concrete index value at borrow creation time; when StorageDead(tmpLocal) executes before the reference is dereferenced, readPlace faults with FailureKind.ub."
 
 [[tests]]
 name = "pass_ptr_offset_within_array"

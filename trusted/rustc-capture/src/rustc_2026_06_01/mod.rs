@@ -851,6 +851,101 @@ pub fn overflow_checks_flag() -> bool {
     }
 
     #[test]
+    fn driver_names_intrinsics_by_defining_path_in_std_crates() {
+        // A crate that links `std` sees `core::intrinsics` through the
+        // `std::intrinsics` re-export. Intrinsic callees must still be named
+        // `core::intrinsics::*`, the paths the MIR semantics recognize, while
+        // other re-exported items keep their visible `std::` paths. The
+        // assertions inspect `RigidTy.fnDef` terms because the emitted module's
+        // `-- bb` comments print rustc's own MIR, which uses visible paths.
+        let temp_root = unique_temp_dir("intrinsic-paths");
+        let capture_dir = temp_root.join("capture");
+        let out_dir = temp_root.join("out");
+        fs::create_dir_all(&capture_dir).expect("create capture dir");
+        fs::create_dir_all(&out_dir).expect("create out dir");
+
+        let src_path = temp_root.join("ipath.rs");
+        let sample_rust = r#"#![allow(internal_features)]
+#![feature(core_intrinsics)]
+
+pub fn pop(x: u32) -> u32 {
+    core::intrinsics::ctpop(x)
+}
+
+pub fn ediv(a: u32, b: u32) -> u32 {
+    unsafe { std::intrinsics::exact_div(a, b) }
+}
+
+pub fn hint(x: bool) -> u32 {
+    if x {
+        unsafe { core::hint::unreachable_unchecked() }
+    }
+    7
+}
+"#;
+        fs::write(&src_path, sample_rust.as_bytes()).expect("write ipath.rs");
+
+        let args = vec![
+            "anneal-rustc-capture".to_owned(),
+            "rustc".to_owned(),
+            "--crate-name".to_owned(),
+            "ipath".to_owned(),
+            "--crate-type".to_owned(),
+            "lib".to_owned(),
+            "--edition=2024".to_owned(),
+            "-Zmir-opt-level=0".to_owned(),
+            "--out-dir".to_owned(),
+            out_dir.to_string_lossy().into_owned(),
+            src_path.to_string_lossy().into_owned(),
+        ];
+
+        let code = run_with_args(&args, Some(capture_dir.clone()), None);
+        assert_eq!(code, 0, "expected run_with_args to succeed with exit code 0");
+
+        let manifest_path = capture_dir.join("ipath").join("UnitCaptureManifest.json");
+        let manifest_json =
+            fs::read_to_string(&manifest_path).expect("read UnitCaptureManifest.json");
+        let parsed = UnitCaptureManifest::from_json_str(&manifest_json)
+            .expect("parse UnitCaptureManifest.json");
+        assert!(parsed.compilation_succeeded);
+
+        let read_mir_module = |def_id: &str| -> String {
+            let record = parsed
+                .unit_targets
+                .iter()
+                .find(|t| t.target.def_id == def_id)
+                .unwrap_or_else(|| panic!("find {def_id} in UnitCaptureManifest"));
+            let lean_path = capture_dir
+                .join("ipath")
+                .join(&record.target.mir_module_path);
+            fs::read_to_string(&lean_path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", lean_path.display()))
+        };
+
+        let pop_lean = read_mir_module("ipath::pop");
+        assert!(
+            pop_lean.contains("(RigidTy.fnDef \"core::intrinsics::ctpop\""),
+            "pop:\n{pop_lean}"
+        );
+        assert!(!pop_lean.contains("(RigidTy.fnDef \"std::intrinsics::"), "pop:\n{pop_lean}");
+
+        let ediv_lean = read_mir_module("ipath::ediv");
+        assert!(
+            ediv_lean.contains("(RigidTy.fnDef \"core::intrinsics::exact_div\""),
+            "ediv:\n{ediv_lean}"
+        );
+        assert!(!ediv_lean.contains("(RigidTy.fnDef \"std::intrinsics::"), "ediv:\n{ediv_lean}");
+
+        let hint_lean = read_mir_module("ipath::hint");
+        assert!(
+            hint_lean.contains("(RigidTy.fnDef \"std::hint::unreachable_unchecked\""),
+            "hint:\n{hint_lean}"
+        );
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
     fn driver_skips_anonymous_consts_disambiguates_collisions_and_applies_filter() {
         use std::collections::BTreeSet;
 

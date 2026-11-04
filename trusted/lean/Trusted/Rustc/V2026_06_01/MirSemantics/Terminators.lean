@@ -2283,6 +2283,12 @@ def withConstEvalSelectIntrinsicTypeArgs
 Construct synthetic zero-sized constant `Operand`s carrying the element types
 `elemTys` of a `const_eval_select` argument tuple `ARG = .tuple elemTys`.
 
+These operands exist only so that `operandTy` can type the runtime target's
+arguments during signedness and pointee resolution in
+`evalNonSelectIntrinsicCall`. They are never evaluated, and their `.zeroSized`
+values and `layoutIdx := 0` do not describe the runtime arguments, which come
+from the unpacked tuple value.
+
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2400-L2408>

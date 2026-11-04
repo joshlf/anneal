@@ -22,6 +22,7 @@ use rustc_middle::mir::{
     ProjectionElem, RawPtrKind, RuntimeChecks, RuntimePhase, Rvalue, Statement, StatementKind,
     SwitchTargets, Terminator, TerminatorKind, UnOp, UnwindAction, VarDebugInfoContents, WithRetag,
 };
+use rustc_middle::ty::print::with_no_visible_paths;
 use rustc_middle::ty::{FloatTy, IntTy, Mutability, ScalarInt, Ty, TyCtxt, TyKind, UintTy};
 use rustc_span::DUMMY_SP;
 
@@ -46,8 +47,46 @@ pub use crate::rustc_2026_06_01::specs::{
 
 /// Returns the canonical crate-qualified `DefId` path for `def_id` (for
 /// example, `"demo::answer"`).
+///
+/// For an item of another crate, `tcx.def_path_str` prints the path through
+/// which the item is visible from the crate being compiled, preferring public
+/// re-exports:
+///
+/// > ```text
+/// > /// Prevent selection of visible paths. `Display` impl of DefId will prefer
+/// > /// visible (public) reexports of types as paths.
+/// > fn with_no_visible_paths(NoVisibleGuard, NO_VISIBLE_PATH);
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/print/pretty.rs#L120-L122
+///
+/// Because `std` re-exports `core::intrinsics` as `std::intrinsics`, a crate
+/// that links `std` therefore sees `core::intrinsics::ctpop` as
+/// `std::intrinsics::ctpop`, while a `#![no_std]` crate sees
+/// `core::intrinsics::ctpop`. The MIR semantics recognize compiler intrinsics
+/// (`tcx.intrinsic(def_id)` is `Some`) by their defining paths
+/// (`classifyRustIntrinsic?`, `isDirectExactDivTarget`), so this function
+/// prints an intrinsic's path with visible-path selection disabled, which skips
+/// the re-export lookup:
+///
+/// > ```text
+/// > fn try_print_visible_def_path(&mut self, def_id: DefId) -> Result<bool, PrintError> {
+/// >     if with_no_visible_paths() {
+/// >         return Ok(false);
+/// >     }
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/print/pretty.rs#L362-L365
+///
+/// Other items keep their visible paths (for example `std::option::Option`
+/// and `std::hint::unreachable_unchecked`), which the semantics and
+/// specifications already match.
 pub fn canonical_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
-    let raw = tcx.def_path_str(def_id);
+    let raw = if tcx.intrinsic(def_id).is_some() {
+        with_no_visible_paths!(tcx.def_path_str(def_id))
+    } else {
+        tcx.def_path_str(def_id)
+    };
     if def_id.is_local() {
         let crate_name = tcx.crate_name(LOCAL_CRATE).to_string();
         if raw.is_empty() {
