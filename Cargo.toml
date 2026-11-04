@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "trusted/rustc-capture",
+    "crates/anneal-mir-instrument",
     "crates/cargo-anneal",
     "crates/anneal-spec",
     "crates/anneal-spec-macros",

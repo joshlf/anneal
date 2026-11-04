@@ -16,7 +16,9 @@
 //! layout-aware argument and return bytes via [`TraceRecorder::observe_root`].
 
 pub use cargo_anneal::trace_observer::{
-    EnvAction, EnvSchedule, FromScheduleBytes, RecordedEvent, RecordedOutcome, RecordedRawTrace,
-    RecordedShadowAlloc, ScheduleError, TraceCapture, TraceRecorder, capture_value_bytes,
-    observe_boundary_call, value_as_raw_bytes,
+    __anneal_mir_rt_branch, __anneal_mir_rt_call_begin, __anneal_mir_rt_call_end_normal,
+    __anneal_mir_rt_push_arg, __anneal_mir_rt_ret, EnvAction, EnvSchedule, FromScheduleBytes,
+    MIR_CALL_TOKEN_PASSTHROUGH_INLINED, MIR_CALL_TOKEN_SCHEDULED_RETURN, RecordedEvent,
+    RecordedOutcome, RecordedRawTrace, RecordedShadowAlloc, ScheduleError, TraceCapture,
+    TraceRecorder, capture_value_bytes, observe_boundary_call, value_as_raw_bytes,
 };

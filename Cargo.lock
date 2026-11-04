@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "anneal-mir-instrument"
+version = "0.1.0"
+
+[[package]]
 name = "anneal-rustc-capture"
 version = "0.1.0-alpha.1"
 

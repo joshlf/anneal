@@ -6,7 +6,7 @@
 // This file may not be copied, modified, or distributed except according to
 // those terms.
 
-#![cfg_attr(not(any(test, anneal_trace_ext)), no_std)]
+#![cfg_attr(not(any(test, anneal_trace_ext, anneal_mir_instrument)), no_std)]
 #![allow(unexpected_cfgs)]
 //! Curated 30-function seed corpus for Anneal ITree trace differential testing (`tests/itree-diff/`).
 //!

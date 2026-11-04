@@ -74,17 +74,16 @@ pub fn external(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mut out = TokenStream::new();
 
-    // 1. Unmodified item for normal (`#![no_std]` / MIR capture) builds:
-    //    `#[allow(unexpected_cfgs)] #[cfg(not(any(test, anneal_trace_ext)))] <orig_stream>`
+    // 1. Unmodified item for normal (`#![no_std]` / MIR capture) or
+    //    MIR-instrumented (`anneal_mir_instrument`) builds:
     out.extend(parse_tokens(
-        "#[allow(unexpected_cfgs)] #[cfg(not(any(test, anneal_trace_ext)))]",
+        "#[allow(unexpected_cfgs)] #[cfg(any(anneal_mir_instrument, not(any(test, anneal_trace_ext))))]",
     ));
     out.extend(orig_stream);
 
-    // 2. Boundary-observing item for test and trace-collection builds:
-    //    `#[allow(unexpected_cfgs)] #[cfg(any(test, anneal_trace_ext))] ...`
+    // 2. Boundary-observing item for source-level test and trace-collection builds:
     out.extend(parse_tokens(
-        "#[allow(unexpected_cfgs)] #[cfg(any(test, anneal_trace_ext))]",
+        "#[allow(unexpected_cfgs)] #[cfg(all(not(anneal_mir_instrument), any(test, anneal_trace_ext)))]",
     ));
     for tt in &tokens[..params_pos] {
         out.extend(std::iter::once(tt.clone()));
@@ -212,13 +211,13 @@ fn expand_struct_capture(
     let impl_src = format!(
         "#[allow(unexpected_cfgs)]\n\
          const _: () = {{\n\
-             #[cfg(any(test, anneal_trace_ext))]\n\
+             #[cfg(any(test, anneal_trace_ext, anneal_mir_instrument))]\n\
              impl ::cargo_anneal::trace_observer::TraceCapture for {struct_name} {{\n\
                  fn write_captured_bytes(&self, dst: &mut [::core::option::Option<u8>]) {{\n\
                      {write_stmts}\
                  }}\n\
              }}\n\
-             #[cfg(any(test, anneal_trace_ext))]\n\
+             #[cfg(any(test, anneal_trace_ext, anneal_mir_instrument))]\n\
              impl ::cargo_anneal::trace_observer::FromScheduleBytes for {struct_name} {{\n\
                  fn from_schedule_bytes(\n\
                      bytes: &[u8],\n\
@@ -283,7 +282,7 @@ fn expand_enum_capture(
     let impl_src = format!(
         "#[allow(unexpected_cfgs)]\n\
          const _: () = {{\n\
-             #[cfg(any(test, anneal_trace_ext))]\n\
+             #[cfg(any(test, anneal_trace_ext, anneal_mir_instrument))]\n\
              impl ::cargo_anneal::trace_observer::TraceCapture for {enum_name} {{\n\
                  fn write_captured_bytes(&self, dst: &mut [::core::option::Option<u8>]) {{\n\
                      let disc: u128 = match *self {{\n\
@@ -303,7 +302,7 @@ fn expand_enum_capture(
                      }}\n\
                  }}\n\
              }}\n\
-             #[cfg(any(test, anneal_trace_ext))]\n\
+             #[cfg(any(test, anneal_trace_ext, anneal_mir_instrument))]\n\
              impl ::cargo_anneal::trace_observer::FromScheduleBytes for {enum_name} {{\n\
                  fn from_schedule_bytes(\n\
                      bytes: &[u8],\n\

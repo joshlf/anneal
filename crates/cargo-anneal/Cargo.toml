@@ -41,4 +41,4 @@ anneal-rustc-capture = { version = "0.1.0-alpha.1", path = "../../trusted/rustc-
 anneal-trace = { path = "../anneal-trace" }
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(anneal_trace_ext)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(anneal_trace_ext)', 'cfg(anneal_mir_instrument)'] }

@@ -763,6 +763,26 @@ pub struct RecordedRawTrace {
     pub outcome: RecordedOutcome,
 }
 
+impl RecordedRawTrace {
+    /// Return a copy of this trace with all [`RecordedEvent::Branch`] events
+    /// removed, suitable for branch-erased (`checkBranches = false`) replay
+    /// against `mirObsErasedStatefulTree`.
+    pub fn without_branches(&self) -> Self {
+        Self {
+            root_def_path: self.root_def_path.clone(),
+            raw_args: self.raw_args.clone(),
+            shadow_provenance: self.shadow_provenance.clone(),
+            events: self
+                .events
+                .iter()
+                .filter(|ev| !matches!(ev, RecordedEvent::Branch { .. }))
+                .cloned()
+                .collect(),
+            outcome: self.outcome.clone(),
+        }
+    }
+}
+
 /// Alias preserving compatibility with JSON raw byte trace descriptors.
 pub type RawByteTraceJson = RecordedRawTrace;
 
@@ -977,7 +997,14 @@ impl EnvSchedule {
     }
 }
 
+struct PendingMirCall {
+    token: u32,
+    def_path: String,
+    raw_args: Vec<Vec<u8>>,
+}
+
 struct ActiveBoundaryState {
+    root_def_path: String,
     root_crate_prefix: Option<String>,
     schedule: EnvSchedule,
     inlined_callees: BTreeSet<String>,
@@ -985,6 +1012,10 @@ struct ActiveBoundaryState {
     branch_tags: Vec<u32>,
     call_count: usize,
     boundary_depth: usize,
+    staged_call_args: Vec<Vec<u8>>,
+    pending_mir_calls: Vec<PendingMirCall>,
+    root_return_bytes: Option<Vec<u8>>,
+    next_mir_call_token: u32,
 }
 
 impl ActiveBoundaryState {
@@ -1007,6 +1038,253 @@ impl ActiveBoundaryState {
             format!("{callee_module_path}::{callee_fn_name}")
         }
     }
+
+    fn canonical_mir_def_path(&self, raw_def_path: &str) -> String {
+        if let Some(ref root_crate) = self.root_crate_prefix {
+            if raw_def_path == root_crate || raw_def_path.starts_with(&format!("{root_crate}::")) {
+                return raw_def_path.to_string();
+            }
+            if let Some((_orig_crate, rest)) = raw_def_path.split_once("::") {
+                if rest == root_crate || rest.starts_with(&format!("{root_crate}::")) {
+                    return rest.to_string();
+                }
+                return format!("{root_crate}::{rest}");
+            }
+            return format!("{root_crate}::{raw_def_path}");
+        }
+        raw_def_path.to_string()
+    }
+
+    fn matches_root_def_path(&self, raw_def_path: &str) -> bool {
+        if self.root_def_path.is_empty() {
+            return false;
+        }
+        if self.canonical_mir_def_path(raw_def_path) == self.root_def_path {
+            return true;
+        }
+        let short_raw = raw_def_path
+            .rsplit_once("::")
+            .map(|(_, s)| s)
+            .unwrap_or(raw_def_path);
+        let short_root = self
+            .root_def_path
+            .rsplit_once("::")
+            .map(|(_, s)| s)
+            .unwrap_or(&self.root_def_path);
+        short_raw == short_root
+    }
+}
+
+/// Token returned by [`__anneal_mir_rt_call_begin`] when the call is inlined or
+/// outside an active external-call boundary.
+pub const MIR_CALL_TOKEN_PASSTHROUGH_INLINED: u32 = 0;
+
+/// Token returned by [`__anneal_mir_rt_call_begin`] when an [`EnvSchedule`]
+/// `ReturnBytes` override wrote the return value directly to the destination
+/// local and the underlying callee body should be skipped.
+pub const MIR_CALL_TOKEN_SCHEDULED_RETURN: u32 = u32::MAX;
+
+fn read_masked_bytes(ptr: *const u8, len: usize, init_mask: u64) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    if len == 0 || ptr.is_null() {
+        return out;
+    }
+    for (i, slot) in out.iter_mut().enumerate() {
+        let is_init = if i < 64 {
+            ((init_mask >> i) & 1) != 0
+        } else {
+            (init_mask >> 63) != 0
+        };
+        if is_init {
+            // SAFETY: `ptr` points to a live stack local of size `len` in the
+            // caller's MIR frame, and `init_mask` bit `i` is set only for
+            // initialized non-padding scalar byte offsets computed from
+            // `tcx.layout_of(ty)`.
+            *slot = unsafe { *ptr.add(i) };
+        }
+    }
+    out
+}
+
+fn write_masked_bytes(ptr: *mut u8, len: usize, init_mask: u64, src: &[u8]) {
+    if len == 0 || ptr.is_null() || src.len() != len {
+        return;
+    }
+    for (i, &byte) in src.iter().enumerate() {
+        let is_init = if i < 64 {
+            ((init_mask >> i) & 1) != 0
+        } else {
+            (init_mask >> 63) != 0
+        };
+        if is_init {
+            // SAFETY: `ptr` points to a live mutable destination local of size
+            // `len` in the caller's MIR frame, and `init_mask` bit `i` is set
+            // only for valid scalar field byte offsets.
+            unsafe {
+                *ptr.add(i) = byte;
+            }
+        }
+    }
+}
+
+/// Runtime hook injected by `anneal-mir-instrument` before every
+/// `TerminatorKind::SwitchInt` to record the unsigned `sizeBytes` discriminant
+/// bit pattern (`tag = tag_lo | (tag_hi << 64)`).
+pub fn __anneal_mir_rt_branch(tag_lo: u64, tag_hi: u64) {
+    let tag = u128::from(tag_lo) | (u128::from(tag_hi) << 64);
+    ACTIVE_RECORDER.with(|cell| {
+        if let Some(state) = cell.borrow_mut().as_mut()
+            && state.boundary_depth == 0
+        {
+            state.branch_tags.push(tag_lo as u32);
+            state.events.push(RecordedEvent::Branch { tag });
+        }
+    });
+}
+
+/// Runtime hook injected by `anneal-mir-instrument` before a
+/// `TerminatorKind::Call` to stage each argument's initialized bytes (masking
+/// padding bytes to `0u8` via `init_mask`).
+pub fn __anneal_mir_rt_push_arg(ptr: *const u8, len: usize, init_mask: u64) {
+    ACTIVE_RECORDER.with(|cell| {
+        if let Some(state) = cell.borrow_mut().as_mut()
+            && state.boundary_depth == 0
+        {
+            let bytes = read_masked_bytes(ptr, len, init_mask);
+            state.staged_call_args.push(bytes);
+        }
+    });
+}
+
+/// Runtime hook injected by `anneal-mir-instrument` immediately before a
+/// `TerminatorKind::Call`.
+///
+/// Returns:
+/// - [`MIR_CALL_TOKEN_PASSTHROUGH_INLINED`] (`0`) when the call is inlined or
+///   inside an already-active external call boundary,
+/// - [`MIR_CALL_TOKEN_SCHEDULED_RETURN`] (`u32::MAX`) when an [`EnvSchedule`]
+///   `ReturnBytes` entry wrote the scheduled return bytes into `dst_ptr` and
+///   the underlying callee invocation should be skipped, or
+/// - a nonzero call token (`1 .. u32::MAX - 1`) paired with the subsequent
+///   [`__anneal_mir_rt_call_end_normal`] hook.
+pub fn __anneal_mir_rt_call_begin(
+    raw_def_path: &'static str,
+    dst_ptr: *mut u8,
+    dst_len: usize,
+    dst_mask: u64,
+) -> u32 {
+    let decision = ACTIVE_RECORDER.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let state = borrow.as_mut()?;
+        let raw_args = mem::take(&mut state.staged_call_args);
+        if state.boundary_depth > 0 {
+            return None;
+        }
+        let def_path = state.canonical_mir_def_path(raw_def_path);
+        let short_name = def_path
+            .rsplit_once("::")
+            .map(|(_, s)| s)
+            .unwrap_or(&def_path);
+        if state.is_inlined(&def_path, short_name) || state.matches_root_def_path(raw_def_path) {
+            return None;
+        }
+        let call_idx = state.call_count;
+        state.call_count += 1;
+        let action = state.schedule.next_action(&def_path, call_idx);
+        match action {
+            EnvAction::PanicOnCall(k) => {
+                state.events.push(RecordedEvent::ExtCallPanic {
+                    def_path: def_path.clone(),
+                    raw_args,
+                });
+                Some(Err((def_path, k)))
+            }
+            EnvAction::ReturnBytes(sched_bytes) => {
+                if sched_bytes.len() != dst_len {
+                    panic!(
+                        "anneal scheduled ReturnBytes for `{def_path}` has mismatched payload size: \
+                         expected {dst_len} bytes, got {} bytes",
+                        sched_bytes.len()
+                    );
+                }
+                write_masked_bytes(dst_ptr, dst_len, dst_mask, &sched_bytes);
+                let raw_ret = read_masked_bytes(dst_ptr.cast_const(), dst_len, dst_mask);
+                state.events.push(RecordedEvent::ExtCall {
+                    def_path,
+                    raw_args,
+                    raw_ret,
+                });
+                Some(Ok(MIR_CALL_TOKEN_SCHEDULED_RETURN))
+            }
+            EnvAction::PassThrough => {
+                state.boundary_depth += 1;
+                let token = state.next_mir_call_token;
+                state.next_mir_call_token = state.next_mir_call_token.wrapping_add(1).max(1);
+                if state.next_mir_call_token == MIR_CALL_TOKEN_SCHEDULED_RETURN {
+                    state.next_mir_call_token = 1;
+                }
+                state.pending_mir_calls.push(PendingMirCall {
+                    token,
+                    def_path,
+                    raw_args,
+                });
+                Some(Ok(token))
+            }
+        }
+    });
+    match decision {
+        None => MIR_CALL_TOKEN_PASSTHROUGH_INLINED,
+        Some(Ok(token)) => token,
+        Some(Err((def_path, k))) => {
+            panic!("anneal scheduled PanicOnCall({k}) triggered in `{def_path}`");
+        }
+    }
+}
+
+/// Runtime hook injected by `anneal-mir-instrument` on the normal-return edge
+/// of a `TerminatorKind::Call`.
+pub fn __anneal_mir_rt_call_end_normal(
+    token: u32,
+    ret_ptr: *mut u8,
+    ret_len: usize,
+    init_mask: u64,
+) {
+    if token == MIR_CALL_TOKEN_PASSTHROUGH_INLINED || token == MIR_CALL_TOKEN_SCHEDULED_RETURN {
+        return;
+    }
+    ACTIVE_RECORDER.with(|cell| {
+        if let Some(state) = cell.borrow_mut().as_mut() {
+            state.boundary_depth = state.boundary_depth.saturating_sub(1);
+            if let Some(pos) = state.pending_mir_calls.iter().rposition(|p| p.token == token) {
+                let pending = state.pending_mir_calls.remove(pos);
+                let raw_ret = read_masked_bytes(ret_ptr.cast_const(), ret_len, init_mask);
+                state.events.push(RecordedEvent::ExtCall {
+                    def_path: pending.def_path,
+                    raw_args: pending.raw_args,
+                    raw_ret,
+                });
+            }
+        }
+    });
+}
+
+/// Runtime hook injected by `anneal-mir-instrument` before `TerminatorKind::Return`
+/// to capture the root function's `_0` return place bytes with padding masked
+/// to `0u8` via `init_mask`.
+pub fn __anneal_mir_rt_ret(
+    raw_def_path: &'static str,
+    ret_ptr: *const u8,
+    ret_len: usize,
+    init_mask: u64,
+) {
+    ACTIVE_RECORDER.with(|cell| {
+        if let Some(state) = cell.borrow_mut().as_mut()
+            && state.boundary_depth == 0
+            && state.matches_root_def_path(raw_def_path)
+        {
+            state.root_return_bytes = Some(read_masked_bytes(ret_ptr, ret_len, init_mask));
+        }
+    });
 }
 
 thread_local! {
@@ -1425,6 +1703,7 @@ impl TraceRecorder {
             .map(|(prefix, _)| prefix.to_string());
 
         let active_init = ActiveBoundaryState {
+            root_def_path: root_def_path_str.clone(),
             root_crate_prefix,
             schedule: recorder.schedule.clone(),
             inlined_callees: recorder.inlined_callees.clone(),
@@ -1432,6 +1711,10 @@ impl TraceRecorder {
             branch_tags: Vec::new(),
             call_count: recorder.call_count,
             boundary_depth: 0,
+            staged_call_args: Vec::new(),
+            pending_mir_calls: Vec::new(),
+            root_return_bytes: None,
+            next_mir_call_token: 1,
         };
 
         let prev_active = ACTIVE_RECORDER.with(|cell| cell.borrow_mut().replace(active_init));
@@ -1443,16 +1726,24 @@ impl TraceRecorder {
             current
         });
 
-        if let Some(active) = finished_active {
+        let mut mir_root_ret: Option<Vec<u8>> = None;
+        if let Some(mut active) = finished_active {
+            for pending in active.pending_mir_calls.drain(..) {
+                active.events.push(RecordedEvent::ExtCallPanic {
+                    def_path: pending.def_path,
+                    raw_args: pending.raw_args,
+                });
+            }
             recorder.schedule = active.schedule;
             recorder.events.extend(active.events);
             recorder.branch_tags.extend(active.branch_tags);
             recorder.call_count = active.call_count;
+            mir_root_ret = active.root_return_bytes;
         }
 
         let outcome = match &res {
             Ok(ret) => RecordedOutcome::Normal {
-                raw_ret: value_as_raw_bytes(ret),
+                raw_ret: mir_root_ret.unwrap_or_else(|| value_as_raw_bytes(ret)),
             },
             Err(_) => RecordedOutcome::Panic,
         };
@@ -1901,9 +2192,16 @@ pub fn render_batch_trace_eval_lean_module(
             let fuel = cfg.fuel;
             let sound_thm = format!("{id}_trace_consistent");
             if cfg.check_branches {
+                let obs_erased_ident = format!("{id}_obsErasedRawTrace");
+                let obs_erased_expr = render_raw_byte_trace_lean(
+                    &case.trace.without_branches(),
+                    init_mem_expr,
+                    &cfg.inlined_callee_modules,
+                );
                 let _ = writeln!(
                     out,
-                    "set_option maxHeartbeats 400000 in\n\
+                    "@[reducible]\ndef {obs_erased_ident} : RawByteTrace :=\n{obs_erased_expr}\n\n\
+                     set_option maxHeartbeats 400000 in\n\
                      theorem {sound_thm} :\n\
                      \x20   ∃ obsTrace tr out,\n\
                      \x20     decodeRawByteTrace {root_body} {sigs_ident} {table_ident} {trace_ident} = some obsTrace ∧\n\
@@ -1913,7 +2211,18 @@ pub fn render_batch_trace_eval_lean_module(
                      \x20       (mirStatefulTree {root_body} obsTrace.args\n\
                      \x20         {{ obsTrace.initMem with callees := obsTrace.inlinedCallees }})\n\
                      \x20       tr out :=\n\
-                     \x20 checkRawByteTraceFullBounded_sound {fuel} {root_body} {sigs_ident} {table_ident} {trace_ident} rfl\n"
+                     \x20 checkRawByteTraceFullBounded_sound {fuel} {root_body} {sigs_ident} {table_ident} {trace_ident} rfl\n\n\
+                     set_option maxHeartbeats 400000 in\n\
+                     theorem {id}_trace_obs_erased_consistent :\n\
+                     \x20   ∃ obsTrace tr out,\n\
+                     \x20     decodeRawByteTrace {root_body} {sigs_ident} {table_ident} {obs_erased_ident} = some obsTrace ∧\n\
+                     \x20     MatchesObservedEvents obsTrace.events tr ∧\n\
+                     \x20     MatchesObservedOutcome obsTrace.outcome out ∧\n\
+                     \x20     ReachesRet\n\
+                     \x20       (mirObsErasedStatefulTree {root_body} obsTrace.args\n\
+                     \x20         {{ obsTrace.initMem with callees := obsTrace.inlinedCallees }})\n\
+                     \x20       tr out :=\n\
+                     \x20 checkRawByteTraceObsErasedBounded_sound {fuel} {root_body} {sigs_ident} {table_ident} {obs_erased_ident} rfl\n"
                 );
             } else {
                 let _ = writeln!(

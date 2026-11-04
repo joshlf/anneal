@@ -6,10 +6,11 @@
 // This file may not be copied, modified, or distributed except according to
 // those terms.
 
-//! Batch compilation, native boundary-interposed trace collection
-//! (`#[anneal_trace::external]`), trace deduplication, and batched Lean 4
-//! `TraceCheck` evaluation (`diagnoseRawByteTraceObsErasedBounded` +
-//! `checkRawByteTraceObsErasedBounded_sound`) for `itree-difftest`.
+//! Batch compilation, binary-level MIR-instrumented trace collection
+//! (`anneal-mir-instrument` at `-C opt-level=0` and `-C opt-level=2`), trace
+//! deduplication, and batched Lean 4 `TraceCheck` evaluation
+//! (`diagnoseRawByteTraceFullBounded` + `checkRawByteTraceFullBounded_sound`
+//! and `checkRawByteTraceObsErasedBounded_sound`) for `itree-difftest`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -162,19 +163,20 @@ pub const ITREE_DIAG_TAG_NAMES: [&str; 11] = [
 /// Default number of input trials executed natively per compiled candidate.
 pub const DEFAULT_ITREE_TRIALS_PER_CANDIDATE: usize = 12;
 
-/// Step fuel bound passed to `diagnoseRawByteTraceObsErasedBounded` and
+/// Step fuel bound passed to `diagnoseRawByteTraceFullBounded`,
+/// `checkRawByteTraceFullBounded_sound`, and
 /// `checkRawByteTraceObsErasedBounded_sound`.
 pub const ITREE_TRACE_CHECK_FUEL: usize = 240;
 
 /// Per-candidate compilation results across `-C opt-level=0`, `-C opt-level=2`,
-/// and the `syn` source-to-source instrumenter check.
+/// and `anneal-mir-instrument` compilation at both `-O0` and `-O2`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CandidateCompile {
     /// Compiled cleanly under `#![forbid(unsafe_code)]` at `-C opt-level=0`.
     pub opt0: bool,
     /// Compiled cleanly under `#![forbid(unsafe_code)]` at `-C opt-level=2`.
     pub opt2: bool,
-    /// Auto-instrumented copy compiled cleanly at `-C opt-level=0`.
+    /// Compiled cleanly under `anneal-mir-instrument` at both `-O0` and `-O2`.
     pub instrumented: bool,
 }
 
@@ -232,7 +234,7 @@ pub struct ItreeFindingBundle {
     pub diag_repr: String,
     /// Encoded hex line of the diverging [`RecordedRawTrace`].
     pub trace_hex: String,
-    /// Whether the Lean 4 kernel confirmed `(diagnoseRawByteTraceObsErasedBounded ...).tagName = "<diag_tag>"` via `by rfl`.
+    /// Whether the Lean 4 kernel confirmed `(diagnoseRawByteTraceFullBounded ...).tagName = "<diag_tag>"` via `by rfl`.
     pub kernel_confirmed: bool,
     /// Kernel-checked `theorem <case_ident>_diag_tag` snippet from `ItreeDiffBatchConfirm.lean`.
     pub kernel_confirm_theorem: String,
@@ -271,7 +273,7 @@ pub struct ItreeCampaignEvalReport {
     pub opt_level_2_compiled: usize,
     /// Count of candidates that compiled at both `-O0` and `-O2`.
     pub opt_level_0_and_2_compiled: usize,
-    /// Count of candidates whose `syn`-instrumented copy compiled at `-O0`.
+    /// Count of candidates whose `anneal-mir-instrument` build succeeded at `-O0` and `-O2`.
     pub instrumented_compiled: usize,
     /// Percentage of generated candidates that compiled at both `-O0` and `-O2`.
     pub compile_pass_rate_pct: f64,
@@ -372,14 +374,66 @@ pub fn compile_rust_strict_opt(label: &str, opt_level: &str, source: &str) -> bo
     ok
 }
 
+/// Runs `anneal-mir-instrument` (`--edition=2024 --crate-type=lib -D warnings
+/// -C opt-level=<level>`) on `source` and reports whether it compiled cleanly.
+pub fn compile_rust_mir_instrumented(label: &str, opt_level: &str, source: &str) -> bool {
+    let repo_root = default_repo_root();
+    let Ok(driver_bin) = ensure_mir_instrument_bin(&repo_root) else {
+        return false;
+    };
+    let tmp_dir = env::temp_dir().join(format!(
+        "anneal_itree_mir_inst_{}_{}_o{}",
+        std::process::id(),
+        label,
+        opt_level
+    ));
+    let _ = fs::create_dir_all(&tmp_dir);
+    let out_path = tmp_dir.join("libitree_mir_inst.rlib");
+    let opt_flag = format!("opt-level={opt_level}");
+
+    let child_res = Command::new(&driver_bin)
+        .args([
+            "--edition=2024",
+            "--crate-type=lib",
+            "-D",
+            "warnings",
+            "-C",
+            &opt_flag,
+            "-o",
+        ])
+        .arg(&out_path)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+
+    let Ok(mut child) = child_res else {
+        let _ = fs::remove_dir_all(&tmp_dir);
+        return false;
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(source.as_bytes());
+    }
+    let ok = child
+        .wait_with_output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let _ = fs::remove_dir_all(&tmp_dir);
+    ok
+}
+
 /// Compiles every candidate under `#![forbid(unsafe_code)]` at `-C opt-level=0`
 /// and `-C opt-level=2`, and compiles every candidate's `#[anneal_trace::external]`-
-/// annotated copy at `-C opt-level=0`. Each check first compiles all candidates
-/// as one crate and falls back to one candidate at a time only when the combined
-/// crate fails.
+/// annotated copy under `anneal-mir-instrument` at both `-C opt-level=0` and
+/// `-C opt-level=2`. Each check first compiles all candidates as one crate and
+/// falls back to one candidate at a time only when the combined crate fails.
 pub fn compile_itree_candidates(
     batches: &[Vec<GeneratedItreeCandidate>],
 ) -> Vec<Vec<CandidateCompile>> {
+    let repo_root = default_repo_root();
+    let _ = ensure_mir_instrument_bin(&repo_root);
     let mut results: Vec<Vec<CandidateCompile>> = batches
         .iter()
         .map(|b| vec![CandidateCompile::default(); b.len()])
@@ -414,7 +468,8 @@ pub fn compile_itree_candidates(
         let hi = s.spawn(|| {
             !any_inst_failed
                 && !combined_inst.is_empty()
-                && compile_rust_strict_opt("all_inst", "0", &combined_inst)
+                && compile_rust_mir_instrumented("all_inst", "0", &combined_inst)
+                && compile_rust_mir_instrumented("all_inst", "2", &combined_inst)
         });
         (
             h0.join().unwrap_or(false),
@@ -436,7 +491,13 @@ pub fn compile_itree_candidates(
                     let inst_src = format!(
                         "#![feature(register_tool)]\n#![register_tool(anneal_trace)]\n{src}"
                     );
-                    inst_all || compile_rust_strict_opt(&format!("{label}_inst"), "0", &inst_src)
+                    inst_all
+                        || (compile_rust_mir_instrumented(&format!("{label}_inst"), "0", &inst_src)
+                            && compile_rust_mir_instrumented(
+                                &format!("{label}_inst"),
+                                "2",
+                                &inst_src,
+                            ))
                 }
             };
         }
@@ -464,6 +525,31 @@ fn ensure_rustc_capture_bin(repo_root: &Path) -> Result<PathBuf, String> {
         .map_err(|e| format!("failed to invoke cargo build for anneal-rustc-capture: {e}"))?;
     if !status.success() {
         return Err("building anneal-rustc-capture failed".to_string());
+    }
+    Ok(bin_path)
+}
+
+fn ensure_mir_instrument_bin(repo_root: &Path) -> Result<PathBuf, String> {
+    let bin_path = repo_root.join("target/debug/anneal-mir-instrument");
+    let lib_src = repo_root.join("crates/anneal-mir-instrument/src/lib.rs");
+    let main_src = repo_root.join("crates/anneal-mir-instrument/src/main.rs");
+    let bin_mtime = fs::metadata(&bin_path).and_then(|m| m.modified()).ok();
+    let lib_mtime = fs::metadata(&lib_src).and_then(|m| m.modified()).ok();
+    let main_mtime = fs::metadata(&main_src).and_then(|m| m.modified()).ok();
+    if bin_path.is_file()
+        && let (Some(bm), Some(lm), Some(mm)) = (bin_mtime, lib_mtime, main_mtime)
+        && bm >= lm
+        && bm >= mm
+    {
+        return Ok(bin_path);
+    }
+    let status = Command::new("cargo")
+        .args(["build", "-p", "anneal-mir-instrument", "--locked"])
+        .current_dir(repo_root)
+        .status()
+        .map_err(|e| format!("failed to invoke cargo build for anneal-mir-instrument: {e}"))?;
+    if !status.success() {
+        return Err("building anneal-mir-instrument failed".to_string());
     }
     Ok(bin_path)
 }
@@ -668,63 +754,97 @@ fn collect_traces_natively(
     staged_candidates: &[(StagedItreeCandidate, Vec<(u32, u32, bool)>)],
 ) -> Result<BTreeMap<String, Vec<RecordedRawTrace>>, String> {
     let proc_macro_dylib = build_anneal_trace_proc_macro_dylib(repo_root, staging_dir)?;
+    let mir_instrument_bin = ensure_mir_instrument_bin(repo_root)?;
     let collector_src = render_trace_collector_source(repo_root, staged_candidates);
     let collector_rs = staging_dir.join("collect_traces.rs");
-    let collector_bin = staging_dir.join("collect_traces_bin");
+    let collector_bin_o0 = staging_dir.join("collect_traces_bin_o0");
+    let collector_bin_o2 = staging_dir.join("collect_traces_bin_o2");
     fs::write(&collector_rs, &collector_src)
         .map_err(|e| format!("failed to write {}: {e}", collector_rs.display()))?;
 
-    let rustc_bin = resolve_rustc_bin();
     let extern_arg = format!("anneal_trace={}", proc_macro_dylib.display());
-    let compile_out = Command::new(&rustc_bin)
-        .args([
-            "--edition=2024",
-            "--cfg",
-            "anneal_trace_ext",
-            "-A",
-            "warnings",
-            "--extern",
-            &extern_arg,
-        ])
-        .arg(&collector_rs)
-        .arg("-o")
-        .arg(&collector_bin)
+    for (opt_level, bin_path) in [("0", &collector_bin_o0), ("2", &collector_bin_o2)] {
+        let opt_flag = format!("opt-level={opt_level}");
+        let compile_out = Command::new(&mir_instrument_bin)
+            .args([
+                "--edition=2024",
+                "--cfg",
+                "anneal_trace_ext",
+                "-A",
+                "warnings",
+                "-C",
+                &opt_flag,
+                "--extern",
+                &extern_arg,
+            ])
+            .arg(&collector_rs)
+            .arg("-o")
+            .arg(bin_path)
+            .current_dir(staging_dir)
+            .output()
+            .map_err(|e| {
+                format!(
+                    "failed to invoke anneal-mir-instrument (-O{opt_level}) for trace collector: {e}"
+                )
+            })?;
+        if !compile_out.status.success() {
+            return Err(format!(
+                "compiling collect_traces.rs with anneal-mir-instrument (-O{opt_level}) failed:\n{}",
+                String::from_utf8_lossy(&compile_out.stderr)
+            ));
+        }
+    }
+
+    let parse_collector_stdout =
+        |stdout: &[u8]| -> Result<BTreeMap<String, Vec<RecordedRawTrace>>, String> {
+            const PREFIX: &str = "ANNEAL_TRACE_HEX:";
+            let mut by_fn: BTreeMap<String, Vec<RecordedRawTrace>> = BTreeMap::new();
+            for line in String::from_utf8_lossy(stdout).lines() {
+                let trimmed = line.trim();
+                let Some(rest) = trimmed.strip_prefix(PREFIX) else {
+                    continue;
+                };
+                let Some((fn_name, hex_line)) = rest.split_once(':') else {
+                    continue;
+                };
+                let trace = decode_recorded_raw_trace_hex(hex_line)?;
+                by_fn.entry(fn_name.to_string()).or_default().push(trace);
+            }
+            Ok(by_fn)
+        };
+
+    let run_o0 = Command::new(&collector_bin_o0)
         .current_dir(staging_dir)
         .output()
-        .map_err(|e| format!("failed to invoke rustc for trace collector: {e}"))?;
-    if !compile_out.status.success() {
+        .map_err(|e| format!("failed to execute -O0 trace collector binary: {e}"))?;
+    if !run_o0.status.success() {
         return Err(format!(
-            "compiling collect_traces.rs failed:\n{}",
-            String::from_utf8_lossy(&compile_out.stderr)
+            "running collect_traces_bin_o0 failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run_o0.stdout),
+            String::from_utf8_lossy(&run_o0.stderr)
+        ));
+    }
+    let run_o2 = Command::new(&collector_bin_o2)
+        .current_dir(staging_dir)
+        .output()
+        .map_err(|e| format!("failed to execute -O2 trace collector binary: {e}"))?;
+    if !run_o2.status.success() {
+        return Err(format!(
+            "running collect_traces_bin_o2 failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run_o2.stdout),
+            String::from_utf8_lossy(&run_o2.stderr)
         ));
     }
 
-    let run_out = Command::new(&collector_bin)
-        .current_dir(staging_dir)
-        .output()
-        .map_err(|e| format!("failed to execute trace collector binary: {e}"))?;
-    if !run_out.status.success() {
-        return Err(format!(
-            "running collect_traces_bin failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&run_out.stdout),
-            String::from_utf8_lossy(&run_out.stderr)
-        ));
+    let by_fn_o0 = parse_collector_stdout(&run_o0.stdout)?;
+    let by_fn_o2 = parse_collector_stdout(&run_o2.stdout)?;
+    if by_fn_o0 != by_fn_o2 {
+        return Err(
+            "binary-instrumented traces differed between `-C opt-level=0` and `-C opt-level=2`"
+                .to_string(),
+        );
     }
-
-    const PREFIX: &str = "ANNEAL_TRACE_HEX:";
-    let mut by_fn: BTreeMap<String, Vec<RecordedRawTrace>> = BTreeMap::new();
-    for line in String::from_utf8_lossy(&run_out.stdout).lines() {
-        let trimmed = line.trim();
-        let Some(rest) = trimmed.strip_prefix(PREFIX) else {
-            continue;
-        };
-        let Some((fn_name, hex_line)) = rest.split_once(':') else {
-            continue;
-        };
-        let trace = decode_recorded_raw_trace_hex(hex_line)?;
-        by_fn.entry(fn_name.to_string()).or_default().push(trace);
-    }
-    Ok(by_fn)
+    Ok(by_fn_o0)
 }
 
 fn extract_mir_neighborhood(staging_dir: &Path, mir_module: &str) -> (String, String) {
@@ -753,8 +873,9 @@ fn extract_mir_neighborhood(staging_dir: &Path, mir_module: &str) -> (String, St
 fn extract_itree_confirm_theorem(confirm_src: &str, case_ident: &str) -> String {
     let diag_header = format!("theorem {case_ident}_diag_tag :");
     let sound_header = format!("theorem {case_ident}_trace_consistent :");
+    let obs_erased_header = format!("theorem {case_ident}_trace_obs_erased_consistent :");
     let mut blocks = Vec::new();
-    for header in [&sound_header, &diag_header] {
+    for header in [&sound_header, &obs_erased_header, &diag_header] {
         if let Some(start_idx) = confirm_src.find(header) {
             let rest = &confirm_src[start_idx..];
             let end_rel = rest.find("\n\n").map(|i| i + 1).unwrap_or(rest.len());
@@ -990,6 +1111,7 @@ pub fn evaluate_itree_batches_with_options(
 
             for tr in &raw_traces {
                 let mut call_seq = Vec::new();
+                let mut branch_tags = Vec::new();
                 for (idx, ev) in tr.events.iter().enumerate() {
                     match ev {
                         RecordedEvent::ExtCall { def_path, .. }
@@ -997,14 +1119,16 @@ pub fn evaluate_itree_batches_with_options(
                         | RecordedEvent::ExtCallAbort { def_path, .. } => {
                             call_seq.push((def_path.clone(), idx));
                         }
-                        RecordedEvent::Branch { .. } => {}
+                        RecordedEvent::Branch { tag } => {
+                            branch_tags.push(*tag as u32);
+                        }
                     }
                 }
                 let is_panic = matches!(tr.outcome, RecordedOutcome::Panic);
                 obs_path_set.record_execution(
                     crate::input_gen::MirObsPathKey {
                         fn_name: fn_name.clone(),
-                        branch_tags: Vec::new(),
+                        branch_tags,
                         ext_call_sequence_shape: call_seq,
                         is_panic,
                     },
@@ -1048,7 +1172,7 @@ pub fn evaluate_itree_batches_with_options(
                         inlined_callee_modules: Vec::new(),
                         init_mem_expr: None,
                         fuel: ITREE_TRACE_CHECK_FUEL,
-                        check_branches: false,
+                        check_branches: true,
                     },
                     trace,
                     expected_diag_tag: None,
@@ -1081,7 +1205,7 @@ pub fn evaluate_itree_batches_with_options(
         fs::create_dir_all(&verify_dir)
             .map_err(|e| format!("failed to create {}: {e}", verify_dir.display()))?;
 
-        // Stage 1: Probe `diagnoseRawByteTraceObsErasedBounded` across all distinct traces.
+        // Stage 1: Probe `diagnoseRawByteTraceFullBounded` across all distinct traces.
         let probe_src =
             render_batch_trace_probe_lean_module("Proof.ItreeDiffBatchProbe", &batch_cases);
         let probe_file = verify_dir.join("ItreeDiffBatchProbe.lean");
@@ -1113,7 +1237,8 @@ pub fn evaluate_itree_batches_with_options(
         }
 
         // Stage 2: Kernel-confirm every trace's `TraceReplayDiag.tagName` (`by rfl`)
-        // and `checkRawByteTraceObsErasedBounded_sound` for `"ok"` traces.
+        // and `checkRawByteTraceFullBounded_sound` + `checkRawByteTraceObsErasedBounded_sound`
+        // for `"ok"` traces.
         let confirm_src = render_batch_trace_eval_lean_module(
             "Proof.ItreeDiffBatchConfirm",
             &batch_cases,
@@ -1322,6 +1447,10 @@ pub fn reproduce_itree_finding(
             .iter()
             .map(|c| format!("Mir.ItreeDiffStaged.{c}"))
             .collect();
+        let has_branches = trace
+            .events
+            .iter()
+            .any(|ev| matches!(ev, RecordedEvent::Branch { .. }));
         let mut case = BatchTraceEvalCase {
             case_ident: "repro_case".to_string(),
             config: TraceCheckModuleConfig {
@@ -1331,7 +1460,7 @@ pub fn reproduce_itree_finding(
                 inlined_callee_modules: Vec::new(),
                 init_mem_expr: None,
                 fuel: ITREE_TRACE_CHECK_FUEL,
-                check_branches: false,
+                check_branches: has_branches,
             },
             trace,
             expected_diag_tag: None,
@@ -1566,7 +1695,7 @@ pub fn render_itree_eval_report_json(report: &ItreeCampaignEvalReport) -> String
 pub fn render_itree_eval_report_markdown(report: &ItreeCampaignEvalReport) -> String {
     let mut out = String::new();
     out.push_str("# `itree-difftest` Differential Oracle Report\n\n");
-    out.push_str("- **Oracle comparison**: PERFORMED (native `#[anneal_trace::external]` boundary execution vs. Anneal `TraceCheck` `diagnoseRawByteTraceObsErasedBounded` + Lean 4 kernel confirmation)\n");
+    out.push_str("- **Oracle comparison**: PERFORMED (`anneal-mir-instrument` binary MIR execution at `-O0` and `-O2` vs. Anneal `TraceCheck` `diagnoseRawByteTraceFullBounded` + Lean 4 kernel confirmation)\n");
     out.push_str(&format!(
         "- **Mode**: `{}` | **Seed**: `0x{:08x}` (`{}` batches × `{}` batch size = `{}` generated, `{}` trials/candidate)\n",
         report.mode,
