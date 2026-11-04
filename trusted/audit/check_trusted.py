@@ -37,7 +37,7 @@ DOWNSTREAM_TARGETS = [
     ("Anneal.Pass", "theory/Anneal/Pass.lean", ["Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree"], "theory"),
     ("Anneal.EffectWP", "theory/Anneal/EffectWP.lean", ["Trusted", "Anneal.Effect"], "theory"),
     ("Anneal.ITreeWP", "theory/Anneal/ITreeWP.lean", ["Std.Do", "Trusted", "Anneal.Refinement", "Anneal.Effect", "Anneal.ITree", "Anneal.EffectWP"], "theory"),
-    ("Anneal.Scalars", "theory/Anneal/Scalars.lean", [], "theory"),
+    ("Anneal.Scalars", "theory/Anneal/Scalars.lean", ["Trusted"], "theory"),
     ("Anneal.Memory", "theory/Anneal/Memory.lean", ["Trusted"], "theory"),
     ("Anneal.BitValidity", "theory/Anneal/BitValidity.lean", ["Trusted", "Anneal.Scalars"], "theory"),
     ("Anneal.UnsafeObligations", "theory/Anneal/UnsafeObligations.lean", ["Trusted", "Anneal.Memory"], "theory"),
