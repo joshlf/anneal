@@ -1,3 +1,11 @@
+// Copyright 2026 The Fuchsia Authors
+//
+// Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+// license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+// This file may not be copied, modified, or distributed except according to
+// those terms.
+
 //! End-to-end integration test for the Rust artifact trace observer and
 //! Lean 4 `TraceCheck` consistency verifier.
 //!
@@ -6,12 +14,14 @@
 //!    `anneal-rustc-capture` (`run_cargo_capture` +
 //!    `scaffold_workspace_with_config`), extracting `Mir.TracePkg.*` modules
 //!    with compiler-computed `LayoutTable`s and `LocalDecl`s.
-//! 2. Executes the Rust functions under `TraceRecorder::observe_root`,
-//!    capturing raw `&[u8]` byte slices via `value_as_raw_bytes` at root
-//!    entry/exit and external call boundaries (`ext_scale_add`), including a
-//!    `#[repr(C)]` struct `PaddedConfig` with deliberately corrupted uninitialized
-//!    padding bytes and a watched allocation registered in the shadow provenance
-//!    table (`register_allocation`).
+//! 2. Executes the unmodified Rust root functions (`trace_pkg::process_packet`
+//!    and `trace_pkg::inspect_ptr_identity`) under `TraceRecorder::observe_root`
+//!    / `TraceRecorder::observe_root_with_inlined_callees`, capturing raw
+//!    `&[u8]` byte slices via `value_as_raw_bytes` at root entry/exit and at
+//!    `#[anneal_trace::external]` boundaries (`ext_scale_add`, `helper_double`),
+//!    including a `#[repr(C)]` struct `PaddedConfig` with deliberately corrupted
+//!    uninitialized padding bytes and a watched allocation registered in the
+//!    shadow provenance table (`register_allocation`).
 //! 3. Generates Lean 4 `TraceVerify` modules via `render_trace_check_lean_module`
 //!    and diagnostic/tampered-outcome snippets via
 //!    `render_trace_diag_eval_lean_snippet` and
@@ -47,7 +57,7 @@ use cargo_anneal::{
     render_raw_byte_trace_lean, render_raw_byte_trace_lean_def,
     render_shadow_provenance_table_lean, render_tampered_outcome_diag_lean_snippet,
     render_trace_check_lean_module, render_trace_diag_eval_lean_snippet, run_cargo_capture,
-    scaffold_workspace_with_config, value_as_raw_bytes,
+    run_lake_verify_targets, scaffold_workspace_with_config, value_as_raw_bytes,
 };
 
 fn unique_temp_dir(label: &str) -> PathBuf {
@@ -102,32 +112,87 @@ fn ensure_rustc_capture_binary(checkout_root: &Path) -> PathBuf {
     default_bin
 }
 
-/// Mirror of `trace_pkg::PaddedConfig` in the test harness so we can execute the
-/// exact same Rust code under `TraceRecorder` and capture its live runtime byte
-/// slices (including non-zero garbage in the 3 padding bytes at offsets `1..4`).
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct PaddedConfig {
-    mode: u8,
-    threshold: u32,
+/// Exact `trace_pkg` module compiled both natively (under `#[cfg(test)]`, where
+/// `#[anneal_trace::external]` records boundary calls) and by
+/// `anneal-rustc-capture` (`cargo check`, where `#[anneal_trace::external]`
+/// emits the unmodified function bodies).
+mod trace_pkg {
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct PaddedConfig {
+        pub mode: u8,
+        pub threshold: u32,
+    }
+
+    #[anneal_trace::external]
+    #[inline(never)]
+    pub fn ext_scale_add(x: u32, bonus: u32) -> u32 {
+        x + bonus
+    }
+
+    #[anneal_trace::external]
+    #[inline(never)]
+    pub fn helper_double(x: u32) -> u32 {
+        x + x
+    }
+
+    pub fn process_packet(cfg: PaddedConfig, input: u32) -> u32 {
+        if cfg.mode == 0 {
+            helper_double(input)
+        } else {
+            let scaled = ext_scale_add(input, cfg.threshold);
+            helper_double(scaled)
+        }
+    }
+
+    pub fn inspect_ptr_identity(p: &u32) -> &u32 {
+        p
+    }
 }
 
-fn ext_scale_add(x: u32, bonus: u32) -> u32 {
+const TRACE_PKG_LIB_RS: &str = r#"#![allow(dead_code)]
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PaddedConfig {
+    pub mode: u8,
+    pub threshold: u32,
+}
+
+#[anneal_trace::external]
+#[inline(never)]
+pub fn ext_scale_add(x: u32, bonus: u32) -> u32 {
     x + bonus
 }
 
-fn helper_double(x: u32) -> u32 {
+#[anneal_trace::external]
+#[inline(never)]
+pub fn helper_double(x: u32) -> u32 {
     x + x
 }
 
+pub fn process_packet(cfg: PaddedConfig, input: u32) -> u32 {
+    if cfg.mode == 0 {
+        helper_double(input)
+    } else {
+        let scaled = ext_scale_add(input, cfg.threshold);
+        helper_double(scaled)
+    }
+}
+
+pub fn inspect_ptr_identity(p: &u32) -> &u32 {
+    p
+}
+"#;
+
 #[test]
 fn batch_trace_module_rendering_and_tampered_diag_contract() {
-    let mut cfg_val = PaddedConfig {
+    let mut cfg_val = trace_pkg::PaddedConfig {
         mode: 1,
         threshold: 11,
     };
     unsafe {
-        let base = (&mut cfg_val as *mut PaddedConfig).cast::<u8>();
+        let base = (&mut cfg_val as *mut trace_pkg::PaddedConfig).cast::<u8>();
         *base.add(1) = 0xAA;
         *base.add(2) = 0xBB;
         *base.add(3) = 0xCC;
@@ -136,20 +201,13 @@ fn batch_trace_module_rendering_and_tampered_diag_contract() {
     let input_val: u32 = 10;
     let raw_input_bytes = value_as_raw_bytes(&input_val);
 
-    let (res, trace) = TraceRecorder::observe_root(
+    let (res, trace) = TraceRecorder::observe_root_with_inlined_callees(
         "trace_pkg::process_packet",
         vec![raw_cfg_bytes, raw_input_bytes],
+        ["trace_pkg::helper_double"],
         |rec| {
             rec.register_address_range(0x2000, 4, 7, 7);
-            let scaled = rec.observe_ext_call(
-                "trace_pkg::ext_scale_add",
-                vec![
-                    value_as_raw_bytes(&input_val),
-                    value_as_raw_bytes(&cfg_val.threshold),
-                ],
-                || ext_scale_add(input_val, cfg_val.threshold),
-            );
-            helper_double(scaled)
+            trace_pkg::process_packet(cfg_val, input_val)
         },
     );
     assert_eq!(res.expect("normal return"), 42);
@@ -212,60 +270,21 @@ fn end_to_end_rust_trace_observer_and_lean_itree_consistency_check() {
     let src_dir = temp_crate.join("src");
     fs::create_dir_all(&src_dir).expect("create temporary crate src/");
 
-    let cargo_toml = r#"[package]
+    let anneal_trace_dir = checkout_root.join("crates/anneal-trace");
+    let cargo_toml = format!(
+        r#"[package]
 name = "trace_pkg"
 version = "0.1.0"
 edition = "2024"
 publish = false
-"#;
+
+[dependencies]
+anneal-trace = {{ path = {:?} }}
+"#,
+        anneal_trace_dir.display()
+    );
     fs::write(temp_crate.join("Cargo.toml"), cargo_toml).expect("write Cargo.toml");
-
-    // `trace_pkg` defines:
-    // - `PaddedConfig`: a `#[repr(C)]` struct with 1-byte `mode`, 3 bytes of
-    //   inter-field padding, and 4-byte `threshold` (total 8 bytes).
-    // - `ext_scale_add`: an external/callee function that will be observed at
-    //   its `MirCallE` boundary.
-    // - `helper_double`: an internal helper function that will be placed in
-    //   `inlinedCallees` (`Memory.callees`) and stepped transparently via `.tau`.
-    // - `process_packet`: a root function that branches on `cfg.mode`
-    //   (`TerminatorKind.switchInt`), invokes `ext_scale_add` on the non-zero
-    //   branch, and doubles the result via `helper_double`.
-    // - `inspect_ptr_identity`: a function taking `&u32` whose pointer argument
-    //   and return value are decoded via the shadow provenance table
-    //   (`ShadowProvenanceTable`).
-    let lib_rs = r#"#![allow(dead_code)]
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PaddedConfig {
-    pub mode: u8,
-    pub threshold: u32,
-}
-
-#[inline(never)]
-pub fn ext_scale_add(x: u32, bonus: u32) -> u32 {
-    x + bonus
-}
-
-#[inline(never)]
-pub fn helper_double(x: u32) -> u32 {
-    x + x
-}
-
-pub fn process_packet(cfg: PaddedConfig, input: u32) -> u32 {
-    if cfg.mode == 0 {
-        helper_double(input)
-    } else {
-        let scaled = ext_scale_add(input, cfg.threshold);
-        helper_double(scaled)
-    }
-}
-
-pub fn inspect_ptr_identity(p: &u32) -> &u32 {
-    p
-}
-"#;
-    fs::write(src_dir.join("lib.rs"), lib_rs).expect("write src/lib.rs");
+    fs::write(src_dir.join("lib.rs"), TRACE_PKG_LIB_RS).expect("write src/lib.rs");
 
     // 1. Run `cargo check` under `anneal-rustc-capture` and scaffold `.anneal/`.
     let units_dir = temp_crate.join("target").join("anneal").join("units");
@@ -294,12 +313,12 @@ pub fn inspect_ptr_identity(p: &u32) -> &u32 {
     // 2. Construct a `PaddedConfig` in memory and deliberately write non-zero
     //    junk bytes (`0xAA, 0xBB, 0xCC`) into its 3 padding bytes at offsets
     //    1..4 so we verify that `decodeRawValue` ignores struct padding bytes.
-    let mut cfg_val = PaddedConfig {
+    let mut cfg_val = trace_pkg::PaddedConfig {
         mode: 1,
         threshold: 11,
     };
     unsafe {
-        let base = (&mut cfg_val as *mut PaddedConfig).cast::<u8>();
+        let base = (&mut cfg_val as *mut trace_pkg::PaddedConfig).cast::<u8>();
         *base.add(1) = 0xAA;
         *base.add(2) = 0xBB;
         *base.add(3) = 0xCC;
@@ -314,31 +333,17 @@ pub fn inspect_ptr_identity(p: &u32) -> &u32 {
     let input_val: u32 = 10;
     let raw_input_bytes = value_as_raw_bytes(&input_val);
 
-    // 3a. Execute `process_packet(cfg_val, 10)` under `TraceRecorder` in
-    //     call-boundary-only mode (`check_branches = false`):
-    //     - `ext_scale_add(10, 11) -> 21` is interposed and recorded as an
-    //       `ExtCall` event.
-    //     - `helper_double(21) -> 42` is NOT interposed at the boundary because
-    //       it is placed in `inlinedCallees` and stepped via `.tau` in the Lean
-    //       ITree model.
-    let (res_call_only, trace_call_only) = TraceRecorder::observe_root(
+    // 3a. Execute unmodified `trace_pkg::process_packet(cfg_val, 10)` under
+    //     `TraceRecorder::observe_root_with_inlined_callees`:
+    //     - `ext_scale_add(10, 11) -> 21` is interposed via `#[anneal_trace::external]`
+    //       and recorded as an `ExtCall` event.
+    //     - `helper_double(21) -> 42` is listed in `inlined_callees` and stepped
+    //       via `.tau` in the Lean ITree model.
+    let (res_call_only, trace_call_only) = TraceRecorder::observe_root_with_inlined_callees(
         "trace_pkg::process_packet",
         vec![raw_cfg_bytes.clone(), raw_input_bytes.clone()],
-        |rec| {
-            if cfg_val.mode == 0 {
-                helper_double(input_val)
-            } else {
-                let scaled = rec.observe_ext_call(
-                    "trace_pkg::ext_scale_add",
-                    vec![
-                        value_as_raw_bytes(&input_val),
-                        value_as_raw_bytes(&cfg_val.threshold),
-                    ],
-                    || ext_scale_add(input_val, cfg_val.threshold),
-                );
-                helper_double(scaled)
-            }
-        },
+        ["trace_pkg::helper_double"],
+        |_rec| trace_pkg::process_packet(cfg_val, input_val),
     );
     assert_eq!(res_call_only.expect("normal return"), 42);
     assert_eq!(
@@ -364,9 +369,9 @@ pub fn inspect_ptr_identity(p: &u32) -> &u32 {
         .events
         .insert(0, RecordedEvent::Branch { tag: 0 });
 
-    // 3c. Execute `inspect_ptr_identity(&watched_u32)` under `TraceRecorder`
-    //     with `watched_u32` registered in the shadow provenance table at
-    //     `(alloc_id = 7, tag = 7)`.
+    // 3c. Execute unmodified `trace_pkg::inspect_ptr_identity(&watched_u32)`
+    //     under `TraceRecorder` with `watched_u32` registered in the shadow
+    //     provenance table at `(alloc_id = 7, tag = 7)`.
     let watched_box: Box<u32> = Box::new(123456);
     let watched_ref: &u32 = &watched_box;
     let (res_ptr, trace_ptr) = TraceRecorder::observe_root(
@@ -374,7 +379,7 @@ pub fn inspect_ptr_identity(p: &u32) -> &u32 {
         vec![value_as_raw_bytes(&watched_ref)],
         |rec| {
             rec.register_allocation(watched_ref, 7, 7);
-            watched_ref
+            trace_pkg::inspect_ptr_identity(watched_ref)
         },
     );
     assert_eq!(*res_ptr.expect("normal ptr return"), 123456);
@@ -523,20 +528,18 @@ end TraceVerify.ObsErased
     // 5. Run `lake env lean` inside `.anneal/` to verify all theorems in the
     //    Lean 4 kernel.
     let anneal_dir = temp_crate.join(".anneal");
-    let build_status = Command::new("lake")
-        .current_dir(&anneal_dir)
-        .arg("build")
-        .arg("Anneal")
-        .arg("Mir.TracePkg.process_packet")
-        .arg("Mir.TracePkg.ext_scale_add")
-        .arg("Mir.TracePkg.helper_double")
-        .arg("Mir.TracePkg.inspect_ptr_identity")
-        .status()
-        .expect("run lake build on Mir.TracePkg modules");
-    assert!(
-        build_status.success(),
-        "lake build of Mir.TracePkg modules must succeed"
-    );
+    let lake_targets: Vec<String> = [
+        "Anneal",
+        "Mir.TracePkg.process_packet",
+        "Mir.TracePkg.ext_scale_add",
+        "Mir.TracePkg.helper_double",
+        "Mir.TracePkg.inspect_ptr_identity",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    run_lake_verify_targets(&anneal_dir, &lake_targets)
+        .expect("lake build of Mir.TracePkg modules must succeed");
 
     let lean_output = Command::new("lake")
         .current_dir(&anneal_dir)

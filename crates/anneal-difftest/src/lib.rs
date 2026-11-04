@@ -17,13 +17,16 @@
 //! Miri (`-Zmiri-tree-borrows`) and Anneal's MIR-in-Lean operational semantics
 //! (`cargo_anneal::run_difftest_oracle_pipeline`), confirming divergences via
 //! `by rfl` theorems in the Lean 4 kernel (`"oracle_comparison": "performed"`).
-//! When invoked with `--compile-only`, it checks candidate compilation without
-//! running the oracle (`"oracle_comparison": "not_performed"`).
-//! `itree-difftest` currently compiles candidates only and reports
-//! `"oracle_comparison": "not_performed"`.
+//! `itree-difftest` executes safe-Rust candidates natively with
+//! `#[anneal_trace::external]` boundary interposition, deduplicates distinct
+//! traces, and checks each in the Lean 4 kernel via `TraceCheck`
+//! (`"oracle_comparison": "performed"`). When invoked with `--compile-only`,
+//! either binary checks candidate compilation without running the oracle
+//! (`"oracle_comparison": "not_performed"`).
 
 pub mod input_gen;
 pub mod instrument;
+pub mod itree_eval;
 pub mod miri_eval;
 pub mod mutators_itree;
 pub mod mutators_miri;
@@ -38,6 +41,14 @@ pub use instrument::{
     RecordedEvent, RecordedOutcome, TraceRecorder, emit_runtime_prelude, instrument_source,
     instrument_source_with_config, value_as_raw_bytes,
 };
+pub use itree_eval::{
+    CandidateCompile, DEFAULT_ITREE_TRIALS_PER_CANDIDATE, ITREE_DIAG_TAG_NAMES,
+    ITREE_MUTATOR_NAMES, ITREE_SAFE_SEEDS, ITREE_TRACE_CHECK_FUEL, ItreeCampaignEvalReport,
+    ItreeEvalOptions, ItreeFindingBundle, ItreeReproReport, compile_itree_candidates,
+    compile_rust_strict_opt, evaluate_itree_batches, evaluate_itree_batches_with_options,
+    render_itree_eval_report_json, render_itree_eval_report_markdown,
+    render_itree_finding_bundle_json, reproduce_itree_finding,
+};
 pub use miri_eval::{
     DIVERGENCE_CLASS_NAMES, MIRI_MUTATOR_NAMES, MiriCampaignEvalReport, MiriFindingBundle,
     NOT_COMPARED_REASON_NAMES, compile_candidates, compile_rust_snippet, divergence_class_slug,
@@ -46,7 +57,9 @@ pub use miri_eval::{
 };
 pub use mutators_itree::{
     BranchLoopWeaver, CallBoundaryOutliner, ExtOracleInjector, GeneratedItreeCandidate,
-    ItreeAstMutator, LayoutPaddingPerturber, contains_unsafe_token, generate_itree_batch,
+    ItreeAstMutator, LayoutPaddingPerturber, StagedItreeCandidate,
+    annotate_itree_external_callees, contains_unsafe_token, generate_itree_batch,
+    generate_itree_identity_batch, stage_itree_candidate_items,
 };
 pub use mutators_miri::{
     ArithmeticCastMutator, BitValidityTransmuteMutator, GeneratedMiriCandidate,

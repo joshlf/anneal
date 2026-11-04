@@ -35,6 +35,8 @@
 //!      relative offset `addr - base_addr`.
 
 use std::any::Any;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
@@ -193,18 +195,333 @@ pub struct RecordedRawTrace {
 /// Alias preserving compatibility with JSON raw byte trace descriptors.
 pub type RawByteTraceJson = RecordedRawTrace;
 
+/// Deterministic action prescribed by an [`EnvSchedule`] for an external call site.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnvAction {
+    /// Invoke the underlying implementation normally and record its return bytes.
+    PassThrough,
+    /// Return a deterministic pre-scheduled byte payload.
+    ReturnBytes(Vec<u8>),
+    /// Deterministically trigger a mid-call panic at call index `k`.
+    PanicOnCall(usize),
+}
+
+/// Deterministic environment response schedule (`inputs-over-time`) across external
+/// callees, supporting per-callee response queues and optional `PanicOnCall(usize)`
+/// unwind fault injection.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnvSchedule {
+    /// Per-callee FIFO queues of raw return-value byte buffers.
+    pub callee_queues: BTreeMap<String, VecDeque<Vec<u8>>>,
+    /// Per-callee fallback constant bytes when the FIFO queue is exhausted.
+    pub callee_defaults: BTreeMap<String, Vec<u8>>,
+    /// Optional global call index (`0`-based) at which any external call panics.
+    pub global_panic_on_call: Option<usize>,
+    /// Optional per-callee call index (`0`-based) at which that callee panics.
+    pub callee_panic_on_call: BTreeMap<String, usize>,
+    /// Per-callee count of invocations served so far.
+    callee_call_counts: BTreeMap<String, usize>,
+}
+
+impl EnvSchedule {
+    /// Creates an empty pass-through schedule with no injected panics.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Configures a deterministic global `PanicOnCall(k)` trigger.
+    pub fn with_panic_on_call(mut self, call_index: usize) -> Self {
+        self.global_panic_on_call = Some(call_index);
+        self
+    }
+
+    /// Sets or updates the global `PanicOnCall(k)` trigger.
+    pub fn set_panic_on_call(&mut self, call_index: usize) {
+        self.global_panic_on_call = Some(call_index);
+    }
+
+    /// Configures a per-callee `PanicOnCall(k)` trigger for `callee`.
+    pub fn set_callee_panic_on_call(&mut self, callee: &str, call_index: usize) {
+        self.callee_panic_on_call
+            .insert(callee.to_string(), call_index);
+    }
+
+    /// Appends a single scheduled raw-byte return payload to `callee`'s queue.
+    pub fn push_callee_response(&mut self, callee: &str, bytes: Vec<u8>) {
+        self.callee_queues
+            .entry(callee.to_string())
+            .or_default()
+            .push_back(bytes);
+    }
+
+    /// Sets the default fallback byte payload for `callee` once its queue empties.
+    pub fn set_callee_default(&mut self, callee: &str, bytes: Vec<u8>) {
+        self.callee_defaults.insert(callee.to_string(), bytes);
+    }
+
+    fn resolve_key(&self, callee: &str) -> String {
+        if self.callee_queues.contains_key(callee)
+            || self.callee_defaults.contains_key(callee)
+            || self.callee_panic_on_call.contains_key(callee)
+        {
+            return callee.to_string();
+        }
+        if let Some((_, short)) = callee.rsplit_once("::")
+            && (self.callee_queues.contains_key(short)
+                || self.callee_defaults.contains_key(short)
+                || self.callee_panic_on_call.contains_key(short))
+        {
+            return short.to_string();
+        }
+        callee.to_string()
+    }
+
+    /// Returns `true` if `global_call_index` or `callee_call_index` matches a configured
+    /// `PanicOnCall` trigger.
+    pub fn should_panic(
+        &self,
+        callee: &str,
+        global_call_index: usize,
+        callee_call_index: usize,
+    ) -> bool {
+        if self.global_panic_on_call == Some(global_call_index) {
+            return true;
+        }
+        let key = self.resolve_key(callee);
+        if self.callee_panic_on_call.get(&key).copied() == Some(callee_call_index) {
+            return true;
+        }
+        false
+    }
+
+    /// Advances the schedule state for `callee` at `global_call_index` and returns the
+    /// prescribed [`EnvAction`].
+    pub fn next_action(&mut self, callee: &str, global_call_index: usize) -> EnvAction {
+        let key = self.resolve_key(callee);
+        let count_entry = self.callee_call_counts.entry(key.clone()).or_insert(0);
+        let callee_call_idx = *count_entry;
+        *count_entry += 1;
+
+        if self.should_panic(&key, global_call_index, callee_call_idx) {
+            return EnvAction::PanicOnCall(global_call_index);
+        }
+
+        if let Some(queue) = self.callee_queues.get_mut(&key)
+            && let Some(front) = queue.pop_front()
+        {
+            return EnvAction::ReturnBytes(front);
+        }
+
+        if let Some(default_bytes) = self.callee_defaults.get(&key) {
+            return EnvAction::ReturnBytes(default_bytes.clone());
+        }
+
+        EnvAction::PassThrough
+    }
+}
+
+struct ActiveBoundaryState {
+    root_crate_prefix: Option<String>,
+    schedule: EnvSchedule,
+    inlined_callees: BTreeSet<String>,
+    events: Vec<RecordedEvent>,
+    branch_tags: Vec<u32>,
+    call_count: usize,
+    boundary_depth: usize,
+}
+
+impl ActiveBoundaryState {
+    fn is_inlined(&self, def_path: &str, short_name: &str) -> bool {
+        self.inlined_callees.contains(def_path) || self.inlined_callees.contains(short_name)
+    }
+
+    fn canonical_def_path(&self, callee_module_path: &str, callee_fn_name: &str) -> String {
+        if let Some(ref root_crate) = self.root_crate_prefix {
+            if callee_module_path == root_crate
+                || callee_module_path.starts_with(&format!("{root_crate}::"))
+            {
+                return format!("{callee_module_path}::{callee_fn_name}");
+            }
+            return format!("{root_crate}::{callee_fn_name}");
+        }
+        if callee_module_path.is_empty() {
+            callee_fn_name.to_string()
+        } else {
+            format!("{callee_module_path}::{callee_fn_name}")
+        }
+    }
+}
+
+thread_local! {
+    static ACTIVE_RECORDER: RefCell<Option<ActiveBoundaryState>> = const { RefCell::new(None) };
+}
+
+struct BoundaryDepthGuard;
+
+impl Drop for BoundaryDepthGuard {
+    fn drop(&mut self) {
+        ACTIVE_RECORDER.with(|cell| {
+            if let Some(state) = cell.borrow_mut().as_mut() {
+                state.boundary_depth = state.boundary_depth.saturating_sub(1);
+            }
+        });
+    }
+}
+
+/// Runtime boundary hook invoked by functions annotated with
+/// `#[anneal_trace::external]` when compiled under `#[cfg(any(test, anneal_trace_ext))]`.
+///
+/// When called inside an active [`TraceRecorder::observe_root`] scope (at
+/// top-level boundary depth `0` and when the callee is not listed in
+/// `inlined_callees`), this function records the actual runtime argument byte
+/// slices `raw_args`, consults the active [`EnvSchedule`], executes `f()`, and
+/// records either [`RecordedEvent::ExtCall`] or [`RecordedEvent::ExtCallPanic`].
+/// When called outside `observe_root`, inside a nested external call, or when
+/// the callee is marked inlined, it invokes `f()` directly with no trace event.
+pub fn observe_boundary_call<R>(
+    callee_module_path: &str,
+    callee_fn_name: &str,
+    raw_args: Vec<Vec<u8>>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let intercept = ACTIVE_RECORDER.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let state = borrow.as_mut()?;
+        let def_path = state.canonical_def_path(callee_module_path, callee_fn_name);
+        if state.boundary_depth > 0 || state.is_inlined(&def_path, callee_fn_name) {
+            return None;
+        }
+        state.boundary_depth += 1;
+        let call_idx = state.call_count;
+        state.call_count += 1;
+        let action = state.schedule.next_action(&def_path, call_idx);
+        Some((def_path, action))
+    });
+
+    let Some((def_path, action)) = intercept else {
+        return f();
+    };
+
+    let _depth_guard = BoundaryDepthGuard;
+
+    match action {
+        EnvAction::PanicOnCall(k) => {
+            ACTIVE_RECORDER.with(|cell| {
+                if let Some(state) = cell.borrow_mut().as_mut() {
+                    state.events.push(RecordedEvent::ExtCallPanic {
+                        def_path,
+                        raw_args,
+                    });
+                }
+            });
+            panic!("anneal scheduled PanicOnCall({k}) triggered in `{callee_fn_name}`");
+        }
+        EnvAction::ReturnBytes(sched_bytes) if sched_bytes.len() == mem::size_of::<R>() => {
+            let mut slot = mem::MaybeUninit::<R>::zeroed();
+            // SAFETY: `sched_bytes.len() == size_of::<R>()` and scheduled payloads are
+            // generated for plain scalar/enum return types of matching size.
+            let ret = unsafe {
+                std::ptr::copy_nonoverlapping(
+                    sched_bytes.as_ptr(),
+                    slot.as_mut_ptr().cast::<u8>(),
+                    mem::size_of::<R>(),
+                );
+                slot.assume_init()
+            };
+            ACTIVE_RECORDER.with(|cell| {
+                if let Some(state) = cell.borrow_mut().as_mut() {
+                    state.events.push(RecordedEvent::ExtCall {
+                        def_path,
+                        raw_args,
+                        raw_ret: sched_bytes,
+                    });
+                }
+            });
+            ret
+        }
+        EnvAction::PassThrough | EnvAction::ReturnBytes(_) => {
+            match panic::catch_unwind(AssertUnwindSafe(f)) {
+                Ok(ret) => {
+                    let raw_ret = value_as_raw_bytes(&ret);
+                    ACTIVE_RECORDER.with(|cell| {
+                        if let Some(state) = cell.borrow_mut().as_mut() {
+                            state.events.push(RecordedEvent::ExtCall {
+                                def_path,
+                                raw_args,
+                                raw_ret,
+                            });
+                        }
+                    });
+                    ret
+                }
+                Err(payload) => {
+                    ACTIVE_RECORDER.with(|cell| {
+                        if let Some(state) = cell.borrow_mut().as_mut() {
+                            state.events.push(RecordedEvent::ExtCallPanic {
+                                def_path,
+                                raw_args,
+                            });
+                        }
+                    });
+                    panic::resume_unwind(payload)
+                }
+            }
+        }
+    }
+}
+
 /// Stateful recorder that interposes at function boundaries (and optional
 /// branch points) to capture a [`RecordedRawTrace`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TraceRecorder {
-    shadow_provenance: Vec<RecordedShadowAlloc>,
-    events: Vec<RecordedEvent>,
+    /// Active environment schedule governing external callees.
+    pub schedule: EnvSchedule,
+    /// Callees (`DefPath` or function identifier) stepped as `.tau` inlined calls
+    /// rather than emitting `MirCallE` boundary events.
+    pub inlined_callees: BTreeSet<String>,
+    /// Watched runtime allocations mapped to abstract MIR `(alloc_id, tag)` provenance.
+    pub shadow_provenance: Vec<RecordedShadowAlloc>,
+    /// Ordered log of recorded branch and external-call events.
+    pub events: Vec<RecordedEvent>,
+    /// Compact sequence of visited basic-block / branch tags.
+    pub branch_tags: Vec<u32>,
+    /// Terminal execution outcome when recorded on the stateful recorder.
+    pub outcome: Option<RecordedOutcome>,
+    /// Total number of external calls initiated during this execution.
+    pub call_count: usize,
 }
 
 impl TraceRecorder {
     /// Construct an empty [`TraceRecorder`].
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a [`TraceRecorder`] configured with `schedule`.
+    pub fn with_schedule(schedule: EnvSchedule) -> Self {
+        Self {
+            schedule,
+            ..Self::default()
+        }
+    }
+
+    /// Construct a [`TraceRecorder`] with the given set of inlined callee names
+    /// or `DefPath`s.
+    pub fn with_inlined_callees<I, S>(inlined: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            inlined_callees: inlined.into_iter().map(Into::into).collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Mark `callee` (`DefPath` or function name) as inlined (stepped via `.tau`
+    /// rather than recorded as a `MirCallE` external call event).
+    pub fn add_inlined_callee(&mut self, callee: impl Into<String>) {
+        self.inlined_callees.insert(callee.into());
     }
 
     /// Return the currently registered shadow provenance table entries.
@@ -248,7 +565,35 @@ impl TraceRecorder {
 
     /// Record a `TerminatorKind.switchInt` branch observation (`MirObs.event tag`).
     pub fn record_branch(&mut self, tag: u128) {
-        self.events.push(RecordedEvent::Branch { tag });
+        let pushed_active = ACTIVE_RECORDER.with(|cell| {
+            if let Some(state) = cell.borrow_mut().as_mut() {
+                state.branch_tags.push(tag as u32);
+                state.events.push(RecordedEvent::Branch { tag });
+                true
+            } else {
+                false
+            }
+        });
+        if !pushed_active {
+            self.branch_tags.push(tag as u32);
+            self.events.push(RecordedEvent::Branch { tag });
+        }
+    }
+
+    /// Consults the embedded [`EnvSchedule`] before invoking `callee`. If `PanicOnCall(k)`
+    /// fires, records [`RecordedEvent::ExtCallPanic`] and sets `outcome` to [`RecordedOutcome::Panic`].
+    pub fn step_ext_call(&mut self, callee: &str) -> (usize, EnvAction) {
+        let idx = self.call_count;
+        self.call_count += 1;
+        let action = self.schedule.next_action(callee, idx);
+        if matches!(action, EnvAction::PanicOnCall(_)) {
+            self.events.push(RecordedEvent::ExtCallPanic {
+                def_path: callee.to_string(),
+                raw_args: Vec::new(),
+            });
+            self.outcome = Some(RecordedOutcome::Panic);
+        }
+        (idx, action)
     }
 
     /// Record a completed external call event directly from raw argument and
@@ -259,11 +604,22 @@ impl TraceRecorder {
         raw_args: Vec<Vec<u8>>,
         raw_ret: Vec<u8>,
     ) {
-        self.events.push(RecordedEvent::ExtCall {
+        let ev = RecordedEvent::ExtCall {
             def_path: def_path.into(),
             raw_args,
             raw_ret,
+        };
+        let pushed_active = ACTIVE_RECORDER.with(|cell| {
+            if let Some(state) = cell.borrow_mut().as_mut() {
+                state.events.push(ev.clone());
+                true
+            } else {
+                false
+            }
         });
+        if !pushed_active {
+            self.events.push(ev);
+        }
     }
 
     /// Record an unwinding external call event directly from raw argument bytes.
@@ -272,10 +628,21 @@ impl TraceRecorder {
         def_path: impl Into<String>,
         raw_args: Vec<Vec<u8>>,
     ) {
-        self.events.push(RecordedEvent::ExtCallPanic {
+        let ev = RecordedEvent::ExtCallPanic {
             def_path: def_path.into(),
             raw_args,
+        };
+        let pushed_active = ACTIVE_RECORDER.with(|cell| {
+            if let Some(state) = cell.borrow_mut().as_mut() {
+                state.events.push(ev.clone());
+                true
+            } else {
+                false
+            }
         });
+        if !pushed_active {
+            self.events.push(ev);
+        }
     }
 
     /// Record an aborting external call event directly from raw argument bytes.
@@ -284,67 +651,147 @@ impl TraceRecorder {
         def_path: impl Into<String>,
         raw_args: Vec<Vec<u8>>,
     ) {
-        self.events.push(RecordedEvent::ExtCallAbort {
+        let ev = RecordedEvent::ExtCallAbort {
             def_path: def_path.into(),
             raw_args,
+        };
+        let pushed_active = ACTIVE_RECORDER.with(|cell| {
+            if let Some(state) = cell.borrow_mut().as_mut() {
+                state.events.push(ev.clone());
+                true
+            } else {
+                false
+            }
         });
-    }
-
-    /// Interpose around an external or unlinked callee invocation `f`,
-    /// recording its `raw_args` and either its normal return bytes
-    /// (`RecordedEvent::ExtCall`) or an unwinding panic
-    /// (`RecordedEvent::ExtCallPanic`, re-raising the panic afterward).
-    pub fn observe_ext_call<R>(
-        &mut self,
-        def_path: impl Into<String>,
-        raw_args: Vec<Vec<u8>>,
-        f: impl FnOnce() -> R,
-    ) -> R {
-        let def_path = def_path.into();
-        match panic::catch_unwind(AssertUnwindSafe(f)) {
-            Ok(ret) => {
-                let raw_ret = value_as_raw_bytes(&ret);
-                self.events.push(RecordedEvent::ExtCall {
-                    def_path,
-                    raw_args,
-                    raw_ret,
-                });
-                ret
-            }
-            Err(payload) => {
-                self.events.push(RecordedEvent::ExtCallPanic {
-                    def_path,
-                    raw_args,
-                });
-                panic::resume_unwind(payload)
-            }
+        if !pushed_active {
+            self.events.push(ev);
         }
     }
 
+    /// Record a normal function return by capturing `value_as_raw_bytes(val)`.
+    pub fn finish_return<T: ?Sized>(&mut self, val: &T) {
+        self.outcome = Some(RecordedOutcome::Normal {
+            raw_ret: value_as_raw_bytes(val),
+        });
+    }
+
+    /// Record an unwinding panic outcome.
+    pub fn finish_panic(&mut self) {
+        self.outcome = Some(RecordedOutcome::Panic);
+    }
+
+    /// Return `true` iff the recorded execution terminated via panic.
+    pub fn is_panic(&self) -> bool {
+        matches!(self.outcome, Some(RecordedOutcome::Panic))
+    }
+
+    /// Extract the canonical external-call sequence shape `(def_path, call_index)`
+    /// across completed and panicking external calls.
+    pub fn ext_call_sequence_shape(&self) -> Vec<(String, usize)> {
+        let mut shape = Vec::new();
+        let mut call_idx = 0usize;
+        for ev in &self.events {
+            match ev {
+                RecordedEvent::ExtCall { def_path, .. }
+                | RecordedEvent::ExtCallPanic { def_path, .. }
+                | RecordedEvent::ExtCallAbort { def_path, .. } => {
+                    shape.push((def_path.clone(), call_idx));
+                    call_idx += 1;
+                }
+                RecordedEvent::Branch { .. } => {}
+            }
+        }
+        shape
+    }
+
     /// Execute and observe a root function invocation `f`, capturing its
-    /// `raw_args`, all interaction events recorded on `TraceRecorder`, and its
-    /// terminal `RecordedOutcome` (`Normal` or `Panic`).
+    /// `raw_args`, all interaction events recorded at `#[anneal_trace::external]`
+    /// boundaries, and its terminal `RecordedOutcome` (`Normal` or `Panic`).
     pub fn observe_root<R>(
         root_def_path: impl Into<String>,
         raw_args: Vec<Vec<u8>>,
         f: impl FnOnce(&mut TraceRecorder) -> R,
     ) -> (Result<R, Box<dyn Any + Send>>, RecordedRawTrace) {
-        let mut recorder = TraceRecorder::new();
+        let (res, trace, _rec) =
+            Self::observe_root_with_recorder(TraceRecorder::new(), root_def_path, raw_args, f);
+        (res, trace)
+    }
+
+    /// Execute and observe a root function invocation `f` with the specified
+    /// `inlined_callees` stepped transparently without emitting `MirCallE`
+    /// boundary events.
+    pub fn observe_root_with_inlined_callees<R, I, S>(
+        root_def_path: impl Into<String>,
+        raw_args: Vec<Vec<u8>>,
+        inlined_callees: I,
+        f: impl FnOnce(&mut TraceRecorder) -> R,
+    ) -> (Result<R, Box<dyn Any + Send>>, RecordedRawTrace)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let rec = TraceRecorder::with_inlined_callees(inlined_callees);
+        let (res, trace, _rec) = Self::observe_root_with_recorder(rec, root_def_path, raw_args, f);
+        (res, trace)
+    }
+
+    /// Execute and observe a root function invocation `f` using a pre-configured
+    /// [`TraceRecorder`] (e.g., carrying an [`EnvSchedule`] or `inlined_callees`),
+    /// returning the invocation result, the [`RecordedRawTrace`], and the updated
+    /// [`TraceRecorder`].
+    pub fn observe_root_with_recorder<R>(
+        mut recorder: TraceRecorder,
+        root_def_path: impl Into<String>,
+        raw_args: Vec<Vec<u8>>,
+        f: impl FnOnce(&mut TraceRecorder) -> R,
+    ) -> (Result<R, Box<dyn Any + Send>>, RecordedRawTrace, TraceRecorder) {
+        let root_def_path_str = root_def_path.into();
+        let root_crate_prefix = root_def_path_str
+            .split_once("::")
+            .map(|(prefix, _)| prefix.to_string());
+
+        let active_init = ActiveBoundaryState {
+            root_crate_prefix,
+            schedule: recorder.schedule.clone(),
+            inlined_callees: recorder.inlined_callees.clone(),
+            events: Vec::new(),
+            branch_tags: Vec::new(),
+            call_count: recorder.call_count,
+            boundary_depth: 0,
+        };
+
+        let prev_active = ACTIVE_RECORDER.with(|cell| cell.borrow_mut().replace(active_init));
         let res = panic::catch_unwind(AssertUnwindSafe(|| f(&mut recorder)));
+        let finished_active = ACTIVE_RECORDER.with(|cell| {
+            let mut borrow = cell.borrow_mut();
+            let current = borrow.take();
+            *borrow = prev_active;
+            current
+        });
+
+        if let Some(active) = finished_active {
+            recorder.schedule = active.schedule;
+            recorder.events.extend(active.events);
+            recorder.branch_tags.extend(active.branch_tags);
+            recorder.call_count = active.call_count;
+        }
+
         let outcome = match &res {
             Ok(ret) => RecordedOutcome::Normal {
                 raw_ret: value_as_raw_bytes(ret),
             },
             Err(_) => RecordedOutcome::Panic,
         };
+        recorder.outcome = Some(outcome.clone());
+
         let trace = RecordedRawTrace {
-            root_def_path: root_def_path.into(),
+            root_def_path: root_def_path_str,
             raw_args,
-            shadow_provenance: recorder.shadow_provenance,
-            events: recorder.events,
+            shadow_provenance: recorder.shadow_provenance.clone(),
+            events: recorder.events.clone(),
             outcome,
         };
-        (res, trace)
+        (res, trace, recorder)
     }
 }
 
@@ -829,6 +1276,305 @@ pub fn render_batch_trace_eval_lean_module(
     out
 }
 
+/// Render a Stage-1 Lean 4 probe module that evaluates
+/// `diagnoseRawByteTraceObsErasedBounded` (or `diagnoseRawByteTraceFullBounded`)
+/// via `#eval` for each [`BatchTraceEvalCase`] and prints
+/// `ANNEAL_ITREE_DIAG:<case_ident>:<tag_name>:<repr>` to stdout without
+/// failing compilation when a case diverges (`tagName != "ok"`).
+pub fn render_batch_trace_probe_lean_module(
+    module_namespace: &str,
+    cases: &[BatchTraceEvalCase],
+) -> String {
+    let mut out = String::new();
+    out.push_str("import Trusted\n");
+    out.push_str("import Anneal\n");
+
+    let mut imported: Vec<String> = Vec::new();
+    for case in cases {
+        for m in std::iter::once(&case.config.root_mir_module)
+            .chain(case.config.callee_sig_modules.iter())
+            .chain(case.config.inlined_callee_modules.iter())
+        {
+            if !imported.contains(m) {
+                let _ = writeln!(out, "import {m}");
+                imported.push(m.clone());
+            }
+        }
+    }
+
+    let _ = writeln!(out, "\nnamespace {module_namespace}\n");
+    out.push_str("open Trusted.Effect\n");
+    out.push_str("open Trusted.ITree\n");
+    out.push_str("open Trusted.Rustc.V2026_06_01.MirAst\n");
+    out.push_str("open Trusted.Rustc.V2026_06_01.MirSemantics\n");
+    out.push_str("open Trusted.VerificationResult\n");
+    out.push_str("open Anneal.Rustc.V2026_06_01.TraceCheck\n\n");
+
+    for case in cases {
+        let id = &case.case_ident;
+        let cfg = &case.config;
+        let callee_sigs_list = if cfg.callee_sig_modules.is_empty() {
+            "[]".to_string()
+        } else {
+            let items: Vec<String> = cfg
+                .callee_sig_modules
+                .iter()
+                .map(|m| format!("{m}.body"))
+                .collect();
+            format!("[{}]", items.join(", "))
+        };
+        let init_mem_expr = cfg.init_mem_expr.as_deref().unwrap_or("emptyMemory");
+        let table_expr = render_shadow_provenance_table_lean(&case.trace.shadow_provenance);
+        let trace_expr =
+            render_raw_byte_trace_lean(&case.trace, init_mem_expr, &cfg.inlined_callee_modules);
+
+        let sigs_ident = format!("{id}_calleeSigs");
+        let table_ident = format!("{id}_shadowTable");
+        let trace_ident = format!("{id}_rawTrace");
+
+        let _ = writeln!(
+            out,
+            "@[reducible]\ndef {sigs_ident} : List CapturedMir := {callee_sigs_list}\n"
+        );
+        let _ = writeln!(
+            out,
+            "@[reducible]\ndef {table_ident} : ShadowProvenanceTable := {table_expr}\n"
+        );
+        let _ = writeln!(
+            out,
+            "@[reducible]\ndef {trace_ident} : RawByteTrace :=\n{trace_expr}\n"
+        );
+
+        let diag_fn = if cfg.check_branches {
+            "diagnoseRawByteTraceFullBounded"
+        } else {
+            "diagnoseRawByteTraceObsErasedBounded"
+        };
+        let root_body = format!("{}.body", cfg.root_mir_module);
+        let fuel = cfg.fuel;
+        let diag_ident = format!("{id}_diag");
+        let _ = writeln!(
+            out,
+            "def {diag_ident} : TraceReplayDiag :=\n  {diag_fn} {fuel} {root_body} {sigs_ident} {table_ident} {trace_ident}\n"
+        );
+        let _ = writeln!(
+            out,
+            "#eval IO.println s!\"ANNEAL_ITREE_DIAG:{id}:{{{diag_ident}.tagName}}:{{reprStr {diag_ident}}}\"\n"
+        );
+    }
+
+    let _ = writeln!(out, "end {module_namespace}");
+    out
+}
+
+/// Parse stdout lines emitted by [`render_batch_trace_probe_lean_module`] into
+/// a map from `case_ident` to `(tag_name, diag_repr)`.
+pub fn parse_batch_trace_probe_output(stdout: &str) -> BTreeMap<String, (String, String)> {
+    const PREFIX: &str = "ANNEAL_ITREE_DIAG:";
+    let mut out = BTreeMap::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix(PREFIX) else {
+            continue;
+        };
+        let Some((case_ident, after_id)) = rest.split_once(':') else {
+            continue;
+        };
+        let (tag_name, repr_str) = after_id.split_once(':').unwrap_or((after_id, ""));
+        out.insert(
+            case_ident.to_string(),
+            (tag_name.to_string(), repr_str.to_string()),
+        );
+    }
+    out
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "-".to_string();
+    }
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
+    let trimmed = hex.trim();
+    if trimmed.is_empty() || trimmed == "-" {
+        return Ok(Vec::new());
+    }
+    if trimmed.len() % 2 != 0 {
+        return Err(format!("odd-length hex slice `{trimmed}`"));
+    }
+    let mut out = Vec::with_capacity(trimmed.len() / 2);
+    let bytes = trimmed.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let pair = std::str::from_utf8(&bytes[i..i + 2])
+            .map_err(|e| format!("invalid utf-8 in hex `{trimmed}`: {e}"))?;
+        let b = u8::from_str_radix(pair, 16)
+            .map_err(|e| format!("invalid hex byte `{pair}` in `{trimmed}`: {e}"))?;
+        out.push(b);
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn encode_byte_slices_hex(slices: &[Vec<u8>]) -> String {
+    if slices.is_empty() {
+        return String::new();
+    }
+    slices
+        .iter()
+        .map(|s| bytes_to_hex(s))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn decode_byte_slices_hex(raw: &str) -> Result<Vec<Vec<u8>>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    trimmed.split(',').map(hex_to_bytes).collect()
+}
+
+/// Encode a [`RecordedRawTrace`] as a single compact ASCII line suitable for
+/// subprocess trace collection and standalone reproducer bundles.
+pub fn encode_recorded_raw_trace_hex(trace: &RecordedRawTrace) -> String {
+    let args_part = encode_byte_slices_hex(&trace.raw_args);
+    let shadow_part = trace
+        .shadow_provenance
+        .iter()
+        .map(|s| format!("{}:{}:{}:{}", s.base_addr, s.byte_len, s.alloc_id, s.tag))
+        .collect::<Vec<_>>()
+        .join(",");
+    let events_part = trace
+        .events
+        .iter()
+        .map(|ev| match ev {
+            RecordedEvent::Branch { tag } => format!("B@{tag}"),
+            RecordedEvent::ExtCall {
+                def_path,
+                raw_args,
+                raw_ret,
+            } => format!(
+                "C@{def_path}@{}@{}",
+                encode_byte_slices_hex(raw_args),
+                bytes_to_hex(raw_ret)
+            ),
+            RecordedEvent::ExtCallPanic { def_path, raw_args } => {
+                format!("P@{def_path}@{}", encode_byte_slices_hex(raw_args))
+            }
+            RecordedEvent::ExtCallAbort { def_path, raw_args } => {
+                format!("A@{def_path}@{}", encode_byte_slices_hex(raw_args))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let outcome_part = match &trace.outcome {
+        RecordedOutcome::Normal { raw_ret } => format!("N@{}", bytes_to_hex(raw_ret)),
+        RecordedOutcome::Panic => "P".to_string(),
+        RecordedOutcome::Abort => "A".to_string(),
+    };
+    format!(
+        "{}|{}|{}|{}|{}",
+        trace.root_def_path, args_part, shadow_part, events_part, outcome_part
+    )
+}
+
+/// Decode a single line produced by [`encode_recorded_raw_trace_hex`] back into
+/// a [`RecordedRawTrace`].
+pub fn decode_recorded_raw_trace_hex(line: &str) -> Result<RecordedRawTrace, String> {
+    let parts: Vec<&str> = line.trim().splitn(5, '|').collect();
+    if parts.len() != 5 {
+        return Err(format!(
+            "expected 5 `|`-separated fields in trace line, got {}: `{line}`",
+            parts.len()
+        ));
+    }
+    let root_def_path = parts[0].to_string();
+    let raw_args = decode_byte_slices_hex(parts[1])?;
+    let mut shadow_provenance = Vec::new();
+    if !parts[2].trim().is_empty() {
+        for item in parts[2].split(',') {
+            let nums: Vec<&str> = item.split(':').collect();
+            if nums.len() != 4 {
+                return Err(format!("invalid shadow provenance entry `{item}`"));
+            }
+            shadow_provenance.push(RecordedShadowAlloc {
+                base_addr: nums[0]
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid base_addr `{}`: {e}", nums[0]))?,
+                byte_len: nums[1]
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid byte_len `{}`: {e}", nums[1]))?,
+                alloc_id: nums[2]
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid alloc_id `{}`: {e}", nums[2]))?,
+                tag: nums[3]
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid tag `{}`: {e}", nums[3]))?,
+            });
+        }
+    }
+    let mut events = Vec::new();
+    if !parts[3].trim().is_empty() {
+        for ev_str in parts[3].split(';') {
+            let fields: Vec<&str> = ev_str.split('@').collect();
+            match fields.as_slice() {
+                ["B", tag_s] => {
+                    let tag = tag_s
+                        .parse::<u128>()
+                        .map_err(|e| format!("invalid branch tag `{tag_s}`: {e}"))?;
+                    events.push(RecordedEvent::Branch { tag });
+                }
+                ["C", def_path, args_s, ret_s] => {
+                    events.push(RecordedEvent::ExtCall {
+                        def_path: (*def_path).to_string(),
+                        raw_args: decode_byte_slices_hex(args_s)?,
+                        raw_ret: hex_to_bytes(ret_s)?,
+                    });
+                }
+                ["P", def_path, args_s] => {
+                    events.push(RecordedEvent::ExtCallPanic {
+                        def_path: (*def_path).to_string(),
+                        raw_args: decode_byte_slices_hex(args_s)?,
+                    });
+                }
+                ["A", def_path, args_s] => {
+                    events.push(RecordedEvent::ExtCallAbort {
+                        def_path: (*def_path).to_string(),
+                        raw_args: decode_byte_slices_hex(args_s)?,
+                    });
+                }
+                _ => return Err(format!("unrecognized encoded event `{ev_str}`")),
+            }
+        }
+    }
+    let outcome = if let Some(ret_hex) = parts[4].strip_prefix("N@") {
+        RecordedOutcome::Normal {
+            raw_ret: hex_to_bytes(ret_hex)?,
+        }
+    } else if parts[4] == "P" {
+        RecordedOutcome::Panic
+    } else if parts[4] == "A" {
+        RecordedOutcome::Abort
+    } else {
+        return Err(format!("unrecognized encoded outcome `{}`", parts[4]));
+    };
+
+    Ok(RecordedRawTrace {
+        root_def_path,
+        raw_args,
+        shadow_provenance,
+        events,
+        outcome,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -857,13 +1603,23 @@ mod tests {
         assert!(value_as_raw_bytes(&()).is_empty());
     }
 
+    #[anneal_trace::external]
+    fn ext(x: u32) -> u32 {
+        x.wrapping_mul(2)
+    }
+
+    #[anneal_trace::external]
+    fn boom() -> u32 {
+        panic!("simulated external panic");
+    }
+
     #[test]
     fn trace_recorder_captures_normal_and_panicking_external_calls() {
         let arg: u32 = 7;
         let (ok_res, ok_trace) =
             TraceRecorder::observe_root("demo::root", vec![value_as_raw_bytes(&arg)], |rec| {
                 rec.record_branch(0);
-                rec.observe_ext_call("demo::ext", vec![value_as_raw_bytes(&arg)], || 14u32)
+                ext(arg)
             });
         assert_eq!(ok_res.expect("normal return"), 14);
         assert_eq!(
@@ -884,11 +1640,8 @@ mod tests {
             }
         );
 
-        let (panic_res, panic_trace) = TraceRecorder::observe_root("demo::panic_root", vec![], |rec| {
-            rec.observe_ext_call("demo::boom", vec![], || -> u32 {
-                panic!("simulated external panic");
-            })
-        });
+        let (panic_res, panic_trace) =
+            TraceRecorder::observe_root("demo::panic_root", vec![], |_rec| boom());
         assert!(panic_res.is_err());
         assert_eq!(
             panic_trace.events,

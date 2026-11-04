@@ -6,4 +6,5 @@ members = [
     "crates/anneal-spec",
     "crates/anneal-spec-macros",
     "crates/anneal-specr-lean",
+    "crates/anneal-trace",
 ]

@@ -6,6 +6,7 @@ version = 4
 name = "anneal-difftest"
 version = "0.1.0"
 dependencies = [
+ "anneal-trace",
  "arbitrary",
  "arbtest",
  "cargo-anneal",
@@ -17,6 +18,10 @@ dependencies = [
 
 [[package]]
 name = "anneal-rustc-capture"
+version = "0.1.0-alpha.1"
+
+[[package]]
+name = "anneal-trace"
 version = "0.1.0-alpha.1"
 
 [[package]]

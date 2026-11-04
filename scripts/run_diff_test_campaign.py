@@ -1423,6 +1423,7 @@ def main() -> int:
                     repo_root,
                     "itree-difftest",
                     [
+                        "--compile-only",
                         "--batches",
                         str(profile.itree_batches),
                         "--batch-size",

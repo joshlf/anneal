@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+anneal-trace = { path = "../anneal-trace" }
 arbitrary = { version = "1.4.2", features = ["derive"] }
 arbtest = "0.3.2"
 cargo-anneal = { path = "../cargo-anneal" }

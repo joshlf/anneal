@@ -1,0 +1,13 @@
+[package]
+name = "anneal-trace"
+version = "0.1.0-alpha.1"
+edition = "2024"
+description = "Boundary trace-observation attribute macros for Anneal differential testing."
+license = "BSD-2-Clause OR Apache-2.0 OR MIT"
+repository = "https://github.com/joshlf/anneal"
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]

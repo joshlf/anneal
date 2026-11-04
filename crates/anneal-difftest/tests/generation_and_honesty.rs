@@ -951,7 +951,7 @@ fn input_builder_schedule_and_shrinker_edge_cases() {
     assert_eq!(rec.outcome, Some(RecordedOutcome::Panic));
     assert!(rec.events.iter().any(|ev| matches!(
         ev,
-        RecordedEvent::ScheduledPanic { callee, call_index: 0 } if callee == "oracle"
+        RecordedEvent::ExtCallPanic { def_path, .. } if def_path == "oracle"
     )));
 }
 
@@ -968,7 +968,7 @@ fn harness_binaries_report_no_oracle_comparison() {
         (
             "itree-difftest",
             env!("CARGO_BIN_EXE_itree-difftest"),
-            &[][..],
+            &["--compile-only"][..],
             ITREE_JSON_KEYS,
         ),
     ] {
@@ -1093,9 +1093,7 @@ fn compile_counts_come_from_rustc() {
     let run = |bin: &str, rustc: &Path, name: &str| -> Vec<(String, String)> {
         let json_path = dir.join(format!("{name}.json"));
         let mut cmd = Command::new(bin);
-        if bin == env!("CARGO_BIN_EXE_miri-difftest") {
-            cmd.arg("--compile-only");
-        }
+        cmd.arg("--compile-only");
         let out = cmd
             .args([
                 "--batches",

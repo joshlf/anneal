@@ -19,6 +19,8 @@
 //!    `verify-audit` mode to enforce anti-cheat rules and classify conditional
 //!    `Assumptions.<Item>` axioms.
 
+extern crate self as cargo_anneal;
+
 pub mod agent;
 pub mod correspondence_bugs;
 pub mod driver;
@@ -98,13 +100,15 @@ pub use scaffold::{
     scaffold_init_spec_templates, scaffold_workspace, scaffold_workspace_with_config,
 };
 pub use trace_observer::{
-    BatchTraceEvalCase, RawByteTraceJson, RawCallEventJson, RawOutcomeJson, RawTraceEventJson,
-    RecordedEvent, RecordedOutcome, RecordedRawTrace, RecordedShadowAlloc, ShadowAllocEntryJson,
-    TraceCheckModuleConfig, TraceObserverSpec, TraceRecorder,
-    render_batch_trace_eval_lean_module, render_raw_byte_trace_lean,
-    render_raw_byte_trace_lean_def, render_raw_outcome_lean,
-    render_shadow_provenance_table_lean, render_tampered_outcome_diag_lean_snippet,
-    render_trace_check_lean_module, render_trace_diag_eval_lean_snippet, value_as_raw_bytes,
+    BatchTraceEvalCase, EnvAction, EnvSchedule, RawByteTraceJson, RawCallEventJson, RawOutcomeJson,
+    RawTraceEventJson, RecordedEvent, RecordedOutcome, RecordedRawTrace, RecordedShadowAlloc,
+    ShadowAllocEntryJson, TraceCheckModuleConfig, TraceObserverSpec, TraceRecorder,
+    decode_recorded_raw_trace_hex, encode_recorded_raw_trace_hex, observe_boundary_call,
+    parse_batch_trace_probe_output, render_batch_trace_eval_lean_module,
+    render_batch_trace_probe_lean_module, render_raw_byte_trace_lean,
+    render_raw_byte_trace_lean_def, render_raw_outcome_lean, render_shadow_provenance_table_lean,
+    render_tampered_outcome_diag_lean_snippet, render_trace_check_lean_module,
+    render_trace_diag_eval_lean_snippet, value_as_raw_bytes,
 };
 
 /// Top-level subcommand selected on the `cargo anneal` command line.

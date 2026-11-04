@@ -29,6 +29,10 @@ name = "anneal-specr-lean"
 version = "0.1.0-alpha.1"
 
 [[package]]
+name = "anneal-trace"
+version = "0.1.0-alpha.1"
+
+[[package]]
 name = "anodized"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -89,6 +93,7 @@ name = "cargo-anneal"
 version = "0.1.0-alpha.1"
 dependencies = [
  "anneal-rustc-capture",
+ "anneal-trace",
 ]
 
 [[package]]

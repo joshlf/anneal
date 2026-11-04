@@ -36,3 +36,9 @@ url = "https://example.com/macos-aarch64.tar.zst"
 
 [dependencies]
 anneal-rustc-capture = { version = "0.1.0-alpha.1", path = "../../trusted/rustc-capture" }
+
+[dev-dependencies]
+anneal-trace = { path = "../anneal-trace" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(anneal_trace_ext)'] }
