@@ -360,7 +360,8 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   (`*_minirust_ret_from_start`, `*_noUB`, direct runs, and byte-level checks
   that each in-place write rewrites exactly the element's bytes at offset
   `index * size_of::<T>()` and leaves its siblings intact:
-  `arrayOpsOk_minirust_inplace_bytes`, `arrayU32IdxOk_minirust_inplace_bytes`),
+  `arrayOpsOk_minirust_inplace_bytes`, `arrayOpsOk_minirust_ret_dealloc`,
+  `arrayU32IdxOk_minirust_inplace_bytes`),
   projected array operands (`copy _1[proj]`) composed with `SwitchInt`,
   `Repeat`, `Aggregate(Array)`, `UnaryOp(Neg)`, and `Cast(IntToInt)`
   (`arrayComposeOk_*`), plus UB for an out-of-bounds `Index` or `ConstantIndex`

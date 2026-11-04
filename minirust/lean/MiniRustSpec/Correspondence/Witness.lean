@@ -2347,6 +2347,17 @@ theorem arrayOpsOk_minirust_inplace_bytes :
        some (some (scalarBytes i8 3 ++ scalarBytes i8 17 ++ scalarBytes i8 20)),
        some (some (scalarBytes i8 3 ++ scalarBytes i8 17 ++ scalarBytes i8 17))] := rfl
 
+/-- On `Terminator::Return` at step `12` of `arrayOpsI8`, `evalReturn` calls
+`storageDead` on every callee local (`_0`..`_5`, allocations `1..=6`), verifying
+`BM.deallocate` against each local's layout (`size = 3, align = 1` for the two
+`[i8; 3]` array locals `_1` and `_2` at allocations `2` and `3`) and marking all
+six callee stack allocations `live = false` while keeping the caller's return
+allocation `0` `live = true`. -/
+theorem arrayOpsOk_minirust_ret_dealloc :
+    (Interp.steps 12 arrayOpsOkMInit).toOption.map
+        (fun m => m.mem.memory.allocations.map (fun a => (a.live, a.data.length))) =
+      some [(true, 1), (false, 1), (false, 3), (false, 3), (false, 1), (false, 8), (false, 8)] := rfl
+
 /-- Out-of-bounds `Index` (`_4 = 3usize >= 3`) on `arrayOpsI8`: raises UB on
 `_2[_4]`. -/
 def arrayOpsOobArgs : List Value :=
@@ -2997,11 +3008,16 @@ theorem array_encode_decode_edge_cases :
       .error (.specPanic "encode: Type::Array length mismatch") ∧
     Type.encode (.Array (.Slice (.Int i8)) 0) (.Tuple []) = .ok [] ∧
     Type.decode (.Array (.Int i8) 2) [.Uninit, .Init 5 none] = .ok none ∧
+    Type.decode (.Array (.Int i8) 2) [.Init 1 none] =
+      .error (.specPanic "decode of Type::Array with invalid length") ∧
+    Type.decode (.Array (.Int i8) (-1)) [] =
+      .error (.specPanic "Size * Int: negative byte count") ∧
+    Type.decode (.Array (.Array (.Int i8) 0) (-1)) [] = .ok (some (.Tuple [])) ∧
     (tryMapM (fun x : Nat =>
       if x = 0 then (.ok none : Interp (Option Val))
       else .error (.specPanic "unreachable")) [0, 1] : Interp (Option (List Val))) =
       .ok none :=
-  ⟨rfl, rfl, rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ## Projected array operands across `SwitchInt`/`Repeat`/`Aggregate`/`UnaryOp`/`Cast`, faulting array rvalues, and faulting in-place write RHS -/
 

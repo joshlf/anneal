@@ -540,7 +540,7 @@ fn quotations_occur_upstream() {
     );
     // The interpretation and the translation quote dozens of upstream items;
     // a sudden drop means the extraction above broke.
-    assert!(total >= 55, "only {total} quotations found");
+    assert!(total >= 65, "only {total} quotations found");
 
     // Every spec-transcribing `def` in `Interp.lean` (after `/-! ## Target`,
     // except the Lean recursion/iteration helpers `countOnesLoop` and `steps`)
@@ -745,9 +745,12 @@ fn mr_2_1_array_quotations_are_pinned_and_tamper_checked() {
         ("spec/lang/representation.md", "(Value::Tuple(vals), Type::Array { elem, count }) =>"),
         ("spec/mem/basic.md", "fn dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Size)"),
         ("spec/mem/interface.md", "fn signed_dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Int)"),
+        ("spec/mem/concurrent.md", "pub fn dereferenceable(&self, ptr: ThinPointer<M::Provenance>, len: Size) -> Result"),
+        ("spec/mem/concurrent.md", "pub fn signed_dereferenceable(&self, ptr: ThinPointer<M::Provenance>, len: Int) -> Result"),
         ("spec/lang/step/operators.md", "fn ptr_offset_inbounds(&self, ptr: ThinPointer<M::Provenance>, offset: Int)"),
         ("spec/lang/step/expressions.md", "PlaceExpr::Index { root, index }: PlaceExpr"),
         ("spec/lang/step/expressions.md", "offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata),"),
+        ("spec/lang/step/expressions.md", "let vals = exprs.try_map(|e| self.eval_value(e))?.map(|e| e.0);"),
         ("spec/lang/step/expressions.md", "ValueExpr::Tuple(exprs, ty): ValueExpr"),
     ];
     for (cited_file, needle) in expected_interp {

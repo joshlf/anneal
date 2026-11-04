@@ -27,10 +27,15 @@ namespace MiniRustSpec.Audit
 
 open Lean Elab Command
 
-/-- Fail unless every listed declaration depends only on the standard axioms. -/
+/-- Fail unless every listed declaration is distinct and depends only on the
+standard axioms. -/
 elab "#assert_standard_axioms " ids:ident* : command => do
+  let mut seen : Lean.NameSet := {}
   for id in ids do
     let n ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo id
+    if seen.contains n then
+      throwError "duplicate declaration {n} in #assert_standard_axioms"
+    seen := seen.insert n
     let axs ← liftCoreM <| Lean.collectAxioms n
     for a in axs do
       unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
@@ -323,6 +328,7 @@ open MiniRustSpec.Correspondence.Witness in
   zeroArrayIdxUb_minirust_ub_from_start
   zeroArrayIdxUb_minirust_direct
   arrayOpsOk_minirust_inplace_bytes
+  arrayOpsOk_minirust_ret_dealloc
   ctxI8_ok_arrayUninitIdx
   arrayUninitIdxI8_inFragment
   arrayUninitIdxI8_translate
@@ -464,6 +470,7 @@ open MiniRustSpec.Correspondence.Witness in
   arrayOpsOk_minirust_ret_from_start
   arrayOpsOk_minirust_direct
   arrayOpsOk_minirust_inplace_bytes
+  arrayOpsOk_minirust_ret_dealloc
   arrayOpsOob_anneal_ub
   arrayOpsOob_minirust_ub_from_start
   arrayOpsOob_minirust_direct

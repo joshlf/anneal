@@ -93,10 +93,10 @@ cd examples && anneal-lean-run --mode file --concurrency 3 -- lake env lean ../m
 Expected audit summary lines:
 
 ```text
-MiniRustSpec.Audit: exhaustively verified standard axioms for 8268 declarations across all MiniRustSpec.* modules
+MiniRustSpec.Audit: exhaustively verified standard axioms for 8269 declarations across all MiniRustSpec.* modules
 [ANCHOR-AUDIT] decls=2 theorems=2 sorry_free=true standard_axioms_only=true
 [SIMULATION-AUDIT] decls=21 theorems=21 sorry_free=true standard_axioms_only=true
-[WITNESS-AUDIT] decls=74 theorems=74 sorry_free=true standard_axioms_only=true
+[WITNESS-AUDIT] decls=75 theorems=75 sorry_free=true standard_axioms_only=true
 ```
 
 ## 6. What the Witnesses Show
@@ -109,7 +109,10 @@ Each witness runs both semantics in the kernel (`decide`/`rfl`, no
   `Index` and `ConstantIndex` (from the start and from the end) reads and
   in-place writes, and `Len`; `arrayOpsOk_minirust_inplace_bytes` shows the
   bytes of `_2`'s MiniRust allocation going from `[3, 10, 20]` to
-  `[3, 17, 20]` to `[3, 17, 17]`, one element per write. Index `3` raises
+  `[3, 17, 20]` to `[3, 17, 17]`, one element per write, and
+  `arrayOpsOk_minirust_ret_dealloc` verifies that `Terminator::Return`
+  deallocates all six callee local allocations (`_0`..`_5`, including both
+  `[i8; 3]` array allocations at size `3`, align `1`). Index `3` raises
   out-of-bounds UB (`arrayOpsOob_*`).
 - `arrayU32Idx` (`[u32; 3]`): a write at index `2` lands at byte offset `8`
   (`index * size_of::<u32>()`) and leaves bytes `0..8` unchanged
@@ -126,9 +129,11 @@ Each witness runs both semantics in the kernel (`decide`/`rfl`, no
   `array_encode_decode_edge_cases`): `PlaceMention(_1)` on an array local and
   out-of-bounds `ConstantIndex` (`fromEnd = false, offset = 2 >= 2`) UB on
   `[i8; 2]`, plus direct checks of `Size.mulInt` (`Size::ZERO * -1 =
-  Size::ZERO`), `Type.encode` length-mismatch ordering and 0-length array
-  encoding, `Type.decode` on uninitialized array elements, and `tryMapM`
-  left-to-right short-circuiting.
+  Size::ZERO`), `checkValue` and `Type.encode` length-mismatch ordering and
+  0-length array encoding, `Type.decode` on uninitialized array elements,
+  invalid byte lengths, and negative array counts (`count < 0` on both
+  non-zero-sized and 0-sized elements), and `tryMapM` left-to-right
+  short-circuiting.
 - `arrayComposeI8` (`[i8; 2]`): composes projected array element operands
   (`copy _1[proj]`) across `SwitchInt`, `Repeat`, `Aggregate(Array)`,
   `UnaryOp(Neg)`, and `Cast(IntToInt)` (`arrayComposeOk_*`), and exercises the
