@@ -34,7 +34,14 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   tyIsSigned placeIsSigned operandIsSigned evalUnaryNot signedOverflowAdd
   signedOverflowSub signedOverflowMul evalSignedDiv evalSignedRem
   signedHalfModulus evalExactDiv evalScalarExactDiv
-  evalScalarBinOp intCastTargetBytes ScalarVal AbstractByte mergeByteProvenance
+  evalScalarBinOp intCastTargetBytes
+  ctpopLoop cttzLoop bitreverseLoop ctlzBits bswapLoop
+  evalCtlz evalCtlzNonzero evalCttz evalCttzNonzero evalCtpop
+  evalBswap evalBitreverse evalWrappingAdd evalWrappingSub evalWrappingMul
+  evalSaturatingAdd evalSaturatingSub evalUncheckedAdd evalUncheckedSub
+  evalUncheckedMul evalUncheckedDiv evalUncheckedRem evalUncheckedShl
+  evalUncheckedShr evalThreeWayCompare evalArithOffset evalSliceSizeOfVal
+  ScalarVal AbstractByte mergeByteProvenance
   encodeLittleEndianBytes encodeScalarBytes decodeLittleEndianBytes
   decodeScalarBytes replicateUninitBytes takeAbstractBytes dropAbstractBytes
   appendAbstractBytes sliceAbstractBytes writeAbstractBytesAt
@@ -59,7 +66,15 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   extractCalleeDefPath? restoreCallerProtectors pushCalleeFrame
   pushDivergingCalleeFrame enterTailCalleeFrame unwindFromCallStack
   applyUnwindAction resumeExternalCall resumeExternalDivergingCall
-  resumeExternalTailCall isUnreachableCallTarget isAbortingPanicDefPath
+  resumeExternalTailCall isDirectExactDivTarget RustIntrinsicKind
+  classifyRustIntrinsic? rigidTyIsSigned resolveIntrinsicIsSigned
+  resolveIntrinsicShiftSigned findDeclLayoutForRigidTy
+  intrinsicRigidTyByteSize intrinsicRigidTyKindAlign tupleFieldsAlign
+  intrinsicRigidTyAlign resolveIntrinsicPointeeTy?
+  unpackConstEvalSelectArgs? resolveConstEvalSelectTarget?
+  writeIntrinsicReturn writeIntrinsicScalarResult
+  evalNonSelectIntrinsicCall evalDirectRustIntrinsic?
+  isUnreachableCallTarget isAbortingPanicDefPath
   isUnwindingPanicDefPath evalTerminator
   initMachineState initMachineStateWithCallees
   stepMirFn stepMirState mirTree mirCallTree MirCallInstance
