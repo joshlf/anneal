@@ -594,6 +594,8 @@ open MiniRustSpec.Correspondence.Witness in
   evalValue_tuple_and_evalPlace_field
   evalBinOp_intWithOverflow_nonInt_panics
   evalPlace_field_panics
+  evalBinOp_withOverflow_all_widths
+  evalPlace_field_union_and_offset_panic
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -888,6 +890,8 @@ open MiniRustSpec.Correspondence.Witness in
   evalValue_tuple_and_evalPlace_field
   evalBinOp_intWithOverflow_nonInt_panics
   evalPlace_field_panics
+  evalBinOp_withOverflow_all_widths
+  evalPlace_field_union_and_offset_panic
   sumTo_minirust_ret_from_start
   castBitNot4_minirust_ret_from_start
   uninitSwitchUb_minirust_ub_from_start

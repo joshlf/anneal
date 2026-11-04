@@ -4302,4 +4302,63 @@ theorem evalPlace_field_panics :
     evalPlace checkedTupleOkMInit (.Field (.Local (localName 1)) 0) =
       .error (.specPanic "field projection on non-projectable type") := ⟨rfl, rfl, rfl, rfl⟩
 
+/-- `IntType::with_overflow` and `evalBinOp (.IntWithOverflow ..)` across the
+remaining integer widths (`u8`, `i16`, `u16`, `i32`, `i64`/`isize`,
+`u64`/`usize`, `i128`, `u128`), including 16-byte `(i64, bool)` (`7` trailing
+padding bytes) and 32-byte `(u128, bool)` (`15` trailing padding bytes). -/
+def i16W : Gen.IntType := ⟨.Signed, ⟨2⟩⟩
+def u16W : Gen.IntType := ⟨.Unsigned, ⟨2⟩⟩
+def i32W : Gen.IntType := ⟨.Signed, ⟨4⟩⟩
+def i64W : Gen.IntType := ⟨.Signed, ⟨8⟩⟩
+def u64W : Gen.IntType := ⟨.Unsigned, ⟨8⟩⟩
+def i128W : Gen.IntType := ⟨.Signed, ⟨16⟩⟩
+def u128W : Gen.IntType := ⟨.Unsigned, ⟨16⟩⟩
+
+theorem evalBinOp_withOverflow_all_widths :
+    Type.layout (intBoolTupleTy i64W) = .ok (.Sized ⟨16⟩ ⟨8⟩) ∧
+    Type.layout (intBoolTupleTy u128W) = .ok (.Sized ⟨32⟩ ⟨16⟩) ∧
+    evalBinOp (.IntWithOverflow .Add) (.Int 255, .Int u8Ty) (.Int 1, .Int u8Ty) =
+      .ok (.Tuple [.Int 0, .Bool true], intBoolTupleTy u8Ty) ∧
+    evalBinOp (.IntWithOverflow .Sub) (.Int (-32768), .Int i16W) (.Int 1, .Int i16W) =
+      .ok (.Tuple [.Int 32767, .Bool true], intBoolTupleTy i16W) ∧
+    evalBinOp (.IntWithOverflow .Add) (.Int 65535, .Int u16W) (.Int 1, .Int u16W) =
+      .ok (.Tuple [.Int 0, .Bool true], intBoolTupleTy u16W) ∧
+    evalBinOp (.IntWithOverflow .Add) (.Int 2147483647, .Int i32W) (.Int 1, .Int i32W) =
+      .ok (.Tuple [.Int (-2147483648), .Bool true], intBoolTupleTy i32W) ∧
+    evalBinOp (.IntWithOverflow .Sub)
+      (.Int (-9223372036854775808), .Int i64W) (.Int 1, .Int i64W) =
+      .ok (.Tuple [.Int 9223372036854775807, .Bool true], intBoolTupleTy i64W) ∧
+    evalBinOp (.IntWithOverflow .Add)
+      (.Int 18446744073709551615, .Int u64W) (.Int 1, .Int u64W) =
+      .ok (.Tuple [.Int 0, .Bool true], intBoolTupleTy u64W) ∧
+    evalBinOp (.IntWithOverflow .Sub)
+      (.Int (-(2 ^ 127)), .Int i128W) (.Int 1, .Int i128W) =
+      .ok (.Tuple [.Int (2 ^ 127 - 1), .Bool true], intBoolTupleTy i128W) ∧
+    evalBinOp (.IntWithOverflow .Sub)
+      (.Int 0, .Int u128W) (.Int 1, .Int u128W) =
+      .ok (.Tuple [.Int (2 ^ 128 - 1), .Bool true], intBoolTupleTy u128W) :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `evalPlace (.Field ..)` on `Type::Union` (`unionPaddedTy`, projecting field
+`0` at offset `0` with type `.Int i8` and field `1` at offset `2` with type
+`.Bool`) and the `offset <= self.compute_size(...)` assertion `specPanic` when a
+malformed tuple's field offset (`16`) exceeds the tuple's head size (`8`). -/
+def unionFieldTestMach : Mach :=
+  machineWithCtx ctxTupleU32 checkedTupleU32
+    { checkedTupleU32Fn with
+      locals := ⟨[(localName 0, unionPaddedTy),
+                  (localName 1, .Tuple [(⟨16⟩, .Int u32)] ⟨⟨8⟩, ⟨4⟩, none⟩ none)]⟩ }
+    checkedTupleOkS0.frame.locals (bbName 0)
+
+theorem evalPlace_field_union_and_offset_panic :
+    evalPlace unionFieldTestMach (.Field (.Local (localName 0)) 0) =
+      .ok ({ ptr := { thin_pointer := { addr := 128, provenance := some (⟨1⟩, ()) }, metadata := none },
+             aligned := true }, .Int i8) ∧
+    evalPlace unionFieldTestMach (.Field (.Local (localName 0)) 1) =
+      .ok ({ ptr := { thin_pointer := { addr := 130, provenance := some (⟨1⟩, ()) }, metadata := none },
+             aligned := true }, .Bool) ∧
+    evalPlace unionFieldTestMach (.Field (.Local (localName 1)) 0) =
+      .error (.specPanic "assertion failed: offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata)") :=
+  ⟨rfl, rfl, rfl⟩
+
 end MiniRustSpec.Correspondence.Witness

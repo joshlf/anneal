@@ -540,7 +540,7 @@ fn quotations_occur_upstream() {
     );
     // The interpretation and the translation quote dozens of upstream items;
     // a sudden drop means the extraction above broke.
-    assert!(total >= 70, "only {total} quotations found");
+    assert!(total >= 90, "only {total} quotations found");
 
     // Every spec-transcribing `def` in `Interp.lean` (after `/-! ## Target`,
     // except the Lean recursion/iteration helpers `countOnesLoop` and `steps`)
@@ -1181,6 +1181,7 @@ fn with_overflow_tuple_and_field_quotations_are_pinned() {
     let mach = "spec/lang/machine.md";
     let rvalue = "tooling/minimize/src/rvalue.rs";
     let min_ty = "tooling/minimize/src/ty.rs";
+    let bb = "tooling/minimize/src/bb.rs";
 
     // (cited file, genuine quotation, tampered quotation, Lean file quoting it)
     let cases: &[(&str, &str, &str, &str)] = &[
@@ -1333,6 +1334,22 @@ fn with_overflow_tuple_and_field_quotations_are_pinned() {
         ),
         (
             exprs,
+            "let tail_ty = unsized_field.expect(\"field projection to non-existing unsized tail\"); \
+             let tail_align = self.compute_align(tail_ty.layout::<M::T>(), root.ptr.metadata); \
+             let offset = sized_head_layout.tail_offset(tail_align); \
+             (offset, tail_ty)",
+            "let offset = Size::ZERO; (offset, tail_ty)",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            exprs,
+            "Type::Union { fields, .. } => fields[field], \
+             _ => panic!(\"field projection on non-projectable type\"),",
+            "Type::Union { fields, .. } => panic!(\"field projection on non-projectable type\"),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            exprs,
             "assert!(offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata)); \
              let ptr = self.ptr_offset_inbounds(root.ptr.thin_pointer, offset.bytes())?;",
             "let ptr = self.ptr_offset_inbounds(root.ptr.thin_pointer, -offset.bytes())?;",
@@ -1400,6 +1417,14 @@ fn with_overflow_tuple_and_field_quotations_are_pinned() {
              let ops: List<_> = operands.iter().map(|x| self.translate_operand_smir(x, span)).collect(); \
              ValueExpr::Tuple(ops, ty) }",
             "Type::Tuple { .. } | Type::Array { .. } => { ValueExpr::Tuple(list![], ty) }",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::StatementKind::PlaceMention(place) => { \
+             let place = self.translate_place(place, span); \
+             Statement::PlaceMention(place) }",
+            "rs::StatementKind::PlaceMention(place) => { Statement::StorageLive(place) }",
             "MiniRustSpec/Correspondence/Translate.lean",
         ),
     ];

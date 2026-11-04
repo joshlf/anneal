@@ -51,10 +51,11 @@ as a pass.
   - `impl_Machine__eval_int_bin_op_with_overflow` (`spec/lang/step/operators.md:208`)
 - **Quotation checks** (`crates/anneal-minirust-gen/tests/quotes.rs` and
   `tests/pipeline.rs`): `with_overflow_tuple_and_field_quotations_are_pinned`
-  pins all 19 new upstream quotations across `Interp.lean` (`spec/lang/types.md`,
+  pins all 22 upstream quotations across `Interp.lean` (`spec/lang/types.md`,
   `spec/mem/basic.md`, `spec/mem/concurrent.md`, `spec/lang/step/operators.md`,
   `spec/lang/step/expressions.md`) and `Translate.lean`
-  (`tooling/minimize/src/{ty,rvalue,place}.rs`), rejects single-token tampering
+  (`tooling/minimize/src/{ty,rvalue,bb}.rs`), raises the global quotation floor
+  in `quotations_occur_upstream` to `>= 90`, rejects single-token tampering
   and file misattribution, and checks that `Anchors.lean` contains 55 anchors.
 - **Translation** (`Correspondence/Translate.lean`):
   - `(Int, bool)` 2-tuple MIR types (`intBoolTupleOf` / `intBoolTupleTy it`,
@@ -132,7 +133,8 @@ as a pass.
     `evalBinOp_subWithOverflow_u32_zero`, `evalBinOp_mulWithOverflow_i8_min`,
     `evalBinOp_mulWithOverflow_u32`, `ptrOffsetInbounds_ok_and_oob`,
     `evalValue_tuple_and_evalPlace_field`, `evalBinOp_intWithOverflow_nonInt_panics`,
-    `evalPlace_field_panics`).
+    `evalPlace_field_panics`, `evalBinOp_withOverflow_all_widths`,
+    `evalPlace_field_union_and_offset_panic`).
 
 ## Step 0: environment
 
@@ -184,6 +186,6 @@ Pass: four lines of the form
 ```text
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
 [SIMULATION-AUDIT] decls=83 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
-[WITNESS-AUDIT] decls=200 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-MiniRustSpec.Audit: exhaustively verified standard axioms for 9216 declarations across all MiniRustSpec.* modules
+[WITNESS-AUDIT] decls=202 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+MiniRustSpec.Audit: exhaustively verified standard axioms for 9226 declarations across all MiniRustSpec.* modules
 ```

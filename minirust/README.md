@@ -446,9 +446,12 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `BinOp::IntWithOverflow` on `INT_MAX + 1`, `INT_MIN - 1`, `UINT_MAX + 1`,
   `0 - 1`, multiplication overflow, and a non-integer operand (`specPanic`),
   `Machine::ptr_offset_inbounds` in-bounds and out-of-bounds UB,
-  `ValueExpr::Tuple`, and `PlaceExpr::Field` (including `specPanic`s on invalid
-  field indices, missing unsized tail, and non-projectable types;
-  `withOverflow_i8_layout`, ..., `evalPlace_field_panics`); and of
+  `ValueExpr::Tuple`, and `PlaceExpr::Field` (including `Type::Union` field
+  projections, `specPanic`s on invalid field indices, missing unsized tail,
+  out-of-bounds field offset, and non-projectable types, and
+  `IntType::with_overflow` / `BinOp::IntWithOverflow` across `u8`, `i8`, `i16`,
+  `u16`, `i32`, `u32`, `i64`, `u64`, `i128`, and `u128`;
+  `withOverflow_i8_layout`, ..., `evalPlace_field_union_and_offset_panic`); and of
   the representation of
   enums, tuples, unions, slices, and trait objects: exactly the bytes `0`, `1`,
   `255` are valid at `orderingTy` (`ordering_validTags`), decoding, encoding,
