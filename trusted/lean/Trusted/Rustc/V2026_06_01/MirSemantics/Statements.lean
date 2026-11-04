@@ -796,27 +796,32 @@ def evalStmt
         layouts
         s.memory.callerLocals
     with
-    | .ok (.ptr ptrVal _) locals' =>
-      match lookupBorrow s.memory.borrows ptrVal.tag with
-      | .some entry =>
-        match entry.perm with
-        | .disabled => MirStepNode.fail .ub
-        | _ =>
-          match retagKind with
-          | .fnEntry =>
-            let protId := s.memory.nextProtector
-            let borrows' :=
-              attachBorrowProtector s.memory.borrows ptrVal.tag protId
-            let mem' : Memory := {
-              s.memory with
-              borrows := borrows'
-              activeProtectors := protId :: s.memory.activeProtectors
-              nextProtector := Nat.add protId 1
-            }
-            MirStepNode.step (advanceStmt s locals' mem')
-          | _ => MirStepNode.step (advanceStmt s locals')
+    | .ok ptrOrFatVal locals' =>
+      match extractDerefPtrVal? ptrOrFatVal with
+      | .some ptrVal =>
+        match lookupBorrow s.memory.borrows ptrVal.tag with
+        | .some entry =>
+          match entry.perm with
+          | .disabled => MirStepNode.fail .ub
+          | _ =>
+            match retagKind with
+            | .fnEntry =>
+              let protId := s.memory.nextProtector
+              let borrows' :=
+                attachBorrowProtector s.memory.borrows ptrVal.tag protId
+              let mem' : Memory := {
+                s.memory with
+                borrows := borrows'
+                activeProtectors := protId :: s.memory.activeProtectors
+                nextProtector := Nat.add protId 1
+              }
+              MirStepNode.step (advanceStmt s locals' mem')
+            | _ => MirStepNode.step (advanceStmt s locals')
+        | .none =>
+          match lookupGlobalAlloc s.memory.globals ptrVal.allocId with
+          | .some _ => MirStepNode.step (advanceStmt s locals')
+          | .none => MirStepNode.fail .ub
       | .none => MirStepNode.fail .ub
-    | .ok _ _ => MirStepNode.fail .ub
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
   | .storageLive loc =>

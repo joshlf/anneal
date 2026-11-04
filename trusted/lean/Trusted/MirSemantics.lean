@@ -60,12 +60,17 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   appendValueList replaceSubslice
   setOrExtendFields writeProjectedValue
   sliceConstElemKind isScalarCompatibleProj uintRigidTyOfStride
+  inferElemListByteStride byteOffsetToElemIdx?
   evalGlobalDerefRead evalSliceFatPtrDerefRead evalPlaceRead
-  evalOperand evalOperands writePlaceValue evalByteCast
+  evalOperand evalOperands
+  extractDerefPtrVal? writeSliceFatPtrTargetValue
+  writePlaceValue evalByteCast
   unsizeArrayToSliceSpec? evalUnsizeCoercion
   resolveBorrowProjectionElems rigidTyIsFreeze tyIsFreeze sharedBorrowPerm
-  splitLastDeref? evalPlaceLen pointeeElemByteStride valueDefaultByteSize
-  ptrAllocByteBound? evalBinOpOffset evalPtrOffsetBinOp
+  splitLastDeref? evalPlaceLen
+  findDeclTyWithKind? pointeeElemByteStride valueDefaultByteSize
+  projectedValueDefaultByteSize ptrAllocByteBound?
+  evalBinOpOffset evalPtrOffsetBinOp evalSliceFatPtrDerefBorrow
   evalRvalue evalRvalueWithMemory advanceStmt projectionsOverlap appendValues
   spliceValues sameRigidTyShape operandPointeeTy evalCopySingleDirect
   evalCopyNonOverlappingWithCount evalCopyNonOverlapping

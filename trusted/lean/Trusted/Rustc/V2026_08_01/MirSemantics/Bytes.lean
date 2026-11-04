@@ -326,7 +326,9 @@ def globalAllocSliceToAbstractBytes
     (alloc : CapturedAllocation)
     (offset len : Nat) :
     Option (List AbstractByte) :=
-  globalAllocBytesAux alloc.bytes alloc.relocations offset len
+  match Nat.ble offset (length alloc.bytes) with
+  | false => .none
+  | true => globalAllocBytesAux alloc.bytes alloc.relocations offset len
 
 /--
 Test whether `code` is a valid Unicode scalar value (`0x0000..=0xD7FF` or

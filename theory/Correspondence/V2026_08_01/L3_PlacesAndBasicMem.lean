@@ -798,4 +798,61 @@ theorem mir_structural_completeness_brief_1_4_corresponds
       .ok (.scalar ⟨0, 8⟩) [.init (.ptr ptrVal ptrSz)] mem := by
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/--
+**Theorem L3.22 (`mir_slice_fat_ptr_write_reborrow_retag_and_edge_cases_corresponds`)**:
+Universal characterization of `B1` hardening for `BRIEF-1.4`.
+-/
+theorem mir_slice_fat_ptr_write_reborrow_retag_and_edge_cases_corresponds
+    (v0 v1 v2 w1 : Value) (binderTy : Ty) :
+    let alloc2 : CapturedAllocation := {
+      allocId := 7
+      bytes := [.some 10, .some 20]
+      relocations := .nil
+      align := ⟨1⟩
+      mutability := .not
+    }
+    let slicePtr : ProvenancePtr := { allocId := 1, offsetBytes := 0 }
+    let sliceFatVal : Value := .aggregate 0 [.ptr slicePtr 8, .scalar ⟨2, 8⟩]
+    let reborrowedFatVal : Value :=
+      .aggregate 0 [.ptr { allocId := 2, offsetBytes := 0 } 8, .scalar ⟨2, 8⟩]
+    let activeBorrows : List BorrowEntry :=
+      [{ tag := 1, targetLocal := 0, targetProjection := .nil, perm := .active }]
+    let reborrowedEntry : BorrowEntry :=
+      { tag := 2, targetLocal := 0, targetProjection := .nil, perm := .frozen }
+    let locals3 : List LocalSlot :=
+      [.init (.aggregate 0 [v0, v1, v2]), .init sliceFatVal]
+    let memActive : Memory :=
+      { emptyMemory with borrows := activeBorrows, nextTag := 2 }
+    let memReborrowed : Memory :=
+      { emptyMemory with borrows := reborrowedEntry :: activeBorrows, nextTag := 3 }
+    let zstArr0Decl : List LocalDecl :=
+      [{ mutability := .not, ty := { kind := .array (.tuple .nil) 0, layoutIdx := 0 }, debugName := "" }]
+    -- 1. 0-byte global slice bounds check at offset = len vs offset > len
+    globalAllocSliceToAbstractBytes alloc2 2 0 = .some [] ∧
+    globalAllocSliceToAbstractBytes alloc2 3 0 = .none ∧
+    -- 2. ConstValue.slice (.int s) normalizes to Value.ptr fat pointer
+    evalConstValue (.slice (.int ⟨4, 8⟩) 0) =
+      .some (.aggregate 0 [.ptr { allocId := 0, offsetBytes := 4 } 8, .scalar ⟨0, 8⟩]) ∧
+    -- 3. Dereferenced slice fat-pointer write: in-bounds (idx = 1 < 2) vs OOB (idx = 2 >= 2)
+    writePlaceValue locals3 activeBorrows { local_ := 1, projection := [.deref, .constantIndex 1 0 false] } w1 =
+      .ok [.init (.aggregate 0 [v0, w1, v2]), .init sliceFatVal] ∧
+    writePlaceValue locals3 activeBorrows { local_ := 1, projection := [.deref, .constantIndex 2 0 false] } w1 =
+      .ub ∧
+    -- 4. Slice fat-pointer raw reborrow (&raw const *_1) and OOB element borrow (&(*_1)[2])
+    evalRvalue locals3 (.rawPtr .not { local_ := 1, projection := [.deref] }) memActive =
+      .ok reborrowedFatVal locals3 memReborrowed ∧
+    evalRvalue locals3 (.ref .shared { local_ := 1, projection := [.deref, .constantIndex 2 0 false] }) memActive =
+      .ub ∧
+    -- 5. Rvalue.len on Value.unit ([T; 0]) and [.deref, .unwrapUnsafeBinder]
+    evalRvalue [.init .unit] (.len { local_ := 0, projection := .nil }) emptyMemory zstArr0Decl =
+      .ok (.scalar ⟨0, 8⟩) [.init .unit] emptyMemory ∧
+    evalRvalue [.init sliceFatVal]
+      (.len { local_ := 0, projection := [.deref, .unwrapUnsafeBinder binderTy] }) emptyMemory =
+      .ok (.scalar ⟨2, 8⟩) [.init sliceFatVal] emptyMemory ∧
+    -- 6. BinOp.offset 0-byte vs non-zero offset on dangling pointer (allocId = 0, bound = 0)
+    evalBinOpOffset { allocId := 0, offsetBytes := 4 } 8 ⟨0, 8⟩ 4 (.some 0) =
+      .some { allocId := 0, offsetBytes := 4 } ∧
+    evalBinOpOffset { allocId := 0, offsetBytes := 4 } 8 ⟨1, 8⟩ 4 (.some 0) = .none := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 end Correspondence.V2026_08_01.L3_PlacesAndBasicMem
