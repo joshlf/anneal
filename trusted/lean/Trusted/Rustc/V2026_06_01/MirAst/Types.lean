@@ -1138,7 +1138,12 @@ def RigidTy.computeLayout
           fields := .arbitrary offsets memIdx
           variants := .single 0
           isUninhabited := uninh }
-  | _ => origLayout
+  | .slice _ => origLayout
+  | .str => origLayout
+  | .dynamic _ => origLayout
+  | .alias _ _ => origLayout
+  | .foreign _ => origLayout
+  | .other _ => origLayout
 
 /--
 Compute concrete `TypeLayout`s for a list of `RigidTy` elements.
