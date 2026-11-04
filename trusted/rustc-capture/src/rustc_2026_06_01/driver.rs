@@ -26,7 +26,7 @@ use crate::manifest::{
     sha256_hex,
 };
 use crate::rustc_2026_06_01::mir_lower::{
-    CrateContractIndex, ItemClassification, canonical_def_path, collect_referenced_def_ids,
+    CrateContractIndex, ItemClassification, canonical_def_path, collect_referenced_callees,
     def_id_sort_key, lower_mir_body, query_post_cleanup_mir, should_capture_mir_item,
     should_capture_non_local_callee,
 };
@@ -327,8 +327,13 @@ fn capture_crate_unit<'tcx>(
 
     let crate_pascal = to_pascal_case(&crate_name);
     let mut unit_targets = Vec::with_capacity(candidates.len());
-    let mut visited_non_local: BTreeSet<(u32, u32)> = BTreeSet::new();
-    let mut worklist: VecDeque<DefId> = VecDeque::new();
+    let mut emitted_non_local: BTreeSet<(u32, u32)> = BTreeSet::new();
+    let mut visited_worklist_substs: BTreeMap<
+        (u32, u32),
+        Vec<Option<rustc_middle::ty::GenericArgsRef<'tcx>>>,
+    > = BTreeMap::new();
+    let mut worklist: VecDeque<(DefId, Option<rustc_middle::ty::GenericArgsRef<'tcx>>)> =
+        VecDeque::new();
 
     for candidate in candidates {
         let def_id = candidate.local_def_id.to_def_id();
@@ -340,11 +345,15 @@ fn capture_crate_unit<'tcx>(
                 | CapturedItemKind::Model
                 | CapturedItemKind::UnsafeTraitImpl
         ) {
-            for callee_def_id in collect_referenced_def_ids(tcx, def_id, body) {
-                if should_capture_non_local_callee(tcx, callee_def_id)
-                    && visited_non_local.insert(def_id_sort_key(callee_def_id))
-                {
-                    worklist.push_back(callee_def_id);
+            for (callee_def_id, opt_substs) in collect_referenced_callees(tcx, def_id, body, None) {
+                if should_capture_non_local_callee(tcx, callee_def_id) {
+                    let seen_substs = visited_worklist_substs
+                        .entry(def_id_sort_key(callee_def_id))
+                        .or_default();
+                    if seen_substs.len() < 16 && !seen_substs.contains(&opt_substs) {
+                        seen_substs.push(opt_substs);
+                        worklist.push_back((callee_def_id, opt_substs));
+                    }
                 }
             }
         }
@@ -412,17 +421,26 @@ fn capture_crate_unit<'tcx>(
         used_stems_by_crate.insert(crate_pascal.clone(), used_item_stems);
         next_stem_suffix_by_crate.insert(crate_pascal.clone(), next_stem_suffix);
 
-        while let Some(callee_def_id) = worklist.pop_front() {
+        while let Some((callee_def_id, opt_substs)) = worklist.pop_front() {
             if !should_capture_non_local_callee(tcx, callee_def_id) {
                 continue;
             }
             let body = tcx.optimized_mir(callee_def_id);
-            for next_def_id in collect_referenced_def_ids(tcx, callee_def_id, body) {
-                if should_capture_non_local_callee(tcx, next_def_id)
-                    && visited_non_local.insert(def_id_sort_key(next_def_id))
-                {
-                    worklist.push_back(next_def_id);
+            for (next_def_id, next_substs) in
+                collect_referenced_callees(tcx, callee_def_id, body, opt_substs)
+            {
+                if should_capture_non_local_callee(tcx, next_def_id) {
+                    let seen_substs = visited_worklist_substs
+                        .entry(def_id_sort_key(next_def_id))
+                        .or_default();
+                    if seen_substs.len() < 16 && !seen_substs.contains(&next_substs) {
+                        seen_substs.push(next_substs);
+                        worklist.push_back((next_def_id, next_substs));
+                    }
                 }
+            }
+            if !emitted_non_local.insert(def_id_sort_key(callee_def_id)) {
+                continue;
             }
 
             let callee_crate_name = tcx.crate_name(callee_def_id.krate).as_str().to_owned();

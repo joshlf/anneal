@@ -1562,7 +1562,15 @@ pub fn check_range_contains(r: &Range<usize>, idx: &usize) -> bool {
             .iter()
             .map(|t| t.target.def_id.as_str())
             .collect();
-        for required_sub in ["len", "as_ptr", "from_raw_parts_mut", "split_at_mut", "contains"] {
+        for required_sub in [
+            "len",
+            "as_ptr",
+            "from_raw_parts_mut",
+            "split_at_mut",
+            "contains",
+            "start_bound",
+            "end_bound",
+        ] {
             assert!(
                 core_def_ids.iter().any(|id| id.contains(required_sub)),
                 "expected sysroot core targets to include `{required_sub}`, got: {core_def_ids:?}"
