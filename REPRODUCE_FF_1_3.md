@@ -62,14 +62,17 @@ fixed-width `BitVec (8 * sz)` representations.
    - Pure scalar evaluators `evalBinOp`, `evalBinOpChecked`, `evalUnOp`, and
      `evalCastValue` mirroring `Trusted.Rustc.V2026_06_01.MirSemantics`.
    - Closed-form `@[simp]` lemmas for `evalBinOp`, `evalScalarBinOp`,
-     `evalCastValue`, `evalExactDiv`, and `evalScalarExactDiv` across `.bitAnd`,
-     `.bitOr`, `.bitXor`, `.shl`, `.shr` (both unsigned logical and signed
-     two's-complement arithmetic), `.shlUnchecked` / `.shrUnchecked` (both
-     in-bounds `< 8 * sz` and out-of-bounds UB `8 * sz ≤ b`), wrapping/checked
-     arithmetic (`.add`, `.sub`, `.mul`, `.div`, `.rem`), and comparisons
-     (`.eq`, `.ne`, `.lt`, `.le`, `.gt`, `.ge`), including width-specialized
-     lemmas for `u8`, `u16`, `u32`, `u64`, `u128`, `usize`, `i8`, `i16`, `i32`,
-     `i64`, `i128`, and `isize`.
+     `evalBinOpChecked`, `evalUnOp`, `evalCastValue`, `evalExactDiv`, and
+     `evalScalarExactDiv` across `.bitAnd`, `.bitOr`, `.bitXor`, `.shl`, `.shr`
+     (both unsigned logical and signed two's-complement arithmetic),
+     `.shlUnchecked` / `.shrUnchecked` (both in-bounds `< 8 * sz` and
+     out-of-bounds UB `8 * sz ≤ b`), wrapping/checked/unchecked arithmetic
+     (`.add`, `.sub`, `.mul`, `.addWithOverflow`, `.subWithOverflow`,
+     `.mulWithOverflow`, `.addUnchecked`, `.subUnchecked`, `.mulUnchecked`,
+     `.div`, `.rem`), unary operations (`.not`, `.neg`), and comparisons (`.eq`,
+     `.ne`, `.lt`, `.le`, `.gt`, `.ge`), including width-specialized lemmas for
+     `u8`, `u16`, `u32`, `u64`, `u128`, `usize`, `i8`, `i16`, `i32`, `i64`,
+     `i128`, and `isize`.
    - `BitVec (8 * sz)` homomorphism theorems (`evalBinOp_ofBitVec_*`,
      `evalExactDiv_ofBitVec_unsigned`, `evalBinOpChecked_ofBitVec_*`,
      `evalUnOp_ofBitVec_*`, `evalCastValue_ofBitVec_*`).

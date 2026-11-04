@@ -1367,22 +1367,54 @@ theorem evalBinOp_shrUnchecked_of_ge {szL szR a b : Nat}
 
 /-- Closed-form `@[simp]` lemmas for `evalBinOp` arithmetic and comparison operators. -/
 
+private theorem sub_mod_eq_add_mod_sub_mod {a b m : Nat} (hm : 0 < m) (hba : b ≤ a) :
+    (a - b) % m = (m + (a % m) - (b % m)) % m := by
+  have ha := Nat.div_add_mod a m
+  have hb := Nat.div_add_mod b m
+  have hra : a % m < m := Nat.mod_lt a hm
+  have hrb : b % m < m := Nat.mod_lt b hm
+  cases Nat.lt_or_ge (a % m) (b % m) with
+  | inr hle =>
+    have hq : b / m ≤ a / m := Nat.div_le_div_right hba
+    have hmul : m * (b / m) ≤ m * (a / m) := Nat.mul_le_mul_left m hq
+    have h1 : a - b = m * (a / m - b / m) + (a % m - b % m) := by
+      rw [Nat.mul_sub]
+      omega
+    have h2 : m + (a % m) - (b % m) = m + (a % m - b % m) := by omega
+    rw [h1, h2, Nat.mul_add_mod_self_left, Nat.add_mod_left]
+  | inl hgt =>
+    have hq : b / m + 1 ≤ a / m := by
+      cases Nat.lt_or_ge (a / m) (b / m + 1) with
+      | inl hlt =>
+        have hle_q : a / m ≤ b / m := by omega
+        have hmul : m * (a / m) ≤ m * (b / m) := Nat.mul_le_mul_left m hle_q
+        omega
+      | inr hge => exact hge
+    have hmul : m * (b / m + 1) ≤ m * (a / m) := Nat.mul_le_mul_left m hq
+    rw [Nat.mul_add, Nat.mul_one] at hmul
+    have h1 : a - b = m * (a / m - (b / m + 1)) + (m + (a % m) - (b % m)) := by
+      rw [Nat.mul_sub, Nat.mul_add, Nat.mul_one]
+      omega
+    rw [h1, Nat.mul_add_mod_self_left]
+
+private theorem mod_sub_mod_eq_add_mod_sub_mod {a b m : Nat}
+    (_hm : 0 < m) (hle : b % m ≤ a % m) :
+    (a % m - b % m) % m = (m + (a % m) - (b % m)) % m := by
+  have h1 : m + (a % m) - (b % m) = m + (a % m - b % m) := by omega
+  rw [h1, Nat.add_mod_left]
+
 @[simp]
 theorem evalBinOp_sub_apply {sz a b : Nat} (hsz : 0 < sz) (isSigned : Bool) :
     evalBinOp .sub ⟨a, sz⟩ ⟨b, sz⟩ isSigned =
-      .some ⟨if b ≤ a then (a - b) % (2 ^ (8 * sz))
-             else (2 ^ (8 * sz) + (a % (2 ^ (8 * sz))) - (b % (2 ^ (8 * sz)))) % (2 ^ (8 * sz)), sz⟩ := by
+      .some ⟨(2 ^ (8 * sz) + (a % (2 ^ (8 * sz))) - (b % (2 ^ (8 * sz)))) % (2 ^ (8 * sz)), sz⟩ := by
   unfold evalBinOp
-  simp [beq_zero_eq_false_of_pos hsz]
-  cases h_ble : Nat.ble b a
-  · have h_not_le : ¬ (b ≤ a) := by
-      intro h_le
-      have h_ble_true := Nat.ble_eq_true_of_le h_le
-      rw [h_ble_true] at h_ble
-      contradiction
-    simp [h_not_le]
-  · have h_le : b ≤ a := Nat.le_of_ble_eq_true h_ble
-    simp [h_le]
+  simp only [beq_zero_eq_false_of_pos hsz, Nat.beq_refl]
+  cases h_ble : Nat.ble b a with
+  | false => rfl
+  | true =>
+    dsimp only
+    congr 1; congr 1
+    exact sub_mod_eq_add_mod_sub_mod (Nat.two_pow_pos (8 * sz)) (Nat.le_of_ble_eq_true h_ble)
 
 @[simp]
 theorem evalBinOp_add_apply {sz a b : Nat} (hsz : 0 < sz) (isSigned : Bool) :
@@ -1443,22 +1475,20 @@ theorem evalBinOp_subUnchecked_apply_signed {sz a b : Nat} (hsz : 0 < sz) :
       match signedOverflowSub a b sz with
       | true => .none
       | false =>
-        let ca := a % (2 ^ (8 * sz))
-        let cb := b % (2 ^ (8 * sz))
-        .some ⟨if cb ≤ ca then (ca - cb) % (2 ^ (8 * sz))
-               else (2 ^ (8 * sz) + ca - cb) % (2 ^ (8 * sz)), sz⟩ := by
+        .some ⟨(2 ^ (8 * sz) + (a % (2 ^ (8 * sz))) - (b % (2 ^ (8 * sz)))) % (2 ^ (8 * sz)), sz⟩ := by
   unfold evalBinOp
-  simp [beq_zero_eq_false_of_pos hsz]
-  cases h_ovf : signedOverflowSub a b sz <;> simp
-  cases h_ble : Nat.ble (b % (2 ^ (8 * sz))) (a % (2 ^ (8 * sz)))
-  · have h_not_le : ¬ (b % (2 ^ (8 * sz)) ≤ a % (2 ^ (8 * sz))) := by
-      intro h_le
-      have h_ble_true := Nat.ble_eq_true_of_le h_le
-      rw [h_ble_true] at h_ble
-      contradiction
-    simp [h_not_le]
-  · have h_le : b % (2 ^ (8 * sz)) ≤ a % (2 ^ (8 * sz)) := Nat.le_of_ble_eq_true h_ble
-    simp [h_le]
+  simp only [beq_zero_eq_false_of_pos hsz, Nat.beq_refl]
+  cases h_ovf : signedOverflowSub a b sz with
+  | true => rfl
+  | false =>
+    dsimp only
+    cases h_ble : Nat.ble (b % (2 ^ (8 * sz))) (a % (2 ^ (8 * sz))) with
+    | false => rfl
+    | true =>
+      dsimp only
+      congr 1; congr 1
+      exact mod_sub_mod_eq_add_mod_sub_mod
+        (Nat.two_pow_pos (8 * sz)) (Nat.le_of_ble_eq_true h_ble)
 
 @[simp]
 theorem evalBinOp_mulUnchecked_apply_unsigned {sz a b : Nat} (hsz : 0 < sz) :
@@ -1501,80 +1531,38 @@ theorem evalBinOpChecked_addWithOverflow_apply {sz a b : Nat} (hsz : 0 < sz) (is
 @[simp]
 theorem evalBinOpChecked_sub_apply {sz a b : Nat} (hsz : 0 < sz) (isSigned : Bool) :
     evalBinOpChecked .sub ⟨a, sz⟩ ⟨b, sz⟩ isSigned =
-      .some (
-        match isSigned with
-        | false =>
-          if b ≤ a then ⟨(a - b) % (2 ^ (8 * sz)), sz⟩
-          else ⟨(2 ^ (8 * sz) + (a % (2 ^ (8 * sz))) - (b % (2 ^ (8 * sz)))) % (2 ^ (8 * sz)), sz⟩
-        | true =>
-          let ca := a % (2 ^ (8 * sz))
-          let cb := b % (2 ^ (8 * sz))
-          if cb ≤ ca then ⟨(ca - cb) % (2 ^ (8 * sz)), sz⟩
-          else ⟨(2 ^ (8 * sz) + ca - cb) % (2 ^ (8 * sz)), sz⟩,
-        match isSigned with
-        | false => Bool.not (Nat.ble b a)
-        | true => signedOverflowSub a b sz
-      ) := by
+      .some (⟨(2 ^ (8 * sz) + (a % (2 ^ (8 * sz))) - (b % (2 ^ (8 * sz)))) % (2 ^ (8 * sz)), sz⟩,
+             match isSigned with
+             | false => Bool.not (Nat.ble b a)
+             | true => signedOverflowSub a b sz) := by
   unfold evalBinOpChecked
-  simp [beq_zero_eq_false_of_pos hsz]
-  cases isSigned <;> simp
-  · cases h_ble : Nat.ble b a
-    · have h_not_le : ¬ (b ≤ a) := by
-        intro h_le
-        have h_ble_true := Nat.ble_eq_true_of_le h_le
-        rw [h_ble_true] at h_ble
-        contradiction
-      simp [h_not_le]
-    · have h_le : b ≤ a := Nat.le_of_ble_eq_true h_ble
-      simp [h_le]
-  · cases h_ble : Nat.ble (b % (2 ^ (8 * sz))) (a % (2 ^ (8 * sz)))
-    · have h_not_le : ¬ (b % (2 ^ (8 * sz)) ≤ a % (2 ^ (8 * sz))) := by
-        intro h_le
-        have h_ble_true := Nat.ble_eq_true_of_le h_le
-        rw [h_ble_true] at h_ble
-        contradiction
-      simp [h_not_le]
-    · have h_le : b % (2 ^ (8 * sz)) ≤ a % (2 ^ (8 * sz)) := Nat.le_of_ble_eq_true h_ble
-      simp [h_le]
+  simp only [beq_zero_eq_false_of_pos hsz, Nat.beq_refl, Bool.not_true, Bool.or_false]
+  cases isSigned with
+  | false =>
+    cases h_ble : Nat.ble b a with
+    | false => rfl
+    | true =>
+      dsimp only
+      congr 1; congr 1; congr 1
+      exact sub_mod_eq_add_mod_sub_mod (Nat.two_pow_pos (8 * sz)) (Nat.le_of_ble_eq_true h_ble)
+  | true =>
+    dsimp only
+    cases h_ble : Nat.ble (b % (2 ^ (8 * sz))) (a % (2 ^ (8 * sz))) with
+    | false => rfl
+    | true =>
+      dsimp only
+      congr 1; congr 1; congr 1
+      exact mod_sub_mod_eq_add_mod_sub_mod
+        (Nat.two_pow_pos (8 * sz)) (Nat.le_of_ble_eq_true h_ble)
 
 @[simp]
 theorem evalBinOpChecked_subWithOverflow_apply {sz a b : Nat} (hsz : 0 < sz) (isSigned : Bool) :
     evalBinOpChecked .subWithOverflow ⟨a, sz⟩ ⟨b, sz⟩ isSigned =
-      .some (
-        match isSigned with
-        | false =>
-          if b ≤ a then ⟨(a - b) % (2 ^ (8 * sz)), sz⟩
-          else ⟨(2 ^ (8 * sz) + (a % (2 ^ (8 * sz))) - (b % (2 ^ (8 * sz)))) % (2 ^ (8 * sz)), sz⟩
-        | true =>
-          let ca := a % (2 ^ (8 * sz))
-          let cb := b % (2 ^ (8 * sz))
-          if cb ≤ ca then ⟨(ca - cb) % (2 ^ (8 * sz)), sz⟩
-          else ⟨(2 ^ (8 * sz) + ca - cb) % (2 ^ (8 * sz)), sz⟩,
-        match isSigned with
-        | false => Bool.not (Nat.ble b a)
-        | true => signedOverflowSub a b sz
-      ) := by
-  unfold evalBinOpChecked
-  simp [beq_zero_eq_false_of_pos hsz]
-  cases isSigned <;> simp
-  · cases h_ble : Nat.ble b a
-    · have h_not_le : ¬ (b ≤ a) := by
-        intro h_le
-        have h_ble_true := Nat.ble_eq_true_of_le h_le
-        rw [h_ble_true] at h_ble
-        contradiction
-      simp [h_not_le]
-    · have h_le : b ≤ a := Nat.le_of_ble_eq_true h_ble
-      simp [h_le]
-  · cases h_ble : Nat.ble (b % (2 ^ (8 * sz))) (a % (2 ^ (8 * sz)))
-    · have h_not_le : ¬ (b % (2 ^ (8 * sz)) ≤ a % (2 ^ (8 * sz))) := by
-        intro h_le
-        have h_ble_true := Nat.ble_eq_true_of_le h_le
-        rw [h_ble_true] at h_ble
-        contradiction
-      simp [h_not_le]
-    · have h_le : b % (2 ^ (8 * sz)) ≤ a % (2 ^ (8 * sz)) := Nat.le_of_ble_eq_true h_ble
-      simp [h_le]
+      .some (⟨(2 ^ (8 * sz) + (a % (2 ^ (8 * sz))) - (b % (2 ^ (8 * sz)))) % (2 ^ (8 * sz)), sz⟩,
+             match isSigned with
+             | false => Bool.not (Nat.ble b a)
+             | true => signedOverflowSub a b sz) := by
+  exact evalBinOpChecked_sub_apply hsz isSigned
 
 @[simp]
 theorem evalBinOpChecked_mul_apply {sz a b : Nat} (hsz : 0 < sz) (isSigned : Bool) :
@@ -1731,6 +1719,29 @@ theorem evalCastValue_signed_of_le {sz dstBytes a : Nat}
     evalCastValue ⟨a, sz⟩ dstBytes true =
       .some ⟨a % (2 ^ (8 * dstBytes)), dstBytes⟩ := by
   rw [evalCastValue_signed_apply hsz hdst, toNat_signExtend_ofNat_of_le (by omega)]
+
+/-- Closed-form `@[simp]` lemmas for `evalUnOp` (`.not` and `.neg`). -/
+@[simp]
+theorem evalUnOp_not_int_apply {sz a : Nat} (hsz : 0 < sz) :
+    evalUnOp .not ⟨a, sz⟩ false =
+      .some ⟨2 ^ (8 * sz) - 1 - a % (2 ^ (8 * sz)), sz⟩ := by
+  unfold evalUnOp
+  simp [beq_zero_eq_false_of_pos hsz]
+
+@[simp]
+theorem evalUnOp_not_bool_zero :
+    evalUnOp .not ⟨0, 1⟩ true = .some ⟨1, 1⟩ := rfl
+
+@[simp]
+theorem evalUnOp_not_bool_one :
+    evalUnOp .not ⟨1, 1⟩ true = .some ⟨0, 1⟩ := rfl
+
+@[simp]
+theorem evalUnOp_neg_apply {sz a : Nat} (hsz : 0 < sz) (isBool : Bool) :
+    evalUnOp .neg ⟨a, sz⟩ isBool =
+      .some ⟨(2 ^ (8 * sz) - a % (2 ^ (8 * sz))) % (2 ^ (8 * sz)), sz⟩ := by
+  unfold evalUnOp
+  simp [beq_zero_eq_false_of_pos hsz]
 
 /-- Concrete width-specialized `@[simp]` lemmas for `u8`, `u16`, `u32`, `u64`, `u128`, `usize`, and `i8`, `i16`, `i32`, `i64`, `i128`, `isize`. -/
 @[simp] theorem evalBinOp_bitAnd_u8 (a b : Nat) (s : Bool) :
@@ -2089,19 +2100,17 @@ theorem evalScalarBinOp_shrUnchecked_of_ge {szL szR a b : Nat}
 theorem evalScalarBinOp_sub {sz a b : Nat} (hsz : 0 < sz)
     (locals : List LocalSlot) (mem : Memory) (isSigned : Bool) :
     evalScalarBinOp .sub ⟨a, sz⟩ ⟨b, sz⟩ locals mem isSigned =
-      .ok (.scalar ⟨if b ≤ a then (a - b) % (2 ^ (8 * sz))
-             else (2 ^ (8 * sz) + (a % (2 ^ (8 * sz))) - (b % (2 ^ (8 * sz)))) % (2 ^ (8 * sz)), sz⟩) locals mem := by
+      .ok (.scalar ⟨(2 ^ (8 * sz) + (a % (2 ^ (8 * sz))) - (b % (2 ^ (8 * sz)))) % (2 ^ (8 * sz)), sz⟩)
+        locals mem := by
   unfold evalScalarBinOp
-  simp [beq_zero_eq_false_of_pos hsz]
-  cases h_ble : Nat.ble b a
-  · have h_not_le : ¬ (b ≤ a) := by
-      intro h_le
-      have h_ble_true := Nat.ble_eq_true_of_le h_le
-      rw [h_ble_true] at h_ble
-      contradiction
-    simp [h_not_le]
-  · have h_le : b ≤ a := Nat.le_of_ble_eq_true h_ble
-    simp [h_le]
+  simp only [beq_zero_eq_false_of_pos hsz, Nat.beq_refl,
+             wrapScalarBits_eq_mod_modulus, scalarModulus_eq_two_pow]
+  cases h_ble : Nat.ble b a with
+  | false => rfl
+  | true =>
+    dsimp only
+    congr 2; congr 1
+    exact sub_mod_eq_add_mod_sub_mod (Nat.two_pow_pos (8 * sz)) (Nat.le_of_ble_eq_true h_ble)
 
 @[simp]
 theorem evalScalarBinOp_addUnchecked_unsigned {sz a b : Nat} (hsz : 0 < sz)
@@ -2154,24 +2163,22 @@ theorem evalScalarBinOp_subUnchecked_signed {sz a b : Nat} (hsz : 0 < sz)
       match signedOverflowSub a b sz with
       | true => .ub
       | false =>
-        let ca := a % (2 ^ (8 * sz))
-        let cb := b % (2 ^ (8 * sz))
-        .ok (.scalar ⟨if cb ≤ ca then (ca - cb) % (2 ^ (8 * sz))
-               else (2 ^ (8 * sz) + ca - cb) % (2 ^ (8 * sz)), sz⟩) locals mem := by
+        .ok (.scalar ⟨(2 ^ (8 * sz) + (a % (2 ^ (8 * sz))) - (b % (2 ^ (8 * sz)))) % (2 ^ (8 * sz)), sz⟩)
+          locals mem := by
   unfold evalScalarBinOp
-  simp [beq_zero_eq_false_of_pos hsz]
-  cases h_ovf : signedOverflowSub a b sz
-  · simp
-    cases h_ble : Nat.ble (b % (2 ^ (8 * sz))) (a % (2 ^ (8 * sz)))
-    · have h_not_le : ¬ (b % (2 ^ (8 * sz)) ≤ a % (2 ^ (8 * sz))) := by
-        intro h_le
-        have h_ble_true := Nat.ble_eq_true_of_le h_le
-        rw [h_ble_true] at h_ble
-        contradiction
-      simp [h_not_le]
-    · have h_le : b % (2 ^ (8 * sz)) ≤ a % (2 ^ (8 * sz)) := Nat.le_of_ble_eq_true h_ble
-      simp [h_le]
-  · rfl
+  simp only [beq_zero_eq_false_of_pos hsz, Nat.beq_refl,
+             wrapScalarBits_eq_mod_modulus, scalarModulus_eq_two_pow]
+  cases h_ovf : signedOverflowSub a b sz with
+  | true => rfl
+  | false =>
+    dsimp only
+    cases h_ble : Nat.ble (b % (2 ^ (8 * sz))) (a % (2 ^ (8 * sz))) with
+    | false => rfl
+    | true =>
+      dsimp only
+      congr 2; congr 1
+      exact mod_sub_mod_eq_add_mod_sub_mod
+        (Nat.two_pow_pos (8 * sz)) (Nat.le_of_ble_eq_true h_ble)
 
 @[simp]
 theorem evalScalarBinOp_mulUnchecked_unsigned {sz a b : Nat} (hsz : 0 < sz)
@@ -2194,6 +2201,67 @@ theorem evalScalarBinOp_mulUnchecked_signed {sz a b : Nat} (hsz : 0 < sz)
   unfold evalScalarBinOp
   simp [beq_zero_eq_false_of_pos hsz]
   cases signedOverflowMul a b sz <;> rfl
+
+@[simp]
+theorem evalScalarBinOp_addWithOverflow {sz a b : Nat} (hsz : 0 < sz)
+    (locals : List LocalSlot) (mem : Memory) (isSigned : Bool) :
+    evalScalarBinOp .addWithOverflow ⟨a, sz⟩ ⟨b, sz⟩ locals mem isSigned =
+      .ok (.aggregate 0
+        [.scalar ⟨(a + b) % (2 ^ (8 * sz)), sz⟩,
+         .scalar ⟨match isSigned with
+                  | false => match Nat.ble (2 ^ (8 * sz)) (a + b) with | true => 1 | false => 0
+                  | true => match signedOverflowAdd a b sz with | true => 1 | false => 0, 1⟩])
+        locals mem := by
+  unfold evalScalarBinOp
+  simp only [beq_zero_eq_false_of_pos hsz, Nat.beq_refl,
+             wrapScalarBits_eq_mod_modulus, scalarModulus_eq_two_pow]
+  rfl
+
+@[simp]
+theorem evalScalarBinOp_subWithOverflow {sz a b : Nat} (hsz : 0 < sz)
+    (locals : List LocalSlot) (mem : Memory) (isSigned : Bool) :
+    evalScalarBinOp .subWithOverflow ⟨a, sz⟩ ⟨b, sz⟩ locals mem isSigned =
+      .ok (.aggregate 0
+        [.scalar ⟨(2 ^ (8 * sz) + (a % (2 ^ (8 * sz))) - (b % (2 ^ (8 * sz)))) % (2 ^ (8 * sz)), sz⟩,
+         .scalar ⟨match isSigned with
+                  | false => match Nat.ble b a with | true => 0 | false => 1
+                  | true => match signedOverflowSub a b sz with | true => 1 | false => 0, 1⟩])
+        locals mem := by
+  unfold evalScalarBinOp
+  simp only [beq_zero_eq_false_of_pos hsz, Nat.beq_refl,
+             wrapScalarBits_eq_mod_modulus, scalarModulus_eq_two_pow]
+  cases isSigned with
+  | false =>
+    cases h_ble : Nat.ble b a with
+    | false => rfl
+    | true =>
+      dsimp only
+      congr 2; congr 1; congr 1; congr 1
+      exact sub_mod_eq_add_mod_sub_mod (Nat.two_pow_pos (8 * sz)) (Nat.le_of_ble_eq_true h_ble)
+  | true =>
+    dsimp only
+    cases h_ble : Nat.ble (b % (2 ^ (8 * sz))) (a % (2 ^ (8 * sz))) with
+    | false => rfl
+    | true =>
+      dsimp only
+      congr 2; congr 1; congr 1; congr 1
+      exact mod_sub_mod_eq_add_mod_sub_mod
+        (Nat.two_pow_pos (8 * sz)) (Nat.le_of_ble_eq_true h_ble)
+
+@[simp]
+theorem evalScalarBinOp_mulWithOverflow {sz a b : Nat} (hsz : 0 < sz)
+    (locals : List LocalSlot) (mem : Memory) (isSigned : Bool) :
+    evalScalarBinOp .mulWithOverflow ⟨a, sz⟩ ⟨b, sz⟩ locals mem isSigned =
+      .ok (.aggregate 0
+        [.scalar ⟨(a * b) % (2 ^ (8 * sz)), sz⟩,
+         .scalar ⟨match isSigned with
+                  | false => match Nat.ble (2 ^ (8 * sz)) (a * b) with | true => 1 | false => 0
+                  | true => match signedOverflowMul a b sz with | true => 1 | false => 0, 1⟩])
+        locals mem := by
+  unfold evalScalarBinOp
+  simp only [beq_zero_eq_false_of_pos hsz, Nat.beq_refl,
+             wrapScalarBits_eq_mod_modulus, scalarModulus_eq_two_pow]
+  rfl
 
 @[simp]
 theorem evalScalarBinOp_add {sz a b : Nat} (hsz : 0 < sz)
