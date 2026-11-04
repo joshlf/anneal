@@ -2436,16 +2436,19 @@ example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (p : ProvenancePtr) :
   rcases h_meta with ⟨_, _, h⟩ | ⟨_, _, h⟩ <;> cases h
 
 -- 7d. `valueValidForTy` rejects `Value.unit` for non-zero-sized inhabited `.adt`
---     types while admitting `.unit` for zero-sized `.adt` types; `Unsize` faults
---     with `.ub` on shared-to-mutable (`&[u8; 4] -> &mut [u8]`), element-mismatch
---     (`&[u8; 4] -> &[u32]`), and `.disabled` borrow tags; and `CastKind.ptrToPtr`
---     faults with `.ub` on thin-to-wide raw pointer casts.
+--     types (both at top level and when nested inside `.tuple` via `fieldLayouts`)
+--     while admitting `.unit` for zero-sized `.adt` types; `Unsize` and other
+--     pointer coercions fault with `.ub` on shared-to-mutable (`&[u8; 4] -> &mut [u8]`,
+--     `&[u8] -> &mut [u8]`), element-mismatch (`&[u8; 4] -> &[u32]`), thin-to-`&str`,
+--     and `.disabled` borrow tags; and `CastKind.ptrToPtr` faults with `.ub` on
+--     thin-to-wide raw pointer casts.
 def sampleAdtLayoutTable : Trusted.Rustc.V2026_06_01.Layout.LayoutTable := {
   pointerBits := 64
   isLittleEndian := true
   entries := [
     { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory, fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [] },
-    { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory, fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+    { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory, fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [] },
+    { size := ⟨8⟩, align := ⟨4⟩, backendRepr := .memory, fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0, isUninhabited := false, fieldLayouts := [0, 0] }
   ]
 }
 
@@ -2454,6 +2457,15 @@ example :
       { kind := .adt "my_crate::WrapperU32" [], layoutIdx := 0 }
       .unit :=
   id
+
+example :
+    ¬ valueValidForTy sampleAdtLayoutTable
+      { kind := .tuple [.uint .u32, .adt "my_crate::WrapperU32" []], layoutIdx := 2 }
+      (.aggregate 0 [.scalar ⟨1, 4⟩, .unit]) := by
+  rintro (⟨h_unit, _⟩ | ⟨fields, h_agg, _, h_elems⟩)
+  · cases h_unit
+  · cases h_agg
+    exact h_elems.2.1
 
 example :
     valueValidForTy sampleAdtLayoutTable
@@ -2483,8 +2495,27 @@ example (p : ProvenancePtr) :
         { kind := .ref .not (.slice (.uint .u8)), layoutIdx := 0 })
       { emptyMemory with
         borrows := [{ tag := 1, targetLocal := 5, targetProjection := .nil, perm := .disabled }] }
-      (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.array (.uint .u8) 4), layoutIdx := 0 }, debugName := .none }]) = .ub :=
-  ⟨rfl, rfl, rfl⟩
+      (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.array (.uint .u8) 4), layoutIdx := 0 }, debugName := .none }]) = .ub ∧
+    evalRvalue
+      [.init (.ptr { allocId := 1, offsetBytes := 0 } 8)]
+      (.cast (.pointerCoercion "MutToConstPointer") (.copy { local_ := 0, projection := .nil })
+        { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 })
+      { emptyMemory with
+        borrows := [{ tag := 1, targetLocal := 5, targetProjection := .nil, perm := .disabled }] }
+      (localDecls := [{ mutability := .not, ty := { kind := .rawPtr .mut (.uint .u8), layoutIdx := 0 }, debugName := .none }]) = .ub ∧
+    evalRvalue
+      [.init (.ptr p 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
+        { kind := .ref .not .str, layoutIdx := 0 })
+      emptyMemory
+      (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.array (.uint .u8) 4), layoutIdx := 0 }, debugName := .none }]) = .ub ∧
+    evalRvalue
+      [.init (.aggregate 0 [.ptr p 8, .scalar ⟨4, 8⟩])]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
+        { kind := .ref .mut (.slice (.uint .u8)), layoutIdx := 0 })
+      emptyMemory
+      (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.slice (.uint .u8)), layoutIdx := 0 }, debugName := .none }]) = .ub :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 example (p : ProvenancePtr) :
     evalRvalue

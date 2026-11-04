@@ -583,8 +583,31 @@ def pointerValueValid (pointee : RigidTy) (v : Value) : Prop :=
             (v = .aggregate 0 (.ptr p sz :: metadata :: .nil)))
 
 /--
+Resolve the `LayoutTable` entry index of field `fieldPos` inside the composite
+layout at `optLayoutIdx` (when recorded in `layout.fieldLayouts`).
+
+Reference (The Rust Reference, "Type Layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html>
+
+> "The layout of a type is its size, alignment, and the relative offsets of its
+> fields."
+-/
+@[reducible]
+def lookupFieldLayoutIdx
+    (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (optLayoutIdx : Option Nat)
+    (fieldPos : Nat) :
+    Option Nat :=
+  match optLayoutIdx with
+  | .some layoutIdx =>
+    match Trusted.Sequence.get? layouts.entries layoutIdx with
+    | .some layout => Trusted.Sequence.get? layout.fieldLayouts fieldPos
+    | .none => .none
+  | .none => .none
+
+/--
 Pointwise element validity predicate over a tuple's `List RigidTy` field types
-and `List Value` runtime field values.
+and `List Value` runtime field values, indexed by field position `fieldPos`.
 
 Reference (The Rust Reference, "Tuple types"):
 <https://doc.rust-lang.org/1.98.0/reference/types/tuple.html>
@@ -593,11 +616,12 @@ Reference (The Rust Reference, "Tuple types"):
 > other types."
 -/
 @[reducible]
-def valuesMatchElemPred (P : RigidTy → Value → Prop) :
-    List RigidTy → List Value → Prop
-  | .nil, .nil => True
-  | ty :: tys, v :: vs => And (P ty v) (valuesMatchElemPred P tys vs)
-  | _, _ => False
+def valuesMatchElemPred (P : Nat → RigidTy → Value → Prop) :
+    Nat → List RigidTy → List Value → Prop
+  | _, .nil, .nil => True
+  | idx, ty :: tys, v :: vs =>
+    And (P idx ty v) (valuesMatchElemPred P (Nat.add idx 1) tys vs)
+  | _, _, _ => False
 
 /--
 Homogeneous element validity predicate over an array's `List Value` elements.
@@ -617,9 +641,11 @@ Whether every `RigidTy` in a list of tuple field types admits `Value.unit`
 (so the composite tuple is zero-sized and may be represented by `Value.unit`).
 -/
 @[reducible]
-def typesAllAdmitUnit (P : RigidTy → Value → Prop) : List RigidTy → Prop
-  | .nil => True
-  | ty :: tys => And (P ty .unit) (typesAllAdmitUnit P tys)
+def typesAllAdmitUnit (P : Nat → RigidTy → Value → Prop) :
+    Nat → List RigidTy → Prop
+  | _, .nil => True
+  | idx, ty :: tys =>
+    And (P idx ty .unit) (typesAllAdmitUnit P (Nat.add idx 1) tys)
 
 /--
 Fuel-bounded recursive runtime `Value` validity predicate against a `RigidTy`,
@@ -663,28 +689,43 @@ def valueValidForRigidTy :
   | _ + 1, _, _, .float _, v => ∃ sv, v = .scalar sv
   | _ + 1, _, _, .never, _ => False
   | _ + 1, _, _, .tuple .nil, v => Or (v = .unit) (v = .aggregate 0 .nil)
-  | fuel + 1, layouts, _, .tuple (elemTy :: restTys), v =>
+  | fuel + 1, layouts, optLayoutIdx, .tuple (elemTy :: restTys), v =>
     Or
       (v = .unit ∧
         typesAllAdmitUnit
-          (valueValidForRigidTy fuel layouts .none)
+          (fun idx ty val =>
+            valueValidForRigidTy
+              fuel
+              layouts
+              (lookupFieldLayoutIdx layouts optLayoutIdx idx)
+              ty
+              val)
+          0
           (elemTy :: restTys))
       (∃ fields,
         v = .aggregate 0 fields ∧
         Trusted.Sequence.length fields = Trusted.Sequence.length (elemTy :: restTys) ∧
         valuesMatchElemPred
-          (valueValidForRigidTy fuel layouts .none)
+          (fun idx ty val =>
+            valueValidForRigidTy
+              fuel
+              layouts
+              (lookupFieldLayoutIdx layouts optLayoutIdx idx)
+              ty
+              val)
+          0
           (elemTy :: restTys)
           fields)
-  | fuel + 1, layouts, _, .array elemTy len, v =>
+  | fuel + 1, layouts, optLayoutIdx, .array elemTy len, v =>
+    let elemLayoutIdx := lookupFieldLayoutIdx layouts optLayoutIdx 0
     Or
       (v = .unit ∧
-        (len = 0 ∨ valueValidForRigidTy fuel layouts .none elemTy .unit))
+        (len = 0 ∨ valueValidForRigidTy fuel layouts elemLayoutIdx elemTy .unit))
       (∃ elems,
         v = .aggregate 0 elems ∧
         Trusted.Sequence.length elems = len ∧
         valuesAllSatisfyPred
-          (valueValidForRigidTy fuel layouts .none elemTy)
+          (valueValidForRigidTy fuel layouts elemLayoutIdx elemTy)
           elems)
   | _ + 1, _, _, .ref _ pointee, v => pointerValueValid pointee v
   | _ + 1, _, _, .rawPtr _ pointee, v => pointerValueValid pointee v

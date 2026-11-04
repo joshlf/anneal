@@ -1902,9 +1902,10 @@ def isWidePtrMetadata : Value → Bool
   | _ => false
 
 /--
-Test whether `kind` is a slice reference or slice raw pointer (`&[T]`, `&mut [T]`,
-`*const [T]`, or `*mut [T]`), which is always represented at runtime as a wide
-pointer aggregate `[ptr, len]`.
+Test whether `kind` is a slice or `str` reference or raw pointer (`&[T]`,
+`&mut [T]`, `*const [T]`, `*mut [T]`, `&str`, `&mut str`, `*const str`, or
+`*mut str`), which is always represented at runtime as a wide pointer
+aggregate `[ptr, len]`.
 
 Reference (The Rust Reference, "Dynamically Sized Types"):
 <https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
@@ -1916,6 +1917,56 @@ Reference (The Rust Reference, "Dynamically Sized Types"):
 def isSlicePtrOrRefKind : RigidTy → Bool
   | .ref _ (.slice _) => true
   | .rawPtr _ (.slice _) => true
+  | .ref _ .str => true
+  | .rawPtr _ .str => true
+  | _ => false
+
+/--
+Test whether `kind` is a trait-object reference or raw pointer (`&dyn Trait`,
+`&mut dyn Trait`, `*const dyn Trait`, or `*mut dyn Trait`), which requires
+wide-pointer vtable metadata.
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Pointer types to DSTs are sized but have twice the size of pointers to sized
+> types"
+-/
+@[reducible]
+def isDynPtrOrRefKind : RigidTy → Bool
+  | .ref _ (.dynamic _) => true
+  | .rawPtr _ (.dynamic _) => true
+  | _ => false
+
+/--
+Test whether `kind` is a reference or raw pointer whose pointee is statically
+known to be thin (not a slice, `str`, `dyn Trait`, generic parameter, alias,
+ADT with a potentially unsized tail, or non-empty tuple).
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Pointer types to DSTs are sized but have twice the size of pointers to sized
+> types"
+-/
+@[reducible]
+def isStrictlyThinPtrOrRefKind : RigidTy → Bool
+  | .ref _ (.slice _) => false
+  | .ref _ .str => false
+  | .ref _ (.dynamic _) => false
+  | .ref _ (.param _ _) => false
+  | .ref _ (.alias _ _) => false
+  | .ref _ (.adt _ _) => false
+  | .ref _ (.tuple (_ :: _)) => false
+  | .ref _ _ => true
+  | .rawPtr _ (.slice _) => false
+  | .rawPtr _ .str => false
+  | .rawPtr _ (.dynamic _) => false
+  | .rawPtr _ (.param _ _) => false
+  | .rawPtr _ (.alias _ _) => false
+  | .rawPtr _ (.adt _ _) => false
+  | .rawPtr _ (.tuple (_ :: _)) => false
+  | .rawPtr _ _ => true
   | _ => false
 
 /--
@@ -1937,6 +1988,39 @@ Reference (The Rust Reference, "Unsized Coercions"):
 @[reducible]
 def unsizeMutabilityCompatible (srcMut dstMut : Mutability) : Bool :=
   Bool.or (mutabilityEq srcMut .mut) (mutabilityEq dstMut .not)
+
+/--
+Check that a pointer coercion from `opTy` to `targetKind` obeys Rust pointer
+mutability and reference/raw-pointer direction rules (no coercion upgrades
+shared/const `.not` to `.mut`, and a raw pointer is never coerced to a
+reference).
+
+Reference (The Rust Reference, "Type coercions"):
+<https://doc.rust-lang.org/1.98.0/reference/type-coercions.html#coercion-types>
+
+> "* `&mut T` to `&T`
+> * `*mut T` to `*const T`
+> * `&T` to `*const T`
+> * `&mut T` to `*mut T`"
+-/
+@[reducible]
+def pointerCoercionTypesCompatible
+    (opTy : Option Ty)
+    (targetKind : RigidTy) :
+    Bool :=
+  match opTy with
+  | .none => true
+  | .some { kind := .ref srcMut _, .. } =>
+    match targetKind with
+    | .ref dstMut _ => unsizeMutabilityCompatible srcMut dstMut
+    | .rawPtr dstMut _ => unsizeMutabilityCompatible srcMut dstMut
+    | _ => true
+  | .some { kind := .rawPtr srcMut _, .. } =>
+    match targetKind with
+    | .ref _ _ => false
+    | .rawPtr dstMut _ => unsizeMutabilityCompatible srcMut dstMut
+    | _ => true
+  | .some _ => true
 
 /--
 Check that a pointer with provenance tag `tag` in `borrows` is not `.disabled`
@@ -1966,8 +2050,9 @@ def unsizeBorrowPermCompatible
 When coercing a fixed-size array reference or raw pointer (`&[T; n]` or
 `*const [T; n]`) to a slice reference or raw pointer (`&[T]` or `*const [T]`)
 via `PointerCoercion::Unsize`, validate source/target mutability, element type
-equality, and Tree Borrows tag permission, and extract the static array length
-`n` for the resulting wide pointer's metadata.
+equality, 64-bit `usize` length range (`n < scalarModulus 8`), and Tree Borrows
+tag permission, and extract the static array length `n` for the resulting wide
+pointer's metadata.
 
 Reference (The Rust Reference, "Unsized Coercions"):
 <https://doc.rust-lang.org/1.98.0/reference/type-coercions.html#unsized-coercions>
@@ -1993,24 +2078,30 @@ def unsizeArrayLen?
     | .ref dstMut (.slice dstElem), .some { kind := .ref srcMut (.array srcElem n), .. } =>
       match
         Bool.and
-          (unsizeMutabilityCompatible srcMut dstMut)
-          (rigidTyEq srcElem dstElem)
+          (Nat.blt n (scalarModulus 8))
+          (Bool.and
+            (unsizeMutabilityCompatible srcMut dstMut)
+            (rigidTyEq srcElem dstElem))
       with
       | true => .some n
       | false => .none
     | .rawPtr dstMut (.slice dstElem), .some { kind := .rawPtr srcMut (.array srcElem n), .. } =>
       match
         Bool.and
-          (unsizeMutabilityCompatible srcMut dstMut)
-          (rigidTyEq srcElem dstElem)
+          (Nat.blt n (scalarModulus 8))
+          (Bool.and
+            (unsizeMutabilityCompatible srcMut dstMut)
+            (rigidTyEq srcElem dstElem))
       with
       | true => .some n
       | false => .none
     | .rawPtr dstMut (.slice dstElem), .some { kind := .ref srcMut (.array srcElem n), .. } =>
       match
         Bool.and
-          (unsizeMutabilityCompatible srcMut dstMut)
-          (rigidTyEq srcElem dstElem)
+          (Nat.blt n (scalarModulus 8))
+          (Bool.and
+            (unsizeMutabilityCompatible srcMut dstMut)
+            (rigidTyEq srcElem dstElem))
       with
       | true => .some n
       | false => .none
@@ -2335,12 +2426,13 @@ def evalReifyFnPointer
     RvalueEvalResult :=
   match isReifyFnPointerCoercion coercionKind with
   | false =>
+    let opTy := operandTy localDecls layouts op
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
     | .ok (.ptr ptrVal sz) locals' =>
       match
         unsizeArrayLen?
           coercionKind
-          (operandTy localDecls layouts op)
+          opTy
           targetTy.kind
           mem.borrows
           ptrVal.tag
@@ -2350,11 +2442,27 @@ def evalReifyFnPointer
       | .none =>
         match isSlicePtrOrRefKind targetTy.kind with
         | true => .ub
-        | false => .ok (.ptr ptrVal sz) locals' mem
+        | false =>
+          match
+            Bool.and
+              (unsizeBorrowPermCompatible mem.borrows ptrVal.tag targetTy.kind)
+              (pointerCoercionTypesCompatible opTy targetTy.kind)
+          with
+          | false => .ub
+          | true =>
+            match isDynPtrOrRefKind targetTy.kind with
+            | true => .unsupported
+            | false => .ok (.ptr ptrVal sz) locals' mem
     | .ok (.aggregate 0 (.ptr ptrVal sz :: metaVal :: .nil)) locals' =>
       match isWidePtrMetadata metaVal with
       | true =>
-        match unsizeBorrowPermCompatible mem.borrows ptrVal.tag targetTy.kind with
+        match
+          Bool.and
+            (unsizeBorrowPermCompatible mem.borrows ptrVal.tag targetTy.kind)
+            (Bool.and
+              (pointerCoercionTypesCompatible opTy targetTy.kind)
+              (Bool.not (isStrictlyThinPtrOrRefKind targetTy.kind)))
+        with
         | true =>
           .ok (.aggregate 0 (.ptr ptrVal sz :: metaVal :: .nil)) locals' mem
         | false => .ub
