@@ -6,7 +6,7 @@ license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
 This file may not be copied, modified, or distributed except according to
 those terms. -->
 
-# Reproducing `MR-1.1`: Booleans, comparisons, `Cmp`, `!b`, `bool` switches
+# Reproducing `MR-1.1`: Booleans, comparisons, `Cmp`, `!b`, `bool` bitwise ops, `bool` switches
 
 This guide lets an independent reviewer check every claim of work unit
 `MR-1.1` from a clean checkout of branch `adv/mr-1-1`. Run all commands from
@@ -24,20 +24,25 @@ as a pass.
   has no Boolean negation, so `UnOp::Int` on a `bool` stays a spec panic. For
   MIR's `Cmp`, whose result is the `core::cmp::Ordering` enum, the
   representation of `Type::Enum` (`decode_discriminant`,
-  `encode_discriminant`, `Type::{decode, encode}`) and of sized `Type::Tuple`
-  (the type of variant data; padding encodes as `Uninit`), `check_value` for
-  tuples and variants, `TupleHeadLayout::head_size_and_align`, and
-  `Type::layout` for enums, unions, and sized tuples. The recursion over
-  nested types, fields, variants, and discriminator trees is structural, so
-  the kernel evaluates it.
+  `encode_discriminant`, `Type::{decode, encode}`, with `decode_discriminant`
+  threading the `FnMut` accessor state `s : σ` and evaluating the `fallback`
+  continuation only when no child branch matches), of `Type::Tuple` (sized
+  tuples as variant data with padding encoded as `Uninit`, and unsized tuple
+  layouts), and of `Type::Slice` and `Type::TraitObject` (`Type::layout`
+  returning `LayoutStrategy::{Slice, TraitObject}` so the unsized panic
+  branches of `LayoutStrategy::{expect_size, expect_align}` are reachable, and
+  `Type::{decode, encode}` and `check_value` raising the exact upstream
+  `specPanic`s). The recursion over nested types, fields, variants, and
+  discriminator trees is structural, so the kernel evaluates it.
 - **Anchors** (`minirust/lean/MiniRustSpec/Anchors.lean`): the upstream
   items `impl_Machine__transmute` (`spec/lang/representation.md:788`),
   `impl_Machine__eval_rel_op` (`spec/lang/step/operators.md:320`),
   `impl_Type__decode_4` (tuples, `representation.md:248`),
   `fn_decode_discriminant` (`:353`), `fn_encode_discriminant` (`:377`),
-  `impl_Type__decode_7` (enums, `:393`), and
+  `impl_Type__decode_7` (enums, `:393`), `impl_Type__decode_8` (slices, `:441`),
+  `impl_Type__decode_9` (trait objects, `:450`), and
   `impl_TupleHeadLayout__capped_tail_align` (`spec/lang/types.md:200`),
-  pinned by token hash and checked by `decide` (46 anchors in total).
+  pinned by token hash and checked by `decide` (48 anchors in total).
 - **Quotation checks** (`crates/anneal-minirust-gen/tests/quotes.rs`):
   `bool_comparison_and_transmute_quotations_are_pinned` and
   `enum_tuple_and_cmp_quotations_are_pinned` check each new upstream
@@ -49,13 +54,17 @@ as a pass.
   constants (`Constant::Bool`, only for the bytes `0` and `1`), the
   comparisons `Eq | Ne | Lt | Le | Gt | Ge` on two integers of one type or two
   `bool`s (`BinOp::Rel`), `!b` on a `bool` as `minimize`'s `build::not`
-  (`transmute::<bool>(1u8 - transmute::<u8>(b))`), `Cast(CastKind::IntToInt)`
-  from a `bool` operand (`CastOp::IntToInt(int_ty)` on `transmute::<u8>(b)`,
-  matching `tooling/minimize/src/rvalue.rs`), `SwitchInt` on a
-  `bool` through `transmute::<u8>`, exactly as `tooling/minimize/src/bb.rs`
-  does, and `core::cmp::Ordering` locals with the three-way comparison
-  `BinaryOp(Cmp, a, b)` on two integers of one type or two `bool`s, which
-  `minimize` (`tooling/minimize/src/rvalue.rs`) translates to
+  (`transmute::<bool>(1u8 - transmute::<u8>(b))`), `BitAnd | BitOr | BitXor`
+  on two `bool` operands as `minimize`'s `build::bool_and`, `build::bool_or`,
+  and `build::bool_xor` (`boolBitOp`: integer `BitAnd | BitOr | BitXor` on the
+  `transmute::<u8>` views, transmuted back to `bool`),
+  `Cast(CastKind::IntToInt)` from a `bool` operand (`CastOp::IntToInt(int_ty)`
+  on `transmute::<u8>(b)`, matching `tooling/minimize/src/rvalue.rs`),
+  `SwitchInt` on a `bool` through `transmute::<u8>`, exactly as
+  `tooling/minimize/src/bb.rs` does, and `core::cmp::Ordering` locals with
+  `Use(copy _j)` and the three-way comparison `BinaryOp(Cmp, a, b)` on two
+  integers of one type or two `bool`s, which `minimize`
+  (`tooling/minimize/src/rvalue.rs`) translates to
   `transmute::<Ordering>(BinOp::Rel(RelOp::Cmp, a, b))` (`translateCmp`); the
   translation of `Ordering` (`orderingTy`) is the one-byte enum with a
   directly encoded `i8` tag that `tooling/minimize/src/enums.rs` builds for
@@ -76,23 +85,28 @@ as a pass.
   `leNeGe` (`<=`, `!=`, `>=`, a `bool` return place that is also a switch
   scrutinee), `boolCastI8` (`Cast(CastKind::IntToInt)` from `bool` to `i8`
   across both `true` and `false` branches plus `argsOk` rejection of invalid
-  `bool` byte `2`), `uninitBool`, `uninitBoolNot`, and `uninitBoolRel` (UB on
-  an uninitialized `bool` in `SwitchInt`, `UnaryOp(Not)`, and `BinaryOp(Eq)`
-  in both semantics), `cmpSel` (an `Ordering` return place receiving a signed
-  `i8` `Cmp` or a `bool` `Cmp`; the inputs `(-1, 1, true)`, `(7, 7, true)`,
-  and `(0, 0, false)` return `Less`, `Equal`, and `Greater` in both
-  semantics), `uninitOrdering` (returning an uninitialized `Ordering` is UB in
-  both semantics), and ground-truth evaluations of the new operators and of
-  the enum and tuple representations.
+  `bool` byte `2`), `uninitBool`, `uninitBoolNot`, `uninitBoolRel`, and
+  `uninitBoolBitAnd` (UB on an uninitialized `bool` in `SwitchInt`,
+  `UnaryOp(Not)`, `BinaryOp(Eq)`, and `BinaryOp(BitAnd)` in both semantics),
+  `cmpSel` (an `Ordering` return place receiving a signed `i8` `Cmp` or a
+  `bool` `Cmp`; the inputs `(-1, 1, true)`, `(7, 7, true)`, and `(0, 0, false)`
+  return `Less`, `Equal`, and `Greater` in both semantics), `boolBitOrdUse`
+  (exercising `BitAnd`, `BitOr`, and `BitXor` on `bool`, unsigned `u8`
+  `255u8.cmp(&1u8) = Greater`, `Use(copy _3)` on an `Ordering` argument local,
+  and `argsOk` rejection of invalid `Ordering` tag bytes `2` and `128`),
+  `uninitOrdering` (returning an uninitialized `Ordering` is UB in both
+  semantics), and ground-truth evaluations of the new operators,
+  `decodeDiscriminant` short-circuiting (`decodeDiscriminant_short_circuits`),
+  and the enum, tuple, slice, and trait-object representations.
 - **Audit** (`minirust/lean/MiniRustSpec/Audit.lean`): `#check_theorem_deps`
   logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, and `[WITNESS-AUDIT]` lines
   ending in `sorry_free=true`, and fails the build on `sorryAx` or any
   non-standard axiom.
 
-An `Ordering` local is written only by `Cmp` and read only by `Return`; the
-fragment has no `Use`, constants, `Discriminant`, or `SwitchInt` of an
-`Ordering`, and `Type::Enum`/`Type::Tuple` are interpreted only as
-representations (no aggregate construction, discriminant statements, or
+An `Ordering` local is written by `Cmp` or `Use(copy _j)` and read by `Use` or
+`Return`; the fragment has no `Ordering` constants, `Discriminant`, or
+`SwitchInt` on an `Ordering`, and `Type::Enum`/`Type::Tuple` are interpreted
+only as representations (no aggregate construction, discriminant statements, or
 projections).
 
 ## Step 0: environment
@@ -104,7 +118,7 @@ git status --porcelain             # pass: no output
 ```
 
 Do not run `lake clean` or delete `examples/.lake`; the build cache is
-reused.
+reused, and all `lake` / `lean` invocations are wrapped in `anneal-lean-run`.
 
 ## Step 1: repository hygiene
 
@@ -116,11 +130,6 @@ python3 trusted/audit/check_trusted.py --fast
 Pass: both exit with status `0`.
 
 ## Step 2: generator determinism and verbatim quotation checks
-
-The brief writes this step as
-`cargo test --manifest-path minirust/Cargo.toml --offline`, but `minirust/`
-has no `Cargo.toml`: the generator and its tests are the workspace crate
-`crates/anneal-minirust-gen`. Run it from the workspace root:
 
 ```bash
 cargo test -p anneal-minirust-gen --offline
@@ -141,7 +150,7 @@ cargo run -q -p anneal-minirust-gen -- generate --check
 ## Step 3: kernel-check the Lean development
 
 ```bash
-(cd examples && lake build MiniRustSpec)
+(cd examples && anneal-lean-run --mode build --concurrency 3 -- lake build MiniRustSpec)
 ```
 
 Pass: `Build completed successfully`, with no `error:` lines and no
@@ -153,45 +162,37 @@ proofs, the witnesses (computed in the kernel by `decide`/`rfl`; no
 ## Step 4: inspect the audit receipts
 
 ```bash
-(cd examples && lake build MiniRustSpec.Audit -v 2>&1 | grep -E '\[(ANCHOR|SIMULATION|WITNESS)-AUDIT\]')
-```
-
-If `lake` replays the cached build without printing messages, force the audit
-module to be re-elaborated and print its messages directly:
-
-```bash
-(cd examples && lake env lean ../minirust/lean/MiniRustSpec/Audit.lean 2>&1 \
+(cd examples && anneal-lean-run --mode file --concurrency 3 -- lake env lean ../minirust/lean/MiniRustSpec/Audit.lean 2>&1 \
   | grep -E '\[(ANCHOR|SIMULATION|WITNESS)-AUDIT\]|MiniRustSpec.Audit: exhaustively')
 ```
 
-Pass: three lines of the form
+Pass: four lines of the form
 
 ```text
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
-[SIMULATION-AUDIT] decls=46 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
-[WITNESS-AUDIT] decls=101 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+[SIMULATION-AUDIT] decls=51 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
+[WITNESS-AUDIT] decls=128 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+MiniRustSpec.Audit: exhaustively verified standard axioms for 8516 declarations across all MiniRustSpec.* modules
 ```
 
 (the axiom lists contain only `propext`, `Quot.sound`, and
-`Classical.choice`; the anchors are decided without any axiom), plus the
-exhaustive line
-`MiniRustSpec.Audit: exhaustively verified standard axioms for N declarations
-across all MiniRustSpec.* modules`.
+`Classical.choice`; the anchors are decided without any axiom).
 
 ## Step 5: spot-check the semantics by hand (optional)
 
 The witnesses are ordinary Lean theorems; a reviewer can restate any of them
 with a different expected value and watch the kernel reject it. For example,
 save the following as a scratch file outside the repository and check it with
-`(cd examples && lake env lean /path/to/Scratch.lean)`; it must fail with a
-type mismatch, because both semantics return `-1i8` (byte `255`), not `1`:
+`(cd examples && anneal-lean-run --mode file --concurrency 3 -- lake env lean /path/to/Scratch.lean)`;
+it must fail with a type mismatch, because both semantics return `-1i8` (byte
+`255`), not `1`:
 
 ```lean
 import MiniRustSpec.Correspondence.Witness
 open MiniRustSpec MiniRustSpec.Interp MiniRustSpec.Correspondence
 open MiniRustSpec.Correspondence.Witness
 set_option maxRecDepth 8192 in
-example : (Interp.steps 9 cmpNotNeg1MInit).toOption.map
+example : (Interp.steps 6 cmpNotNeg1MInit).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAllocI8 with data := scalarBytes i8 1 }, [1]) := rfl
 ```

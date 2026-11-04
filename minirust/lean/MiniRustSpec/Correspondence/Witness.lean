@@ -3086,6 +3086,238 @@ theorem uninitOrdering_minirust_direct :
     Interp.steps 2 uninitOrderingMInit =
       .error (.ub "load at type but the data in memory violates the language invariant") := rfl
 
+/-! ### `bool` bitwise `BitAnd`/`BitOr`/`BitXor`, unsigned `u8` `Cmp`, and `Ordering` `Use` -/
+
+theorem ctxI8_ok_boolBitOrdUse {body : CapturedMir}
+    (h : body.localDecls = [orderingDecl, boolDecl, u8Decl, orderingDecl]) : CtxOk body ctxI8_4 where
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | 2, hd => simp at hd; subst hd; decide
+    | 3, hd => simp at hd; subst hd; decide
+    | _ + 4, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MIR (`Runtime(PostCleanup)`) of
+```rust
+fn bool_bit_ord_use(mut a: bool, x: u8, ord_in: Ordering) -> Ordering {
+    a = ((a & true) | false) ^ true; // bb0: _1 = BitAnd(copy _1, const true);
+                                     //      _1 = BitOr(copy _1, const false);
+                                     //      _1 = BitXor(copy _1, const true);
+                                     //      switchInt(copy _1) -> [0: bb2, otherwise: bb1]
+    if a { x.cmp(&1u8) }             // bb1: _0 = Cmp(copy _2, const 1u8); return
+    else { ord_in }                  // bb2: _0 = Use(copy _3); return
+}
+```
+exercising `build::bool_and`, `build::bool_or`, and `build::bool_xor`
+(`boolBitOp`), unsigned `u8` three-way `Cmp` (`255u8.cmp(&1u8) = Greater`,
+whereas signed `-1i8.cmp(&1i8) = Less` in `cmpSel`), and `Use(copy _3)` on an
+`Ordering` local. -/
+def boolBitOrdUse : CapturedMir where
+  defPath := "witness::bool_bit_ord_use"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 3
+  localDecls := [orderingDecl, boolDecl, u8Decl, orderingDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 1) (.binaryOp .bitAnd (.copy (local_ 1)) (constBool true))),
+        mkStmt (.assign (local_ 1) (.binaryOp .bitOr (.copy (local_ 1)) (constBool false))),
+        mkStmt (.assign (local_ 1) (.binaryOp .bitXor (.copy (local_ 1)) (constBool true)))],
+      terminator := mkTerm (.switchInt (.copy (local_ 1)) { branches := [(0, 2)], otherwise := 1 }),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.binaryOp .cmp (.copy (local_ 2)) (constU8 1)))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.use (.copy (local_ 3))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiCmpSel
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem boolBitOrdUse_inFragment : inFragment boolBitOrdUse = true := by decide
+
+def boolBitOrdUseFn : Gen.Function where
+  locals := ⟨[(localName 0, orderingTy), (localName 1, .Bool), (localName 2, .Int u8),
+    (localName 3, orderingTy)]⟩
+  args := [localName 1, localName 2, localName 3]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 1))
+        (boolBitOp .BitAnd (.Load (.Local (localName 1))) (.Constant (.Bool true) .Bool)),
+      .Assign (.Local (localName 1))
+        (boolBitOp .BitOr (.Load (.Local (localName 1))) (.Constant (.Bool false) .Bool)),
+      .Assign (.Local (localName 1))
+        (boolBitOp .BitXor (.Load (.Local (localName 1))) (.Constant (.Bool true) .Bool))],
+      .Switch (.UnOp (.Cast (.Transmute (.Int u8))) (.Load (.Local (localName 1))))
+        ⟨[(0, bbName 2)]⟩ (bbName 1), .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 0))
+        (translateCmp (.Load (.Local (localName 2))) (.Constant (.Int 1) (.Int u8)))],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Local (localName 0)) (.Load (.Local (localName 3)))],
+      .Return, .Regular⟩),
+    (bbName 3, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 3
+  implicit_writes := true
+
+theorem boolBitOrdUse_translate : translateFn boolBitOrdUse = some boolBitOrdUseFn := rfl
+
+/-- Invalid `Ordering` tag bytes (`2` and `128`, i.e. `-128i8`) are rejected by
+`argsOk`. -/
+theorem boolBitOrdInvalidTag_rejected :
+    argsOk boolBitOrdUse [.scalar ⟨1, 1⟩, .scalar ⟨255, 1⟩, .scalar ⟨2, 1⟩] = false ∧
+      argsOk boolBitOrdUse [.scalar ⟨1, 1⟩, .scalar ⟨255, 1⟩, .scalar ⟨128, 1⟩] = false :=
+  ⟨rfl, rfl⟩
+
+/-- Input `(false, 255u8, Equal)`: `((false & true) | false) ^ true = true`,
+takes `bb1`, and unsigned `255u8.cmp(&1u8)` returns `Greater` (byte `1`). -/
+def boolBitOrdUseCmpArgs : List Value := [.scalar ⟨0, 1⟩, .scalar ⟨255, 1⟩, .scalar ⟨0, 1⟩]
+def boolBitOrdUseCmpS0 : MachineState := initMachineState boolBitOrdUse boolBitOrdUseCmpArgs
+def boolBitOrdUseCmpMInit : Mach :=
+  machineWithCtx ctxI8_4 boolBitOrdUse boolBitOrdUseFn boolBitOrdUseCmpS0.frame.locals
+    boolBitOrdUseFn.start
+
+theorem boolBitOrdUseCmp_anneal_ret :
+    ReachesRet (mirCallTree boolBitOrdUse boolBitOrdUseCmpArgs)
+      [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
+      (.normal (.scalar ⟨1, 1⟩, boolBitOrdUseCmpS0.memory)) :=
+  runA_sound boolBitOrdUse 15 _ _ _ rfl
+
+theorem boolBitOrdUseCmp_noUB : MirNoUBTree (mirCallTree boolBitOrdUse boolBitOrdUseCmpArgs) :=
+  runA_noUB boolBitOrdUse 15 _ _ _ rfl
+
+theorem boolBitOrdUseCmp_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n boolBitOrdUseCmpMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes u8 1 } ∧
+      m'.threads = [thread1 ctxI8_4 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret boolBitOrdUse_inFragment boolBitOrdUse_translate ctxI8_4
+      (ctxI8_ok_boolBitOrdUse rfl) boolBitOrdUseCmpArgs (by decide) boolBitOrdUseCmpMInit
+      rfl rfl rfl boolBitOrdUseCmp_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [boolBitOrdUse] at hd; subst hd
+  simp [retPtr, ctxI8_4] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_4] at hr; subst hr
+  have hbits : bits = 1 := by
+    simp [itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxI8_4, itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW, u8]
+
+set_option maxRecDepth 8192 in
+theorem boolBitOrdUseCmp_minirust_direct :
+    (Interp.steps 7 boolBitOrdUseCmpMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes u8 1 }, [1]) := rfl
+
+/-- Input `(true, 255u8, Less)`: `((true & true) | false) ^ true = false`,
+takes `bb2`, and `_0 = Use(copy _3)` returns `Less` (byte `255`). -/
+def boolBitOrdUseCopyArgs : List Value := [.scalar ⟨1, 1⟩, .scalar ⟨255, 1⟩, .scalar ⟨255, 1⟩]
+def boolBitOrdUseCopyS0 : MachineState := initMachineState boolBitOrdUse boolBitOrdUseCopyArgs
+def boolBitOrdUseCopyMInit : Mach :=
+  machineWithCtx ctxI8_4 boolBitOrdUse boolBitOrdUseFn boolBitOrdUseCopyS0.frame.locals
+    boolBitOrdUseFn.start
+
+theorem boolBitOrdUseCopy_anneal_ret :
+    ReachesRet (mirCallTree boolBitOrdUse boolBitOrdUseCopyArgs)
+      [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
+      (.normal (.scalar ⟨255, 1⟩, boolBitOrdUseCopyS0.memory)) :=
+  runA_sound boolBitOrdUse 15 _ _ _ rfl
+
+theorem boolBitOrdUseCopy_noUB : MirNoUBTree (mirCallTree boolBitOrdUse boolBitOrdUseCopyArgs) :=
+  runA_noUB boolBitOrdUse 15 _ _ _ rfl
+
+theorem boolBitOrdUseCopy_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n boolBitOrdUseCopyMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes u8 255 } ∧
+      m'.threads = [thread1 ctxI8_4 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret boolBitOrdUse_inFragment boolBitOrdUse_translate ctxI8_4
+      (ctxI8_ok_boolBitOrdUse rfl) boolBitOrdUseCopyArgs (by decide) boolBitOrdUseCopyMInit
+      rfl rfl rfl boolBitOrdUseCopy_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [boolBitOrdUse] at hd; subst hd
+  simp [retPtr, ctxI8_4] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_4] at hr; subst hr
+  have hbits : bits = 255 := by
+    simp [itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxI8_4, itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW, u8]
+
+set_option maxRecDepth 8192 in
+theorem boolBitOrdUseCopy_minirust_direct :
+    (Interp.steps 7 boolBitOrdUseCopyMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes u8 255 }, [1]) := rfl
+
+/-- MIR of `fn uninit_bool_bitand() -> bool` whose entry block applies
+`BitAnd(copy _0, const true)` (`build::bool_and`) to the uninitialized return
+place `_0`, faulting at the load of `_0`. -/
+def uninitBoolBitAnd : CapturedMir where
+  defPath := "witness::uninit_bool_bitand"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [boolDecl]
+  basicBlocks := [
+    { statements := [mkStmt (.assign (local_ 0) (.binaryOp .bitAnd (.copy (local_ 0)) (constBool true)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiToBool
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem uninitBoolBitAnd_inFragment : inFragment uninitBoolBitAnd = true := by decide
+
+def uninitBoolBitAndFn : Gen.Function where
+  locals := ⟨[(localName 0, .Bool)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 0))
+        (boolBitOp .BitAnd (.Load (.Local (localName 0))) (.Constant (.Bool true) .Bool))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem uninitBoolBitAnd_translate : translateFn uninitBoolBitAnd = some uninitBoolBitAndFn := rfl
+
+def uninitBoolBitAndS0 : MachineState := initMachineState uninitBoolBitAnd []
+def uninitBoolBitAndMInit : Mach :=
+  machineWithCtx ctxBool uninitBoolBitAnd uninitBoolBitAndFn uninitBoolBitAndS0.frame.locals
+    uninitBoolBitAndFn.start
+
+theorem uninitBoolBitAnd_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree uninitBoolBitAnd []) tr u ∧ FaultNow u :=
+  faultsA_sound uninitBoolBitAnd 3 _ (by decide)
+
+theorem uninitBoolBitAnd_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n uninitBoolBitAndMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := uninitBoolBitAnd_anneal_ub
+  exact mirCall_ub uninitBoolBitAnd_inFragment uninitBoolBitAnd_translate ctxBool (ctxBool_ok1 rfl) []
+    (by decide) uninitBoolBitAndMInit rfl rfl rfl hr hf
+
+set_option maxRecDepth 8192 in
+theorem uninitBoolBitAnd_minirust_direct :
+    Interp.steps 2 uninitBoolBitAndMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") := rfl
+
 /-! ### Ground truth for the interpreted operators
 
 Direct evaluations of the transcribed MiniRust operators, independent of the
@@ -3203,5 +3435,56 @@ theorem decode_paddedPair :
 theorem checkValue_tuple_arity :
     checkValue (.Tuple [.Int (-2)]) paddedPairTy =
       .error (.ub "Value::Tuple: invalid number of fields") := rfl
+
+set_option maxRecDepth 8192 in
+/-- `decodeDiscriminant` threads the `FnMut` accessor state `s` and evaluates
+the `fallback` continuation only when no child branch matches: here a child
+branch matches `(-1, 0)` at offset `0`, so the fallback (which would read
+out-of-bounds offset `99`) is never invoked and the visited-offset log is
+`[0]`. -/
+theorem decodeDiscriminant_short_circuits :
+    decodeDiscriminant
+      (fun (s : List Nat) o sz => do
+        let chunk ← subsliceWithLength ([.Init 255 none] : List Byte) o.bytes sz.bytes
+        pure (chunk, s ++ [o.bytes]))
+      (.Branch ⟨0⟩ IntType.I8
+        (.Branch ⟨99⟩ IntType.I8 .Invalid ⟨[]⟩)
+        ⟨[((-1, 0), .Known (-1))]⟩)
+      [] = .ok (some (-1), [0]) := rfl
+
+/-- Unsized `Type::Slice`, `Type::TraitObject`, and unsized `Type::Tuple`:
+`Type.layout` returns `LayoutStrategy::Slice`, `LayoutStrategy::TraitObject`,
+or `LayoutStrategy::Tuple`, and `LayoutStrategy.expect_size`,
+`LayoutStrategy.expect_align`, `evalCastOp (.Transmute ...)`, `Type.decode`,
+`Type.encode`, and `checkValue` raise the exact upstream `specPanic`s from
+`spec/lang/types.md` and `spec/lang/representation.md`. -/
+theorem layout_slice :
+    Type.layout (.Slice .Bool) = .ok (.Slice ⟨1⟩ ⟨1⟩) := rfl
+theorem layout_traitObject :
+    Type.layout (.TraitObject ⟨⟨0⟩⟩) = .ok (.TraitObject ⟨⟨0⟩⟩) := rfl
+theorem layout_unsizedTuple :
+    Type.layout (.Tuple [] ⟨⟨1⟩, ⟨1⟩, none⟩ (some (.Slice .Bool))) =
+      .ok (.Tuple ⟨⟨1⟩, ⟨1⟩, none⟩ (.Slice ⟨1⟩ ⟨1⟩)) := rfl
+theorem expectSize_unsized_panics :
+    LayoutStrategy.expect_size (.Slice ⟨1⟩ ⟨1⟩) "WF" =
+      .error (.specPanic "expect_size called on unsized type: WF") := by
+  simp [LayoutStrategy.expect_size, specPanic]
+theorem expectAlign_traitObject_panics :
+    LayoutStrategy.expect_align (.TraitObject ⟨⟨0⟩⟩) "WF" =
+      .error (.specPanic "expect_align called on unsized type: WF") := by
+  simp [LayoutStrategy.expect_align, specPanic]
+theorem transmute_unsized_panics :
+    evalCastOp (.Transmute .Bool) (.Tuple [], .Slice .Bool) =
+      .error (.specPanic "expect_size called on unsized type: WF ensures transmutes are sized") := by
+  simp [evalCastOp, Type.layout, LayoutStrategy.expect_size, LayoutStrategy.expect_align, specPanic]
+theorem decode_unsized_panics :
+    Type.decode (.Slice .Bool) [] =
+      .error (.specPanic "decode of Type::Slice") := rfl
+theorem encode_unsized_panics :
+    Type.encode (.TraitObject ⟨⟨0⟩⟩) (.Tuple []) =
+      .error (.specPanic "encode of Type::TraitObject") := rfl
+theorem checkValue_unsized_panics :
+    checkValue (.Tuple []) (.Slice .Bool) =
+      .error (.specPanic "Value: slices cannot be represented as values") := rfl
 
 end MiniRustSpec.Correspondence.Witness

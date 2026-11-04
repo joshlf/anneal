@@ -811,6 +811,14 @@ fn bool_comparison_and_transmute_quotations_are_pinned() {
         ),
         (
             rvalue,
+            "(BitAnd, Type::Bool) => build::bool_and(l, r), \
+             (BitOr, Type::Bool) => build::bool_or(l, r), \
+             (BitXor, Type::Bool) => build::bool_xor(l, r),",
+            "(BitAnd, Type::Bool) => build::bit_and(l, r),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            rvalue,
             "(Lt, _) => build::lt(l, r), (Le, _) => build::le(l, r), (Gt, _) => build::gt(l, r), \
              (Ge, _) => build::ge(l, r), (Eq, _) => build::eq(l, r), (Ne, _) => build::ne(l, r),",
             "(Lt, _) => build::le(l, r),",
@@ -968,6 +976,40 @@ fn enum_tuple_and_cmp_quotations_are_pinned() {
             types,
             "Union { size, align, .. } | Enum { size, align, .. } => Sized(size, align),",
             "Union { size, align, .. } | Enum { size, align, .. } => Sized(align, size),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
+            "Slice { elem } => LayoutStrategy::Slice( \
+             elem.layout::<T>().expect_size(\"WF ensures slice element is sized\"), \
+             elem.layout::<T>().expect_align(\"WF ensures array element is sized\"), ), \
+             TraitObject(trait_name) => LayoutStrategy::TraitObject(trait_name),",
+            "Slice { elem } => LayoutStrategy::Sized( \
+             elem.layout::<T>().expect_size(\"WF ensures slice element is sized\"), \
+             elem.layout::<T>().expect_align(\"WF ensures array element is sized\"), ),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "fn decode<M: Memory>(Type::Slice { .. }: Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> { \
+             panic!(\"decode of Type::Slice\") }",
+            "fn decode<M: Memory>(Type::Slice { .. }: Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> { \
+             throw_ub!(\"decode of Type::Slice\") }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "fn encode<M: Memory>(Type::Slice { .. }: Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> { \
+             panic!(\"encode of Type::Slice\") }",
+            "fn encode<M: Memory>(Type::Slice { .. }: Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> { \
+             throw_ub!(\"encode of Type::Slice\") }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "(_, Type::Slice { .. }) => panic!(\"Value: slices cannot be represented as values\"), \
+             (_, Type::TraitObject { .. }) => panic!(\"Value: trait objects cannot be represented as values\"),",
+            "(_, Type::Slice { .. }) => throw_ub!(\"Value: slices cannot be represented as values\"),",
             "MiniRustSpec/Interp.lean",
         ),
         // `minimize`: `Cmp` is `build::cmp` transmuted to the translation of

@@ -955,6 +955,27 @@ theorem operandOkB_T {decls : List LocalDecl} {op : Operand}
     simp only [operandOkB, Bool.and_eq_true, operandIsBool_iff] at h
     exact h
 
+theorem operandType_of_operandIsOrdering {decls : List LocalDecl} {op : Operand}
+    (h : operandIsOrdering decls op = true) : operandType decls op = some orderingTy := by
+  match op, h with
+  | .copy ⟨j, []⟩, h =>
+    simp only [operandIsOrdering] at h
+    simp only [operandType]
+    cases hd : decls[j]? with
+    | none => simp [hd] at h
+    | some d => simp [hd] at h ⊢; exact scalarTypeOf_ordering h
+  | .constant c, h => simp only [operandIsOrdering] at h; exact scalarTypeOf_ordering h
+
+theorem operandOkO_T {decls : List LocalDecl} {op : Operand}
+    (h : operandOkO decls op = true) : OperandOkT decls orderingTy op := by
+  match op, h with
+  | .copy ⟨j, []⟩, h =>
+    simp only [operandOkO, Bool.and_eq_true, decide_eq_true_eq] at h
+    exact ⟨h.1, operandType_of_operandIsOrdering h.2⟩
+  | .constant c, h =>
+    simp only [operandOkO, Bool.and_eq_true] at h
+    exact ⟨operandType_of_operandIsOrdering h.1, h.2⟩
+
 /-- Evaluating a translated fragment operand of fragment type `T`. -/
 theorem evalValue_operandT {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     {locals : List LocalSlot} {m : Mach} {blk stmt : Nat} (h : FrameOk body f ctx locals m blk stmt)
@@ -1495,17 +1516,73 @@ theorem translateRvalue_rel {decls : List LocalDecl} {op : MirAst.BinOp} {a b : 
     | none => simp [hea, heb] at he
     | some eb => simp [hea, heb, hrel] at he; exact ⟨ea, eb, rfl, rfl, he.symm⟩
 
+/-- Bitwise evaluation of `BitAnd`, `BitOr`, and `BitXor` on `bool` bits (`0`
+or `1`). -/
+def boolBitEval : Gen.IntBinOp → Nat → Nat → Nat
+  | .BitAnd, x, y => if x = 1 ∧ y = 1 then 1 else 0
+  | .BitOr, x, y => if x = 1 ∨ y = 1 then 1 else 0
+  | .BitXor, x, y => if (x = 1) ≠ (y = 1) then 1 else 0
+  | _, _, _ => 0
+
+theorem boolBitEval_lt (iop : Gen.IntBinOp) (x y : Nat) : boolBitEval iop x y < 2 := by
+  unfold boolBitEval
+  split <;> try split
+  all_goals omega
+
+/-- `build::bool_and`, `build::bool_or`, and `build::bool_xor` on two `bool`
+operands: all three transmutes succeed because `0` and `1` are valid `bool`
+bytes and their bitwise combinations are also `0` or `1`. -/
+theorem evalValue_boolBitOp {op : MirAst.BinOp} {iop : Gen.IntBinOp}
+    (hop : translateBoolBitOp op = some iop) (m m1 m2 : Mach) (ea eb : Gen.ValueExpr)
+    (x y : Nat) (hx : x < 2) (hy : y < 2)
+    (ha : evalValue m ea = .ok ((valOf .Bool x, .Bool), m1))
+    (hb : evalValue m1 eb = .ok ((valOf .Bool y, .Bool), m2)) :
+    evalValue m (boolBitOp iop ea eb) =
+      .ok ((valOf .Bool (boolBitEval iop x y), .Bool), m2) := by
+  have ha8 := evalValue_boolToU8 m m1 ea (decide (x = 1)) ha
+  have hb8 := evalValue_boolToU8 m1 m2 eb (decide (y = 1)) hb
+  cases op <;> simp [translateBoolBitOp] at hop <;> subst hop <;>
+    rcases (by omega : x = 0 ∨ x = 1) with rfl | rfl <;>
+    rcases (by omega : y = 0 ∨ y = 1) with rfl | rfl <;>
+    simp [boolBitOp, evalValue, ha8, hb8] <;> rfl
+
+theorem translateRvalue_boolBit {decls : List LocalDecl} {op : MirAst.BinOp} {a b : Operand}
+    {e : Gen.ValueExpr} {iop : Gen.IntBinOp} (hop : translateBoolBitOp op = some iop)
+    (hty : operandType decls a = some .Bool)
+    (he : translateRvalue decls (.binaryOp op a b) = some e) :
+    ∃ ea eb, translateOperand a = some ea ∧ translateOperand b = some eb ∧
+      e = boolBitOp iop ea eb := by
+  have hrel : translateRelOp op = none := by
+    cases op <;> simp [translateBoolBitOp] at hop <;> rfl
+  have hbin : translateBinOp op = some iop := by
+    cases op <;> simp [translateBoolBitOp] at hop <;> subst hop <;> rfl
+  simp only [translateRvalue, Option.bind_eq_bind] at he
+  cases hea : translateOperand a with
+  | none => simp [hea] at he
+  | some ea =>
+    cases heb : translateOperand b with
+    | none => simp [hea, heb] at he
+    | some eb =>
+      simp [hea, heb, hrel, hbin, hty, hop] at he
+      exact ⟨ea, eb, rfl, rfl, he.symm⟩
+
 /-- The bit pattern an Anneal fragment rvalue of type `bool` evaluates to, or
 `none` when evaluating it is UB. -/
 def rvBitsB (decls : List LocalDecl) (locals : List LocalSlot) : Rvalue → Option Nat
   | .use op => opBits locals op
   | .unaryOp .not op => (opBits locals op).map (fun x => 1 - x)
-  | .binaryOp op a b => do
-    let rel ← translateRelOp op
-    let T ← operandType decls a
-    let x ← opBits locals a
-    let y ← opBits locals b
-    pure (if relBool rel (cmpOf T x y) then 1 else 0)
+  | .binaryOp op a b =>
+    match translateRelOp op with
+    | some rel => do
+      let T ← operandType decls a
+      let x ← opBits locals a
+      let y ← opBits locals b
+      pure (if relBool rel (cmpOf T x y) then 1 else 0)
+    | none => do
+      let iop ← translateBoolBitOp op
+      let x ← opBits locals a
+      let y ← opBits locals b
+      pure (boolBitEval iop x y)
   | _ => none
 
 /-- The operands of a fragment comparison have one fragment type. -/
@@ -1564,34 +1641,71 @@ theorem evalValue_rvalueB {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
   | .unaryOp .neg _, hok, _ => simp [rvalueOkB] at hok
   | .unaryOp .ptrMetadata _, hok, _ => simp [rvalueOkB] at hok
   | .binaryOp op a b, hok, he =>
-    simp only [rvalueOkB, Bool.and_eq_true] at hok
-    obtain ⟨hrelSome, hops⟩ := hok
-    obtain ⟨rel, hrel⟩ := Option.isSome_iff_exists.mp hrelSome
-    obtain ⟨ea, eb, hea, heb, rfl⟩ := translateRvalue_rel hrel he
-    obtain ⟨T, it, hT, htyA, hokA, hokB⟩ := relOperandsOk_spec hops
-    obtain ⟨hasome, hanone⟩ := evalValue_operandT h hT.frag a hokA ea hea
-    cases hxa : opBits locals a with
-    | none =>
-      refine ⟨fun r hr => by simp [rvBitsB, hrel, htyA, hxa] at hr, fun _ => ?_⟩
-      obtain ⟨msg, hmsg⟩ := hanone hxa
-      exact ⟨msg, by simp [evalValue, hmsg]⟩
-    | some x =>
-      obtain ⟨_, m1, hm1, h1⟩ := hasome x hxa
-      obtain ⟨hbsome, hbnone⟩ := evalValue_operandT h1 hT.frag b hokB eb heb
-      cases hyb : opBits locals b with
+    cases hrel : translateRelOp op with
+    | some rel =>
+      simp [rvalueOkB, hrel] at hok
+      obtain ⟨ea, eb, hea, heb, rfl⟩ := translateRvalue_rel hrel he
+      obtain ⟨T, it, hT, htyA, hokA, hokB⟩ := relOperandsOk_spec hok
+      obtain ⟨hasome, hanone⟩ := evalValue_operandT h hT.frag a hokA ea hea
+      cases hxa : opBits locals a with
       | none =>
-        refine ⟨fun r hr => by simp [rvBitsB, hrel, htyA, hxa, hyb] at hr, fun _ => ?_⟩
-        obtain ⟨msg, hmsg⟩ := hbnone hyb
-        exact ⟨msg, by simp [evalValue, hm1, hmsg]⟩
-      | some y =>
-        obtain ⟨_, m2, hm2, h2⟩ := hbsome y hyb
-        refine ⟨fun r hr => ?_, fun hr => by simp [rvBitsB, hrel, htyA, hxa, hyb] at hr⟩
-        simp [rvBitsB, hrel, htyA, hxa, hyb] at hr
-        subst hr
-        refine ⟨by split <;> omega, m2, ?_, h2⟩
-        simp only [evalValue, hm1, hm2, ok_bind, evalBinOp_rel_frag hT rel
-          (translateRelOp_ne_cmp hrel) x y]
-        cases relBool rel (cmpOf T x y) <;> rfl
+        refine ⟨fun r hr => by simp [rvBitsB, hrel, htyA, hxa] at hr, fun _ => ?_⟩
+        obtain ⟨msg, hmsg⟩ := hanone hxa
+        exact ⟨msg, by simp [evalValue, hmsg]⟩
+      | some x =>
+        obtain ⟨_, m1, hm1, h1⟩ := hasome x hxa
+        obtain ⟨hbsome, hbnone⟩ := evalValue_operandT h1 hT.frag b hokB eb heb
+        cases hyb : opBits locals b with
+        | none =>
+          refine ⟨fun r hr => by simp [rvBitsB, hrel, htyA, hxa, hyb] at hr, fun _ => ?_⟩
+          obtain ⟨msg, hmsg⟩ := hbnone hyb
+          exact ⟨msg, by simp [evalValue, hm1, hmsg]⟩
+        | some y =>
+          obtain ⟨_, m2, hm2, h2⟩ := hbsome y hyb
+          refine ⟨fun r hr => ?_, fun hr => by simp [rvBitsB, hrel, htyA, hxa, hyb] at hr⟩
+          simp [rvBitsB, hrel, htyA, hxa, hyb] at hr
+          subst hr
+          refine ⟨by split <;> omega, m2, ?_, h2⟩
+          simp only [evalValue, hm1, hm2, ok_bind, evalBinOp_rel_frag hT rel
+            (translateRelOp_ne_cmp hrel) x y]
+          cases relBool rel (cmpOf T x y) <;> rfl
+    | none =>
+      simp [rvalueOkB, hrel] at hok
+      obtain ⟨⟨hbitSome, hokA'⟩, hokB'⟩ := hok
+      cases hiop : translateBoolBitOp op with
+      | none => simp [hiop] at hbitSome
+      | some iop =>
+        have hokA := operandOkB_T hokA'
+        have hokB := operandOkB_T hokB'
+        have htyA : operandType body.localDecls a = some .Bool := by
+          match a, hokA with
+          | .copy ⟨_, []⟩, h => exact h.2
+          | .constant _, h => exact h.1
+        obtain ⟨ea, eb, hea, heb, rfl⟩ := translateRvalue_boolBit hiop htyA he
+        obtain ⟨hasome, hanone⟩ := evalValue_operandT h .bool a hokA ea hea
+        cases hxa : opBits locals a with
+        | none =>
+          refine ⟨fun r hr => by simp [rvBitsB, hrel, hiop, hxa] at hr, fun _ => ?_⟩
+          obtain ⟨msg, hmsg⟩ := hanone hxa
+          exact ⟨msg, by simp [boolBitOp, boolToU8, evalValue, hmsg]⟩
+        | some x =>
+          obtain ⟨hx, m1, hm1, h1⟩ := hasome x hxa
+          have hx2 : x < 2 := by simpa [ValidBits] using hx
+          have ha8 := evalValue_boolToU8 m m1 ea (decide (x = 1)) hm1
+          obtain ⟨hbsome, hbnone⟩ := evalValue_operandT h1 .bool b hokB eb heb
+          cases hyb : opBits locals b with
+          | none =>
+            refine ⟨fun r hr => by simp [rvBitsB, hrel, hiop, hxa, hyb] at hr, fun _ => ?_⟩
+            obtain ⟨msg, hmsg⟩ := hbnone hyb
+            refine ⟨msg, by simp [boolBitOp, evalValue, ha8]; simp [boolToU8, evalValue, hmsg]⟩
+          | some y =>
+            obtain ⟨hy, m2, hm2, h2⟩ := hbsome y hyb
+            have hy2 : y < 2 := by simpa [ValidBits] using hy
+            refine ⟨fun r hr => ?_, fun hr => by simp [rvBitsB, hrel, hiop, hxa, hyb] at hr⟩
+            simp [rvBitsB, hrel, hiop, hxa, hyb] at hr
+            subst hr
+            exact ⟨boolBitEval_lt iop x y, m2,
+              evalValue_boolBitOp hiop m m1 m2 ea eb x y hx2 hy2 hm1 hm2, h2⟩
   | .cast _ _ _, hok, _ => simp [rvalueOkB] at hok
   | .copyForDeref _, hok, _ => simp [rvalueOkB] at hok
   | .repeat _ _, hok, _ => simp [rvalueOkB] at hok
@@ -1679,17 +1793,21 @@ theorem translateRvalue_cmp {decls : List LocalDecl} {a b : Operand} {e : Gen.Va
       simp [hea, heb, translateRelOp, translateBinOp] at he
       exact ⟨ea, eb, rfl, rfl, he.symm⟩
 
-/-- A fragment rvalue of type `Ordering` is a three-way comparison. -/
+/-- A fragment rvalue of type `Ordering` is either a `Use` of an `Ordering`
+operand or a three-way comparison `Cmp`. -/
 theorem rvalueOkO_spec {decls : List LocalDecl} {rv : Rvalue} (h : rvalueOkO decls rv = true) :
-    ∃ a b, rv = .binaryOp .cmp a b ∧ relOperandsOk decls a b = true := by
+    (∃ op, rv = .use op ∧ operandOkO decls op = true) ∨
+    (∃ a b, rv = .binaryOp .cmp a b ∧ relOperandsOk decls a b = true) := by
   unfold rvalueOkO at h
   split at h
-  · exact ⟨_, _, rfl, h⟩
+  · exact .inl ⟨_, rfl, h⟩
+  · exact .inr ⟨_, _, rfl, h⟩
   · simp at h
 
 /-- The bit pattern an Anneal fragment rvalue of type `Ordering` evaluates to,
 or `none` when evaluating it is UB. -/
 def rvBitsO (decls : List LocalDecl) (locals : List LocalSlot) : Rvalue → Option Nat
+  | .use op => opBits locals op
   | .binaryOp .cmp a b => do
     let T ← operandType decls a
     let x ← opBits locals a
@@ -1707,29 +1825,31 @@ theorem evalValue_rvalueO {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
       ∃ m', evalValue m e = .ok ((valOf orderingTy r, orderingTy), m') ∧
         FrameOk body f ctx locals m' blk stmt) ∧
     (rvBitsO body.localDecls locals rv = none → ∃ msg, evalValue m e = .error (.ub msg)) := by
-  obtain ⟨a, b, rfl, hops⟩ := rvalueOkO_spec hok
-  obtain ⟨ea, eb, hea, heb, rfl⟩ := translateRvalue_cmp he
-  obtain ⟨T, it, hT, htyA, hokA, hokB⟩ := relOperandsOk_spec hops
-  obtain ⟨hasome, hanone⟩ := evalValue_operandT h hT.frag a hokA ea hea
-  cases hxa : opBits locals a with
-  | none =>
-    refine ⟨fun r hr => by simp [rvBitsO, htyA, hxa] at hr, fun _ => ?_⟩
-    obtain ⟨msg, hmsg⟩ := hanone hxa
-    exact ⟨msg, by simp [translateCmp, evalValue, hmsg]⟩
-  | some x =>
-    obtain ⟨_, m1, hm1, h1⟩ := hasome x hxa
-    obtain ⟨hbsome, hbnone⟩ := evalValue_operandT h1 hT.frag b hokB eb heb
-    cases hyb : opBits locals b with
+  rcases rvalueOkO_spec hok with ⟨op, rfl, hokOp⟩ | ⟨a, b, rfl, hops⟩
+  · simp only [translateRvalue] at he
+    exact evalValue_operandT h .ordering op (operandOkO_T hokOp) e he
+  · obtain ⟨ea, eb, hea, heb, rfl⟩ := translateRvalue_cmp he
+    obtain ⟨T, it, hT, htyA, hokA, hokB⟩ := relOperandsOk_spec hops
+    obtain ⟨hasome, hanone⟩ := evalValue_operandT h hT.frag a hokA ea hea
+    cases hxa : opBits locals a with
     | none =>
-      refine ⟨fun r hr => by simp [rvBitsO, htyA, hxa, hyb] at hr, fun _ => ?_⟩
-      obtain ⟨msg, hmsg⟩ := hbnone hyb
-      exact ⟨msg, by simp [translateCmp, evalValue, hm1, hmsg]⟩
-    | some y =>
-      obtain ⟨_, m2, hm2, h2⟩ := hbsome y hyb
-      refine ⟨fun r hr => ?_, fun hr => by simp [rvBitsO, htyA, hxa, hyb] at hr⟩
-      simp [rvBitsO, htyA, hxa, hyb] at hr
-      subst hr
-      exact ⟨validBits_ordBits _, m2, evalValue_translateCmp hT m m1 m2 ea eb x y hm1 hm2, h2⟩
+      refine ⟨fun r hr => by simp [rvBitsO, htyA, hxa] at hr, fun _ => ?_⟩
+      obtain ⟨msg, hmsg⟩ := hanone hxa
+      exact ⟨msg, by simp [translateCmp, evalValue, hmsg]⟩
+    | some x =>
+      obtain ⟨_, m1, hm1, h1⟩ := hasome x hxa
+      obtain ⟨hbsome, hbnone⟩ := evalValue_operandT h1 hT.frag b hokB eb heb
+      cases hyb : opBits locals b with
+      | none =>
+        refine ⟨fun r hr => by simp [rvBitsO, htyA, hxa, hyb] at hr, fun _ => ?_⟩
+        obtain ⟨msg, hmsg⟩ := hbnone hyb
+        exact ⟨msg, by simp [translateCmp, evalValue, hm1, hmsg]⟩
+      | some y =>
+        obtain ⟨_, m2, hm2, h2⟩ := hbsome y hyb
+        refine ⟨fun r hr => ?_, fun hr => by simp [rvBitsO, htyA, hxa, hyb] at hr⟩
+        simp [rvBitsO, htyA, hxa, hyb] at hr
+        subst hr
+        exact ⟨validBits_ordBits _, m2, evalValue_translateCmp hT m m1 m2 ea eb x y hm1 hm2, h2⟩
 
 /-- `Machine::eval_statement` on a translated fragment assignment to an
 `Ordering` local. -/

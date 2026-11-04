@@ -354,28 +354,6 @@ and alignment of a tuple without an unsized tail:
 def TupleHeadLayout.head_size_and_align (l : TupleHeadLayout) : Size × Align :=
   (Size.align_to l.end l.align, l.align)
 
-/-- `Type::layout::<x86_64>` for the interpreted types:
-> "Int(int_type) => Sized(int_type.size, int_type.align::<T>()),
->  Bool => Sized(Size::from_bytes_const(1), Align::ONE),
->  ..
->  Union { size, align, .. } | Enum { size, align, .. } => Sized(size, align),
->  Tuple { sized_head_layout, unsized_field, .. } => match unsized_field {
->      None => {
->          let (size, align) = sized_head_layout.head_size_and_align();
->          Sized(size, align)
->      }"
-A tuple with an unsized tail, pointers, arrays, slices, and trait objects are
-outside the fragment. -/
-def Type.layout : «Type» → Interp LayoutStrategy
-  | .Int t => do pure (.Sized t.size (← IntType.align t))
-  | .Bool => pure (.Sized ⟨1⟩ ⟨1⟩)
-  | .Union _ _ size align => pure (.Sized size align)
-  | .Enum _ _ _ size align => pure (.Sized size align)
-  | .Tuple _ headLayout none =>
-    let (size, align) := TupleHeadLayout.head_size_and_align headLayout
-    pure (.Sized size align)
-  | _ => unsupported "Type::layout for a pointer, array, slice, trait object, or unsized tuple"
-
 /-- `LayoutStrategy::expect_size` (`spec/lang/types.md`):
 > "pub fn expect_size(self, msg: &str) -> Size {
 >     match self {
@@ -386,7 +364,7 @@ def Type.layout : «Type» → Interp LayoutStrategy
 def LayoutStrategy.expect_size (l : LayoutStrategy) (msg : String) : Interp Size :=
   match l with
   | .Sized size _ => pure size
-  | _ => specPanic s!"expect_size called on unsized type: {msg}"
+  | _ => specPanic ("expect_size called on unsized type: " ++ msg)
 
 /-- `LayoutStrategy::expect_align` (`spec/lang/types.md`):
 > "pub fn expect_align(self, msg: &str) -> Align {
@@ -398,7 +376,48 @@ def LayoutStrategy.expect_size (l : LayoutStrategy) (msg : String) : Interp Size
 def LayoutStrategy.expect_align (l : LayoutStrategy) (msg : String) : Interp Align :=
   match l with
   | .Sized _ align => pure align
-  | _ => specPanic s!"expect_align called on unsized type: {msg}"
+  | _ => specPanic ("expect_align called on unsized type: " ++ msg)
+
+/-- `Type::layout::<x86_64>` for the interpreted types (`spec/lang/types.md`):
+> "Int(int_type) => Sized(int_type.size, int_type.align::<T>()),
+>  Bool => Sized(Size::from_bytes_const(1), Align::ONE),
+>  ..
+>  Union { size, align, .. } | Enum { size, align, .. } => Sized(size, align),
+>  Tuple { sized_head_layout, unsized_field, .. } => match unsized_field {
+>      None => {
+>          let (size, align) = sized_head_layout.head_size_and_align();
+>          Sized(size, align)
+>      }
+>      Some(tail_ty) => LayoutStrategy::Tuple {
+>          head: sized_head_layout,
+>          tail: tail_ty.layout::<T>(),
+>      },
+>  },
+>  ..
+>  Slice { elem } => LayoutStrategy::Slice(
+>      elem.layout::<T>().expect_size(\"WF ensures slice element is sized\"),
+>      elem.layout::<T>().expect_align(\"WF ensures array element is sized\"),
+>  ),
+>  TraitObject(trait_name) => LayoutStrategy::TraitObject(trait_name),"
+Pointers and arrays are outside the fragment. -/
+def Type.layout : «Type» → Interp LayoutStrategy
+  | .Int t => do pure (.Sized t.size (← IntType.align t))
+  | .Bool => pure (.Sized ⟨1⟩ ⟨1⟩)
+  | .Union _ _ size align => pure (.Sized size align)
+  | .Enum _ _ _ size align => pure (.Sized size align)
+  | .Tuple _ headLayout none =>
+    let (size, align) := TupleHeadLayout.head_size_and_align headLayout
+    pure (.Sized size align)
+  | .Tuple _ headLayout (some tailTy) => do
+    pure (.Tuple headLayout (← Type.layout tailTy))
+  | .Slice elem => do
+    let size ← LayoutStrategy.expect_size (← Type.layout elem)
+      "WF ensures slice element is sized"
+    let align ← LayoutStrategy.expect_align (← Type.layout elem)
+      "WF ensures array element is sized"
+    pure (.Slice size align)
+  | .TraitObject traitName => pure (.TraitObject traitName)
+  | _ => unsupported "Type::layout for a pointer or array type"
 
 /-! ## Representation relation (`spec/lang/representation.md`) -/
 
@@ -469,23 +488,24 @@ enum's `Discriminator` decision tree, reading tags through `accessor`:
 >         }
 >     }
 > }"
-The only accessor in the fragment (the one of `Type::decode` for `Enum`) is a
-pure function of its arguments, so `accessor` maps into `Interp` without
-further state. To keep the recursion structural, the `Branch` case passes the
-result of recursing into `fallback` to `decodeDiscriminantChildren`, which
-returns it exactly when no child's range `[start, end)` contains the tag; Lean
-is pure, so this equals choosing `next_discriminator` first and recursing on
-it afterwards. -/
-def decodeDiscriminant (accessor : Offset → Size → Interp (List Byte)) :
-    Discriminator → Interp (Option Int)
-  | .Known val => pure (some val)
-  | .Invalid => pure none
-  | .Branch offset valueType fallback ⟨children⟩ => do
-    let bytes ← accessor offset valueType.size
+The state that the `FnMut` accessor mutates (for `Type::decode` at `Enum`,
+`Unit`) is threaded through explicitly as `s : σ`. To keep the recursion
+structural while only touching the branch that `val` selects, the `Branch`
+case passes the continuation `decodeDiscriminant accessor fallback : σ →
+Interp (Option Int × σ)` to `decodeDiscriminantChildren`, which invokes it
+with the updated state `s` only when no child's range `[start, end)` contains
+`val`. -/
+def decodeDiscriminant {σ : Type}
+    (accessor : σ → Offset → Size → Interp (List Byte × σ)) :
+    Discriminator → σ → Interp (Option Int × σ)
+  | .Known val, s => pure (some val, s)
+  | .Invalid, s => pure (none, s)
+  | .Branch offset valueType fallback ⟨children⟩, s => do
+    let (bytes, s) ← accessor s offset valueType.size
     match ← Type.decodeInt valueType bytes with
     | some (.Int val) =>
-      decodeDiscriminantChildren accessor val (decodeDiscriminant accessor fallback) children
-    | _ => pure none
+      decodeDiscriminantChildren accessor val (decodeDiscriminant accessor fallback) children s
+    | _ => pure (none, s)
 
 /-- The choice of the next discriminator in `decode_discriminant`
 (`spec/lang/representation.md`), followed by the recursive call:
@@ -494,14 +514,16 @@ def decodeDiscriminant (accessor : Offset → Size → Interp (List Byte)) :
 >         if start <= val && val < end { Some(child) } else { None })
 >     .unwrap_or(fallback);
 > decode_discriminant::<M>(accessor, next_discriminator)"
-`onFallback` is the result of the recursive call on `fallback`. -/
-def decodeDiscriminantChildren (accessor : Offset → Size → Interp (List Byte)) (val : Int)
-    (onFallback : Interp (Option Int)) :
-    List ((Int × Int) × Discriminator) → Interp (Option Int)
-  | [] => onFallback
-  | ((start, end_), child) :: rest =>
-    if start ≤ val ∧ val < end_ then decodeDiscriminant accessor child
-    else decodeDiscriminantChildren accessor val onFallback rest
+`onFallback` is the continuation for `fallback`, invoked with `s` only when
+no child range contains `val`. -/
+def decodeDiscriminantChildren {σ : Type}
+    (accessor : σ → Offset → Size → Interp (List Byte × σ)) (val : Int)
+    (onFallback : σ → Interp (Option Int × σ)) :
+    List ((Int × Int) × Discriminator) → σ → Interp (Option Int × σ)
+  | [], s => onFallback s
+  | ((start, end_), child) :: rest, s =>
+    if start ≤ val ∧ val < end_ then decodeDiscriminant accessor child s
+    else decodeDiscriminantChildren accessor val onFallback rest s
 
 end
 
@@ -528,8 +550,8 @@ def encodeDiscriminant {σ : Type} (accessor : σ → Offset → List Byte → I
 
 mutual
 
-/-- `Type::decode` for `Bool`, `Int` (`Type.decodeInt`), `Tuple`, and `Enum`
-(`spec/lang/representation.md`):
+/-- `Type::decode` for `Bool`, `Int` (`Type.decodeInt`), `Tuple`, `Enum`,
+`Slice`, and `TraitObject` (`spec/lang/representation.md`):
 > "fn decode<M: Memory>(Type::Bool: Self, bytes: ..) -> Option<Value<M>> {
 >     if bytes.len() != 1 { panic!(..); }
 >     ret(match bytes[0] {
@@ -564,11 +586,17 @@ mutual
 >         else { return None };
 >     Some(Value::Variant { discriminant, data: value })
 > }"
+> "fn decode<M: Memory>(Type::Slice { .. }: Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> {
+>     panic!(\"decode of Type::Slice\")
+> }"
+> "fn decode<M: Memory>(Type::TraitObject(..): Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> {
+>     panic!(\"decode of Type::TraitObject\")
+> }"
 The fields of a tuple are decoded by `Type.decodeFields` and the data of an
 enum variant by `Type.decodeVariant`. `decode_discriminant` fails only if its
 accessor does; this accessor fails only by panicking (`subsliceWithLength` out
 of range), so `.unwrap()` is the propagation of that panic. Pointers, arrays,
-unions, and the unsized types are outside the fragment. -/
+and unions are outside the fragment. -/
 def Type.decode : «Type» → List Byte → Interp (Option Val)
   | .Bool, bytes =>
     if bytes.length ≠ 1 then specPanic "decode of Type::Bool with invalid length"
@@ -591,15 +619,18 @@ def Type.decode : «Type» → List Byte → Interp (Option Val)
   | .Enum ⟨variants⟩ _ discriminator size _, bytes =>
     if bytes.length ≠ size.bytes then specPanic "decode of Type::Enum with invalid length"
     else do
-      let accessor := fun (offset : Offset) (size : Size) =>
-        subsliceWithLength bytes offset.bytes size.bytes
-      match ← decodeDiscriminant accessor discriminator with
+      let accessor := fun (_ : Unit) (offset : Offset) (size : Size) => do
+        let bs ← subsliceWithLength bytes offset.bytes size.bytes
+        pure (bs, ())
+      match (← decodeDiscriminant accessor discriminator ()).1 with
       | none => pure none
       | some discriminant =>
         match ← Type.decodeVariant variants discriminant bytes with
         | some value => pure (some (.Variant discriminant value))
         | none => pure none
-  | _, _ => unsupported "Type::decode for a pointer, array, slice, union, or trait object type"
+  | .Slice _, _ => specPanic "decode of Type::Slice"
+  | .TraitObject _, _ => specPanic "decode of Type::TraitObject"
+  | _, _ => unsupported "Type::decode for a pointer, array, or union type"
 
 /-- The fields of `Type::decode` for `Tuple` (`spec/lang/representation.md`),
 each decoded from its own subslice:
@@ -641,8 +672,8 @@ end
 
 mutual
 
-/-- `Type::encode` for `Bool`, `Int` (`Type.encodeInt`), `Tuple`, and `Enum`
-(`spec/lang/representation.md`):
+/-- `Type::encode` for `Bool`, `Int` (`Type.encodeInt`), `Tuple`, `Enum`,
+`Slice`, and `TraitObject` (`spec/lang/representation.md`):
 > "fn encode<M: Memory>(Type::Bool: Self, val: Value<M>) -> .. {
 >     let Value::Bool(b) = val else { panic!() };
 >     list![AbstractByte::Init(if b { 1 } else { 0 }, None)]
@@ -678,9 +709,15 @@ mutual
 >     }, tagger).unwrap();
 >     bytes
 > }"
+> "fn encode<M: Memory>(Type::Slice { .. }: Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> {
+>     panic!(\"encode of Type::Slice\")
+> }"
+> "fn encode<M: Memory>(Type::TraitObject(..): Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> {
+>     panic!(\"encode of Type::TraitObject\")
+> }"
 The fields of a tuple are encoded by `Type.encodeFields` and the variant of
-an enum by `Type.encodeVariant`. Pointers, arrays, unions, and the unsized
-types are outside the fragment. -/
+an enum by `Type.encodeVariant`. Pointers, arrays, and unions are outside the
+fragment. -/
 def Type.encode : «Type» → Val → Interp (List Byte)
   | .Bool, .Bool b => pure [.Init (if b then 1 else 0) none]
   | .Bool, _ => specPanic "encode: Type::Bool with a non-Bool value"
@@ -700,7 +737,9 @@ def Type.encode : «Type» → Val → Interp (List Byte)
     match val with
     | .Variant discriminant data => Type.encodeVariant variants discriminant data
     | _ => specPanic "encode: Type::Enum with a non-Variant value"
-  | _, _ => unsupported "Type::encode for a pointer, array, slice, union, or trait object type"
+  | .Slice _, _ => specPanic "encode of Type::Slice"
+  | .TraitObject _, _ => specPanic "encode of Type::TraitObject"
+  | _, _ => unsupported "Type::encode for a pointer, array, or union type"
 
 /-- The field loop of `Type::encode` for `Tuple`
 (`spec/lang/representation.md`), which writes each field's encoding at its
@@ -734,8 +773,8 @@ end
 
 mutual
 
-/-- `Machine::check_value` for `Int`, `Bool`, `Tuple`, and `Variant`
-(`spec/lang/representation.md`):
+/-- `Machine::check_value` for `Int`, `Bool`, `Tuple`, `Variant`, `Slice`,
+and `TraitObject` (`spec/lang/representation.md`):
 > "(Value::Int(i), Type::Int(int_ty)) => {
 >     ensure_else_ub(int_ty.can_represent(i), \"Value::Int: invalid integer value\")?;
 > }
@@ -750,11 +789,11 @@ mutual
 > (Value::Variant { discriminant, data }, Type::Enum { variants, .. }) => {
 >     ..
 > }
-> ..
+> (_, Type::Slice { .. }) => panic!(\"Value: slices cannot be represented as values\"),
+> (_, Type::TraitObject { .. }) => panic!(\"Value: trait objects cannot be represented as values\"),
 > _ => panic!(\"Value: value does not match type\")"
 The fields of a tuple are checked by `checkFields` and the data of a variant
-by `checkVariant`. Pointers, arrays, unions, and the unsized types are outside
-the fragment. -/
+by `checkVariant`. Pointers, arrays, and unions are outside the fragment. -/
 def checkValue : Val → «Type» → Interp Unit
   | .Int i, .Int t =>
     if IntType.can_represent t i then pure () else ub "Value::Int: invalid integer value"
@@ -766,11 +805,13 @@ def checkValue : Val → «Type» → Interp Unit
       if vals.length ≠ fields.length then ub "Value::Tuple: invalid number of fields"
       else checkFields vals fields
   | .Variant discriminant data, .Enum ⟨variants⟩ _ _ _ _ => checkVariant variants discriminant data
+  | _, .Slice _ => specPanic "Value: slices cannot be represented as values"
+  | _, .TraitObject _ => specPanic "Value: trait objects cannot be represented as values"
   | _, .Int _ => specPanic "Value: value does not match type"
   | _, .Bool => specPanic "Value: value does not match type"
   | _, .Tuple _ _ _ => specPanic "Value: value does not match type"
   | _, .Enum _ _ _ _ _ => specPanic "Value: value does not match type"
-  | _, _ => unsupported "check_value for a pointer, array, slice, union, or trait object type"
+  | _, _ => unsupported "check_value for a pointer, array, or union type"
 
 /-- The field loop of `check_value` for tuples (`spec/lang/representation.md`):
 > "for (val, (_, ty)) in vals.zip(sized_fields) {

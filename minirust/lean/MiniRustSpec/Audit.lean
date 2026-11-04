@@ -155,7 +155,10 @@ open MiniRustSpec.Correspondence in
   evalBinOp_rel_frag
   evalValue_boolNot
   evalValue_boolToU8
+  evalValue_boolBitOp
   translateRvalue_cast_bool
+  translateRvalue_boolBit
+  evalScalarBinOp_boolBit
   switch_spec
   typedLoad_local_bool
   typedLoad_local_bool_uninit
@@ -175,6 +178,8 @@ open MiniRustSpec.Correspondence in
   evalBinOp_cmp_frag
   evalValue_translateCmp
   translateRvalue_cmp
+  operandType_of_operandIsOrdering
+  operandOkO_T
   evalValue_rvalueO
   evalStatement_assignO
   evalScalarBinOp_cmp_int
@@ -415,6 +420,23 @@ open MiniRustSpec.Correspondence.Witness in
   uninitOrdering_anneal_ub
   uninitOrdering_minirust_ub_from_start
   uninitOrdering_minirust_direct
+  ctxI8_ok_boolBitOrdUse
+  boolBitOrdUse_inFragment
+  boolBitOrdUse_translate
+  boolBitOrdInvalidTag_rejected
+  boolBitOrdUseCmp_anneal_ret
+  boolBitOrdUseCmp_noUB
+  boolBitOrdUseCmp_minirust_ret_from_start
+  boolBitOrdUseCmp_minirust_direct
+  boolBitOrdUseCopy_anneal_ret
+  boolBitOrdUseCopy_noUB
+  boolBitOrdUseCopy_minirust_ret_from_start
+  boolBitOrdUseCopy_minirust_direct
+  uninitBoolBitAnd_inFragment
+  uninitBoolBitAnd_translate
+  uninitBoolBitAnd_anneal_ub
+  uninitBoolBitAnd_minirust_ub_from_start
+  uninitBoolBitAnd_minirust_direct
   relLt_signed
   relGt_unsigned
   relCmp_signed
@@ -446,6 +468,16 @@ open MiniRustSpec.Correspondence.Witness in
   encode_paddedPair
   decode_paddedPair
   checkValue_tuple_arity
+  decodeDiscriminant_short_circuits
+  layout_slice
+  layout_traitObject
+  layout_unsizedTuple
+  expectSize_unsized_panics
+  expectAlign_traitObject_panics
+  transmute_unsized_panics
+  decode_unsized_panics
+  encode_unsized_panics
+  checkValue_unsized_panics
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -487,13 +519,18 @@ open MiniRustSpec.Correspondence in
   evalStmt_assignB
   evalScalarBinOp_rel_int
   evalScalarBinOp_rel_bool
+  evalScalarBinOp_boolBit
   evalUnaryNot_bool
   evalBinOp_rel_frag
   evalValue_boolNot
   evalValue_boolToU8
+  evalValue_boolBitOp
   translateRvalue_cast_bool
+  translateRvalue_boolBit
   switch_spec
   typedStore_base_frag
+  operandType_of_operandIsOrdering
+  operandOkO_T
   evalValue_rvalueO
   evalStatement_assignO
   evalRvalue_fragO
@@ -573,6 +610,23 @@ open MiniRustSpec.Correspondence.Witness in
   uninitOrdering_anneal_ub
   uninitOrdering_minirust_ub_from_start
   uninitOrdering_minirust_direct
+  ctxI8_ok_boolBitOrdUse
+  boolBitOrdUse_inFragment
+  boolBitOrdUse_translate
+  boolBitOrdInvalidTag_rejected
+  boolBitOrdUseCmp_anneal_ret
+  boolBitOrdUseCmp_noUB
+  boolBitOrdUseCmp_minirust_ret_from_start
+  boolBitOrdUseCmp_minirust_direct
+  boolBitOrdUseCopy_anneal_ret
+  boolBitOrdUseCopy_noUB
+  boolBitOrdUseCopy_minirust_ret_from_start
+  boolBitOrdUseCopy_minirust_direct
+  uninitBoolBitAnd_inFragment
+  uninitBoolBitAnd_translate
+  uninitBoolBitAnd_anneal_ub
+  uninitBoolBitAnd_minirust_ub_from_start
+  uninitBoolBitAnd_minirust_direct
   relLt_signed
   relGt_unsigned
   relCmp_signed
@@ -604,6 +658,16 @@ open MiniRustSpec.Correspondence.Witness in
   encode_paddedPair
   decode_paddedPair
   checkValue_tuple_arity
+  decodeDiscriminant_short_circuits
+  layout_slice
+  layout_traitObject
+  layout_unsizedTuple
+  expectSize_unsized_panics
+  expectAlign_traitObject_panics
+  transmute_unsized_panics
+  decode_unsized_panics
+  encode_unsized_panics
+  checkValue_unsized_panics
   sumTo_minirust_ret_from_start
   castBitNot4_minirust_ret_from_start
   uninitSwitchUb_minirust_ub_from_start
