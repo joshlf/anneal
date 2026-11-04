@@ -171,7 +171,11 @@ pub fn build_cargo_check_command(config: &CaptureDriverConfig) -> Command {
     let wrapper = resolve_rustc_wrapper(config);
     let existing_rustflags = env::var("RUSTFLAGS").ok();
     let rustflags = merge_rustflags(existing_rustflags.as_deref());
-    cmd.env("RUSTC_WORKSPACE_WRAPPER", wrapper);
+    cmd.env("RUSTC_WRAPPER", wrapper);
+    cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
+    cmd.env("ANNEAL_WHOLE_GRAPH_WRAPPER", "1");
+    cmd.env_remove("CARGO_PRIMARY_PACKAGE");
+    cmd.env_remove("CARGO_PKG_NAME");
     cmd.env(ANNEAL_CAPTURE_DIR_ENV, units_dir);
     if let Some(ref filter) = config.filter
         && !filter.trim().is_empty()
@@ -308,11 +312,28 @@ pub fn aggregate_unit_manifests(
 
         for record in unit.unit_targets {
             let def_id = record.target.def_id.clone();
-            if let Some(existing_target) = targets_by_def_id.get(&def_id) {
-                if existing_target != &record.target {
-                    return Err(format!(
-                        "conflicting captured target entry for def_id '{def_id}'"
-                    ));
+            if let Some(existing_record) = records_by_def_id.get(&def_id) {
+                if existing_record.target != record.target {
+                    // When the same item is captured both from a source-built
+                    // unit and from `.rmeta` in a downstream unit, or across two
+                    // units, prefer a `Subject` record over a `Callee` record,
+                    // and allow deduplication if one is `Callee`.
+                    if matches!(record.item_kind, CapturedItemKind::Subject)
+                        && matches!(existing_record.item_kind, CapturedItemKind::Callee)
+                    {
+                        targets_by_def_id.insert(def_id.clone(), record.target.clone());
+                        records_by_def_id.insert(def_id, record);
+                    } else if !matches!(record.item_kind, CapturedItemKind::Callee)
+                        && !matches!(existing_record.item_kind, CapturedItemKind::Callee)
+                    {
+                        return Err(format!(
+                            "conflicting captured target entry for def_id '{def_id}'"
+                        ));
+                    }
+                } else if matches!(record.item_kind, CapturedItemKind::Subject)
+                    && matches!(existing_record.item_kind, CapturedItemKind::Callee)
+                {
+                    records_by_def_id.insert(def_id, record);
                 }
             } else {
                 targets_by_def_id.insert(def_id.clone(), record.target.clone());
@@ -360,6 +381,7 @@ pub fn aggregate_unit_manifests(
                 lean_module_name,
                 item_kind: CapturedItemKind::Subject,
                 associated_subject_def_id: None,
+                trait_impls: Vec::new(),
             };
             if let Some(existing_target) = targets_by_def_id.get(&def_id) {
                 if existing_target != &target {
@@ -439,7 +461,8 @@ pub fn has_captured_unit_manifests(units_dir: &Path) -> bool {
 }
 
 /// Inspect `UnitCaptureManifest.json` files under `units_dir` and return the
-/// first non-empty `crate_name` recorded by `anneal-rustc-capture`.
+/// primary crate name (preferring a unit containing `Subject` or
+/// `UnsafeTraitImpl` targets) recorded by `anneal-rustc-capture`.
 pub fn infer_crate_name_from_units_dir(units_dir: &Path) -> Option<String> {
     if !units_dir.is_dir() {
         return None;
@@ -447,15 +470,27 @@ pub fn infer_crate_name_from_units_dir(units_dir: &Path) -> Option<String> {
     let mut unit_paths = Vec::new();
     collect_files_named(units_dir, "UnitCaptureManifest.json", &mut unit_paths).ok()?;
     unit_paths.sort();
+    let mut fallback: Option<String> = None;
     for path in unit_paths {
         let content = fs::read_to_string(&path).ok()?;
         let unit = parse_unit_capture_manifest(&content).ok()?;
         let trimmed = unit.crate_name.trim();
         if !trimmed.is_empty() {
-            return Some(trimmed.replace('-', "_"));
+            let normalized = trimmed.replace('-', "_");
+            if unit.unit_targets.iter().any(|t| {
+                matches!(
+                    t.item_kind,
+                    CapturedItemKind::Subject | CapturedItemKind::UnsafeTraitImpl
+                )
+            }) {
+                return Some(normalized);
+            }
+            if fallback.is_none() {
+                fallback = Some(normalized);
+            }
         }
     }
-    None
+    fallback
 }
 
 /// Drop unit manifests that a later compilation of the same crate superseded.
@@ -621,11 +656,32 @@ pub fn serialize_unit_capture_manifest(manifest: &UnitCaptureManifest) -> String
         ));
         match &rec.associated_subject_def_id {
             Some(assoc) => out.push_str(&format!(
-                "      \"associated_subject_def_id\": \"{}\"\n",
+                "      \"associated_subject_def_id\": \"{}\",\n",
                 escape_json(assoc)
             )),
-            None => out.push_str("      \"associated_subject_def_id\": null\n"),
+            None => out.push_str("      \"associated_subject_def_id\": null,\n"),
         }
+        out.push_str("      \"trait_impls\": [\n");
+        for (j, imp) in rec.trait_impls.iter().enumerate() {
+            let comma2 = if j + 1 < rec.trait_impls.len() { "," } else { "" };
+            out.push_str("        {\n");
+            out.push_str(&format!(
+                "          \"trait_method_def_path\": \"{}\",\n",
+                escape_json(&imp.trait_method_def_path)
+            ));
+            out.push_str("          \"trait_args_lean\": [\n");
+            for (k, arg) in imp.trait_args_lean.iter().enumerate() {
+                let comma3 = if k + 1 < imp.trait_args_lean.len() { "," } else { "" };
+                out.push_str(&format!("            \"{}\"{}\n", escape_json(arg), comma3));
+            }
+            out.push_str("          ],\n");
+            out.push_str(&format!(
+                "          \"impl_path\": \"{}\"\n",
+                escape_json(&imp.impl_path)
+            ));
+            out.push_str(&format!("        }}{comma2}\n"));
+        }
+        out.push_str("      ]\n");
         out.push_str(&format!("    }}{comma}\n"));
     }
     out.push_str("  ]\n}\n");
@@ -699,11 +755,46 @@ pub fn parse_unit_capture_manifest(input: &str) -> Result<UnitCaptureManifest, S
             }
         };
 
+        let mut trait_impls = Vec::new();
+        match get_field(item_obj, "trait_impls") {
+            None | Some(JsonValue::Null) => {}
+            Some(JsonValue::Array(arr)) => {
+                for ti_val in arr {
+                    let ti_obj = ti_val
+                        .as_object()
+                        .ok_or_else(|| "trait_impls entry must be an object".to_string())?;
+                    let trait_method_def_path = get_string_field(ti_obj, "trait_method_def_path")?;
+                    let impl_path = get_string_field(ti_obj, "impl_path")?;
+                    let mut trait_args_lean = Vec::new();
+                    if let Some(JsonValue::Array(args)) = get_field(ti_obj, "trait_args_lean") {
+                        for arg in args {
+                            if let JsonValue::Str(s) = arg {
+                                trait_args_lean.push(s.clone());
+                            } else {
+                                return Err("trait_args_lean elements must be strings".to_string());
+                            }
+                        }
+                    } else {
+                        return Err("field 'trait_args_lean' must be an array".to_string());
+                    }
+                    trait_impls.push(anneal_rustc_capture::manifest::ManifestTraitImplEntry {
+                        trait_method_def_path,
+                        trait_args_lean,
+                        impl_path,
+                    });
+                }
+            }
+            Some(_) => {
+                return Err("field 'trait_impls' must be an array".to_string());
+            }
+        }
+
         unit_targets.push(UnitTargetRecord {
             target,
             lean_module_name,
             item_kind,
             associated_subject_def_id,
+            trait_impls,
         });
     }
 
@@ -1096,6 +1187,7 @@ mod tests {
                     lean_module_name: "Mir.DemoCrate.add".to_string(),
                     item_kind: CapturedItemKind::Subject,
                     associated_subject_def_id: None,
+                    trait_impls: Vec::new(),
                 },
                 UnitTargetRecord {
                     target: CapturedTarget {
@@ -1107,6 +1199,7 @@ mod tests {
                     lean_module_name: "Mir.DemoCrate.__anodized_fn_requires_add".to_string(),
                     item_kind: CapturedItemKind::InlineSpecRequires,
                     associated_subject_def_id: Some("demo_crate::add".to_string()),
+                    trait_impls: Vec::new(),
                 },
             ],
         };
@@ -1179,6 +1272,7 @@ mod tests {
                 lean_module_name: "Mir.CrateB.zeta".to_string(),
                 item_kind: CapturedItemKind::Subject,
                 associated_subject_def_id: None,
+                trait_impls: Vec::new(),
             }],
         };
 
@@ -1203,6 +1297,7 @@ mod tests {
                     lean_module_name: "Mir.CrateA.alpha".to_string(),
                     item_kind: CapturedItemKind::Subject,
                     associated_subject_def_id: None,
+                    trait_impls: Vec::new(),
                 },
                 // Duplicate target across units with identical digest should
                 // deduplicate cleanly.
@@ -1215,6 +1310,7 @@ mod tests {
                     lean_module_name: "Mir.CrateB.zeta".to_string(),
                     item_kind: CapturedItemKind::Subject,
                     associated_subject_def_id: None,
+                    trait_impls: Vec::new(),
                 },
             ],
         };
@@ -1315,6 +1411,7 @@ mod tests {
                 lean_module_name: format!("Mir.Demo.{}", def_id.replace("demo::", "")),
                 item_kind: CapturedItemKind::Subject,
                 associated_subject_def_id: None,
+                trait_impls: Vec::new(),
             }],
         };
 
@@ -1395,5 +1492,132 @@ mod tests {
             filter_val,
             std::ffi::OsStr::new("checked_scale,Ptr::try_from")
         );
+    }
+
+    #[test]
+    fn multi_crate_workspace_captures_dependency_and_sysroot_mir_while_scoping_obligations() {
+        let root = unique_temp_dir("multi-crate-whole-graph");
+        let crate_a_dir = root.join("crate_a");
+        let crate_b_dir = root.join("crate_b");
+        fs::create_dir_all(crate_a_dir.join("src")).expect("create crate_a/src");
+        fs::create_dir_all(crate_b_dir.join("src")).expect("create crate_b/src");
+
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crate_a\", \"crate_b\"]\nresolver = \"2\"\n",
+        )
+        .expect("write workspace Cargo.toml");
+
+        fs::write(
+            crate_b_dir.join("Cargo.toml"),
+            "[package]\nname = \"crate_b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write crate_b/Cargo.toml");
+        fs::write(
+            crate_b_dir.join("src/lib.rs"),
+            "#![no_std]\npub fn helper_add(x: usize, y: usize) -> usize {\n    x.wrapping_add(y)\n}\n",
+        )
+        .expect("write crate_b/src/lib.rs");
+
+        fs::write(
+            crate_a_dir.join("Cargo.toml"),
+            "[package]\nname = \"crate_a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ncrate_b = { path = \"../crate_b\" }\n",
+        )
+        .expect("write crate_a/Cargo.toml");
+        fs::write(
+            crate_a_dir.join("src/lib.rs"),
+            "#![no_std]\npub fn slice_len_plus_helper(s: &[u8], extra: usize) -> usize {\n    let len_fn: fn(&[u8]) -> usize = <[u8]>::len;\n    crate_b::helper_add(len_fn(s) + (s.as_ptr() as usize), extra)\n}\n",
+        )
+        .expect("write crate_a/src/lib.rs");
+
+        let mut cfg = CaptureDriverConfig::new(&crate_a_dir);
+        cfg.manifest_path = Some(crate_a_dir.join("Cargo.toml"));
+        let wrapper = resolve_rustc_wrapper(&cfg);
+        if !wrapper.is_file() {
+            // Ensure `anneal-rustc-capture` is built if running unit test standalone.
+            let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .expect("repo root");
+            let status = Command::new("cargo")
+                .args(["build", "-p", "anneal-rustc-capture"])
+                .current_dir(repo_root)
+                .status()
+                .expect("build anneal-rustc-capture");
+            assert!(status.success(), "cargo build -p anneal-rustc-capture must succeed");
+        }
+
+        let (manifest, records) =
+            run_cargo_capture(&cfg).expect("run_cargo_capture on multi-crate workspace");
+        assert!(manifest.compilation_succeeded);
+
+        // 1. Primary crate item `crate_a::slice_len_plus_helper` is `Subject`.
+        let subj_rec = records
+            .iter()
+            .find(|r| r.target.def_id == "crate_a::slice_len_plus_helper")
+            .expect("find primary subject crate_a::slice_len_plus_helper");
+        assert_eq!(subj_rec.item_kind, CapturedItemKind::Subject);
+
+        // 2. Dependency crate item `crate_b::helper_add` is captured as `Callee`.
+        let dep_rec = records
+            .iter()
+            .find(|r| r.target.def_id == "crate_b::helper_add")
+            .expect("find dependency target crate_b::helper_add");
+        assert_eq!(dep_rec.item_kind, CapturedItemKind::Callee);
+        assert_eq!(dep_rec.lean_module_name, "Mir.CrateB.helper_add");
+
+        // 3. Sysroot `core::slice::<impl [T]>::len` is captured as `Callee`.
+        let core_len_rec = records
+            .iter()
+            .find(|r| r.lean_module_name.starts_with("Mir.Core.") && r.target.def_id.ends_with("::len"))
+            .expect("find sysroot Mir.Core.* len target");
+        assert_eq!(core_len_rec.item_kind, CapturedItemKind::Callee);
+
+        // 4. Scaffold the workspace and verify that `Mir/CrateA/*`, `Mir/CrateB/*`, and
+        // `Mir/Core/*` are placed in `.anneal/generated/Mir/`, while ONLY `crate_a`
+        // generates `Obligations/CrateA/*` and `Verify/CrateA/*` proof obligations!
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root");
+        let mut scaffold_cfg = crate::scaffold::ScaffoldConfig::new(&crate_a_dir);
+        scaffold_cfg.units_dir = Some(cfg.units_dir.clone());
+        scaffold_cfg.anneal_repo_root = Some(repo_root.to_path_buf());
+        let scaffold_report =
+            crate::scaffold::scaffold_workspace_with_config(&scaffold_cfg, &records)
+                .expect("scaffold multi-crate workspace");
+
+        assert_eq!(scaffold_report.generated_obligation_files.len(), 1);
+        assert_eq!(scaffold_report.generated_verify_files.len(), 1);
+        assert!(
+            crate_a_dir
+                .join(".anneal/generated/Mir/CrateA/slice_len_plus_helper.lean")
+                .is_file()
+        );
+        assert!(
+            crate_a_dir
+                .join(".anneal/generated/Mir/CrateB/helper_add.lean")
+                .is_file()
+        );
+        assert!(
+            crate_a_dir
+                .join(".anneal/generated")
+                .join(&core_len_rec.target.mir_module_path)
+                .is_file()
+        );
+        assert!(
+            !crate_a_dir
+                .join(".anneal/generated/Verify/CrateB")
+                .exists(),
+            "non-primary crate_b must not generate Verify/CrateB obligations"
+        );
+        assert!(
+            !crate_a_dir
+                .join(".anneal/generated/Verify/Core")
+                .exists(),
+            "sysroot core must not generate Verify/Core obligations"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

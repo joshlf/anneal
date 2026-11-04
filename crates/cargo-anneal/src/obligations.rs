@@ -270,7 +270,8 @@ pub fn group_subject_obligations(records: &[UnitTargetRecord]) -> Vec<SubjectObl
             CapturedItemKind::Subject
             | CapturedItemKind::Model
             | CapturedItemKind::TypeInvariant
-            | CapturedItemKind::UnsafeTraitImpl => {}
+            | CapturedItemKind::UnsafeTraitImpl
+            | CapturedItemKind::Callee => {}
         }
     }
 
@@ -1053,6 +1054,26 @@ pub fn render_verify_module_with_options(
              /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
              abbrev Certificate : Prop := TotalVerificationResult Obligations.{item}.totalClaim\n\n"
         ));
+    } else if !authored.has_specs
+        && bundle.inline_requires.is_empty()
+        && bundle.inline_ensures.is_empty()
+    {
+        out.push_str(&format!(
+            "/-- Low-priority fallback `ItemProof` instance attempting bounded\n    \
+                `WP` discharge when no authored `Proof.{item}` module exists on\n    \
+                disk. -/\n\
+             instance (priority := low) defaultProof :\n    \
+                 ItemProof \"{def_id}\" Obligations.{item}.claim where\n  \
+               verified :=\n    \
+                 Anneal.Rustc.V2026_06_01.SymbolicEval.verifyByWP Obligations.{item}.claim 64 (by\n      \
+                   intro _ _\n      \
+                   exact True.intro)\n\n\
+             /-- Kernel-checked verification certificate for `{def_id}`. -/\n\
+             theorem verified : VerificationResult Obligations.{item}.claim :=\n  \
+               (inferInstance : ItemProof \"{def_id}\" Obligations.{item}.claim).verified\n\n\
+             /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
+             abbrev Certificate : Prop := VerificationResult Obligations.{item}.claim\n\n"
+        ));
     } else {
         let opt_req = if bundle.inline_requires.len() == 1 {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
@@ -1103,7 +1124,7 @@ pub fn render_verify_module_with_options(
                  ItemProof \"{def_id}\" Obligations.{item}.claim where\n  \
                verified := by\n    \
                  first\n\
-             {branches}\n\
+             {branches}\
              /-- Kernel-checked verification certificate for `{def_id}`. -/\n\
              theorem verified : VerificationResult Obligations.{item}.claim :=\n  \
                (inferInstance : ItemProof \"{def_id}\" Obligations.{item}.claim).verified\n\n\
@@ -1357,6 +1378,7 @@ mod tests {
                 lean_module_name: "Mir.MyCrate.math.inc".to_string(),
                 item_kind: CapturedItemKind::Subject,
                 associated_subject_def_id: None,
+                trait_impls: Vec::new(),
             },
             UnitTargetRecord {
                 target: CapturedTarget {
@@ -1368,6 +1390,7 @@ mod tests {
                 lean_module_name: "Mir.MyCrate.math.__anodized_fn_requires_inc".to_string(),
                 item_kind: CapturedItemKind::InlineSpecRequires,
                 associated_subject_def_id: Some("my_crate::math::inc".to_string()),
+                trait_impls: Vec::new(),
             },
             UnitTargetRecord {
                 target: CapturedTarget {
@@ -1379,6 +1402,7 @@ mod tests {
                 lean_module_name: "Mir.MyCrate.math.__anodized_fn_ensures_inc".to_string(),
                 item_kind: CapturedItemKind::InlineSpecEnsures,
                 associated_subject_def_id: Some("my_crate::math::inc".to_string()),
+                trait_impls: Vec::new(),
             },
         ]
     }
@@ -1466,6 +1490,7 @@ mod tests {
             lean_module_name: "Mir.MyCrate.math.id".to_string(),
             item_kind: CapturedItemKind::Subject,
             associated_subject_def_id: None,
+            trait_impls: Vec::new(),
         };
         let empty_bundle = SubjectObligationBundle {
             subject: subject.clone(),
@@ -1484,6 +1509,7 @@ mod tests {
                 lean_module_name: "Mir.MyCrate.math.__ANNEAL_EXT_SPEC_TARGET_id".to_string(),
                 item_kind: CapturedItemKind::ExternalSpec,
                 associated_subject_def_id: Some("my_crate::math::id".to_string()),
+                trait_impls: Vec::new(),
             }],
             called_callees: Vec::new(),
         };
@@ -1515,6 +1541,7 @@ mod tests {
                     lean_module_name: "Mir.MyCrate.math.__anodized_fn_requires_id_0".to_string(),
                     item_kind: CapturedItemKind::InlineSpecRequires,
                     associated_subject_def_id: Some("my_crate::math::id".to_string()),
+                    trait_impls: Vec::new(),
                 },
                 UnitTargetRecord {
                     target: CapturedTarget {
@@ -1526,6 +1553,7 @@ mod tests {
                     lean_module_name: "Mir.MyCrate.math.__anodized_fn_requires_id_1".to_string(),
                     item_kind: CapturedItemKind::InlineSpecRequires,
                     associated_subject_def_id: Some("my_crate::math::id".to_string()),
+                    trait_impls: Vec::new(),
                 },
             ],
             inline_ensures: Vec::new(),
@@ -1747,6 +1775,7 @@ mod tests {
             lean_module_name: String::new(),
             item_kind: CapturedItemKind::ExternalSpec,
             associated_subject_def_id: Some("my_crate::math::inc".to_string()),
+            trait_impls: Vec::new(),
         });
         records.push(UnitTargetRecord {
             target: CapturedTarget {
@@ -1758,6 +1787,7 @@ mod tests {
             lean_module_name: String::new(),
             item_kind: CapturedItemKind::ExternalSpec,
             associated_subject_def_id: Some("my_crate::math::inc".to_string()),
+            trait_impls: Vec::new(),
         });
 
         let bundles = group_subject_obligations(&records);
@@ -1796,6 +1826,7 @@ mod tests {
             lean_module_name: String::new(),
             item_kind: CapturedItemKind::ExternalSpec,
             associated_subject_def_id: Some("my_crate::math::inc".to_string()),
+            trait_impls: Vec::new(),
         });
 
         let bundles = group_subject_obligations(&records);
@@ -1871,6 +1902,7 @@ mod tests {
             lean_module_name: String::new(),
             item_kind: CapturedItemKind::ExternalSpec,
             associated_subject_def_id: Some("my_crate::math::inc".to_string()),
+            trait_impls: Vec::new(),
         });
         let total_bundles = group_subject_obligations(&caller_bundle);
         let total_verify =

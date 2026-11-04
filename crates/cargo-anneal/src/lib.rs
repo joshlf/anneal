@@ -910,6 +910,7 @@ pub fn render_extract_report(
                     record.lean_module_name.as_str(),
                 ));
             }
+            CapturedItemKind::Callee => {}
         }
     }
     subjects.sort_by(|a, b| a.0.cmp(b.0));
@@ -2413,18 +2414,21 @@ mod tests {
                 lean_module_name: "Mir.Demo.id".to_string(),
                 item_kind: CapturedItemKind::Subject,
                 associated_subject_def_id: None,
+                trait_impls: Vec::new(),
             },
             UnitTargetRecord {
                 target: manifest.targets[1].clone(),
                 lean_module_name: "Mir.Demo.__anodized_fn_requires_id".to_string(),
                 item_kind: CapturedItemKind::InlineSpecRequires,
                 associated_subject_def_id: Some("demo::id".to_string()),
+                trait_impls: Vec::new(),
             },
             UnitTargetRecord {
                 target: manifest.targets[2].clone(),
                 lean_module_name: "Mir.Demo.__anodized_fn_ensures_id".to_string(),
                 item_kind: CapturedItemKind::InlineSpecEnsures,
                 associated_subject_def_id: Some("demo::id".to_string()),
+                trait_impls: Vec::new(),
             },
         ];
 
@@ -2553,6 +2557,7 @@ mod tests {
                 lean_module_name: "Mir.Demo.id".to_string(),
                 item_kind: CapturedItemKind::Subject,
                 associated_subject_def_id: None,
+                trait_impls: Vec::new(),
             }],
         };
         fs::write(

@@ -678,6 +678,7 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
                 lean_module_name: format!("Mir.{suffix}"),
                 item_kind: CapturedItemKind::Subject,
                 associated_subject_def_id: None,
+                trait_impls: Vec::new(),
             },
             item_module_suffix: suffix.clone(),
             item_rel_path: rel_path.clone(),
@@ -886,16 +887,26 @@ fn find_source_mir_file(
     rel_item_path: &Path,
 ) -> Option<PathBuf> {
     let recorded_rel = Path::new(&record.target.mir_module_path);
+    let expected_sha = &record.target.mir_module_sha256;
+
+    let matches_sha = |path: &Path| -> bool {
+        if expected_sha.is_empty() {
+            return true;
+        }
+        fs::read(path)
+            .ok()
+            .is_some_and(|bytes| &sha256_hex(&bytes) == expected_sha)
+    };
 
     if let Some(ref units_dir) = config.units_dir
         && units_dir.is_dir()
     {
         let direct_recorded = units_dir.join(recorded_rel);
-        if direct_recorded.is_file() {
+        if direct_recorded.is_file() && matches_sha(&direct_recorded) {
             return Some(direct_recorded);
         }
         let direct_mir = units_dir.join("Mir").join(rel_item_path);
-        if direct_mir.is_file() {
+        if direct_mir.is_file() && matches_sha(&direct_mir) {
             return Some(direct_mir);
         }
         if let Ok(entries) = fs::read_dir(units_dir) {
@@ -904,15 +915,29 @@ fn find_source_mir_file(
                 .filter(|p| p.is_dir())
                 .collect();
             subdirs.sort();
+            let mut fallback_match: Option<PathBuf> = None;
             for unit_subdir in subdirs {
                 let candidate_recorded = unit_subdir.join(recorded_rel);
                 if candidate_recorded.is_file() {
-                    return Some(candidate_recorded);
+                    if matches_sha(&candidate_recorded) {
+                        return Some(candidate_recorded);
+                    }
+                    if fallback_match.is_none() {
+                        fallback_match = Some(candidate_recorded);
+                    }
                 }
                 let candidate_mir = unit_subdir.join("Mir").join(rel_item_path);
                 if candidate_mir.is_file() {
-                    return Some(candidate_mir);
+                    if matches_sha(&candidate_mir) {
+                        return Some(candidate_mir);
+                    }
+                    if fallback_match.is_none() {
+                        fallback_match = Some(candidate_mir);
+                    }
                 }
+            }
+            if let Some(found) = fallback_match {
+                return Some(found);
             }
         }
     }
@@ -1173,6 +1198,7 @@ mod tests {
             lean_module_name: "Mir.MyCrate.compute".to_string(),
             item_kind: CapturedItemKind::Subject,
             associated_subject_def_id: None,
+            trait_impls: Vec::new(),
         }];
 
         // Default scaffold run: creates only `.anneal/generated/` without
@@ -1244,6 +1270,7 @@ mod tests {
                 lean_module_name: "Mir.MyCrate.__anodized_fn_requires_compute".to_string(),
                 item_kind: CapturedItemKind::InlineSpecRequires,
                 associated_subject_def_id: Some("my_crate::compute".to_string()),
+                trait_impls: Vec::new(),
             },
         ];
 
@@ -1288,6 +1315,7 @@ mod tests {
             lean_module_name: format!("Mir.MyCrate.{name}"),
             item_kind: CapturedItemKind::Subject,
             associated_subject_def_id: None,
+            trait_impls: Vec::new(),
         };
 
         scaffold_workspace(&workspace, &[record("keep"), record("gone")])
@@ -1389,6 +1417,7 @@ mod tests {
             lean_module_name: "Mir.MyCrate.ptr_op".to_string(),
             item_kind: CapturedItemKind::Subject,
             associated_subject_def_id: None,
+            trait_impls: Vec::new(),
         }];
         scaffold_workspace(&workspace, &records).expect("scaffold stateful workspace");
 
@@ -1414,6 +1443,7 @@ mod tests {
             lean_module_name: "Mir.MyCrate.add".to_string(),
             item_kind: CapturedItemKind::Subject,
             associated_subject_def_id: None,
+            trait_impls: Vec::new(),
         }];
 
         let cfg = ScaffoldConfig::new(&workspace)

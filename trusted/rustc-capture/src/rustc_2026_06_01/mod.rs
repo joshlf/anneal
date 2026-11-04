@@ -1457,4 +1457,184 @@ example :
 
         let _ = fs::remove_dir_all(&temp_root);
     }
+
+    #[test]
+    fn driver_captures_sysroot_core_slice_and_range_bounds_mir() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = std::env::temp_dir().join(format!(
+            "anneal-rustc-capture-sysroot-test-{}-{nanos}",
+            std::process::id()
+        ));
+        let capture_dir = temp_root.join("units");
+        fs::create_dir_all(&temp_root).expect("create temp test dir");
+
+        let src_path = temp_root.join("sysroot_lib.rs");
+        let rust_source = r#"#![no_std]
+
+use core::ops::{Range, RangeBounds};
+
+pub fn slice_len_and_ptr<T>(s: &[T]) -> (usize, *const T) {
+    let len_fn: fn(&[T]) -> usize = <[T]>::len;
+    (len_fn(s), s.as_ptr())
+}
+
+pub unsafe fn rebuild_and_split<T>(ptr: *mut T, len: usize, mid: usize) -> (*mut [T], *mut [T]) {
+    let whole: &mut [T] = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
+    let (left, right) = whole.split_at_mut(mid);
+    (left as *mut [T], right as *mut [T])
+}
+
+pub fn check_range_contains(r: &Range<usize>, idx: &usize) -> bool {
+    RangeBounds::contains(r, idx)
+}
+"#;
+        fs::write(&src_path, rust_source.as_bytes()).expect("write sysroot_lib.rs");
+
+        let args = vec![
+            String::from("rustc"),
+            String::from("--crate-name"),
+            String::from("demo_sysroot"),
+            String::from("--crate-type"),
+            String::from("lib"),
+            String::from("--edition=2024"),
+            String::from("-C"),
+            String::from("metadata=sysroot01"),
+            String::from("--out-dir"),
+            temp_root.to_string_lossy().into_owned(),
+            src_path.to_string_lossy().into_owned(),
+        ];
+
+        let exit_code = run_with_args(&args, Some(capture_dir.clone()), None);
+        assert_eq!(exit_code, 0, "rustc_driver capture run must succeed");
+
+        let unit_dir = capture_dir.join("demo_sysroot-sysroot01");
+        let manifest_path = unit_dir.join("UnitCaptureManifest.json");
+        let manifest_str =
+            fs::read_to_string(&manifest_path).expect("read UnitCaptureManifest.json");
+        let manifest =
+            UnitCaptureManifest::from_json_str(&manifest_str).expect("parse UnitCaptureManifest");
+        assert!(manifest.compilation_succeeded);
+
+        // 1. Verify primary crate subjects are captured as `Subject`.
+        for expected_subj in [
+            "demo_sysroot::slice_len_and_ptr",
+            "demo_sysroot::rebuild_and_split",
+            "demo_sysroot::check_range_contains",
+        ] {
+            let rec = manifest
+                .unit_targets
+                .iter()
+                .find(|t| t.target.def_id == expected_subj)
+                .unwrap_or_else(|| panic!("missing subject target {expected_subj}"));
+            assert_eq!(rec.item_kind, CapturedItemKind::Subject);
+        }
+
+        // 2. Verify reachable sysroot (`core`) MIR bodies are extracted from `.rmeta`
+        // into `Mir/Core/*.lean` with `CapturedItemKind::Callee` and polymorphic
+        // `genericParams`.
+        let core_targets: Vec<& crate::manifest::UnitTargetRecord> = manifest
+            .unit_targets
+            .iter()
+            .filter(|t| t.lean_module_name.starts_with("Mir.Core."))
+            .collect();
+        assert!(
+            !core_targets.is_empty(),
+            "expected Mir.Core.* targets extracted from sysroot .rmeta"
+        );
+        for ct in &core_targets {
+            assert_eq!(
+                ct.item_kind,
+                CapturedItemKind::Callee,
+                "sysroot target {} must have Callee item_kind",
+                ct.target.def_id
+            );
+            assert!(
+                ct.target.mir_module_path.starts_with("Mir/Core/"),
+                "unexpected mir_module_path: {}",
+                ct.target.mir_module_path
+            );
+        }
+
+        let core_def_ids: Vec<&str> = core_targets
+            .iter()
+            .map(|t| t.target.def_id.as_str())
+            .collect();
+        for required_sub in ["len", "as_ptr", "from_raw_parts_mut", "split_at_mut", "contains"] {
+            assert!(
+                core_def_ids.iter().any(|id| id.contains(required_sub)),
+                "expected sysroot core targets to include `{required_sub}`, got: {core_def_ids:?}"
+            );
+        }
+
+        // Check that polymorphic sysroot bodies preserve genericParams and real CFG blocks.
+        let len_rec = core_targets
+            .iter()
+            .find(|t| t.target.def_id.ends_with("::len"))
+            .expect("find <[T]>::len in core_targets");
+        let len_lean =
+            fs::read_to_string(unit_dir.join(&len_rec.target.mir_module_path)).expect("read len.lean");
+        assert!(
+            len_lean.contains("genericParams := (List.cons { idx := 0, name := \"T\" } List.nil)"),
+            "<[T]>::len must preserve polymorphic genericParams:\n{len_lean}"
+        );
+        assert!(
+            len_lean.contains("phase := MirPhaseTag.runtimeOptimized"),
+            "<[T]>::len from .rmeta must record MirPhaseTag.runtimeOptimized phase:\n{len_lean}"
+        );
+
+        // 3. Verify that every emitted Mir/DemoSysroot/*.lean and Mir/Core/*.lean module
+        // typechecks cleanly in the Lean 4 kernel!
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root");
+        let examples_dir = repo_root.join("examples");
+        let lean_lib_dir = examples_dir.join(".lake/build/lib/lean");
+        let resolve_bin = |name: &str| -> PathBuf {
+            if let Ok(home) = std::env::var("HOME") {
+                let elan_bin = PathBuf::from(home).join(".elan/bin").join(name);
+                if elan_bin.exists() {
+                    return elan_bin;
+                }
+            }
+            PathBuf::from(name)
+        };
+        if !lean_lib_dir.join("Trusted.olean").exists() {
+            let status = Command::new(resolve_bin("lake"))
+                .args(["--dir", examples_dir.to_str().unwrap(), "build", "Trusted"])
+                .status()
+                .expect("invoke lake build Trusted");
+            assert!(status.success(), "lake build Trusted must succeed");
+        }
+
+        let lean_bin = resolve_bin("lean");
+        let lean_path_env = format!("{}:{}", lean_lib_dir.display(), unit_dir.display());
+        for target_rec in &manifest.unit_targets {
+            let src_lean = unit_dir.join(&target_rec.target.mir_module_path);
+            let dst_olean = src_lean.with_extension("olean");
+            let out = Command::new(&lean_bin)
+                .current_dir(&unit_dir)
+                .env("LEAN_PATH", &lean_path_env)
+                .arg("-R")
+                .arg(&unit_dir)
+                .arg("-o")
+                .arg(&dst_olean)
+                .arg(&src_lean)
+                .output()
+                .expect("compile emitted Mir module with lean");
+            assert!(
+                out.status.success(),
+                "lean failed on {} ({}):\nstdout: {}\nstderr: {}",
+                target_rec.target.def_id,
+                src_lean.display(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
 }

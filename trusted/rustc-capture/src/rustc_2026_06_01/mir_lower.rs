@@ -82,7 +82,7 @@ pub fn canonical_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
                 adt_type_param_count != impl_type_param_indices.len()
                     || adt_type_param_indices.as_ref() != Some(&impl_type_param_indices)
             }
-            _ => true,
+            _ => false,
         };
         if has_specialized_self_ty {
             let item_name = tcx.item_name(def_id);
@@ -112,7 +112,16 @@ pub fn canonical_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
             format!("{crate_name}::{raw}")
         }
     } else {
-        raw
+        let crate_name = tcx.crate_name(def_id.krate).to_string();
+        if (crate_name == "core" || crate_name == "alloc")
+            && let Some(rest) = raw.strip_prefix("std::")
+        {
+            format!("{crate_name}::{rest}")
+        } else if !raw.starts_with(&format!("{crate_name}::")) && !raw.starts_with('<') {
+            format!("{crate_name}::{raw}")
+        } else {
+            raw
+        }
     }
 }
 
@@ -454,7 +463,7 @@ struct MirLowerCtx<'tcx> {
     layout_builder: LayoutTableBuilder<'tcx>,
     param_index_map: BTreeMap<u32, u32>,
     pending_allocs: Vec<AllocId>,
-    seen_allocs: BTreeSet<u64>,
+    alloc_id_map: BTreeMap<u64, u64>,
 }
 
 impl<'tcx> MirLowerCtx<'tcx> {
@@ -468,16 +477,19 @@ impl<'tcx> MirLowerCtx<'tcx> {
             ),
             param_index_map,
             pending_allocs: Vec::new(),
-            seen_allocs: BTreeSet::new(),
+            alloc_id_map: BTreeMap::new(),
         }
     }
 
     fn record_alloc_id(&mut self, alloc_id: AllocId) -> u64 {
         let raw_id = alloc_id.0.get();
-        if self.seen_allocs.insert(raw_id) {
-            self.pending_allocs.push(alloc_id);
+        if let Some(&mapped) = self.alloc_id_map.get(&raw_id) {
+            return mapped;
         }
-        raw_id
+        let next_id = (self.alloc_id_map.len() as u64) + 1;
+        self.alloc_id_map.insert(raw_id, next_id);
+        self.pending_allocs.push(alloc_id);
+        next_id
     }
 
     /// Lowers `rustc_middle::mir::LocalDecl` into `IrLocalDecl`.
@@ -1253,19 +1265,22 @@ impl<'tcx> MirLowerCtx<'tcx> {
         while cursor < self.pending_allocs.len() {
             let alloc_id = self.pending_allocs[cursor];
             cursor += 1;
-            let raw_id = alloc_id.0.get();
-            if out_by_id.contains_key(&raw_id) {
+            let mapped_id = self.record_alloc_id(alloc_id);
+            if out_by_id.contains_key(&mapped_id) {
                 continue;
             }
-            if let Some(captured) = self.extract_global_alloc(alloc_id) {
-                out_by_id.insert(raw_id, captured);
+            if let Some(captured) = self.extract_global_alloc(alloc_id, mapped_id) {
+                out_by_id.insert(mapped_id, captured);
             }
         }
         out_by_id.into_values().collect()
     }
 
-    fn extract_global_alloc(&mut self, alloc_id: AllocId) -> Option<IrCapturedAllocation> {
-        let raw_id = alloc_id.0.get();
+    fn extract_global_alloc(
+        &mut self,
+        alloc_id: AllocId,
+        mapped_id: u64,
+    ) -> Option<IrCapturedAllocation> {
         let const_alloc = match self.tcx.global_alloc(alloc_id) {
             GlobalAlloc::Memory(mem) => mem,
             GlobalAlloc::Static(def_id) => {
@@ -1316,7 +1331,7 @@ impl<'tcx> MirLowerCtx<'tcx> {
         }
 
         Some(IrCapturedAllocation {
-            alloc_id: raw_id,
+            alloc_id: mapped_id,
             bytes,
             relocations,
             align: lower_align(alloc.align),
@@ -2411,3 +2426,170 @@ fn format_span(tcx: TyCtxt<'_>, span: rustc_span::Span) -> String {
     }
     tcx.sess.source_map().span_to_diagnostic_string(span)
 }
+
+/// Returns `true` if `def_id` is a non-local function or method whose `.rmeta`
+/// MIR body is available and should be extracted into `Mir/<CalleeCrate>/<Item>.lean`.
+///
+/// Compiler intrinsics (`#[rustc_intrinsic]`) and foreign items (`extern "C"`)
+/// are excluded so that intrinsic calls continue to dispatch through
+/// `CallConv.rustIntrinsic` in `trusted/lean/Rustc/V2026_06_01/Terminators.lean`.
+pub fn should_capture_non_local_callee(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    if def_id.is_local() {
+        return false;
+    }
+    if !matches!(
+        tcx.def_kind(def_id),
+        DefKind::Fn | DefKind::AssocFn | DefKind::Closure
+    ) {
+        return false;
+    }
+    if tcx.is_foreign_item(def_id) {
+        return false;
+    }
+    if tcx.is_intrinsic(def_id, tcx.item_name(def_id)) {
+        return false;
+    }
+    if !tcx.is_mir_available(def_id) {
+        return false;
+    }
+    let def_path = canonical_def_path(tcx, def_id);
+    if def_path.starts_with("core::panicking::")
+        || def_path.starts_with("std::panicking::")
+        || def_path.starts_with("core::fmt::")
+        || def_path.starts_with("std::fmt::")
+        || def_path.starts_with("alloc::fmt::")
+        || def_path.starts_with("core::ub_checks::")
+        || def_path.ends_with("::precondition_check")
+    {
+        return false;
+    }
+    true
+}
+
+/// Returns a deterministic `(CrateNum, DefIndex)` ordering key for `DefId`.
+pub fn def_id_sort_key(def_id: DefId) -> (u32, u32) {
+    (def_id.krate.as_u32(), def_id.index.as_u32())
+}
+
+fn record_referenced_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: rustc_middle::ty::TypingEnv<'tcx>,
+    ty: Ty<'tcx>,
+    seen: &mut BTreeSet<(u32, u32)>,
+    out: &mut Vec<DefId>,
+) {
+    for arg in ty.walk() {
+        if let Some(inner_ty) = arg.as_type()
+            && let TyKind::FnDef(callee_def_id, substs) = *inner_ty.kind()
+        {
+            if seen.insert(def_id_sort_key(callee_def_id)) {
+                out.push(callee_def_id);
+            }
+            if let Ok(Some(instance)) =
+                rustc_middle::ty::Instance::try_resolve(tcx, typing_env, callee_def_id, substs)
+            {
+                let resolved_id = instance.def_id();
+                if seen.insert(def_id_sort_key(resolved_id)) {
+                    out.push(resolved_id);
+                }
+            }
+        }
+    }
+}
+
+fn record_referenced_operand<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: rustc_middle::ty::TypingEnv<'tcx>,
+    op: &Operand<'tcx>,
+    seen: &mut BTreeSet<(u32, u32)>,
+    out: &mut Vec<DefId>,
+) {
+    if let Operand::Constant(c) = op {
+        record_referenced_ty(tcx, typing_env, c.const_.ty(), seen, out);
+    }
+}
+
+/// Collects all callable `DefId`s referenced by `body` (across `Call` and
+/// `TailCall` terminators, `FnDef` constant operands and local declarations,
+/// and concrete trait method resolutions when `FnDef(def_id, args)` resolves
+/// via `rustc_middle::ty::Instance::try_resolve` to a concrete implementation).
+pub fn collect_referenced_def_ids<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner_def_id: DefId,
+    body: &Body<'tcx>,
+) -> Vec<DefId> {
+    let typing_env = rustc_middle::ty::TypingEnv::post_analysis(tcx, owner_def_id);
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<(u32, u32)> = BTreeSet::new();
+
+    for decl in &body.local_decls {
+        record_referenced_ty(tcx, typing_env, decl.ty, &mut seen, &mut out);
+    }
+
+    for bb in body.basic_blocks.iter() {
+        for stmt in &bb.statements {
+            if let StatementKind::Assign(ref assign_box) = stmt.kind {
+                let (_, ref rvalue) = **assign_box;
+                match rvalue {
+                    Rvalue::Use(op, _)
+                    | Rvalue::Repeat(op, _)
+                    | Rvalue::Cast(_, op, _)
+                    | Rvalue::UnaryOp(_, op)
+                    | Rvalue::WrapUnsafeBinder(op, _) => {
+                        record_referenced_operand(tcx, typing_env, op, &mut seen, &mut out);
+                    }
+                    Rvalue::BinaryOp(_, bin_ops) => {
+                        record_referenced_operand(tcx, typing_env, &bin_ops.0, &mut seen, &mut out);
+                        record_referenced_operand(tcx, typing_env, &bin_ops.1, &mut seen, &mut out);
+                    }
+                    Rvalue::Aggregate(kind, ops) => {
+                        if let AggregateKind::Closure(closure_def_id, substs)
+                        | AggregateKind::CoroutineClosure(closure_def_id, substs)
+                        | AggregateKind::Coroutine(closure_def_id, substs) = **kind
+                        {
+                            if seen.insert(def_id_sort_key(closure_def_id)) {
+                                out.push(closure_def_id);
+                            }
+                            for arg in substs.iter() {
+                                if let Some(inner_ty) = arg.as_type() {
+                                    record_referenced_ty(
+                                        tcx,
+                                        typing_env,
+                                        inner_ty,
+                                        &mut seen,
+                                        &mut out,
+                                    );
+                                }
+                            }
+                        }
+                        for op in ops {
+                            record_referenced_operand(tcx, typing_env, op, &mut seen, &mut out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(ref terminator) = bb.terminator {
+            match &terminator.kind {
+                TerminatorKind::Call { func, args, .. }
+                | TerminatorKind::TailCall { func, args, .. } => {
+                    record_referenced_operand(tcx, typing_env, func, &mut seen, &mut out);
+                    for arg in args {
+                        record_referenced_operand(tcx, typing_env, &arg.node, &mut seen, &mut out);
+                    }
+                }
+                TerminatorKind::SwitchInt { discr, .. } => {
+                    record_referenced_operand(tcx, typing_env, discr, &mut seen, &mut out);
+                }
+                TerminatorKind::Assert { cond, .. } => {
+                    record_referenced_operand(tcx, typing_env, cond, &mut seen, &mut out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    out
+}
+

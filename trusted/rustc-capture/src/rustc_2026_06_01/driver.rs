@@ -7,26 +7,28 @@
 //! configured, and runs `rustc_driver::run_compiler` with
 //! [`AnnealCaptureCallbacks`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rustc_driver::{Callbacks, Compilation};
-use rustc_hir::def_id::{LOCAL_CRATE, LocalDefId};
+use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId};
 use rustc_interface::interface;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::FileName;
 
-use crate::lean_emit::emit_mir_lean_module;
+use crate::lean_emit::{IrContractRole, emit_mir_lean_module};
 use crate::manifest::{
-    ANNEAL_CAPTURE_DIR_ENV, ANNEAL_CAPTURE_FILTER_ENV, CapturedTarget, MIR_DIALECT_V2026_06_01,
-    RUSTC_VERSION_STRING, UnitCaptureManifest, UnitTargetRecord, sha256_hex,
+    ANNEAL_CAPTURE_DIR_ENV, ANNEAL_CAPTURE_FILTER_ENV, CapturedItemKind, CapturedTarget,
+    MIR_DIALECT_V2026_06_01, RUSTC_VERSION_STRING, UnitCaptureManifest, UnitTargetRecord,
+    sha256_hex,
 };
 use crate::rustc_2026_06_01::mir_lower::{
-    CrateContractIndex, ItemClassification, canonical_def_path, lower_mir_body,
-    query_post_cleanup_mir, should_capture_mir_item,
+    CrateContractIndex, ItemClassification, canonical_def_path, collect_referenced_def_ids,
+    def_id_sort_key, lower_mir_body, query_post_cleanup_mir, should_capture_mir_item,
+    should_capture_non_local_callee,
 };
 
 /// Default pass-through callbacks used when `anneal-rustc-capture` is invoked
@@ -176,10 +178,39 @@ pub fn disambiguate_identifier(
     }
 }
 
-/// Extracts all local MIR items, layouts, source digests, and contract roles
-/// for the current crate and writes
-/// `<capture_dir>/<unit_id>/Mir/<Crate>/<Item>.lean` along with
-/// `<capture_dir>/<unit_id>/UnitCaptureManifest.json`.
+/// Returns `true` if the current compilation unit is a primary verification
+/// package rather than a dependency crate compiled under `RUSTC_WRAPPER`.
+///
+/// When invoked by Cargo, `CARGO_PKG_NAME` is set for every package and
+/// `CARGO_PRIMARY_PACKAGE` is set only for the primary package(s) requested on
+/// the command line. Direct `rustc` / unit-test invocations without
+/// `CARGO_PKG_NAME` default to `true` unless `ANNEAL_IS_PRIMARY_PACKAGE=0` is
+/// explicitly configured.
+fn is_primary_package_env(crate_name: &str) -> bool {
+    if let Ok(explicit) = env::var("ANNEAL_IS_PRIMARY_PACKAGE") {
+        let trimmed = explicit.trim();
+        if trimmed == "0" || trimmed.eq_ignore_ascii_case("false") {
+            return false;
+        }
+        if trimmed == "1" || trimmed.eq_ignore_ascii_case("true") {
+            return true;
+        }
+    }
+    if env::var("ANNEAL_WHOLE_GRAPH_WRAPPER").ok().as_deref() == Some("1") {
+        return env::var_os("CARGO_PRIMARY_PACKAGE").is_some();
+    }
+    if let Ok(pkg_name) = env::var("CARGO_PKG_NAME")
+        && pkg_name.replace('-', "_") == crate_name.replace('-', "_")
+    {
+        return env::var_os("CARGO_PRIMARY_PACKAGE").is_some();
+    }
+    true
+}
+
+/// Extracts all local MIR items, reachable `.rmeta` / sysroot (`core`/`alloc`)
+/// callee bodies, layouts, source digests, and contract roles for the current
+/// crate and writes `<capture_dir>/<unit_id>/Mir/<Crate>/<Item>.lean` along
+/// with `<capture_dir>/<unit_id>/UnitCaptureManifest.json`.
 fn capture_crate_unit<'tcx>(
     tcx: TyCtxt<'tcx>,
     capture_dir: &Path,
@@ -198,7 +229,8 @@ fn capture_crate_unit<'tcx>(
         format!("failed to create unit capture directory `{}`: {e}", unit_dir.display())
     })?;
 
-    let rust_sources = collect_local_source_digests(tcx);
+    let is_primary_package = is_primary_package_env(&crate_name);
+    let rust_sources = collect_local_source_digests(tcx, is_primary_package);
 
     // Collect and deterministically sort all local definitions with MIR bodies.
     let mut local_defs: Vec<(String, LocalDefId)> = tcx
@@ -227,7 +259,19 @@ fn capture_crate_unit<'tcx>(
 
     for (raw_def_path, local_def_id) in local_defs {
         let def_id = local_def_id.to_def_id();
-        let classification = contract_index.classify(tcx, def_id);
+        let mut classification = contract_index.classify(tcx, def_id);
+        if !is_primary_package {
+            // For non-primary dependency crates compiled under `RUSTC_WRAPPER`,
+            // only emit callable items as `CapturedItemKind::Callee` so that
+            // top-level `Verify/<Crate>/<Item>.lean` obligations are generated
+            // exclusively for the primary crate.
+            if matches!(classification.item_kind, CapturedItemKind::Subject) {
+                classification.item_kind = CapturedItemKind::Callee;
+                classification.associated_subject_def_id = None;
+            } else {
+                continue;
+            }
+        }
         let def_path = disambiguate_identifier(
             &raw_def_path,
             &mut used_def_paths,
@@ -247,7 +291,7 @@ fn capture_crate_unit<'tcx>(
     }
 
     let filter_patterns = parse_capture_filter(capture_filter);
-    if !filter_patterns.is_empty() {
+    if is_primary_package && !filter_patterns.is_empty() {
         let mut selected_subjects = BTreeSet::new();
         for c in &candidates {
             if matches_capture_filter(&c.def_path, &c.item_stem, &filter_patterns)
@@ -277,10 +321,28 @@ fn capture_crate_unit<'tcx>(
 
     let crate_pascal = to_pascal_case(&crate_name);
     let mut unit_targets = Vec::with_capacity(candidates.len());
+    let mut visited_non_local: BTreeSet<(u32, u32)> = BTreeSet::new();
+    let mut worklist: VecDeque<DefId> = VecDeque::new();
 
     for candidate in candidates {
         let def_id = candidate.local_def_id.to_def_id();
         let body = query_post_cleanup_mir(tcx, candidate.local_def_id);
+        if matches!(
+            candidate.classification.item_kind,
+            CapturedItemKind::Subject
+                | CapturedItemKind::Callee
+                | CapturedItemKind::Model
+                | CapturedItemKind::UnsafeTraitImpl
+        ) {
+            for callee_def_id in collect_referenced_def_ids(tcx, def_id, body) {
+                if should_capture_non_local_callee(tcx, callee_def_id)
+                    && visited_non_local.insert(def_id_sort_key(callee_def_id))
+                {
+                    worklist.push_back(callee_def_id);
+                }
+            }
+        }
+
         let mut ir_captured = lower_mir_body(
             tcx,
             def_id,
@@ -334,6 +396,100 @@ fn capture_crate_unit<'tcx>(
         });
     }
 
+    // Transitively extract reachable non-local `.rmeta` / sysroot (`core`/`alloc`)
+    // MIR bodies referenced by the primary crate's captured items.
+    if is_primary_package {
+        let mut used_stems_by_crate: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut next_stem_suffix_by_crate: BTreeMap<String, BTreeMap<String, usize>> =
+            BTreeMap::new();
+        used_stems_by_crate.insert(crate_pascal.clone(), used_item_stems);
+        next_stem_suffix_by_crate.insert(crate_pascal.clone(), next_stem_suffix);
+
+        while let Some(callee_def_id) = worklist.pop_front() {
+            if !should_capture_non_local_callee(tcx, callee_def_id) {
+                continue;
+            }
+            let body = tcx.optimized_mir(callee_def_id);
+            for next_def_id in collect_referenced_def_ids(tcx, callee_def_id, body) {
+                if should_capture_non_local_callee(tcx, next_def_id)
+                    && visited_non_local.insert(def_id_sort_key(next_def_id))
+                {
+                    worklist.push_back(next_def_id);
+                }
+            }
+
+            let callee_crate_name = tcx.crate_name(callee_def_id.krate).as_str().to_owned();
+            let callee_crate_pascal = to_pascal_case(&callee_crate_name);
+            let raw_def_path = canonical_def_path(tcx, callee_def_id);
+            let def_path = disambiguate_identifier(
+                &raw_def_path,
+                &mut used_def_paths,
+                &mut next_def_path_suffix,
+            );
+            let raw_stem = sanitize_item_module_stem(&callee_crate_name, &def_path);
+            let crate_used_stems = used_stems_by_crate
+                .entry(callee_crate_pascal.clone())
+                .or_default();
+            let crate_next_suffix = next_stem_suffix_by_crate
+                .entry(callee_crate_pascal.clone())
+                .or_default();
+            let item_stem =
+                disambiguate_identifier(&raw_stem, crate_used_stems, crate_next_suffix);
+
+            let mut ir_captured =
+                lower_mir_body(tcx, callee_def_id, body, IrContractRole::Subject);
+            ir_captured.def_path = def_path.clone();
+            for ti in &mut ir_captured.trait_impls {
+                ti.impl_path = def_path.clone();
+            }
+
+            let lean_module_name = format!("Mir.{callee_crate_pascal}.{item_stem}");
+            let mir_module_rel_path = format!("Mir/{callee_crate_pascal}/{item_stem}.lean");
+            let lean_source = emit_mir_lean_module(&lean_module_name, &ir_captured);
+            let mir_digest = sha256_hex(lean_source.as_bytes());
+
+            let mir_full_path = unit_dir.join(&mir_module_rel_path);
+            if let Some(parent) = mir_full_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    format!("failed to create MIR directory `{}`: {e}", parent.display())
+                })?;
+            }
+            fs::write(&mir_full_path, lean_source.as_bytes()).map_err(|e| {
+                format!(
+                    "failed to write MIR Lean module `{}`: {e}",
+                    mir_full_path.display()
+                )
+            })?;
+
+            let mut manifest_trait_impls = Vec::new();
+            for ti in ir_captured.trait_impls {
+                let mut trait_args_lean = Vec::new();
+                for arg in ti.trait_ref.args {
+                    trait_args_lean.push(crate::lean_emit::render_rigid_ty_pub(&arg));
+                }
+                manifest_trait_impls.push(crate::manifest::ManifestTraitImplEntry {
+                    trait_method_def_path: ti.trait_ref.def_path,
+                    trait_args_lean,
+                    impl_path: ti.impl_path,
+                });
+            }
+
+            unit_targets.push(UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id: def_path,
+                    mir_module_path: mir_module_rel_path,
+                    mir_module_sha256: mir_digest,
+                },
+                lean_module_name,
+                item_kind: CapturedItemKind::Callee,
+                associated_subject_def_id: None,
+                trait_impls: manifest_trait_impls,
+            });
+        }
+    }
+
+    unit_targets.sort_by(|a, b| a.target.def_id.cmp(&b.target.def_id));
+
     let unit_manifest = UnitCaptureManifest {
         schema: UnitCaptureManifest::SCHEMA_VERSION,
         crate_name,
@@ -373,7 +529,10 @@ fn capture_crate_unit<'tcx>(
 /// >    pub cnum: CrateNum,
 /// >}
 /// >```
-fn collect_local_source_digests(tcx: TyCtxt<'_>) -> Vec<(String, String)> {
+fn collect_local_source_digests(
+    tcx: TyCtxt<'_>,
+    is_primary_package: bool,
+) -> Vec<(String, String)> {
     let source_map = tcx.sess.source_map();
     let files = source_map.files();
     let cwd = env::current_dir().ok();
@@ -399,6 +558,14 @@ fn collect_local_source_digests(tcx: TyCtxt<'_>) -> Vec<(String, String)> {
         } else {
             local_path.to_string_lossy().replace('\\', "/")
         };
+
+        if !is_primary_package
+            && (rel_display.starts_with('/')
+                || rel_display.starts_with("..")
+                || rel_display.contains("/../"))
+        {
+            continue;
+        }
 
         let digest = if let Ok(bytes) = fs::read(local_path) {
             sha256_hex(&bytes)
@@ -502,11 +669,13 @@ pub fn lean_module_segments_for_def_path(crate_name: &str, def_path: &str) -> Ve
 }
 
 /// Normalizes command-line arguments when invoked either directly or via Cargo
-/// `RUSTC_WORKSPACE_WRAPPER` / `RUSTC_WRAPPER` (where `args[1]` is the `rustc`
-/// executable path).
+/// `RUSTC_WRAPPER` / `RUSTC_WORKSPACE_WRAPPER` (where `args[1]` or `args[2]` is
+/// the `rustc` executable path).
 pub fn normalize_wrapper_args(raw_args: &[String]) -> Vec<String> {
     let mut args: Vec<String> = if raw_args.len() >= 2 && is_rustc_executable_arg(&raw_args[1]) {
         raw_args[1..].to_vec()
+    } else if raw_args.len() >= 3 && is_rustc_executable_arg(&raw_args[2]) {
+        raw_args[2..].to_vec()
     } else if raw_args.is_empty() {
         vec!["rustc".to_owned()]
     } else {
@@ -565,7 +734,7 @@ fn detect_sysroot(rustc_bin: &str) -> Option<String> {
 pub fn should_run_capture_for_args(rustc_args: &[String]) -> bool {
     let mut crate_name: Option<&str> = None;
     let mut is_proc_macro = false;
-    let mut has_input_file = false;
+    let mut input_file: Option<&str> = None;
 
     let mut iter = rustc_args.iter().skip(1);
     while let Some(arg) = iter.next() {
@@ -598,16 +767,41 @@ pub fn should_run_capture_for_args(rustc_args: &[String]) -> bool {
                 is_proc_macro = true;
             }
         } else if !arg.starts_with('-') && arg.ends_with(".rs") {
-            has_input_file = true;
+            input_file = Some(arg.as_str());
         }
     }
 
-    if is_proc_macro || !has_input_file {
+    let Some(input_rs) = input_file else {
+        return false;
+    };
+    if is_proc_macro {
+        return false;
+    }
+
+    let normalized_input = input_rs.replace('\\', "/");
+    if normalized_input.contains("/.cargo/registry/")
+        || normalized_input.contains("/.cargo/git/")
+    {
         return false;
     }
 
     if let Some(name) = crate_name {
-        if name == "___" || name == "build_script_build" {
+        if matches!(
+            name,
+            "___"
+                | "build_script_build"
+                | "anneal_spec"
+                | "anneal_spec_macros"
+                | "anodized"
+                | "anodized_core"
+                | "anodized_logic"
+                | "anodized_macros"
+                | "proc_macro2"
+                | "quote"
+                | "unicode_ident"
+                | "syn"
+                | "autocfg"
+        ) {
             return false;
         }
     }

@@ -1040,6 +1040,7 @@ fn discover_workspace_records(workspace_root: &Path) -> Vec<UnitTargetRecord> {
                     lean_module_name: rec.lean_module_name,
                     item_kind,
                     associated_subject_def_id: rec.associated_subject_def_id,
+                    trait_impls: Vec::new(),
                 });
             }
         }
@@ -1602,6 +1603,7 @@ mod tests {
                 lean_module_name: "Mir.Demo.add".to_string(),
                 item_kind: CapturedItemKind::Subject,
                 associated_subject_def_id: None,
+                trait_impls: Vec::new(),
             },
             UnitTargetRecord {
                 target: CapturedTarget {
@@ -1612,6 +1614,7 @@ mod tests {
                 lean_module_name: "Mir.Demo.__anodized_fn_requires_add".to_string(),
                 item_kind: CapturedItemKind::InlineSpecRequires,
                 associated_subject_def_id: Some("demo::add".to_string()),
+                trait_impls: Vec::new(),
             },
         ]
     }
@@ -1747,6 +1750,7 @@ mod tests {
             lean_module_name: "Mir.Demo.__anodized_fn_ensures_add".to_string(),
             item_kind: CapturedItemKind::InlineSpecEnsures,
             associated_subject_def_id: Some("demo::add".to_string()),
+            trait_impls: Vec::new(),
         });
 
         let spec_file = specs_dir.join("add.lean");
@@ -1845,6 +1849,7 @@ mod tests {
             lean_module_name: "Mir.Demo.__anodized_fn_ensures_add".to_string(),
             item_kind: CapturedItemKind::InlineSpecEnsures,
             associated_subject_def_id: Some("demo::add".to_string()),
+            trait_impls: Vec::new(),
         });
 
         let spec_file = specs_dir.join("add.lean");
@@ -1882,6 +1887,7 @@ mod tests {
             lean_module_name: "Mir.Demo.helper".to_string(),
             item_kind: CapturedItemKind::Subject,
             associated_subject_def_id: None,
+            trait_impls: Vec::new(),
         });
 
         let lock_path = lock_workspace_specs_with_mutable(&ws, &records, &["demo::add".to_string()])
@@ -2007,6 +2013,7 @@ mod tests {
             lean_module_name: "Mir.Demo.__anodized_fn_ensures_add".to_string(),
             item_kind: CapturedItemKind::InlineSpecEnsures,
             associated_subject_def_id: Some("demo::add".to_string()),
+            trait_impls: Vec::new(),
         });
 
         let spec_file = specs_dir.join("add.lean");

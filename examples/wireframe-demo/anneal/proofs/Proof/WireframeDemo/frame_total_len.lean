@@ -274,7 +274,7 @@ private def evalRvalueSymTreeFast
           tag := tag
           targetLocal := p.local_
           targetProjection := .nil
-          perm := .frozen
+          perm := sharedBorrowPerm ctx.localDecls ctx.layouts { local_ := p.local_, projection := .nil }
         }
         let mem' := {
           mem with
@@ -839,6 +839,7 @@ private theorem ensures_holds (b1 b2 : Nat) (hb1 : b1 ≤ 16) (hb2 : b2 ≤ 1024
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
     invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, tyIsFreeze, rigidTyIsFreeze, stringEq,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -968,6 +969,7 @@ private theorem wpReq_inversion (v1 v2 : Value) :
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
     invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, tyIsFreeze, rigidTyIsFreeze, stringEq,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1012,6 +1014,7 @@ private theorem wpReq_inversion (v1 v2 : Value) :
             byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
             isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
             invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, tyIsFreeze, rigidTyIsFreeze, stringEq,
             boolToScalar,
             GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
             HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1049,6 +1052,7 @@ private theorem wpReq_inversion (v1 v2 : Value) :
             byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
             isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
             invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, tyIsFreeze, rigidTyIsFreeze, stringEq,
             boolToScalar,
             GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
             HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1093,6 +1097,7 @@ private theorem wpReq_inversion (v1 v2 : Value) :
                     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
                     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
                     invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, tyIsFreeze, rigidTyIsFreeze, stringEq,
                     boolToScalar,
                     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
                     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1195,6 +1200,7 @@ theorem verified : VerificationResult Obligations.WireframeDemo.frame_total_len.
       byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
       isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
       invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, tyIsFreeze, rigidTyIsFreeze, stringEq,
       boolToScalar,
       GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
       HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1249,6 +1255,7 @@ theorem nonVacuousRequires :
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
     invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, tyIsFreeze, rigidTyIsFreeze, stringEq,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
