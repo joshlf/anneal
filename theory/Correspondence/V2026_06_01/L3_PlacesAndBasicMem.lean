@@ -1427,4 +1427,186 @@ theorem mir_ordering_discriminant_subslice_alloc_bound_and_as_ptr_corresponds
         { emptyMemory with globals := [globalArrAlloc] } := by
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/--
+**Theorem L3.27 (`mir_a3_elem_slice_from_raw_parts_tuple_stride_discriminant_and_index_write_corresponds`)**:
+Universal characterization of `A3` hardening for `BRIEF-1.4`:
+1. `readSliceBackingAggregate?` enables slice fat pointers constructed from an
+   array element pointer (`targetProjection = [.constantIndex 1 0 false]`, e.g.
+   `core::ptr::slice_from_raw_parts(&raw mut arr[1], 2)`) to evaluate `Rvalue.len`
+   (succeeding for `len = 2 <= 4 - 1` and faulting with `.ub` for `len = 4 > 3`),
+   dereference reads (`(*s)[1]` -> `arr[2]`), dereference writes (`(*s)[1] = w2`),
+   scoped borrow invalidation (`invalidateDerefWriteBorrows` preserving `arr[0]`
+   while disabling `arr[2]`), and dereferenced element borrows (`&(*s)[1]` ->
+   `targetProjection = [.constantIndex 2 0 false]`);
+2. `inferElemListByteStride` and `valueDefaultByteSize` (via `inferValueByteSizeAux`)
+   compute the true byte stride of aggregate array/slice elements (`8` bytes for
+   `(u32, u32)` tuples), so dereferencing an offset slice fat pointer at
+   `offsetBytes = 8` reads `[tuple1, tuple2]` while rejecting misaligned
+   `offsetBytes = 4` with `.ub`;
+3. `evalPlaceDiscriminant` returns `.ub` on `.never` places, rejects invalid
+   `core::cmp::Ordering` scalar bit patterns (`⟨42, 1⟩`) and widths (`⟨0, 4⟩`)
+   with `.ub`, and rejects out-of-range scalar tags and out-of-bounds `variantIdx`
+   on `VariantsShape.multiple` layouts with `.ub`;
+4. `evalGlobalThinPtrDerefBorrow` normalizes chained subslice projections
+   (`&((*global_arr_ptr)[1..4][1..3])` -> `offsetBytes = 8`) and supports
+   `fromEnd = true` element borrows (`&((*global_arr_ptr)[..fromEnd 1])` ->
+   `offsetBytes = 12` on `[u32; 4]`);
+5. `StatementKind.assign` resolves dynamic `.index idxLocal` projections via
+   `resolveBorrowProjectionElems` before Tree Borrows invalidation, so assigning
+   `arr[i] = w0` at `i = 0` preserves disjoint borrows (`arr[2]`) while disabling
+   overlapping borrows (`arr[0]`).
+-/
+theorem mir_a3_elem_slice_from_raw_parts_tuple_stride_discriminant_and_index_write_corresponds
+    (b0 b1 b2 b3 w0 w2 : Nat) :
+    let arr4Val : Value :=
+      .aggregate 0 [.scalar ⟨b0, 4⟩, .scalar ⟨b1, 4⟩, .scalar ⟨b2, 4⟩, .scalar ⟨b3, 4⟩]
+    let arr4Updated2 : Value :=
+      .aggregate 0 [.scalar ⟨b0, 4⟩, .scalar ⟨b1, 4⟩, .scalar ⟨w2, 4⟩, .scalar ⟨b3, 4⟩]
+    let arr4Updated0 : Value :=
+      .aggregate 0 [.scalar ⟨w0, 4⟩, .scalar ⟨b1, 4⟩, .scalar ⟨b2, 4⟩, .scalar ⟨b3, 4⟩]
+    let elem0Borrow : BorrowEntry :=
+      { tag := 2, targetLocal := 0, targetProjection := [.constantIndex 0 0 false], perm := .frozen }
+    let elem1MutBorrow : BorrowEntry :=
+      { tag := 1, targetLocal := 0, targetProjection := [.constantIndex 1 0 false], perm := .active }
+    let elem2Borrow : BorrowEntry :=
+      { tag := 3, targetLocal := 0, targetProjection := [.constantIndex 2 0 false], perm := .frozen }
+    let sliceFromElem1Len2 : Value :=
+      .aggregate 0 [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨2, 8⟩]
+    let sliceFromElem1Len4Oob : Value :=
+      .aggregate 0 [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩]
+    let memElem1 : Memory := { emptyMemory with borrows := [elem1MutBorrow], nextTag := 4 }
+    let tup0 : Value := .aggregate 0 [.scalar ⟨b0, 4⟩, .scalar ⟨b1, 4⟩]
+    let tup1 : Value := .aggregate 0 [.scalar ⟨b2, 4⟩, .scalar ⟨b3, 4⟩]
+    let tup2 : Value := .aggregate 0 [.scalar ⟨w0, 4⟩, .scalar ⟨w2, 4⟩]
+    let tupleArr3Val : Value := .aggregate 0 [tup0, tup1, tup2]
+    let fullTupleArrBorrow : BorrowEntry :=
+      { tag := 5, targetLocal := 0, targetProjection := .nil, perm := .frozen }
+    let tupleSliceAt8 : Value :=
+      .aggregate 0 [.ptr { allocId := 5, offsetBytes := 8 } 8, .scalar ⟨2, 8⟩]
+    let tupleSliceAt4Misaligned : Value :=
+      .aggregate 0 [.ptr { allocId := 5, offsetBytes := 4 } 8, .scalar ⟨1, 8⟩]
+    let neverDecl : List LocalDecl :=
+      [{ mutability := .not, ty := { kind := .never, layoutIdx := 0 }, debugName := "" }]
+    let orderingDecl : List LocalDecl :=
+      [{ mutability := .not, ty := { kind := .adt "core::cmp::Ordering" .nil, layoutIdx := 0 }, debugName := "" }]
+    let enum2Decl : List LocalDecl :=
+      [{ mutability := .not, ty := { kind := .adt "MyEnum" .nil, layoutIdx := 0 }, debugName := "" }]
+    let enum2Layout : Trusted.Rustc.V2026_06_01.Layout.LayoutTable := {
+      pointerBits := 64
+      isLittleEndian := true
+      entries := [{
+        size := ⟨1⟩
+        align := ⟨1⟩
+        backendRepr := .scalar (.initialized (.int 8 false) ⟨0, 1⟩)
+        fields := .primitive
+        variants := .multiple (.initialized (.int 8 false) ⟨0, 1⟩) 0 [.primitive, .primitive]
+        isUninhabited := false
+      }]
+    }
+    let globalArr4Alloc : CapturedAllocation := {
+      allocId := 9
+      bytes := [
+        .some 1, .some 0, .some 0, .some 0,
+        .some 2, .some 0, .some 0, .some 0,
+        .some 3, .some 0, .some 0, .some 0,
+        .some 4, .some 0, .some 0, .some 0
+      ]
+      relocations := .nil
+      align := ⟨4⟩
+      mutability := .not
+    }
+    let globalArr4PtrDecls : List LocalDecl :=
+      [{ mutability := .not,
+         ty := { kind := .ref .not (.array (.uint .u32) 4), layoutIdx := 0 },
+         debugName := "" }]
+    let assignIdx0Stmt : Statement := {
+      kind := .assign
+        { local_ := 0, projection := [.index 1] }
+        (.use (.copy { local_ := 2, projection := .nil }))
+      span := ""
+    }
+    let initAssignState : MachineState := {
+      frame := {
+        blockIdx := 0
+        stmtIdx := 0
+        locals := [.init arr4Val, .init (.scalar ⟨0, 8⟩), .init (.scalar ⟨w0, 4⟩)]
+      }
+      memory := { emptyMemory with borrows := [elem0Borrow, elem2Borrow] }
+    }
+    let p0 : Place := { local_ := 0, projection := .nil }
+    -- 1. Slice fat pointer backed by element borrow (&raw mut arr[1])
+    evalRvalue [.init arr4Val, .init sliceFromElem1Len2]
+      (.len { local_ := 1, projection := [.deref] }) memElem1 =
+      .ok (.scalar ⟨2, 8⟩) [.init arr4Val, .init sliceFromElem1Len2] memElem1 ∧
+    evalRvalue [.init arr4Val, .init sliceFromElem1Len4Oob]
+      (.len { local_ := 1, projection := [.deref] }) memElem1 = .ub ∧
+    evalOperand [.init arr4Val, .init sliceFromElem1Len2]
+      (.copy { local_ := 1, projection := [.deref, .constantIndex 1 0 false] })
+      [elem1MutBorrow] =
+      .ok (.scalar ⟨b2, 4⟩) [.init arr4Val, .init sliceFromElem1Len2] ∧
+    writePlaceValue [.init arr4Val, .init sliceFromElem1Len2]
+      [elem1MutBorrow]
+      { local_ := 1, projection := [.deref, .constantIndex 1 0 false] }
+      (.scalar ⟨w2, 4⟩) =
+      .ok [.init arr4Updated2, .init sliceFromElem1Len2] ∧
+    invalidateDerefWriteBorrows
+      [.init arr4Val, .init sliceFromElem1Len2]
+      [elem1MutBorrow, elem0Borrow, elem2Borrow]
+      { local_ := 1, projection := [.deref] }
+      .nil =
+      [elem1MutBorrow, elem0Borrow, { elem2Borrow with perm := .disabled }] ∧
+    evalRvalue [.init arr4Val, .init sliceFromElem1Len2]
+      (.ref .shared { local_ := 1, projection := [.deref, .constantIndex 1 0 false] })
+      memElem1 =
+      .ok (.ptr { allocId := 4, offsetBytes := 0 } 8)
+        [.init arr4Val, .init sliceFromElem1Len2]
+        { memElem1 with
+          borrows :=
+            { tag := 4, targetLocal := 0, targetProjection := [.constantIndex 2 0 false], perm := .frozen } ::
+              [elem1MutBorrow]
+          nextTag := 5 } ∧
+    -- 2. Aggregate element byte stride (8-byte (u32, u32) tuples)
+    evalOperand [.init tupleArr3Val, .init tupleSliceAt8]
+      (.copy { local_ := 1, projection := [.deref] })
+      [fullTupleArrBorrow] =
+      .ok (.aggregate 0 [tup1, tup2]) [.init tupleArr3Val, .init tupleSliceAt8] ∧
+    evalOperand [.init tupleArr3Val, .init tupleSliceAt4Misaligned]
+      (.copy { local_ := 1, projection := [.deref] })
+      [fullTupleArrBorrow] = .ub ∧
+    -- 3. evalPlaceDiscriminant hardening (.never, invalid Ordering scalar/width, VariantsShape.multiple bounds)
+    evalRvalue [.init (.scalar ⟨0, 1⟩)] (.discriminant p0) emptyMemory neverDecl = .ub ∧
+    evalRvalue [.init (.scalar ⟨42, 1⟩)] (.discriminant p0) emptyMemory orderingDecl = .ub ∧
+    evalRvalue [.init (.scalar ⟨0, 4⟩)] (.discriminant p0) emptyMemory orderingDecl = .ub ∧
+    evalRvalue [.init (.scalar ⟨5, 1⟩)] (.discriminant p0) emptyMemory enum2Decl enum2Layout = .ub ∧
+    evalRvalue [.init (.aggregate 2 .nil)] (.discriminant p0) emptyMemory enum2Decl enum2Layout = .ub ∧
+    -- 4. evalGlobalThinPtrDerefBorrow chained subslice normalization & fromEnd = true
+    evalRvalue [.init (.ptr { allocId := 9, offsetBytes := 0 } 8)]
+      (.ref .shared { local_ := 0, projection := [.deref, .subslice 1 4 false, .subslice 1 3 false] })
+      { emptyMemory with globals := [globalArr4Alloc] }
+      globalArr4PtrDecls =
+      .ok (.ptr { allocId := 9, offsetBytes := 8 } 8)
+        [.init (.ptr { allocId := 9, offsetBytes := 0 } 8)]
+        { emptyMemory with globals := [globalArr4Alloc] } ∧
+    evalRvalue [.init (.ptr { allocId := 9, offsetBytes := 0 } 8)]
+      (.ref .shared { local_ := 0, projection := [.deref, .constantIndex 1 0 true] })
+      { emptyMemory with globals := [globalArr4Alloc] }
+      globalArr4PtrDecls =
+      .ok (.ptr { allocId := 9, offsetBytes := 12 } 8)
+        [.init (.ptr { allocId := 9, offsetBytes := 0 } 8)]
+        { emptyMemory with globals := [globalArr4Alloc] } ∧
+    -- 5. Dynamic .index write borrow invalidation in StatementKind.assign
+    evalStmt initAssignState assignIdx0Stmt =
+      MirStepNode.step {
+        frame := {
+          blockIdx := 0
+          stmtIdx := 1
+          locals := [.init arr4Updated0, .init (.scalar ⟨0, 8⟩), .init (.scalar ⟨w0, 4⟩)]
+        }
+        memory := {
+          emptyMemory with
+          borrows := [{ elem0Borrow with perm := .disabled }, elem2Borrow]
+        }
+      } := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 end Correspondence.V2026_06_01.L3_PlacesAndBasicMem

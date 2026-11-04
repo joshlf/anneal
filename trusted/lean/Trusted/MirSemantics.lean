@@ -60,8 +60,8 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   appendValueList replaceSubslice
   setOrExtendFields writeProjectedValue
   sliceConstElemKind isScalarCompatibleProj uintRigidTyOfStride
-  inferElemListByteStride exactByteDivAux byteOffsetToElemIdx?
-  splitLastConstantIndex? splitLastSubslice? endsWithSubslice needsThinPtrElemResolution
+  inferValueByteSizeAux inferElemListByteStride exactByteDivAux byteOffsetToElemIdx?
+  splitLastConstantIndex? readSliceBackingAggregate? splitLastSubslice? endsWithSubslice needsThinPtrElemResolution
   startsWithArrayOrSliceProj resolveStackThinPtrTargetProj?
   evalGlobalDerefRead evalSliceFatPtrDerefRead evalPlaceRead
   evalOperand evalOperands

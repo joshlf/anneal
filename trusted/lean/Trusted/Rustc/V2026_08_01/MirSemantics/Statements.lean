@@ -1028,7 +1028,12 @@ def evalStmt
             with
             | .ok callerLocals' =>
               let borrows' :=
-                invalidateDerefWriteBorrows locals₁ mem₁.borrows dst restProj
+                invalidateDerefWriteBorrows
+                  locals₁
+                  mem₁.borrows
+                  dst
+                  restProj
+                  mem₁.callerLocals
               MirStepNode.step
                 (advanceStmt
                   s
@@ -1046,6 +1051,10 @@ def evalStmt
           | .ok rootVal' =>
             match set? locals₁ dst.local_ (.init rootVal') with
             | .some locals₂ =>
+              let resolvedLocalProj :=
+                match resolveBorrowProjectionElems locals₁ (proj :: rest) with
+                | .some rp => rp
+                | .none => proj :: rest
               match mem₁.activeProtectors with
               | .nil =>
                 let borrows' :=
@@ -1053,7 +1062,7 @@ def evalStmt
                     mem₁.borrows
                     dst.local_
                     .none
-                    (proj :: rest)
+                    resolvedLocalProj
                 MirStepNode.step
                   (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
               | protHead :: protTail =>
@@ -1063,7 +1072,7 @@ def evalStmt
                     (protHead :: protTail)
                     dst.local_
                     .none
-                    (proj :: rest)
+                    resolvedLocalProj
                 with
                 | true => MirStepNode.fail .ub
                 | false =>
@@ -1072,7 +1081,7 @@ def evalStmt
                       mem₁.borrows
                       dst.local_
                       .none
-                      (proj :: rest)
+                      resolvedLocalProj
                   MirStepNode.step
                     (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
             | .none => MirStepNode.fail .ub
