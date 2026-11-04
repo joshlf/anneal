@@ -419,4 +419,233 @@ theorem evalTerminator_switchInt_agrees_with_generated
       simp only [evalTerminator] at hUb ⊢ <;>
       simp [hUb]
 
+/-! ## 3. Function-Item Reification (`ReifyFnPointer`), `fnPtrToPtr`, and Indirect `FnPtr` Calls (`BRIEF-1.1`) -/
+
+/--
+Universal characterization of `CastKind.pointerCoercion "ReifyFnPointer"`,
+`CastKind.fnPtrToPtr`, `CastKind.ptrToPtr`, and `CastKind.pointerExposeProvenance`
+in `evalRvalue`:
+1. Reifying a zero-sized `.fnDef defPath typeArgs` constant operand into a
+   `.fnPtr sigInputs sigOut sigSafety sigAbi` target type allocates the canonical
+   function-pointer entry `{ allocId := fnPtrAllocBase, defPath, typeArgs, fnSig }`
+   in `emptyMemory.fnPtrs` and returns
+   `.ptr { allocId := fnPtrAllocBase, offsetBytes := 0 } 8`.
+2. Casting a registered function pointer via `CastKind.fnPtrToPtr` to a thin raw
+   pointer, then via `CastKind.ptrToPtr`, and then exposing its address via
+   `CastKind.pointerExposeProvenance` yields the deterministic exposed scalar
+   address `allocId * 65536`.
+3. Applying `CastKind.fnPtrToPtr` to an unregistered pointer faults with
+   `EvalResult.ub`.
+-/
+theorem mir_evalRvalue_reifyFnPointer_and_fnPtrToPtr_chain
+    (locals : List LocalSlot)
+    (defPath : DefPath)
+    (typeArgs : List RigidTy)
+    (sigInputs : List RigidTy)
+    (sigOut : RigidTy)
+    (sigSafety : Safety)
+    (sigAbi : CallConv) :
+    let fnItemTy : Ty := { kind := .fnDef defPath typeArgs, layoutIdx := 0 }
+    let fnPtrKind : RigidTy := .fnPtr sigInputs sigOut sigSafety sigAbi
+    let fnPtrTy : Ty := { kind := fnPtrKind, layoutIdx := 0 }
+    let rawConstUnitTy : Ty := { kind := .rawPtr .not (.tuple .nil), layoutIdx := 0 }
+    let rawMutUnitTy : Ty := { kind := .rawPtr .mut (.tuple .nil), layoutIdx := 0 }
+    let usizeTy : Ty := { kind := .uint .usize, layoutIdx := 0 }
+    let fnConstOp : Operand := .constant { ty := fnItemTy, val := .zeroSized }
+    let expectedEntry : FnPtrEntry :=
+      { allocId := fnPtrAllocBase
+        defPath := defPath
+        typeArgs := typeArgs
+        fnSig := .some fnPtrKind }
+    let expectedPtr : ProvenancePtr := { allocId := fnPtrAllocBase, offsetBytes := 0 }
+    let memAfterReify : Memory := { emptyMemory with fnPtrs := [expectedEntry] }
+    (evalRvalue
+        locals
+        (.cast (.pointerCoercion "ReifyFnPointer") fnConstOp fnPtrTy)
+        emptyMemory =
+      .ok (.ptr expectedPtr 8) locals memAfterReify) ∧
+    (evalRvalue
+        locals
+        (.cast (.pointerCoercion "ReifyFnPointer(Safe)") fnConstOp fnPtrTy)
+        emptyMemory =
+      .ok (.ptr expectedPtr 8) locals memAfterReify) ∧
+    (evalRvalue
+        [.init (.ptr expectedPtr 8)]
+        (.cast .fnPtrToPtr (.copy ⟨0, .nil⟩) rawConstUnitTy)
+        memAfterReify =
+      .ok (.ptr expectedPtr 8) [.init (.ptr expectedPtr 8)] memAfterReify) ∧
+    (evalRvalue
+        [.init (.ptr expectedPtr 8)]
+        (.cast .ptrToPtr (.copy ⟨0, .nil⟩) rawMutUnitTy)
+        memAfterReify =
+      .ok (.ptr expectedPtr 8) [.init (.ptr expectedPtr 8)] memAfterReify) ∧
+    (evalRvalue
+        [.init (.ptr expectedPtr 8)]
+        (.cast .pointerExposeProvenance (.copy ⟨0, .nil⟩) usizeTy)
+        memAfterReify =
+      .ok
+        (.scalar { bits := fnPtrAllocBase * 65536, sizeBytes := 8 })
+        [.init (.ptr expectedPtr 8)]
+        memAfterReify) ∧
+    (evalRvalue
+        [.init (.ptr { allocId := 0, offsetBytes := 0 } 8)]
+        (.cast .fnPtrToPtr (.copy ⟨0, .nil⟩) rawConstUnitTy)
+        emptyMemory =
+      .ub) := by
+  have hReify1 : isReifyFnPointerCoercion "ReifyFnPointer" = true := by decide
+  have hReify2 : isReifyFnPointerCoercion "ReifyFnPointer(Safe)" = true := by decide
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · simp [evalRvalue, evalReifyFnPointer, hReify1, emptyMemory,
+      findFnPtrEntry?, nextFnPtrAllocId, evalOperand, evalConstValue]
+  · simp [evalRvalue, evalReifyFnPointer, hReify2, emptyMemory,
+      findFnPtrEntry?, nextFnPtrAllocId, evalOperand, evalConstValue]
+  · simp [evalRvalue, evalFnPtrToPtr, evalOperand, get?, readProjectedValue,
+      isThinRawPtrTy, emptyMemory, lookupBorrow, lookupFnPtr]
+  · simp [evalRvalue, evalOperand, get?, readProjectedValue]
+  · simp [evalRvalue, evalOperand, get?, readProjectedValue]
+  · simp [evalRvalue, evalFnPtrToPtr, evalOperand, get?, readProjectedValue,
+      isThinRawPtrTy, emptyMemory, lookupBorrow, isFnPtrAllocId, fnPtrAllocBase]
+
+/--
+Universal proof that dereferencing a reified function pointer (`PlaceElem.deref`)
+as data memory in `evalOperand` or `writePlaceValue` faults with `.ub` when
+`ptrVal.allocId` is not backed by a global allocation in `s.memory.globals`
+(and not a live stack borrow in `s.memory.borrows`).
+-/
+theorem mir_fnPtr_data_deref_is_ub
+    (ptrVal : ProvenancePtr)
+    (mem : Memory)
+    (writeVal : Value)
+    (hNoBorrow : lookupBorrow mem.borrows ptrVal.tag = .none)
+    (hNoGlobal : lookupGlobalAlloc mem.globals ptrVal.allocId = .none) :
+    let locals : List LocalSlot := [.init (.ptr ptrVal 8)]
+    let derefPlace : Place := { local_ := 0, projection := [.deref] }
+    evalOperand locals (.copy derefPlace) mem.borrows mem.globals emptyLayoutTable mem.callerLocals = .ub ∧
+    writePlaceValue locals mem.borrows derefPlace writeVal = .ub := by
+  dsimp only
+  refine ⟨?_, ?_⟩
+  · simp [evalOperand, get?, hNoBorrow, hNoGlobal]
+  · simp [writePlaceValue, get?, hNoBorrow]
+
+/--
+Universal characterization of indirect `TerminatorKind.call` and
+`TerminatorKind.tailCall` through a function pointer (`BRIEF-1.1`) in `V2026_08_01`.
+-/
+theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
+    (s : MachineState)
+    (func : Operand)
+    (argOps : List Operand)
+    (destination : Place)
+    (targetBb : BasicBlockIdx)
+    (unwind : UnwindAction)
+    (span : String)
+    (callerBody calleeBody : CapturedMir)
+    (ptrVal : ProvenancePtr)
+    (fnEntry : FnPtrEntry)
+    (localsAfterFunc locals' : List Value → List LocalSlot)
+    (argVals : List Value)
+    (hNoDirect : extractCalleeDefPath? func = .none)
+    (hEvalFunc :
+      evalOperand
+        s.frame.locals
+        func
+        s.memory.borrows
+        s.memory.globals
+        callerBody.layouts
+        s.memory.callerLocals = .ok (.ptr ptrVal 8) (localsAfterFunc argVals))
+    (hOffsetZero : ptrVal.offsetBytes = 0)
+    (hNoBorrow : lookupBorrow s.memory.borrows ptrVal.tag = .none) :
+    let callerFuncTyOpt := operandTy callerBody.localDecls callerBody.layouts func
+    let resolvedTarget : ResolvedCallTarget :=
+      { defPath := fnEntry.defPath
+        typeArgs := fnEntry.typeArgs
+        fnSig := fnEntry.fnSig
+        isIndirect := true }
+    (lookupFnPtr s.memory.fnPtrs ptrVal.allocId = .some fnEntry →
+      fnEntryCompatibleWithCallSite fnEntry (length argOps) callerFuncTyOpt = true →
+      evalOperands
+        (localsAfterFunc argVals)
+        argOps
+        s.memory.borrows
+        s.memory.globals
+        callerBody.layouts
+        s.memory.callerLocals = .ok argVals (locals' argVals) →
+      findCallee? s.memory.callees fnEntry.defPath = .some calleeBody →
+      checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) = true →
+      evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
+        MirStepNode.step
+          (pushCalleeFrame s callerBody (locals' argVals) destination targetBb calleeBody argVals) ∧
+      evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
+        MirStepNode.step (enterTailCalleeFrame s.memory calleeBody argVals)) ∧
+    (lookupFnPtr s.memory.fnPtrs ptrVal.allocId = .some fnEntry →
+      fnEntryCompatibleWithCallSite fnEntry (length argOps) callerFuncTyOpt = true →
+      evalOperands
+        (localsAfterFunc argVals)
+        argOps
+        s.memory.borrows
+        s.memory.globals
+        callerBody.layouts
+        s.memory.callerLocals = .ok argVals (locals' argVals) →
+      findCallee? s.memory.callees fnEntry.defPath = .none →
+      stringEq fnEntry.defPath "core::intrinsics::exact_div" = false →
+      evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
+        MirStepNode.extCall
+          { defPath := fnEntry.defPath, args := argVals, memory := s.memory }
+          (resumeExternalCall s (locals' argVals) destination targetBb unwind) ∧
+      evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
+        MirStepNode.extCall
+          { defPath := fnEntry.defPath, args := argVals, memory := s.memory }
+          resumeExternalTailCall) ∧
+    (lookupFnPtr s.memory.fnPtrs ptrVal.allocId = .none →
+      evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
+        MirStepNode.fail .ub ∧
+      evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
+        MirStepNode.fail .ub) ∧
+    (lookupFnPtr s.memory.fnPtrs ptrVal.allocId = .some fnEntry →
+      fnEntryCompatibleWithCallSite fnEntry (length argOps) callerFuncTyOpt = false →
+      evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
+        MirStepNode.fail .ub ∧
+      evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
+        MirStepNode.fail .ub) ∧
+    (lookupFnPtr s.memory.fnPtrs ptrVal.allocId = .some fnEntry →
+      fnEntryCompatibleWithCallSite fnEntry (length argOps) callerFuncTyOpt = true →
+      evalOperands
+        (localsAfterFunc argVals)
+        argOps
+        s.memory.borrows
+        s.memory.globals
+        callerBody.layouts
+        s.memory.callerLocals = .ok argVals (locals' argVals) →
+      findCallee? s.memory.callees fnEntry.defPath = .some calleeBody →
+      checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) = false →
+      evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
+        MirStepNode.fail .ub ∧
+      evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
+        MirStepNode.fail .ub) := by
+  dsimp only
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · intro hLookup hCompatSite hArgs hFind hCompatBody
+    refine ⟨?_, ?_⟩ <;>
+      simp only [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc, hOffsetZero,
+        hNoBorrow, hLookup, hCompatSite, hArgs, hFind, hCompatBody,
+        Nat.beq_refl, Bool.and_self]
+  · intro hLookup hCompatSite hArgs hFindNone hNotExactDiv
+    refine ⟨?_, ?_⟩ <;>
+      simp only [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc, hOffsetZero,
+        hNoBorrow, hLookup, hCompatSite, hArgs, hFindNone, hNotExactDiv,
+        Nat.beq_refl, Bool.and_self]
+  · intro hLookupNone
+    refine ⟨?_, ?_⟩ <;>
+      simp only [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc, hOffsetZero,
+        hNoBorrow, hLookupNone, Nat.beq_refl, Bool.and_self]
+  · intro hLookup hCompatFalse
+    refine ⟨?_, ?_⟩ <;>
+      simp only [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc, hOffsetZero,
+        hNoBorrow, hLookup, hCompatFalse, Nat.beq_refl, Bool.and_self]
+  · intro hLookup hCompatSite hArgs hFind hCompatBodyFalse
+    refine ⟨?_, ?_⟩ <;>
+      simp only [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc, hOffsetZero,
+        hNoBorrow, hLookup, hCompatSite, hArgs, hFind, hCompatBodyFalse,
+        Nat.beq_refl, Bool.and_self]
+
 end Correspondence.V2026_08_01.L5_ControlAndCalls
