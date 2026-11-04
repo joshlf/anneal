@@ -802,10 +802,10 @@ def evalExactDiv
     (isSigned : Bool := false) :
     RvalueEvalResult :=
   match Nat.beq lhs.sizeBytes 0 with
-  | true => .unsupported
+  | true => .ub
   | false =>
     match Nat.beq lhs.sizeBytes rhs.sizeBytes with
-    | false => .unsupported
+    | false => .ub
     | true =>
       let sz := lhs.sizeBytes
       let modulus := scalarModulus sz
@@ -825,9 +825,27 @@ def evalExactDiv
             match Nat.beq remSc.bits 0 with
             | true => evalSignedDiv a b sz locals mem
             | false => .ub
-          | .ok _ _ _ => .unsupported
+          | .ok _ _ _ => .ub
           | .ub => .ub
-          | .unsupported => .unsupported
+          | .unsupported => .ub
+
+/--
+Alias for `evalExactDiv` matching the `V2026_06_01` `RvalueEvalResult` helper
+name (`evalScalarExactDiv`).
+
+Reference (`core::intrinsics::exact_div`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.exact_div.html>
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1932-L1939>
+
+> "/// Performs an exact division, resulting in undefined behavior where
+> /// `x % y != 0` or `y == 0` or `x == T::MIN && y == -1`
+> ///
+> /// This intrinsic does not have a stable counterpart."
+-/
+abbrev evalScalarExactDiv := evalExactDiv
 
 /--
 Evaluate a `BinOp` over two concrete `ScalarInt` operands `lhs` and `rhs` of
@@ -1971,7 +1989,7 @@ def evalArithOffset
 Compute the dynamic byte size `elemSizeBytes * len` of a slice `[T]` or `str`
 for `core::intrinsics::size_of_val` from its 8-byte fat-pointer length metadata
 `lenSc`, returning `.none` (undefined behavior) if `lenSc.sizeBytes != 8` or if
-`elemSizeBytes * len` overflows `usize` (`>= 2^64`).
+`elemSizeBytes * len` exceeds `isize::MAX` (`>= 2^63 = signedHalfModulus 8`).
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -1992,7 +2010,7 @@ def evalSliceSizeOfVal
     let modulus := scalarModulus 8
     let len := wrapScalarBits lenSc.bits modulus
     let totalBytes := Nat.mul elemSizeBytes len
-    match Nat.ble modulus totalBytes with
+    match Nat.ble (signedHalfModulus 8) totalBytes with
     | true => .none
     | false => .some ⟨totalBytes, 8⟩
 

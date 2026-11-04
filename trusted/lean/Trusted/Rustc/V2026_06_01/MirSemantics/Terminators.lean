@@ -1021,9 +1021,10 @@ def resolveIntrinsicShiftSigned
 
 /--
 Look up a `TypeLayout` for `ty : RigidTy` by scanning `localDecls` for a
-declaration with `rigidTyEq decl.ty.kind ty`, falling back to index `0` of
-`layouts` for `.adt` and `.closure` types when `localDecls` has no direct
-declaration of type `ty`.
+declaration with `rigidTyEq decl.ty.kind ty`, returning `.none` when no local of
+type `ty` carries a layout. There is deliberately no positional fallback: an
+unrelated entry such as `layouts.entries[0]` (often the return place's layout)
+would silently report the wrong size and alignment.
 
 Reference (`compiler/rustc_middle/src/ty/layout.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -1038,11 +1039,7 @@ def findDeclLayoutForRigidTy
     (ty : RigidTy) :
     Option TypeLayout :=
   match localDecls with
-  | .nil =>
-    match ty with
-    | .adt _ _ => LayoutTable.lookup layouts 0
-    | .closure _ _ => LayoutTable.lookup layouts 0
-    | _ => .none
+  | .nil => .none
   | decl :: rest =>
     match rigidTyEq decl.ty.kind ty with
     | true =>
@@ -1052,50 +1049,8 @@ def findDeclLayoutForRigidTy
     | false => findDeclLayoutForRigidTy rest layouts ty
 
 /--
-Determine the static byte size of a sized `RigidTy` on a 64-bit target for
-`arith_offset` and `size_of_val`, returning `.none` for unsized types (`.slice`,
-`.str`, `.dynamic`, `.foreign`) or unresolvable ADTs.
-
-Reference (The Rust Reference, "Type Layout"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
-
-> "The size of a value is the offset in bytes between successive elements in an
-> array with that item type including alignment padding."
--/
-@[reducible]
-def intrinsicRigidTyByteSize
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (ty : RigidTy) :
-    Option Nat :=
-  match rigidTyKindByteSize ty with
-  | .some sz => .some sz
-  | .none =>
-    match ty with
-    | .never => .some 0
-    | .float .f16 => .some 2
-    | .float .f32 => .some 4
-    | .float .f64 => .some 8
-    | .float .f128 => .some 16
-    | .array elemKind n =>
-      match findDeclLayoutForRigidTy localDecls layouts elemKind with
-      | .some l => .some (Nat.mul l.size.bytes n)
-      | .none =>
-        match findDeclLayoutForRigidTy localDecls layouts ty with
-        | .some l => .some l.size.bytes
-        | .none => .none
-    | .tuple ks =>
-      match findDeclLayoutForRigidTy localDecls layouts ty with
-      | .some l => .some l.size.bytes
-      | .none => tupleFieldsByteSize ks
-    | _ =>
-      match findDeclLayoutForRigidTy localDecls layouts ty with
-      | .some l => .some l.size.bytes
-      | .none => .none
-
-/--
 Compute the ABI byte alignment of a `RigidTy` when determined directly by its
-primitive or pointer constructor on a 64-bit target.
+primitive, pointer, or homogeneous array constructor on a 64-bit target.
 
 Reference (The Rust Reference, "Type Layout"):
 <https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
@@ -1120,45 +1075,83 @@ def intrinsicRigidTyKindAlign : RigidTy → Option Nat
   | .fnPtr _ _ _ _ => .some 8
   | .ref _ _ => .some 8
   | .rawPtr _ _ => .some 8
-  | .array elemKind _ =>
-    match elemKind with
-    | .bool => .some 1
-    | .char => .some 4
-    | .never => .some 1
-    | .uint w => intCastTargetBytes (.uint w)
-    | .int w => intCastTargetBytes (.int w)
-    | .float .f16 => .some 2
-    | .float .f32 => .some 4
-    | .float .f64 => .some 8
-    | .float .f128 => .some 16
-    | .tuple .nil => .some 1
-    | .fnDef _ _ => .some 1
-    | .fnPtr _ _ _ _ => .some 8
-    | .ref _ _ => .some 8
-    | .rawPtr _ _ => .some 8
-    | _ => .none
+  | .array elemKind _ => intrinsicRigidTyKindAlign elemKind
   | _ => .none
 
 /--
-Compute the maximum ABI alignment across a list of `RigidTy` tuple elements when
-each element has a known primitive alignment.
+Compute the maximum `fieldAlign k` over the fields `ks` of a tuple, or `1` for
+the unit tuple `()`, faulting with `.none` if any field alignment is unknown.
 
-Reference (The Rust Reference, "Tuple types"):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#tuple-layout>
+Reference (The Rust Reference, "Type Layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#the-rust-representation>
 
-> "Tuples do not have any guarantees about their layout, other than that the
-> alignment of the tuple is at least the maximum alignment of its fields."
+> "The only data layout guarantees made by this representation are those
+> required for soundness. They are:
+>
+> 1. The fields are properly aligned.
+> 2. The fields do not overlap.
+> 3. The alignment of the type is at least the maximum alignment of its
+>    fields."
 -/
 @[reducible]
-def tupleFieldsAlign : List RigidTy → Option Nat
+def tupleFieldsAlign (fieldAlign : RigidTy → Option Nat) : List RigidTy → Option Nat
   | .nil => .some 1
   | k :: rest =>
-    match intrinsicRigidTyKindAlign k, tupleFieldsAlign rest with
+    match fieldAlign k, tupleFieldsAlign fieldAlign rest with
     | .some a, .some restA =>
       match Nat.ble a restA with
       | true => .some restA
       | false => .some a
     | _, _ => .none
+
+/--
+Fuel-bounded recursive helper for `intrinsicRigidTyAlign`, resolving nested
+arrays of tuples/ADTs and nested tuples on a 64-bit target. `fuel` bounds the
+type nesting depth only: `tupleFieldsAlign` folds over tuple fields without
+consuming fuel, so tuples of any arity resolve.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2282-L2293>
+
+> "pub const unsafe fn min_align_of_val<T: ?Sized>(val: *const T) -> usize;"
+-/
+@[reducible]
+def intrinsicRigidTyAlignAux :
+    Nat → List LocalDecl → LayoutTable → RigidTy → Option Nat
+  | .zero, _, _, _ => .none
+  | .succ fuel', localDecls, layouts, ty =>
+    match intrinsicRigidTyKindAlign ty with
+    | .some a => .some a
+    | .none =>
+      match ty with
+      | .array elemKind _ =>
+        match findDeclLayoutForRigidTy localDecls layouts elemKind with
+        | .some l =>
+          match Align.isPowerOfTwoBytes l.align with
+          | true => .some l.align.bytes
+          | false => .none
+        | .none =>
+          match findDeclLayoutForRigidTy localDecls layouts ty with
+          | .some l =>
+            match Align.isPowerOfTwoBytes l.align with
+            | true => .some l.align.bytes
+            | false => .none
+          | .none => intrinsicRigidTyAlignAux fuel' localDecls layouts elemKind
+      | .tuple ks =>
+        match findDeclLayoutForRigidTy localDecls layouts ty with
+        | .some l =>
+          match Align.isPowerOfTwoBytes l.align with
+          | true => .some l.align.bytes
+          | false => .none
+        | .none => tupleFieldsAlign (intrinsicRigidTyAlignAux fuel' localDecls layouts) ks
+      | _ =>
+        match findDeclLayoutForRigidTy localDecls layouts ty with
+        | .some l =>
+          match Align.isPowerOfTwoBytes l.align with
+          | true => .some l.align.bytes
+          | false => .none
+        | .none => .none
 
 /--
 Determine the ABI byte alignment of a sized `RigidTy` on a 64-bit target for
@@ -1177,37 +1170,137 @@ def intrinsicRigidTyAlign
     (layouts : LayoutTable)
     (ty : RigidTy) :
     Option Nat :=
-  match intrinsicRigidTyKindAlign ty with
-  | .some a => .some a
-  | .none =>
-    match ty with
-    | .array elemKind _ =>
-      match findDeclLayoutForRigidTy localDecls layouts elemKind with
-      | .some l =>
-        match Align.isPowerOfTwoBytes l.align with
-        | true => .some l.align.bytes
-        | false => .none
-      | .none =>
+  intrinsicRigidTyAlignAux 8 localDecls layouts ty
+
+/--
+Sum `fieldSize k` over the fields `ks` of a tuple, before the total is padded to
+the tuple's alignment, faulting with `.none` if any field size is unknown.
+
+Reference (The Rust Reference, "Type Layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#the-rust-representation>
+
+> "2. The fields do not overlap."
+-/
+@[reducible]
+def tupleFieldsByteSum (fieldSize : RigidTy → Option Nat) : List RigidTy → Option Nat
+  | .nil => .some 0
+  | k :: rest =>
+    match fieldSize k, tupleFieldsByteSum fieldSize rest with
+    | .some sz, .some restSz => .some (Nat.add sz restSz)
+    | _, _ => .none
+
+/--
+Round `bytes` up to the nearest multiple of `alignBytes`.
+
+Reference (The Rust Reference, "Type Layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The size of a value is always a multiple of its alignment."
+-/
+@[reducible]
+def roundUpToAlign (bytes alignBytes : Nat) : Nat :=
+  match Nat.beq (Nat.mod bytes alignBytes) 0 with
+  | true => bytes
+  | false => Nat.add bytes (Nat.sub alignBytes (Nat.mod bytes alignBytes))
+
+/--
+Fuel-bounded recursive helper for `intrinsicRigidTyByteSize`, resolving nested
+arrays and tuples of floats, `!`, and nested aggregates on a 64-bit target.
+
+Without a `LayoutTable` entry, a tuple's size is the sum of its field sizes
+rounded up to its alignment (`intrinsicRigidTyAlignAux`): the smallest size the
+`Rust` representation permits, which `rustc` attains by ordering fields by
+decreasing alignment. Summing without padding would give `(u32, u8)` size `5`,
+violating the size/alignment invariant below. `fuel` bounds the type nesting
+depth only: `tupleFieldsByteSum` folds over tuple fields without consuming fuel.
+
+Reference (The Rust Reference, "Type Layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The size of a value is always a multiple of its alignment."
+-/
+@[reducible]
+def intrinsicRigidTyByteSizeAux :
+    Nat → List LocalDecl → LayoutTable → RigidTy → Option Nat
+  | .zero, _, _, _ => .none
+  | .succ fuel', localDecls, layouts, ty =>
+    match rigidTyKindByteSize ty with
+    | .some sz => .some sz
+    | .none =>
+      match ty with
+      | .never => .some 0
+      | .float .f16 => .some 2
+      | .float .f32 => .some 4
+      | .float .f64 => .some 8
+      | .float .f128 => .some 16
+      | .array elemKind n =>
+        match findDeclLayoutForRigidTy localDecls layouts elemKind with
+        | .some l => .some (Nat.mul l.size.bytes n)
+        | .none =>
+          match findDeclLayoutForRigidTy localDecls layouts ty with
+          | .some l => .some l.size.bytes
+          | .none =>
+            match intrinsicRigidTyByteSizeAux fuel' localDecls layouts elemKind with
+            | .some elemSz => .some (Nat.mul elemSz n)
+            | .none => .none
+      | .tuple ks =>
         match findDeclLayoutForRigidTy localDecls layouts ty with
-        | .some l =>
-          match Align.isPowerOfTwoBytes l.align with
-          | true => .some l.align.bytes
-          | false => .none
+        | .some l => .some l.size.bytes
+        | .none =>
+          match
+            tupleFieldsByteSum (intrinsicRigidTyByteSizeAux fuel' localDecls layouts) ks,
+            intrinsicRigidTyAlignAux (.succ fuel') localDecls layouts ty
+          with
+          | .some rawBytes, .some alignBytes => .some (roundUpToAlign rawBytes alignBytes)
+          | _, _ => .none
+      | _ =>
+        match findDeclLayoutForRigidTy localDecls layouts ty with
+        | .some l => .some l.size.bytes
         | .none => .none
-    | .tuple ks =>
-      match findDeclLayoutForRigidTy localDecls layouts ty with
-      | .some l =>
-        match Align.isPowerOfTwoBytes l.align with
-        | true => .some l.align.bytes
-        | false => .none
-      | .none => tupleFieldsAlign ks
-    | _ =>
-      match findDeclLayoutForRigidTy localDecls layouts ty with
-      | .some l =>
-        match Align.isPowerOfTwoBytes l.align with
-        | true => .some l.align.bytes
-        | false => .none
-      | .none => .none
+
+/--
+Determine the static byte size of a sized `RigidTy` on a 64-bit target for
+`arith_offset` and `size_of_val`, returning `.none` for unsized types (`.slice`,
+`.str`, `.dynamic`, `.foreign`) or unresolvable ADTs.
+
+Reference (The Rust Reference, "Type Layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The size of a value is the offset in bytes between successive elements in an
+> array with that item type including alignment padding."
+-/
+@[reducible]
+def intrinsicRigidTyByteSize
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ty : RigidTy) :
+    Option Nat :=
+  intrinsicRigidTyByteSizeAux 8 localDecls layouts ty
+
+/--
+Step for a pointer intrinsic whose pointee or slice element type `ty` has no
+size or alignment the model can resolve. Every caller needs a sized `ty`:
+`arith_offset::<T>` and slice elements require `T: Sized`, and `size_of_val` and
+`min_align_of_val` dispatch `[T]`, `str`, and `dyn Trait` before reaching this
+step. An unsized `ty` is therefore ill-typed and faults with `.ub`. A sized `ty`
+without a `LayoutTable` entry, such as an ADT that no local of the body has as
+its type, is a well-typed program the model cannot evaluate, so it steps to
+`MirStepNode.unsupported` rather than guessing a layout.
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Most types have a fixed size that is known at compile time and implement the
+> trait `Sized`. A type with a size that is known only at run-time is called a
+> dynamically sized type (DST) or, informally, an unsized type."
+-/
+@[reducible]
+def intrinsicUnresolvedLayoutStep : RigidTy → MirStepNode
+  | .slice _ => MirStepNode.fail .ub
+  | .str => MirStepNode.fail .ub
+  | .dynamic _ => MirStepNode.fail .ub
+  | .foreign _ => MirStepNode.fail .ub
+  | _ => MirStepNode.unsupported
 
 /--
 Resolve the pointee `RigidTy` `T` for pointer-parameterized intrinsics
@@ -1257,9 +1350,17 @@ Reference (`library/core/src/intrinsics/mod.rs` at commit
 > ) -> RET;"
 -/
 @[reducible]
-def unpackConstEvalSelectArgs? : Value → Option (List Value)
+def unpackConstEvalSelectArgs?
+    (tupleVal : Value)
+    (tupleTyOpt : Option RigidTy := .none) :
+    Option (List Value) :=
+  match tupleVal with
   | .aggregate 0 fieldVals => .some fieldVals
-  | .unit => .some .nil
+  | .unit =>
+    match tupleTyOpt with
+    | .none => .some .nil
+    | .some (.tuple elemTys) => .some (replicateValue (length elemTys) .unit)
+    | .some _ => .none
   | _ => .none
 
 /--
@@ -1468,7 +1569,7 @@ def evalNonSelectIntrinsicCall
           | .some retPtrVal =>
             writeIntrinsicReturn s locals' destination targetBb (.ptr retPtrVal 8)
           | .none => MirStepNode.fail .ub
-        | .none => MirStepNode.fail .ub
+        | .none => intrinsicUnresolvedLayoutStep pointeeTy
       | .none => MirStepNode.fail .ub
     | _ => MirStepNode.fail .ub
   | .ctlz =>
@@ -1609,7 +1710,7 @@ def evalNonSelectIntrinsicCall
             | .some elemSz =>
               writeIntrinsicScalarResult s locals' destination targetBb
                 (evalSliceSizeOfVal elemSz lenSc)
-            | .none => MirStepNode.fail .ub
+            | .none => intrinsicUnresolvedLayoutStep elemTy
         | _ => MirStepNode.fail .ub
       | .some .str =>
         match ptrArgVal with
@@ -1620,6 +1721,9 @@ def evalNonSelectIntrinsicCall
             writeIntrinsicScalarResult s locals' destination targetBb
               (evalSliceSizeOfVal 1 lenSc)
         | _ => MirStepNode.fail .ub
+      -- The size of a `dyn Trait` value is read from its vtable, which the
+      -- model does not track.
+      | .some (.dynamic _) => MirStepNode.unsupported
       | .some pointeeTy =>
         match ptrArgVal with
         | .ptr _ ptrSz =>
@@ -1628,11 +1732,11 @@ def evalNonSelectIntrinsicCall
           | true =>
             match intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts pointeeTy with
             | .some sz =>
-              match Nat.ble 9223372036854775808 sz with
+              match Nat.ble (signedHalfModulus 8) sz with
               | true => MirStepNode.fail .ub
               | false =>
                 writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨sz, 8⟩)
-            | .none => MirStepNode.fail .ub
+            | .none => intrinsicUnresolvedLayoutStep pointeeTy
         | _ => MirStepNode.fail .ub
       | .none => MirStepNode.fail .ub
     | _ => MirStepNode.fail .ub
@@ -1650,7 +1754,7 @@ def evalNonSelectIntrinsicCall
             | .some alignBytes =>
               writeIntrinsicReturn s locals' destination targetBb
                 (.scalar ⟨alignBytes, 8⟩)
-            | .none => MirStepNode.fail .ub
+            | .none => intrinsicUnresolvedLayoutStep elemTy
         | _ => MirStepNode.fail .ub
       | .some .str =>
         match ptrArgVal with
@@ -1660,6 +1764,9 @@ def evalNonSelectIntrinsicCall
           | true =>
             writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨1, 8⟩)
         | _ => MirStepNode.fail .ub
+      -- The alignment of a `dyn Trait` value is read from its vtable, which the
+      -- model does not track.
+      | .some (.dynamic _) => MirStepNode.unsupported
       | .some pointeeTy =>
         match ptrArgVal with
         | .ptr _ ptrSz =>
@@ -1670,142 +1777,11 @@ def evalNonSelectIntrinsicCall
             | .some alignBytes =>
               writeIntrinsicReturn s locals' destination targetBb
                 (.scalar ⟨alignBytes, 8⟩)
-            | .none => MirStepNode.fail .ub
+            | .none => intrinsicUnresolvedLayoutStep pointeeTy
         | _ => MirStepNode.fail .ub
       | .none => MirStepNode.fail .ub
     | _ => MirStepNode.fail .ub
   | .constEvalSelect => MirStepNode.fail .ub
-
-/--
-Dispatch a direct (`target.isIndirect = false`) call to a `CallConv.rustIntrinsic`
-compiler intrinsic in `evalTerminator` when `classifyRustIntrinsic? target.defPath`
-returns `.some kind`.
-
-Returns `.none` when `target.defPath` is not an inline-modeled intrinsic so
-`evalTerminator` falls through to `MirStepNode.extCall`.
-
-Reference (`library/core/src/intrinsics/mod.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1-L80>
-
-> "Compiler intrinsics."
--/
-@[reducible]
-def evalDirectRustIntrinsic?
-    (s : MachineState)
-    (currentBody : Option CapturedMir)
-    (target : ResolvedCallTarget)
-    (bodyLocalDecls : List LocalDecl)
-    (bodyLayouts : LayoutTable)
-    (argOps : List Operand)
-    (argVals : List Value)
-    (locals' : List LocalSlot)
-    (destination : Place)
-    (targetBb : BasicBlockIdx)
-    (unwind : UnwindAction) :
-    Option MirStepNode :=
-  match classifyRustIntrinsic? target.defPath with
-  | .none => .none
-  | .some .constEvalSelect =>
-    .some
-      (match argVals with
-       | tupleArgVal :: _ :: rtFnVal :: .nil =>
-         match unpackConstEvalSelectArgs? tupleArgVal with
-         | .none => MirStepNode.fail .ub
-         | .some unpackedArgs =>
-           let rtFnOpOpt :=
-             match argOps with
-             | _ :: _ :: rtOp :: _ => .some rtOp
-             | _ => .none
-           match
-             resolveConstEvalSelectTarget?
-               s
-               target
-               bodyLocalDecls
-               bodyLayouts
-               rtFnOpOpt
-               rtFnVal
-               (length unpackedArgs)
-           with
-           | .none => MirStepNode.fail .ub
-           | .some rtTarget =>
-             match findCallee? s.memory.callees rtTarget.defPath with
-             | .some calleeBody =>
-               match
-                 Bool.and
-                   (Nat.beq calleeBody.argCount (length unpackedArgs))
-                   (Bool.and
-                     (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
-                     (checkCalleeTargetCompatible rtTarget calleeBody (length unpackedArgs)))
-               with
-               | false => MirStepNode.fail .ub
-               | true =>
-                 match currentBody with
-                 | .none => MirStepNode.unsupported
-                 | .some callerBody =>
-                   MirStepNode.step
-                     (pushCalleeFrame
-                       s
-                       callerBody
-                       locals'
-                       destination
-                       targetBb
-                       calleeBody
-                       unpackedArgs
-                       unwind)
-             | .none =>
-               match rtTarget.isIndirect with
-               | true =>
-                 MirStepNode.extCall
-                   { defPath := rtTarget.defPath, args := unpackedArgs, memory := s.memory }
-                   (resumeExternalCall s locals' destination targetBb unwind)
-               | false =>
-                 match isDirectExactDivTarget rtTarget with
-                 | true =>
-                   match unpackedArgs with
-                   | .scalar lhs :: .scalar rhs :: .nil =>
-                     let isSigned :=
-                       resolveIntrinsicIsSigned rtTarget bodyLocalDecls bodyLayouts .nil
-                     writeIntrinsicScalarResult
-                       s
-                       locals'
-                       destination
-                       targetBb
-                       (evalExactDiv lhs rhs isSigned)
-                   | _ => MirStepNode.fail .ub
-                 | false =>
-                   match classifyRustIntrinsic? rtTarget.defPath with
-                   | .some .constEvalSelect => MirStepNode.fail .ub
-                   | .some rtKind =>
-                     evalNonSelectIntrinsicCall
-                       rtKind
-                       s
-                       rtTarget
-                       bodyLocalDecls
-                       bodyLayouts
-                       .nil
-                       unpackedArgs
-                       locals'
-                       destination
-                       targetBb
-                   | .none =>
-                     MirStepNode.extCall
-                       { defPath := rtTarget.defPath, args := unpackedArgs, memory := s.memory }
-                       (resumeExternalCall s locals' destination targetBb unwind)
-       | _ => MirStepNode.fail .ub)
-  | .some kind =>
-    .some
-      (evalNonSelectIntrinsicCall
-        kind
-        s
-        target
-        bodyLocalDecls
-        bodyLayouts
-        argOps
-        argVals
-        locals'
-        destination
-        targetBb)
 
 /--
 Test whether `defPath` is an unreachable hint or intrinsic
@@ -1950,6 +1926,154 @@ def isUnwindingPanicDefPath (defPath : DefPath) : Bool :=
                                                   (Bool.or
                                                     (stringEq defPath "core::panicking::panic_const::panic_const_div_by_zero")
                                                     (stringEq defPath "core::panicking::panic_const::panic_const_rem_by_zero")))))))))))))))))))))))))
+
+/--
+Dispatch a direct (`target.isIndirect = false`) call to a
+`CallConv.rustIntrinsic` compiler intrinsic in `evalTerminator` when
+`classifyRustIntrinsic? target.defPath` returns `.some kind`.
+
+Returns `.none` when `target.defPath` is not an inline-modeled intrinsic so
+`evalTerminator` falls through to `MirStepNode.extCall`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1-L80>
+
+> "Compiler intrinsics."
+-/
+@[reducible]
+def evalDirectRustIntrinsic?
+    (s : MachineState)
+    (currentBody : Option CapturedMir)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx)
+    (unwind : UnwindAction) :
+    Option MirStepNode :=
+  match classifyRustIntrinsic? target.defPath with
+  | .none => .none
+  | .some .constEvalSelect =>
+    .some
+      (match argVals with
+       | tupleArgVal :: _ :: rtFnVal :: .nil =>
+         let tupleTyOpt :=
+           match target.typeArgs with
+           | firstTy :: _ => .some firstTy
+           | .nil => .none
+         match unpackConstEvalSelectArgs? tupleArgVal tupleTyOpt with
+         | .none => MirStepNode.fail .ub
+         | .some unpackedArgs =>
+           let rtFnOpOpt :=
+             match argOps with
+             | _ :: _ :: rtOp :: _ => .some rtOp
+             | _ => .none
+           match
+             resolveConstEvalSelectTarget?
+               s
+               target
+               bodyLocalDecls
+               bodyLayouts
+               rtFnOpOpt
+               rtFnVal
+               (length unpackedArgs)
+           with
+           | .none => MirStepNode.fail .ub
+           | .some rtTarget =>
+             match findCallee? s.memory.callees rtTarget.defPath with
+             | .some calleeBody =>
+               match
+                 Bool.and
+                   (Nat.beq calleeBody.argCount (length unpackedArgs))
+                   (Bool.and
+                     (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
+                     (checkCalleeTargetCompatible rtTarget calleeBody (length unpackedArgs)))
+               with
+               | false => MirStepNode.fail .ub
+               | true =>
+                 match currentBody with
+                 | .none => MirStepNode.unsupported
+                 | .some callerBody =>
+                   MirStepNode.step
+                     (pushCalleeFrame
+                       s
+                       callerBody
+                       locals'
+                       destination
+                       targetBb
+                       calleeBody
+                       unpackedArgs
+                       unwind)
+             | .none =>
+               match rtTarget.isIndirect with
+               | true =>
+                 MirStepNode.extCall
+                   { defPath := rtTarget.defPath, args := unpackedArgs, memory := s.memory }
+                   (resumeExternalCall s locals' destination targetBb unwind)
+               | false =>
+                 match isDirectExactDivTarget rtTarget with
+                 | true =>
+                   match unpackedArgs with
+                   | .scalar lhs :: .scalar rhs :: .nil =>
+                     let isSigned :=
+                       resolveIntrinsicIsSigned rtTarget bodyLocalDecls bodyLayouts .nil
+                     writeIntrinsicScalarResult
+                       s
+                       locals'
+                       destination
+                       targetBb
+                       (evalExactDiv lhs rhs isSigned)
+                   | _ => MirStepNode.fail .ub
+                 | false =>
+                   match classifyRustIntrinsic? rtTarget.defPath with
+                   | .some .constEvalSelect => MirStepNode.fail .ub
+                   | .some rtKind =>
+                     evalNonSelectIntrinsicCall
+                       rtKind
+                       s
+                       rtTarget
+                       bodyLocalDecls
+                       bodyLayouts
+                       .nil
+                       unpackedArgs
+                       locals'
+                       destination
+                       targetBb
+                   | .none =>
+                     match isUnreachableCallTarget rtTarget.defPath with
+                     | true => MirStepNode.fail .ub
+                     | false =>
+                       match isAbortingPanicDefPath rtTarget.defPath with
+                       | true => MirStepNode.retOutcome .abort
+                       | false =>
+                         match isUnwindingPanicDefPath rtTarget.defPath with
+                         | true =>
+                           match applyUnwindAction s locals' s.memory unwind with
+                           | .running nextState => MirStepNode.step nextState
+                           | .halted out => MirStepNode.retOutcome out
+                           | .faulted fk => MirStepNode.fail fk
+                         | false =>
+                           MirStepNode.extCall
+                             { defPath := rtTarget.defPath, args := unpackedArgs, memory := s.memory }
+                             (resumeExternalCall s locals' destination targetBb unwind)
+       | _ => MirStepNode.fail .ub)
+  | .some kind =>
+    .some
+      (evalNonSelectIntrinsicCall
+        kind
+        s
+        target
+        bodyLocalDecls
+        bodyLayouts
+        argOps
+        argVals
+        locals'
+        destination
+        targetBb)
 
 /--
 Execute a basic-block `Terminator` from state `s`.

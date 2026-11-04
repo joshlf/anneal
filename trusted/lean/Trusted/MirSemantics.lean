@@ -69,8 +69,10 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   resumeExternalTailCall isDirectExactDivTarget RustIntrinsicKind
   classifyRustIntrinsic? rigidTyIsSigned resolveIntrinsicIsSigned
   resolveIntrinsicShiftSigned findDeclLayoutForRigidTy
-  intrinsicRigidTyByteSize intrinsicRigidTyKindAlign tupleFieldsAlign
-  intrinsicRigidTyAlign resolveIntrinsicPointeeTy?
+  intrinsicRigidTyByteSizeAux intrinsicRigidTyByteSize
+  intrinsicRigidTyKindAlign tupleFieldsAlign tupleFieldsByteSum roundUpToAlign
+  intrinsicRigidTyAlignAux intrinsicRigidTyAlign intrinsicUnresolvedLayoutStep
+  resolveIntrinsicPointeeTy?
   unpackConstEvalSelectArgs? resolveConstEvalSelectTarget?
   writeIntrinsicReturn writeIntrinsicScalarResult
   evalNonSelectIntrinsicCall evalDirectRustIntrinsic?
