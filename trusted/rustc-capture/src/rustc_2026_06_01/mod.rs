@@ -1488,7 +1488,10 @@ pub unsafe fn rebuild_and_split<T>(ptr: *mut T, len: usize, mid: usize) -> (*mut
 }
 
 pub fn check_range_contains(r: &Range<usize>, idx: &usize) -> bool {
-    RangeBounds::contains(r, idx)
+    const OPTION_IS_SOME_FN: fn(&Option<usize>) -> bool = Option::<usize>::is_some;
+    let opt = Some(*idx);
+    let fallback = opt.unwrap_or_else(usize::default);
+    OPTION_IS_SOME_FN(&Some(fallback)) && RangeBounds::contains(r, idx)
 }
 "#;
         fs::write(&src_path, rust_source.as_bytes()).expect("write sysroot_lib.rs");
@@ -1570,6 +1573,9 @@ pub fn check_range_contains(r: &Range<usize>, idx: &usize) -> bool {
             "contains",
             "start_bound",
             "end_bound",
+            "is_some",
+            "unwrap_or_else",
+            "default",
         ] {
             assert!(
                 core_def_ids.iter().any(|id| id.contains(required_sub)),
