@@ -1666,4 +1666,311 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn multi_crate_transitive_callees_and_external_spec_override_end_to_end() {
+        let root = unique_temp_dir("multi-crate-transitive-callees-ext-spec");
+        let crate_a_dir = root.join("crate_a");
+        let crate_b_dir = root.join("crate_b");
+        fs::create_dir_all(crate_a_dir.join("src")).expect("create crate_a/src");
+        fs::create_dir_all(crate_b_dir.join("src")).expect("create crate_b/src");
+
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root");
+
+        fs::write(
+            crate_b_dir.join("Cargo.toml"),
+            "[package]\nname = \"crate_b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write crate_b/Cargo.toml");
+        fs::write(
+            crate_b_dir.join("src/lib.rs"),
+            r#"#![no_std]
+use core::ops::{Range, RangeBounds};
+
+pub fn inner_leaf(x: usize) -> usize {
+    x.wrapping_add(1)
+}
+
+pub fn helper_add(x: usize, y: usize) -> usize {
+    let r: Range<usize> = 0..1024;
+    if RangeBounds::contains(&r, &x) {
+        inner_leaf(x).wrapping_add(y)
+    } else {
+        y
+    }
+}
+
+pub fn overridden_dep(x: usize) -> usize {
+    x.wrapping_add(5)
+}
+"#,
+        )
+        .expect("write crate_b/src/lib.rs");
+
+        fs::write(
+            crate_a_dir.join("Cargo.toml"),
+            "[package]\nname = \"crate_a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ncrate_b = { path = \"../crate_b\" }\n",
+        )
+        .expect("write crate_a/Cargo.toml");
+        fs::write(
+            crate_a_dir.join("src/lib.rs"),
+            r#"#![allow(dead_code, non_snake_case, non_upper_case_globals)]
+
+pub const __ANNEAL_EXT_SPEC_TARGET_ext_overridden_dep: &str = "crate_b::overridden_dep";
+pub fn ext_overridden_dep(x: usize) -> usize {
+    let _: fn(usize) -> usize = *::core::hint::black_box(&crate_b::overridden_dep);
+    let _ = (x,);
+    unreachable!()
+}
+pub fn __anodized_fn_requires_ext_overridden_dep(x: usize) -> bool {
+    x < 100
+}
+pub fn __anodized_fn_ensures_ext_overridden_dep(x: usize, ret: usize) -> bool {
+    ret == x.wrapping_add(5)
+}
+
+pub const __ANNEAL_EXT_SPEC_TARGET_ext_slice_is_empty: &str = "<[u8]>::is_empty";
+pub fn ext_slice_is_empty(s: &[u8]) -> bool {
+    let _: fn(&[u8]) -> bool = *::core::hint::black_box(&<[u8]>::is_empty);
+    let _ = (s,);
+    unreachable!()
+}
+
+pub fn caller_default_callees(s: &[u8], extra: usize) -> usize {
+    let len_fn: fn(&[u8]) -> usize = <[u8]>::len;
+    crate_b::helper_add(len_fn(s), extra)
+}
+
+pub fn caller_with_external_specs(s: &[u8], x: usize) -> usize {
+    let empty_bonus = <[u8]>::is_empty(s) as usize;
+    crate_b::overridden_dep(x).wrapping_add(crate_b::inner_leaf(empty_bonus))
+}
+"#,
+        )
+        .expect("write crate_a/src/lib.rs");
+
+        let mut cfg = CaptureDriverConfig::new(&crate_a_dir);
+        cfg.manifest_path = Some(crate_a_dir.join("Cargo.toml"));
+        let wrapper = resolve_rustc_wrapper(&cfg);
+        if !wrapper.is_file() {
+            let status = Command::new("cargo")
+                .args(["build", "-p", "anneal-rustc-capture"])
+                .current_dir(repo_root)
+                .status()
+                .expect("build anneal-rustc-capture");
+            assert!(
+                status.success(),
+                "cargo build -p anneal-rustc-capture must succeed"
+            );
+        }
+
+        let (manifest, records) =
+            run_cargo_capture(&cfg).expect("run_cargo_capture on multi-crate workspace");
+        assert!(manifest.compilation_succeeded);
+
+        let mut scaffold_cfg = crate::scaffold::ScaffoldConfig::new(&crate_a_dir);
+        scaffold_cfg.units_dir = Some(cfg.units_dir.clone());
+        scaffold_cfg.anneal_repo_root = Some(repo_root.to_path_buf());
+        let scaffold_report =
+            crate::scaffold::scaffold_workspace_with_config(&scaffold_cfg, &records)
+                .expect("scaffold multi-crate workspace");
+
+        let gen_dir = crate_a_dir.join(".anneal/generated");
+        let ob_default = fs::read_to_string(
+            gen_dir.join("Obligations/CrateA/caller_default_callees.lean"),
+        )
+        .expect("read caller_default_callees.lean");
+
+        // 1. Default transitive `defaultCallees` contains `Mir.CrateB.helper_add.body`,
+        // transitive `Mir.CrateB.inner_leaf.body`, `Mir.Core.*len*.body`, and
+        // `Mir.Core.*contains*.body` without any `#[external_spec]` needed!
+        assert!(
+            ob_default.contains("Mir.CrateB.helper_add.body"),
+            "defaultCallees must include direct dependency callee Mir.CrateB.helper_add.body:\n{ob_default}"
+        );
+        assert!(
+            ob_default.contains("Mir.CrateB.inner_leaf.body"),
+            "defaultCallees must include transitive dependency callee Mir.CrateB.inner_leaf.body:\n{ob_default}"
+        );
+        assert!(
+            ob_default.contains("len.body"),
+            "defaultCallees must include sysroot <[T]>::len body:\n{ob_default}"
+        );
+        assert!(
+            ob_default.contains("contains.body"),
+            "defaultCallees must include transitive sysroot RangeBounds::contains body:\n{ob_default}"
+        );
+
+        // 2. Explicit `#[external_spec]` override (both with clauses and clause-less)
+        // excludes overridden targets from `defaultCallees` and emits `externalSpecCallContract`!
+        let ob_override = fs::read_to_string(
+            gen_dir.join("Obligations/CrateA/caller_with_external_specs.lean"),
+        )
+        .expect("read caller_with_external_specs.lean");
+        assert!(
+            ob_override.contains("Mir.CrateB.inner_leaf.body"),
+            "non-overridden callee Mir.CrateB.inner_leaf.body must remain in defaultCallees:\n{ob_override}"
+        );
+        assert!(
+            !ob_override.contains("Mir.CrateB.overridden_dep.body"),
+            "overridden target crate_b::overridden_dep must be excluded from defaultCallees:\n{ob_override}"
+        );
+        assert!(
+            !ob_override.contains("Mir.Core.slice_impl_T_is_empty.body"),
+            "clause-less overridden target <[u8]>::is_empty must be excluded from defaultCallees:\n{ob_override}"
+        );
+        assert!(
+            ob_override.contains(
+                "def externalCallContract_CrateA_ext_overridden_dep : MirCallContract :=\n  externalSpecCallContract\n    \"crate_b::overridden_dep\"\n    Mir.CrateA.ext_overridden_dep.body"
+            ),
+            "expected externalCallContract_CrateA_ext_overridden_dep in caller_with_external_specs.lean:\n{ob_override}"
+        );
+        assert!(
+            ob_override.contains(
+                "def externalCallContract_CrateA_ext_slice_is_empty : MirCallContract :=\n  externalSpecCallContract\n    \"core::slice::<impl [T]>::is_empty\"\n    Mir.CrateA.ext_slice_is_empty.body\n    (fun _ => True)\n    (fun _ _ => True)"
+            ),
+            "expected clause-less externalCallContract_CrateA_ext_slice_is_empty in caller_with_external_specs.lean:\n{ob_override}"
+        );
+
+        // 3. Test `cargo anneal generate-external-spec` against the scaffolded workspace.
+        let snippet = crate::generate_external_spec_snippet(
+            &crate_a_dir,
+            Some(&cfg.units_dir),
+            "crate_b::helper_add",
+        )
+        .expect("generate external spec snippet for crate_b::helper_add");
+        assert!(
+            snippet.contains("#[anneal_spec::external_spec(for = crate_b::helper_add)]"),
+            "snippet must contain external_spec attribute:\n{snippet}"
+        );
+        assert!(
+            snippet.contains("fn external_spec_helper_add(x: usize, y: usize) -> usize;"),
+            "snippet must reconstruct parameter and return types from captured Mir:\n{snippet}"
+        );
+
+        // 4. Compile all generated `Mir` and `Obligations` modules in the Lean 4 kernel (`lean`),
+        // and prove in the Lean 4 kernel that `defaultCallees` steps directly into linked callees while
+        // `externalSpecCallContract` enforces non-vacuous return-type and layout validity!
+        let examples_dir = repo_root.join("examples");
+        let lean_lib_dir = examples_dir.join(".lake/build/lib/lean");
+        let lean_bin = if let Ok(home) = std::env::var("HOME") {
+            let elan_lean = PathBuf::from(home).join(".elan/bin/lean");
+            if elan_lean.exists() {
+                elan_lean
+            } else {
+                PathBuf::from("lean")
+            }
+        } else {
+            PathBuf::from("lean")
+        };
+        let lean_path_env = format!("{}:{}", lean_lib_dir.display(), gen_dir.display());
+
+        let compile_lean_file = |lean_file: &Path| {
+            let dst_olean = lean_file.with_extension("olean");
+            let out = Command::new(&lean_bin)
+                .current_dir(&gen_dir)
+                .env("LEAN_PATH", &lean_path_env)
+                .arg("-R")
+                .arg(&gen_dir)
+                .arg("-o")
+                .arg(&dst_olean)
+                .arg(lean_file)
+                .output()
+                .expect("compile Lean module");
+            assert!(
+                out.status.success(),
+                "lean failed on {}:\nstdout: {}\nstderr: {}",
+                lean_file.display(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        for mir_file in &scaffold_report.generated_mir_files {
+            compile_lean_file(mir_file);
+        }
+        for ob_file in &scaffold_report.generated_obligation_files {
+            compile_lean_file(ob_file);
+        }
+
+        let verify_brief_3_2_path = gen_dir.join("VerifyBrief32.lean");
+        let verify_brief_3_2_src = r#"import Trusted
+import Obligations.CrateA.caller_default_callees
+import Obligations.CrateA.caller_with_external_specs
+
+open Trusted.Sequence
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+open Trusted.VerificationResult
+
+-- 1. Subject claims carry `defaultCallees` by default and populate `s.memory.callees`.
+example :
+    Obligations.CrateA.caller_default_callees.claim.callees =
+      Obligations.CrateA.caller_default_callees.defaultCallees := rfl
+
+example (args : List Value) :
+    (initMachineStateWithCallees
+      Mir.CrateA.caller_default_callees.body
+      args
+      Obligations.CrateA.caller_default_callees.defaultCallees).memory.callees =
+      Obligations.CrateA.caller_default_callees.defaultCallees := rfl
+
+-- 2. Without `#[external_spec]`, `findCallee?` over `defaultCallees` resolves
+--    both direct (`crate_b::helper_add`) and transitive (`crate_b::inner_leaf`) callees!
+example :
+    findCallee?
+      Obligations.CrateA.caller_default_callees.defaultCallees
+      "crate_b::helper_add" = .some Mir.CrateB.helper_add.body := rfl
+
+example :
+    findCallee?
+      Obligations.CrateA.caller_default_callees.defaultCallees
+      "crate_b::inner_leaf" = .some Mir.CrateB.inner_leaf.body := rfl
+
+-- 3. With `#[external_spec(for = ...)]`, overridden targets (`crate_b::overridden_dep`
+--    and `core::slice::<impl [T]>::is_empty`) are excluded from `defaultCallees`
+--    (so `findCallee?` returns `.none` and `evalTerminator` emits `MirCallE`),
+--    while non-overridden `crate_b::inner_leaf` stays linked!
+example :
+    findCallee?
+      Obligations.CrateA.caller_with_external_specs.defaultCallees
+      "crate_b::overridden_dep" = .none := rfl
+
+example :
+    findCallee?
+      Obligations.CrateA.caller_with_external_specs.defaultCallees
+      "core::slice::<impl [T]>::is_empty" = .none := rfl
+
+example :
+    findCallee?
+      Obligations.CrateA.caller_with_external_specs.defaultCallees
+      "crate_b::inner_leaf" = .some Mir.CrateB.inner_leaf.body := rfl
+
+-- 4. Clause-less `#[external_spec(for = <[u8]>::is_empty)]` generates a non-vacuous
+--    well-typed `MirCallContract` whose postcondition accepts valid `bool` scalars
+--    (`0` or `1` of byte width `1`) and rejects out-of-range values!
+example (sVal : Value) :
+    Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
+      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      (.returned (.scalar ⟨1, 1⟩) emptyMemory) := by
+  exact ⟨.scalar ⟨1, 1⟩, rfl, ⟨1, by decide, rfl⟩, trivial⟩
+
+example (sVal : Value) :
+    ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
+      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      (.returned (.scalar ⟨2, 1⟩) emptyMemory) := by
+  rintro ⟨retVal, h_ans, ⟨b, hb_lt, h_ret⟩, _⟩
+  cases h_ans
+  cases h_ret
+  omega
+"#;
+        fs::write(&verify_brief_3_2_path, verify_brief_3_2_src.as_bytes())
+            .expect("write VerifyBrief32.lean");
+        compile_lean_file(&verify_brief_3_2_path);
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

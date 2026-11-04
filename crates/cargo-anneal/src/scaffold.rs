@@ -20,7 +20,7 @@
 //!   are created only when absent on disk and are never overwritten once
 //!   created.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -28,10 +28,11 @@ use anneal_rustc_capture::lean_emit::render_mir_module_header;
 use anneal_rustc_capture::{CapturedItemKind, CapturedTarget, UnitTargetRecord, sha256_hex};
 
 use crate::obligations::{
-    AuthoredItemModules, CalleeContractRef, SubjectObligationBundle, derive_item_module_suffix,
-    group_subject_obligations, module_suffix_to_rel_path, render_crate_verify_module,
-    render_generated_assumptions_module, render_obligations_module_with_options,
-    render_proof_template_with_options, render_specs_template, render_verify_module_with_options,
+    AuthoredItemModules, CalleeContractRef, SubjectObligationBundle, TransitiveCalleeRef,
+    collect_external_spec_contracts, derive_item_module_suffix, group_subject_obligations,
+    module_suffix_to_rel_path, render_crate_verify_module, render_generated_assumptions_module,
+    render_obligations_module_with_options, render_proof_template_with_options,
+    render_specs_template, render_verify_module_with_options,
 };
 
 /// Pinned Lean 4 toolchain identifier written to `.anneal/lean-toolchain`.
@@ -263,12 +264,54 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
     }
 }
 
-/// Populate `bundle.called_callees` for each subject bundle by scanning its
-/// placed `.anneal/generated/Mir/<Item>.lean` file for `.fnDef "<callee_def_id>"`
-/// constants matching sibling verified bundles in the crate.
-fn populate_called_callees(mir_root: &Path, bundles: &mut [SubjectObligationBundle]) {
-    let callee_candidates: Vec<CalleeContractRef> = bundles
+/// Extract all `.fnDef "<def_id>"` and `implPath := "<def_id>"` references from
+/// a placed `.anneal/generated/Mir/<Item>.lean` module in deterministic
+/// first-appearance order.
+fn extract_called_fn_defs(mir_text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for marker in [".fnDef \"", "implPath := \""] {
+        let mut rest = mir_text;
+        while let Some(pos) = rest.find(marker) {
+            let after = &rest[pos + marker.len()..];
+            if let Some(end_quote) = after.find('"') {
+                let def_id = &after[..end_quote];
+                if !def_id.is_empty() && seen.insert(def_id.to_string()) {
+                    out.push(def_id.to_string());
+                }
+                rest = &after[end_quote + 1..];
+            } else {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Populate `bundle.transitive_callees`, `bundle.external_spec_callees`, and
+/// `bundle.called_callees` for each subject bundle by computing the cycle-safe
+/// transitive closure of reachable `.fnDef "<callee_def_id>"` and trait-impl
+/// references across all captured MIR bodies (`Subject`, `UnsafeTraitImpl`,
+/// `Callee`, `Model`, `TypeInvariant`), excluding any target with an explicit
+/// `#[external_spec(for = <target>)]` override or `#[spec(trusted)]` attribute.
+fn populate_called_callees(
+    mir_root: &Path,
+    records: &[UnitTargetRecord],
+    bundles: &mut [SubjectObligationBundle],
+) {
+    let external_spec_contracts = collect_external_spec_contracts(records);
+    let trusted_subject_def_ids: BTreeSet<String> = bundles
         .iter()
+        .filter(|b| b.has_rust_trusted_attr())
+        .map(|b| b.subject.target.def_id.clone())
+        .collect();
+
+    let trusted_callee_candidates: Vec<CalleeContractRef> = bundles
+        .iter()
+        .filter(|b| {
+            b.has_rust_trusted_attr()
+                && !external_spec_contracts.contains_key(&b.subject.target.def_id)
+        })
         .map(|b| CalleeContractRef {
             def_id: b.subject.target.def_id.clone(),
             item_module_suffix: b.item_module_suffix.clone(),
@@ -277,18 +320,131 @@ fn populate_called_callees(mir_root: &Path, bundles: &mut [SubjectObligationBund
         })
         .collect();
 
-    for bundle in bundles.iter_mut() {
-        let mir_path = mir_root.join(&bundle.item_rel_path);
-        let Ok(mir_text) = fs::read_to_string(&mir_path) else {
-            continue;
-        };
-        for cand in &callee_candidates {
-            if cand.def_id == bundle.subject.target.def_id {
-                continue;
+    let mut callable_by_def_id: BTreeMap<String, (String, PathBuf)> = BTreeMap::new();
+    let mut trait_impls_by_method: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for record in records {
+        for entry in &record.trait_impls {
+            if !entry.trait_method_def_path.is_empty() && !entry.impl_path.is_empty() {
+                trait_impls_by_method
+                    .entry(entry.trait_method_def_path.clone())
+                    .or_default()
+                    .push(entry.impl_path.clone());
             }
-            let needle = format!(".fnDef \"{}\"", cand.def_id);
-            if mir_text.contains(&needle) {
+        }
+        if !matches!(
+            record.item_kind,
+            CapturedItemKind::Subject
+                | CapturedItemKind::UnsafeTraitImpl
+                | CapturedItemKind::Callee
+                | CapturedItemKind::Model
+                | CapturedItemKind::TypeInvariant
+        ) {
+            continue;
+        }
+        if record.target.mir_module_path.is_empty() {
+            continue;
+        }
+        if external_spec_contracts.contains_key(&record.target.def_id)
+            || trusted_subject_def_ids.contains(&record.target.def_id)
+        {
+            continue;
+        }
+        let suffix = derive_item_module_suffix(record);
+        let rel_path = module_suffix_to_rel_path(&suffix);
+        callable_by_def_id.insert(record.target.def_id.clone(), (suffix, rel_path));
+    }
+
+    let mut outgoing_cache: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    let mut read_outgoing = |rel_path: &Path| -> Vec<String> {
+        if let Some(cached) = outgoing_cache.get(rel_path) {
+            return cached.clone();
+        }
+        let mir_path = mir_root.join(rel_path);
+        let refs = fs::read_to_string(&mir_path)
+            .map(|txt| extract_called_fn_defs(&txt))
+            .unwrap_or_default();
+        outgoing_cache.insert(rel_path.to_path_buf(), refs.clone());
+        refs
+    };
+
+    for bundle in bundles.iter_mut() {
+        let root_refs = read_outgoing(&bundle.item_rel_path);
+        for cand in &trusted_callee_candidates {
+            if cand.def_id != bundle.subject.target.def_id && root_refs.contains(&cand.def_id) {
                 bundle.called_callees.push(cand.clone());
+            }
+        }
+
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        let mut ext_seen: BTreeSet<String> = BTreeSet::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+
+        let enqueue_ref = |r: &str,
+                           subject_def_id: &str,
+                           visited: &mut BTreeSet<String>,
+                           ext_seen: &mut BTreeSet<String>,
+                           ext_out: &mut Vec<_>,
+                           queue: &mut VecDeque<String>| {
+            if r != subject_def_id
+                && let Some(ext) = external_spec_contracts.get(r)
+            {
+                if ext_seen.insert(r.to_string()) {
+                    ext_out.push(ext.clone());
+                }
+                return;
+            }
+            if callable_by_def_id.contains_key(r) && visited.insert(r.to_string()) {
+                queue.push_back(r.to_string());
+            }
+            if let Some(impls) = trait_impls_by_method.get(r) {
+                for impl_id in impls {
+                    if impl_id != subject_def_id
+                        && let Some(ext) = external_spec_contracts.get(impl_id)
+                    {
+                        if ext_seen.insert(impl_id.clone()) {
+                            ext_out.push(ext.clone());
+                        }
+                        continue;
+                    }
+                    if callable_by_def_id.contains_key(impl_id) && visited.insert(impl_id.clone()) {
+                        queue.push_back(impl_id.clone());
+                    }
+                }
+            }
+        };
+
+        let subject_def_id = bundle.subject.target.def_id.clone();
+        for r in &root_refs {
+            enqueue_ref(
+                r,
+                &subject_def_id,
+                &mut visited,
+                &mut ext_seen,
+                &mut bundle.external_spec_callees,
+                &mut queue,
+            );
+        }
+
+        while let Some(callee_def_id) = queue.pop_front() {
+            let Some((callee_suffix, callee_rel_path)) =
+                callable_by_def_id.get(&callee_def_id).cloned()
+            else {
+                continue;
+            };
+            bundle.transitive_callees.push(TransitiveCalleeRef {
+                def_id: callee_def_id,
+                item_module_suffix: callee_suffix,
+            });
+            let next_refs = read_outgoing(&callee_rel_path);
+            for r in &next_refs {
+                enqueue_ref(
+                    r,
+                    &subject_def_id,
+                    &mut visited,
+                    &mut ext_seen,
+                    &mut bundle.external_spec_callees,
+                    &mut queue,
+                );
             }
         }
     }
@@ -409,7 +565,7 @@ pub fn scaffold_workspace_with_config(
     }
 
     let mut bundles = group_subject_obligations(&sorted_records);
-    populate_called_callees(&mir_root, &mut bundles);
+    populate_called_callees(&mir_root, &sorted_records, &mut bundles);
     let generated_assumptions_root = generated_dir.join("Assumptions");
 
     for bundle in &bundles {
@@ -687,6 +843,8 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
             inline_qualifiers: Vec::new(),
             external_specs: Vec::new(),
             called_callees: Vec::new(),
+            transitive_callees: Vec::new(),
+            external_spec_callees: Vec::new(),
         };
 
         let should_rerender_verify = authored.has_proof
@@ -1461,6 +1619,172 @@ mod tests {
         assert!(
             proof_text.contains("import Obligations.MyCrate.add\nimport Specs.MyCrate.add\n"),
             "created Proof template must automatically import Specs.MyCrate.add when --init-specs and --init-proofs are used together:\n{proof_text}"
+        );
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn transitive_callees_closure_is_cycle_safe_and_excludes_external_spec_overrides() {
+        let workspace = unique_temp_dir("transitive-callees");
+        let unit_dir = workspace.join("target/anneal/units/my_crate-01");
+        fs::create_dir_all(unit_dir.join("Mir/MyCrate")).expect("create Mir/MyCrate");
+        fs::create_dir_all(unit_dir.join("Mir/DepCrate")).expect("create Mir/DepCrate");
+        fs::create_dir_all(unit_dir.join("Mir/Core")).expect("create Mir/Core");
+
+        // `my_crate::entry` calls:
+        // - `my_crate::local_step` (which calls `dep_crate::mutual_a` and trait method `core::ops::RangeBounds::contains`)
+        // - `dep_crate::overridden_fn` (which has an explicit `#[external_spec]` override, so it and its private callee `dep_crate::behind_override` must be excluded from `defaultCallees`!)
+        // Meanwhile `dep_crate::mutual_a` <-> `dep_crate::mutual_b` form a cycle, and `core::ops::RangeBounds::contains` resolves via `trait_impls` to `core::ops::range::<impl RangeBounds<T>>::contains`.
+        let write_mir = |rel: &str, body_refs: &[&str]| {
+            let mut txt = String::from("prelude\nimport Init.Core\nimport Trusted\n");
+            for r in body_refs {
+                txt.push_str(&format!("-- call .fnDef \"{r}\" []\n"));
+            }
+            fs::write(unit_dir.join(rel), txt).expect("write mir file");
+        };
+
+        write_mir(
+            "Mir/MyCrate/entry.lean",
+            &["my_crate::local_step", "dep_crate::overridden_fn"],
+        );
+        write_mir(
+            "Mir/MyCrate/local_step.lean",
+            &["dep_crate::mutual_a", "core::ops::RangeBounds::contains"],
+        );
+        write_mir(
+            "Mir/DepCrate/mutual_a.lean",
+            &["dep_crate::mutual_b", "dep_crate::mutual_a"],
+        );
+        write_mir("Mir/DepCrate/mutual_b.lean", &["dep_crate::mutual_a"]);
+        write_mir(
+            "Mir/DepCrate/overridden_fn.lean",
+            &["dep_crate::behind_override"],
+        );
+        write_mir("Mir/DepCrate/behind_override.lean", &[]);
+        write_mir("Mir/Core/range_contains.lean", &[]);
+        write_mir("Mir/MyCrate/spec_overridden_fn.lean", &[]);
+
+        let records = vec![
+            UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id: "my_crate::entry".to_string(),
+                    mir_module_path: "Mir/MyCrate/entry.lean".to_string(),
+                    mir_module_sha256: String::new(),
+                },
+                lean_module_name: "Mir.MyCrate.entry".to_string(),
+                item_kind: CapturedItemKind::Subject,
+                associated_subject_def_id: None,
+                trait_impls: Vec::new(),
+            },
+            UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id: "my_crate::local_step".to_string(),
+                    mir_module_path: "Mir/MyCrate/local_step.lean".to_string(),
+                    mir_module_sha256: String::new(),
+                },
+                lean_module_name: "Mir.MyCrate.local_step".to_string(),
+                item_kind: CapturedItemKind::Subject,
+                associated_subject_def_id: None,
+                trait_impls: Vec::new(),
+            },
+            UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id: "dep_crate::mutual_a".to_string(),
+                    mir_module_path: "Mir/DepCrate/mutual_a.lean".to_string(),
+                    mir_module_sha256: String::new(),
+                },
+                lean_module_name: "Mir.DepCrate.mutual_a".to_string(),
+                item_kind: CapturedItemKind::Callee,
+                associated_subject_def_id: None,
+                trait_impls: Vec::new(),
+            },
+            UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id: "dep_crate::mutual_b".to_string(),
+                    mir_module_path: "Mir/DepCrate/mutual_b.lean".to_string(),
+                    mir_module_sha256: String::new(),
+                },
+                lean_module_name: "Mir.DepCrate.mutual_b".to_string(),
+                item_kind: CapturedItemKind::Callee,
+                associated_subject_def_id: None,
+                trait_impls: Vec::new(),
+            },
+            UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id: "dep_crate::overridden_fn".to_string(),
+                    mir_module_path: "Mir/DepCrate/overridden_fn.lean".to_string(),
+                    mir_module_sha256: String::new(),
+                },
+                lean_module_name: "Mir.DepCrate.overridden_fn".to_string(),
+                item_kind: CapturedItemKind::Callee,
+                associated_subject_def_id: None,
+                trait_impls: Vec::new(),
+            },
+            UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id: "dep_crate::behind_override".to_string(),
+                    mir_module_path: "Mir/DepCrate/behind_override.lean".to_string(),
+                    mir_module_sha256: String::new(),
+                },
+                lean_module_name: "Mir.DepCrate.behind_override".to_string(),
+                item_kind: CapturedItemKind::Callee,
+                associated_subject_def_id: None,
+                trait_impls: Vec::new(),
+            },
+            UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id: "core::ops::range::<impl RangeBounds<T>>::contains".to_string(),
+                    mir_module_path: "Mir/Core/range_contains.lean".to_string(),
+                    mir_module_sha256: String::new(),
+                },
+                lean_module_name: "Mir.Core.range_contains".to_string(),
+                item_kind: CapturedItemKind::Callee,
+                associated_subject_def_id: None,
+                trait_impls: vec![anneal_rustc_capture::manifest::ManifestTraitImplEntry {
+                    trait_method_def_path: "core::ops::RangeBounds::contains".to_string(),
+                    trait_args_lean: Vec::new(),
+                    impl_path: "core::ops::range::<impl RangeBounds<T>>::contains".to_string(),
+                }],
+            },
+            UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id: "my_crate::spec_overridden_fn".to_string(),
+                    mir_module_path: "Mir/MyCrate/spec_overridden_fn.lean".to_string(),
+                    mir_module_sha256: String::new(),
+                },
+                lean_module_name: "Mir.MyCrate.spec_overridden_fn".to_string(),
+                item_kind: CapturedItemKind::ExternalSpec,
+                associated_subject_def_id: Some("dep_crate::overridden_fn".to_string()),
+                trait_impls: Vec::new(),
+            },
+        ];
+
+        scaffold_workspace(&workspace, &records).expect("scaffold workspace with transitive callees");
+
+        let entry_obligations = fs::read_to_string(
+            workspace.join(".anneal/generated/Obligations/MyCrate/entry.lean"),
+        )
+        .expect("read entry obligations");
+
+        assert!(
+            entry_obligations.contains(
+                "def defaultCallees : List CapturedMir :=\n  \
+                   [Mir.MyCrate.local_step.body, Mir.DepCrate.mutual_a.body, Mir.Core.range_contains.body, Mir.DepCrate.mutual_b.body]"
+            ),
+            "unexpected defaultCallees in entry.lean:\n{entry_obligations}"
+        );
+        assert!(
+            !entry_obligations.contains("Mir.DepCrate.overridden_fn.body"),
+            "overridden_fn must be excluded from defaultCallees:\n{entry_obligations}"
+        );
+        assert!(
+            !entry_obligations.contains("Mir.DepCrate.behind_override.body"),
+            "callees only reachable behind an overridden target must be excluded:\n{entry_obligations}"
+        );
+        assert!(
+            entry_obligations.contains("def externalCallContract_MyCrate_spec_overridden_fn : MirCallContract :="),
+            "entry obligations must include externalCallContract for overridden_fn:\n{entry_obligations}"
         );
 
         let _ = fs::remove_dir_all(&workspace);

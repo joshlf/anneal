@@ -75,7 +75,8 @@ pub use miri_diff::{
     run_miri_diff_suite, stage_miri_diff_workspace,
 };
 pub use obligations::{
-    AuthoredItemModules, SubjectObligationBundle, derive_item_module_suffix,
+    AuthoredItemModules, CalleeContractRef, ExternalSpecContractRef, SubjectObligationBundle,
+    TransitiveCalleeRef, collect_external_spec_contracts, derive_item_module_suffix,
     group_subject_obligations, module_suffix_to_rel_path, render_crate_verify_module,
     render_obligations_module, render_obligations_module_with_options, render_proof_template,
     render_proof_template_with_options, render_specs_template, render_verify_module,
@@ -137,6 +138,9 @@ pub enum CliSubcommand {
     /// Verify upstream MiniRust lockfiles, diff snapshots, and render sync
     /// status reports offline (`cargo anneal minirust-sync`).
     MiniRustSync,
+    /// Generate a ready-to-use `#[anneal_spec::external_spec(for = <target>)]`
+    /// Rust declaration snippet (`cargo anneal generate-external-spec <target> [--output <path>]`).
+    GenerateExternalSpec,
     /// Print CLI usage instructions.
     Help,
     /// Print the `cargo-anneal` package version.
@@ -491,6 +495,10 @@ where
                 extra_cargo_args.extend(slice[i + 1..].iter().cloned());
                 break;
             }
+            "generate-external-spec" if subcommand.is_none() => {
+                subcommand = Some(CliSubcommand::GenerateExternalSpec);
+                i += 1;
+            }
             "--workspace-root" => {
                 i += 1;
                 let val = slice
@@ -718,22 +726,23 @@ where
                 local_archive = Some(PathBuf::from(val));
                 i += 1;
             }
-            "--out-dir" => {
+            "--out-dir" | "--output" | "-o" => {
                 i += 1;
                 let val = slice
                     .get(i)
-                    .ok_or_else(|| "missing value for --out-dir".to_string())?;
+                    .ok_or_else(|| "missing value for --out-dir/--output".to_string())?;
                 let trimmed = val.trim();
                 if trimmed.is_empty() {
-                    return Err("missing value for --out-dir".to_string());
+                    return Err("missing value for --out-dir/--output".to_string());
                 }
                 out_dir = Some(PathBuf::from(trimmed));
                 i += 1;
             }
-            s if s.starts_with("--out-dir=") => {
-                let val = s["--out-dir=".len()..].trim();
+            s if s.starts_with("--out-dir=") || s.starts_with("--output=") => {
+                let (_, val) = s.split_once('=').unwrap_or((s, ""));
+                let val = val.trim();
                 if val.is_empty() {
-                    return Err("missing value for --out-dir".to_string());
+                    return Err("missing value for --out-dir/--output".to_string());
                 }
                 out_dir = Some(PathBuf::from(val));
                 i += 1;
@@ -745,7 +754,7 @@ where
             other => {
                 if subcommand.is_none() {
                     return Err(format!(
-                        "unknown subcommand '{other}' (expected 'extract', 'scaffold', 'verify', 'check', 'lock-specs', 'agent-context', 'agent-verify', 'agent-sandbox', 'setup', 'vendor-fuchsia', 'correspondence-bugs', or 'minirust-sync')"
+                        "unknown subcommand '{other}' (expected 'extract', 'scaffold', 'verify', 'check', 'lock-specs', 'agent-context', 'agent-verify', 'agent-sandbox', 'setup', 'vendor-fuchsia', 'correspondence-bugs', 'minirust-sync', or 'generate-external-spec')"
                     ));
                 }
                 extra_cargo_args.push(other.to_string());
@@ -842,7 +851,8 @@ pub fn cli_usage() -> &'static str {
        agent-verify        Enforce .anneal/spec-lock.json, regenerate .anneal/generated/, and verify\n  \
        agent-sandbox       Run an agent command inside a bwrap read-only sandbox (-- <COMMAND>...)\n  \
        correspondence-bugs Offline non-correspondence gap linter & opt-in manual issue formatter/filer\n  \
-       minirust-sync       Offline upstream MiniRust lock verifier, snapshot differ, and status reporter\n\n\
+       minirust-sync       Offline upstream MiniRust lock verifier, snapshot differ, and status reporter\n  \
+       generate-external-spec  Generate a ready-to-use #[anneal_spec::external_spec(for = <target>)] snippet\n\n\
      Options:\n  \
        --local-archive <PATH>  Install 'setup' from a local .tar.zst toolchain archive\n  \
        --out-dir <DIR>         Output directory for 'vendor-fuchsia'\n  \
@@ -1186,6 +1196,453 @@ pub fn execute_cli(options: &CliOptions) -> Result<(), String> {
             print!("{out}");
             Ok(())
         }
+        CliSubcommand::GenerateExternalSpec => {
+            let target = options
+                .extra_cargo_args
+                .first()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .or(options.item_filter.as_deref())
+                .ok_or_else(|| {
+                    "generate-external-spec requires a <target> function path argument".to_string()
+                })?;
+            let snippet = generate_external_spec_snippet(
+                &options.workspace_root,
+                Some(&options.units_dir),
+                target,
+            )?;
+            if let Some(ref output_path) = options.out_dir {
+                if let Some(parent) = output_path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    fs::create_dir_all(parent).map_err(|err| {
+                        format!(
+                            "failed to create output directory {}: {}",
+                            parent.display(),
+                            err
+                        )
+                    })?;
+                }
+                fs::write(output_path, &snippet).map_err(|err| {
+                    format!(
+                        "failed to write external spec snippet to {}: {}",
+                        output_path.display(),
+                        err
+                    )
+                })?;
+            } else {
+                print!("{snippet}");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Generate a ready-to-use `#[anneal_spec::external_spec(for = <target>)]` Rust
+/// declaration snippet for `target` by inspecting captured MIR modules under
+/// `.anneal/generated/Mir/` or `units_dir`, workspace `.rs` source files, or
+/// standard `core` signatures.
+pub fn generate_external_spec_snippet(
+    workspace_root: &Path,
+    units_dir: Option<&Path>,
+    target: &str,
+) -> Result<String, String> {
+    let trimmed_target = target.trim();
+    if trimmed_target.is_empty() {
+        return Err("target function path must not be empty".to_string());
+    }
+
+    let normalized_lookup = normalize_external_spec_lookup_target(trimmed_target);
+    let short_ident = normalized_lookup
+        .rsplit_once("::")
+        .map(|(_, id)| id)
+        .unwrap_or(&normalized_lookup)
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+    let spec_fn_name = format!(
+        "external_spec_{}",
+        if short_ident.is_empty() {
+            "target"
+        } else {
+            short_ident
+        }
+    );
+
+    if let Some((params, ret_ty)) =
+        find_signature_in_captured_mir(workspace_root, units_dir, trimmed_target, &normalized_lookup)
+            .or_else(|| find_signature_in_rust_sources(workspace_root, short_ident))
+            .or_else(|| builtin_core_signature(trimmed_target, &normalized_lookup))
+    {
+        return Ok(format_external_spec_snippet(
+            trimmed_target,
+            &spec_fn_name,
+            &params,
+            &ret_ty,
+        ));
+    }
+
+    Ok(format_external_spec_snippet(
+        trimmed_target,
+        &spec_fn_name,
+        &[],
+        "()",
+    ))
+}
+
+fn normalize_external_spec_lookup_target(raw: &str) -> String {
+    let collapsed: String = raw.split_whitespace().collect();
+    let trimmed = collapsed
+        .trim_start_matches("::")
+        .strip_prefix("crate::")
+        .or_else(|| collapsed.trim_start_matches("::").strip_prefix("self::"))
+        .unwrap_or(collapsed.trim_start_matches("::"));
+    if let Some(rest) = trimmed.strip_prefix("std::") {
+        return format!("core::{rest}");
+    }
+    if let Some(rest) = trimmed.strip_prefix("<[")
+        && let Some((elem, after)) = rest.split_once("]>::")
+        && !elem.is_empty()
+        && !after.is_empty()
+    {
+        return format!("core::slice::<impl [T]>::{after}");
+    }
+    trimmed.to_string()
+}
+
+fn format_external_spec_snippet(
+    target: &str,
+    spec_fn_name: &str,
+    params: &[(String, String)],
+    ret_ty: &str,
+) -> String {
+    let params_str = params
+        .iter()
+        .map(|(name, ty)| format!("{name}: {ty}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ret_suffix = if ret_ty.is_empty() || ret_ty == "()" {
+        String::new()
+    } else {
+        format!(" -> {ret_ty}")
+    };
+    let ensures_ret_ty = if ret_ty.is_empty() { "()" } else { ret_ty };
+    format!(
+        "// Generated by `cargo anneal generate-external-spec {target}`.\n\
+         // Optional clauses: `requires: <pred>, ensures: |ret: {ensures_ret_ty}| <pred>`.\n\
+         #[anneal_spec::external_spec(for = {target})]\n\
+         fn {spec_fn_name}({params_str}){ret_suffix};\n"
+    )
+}
+
+fn find_signature_in_captured_mir(
+    workspace_root: &Path,
+    units_dir: Option<&Path>,
+    raw_target: &str,
+    normalized_target: &str,
+) -> Option<(Vec<(String, String)>, String)> {
+    let mut candidate_dirs = Vec::new();
+    let gen_mir = workspace_root.join(".anneal/generated/Mir");
+    if gen_mir.is_dir() {
+        candidate_dirs.push(gen_mir);
+    }
+    if let Some(u_dir) = units_dir
+        && u_dir.is_dir()
+    {
+        candidate_dirs.push(u_dir.to_path_buf());
+    }
+    let default_units = workspace_root.join("target/anneal/units");
+    if default_units.is_dir() && !candidate_dirs.contains(&default_units) {
+        candidate_dirs.push(default_units);
+    }
+
+    let mut lean_files = Vec::new();
+    for dir in &candidate_dirs {
+        collect_mir_lean_files(dir, &mut lean_files);
+    }
+    lean_files.sort();
+
+    let suffix_match = format!("::{normalized_target}");
+    for file in &lean_files {
+        let Ok(txt) = fs::read_to_string(file) else {
+            continue;
+        };
+        let Some(def_path) = extract_lean_mir_def_path(&txt) else {
+            continue;
+        };
+        if def_path == raw_target
+            || def_path == normalized_target
+            || def_path.ends_with(&suffix_match)
+        {
+            if let Some(sig) = parse_lean_mir_signature(&txt) {
+                return Some(sig);
+            }
+        }
+    }
+    None
+}
+
+fn collect_mir_lean_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_mir_lean_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("lean") {
+            out.push(path);
+        }
+    }
+}
+
+fn extract_lean_mir_def_path(txt: &str) -> Option<String> {
+    let marker = "defPath := \"";
+    let pos = txt.find(marker)?;
+    let after = &txt[pos + marker.len()..];
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
+}
+
+fn parse_lean_mir_signature(txt: &str) -> Option<(Vec<(String, String)>, String)> {
+    let arg_marker = "argCount := ";
+    let arg_pos = txt.find(arg_marker)?;
+    let after_arg = &txt[arg_pos + arg_marker.len()..];
+    let arg_digits: String = after_arg
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let arg_count: usize = arg_digits.parse().ok()?;
+
+    let decls_marker = "localDecls :=";
+    let decls_pos = txt.find(decls_marker)?;
+    let mut rest = &txt[decls_pos + decls_marker.len()..];
+    let mut decl_tys = Vec::with_capacity(arg_count + 1);
+
+    let kind_marker = "ty := { kind := ";
+    let layout_marker = ", layoutIdx :=";
+    for idx in 0..=arg_count {
+        let k_pos = rest.find(kind_marker)?;
+        let after_k = &rest[k_pos + kind_marker.len()..];
+        let l_pos = after_k.find(layout_marker)?;
+        let kind_expr = after_k[..l_pos].trim();
+        let rust_ty = lean_rigid_ty_to_rust(kind_expr);
+        let after_l = &after_k[l_pos + layout_marker.len()..];
+        let ty_close_brace = after_l.find('}')?;
+        let after_ty = &after_l[ty_close_brace + 1..];
+        let decl_close_brace = after_ty.find('}')?;
+        let decl_tail = &after_ty[..decl_close_brace];
+        let ident = if idx == 0 {
+            "_ret".to_string()
+        } else {
+            let mut extracted = None;
+            for marker in [
+                "userIdent := (Option.some \"",
+                "userIdent := some \"",
+                "debugName := (Option.some \"",
+                "debugName := some \"",
+            ] {
+                if let Some(u_pos) = decl_tail.find(marker) {
+                    let after_u = &decl_tail[u_pos + marker.len()..];
+                    if let Some(end) = after_u.find('"') {
+                        let candidate = &after_u[..end];
+                        if !candidate.is_empty() && candidate != "self" {
+                            extracted = Some(candidate.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+            extracted.unwrap_or_else(|| format!("arg{idx}"))
+        };
+        decl_tys.push((ident, rust_ty));
+        rest = &after_ty[decl_close_brace + 1..];
+    }
+
+    let ret_ty = decl_tys.first()?.1.clone();
+    let params = decl_tys.into_iter().skip(1).collect();
+    Some((params, ret_ty))
+}
+
+fn lean_rigid_ty_to_rust(expr: &str) -> String {
+    let mut trimmed = expr.trim();
+    while trimmed.starts_with('(') && trimmed.ends_with(')') {
+        trimmed = &trimmed[1..trimmed.len() - 1];
+        trimmed = trimmed.trim();
+    }
+    match trimmed {
+        "RigidTy.bool" | ".bool" => "bool".to_string(),
+        "RigidTy.char" | ".char" => "char".to_string(),
+        "RigidTy.str" | ".str" => "str".to_string(),
+        "RigidTy.never" | ".never" => "!".to_string(),
+        "RigidTy.uint UintTy.u8" | ".uint .u8" => "u8".to_string(),
+        "RigidTy.uint UintTy.u16" | ".uint .u16" => "u16".to_string(),
+        "RigidTy.uint UintTy.u32" | ".uint .u32" => "u32".to_string(),
+        "RigidTy.uint UintTy.u64" | ".uint .u64" => "u64".to_string(),
+        "RigidTy.uint UintTy.u128" | ".uint .u128" => "u128".to_string(),
+        "RigidTy.uint UintTy.usize" | ".uint .usize" => "usize".to_string(),
+        "RigidTy.int IntTy.i8" | ".int .i8" => "i8".to_string(),
+        "RigidTy.int IntTy.i16" | ".int .i16" => "i16".to_string(),
+        "RigidTy.int IntTy.i32" | ".int .i32" => "i32".to_string(),
+        "RigidTy.int IntTy.i64" | ".int .i64" => "i64".to_string(),
+        "RigidTy.int IntTy.i128" | ".int .i128" => "i128".to_string(),
+        "RigidTy.int IntTy.isize" | ".int .isize" => "isize".to_string(),
+        "RigidTy.float FloatTy.f32" | ".float .f32" => "f32".to_string(),
+        "RigidTy.float FloatTy.f64" | ".float .f64" => "f64".to_string(),
+        "RigidTy.tuple List.nil" | ".tuple []" | ".tuple List.nil" => "()".to_string(),
+        _ => {
+            if let Some(inner) = trimmed
+                .strip_prefix("RigidTy.ref Mutability.not ")
+                .or_else(|| trimmed.strip_prefix(".ref .not "))
+            {
+                format!("&{}", lean_rigid_ty_to_rust(inner))
+            } else if let Some(inner) = trimmed
+                .strip_prefix("RigidTy.ref Mutability.mut ")
+                .or_else(|| trimmed.strip_prefix(".ref .mut "))
+            {
+                format!("&mut {}", lean_rigid_ty_to_rust(inner))
+            } else if let Some(inner) = trimmed
+                .strip_prefix("RigidTy.rawPtr Mutability.not ")
+                .or_else(|| trimmed.strip_prefix(".rawPtr .not "))
+            {
+                format!("*const {}", lean_rigid_ty_to_rust(inner))
+            } else if let Some(inner) = trimmed
+                .strip_prefix("RigidTy.rawPtr Mutability.mut ")
+                .or_else(|| trimmed.strip_prefix(".rawPtr .mut "))
+            {
+                format!("*mut {}", lean_rigid_ty_to_rust(inner))
+            } else if let Some(inner) = trimmed
+                .strip_prefix("RigidTy.slice ")
+                .or_else(|| trimmed.strip_prefix(".slice "))
+            {
+                format!("[{}]", lean_rigid_ty_to_rust(inner))
+            } else if let Some(after) = trimmed
+                .strip_prefix("RigidTy.adt \"")
+                .or_else(|| trimmed.strip_prefix(".adt \""))
+                && let Some(end_q) = after.find('"')
+            {
+                after[..end_q].to_string()
+            } else if let Some(after) = trimmed
+                .strip_prefix("RigidTy.param ")
+                .or_else(|| trimmed.strip_prefix(".param "))
+                && let Some(q1) = after.find('"')
+                && let Some(q2) = after[q1 + 1..].find('"')
+            {
+                after[q1 + 1..q1 + 1 + q2].to_string()
+            } else {
+                "usize".to_string()
+            }
+        }
+    }
+}
+
+fn find_signature_in_rust_sources(
+    workspace_root: &Path,
+    short_ident: &str,
+) -> Option<(Vec<(String, String)>, String)> {
+    if short_ident.is_empty() {
+        return None;
+    }
+    let src_dir = workspace_root.join("src");
+    let mut rs_files = Vec::new();
+    collect_rs_files(&src_dir, &mut rs_files);
+    rs_files.sort();
+    let needle = format!("fn {short_ident}");
+    for file in &rs_files {
+        let Ok(txt) = fs::read_to_string(file) else {
+            continue;
+        };
+        if let Some(pos) = txt.find(&needle) {
+            let after = &txt[pos + needle.len()..];
+            let open_paren = after.find('(')?;
+            let close_paren = after[open_paren + 1..].find(')')? + open_paren + 1;
+            let raw_params = &after[open_paren + 1..close_paren];
+            let mut params = Vec::new();
+            for (idx, part) in raw_params.split(',').enumerate() {
+                let p = part.trim();
+                if p.is_empty() {
+                    continue;
+                }
+                if let Some((name, ty)) = p.split_once(':') {
+                    let clean_name = name.trim().trim_start_matches("mut ").trim();
+                    params.push((clean_name.to_string(), ty.trim().to_string()));
+                } else if p.contains("self") {
+                    params.push((
+                        "this".to_string(),
+                        p.replace("self", "Self").trim().to_string(),
+                    ));
+                } else {
+                    params.push((format!("arg{}", idx + 1), p.to_string()));
+                }
+            }
+            let after_paren = &after[close_paren + 1..];
+            let end_sig = after_paren.find(['{', ';']).unwrap_or(after_paren.len());
+            let sig_tail = after_paren[..end_sig].trim();
+            let ret_ty = if let Some(ret) = sig_tail.strip_prefix("->") {
+                ret.split("where").next().unwrap_or(ret).trim().to_string()
+            } else {
+                "()".to_string()
+            };
+            return Some((params, ret_ty));
+        }
+    }
+    None
+}
+
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+fn builtin_core_signature(
+    raw_target: &str,
+    normalized_target: &str,
+) -> Option<(Vec<(String, String)>, String)> {
+    let elem_ty = raw_target
+        .strip_prefix("<[")
+        .and_then(|r| r.split_once("]>::"))
+        .map(|(t, _)| t.trim())
+        .filter(|t| !t.is_empty() && *t != "T")
+        .unwrap_or("u8");
+    match normalized_target {
+        "core::slice::<impl [T]>::len" => Some((
+            vec![("slice".to_string(), format!("&[{elem_ty}]"))],
+            "usize".to_string(),
+        )),
+        "core::slice::<impl [T]>::is_empty" => Some((
+            vec![("slice".to_string(), format!("&[{elem_ty}]"))],
+            "bool".to_string(),
+        )),
+        "core::slice::<impl [T]>::as_ptr" => Some((
+            vec![("slice".to_string(), format!("&[{elem_ty}]"))],
+            format!("*const {elem_ty}"),
+        )),
+        "core::slice::<impl [T]>::as_mut_ptr" => Some((
+            vec![("slice".to_string(), format!("&mut [{elem_ty}]"))],
+            format!("*mut {elem_ty}"),
+        )),
+        "core::slice::from_raw_parts" => Some((
+            vec![
+                ("data".to_string(), format!("*const {elem_ty}")),
+                ("len".to_string(), "usize".to_string()),
+            ],
+            format!("&'static [{elem_ty}]"),
+        )),
+        "core::slice::from_raw_parts_mut" => Some((
+            vec![
+                ("data".to_string(), format!("*mut {elem_ty}")),
+                ("len".to_string(), "usize".to_string()),
+            ],
+            format!("&'static mut [{elem_ty}]"),
+        )),
+        _ => None,
     }
 }
 
@@ -2619,6 +3076,87 @@ mod tests {
         let regenerated_obligation =
             fs::read_to_string(&obligation_file).expect("read obligation");
         assert!(regenerated_obligation.contains("def defaultPre (args : List Value) : Prop :="));
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn cli_generate_external_spec_parses_and_emits_snippet() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let gen_opts = parse_cli_args([
+            "cargo-anneal",
+            "anneal",
+            "generate-external-spec",
+            "core::slice::from_raw_parts_mut",
+            "--output",
+            "/tmp/ext_spec.rs",
+        ])
+        .expect("parse generate-external-spec");
+        assert_eq!(gen_opts.subcommand, CliSubcommand::GenerateExternalSpec);
+        assert_eq!(
+            gen_opts.extra_cargo_args,
+            vec!["core::slice::from_raw_parts_mut".to_string()]
+        );
+        assert_eq!(gen_opts.out_dir, Some(PathBuf::from("/tmp/ext_spec.rs")));
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let workspace = env::temp_dir().join(format!(
+            "cargo-anneal-gen-ext-spec-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        let mir_dir = workspace.join(".anneal/generated/Mir/Core");
+        fs::create_dir_all(&mir_dir).expect("create Mir/Core");
+
+        let sample_mir = r#"prelude
+import Init.Core
+import Trusted
+
+namespace Mir.Core.from_raw_parts_mut
+def body : CapturedMir := {
+  defPath := "core::slice::from_raw_parts_mut"
+  argCount := 2
+  localDecls :=
+    [ { mutability := .mut, ty := { kind := .ref .mut (.slice (.uint .u8)), layoutIdx := 0 }, debugName := none },
+      { mutability := .not, ty := { kind := .rawPtr .mut (.uint .u8), layoutIdx := 1 }, debugName := some "data" },
+      { mutability := .not, ty := { kind := .uint .usize, layoutIdx := 2 }, debugName := some "len" } ]
+  basicBlocks := []
+}
+end Mir.Core.from_raw_parts_mut
+"#;
+        fs::write(mir_dir.join("from_raw_parts_mut.lean"), sample_mir)
+            .expect("write sample mir");
+
+        let out_file = workspace.join("generated_spec.rs");
+        let exec_opts = parse_cli_args([
+            "cargo-anneal",
+            "anneal",
+            "generate-external-spec",
+            "core::slice::from_raw_parts_mut",
+            "--workspace-root",
+            workspace.to_str().expect("utf8 path"),
+            "--output",
+            out_file.to_str().expect("utf8 path"),
+        ])
+        .expect("parse exec_opts");
+        execute_cli(&exec_opts).expect("execute generate-external-spec");
+
+        let snippet = fs::read_to_string(&out_file).expect("read generated_spec.rs");
+        assert!(
+            snippet.contains("#[anneal_spec::external_spec(for = core::slice::from_raw_parts_mut)]"),
+            "missing external_spec attribute in:\n{snippet}"
+        );
+        assert!(
+            snippet.contains(
+                "fn external_spec_from_raw_parts_mut(data: *mut u8, len: usize) -> &mut [u8];"
+            ),
+            "unexpected signature in:\n{snippet}"
+        );
 
         let _ = fs::remove_dir_all(&workspace);
     }

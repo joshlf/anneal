@@ -1279,11 +1279,12 @@ theorem verifiedStatefulClaim_satisfies_observedTrace
     (h_pre : c.pre args mem)
     (h_trace :
       checkFullObservedTraceBounded fuel c.body
-        (initMachineStateWithMemory c.body args mem)
+        (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
         events (.normal retVal) = true) :
     ∃ mem', c.post args mem retVal mem' := by
   rcases checkFullObservedTraceBounded_sound fuel c.body
-      (initMachineStateWithMemory c.body args mem) events (.normal retVal) h_trace with
+      (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
+      events (.normal retVal) h_trace with
     ⟨tr, out, _, h_out, h_reach⟩
   cases out with
   | normal p =>
@@ -1307,7 +1308,7 @@ theorem refuteStatefulClaimByObservedTrace
     (h_pre : c.pre args mem)
     (h_trace :
       checkFullObservedTraceBounded fuel c.body
-        (initMachineStateWithMemory c.body args mem)
+        (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
         events (.normal retVal) = true)
     (h_bad : ∀ mem', ¬ c.post args mem retVal mem') :
     ¬ c.holds := by

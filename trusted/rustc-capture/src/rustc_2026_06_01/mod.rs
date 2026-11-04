@@ -600,6 +600,122 @@ pub fn __anodized_fn_ensures_local_target_spec(x: u32, __anodized_output: u32) -
     }
 
     #[test]
+    fn driver_resolves_external_spec_targets_across_local_inherent_and_core_paths() {
+        let temp_root = unique_temp_dir("ext-spec-target-resolution");
+        let capture_dir = temp_root.join("capture");
+        let out_dir = temp_root.join("out");
+        fs::create_dir_all(&capture_dir).expect("create capture dir");
+        fs::create_dir_all(&out_dir).expect("create out dir");
+
+        let src_path = temp_root.join("ext_spec_lib.rs");
+        let sample_rust = r#"#![allow(dead_code, non_snake_case, non_upper_case_globals)]
+
+pub fn local_helper(x: u32) -> u32 {
+    x.wrapping_add(1)
+}
+
+pub const __ANNEAL_EXT_SPEC_TARGET_ext_local_helper: &str = "crate::local_helper";
+pub fn ext_local_helper(x: u32) -> u32 {
+    let _: fn(u32) -> u32 = *::core::hint::black_box(&crate::local_helper);
+    let _ = (x,);
+    unreachable!()
+}
+pub fn __anodized_fn_requires_ext_local_helper(x: u32) -> bool {
+    x < 100
+}
+pub fn __anodized_fn_ensures_ext_local_helper(x: u32, out: u32) -> bool {
+    out == x.wrapping_add(1)
+}
+
+pub const __ANNEAL_EXT_SPEC_TARGET_ext_slice_len: &str = "<[u8]>::len";
+pub fn ext_slice_len(s: &[u8]) -> usize {
+    let _: fn(&[u8]) -> usize = *::core::hint::black_box(&<[u8]>::len);
+    let _ = (s,);
+    unreachable!()
+}
+
+pub const __ANNEAL_EXT_SPEC_TARGET_ext_raw_parts_mut: &str = "std::slice::from_raw_parts_mut";
+pub unsafe fn ext_raw_parts_mut<'a>(data: *mut u8, len: usize) -> &'a mut [u8] {
+    let _: unsafe fn(*mut u8, usize) -> &'a mut [u8] =
+        *::core::hint::black_box(&std::slice::from_raw_parts_mut);
+    let _ = (data, len);
+    unreachable!()
+}
+"#;
+        fs::write(&src_path, sample_rust.as_bytes()).expect("write ext_spec_lib.rs");
+
+        let args = vec![
+            "anneal-rustc-capture".to_owned(),
+            "rustc".to_owned(),
+            "--crate-name".to_owned(),
+            "ext_spec_demo".to_owned(),
+            "--crate-type".to_owned(),
+            "lib".to_owned(),
+            "--edition=2024".to_owned(),
+            "--out-dir".to_owned(),
+            out_dir.to_string_lossy().into_owned(),
+            src_path.to_string_lossy().into_owned(),
+        ];
+
+        let code = run_with_args(&args, Some(capture_dir.clone()), None);
+        assert_eq!(code, 0, "expected run_with_args to succeed with exit code 0");
+
+        let manifest_path = capture_dir
+            .join("ext_spec_demo")
+            .join("UnitCaptureManifest.json");
+        let manifest_json =
+            fs::read_to_string(&manifest_path).expect("read UnitCaptureManifest.json");
+        let parsed = UnitCaptureManifest::from_json_str(&manifest_json)
+            .expect("parse UnitCaptureManifest.json");
+        assert!(parsed.compilation_succeeded);
+
+        let local_ext = parsed
+            .unit_targets
+            .iter()
+            .find(|t| t.target.def_id == "ext_spec_demo::ext_local_helper")
+            .expect("find ext_local_helper");
+        assert_eq!(local_ext.item_kind, CapturedItemKind::ExternalSpec);
+        assert_eq!(
+            local_ext.associated_subject_def_id.as_deref(),
+            Some("ext_spec_demo::local_helper")
+        );
+
+        let local_req = parsed
+            .unit_targets
+            .iter()
+            .find(|t| t.target.def_id == "ext_spec_demo::__anodized_fn_requires_ext_local_helper")
+            .expect("find requires companion for ext_local_helper");
+        assert_eq!(
+            local_req.associated_subject_def_id.as_deref(),
+            Some("ext_spec_demo::local_helper")
+        );
+
+        let slice_len_ext = parsed
+            .unit_targets
+            .iter()
+            .find(|t| t.target.def_id == "ext_spec_demo::ext_slice_len")
+            .expect("find clause-less ext_slice_len");
+        assert_eq!(slice_len_ext.item_kind, CapturedItemKind::ExternalSpec);
+        assert_eq!(
+            slice_len_ext.associated_subject_def_id.as_deref(),
+            Some("core::slice::<impl [T]>::len")
+        );
+
+        let raw_parts_ext = parsed
+            .unit_targets
+            .iter()
+            .find(|t| t.target.def_id == "ext_spec_demo::ext_raw_parts_mut")
+            .expect("find clause-less ext_raw_parts_mut");
+        assert_eq!(raw_parts_ext.item_kind, CapturedItemKind::ExternalSpec);
+        assert_eq!(
+            raw_parts_ext.associated_subject_def_id.as_deref(),
+            Some("core::slice::from_raw_parts_mut")
+        );
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
     fn driver_captures_type_invariant_and_unsafe_impl_targets() {
         let temp_root = unique_temp_dir("invariant-unsafe-impl");
         let capture_dir = temp_root.join("capture");

@@ -70,13 +70,101 @@ def initMachineStateWithMemory
     memory := mem
   }
 
+/--
+Populate `mem.callees` with `defaultCallees` when `defaultCallees` is
+non-empty, preserving `mem` definitionally when `defaultCallees` is `[]`.
+
+Reference (The Rust Reference, "Call expressions"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/call-expr.html>
+
+> "A call expression calls a function. It consists of an expression called the
+> called function operand, followed by a parenthesized comma-separated list of
+> expression operands called the argument operands."
+-/
+def Memory.withDefaultCallees
+    (mem : Memory) (defaultCallees : List CapturedMir) : Memory :=
+  match defaultCallees with
+  | [] => mem
+  | _ :: _ => { mem with callees := defaultCallees }
+
+/--
+Initial `MachineState` for `body` with incoming `args`, initial `Memory` `mem`,
+and default callee table `callees`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L366-L368>
+
+> "At any point during the execution of a function, each local is either
+> allocated or unallocated. Except as noted below, all locals except function
+> parameters are initially unallocated."
+-/
+def initMachineStateWithMemoryAndCallees
+    (body : CapturedMir)
+    (args : List Value)
+    (mem : Memory)
+    (callees : List CapturedMir := .nil) : MachineState :=
+  initMachineStateWithMemory body args (Memory.withDefaultCallees mem callees)
+
+/--
+Fundamental coinductive interaction tree of `body` on `args` with linked
+callee table `callees`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1192-L1203>
+
+> "Block ends with the call of a function."
+-/
+def mirCallTreeWithCallees
+    (body : CapturedMir)
+    (args : List Value)
+    (callees : List CapturedMir := .nil) :
+    ITree MirEffect MirOutcome :=
+  mirTree body (initMachineStateWithCallees body args callees)
+
 /-- Fundamental coinductive interaction tree of `body` from `(args, mem)`. -/
 def mirStatefulTree
     (body : CapturedMir) (args : List Value) (mem : Memory) :
     ITree MirEffect MirOutcome :=
   mirTree body (initMachineStateWithMemory body args mem)
 
+/--
+Fundamental coinductive interaction tree of `body` from `(args, mem)` with
+default callee table `callees`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1192-L1203>
+
+> "Block ends with the call of a function."
+-/
+def mirStatefulTreeWithCallees
+    (body : CapturedMir)
+    (args : List Value)
+    (mem : Memory)
+    (callees : List CapturedMir := .nil) :
+    ITree MirEffect MirOutcome :=
+  mirTree body (initMachineStateWithMemoryAndCallees body args mem callees)
+
 /-! ## 1. Stateless Partial-Correctness Claims (`Claim`, `VerificationResult`) -/
+
+/--
+Smyth `Partial` behavior of `body` on `args` with linked `callees`, projected
+from `mirCallTreeWithCallees`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Rust code is incorrect if it exhibits any of the behaviors in the following
+> list. This includes code within unsafe blocks and unsafe functions."
+-/
+def MirExecPartialWithCallees
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (args : List Value) :
+    Partial (BehaviorSet (List (Event MirEffect) × MirOutcome)) :=
+  (mirCallTreeWithCallees body args callees).toPartial
 
 /--
 Smyth `Partial` behavior of `body` on `args`, projected from `mirCallTree`.
@@ -89,7 +177,7 @@ Reference (The Rust Reference, "Behavior considered undefined"):
 -/
 def MirExecPartial (body : CapturedMir) (args : List Value) :
     Partial (BehaviorSet (List (Event MirEffect) × MirOutcome)) :=
-  (mirCallTree body args).toPartial
+  MirExecPartialWithCallees body .nil args
 
 /--
 Stateless partial contract separating `safetyPre` (`.defined`) from `pre` and
@@ -105,19 +193,74 @@ def MirContractSpec
     pre args →
       ∀ retVal mem', outPair.2 = .normal (retVal, mem') → post args retVal
 
+/--
+Pointwise Smyth refinement claim with linked `callees` and separate `safetyPre`
+and `pre`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Rust code is incorrect if it exhibits any of the behaviors in the following
+> list. This includes code within unsafe blocks and unsafe functions."
+-/
+def MirContractHoldsWithSafetyAndCallees
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (safetyPre pre : List Value → Prop)
+    (post : List Value → Value → Prop) : Prop :=
+  MirExecPartialWithCallees body callees ≤ MirContractSpec safetyPre pre post
+
 /-- Pointwise Smyth refinement claim with separate `safetyPre` and `pre`. -/
 def MirContractHoldsWithSafety
     (body : CapturedMir)
     (safetyPre pre : List Value → Prop)
     (post : List Value → Value → Prop) : Prop :=
-  MirExecPartial body ≤ MirContractSpec safetyPre pre post
+  MirContractHoldsWithSafetyAndCallees body .nil safetyPre pre post
+
+/--
+Pointwise Smyth refinement claim with linked `callees` (`safetyPre := pre`).
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Rust code is incorrect if it exhibits any of the behaviors in the following
+> list. This includes code within unsafe blocks and unsafe functions."
+-/
+def MirContractHoldsWithCallees
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Prop)
+    (post : List Value → Value → Prop) : Prop :=
+  MirContractHoldsWithSafetyAndCallees body callees pre pre post
 
 /-- Pointwise Smyth refinement claim (`safetyPre := pre`). -/
 def MirContractHolds
     (body : CapturedMir)
     (pre : List Value → Prop)
     (post : List Value → Value → Prop) : Prop :=
-  MirContractHoldsWithSafety body pre pre post
+  MirContractHoldsWithCallees body .nil pre post
+
+/--
+Companion boolean contract helper predicate with linked `callees`: on `args`,
+`specBody` is `TreeSafe` and every normal return yields `true`
+(`.scalar ⟨1, 1⟩`).
+
+Reference (The Rust Reference, "Boolean type"):
+<https://doc.rust-lang.org/1.98.0/reference/types/boolean.html>
+
+> "The value false has the bit pattern 0x00 and the value true has the bit
+> pattern 0x01. It is undefined behavior for an object with the boolean type to
+> have any other bit pattern."
+-/
+def MirBoolPredicateHoldsWithCallees
+    (specBody : CapturedMir)
+    (callees : List CapturedMir)
+    (args : List Value) : Prop :=
+  MirContractHoldsWithCallees
+    specBody
+    callees
+    (· = args)
+    (fun _ ret => ret = .scalar { bits := 1, sizeBytes := 1 })
 
 /--
 Companion boolean contract helper predicate: on `args`, `specBody` is `TreeSafe`
@@ -131,20 +274,18 @@ Reference (The Rust Reference, "Boolean type"):
 > have any other bit pattern."
 -/
 def MirBoolPredicateHolds (specBody : CapturedMir) (args : List Value) : Prop :=
-  MirContractHolds
-    specBody
-    (· = args)
-    (fun _ ret => ret = .scalar { bits := 1, sizeBytes := 1 })
+  MirBoolPredicateHoldsWithCallees specBody .nil args
 
 /-- Stateless verification claim for a captured Rust item. -/
 structure Claim : Type 1 where
   body : CapturedMir
   pre : List Value → Prop
   post : List Value → Value → Prop
+  callees : List CapturedMir := .nil
 
 /-- Proposition denoted by `c : Claim`. -/
 def Claim.holds (c : Claim) : Prop :=
-  MirContractHolds c.body c.pre c.post
+  MirContractHoldsWithCallees c.body c.callees c.pre c.post
 
 /-- Audited kernel verification certificate for `c : Claim`. -/
 structure VerificationResult (c : Claim) : Prop where
@@ -161,11 +302,29 @@ class ItemProof (defId : String) (c : Claim) : Prop where
 
 /-! ## 2. Stateful Partial-Correctness Claims (`StatefulClaim`, `StatefulVerificationResult`) -/
 
+/--
+Smyth `Partial` stateful behavior with linked `callees`, projected from
+`mirStatefulTreeWithCallees`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Rust code is incorrect if it exhibits any of the behaviors in the following
+> list. This includes code within unsafe blocks and unsafe functions."
+-/
+def MirStatefulExecPartialWithCallees
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (args : List Value)
+    (mem : Memory) :
+    Partial (BehaviorSet (List (Event MirEffect) × MirOutcome)) :=
+  (mirStatefulTreeWithCallees body args mem callees).toPartial
+
 /-- Smyth `Partial` stateful behavior projected from `mirStatefulTree`. -/
 def MirStatefulExecPartial
     (body : CapturedMir) (args : List Value) (mem : Memory) :
     Partial (BehaviorSet (List (Event MirEffect) × MirOutcome)) :=
-  (mirStatefulTree body args mem).toPartial
+  MirStatefulExecPartialWithCallees body .nil args mem
 
 /-- Stateful partial contract separating `safetyPre` from `pre` and `post`. -/
 def MirStatefulContractSpec
@@ -179,29 +338,64 @@ def MirStatefulContractSpec
       ∀ retVal mem',
         outPair.2 = .normal (retVal, mem') → post args mem retVal mem'
 
+/--
+Pointwise stateful Smyth refinement with linked `callees` and separate
+`safetyPre` and `pre`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Rust code is incorrect if it exhibits any of the behaviors in the following
+> list. This includes code within unsafe blocks and unsafe functions."
+-/
+def MirStatefulContractHoldsWithSafetyAndCallees
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (safetyPre pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop) : Prop :=
+  MirStatefulExecPartialWithCallees body callees ≤
+    MirStatefulContractSpec safetyPre pre post
+
 /-- Pointwise stateful Smyth refinement with separate `safetyPre` and `pre`. -/
 def MirStatefulContractHoldsWithSafety
     (body : CapturedMir)
     (safetyPre pre : List Value → Memory → Prop)
     (post : List Value → Memory → Value → Memory → Prop) : Prop :=
-  MirStatefulExecPartial body ≤ MirStatefulContractSpec safetyPre pre post
+  MirStatefulContractHoldsWithSafetyAndCallees body .nil safetyPre pre post
+
+/--
+Pointwise stateful Smyth refinement with linked `callees` (`safetyPre := pre`).
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Rust code is incorrect if it exhibits any of the behaviors in the following
+> list. This includes code within unsafe blocks and unsafe functions."
+-/
+def MirStatefulContractHoldsWithCallees
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop) : Prop :=
+  MirStatefulContractHoldsWithSafetyAndCallees body callees pre pre post
 
 /-- Pointwise stateful Smyth refinement (`safetyPre := pre`). -/
 def MirStatefulContractHolds
     (body : CapturedMir)
     (pre : List Value → Memory → Prop)
     (post : List Value → Memory → Value → Memory → Prop) : Prop :=
-  MirStatefulContractHoldsWithSafety body pre pre post
+  MirStatefulContractHoldsWithCallees body .nil pre post
 
 /-- Stateful verification claim over `(args, mem)`. -/
 structure StatefulClaim : Type 1 where
   body : CapturedMir
   pre : List Value → Memory → Prop
   post : List Value → Memory → Value → Memory → Prop
+  callees : List CapturedMir := .nil
 
 /-- Proposition denoted by `c : StatefulClaim`. -/
 def StatefulClaim.holds (c : StatefulClaim) : Prop :=
-  MirStatefulContractHolds c.body c.pre c.post
+  MirStatefulContractHoldsWithCallees c.body c.callees c.pre c.post
 
 /-- Audited kernel verification certificate for `c : StatefulClaim`. -/
 structure StatefulVerificationResult (c : StatefulClaim) : Prop where
@@ -232,12 +426,33 @@ def handleMirExternalCalls (h : ExternalCallHandler) :
   | .inr (.inl (.emit obs)) => ITree.emit (E := MirClosedEffect) obs
   | .inr (.inr (.call req)) => h req
 
+/--
+Interpret external calls in `mirStatefulTreeWithCallees body args mem callees`
+with `h`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1192-L1203>
+
+> "Block ends with the call of a function."
+-/
+def mirHandledTreeWithCallees
+    (body : CapturedMir)
+    (args : List Value)
+    (mem : Memory)
+    (callees : List CapturedMir)
+    (h : ExternalCallHandler) :
+    ITree MirClosedEffect MirOutcome :=
+  ITree.interp
+    (handleMirExternalCalls h)
+    (mirStatefulTreeWithCallees body args mem callees)
+
 /-- Interpret external calls in `mirStatefulTree body args mem` with `h`. -/
 def mirHandledTree
     (body : CapturedMir) (args : List Value) (mem : Memory)
     (h : ExternalCallHandler) :
     ITree MirClosedEffect MirOutcome :=
-  ITree.interp (handleMirExternalCalls h) (mirStatefulTree body args mem)
+  mirHandledTreeWithCallees body args mem .nil h
 
 /-- Contract specification over `MirClosedEffect`. -/
 def MirClosedStatefulContractSpec
@@ -255,6 +470,169 @@ def MirClosedStatefulContractSpec
 structure MirCallContract : Type where
   pre : MirCallReq → Prop := fun _ => True
   post : MirCallReq → MirCallAns → Prop := fun _ _ => True
+
+/--
+Well-typed runtime `Value` validity predicate against a captured MIR `Ty` and
+`LayoutTable`, constraining scalar bit-widths and bit-bounds, boolean bit
+patterns (`0` or `1`), Unicode scalar values (`char`), pointer/reference
+metadata, and aggregate field arities.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Producing an invalid value. Producing a value happens any time a value is
+> assigned to or read from a place, passed to a function/primitive operation or
+> returned from a function/primitive operation."
+-/
+def valueValidForTy
+    (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (ty : Ty)
+    (v : Value) : Prop :=
+  let byteSz :=
+    match Trusted.Sequence.get? layouts.entries ty.layoutIdx with
+    | .some layout => layout.size.bytes
+    | .none =>
+      match tyScalarBytes ty with
+      | .some sz => sz
+      | .none => 0
+  match ty.kind with
+  | .bool =>
+    ∃ b : Nat, b < 2 ∧ v = .scalar { bits := b, sizeBytes := 1 }
+  | .char =>
+    ∃ cp : Nat,
+      (cp < 0xD800 ∨ (0xE000 ≤ cp ∧ cp ≤ 0x10FFFF)) ∧
+      v = .scalar { bits := cp, sizeBytes := 4 }
+  | .int _ =>
+    ∃ bits : Nat,
+      bits < scalarModulus byteSz ∧
+      v = .scalar { bits := bits, sizeBytes := byteSz }
+  | .uint _ =>
+    ∃ bits : Nat,
+      bits < scalarModulus byteSz ∧
+      v = .scalar { bits := bits, sizeBytes := byteSz }
+  | .float _ =>
+    ∃ bits : Nat,
+      bits < scalarModulus byteSz ∧
+      v = .scalar { bits := bits, sizeBytes := byteSz }
+  | .rawPtr _ _ =>
+    ∃ ptr sz, v = .ptr ptr sz
+  | .ref _ _ =>
+    ∃ ptr sz, v = .ptr ptr sz
+  | .tuple elemTys =>
+    match elemTys with
+    | .nil => v = .unit
+    | _ :: _ =>
+      ∃ fields,
+        v = .aggregate 0 fields ∧
+        Trusted.Sequence.length fields = Trusted.Sequence.length elemTys
+  | .array _ len =>
+    ∃ fields,
+      v = .aggregate 0 fields ∧
+      Trusted.Sequence.length fields = len
+  | .slice _ =>
+    ∃ ptr sz, v = .ptr ptr sz
+  | .str =>
+    ∃ ptr sz, v = .ptr ptr sz
+  | .fnDef _ _ => v = .unit
+  | .fnPtr _ _ _ _ =>
+    ∃ ptr sz, v = .ptr ptr sz
+  | .closure _ _ =>
+    (byteSz = 0 ∧ v = .unit) ∨
+    (∃ vIdx fields, v = .aggregate vIdx fields)
+  | .adt _ _ =>
+    (byteSz = 0 ∧ v = .unit) ∨
+    (∃ bits,
+      bits < scalarModulus byteSz ∧
+      v = .scalar { bits := bits, sizeBytes := byteSz }) ∨
+    (∃ ptr sz, v = .ptr ptr sz) ∨
+    (∃ vIdx fields, v = .aggregate vIdx fields)
+  | .param _ _ =>
+    (byteSz = 0 ∧ v = .unit) ∨
+    (∃ bits,
+      bits < scalarModulus byteSz ∧
+      v = .scalar { bits := bits, sizeBytes := byteSz }) ∨
+    (∃ ptr sz, v = .ptr ptr sz) ∨
+    (∃ vIdx fields, v = .aggregate vIdx fields)
+  | .alias _ _ =>
+    (byteSz = 0 ∧ v = .unit) ∨
+    (∃ bits,
+      bits < scalarModulus byteSz ∧
+      v = .scalar { bits := bits, sizeBytes := byteSz }) ∨
+    (∃ ptr sz, v = .ptr ptr sz) ∨
+    (∃ vIdx fields, v = .aggregate vIdx fields)
+  | .dynamic _ =>
+    ∃ ptr sz, v = .ptr ptr sz
+  | .foreign _ =>
+    ∃ ptr sz, v = .ptr ptr sz
+  | .never => False
+  | .other _ => False
+
+/--
+Return-local layout and type validity predicate for local `_0` (`decl`) under
+`layouts`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L369-L370>
+
+> "The first local is the return value pointer, followed by `arg_count` locals
+> for the function arguments, followed by any user-declared variables and
+> temporaries."
+-/
+def valueValidForReturnDecl
+    (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (decl : LocalDecl)
+    (retVal : Value) : Prop :=
+  valueValidForTy layouts decl.ty retVal
+
+/--
+Return-type and layout validity predicate for a captured callee or
+`#[external_spec]` sidecar `calleeBody`, constraining `retVal` against return
+local `_0` (`calleeBody.localDecls[0]`) and `calleeBody.layouts`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L369-L370>
+
+> "The first local is the return value pointer, followed by `arg_count` locals
+> for the function arguments, followed by any user-declared variables and
+> temporaries."
+-/
+def retMatchesCalleeReturnTy
+    (calleeBody : CapturedMir) (retVal : Value) : Prop :=
+  match calleeBody.localDecls with
+  | retDecl :: _ => valueValidForReturnDecl calleeBody.layouts retDecl retVal
+  | .nil => False
+
+/--
+Well-typed modular `MirCallContract` for an `#[external_spec(for = <target>)]`
+declaration with canonical target path `targetDefPath` and captured signature
+sidecar `sidecarBody`, enforcing argument arity and return-type/layout validity
+(`retMatchesCalleeReturnTy sidecarBody retVal`) alongside optional `extraPre`
+and `extraPost` clauses.
+
+Reference (The Rust Reference, "Call expressions"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/call-expr.html>
+
+> "A call expression calls a function. It consists of an expression called the
+> called function operand, followed by a parenthesized comma-separated list of
+> expression operands called the argument operands."
+-/
+def externalSpecCallContract
+    (targetDefPath : DefPath)
+    (sidecarBody : CapturedMir)
+    (extraPre : List Value → Prop := fun _ => True)
+    (extraPost : List Value → Value → Prop := fun _ _ => True) :
+    MirCallContract where
+  pre req :=
+    And (req.defPath = targetDefPath)
+      (And (Trusted.Sequence.length req.args = sidecarBody.argCount)
+        (extraPre req.args))
+  post req ans :=
+    ∃ retVal,
+      And (ans = .returned retVal req.memory)
+        (And (retMatchesCalleeReturnTy sidecarBody retVal)
+          (extraPost req.args retVal))
 
 /--
 Semantic rely predicate stating that an `ExternalCallHandler` `h` implements
@@ -284,12 +662,14 @@ structure ModularClaim : Type 1 where
   envAssumed : ExternalCallHandler → Prop
   pre : List Value → Memory → Prop
   post : List Value → Memory → Value → Memory → Prop
+  callees : List CapturedMir := .nil
 
 /-- Proposition denoted by `c : ModularClaim`. -/
 def ModularClaim.holds (c : ModularClaim) : Prop :=
   ∀ h : ExternalCallHandler,
     c.envAssumed h →
-      (fun args mem => (mirHandledTree c.body args mem h).toPartial) ≤
+      (fun args mem =>
+        (mirHandledTreeWithCallees c.body args mem c.callees h).toPartial) ≤
         MirClosedStatefulContractSpec c.pre c.pre c.post
 
 /-- Audited kernel verification certificate for `c : ModularClaim`. -/
@@ -322,10 +702,12 @@ structure TraceClaim : Type 1 where
   body : CapturedMir
   pre : List Value → Memory → Prop
   post : List Value → Memory → List (Event MirEffect) → MirOutcome → Prop
+  callees : List CapturedMir := .nil
 
 /-- Proposition denoted by `c : TraceClaim`. -/
 def TraceClaim.holds (c : TraceClaim) : Prop :=
-  MirStatefulExecPartial c.body ≤ MirTraceContractSpec c.pre c.post
+  MirStatefulExecPartialWithCallees c.body c.callees ≤
+    MirTraceContractSpec c.pre c.post
 
 /-- Audited kernel verification certificate for `c : TraceClaim`. -/
 structure TraceVerificationResult (c : TraceClaim) : Prop where
@@ -342,12 +724,13 @@ structure TotalClaim : Type 1 where
   body : CapturedMir
   pre : List Value → Memory → Prop
   post : List Value → Memory → Value → Memory → Prop
+  callees : List CapturedMir := .nil
 
 /-- Proposition denoted by `c : TotalClaim`. -/
 def TotalClaim.holds (c : TotalClaim) : Prop :=
   ∀ args mem,
     c.pre args mem →
-      let t := mirStatefulTree c.body args mem
+      let t := mirStatefulTreeWithCallees c.body args mem c.callees
       TreeSafe t ∧
       Productive t ∧
       ¬ MayDiverge t ∧
@@ -394,6 +777,27 @@ def silenceMirObs : (i : MirEffect.I) → ITree MirEffect (MirEffect.O i)
     ITree.trigger (E := MirEffect) (.inr (.inr (.call req)))
 
 /--
+Branch-observation-erased stateful interaction tree of `body` from `(args, mem)`
+with linked `callees`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1185-L1190>
+
+> "Block ends with testing the value of an operand and jumping depending on its
+> value."
+-/
+def mirObsErasedStatefulTreeWithCallees
+    (body : CapturedMir)
+    (args : List Value)
+    (mem : Memory)
+    (callees : List CapturedMir := .nil) :
+    ITree MirEffect MirOutcome :=
+  ITree.interp
+    silenceMirObs
+    (mirStatefulTreeWithCallees body args mem callees)
+
+/--
 Branch-observation-erased stateful interaction tree of `body` from `(args, mem)`,
 enabling Smyth `Partial` behavioral comparison across optimizations that alter
 internal CFG branching structure (such as loop unrolling or word-lane
@@ -410,7 +814,32 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 def mirObsErasedStatefulTree
     (body : CapturedMir) (args : List Value) (mem : Memory) :
     ITree MirEffect MirOutcome :=
-  ITree.interp silenceMirObs (mirStatefulTree body args mem)
+  mirObsErasedStatefulTreeWithCallees body args mem .nil
+
+/--
+Pointwise Smyth behavioral refinement from candidate implementation `implBody`
+(with `implCallees`) to reference specification `specBody` (with `specCallees`)
+under `pre` over branch-observation-erased execution.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "It is the programmer’s responsibility when writing unsafe code to ensure that
+> any safe code interacting with the unsafe code cannot trigger these
+> behaviors. unsafe code that satisfies this property for any safe client is
+> called sound; if unsafe code can be misused by safe code to exhibit
+> undefined behavior, it is unsound."
+-/
+def RefinesStatefulMirWithCallees
+    (implBody : CapturedMir)
+    (implCallees : List CapturedMir)
+    (specBody : CapturedMir)
+    (specCallees : List CapturedMir)
+    (pre : List Value → Memory → Prop) : Prop :=
+  ∀ args mem,
+    pre args mem →
+      (mirObsErasedStatefulTreeWithCallees implBody args mem implCallees).toPartial ≤
+        (mirObsErasedStatefulTreeWithCallees specBody args mem specCallees).toPartial
 
 /--
 Pointwise Smyth behavioral refinement from candidate implementation `implBody`
@@ -432,10 +861,7 @@ Reference (The Rust Reference, "Behavior considered undefined"):
 def RefinesStatefulMir
     (implBody specBody : CapturedMir)
     (pre : List Value → Memory → Prop) : Prop :=
-  ∀ args mem,
-    pre args mem →
-      (mirObsErasedStatefulTree implBody args mem).toPartial ≤
-        (mirObsErasedStatefulTree specBody args mem).toPartial
+  RefinesStatefulMirWithCallees implBody .nil specBody .nil pre
 
 /--
 Program-to-program total behavioral equivalence and refinement claim pairing a
@@ -450,11 +876,17 @@ structure StatefulEquivClaim : Type 1 where
   specBody : CapturedMir
   pre : List Value → Memory → Prop
   post : List Value → Memory → Value → Memory → Prop := fun _ _ _ _ => True
+  implCallees : List CapturedMir := .nil
+  specCallees : List CapturedMir := .nil
 
 /-- Proposition denoted by `c : StatefulEquivClaim`. -/
 def StatefulEquivClaim.holds (c : StatefulEquivClaim) : Prop :=
-  RefinesStatefulMir c.implBody c.specBody c.pre ∧
-  ({ body := c.implBody, pre := c.pre, post := c.post } : TotalClaim).holds
+  RefinesStatefulMirWithCallees
+    c.implBody c.implCallees c.specBody c.specCallees c.pre ∧
+  ({ body := c.implBody
+     pre := c.pre
+     post := c.post
+     callees := c.implCallees } : TotalClaim).holds
 
 /-- Audited kernel verification certificate for `c : StatefulEquivClaim`. -/
 structure StatefulEquivVerificationResult (c : StatefulEquivClaim) : Prop where
@@ -517,18 +949,23 @@ structure UbExceptionClaim : Type 1 where
   pre : List Value → Memory → Prop
   strictSafetyPre : List Value → Memory → Prop := fun _ _ => False
   post : List Value → Memory → Value → Memory → Prop
+  callees : List CapturedMir := .nil
 
 /-- Proposition denoted by `c : UbExceptionClaim`. -/
 def UbExceptionClaim.holds (c : UbExceptionClaim) : Prop :=
-  MirStatefulContractHoldsWithSafety
+  MirStatefulContractHoldsWithSafetyAndCallees
     c.body
+    c.callees
     (fun args mem => c.pre args mem ∧ c.strictSafetyPre args mem)
     c.pre
     c.post ∧
   ∀ args mem,
     c.pre args mem →
     ∀ tr retVal mem',
-      ReachesRet (mirStatefulTree c.body args mem) tr (.normal (retVal, mem')) →
+      ReachesRet
+        (mirStatefulTreeWithCallees c.body args mem c.callees)
+        tr
+        (.normal (retVal, mem')) →
       c.post args mem retVal mem'
 
 /--
