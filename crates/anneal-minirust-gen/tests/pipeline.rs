@@ -268,3 +268,92 @@ fn opaque_nodes_are_reported() {
     );
     assert!(!cov.contains("not translated:"), "expected zero skipped shallow data types");
 }
+
+/// Every entry in `Anchors.lean` binds `file` to the exact generated `Items`
+/// module for `file`, matches an item `(name, line, tokenSha256)` in that
+/// module, and every spec-transcribing `def` in `Interp.lean` is anchored.
+#[test]
+fn anchors_match_generated_items_and_cover_interp() {
+    let l = layout();
+    let lock = lock::parse(&std::fs::read_to_string(l.lock_path()).unwrap()).unwrap();
+    let commit = lock.get("upstream", "commit").unwrap().to_string();
+    let vroot = l.vendor_root(&commit);
+
+    let anchors_path = minirust_dir().join("lean/MiniRustSpec/Anchors.lean");
+    let anchors_text = std::fs::read_to_string(&anchors_path).unwrap();
+    let list_body = &anchors_text[anchors_text.find("def anchors : List Anchor := [").unwrap()..];
+    let list_body = &list_body[..list_body.find("\n]\n").unwrap()];
+
+    let mut anchored_interp_defs = std::collections::BTreeSet::new();
+    let mut anchor_count = 0usize;
+    for entry in list_body.split("{ interp :=").skip(1) {
+        anchor_count += 1;
+        let interp_end = entry.find(']').unwrap();
+        let interp_list = &entry[..interp_end];
+        for tok in interp_list.split("``MiniRustSpec.Interp.").skip(1) {
+            let name: String = tok
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+                .collect();
+            assert!(!name.is_empty());
+            anchored_interp_defs.insert(name);
+        }
+
+        let extract_str = |key: &str| -> String {
+            let pat = format!("{key} := \"");
+            let i = entry.find(&pat).unwrap_or_else(|| panic!("missing {key} in {entry}")) + pat.len();
+            entry[i..].split('"').next().unwrap().to_string()
+        };
+        let file = extract_str("file");
+        let name = extract_str("name");
+        let sha = extract_str("tokenSha256");
+
+        let items_pat = "items := MiniRustSpec.Gen.Items.";
+        let items_i = entry.find(items_pat).expect("items :=") + items_pat.len();
+        let items_mod = entry[items_i..].split(".items").next().unwrap();
+
+        let line_pat = "line := ";
+        let line_i = entry.find(line_pat).expect("line :=") + line_pat.len();
+        let line: usize = entry[line_i..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap();
+
+        let sf = source::load_file(&vroot, &file).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let expected_mod = sf.module_components().join(".");
+        assert_eq!(
+            items_mod, expected_mod,
+            "Anchor for `{file}`::{name} references `Items.{items_mod}` instead of `Items.{expected_mod}`"
+        );
+        assert!(
+            sf.items
+                .iter()
+                .any(|it| it.name == name && it.line == line && it.token_sha256 == sha),
+            "Anchor `{file}`::{name}:{line} ({sha}) not found in generated items for `{file}`"
+        );
+    }
+    assert!(anchor_count >= 39, "expected at least 39 anchors, found {anchor_count}");
+
+    let interp_path = minirust_dir().join("lean/MiniRustSpec/Interp.lean");
+    let interp_text = std::fs::read_to_string(&interp_path).unwrap();
+    let spec_sec = interp_text
+        .find("/-! ## Target `x86_64`")
+        .expect("Target x86_64 section in Interp.lean");
+    for line in interp_text[spec_sec..].lines() {
+        if let Some(rest) = line.strip_prefix("def ") {
+            let def_name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+                .collect();
+            // `countOnesLoop` is anchored via `impl_Machine__eval_count_ones`; every
+            // definition in the spec sections of `Interp.lean` must be in `Anchors.lean`.
+            assert!(
+                anchored_interp_defs.contains(&def_name),
+                "MiniRustSpec.Interp.{def_name} is defined in the spec sections of Interp.lean \
+                 but not listed in any Anchor.interp in Anchors.lean"
+            );
+        }
+    }
+}

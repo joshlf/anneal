@@ -87,6 +87,10 @@ open MiniRustSpec.Correspondence in
   evalValue_operand
   evalValue_rvalue
   evalIntBinOp_spec
+  evalIntBinOp_divExact
+  evalUnOp_countOnes
+  intBitAnd_one
+  countOnesLoop_bounds
   evalStmt_assign
   evalStmt_placeMention
   evalOperand_frag
@@ -247,7 +251,25 @@ open MiniRustSpec.Correspondence.Witness in
   heteroShrNegUb_anneal_ub
   heteroShrNegUb_minirust_ub_from_start
   heteroShrNegUb_minirust_direct
+  divExact_ok_i8
+  divExact_rem_ub_i8
+  divExact_zero_ub_i8
+  divExact_min_neg1_ub_i8
+  uninitOperandUb_inFragment
+  uninitOperandUb_translate
+  uninitBinOpUb_anneal_ub
+  uninitBinOpUb_minirust_ub_from_start
+  uninitBinOpUb_minirust_direct
+  uninitUnOpUb_anneal_ub
+  uninitUnOpUb_minirust_ub_from_start
+  uninitUnOpUb_minirust_direct
+  uninitSwitchUb_anneal_ub
+  uninitSwitchUb_minirust_ub_from_start
+  uninitSwitchUb_minirust_direct
+  uninitSwitchUb_converse_error
 
-#assert_standard_axioms MiniRustSpec.Anchors.anchors_ok
+#assert_standard_axioms
+  MiniRustSpec.Anchors.anchors_ok
+  MiniRustSpec.Anchors.anchors_nodup
 
 end MiniRustSpec.Audit

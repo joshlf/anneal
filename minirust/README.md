@@ -138,9 +138,10 @@ comments; `..` marks elided code). Effects are
 (a panic in the spec, which upstream calls a spec bug), and
 `Stop.unsupported` (outside the interpreted fragment; never silently wrong).
 
-`Anchors.lean` lists the 38 upstream items that `Interp.lean` transcribes,
-each with its name, line, and token hash, and proves by `decide` that the
-generated model contains them unchanged. Re-pinning MiniRust therefore breaks
+`Anchors.lean` lists the 39 upstream items that `Interp.lean` transcribes,
+each with its file path, item name, line, and token hash, and proves by `decide`
+that the generated model contains them unchanged (`anchors_ok`) with no
+duplicate entries (`anchors_nodup`). Re-pinning MiniRust therefore breaks
 the build until every affected transcription is re-reviewed.
 
 ## The correspondence
@@ -315,6 +316,13 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `ShrUnchecked` / `ShlUnchecked` (`-32i8 >> 3i32 = -4i8`, `-4i8 << 3i32 = -32i8`),
   plus UB checks at `k = 8i32` (`8 >= i8::BITS` even though `8 < i32::BITS`)
   and `k = -1i32` (`-1 < 0`).
+* `uninitOperandUb` (plus `divExact_ok_i8`, `divExact_rem_ub_i8`,
+  `divExact_zero_ub_i8`, and `divExact_min_neg1_ub_i8`), a signed `i8` body
+  exercising uninitialized-operand UB (`copy _0` before `_0` is initialized) in
+  `BinaryOp`, `UnaryOp`, and `SwitchInt` scrutinee positions (`mirCall_ub`,
+  `mirCall_steps_error`, and direct checks of MiniRust's `"load at type but the
+  data in memory violates the language invariant"` UB), alongside ground-truth
+  checks of all four `IntBinOp::DivExact` outcomes.
 
 ### Gaps
 

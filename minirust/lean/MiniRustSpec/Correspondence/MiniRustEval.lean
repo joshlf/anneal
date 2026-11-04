@@ -370,6 +370,85 @@ theorem evalIntUnOp_eq (uop : MirAst.UnOp) (iuop : Gen.IntUnOp)
     evalIntUnOp iuop x it = .ok (IntType.bring_in_bounds it (intUnArith iuop x)) := by
   cases uop <;> simp [translateUnOp] at huop <;> subst huop <;> rfl
 
+theorem intBitRec_zero_right (k : Nat) (x : Int) :
+    intBitRec (fun _ => 0) (fun b => b) (fun u v => if u = 1 ∧ v = 1 then 1 else 0) k x 0 = 0 := by
+  induction k generalizing x with
+  | zero => simp [intBitRec]
+  | succ k ih =>
+    simp only [intBitRec]
+    split
+    · rfl
+    · split
+      · rfl
+      · rw [show (0 : Int) / 2 = 0 from rfl, show (0 : Int) % 2 = 0 from rfl, ih (x / 2)]
+        omega
+
+/-- On `libspecr::Int`, `x & 1` (`intBitAnd x 1`) equals `x % 2` (`0` or `1`). -/
+theorem intBitAnd_one (x : Int) : intBitAnd x 1 = x % 2 := by
+  unfold intBitAnd
+  have hmod : x % 2 = 0 ∨ x % 2 = 1 := by omega
+  cases hk : intBitMeasure x with
+  | zero =>
+    simp only [intBitRec]
+    split
+    · next h0 => subst h0; rfl
+    · next hne0 =>
+      have hx1 : x = -1 := by
+        unfold intBitMeasure at hk
+        split at hk <;> omega
+      subst hx1; rfl
+  | succ k =>
+    simp only [intBitRec]
+    split
+    · next h0 => subst h0; rfl
+    · split
+      · next hn1 => subst hn1; rfl
+      · rw [show (1 : Int) / 2 = 0 from rfl, show (1 : Int) % 2 = 1 from rfl,
+          intBitRec_zero_right k (x / 2)]
+        rcases hmod with hmod | hmod <;> simp [hmod]
+
+theorem countOnesLoop_bounds (n : Nat) (acc x : Int) :
+    acc ≤ countOnesLoop n acc x ∧ countOnesLoop n acc x ≤ acc + n := by
+  induction n generalizing acc x with
+  | zero => simp [countOnesLoop]
+  | succ n ih =>
+    simp only [countOnesLoop, intBitAnd_one]
+    have hmod : 0 ≤ x % 2 ∧ x % 2 ≤ 1 := by omega
+    have ⟨hl, hr⟩ := ih (acc + x % 2) (x / 2)
+    omega
+
+/-- `Machine::eval_un_op` on `UnOp::Int(IntUnOp::CountOnes)` never triggers the
+`check_value` sanity-check panic on any `GoodSize` integer type, returning
+`evalCountOnes x it` at type `u32` (`spec/lang/step/operators.md`). -/
+theorem evalUnOp_countOnes (x : Int) (it : Gen.IntType) (hgood : GoodSize it.size.bytes) :
+    evalUnOp (.Int .CountOnes) (.Int x, .Int it) =
+      .ok (.Int (evalCountOnes x it), .Int ⟨.Unsigned, ⟨4⟩⟩) := by
+  have hb := countOnesLoop_bounds (Size.bits it.size) 0 x
+  have hbits : (Size.bits it.size : Int) < (2 : Int) ^ Size.bits ⟨4⟩ := by
+    unfold Size.bits
+    rcases hgood with h | h | h | h | h <;> rw [h] <;> decide
+  have hrep : IntType.can_represent ⟨.Unsigned, ⟨4⟩⟩ (evalCountOnes x it) = true := by
+    unfold IntType.can_represent inBounds evalCountOnes
+    dsimp only
+    rw [Bool.and_eq_true, decide_eq_true_eq, decide_eq_true_eq]
+    omega
+  simp [evalUnOp, evalIntUnOp, checkValue, hrep]
+
+/-- Symbolic characterization of `Machine::eval_int_bin_op` on `IntBinOp::DivExact`
+(`spec/lang/step/operators.md`):
+* `r = 0` raises `.ub "division by zero"`,
+* `r ≠ 0` and `!IntType.can_represent it (Int.tdiv l r)` raises `.ub "overflow in division"`,
+* `r ≠ 0`, `IntType.can_represent it (Int.tdiv l r) = true`, and `Int.tmod l r ≠ 0`
+  raises `.ub "non-zero remainder in exact division"`, and
+* otherwise returns `.ok (Int.tdiv l r)`. -/
+theorem evalIntBinOp_divExact (l r : Int) (it : Gen.IntType) :
+    evalIntBinOp .DivExact l r it =
+      if r = 0 then .error (.ub "division by zero")
+      else if !IntType.can_represent it (Int.tdiv l r) then .error (.ub "overflow in division")
+      else if Int.tmod l r ≠ 0 then .error (.ub "non-zero remainder in exact division")
+      else .ok (Int.tdiv l r) := by
+  rfl
+
 theorem intUnArith_emod (uop : MirAst.UnOp) (iuop : Gen.IntUnOp)
     (huop : translateUnOp uop = some iuop) (x x' m : Int) (hx : x % m = x' % m) :
     intUnArith iuop x % m = intUnArith iuop x' % m := by

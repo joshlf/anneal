@@ -79,6 +79,13 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
   and heterogeneous `(i8, i32)` `ShrUnchecked` / `ShlUnchecked` both succeeding
   at `k = 3i32` and faulting with UB at `k = 8i32` (`8 >= i8::BITS` even though
   `8 < i32::BITS`) and `k = -1i32` (`-1 < 0`).
+* `uninitOperandUb` (plus `divExact_ok_i8`, `divExact_rem_ub_i8`,
+  `divExact_zero_ub_i8`, `divExact_min_neg1_ub_i8`): reading an uninitialized
+  local (`copy _0` while `_0` is `.uninit`) inside a `BinaryOp` operand, a
+  `UnaryOp` operand, and a `SwitchInt` scrutinee (`mirCall_ub`,
+  `mirCall_steps_error`, and direct checks of MiniRust's `"load at type but the
+  data in memory violates the language invariant"` UB), alongside ground-truth
+  checks of all four `IntBinOp::DivExact` outcomes.
 -/
 
 namespace MiniRustSpec.Correspondence.Witness
@@ -1936,5 +1943,156 @@ theorem heteroShrNegUb_minirust_ub_from_start :
 
 theorem heteroShrNegUb_minirust_direct :
     Interp.steps 5 heteroShrNegUbMInit = .error (.ub "overflow in unchecked shift") := rfl
+
+/-! ## Uninitialized-operand UB (`BinaryOp`, `UnaryOp`, `SwitchInt`) and `IntBinOp::DivExact` -/
+
+/-- Direct ground-truth checks of `IntBinOp::DivExact` (`spec/lang/step/operators.md`)
+across all four outcomes on `i8`:
+* exact division `-6i8 / 3i8 = -2i8`,
+* non-zero remainder UB on `-7i8 / 3i8`,
+* division by zero UB on `-6i8 / 0i8`, and
+* signed overflow UB on `i8::MIN / -1i8 = -128 / -1`. -/
+theorem divExact_ok_i8 :
+    evalBinOp (.Int .DivExact) (.Int (-6), .Int i8) (.Int 3, .Int i8) =
+      .ok (.Int (-2), .Int i8) := rfl
+
+theorem divExact_rem_ub_i8 :
+    evalBinOp (.Int .DivExact) (.Int (-7), .Int i8) (.Int 3, .Int i8) =
+      .error (.ub "non-zero remainder in exact division") := rfl
+
+theorem divExact_zero_ub_i8 :
+    evalBinOp (.Int .DivExact) (.Int (-6), .Int i8) (.Int 0, .Int i8) =
+      .error (.ub "division by zero") := rfl
+
+theorem divExact_min_neg1_ub_i8 :
+    evalBinOp (.Int .DivExact) (.Int (-128), .Int i8) (.Int (-1), .Int i8) =
+      .error (.ub "overflow in division") := rfl
+
+/-- MIR (`Runtime(PostCleanup)`) of a function that reads an uninitialized local
+(`copy _0` before `_0` has been written) in three different positions depending
+on `x`:
+* `x == 0` (`bb1`): `_0 = Add(copy _0, copy _1)` (uninitialized operand in `BinaryOp`),
+* `x == 1` (`bb2`): `_0 = Neg(copy _0)` (uninitialized operand in `UnaryOp`),
+* otherwise (`bb3`): `switchInt(copy _0)` (uninitialized scrutinee in `SwitchInt`). -/
+def uninitOperandUb : CapturedMir where
+  defPath := "witness::uninit_operand_ub"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [i8Decl, i8Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.switchInt (.copy (local_ 1))
+        { branches := [(0, 1), (1, 2)], otherwise := 3 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .add (.copy (local_ 0)) (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.unaryOp .neg (.copy (local_ 0))))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [],
+      terminator := mkTerm (.switchInt (.copy (local_ 0))
+        { branches := [(0, 1)], otherwise := 2 }),
+      isCleanup := false }]
+  fnAbi := fnAbiI8 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem uninitOperandUb_inFragment : inFragment uninitOperandUb = true := by decide
+
+def uninitOperandUbFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[],
+      .Switch (.Load (.Local (localName 1))) ⟨[(0, bbName 1), (1, bbName 2)]⟩ (bbName 3),
+      .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 0))) (.Load (.Local (localName 1))))],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Local (localName 0)) (.UnOp (.Int .Neg) (.Load (.Local (localName 0))))],
+      .Return, .Regular⟩),
+    (bbName 3, ⟨[],
+      .Switch (.Load (.Local (localName 0))) ⟨[(0, bbName 1)]⟩ (bbName 2),
+      .Regular⟩),
+    (bbName 4, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 4
+  implicit_writes := true
+
+theorem uninitOperandUb_translate : translateFn uninitOperandUb = some uninitOperandUbFn := rfl
+
+/-- `x = 0i8`: `bb1` reads uninitialized `_0` in `BinaryOp(Add, copy _0, copy _1)`. -/
+def uninitBinOpUbS0 : MachineState := initMachineState uninitOperandUb [.scalar ⟨0, 1⟩]
+def uninitBinOpUbMInit : Mach :=
+  machineWithCtx ctxI8 uninitOperandUb uninitOperandUbFn
+    uninitBinOpUbS0.frame.locals uninitOperandUbFn.start
+
+theorem uninitBinOpUb_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree uninitOperandUb [.scalar ⟨0, 1⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound uninitOperandUb 6 _ (by decide)
+
+theorem uninitBinOpUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n uninitBinOpUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := uninitBinOpUb_anneal_ub
+  exact mirCall_ub uninitOperandUb_inFragment uninitOperandUb_translate ctxI8 (ctxI8_ok2 rfl)
+    [.scalar ⟨0, 1⟩] (by decide) uninitBinOpUbMInit rfl rfl rfl hr hf
+
+theorem uninitBinOpUb_minirust_direct :
+    Interp.steps 3 uninitBinOpUbMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") := rfl
+
+/-- `x = 1i8`: `bb2` reads uninitialized `_0` in `UnaryOp(Neg, copy _0)`. -/
+def uninitUnOpUbS0 : MachineState := initMachineState uninitOperandUb [.scalar ⟨1, 1⟩]
+def uninitUnOpUbMInit : Mach :=
+  machineWithCtx ctxI8 uninitOperandUb uninitOperandUbFn
+    uninitUnOpUbS0.frame.locals uninitOperandUbFn.start
+
+theorem uninitUnOpUb_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree uninitOperandUb [.scalar ⟨1, 1⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound uninitOperandUb 6 _ (by decide)
+
+theorem uninitUnOpUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n uninitUnOpUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := uninitUnOpUb_anneal_ub
+  exact mirCall_ub uninitOperandUb_inFragment uninitOperandUb_translate ctxI8 (ctxI8_ok2 rfl)
+    [.scalar ⟨1, 1⟩] (by decide) uninitUnOpUbMInit rfl rfl rfl hr hf
+
+theorem uninitUnOpUb_minirust_direct :
+    Interp.steps 3 uninitUnOpUbMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") := rfl
+
+/-- `x = 2i8`: `bb3` reads uninitialized `_0` as the scrutinee of `SwitchInt(copy _0)`. -/
+def uninitSwitchUbS0 : MachineState := initMachineState uninitOperandUb [.scalar ⟨2, 1⟩]
+def uninitSwitchUbMInit : Mach :=
+  machineWithCtx ctxI8 uninitOperandUb uninitOperandUbFn
+    uninitSwitchUbS0.frame.locals uninitOperandUbFn.start
+
+theorem uninitSwitchUb_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree uninitOperandUb [.scalar ⟨2, 1⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound uninitOperandUb 6 _ (by decide)
+
+theorem uninitSwitchUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n uninitSwitchUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := uninitSwitchUb_anneal_ub
+  exact mirCall_ub uninitOperandUb_inFragment uninitOperandUb_translate ctxI8 (ctxI8_ok2 rfl)
+    [.scalar ⟨2, 1⟩] (by decide) uninitSwitchUbMInit rfl rfl rfl hr hf
+
+theorem uninitSwitchUb_minirust_direct :
+    Interp.steps 3 uninitSwitchUbMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") := rfl
+
+theorem uninitSwitchUb_converse_error :
+    (∃ msg, Stop.ub "load at type but the data in memory violates the language invariant" = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree uninitOperandUb [.scalar ⟨2, 1⟩]) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 3 ∧ Interp.steps k uninitSwitchUbMInit = .ok mRet ∧
+      ReturnRel uninitOperandUb ctxI8 s' v mRet ∧
+      ReachesRet (mirCallTree uninitOperandUb [.scalar ⟨2, 1⟩]) tr (.normal (v, mem))) :=
+  mirCall_steps_error uninitOperandUb_inFragment uninitOperandUb_translate ctxI8 (ctxI8_ok2 rfl)
+    [.scalar ⟨2, 1⟩] (by decide) uninitSwitchUbMInit rfl rfl rfl uninitSwitchUb_minirust_direct
 
 end MiniRustSpec.Correspondence.Witness

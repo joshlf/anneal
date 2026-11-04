@@ -164,7 +164,7 @@ fn doc_comments(lean: &str) -> Vec<DocComment> {
                         if bytes.get(i + 1) == Some(&b'\n') {
                             line += 1;
                         }
-                        i += 2;
+                        i = (i + 2).min(bytes.len());
                         continue;
                     }
                     if bytes[i] == b'"' {
@@ -182,7 +182,12 @@ fn doc_comments(lean: &str) -> Vec<DocComment> {
             b'/' if bytes.get(i + 1) == Some(&b'-') => {
                 let start_line = line;
                 let third = bytes.get(i + 2).copied();
-                let is_doc = matches!(third, Some(b'!' | b'-')) && bytes.get(i + 3) != Some(&b'/');
+                let fourth = bytes.get(i + 3).copied();
+                let is_doc = match third {
+                    Some(b'!') => fourth != Some(b'/'),
+                    Some(b'-') => fourth != Some(b'/') && fourth != Some(b'-'),
+                    _ => false,
+                };
                 let is_module_doc = third == Some(b'!');
                 let body_start = if is_doc { i + 3 } else { i + 2 };
                 i = body_start;
@@ -296,15 +301,23 @@ fn parse_blockquote_literals(
 
 fn extract_backticked_corpus_paths(text: &str, valid_paths: &BTreeSet<String>) -> Vec<String> {
     let mut found = Vec::new();
-    let mut rest = text;
-    while let Some(open) = rest.find('`') {
-        rest = &rest[open + 1..];
-        let Some(close) = rest.find('`') else { break };
-        let span = &rest[..close];
-        if valid_paths.contains(span) && !found.iter().any(|p| p == span) {
-            found.push(span.to_string());
+    for line in text.lines() {
+        let mut rest = line;
+        while let Some(open) = rest.find('`') {
+            let after_open = &rest[open + 1..];
+            let Some(close) = after_open.find('`') else { break };
+            let span = &after_open[..close];
+            if valid_paths.contains(span) {
+                if !found.iter().any(|p| p == span) {
+                    found.push(span.to_string());
+                }
+                rest = &after_open[close + 1..];
+            } else if span.chars().any(char::is_whitespace) {
+                rest = after_open;
+            } else {
+                rest = &after_open[close + 1..];
+            }
         }
-        rest = &rest[close + 1..];
     }
     found
 }
@@ -669,4 +682,14 @@ def w := 5
 
     // Punctuation-only elisions (`"{ .. }"`) with no identifier/keyword/literal must fail.
     assert!(missing_piece_in(&corpus, Some(ops), "{ .. }").is_some());
+
+    // An unmatched backtick or `/---` divider comment must not swallow citations or quotes.
+    let unmatched_tick_and_divider = "\
+/----------/
+/-- Let `x = 1 in (`spec/lang/step/operators.md`):
+> \"Add => left + right,\" -/
+def u := \"trailing\\";
+    let qs4 = extract_quotes(unmatched_tick_and_divider, &valid_paths).unwrap();
+    assert_eq!(qs4.len(), 1);
+    assert_eq!(qs4[0].cited_file, ops);
 }

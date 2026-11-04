@@ -51,13 +51,16 @@ structure Anchor : Type where
   /-- The SHA-256 of the item's token stream, as recorded by the generator. -/
   tokenSha256 : String
 
-/-- The generated model contains the pinned item unchanged. -/
+/-- The generated model contains the pinned item unchanged, the anchor cites a
+known vendored file, and links at least one `MiniRustSpec.Interp` definition. -/
 def Anchor.ok (a : Anchor) : Bool :=
+  !a.interp.isEmpty &&
+  MiniRustSpec.Generated.Manifest.vendoredFiles.any (fun (f, _) => f == a.file) &&
   a.items.any (fun i => i.name == a.name && i.line == a.line && i.tokenSha256 == a.tokenSha256)
 
 /-- Every upstream item transcribed by `MiniRustSpec.Interp`. -/
 def anchors : List Anchor := [
-  { interp := [``MiniRustSpec.Interp.step, ``MiniRustSpec.Interp.pickActiveThread],
+  { interp := [``MiniRustSpec.Interp.step, ``MiniRustSpec.Interp.steps, ``MiniRustSpec.Interp.pickActiveThread],
     file := "spec/lang/machine.md", items := MiniRustSpec.Gen.Items.Lang.Machine.items,
     name := "impl_Machine__new", line := 128,
     tokenSha256 := "45ee0382262183b14b28c5fad1005abbbcbb8bcf0f0cc536fb55ad12605190cf" },
@@ -169,6 +172,10 @@ def anchors : List Anchor := [
     file := "spec/lang/types.md", items := MiniRustSpec.Gen.Items.Lang.Types.items,
     name := "impl_Type__layout", line := 148,
     tokenSha256 := "682e0cbfbea24b480557a76f0b8f41b2d286f604a8f6d0b26df81a02fa15cfcd" },
+  { interp := [``MiniRustSpec.Interp.LayoutStrategy.expect_size, ``MiniRustSpec.Interp.LayoutStrategy.expect_align],
+    file := "spec/lang/types.md", items := MiniRustSpec.Gen.Items.Lang.Types.items,
+    name := "impl_LayoutStrategy__is_sized", line := 234,
+    tokenSha256 := "e52080897bef565d064ef299545ac4985b3364e30fb6076be23e24827dbd9bd5" },
   { interp := [``MiniRustSpec.Interp.IntType.can_represent, ``MiniRustSpec.Interp.IntType.bring_in_bounds],
     file := "spec/lang/types.md", items := MiniRustSpec.Gen.Items.Lang.Types.items,
     name := "impl_IntType__I8", line := 295,
@@ -193,7 +200,7 @@ def anchors : List Anchor := [
     file := "spec/mem/concurrent.md", items := MiniRustSpec.Gen.Items.Mem.Concurrent.items,
     name := "impl_ConcurrentMemory__new", line := 44,
     tokenSha256 := "3115f9afaf9bca67448e9dbcccda3080a4da794597864e8140dfeb68c26932c2" },
-  { interp := [``MiniRustSpec.Interp.CM.check_data_races],
+  { interp := [``MiniRustSpec.Interp.CM.check_data_races, ``MiniRustSpec.Interp.resetDataRaceTracking],
     file := "spec/mem/concurrent.md", items := MiniRustSpec.Gen.Items.Mem.Concurrent.items,
     name := "impl_ConcurrentMemory__check_data_races", line := 134,
     tokenSha256 := "4fd9af133b55d648e6cf0a1e4b226025c24815243741399853395c4d25b63937" },
@@ -212,5 +219,8 @@ def anchors : List Anchor := [
 ]
 
 theorem anchors_ok : anchors.all Anchor.ok = true := by decide
+
+theorem anchors_nodup :
+    decide ((anchors.map (fun a => (a.file, a.name, a.line))).Nodup) = true := by decide
 
 end MiniRustSpec.Anchors

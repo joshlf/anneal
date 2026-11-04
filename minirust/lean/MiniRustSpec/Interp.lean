@@ -140,6 +140,13 @@ these operations are hand-written from its documented behavior. -/
 /-- `Size::bits()`: the number of bits in `s` bytes. -/
 def Size.bits (s : Size) : Nat := 8 * s.bytes
 
+/-- `Align::from_bytes(n)`: `Some` iff `n` is a power of two. -/
+def alignFromBytes (n : Nat) : Option Align :=
+  if n ≠ 0 ∧ n &&& (n - 1) = 0 then some ⟨n⟩ else none
+
+/-- `Align::is_aligned(addr)`: `addr` is a multiple of the alignment. -/
+def Align.is_aligned (a : Align) (addr : Int) : Bool := addr % (a.bytes : Int) == 0
+
 /-- `Int::in_bounds(signed, size)`: whether `i` is representable as an integer
 of the given signedness and size (unsigned: `[0, 2^bits)`; signed:
 `[-2^(bits-1), 2^(bits-1))`). -/
@@ -289,10 +296,6 @@ def x86_64.ENDIANNESS : Endianness := .LittleEndian
 
 /-! ## Types and layout (`spec/lang/types.md`) -/
 
-/-- `Align::from_bytes(n)`: `Some` iff `n` is a power of two. -/
-def alignFromBytes (n : Nat) : Option Align :=
-  if n ≠ 0 ∧ n &&& (n - 1) = 0 then some ⟨n⟩ else none
-
 /-- `IntType::can_represent`:
 > "pub fn can_represent(&self, i: Int) -> bool { i.in_bounds(self.signed, self.size) }" -/
 def IntType.can_represent (t : IntType) (i : Int) : Bool := inBounds i t.signed t.size
@@ -317,13 +320,25 @@ def Type.layout : «Type» → Interp LayoutStrategy
   | .Bool => pure (.Sized ⟨1⟩ ⟨1⟩)
   | _ => unsupported "Type::layout for a non-Int, non-Bool type"
 
-/-- `LayoutStrategy::expect_size`. -/
+/-- `LayoutStrategy::expect_size` (`spec/lang/types.md`):
+> "pub fn expect_size(self, msg: &str) -> Size {
+>     match self {
+>         LayoutStrategy::Sized(size, _) => size,
+>         _ => panic!(\"expect_size called on unsized type: {msg}\"),
+>     }
+> }" -/
 def LayoutStrategy.expect_size (l : LayoutStrategy) (msg : String) : Interp Size :=
   match l with
   | .Sized size _ => pure size
   | _ => specPanic s!"expect_size called on unsized type: {msg}"
 
-/-- `LayoutStrategy::expect_align`. -/
+/-- `LayoutStrategy::expect_align` (`spec/lang/types.md`):
+> "pub fn expect_align(self, msg: &str) -> Align {
+>     match self {
+>         LayoutStrategy::Sized(_, align) => align,
+>         _ => panic!(\"expect_align called on unsized type: {msg}\"),
+>     }
+> }" -/
 def LayoutStrategy.expect_align (l : LayoutStrategy) (msg : String) : Interp Align :=
   match l with
   | .Sized _ align => pure align
@@ -331,7 +346,13 @@ def LayoutStrategy.expect_align (l : LayoutStrategy) (msg : String) : Interp Ali
 
 /-! ## Representation relation (`spec/lang/representation.md`) -/
 
-/-- `AbstractByte::data`. -/
+/-- `AbstractByte::data` (`spec/mem/interface.md`):
+> "pub fn data(self) -> Option<u8> {
+>     match self {
+>         AbstractByte::Uninit => None,
+>         AbstractByte::Init(data, _) => Some(data),
+>     }
+> }" -/
 def AbstractByte.data : Byte → Option UInt8
   | .Uninit => none
   | .Init b _ => some b
@@ -410,9 +431,6 @@ def checkValue : Val → «Type» → Interp Unit
 /-- `Allocation::size`:
 > "fn size(self) -> Size { Size::from_bytes(self.data.len()).unwrap() }" -/
 def Allocation.size (a : Allocation) : Size := ⟨a.data.length⟩
-
-/-- `Align::is_aligned(addr)`: `addr` is a multiple of the alignment. -/
-def Align.is_aligned (a : Align) (addr : Int) : Bool := addr % (a.bytes : Int) == 0
 
 /-- `BasicMemory::check_ptr`:
 > "fn check_ptr(&self, ptr: ThinPointer<..>, len: Size) -> Result<Option<(AllocId, ProvExtra, Size)>> {
@@ -539,7 +557,10 @@ def CM.load (cm : ConcurrentMemory BM) (ptr : Ptr) (len : Size) (align : Align)
   let (bytes, memory) ← BM.load cm.memory ptr len align
   pure (bytes, { memory := memory, accesses := cm.accesses ++ [access] })
 
-/-- `ConcurrentMemory::deallocate`: "self.memory.deallocate(ptr, kind, size, align)". -/
+/-- `ConcurrentMemory::deallocate`:
+> "pub fn deallocate(&mut self, ptr: ThinPointer<M::Provenance>, kind: AllocationKind, size: Size, align: Align) -> Result {
+>     self.memory.deallocate(ptr, kind, size, align)
+> }" -/
 def CM.deallocate (cm : ConcurrentMemory BM) (ptr : Ptr) (kind : AllocationKind) (size : Size)
     (align : Align) : Interp (ConcurrentMemory BM) := do
   pure { cm with memory := ← BM.deallocate cm.memory ptr kind size align }
@@ -569,15 +590,17 @@ def CM.check_data_races (cm : ConcurrentMemory BM) (current : ThreadId)
 
 /-! ## Machine helpers (`spec/lang/machine.md`) -/
 
-/-- `Machine::reset_data_race_tracking`:
+/-- `Machine::reset_data_race_tracking` (`spec/lang/machine.md`):
 > "let mut prev_sync = self.synchronized_threads;
 >  // Every thread is always synchronized with itself.
 >  prev_sync.insert(self.active_thread);
 >  // Reset access tracking list.
 >  let prev_accesses = self.mem.reset_accesses();
 >  (prev_sync, prev_accesses)"
-with `ConcurrentMemory::reset_accesses` ("let prev_accesses = self.accesses;
-self.accesses = list![]; prev_accesses"). -/
+with `ConcurrentMemory::reset_accesses` (`spec/mem/concurrent.md`):
+> "let prev_accesses = self.accesses;
+>  self.accesses = list![];
+>  prev_accesses" -/
 def resetDataRaceTracking (m : Mach) : (Set ThreadId × List Access) × Mach :=
   ((setInsert m.synchronized_threads m.active_thread, m.mem.accesses),
    { m with mem := { m.mem with accesses := [] } })
@@ -599,11 +622,21 @@ def pickActiveThread (m : Mach) : Interp ThreadId :=
   | [] => unsupported "pick with no valid choice (no behavior)"
   | _ => unsupported "daemonic choice among several enabled threads"
 
-/-- `Machine::active_thread`: "self.threads[self.active_thread]". -/
+/-- `Machine::active_thread`:
+> "fn active_thread(&self) -> Thread<M> {
+>     self.threads[self.active_thread]
+> }" -/
 def activeThread (m : Mach) : Interp (Thread BM) :=
   listIndex m.threads m.active_thread "self.threads[self.active_thread]"
 
-/-- `Machine::cur_frame` / `Thread::cur_frame`: "self.stack.last().unwrap()". -/
+/-- `Machine::cur_frame` and `Thread::cur_frame`:
+> "fn cur_frame(&self) -> StackFrame<M> {
+>     self.active_thread().cur_frame()
+> }
+> ..
+> fn cur_frame(&self) -> StackFrame<M> {
+>     self.stack.last().unwrap()
+> }" -/
 def curFrame (m : Mach) : Interp Frame := do
   let t ← activeThread m
   match t.stack.getLast? with
