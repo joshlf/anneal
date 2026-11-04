@@ -1172,6 +1172,9 @@ theorem mir_evalTerminator_diverging_call_panic_entrypoints
        pAbort = "core::panicking::panic_nounwind_nobacktrace" ∨
        pAbort = "core::panicking::panic_in_cleanup" ∨
        pAbort = "core::panicking::panic_cannot_unwind" ∨
+       pAbort = "core::panicking::panic_misaligned_pointer_dereference" ∨
+       pAbort = "core::panicking::panic_null_pointer_dereference" ∨
+       pAbort = "core::panicking::panic_invalid_enum_construction" ∨
        pAbort = "core::intrinsics::abort") →
       findCallee? s.memory.callees pAbort = .none →
       evalTerminator
@@ -1182,14 +1185,29 @@ theorem mir_evalTerminator_diverging_call_panic_entrypoints
       (p = "core::panicking::panic" ∨
        p = "core::panicking::panic_fmt" ∨
        p = "core::panicking::panic_fmt::panic_impl" ∨
+       p = "core::panicking::const_panic_fmt" ∨
        p = "core::panicking::assert_failed" ∨
+       p = "core::panicking::assert_failed_inner" ∨
+       p = "core::panicking::assert_matches_failed" ∨
        p = "core::slice::index::slice_index_fail" ∨
        p = "core::panicking::panic_bounds_check" ∨
        p = "core::panicking::panic_explicit" ∨
        p = "core::panicking::panic_display" ∨
+       p = "core::panicking::panic_str_2015" ∨
+       p = "core::panicking::unreachable_display" ∨
        p = "core::option::unwrap_failed" ∨
+       p = "core::option::expect_failed" ∨
        p = "core::result::unwrap_failed" ∨
-       p = "core::panicking::panic_const::panic_const_add_overflow") →
+       p = "core::panicking::panic_const::panic_const_add_overflow" ∨
+       p = "core::panicking::panic_const::panic_const_sub_overflow" ∨
+       p = "core::panicking::panic_const::panic_const_mul_overflow" ∨
+       p = "core::panicking::panic_const::panic_const_div_overflow" ∨
+       p = "core::panicking::panic_const::panic_const_rem_overflow" ∨
+       p = "core::panicking::panic_const::panic_const_neg_overflow" ∨
+       p = "core::panicking::panic_const::panic_const_shr_overflow" ∨
+       p = "core::panicking::panic_const::panic_const_shl_overflow" ∨
+       p = "core::panicking::panic_const::panic_const_div_by_zero" ∨
+       p = "core::panicking::panic_const::panic_const_rem_by_zero") →
       findCallee? s.memory.callees p = .none →
       (s.memory.callStack = .nil →
         evalTerminator s ⟨.call (mkFnOp p) argOps destination .none .continue_, span⟩ (.some callerBody) =
@@ -1218,7 +1236,7 @@ theorem mir_evalTerminator_diverging_call_panic_entrypoints
     have hpAbortFlags :
         isUnreachableCallTarget pAbort = false ∧
         isAbortingPanicDefPath pAbort = true := by
-      rcases hpAbort with rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide
+      rcases hpAbort with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide
     rcases hpAbortFlags with ⟨hNotUnreach, hAbort⟩
     simp only [evalTerminator, resolveCallTarget, extractCalleeDefPath?,
       extractCalleeTypeArgs, hArgs, hFindNone, hNotUnreach, hAbort]
@@ -1227,7 +1245,7 @@ theorem mir_evalTerminator_diverging_call_panic_entrypoints
         isUnreachableCallTarget p = false ∧
         isAbortingPanicDefPath p = false ∧
         isUnwindingPanicDefPath p = true := by
-      rcases hp with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide
+      rcases hp with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide
     rcases hpFlags with ⟨hNotUnreach, hNotAbort, hUnwindPanic⟩
     refine ⟨?_, ?_, ?_, ?_, ?_⟩
     · intro hRoot
