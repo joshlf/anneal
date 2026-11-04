@@ -1428,6 +1428,7 @@ fn with_overflow_tuple_and_field_quotations_are_pinned() {
             "MiniRustSpec/Correspondence/Translate.lean",
         ),
     ];
+    assert_eq!(cases.len(), 25, "expected 25 pinned MR-1.2 quotations");
 
     let lean_root = minirust_dir().join("lean");
     for (file, genuine, tampered, lean_file) in cases {

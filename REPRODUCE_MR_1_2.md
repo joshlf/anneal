@@ -51,7 +51,7 @@ as a pass.
   - `impl_Machine__eval_int_bin_op_with_overflow` (`spec/lang/step/operators.md:208`)
 - **Quotation checks** (`crates/anneal-minirust-gen/tests/quotes.rs` and
   `tests/pipeline.rs`): `with_overflow_tuple_and_field_quotations_are_pinned`
-  pins all 22 upstream quotations across `Interp.lean` (`spec/lang/types.md`,
+  pins all 25 upstream quotations across `Interp.lean` (`spec/lang/types.md`,
   `spec/mem/basic.md`, `spec/mem/concurrent.md`, `spec/lang/step/operators.md`,
   `spec/lang/step/expressions.md`) and `Translate.lean`
   (`tooling/minimize/src/{ty,rvalue,bb}.rs`), raises the global quotation floor
@@ -60,7 +60,7 @@ as a pass.
 - **Translation** (`Correspondence/Translate.lean`):
   - `(Int, bool)` 2-tuple MIR types (`intBoolTupleOf` / `intBoolTupleTy it`,
     matching `tooling/minimize/src/ty.rs`'s `TyKind::Tuple` translation via
-    `build::tuple_ty`), across all 10 `IntType`s (`i8..i128`, `isize`,
+    `build::tuple_ty`), across all 12 MIR integer types (`i8..i128`, `isize`,
     `u8..u128`, `usize`).
   - Field projections `_j.0` and `_j.1` (`PlaceExpr::Field(PlaceExpr::Local(_j), 0)`
     and `PlaceExpr::Field(PlaceExpr::Local(_j), 1)`, matching
@@ -166,8 +166,9 @@ Pass: both exit with status `0`.
 cargo test -p anneal-minirust-gen --offline
 ```
 
-Pass: all 20 tests pass (`11` in `tests/pipeline.rs`, `9` in `tests/quotes.rs`,
-including `with_overflow_tuple_and_field_quotations_are_pinned`).
+Pass: all 20 tests pass (`8` unit tests in `src/lib.rs`, `7` in
+`tests/pipeline.rs`, and `5` in `tests/quotes.rs`, including
+`with_overflow_tuple_and_field_quotations_are_pinned`).
 
 ## Step 3: kernel-check the Lean development
 
