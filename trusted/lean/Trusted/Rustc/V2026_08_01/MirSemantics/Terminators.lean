@@ -1474,12 +1474,12 @@ scalar length (`.scalar _`, for slice-tailed DSTs) or an 8-byte vtable pointer
 faults with `.ub`.
 
 Reference (The Rust Reference, "Dynamically Sized Types"):
-<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html#r-dynamic-sized.pointer-types>
 
-> "Pointers to DSTs are sized, but have twice the size of pointers to sized
-> types:
+> "Pointer types to DSTs are sized but have twice the size of pointers to sized
+> types
 >
-> * Pointers to slices also store the number of elements of the slice.
+> * Pointers to slices and `str` also store the number of elements.
 > * Pointers to trait objects also store a pointer to a vtable."
 -/
 @[reducible]
@@ -1538,6 +1538,34 @@ def resolveIntrinsicPointeeTy?
       | .some { kind := .ref _ pointeeTy, .. } => .some pointeeTy
       | _ => .none
     | .nil => .none
+
+/--
+Step for `arith_offset`, `size_of_val`, or `align_of_val` when
+`resolveIntrinsicPointeeTy?` finds no pointee type: `MirStepNode.fail .ub` when
+the first argument operand has a known type that is not a pointer (an
+ill-typed call), and `MirStepNode.unsupported` when no operand type is known
+(no `argOps`, or an operand that `operandTy` cannot type). An unknown pointee
+leaves the stride, size, or alignment undetermined, so the call is a program
+the model cannot evaluate rather than one it can show to be undefined.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2850-L2861>
+
+> "pub const unsafe fn size_of_val<T: ?Sized>(ptr: *const T) -> usize;"
+-/
+@[reducible]
+def intrinsicMissingPointeeStep
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand) :
+    MirStepNode :=
+  match argOps with
+  | ptrOp :: _ =>
+    match operandTy bodyLocalDecls bodyLayouts ptrOp with
+    | .some _ => MirStepNode.fail .ub
+    | .none => MirStepNode.unsupported
+  | .nil => MirStepNode.unsupported
 
 /--
 Check whether every element of `ks` satisfies `pred`.
@@ -1854,7 +1882,7 @@ def evalNonSelectIntrinsicCall
               writeIntrinsicReturn s locals' destination targetBb (.ptr retPtrVal 8)
             | .none => MirStepNode.fail .ub
           | .none => intrinsicUnresolvedLayoutStep pointeeTy
-        | .none => MirStepNode.fail .ub
+        | .none => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
     | _ => MirStepNode.fail .ub
   | .ctlz =>
     match argVals with
@@ -2054,7 +2082,7 @@ def evalNonSelectIntrinsicCall
           | false => MirStepNode.fail .ub
           | true => intrinsicWidePointeeStep pointeeTy
         | _ => MirStepNode.fail .ub
-      | .none => MirStepNode.fail .ub
+      | .none => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
     | _ => MirStepNode.fail .ub
   | .alignOfVal =>
     match argVals with
@@ -2120,7 +2148,7 @@ def evalNonSelectIntrinsicCall
           | false => MirStepNode.fail .ub
           | true => intrinsicWidePointeeStep pointeeTy
         | _ => MirStepNode.fail .ub
-      | .none => MirStepNode.fail .ub
+      | .none => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
     | _ => MirStepNode.fail .ub
   | .constEvalSelect => MirStepNode.fail .ub
 
@@ -2143,25 +2171,53 @@ def isPtrPointeeIntrinsicKind : RustIntrinsicKind → Bool
   | _ => false
 
 /--
-Supply fallback `typeArgs` for a runtime intrinsic target `rtTarget` dispatched
-by `const_eval_select` when `rtTarget.typeArgs` is empty and `const_eval_select`
-carries `ARG = .tuple elemTys`:
-- For pointer-parameterized intrinsics (`isPtrPointee = true`), extracts the
-  pointee `T` from the first tuple element `.rawPtr _ T` or `.ref _ T`.
-- For value-parameterized intrinsics (`isPtrPointee = false`), forwards
-  `elemTys` so that `T` (and shift count type `U` for
-  `unchecked_shl`/`unchecked_shr`) are available to `resolveIntrinsicIsSigned`
-  and `resolveIntrinsicShiftSigned`.
+Supply type arguments for a runtime intrinsic target `rtTarget` of
+`const_eval_select` whose callee constant carries none (`rtTarget.typeArgs =
+[]`), using the element types `elemTys` of `const_eval_select`'s first type
+argument `ARG = .tuple elemTys`:
+- for `arith_offset`, `size_of_val`, and `align_of_val` (`isPtrPointee = true`),
+  the pointee `T` of the first element `*const T`, `*mut T`, or `&T`;
+- for the value intrinsics (`isPtrPointee = false`), `elemTys` itself.
+
+The bound `G: FnOnce<ARG, Output = RET>` makes `ARG` the tuple of the parameter
+types of `called_at_rt`. Each value intrinsic modeled here is generic exactly
+over the types of its leading parameters, in order (`T` of `exact_div(x: T, y:
+T)`, `T` and `U` of `unchecked_shl(x: T, y: U)`), and each pointer intrinsic is
+generic only over the pointee of its first parameter (`T` of
+`arith_offset(dst: *const T, offset: isize)`). These element types are
+therefore the instantiation that `rtTarget` omits; trailing extras, such as the
+second `T` of `exact_div`, are ignored by `resolveIntrinsicIsSigned`. Captured
+MIR always carries a callee's generic arguments, and `rustc` replaces every
+`const_eval_select` call with a direct call to `called_at_rt` before
+`optimized_mir` (`remap_mir_for_const_eval_select` in `inner_optimized_mir`), so
+this fallback only affects hand-built MIR.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2798-L2824>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2400-L2408>
 
-> "pub const unsafe fn const_eval_select<ARG: Tuple, F, G, RET>(
->     arg: ARG,
->     called_in_const: F,
->     called_at_rt: G,
-> ) -> RET"
+> "#[rustc_intrinsic]
+> pub const fn const_eval_select<ARG: Tuple, F, G, RET>(
+>     _arg: ARG,
+>     _called_in_const: F,
+>     _called_at_rt: G,
+> ) -> RET
+> where
+>     G: FnOnce<ARG, Output = RET>,
+>     F: const FnOnce<ARG, Output = RET>;"
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1962-L1971>
+
+> "pub const unsafe fn unchecked_shl<T: Copy, U: Copy>(x: T, y: U) -> T;"
+
+Reference (`compiler/rustc_mir_transform/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_mir_transform/src/lib.rs#L798-L799>
+
+> "    let body = tcx.mir_drops_elaborated_and_const_checked(did).steal();
+>     let mut body = remap_mir_for_const_eval_select(tcx, body, hir::Constness::NotConst);"
 -/
 @[reducible]
 def withConstEvalSelectIntrinsicTypeArgs
@@ -2793,6 +2849,12 @@ def evalTerminator
                   calleeBody
                   argVals)
         | .none =>
+          -- A diverging call to `core::intrinsics::const_eval_select` (one whose
+          -- `called_at_rt` returns `!`) is not unpacked here; like any other
+          -- unlinked callee it becomes an external call, which constrains
+          -- nothing. Captured MIR never contains one, because `rustc` replaces
+          -- every `const_eval_select` call with a direct call to `called_at_rt`
+          -- before `optimized_mir` (`withConstEvalSelectIntrinsicTypeArgs`).
           match target.isIndirect with
           | false =>
             match isUnreachableCallTarget target.defPath with

@@ -3321,4 +3321,175 @@ theorem mir_evalTerminator_dst_prefix_meta_decl_and_select_typeArgs_corresponds
       rigidTyKindByteSize, intCastTargetBytes, length]
     cases evalArithOffset ptrVal 8 offsetSc 4 <;> rfl
 
+/-- Every scalar modulus `256 ^ k` is positive. -/
+private theorem shiftParity_scalarModulus_ge_one : ∀ k : Nat, 1 ≤ scalarModulus k
+  | 0 => by decide
+  | k + 1 => by
+    have ih := shiftParity_scalarModulus_ge_one k
+    show 1 ≤ 256 * scalarModulus k
+    omega
+
+/-- The modulus of a non-zero byte width is at least `256`. -/
+private theorem shiftParity_scalarModulus_succ_ge (k : Nat) : 256 ≤ scalarModulus (k + 1) := by
+  have h := shiftParity_scalarModulus_ge_one k
+  show 256 ≤ 256 * scalarModulus k
+  omega
+
+/--
+A shift count whose sign bit is set is at least `128`, which is at least the
+bit width `8 * lw` of any integer type of at most 16 bytes, so for every integer
+type such a count is already an over-wide shift.
+-/
+private theorem shiftParity_negative_count_overshifts
+    (lw rw b : Nat)
+    (hR : Nat.beq rw 0 = false)
+    (hW : lw ≤ 16)
+    (hNeg : Nat.ble (Nat.div (scalarModulus rw) 2) b = true) :
+    Nat.ble (Nat.mul lw 8) b = true := by
+  cases rw with
+  | zero => simp at hR
+  | succ k =>
+    have hm := shiftParity_scalarModulus_succ_ge k
+    have h1 : scalarModulus (k + 1) / 2 ≤ b := Nat.le_of_ble_eq_true hNeg
+    have h2 : lw * 8 ≤ b := by omega
+    exact Nat.ble_eq_true_of_le h2
+
+/--
+**Theorem L5.29 (`mir_intrinsic_shifts_agree_with_evalScalarBinOp`)**:
+Universal correspondence between `unchecked_shl::<T, U>` /
+`unchecked_shr::<T, U>` and the `BinOp.shlUnchecked` / `BinOp.shrUnchecked`
+that `rustc`'s `LowerIntrinsics` pass substitutes for them, for operands of
+different widths and for signed shift counts. L5.27 covers only equal widths
+and unsigned counts, but `core`'s integer methods shift by a `u32`
+(`u64::unchecked_shl(self, rhs: u32)` calls `unchecked_shl::<u64, u32>`), so
+most captured shifts have `T` and `U` of different widths.
+
+For any canonical `lhs : T` of 1 to 16 bytes (the widths of Rust's integer
+types), any canonical `rhs : U` of non-zero width, and any signedness of `T`
+and `U`, the intrinsic and the binary operation agree, including on `.ub`. In
+particular, the intrinsic's separate rejection of negative signed counts adds
+nothing: a count with its sign bit set is at least `128` and therefore at least
+the bit width of `T`.
+-/
+theorem mir_intrinsic_shifts_agree_with_evalScalarBinOp
+    (lhs rhs : ScalarInt)
+    (locals : List LocalSlot)
+    (mem : Memory)
+    (lhsSigned rhsSigned : Bool)
+    (hL : Nat.beq lhs.sizeBytes 0 = false)
+    (hR : Nat.beq rhs.sizeBytes 0 = false)
+    (hW : lhs.sizeBytes ≤ 16)
+    (hCanonL : wrapScalarBits lhs.bits (scalarModulus lhs.sizeBytes) = lhs.bits)
+    (hCanonR : wrapScalarBits rhs.bits (scalarModulus rhs.sizeBytes) = rhs.bits) :
+    liftIntrinsicScalarResult (evalUncheckedShl lhs rhs rhsSigned) locals mem =
+      evalScalarBinOp .shlUnchecked lhs rhs locals mem lhsSigned ∧
+    liftIntrinsicScalarResult (evalUncheckedShr lhs rhs lhsSigned rhsSigned) locals mem =
+      evalScalarBinOp .shrUnchecked lhs rhs locals mem lhsSigned := by
+  have key :
+      Bool.or
+          (Bool.and rhsSigned (isSignedNegative rhs.bits rhs.sizeBytes))
+          (Nat.ble (Nat.mul lhs.sizeBytes 8) rhs.bits) =
+        Nat.ble (Nat.mul lhs.sizeBytes 8) rhs.bits := by
+    cases hb : Nat.ble (Nat.mul lhs.sizeBytes 8) rhs.bits
+    · cases rhsSigned
+      · rfl
+      · cases hn : isSignedNegative rhs.bits rhs.sizeBytes
+        · rfl
+        · exfalso
+          unfold isSignedNegative at hn
+          simp only [hR, hCanonR] at hn
+          have h := shiftParity_negative_count_overshifts
+            lhs.sizeBytes rhs.sizeBytes rhs.bits hR hW hn
+          rw [hb] at h
+          exact Bool.false_ne_true h
+    · cases rhsSigned <;> simp
+  refine ⟨?_, ?_⟩
+  · unfold liftIntrinsicScalarResult evalUncheckedShl evalScalarBinOp
+    simp only [hL, hR, hCanonL, hCanonR, Bool.or_false, key]
+    cases Nat.ble (Nat.mul lhs.sizeBytes 8) rhs.bits <;> rfl
+  · unfold liftIntrinsicScalarResult evalUncheckedShr evalScalarBinOp
+    simp only [hL, hR, hCanonL, hCanonR, Bool.or_false, key]
+    cases Nat.ble (Nat.mul lhs.sizeBytes 8) rhs.bits <;> rfl
+
+/--
+Instances of L5.29 for the shapes `core` produces: `u64 << u32` by `63`
+(defined, `2^63`), `u64 << u32` by `64` (`.ub`), and `i8 >> i32` by `-1` (`.ub`,
+rejected as an over-wide shift).
+-/
+theorem mir_intrinsic_shifts_agree_with_evalScalarBinOp_instances :
+    liftIntrinsicScalarResult (evalUncheckedShl ⟨1, 8⟩ ⟨63, 4⟩ false) .nil emptyMemory =
+      .ok (.scalar ⟨9223372036854775808, 8⟩) .nil emptyMemory ∧
+    evalScalarBinOp .shlUnchecked ⟨1, 8⟩ ⟨63, 4⟩ .nil emptyMemory false =
+      .ok (.scalar ⟨9223372036854775808, 8⟩) .nil emptyMemory ∧
+    liftIntrinsicScalarResult (evalUncheckedShl ⟨1, 8⟩ ⟨64, 4⟩ false) .nil emptyMemory = .ub ∧
+    evalScalarBinOp .shlUnchecked ⟨1, 8⟩ ⟨64, 4⟩ .nil emptyMemory false = .ub ∧
+    liftIntrinsicScalarResult (evalUncheckedShr ⟨128, 1⟩ ⟨4294967295, 4⟩ true true)
+      .nil emptyMemory = .ub ∧
+    evalScalarBinOp .shrUnchecked ⟨128, 1⟩ ⟨4294967295, 4⟩ .nil emptyMemory true = .ub := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;> rfl
+
+/--
+**Theorem L5.30 (`mir_evalTerminator_pointee_resolution_fails_closed`)**:
+When neither a type argument nor an operand type names the pointee `T` of
+`arith_offset::<T>`, `size_of_val::<T>`, or `align_of_val::<T>`, the stride,
+size, or alignment is unknown, so `evalTerminator` steps to
+`MirStepNode.unsupported` instead of reporting undefined behavior for a call
+whose behavior the model cannot determine.
+-/
+theorem mir_evalTerminator_pointee_resolution_fails_closed
+    (ptrVal : ProvenancePtr)
+    (countSc : ScalarInt)
+    (targetBb : BasicBlockIdx)
+    (unwind : UnwindAction)
+    (span : String) :
+    let dest : Place := { local_ := 0, projection := .nil }
+    let offsetOps : List Operand := [
+      .copy { local_ := 1, projection := .nil },
+      .copy { local_ := 2, projection := .nil }
+    ]
+    let ptrOps : List Operand := [.copy { local_ := 1, projection := .nil }]
+    let s : MachineState := {
+      frame := {
+        blockIdx := 0
+        stmtIdx := 0
+        locals := [.uninit, .init (.ptr ptrVal 8), .init (.scalar countSc)]
+      }
+      memory := emptyMemory
+    }
+    evalTerminator s
+        (mkIntrinsicCallTerm "core::intrinsics::arith_offset" .nil
+          offsetOps dest targetBb unwind span) .none =
+      MirStepNode.unsupported ∧
+    evalTerminator s
+        (mkIntrinsicCallTerm "core::intrinsics::size_of_val" .nil
+          ptrOps dest targetBb unwind span) .none =
+      MirStepNode.unsupported ∧
+    evalTerminator s
+        (mkIntrinsicCallTerm "core::intrinsics::align_of_val" .nil
+          ptrOps dest targetBb unwind span) .none =
+      MirStepNode.unsupported := by
+  dsimp only
+  refine ⟨?_, ?_, ?_⟩
+  · have h : classifyRustIntrinsic? "core::intrinsics::arith_offset" = .some .arithOffset := rfl
+    have hEx : stringEq "core::intrinsics::arith_offset" "core::intrinsics::exact_div" = false := rfl
+    unfold evalTerminator mkIntrinsicCallTerm
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+      readProjectedValue, emptyMemory, get?, findCallee?, isDirectExactDivTarget,
+      evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
+      resolveIntrinsicPointeeTy?, intrinsicMissingPointeeStep, operandTy, placeTy]
+  · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
+    have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
+    unfold evalTerminator mkIntrinsicCallTerm
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+      readProjectedValue, emptyMemory, get?, findCallee?, isDirectExactDivTarget,
+      evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
+      resolveIntrinsicPointeeTy?, intrinsicMissingPointeeStep, operandTy, placeTy]
+  · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
+    have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
+    unfold evalTerminator mkIntrinsicCallTerm
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+      readProjectedValue, emptyMemory, get?, findCallee?, isDirectExactDivTarget,
+      evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
+      resolveIntrinsicPointeeTy?, intrinsicMissingPointeeStep, operandTy, placeTy]
+
 end Correspondence.V2026_08_01.L5_ControlAndCalls

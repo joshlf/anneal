@@ -75,7 +75,7 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   anyUnsizedRigidTy isUnsizedRigidTy intrinsicUnresolvedLayoutStep
   intrinsicLastRigidTy? intrinsicTailIsExtern intrinsicTailMayBeUnsized
   intrinsicWidePointeeStep
-  resolveIntrinsicPointeeTy?
+  resolveIntrinsicPointeeTy? intrinsicMissingPointeeStep
   allZeroSizedUnitElemTys isZeroSizedUnitElemTy
   unpackConstEvalSelectArgs? resolveConstEvalSelectTarget?
   writeIntrinsicReturn writeIntrinsicScalarResult
