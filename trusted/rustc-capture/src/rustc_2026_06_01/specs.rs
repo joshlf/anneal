@@ -386,12 +386,16 @@ impl CrateContractIndex {
         companion_def_path: &str,
         mod_parent: ParentKey,
     ) -> String {
-        // When the invariant method is an inherent method `<mod>::<Type>::__anneal_type_invariant_*`,
-        // stripping the trailing `::<fn_ident>` yields the exact canonical path `<mod>::<Type>`.
-        if let Some((parent_path, _fn_name)) = companion_def_path.rsplit_once("::")
-            && parent_path.ends_with(&format!("::{raw_type}"))
-        {
-            return parent_path.to_owned();
+        // When the invariant method is an inherent method `<mod>::<Type>::__anneal_type_invariant_*`
+        // (or `<mod>::<<Type>>::__anneal_type_invariant_*`), stripping the trailing `::<fn_ident>`
+        // yields the exact canonical path `<mod>::<Type>`.
+        if let Some((parent_path, _fn_name)) = companion_def_path.rsplit_once("::") {
+            if parent_path.ends_with(&format!("::{raw_type}")) {
+                return parent_path.to_owned();
+            }
+            if let Some(prefix) = parent_path.strip_suffix(&format!("::<{raw_type}>")) {
+                return format!("{prefix}::{raw_type}");
+            }
         }
         normalize_target_path(
             &self.crate_name,

@@ -288,6 +288,9 @@ fn capture_crate_unit<'tcx>(
             candidate.classification.contract_role.clone(),
         );
         ir_captured.def_path = candidate.def_path.clone();
+        for ti in &mut ir_captured.trait_impls {
+            ti.impl_path = candidate.def_path.clone();
+        }
 
         let item_stem = candidate.item_stem;
         let lean_module_name = format!("Mir.{crate_pascal}.{item_stem}");
@@ -486,6 +489,16 @@ pub fn sanitize_item_module_stem(crate_name: &str, def_path: &str) -> String {
     } else {
         out
     }
+}
+
+/// Returns the hierarchical Lean module segments `["Mir", "<CratePascal>", "<ItemStem>"]`
+/// for a canonical `def_path` in `crate_name`.
+pub fn lean_module_segments_for_def_path(crate_name: &str, def_path: &str) -> Vec<String> {
+    vec![
+        String::from("Mir"),
+        to_pascal_case(crate_name),
+        sanitize_item_module_stem(crate_name, def_path),
+    ]
 }
 
 /// Normalizes command-line arguments when invoked either directly or via Cargo
