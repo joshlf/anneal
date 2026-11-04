@@ -38,6 +38,37 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// If `text[i..]` begins a Rust/Lean character literal (`'c'`, `'α'`, `'\n'`,
+/// `'\x22'`, `'\u{22}'`, etc., as opposed to a Rust lifetime `'a`), returns the
+/// byte index strictly past the closing `'`.
+fn skip_char_literal(text: &str, i: usize) -> Option<usize> {
+    let rest = text.get(i..)?.strip_prefix('\'')?;
+    let mut chars = rest.char_indices();
+    let (_, first) = chars.next()?;
+    match first {
+        '\n' | '\r' | '\'' => None,
+        '\\' => {
+            let (_, esc) = chars.next()?;
+            if esc == '\n' || esc == '\r' {
+                return None;
+            }
+            for (step, (off, ch)) in chars.enumerate() {
+                if step > 12 || ch == '\n' || ch == '\r' {
+                    return None;
+                }
+                if ch == '\'' {
+                    return Some(i + 1 + off + 1);
+                }
+            }
+            None
+        }
+        _ => match chars.next() {
+            Some((off, '\'')) => Some(i + 1 + off + 1),
+            _ => None,
+        },
+    }
+}
+
 /// Drops `//` comments that do not start inside a string or character literal.
 fn strip_line_comments(text: &str) -> String {
     let mut out = String::new();
@@ -50,12 +81,9 @@ fn strip_line_comments(text: &str) -> String {
             match bytes[i] {
                 b'\\' if in_str => i += 1,
                 b'\'' if !in_str => {
-                    if bytes.get(i + 1) == Some(&b'\\') && bytes.get(i + 3) == Some(&b'\'') {
-                        i += 3;
-                    } else if bytes.get(i + 1).is_some_and(|&c| c != b'\'')
-                        && bytes.get(i + 2) == Some(&b'\'')
-                    {
-                        i += 2;
+                    if let Some(next_i) = skip_char_literal(line, i) {
+                        i = next_i;
+                        continue;
                     }
                 }
                 b'"' => in_str = !in_str,
@@ -120,15 +148,8 @@ fn doc_comments(lean: &str) -> Vec<DocComment> {
                 i += 1;
             }
             b'\'' => {
-                if bytes.get(i + 1) == Some(&b'\\')
-                    && bytes.get(i + 2).is_some_and(|&c| c != b'\n')
-                    && bytes.get(i + 3) == Some(&b'\'')
-                {
-                    i += 4;
-                } else if bytes.get(i + 1).is_some_and(|&c| c != b'\n' && c != b'\'')
-                    && bytes.get(i + 2) == Some(&b'\'')
-                {
-                    i += 3;
+                if let Some(next_i) = skip_char_literal(lean, i) {
+                    i = next_i;
                 } else {
                     i += 1;
                 }
@@ -312,7 +333,7 @@ fn extract_quotes(
     let mut section_path: Option<String> = None;
 
     for doc in doc_comments(lean) {
-        if doc.is_module_doc && doc.body.trim_start().starts_with("##") {
+        if doc.is_module_doc && doc.body.trim_start().starts_with('#') {
             let hdr_paths = extract_backticked_corpus_paths(&doc.body, valid_paths);
             section_path = if hdr_paths.len() == 1 {
                 Some(hdr_paths[0].clone())
@@ -416,8 +437,12 @@ fn missing_piece_in<'a>(
         .map(squash)
         .filter(|p| !p.is_empty())
         .collect();
-    if pieces.is_empty() {
-        return Some("<empty quote>".to_string());
+    if pieces.is_empty()
+        || !pieces
+            .iter()
+            .any(|p| p.chars().any(|c| c.is_ascii_alphanumeric()))
+    {
+        return Some("<empty or identifier-free quote>".to_string());
     }
     let mut best_matched = 0usize;
     let mut best_missing: Option<String> = None;
@@ -608,7 +633,7 @@ def amb := 1
 ";
     assert!(extract_quotes(ambiguous, &valid_paths).is_err());
 
-    // A new `##` section header without a file citation resets `section_path`
+    // A new `#` or `##` section header without a file citation resets `section_path`
     // rather than inheriting the previous section's file.
     let reset_sec = "\
 /-! ## Old (`spec/lang/step/operators.md`) -/
@@ -618,4 +643,30 @@ def amb := 1
 def z := 3
 ";
     assert!(extract_quotes(reset_sec, &valid_paths).is_err());
+
+    let reset_h1 = "\
+/-! ## Old (`spec/lang/step/operators.md`) -/
+/-! # Top-level heading with no citation -/
+/-- Quote under uncited top-level heading:
+> \"Add => left + right,\" -/
+def z2 := 4
+";
+    assert!(extract_quotes(reset_h1, &valid_paths).is_err());
+
+    // Hex/unicode/UTF-8 character literals outside comments must not corrupt scanning.
+    let hex_char_lit = "\
+def hexQuote : Char := '\\x22'
+def uniQuote : Char := '\\u{0022}'
+def utf8Char : Char := 'α'
+/-! ## Section (`spec/lang/step/operators.md`) -/
+/-- Quote after hex/unicode char literals:
+> \"Add => left + right,\" -/
+def w := 5
+";
+    let qs3 = extract_quotes(hex_char_lit, &valid_paths).unwrap();
+    assert_eq!(qs3.len(), 1);
+    assert_eq!(qs3[0].cited_file, ops);
+
+    // Punctuation-only elisions (`"{ .. }"`) with no identifier/keyword/literal must fail.
+    assert!(missing_piece_in(&corpus, Some(ops), "{ .. }").is_some());
 }

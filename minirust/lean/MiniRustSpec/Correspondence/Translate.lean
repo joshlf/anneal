@@ -32,13 +32,17 @@ The translation is defined only on the fragment checked by `inFragment`:
 * statements are `_i = Use(copy _j)`, `_i = Use(const c)`,
   `_i = UnaryOp(uop, a)` with `uop ∈ {Neg, Not}`,
   `_i = BinaryOp(op, a, b)` with
-  `op ∈ {Add, Sub, Mul, Div, Rem, AddUnchecked, SubUnchecked, MulUnchecked}`,
+  `op ∈ {Add, Sub, Mul, Div, Rem, BitXor, BitAnd, BitOr, Shl, Shr, AddUnchecked, SubUnchecked, MulUnchecked, ShlUnchecked, ShrUnchecked}`
+  (`a` of `_i`'s integer type `it`, and `b` of `it` for homogeneous binary
+  operators or of any integer type `rhsIt` for the shift operators
+  `Shl, Shr, ShlUnchecked, ShrUnchecked`),
   `_i = Cast(IntToInt, a, targetTy)` (casting an operand `a` of any integer
   type `srcIt` to the destination local's integer type `it`),
   where every operand is `copy _j` (no projections) or an integer constant,
   or `PlaceMention(_i)`;
-* terminators are `Goto`, `SwitchInt` on an integer `copy _j`, `Unreachable`, or
-  `Return`, and every jump target is a block of the body;
+* terminators are `Goto`, `SwitchInt` on an integer operand (`copy _j` or
+  constant), `Unreachable`, or `Return`, and every jump target is a block of the
+  body;
 * no block is a cleanup block.
 
 `Operand::Move` is excluded on purpose: `minimize` translates it exactly like
@@ -142,21 +146,25 @@ def translateUnOp : MirAst.UnOp → Option Gen.IntUnOp
 >  (Rem, Type::Int(_)) => build::rem(l, r),
 >  (Shl, Type::Int(_)) => build::shl(l, r),
 >  (Shr, Type::Int(_)) => build::shr(l, r),
->  ..
+>  (BitAnd, Type::Int(_)) => build::bit_and(l, r),
+>  (BitOr, Type::Int(_)) => build::bit_or(l, r),
+>  (BitXor, Type::Int(_)) => build::bit_xor(l, r),
 >  (AddUnchecked, Type::Int(_)) => build::add_unchecked(l, r),
 >  (SubUnchecked, Type::Int(_)) => build::sub_unchecked(l, r),
 >  (MulUnchecked, Type::Int(_)) => build::mul_unchecked(l, r),
 >  (ShlUnchecked, Type::Int(_)) => build::shl_unchecked(l, r),
 >  (ShrUnchecked, Type::Int(_)) => build::shr_unchecked(l, r),"
 where `build::add(l, r)` is `ValueExpr::BinOp { operator: BinOp::Int(IntBinOp::Add), .. }`
-(and analogously for `Sub`, `Mul`, `Div`, `Rem`, `Shl`, `Shr`, `AddUnchecked`,
-`SubUnchecked`, `MulUnchecked`, `ShlUnchecked`, and `ShrUnchecked`). -/
+(and analogously for the remaining 14 integer `BinOp` variants). -/
 def translateBinOp : MirAst.BinOp → Option Gen.IntBinOp
   | .add => some .Add
   | .sub => some .Sub
   | .mul => some .Mul
   | .div => some .Div
   | .rem => some .Rem
+  | .bitXor => some .BitXor
+  | .bitAnd => some .BitAnd
+  | .bitOr => some .BitOr
   | .shl => some .Shl
   | .shr => some .Shr
   | .addUnchecked => some .AddUnchecked
@@ -370,11 +378,32 @@ def operandOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) (op : MirAst.Op
     decide (operandIntType decls op = some it) && (translateOperand op).isSome
   | _ => false
 
+/-- Whether an `IntBinOp` is a shift operator, which in MiniRust (as in MIR)
+allows the right-hand shift amount to have an integer type unequal to the
+left-hand operand's type (`spec/lang/well-formed.md`):
+> "// Shift operators allow unequal left and right type
+>  if !matches!(int_op, Shl | Shr | ShlUnchecked | ShrUnchecked) {
+>      ensure_wf(left == right, \"BinOp:Int: right and left type are not equal\")?;
+>  }" -/
+def isShiftIntBinOp : Gen.IntBinOp → Bool
+  | .Shl | .Shr | .ShlUnchecked | .ShrUnchecked => true
+  | _ => false
+
 /-- Fragment rvalues of integer type `it`. -/
 def rvalueOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rvalue → Bool
   | .use op => operandOk decls it op
   | .unaryOp uop op => (translateUnOp uop).isSome && operandOk decls it op
-  | .binaryOp op a b => (translateBinOp op).isSome && operandOk decls it a && operandOk decls it b
+  | .binaryOp op a b =>
+    match translateBinOp op with
+    | none => false
+    | some iop =>
+      operandOk decls it a &&
+      if isShiftIntBinOp iop then
+        match operandIntType decls b with
+        | some rhsIt => operandOk decls rhsIt b
+        | none => false
+      else
+        operandOk decls it b
   | .cast .intToInt op targetTy =>
     decide (intTypeOf targetTy = some it) &&
     match operandIntType decls op with
@@ -399,13 +428,13 @@ def terminatorOk (decls : List MirAst.LocalDecl) (nblocks : Nat) (t : MirAst.Ter
   match t.kind with
   | .goto target => decide (target < nblocks)
   | .switchInt discr targets =>
-    match discr, operandIntType decls discr with
-    | .copy ⟨j, []⟩, some it =>
-      decide (j < decls.length) &&
+    match operandIntType decls discr with
+    | some it =>
+      operandOk decls it discr &&
       targets.branches.all (fun p => decide (p.1 < 2 ^ (8 * it.size.bytes)) && decide (p.2 < nblocks)) &&
       (targets.branches.map Prod.fst).Nodup &&
       decide (targets.otherwise < nblocks)
-    | _, _ => false
+    | none => false
   | .unreachable => true
   | .return_ => true
   | _ => false

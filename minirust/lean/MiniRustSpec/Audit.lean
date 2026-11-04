@@ -102,6 +102,10 @@ open MiniRustSpec.Correspondence in
   shiftLeftBits_intFromBits
   shiftRightUnsigned_intFromBits
   arithmeticShrBits_intFromBits
+  bitwiseAndBits_intFromBits
+  bitwiseOrBits_intFromBits
+  bitwiseXorBits_intFromBits
+  rvalueOk_binaryOp
   castBits_eq_toNat
   switch_lookup
   translateFn_spec
@@ -223,6 +227,26 @@ open MiniRustSpec.Correspondence.Witness in
   shlUncheckedNegUb_anneal_ub
   shlUncheckedNegUb_minirust_ub_from_start
   shlUncheckedNegUb_minirust_direct
+  bitwiseI8_inFragment
+  bitwiseI8_translate
+  bitwiseNeg_anneal_ret
+  bitwiseNeg_noUB
+  bitwiseNeg_minirust_ret_from_start
+  bitwiseNeg_minirust_direct
+  countOnes_neg86_i8
+  countOnes_neg1_i8
+  heteroShiftSwitch_inFragment
+  heteroShiftSwitch_translate
+  heteroShiftOk_anneal_ret
+  heteroShiftOk_noUB
+  heteroShiftOk_minirust_ret_from_start
+  heteroShiftOk_minirust_direct
+  heteroShrGe8Ub_anneal_ub
+  heteroShrGe8Ub_minirust_ub_from_start
+  heteroShrGe8Ub_minirust_direct
+  heteroShrNegUb_anneal_ub
+  heteroShrNegUb_minirust_ub_from_start
+  heteroShrNegUb_minirust_direct
 
 #assert_standard_axioms MiniRustSpec.Anchors.anchors_ok
 

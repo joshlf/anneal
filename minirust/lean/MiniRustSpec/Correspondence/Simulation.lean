@@ -313,18 +313,12 @@ theorem terminatorOk_switch {decls : List LocalDecl} {nblocks : Nat} {t : MirAst
     {discr : Operand} {targets : SwitchTargets} {it : Gen.IntType}
     (h : terminatorOk decls nblocks t = true) (hk : t.kind = .switchInt discr targets)
     (hit : operandIntType decls discr = some it) :
-    (∃ j, discr = .copy ⟨j, []⟩ ∧ j < decls.length) ∧
+    operandOk decls it discr = true ∧
     (∀ p ∈ targets.branches, p.1 < 2 ^ (8 * it.size.bytes) ∧ p.2 < nblocks) ∧
     targets.otherwise < nblocks := by
-  simp only [terminatorOk, hk, hit] at h
-  match discr, h with
-  | .copy ⟨j, []⟩, h =>
-    simp only [Bool.and_eq_true, decide_eq_true_eq, List.all_eq_true] at h
-    obtain ⟨⟨⟨hj, hbr⟩, _⟩, ho⟩ := h
-    exact ⟨⟨j, rfl, hj⟩, hbr, ho⟩
-  | .copy ⟨_, _ :: _⟩, h => simp at h
-  | .move _, h => simp at h
-  | .constant _, h => simp at h
+  simp only [terminatorOk, hk, hit, Bool.and_eq_true, decide_eq_true_eq, List.all_eq_true] at h
+  obtain ⟨⟨⟨hokd, hbr⟩, _⟩, ho⟩ := h
+  exact ⟨hokd, hbr, ho⟩
 
 theorem lookupSwitchTarget_lt (bits : Nat) (branches : List (Nat × Nat)) (otherwise n : Nat)
     (hbr : ∀ p ∈ branches, p.2 < n) (ho : otherwise < n) :
@@ -514,14 +508,12 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
       exact StepRel.tau' m3 (by simp [htt, Interp.evalTerminator, hm3, check_after h3])
         (hrel.goto t ht h3)
     · -------------------------------------------------------------- switchInt
-      obtain ⟨⟨j, rfl, hj⟩, hbr, hother⟩ := terminatorOk_switch hterm hk hit
-      have hokd : operandOk body.localDecls it (.copy ⟨j, []⟩) = true := by
-        simp [operandOk, hj, hit]
-      obtain ⟨hMok, hMnone⟩ := evalValue_operand hframe it (.copy ⟨j, []⟩) hokd v hv
+      obtain ⟨hokd, hbr, hother⟩ := terminatorOk_switch hterm hk hit
+      obtain ⟨hMok, hMnone⟩ := evalValue_operand hframe it discr hokd v hv
       obtain ⟨hAok, hAnone⟩ := evalOperand_frag body.localDecls s.frame.locals hslotsA
-        hrel.nlocals it (.copy ⟨j, []⟩) hokd s.memory.borrows s.memory.globals body.layouts
+        hrel.nlocals it discr hokd s.memory.borrows s.memory.globals body.layouts
         s.memory.callerLocals
-      cases hb : opBits s.frame.locals (.copy ⟨j, []⟩) with
+      cases hb : opBits s.frame.locals discr with
       | none =>
         have hA : evalTerminator s bb.terminator (some body) = MirStepNode.fail .ub := by
           simp [MirSemantics.evalTerminator, hk, hAnone hb]

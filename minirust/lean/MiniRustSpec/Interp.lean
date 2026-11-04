@@ -40,11 +40,12 @@ here.
   (`spec/lang/step/statements.md`).
 * `PlaceExpr::Local` (`spec/lang/step/expressions.md`).
 * `ValueExpr::Constant` for `Constant::Int`/`Constant::Bool`, `ValueExpr::Load`,
-  `ValueExpr::UnOp` with `UnOp::Int` (`IntUnOp::{Neg, BitNot}`) and
-  `UnOp::Cast(CastOp::IntToInt)`, and `ValueExpr::BinOp` with `BinOp::Int`
-  (`IntBinOp::{Add, AddUnchecked, Sub, SubUnchecked, Mul, MulUnchecked, Div,
-  DivExact, Rem}`) (`spec/lang/step/expressions.md`,
-  `spec/lang/step/operators.md`).
+  `ValueExpr::UnOp` with `UnOp::Int` (all `IntUnOp` variants: `Neg`, `BitNot`,
+  `CountOnes`) and `UnOp::Cast(CastOp::IntToInt)`, and `ValueExpr::BinOp` with
+  `BinOp::Int` (all `IntBinOp` variants: `Add`, `AddUnchecked`, `Sub`,
+  `SubUnchecked`, `Mul`, `MulUnchecked`, `Div`, `DivExact`, `Rem`, `Shl`, `Shr`,
+  `ShlUnchecked`, `ShrUnchecked`, `BitAnd`, `BitOr`, `BitXor`)
+  (`spec/lang/step/expressions.md`, `spec/lang/step/operators.md`).
 * `Terminator::Goto`, `Terminator::Switch`, `Terminator::Unreachable`, and
   `Terminator::Return` (`spec/lang/step/terminators.md`), including frame
   teardown, `storage_dead` of every local, and both stack-pop actions.
@@ -156,6 +157,35 @@ def bringInBounds (i : Int) (signed : Signedness) (size : Size) : Int :=
   match signed with
   | .Unsigned => r
   | .Signed => if r < (2 : Int) ^ (Size.bits size - 1) then r else r - m
+
+/-- Termination measure for two's-complement bitwise recursion on `libspecr::Int`
+(`num_bigint::BigInt`), measuring distance from the two sign-extension fixed
+points `0` (`...000₂`) and `-1` (`...111₂`) of Euclidean floor division by `2`. -/
+def intBitMeasure (x : Int) : Nat :=
+  if x < 0 then (-x - 1).toNat else x.toNat
+
+/-- Structural recursion over the two's-complement bits of `a : Int` until `a`
+reaches one of the two sign-extension fixed points `0` (`...000₂`) or `-1`
+(`...111₂`) of Euclidean floor division by `2`. -/
+def intBitRec (onZero : Int → Int) (onNegOne : Int → Int) (bitFn : Int → Int → Int) :
+    Nat → Int → Int → Int
+  | 0, a, b => if a = 0 then onZero b else onNegOne b
+  | n + 1, a, b =>
+    if a = 0 then onZero b
+    else if a = -1 then onNegOne b
+    else 2 * intBitRec onZero onNegOne bitFn n (a / 2) (b / 2) + bitFn (a % 2) (b % 2)
+
+/-- Two's-complement bitwise AND `left & right` on `libspecr::Int`. -/
+def intBitAnd (a b : Int) : Int :=
+  intBitRec (fun _ => 0) (fun b => b) (fun x y => if x = 1 ∧ y = 1 then 1 else 0) (intBitMeasure a) a b
+
+/-- Two's-complement bitwise OR `left | right` on `libspecr::Int`. -/
+def intBitOr (a b : Int) : Int :=
+  intBitRec (fun b => b) (fun _ => -1) (fun x y => if x = 1 ∨ y = 1 then 1 else 0) (intBitMeasure a) a b
+
+/-- Two's-complement bitwise XOR `left ^ right` on `libspecr::Int`. -/
+def intBitXor (a b : Int) : Int :=
+  intBitRec (fun b => b) (fun b => -b - 1) (fun x y => if x = y then 0 else 1) (intBitMeasure a) a b
 
 /-- Little-endian bytes of the natural number `u`, `n` bytes long. -/
 def leBytes (u : Nat) : Nat → List UInt8
@@ -672,7 +702,29 @@ def evalConstant : Constant → Interp Val
 
 /-! ## Operators (`spec/lang/step/operators.md`) -/
 
-/-- `Machine::eval_int_un_op` for `Neg` and `BitNot` (`spec/lang/step/operators.md`):
+/-- Bit-extraction loop of `Machine::eval_count_ones` for `n` remaining bit
+positions (`spec/lang/step/operators.md`). -/
+def countOnesLoop : Nat → Int → Int → Int
+  | 0, ones, _ => ones
+  | n + 1, ones, remainingBits =>
+    countOnesLoop n (ones + intBitAnd remainingBits 1) (remainingBits / 2)
+
+/-- `Machine::eval_count_ones` (`spec/lang/step/operators.md`):
+> "fn eval_count_ones(operand: Int, int_ty: IntType) -> Int {
+>     let mut ones = Int::ZERO;
+>     let mut remaining_bits = operand;
+>     // Iterate once per bit in the bit width, afterwards the remaining bits are leading bits only.
+>     for _ in Int::ZERO..int_ty.size.bits() {
+>         // Extract the least significant bit and update `remaining_bits` to remove that bit.
+>         ones += remaining_bits & Int::ONE;
+>         remaining_bits >>= 1;
+>     }
+>     ones
+> }" -/
+def evalCountOnes (operand : Int) (intTy : IntType) : Int :=
+  countOnesLoop (Size.bits intTy.size) 0 operand
+
+/-- `Machine::eval_int_un_op` (`spec/lang/step/operators.md`):
 > "fn eval_int_un_op(op: IntUnOp, operand: Int, operand_ty: IntType) -> Result<Int> {
 >     use IntUnOp::*;
 >     ret(match op {
@@ -681,7 +733,8 @@ def evalConstant : Constant → Interp Val
 >         // Put the result into the right range (in case of a unsigned numbers, which `!`
 >         // makes negative by inverting all the leading zeros).
 >         BitNot => operand_ty.bring_in_bounds(!operand),
->         ..
+>         // This can never overflow, as the total number of bits is below `u32::MAX`.
+>         CountOnes => Self::eval_count_ones(operand, operand_ty),
 >     })
 > }"
 On mathematical integers (`libspecr::Int` / `num_bigint::BigInt`), two's-complement
@@ -690,7 +743,7 @@ def evalIntUnOp (op : IntUnOp) (operand : Int) (operandTy : IntType) : Interp In
   match op with
   | .Neg => pure (IntType.bring_in_bounds operandTy (-operand))
   | .BitNot => pure (IntType.bring_in_bounds operandTy (-operand - 1))
-  | _ => unsupported "eval_int_un_op for CountOnes"
+  | .CountOnes => pure (evalCountOnes operand operandTy)
 
 /-- `Machine::eval_cast_op` for `CastOp::IntToInt` (`spec/lang/step/operators.md`):
 > "fn eval_cast_op(&self, cast_op: CastOp, (operand, old_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
@@ -743,8 +796,8 @@ def evalUnOp (op : UnOp) (arg : Val × «Type») : Interp (Val × «Type») :=
   | .Cast castOp, arg => evalCastOp castOp arg
   | _, _ => unsupported "eval_un_op for an operator outside UnOp::Int and UnOp::Cast"
 
-/-- `Machine::eval_int_bin_op` for wrapping, unchecked, division/remainder,
-and shift integer arithmetic (`spec/lang/step/operators.md`):
+/-- `Machine::eval_int_bin_op` across all `IntBinOp` variants
+(`spec/lang/step/operators.md`):
 > "Add => left + right,
 >  AddUnchecked => {
 >      let result = left + right;
@@ -820,12 +873,16 @@ and shift integer arithmetic (`spec/lang/step/operators.md`):
 >          ShrUnchecked => left >> right,
 >          _ => panic!(),
 >      }
->  }"
+>  }
+>  BitAnd => left & right,
+>  BitOr => left | right,
+>  BitXor => left ^ right,"
 On `libspecr::Int` (`num_bigint::BigInt`), Rust's `/` and `%` round toward zero
-(`Int.tdiv` and `Int.tmod`), whereas Euclidean remainder `.rem_euclid(bits)` for
-`bits > 0` is Lean's `right % bits` (`Int.emod`), and two's-complement bit
-shifts `left << k` and `left >> k` for `k ≥ 0` are `left * 2 ^ k` and Euclidean
-floor division `left / 2 ^ k` (`Int.ediv`). -/
+(`Int.tdiv` and `Int.tmod`), Euclidean remainder `.rem_euclid(bits)` for
+`bits > 0` is Lean's `right % bits` (`Int.emod`), two's-complement bit shifts
+`left << k` and `left >> k` for `k ≥ 0` are `left * 2 ^ k` and Euclidean floor
+division `left / 2 ^ k` (`Int.ediv`), and `&`, `|`, `^` are two's-complement
+bitwise operations (`intBitAnd`, `intBitOr`, `intBitXor`). -/
 def evalIntBinOp (op : IntBinOp) (left right : Int) (leftTy : IntType) : Interp Int :=
   match op with
   | .Add => pure (left + right)
@@ -876,7 +933,9 @@ def evalIntBinOp (op : IntBinOp) (left right : Int) (leftTy : IntType) : Interp 
     let bits : Int := Size.bits leftTy.size
     if right < 0 ∨ right ≥ bits then ub "overflow in unchecked shift"
     else pure (left / (2 : Int) ^ right.toNat)
-  | _ => unsupported "eval_int_bin_op for a bitwise operator"
+  | .BitAnd => pure (intBitAnd left right)
+  | .BitOr => pure (intBitOr left right)
+  | .BitXor => pure (intBitXor left right)
 
 /-- `Machine::eval_bin_op` for `BinOp::Int` (`spec/lang/step/operators.md`):
 > "let Type::Int(int_ty) = l_ty else { panic!(\"non-integer input to integer operation\") };

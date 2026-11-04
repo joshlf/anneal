@@ -410,6 +410,9 @@ def intBinEval (iop : Gen.IntBinOp) (l r : Int) (it : Gen.IntType) : Option Int 
   | .ShrUnchecked =>
     let bits : Int := Size.bits it.size
     if r < 0 ∨ r ≥ bits then none else some (l / (2 : Int) ^ r.toNat)
+  | .BitAnd => some (intBitAnd l r)
+  | .BitOr => some (intBitOr l r)
+  | .BitXor => some (intBitXor l r)
   | _ => none
 
 theorem evalIntBinOp_spec (op : MirAst.BinOp) (iop : Gen.IntBinOp)
@@ -417,7 +420,8 @@ theorem evalIntBinOp_spec (op : MirAst.BinOp) (iop : Gen.IntBinOp)
     (∀ z, intBinEval iop l r it = some z → evalIntBinOp iop l r it = .ok z) ∧
     (intBinEval iop l r it = none → ∃ msg, evalIntBinOp iop l r it = .error (.ub msg)) := by
   match op, hop with
-  | .add, hop | .sub, hop | .mul, hop | .shl, hop | .shr, hop =>
+  | .add, hop | .sub, hop | .mul, hop | .bitXor, hop | .bitAnd, hop | .bitOr, hop
+  | .shl, hop | .shr, hop =>
     simp [translateBinOp] at hop; subst hop; simp [intBinEval, evalIntBinOp]
   | .addUnchecked, hop =>
     simp [translateBinOp] at hop; subst hop
@@ -446,6 +450,43 @@ theorem evalIntBinOp_spec (op : MirAst.BinOp) (iop : Gen.IntBinOp)
   | .shrUnchecked, hop =>
     simp [translateBinOp] at hop; subst hop
     by_cases hoob : r < 0 ∨ r ≥ Size.bits it.size <;> simp [intBinEval, evalIntBinOp, hoob, ub]
+
+theorem operandIntType_of_operandOk {decls : List LocalDecl} {it : Gen.IntType} {op : Operand}
+    (h : operandOk decls it op = true) : operandIntType decls op = some it := by
+  match op, h with
+  | .copy ⟨_, []⟩, h =>
+    simp only [operandOk, Bool.and_eq_true, decide_eq_true_eq] at h
+    exact h.2
+  | .constant _, h =>
+    simp only [operandOk, Bool.and_eq_true, decide_eq_true_eq] at h
+    exact h.1
+
+theorem rvalueOk_binaryOp {decls : List LocalDecl} {it : Gen.IntType}
+    {op : MirAst.BinOp} {a b : Operand}
+    (h : rvalueOk decls it (.binaryOp op a b) = true) :
+    ∃ iop rhsIt,
+      translateBinOp op = some iop ∧
+      operandOk decls it a = true ∧
+      operandIntType decls b = some rhsIt ∧
+      operandOk decls rhsIt b = true ∧
+      (isShiftIntBinOp iop = false → rhsIt = it) := by
+  simp only [rvalueOk] at h
+  cases hiop : translateBinOp op with
+  | none => simp [hiop] at h
+  | some iop =>
+    simp only [hiop, Bool.and_eq_true] at h
+    obtain ⟨hoka, hokb⟩ := h
+    cases hsh : isShiftIntBinOp iop with
+    | true =>
+      simp only [hsh, ↓reduceIte] at hokb
+      cases hrhs : operandIntType decls b with
+      | none => simp [hrhs] at hokb
+      | some rhsIt =>
+        simp only [hrhs] at hokb
+        exact ⟨iop, rhsIt, rfl, hoka, rfl, hokb, fun hf => by rw [hsh] at hf; cases hf⟩
+    | false =>
+      simp only [hsh, Bool.false_eq_true, ↓reduceIte] at hokb
+      exact ⟨iop, it, rfl, hoka, operandIntType_of_operandOk hokb, hokb, fun _ => rfl⟩
 
 /-- Hypotheses describing a callee frame related to Anneal locals `locals`. -/
 structure FrameOk (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (locals : List LocalSlot)
@@ -546,9 +587,10 @@ def rvBits (decls : List LocalDecl) (locals : List LocalSlot) (it : Gen.IntType)
     pure (intUnArith iuop x % 2 ^ (8 * it.size.bytes)).toNat
   | .binaryOp op a b => do
     let iop ← translateBinOp op
+    let rhsIt ← operandIntType decls b
     let x ← opBits locals a
     let y ← opBits locals b
-    let z ← intBinEval iop (intFromBits x it) (intFromBits y it) it
+    let z ← intBinEval iop (intFromBits x it) (intFromBits y rhsIt) it
     pure (z % 2 ^ (8 * it.size.bytes)).toNat
   | .cast .intToInt op _ => do
     let srcIt ← operandIntType decls op
@@ -629,9 +671,7 @@ theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
         cases uop <;> simp [translateUnOp] at hiuop <;> subst hiuop <;>
           simp [evalValue, hm1, evalUnOp, heval, hbring, checkValue, hrep]
   | .binaryOp op a b, hok, he =>
-    simp only [rvalueOk, Bool.and_eq_true] at hok
-    obtain ⟨⟨hop, hoka⟩, hokb⟩ := hok
-    obtain ⟨iop, hiop⟩ := Option.isSome_iff_exists.mp hop
+    obtain ⟨iop, rhsIt, hiop, hoka, hrhsTy, hokb, _⟩ := rvalueOk_binaryOp hok
     simp only [translateRvalue, hiop, Option.bind_eq_bind] at he
     cases hea : translateOperand a with
     | none => simp [hea] at he
@@ -644,29 +684,29 @@ theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
         obtain ⟨haok, hanone⟩ := evalValue_operand h it a hoka ea hea
         cases hxa : opBits locals a with
         | none =>
-          refine ⟨fun r hr => by simp [rvBits, hiop, hxa] at hr, fun _ => ?_⟩
+          refine ⟨fun r hr => by simp [rvBits, hiop, hrhsTy, hxa] at hr, fun _ => ?_⟩
           obtain ⟨msg, hmsg⟩ := hanone hxa
           exact ⟨msg, by simp [evalValue, hmsg]⟩
         | some x =>
           obtain ⟨hx, m1, hm1, h1⟩ := haok x hxa
-          obtain ⟨hbok, hbnone⟩ := evalValue_operand h1 it b hokb eb heb
+          obtain ⟨hbok, hbnone⟩ := evalValue_operand h1 rhsIt b hokb eb heb
           cases hyb : opBits locals b with
           | none =>
-            refine ⟨fun r hr => by simp [rvBits, hiop, hxa, hyb] at hr, fun _ => ?_⟩
+            refine ⟨fun r hr => by simp [rvBits, hiop, hrhsTy, hxa, hyb] at hr, fun _ => ?_⟩
             obtain ⟨msg, hmsg⟩ := hbnone hyb
             exact ⟨msg, by simp [evalValue, hm1, hmsg]⟩
           | some y =>
             obtain ⟨_, m2, hm2, h2⟩ := hbok y hyb
             obtain ⟨hevalOk, hevalNone⟩ :=
-              evalIntBinOp_spec op iop hiop (intFromBits x it) (intFromBits y it) it
-            cases hz : intBinEval iop (intFromBits x it) (intFromBits y it) it with
+              evalIntBinOp_spec op iop hiop (intFromBits x it) (intFromBits y rhsIt) it
+            cases hz : intBinEval iop (intFromBits x it) (intFromBits y rhsIt) it with
             | none =>
-              refine ⟨fun r hr => by simp [rvBits, hiop, hxa, hyb, hz] at hr, fun _ => ?_⟩
+              refine ⟨fun r hr => by simp [rvBits, hiop, hrhsTy, hxa, hyb, hz] at hr, fun _ => ?_⟩
               obtain ⟨msg, hmsg⟩ := hevalNone hz
               exact ⟨msg, by simp [evalValue, hm1, hm2, evalBinOp, hmsg]⟩
             | some z =>
-              refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits, hiop, hxa, hyb, hz] at hnone⟩
-              simp [rvBits, hiop, hxa, hyb, hz] at hr
+              refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits, hiop, hrhsTy, hxa, hyb, hz] at hnone⟩
+              simp [rvBits, hiop, hrhsTy, hxa, hyb, hz] at hr
               subst hr
               have hpos := two_pow_pos (8 * it.size.bytes)
               refine ⟨?_, m2, ?_, h2⟩

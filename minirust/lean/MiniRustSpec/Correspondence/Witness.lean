@@ -63,6 +63,22 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
   `-128 - (-2) = -126`, `-126 + 127 = 1`) and triggering each operator's
   signed overflow UB (`mirCall_ub`, `mirCall_outcome`, and direct checks of
   MiniRust's `throw_ub!` messages).
+* `branchSpinLoop`: diverging conditional `while x != 0 {}` loop emitting a
+  visible `.emit` branch event on every iteration (`treeSafe_of_step_inv`,
+  `noRet_of_step_inv`, and `mirCall_diverges_rel`).
+* `shiftI8` and `shlUncheckedI8`: signed `i8` `Shr`, `Shl`, `ShrUnchecked`, and
+  `ShlUnchecked` including negative shift counts wrapped via `.rem_euclid(8)` and
+  all four unchecked-shift UB paths (`s >= bits` and `s < 0`).
+* `bitwiseI8` (plus `countOnes_neg86_i8` / `countOnes_neg1_i8`): signed `i8`
+  two's-complement `BitAnd`, `BitOr`, and `BitXor` on negative operands
+  (including cancellation of infinite leading two's-complement `1` bits under
+  `BitXor`), alongside ground-truth checks of `IntUnOp::CountOnes` returning
+  `u32` on negative `i8` inputs.
+* `heteroShiftSwitch`: mixed-type `(i8, u32)` wrapping `Shr` / `Shl` with shift
+  counts `258u32, 257u32 >= 256`, constant-discriminant `SwitchInt` on `-1i8`,
+  and heterogeneous `(i8, i32)` `ShrUnchecked` / `ShlUnchecked` both succeeding
+  at `k = 3i32` and faulting with UB at `k = 8i32` (`8 >= i8::BITS` even though
+  `8 < i32::BITS`) and `k = -1i32` (`-1 < 0`).
 -/
 
 namespace MiniRustSpec.Correspondence.Witness
@@ -1625,5 +1641,300 @@ theorem shlUncheckedNegUb_minirust_ub_from_start :
 
 theorem shlUncheckedNegUb_minirust_direct :
     Interp.steps 2 shlUncheckedNegUbMInit = .error (.ub "overflow in unchecked shift") := rfl
+
+/-! ## Signed two's-complement bitwise operators (`BitAnd`, `BitOr`, `BitXor`) and `CountOnes` -/
+
+/-- MIR (`Runtime(PostCleanup)`) of
+```rust
+fn bitwise_i8(mut a: i8, b: i8) -> i8 {
+    a = a & b;        // bb0: _1 = BitAnd(copy _1, copy _2)
+    a = a | -123i8;   //      _1 = BitOr(copy _1, const -123i8)
+    a ^ -59i8         //      _0 = BitXor(copy _1, const -59i8); return
+}
+```
+where `-123i8` has bit pattern `133` (`0x85`) and `-59i8` has bit pattern `197`
+(`0xC5`). -/
+def bitwiseI8 : CapturedMir where
+  defPath := "witness::bitwise_i8"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [i8Decl, i8Decl, i8Decl]
+  basicBlocks := [{
+    statements := [
+      mkStmt (.assign (local_ 1) (.binaryOp .bitAnd (.copy (local_ 1)) (.copy (local_ 2)))),
+      mkStmt (.assign (local_ 1) (.binaryOp .bitOr (.copy (local_ 1)) (constI8 133))),
+      mkStmt (.assign (local_ 0) (.binaryOp .bitXor (.copy (local_ 1)) (constI8 197)))],
+    terminator := mkTerm .return_,
+    isCleanup := false }]
+  fnAbi := fnAbiI8 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem bitwiseI8_inFragment : inFragment bitwiseI8 = true := by decide
+
+def bitwiseI8Fn : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i8)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 1))
+        (.BinOp (.Int .BitAnd) (.Load (.Local (localName 1))) (.Load (.Local (localName 2)))),
+      .Assign (.Local (localName 1))
+        (.BinOp (.Int .BitOr) (.Load (.Local (localName 1))) (.Constant (.Int (-123)) (.Int i8))),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .BitXor) (.Load (.Local (localName 1))) (.Constant (.Int (-59)) (.Int i8)))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem bitwiseI8_translate : translateFn bitwiseI8 = some bitwiseI8Fn := rfl
+
+/-- Input `(-86i8, -15i8)` (bits `170 = 0xAA`, `241 = 0xF1`):
+`(-86i8) & (-15i8) = -96i8` (bits `160 = 0xA0`),
+`(-96i8) | (-123i8) = -91i8` (bits `165 = 0xA5`),
+`(-91i8) ^ (-59i8) = 96i8` (bits `96 = 0x60`, cancelling the infinite leading
+two's-complement `1` bits of both negative `libspecr::Int` operands). -/
+def bitwiseNegS0 : MachineState := initMachineState bitwiseI8 [.scalar ⟨170, 1⟩, .scalar ⟨241, 1⟩]
+def bitwiseNegMInit : Mach :=
+  machineWithCtx ctxI8_3 bitwiseI8 bitwiseI8Fn bitwiseNegS0.frame.locals bitwiseI8Fn.start
+
+theorem bitwiseNeg_anneal_ret :
+    ReachesRet (mirCallTree bitwiseI8 [.scalar ⟨170, 1⟩, .scalar ⟨241, 1⟩]) []
+      (.normal (.scalar ⟨96, 1⟩, bitwiseNegS0.memory)) :=
+  runA_sound bitwiseI8 10 _ _ _ rfl
+
+theorem bitwiseNeg_noUB :
+    MirNoUBTree (mirCallTree bitwiseI8 [.scalar ⟨170, 1⟩, .scalar ⟨241, 1⟩]) :=
+  runA_noUB bitwiseI8 10 _ _ _ rfl
+
+theorem bitwiseNeg_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n bitwiseNegMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 96 } ∧
+      m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret bitwiseI8_inFragment bitwiseI8_translate ctxI8_3 (ctxI8_ok3 rfl)
+      [.scalar ⟨170, 1⟩, .scalar ⟨241, 1⟩] (by decide) bitwiseNegMInit rfl rfl rfl bitwiseNeg_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [bitwiseI8] at hd; subst hd
+  simp [retPtr, ctxI8_3] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_3] at hr; subst hr
+  have hbits : bits = 96 := by
+    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxI8_3, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+
+theorem bitwiseNeg_minirust_direct :
+    (Interp.steps 5 bitwiseNegMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 96 }, [1]) := rfl
+
+/-- Direct ground-truth checks of `IntUnOp::CountOnes` (`eval_count_ones`):
+`-86i8` (`0b1010_1010` modulo `2^8`) has `4` ones and `-1i8` (`0b1111_1111`
+modulo `2^8`) has `8` ones, both returning `u32`. -/
+theorem countOnes_neg86_i8 :
+    evalUnOp (.Int .CountOnes) (.Int (-86), .Int i8) = .ok (.Int 4, .Int u32) := rfl
+
+theorem countOnes_neg1_i8 :
+    evalUnOp (.Int .CountOnes) (.Int (-1), .Int i8) = .ok (.Int 8, .Int u32) := rfl
+
+/-! ## Heterogeneous shifts (`(i8, u32)`, `(i8, i32)`) and constant-discriminant `SwitchInt` -/
+
+def i32Ty : Ty := { kind := .int .i32, layoutIdx := 0 }
+def i32Decl : LocalDecl := { mutability := .mut, ty := i32Ty, debugName := none }
+def i32 : Gen.IntType := ⟨.Signed, ⟨4⟩⟩
+
+def i32Layout : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false }
+
+def fnAbiHeteroShift : FnAbi :=
+  { args := [{ layout := i8Layout, mode := .direct },
+             { layout := i32Layout, mode := .direct }],
+    ret := { layout := i8Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+theorem ctxI8_ok_hetero {body : CapturedMir}
+    (h : body.localDecls = [i8Decl, i8Decl, i32Decl]) : CtxOk body ctxI8_3 where
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | 2, hd => simp at hd; subst hd; decide
+    | _ + 3, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MIR (`Runtime(PostCleanup)`) of
+```rust
+fn hetero_shift_switch(mut x: i8, k: i32) -> i8 {
+    x = x >> 258u32;                // bb0: _1 = Shr(copy _1, const 258u32)   -- (i8, u32)
+    x = x << 257u32;                //      _1 = Shl(copy _1, const 257u32)   -- (i8, u32)
+    match -1i8 {                    //      switchInt(const -1i8) -> [-1i8: bb1, otherwise: bb2]
+        -1 => {
+            x = unchecked_shr(x, k); // bb1: _1 = ShrUnchecked(copy _1, copy _2) -- (i8, i32)
+            unchecked_shl(x, k)      //      _0 = ShlUnchecked(copy _1, copy _2); return
+        }
+        _ => unreachable!(),        // bb2: unreachable
+    }
+}
+```
+exercising unequal `(lhs, rhs)` shift operand types (`(i8, u32)` and `(i8, i32)`)
+together with a constant-operand signed `SwitchInt` scrutinee. -/
+def heteroShiftSwitch : CapturedMir where
+  defPath := "witness::hetero_shift_switch"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [i8Decl, i8Decl, i32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 1) (.binaryOp .shr (.copy (local_ 1)) (constU32 258))),
+        mkStmt (.assign (local_ 1) (.binaryOp .shl (.copy (local_ 1)) (constU32 257)))],
+      terminator := mkTerm (.switchInt (constI8 255)
+        { branches := [(255, 1)], otherwise := 2 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 1) (.binaryOp .shrUnchecked (.copy (local_ 1)) (.copy (local_ 2)))),
+        mkStmt (.assign (local_ 0) (.binaryOp .shlUnchecked (.copy (local_ 1)) (.copy (local_ 2))))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [], terminator := mkTerm .unreachable, isCleanup := false }]
+  fnAbi := fnAbiHeteroShift
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem heteroShiftSwitch_inFragment : inFragment heteroShiftSwitch = true := by decide
+
+def heteroShiftSwitchFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i32)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 1))
+        (.BinOp (.Int .Shr) (.Load (.Local (localName 1))) (.Constant (.Int 258) (.Int u32))),
+      .Assign (.Local (localName 1))
+        (.BinOp (.Int .Shl) (.Load (.Local (localName 1))) (.Constant (.Int 257) (.Int u32)))],
+      .Switch (.Constant (.Int (-1)) (.Int i8)) ⟨[(-1, bbName 1)]⟩ (bbName 2), .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 1))
+        (.BinOp (.Int .ShrUnchecked) (.Load (.Local (localName 1))) (.Load (.Local (localName 2)))),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .ShlUnchecked) (.Load (.Local (localName 1))) (.Load (.Local (localName 2))))],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[], .Unreachable, .Regular⟩),
+    (bbName 3, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 3
+  implicit_writes := true
+
+theorem heteroShiftSwitch_translate : translateFn heteroShiftSwitch = some heteroShiftSwitchFn := rfl
+
+/-- Input `(-64i8, 3i32)` (bits `192`, `3`):
+`-64i8 >> 258u32 = -64i8 >> 2 = -16i8` (bits `240`, with `258 >= 256`),
+`-16i8 << 257u32 = -16i8 << 1 = -32i8` (bits `224`, with `257 >= 256`),
+`switchInt(const -1i8)` takes the `-1` arm to `bb1`,
+`unchecked_shr(-32i8, 3i32) = -4i8` (bits `252`), and
+`unchecked_shl(-4i8, 3i32) = -32i8` (bits `224`). -/
+def heteroShiftOkS0 : MachineState :=
+  initMachineState heteroShiftSwitch [.scalar ⟨192, 1⟩, .scalar ⟨3, 4⟩]
+def heteroShiftOkMInit : Mach :=
+  machineWithCtx ctxI8_3 heteroShiftSwitch heteroShiftSwitchFn
+    heteroShiftOkS0.frame.locals heteroShiftSwitchFn.start
+
+def heteroShiftOkTrace : List (Event MirEffect) :=
+  [⟨.inr (.inl (.emit (.event 255))), PUnit.unit⟩]
+
+theorem heteroShiftOk_anneal_ret :
+    ReachesRet (mirCallTree heteroShiftSwitch [.scalar ⟨192, 1⟩, .scalar ⟨3, 4⟩])
+      heteroShiftOkTrace (.normal (.scalar ⟨224, 1⟩, heteroShiftOkS0.memory)) :=
+  runA_sound heteroShiftSwitch 10 _ _ _ rfl
+
+theorem heteroShiftOk_noUB :
+    MirNoUBTree (mirCallTree heteroShiftSwitch [.scalar ⟨192, 1⟩, .scalar ⟨3, 4⟩]) :=
+  runA_noUB heteroShiftSwitch 10 _ _ _ rfl
+
+theorem heteroShiftOk_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n heteroShiftOkMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 224 } ∧
+      m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret heteroShiftSwitch_inFragment heteroShiftSwitch_translate ctxI8_3
+      (ctxI8_ok_hetero rfl) [.scalar ⟨192, 1⟩, .scalar ⟨3, 4⟩] (by decide)
+      heteroShiftOkMInit rfl rfl rfl heteroShiftOk_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [heteroShiftSwitch] at hd; subst hd
+  simp [retPtr, ctxI8_3] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_3] at hr; subst hr
+  have hbits : bits = 224 := by
+    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxI8_3, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+
+theorem heteroShiftOk_minirust_direct :
+    (Interp.steps 7 heteroShiftOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 224 }, [1]) := rfl
+
+/-- Heterogeneous `ShrUnchecked(i8, i32)` UB when `k = 8i32`: `8 < 32 = i32::BITS`
+(in bounds for the RHS type `i32`), but `8 >= 8 = i8::BITS` (out of bounds for
+the LHS type `i8`). -/
+def heteroShrGe8UbS0 : MachineState :=
+  initMachineState heteroShiftSwitch [.scalar ⟨192, 1⟩, .scalar ⟨8, 4⟩]
+def heteroShrGe8UbMInit : Mach :=
+  machineWithCtx ctxI8_3 heteroShiftSwitch heteroShiftSwitchFn
+    heteroShrGe8UbS0.frame.locals heteroShiftSwitchFn.start
+
+theorem heteroShrGe8Ub_anneal_ub :
+    ∃ tr u,
+      Reaches (mirCallTree heteroShiftSwitch [.scalar ⟨192, 1⟩, .scalar ⟨8, 4⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound heteroShiftSwitch 8 _ (by decide)
+
+theorem heteroShrGe8Ub_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n heteroShrGe8UbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := heteroShrGe8Ub_anneal_ub
+  exact mirCall_ub heteroShiftSwitch_inFragment heteroShiftSwitch_translate ctxI8_3
+    (ctxI8_ok_hetero rfl) [.scalar ⟨192, 1⟩, .scalar ⟨8, 4⟩] (by decide)
+    heteroShrGe8UbMInit rfl rfl rfl hr hf
+
+theorem heteroShrGe8Ub_minirust_direct :
+    Interp.steps 5 heteroShrGe8UbMInit = .error (.ub "overflow in unchecked shift") := rfl
+
+/-- Heterogeneous `ShrUnchecked(i8, i32)` UB when `k = -1i32` (bits `4294967295`
+in 32-bit `i32`, negative `< 0`). -/
+def heteroShrNegUbS0 : MachineState :=
+  initMachineState heteroShiftSwitch [.scalar ⟨192, 1⟩, .scalar ⟨4294967295, 4⟩]
+def heteroShrNegUbMInit : Mach :=
+  machineWithCtx ctxI8_3 heteroShiftSwitch heteroShiftSwitchFn
+    heteroShrNegUbS0.frame.locals heteroShiftSwitchFn.start
+
+theorem heteroShrNegUb_anneal_ub :
+    ∃ tr u,
+      Reaches (mirCallTree heteroShiftSwitch [.scalar ⟨192, 1⟩, .scalar ⟨4294967295, 4⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound heteroShiftSwitch 8 _ (by decide)
+
+theorem heteroShrNegUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n heteroShrNegUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := heteroShrNegUb_anneal_ub
+  exact mirCall_ub heteroShiftSwitch_inFragment heteroShiftSwitch_translate ctxI8_3
+    (ctxI8_ok_hetero rfl) [.scalar ⟨192, 1⟩, .scalar ⟨4294967295, 4⟩] (by decide)
+    heteroShrNegUbMInit rfl rfl rfl hr hf
+
+theorem heteroShrNegUb_minirust_direct :
+    Interp.steps 5 heteroShrNegUbMInit = .error (.ub "overflow in unchecked shift") := rfl
 
 end MiniRustSpec.Correspondence.Witness

@@ -597,21 +597,24 @@ theorem wrap_mul_intFromBits (it : Gen.IntType) (x y : Nat)
   rw [Int.mul_emod (intFromBits x it), intFromBits_emod x it hx, intFromBits_emod y it hy]
   push_cast; rfl
 
-theorem bits_dvd_two_pow (sz : Nat) (hgood : GoodSize sz) :
-    ((8 * sz : Nat) : Int) ∣ (2 : Int) ^ (8 * sz) := by
-  rcases hgood with rfl | rfl | rfl | rfl | rfl <;> decide
+theorem bits_dvd_two_pow (lhsSz rhsSz : Nat) (hlhs : GoodSize lhsSz) (hrhs : GoodSize rhsSz) :
+    ((8 * lhsSz : Nat) : Int) ∣ (2 : Int) ^ (8 * rhsSz) := by
+  rcases hlhs with rfl | rfl | rfl | rfl | rfl <;>
+    rcases hrhs with rfl | rfl | rfl | rfl | rfl <;> decide
 
-theorem bits_le_half_modulus (sz : Nat) (hgood : GoodSize sz) :
-    8 * sz ≤ 2 ^ (8 * sz - 1) := by
-  rcases hgood with rfl | rfl | rfl | rfl | rfl <;> decide
+theorem bits_le_half_modulus (lhsSz rhsSz : Nat) (hlhs : GoodSize lhsSz) (hrhs : GoodSize rhsSz) :
+    8 * lhsSz ≤ 2 ^ (8 * rhsSz - 1) := by
+  rcases hlhs with rfl | rfl | rfl | rfl | rfl <;>
+    rcases hrhs with rfl | rfl | rfl | rfl | rfl <;> decide
 
-theorem shift_offset_eq (it : Gen.IntType) (hgood : GoodSize it.size.bytes)
-    (y : Nat) (hy : y < 2 ^ (8 * it.size.bytes)) :
-    (intFromBits y it % (Size.bits it.size : Int)).toNat = y % (it.size.bytes * 8) := by
-  rcases it with ⟨s, ⟨sz⟩⟩
-  dsimp only [Size.bits] at hgood hy ⊢
-  rw [Nat.mul_comm sz 8]
-  have hcast : ((y % (8 * sz) : Nat) : Int) = (y : Int) % ((8 * sz : Nat) : Int) := by
+theorem shift_offset_eq (it rhsIt : Gen.IntType) (hlhs : GoodSize it.size.bytes)
+    (hrhs : GoodSize rhsIt.size.bytes) (y : Nat) :
+    (intFromBits y rhsIt % (Size.bits it.size : Int)).toNat = y % (it.size.bytes * 8) := by
+  rcases it with ⟨_, ⟨lhsSz⟩⟩
+  rcases rhsIt with ⟨s, ⟨rhsSz⟩⟩
+  dsimp only [Size.bits] at hlhs hrhs ⊢
+  rw [Nat.mul_comm lhsSz 8]
+  have hcast : ((y % (8 * lhsSz) : Nat) : Int) = (y : Int) % ((8 * lhsSz : Nat) : Int) := by
     rw [Int.natCast_emod]
   cases s with
   | Unsigned =>
@@ -621,19 +624,20 @@ theorem shift_offset_eq (it : Gen.IntType) (hgood : GoodSize it.size.bytes)
     simp only [intFromBits]
     split
     · rw [← hcast, Int.toNat_natCast]
-    · have hdvd := bits_dvd_two_pow sz hgood
+    · have hdvd := bits_dvd_two_pow lhsSz rhsSz hlhs hrhs
       rw [Int.sub_emod, Int.emod_eq_zero_of_dvd hdvd, Int.sub_zero,
         Int.emod_emod, ← hcast, Int.toNat_natCast]
 
-theorem unchecked_shift_oob_iff (it : Gen.IntType) (hgood : GoodSize it.size.bytes)
-    (y : Nat) (hy : y < 2 ^ (8 * it.size.bytes)) :
-    (intFromBits y it < 0 ∨ intFromBits y it ≥ (Size.bits it.size : Int)) ↔
+theorem unchecked_shift_oob_iff (it rhsIt : Gen.IntType) (hlhs : GoodSize it.size.bytes)
+    (hrhs : GoodSize rhsIt.size.bytes) (y : Nat) (hy : y < 2 ^ (8 * rhsIt.size.bytes)) :
+    (intFromBits y rhsIt < 0 ∨ intFromBits y rhsIt ≥ (Size.bits it.size : Int)) ↔
       it.size.bytes * 8 ≤ y := by
-  rcases it with ⟨s, ⟨sz⟩⟩
-  dsimp only [Size.bits] at hgood hy ⊢
-  rw [Nat.mul_comm sz 8]
-  have hle := bits_le_half_modulus sz hgood
-  have hp : (2 : Int) ^ (8 * sz) = ((2 ^ (8 * sz) : Nat) : Int) := by push_cast; rfl
+  rcases it with ⟨_, ⟨lhsSz⟩⟩
+  rcases rhsIt with ⟨s, ⟨rhsSz⟩⟩
+  dsimp only [Size.bits] at hlhs hrhs hy ⊢
+  rw [Nat.mul_comm lhsSz 8]
+  have hle := bits_le_half_modulus lhsSz rhsSz hlhs hrhs
+  have hp : (2 : Int) ^ (8 * rhsSz) = ((2 ^ (8 * rhsSz) : Nat) : Int) := by push_cast; rfl
   cases s with
   | Unsigned =>
     simp only [intFromBits]
@@ -642,14 +646,17 @@ theorem unchecked_shift_oob_iff (it : Gen.IntType) (hgood : GoodSize it.size.byt
     simp only [intFromBits, hp]
     split <;> omega
 
-theorem unchecked_shift_toNat (signed : Signedness) (sz : Nat) (hgood : GoodSize sz)
-    (y : Nat) (hlt : y < sz * 8) :
-    (intFromBits y ⟨signed, ⟨sz⟩⟩).toNat = y := by
-  have hle := bits_le_half_modulus sz hgood
+theorem unchecked_shift_toNat (lhsSz : Nat) (rhsIt : Gen.IntType)
+    (hlhs : GoodSize lhsSz) (hrhs : GoodSize rhsIt.size.bytes)
+    (y : Nat) (hlt : y < lhsSz * 8) :
+    (intFromBits y rhsIt).toNat = y := by
+  rcases rhsIt with ⟨signed, ⟨rhsSz⟩⟩
+  dsimp only at hrhs ⊢
+  have hle := bits_le_half_modulus lhsSz rhsSz hlhs hrhs
   cases signed with
   | Unsigned => simp [intFromBits]
   | Signed =>
-    have hyHalf : y < 2 ^ (8 * sz - 1) := by omega
+    have hyHalf : y < 2 ^ (8 * rhsSz - 1) := by omega
     simp [intFromBits, hyHalf]
 
 theorem shiftLeftBits_eq (v k m : Nat) :
@@ -733,31 +740,308 @@ theorem arithmeticShrBits_intFromBits (sz x k : Nat) (hsz : sz ≠ 0)
     have hed : (x : Int) / ((2 ^ k : Nat) : Int) = ((x / 2 ^ k : Nat) : Int) := rfl
     rw [hed, nat_emod_toNat_of_lt _ _ hltM]
 
+theorem emod_pow_succ_two (w : Int) (k : Nat) :
+    (w % (2 : Int) ^ (k + 1)) % 2 = w % 2 :=
+  Int.emod_emod_of_dvd w ⟨(2 : Int) ^ k, by rw [Int.pow_succ, Int.mul_comm]⟩
+
+theorem ediv_two_emod_pow (w : Int) (k : Nat) :
+    (w / 2) % (2 : Int) ^ k = (w % (2 : Int) ^ (k + 1)) / 2 := by
+  have hM : 0 < (2 : Int) ^ k := two_pow_pos k
+  have h2M : (2 : Int) ^ (k + 1) = 2 * (2 : Int) ^ k := by rw [Int.pow_succ, Int.mul_comm]
+  rw [h2M]
+  generalize (2 : Int) ^ k = M at hM ⊢
+  have hr0 : 0 ≤ w % (2 * M) := Int.emod_nonneg w (by omega)
+  have hrlt : w % (2 * M) < 2 * M := Int.emod_lt_of_pos w (by omega)
+  have hw : w = w % (2 * M) + (M * (w / (2 * M))) * 2 := by
+    have hdiv := Int.emod_def w (2 * M)
+    have hmul : 2 * M * (w / (2 * M)) = (M * (w / (2 * M))) * 2 := by
+      rw [Int.mul_assoc, Int.mul_comm 2 _]
+    omega
+  conv => lhs; rw [hw]
+  rw [Int.add_mul_ediv_right _ _ (by decide : (2 : Int) ≠ 0),
+    Int.add_mul_emod_self_left, Int.emod_eq_of_lt (by omega) (by omega)]
+
+theorem two_mul_add_bit_emod_toNat (Q : Int) (bit k : Nat) (hbit : bit < 2) :
+    ((2 * Q + (bit : Int)) % (2 : Int) ^ (k + 1)).toNat =
+      bit + 2 * (Q % (2 : Int) ^ k).toNat := by
+  have hM : 0 < (2 : Int) ^ k := two_pow_pos k
+  have h2M : (2 : Int) ^ (k + 1) = 2 * (2 : Int) ^ k := by rw [Int.pow_succ, Int.mul_comm]
+  rw [h2M]
+  generalize (2 : Int) ^ k = M at hM ⊢
+  have hr0 : 0 ≤ Q % M := Int.emod_nonneg Q (by omega)
+  have hrlt : Q % M < M := Int.emod_lt_of_pos Q hM
+  have hrew : 2 * Q + (bit : Int) = (2 * (Q % M) + (bit : Int)) + (2 * M) * (Q / M) := by
+    have hdiv := Int.emod_def Q M
+    have hmul : 2 * (M * (Q / M)) = (2 * M) * (Q / M) := (Int.mul_assoc 2 M (Q / M)).symm
+    omega
+  rw [hrew, Int.add_mul_emod_self_left, Int.emod_eq_of_lt (by omega) (by omega)]
+  omega
+
+theorem intBitMeasure_pos {a : Int} (h0 : a ≠ 0) (h1 : a ≠ -1) : 0 < intBitMeasure a := by
+  simp only [intBitMeasure]; split <;> omega
+
+theorem intBitMeasure_ediv_lt {a : Int} (h0 : a ≠ 0) (h1 : a ≠ -1) :
+    intBitMeasure (a / 2) < intBitMeasure a := by
+  simp only [intBitMeasure]; split <;> (try split) <;> omega
+
+theorem intBitRec_irrel (z o : Int → Int) (f : Int → Int → Int) (n m : Nat) (a b : Int)
+    (hn : intBitMeasure a ≤ n) (hm : intBitMeasure a ≤ m) :
+    intBitRec z o f n a b = intBitRec z o f m a b := by
+  induction n generalizing m a b with
+  | zero =>
+    by_cases ha0 : a = 0
+    · subst ha0; cases m <;> simp [intBitRec]
+    · by_cases ha1 : a = -1
+      · subst ha1; cases m <;> simp [intBitRec]
+      · exact absurd (intBitMeasure_pos ha0 ha1) (by omega)
+  | succ n ih =>
+    by_cases ha0 : a = 0
+    · subst ha0; cases m <;> simp [intBitRec]
+    · by_cases ha1 : a = -1
+      · subst ha1; cases m <;> simp [intBitRec]
+      · have hpos := intBitMeasure_pos ha0 ha1
+        have hlt := intBitMeasure_ediv_lt ha0 ha1
+        cases m with
+        | zero => exact absurd hpos (by omega)
+        | succ m =>
+          simp only [intBitRec, ha0, ha1, ↓reduceIte]
+          rw [ih m (a / 2) (b / 2) (by omega) (by omega)]
+
+theorem intBitRec_unfold (z o : Int → Int) (f : Int → Int → Int) (a b : Int) :
+    intBitRec z o f (intBitMeasure a) a b =
+      if a = 0 then z b
+      else if a = -1 then o b
+      else 2 * intBitRec z o f (intBitMeasure (a / 2)) (a / 2) (b / 2) + f (a % 2) (b % 2) := by
+  rw [intBitRec_irrel z o f (intBitMeasure a) (intBitMeasure a + 1) a b (Nat.le_refl _) (Nat.le_succ _)]
+  simp only [intBitRec]
+  by_cases ha0 : a = 0
+  · simp [ha0]
+  · by_cases ha1 : a = -1
+    · simp [ha1]
+    · simp only [ha0, ha1, ↓reduceIte]
+      have hlt := intBitMeasure_ediv_lt ha0 ha1
+      rw [intBitRec_irrel z o f (intBitMeasure a) (intBitMeasure (a / 2)) (a / 2) (b / 2)
+        (by omega) (Nat.le_refl _)]
+
+theorem intBitAnd_unfold (a b : Int) :
+    intBitAnd a b =
+      if a = 0 then 0
+      else if a = -1 then b
+      else 2 * intBitAnd (a / 2) (b / 2) + (if a % 2 = 1 ∧ b % 2 = 1 then 1 else 0) :=
+  intBitRec_unfold _ _ _ a b
+
+theorem intBitOr_unfold (a b : Int) :
+    intBitOr a b =
+      if a = 0 then b
+      else if a = -1 then -1
+      else 2 * intBitOr (a / 2) (b / 2) + (if a % 2 = 1 ∨ b % 2 = 1 then 1 else 0) :=
+  intBitRec_unfold _ _ _ a b
+
+theorem intBitXor_unfold (a b : Int) :
+    intBitXor a b =
+      if a = 0 then b
+      else if a = -1 then -b - 1
+      else 2 * intBitXor (a / 2) (b / 2) + (if a % 2 = b % 2 then 0 else 1) :=
+  intBitRec_unfold _ _ _ a b
+
+theorem intBitAnd_step (a b : Int) :
+    intBitAnd a b = 2 * intBitAnd (a / 2) (b / 2) + (if a % 2 = 1 ∧ b % 2 = 1 then 1 else 0) := by
+  rw [intBitAnd_unfold a b]
+  by_cases ha0 : a = 0
+  · subst ha0
+    have hd : (0 : Int) / 2 = 0 := by decide
+    have hm : (0 : Int) % 2 = 0 := by decide
+    rw [hd, hm, intBitAnd_unfold 0 (b / 2)]
+    simp
+  · by_cases ha1 : a = -1
+    · subst ha1
+      have hd : (-1 : Int) / 2 = -1 := by decide
+      have hm : (-1 : Int) % 2 = 1 := by decide
+      rw [hd, hm, intBitAnd_unfold (-1) (b / 2)]
+      simp only [show (-1 : Int) ≠ 0 by decide, ↓reduceIte, true_and]
+      split <;> omega
+    · simp [ha0, ha1]
+
+theorem intBitOr_step (a b : Int) :
+    intBitOr a b = 2 * intBitOr (a / 2) (b / 2) + (if a % 2 = 1 ∨ b % 2 = 1 then 1 else 0) := by
+  rw [intBitOr_unfold a b]
+  by_cases ha0 : a = 0
+  · subst ha0
+    have hd : (0 : Int) / 2 = 0 := by decide
+    have hm : (0 : Int) % 2 = 0 := by decide
+    rw [hd, hm, intBitOr_unfold 0 (b / 2)]
+    simp only [↓reduceIte, show (0 : Int) = 1 ↔ False by decide, false_or]
+    split <;> omega
+  · by_cases ha1 : a = -1
+    · subst ha1
+      have hd : (-1 : Int) / 2 = -1 := by decide
+      have hm : (-1 : Int) % 2 = 1 := by decide
+      rw [hd, hm, intBitOr_unfold (-1) (b / 2)]
+      simp [show (-1 : Int) ≠ 0 by decide]
+    · simp [ha0, ha1]
+
+theorem intBitXor_step (a b : Int) :
+    intBitXor a b = 2 * intBitXor (a / 2) (b / 2) + (if a % 2 = b % 2 then 0 else 1) := by
+  rw [intBitXor_unfold a b]
+  by_cases ha0 : a = 0
+  · subst ha0
+    have hd : (0 : Int) / 2 = 0 := by decide
+    have hm : (0 : Int) % 2 = 0 := by decide
+    rw [hd, hm, intBitXor_unfold 0 (b / 2)]
+    simp only [↓reduceIte]
+    split <;> omega
+  · by_cases ha1 : a = -1
+    · subst ha1
+      have hd : (-1 : Int) / 2 = -1 := by decide
+      have hm : (-1 : Int) % 2 = 1 := by decide
+      rw [hd, hm, intBitXor_unfold (-1) (b / 2)]
+      simp only [show (-1 : Int) ≠ 0 by decide, ↓reduceIte]
+      split <;> omega
+    · simp [ha0, ha1]
+
+theorem bitwiseAndBits_eq_intBitAnd (k x y : Nat) (a b : Int)
+    (ha : a % (2 : Int) ^ k = (x : Int) % (2 : Int) ^ k)
+    (hb : b % (2 : Int) ^ k = (y : Int) % (2 : Int) ^ k) :
+    MirSemantics.bitwiseAndBits k x y = (intBitAnd a b % (2 : Int) ^ k).toNat := by
+  induction k generalizing x y a b with
+  | zero => simp [MirSemantics.bitwiseAndBits]
+  | succ k ih =>
+    have ha2 : a % 2 = ((x % 2 : Nat) : Int) := by
+      rw [← emod_pow_succ_two a k, ha, emod_pow_succ_two]; omega
+    have hb2 : b % 2 = ((y % 2 : Nat) : Int) := by
+      rw [← emod_pow_succ_two b k, hb, emod_pow_succ_two]; omega
+    have hadiv : (a / 2) % (2 : Int) ^ k = ((x / 2 : Nat) : Int) % (2 : Int) ^ k := by
+      rw [ediv_two_emod_pow a k, ha, ← ediv_two_emod_pow (x : Int) k]; rfl
+    have hbdiv : (b / 2) % (2 : Int) ^ k = ((y / 2 : Nat) : Int) % (2 : Int) ^ k := by
+      rw [ediv_two_emod_pow b k, hb, ← ediv_two_emod_pow (y : Int) k]; rfl
+    have hrec := ih (x / 2) (y / 2) (a / 2) (b / 2) hadiv hbdiv
+    simp only [MirSemantics.bitwiseAndBits, nat_mod_eq_mod, nat_div_eq_div, Nat.add_eq, Nat.mul_eq]
+    rw [intBitAnd_step a b, ha2, hb2, hrec]
+    have hbit :
+        (if ((x % 2 : Nat) : Int) = 1 ∧ ((y % 2 : Nat) : Int) = 1 then (1 : Int) else 0) =
+          (((match Bool.and (Nat.beq (x % 2) 1) (Nat.beq (y % 2) 1) with
+              | true => 1 | false => 0) : Nat) : Int) ∧
+        (match Bool.and (Nat.beq (x % 2) 1) (Nat.beq (y % 2) 1) with | true => 1 | false => 0) < 2 := by
+      rcases (by omega : x % 2 = 0 ∨ x % 2 = 1) with hx2 | hx2 <;>
+        rcases (by omega : y % 2 = 0 ∨ y % 2 = 1) with hy2 | hy2 <;>
+        simp [hx2, hy2]
+    rw [hbit.1, two_mul_add_bit_emod_toNat _ _ k hbit.2]; rfl
+
+theorem bitwiseOrBits_eq_intBitOr (k x y : Nat) (a b : Int)
+    (ha : a % (2 : Int) ^ k = (x : Int) % (2 : Int) ^ k)
+    (hb : b % (2 : Int) ^ k = (y : Int) % (2 : Int) ^ k) :
+    MirSemantics.bitwiseOrBits k x y = (intBitOr a b % (2 : Int) ^ k).toNat := by
+  induction k generalizing x y a b with
+  | zero => simp [MirSemantics.bitwiseOrBits]
+  | succ k ih =>
+    have ha2 : a % 2 = ((x % 2 : Nat) : Int) := by
+      rw [← emod_pow_succ_two a k, ha, emod_pow_succ_two]; omega
+    have hb2 : b % 2 = ((y % 2 : Nat) : Int) := by
+      rw [← emod_pow_succ_two b k, hb, emod_pow_succ_two]; omega
+    have hadiv : (a / 2) % (2 : Int) ^ k = ((x / 2 : Nat) : Int) % (2 : Int) ^ k := by
+      rw [ediv_two_emod_pow a k, ha, ← ediv_two_emod_pow (x : Int) k]; rfl
+    have hbdiv : (b / 2) % (2 : Int) ^ k = ((y / 2 : Nat) : Int) % (2 : Int) ^ k := by
+      rw [ediv_two_emod_pow b k, hb, ← ediv_two_emod_pow (y : Int) k]; rfl
+    have hrec := ih (x / 2) (y / 2) (a / 2) (b / 2) hadiv hbdiv
+    simp only [MirSemantics.bitwiseOrBits, nat_mod_eq_mod, nat_div_eq_div, Nat.add_eq, Nat.mul_eq]
+    rw [intBitOr_step a b, ha2, hb2, hrec]
+    have hbit :
+        (if ((x % 2 : Nat) : Int) = 1 ∨ ((y % 2 : Nat) : Int) = 1 then (1 : Int) else 0) =
+          (((match Bool.or (Nat.beq (x % 2) 1) (Nat.beq (y % 2) 1) with
+              | true => 1 | false => 0) : Nat) : Int) ∧
+        (match Bool.or (Nat.beq (x % 2) 1) (Nat.beq (y % 2) 1) with | true => 1 | false => 0) < 2 := by
+      rcases (by omega : x % 2 = 0 ∨ x % 2 = 1) with hx2 | hx2 <;>
+        rcases (by omega : y % 2 = 0 ∨ y % 2 = 1) with hy2 | hy2 <;>
+        simp [hx2, hy2]
+    rw [hbit.1, two_mul_add_bit_emod_toNat _ _ k hbit.2]; rfl
+
+theorem bitwiseXorBits_eq_intBitXor (k x y : Nat) (a b : Int)
+    (ha : a % (2 : Int) ^ k = (x : Int) % (2 : Int) ^ k)
+    (hb : b % (2 : Int) ^ k = (y : Int) % (2 : Int) ^ k) :
+    MirSemantics.bitwiseXorBits k x y = (intBitXor a b % (2 : Int) ^ k).toNat := by
+  induction k generalizing x y a b with
+  | zero => simp [MirSemantics.bitwiseXorBits]
+  | succ k ih =>
+    have ha2 : a % 2 = ((x % 2 : Nat) : Int) := by
+      rw [← emod_pow_succ_two a k, ha, emod_pow_succ_two]; omega
+    have hb2 : b % 2 = ((y % 2 : Nat) : Int) := by
+      rw [← emod_pow_succ_two b k, hb, emod_pow_succ_two]; omega
+    have hadiv : (a / 2) % (2 : Int) ^ k = ((x / 2 : Nat) : Int) % (2 : Int) ^ k := by
+      rw [ediv_two_emod_pow a k, ha, ← ediv_two_emod_pow (x : Int) k]; rfl
+    have hbdiv : (b / 2) % (2 : Int) ^ k = ((y / 2 : Nat) : Int) % (2 : Int) ^ k := by
+      rw [ediv_two_emod_pow b k, hb, ← ediv_two_emod_pow (y : Int) k]; rfl
+    have hrec := ih (x / 2) (y / 2) (a / 2) (b / 2) hadiv hbdiv
+    simp only [MirSemantics.bitwiseXorBits, nat_mod_eq_mod, nat_div_eq_div, Nat.add_eq, Nat.mul_eq]
+    rw [intBitXor_step a b, ha2, hb2, hrec]
+    have hbit :
+        (if ((x % 2 : Nat) : Int) = ((y % 2 : Nat) : Int) then (0 : Int) else 1) =
+          (((match Nat.beq (x % 2) (y % 2) with
+              | true => 0 | false => 1) : Nat) : Int) ∧
+        (match Nat.beq (x % 2) (y % 2) with | true => 0 | false => 1) < 2 := by
+      rcases (by omega : x % 2 = 0 ∨ x % 2 = 1) with hx2 | hx2 <;>
+        rcases (by omega : y % 2 = 0 ∨ y % 2 = 1) with hy2 | hy2 <;>
+        simp [hx2, hy2]
+    rw [hbit.1, two_mul_add_bit_emod_toNat _ _ k hbit.2]; rfl
+
+theorem intFromBits_emod_nat (it : Gen.IntType) (v : Nat) (hv : v < 2 ^ (8 * it.size.bytes)) :
+    intFromBits v it % (2 : Int) ^ (8 * it.size.bytes) = (v : Int) % (2 : Int) ^ (8 * it.size.bytes) := by
+  rw [intFromBits_emod v it hv, Int.emod_eq_of_lt (by omega) (by exact_mod_cast hv)]
+
+theorem bitwiseAndBits_intFromBits (it : Gen.IntType) (x y : Nat)
+    (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * it.size.bytes)) :
+    MirSemantics.bitwiseAndBits (it.size.bytes * 8) x y =
+      (intBitAnd (intFromBits x it) (intFromBits y it) % (2 : Int) ^ (8 * it.size.bytes)).toNat := by
+  rw [Nat.mul_comm _ 8]
+  exact bitwiseAndBits_eq_intBitAnd (8 * it.size.bytes) x y _ _
+    (intFromBits_emod_nat it x hx) (intFromBits_emod_nat it y hy)
+
+theorem bitwiseOrBits_intFromBits (it : Gen.IntType) (x y : Nat)
+    (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * it.size.bytes)) :
+    MirSemantics.bitwiseOrBits (it.size.bytes * 8) x y =
+      (intBitOr (intFromBits x it) (intFromBits y it) % (2 : Int) ^ (8 * it.size.bytes)).toNat := by
+  rw [Nat.mul_comm _ 8]
+  exact bitwiseOrBits_eq_intBitOr (8 * it.size.bytes) x y _ _
+    (intFromBits_emod_nat it x hx) (intFromBits_emod_nat it y hy)
+
+theorem bitwiseXorBits_intFromBits (it : Gen.IntType) (x y : Nat)
+    (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * it.size.bytes)) :
+    MirSemantics.bitwiseXorBits (it.size.bytes * 8) x y =
+      (intBitXor (intFromBits x it) (intFromBits y it) % (2 : Int) ^ (8 * it.size.bytes)).toNat := by
+  rw [Nat.mul_comm _ 8]
+  exact bitwiseXorBits_eq_intBitXor (8 * it.size.bytes) x y _ _
+    (intFromBits_emod_nat it x hx) (intFromBits_emod_nat it y hy)
+
 theorem evalScalarBinOp_frag (op : MirAst.BinOp) (iop : Gen.IntBinOp) (hop : translateBinOp op = some iop)
-    (it : Gen.IntType) (hgood : GoodSize it.size.bytes)
-    (x y : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * it.size.bytes))
+    (it rhsIt : Gen.IntType) (hgood : GoodSize it.size.bytes) (hrhsGood : GoodSize rhsIt.size.bytes)
+    (hhom : isShiftIntBinOp iop = false → rhsIt = it)
+    (x y : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * rhsIt.size.bytes))
     (locals : List LocalSlot) (mem : MirSemantics.Memory) :
-    (∀ z, intBinEval iop (intFromBits x it) (intFromBits y it) it = some z →
-      evalScalarBinOp op ⟨x, it.size.bytes⟩ ⟨y, it.size.bytes⟩ locals mem
+    (∀ z, intBinEval iop (intFromBits x it) (intFromBits y rhsIt) it = some z →
+      evalScalarBinOp op ⟨x, it.size.bytes⟩ ⟨y, rhsIt.size.bytes⟩ locals mem
         (match it.signed with | .Unsigned => false | .Signed => true) =
         .ok (.scalar ⟨(z % 2 ^ (8 * it.size.bytes)).toNat, it.size.bytes⟩) locals mem) ∧
-    (intBinEval iop (intFromBits x it) (intFromBits y it) it = none →
-      evalScalarBinOp op ⟨x, it.size.bytes⟩ ⟨y, it.size.bytes⟩ locals mem
+    (intBinEval iop (intFromBits x it) (intFromBits y rhsIt) it = none →
+      evalScalarBinOp op ⟨x, it.size.bytes⟩ ⟨y, rhsIt.size.bytes⟩ locals mem
         (match it.signed with | .Unsigned => false | .Signed => true) = .ub) := by
   have hsz : it.size.bytes ≠ 0 := Nat.ne_of_gt hgood.pos
+  have hrhsSz : rhsIt.size.bytes ≠ 0 := Nat.ne_of_gt hrhsGood.pos
   rcases it with ⟨signed, ⟨sz⟩⟩
-  dsimp only at hgood hsz hx hy ⊢
+  dsimp only at hgood hsz hx ⊢
   have hbeq : Nat.beq sz 0 = false := by rw [nat_beq_eq_decide, decide_eq_false hsz]
+  have hrhsBeq : Nat.beq rhsIt.size.bytes 0 = false := by
+    rw [nat_beq_eq_decide, decide_eq_false hrhsSz]
   have hp : ((2 : Int) ^ (8 * sz)) = ((2 ^ (8 * sz) : Nat) : Int) := by push_cast; rfl
   match op, hop with
   | .add, hop =>
     simp [translateBinOp] at hop; subst hop
+    have hrhsEq := hhom rfl; subst hrhsEq; dsimp only at hy
     refine ⟨fun z hz => ?_, fun h => by simp [intBinEval] at h⟩
     simp [intBinEval] at hz; subst hz
     simp [evalScalarBinOp, hbeq, Nat.beq_refl, Nat.add_eq,
       wrap_add_intFromBits ⟨signed, ⟨sz⟩⟩ x y hx hy]
   | .sub, hop =>
     simp [translateBinOp] at hop; subst hop
+    have hrhsEq := hhom rfl; subst hrhsEq; dsimp only at hy
     refine ⟨fun z hz => ?_, fun h => by simp [intBinEval] at h⟩
     simp [intBinEval] at hz; subst hz
     have hsub := wrap_sub_intFromBits ⟨signed, ⟨sz⟩⟩ x y hx hy
@@ -766,12 +1050,35 @@ theorem evalScalarBinOp_frag (op : MirAst.BinOp) (iop : Gen.IntBinOp) (hop : tra
     cases hble : Nat.ble y x <;> simp only [hble] at hsub ⊢ <;> rw [hsub]
   | .mul, hop =>
     simp [translateBinOp] at hop; subst hop
+    have hrhsEq := hhom rfl; subst hrhsEq; dsimp only at hy
     refine ⟨fun z hz => ?_, fun h => by simp [intBinEval] at h⟩
     simp [intBinEval] at hz; subst hz
     simp [evalScalarBinOp, hbeq, Nat.beq_refl, Nat.mul_eq,
       wrap_mul_intFromBits ⟨signed, ⟨sz⟩⟩ x y hx hy]
+  | .bitAnd, hop =>
+    simp [translateBinOp] at hop; subst hop
+    have hrhsEq := hhom rfl; subst hrhsEq; dsimp only at hy
+    refine ⟨fun z hz => ?_, fun h => by simp [intBinEval] at h⟩
+    simp [intBinEval] at hz; subst hz
+    simp [evalScalarBinOp, hbeq, Nat.beq_refl, Nat.mul_eq,
+      bitwiseAndBits_intFromBits ⟨signed, ⟨sz⟩⟩ x y hx hy]
+  | .bitOr, hop =>
+    simp [translateBinOp] at hop; subst hop
+    have hrhsEq := hhom rfl; subst hrhsEq; dsimp only at hy
+    refine ⟨fun z hz => ?_, fun h => by simp [intBinEval] at h⟩
+    simp [intBinEval] at hz; subst hz
+    simp [evalScalarBinOp, hbeq, Nat.beq_refl, Nat.mul_eq,
+      bitwiseOrBits_intFromBits ⟨signed, ⟨sz⟩⟩ x y hx hy]
+  | .bitXor, hop =>
+    simp [translateBinOp] at hop; subst hop
+    have hrhsEq := hhom rfl; subst hrhsEq; dsimp only at hy
+    refine ⟨fun z hz => ?_, fun h => by simp [intBinEval] at h⟩
+    simp [intBinEval] at hz; subst hz
+    simp [evalScalarBinOp, hbeq, Nat.beq_refl, Nat.mul_eq,
+      bitwiseXorBits_intFromBits ⟨signed, ⟨sz⟩⟩ x y hx hy]
   | .addUnchecked, hop =>
     simp [translateBinOp] at hop; subst hop
+    have hrhsEq := hhom rfl; subst hrhsEq; dsimp only at hy
     cases signed with
     | Unsigned =>
       simp only [evalScalarBinOp, hbeq, Nat.beq_refl, Nat.add_eq, scalarModulus_eq,
@@ -797,6 +1104,7 @@ theorem evalScalarBinOp_frag (op : MirAst.BinOp) (iop : Gen.IntBinOp) (hop : tra
         simp [wrap_add_intFromBits ⟨.Signed, ⟨sz⟩⟩ x y hx hy]
   | .subUnchecked, hop =>
     simp [translateBinOp] at hop; subst hop
+    have hrhsEq := hhom rfl; subst hrhsEq; dsimp only at hy
     cases signed with
     | Unsigned =>
       simp only [evalScalarBinOp, hbeq, Nat.beq_refl, Nat.sub_eq, scalarModulus_eq,
@@ -830,6 +1138,7 @@ theorem evalScalarBinOp_frag (op : MirAst.BinOp) (iop : Gen.IntBinOp) (hop : tra
         cases hble : Nat.ble y x <;> simp only [hble, Bool.not_true] at hsub ⊢ <;> rw [hsub]
   | .mulUnchecked, hop =>
     simp [translateBinOp] at hop; subst hop
+    have hrhsEq := hhom rfl; subst hrhsEq; dsimp only at hy
     cases signed with
     | Unsigned =>
       simp only [evalScalarBinOp, hbeq, Nat.beq_refl, Nat.mul_eq, scalarModulus_eq,
@@ -855,6 +1164,7 @@ theorem evalScalarBinOp_frag (op : MirAst.BinOp) (iop : Gen.IntBinOp) (hop : tra
         simp [wrap_mul_intFromBits ⟨.Signed, ⟨sz⟩⟩ x y hx hy]
   | .div, hop =>
     simp [translateBinOp] at hop; subst hop
+    have hrhsEq := hhom rfl; subst hrhsEq; dsimp only at hy
     by_cases hy0 : y = 0
     · subst hy0
       have hyInt0 := (intFromBits_eq_zero_iff ⟨signed, ⟨sz⟩⟩ hsz 0 (Nat.two_pow_pos _)).mpr rfl
@@ -878,6 +1188,7 @@ theorem evalScalarBinOp_frag (op : MirAst.BinOp) (iop : Gen.IntBinOp) (hop : tra
         exact evalSignedDiv_spec x y sz hsz hx hy hy0 locals mem
   | .rem, hop =>
     simp [translateBinOp] at hop; subst hop
+    have hrhsEq := hhom rfl; subst hrhsEq; dsimp only at hy
     by_cases hy0 : y = 0
     · subst hy0
       have hyInt0 := (intFromBits_eq_zero_iff ⟨signed, ⟨sz⟩⟩ hsz 0 (Nat.two_pow_pos _)).mpr rfl
@@ -905,57 +1216,57 @@ theorem evalScalarBinOp_frag (op : MirAst.BinOp) (iop : Gen.IntBinOp) (hop : tra
     simp [translateBinOp] at hop; subst hop
     refine ⟨fun z hz => ?_, fun h => by simp [intBinEval] at h⟩
     simp [intBinEval] at hz; subst hz
-    have hoff := shift_offset_eq ⟨signed, ⟨sz⟩⟩ hgood y hy
+    have hoff := shift_offset_eq ⟨signed, ⟨sz⟩⟩ rhsIt hgood hrhsGood y
     dsimp only at hoff
-    simp [evalScalarBinOp, hbeq, Nat.mul_eq, nat_mod_eq_mod, hoff,
+    simp [evalScalarBinOp, hbeq, hrhsBeq, Nat.mul_eq, nat_mod_eq_mod, hoff,
       shiftLeftBits_intFromBits ⟨signed, ⟨sz⟩⟩ x _ hx]
   | .shr, hop =>
     simp [translateBinOp] at hop; subst hop
     refine ⟨fun z hz => ?_, fun h => by simp [intBinEval] at h⟩
     simp [intBinEval] at hz; subst hz
-    have hoff := shift_offset_eq ⟨signed, ⟨sz⟩⟩ hgood y hy
+    have hoff := shift_offset_eq ⟨signed, ⟨sz⟩⟩ rhsIt hgood hrhsGood y
     dsimp only at hoff
     have hklt : y % (sz * 8) < 8 * sz := by rw [Nat.mul_comm]; exact Nat.mod_lt _ (by omega)
     cases signed with
     | Unsigned =>
-      simp [evalScalarBinOp, hbeq, Nat.mul_eq, nat_mod_eq_mod, hoff,
+      simp [evalScalarBinOp, hbeq, hrhsBeq, Nat.mul_eq, nat_mod_eq_mod, hoff,
         shiftRightUnsigned_intFromBits sz x _ hx]
     | Signed =>
-      simp [evalScalarBinOp, hbeq, Nat.mul_eq, nat_mod_eq_mod, hoff,
+      simp [evalScalarBinOp, hbeq, hrhsBeq, Nat.mul_eq, nat_mod_eq_mod, hoff,
         arithmeticShrBits_intFromBits sz x _ hsz hx hklt]
   | .shlUnchecked, hop =>
     simp [translateBinOp] at hop; subst hop
-    have hoob := unchecked_shift_oob_iff ⟨signed, ⟨sz⟩⟩ hgood y hy
+    have hoob := unchecked_shift_oob_iff ⟨signed, ⟨sz⟩⟩ rhsIt hgood hrhsGood y hy
     dsimp only at hoob
     by_cases hle : sz * 8 ≤ y
-    · have hoob' : intFromBits y ⟨signed, ⟨sz⟩⟩ < 0 ∨
-          intFromBits y ⟨signed, ⟨sz⟩⟩ ≥ (Size.bits ⟨sz⟩ : Int) := hoob.mpr hle
-      simp [evalScalarBinOp, hbeq, Nat.mul_eq, nat_ble_eq_decide, decide_eq_true hle,
+    · have hoob' : intFromBits y rhsIt < 0 ∨
+          intFromBits y rhsIt ≥ (Size.bits ⟨sz⟩ : Int) := hoob.mpr hle
+      simp [evalScalarBinOp, hbeq, hrhsBeq, Nat.mul_eq, nat_ble_eq_decide, decide_eq_true hle,
         intBinEval, hoob']
-    · have hnoob : ¬(intFromBits y ⟨signed, ⟨sz⟩⟩ < 0 ∨
-          intFromBits y ⟨signed, ⟨sz⟩⟩ ≥ (Size.bits ⟨sz⟩ : Int)) := by
+    · have hnoob : ¬(intFromBits y rhsIt < 0 ∨
+          intFromBits y rhsIt ≥ (Size.bits ⟨sz⟩ : Int)) := by
         rw [hoob]; exact hle
-      have htoNat := unchecked_shift_toNat signed sz hgood y (by omega)
-      simp only [evalScalarBinOp, hbeq, Nat.mul_eq, nat_ble_eq_decide, decide_eq_false hle,
+      have htoNat := unchecked_shift_toNat sz rhsIt hgood hrhsGood y (by omega)
+      simp only [evalScalarBinOp, hbeq, hrhsBeq, Nat.mul_eq, nat_ble_eq_decide, decide_eq_false hle,
         intBinEval, hnoob, ↓reduceIte, htoNat]
       refine ⟨fun z hz => ?_, fun h => by simp at h⟩
       injection hz with hz; subst hz
       simp [shiftLeftBits_intFromBits ⟨signed, ⟨sz⟩⟩ x y hx]
   | .shrUnchecked, hop =>
     simp [translateBinOp] at hop; subst hop
-    have hoob := unchecked_shift_oob_iff ⟨signed, ⟨sz⟩⟩ hgood y hy
+    have hoob := unchecked_shift_oob_iff ⟨signed, ⟨sz⟩⟩ rhsIt hgood hrhsGood y hy
     dsimp only at hoob
     by_cases hle : sz * 8 ≤ y
-    · have hoob' : intFromBits y ⟨signed, ⟨sz⟩⟩ < 0 ∨
-          intFromBits y ⟨signed, ⟨sz⟩⟩ ≥ (Size.bits ⟨sz⟩ : Int) := hoob.mpr hle
-      simp [evalScalarBinOp, hbeq, Nat.mul_eq, nat_ble_eq_decide, decide_eq_true hle,
+    · have hoob' : intFromBits y rhsIt < 0 ∨
+          intFromBits y rhsIt ≥ (Size.bits ⟨sz⟩ : Int) := hoob.mpr hle
+      simp [evalScalarBinOp, hbeq, hrhsBeq, Nat.mul_eq, nat_ble_eq_decide, decide_eq_true hle,
         intBinEval, hoob']
-    · have hnoob : ¬(intFromBits y ⟨signed, ⟨sz⟩⟩ < 0 ∨
-          intFromBits y ⟨signed, ⟨sz⟩⟩ ≥ (Size.bits ⟨sz⟩ : Int)) := by
+    · have hnoob : ¬(intFromBits y rhsIt < 0 ∨
+          intFromBits y rhsIt ≥ (Size.bits ⟨sz⟩ : Int)) := by
         rw [hoob]; exact hle
-      have htoNat := unchecked_shift_toNat signed sz hgood y (by omega)
+      have htoNat := unchecked_shift_toNat sz rhsIt hgood hrhsGood y (by omega)
       have hklt : y < 8 * sz := by omega
-      simp only [evalScalarBinOp, hbeq, Nat.mul_eq, nat_ble_eq_decide, decide_eq_false hle,
+      simp only [evalScalarBinOp, hbeq, hrhsBeq, Nat.mul_eq, nat_ble_eq_decide, decide_eq_false hle,
         intBinEval, hnoob, ↓reduceIte, htoNat]
       refine ⟨fun z hz => ?_, fun h => by simp at h⟩
       injection hz with hz; subst hz
@@ -1192,35 +1503,35 @@ theorem evalRvalue_frag (decls : List LocalDecl) (locals : List LocalSlot)
       · simp only [evalRvalue, ha x hxo, evalUnaryNot_frag decls layouts it hsz op hok x hx, intUnArith]
       · simp [evalRvalue, ha x hxo, hbeq, Nat.sub_eq, wrap_neg_eq_toNat x _ hx, intUnArith]
   | .binaryOp op a b, hok =>
-    simp only [rvalueOk, Bool.and_eq_true] at hok
-    obtain ⟨⟨hop, hoka⟩, hokb⟩ := hok
-    obtain ⟨iop, hiop⟩ := Option.isSome_iff_exists.mp hop
+    obtain ⟨iop, rhsIt, hiop, hoka, hrhsTy, hokb, hhom⟩ := rvalueOk_binaryOp hok
+    obtain ⟨_, _, hrhsTyOf⟩ := operandTy_of_operandOk decls layouts rhsIt b hokb
+    have hrhsGood : GoodSize rhsIt.size.bytes := intTypeOf_good hrhsTyOf
     obtain ⟨ha, hanone⟩ :=
       evalOperand_frag decls locals hslots hn it a hoka mem.borrows mem.globals layouts mem.callerLocals
     obtain ⟨hb, hbnone⟩ :=
-      evalOperand_frag decls locals hslots hn it b hokb mem.borrows mem.globals layouts mem.callerLocals
+      evalOperand_frag decls locals hslots hn rhsIt b hokb mem.borrows mem.globals layouts mem.callerLocals
     cases hxa : opBits locals a with
     | none =>
-      refine ⟨fun r hr => by simp [rvBits, hiop, hxa] at hr, fun _ => ?_⟩
+      refine ⟨fun r hr => by simp [rvBits, hiop, hrhsTy, hxa] at hr, fun _ => ?_⟩
       simp [evalRvalue, hanone hxa]
     | some x =>
       cases hyb : opBits locals b with
       | none =>
-        refine ⟨fun r hr => by simp [rvBits, hiop, hxa, hyb] at hr, fun _ => ?_⟩
+        refine ⟨fun r hr => by simp [rvBits, hiop, hrhsTy, hxa, hyb] at hr, fun _ => ?_⟩
         simp [evalRvalue, ha x hxa, hbnone hyb]
       | some y =>
         have hx := opBits_lt decls locals hslots it a hoka x hxa
-        have hy := opBits_lt decls locals hslots it b hokb y hyb
+        have hy := opBits_lt decls locals hslots rhsIt b hokb y hyb
         have hsigned := operandIsSigned_of_operandOk decls layouts it a hoka
         obtain ⟨hbinOk, hbinNone⟩ :=
-          evalScalarBinOp_frag op iop hiop it hgood x y hx hy locals mem
-        cases hz : intBinEval iop (intFromBits x it) (intFromBits y it) it with
+          evalScalarBinOp_frag op iop hiop it rhsIt hgood hrhsGood hhom x y hx hy locals mem
+        cases hz : intBinEval iop (intFromBits x it) (intFromBits y rhsIt) it with
         | none =>
-          refine ⟨fun r hr => by simp [rvBits, hiop, hxa, hyb, hz] at hr, fun _ => ?_⟩
+          refine ⟨fun r hr => by simp [rvBits, hiop, hrhsTy, hxa, hyb, hz] at hr, fun _ => ?_⟩
           simp [evalRvalue, ha x hxa, hb y hyb, hsigned, hbinNone hz]
         | some z =>
-          refine ⟨fun r hr => ?_, fun h => by simp [rvBits, hiop, hxa, hyb, hz] at h⟩
-          simp [rvBits, hiop, hxa, hyb, hz] at hr
+          refine ⟨fun r hr => ?_, fun h => by simp [rvBits, hiop, hrhsTy, hxa, hyb, hz] at h⟩
+          simp [rvBits, hiop, hrhsTy, hxa, hyb, hz] at hr
           subst hr
           simp [evalRvalue, ha x hxa, hb y hyb, hsigned, hbinOk z hz]
   | .cast .intToInt op targetTy, hok =>

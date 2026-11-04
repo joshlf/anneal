@@ -123,8 +123,8 @@ executable meaning of the fragment is `Interp.lean`.
 functions needed to run the fragment below on `Machine<BasicMemory<x86_64>>`:
 `Machine::step` (single enabled thread), `Statement::{Assign, PlaceMention}`,
 `PlaceExpr::Local`, `ValueExpr::{Constant, Load, UnOp, BinOp}` with
-`IntUnOp::{Neg, BitNot}`, `CastOp::IntToInt`, and
-`IntBinOp::{Add, AddUnchecked, Sub, SubUnchecked, Mul, MulUnchecked, Div, DivExact, Rem}`,
+`IntUnOp::{Neg, BitNot, CountOnes}` (all 3 `IntUnOp` variants), `CastOp::IntToInt`, and
+`IntBinOp::{Add, AddUnchecked, Sub, SubUnchecked, Mul, MulUnchecked, Div, DivExact, Rem, Shl, Shr, ShlUnchecked, ShrUnchecked, BitAnd, BitOr, BitXor}` (all 16 `IntBinOp` variants),
 `Terminator::{Goto, Switch, Return, Unreachable}` including
 frame teardown and both stack-pop actions, the representation relation for
 `Int` and `Bool`, `Type::layout`, `BasicMemory`'s `check_ptr`, `load`, `store`,
@@ -138,7 +138,7 @@ comments; `..` marks elided code). Effects are
 (a panic in the spec, which upstream calls a spec bug), and
 `Stop.unsupported` (outside the interpreted fragment; never silently wrong).
 
-`Anchors.lean` lists the 37 upstream items that `Interp.lean` transcribes,
+`Anchors.lean` lists the 38 upstream items that `Interp.lean` transcribes,
 each with its name, line, and token hash, and proves by `decide` that the
 generated model contains them unchanged. Re-pinning MiniRust therefore breaks
 the build until every affected transcription is re-reviewed.
@@ -156,13 +156,14 @@ restricted to the fragment checked by `inFragment`:
   and the arguments, all of integer type (`u8`..`u128`, `i8`..`i128`,
   `usize`, `isize`);
 * statements are `_i = Use(op)`, `_i = UnaryOp(Neg | Not, op)`,
-  `_i = BinaryOp(Add | Sub | Mul | Div | Rem | Shl | Shr | AddUnchecked | SubUnchecked | MulUnchecked | ShlUnchecked | ShrUnchecked, op, op)`,
+  `_i = BinaryOp(Add | Sub | Mul | Div | Rem | BitXor | BitAnd | BitOr | Shl | Shr | AddUnchecked | SubUnchecked | MulUnchecked | ShlUnchecked | ShrUnchecked, opL, opR)`,
   `_i = Cast(CastKind::IntToInt, op, targetTy)`, or `PlaceMention(_i)`,
-  with `op` a projection-free `copy _j` or an integer constant (of `_i`'s type
-  for `Use`/`UnaryOp`/`BinaryOp`, or of any integer type for `Cast(IntToInt)`);
-* terminators are `Goto`, `SwitchInt` on an integer `copy _j` with distinct
-  in-range values, `Return`, and `Unreachable`; all targets are blocks of the
-  body; no cleanup blocks.
+  with `op`, `opL`, `opR` projection-free `copy _j` or integer constants (of `_i`'s
+  type for `Use`, `UnaryOp`, `opL`, and non-shift `opR`, or of any integer type
+  for shift `opR` and `Cast(IntToInt)`);
+* terminators are `Goto`, `SwitchInt` on any integer fragment operand (`copy _j`
+  or constant) with distinct in-range values, `Return`, and `Unreachable`; all
+  targets are blocks of the body; no cleanup blocks.
 
 ### States
 
@@ -301,6 +302,19 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `ShlUnchecked` on valid shift counts (`shiftOk_minirust_ret_from_start`,
   `shiftOk_noUB`, `shiftOk_minirust_direct`), and all four unchecked-shift UB
   paths (`s >= bits` and `s < 0` for both `ShrUnchecked` and `ShlUnchecked`).
+* `bitwiseI8` (plus `countOnes_neg86_i8` and `countOnes_neg1_i8`), a signed `i8`
+  body exercising two's-complement `BitAnd`, `BitOr`, and `BitXor` on negative
+  operands (`(-86i8) & (-15i8) = -96i8`, `(-96i8) | (-123i8) = -91i8`, and
+  `(-91i8) ^ (-59i8) = 96i8`, cancelling infinite leading two's-complement `1`
+  bits under `BitXor`), alongside direct ground-truth checks of
+  `IntUnOp::CountOnes` returning `u32` on negative `i8` inputs.
+* `heteroShiftSwitch`, a mixed-type `(i8, u32, i32)` body exercising
+  heterogeneous wrapping `Shr` and `Shl` (`-64i8 >> 258u32 = -16i8` and
+  `-16i8 << 257u32 = -32i8` with shift counts `>= 256`), constant-operand
+  signed `SwitchInt` (`switchInt(const -1i8)`), and heterogeneous `(i8, i32)`
+  `ShrUnchecked` / `ShlUnchecked` (`-32i8 >> 3i32 = -4i8`, `-4i8 << 3i32 = -32i8`),
+  plus UB checks at `k = 8i32` (`8 >= i8::BITS` even though `8 < i32::BITS`)
+  and `k = -1i32` (`-1 < 0`).
 
 ### Gaps
 
@@ -322,8 +336,8 @@ These are deliberate and are the first things to lift:
   visible leakage event; MiniRust has no counterpart, so `StepRel` matches it
   with an ordinary MiniRust step.
 * **Integers only.** No `bool` discriminants (`minimize` inserts a transmute),
-  no pointers, references, aggregates, non-integer casts, comparisons, bitwise
-  or shift binary operators, checked arithmetic, calls, drops, or assertions.
+  no pointers, references, aggregates, non-integer casts, comparisons,
+  checked arithmetic, calls, drops, or assertions.
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.
