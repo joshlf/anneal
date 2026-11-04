@@ -75,8 +75,11 @@ checking the crate's `Trusted.CrateTheorem` (`VerificationResult` over every
 captured function's `Compiler.Verified` obligations) inside the Lean 4 kernel.
 
 See [`README.md`](README.md) for the correctness policy and `trusted/`
-invariant. Before placing or modifying code, check whether it belongs inside
-`trusted/` or outside it (`theory/`):
+invariant, [`docs/design.md`](docs/design.md) for the overall design,
+[`docs/architecture.md`](docs/architecture.md) for the three-stage MIR pipeline
+and repository layout, and [`docs/trust-model.md`](docs/trust-model.md) for
+the trust model and boundary enforcement. Before placing or modifying code,
+check whether it belongs inside `trusted/` or outside it (`theory/`):
 
 - Only primitive semantic and theorem definitions required to state or gate
   `Trusted.CrateTheorem` and `VerificationResult` (`trusted/lean/`) and
