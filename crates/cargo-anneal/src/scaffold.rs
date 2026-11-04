@@ -209,14 +209,17 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
         && (spec_is_ub_exception
             || proof_text.as_deref().is_some_and(|text| {
                 text.contains("UbExceptionVerificationResult")
-                    || (text.contains("ubExceptionClaim")
+                    || ((text.contains("ubExceptionClaim")
+                        || text.contains("polyUbExceptionClaim"))
                         && !text.contains("ModularVerificationResult"))
             }));
 
     let is_modular = !is_ub_exception
         && (spec_is_modular
             || proof_text.as_deref().is_some_and(|text| {
-                text.contains("modularClaim") || text.contains("ModularVerificationResult")
+                text.contains("modularClaim")
+                    || text.contains("polyModularClaim")
+                    || text.contains("ModularVerificationResult")
             }));
 
     let is_equiv = !is_ub_exception
@@ -233,7 +236,9 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
         && (spec_text.as_deref().is_some_and(|text| {
             text.contains("TotalItemSpec") || text.contains("refineTotalSpec")
         }) || proof_text.as_deref().is_some_and(|text| {
-            text.contains("totalClaim") || text.contains("TotalVerificationResult")
+            text.contains("totalClaim")
+                || text.contains("polyTotalClaim")
+                || text.contains("TotalVerificationResult")
         }));
 
     let spec_is_stateful = spec_text.as_deref().is_some_and(|text| {
@@ -242,7 +247,9 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
             || text.contains("refineSafeStatefulSpec")
     });
     let proof_is_stateful = proof_text.as_deref().is_some_and(|text| {
-        text.contains("statefulClaim") || text.contains("StatefulVerificationResult")
+        text.contains("statefulClaim")
+            || text.contains("polyStatefulClaim")
+            || text.contains("StatefulVerificationResult")
     });
     let is_polymorphic = proof_text.as_deref().is_some_and(|text| {
         text.contains("polyClaim")
@@ -1440,6 +1447,43 @@ mod tests {
             proof_text.contains("import Obligations.MyCrate.add\nimport Specs.MyCrate.add\n"),
             "created Proof template must automatically import Specs.MyCrate.add when --init-specs and --init-proofs are used together:\n{proof_text}"
         );
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn detects_polymorphic_proofs_across_all_claim_surfaces() {
+        let workspace = unique_temp_dir("poly-detect");
+        let proofs_root = workspace.join("anneal/proofs");
+        let rel_path = Path::new("MyCrate/poly_fn.lean");
+        let proof_path = proofs_root.join("Proof").join(rel_path);
+        fs::create_dir_all(proof_path.parent().expect("proof parent")).expect("create proof dir");
+
+        let cases = [
+            ("polyClaim", false, false, false, false),
+            ("polyStatefulClaim", true, false, false, false),
+            ("polyTotalClaim", false, true, false, false),
+            ("polyModularClaim", false, false, true, false),
+            ("polyUbExceptionClaim", false, false, false, true),
+        ];
+
+        for (claim_tok, exp_stateful, exp_total, exp_modular, exp_ub) in cases {
+            fs::write(
+                &proof_path,
+                format!("theorem verified : Obligations.MyCrate.poly_fn.{claim_tok} := sorry\n"),
+            )
+            .expect("write poly proof");
+            let detected = detect_authored_item_modules(&proofs_root, rel_path);
+            assert!(detected.has_proof);
+            assert!(detected.is_polymorphic, "expected is_polymorphic for {claim_tok}");
+            assert_eq!(detected.is_stateful, exp_stateful, "stateful mismatch for {claim_tok}");
+            assert_eq!(detected.is_total, exp_total, "total mismatch for {claim_tok}");
+            assert_eq!(detected.is_modular, exp_modular, "modular mismatch for {claim_tok}");
+            assert_eq!(
+                detected.is_ub_exception, exp_ub,
+                "ub_exception mismatch for {claim_tok}"
+            );
+        }
 
         let _ = fs::remove_dir_all(&workspace);
     }

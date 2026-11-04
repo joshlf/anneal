@@ -108,14 +108,36 @@ def maxIsizeBytes (ptrBits : Nat) : Nat :=
 
 /--
 Test whether `layout` is the synthetic generic-parameter placeholder entry
-(`size = 0`, `variants = .empty`, `isUninhabited = false`) emitted for an
-unsubstituted `RigidTy.param` (`@[reducible]` for `dsimp` reduction).
+(`size = 0`, `isUninhabited = false`, and either `variants = .empty` or
+`fields = .primitive`) emitted for an unsubstituted `RigidTy.param`
+(`@[reducible]` for `dsimp` reduction).
 -/
 @[reducible, simp]
 def sigIsParamPlaceholder (layout : TypeLayout) : Bool :=
-  match layout.variants with
-  | .empty => Nat.beq layout.size.bytes 0 && !layout.isUninhabited
-  | _ => false
+  match layout.variants, layout.fields with
+  | .empty, _ => Nat.beq layout.size.bytes 0 && !layout.isUninhabited
+  | _, .primitive => Nat.beq layout.size.bytes 0 && !layout.isUninhabited
+  | _, _ => false
+
+/--
+Test whether any `RigidTy` in a worklist contains an uninstantiated
+`RigidTy.param` or `RigidTy.alias` within `fuel` steps (`@[reducible]` for
+kernel `dsimp` reduction).
+-/
+@[reducible, simp]
+def sigWorklistHasTypeParam : Nat → List RigidTy → Bool
+  | 0, _ => false
+  | _, .nil => false
+  | fuel' + 1, k :: rest =>
+    match k with
+    | .param _ _ | .alias _ _ => true
+    | .tuple inner | .adt _ inner | .fnDef _ inner | .closure _ inner =>
+      sigWorklistHasTypeParam fuel' (List.append inner rest)
+    | .array inner _ | .slice inner | .ref _ inner | .rawPtr _ inner =>
+      sigWorklistHasTypeParam fuel' (inner :: rest)
+    | .fnPtr inputs output _ _ =>
+      sigWorklistHasTypeParam fuel' (output :: List.append inputs rest)
+    | _ => sigWorklistHasTypeParam fuel' rest
 
 /--
 Test whether `val` lies within `range : WrappingRange` (`@[reducible]` for
@@ -265,16 +287,27 @@ def sigIntByteWidth (ptrBits : Nat) : IntTy → Nat
   | .isize => Nat.div ptrBits 8
 
 /--
-Search `decls` for the first `LocalDecl` whose `ty.kind` is an `.adt`, returning
-its `layoutIdx`.
+Boolean equality on `String` (`@[reducible, simp]` for `simp` and `decide`
+reduction).
 -/
 @[reducible, simp]
-def findAdtDeclLayoutIdx : List LocalDecl → Option LayoutIdx
+def sigStringEq (a b : String) : Bool :=
+  decide (a = b)
+
+/--
+Search `decls` for the first `LocalDecl` whose `ty.kind` is an `.adt` with
+definition path `adtDefPath`, returning its `layoutIdx`.
+-/
+@[reducible, simp]
+def findAdtDeclLayoutIdx (adtDefPath : String) : List LocalDecl → Option LayoutIdx
   | .nil => .none
   | d :: rest =>
     match d.ty.kind with
-    | .adt _ _ => .some d.ty.layoutIdx
-    | _ => findAdtDeclLayoutIdx rest
+    | .adt dPath _ =>
+      match sigStringEq dPath adtDefPath with
+      | true => .some d.ty.layoutIdx
+      | false => findAdtDeclLayoutIdx adtDefPath rest
+    | _ => findAdtDeclLayoutIdx adtDefPath rest
 
 /--
 Test whether any `LocalDecl` in `decls` references layout table slot `idx`.
@@ -320,79 +353,120 @@ def resolveChildLayout
     (fieldPos : Option Nat)
     (childKind : RigidTy) :
     Option TypeLayout :=
-  let fromFieldLayouts : Option TypeLayout :=
-    match fieldPos with
-    | .some pos =>
-      match sigGet? parentLayout.fieldLayouts pos with
-      | .some fIdx => sigGet? body.layouts.entries fIdx
-      | .none => .none
+  match sigWorklistHasTypeParam 8 (childKind :: .nil) with
+  | true => .none
+  | false =>
+    let fromFieldLayouts : Option TypeLayout :=
+      match fieldPos with
+      | .some pos =>
+        match sigGet? parentLayout.fieldLayouts pos with
+        | .some fIdx => sigGet? body.layouts.entries fIdx
+        | .none => .none
+      | .none =>
+        match parentLayout.fieldLayouts with
+        | fIdx :: .nil => sigGet? body.layouts.entries fIdx
+        | _ => .none
+    match fromFieldLayouts with
+    | .some l => .some l
     | .none =>
-      match parentLayout.fieldLayouts with
-      | fIdx :: .nil => sigGet? body.layouts.entries fIdx
-      | _ => .none
-  match fromFieldLayouts with
-  | .some l => .some l
-  | .none =>
-    let effPtrBits :=
-      match Nat.beq body.layouts.pointerBits 0 with
-      | true => 64
-      | false => body.layouts.pointerBits
-    match childKind with
-    | .uint w =>
-      let sz := maxNat 1 (sigUintByteWidth effPtrBits w)
-      let bits := sz * 8
-      .some
-        { size := ⟨sz⟩
-          align := ⟨sz⟩
-          backendRepr :=
-            .scalar (.initialized (.int bits false) ⟨0, 2 ^ bits - 1⟩)
-          fields := .primitive
-          variants := .single 0
-          isUninhabited := false }
-    | .int w =>
-      let sz := maxNat 1 (sigIntByteWidth effPtrBits w)
-      let bits := sz * 8
-      .some
-        { size := ⟨sz⟩
-          align := ⟨sz⟩
-          backendRepr :=
-            .scalar (.initialized (.int bits true) ⟨0, 2 ^ bits - 1⟩)
-          fields := .primitive
-          variants := .single 0
-          isUninhabited := false }
-    | .adt _ adtArgs =>
-      let nextIdx := parentLayoutIdx + 1
-      let fallback :=
-        match findAdtDeclLayoutIdx body.localDecls with
-        | .some declIdx => sigGet? body.layouts.entries declIdx
-        | .none =>
-          findUnusedLayoutInTable body.localDecls body.layouts.entries 0
-      let candOpt : Option TypeLayout :=
-        match localDeclsUseLayoutIdx body.localDecls nextIdx with
-        | false =>
-          match sigGet? body.layouts.entries nextIdx with
-          | .some candL =>
-            match sigIsParamPlaceholder candL with
-            | false => .some candL
-            | true => fallback
-          | .none => fallback
-        | true => fallback
-      match adtArgs with
-      | .nil => candOpt
-      | _ :: _ =>
+      let effPtrBits :=
+        match Nat.beq body.layouts.pointerBits 0 with
+        | true => 64
+        | false => body.layouts.pointerBits
+      match childKind with
+      | .uint w =>
+        let sz := maxNat 1 (sigUintByteWidth effPtrBits w)
+        let bits := sz * 8
+        .some
+          { size := ⟨sz⟩
+            align := ⟨sz⟩
+            backendRepr :=
+              .scalar (.initialized (.int bits false) ⟨0, 2 ^ bits - 1⟩)
+            fields := .primitive
+            variants := .single 0
+            isUninhabited := false }
+      | .int w =>
+        let sz := maxNat 1 (sigIntByteWidth effPtrBits w)
+        let bits := sz * 8
+        .some
+          { size := ⟨sz⟩
+            align := ⟨sz⟩
+            backendRepr :=
+              .scalar (.initialized (.int bits true) ⟨0, 2 ^ bits - 1⟩)
+            fields := .primitive
+            variants := .single 0
+            isUninhabited := false }
+      | .adt adtDefPath adtArgs =>
+        match
+          Bool.or
+            (sigStringEq adtDefPath "core::mem::maybe_uninit::MaybeUninit")
+            (sigStringEq adtDefPath "std::mem::MaybeUninit"),
+          adtArgs
+        with
+        | true, innerKind :: .nil =>
+          match
+            RigidTy.computeLayout
+              body.layouts.pointerBits
+              body.layouts.entries
+              .nil
+              .none
+              innerKind
+          with
+          | .some innerL =>
+            .some
+              { size := innerL.size
+                align := innerL.align
+                backendRepr := .memory
+                fields := .union 2
+                variants := .single 0
+                isUninhabited := innerL.isUninhabited }
+          | .none => .none
+        | _, _ =>
+          match
+            Bool.or
+              (sigStringEq adtDefPath "core::ops::range::Range")
+              (sigStringEq adtDefPath "std::ops::Range"),
+            adtArgs
+          with
+          | true, idxKind :: .nil =>
+            RigidTy.computeLayout
+              body.layouts.pointerBits
+              body.layouts.entries
+              .nil
+              .none
+              (.tuple (idxKind :: idxKind :: .nil))
+          | _, _ =>
+            let nextIdx := parentLayoutIdx + 1
+            let fallback :=
+              match findAdtDeclLayoutIdx adtDefPath body.localDecls with
+              | .some declIdx => sigGet? body.layouts.entries declIdx
+              | .none => .none
+            let candOpt : Option TypeLayout :=
+              match localDeclsUseLayoutIdx body.localDecls nextIdx with
+              | false =>
+                match sigGet? body.layouts.entries nextIdx with
+                | .some candL =>
+                  match sigIsParamPlaceholder candL with
+                  | false => .some candL
+                  | true => fallback
+                | .none => fallback
+              | true => fallback
+            match candOpt with
+            | .some candL => .some candL
+            | .none =>
+              RigidTy.computeLayout
+                body.layouts.pointerBits
+                body.layouts.entries
+                .nil
+                .none
+                childKind
+      | _ =>
         RigidTy.computeLayout
           body.layouts.pointerBits
           body.layouts.entries
           .nil
-          candOpt
+          .none
           childKind
-    | _ =>
-      RigidTy.computeLayout
-        body.layouts.pointerBits
-        body.layouts.entries
-        .nil
-        .none
-        childKind
 
 /--
 Check whether Tree Borrows permission `perm` permits a reference with mutability
@@ -428,6 +502,20 @@ def selectVariantTypeArgs :
       | _ :: tail@(_ :: _) => tail
       | _ => adtArgs
     selectVariantTypeArgs v restShapes nextArgs
+
+/--
+Compute the starting index in `parentLayout.fieldLayouts` for variant `vIdx` of
+a multi-variant enum (`VariantsShape.multiple`), summing the field counts of all
+preceding variants (`< vIdx`).
+-/
+@[reducible, simp]
+def variantFieldBaseOffset : Nat → List FieldsShape → Nat
+  | 0, _ => 0
+  | _ + 1, .nil => 0
+  | v + 1, .arbitrary varOffsets _ :: restShapes =>
+    varOffsets.length + variantFieldBaseOffset v restShapes
+  | v + 1, _ :: restShapes =>
+    variantFieldBaseOffset v restShapes
 
 /--
 Recursively validate every `Value` in a list using `elemPred`.
@@ -521,8 +609,12 @@ def valueMatchesLayoutOnly :
     layout.isUninhabited = false ∧
       sigIsParamPlaceholder layout = false ∧
       match layout.variants, layout.fields with
-      | .single 0, .arbitrary .nil _ => layout.size.bytes = 0
-      | .single 0, .array _ 0 => layout.size.bytes = 0
+      | .single expectedVar, .arbitrary .nil _ =>
+        expectedVar = 0 ∧ layout.size.bytes = 0
+      | .single expectedVar, .array _ count =>
+        expectedVar = 0 ∧ count = 0 ∧ layout.size.bytes = 0
+      | .single expectedVar, .union count =>
+        expectedVar = 0 ∧ 0 < count
       | _, _ => False
   | _ + 1, _, .some layout, _, .scalar sv, _ =>
     layout.isUninhabited = false ∧
@@ -567,28 +659,31 @@ def valueMatchesLayoutOnly :
               fields.length = offsets.length ∧
               adtFieldsLayoutOnlyWith fuel' body layout recPred 0 fields
         | .array stride count =>
-          match count with
-          | 0 =>
+          match Nat.beq count 0 with
+          | true =>
             layout.size.bytes = 0 ∧ vIdx = expectedVar ∧ fields = .nil
-          | _ + 1 =>
+          | false =>
             vIdx = expectedVar ∧
               fields.length = count ∧
               adtArrayLayoutOnlyWith body layout stride.bytes recPred fields
         | .union count =>
           0 < count ∧
-            match fields with
-            | .cons fVal .nil =>
-              vIdx = expectedVar ∧
-                adtFieldsLayoutOnlyWith
-                  fuel' body layout recPred 0 (.cons fVal .nil)
-            | _ => False
+            vIdx = expectedVar ∧
+            fields.length ≤ 1 ∧
+            arrayElemsMatchWith (valueMatchesUntypedField fuel') fields
       | .multiple tag _ variantShapes =>
         vIdx < variantShapes.length ∧
           tagMatchesScalarLayout tag vIdx ∧
           match sigGet? variantShapes vIdx with
           | .some (.arbitrary varOffsets _) =>
             fields.length = varOffsets.length ∧
-              adtFieldsLayoutOnlyWith fuel' body layout recPred 0 fields
+              adtFieldsLayoutOnlyWith
+                fuel'
+                body
+                layout
+                recPred
+                (variantFieldBaseOffset vIdx variantShapes)
+                fields
           | .some .primitive => fields = .nil
           | _ => False
 
@@ -740,20 +835,24 @@ def valueMatchesRigidTyAndLayout :
       match kind with
       | .fnDef _ _ | .tuple .nil | .closure _ .nil =>
         layout.size.bytes = 0
-      | .array elemKind 0 =>
-        layout.size.bytes = 0 ∧
+      | .array elemKind len =>
+        len = 0 ∧
+          layout.size.bytes = 0 ∧
           match resolveChildLayout body layout layoutIdx (.some 0) elemKind with
           | .none => False
           | .some elemLayout =>
             elemLayout.isUninhabited = false ∧
               sigIsParamPlaceholder elemLayout = false
-      | .adt _ _ =>
-        match layout.variants, layout.fields with
-        | .single expectedVar, .arbitrary .nil _ =>
-          expectedVar = 0 ∧ layout.size.bytes = 0
-        | .single expectedVar, .array _ count =>
-          expectedVar = 0 ∧ count = 0 ∧ layout.size.bytes = 0
-        | _, _ => False
+      | .adt _ adtArgs =>
+        sigWorklistHasTypeParam 8 adtArgs = false ∧
+          match layout.variants, layout.fields with
+          | .single expectedVar, .arbitrary .nil _ =>
+            expectedVar = 0 ∧ layout.size.bytes = 0
+          | .single expectedVar, .array _ count =>
+            expectedVar = 0 ∧ count = 0 ∧ layout.size.bytes = 0
+          | .single expectedVar, .union count =>
+            expectedVar = 0 ∧ 0 < count
+          | _, _ => False
       | _ => False
   | _ + 1, _, kind, .some layout, _, .scalar sv, _ =>
     layout.isUninhabited = false ∧
@@ -785,14 +884,15 @@ def valueMatchesRigidTyAndLayout :
           sv.sizeBytes = layout.size.bytes ∧
             0 < sv.sizeBytes ∧
             sv.bits < 2 ^ (sv.sizeBytes * 8)
-      | .adt _ _ =>
-        match layout.variants, layout.fields with
-        | .single _, .union count =>
-          0 < count ∧
-            sv.sizeBytes = layout.size.bytes ∧
-            0 < sv.sizeBytes ∧
-            sv.bits < 2 ^ (sv.sizeBytes * 8)
-        | _, _ => False
+      | .adt _ adtArgs =>
+        sigWorklistHasTypeParam 8 adtArgs = false ∧
+          match layout.variants, layout.fields with
+          | .single _, .union count =>
+            0 < count ∧
+              sv.sizeBytes = layout.size.bytes ∧
+              0 < sv.sizeBytes ∧
+              sv.bits < 2 ^ (sv.sizeBytes * 8)
+          | _, _ => False
       | _ => False
   | fuel' + 1, body, kind, .some layout, layoutIdx, .ptr p ptrSz, mem =>
     layout.isUninhabited = false ∧
@@ -977,57 +1077,54 @@ def valueMatchesRigidTyAndLayout :
               tupleFieldsMatchWith
                 body layout layoutIdx recTyPred 0 upvarKinds fields
       | .adt _ adtArgs =>
-        match layout.variants with
-        | .empty => False
-        | .single expectedVar =>
-          match layout.fields with
-          | .primitive => False
-          | .arbitrary offsets _ =>
-            match offsets with
-            | .nil =>
-              layout.size.bytes = 0 ∧ vIdx = expectedVar ∧ fields = .nil
-            | _ :: _ =>
-              vIdx = expectedVar ∧
-                fields.length = offsets.length ∧
-                adtFieldsMatchWith
-                  fuel' body layout layoutIdx recTyPred mem 0 adtArgs fields
-          | .array stride count =>
-            match Nat.beq count 0 with
-            | true =>
-              layout.size.bytes = 0 ∧ vIdx = expectedVar ∧ fields = .nil
-            | false =>
-              vIdx = expectedVar ∧
-                fields.length = count ∧
-                adtArrayElemsMatchWith
-                  fuel' body layout layoutIdx stride.bytes adtArgs recTyPred
-                  mem fields
-          | .union count =>
-            0 < count ∧
-              match fields with
-              | .cons fVal .nil =>
+        sigWorklistHasTypeParam 8 adtArgs = false ∧
+          match layout.variants with
+          | .empty => False
+          | .single expectedVar =>
+            match layout.fields with
+            | .primitive => False
+            | .arbitrary offsets _ =>
+              match offsets with
+              | .nil =>
+                layout.size.bytes = 0 ∧ vIdx = expectedVar ∧ fields = .nil
+              | _ :: _ =>
                 vIdx = expectedVar ∧
+                  fields.length = offsets.length ∧
                   adtFieldsMatchWith
-                    fuel' body layout layoutIdx recTyPred mem 0 adtArgs
-                    (.cons fVal .nil)
+                    fuel' body layout layoutIdx recTyPred mem 0 adtArgs fields
+            | .array stride count =>
+              match Nat.beq count 0 with
+              | true =>
+                layout.size.bytes = 0 ∧ vIdx = expectedVar ∧ fields = .nil
+              | false =>
+                vIdx = expectedVar ∧
+                  fields.length = count ∧
+                  adtArrayElemsMatchWith
+                    fuel' body layout layoutIdx stride.bytes adtArgs recTyPred
+                    mem fields
+            | .union count =>
+              0 < count ∧
+                vIdx = expectedVar ∧
+                fields.length ≤ 1 ∧
+                arrayElemsMatchWith (valueMatchesUntypedField fuel') fields
+          | .multiple tag _ variantShapes =>
+            vIdx < variantShapes.length ∧
+              tagMatchesScalarLayout tag vIdx ∧
+              match sigGet? variantShapes vIdx with
+              | .some (.arbitrary varOffsets _) =>
+                fields.length = varOffsets.length ∧
+                  adtFieldsMatchWith
+                    fuel'
+                    body
+                    layout
+                    layoutIdx
+                    recTyPred
+                    mem
+                    (variantFieldBaseOffset vIdx variantShapes)
+                    (selectVariantTypeArgs vIdx variantShapes adtArgs)
+                    fields
+              | .some .primitive => fields = .nil
               | _ => False
-        | .multiple tag _ variantShapes =>
-          vIdx < variantShapes.length ∧
-            tagMatchesScalarLayout tag vIdx ∧
-            match sigGet? variantShapes vIdx with
-            | .some (.arbitrary varOffsets _) =>
-              fields.length = varOffsets.length ∧
-                adtFieldsMatchWith
-                  fuel'
-                  body
-                  layout
-                  layoutIdx
-                  recTyPred
-                  mem
-                  0
-                  (selectVariantTypeArgs vIdx variantShapes adtArgs)
-                  fields
-            | .some .primitive => fields = .nil
-            | _ => False
       | _ => False
 
 /--
