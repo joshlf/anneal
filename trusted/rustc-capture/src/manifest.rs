@@ -102,6 +102,13 @@ pub struct CapturedTarget {
     pub mir_module_sha256: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestTraitImplEntry {
+    pub trait_method_def_path: String,
+    pub trait_args_lean: Vec<String>,
+    pub impl_path: String,
+}
+
 /// Extended per-item metadata recorded by `anneal-rustc-capture` in
 /// `UnitCaptureManifest.json` so `cargo-anneal` can assemble obligation and
 /// verification modules without re-parsing Rust or Lean source.
@@ -117,6 +124,8 @@ pub struct UnitTargetRecord {
     /// For specification items (`InlineSpec*`, `ExternalSpec`), the canonical
     /// `def_id` of the subject item to which this contract attaches.
     pub associated_subject_def_id: Option<String>,
+    /// Trait method implementations provided by this item, for global trait dispatch.
+    pub trait_impls: Vec<ManifestTraitImplEntry>,
 }
 
 /// Per-compilation-unit manifest written by a single `anneal-rustc-capture`
@@ -216,11 +225,26 @@ impl UnitCaptureManifest {
             ));
             match &rec.associated_subject_def_id {
                 Some(subj) => out.push_str(&format!(
-                    "      \"associated_subject_def_id\": \"{}\"\n",
+                    "      \"associated_subject_def_id\": \"{}\",\n",
                     escape_json(subj)
                 )),
-                None => out.push_str("      \"associated_subject_def_id\": null\n"),
+                None => out.push_str("      \"associated_subject_def_id\": null,\n"),
             }
+            out.push_str("      \"trait_impls\": [\n");
+            for (j, imp) in rec.trait_impls.iter().enumerate() {
+                let comma2 = if j + 1 < rec.trait_impls.len() { "," } else { "" };
+                out.push_str("        {\n");
+                out.push_str(&format!("          \"trait_method_def_path\": \"{}\",\n", escape_json(&imp.trait_method_def_path)));
+                out.push_str("          \"trait_args_lean\": [\n");
+                for (k, arg) in imp.trait_args_lean.iter().enumerate() {
+                    let comma3 = if k + 1 < imp.trait_args_lean.len() { "," } else { "" };
+                    out.push_str(&format!("            \"{}\"{}\n", escape_json(arg), comma3));
+                }
+                out.push_str("          ],\n");
+                out.push_str(&format!("          \"impl_path\": \"{}\"\n", escape_json(&imp.impl_path)));
+                out.push_str(&format!("        }}{comma2}\n"));
+            }
+            out.push_str("      ]\n");
             out.push_str(&format!("    }}{comma}\n"));
         }
         out.push_str("  ]\n}\n");
@@ -275,11 +299,37 @@ impl UnitCaptureManifest {
                     ));
                 }
             };
+            let mut trait_impls = Vec::new();
+            if let Some(JsonValue::Array(arr)) = entry_obj.get("trait_impls") {
+                for item in arr {
+                    let obj = item.as_object().ok_or_else(|| String::from("trait_impls entry must be an object"))?;
+                    let trait_method_def_path = get_string_field(obj, "trait_method_def_path")?;
+                    let impl_path = get_string_field(obj, "impl_path")?;
+                    let mut trait_args_lean = Vec::new();
+                    if let Some(JsonValue::Array(args)) = obj.get("trait_args_lean") {
+                        for arg in args {
+                            if let JsonValue::String(s) = arg {
+                                trait_args_lean.push(s.clone());
+                            } else {
+                                return Err(String::from("trait_args_lean elements must be strings"));
+                            }
+                        }
+                    } else {
+                        return Err(String::from("field 'trait_args_lean' must be an array"));
+                    }
+                    trait_impls.push(ManifestTraitImplEntry {
+                        trait_method_def_path,
+                        trait_args_lean,
+                        impl_path,
+                    });
+                }
+            }
             unit_targets.push(UnitTargetRecord {
                 target,
                 lean_module_name,
                 item_kind,
                 associated_subject_def_id,
+                trait_impls,
             });
         }
 
@@ -854,7 +904,7 @@ mod tests {
                     },
                     lean_module_name: String::from("Mir.Demo.f"),
                     item_kind: CapturedItemKind::Subject,
-                    associated_subject_def_id: None,
+                    associated_subject_def_id: None, trait_impls: vec![],
                 },
                 UnitTargetRecord {
                     target: CapturedTarget {
@@ -864,7 +914,7 @@ mod tests {
                     },
                     lean_module_name: String::from("Mir.Demo.__anodized_fn_requires_f"),
                     item_kind: CapturedItemKind::InlineSpecRequires,
-                    associated_subject_def_id: Some(String::from("demo::f")),
+                    associated_subject_def_id: Some(String::from("demo::f")), trait_impls: vec![],
                 },
                 UnitTargetRecord {
                     target: CapturedTarget {
@@ -880,7 +930,7 @@ mod tests {
                         "Mir.Demo.Positive___anneal_type_invariant_positive",
                     ),
                     item_kind: CapturedItemKind::TypeInvariant,
-                    associated_subject_def_id: Some(String::from("demo::Positive")),
+                    associated_subject_def_id: Some(String::from("demo::Positive")), trait_impls: vec![],
                 },
                 UnitTargetRecord {
                     target: CapturedTarget {
@@ -894,7 +944,7 @@ mod tests {
                         "Mir.Demo.__anneal_unsafe_impl_Zeroable_for_Positive",
                     ),
                     item_kind: CapturedItemKind::UnsafeTraitImpl,
-                    associated_subject_def_id: Some(String::from("Zeroable::Positive")),
+                    associated_subject_def_id: Some(String::from("Zeroable::Positive")), trait_impls: vec![],
                 },
             ],
         };

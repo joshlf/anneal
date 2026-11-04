@@ -664,7 +664,7 @@ pub fn __anodized_fn_requires___anneal_unsafe_impl_TrustedZeroable_for_NonZeroCo
             .iter()
             .find(|t| {
                 t.target.def_id
-                    == "inv_demo::NonZeroCounter::__anneal_type_invariant_non_zero_counter"
+                    == "inv_demo::<NonZeroCounter>::__anneal_type_invariant_non_zero_counter"
             })
             .expect("find type invariant item in UnitCaptureManifest");
         assert_eq!(inv_target.item_kind, CapturedItemKind::TypeInvariant);
@@ -957,6 +957,90 @@ pub fn unselected_helper(y: u32) -> u32 {
             "expected ANNEAL_CAPTURE_FILTER={} to keep only keep_target and its spec companions",
             ANNEAL_CAPTURE_FILTER_ENV
         );
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn driver_captures_generic_functions_and_trait_impls() {
+        let temp_root = unique_temp_dir("generics-traits");
+        let capture_dir = temp_root.join("capture");
+        let out_dir = temp_root.join("out");
+        fs::create_dir_all(&capture_dir).expect("create capture dir");
+        fs::create_dir_all(&out_dir).expect("create out dir");
+
+        let src_path = temp_root.join("demo_generics.rs");
+        let sample_rust = r#"#![allow(dead_code, non_snake_case, non_upper_case_globals)]
+
+pub fn swap_pair<T>(a: T, b: T) -> (T, T) {
+    (b, a)
+}
+
+pub fn id<T>(x: T) -> T {
+    x
+}
+
+pub trait MyTrait {
+    type Assoc;
+    fn method(&self) -> Self::Assoc;
+}
+
+pub struct TypeA;
+pub struct TypeB;
+
+impl MyTrait for TypeA {
+    type Assoc = u32;
+    fn method(&self) -> u32 { 1 }
+}
+
+impl MyTrait for TypeB {
+    type Assoc = u64;
+    fn method(&self) -> u64 { 2 }
+}
+
+pub type MyAlias = TypeA;
+"#;
+        fs::write(&src_path, sample_rust.as_bytes()).expect("write sample rust source");
+
+        let args = vec![
+            "anneal-rustc-capture".to_owned(),
+            "rustc".to_owned(),
+            "--crate-name".to_owned(),
+            "demo_generics".to_owned(),
+            "--crate-type".to_owned(),
+            "lib".to_owned(),
+            "--edition=2024".to_owned(),
+            "--out-dir".to_owned(),
+            out_dir.to_string_lossy().into_owned(),
+            src_path.to_string_lossy().into_owned(),
+        ];
+
+        let code = run_with_args(&args, Some(capture_dir.clone()), None);
+        assert_eq!(code, 0, "expected run_with_args to succeed with exit code 0");
+        
+        let manifest_path = capture_dir.join("demo_generics").join("UnitCaptureManifest.json");
+        let manifest_content = fs::read_to_string(&manifest_path).unwrap();
+        let manifest: crate::manifest::UnitCaptureManifest = crate::manifest::UnitCaptureManifest::from_json_str(&manifest_content).unwrap();
+
+        let swap_pair = manifest.unit_targets.iter().find(|t| t.target.def_id.contains("swap_pair")).unwrap();
+        assert!(swap_pair.trait_impls.is_empty());
+        
+        let a_method = manifest.unit_targets.iter().find(|t| t.target.def_id.contains("TypeA") && t.target.def_id.contains("method"))
+            .unwrap_or_else(|| panic!("failed to find a_method. targets: {:?}", manifest.unit_targets.iter().map(|t| &t.target.def_id).collect::<Vec<_>>()));
+        let b_method = manifest.unit_targets.iter().find(|t| t.target.def_id.contains("TypeB") && t.target.def_id.contains("method")).unwrap();
+        
+        assert_ne!(a_method.target.def_id, b_method.target.def_id);
+        
+        assert_eq!(a_method.trait_impls.len(), 1);
+        assert_eq!(a_method.trait_impls[0].trait_method_def_path, "demo_generics::MyTrait::method");
+        assert_eq!(a_method.trait_impls[0].impl_path, a_method.target.def_id);
+
+        let swap_lean_path = capture_dir.join("demo_generics").join(&swap_pair.target.mir_module_path);
+        let swap_lean = fs::read_to_string(&swap_lean_path).unwrap();
+        assert!(swap_lean.contains("typeParamCount := 1"));
+        assert!(swap_lean.contains(".param 0"));
+        assert!(swap_lean.contains("genericParams :="));
+        assert!(swap_lean.contains("fieldLayouts :=")); // tuple field layouts should be captured
 
         let _ = fs::remove_dir_all(&temp_root);
     }

@@ -47,6 +47,21 @@ pub use crate::rustc_2026_06_01::specs::{
 /// Returns the canonical crate-qualified `DefId` path for `def_id` (for
 /// example, `"demo::answer"`).
 pub fn canonical_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
+    use rustc_hir::def::DefKind;
+    if let Some(parent_id) = tcx.opt_parent(def_id) {
+        if let DefKind::Impl { of_trait } = tcx.def_kind(parent_id) {
+            let item_name = tcx.item_name(def_id);
+            let crate_name = tcx.crate_name(def_id.krate).to_string();
+            let self_ty = tcx.type_of(parent_id).instantiate_identity().skip_norm_wip();
+            if of_trait {
+                let tr = tcx.impl_trait_ref(parent_id).instantiate_identity().skip_norm_wip();
+                return format!("{}::<{} as {}>::{}", crate_name, self_ty, tr, item_name);
+            } else {
+                return format!("{}::<{}>::{}", crate_name, self_ty, item_name);
+            }
+        }
+    }
+
     let raw = tcx.def_path_str(def_id);
     if def_id.is_local() {
         let crate_name = tcx.crate_name(LOCAL_CRATE).to_string();
@@ -177,8 +192,10 @@ pub fn lower_mir_body<'tcx>(
 
     let mut local_layouts = Vec::with_capacity(body.local_decls.len());
     for decl in body.local_decls.iter() {
+        use rustc_middle::ty::TypeVisitableExt;
         let layout = match tcx.layout_of(ctx.layout_builder.typing_env().as_query_input(decl.ty)) {
             Ok(tl) => lower_layout_data(&tl.layout.0),
+            Err(_) if decl.ty.has_param() => crate::rustc_2026_06_01::layout_lower::placeholder_param_layout(),
             Err(_) => crate::rustc_2026_06_01::layout_lower::fallback_zst_layout(),
         };
         local_layouts.push(layout);
@@ -198,6 +215,59 @@ pub fn lower_mir_body<'tcx>(
     }
     ctx.layout_builder.intern_ir_layout(fn_abi.ret.layout.clone());
 
+    let generics = tcx.generics_of(def_id);
+    let mut type_param_count = 0;
+    let mut generic_params = Vec::new();
+    for param in &generics.own_params {
+        if let rustc_middle::ty::GenericParamDefKind::Type { .. } = param.kind {
+            type_param_count += 1;
+            generic_params.push(crate::lean_emit::IrGenericParamDef {
+                index: param.index,
+                name: param.name.as_str().to_string(),
+            });
+        }
+    }
+    // Also include parent generics (for impl blocks)
+    if let Some(parent_id) = generics.parent {
+        let parent_generics = tcx.generics_of(parent_id);
+        for param in &parent_generics.own_params {
+            if let rustc_middle::ty::GenericParamDefKind::Type { .. } = param.kind {
+                type_param_count += 1;
+                generic_params.push(crate::lean_emit::IrGenericParamDef {
+                    index: param.index,
+                    name: param.name.as_str().to_string(),
+                });
+            }
+        }
+    }
+    // Sort generic params by index
+    generic_params.sort_by_key(|p| p.index);
+
+    let mut trait_impls = Vec::new();
+    if let Some(parent_id) = tcx.opt_parent(def_id) {
+        if let rustc_hir::def::DefKind::Impl { of_trait: true } = tcx.def_kind(parent_id) {
+            let trait_ref = tcx.impl_trait_ref(parent_id);
+            let assoc_item = tcx.associated_item(def_id);
+            if let Some(trait_method_def_id) = assoc_item.trait_item_def_id() {
+                let trait_ref_identity = trait_ref.instantiate_identity().skip_norm_wip();
+                let trait_method_path = canonical_def_path(tcx, trait_method_def_id);
+                let mut args = Vec::new();
+                for arg in trait_ref_identity.args {
+                    if let Some(ty) = arg.as_type() {
+                        args.push(ctx.lower_rigid_ty(ty));
+                    }
+                }
+                trait_impls.push(crate::lean_emit::IrTraitImplEntry {
+                    trait_ref: crate::lean_emit::IrTraitRef {
+                        def_path: trait_method_path,
+                        args,
+                    },
+                    impl_path: canonical_def_path(tcx, def_id),
+                });
+            }
+        }
+    }
+
     let allocations = ctx.drain_allocations();
     let layouts = ctx.layout_builder.finish();
 
@@ -205,6 +275,9 @@ pub fn lower_mir_body<'tcx>(
         def_path: canonical_def_path(tcx, def_id),
         phase: lower_mir_phase(body.phase),
         role,
+        type_param_count,
+        generic_params,
+        trait_impls,
         arg_count: body.arg_count,
         local_decls,
         basic_blocks,
@@ -421,6 +494,25 @@ impl<'tcx> MirLowerCtx<'tcx> {
                 }
             }
             TyKind::Foreign(def_id) => IrRigidTy::Foreign(canonical_def_path(self.tcx, *def_id)),
+            TyKind::Param(p) => IrRigidTy::Param {
+                index: p.index,
+                name: p.name.as_str().to_string(),
+            },
+            TyKind::Alias(alias_ty) => {
+                let typing_env = self.layout_builder.typing_env();
+                let normalized = self.tcx.try_normalize_erasing_regions(typing_env, rustc_middle::ty::Unnormalized::new_wip(ty));
+                match normalized {
+                    Ok(norm) if norm != ty => self.lower_rigid_ty(norm),
+                    _ => {
+                        let def_path = canonical_def_path(self.tcx, alias_ty.kind.def_id());
+                        let ty_args = alias_ty.args
+                            .types()
+                            .map(|t| self.lower_rigid_ty(t))
+                            .collect::<Vec<_>>();
+                        IrRigidTy::Alias { def_path, args: ty_args }
+                    }
+                }
+            }
             _ => IrRigidTy::Other(format!("{ty}")),
         }
     }

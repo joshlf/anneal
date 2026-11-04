@@ -93,6 +93,8 @@ impl<'tcx> LayoutTableBuilder<'tcx> {
     }
 
     fn intern_ty_layout_depth(&mut self, ty: Ty<'tcx>, depth: usize) -> usize {
+        use rustc_middle::ty::TypeVisitableExt;
+        
         let ir_layout = match self.tcx.layout_of(self.typing_env.as_query_input(ty)) {
             Ok(ty_and_layout) => {
                 let mut lowered = lower_layout_data(&ty_and_layout.layout.0);
@@ -133,6 +135,32 @@ impl<'tcx> LayoutTableBuilder<'tcx> {
                     }
                 }
                 lowered
+            }
+            Err(_) if ty.has_param() => {
+                let mut placeholder = placeholder_param_layout();
+                if depth < 16 {
+                    let field_tys: Option<Vec<Ty<'tcx>>> = match *ty.kind() {
+                        ty::Tuple(tys) => Some(tys.iter().collect()),
+                        ty::Closure(_, args) => Some(args.as_closure().upvar_tys().iter().collect()),
+                        ty::Adt(def, args) if !def.is_union() => {
+                            let variant = def.variants().iter().next();
+                            if let Some(v) = variant {
+                                Some(v.fields.iter().map(|f| f.ty(self.tcx, args).skip_norm_wip()).collect())
+                            } else {
+                                None
+                            }
+                        }
+                        ty::Array(elem_ty, _) | ty::Slice(elem_ty) => Some(vec![elem_ty]),
+                        _ => None,
+                    };
+                    if let Some(tys) = field_tys {
+                        placeholder.field_layouts = tys
+                            .into_iter()
+                            .map(|fty| self.intern_ty_layout_depth(fty, depth + 1))
+                            .collect();
+                    }
+                }
+                placeholder
             }
             Err(_) => fallback_zst_layout(),
         };
@@ -639,6 +667,18 @@ pub fn fallback_zst_layout() -> IrTypeLayout {
             memory_index: Vec::new(),
         },
         variants: IrVariantsShape::Single { index: 0 },
+        is_uninhabited: false,
+        field_layouts: Vec::new(),
+    }
+}
+
+pub fn placeholder_param_layout() -> IrTypeLayout {
+    IrTypeLayout {
+        size: IrSize { bytes: 0 },
+        align: IrAlign { bytes: 1 },
+        backend_repr: IrBackendRepr::Memory,
+        fields: IrFieldsShape::Primitive,
+        variants: IrVariantsShape::Empty,
         is_uninhabited: false,
         field_layouts: Vec::new(),
     }
