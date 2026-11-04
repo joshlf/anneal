@@ -46,7 +46,7 @@ containing `.param idx _` (such as `(T, u32)`, `[T; N]`, or `Wrapper<T>`).
 
 Reference (`compiler/rustc_middle/src/ty/sty.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/sty.rs#L36-L46>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/sty.rs#L282-L285>
 
 > "pub struct ParamTy {
 >     pub index: u32,
@@ -66,10 +66,9 @@ using `callerLayouts`.
 Reference (The Rust Reference, "Call expressions"):
 <https://doc.rust-lang.org/1.98.0/reference/expressions/call-expr.html>
 
-> "A call expression calls a function. It consists of an expression with a
-> function type or a type that implements one of the Fn, FnMut, or FnOnce
-> traits, followed by a parenthesized comma-separated list of argument
-> expressions."
+> "A call expression calls a function. The syntax of a call expression is an
+> expression, called the function operand, followed by a parenthesized
+> comma-separated list of expression, called the argument operands."
 -/
 def lookupCallee
     (callees : List CapturedMir)
@@ -175,10 +174,9 @@ indirect function-pointer (`RigidTy.fnPtr`) call in `TerminatorKind.call` and
 Reference (The Rust Reference, "Call expressions"):
 <https://doc.rust-lang.org/1.98.0/reference/expressions/call-expr.html>
 
-> "A call expression calls a function. It consists of an expression with a
-> function type or a type that implements one of the Fn, FnMut, or FnOnce
-> traits, followed by a parenthesized comma-separated list of argument
-> expressions."
+> "A call expression calls a function. The syntax of a call expression is an
+> expression, called the function operand, followed by a parenthesized
+> comma-separated list of expression, called the argument operands."
 -/
 structure ResolvedCallTarget : Type where
   /-- Canonical `DefPath` of the resolved callee. -/
@@ -813,9 +811,13 @@ function targets and polymorphic/trait-method callees via `lookupCallee`.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L855-L868>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L823-L839>
 
-> "/// Block ends with the call of a function, which is a tail call."
+> "/// Tail call.
+> ///
+> /// Roughly speaking this is a chimera of [`Call`] and [`Return`], with some caveats.
+> ...
+> TailCall {"
 -/
 def evalTailCallTerminator (s : MachineState) (func : Operand) (argOps : List Operand) (currentBody : Option CapturedMir) : MirStepNode :=
   let bodyLocalDecls := bodyLocalDeclsOf currentBody
@@ -863,13 +865,16 @@ Evaluate basic-block `Terminator` `term` in `s`, producing the next
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L812-L853>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L724-L800>
 
-> "/// Returns from the function. ...
+> "/// Returns from the function.
+> ...
 > Return,
 > ...
-> /// Block ends with the call of a function.
-> Call { ... },"
+> /// Roughly speaking, evaluates the `func` operand and the arguments, and starts execution of
+> /// the referred to function.
+> ...
+> Call {"
 -/
 def evalTerminator
     (s : MachineState)

@@ -1984,9 +1984,9 @@ diagonal instantiations such as `Pair<u32, u64>` against `Pair<T, T>`).
 Reference (The Rust Reference, "Trait implementations"):
 <https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
 
-> "A trait implementation is defined like an inherent implementation, except
-> that the optional generic parameters are followed by a trait, followed by the
-> keyword `for`, followed by the implementing type."
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
 -/
 def matchRigidTy (pat arg : RigidTy) (subst : List (Nat × RigidTy)) : Option (List (Nat × RigidTy)) :=
   match pat with
@@ -2060,9 +2060,9 @@ threading parameter bindings `subst`.
 Reference (The Rust Reference, "Trait implementations"):
 <https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
 
-> "A trait implementation is defined like an inherent implementation, except
-> that the optional generic parameters are followed by a trait, followed by the
-> keyword `for`, followed by the implementing type."
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
 -/
 def matchRigidTyList (pats args : List RigidTy) (subst : List (Nat × RigidTy)) : Option (List (Nat × RigidTy)) :=
   match pats, args with
@@ -2083,9 +2083,9 @@ method-level generic type arguments `restArgs`.
 Reference (The Rust Reference, "Trait implementations"):
 <https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
 
-> "A trait implementation is defined like an inherent implementation, except
-> that the optional generic parameters are followed by a trait, followed by the
-> keyword `for`, followed by the implementing type."
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
 -/
 def matchRigidTyPrefix
     (pats args : List RigidTy)
@@ -2133,7 +2133,7 @@ bypass layout resolution when `callerLayouts` lacks an entry for `idx`.
 
 Reference (`compiler/rustc_middle/src/ty/sty.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/sty.rs#L36-L46>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/sty.rs#L282-L285>
 
 > "pub struct ParamTy {
 >     pub index: u32,
@@ -2171,7 +2171,7 @@ Check that every `RigidTy` in a list satisfies `allParamsInCallerLayouts`.
 
 Reference (`compiler/rustc_middle/src/ty/sty.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/sty.rs#L36-L46>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/sty.rs#L282-L285>
 
 > "pub struct ParamTy {
 >     pub index: u32,
@@ -2192,9 +2192,9 @@ Collect all `TraitImplEntry` records attached to `callees`.
 Reference (The Rust Reference, "Trait implementations"):
 <https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
 
-> "A trait implementation is defined like an inherent implementation, except
-> that the optional generic parameters are followed by a trait, followed by the
-> keyword `for`, followed by the implementing type."
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
 -/
 def flatMapTraitImpls : List CapturedMir → List TraitImplEntry
   | .nil => .nil
@@ -2207,9 +2207,9 @@ Check whether any `TraitImplEntry` in `traitImpls` targets trait method
 Reference (The Rust Reference, "Trait implementations"):
 <https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
 
-> "A trait implementation is defined like an inherent implementation, except
-> that the optional generic parameters are followed by a trait, followed by the
-> keyword `for`, followed by the implementing type."
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
 -/
 def hasTraitImplForDefPath
     (traitImpls : List TraitImplEntry)
@@ -2229,9 +2229,9 @@ Check whether `acc` already contains a matched `TraitImplEntry` with the same
 Reference (The Rust Reference, "Trait implementations"):
 <https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
 
-> "A trait implementation is defined like an inherent implementation, except
-> that the optional generic parameters are followed by a trait, followed by the
-> keyword `for`, followed by the implementing type."
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
 -/
 def hasMatchingImplPath
     (implPath : DefPath) :
@@ -2252,9 +2252,9 @@ each matched entry with its extracted `(implHeaderArgs ++ methodTypeArgs)` (or
 Reference (The Rust Reference, "Trait implementations"):
 <https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
 
-> "A trait implementation is defined like an inherent implementation, except
-> that the optional generic parameters are followed by a trait, followed by the
-> keyword `for`, followed by the implementing type."
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
 -/
 def collectMatchingTraitImpls
     (traitImpls : List TraitImplEntry)
@@ -2296,9 +2296,9 @@ Check whether `candidateArgs` is a substitution instance of every matched
 Reference (The Rust Reference, "Trait implementations"):
 <https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
 
-> "A trait implementation is defined like an inherent implementation, except
-> that the optional generic parameters are followed by a trait, followed by the
-> keyword `for`, followed by the implementing type."
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
 -/
 def isTraitImplInstanceOfAll
     (candidateArgs : List RigidTy) :
@@ -2316,9 +2316,9 @@ matched `TraitImplEntry` in `allMatches`.
 Reference (The Rust Reference, "Trait implementations"):
 <https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
 
-> "A trait implementation is defined like an inherent implementation, except
-> that the optional generic parameters are followed by a trait, followed by the
-> keyword `for`, followed by the implementing type."
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
 -/
 def filterMostSpecificTraitImpls
     (allMatches : List (TraitImplEntry × Option (List RigidTy))) :
@@ -2367,9 +2367,9 @@ generic override.
 Reference (The Rust Reference, "Trait implementations"):
 <https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
 
-> "A trait implementation is defined like an inherent implementation, except
-> that the optional generic parameters are followed by a trait, followed by the
-> keyword `for`, followed by the implementing type."
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
 -/
 def resolveCalleeBodyAndArgs?
     (callees : List CapturedMir)
@@ -2430,7 +2430,7 @@ generic type parameters when checking function-pointer signatures in
 
 Reference (`compiler/rustc_middle/src/ty/generic_args.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/generic_args.rs#L17-L25>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/generic_args.rs#L27-L28>
 
 > "/// An entity in the Rust type system, which can be one of
 > /// several kinds (types, lifetimes, and consts)."
@@ -2450,15 +2450,20 @@ def typeSubstOfRigidTys : List RigidTy → TypeSubst
 Substitute generic type parameters (`RigidTy.param`) in the `ty.kind` of each
 `LocalDecl` using `subst`.
 
-Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L220-L234>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/mod.rs#L967-L1065>
 
 > "pub struct LocalDecl<'tcx> {
+> ...
 >     pub mutability: Mutability,
+> ...
 >     pub local_info: ClearCrossCrate<Box<LocalInfo<'tcx>>>,
+> ...
 >     pub ty: Ty<'tcx>,
+> ...
 >     pub user_ty: Option<Box<UserTypeProjections>>,
+> ...
 >     pub source_info: SourceInfo,
 > }"
 -/

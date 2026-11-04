@@ -66,11 +66,10 @@ made by `body` itself would ignore the implementations recorded on `body`.
 Reference (The Rust Reference, "Call expressions"):
 <https://doc.rust-lang.org/1.98.0/reference/expressions/call-expr.html>
 
-> "A call expression calls a function. It consists of an expression with a
-> function type or a type that implements one of the Fn, FnMut, or FnOnce
-> traits, followed by a parenthesized comma-separated list of argument
-> expressions. If the function eventually returns, then the expression
-> completes."
+> "A call expression calls a function. The syntax of a call expression is an
+> expression, called the function operand, followed by a parenthesized
+> comma-separated list of expression, called the argument operands.
+> If the function eventually returns, then the expression completes."
 -/
 def initMachineStateWithCallees
     (body : CapturedMir)
