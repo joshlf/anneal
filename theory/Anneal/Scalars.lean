@@ -1365,7 +1365,7 @@ theorem evalCastValue_signed_of_le {sz dstBytes a : Nat}
     evalBinOp .bitAnd ⟨a, 8⟩ ⟨b, 8⟩ s = .some ⟨(a &&& b) % 18446744073709551616, 8⟩ := rfl
 @[simp] theorem evalBinOp_bitAnd_u128 (a b : Nat) (s : Bool) :
     evalBinOp .bitAnd ⟨a, 16⟩ ⟨b, 16⟩ s = .some ⟨(a &&& b) % (2 ^ 128), 16⟩ := rfl
-theorem evalBinOp_bitAnd_usize (a b : Nat) (s : Bool) :
+@[simp] theorem evalBinOp_bitAnd_usize (a b : Nat) (s : Bool) :
     evalBinOp .bitAnd ⟨a, 8⟩ ⟨b, 8⟩ s = .some ⟨(a &&& b) % 18446744073709551616, 8⟩ := rfl
 
 @[simp] theorem evalBinOp_bitOr_u8 (a b : Nat) (s : Bool) :
@@ -1378,7 +1378,7 @@ theorem evalBinOp_bitAnd_usize (a b : Nat) (s : Bool) :
     evalBinOp .bitOr ⟨a, 8⟩ ⟨b, 8⟩ s = .some ⟨(a ||| b) % 18446744073709551616, 8⟩ := rfl
 @[simp] theorem evalBinOp_bitOr_u128 (a b : Nat) (s : Bool) :
     evalBinOp .bitOr ⟨a, 16⟩ ⟨b, 16⟩ s = .some ⟨(a ||| b) % (2 ^ 128), 16⟩ := rfl
-theorem evalBinOp_bitOr_usize (a b : Nat) (s : Bool) :
+@[simp] theorem evalBinOp_bitOr_usize (a b : Nat) (s : Bool) :
     evalBinOp .bitOr ⟨a, 8⟩ ⟨b, 8⟩ s = .some ⟨(a ||| b) % 18446744073709551616, 8⟩ := rfl
 
 @[simp] theorem evalBinOp_bitXor_u8 (a b : Nat) (s : Bool) :
@@ -1391,7 +1391,7 @@ theorem evalBinOp_bitOr_usize (a b : Nat) (s : Bool) :
     evalBinOp .bitXor ⟨a, 8⟩ ⟨b, 8⟩ s = .some ⟨(a ^^^ b) % 18446744073709551616, 8⟩ := rfl
 @[simp] theorem evalBinOp_bitXor_u128 (a b : Nat) (s : Bool) :
     evalBinOp .bitXor ⟨a, 16⟩ ⟨b, 16⟩ s = .some ⟨(a ^^^ b) % (2 ^ 128), 16⟩ := rfl
-theorem evalBinOp_bitXor_usize (a b : Nat) (s : Bool) :
+@[simp] theorem evalBinOp_bitXor_usize (a b : Nat) (s : Bool) :
     evalBinOp .bitXor ⟨a, 8⟩ ⟨b, 8⟩ s = .some ⟨(a ^^^ b) % 18446744073709551616, 8⟩ := rfl
 
 @[simp] theorem evalBinOp_shl_u8 (a b : Nat) (szR : Nat) (hR : 0 < szR) (s : Bool) :
@@ -1409,7 +1409,7 @@ theorem evalBinOp_bitXor_usize (a b : Nat) (s : Bool) :
 @[simp] theorem evalBinOp_shl_u128 (a b : Nat) (szR : Nat) (hR : 0 < szR) (s : Bool) :
     evalBinOp .shl ⟨a, 16⟩ ⟨b, szR⟩ s = .some ⟨(a <<< (b % 128)) % (2 ^ 128), 16⟩ :=
   evalBinOp_shl_apply (by decide) hR s
-theorem evalBinOp_shl_usize (a b : Nat) (szR : Nat) (hR : 0 < szR) (s : Bool) :
+@[simp] theorem evalBinOp_shl_usize (a b : Nat) (szR : Nat) (hR : 0 < szR) (s : Bool) :
     evalBinOp .shl ⟨a, 8⟩ ⟨b, szR⟩ s = .some ⟨(a <<< (b % 64)) % 18446744073709551616, 8⟩ :=
   evalBinOp_shl_u64 a b szR hR s
 
@@ -1428,7 +1428,7 @@ theorem evalBinOp_shl_usize (a b : Nat) (szR : Nat) (hR : 0 < szR) (s : Bool) :
 @[simp] theorem evalBinOp_shr_u128 (a b : Nat) (szR : Nat) (hR : 0 < szR) :
     evalBinOp .shr ⟨a, 16⟩ ⟨b, szR⟩ false = .some ⟨(a >>> (b % 128)) % (2 ^ 128), 16⟩ :=
   evalBinOp_shr_unsigned (by decide) hR
-theorem evalBinOp_shr_usize (a b : Nat) (szR : Nat) (hR : 0 < szR) :
+@[simp] theorem evalBinOp_shr_usize (a b : Nat) (szR : Nat) (hR : 0 < szR) :
     evalBinOp .shr ⟨a, 8⟩ ⟨b, szR⟩ false = .some ⟨(a >>> (b % 64)) % 18446744073709551616, 8⟩ :=
   evalBinOp_shr_u64 a b szR hR
 
@@ -1452,7 +1452,7 @@ theorem evalBinOp_shr_usize (a b : Nat) (szR : Nat) (hR : 0 < szR) :
     evalBinOp .shr ⟨a, 16⟩ ⟨b, szR⟩ true =
       .some ⟨((BitVec.ofNat 128 a).sshiftRight (b % 128)).toNat, 16⟩ :=
   evalBinOp_shr_signed (by decide) hR
-theorem evalBinOp_shr_isize (a b : Nat) (szR : Nat) (hR : 0 < szR) :
+@[simp] theorem evalBinOp_shr_isize (a b : Nat) (szR : Nat) (hR : 0 < szR) :
     evalBinOp .shr ⟨a, 8⟩ ⟨b, szR⟩ true =
       .some ⟨((BitVec.ofNat 64 a).sshiftRight (b % 64)).toNat, 8⟩ :=
   evalBinOp_shr_i64 a b szR hR
@@ -1472,7 +1472,7 @@ theorem evalBinOp_shr_isize (a b : Nat) (szR : Nat) (hR : 0 < szR) :
 @[simp] theorem evalBinOp_shlUnchecked_u128 (a b : Nat) (szR : Nat) (hR : 0 < szR) (hb : b < 128) (s : Bool) :
     evalBinOp .shlUnchecked ⟨a, 16⟩ ⟨b, szR⟩ s = .some ⟨(a <<< b) % (2 ^ 128), 16⟩ :=
   evalBinOp_shlUnchecked_apply (by decide) hR hb s
-theorem evalBinOp_shlUnchecked_usize (a b : Nat) (szR : Nat) (hR : 0 < szR) (hb : b < 64) (s : Bool) :
+@[simp] theorem evalBinOp_shlUnchecked_usize (a b : Nat) (szR : Nat) (hR : 0 < szR) (hb : b < 64) (s : Bool) :
     evalBinOp .shlUnchecked ⟨a, 8⟩ ⟨b, szR⟩ s = .some ⟨(a <<< b) % 18446744073709551616, 8⟩ :=
   evalBinOp_shlUnchecked_u64 a b szR hR hb s
 
@@ -1491,7 +1491,7 @@ theorem evalBinOp_shlUnchecked_usize (a b : Nat) (szR : Nat) (hR : 0 < szR) (hb 
 @[simp] theorem evalBinOp_shrUnchecked_u128 (a b : Nat) (szR : Nat) (hR : 0 < szR) (hb : b < 128) :
     evalBinOp .shrUnchecked ⟨a, 16⟩ ⟨b, szR⟩ false = .some ⟨(a >>> b) % (2 ^ 128), 16⟩ :=
   evalBinOp_shrUnchecked_unsigned (by decide) hR hb
-theorem evalBinOp_shrUnchecked_usize (a b : Nat) (szR : Nat) (hR : 0 < szR) (hb : b < 64) :
+@[simp] theorem evalBinOp_shrUnchecked_usize (a b : Nat) (szR : Nat) (hR : 0 < szR) (hb : b < 64) :
     evalBinOp .shrUnchecked ⟨a, 8⟩ ⟨b, szR⟩ false = .some ⟨(a >>> b) % 18446744073709551616, 8⟩ :=
   evalBinOp_shrUnchecked_u64 a b szR hR hb
 
@@ -1510,7 +1510,7 @@ theorem evalBinOp_shrUnchecked_usize (a b : Nat) (szR : Nat) (hR : 0 < szR) (hb 
 @[simp] theorem evalBinOp_shrUnchecked_i128 (a b : Nat) (szR : Nat) (hR : 0 < szR) (hb : b < 128) :
     evalBinOp .shrUnchecked ⟨a, 16⟩ ⟨b, szR⟩ true = .some ⟨((BitVec.ofNat 128 a).sshiftRight b).toNat, 16⟩ :=
   evalBinOp_shrUnchecked_signed (by decide) hR hb
-theorem evalBinOp_shrUnchecked_isize (a b : Nat) (szR : Nat) (hR : 0 < szR) (hb : b < 64) :
+@[simp] theorem evalBinOp_shrUnchecked_isize (a b : Nat) (szR : Nat) (hR : 0 < szR) (hb : b < 64) :
     evalBinOp .shrUnchecked ⟨a, 8⟩ ⟨b, szR⟩ true = .some ⟨((BitVec.ofNat 64 a).sshiftRight b).toNat, 8⟩ :=
   evalBinOp_shrUnchecked_i64 a b szR hR hb
 
@@ -1529,7 +1529,7 @@ theorem evalBinOp_shrUnchecked_isize (a b : Nat) (szR : Nat) (hR : 0 < szR) (hb 
 @[simp] theorem evalCastValue_u128 (a dstBytes : Nat) (hdst : 0 < dstBytes) :
     evalCastValue ⟨a, 16⟩ dstBytes false = .some ⟨a % (2 ^ (8 * dstBytes)), dstBytes⟩ :=
   evalCastValue_unsigned_apply (by decide) hdst
-theorem evalCastValue_usize (a dstBytes : Nat) (hdst : 0 < dstBytes) :
+@[simp] theorem evalCastValue_usize (a dstBytes : Nat) (hdst : 0 < dstBytes) :
     evalCastValue ⟨a, 8⟩ dstBytes false = .some ⟨a % (2 ^ (8 * dstBytes)), dstBytes⟩ :=
   evalCastValue_u64 a dstBytes hdst
 
@@ -1553,7 +1553,7 @@ theorem evalCastValue_usize (a dstBytes : Nat) (hdst : 0 < dstBytes) :
     evalCastValue ⟨a, 16⟩ dstBytes true =
       .some ⟨((BitVec.ofNat 128 a).signExtend (8 * dstBytes)).toNat, dstBytes⟩ :=
   evalCastValue_signed_apply (by decide) hdst
-theorem evalCastValue_isize (a dstBytes : Nat) (hdst : 0 < dstBytes) :
+@[simp] theorem evalCastValue_isize (a dstBytes : Nat) (hdst : 0 < dstBytes) :
     evalCastValue ⟨a, 8⟩ dstBytes true =
       .some ⟨((BitVec.ofNat 64 a).signExtend (8 * dstBytes)).toNat, dstBytes⟩ :=
   evalCastValue_i64 a dstBytes hdst
