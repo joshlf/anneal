@@ -150,6 +150,31 @@ def matchRigidTyList (pats args : List RigidTy) (subst : List (Nat × RigidTy)) 
 end
 
 /--
+Match a non-empty trait-header pattern list `pats : List RigidTy` against a
+prefix of call-site type arguments `args : List RigidTy`, returning the
+accumulated `impl`-level substitution `subst` together with any trailing
+method-level generic type arguments `restArgs`.
+
+Reference (The Rust Reference, "Trait implementations"):
+<https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
+
+> "A trait implementation is defined like an inherent implementation, except
+> that the optional generic parameters are followed by a trait, followed by the
+> keyword `for`, followed by the implementing type."
+-/
+def matchRigidTyPrefix
+    (pats args : List RigidTy)
+    (subst : List (Nat × RigidTy)) :
+    Option (List (Nat × RigidTy) × List RigidTy) :=
+  match pats, args with
+  | .nil, restArgs => Option.some (subst, restArgs)
+  | p :: ps, a :: as =>
+    match matchRigidTy p a subst with
+    | Option.some s => matchRigidTyPrefix ps as s
+    | Option.none => Option.none
+  | _ :: _, .nil => Option.none
+
+/--
 Extract the `count` generic type arguments of an `impl` method body in canonical
 parameter-index order `0 .. count - 1` from pattern-matching substitution `subst`.
 
@@ -173,6 +198,25 @@ def extractImplTypeArgs (subst : List (Nat × RigidTy)) (count : Nat) : Option (
         | Option.some t => loop i (t :: acc)
         | Option.none => Option.none
     loop count .nil
+
+/--
+Construct a `TypeSubst` mapping each layout entry at index `idx` in a caller's
+`LayoutTable.entries` to `(.param idx "", layout)` so `RigidTy.computeLayout`
+can compute layouts of both bare `.param idx _` and compound type arguments
+containing `.param idx _` (such as `(T, u32)`, `[T; N]`, or `Wrapper<T>`).
+
+Reference (`compiler/rustc_middle/src/ty/sty.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/sty.rs#L36-L46>
+
+> "pub struct ParamTy {
+>     pub index: u32,
+>     pub name: Symbol,
+> }"
+-/
+def callerParamSubst (idx : Nat) : List TypeLayout → TypeSubst
+  | .nil => .nil
+  | l :: ls => (.param idx "", l) :: callerParamSubst (idx + 1) ls
 
 /--
 Resolve a direct or indirect call target `(defPath, typeArgs)` against `callees`
@@ -204,15 +248,23 @@ def lookupCallee (callees : List CapturedMir) (callerLayouts : LayoutTable) (def
           | .nil => Option.none
           | entry :: rest =>
             if stringEq entry.traitRef.defPath defPath then
-              match matchRigidTyList entry.traitRef.args typeArgs .nil with
-              | Option.some subst =>
-                match findCallee? callees entry.implPath with
-                | Option.some c =>
-                  match extractImplTypeArgs subst c.typeParamCount with
-                  | Option.some implTypeArgs => Option.some (c, implTypeArgs)
+              match entry.traitRef.args with
+              | .nil => findImpl rest
+              | _ :: _ =>
+                match matchRigidTyPrefix entry.traitRef.args typeArgs .nil with
+                | Option.some (subst, methodTypeArgs) =>
+                  match findCallee? callees entry.implPath with
+                  | Option.some c =>
+                    match extractImplTypeArgs subst subst.length with
+                    | Option.some implHeaderArgs =>
+                      let implTypeArgs := implHeaderArgs ++ methodTypeArgs
+                      if implTypeArgs.length == c.typeParamCount then
+                        Option.some (c, implTypeArgs)
+                      else
+                        findImpl rest
+                    | Option.none => findImpl rest
                   | Option.none => findImpl rest
                 | Option.none => findImpl rest
-              | Option.none => findImpl rest
             else
               findImpl rest
         findImpl allTraitImpls
@@ -227,15 +279,26 @@ def lookupCallee (callees : List CapturedMir) (callerLayouts : LayoutTable) (def
       let rec resolveLayouts : List RigidTy → List TypeLayout → Option (List TypeLayout)
         | .nil, acc => Option.some acc.reverse
         | argTy :: rest, acc =>
-          match RigidTy.computeLayout callerLayouts.pointerBits callerLayouts.entries .nil Option.none argTy with
+          match
+            RigidTy.computeLayout
+              callerLayouts.pointerBits
+              callerLayouts.entries
+              .nil
+              Option.none
+              argTy
+          with
           | Option.some l => resolveLayouts rest (l :: acc)
           | Option.none =>
-            match argTy with
-            | .param idx _ =>
-              match callerLayouts.lookup idx with
-              | Option.some l => resolveLayouts rest (l :: acc)
-              | Option.none => Option.none
-            | _ => Option.none
+            match
+              RigidTy.computeLayout
+                callerLayouts.pointerBits
+                callerLayouts.entries
+                (callerParamSubst 0 callerLayouts.entries)
+                Option.none
+                argTy
+            with
+            | Option.some l => resolveLayouts rest (l :: acc)
+            | Option.none => Option.none
       match resolveLayouts effectiveTypeArgs .nil with
       | Option.some argLayouts =>
         let subst : TypeSubst := effectiveTypeArgs.zip argLayouts

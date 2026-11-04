@@ -1037,8 +1037,13 @@ matching in `lookupCallee`:
 2. Diagonal trait implementations (`impl<T> PairTrait for Pair<T, T>`) accept
    matching `Pair<u32, u32>` and reject mismatched `Pair<u32, u64>`;
 3. Out-of-order and nested generic parameters (`[.param 1 "B", .adt "Wrapper" [.param 0 "A"]]`)
-   are extracted in canonical parameter index order `[0, 1]`; and
-4. `matchRigidTy` structurally matches `.fnPtr` and `.alias` patterns.
+   are extracted in canonical parameter index order `[0, 1]`;
+4. Trait methods with method-level generic parameters (`Convert::convert`)
+   match `entry.traitRef.args` as a prefix of `typeArgs` and append trailing
+   method-level type arguments when their total count matches `c.typeParamCount`;
+5. `resolveLayouts` resolves compound type arguments containing `RigidTy.param`
+   (such as `Wrapper<T>`) against `callerLayouts` when `T` is in `callerLayouts`; and
+6. `matchRigidTy` structurally matches `.fnPtr` and `.alias` patterns.
 -/
 theorem mir_evalTerminator_trait_method_dispatch
     (s : MachineState) :
@@ -1057,6 +1062,13 @@ theorem mir_evalTerminator_trait_method_dispatch
           { defPath := "test::BiTrait::combine"
             args := [.param 1 "B", .adt "Wrapper" [.param 0 "A"]] }
         implPath := "test::<impl BiTrait<B> for Wrapper<A>>::combine" }
+    let methodGenericEntry : TraitImplEntry :=
+      { traitRef :=
+          { defPath := "test::Convert::convert"
+            args := [.adt "Wrapper" [.param 0 "A"]] }
+        implPath := "test::<impl BiTrait<B> for Wrapper<A>>::combine" }
+    let callerLayoutsWithT : LayoutTable :=
+      { emptyLayoutTable with entries := [polyU32Layout] }
     let calleeWithTraitImpl : CapturedMir :=
       { rangeTraitImplCallee with traitImpls := [rangeImplEntry] }
     lookupCallee [rangeTraitImplCallee] emptyLayoutTable
@@ -1074,6 +1086,19 @@ theorem mir_evalTerminator_trait_method_dispatch
     lookupCallee [biTraitImplCallee] emptyLayoutTable
       "test::BiTrait::combine" [.uint .u64, .adt "Wrapper" [.uint .u32]] [outOfOrderEntry] =
       .some (biTraitImplCallee.instantiate [(.uint .u32, polyU32Layout), (.uint .u64, polyU64Layout)]) ∧
+    lookupCallee [biTraitImplCallee] emptyLayoutTable
+      "test::Convert::convert" [.adt "Wrapper" [.uint .u32], .uint .u64] [methodGenericEntry] =
+      .some (biTraitImplCallee.instantiate [(.uint .u32, polyU32Layout), (.uint .u64, polyU64Layout)]) ∧
+    lookupCallee [biTraitImplCallee] emptyLayoutTable
+      "test::Convert::convert" [.adt "Wrapper" [.uint .u32], .uint .u64, .uint .u32] [methodGenericEntry] =
+      .none ∧
+    lookupCallee [polyIdCallee] callerLayoutsWithT
+      "test::id" [.adt "Wrapper" [.param 0 "T"]] .nil =
+      .some (polyIdCallee.instantiate
+        [(.adt "Wrapper" [.param 0 "T"], { polyU32Layout with fields := .arbitrary [⟨0⟩] [0] })]) ∧
+    lookupCallee [polyIdCallee] emptyLayoutTable
+      "test::id" [.adt "Wrapper" [.param 0 "T"]] .nil =
+      .none ∧
     matchRigidTy (.fnPtr [.param 0 "T"] (.param 0 "T") .safe .rust)
       (.fnPtr [.uint .u32] (.uint .u32) .safe .rust) .nil =
       .some [(0, .uint .u32)] ∧
@@ -1081,7 +1106,7 @@ theorem mir_evalTerminator_trait_method_dispatch
       (.alias "Proj" [.uint .u32]) .nil =
       .some [(0, .uint .u32)] ∧
     s.frame.blockIdx = s.frame.blockIdx := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /--
 Universal theorem that when `Self` in a trait-method call `(traitMethodDefPath, typeArgs)`
