@@ -964,6 +964,45 @@ fn enum_tuple_and_cmp_quotations_are_pinned() {
             "ensure_else_ub(vals.len() <= sized_fields.len(), \"Value::Tuple: invalid number of fields\")?;",
             "MiniRustSpec/Interp.lean",
         ),
+        // `Type::decode`, `Type::encode`, and `check_value` for `Union`.
+        (
+            repr,
+            "fn decode<M: Memory>(Type::Union { size, chunks, .. }: Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> { \
+             if bytes.len() != size.bytes() { panic!(\"decode of Type::Union with invalid length\"); } \
+             let mut chunk_data = list![]; \
+             for (offset, size) in chunks { \
+                 chunk_data.push(bytes.subslice_with_length(offset.bytes(), size.bytes())); \
+             } \
+             ret(Value::Union(chunk_data)) }",
+            "if bytes.len() != size.bytes() { throw_ub!(\"decode of Type::Union with invalid length\"); }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "for ((offset, size), data) in chunks.zip(chunk_data) { \
+             assert_eq!(size.bytes(), data.len()); \
+             bytes.write_subslice_at_index(offset.bytes(), data); }",
+            "for ((offset, size), data) in chunks.zip(chunk_data) { \
+             assert_eq!(offset.bytes(), data.len()); \
+             bytes.write_subslice_at_index(offset.bytes(), data); }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "(Value::Union(chunk_data), Type::Union { chunks, .. }) => { \
+             ensure_else_ub(chunk_data.len() == chunks.len(), \"Value::Union: invalid chunk size\")?;",
+            "(Value::Union(chunk_data), Type::Union { chunks, .. }) => { \
+             ensure_else_ub(chunk_data.len() <= chunks.len(), \"Value::Union: invalid chunk size\")?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "for (data, (_, size)) in chunk_data.zip(chunks) { \
+             ensure_else_ub(data.len() == size.bytes(), \"Value::Union: invalid chunk data\")?; }",
+            "for (data, (_, size)) in chunk_data.zip(chunks) { \
+             ensure_else_ub(data.len() <= size.bytes(), \"Value::Union: invalid chunk data\")?; }",
+            "MiniRustSpec/Interp.lean",
+        ),
         // Layout of enums and sized tuples.
         (
             types,

@@ -133,13 +133,13 @@ variants, through `Machine::eval_rel_op`) on integers and Booleans (pointer
 comparison is `unsupported`),
 `Terminator::{Goto, Switch, Return, Unreachable}` including
 frame teardown and both stack-pop actions, the representation relation
-(`Type::{decode, encode}`) for `Int`, `Bool`, sized `Tuple`, `Enum`
+(`Type::{decode, encode}`) for `Int`, `Bool`, sized `Tuple`, `Union`, `Enum`
 (through `decode_discriminant` and `encode_discriminant`), `Slice`, and
-`TraitObject`, `check_value` for those types, `Type::layout` (also for unions
-and unsized tuples, slices, and trait objects), `BasicMemory`'s `check_ptr`,
+`TraitObject`, `check_value` for those types, `Type::layout` (also for unsized
+tuples, slices, and trait objects), `BasicMemory`'s `check_ptr`,
 `load`, `store`, and `deallocate`, and `ConcurrentMemory`'s access log and
-data-race check. The recursion over nested types, tuple fields, enum
-variants, and discriminator trees is structural (Lean `mutual` blocks), so
+data-race check. The recursion over nested types, tuple fields, union chunks,
+enum variants, and discriminator trees is structural (Lean `mutual` blocks), so
 the kernel evaluates it.
 MiniRust has no Boolean `!`: `UnOp::Int` on a `Value::Bool` is a spec panic,
 as upstream, and `minimize` expresses `!b` with transmutes instead (see below).
@@ -152,7 +152,7 @@ comments; `..` marks elided code). Effects are
 (a panic in the spec, which upstream calls a spec bug), and
 `Stop.unsupported` (outside the interpreted fragment; never silently wrong).
 
-`Anchors.lean` lists the 48 upstream items that `Interp.lean` transcribes,
+`Anchors.lean` lists the 49 upstream items that `Interp.lean` transcribes,
 each with its file path, item name, line, and token hash, and proves by `decide`
 that the generated model contains them unchanged (`anchors_ok`) with no
 duplicate entries (`anchors_nodup`). Re-pinning MiniRust therefore breaks
@@ -384,6 +384,7 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   (`uninitBool*_minirust_ub_from_start`, `uninitBool*_minirust_direct`).
 * `cmpSel` and `boolBitOrdUse`, `(i8, i8, bool) -> Ordering` and
   `(bool, u8, Ordering) -> Ordering` bodies that switch on `bool` (including
+  `PlaceMention(_0)` on the uninitialized `Ordering` return place and
   `build::bool_and`, `build::bool_or`, and `build::bool_xor` in
   `boolBitOrdUse`) and return signed `i8` `Cmp`, unsigned `u8` `Cmp`
   (`255u8.cmp(&1u8) = Greater`), `bool` `Cmp`, or `Use(copy _3)` of an
@@ -398,20 +399,23 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   (including the invalid byte `2` and a size mismatch, both UB),
   `Type::Bool` decoding, and `UnOp::Int` on a `bool` being a spec panic
   (`relLt_signed`, ..., `bitNot_bool_panics`); and of the representation of
-  enums, tuples, slices, and trait objects: exactly the bytes `0`, `1`, `255`
-  are valid at `orderingTy` (`ordering_validTags`), decoding, encoding,
+  enums, tuples, unions, slices, and trait objects: exactly the bytes `0`, `1`,
+  `255` are valid at `orderingTy` (`ordering_validTags`), decoding, encoding,
   `check_value`, and transmutes at `orderingTy` (including invalid tags, an
   `Uninit` byte, and `decode_discriminant` short-circuiting before its
   `fallback` continuation in `decodeDiscriminant_short_circuits`), a padded
   `(i8, bool)` tuple whose size rounds up to its alignment and whose padding
   encodes as `Uninit` and is ignored by decoding (`decode_ordering_less`, ...,
-  `checkValue_tuple_arity`), and unsized `Slice`, `TraitObject`, and unsized
-  `Tuple` layouts and `specPanic`s (`layout_slice`, ...,
-  `checkValue_unsized_panics`).
+  `checkValue_tuple_arity`), `Type::Union` chunk decoding, encoding, and
+  `check_value` (`layout_union`, `decode_union`, `encode_union`,
+  `checkValue_union_chunk_size`, `checkValue_union_chunk_data`), and unsized
+  `Slice`, `TraitObject`, and unsized `Tuple` layouts and `specPanic`s
+  (`layout_slice`, ..., `checkValue_unsized_panics`).
 
 `Audit.lean` logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, and
 `[WITNESS-AUDIT]` lines ending in `sorry_free=true` (via
-`#check_theorem_deps`) and fails the build if any listed declaration depends
+`#check_theorem_deps`, which also rejects duplicate declaration names and
+non-`theorem` constants) and fails the build if any listed declaration depends
 on `sorryAx` or a non-standard axiom.
 
 ### Gaps
@@ -435,12 +439,12 @@ These are deliberate and are the first things to lift:
   with an ordinary MiniRust step.
 * **Integers, `bool`, and `Ordering` only.** An `Ordering` local is written
   by `Cmp` or `Use(copy _j)` and read by `Use` or `Return` (no `Ordering`
-  constants, `Discriminant`, or `SwitchInt` on it); `Type::Enum` and
-  `Type::Tuple` are interpreted only as representations (layout, `decode`,
-  `encode`, `check_value`), without `ValueExpr::{Tuple, Variant,
-  GetDiscriminant}`, `Statement::SetDiscriminant`, or field and downcast
-  projections. There are no pointers, references, other aggregates, other
-  casts, checked arithmetic, calls, drops, or assertions.
+  constants, `Discriminant`, or `SwitchInt` on it); `Type::Enum`,
+  `Type::Tuple`, and `Type::Union` are interpreted only as representations
+  (layout, `decode`, `encode`, `check_value`), without `ValueExpr::{Tuple,
+  Union, Variant, GetDiscriminant}`, `Statement::SetDiscriminant`, or field and
+  downcast projections. There are no pointers, references, other aggregates,
+  other casts, checked arithmetic, calls, drops, or assertions.
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.

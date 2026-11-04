@@ -3105,7 +3105,8 @@ theorem ctxI8_ok_boolBitOrdUse {body : CapturedMir}
 /-- MIR (`Runtime(PostCleanup)`) of
 ```rust
 fn bool_bit_ord_use(mut a: bool, x: u8, ord_in: Ordering) -> Ordering {
-    a = ((a & true) | false) ^ true; // bb0: _1 = BitAnd(copy _1, const true);
+    // bb0: PlaceMention(_0) (while _0: Ordering is still uninitialized);
+    a = ((a & true) | false) ^ true; //      _1 = BitAnd(copy _1, const true);
                                      //      _1 = BitOr(copy _1, const false);
                                      //      _1 = BitXor(copy _1, const true);
                                      //      switchInt(copy _1) -> [0: bb2, otherwise: bb1]
@@ -3113,10 +3114,11 @@ fn bool_bit_ord_use(mut a: bool, x: u8, ord_in: Ordering) -> Ordering {
     else { ord_in }                  // bb2: _0 = Use(copy _3); return
 }
 ```
-exercising `build::bool_and`, `build::bool_or`, and `build::bool_xor`
-(`boolBitOp`), unsigned `u8` three-way `Cmp` (`255u8.cmp(&1u8) = Greater`,
-whereas signed `-1i8.cmp(&1i8) = Less` in `cmpSel`), and `Use(copy _3)` on an
-`Ordering` local. -/
+exercising `PlaceMention(_0)` on an uninitialized `Ordering` local,
+`build::bool_and`, `build::bool_or`, and `build::bool_xor` (`boolBitOp`),
+unsigned `u8` three-way `Cmp` (`255u8.cmp(&1u8) = Greater`, whereas signed
+`-1i8.cmp(&1i8) = Less` in `cmpSel`), and `Use(copy _3)` on an `Ordering`
+local. -/
 def boolBitOrdUse : CapturedMir where
   defPath := "witness::bool_bit_ord_use"
   phase := .runtimePostCleanup
@@ -3125,6 +3127,7 @@ def boolBitOrdUse : CapturedMir where
   localDecls := [orderingDecl, boolDecl, u8Decl, orderingDecl]
   basicBlocks := [
     { statements := [
+        mkStmt (.placeMention (local_ 0)),
         mkStmt (.assign (local_ 1) (.binaryOp .bitAnd (.copy (local_ 1)) (constBool true))),
         mkStmt (.assign (local_ 1) (.binaryOp .bitOr (.copy (local_ 1)) (constBool false))),
         mkStmt (.assign (local_ 1) (.binaryOp .bitXor (.copy (local_ 1)) (constBool true)))],
@@ -3148,6 +3151,7 @@ def boolBitOrdUseFn : Gen.Function where
   calling_convention := .Rust
   blocks := ⟨[
     (bbName 0, ⟨[
+      .PlaceMention (.Local (localName 0)),
       .Assign (.Local (localName 1))
         (boolBitOp .BitAnd (.Load (.Local (localName 1))) (.Constant (.Bool true) .Bool)),
       .Assign (.Local (localName 1))
@@ -3216,7 +3220,7 @@ theorem boolBitOrdUseCmp_minirust_ret_from_start :
 
 set_option maxRecDepth 8192 in
 theorem boolBitOrdUseCmp_minirust_direct :
-    (Interp.steps 7 boolBitOrdUseCmpMInit).toOption.map
+    (Interp.steps 8 boolBitOrdUseCmpMInit).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAllocI8 with data := scalarBytes u8 1 }, [1]) := rfl
 
@@ -3260,7 +3264,7 @@ theorem boolBitOrdUseCopy_minirust_ret_from_start :
 
 set_option maxRecDepth 8192 in
 theorem boolBitOrdUseCopy_minirust_direct :
-    (Interp.steps 7 boolBitOrdUseCopyMInit).toOption.map
+    (Interp.steps 8 boolBitOrdUseCopyMInit).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAllocI8 with data := scalarBytes u8 255 }, [1]) := rfl
 
@@ -3486,5 +3490,27 @@ theorem encode_unsized_panics :
 theorem checkValue_unsized_panics :
     checkValue (.Tuple []) (.Slice .Bool) =
       .error (.specPanic "Value: slices cannot be represented as values") := rfl
+
+/-- `Type::Union` with two 1-byte chunks at offsets `0` and `2` and padding at
+offsets `1` and `3`: `Type::decode` extracts each chunk's raw `AbstractByte`s
+(including `Uninit`) and ignores gap bytes outside `chunks`, `Type::encode`
+restores each chunk at its offset and fills gap bytes with `Uninit`, and
+`checkValue` rejects a wrong number of chunks or a chunk of wrong byte length
+as UB. -/
+def unionPaddedTy : Gen.Type :=
+  .Union [(⟨0⟩, .Int IntType.I8), (⟨2⟩, .Bool)] [(⟨0⟩, ⟨1⟩), (⟨2⟩, ⟨1⟩)] ⟨4⟩ ⟨2⟩
+theorem layout_union : Type.layout unionPaddedTy = .ok (.Sized ⟨4⟩ ⟨2⟩) := rfl
+theorem decode_union :
+    Type.decode unionPaddedTy [.Init 254 none, .Init 7 none, .Uninit, .Init 9 none] =
+      .ok (some (.Union [[.Init 254 none], [.Uninit]])) := rfl
+theorem encode_union :
+    Type.encode unionPaddedTy (.Union [[.Init 254 none], [.Uninit]]) =
+      .ok [.Init 254 none, .Uninit, .Uninit, .Uninit] := rfl
+theorem checkValue_union_chunk_size :
+    checkValue (.Union [[.Init 254 none]]) unionPaddedTy =
+      .error (.ub "Value::Union: invalid chunk size") := rfl
+theorem checkValue_union_chunk_data :
+    checkValue (.Union [[.Init 254 none], [.Init 1 none, .Init 2 none]]) unionPaddedTy =
+      .error (.ub "Value::Union: invalid chunk data") := rfl
 
 end MiniRustSpec.Correspondence.Witness

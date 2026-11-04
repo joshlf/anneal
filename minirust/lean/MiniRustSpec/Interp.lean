@@ -550,8 +550,8 @@ def encodeDiscriminant {σ : Type} (accessor : σ → Offset → List Byte → I
 
 mutual
 
-/-- `Type::decode` for `Bool`, `Int` (`Type.decodeInt`), `Tuple`, `Enum`,
-`Slice`, and `TraitObject` (`spec/lang/representation.md`):
+/-- `Type::decode` for `Bool`, `Int` (`Type.decodeInt`), `Tuple`, `Union`,
+`Enum`, `Slice`, and `TraitObject` (`spec/lang/representation.md`):
 > "fn decode<M: Memory>(Type::Bool: Self, bytes: ..) -> Option<Value<M>> {
 >     if bytes.len() != 1 { panic!(..); }
 >     ret(match bytes[0] {
@@ -570,6 +570,15 @@ mutual
 >     ret(Value::Tuple(
 >         sized_fields.try_map(|(offset, ty)| { .. })?
 >     ))
+> }"
+> "fn decode<M: Memory>(Type::Union { size, chunks, .. }: Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> {
+>     if bytes.len() != size.bytes() { panic!(\"decode of Type::Union with invalid length\"); }
+>     let mut chunk_data = list![];
+>     // Store the data from each chunk.
+>     for (offset, size) in chunks {
+>         chunk_data.push(bytes.subslice_with_length(offset.bytes(), size.bytes()));
+>     }
+>     ret(Value::Union(chunk_data))
 > }"
 > "fn decode<M: Memory>(
 >     Type::Enum { variants, discriminator, size, .. }: Self,
@@ -595,8 +604,8 @@ mutual
 The fields of a tuple are decoded by `Type.decodeFields` and the data of an
 enum variant by `Type.decodeVariant`. `decode_discriminant` fails only if its
 accessor does; this accessor fails only by panicking (`subsliceWithLength` out
-of range), so `.unwrap()` is the propagation of that panic. Pointers, arrays,
-and unions are outside the fragment. -/
+of range), so `.unwrap()` is the propagation of that panic. Pointers and arrays
+are outside the fragment. -/
 def Type.decode : «Type» → List Byte → Interp (Option Val)
   | .Bool, bytes =>
     if bytes.length ≠ 1 then specPanic "decode of Type::Bool with invalid length"
@@ -616,6 +625,12 @@ def Type.decode : «Type» → List Byte → Interp (Option Val)
         match ← Type.decodeFields fields bytes with
         | some vals => pure (some (.Tuple vals))
         | none => pure none
+  | .Union _ chunks size _, bytes =>
+    if bytes.length ≠ size.bytes then specPanic "decode of Type::Union with invalid length"
+    else do
+      let chunkData ← chunks.mapM (fun (offset, chunkSize) =>
+        subsliceWithLength bytes offset.bytes chunkSize.bytes)
+      pure (some (.Union chunkData))
   | .Enum ⟨variants⟩ _ discriminator size _, bytes =>
     if bytes.length ≠ size.bytes then specPanic "decode of Type::Enum with invalid length"
     else do
@@ -630,7 +645,7 @@ def Type.decode : «Type» → List Byte → Interp (Option Val)
         | none => pure none
   | .Slice _, _ => specPanic "decode of Type::Slice"
   | .TraitObject _, _ => specPanic "decode of Type::TraitObject"
-  | _, _ => unsupported "Type::decode for a pointer, array, or union type"
+  | _, _ => unsupported "Type::decode for a pointer or array type"
 
 /-- The fields of `Type::decode` for `Tuple` (`spec/lang/representation.md`),
 each decoded from its own subslice:
@@ -670,10 +685,27 @@ def Type.decodeVariant : List (Int × Variant) → Int → List Byte → Interp 
 
 end
 
+/-- The chunk loop of `Type::encode` for `Union`
+(`spec/lang/representation.md`), which writes each chunk's bytes at its offset
+into `bytes` (initially all `Uninit`):
+> "for ((offset, size), data) in chunks.zip(chunk_data) {
+>     assert_eq!(size.bytes(), data.len());
+>     bytes.write_subslice_at_index(offset.bytes(), data);
+> }" -/
+def Type.encodeUnionChunks :
+    List (Offset × Size) → List (List Byte) → List Byte → Interp (List Byte)
+  | (offset, size) :: chunks, data :: chunkData, bytes =>
+    if size.bytes ≠ data.length then
+      specPanic "assertion failed: size.bytes() == data.len()"
+    else do
+      let bytes ← writeSubsliceAtIndex bytes offset.bytes data
+      Type.encodeUnionChunks chunks chunkData bytes
+  | _, _, bytes => pure bytes
+
 mutual
 
-/-- `Type::encode` for `Bool`, `Int` (`Type.encodeInt`), `Tuple`, `Enum`,
-`Slice`, and `TraitObject` (`spec/lang/representation.md`):
+/-- `Type::encode` for `Bool`, `Int` (`Type.encodeInt`), `Tuple`, `Union`,
+`Enum`, `Slice`, and `TraitObject` (`spec/lang/representation.md`):
 > "fn encode<M: Memory>(Type::Bool: Self, val: Value<M>) -> .. {
 >     let Value::Bool(b) = val else { panic!() };
 >     list![AbstractByte::Init(if b { 1 } else { 0 }, None)]
@@ -686,6 +718,13 @@ mutual
 >     let (size, _) = sized_head_layout.head_size_and_align();
 >     let Value::Tuple(values) = val else { panic!() };
 >     assert_eq!(values.len(), sized_fields.len());
+>     let mut bytes = list![AbstractByte::Uninit; size.bytes()];
+>     ..
+>     bytes
+> }"
+> "fn encode<M: Memory>(Type::Union { size, chunks, .. }: Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> {
+>     let Value::Union(chunk_data) = val else { panic!() };
+>     assert_eq!(chunk_data.len(), chunks.len());
 >     let mut bytes = list![AbstractByte::Uninit; size.bytes()];
 >     ..
 >     bytes
@@ -715,9 +754,9 @@ mutual
 > "fn encode<M: Memory>(Type::TraitObject(..): Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> {
 >     panic!(\"encode of Type::TraitObject\")
 > }"
-The fields of a tuple are encoded by `Type.encodeFields` and the variant of
-an enum by `Type.encodeVariant`. Pointers, arrays, and unions are outside the
-fragment. -/
+The fields of a tuple are encoded by `Type.encodeFields`, the chunks of a
+union by `Type.encodeUnionChunks`, and the variant of an enum by
+`Type.encodeVariant`. Pointers and arrays are outside the fragment. -/
 def Type.encode : «Type» → Val → Interp (List Byte)
   | .Bool, .Bool b => pure [.Init (if b then 1 else 0) none]
   | .Bool, _ => specPanic "encode: Type::Bool with a non-Bool value"
@@ -733,13 +772,20 @@ def Type.encode : «Type» → Val → Interp (List Byte)
           specPanic "assertion failed: values.len() == sized_fields.len()"
         else Type.encodeFields fields values (List.replicate size.bytes .Uninit)
       | _ => specPanic "encode: Type::Tuple with a non-Tuple value"
+  | .Union _ chunks size _, val =>
+    match val with
+    | .Union chunkData =>
+      if chunkData.length ≠ chunks.length then
+        specPanic "assertion failed: chunk_data.len() == chunks.len()"
+      else Type.encodeUnionChunks chunks chunkData (List.replicate size.bytes .Uninit)
+    | _ => specPanic "encode: Type::Union with a non-Union value"
   | .Enum ⟨variants⟩ _ _ _ _, val =>
     match val with
     | .Variant discriminant data => Type.encodeVariant variants discriminant data
     | _ => specPanic "encode: Type::Enum with a non-Variant value"
   | .Slice _, _ => specPanic "encode of Type::Slice"
   | .TraitObject _, _ => specPanic "encode of Type::TraitObject"
-  | _, _ => unsupported "Type::encode for a pointer, array, or union type"
+  | _, _ => unsupported "Type::encode for a pointer or array type"
 
 /-- The field loop of `Type::encode` for `Tuple`
 (`spec/lang/representation.md`), which writes each field's encoding at its
@@ -771,10 +817,20 @@ def Type.encodeVariant : List (Int × Variant) → Int → Val → Interp (List 
 
 end
 
+/-- The chunk loop of `check_value` for unions (`spec/lang/representation.md`):
+> "for (data, (_, size)) in chunk_data.zip(chunks) {
+>     ensure_else_ub(data.len() == size.bytes(), \"Value::Union: invalid chunk data\")?;
+> }" -/
+def checkUnionChunks : List (List Byte) → List (Offset × Size) → Interp Unit
+  | data :: chunkData, (_, size) :: chunks =>
+    if data.length ≠ size.bytes then ub "Value::Union: invalid chunk data"
+    else checkUnionChunks chunkData chunks
+  | _, _ => pure ()
+
 mutual
 
-/-- `Machine::check_value` for `Int`, `Bool`, `Tuple`, `Variant`, `Slice`,
-and `TraitObject` (`spec/lang/representation.md`):
+/-- `Machine::check_value` for `Int`, `Bool`, `Tuple`, `Union`, `Variant`,
+`Slice`, and `TraitObject` (`spec/lang/representation.md`):
 > "(Value::Int(i), Type::Int(int_ty)) => {
 >     ensure_else_ub(int_ty.can_represent(i), \"Value::Int: invalid integer value\")?;
 > }
@@ -786,14 +842,19 @@ and `TraitObject` (`spec/lang/representation.md`):
 >     ..
 > }
 > ..
+> (Value::Union(chunk_data), Type::Union { chunks, .. }) => {
+>     ensure_else_ub(chunk_data.len() == chunks.len(), \"Value::Union: invalid chunk size\")?;
+>     ..
+> }
 > (Value::Variant { discriminant, data }, Type::Enum { variants, .. }) => {
 >     ..
 > }
 > (_, Type::Slice { .. }) => panic!(\"Value: slices cannot be represented as values\"),
 > (_, Type::TraitObject { .. }) => panic!(\"Value: trait objects cannot be represented as values\"),
 > _ => panic!(\"Value: value does not match type\")"
-The fields of a tuple are checked by `checkFields` and the data of a variant
-by `checkVariant`. Pointers, arrays, and unions are outside the fragment. -/
+The fields of a tuple are checked by `checkFields`, the chunks of a union by
+`checkUnionChunks`, and the data of a variant by `checkVariant`. Pointers and
+arrays are outside the fragment. -/
 def checkValue : Val → «Type» → Interp Unit
   | .Int i, .Int t =>
     if IntType.can_represent t i then pure () else ub "Value::Int: invalid integer value"
@@ -804,14 +865,18 @@ def checkValue : Val → «Type» → Interp Unit
     | none =>
       if vals.length ≠ fields.length then ub "Value::Tuple: invalid number of fields"
       else checkFields vals fields
+  | .Union chunkData, .Union _ chunks _ _ =>
+    if chunkData.length ≠ chunks.length then ub "Value::Union: invalid chunk size"
+    else checkUnionChunks chunkData chunks
   | .Variant discriminant data, .Enum ⟨variants⟩ _ _ _ _ => checkVariant variants discriminant data
   | _, .Slice _ => specPanic "Value: slices cannot be represented as values"
   | _, .TraitObject _ => specPanic "Value: trait objects cannot be represented as values"
   | _, .Int _ => specPanic "Value: value does not match type"
   | _, .Bool => specPanic "Value: value does not match type"
   | _, .Tuple _ _ _ => specPanic "Value: value does not match type"
+  | _, .Union _ _ _ _ => specPanic "Value: value does not match type"
   | _, .Enum _ _ _ _ _ => specPanic "Value: value does not match type"
-  | _, _ => unsupported "check_value for a pointer, array, or union type"
+  | _, _ => unsupported "check_value for a pointer or array type"
 
 /-- The field loop of `check_value` for tuples (`spec/lang/representation.md`):
 > "for (val, (_, ty)) in vals.zip(sized_fields) {

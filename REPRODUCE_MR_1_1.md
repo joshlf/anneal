@@ -28,7 +28,9 @@ as a pass.
   threading the `FnMut` accessor state `s : σ` and evaluating the `fallback`
   continuation only when no child branch matches), of `Type::Tuple` (sized
   tuples as variant data with padding encoded as `Uninit`, and unsized tuple
-  layouts), and of `Type::Slice` and `Type::TraitObject` (`Type::layout`
+  layouts), of `Type::Union` (chunk extraction and restoration with gap bytes
+  encoded as `Uninit` and `check_value` chunk-count and chunk-length checks),
+  and of `Type::Slice` and `Type::TraitObject` (`Type::layout`
   returning `LayoutStrategy::{Slice, TraitObject}` so the unsized panic
   branches of `LayoutStrategy::{expect_size, expect_align}` are reachable, and
   `Type::{decode, encode}` and `check_value` raising the exact upstream
@@ -38,11 +40,12 @@ as a pass.
   items `impl_Machine__transmute` (`spec/lang/representation.md:788`),
   `impl_Machine__eval_rel_op` (`spec/lang/step/operators.md:320`),
   `impl_Type__decode_4` (tuples, `representation.md:248`),
+  `impl_Type__decode_6` (unions, `:322`),
   `fn_decode_discriminant` (`:353`), `fn_encode_discriminant` (`:377`),
   `impl_Type__decode_7` (enums, `:393`), `impl_Type__decode_8` (slices, `:441`),
   `impl_Type__decode_9` (trait objects, `:450`), and
   `impl_TupleHeadLayout__capped_tail_align` (`spec/lang/types.md:200`),
-  pinned by token hash and checked by `decide` (48 anchors in total).
+  pinned by token hash and checked by `decide` (49 anchors in total).
 - **Quotation checks** (`crates/anneal-minirust-gen/tests/quotes.rs`):
   `bool_comparison_and_transmute_quotations_are_pinned` and
   `enum_tuple_and_cmp_quotations_are_pinned` check each new upstream
@@ -95,17 +98,19 @@ as a pass.
   `cmpSel` (an `Ordering` return place receiving a signed `i8` `Cmp` or a
   `bool` `Cmp`; the inputs `(-1, 1, true)`, `(7, 7, true)`, and `(0, 0, false)`
   return `Less`, `Equal`, and `Greater` in both semantics), `boolBitOrdUse`
-  (exercising `BitAnd`, `BitOr`, and `BitXor` on `bool`, unsigned `u8`
-  `255u8.cmp(&1u8) = Greater`, `Use(copy _3)` on an `Ordering` argument local,
-  and `argsOk` rejection of invalid `Ordering` tag bytes `2` and `128`),
-  `uninitOrdering` (returning an uninitialized `Ordering` is UB in both
-  semantics), and ground-truth evaluations of the new operators,
-  `decodeDiscriminant` short-circuiting (`decodeDiscriminant_short_circuits`),
-  and the enum, tuple, slice, and trait-object representations.
+  (exercising `PlaceMention(_0)` on an uninitialized `Ordering` local, `BitAnd`,
+  `BitOr`, and `BitXor` on `bool`, unsigned `u8` `255u8.cmp(&1u8) = Greater`,
+  `Use(copy _3)` on an `Ordering` argument local, and `argsOk` rejection of
+  invalid `Ordering` tag bytes `2` and `128`), `uninitOrdering` (returning an
+  uninitialized `Ordering` is UB in both semantics), and ground-truth
+  evaluations of the new operators, `decodeDiscriminant` short-circuiting
+  (`decodeDiscriminant_short_circuits`), and the enum, tuple, union, slice,
+  and trait-object representations.
 - **Audit** (`minirust/lean/MiniRustSpec/Audit.lean`): `#check_theorem_deps`
-  logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, and `[WITNESS-AUDIT]` lines
-  ending in `sorry_free=true`, and fails the build on `sorryAx` or any
-  non-standard axiom.
+  verifies that every listed declaration is a distinct `theorem`
+  (`ConstantInfo.thmInfo`), logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, and
+  `[WITNESS-AUDIT]` lines ending in `sorry_free=true`, and fails the build on
+  duplicates, non-theorems, `sorryAx`, or any non-standard axiom.
 
 An `Ordering` local is written by `Cmp` or `Use(copy _j)` and read by `Use` or
 `Return`; the fragment has no `Ordering` constants, `Discriminant`, or
@@ -175,8 +180,8 @@ Pass: four lines of the form
 ```text
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
 [SIMULATION-AUDIT] decls=51 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
-[WITNESS-AUDIT] decls=128 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-MiniRustSpec.Audit: exhaustively verified standard axioms for 8516 declarations across all MiniRustSpec.* modules
+[WITNESS-AUDIT] decls=133 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+MiniRustSpec.Audit: exhaustively verified standard axioms for 8554 declarations across all MiniRustSpec.* modules
 ```
 
 (the axiom lists contain only `propext`, `Quot.sound`, and

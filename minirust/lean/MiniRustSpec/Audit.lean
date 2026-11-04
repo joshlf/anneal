@@ -34,23 +34,35 @@ namespace MiniRustSpec.Audit
 
 open Lean Elab Command
 
-/-- Fail unless every listed declaration depends only on the standard axioms. -/
+/-- Fail unless every listed declaration is distinct and depends only on the
+standard axioms. -/
 elab "#assert_standard_axioms " ids:ident* : command => do
+  let mut seen : Array Name := #[]
   for id in ids do
     let n ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo id
+    if seen.contains n then
+      throwError "duplicate declaration {n} in #assert_standard_axioms"
+    seen := seen.push n
     let axs ← liftCoreM <| Lean.collectAxioms n
     for a in axs do
       unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
         throwError "{n} depends on the non-standard axiom {a}"
     logInfo m!"{n} depends on axioms: {axs.toList}"
 
-/-- `checkTheoremDeps`: fail unless every listed declaration depends only on
-the standard axioms, then log one line
-`<tag> decls=<n> axioms=<union> sorry_free=true`. -/
+/-- `checkTheoremDeps`: fail unless every listed declaration is a distinct
+`theorem` (`ConstantInfo.thmInfo`) that depends only on the standard axioms,
+then log one line `<tag> decls=<n> axioms=<union> sorry_free=true`. -/
 elab "#check_theorem_deps " tag:str ids:ident* : command => do
+  let env ← getEnv
+  let mut seen : Array Name := #[]
   let mut union : Array Name := #[]
   for id in ids do
     let n ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo id
+    if seen.contains n then
+      throwError "{tag.getString} duplicate declaration {n}"
+    seen := seen.push n
+    unless (env.find? n matches some (.thmInfo _)) do
+      throwError "{tag.getString} {n} is not a theorem"
     let axs ← liftCoreM <| Lean.collectAxioms n
     for a in axs do
       if a == ``sorryAx then
@@ -478,6 +490,11 @@ open MiniRustSpec.Correspondence.Witness in
   decode_unsized_panics
   encode_unsized_panics
   checkValue_unsized_panics
+  layout_union
+  decode_union
+  encode_union
+  checkValue_union_chunk_size
+  checkValue_union_chunk_data
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -668,6 +685,11 @@ open MiniRustSpec.Correspondence.Witness in
   decode_unsized_panics
   encode_unsized_panics
   checkValue_unsized_panics
+  layout_union
+  decode_union
+  encode_union
+  checkValue_union_chunk_size
+  checkValue_union_chunk_data
   sumTo_minirust_ret_from_start
   castBitNot4_minirust_ret_from_start
   uninitSwitchUb_minirust_ub_from_start
