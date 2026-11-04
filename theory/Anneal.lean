@@ -16,6 +16,7 @@ import Anneal.Rustc.V2026_06_01.SymReflect
 import Anneal.Rustc.V2026_06_01.TraceCheck
 import Anneal.FunctionalTranslation
 import Anneal.MirFuelFree
+import Anneal.PureMirExec
 
 namespace Anneal
 
