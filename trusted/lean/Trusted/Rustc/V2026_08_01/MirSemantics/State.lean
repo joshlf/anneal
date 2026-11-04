@@ -291,8 +291,46 @@ structure SavedCallerFrame : Type where
   calleeProtectors : List Nat := .nil
 
 /--
+Reified function-pointer table entry in `Memory.fnPtrs`, modeling
+`rustc_middle::mir::interpret::GlobalAlloc::Function` for a function item
+coerced to a function pointer via `CastKind.pointerCoercion "ReifyFnPointer"`.
+
+Records the synthetic allocation identifier `allocId` (`ProvenancePtr.allocId`
+at byte offset `0`), the target function's canonical `defPath` and monomorphized
+`typeArgs` (`RigidTy.fnDef defPath typeArgs`), and the optional reified function
+pointer signature `fnSig` (`RigidTy.fnPtr inputs output safety abi`).
+
+Reference (`compiler/rustc_middle/src/mir/interpret/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/mod.rs#L176-L185>
+
+> "pub enum GlobalAlloc<'tcx> {
+>     /// The alloc ID is used as a function pointer.
+>     Function {
+>         instance: ty::Instance<'tcx>,
+>     },"
+
+Reference (The Rust Reference, "Function pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/function-pointer.html>
+
+> "Function pointer types, written using the `fn` keyword, refer to a function
+> whose identity is not necessarily known at compile-time. They can be created
+> via a coercion from both function items and non-capturing closures."
+-/
+structure FnPtrEntry : Type where
+  /-- Synthetic allocation identifier (`ProvenancePtr.allocId`) for this function pointer. -/
+  allocId : AllocId
+  /-- Canonical `DefPath` of the target function item (`RigidTy.fnDef`). -/
+  defPath : DefPath
+  /-- Monomorphized generic type arguments of the function item (`RigidTy.fnDef`). -/
+  typeArgs : List RigidTy := .nil
+  /-- Optional function-pointer signature (`RigidTy.fnPtr inputs output safety abi`). -/
+  fnSig : Option RigidTy := .none
+
+/--
 Abstract heap, global allocation, Tree Borrows tag table, active function-entry
-lifetime protectors, and interprocedural call stack store.
+lifetime protectors, interprocedural call stack, and reified function-pointer
+table store.
 -/
 structure Memory : Type where
   /-- Next fresh allocation identifier. -/
@@ -307,6 +345,8 @@ structure Memory : Type where
       resolution; calls to targets absent from `callees` emit `MirCallE`
       interactions. -/
   callees : List CapturedMir := .nil
+  /-- Registered trait implementations for polymorphic method resolution. -/
+  traitImpls : List TraitImplEntry := .nil
   /-- Stack of suspended caller frames awaiting `TerminatorKind.return_`. -/
   callStack : List SavedCallerFrame := .nil
   /-- Active callee MIR body, or `.none` when executing the root body. -/
@@ -325,6 +365,19 @@ structure Memory : Type where
       > "Shared references point to memory which is owned by some other value."
       > "Mutable references point to memory which is owned by some other value." -/
   callerLocals : List LocalSlot := .nil
+  /-- Reified function-pointer allocation table (`GlobalAlloc::Function`),
+      mapping synthetic `AllocId`s (`>= fnPtrAllocBase`) to target function
+      identities and signatures (`FnPtrEntry`).
+
+      Reference (`compiler/rustc_middle/src/mir/interpret/mod.rs` at commit
+      `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+      <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/mod.rs#L176-L185>
+
+      > "/// The alloc ID is used as a function pointer.
+      > Function {
+      >     instance: ty::Instance<'tcx>,
+      > }," -/
+  fnPtrs : List FnPtrEntry := .nil
 
 /--
 Default empty `Memory` state used when evaluating pure `Rvalue` expressions
@@ -336,11 +389,13 @@ def emptyMemory : Memory where
   borrows := .nil
   nextTag := 1
   callees := .nil
+  traitImpls := .nil
   callStack := .nil
   activeCallee := .none
   activeProtectors := .nil
   nextProtector := 1
   callerLocals := .nil
+  fnPtrs := .nil
 
 /--
 Small-step machine configuration for `CapturedMir` execution.
@@ -379,6 +434,8 @@ Reference (The Rust Reference, "External blocks - ABI"):
 structure MirCallReq : Type where
   /-- Canonical `DefId` path of the external or unlinked callee. -/
   defPath : DefPath
+  /-- Monomorphized generic type arguments of the target function. -/
+  typeArgs : List RigidTy := .nil
   /-- Evaluated argument values passed to the callee. -/
   args : List Value
   /-- Memory and borrow state at the call point. -/
@@ -619,6 +676,7 @@ def replicateValue : Nat → Value → List Value
 Compare two `List UInt8` byte sequences for equality using only `Init.Core`
 `Nat.beq`.
 -/
+@[reducible]
 def listByteEq : List UInt8 → List UInt8 → Bool
   | .nil, .nil => true
   | b₁ :: bs₁, b₂ :: bs₂ =>
@@ -630,6 +688,7 @@ def listByteEq : List UInt8 → List UInt8 → Bool
 /--
 Compare two `String` values for UTF-8 byte equality in `Init.Core`.
 -/
+@[reducible]
 def stringEq (a b : String) : Bool :=
   listByteEq a.toByteArray.data.toList b.toByteArray.data.toList
 
@@ -659,5 +718,303 @@ Initialize the local variable slots for `body` with argument values `args`.
 -/
 def initLocals (body : CapturedMir) (args : List Value) : List LocalSlot :=
   initLocalsAux 0 body.localDecls args
+
+/--
+Base allocation identifier offset (`65536`) for synthetic function-pointer
+allocations (`GlobalAlloc::Function`), keeping reified function pointer
+`AllocId`s non-zero and disjoint from default stack borrow tags (`1, 2, ...`).
+
+Reference (`compiler/rustc_middle/src/mir/interpret/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/mod.rs#L176-L185>
+
+> "pub enum GlobalAlloc<'tcx> {
+>     /// The alloc ID is used as a function pointer.
+>     Function {
+>         instance: ty::Instance<'tcx>,
+>     },"
+-/
+@[reducible]
+def fnPtrAllocBase : AllocId := 65536
+
+/--
+Test whether `allocId` lies in the synthetic function-pointer `AllocId` range
+(`allocId >= fnPtrAllocBase`).
+
+Reference (`compiler/rustc_middle/src/mir/interpret/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/mod.rs#L176-L185>
+
+> "/// The alloc ID is used as a function pointer.
+> Function {
+>     instance: ty::Instance<'tcx>,
+> },"
+-/
+@[reducible]
+def isFnPtrAllocId (allocId : AllocId) : Bool :=
+  Nat.ble fnPtrAllocBase allocId
+
+/--
+Look up the `FnPtrEntry` with allocation identifier `allocId` in `fnPtrs`.
+
+Reference (`compiler/rustc_middle/src/mir/interpret/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/mod.rs#L176-L185>
+
+> "/// The alloc ID is used as a function pointer.
+> Function {
+>     instance: ty::Instance<'tcx>,
+> },"
+-/
+@[reducible]
+def lookupFnPtr : List FnPtrEntry → AllocId → Option FnPtrEntry
+  | .nil, _ => .none
+  | entry :: rest, allocId =>
+    match Nat.beq entry.allocId allocId with
+    | true => .some entry
+    | false => lookupFnPtr rest allocId
+
+/--
+Compare two `UintTy` unsigned integer width tags for equality in `Init.Core`.
+-/
+@[reducible]
+def uintTyEq : UintTy → UintTy → Bool
+  | .u8, .u8 => true
+  | .u16, .u16 => true
+  | .u32, .u32 => true
+  | .u64, .u64 => true
+  | .u128, .u128 => true
+  | .usize, .usize => true
+  | _, _ => false
+
+/--
+Compare two `IntTy` signed integer width tags for equality in `Init.Core`.
+-/
+@[reducible]
+def intTyEq : IntTy → IntTy → Bool
+  | .i8, .i8 => true
+  | .i16, .i16 => true
+  | .i32, .i32 => true
+  | .i64, .i64 => true
+  | .i128, .i128 => true
+  | .isize, .isize => true
+  | _, _ => false
+
+/--
+Compare two `FloatTy` floating-point width tags for equality in `Init.Core`.
+-/
+@[reducible]
+def floatTyEq : FloatTy → FloatTy → Bool
+  | .f16, .f16 => true
+  | .f32, .f32 => true
+  | .f64, .f64 => true
+  | .f128, .f128 => true
+  | _, _ => false
+
+/--
+Compare two `Mutability` qualifiers for equality in `Init.Core`.
+-/
+@[reducible]
+def mutabilityEq : Mutability → Mutability → Bool
+  | .not, .not => true
+  | .mut, .mut => true
+  | _, _ => false
+
+/--
+Compare two `Safety` qualifiers for equality in `Init.Core`.
+-/
+@[reducible]
+def safetyEq : Safety → Safety → Bool
+  | .safe, .safe => true
+  | .unsafe_, .unsafe_ => true
+  | _, _ => false
+
+/--
+Compare two `CallConv` calling-convention tags for equality in `Init.Core`.
+
+Reference (The Rust Reference, "Function pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/function-pointer.html>
+
+> "Two function pointer types are compatible if they have the same ABI, safety,
+> parameter types, and return type."
+-/
+@[reducible]
+def callConvEq : CallConv → CallConv → Bool
+  | .rust, .rust => true
+  | .c, .c => true
+  | .rustIntrinsic, .rustIntrinsic => true
+  | .other a, .other b => stringEq a b
+  | _, _ => false
+
+/--
+Default recursion budget for fuel-bounded structural `RigidTy` equality.
+-/
+@[reducible]
+def defaultTyEqFuel : Nat := 16
+
+mutual
+
+/--
+Fuel-bounded structural equality on `RigidTy` in `Init.Core`.
+
+Reference (The Rust Reference, "Function pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/function-pointer.html>
+
+> "Function pointer types, written using the `fn` keyword, refer to a function
+> whose identity is not necessarily known at compile-time."
+-/
+@[reducible]
+def rigidTyEqAux : Nat → RigidTy → RigidTy → Bool
+  | .zero, _, _ => false
+  | .succ fuel, a, b =>
+    match a, b with
+    | .bool, .bool => true
+    | .char, .char => true
+    | .int w₁, .int w₂ => intTyEq w₁ w₂
+    | .uint w₁, .uint w₂ => uintTyEq w₁ w₂
+    | .float w₁, .float w₂ => floatTyEq w₁ w₂
+    | .never, .never => true
+    | .str, .str => true
+    | .tuple fs₁, .tuple fs₂ => rigidTyListEqAux fuel fs₁ fs₂
+    | .array e₁ n₁, .array e₂ n₂ =>
+      Bool.and (Nat.beq n₁ n₂) (rigidTyEqAux fuel e₁ e₂)
+    | .slice e₁, .slice e₂ => rigidTyEqAux fuel e₁ e₂
+    | .ref m₁ p₁, .ref m₂ p₂ =>
+      Bool.and (mutabilityEq m₁ m₂) (rigidTyEqAux fuel p₁ p₂)
+    | .rawPtr m₁ p₁, .rawPtr m₂ p₂ =>
+      Bool.and (mutabilityEq m₁ m₂) (rigidTyEqAux fuel p₁ p₂)
+    | .adt d₁ args₁, .adt d₂ args₂ =>
+      Bool.and (stringEq d₁ d₂) (rigidTyListEqAux fuel args₁ args₂)
+    | .fnDef d₁ args₁, .fnDef d₂ args₂ =>
+      Bool.and (stringEq d₁ d₂) (rigidTyListEqAux fuel args₁ args₂)
+    | .fnPtr ins₁ out₁ saf₁ abi₁, .fnPtr ins₂ out₂ saf₂ abi₂ =>
+      Bool.and
+        (rigidTyListEqAux fuel ins₁ ins₂)
+        (Bool.and
+          (rigidTyEqAux fuel out₁ out₂)
+          (Bool.and (safetyEq saf₁ saf₂) (callConvEq abi₁ abi₂)))
+    | .closure d₁ up₁, .closure d₂ up₂ =>
+      Bool.and (stringEq d₁ d₂) (rigidTyListEqAux fuel up₁ up₂)
+    | .dynamic d₁, .dynamic d₂ => stringEq d₁ d₂
+    | .foreign d₁, .foreign d₂ => stringEq d₁ d₂
+    | .param idx₁ name₁, .param idx₂ name₂ =>
+      Bool.and (Nat.beq idx₁ idx₂) (stringEq name₁ name₂)
+    | .alias d₁ args₁, .alias d₂ args₂ =>
+      Bool.and (stringEq d₁ d₂) (rigidTyListEqAux fuel args₁ args₂)
+    | .other r₁, .other r₂ => stringEq r₁ r₂
+    | _, _ => false
+
+/--
+Fuel-bounded pointwise structural equality on `List RigidTy` in `Init.Core`.
+-/
+@[reducible]
+def rigidTyListEqAux : Nat → List RigidTy → List RigidTy → Bool
+  | .zero, _, _ => false
+  | .succ _, .nil, .nil => true
+  | .succ fuel, x :: xs, y :: ys =>
+    Bool.and
+      (rigidTyEqAux (.succ fuel) x y)
+      (rigidTyListEqAux (.succ fuel) xs ys)
+  | .succ _, _, _ => false
+
+end
+
+/--
+Compare two `RigidTy` values for structural equality using `defaultTyEqFuel`.
+-/
+@[reducible]
+def rigidTyEq (a b : RigidTy) : Bool :=
+  rigidTyEqAux defaultTyEqFuel a b
+
+/--
+Compare two `List RigidTy` lists for pointwise structural equality using
+`defaultTyEqFuel`.
+-/
+@[reducible]
+def rigidTyListEq (xs ys : List RigidTy) : Bool :=
+  rigidTyListEqAux defaultTyEqFuel xs ys
+
+/--
+Compare two `Option RigidTy` values for structural equality.
+-/
+@[reducible]
+def optionRigidTyEq : Option RigidTy → Option RigidTy → Bool
+  | .none, .none => true
+  | .some a, .some b => rigidTyEq a b
+  | _, _ => false
+
+/--
+Look up an existing `FnPtrEntry` in `fnPtrs` with matching `(defPath, typeArgs, fnSig)`.
+
+Reference (`compiler/rustc_middle/src/mir/interpret/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/mod.rs#L176-L185>
+
+> "/// The alloc ID is used as a function pointer.
+> Function {
+>     instance: ty::Instance<'tcx>,
+> },"
+-/
+@[reducible]
+def findFnPtrEntry? :
+    List FnPtrEntry → DefPath → List RigidTy → Option RigidTy → Option FnPtrEntry
+  | .nil, _, _, _ => .none
+  | entry :: rest, defPath, typeArgs, fnSig =>
+    match
+      Bool.and
+        (stringEq entry.defPath defPath)
+        (Bool.and
+          (rigidTyListEq entry.typeArgs typeArgs)
+          (optionRigidTyEq entry.fnSig fnSig))
+    with
+    | true => .some entry
+    | false => findFnPtrEntry? rest defPath typeArgs fnSig
+
+/--
+Compute the next fresh function-pointer `AllocId` (`>= fnPtrAllocBase`) above
+all existing entries in `fnPtrs`.
+-/
+@[reducible]
+def nextFnPtrAllocId : List FnPtrEntry → AllocId
+  | .nil => fnPtrAllocBase
+  | entry :: rest =>
+    let restNext := nextFnPtrAllocId rest
+    let cand := Nat.add entry.allocId 1
+    match Nat.ble restNext cand with
+    | true => cand
+    | false => restNext
+
+/--
+Intern a reified function pointer targeting `(defPath, typeArgs, fnSig)` in
+`mem.fnPtrs`, reusing its existing `AllocId` if already registered or allocating
+`nextFnPtrAllocId mem.fnPtrs` (`>= fnPtrAllocBase`) otherwise.
+
+Reference (`compiler/rustc_middle/src/mir/interpret/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/mod.rs#L176-L185>
+
+> "/// The alloc ID is used as a function pointer.
+> Function {
+>     instance: ty::Instance<'tcx>,
+> },"
+-/
+@[reducible]
+def internFnPtr
+    (mem : Memory)
+    (defPath : DefPath)
+    (typeArgs : List RigidTy := .nil)
+    (fnSig : Option RigidTy := .none) :
+    AllocId × Memory :=
+  match findFnPtrEntry? mem.fnPtrs defPath typeArgs fnSig with
+  | .some existing => (existing.allocId, mem)
+  | .none =>
+    let allocId := nextFnPtrAllocId mem.fnPtrs
+    let entry : FnPtrEntry := {
+      allocId := allocId
+      defPath := defPath
+      typeArgs := typeArgs
+      fnSig := fnSig
+    }
+    (allocId, { mem with fnPtrs := entry :: mem.fnPtrs })
 
 end Trusted.Rustc.V2026_08_01.MirSemantics
