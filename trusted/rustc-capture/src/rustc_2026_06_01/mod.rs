@@ -977,6 +977,15 @@ pub fn unselected_helper(y: u32) -> u32 {
 #[derive(Copy, Clone)]
 pub struct Wrapper<T>(pub T);
 
+#[derive(Copy, Clone)]
+pub struct Pair<A, B>(pub A, pub B);
+
+#[derive(Copy, Clone)]
+pub struct PairWithHeader<T> {
+    pub header: u64,
+    pub payload: T,
+}
+
 pub fn swap_pair<'a, T: Copy, U: Copy>(_tag: &'a u32, a: T, b: U) -> (U, T) {
     (b, a)
 }
@@ -987,6 +996,28 @@ pub fn wrap_array<T: Copy>(x: T) -> [T; 2] {
 
 pub fn wrap_opt<T: Copy>(x: T) -> Option<T> {
     Some(x)
+}
+
+pub fn make_header_pair<T: Copy>(header: u64, payload: T) -> PairWithHeader<T> {
+    PairWithHeader { header, payload }
+}
+
+impl<T: Copy> Pair<T, TypeA> {
+    pub fn first(self) -> T {
+        self.0
+    }
+}
+
+impl<T: Copy> Pair<T, TypeB> {
+    pub fn first(self) -> T {
+        self.0
+    }
+}
+
+impl<T: Copy> Pair<T, T> {
+    pub fn diag_first(self) -> T {
+        self.0
+    }
 }
 
 impl<T: Copy> Wrapper<T> {
@@ -1110,6 +1141,9 @@ pub fn unnormalized_assoc<T: MyTrait>(x: &T) -> <T as MyTrait>::Assoc {
         let wrapper_pair_with = find_target("demo_generics::Wrapper::<T>::pair_with");
         let spec_u32 = find_target("demo_generics::<Wrapper<u32>>::spec_tag");
         let spec_u64 = find_target("demo_generics::<Wrapper<u64>>::spec_tag");
+        let pair_type_a = find_target("demo_generics::<Pair<T, TypeA>>::first");
+        let pair_type_b = find_target("demo_generics::<Pair<T, TypeB>>::first");
+        let pair_diagonal = find_target("demo_generics::<Pair<T, T>>::diag_first");
         assert_eq!(wrapper_get.lean_module_name, "Mir.DemoGenerics.Wrapper_T_get");
         assert_eq!(
             wrapper_pair_with.lean_module_name,
@@ -1122,6 +1156,18 @@ pub fn unnormalized_assoc<T: MyTrait>(x: &T) -> <T as MyTrait>::Assoc {
         assert_eq!(
             spec_u64.lean_module_name,
             "Mir.DemoGenerics.Wrapper_u64_spec_tag"
+        );
+        assert_eq!(
+            pair_type_a.lean_module_name,
+            "Mir.DemoGenerics.Pair_T_TypeA_first"
+        );
+        assert_eq!(
+            pair_type_b.lean_module_name,
+            "Mir.DemoGenerics.Pair_T_TypeB_first"
+        );
+        assert_eq!(
+            pair_diagonal.lean_module_name,
+            "Mir.DemoGenerics.Pair_T_T_diag_first"
         );
 
         let pair_with_lean =
@@ -1237,6 +1283,7 @@ pub fn unnormalized_assoc<T: MyTrait>(x: &T) -> <T as MyTrait>::Assoc {
             "Mir/DemoGenerics/swap_pair.lean",
             "Mir/DemoGenerics/wrap_array.lean",
             "Mir/DemoGenerics/wrap_opt.lean",
+            "Mir/DemoGenerics/make_header_pair.lean",
             "Mir/DemoGenerics/Wrapper_T_pair_with.lean",
             "Mir/DemoGenerics/Wrapper_T_as_MyTrait_method.lean",
             "Mir/DemoGenerics/unnormalized_assoc.lean",
@@ -1268,6 +1315,7 @@ pub fn unnormalized_assoc<T: MyTrait>(x: &T) -> <T as MyTrait>::Assoc {
 import Mir.DemoGenerics.swap_pair
 import Mir.DemoGenerics.wrap_array
 import Mir.DemoGenerics.wrap_opt
+import Mir.DemoGenerics.make_header_pair
 import Mir.DemoGenerics.Wrapper_T_pair_with
 import Mir.DemoGenerics.Wrapper_T_as_MyTrait_method
 import Mir.DemoGenerics.unnormalized_assoc
@@ -1321,7 +1369,8 @@ example :
     ((get? (Mir.DemoGenerics.Wrapper_T_pair_with.body.instantiate substU32U64).localDecls 1).map (fun d => d.ty.kind)) =
       .some (.adt "demo_generics::Wrapper" [.uint .u32]) := rfl
 
--- 4. `wrap_array<T>` and `wrap_opt<T>` recompute `[u32; 2]` (8 bytes, align 4) and `Option<u32>` (8 bytes, align 4)
+-- 4. `wrap_array<T>`, `wrap_opt<T>`, and `make_header_pair<T>` recompute `[u32; 2]` (8B, align 4),
+--    `Option<u32>` (8B, align 4), and `PairWithHeader<u32>` (16B, align 8)
 example :
     (Mir.DemoGenerics.wrap_array.body.instantiate substU32).fnAbi.ret.layout.size = { bytes := 8 } := rfl
 example :
@@ -1330,6 +1379,10 @@ example :
     (Mir.DemoGenerics.wrap_opt.body.instantiate substU32).fnAbi.ret.layout.size = { bytes := 8 } := rfl
 example :
     (Mir.DemoGenerics.wrap_opt.body.instantiate substU32).fnAbi.ret.layout.align = { bytes := 4 } := rfl
+example :
+    (Mir.DemoGenerics.make_header_pair.body.instantiate substU32).fnAbi.ret.layout.size = { bytes := 16 } := rfl
+example :
+    (Mir.DemoGenerics.make_header_pair.body.instantiate substU32).fnAbi.ret.layout.align = { bytes := 8 } := rfl
 
 -- 5. Generic trait impl `<Wrapper<T> as MyTrait>::method` instantiates `traitImpls`
 example :

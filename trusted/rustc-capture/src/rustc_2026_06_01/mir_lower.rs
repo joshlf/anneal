@@ -54,9 +54,34 @@ pub fn canonical_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
     {
         let self_ty = tcx.type_of(parent_id).instantiate_identity().skip_norm_wip();
         let has_specialized_self_ty = match self_ty.kind() {
-            TyKind::Adt(_, args) => args
-                .types()
-                .any(|t| !matches!(t.kind(), TyKind::Param(_))),
+            TyKind::Adt(adt_def, args) => {
+                let adt_type_param_count = tcx
+                    .generics_of(adt_def.did())
+                    .own_params
+                    .iter()
+                    .filter(|p| {
+                        matches!(p.kind, rustc_middle::ty::GenericParamDefKind::Type { .. })
+                    })
+                    .count();
+                let impl_type_param_indices: Vec<u32> = tcx
+                    .generics_of(parent_id)
+                    .own_params
+                    .iter()
+                    .filter_map(|p| match p.kind {
+                        rustc_middle::ty::GenericParamDefKind::Type { .. } => Some(p.index),
+                        _ => None,
+                    })
+                    .collect();
+                let adt_type_param_indices: Option<Vec<u32>> = args
+                    .types()
+                    .map(|t| match t.kind() {
+                        TyKind::Param(p) => Some(p.index),
+                        _ => None,
+                    })
+                    .collect();
+                adt_type_param_count != impl_type_param_indices.len()
+                    || adt_type_param_indices.as_ref() != Some(&impl_type_param_indices)
+            }
             _ => true,
         };
         if has_specialized_self_ty {
