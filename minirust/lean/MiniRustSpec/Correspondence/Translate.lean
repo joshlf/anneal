@@ -303,7 +303,7 @@ def translatePlace : MirAst.Place → Option Gen.PlaceExpr
 `copy (_j.0)` on an `(it, bool)` local has type `it`, and a constant carries
 its type. -/
 def operandIntType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.IntType
-  | .copy ⟨j, []⟩ => decls[j]? >>= fun d => intTypeOf d.ty
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ => decls[j]? >>= fun d => intTypeOf d.ty
   | .copy ⟨j, [.field 0 fTy]⟩ => do
     let d ← decls[j]?
     let it ← intBoolTupleOf d.ty
@@ -315,7 +315,7 @@ def operandIntType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option G
 /-- MiniRust type of a fragment operand (including `copy (_j.0)` and
 `copy (_j.1)` field projections on an `(it, bool)` tuple local). -/
 def operandType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.Type
-  | .copy ⟨j, []⟩ => decls[j]? >>= fun d => scalarTypeOf d.ty
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ => decls[j]? >>= fun d => scalarTypeOf d.ty
   | .copy ⟨j, [.field 0 fTy]⟩ => do
     let d ← decls[j]?
     let it ← intBoolTupleOf d.ty
@@ -343,7 +343,7 @@ the one-byte patterns `0` and `1`:
 >      ValueExpr::Constant(Constant::Bool(val), ty)
 >  }" (`tooling/minimize/src/constant.rs`) -/
 def translateOperand : MirAst.Operand → Option Gen.ValueExpr
-  | .copy p => (translatePlace p).map .Load
+  | .copy p | .move p => (translatePlace p).map .Load
   | .constant c =>
     if isBoolTy c.ty then
       match c.val with
@@ -357,7 +357,6 @@ def translateOperand : MirAst.Operand → Option Gen.ValueExpr
           some (.Constant (.Int (intFromBits bits it)) (.Int it))
         else none
       | _, _ => none
-  | _ => none
 
 /-- `minimize`'s unary-operator translation for integer operands
 (`tooling/minimize/src/rvalue.rs`):
@@ -691,6 +690,9 @@ def translateStatement (decls : List MirAst.LocalDecl) (s : MirAst.Statement) :
   | .assign ⟨i, []⟩ rv =>
     (translateRvalue decls rv).map (fun src => .Assign (.Local (localName i)) src)
   | .placeMention p => (translatePlace p).map .PlaceMention
+  | .storageLive i => some (.StorageLive (localName i))
+  | .storageDead i => some (.StorageDead (localName i))
+  | .deinit p => (translatePlace p).map .Deinit
   | _ => none
 
 /-- `minimize`'s switch cases for a discriminant of type `it`
@@ -798,7 +800,20 @@ def translateBlocks (decls : List MirAst.LocalDecl) :
     pure ((bbName i, b) :: rest)
 
 /-- The init block `minimize` prepends (see `translateFn`). -/
-def initBlock : Gen.BasicBlock := ⟨[], .Goto (bbName 0), .Regular⟩
+def hasExplicitStorageLive (body : MirAst.CapturedMir) (loc : Nat) : Bool :=
+  body.basicBlocks.any fun bb =>
+    bb.statements.any fun s =>
+      match s.kind with
+      | .storageLive l => l == loc
+      | .storageDead l => l == loc
+      | _ => false
+
+def alwaysStorageLiveLocals (body : MirAst.CapturedMir) : List Nat :=
+  (List.range body.localDecls.length).filter fun loc =>
+    loc ≥ body.argCount + 1 && !hasExplicitStorageLive body loc
+
+def initBlock (body : MirAst.CapturedMir) : Gen.BasicBlock :=
+  ⟨(alwaysStorageLiveLocals body).map (fun loc => .StorageLive (localName loc)), .Goto (bbName 0), .Regular⟩
 
 /-- `minimize`'s function translation (`tooling/minimize/src/function.rs`),
 specialized to bodies whose only locals are the return place and the arguments:
@@ -835,7 +850,7 @@ def translateFn (body : MirAst.CapturedMir) : Option Gen.Function := do
     args := (List.range body.argCount).map (fun k => localName (k + 1))
     ret := localName 0
     calling_convention := .Rust
-    blocks := ⟨blocks ++ [(bbName n, initBlock)]⟩
+    blocks := ⟨blocks ++ [(bbName n, initBlock body)]⟩
     start := bbName n
     implicit_writes := true
   }
@@ -846,7 +861,7 @@ def translateFn (body : MirAst.CapturedMir) : Option Gen.Function := do
 0 `copy (_j.0)` of an `(it, bool)` tuple local, or an integer constant. -/
 def operandOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) (op : MirAst.Operand) : Bool :=
   match op with
-  | .copy ⟨j, []⟩ | .copy ⟨j, [.field 0 _]⟩ =>
+  | .copy ⟨j, []⟩ | .copy ⟨j, [.field 0 _]⟩ | .move ⟨j, []⟩ | .move ⟨j, [.field 0 _]⟩ =>
     decide (j < decls.length) && decide (operandIntType decls op = some it)
   | .constant _ =>
     decide (operandIntType decls op = some it) && (translateOperand op).isSome
@@ -874,7 +889,7 @@ of an `(Int, bool)` tuple local, or a `bool` constant that `minimize` can read
 (`0` or `1`). -/
 def operandOkB (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
   match op with
-  | .copy ⟨j, []⟩ | .copy ⟨j, [.field 1 _]⟩ =>
+  | .copy ⟨j, []⟩ | .copy ⟨j, [.field 1 _]⟩ | .move ⟨j, []⟩ | .move ⟨j, [.field 1 _]⟩ =>
     decide (j < decls.length) && operandIsBool decls op
   | .constant _ => operandIsBool decls op && (translateOperand op).isSome
   | _ => false
@@ -926,7 +941,7 @@ def rvalueOkB (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Bool
 
 /-- Whether a fragment operand has MiniRust type `orderingTy`. -/
 def operandIsOrdering (decls : List MirAst.LocalDecl) : MirAst.Operand → Bool
-  | .copy ⟨j, []⟩ => match decls[j]? with | some d => isOrderingTy d.ty | none => false
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ => match decls[j]? with | some d => isOrderingTy d.ty | none => false
   | .constant c => isOrderingTy c.ty
   | _ => false
 
@@ -935,7 +950,7 @@ constants are rejected by `translateOperand`; see
 `translateOperand_ordering_const`). -/
 def operandOkO (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
   match op with
-  | .copy ⟨j, []⟩ => decide (j < decls.length) && operandIsOrdering decls op
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ => decide (j < decls.length) && operandIsOrdering decls op
   | .constant _ => operandIsOrdering decls op && (translateOperand op).isSome
   | _ => false
 
@@ -948,13 +963,13 @@ def rvalueOkO (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Bool
 
 /-- Field-0 integer type of a projection-free `(Int, bool)` 2-tuple operand. -/
 def operandTupleIntType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.IntType
-  | .copy ⟨j, []⟩ => decls[j]? >>= fun d => intBoolTupleOf d.ty
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ => decls[j]? >>= fun d => intBoolTupleOf d.ty
   | _ => none
 
 /-- A projection-free `(Int, bool)` 2-tuple operand of field-0 integer type `it`. -/
 def operandOkTuple (decls : List MirAst.LocalDecl) (it : Gen.IntType) (op : MirAst.Operand) : Bool :=
   match op with
-  | .copy ⟨j, []⟩ =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ =>
     decide (j < decls.length) && decide (operandTupleIntType decls op = some it)
   | _ => false
 
@@ -1010,6 +1025,8 @@ def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement) : Bool :=
           | none => false
           | some it => rvalueOk decls it rv
   | .placeMention p => placeOk decls p
+  | .storageLive i | .storageDead i => decide (i < decls.length)
+  | .deinit p => placeOk decls p
   | _ => false
 
 /-- A fragment `switchInt` discriminant: an integer operand of its type, or a
@@ -1042,7 +1059,7 @@ def terminatorOk (decls : List MirAst.LocalDecl) (nblocks : Nat) (t : MirAst.Ter
 /-- The decidable fragment on which the correspondence theorem is stated. -/
 def inFragment (body : MirAst.CapturedMir) : Bool :=
   body.isRuntimePostCleanup &&
-  decide (body.localDecls.length = body.argCount + 1) &&
+  decide (body.argCount + 1 ≤ body.localDecls.length) &&
   body.localDecls.all (fun d => (scalarTypeOf d.ty).isSome) &&
   decide (body.basicBlocks ≠ []) &&
   body.basicBlocks.all (fun bb =>

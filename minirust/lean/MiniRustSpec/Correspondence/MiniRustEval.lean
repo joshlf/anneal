@@ -1191,15 +1191,15 @@ theorem typedLoad_local_tuple_field1_uninit {m : Mach} {ctx : Ctx} {frames : Lis
 /-- The bit pattern an Anneal fragment operand evaluates to, or `none` when
 reading it is UB (an uninitialized local). -/
 def opBits (locals : List LocalSlot) : Operand → Option Nat
-  | .copy ⟨j, []⟩ =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ =>
     match locals[j]? with
     | some (.init (.scalar sc)) => some sc.bits
     | _ => none
-  | .copy ⟨j, [.field 0 _]⟩ =>
+  | .copy ⟨j, [.field 0 _]⟩ | .move ⟨j, [.field 0 _]⟩ =>
     match locals[j]? with
     | some (.init (.aggregate 0 [.scalar sc0, .scalar _])) => some sc0.bits
     | _ => none
-  | .copy ⟨j, [.field 1 _]⟩ =>
+  | .copy ⟨j, [.field 1 _]⟩ | .move ⟨j, [.field 1 _]⟩ =>
     match locals[j]? with
     | some (.init (.aggregate 0 [.scalar _, .scalar sc1])) => some sc1.bits
     | _ => none
@@ -1472,7 +1472,7 @@ theorem fragTy_of_scalarTypeOf {d : LocalDecl} {T : Gen.Type} {it : Gen.IntType}
 (integers) and `operandOkB` (`bool`), including single-level field projections
 `.field 0` and `.field 1` on `(Int, bool)` tuple locals. -/
 def OperandOkT (decls : List LocalDecl) (T : Gen.Type) : Operand → Prop
-  | .copy ⟨j, []⟩ => j < decls.length ∧ operandType decls (.copy ⟨j, []⟩) = some T
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ => j < decls.length ∧ operandType decls (.copy ⟨j, []⟩) = some T
   | .copy ⟨j, [.field 0 fTy]⟩ =>
     j < decls.length ∧ operandType decls (.copy ⟨j, [.field 0 fTy]⟩) = some T
   | .copy ⟨j, [.field 1 fTy]⟩ =>
@@ -1483,7 +1483,7 @@ def OperandOkT (decls : List LocalDecl) (T : Gen.Type) : Operand → Prop
 theorem operandType_of_operandIntType {decls : List LocalDecl} {it : Gen.IntType} {op : Operand}
     (h : operandIntType decls op = some it) : operandType decls op = some (.Int it) := by
   match op, h with
-  | .copy ⟨j, []⟩, h =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩, h =>
     simp only [operandIntType] at h
     simp only [operandType]
     cases hd : decls[j]? with
@@ -1509,7 +1509,7 @@ theorem operandType_of_operandIntType {decls : List LocalDecl} {it : Gen.IntType
 theorem operandOk_T {decls : List LocalDecl} {it : Gen.IntType} {op : Operand}
     (h : operandOk decls it op = true) : OperandOkT decls (.Int it) op := by
   match op, h with
-  | .copy ⟨j, []⟩, h | .copy ⟨j, [.field 0 _]⟩, h =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩, h | .copy ⟨j, [.field 0 _]⟩ | .move ⟨j, [.field 0 _]⟩, h =>
     simp only [operandOk, Bool.and_eq_true, decide_eq_true_eq] at h
     exact ⟨h.1, operandType_of_operandIntType h.2⟩
   | .constant c, h =>
@@ -1524,7 +1524,7 @@ theorem operandIsBool_iff {decls : List LocalDecl} {op : Operand} :
 theorem operandOkB_T {decls : List LocalDecl} {op : Operand}
     (h : operandOkB decls op = true) : OperandOkT decls .Bool op := by
   match op, h with
-  | .copy ⟨j, []⟩, h | .copy ⟨j, [.field 1 _]⟩, h =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩, h | .copy ⟨j, [.field 1 _]⟩ | .move ⟨j, [.field 1 _]⟩, h =>
     simp only [operandOkB, Bool.and_eq_true, decide_eq_true_eq, operandIsBool_iff] at h
     exact h
   | .constant c, h =>
@@ -1541,7 +1541,7 @@ theorem operandType_of_operandOkB {decls : List LocalDecl} {op : Operand}
 theorem operandType_of_operandIsOrdering {decls : List LocalDecl} {op : Operand}
     (h : operandIsOrdering decls op = true) : operandType decls op = some orderingTy := by
   match op, h with
-  | .copy ⟨j, []⟩, h =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩, h =>
     simp only [operandIsOrdering] at h
     simp only [operandType]
     cases hd : decls[j]? with
@@ -1552,7 +1552,7 @@ theorem operandType_of_operandIsOrdering {decls : List LocalDecl} {op : Operand}
 theorem operandOkO_T {decls : List LocalDecl} {op : Operand}
     (h : operandOkO decls op = true) : OperandOkT decls orderingTy op := by
   match op, h with
-  | .copy ⟨j, []⟩, h =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩, h =>
     simp only [operandOkO, Bool.and_eq_true, decide_eq_true_eq] at h
     exact ⟨h.1, operandType_of_operandIsOrdering h.2⟩
   | .constant c, h =>
@@ -1570,7 +1570,7 @@ theorem evalValue_operandT {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
         FrameOk body f ctx locals m' blk stmt) ∧
     (opBits locals op = none → ∃ msg, evalValue m e = .error (.ub msg)) := by
   match op, hok, he with
-  | .copy ⟨j, []⟩, hok, he =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩, hok, he =>
     obtain ⟨hj, hty⟩ := hok
     simp only [translateOperand, translatePlace, Option.map_some, Option.some.injEq] at he
     subst he
@@ -1742,7 +1742,7 @@ theorem operandOk_good {decls : List LocalDecl} {it : Gen.IntType} {op : Operand
     (hok : operandOk decls it op = true) : GoodSize it.size.bytes := by
   have hit := operandIntType_of_operandOk hok
   match op, hit with
-  | .copy ⟨j, []⟩, hit =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩, hit =>
     simp only [operandIntType] at hit
     cases hd : decls[j]? with
     | none => simp [hd] at hit
@@ -2643,7 +2643,7 @@ theorem evalBinOp_intWithOverflow (cop : Gen.IntBinOpWithOverflow) (it : Gen.Int
 /-- Pair of bit patterns `(bits, b)` an Anneal 2-tuple operand evaluates to, or
 `none` when reading it is UB. -/
 def opTupleBits (locals : List LocalSlot) : Operand → Option (Nat × Nat)
-  | .copy ⟨j, []⟩ =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ =>
     match locals[j]? with
     | some (.init (.aggregate 0 [.scalar sc0, .scalar sc1])) => some (sc0.bits, sc1.bits)
     | _ => none
@@ -2718,7 +2718,7 @@ theorem evalValue_operandTuple {body : CapturedMir} {f : Gen.Function} {ctx : Ct
         FrameOk body f ctx locals m' blk stmt) ∧
     (opTupleBits locals op = none → ∃ msg, evalValue m e = .error (.ub msg)) := by
   match op, hok, he with
-  | .copy ⟨j, []⟩, hok, he =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩, hok, he =>
     simp only [operandOkTuple, operandTupleIntType, Option.bind_eq_bind, Bool.and_eq_true,
       decide_eq_true_eq] at hok
     obtain ⟨hj, ht⟩ := hok

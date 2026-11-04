@@ -298,8 +298,8 @@ theorem translateFn_spec (body : CapturedMir) (f : Gen.Function) (h : translateF
 
 theorem translateBlocks_append_get (decls : List LocalDecl) (k : Nat) (bbs : List BasicBlockData)
     (B : List (Gen.BbName × Gen.BasicBlock)) (h : translateBlocks decls k bbs = some B)
-    (m : Nat) (hm : k + bbs.length ≤ m) :
-    mapGet ⟨B ++ [(bbName m, initBlock)]⟩ (bbName m) = some initBlock := by
+    (m : Nat) (hm : k + bbs.length ≤ m) (ib : Gen.BasicBlock) :
+    mapGet ⟨B ++ [(bbName m, ib)]⟩ (bbName m) = some ib := by
   induction bbs generalizing k B with
   | nil => simp [translateBlocks] at h; subst h; simp [mapGet_cons]
   | cons bb bbs ih =>
@@ -321,7 +321,7 @@ theorem translateBlocks_append_get (decls : List LocalDecl) (k : Nat) (bbs : Lis
 that name to `initBlock` (`Goto(bb0)`). -/
 theorem translateFn_start (body : CapturedMir) (f : Gen.Function) (h : translateFn body = some f) :
     f.start = bbName body.basicBlocks.length ∧
-    mapGet f.blocks (bbName body.basicBlocks.length) = some initBlock := by
+    mapGet f.blocks (bbName body.basicBlocks.length) = some (initBlock body) := by
   simp only [translateFn, Option.bind_eq_bind] at h
   cases hL : translateLocals 0 body.localDecls with
   | none => simp [hL] at h
@@ -332,6 +332,6 @@ theorem translateFn_start (body : CapturedMir) (f : Gen.Function) (h : translate
       simp [hL, hB] at h
       subst h
       exact ⟨rfl, translateBlocks_append_get body.localDecls 0 body.basicBlocks B hB
-        body.basicBlocks.length (by omega)⟩
+        body.basicBlocks.length (by omega) (initBlock body)⟩
 
 end MiniRustSpec.Correspondence

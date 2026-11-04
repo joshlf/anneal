@@ -106,6 +106,7 @@ namespace MiniRustSpec.Interp
 open MiniRustSpec.Gen
 open MiniRustSpec.LibSpecr
 
+
 /-! ## Instantiation: `M = BasicMemory<x86_64>` -/
 
 /-- The memory model: `BasicMemory<x86_64>` with `ProvExtra = AllocExtra = ()`
@@ -1999,15 +2000,71 @@ end
 >     self.eval_place(place)?;
 >     ret(())
 > }" -/
-def evalStatement (m : Mach) : Statement → Interp Mach
-  | .Assign destination source => do
-    let (place, ty) ← evalPlace m destination
-    let ((val, _), m) ← evalValue m source
-    placeStore m place val ty
-  | .PlaceMention place => do
-    let _ ← evalPlace m place
-    pure m
-  | _ => unsupported "eval_statement for a statement other than Assign/PlaceMention"
+
+def mapInsert {K V : Type} [DecidableEq K] : List (K × V) → K → V → List (K × V)
+  | [], k, v => [(k, v)]
+  | (k', v') :: tail, k, v => if k' = k then (k, v) :: tail else (k', v') :: mapInsert tail k v
+
+/-- `Map::insert(k, v)`. -/
+def mapInsertMap {K V : Type} [DecidableEq K] (m : Map K V) (k : K) (v : V) : Map K V :=
+  ⟨mapInsert m.entries k v⟩
+
+def validSize (size : Size) : Bool := inBounds (Int.ofNat size.bytes) .Signed x86_64.PTR_SIZE
+
+/-- `BasicMemory::allocate` (with deterministic address choice):
+> "let alloc = Allocation {
+>      data: list![AbstractByte::Uninit; size.bytes()],
+>      align,
+>      ..
+>  };
+>  self.allocations.insert(id, alloc);
+>  let ptr = ThinPointer {
+>      addr: Address::from_usize(0),
+>      provenance: prov,
+>  };
+>  ret(ptr)" -/
+def nextAddress (mem : BM) (align : Align) : Int :=
+  let maxAddr : Int := mem.allocations.foldl (fun (acc : Int) (a : Allocation) =>
+    max acc (if a.live then a.addr + (Allocation.size a).bytes else 0)
+  ) 1024
+  let rem := maxAddr % align.bytes
+  if rem == 0 then maxAddr else maxAddr + (align.bytes - rem)
+
+def BM.allocate (mem : BM) (kind : AllocationKind) (size : Size) (align : Align) :
+    Interp (Ptr × BM) :=
+  if !validSize size then ub "asking for a too large allocation"
+  else
+    let addr := nextAddress mem align
+    let alloc : Allocation := {
+      data := List.replicate size.bytes .Uninit
+      addr := addr
+      align := align
+      kind := kind
+      live := true
+      extra := ()
+    }
+    let id := mem.allocations.length
+    let ptr : Ptr := { addr := addr, provenance := some (⟨id⟩, ()) }
+    pure (ptr, { mem with allocations := mem.allocations ++ [alloc] })
+
+/-- `ConcurrentMemory::allocate`:
+> "pub fn allocate(&mut self, kind: AllocationKind, size: Size, align: Align) -> Result<ThinPointer<M::Provenance>> {
+>     self.memory.allocate(kind, size, align)
+> }" -/
+def CM.allocate (cm : ConcurrentMemory BM) (kind : AllocationKind) (size : Size) (align : Align) :
+    Interp (Ptr × ConcurrentMemory BM) := do
+  let (ptr, mem) ← BM.allocate cm.memory kind size align
+  pure (ptr, { cm with memory := mem })
+
+/-- `ConcurrentMemory::deinit` (`spec/lang/step/statements.md`):
+> "fn deinit(&mut self, ptr: ThinPointer<M::Provenance>, len: Size, align: Align) -> Result {
+>      self.store(ptr, list![AbstractByte::Uninit; len.bytes()], align, Atomicity::None)?;
+>      ret(())
+>  }" -/
+def CM.deinit (cm : ConcurrentMemory BM) (ptr : Ptr) (len : Size) (align : Align) :
+    Interp (ConcurrentMemory BM) := do
+  let mem ← BM.store cm.memory ptr (List.replicate len.bytes .Uninit) align
+  pure { cm with memory := mem }
 
 /-! ## Terminators (`spec/lang/step/terminators.md`) -/
 
@@ -2029,6 +2086,51 @@ def storageDead (fr : Frame) (cm : ConcurrentMemory BM) (local_ : LocalName) :
   match removed with
   | some ptr => do pure (fr, ← CM.deallocate cm ptr .Stack size align)
   | none => pure (fr, cm)
+
+
+/-- `StackFrame::storage_live` (`spec/lang/step/statements.md`):
+> "self.storage_dead(mem, local)?;
+>  let pointee_size = self.func.locals[local].layout::<M::T>().expect_size(..);
+>  let pointee_align = self.func.locals[local].layout::<M::T>().expect_align(..);
+>  let ptr = mem.allocate(AllocationKind::Stack, pointee_size, pointee_align)?;
+>  self.locals.insert(local, ptr);
+>  ret(())" -/
+def storageLive (fr : Frame) (cm : ConcurrentMemory BM) (local_ : LocalName) :
+    Interp (Frame × ConcurrentMemory BM) := do
+  let (fr2, cm2) ← storageDead fr cm local_
+  let ty ← mapIndex fr2.func.locals local_ "self.func.locals[local]"
+  let layout ← Type.layout ty
+  let size ← LayoutStrategy.expect_size layout "WF ensures all locals are sized"
+  let align ← LayoutStrategy.expect_align layout "WF ensures all locals are sized"
+  let (ptr, cm3) ← CM.allocate cm2 .Stack size align
+  let locals := mapInsertMap fr2.locals local_ ptr
+  pure ({ fr2 with locals := locals }, cm3)
+
+def evalStatement (m : Mach) : Statement → Interp Mach
+  | .Assign destination source => do
+    let (place, ty) ← evalPlace m destination
+    let ((val, _), m) ← evalValue m source
+    placeStore m place val ty
+  | .PlaceMention place => do
+    let _ ← evalPlace m place
+    pure m
+  | .StorageLive local_ => do
+    let fr ← curFrame m
+    let (fr2, cm) ← storageLive fr m.mem local_
+    pure { m with mem := cm, threads := ← listSet m.threads m.active_thread { ← activeThread m with stack := (← activeThread m).stack.dropLast ++ [fr2] } "set" }
+  | .StorageDead local_ => do
+    let fr ← curFrame m
+    let (fr2, cm) ← storageDead fr m.mem local_
+    pure { m with mem := cm, threads := ← listSet m.threads m.active_thread { ← activeThread m with stack := (← activeThread m).stack.dropLast ++ [fr2] } "set" }
+  | .Deinit place => do
+    let (p, ty) ← evalPlace m place
+    if !p.aligned then ub "de-initializing a place based on a misaligned pointer"
+    else do
+      let layout ← Type.layout ty
+      let size ← LayoutStrategy.expect_size layout "WF ensures deinits are sized"
+      let cm ← CM.deinit m.mem p.ptr.thin_pointer size ⟨1⟩
+      pure { m with mem := cm }
+  | _ => unsupported "eval_statement for a statement other than Assign/PlaceMention/StorageLive/StorageDead/Deinit"
 
 /-- The teardown loop of `Terminator::Return`:
 > "while let Some(local) = frame.locals.keys().next() {

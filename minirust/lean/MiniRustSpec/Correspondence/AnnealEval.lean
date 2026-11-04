@@ -47,7 +47,7 @@ theorem evalOperand_fragT (decls : List LocalDecl) (locals : List LocalSlot)
         .ok (.scalar ⟨bits, it.size.bytes⟩) locals) ∧
     (opBits locals op = none → evalOperand locals op borrows globals layouts callerLocals = .ub) := by
   match op, hok with
-  | .copy ⟨j, []⟩, hok =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩, hok =>
     obtain ⟨hj, hty⟩ := hok
     have hjl : j < locals.length := by rw [hn]; exact hj
     obtain ⟨d, hd⟩ : ∃ d, decls[j]? = some d := ⟨decls[j], by simp [hj]⟩
@@ -1388,7 +1388,7 @@ theorem opBits_valid (decls : List LocalDecl) (locals : List LocalSlot) (hslots 
     (hok : OperandOkT decls T op) (bits : Nat) (hb : opBits locals op = some bits) :
     ValidBits T bits := by
   match op, hok, hb with
-  | .copy ⟨j, []⟩, hok, hb =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩, hok, hb =>
     obtain ⟨hj, hty⟩ := hok
     obtain ⟨d, hd⟩ : ∃ d, decls[j]? = some d := ⟨decls[j], by simp [hj]⟩
     have hTd : tyOf d = T := by
@@ -1518,7 +1518,7 @@ theorem operandTy_of_operandOk (decls : List LocalDecl) (layouts : Layout.Layout
     (srcIt : Gen.IntType) (op : Operand) (hok : operandOk decls srcIt op = true) :
     ∃ ty, MirSemantics.operandTy decls layouts op = some ty ∧ intTypeOf ty = some srcIt := by
   match op, hok with
-  | .copy ⟨j, []⟩, hok =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩, hok =>
     simp only [operandOk, Bool.and_eq_true, decide_eq_true_eq, operandIntType] at hok
     obtain ⟨hj, hty⟩ := hok
     obtain ⟨d, hd⟩ : ∃ d, decls[j]? = some d := ⟨decls[j], by simp [hj]⟩
@@ -1596,7 +1596,7 @@ theorem operandTy_of_OperandOkT (decls : List LocalDecl) (layouts : Layout.Layou
     {T : Gen.Type} (op : Operand) (hok : OperandOkT decls T op) :
     ∃ ty, MirSemantics.operandTy decls layouts op = some ty ∧ scalarTypeOf ty = some T := by
   match op, hok with
-  | .copy ⟨j, []⟩, hok =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩, hok =>
     obtain ⟨hj, hty⟩ := hok
     obtain ⟨d, hd⟩ : ∃ d, decls[j]? = some d := ⟨decls[j], by simp [hj]⟩
     simp only [operandType, hd] at hty
@@ -2184,7 +2184,7 @@ theorem evalOperand_fragTuple (decls : List LocalDecl) (locals : List LocalSlot)
     (opTupleBits locals op = none →
       evalOperand locals op borrows globals layouts callerLocals = .ub) := by
   match op, hok with
-  | .copy ⟨j, []⟩, hok =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩, hok =>
     simp only [operandOkTuple, operandTupleIntType, Option.bind_eq_bind, Bool.and_eq_true,
       decide_eq_true_eq] at hok
     obtain ⟨hj, ht⟩ := hok
