@@ -1764,6 +1764,491 @@ def evalByteCast
             | .none => .ub
 
 /--
+Test whether a `CastKind.pointerCoercion` tag string denotes function-item or
+non-capturing closure reification to a function pointer
+(`PointerCoercion::ReifyFnPointer` or `PointerCoercion::ClosureFnPointer`).
+
+Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L18-L41>
+
+> "pub enum PointerCoercion {
+>     /// Go from a fn-item type to a fn-pointer type.
+>     ReifyFnPointer(Safety),
+>
+>     /// Go from a safe fn pointer to an unsafe fn pointer.
+>     UnsafeFnPointer,
+>
+>     /// Go from a non-capturing closure to a fn pointer or an unsafe fn pointer.
+>     /// It cannot convert a closure that requires unsafe.
+>     ClosureFnPointer(Safety),"
+-/
+def isReifyFnPointerCoercion (coercionKind : String) : Bool :=
+  Bool.or
+    (stringEq coercionKind "ReifyFnPointer")
+    (Bool.or
+      (stringEq coercionKind "ReifyFnPointer(Safe)")
+      (Bool.or
+        (stringEq coercionKind "ReifyFnPointer(Unsafe)")
+        (Bool.or
+          (stringEq coercionKind "ClosureFnPointer")
+          (Bool.or
+            (stringEq coercionKind "ClosureFnPointer(Safe)")
+            (Bool.or
+              (stringEq coercionKind "ClosureFnPointer(Unsafe)")
+              (stringEq coercionKind "UnsafeFnPointer"))))))
+
+/--
+Extract the target `(defPath, typeArgs)` from the `Ty` of a function-item
+operand (`RigidTy.fnDef defPath typeArgs`).
+
+Reference (The Rust Reference, "Function item types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/function-item.html>
+
+> "When referred to, a function item, or the constructor of a tuple-like struct
+> or enum variant, yields a zero-sized value of its function item type. That
+> type uniquely identifies the function"
+-/
+def extractFnItemTarget? : Option Ty → Option (DefPath × List RigidTy)
+  | .some { kind := .fnDef defPath typeArgs, .. } => .some (defPath, typeArgs)
+  | _ => .none
+
+/--
+Test whether `coercionKind` is one of the `PointerCoercion::ClosureFnPointer`
+coercion tags (`"ClosureFnPointer"`, `"ClosureFnPointer(Safe)"`, or
+`"ClosureFnPointer(Unsafe)"`).
+-/
+@[reducible]
+def isClosureFnPointerCoercion (coercionKind : String) : Bool :=
+  Bool.or
+    (stringEq coercionKind "ClosureFnPointer")
+    (Bool.or
+      (stringEq coercionKind "ClosureFnPointer(Safe)")
+      (stringEq coercionKind "ClosureFnPointer(Unsafe)"))
+
+/--
+Extract the target `(defPath, typeArgs)` from the `Ty` of an operand being
+reified into a function pointer via `coercionKind`:
+- For `"ClosureFnPointer"` / `"ClosureFnPointer(Safe)"` /
+  `"ClosureFnPointer(Unsafe)"`, requires a non-capturing closure type
+  `RigidTy.closure defPath .nil`.
+- For `"ReifyFnPointer"` / `"ReifyFnPointer(Safe)"` /
+  `"ReifyFnPointer(Unsafe)"`, requires a function-item type
+  `RigidTy.fnDef defPath typeArgs`.
+
+Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L18-L41>
+
+> "pub enum PointerCoercion {
+>     /// Go from a fn-item type to a fn-pointer type.
+>     ReifyFnPointer(Safety),
+>
+>     /// Go from a safe fn pointer to an unsafe fn pointer.
+>     UnsafeFnPointer,
+>
+>     /// Go from a non-capturing closure to a fn pointer or an unsafe fn pointer.
+>     /// It cannot convert a closure that requires unsafe.
+>     ClosureFnPointer(Safety),"
+-/
+@[reducible]
+def extractReifyCoercionTarget?
+    (coercionKind : String)
+    (tyOpt : Option Ty) :
+    Option (DefPath × List RigidTy) :=
+  match isClosureFnPointerCoercion coercionKind with
+  | true =>
+    match tyOpt with
+    | .some { kind := .closure defPath .nil, .. } => .some (defPath, .nil)
+    | _ => .none
+  | false => extractFnItemTarget? tyOpt
+
+/--
+Test whether `ty` is a thin raw pointer type (`RigidTy.rawPtr _ pointee` where
+`pointee` is not a dynamically-sized `.slice _`, `.str`, or `.dynamic _`).
+
+Reference (The Rust Reference, "Type cast expressions"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#type-cast-expressions>
+
+> "* Function pointer types can be cast to any thin pointer type"
+-/
+def isThinRawPtrTy (ty : Ty) : Bool :=
+  match ty.kind with
+  | .rawPtr _ (.slice _) => false
+  | .rawPtr _ .str => false
+  | .rawPtr _ (.dynamic _) => false
+  | .rawPtr _ _ => true
+  | _ => false
+
+/--
+Check that `fnInputs` pointwise match the `RigidTy` kinds of the leading
+parameter declarations in `paramDecls`.
+
+Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/mod.rs#L225-L246>
+
+> "/// The first local is the return value pointer, followed by `arg_count`
+> /// locals for the function arguments, followed by any user-declared
+> /// variables and temporaries."
+-/
+def calleeParamTysMatch : List RigidTy → List LocalDecl → Bool
+  | .nil, _ => true
+  | _ :: _, .nil => false
+  | inputTy :: restInputs, decl :: restDecls =>
+    Bool.and
+      (rigidTyEq inputTy decl.ty.kind)
+      (calleeParamTysMatch restInputs restDecls)
+
+/--
+Validate that a callee's `localDecls` (when non-empty) has at least `argCount`
+parameter declarations after `_0` and matches the expected function-pointer
+parameter types `fnInputs` and return type `fnOutput`.
+
+When `localDecls` is `.nil` (as in synthetic stub bodies that omit
+`localDecls`), returns `true`.
+
+Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/mod.rs#L225-L246>
+
+> "/// The first local is the return value pointer, followed by `arg_count`
+> /// locals for the function arguments, followed by any user-declared
+> /// variables and temporaries."
+-/
+def calleeLocalDeclsCompatible
+    (localDecls : List LocalDecl)
+    (argCount : Nat)
+    (fnInputs : List RigidTy)
+    (fnOutput : RigidTy) :
+    Bool :=
+  match localDecls with
+  | .nil => true
+  | retDecl :: paramDecls =>
+    Bool.and
+      (Nat.ble argCount (length paramDecls))
+      (Bool.and
+        (rigidTyEq fnOutput retDecl.ty.kind)
+        (calleeParamTysMatch fnInputs paramDecls))
+
+/--
+Check whether an explicit `ReifyFnPointer(Safety)` or `ClosureFnPointer(Safety)`
+coercion tag is compatible with the target function-pointer `Safety` qualifier
+`fnSafety`.
+
+Unparameterized `"ReifyFnPointer"` and `"ClosureFnPointer"` tags accept both
+`.safe` and `.unsafe_`; `"ReifyFnPointer(Safe)"` / `"ClosureFnPointer(Safe)"`
+require `fnSafety = .safe`; `"ReifyFnPointer(Unsafe)"` /
+`"ClosureFnPointer(Unsafe)"` require `fnSafety = .unsafe_`.
+
+Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L18-L41>
+
+> "pub enum PointerCoercion {
+>     /// Go from a fn-item type to a fn-pointer type.
+>     ReifyFnPointer(Safety),
+>
+>     /// Go from a safe fn pointer to an unsafe fn pointer.
+>     UnsafeFnPointer,
+>
+>     /// Go from a non-capturing closure to a fn pointer or an unsafe fn pointer.
+>     /// It cannot convert a closure that requires unsafe.
+>     ClosureFnPointer(Safety),"
+-/
+def reifyCoercionSafetyCompatible
+    (coercionKind : String)
+    (fnSafety : Safety) :
+    Bool :=
+  match
+    Bool.or
+      (stringEq coercionKind "ReifyFnPointer(Safe)")
+      (stringEq coercionKind "ClosureFnPointer(Safe)")
+  with
+  | true => safetyEq fnSafety .safe
+  | false =>
+    match
+      Bool.or
+        (stringEq coercionKind "ReifyFnPointer(Unsafe)")
+        (stringEq coercionKind "ClosureFnPointer(Unsafe)")
+    with
+    | true => safetyEq fnSafety .unsafe_
+    | false => true
+
+/--
+Validate that a linked callee `p` in `callees` (when present) is compatible with
+the target function-pointer signature `(fnInputs, fnOutput, fnAbi)` during
+`ReifyFnPointer`:
+1. Rejects `CallConv.rustIntrinsic` callees (compiler intrinsics cannot be
+   coerced to function pointers).
+2. Requires `length fnInputs == c.argCount` and `callConvEq fnAbi c.fnAbi.conv`.
+3. Requires `calleeLocalDeclsCompatible c.localDecls c.argCount fnInputs fnOutput`.
+
+Reference (The Rust Reference, "Function pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/function-pointer.html>
+
+> "Two function pointer types are compatible if they have the same ABI, safety,
+> parameter types, and return type."
+-/
+def checkCalleeSig
+    (callees : List CapturedMir)
+    (p : DefPath)
+    (fnInputs : List RigidTy)
+    (fnOutput : RigidTy)
+    (fnAbi : CallConv) :
+    Bool :=
+  match callees with
+  | .nil => true
+  | c :: rest =>
+    match stringEq c.defPath p with
+    | true =>
+      Bool.and
+        (Bool.not (callConvEq c.fnAbi.conv .rustIntrinsic))
+        (Bool.and
+          (Nat.beq (length fnInputs) c.argCount)
+          (Bool.and
+            (callConvEq fnAbi c.fnAbi.conv)
+            (calleeLocalDeclsCompatible
+              c.localDecls
+              c.argCount
+              fnInputs
+              fnOutput)))
+    | false => checkCalleeSig rest p fnInputs fnOutput fnAbi
+
+/--
+Evaluate `CastKind.pointerCoercion "UnsafeFnPointer"`, coercing a safe
+function pointer (`RigidTy.fnPtr inputs output .safe abi`) into an `unsafe`
+function pointer (`RigidTy.fnPtr inputs output .unsafe_ abi`) while preserving
+its `ProvenancePtr`.
+
+Faults with `.ub` if `targetTy.kind` is not an `unsafe` function pointer with a
+non-intrinsic `CallConv`, if `op`'s known `operandTy` is not a compatible safe
+function pointer, or if `op` does not evaluate to a valid 8-byte function
+pointer at offset `0` (disjoint from stack borrows in `mem.borrows`).
+
+Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L21-L22>
+
+> "/// Go from a safe fn pointer to an unsafe fn pointer.
+> UnsafeFnPointer,"
+
+Reference (The Rust Reference, "Type coercions"):
+<https://doc.rust-lang.org/1.98.0/reference/type-coercions.html#coercion-types>
+
+> "* Safe function pointer types to `unsafe` function pointer types"
+-/
+def evalUnsafeFnPointer
+    (locals : List LocalSlot)
+    (op : Operand)
+    (targetTy : Ty)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    RvalueEvalResult :=
+  match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+  | .ub => .ub
+  | .unsupported => .unsupported
+  | .ok (.ptr ptrVal sz) locals' =>
+    match targetTy.kind with
+    | .fnPtr dstInputs dstOutput .unsafe_ dstAbi =>
+      match callConvEq dstAbi .rustIntrinsic with
+      | true => .ub
+      | false =>
+        let validSrcTy :=
+          match operandTy localDecls layouts op with
+          | .none => true
+          | .some { kind := .fnPtr srcInputs srcOutput .safe srcAbi, .. } =>
+            Bool.and
+              (callConvEq srcAbi dstAbi)
+              (Bool.and
+                (rigidTyListEq srcInputs dstInputs)
+                (rigidTyEq srcOutput dstOutput))
+          | .some _ => false
+        let validPtr :=
+          Bool.and
+            (Nat.beq sz 8)
+            (Bool.and
+              (Nat.beq ptrVal.offsetBytes 0)
+              (match lookupBorrow mem.borrows ptrVal.tag with
+               | .some _ => false
+               | .none =>
+                 match mem.fnPtrs with
+                 | .nil => isFnPtrAllocId ptrVal.allocId
+                 | _ :: _ =>
+                   match lookupFnPtr mem.fnPtrs ptrVal.allocId with
+                   | .none => false
+                   | .some entry =>
+                     match entry.fnSig with
+                     | .none => true
+                     | .some (.fnPtr sigInputs sigOutput .safe sigAbi) =>
+                       Bool.and
+                         (callConvEq sigAbi dstAbi)
+                         (Bool.and
+                           (rigidTyListEq sigInputs dstInputs)
+                           (rigidTyEq sigOutput dstOutput))
+                     | .some _ => false))
+        match Bool.and validSrcTy validPtr with
+        | true => .ok (.ptr ptrVal 8) locals' mem
+        | false => .ub
+    | _ => .ub
+  | .ok _ _ => .ub
+
+/--
+Evaluate `CastKind.pointerCoercion` when `isReifyFnPointerCoercion` holds,
+coercing a zero-sized function item (`RigidTy.fnDef defPath typeArgs`, whose
+runtime value is `Value.unit` or `Value.aggregate 0 .nil`) into an 8-byte
+function-pointer `Value.ptr` backed by an `FnPtrEntry` in `Memory.fnPtrs`
+(or delegating `"UnsafeFnPointer"` to `evalUnsafeFnPointer`).
+
+Faults with `.ub` if `op` does not evaluate to a zero-sized value, if `op`'s
+type is not a function item or non-capturing closure, if `targetTy.kind` is not
+`RigidTy.fnPtr` with a non-intrinsic `CallConv`, or if a linked callee in
+`mem.callees` has an incompatible signature (`checkCalleeSig = false`).
+
+Reference (The Rust Reference, "Function pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/function-pointer.html>
+
+> "Function pointer types, written using the `fn` keyword, refer to a function
+> whose identity is not necessarily known at compile-time. They can be created
+> via a coercion from both function items and non-capturing closures."
+-/
+def evalReifyFnPointer
+    (locals : List LocalSlot)
+    (op : Operand)
+    (targetTy : Ty)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (coercionKind : String := "ReifyFnPointer") :
+    RvalueEvalResult :=
+  match isReifyFnPointerCoercion coercionKind with
+  | false =>
+    match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+    | .ok (.ptr ptrVal sz) locals' => .ok (.ptr ptrVal sz) locals' mem
+    | .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' =>
+      .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
+    | .ok _ _ => .unsupported
+    | .ub => .ub
+    | .unsupported => .unsupported
+  | true =>
+    match stringEq coercionKind "UnsafeFnPointer" with
+    | true =>
+      evalUnsafeFnPointer locals op targetTy mem localDecls layouts
+    | false =>
+      match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+      | .ub => .ub
+      | .unsupported => .unsupported
+      | .ok v locals' =>
+        let isZstVal :=
+          match v with
+          | .unit => true
+          | .aggregate 0 .nil => true
+          | _ => false
+        match isZstVal with
+        | false => .ub
+        | true =>
+          match targetTy.kind with
+          | .fnPtr fnInputs fnOutput fnSafety fnAbi =>
+            match
+              Bool.and
+                (Bool.not (callConvEq fnAbi .rustIntrinsic))
+                (reifyCoercionSafetyCompatible coercionKind fnSafety)
+            with
+            | false => .ub
+            | true =>
+              match
+                extractReifyCoercionTarget?
+                  coercionKind
+                  (operandTy localDecls layouts op)
+              with
+              | .some (defPath, typeArgs) =>
+                match
+                  checkCalleeSig
+                    mem.callees
+                    defPath
+                    fnInputs
+                    fnOutput
+                    fnAbi
+                with
+                | false => .ub
+                | true =>
+                  let (allocId, mem') :=
+                    internFnPtr mem defPath typeArgs (.some targetTy.kind)
+                  let p : ProvenancePtr := {
+                    allocId := allocId
+                    offsetBytes := 0
+                  }
+                  .ok (.ptr p 8) locals' mem'
+              | .none => .ub
+          | _ => .ub
+
+/--
+Evaluate `CastKind.fnPtrToPtr`, casting an 8-byte function pointer (`Value.ptr`)
+to a thin raw pointer (`*const T` or `*mut T`), preserving its `ProvenancePtr`
+(`allocId` and `offsetBytes = 0`) so subsequent `CastKind.ptrToPtr` or
+`CastKind.pointerExposeProvenance` casts succeed deterministically.
+
+Faults with `.ub` if `targetTy` is not a thin raw pointer, if `op`'s known
+`operandTy` is not `RigidTy.fnPtr` with a non-intrinsic `CallConv`, or if `op`
+does not evaluate to an 8-byte function pointer at offset `0` (disjoint from
+stack borrows in `mem.borrows`).
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1522-L1523>
+
+> "FnPtrToPtr,"
+
+Reference (The Rust Reference, "Type cast expressions"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#type-cast-expressions>
+
+> "* Function pointer types can be cast to any thin pointer type"
+-/
+def evalFnPtrToPtr
+    (locals : List LocalSlot)
+    (op : Operand)
+    (targetTy : Ty)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    RvalueEvalResult :=
+  match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+  | .ub => .ub
+  | .unsupported => .unsupported
+  | .ok (.ptr ptrVal sz) locals' =>
+    let validTargetTy := isThinRawPtrTy targetTy
+    let validSrcTy :=
+      match operandTy localDecls layouts op with
+      | .none => true
+      | .some { kind := .fnPtr _ _ _ srcAbi, .. } =>
+        Bool.not (callConvEq srcAbi .rustIntrinsic)
+      | .some _ => false
+    let validPtr :=
+      Bool.and
+        (Nat.beq sz 8)
+        (Bool.and
+          (Nat.beq ptrVal.offsetBytes 0)
+          (match lookupBorrow mem.borrows ptrVal.tag with
+           | .some _ => false
+           | .none =>
+             match mem.fnPtrs with
+             | .nil => isFnPtrAllocId ptrVal.allocId
+             | _ :: _ =>
+               match lookupFnPtr mem.fnPtrs ptrVal.allocId with
+               | .some entry =>
+                 match entry.fnSig with
+                 | .none => true
+                 | .some (.fnPtr _ _ _ sigAbi) =>
+                   Bool.not (callConvEq sigAbi .rustIntrinsic)
+                 | .some _ => false
+               | .none => false))
+    match Bool.and validTargetTy (Bool.and validSrcTy validPtr) with
+    | true => .ok (.ptr ptrVal 8) locals' mem
+    | false => .ub
+  | .ok _ _ => .ub
+
+/--
 Resolve dynamic `.index idxLocal` projection elements against the current
 `locals` state at borrow creation time, converting each `.index idxLocal`
 whose index local holds an initialized `.scalar sc` into
@@ -1961,6 +2446,36 @@ def evalRvalue
     | .ok v locals' => .ok v locals' mem
     | .ub => .ub
     | .unsupported => .unsupported
+  | .binaryOp op lhsOp rhsOp =>
+    match evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals with
+    | .ok lhsVal locals₁ =>
+      match evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals with
+      | .ok rhsVal locals₂ =>
+        match lhsVal, rhsVal with
+        | .scalar lhs, .scalar rhs =>
+          let isSigned := operandIsSigned localDecls lhsOp layouts
+          evalScalarBinOp op lhs rhs locals₂ mem isSigned
+        | .ptr ptrVal sz, .scalar offsetSc =>
+          match op with
+          | .offset =>
+            .ok
+              (.ptr
+                { ptrVal with
+                  offsetBytes := Nat.add ptrVal.offsetBytes offsetSc.bits }
+                sz)
+              locals₂
+              mem
+          | _ => .unsupported
+        | _, _ => .unsupported
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .ub => .ub
+    | .unsupported => .unsupported
+  | .aggregate .tuple ops =>
+    match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals with
+    | .ok vals locals' => .ok (.aggregate 0 vals) locals' mem
+    | .ub => .ub
+    | .unsupported => .unsupported
   | .copyForDeref place =>
     match evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals with
     | .ok v locals' => .ok v locals' mem
@@ -2124,14 +2639,10 @@ def evalRvalue
     | .ok _ _ => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported
-  | .cast (.pointerCoercion _) op _ =>
-    match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok (.ptr ptrVal sz) locals' => .ok (.ptr ptrVal sz) locals' mem
-    | .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' =>
-      .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
-    | .ok _ _ => .unsupported
-    | .ub => .ub
-    | .unsupported => .unsupported
+  | .cast (.pointerCoercion coercionKind) op targetTy =>
+    evalReifyFnPointer locals op targetTy mem localDecls layouts coercionKind
+  | .cast .fnPtrToPtr op targetTy =>
+    evalFnPtrToPtr locals op targetTy mem localDecls layouts
   | .cast .pointerExposeProvenance op _ =>
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
     | .ok (.ptr ptrVal _) locals' =>
@@ -2157,31 +2668,6 @@ def evalRvalue
     evalByteCast locals op targetTy mem localDecls layouts
   | .cast .subtype op targetTy =>
     evalByteCast locals op targetTy mem localDecls layouts
-  | .binaryOp op lhsOp rhsOp =>
-    match evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok lhsVal locals₁ =>
-      match evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals with
-      | .ok rhsVal locals₂ =>
-        match lhsVal, rhsVal with
-        | .scalar lhs, .scalar rhs =>
-          let isSigned := operandIsSigned localDecls lhsOp layouts
-          evalScalarBinOp op lhs rhs locals₂ mem isSigned
-        | .ptr ptrVal sz, .scalar offsetSc =>
-          match op with
-          | .offset =>
-            .ok
-              (.ptr
-                { ptrVal with
-                  offsetBytes := Nat.add ptrVal.offsetBytes offsetSc.bits }
-                sz)
-              locals₂
-              mem
-          | _ => .unsupported
-        | _, _ => .unsupported
-      | .ub => .ub
-      | .unsupported => .unsupported
-    | .ub => .ub
-    | .unsupported => .unsupported
   | .unaryOp .not op =>
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
     | .ok (.scalar sc) locals' =>
@@ -2216,11 +2702,6 @@ def evalRvalue
     | .ok (.aggregate variantIdx _) locals' =>
       .ok (.scalar ⟨variantIdx, 8⟩) locals' mem
     | .ok _ _ => .unsupported
-    | .ub => .ub
-    | .unsupported => .unsupported
-  | .aggregate .tuple ops =>
-    match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok vals locals' => .ok (.aggregate 0 vals) locals' mem
     | .ub => .ub
     | .unsupported => .unsupported
   | .aggregate (.array _) ops =>

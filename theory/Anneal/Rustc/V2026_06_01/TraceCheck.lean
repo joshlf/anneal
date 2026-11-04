@@ -566,6 +566,7 @@ deriving instance DecidableEq, Repr for StackFrame
 deriving instance DecidableEq, Repr for TreeBorrowPerm
 deriving instance DecidableEq, Repr for BorrowEntry
 deriving instance DecidableEq, Repr for SavedCallerFrame
+deriving instance DecidableEq, Repr for FnPtrEntry
 deriving instance DecidableEq, Repr for Memory
 deriving instance DecidableEq, Repr for MachineState
 deriving instance DecidableEq, Repr for MirCallReq
