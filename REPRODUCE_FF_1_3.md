@@ -46,6 +46,9 @@ fixed-width `BitVec (8 * sz)` representations.
    - `toNat_signExtend_of_le`, `toNat_signExtend_ofNat_of_le`,
      `signExtendBits_of_le`, and unconditional `signExtendBits_eq_bitVec`
      (`@[simp]`)
+   - `signedLt_eq_slt` and `signedLe_eq_sle` (`@[simp]`): unconditional
+     `BitVec.slt` / `BitVec.sle` characterizations of two's-complement
+     signed comparisons.
 
 4. **`ScalarValue` & `BitVec (8 * s.sizeBytes)` Isomorphism (Section 5)**:
    - `ScalarValue.toBitVec (s : ScalarValue) : BitVec (8 * s.sizeBytes)`
@@ -63,12 +66,13 @@ fixed-width `BitVec (8 * sz)` representations.
      `.bitOr`, `.bitXor`, `.shl`, `.shr` (both unsigned logical and signed
      two's-complement arithmetic), `.shlUnchecked` / `.shrUnchecked` (both
      in-bounds `< 8 * sz` and out-of-bounds UB `8 * sz ≤ b`), wrapping/checked
-     arithmetic, and comparisons, including width-specialized lemmas for `u8`,
-     `u16`, `u32`, `u64`, `u128`, `usize`, `i8`, `i16`, `i32`, `i64`, `i128`,
-     and `isize`.
+     arithmetic (`.add`, `.sub`, `.mul`, `.div`, `.rem`), and comparisons
+     (`.eq`, `.ne`, `.lt`, `.le`, `.gt`, `.ge`), including width-specialized
+     lemmas for `u8`, `u16`, `u32`, `u64`, `u128`, `usize`, `i8`, `i16`, `i32`,
+     `i64`, `i128`, and `isize`.
    - `BitVec (8 * sz)` homomorphism theorems (`evalBinOp_ofBitVec_*`,
-     `evalBinOpChecked_ofBitVec_*`, `evalUnOp_ofBitVec_*`,
-     `evalCastValue_ofBitVec_*`).
+     `evalExactDiv_ofBitVec_unsigned`, `evalBinOpChecked_ofBitVec_*`,
+     `evalUnOp_ofBitVec_*`, `evalCastValue_ofBitVec_*`).
 
 6. **Bit Intrinsic Helpers (`BRIEF-1.2` Support, Section 9)**:
    - `ctpopLoop`, `cttzLoop`, `bitreverseLoop`, `ctlzBits`, and `bswapLoop`
