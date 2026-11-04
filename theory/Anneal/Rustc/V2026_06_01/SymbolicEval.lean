@@ -3644,6 +3644,352 @@ theorem verifyExternalSpecMirSym
   verifyExternalSpecWithCalleesMirSym
     targetDefPath sidecarBody extraPre extraPost body .nil pre post fuel h_wp
 
+theorem restoreCallerMemoryFrame_eq_of_callFrameAndTraitsPreserved
+    {before after : Memory}
+    (h : callFrameAndTraitsPreserved before after) :
+    restoreCallerMemoryFrame before after = after := by
+  rcases h with ⟨⟨h1, h2, h3, h4, _⟩, h5⟩
+  cases after
+  dsimp only [restoreCallerMemoryFrame] at h1 h2 h3 h4 h5 ⊢
+  subst h1 h2 h3 h4 h5
+  rfl
+
+/--
+Project `restoreCallerMemoryFrame before` across a `MirCallAns` response,
+restoring both the caller frame fields and `before.traitImpls` so post-call
+polymorphic and trait-method calls in `before.callees` reduce by WHNF.
+-/
+@[reducible, simp]
+def _root_.Trusted.Rustc.V2026_06_01.MirSemantics.MirCallAns.restoreFrameAndTraits
+    (before : Memory) : MirCallAns → MirCallAns
+  | .returned retVal memAfter =>
+    .returned retVal (restoreCallerMemoryFrame before memAfter)
+  | .panicked memAfter =>
+    .panicked (restoreCallerMemoryFrame before memAfter)
+  | .aborted => .aborted
+
+/--
+Frame-and-`traitImpls` preservation predicate on a `MirCallAns` response
+relative to `before`.
+-/
+@[reducible, simp]
+def _root_.Trusted.Rustc.V2026_06_01.MirSemantics.MirCallAns.frameAndTraitsPreserved
+    (before : Memory) : MirCallAns → Prop
+  | .returned _ memAfter => callFrameAndTraitsPreserved before memAfter
+  | .panicked memAfter => callFrameAndTraitsPreserved before memAfter
+  | .aborted => True
+
+theorem _root_.Trusted.Rustc.V2026_06_01.MirSemantics.MirCallAns.restoreFrameAndTraits_eq_of_frameAndTraitsPreserved
+    {before : Memory} {ans : MirCallAns}
+    (h : ans.frameAndTraitsPreserved before) :
+    ans.restoreFrameAndTraits before = ans := by
+  cases ans with
+  | returned retVal memAfter =>
+    dsimp only [MirCallAns.restoreFrameAndTraits, MirCallAns.frameAndTraitsPreserved] at h ⊢
+    rw [restoreCallerMemoryFrame_eq_of_callFrameAndTraitsPreserved h]
+  | panicked memAfter =>
+    dsimp only [MirCallAns.restoreFrameAndTraits, MirCallAns.frameAndTraitsPreserved] at h ⊢
+    rw [restoreCallerMemoryFrame_eq_of_callFrameAndTraitsPreserved h]
+  | aborted => rfl
+
+/--
+Every `polyExternalSpecCallContract` guarantees
+`ans.frameAndTraitsPreserved req.memory` on every call answer `ans` permitted by
+its postcondition.
+-/
+theorem polyExternalSpecCallContract_frameAndTraitsPreserved
+    (targetDefPath : DefPath)
+    (expectedTypeArgs : List RigidTy)
+    (sidecarBody : CapturedMir)
+    (extraPre : List Value → Prop)
+    (extraPost : List Value → Value → Prop) :
+    ∀ (req : MirCallReq) (ans : MirCallAns),
+      (polyExternalSpecCallContract
+        targetDefPath expectedTypeArgs sidecarBody extraPre extraPost).post req ans →
+      ans.frameAndTraitsPreserved req.memory := by
+  intro req ans h_post
+  cases ans with
+  | returned retVal memAfter =>
+    exact h_post.1
+  | panicked memAfter =>
+    dsimp only [polyExternalSpecCallContract] at h_post
+    cases h_u : sidecarTargetCanUnwind sidecarBody <;> rw [h_u] at h_post
+    · exact False.elim h_post
+    · exact h_post
+  | aborted => trivial
+
+/--
+Frame-and-`traitImpls`-restoring node evaluator for modular call contracts:
+substitutes `ans.restoreFrameAndTraits req.memory` into the post-call
+continuation `k` so all subsequent statements, blocks, polymorphic/trait-method
+inlined `callees`, and `return_` transitions in the caller frame reduce by WHNF.
+-/
+@[reducible]
+def evalNodeFrameAndTraitsModularWP
+    (contract : MirCallContract)
+    (cont : MirExecState → Prop) (post : MirOutcome → Prop) :
+    MirStepNode → Prop
+  | .ret out => post out
+  | .tau st' => cont st'
+  | .vis (.inl _) _ => False
+  | .vis (.inr (.inl _)) k => cont (k PUnit.unit)
+  | .vis (.inr (.inr (.call req))) k =>
+    contract.pre req ∧
+      ∀ ans : MirCallAns,
+        contract.post req ans → cont (k (ans.restoreFrameAndTraits req.memory))
+
+/--
+Structural `Prop`-valued frame-and-`traitImpls`-restoring modular evaluator over
+`SymTree MirStepNode`.
+-/
+def evalSymNodeTreeFrameAndTraitsModular
+    (contract : MirCallContract)
+    (cont : MirExecState → Prop) (post : MirOutcome → Prop) :
+    SymTree MirStepNode → Prop
+  | .leaf (.ret out) => post out
+  | .leaf (.tau st') => cont st'
+  | .leaf (.vis (.inl _) _) => False
+  | .leaf (.vis (.inr (.inl _)) k) => cont (k PUnit.unit)
+  | .leaf (.vis (.inr (.inr (.call req))) k) =>
+    contract.pre req ∧
+      ∀ ans : MirCallAns,
+        contract.post req ans → cont (k (ans.restoreFrameAndTraits req.memory))
+  | .branch c t1 t2 =>
+    match c with
+    | true => evalSymNodeTreeFrameAndTraitsModular contract cont post t1
+    | false => evalSymNodeTreeFrameAndTraitsModular contract cont post t2
+
+theorem evalSymNodeTreeFrameAndTraitsModular_eq
+    (contract : MirCallContract)
+    (cont : MirExecState → Prop) (post : MirOutcome → Prop)
+    (t : SymTree MirStepNode) :
+    evalSymNodeTreeFrameAndTraitsModular contract cont post t =
+      evalNodeFrameAndTraitsModularWP contract cont post t.eval := by
+  induction t with
+  | leaf node =>
+    cases node with
+    | ret _ => rfl
+    | tau _ => rfl
+    | vis i _ =>
+      rcases i with f | (e | c) <;> rfl
+  | branch c _ _ ih1 ih2 =>
+    cases c
+    · exact ih2
+    · exact ih1
+
+/--
+Single-pass fuel-bounded frame-and-`traitImpls`-restoring modular symbolic WP
+over `MirExecState`.
+-/
+def wpMirExecFrameAndTraitsModularSym
+    (contract : MirCallContract)
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (post : MirOutcome → Prop) : Prop :=
+  match fuel with
+  | 0 => False
+  | fuel' + 1 =>
+    evalSymNodeTreeFrameAndTraitsModular contract
+      (fun st' => wpMirExecFrameAndTraitsModularSym contract fuel' body st' post)
+      post
+      (stepMirExecSymTree body st)
+
+/--
+Single-pass fuel-bounded frame-and-`traitImpls`-restoring modular symbolic WP
+over `MachineState`.
+-/
+def wpMirFrameAndTraitsModularSym
+    (contract : MirCallContract)
+    (fuel : Nat) (body : CapturedMir) (s : MachineState)
+    (post : MirOutcome → Prop) : Prop :=
+  wpMirExecFrameAndTraitsModularSym contract fuel body (.running s) post
+
+/--
+Soundness of `wpMirExecFrameAndTraitsModularSym`: for any `contract` whose
+postcondition implies `ans.frameAndTraitsPreserved req.memory`,
+`wpMirExecFrameAndTraitsModularSym` implies `wpMirExecModularSym`.
+-/
+theorem wpMirExecModularSym_of_wpMirExecFrameAndTraitsModularSym
+    (contract : MirCallContract)
+    (h_frame :
+      ∀ (req : MirCallReq) (ans : MirCallAns),
+        contract.post req ans → ans.frameAndTraitsPreserved req.memory)
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (post : MirOutcome → Prop)
+    (h : wpMirExecFrameAndTraitsModularSym contract fuel body st post) :
+    wpMirExecModularSym contract fuel body st post := by
+  induction fuel generalizing st with
+  | zero => exact False.elim h
+  | succ fuel' ih =>
+    unfold wpMirExecFrameAndTraitsModularSym at h
+    unfold wpMirExecModularSym
+    rw [evalSymNodeTreeFrameAndTraitsModular_eq] at h
+    rw [evalSymNodeTreeModular_eq]
+    cases h_ev : (stepMirExecSymTree body st).eval with
+    | ret out =>
+      rw [h_ev] at h
+      exact h
+    | tau st' =>
+      rw [h_ev] at h
+      exact ih st' h
+    | vis i k =>
+      rw [h_ev] at h
+      rcases i with f | (e | c)
+      · cases f; exact False.elim h
+      · cases e; exact ih (k PUnit.unit) h
+      · rcases c with ⟨req⟩
+        dsimp only [evalNodeFrameAndTraitsModularWP, evalNodeModularWP] at h ⊢
+        refine ⟨h.1, fun ans h_post => ?_⟩
+        have h_eq : ans.restoreFrameAndTraits req.memory = ans :=
+          MirCallAns.restoreFrameAndTraits_eq_of_frameAndTraitsPreserved (h_frame req ans h_post)
+        have h_cont := h.2 ans h_post
+        rw [h_eq] at h_cont
+        exact ih (k ans) h_cont
+
+/--
+Discharge a `ModularVerificationResult` with linked `callees` via
+frame-and-`traitImpls`-restoring single-pass symbolic evaluation
+(`wpMirFrameAndTraitsModularSym`).
+-/
+theorem verifyModularFrameAndTraitsContractWithCalleesMirSym
+    (contract : MirCallContract)
+    (h_frame :
+      ∀ (req : MirCallReq) (ans : MirCallAns),
+        contract.post req ans → ans.frameAndTraitsPreserved req.memory)
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        wpMirFrameAndTraitsModularSym contract fuel body
+          (initMachineStateWithMemoryAndCallees body args mem callees)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              post args mem retVal mem')) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := contract.holdsOn
+        pre := pre
+        post := post
+        callees := callees } :=
+  verifyModularContractWithCalleesMirSym contract body callees pre post fuel
+    (fun args mem h_pre =>
+      wpMirExecModularSym_of_wpMirExecFrameAndTraitsModularSym
+        contract h_frame fuel body _ _ (h_wp args mem h_pre))
+
+/--
+Discharge a `ModularVerificationResult` without extra `callees` via
+frame-and-`traitImpls`-restoring single-pass symbolic evaluation
+(`wpMirFrameAndTraitsModularSym`).
+-/
+theorem verifyModularFrameAndTraitsContractMirSym
+    (contract : MirCallContract)
+    (h_frame :
+      ∀ (req : MirCallReq) (ans : MirCallAns),
+        contract.post req ans → ans.frameAndTraitsPreserved req.memory)
+    (body : CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        wpMirFrameAndTraitsModularSym contract fuel body
+          (initMachineStateWithMemory body args mem)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              post args mem retVal mem')) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := contract.holdsOn
+        pre := pre
+        post := post } :=
+  verifyModularFrameAndTraitsContractWithCalleesMirSym
+    contract h_frame body .nil pre post fuel h_wp
+
+/--
+Discharge a `ModularVerificationResult` with linked `callees` for a caller
+invoking a polymorphic `#[external_spec]` target
+(`polyExternalSpecCallContract`), using `wpMirFrameAndTraitsModularSym` so
+subsequent polymorphic and trait-method calls in `callees` reduce by WHNF.
+-/
+theorem verifyPolyExternalSpecWithCalleesMirSym
+    (targetDefPath : DefPath)
+    (expectedTypeArgs : List RigidTy)
+    (sidecarBody : CapturedMir)
+    (extraPre : List Value → Prop := fun _ => True)
+    (extraPost : List Value → Value → Prop := fun _ _ => True)
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        wpMirFrameAndTraitsModularSym
+          (polyExternalSpecCallContract
+            targetDefPath expectedTypeArgs sidecarBody extraPre extraPost)
+          fuel
+          body
+          (initMachineStateWithMemoryAndCallees body args mem callees)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              post args mem retVal mem')) :
+    ModularVerificationResult
+      { body := body
+        envAssumed :=
+          (polyExternalSpecCallContract
+            targetDefPath expectedTypeArgs sidecarBody extraPre extraPost).holdsOn
+        pre := pre
+        post := post
+        callees := callees } :=
+  verifyModularFrameAndTraitsContractWithCalleesMirSym
+    (polyExternalSpecCallContract
+      targetDefPath expectedTypeArgs sidecarBody extraPre extraPost)
+    (polyExternalSpecCallContract_frameAndTraitsPreserved
+      targetDefPath expectedTypeArgs sidecarBody extraPre extraPost)
+    body callees pre post fuel h_wp
+
+/--
+Discharge a `ModularVerificationResult` for a caller invoking a polymorphic
+`#[external_spec]` target (`polyExternalSpecCallContract`), using
+`wpMirFrameAndTraitsModularSym`.
+-/
+theorem verifyPolyExternalSpecMirSym
+    (targetDefPath : DefPath)
+    (expectedTypeArgs : List RigidTy)
+    (sidecarBody : CapturedMir)
+    (extraPre : List Value → Prop := fun _ => True)
+    (extraPost : List Value → Value → Prop := fun _ _ => True)
+    (body : CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        wpMirFrameAndTraitsModularSym
+          (polyExternalSpecCallContract
+            targetDefPath expectedTypeArgs sidecarBody extraPre extraPost)
+          fuel
+          body
+          (initMachineStateWithMemory body args mem)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              post args mem retVal mem')) :
+    ModularVerificationResult
+      { body := body
+        envAssumed :=
+          (polyExternalSpecCallContract
+            targetDefPath expectedTypeArgs sidecarBody extraPre extraPost).holdsOn
+        pre := pre
+        post := post } :=
+  verifyPolyExternalSpecWithCalleesMirSym
+    targetDefPath expectedTypeArgs sidecarBody extraPre extraPost body .nil pre post fuel h_wp
+
 /--
 Single-pass symbolic caller–callee linking theorem with `callerCallees` and
 `calleeCallees` under `C.holdsOn` via `wpMirNoCallSym`.
@@ -3670,9 +4016,8 @@ theorem linkVerifiedContractMirCalleeWithCalleesSym
         req.defPath = calleeBody.defPath →
         C.pre req →
         wpMirNoCallSym calleeFuel calleeBody
-          (initMachineStateWithMemoryAndCallees
-            calleeBody req.args req.memory calleeCallees)
-          (fun out => C.post req (outcomeToCallAns req.memory out)))
+          (enterExternalCalleeState calleeBody req.args req.memory calleeCallees)
+          (fun out => C.post req (outcomeToRestoredCallAns req.memory out)))
     (h_fallback :
       ∀ req : MirCallReq,
         req.defPath ≠ calleeBody.defPath →
@@ -3716,13 +4061,15 @@ theorem linkVerifiedPolyContractMirCalleeWithCalleesSym
         req.defPath = calleeBody.defPath →
         C.pre req →
         wpMirNoCallSym calleeFuel
-          (instantiateCalleeForReq calleeBody callerBody.layouts req)
-          (initMachineStateWithMemoryAndCallees
-            (instantiateCalleeForReq calleeBody callerBody.layouts req)
+          (instantiateCalleeForReq
+            calleeBody callerBody.layouts req callerBody.traitImpls)
+          (enterExternalCalleeState
+            (instantiateCalleeForReq
+              calleeBody callerBody.layouts req callerBody.traitImpls)
             req.args
             req.memory
             calleeCallees)
-          (fun out => C.post req (outcomeToCallAns req.memory out)))
+          (fun out => C.post req (outcomeToRestoredCallAns req.memory out)))
     (h_fallback :
       ∀ req : MirCallReq,
         req.defPath ≠ calleeBody.defPath →
@@ -3732,13 +4079,71 @@ theorem linkVerifiedPolyContractMirCalleeWithCalleesSym
     (fun args mem =>
       (mirHandledTreeWithCallees callerBody args mem callerCallees
         (linkPolyCalleeWithCalleesHandler
-          calleeBody callerBody.layouts calleeCallees fallback)).toPartial) ≤
+          calleeBody callerBody.layouts calleeCallees fallback
+          callerBody.traitImpls)).toPartial) ≤
       MirClosedStatefulContractSpec pre pre post :=
   linkVerifiedPolyContractMirCalleeWithCalleesBounded
     h_caller calleeBody calleeCallees calleeFuel fallback
     (fun req h_eq h_pre => by
       rw [← wpMirNoCallSym_eq_wpMirNoCallBounded]
       exact h_callee req h_eq h_pre)
+    h_fallback
+
+/--
+Trait-method or polymorphic single-pass symbolic caller–callee linking theorem
+with `callerCallees` and `calleeCallees` under `C.holdsOn` via `wpMirNoCallSym`.
+-/
+theorem linkVerifiedTraitOrPolyContractMirCalleeWithCalleesSym
+    {C : MirCallContract}
+    {callerBody : CapturedMir}
+    {callerCallees : List CapturedMir}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (h_caller :
+      ModularVerificationResult
+        { body := callerBody
+          envAssumed := C.holdsOn
+          pre := pre
+          post := post
+          callees := callerCallees })
+    (calleeBody : CapturedMir)
+    (calleeCallees : List CapturedMir)
+    (calleeFuel : Nat)
+    (fallback : ExternalCallHandler)
+    (h_callee :
+      ∀ (req : MirCallReq) (instBody : CapturedMir),
+        lookupCallee
+          [calleeBody]
+          callerBody.layouts
+          req.defPath
+          req.typeArgs
+          callerBody.traitImpls = .some instBody →
+        C.pre req →
+        wpMirNoCallSym calleeFuel instBody
+          (enterExternalCalleeState instBody req.args req.memory calleeCallees)
+          (fun out => C.post req (outcomeToRestoredCallAns req.memory out)))
+    (h_fallback :
+      ∀ req : MirCallReq,
+        lookupCallee
+          [calleeBody]
+          callerBody.layouts
+          req.defPath
+          req.typeArgs
+          callerBody.traitImpls = .none →
+        C.pre req →
+        TreeSafe (fallback req) ∧
+        ∀ tr ans, ReachesRet (fallback req) tr ans → C.post req ans) :
+    (fun args mem =>
+      (mirHandledTreeWithCallees callerBody args mem callerCallees
+        (linkTraitOrPolyCalleeWithCalleesHandler
+          calleeBody callerBody.layouts calleeCallees fallback
+          callerBody.traitImpls)).toPartial) ≤
+      MirClosedStatefulContractSpec pre pre post :=
+  linkVerifiedTraitOrPolyContractMirCalleeWithCalleesBounded
+    h_caller calleeBody calleeCallees calleeFuel fallback
+    (fun req instBody h_lk h_pre => by
+      rw [← wpMirNoCallSym_eq_wpMirNoCallBounded]
+      exact h_callee req instBody h_lk h_pre)
     h_fallback
 
 /-! ## 15. `O(1)` Block & Callee Lookup Context Lemmas, Indirect `FnPtr` & Diverging Call Stepping, and Polymorphic Claim Combinators -/
@@ -3856,6 +4261,299 @@ theorem resolveCallTarget_const_fnDef
         isIndirect := false }
       s.frame.locals :=
   rfl
+
+/--
+Indirect `resolveCallTarget` reduction for a runtime `Value.ptr` function pointer
+registered in `s.memory.fnPtrs`.
+-/
+theorem resolveCallTarget_indirect_fnPtr
+    (s : MachineState)
+    (func : Operand)
+    (argCount : Nat)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (ptrVal : ProvenancePtr)
+    (localsAfterFunc : List LocalSlot)
+    (fnEntry : FnPtrEntry)
+    (h_nonConst : extractCalleeDefPath? func = .none)
+    (h_eval :
+      evalOperand
+        s.frame.locals
+        func
+        s.memory.borrows
+        s.memory.globals
+        bodyLayouts
+        s.memory.callerLocals =
+      .ok (.ptr ptrVal 8) localsAfterFunc)
+    (h_off : ptrVal.offsetBytes = 0)
+    (h_noBorrow : lookupBorrow s.memory.borrows ptrVal.tag = .none)
+    (h_fnPtr : lookupFnPtr s.memory.fnPtrs ptrVal.allocId = .some fnEntry)
+    (h_compat :
+      fnEntryCompatibleWithCallSite
+        fnEntry
+        argCount
+        (operandTy bodyLocalDecls bodyLayouts func) = true) :
+    resolveCallTarget s func argCount bodyLocalDecls bodyLayouts =
+      .ok
+        { defPath := fnEntry.defPath
+          typeArgs := fnEntry.typeArgs
+          fnSig := fnEntry.fnSig
+          isIndirect := true }
+        localsAfterFunc := by
+  unfold resolveCallTarget
+  rw [h_nonConst, h_eval]
+  dsimp only []
+  rw [h_off, h_noBorrow]
+  dsimp only [Nat.beq, Bool.and]
+  rw [h_fnPtr]
+  dsimp only []
+  rw [h_compat]
+
+/--
+`evalTerminatorSymTree` for an unreachable basic-block terminator
+(`TerminatorKind.unreachable`) reduces directly to `.leaf (MirStepNode.fail .ub)`.
+-/
+@[simp]
+theorem evalTerminatorSymTree_unreachable_eq_ub
+    (s : MachineState)
+    (span : String)
+    (currentBody : CapturedMir) :
+    evalTerminatorSymTree s { kind := .unreachable, span := span } currentBody =
+      .leaf (MirStepNode.fail .ub) :=
+  rfl
+
+/--
+`evalTerminatorSymTree` for a normal inlined call (`target = .some targetBb`)
+resolved via `CalleeCtx`.
+-/
+theorem evalTerminatorSymTree_call_inlined_of_calleeCtx
+    (s : MachineState)
+    (func : Operand)
+    (argOps : List Operand)
+    (destination : Place)
+    (targetBb : BasicBlockIdx)
+    (unwind : UnwindAction)
+    (span : String)
+    (currentBody : CapturedMir)
+    (resolvedTarget : ResolvedCallTarget)
+    (localsAfterFunc : List LocalSlot)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (calleeBody : CapturedMir)
+    (h_res :
+      resolveCallTarget
+        s func (length argOps) currentBody.localDecls currentBody.layouts =
+      .ok resolvedTarget localsAfterFunc)
+    (h_args :
+      evalOperands
+        localsAfterFunc
+        argOps
+        s.memory.borrows
+        s.memory.globals
+        currentBody.layouts
+        s.memory.callerLocals =
+      .ok argVals locals')
+    (h_callee :
+      CalleeCtx
+        s.memory.callees
+        currentBody.layouts
+        resolvedTarget.defPath
+        resolvedTarget.typeArgs
+        s.memory.traitImpls
+        calleeBody)
+    (h_compat :
+      checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) = true) :
+    evalTerminatorSymTree
+      s
+      { kind := .call func argOps destination (.some targetBb) unwind, span := span }
+      currentBody =
+    .leaf
+      (MirStepNode.step
+        (pushCalleeFrame
+          s currentBody locals' destination targetBb calleeBody argVals unwind)) := by
+  dsimp only [evalTerminatorSymTree, evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
+  rw [h_res]
+  dsimp only []
+  rw [h_args]
+  dsimp only []
+  rw [lookupCallee_eq_of_calleeCtx h_callee]
+  dsimp only []
+  rw [h_compat]
+
+/--
+`evalTerminatorSymTree` for an inlined tail call (`TerminatorKind.tailCall`)
+resolved via `CalleeCtx`.
+-/
+theorem evalTerminatorSymTree_tailCall_inlined_of_calleeCtx
+    (s : MachineState)
+    (func : Operand)
+    (argOps : List Operand)
+    (span : String)
+    (currentBody : CapturedMir)
+    (resolvedTarget : ResolvedCallTarget)
+    (localsAfterFunc : List LocalSlot)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (calleeBody : CapturedMir)
+    (h_res :
+      resolveCallTarget
+        s func (length argOps) currentBody.localDecls currentBody.layouts =
+      .ok resolvedTarget localsAfterFunc)
+    (h_args :
+      evalOperands
+        localsAfterFunc
+        argOps
+        s.memory.borrows
+        s.memory.globals
+        currentBody.layouts
+        s.memory.callerLocals =
+      .ok argVals locals')
+    (h_callee :
+      CalleeCtx
+        s.memory.callees
+        currentBody.layouts
+        resolvedTarget.defPath
+        resolvedTarget.typeArgs
+        s.memory.traitImpls
+        calleeBody)
+    (h_compat :
+      checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) = true) :
+    evalTerminatorSymTree
+      s
+      { kind := .tailCall func argOps, span := span }
+      currentBody =
+    .leaf
+      (MirStepNode.step
+        (enterTailCalleeFrame s.memory calleeBody argVals)) := by
+  dsimp only [evalTerminatorSymTree, evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf]
+  rw [h_res]
+  dsimp only []
+  rw [h_args]
+  dsimp only []
+  rw [lookupCallee_eq_of_calleeCtx h_callee]
+  dsimp only []
+  rw [h_compat]
+
+/--
+`evalTerminatorSymTree` for a diverging (`target = .none`) inlined call resolved
+via `CalleeCtx`.
+-/
+theorem evalTerminatorSymTree_diverging_call_inlined_of_calleeCtx
+    (s : MachineState)
+    (func : Operand)
+    (argOps : List Operand)
+    (destination : Place)
+    (unwind : UnwindAction)
+    (span : String)
+    (currentBody : CapturedMir)
+    (resolvedTarget : ResolvedCallTarget)
+    (localsAfterFunc : List LocalSlot)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (calleeBody : CapturedMir)
+    (h_res :
+      resolveCallTarget
+        s func (length argOps) currentBody.localDecls currentBody.layouts =
+      .ok resolvedTarget localsAfterFunc)
+    (h_args :
+      evalOperands
+        localsAfterFunc
+        argOps
+        s.memory.borrows
+        s.memory.globals
+        currentBody.layouts
+        s.memory.callerLocals =
+      .ok argVals locals')
+    (h_callee :
+      CalleeCtx
+        s.memory.callees
+        currentBody.layouts
+        resolvedTarget.defPath
+        resolvedTarget.typeArgs
+        s.memory.traitImpls
+        calleeBody)
+    (h_compat :
+      checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) = true) :
+    evalTerminatorSymTree
+      s
+      { kind := .call func argOps destination .none unwind, span := span }
+      currentBody =
+    .leaf
+      (MirStepNode.step
+        (pushDivergingCalleeFrame
+          s currentBody locals' destination unwind calleeBody argVals)) := by
+  dsimp only [evalTerminatorSymTree, evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
+  rw [h_res]
+  dsimp only []
+  rw [h_args]
+  dsimp only []
+  rw [lookupCallee_eq_of_calleeCtx h_callee]
+  dsimp only []
+  rw [h_compat]
+
+/--
+`evalTerminatorSymTree` for an unresolved diverging (`target = .none`) external
+call (neither an unreachable hint nor a built-in panic entrypoint) reduces to
+`MirStepNode.extCall` with `resumeExternalDivergingCall`.
+-/
+theorem evalTerminatorSymTree_diverging_extCall
+    (s : MachineState)
+    (func : Operand)
+    (argOps : List Operand)
+    (destination : Place)
+    (unwind : UnwindAction)
+    (span : String)
+    (currentBody : CapturedMir)
+    (resolvedTarget : ResolvedCallTarget)
+    (localsAfterFunc : List LocalSlot)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (h_res :
+      resolveCallTarget
+        s func (length argOps) currentBody.localDecls currentBody.layouts =
+      .ok resolvedTarget localsAfterFunc)
+    (h_args :
+      evalOperands
+        localsAfterFunc
+        argOps
+        s.memory.borrows
+        s.memory.globals
+        currentBody.layouts
+        s.memory.callerLocals =
+      .ok argVals locals')
+    (h_none :
+      lookupCallee
+        s.memory.callees
+        currentBody.layouts
+        resolvedTarget.defPath
+        resolvedTarget.typeArgs
+        s.memory.traitImpls =
+      .none)
+    (h_not_unreach : isUnreachableCallTarget resolvedTarget.defPath = false)
+    (h_not_abort : isAbortingPanicDefPath resolvedTarget.defPath = false)
+    (h_not_unwind : isUnwindingPanicDefPath resolvedTarget.defPath = false) :
+    evalTerminatorSymTree
+      s
+      { kind := .call func argOps destination .none unwind, span := span }
+      currentBody =
+    .leaf
+      (MirStepNode.extCall
+        { defPath := resolvedTarget.defPath
+          typeArgs := resolvedTarget.typeArgs
+          args := argVals
+          memory := s.memory }
+        (resumeExternalDivergingCall s locals' unwind)) := by
+  dsimp only [evalTerminatorSymTree, evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
+  rw [h_res]
+  dsimp only []
+  rw [h_args]
+  dsimp only []
+  rw [h_none]
+  dsimp only []
+  cases resolvedTarget.isIndirect
+  · dsimp only []
+    rw [h_not_unreach, h_not_abort, h_not_unwind]
+  · rfl
 
 /--
 Verify a universally quantified polymorphic stateless claim
@@ -4027,6 +4725,97 @@ theorem verifyPolyUbExceptionMirSym
       fuel
       (h_strict typeArgs h_len)
       (h_waived typeArgs h_len)
+
+/--
+Verify a universally quantified polymorphic modular claim
+`∀ typeArgs, typeArgs.length = polyBody.typeParamCount → ModularVerificationResult ...`
+via single-pass symbolic evaluation (`verifyModularContractWithCalleesMirSym`).
+-/
+theorem verifyPolyModularMirSym
+    (polyBody : CapturedMir)
+    (contractFor : TypeSubst → MirCallContract)
+    (bodyFor : TypeSubst → CapturedMir)
+    (calleesFor : TypeSubst → List CapturedMir)
+    (preFor : TypeSubst → List Value → Memory → Prop)
+    (postFor : TypeSubst → List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (typeArgs : TypeSubst),
+        typeArgs.length = polyBody.typeParamCount →
+        ∀ (args : List Value) (mem : Memory),
+          preFor typeArgs args mem →
+          wpMirModularSym (contractFor typeArgs) fuel (bodyFor typeArgs)
+            (initMachineStateWithMemoryAndCallees
+              (bodyFor typeArgs) args mem (calleesFor typeArgs))
+            (fun out =>
+              ∀ retVal mem', out = .normal (retVal, mem') →
+                postFor typeArgs args mem retVal mem')) :
+    ∀ (typeArgs : TypeSubst),
+      typeArgs.length = polyBody.typeParamCount →
+      ModularVerificationResult
+        { body := bodyFor typeArgs
+          envAssumed := (contractFor typeArgs).holdsOn
+          pre := preFor typeArgs
+          post := postFor typeArgs
+          callees := calleesFor typeArgs } :=
+  fun typeArgs h_len =>
+    verifyModularContractWithCalleesMirSym
+      (contractFor typeArgs)
+      (bodyFor typeArgs)
+      (calleesFor typeArgs)
+      (preFor typeArgs)
+      (postFor typeArgs)
+      fuel
+      (h_wp typeArgs h_len)
+
+/--
+Verify a universally quantified polymorphic modular claim via
+frame-and-`traitImpls`-restoring symbolic evaluation
+(`wpMirFrameAndTraitsModularSym`).
+-/
+theorem verifyPolyModularFrameAndTraitsMirSym
+    (polyBody : CapturedMir)
+    (contractFor : TypeSubst → MirCallContract)
+    (h_frame :
+      ∀ (typeArgs : TypeSubst),
+        typeArgs.length = polyBody.typeParamCount →
+        ∀ (req : MirCallReq) (ans : MirCallAns),
+          (contractFor typeArgs).post req ans →
+          ans.frameAndTraitsPreserved req.memory)
+    (bodyFor : TypeSubst → CapturedMir)
+    (calleesFor : TypeSubst → List CapturedMir)
+    (preFor : TypeSubst → List Value → Memory → Prop)
+    (postFor : TypeSubst → List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (typeArgs : TypeSubst),
+        typeArgs.length = polyBody.typeParamCount →
+        ∀ (args : List Value) (mem : Memory),
+          preFor typeArgs args mem →
+          wpMirFrameAndTraitsModularSym (contractFor typeArgs) fuel (bodyFor typeArgs)
+            (initMachineStateWithMemoryAndCallees
+              (bodyFor typeArgs) args mem (calleesFor typeArgs))
+            (fun out =>
+              ∀ retVal mem', out = .normal (retVal, mem') →
+                postFor typeArgs args mem retVal mem')) :
+    ∀ (typeArgs : TypeSubst),
+      typeArgs.length = polyBody.typeParamCount →
+      ModularVerificationResult
+        { body := bodyFor typeArgs
+          envAssumed := (contractFor typeArgs).holdsOn
+          pre := preFor typeArgs
+          post := postFor typeArgs
+          callees := calleesFor typeArgs } :=
+  fun typeArgs h_len =>
+    verifyModularFrameAndTraitsContractWithCalleesMirSym
+      (contractFor typeArgs)
+      (h_frame typeArgs h_len)
+      (bodyFor typeArgs)
+      (calleesFor typeArgs)
+      (preFor typeArgs)
+      (postFor typeArgs)
+      fuel
+      (h_wp typeArgs h_len)
 
 /-! ## 10. Differential Testing Outcome Classifiers & Strict UB / Panic Refutation Combinators -/
 

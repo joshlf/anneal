@@ -870,6 +870,8 @@ private def rawConstPtrU8MirTy : Ty :=
   { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }
 private def rawMutPtrU8MirTy : Ty :=
   { kind := .rawPtr .mut (.uint .u8), layoutIdx := 0 }
+private def splitTupleParamTMirTy : Ty :=
+  { kind := .tuple [sliceMutRefParamTMirTy.kind, sliceMutRefParamTMirTy.kind], layoutIdx := 0 }
 private def splitTupleU8MirTy : Ty :=
   { kind := .tuple [sliceMutRefU8MirTy.kind, sliceMutRefU8MirTy.kind], layoutIdx := 0 }
 private def rangeUsizeMirTy : Ty :=
@@ -909,7 +911,7 @@ Polymorphic `core::slice::<impl [T]>::as_ptr`:
 -/
 def coreSliceAsPtrMir : CapturedMir := {
   mkMirBody "core::slice::<impl [T]>::as_ptr" 1
-    [ mkDecl .mut rawConstPtrU8MirTy
+    [ mkDecl .mut rawConstPtrParamTMirTy
     , mkDecl .not sliceRefParamTMirTy ]
     [ { statements :=
           [ mkStmt (.assign { local_ := 0, projection := [] }
@@ -929,7 +931,7 @@ Polymorphic `core::slice::from_raw_parts_mut`:
 -/
 def coreSliceFromRawPartsMutMir : CapturedMir := {
   mkMirBody "core::slice::from_raw_parts_mut" 2
-    [ mkDecl .mut sliceMutRefU8MirTy
+    [ mkDecl .mut sliceMutRefParamTMirTy
     , mkDecl .not rawMutPtrParamTMirTy
     , mkDecl .not usizeMirTy ]
     [ { statements :=
@@ -945,8 +947,8 @@ def coreSliceFromRawPartsMutMir : CapturedMir := {
 }
 
 /--
-`core::slice::<impl [T]>::split_at_mut` (specialized for `[u8]`, calling
-polymorphic `core::slice::<impl [T]>::len` and `core::slice::from_raw_parts_mut`
+`core::slice::<impl [T]>::split_at_mut` (calling polymorphic
+`core::slice::<impl [T]>::len::<u8>` and `core::slice::from_raw_parts_mut::<u8>`
 across nested stack frames):
 - `bb0`: `_3 = core::slice::<impl [T]>::len::<u8>(copy _1) -> bb1`
 - `bb1`: `_4 = copy _1 as *mut u8 (PtrToPtr); _5 = Offset(copy _4, copy _2);
@@ -1704,24 +1706,18 @@ def extFromRawPartsMutSidecarMir : CapturedMir := {
 }
 
 def extFromRawPartsMutContract : MirCallContract :=
-  externalSpecCallContract
+  polyExternalSpecCallContract
     "core::slice::from_raw_parts_mut"
+    [.uint .u8]
     extFromRawPartsMutSidecarMir
-    (fun _ => True)
+    (fun args =>
+      ∃ p len,
+        len < 18446744073709551616 ∧
+        args = [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }])
     (fun args ret =>
       ∀ p len,
         args = [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }] →
         ret = .aggregate 0 [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }])
-
-/-- Monomorphic `core::slice::<impl [T]>::len` specialized for `&[u8]`. -/
-def coreSliceLenU8Mir : CapturedMir :=
-  mkMirBody "core::slice::<impl [T]>::len" 1
-    [mkDecl .mut usizeMirTy, mkDecl .not sliceRefU8MirTy]
-    [ { statements :=
-          [ mkStmt (.assign { local_ := 0, projection := [] }
-              (.unaryOp .ptrMetadata (.move { local_ := 1, projection := [] }))) ]
-        terminator := mkTerm .return_
-        isCleanup := false } ]
 
 def externalSpecSliceCallerMir : CapturedMir := {
   mkMirBody "sym_test::ext_spec_slice_caller" 2
@@ -1742,7 +1738,7 @@ def externalSpecSliceCallerMir : CapturedMir := {
     , { statements := []
         terminator :=
           mkTerm (.call
-            (fnConstOp "core::slice::<impl [T]>::len")
+            (fnConstOp "core::slice::<impl [T]>::len" [.uint .u8])
             [.move { local_ := 3, projection := [] }]
             { local_ := 0, projection := [] }
             (.some 2)
@@ -1756,7 +1752,7 @@ def externalSpecSliceCallerMir : CapturedMir := {
 
 def externalSpecSliceCallerClaim : ModularClaim where
   body := externalSpecSliceCallerMir
-  callees := [coreSliceLenU8Mir]
+  callees := [coreSliceLenMir]
   envAssumed := extFromRawPartsMutContract.holdsOn
   pre args mem :=
     ∃ (p : ProvenancePtr) (len : Nat),
@@ -1769,31 +1765,36 @@ def externalSpecSliceCallerClaim : ModularClaim where
       ret = .scalar { bits := len, sizeBytes := 8 }
 
 /--
-Kernel-checked modular verification via `verifyExternalSpecWithCalleesMirSym`:
-`wpMirFrameModularSym` restores `callees` and `callStack` across the
-`#[external_spec]` call to `core::slice::from_raw_parts_mut`, allowing the
-subsequent inlined call to `core::slice::<impl [T]>::len` in `c.callees` to
-reduce in a single pass!
+Kernel-checked modular verification via `verifyPolyExternalSpecWithCalleesMirSym`:
+`wpMirFrameAndTraitsModularSym` restores `callees`, `traitImpls`, and `callStack`
+across the polymorphic `#[external_spec]` call to
+`core::slice::from_raw_parts_mut::<u8>`, allowing the subsequent inlined
+polymorphic call to `core::slice::<impl [T]>::len::<u8>` in `c.callees` to
+instantiate and reduce in a single pass!
 -/
 theorem externalSpecSliceCaller_verified :
     ModularVerificationResult externalSpecSliceCallerClaim := by
-  refine verifyExternalSpecWithCalleesMirSym
+  refine verifyPolyExternalSpecWithCalleesMirSym
     "core::slice::from_raw_parts_mut"
+    [.uint .u8]
     extFromRawPartsMutSidecarMir
-    (fun _ => True)
+    (fun args =>
+      ∃ p len,
+        len < 18446744073709551616 ∧
+        args = [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }])
     (fun args ret =>
       ∀ p len,
         args = [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }] →
         ret = .aggregate 0 [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }])
     externalSpecSliceCallerMir
-    [coreSliceLenU8Mir]
+    [coreSliceLenMir]
     externalSpecSliceCallerClaim.pre
     externalSpecSliceCallerClaim.post
     16
     ?_
   rintro _ _ ⟨p, len, hp, hlen, rfl, rfl⟩
   (conv => whnf)
-  refine ⟨⟨rfl, rfl, ⟨Or.inl ⟨p, 8, rfl⟩, ⟨len, hlen, rfl⟩, trivial⟩, trivial⟩, ?_⟩
+  refine ⟨⟨rfl, rfl, rfl, ⟨Or.inl ⟨p, 8, rfl⟩, ⟨len, hlen, rfl⟩, trivial⟩, ⟨p, len, hlen, rfl⟩⟩, ?_⟩
   rintro ans h_post
   cases ans with
   | returned retVal memAfter =>
@@ -1816,8 +1817,53 @@ theorem externalSpecSliceCaller_verified :
     cases h_eq
 
 /--
+Kernel-checked compositional caller–callee linking via
+`linkVerifiedPolyContractMirCalleeWithCalleesSym`: links
+`externalSpecSliceCaller_verified` (which has `[coreSliceLenMir]` in
+`callerCallees`) with the polymorphic implementation
+`coreSliceFromRawPartsMutMir`, closing the modular assumption into a closed
+`MirClosedStatefulContractSpec` refinement!
+-/
+theorem externalSpecSliceCaller_linked_verified :
+    (fun args mem =>
+      (mirHandledTreeWithCallees
+        externalSpecSliceCallerMir args mem [coreSliceLenMir]
+        (linkPolyCalleeWithCalleesHandler
+          coreSliceFromRawPartsMutMir
+          externalSpecSliceCallerMir.layouts
+          []
+          abortExternalCalls
+          externalSpecSliceCallerMir.traitImpls)).toPartial) ≤
+      MirClosedStatefulContractSpec
+        externalSpecSliceCallerClaim.pre
+        externalSpecSliceCallerClaim.pre
+        externalSpecSliceCallerClaim.post := by
+  refine linkVerifiedPolyContractMirCalleeWithCalleesSym
+    externalSpecSliceCaller_verified
+    coreSliceFromRawPartsMutMir
+    []
+    8
+    abortExternalCalls
+    ?_
+    ?_
+  · rintro req h_path ⟨_, h_typeArgs, _, _, ⟨p, len, h_len_lt, h_args⟩⟩
+    cases req with
+    | mk defPath typeArgs args memory =>
+      dsimp only at h_path h_typeArgs h_args ⊢
+      subst h_path h_typeArgs h_args
+      refine ⟨callFrameAndTraitsPreserved_restoreCallerMemoryFrame_same_fnPtrs memory _ rfl, ?_, ?_⟩
+      · exact ⟨p, 8, len, h_len_lt, rfl⟩
+      · intro p' len' h_eq
+        simp only [List.cons.injEq, Value.ptr.injEq, Value.scalar.injEq,
+          ScalarInt.mk.injEq, and_true] at h_eq
+        rcases h_eq with ⟨rfl, rfl⟩
+        rfl
+  · rintro req h_ne ⟨h_eq, _⟩
+    exact False.elim (h_ne h_eq)
+
+/--
 `O(1)` lookup context witness for `coreSliceLenMir` basic block `0` and
-callee lookup in `[coreSliceLenU8Mir]`.
+polymorphic callee lookup in `[coreSliceLenMir]`.
 -/
 theorem coreSliceLenMir_blockCtx_0 :
     BlockCtx coreSliceLenMir 0
@@ -1829,9 +1875,16 @@ theorem coreSliceLenMir_blockCtx_0 :
   rfl
 
 theorem sliceHelperCallees_calleeCtx_len :
-    CalleeCtx [coreSliceLenU8Mir] sliceCallerLayouts
-      "core::slice::<impl [T]>::len" [] []
-      coreSliceLenU8Mir :=
+    CalleeCtx [coreSliceLenMir] sliceCallerLayouts
+      "core::slice::<impl [T]>::len" [.uint .u8] []
+      (instantiateCalleeForReq
+        coreSliceLenMir
+        sliceCallerLayouts
+        { defPath := "core::slice::<impl [T]>::len"
+          typeArgs := [.uint .u8]
+          args := []
+          memory := emptyMemory }
+        []) :=
   rfl
 
 /--
@@ -1913,6 +1966,28 @@ theorem pinnedWithSpecCallees_verified :
     VerificationResult pinnedWithSpecCalleesClaim := by
   exact dischargeRustPinnedContractWithSpecCalleesAuto
     pinnedWithSpecCalleesClaim 16 16
+    [incU8CallbackMir]
+    (.some companionPinnedReqMir)
+    (.some companionWithCallEnsMir)
+
+def pinnedWithSpecCalleesTotalClaim : TotalClaim where
+  body := pinnedWithSpecCalleesSubjectMir
+  callees := [incU8CallbackMir]
+  pre args mem :=
+    (Trusted.Sequence.length args = 1 ∧
+      MirBoolPredicateHolds companionPinnedReqMir args) ∧
+      mem = (initMachineState pinnedWithSpecCalleesSubjectMir args).memory
+  post args _ ret _ :=
+    MirBoolPredicateHoldsWithCallees companionWithCallEnsMir [incU8CallbackMir] (args ++ [ret])
+
+/--
+Kernel-checked total verification of `pinnedWithSpecCalleesTotalClaim` via
+`dischargeRustTotalPinnedContractWithSpecCalleesAuto`.
+-/
+theorem pinnedWithSpecCalleesTotal_verified :
+    TotalVerificationResult pinnedWithSpecCalleesTotalClaim := by
+  exact dischargeRustTotalPinnedContractWithSpecCalleesAuto
+    pinnedWithSpecCalleesTotalClaim 16 16
     [incU8CallbackMir]
     (.some companionPinnedReqMir)
     (.some companionWithCallEnsMir)
