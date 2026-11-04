@@ -1128,22 +1128,28 @@ def evalTerminator
                   calleeBody
                   argVals)
         | .none =>
-          match isUnreachableCallTarget target.defPath with
-          | true => MirStepNode.fail .ub
+          match target.isIndirect with
           | false =>
-            match isAbortingPanicDefPath target.defPath with
-            | true => MirStepNode.retOutcome .abort
+            match isUnreachableCallTarget target.defPath with
+            | true => MirStepNode.fail .ub
             | false =>
-              match isUnwindingPanicDefPath target.defPath with
-              | true =>
-                match applyUnwindAction s locals' s.memory unwind with
-                | .running nextState => MirStepNode.step nextState
-                | .halted out => MirStepNode.retOutcome out
-                | .faulted fk => MirStepNode.fail fk
+              match isAbortingPanicDefPath target.defPath with
+              | true => MirStepNode.retOutcome .abort
               | false =>
-                MirStepNode.extCall
-                  { defPath := target.defPath, args := argVals, memory := s.memory }
-                  (resumeExternalDivergingCall s locals' unwind)
+                match isUnwindingPanicDefPath target.defPath with
+                | true =>
+                  match applyUnwindAction s locals' s.memory unwind with
+                  | .running nextState => MirStepNode.step nextState
+                  | .halted out => MirStepNode.retOutcome out
+                  | .faulted fk => MirStepNode.fail fk
+                | false =>
+                  MirStepNode.extCall
+                    { defPath := target.defPath, args := argVals, memory := s.memory }
+                    (resumeExternalDivergingCall s locals' unwind)
+          | true =>
+            MirStepNode.extCall
+              { defPath := target.defPath, args := argVals, memory := s.memory }
+              (resumeExternalDivergingCall s locals' unwind)
   | .tailCall func argOps =>
     let bodyLocalDecls := bodyLocalDeclsOf currentBody
     let bodyLayouts : LayoutTable :=
