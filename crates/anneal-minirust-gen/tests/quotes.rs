@@ -540,7 +540,7 @@ fn quotations_occur_upstream() {
     );
     // The interpretation and the translation quote dozens of upstream items;
     // a sudden drop means the extraction above broke.
-    assert!(total >= 40, "only {total} quotations found");
+    assert!(total >= 70, "only {total} quotations found");
 
     // Every spec-transcribing `def` in `Interp.lean` (after `/-! ## Target`,
     // except the Lean recursion/iteration helpers `countOnesLoop` and `steps`)
@@ -954,6 +954,19 @@ fn enum_tuple_and_cmp_quotations_are_pinned() {
             "let mut bytes = list![AbstractByte::Init(0, None); size.bytes()];",
             "MiniRustSpec/Interp.lean",
         ),
+        (
+            repr,
+            "sized_fields.try_map(|(offset, ty)| { \
+             let subslice = bytes.subslice_with_length( \
+                 offset.bytes(), \
+                 ty.layout::<M::T>().expect_size(\"WF ensures all sized tuple fields are sized\").bytes() \
+             ); \
+             ty.decode::<M>(subslice) })?",
+            "sized_fields.try_map(|(offset, ty)| { \
+             let subslice = bytes.subslice_with_length(0, offset.bytes()); \
+             ty.decode::<M>(subslice) })?",
+            "MiniRustSpec/Interp.lean",
+        ),
         // `check_value` for variants and tuples, and `ensure_else_ub`.
         (
             repr,
@@ -1031,6 +1044,14 @@ fn enum_tuple_and_cmp_quotations_are_pinned() {
         ),
         (
             types,
+            "Some(tail_ty) => LayoutStrategy::Tuple { \
+             head: sized_head_layout, \
+             tail: tail_ty.layout::<T>(), },",
+            "Some(tail_ty) => LayoutStrategy::Sized(sized_head_layout, tail_ty.layout::<T>()),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
             "Slice { elem } => LayoutStrategy::Slice( \
              elem.layout::<T>().expect_size(\"WF ensures slice element is sized\"), \
              elem.layout::<T>().expect_align(\"WF ensures array element is sized\"), ), \
@@ -1050,10 +1071,26 @@ fn enum_tuple_and_cmp_quotations_are_pinned() {
         ),
         (
             repr,
+            "fn decode<M: Memory>(Type::TraitObject(..): Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> { \
+             panic!(\"decode of Type::TraitObject\") }",
+            "fn decode<M: Memory>(Type::TraitObject(..): Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> { \
+             throw_ub!(\"decode of Type::TraitObject\") }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
             "fn encode<M: Memory>(Type::Slice { .. }: Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> { \
              panic!(\"encode of Type::Slice\") }",
             "fn encode<M: Memory>(Type::Slice { .. }: Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> { \
              throw_ub!(\"encode of Type::Slice\") }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "fn encode<M: Memory>(Type::TraitObject(..): Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> { \
+             panic!(\"encode of Type::TraitObject\") }",
+            "fn encode<M: Memory>(Type::TraitObject(..): Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> { \
+             throw_ub!(\"encode of Type::TraitObject\") }",
             "MiniRustSpec/Interp.lean",
         ),
         (
