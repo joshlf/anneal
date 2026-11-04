@@ -637,7 +637,7 @@ impl<T: FromScheduleBytes, E: FromScheduleBytes> FromScheduleBytes for Result<T,
 
 /// Entry in the runtime observer's shadow provenance table mapping a native
 /// virtual address range `[base_addr, base_addr + byte_len)` to an abstract
-/// MIR `(alloc_id, tag)`.
+/// MIR `(alloc_id, tag)` and optional initial referent bytes `raw_bytes`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordedShadowAlloc {
     /// Native runtime base virtual address (`ptr as usize`).
@@ -648,6 +648,8 @@ pub struct RecordedShadowAlloc {
     pub alloc_id: usize,
     /// Tree Borrows provenance tag associated with this allocation.
     pub tag: usize,
+    /// Initial raw referent bytes captured when the allocation was registered.
+    pub raw_bytes: Vec<u8>,
 }
 
 /// Alias preserving compatibility with JSON trace interchange descriptors.
@@ -1189,8 +1191,10 @@ impl TraceRecorder {
         &self.events
     }
 
-    /// Register a watched runtime allocation in the shadow provenance table.
-    pub fn register_allocation<T: ?Sized>(
+    /// Register a watched runtime allocation in the shadow provenance table,
+    /// capturing its initial referent bytes via [`value_as_raw_bytes`] so
+    /// Lean `TraceCheck` can populate initial memory for pointer dereferences.
+    pub fn register_allocation<T: TraceCapture + ?Sized>(
         &mut self,
         referent: &T,
         alloc_id: usize,
@@ -1198,11 +1202,12 @@ impl TraceRecorder {
     ) {
         let base_addr = (referent as *const T).cast::<u8>() as usize;
         let byte_len = mem::size_of_val(referent);
-        self.register_address_range(base_addr, byte_len, alloc_id, tag);
+        let raw_bytes = value_as_raw_bytes(referent);
+        self.register_address_range_with_bytes(base_addr, byte_len, alloc_id, tag, raw_bytes);
     }
 
     /// Register an explicit native virtual address range `[base_addr, base_addr + byte_len)`
-    /// in the shadow provenance table.
+    /// in the shadow provenance table without initial memory bytes.
     pub fn register_address_range(
         &mut self,
         base_addr: usize,
@@ -1210,11 +1215,25 @@ impl TraceRecorder {
         alloc_id: usize,
         tag: usize,
     ) {
+        self.register_address_range_with_bytes(base_addr, byte_len, alloc_id, tag, Vec::new());
+    }
+
+    /// Register an explicit native virtual address range `[base_addr, base_addr + byte_len)`
+    /// with initial referent bytes `raw_bytes` in the shadow provenance table.
+    pub fn register_address_range_with_bytes(
+        &mut self,
+        base_addr: usize,
+        byte_len: usize,
+        alloc_id: usize,
+        tag: usize,
+        raw_bytes: Vec<u8>,
+    ) {
         self.shadow_provenance.push(RecordedShadowAlloc {
             base_addr,
             byte_len,
             alloc_id,
             tag,
+            raw_bytes,
         });
     }
 
@@ -1541,10 +1560,21 @@ pub fn render_shadow_provenance_table_lean(entries: &[RecordedShadowAlloc]) -> S
     let rendered: Vec<String> = entries
         .iter()
         .map(|e| {
-            format!(
-                "{{ baseAddr := {}, byteLen := {}, allocId := {}, tag := {} }}",
-                e.base_addr, e.byte_len, e.alloc_id, e.tag
-            )
+            if e.raw_bytes.is_empty() {
+                format!(
+                    "{{ baseAddr := {}, byteLen := {}, allocId := {}, tag := {} }}",
+                    e.base_addr, e.byte_len, e.alloc_id, e.tag
+                )
+            } else {
+                format!(
+                    "{{ baseAddr := {}, byteLen := {}, allocId := {}, tag := {}, rawBytes := {} }}",
+                    e.base_addr,
+                    e.byte_len,
+                    e.alloc_id,
+                    e.tag,
+                    render_u8_list_lean(&e.raw_bytes)
+                )
+            }
         })
         .collect();
     format!("[{}]", rendered.join(", "))
@@ -1645,7 +1675,7 @@ pub fn render_trace_diag_eval_lean_snippet(
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "set_option maxHeartbeats 2000000 in\n\
+        "set_option maxHeartbeats 400000 in\n\
          theorem {theorem_name} :\n\
          \x20   ({diag_fn} {fuel} {root_body} {callee_sigs_expr} {table_expr} {trace_expr}).tagName = \"{escaped_tag}\" := by\n\
          \x20 rfl\n"
@@ -1754,7 +1784,7 @@ pub fn render_trace_check_lean_module(
     if cfg.check_branches {
         let _ = writeln!(
             out,
-            "set_option maxHeartbeats 2000000 in\n\
+            "set_option maxHeartbeats 400000 in\n\
              theorem trace_consistent :\n\
              \x20   ∃ obsTrace tr out,\n\
              \x20     decodeRawByteTrace {root_body} calleeSigs shadowTable observedRawTrace = some obsTrace ∧\n\
@@ -1769,7 +1799,7 @@ pub fn render_trace_check_lean_module(
     } else {
         let _ = writeln!(
             out,
-            "set_option maxHeartbeats 2000000 in\n\
+            "set_option maxHeartbeats 400000 in\n\
              theorem trace_consistent :\n\
              \x20   ∃ obsTrace tr out,\n\
              \x20     decodeRawByteTrace {root_body} calleeSigs shadowTable observedRawTrace = some obsTrace ∧\n\
@@ -1873,7 +1903,7 @@ pub fn render_batch_trace_eval_lean_module(
             if cfg.check_branches {
                 let _ = writeln!(
                     out,
-                    "set_option maxHeartbeats 2000000 in\n\
+                    "set_option maxHeartbeats 400000 in\n\
                      theorem {sound_thm} :\n\
                      \x20   ∃ obsTrace tr out,\n\
                      \x20     decodeRawByteTrace {root_body} {sigs_ident} {table_ident} {trace_ident} = some obsTrace ∧\n\
@@ -1888,7 +1918,7 @@ pub fn render_batch_trace_eval_lean_module(
             } else {
                 let _ = writeln!(
                     out,
-                    "set_option maxHeartbeats 2000000 in\n\
+                    "set_option maxHeartbeats 400000 in\n\
                      theorem {sound_thm} :\n\
                      \x20   ∃ obsTrace tr out,\n\
                      \x20     decodeRawByteTrace {root_body} {sigs_ident} {table_ident} {trace_ident} = some obsTrace ∧\n\
@@ -2103,7 +2133,20 @@ pub fn encode_recorded_raw_trace_hex(trace: &RecordedRawTrace) -> String {
     let shadow_part = trace
         .shadow_provenance
         .iter()
-        .map(|s| format!("{}:{}:{}:{}", s.base_addr, s.byte_len, s.alloc_id, s.tag))
+        .map(|s| {
+            if s.raw_bytes.is_empty() {
+                format!("{}:{}:{}:{}", s.base_addr, s.byte_len, s.alloc_id, s.tag)
+            } else {
+                format!(
+                    "{}:{}:{}:{}:{}",
+                    s.base_addr,
+                    s.byte_len,
+                    s.alloc_id,
+                    s.tag,
+                    bytes_to_hex(&s.raw_bytes)
+                )
+            }
+        })
         .collect::<Vec<_>>()
         .join(",");
     let events_part = trace
@@ -2156,9 +2199,14 @@ pub fn decode_recorded_raw_trace_hex(line: &str) -> Result<RecordedRawTrace, Str
     if !parts[2].trim().is_empty() {
         for item in parts[2].split(',') {
             let nums: Vec<&str> = item.split(':').collect();
-            if nums.len() != 4 {
+            if nums.len() != 4 && nums.len() != 5 {
                 return Err(format!("invalid shadow provenance entry `{item}`"));
             }
+            let raw_bytes = if nums.len() == 5 {
+                hex_to_bytes(nums[4])?
+            } else {
+                Vec::new()
+            };
             shadow_provenance.push(RecordedShadowAlloc {
                 base_addr: nums[0]
                     .parse::<usize>()
@@ -2172,6 +2220,7 @@ pub fn decode_recorded_raw_trace_hex(line: &str) -> Result<RecordedRawTrace, Str
                 tag: nums[3]
                     .parse::<usize>()
                     .map_err(|e| format!("invalid tag `{}`: {e}", nums[3]))?,
+                raw_bytes,
             });
         }
     }
@@ -2489,6 +2538,7 @@ mod tests {
                 byte_len: 4,
                 alloc_id: 7,
                 tag: 7,
+                raw_bytes: Vec::new(),
             }],
             events: vec![RecordedEvent::ExtCall {
                 def_path: "trace_pkg::ext_scale_add".to_string(),
