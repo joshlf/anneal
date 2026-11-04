@@ -91,15 +91,26 @@ open MiniRustSpec.Correspondence in
   evalStatement_assign
   evalStatement_assign_array
   evalStatement_assign_index
+  evalStatement_assign_tuple
+  evalStatement_assign_field_scalar
   evalStatement_placeMention
   evalValue_operand
+  evalValue_specOperand
   evalValue_rvalue
   evalValue_arrayRvalue
+  evalValue_tupleRvalue
   evalPlace_proj
+  evalPlace_fieldPath
+  evalPlace_tuplePlace
   typedLoad_array_local
   typedLoad_array_elem
+  typedLoad_tuple_slice
   typedStore_array_local
   typedStore_array_elem
+  typedStore_tuple_slice
+  decode_tupleSpec
+  encode_tupleSpec
+  checkValue_tupleSpec
   evalIntBinOp_spec
   evalIntBinOp_divExact
   evalUnOp_countOnes
@@ -108,12 +119,17 @@ open MiniRustSpec.Correspondence in
   evalStmt_assign
   evalStmt_assign_array
   evalStmt_assign_index
+  evalStmt_assign_tuple
+  evalStmt_assign_field_scalar
   evalStmt_placeMention
   evalOperand_frag
   evalRvalue_frag
   evalRvalue_array_frag
+  evalRvalue_tuple_frag
   readProjectedValue_proj
   writeProjectedValue_proj
+  resolveFieldPath_read
+  resolveFieldPath_write
   evalScalarBinOp_frag
   signedOverflowAdd_eq
   signedOverflowSub_eq
@@ -375,6 +391,32 @@ open MiniRustSpec.Correspondence.Witness in
   arrayComposeSwitchOobUb_anneal_ub
   arrayComposeSwitchOobUb_minirust_ub_from_start
   arrayComposeSwitchOobUb_minirust_direct
+  ctxPadded3_ok
+  paddedStructOps_inFragment
+  paddedStructOps_translate
+  paddedStructOk_anneal_ret
+  paddedStructOk_noUB
+  paddedStructOk_minirust_ret_from_start
+  paddedStructOk_minirust_direct
+  paddedStructOk_minirust_padding_bytes
+  ctxNested5_ok
+  nestedTupleOps_inFragment
+  nestedTupleOps_translate
+  nestedTupleOk_anneal_ret
+  nestedTupleOk_noUB
+  nestedTupleOk_minirust_ret_from_start
+  nestedTupleOk_minirust_direct
+  nestedTupleOk_minirust_padding_bytes
+  nestedTupleAggUb_anneal_ub
+  nestedTupleAggUb_minirust_ub_from_start
+  nestedTupleAggUb_minirust_direct
+  nestedTupleFieldRhsUb_anneal_ub
+  nestedTupleFieldRhsUb_minirust_ub_from_start
+  nestedTupleFieldRhsUb_minirust_direct
+  nestedTupleCopyUninitUb_anneal_ub
+  nestedTupleCopyUninitUb_minirust_ub_from_start
+  nestedTupleCopyUninitUb_minirust_direct
+  tuple_encode_decode_place_edge_cases
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -460,6 +502,22 @@ open MiniRustSpec.Correspondence in
   evalRvalue_array_frag
   readProjectedValue_proj
   writeProjectedValue_proj
+  evalPlace_fieldPath
+  evalPlace_tuplePlace
+  typedLoad_tuple_slice
+  typedStore_tuple_slice
+  decode_tupleSpec
+  encode_tupleSpec
+  checkValue_tupleSpec
+  evalValue_specOperand
+  evalValue_tupleRvalue
+  evalStatement_assign_tuple
+  evalStatement_assign_field_scalar
+  evalStmt_assign_tuple
+  evalStmt_assign_field_scalar
+  evalRvalue_tuple_frag
+  resolveFieldPath_read
+  resolveFieldPath_write
 
 open MiniRustSpec.Correspondence.Witness in
 #audit_group "WITNESS-AUDIT"
@@ -538,5 +596,29 @@ open MiniRustSpec.Correspondence.Witness in
   arrayComposeSwitchOobUb_anneal_ub
   arrayComposeSwitchOobUb_minirust_ub_from_start
   arrayComposeSwitchOobUb_minirust_direct
+  paddedStructOps_inFragment
+  paddedStructOps_translate
+  paddedStructOk_anneal_ret
+  paddedStructOk_noUB
+  paddedStructOk_minirust_ret_from_start
+  paddedStructOk_minirust_direct
+  paddedStructOk_minirust_padding_bytes
+  nestedTupleOps_inFragment
+  nestedTupleOps_translate
+  nestedTupleOk_anneal_ret
+  nestedTupleOk_noUB
+  nestedTupleOk_minirust_ret_from_start
+  nestedTupleOk_minirust_direct
+  nestedTupleOk_minirust_padding_bytes
+  nestedTupleAggUb_anneal_ub
+  nestedTupleAggUb_minirust_ub_from_start
+  nestedTupleAggUb_minirust_direct
+  nestedTupleFieldRhsUb_anneal_ub
+  nestedTupleFieldRhsUb_minirust_ub_from_start
+  nestedTupleFieldRhsUb_minirust_direct
+  nestedTupleCopyUninitUb_anneal_ub
+  nestedTupleCopyUninitUb_minirust_ub_from_start
+  nestedTupleCopyUninitUb_minirust_direct
+  tuple_encode_decode_place_edge_cases
 
 end MiniRustSpec.Audit

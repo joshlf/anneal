@@ -573,7 +573,7 @@ theorem mirCall_ret {body : CapturedMir} {f : Gen.Function} (hfrag : inFragment 
         { calleeFrame f ctx body.localDecls.length 0 0 with next_block := f.start }]])
     (hactive : mInit.active_thread = 0)
     (hallocs : mInit.mem.memory.allocations =
-      ctx.base ++ localAllocs ctx body.localDecls (initMachineState body args).frame.locals)
+      ctx.base ++ localAllocs body.layouts ctx body.localDecls (initMachineState body args).frame.locals)
     {tr : List (Event MirEffect)} {v : Value} {mem : MirSemantics.Memory}
     (hret : ReachesRet (mirCallTree body args) tr (.normal (v, mem))) :
     ∃ (n : Nat) (s' : MachineState) (m' : Mach),
@@ -591,7 +591,7 @@ theorem mirCall_ub {body : CapturedMir} {f : Gen.Function} (hfrag : inFragment b
         { calleeFrame f ctx body.localDecls.length 0 0 with next_block := f.start }]])
     (hactive : mInit.active_thread = 0)
     (hallocs : mInit.mem.memory.allocations =
-      ctx.base ++ localAllocs ctx body.localDecls (initMachineState body args).frame.locals)
+      ctx.base ++ localAllocs body.layouts ctx body.localDecls (initMachineState body args).frame.locals)
     {tr : List (Event MirEffect)} {u : ITree MirEffect MirOutcome}
     (hreach : Reaches (mirCallTree body args) tr u) (hfault : FaultNow u) :
     ∃ (n : Nat) (msg : String), Interp.steps n mInit = .error (.ub msg) :=
@@ -609,7 +609,7 @@ theorem mirCall_noUB {body : CapturedMir} {f : Gen.Function} (hfrag : inFragment
         { calleeFrame f ctx body.localDecls.length 0 0 with next_block := f.start }]])
     (hactive : mInit.active_thread = 0)
     (hallocs : mInit.mem.memory.allocations =
-      ctx.base ++ localAllocs ctx body.localDecls (initMachineState body args).frame.locals)
+      ctx.base ++ localAllocs body.layouts ctx body.localDecls (initMachineState body args).frame.locals)
     (hsafe : MirNoUBTree (mirCallTree body args))
     {n : Nat} {e : Stop} (herr : Interp.steps n mInit = .error e) :
     ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k mInit = .ok mRet ∧
@@ -629,7 +629,7 @@ theorem mirCall_progress {body : CapturedMir} {f : Gen.Function} (hfrag : inFrag
         { calleeFrame f ctx body.localDecls.length 0 0 with next_block := f.start }]])
     (hactive : mInit.active_thread = 0)
     (hallocs : mInit.mem.memory.allocations =
-      ctx.base ++ localAllocs ctx body.localDecls (initMachineState body args).frame.locals)
+      ctx.base ++ localAllocs body.layouts ctx body.localDecls (initMachineState body args).frame.locals)
     (hsafe : MirNoUBTree (mirCallTree body args)) (n : Nat) :
     (∃ s' m' tr, Interp.steps (n + 1) mInit = .ok m' ∧ StateRel body f ctx s' m' ∧
       Reaches (mirCallTree body args) tr (mirTree body s')) ∨
@@ -650,7 +650,7 @@ theorem mirCall_diverges_steps_ok {body : CapturedMir} {f : Gen.Function}
         { calleeFrame f ctx body.localDecls.length 0 0 with next_block := f.start }]])
     (hactive : mInit.active_thread = 0)
     (hallocs : mInit.mem.memory.allocations =
-      ctx.base ++ localAllocs ctx body.localDecls (initMachineState body args).frame.locals)
+      ctx.base ++ localAllocs body.layouts ctx body.localDecls (initMachineState body args).frame.locals)
     (hsafe : MirNoUBTree (mirCallTree body args))
     (hdiv : ∀ tr o, ¬ ReachesRet (mirCallTree body args) tr o) (n : Nat) :
     ∃ m', Interp.steps n mInit = .ok m' :=
@@ -671,7 +671,7 @@ theorem mirCall_steps_error {body : CapturedMir} {f : Gen.Function}
         { calleeFrame f ctx body.localDecls.length 0 0 with next_block := f.start }]])
     (hactive : mInit.active_thread = 0)
     (hallocs : mInit.mem.memory.allocations =
-      ctx.base ++ localAllocs ctx body.localDecls (initMachineState body args).frame.locals)
+      ctx.base ++ localAllocs body.layouts ctx body.localDecls (initMachineState body args).frame.locals)
     {n : Nat} {e : Stop} (herr : Interp.steps n mInit = .error e) :
     (∃ msg, e = .ub msg ∧ ∃ tr u, Reaches (mirCallTree body args) tr u ∧ FaultNow u) ∨
     (∃ k s' mRet tr v mem, k < n ∧ Interp.steps k mInit = .ok mRet ∧
@@ -693,7 +693,7 @@ theorem mirCall_outcome {body : CapturedMir} {f : Gen.Function}
         { calleeFrame f ctx body.localDecls.length 0 0 with next_block := f.start }]])
     (hactive : mInit.active_thread = 0)
     (hallocs : mInit.mem.memory.allocations =
-      ctx.base ++ localAllocs ctx body.localDecls (initMachineState body args).frame.locals)
+      ctx.base ++ localAllocs body.layouts ctx body.localDecls (initMachineState body args).frame.locals)
     (n : Nat) :
     (∃ s' m' tr, Interp.steps (n + 1) mInit = .ok m' ∧ StateRel body f ctx s' m' ∧
       Reaches (mirCallTree body args) tr (mirTree body s')) ∨
@@ -716,7 +716,7 @@ theorem mirCall_diverges_rel {body : CapturedMir} {f : Gen.Function}
         { calleeFrame f ctx body.localDecls.length 0 0 with next_block := f.start }]])
     (hactive : mInit.active_thread = 0)
     (hallocs : mInit.mem.memory.allocations =
-      ctx.base ++ localAllocs ctx body.localDecls (initMachineState body args).frame.locals)
+      ctx.base ++ localAllocs body.layouts ctx body.localDecls (initMachineState body args).frame.locals)
     (hsafe : MirNoUBTree (mirCallTree body args))
     (hdiv : ∀ tr o, ¬ ReachesRet (mirCallTree body args) tr o) (n : Nat) :
     ∃ s' m' tr, Interp.steps (n + 1) mInit = .ok m' ∧ StateRel body f ctx s' m' ∧
