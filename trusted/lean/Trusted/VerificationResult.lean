@@ -687,14 +687,19 @@ def valueValidForRigidTy :
   | _ + 1, _, _, .fnDef _ _, v => Or (v = .unit) (v = .aggregate 0 .nil)
   | _ + 1, _, _, .closure _ _, v =>
     Or (v = .unit) (∃ vIdx fields, v = .aggregate vIdx fields)
-  | _ + 1, layouts, .some layoutIdx, .adt _ _, _ =>
-    match Trusted.Sequence.get? layouts.entries layoutIdx with
-    | .some layout =>
-      match layout.isUninhabited with
-      | true => False
-      | false => True
-    | .none => True
-  | _ + 1, _, .none, .adt _ _, _ => True
+  | _ + 1, layouts, optLayoutIdx, .adt defPath _, _ =>
+    match stringEq defPath "core::convert::Infallible" with
+    | true => False
+    | false =>
+      match optLayoutIdx with
+      | .some layoutIdx =>
+        match Trusted.Sequence.get? layouts.entries layoutIdx with
+        | .some layout =>
+          match layout.isUninhabited with
+          | true => False
+          | false => True
+        | .none => True
+      | .none => True
   | _ + 1, _, _, .param _ _, _ => True
   | _ + 1, _, _, .alias _ _, _ => True
   | _ + 1, _, _, .slice _, _ => True

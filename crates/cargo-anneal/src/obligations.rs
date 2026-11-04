@@ -453,7 +453,7 @@ fn render_companion_predicate(
 
 /// Lean identifier of the `externalSpecCallContract` definition emitted for
 /// `ext` in an `Obligations.<Item>` module.
-fn external_call_contract_ident(ext: &ExternalSpecContractRef) -> String {
+pub(crate) fn external_call_contract_ident(ext: &ExternalSpecContractRef) -> String {
     format!(
         "externalCallContract_{}",
         sanitize_lean_ident(&ext.sidecar_module_suffix)

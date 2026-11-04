@@ -1921,6 +1921,24 @@ def rigidTyMatchesCalleeDecl (typeArgs : List RigidTy) : Nat → RigidTy → Rig
       (Bool.and
         (rigidTyMatchesCalleeDecl typeArgs fuel a1 a2)
         (rigidTyMatchesCalleeDecl typeArgs fuel (.tuple as1) (.tuple as2)))
+  | .succ fuel, .fnDef p1 (a1 :: as1), .fnDef p2 (a2 :: as2) =>
+    Bool.and
+      (stringEq p1 p2)
+      (Bool.and
+        (rigidTyMatchesCalleeDecl typeArgs fuel a1 a2)
+        (rigidTyMatchesCalleeDecl typeArgs fuel (.tuple as1) (.tuple as2)))
+  | .succ fuel, .closure p1 (a1 :: as1), .closure p2 (a2 :: as2) =>
+    Bool.and
+      (stringEq p1 p2)
+      (Bool.and
+        (rigidTyMatchesCalleeDecl typeArgs fuel a1 a2)
+        (rigidTyMatchesCalleeDecl typeArgs fuel (.tuple as1) (.tuple as2)))
+  | .succ fuel, .alias p1 (a1 :: as1), .alias p2 (a2 :: as2) =>
+    Bool.and
+      (stringEq p1 p2)
+      (Bool.and
+        (rigidTyMatchesCalleeDecl typeArgs fuel a1 a2)
+        (rigidTyMatchesCalleeDecl typeArgs fuel (.tuple as1) (.tuple as2)))
   | .succ fuel, .fnPtr in1 out1 s1 abi1, .fnPtr in2 out2 s2 abi2 =>
     Bool.and
       (safetyEq s1 s2)
@@ -2581,7 +2599,7 @@ def evalRvalue
               }
               .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
         | .none => .ub
-      | .some (.init (.aggregate 0 (.ptr parentPtr sz :: .scalar metaSc :: .nil))) =>
+      | .some (.init (.aggregate 0 (.ptr parentPtr sz :: metaVal :: .nil))) =>
         match restProj with
         | .nil =>
           match lookupBorrow mem.borrows parentPtr.tag with
@@ -2607,13 +2625,18 @@ def evalRvalue
               .ok
                 (.aggregate 0
                   (.ptr { allocId := tag, offsetBytes := parentPtr.offsetBytes } sz ::
-                    .scalar metaSc :: .nil))
+                    metaVal :: .nil))
                 locals
                 mem'
           | .none =>
             match borrowKind, lookupGlobalAlloc mem.globals parentPtr.allocId with
             | .shared, .some _ =>
-              .ok (.aggregate 0 (.ptr parentPtr sz :: .scalar metaSc :: .nil)) locals mem
+              .ok (.aggregate 0 (.ptr parentPtr sz :: metaVal :: .nil)) locals mem
+            | .mut _, .some alloc =>
+              match alloc.mutability with
+              | .mut =>
+                .ok (.aggregate 0 (.ptr parentPtr sz :: metaVal :: .nil)) locals mem
+              | .not => .ub
             | _, _ => .ub
         | _ :: _ => .ub
       | _ => .ub
@@ -2674,7 +2697,7 @@ def evalRvalue
               }
               .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
         | .none => .ub
-      | .some (.init (.aggregate 0 (.ptr parentPtr sz :: .scalar metaSc :: .nil))) =>
+      | .some (.init (.aggregate 0 (.ptr parentPtr sz :: metaVal :: .nil))) =>
         match restProj with
         | .nil =>
           match lookupBorrow mem.borrows parentPtr.tag with
@@ -2700,13 +2723,18 @@ def evalRvalue
               .ok
                 (.aggregate 0
                   (.ptr { allocId := tag, offsetBytes := parentPtr.offsetBytes } sz ::
-                    .scalar metaSc :: .nil))
+                    metaVal :: .nil))
                 locals
                 mem'
           | .none =>
             match mutability, lookupGlobalAlloc mem.globals parentPtr.allocId with
             | .not, .some _ =>
-              .ok (.aggregate 0 (.ptr parentPtr sz :: .scalar metaSc :: .nil)) locals mem
+              .ok (.aggregate 0 (.ptr parentPtr sz :: metaVal :: .nil)) locals mem
+            | .mut, .some alloc =>
+              match alloc.mutability with
+              | .mut =>
+                .ok (.aggregate 0 (.ptr parentPtr sz :: metaVal :: .nil)) locals mem
+              | .not => .ub
             | _, _ => .ub
         | _ :: _ => .ub
       | _ => .ub

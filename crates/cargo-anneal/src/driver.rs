@@ -1936,6 +1936,50 @@ pub fn caller_ffi_and_len(s: &[u8]) -> u32 {
             "snippet must reconstruct parameter and return types from captured Mir:\n{snippet}"
         );
 
+        let slice_len_u8_snippet = crate::generate_external_spec_snippet(
+            &crate_a_dir,
+            Some(&cfg.units_dir),
+            "<[u8]>::len",
+        )
+        .expect("generate external spec snippet for <[u8]>::len");
+        assert!(
+            slice_len_u8_snippet.contains("(&[u8]) -> usize;")
+                || slice_len_u8_snippet.contains(": &[u8]) -> usize;"),
+            "snippet for <[u8]>::len must substitute concrete u8 element type even when polymorphic Mir/Core/slice_impl_T_len.lean is on disk:\n{slice_len_u8_snippet}"
+        );
+
+        let generic_slice_len_snippet = crate::generate_external_spec_snippet(
+            &crate_a_dir,
+            Some(&cfg.units_dir),
+            "crate_b::slice_len",
+        )
+        .expect("generate external spec snippet for generic crate_b::slice_len");
+        assert!(
+            generic_slice_len_snippet
+                .contains("unsafe fn external_spec_slice_len<T>(s: &[T]) -> usize;"),
+            "snippet for generic crate_b::slice_len must include <T> generic parameter:\n{generic_slice_len_snippet}"
+        );
+
+        // 3b. Verify `render_agent_context` classifies subjects with `#[external_spec]`
+        // callees as `modular` and emits a `ModularVerificationResult` starter template
+        // even before `Specs/` or `Proof/` files exist on disk.
+        let ctx_report = crate::agent::render_agent_context(
+            &crate_a_dir,
+            &records,
+            Some("caller_with_external_specs"),
+        )
+        .expect("render agent context for caller_with_external_specs");
+        assert!(
+            ctx_report.contains("- **`is_stateful`**: modular (`ModularItemSpec` / `ModularVerificationResult`)"),
+            "agent-context must classify subject with #[external_spec] callees as modular:\n{ctx_report}"
+        );
+        assert!(
+            ctx_report.contains(
+                "theorem verified : ModularVerificationResult Obligations.CrateA.caller_with_external_specs.modularClaim"
+            ),
+            "agent-context starter template must target ModularVerificationResult:\n{ctx_report}"
+        );
+
         // 4. Compile all generated `Mir` and `Obligations` modules in the Lean 4 kernel (`lean`),
         // and prove in the Lean 4 kernel that `defaultCallees` steps directly into linked callees while
         // `externalSpecCallContract` enforces non-vacuous return-type and layout validity!
@@ -2265,6 +2309,63 @@ example :
       (.fnPtr [.param 0 "T"] (.param 1 "U") .safe .rust) = false :=
   ⟨rfl, rfl⟩
 
+-- 7b. Nested `core::convert::Infallible` inside a `.tuple` is rejected even when
+--     `optLayoutIdx = .none` or `layouts.entries` is empty, mutable global wide
+--     reborrows (`alloc.mutability = .mut`) and vtable `.ptr` metadata succeed,
+--     and `rigidTyMatchesCalleeDecl` recurses into `.fnDef`, `.closure`, and `.alias`.
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (v : Value) :
+    ¬ valueValidForTy L
+      { kind := .tuple [.uint .u32, .adt "core::convert::Infallible" []], layoutIdx := 0 }
+      (.aggregate 0 [.scalar ⟨1, 4⟩, v]) := by
+  rintro (⟨h_unit, _⟩ | ⟨fields, h_agg, _, h_elems⟩)
+  · cases h_unit
+  · cases h_agg
+    exact h_elems.2.1
+
+example :
+    evalRvalue
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])]
+      (.ref (.mut false) { local_ := 0, projection := [.deref] })
+      { emptyMemory with
+        globals := [{ allocId := 7, bytes := [], relocations := [], align := ⟨1⟩, mutability := .mut }] } =
+    .ok
+      (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])]
+      { emptyMemory with
+        globals := [{ allocId := 7, bytes := [], relocations := [], align := ⟨1⟩, mutability := .mut }] } :=
+  rfl
+
+example (vtablePtr : ProvenancePtr) :
+    evalRvalue
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .ptr vtablePtr 8])]
+      (.ref .shared { local_ := 0, projection := [.deref] })
+      { emptyMemory with
+        globals := [{ allocId := 7, bytes := [], relocations := [], align := ⟨1⟩, mutability := .not }] } =
+    .ok
+      (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .ptr vtablePtr 8])
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .ptr vtablePtr 8])]
+      { emptyMemory with
+        globals := [{ allocId := 7, bytes := [], relocations := [], align := ⟨1⟩, mutability := .not }] } :=
+  rfl
+
+example :
+    rigidTyMatchesCalleeDecl
+      [.uint .u32]
+      8
+      (.fnDef "f" [.uint .u32])
+      (.fnDef "f" [.param 0 "T"]) = true ∧
+    rigidTyMatchesCalleeDecl
+      [.uint .u32]
+      8
+      (.closure "c" [.uint .u64])
+      (.closure "c" [.param 0 "T"]) = false ∧
+    rigidTyMatchesCalleeDecl
+      [.uint .u32]
+      8
+      (.alias "Assoc" [.uint .u32])
+      (.alias "Assoc" [.param 0 "T"]) = true :=
+  ⟨rfl, rfl, rfl⟩
+
 -- 8. The FFI target has no captured body, so a call to it is a `MirCallE`
 --    interaction bound only by its external call contract, whose postcondition
 --    types the `u32` result and forbids `.panicked` for `extern "C"` (nounwind)
@@ -2483,6 +2584,16 @@ end Proof.CrateA.caller_ffi_and_len
 
         crate::scaffold::refresh_workspace_assembly(&crate_a_dir)
             .expect("refresh workspace assembly after authoring caller_ffi_and_len");
+        let verify_ffi_text = fs::read_to_string(
+            gen_dir.join("Verify/CrateA/caller_ffi_and_len.lean"),
+        )
+        .expect("read refreshed Verify/CrateA/caller_ffi_and_len.lean");
+        assert!(
+            verify_ffi_text.contains(
+                "theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_len.modularClaim"
+            ),
+            "refresh_workspace_assembly must preserve modular verification target in Verify/CrateA/caller_ffi_and_len.lean:\n{verify_ffi_text}"
+        );
         compile_lean_file(&caller_ffi_specs_path);
         compile_lean_file(&gen_dir.join("Obligations/CrateA/caller_ffi_and_len.lean"));
         compile_lean_file(&caller_ffi_proof_path);

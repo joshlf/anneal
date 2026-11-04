@@ -185,7 +185,9 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
 
     let has_specs = spec_path.is_file();
     let spec_text = if has_specs {
-        fs::read_to_string(&spec_path).ok()
+        fs::read_to_string(&spec_path)
+            .ok()
+            .map(|raw| crate::agent::strip_lean_comments(&raw))
     } else {
         None
     };
@@ -195,7 +197,9 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
 
     let has_proof = proof_path.is_file();
     let proof_text = if has_proof {
-        fs::read_to_string(&proof_path).ok()
+        fs::read_to_string(&proof_path)
+            .ok()
+            .map(|raw| crate::agent::strip_lean_comments(&raw))
     } else {
         None
     };
@@ -211,6 +215,7 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
         && (spec_is_ub_exception
             || proof_text.as_deref().is_some_and(|text| {
                 text.contains("UbExceptionVerificationResult")
+                    || text.contains("UbExceptionItemProof")
                     || (text.contains("ubExceptionClaim")
                         && !text.contains("ModularVerificationResult"))
             }));
@@ -218,7 +223,9 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
     let is_modular = !is_ub_exception
         && (spec_is_modular
             || proof_text.as_deref().is_some_and(|text| {
-                text.contains("modularClaim") || text.contains("ModularVerificationResult")
+                text.contains("modularClaim")
+                    || text.contains("ModularVerificationResult")
+                    || text.contains("ModularItemProof")
             }));
 
     let is_equiv = !is_ub_exception
@@ -226,7 +233,9 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
         && (spec_text.as_deref().is_some_and(|text| {
             text.contains("StatefulEquivItemSpec") || text.contains("refineEquivSpec")
         }) || proof_text.as_deref().is_some_and(|text| {
-            text.contains("equivClaim") || text.contains("StatefulEquivVerificationResult")
+            text.contains("equivClaim")
+                || text.contains("StatefulEquivVerificationResult")
+                || text.contains("StatefulEquivItemProof")
         }));
 
     let is_total = !is_ub_exception
@@ -235,7 +244,9 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
         && (spec_text.as_deref().is_some_and(|text| {
             text.contains("TotalItemSpec") || text.contains("refineTotalSpec")
         }) || proof_text.as_deref().is_some_and(|text| {
-            text.contains("totalClaim") || text.contains("TotalVerificationResult")
+            text.contains("totalClaim")
+                || text.contains("TotalVerificationResult")
+                || text.contains("TotalItemProof")
         }));
 
     let spec_is_stateful = spec_text.as_deref().is_some_and(|text| {
@@ -244,7 +255,9 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
             || text.contains("refineSafeStatefulSpec")
     });
     let proof_is_stateful = proof_text.as_deref().is_some_and(|text| {
-        text.contains("statefulClaim") || text.contains("StatefulVerificationResult")
+        text.contains("statefulClaim")
+            || text.contains("StatefulVerificationResult")
+            || text.contains("StatefulItemProof")
     });
 
     AuthoredItemModules {
@@ -417,7 +430,7 @@ impl CalleeGraph<'_> {
 /// The subject body's closure becomes `defaultCallees`; the closure of its
 /// `requires` / `ensures` companions (including those of reachable
 /// `#[external_spec]` contracts) becomes `defaultSpecCallees`.
-fn populate_called_callees(
+pub(crate) fn populate_called_callees(
     mir_root: &Path,
     records: &[UnitTargetRecord],
     bundles: &mut [SubjectObligationBundle],
@@ -450,7 +463,11 @@ fn populate_called_callees(
 
     let mut callable_by_def_id: BTreeMap<String, (String, PathBuf)> = BTreeMap::new();
     let mut trait_impls_by_method: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut record_by_rel_path: BTreeMap<PathBuf, &UnitTargetRecord> = BTreeMap::new();
     for record in records {
+        let rec_suffix = derive_item_module_suffix(record);
+        let rec_rel_path = module_suffix_to_rel_path(&rec_suffix);
+        record_by_rel_path.insert(rec_rel_path.clone(), record);
         for entry in &record.trait_impls {
             if !entry.trait_method_def_path.is_empty() && !entry.impl_path.is_empty() {
                 trait_impls_by_method
@@ -477,9 +494,7 @@ fn populate_called_callees(
         {
             continue;
         }
-        let suffix = derive_item_module_suffix(record);
-        let rel_path = module_suffix_to_rel_path(&suffix);
-        callable_by_def_id.insert(record.target.def_id.clone(), (suffix, rel_path));
+        callable_by_def_id.insert(record.target.def_id.clone(), (rec_suffix, rec_rel_path));
     }
 
     let graph = CalleeGraph {
@@ -489,13 +504,29 @@ fn populate_called_callees(
         trusted_callees: &trusted_callees_by_def_id,
     };
 
+    let fallback_cfg = mir_root
+        .parent()
+        .and_then(|g| g.parent())
+        .and_then(|d| d.parent())
+        .map(ScaffoldConfig::new);
+
     let mut outgoing_cache: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
     let mut read_outgoing = |rel_path: &Path| -> Vec<String> {
         if let Some(cached) = outgoing_cache.get(rel_path) {
             return cached.clone();
         }
         let mir_path = mir_root.join(rel_path);
-        let refs = fs::read_to_string(&mir_path)
+        let resolved_path = if mir_path.is_file() {
+            Some(mir_path)
+        } else if let Some(ref cfg) = fallback_cfg
+            && let Some(rec) = record_by_rel_path.get(rel_path)
+        {
+            find_source_mir_file(cfg, rec, rel_path)
+        } else {
+            None
+        };
+        let refs = resolved_path
+            .and_then(|p| fs::read_to_string(p).ok())
             .map(|txt| extract_called_fn_defs(&txt))
             .unwrap_or_default();
         outgoing_cache.insert(rel_path.to_path_buf(), refs.clone());
@@ -918,7 +949,7 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
             .ok()
             .map(|b| sha256_hex(&b))
             .unwrap_or_default();
-        let synthetic_bundle = SubjectObligationBundle {
+        let mut synthetic_bundle = SubjectObligationBundle {
             subject: UnitTargetRecord {
                 target: CapturedTarget {
                     def_id: def_id.clone(),
@@ -942,6 +973,9 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
             spec_callees: Vec::new(),
             spec_companions_with_calls: BTreeSet::new(),
         };
+        if let Some(ref ob_text) = ob_text_opt {
+            rehydrate_bundle_from_obligations_text(&mut synthetic_bundle, ob_text);
+        }
 
         let should_rerender_verify = authored.has_proof
             || authored.has_specs
@@ -1026,6 +1060,78 @@ fn extract_def_id_comment(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Reconstruct companion and external-spec metadata on `bundle` from an
+/// existing `.anneal/generated/Obligations/<Item>.lean` file so
+/// `refresh_workspace_assembly` preserves inline companions and
+/// `#[external_spec]` contracts when re-rendering `Verify/<Item>.lean`.
+fn rehydrate_bundle_from_obligations_text(bundle: &mut SubjectObligationBundle, ob_text: &str) {
+    let parse_linked_item = |line: &str, prefix: &str| -> Option<(String, String)> {
+        let rest = line.strip_prefix(prefix)?;
+        let (def_id, after) = rest.split_once("` (`")?;
+        let (lean_mod, _) = after.split_once("`)")?;
+        Some((def_id.to_string(), lean_mod.to_string()))
+    };
+    let subject_def_id = bundle.subject.target.def_id.clone();
+    let lines: Vec<&str> = ob_text.lines().collect();
+    for (idx, &line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if let Some((def_id, lean_mod)) = parse_linked_item(trimmed, "- Inline requires: `") {
+            bundle.inline_requires.push(UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id,
+                    mir_module_path: String::new(),
+                    mir_module_sha256: String::new(),
+                },
+                lean_module_name: lean_mod,
+                item_kind: CapturedItemKind::InlineSpecRequires,
+                associated_subject_def_id: Some(subject_def_id.clone()),
+                trait_impls: Vec::new(),
+            });
+        } else if let Some((def_id, lean_mod)) = parse_linked_item(trimmed, "- Inline ensures: `") {
+            bundle.inline_ensures.push(UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id,
+                    mir_module_path: String::new(),
+                    mir_module_sha256: String::new(),
+                },
+                lean_module_name: lean_mod,
+                item_kind: CapturedItemKind::InlineSpecEnsures,
+                associated_subject_def_id: Some(subject_def_id.clone()),
+                trait_impls: Vec::new(),
+            });
+        } else if let Some((def_id, lean_mod)) = parse_linked_item(trimmed, "- External spec: `") {
+            bundle.external_specs.push(UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id,
+                    mir_module_path: String::new(),
+                    mir_module_sha256: String::new(),
+                },
+                lean_module_name: lean_mod,
+                item_kind: CapturedItemKind::ExternalSpec,
+                associated_subject_def_id: Some(subject_def_id.clone()),
+                trait_impls: Vec::new(),
+            });
+        } else if trimmed == "externalSpecCallContract"
+            && let Some(target_line) = lines.get(idx + 1)
+            && let Some(sidecar_line) = lines.get(idx + 2)
+        {
+            let target_def_id = target_line.trim().trim_matches('"').to_string();
+            let sidecar_trimmed = sidecar_line.trim();
+            if let Some(sidecar_suffix) = sidecar_trimmed
+                .strip_prefix("Mir.")
+                .and_then(|s| s.strip_suffix(".body"))
+            {
+                bundle.external_spec_callees.push(ExternalSpecContractRef {
+                    target_def_id,
+                    sidecar_module_suffix: sidecar_suffix.to_string(),
+                    req_module_suffix: None,
+                    ens_module_suffix: None,
+                });
+            }
+        }
+    }
 }
 
 fn update_obligations_legacy_spec_bridge(
@@ -1501,6 +1607,12 @@ mod tests {
             scaffold_init_proof_templates(&cfg, &initial_records).expect("init proof templates");
         assert_eq!(init_report.created_proof_files, vec![proof_path.clone()]);
         assert_eq!(init_report.preserved_spec_files, vec![spec_path.clone()]);
+        let init_proof_text =
+            fs::read_to_string(&proof_path).expect("read initial proof template");
+        assert!(
+            init_proof_text.contains("theorem verified : VerificationResult Obligations.MyCrate.compute.claim"),
+            "stateless spec template doc comments must not cause init-proofs to emit StatefulVerificationResult:\n{init_proof_text}"
+        );
 
         // Simulate user edits to Specs/<Item>.lean and Proof/<Item>.lean, plus
         // stale edits in Obligations/<Item>.lean.
