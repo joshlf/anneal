@@ -79,7 +79,6 @@ Reference (The Rust Reference, "Function item types"):
 > or enum variant, yields a zero-sized value of its function item type. That
 > type uniquely identifies the function"
 -/
-@[reducible]
 def extractCalleeTypeArgs : Operand → List RigidTy
   | .constant c =>
     match c.ty.kind with
@@ -98,7 +97,6 @@ Reference (The Rust Reference, "Function item types"):
 > or enum variant, yields a zero-sized value of its function item type. That
 > type uniquely identifies the function"
 -/
-@[reducible]
 def extractCallee? (op : Operand) : Option (DefPath × List RigidTy) :=
   match extractCalleeDefPath? op with
   | .some defPath => .some (defPath, extractCalleeTypeArgs op)
@@ -142,14 +140,38 @@ inductive CallTargetResult : Type where
   | unsupported : CallTargetResult
 
 /--
+Test whether a function pointer's reified `Safety` (`sigSafety`) is compatible
+with the call site's declared function-pointer `Safety` (`callerSafety`).
+
+Because a safe function pointer (`Safety.safe`) coerces to an `unsafe` function
+pointer (`Safety.unsafe_`) via `PointerCoercion::UnsafeFnPointer`, `.safe` is
+compatible with both `.safe` and `.unsafe_`; an `.unsafe_` function pointer is
+compatible only with an `.unsafe_` call-site signature.
+
+Reference (The Rust Reference, "Type coercions"):
+<https://doc.rust-lang.org/1.98.0/reference/type-coercions.html#coercion-types>
+
+> "* Safe function pointer types to `unsafe` function pointer types"
+-/
+@[reducible]
+def safetyCompatible : Safety → Safety → Bool
+  | .safe, _ => true
+  | .unsafe_, .unsafe_ => true
+  | .unsafe_, .safe => false
+
+/--
 Test whether a reified `FnPtrEntry` signature is compatible with a call site's
-argument count `argCount` and optional declared `func` operand type `callerFuncTyOpt`.
+argument count `argCount` and optional declared `func` operand type
+`callerFuncTyOpt`.
 
 Checks that:
-1. If `fnEntry.fnSig` is `.some (.fnPtr sigInputs _ _ _)`, `length sigInputs == argCount`.
-2. If `callerFuncTyOpt` is `.some { kind := .fnPtr callerInputs callerOutput _ callerAbi, .. }`,
-   `length callerInputs == argCount` and (when `fnEntry.fnSig` is present)
-   `callerInputs`, `callerOutput`, and `callerAbi` match `fnEntry.fnSig`.
+1. If `fnEntry.fnSig` is `.some (.fnPtr sigInputs _ _ sigAbi)`,
+   `sigAbi != .rustIntrinsic` and `length sigInputs == argCount`.
+2. If `callerFuncTyOpt` is
+   `.some { kind := .fnPtr callerInputs callerOutput callerSafety callerAbi, .. }`,
+   `callerAbi != .rustIntrinsic`, `length callerInputs == argCount`, and (when
+   `fnEntry.fnSig` is present) `callerInputs`, `callerOutput`, `callerAbi`, and
+   `safetyCompatible sigSafety callerSafety` match `fnEntry.fnSig`.
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -165,25 +187,32 @@ def fnEntryCompatibleWithCallSite
   let entryArityOk :=
     match fnEntry.fnSig with
     | .none => true
-    | .some (.fnPtr sigInputs _ _ _) => Nat.beq (length sigInputs) argCount
+    | .some (.fnPtr sigInputs _ _ sigAbi) =>
+      Bool.and
+        (Bool.not (callConvEq sigAbi .rustIntrinsic))
+        (Nat.beq (length sigInputs) argCount)
     | .some _ => false
   let callerSigOk :=
     match callerFuncTyOpt with
     | .none => true
-    | .some { kind := .fnPtr callerInputs callerOutput _ callerAbi, .. } =>
+    | .some { kind := .fnPtr callerInputs callerOutput callerSafety callerAbi, .. } =>
       Bool.and
-        (Nat.beq (length callerInputs) argCount)
-        (match fnEntry.fnSig with
-         | .none => true
-         | .some (.fnPtr sigInputs sigOutput _ sigAbi) =>
-           Bool.and
-             (Nat.beq (length callerInputs) (length sigInputs))
-             (Bool.and
-               (callConvEq callerAbi sigAbi)
+        (Bool.not (callConvEq callerAbi .rustIntrinsic))
+        (Bool.and
+          (Nat.beq (length callerInputs) argCount)
+          (match fnEntry.fnSig with
+           | .none => true
+           | .some (.fnPtr sigInputs sigOutput sigSafety sigAbi) =>
+             Bool.and
+               (Nat.beq (length callerInputs) (length sigInputs))
                (Bool.and
-                 (rigidTyListEq callerInputs sigInputs)
-                 (rigidTyEq callerOutput sigOutput)))
-         | .some _ => false)
+                 (callConvEq callerAbi sigAbi)
+                 (Bool.and
+                   (safetyCompatible sigSafety callerSafety)
+                   (Bool.and
+                     (rigidTyListEq callerInputs sigInputs)
+                     (rigidTyEq callerOutput sigOutput))))
+           | .some _ => false))
     | .some _ => false
   Bool.and entryArityOk callerSigOk
 
@@ -303,10 +332,13 @@ def resolveCallee? := resolveCallTarget
 Validate that a linked `calleeBody : CapturedMir` in `s.memory.callees` is
 compatible with `target` and `argCount` on an indirect function-pointer call.
 
-For direct calls (`target.isIndirect == false`), reduces definitionally to `true`.
+For direct calls (`target.isIndirect == false`), reduces definitionally to
+`true`.
 For indirect calls (`target.isIndirect == true`), checks that
-`calleeBody.argCount == argCount` and that `target.fnSig` (when present) matches
-`calleeBody.argCount` and `calleeBody.fnAbi.conv`.
+`calleeBody.fnAbi.conv != .rustIntrinsic`, `calleeBody.argCount == argCount`,
+and that `target.fnSig` (when present) matches `calleeBody.argCount`,
+`calleeBody.fnAbi.conv`, and `calleeLocalDeclsCompatible` on
+`calleeBody.localDecls`.
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -323,14 +355,22 @@ def checkCalleeTargetCompatible
   | false => true
   | true =>
     Bool.and
-      (Nat.beq calleeBody.argCount argCount)
-      (match target.fnSig with
-       | .none => true
-       | .some (.fnPtr sigInputs _ _ sigAbi) =>
-         Bool.and
-           (Nat.beq (length sigInputs) calleeBody.argCount)
-           (callConvEq sigAbi calleeBody.fnAbi.conv)
-       | .some _ => false)
+      (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
+      (Bool.and
+        (Nat.beq calleeBody.argCount argCount)
+        (match target.fnSig with
+         | .none => true
+         | .some (.fnPtr sigInputs sigOut _ sigAbi) =>
+           Bool.and
+             (Nat.beq (length sigInputs) calleeBody.argCount)
+             (Bool.and
+               (callConvEq sigAbi calleeBody.fnAbi.conv)
+               (calleeLocalDeclsCompatible
+                 calleeBody.localDecls
+                 calleeBody.argCount
+                 sigInputs
+                 sigOut))
+         | .some _ => false))
 
 /--
 Direct calls (`isIndirect = false`) are unconditionally compatible with their
@@ -545,9 +585,27 @@ Execute a basic-block `Terminator` from state `s`.
 
 Supports `.goto`, `.return_` (both root-frame termination and interprocedural
 return to `Memory.callStack`), `.unreachable`, `.switchInt`, `.assert`, `.drop`,
-`.call`, and `.tailCall`. When `.call` or `.tailCall` targets a `defPath`
-without a transparent body in `s.memory.callees`, execution emits a `MirCallE`
-effect interaction carrying `(defPath, argVals, s.memory)`.
+`.call`, and `.tailCall`. When `.call` targets the compiler intrinsic
+`core::intrinsics::exact_div`, execution evaluates `evalExactDiv` inline; when
+`.call` or `.tailCall` targets any other `defPath` without a transparent body in
+`s.memory.callees`, execution emits a `MirCallE` effect interaction carrying
+`(defPath, argVals, s.memory)`.
+
+Reference (`core::intrinsics::exact_div`, Rust 1.98.0 standard library):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.exact_div.html>
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1932-L1939>
+
+> "/// Performs an exact division, resulting in undefined behavior where
+> /// `x % y != 0` or `y == 0` or `x == T::MIN && y == -1`
+> ///
+> /// This intrinsic does not have a stable counterpart.
+> #[rustc_intrinsic_const_stable_indirect]
+> #[rustc_nounwind]
+> #[rustc_intrinsic]
+> pub const unsafe fn exact_div<T: Copy>(x: T, y: T) -> T;"
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -582,20 +640,36 @@ def evalTerminator
     (term : Terminator)
     (currentBody : Option CapturedMir := .none) :
     MirStepNode :=
-  let bodyLocalDecls : List LocalDecl :=
-    match currentBody with
-    | .some b => b.localDecls
-    | .none => .nil
-  let bodyLayouts : LayoutTable :=
-    match currentBody with
-    | .some b => b.layouts
-    | .none => emptyLayoutTable
   match term.kind with
   | .goto target =>
     MirStepNode.step {
       s with
       frame := { s.frame with blockIdx := target, stmtIdx := 0 }
     }
+  | .switchInt discr targets =>
+    let bodyLayouts : LayoutTable :=
+      match currentBody with
+      | .some b => b.layouts
+      | .none => emptyLayoutTable
+    match
+      evalOperand
+        s.frame.locals
+        discr
+        s.memory.borrows
+        s.memory.globals
+        bodyLayouts
+        s.memory.callerLocals
+    with
+    | .ok (.scalar sc) locals' =>
+      let target :=
+        lookupSwitchTarget sc.bits targets.branches targets.otherwise
+      MirStepNode.emitStep (.event sc.bits) {
+        s with
+        frame := { blockIdx := target, stmtIdx := 0, locals := locals' }
+      }
+    | .ok _ _ => MirStepNode.fail .ub
+    | .ub => MirStepNode.fail .ub
+    | .unsupported => MirStepNode.unsupported
   | .return_ =>
     match get? s.frame.locals 0 with
     | .some (.init retVal) =>
@@ -659,6 +733,14 @@ def evalTerminator
           | .unsupported => MirStepNode.unsupported
         | _ => MirStepNode.fail .ub
   | .call func argOps destination (.some targetBb) unwind =>
+    let bodyLocalDecls : List LocalDecl :=
+      match currentBody with
+      | .some b => b.localDecls
+      | .none => .nil
+    let bodyLayouts : LayoutTable :=
+      match currentBody with
+      | .some b => b.layouts
+      | .none => emptyLayoutTable
     match
       resolveCallTarget
         s
@@ -742,6 +824,14 @@ def evalTerminator
   -- enabling further optimizations. Reaching this function is completely
   -- undefined behavior."
   | .call func argOps _ .none _ =>
+    let bodyLocalDecls : List LocalDecl :=
+      match currentBody with
+      | .some b => b.localDecls
+      | .none => .nil
+    let bodyLayouts : LayoutTable :=
+      match currentBody with
+      | .some b => b.layouts
+      | .none => emptyLayoutTable
     match
       resolveCallTarget
         s
@@ -757,6 +847,14 @@ def evalTerminator
       | "core::hint::unreachable_unchecked" => MirStepNode.fail .ub
       | _ => MirStepNode.unsupported
   | .tailCall func argOps =>
+    let bodyLocalDecls : List LocalDecl :=
+      match currentBody with
+      | .some b => b.localDecls
+      | .none => .nil
+    let bodyLayouts : LayoutTable :=
+      match currentBody with
+      | .some b => b.layouts
+      | .none => emptyLayoutTable
     match
       resolveCallTarget
         s
@@ -790,27 +888,11 @@ def evalTerminator
           MirStepNode.extCall
             { defPath := target.defPath, args := argVals, memory := s.memory }
             resumeExternalTailCall
-  | .switchInt discr targets =>
-    match
-      evalOperand
-        s.frame.locals
-        discr
-        s.memory.borrows
-        s.memory.globals
-        bodyLayouts
-        s.memory.callerLocals
-    with
-    | .ok (.scalar sc) locals' =>
-      let target :=
-        lookupSwitchTarget sc.bits targets.branches targets.otherwise
-      MirStepNode.emitStep (.event sc.bits) {
-        s with
-        frame := { blockIdx := target, stmtIdx := 0, locals := locals' }
-      }
-    | .ok _ _ => MirStepNode.fail .ub
-    | .ub => MirStepNode.fail .ub
-    | .unsupported => MirStepNode.unsupported
   | .assert cond expected target unwind =>
+    let bodyLayouts : LayoutTable :=
+      match currentBody with
+      | .some b => b.layouts
+      | .none => emptyLayoutTable
     match
       evalOperand
         s.frame.locals
