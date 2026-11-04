@@ -71,8 +71,10 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   resolveIntrinsicShiftSigned findDeclLayoutForRigidTy
   intrinsicRigidTyByteSizeAux intrinsicRigidTyByteSize
   intrinsicRigidTyKindAlign tupleFieldsAlign tupleFieldsByteSum roundUpToAlign
-  intrinsicRigidTyAlignAux intrinsicRigidTyAlign intrinsicUnresolvedLayoutStep
+  intrinsicRigidTyAlignAux intrinsicRigidTyAlign
+  anyUnsizedRigidTy isUnsizedRigidTy intrinsicUnresolvedLayoutStep
   resolveIntrinsicPointeeTy?
+  allZeroSizedUnitElemTys isZeroSizedUnitElemTy
   unpackConstEvalSelectArgs? resolveConstEvalSelectTarget?
   writeIntrinsicReturn writeIntrinsicScalarResult
   evalNonSelectIntrinsicCall evalDirectRustIntrinsic?

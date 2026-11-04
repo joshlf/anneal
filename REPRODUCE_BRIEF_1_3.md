@@ -1,14 +1,14 @@
 # Step-by-Step Reproduction Instructions for `BRIEF-1.3`
 
 - **Item ID**: `BRIEF-1.3` (`CallConv.rustIntrinsic` Compiler Intrinsics Executed Inside `core`)
-- **Worktree**: `/home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-1-3`
+- **Worktree**: `/usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1-3`
 - **Branch**: `adv/brief-1-3`
 - **Base Commit (`sup/brief-1`)**: `163ff6068da17eacfa4bb581f841e527e03ae455`
 
 ## 1. Verify Worktree & Commit History
 
 ```bash
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-1-3
+cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1-3
 git status --porcelain
 git log --oneline -10
 ```
@@ -17,7 +17,7 @@ git log --oneline -10
 
 ```bash
 export PATH="$HOME/.elan/bin:$PATH"
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-1-3/examples
+cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1-3/examples
 lake build Trusted Anneal Correspondence.V2026_06_01.L5_ControlAndCalls Correspondence.V2026_08_01.L5_ControlAndCalls
 ```
 
@@ -30,11 +30,10 @@ Expected output:
 
 ```bash
 export PATH="$HOME/.elan/bin:$PATH"
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-1-3
+cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1-3
 python3 trusted/audit/check_trusted.py --fast
 ```
 
 Expected output:
 - `PASS: kernel dependency closure, statement-origin separation, and Cargo DAG boundary`
-- `40 Trusted modules; 7578 Trusted kernel declarations; 15579 total replayed declarations; 11 claim theorem statements origin-checked; axioms=['propext', 'Classical.choice', 'Quot.sound']`
 - Exit code `0`.

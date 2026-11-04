@@ -819,8 +819,8 @@ inductive RustIntrinsicKind : Type where
   | threeWayCompare : RustIntrinsicKind
   /-- `core::intrinsics::size_of_val` dynamic or static pointee byte size. -/
   | sizeOfVal : RustIntrinsicKind
-  /-- `core::intrinsics::min_align_of_val` dynamic or static pointee alignment. -/
-  | minAlignOfVal : RustIntrinsicKind
+  /-- `core::intrinsics::align_of_val` dynamic or static pointee alignment. -/
+  | alignOfVal : RustIntrinsicKind
 
 /--
 Classify a canonical `DefPath` into a `RustIntrinsicKind` when it names one of
@@ -906,12 +906,8 @@ def classifyRustIntrinsic? (defPath : DefPath) : Option RustIntrinsicKind :=
                                                 match stringEq defPath "core::intrinsics::size_of_val" with
                                                 | true => .some .sizeOfVal
                                                 | false =>
-                                                  match
-                                                    Bool.or
-                                                      (stringEq defPath "core::intrinsics::min_align_of_val")
-                                                      (stringEq defPath "core::intrinsics::align_of_val")
-                                                  with
-                                                  | true => .some .minAlignOfVal
+                                                  match stringEq defPath "core::intrinsics::align_of_val" with
+                                                  | true => .some .alignOfVal
                                                   | false => .none
 
 /--
@@ -969,7 +965,7 @@ second (or sole) type argument in `target.typeArgs`.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1955-L1972>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1962-L1981>
 
 > "pub const unsafe fn unchecked_shl<T: Copy, U: Copy>(x: T, y: U) -> T;"
 -/
@@ -1113,9 +1109,9 @@ consuming fuel, so tuples of any arity resolve.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2282-L2293>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2863-L2874>
 
-> "pub const unsafe fn min_align_of_val<T: ?Sized>(val: *const T) -> usize;"
+> "pub const unsafe fn align_of_val<T: ?Sized>(ptr: *const T) -> usize;"
 -/
 @[reducible]
 def intrinsicRigidTyAlignAux :
@@ -1156,14 +1152,14 @@ def intrinsicRigidTyAlignAux :
 
 /--
 Determine the ABI byte alignment of a sized `RigidTy` on a 64-bit target for
-`min_align_of_val`, validating that any `LayoutTable` entry alignment is a
-positive power of two.
+`align_of_val`, validating that any `LayoutTable` entry alignment is a positive
+power of two.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2282-L2293>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2863-L2874>
 
-> "pub const unsafe fn min_align_of_val<T: ?Sized>(val: *const T) -> usize;"
+> "pub const unsafe fn align_of_val<T: ?Sized>(ptr: *const T) -> usize;"
 -/
 @[reducible]
 def intrinsicRigidTyAlign
@@ -1279,14 +1275,25 @@ def intrinsicRigidTyByteSize
   intrinsicRigidTyByteSizeAux 8 localDecls layouts ty
 
 /--
-Step for a pointer intrinsic whose pointee or slice element type `ty` has no
-size or alignment the model can resolve. Every caller needs a sized `ty`:
-`arith_offset::<T>` and slice elements require `T: Sized`, and `size_of_val` and
-`min_align_of_val` dispatch `[T]`, `str`, and `dyn Trait` before reaching this
-step. An unsized `ty` is therefore ill-typed and faults with `.ub`. A sized `ty`
-without a `LayoutTable` entry, such as an ADT that no local of the body has as
-its type, is a well-typed program the model cannot evaluate, so it steps to
-`MirStepNode.unsupported` rather than guessing a layout.
+Check whether any element of `ks` satisfies `pred`.
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Most types have a fixed size that is known at compile time and implement the
+> trait `Sized`."
+-/
+@[reducible]
+def anyUnsizedRigidTy (pred : RigidTy → Bool) : List RigidTy → Bool
+  | .nil => false
+  | k :: rest =>
+    match pred k with
+    | true => true
+    | false => anyUnsizedRigidTy pred rest
+
+/--
+Fuel-bounded check for whether `ty` is unsized (`.slice`, `.str`, `.dynamic`,
+`.foreign`) or is a compound array/tuple containing an unsized type.
 
 Reference (The Rust Reference, "Dynamically Sized Types"):
 <https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
@@ -1296,24 +1303,53 @@ Reference (The Rust Reference, "Dynamically Sized Types"):
 > dynamically sized type (DST) or, informally, an unsized type."
 -/
 @[reducible]
-def intrinsicUnresolvedLayoutStep : RigidTy → MirStepNode
-  | .slice _ => MirStepNode.fail .ub
-  | .str => MirStepNode.fail .ub
-  | .dynamic _ => MirStepNode.fail .ub
-  | .foreign _ => MirStepNode.fail .ub
-  | _ => MirStepNode.unsupported
+def isUnsizedRigidTy : Nat → RigidTy → Bool
+  | .zero, _ => false
+  | .succ fuel', ty =>
+    match ty with
+    | .slice _ => true
+    | .str => true
+    | .dynamic _ => true
+    | .foreign _ => true
+    | .array elemTy _ => isUnsizedRigidTy fuel' elemTy
+    | .tuple ks => anyUnsizedRigidTy (isUnsizedRigidTy fuel') ks
+    | _ => false
+
+/--
+Step for a pointer intrinsic whose pointee or slice element type `ty` has no
+size or alignment the model can resolve. Every caller needs a sized `ty`:
+`arith_offset::<T>` and slice elements require `T: Sized`, and `size_of_val` and
+`align_of_val` dispatch `[T]`, `str`, and `dyn Trait` before reaching this step.
+An unsized `ty` (including an array or tuple containing an unsized component) is
+therefore ill-typed and faults with `.ub`. A sized `ty` without a `LayoutTable`
+entry, such as an ADT that no local of the body has as its type, is a well-typed
+program the model cannot evaluate, so it steps to `MirStepNode.unsupported`
+rather than guessing a layout.
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Most types have a fixed size that is known at compile time and implement the
+> trait `Sized`. A type with a size that is known only at run-time is called a
+> dynamically sized type (DST) or, informally, an unsized type."
+-/
+@[reducible]
+def intrinsicUnresolvedLayoutStep (ty : RigidTy) : MirStepNode :=
+  match isUnsizedRigidTy 8 ty with
+  | true => MirStepNode.fail .ub
+  | false => MirStepNode.unsupported
 
 /--
 Resolve the pointee `RigidTy` `T` for pointer-parameterized intrinsics
-(`arith_offset<T>`, `size_of_val<T>`, `min_align_of_val<T>`), consulting
+(`arith_offset<T>`, `size_of_val<T>`, `align_of_val<T>`), consulting
 `target.typeArgs` first and falling back to the pointee type of the first pointer
 operand in `argOps`.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2268-L2293>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2850-L2861>
 
-> "pub const unsafe fn size_of_val<T: ?Sized>(val: *const T) -> usize;"
+> "pub const unsafe fn size_of_val<T: ?Sized>(ptr: *const T) -> usize;"
 -/
 @[reducible]
 def resolveIntrinsicPointeeTy?
@@ -1334,21 +1370,74 @@ def resolveIntrinsicPointeeTy?
     | .nil => .none
 
 /--
-Unpack the tuple argument `arg : ARG` of `core::intrinsics::const_eval_select`
-into a list of individual call argument `Value`s.
-
-Accepts `Value.aggregate 0 fieldVals` (n-ary tuple) and `Value.unit` (0-tuple
-`()`), returning `.none` (which faults with `.ub`) for any non-tuple value.
+Check whether every element of `ks` satisfies `pred`.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2665-L2680>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2400-L2408>
 
-> "pub const unsafe fn const_eval_select<ARG: Tuple, F, G, RET>(
->     arg: ARG,
->     called_in_const: F,
->     called_at_rt: G,
-> ) -> RET;"
+> "#[rustc_intrinsic]
+> pub const fn const_eval_select<ARG: Tuple, F, G, RET>(
+>     _arg: ARG,
+>     _called_in_const: F,
+>     _called_at_rt: G,
+> ) -> RET"
+-/
+@[reducible]
+def allZeroSizedUnitElemTys (pred : RigidTy → Bool) : List RigidTy → Bool
+  | .nil => true
+  | k :: rest =>
+    match pred k with
+    | true => allZeroSizedUnitElemTys pred rest
+    | false => false
+
+/--
+Test whether `ty` is an inhabited zero-sized `RigidTy` that can be represented
+by `Value.unit` when unpacking a `ConstValue.zeroSized` tuple argument in
+`const_eval_select` (excluding uninhabited `.never` and positive-size scalars or
+pointers).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2400-L2408>
+
+> "#[rustc_intrinsic]
+> pub const fn const_eval_select<ARG: Tuple, F, G, RET>(
+>     _arg: ARG,
+>     _called_in_const: F,
+>     _called_at_rt: G,
+> ) -> RET"
+-/
+@[reducible]
+def isZeroSizedUnitElemTy : Nat → RigidTy → Bool
+  | .zero, _ => false
+  | .succ fuel', ty =>
+    match ty with
+    | .tuple ks => allZeroSizedUnitElemTys (isZeroSizedUnitElemTy fuel') ks
+    | .fnDef _ _ => true
+    | .array _ .zero => true
+    | .array elemTy (.succ _) => isZeroSizedUnitElemTy fuel' elemTy
+    | _ => false
+
+/--
+Unpack the tuple argument `arg : ARG` of `core::intrinsics::const_eval_select`
+into a list of individual call argument `Value`s.
+
+Accepts `Value.aggregate 0 fieldVals` (when `tupleTyOpt` is `.none` or `.some
+(.tuple elemTys)` of matching length) and `Value.unit` (for `()` or a tuple of
+inhabited zero-sized fields), returning `.none` (which faults with `.ub`) for
+any non-tuple value, non-tuple `ARG` type, or arity mismatch.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2400-L2408>
+
+> "#[rustc_intrinsic]
+> pub const fn const_eval_select<ARG: Tuple, F, G, RET>(
+>     _arg: ARG,
+>     _called_in_const: F,
+>     _called_at_rt: G,
+> ) -> RET"
 -/
 @[reducible]
 def unpackConstEvalSelectArgs?
@@ -1356,11 +1445,21 @@ def unpackConstEvalSelectArgs?
     (tupleTyOpt : Option RigidTy := .none) :
     Option (List Value) :=
   match tupleVal with
-  | .aggregate 0 fieldVals => .some fieldVals
+  | .aggregate 0 fieldVals =>
+    match tupleTyOpt with
+    | .none => .some fieldVals
+    | .some (.tuple elemTys) =>
+      match Nat.beq (length fieldVals) (length elemTys) with
+      | true => .some fieldVals
+      | false => .none
+    | .some _ => .none
   | .unit =>
     match tupleTyOpt with
     | .none => .some .nil
-    | .some (.tuple elemTys) => .some (replicateValue (length elemTys) .unit)
+    | .some (.tuple elemTys) =>
+      match allZeroSizedUnitElemTys (isZeroSizedUnitElemTy 8) elemTys with
+      | true => .some (replicateValue (length elemTys) .unit)
+      | false => .none
     | .some _ => .none
   | _ => .none
 
@@ -1377,13 +1476,14 @@ Resolve the runtime target function `called_at_rt : G` (the 3rd argument) of
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2665-L2680>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2400-L2408>
 
-> "pub const unsafe fn const_eval_select<ARG: Tuple, F, G, RET>(
->     arg: ARG,
->     called_in_const: F,
->     called_at_rt: G,
-> ) -> RET;"
+> "#[rustc_intrinsic]
+> pub const fn const_eval_select<ARG: Tuple, F, G, RET>(
+>     _arg: ARG,
+>     _called_in_const: F,
+>     _called_at_rt: G,
+> ) -> RET"
 -/
 @[reducible]
 def resolveConstEvalSelectTarget?
@@ -1479,12 +1579,16 @@ advance to `targetBb` at `stmtIdx := 0`.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L841-L853>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L800-L814>
 
 > "Call {
+> ...
 >     func: Operand<'tcx>,
+> ...
 >     args: Box<[Spanned<Operand<'tcx>>]>,
+> ...
 >     destination: Place<'tcx>,
+> ...
 >     target: Option<BasicBlock>,"
 -/
 @[reducible]
@@ -1562,16 +1666,19 @@ def evalNonSelectIntrinsicCall
   | .arithOffset =>
     match argVals with
     | .ptr ptrVal ptrSz :: .scalar countSc :: .nil =>
-      match resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
-      | .some pointeeTy =>
-        match intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts pointeeTy with
-        | .some elemSz =>
-          match evalArithOffset ptrVal ptrSz countSc elemSz with
-          | .some retPtrVal =>
-            writeIntrinsicReturn s locals' destination targetBb (.ptr retPtrVal 8)
-          | .none => MirStepNode.fail .ub
-        | .none => intrinsicUnresolvedLayoutStep pointeeTy
-      | .none => MirStepNode.fail .ub
+      match Nat.beq ptrSz 8 with
+      | false => MirStepNode.fail .ub
+      | true =>
+        match resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+        | .some pointeeTy =>
+          match intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts pointeeTy with
+          | .some elemSz =>
+            match evalArithOffset ptrVal ptrSz countSc elemSz with
+            | .some retPtrVal =>
+              writeIntrinsicReturn s locals' destination targetBb (.ptr retPtrVal 8)
+            | .none => MirStepNode.fail .ub
+          | .none => intrinsicUnresolvedLayoutStep pointeeTy
+        | .none => MirStepNode.fail .ub
     | _ => MirStepNode.fail .ub
   | .ctlz =>
     match argVals with
@@ -1723,8 +1830,14 @@ def evalNonSelectIntrinsicCall
               (evalSliceSizeOfVal 1 lenSc)
         | _ => MirStepNode.fail .ub
       -- The size of a `dyn Trait` value is read from its vtable, which the
-      -- model does not track.
-      | .some (.dynamic _) => MirStepNode.unsupported
+      -- model does not track; malformed non-wide pointers still fault with `.ub`.
+      | .some (.dynamic _) =>
+        match ptrArgVal with
+        | .aggregate 0 (.ptr _ ptrSz :: _ :: .nil) =>
+          match Nat.beq ptrSz 8 with
+          | false => MirStepNode.fail .ub
+          | true => MirStepNode.unsupported
+        | _ => MirStepNode.fail .ub
       | .some pointeeTy =>
         match ptrArgVal with
         | .ptr _ ptrSz =>
@@ -1741,7 +1854,7 @@ def evalNonSelectIntrinsicCall
         | _ => MirStepNode.fail .ub
       | .none => MirStepNode.fail .ub
     | _ => MirStepNode.fail .ub
-  | .minAlignOfVal =>
+  | .alignOfVal =>
     match argVals with
     | ptrArgVal :: .nil =>
       match resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
@@ -1766,8 +1879,14 @@ def evalNonSelectIntrinsicCall
             writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨1, 8⟩)
         | _ => MirStepNode.fail .ub
       -- The alignment of a `dyn Trait` value is read from its vtable, which the
-      -- model does not track.
-      | .some (.dynamic _) => MirStepNode.unsupported
+      -- model does not track; malformed non-wide pointers still fault with `.ub`.
+      | .some (.dynamic _) =>
+        match ptrArgVal with
+        | .aggregate 0 (.ptr _ ptrSz :: _ :: .nil) =>
+          match Nat.beq ptrSz 8 with
+          | false => MirStepNode.fail .ub
+          | true => MirStepNode.unsupported
+        | _ => MirStepNode.fail .ub
       | .some pointeeTy =>
         match ptrArgVal with
         | .ptr _ ptrSz =>
@@ -1791,15 +1910,13 @@ reaching which is immediate undefined behavior (`MirStepNode.fail .ub`).
 
 Reference (`library/core/src/hint.rs` and `library/core/src/intrinsics/mod.rs`
 at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/hint.rs#L112-L120>
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1867-L1873>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L373-L384>
 
-> "/// Informs the compiler that the site which is calling this function is not
-> /// reachable, possibly enabling further optimizations.
-> ///
-> /// # Safety
-> ///
-> /// Reaching this function is *Undefined Behavior*."
+> "/// Informs the optimizer that this point in the code is not reachable,
+> /// enabling further optimizations.
+> ...
+> #[rustc_intrinsic]
+> pub const unsafe fn unreachable() -> !;"
 -/
 @[simp]
 def isUnreachableCallTarget (defPath : DefPath) : Bool :=
@@ -1822,10 +1939,11 @@ in `core` (`"core::panicking::panic_nounwind"`,
 
 Reference (`library/core/src/panicking.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/panicking.rs#L218-L234>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/panicking.rs#L217-L226>
 
 > "/// Like `panic`, but without unwinding and track_caller to reduce the impact
 > /// on codesize on the caller.
+> ...
 > #[rustc_nounwind]
 > pub const fn panic_nounwind(expr: &'static str) -> !"
 -/
@@ -1867,10 +1985,11 @@ Test whether `defPath` is a standard unwinding panic entrypoint in `core`
 
 Reference (`library/core/src/panicking.rs` and `library/core/src/slice/index.rs`
 at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/panicking.rs#L139-L154>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/panicking.rs#L130-L138>
 
-> "/// The underlying implementation of core's `panic!` macro when no formatting is used.
-> #[cold]
+> "/// The underlying implementation of core's `panic!` macro when no formatting
+> /// is used.
+> ...
 > #[track_caller]
 > pub const fn panic(expr: &'static str) -> !"
 -/

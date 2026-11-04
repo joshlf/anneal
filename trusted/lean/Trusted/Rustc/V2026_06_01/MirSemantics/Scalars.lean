@@ -1228,9 +1228,10 @@ structural recursion (`core::intrinsics::ctpop`).
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1651-L1664>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1656-L1669>
 
 > "/// Returns the number of bits set in an integer type `T`
+> ...
 > #[rustc_intrinsic]
 > pub const fn ctpop<T: Copy>(x: T) -> u32;"
 -/
@@ -1246,10 +1247,12 @@ bit across `remBits` bits of `bits` (`core::intrinsics::cttz`).
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1616-L1631>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1734-L1773>
 
-> "/// Returns the number of trailing unset bits (zeroes) in an integer type
-> /// `T`."
+> "/// Returns the number of trailing unset bits (zeroes) in an integer type `T`.
+> ...
+> #[rustc_intrinsic]
+> pub const fn cttz<T: Copy>(x: T) -> u32;"
 -/
 @[reducible]
 def cttzLoop : Nat → Nat → Nat
@@ -1265,9 +1268,10 @@ Reverse the low `remBits` bits of `bits` into accumulator `acc`
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1666-L1679>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1812-L1825>
 
 > "/// Reverses the bits in an integer type `T`.
+> ...
 > #[rustc_intrinsic]
 > pub const fn bitreverse<T: Copy>(x: T) -> T;"
 -/
@@ -1287,9 +1291,12 @@ the trailing zero count of the `numBits`-bit reversal of `bits`.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1582-L1597>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1671-L1710>
 
-> "/// Returns the number of leading unset bits (zeroes) in an integer type `T`."
+> "/// Returns the number of leading unset bits (zeroes) in an integer type `T`.
+> ...
+> #[rustc_intrinsic]
+> pub const fn ctlz<T: Copy>(x: T) -> u32;"
 -/
 @[reducible]
 def ctlzBits (numBits bits : Nat) : Nat :=
@@ -1301,9 +1308,10 @@ Reverse the low `remBytes` bytes of `bits` into accumulator `acc`
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1681-L1695>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1797-L1810>
 
 > "/// Reverses the bytes in an integer type `T`.
+> ...
 > #[rustc_intrinsic]
 > pub const fn bswap<T: Copy>(x: T) -> T;"
 -/
@@ -1323,9 +1331,10 @@ Returns `.none` if `sc.sizeBytes == 0` or `retBytes == 0`.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1582-L1597>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1671-L1710>
 
 > "/// Returns the number of leading unset bits (zeroes) in an integer type `T`.
+> ...
 > #[rustc_intrinsic]
 > pub const fn ctlz<T: Copy>(x: T) -> u32;"
 -/
@@ -1343,10 +1352,11 @@ behavior) when `sc` is zero (`ca == 0`) or has zero byte width.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1599-L1614>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1712-L1732>
 
-> "/// Like `ctlz`, but extra-unsafe as it returns `undef` when given an `x`
-> /// with value `0`.
+> "/// Like `ctlz`, but extra-unsafe as it returns `undef` when
+> /// given an `x` with value `0`.
+> ...
 > #[rustc_intrinsic]
 > pub const unsafe fn ctlz_nonzero<T: Copy>(x: T) -> u32;"
 -/
@@ -1367,10 +1377,10 @@ Returns `.none` if `sc.sizeBytes == 0` or `retBytes == 0`.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1616-L1631>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1734-L1773>
 
-> "/// Returns the number of trailing unset bits (zeroes) in an integer type
-> /// `T`.
+> "/// Returns the number of trailing unset bits (zeroes) in an integer type `T`.
+> ...
 > #[rustc_intrinsic]
 > pub const fn cttz<T: Copy>(x: T) -> u32;"
 -/
@@ -1388,10 +1398,11 @@ behavior) when `sc` is zero (`ca == 0`) or has zero byte width.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1633-L1649>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1775-L1795>
 
-> "/// Like `cttz`, but extra-unsafe as it returns `undef` when given an `x`
-> /// with value `0`.
+> "/// Like `cttz`, but extra-unsafe as it returns `undef` when
+> /// given an `x` with value `0`.
+> ...
 > #[rustc_intrinsic]
 > pub const unsafe fn cttz_nonzero<T: Copy>(x: T) -> u32;"
 -/
@@ -1411,9 +1422,10 @@ Evaluate `core::intrinsics::ctpop(sc)`, returning a `retBytes`-byte `ScalarInt`
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1651-L1664>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1656-L1669>
 
 > "/// Returns the number of bits set in an integer type `T`
+> ...
 > #[rustc_intrinsic]
 > pub const fn ctpop<T: Copy>(x: T) -> u32;"
 -/
@@ -1431,9 +1443,10 @@ preserving `sc.sizeBytes`. Returns `.none` if `sc.sizeBytes == 0`.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1681-L1695>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1797-L1810>
 
 > "/// Reverses the bytes in an integer type `T`.
+> ...
 > #[rustc_intrinsic]
 > pub const fn bswap<T: Copy>(x: T) -> T;"
 -/
@@ -1452,9 +1465,10 @@ if `sc.sizeBytes == 0`.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1666-L1679>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1812-L1825>
 
 > "/// Reverses the bits in an integer type `T`.
+> ...
 > #[rustc_intrinsic]
 > pub const fn bitreverse<T: Copy>(x: T) -> T;"
 -/
@@ -1473,9 +1487,10 @@ Evaluate `core::intrinsics::wrapping_add(lhs, rhs)` modulo
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2043-L2052>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2057-L2070>
 
-> "/// Performs wrapping addition.
+> "/// Returns (a + b) mod 2<sup>N</sup>, where N is the width of T in bits.
+> ...
 > #[rustc_intrinsic]
 > pub const fn wrapping_add<T: Copy>(a: T, b: T) -> T;"
 -/
@@ -1501,9 +1516,10 @@ Evaluate `core::intrinsics::wrapping_sub(lhs, rhs)` modulo
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2054-L2063>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2071-L2084>
 
-> "/// Performs wrapping subtraction.
+> "/// Returns (a - b) mod 2<sup>N</sup>, where N is the width of T in bits.
+> ...
 > #[rustc_intrinsic]
 > pub const fn wrapping_sub<T: Copy>(a: T, b: T) -> T;"
 -/
@@ -1529,9 +1545,10 @@ Evaluate `core::intrinsics::wrapping_mul(lhs, rhs)` modulo
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2065-L2074>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2085-L2098>
 
-> "/// Performs wrapping multiplication.
+> "/// Returns (a * b) mod 2<sup>N</sup>, where N is the width of T in bits.
+> ...
 > #[rustc_intrinsic]
 > pub const fn wrapping_mul<T: Copy>(a: T, b: T) -> T;"
 -/
@@ -1557,9 +1574,10 @@ overflow to `T::MIN = -2^(w-1)` or `T::MAX = 2^(w-1) - 1` (`isSigned = true`).
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2088-L2096>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2100-L2113>
 
 > "/// Computes `a + b`, saturating at numeric bounds.
+> ...
 > #[rustc_intrinsic]
 > pub const fn saturating_add<T: Copy>(a: T, b: T) -> T;"
 -/
@@ -1601,9 +1619,10 @@ underflow to `0` (`isSigned = false`) and on signed two's-complement overflow to
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2098-L2106>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2114-L2127>
 
 > "/// Computes `a - b`, saturating at numeric bounds.
+> ...
 > #[rustc_intrinsic]
 > pub const fn saturating_sub<T: Copy>(a: T, b: T) -> T;"
 -/
@@ -1644,10 +1663,11 @@ Evaluate `core::intrinsics::unchecked_add(lhs, rhs)`, returning `.none`
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1974-L1985>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1983-L1991>
 
-> "/// Performs an unchecked addition, resulting in undefined behavior
-> /// where `x + y > T::MAX` or `x + y < T::MIN`.
+> "/// Returns the result of an unchecked addition, resulting in
+> /// undefined behavior when `x + y > T::MAX` or `x + y < T::MIN`.
+> ...
 > #[rustc_intrinsic]
 > pub const unsafe fn unchecked_add<T: Copy>(x: T, y: T) -> T;"
 -/
@@ -1684,10 +1704,11 @@ Evaluate `core::intrinsics::unchecked_sub(lhs, rhs)`, returning `.none`
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1987-L1998>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1993-L2001>
 
-> "/// Performs an unchecked subtraction, resulting in undefined behavior
-> /// where `x - y > T::MAX` or `x - y < T::MIN`.
+> "/// Returns the result of an unchecked subtraction, resulting in
+> /// undefined behavior when `x - y > T::MAX` or `x - y < T::MIN`.
+> ...
 > #[rustc_intrinsic]
 > pub const unsafe fn unchecked_sub<T: Copy>(x: T, y: T) -> T;"
 -/
@@ -1725,10 +1746,11 @@ overflow.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2000-L2011>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2003-L2011>
 
-> "/// Performs an unchecked multiplication, resulting in undefined behavior
-> /// where `x * y > T::MAX` or `x * y < T::MIN`.
+> "/// Returns the result of an unchecked multiplication, resulting in
+> /// undefined behavior when `x * y > T::MAX` or `x * y < T::MIN`.
+> ...
 > #[rustc_intrinsic]
 > pub const unsafe fn unchecked_mul<T: Copy>(x: T, y: T) -> T;"
 -/
@@ -1765,10 +1787,11 @@ Evaluate `core::intrinsics::unchecked_div(lhs, rhs)`, returning `.none`
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1918-L1930>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1941-L1950>
 
 > "/// Performs an unchecked division, resulting in undefined behavior
 > /// where `y == 0` or `x == T::MIN && y == -1`
+> ...
 > #[rustc_intrinsic]
 > pub const unsafe fn unchecked_div<T: Copy>(x: T, y: T) -> T;"
 -/
@@ -1819,10 +1842,11 @@ Evaluate `core::intrinsics::unchecked_rem(lhs, rhs)`, returning `.none`
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1941-L1953>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1951-L1960>
 
 > "/// Returns the remainder of an unchecked division, resulting in
 > /// undefined behavior when `y == 0` or `x == T::MIN && y == -1`
+> ...
 > #[rustc_intrinsic]
 > pub const unsafe fn unchecked_rem<T: Copy>(x: T, y: T) -> T;"
 -/
@@ -1873,10 +1897,11 @@ lhs.sizeBytes`.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1955-L1963>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1962-L1971>
 
 > "/// Performs an unchecked left shift, resulting in undefined behavior when
 > /// `y < 0` or `y >= N`, where N is the width of T in bits.
+> ...
 > #[rustc_intrinsic]
 > pub const unsafe fn unchecked_shl<T: Copy, U: Copy>(x: T, y: U) -> T;"
 -/
@@ -1906,10 +1931,11 @@ arithmetic sign-extending right shift when `lhsIsSigned = true`.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1965-L1972>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1972-L1981>
 
 > "/// Performs an unchecked right shift, resulting in undefined behavior when
 > /// `y < 0` or `y >= N`, where N is the width of T in bits.
+> ...
 > #[rustc_intrinsic]
 > pub const unsafe fn unchecked_shr<T: Copy, U: Copy>(x: T, y: U) -> T;"
 -/
@@ -1945,11 +1971,13 @@ Evaluate `core::intrinsics::three_way_compare(lhs, rhs)`, returning a 1-byte
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1899-L1905>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1827-L1837>
 
-> "/// Compares two values using three-way comparison, returning `Ordering`.
+> "/// Does a three-way comparison between the two arguments,
+> /// which must be of character or integer (signed or unsigned) type.
+> ...
 > #[rustc_intrinsic]
-> pub const fn three_way_compare<T: Copy>(lhs: T, rhs: T) ->
+> pub const fn three_way_compare<T: Copy>(lhs: T, rhss: T) ->
 >     crate::cmp::Ordering;"
 -/
 @[reducible]
@@ -1987,11 +2015,13 @@ Evaluate `core::intrinsics::arith_offset(dst, offset)` on a 64-bit pointer
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1168-L1185>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L899-L916>
 
 > "/// Calculates the offset from a pointer, potentially wrapping.
+> ///
 > /// This is implemented as an intrinsic to avoid converting to and from an
-> /// integer, since the conversion inhibit certain optimizations.
+> /// integer, since the conversion inhibits certain optimizations.
+> ...
 > #[rustc_intrinsic]
 > pub const unsafe fn arith_offset<T>(dst: *const T, offset: isize) -> *const T;"
 -/
@@ -2033,11 +2063,13 @@ for `core::intrinsics::size_of_val` from its 8-byte fat-pointer length metadata
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1486-L1501>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2850-L2861>
 
 > "/// The size of the referenced value in bytes.
+> ...
 > #[rustc_intrinsic]
-> pub const unsafe fn size_of_val<T: ?Sized>(val: *const T) -> usize;"
+> #[rustc_intrinsic_const_stable_indirect]
+> pub const unsafe fn size_of_val<T: ?Sized>(ptr: *const T) -> usize;"
 -/
 @[reducible]
 def evalSliceSizeOfVal
