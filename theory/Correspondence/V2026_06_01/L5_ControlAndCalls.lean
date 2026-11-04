@@ -1144,12 +1144,20 @@ theorem mir_evalTerminator_trait_method_dispatch
       { emptyLayoutTable with entries := [polyU32Layout] }
     let calleeWithTraitImpl : CapturedMir :=
       { rangeTraitImplCallee with traitImpls := [rangeImplEntry] }
+    let defaultCheckCallee : CapturedMir :=
+      { polyIdCallee with defPath := "test::MyTrait::check" }
     lookupCallee [monoIdCallee] emptyLayoutTable
       "test::MyTrait::compute" [.uint .u32] [monoImplEntry] =
       .some monoIdCallee ∧
     lookupCallee [rangeTraitImplCallee] emptyLayoutTable
       "test::MyTrait::check" [.adt "Range" [.uint .usize], .uint .usize] [rangeImplEntry] =
       .some (rangeTraitImplCallee.instantiate [(.uint .usize, polyU64Layout)]) ∧
+    lookupCallee [defaultCheckCallee, rangeTraitImplCallee] emptyLayoutTable
+      "test::MyTrait::check" [.adt "Range" [.uint .usize], .uint .usize] [rangeImplEntry] =
+      .some (rangeTraitImplCallee.instantiate [(.uint .usize, polyU64Layout)]) ∧
+    lookupCallee [defaultCheckCallee, rangeTraitImplCallee] emptyLayoutTable
+      "test::MyTrait::check" [.uint .u32] [rangeImplEntry] =
+      .some (defaultCheckCallee.instantiate [(.uint .u32, polyU32Layout)]) ∧
     lookupCallee [calleeWithTraitImpl] emptyLayoutTable
       "test::MyTrait::check" [.adt "Range" [.uint .usize], .uint .usize] .nil =
       .some (calleeWithTraitImpl.instantiate [(.uint .usize, polyU64Layout)]) ∧
@@ -1194,16 +1202,17 @@ theorem mir_evalTerminator_trait_method_dispatch
       (.alias "Proj" [.uint .u32]) .nil =
       .some [(0, .uint .u32)] ∧
     s.frame.blockIdx = s.frame.blockIdx := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /--
 Universal theorem that when `Self` in a trait-method call `(traitMethodDefPath, typeArgs)`
 is an uninstantiated `RigidTy.param paramIdx paramName` (`typeArgs = .param paramIdx paramName :: restArgs`),
 `lookupCallee` returns `.none` (even when `s.memory.traitImpls` or `s.memory.callees`
-contain trait implementations) and both `TerminatorKind.call` and `TerminatorKind.tailCall`
-step to `MirStepNode.extCall` carrying `typeArgs` in `MirCallReq`. Also verifies
-that a compound `Self` containing a nested `.param` returns `.none` when no
-generic implementation matches.
+contain trait implementations or a default trait method body) and both
+`TerminatorKind.call` and `TerminatorKind.tailCall` step to `MirStepNode.extCall`
+carrying `typeArgs` in `MirCallReq`. Also verifies that a compound `Self`
+containing a nested `.param` returns `.none` when no generic implementation
+matches.
 -/
 theorem mir_evalTerminator_uninstantiated_trait_method_extCall
     (s : MachineState)
@@ -1233,6 +1242,15 @@ theorem mir_evalTerminator_uninstantiated_trait_method_extCall
         callerBody.layouts
         s.memory.callerLocals = .ok argVals locals') :
     let typeArgs := .param paramIdx paramName :: restTypeArgs
+    let defaultCheckCallee : CapturedMir :=
+      { polyIdCallee with defPath := "test::MyTrait::check" }
+    let rangeImplEntry : TraitImplEntry :=
+      { traitRef :=
+          { defPath := "test::MyTrait::check"
+            args := [.adt "Range" [.param 0 "T"], .param 0 "T"] }
+        implPath := "test::<impl MyTrait<T> for Range<T>>::check" }
+    let callerLayoutsWithT : LayoutTable :=
+      { emptyLayoutTable with entries := [polyU32Layout] }
     lookupCallee s.memory.callees callerBody.layouts traitMethodDefPath typeArgs s.memory.traitImpls = .none ∧
     evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
       MirStepNode.extCall
@@ -1243,13 +1261,17 @@ theorem mir_evalTerminator_uninstantiated_trait_method_extCall
         { defPath := traitMethodDefPath, typeArgs := typeArgs, args := argVals, memory := s.memory }
         resumeExternalTailCall ∧
     lookupCallee [monoIdCallee] emptyLayoutTable
-      "test::MyTrait::check" [.adt "Wrapper" [.param 0 "T"]] .nil = .none := by
+      "test::MyTrait::check" [.adt "Wrapper" [.param 0 "T"]] .nil = .none ∧
+    lookupCallee [defaultCheckCallee, rangeTraitImplCallee] callerLayoutsWithT
+      "test::MyTrait::check" [.param 0 "Self"] [rangeImplEntry] = .none ∧
+    lookupCallee [defaultCheckCallee, rangeTraitImplCallee] callerLayoutsWithT
+      "test::MyTrait::check" [.adt "Wrapper" [.param 0 "T"]] [rangeImplEntry] = .none := by
   dsimp only
   have hLookupNone :
       lookupCallee s.memory.callees callerBody.layouts traitMethodDefPath
         (.param paramIdx paramName :: restTypeArgs) s.memory.traitImpls = .none := by
-    simp [lookupCallee, hNotInCallees]
-  refine ⟨hLookupNone, ?_, ?_, rfl⟩
+    simp [lookupCallee, resolveCalleeBodyAndArgs?, hNotInCallees]
+  refine ⟨hLookupNone, ?_, ?_, rfl, rfl, rfl⟩
   · simp [evalTerminator, evalCallTerminator, resolveCallTarget, isDirectExactDivTarget,
       hExtractDef, hExtractArgs, hArgs, hLookupNone, hNotExactDiv]
   · simp [evalTerminator, evalTailCallTerminator, resolveCallTarget,
@@ -1257,19 +1279,25 @@ theorem mir_evalTerminator_uninstantiated_trait_method_extCall
 
 /--
 End-to-end characterization of `ReifyFnPointer` and indirect `FnPtr` calls
-(`TerminatorKind.call` and `TerminatorKind.tailCall`) to polymorphic functions:
+(`TerminatorKind.call` and `TerminatorKind.tailCall`) to polymorphic functions
+and trait methods:
 1. Coercing `id::<u32>` (`RigidTy.fnDef "test::id" [.uint .u32]`) to
    `fn(u32) -> u32` via `CastKind.pointerCoercion "ReifyFnPointer"` when
    `mem.callees = [polyIdCallee]` instantiates `polyIdCallee`'s signature via
    `checkCalleeSig` (`true`) and interns the `FnPtrEntry` with
-   `typeArgs = [.uint .u32]`, whereas coercing `id::<u32>` to `fn(u64) -> u64`
-   or with mismatched `typeArgs` arity faults with `.ub`;
-2. When an indirect `FnPtrEntry` targets `polyIdCallee` (`id<T>`) with
+   `typeArgs = [.uint .u32]`, whereas coercing `id::<u32>` to `fn(u64) -> u64`,
+   with mismatched `typeArgs` arity, or with an unbound `RigidTy.param` faults
+   with `.ub`;
+2. Coercing a trait method item `MyTrait::check::<Range<usize>, usize>` via
+   `ReifyFnPointer` resolves through `mem.traitImpls`, instantiates the
+   matching `impl` body's signature, accepts `fn(usize) -> usize`, and rejects
+   mismatched `fn(u32) -> u32` with `.ub`;
+3. When an indirect `FnPtrEntry` targets `polyIdCallee` (`id<T>`) with
    `typeArgs = [.uint .u32]` and compatible signature `fn(u32) -> u32`,
    `lookupCallee` instantiates `polyIdCallee` to `u32`, `checkCalleeTargetCompatible`
    succeeds (`true`), and both `.call` and `.tailCall` step into the instantiated
    `calleeBody`;
-3. When an indirect `FnPtrEntry` targets `polyIdCallee` with `typeArgs = [.uint .u32]`
+4. When an indirect `FnPtrEntry` targets `polyIdCallee` with `typeArgs = [.uint .u32]`
    (instantiating to `fn(u32) -> u32`) but carries a mismatched signature
    `fn(u64) -> u64`, `checkCalleeTargetCompatible` rejects the instantiated
    callee (`false`) and both `.call` and `.tailCall` fault with `MirStepNode.fail .ub`.
@@ -1310,14 +1338,35 @@ theorem mir_evalTerminator_indirect_polymorphic_fnptr_call
     let instU32Callee := polyIdCallee.instantiate [(.uint .u32, polyU32Layout)]
     let u32FnSig : RigidTy := .fnPtr [.uint .u32] (.uint .u32) .safe .rust
     let u64FnSig : RigidTy := .fnPtr [.uint .u64] (.uint .u64) .safe .rust
+    let usizeFnSig : RigidTy := .fnPtr [.uint .usize] (.uint .usize) .safe .rust
     let idU32Op : Operand :=
       .constant { ty := { kind := .fnDef "test::id" [.uint .u32], layoutIdx := 0 }, val := .zeroSized }
+    let idUnboundParamOp : Operand :=
+      .constant { ty := { kind := .fnDef "test::id" [.param 0 "T"], layoutIdx := 0 }, val := .zeroSized }
+    let traitCheckOp : Operand :=
+      .constant
+        { ty :=
+            { kind := .fnDef "test::MyTrait::check" [.adt "Range" [.uint .usize], .uint .usize]
+              layoutIdx := 0 }
+          val := .zeroSized }
+    let rangeImplEntry : TraitImplEntry :=
+      { traitRef :=
+          { defPath := "test::MyTrait::check"
+            args := [.adt "Range" [.param 0 "T"], .param 0 "T"] }
+        implPath := "test::<impl MyTrait<T> for Range<T>>::check" }
     let memWithPolyCallee : Memory := { emptyMemory with callees := [polyIdCallee] }
+    let memWithTraitCallee : Memory :=
+      { emptyMemory with callees := [rangeTraitImplCallee], traitImpls := [rangeImplEntry] }
     let expectedPolyEntry : FnPtrEntry :=
       { allocId := fnPtrAllocBase
         defPath := "test::id"
         typeArgs := [.uint .u32]
         fnSig := .some u32FnSig }
+    let expectedTraitEntry : FnPtrEntry :=
+      { allocId := fnPtrAllocBase
+        defPath := "test::MyTrait::check"
+        typeArgs := [.adt "Range" [.uint .usize], .uint .usize]
+        fnSig := .some usizeFnSig }
     let goodTarget : ResolvedCallTarget :=
       { defPath := "test::id"
         typeArgs := [.uint .u32]
@@ -1332,6 +1381,10 @@ theorem mir_evalTerminator_indirect_polymorphic_fnptr_call
     checkCalleeSig [polyIdCallee] "test::id" [.uint .u64] (.uint .u64) .rust [.uint .u32] = false ∧
     checkCalleeSig [polyIdCallee] "test::id" [.uint .u32] (.uint .u32) .rust .nil = false ∧
     checkCalleeSig [monoIdCallee] "test::mono_id" [.uint .u32] (.uint .u32) .rust [.uint .u32] = false ∧
+    checkCalleeSig [rangeTraitImplCallee] "test::MyTrait::check" [.uint .usize] (.uint .usize) .rust
+      [.adt "Range" [.uint .usize], .uint .usize] [rangeImplEntry] = true ∧
+    checkCalleeSig [rangeTraitImplCallee] "test::MyTrait::check" [.uint .u32] (.uint .u32) .rust
+      [.adt "Range" [.uint .usize], .uint .usize] [rangeImplEntry] = false ∧
     evalRvalue
         .nil
         (.cast (.pointerCoercion "ReifyFnPointer") idU32Op { kind := u32FnSig, layoutIdx := 0 })
@@ -1344,6 +1397,24 @@ theorem mir_evalTerminator_indirect_polymorphic_fnptr_call
         .nil
         (.cast (.pointerCoercion "ReifyFnPointer") idU32Op { kind := u64FnSig, layoutIdx := 0 })
         memWithPolyCallee =
+      .ub ∧
+    evalRvalue
+        .nil
+        (.cast (.pointerCoercion "ReifyFnPointer") idUnboundParamOp { kind := u32FnSig, layoutIdx := 0 })
+        memWithPolyCallee =
+      .ub ∧
+    evalRvalue
+        .nil
+        (.cast (.pointerCoercion "ReifyFnPointer") traitCheckOp { kind := usizeFnSig, layoutIdx := 0 })
+        memWithTraitCallee =
+      .ok
+        (.ptr { allocId := fnPtrAllocBase, offsetBytes := 0 } 8)
+        .nil
+        { memWithTraitCallee with fnPtrs := [expectedTraitEntry] } ∧
+    evalRvalue
+        .nil
+        (.cast (.pointerCoercion "ReifyFnPointer") traitCheckOp { kind := u32FnSig, layoutIdx := 0 })
+        memWithTraitCallee =
       .ub ∧
     checkCalleeTargetCompatible goodTarget instU32Callee 1 = true ∧
     checkCalleeTargetCompatible badTarget instU32Callee 1 = false ∧
@@ -1360,7 +1431,7 @@ theorem mir_evalTerminator_indirect_polymorphic_fnptr_call
       evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
         MirStepNode.fail .ub) := by
   dsimp only
-  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ?_⟩
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ?_⟩
   intro fnEntry hLookupPtr hDef hTypeArgs hSig hCompatSite hLookupCallee
   have hCompatBodyFalse :
       checkCalleeTargetCompatible
