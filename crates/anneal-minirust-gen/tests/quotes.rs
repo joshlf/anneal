@@ -742,6 +742,10 @@ fn bool_comparison_and_transmute_quotations_are_pinned() {
     let bb = "tooling/minimize/src/bb.rs";
     let constant = "tooling/minimize/src/constant.rs";
 
+    // Note: `tooling/miniutil/src/...` (e.g. `expr.rs`, `ty.rs`) is not vendored
+    // by `minirust.lock.toml`, so quotations from it (`bool_to_int`, `not`,
+    // `bool_and`, `bool_or`, `bool_xor`, `tuple_ty`) cannot be pinned here.
+
     // (cited file, genuine quotation, tampered quotation, Lean file quoting it)
     let cases: &[(&str, &str, &str, &str)] = &[
         // `Machine::transmute`: encode at the old type, decode at the new one.
