@@ -2815,6 +2815,16 @@ def multiBlockPipelineTotalClaim : TotalClaim where
   pre args mem := WellTypedScalarArg1 4 args ∧ RootActiveMemory mem
   post args mem retVal mem' := args = [retVal] ∧ mem' = mem
 
+/-- Non-vacuity witness for `multiBlockPipelineTotalClaim.pre`. -/
+theorem multiBlockPipelineTotalClaim_nonVacuous :
+    ∃ args mem,
+      multiBlockPipelineTotalClaim.pre args mem :=
+  proveNonVacuousStatefulPre
+    [.scalar { bits := 42, sizeBytes := 4 }]
+    (initMachineStateWithCallees multiBlockPipelineBody
+      [.scalar { bits := 42, sizeBytes := 4 }] [multiBlockPipelineBody]).memory
+    ⟨⟨42, by decide, rfl⟩, ⟨rfl, rfl, rfl, rfl⟩⟩
+
 /--
 Fuel-free discharge of `TotalVerificationResult multiBlockPipelineTotalClaim`
 using `verifyTotalMir_of_wpConverges` and `MirWpConverges.bind`.
