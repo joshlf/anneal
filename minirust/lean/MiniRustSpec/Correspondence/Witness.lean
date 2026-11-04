@@ -4150,6 +4150,16 @@ theorem uninitTupleField0_minirust_direct :
     Interp.steps 2 uninitTupleField0MInit =
       .error (.ub "load at type but the data in memory violates the language invariant") := rfl
 
+theorem uninitTupleField0_converse_error :
+    (∃ msg, Stop.ub "load at type but the data in memory violates the language invariant" = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree uninitTupleField0 []) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 2 ∧ Interp.steps k uninitTupleField0MInit = .ok mRet ∧
+      ReturnRel uninitTupleField0 ctxTupleU32 s' v mRet ∧
+      ReachesRet (mirCallTree uninitTupleField0 []) tr (.normal (v, mem))) :=
+  mirCall_steps_error uninitTupleField0_inFragment uninitTupleField0_translate ctxTupleU32
+    (ctxTupleU32_ok1 rfl) [] (by decide) uninitTupleField0MInit rfl rfl rfl
+    uninitTupleField0_minirust_direct
+
 /-- MIR of `fn uninit_tuple_field1() -> (u32, bool)` whose entry block switches
 on `_0.1` (at offset `4`) from the uninitialized `(u32, bool)` return place
 `_0`, raising UB in both Anneal and MiniRust. -/
@@ -4208,6 +4218,19 @@ theorem uninitTupleField1_minirust_direct :
     Interp.steps 2 uninitTupleField1MInit =
       .error (.ub "load at type but the data in memory violates the language invariant") := rfl
 
+theorem uninitTupleField1_outcome (n : Nat) :
+    (∃ s' m' tr, Interp.steps (n + 1) uninitTupleField1MInit = .ok m' ∧
+      StateRel uninitTupleField1 uninitTupleField1Fn ctxTupleU32 s' m' ∧
+      Reaches (mirCallTree uninitTupleField1 []) tr
+        (mirTree uninitTupleField1 s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ n + 1 ∧ Interp.steps k uninitTupleField1MInit = .ok mRet ∧
+      ReturnRel uninitTupleField1 ctxTupleU32 s' v mRet ∧
+      ReachesRet (mirCallTree uninitTupleField1 []) tr (.normal (v, mem))) ∨
+    (∃ msg, Interp.steps (n + 1) uninitTupleField1MInit = .error (.ub msg) ∧
+      ∃ tr u, Reaches (mirCallTree uninitTupleField1 []) tr u ∧ FaultNow u) :=
+  mirCall_outcome uninitTupleField1_inFragment uninitTupleField1_translate ctxTupleU32
+    (ctxTupleU32_ok1 rfl) [] (by decide) uninitTupleField1MInit rfl rfl rfl n
+
 /-! ### Ground truth for `IntType::with_overflow`, `BinOpIntWithOverflow`, `ValueExpr::Tuple`, and `PlaceExpr::Field` -/
 
 /-- `IntType::with_overflow` layout on `i8` (size `2`, align `1`, no trailing
@@ -4231,6 +4254,31 @@ theorem tupleHeadLayout_full_sized_and_slice :
       TupleHeadLayout.full_size_and_align ⟨⟨5⟩, ⟨4⟩, some ⟨2⟩⟩ ⟨6⟩ ⟨2⟩ = (⟨12⟩, ⟨4⟩) ∧
       LayoutStrategy.compute_size_and_align (vtableLookup checkedTupleOkMInit)
         (.Slice ⟨2⟩ ⟨2⟩) (some (.ElementCount 3)) = .ok (⟨6⟩, ⟨2⟩) := ⟨rfl, rfl, rfl⟩
+
+/-- `TupleHeadLayout::{capped_tail_align, tail_offset}` when `packed_align`
+genuinely caps `tail_align` (`min 4 1 = 1`, placing the tail at offset `5`
+instead of `8`), and `LayoutStrategy::compute_size_and_align` on `Tuple`,
+`TraitObject`, mismatched pointer metadata (`specPanic`), and negative slice
+count (`specPanic`). -/
+theorem cappedTailAlign_and_computeSizeAndAlign_all_branches :
+    TupleHeadLayout.capped_tail_align ⟨⟨5⟩, ⟨1⟩, some ⟨1⟩⟩ ⟨4⟩ = ⟨1⟩ ∧
+    TupleHeadLayout.tail_offset ⟨⟨5⟩, ⟨1⟩, some ⟨1⟩⟩ ⟨4⟩ = ⟨5⟩ ∧
+    TupleHeadLayout.tail_offset ⟨⟨5⟩, ⟨1⟩, none⟩ ⟨4⟩ = ⟨8⟩ ∧
+    LayoutStrategy.compute_size_and_align (vtableLookup checkedTupleOkMInit)
+      (.Tuple ⟨⟨5⟩, ⟨4⟩, none⟩ (.Slice ⟨2⟩ ⟨2⟩)) (some (.ElementCount 3)) =
+      .ok (⟨12⟩, ⟨4⟩) ∧
+    LayoutStrategy.compute_size_and_align
+      (fun _ => .ok { trait_name := ⟨⟨0⟩⟩, size := ⟨24⟩, align := ⟨8⟩, cells := [], methods := ⟨[]⟩ })
+      (.TraitObject ⟨⟨0⟩⟩)
+      (some (.VTablePointer { addr := 64, provenance := none })) =
+      .ok (⟨24⟩, ⟨8⟩) ∧
+    LayoutStrategy.compute_size_and_align (vtableLookup checkedTupleOkMInit)
+      (.Sized ⟨4⟩ ⟨4⟩) (some (.ElementCount 1)) =
+      .error (.specPanic "pointer meta data does not match type") ∧
+    LayoutStrategy.compute_size_and_align (vtableLookup checkedTupleOkMInit)
+      (.Slice ⟨2⟩ ⟨2⟩) (some (.ElementCount (-1))) =
+      .error (.specPanic "Size::from_bytes(count * elem_size.bytes()).unwrap()") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- Direct ground-truth evaluations of `evalBinOp (.IntWithOverflow ..)` on
 `INT_MAX + 1`, `INT_MIN - 1`, `UINT_MAX + 1`, `0 - 1`, and signed/unsigned

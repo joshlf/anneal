@@ -126,9 +126,13 @@ as a pass.
     - no-overflow `(10u32, 3u32) -> (21u32, false)` (`checkedTupleOk_*`).
   - `uninitTupleField0` and `uninitTupleField1`: reading `_0.0` or `_0.1` from
     an uninitialized `(u32, bool)` local raises UB in both Anneal and MiniRust
-    (`uninitTupleField0_*`, `uninitTupleField1_*`).
+    (`uninitTupleField0_*`, `uninitTupleField1_*`, including converse error
+    soundness `uninitTupleField0_converse_error` via `mirCall_steps_error` and
+    `n`-step outcome trichotomy `uninitTupleField1_outcome` via `mirCall_outcome`).
   - Ground-truth theorems (`withOverflow_i8_layout`, `withOverflow_u32_layout`,
-    `tupleHeadLayout_full_sized_and_slice`, `evalBinOp_addWithOverflow_i8_max`,
+    `tupleHeadLayout_full_sized_and_slice`,
+    `cappedTailAlign_and_computeSizeAndAlign_all_branches`,
+    `evalBinOp_addWithOverflow_i8_max`,
     `evalBinOp_subWithOverflow_i8_min`, `evalBinOp_addWithOverflow_u32_max`,
     `evalBinOp_subWithOverflow_u32_zero`, `evalBinOp_mulWithOverflow_i8_min`,
     `evalBinOp_mulWithOverflow_u32`, `ptrOffsetInbounds_ok_and_oob`,
@@ -186,6 +190,6 @@ Pass: four lines of the form
 ```text
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
 [SIMULATION-AUDIT] decls=83 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
-[WITNESS-AUDIT] decls=202 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-MiniRustSpec.Audit: exhaustively verified standard axioms for 9226 declarations across all MiniRustSpec.* modules
+[WITNESS-AUDIT] decls=205 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+MiniRustSpec.Audit: exhaustively verified standard axioms for 9229 declarations across all MiniRustSpec.* modules
 ```

@@ -434,7 +434,10 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   writing 4-byte `u32` at offset `0`, 1-byte `bool` at offset `4`, and 3
   trailing `AbstractByte::Uninit` padding bytes at offsets `5..8`; plus
   `uninitTupleField0` and `uninitTupleField1`, whose reads of `_0.0` and `_0.1`
-  from an uninitialized `(u32, bool)` local raise UB in both semantics.
+  from an uninitialized `(u32, bool)` local raise UB in both semantics (with
+  converse error soundness `uninitTupleField0_converse_error` via
+  `mirCall_steps_error` and total outcome trichotomy `uninitTupleField1_outcome`
+  via `mirCall_outcome`).
 * Ground-truth checks of the interpreted operators: signed and unsigned
   `BinOp::Rel`, `RelOp::Cmp` returning `i8`, `bool` ordering, a value-type
   mismatch being a spec panic, `CastOp::Transmute` between `bool` and `u8`

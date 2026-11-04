@@ -576,14 +576,17 @@ open MiniRustSpec.Correspondence.Witness in
   uninitTupleField0_anneal_ub
   uninitTupleField0_minirust_ub_from_start
   uninitTupleField0_minirust_direct
+  uninitTupleField0_converse_error
   uninitTupleField1_inFragment
   uninitTupleField1_translate
   uninitTupleField1_anneal_ub
   uninitTupleField1_minirust_ub_from_start
   uninitTupleField1_minirust_direct
+  uninitTupleField1_outcome
   withOverflow_i8_layout
   withOverflow_u32_layout
   tupleHeadLayout_full_sized_and_slice
+  cappedTailAlign_and_computeSizeAndAlign_all_branches
   evalBinOp_addWithOverflow_i8_max
   evalBinOp_subWithOverflow_i8_min
   evalBinOp_addWithOverflow_u32_max
@@ -872,14 +875,17 @@ open MiniRustSpec.Correspondence.Witness in
   uninitTupleField0_anneal_ub
   uninitTupleField0_minirust_ub_from_start
   uninitTupleField0_minirust_direct
+  uninitTupleField0_converse_error
   uninitTupleField1_inFragment
   uninitTupleField1_translate
   uninitTupleField1_anneal_ub
   uninitTupleField1_minirust_ub_from_start
   uninitTupleField1_minirust_direct
+  uninitTupleField1_outcome
   withOverflow_i8_layout
   withOverflow_u32_layout
   tupleHeadLayout_full_sized_and_slice
+  cappedTailAlign_and_computeSizeAndAlign_all_branches
   evalBinOp_addWithOverflow_i8_max
   evalBinOp_subWithOverflow_i8_min
   evalBinOp_addWithOverflow_u32_max
