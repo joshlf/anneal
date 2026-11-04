@@ -618,7 +618,7 @@ theorem mir_evalRvalue_reifyFnPointer_callee_sig_and_unsafeFnPointer_corresponds
     let expectedPtr : ProvenancePtr := { allocId := fnPtrAllocBase, offsetBytes := 0 }
     let memWithSafe : Memory := { emptyMemory with fnPtrs := [safeEntry] }
     let memWithIntrinsic : Memory := { emptyMemory with fnPtrs := [intrinsicEntry] }
-    (checkCalleeSig mem.callees defPath sigInputs sigOut sigAbi typeArgs = false →
+    (checkCalleeSig mem.callees defPath sigInputs sigOut sigAbi typeArgs mem.traitImpls = false →
       evalRvalue
         locals
         (.cast (.pointerCoercion "ReifyFnPointer") fnConstOp fnPtrTy)
@@ -1160,15 +1160,53 @@ theorem mir_evalTerminator_trait_method_dispatch
       { rangeTraitImplCallee with traitImpls := [rangeImplEntry] }
     let defaultCheckCallee : CapturedMir :=
       { polyIdCallee with defPath := "test::MyTrait::check" }
+    let badArityRangeCallee : CapturedMir :=
+      { rangeTraitImplCallee with typeParamCount := 2 }
+    let blanketComputeEntry : TraitImplEntry :=
+      { traitRef :=
+          { defPath := "test::MyTrait::compute"
+            args := [.param 0 "T"] }
+        implPath := "test::id" }
+    let leftPairEntry : TraitImplEntry :=
+      { traitRef :=
+          { defPath := "test::PairTrait::eq_pair"
+            args := [.adt "Pair" [.param 0 "T", .uint .u32]] }
+        implPath := "test::id" }
+    let rightPairEntry : TraitImplEntry :=
+      { traitRef :=
+          { defPath := "test::PairTrait::eq_pair"
+            args := [.adt "Pair" [.uint .u32, .param 0 "T"]] }
+        implPath := "test::<impl MyTrait<T> for Range<T>>::check" }
     lookupCallee [monoIdCallee] emptyLayoutTable
       "test::MyTrait::compute" [.uint .u32] [monoImplEntry] =
       .some monoIdCallee ∧
+    lookupCallee [polyIdCallee, monoIdCallee] emptyLayoutTable
+      "test::MyTrait::compute" [.uint .u32] [blanketComputeEntry, monoImplEntry] =
+      .some monoIdCallee ∧
+    lookupCallee [polyIdCallee, monoIdCallee] emptyLayoutTable
+      "test::MyTrait::compute" [.uint .u32] [monoImplEntry, blanketComputeEntry] =
+      .some monoIdCallee ∧
+    lookupCallee [polyIdCallee, monoIdCallee] emptyLayoutTable
+      "test::MyTrait::compute" [.uint .u32] [blanketComputeEntry, monoImplEntry, monoImplEntry] =
+      .some monoIdCallee ∧
+    lookupCallee [polyIdCallee, rangeTraitImplCallee] emptyLayoutTable
+      "test::PairTrait::eq_pair" [.adt "Pair" [.uint .u32, .uint .u32]] [leftPairEntry, rightPairEntry] =
+      .none ∧
+    lookupCallee [polyIdCallee, rangeTraitImplCallee] emptyLayoutTable
+      "test::PairTrait::eq_pair" [.adt "Pair" [.uint .u32, .uint .u32]] [rightPairEntry, leftPairEntry] =
+      .none ∧
     lookupCallee [rangeTraitImplCallee] emptyLayoutTable
       "test::MyTrait::check" [.adt "Range" [.uint .usize], .uint .usize] [rangeImplEntry] =
       .some (rangeTraitImplCallee.instantiate [(.uint .usize, polyU64Layout)]) ∧
     lookupCallee [defaultCheckCallee, rangeTraitImplCallee] emptyLayoutTable
       "test::MyTrait::check" [.adt "Range" [.uint .usize], .uint .usize] [rangeImplEntry] =
       .some (rangeTraitImplCallee.instantiate [(.uint .usize, polyU64Layout)]) ∧
+    lookupCallee [defaultCheckCallee] emptyLayoutTable
+      "test::MyTrait::check" [.adt "Range" [.uint .usize], .uint .usize] [rangeImplEntry] =
+      .none ∧
+    lookupCallee [defaultCheckCallee, badArityRangeCallee] emptyLayoutTable
+      "test::MyTrait::check" [.adt "Range" [.uint .usize], .uint .usize] [rangeImplEntry] =
+      .none ∧
     lookupCallee [defaultCheckCallee, rangeTraitImplCallee] emptyLayoutTable
       "test::MyTrait::check" [.uint .u32] [rangeImplEntry] =
       .some (defaultCheckCallee.instantiate [(.uint .u32, polyU32Layout)]) ∧
@@ -1216,7 +1254,7 @@ theorem mir_evalTerminator_trait_method_dispatch
       (.alias "Proj" [.uint .u32]) .nil =
       .some [(0, .uint .u32)] ∧
     s.frame.blockIdx = s.frame.blockIdx := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /--
 Universal theorem that when `Self` in a trait-method call `(traitMethodDefPath, typeArgs)`
