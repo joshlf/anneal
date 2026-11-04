@@ -974,14 +974,19 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
             spec_companions_with_calls: BTreeSet::new(),
         };
         if let Some(ref ob_text) = ob_text_opt {
-            rehydrate_bundle_from_obligations_text(&mut synthetic_bundle, ob_text);
+            rehydrate_bundle_from_obligations_text(
+                &mut synthetic_bundle,
+                ob_text,
+                Some(&obligations_root),
+            );
         }
 
         let should_rerender_verify = authored.has_proof
             || authored.has_specs
             || authored.has_assumptions
             || verify_text.contains(&format!("import Proof.{suffix}"))
-            || verify_text.contains(&format!("import Specs.{suffix}"));
+            || verify_text.contains(&format!("import Specs.{suffix}"))
+            || verify_text.contains(&format!("import Assumptions.{suffix}"));
         if should_rerender_verify {
             let new_verify = render_verify_module_with_options(&synthetic_bundle, authored);
             write_if_changed(verify_path, &new_verify)?;
@@ -1062,22 +1067,96 @@ fn extract_def_id_comment(text: &str) -> Option<String> {
     None
 }
 
-/// Reconstruct companion and external-spec metadata on `bundle` from an
-/// existing `.anneal/generated/Obligations/<Item>.lean` file so
-/// `refresh_workspace_assembly` preserves inline companions and
-/// `#[external_spec]` contracts when re-rendering `Verify/<Item>.lean`.
-fn rehydrate_bundle_from_obligations_text(bundle: &mut SubjectObligationBundle, ob_text: &str) {
+/// Reconstruct companion, transitive-callee, external-spec, and trusted-callee
+/// metadata on `bundle` from an existing `.anneal/generated/Obligations/<Item>.lean`
+/// file so `refresh_workspace_assembly` preserves inline companions,
+/// `defaultCallees`, `#[external_spec]` contracts, and sibling `#[spec(trusted)]`
+/// callee references when re-rendering `Verify/<Item>.lean`.
+fn rehydrate_bundle_from_obligations_text(
+    bundle: &mut SubjectObligationBundle,
+    ob_text: &str,
+    obligations_root: Option<&Path>,
+) {
     let parse_linked_item = |line: &str, prefix: &str| -> Option<(String, String)> {
         let rest = line.strip_prefix(prefix)?;
         let (def_id, after) = rest.split_once("` (`")?;
         let (lean_mod, _) = after.split_once("`)")?;
         Some((def_id.to_string(), lean_mod.to_string()))
     };
+    let extract_mir_body_suffixes = |line: &str| -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = line;
+        while let Some(pos) = rest.find("Mir.") {
+            let after_mir = &rest[pos + "Mir.".len()..];
+            if let Some(body_pos) = after_mir.find(".body") {
+                let candidate = &after_mir[..body_pos];
+                if !candidate.is_empty()
+                    && candidate
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                {
+                    out.push(candidate.to_string());
+                    rest = &after_mir[body_pos + ".body".len()..];
+                    continue;
+                }
+            }
+            rest = &after_mir[1..];
+        }
+        out
+    };
     let subject_def_id = bundle.subject.target.def_id.clone();
     let lines: Vec<&str> = ob_text.lines().collect();
     for (idx, &line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if let Some((def_id, lean_mod)) = parse_linked_item(trimmed, "- Inline requires: `") {
+        if let Some(callee_suffix) = trimmed.strip_prefix("import Obligations.") {
+            let callee_suffix = callee_suffix.trim();
+            if !callee_suffix.is_empty() && callee_suffix != bundle.item_module_suffix {
+                let mut callee_def_id = callee_suffix.to_string();
+                let mut req_module_suffix = None;
+                let mut ens_module_suffix = None;
+                if let Some(ob_root) = obligations_root {
+                    let callee_ob_path = ob_root.join(module_suffix_to_rel_path(callee_suffix));
+                    if let Ok(callee_ob_text) = fs::read_to_string(&callee_ob_path) {
+                        for c_line in callee_ob_text.lines() {
+                            let c_trimmed = c_line.trim();
+                            if let Some(rest) =
+                                c_trimmed.strip_prefix("Disposable verification obligations for `")
+                                && let Some((did, _)) = rest.split_once("`.")
+                            {
+                                callee_def_id = did.to_string();
+                            } else if req_module_suffix.is_none()
+                                && let Some((_, lean_mod)) =
+                                    parse_linked_item(c_trimmed, "- Inline requires: `")
+                            {
+                                req_module_suffix = Some(
+                                    lean_mod
+                                        .strip_prefix("Mir.")
+                                        .unwrap_or(&lean_mod)
+                                        .to_string(),
+                                );
+                            } else if ens_module_suffix.is_none()
+                                && let Some((_, lean_mod)) =
+                                    parse_linked_item(c_trimmed, "- Inline ensures: `")
+                            {
+                                ens_module_suffix = Some(
+                                    lean_mod
+                                        .strip_prefix("Mir.")
+                                        .unwrap_or(&lean_mod)
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+                bundle.called_callees.push(CalleeContractRef {
+                    def_id: callee_def_id,
+                    item_module_suffix: callee_suffix.to_string(),
+                    req_module_suffix,
+                    ens_module_suffix,
+                });
+            }
+        } else if let Some((def_id, lean_mod)) = parse_linked_item(trimmed, "- Inline requires: `")
+        {
             bundle.inline_requires.push(UnitTargetRecord {
                 target: CapturedTarget {
                     def_id,
@@ -1113,6 +1192,24 @@ fn rehydrate_bundle_from_obligations_text(bundle: &mut SubjectObligationBundle, 
                 associated_subject_def_id: Some(subject_def_id.clone()),
                 trait_impls: Vec::new(),
             });
+        } else if trimmed == "def defaultCallees : List CapturedMir :="
+            && let Some(list_line) = lines.get(idx + 1)
+        {
+            for suffix in extract_mir_body_suffixes(list_line) {
+                bundle.transitive_callees.push(TransitiveCalleeRef {
+                    def_id: suffix.clone(),
+                    item_module_suffix: suffix,
+                });
+            }
+        } else if trimmed == "def defaultSpecCallees : List CapturedMir :="
+            && let Some(list_line) = lines.get(idx + 1)
+        {
+            for suffix in extract_mir_body_suffixes(list_line) {
+                bundle.spec_callees.push(TransitiveCalleeRef {
+                    def_id: suffix.clone(),
+                    item_module_suffix: suffix,
+                });
+            }
         } else if trimmed == "externalSpecCallContract"
             && let Some(target_line) = lines.get(idx + 1)
             && let Some(sidecar_line) = lines.get(idx + 2)
@@ -1123,11 +1220,17 @@ fn rehydrate_bundle_from_obligations_text(bundle: &mut SubjectObligationBundle, 
                 .strip_prefix("Mir.")
                 .and_then(|s| s.strip_suffix(".body"))
             {
+                let req_module_suffix = lines
+                    .get(idx + 3)
+                    .and_then(|l| extract_mir_body_suffixes(l).into_iter().next());
+                let ens_module_suffix = lines
+                    .get(idx + 4)
+                    .and_then(|l| extract_mir_body_suffixes(l).into_iter().next());
                 bundle.external_spec_callees.push(ExternalSpecContractRef {
                     target_def_id,
                     sidecar_module_suffix: sidecar_suffix.to_string(),
-                    req_module_suffix: None,
-                    ens_module_suffix: None,
+                    req_module_suffix,
+                    ens_module_suffix,
                 });
             }
         }
@@ -2138,6 +2241,7 @@ mod tests {
         write_mir("Mir/MyCrate/linked_mid.lean", &["my_crate::trusted_leaf"]);
         write_mir("Mir/MyCrate/trusted_leaf.lean", &[]);
         write_mir("Mir/MyCrate/__anneal_attr_trusted_trusted_leaf.lean", &[]);
+        write_mir("Mir/MyCrate/__anodized_fn_ensures_trusted_leaf.lean", &[]);
 
         let rec = |def_id: &str, rel: &str, module: &str, kind, assoc: Option<&str>| {
             UnitTargetRecord {
@@ -2181,6 +2285,13 @@ mod tests {
                 CapturedItemKind::ExternalSpec,
                 Some("my_crate::trusted_leaf"),
             ),
+            rec(
+                "my_crate::__anodized_fn_ensures_trusted_leaf",
+                "Mir/MyCrate/__anodized_fn_ensures_trusted_leaf.lean",
+                "Mir.MyCrate.__anodized_fn_ensures_trusted_leaf",
+                CapturedItemKind::InlineSpecEnsures,
+                Some("my_crate::trusted_leaf"),
+            ),
         ];
 
         scaffold_workspace(&workspace, &records)
@@ -2195,6 +2306,40 @@ mod tests {
         assert!(
             caller_ob.contains("envAssumed := Obligations.MyCrate.trusted_leaf.defaultCallContract.holdsOn"),
             "caller must assume transitive trusted_leaf's defaultCallContract in envAssumed:\n{caller_ob}"
+        );
+        let initial_caller_verify =
+            fs::read_to_string(workspace.join(".anneal/generated/Verify/MyCrate/caller.lean"))
+                .expect("read initial caller verify");
+        assert!(
+            initial_caller_verify.contains("import Mir.MyCrate.linked_mid\n")
+                && initial_caller_verify.contains("import Mir.MyCrate.trusted_leaf\n")
+                && initial_caller_verify
+                    .contains("import Mir.MyCrate.__anodized_fn_ensures_trusted_leaf\n")
+                && initial_caller_verify.contains("instance (priority := low) defaultModularProof"),
+            "initial Verify/MyCrate/caller.lean must import linked/trusted callees and emit defaultModularProof:\n{initial_caller_verify}"
+        );
+
+        // Author and then delete a temporary Proof/MyCrate/caller.lean, then
+        // verify `refresh_workspace_assembly` rehydrates `transitive_callees`
+        // and `called_callees` from `Obligations/MyCrate/caller.lean`.
+        let caller_proof_path = workspace.join("anneal/proofs/Proof/MyCrate/caller.lean");
+        fs::create_dir_all(caller_proof_path.parent().expect("proof parent"))
+            .expect("create Proof/MyCrate");
+        fs::write(
+            &caller_proof_path,
+            "theorem verified : ModularVerificationResult Obligations.MyCrate.caller.modularClaim := sorry\n",
+        )
+        .expect("write temporary caller proof");
+        refresh_workspace_assembly(&workspace).expect("refresh with caller proof");
+        fs::remove_file(&caller_proof_path).expect("delete temporary caller proof");
+        refresh_workspace_assembly(&workspace).expect("refresh after deleting caller proof");
+
+        let refreshed_caller_verify =
+            fs::read_to_string(workspace.join(".anneal/generated/Verify/MyCrate/caller.lean"))
+                .expect("read refreshed caller verify");
+        assert_eq!(
+            refreshed_caller_verify, initial_caller_verify,
+            "refresh_workspace_assembly must preserve transitive_callees, called_callees, and defaultModularProof"
         );
 
         let _ = fs::remove_dir_all(&workspace);

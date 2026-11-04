@@ -2266,7 +2266,7 @@ example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (p : ProvenancePtr) :
     valueValidForTy L { kind := .ref .not (.param 0 "T"), layoutIdx := 0 } (.ptr p 8) ∧
     valueValidForTy L { kind := .ref .not (.param 0 "T"), layoutIdx := 0 }
       (.aggregate 0 [.ptr p 8, .scalar ⟨5, 8⟩]) :=
-  ⟨Or.inl (Or.inl ⟨p, 8, rfl⟩), Or.inr ⟨p, 8, .scalar ⟨5, 8⟩, rfl⟩⟩
+  ⟨Or.inl (Or.inl ⟨p, 8, rfl⟩), Or.inr ⟨p, 8, .scalar ⟨5, 8⟩, Or.inr ⟨⟨5, 8⟩, rfl⟩, rfl⟩⟩
 
 example (p : ProvenancePtr) :
     evalRvalue
@@ -2365,6 +2365,52 @@ example :
       (.alias "Assoc" [.uint .u32])
       (.alias "Assoc" [.param 0 "T"]) = true :=
   ⟨rfl, rfl, rfl⟩
+
+-- 7c. Wide-to-thin `CastKind.ptrToPtr` (as in `<[T]>::as_ptr`), wide-to-wide
+--     `CastKind.ptrToPtr`, array-to-slice `Unsize`, and rejection of non-word
+--     (`.unit`) wide-pointer metadata.
+example (p : ProvenancePtr) :
+    evalRvalue
+      [.init (.aggregate 0 [.ptr p 8, .scalar ⟨4, 8⟩])]
+      (.cast .ptrToPtr (.move { local_ := 0, projection := .nil })
+        { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 })
+      emptyMemory =
+    .ok (.ptr p 8) [.uninit] emptyMemory :=
+  rfl
+
+example (p : ProvenancePtr) :
+    evalRvalue
+      [.init (.aggregate 0 [.ptr p 8, .scalar ⟨4, 8⟩])]
+      (.cast .ptrToPtr (.move { local_ := 0, projection := .nil })
+        { kind := .rawPtr .not (.slice (.uint .u8)), layoutIdx := 0 })
+      emptyMemory =
+    .ok (.aggregate 0 [.ptr p 8, .scalar ⟨4, 8⟩]) [.uninit] emptyMemory :=
+  rfl
+
+example (p : ProvenancePtr) :
+    evalRvalue
+      [.init (.ptr p 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
+        { kind := .ref .not (.slice (.uint .u8)), layoutIdx := 0 })
+      emptyMemory
+      (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.array (.uint .u8) 4), layoutIdx := 0 }, debugName := .none }]) =
+    .ok (.aggregate 0 [.ptr p 8, .scalar ⟨4, 8⟩]) [.init (.ptr p 8)] emptyMemory :=
+  rfl
+
+example :
+    evalRvalue
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .unit])]
+      (.ref .shared { local_ := 0, projection := [.deref] })
+      { emptyMemory with
+        globals := [{ allocId := 7, bytes := [], relocations := [], align := ⟨1⟩, mutability := .not }] } = .ub :=
+  rfl
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (p : ProvenancePtr) :
+    ¬ valueValidForTy L { kind := .ref .not (.dynamic "Trait"), layoutIdx := 0 }
+      (.aggregate 0 [.ptr p 8, .unit]) := by
+  rintro ⟨_, _, _, h_meta, h_eq⟩
+  cases h_eq
+  rcases h_meta with ⟨_, _, h⟩ | ⟨_, _, h⟩ <;> cases h
 
 -- 8. The FFI target has no captured body, so a call to it is a `MirCallE`
 --    interaction bound only by its external call contract, whose postcondition

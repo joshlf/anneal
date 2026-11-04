@@ -1881,6 +1881,44 @@ def isThinRawPtrTy (ty : Ty) : Bool :=
   | _ => false
 
 /--
+Test whether `v` is valid second-word metadata for a wide pointer (`Value.scalar`
+for slice/`str` length or vtable address, or `Value.ptr` for vtable provenance).
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Pointer types to DSTs are sized but have twice the size of pointers to sized
+> types"
+-/
+@[reducible]
+def isWidePtrMetadata : Value → Bool
+  | .scalar _ => true
+  | .ptr _ _ => true
+  | _ => false
+
+/--
+When coercing a fixed-size array reference or raw pointer (`&[T; n]` or
+`*const [T; n]`) to a slice reference or raw pointer (`&[T]` or `*const [T]`),
+extract the static array length `n` for the resulting wide pointer's metadata.
+
+Reference (The Rust Reference, "Unsized Coercions"):
+<https://doc.rust-lang.org/1.98.0/reference/type-coercions.html#unsized-coercions>
+
+> "* `[T; n]` to `[T]`."
+-/
+@[reducible]
+def unsizeArrayLen? (opTy : Option Ty) (targetKind : RigidTy) : Option Nat :=
+  let isSliceTarget :=
+    match targetKind with
+    | .ref _ (.slice _) => true
+    | .rawPtr _ (.slice _) => true
+    | _ => false
+  match isSliceTarget, opTy with
+  | true, .some { kind := .ref _ (.array _ n), .. } => .some n
+  | true, .some { kind := .rawPtr _ (.array _ n), .. } => .some n
+  | _, _ => .none
+
+/--
 Test whether a monomorphized caller `RigidTy` matches a (possibly polymorphic)
 callee declaration `RigidTy` once every generic parameter `.param idx _` in the
 declaration is resolved to `typeArgs[idx]`, the monomorphized type arguments of
@@ -2200,9 +2238,16 @@ def evalReifyFnPointer
   match isReifyFnPointerCoercion coercionKind with
   | false =>
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok (.ptr ptrVal sz) locals' => .ok (.ptr ptrVal sz) locals' mem
-    | .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' =>
-      .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
+    | .ok (.ptr ptrVal sz) locals' =>
+      match unsizeArrayLen? (operandTy localDecls layouts op) targetTy.kind with
+      | .some n =>
+        .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar ⟨n, 8⟩ :: .nil)) locals' mem
+      | .none => .ok (.ptr ptrVal sz) locals' mem
+    | .ok (.aggregate 0 (.ptr ptrVal sz :: metaVal :: .nil)) locals' =>
+      match isWidePtrMetadata metaVal with
+      | true =>
+        .ok (.aggregate 0 (.ptr ptrVal sz :: metaVal :: .nil)) locals' mem
+      | false => .unsupported
     | .ok _ _ => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported
@@ -2600,8 +2645,8 @@ def evalRvalue
               .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
         | .none => .ub
       | .some (.init (.aggregate 0 (.ptr parentPtr sz :: metaVal :: .nil))) =>
-        match restProj with
-        | .nil =>
+        match isWidePtrMetadata metaVal, restProj with
+        | true, .nil =>
           match lookupBorrow mem.borrows parentPtr.tag with
           | .some parentEntry =>
             match parentEntry.perm, borrowKind with
@@ -2638,7 +2683,7 @@ def evalRvalue
                 .ok (.aggregate 0 (.ptr parentPtr sz :: metaVal :: .nil)) locals mem
               | .not => .ub
             | _, _ => .ub
-        | _ :: _ => .ub
+        | _, _ => .ub
       | _ => .ub
     | _ =>
       match get? locals place.local_ with
@@ -2698,8 +2743,8 @@ def evalRvalue
               .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
         | .none => .ub
       | .some (.init (.aggregate 0 (.ptr parentPtr sz :: metaVal :: .nil))) =>
-        match restProj with
-        | .nil =>
+        match isWidePtrMetadata metaVal, restProj with
+        | true, .nil =>
           match lookupBorrow mem.borrows parentPtr.tag with
           | .some parentEntry =>
             match parentEntry.perm, mutability with
@@ -2736,7 +2781,7 @@ def evalRvalue
                 .ok (.aggregate 0 (.ptr parentPtr sz :: metaVal :: .nil)) locals mem
               | .not => .ub
             | _, _ => .ub
-        | _ :: _ => .ub
+        | _, _ => .ub
       | _ => .ub
     | _ =>
       match get? locals place.local_ with
@@ -2787,11 +2832,17 @@ def evalRvalue
     | .ok _ _ => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported
-  | .cast .ptrToPtr op _ =>
+  | .cast .ptrToPtr op targetTy =>
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
     | .ok (.ptr ptrVal sz) locals' => .ok (.ptr ptrVal sz) locals' mem
-    | .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' =>
-      .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
+    | .ok (.aggregate 0 (.ptr ptrVal sz :: metaVal :: .nil)) locals' =>
+      match isWidePtrMetadata metaVal with
+      | true =>
+        match isThinRawPtrTy targetTy with
+        | true => .ok (.ptr ptrVal sz) locals' mem
+        | false =>
+          .ok (.aggregate 0 (.ptr ptrVal sz :: metaVal :: .nil)) locals' mem
+      | false => .unsupported
     | .ok _ _ => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported

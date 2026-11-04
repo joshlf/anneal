@@ -539,7 +539,7 @@ def thinPointerValueValid (v : Value) : Prop :=
 /--
 Validity of a wide pointer `Value` to an unsized `pointee`: a data pointer
 paired with a 64-bit `usize` length metadata scalar (`len < scalarModulus 8`)
-for slices and `str`, or with arbitrary vtable metadata for `dyn Trait`.
+for slices and `str`, or with thin-pointer vtable metadata for `dyn Trait`.
 
 Reference (The Rust Reference, "Dynamically Sized Types"):
 <https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
@@ -548,7 +548,10 @@ Reference (The Rust Reference, "Dynamically Sized Types"):
 -/
 def widePointerValueValid (pointee : RigidTy) (v : Value) : Prop :=
   match pointee with
-  | .dynamic _ => ∃ p sz metadata, v = .aggregate 0 (.ptr p sz :: metadata :: .nil)
+  | .dynamic _ =>
+    ∃ p sz metadata,
+      And (thinPointerValueValid metadata)
+        (v = .aggregate 0 (.ptr p sz :: metadata :: .nil))
   | _ =>
     ∃ p sz len,
       And (len < scalarModulus 8)
@@ -575,7 +578,9 @@ def pointerValueValid (pointee : RigidTy) (v : Value) : Prop :=
     | true => thinPointerValueValid v
     | false =>
       Or (thinPointerValueValid v)
-        (∃ p sz metadata, v = .aggregate 0 (.ptr p sz :: metadata :: .nil))
+        (∃ p sz metadata,
+          And (thinPointerValueValid metadata)
+            (v = .aggregate 0 (.ptr p sz :: metadata :: .nil)))
 
 /--
 Pointwise element validity predicate over a tuple's `List RigidTy` field types
