@@ -2496,6 +2496,24 @@ theorem evalStmt_placeMention (s : MachineState) (decls : List LocalDecl) (layou
   | uninit => simp [MirStepNode.step]
   | init v => simp [MirStepNode.step]
 
+theorem evalStmt_placeMention_place (s : MachineState) (decls : List LocalDecl)
+    (layouts : Layout.LayoutTable) (p : Place) (span : String)
+    (hslots : SlotsOk decls s.frame.locals) (hn : s.frame.locals.length = decls.length)
+    (hi : p.local_ < decls.length) :
+    evalStmt s ⟨.placeMention p, span⟩ decls layouts =
+      .tau (.running (advanceStmt s s.frame.locals)) := by
+  have hil : p.local_ < s.frame.locals.length := by rw [hn]; exact hi
+  obtain ⟨d, hd⟩ : ∃ d, decls[p.local_]? = some d := ⟨decls[p.local_], by simp [hi]⟩
+  have hs : s.frame.locals[p.local_]? = some s.frame.locals[p.local_] := by simp [hil]
+  have hslot := hslots p.local_ d _ hd hs
+  have hlive : s.frame.locals[p.local_] ≠ .dead := by
+    intro h; rw [h] at hslot; exact hslot
+  simp only [evalStmt, get?, hs]
+  cases hsl : s.frame.locals[p.local_] with
+  | dead => exact absurd hsl hlive
+  | uninit => simp [MirStepNode.step]
+  | init v => simp [MirStepNode.step]
+
 theorem stepMirFn_stmt (body : CapturedMir) (s : MachineState) (bb : BasicBlockData)
     (stmt : MirAst.Statement) (hcallee : s.memory.activeCallee = none)
     (hphase : body.phase = .runtimePostCleanup)

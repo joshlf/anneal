@@ -125,8 +125,10 @@ functions needed to run the fragment below on `Machine<BasicMemory<x86_64>>`:
 `PlaceExpr::{Local, Field}` (`PlaceExpr::Field` indexing `(offset, field_ty)`
 and offsetting the pointer via `Machine::ptr_offset_inbounds` and
 `ConcurrentMemory::signed_dereferenceable` / `BasicMemory::signed_dereferenceable`),
-`ValueExpr::{Constant, Load, Tuple, UnOp, BinOp}` (`ValueExpr::Tuple` checking
-each field value's type against `Type::Tuple`) with
+`ValueExpr::{Constant, Load, Tuple, UnOp, BinOp}` (`ValueExpr::Tuple` evaluating
+each field expression in order and returning `(Value::Tuple(fields), ty)`, while
+`check_value` and `Type::encode` validate field count and field values against
+`Type::Tuple` at `typed_store` / `typed_load`) with
 `IntUnOp::{Neg, BitNot, CountOnes}` (all 3 `IntUnOp` variants),
 `CastOp::{IntToInt, Transmute}` (both `CastOp` variants; `Transmute` runs
 `Machine::transmute`, which encodes the value at the old type and decodes
@@ -181,7 +183,7 @@ restricted to the fragment checked by `inFragment`:
   for any integer type `Int`;
 * statements are `_i = Use(op)`, `_i = UnaryOp(Neg | Not, op)`,
   `_i = BinaryOp(Add | Sub | Mul | Div | Rem | BitXor | BitAnd | BitOr | Shl | Shr | AddUnchecked | SubUnchecked | MulUnchecked | ShlUnchecked | ShrUnchecked, opL, opR)`,
-  `_i = Cast(CastKind::IntToInt, op, targetTy)`, or `PlaceMention(_i)`,
+  `_i = Cast(CastKind::IntToInt, op, targetTy)`, or `PlaceMention(_i | _i.0 | _i.1)`,
   with `op`, `opL`, `opR` projection-free `copy _j`, tuple field projection
   `copy (_j.0)` (for an integer operand from a `(Int, bool)` local) or
   `copy (_j.1)` (for a `bool` operand from a `(Int, bool)` local), or integer
@@ -422,8 +424,9 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `checkedArithMulOv_*`), plus `argsOk` rejection of an invalid `bool` byte in
   a tuple argument (`checkedArithInvalidTupleArg_rejected`).
 * `checkedTupleU32`, a `(u32, u32) -> (u32, bool)` body returning a padded
-  8-byte `(u32, bool)` 2-tuple in `_0`, exercising `PlaceMention(_0)` on the
-  uninitialized tuple return place, unsigned `0u32 - 1u32 = (u32::MAX, true)`
+  8-byte `(u32, bool)` 2-tuple in `_0`, exercising `PlaceMention(_0)`,
+  `PlaceMention(_0.0)`, and `PlaceMention(_0.1)` on the uninitialized tuple
+  return place, unsigned `0u32 - 1u32 = (u32::MAX, true)`
   underflow followed by `u32::MAX + 1u32 = (0u32, true)` overflow
   (`checkedTupleUnderAddOv_*`), unsigned multiplication overflow
   `65536u32 * 65536u32 = (0u32, true)` and `Aggregate(Tuple, [copy (_0.0), copy (_0.1)])`
@@ -441,9 +444,11 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   and encodings on `i8` and `u32`, `TupleHeadLayout::full_size_and_align` and
   `LayoutStrategy::compute_size_and_align` on sized and unsized layouts,
   `BinOp::IntWithOverflow` on `INT_MAX + 1`, `INT_MIN - 1`, `UINT_MAX + 1`,
-  `0 - 1`, and multiplication overflow, `Machine::ptr_offset_inbounds` in-bounds
-  and out-of-bounds UB, `ValueExpr::Tuple`, and `PlaceExpr::Field`
-  (`withOverflow_i8_layout`, ..., `evalValue_tuple_and_evalPlace_field`); and of
+  `0 - 1`, multiplication overflow, and a non-integer operand (`specPanic`),
+  `Machine::ptr_offset_inbounds` in-bounds and out-of-bounds UB,
+  `ValueExpr::Tuple`, and `PlaceExpr::Field` (including `specPanic`s on invalid
+  field indices, missing unsized tail, and non-projectable types;
+  `withOverflow_i8_layout`, ..., `evalPlace_field_panics`); and of
   the representation of
   enums, tuples, unions, slices, and trait objects: exactly the bytes `0`, `1`,
   `255` are valid at `orderingTy` (`ordering_validTags`), decoding, encoding,

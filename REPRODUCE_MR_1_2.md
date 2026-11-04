@@ -28,14 +28,16 @@ as a pass.
     `Int`, wraps it with `int_ty.bring_in_bounds(res)` (`res_wrapped`), and
     returns `(Value::Tuple([Value::Int(res_wrapped), Value::Bool(res != res_wrapped)]), int_ty.with_overflow())`.
   - `ValueExpr::Tuple` (`spec/lang/step/expressions.md:72`), evaluating each
-    field expression in order (`evalValues`), checking `Type::Tuple { sized_fields, unsized_field: None, .. }`,
-    and verifying `f_ty == ty` for every field (`specPanic` on mismatch).
+    field expression in order (`evalValues`) and returning
+    `(Value::Tuple(fields), ty)` (while static WF checks expression types and
+    dynamic `check_value` / `Type::encode` validate field count and field values
+    against `Type::Tuple` at `typed_store` / `typed_load`).
   - `PlaceExpr::Field` (`spec/lang/step/expressions.md:24`), evaluating the root
     place, indexing `(offset, field_ty)` in `Type::Tuple { sized_fields, unsized_field, sized_head_layout }`
-    (supporting both sized fields and an unsized tail field via
-    `TupleHeadLayout::full_size_and_align` and
+    or `Type::Union { fields, .. }` (supporting both sized fields and an unsized
+    tail field via `TupleHeadLayout::full_size_and_align` and
     `LayoutStrategy::compute_size_and_align`), checking in-bounds dereferenceability
-    of the entire root tuple via `Machine::ptr_offset_inbounds`
+    of the entire root tuple/union via `Machine::ptr_offset_inbounds`
     (`ConcurrentMemory::signed_dereferenceable` /
     `BasicMemory::signed_dereferenceable`), offsetting the thin pointer by
     `offset.bytes()`, and widening with `field_ty.layout().is_sized()`.
@@ -61,7 +63,10 @@ as a pass.
     `u8..u128`, `usize`).
   - Field projections `_j.0` and `_j.1` (`PlaceExpr::Field(PlaceExpr::Local(_j), 0)`
     and `PlaceExpr::Field(PlaceExpr::Local(_j), 1)`, matching
-    `tooling/minimize/src/place.rs`'s `ProjectionElem::Field`).
+    `tooling/minimize/src/place.rs`'s `ProjectionElem::Field`), in both
+    `Operand::Copy` (`copy (_j.0)`, `copy (_j.1)`) and `StatementKind::PlaceMention`
+    (`PlaceMention(_j)`, `PlaceMention(_j.0)`, `PlaceMention(_j.1)`, matching
+    `tooling/minimize/src/bb.rs`).
   - Checked binary operations `BinOp::AddWithOverflow`, `BinOp::SubWithOverflow`,
     and `BinOp::MulWithOverflow` (`translateCheckedBinOp`, matching
     `tooling/minimize/src/rvalue.rs` lines 169-174 and 291-295).
@@ -78,7 +83,8 @@ as a pass.
     uninitialized slot as `2 * it.size.bytes` `Uninit` bytes.
   - Proves `evalPlace_field0`, `evalPlace_field1`, `typedLoad_local_tuple_field0`,
     `typedLoad_local_tuple_field0_uninit`, `typedLoad_local_tuple_field1`,
-    `typedLoad_local_tuple_field1_uninit`, `evalBinOp_intWithOverflow`,
+    `typedLoad_local_tuple_field1_uninit`, `evalStatement_placeMention_place`,
+    `evalStmt_placeMention_place`, `evalBinOp_intWithOverflow`,
     `evalScalarBinOp_checked`, `evalValue_rvalueTuple`, `evalRvalue_fragTuple`,
     `evalStatement_assignTuple`, and `evalStmt_assignTuple`, establishing exact
     agreement between Anneal's `evalScalarBinOp` and MiniRust's
@@ -107,8 +113,9 @@ as a pass.
       argument (`checkedArithInvalidTupleArg_rejected`).
   - `checkedTupleU32`: a 3-block `(u32, u32) -> (u32, bool)` program returning a
     padded 8-byte `(u32, bool)` tuple (3 trailing `AbstractByte::Uninit` padding
-    bytes), exercising `PlaceMention(_0)` on the uninitialized tuple return
-    place, `SubWithOverflow`, `AddWithOverflow`, `MulWithOverflow`, and
+    bytes), exercising `PlaceMention(_0)`, `PlaceMention(_0.0)`, and
+    `PlaceMention(_0.1)` on the uninitialized tuple return place,
+    `SubWithOverflow`, `AddWithOverflow`, `MulWithOverflow`, and
     `Aggregate(Tuple, [copy (_0.0), copy (_0.1)])` across:
     - unsigned `0u32 - 1u32 = (u32::MAX, true)` underflow followed by
       `UINT_MAX + 1` (`u32::MAX + 1u32 = (0u32, true)`,
@@ -124,7 +131,8 @@ as a pass.
     `evalBinOp_subWithOverflow_i8_min`, `evalBinOp_addWithOverflow_u32_max`,
     `evalBinOp_subWithOverflow_u32_zero`, `evalBinOp_mulWithOverflow_i8_min`,
     `evalBinOp_mulWithOverflow_u32`, `ptrOffsetInbounds_ok_and_oob`,
-    `evalValue_tuple_and_evalPlace_field`).
+    `evalValue_tuple_and_evalPlace_field`, `evalBinOp_intWithOverflow_nonInt_panics`,
+    `evalPlace_field_panics`).
 
 ## Step 0: environment
 
@@ -175,7 +183,7 @@ Pass: four lines of the form
 
 ```text
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
-[SIMULATION-AUDIT] decls=81 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
-[WITNESS-AUDIT] decls=198 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-MiniRustSpec.Audit: exhaustively verified standard axioms for 9193 declarations across all MiniRustSpec.* modules
+[SIMULATION-AUDIT] decls=83 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
+[WITNESS-AUDIT] decls=200 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+MiniRustSpec.Audit: exhaustively verified standard axioms for 9216 declarations across all MiniRustSpec.* modules
 ```

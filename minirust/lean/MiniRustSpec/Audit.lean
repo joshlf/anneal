@@ -121,6 +121,7 @@ open MiniRustSpec.Correspondence in
   evalReturn_callee
   evalStatement_assign
   evalStatement_placeMention
+  evalStatement_placeMention_place
   evalValue_operand
   evalValue_rvalue
   evalIntBinOp_spec
@@ -130,6 +131,7 @@ open MiniRustSpec.Correspondence in
   countOnesLoop_bounds
   evalStmt_assign
   evalStmt_placeMention
+  evalStmt_placeMention_place
   evalOperand_frag
   evalRvalue_frag
   evalScalarBinOp_frag
@@ -590,6 +592,8 @@ open MiniRustSpec.Correspondence.Witness in
   evalBinOp_mulWithOverflow_u32
   ptrOffsetInbounds_ok_and_oob
   evalValue_tuple_and_evalPlace_field
+  evalBinOp_intWithOverflow_nonInt_panics
+  evalPlace_field_panics
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -682,6 +686,8 @@ open MiniRustSpec.Correspondence in
   evalScalarBinOp_checked
   evalRvalue_fragTuple
   evalStmt_assignTuple
+  evalStatement_placeMention_place
+  evalStmt_placeMention_place
 
 open MiniRustSpec.Correspondence.Witness in
 #check_theorem_deps "[WITNESS-AUDIT]"
@@ -880,6 +886,8 @@ open MiniRustSpec.Correspondence.Witness in
   evalBinOp_mulWithOverflow_u32
   ptrOffsetInbounds_ok_and_oob
   evalValue_tuple_and_evalPlace_field
+  evalBinOp_intWithOverflow_nonInt_panics
+  evalPlace_field_panics
   sumTo_minirust_ret_from_start
   castBitNot4_minirust_ret_from_start
   uninitSwitchUb_minirust_ub_from_start

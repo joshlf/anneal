@@ -3869,7 +3869,7 @@ theorem ctxTupleU32_ok {body : CapturedMir}
 /-- MIR (`Runtime(PostCleanup)`) of
 ```rust
 fn checked_tuple_u32(x: u32, y: u32) -> (u32, bool) {
-    // bb0: PlaceMention(_0) (while _0: (u32, bool) is uninit)
+    // bb0: PlaceMention(_0), PlaceMention(_0.0), PlaceMention(_0.1) (while _0: (u32, bool) is uninit)
     let mut t: (u32, bool) = SubWithOverflow(x, y); // _0 = SubWithOverflow(copy _1, copy _2)
     if t.1 {                                        // switchInt(copy (_0.1)) -> [0: bb1, otherwise: bb2]
         return AddWithOverflow(t.0, 1u32);          // bb2: _0 = AddWithOverflow(copy (_0.0), const 1u32); return
@@ -3879,7 +3879,7 @@ fn checked_tuple_u32(x: u32, y: u32) -> (u32, bool) {
 }
 ```
 Exercises:
-* `PlaceMention(_0)` on the uninitialized `(u32, bool)` return place `_0`;
+* `PlaceMention(_0)`, `PlaceMention(_0.0)`, and `PlaceMention(_0.1)` on the uninitialized `(u32, bool)` return place `_0`;
 * unsigned `0u32 - 1u32 = (u32::MAX, true)` underflow followed by `u32::MAX + 1u32 = (0u32, true)` overflow;
 * unsigned `65536u32 * 65536u32 = (0u32, true)` multiplication overflow;
 * `Rvalue::Aggregate(AggregateKind::Tuple, [copy (_0.0), copy (_0.1)])` (`ValueExpr::Tuple`);
@@ -3893,6 +3893,8 @@ def checkedTupleU32 : CapturedMir where
   basicBlocks := [
     { statements := [
         mkStmt (.placeMention (local_ 0)),
+        mkStmt (.placeMention (field0U32 0)),
+        mkStmt (.placeMention (field1 0)),
         mkStmt (.assign (local_ 0) (.binaryOp .subWithOverflow (.copy (local_ 1)) (.copy (local_ 2))))],
       terminator := mkTerm (.switchInt (.copy (field1 0)) { branches := [(0, 1)], otherwise := 2 }),
       isCleanup := false },
@@ -3917,6 +3919,8 @@ def checkedTupleU32Fn : Gen.Function where
   blocks := ⟨[
     (bbName 0, ⟨[
       .PlaceMention (.Local (localName 0)),
+      .PlaceMention (.Field (.Local (localName 0)) 0),
+      .PlaceMention (.Field (.Local (localName 0)) 1),
       .Assign (.Local (localName 0))
         (.BinOp (.IntWithOverflow .Sub) (.Load (.Local (localName 1))) (.Load (.Local (localName 2))))],
       .Switch
@@ -3985,7 +3989,7 @@ theorem checkedTupleUnderAddOv_minirust_ret_from_start :
 
 set_option maxRecDepth 8192 in
 theorem checkedTupleUnderAddOv_minirust_direct :
-    (Interp.steps 6 checkedTupleUnderAddOvMInit).toOption.map
+    (Interp.steps 8 checkedTupleUnderAddOvMInit).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAllocTupleU32 with data := tupleBytes u32 0 1 }, [1]) := rfl
 
@@ -4029,7 +4033,7 @@ theorem checkedTupleMulOv_minirust_ret_from_start :
 
 set_option maxRecDepth 8192 in
 theorem checkedTupleMulOv_minirust_direct :
-    (Interp.steps 7 checkedTupleMulOvMInit).toOption.map
+    (Interp.steps 9 checkedTupleMulOvMInit).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAllocTupleU32 with data := tupleBytes u32 0 1 }, [1]) := rfl
 
@@ -4071,7 +4075,7 @@ theorem checkedTupleOk_minirust_ret_from_start :
 
 set_option maxRecDepth 8192 in
 theorem checkedTupleOk_minirust_direct :
-    (Interp.steps 7 checkedTupleOkMInit).toOption.map
+    (Interp.steps 9 checkedTupleOkMInit).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAllocTupleU32 with data := tupleBytes u32 21 0 }, [1]) := rfl
 
@@ -4280,5 +4284,22 @@ theorem evalValue_tuple_and_evalPlace_field :
     evalPlace checkedTupleOkMInit (.Field (.Local (localName 0)) 1) =
       .ok ({ ptr := { thin_pointer := { addr := 132, provenance := some (⟨1⟩, ()) }, metadata := none },
              aligned := true }, .Bool) := ⟨rfl, rfl, rfl⟩
+
+/-- `evalBinOp (.IntWithOverflow ..)` on a non-integer operand and `evalPlace (.Field ..)`
+on an out-of-range field index, a missing unsized tail, or a non-projectable
+type raise the exact upstream `specPanic`s from `spec/lang/step/{operators,expressions}.md`. -/
+theorem evalBinOp_intWithOverflow_nonInt_panics :
+    evalBinOp (.IntWithOverflow .Add) (.Bool true, .Bool) (.Bool false, .Bool) =
+      .error (.specPanic "non-integer input to integer operation") := rfl
+
+theorem evalPlace_field_panics :
+    evalPlace checkedTupleOkMInit (.Field (.Local (localName 0)) 2) =
+      .error (.specPanic "field projection to non-existing unsized tail") ∧
+    evalPlace checkedTupleOkMInit (.Field (.Local (localName 0)) 3) =
+      .error (.specPanic "field projection to invalid field") ∧
+    evalPlace checkedTupleOkMInit (.Field (.Local (localName 0)) (-1)) =
+      .error (.specPanic "field projection to invalid field") ∧
+    evalPlace checkedTupleOkMInit (.Field (.Local (localName 1)) 0) =
+      .error (.specPanic "field projection on non-projectable type") := ⟨rfl, rfl, rfl, rfl⟩
 
 end MiniRustSpec.Correspondence.Witness

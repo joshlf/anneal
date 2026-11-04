@@ -668,8 +668,9 @@ def translateRvalue (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Option G
     | _ => none
   | _ => none
 
-/-- `minimize`'s statement translation for assignments and `PlaceMention` on a
-projection-free place (`tooling/minimize/src/bb.rs`):
+/-- `minimize`'s statement translation for assignments to projection-free locals
+and `PlaceMention` on a fragment place (`_i`, `_i.0`, or `_i.1`,
+`tooling/minimize/src/bb.rs`):
 > "rs::StatementKind::Assign(operands) => {
 >      let (place, rval) = &**operands;
 >      let destination = self.translate_place(place, span);
@@ -689,7 +690,7 @@ def translateStatement (decls : List MirAst.LocalDecl) (s : MirAst.Statement) :
   match s.kind with
   | .assign ⟨i, []⟩ rv =>
     (translateRvalue decls rv).map (fun src => .Assign (.Local (localName i)) src)
-  | .placeMention ⟨i, []⟩ => some (.PlaceMention (.Local (localName i)))
+  | .placeMention p => (translatePlace p).map .PlaceMention
   | _ => none
 
 /-- `minimize`'s switch cases for a discriminant of type `it`
@@ -968,11 +969,31 @@ def rvalueOkTuple (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rv
   | .aggregate .tuple [a, b] => operandOk decls it a && operandOkB decls b
   | _ => false
 
+/-- A fragment place: a local `_i`, field `0` (`_i.0`) of an `(Int, bool)`
+tuple local, or field `1` (`_i.1`) of an `(Int, bool)` tuple local. -/
+def placeOk (decls : List MirAst.LocalDecl) : MirAst.Place → Bool
+  | ⟨i, []⟩ => decide (i < decls.length)
+  | ⟨i, [.field 0 fieldTy]⟩ =>
+    decide (i < decls.length) &&
+    match decls[i]? with
+    | some d =>
+      match intBoolTupleOf d.ty, intTypeOf fieldTy with
+      | some it, some fit => decide (fit = it)
+      | _, _ => false
+    | none => false
+  | ⟨i, [.field 1 fieldTy]⟩ =>
+    decide (i < decls.length) &&
+    match decls[i]? with
+    | some d => (intBoolTupleOf d.ty).isSome && isBoolTy fieldTy
+    | none => false
+  | _ => false
+
 /-- Fragment statements, type-checked against the destination's type: an
 integer destination takes an integer rvalue (`rvalueOk`), a `bool`
 destination takes a `bool` rvalue (`rvalueOkB`), an `Ordering` destination
-takes a three-way comparison (`rvalueOkO`), and an `(it, bool)` 2-tuple
-destination takes a 2-tuple rvalue (`rvalueOkTuple`). -/
+takes a three-way comparison (`rvalueOkO`), an `(it, bool)` 2-tuple
+destination takes a 2-tuple rvalue (`rvalueOkTuple`), and `PlaceMention` takes
+any fragment place (`placeOk`). -/
 def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement) : Bool :=
   match s.kind with
   | .assign ⟨i, []⟩ rv =>
@@ -988,7 +1009,7 @@ def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement) : Bool :=
           match intTypeOf d.ty with
           | none => false
           | some it => rvalueOk decls it rv
-  | .placeMention ⟨i, []⟩ => decide (i < decls.length)
+  | .placeMention p => placeOk decls p
   | _ => false
 
 /-- A fragment `switchInt` discriminant: an integer operand of its type, or a

@@ -2134,6 +2134,64 @@ theorem evalStatement_placeMention {body : CapturedMir} {f : Gen.Function} {ctx 
   have hplace := evalPlace_local h.shape i hi _ hspec.2
   simp [evalStatement, hplace]
 
+/-- `Machine::eval_statement` on a translated fragment `PlaceMention` (including
+field projections `_i.0` and `_i.1` on an `(Int, bool)` 2-tuple local). -/
+theorem evalStatement_placeMention_place {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {locals : List LocalSlot} {m : Mach} {blk stmt : Nat} (h : FrameOk body f ctx locals m blk stmt)
+    (p : Place) (hp : placeOk body.localDecls p = true) (pe : Gen.PlaceExpr)
+    (hpe : translatePlace p = some pe) :
+    evalStatement m (.PlaceMention pe) = .ok m ∧ p.local_ < body.localDecls.length := by
+  match p, hp, hpe with
+  | ⟨i, []⟩, hp, hpe =>
+    simp only [placeOk, decide_eq_true_eq] at hp
+    simp only [translatePlace, Option.some.injEq] at hpe
+    subst hpe
+    exact ⟨evalStatement_placeMention h i hp, hp⟩
+  | ⟨i, [.field 0 fieldTy]⟩, hp, hpe =>
+    simp only [placeOk, Bool.and_eq_true, decide_eq_true_eq] at hp
+    obtain ⟨hi, ht⟩ := hp
+    simp only [translatePlace, Option.some.injEq] at hpe
+    subst hpe
+    obtain ⟨d, slot, hd, _⟩ := h.slot_exists i hi
+    simp only [hd] at ht
+    cases htup : intBoolTupleOf d.ty with
+    | none => simp [htup] at ht
+    | some it =>
+      cases hf : intTypeOf fieldTy with
+      | none => simp [htup, hf] at ht
+      | some fit =>
+        simp only [htup, hf, decide_eq_true_eq] at ht
+        subst ht
+        obtain ⟨hTd, hitd⟩ := tyOf_tuple htup
+        have hspec := (translateFn_spec body f h.hf).2.1 i d hd
+        have hloc := hspec.2
+        rw [hTd] at hloc
+        have haddr := h.addrs i d hd
+        rw [hitd] at haddr
+        have hplace := evalPlace_field0 h.shape i hi fit (intBoolTupleOf_good htup) hloc haddr
+        exact ⟨by simp [evalStatement, hplace], hi⟩
+  | ⟨i, [.field 1 fieldTy]⟩, hp, hpe =>
+    simp only [placeOk, Bool.and_eq_true, decide_eq_true_eq] at hp
+    obtain ⟨hi, ht⟩ := hp
+    simp only [translatePlace, Option.some.injEq] at hpe
+    subst hpe
+    obtain ⟨d, slot, hd, hs⟩ := h.slot_exists i hi
+    simp only [hd, Bool.and_eq_true] at ht
+    obtain ⟨htSome, _⟩ := ht
+    obtain ⟨it, htup⟩ := Option.isSome_iff_exists.mp htSome
+    obtain ⟨hTd, hitd⟩ := tyOf_tuple htup
+    have hgood := intBoolTupleOf_good htup
+    have hspec := (translateFn_spec body f h.hf).2.1 i d hd
+    have hloc := hspec.2
+    rw [hTd] at hloc
+    have hL := h.localAllocs_get i d slot hd hs
+    rw [declSlotData_of_some htup, hitd] at hL
+    have haddr := h.addrs i d hd
+    rw [hitd] at haddr
+    have hlen := tupleSlotData_length it slot hgood.pos
+    have hplace := evalPlace_field1 h.shape i hi it hgood hloc _ hL hlen haddr
+    exact ⟨by simp [evalStatement, hplace], hi⟩
+
 /-! ## `bool` rvalues -/
 
 /-- The outcome MiniRust's `BinOp::Rel` computes for two fragment values of

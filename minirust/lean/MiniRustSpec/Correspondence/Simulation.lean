@@ -245,7 +245,8 @@ theorem translateStatement_some {decls : List LocalDecl} {st : MirAst.Statement}
     {st' : Gen.Statement} (h : translateStatement decls st = some st') :
     (∃ i rv e, st.kind = .assign ⟨i, []⟩ rv ∧ translateRvalue decls rv = some e ∧
       st' = .Assign (.Local (localName i)) e) ∨
-    (∃ i, st.kind = .placeMention ⟨i, []⟩ ∧ st' = .PlaceMention (.Local (localName i))) := by
+    (∃ p pe, st.kind = .placeMention p ∧ translatePlace p = some pe ∧
+      st' = .PlaceMention pe) := by
   obtain ⟨kind, span⟩ := st
   simp only [translateStatement] at h ⊢
   match kind, h with
@@ -259,8 +260,10 @@ theorem translateStatement_some {decls : List LocalDecl} {st : MirAst.Statement}
   | .storageLive _, h => simp at h
   | .storageDead _, h => simp at h
   | .retag _ _, h => simp at h
-  | .placeMention ⟨i, []⟩, h => simp at h; exact .inr ⟨i, rfl, h.symm⟩
-  | .placeMention ⟨_, _ :: _⟩, h => simp at h
+  | .placeMention p, h =>
+    cases hpe : translatePlace p with
+    | none => simp [hpe] at h
+    | some pe => simp [hpe] at h; exact .inr ⟨p, pe, rfl, hpe, h.symm⟩
   | .intrinsic _, h => simp at h
   | .coverage, h => simp at h
   | .constEvalCounter, h => simp at h
@@ -458,7 +461,7 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
       rw [hbb] at hbb'
       cases hbb'
       exact hlt
-    rcases translateStatement_some hst' with ⟨i, rv, e, hkind, he, rfl⟩ | ⟨i, hkind, rfl⟩
+    rcases translateStatement_some hst' with ⟨i, rv, e, hkind, he, rfl⟩ | ⟨p, pe, hkind, hpe, rfl⟩
     · ------------------------------------------------------------ assign
       obtain ⟨kind, span⟩ := st
       simp only at hkind
@@ -585,9 +588,10 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
       obtain ⟨kind, span⟩ := st
       simp only at hkind
       subst hkind
-      have hi : i < body.localDecls.length := by simpa [statementOk] using hok
-      have hM := evalStatement_placeMention hframe i hi
-      have hA := evalStmt_placeMention s body.localDecls body.layouts i span hslotsA hrel.nlocals hi
+      have hpOk : placeOk body.localDecls p = true := by simpa [statementOk] using hok
+      obtain ⟨hM, hi⟩ := evalStatement_placeMention_place hframe p hpOk pe hpe
+      have hA := evalStmt_placeMention_place s body.localDecls body.layouts p span hslotsA
+        hrel.nlocals hi
       rw [hA]
       obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee hframe.shape
       refine StepRel.tau' m4 (by simp [hne, listIndex_nat _ _ _ htst, hM, hm4, check_after h4]) ?_
