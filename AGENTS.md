@@ -89,15 +89,31 @@ invariant. Before placing or modifying code, check whether it belongs inside
 
 ## Commenting in `trusted/`
 
-Because auditing `trusted/` alone must suffice to verify that Anneal upholds
-[`PRINCIPLES.md`](PRINCIPLES.md), all code in `trusted/` will undergo careful
-human review. Human understanding is therefore paramount in `trusted/`: comment
-liberally using [`comment-guidelines`](skills/comment-guidelines/SKILL.md) (and
-its companion writing skills in the table above) so a human auditor can verify
-the design rationale, invariants, assumptions, contracts, and subtle semantic or
+Because auditing `trusted/` and its explicit, pinned dependency manifest must
+suffice to verify that Anneal upholds [`PRINCIPLES.md`](PRINCIPLES.md), all code
+in `trusted/` will undergo careful human review. Human understanding is
+therefore paramount in `trusted/`: comment liberally using
+[`comment-guidelines`](skills/comment-guidelines/SKILL.md) (and its companion
+writing skills in the table above) so a human auditor can verify the design
+rationale, invariants, assumptions, contracts, and subtle semantic or
 implementation choices without reconstructing unstated context.
 
 Any code in `trusted/` that claims to model Rust semantics or extract `rustc`
 compiler structures must explain the correspondence in its comments and both
 quote and cite the applicable Rust documentation (`rust-lang/reference`) or
 compiler source (`rust-lang/rust`) at a pinned commit hash.
+
+## Dependencies in `trusted/`
+
+When implementing or modifying components in `trusted/`:
+
+- **Do not hand-roll standard utilities:** Do not write bespoke argument
+  parsers, serializers, cryptographic hashers, or logging machinery to avoid
+  adding a dependency. Rely on battle-tested, standard ecosystem crates.
+- **Audit economy:** A concise, idiomatic interface built on a standard crate
+  is much easier for human reviewers to audit than hundreds of lines of
+  hand-rolled plumbing.
+- **Dependency discipline:** Keep dependencies in `trusted/` focused and
+  conservative. Prefer crates with minimal transitive dependencies and generic,
+  well-understood failure modes that do not pose soundness risks specific to
+  Anneal.
