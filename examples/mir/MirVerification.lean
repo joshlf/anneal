@@ -844,4 +844,141 @@ theorem example_trace_replay_diag_and_soundness :
    rfl,
    rfl⟩
 
+/-! ## 10. Polymorphic `MirAst` (`RigidTy.param`, `RigidTy.alias`, Parametric `LayoutTable`, and `CapturedMir.instantiate`) -/
+
+@[reducible]
+def paramTMirTy : Ty := { kind := .param 0 "T", layoutIdx := 0 }
+
+@[reducible]
+def pairParamTMirTy : Ty :=
+  { kind := .tuple [.param 0 "T", .param 0 "T"], layoutIdx := 1 }
+
+@[reducible]
+def paramTPlaceholderLayout : TypeLayout := {
+  size := { bytes := 0 }
+  align := { bytes := 1 }
+  backendRepr := .memory
+  fields := .primitive
+  variants := .single 0
+  isUninhabited := false
+}
+
+@[reducible]
+def pairParamTCompoundLayout : TypeLayout := {
+  size := { bytes := 0 }
+  align := { bytes := 1 }
+  backendRepr := .memory
+  fields := .arbitrary [{ bytes := 0 }, { bytes := 0 }] [0, 1]
+  variants := .single 0
+  isUninhabited := false
+}
+
+@[reducible]
+def polySwapLayoutTable : LayoutTable := {
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [paramTPlaceholderLayout, pairParamTCompoundLayout]
+}
+
+/--
+Polymorphic `CapturedMir` body `fn swap_pair<T>(a: T, b: T) -> (T, T)` using
+`RigidTy.param 0 "T"`, parametric `LayoutTable` slots (`0` for `T`, `1` for
+`(T, T)`), field projections typed with `paramTMirTy`, and a `TraitImplEntry`.
+-/
+@[reducible]
+def polySwapPairMirBody : CapturedMir := {
+  defPath := "demo::swap_pair"
+  argCount := 2
+  typeParamCount := 1
+  genericParams := [{ idx := 0, name := "T" }]
+  traitImpls := [
+    { traitRef := { defPath := "core::clone::Clone", args := [.param 0 "T"] }
+      implPath := "demo::impl_clone_T" }
+  ]
+  localDecls := [
+    mkDecl .mut pairParamTMirTy,
+    mkDecl .not paramTMirTy,
+    mkDecl .not paramTMirTy,
+    mkDecl .mut pairParamTMirTy
+  ]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 3),
+        mkStmt (.assign { local_ := 3, projection := [] }
+          (.aggregate .tuple
+            [.copy { local_ := 1, projection := [] },
+             .copy { local_ := 2, projection := [] }])),
+        mkStmt (.assign { local_ := 0, projection := [] }
+          (.aggregate .tuple
+            [.copy { local_ := 3, projection := [.field 1 paramTMirTy] },
+             .copy { local_ := 3, projection := [.field 0 paramTMirTy] }])),
+        mkStmt (.storageDead 3)
+      ]
+      terminator := mkTerm .return_
+      isCleanup := false }
+  ]
+  phase := .runtimePostCleanup
+  role := .subject
+  fnAbi := {
+    args := [
+      { layout := paramTPlaceholderLayout, mode := .direct },
+      { layout := paramTPlaceholderLayout, mode := .direct }
+    ]
+    ret := { layout := pairParamTCompoundLayout, mode := .direct }
+    conv := .rust
+    canUnwind := false
+  }
+  layouts := polySwapLayoutTable
+  allocations := []
+}
+
+@[reducible]
+def polySwapPairU32MirBody : CapturedMir :=
+  polySwapPairMirBody.instantiate [(.uint .u32, defaultU32TypeLayout)]
+
+def polySwapPairU32Claim : Claim where
+  body := polySwapPairU32MirBody
+  pre args := args = [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩]
+  post _ ret := ret = .aggregate 0 [.scalar ⟨20, 4⟩, .scalar ⟨10, 4⟩]
+
+theorem polySwapPairU32Claim_verified : VerificationResult polySwapPairU32Claim := by
+  refine verifyMirBounded polySwapPairU32Claim 6 ?_
+  rintro _ rfl retVal _ h_out
+  injection h_out with h_pair; injection h_pair with h_ret _
+  exact h_ret.symm
+
+theorem example_polymorphic_mir_instantiate_and_verify :
+    polySwapPairMirBody.instantiate [] = polySwapPairMirBody ∧
+    polySwapPairMirBody.wellFormed = true ∧
+    (polySwapPairMirBody.instantiate [(.uint .u32, defaultU32TypeLayout)]).wellFormed =
+      polySwapPairMirBody.wellFormed ∧
+    polySwapPairU32MirBody.wellFormed = true ∧
+    polySwapPairU32MirBody.typeParamCount = 0 ∧
+    polySwapPairU32MirBody.genericParams = [] ∧
+    polySwapPairU32MirBody.traitImpls =
+      [{ traitRef := { defPath := "core::clone::Clone", args := [.uint .u32] }
+         implPath := "demo::impl_clone_T" }] ∧
+    polySwapPairU32MirBody.layouts.entries =
+      [defaultU32TypeLayout,
+       { size := { bytes := 8 }
+         align := { bytes := 4 }
+         backendRepr := .memory
+         fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }] [0, 1]
+         variants := .single 0
+         isUninhabited := false
+         fieldLayouts := [] },
+       defaultU32TypeLayout] ∧
+    polySwapPairU32MirBody.fnAbi.ret.layout.size = { bytes := 8 } ∧
+    VerificationResult polySwapPairU32Claim :=
+  ⟨CapturedMir.instantiate_nil polySwapPairMirBody,
+   rfl,
+   CapturedMir.instantiate_wellFormed polySwapPairMirBody [(.uint .u32, defaultU32TypeLayout)],
+   rfl,
+   rfl,
+   rfl,
+   rfl,
+   rfl,
+   rfl,
+   polySwapPairU32Claim_verified⟩
+
 end AnnealExamples.MirVerification

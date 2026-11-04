@@ -1,21 +1,34 @@
 # Reproduction Instructions for BRIEF-2.1
 
-1. Check out the branch:
+## Environment & Worktree
+- **Worktree Path**: `/home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2-1`
+- **Branch**: `adv/brief-2-1`
+- **Base Commit**: `d2851b0d778b90c2cb134350b3d7466361bcb3d1`
+
+## Step-by-Step Verification Commands
+
+1. Enter the worktree and verify the branch:
    ```bash
-   git checkout adv/brief-2-1
+   cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2-1
+   git status --short --branch
    ```
 
-2. Verify that the build succeeds:
+2. Build the Lean targets (`Trusted`, `Anneal`, and `MirVerification` including polymorphic `CapturedMir.instantiate` tests) via Lake:
    ```bash
-   cd trusted/lean
-   lake build
-   cd ../../theory
-   lake build
+   export PATH="$HOME/.elan/bin:$PATH"
+   cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2-1/examples
+   lake build Trusted Anneal MirVerification
    ```
+   Expected output: Exit code `0` (`Build completed successfully`).
 
-3. Run the TrustedBoundary audit script:
+3. Run the TrustedBoundary & downstream kernel replay audit:
    ```bash
+   cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2-1
    python3 trusted/audit/check_trusted.py --fast
    ```
-
-4. Both should exit with `0`. The changes introduce `RigidTy.param`, `RigidTy.alias`, `GenericParamDef`, `TraitRef`, `TraitImplEntry`, and `TypeSubst` to `MirAst/Types.lean`, update `CapturedMir` with default fields in `MirAst/Body.lean`, and implement `CapturedMir.instantiate` and `@[simp] theorem instantiate_nil` across both V2026_06_01 and V2026_08_01.
+   Expected output:
+   ```text
+   PASS: kernel dependency closure, statement-origin separation, and Cargo DAG boundary
+   40 Trusted modules; ...
+   ```
+   with exit code `0` and `axioms=['propext', 'Classical.choice', 'Quot.sound']`.
