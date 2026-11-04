@@ -825,7 +825,7 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
   refine ⟨?_, ?_, ?_, ?_, ?_⟩
   · intro hLookup hCompatSite hArgs hFind hCompatBody
     refine ⟨?_, ?_⟩ <;>
-      simp only [evalTerminator, bodyLocalDeclsOf, isDirectExactDivTarget, resolveCallTarget,
+      simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget,
         hNoDirect, hEvalFunc, hOffsetZero, hNoBorrow, hLookup, hCompatSite, hArgs, hFind,
         hCompatBody, Nat.beq_refl, Bool.and_self]
   · intro hLookup hCompatSite hArgs hFindNone
@@ -835,7 +835,7 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
         Nat.beq_refl, Bool.and_self]
   · intro hLookupNone
     refine ⟨?_, ?_⟩ <;>
-      simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hNoDirect, hEvalFunc,
+      simp only [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc,
         hOffsetZero, hNoBorrow, hLookupNone, Nat.beq_refl, Bool.and_self]
   · intro hLookup hCompatFalse
     refine ⟨?_, ?_⟩ <;>
@@ -846,5 +846,53 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
       simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hNoDirect, hEvalFunc,
         hOffsetZero, hNoBorrow, hLookup, hCompatSite, hArgs, hFind, hCompatBodyFalse,
         Nat.beq_refl, Bool.and_self]
+
+/--
+Universal proof that indirect `TerminatorKind.call` and `TerminatorKind.tailCall`
+fault with `MirStepNode.fail .ub` when the function-pointer operand evaluates to
+a pointer with a non-zero byte offset (`ptrVal.offsetBytes = n + 1`) or a
+live stack borrow data pointer (`lookupBorrow s.memory.borrows ptrVal.tag = .some bEntry`).
+-/
+theorem mir_evalTerminator_indirect_call_nonZeroOffset_or_borrow_is_ub
+    (s : MachineState)
+    (func : Operand)
+    (argOps : List Operand)
+    (destination : Place)
+    (targetBb : BasicBlockIdx)
+    (unwind : UnwindAction)
+    (span : String)
+    (callerBody : CapturedMir)
+    (ptrVal : ProvenancePtr)
+    (n : Nat)
+    (bEntry : BorrowEntry)
+    (localsAfterFunc : List LocalSlot)
+    (hNoDirect : extractCalleeDefPath? func = .none)
+    (hEvalFunc :
+      evalOperand
+        s.frame.locals
+        func
+        s.memory.borrows
+        s.memory.globals
+        callerBody.layouts
+        s.memory.callerLocals = .ok (.ptr ptrVal 8) localsAfterFunc) :
+    (ptrVal.offsetBytes = n + 1 →
+      evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
+        MirStepNode.fail .ub ∧
+      evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
+        MirStepNode.fail .ub) ∧
+    (ptrVal.offsetBytes = 0 →
+      lookupBorrow s.memory.borrows ptrVal.tag = .some bEntry →
+      evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
+        MirStepNode.fail .ub ∧
+      evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
+        MirStepNode.fail .ub) := by
+  refine ⟨?_, ?_⟩
+  · intro hNonZero
+    refine ⟨?_, ?_⟩ <;>
+      simp [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc, hNonZero, Nat.beq]
+  · intro hOffsetZero hBorrow
+    refine ⟨?_, ?_⟩ <;>
+      simp [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc,
+        hOffsetZero, hBorrow]
 
 end Correspondence.V2026_08_01.L5_ControlAndCalls
