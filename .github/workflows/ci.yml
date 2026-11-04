@@ -66,6 +66,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Restore the Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: Run workspace unit tests
         run: cargo test --workspace --lib --bins --locked
 
@@ -116,6 +127,18 @@ jobs:
           key: lake-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('trusted/lean/lean-toolchain', 'trusted/lean/**/*.lean', 'theory/**/*.lean') }}
           restore-keys: |
             lake-artifacts-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Restore the Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Replay the tutor and check its rendered chapters
         env:
@@ -176,6 +199,18 @@ jobs:
           key: lake-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('trusted/lean/lean-toolchain', 'trusted/lean/**/*.lean', 'theory/**/*.lean') }}
           restore-keys: |
             lake-artifacts-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Restore the Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Run end-to-end pipeline, demo user journeys, and Miri differential suite
         env:
