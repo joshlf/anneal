@@ -33,11 +33,10 @@ use crate::input_gen::{
     LayoutAwareByteBuilder, LayoutSpec, MirInputDictionary, MirObsPathSet, PaddingFillPattern,
     ScalarLayout,
 };
-use crate::instrument::instrument_source;
 use crate::miri_eval::{json_escape, resolve_rustc_bin};
 use crate::mutators_itree::{
-    GeneratedItreeCandidate, StagedItreeCandidate, contains_unsafe_token,
-    stage_itree_candidate_items,
+    GeneratedItreeCandidate, StagedItreeCandidate, annotate_itree_external_callees,
+    contains_unsafe_token, stage_itree_candidate_items,
 };
 use crate::mutators_miri::DetRng;
 
@@ -374,9 +373,10 @@ pub fn compile_rust_strict_opt(label: &str, opt_level: &str, source: &str) -> bo
 }
 
 /// Compiles every candidate under `#![forbid(unsafe_code)]` at `-C opt-level=0`
-/// and `-C opt-level=2`, and compiles every candidate's `syn`-instrumented copy
-/// at `-C opt-level=0`. Each check first compiles all candidates as one crate
-/// and falls back to one candidate at a time only when the combined crate fails.
+/// and `-C opt-level=2`, and compiles every candidate's `#[anneal_trace::external]`-
+/// annotated copy at `-C opt-level=0`. Each check first compiles all candidates
+/// as one crate and falls back to one candidate at a time only when the combined
+/// crate fails.
 pub fn compile_itree_candidates(
     batches: &[Vec<GeneratedItreeCandidate>],
 ) -> Vec<Vec<CandidateCompile>> {
@@ -386,7 +386,8 @@ pub fn compile_itree_candidates(
         .collect();
 
     let mut combined_safe = String::from("#![forbid(unsafe_code)]\n");
-    let mut combined_inst = String::new();
+    let mut combined_inst =
+        String::from("#![feature(register_tool)]\n#![register_tool(anneal_trace)]\n");
     let mut inst_sources: Vec<Vec<Option<String>>> = Vec::with_capacity(batches.len());
     for (b_idx, batch) in batches.iter().enumerate() {
         let mut batch_inst = Vec::with_capacity(batch.len());
@@ -395,7 +396,9 @@ pub fn compile_itree_candidates(
                 "pub mod b{b_idx}_c{c_idx} {{\n{}\n}}\n",
                 cand.source
             ));
-            let inst = instrument_source(&cand.source, "kernel_step", &["ext_oracle"]).ok();
+            let inst = annotate_itree_external_callees(&cand.source, "kernel_step")
+                .ok()
+                .map(|(annotated, _)| annotated);
             if let Some(src) = &inst {
                 combined_inst.push_str(&format!("pub mod inst_b{b_idx}_c{c_idx} {{\n{src}\n}}\n"));
             }
@@ -430,7 +433,10 @@ pub fn compile_itree_candidates(
             entry.instrumented = match &inst_sources[b_idx][c_idx] {
                 None => false,
                 Some(src) => {
-                    inst_all || compile_rust_strict_opt(&format!("{label}_inst"), "0", src)
+                    let inst_src = format!(
+                        "#![feature(register_tool)]\n#![register_tool(anneal_trace)]\n{src}"
+                    );
+                    inst_all || compile_rust_strict_opt(&format!("{label}_inst"), "0", &inst_src)
                 }
             };
         }

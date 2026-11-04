@@ -13,8 +13,9 @@
 //! `TraceReplayDiag` divergences.
 //!
 //! When invoked with `--compile-only`, it checks candidate compilation at
-//! `-C opt-level=0`, `-C opt-level=2`, and `instrument_source` without running
-//! native execution or Lean (`"oracle_comparison": "not_performed"`).
+//! `-C opt-level=0`, `-C opt-level=2`, and `#[anneal_trace::external]`
+//! annotation without running native execution or Lean
+//! (`"oracle_comparison": "not_performed"`).
 
 use std::collections::BTreeMap;
 use std::env;

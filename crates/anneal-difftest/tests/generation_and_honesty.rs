@@ -28,9 +28,11 @@ use anneal_difftest::input_gen::{
     MirInputDictionary, PaddingFillPattern, ScalarLayout,
 };
 use anneal_difftest::instrument::{
-    EnvAction, EnvSchedule, RecordedEvent, RecordedOutcome, TraceRecorder, instrument_source,
+    EnvAction, EnvSchedule, RecordedEvent, RecordedOutcome, TraceRecorder,
 };
-use anneal_difftest::mutators_itree::{contains_unsafe_token, generate_itree_batch};
+use anneal_difftest::mutators_itree::{
+    annotate_itree_external_callees, contains_unsafe_token, generate_itree_batch,
+};
 use anneal_difftest::mutators_miri::generate_miri_batch;
 use anneal_difftest::shrink::{shrink_bytes, shrink_mutation_chain};
 
@@ -794,7 +796,8 @@ pub fn kernel_step(magic: u32, len: u32) -> u32 {
 
     let mut seen_mutators = BTreeSet::new();
     let mut combined_forbid_unsafe = String::from("#![forbid(unsafe_code)]\n");
-    let mut combined_instrumented = String::new();
+    let mut combined_instrumented =
+        String::from("#![feature(register_tool)]\n#![register_tool(anneal_trace)]\n");
     for b_idx in 0..NUM_BATCHES {
         let batch_seed = BASE_SEED.wrapping_add((b_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let batch = generate_itree_batch(itree_seeds, BATCH_SIZE, batch_seed);
@@ -812,8 +815,8 @@ pub fn kernel_step(magic: u32, len: u32) -> u32 {
                 "pub mod b{b_idx}_c{c_idx} {{\n{}\n}}\n",
                 cand.source
             ));
-            let inst = instrument_source(&cand.source, "kernel_step", &["ext_oracle"])
-                .expect("instrumentation must succeed on every ITree candidate");
+            let (inst, _) = annotate_itree_external_callees(&cand.source, "kernel_step")
+                .expect("external boundary annotation must succeed on every ITree candidate");
             combined_instrumented
                 .push_str(&format!("pub mod inst_b{b_idx}_c{c_idx} {{\n{inst}\n}}\n"));
         }
@@ -1050,7 +1053,7 @@ fn compile_counts_come_from_rustc() {
     write_executable(
         &reject_instrumented,
         &format!(
-            "#!/bin/sh\nsrc=$(cat)\ncase \"$src\" in *__anneal_traced_*) exit 1 ;; esac\n\
+            "#!/bin/sh\nsrc=$(cat)\ncase \"$src\" in *anneal_trace::external*) exit 1 ;; esac\n\
              printf '%s\\n' \"$src\" | exec '{real_rustc}' \"$@\"\n"
         ),
     );

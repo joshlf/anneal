@@ -37,9 +37,9 @@ pub use input_gen::{
     LayoutSpec, MirInputDictionary, MirObsPathKey, MirObsPathSet, PaddingFillPattern, ScalarLayout,
 };
 pub use instrument::{
-    EnvAction, EnvSchedule, InstrumentConfig, InstrumentationError, InstrumentationResult,
-    RecordedEvent, RecordedOutcome, TraceRecorder, emit_runtime_prelude, instrument_source,
-    instrument_source_with_config, value_as_raw_bytes,
+    EnvAction, EnvSchedule, FromScheduleBytes, RecordedEvent, RecordedOutcome, RecordedRawTrace,
+    RecordedShadowAlloc, ScheduleError, TraceCapture, TraceRecorder, capture_value_bytes,
+    observe_boundary_call, value_as_raw_bytes,
 };
 pub use itree_eval::{
     CandidateCompile, DEFAULT_ITREE_TRIALS_PER_CANDIDATE, ITREE_DIAG_TAG_NAMES,

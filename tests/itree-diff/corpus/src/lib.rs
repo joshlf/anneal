@@ -22,6 +22,7 @@
 // Shared types & helper / external callees
 // ============================================================================
 
+#[anneal_trace::capture]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaddedHeader {
@@ -30,6 +31,7 @@ pub struct PaddedHeader {
     pub len: u32,
 }
 
+#[anneal_trace::capture]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NestedPair {
@@ -39,6 +41,7 @@ pub struct NestedPair {
     pub right: u32,
 }
 
+#[anneal_trace::capture]
 #[repr(u8)]
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +52,7 @@ pub enum DispatchMode {
     SelectLeft = 3,
 }
 
+#[anneal_trace::capture]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MaybeU32 {
@@ -57,6 +61,7 @@ pub struct MaybeU32 {
     pub val: u32,
 }
 
+#[anneal_trace::capture]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutcomeU16 {

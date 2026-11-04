@@ -100,11 +100,12 @@ pub use scaffold::{
     scaffold_init_spec_templates, scaffold_workspace, scaffold_workspace_with_config,
 };
 pub use trace_observer::{
-    BatchTraceEvalCase, EnvAction, EnvSchedule, RawByteTraceJson, RawCallEventJson, RawOutcomeJson,
-    RawTraceEventJson, RecordedEvent, RecordedOutcome, RecordedRawTrace, RecordedShadowAlloc,
-    ShadowAllocEntryJson, TraceCheckModuleConfig, TraceObserverSpec, TraceRecorder,
-    decode_recorded_raw_trace_hex, encode_recorded_raw_trace_hex, observe_boundary_call,
-    parse_batch_trace_probe_output, render_batch_trace_eval_lean_module,
+    BatchTraceEvalCase, EnvAction, EnvSchedule, FromScheduleBytes, RawByteTraceJson,
+    RawCallEventJson, RawOutcomeJson, RawTraceEventJson, RecordedEvent, RecordedOutcome,
+    RecordedRawTrace, RecordedShadowAlloc, ScheduleError, ShadowAllocEntryJson,
+    TraceCapture, TraceCheckModuleConfig, TraceObserverSpec, TraceRecorder,
+    capture_value_bytes, decode_recorded_raw_trace_hex, encode_recorded_raw_trace_hex,
+    observe_boundary_call, parse_batch_trace_probe_output, render_batch_trace_eval_lean_module,
     render_batch_trace_probe_lean_module, render_raw_byte_trace_lean,
     render_raw_byte_trace_lean_def, render_raw_outcome_lean, render_shadow_provenance_table_lean,
     render_tampered_outcome_diag_lean_snippet, render_trace_check_lean_module,

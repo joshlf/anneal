@@ -1,3 +1,11 @@
+// Copyright 2026 The Fuchsia Authors
+//
+// Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+// license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+// This file may not be copied, modified, or distributed except according to
+// those terms.
+
 //! Runtime trace observer and Lean 4 `TraceCheck` module generator.
 //!
 //! Bridges compiled Rust artifacts to Anneal's coinductive `MIR -> ITree`
@@ -5,8 +13,8 @@
 //!
 //! 1. **Interposition & Branch Erasure**:
 //!    - **Call-boundary interposition (`check_branches = false`)**: captures
-//!      raw argument and return byte slices at the root entry/exit and at
-//!      unresolved external/callee boundaries (`MirCallE`), checking the
+//!      layout-aware argument and return byte slices at the root entry/exit and
+//!      at unresolved external/callee boundaries (`MirCallE`), checking the
 //!      resulting `RawByteTrace` against `mirObsErasedStatefulTree` via
 //!      `checkRawByteTraceObsErasedBounded_sound` and
 //!      `diagnoseRawByteTraceObsErasedBounded` without requiring internal
@@ -20,14 +28,17 @@
 //!      `.tau` transitions in the Lean model rather than emitting `MirCallE`
 //!      events.
 //!
-//! 2. **Raw Byte Decoding & Shadow Provenance (`ShadowProvenanceTable`)**:
-//!    - **Zero-annotation raw byte capture**: [`value_as_raw_bytes`] copies the
-//!      in-memory byte representation (`&[u8]`) of any Rust value at a call
-//!      boundary without requiring `Serialize` or `Debug` bounds; the Lean
-//!      checker decodes the raw byte slice using the compiler-extracted
-//!      `LayoutTable` and `LocalDecl` metadata in `CapturedMir` (ignoring
-//!      uninitialized inter-field padding bytes while enforcing scalar and
-//!      niche bit-validity).
+//! 2. **Layout-Aware Byte Capture, Safe Schedule Decoding & Shadow Provenance**:
+//!    - **Padding-safe byte capture ([`TraceCapture`], [`capture_value_bytes`],
+//!      [`value_as_raw_bytes`])**: captures only initialized field bytes at
+//!      their compiler-computed `core::mem::offset_of!` offsets and leaves
+//!      inter-field/trailing struct padding bytes as `None` (unknown) in
+//!      [`capture_value_bytes`] (or `0` in [`value_as_raw_bytes`]), never
+//!      reading uninitialized padding bytes from memory.
+//!    - **Validity-checked schedule materialization ([`FromScheduleBytes`])**:
+//!      scheduled `EnvAction::ReturnBytes` payloads are validated for exact byte
+//!      length and bit-validity invariants (`bool`, `char`, `NonZero*`, enums,
+//!      and structs) without `MaybeUninit::assume_init`.
 //!    - **Shadow provenance table**: [`TraceRecorder::register_allocation`]
 //!      maps watched runtime virtual address ranges `[base_addr, base_addr +
 //!      byte_len)` to abstract MIR `(alloc_id, tag)` provenance so thin and
@@ -37,32 +48,590 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::mem;
+use std::num::{
+    NonZeroI8, NonZeroI16, NonZeroI32, NonZeroI64, NonZeroI128, NonZeroIsize, NonZeroU8,
+    NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize,
+};
 use std::panic::{self, AssertUnwindSafe};
 
-/// Copy the raw in-memory representation of `val` as a byte vector (`Vec<u8>`).
-///
-/// For structs or enums with inter-field padding, reading padding bytes as
-/// `u8` in a runtime observer wrapper is strictly for diagnostic trace export;
-/// the Lean `decodeValueFromBytes` decoder only inspects field byte ranges
-/// dictated by `TypeLayout.fields` and `TypeLayout.variants`, ignoring padding
-/// offsets completely.
-pub fn value_as_raw_bytes<T: ?Sized>(val: &T) -> Vec<u8> {
-    let size = mem::size_of_val(val);
-    if size == 0 {
-        return Vec::new();
+/// Error returned when a scheduled environment payload or layout-aware input
+/// fails size or bit-validity checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScheduleError {
+    /// Payload byte length did not match the target type or layout size.
+    PayloadSizeMismatch {
+        /// Callee or type context where the mismatch occurred.
+        context: String,
+        /// Expected byte length (`size_of::<T>()` or `LayoutSpec::total_size()`).
+        expected: usize,
+        /// Actual byte length supplied.
+        actual: usize,
+    },
+    /// Payload bytes violated a bit-validity invariant of the target type
+    /// (for example, `bool > 1`, surrogate `char`, zero `NonZero*`, or an
+    /// unrecognized enum discriminant).
+    InvalidBitPattern {
+        /// Callee or type context where the invalid bit pattern was rejected.
+        context: String,
+        /// Human-readable explanation of the violated validity invariant.
+        reason: String,
+    },
+}
+
+impl fmt::Display for ScheduleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PayloadSizeMismatch {
+                context,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "schedule payload size mismatch for `{context}`: expected {expected} bytes, got {actual}"
+            ),
+            Self::InvalidBitPattern { context, reason } => write!(
+                f,
+                "invalid bit pattern in schedule payload for `{context}`: {reason}"
+            ),
+        }
     }
-    let src = (val as *const T).cast::<mem::MaybeUninit<u8>>();
-    let mut dst: Vec<mem::MaybeUninit<u8>> = vec![mem::MaybeUninit::new(0); size];
-    // SAFETY: `val` is a valid reference of `size` bytes, and copying as
-    // `MaybeUninit<u8>` avoids forming a `&[u8]` slice reference over `val`.
-    unsafe {
-        std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), size);
-        let ptr = dst.as_mut_ptr().cast::<u8>();
-        let cap = dst.capacity();
-        mem::forget(dst);
-        Vec::from_raw_parts(ptr, size, cap)
+}
+
+impl std::error::Error for ScheduleError {}
+
+/// Layout-aware trace byte capture that writes `Some(byte)` at initialized field
+/// offsets and leaves inter-field or trailing padding offsets untouched (`None`),
+/// avoiding any read of uninitialized padding bytes.
+///
+/// Composite structs and unit enums in traced crates can derive this trait (and
+/// [`FromScheduleBytes`]) via `#[anneal_trace::capture]`.
+pub trait TraceCapture {
+    /// Write the initialized field bytes of `self` into `dst` (which is
+    /// pre-initialized to `None` of length `core::mem::size_of_val(self)`).
+    /// Any padding offsets in `dst` must remain `None`.
+    fn write_captured_bytes(&self, dst: &mut [Option<u8>]);
+
+    /// Write the niche byte representation for `Option::<Self>::None` when
+    /// `size_of::<Option<Self>>() == size_of::<Self>()` (defaults to all-zero
+    /// bytes, as used by `NonZero*` and references).
+    fn write_niche_none_bytes(dst: &mut [Option<u8>]) {
+        for slot in dst.iter_mut() {
+            *slot = Some(0);
+        }
+    }
+}
+
+/// Capture the layout-aware byte representation of `val`, returning `Some(b)`
+/// for every initialized field byte and `None` for unknown/padding bytes.
+///
+/// Unlike raw pointer byte copies, this function never reads padding bytes from
+/// `val` and is completely free of Undefined Behavior under Miri even when
+/// `val` contains uninitialized padding.
+pub fn capture_value_bytes<T: TraceCapture + ?Sized>(val: &T) -> Vec<Option<u8>> {
+    let size = mem::size_of_val(val);
+    let mut dst = vec![None; size];
+    val.write_captured_bytes(&mut dst);
+    dst
+}
+
+/// Capture the byte representation of `val` as a `Vec<u8>` by reading only
+/// initialized field bytes via [`TraceCapture`] and substituting `0u8` for any
+/// unknown (`None`) padding offsets.
+///
+/// Because padding bytes are never read from `val` and are deterministically
+/// represented as `0` where `capture_value_bytes` marks `None`, this function
+/// is Miri-clean even when `val` has uninitialized inter-field or trailing
+/// padding.
+pub fn value_as_raw_bytes<T: TraceCapture + ?Sized>(val: &T) -> Vec<u8> {
+    capture_value_bytes(val)
+        .into_iter()
+        .map(|b| b.unwrap_or(0))
+        .collect()
+}
+
+/// Safe, validity-checked deserialization of scheduled return bytes (`EnvAction::ReturnBytes`)
+/// and layout-aware generated inputs without `MaybeUninit::assume_init`.
+pub trait FromScheduleBytes: Sized {
+    /// Decode `bytes` into `Self` after verifying that `bytes.len() == size_of::<Self>()`
+    /// and that every scalar, niche, and discriminant bit-validity invariant holds.
+    fn from_schedule_bytes(bytes: &[u8]) -> Result<Self, ScheduleError>;
+
+    /// Return `true` if `bytes` encodes `Option::<Self>::None` when
+    /// `size_of::<Option<Self>>() == size_of::<Self>()` (defaults to checking
+    /// whether all bytes are zero and rejected by `Self::from_schedule_bytes`).
+    fn is_niche_none_bytes(bytes: &[u8]) -> bool {
+        !bytes.is_empty()
+            && bytes.iter().all(|&b| b == 0)
+            && Self::from_schedule_bytes(bytes).is_err()
+    }
+}
+
+fn check_exact_len(context: &str, expected: usize, actual: usize) -> Result<(), ScheduleError> {
+    if expected != actual {
+        Err(ScheduleError::PayloadSizeMismatch {
+            context: context.to_string(),
+            expected,
+            actual,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn write_le_some(dst: &mut [Option<u8>], bytes: &[u8]) {
+    for (slot, &b) in dst.iter_mut().zip(bytes.iter()) {
+        *slot = Some(b);
+    }
+}
+
+impl TraceCapture for () {
+    fn write_captured_bytes(&self, _dst: &mut [Option<u8>]) {}
+}
+
+impl FromScheduleBytes for () {
+    fn from_schedule_bytes(bytes: &[u8]) -> Result<Self, ScheduleError> {
+        check_exact_len("()", 0, bytes.len())?;
+        Ok(())
+    }
+}
+
+impl TraceCapture for bool {
+    fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+        if let Some(slot) = dst.first_mut() {
+            *slot = Some(u8::from(*self));
+        }
+    }
+
+    fn write_niche_none_bytes(dst: &mut [Option<u8>]) {
+        if let Some(slot) = dst.first_mut() {
+            *slot = Some(2);
+        }
+    }
+}
+
+impl FromScheduleBytes for bool {
+    fn from_schedule_bytes(bytes: &[u8]) -> Result<Self, ScheduleError> {
+        check_exact_len("bool", 1, bytes.len())?;
+        match bytes[0] {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(ScheduleError::InvalidBitPattern {
+                context: "bool".to_string(),
+                reason: format!("expected 0 or 1 for `bool`, got {other:#04x}"),
+            }),
+        }
+    }
+
+    fn is_niche_none_bytes(bytes: &[u8]) -> bool {
+        bytes == [2]
+    }
+}
+
+impl TraceCapture for char {
+    fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+        let code = *self as u32;
+        write_le_some(dst, &code.to_le_bytes());
+    }
+
+    fn write_niche_none_bytes(dst: &mut [Option<u8>]) {
+        write_le_some(dst, &0x0011_0000u32.to_le_bytes());
+    }
+}
+
+impl FromScheduleBytes for char {
+    fn from_schedule_bytes(bytes: &[u8]) -> Result<Self, ScheduleError> {
+        check_exact_len("char", 4, bytes.len())?;
+        let raw = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        char::from_u32(raw).ok_or_else(|| ScheduleError::InvalidBitPattern {
+            context: "char".to_string(),
+            reason: format!("invalid Unicode scalar value {raw:#010x}"),
+        })
+    }
+
+    fn is_niche_none_bytes(bytes: &[u8]) -> bool {
+        bytes == 0x0011_0000u32.to_le_bytes()
+    }
+}
+
+macro_rules! impl_int_trace_capture {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl TraceCapture for $ty {
+                fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+                    write_le_some(dst, &self.to_le_bytes());
+                }
+            }
+
+            impl FromScheduleBytes for $ty {
+                fn from_schedule_bytes(bytes: &[u8]) -> Result<Self, ScheduleError> {
+                    const N: usize = mem::size_of::<$ty>();
+                    check_exact_len(stringify!($ty), N, bytes.len())?;
+                    let mut arr = [0u8; N];
+                    arr.copy_from_slice(bytes);
+                    Ok(<$ty>::from_le_bytes(arr))
+                }
+            }
+        )*
+    };
+}
+
+impl_int_trace_capture!(
+    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64
+);
+
+macro_rules! impl_nonzero_trace_capture {
+    ($($nz:ty => $prim:ty),* $(,)?) => {
+        $(
+            impl TraceCapture for $nz {
+                fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+                    self.get().write_captured_bytes(dst);
+                }
+            }
+
+            impl FromScheduleBytes for $nz {
+                fn from_schedule_bytes(bytes: &[u8]) -> Result<Self, ScheduleError> {
+                    let raw = <$prim as FromScheduleBytes>::from_schedule_bytes(bytes).map_err(
+                        |e| match e {
+                            ScheduleError::PayloadSizeMismatch { expected, actual, .. } => {
+                                ScheduleError::PayloadSizeMismatch {
+                                    context: stringify!($nz).to_string(),
+                                    expected,
+                                    actual,
+                                }
+                            }
+                            other => other,
+                        },
+                    )?;
+                    <$nz>::new(raw).ok_or_else(|| ScheduleError::InvalidBitPattern {
+                        context: stringify!($nz).to_string(),
+                        reason: "zero bit pattern is invalid for NonZero integer".to_string(),
+                    })
+                }
+            }
+        )*
+    };
+}
+
+impl_nonzero_trace_capture!(
+    NonZeroU8 => u8,
+    NonZeroU16 => u16,
+    NonZeroU32 => u32,
+    NonZeroU64 => u64,
+    NonZeroU128 => u128,
+    NonZeroUsize => usize,
+    NonZeroI8 => i8,
+    NonZeroI16 => i16,
+    NonZeroI32 => i32,
+    NonZeroI64 => i64,
+    NonZeroI128 => i128,
+    NonZeroIsize => isize,
+);
+
+impl<T: TraceCapture, const N: usize> TraceCapture for [T; N] {
+    fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+        let elem_size = mem::size_of::<T>();
+        for (idx, item) in self.iter().enumerate() {
+            let start = idx * elem_size;
+            item.write_captured_bytes(&mut dst[start..start + elem_size]);
+        }
+    }
+}
+
+impl<T: FromScheduleBytes, const N: usize> FromScheduleBytes for [T; N] {
+    fn from_schedule_bytes(bytes: &[u8]) -> Result<Self, ScheduleError> {
+        let elem_size = mem::size_of::<T>();
+        let expected = elem_size * N;
+        check_exact_len("[T; N]", expected, bytes.len())?;
+        let mut items = Vec::with_capacity(N);
+        for idx in 0..N {
+            let start = idx * elem_size;
+            items.push(T::from_schedule_bytes(&bytes[start..start + elem_size])?);
+        }
+        items
+            .try_into()
+            .map_err(|_| ScheduleError::PayloadSizeMismatch {
+                context: "[T; N]".to_string(),
+                expected,
+                actual: bytes.len(),
+            })
+    }
+}
+
+impl<T: TraceCapture> TraceCapture for [T] {
+    fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+        let elem_size = mem::size_of::<T>();
+        for (idx, item) in self.iter().enumerate() {
+            let start = idx * elem_size;
+            item.write_captured_bytes(&mut dst[start..start + elem_size]);
+        }
+    }
+}
+
+impl TraceCapture for str {
+    fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+        write_le_some(dst, self.as_bytes());
+    }
+}
+
+impl<T> TraceCapture for &T {
+    fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+        let addr = (*self as *const T) as usize;
+        write_le_some(dst, &addr.to_le_bytes());
+    }
+}
+
+impl<T> TraceCapture for &mut T {
+    fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+        let addr = (*self as *const T) as usize;
+        write_le_some(dst, &addr.to_le_bytes());
+    }
+}
+
+impl<T> TraceCapture for *const T {
+    fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+        let addr = *self as usize;
+        write_le_some(dst, &addr.to_le_bytes());
+    }
+}
+
+impl<T> TraceCapture for *mut T {
+    fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+        let addr = *self as usize;
+        write_le_some(dst, &addr.to_le_bytes());
+    }
+}
+
+impl<T> TraceCapture for &[T] {
+    fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+        let ptr_size = mem::size_of::<usize>();
+        let addr = self.as_ptr() as usize;
+        let len = self.len();
+        if dst.len() >= ptr_size * 2 {
+            write_le_some(&mut dst[..ptr_size], &addr.to_le_bytes());
+            write_le_some(&mut dst[ptr_size..ptr_size * 2], &len.to_le_bytes());
+        }
+    }
+}
+
+impl TraceCapture for &str {
+    fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+        self.as_bytes().write_captured_bytes(dst);
+    }
+}
+
+impl<A: TraceCapture, B: TraceCapture> TraceCapture for (A, B) {
+    fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+        let off0 = mem::offset_of!(Self, 0);
+        let len0 = mem::size_of::<A>();
+        self.0.write_captured_bytes(&mut dst[off0..off0 + len0]);
+        let off1 = mem::offset_of!(Self, 1);
+        let len1 = mem::size_of::<B>();
+        self.1.write_captured_bytes(&mut dst[off1..off1 + len1]);
+    }
+}
+
+impl<A: FromScheduleBytes, B: FromScheduleBytes> FromScheduleBytes for (A, B) {
+    fn from_schedule_bytes(bytes: &[u8]) -> Result<Self, ScheduleError> {
+        check_exact_len("(A, B)", mem::size_of::<Self>(), bytes.len())?;
+        let off0 = mem::offset_of!(Self, 0);
+        let len0 = mem::size_of::<A>();
+        let off1 = mem::offset_of!(Self, 1);
+        let len1 = mem::size_of::<B>();
+        Ok((
+            A::from_schedule_bytes(&bytes[off0..off0 + len0])?,
+            B::from_schedule_bytes(&bytes[off1..off1 + len1])?,
+        ))
+    }
+}
+
+impl<A: TraceCapture, B: TraceCapture, C: TraceCapture> TraceCapture for (A, B, C) {
+    fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+        let off0 = mem::offset_of!(Self, 0);
+        let len0 = mem::size_of::<A>();
+        self.0.write_captured_bytes(&mut dst[off0..off0 + len0]);
+        let off1 = mem::offset_of!(Self, 1);
+        let len1 = mem::size_of::<B>();
+        self.1.write_captured_bytes(&mut dst[off1..off1 + len1]);
+        let off2 = mem::offset_of!(Self, 2);
+        let len2 = mem::size_of::<C>();
+        self.2.write_captured_bytes(&mut dst[off2..off2 + len2]);
+    }
+}
+
+impl<A: FromScheduleBytes, B: FromScheduleBytes, C: FromScheduleBytes> FromScheduleBytes
+    for (A, B, C)
+{
+    fn from_schedule_bytes(bytes: &[u8]) -> Result<Self, ScheduleError> {
+        check_exact_len("(A, B, C)", mem::size_of::<Self>(), bytes.len())?;
+        let off0 = mem::offset_of!(Self, 0);
+        let len0 = mem::size_of::<A>();
+        let off1 = mem::offset_of!(Self, 1);
+        let len1 = mem::size_of::<B>();
+        let off2 = mem::offset_of!(Self, 2);
+        let len2 = mem::size_of::<C>();
+        Ok((
+            A::from_schedule_bytes(&bytes[off0..off0 + len0])?,
+            B::from_schedule_bytes(&bytes[off1..off1 + len1])?,
+            C::from_schedule_bytes(&bytes[off2..off2 + len2])?,
+        ))
+    }
+}
+
+impl<A: TraceCapture, B: TraceCapture, C: TraceCapture, D: TraceCapture> TraceCapture
+    for (A, B, C, D)
+{
+    fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+        let off0 = mem::offset_of!(Self, 0);
+        let len0 = mem::size_of::<A>();
+        self.0.write_captured_bytes(&mut dst[off0..off0 + len0]);
+        let off1 = mem::offset_of!(Self, 1);
+        let len1 = mem::size_of::<B>();
+        self.1.write_captured_bytes(&mut dst[off1..off1 + len1]);
+        let off2 = mem::offset_of!(Self, 2);
+        let len2 = mem::size_of::<C>();
+        self.2.write_captured_bytes(&mut dst[off2..off2 + len2]);
+        let off3 = mem::offset_of!(Self, 3);
+        let len3 = mem::size_of::<D>();
+        self.3.write_captured_bytes(&mut dst[off3..off3 + len3]);
+    }
+}
+
+impl<A: FromScheduleBytes, B: FromScheduleBytes, C: FromScheduleBytes, D: FromScheduleBytes>
+    FromScheduleBytes for (A, B, C, D)
+{
+    fn from_schedule_bytes(bytes: &[u8]) -> Result<Self, ScheduleError> {
+        check_exact_len("(A, B, C, D)", mem::size_of::<Self>(), bytes.len())?;
+        let off0 = mem::offset_of!(Self, 0);
+        let len0 = mem::size_of::<A>();
+        let off1 = mem::offset_of!(Self, 1);
+        let len1 = mem::size_of::<B>();
+        let off2 = mem::offset_of!(Self, 2);
+        let len2 = mem::size_of::<C>();
+        let off3 = mem::offset_of!(Self, 3);
+        let len3 = mem::size_of::<D>();
+        Ok((
+            A::from_schedule_bytes(&bytes[off0..off0 + len0])?,
+            B::from_schedule_bytes(&bytes[off1..off1 + len1])?,
+            C::from_schedule_bytes(&bytes[off2..off2 + len2])?,
+            D::from_schedule_bytes(&bytes[off3..off3 + len3])?,
+        ))
+    }
+}
+
+impl<T: TraceCapture> TraceCapture for Option<T> {
+    fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+        let total = dst.len();
+        let val_size = mem::size_of::<T>();
+        match self {
+            None => {
+                if total == val_size {
+                    T::write_niche_none_bytes(dst);
+                } else if let Some(tag) = dst.first_mut() {
+                    *tag = Some(0);
+                }
+            }
+            Some(v) => {
+                if total == val_size {
+                    // Niche-optimized `Option<T>` (e.g., `Option<NonZeroU32>`, `Option<bool>`).
+                    v.write_captured_bytes(dst);
+                } else {
+                    if let Some(tag) = dst.first_mut() {
+                        *tag = Some(1);
+                    }
+                    let payload_off = total.saturating_sub(val_size);
+                    v.write_captured_bytes(&mut dst[payload_off..payload_off + val_size]);
+                }
+            }
+        }
+    }
+}
+
+impl<T: FromScheduleBytes> FromScheduleBytes for Option<T> {
+    fn from_schedule_bytes(bytes: &[u8]) -> Result<Self, ScheduleError> {
+        let total = mem::size_of::<Self>();
+        check_exact_len("Option<T>", total, bytes.len())?;
+        let val_size = mem::size_of::<T>();
+        if total == val_size {
+            if T::is_niche_none_bytes(bytes) {
+                return Ok(None);
+            }
+            return T::from_schedule_bytes(bytes).map(Some);
+        }
+        match bytes[0] {
+            0 => Ok(None),
+            1 => {
+                let payload_off = total.saturating_sub(val_size);
+                T::from_schedule_bytes(&bytes[payload_off..payload_off + val_size]).map(Some)
+            }
+            other => Err(ScheduleError::InvalidBitPattern {
+                context: "Option<T>".to_string(),
+                reason: format!("expected Option discriminant 0 or 1, got {other:#04x}"),
+            }),
+        }
+    }
+}
+
+impl<T: TraceCapture, E: TraceCapture> TraceCapture for Result<T, E> {
+    fn write_captured_bytes(&self, dst: &mut [Option<u8>]) {
+        let total = dst.len();
+        match self {
+            Ok(v) => {
+                if let Some(tag) = dst.first_mut() {
+                    *tag = Some(0);
+                }
+                let val_size = mem::size_of::<T>();
+                if val_size > 0 && total > val_size {
+                    let off = total - val_size;
+                    v.write_captured_bytes(&mut dst[off..off + val_size]);
+                }
+            }
+            Err(e) => {
+                if let Some(tag) = dst.first_mut() {
+                    *tag = Some(1);
+                }
+                let err_size = mem::size_of::<E>();
+                if err_size > 0 && total > err_size {
+                    let off = total - err_size;
+                    e.write_captured_bytes(&mut dst[off..off + err_size]);
+                }
+            }
+        }
+    }
+}
+
+impl<T: FromScheduleBytes, E: FromScheduleBytes> FromScheduleBytes for Result<T, E> {
+    fn from_schedule_bytes(bytes: &[u8]) -> Result<Self, ScheduleError> {
+        let total = mem::size_of::<Self>();
+        check_exact_len("Result<T, E>", total, bytes.len())?;
+        if total == 0 {
+            return T::from_schedule_bytes(&[]).map(Ok);
+        }
+        match bytes[0] {
+            0 => {
+                let val_size = mem::size_of::<T>();
+                let off = if val_size == 0 {
+                    0
+                } else {
+                    total.saturating_sub(val_size)
+                };
+                T::from_schedule_bytes(&bytes[off..off + val_size]).map(Ok)
+            }
+            1 => {
+                let err_size = mem::size_of::<E>();
+                let off = if err_size == 0 {
+                    0
+                } else {
+                    total.saturating_sub(err_size)
+                };
+                E::from_schedule_bytes(&bytes[off..off + err_size]).map(Err)
+            }
+            other => Err(ScheduleError::InvalidBitPattern {
+                context: "Result<T, E>".to_string(),
+                reason: format!("expected Result discriminant 0 or 1, got {other:#04x}"),
+            }),
+        }
     }
 }
 
@@ -215,6 +784,9 @@ pub struct EnvSchedule {
     pub callee_queues: BTreeMap<String, VecDeque<Vec<u8>>>,
     /// Per-callee fallback constant bytes when the FIFO queue is exhausted.
     pub callee_defaults: BTreeMap<String, Vec<u8>>,
+    /// Optional per-callee expected return byte sizes used to reject mismatched
+    /// schedule payloads at construction / registration time.
+    pub callee_return_sizes: BTreeMap<String, usize>,
     /// Optional global call index (`0`-based) at which any external call panics.
     pub global_panic_on_call: Option<usize>,
     /// Optional per-callee call index (`0`-based) at which that callee panics.
@@ -227,6 +799,51 @@ impl EnvSchedule {
     /// Creates an empty pass-through schedule with no injected panics.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Registers the expected return byte size for `callee` and returns `self`.
+    pub fn with_callee_return_size(mut self, callee: &str, expected_size: usize) -> Self {
+        self.register_callee_return_size(callee, expected_size);
+        self
+    }
+
+    /// Registers the expected return byte size for `callee`.
+    pub fn register_callee_return_size(&mut self, callee: &str, expected_size: usize) {
+        self.callee_return_sizes
+            .insert(callee.to_string(), expected_size);
+    }
+
+    /// Looks up the expected return byte size for `callee` (checking both the
+    /// full path and the short function name).
+    pub fn expected_return_size(&self, callee: &str) -> Option<usize> {
+        if let Some(&sz) = self.callee_return_sizes.get(callee) {
+            return Some(sz);
+        }
+        if let Some((_, short)) = callee.rsplit_once("::")
+            && let Some(&sz) = self.callee_return_sizes.get(short)
+        {
+            return Some(sz);
+        }
+        None
+    }
+
+    /// Validates that `bytes.len()` matches the registered return size for
+    /// `callee` (if one has been registered).
+    pub fn validate_callee_payload(
+        &self,
+        callee: &str,
+        bytes: &[u8],
+    ) -> Result<(), ScheduleError> {
+        if let Some(expected_size) = self.expected_return_size(callee)
+            && bytes.len() != expected_size
+        {
+            return Err(ScheduleError::PayloadSizeMismatch {
+                context: callee.to_string(),
+                expected: expected_size,
+                actual: bytes.len(),
+            });
+        }
+        Ok(())
     }
 
     /// Configures a deterministic global `PanicOnCall(k)` trigger.
@@ -246,17 +863,55 @@ impl EnvSchedule {
             .insert(callee.to_string(), call_index);
     }
 
-    /// Appends a single scheduled raw-byte return payload to `callee`'s queue.
-    pub fn push_callee_response(&mut self, callee: &str, bytes: Vec<u8>) {
+    /// Appends a single scheduled raw-byte return payload to `callee`'s queue,
+    /// returning an error if `callee` has a registered return size that does
+    /// not match `bytes.len()`.
+    pub fn push_callee_response_checked(
+        &mut self,
+        callee: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), ScheduleError> {
+        self.validate_callee_payload(callee, &bytes)?;
         self.callee_queues
             .entry(callee.to_string())
             .or_default()
             .push_back(bytes);
+        Ok(())
+    }
+
+    /// Appends a single scheduled raw-byte return payload to `callee`'s queue.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `callee` has a registered return size that does not match
+    /// `bytes.len()`.
+    pub fn push_callee_response(&mut self, callee: &str, bytes: Vec<u8>) {
+        self.push_callee_response_checked(callee, bytes)
+            .unwrap_or_else(|err| panic!("invalid schedule response for `{callee}`: {err}"));
+    }
+
+    /// Sets the default fallback byte payload for `callee` once its queue
+    /// empties, returning an error if `callee` has a registered return size
+    /// that does not match `bytes.len()`.
+    pub fn set_callee_default_checked(
+        &mut self,
+        callee: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), ScheduleError> {
+        self.validate_callee_payload(callee, &bytes)?;
+        self.callee_defaults.insert(callee.to_string(), bytes);
+        Ok(())
     }
 
     /// Sets the default fallback byte payload for `callee` once its queue empties.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `callee` has a registered return size that does not match
+    /// `bytes.len()`.
     pub fn set_callee_default(&mut self, callee: &str, bytes: Vec<u8>) {
-        self.callee_defaults.insert(callee.to_string(), bytes);
+        self.set_callee_default_checked(callee, bytes)
+            .unwrap_or_else(|err| panic!("invalid schedule default for `{callee}`: {err}"));
     }
 
     fn resolve_key(&self, callee: &str) -> String {
@@ -378,7 +1033,7 @@ impl Drop for BoundaryDepthGuard {
 /// records either [`RecordedEvent::ExtCall`] or [`RecordedEvent::ExtCallPanic`].
 /// When called outside `observe_root`, inside a nested external call, or when
 /// the callee is marked inlined, it invokes `f()` directly with no trace event.
-pub fn observe_boundary_call<R>(
+pub fn observe_boundary_call<R: TraceCapture + FromScheduleBytes>(
     callee_module_path: &str,
     callee_fn_name: &str,
     raw_args: Vec<Vec<u8>>,
@@ -416,57 +1071,57 @@ pub fn observe_boundary_call<R>(
             });
             panic!("anneal scheduled PanicOnCall({k}) triggered in `{callee_fn_name}`");
         }
-        EnvAction::ReturnBytes(sched_bytes) if sched_bytes.len() == mem::size_of::<R>() => {
-            let mut slot = mem::MaybeUninit::<R>::zeroed();
-            // SAFETY: `sched_bytes.len() == size_of::<R>()` and scheduled payloads are
-            // generated for plain scalar/enum return types of matching size.
-            let ret = unsafe {
-                std::ptr::copy_nonoverlapping(
-                    sched_bytes.as_ptr(),
-                    slot.as_mut_ptr().cast::<u8>(),
+        EnvAction::ReturnBytes(sched_bytes) => {
+            if sched_bytes.len() != mem::size_of::<R>() {
+                panic!(
+                    "anneal scheduled ReturnBytes for `{def_path}` has mismatched payload size: \
+                     expected {} bytes for `{}`, got {} bytes",
                     mem::size_of::<R>(),
+                    std::any::type_name::<R>(),
+                    sched_bytes.len()
                 );
-                slot.assume_init()
-            };
+            }
+            let ret = R::from_schedule_bytes(&sched_bytes).unwrap_or_else(|err| {
+                panic!("anneal scheduled ReturnBytes for `{def_path}` failed validation: {err}")
+            });
+            let raw_ret = value_as_raw_bytes(&ret);
             ACTIVE_RECORDER.with(|cell| {
                 if let Some(state) = cell.borrow_mut().as_mut() {
                     state.events.push(RecordedEvent::ExtCall {
                         def_path,
                         raw_args,
-                        raw_ret: sched_bytes,
+                        raw_ret,
                     });
                 }
             });
             ret
         }
-        EnvAction::PassThrough | EnvAction::ReturnBytes(_) => {
-            match panic::catch_unwind(AssertUnwindSafe(f)) {
-                Ok(ret) => {
-                    let raw_ret = value_as_raw_bytes(&ret);
-                    ACTIVE_RECORDER.with(|cell| {
-                        if let Some(state) = cell.borrow_mut().as_mut() {
-                            state.events.push(RecordedEvent::ExtCall {
-                                def_path,
-                                raw_args,
-                                raw_ret,
-                            });
-                        }
-                    });
-                    ret
-                }
-                Err(payload) => {
-                    ACTIVE_RECORDER.with(|cell| {
-                        if let Some(state) = cell.borrow_mut().as_mut() {
-                            state.events.push(RecordedEvent::ExtCallPanic {
-                                def_path,
-                                raw_args,
-                            });
-                        }
-                    });
-                    panic::resume_unwind(payload)
-                }
+        EnvAction::PassThrough => match panic::catch_unwind(AssertUnwindSafe(f)) {
+            Ok(ret) => {
+                let raw_ret = value_as_raw_bytes(&ret);
+                ACTIVE_RECORDER.with(|cell| {
+                    if let Some(state) = cell.borrow_mut().as_mut() {
+                        state.events.push(RecordedEvent::ExtCall {
+                            def_path,
+                            raw_args,
+                            raw_ret,
+                        });
+                    }
+                });
+                ret
             }
-        }
+            Err(payload) => {
+                ACTIVE_RECORDER.with(|cell| {
+                    if let Some(state) = cell.borrow_mut().as_mut() {
+                        state.events.push(RecordedEvent::ExtCallPanic {
+                            def_path,
+                            raw_args,
+                        });
+                    }
+                });
+                panic::resume_unwind(payload)
+            }
+        },
     }
 }
 
@@ -669,7 +1324,7 @@ impl TraceRecorder {
     }
 
     /// Record a normal function return by capturing `value_as_raw_bytes(val)`.
-    pub fn finish_return<T: ?Sized>(&mut self, val: &T) {
+    pub fn finish_return<T: TraceCapture + ?Sized>(&mut self, val: &T) {
         self.outcome = Some(RecordedOutcome::Normal {
             raw_ret: value_as_raw_bytes(val),
         });
@@ -707,7 +1362,7 @@ impl TraceRecorder {
     /// Execute and observe a root function invocation `f`, capturing its
     /// `raw_args`, all interaction events recorded at `#[anneal_trace::external]`
     /// boundaries, and its terminal `RecordedOutcome` (`Normal` or `Panic`).
-    pub fn observe_root<R>(
+    pub fn observe_root<R: TraceCapture>(
         root_def_path: impl Into<String>,
         raw_args: Vec<Vec<u8>>,
         f: impl FnOnce(&mut TraceRecorder) -> R,
@@ -720,7 +1375,7 @@ impl TraceRecorder {
     /// Execute and observe a root function invocation `f` with the specified
     /// `inlined_callees` stepped transparently without emitting `MirCallE`
     /// boundary events.
-    pub fn observe_root_with_inlined_callees<R, I, S>(
+    pub fn observe_root_with_inlined_callees<R: TraceCapture, I, S>(
         root_def_path: impl Into<String>,
         raw_args: Vec<Vec<u8>>,
         inlined_callees: I,
@@ -739,7 +1394,7 @@ impl TraceRecorder {
     /// [`TraceRecorder`] (e.g., carrying an [`EnvSchedule`] or `inlined_callees`),
     /// returning the invocation result, the [`RecordedRawTrace`], and the updated
     /// [`TraceRecorder`].
-    pub fn observe_root_with_recorder<R>(
+    pub fn observe_root_with_recorder<R: TraceCapture>(
         mut recorder: TraceRecorder,
         root_def_path: impl Into<String>,
         raw_args: Vec<Vec<u8>>,
@@ -1578,16 +2233,53 @@ pub fn decode_recorded_raw_trace_hex(line: &str) -> Result<RecordedRawTrace, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU32;
 
+    #[anneal_trace::capture]
     #[repr(C)]
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct TestPaddedStruct {
         flag: u8,
         value: u32,
     }
 
+    #[anneal_trace::capture]
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TestMode {
+        Fast = 0,
+        Safe = 1,
+    }
+
     #[test]
-    fn value_as_raw_bytes_preserves_exact_layout_and_padding_bytes() {
+    fn capture_value_bytes_never_reads_uninitialized_padding_and_marks_it_unknown() {
+        let mut slot = mem::MaybeUninit::<TestPaddedStruct>::uninit();
+        let s_ref = unsafe {
+            let base = slot.as_mut_ptr();
+            core::ptr::addr_of_mut!((*base).flag).write(1);
+            core::ptr::addr_of_mut!((*base).value).write(0x0403_0201);
+            slot.assume_init_ref()
+        };
+        let captured = capture_value_bytes(s_ref);
+        assert_eq!(
+            captured,
+            vec![
+                Some(1),
+                None,
+                None,
+                None,
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+            ]
+        );
+        let raw = value_as_raw_bytes(s_ref);
+        assert_eq!(raw, vec![1, 0, 0, 0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn value_as_raw_bytes_ignores_scribbled_padding_bytes_and_masks_them_as_zero() {
         let mut s = TestPaddedStruct {
             flag: 1,
             value: 0x0403_0201,
@@ -1598,9 +2290,96 @@ mod tests {
             *ptr.add(2) = 0xBB;
             *ptr.add(3) = 0xCC;
         }
+        assert_eq!(
+            capture_value_bytes(&s),
+            vec![
+                Some(1),
+                None,
+                None,
+                None,
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+            ]
+        );
         let raw = value_as_raw_bytes(&s);
-        assert_eq!(raw, vec![1, 0xAA, 0xBB, 0xCC, 1, 2, 3, 4]);
+        assert_eq!(raw, vec![1, 0, 0, 0, 1, 2, 3, 4]);
         assert!(value_as_raw_bytes(&()).is_empty());
+    }
+
+    #[test]
+    fn from_schedule_bytes_validates_invariants_without_ub() {
+        assert_eq!(bool::from_schedule_bytes(&[0]), Ok(false));
+        assert_eq!(bool::from_schedule_bytes(&[1]), Ok(true));
+        assert!(bool::from_schedule_bytes(&[2]).is_err());
+        assert!(bool::from_schedule_bytes(&[0, 0]).is_err());
+
+        assert_eq!(
+            char::from_schedule_bytes(&('A' as u32).to_le_bytes()),
+            Ok('A')
+        );
+        assert!(char::from_schedule_bytes(&0xD800u32.to_le_bytes()).is_err());
+        assert!(char::from_schedule_bytes(&0x0011_0000u32.to_le_bytes()).is_err());
+
+        assert!(NonZeroU32::from_schedule_bytes(&0u32.to_le_bytes()).is_err());
+        assert_eq!(
+            NonZeroU32::from_schedule_bytes(&7u32.to_le_bytes()),
+            Ok(NonZeroU32::new(7).unwrap())
+        );
+
+        assert_eq!(
+            TestMode::from_schedule_bytes(&0i32.to_le_bytes()),
+            Ok(TestMode::Fast)
+        );
+        assert_eq!(
+            TestMode::from_schedule_bytes(&1i32.to_le_bytes()),
+            Ok(TestMode::Safe)
+        );
+        assert!(TestMode::from_schedule_bytes(&2i32.to_le_bytes()).is_err());
+
+        let decoded_struct =
+            TestPaddedStruct::from_schedule_bytes(&[1, 0xFF, 0xFF, 0xFF, 1, 2, 3, 4])
+                .expect("valid struct fields decode cleanly ignoring padding bytes");
+        assert_eq!(
+            decoded_struct,
+            TestPaddedStruct {
+                flag: 1,
+                value: 0x0403_0201
+            }
+        );
+
+        // Niche-optimized Option<bool>
+        for opt_b in [None, Some(false), Some(true)] {
+            let raw = value_as_raw_bytes(&opt_b);
+            assert_eq!(Option::<bool>::from_schedule_bytes(&raw), Ok(opt_b));
+        }
+        assert!(Option::<bool>::from_schedule_bytes(&[3]).is_err());
+
+        // Niche-optimized Option<char>
+        for opt_c in [None, Some('\0'), Some('A')] {
+            let raw = value_as_raw_bytes(&opt_c);
+            assert_eq!(Option::<char>::from_schedule_bytes(&raw), Ok(opt_c));
+        }
+        assert!(Option::<char>::from_schedule_bytes(&0xD800u32.to_le_bytes()).is_err());
+
+        // Niche-optimized Option<NonZeroU32>
+        let nz7 = NonZeroU32::new(7).unwrap();
+        assert_eq!(
+            capture_value_bytes(&None::<NonZeroU32>),
+            vec![Some(0), Some(0), Some(0), Some(0)]
+        );
+        for opt_nz in [None, Some(nz7)] {
+            let raw = value_as_raw_bytes(&opt_nz);
+            assert_eq!(Option::<NonZeroU32>::from_schedule_bytes(&raw), Ok(opt_nz));
+        }
+
+        // Niche-optimized Option<TestMode>
+        for opt_m in [None, Some(TestMode::Fast), Some(TestMode::Safe)] {
+            let raw = value_as_raw_bytes(&opt_m);
+            assert_eq!(Option::<TestMode>::from_schedule_bytes(&raw), Ok(opt_m));
+        }
+        assert!(Option::<TestMode>::from_schedule_bytes(&2i32.to_le_bytes()).is_err());
     }
 
     #[anneal_trace::external]
@@ -1609,8 +2388,55 @@ mod tests {
     }
 
     #[anneal_trace::external]
+    fn ext_bool(x: u32) -> bool {
+        x != 0
+    }
+
+    #[anneal_trace::external]
     fn boom() -> u32 {
         panic!("simulated external panic");
+    }
+
+    #[test]
+    fn env_schedule_rejects_mismatched_return_payload_sizes() {
+        let mut sched = EnvSchedule::new().with_callee_return_size("demo::ext", 4);
+        assert!(sched.push_callee_response_checked("demo::ext", vec![1, 2, 3, 4]).is_ok());
+        let err = sched
+            .push_callee_response_checked("demo::ext", vec![1, 2])
+            .expect_err("2-byte payload for 4-byte callee must fail");
+        assert_eq!(
+            err,
+            ScheduleError::PayloadSizeMismatch {
+                context: "demo::ext".to_string(),
+                expected: 4,
+                actual: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn observe_boundary_call_rejects_mismatched_and_invalid_return_bytes_without_fallthrough() {
+        let mut bad_len_sched = EnvSchedule::new();
+        bad_len_sched.push_callee_response("demo::ext", vec![1, 2]);
+        let rec = TraceRecorder::with_schedule(bad_len_sched);
+        let (res, _trace, _rec) =
+            TraceRecorder::observe_root_with_recorder(rec, "demo::root", vec![], |_rec| ext(5));
+        assert!(
+            res.is_err(),
+            "mismatched ReturnBytes payload size must panic rather than falling through to f()"
+        );
+
+        let mut bad_bool_sched = EnvSchedule::new();
+        bad_bool_sched.push_callee_response("demo::ext_bool", vec![2]);
+        let rec2 = TraceRecorder::with_schedule(bad_bool_sched);
+        let (res2, _trace2, _rec2) =
+            TraceRecorder::observe_root_with_recorder(rec2, "demo::root", vec![], |_rec| {
+                ext_bool(5)
+            });
+        assert!(
+            res2.is_err(),
+            "invalid bool bit pattern in ReturnBytes must fail validation without UB"
+        );
     }
 
     #[test]

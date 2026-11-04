@@ -53,11 +53,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cargo_anneal::{
     BatchTraceEvalCase, CaptureDriverConfig, RecordedEvent, RecordedOutcome, RecordedShadowAlloc,
-    ScaffoldConfig, TraceCheckModuleConfig, TraceRecorder, render_batch_trace_eval_lean_module,
-    render_raw_byte_trace_lean, render_raw_byte_trace_lean_def,
-    render_shadow_provenance_table_lean, render_tampered_outcome_diag_lean_snippet,
-    render_trace_check_lean_module, render_trace_diag_eval_lean_snippet, run_cargo_capture,
-    run_lake_verify_targets, scaffold_workspace_with_config, value_as_raw_bytes,
+    ScaffoldConfig, TraceCheckModuleConfig, TraceRecorder, capture_value_bytes,
+    render_batch_trace_eval_lean_module, render_raw_byte_trace_lean,
+    render_raw_byte_trace_lean_def, render_shadow_provenance_table_lean,
+    render_tampered_outcome_diag_lean_snippet, render_trace_check_lean_module,
+    render_trace_diag_eval_lean_snippet, run_cargo_capture, run_lake_verify_targets,
+    scaffold_workspace_with_config, value_as_raw_bytes,
 };
 
 fn unique_temp_dir(label: &str) -> PathBuf {
@@ -117,6 +118,7 @@ fn ensure_rustc_capture_binary(checkout_root: &Path) -> PathBuf {
 /// `anneal-rustc-capture` (`cargo check`, where `#[anneal_trace::external]`
 /// emits the unmodified function bodies).
 mod trace_pkg {
+    #[anneal_trace::capture]
     #[repr(C)]
     #[derive(Clone, Copy, Debug)]
     pub struct PaddedConfig {
@@ -152,6 +154,7 @@ mod trace_pkg {
 
 const TRACE_PKG_LIB_RS: &str = r#"#![allow(dead_code)]
 
+#[anneal_trace::capture]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PaddedConfig {
@@ -198,6 +201,20 @@ fn batch_trace_module_rendering_and_tampered_diag_contract() {
         *base.add(3) = 0xCC;
     }
     let raw_cfg_bytes = value_as_raw_bytes(&cfg_val);
+    assert_eq!(
+        capture_value_bytes(&cfg_val),
+        vec![
+            Some(1),
+            None,
+            None,
+            None,
+            Some(11),
+            Some(0),
+            Some(0),
+            Some(0)
+        ]
+    );
+    assert_eq!(raw_cfg_bytes, vec![1, 0, 0, 0, 11, 0, 0, 0]);
     let input_val: u32 = 10;
     let raw_input_bytes = value_as_raw_bytes(&input_val);
 
@@ -228,7 +245,7 @@ fn batch_trace_module_rendering_and_tampered_diag_contract() {
         &["Mir.TracePkg.helper_double".to_string()],
     );
     assert!(named_def.contains("def packetRawTrace : RawByteTrace :="));
-    assert!(named_def.contains("rawArgs := [[1, 170, 187, 204, 11, 0, 0, 0], [10, 0, 0, 0]]"));
+    assert!(named_def.contains("rawArgs := [[1, 0, 0, 0, 11, 0, 0, 0], [10, 0, 0, 0]]"));
 
     let cfg = TraceCheckModuleConfig {
         module_namespace: "TraceVerify.BatchContract".to_string(),
@@ -312,7 +329,9 @@ anneal-trace = {{ path = {:?} }}
 
     // 2. Construct a `PaddedConfig` in memory and deliberately write non-zero
     //    junk bytes (`0xAA, 0xBB, 0xCC`) into its 3 padding bytes at offsets
-    //    1..4 so we verify that `decodeRawValue` ignores struct padding bytes.
+    //    1..4 so we verify that `capture_value_bytes` marks padding as `None`
+    //    without reading padding bytes and `value_as_raw_bytes` masks unknown
+    //    padding bytes as `0`.
     let mut cfg_val = trace_pkg::PaddedConfig {
         mode: 1,
         threshold: 11,
@@ -323,11 +342,24 @@ anneal-trace = {{ path = {:?} }}
         *base.add(2) = 0xBB;
         *base.add(3) = 0xCC;
     }
+    assert_eq!(
+        capture_value_bytes(&cfg_val),
+        vec![
+            Some(1),
+            None,
+            None,
+            None,
+            Some(11),
+            Some(0),
+            Some(0),
+            Some(0)
+        ]
+    );
     let raw_cfg_bytes = value_as_raw_bytes(&cfg_val);
     assert_eq!(
         raw_cfg_bytes,
-        vec![1, 0xAA, 0xBB, 0xCC, 11, 0, 0, 0],
-        "expected 8-byte repr(C) struct with 3 corrupted padding bytes"
+        vec![1, 0, 0, 0, 11, 0, 0, 0],
+        "expected 8-byte repr(C) struct with padding masked as 0 without reading padding"
     );
 
     let input_val: u32 = 10;

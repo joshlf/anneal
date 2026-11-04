@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cargo_anneal::{
     BatchTraceEvalCase, CaptureDriverConfig, RecordedEvent, RecordedOutcome, ScaffoldConfig,
-    TraceCheckModuleConfig, TraceRecorder, parse_batch_trace_probe_output,
+    TraceCheckModuleConfig, TraceRecorder, capture_value_bytes, parse_batch_trace_probe_output,
     render_batch_trace_eval_lean_module, render_batch_trace_probe_lean_module, run_cargo_capture,
     run_lake_verify_targets, scaffold_workspace_with_config, value_as_raw_bytes,
 };
@@ -130,8 +130,21 @@ fn m1_and_m2_curated_30_and_harvested_45_native_and_metamorphic_calibration_gate
         *base.add(3) = 0xCC;
     }
     let raw_hdr_bytes = value_as_raw_bytes(&padded_hdr);
+    assert_eq!(
+        capture_value_bytes(&padded_hdr),
+        vec![
+            Some(1),
+            None,
+            None,
+            None,
+            Some(38),
+            Some(0),
+            Some(0),
+            Some(0)
+        ]
+    );
     assert_eq!(raw_hdr_bytes.len(), 8);
-    assert_eq!(&raw_hdr_bytes[1..4], &[0xAA, 0xBB, 0xCC]);
+    assert_eq!(&raw_hdr_bytes[1..4], &[0, 0, 0]);
     assert_eq!(corpus::repr_c_padded_header(padded_hdr, 4), 42);
     passed_curated += 1;
 
@@ -699,9 +712,7 @@ anneal-trace = {{ path = {:?} }}
         *base.add(3) = 0xCC;
         padded_hdr = slot.assume_init();
     }
-    let raw_padded_bytes = unsafe {
-        core::slice::from_raw_parts(slot.as_ptr().cast::<u8>(), 8).to_vec()
-    };
+    let raw_padded_bytes = value_as_raw_bytes(&padded_hdr);
     let (_res2, trace_cat2) = TraceRecorder::observe_root(
         "itree_diff_corpus::repr_c_padded_header",
         vec![raw_padded_bytes, value_as_raw_bytes(&4u32)],
