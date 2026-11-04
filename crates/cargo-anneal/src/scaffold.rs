@@ -28,7 +28,8 @@ use anneal_rustc_capture::lean_emit::render_mir_module_header;
 use anneal_rustc_capture::{CapturedItemKind, CapturedTarget, UnitTargetRecord, sha256_hex};
 
 use crate::obligations::{
-    AuthoredItemModules, CalleeContractRef, SubjectObligationBundle, TransitiveCalleeRef,
+    AuthoredItemModules, CalleeContractRef, ExternalSpecContractRef, SubjectObligationBundle,
+    TransitiveCalleeRef,
     collect_external_spec_contracts, derive_item_module_suffix, group_subject_obligations,
     module_suffix_to_rel_path, render_crate_verify_module, render_generated_assumptions_module,
     render_obligations_module_with_options, render_proof_template_with_options,
@@ -288,12 +289,108 @@ fn extract_called_fn_defs(mir_text: &str) -> Vec<String> {
     out
 }
 
-/// Populate `bundle.transitive_callees`, `bundle.external_spec_callees`, and
-/// `bundle.called_callees` for each subject bundle by computing the cycle-safe
-/// transitive closure of reachable `.fnDef "<callee_def_id>"` and trait-impl
-/// references across all captured MIR bodies (`Subject`, `UnsafeTraitImpl`,
-/// `Callee`, `Model`, `TypeInvariant`), excluding any target with an explicit
-/// `#[external_spec(for = <target>)]` override or `#[spec(trusted)]` attribute.
+/// Call-graph lookup tables shared by every transitive callee closure computed
+/// during scaffolding.
+struct CalleeGraph<'a> {
+    /// Linkable captured MIR bodies keyed by canonical `def_id`, mapped to their
+    /// dotted module suffix and relative `Mir/` path.
+    callable_by_def_id: &'a BTreeMap<String, (String, PathBuf)>,
+    /// Trait method `def_id` to the `def_id`s of every captured implementation.
+    trait_impls_by_method: &'a BTreeMap<String, Vec<String>>,
+    /// Explicit `#[external_spec(for = <target>)]` overrides keyed by target.
+    external_spec_contracts: &'a BTreeMap<String, ExternalSpecContractRef>,
+}
+
+/// Mutable worklist state of one transitive callee closure.
+#[derive(Default)]
+struct CalleeClosureState {
+    visited: BTreeSet<String>,
+    ext_seen: BTreeSet<String>,
+    queue: VecDeque<String>,
+    external_specs: Vec<ExternalSpecContractRef>,
+}
+
+impl CalleeGraph<'_> {
+    /// Record a reference to `r` found in a body reachable from
+    /// `subject_def_id`: an overridden target is recorded as an external spec
+    /// (and not traversed), a linkable body is queued once, and a trait method
+    /// additionally queues (or records as overridden) each of its captured
+    /// implementations.
+    fn enqueue_ref(&self, r: &str, subject_def_id: &str, state: &mut CalleeClosureState) {
+        if r != subject_def_id
+            && let Some(ext) = self.external_spec_contracts.get(r)
+        {
+            if state.ext_seen.insert(r.to_string()) {
+                state.external_specs.push(ext.clone());
+            }
+            return;
+        }
+        if self.callable_by_def_id.contains_key(r) && state.visited.insert(r.to_string()) {
+            state.queue.push_back(r.to_string());
+        }
+        if let Some(impls) = self.trait_impls_by_method.get(r) {
+            for impl_id in impls {
+                if impl_id != subject_def_id
+                    && let Some(ext) = self.external_spec_contracts.get(impl_id)
+                {
+                    if state.ext_seen.insert(impl_id.clone()) {
+                        state.external_specs.push(ext.clone());
+                    }
+                    continue;
+                }
+                if self.callable_by_def_id.contains_key(impl_id)
+                    && state.visited.insert(impl_id.clone())
+                {
+                    state.queue.push_back(impl_id.clone());
+                }
+            }
+        }
+    }
+
+    /// Compute the cycle-safe breadth-first closure of linkable callee bodies
+    /// reachable from `root_refs`, returning the linked bodies in discovery
+    /// order together with the overridden `#[external_spec]` targets reached.
+    fn closure(
+        &self,
+        root_refs: &[String],
+        subject_def_id: &str,
+        read_outgoing: &mut dyn FnMut(&Path) -> Vec<String>,
+    ) -> (Vec<TransitiveCalleeRef>, Vec<ExternalSpecContractRef>) {
+        let mut state = CalleeClosureState::default();
+        for r in root_refs {
+            self.enqueue_ref(r, subject_def_id, &mut state);
+        }
+        let mut linked = Vec::new();
+        while let Some(callee_def_id) = state.queue.pop_front() {
+            let Some((callee_suffix, callee_rel_path)) =
+                self.callable_by_def_id.get(&callee_def_id).cloned()
+            else {
+                continue;
+            };
+            linked.push(TransitiveCalleeRef {
+                def_id: callee_def_id,
+                item_module_suffix: callee_suffix,
+            });
+            for r in &read_outgoing(&callee_rel_path) {
+                self.enqueue_ref(r, subject_def_id, &mut state);
+            }
+        }
+        (linked, state.external_specs)
+    }
+}
+
+/// Populate `bundle.transitive_callees`, `bundle.external_spec_callees`,
+/// `bundle.called_callees`, `bundle.spec_callees`, and
+/// `bundle.spec_companions_with_calls` for each subject bundle by computing the
+/// cycle-safe transitive closure of reachable `.fnDef "<callee_def_id>"` and
+/// trait-impl references across all captured MIR bodies (`Subject`,
+/// `UnsafeTraitImpl`, `Callee`, `Model`, `TypeInvariant`), excluding any target
+/// with an explicit `#[external_spec(for = <target>)]` override or
+/// `#[spec(trusted)]` attribute.
+///
+/// The subject body's closure becomes `defaultCallees`; the closure of its
+/// `requires` / `ensures` companions (including those of reachable
+/// `#[external_spec]` contracts) becomes `defaultSpecCallees`.
 fn populate_called_callees(
     mir_root: &Path,
     records: &[UnitTargetRecord],
@@ -354,6 +451,12 @@ fn populate_called_callees(
         callable_by_def_id.insert(record.target.def_id.clone(), (suffix, rel_path));
     }
 
+    let graph = CalleeGraph {
+        callable_by_def_id: &callable_by_def_id,
+        trait_impls_by_method: &trait_impls_by_method,
+        external_spec_contracts: &external_spec_contracts,
+    };
+
     let mut outgoing_cache: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
     let mut read_outgoing = |rel_path: &Path| -> Vec<String> {
         if let Some(cached) = outgoing_cache.get(rel_path) {
@@ -375,78 +478,42 @@ fn populate_called_callees(
             }
         }
 
-        let mut visited: BTreeSet<String> = BTreeSet::new();
-        let mut ext_seen: BTreeSet<String> = BTreeSet::new();
-        let mut queue: VecDeque<String> = VecDeque::new();
-
-        let enqueue_ref = |r: &str,
-                           subject_def_id: &str,
-                           visited: &mut BTreeSet<String>,
-                           ext_seen: &mut BTreeSet<String>,
-                           ext_out: &mut Vec<_>,
-                           queue: &mut VecDeque<String>| {
-            if r != subject_def_id
-                && let Some(ext) = external_spec_contracts.get(r)
-            {
-                if ext_seen.insert(r.to_string()) {
-                    ext_out.push(ext.clone());
-                }
-                return;
-            }
-            if callable_by_def_id.contains_key(r) && visited.insert(r.to_string()) {
-                queue.push_back(r.to_string());
-            }
-            if let Some(impls) = trait_impls_by_method.get(r) {
-                for impl_id in impls {
-                    if impl_id != subject_def_id
-                        && let Some(ext) = external_spec_contracts.get(impl_id)
-                    {
-                        if ext_seen.insert(impl_id.clone()) {
-                            ext_out.push(ext.clone());
-                        }
-                        continue;
-                    }
-                    if callable_by_def_id.contains_key(impl_id) && visited.insert(impl_id.clone()) {
-                        queue.push_back(impl_id.clone());
-                    }
-                }
-            }
-        };
-
         let subject_def_id = bundle.subject.target.def_id.clone();
-        for r in &root_refs {
-            enqueue_ref(
-                r,
-                &subject_def_id,
-                &mut visited,
-                &mut ext_seen,
-                &mut bundle.external_spec_callees,
-                &mut queue,
-            );
-        }
+        let (linked, external_specs) =
+            graph.closure(&root_refs, &subject_def_id, &mut read_outgoing);
+        bundle.transitive_callees = linked;
+        bundle.external_spec_callees = external_specs;
 
-        while let Some(callee_def_id) = queue.pop_front() {
-            let Some((callee_suffix, callee_rel_path)) =
-                callable_by_def_id.get(&callee_def_id).cloned()
-            else {
+        let mut companion_suffixes: Vec<String> = Vec::new();
+        for companion in bundle.inline_requires.iter().chain(bundle.inline_ensures.iter()) {
+            companion_suffixes.push(derive_item_module_suffix(companion));
+        }
+        for ext in &bundle.external_spec_callees {
+            companion_suffixes.extend(ext.req_module_suffix.iter().cloned());
+            companion_suffixes.extend(ext.ens_module_suffix.iter().cloned());
+        }
+        let mut spec_root_refs: Vec<String> = Vec::new();
+        let mut seen_companions: BTreeSet<String> = BTreeSet::new();
+        for suffix in companion_suffixes {
+            if !seen_companions.insert(suffix.clone()) {
                 continue;
-            };
-            bundle.transitive_callees.push(TransitiveCalleeRef {
-                def_id: callee_def_id,
-                item_module_suffix: callee_suffix,
-            });
-            let next_refs = read_outgoing(&callee_rel_path);
-            for r in &next_refs {
-                enqueue_ref(
-                    r,
-                    &subject_def_id,
-                    &mut visited,
-                    &mut ext_seen,
-                    &mut bundle.external_spec_callees,
-                    &mut queue,
-                );
+            }
+            let refs = read_outgoing(&module_suffix_to_rel_path(&suffix));
+            if !refs.is_empty() {
+                bundle.spec_companions_with_calls.insert(suffix);
+            }
+            for r in refs {
+                if !spec_root_refs.contains(&r) {
+                    spec_root_refs.push(r);
+                }
             }
         }
+        // Overridden targets reached only from predicates are not added to the
+        // modular environment: predicates are evaluated by
+        // `MirBoolPredicateHoldsWithCallees`, which has no handler.
+        let (spec_linked, _predicate_external_specs) =
+            graph.closure(&spec_root_refs, &subject_def_id, &mut read_outgoing);
+        bundle.spec_callees = spec_linked;
     }
 }
 
@@ -845,6 +912,8 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
             called_callees: Vec::new(),
             transitive_callees: Vec::new(),
             external_spec_callees: Vec::new(),
+            spec_callees: Vec::new(),
+            spec_companions_with_calls: BTreeSet::new(),
         };
 
         let should_rerender_verify = authored.has_proof
@@ -1785,6 +1854,127 @@ mod tests {
         assert!(
             entry_obligations.contains("def externalCallContract_MyCrate_spec_overridden_fn : MirCallContract :="),
             "entry obligations must include externalCallContract for overridden_fn:\n{entry_obligations}"
+        );
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn spec_companion_callees_are_linked_without_widening_the_modular_environment() {
+        let workspace = unique_temp_dir("spec-companion-callees");
+        let unit_dir = workspace.join("target/anneal/units/my_crate-01");
+        fs::create_dir_all(unit_dir.join("Mir/MyCrate")).expect("create Mir/MyCrate");
+        fs::create_dir_all(unit_dir.join("Mir/Core")).expect("create Mir/Core");
+        fs::create_dir_all(unit_dir.join("Mir/DepCrate")).expect("create Mir/DepCrate");
+
+        let write_mir = |rel: &str, body_refs: &[&str]| {
+            let mut txt = String::from("prelude\nimport Init.Core\nimport Trusted\n");
+            for r in body_refs {
+                txt.push_str(&format!("-- call .fnDef \"{r}\" []\n"));
+            }
+            fs::write(unit_dir.join(rel), txt).expect("write mir file");
+        };
+        // The subject body is call-free; its `ensures` companion calls a `core`
+        // helper and an `#[external_spec]`-overridden dependency function, and
+        // its `requires` companion is call-free.
+        write_mir("Mir/MyCrate/entry.lean", &[]);
+        write_mir("Mir/MyCrate/__anodized_fn_requires_entry.lean", &[]);
+        write_mir(
+            "Mir/MyCrate/__anodized_fn_ensures_entry.lean",
+            &["core::num::wrapping_add", "dep_crate::overridden_fn"],
+        );
+        write_mir("Mir/Core/wrapping_add.lean", &[]);
+        write_mir("Mir/DepCrate/overridden_fn.lean", &[]);
+        write_mir("Mir/MyCrate/spec_overridden_fn.lean", &[]);
+
+        let rec = |def_id: &str, rel: &str, module: &str, kind, assoc: Option<&str>| {
+            UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id: def_id.to_string(),
+                    mir_module_path: rel.to_string(),
+                    mir_module_sha256: String::new(),
+                },
+                lean_module_name: module.to_string(),
+                item_kind: kind,
+                associated_subject_def_id: assoc.map(str::to_string),
+                trait_impls: Vec::new(),
+            }
+        };
+        let records = vec![
+            rec(
+                "my_crate::entry",
+                "Mir/MyCrate/entry.lean",
+                "Mir.MyCrate.entry",
+                CapturedItemKind::Subject,
+                None,
+            ),
+            rec(
+                "my_crate::__anodized_fn_requires_entry",
+                "Mir/MyCrate/__anodized_fn_requires_entry.lean",
+                "Mir.MyCrate.__anodized_fn_requires_entry",
+                CapturedItemKind::InlineSpecRequires,
+                Some("my_crate::entry"),
+            ),
+            rec(
+                "my_crate::__anodized_fn_ensures_entry",
+                "Mir/MyCrate/__anodized_fn_ensures_entry.lean",
+                "Mir.MyCrate.__anodized_fn_ensures_entry",
+                CapturedItemKind::InlineSpecEnsures,
+                Some("my_crate::entry"),
+            ),
+            rec(
+                "core::num::wrapping_add",
+                "Mir/Core/wrapping_add.lean",
+                "Mir.Core.wrapping_add",
+                CapturedItemKind::Callee,
+                None,
+            ),
+            rec(
+                "dep_crate::overridden_fn",
+                "Mir/DepCrate/overridden_fn.lean",
+                "Mir.DepCrate.overridden_fn",
+                CapturedItemKind::Callee,
+                None,
+            ),
+            rec(
+                "my_crate::spec_overridden_fn",
+                "Mir/MyCrate/spec_overridden_fn.lean",
+                "Mir.MyCrate.spec_overridden_fn",
+                CapturedItemKind::ExternalSpec,
+                Some("dep_crate::overridden_fn"),
+            ),
+        ];
+
+        scaffold_workspace(&workspace, &records).expect("scaffold workspace with spec companions");
+        let obligations =
+            fs::read_to_string(workspace.join(".anneal/generated/Obligations/MyCrate/entry.lean"))
+                .expect("read entry obligations");
+
+        assert!(
+            obligations.contains("def defaultSpecCallees : List CapturedMir :=\n  [Mir.Core.wrapping_add.body]"),
+            "the ensures companion's callee must be linked for predicate evaluation:\n{obligations}"
+        );
+        assert!(
+            obligations.contains(
+                "MirBoolPredicateHoldsWithCallees Mir.MyCrate.__anodized_fn_ensures_entry.body defaultSpecCallees"
+            ),
+            "call-containing ensures companion must link defaultSpecCallees:\n{obligations}"
+        );
+        assert!(
+            obligations.contains("MirBoolPredicateHolds Mir.MyCrate.__anodized_fn_requires_entry.body args"),
+            "call-free requires companion keeps the plain form:\n{obligations}"
+        );
+        assert!(
+            obligations.contains("def defaultCallees : List CapturedMir :=\n  .nil"),
+            "predicate-only callees must not be linked into the subject's own callee table:\n{obligations}"
+        );
+        assert!(
+            !obligations.contains("Mir.DepCrate.overridden_fn.body"),
+            "the overridden target stays excluded from every callee table:\n{obligations}"
+        );
+        assert!(
+            obligations.contains("envAssumed := fun _ => True"),
+            "a target reached only from a predicate is not assumed in the modular environment:\n{obligations}"
         );
 
         let _ = fs::remove_dir_all(&workspace);

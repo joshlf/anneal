@@ -338,12 +338,19 @@ fn capture_crate_unit<'tcx>(
     for candidate in candidates {
         let def_id = candidate.local_def_id.to_def_id();
         let body = query_post_cleanup_mir(tcx, candidate.local_def_id);
+        // `requires` / `ensures` companions are evaluated with their transitive
+        // callees linked (`defaultSpecCallees`), so the bodies they call must be
+        // captured as well. `#[external_spec]` sidecars are deliberately not
+        // traversed: their bodies only reference the abstracted target and the
+        // `unimplemented!` panic machinery.
         if matches!(
             candidate.classification.item_kind,
             CapturedItemKind::Subject
                 | CapturedItemKind::Callee
                 | CapturedItemKind::Model
                 | CapturedItemKind::UnsafeTraitImpl
+                | CapturedItemKind::InlineSpecRequires
+                | CapturedItemKind::InlineSpecEnsures
         ) {
             for (callee_def_id, opt_substs) in collect_referenced_callees(tcx, def_id, body, None) {
                 if should_capture_non_local_callee(tcx, callee_def_id) {

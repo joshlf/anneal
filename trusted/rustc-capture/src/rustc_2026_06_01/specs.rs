@@ -544,7 +544,7 @@ pub(crate) fn normalize_target_path(
     for std_mod in [
         "slice", "ops", "ptr", "mem", "cmp", "option", "result", "num", "convert", "default",
         "iter", "marker", "hint", "cell", "char", "str", "array", "clone", "hash", "fmt", "any",
-        "arch", "ascii", "borrow", "ffi", "future", "pin", " primitive", "Quick", "sync::atomic",
+        "arch", "ascii", "borrow", "ffi", "future", "pin", "sync::atomic",
     ] {
         let std_prefix = format!("std::{std_mod}::");
         if let Some(rest) = cleaned.strip_prefix(&std_prefix) {
@@ -552,7 +552,7 @@ pub(crate) fn normalize_target_path(
             break;
         }
     }
-    if let Some(( bracket_head, method )) = cleaned.rsplit_once(">::")
+    if let Some((bracket_head, method)) = cleaned.rsplit_once(">::")
         && let Some(inner) = bracket_head.strip_prefix('<')
         && inner.starts_with('[')
         && inner.ends_with(']')

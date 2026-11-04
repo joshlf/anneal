@@ -472,10 +472,131 @@ structure MirCallContract : Type where
   post : MirCallReq → MirCallAns → Prop := fun _ _ => True
 
 /--
+Pointee kinds whose references and raw pointers are wide (fat) pointers in the
+operational value model, carried as
+`Value.aggregate 0 [Value.ptr p sz, metadata]` (see the `.ref` / `.rawPtr` cases
+of `encodeValueToBytes` and `decodeValueFromBytes`): slices `[T]`, string
+slices `str`, and trait objects `dyn Trait`.
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Pointer types to DSTs are sized but have twice the size of pointers to sized
+> types
+>     - Pointers to slices and `str` also store the number of elements.
+>     - Pointers to trait objects also store a pointer to a vtable."
+-/
+def rigidTyIsWidePointee : RigidTy → Bool
+  | .slice _ => true
+  | .str => true
+  | .dynamic _ => true
+  | _ => false
+
+/--
+Pointee kinds that are statically `Sized` (or extern `foreign` types, which are
+unsized but use thin pointers), so that references and raw pointers to them are
+always thin pointers. Generic parameters, aliases, ADTs (which may have an
+unsized tail field), non-empty tuples, and unrendered `.other` types may be
+either thin or wide.
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Structs may contain a DST as the last field; this makes the struct itself a
+> DST."
+-/
+def rigidTyIsThinPointee : RigidTy → Bool
+  | .bool => true
+  | .char => true
+  | .int _ => true
+  | .uint _ => true
+  | .float _ => true
+  | .never => true
+  | .array _ _ => true
+  | .ref _ _ => true
+  | .rawPtr _ _ => true
+  | .fnDef _ _ => true
+  | .fnPtr _ _ _ _ => true
+  | .closure _ _ => true
+  | .foreign _ => true
+  | .tuple .nil => true
+  | _ => false
+
+/--
+Validity of a thin pointer, reference, or function-pointer `Value`: either a
+provenance-carrying `Value.ptr` or a provenance-free address scalar (as produced
+for dangling-but-aligned references to zero-sized constants and integer-valued
+raw pointers).
+
+Reference (The Rust Reference, "Pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/pointer.html>
+
+> "Raw pointers are pointers without safety or liveness guarantees."
+-/
+def thinPointerValueValid (v : Value) : Prop :=
+  Or (∃ p sz, v = .ptr p sz) (∃ sv, v = .scalar sv)
+
+/--
+Validity of a wide pointer `Value` to an unsized `pointee`: a data pointer
+paired with `usize` length metadata for slices and `str`, or with arbitrary
+vtable metadata for `dyn Trait`.
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Pointers to slices and `str` also store the number of elements."
+-/
+def widePointerValueValid (pointee : RigidTy) (v : Value) : Prop :=
+  match pointee with
+  | .dynamic _ => ∃ p sz metadata, v = .aggregate 0 (.ptr p sz :: metadata :: .nil)
+  | _ => ∃ p sz metadata, v = .aggregate 0 (.ptr p sz :: .scalar metadata :: .nil)
+
+/--
+Validity of a reference or raw-pointer `Value` whose pointee is `pointee`:
+wide for slices, `str`, and `dyn Trait`; thin for statically `Sized` (and
+`foreign`) pointees; and either thin or wide when the pointee may be unsized
+(generic parameters, aliases, ADTs with a possibly unsized tail, and non-empty
+tuples).
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Pointer types to DSTs are sized but have twice the size of pointers to sized
+> types"
+-/
+def pointerValueValid (pointee : RigidTy) (v : Value) : Prop :=
+  match rigidTyIsWidePointee pointee with
+  | true => widePointerValueValid pointee v
+  | false =>
+    match rigidTyIsThinPointee pointee with
+    | true => thinPointerValueValid v
+    | false =>
+      Or (thinPointerValueValid v)
+        (∃ p sz metadata, v = .aggregate 0 (.ptr p sz :: metadata :: .nil))
+
+/--
 Well-typed runtime `Value` validity predicate against a captured MIR `Ty` and
-`LayoutTable`, constraining scalar bit-widths and bit-bounds, boolean bit
-patterns (`0` or `1`), Unicode scalar values (`char`), pointer/reference
-metadata, and aggregate field arities.
+`LayoutTable`, used to type the arguments and return value of default
+`#[external_spec]` call contracts.
+
+The predicate must never be stronger than the operational value model: it is
+assumed of external return values, so an over-strong case would exclude real
+callee behaviors and make modular claims vacuous. It therefore accepts every
+representation that `MirSemantics` can produce for a valid value of `ty`:
+- `bool` is `0` or `1` of width `1`, `char` is a Unicode scalar value of width
+  `4`, and integers have the width of their type (`intCastTargetBytes`) with
+  in-range bits;
+- `()` and function items are `Value.unit` or the empty aggregate;
+- references and raw pointers follow `pointerValueValid` (wide `[ptr, meta]`
+  aggregates for slices, `str`, and `dyn Trait`), and function pointers are
+  thin pointers;
+- tuples and arrays are `Value.unit` (zero-sized constants) or aggregates of the
+  declared arity;
+- ADTs with an uninhabited layout have no valid value;
+- `!` has no valid value; and
+- generic parameters, aliases, unsized types (which are never passed or returned
+  by value), floats' bit patterns, and unrendered `.other` types are not
+  further constrained.
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -483,18 +604,16 @@ Reference (The Rust Reference, "Behavior considered undefined"):
 > "Producing an invalid value. Producing a value happens any time a value is
 > assigned to or read from a place, passed to a function/primitive operation or
 > returned from a function/primitive operation."
+>
+> "The following is a non-exhaustive list of invalid values:
+> - A `bool` that isn't 0 or 1.
+> - A `char` that is a surrogate or above `char::MAX`.
+> - A `!`."
 -/
 def valueValidForTy
     (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
     (ty : Ty)
     (v : Value) : Prop :=
-  let byteSz :=
-    match Trusted.Sequence.get? layouts.entries ty.layoutIdx with
-    | .some layout => layout.size.bytes
-    | .none =>
-      match tyScalarBytes ty with
-      | .some sz => sz
-      | .none => 0
   match ty.kind with
   | .bool =>
     ∃ b : Nat, b < 2 ∧ v = .scalar { bits := b, sizeBytes := 1 }
@@ -502,70 +621,55 @@ def valueValidForTy
     ∃ cp : Nat,
       (cp < 0xD800 ∨ (0xE000 ≤ cp ∧ cp ≤ 0x10FFFF)) ∧
       v = .scalar { bits := cp, sizeBytes := 4 }
-  | .int _ =>
-    ∃ bits : Nat,
-      bits < scalarModulus byteSz ∧
-      v = .scalar { bits := bits, sizeBytes := byteSz }
-  | .uint _ =>
-    ∃ bits : Nat,
-      bits < scalarModulus byteSz ∧
-      v = .scalar { bits := bits, sizeBytes := byteSz }
-  | .float _ =>
-    ∃ bits : Nat,
-      bits < scalarModulus byteSz ∧
-      v = .scalar { bits := bits, sizeBytes := byteSz }
-  | .rawPtr _ _ =>
-    ∃ ptr sz, v = .ptr ptr sz
-  | .ref _ _ =>
-    ∃ ptr sz, v = .ptr ptr sz
+  | .int w =>
+    match intCastTargetBytes (.int w) with
+    | .some bytes =>
+      ∃ bits : Nat,
+        bits < scalarModulus bytes ∧
+        v = .scalar { bits := bits, sizeBytes := bytes }
+    | .none => ∃ sv, v = .scalar sv
+  | .uint w =>
+    match intCastTargetBytes (.uint w) with
+    | .some bytes =>
+      ∃ bits : Nat,
+        bits < scalarModulus bytes ∧
+        v = .scalar { bits := bits, sizeBytes := bytes }
+    | .none => ∃ sv, v = .scalar sv
+  | .float _ => ∃ sv, v = .scalar sv
+  | .never => False
   | .tuple elemTys =>
     match elemTys with
-    | .nil => v = .unit
+    | .nil => Or (v = .unit) (v = .aggregate 0 .nil)
     | _ :: _ =>
-      ∃ fields,
-        v = .aggregate 0 fields ∧
-        Trusted.Sequence.length fields = Trusted.Sequence.length elemTys
+      Or (v = .unit)
+        (∃ fields,
+          v = .aggregate 0 fields ∧
+          Trusted.Sequence.length fields = Trusted.Sequence.length elemTys)
   | .array _ len =>
-    ∃ fields,
-      v = .aggregate 0 fields ∧
-      Trusted.Sequence.length fields = len
-  | .slice _ =>
-    ∃ ptr sz, v = .ptr ptr sz
-  | .str =>
-    ∃ ptr sz, v = .ptr ptr sz
-  | .fnDef _ _ => v = .unit
-  | .fnPtr _ _ _ _ =>
-    ∃ ptr sz, v = .ptr ptr sz
+    Or (v = .unit)
+      (∃ elems,
+        v = .aggregate 0 elems ∧
+        Trusted.Sequence.length elems = len)
+  | .ref _ pointee => pointerValueValid pointee v
+  | .rawPtr _ pointee => pointerValueValid pointee v
+  | .fnPtr _ _ _ _ => thinPointerValueValid v
+  | .fnDef _ _ => Or (v = .unit) (v = .aggregate 0 .nil)
   | .closure _ _ =>
-    (byteSz = 0 ∧ v = .unit) ∨
-    (∃ vIdx fields, v = .aggregate vIdx fields)
+    Or (v = .unit) (∃ vIdx fields, v = .aggregate vIdx fields)
   | .adt _ _ =>
-    (byteSz = 0 ∧ v = .unit) ∨
-    (∃ bits,
-      bits < scalarModulus byteSz ∧
-      v = .scalar { bits := bits, sizeBytes := byteSz }) ∨
-    (∃ ptr sz, v = .ptr ptr sz) ∨
-    (∃ vIdx fields, v = .aggregate vIdx fields)
-  | .param _ _ =>
-    (byteSz = 0 ∧ v = .unit) ∨
-    (∃ bits,
-      bits < scalarModulus byteSz ∧
-      v = .scalar { bits := bits, sizeBytes := byteSz }) ∨
-    (∃ ptr sz, v = .ptr ptr sz) ∨
-    (∃ vIdx fields, v = .aggregate vIdx fields)
-  | .alias _ _ =>
-    (byteSz = 0 ∧ v = .unit) ∨
-    (∃ bits,
-      bits < scalarModulus byteSz ∧
-      v = .scalar { bits := bits, sizeBytes := byteSz }) ∨
-    (∃ ptr sz, v = .ptr ptr sz) ∨
-    (∃ vIdx fields, v = .aggregate vIdx fields)
-  | .dynamic _ =>
-    ∃ ptr sz, v = .ptr ptr sz
-  | .foreign _ =>
-    ∃ ptr sz, v = .ptr ptr sz
-  | .never => False
-  | .other _ => False
+    match Trusted.Sequence.get? layouts.entries ty.layoutIdx with
+    | .some layout =>
+      match layout.isUninhabited with
+      | true => False
+      | false => True
+    | .none => True
+  | .param _ _ => True
+  | .alias _ _ => True
+  | .slice _ => True
+  | .str => True
+  | .dynamic _ => True
+  | .foreign _ => True
+  | .other _ => True
 
 /--
 Return-local layout and type validity predicate for local `_0` (`decl`) under
@@ -588,7 +692,8 @@ def valueValidForReturnDecl
 /--
 Return-type and layout validity predicate for a captured callee or
 `#[external_spec]` sidecar `calleeBody`, constraining `retVal` against return
-local `_0` (`calleeBody.localDecls[0]`) and `calleeBody.layouts`.
+local `_0` (`calleeBody.localDecls[0]`) and `calleeBody.layouts`. A body without
+locals (never produced by `anneal-rustc-capture`) imposes no constraint.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -602,14 +707,82 @@ def retMatchesCalleeReturnTy
     (calleeBody : CapturedMir) (retVal : Value) : Prop :=
   match calleeBody.localDecls with
   | retDecl :: _ => valueValidForReturnDecl calleeBody.layouts retDecl retVal
-  | .nil => False
+  | .nil => True
+
+/--
+Pointwise validity of incoming argument values `args` against parameter local
+declarations `paramDecls` (locals `_1..=_argCount`) under `layouts`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L369-L370>
+
+> "The first local is the return value pointer, followed by `arg_count` locals
+> for the function arguments, followed by any user-declared variables and
+> temporaries."
+-/
+def argsValidForParamDecls
+    (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    List LocalDecl → List Value → Prop
+  | decl :: decls, arg :: args =>
+    And (valueValidForTy layouts decl.ty arg) (argsValidForParamDecls layouts decls args)
+  | _, _ => True
+
+/--
+Argument-type and layout validity predicate for a captured callee or
+`#[external_spec]` sidecar `calleeBody`, constraining each argument in `args`
+against the corresponding parameter local of `calleeBody`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Producing a value happens any time a value is assigned to or read from a
+> place, passed to a function/primitive operation or returned from a
+> function/primitive operation."
+-/
+def argsMatchCalleeParamTys
+    (calleeBody : CapturedMir) (args : List Value) : Prop :=
+  match calleeBody.localDecls with
+  | _ :: paramDecls => argsValidForParamDecls calleeBody.layouts paramDecls args
+  | .nil => True
+
+/--
+Frame condition relating the `Memory` at an external call site (`before`) to the
+`Memory` handed back by the callee (`after`): an external callee may mutate heap,
+global, borrow-tag, and caller-owned referent state, but it returns (or unwinds)
+to the same suspended call stack, active body, and immutable callee code table.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L812-L853>
+
+> "/// Returns from the function.
+> ///
+> /// Like function calls, the exact semantics of returns in Rust are unclear.
+> /// Returning very likely at least assigns the value currently in the return
+> /// place (`_0`) to the place specified in the associated `Call` terminator
+> /// in the calling function, as if assigned via `dest = move _0`."
+-/
+def callFramePreserved (before after : Memory) : Prop :=
+  And (after.callees = before.callees)
+    (And (after.callStack = before.callStack)
+      (after.activeCallee = before.activeCallee))
 
 /--
 Well-typed modular `MirCallContract` for an `#[external_spec(for = <target>)]`
 declaration with canonical target path `targetDefPath` and captured signature
-sidecar `sidecarBody`, enforcing argument arity and return-type/layout validity
-(`retMatchesCalleeReturnTy sidecarBody retVal`) alongside optional `extraPre`
-and `extraPost` clauses.
+sidecar `sidecarBody`.
+
+The precondition requires the target path, the argument arity, the
+argument-type validity of every argument (`argsMatchCalleeParamTys`), and the
+optional `requires` clause `extraPre`. The postcondition assumes only what holds
+of every Rust or FFI callee with that signature: a normal return yields a value
+satisfying the return type and layout (`retMatchesCalleeReturnTy`) and the
+optional `ensures` clause `extraPost`, with arbitrary heap mutation but the same
+call frame (`callFramePreserved`); unwinding preserves the call frame; and
+aborting is unconstrained. It does not assume that the callee leaves memory
+unchanged or never panics, since neither follows from a signature or from
+`requires`/`ensures` clauses over arguments and return values.
 
 Reference (The Rust Reference, "Call expressions"):
 <https://doc.rust-lang.org/1.98.0/reference/expressions/call-expr.html>
@@ -617,6 +790,12 @@ Reference (The Rust Reference, "Call expressions"):
 > "A call expression calls a function. It consists of an expression called the
 > called function operand, followed by a parenthesized comma-separated list of
 > expression operands called the argument operands."
+
+Reference (The Rust Reference, "External blocks - ABI"):
+<https://doc.rust-lang.org/1.98.0/reference/items/external-blocks.html#abi>
+
+> "By default external blocks assume that the library they are calling uses
+> the standard C ABI on the specific platform."
 -/
 def externalSpecCallContract
     (targetDefPath : DefPath)
@@ -627,12 +806,16 @@ def externalSpecCallContract
   pre req :=
     And (req.defPath = targetDefPath)
       (And (Trusted.Sequence.length req.args = sidecarBody.argCount)
-        (extraPre req.args))
+        (And (argsMatchCalleeParamTys sidecarBody req.args)
+          (extraPre req.args)))
   post req ans :=
-    ∃ retVal,
-      And (ans = .returned retVal req.memory)
+    match ans with
+    | .returned retVal memAfter =>
+      And (callFramePreserved req.memory memAfter)
         (And (retMatchesCalleeReturnTy sidecarBody retVal)
           (extraPost req.args retVal))
+    | .panicked memAfter => callFramePreserved req.memory memAfter
+    | .aborted => True
 
 /--
 Semantic rely predicate stating that an `ExternalCallHandler` `h` implements

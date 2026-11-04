@@ -1748,24 +1748,44 @@ pub fn caller_with_external_specs(s: &[u8], x: usize) -> usize {
     let empty_bonus = <[u8]>::is_empty(s) as usize;
     crate_b::overridden_dep(x).wrapping_add(crate_b::inner_leaf(empty_bonus))
 }
+
+unsafe extern "C" {
+    pub fn ffi_checksum(len: usize) -> u32;
+}
+
+pub const __ANNEAL_EXT_SPEC_TARGET_ext_ffi_checksum: &str = "ffi_checksum";
+pub unsafe fn ext_ffi_checksum(len: usize) -> u32 {
+    let _: unsafe extern "C" fn(usize) -> u32 = *::core::hint::black_box(&ffi_checksum);
+    let _ = (len,);
+    unreachable!()
+}
+
+pub fn caller_ffi_and_len(s: &[u8]) -> u32 {
+    // A direct `s.len()` is lowered to `PtrMetadata` by rustc; calling through
+    // a function pointer keeps a real call to `<[T]>::len` in the MIR.
+    let len_fn: fn(&[u8]) -> usize = <[u8]>::len;
+    unsafe { ffi_checksum(len_fn(s)) }
+}
 "#,
         )
         .expect("write crate_a/src/lib.rs");
 
         let mut cfg = CaptureDriverConfig::new(&crate_a_dir);
         cfg.manifest_path = Some(crate_a_dir.join("Cargo.toml"));
+        // Always (incrementally) rebuild the capture wrapper so the test never
+        // runs a stale `anneal-rustc-capture` binary from an earlier checkout.
+        let cargo_bin = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let status = Command::new(cargo_bin)
+            .args(["build", "-p", "anneal-rustc-capture", "--bin", "anneal-rustc-capture"])
+            .current_dir(repo_root)
+            .status()
+            .expect("build anneal-rustc-capture");
+        assert!(
+            status.success(),
+            "cargo build -p anneal-rustc-capture must succeed"
+        );
         let wrapper = resolve_rustc_wrapper(&cfg);
-        if !wrapper.is_file() {
-            let status = Command::new("cargo")
-                .args(["build", "-p", "anneal-rustc-capture"])
-                .current_dir(repo_root)
-                .status()
-                .expect("build anneal-rustc-capture");
-            assert!(
-                status.success(),
-                "cargo build -p anneal-rustc-capture must succeed"
-            );
-        }
+        assert!(wrapper.is_file(), "expected capture wrapper at {}", wrapper.display());
 
         let (manifest, records) =
             run_cargo_capture(&cfg).expect("run_cargo_capture on multi-crate workspace");
@@ -1834,6 +1854,67 @@ pub fn caller_with_external_specs(s: &[u8], x: usize) -> usize {
             ),
             "expected clause-less externalCallContract_CrateA_ext_slice_is_empty in caller_with_external_specs.lean:\n{ob_override}"
         );
+        // Every abstracted callee is assumed in the modular environment, not
+        // only the first one discovered.
+        for contract in [
+            "externalCallContract_CrateA_ext_overridden_dep",
+            "externalCallContract_CrateA_ext_slice_is_empty",
+        ] {
+            assert!(
+                ob_override.contains(&format!("{contract}.holdsOn h")),
+                "envAssumed must conjoin {contract}.holdsOn:\n{ob_override}"
+            );
+        }
+        assert!(
+            ob_override.contains("envAssumed := fun h => And ("),
+            "envAssumed must be the conjunction of every external call contract:\n{ob_override}"
+        );
+        // The claused `ensures: ret == x.wrapping_add(5)` companion calls
+        // `core::num::<impl usize>::wrapping_add`, so it is evaluated with its
+        // callees linked instead of treating the call as an arbitrary-valued
+        // external call (which would make the contract's postcondition
+        // unsatisfiable). The call-free `requires: x < 100` keeps the plain form.
+        let spec_callees_line = ob_override
+            .lines()
+            .skip_while(|l| !l.starts_with("def defaultSpecCallees : List CapturedMir :="))
+            .nth(1)
+            .unwrap_or_default();
+        assert!(
+            spec_callees_line.contains("wrapping_add"),
+            "defaultSpecCallees must link the wrapping_add body called by the ensures companion:\n{ob_override}"
+        );
+        assert!(
+            ob_override.contains(
+                "(fun args ret => MirBoolPredicateHoldsWithCallees Mir.CrateA.__anodized_fn_ensures_ext_overridden_dep.body defaultSpecCallees (List.append args (List.cons ret List.nil)))"
+            ),
+            "call-containing ensures companion must be evaluated with defaultSpecCallees:\n{ob_override}"
+        );
+        assert!(
+            ob_override.contains(
+                "(fun args => MirBoolPredicateHolds Mir.CrateA.__anodized_fn_requires_ext_overridden_dep.body args)"
+            ),
+            "call-free requires companion keeps the plain MirBoolPredicateHolds form:\n{ob_override}"
+        );
+
+        // 2b. A true `extern "C"` FFI function (no MIR body) abstracted by an
+        // `#[external_spec]` sidecar is bound by its contract, while the
+        // `<[u8]>::len` call in the same subject still steps through `core`.
+        let ob_ffi = fs::read_to_string(gen_dir.join("Obligations/CrateA/caller_ffi_and_len.lean"))
+            .expect("read caller_ffi_and_len.lean");
+        assert!(
+            ob_ffi.contains("def externalCallContract_CrateA_ext_ffi_checksum : MirCallContract :=")
+                && ob_ffi.contains("envAssumed := externalCallContract_CrateA_ext_ffi_checksum.holdsOn"),
+            "FFI target must be abstracted by its external call contract:\n{ob_ffi}"
+        );
+        let ffi_callees_line = ob_ffi
+            .lines()
+            .skip_while(|l| !l.starts_with("def defaultCallees : List CapturedMir :="))
+            .nth(1)
+            .unwrap_or_default();
+        assert!(
+            ffi_callees_line.contains("len.body") && !ffi_callees_line.contains("ffi_checksum"),
+            "defaultCallees must link <[T]>::len and contain no FFI body:\n{ob_ffi}"
+        );
 
         // 3. Test `cargo anneal generate-external-spec` against the scaffolded workspace.
         let snippet = crate::generate_external_spec_snippet(
@@ -1847,7 +1928,7 @@ pub fn caller_with_external_specs(s: &[u8], x: usize) -> usize {
             "snippet must contain external_spec attribute:\n{snippet}"
         );
         assert!(
-            snippet.contains("fn external_spec_helper_add(x: usize, y: usize) -> usize;"),
+            snippet.contains("unsafe fn external_spec_helper_add(x: usize, y: usize) -> usize;"),
             "snippet must reconstruct parameter and return types from captured Mir:\n{snippet}"
         );
 
@@ -1900,6 +1981,7 @@ pub fn caller_with_external_specs(s: &[u8], x: usize) -> usize {
         let verify_brief_3_2_src = r#"import Trusted
 import Obligations.CrateA.caller_default_callees
 import Obligations.CrateA.caller_with_external_specs
+import Obligations.CrateA.caller_ffi_and_len
 
 open Trusted.Sequence
 open Trusted.Rustc.V2026_06_01.MirAst
@@ -1951,21 +2033,100 @@ example :
 
 -- 4. Clause-less `#[external_spec(for = <[u8]>::is_empty)]` generates a non-vacuous
 --    well-typed `MirCallContract` whose postcondition accepts valid `bool` scalars
---    (`0` or `1` of byte width `1`) and rejects out-of-range values!
+--    (`0` or `1` of byte width `1`) and rejects out-of-range values.
 example (sVal : Value) :
     Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
       { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
-      (.returned (.scalar ⟨1, 1⟩) emptyMemory) := by
-  exact ⟨.scalar ⟨1, 1⟩, rfl, ⟨1, by decide, rfl⟩, trivial⟩
+      (.returned (.scalar ⟨1, 1⟩) emptyMemory) :=
+  ⟨⟨rfl, rfl, rfl⟩, ⟨1, by decide, rfl⟩, trivial⟩
 
 example (sVal : Value) :
     ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
       { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
       (.returned (.scalar ⟨2, 1⟩) emptyMemory) := by
-  rintro ⟨retVal, h_ans, ⟨b, hb_lt, h_ret⟩, _⟩
-  cases h_ans
+  rintro ⟨_, ⟨b, hb_lt, h_ret⟩, _⟩
   cases h_ret
   omega
+
+-- 5. The default contract assumes nothing a real callee could violate: a normal
+--    return may mutate the heap (only the call frame is preserved), and the callee
+--    may unwind or abort.
+example (sVal : Value) :
+    Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
+      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      (.returned (.scalar ⟨0, 1⟩) { emptyMemory with nextAllocId := 7, nextTag := 9 }) :=
+  ⟨⟨rfl, rfl, rfl⟩, ⟨0, by decide, rfl⟩, trivial⟩
+
+example (sVal : Value) :
+    Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
+      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      (.panicked { emptyMemory with nextTag := 3 }) :=
+  ⟨rfl, rfl, rfl⟩
+
+example (sVal : Value) :
+    Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
+      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      .aborted :=
+  trivial
+
+-- 6. The default input contract requires well-typed arguments: the `&[u8]`
+--    parameter must be a wide (pointer, length) aggregate, not a thin pointer.
+example (p : ProvenancePtr) :
+    Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.pre
+      { defPath := "core::slice::<impl [T]>::is_empty"
+        args := [.aggregate 0 [.ptr p 8, .scalar ⟨3, 8⟩]]
+        memory := emptyMemory } :=
+  ⟨rfl, rfl, ⟨⟨p, 8, ⟨3, 8⟩, rfl⟩, trivial⟩, trivial⟩
+
+example (p : ProvenancePtr) :
+    ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.pre
+      { defPath := "core::slice::<impl [T]>::is_empty"
+        args := [.ptr p 8]
+        memory := emptyMemory } := by
+  rintro ⟨_, _, ⟨⟨_, _, _, h⟩, _⟩, _⟩
+  cases h
+
+-- 7. Wide references, raw pointers, and generic pointees: slice and `str`
+--    references must carry length metadata, while a pointee that may be
+--    unsized (a generic parameter) admits both representations.
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (p : ProvenancePtr) :
+    valueValidForTy L { kind := .ref .not .str, layoutIdx := 0 }
+      (.aggregate 0 [.ptr p 8, .scalar ⟨5, 8⟩]) :=
+  ⟨p, 8, ⟨5, 8⟩, rfl⟩
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (p : ProvenancePtr) :
+    ¬ valueValidForTy L { kind := .rawPtr .mut (.slice (.uint .u8)), layoutIdx := 0 }
+      (.ptr p 8) := by
+  rintro ⟨_, _, _, h⟩
+  cases h
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (p : ProvenancePtr) :
+    valueValidForTy L { kind := .ref .not (.param 0 "T"), layoutIdx := 0 } (.ptr p 8) ∧
+    valueValidForTy L { kind := .ref .not (.param 0 "T"), layoutIdx := 0 }
+      (.aggregate 0 [.ptr p 8, .scalar ⟨5, 8⟩]) :=
+  ⟨Or.inl (Or.inl ⟨p, 8, rfl⟩), Or.inr ⟨p, 8, .scalar ⟨5, 8⟩, rfl⟩⟩
+
+-- 8. The FFI target has no captured body, so a call to it is a `MirCallE`
+--    interaction bound only by its external call contract, whose postcondition
+--    types the `u32` result.
+example (lenVal : Value) :
+    ¬ Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum.post
+      { defPath := "ffi_checksum", args := [lenVal], memory := emptyMemory }
+      (.returned (.scalar ⟨4294967296, 4⟩) emptyMemory) := by
+  rintro ⟨_, ⟨bits, h_lt, h_ret⟩, _⟩
+  cases h_ret
+  exact absurd h_lt (by decide)
+
+-- 9. Every abstracted callee is assumed in the modular environment.
+example (h : ExternalCallHandler)
+    (h1 :
+      Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_overridden_dep.holdsOn h)
+    (h2 :
+      Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.holdsOn h) :
+    Obligations.CrateA.caller_with_external_specs.modularClaim.envAssumed h := by
+  first
+  | exact ⟨h1, h2⟩
+  | exact ⟨h2, h1⟩
 "#;
         fs::write(&verify_brief_3_2_path, verify_brief_3_2_src.as_bytes())
             .expect("write VerifyBrief32.lean");

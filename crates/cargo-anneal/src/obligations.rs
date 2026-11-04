@@ -122,6 +122,17 @@ pub struct SubjectObligationBundle {
     /// declaration, excluded from `s.memory.callees` and abstracted via
     /// `MirCallE` + `externalSpecCallContract`.
     pub external_spec_callees: Vec<ExternalSpecContractRef>,
+    /// Transitive closure of captured MIR callees reachable from the `requires`
+    /// and `ensures` companion bodies evaluated in this subject's obligations
+    /// (`defaultSpecCallees`). Companion predicates that call functions are
+    /// evaluated with these bodies linked, so that a call inside a predicate
+    /// steps through the callee instead of returning an arbitrary value (which
+    /// would make the predicate unsatisfiable and the contract vacuous).
+    pub spec_callees: Vec<TransitiveCalleeRef>,
+    /// Module suffixes of companion bodies that reference at least one function
+    /// and are therefore evaluated with `MirBoolPredicateHoldsWithCallees` over
+    /// `defaultSpecCallees`.
+    pub spec_companions_with_calls: BTreeSet<String>,
 }
 
 impl SubjectObligationBundle {
@@ -276,6 +287,8 @@ pub fn group_subject_obligations(records: &[UnitTargetRecord]) -> Vec<SubjectObl
                     called_callees: Vec::new(),
                     transitive_callees: Vec::new(),
                     external_spec_callees: Vec::new(),
+                    spec_callees: Vec::new(),
+                    spec_companions_with_calls: BTreeSet::new(),
                 },
             );
         }
@@ -327,6 +340,11 @@ pub fn group_subject_obligations(records: &[UnitTargetRecord]) -> Vec<SubjectObl
     bundles_by_def_id.into_values().collect()
 }
 
+/// Item-name prefix of `anodized` `requires` companion functions.
+const ANODIZED_REQUIRES_COMPANION_PREFIX: &str = "__anodized_fn_requires_";
+/// Item-name prefix of `anodized` `ensures` companion functions.
+const ANODIZED_ENSURES_COMPANION_PREFIX: &str = "__anodized_fn_ensures_";
+
 /// Collect all explicit `#[external_spec(for = <target>)]` overrides across
 /// `records`, keyed by canonical `target_def_id`.
 pub fn collect_external_spec_contracts(
@@ -343,47 +361,35 @@ pub fn collect_external_spec_contracts(
             .clone()
             .unwrap_or_else(|| record.target.def_id.clone());
         let sidecar_module_suffix = derive_item_module_suffix(record);
-        let sidecar_ident = record
-            .target
-            .def_id
-            .rsplit_once("::")
-            .map(|(_, id)| id)
-            .unwrap_or(&record.target.def_id);
-        let req_prefix = format!("__anodized_fn_requires_{sidecar_ident}");
-        let ens_prefix = format!("__anodized_fn_ensures_{sidecar_ident}");
+        // `anodized` emits the `requires` / `ensures` companions of a sidecar
+        // `<parent>::<ident>` as sibling items
+        // `<parent>::__anodized_fn_{requires,ensures}_<ident>`. Match them by
+        // exact path: matching by associated subject alone would also pick up
+        // the target's own inline `#[spec]` companions (which share the same
+        // associated subject) or the companions of another sidecar whose name
+        // extends `<ident>`.
+        let (sidecar_parent, sidecar_ident) = match record.target.def_id.rsplit_once("::") {
+            Some((parent, ident)) => (Some(parent), ident),
+            None => (None, record.target.def_id.as_str()),
+        };
+        let companion_def_id = |prefix: &str| match sidecar_parent {
+            Some(parent) => format!("{parent}::{prefix}{sidecar_ident}"),
+            None => format!("{prefix}{sidecar_ident}"),
+        };
+        let req_def_id = companion_def_id(ANODIZED_REQUIRES_COMPANION_PREFIX);
+        let ens_def_id = companion_def_id(ANODIZED_ENSURES_COMPANION_PREFIX);
 
         let mut req_module_suffix = None;
         let mut ens_module_suffix = None;
         for comp in records {
-            let assoc_matches = comp.associated_subject_def_id.as_deref()
-                == Some(target_def_id.as_str())
-                || comp.associated_subject_def_id.as_deref()
-                    == Some(record.target.def_id.as_str());
-            if !assoc_matches {
-                continue;
-            }
-            let comp_ident = comp
-                .target
-                .def_id
-                .rsplit_once("::")
-                .map(|(_, id)| id)
-                .unwrap_or(&comp.target.def_id);
             match comp.item_kind {
                 CapturedItemKind::InlineSpecRequires
-                    if req_module_suffix.is_none()
-                        && (comp_ident == req_prefix
-                            || comp_ident.starts_with(&format!("{req_prefix}_"))
-                            || comp.associated_subject_def_id.as_deref()
-                                == Some(target_def_id.as_str())) =>
+                    if req_module_suffix.is_none() && comp.target.def_id == req_def_id =>
                 {
                     req_module_suffix = Some(derive_item_module_suffix(comp));
                 }
                 CapturedItemKind::InlineSpecEnsures
-                    if ens_module_suffix.is_none()
-                        && (comp_ident == ens_prefix
-                            || comp_ident.starts_with(&format!("{ens_prefix}_"))
-                            || comp.associated_subject_def_id.as_deref()
-                                == Some(target_def_id.as_str())) =>
+                    if ens_module_suffix.is_none() && comp.target.def_id == ens_def_id =>
                 {
                     ens_module_suffix = Some(derive_item_module_suffix(comp));
                 }
@@ -420,6 +426,65 @@ fn conjoin_prop_clauses(clauses: &[String]) -> String {
 fn is_callable_external_spec(record: &UnitTargetRecord) -> bool {
     !record.target.mir_module_path.is_empty()
         && !record.target.def_id.contains("__ANNEAL_EXT_SPEC_TARGET_")
+}
+
+/// Render the Lean proposition asserting that the boolean companion predicate
+/// `Mir.<companion_suffix>.body` holds on `args_expr`.
+///
+/// Companions that call functions are evaluated with `defaultSpecCallees`
+/// linked (`MirBoolPredicateHoldsWithCallees`); call-free companions keep the
+/// plain `MirBoolPredicateHolds` form, which is definitionally the same
+/// predicate with no linked callees.
+fn render_companion_predicate(
+    bundle: &SubjectObligationBundle,
+    companion_suffix: &str,
+    args_expr: &str,
+) -> String {
+    if !bundle.spec_callees.is_empty()
+        && bundle.spec_companions_with_calls.contains(companion_suffix)
+    {
+        format!(
+            "MirBoolPredicateHoldsWithCallees Mir.{companion_suffix}.body defaultSpecCallees {args_expr}"
+        )
+    } else {
+        format!("MirBoolPredicateHolds Mir.{companion_suffix}.body {args_expr}")
+    }
+}
+
+/// Lean identifier of the `externalSpecCallContract` definition emitted for
+/// `ext` in an `Obligations.<Item>` module.
+fn external_call_contract_ident(ext: &ExternalSpecContractRef) -> String {
+    format!(
+        "externalCallContract_{}",
+        sanitize_lean_ident(&ext.sidecar_module_suffix)
+    )
+}
+
+/// Render `defaultModularSpec.envAssumed` for `bundle`: the conjunction of
+/// `holdsOn` for every `#[external_spec]` contract abstracting a reachable
+/// callee and every verified sibling callee contract.
+///
+/// Every contract's precondition is guarded by `req.defPath`, so the
+/// conjunction constrains each abstracted callee independently. A single
+/// contract keeps the bare `<contract>.holdsOn` form expected by the automatic
+/// modular discharge combinators.
+fn render_default_env_assumed(bundle: &SubjectObligationBundle) -> String {
+    let mut contracts: Vec<String> = bundle
+        .external_spec_callees
+        .iter()
+        .map(external_call_contract_ident)
+        .collect();
+    contracts.extend(bundle.called_callees.iter().map(|callee| {
+        format!("Obligations.{}.defaultCallContract", callee.item_module_suffix)
+    }));
+    match contracts.as_slice() {
+        [] => "fun _ => True".to_string(),
+        [single] => format!("{single}.holdsOn"),
+        many => {
+            let clauses: Vec<String> = many.iter().map(|c| format!("{c}.holdsOn h")).collect();
+            format!("fun h => {}", conjoin_prop_clauses(&clauses))
+        }
+    }
 }
 
 /// Render the disposable `.anneal/generated/Obligations/<Item>.lean` module for
@@ -501,6 +566,13 @@ pub fn render_obligations_module_with_options(
             out.push_str(&format!("import Mir.{ens_suf}\n"));
         }
     }
+    for callee in &bundle.spec_callees {
+        if callee.item_module_suffix != *item
+            && imported_companions.insert(callee.item_module_suffix.clone())
+        {
+            out.push_str(&format!("import Mir.{}\n", callee.item_module_suffix));
+        }
+    }
 
     let mut imported_obligations: BTreeSet<String> = BTreeSet::new();
     for callee in &bundle.called_callees {
@@ -563,6 +635,22 @@ pub fn render_obligations_module_with_options(
     let has_contract_companions =
         !bundle.inline_requires.is_empty() || !bundle.inline_ensures.is_empty();
 
+    if !bundle.spec_callees.is_empty() {
+        let elems: Vec<String> = bundle
+            .spec_callees
+            .iter()
+            .map(|c| format!("Mir.{}.body", c.item_module_suffix))
+            .collect();
+        out.push_str(&format!(
+            "/-- Transitive callee table linked while evaluating the `requires` /\n    \
+                `ensures` companion predicates of `{def_id}`, so that calls inside\n    \
+                a predicate step through the callee bodies. -/\n\
+             def defaultSpecCallees : List CapturedMir :=\n  \
+               [{}]\n\n",
+            elems.join(", ")
+        ));
+    }
+
     let default_pre_expr = if has_contract_companions {
         let mut clauses = Vec::with_capacity(bundle.inline_requires.len() + 1);
         clauses.push(format!(
@@ -570,7 +658,7 @@ pub fn render_obligations_module_with_options(
         ));
         for req in &bundle.inline_requires {
             let req_suffix = derive_item_module_suffix(req);
-            clauses.push(format!("MirBoolPredicateHolds Mir.{req_suffix}.body args"));
+            clauses.push(render_companion_predicate(bundle, &req_suffix, "args"));
         }
         conjoin_prop_clauses(&clauses)
     } else {
@@ -583,9 +671,10 @@ pub fn render_obligations_module_with_options(
             .iter()
             .map(|ens| {
                 let ens_suffix = derive_item_module_suffix(ens);
-                format!(
-                    "MirBoolPredicateHolds Mir.{ens_suffix}.body \
-                     (List.append args (List.cons ret List.nil))"
+                render_companion_predicate(
+                    bundle,
+                    &ens_suffix,
+                    "(List.append args (List.cons ret List.nil))",
                 )
             })
             .collect();
@@ -686,19 +775,23 @@ pub fn render_obligations_module_with_options(
     ));
 
     for (idx, ext) in bundle.external_spec_callees.iter().enumerate() {
-        let contract_ident = format!(
-            "externalCallContract_{}",
-            sanitize_lean_ident(&ext.sidecar_module_suffix)
-        );
+        let contract_ident = external_call_contract_ident(ext);
         let extra_pre = if let Some(ref req_suf) = ext.req_module_suffix {
-            format!("(fun args => MirBoolPredicateHolds Mir.{req_suf}.body args)")
+            format!(
+                "(fun args => {})",
+                render_companion_predicate(bundle, req_suf, "args")
+            )
         } else {
             "(fun _ => True)".to_string()
         };
         let extra_post = if let Some(ref ens_suf) = ext.ens_module_suffix {
             format!(
-                "(fun args ret => MirBoolPredicateHolds Mir.{ens_suf}.body \
-                 (List.append args (List.cons ret List.nil)))"
+                "(fun args ret => {})",
+                render_companion_predicate(
+                    bundle,
+                    ens_suf,
+                    "(List.append args (List.cons ret List.nil))"
+                )
             )
         } else {
             "(fun _ _ => True)".to_string()
@@ -725,20 +818,7 @@ pub fn render_obligations_module_with_options(
         }
     }
 
-    let default_env_assumed = if let Some(ext) = bundle.external_spec_callees.first() {
-        let contract_ident = format!(
-            "externalCallContract_{}",
-            sanitize_lean_ident(&ext.sidecar_module_suffix)
-        );
-        format!("{contract_ident}.holdsOn")
-    } else if let Some(callee) = bundle.called_callees.first() {
-        format!(
-            "Obligations.{}.defaultCallContract.holdsOn",
-            callee.item_module_suffix
-        )
-    } else {
-        "fun _ => True".to_string()
-    };
+    let default_env_assumed = render_default_env_assumed(bundle);
 
     out.push_str(&format!(
         "/-- Low-priority default `ModularItemSpec` instance for `{def_id}`. -/\n"
@@ -1160,51 +1240,35 @@ pub fn render_verify_module_with_options(
             ));
         }
     } else if !authored.has_specs
+        // The automatic modular discharge combinators assume a single callee
+        // contract whose normal returns leave memory unchanged
+        // (`ans = .returned retVal req.memory`). That holds for a verified
+        // sibling callee's `defaultCallContract`, but not for
+        // `externalSpecCallContract` (which soundly permits heap mutation and
+        // unwinding) or for a conjunction of several contracts, so only the
+        // single-sibling-callee case is attempted here.
+        && bundle.external_spec_callees.is_empty()
+        && bundle.called_callees.len() == 1
         && let Some((contract_expr, callee_def_id, callee_arg_count_expr, opt_callee_req, callee_ens_suffix)) =
-            bundle
-                .external_spec_callees
-                .first()
-                .and_then(|ext| {
-                    ext.ens_module_suffix.as_ref().map(|ens_suf| {
-                        let contract_ident = format!(
-                            "Obligations.{item}.externalCallContract_{}",
-                            sanitize_lean_ident(&ext.sidecar_module_suffix)
-                        );
-                        let opt_req = if let Some(ref req_suf) = ext.req_module_suffix {
-                            format!("(Option.some Mir.{req_suf}.body)")
-                        } else {
-                            "Option.none".to_string()
-                        };
-                        (
-                            contract_ident,
-                            ext.target_def_id.as_str(),
-                            format!("Mir.{}.body.argCount", ext.sidecar_module_suffix),
-                            opt_req,
-                            ens_suf.as_str(),
-                        )
-                    })
+            bundle.called_callees.first().and_then(|callee| {
+                callee.ens_module_suffix.as_ref().map(|ens_suf| {
+                    let opt_req = if let Some(ref req_suf) = callee.req_module_suffix {
+                        format!("(Option.some Mir.{req_suf}.body)")
+                    } else {
+                        "Option.none".to_string()
+                    };
+                    (
+                        format!(
+                            "Obligations.{}.defaultCallContract",
+                            callee.item_module_suffix
+                        ),
+                        callee.def_id.as_str(),
+                        format!("Mir.{}.body.argCount", callee.item_module_suffix),
+                        opt_req,
+                        ens_suf.as_str(),
+                    )
                 })
-                .or_else(|| {
-                    bundle.called_callees.first().and_then(|callee| {
-                        callee.ens_module_suffix.as_ref().map(|ens_suf| {
-                            let opt_req = if let Some(ref req_suf) = callee.req_module_suffix {
-                                format!("(Option.some Mir.{req_suf}.body)")
-                            } else {
-                                "Option.none".to_string()
-                            };
-                            (
-                                format!(
-                                    "Obligations.{}.defaultCallContract",
-                                    callee.item_module_suffix
-                                ),
-                                callee.def_id.as_str(),
-                                format!("Mir.{}.body.argCount", callee.item_module_suffix),
-                                opt_req,
-                                ens_suf.as_str(),
-                            )
-                        })
-                    })
-                })
+            })
     {
         let opt_subject_req = if bundle.inline_requires.len() == 1 {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
@@ -1778,6 +1842,8 @@ mod tests {
             called_callees: Vec::new(),
             transitive_callees: Vec::new(),
             external_spec_callees: Vec::new(),
+            spec_callees: Vec::new(),
+            spec_companions_with_calls: BTreeSet::new(),
         };
 
         let empty_obligations = render_obligations_module(&empty_bundle);
@@ -1828,6 +1894,8 @@ mod tests {
             called_callees: Vec::new(),
             transitive_callees: Vec::new(),
             external_spec_callees: Vec::new(),
+            spec_callees: Vec::new(),
+            spec_companions_with_calls: BTreeSet::new(),
         };
 
         let multi_obligations = render_obligations_module(&multi_bundle);
@@ -2306,5 +2374,158 @@ mod tests {
         assert!(obligations.contains("callees := defaultCallees"));
         assert!(obligations.contains("implCallees := defaultCallees"));
         assert!(obligations.contains("specCallees := defaultCallees"));
+    }
+
+    fn record(def_id: &str, kind: CapturedItemKind, assoc: Option<&str>) -> UnitTargetRecord {
+        let suffix: Vec<String> = def_id
+            .split("::")
+            .map(|seg| if seg == "my_crate" { "MyCrate".to_string() } else { seg.to_string() })
+            .collect();
+        UnitTargetRecord {
+            target: CapturedTarget {
+                def_id: def_id.to_string(),
+                mir_module_path: format!("Mir/{}.lean", suffix.join("/")),
+                mir_module_sha256: "0".repeat(64),
+            },
+            lean_module_name: format!("Mir.{}", suffix.join(".")),
+            item_kind: kind,
+            associated_subject_def_id: assoc.map(str::to_string),
+            trait_impls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn external_spec_companions_match_by_exact_sidecar_path() {
+        // `my_crate::helper` carries its own inline `#[spec]` companion and is
+        // also the target of the `my_crate::spec_helper` sidecar. Both
+        // companions are associated with `my_crate::helper`, and the target's
+        // own companion sorts first, so association alone would mis-attribute
+        // it to the sidecar contract.
+        let records = vec![
+            record("my_crate::helper", CapturedItemKind::Subject, None),
+            record(
+                "my_crate::__anodized_fn_requires_helper",
+                CapturedItemKind::InlineSpecRequires,
+                Some("my_crate::helper"),
+            ),
+            record(
+                "my_crate::spec_helper",
+                CapturedItemKind::ExternalSpec,
+                Some("my_crate::helper"),
+            ),
+            record(
+                "my_crate::__anodized_fn_requires_spec_helper",
+                CapturedItemKind::InlineSpecRequires,
+                Some("my_crate::helper"),
+            ),
+            record(
+                "my_crate::__anodized_fn_ensures_spec_helper",
+                CapturedItemKind::InlineSpecEnsures,
+                Some("my_crate::helper"),
+            ),
+            // A clause-less sidecar whose name is a prefix of `spec_helper` must
+            // not adopt `spec_helper`'s companions.
+            record("my_crate::spec", CapturedItemKind::ExternalSpec, Some("dep::other")),
+        ];
+        let contracts = collect_external_spec_contracts(&records);
+        let helper = contracts.get("my_crate::helper").expect("helper contract");
+        assert_eq!(
+            helper.req_module_suffix.as_deref(),
+            Some("MyCrate.__anodized_fn_requires_spec_helper")
+        );
+        assert_eq!(
+            helper.ens_module_suffix.as_deref(),
+            Some("MyCrate.__anodized_fn_ensures_spec_helper")
+        );
+        let other = contracts.get("dep::other").expect("clause-less contract");
+        assert_eq!(other.req_module_suffix, None);
+        assert_eq!(other.ens_module_suffix, None);
+    }
+
+    #[test]
+    fn default_env_assumed_conjoins_every_abstracted_callee_contract() {
+        let records = vec![record("my_crate::caller", CapturedItemKind::Subject, None)];
+        let mut bundles = group_subject_obligations(&records);
+        let bundle = &mut bundles[0];
+
+        let ext = |target: &str, sidecar: &str| ExternalSpecContractRef {
+            target_def_id: target.to_string(),
+            sidecar_module_suffix: sidecar.to_string(),
+            req_module_suffix: None,
+            ens_module_suffix: None,
+        };
+
+        bundle.external_spec_callees = vec![ext("dep::a", "MyCrate.spec_a")];
+        let single = render_obligations_module(bundle);
+        assert!(
+            single.contains("envAssumed := externalCallContract_MyCrate_spec_a.holdsOn\n"),
+            "a single contract keeps the bare holdsOn form:\n{single}"
+        );
+
+        bundle.external_spec_callees.push(ext("dep::b", "MyCrate.spec_b"));
+        bundle.called_callees.push(CalleeContractRef {
+            def_id: "my_crate::trusted".to_string(),
+            item_module_suffix: "MyCrate.trusted".to_string(),
+            req_module_suffix: None,
+            ens_module_suffix: None,
+        });
+        let many = render_obligations_module(bundle);
+        assert!(
+            many.contains(
+                "envAssumed := fun h => And (externalCallContract_MyCrate_spec_a.holdsOn h) \
+                 (And (externalCallContract_MyCrate_spec_b.holdsOn h) \
+                 (Obligations.MyCrate.trusted.defaultCallContract.holdsOn h))\n"
+            ),
+            "every abstracted callee contract must be assumed:\n{many}"
+        );
+
+        // The automatic modular discharge assumes a single memory-preserving
+        // sibling contract and is not attempted for external-spec callees.
+        let verify = render_verify_module_with_options(bundle, AuthoredItemModules::default());
+        assert!(
+            !verify.contains("dischargeRustModularContractAuto"),
+            "external-spec callees must not use the memory-preserving modular discharge:\n{verify}"
+        );
+    }
+
+    #[test]
+    fn call_containing_companions_are_evaluated_with_default_spec_callees() {
+        let records = sample_records();
+        let mut bundles = group_subject_obligations(&records);
+        let bundle = &mut bundles[0];
+        bundle.spec_callees = vec![TransitiveCalleeRef {
+            def_id: "core::num::<impl u32>::wrapping_add".to_string(),
+            item_module_suffix: "Core.num_impl_u32_wrapping_add".to_string(),
+        }];
+        bundle
+            .spec_companions_with_calls
+            .insert("MyCrate.math.__anodized_fn_ensures_inc".to_string());
+
+        let obligations = render_obligations_module(bundle);
+        assert!(obligations.contains("import Mir.Core.num_impl_u32_wrapping_add\n"));
+        assert!(obligations.contains(
+            "def defaultSpecCallees : List CapturedMir :=\n  [Mir.Core.num_impl_u32_wrapping_add.body]"
+        ));
+        let spec_callees_pos = obligations.find("def defaultSpecCallees").unwrap();
+        let default_pre_pos = obligations.find("def defaultPre").unwrap();
+        assert!(spec_callees_pos < default_pre_pos);
+        // The call-free `requires` companion keeps the plain form.
+        assert!(obligations.contains(
+            "MirBoolPredicateHolds Mir.MyCrate.math.__anodized_fn_requires_inc.body args"
+        ));
+        assert!(obligations.contains(
+            "def defaultPost (args : List Value) (ret : Value) : Prop :=\n  \
+             MirBoolPredicateHoldsWithCallees Mir.MyCrate.math.__anodized_fn_ensures_inc.body \
+             defaultSpecCallees (List.append args (List.cons ret List.nil))"
+        ));
+
+        // Without linked spec callees, every companion keeps the plain form.
+        bundle.spec_callees.clear();
+        let plain = render_obligations_module(bundle);
+        assert!(!plain.contains("defaultSpecCallees"));
+        assert!(plain.contains(
+            "MirBoolPredicateHolds Mir.MyCrate.math.__anodized_fn_ensures_inc.body \
+             (List.append args (List.cons ret List.nil))"
+        ));
     }
 }
