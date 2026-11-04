@@ -2582,6 +2582,95 @@ theorem evalBinOp_ofBitVec_mul {sz : Nat} (hsz : 0 < sz)
   unfold evalBinOp ScalarValue.ofBitVec
   simp [beq_zero_eq_false_of_pos hsz, BitVec.toNat_mul]
 
+/-- `evalBinOp .addUnchecked` (unsigned) commutes with `ScalarValue.ofBitVec` when `x.toNat + y.toNat < 2 ^ (8 * sz)`. -/
+@[simp]
+theorem evalBinOp_ofBitVec_addUnchecked_unsigned {sz : Nat} (hsz : 0 < sz)
+    (x y : BitVec (8 * sz)) (h : x.toNat + y.toNat < 2 ^ (8 * sz)) :
+    evalBinOp .addUnchecked (ScalarValue.ofBitVec sz x) (ScalarValue.ofBitVec sz y) false =
+      .some (ScalarValue.ofBitVec sz (x + y)) := by
+  rw [evalBinOp_addUnchecked_apply_unsigned hsz]
+  unfold ScalarValue.ofBitVec
+  have hble : Nat.ble (2 ^ (8 * sz)) (x.toNat + y.toNat) = false := by
+    cases hble_eq : Nat.ble (2 ^ (8 * sz)) (x.toNat + y.toNat) with
+    | false => rfl
+    | true => exact absurd (Nat.le_of_ble_eq_true hble_eq) (by omega)
+  simp only [hble, BitVec.toNat_add, Nat.mod_eq_of_lt h]
+
+/-- `evalBinOp .addUnchecked` (signed) commutes with `ScalarValue.ofBitVec` when `signedOverflowAdd x.toNat y.toNat sz = false`. -/
+@[simp]
+theorem evalBinOp_ofBitVec_addUnchecked_signed {sz : Nat} (hsz : 0 < sz)
+    (x y : BitVec (8 * sz)) (h : signedOverflowAdd x.toNat y.toNat sz = false) :
+    evalBinOp .addUnchecked (ScalarValue.ofBitVec sz x) (ScalarValue.ofBitVec sz y) true =
+      .some (ScalarValue.ofBitVec sz (x + y)) := by
+  rw [evalBinOp_addUnchecked_apply_signed hsz]
+  unfold ScalarValue.ofBitVec
+  simp only [h, BitVec.toNat_add]
+
+/-- `evalBinOp .subUnchecked` (unsigned) commutes with `ScalarValue.ofBitVec` when `y.toNat ≤ x.toNat`. -/
+@[simp]
+theorem evalBinOp_ofBitVec_subUnchecked_unsigned {sz : Nat} (hsz : 0 < sz)
+    (x y : BitVec (8 * sz)) (h : y.toNat ≤ x.toNat) :
+    evalBinOp .subUnchecked (ScalarValue.ofBitVec sz x) (ScalarValue.ofBitVec sz y) false =
+      .some (ScalarValue.ofBitVec sz (x - y)) := by
+  rw [evalBinOp_subUnchecked_apply_unsigned hsz]
+  unfold ScalarValue.ofBitVec
+  have hsub_lt : x.toNat - y.toNat < 2 ^ (8 * sz) := by
+    have hx := x.isLt
+    omega
+  have hble_sub : Nat.ble (2 ^ (8 * sz)) (x.toNat - y.toNat) = false := by
+    cases hble_eq : Nat.ble (2 ^ (8 * sz)) (x.toNat - y.toNat) with
+    | false => rfl
+    | true => exact absurd (Nat.le_of_ble_eq_true hble_eq) (by omega)
+  simp only [h, ↓reduceDIte, hble_sub, BitVec.toNat_sub]
+  congr 1; congr 1
+  have h1 : 2 ^ (8 * sz) - y.toNat + x.toNat = 2 ^ (8 * sz) + (x.toNat - y.toNat) := by omega
+  rw [h1, Nat.add_mod_left, Nat.mod_eq_of_lt hsub_lt]
+
+/-- `evalBinOp .subUnchecked` (signed) commutes with `ScalarValue.ofBitVec` when `signedOverflowSub x.toNat y.toNat sz = false`. -/
+@[simp]
+theorem evalBinOp_ofBitVec_subUnchecked_signed {sz : Nat} (hsz : 0 < sz)
+    (x y : BitVec (8 * sz)) (h : signedOverflowSub x.toNat y.toNat sz = false) :
+    evalBinOp .subUnchecked (ScalarValue.ofBitVec sz x) (ScalarValue.ofBitVec sz y) true =
+      .some (ScalarValue.ofBitVec sz (x - y)) := by
+  rw [evalBinOp_subUnchecked_apply_signed hsz]
+  unfold ScalarValue.ofBitVec
+  simp only [h, BitVec.toNat_sub, Nat.mod_eq_of_lt x.isLt, Nat.mod_eq_of_lt y.isLt]
+  congr 1; congr 1
+  cases hble : Nat.ble y.toNat x.toNat with
+  | true =>
+    have hle : y.toNat ≤ x.toNat := Nat.le_of_ble_eq_true hble
+    have h1 : 2 ^ (8 * sz) + x.toNat - y.toNat = 2 ^ (8 * sz) + (x.toNat - y.toNat) := by omega
+    rw [h1, Nat.add_mod_left]
+    have h2 : 2 ^ (8 * sz) - y.toNat + x.toNat = 2 ^ (8 * sz) + (x.toNat - y.toNat) := by omega
+    rw [h2, Nat.add_mod_left]
+  | false =>
+    have h1 : 2 ^ (8 * sz) + x.toNat - y.toNat = 2 ^ (8 * sz) - y.toNat + x.toNat := by omega
+    rw [h1]
+
+/-- `evalBinOp .mulUnchecked` (unsigned) commutes with `ScalarValue.ofBitVec` when `x.toNat * y.toNat < 2 ^ (8 * sz)`. -/
+@[simp]
+theorem evalBinOp_ofBitVec_mulUnchecked_unsigned {sz : Nat} (hsz : 0 < sz)
+    (x y : BitVec (8 * sz)) (h : x.toNat * y.toNat < 2 ^ (8 * sz)) :
+    evalBinOp .mulUnchecked (ScalarValue.ofBitVec sz x) (ScalarValue.ofBitVec sz y) false =
+      .some (ScalarValue.ofBitVec sz (x * y)) := by
+  rw [evalBinOp_mulUnchecked_apply_unsigned hsz]
+  unfold ScalarValue.ofBitVec
+  have hble : Nat.ble (2 ^ (8 * sz)) (x.toNat * y.toNat) = false := by
+    cases hble_eq : Nat.ble (2 ^ (8 * sz)) (x.toNat * y.toNat) with
+    | false => rfl
+    | true => exact absurd (Nat.le_of_ble_eq_true hble_eq) (by omega)
+  simp only [hble, BitVec.toNat_mul, Nat.mod_eq_of_lt h]
+
+/-- `evalBinOp .mulUnchecked` (signed) commutes with `ScalarValue.ofBitVec` when `signedOverflowMul x.toNat y.toNat sz = false`. -/
+@[simp]
+theorem evalBinOp_ofBitVec_mulUnchecked_signed {sz : Nat} (hsz : 0 < sz)
+    (x y : BitVec (8 * sz)) (h : signedOverflowMul x.toNat y.toNat sz = false) :
+    evalBinOp .mulUnchecked (ScalarValue.ofBitVec sz x) (ScalarValue.ofBitVec sz y) true =
+      .some (ScalarValue.ofBitVec sz (x * y)) := by
+  rw [evalBinOp_mulUnchecked_apply_signed hsz]
+  unfold ScalarValue.ofBitVec
+  simp only [h, BitVec.toNat_mul]
+
 /-- `evalBinOp .div` (unsigned) commutes with `ScalarValue.ofBitVec` and `BitVec.udiv` (`/`). -/
 @[simp]
 theorem evalBinOp_ofBitVec_div_unsigned {sz : Nat} (hsz : 0 < sz)
