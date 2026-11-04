@@ -515,8 +515,14 @@ pub fn render_obligations_module_with_options(
     out.push_str(&format!(
         "instance (priority := low) defaultStatefulSpec :\n    \
            StatefulItemSpec \"{def_id}\" where\n  \
-           pre := fun args _ => defaultPre args\n  \
-           post := fun args _ ret _ => defaultPost args ret\n\n"
+           pre := fun args mem =>\n    \
+             And (defaultPre args)\n    \
+                 (∀ (typeArgs : Trusted.MirAst.TypeSubst), typeArgs.length = Mir.{item}.body.typeParamCount →\n    \
+                    Trusted.VerificationResult.argsMatchSignature (Mir.{item}.body.instantiate typeArgs) args mem)\n  \
+           post := fun args _ ret mem =>\n    \
+             And (defaultPost args ret)\n    \
+                 (∀ (typeArgs : Trusted.MirAst.TypeSubst), typeArgs.length = Mir.{item}.body.typeParamCount →\n    \
+                    Trusted.VerificationResult.retMatchesSignature (Mir.{item}.body.instantiate typeArgs) ret mem)\n\n"
     ));
 
     out.push_str(&format!(
@@ -526,8 +532,13 @@ pub fn render_obligations_module_with_options(
         "instance (priority := low) defaultTotalSpec :\n    \
            TotalItemSpec \"{def_id}\" where\n  \
            pre := fun args mem =>\n    \
-             And (defaultPre args) (mem = (initMachineState Mir.{item}.body args).memory)\n  \
-           post := fun args _ ret _ => defaultPost args ret\n\n"
+             And (And (defaultPre args) (mem = (initMachineState Mir.{item}.body args).memory))\n    \
+                 (∀ (typeArgs : Trusted.MirAst.TypeSubst), typeArgs.length = Mir.{item}.body.typeParamCount →\n    \
+                    Trusted.VerificationResult.argsMatchSignature (Mir.{item}.body.instantiate typeArgs) args mem)\n  \
+           post := fun args _ ret mem =>\n    \
+             And (defaultPost args ret)\n    \
+                 (∀ (typeArgs : Trusted.MirAst.TypeSubst), typeArgs.length = Mir.{item}.body.typeParamCount →\n    \
+                    Trusted.VerificationResult.retMatchesSignature (Mir.{item}.body.instantiate typeArgs) ret mem)\n\n"
     ));
 
     let default_env_assumed = if let Some(callee) = bundle.called_callees.first() {
@@ -547,8 +558,13 @@ pub fn render_obligations_module_with_options(
            ModularItemSpec \"{def_id}\" where\n  \
            envAssumed := {default_env_assumed}\n  \
            pre := fun args mem =>\n    \
-             And (defaultPre args) (mem = (initMachineState Mir.{item}.body args).memory)\n  \
-           post := fun args _ ret _ => defaultPost args ret\n\n"
+             And (And (defaultPre args) (mem = (initMachineState Mir.{item}.body args).memory))\n    \
+                 (∀ (typeArgs : Trusted.MirAst.TypeSubst), typeArgs.length = Mir.{item}.body.typeParamCount →\n    \
+                    Trusted.VerificationResult.argsMatchSignature (Mir.{item}.body.instantiate typeArgs) args mem)\n  \
+           post := fun args _ ret mem =>\n    \
+             And (defaultPost args ret)\n    \
+                 (∀ (typeArgs : Trusted.MirAst.TypeSubst), typeArgs.length = Mir.{item}.body.typeParamCount →\n    \
+                    Trusted.VerificationResult.retMatchesSignature (Mir.{item}.body.instantiate typeArgs) ret mem)\n\n"
     ));
 
     out.push_str(&format!(
@@ -557,9 +573,15 @@ pub fn render_obligations_module_with_options(
     out.push_str(&format!(
         "instance (priority := low) defaultUbExceptionSpec :\n    \
            UbExceptionItemSpec \"{def_id}\" where\n  \
-           pre := fun args _ => defaultPre args\n  \
+           pre := fun args mem =>\n    \
+             And (defaultPre args)\n    \
+                 (∀ (typeArgs : Trusted.MirAst.TypeSubst), typeArgs.length = Mir.{item}.body.typeParamCount →\n    \
+                    Trusted.VerificationResult.argsMatchSignature (Mir.{item}.body.instantiate typeArgs) args mem)\n  \
            strictSafetyPre := fun _ _ => False\n  \
-           post := fun args _ ret _ => defaultPost args ret\n\n"
+           post := fun args _ ret mem =>\n    \
+             And (defaultPost args ret)\n    \
+                 (∀ (typeArgs : Trusted.MirAst.TypeSubst), typeArgs.length = Mir.{item}.body.typeParamCount →\n    \
+                    Trusted.VerificationResult.retMatchesSignature (Mir.{item}.body.instantiate typeArgs) ret mem)\n\n"
     ));
 
     out.push_str(&format!(

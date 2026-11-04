@@ -361,6 +361,7 @@ end Proof.FrameTutor.pin_magic
         manifest_path: None,
         units_dir: units_dir.clone(),
         rustc_wrapper: Some(wrapper_bin.clone()),
+        out_dir: None,
         anneal_repo_root: Some(checkout_root.clone()),
         from_existing_units: true,
         init_specs: false,

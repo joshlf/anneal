@@ -70,6 +70,112 @@ def initMachineStateWithMemory
     memory := mem
   }
 
+/--
+Verifies that a `ScalarInt` is a valid Unicode scalar value.
+-/
+@[reducible]
+def isValidChar (sv : ScalarInt) : Prop :=
+  sv.sizeBytes = 4 ∧ (sv.bits ≤ 0xD7FF ∨ (0xE000 ≤ sv.bits ∧ sv.bits ≤ 0x10FFFF))
+
+/--
+Structurally validates a single value against its `Ty` and `TypeLayout`, recursively traversing aggregates.
+-/
+@[simp]
+def valueMatchesTyAndLayout (fuel : Nat) (body : CapturedMir) (ty : Ty) (layoutIdx : LayoutIdx) (val : Value) (mem : Memory) : Prop :=
+  match fuel with
+  | 0 => True
+  | fuel' + 1 =>
+    match body.layouts.lookup layoutIdx with
+    | .none => False
+    | .some layout =>
+      match val with
+      | .unit => layout.size.bytes = 0
+      | .scalar sv =>
+        match ty.kind with
+        | .bool => sv.sizeBytes = layout.size.bytes ∧ (sv.bits = 0 ∨ sv.bits = 1)
+        | .char => isValidChar sv
+        | .int _ => sv.sizeBytes = layout.size.bytes ∧ sv.bits < 2^(sv.sizeBytes * 8)
+        | .uint _ => sv.sizeBytes = layout.size.bytes ∧ sv.bits < 2^(sv.sizeBytes * 8)
+        | .float _ => sv.sizeBytes = layout.size.bytes ∧ sv.bits < 2^(sv.sizeBytes * 8)
+        | .rawPtr _ _ => sv.sizeBytes = layout.size.bytes
+        | .fnPtr _ _ _ _ => sv.sizeBytes = layout.size.bytes
+        | _ => True
+      | .ptr p sz =>
+        match ty.kind with
+        | .ref _ _ =>
+          match sz with
+          | 0 => True
+          | _ =>
+            match lookupGlobalAlloc mem.globals p.allocId with
+            | .none => False
+            | .some alloc => p.offsetBytes + sz ≤ alloc.bytes.length
+        | .rawPtr _ _ => True
+        | .fnPtr _ _ _ _ => p.offsetBytes = 0
+        | _ => True
+      | .aggregate variantIdx fields =>
+        match ty.kind with
+        | .ref _ (.slice _) =>
+          match fields with
+          | .cons (.ptr p sz) (.cons (.scalar len_sv) .nil) =>
+            match lookupGlobalAlloc mem.globals p.allocId with
+            | .some alloc =>
+              len_sv.bits ≤ 9223372036854775807 ∧ 
+              p.offsetBytes + len_sv.bits * sz ≤ alloc.bytes.length
+            | .none => False
+          | _ => False
+        | .ref _ .str =>
+          match fields with
+          | .cons (.ptr p sz) (.cons (.scalar len_sv) .nil) =>
+            match lookupGlobalAlloc mem.globals p.allocId with
+            | .some alloc =>
+              len_sv.bits ≤ 9223372036854775807 ∧
+              p.offsetBytes + len_sv.bits ≤ alloc.bytes.length
+            | .none => False
+          | _ => False
+        | .rawPtr _ (.slice _) => True
+        | .rawPtr _ .str => True
+        | _ => True
+
+/--
+Recursively validates that all arguments match their expected signature types.
+-/
+@[reducible]
+def argsMatchSignatureAux (fuel : Nat) (body : CapturedMir) (args : List Value) (decls : List LocalDecl) (mem : Memory) : Prop :=
+  match fuel with
+  | 0 => True
+  | fuel' + 1 =>
+    match args, decls with
+    | .nil, _ => True
+    | .cons a restA, .cons d restD =>
+      valueMatchesTyAndLayout fuel' body d.ty d.ty.layoutIdx a mem ∧ argsMatchSignatureAux fuel' body restA restD mem
+    | _, _ => False
+
+/--
+Verifies that all `args` match the signature types and layouts.
+-/
+@[reducible]
+def argsMatchSignature (body : CapturedMir) (args : List Value) (mem : Memory) : Prop :=
+  args.length = body.argCount ∧
+  match body.localDecls with
+  | .nil => False
+  | .cons _ argDecls => argsMatchSignatureAux 100 body args argDecls mem
+
+/--
+Verifies that `ret` matches the return signature type and layout.
+-/
+@[reducible]
+def retMatchesSignature (body : CapturedMir) (ret : Value) (mem : Memory) : Prop :=
+  match body.localDecls with
+  | .nil => False
+  | .cons retDecl _ =>
+    valueMatchesTyAndLayout 100 body retDecl.ty retDecl.ty.layoutIdx ret mem
+
+@[simp] theorem argsMatchSignatureAux_nil (fuel : Nat) (body : CapturedMir) (decls : List LocalDecl) (mem : Memory) : argsMatchSignatureAux (fuel + 1) body .nil decls mem = True := by
+  cases decls <;> simp [argsMatchSignatureAux]
+
+@[simp] theorem argsMatchSignatureAux_cons (fuel : Nat) (body : CapturedMir) (a : Value) (restA : List Value) (d : LocalDecl) (restD : List LocalDecl) (mem : Memory) : argsMatchSignatureAux (fuel + 1) body (.cons a restA) (.cons d restD) mem = (valueMatchesTyAndLayout fuel body d.ty d.ty.layoutIdx a mem ∧ argsMatchSignatureAux fuel body restA restD mem) := by
+  simp [argsMatchSignatureAux]
+
 /-- Fundamental coinductive interaction tree of `body` from `(args, mem)`. -/
 def mirStatefulTree
     (body : CapturedMir) (args : List Value) (mem : Memory) :

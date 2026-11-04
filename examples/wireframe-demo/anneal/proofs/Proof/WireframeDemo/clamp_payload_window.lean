@@ -274,7 +274,7 @@ private def evalRvalueSymTreeFast
           tag := tag
           targetLocal := p.local_
           targetProjection := .nil
-          perm := .frozen
+          perm := sharedBorrowPerm ctx.localDecls ctx.layouts { local_ := p.local_, projection := [] }
         }
         let mem' := {
           mem with
@@ -971,7 +971,7 @@ private theorem ensures_holds (b1 b2 ret : Nat)
     evalRvalueSymTreeFast,
     evalOperandFast, evalOperandsFast, evalConstValue,
     evalScalarBinOpSymTree, bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree,
-    operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
+    operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
     scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
     mul_1_8, mul_2_8, mul_4_8, mul_8_8,
     evalTerminatorSymTreeFast,
@@ -1006,7 +1006,7 @@ private theorem ensures_holds (b1 b2 ret : Nat)
       evalRvalueSymTreeFast,
       evalOperandFast, evalOperandsFast, evalConstValue,
       evalScalarBinOpSymTree, bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree,
-      operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
+      operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
       scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
       mul_1_8, mul_2_8, mul_4_8, mul_8_8,
       evalTerminatorSymTreeFast,
@@ -1102,7 +1102,7 @@ private theorem ensures_holds (b1 b2 ret : Nat)
       evalRvalueSymTreeFast,
       evalOperandFast, evalOperandsFast, evalConstValue,
       evalScalarBinOpSymTree, bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree,
-      operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
+      operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
       scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
       mul_1_8, mul_2_8, mul_4_8, mul_8_8,
       evalTerminatorSymTreeFast,
@@ -1272,7 +1272,7 @@ private theorem wpReq_inversion (v1 v2 : Value) :
     evalRvalueSymTreeFast,
     evalOperandFast, evalOperandsFast, evalConstValue,
     evalScalarBinOpSymTree, bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree,
-    operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
+    operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
     scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
     mul_1_8, mul_2_8, mul_4_8, mul_8_8,
     evalTerminatorSymTreeFast,
@@ -1352,7 +1352,7 @@ private theorem wpReq_inversion (v1 v2 : Value) :
             evalRvalueSymTreeFast,
             evalOperandFast, evalOperandsFast, evalConstValue,
             evalScalarBinOpSymTree, bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree,
-            operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
+            operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
             scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
             mul_1_8, mul_2_8, mul_4_8, mul_8_8,
             evalTerminatorSymTreeFast,
@@ -1502,7 +1502,7 @@ theorem verified : VerificationResult Obligations.WireframeDemo.clamp_payload_wi
       evalRvalueSymTreeFast,
       evalOperandFast, evalOperandsFast, evalConstValue,
       evalScalarBinOpSymTree, bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree,
-      operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
+      operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
       scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
       mul_1_8, mul_2_8, mul_4_8, mul_8_8,
       evalTerminatorSymTreeFast,
@@ -1557,7 +1557,7 @@ theorem nonVacuousRequires :
     evalRvalueSymTreeFast,
     evalOperandFast, evalOperandsFast, evalConstValue,
     evalScalarBinOpSymTree, bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree,
-    operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
+    operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
     scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
     mul_1_8, mul_2_8, mul_4_8, mul_8_8,
     evalTerminatorSymTreeFast,
