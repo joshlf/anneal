@@ -2054,7 +2054,7 @@ example (sVal : Value) :
     Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
       { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
       (.returned (.scalar ⟨1, 1⟩) emptyMemory) :=
-  ⟨⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, ⟨1, by decide, rfl⟩, trivial⟩
+  ⟨⟨rfl, rfl, rfl, rfl, ⟨[], rfl⟩⟩, ⟨1, by decide, rfl⟩, trivial⟩
 
 example (sVal : Value) :
     ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
@@ -2071,13 +2071,13 @@ example (sVal : Value) :
     Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
       { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
       (.returned (.scalar ⟨0, 1⟩) { emptyMemory with nextAllocId := 7, nextTag := 9 }) :=
-  ⟨⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, ⟨0, by decide, rfl⟩, trivial⟩
+  ⟨⟨rfl, rfl, rfl, rfl, ⟨[], rfl⟩⟩, ⟨0, by decide, rfl⟩, trivial⟩
 
 example (sVal : Value) :
     Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
       { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
       (.panicked { emptyMemory with nextTag := 3 }) :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl, ⟨[], rfl⟩⟩
 
 example (sVal : Value) :
     Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
@@ -2086,13 +2086,31 @@ example (sVal : Value) :
   trivial
 
 -- 5b. `callFramePreserved` rejects external call responses that clobber the
---     caller's `activeProtectors`, `borrows`, or `fnPtrs` tables.
+--     caller's `activeProtectors` or drop existing reified function pointers,
+--     but admits Tree Borrows tag-table changes (a write through an argument
+--     reference updates tag permissions) and freshly reified function pointers.
 example (sVal : Value) :
     ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
       { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
       (.returned (.scalar ⟨0, 1⟩) { emptyMemory with activeProtectors := [1] }) := by
-  rintro ⟨⟨_, _, _, h_prot, _, _⟩, _, _⟩
+  rintro ⟨⟨_, _, _, h_prot, _⟩, _, _⟩
   cases h_prot
+
+example (sVal : Value) (entry : BorrowEntry) (fnEntry : FnPtrEntry) :
+    Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
+      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      (.returned (.scalar ⟨1, 1⟩)
+        { emptyMemory with borrows := [entry], fnPtrs := [fnEntry], nextTag := 2 }) :=
+  ⟨⟨rfl, rfl, rfl, rfl, ⟨[fnEntry], rfl⟩⟩, ⟨1, by decide, rfl⟩, trivial⟩
+
+example (sVal : Value) (fnEntry : FnPtrEntry) :
+    ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
+      { defPath := "core::slice::<impl [T]>::is_empty"
+        args := [sVal]
+        memory := { emptyMemory with fnPtrs := [fnEntry] } }
+      (.returned (.scalar ⟨1, 1⟩) emptyMemory) := by
+  rintro ⟨⟨_, _, _, _, ⟨fresh, h_fn⟩⟩, _, _⟩
+  cases fresh <;> cases h_fn
 
 -- 5c. `valueValidForTy` recursively validates nested element types of `.tuple`
 --     and `.array` values, rejecting ill-typed elements and non-ZST `.unit`
@@ -2243,7 +2261,7 @@ theorem callerFfiAndLen_verified :
   intro ans h_post
   cases ans with
   | returned retVal memAfter =>
-    rcases h_post with ⟨⟨_, h_stack, h_active, _, _, _⟩, h_ret, _⟩
+    rcases h_post with ⟨⟨_, h_stack, h_active, _, _⟩, h_ret, _⟩
     have h_act : memAfter.activeCallee = .some Mir.CrateA.caller_ffi_and_len.body := h_active
     have h_stk : memAfter.callStack = .nil := h_stack
     change
@@ -2353,7 +2371,7 @@ theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_l
   intro ans h_post
   cases ans with
   | returned retVal memAfter =>
-    rcases h_post with ⟨⟨_, h_stack, h_active, _, _, _⟩, h_ret, _⟩
+    rcases h_post with ⟨⟨_, h_stack, h_active, _, _⟩, h_ret, _⟩
     have h_act : memAfter.activeCallee = .some Mir.CrateA.caller_ffi_and_len.body := h_active
     have h_stk : memAfter.callStack = .nil := h_stack
     change

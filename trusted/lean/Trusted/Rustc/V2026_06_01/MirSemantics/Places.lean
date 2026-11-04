@@ -1882,7 +1882,12 @@ def isThinRawPtrTy (ty : Ty) : Bool :=
 
 /--
 Test whether a monomorphized caller `RigidTy` matches a (possibly polymorphic)
-callee declaration `RigidTy` up to generic type parameters (`RigidTy.param`).
+callee declaration `RigidTy` once every generic parameter `.param idx _` in the
+declaration is resolved to `typeArgs[idx]`, the monomorphized type arguments of
+the call target (`ResolvedCallTarget.typeArgs`, recorded for reified function
+pointers in `FnPtrEntry.typeArgs`). A parameter without a type argument fails
+closed, so a polymorphic body is only accepted at the instantiation it was
+reified for.
 
 Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -1892,33 +1897,36 @@ Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
 > /// locals for the function arguments, followed by any user-declared
 > /// variables and temporaries."
 -/
-def rigidTyMatchesCalleeDecl : Nat → RigidTy → RigidTy → Bool
+def rigidTyMatchesCalleeDecl (typeArgs : List RigidTy) : Nat → RigidTy → RigidTy → Bool
   | .zero, callerTy, declTy => rigidTyEq callerTy declTy
-  | .succ _, _, .param _ _ => true
+  | .succ _, callerTy, .param idx _ =>
+    match get? typeArgs idx with
+    | .some argTy => rigidTyEq callerTy argTy
+    | .none => false
   | .succ fuel, .ref m1 t1, .ref m2 t2 =>
-    Bool.and (mutabilityEq m1 m2) (rigidTyMatchesCalleeDecl fuel t1 t2)
+    Bool.and (mutabilityEq m1 m2) (rigidTyMatchesCalleeDecl typeArgs fuel t1 t2)
   | .succ fuel, .rawPtr m1 t1, .rawPtr m2 t2 =>
-    Bool.and (mutabilityEq m1 m2) (rigidTyMatchesCalleeDecl fuel t1 t2)
+    Bool.and (mutabilityEq m1 m2) (rigidTyMatchesCalleeDecl typeArgs fuel t1 t2)
   | .succ fuel, .slice t1, .slice t2 =>
-    rigidTyMatchesCalleeDecl fuel t1 t2
+    rigidTyMatchesCalleeDecl typeArgs fuel t1 t2
   | .succ fuel, .array t1 n1, .array t2 n2 =>
-    Bool.and (Nat.beq n1 n2) (rigidTyMatchesCalleeDecl fuel t1 t2)
+    Bool.and (Nat.beq n1 n2) (rigidTyMatchesCalleeDecl typeArgs fuel t1 t2)
   | .succ fuel, .tuple (t1 :: ts1), .tuple (t2 :: ts2) =>
     Bool.and
-      (rigidTyMatchesCalleeDecl fuel t1 t2)
-      (rigidTyMatchesCalleeDecl fuel (.tuple ts1) (.tuple ts2))
+      (rigidTyMatchesCalleeDecl typeArgs fuel t1 t2)
+      (rigidTyMatchesCalleeDecl typeArgs fuel (.tuple ts1) (.tuple ts2))
   | .succ fuel, .adt p1 (a1 :: as1), .adt p2 (a2 :: as2) =>
     Bool.and
       (stringEq p1 p2)
       (Bool.and
-        (rigidTyMatchesCalleeDecl fuel a1 a2)
-        (rigidTyMatchesCalleeDecl fuel (.tuple as1) (.tuple as2)))
+        (rigidTyMatchesCalleeDecl typeArgs fuel a1 a2)
+        (rigidTyMatchesCalleeDecl typeArgs fuel (.tuple as1) (.tuple as2)))
   | .succ _, callerTy, declTy => rigidTyEq callerTy declTy
 
 /--
 Check that `fnInputs` pointwise match the `RigidTy` kinds of the leading
-parameter declarations in `paramDecls` (allowing generic `RigidTy.param` slots
-in polymorphic `CapturedMir` bodies).
+parameter declarations in `paramDecls`, resolving generic `RigidTy.param` slots
+of polymorphic `CapturedMir` bodies through `typeArgs`.
 
 Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -1928,13 +1936,13 @@ Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
 > /// locals for the function arguments, followed by any user-declared
 > /// variables and temporaries."
 -/
-def calleeParamTysMatch : List RigidTy → List LocalDecl → Bool
+def calleeParamTysMatch (typeArgs : List RigidTy) : List RigidTy → List LocalDecl → Bool
   | .nil, _ => true
   | _ :: _, .nil => false
   | inputTy :: restInputs, decl :: restDecls =>
     Bool.and
-      (rigidTyMatchesCalleeDecl 8 inputTy decl.ty.kind)
-      (calleeParamTysMatch restInputs restDecls)
+      (rigidTyMatchesCalleeDecl typeArgs 8 inputTy decl.ty.kind)
+      (calleeParamTysMatch typeArgs restInputs restDecls)
 
 /--
 Validate that a callee's `localDecls` (when non-empty) has at least `argCount`
@@ -1953,6 +1961,7 @@ Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
 > /// variables and temporaries."
 -/
 def calleeLocalDeclsCompatible
+    (typeArgs : List RigidTy)
     (localDecls : List LocalDecl)
     (argCount : Nat)
     (fnInputs : List RigidTy)
@@ -1964,8 +1973,8 @@ def calleeLocalDeclsCompatible
     Bool.and
       (Nat.ble argCount (length paramDecls))
       (Bool.and
-        (rigidTyMatchesCalleeDecl 8 fnOutput retDecl.ty.kind)
-        (calleeParamTysMatch fnInputs paramDecls))
+        (rigidTyMatchesCalleeDecl typeArgs 8 fnOutput retDecl.ty.kind)
+        (calleeParamTysMatch typeArgs fnInputs paramDecls))
 
 /--
 Check whether an explicit `ReifyFnPointer(Safety)` or `ClosureFnPointer(Safety)`
@@ -2018,7 +2027,9 @@ the target function-pointer signature `(fnInputs, fnOutput, fnAbi)` during
 1. Rejects `CallConv.rustIntrinsic` callees (compiler intrinsics cannot be
    coerced to function pointers).
 2. Requires `length fnInputs == c.argCount` and `callConvEq fnAbi c.fnAbi.conv`.
-3. Requires `calleeLocalDeclsCompatible c.localDecls c.argCount fnInputs fnOutput`.
+3. Requires `calleeLocalDeclsCompatible typeArgs c.localDecls c.argCount fnInputs
+   fnOutput`, resolving generic parameters of a polymorphic callee body through
+   the reified function item's `typeArgs`.
 
 Reference (The Rust Reference, "Function pointer types"):
 <https://doc.rust-lang.org/1.98.0/reference/types/function-pointer.html>
@@ -2029,6 +2040,7 @@ Reference (The Rust Reference, "Function pointer types"):
 def checkCalleeSig
     (callees : List CapturedMir)
     (p : DefPath)
+    (typeArgs : List RigidTy)
     (fnInputs : List RigidTy)
     (fnOutput : RigidTy)
     (fnAbi : CallConv) :
@@ -2045,11 +2057,12 @@ def checkCalleeSig
           (Bool.and
             (callConvEq fnAbi c.fnAbi.conv)
             (calleeLocalDeclsCompatible
+              typeArgs
               c.localDecls
               c.argCount
               fnInputs
               fnOutput)))
-    | false => checkCalleeSig rest p fnInputs fnOutput fnAbi
+    | false => checkCalleeSig rest p typeArgs fnInputs fnOutput fnAbi
 
 /--
 Evaluate `CastKind.pointerCoercion "UnsafeFnPointer"`, coercing a safe
@@ -2203,6 +2216,7 @@ def evalReifyFnPointer
                   checkCalleeSig
                     mem.callees
                     defPath
+                    typeArgs
                     fnInputs
                     fnOutput
                     fnAbi

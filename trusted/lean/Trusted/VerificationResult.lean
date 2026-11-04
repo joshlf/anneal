@@ -819,11 +819,14 @@ def argsMatchCalleeParamTys
 
 /--
 Frame condition relating the `Memory` at an external call site (`before`) to the
-`Memory` handed back by the callee (`after`): an external callee may mutate heap,
-global, fresh tag/protector counters, and caller-owned referent state, but it
-returns (or unwinds) to the same suspended call stack, active body, immutable
-callee code table, active caller protectors, caller stack-local borrows, and
-reified function-pointer table.
+`Memory` handed back by the callee (`after`). An external callee returns (or
+unwinds) to the same suspended call stack, active body, active caller
+protectors, and immutable callee code table, and it keeps every existing
+reified function-pointer entry (it may only prepend fresh entries, as
+`internFnPtr` does). It may mutate global and caller-owned referent state,
+the Tree Borrows tag table (a write through an argument reference changes tag
+permissions, and reborrows inside the callee push tags), and the fresh
+allocation, tag, and protector counters, so those are left unconstrained.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -841,38 +844,17 @@ def callFramePreserved (before after : Memory) : Prop :=
     (And (after.callStack = before.callStack)
       (And (after.activeCallee = before.activeCallee)
         (And (after.activeProtectors = before.activeProtectors)
-          (And (after.borrows = before.borrows)
-            (after.fnPtrs = before.fnPtrs)))))
+          (∃ fresh, after.fnPtrs = List.append fresh before.fnPtrs))))
 
 /--
-Check whether any local declaration in `decls` is a signature-check function
-pointer with a non-unwinding ABI (`RigidTy.fnPtr _ _ _ .c` or
-`RigidTy.fnPtr _ _ _ .rustIntrinsic`).
-
-Reference (The Rust Reference, "External blocks - ABI"):
-<https://doc.rust-lang.org/1.98.0/reference/items/external-blocks.html#abi>
-
-> "The strings that end with `-unwind` ... are the same as the corresponding ABI
-> strings without `-unwind`, except that they allow the called function to
-> safely unwind the stack (for example, via a Rust panic or a C++ exception)
-> through the foreign frame into the caller's frame."
--/
-@[reducible]
-def localDeclsHaveNounwindFnPtr : List LocalDecl → Bool
-  | .nil => false
-  | decl :: rest =>
-    match decl.ty.kind with
-    | .fnPtr _ _ _ .c => true
-    | .fnPtr _ _ _ .rustIntrinsic => true
-    | _ => localDeclsHaveNounwindFnPtr rest
-
-/--
-Determine from a captured `#[external_spec]` `sidecarBody` whether the target
-function's ABI permits stack unwinding (`.panicked`): returns `false` when the
-sidecar's own `fnAbi.canUnwind` is `false`, when `sidecarBody.fnAbi.conv` is
-`.c` or `.rustIntrinsic`, or when the sidecar's signature-check local has type
-`RigidTy.fnPtr _ _ _ .c`; returns `true` otherwise (such as `CallConv.rust` and
-`extern "C-unwind"`).
+Whether the target of a captured `#[external_spec]` `sidecarBody` may unwind
+(`MirCallAns.panicked`), as recorded in `sidecarBody.fnAbi.canUnwind`.
+`anneal-rustc-capture` copies the calling convention and unwind capability of
+the resolved target into the sidecar's `fnAbi` (`FnAbi::can_unwind` from
+`tcx.fn_abi_of_instance`, which is `false` for `extern "C"` and other nounwind
+ABIs, for `-C panic=abort`, and for `#[rustc_nounwind]` items, and `true` for
+`extern "Rust"` and `extern "C-unwind"`). The calling convention alone does not
+decide this: `extern "C"` and `extern "C-unwind"` share `CallConv.c`.
 
 Reference (The Rust Reference, "External blocks - ABI"):
 <https://doc.rust-lang.org/1.98.0/reference/items/external-blocks.html#abi>
@@ -884,13 +866,7 @@ Reference (The Rust Reference, "External blocks - ABI"):
 -/
 @[reducible]
 def sidecarTargetCanUnwind (sidecarBody : CapturedMir) : Bool :=
-  match sidecarBody.fnAbi.canUnwind with
-  | false => false
-  | true =>
-    match sidecarBody.fnAbi.conv with
-    | .c => false
-    | .rustIntrinsic => false
-    | _ => Bool.not (localDeclsHaveNounwindFnPtr sidecarBody.localDecls)
+  sidecarBody.fnAbi.canUnwind
 
 /--
 Well-typed modular `MirCallContract` for an `#[external_spec(for = <target>)]`

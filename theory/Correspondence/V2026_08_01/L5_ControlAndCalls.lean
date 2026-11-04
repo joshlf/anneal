@@ -588,7 +588,7 @@ theorem mir_evalRvalue_reifyFnPointer_and_fnPtrToPtr_chain
 Universal characterization of `checkCalleeSig`, `PointerCoercion::ClosureFnPointer`,
 `PointerCoercion::UnsafeFnPointer`, and `safetyCompatible` in `evalRvalue` and
 `fnEntryCompatibleWithCallSite`:
-1. Reifying a function item when `checkCalleeSig mem.callees defPath sigInputs sigOut sigAbi = false`
+1. Reifying a function item when `checkCalleeSig mem.callees defPath typeArgs sigInputs sigOut sigAbi = false`
    faults with `RvalueEvalResult.ub`.
 2. Applying `"ClosureFnPointer(Safe)"` to a non-capturing closure
    (`.closure defPath .nil`) succeeds, while applying `"ClosureFnPointer(Safe)"`
@@ -638,7 +638,7 @@ theorem mir_evalRvalue_reifyFnPointer_callee_sig_and_unsafeFnPointer_corresponds
     let expectedPtr : ProvenancePtr := { allocId := fnPtrAllocBase, offsetBytes := 0 }
     let memWithSafe : Memory := { emptyMemory with fnPtrs := [safeEntry] }
     let memWithIntrinsic : Memory := { emptyMemory with fnPtrs := [intrinsicEntry] }
-    (checkCalleeSig mem.callees defPath sigInputs sigOut sigAbi = false →
+    (checkCalleeSig mem.callees defPath typeArgs sigInputs sigOut sigAbi = false →
       evalRvalue
         locals
         (.cast (.pointerCoercion "ReifyFnPointer") fnConstOp fnPtrTy)

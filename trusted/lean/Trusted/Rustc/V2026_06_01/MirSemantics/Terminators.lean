@@ -366,6 +366,7 @@ def checkCalleeTargetCompatible
              (Bool.and
                (callConvEq sigAbi calleeBody.fnAbi.conv)
                (calleeLocalDeclsCompatible
+                 target.typeArgs
                  calleeBody.localDecls
                  calleeBody.argCount
                  sigInputs
