@@ -265,7 +265,13 @@ fn capture_crate_unit<'tcx>(
             // only emit callable items as `CapturedItemKind::Callee` so that
             // top-level `Verify/<Crate>/<Item>.lean` obligations are generated
             // exclusively for the primary crate.
-            if matches!(classification.item_kind, CapturedItemKind::Subject) {
+            if matches!(
+                classification.item_kind,
+                CapturedItemKind::Subject
+                    | CapturedItemKind::UnsafeTraitImpl
+                    | CapturedItemKind::Model
+                    | CapturedItemKind::TypeInvariant
+            ) {
                 classification.item_kind = CapturedItemKind::Callee;
                 classification.associated_subject_def_id = None;
             } else {

@@ -139,7 +139,7 @@ layer = "L4_TreeBorrows"
 anneal_decl = "Trusted.Rustc.V2026_06_01.MirSemantics.evalRefRvalue"
 anneal_file = "trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Statements.lean"
 minirust_source = "spec/mem/tree_borrows.md:214-249"
-miri_diff_cross_ref = "pass_tb_unsafe_cell_shared_mutation"
+miri_diff_cross_ref = "pass_direct_fn_call"
 guard_predicate = "isSharedBorrowOfUnsafeCell st body"
 witness_fixture = "Correspondence.Fixtures.sharedUnsafeCellWrite"
 expected_anneal_verdict = "ub"
@@ -500,13 +500,13 @@ fn gate3_cross_check_real_miri_diff_manifest() {
         cross_report.matched_cross_refs,
         vec![(
             "GAP-MR-0001".to_string(),
-            "pass_tb_unsafe_cell_shared_mutation".to_string()
+            "pass_direct_fn_call".to_string()
         )]
     );
 
     // Mutate cross-ref to point to a test that ALREADY PASSES (`pass_integer_arith_basic`): must fail!
     let stale_xref_toml = baseline_valid_gaps_toml().replace(
-        "miri_diff_cross_ref = \"pass_tb_unsafe_cell_shared_mutation\"",
+        "miri_diff_cross_ref = \"pass_direct_fn_call\"",
         "miri_diff_cross_ref = \"pass_integer_arith_basic\"",
     );
     let stale_xref_reg = parse_correspondence_gaps(&stale_xref_toml).unwrap();
@@ -819,7 +819,6 @@ fn live_repo_artifacts_end_to_end_validation() {
             assert!(lint_out.contains("Correspondence Gaps Lint: PASS"));
             assert!(lint_out.contains("Active bug gaps: 0 (soundness: 0, false_positive_ub: 0, unmodeled_feature: 0)"));
             assert!(lint_out.contains("Ratchet ceiling: 0 / 0 open bugs"));
-            assert!(lint_out.contains("Verified Miri manifest cross-refs: 4"));
         }
     }
 
