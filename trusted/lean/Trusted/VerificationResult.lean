@@ -534,8 +534,46 @@ def sigPtrLiveForRef
     match sigLookupBorrow mem.borrows p.allocId with
     | .some entry =>
       borrowPermAllowsRef refMut entry.perm = true ∧
-        p.offsetBytes ≤ entry.rangeOffset + entry.rangeLen
+        match
+          entry.targetProjection,
+          Nat.beq p.offsetBytes 0,
+          Nat.beq entry.rangeOffset 0,
+          sigGet? mem.callerLocals entry.targetLocal
+        with
+        | .nil, true, true, .some (.init _) => True
+        | _, _, _, _ =>
+          0 < entry.rangeLen ∧
+            entry.rangeOffset ≤ p.offsetBytes ∧
+            p.offsetBytes ≤ entry.rangeOffset + entry.rangeLen
     | .none => False
+
+/--
+Test whether `adtDefPath` names a standard-library single-variant wrapper struct
+whose source fields are guaranteed to match `adtArgs` positionally (`Range<Idx>`
+repeating `Idx` for `start` and `end`, or `ManuallyDrop<T>` / `UnsafeCell<T>` /
+`Cell<T>` wrapping `T`).
+
+For arbitrary single-variant structs (`VariantsShape.single`), field types need
+not follow `adtArgs` (for example `NonNull<T> { pointer: *const T }`,
+`struct TaggedStruct<T> { tag: u8, val: T }`, or
+`struct FlipPair<A, B> { second: B, first: A }`). When `fieldLayouts` is
+populated by `anneal-rustc-capture`, `adtFieldsMatchWith` uses those captured
+layouts directly; when `fieldLayouts` is empty (such as after layout
+instantiation or beyond the capture recursion depth), only structs satisfying
+`sigStructFieldsAreTypeArgs` fall back to positional `adtArgs`, while all other
+structs fall back to `parentLayout.backendRepr` (`.scalar` / `.scalarPair`) and
+`valueMatchesUntypedField`.
+-/
+@[reducible, simp]
+def sigStructFieldsAreTypeArgs (adtDefPath : String) : Bool :=
+  sigStringEq adtDefPath "core::ops::range::Range" ||
+    sigStringEq adtDefPath "std::ops::Range" ||
+    sigStringEq adtDefPath "core::mem::manually_drop::ManuallyDrop" ||
+    sigStringEq adtDefPath "std::mem::ManuallyDrop" ||
+    sigStringEq adtDefPath "core::cell::UnsafeCell" ||
+    sigStringEq adtDefPath "std::cell::UnsafeCell" ||
+    sigStringEq adtDefPath "core::cell::Cell" ||
+    sigStringEq adtDefPath "std::cell::Cell"
 
 /--
 Test whether `adtDefPath` names `Option<T>` or `Result<T, E>`, the standard
@@ -888,26 +926,26 @@ def adtArrayElemsMatchWith
   | .nil => True
   | e :: rest =>
     let elemOk : Prop :=
-      match adtArgs with
-      | elemKind :: _ =>
-        tyPred
-          elemKind
-          (resolveChildLayout
-            body parentLayout parentLayoutIdx (.some 0) elemKind)
-          parentLayoutIdx
-          e
+      match parentLayout.fieldLayouts with
+      | fIdx :: _ =>
+        valueMatchesLayoutOnly
+          fuel' body (sigGet? body.layouts.entries fIdx) fIdx e mem
       | .nil =>
-        match parentLayout.fieldLayouts with
-        | fIdx :: _ =>
-          valueMatchesLayoutOnly
-            fuel' body (sigGet? body.layouts.entries fIdx) fIdx e mem
+        match adtArgs with
+        | elemKind :: _ =>
+          tyPred
+            elemKind
+            (resolveChildLayout
+              body parentLayout parentLayoutIdx (.some 0) elemKind)
+            parentLayoutIdx
+            e
         | .nil =>
           match e with
           | .scalar sv =>
             sv.sizeBytes = strideBytes ∧
               0 < sv.sizeBytes ∧
               sv.bits < 2 ^ (sv.sizeBytes * 8)
-          | _ => False
+          | _ => valueMatchesUntypedField fuel' e
     elemOk ∧
       adtArrayElemsMatchWith
         fuel' body parentLayout parentLayoutIdx strideBytes adtArgs tyPred
@@ -921,11 +959,11 @@ A field layout captured by `anneal-rustc-capture` (`fieldLayouts`, interned from
 `ty_and_layout_field` in source field order) is authoritative, because ADT field
 types need not coincide with the ADT's type arguments (for example
 `NonNull<T> { pointer: *const T }` or `struct S<T> { len: usize, data: T }`).
-Only fields without a captured layout (enum payloads) are matched positionally
-against `adtArgs`, repeating the last argument for trailing fields. For enum
-payloads, callers pass `selectVariantTypeArgs` only when
-`sigEnumPayloadsAreTypeArgs` holds and `.nil` otherwise, which checks the
-payload structurally.
+Only fields without a captured layout are matched positionally against `adtArgs`
+when `sigStructFieldsAreTypeArgs` (for single-variant wrappers) or
+`sigEnumPayloadsAreTypeArgs` (for `Option` and `Result`) holds, repeating the
+last argument for trailing fields, and otherwise against
+`parentLayout.backendRepr` or `valueMatchesUntypedField`.
 -/
 @[reducible, simp]
 def adtFieldsMatchWith
@@ -1115,19 +1153,24 @@ def valueMatchesRigidTyAndLayout :
                       match
                         entry.targetProjection,
                         Nat.beq p.offsetBytes 0,
+                        Nat.beq entry.rangeOffset 0,
                         sigGet? mem.callerLocals entry.targetLocal
                       with
-                      | .nil, true, .some (.init targetVal) =>
-                        valueMatchesRigidTyAndLayout
-                          fuel'
-                          body
-                          pointee
-                          (.some pointeeLayout)
-                          layoutIdx
-                          targetVal
-                          mem
-                      | _, _, _ =>
+                      | .nil, true, true, .some (.init targetVal) =>
+                        (match Nat.beq entry.rangeLen 0 with
+                         | true => True
+                         | false => pointeeLayout.size.bytes ≤ entry.rangeLen) ∧
+                          valueMatchesRigidTyAndLayout
+                            fuel'
+                            body
+                            pointee
+                            (.some pointeeLayout)
+                            layoutIdx
+                            targetVal
+                            mem
+                      | _, _, _, _ =>
                         0 < entry.rangeLen ∧
+                          entry.rangeOffset ≤ p.offsetBytes ∧
                           p.offsetBytes + pointeeLayout.size.bytes ≤
                             entry.rangeOffset + entry.rangeLen
                   | .none => False
@@ -1162,6 +1205,7 @@ def valueMatchesRigidTyAndLayout :
                 with
                 | .none =>
                   sigWorklistHasTypeParam 8 (elemKind :: .nil) = false ∧
+                    len_sv.bits ≤ maxBytes ∧
                     sigPtrLiveForRef mem refMut p
                 | .some elemLayout =>
                   let sliceBytes := len_sv.bits * elemLayout.size.bytes
@@ -1177,11 +1221,20 @@ def valueMatchesRigidTyAndLayout :
                       match sigLookupBorrow mem.borrows p.allocId with
                       | .some entry =>
                         borrowPermAllowsRef refMut entry.perm = true ∧
-                          match sigGet? mem.callerLocals entry.targetLocal with
-                          | .some (.init (.aggregate aggVar elems)) =>
+                          match
+                            entry.targetProjection,
+                            sigGet? mem.callerLocals entry.targetLocal
+                          with
+                          | .nil, .some (.init (.aggregate aggVar elems)) =>
                             match Nat.beq aggVar 0 with
                             | true =>
-                              len_sv.bits ≤ elems.length ∧
+                              entry.rangeOffset ≤ p.offsetBytes ∧
+                                (match Nat.beq entry.rangeLen 0 with
+                                 | true => True
+                                 | false =>
+                                   p.offsetBytes + sliceBytes ≤
+                                     entry.rangeOffset + entry.rangeLen) ∧
+                                len_sv.bits ≤ elems.length ∧
                                 p.offsetBytes + sliceBytes ≤
                                   elems.length * elemLayout.size.bytes ∧
                                 arrayElemsMatchWith
@@ -1191,10 +1244,12 @@ def valueMatchesRigidTyAndLayout :
                                   elems
                             | false =>
                               0 < entry.rangeLen ∧
+                                entry.rangeOffset ≤ p.offsetBytes ∧
                                 p.offsetBytes + sliceBytes ≤
                                   entry.rangeOffset + entry.rangeLen
-                          | _ =>
+                          | _, _ =>
                             0 < entry.rangeLen ∧
+                              entry.rangeOffset ≤ p.offsetBytes ∧
                               p.offsetBytes + sliceBytes ≤
                                 entry.rangeOffset + entry.rangeLen
                       | .none => False
@@ -1211,6 +1266,7 @@ def valueMatchesRigidTyAndLayout :
                   | .some entry =>
                     borrowPermAllowsRef refMut entry.perm = true ∧
                       0 < entry.rangeLen ∧
+                      entry.rangeOffset ≤ p.offsetBytes ∧
                       p.offsetBytes + len_sv.bits ≤
                         entry.rangeOffset + entry.rangeLen
                   | .none => False
@@ -1282,6 +1338,10 @@ def valueMatchesRigidTyAndLayout :
                 body layout layoutIdx recTyPred 0 upvarKinds fields
       | .adt adtDefPath adtArgs =>
         sigWorklistHasTypeParam 8 adtArgs = false ∧
+          let singleAdtArgs :=
+            match sigStructFieldsAreTypeArgs adtDefPath with
+            | true => adtArgs
+            | false => .nil
           match layout.variants with
           | .empty => False
           | .single expectedVar =>
@@ -1296,7 +1356,15 @@ def valueMatchesRigidTyAndLayout :
                   fields.length = offsets.length ∧
                   sigScalarNicheHolds layout fields ∧
                   adtFieldsMatchWith
-                    fuel' body layout layoutIdx recTyPred mem 0 adtArgs fields
+                    fuel'
+                    body
+                    layout
+                    layoutIdx
+                    recTyPred
+                    mem
+                    0
+                    singleAdtArgs
+                    fields
             | .array stride count =>
               match Nat.beq count 0 with
               | true =>
@@ -1305,8 +1373,15 @@ def valueMatchesRigidTyAndLayout :
                 vIdx = expectedVar ∧
                   fields.length = count ∧
                   adtArrayElemsMatchWith
-                    fuel' body layout layoutIdx stride.bytes adtArgs recTyPred
-                    mem fields
+                    fuel'
+                    body
+                    layout
+                    layoutIdx
+                    stride.bytes
+                    singleAdtArgs
+                    recTyPred
+                    mem
+                    fields
             | .union count =>
               0 < count ∧
                 vIdx = expectedVar ∧

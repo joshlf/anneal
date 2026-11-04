@@ -1532,6 +1532,22 @@ def rcControlFlowU8BoolTypeLayout : TypeLayout := {
   isUninhabited := false
 }
 
+/-- `struct TaggedStruct<T> { tag: u8, val: T }` at `T = bool` without captured
+`fieldLayouts` (e.g. after layout instantiation or beyond the capture recursion
+depth): its `ScalarPair` `backendRepr` validates `tag: u8` (`0..=255`) and
+`val: bool` (`0..=1`) instead of mistyping field `0` positionally as `T = bool`. -/
+@[reducible]
+def rcTaggedStructBoolTypeLayout : TypeLayout := {
+  size := { bytes := 2 }
+  align := { bytes := 1 }
+  backendRepr := .scalarPair
+    (.initialized (.int 8 false) { start := 0, end_ := 255 })
+    (.initialized (.int 8 false) { start := 0, end_ := 1 })
+  fields := .arbitrary [{ bytes := 0 }, { bytes := 1 }] [0, 1]
+  variants := .single 0
+  isUninhabited := false
+}
+
 /-- Deduplicated layout table shaped like `anneal-rustc-capture` output: no
 pointee layout is interned next to the shared thin-pointer slot `1`. -/
 @[reducible]
@@ -1549,7 +1565,8 @@ def rcLayoutTable : LayoutTable := {
     rcWideDynTypeLayout,          -- 7: &dyn Debug / &mut dyn Debug
     rcOptionBoolTypeLayout,       -- 8: Option<bool>
     rcTaggedBoolTypeLayout,       -- 9: Tagged<bool>
-    rcControlFlowU8BoolTypeLayout -- 10: ControlFlow<u8, bool>
+    rcControlFlowU8BoolTypeLayout, -- 10: ControlFlow<u8, bool>
+    rcTaggedStructBoolTypeLayout  -- 11: TaggedStruct<bool> (without fieldLayouts)
   ]
 }
 
@@ -1597,6 +1614,12 @@ def rcMem : Memory := {
       targetProjection := []
       perm := .frozen
       rangeOffset := 0
+      rangeLen := 8 },
+    { tag := 24
+      targetLocal := 0
+      targetProjection := [.field 1 { kind := .uint .usize, layoutIdx := 0 }]
+      perm := .frozen
+      rangeOffset := 8
       rangeLen := 8 }
   ]
   callerLocals := [
@@ -1623,9 +1646,9 @@ Kernel-checked signature validation over a capture-shaped layout table:
    `NonNull<u8>`'s field is a `*const u8`, and the struct-level nonzero niche
    rejects a null pointer.
 3. A `&Usercopy` receiver whose pointee layout is not recorded must point into
-   a live borrow with compatible permission (dangling and `.disabled`
-   references are rejected), and when a `Usercopy` local records the layout,
-   the borrowed caller value is validated against it.
+   a live borrow with compatible permission and within `[rangeOffset, rangeOffset + rangeLen]`
+   (dangling, `.disabled`, and before-`rangeOffset` references are rejected), and when
+   a `Usercopy` local records the layout, the borrowed caller value is validated against it.
 -/
 theorem example_capture_shaped_signature_predicates :
     argsMatchSignature
@@ -1649,6 +1672,8 @@ theorem example_capture_shaped_signature_predicates :
       [.aggregate 0 [.scalar ⟨0, 8⟩]]
       rcMem ∧
     argsMatchSignature (mkRcBody [rcRefUsercopyTy] rcUsizeTy) [.ptr ⟨20, 0⟩ 8] rcMem ∧
+    argsMatchSignature (mkRcBody [rcRefUsercopyTy] rcUsizeTy) [.ptr ⟨24, 8⟩ 8] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefUsercopyTy] rcUsizeTy) [.ptr ⟨24, 0⟩ 8] rcMem ∧
     ¬ argsMatchSignature (mkRcBody [rcRefUsercopyTy] rcUsizeTy) [.ptr ⟨99, 0⟩ 8] rcMem ∧
     ¬ argsMatchSignature (mkRcBody [rcRefUsercopyTy] rcUsizeTy) [.ptr ⟨22, 0⟩ 8] rcMem ∧
     argsMatchSignature
@@ -1740,9 +1765,13 @@ def rcControlFlowU8BoolTy : Ty :=
   { kind := .adt "core::ops::control_flow::ControlFlow" [.uint .u8, .bool],
     layoutIdx := 10 }
 
+@[reducible]
+def rcTaggedStructBoolTy : Ty :=
+  { kind := .adt "demo::TaggedStruct" [.bool], layoutIdx := 11 }
+
 /--
-Kernel-checked typing of multi-variant enum payloads, for which
-`anneal-rustc-capture` records no field layouts:
+Kernel-checked typing of multi-variant enum payloads and single-variant generic
+structs without captured `fieldLayouts`:
 1. `Option<T>` and `Result<T, E>` payloads are exactly their type arguments, so
    `Some(2)` is rejected as an `Option<bool>`.
 2. Other generic enums are checked structurally, because their payload types
@@ -1750,6 +1779,10 @@ Kernel-checked typing of multi-variant enum payloads, for which
    `u8` field, and `ControlFlow<u8, bool>::Break(200)` is variant `1` although
    `u8` is the first type argument. Variant indices and payload arity are still
    checked.
+3. Single-variant generic structs without captured `fieldLayouts` (other than
+   standard-library single-type wrappers `Range`/`ManuallyDrop`/`UnsafeCell`/`Cell`)
+   validate against `parentLayout.backendRepr` rather than positional `adtArgs`, so
+   `TaggedStruct<bool> { tag: 200, val: true }` is accepted and `val = 2` is rejected.
 -/
 theorem example_generic_enum_payload_signatures :
     retMatchesSignature (mkRcBody [] rcOptionBoolTy)
@@ -1766,7 +1799,11 @@ theorem example_generic_enum_payload_signatures :
     argsMatchSignature (mkRcBody [rcControlFlowU8BoolTy] rcUsizeTy)
       [.aggregate 0 [.scalar ⟨1, 1⟩]] rcMem ∧
     ¬ argsMatchSignature (mkRcBody [rcControlFlowU8BoolTy] rcUsizeTy)
-      [.aggregate 2 [.scalar ⟨200, 1⟩]] rcMem := by
+      [.aggregate 2 [.scalar ⟨200, 1⟩]] rcMem ∧
+    argsMatchSignature (mkRcBody [rcTaggedStructBoolTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨200, 1⟩, .scalar ⟨1, 1⟩]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcTaggedStructBoolTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨200, 1⟩, .scalar ⟨2, 1⟩]] rcMem := by
   set_option linter.unusedSimpArgs false in
   simp [
     emptyMemory,
@@ -1777,6 +1814,7 @@ theorem example_generic_enum_payload_signatures :
     rcOptionBoolTy,
     rcTaggedBoolTy,
     rcControlFlowU8BoolTy,
+    rcTaggedStructBoolTy,
     rcCursorTypeLayout,
     rcNonNullU8TypeLayout,
     rcUsercopyTypeLayout,
@@ -1784,6 +1822,7 @@ theorem example_generic_enum_payload_signatures :
     rcOptionBoolTypeLayout,
     rcTaggedBoolTypeLayout,
     rcControlFlowU8BoolTypeLayout,
+    rcTaggedStructBoolTypeLayout,
     sigUsizeTypeLayout,
     sigThinPtrTypeLayout,
     sigWideSliceTypeLayout,

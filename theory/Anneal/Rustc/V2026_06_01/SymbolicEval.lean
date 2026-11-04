@@ -4005,9 +4005,10 @@ theorem sig_polymorphic_instantiate_validated :
   ]
 
 /-- Sub-borrows into composite caller locals (`targetProjection != []` or
-nonzero `offsetBytes`) and offset slice borrows (`&arr[1..3]`) check the
-sub-range bounds against `entry.rangeOffset + entry.rangeLen` and array element
-byte capacity. -/
+nonzero `offsetBytes`) and offset slice borrows (`&arr[1..3]`) check both the
+lower (`entry.rangeOffset ≤ p.offsetBytes`) and upper
+(`p.offsetBytes + size ≤ entry.rangeOffset + entry.rangeLen`) sub-range bounds
+as well as array element byte capacity. -/
 theorem sig_subborrow_and_slice_offset_validated :
     let subBorrowMem : Memory :=
       { emptyMemory with
@@ -4032,11 +4033,19 @@ theorem sig_subborrow_and_slice_offset_validated :
       subBorrowMem ∧
     ¬ argsMatchSignature
       (mkTestBody ⟨.ref .mut (.uint .u32), 3⟩ ⟨.uint .u32, 0⟩)
+      [.ptr ⟨3, 0⟩ 8]
+      subBorrowMem ∧
+    ¬ argsMatchSignature
+      (mkTestBody ⟨.ref .mut (.uint .u32), 3⟩ ⟨.uint .u32, 0⟩)
       [.ptr ⟨3, 8⟩ 8]
       subBorrowMem ∧
     argsMatchSignature
       (mkTestBody ⟨.ref .not (.slice (.uint .u32)), 4⟩ ⟨.uint .u32, 0⟩)
       [.aggregate 0 [.ptr ⟨4, 4⟩ 8, .scalar ⟨1, 8⟩]]
+      subBorrowMem ∧
+    ¬ argsMatchSignature
+      (mkTestBody ⟨.ref .not (.slice (.uint .u32)), 4⟩ ⟨.uint .u32, 0⟩)
+      [.aggregate 0 [.ptr ⟨3, 0⟩ 8, .scalar ⟨2, 8⟩]]
       subBorrowMem ∧
     ¬ argsMatchSignature
       (mkTestBody ⟨.ref .not (.slice (.uint .u32)), 4⟩ ⟨.uint .u32, 0⟩)
