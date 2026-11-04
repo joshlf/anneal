@@ -22,6 +22,7 @@
 5. **Concrete Multi-Block Fuel-Free Verification Witnesses (All 7 Trusted Certificates)**:
    - `multiBlockPipeline_stage1_converges`, `multiBlockPipeline_stage2_converges`, `multiBlockPipeline_wpConverges`, `multiBlockPipeline_noCallWpConverges`, `multiBlockPipeline_ubWaivedWpConverges`, `multiBlockPipeline_modularWpConverges`, `multiBlockPipeline_traceWpConverges`, `multiBlockPipeline_converges`, `multiBlockPipeline_withMemoryAndCallees_wpConverges`, `multiBlockPipeline_withCallees_wpConverges`.
    - `verify_multiBlockPipelineClaim`, `verify_multiBlockPipelineStatefulClaim`, `verify_multiBlockPipelineTotalClaim`, `verify_multiBlockPipelineEquivClaim`, `verify_multiBlockPipelineUbExceptionClaim`, `verify_multiBlockPipelineModularClaim`, `verify_multiBlockPipelineTraceClaim`.
+   - **Non-vacuous Test Witnesses**: `multiBlockPipelineClaim_nonVacuous`, `multiBlockPipelineStatefulClaim_nonVacuous`, `multiBlockPipelineTotalClaim_nonVacuous`, `multiBlockPipelineEquivClaim_nonVacuous`, `multiBlockPipelineUbExceptionClaim_nonVacuous`, `multiBlockPipelineUbExceptionClaim_strictDomain_nonVacuous`, `multiBlockPipelineUbExceptionClaim_waivedDomain_nonVacuous`, `multiBlockPipelineModularClaim_nonVacuous`, `multiBlockPipelineTraceClaim_nonVacuous`.
 
 ## Step-by-Step Verification Commands
 
