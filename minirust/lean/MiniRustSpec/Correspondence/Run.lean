@@ -62,6 +62,18 @@ theorem steps_add (a b : Nat) (m : Mach) :
     | error e => simp
     | ok m1 => simp [ih]
 
+/-- Monotonicity of `.ok` across step prefixes: if `Interp.steps k m = .ok m'`,
+then every prefix `j ≤ k` also succeeds (`∃ mj, Interp.steps j m = .ok mj`),
+so no error (`.ub`, `.specPanic`, `.deadlock`, or `.unsupported`) occurs at any
+step `j ≤ k`. -/
+theorem steps_ok_mono {j k : Nat} {m m' : Mach} (hj : j ≤ k) (hk : Interp.steps k m = .ok m') :
+    ∃ mj, Interp.steps j m = .ok mj := by
+  have hsplit : k = j + (k - j) := by omega
+  rw [hsplit, steps_add] at hk
+  cases hjsteps : Interp.steps j m with
+  | error e => simp [hjsteps] at hk
+  | ok mj => exact ⟨mj, rfl⟩
+
 theorem tauStar_reaches {t u : ITree MirEffect MirOutcome} (h : TauStar t u) : Reaches t [] u := by
   induction h with
   | refl t => exact .refl t

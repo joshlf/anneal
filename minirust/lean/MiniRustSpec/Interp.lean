@@ -287,11 +287,14 @@ def writeSubsliceAtIndex {T : Type} (xs : List T) (start : Int) (src : List T) :
 >     ..."
 -/
 
-/-- `x86_64::PTR_SIZE` = 64 bits. -/
+/-- `x86_64::PTR_SIZE` = 64 bits:
+> "const PTR_SIZE: Size = Size::from_bits_const(64).unwrap();" -/
 def x86_64.PTR_SIZE : Size := ⟨8⟩
-/-- `x86_64::INT_MAX_ALIGN` = 128 bits. -/
+/-- `x86_64::INT_MAX_ALIGN` = 128 bits:
+> "const INT_MAX_ALIGN: Align = Align::from_bits_const(128).unwrap();" -/
 def x86_64.INT_MAX_ALIGN : Align := ⟨16⟩
-/-- `x86_64::ENDIANNESS`. -/
+/-- `x86_64::ENDIANNESS`:
+> "const ENDIANNESS: Endianness = LittleEndian;" -/
 def x86_64.ENDIANNESS : Endianness := .LittleEndian
 
 /-! ## Types and layout (`spec/lang/types.md`) -/

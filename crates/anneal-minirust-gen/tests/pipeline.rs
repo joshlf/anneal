@@ -356,4 +356,25 @@ fn anchors_match_generated_items_and_cover_interp() {
             );
         }
     }
+
+    // Every `theorem` in `Anchors.lean` and `Correspondence/Witness.lean` must be
+    // explicitly listed in `Audit.lean` so `lake build MiniRustSpec` logs its axioms.
+    let audit_text =
+        std::fs::read_to_string(minirust_dir().join("lean/MiniRustSpec/Audit.lean")).unwrap();
+    for rel in ["lean/MiniRustSpec/Anchors.lean", "lean/MiniRustSpec/Correspondence/Witness.lean"] {
+        let text = std::fs::read_to_string(minirust_dir().join(rel)).unwrap();
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("theorem ") {
+                let thm: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+                    .collect();
+                assert!(
+                    audit_text.lines().any(|al| al.trim() == thm
+                        || al.trim().ends_with(&format!(".{thm}"))),
+                    "theorem `{thm}` in `{rel}` is not listed in `MiniRustSpec/Audit.lean`"
+                );
+            }
+        }
+    }
 }

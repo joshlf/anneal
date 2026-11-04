@@ -541,6 +541,39 @@ fn quotations_occur_upstream() {
     // The interpretation and the translation quote dozens of upstream items;
     // a sudden drop means the extraction above broke.
     assert!(total >= 40, "only {total} quotations found");
+
+    // Every spec-transcribing `def` in `Interp.lean` (after `/-! ## Target`,
+    // except the Lean recursion/iteration helpers `countOnesLoop` and `steps`)
+    // must carry its own `/-- ... -/` doc comment with at least one `>` quote.
+    let interp_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Interp.lean")).unwrap();
+    let spec_start = interp_text
+        .find("/-! ## Target `x86_64`")
+        .expect("Target section in Interp.lean");
+    let spec_slice = &interp_text[spec_start..];
+    for chunk in spec_slice.split("\ndef ").skip(1) {
+        let def_name: String = chunk
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+            .collect();
+        if matches!(def_name.as_str(), "countOnesLoop" | "steps") {
+            continue;
+        }
+        let def_offset = spec_start + (chunk.as_ptr() as usize - spec_slice.as_ptr() as usize) - 4;
+        let before = interp_text[..def_offset].trim_end();
+        assert!(
+            before.ends_with("-/"),
+            "MiniRustSpec.Interp.{def_name} is not immediately preceded by a doc comment"
+        );
+        let doc_open = before.rfind("/--").unwrap_or_else(|| {
+            panic!("MiniRustSpec.Interp.{def_name} has no `/-- ... -/` doc comment")
+        });
+        let doc_body = &before[doc_open..];
+        assert!(
+            doc_body.lines().any(|l| l.trim_start().starts_with('>')),
+            "MiniRustSpec.Interp.{def_name} doc comment contains no `>` upstream block quote"
+        );
+    }
 }
 
 #[test]

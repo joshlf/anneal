@@ -50,6 +50,7 @@ open MiniRustSpec.Correspondence in
   step_initBlock
   step_start
   initMachineState_startRel
+  steps_ok_mono
   reaches_rel
   run_ret
   run_ret_from_start
@@ -117,6 +118,14 @@ open MiniRustSpec.Correspondence in
 
 open MiniRustSpec.Correspondence.Witness in
 #assert_standard_axioms
+  ctx0_ok1
+  ctx0_ok2
+  ctxI8_ok2
+  ctx0_ok_u32_i8
+  ctxI8_ok3
+  ctxI8_ok_hetero
+  spinLoop_step_self
+  branchSpinLoop1_step_self
   sumTo_inFragment
   sumTo_translate
   sumTo_init_step
@@ -271,5 +280,25 @@ open MiniRustSpec.Correspondence.Witness in
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
   MiniRustSpec.Anchors.anchors_nodup
+
+/-- Exhaustively verify that every declaration across every imported
+`MiniRustSpec.*` module in the environment depends only on Lean's standard
+axioms (`propext`, `Quot.sound`, `Classical.choice`). -/
+elab "#assert_all_minirustspec_standard_axioms" : command => do
+  let env ← getEnv
+  let mut checked : Nat := 0
+  for i in [:env.header.moduleNames.size] do
+    let modName := env.header.moduleNames[i]!
+    if (`MiniRustSpec).isPrefixOf modName then
+      let modData := env.header.moduleData[i]!
+      for c in modData.constNames do
+        let axs ← liftCoreM <| Lean.collectAxioms c
+        for a in axs do
+          unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
+            throwError "{c} (in {modName}) depends on the non-standard axiom {a}"
+        checked := checked + 1
+  logInfo m!"MiniRustSpec.Audit: exhaustively verified standard axioms for {checked} declarations across all MiniRustSpec.* modules"
+
+#assert_all_minirustspec_standard_axioms
 
 end MiniRustSpec.Audit
