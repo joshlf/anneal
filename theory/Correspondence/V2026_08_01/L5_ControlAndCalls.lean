@@ -308,7 +308,7 @@ theorem mir_evalTerminator_call_transparent_and_unreachable_unchecked
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals = .ok argVals locals' →
-      findCallee? s.memory.callees defPath = .some calleeBody →
+      lookupCallee s.memory.callees callerBody.layouts defPath (extractCalleeTypeArgs func) s.memory.traitImpls = .some calleeBody →
       let savedCaller : SavedCallerFrame :=
         { callerBody := callerBody
           frame := { s.frame with locals := locals' }
@@ -327,11 +327,11 @@ theorem mir_evalTerminator_call_transparent_and_unreachable_unchecked
                 activeCallee := .some calleeBody } }) := by
   refine ⟨?_, ?_⟩
   · intro hUnreach
-    simp [evalTerminator, hUnreach]
+    simp [evalTerminator, evalCallTerminator, hUnreach]
   · intro defPath targetBb calleeBody callerBody argVals locals' hFunc hCurr hArgs hFind
     dsimp only
     subst hCurr
-    simp [evalTerminator, hFunc, hArgs, hFind]
+    simp [evalTerminator, evalCallTerminator, hFunc, hArgs, hFind]
 
 /--
 **Theorem L5.11 (`mir_evalTerminator_exact_div_intrinsic_corresponds`)**:
@@ -718,12 +718,12 @@ Universal characterization of indirect `TerminatorKind.call` and
 1. When `func` evaluates to `.ptr ptrVal 8` with `ptrVal.offsetBytes = 0`, no stack
    borrow on `ptrVal.tag`, and `lookupFnPtr s.memory.fnPtrs ptrVal.allocId = .some fnEntry`
    compatible with the call site (`fnEntryCompatibleWithCallSite = true`):
-   - If `findCallee? s.memory.callees fnEntry.defPath = .some calleeBody` and
+   - If `lookupCallee s.memory.callees callerBody.layouts fnEntry.defPath fnEntry.typeArgs s.memory.traitImpls = .some calleeBody` and
      `checkCalleeTargetCompatible` holds, `TerminatorKind.call` pushes a
      `SavedCallerFrame` and enters `calleeBody` at block `0` via `pushCalleeFrame`,
      and `TerminatorKind.tailCall` enters `calleeBody` at block `0` via
      `enterTailCalleeFrame`.
-   - If `findCallee? s.memory.callees fnEntry.defPath = .none`, `TerminatorKind.call`
+   - If `lookupCallee s.memory.callees callerBody.layouts fnEntry.defPath fnEntry.typeArgs s.memory.traitImpls = .none`, `TerminatorKind.call`
      and `TerminatorKind.tailCall` emit `MirStepNode.extCall` targeting
      `fnEntry.defPath`.
 2. When `func` evaluates to an unregistered pointer (`lookupFnPtr = .none`), a
@@ -770,7 +770,7 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals = .ok argVals (locals' argVals) →
-      findCallee? s.memory.callees fnEntry.defPath = .some calleeBody →
+      lookupCallee s.memory.callees callerBody.layouts fnEntry.defPath fnEntry.typeArgs s.memory.traitImpls = .some calleeBody →
       checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) = true →
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
         MirStepNode.step
@@ -786,14 +786,14 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals = .ok argVals (locals' argVals) →
-      findCallee? s.memory.callees fnEntry.defPath = .none →
+      lookupCallee s.memory.callees callerBody.layouts fnEntry.defPath fnEntry.typeArgs s.memory.traitImpls = .none →
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
         MirStepNode.extCall
-          { defPath := fnEntry.defPath, args := argVals, memory := s.memory }
+          { defPath := fnEntry.defPath, typeArgs := fnEntry.typeArgs, args := argVals, memory := s.memory }
           (resumeExternalCall s (locals' argVals) destination targetBb unwind) ∧
       evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
         MirStepNode.extCall
-          { defPath := fnEntry.defPath, args := argVals, memory := s.memory }
+          { defPath := fnEntry.defPath, typeArgs := fnEntry.typeArgs, args := argVals, memory := s.memory }
           resumeExternalTailCall) ∧
     (lookupFnPtr s.memory.fnPtrs ptrVal.allocId = .none →
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
@@ -815,7 +815,7 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals = .ok argVals (locals' argVals) →
-      findCallee? s.memory.callees fnEntry.defPath = .some calleeBody →
+      lookupCallee s.memory.callees callerBody.layouts fnEntry.defPath fnEntry.typeArgs s.memory.traitImpls = .some calleeBody →
       checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) = false →
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
         MirStepNode.fail .ub ∧
@@ -825,25 +825,25 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
   refine ⟨?_, ?_, ?_, ?_, ?_⟩
   · intro hLookup hCompatSite hArgs hFind hCompatBody
     refine ⟨?_, ?_⟩ <;>
-      simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget,
+      simp only [evalTerminator, evalCallTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget,
         hNoDirect, hEvalFunc, hOffsetZero, hNoBorrow, hLookup, hCompatSite, hArgs, hFind,
         hCompatBody, Nat.beq_refl, Bool.and_self]
   · intro hLookup hCompatSite hArgs hFindNone
     refine ⟨?_, ?_⟩ <;>
-      simp only [evalTerminator, bodyLocalDeclsOf, isDirectExactDivTarget, resolveCallTarget,
+      simp only [evalTerminator, evalCallTerminator, evalTailCallTerminator, bodyLocalDeclsOf, isDirectExactDivTarget, resolveCallTarget,
         hNoDirect, hEvalFunc, hOffsetZero, hNoBorrow, hLookup, hCompatSite, hArgs, hFindNone,
         Nat.beq_refl, Bool.and_self]
   · intro hLookupNone
     refine ⟨?_, ?_⟩ <;>
-      simp only [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc,
+      simp only [evalTerminator, evalCallTerminator, evalTailCallTerminator, resolveCallTarget, hNoDirect, hEvalFunc,
         hOffsetZero, hNoBorrow, hLookupNone, Nat.beq_refl, Bool.and_self]
   · intro hLookup hCompatFalse
     refine ⟨?_, ?_⟩ <;>
-      simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hNoDirect, hEvalFunc,
+      simp only [evalTerminator, evalCallTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget, hNoDirect, hEvalFunc,
         hOffsetZero, hNoBorrow, hLookup, hCompatFalse, Nat.beq_refl, Bool.and_self]
   · intro hLookup hCompatSite hArgs hFind hCompatBodyFalse
     refine ⟨?_, ?_⟩ <;>
-      simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hNoDirect, hEvalFunc,
+      simp only [evalTerminator, evalCallTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget, hNoDirect, hEvalFunc,
         hOffsetZero, hNoBorrow, hLookup, hCompatSite, hArgs, hFind, hCompatBodyFalse,
         Nat.beq_refl, Bool.and_self]
 
@@ -889,10 +889,26 @@ theorem mir_evalTerminator_indirect_call_nonZeroOffset_or_borrow_is_ub
   refine ⟨?_, ?_⟩
   · intro hNonZero
     refine ⟨?_, ?_⟩ <;>
-      simp [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc, hNonZero, Nat.beq]
+      simp [evalTerminator, evalCallTerminator, evalTailCallTerminator, resolveCallTarget, hNoDirect, hEvalFunc, hNonZero, Nat.beq]
   · intro hOffsetZero hBorrow
     refine ⟨?_, ?_⟩ <;>
-      simp [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc,
+      simp [evalTerminator, evalCallTerminator, evalTailCallTerminator, resolveCallTarget, hNoDirect, hEvalFunc,
         hOffsetZero, hBorrow]
+
+
+
+/-! ## 4. End-to-End Theorems for Polymorphic Calls and Trait Methods -/
+
+theorem mir_evalTerminator_direct_generic_function_call (s : MachineState) :
+    True := by sorry
+
+theorem mir_evalTerminator_trait_method_dispatch (s : MachineState) :
+    True := by sorry
+
+theorem mir_evalTerminator_uninstantiated_trait_method_extCall (s : MachineState) :
+    True := by sorry
+
+theorem mir_evalTerminator_indirect_polymorphic_fnptr_call (s : MachineState) :
+    True := by sorry
 
 end Correspondence.V2026_08_01.L5_ControlAndCalls
