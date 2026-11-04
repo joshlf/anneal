@@ -964,6 +964,27 @@ def interleavedPolyLayoutTable : LayoutTable := {
   entries := [defaultU32TypeLayout, paramTPlaceholderLayout]
 }
 
+@[reducible]
+def defaultU64TypeLayout : TypeLayout := {
+  size := { bytes := 8 }
+  align := { bytes := 8 }
+  backendRepr := .scalar (.initialized (.int 64 false) { start := 0, end_ := 8 })
+  fields := .primitive
+  variants := .single 0
+  isUninhabited := false
+}
+
+@[reducible]
+def polyUnionCompoundLayout : TypeLayout := {
+  size := { bytes := 4 }
+  align := { bytes := 4 }
+  backendRepr := .memory
+  fields := .union 2
+  variants := .single 0
+  isUninhabited := false
+  fieldLayouts := [0, 1]
+}
+
 theorem example_polymorphic_mir_instantiate_and_verify :
     polySwapPairMirBody.instantiate [] = polySwapPairMirBody ∧
     polySwapPairMirBody.wellFormed = true ∧
@@ -987,6 +1008,20 @@ theorem example_polymorphic_mir_instantiate_and_verify :
        defaultU32TypeLayout] ∧
     (interleavedPolyLayoutTable.instantiate [(.bool, defaultBoolTypeLayout)]).entries =
       [defaultU32TypeLayout, defaultBoolTypeLayout, defaultBoolTypeLayout] ∧
+    (polyUnionCompoundLayout.recomputeFromFieldLayouts
+      [defaultU32TypeLayout, defaultU64TypeLayout]).size =
+      { bytes := 8 } ∧
+    (polyUnionCompoundLayout.recomputeFromFieldLayouts
+      [defaultU32TypeLayout, defaultU64TypeLayout]).fields =
+      .union 2 ∧
+    (RigidTy.instantiate [(.uint .u32, defaultU32TypeLayout)]
+      (RigidTy.instantiate [(.param 0 "U", paramTPlaceholderLayout)]
+        (.tuple [.param 0 "T", .param 1 "U"]))) =
+      RigidTy.instantiate
+        (TypeSubst.compose
+          [(.param 0 "U", paramTPlaceholderLayout)]
+          [(.uint .u32, defaultU32TypeLayout)])
+        (.tuple [.param 0 "T", .param 1 "U"]) ∧
     polySwapPairU32MirBody.fnAbi.ret.layout.size = { bytes := 8 } ∧
     VerificationResult polySwapPairU32Claim :=
   ⟨CapturedMir.instantiate_nil polySwapPairMirBody,
@@ -998,6 +1033,12 @@ theorem example_polymorphic_mir_instantiate_and_verify :
    rfl,
    rfl,
    rfl,
+   rfl,
+   rfl,
+   RigidTy.instantiate_instantiate
+     [(.param 0 "U", paramTPlaceholderLayout)]
+     [(.uint .u32, defaultU32TypeLayout)]
+     (.tuple [.param 0 "T", .param 1 "U"]),
    rfl,
    polySwapPairU32Claim_verified⟩
 

@@ -893,23 +893,324 @@ theorem LocalDecl.instantiateList_length
     congrArg Nat.succ (LocalDecl.instantiateList_length tbl args ds)
 
 /--
+Structural concatenation of two `List Ty` sequences in `Init.Core`.
+-/
+@[reducible]
+def appendTys : List Ty → List Ty → List Ty
+  | .nil, ys => ys
+  | x :: xs, ys => x :: appendTys xs ys
+
+/--
+Collect all `Ty` occurrences embedded in a `ProjectionElem`.
+-/
+@[reducible]
+def ProjectionElem.collectTys : ProjectionElem → List Ty
+  | .deref => .nil
+  | .field _ ty => ty :: .nil
+  | .index _ => .nil
+  | .constantIndex _ _ _ => .nil
+  | .subslice _ _ _ => .nil
+  | .downcast _ _ => .nil
+  | .opaqueCast ty => ty :: .nil
+  | .unwrapUnsafeBinder ty => ty :: .nil
+
+/--
+Collect all `Ty` occurrences across a list of `ProjectionElem`s.
+-/
+@[reducible]
+def ProjectionElem.collectTysList : List ProjectionElem → List Ty
+  | .nil => .nil
+  | e :: rest =>
+    appendTys (ProjectionElem.collectTys e) (ProjectionElem.collectTysList rest)
+
+/--
+Collect all `Ty` occurrences embedded in a `Place`'s projection chain.
+-/
+@[reducible]
+def Place.collectTys (p : Place) : List Ty :=
+  ProjectionElem.collectTysList p.projection
+
+/--
+Collect all `Ty` occurrences embedded in an `Operand`.
+-/
+@[reducible]
+def Operand.collectTys : Operand → List Ty
+  | .copy place => Place.collectTys place
+  | .move place => Place.collectTys place
+  | .constant c => c.ty :: .nil
+
+/--
+Collect all `Ty` occurrences across a list of `Operand`s.
+-/
+@[reducible]
+def Operand.collectTysList : List Operand → List Ty
+  | .nil => .nil
+  | op :: rest =>
+    appendTys (Operand.collectTys op) (Operand.collectTysList rest)
+
+/--
+Collect all `Ty` occurrences embedded in an `AggregateKind`.
+-/
+@[reducible]
+def AggregateKind.collectTys : AggregateKind → List Ty
+  | .array elemTy => elemTy :: .nil
+  | .tuple => .nil
+  | .adt _ _ _ => .nil
+  | .closure _ => .nil
+  | .coroutine _ => .nil
+  | .rawPtr pointeeTy _ => pointeeTy :: .nil
+
+/--
+Collect all `Ty` occurrences embedded in an `Rvalue`.
+-/
+@[reducible]
+def Rvalue.collectTys : Rvalue → List Ty
+  | .use op => Operand.collectTys op
+  | .repeat op _ => Operand.collectTys op
+  | .ref _ place => Place.collectTys place
+  | .threadLocalRef _ => .nil
+  | .rawPtr _ place => Place.collectTys place
+  | .len place => Place.collectTys place
+  | .cast _ op targetTy => targetTy :: Operand.collectTys op
+  | .binaryOp _ lhs rhs =>
+    appendTys (Operand.collectTys lhs) (Operand.collectTys rhs)
+  | .nullaryOp _ ty => ty :: .nil
+  | .unaryOp _ val => Operand.collectTys val
+  | .discriminant place => Place.collectTys place
+  | .aggregate kind operands =>
+    appendTys (AggregateKind.collectTys kind) (Operand.collectTysList operands)
+  | .shallowInitBox op contentTy => contentTy :: Operand.collectTys op
+  | .copyForDeref place => Place.collectTys place
+  | .wrapUnsafeBinder op targetTy => targetTy :: Operand.collectTys op
+
+/--
+Collect all `Ty` occurrences embedded in a `NonDivergingIntrinsic`.
+-/
+@[reducible]
+def NonDivergingIntrinsic.collectTys : NonDivergingIntrinsic → List Ty
+  | .assume op => Operand.collectTys op
+  | .copyNonOverlapping src dst count =>
+    appendTys
+      (Operand.collectTys src)
+      (appendTys (Operand.collectTys dst) (Operand.collectTys count))
+
+/--
+Collect all `Ty` occurrences embedded in a `StatementKind`.
+-/
+@[reducible]
+def StatementKind.collectTys : StatementKind → List Ty
+  | .assign place rvalue =>
+    appendTys (Place.collectTys place) (Rvalue.collectTys rvalue)
+  | .setDiscriminant place _ => Place.collectTys place
+  | .deinit place => Place.collectTys place
+  | .storageLive _ => .nil
+  | .storageDead _ => .nil
+  | .retag _ place => Place.collectTys place
+  | .placeMention place => Place.collectTys place
+  | .intrinsic intr => NonDivergingIntrinsic.collectTys intr
+  | .constEvalCounter => .nil
+  | .nop => .nil
+  | .coverage => .nil
+  | .backwardIncompatibleDropHint place => Place.collectTys place
+
+/--
+Collect all `Ty` occurrences embedded in a `Statement`.
+-/
+@[reducible]
+def Statement.collectTys (s : Statement) : List Ty :=
+  StatementKind.collectTys s.kind
+
+/--
+Collect all `Ty` occurrences across a list of `Statement`s.
+-/
+@[reducible]
+def Statement.collectTysList : List Statement → List Ty
+  | .nil => .nil
+  | s :: rest =>
+    appendTys (Statement.collectTys s) (Statement.collectTysList rest)
+
+/--
+Collect all `Ty` occurrences embedded in a `TerminatorKind`.
+-/
+@[reducible]
+def TerminatorKind.collectTys : TerminatorKind → List Ty
+  | .goto _ => .nil
+  | .switchInt discr _ => Operand.collectTys discr
+  | .unwindResume => .nil
+  | .unwindTerminate => .nil
+  | .return_ => .nil
+  | .unreachable => .nil
+  | .drop place _ _ => Place.collectTys place
+  | .call func callArgs destination _ _ =>
+    appendTys
+      (Operand.collectTys func)
+      (appendTys
+        (Operand.collectTysList callArgs)
+        (Place.collectTys destination))
+  | .tailCall func callArgs =>
+    appendTys (Operand.collectTys func) (Operand.collectTysList callArgs)
+  | .assert cond _ _ _ => Operand.collectTys cond
+  | .inlineAsm _ _ _ => .nil
+
+/--
+Collect all `Ty` occurrences embedded in a `Terminator`.
+-/
+@[reducible]
+def Terminator.collectTys (t : Terminator) : List Ty :=
+  TerminatorKind.collectTys t.kind
+
+/--
+Collect all `Ty` occurrences embedded in a `BasicBlockData`.
+-/
+@[reducible]
+def BasicBlockData.collectTys (b : BasicBlockData) : List Ty :=
+  appendTys
+    (Statement.collectTysList b.statements)
+    (Terminator.collectTys b.terminator)
+
+/--
+Collect all `Ty` occurrences across a list of `BasicBlockData` blocks.
+-/
+@[reducible]
+def BasicBlockData.collectTysList : List BasicBlockData → List Ty
+  | .nil => .nil
+  | b :: rest =>
+    appendTys (BasicBlockData.collectTys b) (BasicBlockData.collectTysList rest)
+
+/--
+Extract the `Ty` of each `LocalDecl` in a list.
+-/
+@[reducible]
+def LocalDecl.collectTysList : List LocalDecl → List Ty
+  | .nil => .nil
+  | d :: rest => d.ty :: LocalDecl.collectTysList rest
+
+/--
+Collect all `Ty` occurrences across `localDecls` and `basicBlocks` of a MIR body.
+-/
+@[reducible]
+def collectBodyTys
+    (localDecls : List LocalDecl)
+    (basicBlocks : List BasicBlockData) :
+    List Ty :=
+  appendTys
+    (LocalDecl.collectTysList localDecls)
+    (BasicBlockData.collectTysList basicBlocks)
+
+/--
+Test whether any non-parametric, non-trivial-ZST `Ty` in `tys` uses layout table
+index `targetIdx`. Trivial 0-byte ZSTs (`.tuple .nil` and `.fnDef _ _`) do not
+read `LayoutTable.lookup` in `MirSemantics`, so a shared `fallback_zst_layout`
+slot `0` with `_0 : ()` does not block parametric layout recomputation.
+-/
+@[reducible]
+def hasNonParamTyAtIdx
+    (args : TypeSubst)
+    (targetIdx : Nat) :
+    List Ty → Bool
+  | .nil => false
+  | ty :: rest =>
+    let isNonParamHere :=
+      Bool.and
+        (Nat.beq ty.layoutIdx targetIdx)
+        (Bool.and
+          (Bool.not (RigidTy.hasSubstParam args ty.kind))
+          (Bool.not (RigidTy.isTrivialZst ty.kind)))
+    match isNonParamHere with
+    | true => true
+    | false => hasNonParamTyAtIdx args targetIdx rest
+
+/--
+Test whether any `Ty` in `tys` whose `layoutIdx` equals `targetIdx` has a
+compound parametric `RigidTy` under `args`.
+-/
+@[reducible]
+def hasCompoundParamTyAtIdx
+    (args : TypeSubst)
+    (targetIdx : Nat) :
+    List Ty → Bool
+  | .nil => false
+  | ty :: rest =>
+    let isCompoundHere :=
+      Bool.and
+        (Nat.beq ty.layoutIdx targetIdx)
+        (RigidTy.isCompoundSubstParam args ty.kind)
+    match isCompoundHere with
+    | true => true
+    | false => hasCompoundParamTyAtIdx args targetIdx rest
+
+/--
+Substitute `LayoutTable` entries referenced exclusively by `.param idx _` `Ty`s
+in `allTys` (where no non-parametric or compound parametric `Ty` shares
+`ty.layoutIdx`).
+-/
+@[reducible]
+def substituteTyParamLayoutsAux
+    (allTys : List Ty)
+    (args : TypeSubst) :
+    List Ty → List TypeLayout → List TypeLayout
+  | .nil, entries => entries
+  | ty :: rest, entries =>
+    let entries' :=
+      match ty.kind with
+      | .param idx _ =>
+        match TypeSubst.lookup args idx with
+        | .none => entries
+        | .some (_, paramLayout) =>
+          match
+            Bool.or
+              (hasNonParamTyAtIdx args ty.layoutIdx allTys)
+              (hasCompoundParamTyAtIdx args ty.layoutIdx allTys)
+          with
+          | true => entries
+          | false => setTypeLayoutAt entries ty.layoutIdx paramLayout
+      | _ => entries
+    substituteTyParamLayoutsAux allTys args rest entries'
+
+/--
+Recompute `LayoutTable` entries referenced by compound parametric `Ty`s (such as
+`(T, u32)`, `[T; N]`, `&T`, `*const T`, `Option<T>`, `MaybeUninit<T>`,
+`Wrapper<T>`) across `allTys` whose layout slot `ty.layoutIdx` is not owned by a
+concrete non-parametric type.
+-/
+@[reducible]
+def recomputeTyCompoundLayoutsAux
+    (origTbl : LayoutTable)
+    (allTys : List Ty)
+    (args : TypeSubst) :
+    List Ty → List TypeLayout → List TypeLayout
+  | .nil, entries => entries
+  | ty :: rest, entries =>
+    let entries' :=
+      match RigidTy.isCompoundSubstParam args ty.kind with
+      | false => entries
+      | true =>
+        match hasNonParamTyAtIdx args ty.layoutIdx allTys with
+        | true => entries
+        | false =>
+          match
+            RigidTy.computeLayout
+              origTbl.pointerBits
+              entries
+              args
+              (LayoutTable.lookup origTbl ty.layoutIdx)
+              ty.kind
+          with
+          | .some newLayout => setTypeLayoutAt entries ty.layoutIdx newLayout
+          | .none => entries
+    recomputeTyCompoundLayoutsAux origTbl allTys args rest entries'
+
+/--
 Test whether any non-parametric `LocalDecl` in `decls` uses layout table index
 `targetIdx`.
 -/
 @[reducible]
 def hasNonParamDeclAtIdx
     (args : TypeSubst)
-    (targetIdx : Nat) :
-    List LocalDecl → Bool
-  | .nil => false
-  | d :: rest =>
-    let isNonParamHere :=
-      Bool.and
-        (Nat.beq d.ty.layoutIdx targetIdx)
-        (Bool.not (RigidTy.hasSubstParam args d.ty.kind))
-    match isNonParamHere with
-    | true => true
-    | false => hasNonParamDeclAtIdx args targetIdx rest
+    (targetIdx : Nat)
+    (decls : List LocalDecl) :
+    Bool :=
+  hasNonParamTyAtIdx args targetIdx (LocalDecl.collectTysList decls)
 
 /--
 Test whether any `LocalDecl` in `decls` whose `ty.layoutIdx` equals `targetIdx`
@@ -918,17 +1219,10 @@ has a compound parametric `RigidTy` under `args`.
 @[reducible]
 def hasCompoundParamDeclAtIdx
     (args : TypeSubst)
-    (targetIdx : Nat) :
-    List LocalDecl → Bool
-  | .nil => false
-  | d :: rest =>
-    let isCompoundHere :=
-      Bool.and
-        (Nat.beq d.ty.layoutIdx targetIdx)
-        (RigidTy.isCompoundSubstParam args d.ty.kind)
-    match isCompoundHere with
-    | true => true
-    | false => hasCompoundParamDeclAtIdx args targetIdx rest
+    (targetIdx : Nat)
+    (decls : List LocalDecl) :
+    Bool :=
+  hasCompoundParamTyAtIdx args targetIdx (LocalDecl.collectTysList decls)
 
 /--
 Substitute `LayoutTable` entries referenced exclusively by `.param idx _`
@@ -938,25 +1232,15 @@ Substitute `LayoutTable` entries referenced exclusively by `.param idx _`
 @[reducible]
 def substituteDeclParamLayoutsAux
     (allDecls : List LocalDecl)
-    (args : TypeSubst) :
-    List LocalDecl → List TypeLayout → List TypeLayout
-  | .nil, entries => entries
-  | d :: rest, entries =>
-    let entries' :=
-      match d.ty.kind with
-      | .param idx _ =>
-        match TypeSubst.lookup args idx with
-        | .none => entries
-        | .some (_, paramLayout) =>
-          match
-            Bool.or
-              (hasNonParamDeclAtIdx args d.ty.layoutIdx allDecls)
-              (hasCompoundParamDeclAtIdx args d.ty.layoutIdx allDecls)
-          with
-          | true => entries
-          | false => setTypeLayoutAt entries d.ty.layoutIdx paramLayout
-      | _ => entries
-    substituteDeclParamLayoutsAux allDecls args rest entries'
+    (args : TypeSubst)
+    (decls : List LocalDecl)
+    (entries : List TypeLayout) :
+    List TypeLayout :=
+  substituteTyParamLayoutsAux
+    (LocalDecl.collectTysList allDecls)
+    args
+    (LocalDecl.collectTysList decls)
+    entries
 
 /--
 Recompute `LayoutTable` entries referenced by compound parametric `LocalDecl`s
@@ -967,28 +1251,51 @@ whose layout slot `d.ty.layoutIdx` is dedicated to that parametric type.
 def recomputeDeclCompoundLayoutsAux
     (origTbl : LayoutTable)
     (allDecls : List LocalDecl)
+    (args : TypeSubst)
+    (decls : List LocalDecl)
+    (entries : List TypeLayout) :
+    List TypeLayout :=
+  recomputeTyCompoundLayoutsAux
+    origTbl
+    (LocalDecl.collectTysList allDecls)
+    args
+    (LocalDecl.collectTysList decls)
+    entries
+
+/--
+Instantiate `tbl : LayoutTable` for a `CapturedMir` body with `localDecls`,
+`basicBlocks`, and `args : TypeSubst`, combining `LayoutTable.instantiate` with
+parameter slot substitution and compound layout recomputation across all `Ty`s
+occurring in `localDecls` or `basicBlocks`.
+-/
+@[reducible]
+def LayoutTable.instantiateForBody
+    (tbl : LayoutTable)
+    (localDecls : List LocalDecl)
+    (basicBlocks : List BasicBlockData)
     (args : TypeSubst) :
-    List LocalDecl → List TypeLayout → List TypeLayout
-  | .nil, entries => entries
-  | d :: rest, entries =>
-    let entries' :=
-      match RigidTy.isCompoundSubstParam args d.ty.kind with
-      | false => entries
-      | true =>
-        match hasNonParamDeclAtIdx args d.ty.layoutIdx allDecls with
-        | true => entries
-        | false =>
-          match
-            RigidTy.computeLayout
-              origTbl.pointerBits
-              entries
-              args
-              (LayoutTable.lookup origTbl d.ty.layoutIdx)
-              d.ty.kind
-          with
-          | .some newLayout => setTypeLayoutAt entries d.ty.layoutIdx newLayout
-          | .none => entries
-    recomputeDeclCompoundLayoutsAux origTbl allDecls args rest entries'
+    LayoutTable :=
+  match args with
+  | .nil => LayoutTable.instantiate tbl .nil
+  | _ :: _ =>
+    let allTys := collectBodyTys localDecls basicBlocks
+    let base := LayoutTable.instantiate tbl args
+    let entriesWithParams :=
+      substituteTyParamLayoutsAux allTys args allTys base.entries
+    { base with
+      entries :=
+        recomputeTyCompoundLayoutsAux tbl allTys args allTys entriesWithParams }
+
+/--
+Universal identity theorem for `LayoutTable.instantiateForBody` on `.nil`.
+-/
+@[simp]
+theorem LayoutTable.instantiateForBody_nil
+    (tbl : LayoutTable)
+    (localDecls : List LocalDecl)
+    (basicBlocks : List BasicBlockData) :
+    LayoutTable.instantiateForBody tbl localDecls basicBlocks .nil = tbl :=
+  LayoutTable.instantiate_nil tbl
 
 /--
 Instantiate `tbl : LayoutTable` for a `CapturedMir` body with `localDecls` and
@@ -1001,15 +1308,7 @@ def LayoutTable.instantiateForDecls
     (localDecls : List LocalDecl)
     (args : TypeSubst) :
     LayoutTable :=
-  match args with
-  | .nil => LayoutTable.instantiate tbl .nil
-  | _ :: _ =>
-    let base := LayoutTable.instantiate tbl args
-    let entriesWithParams :=
-      substituteDeclParamLayoutsAux localDecls args localDecls base.entries
-    { base with
-      entries :=
-        recomputeDeclCompoundLayoutsAux tbl localDecls args localDecls entriesWithParams }
+  LayoutTable.instantiateForBody tbl localDecls .nil args
 
 /--
 Universal identity theorem for `LayoutTable.instantiateForDecls` on `.nil`.
@@ -1171,6 +1470,25 @@ def dropGenericParams : Nat → List GenericParamDef → List GenericParamDef
   | .succ k, _ :: ps => dropGenericParams k ps
 
 /--
+Dropping `n₁` then `n₂` generic parameter declarations equals dropping `n₂ + n₁`.
+-/
+@[simp]
+theorem dropGenericParams_dropGenericParams
+    (n₁ n₂ : Nat)
+    (ps : List GenericParamDef) :
+    dropGenericParams n₂ (dropGenericParams n₁ ps) =
+      dropGenericParams (Nat.add n₂ n₁) ps := by
+  induction n₁ generalizing ps with
+  | zero =>
+    rfl
+  | succ k ih =>
+    cases ps with
+    | nil =>
+      cases n₂ <;> rfl
+    | cons p rest =>
+      exact ih rest
+
+/--
 Instantiate a polymorphic `CapturedMir` body with concrete `(RigidTy × TypeLayout)`
 arguments `args : TypeSubst`, substituting `.param idx _` across all `localDecls`,
 `basicBlocks` (statements, rvalues, operands, places/projections, constants,
@@ -1179,7 +1497,7 @@ terminators), `fnAbi`, `layouts`, and `traitImpls`, and recomputing dependent
 -/
 @[reducible]
 def CapturedMir.instantiate (m : CapturedMir) (args : TypeSubst) : CapturedMir :=
-  let tbl' := LayoutTable.instantiateForDecls m.layouts m.localDecls args
+  let tbl' := LayoutTable.instantiateForBody m.layouts m.localDecls m.basicBlocks args
   let substLen := TypeSubst.length args
   { m with
     localDecls := LocalDecl.instantiateList m.layouts args m.localDecls
@@ -1202,7 +1520,7 @@ theorem CapturedMir.instantiate_nil (m : CapturedMir) :
   rw [LocalDecl.instantiateList_nil,
       BasicBlockData.instantiateList_nil,
       FnAbi.instantiate_nil,
-      LayoutTable.instantiateForDecls_nil,
+      LayoutTable.instantiateForBody_nil,
       TraitImplEntry.instantiateList_nil]
 
 /--
@@ -1228,6 +1546,29 @@ Universal identity theorem `instantiate_empty_id` over arbitrary
 @[simp]
 theorem instantiate_empty_id (m : CapturedMir) : m.instantiate .nil = m :=
   CapturedMir.instantiate_nil m
+
+/--
+`CapturedMir.instantiate` drops the first `TypeSubst.length args` entries of
+`genericParams`.
+-/
+@[simp]
+theorem CapturedMir.instantiate_genericParams
+    (m : CapturedMir)
+    (args : TypeSubst) :
+    (m.instantiate args).genericParams =
+      dropGenericParams (TypeSubst.length args) m.genericParams :=
+  rfl
+
+/--
+`CapturedMir.instantiate` instantiates `traitImpls` via `TraitImplEntry.instantiateList`.
+-/
+@[simp]
+theorem CapturedMir.instantiate_traitImpls
+    (m : CapturedMir)
+    (args : TypeSubst) :
+    (m.instantiate args).traitImpls =
+      TraitImplEntry.instantiateList args m.traitImpls :=
+  rfl
 
 /--
 `CapturedMir.instantiate` preserves `defPath` for all `m` and `args`.

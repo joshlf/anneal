@@ -812,6 +812,164 @@ theorem RigidTy.instantiate_empty_id (k : RigidTy) :
     RigidTy.instantiate .nil k = k :=
   RigidTy.instantiate_nil k
 
+/--
+Auxiliary composition of two `TypeSubst` substitutions `fullArgs₂` and `args₁`,
+stepping `rem₂` in lockstep with `args₁` so out-of-bounds parameter indices in
+`args₁` fall through to `fullArgs₂`.
+-/
+@[reducible]
+def TypeSubst.composeAux (fullArgs₂ : TypeSubst) :
+    TypeSubst → TypeSubst → TypeSubst
+  | rem₂, .nil => rem₂
+  | .nil, (ty₁, l₁) :: rest₁ =>
+    (RigidTy.instantiate fullArgs₂ ty₁, l₁) ::
+      TypeSubst.composeAux fullArgs₂ .nil rest₁
+  | _ :: rest₂, (ty₁, l₁) :: rest₁ =>
+    (RigidTy.instantiate fullArgs₂ ty₁, l₁) ::
+      TypeSubst.composeAux fullArgs₂ rest₂ rest₁
+
+/--
+Compose two `TypeSubst` substitutions `args₂` and `args₁` such that
+instantiating a `RigidTy` with `args₁` and then `args₂` is equal to
+instantiating once with `TypeSubst.compose args₂ args₁`.
+-/
+@[reducible]
+def TypeSubst.compose (args₂ args₁ : TypeSubst) : TypeSubst :=
+  TypeSubst.composeAux args₂ args₂ args₁
+
+/--
+Left identity for `TypeSubst.composeAux` when `fullArgs₂ = .nil` and `rem₂ = .nil`.
+-/
+@[simp]
+theorem TypeSubst.composeAux_nil_left :
+    (args₁ : TypeSubst) → TypeSubst.composeAux .nil .nil args₁ = args₁
+  | .nil => rfl
+  | (ty₁, _) :: rest₁ => by
+    dsimp [TypeSubst.composeAux]
+    rw [RigidTy.instantiate_nil ty₁, TypeSubst.composeAux_nil_left rest₁]
+
+/--
+Left identity for `TypeSubst.compose` with `.nil`.
+-/
+@[simp]
+theorem TypeSubst.compose_nil_left (args₁ : TypeSubst) :
+    TypeSubst.compose .nil args₁ = args₁ :=
+  TypeSubst.composeAux_nil_left args₁
+
+/--
+Right identity for `TypeSubst.compose` with `.nil`.
+-/
+@[simp]
+theorem TypeSubst.compose_nil_right (args₂ : TypeSubst) :
+    TypeSubst.compose args₂ .nil = args₂ :=
+  rfl
+
+/--
+Step lemma relating `TypeSubst.lookup` on `TypeSubst.composeAux` to sequential
+`RigidTy.instantiate` on `.param`.
+-/
+theorem RigidTy.instantiate_param_composeAux
+    (fullArgs₂ : TypeSubst)
+    (origIdx : Nat)
+    (name : String) :
+    (rem₂ args₁ : TypeSubst) →
+    (curIdx : Nat) →
+    (h :
+      (match TypeSubst.lookup rem₂ curIdx with
+       | .some (t, _) => t
+       | .none => .param origIdx name) =
+      RigidTy.instantiate fullArgs₂ (.param origIdx name)) →
+    RigidTy.instantiate fullArgs₂
+      (match TypeSubst.lookup args₁ curIdx with
+       | .some (t, _) => t
+       | .none => .param origIdx name) =
+    (match TypeSubst.lookup (TypeSubst.composeAux fullArgs₂ rem₂ args₁) curIdx with
+     | .some (t, _) => t
+     | .none => .param origIdx name)
+  | rem₂, .nil, curIdx, h => by
+    dsimp [TypeSubst.lookup, TypeSubst.composeAux]
+    exact h.symm
+  | .nil, (_, _) :: _, .zero, _ => rfl
+  | _ :: _, (_, _) :: _, .zero, _ => rfl
+  | .nil, (_, _) :: rest₁, .succ idx', h =>
+    RigidTy.instantiate_param_composeAux fullArgs₂ origIdx name .nil rest₁ idx' h
+  | _ :: rest₂, (_, _) :: rest₁, .succ idx', h =>
+    RigidTy.instantiate_param_composeAux fullArgs₂ origIdx name rest₂ rest₁ idx' h
+
+mutual
+/--
+Universal composition theorem for `RigidTy.instantiate`: instantiating with
+`args₁` followed by `args₂` equals instantiating with
+`TypeSubst.compose args₂ args₁`.
+-/
+@[simp]
+theorem RigidTy.instantiate_instantiate
+    (args₂ args₁ : TypeSubst) :
+    (k : RigidTy) →
+    RigidTy.instantiate args₂ (RigidTy.instantiate args₁ k) =
+      RigidTy.instantiate (TypeSubst.compose args₂ args₁) k
+  | .param idx name =>
+    RigidTy.instantiate_param_composeAux args₂ idx name args₂ args₁ idx rfl
+  | .alias p a =>
+    congrArg (RigidTy.alias p) (RigidTy.instantiateList_instantiateList args₂ args₁ a)
+  | .bool => rfl
+  | .char => rfl
+  | .int _ => rfl
+  | .uint _ => rfl
+  | .float _ => rfl
+  | .never => rfl
+  | .str => rfl
+  | .tuple fields =>
+    congrArg RigidTy.tuple (RigidTy.instantiateList_instantiateList args₂ args₁ fields)
+  | .array elem len =>
+    congrArg (RigidTy.array · len) (RigidTy.instantiate_instantiate args₂ args₁ elem)
+  | .slice elem =>
+    congrArg RigidTy.slice (RigidTy.instantiate_instantiate args₂ args₁ elem)
+  | .ref m pointee =>
+    congrArg (RigidTy.ref m) (RigidTy.instantiate_instantiate args₂ args₁ pointee)
+  | .rawPtr m pointee =>
+    congrArg (RigidTy.rawPtr m) (RigidTy.instantiate_instantiate args₂ args₁ pointee)
+  | .adt p a =>
+    congrArg (RigidTy.adt p) (RigidTy.instantiateList_instantiateList args₂ args₁ a)
+  | .fnDef p a =>
+    congrArg (RigidTy.fnDef p) (RigidTy.instantiateList_instantiateList args₂ args₁ a)
+  | .fnPtr inputs output safety abi =>
+    congrArg2 (RigidTy.fnPtr · · safety abi)
+      (RigidTy.instantiateList_instantiateList args₂ args₁ inputs)
+      (RigidTy.instantiate_instantiate args₂ args₁ output)
+  | .closure p upvars =>
+    congrArg (RigidTy.closure p) (RigidTy.instantiateList_instantiateList args₂ args₁ upvars)
+  | .dynamic _ => rfl
+  | .foreign _ => rfl
+  | .other _ => rfl
+
+/--
+Universal composition theorem for `RigidTy.instantiateList`.
+-/
+@[simp]
+theorem RigidTy.instantiateList_instantiateList
+    (args₂ args₁ : TypeSubst) :
+    (ks : List RigidTy) →
+    RigidTy.instantiateList args₂ (RigidTy.instantiateList args₁ ks) =
+      RigidTy.instantiateList (TypeSubst.compose args₂ args₁) ks
+  | .nil => rfl
+  | k :: ks =>
+    congrArg2 List.cons
+      (RigidTy.instantiate_instantiate args₂ args₁ k)
+      (RigidTy.instantiateList_instantiateList args₂ args₁ ks)
+end
+
+/--
+Test whether `k : RigidTy` is a trivial 0-byte zero-sized type (`.tuple .nil` or
+`.fnDef _ _`) whose operational semantics in `MirSemantics` never queries
+`LayoutTable.lookup`.
+-/
+@[reducible]
+def RigidTy.isTrivialZst : RigidTy → Bool
+  | .tuple .nil => true
+  | .fnDef _ _ => true
+  | _ => false
+
 mutual
 /--
 Test whether `k : RigidTy` contains any `.param idx _` resolved by `args`.
@@ -1203,24 +1361,39 @@ def RigidTy.computeLayout
           match origL.variants with
           | .empty => .some origL
           | .single vIdx =>
-            let (offsets, memIdx, totalSz, maxAl, uninh) :=
-              computeArbitraryFieldsAux 0 1 0 fls
-            .some
-              { origL with
-                size := ⟨totalSz⟩
-                align := ⟨maxAl⟩
-                backendRepr := computeAggregateBackendRepr totalSz fls
-                fields := .arbitrary offsets memIdx
-                variants := .single vIdx
-                isUninhabited := uninh }
+            match origL.fields with
+            | .union count =>
+              let (totalSz, maxAl) := computeUnionSizeAndAlign 0 1 fls
+              .some
+                { origL with
+                  size := ⟨totalSz⟩
+                  align := ⟨maxAl⟩
+                  fields := .union count
+                  variants := .single vIdx }
+            | _ =>
+              let (offsets, memIdx, totalSz, maxAl, uninh) :=
+                computeArbitraryFieldsAux 0 1 0 fls
+              .some
+                { origL with
+                  size := ⟨totalSz⟩
+                  align := ⟨maxAl⟩
+                  backendRepr := computeAggregateBackendRepr totalSz fls
+                  fields := .arbitrary offsets memIdx
+                  variants := .single vIdx
+                  isUninhabited := uninh }
           | .multiple tag tagField variantShapes =>
             let tagBytes := tagScalarByteWidth tag
             let (shapes', maxSz, maxAl) :=
               recomputeVariantShapesAux tagBytes variantShapes fls
+            let outerFields :=
+              match origL.fields with
+              | .arbitrary (_ :: _) _ => origL.fields
+              | _ => .arbitrary (⟨0⟩ :: .nil) (0 :: .nil)
             .some
               { origL with
                 size := ⟨alignUp maxSz maxAl⟩
                 align := ⟨maxAl⟩
+                fields := outerFields
                 variants := .multiple tag tagField shapes' }
     | .none =>
       match RigidTy.computeLayoutList ptrBits extEntries args adtArgs with
@@ -1462,5 +1635,44 @@ theorem TraitImplEntry.instantiateList_nil :
     congrArg2 List.cons
       (TraitImplEntry.instantiate_nil e)
       (TraitImplEntry.instantiateList_nil es)
+
+/--
+Universal composition theorem for `TraitRef.instantiate`.
+-/
+@[simp]
+theorem TraitRef.instantiate_instantiate
+    (args₂ args₁ : TypeSubst)
+    (tr : TraitRef) :
+    TraitRef.instantiate args₂ (TraitRef.instantiate args₁ tr) =
+      TraitRef.instantiate (TypeSubst.compose args₂ args₁) tr := by
+  cases tr
+  simp [TraitRef.instantiate]
+
+/--
+Universal composition theorem for `TraitImplEntry.instantiate`.
+-/
+@[simp]
+theorem TraitImplEntry.instantiate_instantiate
+    (args₂ args₁ : TypeSubst)
+    (e : TraitImplEntry) :
+    TraitImplEntry.instantiate args₂ (TraitImplEntry.instantiate args₁ e) =
+      TraitImplEntry.instantiate (TypeSubst.compose args₂ args₁) e := by
+  cases e
+  simp [TraitImplEntry.instantiate]
+
+/--
+Universal composition theorem for `TraitImplEntry.instantiateList`.
+-/
+@[simp]
+theorem TraitImplEntry.instantiateList_instantiateList
+    (args₂ args₁ : TypeSubst) :
+    (es : List TraitImplEntry) →
+    TraitImplEntry.instantiateList args₂ (TraitImplEntry.instantiateList args₁ es) =
+      TraitImplEntry.instantiateList (TypeSubst.compose args₂ args₁) es
+  | .nil => rfl
+  | e :: es =>
+    congrArg2 List.cons
+      (TraitImplEntry.instantiate_instantiate args₂ args₁ e)
+      (TraitImplEntry.instantiateList_instantiateList args₂ args₁ es)
 
 end Trusted.Rustc.V2026_08_01.MirAst

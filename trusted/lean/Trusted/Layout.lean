@@ -11,8 +11,8 @@ export Trusted.Rustc.V2026_06_01.Layout (
   FieldsShape VariantsShape BackendRepr TypeLayout AbiPassMode ArgAbi
   CallConv FnAbi LayoutTable
   alignUp maxNat appendTypeLayouts appendTypeLayouts_nil setTypeLayoutAt
-  lookupFieldLayouts computeArbitraryFieldsAux computeAggregateBackendRepr
-  tagScalarByteWidth recomputeVariantShapesAux
+  lookupFieldLayouts computeArbitraryFieldsAux computeUnionSizeAndAlign
+  computeAggregateBackendRepr tagScalarByteWidth recomputeVariantShapesAux
 )
 
 namespace Align

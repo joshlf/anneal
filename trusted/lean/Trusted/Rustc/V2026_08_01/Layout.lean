@@ -778,6 +778,28 @@ def computeArbitraryFieldsAux :
      Bool.or fl.isUninhabited restUninhabited)
 
 /--
+Compute the padded total byte size and maximum alignment of a `FieldsShape.union`
+across its member field layouts `fls` (where all fields overlap at byte offset
+`0`, so the union's size is `alignUp maxFieldSize maxFieldAlign`).
+
+Reference (The Rust Reference, "Unions"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html>
+
+> "The key property of unions is that all fields of a union share common
+> storage. As a result, writes to one field of a union can overwrite its other
+> fields, and size of a union is determined by the size of its largest field."
+-/
+@[reducible]
+def computeUnionSizeAndAlign :
+    Nat → Nat → List TypeLayout → (Nat × Nat)
+  | maxSz, maxAl, .nil => (alignUp maxSz maxAl, maxAl)
+  | maxSz, maxAl, fl :: rest =>
+    let fAlign := maxNat 1 fl.align.bytes
+    let nextMaxSz := maxNat maxSz fl.size.bytes
+    let nextMaxAl := maxNat maxAl fAlign
+    computeUnionSizeAndAlign nextMaxSz nextMaxAl rest
+
+/--
 Determine the `BackendRepr` of a single-variant aggregate from its total byte
 size and component field layouts.
 -/
@@ -837,8 +859,12 @@ def recomputeVariantShapesAux (tagBytes : Nat) :
     let payloadOff := alignUp tagBytes fAlign
     let varEnd := Nat.add payloadOff fl.size.bytes
     let varAlign := maxNat tagBytes fAlign
+    let nextPayloads :=
+      match pRest with
+      | .nil => fl :: .nil
+      | _ => pRest
     let (restShapes, restMaxSz, restMaxAl) :=
-      recomputeVariantShapesAux tagBytes vRest pRest
+      recomputeVariantShapesAux tagBytes vRest nextPayloads
     let newMaxAl := maxNat varAlign restMaxAl
     let newMaxSz := alignUp (maxNat varEnd restMaxSz) newMaxAl
     (.arbitrary (⟨payloadOff⟩ :: .nil) memIdx :: restShapes, newMaxSz, newMaxAl)
@@ -904,8 +930,7 @@ def TypeLayout.recomputeFromFieldLayouts
             variants := .single vIdx
             isUninhabited := uninh }
         | .union _ =>
-          let (_, _, totalSz, maxAl, _) :=
-            computeArbitraryFieldsAux 0 1 0 fls
+          let (totalSz, maxAl) := computeUnionSizeAndAlign 0 1 fls
           { l with
             size := ⟨totalSz⟩
             align := ⟨maxAl⟩ }
@@ -917,9 +942,14 @@ def TypeLayout.recomputeFromFieldLayouts
         let tagBytes := tagScalarByteWidth tag
         let (shapes', maxSz, maxAl) :=
           recomputeVariantShapesAux tagBytes variantShapes fls
+        let outerFields :=
+          match l.fields with
+          | .arbitrary (_ :: _) _ => l.fields
+          | _ => .arbitrary (⟨0⟩ :: .nil) (0 :: .nil)
         { l with
           size := ⟨alignUp maxSz maxAl⟩
           align := ⟨maxAl⟩
+          fields := outerFields
           variants := .multiple tag tagField shapes' }
 
 /--

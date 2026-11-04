@@ -21,6 +21,7 @@ export Trusted.Rustc.V2026_06_01.MirAst (
   BasicBlockData LocalDecl MirPhaseTag ContractRole CapturedAllocation
   GenericParamDef TraitRef TraitImplEntry TypeSubst
   CapturedMir
+  dropGenericParams dropGenericParams_dropGenericParams
   instantiate_nil instantiate_empty_id instantiate_wellFormed
 )
 
@@ -45,14 +46,20 @@ export Trusted.Rustc.V2026_06_01.MirAst.ProvenancePtr (tag)
 end ProvenancePtr
 
 namespace TypeSubst
-export Trusted.Rustc.V2026_06_01.MirAst.TypeSubst (lookup layouts length)
+export Trusted.Rustc.V2026_06_01.MirAst.TypeSubst (
+  lookup layouts length composeAux compose
+  composeAux_nil_left compose_nil_left compose_nil_right
+)
 end TypeSubst
 
 namespace RigidTy
 export Trusted.Rustc.V2026_06_01.MirAst.RigidTy (
   instantiate instantiateList instantiate_nil instantiateList_nil
-  instantiateList_nil_eq instantiate_empty_id hasSubstParam hasSubstParamList
-  isCompoundSubstParam instantiate_of_hasSubstParam_false
+  instantiateList_nil_eq instantiate_empty_id
+  instantiate_param_composeAux instantiate_instantiate instantiateList_instantiateList
+  hasSubstParam hasSubstParamList
+  isCompoundSubstParam isTrivialZst
+  instantiate_of_hasSubstParam_false
   instantiateList_of_hasSubstParamList_false
   hasSubstParam_nil hasSubstParamList_nil computeLayout computeLayoutList
 )
@@ -62,6 +69,7 @@ namespace LayoutTable
 export Trusted.Rustc.V2026_06_01.MirAst.LayoutTable (
   instantiate instantiate_nil instantiate_empty_id
   instantiateForDecls instantiateForDecls_nil
+  instantiateForBody instantiateForBody_nil
 )
 end LayoutTable
 
@@ -80,13 +88,14 @@ end ConstOperand
 
 namespace TraitRef
 export Trusted.Rustc.V2026_06_01.MirAst.TraitRef (
-  instantiate instantiate_nil
+  instantiate instantiate_nil instantiate_instantiate
 )
 end TraitRef
 
 namespace TraitImplEntry
 export Trusted.Rustc.V2026_06_01.MirAst.TraitImplEntry (
   instantiate instantiateList instantiate_nil instantiateList_nil
+  instantiate_instantiate instantiateList_instantiateList
 )
 end TraitImplEntry
 
@@ -183,6 +192,7 @@ export Trusted.Rustc.V2026_06_01.MirAst.CapturedMir (
   instantiate instantiate_nil instantiate_empty_id
   instantiate_defPath instantiate_phase instantiate_role
   instantiate_argCount instantiate_allocations instantiate_typeParamCount
+  instantiate_genericParams instantiate_traitImpls
   instantiate_isRuntimePostCleanup instantiate_localDecls_length
   instantiate_basicBlocks_length instantiate_wellFormed
 )
