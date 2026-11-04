@@ -1263,7 +1263,73 @@ def checkObservedTraceConsistencyBounded
   | true => checkFullObservedTraceBounded fuel body s trace.events trace.outcome
   | false => checkObsErasedObservedTraceBounded fuel body s trace.events trace.outcome
 
+/--
+Unified trace-consistency dispatcher initializing `MachineState` via
+`initMachineStateWithMemoryAndCallees body trace.args trace.initMem trace.inlinedCallees`
+so that both `trace.inlinedCallees` and `body.traitImpls` are populated when
+`trace.inlinedCallees` is non-empty.
+-/
+@[reducible]
+def checkObservedTraceWithCalleesBounded
+    (fuel : Nat) (checkBranches : Bool) (body : CapturedMir)
+    (trace : ObservedTrace) : Bool :=
+  let s := initMachineStateWithMemoryAndCallees body trace.args trace.initMem trace.inlinedCallees
+  match checkBranches with
+  | true => checkFullObservedTraceBounded fuel body s trace.events trace.outcome
+  | false => checkObsErasedObservedTraceBounded fuel body s trace.events trace.outcome
+
 /-! ## 5. Connection to Verification Certificates & Postcondition Refutation -/
+
+/--
+If a `VerificationResult c` certificate holds and an observed full trace is
+consistent with `c.body` (and `c.callees`) on inputs `args` satisfying
+`c.pre args` with normal return `retVal`, then `retVal` provably satisfies
+`c.post args retVal`.
+-/
+theorem verifiedClaim_satisfies_observedTrace
+    {c : Claim}
+    (h_ver : VerificationResult c)
+    (fuel : Nat) (args : List Value)
+    (events : List ObservedEvent) (retVal : Value)
+    (h_pre : c.pre args)
+    (h_trace :
+      checkFullObservedTraceBounded fuel c.body
+        (initMachineStateWithCallees c.body args c.callees)
+        events (.normal retVal) = true) :
+    c.post args retVal := by
+  rcases checkFullObservedTraceBounded_sound fuel c.body
+      (initMachineStateWithCallees c.body args c.callees)
+      events (.normal retVal) h_trace with
+    ⟨tr, out, _, h_out, h_reach⟩
+  cases out with
+  | normal p =>
+    rcases p with ⟨actualRet, mem'⟩
+    dsimp [MatchesObservedOutcome] at h_out
+    subst h_out
+    exact (h_ver.proof args h_pre).2 (tr, .normal (actualRet, mem'))
+      h_reach h_pre actualRet mem' rfl
+  | panic => nomatch h_out
+  | abort => nomatch h_out
+
+/--
+Refute a stateless `Claim` (`¬ c.holds`) by exhibiting a runtime trace
+consistent with `c.body` and `c.callees` on inputs `args` satisfying `c.pre args`
+whose normal return value `retVal` violates `c.post args retVal`.
+-/
+theorem refuteClaimByObservedTrace
+    (c : Claim)
+    (fuel : Nat) (args : List Value)
+    (events : List ObservedEvent) (retVal : Value)
+    (h_pre : c.pre args)
+    (h_trace :
+      checkFullObservedTraceBounded fuel c.body
+        (initMachineStateWithCallees c.body args c.callees)
+        events (.normal retVal) = true)
+    (h_bad : ¬ c.post args retVal) :
+    ¬ c.holds := by
+  intro h_holds
+  exact h_bad (verifiedClaim_satisfies_observedTrace ⟨h_holds⟩ fuel args
+    events retVal h_pre h_trace)
 
 /--
 If a `StatefulVerificationResult c` certificate holds and an observed full trace
@@ -1316,6 +1382,56 @@ theorem refuteStatefulClaimByObservedTrace
   rcases verifiedStatefulClaim_satisfies_observedTrace ⟨h_holds⟩ fuel args mem
       events retVal h_pre h_trace with ⟨mem', h_post⟩
   exact h_bad mem' h_post
+
+/--
+If a universally quantified polymorphic stateful claim holds across all
+`typeArgs` of length `paramCount`, and an observed full trace at a specific
+instantiation `typeArgs` returns `retVal`, then `retVal` provably satisfies the
+instantiated claim's postcondition for some post-state `mem'`.
+-/
+theorem verifiedPolyStatefulClaim_satisfies_observedTrace
+    {claimFor : TypeSubst → StatefulClaim} {paramCount : Nat}
+    (h_poly : ∀ typeArgs : TypeSubst,
+      typeArgs.length = paramCount →
+      StatefulVerificationResult (claimFor typeArgs))
+    (typeArgs : TypeSubst)
+    (h_len : typeArgs.length = paramCount)
+    (fuel : Nat) (args : List Value) (mem : Memory)
+    (events : List ObservedEvent) (retVal : Value)
+    (h_pre : (claimFor typeArgs).pre args mem)
+    (h_trace :
+      checkFullObservedTraceBounded fuel (claimFor typeArgs).body
+        (initMachineStateWithMemoryAndCallees (claimFor typeArgs).body args mem
+          (claimFor typeArgs).callees)
+        events (.normal retVal) = true) :
+    ∃ mem', (claimFor typeArgs).post args mem retVal mem' :=
+  verifiedStatefulClaim_satisfies_observedTrace (h_poly typeArgs h_len) fuel args
+    mem events retVal h_pre h_trace
+
+/--
+Refute a universally quantified polymorphic stateful claim by exhibiting a
+single monomorphized instantiation `typeArgs` (with `typeArgs.length = paramCount`)
+and a consistent runtime trace whose normal return `retVal` violates the
+postcondition across all post-states `mem'`.
+-/
+theorem refutePolyStatefulClaimByObservedTrace
+    (claimFor : TypeSubst → StatefulClaim) (paramCount : Nat)
+    (typeArgs : TypeSubst)
+    (h_len : typeArgs.length = paramCount)
+    (fuel : Nat) (args : List Value) (mem : Memory)
+    (events : List ObservedEvent) (retVal : Value)
+    (h_pre : (claimFor typeArgs).pre args mem)
+    (h_trace :
+      checkFullObservedTraceBounded fuel (claimFor typeArgs).body
+        (initMachineStateWithMemoryAndCallees (claimFor typeArgs).body args mem
+          (claimFor typeArgs).callees)
+        events (.normal retVal) = true)
+    (h_bad : ∀ mem', ¬ (claimFor typeArgs).post args mem retVal mem') :
+    ¬ (∀ ta : TypeSubst, ta.length = paramCount →
+        StatefulVerificationResult (claimFor ta)) := by
+  intro h_poly
+  exact refuteStatefulClaimByObservedTrace (claimFor typeArgs) fuel args mem
+    events retVal h_pre h_trace h_bad (h_poly typeArgs h_len).proof
 
 /-! ## 6. Raw Byte-Slice & Shadow-Provenance Decoding (`RawByteTrace`) -/
 
@@ -1861,6 +1977,19 @@ def diagnoseObservedTraceBounded
     (trace : ObservedTrace) : TraceReplayDiag :=
   let mem := { trace.initMem with callees := trace.inlinedCallees }
   let s := initMachineStateWithMemory body trace.args mem
+  diagnoseMirExecBounded fuel checkBranches body (.running s) trace.events trace.outcome
+
+/--
+Diagnose a decoded `ObservedTrace` against `body` using
+`initMachineStateWithMemoryAndCallees body trace.args trace.initMem trace.inlinedCallees`
+so that both `trace.inlinedCallees` and `body.traitImpls` are populated when
+`trace.inlinedCallees` is non-empty.
+-/
+@[reducible]
+def diagnoseObservedTraceWithCalleesBounded
+    (fuel : Nat) (checkBranches : Bool) (body : CapturedMir)
+    (trace : ObservedTrace) : TraceReplayDiag :=
+  let s := initMachineStateWithMemoryAndCallees body trace.args trace.initMem trace.inlinedCallees
   diagnoseMirExecBounded fuel checkBranches body (.running s) trace.events trace.outcome
 
 /--

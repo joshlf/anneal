@@ -175,6 +175,87 @@ theorem mirContractHoldsWithSafety_iff_mirContractHolds_imp
       (fun _ _ hf h_pre retVal mem' h_out => hf retVal mem' h_out h_pre)
       (h args h_safe)
 
+/-- Exact `DWLP mirDefaultWP` characterization of `MirContractHoldsWithSafetyAndCallees`. -/
+theorem mirContractHoldsWithSafetyAndCallees_iff_dwlp
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (safetyPre pre : List Value → Prop)
+    (post : List Value → Value → Prop) :
+    MirContractHoldsWithSafetyAndCallees body callees safetyPre pre post ↔
+      ∀ args : List Value,
+        safetyPre args →
+        DWLP mirDefaultWP (mirCallTreeWithCallees body args callees)
+          (fun out _ =>
+            pre args →
+              ∀ retVal mem', out = .normal (retVal, mem') → post args retVal)
+          PUnit.unit := by
+  constructor
+  · intro h args h_safe
+    rcases h args h_safe with ⟨h_tree_safe, h_val⟩
+    exact (dwlp_mirDefaultWP_iff _ _).2
+      ⟨h_tree_safe, fun tr out h_ret h_pre retVal mem' h_out =>
+        h_val (tr, out) h_ret h_pre retVal mem' h_out⟩
+  · intro h args h_safe
+    have h_adeq := (dwlp_mirDefaultWP_iff _ _).1 (h args h_safe)
+    exact ⟨h_adeq.1, fun outPair h_ret h_pre retVal mem' h_out =>
+      h_adeq.2 outPair.1 outPair.2 h_ret h_pre retVal mem' h_out⟩
+
+/-- Exact `DWLP mirDefaultWP` characterization of `MirContractHoldsWithCallees`. -/
+theorem mirContractHoldsWithCallees_iff_dwlp
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Prop)
+    (post : List Value → Value → Prop) :
+    MirContractHoldsWithCallees body callees pre post ↔
+      ∀ args : List Value,
+        pre args →
+        DWLP mirDefaultWP (mirCallTreeWithCallees body args callees)
+          (fun out _ =>
+            ∀ retVal mem', out = .normal (retVal, mem') → post args retVal)
+          PUnit.unit := by
+  rw [MirContractHoldsWithCallees, mirContractHoldsWithSafetyAndCallees_iff_dwlp]
+  constructor
+  · intro h args h_pre
+    exact DWLP.mono (fun _ _ hf => hf h_pre) (h args h_pre)
+  · intro h args h_pre
+    exact DWLP.mono (fun _ _ hf _ => hf) (h args h_pre)
+
+/--
+Equivalence between two-precondition `MirContractHoldsWithSafetyAndCallees` and
+single-precondition `MirContractHoldsWithCallees` with guarded postcondition.
+-/
+theorem mirContractHoldsWithSafetyAndCallees_iff_mirContractHoldsWithCallees_imp
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (safetyPre pre : List Value → Prop)
+    (post : List Value → Value → Prop) :
+    MirContractHoldsWithSafetyAndCallees body callees safetyPre pre post ↔
+      MirContractHoldsWithCallees body callees safetyPre
+        (fun args ret => pre args → post args ret) := by
+  rw [mirContractHoldsWithSafetyAndCallees_iff_dwlp, mirContractHoldsWithCallees_iff_dwlp]
+  constructor
+  · intro h args h_safe
+    exact DWLP.mono
+      (fun _ _ hf retVal mem' h_out h_pre => hf h_pre retVal mem' h_out)
+      (h args h_safe)
+  · intro h args h_safe
+    exact DWLP.mono
+      (fun _ _ hf h_pre retVal mem' h_out => hf retVal mem' h_out h_pre)
+      (h args h_safe)
+
+/-- Exact `DWLP mirDefaultWP` characterization of `MirBoolPredicateHoldsWithCallees`. -/
+theorem mirBoolPredicateHoldsWithCallees_iff_dwlp
+    (specBody : CapturedMir) (callees : List CapturedMir) (args : List Value) :
+    MirBoolPredicateHoldsWithCallees specBody callees args ↔
+      DWLP mirDefaultWP (mirCallTreeWithCallees specBody args callees)
+        (fun out _ =>
+          ∀ retVal mem',
+            out = .normal (retVal, mem') →
+            retVal = .scalar { bits := 1, sizeBytes := 1 })
+        PUnit.unit := by
+  rw [MirBoolPredicateHoldsWithCallees, mirContractHoldsWithCallees_iff_dwlp]
+  exact ⟨fun h => h args rfl, fun h _ h_eq => h_eq ▸ h⟩
+
 /-- Exact `DWLP mirDefaultWP` characterization of `MirBoolPredicateHolds`. -/
 theorem mirBoolPredicateHolds_iff_dwlp
     (specBody : CapturedMir) (args : List Value) :
@@ -184,10 +265,81 @@ theorem mirBoolPredicateHolds_iff_dwlp
           ∀ retVal mem',
             out = .normal (retVal, mem') →
             retVal = .scalar { bits := 1, sizeBytes := 1 })
-        PUnit.unit := by
-  rw [MirBoolPredicateHolds, MirBoolPredicateHoldsWithCallees, ← MirContractHolds,
-    mirContractHolds_iff_dwlp]
-  exact ⟨fun h => h args rfl, fun h _ h_eq => h_eq ▸ h⟩
+        PUnit.unit :=
+  mirBoolPredicateHoldsWithCallees_iff_dwlp specBody .nil args
+
+/-- Exact `DWLP mirDefaultWP` characterization of `MirStatefulContractHoldsWithSafetyAndCallees`. -/
+theorem mirStatefulContractHoldsWithSafetyAndCallees_iff_dwlp
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (safetyPre pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop) :
+    MirStatefulContractHoldsWithSafetyAndCallees body callees safetyPre pre post ↔
+      ∀ (args : List Value) (mem : Memory),
+        safetyPre args mem →
+        DWLP mirDefaultWP (mirStatefulTreeWithCallees body args mem callees)
+          (fun out _ =>
+            pre args mem →
+              ∀ retVal mem',
+                out = .normal (retVal, mem') → post args mem retVal mem')
+          PUnit.unit := by
+  constructor
+  · intro h args mem h_safe
+    rcases h args mem h_safe with ⟨h_tree_safe, h_val⟩
+    exact (dwlp_mirDefaultWP_iff _ _).2
+      ⟨h_tree_safe, fun tr out h_ret h_pre retVal mem' h_out =>
+        h_val (tr, out) h_ret h_pre retVal mem' h_out⟩
+  · intro h args mem h_safe
+    have h_adeq := (dwlp_mirDefaultWP_iff _ _).1 (h args mem h_safe)
+    exact ⟨h_adeq.1, fun outPair h_ret h_pre retVal mem' h_out =>
+      h_adeq.2 outPair.1 outPair.2 h_ret h_pre retVal mem' h_out⟩
+
+/-- Exact `DWLP mirDefaultWP` characterization of `MirStatefulContractHoldsWithCallees`. -/
+theorem mirStatefulContractHoldsWithCallees_iff_dwlp
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop) :
+    MirStatefulContractHoldsWithCallees body callees pre post ↔
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        DWLP mirDefaultWP (mirStatefulTreeWithCallees body args mem callees)
+          (fun out _ =>
+            ∀ retVal mem',
+              out = .normal (retVal, mem') → post args mem retVal mem')
+          PUnit.unit := by
+  rw [MirStatefulContractHoldsWithCallees,
+    mirStatefulContractHoldsWithSafetyAndCallees_iff_dwlp]
+  constructor
+  · intro h args mem h_pre
+    exact DWLP.mono (fun _ _ hf => hf h_pre) (h args mem h_pre)
+  · intro h args mem h_pre
+    exact DWLP.mono (fun _ _ hf _ => hf) (h args mem h_pre)
+
+/--
+Equivalence between two-precondition `MirStatefulContractHoldsWithSafetyAndCallees`
+and single-precondition `MirStatefulContractHoldsWithCallees` with guarded
+postcondition.
+-/
+theorem mirStatefulContractHoldsWithSafetyAndCallees_iff_mirStatefulContractHoldsWithCallees_imp
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (safetyPre pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop) :
+    MirStatefulContractHoldsWithSafetyAndCallees body callees safetyPre pre post ↔
+      MirStatefulContractHoldsWithCallees body callees safetyPre
+        (fun args mem ret mem' => pre args mem → post args mem ret mem') := by
+  rw [mirStatefulContractHoldsWithSafetyAndCallees_iff_dwlp,
+    mirStatefulContractHoldsWithCallees_iff_dwlp]
+  constructor
+  · intro h args mem h_safe
+    exact DWLP.mono
+      (fun _ _ hf retVal mem' h_out h_pre => hf h_pre retVal mem' h_out)
+      (h args mem h_safe)
+  · intro h args mem h_safe
+    exact DWLP.mono
+      (fun _ _ hf h_pre retVal mem' h_out => hf retVal mem' h_out h_pre)
+      (h args mem h_safe)
 
 /-- Exact `DWLP mirDefaultWP` characterization of `MirStatefulContractHoldsWithSafety`. -/
 theorem mirStatefulContractHoldsWithSafety_iff_dwlp
@@ -1998,51 +2150,65 @@ abbrev mirBoolPredicateHolds_of_wp_bounded :=
   @mirBoolPredicateHolds_of_checkBounded
 
 /--
-Single-pass symbolic sufficiency proposition for `MirBoolPredicateHolds`:
-`specBody` executes within `fuel` steps without UB and returns `true`
-(`.scalar ⟨1, 1⟩`) on every normal return path.
+Single-pass symbolic sufficiency proposition for `MirBoolPredicateHoldsWithCallees`:
+`specBody` executes with linked `callees` within `fuel` steps without UB and
+returns `true` (`.scalar ⟨1, 1⟩`) on every normal return path.
 -/
-def wpMirBoolSym
-    (fuel : Nat) (specBody : CapturedMir) (args : List Value) : Prop :=
-  wpMirSym fuel specBody (initMachineState specBody args)
+def wpMirBoolWithCalleesSym
+    (fuel : Nat)
+    (specBody : CapturedMir)
+    (callees : List CapturedMir)
+    (args : List Value) : Prop :=
+  wpMirSym fuel specBody (initMachineStateWithCallees specBody args callees)
     (mirSafePost (fun retVal _ => retVal = .scalar { bits := 1, sizeBytes := 1 }))
 
 /--
-Single-pass symbolic necessity / inversion proposition for `MirBoolPredicateHolds`:
-at any finite `fuel`, `MirBoolPredicateHolds specBody args` unfolds into a pure
+Single-pass symbolic necessity / inversion proposition for
+`MirBoolPredicateHoldsWithCallees`: at any finite `fuel`,
+`MirBoolPredicateHoldsWithCallees specBody callees args` unfolds into a pure
 `Prop` formula over `args`.
 -/
-def holdBoolMirSym
-    (fuel : Nat) (specBody : CapturedMir) (args : List Value) : Prop :=
-  wpMirOrExhaustedSym fuel specBody (initMachineState specBody args)
+def holdBoolMirWithCalleesSym
+    (fuel : Nat)
+    (specBody : CapturedMir)
+    (callees : List CapturedMir)
+    (args : List Value) : Prop :=
+  wpMirOrExhaustedSym fuel specBody
+    (initMachineStateWithCallees specBody args callees)
     (mirSafePost (fun retVal _ => retVal = .scalar { bits := 1, sizeBytes := 1 }))
 
-/-- Prove `MirBoolPredicateHolds specBody args` from symbolic `wpMirBoolSym`. -/
-theorem mirBoolPredicateHolds_of_wpMirSym
-    (fuel : Nat) (specBody : CapturedMir) (args : List Value)
-    (h : wpMirBoolSym fuel specBody args) :
-    MirBoolPredicateHolds specBody args := by
+/-- Prove `MirBoolPredicateHoldsWithCallees specBody callees args` from symbolic `wpMirBoolWithCalleesSym`. -/
+theorem mirBoolPredicateHoldsWithCallees_of_wpMirSym
+    (fuel : Nat)
+    (specBody : CapturedMir)
+    (callees : List CapturedMir)
+    (args : List Value)
+    (h : wpMirBoolWithCalleesSym fuel specBody callees args) :
+    MirBoolPredicateHoldsWithCallees specBody callees args := by
   have h' :
-      wpMirSym fuel specBody (initMachineState specBody args)
+      wpMirSym fuel specBody (initMachineStateWithCallees specBody args callees)
         (fun out =>
           ∀ retVal mem',
             out = .normal (retVal, mem') →
             retVal = .scalar { bits := 1, sizeBytes := 1 }) :=
     wpMirSym_mono (fun out ho => (mirSafePost_iff_forall_normal _ out).1 ho) h
   rw [wpMirSym_eq_wpMirBounded] at h'
-  exact mirBoolPredicateHolds_of_bounded fuel specBody args h'
+  exact mirBoolPredicateHoldsWithCallees_of_bounded fuel specBody callees args h'
 
 /--
-Invert a `MirBoolPredicateHolds specBody args` hypothesis (such as a `#[spec]`
-`requires` clause) into a single-pass symbolic `holdBoolMirSym` formula.
+Invert a `MirBoolPredicateHoldsWithCallees specBody callees args` hypothesis into
+a single-pass symbolic `holdBoolMirWithCalleesSym` formula.
 -/
-theorem holdBoolMirSym_of_mirBoolPredicateHolds
-    (fuel : Nat) (specBody : CapturedMir) (args : List Value)
-    (h : MirBoolPredicateHolds specBody args) :
-    holdBoolMirSym fuel specBody args := by
-  have h_dwlp := (mirBoolPredicateHolds_iff_dwlp specBody args).1 h
+theorem holdBoolMirWithCalleesSym_of_mirBoolPredicateHoldsWithCallees
+    (fuel : Nat)
+    (specBody : CapturedMir)
+    (callees : List CapturedMir)
+    (args : List Value)
+    (h : MirBoolPredicateHoldsWithCallees specBody callees args) :
+    holdBoolMirWithCalleesSym fuel specBody callees args := by
+  have h_dwlp := (mirBoolPredicateHoldsWithCallees_iff_dwlp specBody callees args).1 h
   have h_safe :
-      DWLP mirDefaultWP (mirCallTree specBody args)
+      DWLP mirDefaultWP (mirCallTreeWithCallees specBody args callees)
         (fun out _ =>
           mirSafePost
             (fun retVal _ => retVal = .scalar { bits := 1, sizeBytes := 1 }) out)
@@ -2051,7 +2217,65 @@ theorem holdBoolMirSym_of_mirBoolPredicateHolds
       (fun out _ ho => (mirSafePost_iff_forall_normal _ out).2 ho)
       h_dwlp
   exact wpMirOrExhaustedSym_of_dwlp fuel specBody
-    (initMachineState specBody args) _ h_safe
+    (initMachineStateWithCallees specBody args callees) _ h_safe
+
+/--
+Exact equivalence between `MirBoolPredicateHoldsWithCallees specBody callees args`
+and single-pass symbolic `wpMirBoolWithCalleesSym fuel specBody callees args`
+whenever `specBody` terminates without UB within `fuel` steps on `args`.
+-/
+theorem mirBoolPredicateHoldsWithCallees_iff_wpMirBoolWithCalleesSym
+    (fuel : Nat)
+    (specBody : CapturedMir)
+    (callees : List CapturedMir)
+    (args : List Value)
+    (h_term :
+      wpMirSym fuel specBody
+        (initMachineStateWithCallees specBody args callees)
+        (fun _ => True)) :
+    MirBoolPredicateHoldsWithCallees specBody callees args ↔
+      wpMirBoolWithCalleesSym fuel specBody callees args :=
+  ⟨fun h =>
+    wpMirSym_of_wpMirOrExhaustedSym h_term
+      (holdBoolMirWithCalleesSym_of_mirBoolPredicateHoldsWithCallees
+        fuel specBody callees args h),
+   mirBoolPredicateHoldsWithCallees_of_wpMirSym fuel specBody callees args⟩
+
+/--
+Single-pass symbolic sufficiency proposition for `MirBoolPredicateHolds`:
+`specBody` executes within `fuel` steps without UB and returns `true`
+(`.scalar ⟨1, 1⟩`) on every normal return path.
+-/
+def wpMirBoolSym
+    (fuel : Nat) (specBody : CapturedMir) (args : List Value) : Prop :=
+  wpMirBoolWithCalleesSym fuel specBody .nil args
+
+/--
+Single-pass symbolic necessity / inversion proposition for `MirBoolPredicateHolds`:
+at any finite `fuel`, `MirBoolPredicateHolds specBody args` unfolds into a pure
+`Prop` formula over `args`.
+-/
+def holdBoolMirSym
+    (fuel : Nat) (specBody : CapturedMir) (args : List Value) : Prop :=
+  holdBoolMirWithCalleesSym fuel specBody .nil args
+
+/-- Prove `MirBoolPredicateHolds specBody args` from symbolic `wpMirBoolSym`. -/
+theorem mirBoolPredicateHolds_of_wpMirSym
+    (fuel : Nat) (specBody : CapturedMir) (args : List Value)
+    (h : wpMirBoolSym fuel specBody args) :
+    MirBoolPredicateHolds specBody args :=
+  mirBoolPredicateHoldsWithCallees_of_wpMirSym fuel specBody .nil args h
+
+/--
+Invert a `MirBoolPredicateHolds specBody args` hypothesis (such as a `#[spec]`
+`requires` clause) into a single-pass symbolic `holdBoolMirSym` formula.
+-/
+theorem holdBoolMirSym_of_mirBoolPredicateHolds
+    (fuel : Nat) (specBody : CapturedMir) (args : List Value)
+    (h : MirBoolPredicateHolds specBody args) :
+    holdBoolMirSym fuel specBody args :=
+  holdBoolMirWithCalleesSym_of_mirBoolPredicateHoldsWithCallees
+    fuel specBody .nil args h
 
 /--
 Exact equivalence between `MirBoolPredicateHolds specBody args` and single-pass
@@ -2063,10 +2287,8 @@ theorem mirBoolPredicateHolds_iff_wpMirBoolSym
     (h_term :
       wpMirSym fuel specBody (initMachineState specBody args) (fun _ => True)) :
     MirBoolPredicateHolds specBody args ↔ wpMirBoolSym fuel specBody args :=
-  ⟨fun h =>
-    wpMirSym_of_wpMirOrExhaustedSym h_term
-      (holdBoolMirSym_of_mirBoolPredicateHolds fuel specBody args h),
-   mirBoolPredicateHolds_of_wpMirSym fuel specBody args⟩
+  mirBoolPredicateHoldsWithCallees_iff_wpMirBoolWithCalleesSym
+    fuel specBody .nil args h_term
 
 /-! ## 6. Certificate Discharge Combinators (`Claim`, `TotalClaim`, `StatefulClaim`) -/
 
@@ -3079,6 +3301,732 @@ theorem verifyModularContractMirSym
         pre := pre
         post := post } :=
   verifyModularContractWithCalleesMirSym contract body .nil pre post fuel h_wp
+
+/--
+Overwrite the call-frame components (`callees`, `callStack`, `activeCallee`,
+and `activeProtectors`) of `after : Memory` with those of `before : Memory` so
+post-call symbolic evaluation can reduce concrete caller frame fields by WHNF
+even when `after` is a universally quantified symbolic memory.
+-/
+@[reducible, simp]
+def restoreCallFrame (before after : Memory) : Memory :=
+  { after with
+    callees := before.callees
+    callStack := before.callStack
+    activeCallee := before.activeCallee
+    activeProtectors := before.activeProtectors }
+
+theorem restoreCallFrame_eq_of_callFramePreserved
+    {before after : Memory}
+    (h : callFramePreserved before after) :
+    restoreCallFrame before after = after := by
+  rcases h with ⟨h1, h2, h3, h4, _⟩
+  cases after
+  dsimp only [restoreCallFrame] at h1 h2 h3 h4 ⊢
+  subst h1 h2 h3 h4
+  rfl
+
+/--
+Project `restoreCallFrame before` across a `MirCallAns` response.
+-/
+@[reducible, simp]
+def _root_.Trusted.Rustc.V2026_06_01.MirSemantics.MirCallAns.restoreFrame
+    (before : Memory) : MirCallAns → MirCallAns
+  | .returned retVal memAfter =>
+    .returned retVal (restoreCallFrame before memAfter)
+  | .panicked memAfter =>
+    .panicked (restoreCallFrame before memAfter)
+  | .aborted => .aborted
+
+/--
+Frame-preservation predicate on a `MirCallAns` response relative to `before`.
+-/
+@[reducible, simp]
+def _root_.Trusted.Rustc.V2026_06_01.MirSemantics.MirCallAns.framePreserved
+    (before : Memory) : MirCallAns → Prop
+  | .returned _ memAfter => callFramePreserved before memAfter
+  | .panicked memAfter => callFramePreserved before memAfter
+  | .aborted => True
+
+theorem _root_.Trusted.Rustc.V2026_06_01.MirSemantics.MirCallAns.restoreFrame_eq_of_framePreserved
+    {before : Memory} {ans : MirCallAns}
+    (h : ans.framePreserved before) :
+    ans.restoreFrame before = ans := by
+  cases ans with
+  | returned retVal memAfter =>
+    dsimp only [MirCallAns.restoreFrame, MirCallAns.framePreserved] at h ⊢
+    rw [restoreCallFrame_eq_of_callFramePreserved h]
+  | panicked memAfter =>
+    dsimp only [MirCallAns.restoreFrame, MirCallAns.framePreserved] at h ⊢
+    rw [restoreCallFrame_eq_of_callFramePreserved h]
+  | aborted => rfl
+
+/--
+Every `externalSpecCallContract` guarantees `ans.framePreserved req.memory` on
+every call answer `ans` permitted by its postcondition.
+-/
+theorem externalSpecCallContract_framePreserved
+    (targetDefPath : DefPath)
+    (sidecarBody : CapturedMir)
+    (extraPre : List Value → Prop)
+    (extraPost : List Value → Value → Prop) :
+    ∀ (req : MirCallReq) (ans : MirCallAns),
+      (externalSpecCallContract targetDefPath sidecarBody extraPre extraPost).post req ans →
+      ans.framePreserved req.memory := by
+  intro req ans h_post
+  cases ans with
+  | returned retVal memAfter =>
+    exact h_post.1
+  | panicked memAfter =>
+    dsimp only [externalSpecCallContract] at h_post
+    cases h_u : sidecarTargetCanUnwind sidecarBody <;> rw [h_u] at h_post
+    · exact False.elim h_post
+    · exact h_post
+  | aborted => trivial
+
+/--
+Frame-restoring node evaluator for modular call contracts: substitutes
+`ans.restoreFrame req.memory` into the post-call continuation `k` so all
+subsequent statements, blocks, inlined `callees`, and `return_` transitions in
+the caller frame reduce by WHNF without manual `rw` on `memAfter`.
+-/
+@[reducible]
+def evalNodeFrameModularWP
+    (contract : MirCallContract)
+    (cont : MirExecState → Prop) (post : MirOutcome → Prop) :
+    MirStepNode → Prop
+  | .ret out => post out
+  | .tau st' => cont st'
+  | .vis (.inl _) _ => False
+  | .vis (.inr (.inl _)) k => cont (k PUnit.unit)
+  | .vis (.inr (.inr (.call req))) k =>
+    contract.pre req ∧
+      ∀ ans : MirCallAns,
+        contract.post req ans → cont (k (ans.restoreFrame req.memory))
+
+/--
+Structural `Prop`-valued frame-restoring modular evaluator over
+`SymTree MirStepNode`.
+-/
+def evalSymNodeTreeFrameModular
+    (contract : MirCallContract)
+    (cont : MirExecState → Prop) (post : MirOutcome → Prop) :
+    SymTree MirStepNode → Prop
+  | .leaf (.ret out) => post out
+  | .leaf (.tau st') => cont st'
+  | .leaf (.vis (.inl _) _) => False
+  | .leaf (.vis (.inr (.inl _)) k) => cont (k PUnit.unit)
+  | .leaf (.vis (.inr (.inr (.call req))) k) =>
+    contract.pre req ∧
+      ∀ ans : MirCallAns,
+        contract.post req ans → cont (k (ans.restoreFrame req.memory))
+  | .branch c t1 t2 =>
+    match c with
+    | true => evalSymNodeTreeFrameModular contract cont post t1
+    | false => evalSymNodeTreeFrameModular contract cont post t2
+
+theorem evalSymNodeTreeFrameModular_eq
+    (contract : MirCallContract)
+    (cont : MirExecState → Prop) (post : MirOutcome → Prop)
+    (t : SymTree MirStepNode) :
+    evalSymNodeTreeFrameModular contract cont post t =
+      evalNodeFrameModularWP contract cont post t.eval := by
+  induction t with
+  | leaf node =>
+    cases node with
+    | ret _ => rfl
+    | tau _ => rfl
+    | vis i _ =>
+      rcases i with f | (e | c) <;> rfl
+  | branch c _ _ ih1 ih2 =>
+    cases c
+    · exact ih2
+    · exact ih1
+
+/--
+Single-pass fuel-bounded frame-restoring modular symbolic WP over `MirExecState`.
+-/
+def wpMirExecFrameModularSym
+    (contract : MirCallContract)
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (post : MirOutcome → Prop) : Prop :=
+  match fuel with
+  | 0 => False
+  | fuel' + 1 =>
+    evalSymNodeTreeFrameModular contract
+      (fun st' => wpMirExecFrameModularSym contract fuel' body st' post)
+      post
+      (stepMirExecSymTree body st)
+
+/--
+Single-pass fuel-bounded frame-restoring modular symbolic WP over `MachineState`.
+-/
+def wpMirFrameModularSym
+    (contract : MirCallContract)
+    (fuel : Nat) (body : CapturedMir) (s : MachineState)
+    (post : MirOutcome → Prop) : Prop :=
+  wpMirExecFrameModularSym contract fuel body (.running s) post
+
+/--
+Soundness of `wpMirExecFrameModularSym`: for any `contract` whose postcondition
+implies `ans.framePreserved req.memory`, `wpMirExecFrameModularSym` implies
+`wpMirExecModularSym`.
+-/
+theorem wpMirExecModularSym_of_wpMirExecFrameModularSym
+    (contract : MirCallContract)
+    (h_frame :
+      ∀ (req : MirCallReq) (ans : MirCallAns),
+        contract.post req ans → ans.framePreserved req.memory)
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (post : MirOutcome → Prop)
+    (h : wpMirExecFrameModularSym contract fuel body st post) :
+    wpMirExecModularSym contract fuel body st post := by
+  induction fuel generalizing st with
+  | zero => exact False.elim h
+  | succ fuel' ih =>
+    unfold wpMirExecFrameModularSym at h
+    unfold wpMirExecModularSym
+    rw [evalSymNodeTreeFrameModular_eq] at h
+    rw [evalSymNodeTreeModular_eq]
+    cases h_ev : (stepMirExecSymTree body st).eval with
+    | ret out =>
+      rw [h_ev] at h
+      exact h
+    | tau st' =>
+      rw [h_ev] at h
+      exact ih st' h
+    | vis i k =>
+      rw [h_ev] at h
+      rcases i with f | (e | c)
+      · cases f; exact False.elim h
+      · cases e; exact ih (k PUnit.unit) h
+      · rcases c with ⟨req⟩
+        dsimp only [evalNodeFrameModularWP, evalNodeModularWP] at h ⊢
+        refine ⟨h.1, fun ans h_post => ?_⟩
+        have h_eq : ans.restoreFrame req.memory = ans :=
+          MirCallAns.restoreFrame_eq_of_framePreserved (h_frame req ans h_post)
+        have h_cont := h.2 ans h_post
+        rw [h_eq] at h_cont
+        exact ih (k ans) h_cont
+
+/--
+Discharge a `ModularVerificationResult` with linked `callees` via frame-restoring
+single-pass symbolic evaluation (`wpMirFrameModularSym`).
+-/
+theorem verifyModularFrameContractWithCalleesMirSym
+    (contract : MirCallContract)
+    (h_frame :
+      ∀ (req : MirCallReq) (ans : MirCallAns),
+        contract.post req ans → ans.framePreserved req.memory)
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        wpMirFrameModularSym contract fuel body
+          (initMachineStateWithMemoryAndCallees body args mem callees)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              post args mem retVal mem')) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := contract.holdsOn
+        pre := pre
+        post := post
+        callees := callees } :=
+  verifyModularContractWithCalleesMirSym contract body callees pre post fuel
+    (fun args mem h_pre =>
+      wpMirExecModularSym_of_wpMirExecFrameModularSym
+        contract h_frame fuel body _ _ (h_wp args mem h_pre))
+
+/--
+Discharge a `ModularVerificationResult` without extra `callees` via
+frame-restoring single-pass symbolic evaluation (`wpMirFrameModularSym`).
+-/
+theorem verifyModularFrameContractMirSym
+    (contract : MirCallContract)
+    (h_frame :
+      ∀ (req : MirCallReq) (ans : MirCallAns),
+        contract.post req ans → ans.framePreserved req.memory)
+    (body : CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        wpMirFrameModularSym contract fuel body
+          (initMachineStateWithMemory body args mem)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              post args mem retVal mem')) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := contract.holdsOn
+        pre := pre
+        post := post } :=
+  verifyModularFrameContractWithCalleesMirSym
+    contract h_frame body .nil pre post fuel h_wp
+
+/--
+Discharge a `ModularVerificationResult` with linked `callees` for a caller
+invoking an `#[external_spec]` target (`externalSpecCallContract`), using
+frame-restoring `wpMirFrameModularSym` so post-call execution steps by `whnf`
+without manual frame-preservation rewrites.
+-/
+theorem verifyExternalSpecWithCalleesMirSym
+    (targetDefPath : DefPath)
+    (sidecarBody : CapturedMir)
+    (extraPre : List Value → Prop := fun _ => True)
+    (extraPost : List Value → Value → Prop := fun _ _ => True)
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        wpMirFrameModularSym
+          (externalSpecCallContract targetDefPath sidecarBody extraPre extraPost)
+          fuel
+          body
+          (initMachineStateWithMemoryAndCallees body args mem callees)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              post args mem retVal mem')) :
+    ModularVerificationResult
+      { body := body
+        envAssumed :=
+          (externalSpecCallContract targetDefPath sidecarBody extraPre extraPost).holdsOn
+        pre := pre
+        post := post
+        callees := callees } :=
+  verifyModularFrameContractWithCalleesMirSym
+    (externalSpecCallContract targetDefPath sidecarBody extraPre extraPost)
+    (externalSpecCallContract_framePreserved targetDefPath sidecarBody extraPre extraPost)
+    body callees pre post fuel h_wp
+
+/--
+Discharge a `ModularVerificationResult` for a caller invoking an
+`#[external_spec]` target (`externalSpecCallContract`), using frame-restoring
+`wpMirFrameModularSym`.
+-/
+theorem verifyExternalSpecMirSym
+    (targetDefPath : DefPath)
+    (sidecarBody : CapturedMir)
+    (extraPre : List Value → Prop := fun _ => True)
+    (extraPost : List Value → Value → Prop := fun _ _ => True)
+    (body : CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        wpMirFrameModularSym
+          (externalSpecCallContract targetDefPath sidecarBody extraPre extraPost)
+          fuel
+          body
+          (initMachineStateWithMemory body args mem)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              post args mem retVal mem')) :
+    ModularVerificationResult
+      { body := body
+        envAssumed :=
+          (externalSpecCallContract targetDefPath sidecarBody extraPre extraPost).holdsOn
+        pre := pre
+        post := post } :=
+  verifyExternalSpecWithCalleesMirSym
+    targetDefPath sidecarBody extraPre extraPost body .nil pre post fuel h_wp
+
+/--
+Single-pass symbolic caller–callee linking theorem with `callerCallees` and
+`calleeCallees` under `C.holdsOn` via `wpMirNoCallSym`.
+-/
+theorem linkVerifiedContractMirCalleeWithCalleesSym
+    {C : MirCallContract}
+    {callerBody : CapturedMir}
+    {callerCallees : List CapturedMir}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (h_caller :
+      ModularVerificationResult
+        { body := callerBody
+          envAssumed := C.holdsOn
+          pre := pre
+          post := post
+          callees := callerCallees })
+    (calleeBody : CapturedMir)
+    (calleeCallees : List CapturedMir)
+    (calleeFuel : Nat)
+    (fallback : ExternalCallHandler)
+    (h_callee :
+      ∀ req : MirCallReq,
+        req.defPath = calleeBody.defPath →
+        C.pre req →
+        wpMirNoCallSym calleeFuel calleeBody
+          (initMachineStateWithMemoryAndCallees
+            calleeBody req.args req.memory calleeCallees)
+          (fun out => C.post req (outcomeToCallAns req.memory out)))
+    (h_fallback :
+      ∀ req : MirCallReq,
+        req.defPath ≠ calleeBody.defPath →
+        C.pre req →
+        TreeSafe (fallback req) ∧
+        ∀ tr ans, ReachesRet (fallback req) tr ans → C.post req ans) :
+    (fun args mem =>
+      (mirHandledTreeWithCallees callerBody args mem callerCallees
+        (linkCalleeWithCalleesHandler calleeBody calleeCallees fallback)).toPartial) ≤
+      MirClosedStatefulContractSpec pre pre post :=
+  linkVerifiedContractMirCalleeWithCalleesBounded
+    h_caller calleeBody calleeCallees calleeFuel fallback
+    (fun req h_eq h_pre => by
+      rw [← wpMirNoCallSym_eq_wpMirNoCallBounded]
+      exact h_callee req h_eq h_pre)
+    h_fallback
+
+/--
+Polymorphic single-pass symbolic caller–callee linking theorem with
+`callerCallees` and `calleeCallees` under `C.holdsOn` via `wpMirNoCallSym`.
+-/
+theorem linkVerifiedPolyContractMirCalleeWithCalleesSym
+    {C : MirCallContract}
+    {callerBody : CapturedMir}
+    {callerCallees : List CapturedMir}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (h_caller :
+      ModularVerificationResult
+        { body := callerBody
+          envAssumed := C.holdsOn
+          pre := pre
+          post := post
+          callees := callerCallees })
+    (calleeBody : CapturedMir)
+    (calleeCallees : List CapturedMir)
+    (calleeFuel : Nat)
+    (fallback : ExternalCallHandler)
+    (h_callee :
+      ∀ req : MirCallReq,
+        req.defPath = calleeBody.defPath →
+        C.pre req →
+        wpMirNoCallSym calleeFuel
+          (instantiateCalleeForReq calleeBody callerBody.layouts req)
+          (initMachineStateWithMemoryAndCallees
+            (instantiateCalleeForReq calleeBody callerBody.layouts req)
+            req.args
+            req.memory
+            calleeCallees)
+          (fun out => C.post req (outcomeToCallAns req.memory out)))
+    (h_fallback :
+      ∀ req : MirCallReq,
+        req.defPath ≠ calleeBody.defPath →
+        C.pre req →
+        TreeSafe (fallback req) ∧
+        ∀ tr ans, ReachesRet (fallback req) tr ans → C.post req ans) :
+    (fun args mem =>
+      (mirHandledTreeWithCallees callerBody args mem callerCallees
+        (linkPolyCalleeWithCalleesHandler
+          calleeBody callerBody.layouts calleeCallees fallback)).toPartial) ≤
+      MirClosedStatefulContractSpec pre pre post :=
+  linkVerifiedPolyContractMirCalleeWithCalleesBounded
+    h_caller calleeBody calleeCallees calleeFuel fallback
+    (fun req h_eq h_pre => by
+      rw [← wpMirNoCallSym_eq_wpMirNoCallBounded]
+      exact h_callee req h_eq h_pre)
+    h_fallback
+
+/-! ## 15. `O(1)` Block & Callee Lookup Context Lemmas, Indirect `FnPtr` & Diverging Call Stepping, and Polymorphic Claim Combinators -/
+
+/--
+`O(1)` basic-block lookup context hypothesis (`BlockCtx body idx bb`): records
+that basic block `idx` in `body.basicBlocks` is `bb`, avoiding repeated linear
+list traversal of `body.basicBlocks` during symbolic execution.
+-/
+def BlockCtx (body : CapturedMir) (idx : BasicBlockIdx) (bb : BasicBlockData) : Prop :=
+  get? body.basicBlocks idx = .some bb
+
+theorem get?_basicBlocks_of_blockCtx
+    {body : CapturedMir} {idx : BasicBlockIdx} {bb : BasicBlockData}
+    (h : BlockCtx body idx bb) :
+    get? body.basicBlocks idx = .some bb :=
+  h
+
+/--
+`O(1)` callee lookup context hypothesis
+(`CalleeCtx callees callerLayouts defPath typeArgs extraTraitImpls resolvedBody`):
+records that `lookupCallee` resolves `(defPath, typeArgs)` to `resolvedBody`,
+avoiding repeated `CapturedMir.instantiate` and `TraitImplEntry` searches across
+multi-frame `s.memory.callees` steps.
+-/
+def CalleeCtx
+    (callees : List CapturedMir)
+    (callerLayouts : LayoutTable)
+    (defPath : DefPath)
+    (typeArgs : List RigidTy)
+    (extraTraitImpls : List TraitImplEntry)
+    (resolvedBody : CapturedMir) : Prop :=
+  lookupCallee callees callerLayouts defPath typeArgs extraTraitImpls =
+    .some resolvedBody
+
+theorem lookupCallee_eq_of_calleeCtx
+    {callees : List CapturedMir}
+    {callerLayouts : LayoutTable}
+    {defPath : DefPath}
+    {typeArgs : List RigidTy}
+    {extraTraitImpls : List TraitImplEntry}
+    {resolvedBody : CapturedMir}
+    (h : CalleeCtx callees callerLayouts defPath typeArgs extraTraitImpls resolvedBody) :
+    lookupCallee callees callerLayouts defPath typeArgs extraTraitImpls =
+      .some resolvedBody :=
+  h
+
+/--
+Step `stepMirSymTree` in `O(1)` at statement `stmt` using a `BlockCtx`
+hypothesis on the active body `s.memory.activeCallee.getD body`.
+-/
+theorem stepMirSymTree_stmt_of_blockCtx
+    (body : CapturedMir)
+    (s : MachineState)
+    (bb : BasicBlockData)
+    (stmt : Statement)
+    (h_phase : (s.memory.activeCallee.getD body).phase = .runtimeOptimized)
+    (h_bb : BlockCtx (s.memory.activeCallee.getD body) s.frame.blockIdx bb)
+    (h_stmt : get? bb.statements s.frame.stmtIdx = .some stmt) :
+    stepMirSymTree body s =
+      evalStmtSymTree s stmt
+        (s.memory.activeCallee.getD body).localDecls
+        (s.memory.activeCallee.getD body).layouts := by
+  unfold stepMirSymTree
+  dsimp only []
+  rw [h_phase, h_bb]
+  dsimp only []
+  rw [h_stmt]
+
+/--
+Step `stepMirSymTree` in `O(1)` at terminator `bb.terminator` using a `BlockCtx`
+hypothesis when `s.frame.stmtIdx == length bb.statements`.
+-/
+theorem stepMirSymTree_term_of_blockCtx
+    (body : CapturedMir)
+    (s : MachineState)
+    (bb : BasicBlockData)
+    (h_phase : (s.memory.activeCallee.getD body).phase = .runtimeOptimized)
+    (h_bb : BlockCtx (s.memory.activeCallee.getD body) s.frame.blockIdx bb)
+    (h_none : get? bb.statements s.frame.stmtIdx = .none)
+    (h_end : (s.frame.stmtIdx == length bb.statements) = true) :
+    stepMirSymTree body s =
+      evalTerminatorSymTree s bb.terminator (s.memory.activeCallee.getD body) := by
+  unfold stepMirSymTree
+  dsimp only []
+  rw [h_phase, h_bb]
+  dsimp only []
+  rw [h_none, h_end]
+  rfl
+
+/--
+Direct `resolveCallTarget` reduction for a constant `RigidTy.fnDef defPath typeArgs`
+operand.
+-/
+@[simp]
+theorem resolveCallTarget_const_fnDef
+    (s : MachineState)
+    (defPath : DefPath)
+    (typeArgs : List RigidTy)
+    (layoutIdx : LayoutIdx)
+    (val : ConstValue)
+    (argCount : Nat)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) :
+    resolveCallTarget
+      s
+      (.constant { ty := { kind := .fnDef defPath typeArgs, layoutIdx := layoutIdx }, val := val })
+      argCount
+      bodyLocalDecls
+      bodyLayouts =
+    .ok
+      { defPath := defPath
+        typeArgs := typeArgs
+        fnSig := .none
+        isIndirect := false }
+      s.frame.locals :=
+  rfl
+
+/--
+Verify a universally quantified polymorphic stateless claim
+`∀ typeArgs, typeArgs.length = polyBody.typeParamCount → VerificationResult (claimFor typeArgs)`
+via single-pass symbolic evaluation (`verifyMirSafeSym`).
+-/
+theorem verifyPolyMirSym
+    (polyBody : CapturedMir)
+    (claimFor : TypeSubst → Claim)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (typeArgs : TypeSubst),
+        typeArgs.length = polyBody.typeParamCount →
+        ∀ (args : List Value),
+          (claimFor typeArgs).pre args →
+          wpMirSym fuel (claimFor typeArgs).body
+            (initMachineStateWithCallees
+              (claimFor typeArgs).body args (claimFor typeArgs).callees)
+            (mirSafePost (fun retVal _ => (claimFor typeArgs).post args retVal))) :
+    ∀ (typeArgs : TypeSubst),
+      typeArgs.length = polyBody.typeParamCount →
+      VerificationResult (claimFor typeArgs) :=
+  fun typeArgs h_len => verifyMirSafeSym (claimFor typeArgs) fuel (h_wp typeArgs h_len)
+
+/--
+Panic-forbidding variant of `verifyPolyMirSym` (`mirNormalPost`).
+-/
+theorem verifyPolyMirNoPanicSym
+    (polyBody : CapturedMir)
+    (claimFor : TypeSubst → Claim)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (typeArgs : TypeSubst),
+        typeArgs.length = polyBody.typeParamCount →
+        ∀ (args : List Value),
+          (claimFor typeArgs).pre args →
+          wpMirSym fuel (claimFor typeArgs).body
+            (initMachineStateWithCallees
+              (claimFor typeArgs).body args (claimFor typeArgs).callees)
+            (mirNormalPost (fun retVal _ => (claimFor typeArgs).post args retVal))) :
+    ∀ (typeArgs : TypeSubst),
+      typeArgs.length = polyBody.typeParamCount →
+      VerificationResult (claimFor typeArgs) :=
+  fun typeArgs h_len => verifyMirNoPanicSym (claimFor typeArgs) fuel (h_wp typeArgs h_len)
+
+/--
+Verify a universally quantified polymorphic stateful claim
+`∀ typeArgs, typeArgs.length = polyBody.typeParamCount → StatefulVerificationResult (statefulClaimFor typeArgs)`
+via single-pass symbolic evaluation (`verifyStatefulMirSym`).
+-/
+theorem verifyPolyStatefulMirSym
+    (polyBody : CapturedMir)
+    (statefulClaimFor : TypeSubst → StatefulClaim)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (typeArgs : TypeSubst),
+        typeArgs.length = polyBody.typeParamCount →
+        ∀ (args : List Value) (mem : Memory),
+          (statefulClaimFor typeArgs).pre args mem →
+          wpMirSym fuel (statefulClaimFor typeArgs).body
+            (initMachineStateWithMemoryAndCallees
+              (statefulClaimFor typeArgs).body
+              args
+              mem
+              (statefulClaimFor typeArgs).callees)
+            (mirSafePost ((statefulClaimFor typeArgs).post args mem))) :
+    ∀ (typeArgs : TypeSubst),
+      typeArgs.length = polyBody.typeParamCount →
+      StatefulVerificationResult (statefulClaimFor typeArgs) :=
+  fun typeArgs h_len =>
+    verifyStatefulMirSym (statefulClaimFor typeArgs) fuel (h_wp typeArgs h_len)
+
+/--
+Panic-forbidding variant of `verifyPolyStatefulMirSym` (`mirNormalPost`).
+-/
+theorem verifyPolyStatefulMirNoPanicSym
+    (polyBody : CapturedMir)
+    (statefulClaimFor : TypeSubst → StatefulClaim)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (typeArgs : TypeSubst),
+        typeArgs.length = polyBody.typeParamCount →
+        ∀ (args : List Value) (mem : Memory),
+          (statefulClaimFor typeArgs).pre args mem →
+          wpMirSym fuel (statefulClaimFor typeArgs).body
+            (initMachineStateWithMemoryAndCallees
+              (statefulClaimFor typeArgs).body
+              args
+              mem
+              (statefulClaimFor typeArgs).callees)
+            (mirNormalPost ((statefulClaimFor typeArgs).post args mem))) :
+    ∀ (typeArgs : TypeSubst),
+      typeArgs.length = polyBody.typeParamCount →
+      StatefulVerificationResult (statefulClaimFor typeArgs) :=
+  fun typeArgs h_len =>
+    verifyStatefulMirNoPanicSym (statefulClaimFor typeArgs) fuel (h_wp typeArgs h_len)
+
+/--
+Verify a universally quantified polymorphic total-correctness claim
+`∀ typeArgs, typeArgs.length = polyBody.typeParamCount → TotalVerificationResult (totalClaimFor typeArgs)`
+via single-pass symbolic evaluation (`verifyTotalMirSym`).
+-/
+theorem verifyPolyTotalMirSym
+    (polyBody : CapturedMir)
+    (totalClaimFor : TypeSubst → TotalClaim)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (typeArgs : TypeSubst),
+        typeArgs.length = polyBody.typeParamCount →
+        ∀ (args : List Value) (mem : Memory),
+          (totalClaimFor typeArgs).pre args mem →
+          wpMirSym fuel (totalClaimFor typeArgs).body
+            (initMachineStateWithMemoryAndCallees
+              (totalClaimFor typeArgs).body
+              args
+              mem
+              (totalClaimFor typeArgs).callees)
+            (mirNormalPost ((totalClaimFor typeArgs).post args mem))) :
+    ∀ (typeArgs : TypeSubst),
+      typeArgs.length = polyBody.typeParamCount →
+      TotalVerificationResult (totalClaimFor typeArgs) :=
+  fun typeArgs h_len =>
+    verifyTotalMirSym (totalClaimFor typeArgs) fuel (h_wp typeArgs h_len)
+
+/--
+Verify a universally quantified polymorphic scoped UB-exception claim
+`∀ typeArgs, typeArgs.length = polyBody.typeParamCount → UbExceptionVerificationResult (ubExceptionClaimFor typeArgs)`
+via single-pass symbolic evaluation (`verifyUbExceptionMirSym`).
+-/
+theorem verifyPolyUbExceptionMirSym
+    (polyBody : CapturedMir)
+    (ubExceptionClaimFor : TypeSubst → UbExceptionClaim)
+    (fuel : Nat)
+    (h_strict :
+      ∀ (typeArgs : TypeSubst),
+        typeArgs.length = polyBody.typeParamCount →
+        ∀ (args : List Value) (mem : Memory),
+          (ubExceptionClaimFor typeArgs).pre args mem →
+          (ubExceptionClaimFor typeArgs).strictSafetyPre args mem →
+          wpMirSym fuel (ubExceptionClaimFor typeArgs).body
+            (initMachineStateWithMemoryAndCallees
+              (ubExceptionClaimFor typeArgs).body
+              args
+              mem
+              (ubExceptionClaimFor typeArgs).callees)
+            (fun out =>
+              ∀ retVal mem', out = .normal (retVal, mem') →
+                (ubExceptionClaimFor typeArgs).post args mem retVal mem'))
+    (h_waived :
+      ∀ (typeArgs : TypeSubst),
+        typeArgs.length = polyBody.typeParamCount →
+        ∀ (args : List Value) (mem : Memory),
+          (ubExceptionClaimFor typeArgs).pre args mem →
+          wpMirUbWaivedSym fuel (ubExceptionClaimFor typeArgs).body
+            (initMachineStateWithMemoryAndCallees
+              (ubExceptionClaimFor typeArgs).body
+              args
+              mem
+              (ubExceptionClaimFor typeArgs).callees)
+            (fun out =>
+              ∀ retVal mem', out = .normal (retVal, mem') →
+                (ubExceptionClaimFor typeArgs).post args mem retVal mem')) :
+    ∀ (typeArgs : TypeSubst),
+      typeArgs.length = polyBody.typeParamCount →
+      UbExceptionVerificationResult (ubExceptionClaimFor typeArgs) :=
+  fun typeArgs h_len =>
+    verifyUbExceptionMirSym
+      (ubExceptionClaimFor typeArgs)
+      fuel
+      (h_strict typeArgs h_len)
+      (h_waived typeArgs h_len)
 
 /-! ## 10. Differential Testing Outcome Classifiers & Strict UB / Panic Refutation Combinators -/
 
