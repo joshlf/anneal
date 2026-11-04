@@ -1515,7 +1515,7 @@ mod tests {
         .expect("write crate_b/Cargo.toml");
         fs::write(
             crate_b_dir.join("src/lib.rs"),
-            "#![no_std]\npub fn helper_add(x: usize, y: usize) -> usize {\n    x.wrapping_add(y)\n}\n",
+            "#![no_std]\nuse core::ops::{Range, RangeBounds};\npub fn helper_add(x: usize, y: usize) -> usize {\n    let r: Range<usize> = 0..1024;\n    if RangeBounds::contains(&r, &x) {\n        x.wrapping_add(y)\n    } else {\n        y\n    }\n}\n",
         )
         .expect("write crate_b/src/lib.rs");
 
@@ -1566,12 +1566,20 @@ mod tests {
         assert_eq!(dep_rec.item_kind, CapturedItemKind::Callee);
         assert_eq!(dep_rec.lean_module_name, "Mir.CrateB.helper_add");
 
-        // 3. Sysroot `core::slice::<impl [T]>::len` is captured as `Callee`.
+        // 3. Sysroot `core::slice::<impl [T]>::len` (called from `crate_a`) and
+        // `RangeBounds::contains` (called only from non-inline dependency
+        // `crate_b::helper_add`) are both captured as `Callee`.
         let core_len_rec = records
             .iter()
             .find(|r| r.lean_module_name.starts_with("Mir.Core.") && r.target.def_id.ends_with("::len"))
             .expect("find sysroot Mir.Core.* len target");
         assert_eq!(core_len_rec.item_kind, CapturedItemKind::Callee);
+
+        let core_contains_rec = records
+            .iter()
+            .find(|r| r.lean_module_name.starts_with("Mir.Core.") && r.target.def_id.contains("contains"))
+            .expect("find transitive sysroot Mir.Core.* RangeBounds::contains target from crate_b");
+        assert_eq!(core_contains_rec.item_kind, CapturedItemKind::Callee);
 
         // 4. Scaffold the workspace and verify that `Mir/CrateA/*`, `Mir/CrateB/*`, and
         // `Mir/Core/*` are placed in `.anneal/generated/Mir/`, while ONLY `crate_a`
@@ -1603,6 +1611,12 @@ mod tests {
             crate_a_dir
                 .join(".anneal/generated")
                 .join(&core_len_rec.target.mir_module_path)
+                .is_file()
+        );
+        assert!(
+            crate_a_dir
+                .join(".anneal/generated")
+                .join(&core_contains_rec.target.mir_module_path)
                 .is_file()
         );
         assert!(

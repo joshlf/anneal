@@ -403,8 +403,9 @@ fn capture_crate_unit<'tcx>(
     }
 
     // Transitively extract reachable non-local `.rmeta` / sysroot (`core`/`alloc`)
-    // MIR bodies referenced by the primary crate's captured items.
-    if is_primary_package {
+    // MIR bodies referenced by this compilation unit's captured items (both
+    // primary-crate subjects and source-built dependency-crate callees).
+    {
         let mut used_stems_by_crate: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut next_stem_suffix_by_crate: BTreeMap<String, BTreeMap<String, usize>> =
             BTreeMap::new();

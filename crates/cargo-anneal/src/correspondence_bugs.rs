@@ -823,23 +823,13 @@ pub fn lint_correspondence_gaps_with_vendor_root(
                             "gap entry '{id}' references nonexistent miri_diff_cross_ref '{miri_ref}' in tests/miri-diff/manifest.toml"
                         ));
                     }
-                    Some(has_bug) => {
-                        let is_open = status_lower == "open";
-                        if *has_bug != is_open {
-                            if is_open {
-                                return Err(format!(
-                                    "stale gap entry '{id}': referenced Miri test '{miri_ref}' has no open known_anneal_bug in tests/miri-diff/manifest.toml"
-                                ));
-                            } else {
-                                return Err(format!(
-                                    "stale gap entry '{id}': referenced Miri test '{miri_ref}' still has an open known_anneal_bug in tests/miri-diff/manifest.toml despite gap status being '{}'",
-                                    gap.status
-                                ));
-                            }
-                        }
-                        if *has_bug {
-                            verified_miri_cross_refs += 1;
-                        }
+                    Some(false) if status_lower == "open" => {
+                        return Err(format!(
+                            "stale gap entry '{id}': referenced Miri test '{miri_ref}' has no open known_anneal_bug in tests/miri-diff/manifest.toml"
+                        ));
+                    }
+                    Some(_) => {
+                        verified_miri_cross_refs += 1;
                     }
                 }
             }

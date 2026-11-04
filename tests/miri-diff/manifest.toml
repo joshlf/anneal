@@ -82,6 +82,12 @@ category = "scalar_arithmetic"
 upstream_path = "tests/pass/intrinsics/integer.rs"
 miri_verdict = "pass:scalar:12:4"
 fuel = 128
+[tests.known_anneal_bug]
+status = "open_bug"
+bug_class = "incompleteness_unmodeled_intrinsic_or_call"
+observed_anneal_tag = "externalCall:core::intrinsics::exact_div"
+suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators"
+summary = "core::intrinsics::exact_div is emitted as a Call terminator rather than lowered to BinOp.div and is not yet interpreted natively by evalCallTerminator."
 
 [[tests]]
 name = "pass_int_widening_and_truncating_casts"
@@ -536,6 +542,12 @@ category = "tree_borrows"
 upstream_path = "tests/pass/both_borrows/interior_mutability.rs"
 miri_verdict = "pass:scalar:42:4"
 fuel = 128
+[tests.known_anneal_bug]
+status = "open_bug"
+bug_class = "completeness_false_positive_ub"
+observed_anneal_tag = "ub"
+suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Memory"
+summary = "BorrowKind.shared unconditionally assigns Tree Borrows Permission.frozen without checking whether the pointee type contains UnsafeCell (!Freeze), rejecting valid interior-mutable writes with FailureKind.ub."
 
 [[tests]]
 name = "ub_tb_use_frozen_mut_after_parent_read"
