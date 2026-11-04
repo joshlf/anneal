@@ -67,12 +67,14 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   pushDivergingCalleeFrame enterTailCalleeFrame unwindFromCallStack
   applyUnwindAction resumeExternalCall resumeExternalDivergingCall
   resumeExternalTailCall isDirectExactDivTarget RustIntrinsicKind
-  classifyRustIntrinsic? rigidTyIsSigned resolveIntrinsicIsSigned
-  resolveIntrinsicShiftSigned findDeclLayoutForRigidTy
+  classifyRustIntrinsic? rigidTyIsSigned intrinsicIntSignedness?
+  resolveIntrinsicIsSigned resolveIntrinsicShiftSigned findDeclLayoutForRigidTy
   intrinsicRigidTyByteSizeAux intrinsicRigidTyByteSize
   intrinsicRigidTyKindAlign tupleFieldsAlign tupleFieldsByteSum roundUpToAlign
   intrinsicRigidTyAlignAux intrinsicRigidTyAlign
   anyUnsizedRigidTy isUnsizedRigidTy intrinsicUnresolvedLayoutStep
+  intrinsicLastRigidTy? intrinsicTailIsExtern intrinsicTailMayBeUnsized
+  intrinsicWidePointeeStep
   resolveIntrinsicPointeeTy?
   allZeroSizedUnitElemTys isZeroSizedUnitElemTy
   unpackConstEvalSelectArgs? resolveConstEvalSelectTarget?

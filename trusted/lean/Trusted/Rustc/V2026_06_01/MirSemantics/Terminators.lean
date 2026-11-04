@@ -926,9 +926,46 @@ def rigidTyIsSigned : RigidTy → Option Bool
   | _ => .none
 
 /--
-Resolve whether the primary scalar operand of a `CallConv.rustIntrinsic` call is
-signed, consulting the first monomorphized type argument in `target.typeArgs`
-when present and falling back to `operandIsSigned` on the first argument operand.
+Return the signedness of an intrinsic's integer type parameter: `.some true`
+for `RigidTy.int _`, `.some false` for `RigidTy.uint _`, `.some false` for
+`char` when `allowChar = true`, and `.none` for every other type.
+
+The arithmetic, saturating, shift, and exact-division intrinsics accept only
+integer types, and `three_way_compare` also accepts `char`, whose values compare
+as unsigned code points. Returning `.none` for any other type lets callers step
+to `MirStepNode.unsupported` instead of guessing a signedness: an unsigned guess
+for a signed type changes both the overflow conditions and the results.
+
+Reference (The Rust Reference, "Numeric types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html>
+
+> "The signed two's complement integer types consist of: ... i8, i16, i32, i64,
+> i128, isize"
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1827-L1837>
+
+> "/// Does a three-way comparison between the two arguments,
+> /// which must be of character or integer (signed or unsigned) type."
+-/
+@[reducible]
+def intrinsicIntSignedness? (allowChar : Bool) : RigidTy → Option Bool
+  | .int _ => .some true
+  | .uint _ => .some false
+  | .char =>
+    match allowChar with
+    | true => .some false
+    | false => .none
+  | _ => .none
+
+/--
+Resolve the signedness of the primary type parameter `T` of a
+`CallConv.rustIntrinsic` call with `intrinsicIntSignedness? allowChar`. The first
+monomorphized type argument in `target.typeArgs` is authoritative when present;
+otherwise the type of the first argument operand is used. Returns `.none`, which
+callers turn into `MirStepNode.unsupported`, when neither source names an
+accepted type.
 
 Reference (The Rust Reference, "Numeric types"):
 <https://doc.rust-lang.org/1.98.0/reference/types/numeric.html>
@@ -941,32 +978,34 @@ def resolveIntrinsicIsSigned
     (target : ResolvedCallTarget)
     (bodyLocalDecls : List LocalDecl)
     (bodyLayouts : LayoutTable)
-    (argOps : List Operand) :
-    Bool :=
+    (argOps : List Operand)
+    (allowChar : Bool := false) :
+    Option Bool :=
   match target.typeArgs with
-  | firstTy :: _ =>
-    match rigidTyIsSigned firstTy with
-    | .some b => b
-    | .none =>
-      match argOps with
-      | lhsOp :: _ => operandIsSigned bodyLocalDecls lhsOp bodyLayouts
-      | .nil => false
+  | firstTy :: _ => intrinsicIntSignedness? allowChar firstTy
   | .nil =>
     match argOps with
-    | lhsOp :: _ => operandIsSigned bodyLocalDecls lhsOp bodyLayouts
-    | .nil => false
+    | lhsOp :: _ =>
+      match operandTy bodyLocalDecls bodyLayouts lhsOp with
+      | .some ty => intrinsicIntSignedness? allowChar ty.kind
+      | .none => .none
+    | .nil => .none
 
 /--
-Resolve whether the shift-count operand (`rhs`, type parameter `U`) of
-`unchecked_shl<T, U>` or `unchecked_shr<T, U>` is a signed integer type,
-consulting `operandTy` on the second operand first and falling back to the
-second (or sole) type argument in `target.typeArgs`.
+Resolve the signedness of the shift-count type parameter `U` of
+`unchecked_shl<T, U>` or `unchecked_shr<T, U>`. The second monomorphized type
+argument in `target.typeArgs` is authoritative when present; otherwise the type
+of the second argument operand is used. Returns `.none`, which callers turn into
+`MirStepNode.unsupported`, when neither source names an integer type.
 
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1962-L1981>
 
-> "pub const unsafe fn unchecked_shl<T: Copy, U: Copy>(x: T, y: U) -> T;"
+> "/// Performs an unchecked left shift, resulting in undefined behavior when
+> /// `y < 0` or `y >= N`, where N is the width of T in bits.
+> ...
+> pub const unsafe fn unchecked_shl<T: Copy, U: Copy>(x: T, y: U) -> T;"
 -/
 @[reducible]
 def resolveIntrinsicShiftSigned
@@ -974,46 +1013,16 @@ def resolveIntrinsicShiftSigned
     (bodyLocalDecls : List LocalDecl)
     (bodyLayouts : LayoutTable)
     (argOps : List Operand) :
-    Bool :=
-  match argOps with
-  | _ :: rhsOp :: _ =>
-    match operandTy bodyLocalDecls bodyLayouts rhsOp with
-    | .some ty =>
-      match rigidTyIsSigned ty.kind with
-      | .some b => b
-      | .none =>
-        match target.typeArgs with
-        | _ :: secondTy :: _ =>
-          match rigidTyIsSigned secondTy with
-          | .some b => b
-          | .none => false
-        | firstTy :: .nil =>
-          match rigidTyIsSigned firstTy with
-          | .some b => b
-          | .none => false
-        | .nil => false
-    | .none =>
-      match target.typeArgs with
-      | _ :: secondTy :: _ =>
-        match rigidTyIsSigned secondTy with
-        | .some b => b
-        | .none => false
-      | firstTy :: .nil =>
-        match rigidTyIsSigned firstTy with
-        | .some b => b
-        | .none => false
-      | .nil => false
+    Option Bool :=
+  match target.typeArgs with
+  | _ :: shiftTy :: _ => intrinsicIntSignedness? false shiftTy
   | _ =>
-    match target.typeArgs with
-    | _ :: secondTy :: _ =>
-      match rigidTyIsSigned secondTy with
-      | .some b => b
-      | .none => false
-    | firstTy :: .nil =>
-      match rigidTyIsSigned firstTy with
-      | .some b => b
-      | .none => false
-    | .nil => false
+    match argOps with
+    | _ :: rhsOp :: _ =>
+      match operandTy bodyLocalDecls bodyLayouts rhsOp with
+      | .some ty => intrinsicIntSignedness? false ty.kind
+      | .none => .none
+    | _ => .none
 
 /--
 Look up a `TypeLayout` for `ty : RigidTy` by scanning `localDecls` for a
@@ -1318,12 +1327,13 @@ def isUnsizedRigidTy : Nat → RigidTy → Bool
 Step for a pointer intrinsic whose pointee or slice element type `ty` has no
 size or alignment the model can resolve. Every caller needs a sized `ty`:
 `arith_offset::<T>` and slice elements require `T: Sized`, and `size_of_val` and
-`align_of_val` dispatch `[T]`, `str`, and `dyn Trait` before reaching this step.
-An unsized `ty` (including an array or tuple containing an unsized component) is
-therefore ill-typed and faults with `.ub`. A sized `ty` without a `LayoutTable`
-entry, such as an ADT that no local of the body has as its type, is a well-typed
-program the model cannot evaluate, so it steps to `MirStepNode.unsupported`
-rather than guessing a layout.
+`align_of_val` reach this step only with a thin pointer, after dispatching
+`[T]`, `str`, `dyn Trait`, extern-type tails (`intrinsicTailIsExtern`), and wide
+pointers (`intrinsicWidePointeeStep`). An unsized `ty` (including an array or
+tuple containing an unsized component) is therefore ill-typed and faults with
+`.ub`. A sized `ty` without a `LayoutTable` entry, such as an ADT that no local
+of the body has as its type, is a well-typed program the model cannot evaluate,
+so it steps to `MirStepNode.unsupported` rather than guessing a layout.
 
 Reference (The Rust Reference, "Dynamically Sized Types"):
 <https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
@@ -1337,6 +1347,134 @@ def intrinsicUnresolvedLayoutStep (ty : RigidTy) : MirStepNode :=
   match isUnsizedRigidTy 8 ty with
   | true => MirStepNode.fail .ub
   | false => MirStepNode.unsupported
+
+/--
+Return the last element of `ks`, or `.none` when `ks` is empty.
+
+A tuple can be unsized only through its last element, so the unsized-tail
+checks `intrinsicTailIsExtern` and `intrinsicTailMayBeUnsized` inspect only
+that element.
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Structs may contain a DST as the last field; this makes the struct itself a
+> DST."
+-/
+@[reducible]
+def intrinsicLastRigidTy? : List RigidTy → Option RigidTy
+  | .nil => .none
+  | k :: .nil => .some k
+  | _ :: rest => intrinsicLastRigidTy? rest
+
+/--
+Fuel-bounded check for whether the unsized tail of `ty` may be an extern type:
+`ty` is `.foreign` itself, or `ty` is a tuple whose last element's tail may be
+one. Exhausting `fuel` answers `true`, so the caller steps to
+`MirStepNode.unsupported` rather than computing a layout.
+
+`rustc` passes pointers to extern-type tails as thin pointers, and `core`
+documents that `size_of_val` and `align_of_val` on such a value are always safe
+to call but may panic or return a wrong value. The model cannot tell which, so `size_of_val`
+and `align_of_val` step to `MirStepNode.unsupported` for these pointees; the
+CTFE interpreter likewise reports an unsupported operation ("`extern type` does
+not have known layout"). An ADT whose last field is an extern type is not
+detected here because `RigidTy.adt` does not record its fields; for such an ADT
+the model returns the size of a `LayoutTable` entry if one exists, one of the
+"wrong value" outcomes that the documentation permits.
+
+Reference (`library/core/src/mem/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/mem/mod.rs#L412-L435>
+
+> "///     - an (unstable) [extern type], then this function is always safe to
+> ///       call, but may panic or otherwise return the wrong value, as the
+> ///       extern type's layout is not known. This is the same behavior as
+> ///       [`size_of_val`] on a reference to a type with an extern type tail."
+
+Reference (`library/core/src/mem/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/mem/mod.rs#L560-L579>
+
+> "///     - an (unstable) [extern type], then this function is always safe to
+> ///       call, but may panic or otherwise return the wrong value, as the
+> ///       extern type's layout is not known. This is the same behavior as
+> ///       [`align_of_val`] on a reference to a type with an extern type tail."
+-/
+@[reducible]
+def intrinsicTailIsExtern : Nat → RigidTy → Bool
+  | .zero, _ => true
+  | .succ fuel', ty =>
+    match ty with
+    | .foreign _ => true
+    | .tuple ks =>
+      match intrinsicLastRigidTy? ks with
+      | .some k => intrinsicTailIsExtern fuel' k
+      | .none => false
+    | _ => false
+
+/--
+Fuel-bounded check for whether `ty` may be a dynamically sized type whose
+pointers are wide (`Value.aggregate 0 [.ptr p 8, metadata]`): a slice, `str`,
+or `dyn Trait`; an ADT, whose fields `RigidTy.adt` does not record; an
+unrecognized `.other` type; or a tuple whose last element may be one.
+Exhausting `fuel` answers `true`.
+
+`size_of_val` and `align_of_val` dispatch top-level `[T]`, `str`, and
+`dyn Trait` pointees themselves. When they receive a wide pointer to any other
+pointee, a well-typed program can only be passing a struct or tuple that ends
+in an unsized field. `rustc` computes the size and alignment of such a value
+from the offsets of its statically sized fields and the metadata of its tail,
+which the model does not track, so the step is `MirStepNode.unsupported`. A
+wide pointer to a type that cannot end in an unsized field, such as `u64`, is
+malformed and faults with `.ub`.
+
+Reference (`library/core/src/mem/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/mem/mod.rs#L412-L435>
+
+> "/// - If `T` is `Sized`, this function is always safe to call.
+> /// - If the unsized tail of `T` is:
+> ///     - a [slice], then the length of the slice tail must be an initialized
+> ///       integer, and the size of the *entire value*
+> ///       (dynamic tail length + statically sized prefix) must fit in `isize`."
+-/
+@[reducible]
+def intrinsicTailMayBeUnsized : Nat → RigidTy → Bool
+  | .zero, _ => true
+  | .succ fuel', ty =>
+    match ty with
+    | .slice _ => true
+    | .str => true
+    | .dynamic _ => true
+    | .adt _ _ => true
+    | .other _ => true
+    | .tuple ks =>
+      match intrinsicLastRigidTy? ks with
+      | .some k => intrinsicTailMayBeUnsized fuel' k
+      | .none => false
+    | _ => false
+
+/--
+Step for `size_of_val` or `align_of_val` when the pointer argument is a
+well-formed wide pointer but the pointee `ty` is not `[T]`, `str`, or
+`dyn Trait`: `MirStepNode.unsupported` when `intrinsicTailMayBeUnsized` admits a
+custom dynamically sized type, and `MirStepNode.fail .ub` otherwise.
+
+Reference (`library/core/src/mem/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/mem/mod.rs#L412-L435>
+
+> "/// - If the unsized tail of `T` is:
+> ///     - a [slice], then the length of the slice tail must be an initialized
+> ///       integer, and the size of the *entire value*
+> ///       (dynamic tail length + statically sized prefix) must fit in `isize`."
+-/
+@[reducible]
+def intrinsicWidePointeeStep (ty : RigidTy) : MirStepNode :=
+  match intrinsicTailMayBeUnsized 8 ty with
+  | true => MirStepNode.unsupported
+  | false => MirStepNode.fail .ub
 
 /--
 Resolve the pointee `RigidTy` `T` for pointer-parameterized intrinsics
@@ -1638,6 +1776,12 @@ def writeIntrinsicScalarResult
 Evaluate a value-returning `RustIntrinsicKind` (all variants except
 `.constEvalSelect`) from evaluated argument values `argVals`.
 
+Malformed argument lists and values fault with `.ub`. An intrinsic whose result
+depends on the signedness of an integer type parameter steps to
+`MirStepNode.unsupported` when `resolveIntrinsicIsSigned` or
+`resolveIntrinsicShiftSigned` cannot determine it, rather than assuming an
+unsigned type.
+
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1-L80>
@@ -1732,76 +1876,95 @@ def evalNonSelectIntrinsicCall
   | .saturatingAdd =>
     match argVals with
     | .scalar lhs :: .scalar rhs :: .nil =>
-      let isSigned := resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps
-      writeIntrinsicScalarResult s locals' destination targetBb
-        (evalSaturatingAdd lhs rhs isSigned)
+      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
+      | .some isSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalSaturatingAdd lhs rhs isSigned)
+      | .none => MirStepNode.unsupported
     | _ => MirStepNode.fail .ub
   | .saturatingSub =>
     match argVals with
     | .scalar lhs :: .scalar rhs :: .nil =>
-      let isSigned := resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps
-      writeIntrinsicScalarResult s locals' destination targetBb
-        (evalSaturatingSub lhs rhs isSigned)
+      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
+      | .some isSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalSaturatingSub lhs rhs isSigned)
+      | .none => MirStepNode.unsupported
     | _ => MirStepNode.fail .ub
   | .uncheckedShl =>
     match argVals with
     | .scalar lhs :: .scalar rhs :: .nil =>
-      let rhsSigned :=
-        resolveIntrinsicShiftSigned target bodyLocalDecls bodyLayouts argOps
-      writeIntrinsicScalarResult s locals' destination targetBb
-        (evalUncheckedShl lhs rhs rhsSigned)
+      match resolveIntrinsicShiftSigned target bodyLocalDecls bodyLayouts argOps with
+      | .some rhsSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalUncheckedShl lhs rhs rhsSigned)
+      | .none => MirStepNode.unsupported
     | _ => MirStepNode.fail .ub
   | .uncheckedShr =>
     match argVals with
     | .scalar lhs :: .scalar rhs :: .nil =>
-      let lhsSigned :=
-        resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps
-      let rhsSigned :=
+      match
+        resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps,
         resolveIntrinsicShiftSigned target bodyLocalDecls bodyLayouts argOps
-      writeIntrinsicScalarResult s locals' destination targetBb
-        (evalUncheckedShr lhs rhs lhsSigned rhsSigned)
+      with
+      | .some lhsSigned, .some rhsSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalUncheckedShr lhs rhs lhsSigned rhsSigned)
+      | _, _ => MirStepNode.unsupported
     | _ => MirStepNode.fail .ub
   | .uncheckedAdd =>
     match argVals with
     | .scalar lhs :: .scalar rhs :: .nil =>
-      let isSigned := resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps
-      writeIntrinsicScalarResult s locals' destination targetBb
-        (evalUncheckedAdd lhs rhs isSigned)
+      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
+      | .some isSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalUncheckedAdd lhs rhs isSigned)
+      | .none => MirStepNode.unsupported
     | _ => MirStepNode.fail .ub
   | .uncheckedSub =>
     match argVals with
     | .scalar lhs :: .scalar rhs :: .nil =>
-      let isSigned := resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps
-      writeIntrinsicScalarResult s locals' destination targetBb
-        (evalUncheckedSub lhs rhs isSigned)
+      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
+      | .some isSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalUncheckedSub lhs rhs isSigned)
+      | .none => MirStepNode.unsupported
     | _ => MirStepNode.fail .ub
   | .uncheckedMul =>
     match argVals with
     | .scalar lhs :: .scalar rhs :: .nil =>
-      let isSigned := resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps
-      writeIntrinsicScalarResult s locals' destination targetBb
-        (evalUncheckedMul lhs rhs isSigned)
+      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
+      | .some isSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalUncheckedMul lhs rhs isSigned)
+      | .none => MirStepNode.unsupported
     | _ => MirStepNode.fail .ub
   | .uncheckedDiv =>
     match argVals with
     | .scalar lhs :: .scalar rhs :: .nil =>
-      let isSigned := resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps
-      writeIntrinsicScalarResult s locals' destination targetBb
-        (evalUncheckedDiv lhs rhs isSigned)
+      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
+      | .some isSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalUncheckedDiv lhs rhs isSigned)
+      | .none => MirStepNode.unsupported
     | _ => MirStepNode.fail .ub
   | .uncheckedRem =>
     match argVals with
     | .scalar lhs :: .scalar rhs :: .nil =>
-      let isSigned := resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps
-      writeIntrinsicScalarResult s locals' destination targetBb
-        (evalUncheckedRem lhs rhs isSigned)
+      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
+      | .some isSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalUncheckedRem lhs rhs isSigned)
+      | .none => MirStepNode.unsupported
     | _ => MirStepNode.fail .ub
   | .threeWayCompare =>
     match argVals with
     | .scalar lhs :: .scalar rhs :: .nil =>
-      let isSigned := resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps
-      writeIntrinsicScalarResult s locals' destination targetBb
-        (evalThreeWayCompare lhs rhs isSigned)
+      match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps (allowChar := true) with
+      | .some isSigned =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalThreeWayCompare lhs rhs isSigned)
+      | .none => MirStepNode.unsupported
     | _ => MirStepNode.fail .ub
   | .sizeOfVal =>
     match argVals with
@@ -1843,13 +2006,20 @@ def evalNonSelectIntrinsicCall
           match Nat.beq ptrSz 8 with
           | false => MirStepNode.fail .ub
           | true =>
-            match intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts pointeeTy with
-            | .some sz =>
-              match Nat.ble (signedHalfModulus 8) sz with
-              | true => MirStepNode.fail .ub
-              | false =>
-                writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨sz, 8⟩)
-            | .none => intrinsicUnresolvedLayoutStep pointeeTy
+            match intrinsicTailIsExtern 8 pointeeTy with
+            | true => MirStepNode.unsupported
+            | false =>
+              match intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts pointeeTy with
+              | .some sz =>
+                match Nat.ble (signedHalfModulus 8) sz with
+                | true => MirStepNode.fail .ub
+                | false =>
+                  writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨sz, 8⟩)
+              | .none => intrinsicUnresolvedLayoutStep pointeeTy
+        | .aggregate 0 (.ptr _ ptrSz :: _ :: .nil) =>
+          match Nat.beq ptrSz 8 with
+          | false => MirStepNode.fail .ub
+          | true => intrinsicWidePointeeStep pointeeTy
         | _ => MirStepNode.fail .ub
       | .none => MirStepNode.fail .ub
     | _ => MirStepNode.fail .ub
@@ -1857,25 +2027,37 @@ def evalNonSelectIntrinsicCall
     match argVals with
     | ptrArgVal :: .nil =>
       match resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+      -- `align_of_val` has the same safety conditions as `size_of_val`: the
+      -- slice's total size must fit in `isize` even though only the element
+      -- alignment is returned.
       | .some (.slice elemTy) =>
         match ptrArgVal with
         | .aggregate 0 (.ptr _ ptrSz :: .scalar lenSc :: .nil) =>
-          match Bool.and (Nat.beq ptrSz 8) (Nat.beq lenSc.sizeBytes 8) with
+          match Nat.beq ptrSz 8 with
           | false => MirStepNode.fail .ub
           | true =>
-            match intrinsicRigidTyAlign bodyLocalDecls bodyLayouts elemTy with
-            | .some alignBytes =>
-              writeIntrinsicReturn s locals' destination targetBb
-                (.scalar ⟨alignBytes, 8⟩)
-            | .none => intrinsicUnresolvedLayoutStep elemTy
+            match
+              intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy,
+              intrinsicRigidTyAlign bodyLocalDecls bodyLayouts elemTy
+            with
+            | .some elemSz, .some alignBytes =>
+              match evalSliceSizeOfVal elemSz lenSc with
+              | .some _ =>
+                writeIntrinsicReturn s locals' destination targetBb
+                  (.scalar ⟨alignBytes, 8⟩)
+              | .none => MirStepNode.fail .ub
+            | _, _ => intrinsicUnresolvedLayoutStep elemTy
         | _ => MirStepNode.fail .ub
       | .some .str =>
         match ptrArgVal with
         | .aggregate 0 (.ptr _ ptrSz :: .scalar lenSc :: .nil) =>
-          match Bool.and (Nat.beq ptrSz 8) (Nat.beq lenSc.sizeBytes 8) with
+          match Nat.beq ptrSz 8 with
           | false => MirStepNode.fail .ub
           | true =>
-            writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨1, 8⟩)
+            match evalSliceSizeOfVal 1 lenSc with
+            | .some _ =>
+              writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨1, 8⟩)
+            | .none => MirStepNode.fail .ub
         | _ => MirStepNode.fail .ub
       -- The alignment of a `dyn Trait` value is read from its vtable, which the
       -- model does not track; malformed non-wide pointers still fault with `.ub`.
@@ -1892,11 +2074,18 @@ def evalNonSelectIntrinsicCall
           match Nat.beq ptrSz 8 with
           | false => MirStepNode.fail .ub
           | true =>
-            match intrinsicRigidTyAlign bodyLocalDecls bodyLayouts pointeeTy with
-            | .some alignBytes =>
-              writeIntrinsicReturn s locals' destination targetBb
-                (.scalar ⟨alignBytes, 8⟩)
-            | .none => intrinsicUnresolvedLayoutStep pointeeTy
+            match intrinsicTailIsExtern 8 pointeeTy with
+            | true => MirStepNode.unsupported
+            | false =>
+              match intrinsicRigidTyAlign bodyLocalDecls bodyLayouts pointeeTy with
+              | .some alignBytes =>
+                writeIntrinsicReturn s locals' destination targetBb
+                  (.scalar ⟨alignBytes, 8⟩)
+              | .none => intrinsicUnresolvedLayoutStep pointeeTy
+        | .aggregate 0 (.ptr _ ptrSz :: _ :: .nil) =>
+          match Nat.beq ptrSz 8 with
+          | false => MirStepNode.fail .ub
+          | true => intrinsicWidePointeeStep pointeeTy
         | _ => MirStepNode.fail .ub
       | .none => MirStepNode.fail .ub
     | _ => MirStepNode.fail .ub
@@ -2138,14 +2327,15 @@ def evalDirectRustIntrinsic?
                  | true =>
                    match unpackedArgs with
                    | .scalar lhs :: .scalar rhs :: .nil =>
-                     let isSigned :=
-                       resolveIntrinsicIsSigned rtTarget bodyLocalDecls bodyLayouts .nil
-                     writeIntrinsicScalarResult
-                       s
-                       locals'
-                       destination
-                       targetBb
-                       (evalExactDiv lhs rhs isSigned)
+                     match resolveIntrinsicIsSigned rtTarget bodyLocalDecls bodyLayouts .nil with
+                     | .none => MirStepNode.unsupported
+                     | .some isSigned =>
+                       writeIntrinsicScalarResult
+                         s
+                         locals'
+                         destination
+                         targetBb
+                         (evalExactDiv lhs rhs isSigned)
                    | _ => MirStepNode.fail .ub
                  | false =>
                    match classifyRustIntrinsic? rtTarget.defPath with
@@ -2404,28 +2594,31 @@ def evalTerminator
           | true =>
             match argVals with
             | .scalar lhs :: .scalar rhs :: .nil =>
-              let isSigned :=
+              match
                 resolveIntrinsicIsSigned
                   target
                   bodyLocalDecls
                   bodyLayouts
                   argOps
-              match evalExactDiv lhs rhs isSigned with
-              | .some retScalar =>
-                match writePlaceValue locals' s.memory.borrows destination (.scalar retScalar) with
-                | .ok updatedLocals =>
-                  MirStepNode.step {
-                    frame := {
-                      s.frame with
-                      blockIdx := targetBb
-                      stmtIdx := 0
-                      locals := updatedLocals
+              with
+              | .none => MirStepNode.unsupported
+              | .some isSigned =>
+                match evalExactDiv lhs rhs isSigned with
+                | .some retScalar =>
+                  match writePlaceValue locals' s.memory.borrows destination (.scalar retScalar) with
+                  | .ok updatedLocals =>
+                    MirStepNode.step {
+                      frame := {
+                        s.frame with
+                        blockIdx := targetBb
+                        stmtIdx := 0
+                        locals := updatedLocals
+                      }
+                      memory := s.memory
                     }
-                    memory := s.memory
-                  }
-                | .ub => MirStepNode.fail .ub
-                | .unsupported => MirStepNode.unsupported
-              | .none => MirStepNode.fail .ub
+                  | .ub => MirStepNode.fail .ub
+                  | .unsupported => MirStepNode.unsupported
+                | .none => MirStepNode.fail .ub
             | _ => MirStepNode.fail .ub
           | false =>
             match target.isIndirect with

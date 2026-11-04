@@ -36,7 +36,9 @@ mod tests {
         parse_capture_filter, run_with_args, run_with_args_and_filter,
         should_run_capture_for_args,
     };
-    use crate::rustc_2026_06_01::mir_lower::is_unnamed_const_def_path;
+    use crate::rustc_2026_06_01::mir_lower::{
+        is_unnamed_const_def_path, verification_runtime_check_value,
+    };
 
     fn unique_temp_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -758,6 +760,94 @@ pub fn __anodized_fn_requires___anneal_unsafe_impl_TrustedZeroable_for_NonZeroCo
             disambiguate_identifier("Zerocopy_impl_foo", &mut used, &mut counts),
             "Zerocopy_impl_foo_3"
         );
+    }
+
+    #[test]
+    fn runtime_checks_fix_ub_checks_true_and_keep_session_flags() {
+        use rustc_middle::mir::RuntimeChecks;
+
+        // The verification policy ignores the session for `UbChecks` and
+        // defers to it for the other runtime checks.
+        assert!(verification_runtime_check_value(RuntimeChecks::UbChecks, |_| false));
+        assert!(!verification_runtime_check_value(RuntimeChecks::OverflowChecks, |_| false));
+        assert!(verification_runtime_check_value(RuntimeChecks::OverflowChecks, |_| true));
+        assert!(!verification_runtime_check_value(RuntimeChecks::ContractChecks, |_| false));
+
+        // End to end: with debug assertions and overflow checks disabled,
+        // `rustc` evaluates both operands to `false`. `-Zmir-opt-level=0` keeps
+        // `InstSimplify` from folding the `UbChecks` operand before capture, as
+        // `#![rustc_preserve_ub_checks]` does for `core`.
+        let temp_root = unique_temp_dir("runtime-checks");
+        let capture_dir = temp_root.join("capture");
+        let out_dir = temp_root.join("out");
+        fs::create_dir_all(&capture_dir).expect("create capture dir");
+        fs::create_dir_all(&out_dir).expect("create out dir");
+
+        let src_path = temp_root.join("rt_checks.rs");
+        let sample_rust = r#"#![allow(internal_features)]
+#![feature(core_intrinsics)]
+
+pub fn ub_checks_flag() -> bool {
+    core::intrinsics::ub_checks()
+}
+
+pub fn overflow_checks_flag() -> bool {
+    core::intrinsics::overflow_checks()
+}
+"#;
+        fs::write(&src_path, sample_rust.as_bytes()).expect("write rt_checks.rs");
+
+        let args = vec![
+            "anneal-rustc-capture".to_owned(),
+            "rustc".to_owned(),
+            "--crate-name".to_owned(),
+            "rt_checks".to_owned(),
+            "--crate-type".to_owned(),
+            "lib".to_owned(),
+            "--edition=2024".to_owned(),
+            "-Zmir-opt-level=0".to_owned(),
+            "-Cdebug-assertions=off".to_owned(),
+            "-Coverflow-checks=off".to_owned(),
+            "--out-dir".to_owned(),
+            out_dir.to_string_lossy().into_owned(),
+            src_path.to_string_lossy().into_owned(),
+        ];
+
+        let code = run_with_args(&args, Some(capture_dir.clone()), None);
+        assert_eq!(code, 0, "expected run_with_args to succeed with exit code 0");
+
+        let manifest_path = capture_dir.join("rt_checks").join("UnitCaptureManifest.json");
+        let manifest_json =
+            fs::read_to_string(&manifest_path).expect("read UnitCaptureManifest.json");
+        let parsed = UnitCaptureManifest::from_json_str(&manifest_json)
+            .expect("parse UnitCaptureManifest.json");
+        assert!(parsed.compilation_succeeded);
+
+        let read_mir_module = |def_id: &str| -> String {
+            let record = parsed
+                .unit_targets
+                .iter()
+                .find(|t| t.target.def_id == def_id)
+                .unwrap_or_else(|| panic!("find {def_id} in UnitCaptureManifest"));
+            let lean_path = capture_dir
+                .join("rt_checks")
+                .join(&record.target.mir_module_path);
+            fs::read_to_string(&lean_path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", lean_path.display()))
+        };
+
+        let true_const = "(ConstValue.scalar (ConstScalar.int { bits := 1, sizeBytes := 1 }))";
+        let false_const = "(ConstValue.scalar (ConstScalar.int { bits := 0, sizeBytes := 1 }))";
+
+        let ub_lean = read_mir_module("rt_checks::ub_checks_flag");
+        assert!(ub_lean.contains(true_const), "ub_checks_flag:\n{ub_lean}");
+        assert!(!ub_lean.contains(false_const), "ub_checks_flag:\n{ub_lean}");
+
+        let overflow_lean = read_mir_module("rt_checks::overflow_checks_flag");
+        assert!(overflow_lean.contains(false_const), "overflow_checks_flag:\n{overflow_lean}");
+        assert!(!overflow_lean.contains(true_const), "overflow_checks_flag:\n{overflow_lean}");
+
+        let _ = fs::remove_dir_all(&temp_root);
     }
 
     #[test]

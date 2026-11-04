@@ -2021,6 +2021,11 @@ for `core::intrinsics::size_of_val` from its 8-byte fat-pointer length metadata
 `lenSc`, returning `.none` (undefined behavior) if `lenSc.sizeBytes != 8` or if
 `elemSizeBytes * len` exceeds `isize::MAX` (`>= 2^63 = signedHalfModulus 8`).
 
+`core::intrinsics::align_of_val` performs the same check before returning the
+element alignment: `align_of_val_raw` has the same safety conditions as
+`size_of_val_raw`, and the CTFE interpreter computes both results with one
+function that rejects a slice larger than `isize::MAX` bytes.
+
 Reference (`library/core/src/intrinsics/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2850-L2861>
@@ -2030,6 +2035,18 @@ Reference (`library/core/src/intrinsics/mod.rs` at commit
 > #[rustc_intrinsic]
 > #[rustc_intrinsic_const_stable_indirect]
 > pub const unsafe fn size_of_val<T: ?Sized>(ptr: *const T) -> usize;"
+
+Reference (`library/core/src/mem/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/mem/mod.rs#L560-L579>
+
+> "/// This function is only safe to call if the following conditions hold:
+> ///
+> /// - If `T` is `Sized`, this function is always safe to call.
+> /// - If the unsized tail of `T` is:
+> ///     - a [slice], then the length of the slice tail must be an initialized
+> ///       integer, and the size of the *entire value*
+> ///       (dynamic tail length + statically sized prefix) must fit in `isize`."
 -/
 @[reducible]
 def evalSliceSizeOfVal
