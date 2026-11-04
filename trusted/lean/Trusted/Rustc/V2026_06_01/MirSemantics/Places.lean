@@ -2365,6 +2365,16 @@ uninstantiated `CapturedMir` body together with its effective `typeArgs`:
      whose `traitRef.args` is an instance of every matched entry's
      `traitRef.args` (never falling back to a default trait method body when a
      matching override is unlinked, has mismatched arity, or is ambiguous).
+     A winning entry whose `implPath` is `defPath` itself records an `impl`
+     that inherits the trait's default method body; that body is generic over
+     `Self`, so it resolves with the full call-site `typeArgs`.
+
+Header matching ignores `impl` where-clauses. The `TraitImplEntry` table is
+therefore trusted to be complete: if a where-clause-bounded generic `impl`
+(such as `impl<T: Copy> Trait for T`) overrides `defPath`, every more specific
+`impl` that inherits the default method instead needs its own
+`implPath := defPath` entry, or calls on that `impl`'s `Self` resolve to the
+generic override.
 
 Reference (The Rust Reference, "Trait implementations"):
 <https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
@@ -2413,8 +2423,12 @@ def resolveCalleeBodyAndArgs?
       | (winnerEntry, Option.some implTypeArgs) :: .nil =>
         match findCallee? callees winnerEntry.implPath with
         | Option.some c =>
-          if implTypeArgs.length == c.typeParamCount then
-            Option.some (c, implTypeArgs)
+          let effectiveTypeArgs :=
+            match stringEq winnerEntry.implPath defPath with
+            | true => firstArg :: restArgs
+            | false => implTypeArgs
+          if effectiveTypeArgs.length == c.typeParamCount then
+            Option.some (c, effectiveTypeArgs)
           else
             Option.none
         | Option.none => Option.none

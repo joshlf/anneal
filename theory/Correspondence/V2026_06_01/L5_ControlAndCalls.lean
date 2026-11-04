@@ -1,5 +1,6 @@
 import Trusted.Rustc.V2026_06_01.MirSemantics.Statements
 import Trusted.Rustc.V2026_06_01.MirSemantics.Terminators
+import Trusted.Rustc.V2026_06_01.MirSemantics.Machine
 import MiniRust.LibSpecr
 import MiniRust.Snapshots.S2026_05_Matched.Generated.Ops
 import Correspondence.Framework
@@ -1241,6 +1242,78 @@ theorem mir_evalTerminator_trait_method_dispatch
       .some [(0, .uint .u32)] ∧
     s.frame.blockIdx = s.frame.blockIdx := by
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/--
+End-to-end characterization of `TraitImplEntry` tables that record inherited
+default methods and of trait dispatch through the subject body's own
+`traitImpls`:
+1. An entry whose `implPath` is the trait method's own `defPath` records an
+   `impl` that inherits the default body. Because its header is more specific
+   than an overriding blanket `impl<T> Describe for T`, `<u32 as Describe>::describe`
+   resolves to the default body instantiated with `Self = u32` in either entry
+   order, while `<u64 as Describe>::describe` still resolves to the blanket
+   override. Without the inherit entry, the blanket override wins for `u32`
+   (where-clauses are not modeled, so the table must list inherited defaults).
+2. `initMachineStateWithCallees` seeds `Memory.traitImpls` with the subject's
+   `traitImpls`, so the subject's call to `MyTrait::compute::<u32>` steps into
+   the override `monoIdCallee` even though the default trait method body
+   `test::MyTrait::compute` is also linked in `callees`.
+-/
+theorem mir_evalTerminator_inherited_default_and_subject_traitImpls_dispatch :
+    let blanketDescribeEntry : TraitImplEntry :=
+      { traitRef :=
+          { defPath := "test::Describe::describe"
+            args := [.param 0 "T"] }
+        implPath := "test::id" }
+    let u32InheritsDefaultEntry : TraitImplEntry :=
+      { traitRef :=
+          { defPath := "test::Describe::describe"
+            args := [.uint .u32] }
+        implPath := "test::Describe::describe" }
+    let defaultDescribeCallee : CapturedMir :=
+      { polyIdCallee with defPath := "test::Describe::describe" }
+    let monoImplEntry : TraitImplEntry :=
+      { traitRef :=
+          { defPath := "test::MyTrait::compute"
+            args := [.uint .u32] }
+        implPath := "test::mono_id" }
+    let defaultComputeCallee : CapturedMir :=
+      { polyIdCallee with defPath := "test::MyTrait::compute" }
+    let computeU32Op : Operand :=
+      .constant
+        { ty := { kind := .fnDef "test::MyTrait::compute" [.uint .u32], layoutIdx := 0 }
+          val := .zeroSized }
+    let callComputeTerm : Terminator :=
+      ⟨.call computeU32Op [.copy ⟨1, .nil⟩] ⟨0, .nil⟩ (.some 1) .continue_, "call_compute"⟩
+    let subjectBody : CapturedMir :=
+      { monoIdCallee with
+        defPath := "test::subject"
+        basicBlocks :=
+          [ { statements := .nil, terminator := callComputeTerm, isCleanup := false },
+            { statements := .nil, terminator := { kind := .return_, span := "subject" }, isCleanup := false } ]
+        traitImpls := [monoImplEntry] }
+    let s0 : MachineState :=
+      initMachineStateWithCallees subjectBody [.scalar ⟨42, 4⟩] [defaultComputeCallee, monoIdCallee]
+    lookupCallee [defaultDescribeCallee, polyIdCallee] emptyLayoutTable
+      "test::Describe::describe" [.uint .u32] [blanketDescribeEntry, u32InheritsDefaultEntry] =
+      .some (defaultDescribeCallee.instantiate [(.uint .u32, polyU32Layout)]) ∧
+    lookupCallee [defaultDescribeCallee, polyIdCallee] emptyLayoutTable
+      "test::Describe::describe" [.uint .u32] [u32InheritsDefaultEntry, blanketDescribeEntry] =
+      .some (defaultDescribeCallee.instantiate [(.uint .u32, polyU32Layout)]) ∧
+    lookupCallee [defaultDescribeCallee, polyIdCallee] emptyLayoutTable
+      "test::Describe::describe" [.uint .u64] [blanketDescribeEntry, u32InheritsDefaultEntry] =
+      .some (polyIdCallee.instantiate [(.uint .u64, polyU64Layout)]) ∧
+    lookupCallee [defaultDescribeCallee, polyIdCallee] emptyLayoutTable
+      "test::Describe::describe" [.uint .u32] [blanketDescribeEntry] =
+      .some (polyIdCallee.instantiate [(.uint .u32, polyU32Layout)]) ∧
+    lookupCallee [polyIdCallee] emptyLayoutTable
+      "test::Describe::describe" [.uint .u32] [blanketDescribeEntry, u32InheritsDefaultEntry] =
+      .none ∧
+    s0.memory.traitImpls = [monoImplEntry] ∧
+    stepMirFn subjectBody s0 =
+      MirStepNode.step
+        (pushCalleeFrame s0 subjectBody s0.frame.locals ⟨0, .nil⟩ 1 monoIdCallee [.scalar ⟨42, 4⟩]) := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /--
 Universal theorem that when `Self` in a trait-method call `(traitMethodDefPath, typeArgs)`

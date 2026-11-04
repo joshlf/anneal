@@ -37,9 +37,11 @@ and proves step simulation and `Trusted.Refinement.GuardedRefines` against MiniR
 /-! ## 1. Initial Machine Configuration Correspondence -/
 
 /-- Universal characterization of `initMachineState` and `initMachineStateWithCallees`
-(`Machine.lean:42-91` vs. `spec/lang/machine.md:120-165`): both initialize the
+(`Machine.lean:42-95` vs. `spec/lang/machine.md:120-165`): both initialize the
 entry stack frame at `blockIdx = 0` and `stmtIdx = 0` with `callStack = []`,
-`activeCallee = none`, and initial borrow tag counter `nextTag = 1`. -/
+`activeCallee = none`, and initial borrow tag counter `nextTag = 1`;
+`initMachineStateWithCallees` also seeds `Memory.traitImpls` with
+`body.traitImpls`. -/
 theorem mir_initMachineState_pc_zero
     (body : CapturedMir) (args : List Value) (callees : List CapturedMir) :
     (initMachineState body args).frame.blockIdx = 0 ∧
@@ -52,8 +54,9 @@ theorem mir_initMachineState_pc_zero
     (initMachineStateWithCallees body args callees).memory.callStack = [] ∧
     (initMachineStateWithCallees body args callees).memory.activeCallee = none ∧
     (initMachineStateWithCallees body args callees).memory.nextTag = 1 ∧
-    (initMachineStateWithCallees body args callees).memory.callees = callees := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+    (initMachineStateWithCallees body args callees).memory.callees = callees ∧
+    (initMachineStateWithCallees body args callees).memory.traitImpls = body.traitImpls := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ## 2. Program-Counter Statement-vs-Terminator Dispatch Correspondence -/
 

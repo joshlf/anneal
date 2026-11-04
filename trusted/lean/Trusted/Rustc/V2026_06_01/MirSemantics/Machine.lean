@@ -59,6 +59,9 @@ def initMachineState (body : CapturedMir) (args : List Value) : MachineState :=
 /--
 Initial `MachineState` for a `CapturedMir` body with argument values `args` and
 available callee bodies `callees` for inline `TerminatorKind.call` resolution.
+`Memory.traitImpls` starts as `body.traitImpls`: `lookupCallee` otherwise reads
+`TraitImplEntry` records only from bodies in `callees`, so trait-method calls
+made by `body` itself would ignore the implementations recorded on `body`.
 
 Reference (The Rust Reference, "Call expressions"):
 <https://doc.rust-lang.org/1.98.0/reference/expressions/call-expr.html>
@@ -87,6 +90,7 @@ def initMachineStateWithCallees
       callees := callees
       callStack := []
       activeCallee := none
+      traitImpls := body.traitImpls
     }
   }
 
