@@ -799,8 +799,9 @@ def evalStmt
     | .ok ptrOrFatVal locals' =>
       match extractDerefPtrVal? ptrOrFatVal with
       | .some ptrVal =>
+        let placeTyOpt := placeTy localDecls layouts place
         let isMutRefPlace :=
-          match placeTy localDecls layouts place with
+          match placeTyOpt with
           | .some { kind := .ref .mut _, .. } => true
           | _ => false
         match lookupBorrow s.memory.borrows ptrVal.tag with
@@ -836,9 +837,32 @@ def evalStmt
             let boundsOk :=
               match ptrOrFatVal with
               | .aggregate 0 (.ptr p 8 :: .scalar lenSc :: .nil) =>
-                Nat.ble (Nat.add p.offsetBytes lenSc.bits) (length alloc.bytes)
+                let elemSz :=
+                  match placeTyOpt with
+                  | .some { kind := .ref _ (.slice ek), .. } =>
+                    match rigidTyByteSize layouts { kind := ek, layoutIdx := 0 } with
+                    | .some n => n
+                    | .none => 1
+                  | .some { kind := .rawPtr _ (.slice ek), .. } =>
+                    match rigidTyByteSize layouts { kind := ek, layoutIdx := 0 } with
+                    | .some n => n
+                    | .none => 1
+                  | _ => 1
+                Nat.ble
+                  (Nat.add p.offsetBytes (Nat.mul lenSc.bits elemSz))
+                  (length alloc.bytes)
               | _ =>
-                Nat.ble ptrVal.offsetBytes (length alloc.bytes)
+                let pointeeBytes :=
+                  match placeTyOpt with
+                  | .some pTy =>
+                    match pointeeTyOf pTy with
+                    | .some innerTy =>
+                      match rigidTyByteSize layouts innerTy with
+                      | .some n => n
+                      | .none => 0
+                    | .none => 0
+                  | .none => 0
+                Nat.ble (Nat.add ptrVal.offsetBytes pointeeBytes) (length alloc.bytes)
             match Bool.and mutOk boundsOk with
             | true => MirStepNode.step (advanceStmt s locals')
             | false => MirStepNode.fail .ub
@@ -1004,11 +1028,7 @@ def evalStmt
             with
             | .ok callerLocals' =>
               let borrows' :=
-                invalidateDerefWriteBorrows
-                  locals₁
-                  mem₁.borrows
-                  dst
-                  restProj
+                invalidateDerefWriteBorrows locals₁ mem₁.borrows dst restProj
               MirStepNode.step
                 (advanceStmt
                   s

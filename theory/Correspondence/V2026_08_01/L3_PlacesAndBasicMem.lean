@@ -582,15 +582,15 @@ theorem mir_unsize_array_to_slice_coercion_corresponds
   · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
       evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy,
       resolveProjectedTy, layoutPointerBytes, evalOperand,
-      readProjectedValue, get?, h_elem_eq]
+      readProjectedValue, get?, h_no_borrow, h_elem_eq]
   · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
       evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy,
       resolveProjectedTy, layoutPointerBytes, evalOperand,
-      readProjectedValue, get?, h_elem_eq]
+      readProjectedValue, get?, h_no_borrow, h_elem_eq]
   · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
       evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy,
       resolveProjectedTy, layoutPointerBytes, evalOperand,
-      readProjectedValue, get?, h_elem_eq]
+      readProjectedValue, get?, h_no_borrow, h_elem_eq]
   · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
       evalUnsizeCoercion, lookupBorrow, evalOperand, readProjectedValue, get?]
   · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
@@ -598,7 +598,7 @@ theorem mir_unsize_array_to_slice_coercion_corresponds
       resolveProjectedTy, evalOperand, readProjectedValue, get?, h_no_borrow]
   · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
       evalUnsizeCoercion, operandTy, placeTy,
-      resolveProjectedTy, evalOperand, readProjectedValue, get?]
+      resolveProjectedTy, evalOperand, readProjectedValue, get?, h_no_borrow]
   · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
       evalUnsizeCoercion, evalOperand, readProjectedValue, get?]
 
@@ -926,5 +926,108 @@ theorem mir_subslice_disjoint_overlap_offset_borrow_and_unsize_mut_corresponds
     evalStmt sEmptyRetag { kind := .retag .default { local_ := 0, projection := .nil }, span := "" } =
       MirStepNode.step (advanceStmt sEmptyRetag sEmptyRetag.frame.locals) := by
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/--
+**Theorem L3.24 (`mir_b2_slice_stride_subslice_bounds_ptr_to_ptr_and_validity_corresponds`)**:
+Universal characterization of `B2` hardening for `BRIEF-1.4` in `V2026_08_01`.
+-/
+theorem mir_b2_slice_stride_subslice_bounds_ptr_to_ptr_and_validity_corresponds
+    (b0 b1 b2 b3 : UInt8) :
+    let u32Kind : RigidTy := .uint .u32
+    let u16Kind : RigidTy := .uint .u16
+    let u8Kind : RigidTy := .uint .u8
+    let rawMutSliceU32Ty : Ty := { kind := .rawPtr .mut (.slice u32Kind), layoutIdx := 0 }
+    let rawConstU32Ty : Ty := { kind := .rawPtr .not u32Kind, layoutIdx := 0 }
+    let rawMutArrU32Decl : List LocalDecl :=
+      [{ mutability := .not, ty := { kind := .rawPtr .mut (.array u32Kind 2), layoutIdx := 0 }, debugName := "" }]
+    let refSliceU32Decl : List LocalDecl :=
+      [{ mutability := .not, ty := { kind := .ref .not (.slice u32Kind), layoutIdx := 0 }, debugName := "" }]
+    let boolTy : Ty := { kind := .bool, layoutIdx := 0 }
+    let refBoolDecl : List LocalDecl :=
+      [{ mutability := .not, ty := { kind := .ref .not .bool, layoutIdx := 0 }, debugName := "" }]
+    let arrTuple2U8Ty : Ty :=
+      { kind := .array (.tuple [u8Kind, u8Kind]) 2, layoutIdx := 0 }
+    let alloc8 : CapturedAllocation := {
+      allocId := 7
+      bytes := [.some 1, .some 0, .some 0, .some 0, .some 2, .some 0, .some 0, .some 0]
+      relocations := .nil
+      align := ⟨4⟩
+      mutability := .not
+    }
+    let allocInvalidBool : CapturedAllocation := {
+      allocId := 9
+      bytes := [.some 2]
+      relocations := .nil
+      align := ⟨1⟩
+      mutability := .not
+    }
+    let memGlobal8 : Memory := { emptyMemory with globals := [alloc8] }
+    let globalSlice2U32 : Value :=
+      .aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨2, 8⟩]
+    let globalSlice3U32Oob : Value :=
+      .aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨3, 8⟩]
+    let arr4Val : Value :=
+      .aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩, .scalar ⟨40, 4⟩]
+    let slice0To2FatVal : Value :=
+      .aggregate 0 [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨2, 8⟩]
+    let borrowSlice0To2 : BorrowEntry :=
+      { tag := 1, targetLocal := 0, targetProjection := .nil, perm := .active }
+    let borrowSlice2To4 : BorrowEntry :=
+      { tag := 2, targetLocal := 0, targetProjection := [.subslice 2 4 false], perm := .frozen }
+    let frozenBorrow : BorrowEntry :=
+      { tag := 1, targetLocal := 0, targetProjection := .nil, perm := .frozen }
+    -- 1. Out-of-bounds nested .constantIndex (fromEnd = true, offset = 5, minLen = 5 > subLen = 2) does not wrap to index 0
+    normalizeSubsliceProjections [.subslice 1 3 false, .constantIndex 5 5 true] =
+      [.subslice 1 3 false, .constantIndex 5 5 true] ∧
+    readProjectedValue .nil arr4Val
+      (normalizeSubsliceProjections [.subslice 1 3 false, .constantIndex 5 5 true]) = .ub ∧
+    -- 2. Global slice borrow scales by elemSz = 4 (idx 1 -> offsetBytes = 4) and rejects 3 * 4 = 12 > 8 bytes
+    evalRvalue [.init globalSlice2U32]
+      (.ref .shared { local_ := 0, projection := [.deref, .constantIndex 1 0 false] })
+      memGlobal8 refSliceU32Decl =
+      .ok (.ptr { allocId := 7, offsetBytes := 4 } 8) [.init globalSlice2U32] memGlobal8 ∧
+    evalRvalue [.init globalSlice3U32Oob]
+      (.ref .shared { local_ := 0, projection := [.deref] })
+      memGlobal8 refSliceU32Decl = .ub ∧
+    evalRvalue [.init globalSlice2U32]
+      (.ref .shared { local_ := 0, projection := [.deref, .constantIndex 5 0 true] })
+      memGlobal8 refSliceU32Decl = .ub ∧
+    -- 3. 0-offset slice fat-pointer write (*s1 = ...) preserves disjoint borrow on [2..4)
+    invalidateDerefWriteBorrows
+      [.init arr4Val, .init slice0To2FatVal]
+      [borrowSlice0To2, borrowSlice2To4]
+      { local_ := 1, projection := [.deref] }
+      .nil =
+      [borrowSlice0To2, borrowSlice2To4] ∧
+    -- 4. Typed Unsize coercion to *mut [u32] rejects .frozen tag, and untyped Unsize on global 8-byte alloc -> len 4 &[u16]
+    evalRvalue [.init (.ptr { allocId := 1, offsetBytes := 0 } 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil }) rawMutSliceU32Ty)
+      { emptyMemory with borrows := [frozenBorrow] } rawMutArrU32Decl = .ub ∧
+    evalRvalue [.init (.ptr { allocId := 7, offsetBytes := 0 } 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
+        { kind := .ref .not (.slice u16Kind), layoutIdx := 0 })
+      memGlobal8 =
+      .ok (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])
+        [.init (.ptr { allocId := 7, offsetBytes := 0 } 8)] memGlobal8 ∧
+    -- 5. Fat-to-thin CastKind.ptrToPtr (slice::as_ptr) and thin UnOp.ptrMetadata
+    evalRvalue [.init globalSlice2U32]
+      (.cast .ptrToPtr (.copy { local_ := 0, projection := .nil }) rawConstU32Ty)
+      emptyMemory =
+      .ok (.ptr { allocId := 7, offsetBytes := 0 } 8) [.init globalSlice2U32] emptyMemory ∧
+    evalRvalue [.init (.ptr { allocId := 7, offsetBytes := 0 } 8)]
+      (.unaryOp .ptrMetadata (.copy { local_ := 0, projection := .nil }))
+      emptyMemory =
+      .ok .unit [.init (.ptr { allocId := 7, offsetBytes := 0 } 8)] emptyMemory ∧
+    -- 6. Invalid bool (byte 2) rejected in evalConstValue / evalPlaceRead, and [(u8, u8); 2] decoded
+    evalConstValue (.indirect 9 0) boolTy [allocInvalidBool] emptyLayoutTable = .none ∧
+    evalPlaceRead [.init (.ptr { allocId := 9, offsetBytes := 0 } 8)]
+      { local_ := 0, projection := [.deref] } .nil [allocInvalidBool] emptyLayoutTable .nil refBoolDecl = .ub ∧
+    decodeValueFromBytes defaultCodecFuel emptyLayoutTable arrTuple2U8Ty
+      [.init b0 .none, .init b1 .none, .init b2 .none, .init b3 .none] =
+      .some (.aggregate 0 [
+        .aggregate 0 [.scalar ⟨b0.toNat, 1⟩, .scalar ⟨b1.toNat, 1⟩],
+        .aggregate 0 [.scalar ⟨b2.toNat, 1⟩, .scalar ⟨b3.toNat, 1⟩]
+      ]) := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Correspondence.V2026_08_01.L3_PlacesAndBasicMem

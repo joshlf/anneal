@@ -1102,7 +1102,10 @@ def encodeValueToBytes :
                   match l.fields with
                   | .array stride _ => .some stride.bytes
                   | _ => .none
-                | .none => .none
+                | .none =>
+                  match elemKind with
+                  | .tuple ks => tupleFieldsByteSize ks
+                  | _ => .none
             match elemSzOpt with
             | .none => .none
             | .some elemSz =>
@@ -1433,7 +1436,10 @@ def decodeValueFromBytes :
               match l.fields with
               | .array stride _ => .some stride.bytes
               | _ => .none
-            | .none => .none
+            | .none =>
+              match elemKind with
+              | .tuple ks => tupleFieldsByteSize ks
+              | _ => .none
         match elemSzOpt with
         | .none => .none
         | .some elemSz =>
