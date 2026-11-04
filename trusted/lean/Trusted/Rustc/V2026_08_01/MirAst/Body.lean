@@ -912,6 +912,53 @@ def hasNonParamDeclAtIdx
     | false => hasNonParamDeclAtIdx args targetIdx rest
 
 /--
+Test whether any `LocalDecl` in `decls` whose `ty.layoutIdx` equals `targetIdx`
+has a compound parametric `RigidTy` under `args`.
+-/
+@[reducible]
+def hasCompoundParamDeclAtIdx
+    (args : TypeSubst)
+    (targetIdx : Nat) :
+    List LocalDecl → Bool
+  | .nil => false
+  | d :: rest =>
+    let isCompoundHere :=
+      Bool.and
+        (Nat.beq d.ty.layoutIdx targetIdx)
+        (RigidTy.isCompoundSubstParam args d.ty.kind)
+    match isCompoundHere with
+    | true => true
+    | false => hasCompoundParamDeclAtIdx args targetIdx rest
+
+/--
+Substitute `LayoutTable` entries referenced exclusively by `.param idx _`
+`LocalDecl`s (where no non-parametric or compound parametric `LocalDecl` shares
+`d.ty.layoutIdx`).
+-/
+@[reducible]
+def substituteDeclParamLayoutsAux
+    (allDecls : List LocalDecl)
+    (args : TypeSubst) :
+    List LocalDecl → List TypeLayout → List TypeLayout
+  | .nil, entries => entries
+  | d :: rest, entries =>
+    let entries' :=
+      match d.ty.kind with
+      | .param idx _ =>
+        match TypeSubst.lookup args idx with
+        | .none => entries
+        | .some (_, paramLayout) =>
+          match
+            Bool.or
+              (hasNonParamDeclAtIdx args d.ty.layoutIdx allDecls)
+              (hasCompoundParamDeclAtIdx args d.ty.layoutIdx allDecls)
+          with
+          | true => entries
+          | false => setTypeLayoutAt entries d.ty.layoutIdx paramLayout
+      | _ => entries
+    substituteDeclParamLayoutsAux allDecls args rest entries'
+
+/--
 Recompute `LayoutTable` entries referenced by compound parametric `LocalDecl`s
 (such as `(T, u32)`, `[T; N]`, `&T`, `*const T`, `Option<T>`, `Wrapper<T>`)
 whose layout slot `d.ty.layoutIdx` is dedicated to that parametric type.
@@ -925,7 +972,7 @@ def recomputeDeclCompoundLayoutsAux
   | .nil, entries => entries
   | d :: rest, entries =>
     let entries' :=
-      match RigidTy.hasSubstParam args d.ty.kind with
+      match RigidTy.isCompoundSubstParam args d.ty.kind with
       | false => entries
       | true =>
         match hasNonParamDeclAtIdx args d.ty.layoutIdx allDecls with
@@ -945,8 +992,8 @@ def recomputeDeclCompoundLayoutsAux
 
 /--
 Instantiate `tbl : LayoutTable` for a `CapturedMir` body with `localDecls` and
-`args : TypeSubst`, combining `LayoutTable.instantiate` with compound local
-layout recomputation.
+`args : TypeSubst`, combining `LayoutTable.instantiate` with local parameter
+slot substitution and compound local layout recomputation.
 -/
 @[reducible]
 def LayoutTable.instantiateForDecls
@@ -958,9 +1005,11 @@ def LayoutTable.instantiateForDecls
   | .nil => LayoutTable.instantiate tbl .nil
   | _ :: _ =>
     let base := LayoutTable.instantiate tbl args
+    let entriesWithParams :=
+      substituteDeclParamLayoutsAux localDecls args localDecls base.entries
     { base with
       entries :=
-        recomputeDeclCompoundLayoutsAux tbl localDecls args localDecls base.entries }
+        recomputeDeclCompoundLayoutsAux tbl localDecls args localDecls entriesWithParams }
 
 /--
 Universal identity theorem for `LayoutTable.instantiateForDecls` on `.nil`.
@@ -1179,6 +1228,67 @@ Universal identity theorem `instantiate_empty_id` over arbitrary
 @[simp]
 theorem instantiate_empty_id (m : CapturedMir) : m.instantiate .nil = m :=
   CapturedMir.instantiate_nil m
+
+/--
+`CapturedMir.instantiate` preserves `defPath` for all `m` and `args`.
+-/
+@[simp]
+theorem CapturedMir.instantiate_defPath
+    (m : CapturedMir)
+    (args : TypeSubst) :
+    (m.instantiate args).defPath = m.defPath :=
+  rfl
+
+/--
+`CapturedMir.instantiate` preserves `phase` for all `m` and `args`.
+-/
+@[simp]
+theorem CapturedMir.instantiate_phase
+    (m : CapturedMir)
+    (args : TypeSubst) :
+    (m.instantiate args).phase = m.phase :=
+  rfl
+
+/--
+`CapturedMir.instantiate` preserves `role` for all `m` and `args`.
+-/
+@[simp]
+theorem CapturedMir.instantiate_role
+    (m : CapturedMir)
+    (args : TypeSubst) :
+    (m.instantiate args).role = m.role :=
+  rfl
+
+/--
+`CapturedMir.instantiate` preserves `argCount` for all `m` and `args`.
+-/
+@[simp]
+theorem CapturedMir.instantiate_argCount
+    (m : CapturedMir)
+    (args : TypeSubst) :
+    (m.instantiate args).argCount = m.argCount :=
+  rfl
+
+/--
+`CapturedMir.instantiate` preserves `allocations` for all `m` and `args`.
+-/
+@[simp]
+theorem CapturedMir.instantiate_allocations
+    (m : CapturedMir)
+    (args : TypeSubst) :
+    (m.instantiate args).allocations = m.allocations :=
+  rfl
+
+/--
+`CapturedMir.instantiate` decrements `typeParamCount` by `TypeSubst.length args`.
+-/
+@[simp]
+theorem CapturedMir.instantiate_typeParamCount
+    (m : CapturedMir)
+    (args : TypeSubst) :
+    (m.instantiate args).typeParamCount =
+      Nat.sub m.typeParamCount (TypeSubst.length args) :=
+  rfl
 
 /--
 `CapturedMir.instantiate` preserves `CapturedMir.isRuntimePostCleanup` for all

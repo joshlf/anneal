@@ -923,23 +923,27 @@ def TypeLayout.recomputeFromFieldLayouts
           variants := .multiple tag tagField shapes' }
 
 /--
-Substitute placeholder parameter slots at indices `< paramLayouts.length` in
-`entries` before recomputing compound layouts that depend on those slots.
+Substitute placeholder parameter slots in `entries` with successive layouts from
+`paramLayouts` before recomputing compound layouts that depend on those slots.
+Only placeholder entries (`TypeLayout.isParamPlaceholder l = true`) advance the
+parameter index `paramIdx`, so concrete entries preceding or interleaved with
+placeholder slots are preserved without shifting parameter indices.
 -/
 @[reducible]
 def substitutePlaceholderEntries
     (paramLayouts : List TypeLayout) :
     Nat → List TypeLayout → List TypeLayout
   | _, .nil => .nil
-  | idx, l :: rest =>
-    let l' :=
-      match TypeLayout.isParamPlaceholder l with
-      | true =>
-        match Trusted.Sequence.get? paramLayouts idx with
+  | paramIdx, l :: rest =>
+    match TypeLayout.isParamPlaceholder l with
+    | true =>
+      let l' :=
+        match Trusted.Sequence.get? paramLayouts paramIdx with
         | .some pl => pl
         | .none => l
-      | false => l
-    l' :: substitutePlaceholderEntries paramLayouts (Nat.add idx 1) rest
+      l' :: substitutePlaceholderEntries paramLayouts (Nat.add paramIdx 1) rest
+    | false =>
+      l :: substitutePlaceholderEntries paramLayouts paramIdx rest
 
 /--
 Recompute all compound `TypeLayout` entries in `entries` using `extEntries`

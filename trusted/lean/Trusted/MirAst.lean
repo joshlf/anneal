@@ -52,6 +52,8 @@ namespace RigidTy
 export Trusted.Rustc.V2026_06_01.MirAst.RigidTy (
   instantiate instantiateList instantiate_nil instantiateList_nil
   instantiateList_nil_eq instantiate_empty_id hasSubstParam hasSubstParamList
+  isCompoundSubstParam instantiate_of_hasSubstParam_false
+  instantiateList_of_hasSubstParamList_false
   hasSubstParam_nil hasSubstParamList_nil computeLayout computeLayoutList
 )
 end RigidTy
@@ -66,6 +68,7 @@ end LayoutTable
 namespace Ty
 export Trusted.Rustc.V2026_06_01.MirAst.Ty (
   instantiate instantiate_nil instantiate_empty_id
+  instantiate_of_hasSubstParam_false
 )
 end Ty
 
@@ -178,6 +181,8 @@ namespace CapturedMir
 export Trusted.Rustc.V2026_06_01.MirAst.CapturedMir (
   getBlock? getLocalDecl? isRuntimePostCleanup wellFormed
   instantiate instantiate_nil instantiate_empty_id
+  instantiate_defPath instantiate_phase instantiate_role
+  instantiate_argCount instantiate_allocations instantiate_typeParamCount
   instantiate_isRuntimePostCleanup instantiate_localDecls_length
   instantiate_basicBlocks_length instantiate_wellFormed
 )

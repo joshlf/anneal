@@ -947,6 +947,23 @@ theorem polySwapPairU32Claim_verified : VerificationResult polySwapPairU32Claim 
   injection h_out with h_pair; injection h_pair with h_ret _
   exact h_ret.symm
 
+@[reducible]
+def defaultBoolTypeLayout : TypeLayout := {
+  size := { bytes := 1 }
+  align := { bytes := 1 }
+  backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 1 })
+  fields := .primitive
+  variants := .single 0
+  isUninhabited := false
+}
+
+@[reducible]
+def interleavedPolyLayoutTable : LayoutTable := {
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [defaultU32TypeLayout, paramTPlaceholderLayout]
+}
+
 theorem example_polymorphic_mir_instantiate_and_verify :
     polySwapPairMirBody.instantiate [] = polySwapPairMirBody ∧
     polySwapPairMirBody.wellFormed = true ∧
@@ -968,11 +985,14 @@ theorem example_polymorphic_mir_instantiate_and_verify :
          isUninhabited := false
          fieldLayouts := [] },
        defaultU32TypeLayout] ∧
+    (interleavedPolyLayoutTable.instantiate [(.bool, defaultBoolTypeLayout)]).entries =
+      [defaultU32TypeLayout, defaultBoolTypeLayout, defaultBoolTypeLayout] ∧
     polySwapPairU32MirBody.fnAbi.ret.layout.size = { bytes := 8 } ∧
     VerificationResult polySwapPairU32Claim :=
   ⟨CapturedMir.instantiate_nil polySwapPairMirBody,
    rfl,
    CapturedMir.instantiate_wellFormed polySwapPairMirBody [(.uint .u32, defaultU32TypeLayout)],
+   rfl,
    rfl,
    rfl,
    rfl,

@@ -835,7 +835,16 @@ def RigidTy.hasSubstParam (args : TypeSubst) : RigidTy → Bool
       (RigidTy.hasSubstParamList args inputs)
       (RigidTy.hasSubstParam args output)
   | .closure _ upvars => RigidTy.hasSubstParamList args upvars
-  | _ => false
+  | .bool => false
+  | .char => false
+  | .int _ => false
+  | .uint _ => false
+  | .float _ => false
+  | .never => false
+  | .str => false
+  | .dynamic _ => false
+  | .foreign _ => false
+  | .other _ => false
 
 /--
 Test whether any `RigidTy` in a list contains a resolved `.param`.
@@ -845,6 +854,107 @@ def RigidTy.hasSubstParamList (args : TypeSubst) : List RigidTy → Bool
   | .nil => false
   | t :: ts =>
     Bool.or (RigidTy.hasSubstParam args t) (RigidTy.hasSubstParamList args ts)
+end
+
+/--
+Test whether `k : RigidTy` is a non-`.param` compound type that contains at
+least one `.param idx _` resolved by `args`.
+-/
+@[reducible]
+def RigidTy.isCompoundSubstParam (args : TypeSubst) : RigidTy → Bool
+  | .param _ _ => false
+  | k => RigidTy.hasSubstParam args k
+
+/--
+Left projection for `Bool.or a b = false`.
+-/
+theorem bool_or_eq_false_left {a b : Bool} (h : Bool.or a b = false) :
+    a = false := by
+  cases a with
+  | false => rfl
+  | true => cases h
+
+/--
+Right projection for `Bool.or a b = false`.
+-/
+theorem bool_or_eq_false_right {a b : Bool} (h : Bool.or a b = false) :
+    b = false := by
+  cases a with
+  | false => exact h
+  | true => cases h
+
+mutual
+/--
+When `RigidTy.hasSubstParam args k = false`, `RigidTy.instantiate args k = k`.
+-/
+@[simp]
+theorem RigidTy.instantiate_of_hasSubstParam_false (args : TypeSubst) :
+    (k : RigidTy) → RigidTy.hasSubstParam args k = false →
+    RigidTy.instantiate args k = k
+  | .param idx _, h => by
+    dsimp [RigidTy.hasSubstParam, RigidTy.instantiate] at h ⊢
+    cases hLook : TypeSubst.lookup args idx with
+    | none => rfl
+    | some _ => rw [hLook] at h; cases h
+  | .alias defPath a, h =>
+    congrArg (RigidTy.alias defPath)
+      (RigidTy.instantiateList_of_hasSubstParamList_false args a h)
+  | .bool, _ => rfl
+  | .char, _ => rfl
+  | .int _, _ => rfl
+  | .uint _, _ => rfl
+  | .float _, _ => rfl
+  | .never, _ => rfl
+  | .str, _ => rfl
+  | .tuple fields, h =>
+    congrArg RigidTy.tuple
+      (RigidTy.instantiateList_of_hasSubstParamList_false args fields h)
+  | .array elem len, h =>
+    congrArg (RigidTy.array · len)
+      (RigidTy.instantiate_of_hasSubstParam_false args elem h)
+  | .slice elem, h =>
+    congrArg RigidTy.slice
+      (RigidTy.instantiate_of_hasSubstParam_false args elem h)
+  | .ref mutability pointee, h =>
+    congrArg (RigidTy.ref mutability)
+      (RigidTy.instantiate_of_hasSubstParam_false args pointee h)
+  | .rawPtr mutability pointee, h =>
+    congrArg (RigidTy.rawPtr mutability)
+      (RigidTy.instantiate_of_hasSubstParam_false args pointee h)
+  | .adt defPath a, h =>
+    congrArg (RigidTy.adt defPath)
+      (RigidTy.instantiateList_of_hasSubstParamList_false args a h)
+  | .fnDef defPath a, h =>
+    congrArg (RigidTy.fnDef defPath)
+      (RigidTy.instantiateList_of_hasSubstParamList_false args a h)
+  | .fnPtr inputs output _ _, h => by
+    dsimp [RigidTy.instantiate]
+    rw [RigidTy.instantiateList_of_hasSubstParamList_false args inputs
+          (bool_or_eq_false_left h),
+        RigidTy.instantiate_of_hasSubstParam_false args output
+          (bool_or_eq_false_right h)]
+  | .closure defPath upvars, h =>
+    congrArg (RigidTy.closure defPath)
+      (RigidTy.instantiateList_of_hasSubstParamList_false args upvars h)
+  | .dynamic _, _ => rfl
+  | .foreign _, _ => rfl
+  | .other _, _ => rfl
+
+/--
+When `RigidTy.hasSubstParamList args ks = false`,
+`RigidTy.instantiateList args ks = ks`.
+-/
+@[simp]
+theorem RigidTy.instantiateList_of_hasSubstParamList_false (args : TypeSubst) :
+    (ks : List RigidTy) → RigidTy.hasSubstParamList args ks = false →
+    RigidTy.instantiateList args ks = ks
+  | .nil, _ => rfl
+  | k :: ks, h =>
+    congrArg2 List.cons
+      (RigidTy.instantiate_of_hasSubstParam_false args k
+        (bool_or_eq_false_left h))
+      (RigidTy.instantiateList_of_hasSubstParamList_false args ks
+        (bool_or_eq_false_right h))
 end
 
 mutual
@@ -1247,6 +1357,32 @@ Alias for `Ty.instantiate_nil`.
 theorem Ty.instantiate_empty_id (tbl : LayoutTable) (ty : Ty) :
     Ty.instantiate tbl .nil ty = ty :=
   Ty.instantiate_nil tbl ty
+
+/--
+When `RigidTy.hasSubstParam args ty.kind = false`, `Ty.instantiate tbl args ty = ty`.
+-/
+@[simp]
+theorem Ty.instantiate_of_hasSubstParam_false
+    (tbl : LayoutTable)
+    (args : TypeSubst)
+    (ty : Ty)
+    (h : RigidTy.hasSubstParam args ty.kind = false) :
+    Ty.instantiate tbl args ty = ty := by
+  cases ty with
+  | mk kind layoutIdx =>
+    dsimp at h
+    have hKind : RigidTy.instantiate args kind = kind :=
+      RigidTy.instantiate_of_hasSubstParam_false args kind h
+    dsimp [Ty.instantiate]
+    rw [hKind]
+    clear hKind
+    cases kind with
+    | param idx name =>
+      dsimp [RigidTy.hasSubstParam] at h ⊢
+      cases hLook : TypeSubst.lookup args idx with
+      | none => rfl
+      | some _ => rw [hLook] at h; cases h
+    | _ => rfl
 
 /--
 Instantiate a `ConstOperand` by instantiating its `ty` field.
