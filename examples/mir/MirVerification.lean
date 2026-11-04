@@ -1671,6 +1671,10 @@ def rcMem : Memory := {
     { tag := 26
       targetLocal := 0
       targetProjection := [.field 5 { kind := .uint .usize, layoutIdx := 0 }]
+      perm := .frozen },
+    { tag := 27
+      targetLocal := 0
+      targetProjection := [.subslice 1 2 false]
       perm := .frozen }
   ]
   callerLocals := [
@@ -1896,6 +1900,9 @@ def rcRefUsizeTy : Ty := { kind := .ref .not (.uint .usize), layoutIdx := 1 }
 @[reducible]
 def rcRefOpaqueTy : Ty := { kind := .ref .not (.adt "demo::Opaque" []), layoutIdx := 1 }
 
+@[reducible]
+def rcRefSliceUsizeTy : Ty := { kind := .ref .not (.slice (.uint .usize)), layoutIdx := 2 }
+
 /--
 Kernel-checked validation of aggregates without captured field layouts and of
 references to borrowed sub-places:
@@ -1904,10 +1911,11 @@ references to borrowed sub-places:
    a `T` and is typed by its type argument.
 2. `struct Reordered { a: u8, b: u32 }` places `b` at offset `0`, so `b` is
    checked against the first `ScalarPair` component and `a` against the second.
-3. Borrowing the sub-place `usercopy.b` records the projection `[.field 1]`.
-   The projected caller value is validated against a known pointee type, a
-   pointee of unrecorded layout only requires the projection to resolve, and an
-   unresolvable projection is rejected in both cases.
+3. Borrowing the sub-place `usercopy.b` records the projection `[.field 1]`, and
+   borrowing a subslice records `[.subslice 1 2 false]`. The projected caller
+   value is validated against a known pointee or slice element type, a pointee
+   of unrecorded layout only requires the projection to resolve, and an
+   unresolvable projection or oversized subslice length is rejected.
 -/
 theorem example_layoutless_fields_and_subplace_borrows :
     argsMatchSignature (mkRcBody [rcCellU32Ty] rcUsizeTy)
@@ -1925,7 +1933,11 @@ theorem example_layoutless_fields_and_subplace_borrows :
     argsMatchSignature (mkRcBody [rcRefUsizeTy] rcUsizeTy) [.ptr ⟨25, 0⟩ 8] rcMem ∧
     ¬ argsMatchSignature (mkRcBody [rcRefUsizeTy] rcUsizeTy) [.ptr ⟨26, 0⟩ 8] rcMem ∧
     argsMatchSignature (mkRcBody [rcRefOpaqueTy] rcUsizeTy) [.ptr ⟨25, 0⟩ 8] rcMem ∧
-    ¬ argsMatchSignature (mkRcBody [rcRefOpaqueTy] rcUsizeTy) [.ptr ⟨26, 0⟩ 8] rcMem := by
+    ¬ argsMatchSignature (mkRcBody [rcRefOpaqueTy] rcUsizeTy) [.ptr ⟨26, 0⟩ 8] rcMem ∧
+    argsMatchSignature (mkRcBody [rcRefSliceUsizeTy] rcUsizeTy)
+      [.aggregate 0 [.ptr ⟨27, 0⟩ 8, .scalar ⟨1, 8⟩]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefSliceUsizeTy] rcUsizeTy)
+      [.aggregate 0 [.ptr ⟨27, 0⟩ 8, .scalar ⟨2, 8⟩]] rcMem := by
   set_option linter.unusedSimpArgs false in
   simp [
     emptyMemory,
@@ -1938,13 +1950,19 @@ theorem example_layoutless_fields_and_subplace_borrows :
     rcReorderedTy,
     rcRefUsizeTy,
     rcRefOpaqueTy,
+    rcRefSliceUsizeTy,
     rcCellU32TypeLayout,
     rcUnsafeCellBoolTypeLayout,
     rcReorderedTypeLayout,
     readProjectedValue,
+    extractSubslice,
+    takeValues,
+    dropValues,
     Trusted.Sequence.get?,
+    Trusted.Sequence.length,
     sigUsizeTypeLayout,
-    sigThinPtrTypeLayout
+    sigThinPtrTypeLayout,
+    sigWideSliceTypeLayout
   ] <;> decide
 
 /--

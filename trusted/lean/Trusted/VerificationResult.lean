@@ -1352,6 +1352,34 @@ def valueMatchesRigidTyAndLayout :
                                 entry.rangeOffset ≤ p.offsetBytes ∧
                                 p.offsetBytes + sliceBytes ≤
                                   entry.rangeOffset + entry.rangeLen
+                          | _ :: _, .some (.init targetVal) =>
+                            match Nat.beq entry.rangeLen 0 with
+                            | true =>
+                              match
+                                Nat.beq entry.rangeOffset 0,
+                                readProjectedValue
+                                  .nil targetVal entry.targetProjection
+                              with
+                              | true, .ok (.aggregate aggVar elems) =>
+                                match Nat.beq aggVar 0 with
+                                | true =>
+                                  len_sv.bits ≤ elems.length ∧
+                                    p.offsetBytes + sliceBytes ≤
+                                      elems.length * elemLayout.size.bytes ∧
+                                    arrayElemsMatchWith
+                                      (fun e =>
+                                        recTyPred
+                                          elemKind
+                                          (.some elemLayout)
+                                          layoutIdx
+                                          e)
+                                      elems
+                                | false => False
+                              | _, _ => False
+                            | false =>
+                              entry.rangeOffset ≤ p.offsetBytes ∧
+                                p.offsetBytes + sliceBytes ≤
+                                  entry.rangeOffset + entry.rangeLen
                           | _, _ =>
                             0 < entry.rangeLen ∧
                               entry.rangeOffset ≤ p.offsetBytes ∧
