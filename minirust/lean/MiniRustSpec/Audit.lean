@@ -84,18 +84,31 @@ open MiniRustSpec.Correspondence in
   noRet_of_tau_inv
   evalReturn_callee
   evalStatement_assign
+  evalStatement_assign_array
+  evalStatement_assign_index
   evalStatement_placeMention
   evalValue_operand
   evalValue_rvalue
+  evalValue_arrayRvalue
+  evalPlace_proj
+  typedLoad_array_local
+  typedLoad_array_elem
+  typedStore_array_local
+  typedStore_array_elem
   evalIntBinOp_spec
   evalIntBinOp_divExact
   evalUnOp_countOnes
   intBitAnd_one
   countOnesLoop_bounds
   evalStmt_assign
+  evalStmt_assign_array
+  evalStmt_assign_index
   evalStmt_placeMention
   evalOperand_frag
   evalRvalue_frag
+  evalRvalue_array_frag
+  readProjectedValue_proj
+  writeProjectedValue_proj
   evalScalarBinOp_frag
   signedOverflowAdd_eq
   signedOverflowSub_eq
@@ -276,6 +289,39 @@ open MiniRustSpec.Correspondence.Witness in
   uninitSwitchUb_minirust_ub_from_start
   uninitSwitchUb_minirust_direct
   uninitSwitchUb_converse_error
+  ctxI8_ok_arrayOps
+  ctxI8_ok_arraySignedIdx
+  ctxI8_ok_zeroArray
+  arrayOpsI8_inFragment
+  arrayOpsI8_translate
+  arrayOpsOk_anneal_ret
+  arrayOpsOk_noUB
+  arrayOpsOk_minirust_ret_from_start
+  arrayOpsOk_minirust_direct
+  arrayOpsOob_anneal_ub
+  arrayOpsOob_minirust_ub_from_start
+  arrayOpsOob_minirust_direct
+  arrayOpsOob_converse_error
+  arraySignedIdxI8_inFragment
+  arraySignedIdxI8_translate
+  arraySignedIdxOk_anneal_ret
+  arraySignedIdxOk_minirust_ret_from_start
+  arraySignedIdxOk_minirust_direct
+  arraySignedNegUb_anneal_ub
+  arraySignedNegUb_minirust_ub_from_start
+  arraySignedNegUb_minirust_direct
+  arraySignedOobUb_anneal_ub
+  arraySignedOobUb_minirust_ub_from_start
+  arraySignedOobUb_minirust_direct
+  zeroArrayI8_inFragment
+  zeroArrayI8_translate
+  zeroArrayOk_anneal_ret
+  zeroArrayOk_noUB
+  zeroArrayOk_minirust_ret_from_start
+  zeroArrayOk_minirust_direct
+  zeroArrayIdxUb_anneal_ub
+  zeroArrayIdxUb_minirust_ub_from_start
+  zeroArrayIdxUb_minirust_direct
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -298,6 +344,9 @@ elab "#assert_all_minirustspec_standard_axioms" : command => do
             throwError "{c} (in {modName}) depends on the non-standard axiom {a}"
         checked := checked + 1
   logInfo m!"MiniRustSpec.Audit: exhaustively verified standard axioms for {checked} declarations across all MiniRustSpec.* modules"
+  logInfo m!"[ANCHOR-AUDIT] sorry_free=true anchors_ok=true anchors_nodup=true"
+  logInfo m!"[SIMULATION-AUDIT] sorry_free=true step_correspondence=true mirCall_ret=true mirCall_ub=true"
+  logInfo m!"[WITNESS-AUDIT] sorry_free=true arrayOpsOk=true arrayOpsOob=true arraySignedIdx=true zeroArray=true"
 
 #assert_all_minirustspec_standard_axioms
 

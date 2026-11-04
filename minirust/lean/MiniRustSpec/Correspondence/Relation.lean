@@ -48,9 +48,12 @@ open MiniRustSpec
 open MiniRustSpec.LibSpecr
 open MiniRustSpec.Interp
 
-/-- MiniRust integer type of a MIR local declaration (the default is never
-used for fragment bodies, whose locals all have integer types). -/
-def itOf (d : LocalDecl) : Gen.IntType := (intTypeOf d.ty).getD ⟨.Unsigned, ⟨1⟩⟩
+/-- MiniRust integer type (or element integer type for an array local) of a MIR
+local declaration. -/
+def itOf (d : LocalDecl) : Gen.IntType :=
+  match arrayTypeOf d.ty with
+  | some (elemIt, _) => elemIt
+  | none => (intTypeOf d.ty).getD ⟨.Unsigned, ⟨1⟩⟩
 
 /-- `Type::encode` of `Value::Int(int_from_bits(bits))` at `Type::Int(it)`:
 little-endian bytes without provenance. -/
@@ -60,11 +63,25 @@ def scalarBytes (it : Gen.IntType) (bits : Nat) : List Byte :=
 /-- The contents of a freshly allocated MiniRust local: all `Uninit`. -/
 def uninitBytes (it : Gen.IntType) : List Byte := List.replicate it.size.bytes .Uninit
 
+/-- MiniRust bytes corresponding to an Anneal scalar value at integer type `it`. -/
+def valBytes (it : Gen.IntType) : Value → List Byte
+  | .scalar sc => scalarBytes it sc.bits
+  | _ => uninitBytes it
+
 /-- MiniRust bytes corresponding to an Anneal local slot (meaningful for
 fragment slots, see `SlotOk`). -/
 def slotData (it : Gen.IntType) : LocalSlot → List Byte
   | .init (.scalar sc) => scalarBytes it sc.bits
   | _ => uninitBytes it
+
+/-- MiniRust bytes corresponding to a scalar or homogeneous-array local slot. -/
+def declSlotData (d : LocalDecl) (slot : LocalSlot) : List Byte :=
+  match arrayTypeOf d.ty with
+  | none => slotData (itOf d) slot
+  | some (elemIt, count) =>
+    match slot with
+    | .init (.aggregate 0 elems) => (elems.map (valBytes elemIt)).flatten
+    | _ => List.replicate (count * elemIt.size.bytes) .Uninit
 
 /-- Fragment slots: live, and holding either nothing or a scalar of the
 declared size whose bit pattern is in range. -/
@@ -72,6 +89,40 @@ def SlotOk (it : Gen.IntType) : LocalSlot → Prop
   | .uninit => True
   | .init (.scalar sc) => sc.sizeBytes = it.size.bytes ∧ sc.bits < 2 ^ (8 * it.size.bytes)
   | _ => False
+
+/-- Well-formedness of an initialized scalar element at integer type `it`. -/
+def ElemOk (it : Gen.IntType) : Value → Prop
+  | .scalar sc => sc.sizeBytes = it.size.bytes ∧ sc.bits < 2 ^ (8 * it.size.bytes)
+  | _ => False
+
+/-- Well-formedness of a fragment local slot for declaration `d`: scalar locals
+satisfy `SlotOk (itOf d) slot`, while array locals `[elemIt; count]` hold an
+initialized `.aggregate 0 elems` of `count` well-formed elements. -/
+def DeclSlotOk (d : LocalDecl) (slot : LocalSlot) : Prop :=
+  match arrayTypeOf d.ty with
+  | none => SlotOk (itOf d) slot
+  | some (elemIt, count) =>
+    match slot with
+    | .init (.aggregate 0 elems) =>
+      elems.length = count ∧ ∀ v ∈ elems, ElemOk elemIt v
+    | _ => False
+
+/-- Alignment and address-space bounds for a local allocation at `addr`:
+reduces definitionally to `addr % (itOf d).size.bytes = 0` for scalar locals,
+and additionally requires `0 ≤ addr` and `addr + count * elemIt.size.bytes < 2^64`
+for array locals so `ptr_offset_inbounds` does not overflow the 64-bit address
+space. -/
+def AddrOk (addr : Int) (d : LocalDecl) : Prop :=
+  match arrayTypeOf d.ty with
+  | none => addr % ((itOf d).size.bytes : Int) = 0
+  | some (elemIt, count) =>
+    addr % (elemIt.size.bytes : Int) = 0 ∧
+    0 ≤ addr ∧
+    addr + ((count * elemIt.size.bytes : Nat) : Int) < 2 ^ 64
+
+instance (addr : Int) (d : LocalDecl) : Decidable (AddrOk addr d) := by
+  unfold AddrOk
+  cases arrayTypeOf d.ty <;> infer_instance
 
 /-- The parts of the MiniRust machine that the callee's execution does not
 determine but must keep stable: the caller frame, the caller's continuation
@@ -99,7 +150,7 @@ def localAlloc (ctx : Ctx) (i : Nat) (it : Gen.IntType) (data : List Byte) : Gen
 /-- The callee's allocations for locals `_i, _(i+1), ..`, in local order. -/
 def localAllocsFrom (ctx : Ctx) : Nat → List LocalDecl → List LocalSlot → List Gen.Allocation
   | i, d :: ds, slot :: slots =>
-    localAlloc ctx i (itOf d) (slotData (itOf d) slot) :: localAllocsFrom ctx (i + 1) ds slots
+    localAlloc ctx i (itOf d) (declSlotData d slot) :: localAllocsFrom ctx (i + 1) ds slots
   | _, _, _ => []
 
 /-- The callee's allocations, one per local, in local order. -/
@@ -139,9 +190,9 @@ structure StateRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : Mach
   stmt : ∀ bb, body.basicBlocks[s.frame.blockIdx]? = some bb → s.frame.stmtIdx ≤ bb.statements.length
   nlocals : s.frame.locals.length = body.localDecls.length
   slots : ∀ (i : Nat) d slot, body.localDecls[i]? = some d → s.frame.locals[i]? = some slot →
-    SlotOk (itOf d) slot
+    DeclSlotOk d slot
   addrs : ∀ (i : Nat) d, body.localDecls[i]? = some d →
-    ctx.addrs.getD i 0 % ((itOf d).size.bytes : Int) = 0
+    AddrOk (ctx.addrs.getD i 0) d
   ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (itOf d)
   borrows : s.memory.borrows = []
   callStack : s.memory.callStack = []
@@ -166,9 +217,9 @@ structure StartRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : Mach
   hasBlocks : 0 < body.basicBlocks.length
   nlocals : s.frame.locals.length = body.localDecls.length
   slots : ∀ (i : Nat) d slot, body.localDecls[i]? = some d → s.frame.locals[i]? = some slot →
-    SlotOk (itOf d) slot
+    DeclSlotOk d slot
   addrs : ∀ (i : Nat) d, body.localDecls[i]? = some d →
-    ctx.addrs.getD i 0 % ((itOf d).size.bytes : Int) = 0
+    AddrOk (ctx.addrs.getD i 0) d
   ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (itOf d)
   borrows : s.memory.borrows = []
   callStack : s.memory.callStack = []
@@ -177,11 +228,11 @@ structure StartRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : Mach
   callerLocals : s.memory.callerLocals = []
 
 /-- Well-formed caller context for executing `body`: every callee local address
-is aligned for its integer type, and the caller's return place is a live,
-aligned allocation of `_0`'s byte size. -/
+is aligned for its type (and within address-space bounds for arrays), and the
+caller's return place is a live, aligned allocation of `_0`'s byte size. -/
 structure CtxOk (body : CapturedMir) (ctx : Ctx) : Prop where
   addrs : ∀ (i : Nat) d, body.localDecls[i]? = some d →
-    ctx.addrs.getD i 0 % ((itOf d).size.bytes : Int) = 0
+    AddrOk (ctx.addrs.getD i 0) d
   ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (itOf d)
 
 /-- Decidable well-typedness of an incoming argument `v` for integer parameter
@@ -190,11 +241,22 @@ def argOk (it : Gen.IntType) : Value → Bool
   | .scalar sc => decide (sc.sizeBytes = it.size.bytes) && decide (sc.bits < 2 ^ (8 * it.size.bytes))
   | _ => false
 
+/-- Decidable well-typedness of an incoming argument `v` for parameter
+declaration `d` (scalar integer or homogeneous array). -/
+def declArgOk (d : LocalDecl) (v : Value) : Bool :=
+  match arrayTypeOf d.ty with
+  | none => argOk (itOf d) v
+  | some (elemIt, count) =>
+    match v with
+    | .aggregate 0 elems =>
+      decide (elems.length = count) && elems.all (argOk elemIt)
+    | _ => false
+
 /-- Decidable well-typedness of argument values `args` against parameter
 declarations `decls` (`_1 .. _argCount`). -/
 def argsOkAux : List LocalDecl → List Value → Bool
   | [], [] => true
-  | d :: ds, v :: vs => argOk (itOf d) v && argsOkAux ds vs
+  | d :: ds, v :: vs => declArgOk d v && argsOkAux ds vs
   | _, _ => false
 
 /-- Decidable well-typedness of `args` for `mirCallTree body args`. -/

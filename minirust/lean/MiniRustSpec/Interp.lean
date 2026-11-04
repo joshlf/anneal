@@ -38,8 +38,12 @@ here.
   `Stop.unsupported` instead of resolving the choice.
 * `Statement::Assign` and `Statement::PlaceMention`
   (`spec/lang/step/statements.md`).
-* `PlaceExpr::Local` (`spec/lang/step/expressions.md`).
-* `ValueExpr::Constant` for `Constant::Int`/`Constant::Bool`, `ValueExpr::Load`,
+* `PlaceExpr::Local` and `PlaceExpr::Index` (`spec/lang/step/expressions.md`),
+  together with `Machine::ptr_offset_inbounds` (`spec/lang/step/operators.md`)
+  and `Memory::dereferenceable` / `Memory::signed_dereferenceable`
+  (`spec/mem/basic.md`, `spec/mem/interface.md`, `spec/mem/concurrent.md`).
+* `ValueExpr::Constant` for `Constant::Int`/`Constant::Bool`,
+  `ValueExpr::Tuple`, `ValueExpr::Load`,
   `ValueExpr::UnOp` with `UnOp::Int` (all `IntUnOp` variants: `Neg`, `BitNot`,
   `CountOnes`) and `UnOp::Cast(CastOp::IntToInt)`, and `ValueExpr::BinOp` with
   `BinOp::Int` (all `IntBinOp` variants: `Add`, `AddUnchecked`, `Sub`,
@@ -49,11 +53,12 @@ here.
 * `Terminator::Goto`, `Terminator::Switch`, `Terminator::Unreachable`, and
   `Terminator::Return` (`spec/lang/step/terminators.md`), including frame
   teardown, `storage_dead` of every local, and both stack-pop actions.
-* The representation relation for `Type::Int` and `Type::Bool`
+* The representation relation for `Type::Int`, `Type::Bool`, and `Type::Array`
   (`spec/lang/representation.md`), `Type::layout` for those types
   (`spec/lang/types.md`), and `BasicMemory`'s `load`, `store`, `deallocate`,
-  and `check_ptr` (`spec/mem/basic.md`), wrapped by `ConcurrentMemory`'s access
-  recording (`spec/mem/concurrent.md`).
+  `dereferenceable`, `signed_dereferenceable`, and `check_ptr`
+  (`spec/mem/basic.md`, `spec/mem/interface.md`), wrapped by
+  `ConcurrentMemory`'s access recording (`spec/mem/concurrent.md`).
 * The `x86_64` target (`spec/prelude/target.md`) as the instance of `T` and
   `BasicMemory<x86_64>` as the instance of `M`.
 
@@ -139,6 +144,15 @@ these operations are hand-written from its documented behavior. -/
 
 /-- `Size::bits()`: the number of bits in `s` bytes. -/
 def Size.bits (s : Size) : Nat := 8 * s.bytes
+
+/-- `Size::from_bytes(n)`: `Some` iff `n ≥ 0`. -/
+def Size.from_bytes (n : Int) : Option Size :=
+  if 0 ≤ n then some ⟨n.toNat⟩ else none
+
+/-- `Size * Int` (`Mul<Int> for Size` in `libspecr`), which panics if the factor is negative. -/
+def Size.mulInt (s : Size) (n : Int) : Interp Size :=
+  if 0 ≤ n then pure ⟨s.bytes * n.toNat⟩
+  else specPanic "Size * Int: negative factor"
 
 /-- `Align::from_bytes(n)`: `Some` iff `n` is a power of two. -/
 def alignFromBytes (n : Nat) : Option Align :=
@@ -315,14 +329,6 @@ def IntType.align (t : IntType) : Interp Align :=
   | some a => pure ⟨min a.bytes x86_64.INT_MAX_ALIGN.bytes⟩
   | none => specPanic "Align::from_bytes(size).unwrap()"
 
-/-- `Type::layout::<x86_64>` for the interpreted types:
-> "Int(int_type) => Sized(int_type.size, int_type.align::<T>()),
->  Bool => Sized(Size::from_bytes_const(1), Align::ONE)," -/
-def Type.layout : «Type» → Interp LayoutStrategy
-  | .Int t => do pure (.Sized t.size (← IntType.align t))
-  | .Bool => pure (.Sized ⟨1⟩ ⟨1⟩)
-  | _ => unsupported "Type::layout for a non-Int, non-Bool type"
-
 /-- `LayoutStrategy::expect_size` (`spec/lang/types.md`):
 > "pub fn expect_size(self, msg: &str) -> Size {
 >     match self {
@@ -347,6 +353,25 @@ def LayoutStrategy.expect_align (l : LayoutStrategy) (msg : String) : Interp Ali
   | .Sized _ align => pure align
   | _ => specPanic s!"expect_align called on unsized type: {msg}"
 
+/-- `Type::layout::<x86_64>` for the interpreted types:
+> "Int(int_type) => Sized(int_type.size, int_type.align::<T>()),
+>  Bool => Sized(Size::from_bytes_const(1), Align::ONE),
+>  ..
+>  Array { elem, count } => Sized(
+>      elem.layout::<T>().expect_size(\"WF ensures array element is sized\") * count,
+>      elem.layout::<T>().expect_align(\"WF ensures array element is sized\"),
+>  )," -/
+def Type.layout : «Type» → Interp LayoutStrategy
+  | .Int t => do pure (.Sized t.size (← IntType.align t))
+  | .Bool => pure (.Sized ⟨1⟩ ⟨1⟩)
+  | .Array elem count => do
+    let elemLayout ← Type.layout elem
+    let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures array element is sized"
+    let elemAlign ← LayoutStrategy.expect_align elemLayout "WF ensures array element is sized"
+    let size ← Size.mulInt elemSize count
+    pure (.Sized size elemAlign)
+  | _ => unsupported "Type::layout for a non-Int, non-Bool, non-Array type"
+
 /-! ## Representation relation (`spec/lang/representation.md`) -/
 
 /-- `AbstractByte::data` (`spec/mem/interface.md`):
@@ -360,7 +385,7 @@ def AbstractByte.data : Byte → Option UInt8
   | .Uninit => none
   | .Init b _ => some b
 
-/-- `Type::decode` for `Bool` and `Int`:
+/-- `Type::decode` for `Bool`, `Int`, and `Array`:
 > "fn decode<M: Memory>(Type::Bool: Self, bytes: ..) -> Option<Value<M>> {
 >     if bytes.len() != 1 { panic!(..); }
 >     ret(match bytes[0] {
@@ -375,6 +400,21 @@ def AbstractByte.data : Byte → Option UInt8
 >     // Fails if any byte is `Uninit`.
 >     let bytes_data: List<u8> = bytes.try_map(|b| b.data())?;
 >     ret(Value::Int(M::T::ENDIANNESS.decode(signed, bytes_data)))
+> }
+> ..
+> fn decode<M: Memory>(Type::Array { elem, count }: Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> {
+>     let elem_size = elem.layout::<M::T>().expect_size(\"WF ensures array element is sized\");
+>     let full_size = elem_size * count;
+>
+>     if bytes.len() != full_size.bytes() { panic!(\"decode of Type::Array with invalid length\"); }
+>
+>     let chunks: List<_> = (Int::ZERO..count).map(|i|
+>         bytes.subslice_with_length(i*elem_size.bytes(), elem_size.bytes())
+>     ).collect();
+>
+>     ret(Value::Tuple(
+>         chunks.try_map(|elem_bytes| elem.decode::<M>(elem_bytes))?
+>     ))
 > }" -/
 def Type.decode : «Type» → List Byte → Interp (Option Val)
   | .Bool, bytes =>
@@ -390,9 +430,21 @@ def Type.decode : «Type» → List Byte → Interp (Option Val)
       match bytes.mapM AbstractByte.data with
       | some data => pure (some (.Int (Endianness.decode x86_64.ENDIANNESS signed data)))
       | none => pure none
-  | _, _ => unsupported "Type::decode for a non-Int, non-Bool type"
+  | .Array elem count, bytes => do
+    let elemLayout ← Type.layout elem
+    let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures array element is sized"
+    let fullSize ← Size.mulInt elemSize count
+    if bytes.length ≠ fullSize.bytes then
+      specPanic "decode of Type::Array with invalid length"
+    else do
+      let chunks ← (List.range count.toNat).mapM (fun i => do
+        let byteOffset ← Size.mulInt elemSize (Int.ofNat i)
+        subsliceWithLength bytes byteOffset.bytes elemSize.bytes)
+      let decoded ← chunks.mapM (fun elemBytes => Type.decode elem elemBytes)
+      pure ((decoded.mapM id).map Value.Tuple)
+  | _, _ => unsupported "Type::decode for a non-Int, non-Bool, non-Array type"
 
-/-- `Type::encode` for `Bool` and `Int`:
+/-- `Type::encode` for `Bool`, `Int`, and `Array`:
 > "fn encode<M: Memory>(Type::Bool: Self, val: Value<M>) -> .. {
 >     let Value::Bool(b) = val else { panic!() };
 >     list![AbstractByte::Init(if b { 1 } else { 0 }, None)]
@@ -403,6 +455,16 @@ def Type.decode : «Type» → List Byte → Interp (Option Val)
 >     // `Endianness::encode` will do the integer's bound check.
 >     let bytes_data = M::T::ENDIANNESS.encode(signed, size, i).unwrap();
 >     bytes_data.map(|b| AbstractByte::Init(b, None))
+> }
+> ..
+> fn encode<M: Memory>(Type::Array { elem, count }: Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> {
+>     let Value::Tuple(values) = val else { panic!() };
+>     assert_eq!(values.len(), count);
+>     values.flat_map(|value| {
+>         let bytes = elem.encode::<M>(value);
+>         assert_eq!(bytes.len(), elem.layout::<M::T>().expect_size(\"WF ensures array element is sized\").bytes());
+>         bytes
+>     })
 > }" -/
 def Type.encode : «Type» → Val → Interp (List Byte)
   | .Bool, .Bool b => pure [.Init (if b then 1 else 0) none]
@@ -412,22 +474,49 @@ def Type.encode : «Type» → Val → Interp (List Byte)
     | some data => pure (data.map (fun b => .Init b none))
     | none => specPanic "Endianness::encode(..).unwrap()"
   | .Int _, _ => specPanic "encode: Type::Int with a non-Int value"
-  | _, _ => unsupported "Type::encode for a non-Int, non-Bool type"
+  | .Array elem count, .Tuple values => do
+    let elemLayout ← Type.layout elem
+    let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures array element is sized"
+    if (values.length : Int) ≠ count then
+      specPanic "encode: Type::Array length mismatch"
+    else do
+      let encoded ← values.mapM (fun value => do
+        let bytes ← Type.encode elem value
+        if bytes.length ≠ elemSize.bytes then
+          specPanic "encode: Type::Array element byte length mismatch"
+        else
+          pure bytes)
+      pure encoded.flatten
+  | .Array _ _, _ => specPanic "encode: Type::Array with a non-Tuple value"
+  | _, _ => unsupported "Type::encode for a non-Int, non-Bool, non-Array type"
 
-/-- `Machine::check_value` for `Int` and `Bool`:
+/-- `Machine::check_value` for `Int`, `Bool`, and `Array`:
 > "(Value::Int(i), Type::Int(int_ty)) => {
 >     ensure_else_ub(int_ty.can_represent(i), \"Value::Int: invalid integer value\")?;
 > }
 > (Value::Bool(_), Type::Bool) => {},
+> ..
+> (Value::Tuple(vals), Type::Array { elem, count }) => {
+>     ensure_else_ub(vals.len() == count, \"Value::Tuple: invalid number of elements\")?;
+>     for val in vals {
+>         self.check_value(val, elem)?;
+>     }
+> }
 > ..
 > _ => panic!(\"Value: value does not match type\")" -/
 def checkValue : Val → «Type» → Interp Unit
   | .Int i, .Int t =>
     if IntType.can_represent t i then pure () else ub "Value::Int: invalid integer value"
   | .Bool _, .Bool => pure ()
+  | .Tuple vals, .Array elem count =>
+    if (vals.length : Int) = count then
+      vals.forM (fun val => checkValue val elem)
+    else
+      ub "Value::Tuple: invalid number of elements"
   | _, .Int _ => specPanic "Value: value does not match type"
   | _, .Bool => specPanic "Value: value does not match type"
-  | _, _ => unsupported "check_value for a non-Int, non-Bool type"
+  | _, .Array _ _ => specPanic "Value: value does not match type"
+  | _, _ => unsupported "check_value for a non-Int, non-Bool, non-Array type"
 
 /-! ## `BasicMemory` (`spec/mem/basic.md`) -/
 
@@ -537,6 +626,35 @@ def BM.deallocate (mem : BM) (ptr : Ptr) (kind : AllocationKind) (size : Size) (
       let allocations ← listSet mem.allocations id._0 { allocation with live := false } "set"
       pure { mem with allocations := allocations }
 
+/-- `BasicMemory::dereferenceable`:
+> "fn dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Size) -> Result {
+>     self.check_ptr(ptr, len)?;
+>     ret(())
+> }" -/
+def BM.dereferenceable (mem : BM) (ptr : Ptr) (len : Size) : Interp Unit := do
+  let _ ← BM.check_ptr mem ptr len
+  pure ()
+
+/-- `Memory::signed_dereferenceable` (`spec/mem/interface.md`):
+> "fn signed_dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Int) -> Result {
+>     if len > 0 {
+>         self.dereferenceable(ptr, Size::from_bytes(len).unwrap())
+>     } else {
+>         let begin_ptr = ThinPointer { addr: ptr.addr + len, ..ptr };
+>         self.dereferenceable(begin_ptr, Size::from_bytes(-len).unwrap())
+>     }
+> }" -/
+def BM.signed_dereferenceable (mem : BM) (ptr : Ptr) (len : Int) : Interp Unit :=
+  if len > 0 then
+    match Size.from_bytes len with
+    | some sz => BM.dereferenceable mem ptr sz
+    | none => specPanic "Size::from_bytes(len).unwrap()"
+  else
+    let beginPtr : Ptr := { ptr with addr := ptr.addr + len }
+    match Size.from_bytes (-len) with
+    | some sz => BM.dereferenceable mem beginPtr sz
+    | none => specPanic "Size::from_bytes(-len).unwrap()"
+
 /-! ## `ConcurrentMemory` (`spec/mem/concurrent.md`) -/
 
 /-- `ConcurrentMemory::store`:
@@ -567,6 +685,21 @@ def CM.load (cm : ConcurrentMemory BM) (ptr : Ptr) (len : Size) (align : Align)
 def CM.deallocate (cm : ConcurrentMemory BM) (ptr : Ptr) (kind : AllocationKind) (size : Size)
     (align : Align) : Interp (ConcurrentMemory BM) := do
   pure { cm with memory := ← BM.deallocate cm.memory ptr kind size align }
+
+/-- `ConcurrentMemory::dereferenceable`:
+> "pub fn dereferenceable(&self, ptr: ThinPointer<M::Provenance>, len: Size) -> Result {
+>     self.memory.dereferenceable(ptr, len)
+> }" -/
+def CM.dereferenceable (cm : ConcurrentMemory BM) (ptr : Ptr) (len : Size) : Interp Unit :=
+  BM.dereferenceable cm.memory ptr len
+
+/-- `ConcurrentMemory::signed_dereferenceable`:
+> "pub fn signed_dereferenceable(&self, ptr: ThinPointer<M::Provenance>, len: Int) -> Result {
+>     self.memory.signed_dereferenceable(ptr, len)
+> }" -/
+def CM.signed_dereferenceable (cm : ConcurrentMemory BM) (ptr : Ptr) (len : Int) :
+    Interp Unit :=
+  BM.signed_dereferenceable cm.memory ptr len
 
 /-- `Access::races`:
 > "if self.ty == AccessType::Load && other.ty == AccessType::Load { return false; }
@@ -698,21 +831,6 @@ def typedStore (m : Mach) (ptr : Ptr) (val : Val) (ty : «Type») (align : Align
   pure { m with mem := cm }
 
 /-! ## Places and values (`spec/lang/step/expressions.md`) -/
-
-/-- `Machine::eval_place` for `PlaceExpr::Local`:
-> "let ty = self.cur_frame().func.locals[name];
->  let Some(ptr) = self.cur_frame().locals.get(name) else {
->      throw_ub!(\"access to a dead local\");
->  };
->  ret((Place { ptr: ptr.widen(None), aligned: true }, ty))" -/
-def evalPlace (m : Mach) : PlaceExpr → Interp (Place BM × «Type»)
-  | .Local name => do
-    let fr ← curFrame m
-    let ty ← mapIndex fr.func.locals name "self.cur_frame().func.locals[name]"
-    match mapGet fr.locals name with
-    | none => ub "access to a dead local"
-    | some ptr => pure ({ ptr := { thin_pointer := ptr, metadata := none }, aligned := true }, ty)
-  | _ => unsupported "eval_place for a non-Local place expression"
 
 /-- `Machine::place_load`:
 > "if !place.aligned { throw_ub!(\"loading from a place based on a misaligned pointer\"); }
@@ -990,11 +1108,102 @@ def evalBinOp (op : BinOp) (l : Val × «Type») (r : Val × «Type») : Interp 
   | .Int _, _, _ => specPanic "non-integer input to integer operation"
   | _, _, _ => unsupported "eval_bin_op for a non-Int operator"
 
-/-! ## Value expressions (`spec/lang/step/expressions.md`) -/
+/-- `Machine::ptr_offset_inbounds` (`spec/lang/step/operators.md`):
+> "fn ptr_offset_inbounds(&self, ptr: ThinPointer<M::Provenance>, offset: Int) -> Result<ThinPointer<M::Provenance>> {
+>     // Ensure dereferenceability.
+>     self.mem.signed_dereferenceable(ptr, offset)?;
+>     // This also ensures that `offset` fits in an `isize`, since no allocation
+>     // can be bigger than `isize`, and it ensures that the arithmetic does not overflow, since no
+>     // allocation wraps around the edge of the address space.
+>     assert!(offset.in_bounds(Signed, M::T::PTR_SIZE));
+>     assert!((ptr.addr + offset).in_bounds(Unsigned, M::T::PTR_SIZE));
+>     // All checked!
+>     ret(ThinPointer { addr: ptr.addr + offset, ..ptr })
+> }" -/
+def ptrOffsetInbounds (m : Mach) (ptr : Ptr) (offset : Int) : Interp Ptr := do
+  CM.signed_dereferenceable m.mem ptr offset
+  if !(inBounds offset .Signed x86_64.PTR_SIZE &&
+       inBounds (ptr.addr + offset) .Unsigned x86_64.PTR_SIZE) then
+    specPanic "ptr_offset_inbounds arithmetic overflow"
+  else
+    pure { ptr with addr := ptr.addr + offset }
 
-/-- `Machine::eval_value` for `Constant`, `Load`, `UnOp`, and `BinOp`:
+/-! ## Place and value expressions (`spec/lang/step/expressions.md`) -/
+
+mutual
+
+/-- `Machine::eval_place` for `PlaceExpr::Local` and `PlaceExpr::Index`:
+> "let ty = self.cur_frame().func.locals[name];
+>  let Some(ptr) = self.cur_frame().locals.get(name) else {
+>      throw_ub!(\"access to a dead local\");
+>  };
+>  ret((Place { ptr: ptr.widen(None), aligned: true }, ty))
+>  ..
+>  fn eval_place(&mut self, PlaceExpr::Index { root, index }: PlaceExpr) -> Result<(Place<M>, Type)> {
+>      let (root, ty) = self.eval_place(root)?;
+>      let (Value::Int(index), _) = self.eval_value(index)? else {
+>          panic!(\"non-integer operand for array index\")
+>      };
+>      let (elem_ty, count) = match ty {
+>          Type::Array { elem, count } => (elem, count),
+>          ..
+>          _ => panic!(\"index projection on non-indexable type\"),
+>      };
+>      if index < 0 || index >= count {
+>          throw_ub!(\"access to out-of-bounds index\");
+>      }
+>
+>      let elem_size = elem_ty.layout::<M::T>().expect_size(\"WF ensures array & slice elements are sized\");
+>      let offset = index * elem_size;
+>      ..
+>      let ptr = self.ptr_offset_inbounds(root.ptr.thin_pointer, offset.bytes())?;
+>      ret((Place { ptr: ptr.widen(None), ..root }, elem_ty))
+>  }" -/
+def evalPlace (m : Mach) : PlaceExpr → Interp ((Place BM × «Type») × Mach)
+  | .Local name => do
+    let fr ← curFrame m
+    let ty ← mapIndex fr.func.locals name "self.cur_frame().func.locals[name]"
+    match mapGet fr.locals name with
+    | none => ub "access to a dead local"
+    | some ptr => pure (({ ptr := { thin_pointer := ptr, metadata := none }, aligned := true }, ty), m)
+  | .Index root index => do
+    let ((rootPlace, ty), m) ← evalPlace m root
+    let ((idxVal, _), m) ← evalValue m index
+    let idx ← match idxVal with
+      | .Int i => pure i
+      | _ => specPanic "non-integer operand for array index"
+    let (elemTy, count) ← match ty with
+      | .Array elem count => pure (elem, count)
+      | .Slice _ => unsupported "eval_place for PlaceExpr::Index on Type::Slice"
+      | _ => specPanic "index projection on non-indexable type"
+    if idx < 0 ∨ idx ≥ count then
+      ub "access to out-of-bounds index"
+    else do
+      let elemLayout ← Type.layout elemTy
+      let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures array & slice elements are sized"
+      let offset ← Size.mulInt elemSize idx
+      let ptr ← ptrOffsetInbounds m rootPlace.ptr.thin_pointer offset.bytes
+      pure (({ rootPlace with ptr := { thin_pointer := ptr, metadata := none } }, elemTy), m)
+  | _ => unsupported "eval_place for a non-Local, non-Index place expression"
+
+/-- Left-to-right element evaluation `exprs.try_map(|e| self.eval_value(e))?.map(|e| e.0)`
+in `Machine::eval_value` for `ValueExpr::Tuple` (`spec/lang/step/expressions.md`):
+> "let vals = exprs.try_map(|e| self.eval_value(e))?.map(|e| e.0);" -/
+def evalValueList (m : Mach) : List ValueExpr → Interp (List Val × Mach)
+  | [] => pure ([], m)
+  | e :: es => do
+    let ((v, _), m) ← evalValue m e
+    let (vs, m) ← evalValueList m es
+    pure (v :: vs, m)
+
+/-- `Machine::eval_value` for `Constant`, `Tuple`, `Load`, `UnOp`, and `BinOp`:
 > "fn eval_value(&mut self, ValueExpr::Constant(constant, ty): ValueExpr) -> .. {
 >     ret((self.eval_constant(constant)?, ty))
+> }
+> ..
+> fn eval_value(&mut self, ValueExpr::Tuple(exprs, ty): ValueExpr) -> Result<(Value<M>, Type)> {
+>     let vals = exprs.try_map(|e| self.eval_value(e))?.map(|e| e.0);
+>     ret((Value::Tuple(vals), ty))
 > }
 > ..
 > fn eval_value(&mut self, ValueExpr::Load { source }: ValueExpr) -> .. {
@@ -1017,8 +1226,11 @@ def evalBinOp (op : BinOp) (l : Val × «Type») (r : Val × «Type») : Interp 
 > }" -/
 def evalValue (m : Mach) : ValueExpr → Interp ((Val × «Type») × Mach)
   | .Constant c ty => do pure ((← evalConstant c, ty), m)
+  | .Tuple exprs ty => do
+    let (vals, m) ← evalValueList m exprs
+    pure ((.Tuple vals, ty), m)
   | .Load source => do
-    let (place, ty) ← evalPlace m source
+    let ((place, ty), m) ← evalPlace m source
     let (v, m) ← placeLoad m place ty
     pure ((v, ty), m)
   | .UnOp operator operand => do
@@ -1029,6 +1241,8 @@ def evalValue (m : Mach) : ValueExpr → Interp ((Val × «Type») × Mach)
     let (r, m) ← evalValue m right
     pure (← evalBinOp operator l r, m)
   | _ => unsupported "eval_value for an expression outside the fragment"
+
+end
 
 /-! ## Statements (`spec/lang/step/statements.md`) -/
 
@@ -1046,11 +1260,11 @@ def evalValue (m : Mach) : ValueExpr → Interp ((Val × «Type») × Mach)
 > }" -/
 def evalStatement (m : Mach) : Statement → Interp Mach
   | .Assign destination source => do
-    let (place, ty) ← evalPlace m destination
+    let ((place, ty), m) ← evalPlace m destination
     let ((val, _), m) ← evalValue m source
     placeStore m place val ty
   | .PlaceMention place => do
-    let _ ← evalPlace m place
+    let (_, m) ← evalPlace m place
     pure m
   | _ => unsupported "eval_statement for a statement other than Assign/PlaceMention"
 

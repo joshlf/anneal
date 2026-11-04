@@ -58,27 +58,27 @@ theorem bbName_inj (a b : Nat) : bbName a = bbName b ↔ a = b := by
 
 theorem translateLocals_get (k : Nat) (ds : List LocalDecl) (L : List (Gen.LocalName × Gen.Type))
     (h : translateLocals k ds = some L) (j : Nat) (d : LocalDecl) (hd : ds[j]? = some d) :
-    ∃ it, intTypeOf d.ty = some it ∧ mapGet ⟨L⟩ (localName (k + j)) = some (.Int it) := by
+    ∃ ty, translateTy d.ty = some ty ∧ mapGet ⟨L⟩ (localName (k + j)) = some ty := by
   induction ds generalizing k L j with
   | nil => simp at hd
   | cons d' ds ih =>
     simp only [translateLocals, Option.bind_eq_bind] at h
-    cases hit : intTypeOf d'.ty with
-    | none => simp [hit] at h
-    | some it' =>
+    cases hty : translateTy d'.ty with
+    | none => simp [hty] at h
+    | some ty' =>
       cases hrest : translateLocals (k + 1) ds with
-      | none => simp [hit, hrest] at h
+      | none => simp [hty, hrest] at h
       | some rest =>
-        simp [hit, hrest] at h
+        simp [hty, hrest] at h
         subst h
         cases j with
         | zero =>
           simp at hd; subst hd
-          exact ⟨it', hit, by simp [mapGet_cons]⟩
+          exact ⟨ty', hty, by simp [mapGet_cons]⟩
         | succ j =>
           simp at hd
-          obtain ⟨it, hit2, hget⟩ := ih (k + 1) rest hrest j hd
-          refine ⟨it, hit2, ?_⟩
+          obtain ⟨ty, hty2, hget⟩ := ih (k + 1) rest hrest j hd
+          refine ⟨ty, hty2, ?_⟩
           rw [mapGet_cons]
           split
           · next heq => rw [localName_inj] at heq; omega
@@ -117,7 +117,7 @@ theorem translateBlocks_get (decls : List LocalDecl) (k : Nat) (bbs : List Basic
 theorem translateFn_spec (body : CapturedMir) (f : Gen.Function) (h : translateFn body = some f) :
     f.ret = localName 0 ∧
     (∀ (i : Nat) d, body.localDecls[i]? = some d →
-      intTypeOf d.ty = some (itOf d) ∧ mapGet f.locals (localName i) = some (.Int (itOf d))) ∧
+      ∃ ty, translateTy d.ty = some ty ∧ mapGet f.locals (localName i) = some ty) ∧
     (∀ (i : Nat) bb, body.basicBlocks[i]? = some bb →
       ∃ tb, translateBlock body.localDecls bb = some tb ∧ mapGet f.blocks (bbName i) = some tb) := by
   simp only [translateFn, Option.bind_eq_bind] at h
@@ -131,10 +131,8 @@ theorem translateFn_spec (body : CapturedMir) (f : Gen.Function) (h : translateF
       subst h
       refine ⟨rfl, ?_, ?_⟩
       · intro i d hd
-        obtain ⟨it, hit, hget⟩ := translateLocals_get 0 body.localDecls L hL i d hd
-        have : itOf d = it := by simp [itOf, hit]
-        rw [this]; refine ⟨hit, ?_⟩
-        simpa using hget
+        obtain ⟨ty, hty, hget⟩ := translateLocals_get 0 body.localDecls L hL i d hd
+        exact ⟨ty, hty, by simpa using hget⟩
       · intro i bb hbb
         obtain ⟨tb, htb, hget⟩ := translateBlocks_get body.localDecls 0 body.basicBlocks B hB i bb hbb
         refine ⟨tb, htb, ?_⟩
@@ -178,5 +176,130 @@ theorem translateFn_start (body : CapturedMir) (f : Gen.Function) (h : translate
       subst h
       exact ⟨rfl, translateBlocks_append_get body.localDecls 0 body.basicBlocks B hB
         body.basicBlocks.length (by omega)⟩
+
+theorem arrayTypeOf_none_of_intTypeOf {t : MirAst.Ty} {it : Gen.IntType}
+    (h : intTypeOf t = some it) : arrayTypeOf t = none := by
+  unfold intTypeOf intTyBytes at h
+  unfold arrayTypeOf
+  split at h <;> simp_all
+
+theorem intTypeOf_none_of_arrayTypeOf {t : MirAst.Ty} {elemIt : Gen.IntType} {count : Nat}
+    (h : arrayTypeOf t = some (elemIt, count)) : intTypeOf t = none := by
+  unfold arrayTypeOf at h
+  unfold intTypeOf intTyBytes
+  split at h <;> simp_all
+
+theorem itOf_eq_of_intTypeOf {d : LocalDecl} {it : Gen.IntType}
+    (h : intTypeOf d.ty = some it) : itOf d = it := by
+  simp [itOf, arrayTypeOf_none_of_intTypeOf h, h]
+
+theorem itOf_eq_of_arrayTypeOf {d : LocalDecl} {elemIt : Gen.IntType} {count : Nat}
+    (h : arrayTypeOf d.ty = some (elemIt, count)) : itOf d = elemIt := by
+  simp [itOf, h]
+
+theorem translateTy_of_intTypeOf {t : MirAst.Ty} {it : Gen.IntType}
+    (h : intTypeOf t = some it) : translateTy t = some (.Int it) := by
+  simp [translateTy, h]
+
+theorem translateTy_of_arrayTypeOf {t : MirAst.Ty} {elemIt : Gen.IntType} {count : Nat}
+    (h : arrayTypeOf t = some (elemIt, count)) :
+    translateTy t = some (.Array (.Int elemIt) (Int.ofNat count)) := by
+  simp [translateTy, intTypeOf_none_of_arrayTypeOf h, h]
+
+/-! ## Uniform byte-chunk lists for homogeneous arrays -/
+
+theorem drop_length_add_append {β : Type} (a b : List β) (n : Nat) :
+    (a ++ b).drop (a.length + n) = b.drop n := by
+  induction a with
+  | nil => simp
+  | cons _ a ih => simp [Nat.succ_add, ih]
+
+theorem take_length_add_append {β : Type} (a b : List β) (n : Nat) :
+    (a ++ b).take (a.length + n) = a ++ b.take n := by
+  induction a with
+  | nil => simp
+  | cons _ a ih => simp [Nat.succ_add, ih]
+
+theorem flatten_map_length {α β : Type} (f : α → List β) (k : Nat) (xs : List α)
+    (hf : ∀ x ∈ xs, (f x).length = k) :
+    (xs.map f).flatten.length = xs.length * k := by
+  induction xs with
+  | nil => simp
+  | cons x xs ih =>
+    have hx : (f x).length = k := hf x (by simp)
+    have hxs : ∀ y ∈ xs, (f y).length = k := fun y hy => hf y (by simp [hy])
+    simp [hx, ih hxs, Nat.succ_mul, Nat.add_comm]
+
+theorem drop_mul_take_flatten_map {α β : Type} (f : α → List β) (k : Nat)
+    (xs : List α) (hf : ∀ x ∈ xs, (f x).length = k) (i : Nat) (x : α)
+    (hi : xs[i]? = some x) :
+    ((xs.map f).flatten.drop (i * k)).take k = f x := by
+  induction xs generalizing i with
+  | nil => simp at hi
+  | cons hd tl ih =>
+    have hhd : (f hd).length = k := hf hd (by simp)
+    have htl : ∀ y ∈ tl, (f y).length = k := fun y hy => hf y (by simp [hy])
+    cases i with
+    | zero =>
+      simp at hi; subst hi
+      have htake := take_length_add_append (f hd) (tl.map f).flatten 0
+      rw [hhd, Nat.add_zero] at htake
+      simpa using htake
+    | succ j =>
+      simp at hi
+      rw [List.map_cons, List.flatten_cons,
+        show (j + 1) * k = (f hd).length + j * k by rw [hhd, Nat.succ_mul, Nat.add_comm],
+        drop_length_add_append]
+      exact ih htl j hi
+
+theorem subsliceWithLength_flatten_map {α β : Type} (f : α → List β) (k : Nat)
+    (xs : List α) (hf : ∀ x ∈ xs, (f x).length = k) (i : Nat) (x : α)
+    (hi : xs[i]? = some x) :
+    subsliceWithLength (xs.map f).flatten ((i * k : Nat) : Int) (k : Int) = .ok (f x) := by
+  have hlt : i < xs.length := (List.getElem?_eq_some_iff.mp hi).1
+  have hlen : (xs.map f).flatten.length = xs.length * k := flatten_map_length f k xs hf
+  have hle : i * k + k ≤ (xs.map f).flatten.length := by
+    rw [hlen, ← Nat.succ_mul]
+    exact Nat.mul_le_mul_right k (by omega)
+  have hle' : ((i * k : Nat) : Int) + (k : Int) ≤ ((xs.map f).flatten.length : Int) := by
+    exact_mod_cast hle
+  unfold subsliceWithLength
+  split
+  · have htonat1 : (((i * k : Nat) : Int)).toNat = i * k := rfl
+    have htonat2 : ((k : Int)).toNat = k := rfl
+    rw [htonat1, htonat2, drop_mul_take_flatten_map f k xs hf i x hi]
+    rfl
+  · next hbad =>
+    exfalso
+    apply hbad
+    exact ⟨by omega, by omega, hle'⟩
+
+theorem splice_flatten_map {α β : Type} (f : α → List β) (k : Nat)
+    (xs : List α) (hf : ∀ x ∈ xs, (f x).length = k) (i : Nat) (v : α)
+    (hi : i < xs.length) :
+    (xs.map f).flatten.take (i * k) ++ f v ++ (xs.map f).flatten.drop (i * k + k) =
+      ((xs.set i v).map f).flatten := by
+  induction xs generalizing i with
+  | nil => simp at hi
+  | cons hd tl ih =>
+    have hhd : (f hd).length = k := hf hd (by simp)
+    have htl : ∀ y ∈ tl, (f y).length = k := fun y hy => hf y (by simp [hy])
+    cases i with
+    | zero =>
+      simp only [Nat.zero_mul, Nat.zero_add, List.map_cons, List.flatten_cons, List.set_cons_zero]
+      have hdrop := drop_length_add_append (f hd) (tl.map f).flatten 0
+      rw [hhd, Nat.add_zero] at hdrop
+      simp [hdrop]
+    | succ j =>
+      simp only [List.length_cons] at hi
+      have hj : j < tl.length := by omega
+      simp only [List.map_cons, List.flatten_cons, List.set_cons_succ]
+      rw [show (j + 1) * k = (f hd).length + j * k by rw [hhd, Nat.succ_mul, Nat.add_comm],
+        take_length_add_append,
+        show (f hd).length + j * k + k = (f hd).length + (j * k + k) by omega,
+        drop_length_add_append]
+      simp only [List.append_assoc]
+      congr 1
+      simpa [List.append_assoc] using ih htl j hj
 
 end MiniRustSpec.Correspondence
