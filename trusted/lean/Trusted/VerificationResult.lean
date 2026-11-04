@@ -517,7 +517,10 @@ def borrowPermAllowsRef : Mutability → TreeBorrowPerm → Bool
 Liveness check for a reference `p` whose pointee layout is not recorded in
 `body.layouts`: `p` must point into a live global allocation, or carry a
 `BorrowEntry` tag whose Tree Borrows permission admits a reference with
-mutability `refMut` and whose borrowed range contains `p.offsetBytes`.
+mutability `refMut` and that designates an initialized place: a whole caller
+local, a sub-place whose projection resolves in the caller local's value (the
+form `Rvalue.ref` creates for `&s.field`), or a byte range containing
+`p.offsetBytes`.
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -541,6 +544,15 @@ def sigPtrLiveForRef
           sigGet? mem.callerLocals entry.targetLocal
         with
         | .nil, true, true, .some (.init _) => True
+        | _ :: _, true, true, .some (.init targetVal) =>
+          match Nat.beq entry.rangeLen 0 with
+          | true =>
+            match readProjectedValue .nil targetVal entry.targetProjection with
+            | .ok _ => True
+            | _ => False
+          | false =>
+            entry.rangeOffset ≤ p.offsetBytes ∧
+              p.offsetBytes ≤ entry.rangeOffset + entry.rangeLen
         | _, _, _, _ =>
           0 < entry.rangeLen ∧
             entry.rangeOffset ≤ p.offsetBytes ∧
@@ -548,32 +560,61 @@ def sigPtrLiveForRef
     | .none => False
 
 /--
-Test whether `adtDefPath` names a standard-library single-variant wrapper struct
-whose source fields are guaranteed to match `adtArgs` positionally (`Range<Idx>`
-repeating `Idx` for `start` and `end`, or `ManuallyDrop<T>` / `UnsafeCell<T>` /
-`Cell<T>` wrapping `T`).
+Test whether `adtDefPath` names `Range<Idx>` or `UnsafeCell<T>`, the
+standard-library structs whose source fields have exactly their type arguments
+as types (`start: Idx`, `end: Idx`; `value: T`). `anneal-rustc-capture`
+renders their paths with either the `core` or the `std` prefix.
 
-For arbitrary single-variant structs (`VariantsShape.single`), field types need
-not follow `adtArgs` (for example `NonNull<T> { pointer: *const T }`,
-`struct TaggedStruct<T> { tag: u8, val: T }`, or
-`struct FlipPair<A, B> { second: B, first: A }`). When `fieldLayouts` is
-populated by `anneal-rustc-capture`, `adtFieldsMatchWith` uses those captured
-layouts directly; when `fieldLayouts` is empty (such as after layout
-instantiation or beyond the capture recursion depth), only structs satisfying
-`sigStructFieldsAreTypeArgs` fall back to positional `adtArgs`, while all other
-structs fall back to `parentLayout.backendRepr` (`.scalar` / `.scalarPair`) and
-`valueMatchesUntypedField`.
+For other single-variant structs (`VariantsShape.single`), field types need not
+follow the type arguments: `NonNull<T> { pointer: *const T }`,
+`struct TaggedStruct<T> { tag: u8, val: T }`, `Cell<T> { value: UnsafeCell<T> }`,
+and `ManuallyDrop<T> { value: MaybeDangling<T> }`. A layout captured by
+`anneal-rustc-capture` (`fieldLayouts`) types each field directly. When none is
+recorded (beyond the capture recursion depth, or for a layout recomputed by
+`CapturedMir.instantiate`), only structs satisfying this test are typed
+positionally against their type arguments; other structs fall back to
+`sigFieldMatchesBackendRepr`.
+
+Reference (`library/core/src/ops/range.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ops/range.rs#L82-L89>
+
+> "pub struct Range<Idx> {
+>     /// The lower bound of the range (inclusive).
+>     #[stable(feature = "rust1", since = "1.0.0")]
+>     pub start: Idx,
+>     /// The upper bound of the range (exclusive).
+>     #[stable(feature = "rust1", since = "1.0.0")]
+>     pub end: Idx,
+> }"
+
+Reference (`library/core/src/cell.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/cell.rs#L2323-L2325>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/cell.rs#L312-L314>
+
+> "pub struct UnsafeCell<T: ?Sized> {
+>     value: T,
+> }"
+>
+> "pub struct Cell<T: ?Sized> {
+>     value: UnsafeCell<T>,
+> }"
+
+Reference (`library/core/src/mem/manually_drop.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/mem/manually_drop.rs#L161-L163>
+
+> "pub struct ManuallyDrop<T: ?Sized> {
+>     value: MaybeDangling<T>,
+> }"
 -/
 @[reducible, simp]
 def sigStructFieldsAreTypeArgs (adtDefPath : String) : Bool :=
   sigStringEq adtDefPath "core::ops::range::Range" ||
     sigStringEq adtDefPath "std::ops::Range" ||
-    sigStringEq adtDefPath "core::mem::manually_drop::ManuallyDrop" ||
-    sigStringEq adtDefPath "std::mem::ManuallyDrop" ||
     sigStringEq adtDefPath "core::cell::UnsafeCell" ||
-    sigStringEq adtDefPath "std::cell::UnsafeCell" ||
-    sigStringEq adtDefPath "core::cell::Cell" ||
-    sigStringEq adtDefPath "std::cell::Cell"
+    sigStringEq adtDefPath "std::cell::UnsafeCell"
 
 /--
 Test whether `adtDefPath` names `Option<T>` or `Result<T, E>`, the standard
@@ -735,8 +776,69 @@ def sigScalarNicheHolds (layout : TypeLayout) (fields : List Value) : Prop :=
   | _, _ => True
 
 /--
+Validate field value `v` against one scalar component `sl` of its parent's
+`Scalar` or `ScalarPair` `BackendRepr`, after unwrapping newtypes: the field of
+`Cell<u32>` is an `UnsafeCell<u32>` aggregate wrapping the `u32`. A field that
+does not reduce to a bare scalar or pointer, such as a zero-sized field or a
+nested aggregate holding both components of a pair, is checked structurally.
+-/
+@[reducible, simp]
+def sigFieldMatchesScalarComponent
+    (fuel' : Nat) (sl : ScalarLayout) (v : Value) : Prop :=
+  match sigUnwrapNewtype 8 v with
+  | .scalar sv => valueMatchesScalarLayout sl (.scalar sv)
+  | .ptr p ptrSz => valueMatchesScalarLayout sl (.ptr p ptrSz)
+  | inner => valueMatchesUntypedField fuel' inner
+
+/--
+Validate field `pos` (value `v`) of a single-variant aggregate whose `layout`
+records no `fieldLayouts`, using its `Scalar` or `ScalarPair` `BackendRepr`.
+
+Fields appear in source order, but `BackendRepr` components do not follow them:
+rustc may reorder fields (`struct S { a: u8, b: u32 }` places `b` at offset
+`0`), and a `ScalarPair` stores its first component at offset `0` and its second
+at a nonzero offset. A `Scalar` aggregate has one non-zero-sized field, so every
+field is matched against the scalar (zero-sized fields reduce to structural
+checks in `sigFieldMatchesScalarComponent`). For a `ScalarPair`, field `pos`
+selects the first component when its offset in `FieldsShape.arbitrary` is `0`
+and the second component otherwise. Without a `Scalar` or `ScalarPair`
+`BackendRepr`, the field is checked structurally.
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L2118-L2121>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1878-L1880>
+
+> "Note that this is entirely orthogonal to the recursive structure defined by
+> `variants` and `fields`; for example, `ManuallyDrop<Result<isize, isize>>` has
+> `IrForm::ScalarPair`! So, even with non-`Memory` `backend_repr`, `fields` and `variants`
+> have to be taken into account to find all fields of this layout."
+>
+> "// May have some padding between the pair.
+> BackendRepr::ScalarPair(s1, s2) => {
+>     let field2_offset = s1.size(cx).align_to(s2.align(cx).abi);"
+-/
+@[reducible, simp]
+def sigFieldMatchesBackendRepr
+    (fuel' : Nat) (layout : TypeLayout) (pos : Nat) (v : Value) : Prop :=
+  match layout.variants, layout.backendRepr with
+  | .single _, .scalar sl => sigFieldMatchesScalarComponent fuel' sl v
+  | .single _, .scalarPair sl0 sl1 =>
+    match layout.fields with
+    | .arbitrary offsets _ =>
+      match sigGet? offsets pos with
+      | .some off =>
+        match Nat.beq off.bytes 0 with
+        | true => sigFieldMatchesScalarComponent fuel' sl0 v
+        | false => sigFieldMatchesScalarComponent fuel' sl1 v
+      | .none => valueMatchesUntypedField fuel' v
+    | _ => valueMatchesUntypedField fuel' v
+  | _, _ => valueMatchesUntypedField fuel' v
+
+/--
 Recursively validate each field of an untyped ADT against `parentLayout` using
-`layoutPred` when `fieldLayouts` is populated.
+`layoutPred` when `fieldLayouts` is populated, and `sigFieldMatchesBackendRepr`
+otherwise.
 -/
 @[reducible, simp]
 def adtFieldsLayoutOnlyWith
@@ -751,18 +853,7 @@ def adtFieldsLayoutOnlyWith
       match sigGet? parentLayout.fieldLayouts pos with
       | .some fIdx =>
         layoutPred (sigGet? body.layouts.entries fIdx) fIdx v
-      | .none =>
-        match parentLayout.variants, parentLayout.backendRepr with
-        | .single _, .scalar sl =>
-          match pos, restV with
-          | 0, .nil => valueMatchesScalarLayout sl v
-          | _, _ => valueMatchesUntypedField fuel' v
-        | .single _, .scalarPair sl0 sl1 =>
-          match pos with
-          | 0 => valueMatchesScalarLayout sl0 v
-          | 1 => valueMatchesScalarLayout sl1 v
-          | _ => valueMatchesUntypedField fuel' v
-        | _, _ => valueMatchesUntypedField fuel' v
+      | .none => sigFieldMatchesBackendRepr fuel' parentLayout pos v
     ok ∧
       adtFieldsLayoutOnlyWith fuel' body parentLayout layoutPred (pos + 1) restV
 
@@ -960,10 +1051,10 @@ A field layout captured by `anneal-rustc-capture` (`fieldLayouts`, interned from
 types need not coincide with the ADT's type arguments (for example
 `NonNull<T> { pointer: *const T }` or `struct S<T> { len: usize, data: T }`).
 Only fields without a captured layout are matched positionally against `adtArgs`
-when `sigStructFieldsAreTypeArgs` (for single-variant wrappers) or
+when `sigStructFieldsAreTypeArgs` (for `Range` and `UnsafeCell`) or
 `sigEnumPayloadsAreTypeArgs` (for `Option` and `Result`) holds, repeating the
-last argument for trailing fields, and otherwise against
-`parentLayout.backendRepr` or `valueMatchesUntypedField`.
+last argument for trailing fields, and otherwise through
+`sigFieldMatchesBackendRepr`.
 -/
 @[reducible, simp]
 def adtFieldsMatchWith
@@ -994,18 +1085,7 @@ def adtFieldsMatchWith
               body parentLayout parentLayoutIdx (.some pos) argKind)
             parentLayoutIdx
             v
-        | .nil =>
-          match parentLayout.variants, parentLayout.backendRepr with
-          | .single _, .scalar sl =>
-            match pos, restV with
-            | 0, .nil => valueMatchesScalarLayout sl v
-            | _, _ => valueMatchesUntypedField fuel' v
-          | .single _, .scalarPair sl0 sl1 =>
-            match pos with
-            | 0 => valueMatchesScalarLayout sl0 v
-            | 1 => valueMatchesScalarLayout sl1 v
-            | _ => valueMatchesUntypedField fuel' v
-          | _, _ => valueMatchesUntypedField fuel' v
+        | .nil => sigFieldMatchesBackendRepr fuel' parentLayout pos v
     fieldOk ∧
       adtFieldsMatchWith
         fuel' body parentLayout parentLayoutIdx tyPred mem (pos + 1)
@@ -1168,6 +1248,31 @@ def valueMatchesRigidTyAndLayout :
                             layoutIdx
                             targetVal
                             mem
+                      | _ :: _, true, true, .some (.init targetVal) =>
+                        match Nat.beq entry.rangeLen 0 with
+                        | true =>
+                          -- `Rvalue.ref` borrows a sub-place such as `&s.field`
+                          -- by recording its projection with no byte range, and
+                          -- `evalPlaceRead` reads the pointee by applying that
+                          -- projection to the borrowed local's value.
+                          match
+                            readProjectedValue
+                              .nil targetVal entry.targetProjection
+                          with
+                          | .ok pointeeVal =>
+                            valueMatchesRigidTyAndLayout
+                              fuel'
+                              body
+                              pointee
+                              (.some pointeeLayout)
+                              layoutIdx
+                              pointeeVal
+                              mem
+                          | _ => False
+                        | false =>
+                          entry.rangeOffset ≤ p.offsetBytes ∧
+                            p.offsetBytes + pointeeLayout.size.bytes ≤
+                              entry.rangeOffset + entry.rangeLen
                       | _, _, _, _ =>
                         0 < entry.rangeLen ∧
                           entry.rangeOffset ≤ p.offsetBytes ∧

@@ -1548,6 +1548,44 @@ def rcTaggedStructBoolTypeLayout : TypeLayout := {
   isUninhabited := false
 }
 
+/-- `Cell<u32>` without captured `fieldLayouts`: its only field is an
+`UnsafeCell<u32>`, not a `u32`. -/
+@[reducible]
+def rcCellU32TypeLayout : TypeLayout := {
+  size := { bytes := 4 }
+  align := { bytes := 4 }
+  backendRepr := .scalar (.initialized (.int 32 false) { start := 0, end_ := 4294967295 })
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .single 0
+  isUninhabited := false
+}
+
+/-- `UnsafeCell<bool>` without captured `fieldLayouts`: its only field is a
+`bool`. -/
+@[reducible]
+def rcUnsafeCellBoolTypeLayout : TypeLayout := {
+  size := { bytes := 1 }
+  align := { bytes := 1 }
+  backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 1 })
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .single 0
+  isUninhabited := false
+}
+
+/-- `struct Reordered { a: u8, b: u32 }` without captured `fieldLayouts`: rustc
+places `b` at offset `0`, so the first `ScalarPair` component is `b`. -/
+@[reducible]
+def rcReorderedTypeLayout : TypeLayout := {
+  size := { bytes := 8 }
+  align := { bytes := 4 }
+  backendRepr := .scalarPair
+    (.initialized (.int 32 false) { start := 0, end_ := 4294967295 })
+    (.initialized (.int 8 false) { start := 0, end_ := 255 })
+  fields := .arbitrary [{ bytes := 4 }, { bytes := 0 }] [1, 0]
+  variants := .single 0
+  isUninhabited := false
+}
+
 /-- Deduplicated layout table shaped like `anneal-rustc-capture` output: no
 pointee layout is interned next to the shared thin-pointer slot `1`. -/
 @[reducible]
@@ -1566,7 +1604,10 @@ def rcLayoutTable : LayoutTable := {
     rcOptionBoolTypeLayout,       -- 8: Option<bool>
     rcTaggedBoolTypeLayout,       -- 9: Tagged<bool>
     rcControlFlowU8BoolTypeLayout, -- 10: ControlFlow<u8, bool>
-    rcTaggedStructBoolTypeLayout  -- 11: TaggedStruct<bool> (without fieldLayouts)
+    rcTaggedStructBoolTypeLayout,  -- 11: TaggedStruct<bool> (without fieldLayouts)
+    rcCellU32TypeLayout,           -- 12: Cell<u32> (without fieldLayouts)
+    rcUnsafeCellBoolTypeLayout,    -- 13: UnsafeCell<bool> (without fieldLayouts)
+    rcReorderedTypeLayout          -- 14: Reordered (without fieldLayouts)
   ]
 }
 
@@ -1620,7 +1661,17 @@ def rcMem : Memory := {
       targetProjection := [.field 1 { kind := .uint .usize, layoutIdx := 0 }]
       perm := .frozen
       rangeOffset := 8
-      rangeLen := 8 }
+      rangeLen := 8 },
+    -- Projection-governed sub-place borrows, as `Rvalue.ref` creates them
+    -- (`&usercopy.b` resolves; field `5` does not exist).
+    { tag := 25
+      targetLocal := 0
+      targetProjection := [.field 1 { kind := .uint .usize, layoutIdx := 0 }]
+      perm := .frozen },
+    { tag := 26
+      targetLocal := 0
+      targetProjection := [.field 5 { kind := .uint .usize, layoutIdx := 0 }]
+      perm := .frozen }
   ]
   callerLocals := [
     .init (.aggregate 0 [.scalar ⟨1, 8⟩, .scalar ⟨2, 8⟩]),
@@ -1827,6 +1878,73 @@ theorem example_generic_enum_payload_signatures :
     sigThinPtrTypeLayout,
     sigWideSliceTypeLayout,
     sigRawPtrTypeLayout
+  ] <;> decide
+
+@[reducible]
+def rcCellU32Ty : Ty := { kind := .adt "core::cell::Cell" [.uint .u32], layoutIdx := 12 }
+
+@[reducible]
+def rcUnsafeCellBoolTy : Ty :=
+  { kind := .adt "core::cell::UnsafeCell" [.bool], layoutIdx := 13 }
+
+@[reducible]
+def rcReorderedTy : Ty := { kind := .adt "demo::Reordered" [], layoutIdx := 14 }
+
+@[reducible]
+def rcRefUsizeTy : Ty := { kind := .ref .not (.uint .usize), layoutIdx := 1 }
+
+@[reducible]
+def rcRefOpaqueTy : Ty := { kind := .ref .not (.adt "demo::Opaque" []), layoutIdx := 1 }
+
+/--
+Kernel-checked validation of aggregates without captured field layouts and of
+references to borrowed sub-places:
+1. `Cell<u32>` holds an `UnsafeCell<u32>`, not a `u32`, so its field is checked
+   against the `u32` scalar after unwrapping the newtype; `UnsafeCell<T>` holds
+   a `T` and is typed by its type argument.
+2. `struct Reordered { a: u8, b: u32 }` places `b` at offset `0`, so `b` is
+   checked against the first `ScalarPair` component and `a` against the second.
+3. Borrowing the sub-place `usercopy.b` records the projection `[.field 1]`.
+   The projected caller value is validated against a known pointee type, a
+   pointee of unrecorded layout only requires the projection to resolve, and an
+   unresolvable projection is rejected in both cases.
+-/
+theorem example_layoutless_fields_and_subplace_borrows :
+    argsMatchSignature (mkRcBody [rcCellU32Ty] rcUsizeTy)
+      [.aggregate 0 [.aggregate 0 [.scalar ⟨5, 4⟩]]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcCellU32Ty] rcUsizeTy)
+      [.aggregate 0 [.aggregate 0 [.scalar ⟨5, 1⟩]]] rcMem ∧
+    argsMatchSignature (mkRcBody [rcUnsafeCellBoolTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨1, 1⟩]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcUnsafeCellBoolTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨2, 1⟩]] rcMem ∧
+    argsMatchSignature (mkRcBody [rcReorderedTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨5, 1⟩, .scalar ⟨70000, 4⟩]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcReorderedTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨70000, 4⟩]] rcMem ∧
+    argsMatchSignature (mkRcBody [rcRefUsizeTy] rcUsizeTy) [.ptr ⟨25, 0⟩ 8] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefUsizeTy] rcUsizeTy) [.ptr ⟨26, 0⟩ 8] rcMem ∧
+    argsMatchSignature (mkRcBody [rcRefOpaqueTy] rcUsizeTy) [.ptr ⟨25, 0⟩ 8] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefOpaqueTy] rcUsizeTy) [.ptr ⟨26, 0⟩ 8] rcMem := by
+  set_option linter.unusedSimpArgs false in
+  simp [
+    emptyMemory,
+    rcMem,
+    rcLayoutTable,
+    mkRcBody,
+    rcUsizeTy,
+    rcCellU32Ty,
+    rcUnsafeCellBoolTy,
+    rcReorderedTy,
+    rcRefUsizeTy,
+    rcRefOpaqueTy,
+    rcCellU32TypeLayout,
+    rcUnsafeCellBoolTypeLayout,
+    rcReorderedTypeLayout,
+    readProjectedValue,
+    Trusted.Sequence.get?,
+    sigUsizeTypeLayout,
+    sigThinPtrTypeLayout
   ] <;> decide
 
 /--
