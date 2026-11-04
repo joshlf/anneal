@@ -419,14 +419,15 @@ in `evalRvalue`:
    function-pointer entry `{ allocId := fnPtrAllocBase, defPath, typeArgs, fnSig }`
    in `emptyMemory.fnPtrs` and returns
    `.ptr { allocId := fnPtrAllocBase, offsetBytes := 0 } 8`.
-2. Reifying the same `(defPath, typeArgs, fnSig)` a second time is idempotent and
-   returns the existing `allocId` without duplicating the entry in `mem.fnPtrs`.
+2. Explicit safety-tagged coercions (`"ReifyFnPointer(Safe)"` and
+   `"ReifyFnPointer(Unsafe)"`) succeed when the target `fnPtr` safety matches
+   and fault with `.ub` on a safety mismatch or `.rustIntrinsic` ABI.
 3. Casting a registered function pointer via `CastKind.fnPtrToPtr` to a thin raw
    pointer, then via `CastKind.ptrToPtr`, and then exposing its address via
    `CastKind.pointerExposeProvenance` yields the deterministic exposed scalar
    address `allocId * 65536`.
-4. Applying `CastKind.fnPtrToPtr` to an unregistered pointer or a stack borrow
-   pointer faults with `EvalResult.ub`.
+4. Applying `CastKind.fnPtrToPtr` to an unregistered pointer faults with
+   `EvalResult.ub`.
 -/
 theorem mir_evalRvalue_reifyFnPointer_and_fnPtrToPtr_chain
     (locals : List LocalSlot)
@@ -519,21 +520,22 @@ theorem mir_evalRvalue_reifyFnPointer_and_fnPtrToPtr_chain
   have hNeUnsafe3 : stringEq "ReifyFnPointer(Unsafe)" "UnsafeFnPointer" = false := by decide
   have hSafeCompat1 :
       reifyCoercionSafetyCompatible "ReifyFnPointer" sigSafety = true := by
-    simp [reifyCoercionSafetyCompatible]
-    rfl
+    cases sigSafety <;> rfl
   have hSafeCompat2 :
       reifyCoercionSafetyCompatible "ReifyFnPointer(Safe)" .safe = true := by decide
   have hSafeCompat3 :
       reifyCoercionSafetyCompatible "ReifyFnPointer(Safe)" .unsafe_ = false := by decide
   have hSafeCompat4 :
       reifyCoercionSafetyCompatible "ReifyFnPointer(Unsafe)" .safe = false := by decide
+  have hNotClosure1 : isClosureFnPointerCoercion "ReifyFnPointer" = false := by decide
+  have hNotClosure2 : isClosureFnPointerCoercion "ReifyFnPointer(Safe)" = false := by decide
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · simp [evalRvalue, evalReifyFnPointer, hReify1, hNeUnsafe1, hNotIntrinsic,
-      hSafeCompat1, emptyMemory, extractFnItemTarget?, checkCalleeSig,
-      findFnPtrEntry?, nextFnPtrAllocId, evalOperand, evalConstValue]
+      hSafeCompat1, hNotClosure1, extractReifyCoercionTarget?, extractFnItemTarget?,
+      emptyMemory, checkCalleeSig, findFnPtrEntry?, nextFnPtrAllocId, evalOperand, evalConstValue]
   · simp [evalRvalue, evalReifyFnPointer, hReify2, hNeUnsafe2, hNotIntrinsic,
-      hSafeCompat2, emptyMemory, extractFnItemTarget?, checkCalleeSig,
-      findFnPtrEntry?, nextFnPtrAllocId, evalOperand, evalConstValue]
+      hSafeCompat2, hNotClosure2, extractReifyCoercionTarget?, extractFnItemTarget?,
+      emptyMemory, checkCalleeSig, findFnPtrEntry?, nextFnPtrAllocId, evalOperand, evalConstValue]
   · simp [evalRvalue, evalReifyFnPointer, hReify2, hNeUnsafe2, hNotIntrinsic,
       hSafeCompat3, evalOperand, evalConstValue]
   · simp [evalRvalue, evalReifyFnPointer, hReify3, hNeUnsafe3, hNotIntrinsic,
@@ -548,15 +550,19 @@ theorem mir_evalRvalue_reifyFnPointer_and_fnPtrToPtr_chain
       isThinRawPtrTy, emptyMemory, lookupBorrow, isFnPtrAllocId, fnPtrAllocBase]
 
 /--
-Universal characterization of `checkCalleeSig`, `PointerCoercion::UnsafeFnPointer`,
-and `safetyCompatible` in `evalRvalue` and `fnEntryCompatibleWithCallSite`:
+Universal characterization of `checkCalleeSig`, `PointerCoercion::ClosureFnPointer`,
+`PointerCoercion::UnsafeFnPointer`, and `safetyCompatible` in `evalRvalue` and
+`fnEntryCompatibleWithCallSite`:
 1. Reifying a function item when `checkCalleeSig mem.callees defPath sigInputs sigOut sigAbi = false`
    faults with `RvalueEvalResult.ub`.
-2. Applying `CastKind.pointerCoercion "UnsafeFnPointer"` to a registered safe
+2. Applying `"ClosureFnPointer(Safe)"` to a non-capturing closure
+   (`.closure defPath .nil`) succeeds, while applying `"ClosureFnPointer(Safe)"`
+   to a `.fnDef` or `"ReifyFnPointer"` to a `.closure` faults with `.ub`.
+3. Applying `CastKind.pointerCoercion "UnsafeFnPointer"` to a registered safe
    function pointer (`Safety.safe`) produces the same `ProvenancePtr` at the
    matching `Safety.unsafe_` signature, whereas applying `"UnsafeFnPointer"` to
    a `.safe` target signature faults with `RvalueEvalResult.ub`.
-3. An `.unsafe_` `FnPtrEntry` is rejected by `fnEntryCompatibleWithCallSite` when
+4. An `.unsafe_` `FnPtrEntry` is rejected by `fnEntryCompatibleWithCallSite` when
    the call-site operand has `Safety.safe`.
 -/
 theorem mir_evalRvalue_reifyFnPointer_callee_sig_and_unsafeFnPointer_corresponds
@@ -571,6 +577,8 @@ theorem mir_evalRvalue_reifyFnPointer_callee_sig_and_unsafeFnPointer_corresponds
     (hNotIntrinsic : callConvEq sigAbi .rustIntrinsic = false) :
     let fnItemTy : Ty := { kind := .fnDef defPath typeArgs, layoutIdx := 0 }
     let fnConstOp : Operand := .constant { ty := fnItemTy, val := .zeroSized }
+    let closureTy : Ty := { kind := .closure defPath .nil, layoutIdx := 0 }
+    let closureConstOp : Operand := .constant { ty := closureTy, val := .zeroSized }
     let fnPtrTy : Ty := { kind := .fnPtr sigInputs sigOut sigSafety sigAbi, layoutIdx := 0 }
     let safeFnKind : RigidTy := .fnPtr [.uint .u64] (.uint .u64) .safe .rust
     let unsafeFnKind : RigidTy := .fnPtr [.uint .u64] (.uint .u64) .unsafe_ .rust
@@ -601,6 +609,21 @@ theorem mir_evalRvalue_reifyFnPointer_callee_sig_and_unsafeFnPointer_corresponds
         (.cast (.pointerCoercion "ReifyFnPointer") fnConstOp fnPtrTy)
         mem = .ub) ∧
     (evalRvalue
+        locals
+        (.cast (.pointerCoercion "ClosureFnPointer(Safe)") closureConstOp safeFnTy)
+        emptyMemory =
+      .ok (.ptr expectedPtr 8) locals memWithSafe) ∧
+    (evalRvalue
+        locals
+        (.cast (.pointerCoercion "ClosureFnPointer(Safe)") fnConstOp safeFnTy)
+        emptyMemory =
+      .ub) ∧
+    (evalRvalue
+        locals
+        (.cast (.pointerCoercion "ReifyFnPointer") closureConstOp safeFnTy)
+        emptyMemory =
+      .ub) ∧
+    (evalRvalue
         [.init (.ptr expectedPtr 8)]
         (.cast (.pointerCoercion "UnsafeFnPointer") (.copy ⟨0, .nil⟩) unsafeFnTy)
         memWithSafe =
@@ -617,17 +640,36 @@ theorem mir_evalRvalue_reifyFnPointer_callee_sig_and_unsafeFnPointer_corresponds
       .ub) ∧
     (fnEntryCompatibleWithCallSite unsafeEntry 1 (.some safeFnTy) = false) := by
   have hReify : isReifyFnPointerCoercion "ReifyFnPointer" = true := by decide
+  have hClosureSafe : isReifyFnPointerCoercion "ClosureFnPointer(Safe)" = true := by decide
   have hReifyUnsafe : isReifyFnPointerCoercion "UnsafeFnPointer" = true := by decide
   have hEqUnsafe : stringEq "UnsafeFnPointer" "UnsafeFnPointer" = true := by decide
+  have hNeUnsafeClosure : stringEq "ClosureFnPointer(Safe)" "UnsafeFnPointer" = false := by decide
   have hSafeCompat :
       reifyCoercionSafetyCompatible "ReifyFnPointer" sigSafety = true := by
-    simp [reifyCoercionSafetyCompatible]
-    rfl
-  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+    cases sigSafety <;> rfl
+  have hSafeCompatClosure :
+      reifyCoercionSafetyCompatible "ClosureFnPointer(Safe)" .safe = true := by decide
+  have hNotClosure : isClosureFnPointerCoercion "ReifyFnPointer" = false := by decide
+  have hIsClosureSafe : isClosureFnPointerCoercion "ClosureFnPointer(Safe)" = true := by decide
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro hSigFalse
     have hNeUnsafe : stringEq "ReifyFnPointer" "UnsafeFnPointer" = false := by decide
     simp [evalRvalue, evalReifyFnPointer, hReify, hNeUnsafe, hNotIntrinsic,
-      hSafeCompat, hSigFalse, extractFnItemTarget?, evalOperand, evalConstValue]
+      hSafeCompat, hNotClosure, extractReifyCoercionTarget?, extractFnItemTarget?,
+      hSigFalse, evalOperand, evalConstValue]
+  · simp [evalRvalue, evalReifyFnPointer, hClosureSafe, hNeUnsafeClosure,
+      hSafeCompatClosure, hIsClosureSafe, extractReifyCoercionTarget?,
+      emptyMemory, checkCalleeSig, findFnPtrEntry?, nextFnPtrAllocId,
+      evalOperand, evalConstValue, callConvEq]
+  · simp [evalRvalue, evalReifyFnPointer, hClosureSafe, hNeUnsafeClosure,
+      hSafeCompatClosure, hIsClosureSafe, extractReifyCoercionTarget?,
+      evalOperand, evalConstValue, callConvEq]
+  · have hNeUnsafe : stringEq "ReifyFnPointer" "UnsafeFnPointer" = false := by decide
+    have hSafeCompatReifySafe :
+        reifyCoercionSafetyCompatible "ReifyFnPointer" .safe = true := by decide
+    simp [evalRvalue, evalReifyFnPointer, hReify, hNeUnsafe,
+      hSafeCompatReifySafe, hNotClosure, extractReifyCoercionTarget?, extractFnItemTarget?,
+      evalOperand, evalConstValue, callConvEq]
   · simp [evalRvalue, evalReifyFnPointer, hReifyUnsafe, hEqUnsafe, evalUnsafeFnPointer,
       evalOperand, get?, readProjectedValue, emptyMemory, lookupBorrow,
       lookupFnPtr, callConvEq, rigidTyListEq, rigidTyEq,
@@ -734,7 +776,6 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
         callerBody.layouts
         s.memory.callerLocals = .ok argVals (locals' argVals) →
       findCallee? s.memory.callees fnEntry.defPath = .none →
-      stringEq fnEntry.defPath "core::intrinsics::exact_div" = false →
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
         MirStepNode.extCall
           { defPath := fnEntry.defPath, args := argVals, memory := s.memory }
@@ -773,26 +814,26 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
   refine ⟨?_, ?_, ?_, ?_, ?_⟩
   · intro hLookup hCompatSite hArgs hFind hCompatBody
     refine ⟨?_, ?_⟩ <;>
-      simp only [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc, hOffsetZero,
-        hNoBorrow, hLookup, hCompatSite, hArgs, hFind, hCompatBody,
-        Nat.beq_refl, Bool.and_self]
-  · intro hLookup hCompatSite hArgs hFindNone hNotExactDiv
+      simp only [evalTerminator, bodyLocalDeclsOf, isDirectExactDivTarget, resolveCallTarget,
+        hNoDirect, hEvalFunc, hOffsetZero, hNoBorrow, hLookup, hCompatSite, hArgs, hFind,
+        hCompatBody, Nat.beq_refl, Bool.and_self]
+  · intro hLookup hCompatSite hArgs hFindNone
     refine ⟨?_, ?_⟩ <;>
-      simp only [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc, hOffsetZero,
-        hNoBorrow, hLookup, hCompatSite, hArgs, hFindNone, hNotExactDiv,
+      simp only [evalTerminator, bodyLocalDeclsOf, isDirectExactDivTarget, resolveCallTarget,
+        hNoDirect, hEvalFunc, hOffsetZero, hNoBorrow, hLookup, hCompatSite, hArgs, hFindNone,
         Nat.beq_refl, Bool.and_self]
   · intro hLookupNone
     refine ⟨?_, ?_⟩ <;>
-      simp only [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc, hOffsetZero,
-        hNoBorrow, hLookupNone, Nat.beq_refl, Bool.and_self]
+      simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hNoDirect, hEvalFunc,
+        hOffsetZero, hNoBorrow, hLookupNone, Nat.beq_refl, Bool.and_self]
   · intro hLookup hCompatFalse
     refine ⟨?_, ?_⟩ <;>
-      simp only [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc, hOffsetZero,
-        hNoBorrow, hLookup, hCompatFalse, Nat.beq_refl, Bool.and_self]
+      simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hNoDirect, hEvalFunc,
+        hOffsetZero, hNoBorrow, hLookup, hCompatFalse, Nat.beq_refl, Bool.and_self]
   · intro hLookup hCompatSite hArgs hFind hCompatBodyFalse
     refine ⟨?_, ?_⟩ <;>
-      simp only [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc, hOffsetZero,
-        hNoBorrow, hLookup, hCompatSite, hArgs, hFind, hCompatBodyFalse,
+      simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hNoDirect, hEvalFunc,
+        hOffsetZero, hNoBorrow, hLookup, hCompatSite, hArgs, hFind, hCompatBodyFalse,
         Nat.beq_refl, Bool.and_self]
 
 end Correspondence.V2026_06_01.L5_ControlAndCalls

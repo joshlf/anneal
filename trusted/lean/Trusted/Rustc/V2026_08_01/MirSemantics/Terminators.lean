@@ -582,6 +582,25 @@ def resumeExternalTailCall (ans : MirCallAns) : MirExecState :=
   | .aborted => .halted .abort
 
 /--
+Extract `localDecls` from an optional active `CapturedMir` body, defaulting to
+`.nil` when `currentBody = .none`.
+-/
+@[simp]
+def bodyLocalDeclsOf : Option CapturedMir → List LocalDecl
+  | .some b => b.localDecls
+  | .none => .nil
+
+/--
+Test whether a resolved call `target` is a direct call to the inline-modeled
+compiler intrinsic `core::intrinsics::exact_div`.
+-/
+@[simp]
+def isDirectExactDivTarget (target : ResolvedCallTarget) : Bool :=
+  match target.isIndirect with
+  | true => false
+  | false => stringEq target.defPath "core::intrinsics::exact_div"
+
+/--
 Execute a basic-block `Terminator` from state `s`.
 
 Supports `.goto`, `.return_` (both root-frame termination and interprocedural
@@ -734,10 +753,7 @@ def evalTerminator
           | .unsupported => MirStepNode.unsupported
         | _ => MirStepNode.fail .ub
   | .call func argOps destination (.some targetBb) unwind =>
-    let bodyLocalDecls : List LocalDecl :=
-      match currentBody with
-      | .some b => b.localDecls
-      | .none => .nil
+    let bodyLocalDecls := bodyLocalDeclsOf currentBody
     let bodyLayouts : LayoutTable :=
       match currentBody with
       | .some b => b.layouts
@@ -783,7 +799,7 @@ def evalTerminator
                   calleeBody
                   argVals)
         | .none =>
-          match stringEq target.defPath "core::intrinsics::exact_div" with
+          match isDirectExactDivTarget target with
           | true =>
             match argVals with
             | .scalar lhs :: .scalar rhs :: .nil =>
@@ -826,10 +842,7 @@ def evalTerminator
   -- enabling further optimizations. Reaching this function is completely
   -- undefined behavior."
   | .call func argOps _ .none _ =>
-    let bodyLocalDecls : List LocalDecl :=
-      match currentBody with
-      | .some b => b.localDecls
-      | .none => .nil
+    let bodyLocalDecls := bodyLocalDeclsOf currentBody
     let bodyLayouts : LayoutTable :=
       match currentBody with
       | .some b => b.layouts
@@ -849,10 +862,7 @@ def evalTerminator
       | "core::hint::unreachable_unchecked" => MirStepNode.fail .ub
       | _ => MirStepNode.unsupported
   | .tailCall func argOps =>
-    let bodyLocalDecls : List LocalDecl :=
-      match currentBody with
-      | .some b => b.localDecls
-      | .none => .nil
+    let bodyLocalDecls := bodyLocalDeclsOf currentBody
     let bodyLayouts : LayoutTable :=
       match currentBody with
       | .some b => b.layouts

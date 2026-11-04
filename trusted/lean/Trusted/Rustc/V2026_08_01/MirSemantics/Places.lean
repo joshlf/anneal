@@ -1787,11 +1787,8 @@ def isReifyFnPointerCoercion (coercionKind : String) : Bool :=
               (stringEq coercionKind "UnsafeFnPointer"))))))
 
 /--
-Extract the target `(defPath, typeArgs)` from the `Ty` of an operand being
-reified into a function pointer via `ReifyFnPointer` or `ClosureFnPointer`.
-
-Accepts `RigidTy.fnDef defPath typeArgs` and zero-upvar
-`RigidTy.closure defPath .nil`.
+Extract the target `(defPath, typeArgs)` from the `Ty` of a function-item
+operand (`RigidTy.fnDef defPath typeArgs`).
 
 Reference (The Rust Reference, "Function item types"):
 <https://doc.rust-lang.org/1.98.0/reference/types/function-item.html>
@@ -1802,8 +1799,57 @@ Reference (The Rust Reference, "Function item types"):
 -/
 def extractFnItemTarget? : Option Ty → Option (DefPath × List RigidTy)
   | .some { kind := .fnDef defPath typeArgs, .. } => .some (defPath, typeArgs)
-  | .some { kind := .closure defPath .nil, .. } => .some (defPath, .nil)
   | _ => .none
+
+/--
+Test whether `coercionKind` is one of the `PointerCoercion::ClosureFnPointer`
+coercion tags (`"ClosureFnPointer"`, `"ClosureFnPointer(Safe)"`, or
+`"ClosureFnPointer(Unsafe)"`).
+-/
+@[reducible]
+def isClosureFnPointerCoercion (coercionKind : String) : Bool :=
+  Bool.or
+    (stringEq coercionKind "ClosureFnPointer")
+    (Bool.or
+      (stringEq coercionKind "ClosureFnPointer(Safe)")
+      (stringEq coercionKind "ClosureFnPointer(Unsafe)"))
+
+/--
+Extract the target `(defPath, typeArgs)` from the `Ty` of an operand being
+reified into a function pointer via `coercionKind`:
+- For `"ClosureFnPointer"` / `"ClosureFnPointer(Safe)"` /
+  `"ClosureFnPointer(Unsafe)"`, requires a non-capturing closure type
+  `RigidTy.closure defPath .nil`.
+- For `"ReifyFnPointer"` / `"ReifyFnPointer(Safe)"` /
+  `"ReifyFnPointer(Unsafe)"`, requires a function-item type
+  `RigidTy.fnDef defPath typeArgs`.
+
+Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L18-L41>
+
+> "pub enum PointerCoercion {
+>     /// Go from a fn-item type to a fn-pointer type.
+>     ReifyFnPointer(Safety),
+>
+>     /// Go from a safe fn pointer to an unsafe fn pointer.
+>     UnsafeFnPointer,
+>
+>     /// Go from a non-capturing closure to a fn pointer or an unsafe fn pointer.
+>     /// It cannot convert a closure that requires unsafe.
+>     ClosureFnPointer(Safety),"
+-/
+@[reducible]
+def extractReifyCoercionTarget?
+    (coercionKind : String)
+    (tyOpt : Option Ty) :
+    Option (DefPath × List RigidTy) :=
+  match isClosureFnPointerCoercion coercionKind with
+  | true =>
+    match tyOpt with
+    | .some { kind := .closure defPath .nil, .. } => .some (defPath, .nil)
+    | _ => .none
+  | false => extractFnItemTarget? tyOpt
 
 /--
 Test whether `ty` is a thin raw pointer type (`RigidTy.rawPtr _ pointee` where
@@ -2064,52 +2110,66 @@ def evalReifyFnPointer
     (layouts : LayoutTable)
     (coercionKind : String := "ReifyFnPointer") :
     RvalueEvalResult :=
-  match stringEq coercionKind "UnsafeFnPointer" with
-  | true =>
-    evalUnsafeFnPointer locals op targetTy mem localDecls layouts
+  match isReifyFnPointerCoercion coercionKind with
   | false =>
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+    | .ok (.ptr ptrVal sz) locals' => .ok (.ptr ptrVal sz) locals' mem
+    | .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' =>
+      .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
+    | .ok _ _ => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported
-    | .ok v locals' =>
-      let isZstVal :=
-        match v with
-        | .unit => true
-        | .aggregate 0 .nil => true
-        | _ => false
-      match isZstVal with
-      | false => .ub
-      | true =>
-        match targetTy.kind with
-        | .fnPtr fnInputs fnOutput fnSafety fnAbi =>
-          match
-            Bool.and
-              (Bool.not (callConvEq fnAbi .rustIntrinsic))
-              (reifyCoercionSafetyCompatible coercionKind fnSafety)
-          with
-          | false => .ub
-          | true =>
-            match extractFnItemTarget? (operandTy localDecls layouts op) with
-            | .some (defPath, typeArgs) =>
+  | true =>
+    match stringEq coercionKind "UnsafeFnPointer" with
+    | true =>
+      evalUnsafeFnPointer locals op targetTy mem localDecls layouts
+    | false =>
+      match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+      | .ub => .ub
+      | .unsupported => .unsupported
+      | .ok v locals' =>
+        let isZstVal :=
+          match v with
+          | .unit => true
+          | .aggregate 0 .nil => true
+          | _ => false
+        match isZstVal with
+        | false => .ub
+        | true =>
+          match targetTy.kind with
+          | .fnPtr fnInputs fnOutput fnSafety fnAbi =>
+            match
+              Bool.and
+                (Bool.not (callConvEq fnAbi .rustIntrinsic))
+                (reifyCoercionSafetyCompatible coercionKind fnSafety)
+            with
+            | false => .ub
+            | true =>
               match
-                checkCalleeSig
-                  mem.callees
-                  defPath
-                  fnInputs
-                  fnOutput
-                  fnAbi
+                extractReifyCoercionTarget?
+                  coercionKind
+                  (operandTy localDecls layouts op)
               with
-              | false => .ub
-              | true =>
-                let (allocId, mem') :=
-                  internFnPtr mem defPath typeArgs (.some targetTy.kind)
-                let p : ProvenancePtr := {
-                  allocId := allocId
-                  offsetBytes := 0
-                }
-                .ok (.ptr p 8) locals' mem'
-            | .none => .ub
-        | _ => .ub
+              | .some (defPath, typeArgs) =>
+                match
+                  checkCalleeSig
+                    mem.callees
+                    defPath
+                    fnInputs
+                    fnOutput
+                    fnAbi
+                with
+                | false => .ub
+                | true =>
+                  let (allocId, mem') :=
+                    internFnPtr mem defPath typeArgs (.some targetTy.kind)
+                  let p : ProvenancePtr := {
+                    allocId := allocId
+                    offsetBytes := 0
+                  }
+                  .ok (.ptr p 8) locals' mem'
+              | .none => .ub
+          | _ => .ub
 
 /--
 Evaluate `CastKind.fnPtrToPtr`, casting an 8-byte function pointer (`Value.ptr`)
@@ -2547,17 +2607,7 @@ def evalRvalue
     | .ub => .ub
     | .unsupported => .unsupported
   | .cast (.pointerCoercion coercionKind) op targetTy =>
-    match isReifyFnPointerCoercion coercionKind with
-    | true =>
-      evalReifyFnPointer locals op targetTy mem localDecls layouts coercionKind
-    | false =>
-      match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
-      | .ok (.ptr ptrVal sz) locals' => .ok (.ptr ptrVal sz) locals' mem
-      | .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' =>
-        .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
-      | .ok _ _ => .unsupported
-      | .ub => .ub
-      | .unsupported => .unsupported
+    evalReifyFnPointer locals op targetTy mem localDecls layouts coercionKind
   | .cast .fnPtrToPtr op targetTy =>
     evalFnPtrToPtr locals op targetTy mem localDecls layouts
   | .cast .pointerExposeProvenance op _ =>
