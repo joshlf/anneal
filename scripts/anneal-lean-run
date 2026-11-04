@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+#
+# Copyright 2026 The Fuchsia Authors
+#
+# Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+# <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+# license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+# This file may not be copied, modified, or distributed except according to
+# those terms.
+
+"""Hardware-matched resource wrapper for `lake`, `lean`, and `cargo` commands.
+
+Probes the host's logical CPU count and physical RAM (`MemTotal` and
+`MemAvailable`) at invocation time, partitions threads and memory across the
+active worktree concurrency factor `W`, and executes the target command inside a
+fail-fast OS memory boundary (`MemoryMax` with `MemorySwapMax=0` when `systemd`
+user scopes are available) and a wall-clock timeout.
+
+Why this wrapper exists:
+- Lean 4's `-M <MB>` flag bounds only the internal small-object allocator and
+  does not cap total process RSS, `mmap` regions, or child processes spawned by
+  `lake build`.
+- On hosts with large swap partitions, an unbounded kernel `whnf` or `dsimp`
+  blowup pages tens of gigabytes per minute to disk (`iowait ~90%`) instead of
+  failing fast, wedging interactive SSH sessions and background daemons.
+- Setting `MemorySwapMax=0` alongside `MemoryMax` derived from physical RAM
+  forces the kernel cgroup controller to terminate only the runaway `lean`
+  scope immediately (`exit 137`) with zero swap thrashing.
+"""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import fcntl
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from typing import Iterator
+
+sys.dont_write_bytecode = True
+
+
+def probe_host_hardware() -> dict[str, int]:
+    """Returns host logical CPU count and physical memory in MiB."""
+    cpu_cores = os.cpu_count() or 4
+    mem_total_mb = 16384
+    mem_avail_mb = 12288
+
+    meminfo = Path("/proc/meminfo")
+    if meminfo.is_file():
+        try:
+            raw = meminfo.read_text(encoding="utf-8", errors="replace")
+            kv: dict[str, int] = {}
+            for line in raw.splitlines():
+                parts = line.split(":")
+                if len(parts) != 2:
+                    continue
+                key = parts[0].strip()
+                val_parts = parts[1].strip().split()
+                if val_parts and val_parts[0].isdigit():
+                    kv[key] = int(val_parts[0]) // 1024
+            if "MemTotal" in kv and kv["MemTotal"] > 0:
+                mem_total_mb = kv["MemTotal"]
+            if "MemAvailable" in kv and kv["MemAvailable"] > 0:
+                mem_avail_mb = kv["MemAvailable"]
+            elif "MemFree" in kv:
+                mem_avail_mb = kv["MemFree"] + kv.get("Cached", 0)
+        except OSError:
+            pass
+    elif sys.platform == "darwin":
+        try:
+            res = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2.0,
+            )
+            if res.returncode == 0 and res.stdout.strip().isdigit():
+                mem_total_mb = int(res.stdout.strip()) // (1024 * 1024)
+                mem_avail_mb = int(mem_total_mb * 0.75)
+        except Exception:
+            pass
+
+    return {
+        "cpu_cores": max(1, cpu_cores),
+        "mem_total_mb": max(1024, mem_total_mb),
+        "mem_avail_mb": max(512, min(mem_total_mb, mem_avail_mb)),
+    }
+
+
+def detect_mode(cmd: list[str], requested_mode: str) -> str:
+    """Determines whether `cmd` is a single-file check or a workspace build."""
+    if requested_mode in ("file", "build"):
+        return requested_mode
+    if not cmd:
+        return "build"
+
+    exe = Path(cmd[0]).name
+    if exe == "lean" and "--run" not in cmd:
+        return "file"
+    if (
+        exe == "lake"
+        and len(cmd) >= 3
+        and cmd[1] == "env"
+        and Path(cmd[2]).name == "lean"
+        and "--run" not in cmd
+    ):
+        return "file"
+    return "build"
+
+
+def compute_limits(
+    hw: dict[str, int],
+    mode: str,
+    concurrency: int,
+    override_mem_mb: int | None,
+    override_timeout_sec: int | None,
+) -> dict[str, int | str]:
+    """Computes hardware-matched thread, RAM, and wall-clock limits."""
+    w = max(1, concurrency)
+    cpu_cores = hw["cpu_cores"]
+    mem_total_mb = hw["mem_total_mb"]
+    mem_avail_mb = hw["mem_avail_mb"]
+
+    threads = max(1, cpu_cores // w)
+
+    # Reserve at least 30% of total RAM for the OS, editors, and warm LSP
+    # servers, and never allocate more than 80% of currently available RAM.
+    per_worker_total_share = int((mem_total_mb * 0.70) // w)
+    avail_share = int(mem_avail_mb * 0.80)
+
+    if mode == "file":
+        # A single `.lean` module check should never consume more than 15% of
+        # total RAM or 16 GiB; exceeding that indicates an exponential kernel
+        # `whnf` or `dsimp` blowup.
+        file_ceiling = min(int(mem_total_mb * 0.15), 16384)
+        computed_mem_mb = max(
+            1024, min(per_worker_total_share, avail_share, file_ceiling)
+        )
+        default_timeout = 180
+    else:
+        computed_mem_mb = max(2048, min(per_worker_total_share, avail_share))
+        default_timeout = 900
+
+    memory_max_mb = (
+        override_mem_mb
+        if (override_mem_mb and override_mem_mb > 0)
+        else computed_mem_mb
+    )
+    lean_m_mb = max(512, int(memory_max_mb * 0.75))
+    timeout_sec = (
+        override_timeout_sec
+        if (override_timeout_sec and override_timeout_sec > 0)
+        else default_timeout
+    )
+
+    # Number of concurrent heavy `lake build` / `cargo` slots the host can
+    # safely sustain (~24 GiB physical RAM per concurrent full build, min 1).
+    build_slots = max(1, mem_total_mb // 24576)
+
+    return {
+        "mode": mode,
+        "concurrency": w,
+        "cpu_cores": cpu_cores,
+        "mem_total_mb": mem_total_mb,
+        "mem_avail_mb": mem_avail_mb,
+        "threads": threads,
+        "memory_max_mb": memory_max_mb,
+        "lean_m_mb": lean_m_mb,
+        "timeout_sec": timeout_sec,
+        "build_slots": build_slots,
+    }
+
+
+def systemd_user_scope_available() -> bool:
+    """Returns True if `systemd-run --user --scope` can create cgroup scopes."""
+    if shutil.which("systemd-run") is None:
+        return False
+    try:
+        res = subprocess.run(
+            [
+                "systemd-run",
+                "--user",
+                "--scope",
+                "--quiet",
+                "-p",
+                "MemoryMax=512M",
+                "true",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3.0,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+@contextmanager
+def acquire_build_slot(
+    max_slots: int, timeout_sec: int, enabled: bool
+) -> Iterator[int | None]:
+    """Acquires one of `max_slots` host build locks to prevent RAM stampedes."""
+    if not enabled or max_slots <= 0:
+        yield None
+        return
+
+    runtime_base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    slot_dir = Path(runtime_base) / f"anneal-build-slots-{os.getuid()}"
+    try:
+        slot_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        yield None
+        return
+
+    deadline = time.monotonic() + max(30, timeout_sec)
+    warned = False
+    while True:
+        for slot_idx in range(1, max_slots + 1):
+            lock_path = slot_dir / f"slot-{slot_idx}.lock"
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            except OSError:
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    os.ftruncate(fd, 0)
+                    os.write(
+                        fd,
+                        f"pid={os.getpid()} ts={int(time.time())}\n".encode(
+                            "utf-8"
+                        ),
+                    )
+                except OSError:
+                    pass
+                try:
+                    yield slot_idx
+                finally:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                    os.close(fd)
+                return
+            except BlockingIOError:
+                os.close(fd)
+                continue
+
+        if time.monotonic() >= deadline:
+            yield None
+            return
+        if not warned:
+            sys.stderr.write(
+                f"[anneal-lean-run] All {max_slots} host build slot(s) busy; "
+                "queuing to prevent RAM/swap exhaustion...\n"
+            )
+            warned = True
+        time.sleep(1.0)
+
+
+def inject_lean_m_flag(cmd: list[str], lean_m_mb: int) -> list[str]:
+    """Injects `-M <lean_m_mb>` into direct `lean` calls when absent."""
+    if "-M" in cmd or any(a.startswith("-M") for a in cmd):
+        return list(cmd)
+    if not cmd:
+        return []
+    exe = Path(cmd[0]).name
+    if exe == "lean" and "--run" not in cmd:
+        return [cmd[0], "-M", str(lean_m_mb), *cmd[1:]]
+    if (
+        exe == "lake"
+        and len(cmd) >= 3
+        and cmd[1] == "env"
+        and Path(cmd[2]).name == "lean"
+        and "--run" not in cmd
+    ):
+        return [cmd[0], cmd[1], cmd[2], "-M", str(lean_m_mb), *cmd[3:]]
+    return list(cmd)
+
+
+def run_bounded_command(
+    cmd: list[str], limits: dict[str, int | str], use_slot_lock: bool
+) -> int:
+    """Executes `cmd` inside the computed memory, swap, thread, and time bounds."""
+    threads = int(limits["threads"])
+    memory_max_mb = int(limits["memory_max_mb"])
+    lean_m_mb = int(limits["lean_m_mb"])
+    timeout_sec = int(limits["timeout_sec"])
+    build_slots = int(limits["build_slots"])
+    mode = str(limits["mode"])
+
+    effective_cmd = inject_lean_m_flag(cmd, lean_m_mb)
+    has_systemd_scope = systemd_user_scope_available()
+    if has_systemd_scope:
+        full_cmd = [
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--quiet",
+            "-p",
+            f"MemoryMax={memory_max_mb}M",
+            "-p",
+            "MemorySwapMax=0",
+            "-p",
+            f"CPUQuota={threads * 100}%",
+            "--",
+            *effective_cmd,
+        ]
+    else:
+        full_cmd = effective_cmd
+
+    env = os.environ.copy()
+    env.setdefault("LEAN_NUM_THREADS", str(threads))
+    env.setdefault("CARGO_BUILD_JOBS", str(threads))
+    env.setdefault("RAYON_NUM_THREADS", str(threads))
+
+    need_slot = use_slot_lock and (mode == "build")
+    with acquire_build_slot(build_slots, timeout_sec, enabled=need_slot):
+        proc = subprocess.Popen(
+            full_cmd,
+            env=env,
+            start_new_session=True,
+        )
+        try:
+            rc = proc.wait(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                time.sleep(2.0)
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            sys.stderr.write(
+                f"\n[anneal-lean-run] ERROR: Command timed out after "
+                f"{timeout_sec}s (mode={mode}, MemoryMax={memory_max_mb}M, "
+                f"threads={threads}).\n"
+                "  Remediation: Inspect proof goals interactively with "
+                "`lean_goal` / wildcard `change ... _` "
+                "(`skills/anneal-lsp/SKILL.md`) and apply the kernel "
+                "proof-scaling patterns in `skills/anneal-prove/SKILL.md` "
+                "(`BlockCtx`, `Hold` barrier, `bitwiseAndBitsFast`).\n"
+            )
+            return 124
+
+    if rc in (137, -9):
+        sys.stderr.write(
+            f"\n[anneal-lean-run] ERROR: Command was terminated by the OS "
+            f"memory guard (exit 137, MemoryMax={memory_max_mb}M, "
+            f"MemorySwapMax=0, mode={mode}).\n"
+            "  Why: The process exceeded its hardware-matched physical RAM "
+            "ceiling and was killed before it could thrash host swap.\n"
+            "  Remediation: Avoid unfolding multi-block "
+            "`Mir.<Crate>.<Item>.body` or `wpMirExecSym` inside `dsimp`; "
+            "use `BlockCtx`, `Hold`, and top-down wildcard `change` "
+            "(`skills/anneal-prove/SKILL.md` Section 5).\n"
+        )
+        return 137
+
+    return rc
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description=(
+            "Run `lake`, `lean`, or `cargo` commands with hardware-matched "
+            "CPU thread, physical RAM (`MemoryMax`), zero-swap "
+            "(`MemorySwapMax=0`), and wall-clock timeout limits."
+        )
+    )
+    p.add_argument(
+        "--probe",
+        action="store_true",
+        help=(
+            "Print detected host hardware and computed resource limits "
+            "without running a command."
+        ),
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="Format `--probe` output as JSON.",
+    )
+    p.add_argument(
+        "--mode",
+        choices=("auto", "file", "build"),
+        default="auto",
+        help=(
+            "Resource profile: 'file' for single-file `lean` checks, 'build' "
+            "for `lake build`/`cargo` (default: auto)."
+        ),
+    )
+    p.add_argument(
+        "--concurrency",
+        "-W",
+        type=int,
+        default=int(os.environ.get("ANNEAL_WORKTREE_CONCURRENCY", "1")),
+        help=(
+            "Number of concurrent active build worktrees sharing this host "
+            "(default: $ANNEAL_WORKTREE_CONCURRENCY or 1)."
+        ),
+    )
+    p.add_argument(
+        "--memory-max-mb",
+        type=int,
+        default=int(os.environ.get("ANNEAL_LEAN_MEMORY_MAX_MB", "0")) or None,
+        help="Override the computed hard physical RAM ceiling in MiB.",
+    )
+    p.add_argument(
+        "--timeout",
+        type=int,
+        default=int(os.environ.get("ANNEAL_LEAN_TIMEOUT_SEC", "0")) or None,
+        help=(
+            "Override the wall-clock timeout in seconds (default: 180s for "
+            "file, 900s for build)."
+        ),
+    )
+    p.add_argument(
+        "--no-slot-lock",
+        action="store_true",
+        help="Disable the host-wide concurrent build slot lock for `build` mode.",
+    )
+    p.add_argument(
+        "cmd",
+        nargs=argparse.REMAINDER,
+        help=(
+            "Command and arguments to execute (e.g., `lake build` or "
+            "`lake env lean File.lean`)."
+        ),
+    )
+    return p
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    cmd = list(args.cmd)
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+
+    hw = probe_host_hardware()
+    eff_mode = detect_mode(cmd, args.mode)
+    limits = compute_limits(
+        hw=hw,
+        mode=eff_mode,
+        concurrency=args.concurrency,
+        override_mem_mb=args.memory_max_mb,
+        override_timeout_sec=args.timeout,
+    )
+
+    if args.probe or not cmd:
+        if not args.probe and not cmd:
+            parser.print_help(sys.stderr)
+            return 2
+        limits["systemd_user_scope"] = systemd_user_scope_available()
+        if args.json:
+            print(json.dumps(limits, indent=2))
+        else:
+            print(
+                f"=== Anneal Hardware-Matched Resource Limits "
+                f"(mode={limits['mode']}, W={limits['concurrency']}) ===\n"
+                f"  Host CPUs          : {limits['cpu_cores']} logical cores\n"
+                f"  Host Physical RAM  : {limits['mem_total_mb']} MiB total, "
+                f"{limits['mem_avail_mb']} MiB available\n"
+                f"  Thread Budget (-j) : {limits['threads']} threads "
+                f"(LEAN_NUM_THREADS={limits['threads']})\n"
+                f"  Hard RAM Cap       : {limits['memory_max_mb']} MiB "
+                f"(MemorySwapMax=0, lean -M {limits['lean_m_mb']})\n"
+                f"  Wall-Clock Timeout : {limits['timeout_sec']}s\n"
+                f"  Host Build Slots   : {limits['build_slots']} concurrent build(s)\n"
+                f"  Systemd User Scope : {limits['systemd_user_scope']}"
+            )
+        return 0
+
+    return run_bounded_command(
+        cmd=cmd,
+        limits=limits,
+        use_slot_lock=not args.no_slot_lock,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())

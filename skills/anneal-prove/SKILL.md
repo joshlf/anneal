@@ -115,12 +115,23 @@ tool output:
 
 When iterating from the CLI without `anneal-lean_lsp`, ensure
 `.anneal/lakefile.toml` registers the `Proof` library root, then run
-`lake env lean` inside `.anneal/` for single-file feedback without rebuilding
-the entire workspace:
+`lake env lean` inside `.anneal/` wrapped with `anneal-lean-run` (or
+`scripts/anneal-lean-run`) for single-file feedback without rebuilding the
+entire workspace:
 
 ```bash
-(cd .anneal && lake env lean ../anneal/proofs/Proof/<Crate>/<Item>.lean)
+(cd .anneal && anneal-lean-run --mode file -- lake env lean ../anneal/proofs/Proof/<Crate>/<Item>.lean)
 ```
+
+Never run bare unbounded `lake env lean` or rely solely on `lean -M <MB>` when
+testing reproducers or proofs with elevated `maxHeartbeats`: Lean's `-M` flag
+bounds only its internal small-object allocator and does not cap total process
+RSS or prevent swap thrashing when kernel `whnf` diverges. `anneal-lean-run`
+probes the host's CPU cores and physical RAM (`MemTotal` and `MemAvailable`),
+scales thread count (`LEAN_NUM_THREADS`) by active worktree concurrency
+(`--concurrency <W>`), and enforces a hard physical RAM cap (`MemoryMax` with
+`MemorySwapMax=0`) and wall-clock timeout so runaway reductions fail fast (`exit
+137` or `124`) with zero swap paging.
 
 ### 4. Apply standard Anneal proof patterns
 

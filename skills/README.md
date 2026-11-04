@@ -21,6 +21,7 @@ for configuring Claude Code, Gemini CLI, Jetski, and Codex to load these skills.
 | [`anneal-lsp`](anneal-lsp/SKILL.md) | Repository-owned | Warm `lake serve` LSP MCP workflow (`lean_goal`, `lean_multi_attempt`, `anneal_audit_preview`) and two-regime threshold heuristic |
 | [`anneal-doc-audit`](anneal-doc-audit/SKILL.md) | Repository-owned | CLI command, tutorial directive, and report output verification across `docs/` and `examples/` |
 | [`adversarial-rounds`](adversarial-rounds/SKILL.md) | Repository-owned | $N$-round adversarial implementation, critique, and repair between two randomly assigned frontier models (`Model X` and `Model Y`) over shared git worktree(s) |
+| [`hierarchical-supervision`](hierarchical-supervision/SKILL.md) | Repository-owned | Quota- and hardware-aware multi-tier supervisor + leaf orchestration (`<SUPERVISOR_MODEL>`, `P0`/`P1`/`P2` reserve floors, handoff-only model switching, and `anneal-lean-run` resource bounds) |
 | [`authorship-disclosure`](authorship-disclosure/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | [`authorship_disclosure/` at `b563468a8148df117283494915cee5b6561cc47f`](https://github.com/joshlf/skills/tree/b563468a8148df117283494915cee5b6561cc47f/authorship_disclosure) |
 | [`comment-guidelines`](comment-guidelines/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | [`comment_guidelines/` at `b563468a8148df117283494915cee5b6561cc47f`](https://github.com/joshlf/skills/tree/b563468a8148df117283494915cee5b6561cc47f/comment_guidelines) |
 | [`commit-message`](commit-message/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | [`commit-message/` at `b563468a8148df117283494915cee5b6561cc47f`](https://github.com/joshlf/skills/tree/b563468a8148df117283494915cee5b6561cc47f/commit-message) |
@@ -33,6 +34,7 @@ for configuring Claude Code, Gemini CLI, Jetski, and Codex to load these skills.
 
 Keep the vendored `joshlf/skills` packages unmodified so they can be updated
 cleanly from upstream; place Anneal-specific conventions in repository-owned
-files (`AGENTS.md`, `skills/adversarial-rounds/`, `skills/anneal-prove/`,
+files (`AGENTS.md`, `skills/adversarial-rounds/`,
+`skills/hierarchical-supervision/`, `skills/anneal-prove/`,
 `skills/anneal-lsp/`, `skills/anneal-doc-audit/`, and
 `skills/source-control/`).
