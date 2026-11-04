@@ -807,6 +807,23 @@ theorem MirWpConverges.of_noCall
   rcases h with ⟨fuel, h_wp⟩
   exact ⟨fuel, wpMirSym_of_wpMirNoCallSym h_wp⟩
 
+/-- Lift any bounded `wpMirNoCallSym` proof into `MirNoCallWpConverges`. -/
+theorem MirNoCallWpConverges.of_wpMirNoCallSym
+    {fuel : Nat} {body : CapturedMir} {s : MachineState}
+    {post : MirOutcome → Prop}
+    (h : wpMirNoCallSym fuel body s post) :
+    MirNoCallWpConverges body s post :=
+  ⟨fuel, h⟩
+
+/-- Lift a computable `runMirBounded` evaluation into `MirNoCallWpConverges`. -/
+theorem MirNoCallWpConverges.of_runMirBounded
+    {fuel : Nat} {body : CapturedMir} {s : MachineState}
+    {out : MirOutcome} {post : MirOutcome → Prop}
+    (h_run : runMirBounded fuel body s = some out)
+    (h_post : post out) :
+    MirNoCallWpConverges body s post :=
+  ⟨fuel, wpMirNoCallSym_of_runMirBounded h_run h_post⟩
+
 /-- Lift a computable `runMirBounded` evaluation into `MirWpConverges`. -/
 theorem MirWpConverges.of_runMirBounded
     {fuel : Nat} {body : CapturedMir} {s : MachineState}
@@ -991,6 +1008,78 @@ theorem MirConverges.det
     (h₂ : MirConverges body s out₂) :
     out₁ = out₂ :=
   MirExecConverges.det h₁ h₂
+
+/--
+Definitional equivalence between `MirWpConverges body s (· = out)` and
+`MirConverges body s out`.
+-/
+@[simp]
+theorem MirWpConverges.iff_mirConverges_eq
+    (body : CapturedMir) (s : MachineState) (out : MirOutcome) :
+    MirWpConverges body s (· = out) ↔ MirConverges body s out :=
+  Iff.rfl
+
+/--
+Once `MirConverges body s out` holds, any fuel-free weakest precondition
+`MirWpConverges body s post` is equivalent to `post out`.
+-/
+theorem MirConverges.iff_wpConverges_of_det
+    {body : CapturedMir} {s : MachineState} {out : MirOutcome}
+    {post : MirOutcome → Prop}
+    (h_conv : MirConverges body s out) :
+    MirWpConverges body s post ↔ post out := by
+  constructor
+  · intro h_wp
+    rcases MirWpConverges.exists_outcome (MirWpConverges.conj h_conv h_wp) with
+      ⟨out', rfl, h_post⟩
+    exact h_post
+  · intro h_post
+    exact MirWpConverges.of_mirConverges h_conv h_post
+
+/--
+Conjunction of two call-free `wpMirExecNoCallSym` proofs at the same fuel budget.
+-/
+theorem wpMirExecNoCallSym_conj
+    {fuel : Nat} {body : CapturedMir} {st : MirExecState}
+    {P Q : MirOutcome → Prop}
+    (hP : wpMirExecNoCallSym fuel body st P)
+    (hQ : wpMirExecNoCallSym fuel body st Q) :
+    wpMirExecNoCallSym fuel body st (fun out => P out ∧ Q out) := by
+  rw [wpMirExecNoCallSym_eq_wpCoalBounded] at hP hQ ⊢
+  induction fuel generalizing st with
+  | zero => exact False.elim hP
+  | succ fuel' ih =>
+    unfold wpCoalBounded at hP hQ ⊢
+    cases h_step : stepMirState body st with
+    | ret out =>
+      simp only [h_step] at hP hQ ⊢
+      exact ⟨hP, hQ⟩
+    | tau st' =>
+      simp only [h_step] at hP hQ ⊢
+      exact ih hP hQ
+    | vis i k =>
+      simp only [h_step] at hP hQ ⊢
+      rcases i with f | (e | c)
+      · exact False.elim hP
+      · cases e
+        exact ih hP hQ
+      · exact False.elim hP
+
+/--
+Conjunction of two fuel-free `MirNoCallWpConverges` proofs by aligning fuel to
+`max f₁ f₂`.
+-/
+theorem MirNoCallWpConverges.conj
+    {body : CapturedMir} {s : MachineState} {P Q : MirOutcome → Prop}
+    (hP : MirNoCallWpConverges body s P)
+    (hQ : MirNoCallWpConverges body s Q) :
+    MirNoCallWpConverges body s (fun out => P out ∧ Q out) := by
+  rcases hP with ⟨f₁, h₁⟩
+  rcases hQ with ⟨f₂, h₂⟩
+  exact ⟨max f₁ f₂,
+    wpMirExecNoCallSym_conj
+      (wpMirNoCallSym_mono (Nat.le_max_left f₁ f₂) h₁)
+      (wpMirNoCallSym_mono (Nat.le_max_right f₁ f₂) h₂)⟩
 
 /-! ## 5. Fuel-Free Step and Sequential Composition (`step` & `bind`) -/
 
@@ -1356,6 +1445,100 @@ theorem wpMirSym_add_of_stepsSym
     exact False.elim h_mid
 
 /--
+Exact `f₁ + f₂` composition theorem combining `wpMirStepsSym f₁` with
+`wpMirSym f₂` when `0 < f₂`.
+-/
+theorem wpMirSym_add_of_stepsSym_pos
+    {f₁ f₂ : Nat} (h_pos : 0 < f₂)
+    {body : CapturedMir} {s : MachineState}
+    {mid : MachineState → Prop} {post : MirOutcome → Prop}
+    (h₁ : wpMirStepsSym f₁ body s mid post)
+    (h₂ : ∀ s', mid s' → wpMirSym f₂ body s' post) :
+    wpMirSym (f₁ + f₂) body s post := by
+  cases f₂ with
+  | zero => exact absurd h_pos (Nat.lt_irrefl 0)
+  | succ f₂' =>
+    refine wpMirExecSym_add_of_stepsSym h₁ ?_
+    intro st' h_mid
+    cases st' with
+    | running s' => exact h₂ s' h_mid
+    | halted out => exact h_mid
+    | faulted _ => exact False.elim h_mid
+
+/--
+Internal `f₁ + f₂` step-addition theorem for `wpMirStepsSym` over `MachineState`.
+-/
+theorem wpMirStepsSym_add
+    {f₁ f₂ : Nat} {body : CapturedMir} {s : MachineState}
+    {mid₁ mid₂ : MachineState → Prop} {post : MirOutcome → Prop}
+    (h₁ : wpMirStepsSym f₁ body s mid₁ post)
+    (h₂ : ∀ s', mid₁ s' → wpMirStepsSym f₂ body s' mid₂ post) :
+    wpMirStepsSym (f₁ + f₂) body s mid₂ post := by
+  refine wpMirExecStepsSym_add h₁ ?_
+  intro st' h_mid
+  cases st' with
+  | running s' => exact h₂ s' h_mid
+  | halted out =>
+    clear h₁ h₂
+    induction f₂ with
+    | zero => exact h_mid
+    | succ f₂' _ =>
+      unfold wpMirExecStepsSym
+      rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq]
+      dsimp only [stepMirState]
+      exact h_mid
+  | faulted _ => exact False.elim h_mid
+
+/--
+Internal `f₁ + (f₂ + 1)` composition theorem combining `wpMirStepsSym f₁` with
+`wpMirNoCallSym f₂` into `wpMirNoCallSym (f₁ + (f₂ + 1))`.
+-/
+theorem wpMirNoCallSym_add_of_stepsSym
+    {f₁ f₂ : Nat} {body : CapturedMir} {s : MachineState}
+    {mid : MachineState → Prop} {post : MirOutcome → Prop}
+    (h₁ : wpMirStepsSym f₁ body s mid post)
+    (h₂ : ∀ s', mid s' → wpMirNoCallSym f₂ body s' post) :
+    wpMirNoCallSym (f₁ + (f₂ + 1)) body s post := by
+  suffices ∀ st : MirExecState,
+      wpMirExecStepsSym f₁ body st
+        (fun
+          | .running s' => mid s'
+          | .halted out => post out
+          | .faulted _ => False)
+        post →
+      wpMirExecNoCallSym (f₁ + (f₂ + 1)) body st post from
+    this (.running s) h₁
+  clear h₁
+  induction f₁ with
+  | zero =>
+    intro st h_st
+    rw [Nat.zero_add]
+    cases st with
+    | running s' => exact wpMirExecNoCallSym_mono (Nat.le_succ f₂) (h₂ s' h_st)
+    | halted out => exact h_st
+    | faulted _ => exact False.elim h_st
+  | succ f₁' ih =>
+    intro st h_st
+    rw [Nat.succ_add]
+    unfold wpMirExecStepsSym at h_st
+    unfold wpMirExecNoCallSym
+    rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq] at h_st ⊢
+    cases h_step : stepMirState body st with
+    | ret out =>
+      simp only [h_step] at h_st ⊢
+      exact h_st
+    | tau st' =>
+      simp only [h_step] at h_st ⊢
+      exact ih st' h_st
+    | vis i k =>
+      simp only [h_step] at h_st ⊢
+      rcases i with f | (e | c)
+      · exact False.elim h_st
+      · cases e
+        exact ih (k PUnit.unit) h_st
+      · exact False.elim h_st
+
+/--
 Fuel-free sequential composition (`MirExecWpConverges.bind`): composes an
 intermediate stage `wpMirExecStepsSym` with a continuation
 `∀ st', mid st' → MirExecWpConverges body st' post` without exposing fuel.
@@ -1419,6 +1602,235 @@ theorem MirWpConverges.bind_reachState
   MirWpConverges.bind
     (MirStepsConverges.mono (fun _ h => h) (fun _ h => h.elim) h₁)
     (fun _ h_eq => h_eq ▸ h₂)
+
+/--
+Fuel-free sequential composition for deterministic convergence (`MirConverges.bind`).
+-/
+theorem MirConverges.bind
+    {body : CapturedMir} {s : MachineState}
+    {mid : MachineState → Prop} {out : MirOutcome}
+    (h₁ : MirStepsConverges body s mid (· = out))
+    (h₂ : ∀ s', mid s' → MirConverges body s' out) :
+    MirConverges body s out :=
+  MirWpConverges.bind h₁ h₂
+
+/--
+Pointwise state-to-state `bind` specialization for `MirConverges` via
+`MirReachState`.
+-/
+theorem MirConverges.bind_reachState
+    {body : CapturedMir} {s s' : MachineState} {out : MirOutcome}
+    (h₁ : MirReachState body s s')
+    (h₂ : MirConverges body s' out) :
+    MirConverges body s out :=
+  MirWpConverges.bind_reachState h₁ h₂
+
+/--
+Monotonicity of `evalSymNodeTreeNoCall` in both continuation `cont` and
+postcondition `post`.
+-/
+theorem evalSymNodeTreeNoCall_mono
+    {cont₁ cont₂ : MirExecState → Prop} {post₁ post₂ : MirOutcome → Prop}
+    (h_cont : ∀ st', cont₁ st' → cont₂ st')
+    (h_post : ∀ out, post₁ out → post₂ out)
+    {t : SymTree MirStepNode}
+    (h : evalSymNodeTreeNoCall cont₁ post₁ t) :
+    evalSymNodeTreeNoCall cont₂ post₂ t := by
+  induction t with
+  | leaf node =>
+    cases node with
+    | ret out => exact h_post out h
+    | tau st' => exact h_cont st' h
+    | vis i k =>
+      rcases i with f | (e | c)
+      · exact False.elim h
+      · exact h_cont (k PUnit.unit) h
+      · exact False.elim h
+  | branch c _ _ ih1 ih2 =>
+    cases c
+    · exact ih2 h
+    · exact ih1 h
+
+/--
+Fuel-free single-step symbolic unfolding rule for `MirNoCallWpConverges`.
+-/
+theorem MirNoCallWpConverges.step
+    {body : CapturedMir} {s : MachineState} {post : MirOutcome → Prop}
+    (h :
+      evalSymNodeTreeNoCall
+        (fun
+          | .running s' => MirNoCallWpConverges body s' post
+          | .halted out => post out
+          | .faulted _ => False)
+        post
+        (stepMirSymTree body s)) :
+    MirNoCallWpConverges body s post := by
+  have h_ex :
+      evalSymNodeTreeNoCall
+        (fun st' => ∃ f, wpMirExecNoCallSym (f + 1) body st' post)
+        post
+        (stepMirSymTree body s) := by
+    refine evalSymNodeTreeNoCall_mono ?_ (fun _ hp => hp) h
+    intro st' h_st'
+    cases st' with
+    | running s' =>
+      rcases h_st' with ⟨f, hf⟩
+      exact ⟨f, wpMirExecNoCallSym_mono (Nat.le_succ f) hf⟩
+    | halted out => exact ⟨0, h_st'⟩
+    | faulted _ => exact False.elim h_st'
+  rcases evalSymNodeTreeNoCall_exists_fuel (stepMirSymTree body s) h_ex with
+    ⟨fuel, h_fuel⟩
+  exact ⟨fuel + 2, h_fuel⟩
+
+/--
+Fuel-free sequential composition (`MirNoCallWpConverges.bind`): composes a first
+stage `MirStepsConverges body s mid post` with a continuation
+`∀ s', mid s' → MirNoCallWpConverges body s' post` without exposing fuel.
+-/
+theorem MirNoCallWpConverges.bind
+    {body : CapturedMir} {s : MachineState}
+    {mid : MachineState → Prop} {post : MirOutcome → Prop}
+    (h₁ : MirStepsConverges body s mid post)
+    (h₂ : ∀ s', mid s' → MirNoCallWpConverges body s' post) :
+    MirNoCallWpConverges body s post := by
+  rcases h₁ with ⟨f₁, hf₁⟩
+  suffices ∀ st : MirExecState,
+      wpMirExecStepsSym f₁ body st
+        (fun
+          | .running s' => mid s'
+          | .halted out => post out
+          | .faulted _ => False)
+        post →
+      ∃ f : Nat, wpMirExecNoCallSym f body st post from
+    this (.running s) hf₁
+  clear hf₁
+  induction f₁ with
+  | zero =>
+    intro st h_st
+    cases st with
+    | running s' => exact h₂ s' h_st
+    | halted out => exact ⟨1, h_st⟩
+    | faulted _ => exact False.elim h_st
+  | succ f₁' ih =>
+    intro st h_st
+    unfold wpMirExecStepsSym at h_st
+    have h_ex :
+        evalSymNodeTreeNoCall
+          (fun st' => ∃ f, wpMirExecNoCallSym f body st' post)
+          post
+          (stepMirExecSymTree body st) := by
+      rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq] at h_st ⊢
+      cases h_step : stepMirState body st with
+      | ret out =>
+        simp only [h_step] at h_st ⊢
+        exact h_st
+      | tau st' =>
+        simp only [h_step] at h_st ⊢
+        exact ih st' h_st
+      | vis i k =>
+        simp only [h_step] at h_st ⊢
+        rcases i with f | (e | c)
+        · exact False.elim h_st
+        · cases e
+          exact ih (k PUnit.unit) h_st
+        · exact False.elim h_st
+    rcases evalSymNodeTreeNoCall_exists_fuel (stepMirExecSymTree body st) h_ex with
+      ⟨f₂, hf₂⟩
+    exact ⟨f₂ + 1, hf₂⟩
+
+/--
+Pointwise state-to-state `bind` specialization for `MirNoCallWpConverges` via
+`MirReachState`.
+-/
+theorem MirNoCallWpConverges.bind_reachState
+    {body : CapturedMir} {s s' : MachineState} {post : MirOutcome → Prop}
+    (h₁ : MirReachState body s s')
+    (h₂ : MirNoCallWpConverges body s' post) :
+    MirNoCallWpConverges body s post :=
+  MirNoCallWpConverges.bind
+    (MirStepsConverges.mono (fun _ h => h) (fun _ h => h.elim) h₁)
+    (fun _ h_eq => h_eq ▸ h₂)
+
+/--
+Single-step symbolic unfolding rule for `MirStepsConverges`.
+-/
+theorem MirStepsConverges.step
+    {body : CapturedMir} {s : MachineState}
+    {mid : MachineState → Prop} {post : MirOutcome → Prop}
+    (h :
+      evalSymNodeTreeNoCall
+        (fun
+          | .running s' => MirStepsConverges body s' mid post
+          | .halted out => post out
+          | .faulted _ => False)
+        post
+        (stepMirSymTree body s)) :
+    MirStepsConverges body s mid post := by
+  have h_ex :
+      evalSymNodeTreeNoCall
+        (fun st' =>
+          ∃ f,
+            wpMirExecStepsSym f body st'
+              (fun
+                | .running s' => mid s'
+                | .halted out => post out
+                | .faulted _ => False)
+              post)
+        post
+        (stepMirSymTree body s) := by
+    refine evalSymNodeTreeNoCall_mono ?_ (fun _ hp => hp) h
+    intro st' h_st'
+    cases st' with
+    | running s' => exact h_st'
+    | halted out => exact ⟨0, h_st'⟩
+    | faulted _ => exact False.elim h_st'
+  rcases evalSymNodeTreeNoCall_exists_fuel (stepMirSymTree body s) h_ex with
+    ⟨fuel, h_fuel⟩
+  exact ⟨fuel + 1, h_fuel⟩
+
+/-- Single-step silent `.tau` transition rule for `MirStepsConverges`. -/
+theorem MirStepsConverges.step_tau
+    {body : CapturedMir} {s s' : MachineState}
+    {mid : MachineState → Prop} {post : MirOutcome → Prop}
+    (h_step : stepMirFn body s = .tau (.running s'))
+    (h_next : MirStepsConverges body s' mid post) :
+    MirStepsConverges body s mid post := by
+  rcases h_next with ⟨fuel, h_wp⟩
+  refine ⟨fuel + 1, ?_⟩
+  unfold wpMirStepsSym wpMirExecStepsSym
+  rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq]
+  dsimp only [stepMirState]
+  rw [h_step]
+  exact h_wp
+
+/-- Single-step `MirObsE` emission rule for `MirStepsConverges`. -/
+theorem MirStepsConverges.step_emit
+    {body : CapturedMir} {s s' : MachineState} {obs : MirObs}
+    {mid : MachineState → Prop} {post : MirOutcome → Prop}
+    (h_step : stepMirFn body s = MirStepNode.emitStep obs s')
+    (h_next : MirStepsConverges body s' mid post) :
+    MirStepsConverges body s mid post := by
+  rcases h_next with ⟨fuel, h_wp⟩
+  refine ⟨fuel + 1, ?_⟩
+  unfold wpMirStepsSym wpMirExecStepsSym
+  rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq]
+  dsimp only [stepMirState]
+  rw [h_step]
+  cases obs <;> (dsimp [MirStepNode.emitStep]; exact h_wp)
+
+/-- Single-step early `.ret` rule for `MirStepsConverges`. -/
+theorem MirStepsConverges.ret_of_step
+    {body : CapturedMir} {s : MachineState} {out : MirOutcome}
+    {mid : MachineState → Prop} {post : MirOutcome → Prop}
+    (h_step : stepMirFn body s = .ret out)
+    (h_post : post out) :
+    MirStepsConverges body s mid post := by
+  refine ⟨1, ?_⟩
+  unfold wpMirStepsSym wpMirExecStepsSym
+  rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq]
+  dsimp only [stepMirState]
+  rw [h_step]
+  exact h_post
 
 /--
 Fuel-free transitivity of `MirStepsConverges` across multi-stage executions.
@@ -1486,6 +1898,36 @@ theorem MirStepsConverges.trans
     rcases evalSymNodeTreeNoCall_exists_fuel (stepMirExecSymTree body st) h_ex with
       ⟨f₂, hf₂⟩
     exact ⟨f₂ + 1, hf₂⟩
+
+/-- Reflexivity of `MirReachState`. -/
+theorem MirReachState.refl
+    (body : CapturedMir) (s : MachineState) :
+    MirReachState body s s :=
+  ⟨0, rfl⟩
+
+/-- Transitivity of `MirReachState`. -/
+theorem MirReachState.trans
+    {body : CapturedMir} {s₁ s₂ s₃ : MachineState}
+    (h₁₂ : MirReachState body s₁ s₂)
+    (h₂₃ : MirReachState body s₂ s₃) :
+    MirReachState body s₁ s₃ :=
+  MirStepsConverges.trans h₁₂ (fun _ h_eq => h_eq ▸ h₂₃)
+
+/-- Single-step `.tau` rule for `MirReachState`. -/
+theorem MirReachState.step_tau
+    {body : CapturedMir} {s₁ s₂ s₃ : MachineState}
+    (h_step : stepMirFn body s₁ = .tau (.running s₂))
+    (h_next : MirReachState body s₂ s₃) :
+    MirReachState body s₁ s₃ :=
+  MirStepsConverges.step_tau h_step h_next
+
+/-- Single-step `MirObsE` emission rule for `MirReachState`. -/
+theorem MirReachState.step_emit
+    {body : CapturedMir} {s₁ s₂ s₃ : MachineState} {obs : MirObs}
+    (h_step : stepMirFn body s₁ = MirStepNode.emitStep obs s₂)
+    (h_next : MirReachState body s₂ s₃) :
+    MirReachState body s₁ s₃ :=
+  MirStepsConverges.step_emit h_step h_next
 
 /-! ### Bridges from `runMirToBlock`, `runMirTauToBlock`, and `runMirToBinarySwitch` -/
 
@@ -1624,6 +2066,28 @@ theorem MirStepsConverges.of_runMirToBinarySwitch
         | faulted _ => nomatch h
 
 /--
+Every `runMirToBlock fuel body targetBlock s = some s'` execution witnesses
+`MirReachState body s s'`.
+-/
+theorem MirReachState.of_runMirToBlock
+    {fuel : Nat} {body : CapturedMir} {targetBlock : BasicBlockIdx}
+    {s s' : MachineState}
+    (h : runMirToBlock fuel body targetBlock s = some s') :
+    MirReachState body s s' :=
+  MirStepsConverges.of_runMirToBlock h
+
+/--
+Every `runMirTauToBlock fuel body targetBlock s = some s'` execution witnesses
+`MirReachState body s s'`.
+-/
+theorem MirReachState.of_runMirTauToBlock
+    {fuel : Nat} {body : CapturedMir} {targetBlock : BasicBlockIdx}
+    {s s' : MachineState}
+    (h : runMirTauToBlock fuel body targetBlock s = some s') :
+    MirReachState body s s' :=
+  MirStepsConverges.of_runMirTauToBlock h
+
+/--
 Compose `runMirToBlock` with a continuation `MirWpConverges` proof.
 -/
 theorem MirWpConverges.of_runMirToBlock
@@ -1667,26 +2131,132 @@ theorem MirWpConverges.of_runMirToBinarySwitch
 /-! ## 6. Callee-Aware Machine State Initialization (`BRIEF-3.2` Compatibility) -/
 
 /--
-Populate `mem.callees` with `defaultCallees` when `mem.callees` is empty,
-preserving any explicit caller-supplied callee table.
+Populate `mem.callees` with `defaultCallees` when `defaultCallees` is non-empty,
+matching `adv/brief-3-2` (`Trusted.VerificationResult.Memory.withDefaultCallees`)
+so that `Memory.withDefaultCallees mem [] = mem` holds definitionally (`rfl`)
+for any abstract `mem : Memory`.
 -/
 def Memory.withDefaultCallees
     (mem : Memory) (defaultCallees : List CapturedMir) : Memory :=
-  match mem.callees with
-  | [] => { mem with callees := defaultCallees }
-  | _ :: _ => mem
+  match defaultCallees with
+  | [] => mem
+  | _ :: _ => { mem with callees := defaultCallees }
+
+@[simp]
+theorem Memory.withDefaultCallees_nil (mem : Memory) :
+    Memory.withDefaultCallees mem [] = mem :=
+  rfl
+
+@[simp]
+theorem Memory.withDefaultCallees_cons
+    (mem : Memory) (c : CapturedMir) (cs : List CapturedMir) :
+    Memory.withDefaultCallees mem (c :: cs) = { mem with callees := c :: cs } :=
+  rfl
+
+@[simp]
+theorem Memory.withDefaultCallees_activeCallee
+    (mem : Memory) (callees : List CapturedMir) :
+    (Memory.withDefaultCallees mem callees).activeCallee = mem.activeCallee := by
+  cases callees <;> rfl
+
+@[simp]
+theorem Memory.withDefaultCallees_callStack
+    (mem : Memory) (callees : List CapturedMir) :
+    (Memory.withDefaultCallees mem callees).callStack = mem.callStack := by
+  cases callees <;> rfl
 
 /--
-Initialize `MachineState` for `body` on `(args, mem)` with fallback callee table
-`defaultCallees`.
+Initialize `MachineState` for `body` on `(args, mem)` with default callee table
+`callees` (matching `adv/brief-3-2`).
 -/
 def initMachineStateWithMemoryAndCallees
     (body : CapturedMir)
     (args : List Value)
     (mem : Memory)
-    (defaultCallees : List CapturedMir) :
+    (callees : List CapturedMir := .nil) :
     MachineState :=
-  initMachineStateWithMemory body args (Memory.withDefaultCallees mem defaultCallees)
+  initMachineStateWithMemory body args (Memory.withDefaultCallees mem callees)
+
+@[simp]
+theorem initMachineStateWithCallees_nil
+    (body : CapturedMir) (args : List Value) :
+    initMachineStateWithCallees body args [] = initMachineState body args :=
+  rfl
+
+@[simp]
+theorem initMachineStateWithMemoryAndCallees_nil
+    (body : CapturedMir) (args : List Value) (mem : Memory) :
+    initMachineStateWithMemoryAndCallees body args mem [] =
+      initMachineStateWithMemory body args mem :=
+  rfl
+
+/--
+Coinductive interaction tree of `body` on `args` with linked callee table
+`callees` (matching `adv/brief-3-2`).
+-/
+def mirCallTreeWithCallees
+    (body : CapturedMir)
+    (args : List Value)
+    (callees : List CapturedMir := .nil) :
+    ITree MirEffect MirOutcome :=
+  mirTree body (initMachineStateWithCallees body args callees)
+
+/--
+Coinductive interaction tree of `body` from `(args, mem)` with default callee
+table `callees` (matching `adv/brief-3-2`).
+-/
+def mirStatefulTreeWithCallees
+    (body : CapturedMir)
+    (args : List Value)
+    (mem : Memory)
+    (callees : List CapturedMir := .nil) :
+    ITree MirEffect MirOutcome :=
+  mirTree body (initMachineStateWithMemoryAndCallees body args mem callees)
+
+@[simp]
+theorem mirCallTreeWithCallees_nil
+    (body : CapturedMir) (args : List Value) :
+    mirCallTreeWithCallees body args [] = mirCallTree body args :=
+  rfl
+
+@[simp]
+theorem mirStatefulTreeWithCallees_nil
+    (body : CapturedMir) (args : List Value) (mem : Memory) :
+    mirStatefulTreeWithCallees body args mem [] = mirStatefulTree body args mem :=
+  rfl
+
+/--
+Predicate asserting that `mem` is at a borrow-free root caller activation
+(`mem.borrows = []`, `mem.callStack = []`, `mem.activeCallee = none`,
+`mem.activeProtectors = []`), while leaving heap allocations (`globals`,
+`nextAllocId`), tag/protector counters (`nextTag`, `nextProtector`), caller
+locals (`callerLocals`), and linked callee tables (`callees`) completely
+unconstrained.
+-/
+def RootActiveMemory (mem : Memory) : Prop :=
+  mem.borrows = [] ∧
+  mem.callStack = [] ∧
+  mem.activeCallee = none ∧
+  mem.activeProtectors = []
+
+@[simp]
+theorem rootActiveMemory_initMachineState
+    (body : CapturedMir) (args : List Value) :
+    RootActiveMemory (initMachineState body args).memory :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+@[simp]
+theorem rootActiveMemory_initMachineStateWithCallees
+    (body : CapturedMir) (args : List Value) (callees : List CapturedMir) :
+    RootActiveMemory (initMachineStateWithCallees body args callees).memory :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+@[simp]
+theorem rootActiveMemory_withDefaultCallees
+    (mem : Memory) (callees : List CapturedMir) :
+    RootActiveMemory (Memory.withDefaultCallees mem callees) ↔
+      RootActiveMemory mem := by
+  cases callees <;> rfl
 
 /-! ## 7. Fuel-Free Adequacy Bridges (`DWP`, `DWLP`, `VerificationResult`) -/
 
@@ -1722,6 +2292,58 @@ theorem dwlp_of_mirWpConverges
     (h : MirWpConverges body s post) :
     DWLP mirDefaultWP (mirTree body s) (fun out _ => post out) PUnit.unit :=
   (dwp_of_mirWpConverges h).toDWLP
+
+/--
+Total-correctness (`DWP mirDefaultWP`) soundness of `MirWpConverges` on
+`mirCallTreeWithCallees body args callees`.
+-/
+theorem dwp_mirCallTreeWithCallees_of_mirWpConverges
+    {body : CapturedMir} {args : List Value} {callees : List CapturedMir}
+    {post : MirOutcome → Prop}
+    (h : MirWpConverges body (initMachineStateWithCallees body args callees) post) :
+    DWP mirDefaultWP (mirCallTreeWithCallees body args callees)
+      (fun out _ => post out) PUnit.unit :=
+  dwp_of_mirWpConverges h
+
+/--
+Partial-correctness (`DWLP mirDefaultWP`) soundness of `MirWpConverges` on
+`mirCallTreeWithCallees body args callees`.
+-/
+theorem dwlp_mirCallTreeWithCallees_of_mirWpConverges
+    {body : CapturedMir} {args : List Value} {callees : List CapturedMir}
+    {post : MirOutcome → Prop}
+    (h : MirWpConverges body (initMachineStateWithCallees body args callees) post) :
+    DWLP mirDefaultWP (mirCallTreeWithCallees body args callees)
+      (fun out _ => post out) PUnit.unit :=
+  dwlp_of_mirWpConverges h
+
+/--
+Total-correctness (`DWP mirDefaultWP`) soundness of `MirWpConverges` on
+`mirStatefulTreeWithCallees body args mem callees`.
+-/
+theorem dwp_mirStatefulTreeWithCallees_of_mirWpConverges
+    {body : CapturedMir} {args : List Value} {mem : Memory}
+    {callees : List CapturedMir} {post : MirOutcome → Prop}
+    (h :
+      MirWpConverges body
+        (initMachineStateWithMemoryAndCallees body args mem callees) post) :
+    DWP mirDefaultWP (mirStatefulTreeWithCallees body args mem callees)
+      (fun out _ => post out) PUnit.unit :=
+  dwp_of_mirWpConverges h
+
+/--
+Partial-correctness (`DWLP mirDefaultWP`) soundness of `MirWpConverges` on
+`mirStatefulTreeWithCallees body args mem callees`.
+-/
+theorem dwlp_mirStatefulTreeWithCallees_of_mirWpConverges
+    {body : CapturedMir} {args : List Value} {mem : Memory}
+    {callees : List CapturedMir} {post : MirOutcome → Prop}
+    (h :
+      MirWpConverges body
+        (initMachineStateWithMemoryAndCallees body args mem callees) post) :
+    DWLP mirDefaultWP (mirStatefulTreeWithCallees body args mem callees)
+      (fun out _ => post out) PUnit.unit :=
+  dwlp_of_mirWpConverges h
 
 /--
 Total-correctness (`DWP mirNoCallWP`) soundness of `MirNoCallWpConverges` on
@@ -1976,18 +2598,12 @@ def multiBlockMidState (b : Nat) (mem : Memory) : MachineState :=
 
 /--
 Stage 1 (`bb0 -> bb1`): `multiBlockPipelineBody` steps from its initial state on
-`[.scalar ⟨b, 4⟩]` and `mem` to `multiBlockMidState b mem`.
+`[.scalar ⟨b, 4⟩]` and any root-activation `mem : Memory` (`RootActiveMemory mem`,
+preserving arbitrary heap allocations, tag counters, and `callees` tables) to
+`multiBlockMidState b mem`.
 -/
-
-
-
-
-
-
-
-
 theorem multiBlockPipeline_stage1_converges
-    (b : Nat) (mem : Memory) (h_mem : mem = (initMachineState multiBlockPipelineBody [.scalar { bits := b, sizeBytes := 4 }]).memory) :
+    (b : Nat) (mem : Memory) (h_root : RootActiveMemory mem) :
     MirStepsConverges multiBlockPipelineBody
       (initMachineStateWithMemory multiBlockPipelineBody
         [.scalar { bits := b, sizeBytes := 4 }] mem)
@@ -1995,37 +2611,57 @@ theorem multiBlockPipeline_stage1_converges
       (mirNormalPost
         (fun retVal mem' =>
           retVal = .scalar { bits := b, sizeBytes := 4 } ∧ mem' = mem)) := by
+  rcases mem with
+    ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
+     activeCallee, activeProtectors, nextProtector, callerLocals⟩
+  rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
   refine ⟨3, ?_⟩
-  subst h_mem
-  dsimp [initMachineState, initMachineStateWithMemory, initMachineStateWithMemoryAndCallees, Memory.withDefaultCallees, initLocals, initLocalsAux, List.length, multiBlockMidState, advanceStmt, Trusted.Sequence.set?, multiBlockPipelineBody, Trusted.Sequence.get?]
+  dsimp [initMachineState, initMachineStateWithMemory, initLocals, initLocalsAux,
+    List.length, multiBlockMidState, advanceStmt, Trusted.Sequence.set?,
+    multiBlockPipelineBody, Trusted.Sequence.get?]
   dsimp [wpMirStepsSym, wpMirExecStepsSym]
-  simp [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq, stepMirState, stepMirFn, Trusted.Sequence.get?, evalStmt, evalRvalue, evalOperand, evalTerminator, readProjectedValue, writePlaceValue, get?, List.length, Trusted.Sequence.length, BEq.beq, advanceStmt, Trusted.Sequence.set?, evalNodeNoCallWP, MirStepNode.step]
+  simp [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval,
+    evalNodeNoCallWP_eq, stepMirState, stepMirFn, Trusted.Sequence.get?,
+    evalStmt, evalRvalue, evalOperand, evalTerminator, readProjectedValue,
+    writePlaceValue, invalidateConflictingBorrows, get?, List.length,
+    Trusted.Sequence.length, BEq.beq, advanceStmt, Trusted.Sequence.set?,
+    evalNodeNoCallWP, MirStepNode.step]
 
 /--
 Stage 2 (`bb1 -> bb2 -> return`): from `multiBlockMidState b mem`,
 `multiBlockPipelineBody` converges to normal return `.scalar ⟨b, 4⟩` with
-unchanged `mem`.
+unchanged `mem` for any `RootActiveMemory mem`.
 -/
 theorem multiBlockPipeline_stage2_converges
-    (b : Nat) (mem : Memory) (h_mem : mem = (initMachineState multiBlockPipelineBody [.scalar { bits := b, sizeBytes := 4 }]).memory) :
+    (b : Nat) (mem : Memory) (h_root : RootActiveMemory mem) :
     MirWpConverges multiBlockPipelineBody
       (multiBlockMidState b mem)
       (mirNormalPost
         (fun retVal mem' =>
           retVal = .scalar { bits := b, sizeBytes := 4 } ∧ mem' = mem)) := by
+  rcases mem with
+    ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
+     activeCallee, activeProtectors, nextProtector, callerLocals⟩
+  rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
   refine ⟨3, ?_⟩
-  subst h_mem
-  dsimp [initMachineState, initMachineStateWithMemory, initMachineStateWithMemoryAndCallees, Memory.withDefaultCallees, initLocals, initLocalsAux, List.length, multiBlockMidState, advanceStmt, Trusted.Sequence.set?, multiBlockPipelineBody, Trusted.Sequence.get?]
+  dsimp [initMachineState, initMachineStateWithMemory, initLocals, initLocalsAux,
+    List.length, multiBlockMidState, advanceStmt, Trusted.Sequence.set?,
+    multiBlockPipelineBody, Trusted.Sequence.get?]
   dsimp [wpMirSym, wpMirExecSym]
-  simp [evalSymNodeTree_eq, stepMirExecSymTree_eval, evalNodeWP_eq, stepMirState, stepMirFn, Trusted.Sequence.get?, evalStmt, evalRvalue, evalOperand, evalTerminator, writePlaceValue, get?, List.length, Trusted.Sequence.length, BEq.beq, advanceStmt, Trusted.Sequence.set?, evalNodeWP, MirStepNode.step, MirStepNode.retNormal, mirNormalPost]
+  simp [evalSymNodeTree_eq, stepMirExecSymTree_eval,
+    evalNodeWP_eq, stepMirState, stepMirFn, Trusted.Sequence.get?, evalStmt,
+    evalRvalue, evalOperand, evalTerminator, writePlaceValue,
+    invalidateConflictingBorrows, get?, List.length,
+    Trusted.Sequence.length, BEq.beq, advanceStmt, Trusted.Sequence.set?,
+    evalNodeWP, MirStepNode.step, MirStepNode.retNormal, mirNormalPost]
 
 /--
 Fuel-free sequential composition of Stage 1 and Stage 2 via
 `MirWpConverges.bind` without exposing any fuel constant in the theorem
-signature.
+signature, valid across arbitrary `mem : Memory` with `RootActiveMemory mem`.
 -/
 theorem multiBlockPipeline_wpConverges
-    (b : Nat) (mem : Memory) (h_mem : mem = (initMachineState multiBlockPipelineBody [.scalar { bits := b, sizeBytes := 4 }]).memory) :
+    (b : Nat) (mem : Memory) (h_root : RootActiveMemory mem) :
     MirWpConverges multiBlockPipelineBody
       (initMachineStateWithMemory multiBlockPipelineBody
         [.scalar { bits := b, sizeBytes := 4 }] mem)
@@ -2033,8 +2669,67 @@ theorem multiBlockPipeline_wpConverges
         (fun retVal mem' =>
           retVal = .scalar { bits := b, sizeBytes := 4 } ∧ mem' = mem)) :=
   MirWpConverges.bind
-    (multiBlockPipeline_stage1_converges b mem h_mem)
-    (fun _ h_eq => h_eq ▸ multiBlockPipeline_stage2_converges b mem h_mem)
+    (multiBlockPipeline_stage1_converges b mem h_root)
+    (fun _ h_eq => h_eq ▸ multiBlockPipeline_stage2_converges b mem h_root)
+
+/--
+Deterministic outcome convergence (`MirConverges`) for `multiBlockPipelineBody`
+across any `RootActiveMemory mem`.
+-/
+theorem multiBlockPipeline_converges
+    (b : Nat) (mem : Memory) (h_root : RootActiveMemory mem) :
+    MirConverges multiBlockPipelineBody
+      (initMachineStateWithMemory multiBlockPipelineBody
+        [.scalar { bits := b, sizeBytes := 4 }] mem)
+      (.normal (.scalar { bits := b, sizeBytes := 4 }, mem)) := by
+  refine MirWpConverges.mono ?_ (multiBlockPipeline_wpConverges b mem h_root)
+  intro out h_post
+  cases out with
+  | normal rv =>
+    rcases rv with ⟨retVal, mem'⟩
+    rcases h_post with ⟨rfl, rfl⟩
+    rfl
+  | panic => exact False.elim h_post
+  | abort => exact False.elim h_post
+
+/--
+Callee-populated (`BRIEF-3.2`) fuel-free convergence for
+`initMachineStateWithMemoryAndCallees` across arbitrary `callees : List CapturedMir`
+and any `RootActiveMemory mem`.
+-/
+theorem multiBlockPipeline_withMemoryAndCallees_wpConverges
+    (b : Nat) (mem : Memory) (callees : List CapturedMir)
+    (h_root : RootActiveMemory mem) :
+    MirWpConverges multiBlockPipelineBody
+      (initMachineStateWithMemoryAndCallees multiBlockPipelineBody
+        [.scalar { bits := b, sizeBytes := 4 }] mem callees)
+      (mirNormalPost
+        (fun retVal mem' =>
+          retVal = .scalar { bits := b, sizeBytes := 4 } ∧
+          mem' = Memory.withDefaultCallees mem callees)) :=
+  multiBlockPipeline_wpConverges b
+    (Memory.withDefaultCallees mem callees)
+    ((rootActiveMemory_withDefaultCallees mem callees).2 h_root)
+
+/--
+Callee-populated (`BRIEF-3.2`) fuel-free convergence for
+`initMachineStateWithCallees` across arbitrary `callees : List CapturedMir`.
+-/
+theorem multiBlockPipeline_withCallees_wpConverges
+    (b : Nat) (callees : List CapturedMir) :
+    MirWpConverges multiBlockPipelineBody
+      (initMachineStateWithCallees multiBlockPipelineBody
+        [.scalar { bits := b, sizeBytes := 4 }] callees)
+      (mirNormalPost
+        (fun retVal mem' =>
+          retVal = .scalar { bits := b, sizeBytes := 4 } ∧
+          mem' =
+            (initMachineStateWithCallees multiBlockPipelineBody
+              [.scalar { bits := b, sizeBytes := 4 }] callees).memory)) :=
+  multiBlockPipeline_wpConverges b
+    (initMachineStateWithCallees multiBlockPipelineBody
+      [.scalar { bits := b, sizeBytes := 4 }] callees).memory
+    ⟨rfl, rfl, rfl, rfl⟩
 
 /-- Stateless `Claim` for `multiBlockPipelineBody`. -/
 def multiBlockPipelineClaim : Claim where
@@ -2063,17 +2758,21 @@ theorem verify_multiBlockPipelineClaim :
       cases out with
       | normal rv =>
         rcases rv with ⟨retVal, mem'⟩
-        rcases ho with ⟨h_rv, h_mem_eq⟩
+        rcases ho with ⟨h_rv, _⟩
         dsimp [mirNormalPost, multiBlockPipelineClaim]
         exact by rw [h_rv]
       | panic => exact False.elim ho
       | abort => exact False.elim ho)
-    (multiBlockPipeline_wpConverges b _ rfl)
+    (multiBlockPipeline_wpConverges b _ ⟨rfl, rfl, rfl, rfl⟩)
 
-/-- Stateful `StatefulClaim` for `multiBlockPipelineBody`. -/
+/--
+Stateful `StatefulClaim` for `multiBlockPipelineBody` over any root-activation
+`mem : Memory` (allowing arbitrary heap allocations, tag counters, and callee
+tables).
+-/
 def multiBlockPipelineStatefulClaim : StatefulClaim where
   body := multiBlockPipelineBody
-  pre args mem := WellTypedScalarArg1 4 args ∧ mem = (initMachineState multiBlockPipelineBody args).memory
+  pre args mem := WellTypedScalarArg1 4 args ∧ RootActiveMemory mem
   post args mem retVal mem' := args = [retVal] ∧ mem' = mem
 
 /-- Non-vacuity witness for `multiBlockPipelineStatefulClaim.pre`. -/
@@ -2082,8 +2781,9 @@ theorem multiBlockPipelineStatefulClaim_nonVacuous :
       multiBlockPipelineStatefulClaim.pre args mem :=
   proveNonVacuousStatefulPre
     [.scalar { bits := 42, sizeBytes := 4 }]
-    (initMachineState multiBlockPipelineBody [.scalar { bits := 42, sizeBytes := 4 }]).memory
-    ⟨⟨42, by decide, rfl⟩, rfl⟩
+    (initMachineStateWithCallees multiBlockPipelineBody
+      [.scalar { bits := 42, sizeBytes := 4 }] [multiBlockPipelineBody]).memory
+    ⟨⟨42, by decide, rfl⟩, ⟨rfl, rfl, rfl, rfl⟩⟩
 
 /--
 Fuel-free discharge of `StatefulVerificationResult multiBlockPipelineStatefulClaim`
@@ -2093,7 +2793,7 @@ theorem verify_multiBlockPipelineStatefulClaim :
     StatefulVerificationResult multiBlockPipelineStatefulClaim := by
   refine verifyStatefulMirNoPanic_of_wpConverges multiBlockPipelineStatefulClaim ?_
   intro args mem h_pre
-  rcases h_pre with ⟨⟨b, _, rfl⟩, h_mem⟩
+  rcases h_pre with ⟨⟨b, _, rfl⟩, h_root⟩
   exact MirWpConverges.mono
     (fun out ho => by
       cases out with
@@ -2104,12 +2804,15 @@ theorem verify_multiBlockPipelineStatefulClaim :
         exact ⟨by rw [h_rv], h_mem_eq⟩
       | panic => exact False.elim ho
       | abort => exact False.elim ho)
-    (multiBlockPipeline_wpConverges b mem h_mem)
+    (multiBlockPipeline_wpConverges b mem h_root)
 
-/-- Total-correctness `TotalClaim` for `multiBlockPipelineBody`. -/
+/--
+Total-correctness `TotalClaim` for `multiBlockPipelineBody` over any
+root-activation `mem : Memory`.
+-/
 def multiBlockPipelineTotalClaim : TotalClaim where
   body := multiBlockPipelineBody
-  pre args mem := WellTypedScalarArg1 4 args ∧ mem = (initMachineState multiBlockPipelineBody args).memory
+  pre args mem := WellTypedScalarArg1 4 args ∧ RootActiveMemory mem
   post args mem retVal mem' := args = [retVal] ∧ mem' = mem
 
 /--
@@ -2120,18 +2823,18 @@ theorem verify_multiBlockPipelineTotalClaim :
     TotalVerificationResult multiBlockPipelineTotalClaim := by
   refine verifyTotalMir_of_wpConverges multiBlockPipelineTotalClaim ?_
   intro args mem h_pre
-  rcases h_pre with ⟨⟨b, _, rfl⟩, h_mem⟩
+  rcases h_pre with ⟨⟨b, _, rfl⟩, h_root⟩
   exact MirWpConverges.mono
     (fun out ho => by
       cases out with
       | normal rv =>
         rcases rv with ⟨retVal, mem'⟩
         rcases ho with ⟨h_rv, h_mem_eq⟩
-        dsimp [mirNormalPost, multiBlockPipelineStatefulClaim]
+        dsimp [mirNormalPost, multiBlockPipelineTotalClaim]
         exact ⟨by rw [h_rv], h_mem_eq⟩
       | panic => exact False.elim ho
       | abort => exact False.elim ho)
-    (multiBlockPipeline_wpConverges b mem h_mem)
+    (multiBlockPipeline_wpConverges b mem h_root)
 
 end ConcreteWitnesses
 
