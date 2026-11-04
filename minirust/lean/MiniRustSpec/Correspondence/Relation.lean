@@ -28,9 +28,10 @@ MiniRust `Machine<BasicMemory<x86_64>>` in which:
 * every MIR local `_i` is live in both models. In MiniRust it is a pointer to
   its own `Stack` allocation whose bytes are the representation-relation
   encoding of Anneal's slot: `Uninit` bytes for an uninitialized slot and the
-  little-endian bytes of the bit pattern for an initialized scalar. The
-  callee's allocations sit after an arbitrary prefix `base` of allocations,
-  which contains the caller's return place;
+  little-endian bytes of the bit pattern for an initialized scalar. An
+  initialized `bool` slot holds `0` or `1` (`ValidBits`), so its one byte
+  decodes at `Type::Bool`. The callee's allocations sit after an arbitrary
+  prefix `base` of allocations, which contains the caller's return place;
 * the Anneal state has no borrows, protectors, call stack, active callee, or
   caller-owned referents (the fragment cannot create any).
 
@@ -48,9 +49,41 @@ open MiniRustSpec
 open MiniRustSpec.LibSpecr
 open MiniRustSpec.Interp
 
-/-- MiniRust integer type of a MIR local declaration (the default is never
-used for fragment bodies, whose locals all have integer types). -/
+/-- MiniRust storage integer type of a MIR local declaration: its own integer
+type, or `u8` (the default) for a `bool` local, which occupies one byte with
+alignment one just like a `u8` (`Type::layout` gives `Bool` the layout
+`Sized(Size::from_bytes_const(1), Align::ONE)`). -/
 def itOf (d : LocalDecl) : Gen.IntType := (intTypeOf d.ty).getD ⟨.Unsigned, ⟨1⟩⟩
+
+/-- MiniRust type of a fragment local declaration (`Type::Int(..)` or
+`Type::Bool`, as `minimize` translates it); the default is never used for
+fragment bodies. -/
+def tyOf (d : LocalDecl) : Gen.Type := (scalarTypeOf d.ty).getD (.Int (itOf d))
+
+/-- Byte size of a fragment type. -/
+def tyBytes : Gen.Type → Nat
+  | .Int it => it.size.bytes
+  | _ => 1
+
+/-- The bit patterns that encode a value of a fragment type: every in-range
+pattern for an integer type, and only `0` (`false`) and `1` (`true`) for
+`bool`, whose other byte values MiniRust's `decode` rejects. -/
+def ValidBits : Gen.Type → Nat → Prop
+  | .Int it, bits => bits < 2 ^ (8 * it.size.bytes)
+  | .Bool, bits => bits < 2
+  | _, _ => False
+
+/-- Decidable `ValidBits`. -/
+def validBits : Gen.Type → Nat → Bool
+  | .Int it, bits => decide (bits < 2 ^ (8 * it.size.bytes))
+  | .Bool, bits => decide (bits < 2)
+  | _, _ => false
+
+theorem validBits_iff (T : Gen.Type) (bits : Nat) : validBits T bits = true ↔ ValidBits T bits := by
+  cases T <;> simp [validBits, ValidBits]
+
+instance (T : Gen.Type) (bits : Nat) : Decidable (ValidBits T bits) :=
+  decidable_of_iff _ (validBits_iff T bits)
 
 /-- `Type::encode` of `Value::Int(int_from_bits(bits))` at `Type::Int(it)`:
 little-endian bytes without provenance. -/
@@ -66,11 +99,11 @@ def slotData (it : Gen.IntType) : LocalSlot → List Byte
   | .init (.scalar sc) => scalarBytes it sc.bits
   | _ => uninitBytes it
 
-/-- Fragment slots: live, and holding either nothing or a scalar of the
-declared size whose bit pattern is in range. -/
-def SlotOk (it : Gen.IntType) : LocalSlot → Prop
+/-- Fragment slots of type `T`: live, and holding either nothing or a scalar
+of `T`'s size whose bit pattern encodes a value of `T` (`ValidBits`). -/
+def SlotOk (T : Gen.Type) : LocalSlot → Prop
   | .uninit => True
-  | .init (.scalar sc) => sc.sizeBytes = it.size.bytes ∧ sc.bits < 2 ^ (8 * it.size.bytes)
+  | .init (.scalar sc) => sc.sizeBytes = tyBytes T ∧ ValidBits T sc.bits
   | _ => False
 
 /-- The parts of the MiniRust machine that the callee's execution does not
@@ -139,7 +172,7 @@ structure StateRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : Mach
   stmt : ∀ bb, body.basicBlocks[s.frame.blockIdx]? = some bb → s.frame.stmtIdx ≤ bb.statements.length
   nlocals : s.frame.locals.length = body.localDecls.length
   slots : ∀ (i : Nat) d slot, body.localDecls[i]? = some d → s.frame.locals[i]? = some slot →
-    SlotOk (itOf d) slot
+    SlotOk (tyOf d) slot
   addrs : ∀ (i : Nat) d, body.localDecls[i]? = some d →
     ctx.addrs.getD i 0 % ((itOf d).size.bytes : Int) = 0
   ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (itOf d)
@@ -166,7 +199,7 @@ structure StartRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : Mach
   hasBlocks : 0 < body.basicBlocks.length
   nlocals : s.frame.locals.length = body.localDecls.length
   slots : ∀ (i : Nat) d slot, body.localDecls[i]? = some d → s.frame.locals[i]? = some slot →
-    SlotOk (itOf d) slot
+    SlotOk (tyOf d) slot
   addrs : ∀ (i : Nat) d, body.localDecls[i]? = some d →
     ctx.addrs.getD i 0 % ((itOf d).size.bytes : Int) = 0
   ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (itOf d)
@@ -184,17 +217,18 @@ structure CtxOk (body : CapturedMir) (ctx : Ctx) : Prop where
     ctx.addrs.getD i 0 % ((itOf d).size.bytes : Int) = 0
   ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (itOf d)
 
-/-- Decidable well-typedness of an incoming argument `v` for integer parameter
-type `it`. -/
-def argOk (it : Gen.IntType) : Value → Bool
-  | .scalar sc => decide (sc.sizeBytes = it.size.bytes) && decide (sc.bits < 2 ^ (8 * it.size.bytes))
+/-- Decidable well-typedness of an incoming argument `v` for a parameter of
+fragment type `T`: a scalar of `T`'s size whose bit pattern encodes a value of
+`T` (for `bool`, only `0` and `1`). -/
+def argOk (T : Gen.Type) : Value → Bool
+  | .scalar sc => decide (sc.sizeBytes = tyBytes T) && validBits T sc.bits
   | _ => false
 
 /-- Decidable well-typedness of argument values `args` against parameter
 declarations `decls` (`_1 .. _argCount`). -/
 def argsOkAux : List LocalDecl → List Value → Bool
   | [], [] => true
-  | d :: ds, v :: vs => argOk (itOf d) v && argsOkAux ds vs
+  | d :: ds, v :: vs => argOk (tyOf d) v && argsOkAux ds vs
   | _, _ => false
 
 /-- Decidable well-typedness of `args` for `mirCallTree body args`. -/

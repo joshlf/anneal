@@ -21,6 +21,13 @@ depends only on Lean's standard axioms (`propext`, `Quot.sound`,
 `Lean.ofReduceBool` (which `native_decide` would introduce). It also logs the
 axioms of each declaration, so `lake build MiniRustSpec.Audit` doubles as the
 `#print axioms` receipt.
+
+`#check_theorem_deps` (`checkTheoremDeps`) performs the same check on a group
+of declarations and logs one summary line per group, tagged `[ANCHOR-AUDIT]`
+(the anchors of the interpretation), `[SIMULATION-AUDIT]` (the
+correspondence theorems and the lemmas they rest on), or `[WITNESS-AUDIT]`
+(the concrete witnesses), ending in `sorry_free=true`. A group that depends on
+`sorryAx` or on any other non-standard axiom fails the build instead.
 -/
 
 namespace MiniRustSpec.Audit
@@ -36,6 +43,23 @@ elab "#assert_standard_axioms " ids:ident* : command => do
       unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
         throwError "{n} depends on the non-standard axiom {a}"
     logInfo m!"{n} depends on axioms: {axs.toList}"
+
+/-- `checkTheoremDeps`: fail unless every listed declaration depends only on
+the standard axioms, then log one line
+`<tag> decls=<n> axioms=<union> sorry_free=true`. -/
+elab "#check_theorem_deps " tag:str ids:ident* : command => do
+  let mut union : Array Name := #[]
+  for id in ids do
+    let n ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo id
+    let axs ← liftCoreM <| Lean.collectAxioms n
+    for a in axs do
+      if a == ``sorryAx then
+        throwError "{tag.getString} {n} depends on sorryAx"
+      unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
+        throwError "{tag.getString} {n} depends on the non-standard axiom {a}"
+      unless union.contains a do
+        union := union.push a
+  logInfo m!"{tag.getString} decls={ids.size} axioms={union.toList} sorry_free=true"
 
 open MiniRustSpec.LibSpecr in
 #assert_standard_axioms
@@ -115,6 +139,29 @@ open MiniRustSpec.Correspondence in
   switch_lookup
   translateFn_spec
   translateFn_start
+  evalValue_operandT
+  evalValue_rvalueB
+  evalStatement_assign_of
+  evalStatement_assignB
+  evalOperand_fragT
+  evalRvalue_fragB
+  evalStmt_assign_of
+  evalStmt_assignB
+  evalScalarBinOp_rel_int
+  evalScalarBinOp_rel_bool
+  signedLt_eq
+  signedLe_eq
+  evalUnaryNot_bool
+  evalBinOp_rel_frag
+  evalValue_boolNot
+  evalValue_boolToU8
+  switch_spec
+  typedLoad_local_bool
+  typedLoad_local_bool_uninit
+  typedStore_local_bool
+  typedStore_base_frag
+  opBits_valid
+  operandIsSigned_of_OperandOkT
 
 open MiniRustSpec.Correspondence.Witness in
 #assert_standard_axioms
@@ -276,10 +323,136 @@ open MiniRustSpec.Correspondence.Witness in
   uninitSwitchUb_minirust_ub_from_start
   uninitSwitchUb_minirust_direct
   uninitSwitchUb_converse_error
+  ctxI8_ok_cmpNot
+  cmpNotSwitch_inFragment
+  cmpNotSwitch_translate
+  cmpNotNeg1_anneal_ret
+  cmpNotNeg1_noUB
+  cmpNotNeg1_minirust_ret_from_start
+  cmpNotNeg1_minirust_direct
+  cmpNot3_anneal_ret
+  cmpNot3_minirust_ret_from_start
+  cmpNot3_minirust_direct
+  ctxBool_ok
+  ctxBool_ok1
+  leNeGe_inFragment
+  leNeGe_translate
+  leNeGe250_anneal_ret
+  leNeGe250_minirust_ret_from_start
+  leNeGe250_minirust_direct
+  leNeGe5_anneal_ret
+  leNeGe5_minirust_direct
+  uninitBool_inFragment
+  uninitBool_translate
+  uninitBool_anneal_ub
+  uninitBool_minirust_ub_from_start
+  uninitBool_minirust_direct
+  relLt_signed
+  relGt_unsigned
+  relCmp_signed
+  relCmp_unsigned
+  relCmp_bool
+  relLt_bool
+  relLe_bool
+  relGe_eq
+  relNe_eq
+  rel_mismatch
+  transmute_bool_u8
+  transmute_u8_bool
+  transmute_u8_bool_invalid
+  transmute_size_mismatch
+  decode_bool_invalid
+  bitNot_bool_panics
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
   MiniRustSpec.Anchors.anchors_nodup
+
+#check_theorem_deps "[ANCHOR-AUDIT]"
+  MiniRustSpec.Anchors.anchors_ok
+  MiniRustSpec.Anchors.anchors_nodup
+
+open MiniRustSpec.Correspondence in
+#check_theorem_deps "[SIMULATION-AUDIT]"
+  step_correspondence
+  step_initBlock
+  step_start
+  initMachineState_startRel
+  run_ret
+  run_ret_from_start
+  run_ub
+  run_ub_from_start
+  steps_error
+  steps_error_from_start
+  steps_outcome
+  steps_outcome_from_start
+  mirNoUB_safe
+  mirNoUB_safe_from_start
+  mirCall_ret
+  mirCall_ub
+  mirCall_noUB
+  mirCall_progress
+  mirCall_steps_error
+  mirCall_outcome
+  mirCall_diverges_steps_ok
+  mirCall_diverges_rel
+  evalValue_operandT
+  evalValue_rvalueB
+  evalStatement_assignB
+  evalOperand_fragT
+  evalRvalue_fragB
+  evalStmt_assignB
+  evalScalarBinOp_rel_int
+  evalScalarBinOp_rel_bool
+  evalUnaryNot_bool
+  evalBinOp_rel_frag
+  evalValue_boolNot
+  evalValue_boolToU8
+  switch_spec
+  typedStore_base_frag
+
+open MiniRustSpec.Correspondence.Witness in
+#check_theorem_deps "[WITNESS-AUDIT]"
+  cmpNotSwitch_inFragment
+  cmpNotSwitch_translate
+  cmpNotNeg1_anneal_ret
+  cmpNotNeg1_noUB
+  cmpNotNeg1_minirust_ret_from_start
+  cmpNotNeg1_minirust_direct
+  cmpNot3_anneal_ret
+  cmpNot3_minirust_ret_from_start
+  cmpNot3_minirust_direct
+  leNeGe_inFragment
+  leNeGe_translate
+  leNeGe250_anneal_ret
+  leNeGe250_minirust_ret_from_start
+  leNeGe250_minirust_direct
+  leNeGe5_anneal_ret
+  leNeGe5_minirust_direct
+  uninitBool_inFragment
+  uninitBool_translate
+  uninitBool_anneal_ub
+  uninitBool_minirust_ub_from_start
+  uninitBool_minirust_direct
+  relLt_signed
+  relGt_unsigned
+  relCmp_signed
+  relCmp_unsigned
+  relCmp_bool
+  relLt_bool
+  relLe_bool
+  relGe_eq
+  relNe_eq
+  rel_mismatch
+  transmute_bool_u8
+  transmute_u8_bool
+  transmute_u8_bool_invalid
+  transmute_size_mismatch
+  decode_bool_invalid
+  bitNot_bool_panics
+  sumTo_minirust_ret_from_start
+  castBitNot4_minirust_ret_from_start
+  uninitSwitchUb_minirust_ub_from_start
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

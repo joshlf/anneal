@@ -54,16 +54,61 @@ theorem localName_inj (a b : Nat) : localName a = localName b ↔ a = b := by
 theorem bbName_inj (a b : Nat) : bbName a = bbName b ↔ a = b := by
   simp [bbName]
 
+/-! ## Fragment types -/
+
+theorem intTypeOf_isBoolTy {t : MirAst.Ty} {it : Gen.IntType} (h : intTypeOf t = some it) :
+    isBoolTy t = false := by
+  unfold intTypeOf intTyBytes at h
+  unfold isBoolTy
+  split at h <;> simp_all
+
+theorem isBoolTy_intTypeOf {t : MirAst.Ty} (h : isBoolTy t = true) : intTypeOf t = none := by
+  unfold isBoolTy at h
+  unfold intTypeOf intTyBytes
+  split at h <;> simp_all
+
+theorem scalarTypeOf_int {t : MirAst.Ty} {it : Gen.IntType} (h : intTypeOf t = some it) :
+    scalarTypeOf t = some (.Int it) := by
+  simp [scalarTypeOf, intTypeOf_isBoolTy h, h]
+
+theorem scalarTypeOf_bool {t : MirAst.Ty} (h : isBoolTy t = true) : scalarTypeOf t = some .Bool := by
+  simp [scalarTypeOf, h]
+
+/-- A fragment scalar type is `bool` or an integer type. -/
+theorem scalarTypeOf_cases {t : MirAst.Ty} {T : Gen.Type} (h : scalarTypeOf t = some T) :
+    (isBoolTy t = true ∧ T = .Bool) ∨ (∃ it, intTypeOf t = some it ∧ T = .Int it) := by
+  unfold scalarTypeOf at h
+  cases hb : isBoolTy t with
+  | true => simp [hb] at h; exact .inl ⟨rfl, h.symm⟩
+  | false =>
+    simp only [hb, Bool.false_eq_true, ↓reduceIte] at h
+    cases hit : intTypeOf t with
+    | none => simp [hit] at h
+    | some it => simp [hit] at h; exact .inr ⟨it, rfl, h.symm⟩
+
+theorem tyOf_int {d : LocalDecl} {it : Gen.IntType} (h : intTypeOf d.ty = some it) :
+    tyOf d = .Int it ∧ itOf d = it := by
+  simp [tyOf, itOf, scalarTypeOf_int h, h]
+
+theorem tyOf_bool {d : LocalDecl} (h : isBoolTy d.ty = true) : tyOf d = .Bool ∧ itOf d = u8Ty := by
+  simp [tyOf, itOf, scalarTypeOf_bool h, isBoolTy_intTypeOf h, u8Ty]
+
+/-- `tyOf` is the translated type of a fragment local. -/
+theorem tyOf_of_scalarTypeOf {d : LocalDecl} {T : Gen.Type} (h : scalarTypeOf d.ty = some T) :
+    tyOf d = T := by
+  simp [tyOf, h]
+
+
 /-! ## `translateFn` -/
 
 theorem translateLocals_get (k : Nat) (ds : List LocalDecl) (L : List (Gen.LocalName × Gen.Type))
     (h : translateLocals k ds = some L) (j : Nat) (d : LocalDecl) (hd : ds[j]? = some d) :
-    ∃ it, intTypeOf d.ty = some it ∧ mapGet ⟨L⟩ (localName (k + j)) = some (.Int it) := by
+    ∃ T, scalarTypeOf d.ty = some T ∧ mapGet ⟨L⟩ (localName (k + j)) = some T := by
   induction ds generalizing k L j with
   | nil => simp at hd
   | cons d' ds ih =>
     simp only [translateLocals, Option.bind_eq_bind] at h
-    cases hit : intTypeOf d'.ty with
+    cases hit : scalarTypeOf d'.ty with
     | none => simp [hit] at h
     | some it' =>
       cases hrest : translateLocals (k + 1) ds with
@@ -117,7 +162,7 @@ theorem translateBlocks_get (decls : List LocalDecl) (k : Nat) (bbs : List Basic
 theorem translateFn_spec (body : CapturedMir) (f : Gen.Function) (h : translateFn body = some f) :
     f.ret = localName 0 ∧
     (∀ (i : Nat) d, body.localDecls[i]? = some d →
-      intTypeOf d.ty = some (itOf d) ∧ mapGet f.locals (localName i) = some (.Int (itOf d))) ∧
+      scalarTypeOf d.ty = some (tyOf d) ∧ mapGet f.locals (localName i) = some (tyOf d)) ∧
     (∀ (i : Nat) bb, body.basicBlocks[i]? = some bb →
       ∃ tb, translateBlock body.localDecls bb = some tb ∧ mapGet f.blocks (bbName i) = some tb) := by
   simp only [translateFn, Option.bind_eq_bind] at h
@@ -131,9 +176,8 @@ theorem translateFn_spec (body : CapturedMir) (f : Gen.Function) (h : translateF
       subst h
       refine ⟨rfl, ?_, ?_⟩
       · intro i d hd
-        obtain ⟨it, hit, hget⟩ := translateLocals_get 0 body.localDecls L hL i d hd
-        have : itOf d = it := by simp [itOf, hit]
-        rw [this]; refine ⟨hit, ?_⟩
+        obtain ⟨T, hT, hget⟩ := translateLocals_get 0 body.localDecls L hL i d hd
+        rw [tyOf_of_scalarTypeOf hT]; refine ⟨hT, ?_⟩
         simpa using hget
       · intro i bb hbb
         obtain ⟨tb, htb, hget⟩ := translateBlocks_get body.localDecls 0 body.basicBlocks B hB i bb hbb

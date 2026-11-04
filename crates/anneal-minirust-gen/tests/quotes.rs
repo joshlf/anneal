@@ -726,3 +726,137 @@ def u := \"trailing\\";
     assert_eq!(qs4.len(), 1);
     assert_eq!(qs4[0].cited_file, ops);
 }
+
+/// The upstream items behind `bool`, comparisons, and transmutes (`MR-1.1`):
+/// each quotation that the Lean transcriptions rely on occurs verbatim in its
+/// vendored file, a one-token tampering of it is rejected, and the Lean
+/// sources still carry it (so the doc comment cannot silently lose the quote
+/// that justifies a definition).
+#[test]
+fn bool_comparison_and_transmute_quotations_are_pinned() {
+    let corpus = corpus();
+    let ops = "spec/lang/step/operators.md";
+    let repr = "spec/lang/representation.md";
+    let types = "spec/lang/types.md";
+    let rvalue = "tooling/minimize/src/rvalue.rs";
+    let bb = "tooling/minimize/src/bb.rs";
+    let constant = "tooling/minimize/src/constant.rs";
+
+    // (cited file, genuine quotation, tampered quotation, Lean file quoting it)
+    let cases: &[(&str, &str, &str, &str)] = &[
+        // `Machine::transmute`: encode at the old type, decode at the new one.
+        (
+            repr,
+            "let bytes = type1.encode::<M>(val); if let Some(raw_value) = type2.decode::<M>(bytes) { \
+             self.check_value(raw_value, type2)?; ret(raw_value) } else { \
+             throw_ub!(\"transmuted value is not valid at new type\") }",
+            "let bytes = type1.encode::<M>(val); if let Some(raw_value) = type1.decode::<M>(bytes) {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `CastOp::Transmute` checks the sizes before transmuting.
+        (
+            ops,
+            "Transmute(new_ty) => { if old_ty.layout::<M::T>().expect_size(\"WF ensures transmutes are sized\") \
+             != new_ty.layout::<M::T>().expect_size(\"WF ensures transmutes are sized\") { \
+             throw_ub!(\"transmute between types of different size\") }",
+            "Transmute(new_ty) => { if old_ty.layout::<M::T>().expect_size(\"WF ensures transmutes are sized\") \
+             == new_ty.layout::<M::T>().expect_size(\"WF ensures transmutes are sized\") {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `eval_rel_op`: every relational operator and the `i8` of `Cmp`.
+        (
+            ops,
+            "Lt => (Value::Bool(ord.is_lt()), Type::Bool), Gt => (Value::Bool(ord.is_gt()), Type::Bool), \
+             Le => (Value::Bool(ord.is_le()), Type::Bool), Ge => (Value::Bool(ord.is_ge()), Type::Bool), \
+             Eq => (Value::Bool(ord.is_eq()), Type::Bool), Ne => (Value::Bool(ord.is_ne()), Type::Bool),",
+            "Lt => (Value::Bool(ord.is_gt()), Type::Bool),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            ops,
+            "(Value::Int(Int::from(val)), Type::Int(IntType::I8))",
+            "(Value::Int(Int::from(val)), Type::Int(IntType::I32))",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `BinOp::Rel` compares integers and Booleans with `cmp`.
+        (
+            ops,
+            "(Type::Int(_), Value::Int(left), Value::Int(right)) => { left.cmp(&right) } \
+             (Type::Bool, Value::Bool(left), Value::Bool(right)) => { left.cmp(&right) }",
+            "(Type::Int(_), Value::Int(left), Value::Int(right)) => { right.cmp(&left) }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
+            "pub const I8: IntType = IntType { signed: Signedness::Signed, size: Size::from_bytes_const(1) };",
+            "pub const I8: IntType = IntType { signed: Signedness::Unsigned, size: Size::from_bytes_const(1) };",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `bool` decodes only the bytes 0 and 1.
+        (
+            repr,
+            "AbstractByte::Init(0, _) => Value::Bool(false), AbstractByte::Init(1, _) => Value::Bool(true), \
+             _ => throw!(),",
+            "AbstractByte::Init(2, _) => Value::Bool(true),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `minimize`: `!b` on a `bool` is `build::not`, comparisons are
+        // `build::lt` and friends, `bool` constants go through `to_bool`, and a
+        // `bool` switch is transmuted to `u8`.
+        (
+            rvalue,
+            "(Not, Type::Int(_)) => build::bit_not(operand), (Not, Type::Bool) => build::not(operand),",
+            "(Not, Type::Bool) => build::bit_not(operand),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            rvalue,
+            "(Lt, _) => build::lt(l, r), (Le, _) => build::le(l, r), (Gt, _) => build::gt(l, r), \
+             (Ge, _) => build::ge(l, r), (Eq, _) => build::eq(l, r), (Ne, _) => build::ne(l, r),",
+            "(Lt, _) => build::le(l, r),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            constant,
+            "let val = ecx.read_scalar(&val).unwrap().to_bool().unwrap(); \
+             ValueExpr::Constant(Constant::Bool(val), ty)",
+            "let val = ecx.read_scalar(&val).unwrap().to_u8().unwrap();",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "let Type::Int(u8_inttype) = <u8>::get_type() else { unreachable!() }; ( ValueExpr::UnOp { \
+             operator: UnOp::Cast(CastOp::Transmute(Type::Int(u8_inttype))), operand: GcCow::new(discr_op), }, \
+             u8_inttype, )",
+            "operator: UnOp::Cast(CastOp::IntToInt(u8_inttype)),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+    ];
+
+    let lean_root = minirust_dir().join("lean");
+    for (file, genuine, tampered, lean_file) in cases {
+        assert_eq!(
+            missing_piece_in(&corpus, Some(file), genuine),
+            None,
+            "genuine quotation not found in `{file}`: {genuine}"
+        );
+        assert!(
+            missing_piece_in(&corpus, Some(file), tampered).is_some(),
+            "tampered quotation unexpectedly found in `{file}`: {tampered}"
+        );
+        // The same quotation must be rejected when attributed to another file.
+        let other = if *file == ops { repr } else { ops };
+        assert!(
+            missing_piece_in(&corpus, Some(other), genuine).is_some(),
+            "quotation from `{file}` also matches `{other}`: {genuine}"
+        );
+        let lean = std::fs::read_to_string(lean_root.join(lean_file)).unwrap();
+        let lean_squashed = squash(&lean.replace("\\\"", "\"").replace("\n>", "\n"));
+        let first_piece = squash(genuine.split("..").next().unwrap());
+        let probe: String = first_piece.chars().take(40).collect();
+        assert!(
+            lean_squashed.contains(&probe),
+            "`{lean_file}` no longer quotes `{probe}`"
+        );
+    }
+}

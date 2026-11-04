@@ -28,7 +28,7 @@ we choose the program that MiniRust's tooling would produce.
 The translation is defined only on the fragment checked by `inFragment`:
 
 * the body declares exactly the return place and the arguments
-  (`localDecls.length = argCount + 1`), all of integer type;
+  (`localDecls.length = argCount + 1`), all of integer or `bool` type;
 * statements are `_i = Use(copy _j)`, `_i = Use(const c)`,
   `_i = UnaryOp(uop, a)` with `uop ∈ {Neg, Not}`,
   `_i = BinaryOp(op, a, b)` with
@@ -37,13 +37,24 @@ The translation is defined only on the fragment checked by `inFragment`:
   operators or of any integer type `rhsIt` for the shift operators
   `Shl, Shr, ShlUnchecked, ShrUnchecked`),
   `_i = Cast(IntToInt, a, targetTy)` (casting an operand `a` of any integer
-  type `srcIt` to the destination local's integer type `it`),
-  where every operand is `copy _j` (no projections) or an integer constant,
-  or `PlaceMention(_i)`;
-* terminators are `Goto`, `SwitchInt` on an integer operand (`copy _j` or
-  constant), `Unreachable`, or `Return`, and every jump target is a block of the
-  body;
+  type `srcIt` to the destination local's integer type `it`), all for an
+  integer `_i`; and, for a `bool` `_i`, `_i = Use(a)` and `_i = UnaryOp(Not,
+  a)` with a `bool` operand `a`, and the comparisons
+  `_i = BinaryOp(Eq | Ne | Lt | Le | Gt | Ge, a, b)` of two integer operands
+  of one type or of two `bool` operands; every operand is `copy _j` (no
+  projections) or a scalar constant; or `PlaceMention(_i)`;
+* terminators are `Goto`, `SwitchInt` on an integer or `bool` operand
+  (`copy _j` or constant), `Unreachable`, or `Return`, and every jump target is
+  a block of the body;
 * no block is a cleanup block.
+
+`minimize` has no MiniRust Boolean operator to use: it writes `!b` as a
+transmute of `1 - b` back to `bool` (`boolNot`) and switches on a `bool`
+through a transmute to `u8` (`boolToU8`). Both are `CastOp::Transmute`,
+which MiniRust evaluates by encoding at the old type and decoding at the new
+one (`MiniRustSpec.Interp.transmute`). MIR's three-way comparison `Cmp` is
+outside the fragment because `minimize` transmutes its result to the
+`Ordering` enum.
 
 `Operand::Move` is excluded on purpose: `minimize` translates it exactly like
 `Copy` ("smir::Operand::Move(place) => ValueExpr::Load { .. }"), while Anneal's
@@ -93,6 +104,32 @@ with the size from the layout. -/
 def intTypeOf (t : MirAst.Ty) : Option Gen.IntType :=
   (intTyBytes t.kind).map (fun (s, n) => ⟨s, ⟨n⟩⟩)
 
+/-- `u8`, as MiniRust's tooling writes it (`<u8>::get_type()`, an unsigned
+one-byte `IntType`). `minimize` transmutes a `bool` to `u8` before switching
+on it or doing arithmetic on it, and a fragment `bool` local occupies the same
+storage as a `u8` local (one byte, alignment one). -/
+def u8Ty : Gen.IntType := ⟨.Unsigned, ⟨1⟩⟩
+
+/-- Whether a MIR type is `bool` (`rs::TyKind::Bool`). -/
+def isBoolTy (t : MirAst.Ty) : Bool :=
+  match t.kind with
+  | .bool => true
+  | _ => false
+
+/-- `minimize`'s type translation for the fragment's scalar types
+(`tooling/minimize/src/ty.rs`):
+> "rs::TyKind::Bool => Type::Bool,
+>  rs::TyKind::Int(t) => {
+>      let sz = rs::abi::Integer::from_int_ty(&self.tcx, *t).size();
+>      Type::Int(IntType { size: translate_size(sz), signed: Signedness::Signed })
+>  }
+>  rs::TyKind::Uint(t) => {
+>      let sz = rs::abi::Integer::from_uint_ty(&self.tcx, *t).size();
+>      Type::Int(IntType { size: translate_size(sz), signed: Signedness::Unsigned })
+>  }" -/
+def scalarTypeOf (t : MirAst.Ty) : Option Gen.Type :=
+  if isBoolTy t then some .Bool else (intTypeOf t).map .Int
+
 /-- `minimize`'s `int_from_bits(bits, int_ty)`: interpret a `u128` bit pattern as
 the mathematical integer it encodes at type `int_ty` (two's complement for
 signed types). -/
@@ -109,21 +146,41 @@ def operandIntType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option G
   | .constant c => intTypeOf c.ty
   | _ => none
 
+/-- MiniRust type (an integer type or `Type::Bool`) of a fragment operand. -/
+def operandType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.Type
+  | .copy ⟨j, []⟩ => decls[j]? >>= fun d => scalarTypeOf d.ty
+  | .constant c => scalarTypeOf c.ty
+  | _ => none
+
 /-- `minimize`'s operand translation (`tooling/minimize/src/rvalue.rs`):
 > "smir::Operand::Constant(c) => self.translate_const_smir(&c.const_, span),
 >  smir::Operand::Copy(place) =>
 >      ValueExpr::Load { source: GcCow::new(self.translate_place_smir(place, span)) },"
-restricted to projection-free places (`PlaceExpr::Local`) and integer scalar
-constants (`Constant::Int(int_from_bits(..))` at the constant's type). -/
+restricted to projection-free places (`PlaceExpr::Local`) and scalar
+constants. For an integer constant, `translate_const_val`
+(`tooling/minimize/src/constant.rs`) reads the scalar at the constant's type,
+which is `Constant::Int(int_from_bits(..))`; for a `bool` constant it reads a
+`bool`, which rustc's `Scalar::to_bool` accepts only for the one-byte patterns
+`0` and `1`:
+> "Type::Bool => {
+>      let val = ecx.read_scalar(&val).unwrap().to_bool().unwrap();
+>      ValueExpr::Constant(Constant::Bool(val), ty)
+>  }" (`tooling/minimize/src/constant.rs`) -/
 def translateOperand : MirAst.Operand → Option Gen.ValueExpr
   | .copy ⟨j, []⟩ => some (.Load (.Local (localName j)))
   | .constant c =>
-    match c.val, intTypeOf c.ty with
-    | .scalar (.int ⟨bits, sz⟩), some it =>
-      if sz = it.size.bytes ∧ bits < 2 ^ (8 * sz) then
-        some (.Constant (.Int (intFromBits bits it)) (.Int it))
-      else none
-    | _, _ => none
+    if isBoolTy c.ty then
+      match c.val with
+      | .scalar (.int ⟨bits, sz⟩) =>
+        if sz = 1 ∧ bits < 2 then some (.Constant (.Bool (decide (bits = 1))) .Bool) else none
+      | _ => none
+    else
+      match c.val, intTypeOf c.ty with
+      | .scalar (.int ⟨bits, sz⟩), some it =>
+        if sz = it.size.bytes ∧ bits < 2 ^ (8 * sz) then
+          some (.Constant (.Int (intFromBits bits it)) (.Int it))
+        else none
+      | _, _ => none
   | _ => none
 
 /-- `minimize`'s unary-operator translation for integer operands
@@ -174,16 +231,85 @@ def translateBinOp : MirAst.BinOp → Option Gen.IntBinOp
   | .shrUnchecked => some .ShrUnchecked
   | _ => none
 
+/-- `minimize`'s translation of the comparison operators, which it applies to
+operands of any type (`tooling/minimize/src/rvalue.rs`):
+> "(Lt, _) => build::lt(l, r),
+>  (Le, _) => build::le(l, r),
+>  (Gt, _) => build::gt(l, r),
+>  (Ge, _) => build::ge(l, r),
+>  (Eq, _) => build::eq(l, r),
+>  (Ne, _) => build::ne(l, r),"
+where each `build` helper is `rel_op(RelOp::_, l, r)`, which builds
+`ValueExpr::BinOp { operator: BinOp::Rel(op), left, right }` (MiniRust's
+`tooling/miniutil/src/build/expr.rs`, lines 209-235 at the pinned commit:
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/expr.rs#L209-L235>).
+MIR's three-way `Cmp` is not translated: `minimize` transmutes its `i8`
+result to the `Ordering` enum, and enum types are outside the fragment. -/
+def translateRelOp : MirAst.BinOp → Option Gen.RelOp
+  | .lt => some .Lt
+  | .le => some .Le
+  | .gt => some .Gt
+  | .ge => some .Ge
+  | .eq => some .Eq
+  | .ne => some .Ne
+  | _ => none
+
+/-- `build::bool_to_int::<u8>(v)`, which `minimize` uses to view a `bool` as
+the integer `0` or `1`. It is a transmute to `u8`, with no further cast because
+the target type already is `u8` (MiniRust's
+`tooling/miniutil/src/build/expr.rs`, lines 101-107 at the pinned commit,
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/expr.rs#L101-L107>):
+```rust
+pub fn bool_to_int<T: TypeConv>(v: ValueExpr) -> ValueExpr {
+    // First transmute to `u8`.
+    let t_u8 = u8::get_type();
+    let int = transmute(v, t_u8);
+    // Then cast that to the desired integer type, if necessary.
+    if T::get_type() == t_u8 { int } else { int_cast::<T>(int) }
+}
+```
+with `transmute(v, t)` building
+`ValueExpr::UnOp { operator: UnOp::Cast(CastOp::Transmute(t)), operand: v }`. -/
+def boolToU8 (v : Gen.ValueExpr) : Gen.ValueExpr :=
+  .UnOp (.Cast (.Transmute (.Int u8Ty))) v
+
+/-- `build::not(v)`, `minimize`'s translation of `!b` on a `bool` operand
+(`tooling/minimize/src/rvalue.rs`):
+> "(Not, Type::Bool) => build::not(operand),"
+MiniRust has no Boolean negation operator; `build::not` computes `1 - b` on
+the `u8` view of `b` and transmutes the result back to `bool` (MiniRust's
+`tooling/miniutil/src/build/expr.rs`, lines 109-112 at the pinned commit,
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/expr.rs#L109-L112>):
+```rust
+pub fn not(v: ValueExpr) -> ValueExpr {
+    // `1 - v` is always 0 or 1, so safe to transmute back
+    transmute(sub(const_int(1u8), bool_to_int::<u8>(v)), bool_ty())
+}
+```
+where `const_int(1u8)` is `ValueExpr::Constant(Constant::Int(1), u8)`,
+`sub(l, r)` is `BinOp::Int(IntBinOp::Sub)`, and `bool_ty()` is `Type::Bool`.
+Both transmutes run through `Machine::transmute`, so the MiniRust side
+re-validates the byte (`0` or `1`) at `bool`. -/
+def boolNot (v : Gen.ValueExpr) : Gen.ValueExpr :=
+  .UnOp (.Cast (.Transmute .Bool))
+    (.BinOp (.Int .Sub) (.Constant (.Int 1) (.Int u8Ty)) (boolToU8 v))
+
 /-- `minimize`'s rvalue translation for `Use`, `UnaryOp(Neg | Not)` on
-integers, `BinaryOp`, and `Cast(CastKind::IntToInt)` on integers
+integers, `UnaryOp(Not)` on `bool`, integer `BinaryOp`s, the comparison
+`BinaryOp`s, and `Cast(CastKind::IntToInt)` on integers
 (`tooling/minimize/src/rvalue.rs`):
 > "match rv {
 >      smir::Rvalue::Use(operand) => self.translate_operand_smir(operand, span),
 >      smir::Rvalue::BinaryOp(bin_op, l, r) => {
+>          let lty_smir = l.ty(&self.locals_smir).unwrap();
+>          let lty = self.translate_ty_smir(lty_smir, span);
 >          ..
 >          let l = self.translate_operand_smir(l, span);
 >          let r = self.translate_operand_smir(r, span);
->          ..
+>          use smir::BinOp::*;
+>          match (bin_op, lty) {
+>              ..
+>          }
 >      }
 >      ..
 >      smir::Rvalue::UnaryOp(unop, operand) => {
@@ -194,6 +320,7 @@ integers, `BinaryOp`, and `Cast(CastKind::IntToInt)` on integers
 >          match (unop, ty) {
 >              (Neg, Type::Int(_)) => build::neg(operand),
 >              (Not, Type::Int(_)) => build::bit_not(operand),
+>              (Not, Type::Bool) => build::not(operand),
 >              ..
 >          }
 >      }
@@ -216,19 +343,38 @@ integers, `BinaryOp`, and `Cast(CastKind::IntToInt)` on integers
 >                  }
 >              }"
 where `build::neg(x)` is `ValueExpr::UnOp { operator: UnOp::Int(IntUnOp::Neg), operand: x }`
-and `build::bit_not(x)` is `ValueExpr::UnOp { operator: UnOp::Int(IntUnOp::BitNot), operand: x }`. -/
-def translateRvalue : MirAst.Rvalue → Option Gen.ValueExpr
+and `build::bit_not(x)` is `ValueExpr::UnOp { operator: UnOp::Int(IntUnOp::BitNot), operand: x }`.
+Like `minimize`, the translation dispatches on the operand type (`decls`
+gives the types of locals): integer arithmetic needs an integer left operand,
+`Not` means `build::not` exactly when the operand is a `bool`, and the
+comparisons apply to operands of any type. `bool` arithmetic (`bool_and` and
+friends) and `bool`-to-integer casts are outside the fragment. -/
+def translateRvalue (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Option Gen.ValueExpr
   | .use op => translateOperand op
   | .unaryOp uop op => do
-    let iuop ← translateUnOp uop
-    pure (.UnOp (.Int iuop) (← translateOperand op))
+    let e ← translateOperand op
+    match operandType decls op with
+    | some (.Int _) => pure (.UnOp (.Int (← translateUnOp uop)) e)
+    | some .Bool =>
+      match uop with
+      | .not => pure (boolNot e)
+      | _ => none
+    | _ => none
   | .binaryOp op l r => do
-    let iop ← translateBinOp op
-    pure (.BinOp (.Int iop) (← translateOperand l) (← translateOperand r))
+    let el ← translateOperand l
+    let er ← translateOperand r
+    match translateRelOp op with
+    | some rel => pure (.BinOp (.Rel rel) el er)
+    | none =>
+      match operandType decls l with
+      | some (.Int _) => pure (.BinOp (.Int (← translateBinOp op)) el er)
+      | _ => none
   | .cast .intToInt op targetTy => do
     let intTy ← intTypeOf targetTy
     let operand ← translateOperand op
-    pure (.UnOp (.Cast (.IntToInt intTy)) operand)
+    match operandType decls op with
+    | some (.Int _) => pure (.UnOp (.Cast (.IntToInt intTy)) operand)
+    | _ => none
   | _ => none
 
 /-- `minimize`'s statement translation for assignments and `PlaceMention` on a
@@ -247,9 +393,11 @@ projection-free place (`tooling/minimize/src/bb.rs`):
 >  }"
 where the elided part special-cases two pointer-provenance casts, which are
 outside the fragment. -/
-def translateStatement (s : MirAst.Statement) : Option Gen.Statement :=
+def translateStatement (decls : List MirAst.LocalDecl) (s : MirAst.Statement) :
+    Option Gen.Statement :=
   match s.kind with
-  | .assign ⟨i, []⟩ rv => (translateRvalue rv).map (fun src => .Assign (.Local (localName i)) src)
+  | .assign ⟨i, []⟩ rv =>
+    (translateRvalue decls rv).map (fun src => .Assign (.Local (localName i)) src)
   | .placeMention ⟨i, []⟩ => some (.PlaceMention (.Local (localName i)))
   | _ => none
 
@@ -266,28 +414,60 @@ the association list is irrelevant. -/
 def switchCases (it : Gen.IntType) (branches : List (Nat × Nat)) : Map Int Gen.BbName :=
   ⟨branches.map (fun p => (intFromBits p.1 it, bbName p.2))⟩
 
+/-- The integer type `minimize` switches at for a fragment discriminant: the
+discriminant's own type for an integer, and `u8` for a `bool`, which
+`minimize` first transmutes to `u8` (see `translateTerminator`). -/
+def switchIntType (decls : List MirAst.LocalDecl) (discr : MirAst.Operand) : Option Gen.IntType :=
+  match operandType decls discr with
+  | some (.Int it) => some it
+  | some .Bool => some u8Ty
+  | _ => none
+
 /-- `minimize`'s terminator translation (`tooling/minimize/src/bb.rs`):
 > "rs::TerminatorKind::Return => Terminator::Return,
 >  rs::TerminatorKind::Goto { target } => Terminator::Goto(self.bb_name_map[&target]),
 >  ..
 >  rs::TerminatorKind::SwitchInt { discr, targets } => {
->      ..
+>      let ty = discr.ty(&self.body, self.tcx);
+>      let ty = self.translate_ty(ty, span);
+>      let discr_op = self.translate_operand(discr, span);
+>      let (value, int_ty) = match ty {
+>          Type::Bool => {
+>              // If the value is a boolean we need to cast it to an integer first as MiniRust switch only operates on ints.
+>              let Type::Int(u8_inttype) = <u8>::get_type() else { unreachable!() };
+>              (
+>                  ValueExpr::UnOp {
+>                      operator: UnOp::Cast(CastOp::Transmute(Type::Int(u8_inttype))),
+>                      operand: GcCow::new(discr_op),
+>                  },
+>                  u8_inttype,
+>              )
+>          }
+>          Type::Int(ity) => (discr_op, ity),
+>          ..
+>      };
 >      let cases = targets .. .collect();
 >      let fallback_block = targets.otherwise();
 >      let fallback = self.bb_name_map[&fallback_block];
 >      Terminator::Switch { value, cases, fallback }
 >  }
 >  rs::TerminatorKind::Unreachable => Terminator::Unreachable,"
-restricted to integer-typed `switchInt` discriminants (for `bool`, `minimize`
-inserts a transmute to `u8`, which is outside this fragment). -/
+restricted to integer and `bool` discriminants. For a `bool`, the
+discriminant is transmuted to `u8` (`boolToU8`), so MiniRust re-validates the
+byte at `bool` when it loads the local and then switches on the integer `0` or
+`1`. -/
 def translateTerminator (decls : List MirAst.LocalDecl) (t : MirAst.Terminator) :
     Option Gen.Terminator :=
   match t.kind with
   | .goto target => some (.Goto (bbName target))
   | .switchInt discr targets => do
-    let v ← translateOperand discr
-    let it ← operandIntType decls discr
-    pure (.Switch v (switchCases it targets.branches) (bbName targets.otherwise))
+    let discrOp ← translateOperand discr
+    match operandType decls discr with
+    | some (.Int it) =>
+      pure (.Switch discrOp (switchCases it targets.branches) (bbName targets.otherwise))
+    | some .Bool =>
+      pure (.Switch (boolToU8 discrOp) (switchCases u8Ty targets.branches) (bbName targets.otherwise))
+    | _ => none
   | .unreachable => some .Unreachable
   | .return_ => some .Return
   | _ => none
@@ -296,7 +476,7 @@ def translateTerminator (decls : List MirAst.LocalDecl) (t : MirAst.Terminator) 
 so their kind is `BbKind::Regular`. -/
 def translateBlock (decls : List MirAst.LocalDecl) (bb : MirAst.BasicBlockData) :
     Option Gen.BasicBlock := do
-  let stmts ← bb.statements.mapM translateStatement
+  let stmts ← bb.statements.mapM (translateStatement decls)
   let term ← translateTerminator decls bb.terminator
   pure ⟨stmts, term, .Regular⟩
 
@@ -311,9 +491,9 @@ def translateBlock (decls : List MirAst.LocalDecl) (bb : MirAst.BasicBlockData) 
 def translateLocals : Nat → List MirAst.LocalDecl → Option (List (Gen.LocalName × Gen.Type))
   | _, [] => some []
   | i, d :: ds => do
-    let it ← intTypeOf d.ty
+    let ty ← scalarTypeOf d.ty
     let rest ← translateLocals (i + 1) ds
-    pure ((localName i, .Int it) :: rest)
+    pure ((localName i, ty) :: rest)
 
 /-- `minimize`'s block map, one entry per MIR block in index order
 ("for (id, bb_name) in self.bb_name_map.clone() { .. self.translate_bb(bb_name, bb_data); }"). -/
@@ -411,26 +591,76 @@ def rvalueOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rvalue 
     | none => false
   | _ => false
 
-/-- Fragment statements, type-checked against the destination's type. -/
+/-- Whether a fragment operand has MiniRust type `Type::Bool`. -/
+def operandIsBool (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
+  match operandType decls op with
+  | some .Bool => true
+  | _ => false
+
+/-- A projection-free `bool` operand: a `bool` local, or a `bool` constant
+that `minimize` can read (`0` or `1`). -/
+def operandOkB (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
+  match op with
+  | .copy ⟨j, []⟩ => decide (j < decls.length) && operandIsBool decls op
+  | .constant _ => operandIsBool decls op && (translateOperand op).isSome
+  | _ => false
+
+/-- The operands of a fragment comparison: both integers of one type, or both
+`bool`s (MiniRust requires both operands of `BinOp::Rel` to have the same
+type, `spec/lang/well-formed.md`:
+> "ensure_wf(right == left, \"BinOp::Rel: invalid right type\")?;"
+and MIR's comparisons are homogeneous as well). -/
+def relOperandsOk (decls : List MirAst.LocalDecl) (a b : MirAst.Operand) : Bool :=
+  match operandType decls a with
+  | some (.Int it) => operandOk decls it a && operandOk decls it b
+  | some .Bool => operandOkB decls a && operandOkB decls b
+  | _ => false
+
+/-- Fragment rvalues of type `bool`: a `bool` operand, `!b` on a `bool`
+operand, or a comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`) of two integers of
+one type or of two `bool`s. -/
+def rvalueOkB (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Bool
+  | .use op => operandOkB decls op
+  | .unaryOp .not op => operandOkB decls op
+  | .binaryOp op a b => (translateRelOp op).isSome && relOperandsOk decls a b
+  | _ => false
+
+/-- Fragment statements, type-checked against the destination's type: an
+integer destination takes an integer rvalue (`rvalueOk`), and a `bool`
+destination takes a `bool` rvalue (`rvalueOkB`). -/
 def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement) : Bool :=
   match s.kind with
   | .assign ⟨i, []⟩ rv =>
-    match decls[i]? >>= fun d => intTypeOf d.ty with
+    match decls[i]? with
     | none => false
-    | some it => rvalueOk decls it rv
+    | some d =>
+      if isBoolTy d.ty then rvalueOkB decls rv
+      else
+        match intTypeOf d.ty with
+        | none => false
+        | some it => rvalueOk decls it rv
   | .placeMention ⟨i, []⟩ => decide (i < decls.length)
   | _ => false
 
+/-- A fragment `switchInt` discriminant: an integer operand of its type, or a
+`bool` operand. -/
+def discrOk (decls : List MirAst.LocalDecl) (discr : MirAst.Operand) : Bool :=
+  match operandType decls discr with
+  | some (.Int it) => operandOk decls it discr
+  | some .Bool => operandOkB decls discr
+  | _ => false
+
 /-- Fragment terminators; jump targets must be blocks of the body and
-`switchInt` values must be distinct in-range bit patterns of the
-discriminant's type. -/
+`switchInt` values must be distinct in-range bit patterns of the type
+`minimize` switches at (`switchIntType`: the discriminant's integer type, or
+`u8` for a `bool`). -/
 def terminatorOk (decls : List MirAst.LocalDecl) (nblocks : Nat) (t : MirAst.Terminator) : Bool :=
   match t.kind with
   | .goto target => decide (target < nblocks)
   | .switchInt discr targets =>
-    match operandIntType decls discr with
+    match switchIntType decls discr with
     | some it =>
-      operandOk decls it discr &&
+      discrOk decls discr &&
       targets.branches.all (fun p => decide (p.1 < 2 ^ (8 * it.size.bytes)) && decide (p.2 < nblocks)) &&
       (targets.branches.map Prod.fst).Nodup &&
       decide (targets.otherwise < nblocks)
@@ -443,7 +673,7 @@ def terminatorOk (decls : List MirAst.LocalDecl) (nblocks : Nat) (t : MirAst.Ter
 def inFragment (body : MirAst.CapturedMir) : Bool :=
   body.isRuntimePostCleanup &&
   decide (body.localDecls.length = body.argCount + 1) &&
-  body.localDecls.all (fun d => (intTypeOf d.ty).isSome) &&
+  body.localDecls.all (fun d => (scalarTypeOf d.ty).isSome) &&
   decide (body.basicBlocks ≠ []) &&
   body.basicBlocks.all (fun bb =>
     !bb.isCleanup &&

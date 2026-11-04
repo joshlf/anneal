@@ -41,11 +41,18 @@ here.
 * `PlaceExpr::Local` (`spec/lang/step/expressions.md`).
 * `ValueExpr::Constant` for `Constant::Int`/`Constant::Bool`, `ValueExpr::Load`,
   `ValueExpr::UnOp` with `UnOp::Int` (all `IntUnOp` variants: `Neg`, `BitNot`,
-  `CountOnes`) and `UnOp::Cast(CastOp::IntToInt)`, and `ValueExpr::BinOp` with
-  `BinOp::Int` (all `IntBinOp` variants: `Add`, `AddUnchecked`, `Sub`,
-  `SubUnchecked`, `Mul`, `MulUnchecked`, `Div`, `DivExact`, `Rem`, `Shl`, `Shr`,
-  `ShlUnchecked`, `ShrUnchecked`, `BitAnd`, `BitOr`, `BitXor`)
-  (`spec/lang/step/expressions.md`, `spec/lang/step/operators.md`).
+  `CountOnes`) and `UnOp::Cast` (both `CastOp` variants: `IntToInt` and
+  `Transmute`, the latter through `Machine::transmute`, i.e. `encode` at the
+  old type followed by `decode` and `check_value` at the new type), and
+  `ValueExpr::BinOp` with `BinOp::Int` (all `IntBinOp` variants: `Add`,
+  `AddUnchecked`, `Sub`, `SubUnchecked`, `Mul`, `MulUnchecked`, `Div`,
+  `DivExact`, `Rem`, `Shl`, `Shr`, `ShlUnchecked`, `ShrUnchecked`, `BitAnd`,
+  `BitOr`, `BitXor`) and `BinOp::Rel` (all `RelOp` variants: `Lt`, `Gt`, `Le`,
+  `Ge`, `Eq`, `Ne`, `Cmp`) on integers and Booleans
+  (`spec/lang/step/expressions.md`, `spec/lang/step/operators.md`). MiniRust
+  has no Boolean negation operator: `minimize` expresses `!b` with transmutes
+  and integer subtraction (see `MiniRustSpec.Correspondence.Translate`), so
+  `UnOp::Int` on a `Value::Bool` stays a spec panic, exactly as upstream.
 * `Terminator::Goto`, `Terminator::Switch`, `Terminator::Unreachable`, and
   `Terminator::Return` (`spec/lang/step/terminators.md`), including frame
   teardown, `storage_dead` of every local, and both stack-pop actions.
@@ -270,6 +277,14 @@ def subsliceWithLength {T : Type} (xs : List T) (start len : Int) : Interp (List
     pure ((xs.drop start.toNat).take len.toNat)
   else specPanic "subslice_with_length out of range"
 
+/-- `Ord::cmp` on `libspecr::Int` (`num_bigint::BigInt`): the numeric order of
+mathematical integers, so signedness never enters (`-1 < 0` even when the bit
+pattern of `-1i8` is `255`). -/
+def intCmp (a b : Int) : Ordering := if a < b then .lt else if a = b then .eq else .gt
+
+/-- `Ord::cmp` on `bool` (Rust's `impl Ord for bool`): `false < true`. -/
+def boolCmp (a b : Bool) : Ordering := intCmp (if a then 1 else 0) (if b then 1 else 0)
+
 /-- `List::write_subslice_at_index(start, src)`. -/
 def writeSubsliceAtIndex {T : Type} (xs : List T) (start : Int) (src : List T) :
     Interp (List T) :=
@@ -306,6 +321,10 @@ def IntType.can_represent (t : IntType) (i : Int) : Bool := inBounds i t.signed 
 /-- `IntType::bring_in_bounds`:
 > "pub fn bring_in_bounds(&self, i: Int) -> Int { i.bring_in_bounds(self.signed, self.size) }" -/
 def IntType.bring_in_bounds (t : IntType) (i : Int) : Int := bringInBounds i t.signed t.size
+
+/-- `IntType::I8`, the result type of `RelOp::Cmp`:
+> "pub const I8: IntType = IntType { signed: Signedness::Signed, size: Size::from_bytes_const(1) };" -/
+def IntType.I8 : IntType := ⟨.Signed, ⟨1⟩⟩
 
 /-- `IntType::align::<x86_64>`:
 > "let natural_align = Align::from_bytes(size).unwrap();
@@ -697,6 +716,31 @@ def typedStore (m : Mach) (ptr : Ptr) (val : Val) (ty : «Type») (align : Align
   let cm ← CM.store m.mem ptr bytes align atomicity
   pure { m with mem := cm }
 
+/-- `Machine::transmute` (`spec/lang/representation.md`), which reinterprets
+the bytes of `val : type1` at `type2`; it never inspects the value directly:
+> "fn transmute(&self, val: Value<M>, type1: Type, type2: Type) -> Result<Value<M>> {
+>     assert!(
+>         type1.layout::<M::T>().expect_size(\"WF ensures sized operands\")
+>             == type2.layout::<M::T>().expect_size(\"WF ensures sized operands\")
+>     );
+>     let bytes = type1.encode::<M>(val);
+>     if let Some(raw_value) = type2.decode::<M>(bytes) {
+>         self.check_value(raw_value, type2)?;
+>         ret(raw_value)
+>     } else {
+>         throw_ub!(\"transmuted value is not valid at new type\")
+>     }
+> }" -/
+def transmute (val : Val) (type1 type2 : «Type») : Interp Val := do
+  let size1 ← LayoutStrategy.expect_size (← Type.layout type1) "WF ensures sized operands"
+  let size2 ← LayoutStrategy.expect_size (← Type.layout type2) "WF ensures sized operands"
+  if size1 ≠ size2 then specPanic "assertion failed: transmute between types of different size"
+  else do
+    let bytes ← Type.encode type1 val
+    match ← Type.decode type2 bytes with
+    | some rawValue => do checkValue rawValue type2; pure rawValue
+    | none => ub "transmuted value is not valid at new type"
+
 /-! ## Places and values (`spec/lang/step/expressions.md`) -/
 
 /-- `Machine::eval_place` for `PlaceExpr::Local`:
@@ -781,7 +825,7 @@ def evalIntUnOp (op : IntUnOp) (operand : Int) (operandTy : IntType) : Interp In
   | .BitNot => pure (IntType.bring_in_bounds operandTy (-operand - 1))
   | .CountOnes => pure (evalCountOnes operand operandTy)
 
-/-- `Machine::eval_cast_op` for `CastOp::IntToInt` (`spec/lang/step/operators.md`):
+/-- `Machine::eval_cast_op` for both `CastOp` variants (`spec/lang/step/operators.md`):
 > "fn eval_cast_op(&self, cast_op: CastOp, (operand, old_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
 >     use CastOp::*;
 >     match cast_op {
@@ -790,7 +834,15 @@ def evalIntUnOp (op : IntUnOp) (operand : Int) (operandTy : IntType) : Interp In
 >             let result = int_ty.bring_in_bounds(operand);
 >             ret((Value::Int(result), Type::Int(int_ty)))
 >         }
->         ..
+>         Transmute(new_ty) => {
+>             if old_ty.layout::<M::T>().expect_size(\"WF ensures transmutes are sized\")
+>                 != new_ty.layout::<M::T>().expect_size(\"WF ensures transmutes are sized\")
+>             {
+>                 throw_ub!(\"transmute between types of different size\")
+>             }
+>             let val = self.transmute(operand, old_ty, new_ty)?;
+>             ret((val, new_ty))
+>         }
 >     }
 > }" -/
 def evalCastOp (castOp : CastOp) (arg : Val × «Type») : Interp (Val × «Type») :=
@@ -798,7 +850,13 @@ def evalCastOp (castOp : CastOp) (arg : Val × «Type») : Interp (Val × «Type
   | .IntToInt intTy, (.Int operand, _) =>
     pure (.Int (IntType.bring_in_bounds intTy operand), .Int intTy)
   | .IntToInt _, _ => specPanic "non-integer input to int-to-int cast"
-  | .Transmute _, _ => unsupported "eval_cast_op for CastOp::Transmute"
+  | .Transmute newTy, (operand, oldTy) => do
+    let oldSize ← LayoutStrategy.expect_size (← Type.layout oldTy) "WF ensures transmutes are sized"
+    let newSize ← LayoutStrategy.expect_size (← Type.layout newTy) "WF ensures transmutes are sized"
+    if oldSize ≠ newSize then ub "transmute between types of different size"
+    else do
+      let val ← transmute operand oldTy newTy
+      pure (val, newTy)
 
 /-- `Machine::eval_un_op` for `UnOp::Int` and `UnOp::Cast` (`spec/lang/step/operators.md`):
 > "fn eval_un_op(&self, UnOp::Int(op): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
@@ -973,7 +1031,45 @@ def evalIntBinOp (op : IntBinOp) (left right : Int) (leftTy : IntType) : Interp 
   | .BitOr => pure (intBitOr left right)
   | .BitXor => pure (intBitXor left right)
 
-/-- `Machine::eval_bin_op` for `BinOp::Int` (`spec/lang/step/operators.md`):
+/-- `Machine::eval_rel_op` (`spec/lang/step/operators.md`), which turns the
+outcome of a comparison into the result value:
+> "fn eval_rel_op(rel: RelOp, ord: std::cmp::Ordering) -> (Value<M>, Type) {
+>     use RelOp::*;
+>     match rel {
+>         Lt => (Value::Bool(ord.is_lt()), Type::Bool),
+>         Gt => (Value::Bool(ord.is_gt()), Type::Bool),
+>         Le => (Value::Bool(ord.is_le()), Type::Bool),
+>         Ge => (Value::Bool(ord.is_ge()), Type::Bool),
+>         Eq => (Value::Bool(ord.is_eq()), Type::Bool),
+>         Ne => (Value::Bool(ord.is_ne()), Type::Bool),
+>         Cmp => {
+>             let val = match ord {
+>                 std::cmp::Ordering::Less => -1,
+>                 std::cmp::Ordering::Equal => 0,
+>                 std::cmp::Ordering::Greater => 1,
+>             };
+>             (Value::Int(Int::from(val)), Type::Int(IntType::I8))
+>         }
+>     }
+> }"
+Rust's `Ordering::is_le` is `!is_gt` and `is_ge` is `!is_lt`, which are
+Lean's `Ordering.isLE` and `Ordering.isGE`. -/
+def evalRelOp (rel : RelOp) (ord : Ordering) : Val × «Type» :=
+  match rel with
+  | .Lt => (.Bool ord.isLT, .Bool)
+  | .Gt => (.Bool ord.isGT, .Bool)
+  | .Le => (.Bool ord.isLE, .Bool)
+  | .Ge => (.Bool ord.isGE, .Bool)
+  | .Eq => (.Bool ord.isEq, .Bool)
+  | .Ne => (.Bool ord.isNe, .Bool)
+  | .Cmp =>
+    let val : Int := match ord with
+      | .lt => -1
+      | .eq => 0
+      | .gt => 1
+    (.Int val, .Int IntType.I8)
+
+/-- `Machine::eval_bin_op` for `BinOp::Int` and `BinOp::Rel` (`spec/lang/step/operators.md`):
 > "let Type::Int(int_ty) = l_ty else { panic!(\"non-integer input to integer operation\") };
 >  let Value::Int(left) = left else { panic!(..) };
 >  let Value::Int(right) = right else { panic!(..) };
@@ -981,14 +1077,44 @@ def evalIntBinOp (op : IntBinOp) (left right : Int) (leftTy : IntType) : Interp 
 >  let result = Self::eval_int_bin_op(op, left, right, int_ty)?;
 >  // Put the result into the right range (in case of overflow).
 >  let result = int_ty.bring_in_bounds(result);
->  ret((Value::Int(result), Type::Int(int_ty)))" -/
+>  ret((Value::Int(result), Type::Int(int_ty)))"
+and, for `BinOp::Rel`:
+> "fn eval_bin_op(
+>     &self,
+>     BinOp::Rel(rel_op): BinOp,
+>     (left, l_ty): (Value<M>, Type),
+>     (right, _r_ty): (Value<M>, Type)
+> ) -> Result<(Value<M>, Type)> {
+>     let ord = match (l_ty, left, right) {
+>         (Type::Int(_), Value::Int(left), Value::Int(right)) => {
+>             left.cmp(&right)
+>         }
+>         (Type::Bool, Value::Bool(left), Value::Bool(right)) => {
+>             left.cmp(&right)
+>         }
+>         (Type::Ptr(_), Value::Ptr(left), Value::Ptr(right)) => {
+>             Self::compare_ptr(left, right)
+>         }
+>         _ => panic!(\"relational operator on incomparable type or value-type mismatch\"),
+>     };
+>     ret(Self::eval_rel_op(rel_op, ord))
+> }"
+Integers compare as mathematical integers (`intCmp`), so a signed operand is
+ordered by its value, not by its bit pattern; Booleans compare with
+`false < true` (`boolCmp`). Pointer comparison is outside the fragment. -/
 def evalBinOp (op : BinOp) (l : Val × «Type») (r : Val × «Type») : Interp (Val × «Type») :=
   match op, l, r with
   | .Int op, (.Int left, .Int intTy), (.Int right, _) => do
     let result ← evalIntBinOp op left right intTy
     pure (.Int (IntType.bring_in_bounds intTy result), .Int intTy)
   | .Int _, _, _ => specPanic "non-integer input to integer operation"
-  | _, _, _ => unsupported "eval_bin_op for a non-Int operator"
+  | .Rel relOp, (left, lTy), (right, _) =>
+    match lTy, left, right with
+    | .Int _, .Int left, .Int right => pure (evalRelOp relOp (intCmp left right))
+    | .Bool, .Bool left, .Bool right => pure (evalRelOp relOp (boolCmp left right))
+    | .Ptr _, .Ptr _, .Ptr _ => unsupported "BinOp::Rel on pointers (compare_ptr)"
+    | _, _, _ => specPanic "relational operator on incomparable type or value-type mismatch"
+  | _, _, _ => unsupported "eval_bin_op for an operator outside BinOp::Int and BinOp::Rel"
 
 /-! ## Value expressions (`spec/lang/step/expressions.md`) -/
 
