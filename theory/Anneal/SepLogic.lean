@@ -548,6 +548,7 @@ theorem dwp_frame_disjoint
 /-- Conjoin a frame predicate `frame : HeapPred` onto a `StatefulClaim`. -/
 def frameStatefulClaim (c : StatefulClaim) (frame : HeapPred) : StatefulClaim where
   body := c.body
+  callees := c.callees
   pre args mem := c.pre args mem ∧ frame mem
   post args mem retVal mem' := c.post args mem retVal mem' ∧ frame mem'
 

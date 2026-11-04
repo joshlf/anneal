@@ -930,7 +930,12 @@ pub fn check_specs_non_vacuous_with_records(
         return Ok(());
     }
 
-    let bundles = group_subject_obligations(records);
+    let mut bundles = group_subject_obligations(records);
+    crate::scaffold::populate_called_callees(
+        &workspace_root.join(".anneal/generated/Mir"),
+        records,
+        &mut bundles,
+    );
     let bundles_by_rel_path: BTreeMap<PathBuf, &SubjectObligationBundle> = bundles
         .iter()
         .map(|b| (b.item_rel_path.clone(), b))
@@ -997,6 +1002,72 @@ pub fn check_specs_non_vacuous_with_records(
             }
         }
 
+        // Check 4b: When the item has `#[external_spec]` callees or sibling
+        // `#[spec]` `called_callees` and `Specs/<Item>.lean` overrides
+        // `ModularItemSpec`, verify that it preserves every generated external
+        // and sibling call contract unless opted out.
+        let mut required_ext_contracts: Vec<String> = bundles_by_rel_path
+            .get(item_rel_path)
+            .map(|b| {
+                b.external_spec_callees
+                    .iter()
+                    .map(crate::obligations::external_call_contract_ident)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for disk_contract in obligation_file_external_call_contracts(workspace_root, item_rel_path) {
+            if !required_ext_contracts.contains(&disk_contract) {
+                required_ext_contracts.push(disk_contract);
+            }
+        }
+        let mut required_called_callees: Vec<String> = bundles_by_rel_path
+            .get(item_rel_path)
+            .map(|b| {
+                b.called_callees
+                    .iter()
+                    .map(|c| c.item_module_suffix.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for disk_callee in obligation_file_called_callees(workspace_root, item_rel_path) {
+            if !required_called_callees.contains(&disk_callee) {
+                required_called_callees.push(disk_callee);
+            }
+        }
+        let has_external_spec_callees = !required_ext_contracts.is_empty()
+            || obligation_file_has_external_spec_callees(workspace_root, item_rel_path);
+        let has_called_callees = !required_called_callees.is_empty();
+
+        if (has_external_spec_callees || has_called_callees)
+            && !content.contains("-- @anneal-allow-replace-rust-spec")
+        {
+            let stripped_spec = strip_lean_comments(&content);
+            if stripped_spec.contains("ModularItemSpec")
+                || stripped_spec.contains("refineModularSpec")
+            {
+                let preserves_ext_contracts = !has_external_spec_callees
+                    || stripped_spec.contains("defaultModularSpec.envAssumed")
+                    || (required_ext_contracts.len() <= 1
+                        && stripped_spec.contains("defaultExternalCallContract"))
+                    || (!required_ext_contracts.is_empty()
+                        && required_ext_contracts
+                            .iter()
+                            .all(|c| stripped_spec.contains(c.as_str())));
+                let preserves_called_callees = !has_called_callees
+                    || stripped_spec.contains("defaultModularSpec.envAssumed")
+                    || required_called_callees.iter().all(|callee| {
+                        stripped_spec.contains(&format!("Obligations.{callee}."))
+                            || stripped_spec.contains(&format!("Specs.{callee}."))
+                    });
+                if !preserves_ext_contracts || !preserves_called_callees {
+                    return Err(format!(
+                        "spec override in {} drops the Rust #[external_spec] call contract in `ModularItemSpec.envAssumed`; reference `Obligations.{item_suffix}.defaultModularSpec.envAssumed`, `Obligations.{item_suffix}.defaultExternalCallContract`, or all `Obligations.{item_suffix}.externalCallContract_*` and `Obligations.<Callee>.defaultCallContract` contracts (or add `-- @anneal-allow-replace-rust-spec`)",
+                        spec_rel.display()
+                    ));
+                }
+            }
+        }
+
         // Check 5: When both `Specs/<Item>.lean` and `Proof/<Item>.lean` exist
         // on disk, `Proof/<Item>.lean` must `import Specs.<Item>` in non-comment
         // text so `Obligations.<Item>.claim` resolves to the overridden
@@ -1040,6 +1111,7 @@ fn discover_workspace_records(workspace_root: &Path) -> Vec<UnitTargetRecord> {
                     lean_module_name: rec.lean_module_name,
                     item_kind,
                     associated_subject_def_id: rec.associated_subject_def_id,
+                    trait_impls: Vec::new(),
                 });
             }
         }
@@ -1066,6 +1138,76 @@ fn obligation_file_has_inline_ensures(workspace_root: &Path, item_rel_path: &Pat
     ob_text.contains("- Inline ensures:") || ob_text.contains("__anodized_fn_ensures_")
 }
 
+fn obligation_file_has_external_spec_callees(workspace_root: &Path, item_rel_path: &Path) -> bool {
+    let ob_path = workspace_root
+        .join(".anneal/generated/Obligations")
+        .join(item_rel_path);
+    let Ok(ob_text) = fs::read_to_string(ob_path) else {
+        return false;
+    };
+    ob_text.contains("def externalCallContract_")
+        || ob_text.contains("abbrev defaultExternalCallContract")
+}
+
+fn obligation_file_external_call_contracts(
+    workspace_root: &Path,
+    item_rel_path: &Path,
+) -> Vec<String> {
+    let ob_path = workspace_root
+        .join(".anneal/generated/Obligations")
+        .join(item_rel_path);
+    let Ok(ob_text) = fs::read_to_string(ob_path) else {
+        return Vec::new();
+    };
+    let mut contracts = Vec::new();
+    for line in ob_text.lines() {
+        let trimmed = line.trim();
+        if let Some(after) = trimmed.strip_prefix("def externalCallContract_") {
+            let ident_suffix: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !ident_suffix.is_empty() {
+                let full_ident = format!("externalCallContract_{ident_suffix}");
+                if !contracts.contains(&full_ident) {
+                    contracts.push(full_ident);
+                }
+            }
+        }
+    }
+    contracts
+}
+
+fn obligation_file_called_callees(workspace_root: &Path, item_rel_path: &Path) -> Vec<String> {
+    let ob_path = workspace_root
+        .join(".anneal/generated/Obligations")
+        .join(item_rel_path);
+    let Ok(ob_text) = fs::read_to_string(ob_path) else {
+        return Vec::new();
+    };
+    let mut callees = Vec::new();
+    let needle = ".defaultCallContract.holdsOn";
+    for line in ob_text.lines() {
+        let mut rest = line.trim();
+        while let Some(end_idx) = rest.find(needle) {
+            let before = &rest[..end_idx];
+            if let Some(ob_idx) = before.rfind("Obligations.") {
+                let suffix = &before[ob_idx + "Obligations.".len()..];
+                if !suffix.is_empty()
+                    && suffix
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                    && !callees.contains(&suffix.to_string())
+                {
+                    callees.push(suffix.to_string());
+                }
+            }
+            rest = &rest[end_idx + needle.len()..];
+        }
+    }
+    callees
+}
+
 fn detect_vacuous_precondition(lean_src: &str) -> Option<&'static str> {
     let stripped = strip_lean_comments(lean_src);
     let collapsed = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1087,6 +1229,17 @@ fn detect_vacuous_precondition(lean_src: &str) -> Option<&'static str> {
         "def pre (args : List Value) (mem : Memory) : Prop := False",
         "def pre : List Value → Prop := fun _ => False",
         "def pre : List Value -> Prop := fun _ => False",
+        "envAssumed := fun _ => False",
+        "envAssumed := fun h => False",
+        "envAssumed := fun (_ : ExternalCallHandler) => False",
+        "envAssumed := fun (h : ExternalCallHandler) => False",
+        "envAssumed := False",
+        "envAssumed _ := False",
+        "envAssumed h := False",
+        "def envAssumed (h : ExternalCallHandler) : Prop := False",
+        "def envAssumed (_ : ExternalCallHandler) : Prop := False",
+        "def envAssumed : ExternalCallHandler → Prop := fun _ => False",
+        "def envAssumed : ExternalCallHandler -> Prop := fun _ => False",
         "safetyPre := fun _ => False",
         "safetyPre := fun _ _ => False",
         "safetyPre := False",
@@ -1097,6 +1250,12 @@ fn detect_vacuous_precondition(lean_src: &str) -> Option<&'static str> {
         "refineStatefulSpec (fun _ _ => False)",
         "refineSafeStatefulSpec (fun _ _ => False)",
         "refineTotalSpec (fun _ _ => False)",
+        "refineModularSpec (fun _ => False)",
+        "refineModularSpec (fun h => False)",
+        "refineModularSpec (fun (_ : ExternalCallHandler) => False)",
+        "refineModularSpec (fun (h : ExternalCallHandler) => False)",
+        "refineModularSpec envAssumed (fun _ _ => False)",
+        "refineModularSpec _ (fun _ _ => False)",
         "∧ False",
         "False ∧",
         "And False",
@@ -1147,7 +1306,7 @@ fn detect_tautological_ensures_weakening(stripped_lean_src: &str) -> Option<&'st
     None
 }
 
-fn strip_lean_comments(input: &str) -> String {
+pub(crate) fn strip_lean_comments(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
@@ -1205,7 +1364,12 @@ pub fn render_agent_context(
     records: &[UnitTargetRecord],
     item_filter: Option<&str>,
 ) -> Result<String, String> {
-    let all_bundles = group_subject_obligations(records);
+    let mut all_bundles = group_subject_obligations(records);
+    crate::scaffold::populate_called_callees(
+        &workspace_root.join(".anneal/generated/Mir"),
+        records,
+        &mut all_bundles,
+    );
     let filter_patterns: Vec<&str> = item_filter
         .map(|f| {
             f.split(',')
@@ -1297,7 +1461,14 @@ pub fn render_agent_context(
         } else {
             "Missing"
         };
-        let contract_surface = if authored.is_equiv {
+        let is_effectively_modular = authored.is_modular
+            || (!authored.has_specs
+                && (!bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty()));
+        let contract_surface = if authored.is_ub_exception {
+            "ub_exception (`UbExceptionItemSpec` / `UbExceptionVerificationResult`)"
+        } else if is_effectively_modular {
+            "modular (`ModularItemSpec` / `ModularVerificationResult`)"
+        } else if authored.is_equiv {
             "equiv (`StatefulEquivItemSpec` / `StatefulEquivVerificationResult`)"
         } else if authored.is_total {
             "total (`TotalItemSpec` / `TotalVerificationResult`)"
@@ -1602,6 +1773,7 @@ mod tests {
                 lean_module_name: "Mir.Demo.add".to_string(),
                 item_kind: CapturedItemKind::Subject,
                 associated_subject_def_id: None,
+                trait_impls: Vec::new(),
             },
             UnitTargetRecord {
                 target: CapturedTarget {
@@ -1612,6 +1784,7 @@ mod tests {
                 lean_module_name: "Mir.Demo.__anodized_fn_requires_add".to_string(),
                 item_kind: CapturedItemKind::InlineSpecRequires,
                 associated_subject_def_id: Some("demo::add".to_string()),
+                trait_impls: Vec::new(),
             },
         ]
     }
@@ -1747,6 +1920,7 @@ mod tests {
             lean_module_name: "Mir.Demo.__anodized_fn_ensures_add".to_string(),
             item_kind: CapturedItemKind::InlineSpecEnsures,
             associated_subject_def_id: Some("demo::add".to_string()),
+            trait_impls: Vec::new(),
         });
 
         let spec_file = specs_dir.join("add.lean");
@@ -1845,6 +2019,7 @@ mod tests {
             lean_module_name: "Mir.Demo.__anodized_fn_ensures_add".to_string(),
             item_kind: CapturedItemKind::InlineSpecEnsures,
             associated_subject_def_id: Some("demo::add".to_string()),
+            trait_impls: Vec::new(),
         });
 
         let spec_file = specs_dir.join("add.lean");
@@ -1882,6 +2057,7 @@ mod tests {
             lean_module_name: "Mir.Demo.helper".to_string(),
             item_kind: CapturedItemKind::Subject,
             associated_subject_def_id: None,
+            trait_impls: Vec::new(),
         });
 
         let lock_path = lock_workspace_specs_with_mutable(&ws, &records, &["demo::add".to_string()])
@@ -2007,6 +2183,7 @@ mod tests {
             lean_module_name: "Mir.Demo.__anodized_fn_ensures_add".to_string(),
             item_kind: CapturedItemKind::InlineSpecEnsures,
             associated_subject_def_id: Some("demo::add".to_string()),
+            trait_impls: Vec::new(),
         });
 
         let spec_file = specs_dir.join("add.lean");
@@ -2040,6 +2217,133 @@ mod tests {
             taut_err.contains("trivializes the Rust #[spec] `ensures` clause via"),
             "unexpected tautological error: {taut_err}"
         );
+
+        // Rejects vacuous `envAssumed` and dropped `#[external_spec]` call contracts:
+        let ob_dir = ws.join(".anneal/generated/Obligations/Demo");
+        fs::create_dir_all(&ob_dir).expect("create Obligations/Demo");
+        fs::write(
+            ob_dir.join("add.lean"),
+            "def externalCallContract_Demo_ext_helper : MirCallContract := sorry\n\
+             abbrev defaultExternalCallContract : MirCallContract := externalCallContract_Demo_ext_helper\n",
+        )
+        .expect("write synthetic Obligations/Demo/add.lean");
+
+        for bad_mod in [
+            "instance : ModularItemSpec \"demo::add\" where\n  envAssumed := fun _ => False\n  pre args _ := Obligations.Demo.add.rustRequires args\n  post args _ ret _ := Obligations.Demo.add.rustEnsures args ret\n",
+            "instance : ModularItemSpec \"demo::add\" :=\n  Obligations.Demo.add.refineModularSpec (fun _ => False) (fun _ _ => True) (fun _ _ _ _ => True)\n",
+        ] {
+            fs::write(&spec_file, bad_mod).expect("write bad modular spec");
+            let err = check_specs_non_vacuous_with_records(&ws, &records)
+                .expect_err("must reject vacuous modular envAssumed");
+            assert!(
+                err.contains("vacuous specification precondition rejected"),
+                "expected vacuous error for:\n{bad_mod}\ngot: {err}"
+            );
+        }
+
+        fs::write(
+            &spec_file,
+            "instance : ModularItemSpec \"demo::add\" :=\n  \
+               Obligations.Demo.add.refineModularSpec\n    \
+                 (fun _ => True)\n    \
+                 (fun _ _ => True)\n    \
+                 (fun _ _ _ _ => True)\n",
+        )
+        .expect("write modular spec dropping externalCallContract");
+        let drop_ext_err = check_specs_non_vacuous_with_records(&ws, &records)
+            .expect_err("must reject modular spec override that drops #[external_spec] contract");
+        assert!(
+            drop_ext_err.contains("drops the Rust #[external_spec] call contract"),
+            "unexpected drop_ext_err: {drop_ext_err}"
+        );
+
+        // When multiple `#[external_spec]` contracts exist for an item, referencing only one
+        // (`externalCallContract_Demo_ext_helper` or `defaultExternalCallContract`) while dropping
+        // the second (`externalCallContract_Demo_ext_second`) must also be rejected!
+        fs::write(
+            ob_dir.join("add.lean"),
+            "def externalCallContract_Demo_ext_helper : MirCallContract := sorry\n\
+             def externalCallContract_Demo_ext_second : MirCallContract := sorry\n\
+             abbrev defaultExternalCallContract : MirCallContract := externalCallContract_Demo_ext_helper\n",
+        )
+        .expect("write synthetic Obligations/Demo/add.lean with 2 external contracts");
+
+        for partial_drop in [
+            "instance : ModularItemSpec \"demo::add\" :=\n  \
+               Obligations.Demo.add.refineModularSpec\n    \
+                 (fun h => Obligations.Demo.add.externalCallContract_Demo_ext_helper.Handles h)\n    \
+                 (fun _ _ => True)\n    \
+                 (fun _ _ _ _ => True)\n",
+            "instance : ModularItemSpec \"demo::add\" :=\n  \
+               Obligations.Demo.add.refineModularSpec\n    \
+                 (fun h => Obligations.Demo.add.defaultExternalCallContract.Handles h)\n    \
+                 (fun _ _ => True)\n    \
+                 (fun _ _ _ _ => True)\n",
+        ] {
+            fs::write(&spec_file, partial_drop).expect("write partial drop spec");
+            let partial_err = check_specs_non_vacuous_with_records(&ws, &records)
+                .expect_err("must reject modular spec override that drops 2nd external contract");
+            assert!(
+                partial_err.contains("drops the Rust #[external_spec] call contract"),
+                "unexpected partial_err: {partial_err}"
+            );
+        }
+
+        // Referencing `defaultModularSpec.envAssumed` or both `externalCallContract_*` contracts succeeds:
+        for valid_multi in [
+            "instance : ModularItemSpec \"demo::add\" :=\n  \
+               Obligations.Demo.add.refineModularSpec\n    \
+                 Obligations.Demo.add.defaultModularSpec.envAssumed\n    \
+                 (fun _ _ => True)\n    \
+                 (fun _ _ _ _ => True)\n",
+            "instance : ModularItemSpec \"demo::add\" :=\n  \
+               Obligations.Demo.add.refineModularSpec\n    \
+                 (fun h => Obligations.Demo.add.externalCallContract_Demo_ext_helper.Handles h ∧ Obligations.Demo.add.externalCallContract_Demo_ext_second.Handles h)\n    \
+                 (fun _ _ => True)\n    \
+                 (fun _ _ _ _ => True)\n",
+        ] {
+            fs::write(&spec_file, valid_multi).expect("write valid multi-contract spec");
+            check_specs_non_vacuous_with_records(&ws, &records)
+                .expect("valid multi-contract modular spec must pass Check 4b");
+        }
+
+        // When an item has both an `#[external_spec]` contract and a sibling `#[spec]` callee
+        // (`Obligations.Demo.sibling.defaultCallContract.holdsOn`), referencing only
+        // `defaultExternalCallContract` while dropping the sibling callee contract must be rejected:
+        fs::write(
+            ob_dir.join("add.lean"),
+            "def externalCallContract_Demo_ext_helper : MirCallContract := sorry\n\
+             abbrev defaultExternalCallContract : MirCallContract := externalCallContract_Demo_ext_helper\n\
+             instance (priority := low) defaultModularSpec : ModularItemSpec \"demo::add\" where\n  \
+               envAssumed := fun h => And (externalCallContract_Demo_ext_helper.holdsOn h) (Obligations.Demo.sibling.defaultCallContract.holdsOn h)\n",
+        )
+        .expect("write synthetic Obligations/Demo/add.lean with external + sibling callee");
+        fs::write(
+            &spec_file,
+            "instance : ModularItemSpec \"demo::add\" :=\n  \
+               Obligations.Demo.add.refineModularSpec\n    \
+                 Obligations.Demo.add.defaultExternalCallContract.holdsOn\n    \
+                 (fun _ _ => True)\n    \
+                 (fun _ _ _ _ => True)\n",
+        )
+        .expect("write spec dropping sibling callee contract");
+        let drop_sibling_err = check_specs_non_vacuous_with_records(&ws, &records)
+            .expect_err("must reject modular spec override that drops sibling defaultCallContract");
+        assert!(
+            drop_sibling_err.contains("drops the Rust #[external_spec] call contract"),
+            "unexpected drop_sibling_err: {drop_sibling_err}"
+        );
+        fs::write(
+            &spec_file,
+            "instance : ModularItemSpec \"demo::add\" :=\n  \
+               Obligations.Demo.add.refineModularSpec\n    \
+                 (fun h => And (Obligations.Demo.add.defaultExternalCallContract.holdsOn h) (Obligations.Demo.sibling.defaultCallContract.holdsOn h))\n    \
+                 (fun _ _ => True)\n    \
+                 (fun _ _ _ _ => True)\n",
+        )
+        .expect("write spec preserving both external and sibling callee contracts");
+        check_specs_non_vacuous_with_records(&ws, &records)
+            .expect("preserving both external and sibling callee contracts must pass Check 4b");
 
         let _ = fs::remove_dir_all(&ws);
     }

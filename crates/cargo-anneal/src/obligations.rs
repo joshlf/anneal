@@ -67,6 +67,31 @@ pub struct CalleeContractRef {
     pub ens_module_suffix: Option<String>,
 }
 
+/// Reference to a transitive callee MIR body linked into `s.memory.callees`
+/// (`defaultCallees`) so `evalTerminator` steps directly into its body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransitiveCalleeRef {
+    /// Canonical `def_id` of the callee (for example, `"core::slice::<impl [T]>::len"`).
+    pub def_id: String,
+    /// Dotted Lean module suffix `<Callee>` (for example, `"Core.slice.len"`).
+    pub item_module_suffix: String,
+}
+
+/// Reference to an explicit `#[external_spec(for = <target>)]` override
+/// excluding `target_def_id` from `defaultCallees` and binding it to a
+/// well-typed `MirCallContract`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalSpecContractRef {
+    /// Canonical `def_id` of the abstracted target function.
+    pub target_def_id: String,
+    /// Dotted Lean module suffix of the `#[external_spec]` sidecar item.
+    pub sidecar_module_suffix: String,
+    /// Optional inline `requires` companion module suffix `<ExtReq>`.
+    pub req_module_suffix: Option<String>,
+    /// Optional inline `ensures` companion module suffix `<ExtEns>`.
+    pub ens_module_suffix: Option<String>,
+}
+
 /// A captured subject item paired with its canonical `<Item>` module path and
 /// all linked specification companion records.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,6 +119,24 @@ pub struct SubjectObligationBundle {
     /// Sibling verified callees referenced via `.fnDef "<callee_def_id>"` in
     /// this subject's captured MIR body.
     pub called_callees: Vec<CalleeContractRef>,
+    /// Transitive closure of reachable captured MIR callees without an active
+    /// `#[external_spec]` override, wired into `s.memory.callees` by default.
+    pub transitive_callees: Vec<TransitiveCalleeRef>,
+    /// Reachable callees overridden by an explicit `#[external_spec(for = ...)]`
+    /// declaration, excluded from `s.memory.callees` and abstracted via
+    /// `MirCallE` + `externalSpecCallContract`.
+    pub external_spec_callees: Vec<ExternalSpecContractRef>,
+    /// Transitive closure of captured MIR callees reachable from the `requires`
+    /// and `ensures` companion bodies evaluated in this subject's obligations
+    /// (`defaultSpecCallees`). Companion predicates that call functions are
+    /// evaluated with these bodies linked, so that a call inside a predicate
+    /// steps through the callee instead of returning an arbitrary value (which
+    /// would make the predicate unsatisfiable and the contract vacuous).
+    pub spec_callees: Vec<TransitiveCalleeRef>,
+    /// Module suffixes of companion bodies that reference at least one function
+    /// and are therefore evaluated with `MirBoolPredicateHoldsWithCallees` over
+    /// `defaultSpecCallees`.
+    pub spec_companions_with_calls: BTreeSet<String>,
 }
 
 impl SubjectObligationBundle {
@@ -246,6 +289,10 @@ pub fn group_subject_obligations(records: &[UnitTargetRecord]) -> Vec<SubjectObl
                     inline_qualifiers: Vec::new(),
                     external_specs: Vec::new(),
                     called_callees: Vec::new(),
+                    transitive_callees: Vec::new(),
+                    external_spec_callees: Vec::new(),
+                    spec_callees: Vec::new(),
+                    spec_companions_with_calls: BTreeSet::new(),
                 },
             );
         }
@@ -274,7 +321,8 @@ pub fn group_subject_obligations(records: &[UnitTargetRecord]) -> Vec<SubjectObl
             CapturedItemKind::Subject
             | CapturedItemKind::Model
             | CapturedItemKind::TypeInvariant
-            | CapturedItemKind::UnsafeTraitImpl => {}
+            | CapturedItemKind::UnsafeTraitImpl
+            | CapturedItemKind::Callee => {}
         }
     }
 
@@ -296,6 +344,75 @@ pub fn group_subject_obligations(records: &[UnitTargetRecord]) -> Vec<SubjectObl
     bundles_by_def_id.into_values().collect()
 }
 
+/// Item-name prefix of `anodized` `requires` companion functions.
+const ANODIZED_REQUIRES_COMPANION_PREFIX: &str = "__anodized_fn_requires_";
+/// Item-name prefix of `anodized` `ensures` companion functions.
+const ANODIZED_ENSURES_COMPANION_PREFIX: &str = "__anodized_fn_ensures_";
+
+/// Collect all explicit `#[external_spec(for = <target>)]` overrides across
+/// `records`, keyed by canonical `target_def_id`.
+pub fn collect_external_spec_contracts(
+    records: &[UnitTargetRecord],
+) -> BTreeMap<String, ExternalSpecContractRef> {
+    let mut contracts = BTreeMap::new();
+    for record in records {
+        if record.item_kind != CapturedItemKind::ExternalSpec || !is_callable_external_spec(record)
+        {
+            continue;
+        }
+        let target_def_id = record
+            .associated_subject_def_id
+            .clone()
+            .unwrap_or_else(|| record.target.def_id.clone());
+        let sidecar_module_suffix = derive_item_module_suffix(record);
+        // `anodized` emits the `requires` / `ensures` companions of a sidecar
+        // `<parent>::<ident>` as sibling items
+        // `<parent>::__anodized_fn_{requires,ensures}_<ident>`. Match them by
+        // exact path: matching by associated subject alone would also pick up
+        // the target's own inline `#[spec]` companions (which share the same
+        // associated subject) or the companions of another sidecar whose name
+        // extends `<ident>`.
+        let (sidecar_parent, sidecar_ident) = match record.target.def_id.rsplit_once("::") {
+            Some((parent, ident)) => (Some(parent), ident),
+            None => (None, record.target.def_id.as_str()),
+        };
+        let companion_def_id = |prefix: &str| match sidecar_parent {
+            Some(parent) => format!("{parent}::{prefix}{sidecar_ident}"),
+            None => format!("{prefix}{sidecar_ident}"),
+        };
+        let req_def_id = companion_def_id(ANODIZED_REQUIRES_COMPANION_PREFIX);
+        let ens_def_id = companion_def_id(ANODIZED_ENSURES_COMPANION_PREFIX);
+
+        let mut req_module_suffix = None;
+        let mut ens_module_suffix = None;
+        for comp in records {
+            match comp.item_kind {
+                CapturedItemKind::InlineSpecRequires
+                    if req_module_suffix.is_none() && comp.target.def_id == req_def_id =>
+                {
+                    req_module_suffix = Some(derive_item_module_suffix(comp));
+                }
+                CapturedItemKind::InlineSpecEnsures
+                    if ens_module_suffix.is_none() && comp.target.def_id == ens_def_id =>
+                {
+                    ens_module_suffix = Some(derive_item_module_suffix(comp));
+                }
+                _ => {}
+            }
+        }
+        contracts.insert(
+            target_def_id.clone(),
+            ExternalSpecContractRef {
+                target_def_id,
+                sidecar_module_suffix,
+                req_module_suffix,
+                ens_module_suffix,
+            },
+        );
+    }
+    contracts
+}
+
 /// Conjoin a slice of Lean `Prop` clause expressions using `And`, returning
 /// `"True"` when `clauses` is empty.
 fn conjoin_prop_clauses(clauses: &[String]) -> String {
@@ -313,6 +430,65 @@ fn conjoin_prop_clauses(clauses: &[String]) -> String {
 fn is_callable_external_spec(record: &UnitTargetRecord) -> bool {
     !record.target.mir_module_path.is_empty()
         && !record.target.def_id.contains("__ANNEAL_EXT_SPEC_TARGET_")
+}
+
+/// Render the Lean proposition asserting that the boolean companion predicate
+/// `Mir.<companion_suffix>.body` holds on `args_expr`.
+///
+/// Companions that call functions are evaluated with `defaultSpecCallees`
+/// linked (`MirBoolPredicateHoldsWithCallees`); call-free companions keep the
+/// plain `MirBoolPredicateHolds` form, which is definitionally the same
+/// predicate with no linked callees.
+fn render_companion_predicate(
+    bundle: &SubjectObligationBundle,
+    companion_suffix: &str,
+    args_expr: &str,
+) -> String {
+    if !bundle.spec_callees.is_empty()
+        && bundle.spec_companions_with_calls.contains(companion_suffix)
+    {
+        format!(
+            "MirBoolPredicateHoldsWithCallees Mir.{companion_suffix}.body defaultSpecCallees {args_expr}"
+        )
+    } else {
+        format!("MirBoolPredicateHolds Mir.{companion_suffix}.body {args_expr}")
+    }
+}
+
+/// Lean identifier of the `externalSpecCallContract` definition emitted for
+/// `ext` in an `Obligations.<Item>` module.
+pub(crate) fn external_call_contract_ident(ext: &ExternalSpecContractRef) -> String {
+    format!(
+        "externalCallContract_{}",
+        sanitize_lean_ident(&ext.sidecar_module_suffix)
+    )
+}
+
+/// Render `defaultModularSpec.envAssumed` for `bundle`: the conjunction of
+/// `holdsOn` for every `#[external_spec]` contract abstracting a reachable
+/// callee and every verified sibling callee contract.
+///
+/// Every contract's precondition is guarded by `req.defPath`, so the
+/// conjunction constrains each abstracted callee independently. A single
+/// contract keeps the bare `<contract>.holdsOn` form expected by the automatic
+/// modular discharge combinators.
+fn render_default_env_assumed(bundle: &SubjectObligationBundle) -> String {
+    let mut contracts: Vec<String> = bundle
+        .external_spec_callees
+        .iter()
+        .map(external_call_contract_ident)
+        .collect();
+    contracts.extend(bundle.called_callees.iter().map(|callee| {
+        format!("Obligations.{}.defaultCallContract", callee.item_module_suffix)
+    }));
+    match contracts.as_slice() {
+        [] => "fun _ => True".to_string(),
+        [single] => format!("{single}.holdsOn"),
+        many => {
+            let clauses: Vec<String> = many.iter().map(|c| format!("{c}.holdsOn h")).collect();
+            format!("fun h => {}", conjoin_prop_clauses(&clauses))
+        }
+    }
 }
 
 /// Render the disposable `.anneal/generated/Obligations/<Item>.lean` module for
@@ -367,6 +543,39 @@ pub fn render_obligations_module_with_options(
         && imported_companions.insert(ref_suffix.clone())
     {
         out.push_str(&format!("import Mir.{ref_suffix}\n"));
+    }
+    for callee in &bundle.transitive_callees {
+        if callee.item_module_suffix != *item
+            && imported_companions.insert(callee.item_module_suffix.clone())
+        {
+            out.push_str(&format!("import Mir.{}\n", callee.item_module_suffix));
+        }
+    }
+    for ext in &bundle.external_spec_callees {
+        if ext.sidecar_module_suffix != *item
+            && imported_companions.insert(ext.sidecar_module_suffix.clone())
+        {
+            out.push_str(&format!("import Mir.{}\n", ext.sidecar_module_suffix));
+        }
+        if let Some(ref req_suf) = ext.req_module_suffix
+            && req_suf != item
+            && imported_companions.insert(req_suf.clone())
+        {
+            out.push_str(&format!("import Mir.{req_suf}\n"));
+        }
+        if let Some(ref ens_suf) = ext.ens_module_suffix
+            && ens_suf != item
+            && imported_companions.insert(ens_suf.clone())
+        {
+            out.push_str(&format!("import Mir.{ens_suf}\n"));
+        }
+    }
+    for callee in &bundle.spec_callees {
+        if callee.item_module_suffix != *item
+            && imported_companions.insert(callee.item_module_suffix.clone())
+        {
+            out.push_str(&format!("import Mir.{}\n", callee.item_module_suffix));
+        }
     }
 
     let mut imported_obligations: BTreeSet<String> = BTreeSet::new();
@@ -430,6 +639,22 @@ pub fn render_obligations_module_with_options(
     let has_contract_companions =
         !bundle.inline_requires.is_empty() || !bundle.inline_ensures.is_empty();
 
+    if !bundle.spec_callees.is_empty() {
+        let elems: Vec<String> = bundle
+            .spec_callees
+            .iter()
+            .map(|c| format!("Mir.{}.body", c.item_module_suffix))
+            .collect();
+        out.push_str(&format!(
+            "/-- Transitive callee table linked while evaluating the `requires` /\n    \
+                `ensures` companion predicates of `{def_id}`, so that calls inside\n    \
+                a predicate step through the callee bodies. -/\n\
+             def defaultSpecCallees : List CapturedMir :=\n  \
+               [{}]\n\n",
+            elems.join(", ")
+        ));
+    }
+
     let default_pre_expr = if has_contract_companions {
         let mut clauses = Vec::with_capacity(bundle.inline_requires.len() + 1);
         clauses.push(format!(
@@ -437,7 +662,7 @@ pub fn render_obligations_module_with_options(
         ));
         for req in &bundle.inline_requires {
             let req_suffix = derive_item_module_suffix(req);
-            clauses.push(format!("MirBoolPredicateHolds Mir.{req_suffix}.body args"));
+            clauses.push(render_companion_predicate(bundle, &req_suffix, "args"));
         }
         conjoin_prop_clauses(&clauses)
     } else {
@@ -450,9 +675,10 @@ pub fn render_obligations_module_with_options(
             .iter()
             .map(|ens| {
                 let ens_suffix = derive_item_module_suffix(ens);
-                format!(
-                    "MirBoolPredicateHolds Mir.{ens_suffix}.body \
-                     (List.append args (List.cons ret List.nil))"
+                render_companion_predicate(
+                    bundle,
+                    &ens_suffix,
+                    "(List.append args (List.cons ret List.nil))",
                 )
             })
             .collect();
@@ -607,14 +833,69 @@ pub fn render_obligations_module_with_options(
            post := fun args _ ret _ => defaultPost args ret\n\n"
     ));
 
-    let default_env_assumed = if let Some(callee) = bundle.called_callees.first() {
-        format!(
-            "Obligations.{}.defaultCallContract.holdsOn",
-            callee.item_module_suffix
-        )
+    let default_callees_expr = if bundle.transitive_callees.is_empty() {
+        ".nil".to_string()
     } else {
-        "fun _ => True".to_string()
+        let elems: Vec<String> = bundle
+            .transitive_callees
+            .iter()
+            .map(|c| format!("Mir.{}.body", c.item_module_suffix))
+            .collect();
+        format!("[{}]", elems.join(", "))
     };
+    out.push_str(&format!(
+        "/-- Default transitive callee table (`s.memory.callees`) for `{def_id}`,\n    \
+            containing all reachable captured MIR bodies without an explicit\n    \
+            `#[external_spec]` override. -/\n\
+         def defaultCallees : List CapturedMir :=\n  \
+           {default_callees_expr}\n\n"
+    ));
+
+    for (idx, ext) in bundle.external_spec_callees.iter().enumerate() {
+        let contract_ident = external_call_contract_ident(ext);
+        let extra_pre = if let Some(ref req_suf) = ext.req_module_suffix {
+            format!(
+                "(fun args => {})",
+                render_companion_predicate(bundle, req_suf, "args")
+            )
+        } else {
+            "(fun _ => True)".to_string()
+        };
+        let extra_post = if let Some(ref ens_suf) = ext.ens_module_suffix {
+            format!(
+                "(fun args ret => {})",
+                render_companion_predicate(
+                    bundle,
+                    ens_suf,
+                    "(List.append args (List.cons ret List.nil))"
+                )
+            )
+        } else {
+            "(fun _ _ => True)".to_string()
+        };
+        out.push_str(&format!(
+            "/-- Well-typed external call contract for `{}` lowered from\n    \
+                `#[external_spec]` sidecar `Mir.{}`. -/\n\
+             def {contract_ident} : MirCallContract :=\n  \
+               externalSpecCallContract\n    \
+                 \"{}\"\n    \
+                 Mir.{}.body\n    \
+                 {extra_pre}\n    \
+                 {extra_post}\n\n",
+            ext.target_def_id,
+            ext.sidecar_module_suffix,
+            ext.target_def_id,
+            ext.sidecar_module_suffix,
+        ));
+        if idx == 0 {
+            out.push_str(&format!(
+                "/-- Primary `#[external_spec]` call contract for `{def_id}`. -/\n\
+                 abbrev defaultExternalCallContract : MirCallContract := {contract_ident}\n\n"
+            ));
+        }
+    }
+
+    let default_env_assumed = render_default_env_assumed(bundle);
 
     out.push_str(&format!(
         "/-- Low-priority default `ModularItemSpec` instance for `{def_id}`. -/\n"
@@ -776,7 +1057,7 @@ pub fn render_obligations_module_with_options(
     ));
     out.push_str(&format!(
         "def claim [spec : ItemSpec \"{def_id}\"] : Claim :=\n  \
-           {{ body := Mir.{item}.body, pre := spec.pre, post := spec.post }}\n\n"
+           {{ body := Mir.{item}.body, pre := spec.pre, post := spec.post, callees := defaultCallees }}\n\n"
     ));
 
     out.push_str(&format!(
@@ -785,7 +1066,7 @@ pub fn render_obligations_module_with_options(
     ));
     out.push_str(&format!(
         "def statefulClaim [spec : StatefulItemSpec \"{def_id}\"] : StatefulClaim :=\n  \
-           {{ body := Mir.{item}.body, pre := spec.pre, post := spec.post }}\n\n"
+           {{ body := Mir.{item}.body, pre := spec.pre, post := spec.post, callees := defaultCallees }}\n\n"
     ));
 
     out.push_str(&format!(
@@ -794,7 +1075,7 @@ pub fn render_obligations_module_with_options(
     ));
     out.push_str(&format!(
         "def totalClaim [spec : TotalItemSpec \"{def_id}\"] : TotalClaim :=\n  \
-           {{ body := Mir.{item}.body, pre := spec.pre, post := spec.post }}\n\n"
+           {{ body := Mir.{item}.body, pre := spec.pre, post := spec.post, callees := defaultCallees }}\n\n"
     ));
 
     out.push_str(&format!(
@@ -803,7 +1084,7 @@ pub fn render_obligations_module_with_options(
     ));
     out.push_str(&format!(
         "def equivClaim [spec : StatefulEquivItemSpec \"{def_id}\"] : StatefulEquivClaim :=\n  \
-           {{ implBody := Mir.{item}.body, specBody := spec.specBody, pre := spec.pre, post := spec.post }}\n\n"
+           {{ implBody := Mir.{item}.body, specBody := spec.specBody, pre := spec.pre, post := spec.post, implCallees := defaultCallees, specCallees := defaultCallees }}\n\n"
     ));
 
     out.push_str(&format!(
@@ -812,7 +1093,7 @@ pub fn render_obligations_module_with_options(
     ));
     out.push_str(&format!(
         "def modularClaim [spec : ModularItemSpec \"{def_id}\"] : ModularClaim :=\n  \
-           {{ body := Mir.{item}.body, envAssumed := spec.envAssumed, pre := spec.pre, post := spec.post }}\n\n"
+           {{ body := Mir.{item}.body, envAssumed := spec.envAssumed, pre := spec.pre, post := spec.post, callees := defaultCallees }}\n\n"
     ));
 
     out.push_str(&format!(
@@ -821,7 +1102,7 @@ pub fn render_obligations_module_with_options(
     ));
     out.push_str(&format!(
         "def ubExceptionClaim [spec : UbExceptionItemSpec \"{def_id}\"] : UbExceptionClaim :=\n  \
-           {{ body := Mir.{item}.body, pre := spec.pre, strictSafetyPre := spec.strictSafetyPre, post := spec.post }}\n\n"
+           {{ body := Mir.{item}.body, pre := spec.pre, strictSafetyPre := spec.strictSafetyPre, post := spec.post, callees := defaultCallees }}\n\n"
     ));
 
     let sha = &bundle.subject.target.mir_module_sha256;
@@ -1023,6 +1304,32 @@ pub fn render_verify_module_with_options(
     out.push_str(&format!("import Obligations.{item}\n"));
     if !authored.has_proof && !uses_rust_trusted_contract && !authored.has_specs {
         let mut imported_callee_mir: BTreeSet<String> = BTreeSet::new();
+        for callee in &bundle.transitive_callees {
+            if callee.item_module_suffix != *item
+                && imported_callee_mir.insert(callee.item_module_suffix.clone())
+            {
+                out.push_str(&format!("import Mir.{}\n", callee.item_module_suffix));
+            }
+        }
+        for ext in &bundle.external_spec_callees {
+            if ext.sidecar_module_suffix != *item
+                && imported_callee_mir.insert(ext.sidecar_module_suffix.clone())
+            {
+                out.push_str(&format!("import Mir.{}\n", ext.sidecar_module_suffix));
+            }
+            if let Some(ref req_suf) = ext.req_module_suffix
+                && req_suf != item
+                && imported_callee_mir.insert(req_suf.clone())
+            {
+                out.push_str(&format!("import Mir.{req_suf}\n"));
+            }
+            if let Some(ref ens_suf) = ext.ens_module_suffix
+                && ens_suf != item
+                && imported_callee_mir.insert(ens_suf.clone())
+            {
+                out.push_str(&format!("import Mir.{ens_suf}\n"));
+            }
+        }
         for callee in &bundle.called_callees {
             if callee.item_module_suffix != *item
                 && imported_callee_mir.insert(callee.item_module_suffix.clone())
@@ -1165,8 +1472,35 @@ pub fn render_verify_module_with_options(
             ));
         }
     } else if !authored.has_specs
-        && let Some(callee) = bundle.called_callees.first()
-        && let Some(ref callee_ens_suffix) = callee.ens_module_suffix
+        // The automatic modular discharge combinators assume a single callee
+        // contract whose normal returns leave memory unchanged
+        // (`ans = .returned retVal req.memory`). That holds for a verified
+        // sibling callee's `defaultCallContract`, but not for
+        // `externalSpecCallContract` (which soundly permits heap mutation and
+        // unwinding) or for a conjunction of several contracts, so only the
+        // single-sibling-callee case is attempted here.
+        && bundle.external_spec_callees.is_empty()
+        && bundle.called_callees.len() == 1
+        && let Some((contract_expr, callee_def_id, callee_arg_count_expr, opt_callee_req, callee_ens_suffix)) =
+            bundle.called_callees.first().and_then(|callee| {
+                callee.ens_module_suffix.as_ref().map(|ens_suf| {
+                    let opt_req = if let Some(ref req_suf) = callee.req_module_suffix {
+                        format!("(Option.some Mir.{req_suf}.body)")
+                    } else {
+                        "Option.none".to_string()
+                    };
+                    (
+                        format!(
+                            "Obligations.{}.defaultCallContract",
+                            callee.item_module_suffix
+                        ),
+                        callee.def_id.as_str(),
+                        format!("Mir.{}.body.argCount", callee.item_module_suffix),
+                        opt_req,
+                        ens_suf.as_str(),
+                    )
+                })
+            })
     {
         let opt_subject_req = if bundle.inline_requires.len() == 1 {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
@@ -1180,16 +1514,9 @@ pub fn render_verify_module_with_options(
         } else {
             "Option.none".to_string()
         };
-        let opt_callee_req = if let Some(ref callee_req_suf) = callee.req_module_suffix {
-            format!("(Option.some Mir.{callee_req_suf}.body)")
-        } else {
-            "Option.none".to_string()
-        };
-        let callee_item = &callee.item_module_suffix;
-        let callee_def_id = &callee.def_id;
         let mut branches = format!(
             "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustModularContractAuto\n          \
-                     Obligations.{callee_item}.defaultCallContract\n          \
+                     {contract_expr}\n          \
                      Mir.{item}.body\n          \
                      Obligations.{item}.defaultModularSpec.pre\n          \
                      Obligations.{item}.defaultModularSpec.post\n          \
@@ -1197,15 +1524,16 @@ pub fn render_verify_module_with_options(
                      {opt_subject_req}\n          \
                      {opt_subject_ens}\n          \
                      \"{callee_def_id}\"\n          \
-                     Mir.{callee_item}.body.argCount\n          \
+                     {callee_arg_count_expr}\n          \
                      {opt_callee_req}\n          \
-                     Mir.{callee_ens_suffix}.body\n"
+                     Mir.{callee_ens_suffix}.body\n          \
+                     Obligations.{item}.defaultCallees\n"
         );
         if bundle.inline_requires.len() == 1 {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
             branches.push_str(&format!(
                 "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustModularBoundedRange1Auto\n          \
-                         Obligations.{callee_item}.defaultCallContract\n          \
+                         {contract_expr}\n          \
                          Mir.{item}.body\n          \
                          Obligations.{item}.defaultModularSpec.pre\n          \
                          Obligations.{item}.defaultModularSpec.post\n          \
@@ -1213,9 +1541,10 @@ pub fn render_verify_module_with_options(
                          Mir.{req_suf}.body\n          \
                          {opt_subject_ens}\n          \
                          \"{callee_def_id}\"\n          \
-                         Mir.{callee_item}.body.argCount\n          \
+                         {callee_arg_count_expr}\n          \
                          {opt_callee_req}\n          \
-                         Mir.{callee_ens_suffix}.body\n"
+                         Mir.{callee_ens_suffix}.body\n          \
+                         Obligations.{item}.defaultCallees\n"
             ));
         }
         out.push_str(&format!(
@@ -1228,6 +1557,18 @@ pub fn render_verify_module_with_options(
                  first\n\
              {branches}\n\
              /-- Kernel-checked modular verification certificate for `{def_id}`. -/\n\
+             theorem verified : ModularVerificationResult Obligations.{item}.modularClaim :=\n  \
+               (inferInstance : ModularItemProof \"{def_id}\" Obligations.{item}.modularClaim).verified\n\n\
+             /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
+             abbrev Certificate : Prop := ModularVerificationResult Obligations.{item}.modularClaim\n\n"
+        ));
+        out.push_str(&render_monomorphic_signature_guard(item));
+    } else if authored.is_modular
+        || (!authored.has_specs
+            && (!bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty()))
+    {
+        out.push_str(&format!(
+            "/-- Kernel-checked modular verification certificate for `{def_id}`. -/\n\
              theorem verified : ModularVerificationResult Obligations.{item}.modularClaim :=\n  \
                (inferInstance : ModularItemProof \"{def_id}\" Obligations.{item}.modularClaim).verified\n\n\
              /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
@@ -1287,6 +1628,26 @@ pub fn render_verify_module_with_options(
              abbrev Certificate : Prop := TotalVerificationResult Obligations.{item}.totalClaim\n\n"
         ));
         out.push_str(&render_monomorphic_signature_guard(item));
+    } else if !authored.has_specs
+        && bundle.inline_requires.is_empty()
+        && bundle.inline_ensures.is_empty()
+    {
+        out.push_str(&format!(
+            "/-- Low-priority fallback `ItemProof` instance attempting bounded\n    \
+                `WP` discharge when no authored `Proof.{item}` module exists on\n    \
+                disk. -/\n\
+             instance (priority := low) defaultProof :\n    \
+                 ItemProof \"{def_id}\" Obligations.{item}.claim where\n  \
+               verified :=\n    \
+                 Anneal.Rustc.V2026_06_01.SymbolicEval.verifyByWP Obligations.{item}.claim 64 (by\n      \
+                   intro _ _\n      \
+                   exact True.intro)\n\n\
+             /-- Kernel-checked verification certificate for `{def_id}`. -/\n\
+             theorem verified : VerificationResult Obligations.{item}.claim :=\n  \
+               (inferInstance : ItemProof \"{def_id}\" Obligations.{item}.claim).verified\n\n\
+             /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
+             abbrev Certificate : Prop := VerificationResult Obligations.{item}.claim\n\n"
+        ));
     } else {
         let opt_req = if bundle.inline_requires.len() == 1 {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
@@ -1337,7 +1698,7 @@ pub fn render_verify_module_with_options(
                  ItemProof \"{def_id}\" Obligations.{item}.claim where\n  \
                verified := by\n    \
                  first\n\
-             {branches}\n\
+             {branches}\
              /-- Kernel-checked verification certificate for `{def_id}`. -/\n\
              theorem verified : VerificationResult Obligations.{item}.claim :=\n  \
                (inferInstance : ItemProof \"{def_id}\" Obligations.{item}.claim).verified\n\n\
@@ -1420,6 +1781,45 @@ pub fn render_crate_verify_module(crate_name: &str, bundles: &[SubjectObligation
 pub fn render_specs_template(bundle: &SubjectObligationBundle) -> String {
     let item = &bundle.item_module_suffix;
     let def_id = &bundle.subject.target.def_id;
+    if !bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty() {
+        return format!(
+            "import Trusted\n\
+             import Mir.{item}\n\
+             import Obligations.{item}\n\n\
+             namespace Specs.{item}\n\n\
+             set_option linter.unusedVariables false\n\n\
+             open Trusted.MirSemantics\n\
+             open Trusted.VerificationResult\n\n\
+             /-!\n\
+             Durable modular specification override module for `{def_id}`.\n\n\
+             `Obligations.{item}.defaultModularSpec` provides a `priority := low` default\n\
+             `ModularItemSpec \"{def_id}\"` instance lowered from Rust `#[spec]` and\n\
+             `#[external_spec]` companions. Declaring a normal-priority `ModularItemSpec`\n\
+             instance in this module overrides that default without modifying any\n\
+             generated file.\n\n\
+             To strengthen the contract while preserving Rust `#[spec]` and\n\
+             `#[external_spec]` companions, use `Obligations.{item}.refineModularSpec`.\n\
+             -/\n\n\
+             /-- Assumed external call-handler environment contract. -/\n\
+             def envAssumed (h : ExternalCallHandler) : Prop :=\n  \
+               Obligations.{item}.defaultModularSpec.envAssumed h\n\n\
+             /-- Precondition over the incoming argument list `args` and initial `mem`. -/\n\
+             def pre (args : List Value) (mem : Memory) : Prop :=\n  \
+               Obligations.{item}.defaultModularSpec.pre args mem\n\n\
+             /-- Postcondition relating `(args, mem)` to `(ret, mem')`. -/\n\
+             def post (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory) : Prop :=\n  \
+               Obligations.{item}.defaultModularSpec.post args mem ret mem'\n\n\
+             /-- Normal-priority `ModularItemSpec` instance overriding\n    \
+                 `Obligations.{item}.defaultModularSpec`.\n    \
+                 Alternatively, define `instance : ModularItemSpec \"{def_id}\" :=\n    \
+                 Obligations.{item}.refineModularSpec envAssumed extraPre extraPost`. -/\n\
+             instance : ModularItemSpec \"{def_id}\" where\n  \
+               envAssumed := envAssumed\n  \
+               pre := pre\n  \
+               post := post\n\n\
+             end Specs.{item}\n"
+        );
+    }
     format!(
         "import Trusted\n\
          import Mir.{item}\n\
@@ -1533,7 +1933,10 @@ pub fn render_proof_template_with_options(
                sorry\n\n\
              end Proof.{item}\n"
         ));
-    } else if authored.is_modular {
+    } else if authored.is_modular
+        || (!authored.has_specs
+            && (!bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty()))
+    {
         out.push_str(&format!(
             "/-!\n\
              Durable modular proof module for `{def_id}`.\n\n\
@@ -1614,6 +2017,7 @@ mod tests {
                 lean_module_name: "Mir.MyCrate.math.inc".to_string(),
                 item_kind: CapturedItemKind::Subject,
                 associated_subject_def_id: None,
+                trait_impls: Vec::new(),
             },
             UnitTargetRecord {
                 target: CapturedTarget {
@@ -1625,6 +2029,7 @@ mod tests {
                 lean_module_name: "Mir.MyCrate.math.__anodized_fn_requires_inc".to_string(),
                 item_kind: CapturedItemKind::InlineSpecRequires,
                 associated_subject_def_id: Some("my_crate::math::inc".to_string()),
+                trait_impls: Vec::new(),
             },
             UnitTargetRecord {
                 target: CapturedTarget {
@@ -1636,6 +2041,7 @@ mod tests {
                 lean_module_name: "Mir.MyCrate.math.__anodized_fn_ensures_inc".to_string(),
                 item_kind: CapturedItemKind::InlineSpecEnsures,
                 associated_subject_def_id: Some("my_crate::math::inc".to_string()),
+                trait_impls: Vec::new(),
             },
         ]
     }
@@ -1671,7 +2077,7 @@ mod tests {
             "instance (priority := low) defaultSpec : ItemSpec \"my_crate::math::inc\" where"
         ));
         assert!(obligations.contains(
-            "def claim [spec : ItemSpec \"my_crate::math::inc\"] : Claim :=\n  { body := Mir.MyCrate.math.inc.body, pre := spec.pre, post := spec.post }"
+            "def claim [spec : ItemSpec \"my_crate::math::inc\"] : Claim :=\n  { body := Mir.MyCrate.math.inc.body, pre := spec.pre, post := spec.post, callees := defaultCallees }"
         ));
 
         let verify_with_proof = render_verify_module_with_options(
@@ -1723,6 +2129,7 @@ mod tests {
             lean_module_name: "Mir.MyCrate.math.id".to_string(),
             item_kind: CapturedItemKind::Subject,
             associated_subject_def_id: None,
+            trait_impls: Vec::new(),
         };
         let empty_bundle = SubjectObligationBundle {
             subject: subject.clone(),
@@ -1741,8 +2148,13 @@ mod tests {
                 lean_module_name: "Mir.MyCrate.math.__ANNEAL_EXT_SPEC_TARGET_id".to_string(),
                 item_kind: CapturedItemKind::ExternalSpec,
                 associated_subject_def_id: Some("my_crate::math::id".to_string()),
+                trait_impls: Vec::new(),
             }],
             called_callees: Vec::new(),
+            transitive_callees: Vec::new(),
+            external_spec_callees: Vec::new(),
+            spec_callees: Vec::new(),
+            spec_companions_with_calls: BTreeSet::new(),
         };
 
         let empty_obligations = render_obligations_module(&empty_bundle);
@@ -1772,6 +2184,7 @@ mod tests {
                     lean_module_name: "Mir.MyCrate.math.__anodized_fn_requires_id_0".to_string(),
                     item_kind: CapturedItemKind::InlineSpecRequires,
                     associated_subject_def_id: Some("my_crate::math::id".to_string()),
+                    trait_impls: Vec::new(),
                 },
                 UnitTargetRecord {
                     target: CapturedTarget {
@@ -1783,12 +2196,17 @@ mod tests {
                     lean_module_name: "Mir.MyCrate.math.__anodized_fn_requires_id_1".to_string(),
                     item_kind: CapturedItemKind::InlineSpecRequires,
                     associated_subject_def_id: Some("my_crate::math::id".to_string()),
+                    trait_impls: Vec::new(),
                 },
             ],
             inline_ensures: Vec::new(),
             inline_qualifiers: Vec::new(),
             external_specs: Vec::new(),
             called_callees: Vec::new(),
+            transitive_callees: Vec::new(),
+            external_spec_callees: Vec::new(),
+            spec_callees: Vec::new(),
+            spec_companions_with_calls: BTreeSet::new(),
         };
 
         let multi_obligations = render_obligations_module(&multi_bundle);
@@ -2013,6 +2431,7 @@ mod tests {
             lean_module_name: String::new(),
             item_kind: CapturedItemKind::ExternalSpec,
             associated_subject_def_id: Some("my_crate::math::inc".to_string()),
+            trait_impls: Vec::new(),
         });
         records.push(UnitTargetRecord {
             target: CapturedTarget {
@@ -2024,6 +2443,7 @@ mod tests {
             lean_module_name: String::new(),
             item_kind: CapturedItemKind::ExternalSpec,
             associated_subject_def_id: Some("my_crate::math::inc".to_string()),
+            trait_impls: Vec::new(),
         });
 
         let bundles = group_subject_obligations(&records);
@@ -2062,6 +2482,7 @@ mod tests {
             lean_module_name: String::new(),
             item_kind: CapturedItemKind::ExternalSpec,
             associated_subject_def_id: Some("my_crate::math::inc".to_string()),
+            trait_impls: Vec::new(),
         });
 
         let bundles = group_subject_obligations(&records);
@@ -2137,6 +2558,7 @@ mod tests {
             lean_module_name: String::new(),
             item_kind: CapturedItemKind::ExternalSpec,
             associated_subject_def_id: Some("my_crate::math::inc".to_string()),
+            trait_impls: Vec::new(),
         });
         let total_bundles = group_subject_obligations(&caller_bundle);
         let total_verify =
@@ -2259,5 +2681,322 @@ mod tests {
                  Proof.MyCrate.math.inc.verified"
         ));
         assert!(!verify_poly.contains("signatureMonomorphic"));
+    }
+
+    #[test]
+    fn renders_transitive_default_callees_and_external_spec_contracts() {
+        let mut records = sample_records();
+        // Add a clause-less `#[external_spec(for = core::slice::from_raw_parts_mut)]`
+        // sidecar and a claused `#[external_spec(for = dep_crate::helper)]` sidecar.
+        records.push(UnitTargetRecord {
+            target: CapturedTarget {
+                def_id: "my_crate::math::spec_from_raw_parts_mut".to_string(),
+                mir_module_path: "Mir/MyCrate/math/spec_from_raw_parts_mut.lean".to_string(),
+                mir_module_sha256: "e".repeat(64),
+            },
+            lean_module_name: "Mir.MyCrate.math.spec_from_raw_parts_mut".to_string(),
+            item_kind: CapturedItemKind::ExternalSpec,
+            associated_subject_def_id: Some("core::slice::from_raw_parts_mut".to_string()),
+            trait_impls: Vec::new(),
+        });
+        records.push(UnitTargetRecord {
+            target: CapturedTarget {
+                def_id: "my_crate::math::spec_dep_helper".to_string(),
+                mir_module_path: "Mir/MyCrate/math/spec_dep_helper.lean".to_string(),
+                mir_module_sha256: "f".repeat(64),
+            },
+            lean_module_name: "Mir.MyCrate.math.spec_dep_helper".to_string(),
+            item_kind: CapturedItemKind::ExternalSpec,
+            associated_subject_def_id: Some("dep_crate::helper".to_string()),
+            trait_impls: Vec::new(),
+        });
+        records.push(UnitTargetRecord {
+            target: CapturedTarget {
+                def_id: "my_crate::math::__anodized_fn_requires_spec_dep_helper".to_string(),
+                mir_module_path: "Mir/MyCrate/math/__anodized_fn_requires_spec_dep_helper.lean"
+                    .to_string(),
+                mir_module_sha256: "1".repeat(64),
+            },
+            lean_module_name: "Mir.MyCrate.math.__anodized_fn_requires_spec_dep_helper"
+                .to_string(),
+            item_kind: CapturedItemKind::InlineSpecRequires,
+            associated_subject_def_id: Some("dep_crate::helper".to_string()),
+            trait_impls: Vec::new(),
+        });
+        records.push(UnitTargetRecord {
+            target: CapturedTarget {
+                def_id: "my_crate::math::__anodized_fn_ensures_spec_dep_helper".to_string(),
+                mir_module_path: "Mir/MyCrate/math/__anodized_fn_ensures_spec_dep_helper.lean"
+                    .to_string(),
+                mir_module_sha256: "2".repeat(64),
+            },
+            lean_module_name: "Mir.MyCrate.math.__anodized_fn_ensures_spec_dep_helper"
+                .to_string(),
+            item_kind: CapturedItemKind::InlineSpecEnsures,
+            associated_subject_def_id: Some("dep_crate::helper".to_string()),
+            trait_impls: Vec::new(),
+        });
+
+        let ext_contracts = collect_external_spec_contracts(&records);
+        assert_eq!(ext_contracts.len(), 2);
+        let raw_parts_ext = ext_contracts
+            .get("core::slice::from_raw_parts_mut")
+            .expect("clause-less external spec contract");
+        assert_eq!(raw_parts_ext.req_module_suffix, None);
+        assert_eq!(raw_parts_ext.ens_module_suffix, None);
+
+        let dep_ext = ext_contracts
+            .get("dep_crate::helper")
+            .expect("claused external spec contract");
+        assert_eq!(
+            dep_ext.req_module_suffix.as_deref(),
+            Some("MyCrate.math.__anodized_fn_requires_spec_dep_helper")
+        );
+        assert_eq!(
+            dep_ext.ens_module_suffix.as_deref(),
+            Some("MyCrate.math.__anodized_fn_ensures_spec_dep_helper")
+        );
+
+        let mut bundles = group_subject_obligations(&records);
+        let bundle = &mut bundles[0];
+        bundle.transitive_callees = vec![
+            TransitiveCalleeRef {
+                def_id: "dep_crate::step_a".to_string(),
+                item_module_suffix: "DepCrate.step_a".to_string(),
+            },
+            TransitiveCalleeRef {
+                def_id: "core::slice::<impl [T]>::len".to_string(),
+                item_module_suffix: "Core.slice_impl_T_len".to_string(),
+            },
+        ];
+        bundle.external_spec_callees = vec![raw_parts_ext.clone(), dep_ext.clone()];
+
+        let obligations = render_obligations_module(bundle);
+        assert!(obligations.contains("import Mir.DepCrate.step_a\n"));
+        assert!(obligations.contains("import Mir.Core.slice_impl_T_len\n"));
+        assert!(obligations.contains("import Mir.MyCrate.math.spec_from_raw_parts_mut\n"));
+        assert!(obligations.contains("import Mir.MyCrate.math.spec_dep_helper\n"));
+        assert!(obligations.contains(
+            "import Mir.MyCrate.math.__anodized_fn_requires_spec_dep_helper\n"
+        ));
+        assert!(obligations.contains(
+            "import Mir.MyCrate.math.__anodized_fn_ensures_spec_dep_helper\n"
+        ));
+        assert!(obligations.contains(
+            "def defaultCallees : List CapturedMir :=\n  \
+               [Mir.DepCrate.step_a.body, Mir.Core.slice_impl_T_len.body]"
+        ));
+        assert!(obligations.contains(
+            "def externalCallContract_MyCrate_math_spec_from_raw_parts_mut : MirCallContract :=\n  \
+               externalSpecCallContract\n    \
+                 \"core::slice::from_raw_parts_mut\"\n    \
+                 Mir.MyCrate.math.spec_from_raw_parts_mut.body\n    \
+                 (fun _ => True)\n    \
+                 (fun _ _ => True)"
+        ));
+        assert!(obligations.contains(
+            "def externalCallContract_MyCrate_math_spec_dep_helper : MirCallContract :=\n  \
+               externalSpecCallContract\n    \
+                 \"dep_crate::helper\"\n    \
+                 Mir.MyCrate.math.spec_dep_helper.body\n    \
+                 (fun args => MirBoolPredicateHolds Mir.MyCrate.math.__anodized_fn_requires_spec_dep_helper.body args)\n    \
+                 (fun args ret => MirBoolPredicateHolds Mir.MyCrate.math.__anodized_fn_ensures_spec_dep_helper.body (List.append args (List.cons ret List.nil)))"
+        ));
+        assert!(obligations.contains("callees := defaultCallees"));
+        assert!(obligations.contains("implCallees := defaultCallees"));
+        assert!(obligations.contains("specCallees := defaultCallees"));
+    }
+
+    fn record(def_id: &str, kind: CapturedItemKind, assoc: Option<&str>) -> UnitTargetRecord {
+        let suffix: Vec<String> = def_id
+            .split("::")
+            .map(|seg| if seg == "my_crate" { "MyCrate".to_string() } else { seg.to_string() })
+            .collect();
+        UnitTargetRecord {
+            target: CapturedTarget {
+                def_id: def_id.to_string(),
+                mir_module_path: format!("Mir/{}.lean", suffix.join("/")),
+                mir_module_sha256: "0".repeat(64),
+            },
+            lean_module_name: format!("Mir.{}", suffix.join(".")),
+            item_kind: kind,
+            associated_subject_def_id: assoc.map(str::to_string),
+            trait_impls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn external_spec_companions_match_by_exact_sidecar_path() {
+        // `my_crate::helper` carries its own inline `#[spec]` companion and is
+        // also the target of the `my_crate::spec_helper` sidecar. Both
+        // companions are associated with `my_crate::helper`, and the target's
+        // own companion sorts first, so association alone would mis-attribute
+        // it to the sidecar contract.
+        let records = vec![
+            record("my_crate::helper", CapturedItemKind::Subject, None),
+            record(
+                "my_crate::__anodized_fn_requires_helper",
+                CapturedItemKind::InlineSpecRequires,
+                Some("my_crate::helper"),
+            ),
+            record(
+                "my_crate::spec_helper",
+                CapturedItemKind::ExternalSpec,
+                Some("my_crate::helper"),
+            ),
+            record(
+                "my_crate::__anodized_fn_requires_spec_helper",
+                CapturedItemKind::InlineSpecRequires,
+                Some("my_crate::helper"),
+            ),
+            record(
+                "my_crate::__anodized_fn_ensures_spec_helper",
+                CapturedItemKind::InlineSpecEnsures,
+                Some("my_crate::helper"),
+            ),
+            // A clause-less sidecar whose name is a prefix of `spec_helper` must
+            // not adopt `spec_helper`'s companions.
+            record("my_crate::spec", CapturedItemKind::ExternalSpec, Some("dep::other")),
+        ];
+        let contracts = collect_external_spec_contracts(&records);
+        let helper = contracts.get("my_crate::helper").expect("helper contract");
+        assert_eq!(
+            helper.req_module_suffix.as_deref(),
+            Some("MyCrate.__anodized_fn_requires_spec_helper")
+        );
+        assert_eq!(
+            helper.ens_module_suffix.as_deref(),
+            Some("MyCrate.__anodized_fn_ensures_spec_helper")
+        );
+        let other = contracts.get("dep::other").expect("clause-less contract");
+        assert_eq!(other.req_module_suffix, None);
+        assert_eq!(other.ens_module_suffix, None);
+    }
+
+    #[test]
+    fn default_env_assumed_conjoins_every_abstracted_callee_contract() {
+        let records = vec![record("my_crate::caller", CapturedItemKind::Subject, None)];
+        let mut bundles = group_subject_obligations(&records);
+        let bundle = &mut bundles[0];
+
+        let ext = |target: &str, sidecar: &str| ExternalSpecContractRef {
+            target_def_id: target.to_string(),
+            sidecar_module_suffix: sidecar.to_string(),
+            req_module_suffix: None,
+            ens_module_suffix: None,
+        };
+
+        bundle.external_spec_callees = vec![ext("dep::a", "MyCrate.spec_a")];
+        let single = render_obligations_module(bundle);
+        assert!(
+            single.contains("envAssumed := externalCallContract_MyCrate_spec_a.holdsOn\n"),
+            "a single contract keeps the bare holdsOn form:\n{single}"
+        );
+
+        bundle.external_spec_callees.push(ext("dep::b", "MyCrate.spec_b"));
+        bundle.called_callees.push(CalleeContractRef {
+            def_id: "my_crate::trusted".to_string(),
+            item_module_suffix: "MyCrate.trusted".to_string(),
+            req_module_suffix: None,
+            ens_module_suffix: None,
+        });
+        let many = render_obligations_module(bundle);
+        assert!(
+            many.contains(
+                "envAssumed := fun h => And (externalCallContract_MyCrate_spec_a.holdsOn h) \
+                 (And (externalCallContract_MyCrate_spec_b.holdsOn h) \
+                 (Obligations.MyCrate.trusted.defaultCallContract.holdsOn h))\n"
+            ),
+            "every abstracted callee contract must be assumed:\n{many}"
+        );
+
+        // The automatic modular discharge assumes a single memory-preserving
+        // sibling contract and is not attempted for external-spec callees.
+        let verify = render_verify_module_with_options(bundle, AuthoredItemModules::default());
+        assert!(
+            !verify.contains("dischargeRustModularContractAuto"),
+            "external-spec callees must not use the memory-preserving modular discharge:\n{verify}"
+        );
+    }
+
+    #[test]
+    fn call_containing_companions_are_evaluated_with_default_spec_callees() {
+        let records = sample_records();
+        let mut bundles = group_subject_obligations(&records);
+        let bundle = &mut bundles[0];
+        bundle.spec_callees = vec![TransitiveCalleeRef {
+            def_id: "core::num::<impl u32>::wrapping_add".to_string(),
+            item_module_suffix: "Core.num_impl_u32_wrapping_add".to_string(),
+        }];
+        bundle
+            .spec_companions_with_calls
+            .insert("MyCrate.math.__anodized_fn_ensures_inc".to_string());
+
+        let obligations = render_obligations_module(bundle);
+        assert!(obligations.contains("import Mir.Core.num_impl_u32_wrapping_add\n"));
+        assert!(obligations.contains(
+            "def defaultSpecCallees : List CapturedMir :=\n  [Mir.Core.num_impl_u32_wrapping_add.body]"
+        ));
+        let spec_callees_pos = obligations.find("def defaultSpecCallees").unwrap();
+        let default_pre_pos = obligations.find("def defaultPre").unwrap();
+        assert!(spec_callees_pos < default_pre_pos);
+        // The call-free `requires` companion keeps the plain form.
+        assert!(obligations.contains(
+            "MirBoolPredicateHolds Mir.MyCrate.math.__anodized_fn_requires_inc.body args"
+        ));
+        assert!(obligations.contains(
+            "def defaultPost (args : List Value) (ret : Value) : Prop :=\n  \
+             MirBoolPredicateHoldsWithCallees Mir.MyCrate.math.__anodized_fn_ensures_inc.body \
+             defaultSpecCallees (List.append args (List.cons ret List.nil))"
+        ));
+
+        // Without linked spec callees, every companion keeps the plain form.
+        bundle.spec_callees.clear();
+        let plain = render_obligations_module(bundle);
+        assert!(!plain.contains("defaultSpecCallees"));
+        assert!(plain.contains(
+            "MirBoolPredicateHolds Mir.MyCrate.math.__anodized_fn_ensures_inc.body \
+             (List.append args (List.cons ret List.nil))"
+        ));
+    }
+
+    #[test]
+    fn render_proof_template_emits_modular_claim_when_bundle_has_abstracted_callees() {
+        let records = vec![record("my_crate::caller", CapturedItemKind::Subject, None)];
+        let mut bundles = group_subject_obligations(&records);
+        let bundle = &mut bundles[0];
+        bundle.external_spec_callees.push(ExternalSpecContractRef {
+            target_def_id: "dep::ffi_op".to_string(),
+            sidecar_module_suffix: "MyCrate.ext_ffi_op".to_string(),
+            req_module_suffix: None,
+            ens_module_suffix: None,
+        });
+        let specs_template = render_specs_template(bundle);
+        assert!(
+            specs_template.contains("instance : ModularItemSpec \"my_crate::caller\" where")
+                && specs_template.contains("Obligations.MyCrate.caller.defaultModularSpec.envAssumed"),
+            "specs template for subject with external_spec_callees must emit ModularItemSpec:\n{specs_template}"
+        );
+        let template = render_proof_template_with_options(bundle, AuthoredItemModules::default());
+        assert!(
+            template.contains(
+                "theorem verified : ModularVerificationResult Obligations.MyCrate.caller.modularClaim := by"
+            ),
+            "proof template for subject with external_spec_callees must target modularClaim:\n{template}"
+        );
+        let verify_mod = render_verify_module_with_options(
+            bundle,
+            AuthoredItemModules {
+                has_specs: true,
+                is_modular: true,
+                ..AuthoredItemModules::default()
+            },
+        );
+        assert!(
+            verify_mod.contains(
+                "theorem verified : ModularVerificationResult Obligations.MyCrate.caller.modularClaim :="
+            ),
+            "verify module with authored ModularItemSpec and no Proof must target modularClaim:\n{verify_mod}"
+        );
     }
 }

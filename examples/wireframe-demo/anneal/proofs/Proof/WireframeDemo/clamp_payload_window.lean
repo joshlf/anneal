@@ -274,7 +274,7 @@ private def evalRvalueSymTreeFast
           tag := tag
           targetLocal := p.local_
           targetProjection := .nil
-          perm := sharedBorrowPerm ctx.localDecls ctx.layouts { local_ := p.local_, projection := [] }
+          perm := sharedBorrowPerm ctx.localDecls ctx.layouts { local_ := p.local_, projection := .nil }
         }
         let mem' := {
           mem with
@@ -984,6 +984,7 @@ private theorem ensures_holds (b1 b2 ret : Nat)
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
     invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1018,6 +1019,7 @@ private theorem ensures_holds (b1 b2 ret : Nat)
       byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
       isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
       invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
       boolToScalar,
       GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
       HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1047,6 +1049,7 @@ private theorem ensures_holds (b1 b2 ret : Nat)
       byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
       isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
       invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
       boolToScalar,
       GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
       HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1076,6 +1079,7 @@ private theorem ensures_holds (b1 b2 ret : Nat)
       byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
       isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
       invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
       boolToScalar,
       GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
       HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1114,6 +1118,7 @@ private theorem ensures_holds (b1 b2 ret : Nat)
       byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
       isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
       invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
       boolToScalar,
       GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
       HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1143,6 +1148,7 @@ private theorem ensures_holds (b1 b2 ret : Nat)
       byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
       isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
       invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
       boolToScalar,
       GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
       HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1172,6 +1178,7 @@ private theorem ensures_holds (b1 b2 ret : Nat)
       byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
       isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
       invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
       boolToScalar,
       GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
       HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1285,6 +1292,7 @@ private theorem wpReq_inversion (v1 v2 : Value) :
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
     invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1328,6 +1336,7 @@ private theorem wpReq_inversion (v1 v2 : Value) :
             byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
             isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
             invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
             boolToScalar,
             GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
             HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1365,6 +1374,7 @@ private theorem wpReq_inversion (v1 v2 : Value) :
             byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
             isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
             invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
             boolToScalar,
             GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
             HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1408,6 +1418,7 @@ private theorem wpReq_inversion (v1 v2 : Value) :
                     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
                     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
                     invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
                     boolToScalar,
                     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
                     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1519,6 +1530,7 @@ theorem verified : VerificationResult Obligations.WireframeDemo.clamp_payload_wi
       byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
       isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
       invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
       boolToScalar,
       GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
       HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1570,6 +1582,7 @@ theorem nonVacuousRequires :
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
     invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,

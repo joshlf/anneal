@@ -1356,6 +1356,16 @@ theorem dwlp_of_wpTransPlan
     DWLP ewp (mirTree body s) (fun out _ => post out) PUnit.unit :=
   (dwp_of_wpTransPlan plan h).toDWLP
 
+/-- Lift `wpTransPlan` to `DWP` on `mirStatefulTreeWithCallees`. -/
+theorem dwp_mirStatefulTreeWithCallees_of_transPlan
+    {ewp : EffectWP MirEffect} [ObsTransparentWP ewp]
+    {body : CapturedMir} {callees : List CapturedMir} {args : List Value} {mem : Memory}
+    {plan : TransPlan} {post : MirOutcome → Prop}
+    (h : wpTransPlan ewp body plan post
+      (initMachineStateWithMemoryAndCallees body args mem callees)) :
+    DWP ewp (mirStatefulTreeWithCallees body args mem callees) (fun out _ => post out) PUnit.unit :=
+  dwp_of_wpTransPlan plan h
+
 /-- Lift `wpTransPlan` to `DWP` on `mirStatefulTree`. -/
 theorem dwp_mirStatefulTree_of_transPlan
     {ewp : EffectWP MirEffect} [ObsTransparentWP ewp]
@@ -1363,6 +1373,15 @@ theorem dwp_mirStatefulTree_of_transPlan
     {plan : TransPlan} {post : MirOutcome → Prop}
     (h : wpTransPlan ewp body plan post (initMachineStateWithMemory body args mem)) :
     DWP ewp (mirStatefulTree body args mem) (fun out _ => post out) PUnit.unit :=
+  dwp_of_wpTransPlan plan h
+
+/-- Lift `wpTransPlan` to `DWP` on `mirCallTreeWithCallees`. -/
+theorem dwp_mirCallTreeWithCallees_of_transPlan
+    {ewp : EffectWP MirEffect} [ObsTransparentWP ewp]
+    {body : CapturedMir} {callees : List CapturedMir} {args : List Value}
+    {plan : TransPlan} {post : MirOutcome → Prop}
+    (h : wpTransPlan ewp body plan post (initMachineStateWithCallees body args callees)) :
+    DWP ewp (mirCallTreeWithCallees body args callees) (fun out _ => post out) PUnit.unit :=
   dwp_of_wpTransPlan plan h
 
 /-- Lift `wpTransPlan` to `DWP` on `mirOpenTree` (`mirCallTree`). -/
@@ -1385,11 +1404,11 @@ theorem verifyByTransPlan
         wpTransPlan ewp c.body (plan args)
           (fun out =>
             ∀ retVal mem', out = .normal (retVal, mem') → c.post args retVal)
-          (initMachineState c.body args)) :
+          (initMachineStateWithCallees c.body args c.callees)) :
     VerificationResult c := by
   refine ⟨fun args h_pre => ?_⟩
   have h_adeq :=
-    dwlp_pure_adequacy (dwp_mirOpenTree_of_transPlan (h_plan args h_pre)).toDWLP
+    dwlp_pure_adequacy (dwp_mirCallTreeWithCallees_of_transPlan (h_plan args h_pre)).toDWLP
   exact ⟨h_adeq.1, fun outPair h_ret _ retVal mem' h_out =>
     h_adeq.2 outPair.1 outPair.2 h_ret retVal mem' h_out⟩
 
@@ -1405,11 +1424,11 @@ theorem verifyStatefulByTransPlan
           (fun out =>
             ∀ retVal mem',
               out = .normal (retVal, mem') → c.post args mem retVal mem')
-          (initMachineStateWithMemory c.body args mem)) :
+          (initMachineStateWithMemoryAndCallees c.body args mem c.callees)) :
     StatefulVerificationResult c := by
   refine ⟨fun args mem h_pre => ?_⟩
   have h_adeq :=
-    dwlp_pure_adequacy (dwp_mirStatefulTree_of_transPlan (h_plan args mem h_pre)).toDWLP
+    dwlp_pure_adequacy (dwp_mirStatefulTreeWithCallees_of_transPlan (h_plan args mem h_pre)).toDWLP
   exact ⟨h_adeq.1, fun outPair h_ret _ retVal mem' h_out =>
     h_adeq.2 outPair.1 outPair.2 h_ret retVal mem' h_out⟩
 
@@ -1425,10 +1444,10 @@ theorem verifyTotalByTransPlan
           (fun out =>
             ∃ retVal mem',
               out = .normal (retVal, mem') ∧ c.post args mem retVal mem')
-          (initMachineStateWithMemory c.body args mem)) :
+          (initMachineStateWithMemoryAndCallees c.body args mem c.callees)) :
     TotalVerificationResult c :=
   ⟨fun args mem h_pre =>
-    dwp_pure_adequacy (dwp_mirStatefulTree_of_transPlan (h_plan args mem h_pre))⟩
+    dwp_pure_adequacy (dwp_mirStatefulTreeWithCallees_of_transPlan (h_plan args mem h_pre))⟩
 
 /-! ### Coinductive `DWLP` Loop-Invariant Rule for Unbounded Loops -/
 
@@ -2997,17 +3016,17 @@ theorem verifyStatefulEquivClaimByTransPlan
           (fun out =>
             out = .normal (model args mem) ∧
             c.post args mem (model args mem).1 (model args mem).2)
-          (initMachineStateWithMemory c.implBody args mem))
+          (initMachineStateWithMemoryAndCallees c.implBody args mem c.implCallees))
     (h_spec :
       ∀ args mem,
         c.pre args mem →
         wpTransPlan mirNoCallWP c.specBody specPlan
           (fun out => out = .normal (model args mem))
-          (initMachineStateWithMemory c.specBody args mem)) :
+          (initMachineStateWithMemoryAndCallees c.specBody args mem c.specCallees)) :
     StatefulEquivVerificationResult c :=
   verifyStatefulEquivViaPureModel c model
-    (fun args mem h_pre => dwp_mirStatefulTree_of_transPlan (h_impl args mem h_pre))
-    (fun args mem h_pre => dwp_mirStatefulTree_of_transPlan (h_spec args mem h_pre))
+    (fun args mem h_pre => dwp_mirStatefulTreeWithCallees_of_transPlan (h_impl args mem h_pre))
+    (fun args mem h_pre => dwp_mirStatefulTreeWithCallees_of_transPlan (h_spec args mem h_pre))
 
 end Anneal.FunctionalTranslation
 

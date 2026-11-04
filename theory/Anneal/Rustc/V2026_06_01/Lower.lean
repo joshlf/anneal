@@ -221,7 +221,7 @@ theorem verifyByDWLP
     (h_dwlp :
       ∀ args : List Value,
         c.pre args →
-        DWLP mirDefaultWP (mirCallTree c.body args)
+        DWLP mirDefaultWP (mirCallTreeWithCallees c.body args c.callees)
           (fun out _ =>
             ∀ retVal mem', out = .normal (retVal, mem') → c.post args retVal)
           PUnit.unit) :
@@ -237,11 +237,30 @@ theorem verifyMirBounded
     (h_wp :
       ∀ args : List Value,
         c.pre args →
-        wpMirBounded fuel c.body (initMachineState c.body args)
+        wpMirBounded fuel c.body
+          (initMachineStateWithCallees c.body args c.callees)
           (fun out =>
             ∀ retVal mem', out = .normal (retVal, mem') → c.post args retVal)) :
     VerificationResult c :=
   verifyByDWLP c (fun args h_pre => dwlp_cofix_of_wpCoalBounded (h_wp args h_pre))
+
+/-- Prove `MirBoolPredicateHoldsWithCallees specBody callees args` from `DWP mirDefaultWP`. -/
+theorem mirBoolPredicateHoldsWithCallees_of_dwp
+    (specBody : CapturedMir) (callees : List CapturedMir) (args : List Value)
+    (h_dwp :
+      DWP mirDefaultWP (mirCallTreeWithCallees specBody args callees)
+        (fun out _ =>
+          ∀ retVal mem',
+            out = .normal (retVal, mem') →
+            retVal = .scalar { bits := 1, sizeBytes := 1 })
+        PUnit.unit) :
+    MirBoolPredicateHoldsWithCallees specBody callees args :=
+  (verifyByDWLP
+    { body := specBody
+      pre := (· = args)
+      post := fun _ ret => ret = .scalar { bits := 1, sizeBytes := 1 }
+      callees := callees }
+    (fun _ h_eq => h_eq ▸ h_dwp.toDWLP)).proof
 
 /-- Prove `MirBoolPredicateHolds specBody args` from `DWP mirDefaultWP`. -/
 theorem mirBoolPredicateHolds_of_dwp
@@ -254,11 +273,24 @@ theorem mirBoolPredicateHolds_of_dwp
             retVal = .scalar { bits := 1, sizeBytes := 1 })
         PUnit.unit) :
     MirBoolPredicateHolds specBody args :=
-  (verifyByDWLP
-    { body := specBody
-      pre := (· = args)
-      post := fun _ ret => ret = .scalar { bits := 1, sizeBytes := 1 } }
-    (fun _ h_eq => h_eq ▸ h_dwp.toDWLP)).proof
+  mirBoolPredicateHoldsWithCallees_of_dwp specBody .nil args h_dwp
+
+/-- Prove `MirBoolPredicateHoldsWithCallees specBody callees args` from `wpMirBounded`. -/
+theorem mirBoolPredicateHoldsWithCallees_of_bounded
+    (fuel : Nat)
+    (specBody : CapturedMir)
+    (callees : List CapturedMir)
+    (args : List Value)
+    (h_wp :
+      wpMirBounded fuel specBody
+        (initMachineStateWithCallees specBody args callees)
+        (fun out =>
+          ∀ retVal mem',
+            out = .normal (retVal, mem') →
+            retVal = .scalar { bits := 1, sizeBytes := 1 })) :
+    MirBoolPredicateHoldsWithCallees specBody callees args :=
+  mirBoolPredicateHoldsWithCallees_of_dwp
+    specBody callees args (dwp_cofix_of_wpCoalBounded fuel h_wp)
 
 /-- Prove `MirBoolPredicateHolds specBody args` from `wpMirBounded`. -/
 theorem mirBoolPredicateHolds_of_bounded
@@ -270,7 +302,7 @@ theorem mirBoolPredicateHolds_of_bounded
             out = .normal (retVal, mem') →
             retVal = .scalar { bits := 1, sizeBytes := 1 })) :
     MirBoolPredicateHolds specBody args :=
-  mirBoolPredicateHolds_of_dwp specBody args (dwp_cofix_of_wpCoalBounded fuel h_wp)
+  mirBoolPredicateHoldsWithCallees_of_bounded fuel specBody .nil args h_wp
 
 /-- Prove a stateful `StatefulVerificationResult c` from `DWLP mirDefaultWP`. -/
 theorem verifyStatefulByDWLP
@@ -278,7 +310,7 @@ theorem verifyStatefulByDWLP
     (h_dwlp :
       ∀ args mem,
         c.pre args mem →
-        DWLP mirDefaultWP (mirStatefulTree c.body args mem)
+        DWLP mirDefaultWP (mirStatefulTreeWithCallees c.body args mem c.callees)
           (fun out _ =>
             ∀ retVal mem',
               out = .normal (retVal, mem') → c.post args mem retVal mem')
@@ -295,7 +327,8 @@ theorem verifyStatefulMirBounded
     (h_wp :
       ∀ args mem,
         c.pre args mem →
-        wpMirBounded fuel c.body (initMachineStateWithMemory c.body args mem)
+        wpMirBounded fuel c.body
+          (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
           (fun out =>
             ∀ retVal mem',
               out = .normal (retVal, mem') → c.post args mem retVal mem')) :
@@ -309,7 +342,7 @@ theorem verifyTraceByDWLP
     (h_dwlp :
       ∀ args mem,
         c.pre args mem →
-        DWLP mirTraceWP (mirStatefulTree c.body args mem)
+        DWLP mirTraceWP (mirStatefulTreeWithCallees c.body args mem c.callees)
           (fun out tr => c.post args mem tr out) []) :
     TraceVerificationResult c := by
   refine ⟨fun args mem h_pre => ?_⟩
@@ -322,7 +355,8 @@ theorem verifyTraceMirBounded
     (h_wp :
       ∀ args mem,
         c.pre args mem →
-        wpMirTraceBounded fuel c.body (initMachineStateWithMemory c.body args mem)
+        wpMirTraceBounded fuel c.body
+          (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
           (fun tr out => c.post args mem tr out)) :
     TraceVerificationResult c :=
   verifyTraceByDWLP c
@@ -334,7 +368,7 @@ theorem verifyTotalByDWP
     (h_dwp :
       ∀ args mem,
         c.pre args mem →
-        DWP mirDefaultWP (mirStatefulTree c.body args mem)
+        DWP mirDefaultWP (mirStatefulTreeWithCallees c.body args mem c.callees)
           (fun out _ =>
             ∃ retVal mem',
               out = .normal (retVal, mem') ∧ c.post args mem retVal mem')
@@ -348,7 +382,8 @@ theorem verifyTotalMirBounded
     (h_wp :
       ∀ args mem,
         c.pre args mem →
-        wpMirBounded fuel c.body (initMachineStateWithMemory c.body args mem)
+        wpMirBounded fuel c.body
+          (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
           (fun out =>
             ∃ retVal mem',
               out = .normal (retVal, mem') ∧ c.post args mem retVal mem')) :
@@ -379,6 +414,38 @@ private theorem handleMirExternalCalls_links_modularWP
   | .inr (.inr (.call req)), Q, .unit, h_wp => h_env req Q h_wp.1 h_wp.2
 
 /--
+Prove a `ModularVerificationResult` with linked `callees` against
+`envSatisfiesContract C` from `DWLP (mirModularWP C)` by linking
+`handleMirExternalCalls` via `dwlp_interp`.
+-/
+theorem verifyModularWithCalleesByDWLP
+    (C : CallContract MirCallReq (fun _ => MirCallAns))
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (h_dwlp :
+      ∀ args mem,
+        pre args mem →
+        DWLP (mirModularWP C)
+          (mirStatefulTreeWithCallees body args mem callees)
+          (fun out _ =>
+            ∀ retVal mem',
+              out = .normal (retVal, mem') → post args mem retVal mem')
+          PUnit.unit) :
+    ModularVerificationResult
+      { body, envAssumed := envSatisfiesContract C, pre, post, callees } := by
+  refine ⟨fun h h_env args mem h_pre => ?_⟩
+  have h_interp :=
+    dwlp_interp
+      (handleMirExternalCalls h)
+      (handleMirExternalCalls_links_modularWP C h h_env)
+      (h_dwlp args mem h_pre)
+  have h_adeq := dwlp_pure_adequacy h_interp
+  exact ⟨h_adeq.1, fun outPair h_ret _ retVal mem' h_out =>
+    h_adeq.2 outPair.1 outPair.2 h_ret retVal mem' h_out⟩
+
+/--
 Prove a `ModularVerificationResult` against `envSatisfiesContract C` from
 `DWLP (mirModularWP C)` by linking `handleMirExternalCalls` via `dwlp_interp`.
 -/
@@ -396,16 +463,29 @@ theorem verifyModularByDWLP
               out = .normal (retVal, mem') → post args mem retVal mem')
           PUnit.unit) :
     ModularVerificationResult
-      { body, envAssumed := envSatisfiesContract C, pre, post } := by
-  refine ⟨fun h h_env args mem h_pre => ?_⟩
-  have h_interp :=
-    dwlp_interp
-      (handleMirExternalCalls h)
-      (handleMirExternalCalls_links_modularWP C h h_env)
-      (h_dwlp args mem h_pre)
-  have h_adeq := dwlp_pure_adequacy h_interp
-  exact ⟨h_adeq.1, fun outPair h_ret _ retVal mem' h_out =>
-    h_adeq.2 outPair.1 outPair.2 h_ret retVal mem' h_out⟩
+      { body, envAssumed := envSatisfiesContract C, pre, post } :=
+  verifyModularWithCalleesByDWLP C body .nil pre post h_dwlp
+
+/-- Prove a `ModularVerificationResult` with linked `callees` from `wpMirModularBounded`. -/
+theorem verifyModularWithCalleesMirBounded
+    (C : CallContract MirCallReq (fun _ => MirCallAns))
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ args mem,
+        pre args mem →
+        wpMirModularBounded fuel C body
+          (initMachineStateWithMemoryAndCallees body args mem callees)
+          (fun out =>
+            ∀ retVal mem',
+              out = .normal (retVal, mem') → post args mem retVal mem')) :
+    ModularVerificationResult
+      { body, envAssumed := envSatisfiesContract C, pre, post, callees } :=
+  verifyModularWithCalleesByDWLP C body callees pre post
+    (fun args mem h_pre => dwlp_cofix_of_wpCoalBounded (h_wp args mem h_pre))
 
 /-- Prove a `ModularVerificationResult` from `wpMirModularBounded`. -/
 theorem verifyModularMirBounded
@@ -424,8 +504,7 @@ theorem verifyModularMirBounded
               out = .normal (retVal, mem') → post args mem retVal mem')) :
     ModularVerificationResult
       { body, envAssumed := envSatisfiesContract C, pre, post } :=
-  verifyModularByDWLP C body pre post
-    (fun args mem h_pre => dwlp_cofix_of_wpCoalBounded (h_wp args mem h_pre))
+  verifyModularWithCalleesMirBounded C body .nil pre post fuel h_wp
 
 private theorem dwlp_ubWaived_reaches
     {t u : ITree MirEffect MirOutcome} {tr : List (Event MirEffect)}
@@ -474,7 +553,7 @@ theorem verifyUbExceptionByDWLP
       ∀ args mem,
         c.pre args mem →
         c.strictSafetyPre args mem →
-        DWLP mirDefaultWP (mirStatefulTree c.body args mem)
+        DWLP mirDefaultWP (mirStatefulTreeWithCallees c.body args mem c.callees)
           (fun out _ =>
             ∀ retVal mem',
               out = .normal (retVal, mem') → c.post args mem retVal mem')
@@ -482,7 +561,7 @@ theorem verifyUbExceptionByDWLP
     (h_waived :
       ∀ args mem,
         c.pre args mem →
-        DWLP mirUbWaivedWP (mirStatefulTree c.body args mem)
+        DWLP mirUbWaivedWP (mirStatefulTreeWithCallees c.body args mem c.callees)
           (fun out _ =>
             ∀ retVal mem',
               out = .normal (retVal, mem') → c.post args mem retVal mem')
@@ -508,14 +587,16 @@ theorem verifyUbExceptionMirBounded
       ∀ args mem,
         c.pre args mem →
         c.strictSafetyPre args mem →
-        wpMirBounded fuel c.body (initMachineStateWithMemory c.body args mem)
+        wpMirBounded fuel c.body
+          (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
           (fun out =>
             ∀ retVal mem',
               out = .normal (retVal, mem') → c.post args mem retVal mem'))
     (h_waived :
       ∀ args mem,
         c.pre args mem →
-        wpMirUbWaivedBounded fuel c.body (initMachineStateWithMemory c.body args mem)
+        wpMirUbWaivedBounded fuel c.body
+          (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
           (fun out =>
             ∀ retVal mem',
               out = .normal (retVal, mem') → c.post args mem retVal mem')) :
@@ -583,6 +664,31 @@ theorem envSatisfiesContract_of_holdsOn
     (fun tr ans h_r => h_post_imp ans (h_ret tr ans h_r))
 
 /--
+Prove a `ModularVerificationResult` with linked `callees` against `C.holdsOn`
+(`MirCallContract`) from `DWLP (mirModularWP C.toCallContract)`.
+-/
+theorem verifyModularContractWithCalleesByDWLP
+    (C : MirCallContract)
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (h_dwlp :
+      ∀ args mem,
+        pre args mem →
+        DWLP (mirModularWP C.toCallContract)
+          (mirStatefulTreeWithCallees body args mem callees)
+          (fun out _ =>
+            ∀ retVal mem',
+              out = .normal (retVal, mem') → post args mem retVal mem')
+          PUnit.unit) :
+    ModularVerificationResult
+      { body, envAssumed := C.holdsOn, pre, post, callees } :=
+  ⟨fun h h_on =>
+    (verifyModularWithCalleesByDWLP C.toCallContract body callees pre post h_dwlp).proof
+      h (envSatisfiesContract_of_holdsOn C h h_on)⟩
+
+/--
 Prove a `ModularVerificationResult` against `C.holdsOn` (`MirCallContract`) from
 `DWLP (mirModularWP C.toCallContract)`.
 -/
@@ -601,9 +707,31 @@ theorem verifyModularContractByDWLP
           PUnit.unit) :
     ModularVerificationResult
       { body, envAssumed := C.holdsOn, pre, post } :=
-  ⟨fun h h_on =>
-    (verifyModularByDWLP C.toCallContract body pre post h_dwlp).proof
-      h (envSatisfiesContract_of_holdsOn C h h_on)⟩
+  verifyModularContractWithCalleesByDWLP C body .nil pre post h_dwlp
+
+/--
+Prove a `ModularVerificationResult` with linked `callees` against `C.holdsOn`
+(`MirCallContract`) from fuel-bounded `wpMirModularBounded`.
+-/
+theorem verifyModularContractWithCalleesMirBounded
+    (C : MirCallContract)
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ args mem,
+        pre args mem →
+        wpMirModularBounded fuel C.toCallContract body
+          (initMachineStateWithMemoryAndCallees body args mem callees)
+          (fun out =>
+            ∀ retVal mem',
+              out = .normal (retVal, mem') → post args mem retVal mem')) :
+    ModularVerificationResult
+      { body, envAssumed := C.holdsOn, pre, post, callees } :=
+  verifyModularContractWithCalleesByDWLP C body callees pre post
+    (fun args mem h_pre => dwlp_cofix_of_wpCoalBounded (h_wp args mem h_pre))
 
 /--
 Prove a `ModularVerificationResult` against `C.holdsOn` (`MirCallContract`) from
@@ -625,8 +753,7 @@ theorem verifyModularContractMirBounded
               out = .normal (retVal, mem') → post args mem retVal mem')) :
     ModularVerificationResult
       { body, envAssumed := C.holdsOn, pre, post } :=
-  verifyModularContractByDWLP C body pre post
-    (fun args mem h_pre => dwlp_cofix_of_wpCoalBounded (h_wp args mem h_pre))
+  verifyModularContractWithCalleesMirBounded C body .nil pre post fuel h_wp
 
 /-! ## 3. Horizontal Caller–Callee Linking via `ITree.interp` -/
 
@@ -792,7 +919,10 @@ theorem holdsOn_ubExceptionModelHandler
       ∀ args mem,
         c.pre args mem →
         (∀ tr retVal mem',
-          ReachesRet (mirStatefulTree c.body args mem) tr (.normal (retVal, mem')) →
+          ReachesRet
+            (mirStatefulTreeWithCallees c.body args mem c.callees)
+            tr
+            (.normal (retVal, mem')) →
           c.post args mem retVal mem') →
         c.post args mem (excModel args mem).1 (excModel args mem).2) :
     c.callContract.holdsOn (ubExceptionModelHandler c excModel fallback) := by
@@ -834,15 +964,19 @@ theorem linkUbExceptionCallee
       ∀ args mem,
         c.pre args mem →
         (∀ tr retVal mem',
-          ReachesRet (mirStatefulTree c.body args mem) tr (.normal (retVal, mem')) →
+          ReachesRet
+            (mirStatefulTreeWithCallees c.body args mem c.callees)
+            tr
+            (.normal (retVal, mem')) →
           c.post args mem retVal mem') →
         c.post args mem (excModel args mem).1 (excModel args mem).2) :
     ((fun args mem =>
       (mirHandledTree callerBody args mem
         (ubExceptionModelHandler c excModel fallback)).toPartial) ≤
       MirClosedStatefulContractSpec pre pre post) ∧
-    MirStatefulContractHoldsWithSafety
+    MirStatefulContractHoldsWithSafetyAndCallees
       c.body
+      c.callees
       (fun args mem => c.pre args mem ∧ c.strictSafetyPre args mem)
       c.pre
       c.post :=
@@ -965,19 +1099,25 @@ theorem verifyStatefulEquivByWeakRefAndTotal
       ∀ args mem,
         c.pre args mem →
         WeakRef
-          (mirObsErasedStatefulTree c.implBody args mem)
-          (mirObsErasedStatefulTree c.specBody args mem))
+          (mirObsErasedStatefulTreeWithCallees c.implBody args mem c.implCallees)
+          (mirObsErasedStatefulTreeWithCallees c.specBody args mem c.specCallees))
     (h_total :
       ∀ args mem,
         c.pre args mem →
-        DWP mirDefaultWP (mirStatefulTree c.implBody args mem)
+        DWP mirDefaultWP
+          (mirStatefulTreeWithCallees c.implBody args mem c.implCallees)
           (fun out _ =>
             ∃ retVal mem',
               out = .normal (retVal, mem') ∧ c.post args mem retVal mem')
           PUnit.unit) :
     StatefulEquivVerificationResult c :=
   ⟨⟨fun args mem h_pre => WeakRef.toPartial_le (h_ref args mem h_pre),
-    (verifyTotalByDWP { body := c.implBody, pre := c.pre, post := c.post } h_total).proof⟩⟩
+    (verifyTotalByDWP
+      { body := c.implBody
+        pre := c.pre
+        post := c.post
+        callees := c.implCallees }
+      h_total).proof⟩⟩
 
 /--
 Relational pure-model equivalence bridge (`verifyStatefulEquivViaPureModel`):
@@ -995,7 +1135,8 @@ theorem verifyStatefulEquivViaPureModel
     (h_impl :
       ∀ args mem,
         c.pre args mem →
-        DWP mirNoCallWP (mirStatefulTree c.implBody args mem)
+        DWP mirNoCallWP
+          (mirStatefulTreeWithCallees c.implBody args mem c.implCallees)
           (fun out _ =>
             out = .normal (model args mem) ∧
             c.post args mem (model args mem).1 (model args mem).2)
@@ -1003,7 +1144,8 @@ theorem verifyStatefulEquivViaPureModel
     (h_spec :
       ∀ args mem,
         c.pre args mem →
-        DWP mirNoCallWP (mirStatefulTree c.specBody args mem)
+        DWP mirNoCallWP
+          (mirStatefulTreeWithCallees c.specBody args mem c.specCallees)
           (fun out _ => out = .normal (model args mem))
           PUnit.unit) :
     StatefulEquivVerificationResult c := by
@@ -1040,7 +1182,7 @@ theorem verifyStatefulEquivMirBounded
       ∀ args mem,
         c.pre args mem →
         wpMirNoCallBounded implFuel c.implBody
-          (initMachineStateWithMemory c.implBody args mem)
+          (initMachineStateWithMemoryAndCallees c.implBody args mem c.implCallees)
           (fun out =>
             out = .normal (model args mem) ∧
             c.post args mem (model args mem).1 (model args mem).2))
@@ -1048,7 +1190,7 @@ theorem verifyStatefulEquivMirBounded
       ∀ args mem,
         c.pre args mem →
         wpMirNoCallBounded specFuel c.specBody
-          (initMachineStateWithMemory c.specBody args mem)
+          (initMachineStateWithMemoryAndCallees c.specBody args mem c.specCallees)
           (fun out => out = .normal (model args mem))) :
     StatefulEquivVerificationResult c :=
   verifyStatefulEquivViaPureModel c model

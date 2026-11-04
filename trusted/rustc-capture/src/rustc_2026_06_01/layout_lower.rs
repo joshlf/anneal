@@ -843,6 +843,36 @@ pub fn lower_fn_abi<'tcx>(abi: &FnAbi<'tcx, Ty<'tcx>>) -> IrFnAbi {
     }
 }
 
+/// Extracts the calling convention and unwind capability declared on `def_id`
+/// (including foreign `extern "C"` items and generic functions).
+pub fn extract_fn_conv_and_unwind<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    typing_env: TypingEnv<'tcx>,
+) -> Option<(IrCallConv, bool)> {
+    if !tcx.def_kind(def_id).is_fn_like() {
+        return None;
+    }
+    let generics = tcx.generics_of(def_id);
+    if generics.count() == 0 {
+        let instance = Instance::mono(tcx, def_id);
+        let query_input = typing_env.as_query_input((instance, ty::List::empty()));
+        if let Ok(fn_abi) = tcx.fn_abi_of_instance(query_input) {
+            return Some((lower_canon_abi(fn_abi.conv), fn_abi.can_unwind));
+        }
+    }
+    let abi = tcx.fn_sig(def_id).skip_binder().abi();
+    let can_unwind = matches!(
+        abi,
+        ExternAbi::Rust
+            | ExternAbi::RustCall
+            | ExternAbi::RustCold
+            | ExternAbi::C { unwind: true }
+            | ExternAbi::System { unwind: true }
+    );
+    Some((lower_extern_abi(abi), can_unwind))
+}
+
 /// Queries `tcx.fn_abi_of_instance` for a monomorphic function `def_id`, or
 /// synthesizes a fallback `IrFnAbi` from the MIR local declarations when the
 /// item is a constant, static, or generic function with uninstantiated type
@@ -863,6 +893,8 @@ pub fn extract_fn_abi_for_body<'tcx>(
         }
     }
 
+    let (conv, can_unwind) =
+        extract_fn_conv_and_unwind(tcx, def_id, typing_env).unwrap_or((IrCallConv::Rust, true));
     let ret_layout = local_layouts
         .first()
         .cloned()
@@ -885,8 +917,8 @@ pub fn extract_fn_abi_for_body<'tcx>(
     IrFnAbi {
         args,
         ret,
-        conv: IrCallConv::Rust,
-        can_unwind: true,
+        conv,
+        can_unwind,
     }
 }
 

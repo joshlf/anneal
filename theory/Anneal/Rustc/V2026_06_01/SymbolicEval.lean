@@ -145,7 +145,8 @@ theorem mirContractHolds_iff_dwlp
           (fun out _ =>
             ∀ retVal mem', out = .normal (retVal, mem') → post args retVal)
           PUnit.unit := by
-  rw [MirContractHolds, mirContractHoldsWithSafety_iff_dwlp]
+  rw [MirContractHolds, MirContractHoldsWithCallees, ← MirContractHoldsWithSafety,
+    mirContractHoldsWithSafety_iff_dwlp]
   constructor
   · intro h args h_pre
     exact DWLP.mono (fun _ _ hf => hf h_pre) (h args h_pre)
@@ -184,7 +185,8 @@ theorem mirBoolPredicateHolds_iff_dwlp
             out = .normal (retVal, mem') →
             retVal = .scalar { bits := 1, sizeBytes := 1 })
         PUnit.unit := by
-  rw [MirBoolPredicateHolds, mirContractHolds_iff_dwlp]
+  rw [MirBoolPredicateHolds, MirBoolPredicateHoldsWithCallees, ← MirContractHolds,
+    mirContractHolds_iff_dwlp]
   exact ⟨fun h => h args rfl, fun h _ h_eq => h_eq ▸ h⟩
 
 /-- Exact `DWLP mirDefaultWP` characterization of `MirStatefulContractHoldsWithSafety`. -/
@@ -225,7 +227,8 @@ theorem mirStatefulContractHolds_iff_dwlp
             ∀ retVal mem',
               out = .normal (retVal, mem') → post args mem retVal mem')
           PUnit.unit := by
-  rw [MirStatefulContractHolds, mirStatefulContractHoldsWithSafety_iff_dwlp]
+  rw [MirStatefulContractHolds, MirStatefulContractHoldsWithCallees,
+    ← MirStatefulContractHoldsWithSafety, mirStatefulContractHoldsWithSafety_iff_dwlp]
   constructor
   · intro h args mem h_pre
     exact DWLP.mono (fun _ _ hf => hf h_pre) (h args mem h_pre)
@@ -1890,10 +1893,25 @@ def checkMirBoolExecBounded
     | .vis (.inr (.inl _)) k => checkMirBoolExecBounded fuel' body (k PUnit.unit)
     | .vis (.inr (.inr _)) _ => false
 
+/--
+Computable bounded boolean checker for `MirBoolPredicateHoldsWithCallees`:
+returns `true` when `specBody` halts normally with `true` (`.scalar ⟨1, 1⟩`) or
+unwinds safely within `fuel` steps with linked `callees`.
+-/
+def checkMirBoolWithCalleesBounded
+    (fuel : Nat)
+    (specBody : CapturedMir)
+    (callees : List CapturedMir)
+    (args : List Value) : Bool :=
+  checkMirBoolExecBounded
+    fuel
+    specBody
+    (.running (initMachineStateWithCallees specBody args callees))
+
 /-- Computable bounded boolean checker for `MirBoolPredicateHolds specBody args`. -/
 def checkMirBoolBounded
     (fuel : Nat) (specBody : CapturedMir) (args : List Value) : Bool :=
-  checkMirBoolExecBounded fuel specBody (.running (initMachineState specBody args))
+  checkMirBoolWithCalleesBounded fuel specBody .nil args
 
 private theorem wpCoalBounded_of_checkMirBoolExecBounded
     (fuel : Nat) (body : CapturedMir) (st : MirExecState)
@@ -1949,6 +1967,23 @@ private theorem wpCoalBounded_of_checkMirBoolExecBounded
       · nomatch h
 
 /--
+Discharge `MirBoolPredicateHoldsWithCallees specBody callees args` on concrete
+inputs by kernel `rfl`
+(`checkMirBoolWithCalleesBounded fuel specBody callees args = true`).
+-/
+theorem mirBoolPredicateHoldsWithCallees_of_checkBounded
+    (fuel : Nat)
+    (specBody : CapturedMir)
+    (callees : List CapturedMir)
+    (args : List Value)
+    (h :
+      checkMirBoolWithCalleesBounded fuel specBody callees args = true := by
+        rfl) :
+    MirBoolPredicateHoldsWithCallees specBody callees args :=
+  mirBoolPredicateHoldsWithCallees_of_bounded fuel specBody callees args
+    (wpCoalBounded_of_checkMirBoolExecBounded fuel specBody _ h)
+
+/--
 Discharge `MirBoolPredicateHolds specBody args` on concrete inputs by kernel
 `rfl` (`checkMirBoolBounded fuel specBody args = true`).
 -/
@@ -1956,8 +1991,7 @@ theorem mirBoolPredicateHolds_of_checkBounded
     (fuel : Nat) (specBody : CapturedMir) (args : List Value)
     (h : checkMirBoolBounded fuel specBody args = true := by rfl) :
     MirBoolPredicateHolds specBody args :=
-  mirBoolPredicateHolds_of_bounded fuel specBody args
-    (wpCoalBounded_of_checkMirBoolExecBounded fuel specBody _ h)
+  mirBoolPredicateHoldsWithCallees_of_checkBounded fuel specBody .nil args h
 
 /-- Compatibility alias used by Tutor proof modules (`rfl`-discharged). -/
 abbrev mirBoolPredicateHolds_of_wp_bounded :=
@@ -2046,7 +2080,8 @@ theorem verifyMirSafeSym
     (h_wp :
       ∀ args : List Value,
         c.pre args →
-        wpMirSym fuel c.body (initMachineState c.body args)
+        wpMirSym fuel c.body
+          (initMachineStateWithCallees c.body args c.callees)
           (mirSafePost (fun retVal _ => c.post args retVal))) :
     VerificationResult c := by
   refine verifyMirBounded c fuel (fun args h_pre => ?_)
@@ -2071,7 +2106,8 @@ theorem verifyMirNoPanicSym
     (h_wp :
       ∀ args : List Value,
         c.pre args →
-        wpMirSym fuel c.body (initMachineState c.body args)
+        wpMirSym fuel c.body
+          (initMachineStateWithCallees c.body args c.callees)
           (mirNormalPost (fun retVal _ => c.post args retVal))) :
     VerificationResult c :=
   verifyMirSafeSym c fuel (fun args h_pre =>
@@ -2090,7 +2126,8 @@ theorem dischargeStatelessEq
     (expectedArgs : List Value)
     (h_pre : ∀ args : List Value, c.pre args → args = expectedArgs)
     (h_eval :
-      wpMirSym fuel c.body (initMachineState c.body expectedArgs)
+      wpMirSym fuel c.body
+        (initMachineStateWithCallees c.body expectedArgs c.callees)
         (mirNormalPost (fun retVal _ => c.post expectedArgs retVal))) :
     VerificationResult c :=
   verifyMirNoPanicSym c fuel (fun args hp => by
@@ -2107,7 +2144,8 @@ theorem verifyTotalMirSym
     (h_wp :
       ∀ (args : List Value) (mem : Memory),
         c.pre args mem →
-        wpMirSym fuel c.body (initMachineStateWithMemory c.body args mem)
+        wpMirSym fuel c.body
+          (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
           (mirNormalPost (c.post args mem))) :
     TotalVerificationResult c := by
   refine verifyTotalMirBounded c fuel (fun args mem h_pre => ?_)
@@ -2125,7 +2163,8 @@ theorem verifyStatefulMirSym
     (h_wp :
       ∀ (args : List Value) (mem : Memory),
         c.pre args mem →
-        wpMirSym fuel c.body (initMachineStateWithMemory c.body args mem)
+        wpMirSym fuel c.body
+          (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
           (mirSafePost (c.post args mem))) :
     StatefulVerificationResult c := by
   refine verifyStatefulMirBounded c fuel (fun args mem h_pre => ?_)
@@ -2143,7 +2182,8 @@ theorem verifyStatefulMirNoPanicSym
     (h_wp :
       ∀ (args : List Value) (mem : Memory),
         c.pre args mem →
-        wpMirSym fuel c.body (initMachineStateWithMemory c.body args mem)
+        wpMirSym fuel c.body
+          (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
           (mirNormalPost (c.post args mem))) :
     StatefulVerificationResult c :=
   verifyStatefulMirSym c fuel (fun args mem h_pre =>
@@ -2163,7 +2203,7 @@ theorem dischargeStatefulEq
         c.pre args mem → args = expectedArgs ∧ mem = expectedMem)
     (h_eval :
       wpMirSym fuel c.body
-        (initMachineStateWithMemory c.body expectedArgs expectedMem)
+        (initMachineStateWithMemoryAndCallees c.body expectedArgs expectedMem c.callees)
         (mirNormalPost (c.post expectedArgs expectedMem))) :
     StatefulVerificationResult c :=
   verifyStatefulMirNoPanicSym c fuel (fun args mem hp => by
@@ -2196,7 +2236,9 @@ theorem verifyWellTypedScalarArg1
         b < scalarModulus width →
         c.pre [.scalar { bits := b, sizeBytes := width }] →
         wpMirSym fuel c.body
-          (initMachineState c.body [.scalar { bits := b, sizeBytes := width }])
+          (initMachineStateWithCallees c.body
+            [.scalar { bits := b, sizeBytes := width }]
+            c.callees)
           (mirNormalPost
             (fun retVal _ =>
               c.post [.scalar { bits := b, sizeBytes := width }] retVal))) :
@@ -2214,7 +2256,9 @@ theorem verifyWellTypedSafeScalarArg1
         b < scalarModulus width →
         c.pre [.scalar { bits := b, sizeBytes := width }] →
         wpMirSym fuel c.body
-          (initMachineState c.body [.scalar { bits := b, sizeBytes := width }])
+          (initMachineStateWithCallees c.body
+            [.scalar { bits := b, sizeBytes := width }]
+            c.callees)
           (mirSafePost
             (fun retVal _ =>
               c.post [.scalar { bits := b, sizeBytes := width }] retVal))) :
@@ -2235,9 +2279,10 @@ theorem verifyWellTypedScalarArg2
           [ .scalar { bits := b1, sizeBytes := w1 }
           , .scalar { bits := b2, sizeBytes := w2 } ] →
         wpMirSym fuel c.body
-          (initMachineState c.body
+          (initMachineStateWithCallees c.body
             [ .scalar { bits := b1, sizeBytes := w1 }
-            , .scalar { bits := b2, sizeBytes := w2 } ])
+            , .scalar { bits := b2, sizeBytes := w2 } ]
+            c.callees)
           (mirNormalPost
             (fun retVal _ =>
               c.post
@@ -2250,6 +2295,32 @@ theorem verifyWellTypedScalarArg2
     exact h_sym b1 b2 hb1 hb2 hp)
 
 /--
+Computable check that `subjectBody` evaluates on `args` with `callees` within
+`subjectFuel` steps to a normal return value `retVal` for which
+`checkMirBoolWithCalleesBounded specFuel ensBody callees (args ++ [retVal])`
+holds.
+-/
+def checkMirRustPinnedSpecWithCallees
+    (subjectFuel specFuel : Nat)
+    (subjectBody ensBody : CapturedMir)
+    (callees : List CapturedMir)
+    (args : List Value) : Bool :=
+  let rec loop (fuel : Nat) (st : MirExecState) : Bool :=
+    match fuel with
+    | 0 => false
+    | fuel' + 1 =>
+      match stepMirState subjectBody st with
+      | .ret (.normal (retVal, _)) =>
+        checkMirBoolWithCalleesBounded specFuel ensBody callees (args ++ [retVal])
+      | .ret .panic => false
+      | .ret .abort => false
+      | .tau st' => loop fuel' st'
+      | .vis (.inl _) _ => false
+      | .vis (.inr (.inl _)) k => loop fuel' (k PUnit.unit)
+      | .vis (.inr (.inr _)) _ => false
+  loop subjectFuel (.running (initMachineStateWithCallees subjectBody args callees))
+
+/--
 Computable check that `body` evaluates on `args` within `fuel` steps to a normal
 return value `retVal` for which `checkMirBoolBounded specFuel ensBody (args ++ [retVal])`
 holds.
@@ -2258,41 +2329,32 @@ def checkMirRustPinnedSpec
     (subjectFuel specFuel : Nat)
     (subjectBody ensBody : CapturedMir)
     (args : List Value) : Bool :=
-  let rec loop (fuel : Nat) (st : MirExecState) : Bool :=
-    match fuel with
-    | 0 => false
-    | fuel' + 1 =>
-      match stepMirState subjectBody st with
-      | .ret (.normal (retVal, _)) =>
-        checkMirBoolBounded specFuel ensBody (args ++ [retVal])
-      | .ret .panic => false
-      | .ret .abort => false
-      | .tau st' => loop fuel' st'
-      | .vis (.inl _) _ => false
-      | .vis (.inr (.inl _)) k => loop fuel' (k PUnit.unit)
-      | .vis (.inr (.inr _)) _ => false
-  loop subjectFuel (.running (initMachineState subjectBody args))
+  checkMirRustPinnedSpecWithCallees subjectFuel specFuel subjectBody ensBody .nil args
 
-theorem wpMirBounded_of_checkMirRustPinnedSpec
+theorem wpMirBounded_of_checkMirRustPinnedSpecWithCallees
     (subjectFuel specFuel : Nat)
     (subjectBody ensBody : CapturedMir)
+    (callees : List CapturedMir)
     (args : List Value)
     (h_ok :
-      checkMirRustPinnedSpec subjectFuel specFuel subjectBody ensBody args = true) :
-    wpMirBounded subjectFuel subjectBody (initMachineState subjectBody args)
+      checkMirRustPinnedSpecWithCallees
+        subjectFuel specFuel subjectBody ensBody callees args = true) :
+    wpMirBounded subjectFuel subjectBody
+      (initMachineStateWithCallees subjectBody args callees)
       (fun out =>
         ∀ retVal mem',
           out = .normal (retVal, mem') →
-          MirBoolPredicateHolds ensBody (args ++ [retVal])) := by
-  unfold checkMirRustPinnedSpec at h_ok
+          MirBoolPredicateHoldsWithCallees ensBody callees (args ++ [retVal])) := by
+  unfold checkMirRustPinnedSpecWithCallees at h_ok
   unfold wpMirBounded
   suffices ∀ (fuel : Nat) (st : MirExecState),
-      checkMirRustPinnedSpec.loop specFuel subjectBody ensBody args fuel st = true →
+      checkMirRustPinnedSpecWithCallees.loop
+        specFuel subjectBody ensBody callees args fuel st = true →
       wpCoalBounded fuel mirDefaultWP (stepMirState subjectBody)
         (fun out _ =>
           ∀ retVal mem',
             out = .normal (retVal, mem') →
-            MirBoolPredicateHolds ensBody (args ++ [retVal]))
+            MirBoolPredicateHoldsWithCallees ensBody callees (args ++ [retVal]))
         st PUnit.unit from
     this subjectFuel _ h_ok
   intro fuel
@@ -2300,7 +2362,7 @@ theorem wpMirBounded_of_checkMirRustPinnedSpec
   | zero => intro _ h; nomatch h
   | succ fuel' ih =>
     intro st h
-    unfold checkMirRustPinnedSpec.loop at h
+    unfold checkMirRustPinnedSpecWithCallees.loop at h
     unfold wpCoalBounded
     cases h_step : stepMirState subjectBody st with
     | ret out =>
@@ -2311,8 +2373,8 @@ theorem wpMirBounded_of_checkMirRustPinnedSpec
         intro retVal mem' h_eq
         injection h_eq with h_pair
         cases h_pair
-        exact mirBoolPredicateHolds_of_checkBounded specFuel ensBody
-          (args ++ [rv]) h
+        exact mirBoolPredicateHoldsWithCallees_of_checkBounded specFuel ensBody
+          callees (args ++ [rv]) h
       | panic => nomatch h
       | abort => nomatch h
     | tau st' =>
@@ -2325,6 +2387,20 @@ theorem wpMirBounded_of_checkMirRustPinnedSpec
       · cases e
         exact ih (k PUnit.unit) h
       · nomatch h
+
+theorem wpMirBounded_of_checkMirRustPinnedSpec
+    (subjectFuel specFuel : Nat)
+    (subjectBody ensBody : CapturedMir)
+    (args : List Value)
+    (h_ok :
+      checkMirRustPinnedSpec subjectFuel specFuel subjectBody ensBody args = true) :
+    wpMirBounded subjectFuel subjectBody (initMachineState subjectBody args)
+      (fun out =>
+        ∀ retVal mem',
+          out = .normal (retVal, mem') →
+          MirBoolPredicateHolds ensBody (args ++ [retVal])) :=
+  wpMirBounded_of_checkMirRustPinnedSpecWithCallees
+    subjectFuel specFuel subjectBody ensBody .nil args h_ok
 
 /-! ## 8. Bounded UB Counterexample / Claim Refutation & Non-Vacuity Witnesses -/
 
@@ -2420,6 +2496,28 @@ theorem reachesFaultBounded_not_treeSafe
   reachesFaultExecBounded_not_treeSafe fuel body (.running s) h_fault
 
 /--
+Refute `MirContractHoldsWithSafetyAndCallees` by exhibiting a concrete input
+`args` in `safetyPre` whose bounded execution hits a fault within `fuel` steps.
+-/
+theorem refuteMirContractWithSafetyAndCalleesByBoundedUB
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {safetyPre pre : List Value → Prop}
+    {post : List Value → Value → Prop}
+    (fuel : Nat)
+    (args : List Value)
+    (h_safe_pre : safetyPre args)
+    (h_ub :
+      reachesFaultBounded fuel body
+        (initMachineStateWithCallees body args callees) = true := by
+      rfl) :
+    ¬ MirContractHoldsWithSafetyAndCallees body callees safetyPre pre post := by
+  intro h_holds
+  rcases h_holds args h_safe_pre with ⟨h_tree_safe, _⟩
+  exact reachesFaultBounded_not_treeSafe fuel body
+    (initMachineStateWithCallees body args callees) h_ub h_tree_safe
+
+/--
 Refute `MirContractHoldsWithSafety` by exhibiting a concrete input `args` in
 `safetyPre` whose bounded execution hits a fault within `fuel` steps.
 -/
@@ -2433,11 +2531,8 @@ theorem refuteMirContractWithSafetyByBoundedUB
     (h_ub :
       reachesFaultBounded fuel body (initMachineState body args) = true := by
       rfl) :
-    ¬ MirContractHoldsWithSafety body safetyPre pre post := by
-  intro h_holds
-  rcases h_holds args h_safe_pre with ⟨h_tree_safe, _⟩
-  exact reachesFaultBounded_not_treeSafe fuel body
-    (initMachineState body args) h_ub h_tree_safe
+    ¬ MirContractHoldsWithSafety body safetyPre pre post :=
+  refuteMirContractWithSafetyAndCalleesByBoundedUB fuel args h_safe_pre h_ub
 
 /--
 Refute a stateless `c : Claim` (`¬ c.holds`) by exhibiting a concrete input
@@ -2450,10 +2545,11 @@ theorem refuteClaimByBoundedUB
     (args : List Value)
     (h_pre : c.pre args)
     (h_ub :
-      reachesFaultBounded fuel c.body (initMachineState c.body args) = true := by
+      reachesFaultBounded fuel c.body
+        (initMachineStateWithCallees c.body args c.callees) = true := by
       rfl) :
     ¬ c.holds :=
-  refuteMirContractWithSafetyByBoundedUB fuel args h_pre h_ub
+  refuteMirContractWithSafetyAndCalleesByBoundedUB fuel args h_pre h_ub
 
 /--
 Refute a stateful `c : StatefulClaim` (`¬ c.holds`) by exhibiting a concrete
@@ -2468,13 +2564,13 @@ theorem refuteStatefulClaimByBoundedUB
     (h_pre : c.pre args mem)
     (h_ub :
       reachesFaultBounded fuel c.body
-        (initMachineStateWithMemory c.body args mem) = true := by
+        (initMachineStateWithMemoryAndCallees c.body args mem c.callees) = true := by
       rfl) :
     ¬ c.holds := by
   intro h_holds
   rcases h_holds args mem h_pre with ⟨h_tree_safe, _⟩
   exact reachesFaultBounded_not_treeSafe fuel c.body
-    (initMachineStateWithMemory c.body args mem) h_ub h_tree_safe
+    (initMachineStateWithMemoryAndCallees c.body args mem c.callees) h_ub h_tree_safe
 
 /--
 Refute a total-correctness `c : TotalClaim` (`¬ c.holds`) by exhibiting a
@@ -2489,13 +2585,13 @@ theorem refuteTotalClaimByBoundedUB
     (h_pre : c.pre args mem)
     (h_ub :
       reachesFaultBounded fuel c.body
-        (initMachineStateWithMemory c.body args mem) = true := by
+        (initMachineStateWithMemoryAndCallees c.body args mem c.callees) = true := by
       rfl) :
     ¬ c.holds := by
   intro h_holds
   have h_tree_safe := (h_holds args mem h_pre).1
   exact reachesFaultBounded_not_treeSafe fuel c.body
-    (initMachineStateWithMemory c.body args mem) h_ub h_tree_safe
+    (initMachineStateWithMemoryAndCallees c.body args mem c.callees) h_ub h_tree_safe
 
 /-- Package a concrete argument list `args` as a non-vacuity witness (`∃ a, pre a`). -/
 theorem proveNonVacuousPre
@@ -2650,7 +2746,7 @@ theorem verifyStatefulEquivMirSym
       ∀ (args : List Value) (mem : Memory),
         c.pre args mem →
         wpMirNoCallSym implFuel c.implBody
-          (initMachineStateWithMemory c.implBody args mem)
+          (initMachineStateWithMemoryAndCallees c.implBody args mem c.implCallees)
           (fun out =>
             out = .normal (model args mem) ∧
             c.post args mem (model args mem).1 (model args mem).2))
@@ -2658,7 +2754,7 @@ theorem verifyStatefulEquivMirSym
       ∀ (args : List Value) (mem : Memory),
         c.pre args mem →
         wpMirNoCallSym specFuel c.specBody
-          (initMachineStateWithMemory c.specBody args mem)
+          (initMachineStateWithMemoryAndCallees c.specBody args mem c.specCallees)
           (fun out => out = .normal (model args mem))) :
     StatefulEquivVerificationResult c := by
   refine verifyStatefulEquivMirBounded c implFuel specFuel model
@@ -2796,7 +2892,7 @@ theorem verifyUbExceptionMirSym
         c.pre args mem →
         c.strictSafetyPre args mem →
         wpMirSym fuel c.body
-          (initMachineStateWithMemory c.body args mem)
+          (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
           (fun out =>
             ∀ retVal mem', out = .normal (retVal, mem') →
               c.post args mem retVal mem'))
@@ -2804,7 +2900,7 @@ theorem verifyUbExceptionMirSym
       ∀ (args : List Value) (mem : Memory),
         c.pre args mem →
         wpMirUbWaivedSym fuel c.body
-          (initMachineStateWithMemory c.body args mem)
+          (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
           (fun out =>
             ∀ retVal mem', out = .normal (retVal, mem') →
               c.post args mem retVal mem')) :
@@ -2930,6 +3026,36 @@ theorem wpMirExecModularSym_eq_wpCoalBounded
         simp only [ih]
 
 /--
+Discharge a `ModularVerificationResult` with linked `callees` for `body` under
+`contract.holdsOn` via single-pass symbolic evaluation (`wpMirModularSym`).
+-/
+theorem verifyModularContractWithCalleesMirSym
+    (contract : MirCallContract)
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        wpMirModularSym contract fuel body
+          (initMachineStateWithMemoryAndCallees body args mem callees)
+          (fun out =>
+            ∀ retVal mem', out = .normal (retVal, mem') →
+              post args mem retVal mem')) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := contract.holdsOn
+        pre := pre
+        post := post
+        callees := callees } := by
+  refine verifyModularContractWithCalleesMirBounded contract body callees pre post fuel
+    (fun args mem h_pre => ?_)
+  rw [wpMirModularBounded, ← wpMirExecModularSym_eq_wpCoalBounded]
+  exact h_wp args mem h_pre
+
+/--
 Discharge a `ModularVerificationResult` for `body` under `contract.holdsOn` via
 single-pass symbolic evaluation (`wpMirModularSym`).
 -/
@@ -2951,11 +3077,8 @@ theorem verifyModularContractMirSym
       { body := body
         envAssumed := contract.holdsOn
         pre := pre
-        post := post } := by
-  refine verifyModularContractMirBounded contract body pre post fuel
-    (fun args mem h_pre => ?_)
-  rw [wpMirModularBounded, ← wpMirExecModularSym_eq_wpCoalBounded]
-  exact h_wp args mem h_pre
+        post := post } :=
+  verifyModularContractWithCalleesMirSym contract body .nil pre post fuel h_wp
 
 /-! ## 10. Differential Testing Outcome Classifiers & Strict UB / Panic Refutation Combinators -/
 
@@ -3121,12 +3244,13 @@ theorem refuteClaimByStrictUB
     (args : List Value)
     (h_pre : c.pre args)
     (h_ub :
-      reachesStrictUBBounded fuel c.body (initMachineState c.body args) = true := by
+      reachesStrictUBBounded fuel c.body
+        (initMachineStateWithCallees c.body args c.callees) = true := by
       rfl) :
     ¬ c.holds :=
   refuteClaimByBoundedUB c fuel args h_pre
     (reachesFaultExecBounded_of_reachesStrictUBExecBounded
-      fuel c.body (.running (initMachineState c.body args)) h_ub)
+      fuel c.body (.running (initMachineStateWithCallees c.body args c.callees)) h_ub)
 
 /--
 Refute a stateful `c : StatefulClaim` (`¬ c.holds`) by exhibiting a concrete
@@ -3141,12 +3265,12 @@ theorem refuteStatefulClaimByStrictUB
     (h_pre : c.pre args mem)
     (h_ub :
       reachesStrictUBBounded fuel c.body
-        (initMachineStateWithMemory c.body args mem) = true := by
+        (initMachineStateWithMemoryAndCallees c.body args mem c.callees) = true := by
       rfl) :
     ¬ c.holds :=
   refuteStatefulClaimByBoundedUB c fuel args mem h_pre
     (reachesFaultExecBounded_of_reachesStrictUBExecBounded
-      fuel c.body (.running (initMachineStateWithMemory c.body args mem)) h_ub)
+      fuel c.body (.running (initMachineStateWithMemoryAndCallees c.body args mem c.callees)) h_ub)
 
 /--
 Refute a total-correctness `c : TotalClaim` (`¬ c.holds`) by exhibiting a
@@ -3161,12 +3285,12 @@ theorem refuteTotalClaimByStrictUB
     (h_pre : c.pre args mem)
     (h_ub :
       reachesStrictUBBounded fuel c.body
-        (initMachineStateWithMemory c.body args mem) = true := by
+        (initMachineStateWithMemoryAndCallees c.body args mem c.callees) = true := by
       rfl) :
     ¬ c.holds :=
   refuteTotalClaimByBoundedUB c fuel args mem h_pre
     (reachesFaultExecBounded_of_reachesStrictUBExecBounded
-      fuel c.body (.running (initMachineStateWithMemory c.body args mem)) h_ub)
+      fuel c.body (.running (initMachineStateWithMemoryAndCallees c.body args mem c.callees)) h_ub)
 
 /--
 Computable bounded panic detector over `MirExecState`: returns `true` when
@@ -3264,12 +3388,12 @@ theorem refuteTotalClaimByBoundedPanic
     (h_pre : c.pre args mem)
     (h_panic :
       reachesPanicBounded fuel c.body
-        (initMachineStateWithMemory c.body args mem) = true := by
+        (initMachineStateWithMemoryAndCallees c.body args mem c.callees) = true := by
       rfl) :
     ¬ c.holds := by
   intro h_holds
   rcases reachesPanicBounded_reachesRet fuel c.body
-    (initMachineStateWithMemory c.body args mem) h_panic with ⟨tr, h_ret⟩
+    (initMachineStateWithMemoryAndCallees c.body args mem c.callees) h_panic with ⟨tr, h_ret⟩
   rcases (h_holds args mem h_pre).2.2.2 tr .panic h_ret with
     ⟨_, _, h_eq, _⟩
   nomatch h_eq

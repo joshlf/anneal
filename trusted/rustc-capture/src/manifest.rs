@@ -57,6 +57,11 @@ pub enum CapturedItemKind {
     /// Safety witness lowered by `#[anneal_spec::unsafe_impl(...)]`
     /// (`__anneal_unsafe_impl_*`).
     UnsafeTraitImpl,
+    /// Callable helper item from a non-primary dependency crate or reachable
+    /// `.rmeta` / sysroot (`core`/`alloc`) body extracted for cross-crate call
+    /// verification without generating top-level `Verify/<Crate>/<Item>.lean`
+    /// proof obligations.
+    Callee,
 }
 
 impl CapturedItemKind {
@@ -71,6 +76,7 @@ impl CapturedItemKind {
             Self::Model => "model",
             Self::TypeInvariant => "type_invariant",
             Self::UnsafeTraitImpl => "unsafe_trait_impl",
+            Self::Callee => "callee",
         }
     }
 
@@ -85,6 +91,7 @@ impl CapturedItemKind {
             "model" => Some(Self::Model),
             "type_invariant" => Some(Self::TypeInvariant),
             "unsafe_trait_impl" | "unsafe_impl" => Some(Self::UnsafeTraitImpl),
+            "callee" => Some(Self::Callee),
             _ => None,
         }
     }

@@ -828,7 +828,7 @@ pub fn lint_correspondence_gaps_with_vendor_root(
                             "stale gap entry '{id}': referenced Miri test '{miri_ref}' has no open known_anneal_bug in tests/miri-diff/manifest.toml"
                         ));
                     }
-                    Some(false) | Some(true) => {
+                    Some(_) => {
                         verified_miri_cross_refs += 1;
                     }
                 }

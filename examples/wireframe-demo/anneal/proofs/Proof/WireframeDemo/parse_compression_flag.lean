@@ -268,7 +268,7 @@ private def evalRvalueSymTreeFast
           tag := tag
           targetLocal := p.local_
           targetProjection := .nil
-          perm := sharedBorrowPerm localDecls layouts { local_ := p.local_, projection := [] }
+          perm := sharedBorrowPerm localDecls layouts { local_ := p.local_, projection := .nil }
         }
         let mem' := {
           mem with
@@ -860,6 +860,11 @@ private theorem wpReq_imp_zero_or_one (b : Nat) :
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
     invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.layouts,
+    Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.layouts,
+    Mir.WireframeDemo.parse_compression_flag.layouts,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
+    reqCtx, ensCtx, parseCtx,
     mirSafePost,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
@@ -910,6 +915,11 @@ private theorem ensures_holds_one :
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
     invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.layouts,
+    Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.layouts,
+    Mir.WireframeDemo.parse_compression_flag.layouts,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
+    reqCtx, ensCtx, parseCtx,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -942,6 +952,11 @@ private theorem ensures_holds_zero :
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
     invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.layouts,
+    Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.layouts,
+    Mir.WireframeDemo.parse_compression_flag.layouts,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
+    reqCtx, ensCtx, parseCtx,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1019,6 +1034,9 @@ theorem verified : VerificationResult Obligations.WireframeDemo.parse_compressio
     initMachineState, initLocals, initLocalsAux, emptyMemory,
     readProjectedValue_nil, readProjectedValue_field,
     invalidateConflictingBorrows, mirNormalPost, boolToScalar,
+    Mir.WireframeDemo.parse_compression_flag.layouts,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
+    reqCtx, ensCtx, parseCtx,
     Obligations.WireframeDemo.parse_compression_flag.claim,
     Obligations.WireframeDemo.parse_compression_flag.refineSafeSpec,
     Obligations.WireframeDemo.parse_compression_flag.rustEnsures,
@@ -1070,6 +1088,11 @@ theorem nonVacuousRequires :
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
     invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.layouts,
+    Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.layouts,
+    Mir.WireframeDemo.parse_compression_flag.layouts,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
+    reqCtx, ensCtx, parseCtx,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
