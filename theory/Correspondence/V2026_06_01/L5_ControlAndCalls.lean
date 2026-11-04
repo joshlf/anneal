@@ -789,6 +789,9 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
         MirStepNode.step
           (pushCalleeFrame s callerBody (locals' argVals) destination targetBb calleeBody argVals unwind) ∧
+      evalTerminator s ⟨.call func argOps destination .none unwind, span⟩ (.some callerBody) =
+        MirStepNode.step
+          (pushDivergingCalleeFrame s callerBody (locals' argVals) destination unwind calleeBody argVals) ∧
       evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
         MirStepNode.step (enterTailCalleeFrame s.memory calleeBody argVals)) ∧
     (lookupFnPtr s.memory.fnPtrs ptrVal.allocId = .some fnEntry →
@@ -805,6 +808,10 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
         MirStepNode.extCall
           { defPath := fnEntry.defPath, args := argVals, memory := s.memory }
           (resumeExternalCall s (locals' argVals) destination targetBb unwind) ∧
+      evalTerminator s ⟨.call func argOps destination .none unwind, span⟩ (.some callerBody) =
+        MirStepNode.extCall
+          { defPath := fnEntry.defPath, args := argVals, memory := s.memory }
+          (resumeExternalDivergingCall s (locals' argVals) unwind) ∧
       evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
         MirStepNode.extCall
           { defPath := fnEntry.defPath, args := argVals, memory := s.memory }
@@ -812,11 +819,15 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
     (lookupFnPtr s.memory.fnPtrs ptrVal.allocId = .none →
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
         MirStepNode.fail .ub ∧
+      evalTerminator s ⟨.call func argOps destination .none unwind, span⟩ (.some callerBody) =
+        MirStepNode.fail .ub ∧
       evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
         MirStepNode.fail .ub) ∧
     (lookupFnPtr s.memory.fnPtrs ptrVal.allocId = .some fnEntry →
       fnEntryCompatibleWithCallSite fnEntry (length argOps) callerFuncTyOpt = false →
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
+        MirStepNode.fail .ub ∧
+      evalTerminator s ⟨.call func argOps destination .none unwind, span⟩ (.some callerBody) =
         MirStepNode.fail .ub ∧
       evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
         MirStepNode.fail .ub) ∧
@@ -833,30 +844,32 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
       checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) = false →
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
         MirStepNode.fail .ub ∧
+      evalTerminator s ⟨.call func argOps destination .none unwind, span⟩ (.some callerBody) =
+        MirStepNode.fail .ub ∧
       evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
         MirStepNode.fail .ub) := by
   dsimp only
   refine ⟨?_, ?_, ?_, ?_, ?_⟩
   · intro hLookup hCompatSite hArgs hFind hCompatBody
-    refine ⟨?_, ?_⟩ <;>
+    refine ⟨?_, ?_, ?_⟩ <;>
       simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget,
         hNoDirect, hEvalFunc, hOffsetZero, hNoBorrow, hLookup, hCompatSite, hArgs, hFind,
         hCompatBody, Nat.beq_refl, Bool.and_self]
   · intro hLookup hCompatSite hArgs hFindNone
-    refine ⟨?_, ?_⟩ <;>
+    refine ⟨?_, ?_, ?_⟩ <;>
       simp only [evalTerminator, bodyLocalDeclsOf, isDirectExactDivTarget, resolveCallTarget,
         hNoDirect, hEvalFunc, hOffsetZero, hNoBorrow, hLookup, hCompatSite, hArgs, hFindNone,
         Nat.beq_refl, Bool.and_self]
   · intro hLookupNone
-    refine ⟨?_, ?_⟩ <;>
+    refine ⟨?_, ?_, ?_⟩ <;>
       simp only [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc,
         hOffsetZero, hNoBorrow, hLookupNone, Nat.beq_refl, Bool.and_self]
   · intro hLookup hCompatFalse
-    refine ⟨?_, ?_⟩ <;>
+    refine ⟨?_, ?_, ?_⟩ <;>
       simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hNoDirect, hEvalFunc,
         hOffsetZero, hNoBorrow, hLookup, hCompatFalse, Nat.beq_refl, Bool.and_self]
   · intro hLookup hCompatSite hArgs hFind hCompatBodyFalse
-    refine ⟨?_, ?_⟩ <;>
+    refine ⟨?_, ?_, ?_⟩ <;>
       simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hNoDirect, hEvalFunc,
         hOffsetZero, hNoBorrow, hLookup, hCompatSite, hArgs, hFind, hCompatBodyFalse,
         Nat.beq_refl, Bool.and_self]
@@ -892,20 +905,24 @@ theorem mir_evalTerminator_indirect_call_nonZeroOffset_or_borrow_is_ub
     (ptrVal.offsetBytes = n + 1 →
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
         MirStepNode.fail .ub ∧
+      evalTerminator s ⟨.call func argOps destination .none unwind, span⟩ (.some callerBody) =
+        MirStepNode.fail .ub ∧
       evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
         MirStepNode.fail .ub) ∧
     (ptrVal.offsetBytes = 0 →
       lookupBorrow s.memory.borrows ptrVal.tag = .some bEntry →
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
         MirStepNode.fail .ub ∧
+      evalTerminator s ⟨.call func argOps destination .none unwind, span⟩ (.some callerBody) =
+        MirStepNode.fail .ub ∧
       evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
         MirStepNode.fail .ub) := by
   refine ⟨?_, ?_⟩
   · intro hNonZero
-    refine ⟨?_, ?_⟩ <;>
+    refine ⟨?_, ?_, ?_⟩ <;>
       simp [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc, hNonZero, Nat.beq]
   · intro hOffsetZero hBorrow
-    refine ⟨?_, ?_⟩ <;>
+    refine ⟨?_, ?_, ?_⟩ <;>
       simp [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc,
         hOffsetZero, hBorrow]
 
