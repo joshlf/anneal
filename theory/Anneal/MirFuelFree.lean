@@ -3607,6 +3607,89 @@ theorem verify_multiBlockPipelineEquivClaim :
     | panic => exact False.elim ho
     | abort => exact False.elim ho
 
+
+/-- UbException-aware `UbExceptionClaim` for `multiBlockPipelineBody`. -/
+def multiBlockPipelineUbExceptionClaim : UbExceptionClaim where
+  body := multiBlockPipelineBody
+  pre args mem := WellTypedScalarArg1 4 args ∧ RootActiveMemory mem
+  strictSafetyPre _ _ := True
+  post args mem retVal mem' := args = [retVal] ∧ mem' = mem
+
+/-- Non-vacuity witness for `multiBlockPipelineUbExceptionClaim.pre`. -/
+theorem multiBlockPipelineUbExceptionClaim_nonVacuous :
+    ∃ args mem, multiBlockPipelineUbExceptionClaim.pre args mem :=
+  multiBlockPipelineStatefulClaim_nonVacuous
+
+/-- Fuel-free discharge of `UbExceptionVerificationResult`. -/
+theorem verify_multiBlockPipelineUbExceptionClaim :
+    UbExceptionVerificationResult multiBlockPipelineUbExceptionClaim := by
+  refine verifyUbExceptionMir_of_wpConverges
+    multiBlockPipelineUbExceptionClaim
+    (fun args mem h_pre _ => ?_)
+    (fun args mem h_pre => ?_)
+  · rcases h_pre with ⟨⟨b, _, rfl⟩, h_root⟩
+    have h_conv := multiBlockPipeline_noCallWpConverges b mem h_root
+    have h_wp := MirWpConverges.of_noCall h_conv
+    refine MirWpConverges.mono ?_ h_wp
+    intro out ho
+    cases out with
+    | normal rv =>
+      rcases rv with ⟨retVal, mem'⟩
+      rcases ho with ⟨rfl, rfl⟩
+      exact ⟨rfl, rfl⟩
+    | panic => exact False.elim ho
+    | abort => exact False.elim ho
+  · rcases h_pre with ⟨⟨b, _, rfl⟩, h_root⟩
+    have h_conv := multiBlockPipeline_noCallWpConverges b mem h_root
+    have h_wp := MirWpConverges.of_noCall h_conv
+    have h_ub := MirUbWaivedWpConverges.of_mirWpConverges h_wp
+    refine MirUbWaivedWpConverges.mono ?_ h_ub
+    intro out ho
+    cases out with
+    | normal rv =>
+      rcases rv with ⟨retVal, mem'⟩
+      rcases ho with ⟨rfl, rfl⟩
+      exact ⟨rfl, rfl⟩
+    | panic => exact False.elim ho
+    | abort => exact False.elim ho
+
+/-- Dummy call contract that allows anything. -/
+def dummyContract : MirCallContract where
+  pre _ := True
+  post _ _ := True
+
+/-- ModularClaim using dummyContract. -/
+def multiBlockPipelineModularClaim : ModularClaim :=
+  { body := multiBlockPipelineBody
+    envAssumed := dummyContract.holdsOn
+    pre := multiBlockPipelineEquivClaim.pre
+    post := multiBlockPipelineEquivClaim.post }
+
+/-- Non-vacuity witness for `multiBlockPipelineModularClaim.pre`. -/
+theorem multiBlockPipelineModularClaim_nonVacuous :
+    ∃ args mem, multiBlockPipelineModularClaim.pre args mem :=
+  multiBlockPipelineStatefulClaim_nonVacuous
+
+/-- Fuel-free discharge of a modular verification result. -/
+theorem verify_multiBlockPipelineModularClaim :
+    ModularVerificationResult multiBlockPipelineModularClaim := by
+  exact verifyModularContractMir_of_wpConverges
+    dummyContract multiBlockPipelineBody
+    multiBlockPipelineModularClaim.pre multiBlockPipelineModularClaim.post
+    (fun args mem h_pre => by
+      rcases h_pre with ⟨⟨b, _, rfl⟩, h_root⟩
+      have h_conv := multiBlockPipeline_noCallWpConverges b mem h_root
+      have h_mod_wp := MirModularWpConverges.of_noCall (contract := dummyContract) h_conv
+      refine MirModularWpConverges.mono ?_ h_mod_wp
+      intro out ho
+      cases out with
+      | normal rv =>
+        rcases rv with ⟨retVal, mem'⟩
+        rcases ho with ⟨rfl, rfl⟩
+        exact ⟨rfl, rfl⟩
+      | panic => exact False.elim ho
+      | abort => exact False.elim ho)
+
 end ConcreteWitnesses
 
 end Anneal.MirFuelFree
