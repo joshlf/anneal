@@ -40,3 +40,17 @@ invites defect-prone reinvented wheels.
 
 (Currently, `.github` is an exception to this rule, although we aim to tighten
 that as well.)
+
+## Design documentation
+
+- [`PRINCIPLES.md`](PRINCIPLES.md): Anneal's mission, correctness promise, and
+  decision-making priority order.
+- [`docs/design.md`](docs/design.md): Overall system design, end-to-end
+  verification workflow, library-centric verification, multi-modal
+  specifications, and progressive disclosure.
+- [`docs/architecture.md`](docs/architecture.md): The three-stage MIR pipeline,
+  repository layout, `rustc` extraction lifecycle, and multi-version toolchain
+  strategy.
+- [`docs/trust-model.md`](docs/trust-model.md): The `trusted/` vs. `theory/`
+  boundary, Statement-Origin Separation, `.olean` kernel auditing, and how
+  Anneal validates its TCB against soundness hazards.
