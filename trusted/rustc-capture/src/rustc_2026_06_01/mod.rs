@@ -1078,6 +1078,32 @@ pub fn normalized_assoc(a: &TypeA) -> <TypeA as MyTrait>::Assoc {
 pub fn unnormalized_assoc<T: MyTrait>(x: &T) -> <T as MyTrait>::Assoc {
     x.method()
 }
+
+pub mod inner {
+    #[derive(Copy, Clone)]
+    pub struct GenericBox<T>(pub T);
+
+    impl<T: Copy> GenericBox<T> {
+        #[doc = "\u{200b}anneal::type_invariant=GenericBox"]
+        pub fn __anneal_type_invariant_generic_box(&self) -> bool {
+            true
+        }
+
+        pub fn unbox(self) -> T {
+            self.0
+        }
+
+        pub fn __anodized_fn_requires_unbox(self) -> bool {
+            true
+        }
+    }
+
+    impl GenericBox<u32> {
+        pub fn unbox_u32(self) -> u32 {
+            self.0
+        }
+    }
+}
 "#;
         fs::write(&src_path, sample_rust.as_bytes()).expect("write sample rust source");
 
@@ -1247,6 +1273,30 @@ pub fn unnormalized_assoc<T: MyTrait>(x: &T) -> <T as MyTrait>::Assoc {
         assert!(unnorm_lean.contains(
             "(RigidTy.alias \"demo_generics::MyTrait::Assoc\" (List.cons (RigidTy.param 0 \"T\") List.nil))"
         ));
+
+        // 5. Generic type invariant and inline spec companion resolution inside `inner::GenericBox<T>`.
+        let generic_box_inv = find_target(
+            "demo_generics::inner::GenericBox::<T>::__anneal_type_invariant_generic_box",
+        );
+        assert_eq!(
+            generic_box_inv.item_kind,
+            crate::manifest::CapturedItemKind::TypeInvariant
+        );
+        assert_eq!(
+            generic_box_inv.associated_subject_def_id.as_deref(),
+            Some("demo_generics::inner::GenericBox")
+        );
+
+        let generic_box_req =
+            find_target("demo_generics::inner::GenericBox::<T>::__anodized_fn_requires_unbox");
+        assert_eq!(
+            generic_box_req.item_kind,
+            crate::manifest::CapturedItemKind::InlineSpecRequires
+        );
+        assert_eq!(
+            generic_box_req.associated_subject_def_id.as_deref(),
+            Some("demo_generics::inner::GenericBox::<T>::unbox")
+        );
 
         // 5. End-to-end Lean 4 kernel typechecking of emitted polymorphic modules and
         // `CapturedMir.instantiate` reduction theorems.
