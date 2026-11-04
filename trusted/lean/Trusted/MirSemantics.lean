@@ -56,8 +56,11 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   spliceValues sameRigidTyShape operandPointeeTy evalCopySingleDirect
   evalCopyNonOverlappingWithCount evalCopyNonOverlapping
   evalStmt lookupSwitchTarget findCallee?
-  extractCalleeDefPath? applyUnwindAction resumeExternalCall
-  resumeExternalTailCall evalTerminator
+  extractCalleeDefPath? restoreCallerProtectors pushCalleeFrame
+  pushDivergingCalleeFrame enterTailCalleeFrame unwindFromCallStack
+  applyUnwindAction resumeExternalCall resumeExternalDivergingCall
+  resumeExternalTailCall isUnreachableCallTarget isAbortingPanicDefPath
+  isUnwindingPanicDefPath evalTerminator
   initMachineState initMachineStateWithCallees
   stepMirFn stepMirState mirTree mirCallTree MirCallInstance
   MirLang MirNoUBTree

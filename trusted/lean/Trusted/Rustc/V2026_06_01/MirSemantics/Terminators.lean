@@ -390,6 +390,24 @@ theorem checkCalleeTargetCompatible_direct
   rfl
 
 /--
+Restore the caller frame's active function-entry lifetime protectors upon
+popping `caller` from `Memory.callStack`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L276-L287>
+
+> "pub enum RetagKind {
+>     /// The initial retag of arguments when entering a function.
+>     FnEntry,"
+-/
+@[simp]
+def restoreCallerProtectors (caller : SavedCallerFrame) : List Nat :=
+  match caller.callerProtector with
+  | .some protId => protId :: caller.calleeProtectors
+  | .none => caller.calleeProtectors
+
+/--
 Push a `SavedCallerFrame` onto `s.memory.callStack` and enter `calleeBody` at
 basic block `0` with `initLocals calleeBody argVals`.
 
@@ -415,7 +433,8 @@ def pushCalleeFrame
     (destination : Place)
     (targetBb : BasicBlockIdx)
     (calleeBody : CapturedMir)
-    (argVals : List Value) :
+    (argVals : List Value)
+    (unwind : UnwindAction := .continue_) :
     MachineState :=
   let savedCaller : SavedCallerFrame := {
     callerBody := callerBody
@@ -423,6 +442,63 @@ def pushCalleeFrame
     destination := destination
     returnTarget := targetBb
     calleeProtectors := s.memory.activeProtectors
+    returnUnwind := unwind
+    isDiverging := false
+  }
+  { frame := {
+      blockIdx := 0
+      stmtIdx := 0
+      locals := initLocals calleeBody argVals
+    }
+    memory := {
+      s.memory with
+      callStack := savedCaller :: s.memory.callStack
+      activeCallee := .some calleeBody
+    }
+  }
+
+/--
+Push a diverging `SavedCallerFrame` (`isDiverging := true`, `returnUnwind := unwind`)
+onto `s.memory.callStack` and enter `calleeBody` at basic block `0` with
+`initLocals calleeBody argVals` for a diverging `TerminatorKind.call`
+(`target = .none`).
+
+If `calleeBody` later executes `TerminatorKind.return_`, execution faults with
+`MirStepNode.fail .ub`; if `calleeBody` unwinds, execution pops `savedCaller`
+and dispatches `unwind : UnwindAction` in `callerBody`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L841-L853>
+
+> "Call {
+>     func: Operand<'tcx>,
+>     args: Box<[Spanned<Operand<'tcx>>]>,
+>     destination: Place<'tcx>,
+>     target: Option<BasicBlock>,
+>     unwind: UnwindAction,
+>     call_source: CallSource,
+>     fn_span: Span,
+> },"
+-/
+@[simp]
+def pushDivergingCalleeFrame
+    (s : MachineState)
+    (callerBody : CapturedMir)
+    (localsAfterArgs : List LocalSlot)
+    (destination : Place)
+    (unwind : UnwindAction)
+    (calleeBody : CapturedMir)
+    (argVals : List Value) :
+    MachineState :=
+  let savedCaller : SavedCallerFrame := {
+    callerBody := callerBody
+    frame := { s.frame with locals := localsAfterArgs }
+    destination := destination
+    returnTarget := 0
+    calleeProtectors := s.memory.activeProtectors
+    returnUnwind := unwind
+    isDiverging := true
   }
   { frame := {
       blockIdx := 0
@@ -468,7 +544,57 @@ def enterTailCalleeFrame
   }
 
 /--
+Unwind out of the active frame by popping caller frames from `callStack` until a
+caller frame catches the unwind (`.cleanup cleanupBb`), aborts (`.terminate`),
+faults on an impossible unwind ABI (`.unreachable`), or reaches the root frame
+(`callStack = .nil`, halting with `.halted .panic`).
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L714-L722>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L964-L980>
+
+> "/// Indicates that the landing pad is finished and that the process should
+> /// continue unwinding.
+> UnwindResume,"
+>
+> "pub enum UnwindAction {
+>     Continue,
+>     Unreachable,
+>     Terminate(UnwindTerminateReason),
+>     Cleanup(BasicBlock),
+> }"
+-/
+@[simp]
+def unwindFromCallStack : List SavedCallerFrame → Memory → MirExecState
+  | .nil, _ => .halted .panic
+  | caller :: restStack, memAfter =>
+    let memCaller : Memory := {
+      memAfter with
+      callStack := restStack
+      activeCallee := .some caller.callerBody
+      activeProtectors := restoreCallerProtectors caller
+    }
+    match caller.returnUnwind with
+    | .unreachable => .faulted .ub
+    | .terminate => .halted .abort
+    | .continue_ => unwindFromCallStack restStack memCaller
+    | .cleanup cleanupBb =>
+      .running {
+        frame := {
+          caller.frame with
+          blockIdx := cleanupBb
+          stmtIdx := 0
+        }
+        memory := memCaller
+      }
+
+/--
 Resolve an unwinding outcome according to the call or assertion `UnwindAction`.
+
+When `unwind` is `.continue_`, propagates the unwind up `memAfter.callStack` via
+`unwindFromCallStack` (popping caller frames and restoring lifetime protectors,
+or halting with `.halted .panic` at the root frame).
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -490,7 +616,7 @@ def applyUnwindAction
   match unwind with
   | .unreachable => .faulted .ub
   | .terminate => .halted .abort
-  | .continue_ => .halted .panic
+  | .continue_ => unwindFromCallStack memAfter.callStack memAfter
   | .cleanup cleanupBb =>
     .running {
       frame := {
@@ -541,6 +667,38 @@ def resumeExternalCall
   | .aborted => .halted .abort
 
 /--
+Resume after an external diverging `TerminatorKind.call` (`target = .none`)
+response `ans : MirCallAns`.
+
+Because a diverging call has no return target (`!` return type), a normal return
+(`MirCallAns.returned`) is immediate undefined behavior (`.faulted .ub`), an
+unwind (`MirCallAns.panicked memAfter`) dispatches `applyUnwindAction`, and an
+abort (`MirCallAns.aborted`) halts with `.halted .abort`.
+
+Reference (The Rust Reference, "Never type"):
+<https://doc.rust-lang.org/1.98.0/reference/types/never.html>
+
+> "The never type `!` is a type with no values, representing the result of
+> computations that never complete."
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Producing an invalid value ... A value of the `!` type is invalid."
+-/
+def resumeExternalDivergingCall
+    (s : MachineState)
+    (localsAfterArgs : List LocalSlot)
+    (unwind : UnwindAction)
+    (ans : MirCallAns) :
+    MirExecState :=
+  match ans with
+  | .returned _ _ => .faulted .ub
+  | .panicked memAfter =>
+    applyUnwindAction s localsAfterArgs memAfter unwind
+  | .aborted => .halted .abort
+
+/--
 Resume after an external `TerminatorKind.tailCall` response `ans : MirCallAns`.
 -/
 def resumeExternalTailCall (ans : MirCallAns) : MirExecState :=
@@ -549,35 +707,36 @@ def resumeExternalTailCall (ans : MirCallAns) : MirExecState :=
     match memAfter.callStack with
     | .nil => .halted (.normal (retVal, memAfter))
     | caller :: restStack =>
-      match
-        writePlaceValue
-          caller.frame.locals
-          memAfter.borrows
-          caller.destination
-          retVal
-      with
-      | .ok updatedCallerLocals =>
-        let restoredProtectors :=
-          match caller.callerProtector with
-          | .some protId => protId :: caller.calleeProtectors
-          | .none => caller.calleeProtectors
-        .running {
-          frame := {
-            caller.frame with
-            blockIdx := caller.returnTarget
-            stmtIdx := 0
-            locals := updatedCallerLocals
+      match caller.isDiverging with
+      | true => .faulted .ub
+      | false =>
+        match
+          writePlaceValue
+            caller.frame.locals
+            memAfter.borrows
+            caller.destination
+            retVal
+        with
+        | .ok updatedCallerLocals =>
+          let restoredProtectors := restoreCallerProtectors caller
+          .running {
+            frame := {
+              caller.frame with
+              blockIdx := caller.returnTarget
+              stmtIdx := 0
+              locals := updatedCallerLocals
+            }
+            memory := {
+              memAfter with
+              callStack := restStack
+              activeCallee := .some caller.callerBody
+              activeProtectors := restoredProtectors
+            }
           }
-          memory := {
-            memAfter with
-            callStack := restStack
-            activeCallee := .some caller.callerBody
-            activeProtectors := restoredProtectors
-          }
-        }
-      | .ub => .faulted .ub
-      | .unsupported => .faulted .unsupported
-  | .panicked _ => .halted .panic
+        | .ub => .faulted .ub
+        | .unsupported => .faulted .unsupported
+  | .panicked memAfter =>
+    unwindFromCallStack memAfter.callStack memAfter
   | .aborted => .halted .abort
 
 /--
@@ -598,6 +757,89 @@ def isDirectExactDivTarget (target : ResolvedCallTarget) : Bool :=
   match target.isIndirect with
   | true => false
   | false => stringEq target.defPath "core::intrinsics::exact_div"
+
+/--
+Test whether `defPath` is an unreachable hint or intrinsic
+(`"core::hint::unreachable_unchecked"` or `"core::intrinsics::unreachable"`),
+reaching which is immediate undefined behavior (`MirStepNode.fail .ub`).
+
+Reference (`library/core/src/hint.rs` and `library/core/src/intrinsics/mod.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/hint.rs#L112-L120>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1867-L1873>
+
+> "/// Informs the compiler that the site which is calling this function is not
+> /// reachable, possibly enabling further optimizations.
+> ///
+> /// # Safety
+> ///
+> /// Reaching this function is *Undefined Behavior*."
+-/
+@[simp]
+def isUnreachableCallTarget (defPath : DefPath) : Bool :=
+  Bool.or
+    (stringEq defPath "core::hint::unreachable_unchecked")
+    (stringEq defPath "core::intrinsics::unreachable")
+
+/--
+Test whether `defPath` is a non-unwinding (aborting) panic or abort entrypoint
+in `core` (`"core::panicking::panic_nounwind"`,
+`"core::panicking::panic_nounwind_fmt"`,
+`"core::panicking::panic_nounwind_nobacktrace"`,
+`"core::panicking::panic_in_cleanup"`, or `"core::intrinsics::abort"`).
+
+Reference (`library/core/src/panicking.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/panicking.rs#L218-L234>
+
+> "/// Like `panic`, but without unwinding and track_caller to reduce the impact
+> /// on codesize on the caller.
+> #[rustc_nounwind]
+> pub const fn panic_nounwind(expr: &'static str) -> !"
+-/
+@[simp]
+def isAbortingPanicDefPath (defPath : DefPath) : Bool :=
+  Bool.or
+    (stringEq defPath "core::panicking::panic_nounwind")
+    (Bool.or
+      (stringEq defPath "core::panicking::panic_nounwind_fmt")
+      (Bool.or
+        (stringEq defPath "core::panicking::panic_nounwind_nobacktrace")
+        (Bool.or
+          (stringEq defPath "core::panicking::panic_in_cleanup")
+          (stringEq defPath "core::intrinsics::abort"))))
+
+/--
+Test whether `defPath` is a standard unwinding panic entrypoint in `core`
+(`"core::panicking::panic"`, `"core::panicking::panic_fmt"`,
+`"core::panicking::assert_failed"`, `"core::slice::index::slice_index_fail"`,
+`"core::panicking::panic_bounds_check"`, `"core::panicking::panic_explicit"`, or
+`"core::panicking::panic_display"`).
+
+Reference (`library/core/src/panicking.rs` and `library/core/src/slice/index.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/panicking.rs#L139-L154>
+
+> "/// The underlying implementation of core's `panic!` macro when no formatting is used.
+> #[cold]
+> #[track_caller]
+> pub const fn panic(expr: &'static str) -> !"
+-/
+@[simp]
+def isUnwindingPanicDefPath (defPath : DefPath) : Bool :=
+  Bool.or
+    (stringEq defPath "core::panicking::panic")
+    (Bool.or
+      (stringEq defPath "core::panicking::panic_fmt")
+      (Bool.or
+        (stringEq defPath "core::panicking::assert_failed")
+        (Bool.or
+          (stringEq defPath "core::slice::index::slice_index_fail")
+          (Bool.or
+            (stringEq defPath "core::panicking::panic_bounds_check")
+            (Bool.or
+              (stringEq defPath "core::panicking::panic_explicit")
+              (stringEq defPath "core::panicking::panic_display"))))))
 
 /--
 Execute a basic-block `Terminator` from state `s`.
@@ -689,40 +931,46 @@ def evalTerminator
     | .ok _ _ => MirStepNode.fail .ub
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
+  | .unwindResume =>
+    match unwindFromCallStack s.memory.callStack s.memory with
+    | .running nextState => MirStepNode.step nextState
+    | .halted out => MirStepNode.retOutcome out
+    | .faulted fk => MirStepNode.fail fk
+  | .unwindTerminate => MirStepNode.retOutcome .abort
   | .return_ =>
     match get? s.frame.locals 0 with
     | .some (.init retVal) =>
       match s.memory.callStack with
       | .nil => MirStepNode.retNormal retVal s.memory
       | caller :: restStack =>
-        match
-          writePlaceValue
-            caller.frame.locals
-            s.memory.borrows
-            caller.destination
-            retVal
-        with
-        | .ok updatedCallerLocals =>
-          let restoredProtectors :=
-            match caller.callerProtector with
-            | .some protId => protId :: caller.calleeProtectors
-            | .none => caller.calleeProtectors
-          MirStepNode.step {
-            frame := {
-              caller.frame with
-              blockIdx := caller.returnTarget
-              stmtIdx := 0
-              locals := updatedCallerLocals
+        match caller.isDiverging with
+        | true => MirStepNode.fail .ub
+        | false =>
+          match
+            writePlaceValue
+              caller.frame.locals
+              s.memory.borrows
+              caller.destination
+              retVal
+          with
+          | .ok updatedCallerLocals =>
+            let restoredProtectors := restoreCallerProtectors caller
+            MirStepNode.step {
+              frame := {
+                caller.frame with
+                blockIdx := caller.returnTarget
+                stmtIdx := 0
+                locals := updatedCallerLocals
+              }
+              memory := {
+                s.memory with
+                callStack := restStack
+                activeCallee := .some caller.callerBody
+                activeProtectors := restoredProtectors
+              }
             }
-            memory := {
-              s.memory with
-              callStack := restStack
-              activeCallee := .some caller.callerBody
-              activeProtectors := restoredProtectors
-            }
-          }
-        | .ub => MirStepNode.fail .ub
-        | .unsupported => MirStepNode.unsupported
+          | .ub => MirStepNode.fail .ub
+          | .unsupported => MirStepNode.unsupported
     | _ => MirStepNode.fail .ub
   | .unreachable => MirStepNode.fail .ub
   | .drop place target _ =>
@@ -796,7 +1044,8 @@ def evalTerminator
                   destination
                   targetBb
                   calleeBody
-                  argVals)
+                  argVals
+                  unwind)
         | .none =>
           match isDirectExactDivTarget target with
           | true =>
@@ -832,14 +1081,7 @@ def evalTerminator
               { defPath := target.defPath, args := argVals, memory := s.memory }
               (resumeExternalCall s locals' destination targetBb unwind)
   -- Diverging call (`target == Option.none`, return type `!`):
-  -- `core::hint::unreachable_unchecked` (`library/core/src/hint.rs` at commit
-  -- `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65` and The Rust Reference 1.98.0,
-  -- "Behavior considered undefined",
-  -- <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>):
-  -- "Informs the compiler that this point in the code is not reachable,
-  -- enabling further optimizations. Reaching this function is completely
-  -- undefined behavior."
-  | .call func argOps _ .none _ =>
+  | .call func argOps destination .none unwind =>
     let bodyLocalDecls := bodyLocalDeclsOf currentBody
     let bodyLayouts : LayoutTable :=
       match currentBody with
@@ -855,10 +1097,53 @@ def evalTerminator
     with
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
-    | .ok target _ =>
-      match target.defPath with
-      | "core::hint::unreachable_unchecked" => MirStepNode.fail .ub
-      | _ => MirStepNode.unsupported
+    | .ok target localsAfterFunc =>
+      match
+        evalOperands
+          localsAfterFunc
+          argOps
+          s.memory.borrows
+          s.memory.globals
+          bodyLayouts
+          s.memory.callerLocals
+      with
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+      | .ok argVals locals' =>
+        match isUnreachableCallTarget target.defPath with
+        | true => MirStepNode.fail .ub
+        | false =>
+          match findCallee? s.memory.callees target.defPath with
+          | .some calleeBody =>
+            match checkCalleeTargetCompatible target calleeBody (length argVals) with
+            | false => MirStepNode.fail .ub
+            | true =>
+              match currentBody with
+              | .none => MirStepNode.unsupported
+              | .some callerBody =>
+                MirStepNode.step
+                  (pushDivergingCalleeFrame
+                    s
+                    callerBody
+                    locals'
+                    destination
+                    unwind
+                    calleeBody
+                    argVals)
+          | .none =>
+            match isAbortingPanicDefPath target.defPath with
+            | true => MirStepNode.retOutcome .abort
+            | false =>
+              match isUnwindingPanicDefPath target.defPath with
+              | true =>
+                match applyUnwindAction s locals' s.memory unwind with
+                | .running nextState => MirStepNode.step nextState
+                | .halted out => MirStepNode.retOutcome out
+                | .faulted fk => MirStepNode.fail fk
+              | false =>
+                MirStepNode.extCall
+                  { defPath := target.defPath, args := argVals, memory := s.memory }
+                  (resumeExternalDivergingCall s locals' unwind)
   | .tailCall func argOps =>
     let bodyLocalDecls := bodyLocalDeclsOf currentBody
     let bodyLayouts : LayoutTable :=
