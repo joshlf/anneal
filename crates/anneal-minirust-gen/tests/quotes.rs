@@ -867,3 +867,169 @@ fn bool_comparison_and_transmute_quotations_are_pinned() {
         );
     }
 }
+
+/// The upstream items behind `core::cmp::Ordering` and MIR's three-way `Cmp`
+/// (`MR-1.1`): the representation of enums (`decode_discriminant`,
+/// `encode_discriminant`, `Type::{decode, encode}` for `Enum`) and of the
+/// tuples that carry variant data, `check_value` for both, the layout of
+/// both, and `minimize`'s translation of `Cmp` and of directly tagged enums.
+/// Each quotation occurs verbatim in its vendored file, a one-token tampering
+/// of it is rejected, it does not match another file, and the Lean sources
+/// still carry it.
+#[test]
+fn enum_tuple_and_cmp_quotations_are_pinned() {
+    let corpus = corpus();
+    let ops = "spec/lang/step/operators.md";
+    let repr = "spec/lang/representation.md";
+    let types = "spec/lang/types.md";
+    let rvalue = "tooling/minimize/src/rvalue.rs";
+    let enums = "tooling/minimize/src/enums.rs";
+
+    // (cited file, genuine quotation, tampered quotation, Lean file quoting it)
+    let cases: &[(&str, &str, &str, &str)] = &[
+        // `decode_discriminant`: `Known` and `Invalid` leaves, and the
+        // half-open ranges of `Branch` children.
+        (
+            repr,
+            "fn decode_discriminant<M: Memory>(mut accessor: impl FnMut(Offset, Size) -> \
+             Result<List<AbstractByte<M::Provenance>>>, discriminator: Discriminator) -> \
+             Result<Option<Int>> { match discriminator { Discriminator::Known(val) => ret(Some(val)), \
+             Discriminator::Invalid => ret(None),",
+            "Discriminator::Invalid => ret(Some(val)),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            ".find_map(|((start, end), child)| if start <= val && val < end { Some(child) } else { None }) \
+             .unwrap_or(fallback);",
+            ".find_map(|((start, end), child)| if start <= val && val <= end { Some(child) } else { None })",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `encode_discriminant` encodes each tag at its integer type.
+        (
+            repr,
+            "for (offset, (value_type, value)) in tagger.iter() { \
+             let bytes = Type::Int(value_type).encode::<M>(Value::Int(value)); accessor(offset, bytes)?; }",
+            "let bytes = Type::Int(value_type).encode::<M>(Value::Int(offset));",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `Type::decode` for `Enum` and for `Tuple`, and `Type::encode` for
+        // `Tuple` (padding is `Uninit`).
+        (
+            repr,
+            "if bytes.len() != size.bytes() { panic!(\"decode of Type::Enum with invalid length\"); }",
+            "if bytes.len() != size.bytes() { throw_ub!(\"decode of Type::Enum with invalid length\"); }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "let Some(value) = variants[discriminant].ty.decode(bytes) else { return None }; \
+             Some(Value::Variant { discriminant, data: value })",
+            "Some(Value::Variant { discriminant: Int::ZERO, data: value })",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "assert!(unsized_field.is_none(), \"decode of Type::Tuple with unsized field\"); \
+             let (size, _) = sized_head_layout.head_size_and_align(); \
+             if bytes.len() != size.bytes() { panic!(\"decode of Type::Tuple with invalid length\"); }",
+            "let (_, size) = sized_head_layout.head_size_and_align();",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "let mut bytes = list![AbstractByte::Uninit; size.bytes()];",
+            "let mut bytes = list![AbstractByte::Init(0, None); size.bytes()];",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `check_value` for variants and tuples.
+        (
+            repr,
+            "let Some(variant) = variants.get(discriminant) else { \
+             throw_ub!(\"Value::Variant: invalid discrimant\"); }; self.check_value(data, variant.ty)?;",
+            "let Some(variant) = variants.get(discriminant) else { panic!(\"Value::Variant: invalid discrimant\"); };",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            repr,
+            "ensure_else_ub(vals.len() == sized_fields.len(), \"Value::Tuple: invalid number of fields\")?;",
+            "ensure_else_ub(vals.len() <= sized_fields.len(), \"Value::Tuple: invalid number of fields\")?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // Layout of enums and sized tuples.
+        (
+            types,
+            "pub fn head_size_and_align(self) -> (Size, Align) { \
+             (self.end.align_to(self.align), self.align) }",
+            "pub fn head_size_and_align(self) -> (Size, Align) { (self.end, self.align) }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
+            "Union { size, align, .. } | Enum { size, align, .. } => Sized(size, align),",
+            "Union { size, align, .. } | Enum { size, align, .. } => Sized(align, size),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `minimize`: `Cmp` is `build::cmp` transmuted to the translation of
+        // `Ordering`, and directly tagged enums tag every variant with its
+        // own discriminant, with an `Invalid` fallback.
+        (
+            rvalue,
+            "(Cmp, _) => { let res = build::cmp(l, r);",
+            "(Cmp, _) => { let res = build::lt(l, r);",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            rvalue,
+            "let ordering_ty: rs::Ty = self.tcx.ty_ordering_enum(rs::DUMMY_SP); \
+             let ordering_ty: Type = self.translate_ty(ordering_ty, span); build::transmute(res, ordering_ty)",
+            "let ordering_ty: Type = self.translate_ty(ordering_ty, span); build::int_cast(res, ordering_ty)",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            enums,
+            "let tagger = [(tag_offset, (tag_ty, discr_int))] .into_iter() \
+             .collect::<Map<Offset, (IntType, Int)>>();",
+            "let tagger = [(tag_offset, (discriminant_ty, discr_int))]",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            enums,
+            "discriminator_branches.insert( (discr_int, discr_int + Int::ONE), Discriminator::Known(discr_int), );",
+            "discriminator_branches.insert( (discr_int, discr_int), Discriminator::Known(discr_int), );",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            enums,
+            "rs::TagEncoding::Direct => GcCow::new(Discriminator::Invalid),",
+            "rs::TagEncoding::Direct => GcCow::new(Discriminator::Known(discr_int)),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+    ];
+
+    let lean_root = minirust_dir().join("lean");
+    for (file, genuine, tampered, lean_file) in cases {
+        assert_eq!(
+            missing_piece_in(&corpus, Some(file), genuine),
+            None,
+            "genuine quotation not found in `{file}`: {genuine}"
+        );
+        assert!(
+            missing_piece_in(&corpus, Some(file), tampered).is_some(),
+            "tampered quotation unexpectedly found in `{file}`: {tampered}"
+        );
+        let other = if *file == ops { repr } else { ops };
+        assert!(
+            missing_piece_in(&corpus, Some(other), genuine).is_some(),
+            "quotation from `{file}` also matches `{other}`: {genuine}"
+        );
+        let lean = std::fs::read_to_string(lean_root.join(lean_file)).unwrap();
+        let lean_squashed = squash(&lean.replace("\\\"", "\"").replace("\n>", "\n"));
+        let first_piece = squash(genuine.split("..").next().unwrap());
+        let probe: String = first_piece.chars().take(40).collect();
+        assert!(
+            lean_squashed.contains(&probe),
+            "`{lean_file}` no longer quotes `{probe}`"
+        );
+    }
+}

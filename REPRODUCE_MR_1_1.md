@@ -6,7 +6,7 @@ license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
 This file may not be copied, modified, or distributed except according to
 those terms. -->
 
-# Reproducing `MR-1.1`: Booleans, comparisons, `!b`, and `SwitchInt` on `bool`
+# Reproducing `MR-1.1`: Booleans, comparisons, `Cmp`, `!b`, `bool` switches
 
 This guide lets an independent reviewer check every claim of work unit
 `MR-1.1` from a clean checkout of branch `adv/mr-1-1`. Run all commands from
@@ -21,16 +21,29 @@ as a pass.
   invalid result such as the byte `2` at `bool`), `BinOp::Rel` with all seven
   `RelOp`s on integers (compared as mathematical integers) and Booleans
   (`false < true`), `RelOp::Cmp` returning `i8`, and `IntType::I8`. MiniRust
-  has no Boolean negation, so `UnOp::Int` on a `bool` stays a spec panic.
+  has no Boolean negation, so `UnOp::Int` on a `bool` stays a spec panic. For
+  MIR's `Cmp`, whose result is the `core::cmp::Ordering` enum, the
+  representation of `Type::Enum` (`decode_discriminant`,
+  `encode_discriminant`, `Type::{decode, encode}`) and of sized `Type::Tuple`
+  (the type of variant data; padding encodes as `Uninit`), `check_value` for
+  tuples and variants, `TupleHeadLayout::head_size_and_align`, and
+  `Type::layout` for enums, unions, and sized tuples. The recursion over
+  nested types, fields, variants, and discriminator trees is structural, so
+  the kernel evaluates it.
 - **Anchors** (`minirust/lean/MiniRustSpec/Anchors.lean`): the upstream
-  items `impl_Machine__transmute` (`spec/lang/representation.md:788`) and
-  `impl_Machine__eval_rel_op` (`spec/lang/step/operators.md:320`), pinned by
-  token hash and checked by `decide` (41 anchors in total).
+  items `impl_Machine__transmute` (`spec/lang/representation.md:788`),
+  `impl_Machine__eval_rel_op` (`spec/lang/step/operators.md:320`),
+  `impl_Type__decode_4` (tuples, `representation.md:248`),
+  `fn_decode_discriminant` (`:353`), `fn_encode_discriminant` (`:377`),
+  `impl_Type__decode_7` (enums, `:393`), and
+  `impl_TupleHeadLayout__capped_tail_align` (`spec/lang/types.md:200`),
+  pinned by token hash and checked by `decide` (46 anchors in total).
 - **Quotation checks** (`crates/anneal-minirust-gen/tests/quotes.rs`):
-  `bool_comparison_and_transmute_quotations_are_pinned` checks each new
-  upstream quotation in its vendored file, rejects a one-token tampering of
-  it and a misattribution to another file, and requires the Lean sources to
-  keep carrying it. `quotations_occur_upstream` checks every `> "..."`
+  `bool_comparison_and_transmute_quotations_are_pinned` and
+  `enum_tuple_and_cmp_quotations_are_pinned` check each new upstream
+  quotation in its vendored file, reject a one-token tampering of it and a
+  misattribution to another file, and require the Lean sources to keep
+  carrying it. `quotations_occur_upstream` checks every `> "..."`
   quotation in the hand-written Lean against its cited vendored file.
 - **Translation** (`Correspondence/Translate.lean`): `bool` locals and
   constants (`Constant::Bool`, only for the bytes `0` and `1`), the
@@ -38,16 +51,26 @@ as a pass.
   `bool`s (`BinOp::Rel`), `!b` on a `bool` as `minimize`'s `build::not`
   (`transmute::<bool>(1u8 - transmute::<u8>(b))`), `Cast(CastKind::IntToInt)`
   from a `bool` operand (`CastOp::IntToInt(int_ty)` on `transmute::<u8>(b)`,
-  matching `tooling/minimize/src/rvalue.rs`), and `SwitchInt` on a
+  matching `tooling/minimize/src/rvalue.rs`), `SwitchInt` on a
   `bool` through `transmute::<u8>`, exactly as `tooling/minimize/src/bb.rs`
-  does.
+  does, and `core::cmp::Ordering` locals with the three-way comparison
+  `BinaryOp(Cmp, a, b)` on two integers of one type or two `bool`s, which
+  `minimize` (`tooling/minimize/src/rvalue.rs`) translates to
+  `transmute::<Ordering>(BinOp::Rel(RelOp::Cmp, a, b))` (`translateCmp`); the
+  translation of `Ordering` (`orderingTy`) is the one-byte enum with a
+  directly encoded `i8` tag that `tooling/minimize/src/enums.rs` builds for
+  `#[repr(i8)] enum Ordering { Less = -1, Equal = 0, Greater = 1 }`.
 - **Correspondence** (`Relation.lean`, `Lemmas.lean`, `MiniRustEval.lean`,
   `AnnealEval.lean`, `Simulation.lean`): each local now has a fragment type
-  (`tyOf`: an integer type or `Type::Bool`); an initialized `bool` slot must
-  hold `0` or `1` (`ValidBits`), and so must a `bool` argument (`argOk`). The
-  single-step theorem `step_correspondence` and everything `Run.lean` derives
-  from it (`mirCall_ret`, `mirCall_ub`, `mirCall_noUB`, ...) hold for the
-  extended fragment.
+  (`tyOf`: an integer type, `Type::Bool`, or `orderingTy`); an initialized
+  `bool` slot must hold `0` or `1`, an initialized `Ordering` slot one of the
+  tags `255`, `0`, `1` (`ValidBits`, which for an enum means that the bytes
+  decode), and so must the corresponding arguments (`argOk`). Anneal's
+  `Cmp` result (`255`, `0`, or `1`) matches MiniRust's transmuted variant
+  (`evalScalarBinOp_cmp_int`, `evalScalarBinOp_cmp_bool`,
+  `evalValue_translateCmp`). The single-step theorem `step_correspondence`
+  and everything `Run.lean` derives from it (`mirCall_ret`, `mirCall_ub`,
+  `mirCall_noUB`, ...) hold for the extended fragment.
 - **Witnesses** (`Correspondence/Witness.lean`): `cmpNotSwitch` (signed `<`,
   `==`, `!b`, `b > false`, two `SwitchInt`s on `bool`, four blocks),
   `leNeGe` (`<=`, `!=`, `>=`, a `bool` return place that is also a switch
@@ -55,16 +78,22 @@ as a pass.
   across both `true` and `false` branches plus `argsOk` rejection of invalid
   `bool` byte `2`), `uninitBool`, `uninitBoolNot`, and `uninitBoolRel` (UB on
   an uninitialized `bool` in `SwitchInt`, `UnaryOp(Not)`, and `BinaryOp(Eq)`
-  in both semantics), and ground-truth evaluations of the new operators.
+  in both semantics), `cmpSel` (an `Ordering` return place receiving a signed
+  `i8` `Cmp` or a `bool` `Cmp`; the inputs `(-1, 1, true)`, `(7, 7, true)`,
+  and `(0, 0, false)` return `Less`, `Equal`, and `Greater` in both
+  semantics), `uninitOrdering` (returning an uninitialized `Ordering` is UB in
+  both semantics), and ground-truth evaluations of the new operators and of
+  the enum and tuple representations.
 - **Audit** (`minirust/lean/MiniRustSpec/Audit.lean`): `#check_theorem_deps`
   logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, and `[WITNESS-AUDIT]` lines
   ending in `sorry_free=true`, and fails the build on `sorryAx` or any
   non-standard axiom.
 
-Three-way `Cmp` in MIR is not in the translated fragment: `minimize`
-transmutes its `i8` result to the `Ordering` enum, and enum types are not
-interpreted yet. The interpreted `RelOp::Cmp` itself is covered by
-`relCmp_signed`, `relCmp_unsigned`, and `relCmp_bool`.
+An `Ordering` local is written only by `Cmp` and read only by `Return`; the
+fragment has no `Use`, constants, `Discriminant`, or `SwitchInt` of an
+`Ordering`, and `Type::Enum`/`Type::Tuple` are interpreted only as
+representations (no aggregate construction, discriminant statements, or
+projections).
 
 ## Step 0: environment
 
@@ -98,8 +127,9 @@ cargo test -p anneal-minirust-gen --offline
 ```
 
 Pass: every test passes, in particular `quotations_occur_upstream`,
-`fabricated_quotations_are_rejected`, and
-`bool_comparison_and_transmute_quotations_are_pinned` in `tests/quotes.rs`,
+`fabricated_quotations_are_rejected`,
+`bool_comparison_and_transmute_quotations_are_pinned`, and
+`enum_tuple_and_cmp_quotations_are_pinned` in `tests/quotes.rs`,
 and the determinism, freshness, recount, and tamper-detection tests in
 `tests/pipeline.rs`. To check that the checked-in generated Lean is exactly
 what the generator produces:
@@ -138,8 +168,8 @@ Pass: three lines of the form
 
 ```text
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
-[SIMULATION-AUDIT] decls=37 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
-[WITNESS-AUDIT] decls=69 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+[SIMULATION-AUDIT] decls=46 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
+[WITNESS-AUDIT] decls=101 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
 ```
 
 (the axiom lists contain only `propext`, `Quot.sound`, and
@@ -164,4 +194,18 @@ set_option maxRecDepth 8192 in
 example : (Interp.steps 9 cmpNotNeg1MInit).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAllocI8 with data := scalarBytes i8 1 }, [1]) := rfl
+```
+
+Likewise, `Cmp` on `(-1i8, 1i8)` returns `Less` (byte `255`), so claiming
+`Greater` (byte `1`, what an unsigned comparison of the bit patterns would
+give) must fail:
+
+```lean
+import MiniRustSpec.Correspondence.Witness
+open MiniRustSpec MiniRustSpec.Interp MiniRustSpec.Correspondence
+open MiniRustSpec.Correspondence.Witness
+set_option maxRecDepth 8192 in
+example : (Interp.steps 4 cmpSelLessMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes u8 1 }, [1]) := rfl
 ```

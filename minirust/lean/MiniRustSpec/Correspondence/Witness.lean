@@ -2813,6 +2813,279 @@ theorem uninitBoolRel_minirust_direct :
     Interp.steps 2 uninitBoolRelMInit =
       .error (.ub "load at type but the data in memory violates the language invariant") := rfl
 
+/-! ## Three-way comparison `Cmp` and `core::cmp::Ordering` -/
+
+def orderingTyW : Ty := { kind := .adt "core::cmp::Ordering" [], layoutIdx := 0 }
+def orderingDecl : LocalDecl := { mutability := .mut, ty := orderingTyW, debugName := none }
+
+/-- The ABI of `cmp_sel`. Like the other ABI layouts in this module, the
+return layout is never read by the fragment, so the one-byte `i8Layout`
+stands in for `Ordering`'s one-byte layout. -/
+def fnAbiCmpSel : FnAbi :=
+  { args := [{ layout := i8Layout, mode := .direct }, { layout := i8Layout, mode := .direct },
+      { layout := boolLayout, mode := .direct }],
+    ret := { layout := i8Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+theorem ctxI8_ok_cmpSel {body : CapturedMir}
+    (h : body.localDecls = [orderingDecl, i8Decl, i8Decl, boolDecl]) : CtxOk body ctxI8_4 where
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | 2, hd => simp at hd; subst hd; decide
+    | 3, hd => simp at hd; subst hd; decide
+    | _ + 4, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MIR (`Runtime(PostCleanup)`, with `Ord::cmp` inlined to `BinOp::Cmp`) of
+```rust
+fn cmp_sel(x: i8, y: i8, b: bool) -> Ordering {
+    if b { x.cmp(&y) }       // bb0: switchInt(copy _3) -> [0: bb2, otherwise: bb1]
+                             // bb1: _0 = Cmp(copy _1, copy _2); return
+    else { true.cmp(&b) }    // bb2: _0 = Cmp(const true, copy _3); return
+}
+```
+whose `Ordering` return place receives a three-way comparison of two signed
+integers or of two `bool`s. `minimize` turns each `Cmp` into a transmute of
+MiniRust's `i8` comparison result to `orderingTy` (`translateCmp`), and the
+return path loads and stores the result at `orderingTy`. -/
+def cmpSel : CapturedMir where
+  defPath := "witness::cmp_sel"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 3
+  localDecls := [orderingDecl, i8Decl, i8Decl, boolDecl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.switchInt (.copy (local_ 3)) { branches := [(0, 2)], otherwise := 1 }),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.binaryOp .cmp (.copy (local_ 1)) (.copy (local_ 2))))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.binaryOp .cmp (constBool true) (.copy (local_ 3))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiCmpSel
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem cmpSel_inFragment : inFragment cmpSel = true := by decide
+
+/-- The MiniRust function `minimize` produces for `cmpSel`, spelled out: the
+return place has type `orderingTy`, each `Cmp` is
+`transmute::<orderingTy>(BinOp::Rel(RelOp::Cmp, ..))`, and the `switchInt` on
+`b` switches on `transmute::<u8>(b)`. -/
+def cmpSelFn : Gen.Function where
+  locals := ⟨[(localName 0, orderingTy), (localName 1, .Int i8), (localName 2, .Int i8),
+    (localName 3, .Bool)]⟩
+  args := [localName 1, localName 2, localName 3]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[], .Switch (.UnOp (.Cast (.Transmute (.Int u8))) (.Load (.Local (localName 3))))
+      ⟨[(0, bbName 2)]⟩ (bbName 1), .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 0))
+        (.UnOp (.Cast (.Transmute orderingTy))
+          (.BinOp (.Rel .Cmp) (.Load (.Local (localName 1))) (.Load (.Local (localName 2)))))],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Local (localName 0))
+        (.UnOp (.Cast (.Transmute orderingTy))
+          (.BinOp (.Rel .Cmp) (.Constant (.Bool true) .Bool) (.Load (.Local (localName 3)))))],
+      .Return, .Regular⟩),
+    (bbName 3, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 3
+  implicit_writes := true
+
+theorem cmpSel_translate : translateFn cmpSel = some cmpSelFn := rfl
+
+/-- Input `(x, y, b) = (-1, 1, true)`: `(-1).cmp(&1)` is `Less`, whose tag is
+the `i8` `-1` (byte `255`). Comparing the bit patterns unsigned (`255 > 1`)
+would give `Greater` instead. -/
+def cmpSelLessArgs : List Value := [.scalar ⟨255, 1⟩, .scalar ⟨1, 1⟩, .scalar ⟨1, 1⟩]
+def cmpSelLessS0 : MachineState := initMachineState cmpSel cmpSelLessArgs
+def cmpSelLessMInit : Mach :=
+  machineWithCtx ctxI8_4 cmpSel cmpSelFn cmpSelLessS0.frame.locals cmpSelFn.start
+
+theorem cmpSelLess_anneal_ret :
+    ReachesRet (mirCallTree cmpSel cmpSelLessArgs) [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
+      (.normal (.scalar ⟨255, 1⟩, cmpSelLessS0.memory)) :=
+  runA_sound cmpSel 10 _ _ _ rfl
+
+theorem cmpSelLess_noUB : MirNoUBTree (mirCallTree cmpSel cmpSelLessArgs) :=
+  runA_noUB cmpSel 10 _ _ _ rfl
+
+theorem cmpSelLess_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n cmpSelLessMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes u8 255 } ∧
+      m'.threads = [thread1 ctxI8_4 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret cmpSel_inFragment cmpSel_translate ctxI8_4 (ctxI8_ok_cmpSel rfl)
+      cmpSelLessArgs (by decide) cmpSelLessMInit rfl rfl rfl cmpSelLess_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [cmpSel] at hd; subst hd
+  simp [retPtr, ctxI8_4] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_4] at hr; subst hr
+  have hbits : bits = 255 := by
+    simp [itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxI8_4, itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW, u8]
+
+set_option maxRecDepth 8192 in
+theorem cmpSelLess_minirust_direct :
+    (Interp.steps 4 cmpSelLessMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes u8 255 }, [1]) := rfl
+
+/-- Input `(7, 7, true)`: `7.cmp(&7)` is `Equal` (byte `0`). -/
+def cmpSelEqualArgs : List Value := [.scalar ⟨7, 1⟩, .scalar ⟨7, 1⟩, .scalar ⟨1, 1⟩]
+def cmpSelEqualS0 : MachineState := initMachineState cmpSel cmpSelEqualArgs
+def cmpSelEqualMInit : Mach :=
+  machineWithCtx ctxI8_4 cmpSel cmpSelFn cmpSelEqualS0.frame.locals cmpSelFn.start
+
+theorem cmpSelEqual_anneal_ret :
+    ReachesRet (mirCallTree cmpSel cmpSelEqualArgs) [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
+      (.normal (.scalar ⟨0, 1⟩, cmpSelEqualS0.memory)) :=
+  runA_sound cmpSel 10 _ _ _ rfl
+
+theorem cmpSelEqual_noUB : MirNoUBTree (mirCallTree cmpSel cmpSelEqualArgs) :=
+  runA_noUB cmpSel 10 _ _ _ rfl
+
+theorem cmpSelEqual_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n cmpSelEqualMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes u8 0 } ∧
+      m'.threads = [thread1 ctxI8_4 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret cmpSel_inFragment cmpSel_translate ctxI8_4 (ctxI8_ok_cmpSel rfl)
+      cmpSelEqualArgs (by decide) cmpSelEqualMInit rfl rfl rfl cmpSelEqual_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [cmpSel] at hd; subst hd
+  simp [retPtr, ctxI8_4] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_4] at hr; subst hr
+  have hbits : bits = 0 := by
+    simp [itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxI8_4, itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW, u8]
+
+set_option maxRecDepth 8192 in
+theorem cmpSelEqual_minirust_direct :
+    (Interp.steps 4 cmpSelEqualMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes u8 0 }, [1]) := rfl
+
+/-- Input `(0, 0, false)`: `true.cmp(&false)` is `Greater` (byte `1`). -/
+def cmpSelGreaterArgs : List Value := [.scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩]
+def cmpSelGreaterS0 : MachineState := initMachineState cmpSel cmpSelGreaterArgs
+def cmpSelGreaterMInit : Mach :=
+  machineWithCtx ctxI8_4 cmpSel cmpSelFn cmpSelGreaterS0.frame.locals cmpSelFn.start
+
+theorem cmpSelGreater_anneal_ret :
+    ReachesRet (mirCallTree cmpSel cmpSelGreaterArgs) [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
+      (.normal (.scalar ⟨1, 1⟩, cmpSelGreaterS0.memory)) :=
+  runA_sound cmpSel 10 _ _ _ rfl
+
+theorem cmpSelGreater_noUB : MirNoUBTree (mirCallTree cmpSel cmpSelGreaterArgs) :=
+  runA_noUB cmpSel 10 _ _ _ rfl
+
+theorem cmpSelGreater_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n cmpSelGreaterMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes u8 1 } ∧
+      m'.threads = [thread1 ctxI8_4 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret cmpSel_inFragment cmpSel_translate ctxI8_4 (ctxI8_ok_cmpSel rfl)
+      cmpSelGreaterArgs (by decide) cmpSelGreaterMInit rfl rfl rfl cmpSelGreater_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [cmpSel] at hd; subst hd
+  simp [retPtr, ctxI8_4] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_4] at hr; subst hr
+  have hbits : bits = 1 := by
+    simp [itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxI8_4, itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW, u8]
+
+set_option maxRecDepth 8192 in
+theorem cmpSelGreater_minirust_direct :
+    (Interp.steps 4 cmpSelGreaterMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes u8 1 }, [1]) := rfl
+
+/-! ### Returning an uninitialized `Ordering` -/
+
+def fnAbiToOrdering : FnAbi :=
+  { args := [], ret := { layout := i8Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+/-- MIR of `fn uninit_ordering() -> Ordering` that returns without writing its
+return place: both semantics raise UB when the return reads `_0` (MiniRust
+decodes the `Uninit` byte at `orderingTy` and finds no tag). -/
+def uninitOrdering : CapturedMir where
+  defPath := "witness::uninit_ordering"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [orderingDecl]
+  basicBlocks := [{ statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiToOrdering
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem uninitOrdering_inFragment : inFragment uninitOrdering = true := by decide
+
+def uninitOrderingFn : Gen.Function where
+  locals := ⟨[(localName 0, orderingTy)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[(bbName 0, ⟨[], .Return, .Regular⟩), (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem uninitOrdering_translate : translateFn uninitOrdering = some uninitOrderingFn := rfl
+
+theorem ctxBool_ok_ordering {body : CapturedMir} (h : body.localDecls = [orderingDecl]) :
+    CtxOk body ctxBool where
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | _ + 1, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def uninitOrderingS0 : MachineState := initMachineState uninitOrdering []
+def uninitOrderingMInit : Mach :=
+  machineWithCtx ctxBool uninitOrdering uninitOrderingFn uninitOrderingS0.frame.locals
+    uninitOrderingFn.start
+
+theorem uninitOrdering_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree uninitOrdering []) tr u ∧ FaultNow u :=
+  faultsA_sound uninitOrdering 3 _ (by decide)
+
+theorem uninitOrdering_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n uninitOrderingMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := uninitOrdering_anneal_ub
+  exact mirCall_ub uninitOrdering_inFragment uninitOrdering_translate ctxBool
+    (ctxBool_ok_ordering rfl) [] (by decide) uninitOrderingMInit rfl rfl rfl hr hf
+
+set_option maxRecDepth 8192 in
+theorem uninitOrdering_minirust_direct :
+    Interp.steps 2 uninitOrderingMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") := rfl
+
 /-! ### Ground truth for the interpreted operators
 
 Direct evaluations of the transcribed MiniRust operators, independent of the
@@ -2880,5 +3153,55 @@ theorem decode_bool_invalid :
 /-- `UnOp::Int` on a `bool` is a spec panic: MiniRust has no Boolean `!`. -/
 theorem bitNot_bool_panics : evalUnOp (.Int .BitNot) (.Bool true, .Bool) =
     .error (.specPanic "non-integer input to integer operation") := rfl
+
+/-- `core::cmp::Ordering`'s discriminator accepts exactly the tags `0`, `1`,
+and `255` (the `i8`s `0`, `1`, `-1`) among all one-byte patterns. -/
+theorem ordering_validTags : (List.range 256).filter (validBits orderingTy) = [0, 1, 255] := by
+  decide +kernel
+
+/-- `Type::decode` at `orderingTy` walks the discriminator: the byte `255` is
+the tag `-1` of `Less`, while `2` and `128` (the `i8` `-128`) fall into the
+`Invalid` fallback and an `Uninit` byte has no tag. -/
+theorem decode_ordering_less :
+    Type.decode orderingTy [.Init 255 none] = .ok (some (.Variant (-1) (.Tuple []))) := rfl
+theorem decode_ordering_invalid :
+    Type.decode orderingTy [.Init 2 none] = .ok none ∧
+      Type.decode orderingTy [.Init 128 none] = .ok none ∧
+      Type.decode orderingTy [.Uninit] = .ok none := ⟨rfl, rfl, rfl⟩
+
+/-- `Type::encode` at `orderingTy` encodes the variant's empty tuple as one
+`Uninit` byte and then writes the tag over it (`encode_discriminant`). -/
+theorem encode_ordering_greater :
+    Type.encode orderingTy (.Variant 1 (.Tuple [])) = .ok [.Init 1 none] := rfl
+
+/-- `check_value` rejects a discriminant without a variant as UB. -/
+theorem checkValue_variant_invalid :
+    checkValue (.Variant 2 (.Tuple [])) orderingTy =
+      .error (.ub "Value::Variant: invalid discrimant") := rfl
+
+/-- `translateCmp`'s transmute: the `i8` `-1` becomes `Less`, while the `i8`
+`2` (which `RelOp::Cmp` never returns) is not a valid `Ordering`. -/
+theorem transmute_i8_ordering :
+    transmute (.Int (-1)) (.Int IntType.I8) orderingTy = .ok (.Variant (-1) (.Tuple [])) := rfl
+theorem transmute_i8_ordering_invalid :
+    transmute (.Int 2) (.Int IntType.I8) orderingTy =
+      .error (.ub "transmuted value is not valid at new type") := rfl
+
+/-- A padded tuple `(i8, bool)` with the `bool` at offset 2 and alignment 2:
+`head_size_and_align` rounds the head size 3 up to 4, `Type::encode` makes
+both padding bytes `Uninit`, `Type::decode` ignores them, and `check_value`
+rejects a value with the wrong number of fields as UB. -/
+def paddedPairTy : Gen.Type := .Tuple [(⟨0⟩, .Int IntType.I8), (⟨2⟩, .Bool)] ⟨⟨3⟩, ⟨2⟩, none⟩ none
+theorem layout_paddedPair : Type.layout paddedPairTy = .ok (.Sized ⟨4⟩ ⟨2⟩) := rfl
+theorem encode_paddedPair :
+    Type.encode paddedPairTy (.Tuple [.Int (-2), .Bool true]) =
+      .ok [.Init 254 none, .Uninit, .Init 1 none, .Uninit] := rfl
+set_option maxRecDepth 8192 in
+theorem decode_paddedPair :
+    Type.decode paddedPairTy [.Init 254 none, .Init 7 none, .Init 1 none, .Uninit] =
+      .ok (some (.Tuple [.Int (-2), .Bool true])) := rfl
+theorem checkValue_tuple_arity :
+    checkValue (.Tuple [.Int (-2)]) paddedPairTy =
+      .error (.ub "Value::Tuple: invalid number of fields") := rfl
 
 end MiniRustSpec.Correspondence.Witness

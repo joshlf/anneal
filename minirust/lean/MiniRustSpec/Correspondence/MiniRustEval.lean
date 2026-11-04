@@ -233,6 +233,12 @@ theorem canRepresent_intFromBits (it : Gen.IntType) (bits : Nat) (hgood : GoodSi
   rw [inBounds_iff _ _ _ (by simpa [Size.bits] using hn)]
   simpa [Size.bits] using intFromBits_window bits it hn hb
 
+theorem checkValue_int {t : Gen.IntType} {i : Int} (h : IntType.can_represent t i = true) :
+    checkValue (.Int i) (.Int t) = .ok () := by
+  simp only [checkValue, h, ite_true]; rfl
+
+theorem checkValue_bool (b : Bool) : checkValue (.Bool b) .Bool = .ok () := rfl
+
 /-- Encoding an in-window integer at an integer type yields the little-endian
 bytes of its residue. -/
 theorem encode_int (it : Gen.IntType) (v : Int) (hgood : GoodSize it.size.bytes)
@@ -240,7 +246,8 @@ theorem encode_int (it : Gen.IntType) (v : Int) (hgood : GoodSize it.size.bytes)
     Type.encode (.Int it) (.Int v) = .ok (scalarBytes it (v % 2 ^ (8 * it.size.bytes)).toNat) := by
   obtain ⟨signed, size⟩ := it
   have h : inBounds v signed size = true := hv
-  simp [Type.encode, x86_64.ENDIANNESS, encode_eq signed size v h, scalarBytes, Size.bits]
+  simp [Type.encode, Type.encodeInt, x86_64.ENDIANNESS, encode_eq signed size v h, scalarBytes,
+    Size.bits]
 
 /-! ## Loads and stores of the callee's locals -/
 
@@ -288,9 +295,9 @@ theorem typedLoad_local_init {m : Mach} {ctx : Ctx} {frames : List Frame} {L : L
   simp only [typedLoad, layout_eq _ hgood, LayoutStrategy.expect_size, CM.load, BM.load, hal,
     BM.check_ptr, localPtr, listIndex, h.allocs]
   simp [Nat.ne_of_gt hpos, hi, hLi, Allocation.size, hlen, listSet, subsliceWithLength, hset,
-    List.take_of_length_le, Type.decode, mapM_data_scalarBytes, x86_64.ENDIANNESS,
-    decode_leBytes signed size.bytes bits hb, checkValue, canRepresent_intFromBits _ bits hgood hb,
-    withMem]
+    List.take_of_length_le, Type.decode, Type.decodeInt, mapM_data_scalarBytes, x86_64.ENDIANNESS,
+    decode_leBytes signed size.bytes bits hb,
+    checkValue_int (canRepresent_intFromBits ⟨signed, size⟩ bits hgood hb), withMem]
 
 theorem typedLoad_local_uninit {m : Mach} {ctx : Ctx} {frames : List Frame} {L : List Gen.Allocation}
     (h : Shape m ctx frames (ctx.base ++ L)) (i : Nat) (it : Gen.IntType)
@@ -306,7 +313,7 @@ theorem typedLoad_local_uninit {m : Mach} {ctx : Ctx} {frames : List Frame} {L :
   simp only [typedLoad, layout_eq _ hgood, LayoutStrategy.expect_size, CM.load, BM.load, hal,
     BM.check_ptr, localPtr, listIndex, h.allocs]
   simp [Nat.ne_of_gt hpos, hi, hLi, Allocation.size, hlen, listSet, subsliceWithLength, hset,
-    List.take_of_length_le, Type.decode, mapM_data_uninitBytes _ hpos, ub]
+    List.take_of_length_le, Type.decode, Type.decodeInt, mapM_data_uninitBytes _ hpos, ub]
 
 theorem localAlloc_with_data (ctx : Ctx) (i : Nat) (it : Gen.IntType) (data data' : List Byte) :
     { localAlloc ctx i it data with data := data' } = localAlloc ctx i it data' := rfl
@@ -324,7 +331,7 @@ theorem typedStore_local {m : Mach} {ctx : Ctx} {frames : List Frame} {L : List 
   obtain ⟨hi, hLi⟩ := List.getElem?_eq_some_iff.mp hL
   have hblen : (scalarBytes it (v % 2 ^ (8 * it.size.bytes)).toNat).length = it.size.bytes := by
     simp [scalarBytes, leBytes_length]
-  have hck : checkValue (.Int v) (.Int it) = .ok () := by simp [checkValue, hv]
+  have hck : checkValue (.Int v) (.Int it) = .ok () := checkValue_int hv
   have hne : scalarBytes it (v % 2 ^ (8 * it.size.bytes)).toNat ≠ [] :=
     List.ne_nil_of_length_pos (by omega)
   simp only [typedStore, hck, encode_int it v hgood hv, CM.store, BM.store, hal, BM.check_ptr,
@@ -369,7 +376,7 @@ theorem typedLoad_local_bool {m : Mach} {ctx : Ctx} {frames : List Frame} {L : L
   simp only [typedLoad, layout_bool, LayoutStrategy.expect_size, CM.load, BM.load, hal,
     BM.check_ptr, localPtr, listIndex, h.allocs]
   simp [hu8, hi, hLi, Allocation.size, hlen, listSet, subsliceWithLength, hset,
-    List.take_of_length_le, decode_bool bits hb, checkValue, withMem]
+    List.take_of_length_le, decode_bool bits hb, checkValue_bool, withMem]
 
 theorem typedLoad_local_bool_uninit {m : Mach} {ctx : Ctx} {frames : List Frame}
     {L : List Gen.Allocation} (h : Shape m ctx frames (ctx.base ++ L)) (i : Nat)
@@ -408,33 +415,156 @@ theorem typedStore_local_bool {m : Mach} {ctx : Ctx} {frames : List Frame} {L : 
   simp [hne, hi, hLi, Allocation.size, hlen, hblen, writeSubsliceAtIndex, listSet, withMem, hdrop]
   simp [localAlloc, hu8]
 
+/-! ## `core::cmp::Ordering` locals
+
+An `Ordering` local is stored like a `u8` local (`u8Ty`: one byte, alignment
+one), and its byte must be a tag that `orderingTy`'s discriminator accepts:
+`255` (`Less`, the `i8` `-1`), `0` (`Equal`), or `1` (`Greater`). The loads and
+stores below are stated for any one-byte type `T` whose decoding, checking,
+and encoding of the stored byte are known; for `orderingTy` these facts are
+computed for each of the three tags. -/
+
+theorem typedLoad_local_byte {m : Mach} {ctx : Ctx} {frames : List Frame} {L : List Gen.Allocation}
+    (h : Shape m ctx frames (ctx.base ++ L)) (i : Nat) (T : Gen.Type) (bits : Nat) (v : Val)
+    (hlay : Type.layout T = .ok (.Sized u8Ty.size ⟨u8Ty.size.bytes⟩))
+    (hdec : Type.decode T (scalarBytes u8Ty bits) = .ok (some v)) (hck : checkValue v T = .ok ())
+    (hL : L[i]? = some (localAlloc ctx i u8Ty (scalarBytes u8Ty bits)))
+    (align : Align) (hal : Align.is_aligned align (ctx.addrs.getD i 0) = true) :
+    ∃ m', typedLoad m (localPtr ctx i) T align .None = .ok (v, m') ∧
+      Shape m' ctx frames (ctx.base ++ L) := by
+  obtain ⟨hi, hLi⟩ := List.getElem?_eq_some_iff.mp hL
+  have hu8 : u8Ty.size.bytes = 1 := rfl
+  have hlen : (scalarBytes u8Ty bits).length = u8Ty.size.bytes := by
+    simp [scalarBytes, leBytes_length]
+  have hset := set_self_of_getElem? L i _ hL
+  refine ⟨withMem m (ctx.base ++ L) ⟨.Load, .None, ctx.addrs.getD i 0, u8Ty.size⟩, ?_,
+    withMem_shape h _⟩
+  simp only [typedLoad, hlay, LayoutStrategy.expect_size, CM.load, BM.load, hal,
+    BM.check_ptr, localPtr, listIndex, h.allocs]
+  simp [hu8, hi, hLi, Allocation.size, hlen, listSet, subsliceWithLength, hset,
+    List.take_of_length_le, hdec, hck, withMem]
+
+theorem typedLoad_local_byte_uninit {m : Mach} {ctx : Ctx} {frames : List Frame}
+    {L : List Gen.Allocation} (h : Shape m ctx frames (ctx.base ++ L)) (i : Nat) (T : Gen.Type)
+    (hlay : Type.layout T = .ok (.Sized u8Ty.size ⟨u8Ty.size.bytes⟩))
+    (hdec : Type.decode T (uninitBytes u8Ty) = .ok none)
+    (hL : L[i]? = some (localAlloc ctx i u8Ty (uninitBytes u8Ty)))
+    (align : Align) (hal : Align.is_aligned align (ctx.addrs.getD i 0) = true) :
+    ∃ msg, typedLoad m (localPtr ctx i) T align .None = .error (.ub msg) := by
+  obtain ⟨hi, hLi⟩ := List.getElem?_eq_some_iff.mp hL
+  have hu8 : u8Ty.size.bytes = 1 := rfl
+  have hlen : (uninitBytes u8Ty).length = u8Ty.size.bytes := by simp [uninitBytes]
+  have hset := set_self_of_getElem? L i _ hL
+  refine ⟨"load at type but the data in memory violates the language invariant", ?_⟩
+  simp only [typedLoad, hlay, LayoutStrategy.expect_size, CM.load, BM.load, hal,
+    BM.check_ptr, localPtr, listIndex, h.allocs]
+  simp [hu8, hi, hLi, Allocation.size, hlen, listSet, subsliceWithLength, hset,
+    List.take_of_length_le, hdec, ub]
+
+theorem typedStore_local_byte {m : Mach} {ctx : Ctx} {frames : List Frame} {L : List Gen.Allocation}
+    (h : Shape m ctx frames (ctx.base ++ L)) (i : Nat) (T : Gen.Type) (data : List Byte) (v : Val)
+    (bits : Nat) (hck : checkValue v T = .ok ())
+    (henc : Type.encode T v = .ok (scalarBytes u8Ty bits))
+    (hL : L[i]? = some (localAlloc ctx i u8Ty data)) (hlen : data.length = u8Ty.size.bytes)
+    (align : Align) (hal : Align.is_aligned align (ctx.addrs.getD i 0) = true) :
+    typedStore m (localPtr ctx i) v T align .None =
+      .ok (withMem m (ctx.base ++ L.set i (localAlloc ctx i u8Ty (scalarBytes u8Ty bits)))
+            ⟨.Store, .None, ctx.addrs.getD i 0, u8Ty.size⟩) := by
+  obtain ⟨hi, hLi⟩ := List.getElem?_eq_some_iff.mp hL
+  have hu8 : u8Ty.size.bytes = 1 := rfl
+  have hblen : (scalarBytes u8Ty bits).length = u8Ty.size.bytes := by
+    simp [scalarBytes, leBytes_length]
+  have hne : scalarBytes u8Ty bits ≠ [] :=
+    List.ne_nil_of_length_pos (by rw [hblen, hu8]; omega)
+  have hdrop : data.drop u8Ty.size.bytes = [] := List.drop_eq_nil_of_le (by omega)
+  simp only [typedStore, hck, henc, CM.store, BM.store, hal, BM.check_ptr, localPtr,
+    listIndex, h.allocs]
+  simp [hne, hi, hLi, Allocation.size, hlen, hblen, writeSubsliceAtIndex, listSet, withMem, hdrop]
+  simp [localAlloc, hu8]
+
+theorem layout_ordering : Type.layout orderingTy = .ok (.Sized u8Ty.size ⟨u8Ty.size.bytes⟩) := rfl
+
+/-- `validBits` on every one-byte pattern: exactly the tags `255`, `0`, and
+`1` decode at `orderingTy` (computed by the kernel). -/
+theorem validBits_ordering_table :
+    (List.range 256).all (fun b => validBits orderingTy b == (b == 255 || b == 0 || b == 1)) =
+      true := by
+  decide +kernel
+
+/-- The bit patterns valid at `orderingTy` are its three tags. -/
+theorem validBits_ordering (bits : Nat) :
+    ValidBits orderingTy bits ↔ bits = 255 ∨ bits = 0 ∨ bits = 1 := by
+  constructor
+  · intro h
+    have hlt : bits < 256 := by
+      have := h.1
+      simpa using this
+    have hv : validBits orderingTy bits = true := (validBits_iff _ _).mpr h
+    have ht := List.all_eq_true.mp validBits_ordering_table bits (List.mem_range.mpr hlt)
+    rw [hv] at ht
+    simpa [or_assoc] using ht
+  · rintro (rfl | rfl | rfl) <;> exact (validBits_iff _ _).mp rfl
+
+theorem decode_ordering_uninit : Type.decode orderingTy (uninitBytes u8Ty) = .ok none := rfl
+
 /-! ## Fragment types
 
 `FragTy T it` says that `T` is a fragment type stored like the integer type
-`it`: an integer type of good size is stored as itself, and `bool` as `u8`. -/
+`it`: an integer type of good size is stored as itself, and `bool` and
+`core::cmp::Ordering` (`orderingTy`) as `u8`. -/
 
 /-- Fragment types and their storage integer types. -/
 inductive FragTy : Gen.Type → Gen.IntType → Prop
   | int (it : Gen.IntType) (h : GoodSize it.size.bytes) : FragTy (.Int it) it
   | bool : FragTy .Bool u8Ty
+  | ordering : FragTy orderingTy u8Ty
+
+/-- The fragment types that MiniRust's `BinOp::Rel` compares: integers (by
+value) and `bool` (`false < true`); an `Ordering` value is not comparable. -/
+inductive RelTy : Gen.Type → Gen.IntType → Prop
+  | int (it : Gen.IntType) (h : GoodSize it.size.bytes) : RelTy (.Int it) it
+  | bool : RelTy .Bool u8Ty
+
+theorem RelTy.frag {T : Gen.Type} {it : Gen.IntType} (h : RelTy T it) : FragTy T it := by
+  cases h with
+  | int it h => exact .int it h
+  | bool => exact .bool
 
 /-- The MiniRust value that the bit pattern `bits` encodes at fragment type
-`T`. -/
+`T`; for an enum, the value that its little-endian bytes decode to. -/
 def valOf : Gen.Type → Nat → Val
   | .Int it, bits => .Int (intFromBits bits it)
   | .Bool, bits => .Bool (decide (bits = 1))
+  | T@(.Enum _ _ _ size _), bits =>
+    match Type.decode T (scalarBytes ⟨.Unsigned, size⟩ bits) with
+    | .ok (some v) => v
+    | _ => .Int 0
   | _, _ => .Int 0
+
+theorem decode_ordering {bits : Nat} (hb : ValidBits orderingTy bits) :
+    Type.decode orderingTy (scalarBytes u8Ty bits) = .ok (some (valOf orderingTy bits)) := by
+  rcases (validBits_ordering bits).mp hb with rfl | rfl | rfl <;> rfl
+
+theorem checkValue_ordering {bits : Nat} (hb : ValidBits orderingTy bits) :
+    checkValue (valOf orderingTy bits) orderingTy = .ok () := by
+  rcases (validBits_ordering bits).mp hb with rfl | rfl | rfl <;> rfl
+
+theorem encode_ordering {bits : Nat} (hb : ValidBits orderingTy bits) :
+    Type.encode orderingTy (valOf orderingTy bits) = .ok (scalarBytes u8Ty bits) := by
+  rcases (validBits_ordering bits).mp hb with rfl | rfl | rfl <;> rfl
 
 theorem FragTy.good {T : Gen.Type} {it : Gen.IntType} (h : FragTy T it) : GoodSize it.size.bytes := by
   cases h with
   | int _ h => exact h
   | bool => simp [u8Ty, GoodSize]
+  | ordering => simp [u8Ty, GoodSize]
 
 theorem FragTy.layout {T : Gen.Type} {it : Gen.IntType} (h : FragTy T it) :
     Type.layout T = .ok (.Sized it.size ⟨it.size.bytes⟩) := by
   cases h with
   | int _ h => exact layout_eq _ h
   | bool => exact layout_bool
+  | ordering => exact layout_ordering
 
 theorem FragTy.tyBytes {T : Gen.Type} {it : Gen.IntType} (h : FragTy T it) :
     tyBytes T = it.size.bytes := by
@@ -445,14 +575,17 @@ theorem FragTy.validBits_lt {T : Gen.Type} {it : Gen.IntType} (h : FragTy T it) 
   cases h with
   | int _ _ => exact hb
   | bool => simp [ValidBits] at hb; simp [u8Ty]; omega
+  | ordering =>
+    rcases (validBits_ordering bits).mp hb with rfl | rfl | rfl <;> simp [u8Ty]
 
 /-- A fragment local's declared MiniRust type is a fragment type stored like
 `itOf d`. -/
 theorem fragTy_of_decl {d : LocalDecl} (h : scalarTypeOf d.ty = some (tyOf d)) :
     FragTy (tyOf d) (itOf d) := by
-  rcases scalarTypeOf_cases h with ⟨hb, _⟩ | ⟨it, hit, _⟩
+  rcases scalarTypeOf_cases h with ⟨hb, _⟩ | ⟨it, hit, _⟩ | ⟨ho, _⟩
   · obtain ⟨h1, h2⟩ := tyOf_bool hb; rw [h1, h2]; exact .bool
   · obtain ⟨h1, h2⟩ := tyOf_int hit; rw [h1, h2]; exact .int it (intTypeOf_good hit)
+  · obtain ⟨h1, h2⟩ := tyOf_ordering ho; rw [h1, h2]; exact .ordering
 
 theorem typedLoad_local_frag {m : Mach} {ctx : Ctx} {frames : List Frame} {L : List Gen.Allocation}
     (h : Shape m ctx frames (ctx.base ++ L)) (i : Nat) {T : Gen.Type} {it : Gen.IntType}
@@ -464,6 +597,9 @@ theorem typedLoad_local_frag {m : Mach} {ctx : Ctx} {frames : List Frame} {L : L
   cases hT with
   | int it hgood => exact typedLoad_local_init h i it bits hgood hb hL align hal
   | bool => exact typedLoad_local_bool h i bits (by simpa [ValidBits] using hb) hL align hal
+  | ordering =>
+    exact typedLoad_local_byte h i orderingTy bits _ layout_ordering (decode_ordering hb)
+      (checkValue_ordering hb) hL align hal
 
 theorem typedLoad_local_frag_uninit {m : Mach} {ctx : Ctx} {frames : List Frame}
     {L : List Gen.Allocation} (h : Shape m ctx frames (ctx.base ++ L)) (i : Nat) {T : Gen.Type}
@@ -473,6 +609,9 @@ theorem typedLoad_local_frag_uninit {m : Mach} {ctx : Ctx} {frames : List Frame}
   cases hT with
   | int it hgood => exact typedLoad_local_uninit h i it hgood hL align hal
   | bool => exact typedLoad_local_bool_uninit h i hL align hal
+  | ordering =>
+    exact typedLoad_local_byte_uninit h i orderingTy layout_ordering decode_ordering_uninit hL
+      align hal
 
 theorem typedStore_local_frag {m : Mach} {ctx : Ctx} {frames : List Frame} {L : List Gen.Allocation}
     (h : Shape m ctx frames (ctx.base ++ L)) (i : Nat) {T : Gen.Type} {it : Gen.IntType}
@@ -498,6 +637,9 @@ theorem typedStore_local_frag {m : Mach} {ctx : Ctx} {frames : List Frame} {L : 
       rcases (by omega : bits = 0 ∨ bits = 1) with rfl | rfl <;> rfl
     rw [hres] at hst
     exact hst
+  | ordering =>
+    exact typedStore_local_byte h i orderingTy data _ bits (checkValue_ordering hb)
+      (encode_ordering hb) hL hlen align hal
 
 /-! ## Places of the callee's locals -/
 
@@ -597,7 +739,7 @@ theorem evalUnOp_countOnes (x : Int) (it : Gen.IntType) (hgood : GoodSize it.siz
     dsimp only
     rw [Bool.and_eq_true, decide_eq_true_eq, decide_eq_true_eq]
     omega
-  simp [evalUnOp, evalIntUnOp, checkValue, hrep]
+  simp [evalUnOp, evalIntUnOp, checkValue_int hrep]
 
 /-- Symbolic characterization of `Machine::eval_int_bin_op` on `IntBinOp::DivExact`
 (`spec/lang/step/operators.md`):
@@ -858,7 +1000,7 @@ theorem evalValue_operandT {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
   | .constant c, hok, he =>
     obtain ⟨hty, _⟩ := hok
     simp only [operandType] at hty
-    rcases scalarTypeOf_cases hty with ⟨hb, hTb⟩ | ⟨it', hit', hTi⟩
+    rcases scalarTypeOf_cases hty with ⟨hb, hTb⟩ | ⟨it', hit', hTi⟩ | ⟨ho, _⟩
     · subst hTb
       simp only [translateOperand, hb, ↓reduceIte] at he
       match hv : c.val, he with
@@ -891,6 +1033,7 @@ theorem evalValue_operandT {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
           subst hbits
           exact ⟨hb, m, by simp [evalValue, evalConstant, valOf], h⟩
         · simp at he
+    · simp [translateOperand_ordering_const ho] at he
 
 theorem operandOk_good {decls : List LocalDecl} {it : Gen.IntType} {op : Operand}
     (hok : operandOk decls it op = true) : GoodSize it.size.bytes := by
@@ -1081,7 +1224,7 @@ theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
       have hbring := bringInBounds_intUnArith uop iuop hiuop it hgood x hx
       have heval := evalIntUnOp_eq uop iuop hiuop (intFromBits x it) it
       cases uop <;> simp [translateUnOp] at hiuop <;> subst hiuop <;>
-        simp [evalValue, hm1, evalUnOp, heval, hbring, checkValue, hrep]
+        simp [evalValue, hm1, evalUnOp, heval, hbring, checkValue_int hrep]
   | .binaryOp op a b, hok, he =>
     obtain ⟨iop, rhsIt, hiop, hoka, hrhsTy, hokb, _⟩ := rvalueOk_binaryOp hok
     obtain ⟨ea, eb, hea, heb, rfl⟩ := translateRvalue_binary_int hiop hoka he
@@ -1309,7 +1452,7 @@ theorem evalRelOp_bool (rel : Gen.RelOp) (hrel : rel ≠ .Cmp) (o : Ordering) :
   cases rel <;> simp_all [evalRelOp, relBool]
 
 /-- `BinOp::Rel` on two fragment values of the same fragment type. -/
-theorem evalBinOp_rel_frag {T : Gen.Type} {it : Gen.IntType} (hT : FragTy T it) (rel : Gen.RelOp)
+theorem evalBinOp_rel_frag {T : Gen.Type} {it : Gen.IntType} (hT : RelTy T it) (rel : Gen.RelOp)
     (hrel : rel ≠ .Cmp) (x y : Nat) :
     evalBinOp (.Rel rel) (valOf T x, T) (valOf T y, T) =
       .ok (.Bool (relBool rel (cmpOf T x y)), .Bool) := by
@@ -1368,7 +1511,7 @@ def rvBitsB (decls : List LocalDecl) (locals : List LocalSlot) : Rvalue → Opti
 /-- The operands of a fragment comparison have one fragment type. -/
 theorem relOperandsOk_spec {decls : List LocalDecl} {a b : Operand}
     (h : relOperandsOk decls a b = true) :
-    ∃ T it, FragTy T it ∧ operandType decls a = some T ∧ OperandOkT decls T a ∧
+    ∃ T it, RelTy T it ∧ operandType decls a = some T ∧ OperandOkT decls T a ∧
       OperandOkT decls T b := by
   unfold relOperandsOk at h
   split at h
@@ -1426,7 +1569,7 @@ theorem evalValue_rvalueB {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     obtain ⟨rel, hrel⟩ := Option.isSome_iff_exists.mp hrelSome
     obtain ⟨ea, eb, hea, heb, rfl⟩ := translateRvalue_rel hrel he
     obtain ⟨T, it, hT, htyA, hokA, hokB⟩ := relOperandsOk_spec hops
-    obtain ⟨hasome, hanone⟩ := evalValue_operandT h hT a hokA ea hea
+    obtain ⟨hasome, hanone⟩ := evalValue_operandT h hT.frag a hokA ea hea
     cases hxa : opBits locals a with
     | none =>
       refine ⟨fun r hr => by simp [rvBitsB, hrel, htyA, hxa] at hr, fun _ => ?_⟩
@@ -1434,7 +1577,7 @@ theorem evalValue_rvalueB {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
       exact ⟨msg, by simp [evalValue, hmsg]⟩
     | some x =>
       obtain ⟨_, m1, hm1, h1⟩ := hasome x hxa
-      obtain ⟨hbsome, hbnone⟩ := evalValue_operandT h1 hT b hokB eb heb
+      obtain ⟨hbsome, hbnone⟩ := evalValue_operandT h1 hT.frag b hokB eb heb
       cases hyb : opBits locals b with
       | none =>
         refine ⟨fun r hr => by simp [rvBitsB, hrel, htyA, hxa, hyb] at hr, fun _ => ?_⟩
@@ -1479,6 +1622,132 @@ theorem evalStatement_assignB {body : CapturedMir} {f : Gen.Function} {ctx : Ctx
   have hspec := (translateFn_spec body f h.hf).2.1 i d hd
   have hplace := evalPlace_local h.shape i hi _ hspec.2
   obtain ⟨hrok, hrnone⟩ := evalValue_rvalueB h rv hok e he
+  refine ⟨fun r hr => ?_, fun hnone => ?_⟩
+  · obtain ⟨hrlt, m1, hm1, h1⟩ := hrok r hr
+    exact evalStatement_assign_of h i d hd e r (by rw [htyd]; exact hrlt) _ m1
+      (by rw [htyd]; exact hm1) h1
+  · obtain ⟨msg, hmsg⟩ := hrnone hnone
+    exact ⟨msg, by simp [evalStatement, hplace, hmsg]⟩
+
+/-! ## `Ordering` rvalues -/
+
+/-- The tag of the `Ordering` variant for a comparison outcome: `Less` is the
+`i8` `-1` (bit pattern `255`), `Equal` is `0`, and `Greater` is `1`. -/
+def ordBits : Ordering → Nat
+  | .lt => 255
+  | .eq => 0
+  | .gt => 1
+
+theorem validBits_ordBits (o : Ordering) : ValidBits orderingTy (ordBits o) := by
+  cases o <;> exact (validBits_iff _ _).mp rfl
+
+/-- The transmute of `translateCmp` turns the `i8` that `RelOp::Cmp` returns
+for the outcome `o` into the `Ordering` variant with tag `ordBits o`. -/
+theorem evalUnOp_transmute_ordering (o : Ordering) :
+    evalUnOp (.Cast (.Transmute orderingTy)) (evalRelOp .Cmp o) =
+      .ok (valOf orderingTy (ordBits o), orderingTy) := by
+  cases o <;> rfl
+
+/-- `BinOp::Rel(RelOp::Cmp)` on two values of one comparable fragment type. -/
+theorem evalBinOp_cmp_frag {T : Gen.Type} {it : Gen.IntType} (hT : RelTy T it) (x y : Nat) :
+    evalBinOp (.Rel .Cmp) (valOf T x, T) (valOf T y, T) = .ok (evalRelOp .Cmp (cmpOf T x y)) := by
+  cases hT <;> simp [evalBinOp, valOf, cmpOf]
+
+/-- `translateCmp` on two operands of one comparable fragment type evaluates
+to the `Ordering` variant of their comparison. -/
+theorem evalValue_translateCmp {T : Gen.Type} {it : Gen.IntType} (hT : RelTy T it)
+    (m m1 m2 : Mach) (ea eb : Gen.ValueExpr) (x y : Nat)
+    (ha : evalValue m ea = .ok ((valOf T x, T), m1))
+    (hb : evalValue m1 eb = .ok ((valOf T y, T), m2)) :
+    evalValue m (translateCmp ea eb) =
+      .ok ((valOf orderingTy (ordBits (cmpOf T x y)), orderingTy), m2) := by
+  simp only [translateCmp, evalValue, ha, hb, ok_bind, evalBinOp_cmp_frag hT x y]
+  generalize cmpOf T x y = o
+  cases o <;> rfl
+
+theorem translateRvalue_cmp {decls : List LocalDecl} {a b : Operand} {e : Gen.ValueExpr}
+    (he : translateRvalue decls (.binaryOp .cmp a b) = some e) :
+    ∃ ea eb, translateOperand a = some ea ∧ translateOperand b = some eb ∧
+      e = translateCmp ea eb := by
+  simp only [translateRvalue, Option.bind_eq_bind] at he
+  cases hea : translateOperand a with
+  | none => simp [hea] at he
+  | some ea =>
+    cases heb : translateOperand b with
+    | none => simp [hea, heb] at he
+    | some eb =>
+      simp [hea, heb, translateRelOp, translateBinOp] at he
+      exact ⟨ea, eb, rfl, rfl, he.symm⟩
+
+/-- A fragment rvalue of type `Ordering` is a three-way comparison. -/
+theorem rvalueOkO_spec {decls : List LocalDecl} {rv : Rvalue} (h : rvalueOkO decls rv = true) :
+    ∃ a b, rv = .binaryOp .cmp a b ∧ relOperandsOk decls a b = true := by
+  unfold rvalueOkO at h
+  split at h
+  · exact ⟨_, _, rfl, h⟩
+  · simp at h
+
+/-- The bit pattern an Anneal fragment rvalue of type `Ordering` evaluates to,
+or `none` when evaluating it is UB. -/
+def rvBitsO (decls : List LocalDecl) (locals : List LocalSlot) : Rvalue → Option Nat
+  | .binaryOp .cmp a b => do
+    let T ← operandType decls a
+    let x ← opBits locals a
+    let y ← opBits locals b
+    pure (ordBits (cmpOf T x y))
+  | _ => none
+
+/-- Evaluating a translated fragment rvalue of type `Ordering`. -/
+theorem evalValue_rvalueO {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {locals : List LocalSlot} {m : Mach} {blk stmt : Nat} (h : FrameOk body f ctx locals m blk stmt)
+    (rv : Rvalue) (hok : rvalueOkO body.localDecls rv = true) (e : Gen.ValueExpr)
+    (he : translateRvalue body.localDecls rv = some e) :
+    (∀ r, rvBitsO body.localDecls locals rv = some r →
+      ValidBits orderingTy r ∧
+      ∃ m', evalValue m e = .ok ((valOf orderingTy r, orderingTy), m') ∧
+        FrameOk body f ctx locals m' blk stmt) ∧
+    (rvBitsO body.localDecls locals rv = none → ∃ msg, evalValue m e = .error (.ub msg)) := by
+  obtain ⟨a, b, rfl, hops⟩ := rvalueOkO_spec hok
+  obtain ⟨ea, eb, hea, heb, rfl⟩ := translateRvalue_cmp he
+  obtain ⟨T, it, hT, htyA, hokA, hokB⟩ := relOperandsOk_spec hops
+  obtain ⟨hasome, hanone⟩ := evalValue_operandT h hT.frag a hokA ea hea
+  cases hxa : opBits locals a with
+  | none =>
+    refine ⟨fun r hr => by simp [rvBitsO, htyA, hxa] at hr, fun _ => ?_⟩
+    obtain ⟨msg, hmsg⟩ := hanone hxa
+    exact ⟨msg, by simp [translateCmp, evalValue, hmsg]⟩
+  | some x =>
+    obtain ⟨_, m1, hm1, h1⟩ := hasome x hxa
+    obtain ⟨hbsome, hbnone⟩ := evalValue_operandT h1 hT.frag b hokB eb heb
+    cases hyb : opBits locals b with
+    | none =>
+      refine ⟨fun r hr => by simp [rvBitsO, htyA, hxa, hyb] at hr, fun _ => ?_⟩
+      obtain ⟨msg, hmsg⟩ := hbnone hyb
+      exact ⟨msg, by simp [translateCmp, evalValue, hm1, hmsg]⟩
+    | some y =>
+      obtain ⟨_, m2, hm2, h2⟩ := hbsome y hyb
+      refine ⟨fun r hr => ?_, fun hr => by simp [rvBitsO, htyA, hxa, hyb] at hr⟩
+      simp [rvBitsO, htyA, hxa, hyb] at hr
+      subst hr
+      exact ⟨validBits_ordBits _, m2, evalValue_translateCmp hT m m1 m2 ea eb x y hm1 hm2, h2⟩
+
+/-- `Machine::eval_statement` on a translated fragment assignment to an
+`Ordering` local. -/
+theorem evalStatement_assignO {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {locals : List LocalSlot} {m : Mach} {blk stmt : Nat} (h : FrameOk body f ctx locals m blk stmt)
+    (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d) (hord : isOrderingTy d.ty = true)
+    (rv : Rvalue) (hok : rvalueOkO body.localDecls rv = true) (e : Gen.ValueExpr)
+    (he : translateRvalue body.localDecls rv = some e) :
+    (∀ r, rvBitsO body.localDecls locals rv = some r →
+      ∃ m', evalStatement m (.Assign (.Local (localName i)) e) = .ok m' ∧
+        FrameOk body f ctx (locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩))) m' blk stmt) ∧
+    (rvBitsO body.localDecls locals rv = none →
+      ∃ msg, evalStatement m (.Assign (.Local (localName i)) e) = .error (.ub msg)) := by
+  have hi : i < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
+  have htyd : tyOf d = orderingTy := (tyOf_ordering hord).1
+  have hspec := (translateFn_spec body f h.hf).2.1 i d hd
+  have hplace := evalPlace_local h.shape i hi _ hspec.2
+  obtain ⟨hrok, hrnone⟩ := evalValue_rvalueO h rv hok e he
   refine ⟨fun r hr => ?_, fun hnone => ?_⟩
   · obtain ⟨hrlt, m1, hm1, h1⟩ := hrok r hr
     exact evalStatement_assign_of h i d hd e r (by rw [htyd]; exact hrlt) _ m1
@@ -1635,7 +1904,7 @@ theorem typedStore_base {m : Mach} {ctx : Ctx} {frames : List Frame} {L : List G
   obtain ⟨hri, hai⟩ := List.getElem?_eq_some_iff.mp hr
   have hblen : (scalarBytes it (v % 2 ^ (8 * it.size.bytes)).toNat).length = it.size.bytes := by
     simp [scalarBytes, leBytes_length]
-  have hck : checkValue (.Int v) (.Int it) = .ok () := by simp [checkValue, hv]
+  have hck : checkValue (.Int v) (.Int it) = .ok () := checkValue_int hv
   have hne : scalarBytes it (v % 2 ^ (8 * it.size.bytes)).toNat ≠ [] :=
     List.ne_nil_of_length_pos (by omega)
   have hdrop : a.data.drop it.size.bytes = [] := List.drop_eq_nil_of_le (by omega)
@@ -1668,6 +1937,29 @@ theorem typedStore_base_bool {m : Mach} {ctx : Ctx} {frames : List Frame} {L : L
   simp [hne, hlive, haddr, Allocation.size, hlen, hblen, writeSubsliceAtIndex, listSet, withMem,
     hdrop, List.set_append_left _ _ hri, hri, hrlt, hai]
 
+theorem typedStore_base_byte {m : Mach} {ctx : Ctx} {frames : List Frame} {L : List Gen.Allocation}
+    (h : Shape m ctx frames (ctx.base ++ L)) (p : Ptr) (r : Nat) (a : Gen.Allocation)
+    (hp : p.provenance = some (⟨(r : Int)⟩, ())) (hr : ctx.base[r]? = some a) (hlive : a.live = true)
+    (haddr : a.addr = p.addr) (hlen : a.data.length = u8Ty.size.bytes) (T : Gen.Type) (v : Val)
+    (bits : Nat) (hck : checkValue v T = .ok ())
+    (henc : Type.encode T v = .ok (scalarBytes u8Ty bits))
+    (align : Align) (hal : Align.is_aligned align p.addr = true) :
+    typedStore m p v T align .None =
+      .ok (withMem m (ctx.base.set r { a with data := scalarBytes u8Ty bits } ++ L)
+            ⟨.Store, .None, p.addr, u8Ty.size⟩) := by
+  obtain ⟨hri, hai⟩ := List.getElem?_eq_some_iff.mp hr
+  have hu8 : u8Ty.size.bytes = 1 := rfl
+  have hblen : (scalarBytes u8Ty bits).length = u8Ty.size.bytes := by
+    simp [scalarBytes, leBytes_length]
+  have hne : scalarBytes u8Ty bits ≠ [] :=
+    List.ne_nil_of_length_pos (by rw [hblen, hu8]; omega)
+  have hdrop : a.data.drop u8Ty.size.bytes = [] := List.drop_eq_nil_of_le (by omega)
+  have hrlt : r < ctx.base.length + L.length := by omega
+  simp only [typedStore, hck, henc, CM.store, BM.store, hal, BM.check_ptr, hp,
+    listIndex, h.allocs]
+  simp [hne, hlive, haddr, Allocation.size, hlen, hblen, writeSubsliceAtIndex, listSet, withMem,
+    hdrop, List.set_append_left _ _ hri, hri, hrlt, hai]
+
 /-- `typed_store` of the value of a valid bit pattern of a fragment type into
 the caller's return place (an allocation in `base`). -/
 theorem typedStore_base_frag {m : Mach} {ctx : Ctx} {frames : List Frame} {L : List Gen.Allocation}
@@ -1695,5 +1987,8 @@ theorem typedStore_base_frag {m : Mach} {ctx : Ctx} {frames : List Frame} {L : L
       rcases (by omega : bits = 0 ∨ bits = 1) with rfl | rfl <;> rfl
     rw [hres] at hst
     exact hst
+  | ordering =>
+    exact typedStore_base_byte h p r a hp hr hlive haddr hlen orderingTy _ bits
+      (checkValue_ordering hb) (encode_ordering hb) align hal
 
 end MiniRustSpec.Correspondence

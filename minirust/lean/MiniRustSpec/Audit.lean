@@ -163,6 +163,26 @@ open MiniRustSpec.Correspondence in
   typedStore_base_frag
   opBits_valid
   operandIsSigned_of_OperandOkT
+  typedLoad_local_byte
+  typedLoad_local_byte_uninit
+  typedStore_local_byte
+  typedStore_base_byte
+  validBits_ordering
+  decode_ordering
+  checkValue_ordering
+  encode_ordering
+  evalUnOp_transmute_ordering
+  evalBinOp_cmp_frag
+  evalValue_translateCmp
+  translateRvalue_cmp
+  evalValue_rvalueO
+  evalStatement_assignO
+  evalScalarBinOp_cmp_int
+  evalScalarBinOp_cmp_bool
+  evalRvalue_fragO
+  evalStmt_assignO
+  translateOperand_ordering_const
+  scalarTypeOf_cases
 
 open MiniRustSpec.Correspondence.Witness in
 #assert_standard_axioms
@@ -374,6 +394,27 @@ open MiniRustSpec.Correspondence.Witness in
   uninitBoolRel_anneal_ub
   uninitBoolRel_minirust_ub_from_start
   uninitBoolRel_minirust_direct
+  ctxI8_ok_cmpSel
+  cmpSel_inFragment
+  cmpSel_translate
+  cmpSelLess_anneal_ret
+  cmpSelLess_noUB
+  cmpSelLess_minirust_ret_from_start
+  cmpSelLess_minirust_direct
+  cmpSelEqual_anneal_ret
+  cmpSelEqual_noUB
+  cmpSelEqual_minirust_ret_from_start
+  cmpSelEqual_minirust_direct
+  cmpSelGreater_anneal_ret
+  cmpSelGreater_noUB
+  cmpSelGreater_minirust_ret_from_start
+  cmpSelGreater_minirust_direct
+  ctxBool_ok_ordering
+  uninitOrdering_inFragment
+  uninitOrdering_translate
+  uninitOrdering_anneal_ub
+  uninitOrdering_minirust_ub_from_start
+  uninitOrdering_minirust_direct
   relLt_signed
   relGt_unsigned
   relCmp_signed
@@ -394,6 +435,17 @@ open MiniRustSpec.Correspondence.Witness in
   transmute_size_mismatch
   decode_bool_invalid
   bitNot_bool_panics
+  ordering_validTags
+  decode_ordering_less
+  decode_ordering_invalid
+  encode_ordering_greater
+  checkValue_variant_invalid
+  transmute_i8_ordering
+  transmute_i8_ordering_invalid
+  layout_paddedPair
+  encode_paddedPair
+  decode_paddedPair
+  checkValue_tuple_arity
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -442,6 +494,15 @@ open MiniRustSpec.Correspondence in
   translateRvalue_cast_bool
   switch_spec
   typedStore_base_frag
+  evalValue_rvalueO
+  evalStatement_assignO
+  evalRvalue_fragO
+  evalStmt_assignO
+  evalScalarBinOp_cmp_int
+  evalScalarBinOp_cmp_bool
+  evalValue_translateCmp
+  validBits_ordering
+  typedStore_base_byte
 
 open MiniRustSpec.Correspondence.Witness in
 #check_theorem_deps "[WITNESS-AUDIT]"
@@ -491,6 +552,27 @@ open MiniRustSpec.Correspondence.Witness in
   uninitBoolRel_anneal_ub
   uninitBoolRel_minirust_ub_from_start
   uninitBoolRel_minirust_direct
+  ctxI8_ok_cmpSel
+  cmpSel_inFragment
+  cmpSel_translate
+  cmpSelLess_anneal_ret
+  cmpSelLess_noUB
+  cmpSelLess_minirust_ret_from_start
+  cmpSelLess_minirust_direct
+  cmpSelEqual_anneal_ret
+  cmpSelEqual_noUB
+  cmpSelEqual_minirust_ret_from_start
+  cmpSelEqual_minirust_direct
+  cmpSelGreater_anneal_ret
+  cmpSelGreater_noUB
+  cmpSelGreater_minirust_ret_from_start
+  cmpSelGreater_minirust_direct
+  ctxBool_ok_ordering
+  uninitOrdering_inFragment
+  uninitOrdering_translate
+  uninitOrdering_anneal_ub
+  uninitOrdering_minirust_ub_from_start
+  uninitOrdering_minirust_direct
   relLt_signed
   relGt_unsigned
   relCmp_signed
@@ -511,6 +593,17 @@ open MiniRustSpec.Correspondence.Witness in
   transmute_size_mismatch
   decode_bool_invalid
   bitNot_bool_panics
+  ordering_validTags
+  decode_ordering_less
+  decode_ordering_invalid
+  encode_ordering_greater
+  checkValue_variant_invalid
+  transmute_i8_ordering
+  transmute_i8_ordering_invalid
+  layout_paddedPair
+  encode_paddedPair
+  decode_paddedPair
+  checkValue_tuple_arity
   sumTo_minirust_ret_from_start
   castBitNot4_minirust_ret_from_start
   uninitSwitchUb_minirust_ub_from_start

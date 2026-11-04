@@ -28,7 +28,8 @@ we choose the program that MiniRust's tooling would produce.
 The translation is defined only on the fragment checked by `inFragment`:
 
 * the body declares exactly the return place and the arguments
-  (`localDecls.length = argCount + 1`), all of integer or `bool` type;
+  (`localDecls.length = argCount + 1`), all of integer, `bool`, or
+  `core::cmp::Ordering` type;
 * statements are `_i = Use(copy _j)`, `_i = Use(const c)`,
   `_i = UnaryOp(uop, a)` with `uop ∈ {Neg, Not}`,
   `_i = BinaryOp(op, a, b)` with
@@ -41,8 +42,10 @@ The translation is defined only on the fragment checked by `inFragment`:
   integer `_i`; and, for a `bool` `_i`, `_i = Use(a)` and `_i = UnaryOp(Not,
   a)` with a `bool` operand `a`, and the comparisons
   `_i = BinaryOp(Eq | Ne | Lt | Le | Gt | Ge, a, b)` of two integer operands
-  of one type or of two `bool` operands; every operand is `copy _j` (no
-  projections) or a scalar constant; or `PlaceMention(_i)`;
+  of one type or of two `bool` operands; for an `Ordering` `_i`, the
+  three-way comparison `_i = BinaryOp(Cmp, a, b)` of such operands; every
+  operand is `copy _j` (no projections) or a scalar constant; or
+  `PlaceMention(_i)`;
 * terminators are `Goto`, `SwitchInt` on an integer or `bool` operand
   (`copy _j` or constant), `Unreachable`, or `Return`, and every jump target is
   a block of the body;
@@ -52,9 +55,11 @@ The translation is defined only on the fragment checked by `inFragment`:
 transmute of `1 - b` back to `bool` (`boolNot`) and switches on a `bool`
 through a transmute to `u8` (`boolToU8`). Both are `CastOp::Transmute`,
 which MiniRust evaluates by encoding at the old type and decoding at the new
-one (`MiniRustSpec.Interp.transmute`). MIR's three-way comparison `Cmp` is
-outside the fragment because `minimize` transmutes its result to the
-`Ordering` enum.
+one (`MiniRustSpec.Interp.transmute`). MIR's three-way comparison `Cmp`
+returns `core::cmp::Ordering`, while MiniRust's `RelOp::Cmp` returns an `i8`;
+`minimize` transmutes that `i8` to its translation of the `Ordering` enum
+(`orderingTy`, `translateCmp`), so an `Ordering` local is a one-byte
+`Type::Enum` whose byte must be a valid tag (`-1`, `0`, or `1`).
 
 `Operand::Move` is excluded on purpose: `minimize` translates it exactly like
 `Copy` ("smir::Operand::Move(place) => ValueExpr::Load { .. }"), while Anneal's
@@ -116,7 +121,93 @@ def isBoolTy (t : MirAst.Ty) : Bool :=
   | .bool => true
   | _ => false
 
-/-- `minimize`'s type translation for the fragment's scalar types
+/-- Whether a MIR type is `core::cmp::Ordering`, the result type of MIR's
+three-way comparison `BinOp::Cmp` (`self.tcx.ty_ordering_enum(..)` in
+`minimize`). Like Anneal's own recognition of `UnsafeCell`, both the `core`
+and the `std` path are accepted. -/
+def isOrderingTy (t : MirAst.Ty) : Bool :=
+  match t.kind with
+  | .adt p [] => decide (p = "core::cmp::Ordering") || decide (p = "std::cmp::Ordering")
+  | _ => false
+
+/-- The type of the data of each `Ordering` variant. `minimize` gives every
+variant of an enum the type `build::tuple_ty(&fields, size, align)` of its
+fields, with the size and alignment of the whole enum
+(`tooling/minimize/src/enums.rs`):
+> "let variant = Variant {
+>     ty: build::tuple_ty(
+>         &fields.iter().collect::<Vec<_>>(),
+>         size,
+>         align,
+>     ),
+>     tagger,
+> };"
+where `tuple_ty` builds a tuple type with no unsized tail whose sized head
+ends at `size` (MiniRust's `tooling/miniutil/src/build/ty.rs`, lines 63-69 at
+the pinned commit,
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/ty.rs#L63-L69>):
+```rust
+pub fn tuple_ty(f: &[(Offset, Type)], size: Size, align: Align) -> Type {
+    Type::Tuple {
+        sized_fields: f.iter().copied().collect(),
+        sized_head_layout: TupleHeadLayout { end: size, align, packed_align: None },
+        unsized_field: GcCow::new(None),
+    }
+}
+```
+`Ordering`'s variants have no fields, and the enum has size and alignment 1
+(see `orderingTy`). -/
+def orderingVariantTy : Gen.Type := .Tuple [] ⟨⟨1⟩, ⟨1⟩, none⟩ none
+
+/-- `minimize`'s translation of `core::cmp::Ordering`. In `core`
+(`library/core/src/cmp.rs`, lines 403-415 at Rust 1.98.0,
+<https://github.com/rust-lang/rust/blob/1.98.0/library/core/src/cmp.rs#L403-L415>,
+doc comments and stability attributes elided):
+```rust
+#[lang = "Ordering"]
+#[repr(i8)]
+pub enum Ordering {
+    Less = -1,
+    Equal = 0,
+    Greater = 1,
+}
+```
+so rustc lays it out with size and alignment 1 and a directly encoded `i8`
+tag at offset 0 (`TagEncoding::Direct`), and its discriminant type is `i8`.
+For such a layout, `translate_enum` (`tooling/minimize/src/enums.rs`) tags
+every variant with its own discriminant and branches on the tag, rejecting
+every other tag value:
+> "rs::TagEncoding::Direct => {
+>     // direct tagging places the discriminant in the tag for all variants
+>     let tagger = [(tag_offset, (tag_ty, discr_int))]
+>         .into_iter()
+>         .collect::<Map<Offset, (IntType, Int)>>();
+>     ..
+>     translated_variants.insert(discr_int, variant);
+>     discriminator_branches.insert(
+>         (discr_int, discr_int + Int::ONE),
+>         Discriminator::Known(discr_int),
+>     );
+> }"
+> "rs::TagEncoding::Direct => GcCow::new(Discriminator::Invalid),"
+> "let discriminator = Discriminator::Branch {
+>     offset: tag_offset,
+>     value_type: tag_ty,
+>     fallback,
+>     children: discriminator_branches,
+> };"
+> "Type::Enum { variants, discriminator, discriminant_ty, size, align }"
+-/
+def orderingTy : Gen.Type :=
+  .Enum ⟨[(-1, ⟨orderingVariantTy, ⟨[(⟨0⟩, (IntType.I8, -1))]⟩⟩),
+          (0, ⟨orderingVariantTy, ⟨[(⟨0⟩, (IntType.I8, 0))]⟩⟩),
+          (1, ⟨orderingVariantTy, ⟨[(⟨0⟩, (IntType.I8, 1))]⟩⟩)]⟩
+    IntType.I8
+    (.Branch ⟨0⟩ IntType.I8 .Invalid
+      ⟨[((-1, 0), .Known (-1)), ((0, 1), .Known 0), ((1, 2), .Known 1)]⟩)
+    ⟨1⟩ ⟨1⟩
+
+/-- `minimize`'s type translation for the fragment's types
 (`tooling/minimize/src/ty.rs`):
 > "rs::TyKind::Bool => Type::Bool,
 >  rs::TyKind::Int(t) => {
@@ -126,9 +217,12 @@ def isBoolTy (t : MirAst.Ty) : Bool :=
 >  rs::TyKind::Uint(t) => {
 >      let sz = rs::abi::Integer::from_uint_ty(&self.tcx, *t).size();
 >      Type::Int(IntType { size: translate_size(sz), signed: Signedness::Unsigned })
->  }" -/
+>  }"
+and `core::cmp::Ordering`, whose translation is `orderingTy`. -/
 def scalarTypeOf (t : MirAst.Ty) : Option Gen.Type :=
-  if isBoolTy t then some .Bool else (intTypeOf t).map .Int
+  if isBoolTy t then some .Bool
+  else if isOrderingTy t then some orderingTy
+  else (intTypeOf t).map .Int
 
 /-- `minimize`'s `int_from_bits(bits, int_ty)`: interpret a `u128` bit pattern as
 the mathematical integer it encodes at type `int_ty` (two's complement for
@@ -243,8 +337,8 @@ where each `build` helper is `rel_op(RelOp::_, l, r)`, which builds
 `ValueExpr::BinOp { operator: BinOp::Rel(op), left, right }` (MiniRust's
 `tooling/miniutil/src/build/expr.rs`, lines 209-235 at the pinned commit:
 <https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/expr.rs#L209-L235>).
-MIR's three-way `Cmp` is not translated: `minimize` transmutes its `i8`
-result to the `Ordering` enum, and enum types are outside the fragment. -/
+MIR's three-way `Cmp` is translated separately (`translateCmp`), because
+`minimize` transmutes its result to the `Ordering` enum. -/
 def translateRelOp : MirAst.BinOp → Option Gen.RelOp
   | .lt => some .Lt
   | .le => some .Le
@@ -294,9 +388,31 @@ def boolNot (v : Gen.ValueExpr) : Gen.ValueExpr :=
   .UnOp (.Cast (.Transmute .Bool))
     (.BinOp (.Int .Sub) (.Constant (.Int 1) (.Int u8Ty)) (boolToU8 v))
 
+/-- `minimize`'s translation of MIR's three-way comparison `Cmp` of `l` and `r`
+(`tooling/minimize/src/rvalue.rs`):
+> "(Cmp, _) => {
+>     let res = build::cmp(l, r);
+>     // MiniRust expects an i8 for BinOp::Cmp but MIR uses an Ordering enum,
+>     // so we have to transmute the result.
+>     let ordering_ty: rs::Ty = self.tcx.ty_ordering_enum(rs::DUMMY_SP);
+>     let ordering_ty: Type = self.translate_ty(ordering_ty, span);
+>     build::transmute(res, ordering_ty)
+> }"
+where `build::cmp(l, r)` is
+`ValueExpr::BinOp { operator: BinOp::Rel(RelOp::Cmp), left: l, right: r }`
+(MiniRust's `tooling/miniutil/src/build/expr.rs`, lines 236-238 at the pinned
+commit,
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/expr.rs#L236-L238>),
+`build::transmute` is the `CastOp::Transmute` of `boolToU8`, and the
+translation of `Ordering` is `orderingTy`. MiniRust thus computes the `i8`
+`-1`, `0`, or `1` and re-validates its byte as a tag of `orderingTy`. -/
+def translateCmp (l r : Gen.ValueExpr) : Gen.ValueExpr :=
+  .UnOp (.Cast (.Transmute orderingTy)) (.BinOp (.Rel .Cmp) l r)
+
 /-- `minimize`'s rvalue translation for `Use`, `UnaryOp(Neg | Not)` on
 integers, `UnaryOp(Not)` on `bool`, integer `BinaryOp`s, the comparison
-`BinaryOp`s, and `Cast(CastKind::IntToInt)` on integers and `bool`
+`BinaryOp`s (including the three-way `Cmp`, `translateCmp`), and
+`Cast(CastKind::IntToInt)` on integers and `bool`
 (`tooling/minimize/src/rvalue.rs`):
 > "match rv {
 >      smir::Rvalue::Use(operand) => self.translate_operand_smir(operand, span),
@@ -368,9 +484,15 @@ def translateRvalue (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Option G
     match translateRelOp op with
     | some rel => pure (.BinOp (.Rel rel) el er)
     | none =>
-      match operandType decls l with
-      | some (.Int _) => pure (.BinOp (.Int (← translateBinOp op)) el er)
-      | _ => none
+      match translateBinOp op with
+      | some iop =>
+        match operandType decls l with
+        | some (.Int _) => pure (.BinOp (.Int iop) el er)
+        | _ => none
+      | none =>
+        match op with
+        | .cmp => pure (translateCmp el er)
+        | _ => none
   | .cast .intToInt op targetTy => do
     let intTy ← intTypeOf targetTy
     let operand ← translateOperand op
@@ -628,9 +750,16 @@ def rvalueOkB (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Bool
   | .binaryOp op a b => (translateRelOp op).isSome && relOperandsOk decls a b
   | _ => false
 
+/-- Fragment rvalues of type `core::cmp::Ordering`: a three-way comparison
+`Cmp` of two integers of one type or of two `bool`s. -/
+def rvalueOkO (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Bool
+  | .binaryOp .cmp a b => relOperandsOk decls a b
+  | _ => false
+
 /-- Fragment statements, type-checked against the destination's type: an
-integer destination takes an integer rvalue (`rvalueOk`), and a `bool`
-destination takes a `bool` rvalue (`rvalueOkB`). -/
+integer destination takes an integer rvalue (`rvalueOk`), a `bool`
+destination takes a `bool` rvalue (`rvalueOkB`), and an `Ordering`
+destination takes a three-way comparison (`rvalueOkO`). -/
 def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement) : Bool :=
   match s.kind with
   | .assign ⟨i, []⟩ rv =>
@@ -638,6 +767,7 @@ def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement) : Bool :=
     | none => false
     | some d =>
       if isBoolTy d.ty then rvalueOkB decls rv
+      else if isOrderingTy d.ty then rvalueOkO decls rv
       else
         match intTypeOf d.ty with
         | none => false

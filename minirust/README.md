@@ -132,9 +132,14 @@ and checks it at the new one),
 variants, through `Machine::eval_rel_op`) on integers and Booleans (pointer
 comparison is `unsupported`),
 `Terminator::{Goto, Switch, Return, Unreachable}` including
-frame teardown and both stack-pop actions, the representation relation for
-`Int` and `Bool`, `Type::layout`, `BasicMemory`'s `check_ptr`, `load`, `store`,
-and `deallocate`, and `ConcurrentMemory`'s access log and data-race check.
+frame teardown and both stack-pop actions, the representation relation
+(`Type::{decode, encode}`) for `Int`, `Bool`, sized `Tuple`, and `Enum`
+(through `decode_discriminant` and `encode_discriminant`), `check_value` for
+those types, `Type::layout` (also for unions), `BasicMemory`'s `check_ptr`,
+`load`, `store`, and `deallocate`, and `ConcurrentMemory`'s access log and
+data-race check. The recursion over nested types, tuple fields, enum
+variants, and discriminator trees is structural (Lean `mutual` blocks), so
+the kernel evaluates it.
 MiniRust has no Boolean `!`: `UnOp::Int` on a `Value::Bool` is a spec panic,
 as upstream, and `minimize` expresses `!b` with transmutes instead (see below).
 Every definition quotes the upstream code it transcribes and cites its exact
@@ -146,7 +151,7 @@ comments; `..` marks elided code). Effects are
 (a panic in the spec, which upstream calls a spec bug), and
 `Stop.unsupported` (outside the interpreted fragment; never silently wrong).
 
-`Anchors.lean` lists the 41 upstream items that `Interp.lean` transcribes,
+`Anchors.lean` lists the 46 upstream items that `Interp.lean` transcribes,
 each with its file path, item name, line, and token hash, and proves by `decide`
 that the generated model contains them unchanged (`anchors_ok`) with no
 duplicate entries (`anchors_nodup`). Re-pinning MiniRust therefore breaks
@@ -163,7 +168,7 @@ restricted to the fragment checked by `inFragment`:
 
 * the body is `Runtime(PostCleanup)` MIR and declares only the return place
   and the arguments, all of integer type (`u8`..`u128`, `i8`..`i128`,
-  `usize`, `isize`) or `bool`;
+  `usize`, `isize`), `bool`, or `core::cmp::Ordering`;
 * statements are `_i = Use(op)`, `_i = UnaryOp(Neg | Not, op)`,
   `_i = BinaryOp(Add | Sub | Mul | Div | Rem | BitXor | BitAnd | BitOr | Shl | Shr | AddUnchecked | SubUnchecked | MulUnchecked | ShlUnchecked | ShrUnchecked, opL, opR)`,
   `_i = Cast(CastKind::IntToInt, op, targetTy)`, or `PlaceMention(_i)`,
@@ -178,6 +183,13 @@ restricted to the fragment checked by `inFragment`:
   constant `0`/`1`). `minimize` translates the comparisons to `BinOp::Rel`,
   `!b` to `build::not(b)` (a transmute of `1u8 - transmute::<u8>(b)` back to
   `bool`), and a `bool` constant to `Constant::Bool`;
+* for a `core::cmp::Ordering` `_i`: the three-way comparison
+  `_i = BinaryOp(Cmp, opL, opR)` of such operands. MiniRust's `RelOp::Cmp`
+  returns the `i8` `-1`, `0`, or `1`, and `minimize` transmutes it to its
+  translation of `Ordering` (`orderingTy`: a one-byte `Type::Enum` with a
+  directly encoded `i8` tag, built as `translate_enum` does for
+  `#[repr(i8)] enum Ordering { Less = -1, Equal = 0, Greater = 1 }`), so the
+  tag is re-validated by `decode_discriminant`;
 * terminators are `Goto`, `SwitchInt` on any integer or `bool` fragment operand
   (`copy _j` or constant) with distinct in-range values (`minimize` switches
   on `transmute::<u8>(b)` for a `bool`), `Return`, and `Unreachable`; all
@@ -192,11 +204,12 @@ MiniRust machine has one enabled thread whose stack is `[caller, callee]`; the
 callee runs `f` at the corresponding program point; every MIR local `_i` is a
 live MiniRust local pointing to its own `Stack` allocation whose bytes are the
 encoding of Anneal's slot (`Uninit` bytes for an uninitialized slot,
-little-endian bytes for an initialized scalar, and only `0` or `1` for an
-initialized `bool`, so that it decodes at `Type::Bool`); the caller's return
-place is a
-live, large-enough, aligned allocation (`CtxOk`); and Anneal's memory has no
-borrows, protectors, call stack, or caller-owned referents. `ctx` fixes
+little-endian bytes for an initialized scalar, only `0` or `1` for an
+initialized `bool`, and only the tags `255`, `0`, or `1` for an initialized
+`Ordering`, so that the byte decodes at the local's MiniRust type); the
+caller's return place is a live, large-enough, aligned allocation (`CtxOk`);
+and Anneal's memory has no borrows, protectors, call stack, or caller-owned
+referents. `ctx` fixes
 everything the callee does not determine: caller frame, unwind payloads, the
 allocations below the callee's locals, the locals' addresses (arbitrary,
 subject only to alignment, so every MiniRust address choice is covered), and
@@ -354,19 +367,37 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   (`cmpNot3_*`).
 * `leNeGe`, a `(u8, u8) -> bool` body whose `bool` return place is also the
   `SwitchInt` scrutinee, exercising `<=`, `!=`, `>=`, and `bool` returns
-  (`leNeGe250_*` returns `true`, `leNeGe5_*` returns `false`), `boolCastI8`, a
-  `bool -> i8` body exercising `Cast(CastKind::IntToInt)` on `bool` across both
-  `true` and `false` branches plus `argsOk` rejection of invalid `bool` byte `2`
-  (`boolCastTrue_*`, `boolCastFalse_*`, `boolCastInvalidArg_rejected`), and
-  `uninitBool`, `uninitBoolNot`, and `uninitBoolRel`, whose `SwitchInt`,
+  (`leNeGe250_*` returns `true`, `leNeGe5_*` returns `false`).
+* `boolCastI8`, a `bool -> i8` body exercising `Cast(CastKind::IntToInt)` on
+  `bool` across both `true` and `false` branches, plus `argsOk` rejection of
+  the invalid `bool` byte `2` (`boolCastTrue_*`, `boolCastFalse_*`,
+  `boolCastInvalidArg_rejected`).
+* `uninitBool`, `uninitBoolNot`, and `uninitBoolRel`, whose `SwitchInt`,
   `UnaryOp(Not)`, and `BinaryOp(Eq)` on an uninitialized `bool` are UB in both
-  semantics (`uninitBool*_minirust_ub_from_start`, `uninitBool*_minirust_direct`).
+  semantics (`uninitBool*_minirust_ub_from_start`,
+  `uninitBool*_minirust_direct`).
+* `cmpSel`, an `(i8, i8, bool) -> Ordering` body that switches on its `bool`
+  and returns `x.cmp(&y)` (signed `Cmp`) or `true.cmp(&b)` (`bool` `Cmp`),
+  each translated to `transmute::<orderingTy>(BinOp::Rel(RelOp::Cmp, ..))`:
+  `(-1, 1, true)` returns `Less` (byte `255`; comparing the bit patterns
+  unsigned would give `Greater`), `(7, 7, true)` returns `Equal` (byte `0`),
+  and `(0, 0, false)` returns `Greater` (byte `1`), each in both semantics
+  (`cmpSelLess_*`, `cmpSelEqual_*`, `cmpSelGreater_*`: Anneal `ReachesRet`
+  and `MirNoUBTree`, MiniRust via `mirCall_ret`, and a direct 4-step run);
+  and `uninitOrdering`, whose return of an uninitialized `Ordering` is UB in
+  both semantics (`uninitOrdering_*`).
 * Ground-truth checks of the interpreted operators: signed and unsigned
   `BinOp::Rel`, `RelOp::Cmp` returning `i8`, `bool` ordering, a value-type
   mismatch being a spec panic, `CastOp::Transmute` between `bool` and `u8`
   (including the invalid byte `2` and a size mismatch, both UB),
   `Type::Bool` decoding, and `UnOp::Int` on a `bool` being a spec panic
-  (`relLt_signed`, ..., `bitNot_bool_panics`).
+  (`relLt_signed`, ..., `bitNot_bool_panics`); and of the representation of
+  enums and tuples: exactly the bytes `0`, `1`, `255` are valid at
+  `orderingTy` (`ordering_validTags`), decoding, encoding, `check_value`, and
+  transmutes at `orderingTy` (including invalid tags and an `Uninit` byte),
+  and a padded `(i8, bool)` tuple whose size rounds up to its alignment and
+  whose padding encodes as `Uninit` and is ignored by decoding
+  (`decode_ordering_less`, ..., `checkValue_tuple_arity`).
 
 `Audit.lean` logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, and
 `[WITNESS-AUDIT]` lines ending in `sorry_free=true` (via
@@ -392,12 +423,15 @@ These are deliberate and are the first things to lift:
 * **Branch observations.** Anneal's `switchInt` emits the scrutinee as a
   visible leakage event; MiniRust has no counterpart, so `StepRel` matches it
   with an ordinary MiniRust step.
-* **Integers and `bool` only.** No three-way `Cmp` (`minimize` transmutes its
-  `i8` result to the `Ordering` enum, and enum types are outside the
-  interpretation), no `bool` arithmetic (`BitAnd`, `BitOr`, `BitXor` on
-  `bool` become `build::bool_and` and friends), no
-  pointers, references, aggregates, other casts, checked arithmetic, calls,
-  drops, or assertions.
+* **Integers, `bool`, and `Ordering` only.** An `Ordering` local is written
+  only by `Cmp` and read only by `Return` (no `Use`, `Ordering` constants,
+  `Discriminant`, or `SwitchInt` on it); `Type::Enum` and `Type::Tuple` are
+  interpreted only as representations (layout, `decode`, `encode`,
+  `check_value`), without `ValueExpr::{Tuple, Variant, GetDiscriminant}`,
+  `Statement::SetDiscriminant`, or field and downcast projections. There is
+  no `bool` arithmetic (`BitAnd`, `BitOr`, `BitXor` on `bool` become
+  `build::bool_and` and friends), and no pointers, references, other
+  aggregates, other casts, checked arithmetic, calls, drops, or assertions.
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.

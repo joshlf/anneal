@@ -73,7 +73,7 @@ theorem evalOperand_fragT (decls : List LocalDecl) (locals : List LocalSlot)
     obtain ⟨hty, htr⟩ := hok
     simp only [operandType] at hty
     obtain ⟨e, he⟩ := Option.isSome_iff_exists.mp htr
-    rcases scalarTypeOf_cases hty with ⟨hb, hTb⟩ | ⟨it', hit', hTi⟩
+    rcases scalarTypeOf_cases hty with ⟨hb, hTb⟩ | ⟨it', hit', hTi⟩ | ⟨ho, _⟩
     · subst hTb
       cases hT
       simp only [translateOperand, hb, ↓reduceIte] at he
@@ -105,6 +105,7 @@ theorem evalOperand_fragT (decls : List LocalDecl) (locals : List LocalSlot)
             subst hb
             simp [evalOperand, hv, evalConstValue, hsz]
           · simp at he
+    · simp [translateOperand_ordering_const ho] at he
 
 theorem evalOperand_frag (decls : List LocalDecl) (locals : List LocalSlot)
     (hslots : SlotsOk decls locals) (hn : locals.length = decls.length)
@@ -1333,7 +1334,7 @@ theorem opBits_valid (decls : List LocalDecl) (locals : List LocalSlot) (hslots 
     simp only [operandType] at hty
     obtain ⟨e, he⟩ := Option.isSome_iff_exists.mp htr
     simp only [opBits] at hb
-    rcases scalarTypeOf_cases hty with ⟨hbool, hTb⟩ | ⟨it', hit', hTi⟩
+    rcases scalarTypeOf_cases hty with ⟨hbool, hTb⟩ | ⟨it', hit', hTi⟩ | ⟨ho, _⟩
     · subst hTb
       simp only [translateOperand, hbool, ↓reduceIte] at he
       match hv : c.val, he, hb with
@@ -1353,6 +1354,7 @@ theorem opBits_valid (decls : List LocalDecl) (locals : List LocalSlot) (hslots 
         split at he
         · next hc => obtain ⟨hsz, hlt⟩ := hc; subst hsz; exact hlt
         · simp at he
+    · simp [translateOperand_ordering_const ho] at he
 
 theorem opBits_lt (decls : List LocalDecl) (locals : List LocalSlot) (hslots : SlotsOk decls locals)
     (it : Gen.IntType) (op : Operand) (hok : operandOk decls it op = true) (bits : Nat)
@@ -1464,12 +1466,14 @@ theorem operandIsSigned_of_OperandOkT (decls : List LocalDecl) (layouts : Layout
     | .constant c, hok => exact ⟨c.ty, rfl, hok.1⟩
   obtain ⟨ty, hty, hT⟩ := hty
   simp only [MirSemantics.operandIsSigned, hty, MirSemantics.tyIsSigned]
-  rcases scalarTypeOf_cases hT with ⟨hb, rfl⟩ | ⟨it, hit, rfl⟩
+  rcases scalarTypeOf_cases hT with ⟨hb, rfl⟩ | ⟨it, hit, rfl⟩ | ⟨ho, rfl⟩
   · unfold isBoolTy at hb
     split at hb <;> simp_all [signedOf]
   · rcases intTypeOf_kind hit with ⟨⟨u, hu⟩, hs⟩ | ⟨⟨i, hi⟩, hs⟩
     · simp [hu, hs, signedOf]
     · simp [hi, hs, signedOf]
+  · unfold isOrderingTy at ho
+    split at ho <;> simp_all [signedOf, orderingTy]
 
 theorem castBits_eq_toNat (srcIt it : Gen.IntType) (hsrcGood : GoodSize srcIt.size.bytes)
     (x : Nat) (hx : x < 2 ^ (8 * srcIt.size.bytes)) :
@@ -1770,9 +1774,10 @@ theorem evalUnaryNot_bool (decls : List LocalDecl) (layouts : Layout.LayoutTable
       .ok (.scalar ⟨1 - x, u8Ty.size.bytes⟩) locals mem := by
   obtain ⟨ty, hty, hT⟩ := operandTy_of_OperandOkT decls layouts op hok
   have hkind : ty.kind = .bool := by
-    rcases scalarTypeOf_cases hT with ⟨hb, _⟩ | ⟨it, _, h⟩
+    rcases scalarTypeOf_cases hT with ⟨hb, _⟩ | ⟨it, _, h⟩ | ⟨_, h⟩
     · unfold isBoolTy at hb; split at hb <;> simp_all
     · cases h
+    · simp [orderingTy] at h
   rcases (by omega : x = 0 ∨ x = 1) with rfl | rfl <;>
     simp [MirSemantics.evalUnaryNot, hty, hkind, u8Ty]
 
@@ -1814,9 +1819,9 @@ theorem evalRvalue_fragB (decls : List LocalDecl) (locals : List LocalSlot)
     obtain ⟨hrelSome, hops⟩ := hok
     obtain ⟨rel, hrel⟩ := Option.isSome_iff_exists.mp hrelSome
     obtain ⟨T, it, hT, htyA, hokA, hokB⟩ := relOperandsOk_spec hops
-    obtain ⟨ha, hanone⟩ := evalOperand_fragT decls locals hslots hn hT a hokA
+    obtain ⟨ha, hanone⟩ := evalOperand_fragT decls locals hslots hn hT.frag a hokA
       mem.borrows mem.globals layouts mem.callerLocals
-    obtain ⟨hb, hbnone⟩ := evalOperand_fragT decls locals hslots hn hT b hokB
+    obtain ⟨hb, hbnone⟩ := evalOperand_fragT decls locals hslots hn hT.frag b hokB
       mem.borrows mem.globals layouts mem.callerLocals
     have hsigned := operandIsSigned_of_OperandOkT decls layouts a hokA
     cases hxa : opBits locals a with
@@ -1829,8 +1834,8 @@ theorem evalRvalue_fragB (decls : List LocalDecl) (locals : List LocalSlot)
         refine ⟨fun r hr => by simp [rvBitsB, hrel, htyA, hxa, hyb] at hr, fun _ => ?_⟩
         simp [evalRvalue, ha x hxa, hbnone hyb]
       | some y =>
-        have hx := opBits_valid decls locals hslots hT a hokA x hxa
-        have hy := opBits_valid decls locals hslots hT b hokB y hyb
+        have hx := opBits_valid decls locals hslots hT.frag a hokA x hxa
+        have hy := opBits_valid decls locals hslots hT.frag b hokB y hyb
         refine ⟨fun r hr => ?_, fun h => by simp [rvBitsB, hrel, htyA, hxa, hyb] at h⟩
         simp [rvBitsB, hrel, htyA, hxa, hyb] at hr
         subst hr
@@ -1855,6 +1860,99 @@ theorem evalRvalue_fragB (decls : List LocalDecl) (locals : List LocalSlot)
   | .nullaryOp _ _, hok => simp [rvalueOkB] at hok
   | .shallowInitBox _ _, hok => simp [rvalueOkB] at hok
   | .wrapUnsafeBinder _ _, hok => simp [rvalueOkB] at hok
+
+/-! ## Three-way comparisons (`Ordering` rvalues) -/
+
+/-- Anneal's three-way comparison of two integers of one fragment type yields
+the tag (`ordBits`) of the `Ordering` variant that MiniRust's `RelOp::Cmp`
+followed by `minimize`'s transmute produces from the decoded values (`cmpOf`),
+for both signed and unsigned types. -/
+theorem evalScalarBinOp_cmp_int (it : Gen.IntType) (hgood : GoodSize it.size.bytes)
+    (x y : Nat) (hx : x < 2 ^ (8 * it.size.bytes)) (hy : y < 2 ^ (8 * it.size.bytes))
+    (locals : List LocalSlot) (mem : MirSemantics.Memory) :
+    evalScalarBinOp .cmp ⟨x, it.size.bytes⟩ ⟨y, it.size.bytes⟩ locals mem
+        (match it.signed with | .Unsigned => false | .Signed => true) =
+      .ok (.scalar ⟨ordBits (cmpOf (.Int it) x y), u8Ty.size.bytes⟩) locals mem := by
+  have hsz : it.size.bytes ≠ 0 := Nat.ne_of_gt hgood.pos
+  have hbeq : Nat.beq it.size.bytes 0 = false := by rw [nat_beq_eq_decide, decide_eq_false hsz]
+  have heq := decide_intFromBits_eq it x y hx hy
+  rcases it with ⟨signed, ⟨sz⟩⟩
+  dsimp only at hsz hbeq hx hy heq ⊢
+  cases signed with
+  | Unsigned =>
+    simp only [evalScalarBinOp, hbeq, Nat.beq_refl, cmpOf, intFromBits_unsigned, intCmp,
+      nat_beq_eq_decide, nat_ble_eq_decide]
+    by_cases h1 : x < y
+    · have h2 : x ≠ y := by omega
+      have h3 : x ≤ y := by omega
+      simp [h1, h2, h3, ordBits, u8Ty]
+    · by_cases h2 : x = y
+      · subst h2; simp [ordBits, u8Ty]
+      · have h3 : ¬ x ≤ y := by omega
+        have h4 : ¬ (x : Int) < y := by omega
+        have h5 : ¬ (x : Int) = y := by omega
+        simp [h2, h3, h4, h5, ordBits, u8Ty]
+  | Signed =>
+    obtain ⟨hM, _⟩ := two_pow_byte_split sz hsz
+    simp only [evalScalarBinOp, hbeq, Nat.beq_refl, cmpOf, intCmp, scalarModulus_eq,
+      wrapScalarBits_eq, Nat.mod_eq_of_lt hx, Nat.mod_eq_of_lt hy, signedLt_eq x y sz hsz hx hy]
+    rw [← heq]
+    generalize intFromBits x ⟨.Signed, ⟨sz⟩⟩ = a
+    generalize intFromBits y ⟨.Signed, ⟨sz⟩⟩ = b
+    by_cases h1 : a < b
+    · have h2 : a ≠ b := by omega
+      simp [h1, h2, ordBits, u8Ty]
+    · by_cases h2 : a = b
+      · subst h2; simp [ordBits, u8Ty]
+      · simp [h1, h2, ordBits, u8Ty]
+
+/-- Anneal's three-way comparison of two `bool`s (one byte each, `0` or `1`,
+compared unsigned) agrees with MiniRust's `false < true`. -/
+theorem evalScalarBinOp_cmp_bool (x y : Nat) (hx : x < 2) (hy : y < 2)
+    (locals : List LocalSlot) (mem : MirSemantics.Memory) :
+    evalScalarBinOp .cmp ⟨x, u8Ty.size.bytes⟩ ⟨y, u8Ty.size.bytes⟩ locals mem false =
+      .ok (.scalar ⟨ordBits (cmpOf .Bool x y), u8Ty.size.bytes⟩) locals mem := by
+  rcases (by omega : x = 0 ∨ x = 1) with rfl | rfl <;>
+    rcases (by omega : y = 0 ∨ y = 1) with rfl | rfl <;> rfl
+
+/-- Evaluating a fragment rvalue of type `Ordering` in Anneal's semantics. -/
+theorem evalRvalue_fragO (decls : List LocalDecl) (locals : List LocalSlot)
+    (hslots : SlotsOk decls locals) (hn : locals.length = decls.length)
+    (rv : Rvalue) (hok : rvalueOkO decls rv = true)
+    (mem : MirSemantics.Memory) (layouts : Layout.LayoutTable) :
+    (∀ r, rvBitsO decls locals rv = some r →
+      evalRvalue locals rv mem decls layouts = .ok (.scalar ⟨r, u8Ty.size.bytes⟩) locals mem) ∧
+    (rvBitsO decls locals rv = none → evalRvalue locals rv mem decls layouts = .ub) := by
+  obtain ⟨a, b, rfl, hops⟩ := rvalueOkO_spec hok
+  obtain ⟨T, it, hT, htyA, hokA, hokB⟩ := relOperandsOk_spec hops
+  obtain ⟨ha, hanone⟩ := evalOperand_fragT decls locals hslots hn hT.frag a hokA
+    mem.borrows mem.globals layouts mem.callerLocals
+  obtain ⟨hb, hbnone⟩ := evalOperand_fragT decls locals hslots hn hT.frag b hokB
+    mem.borrows mem.globals layouts mem.callerLocals
+  have hsigned := operandIsSigned_of_OperandOkT decls layouts a hokA
+  cases hxa : opBits locals a with
+  | none =>
+    refine ⟨fun r hr => by simp [rvBitsO, htyA, hxa] at hr, fun _ => ?_⟩
+    simp [evalRvalue, hanone hxa]
+  | some x =>
+    cases hyb : opBits locals b with
+    | none =>
+      refine ⟨fun r hr => by simp [rvBitsO, htyA, hxa, hyb] at hr, fun _ => ?_⟩
+      simp [evalRvalue, ha x hxa, hbnone hyb]
+    | some y =>
+      have hx := opBits_valid decls locals hslots hT.frag a hokA x hxa
+      have hy := opBits_valid decls locals hslots hT.frag b hokB y hyb
+      refine ⟨fun r hr => ?_, fun h => by simp [rvBitsO, htyA, hxa, hyb] at h⟩
+      simp [rvBitsO, htyA, hxa, hyb] at hr
+      subst hr
+      have hres : evalScalarBinOp .cmp ⟨x, it.size.bytes⟩ ⟨y, it.size.bytes⟩ locals mem
+          (signedOf T) = .ok (.scalar ⟨ordBits (cmpOf T x y), u8Ty.size.bytes⟩) locals mem := by
+        cases hT with
+        | int it hgood => exact evalScalarBinOp_cmp_int it hgood x y hx hy locals mem
+        | bool =>
+          exact evalScalarBinOp_cmp_bool x y (by simpa [ValidBits] using hx)
+            (by simpa [ValidBits] using hy) locals mem
+      simp only [evalRvalue, ha x hxa, hb y hyb, hsigned, hres]
 
 /-! ## Statements -/
 
@@ -1911,6 +2009,24 @@ theorem evalStmt_assignB (s : MachineState) (decls : List LocalDecl) (layouts : 
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
   have hit : itOf d = u8Ty := (tyOf_bool hbool).2
   obtain ⟨hok', hnone⟩ := evalRvalue_fragB decls s.frame.locals hslots hn rv hok s.memory layouts
+  obtain ⟨hA, hAub⟩ := evalStmt_assign_of s decls layouts i rv span hslots hn d hd hbor hprot
+  refine ⟨fun r hr => ?_, fun h => hAub (hnone h)⟩
+  rw [hit]
+  exact hA _ (hok' r hr)
+
+theorem evalStmt_assignO (s : MachineState) (decls : List LocalDecl) (layouts : Layout.LayoutTable)
+    (i : Nat) (rv : Rvalue) (span : String) (hslots : SlotsOk decls s.frame.locals)
+    (hn : s.frame.locals.length = decls.length) (d : LocalDecl) (hd : decls[i]? = some d)
+    (hord : isOrderingTy d.ty = true) (hok : rvalueOkO decls rv = true)
+    (hbor : s.memory.borrows = []) (hprot : s.memory.activeProtectors = []) :
+    (∀ r, rvBitsO decls s.frame.locals rv = some r →
+      evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts =
+        .tau (.running (advanceStmt s (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩)))
+          { s.memory with borrows := [] }))) ∧
+    (rvBitsO decls s.frame.locals rv = none →
+      evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
+  have hit : itOf d = u8Ty := (tyOf_ordering hord).2
+  obtain ⟨hok', hnone⟩ := evalRvalue_fragO decls s.frame.locals hslots hn rv hok s.memory layouts
   obtain ⟨hA, hAub⟩ := evalStmt_assign_of s decls layouts i rv span hslots hn d hd hbor hprot
   refine ⟨fun r hr => ?_, fun h => hAub (hnone h)⟩
   rw [hit]

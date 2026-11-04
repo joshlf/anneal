@@ -29,9 +29,11 @@ MiniRust `Machine<BasicMemory<x86_64>>` in which:
   its own `Stack` allocation whose bytes are the representation-relation
   encoding of Anneal's slot: `Uninit` bytes for an uninitialized slot and the
   little-endian bytes of the bit pattern for an initialized scalar. An
-  initialized `bool` slot holds `0` or `1` (`ValidBits`), so its one byte
-  decodes at `Type::Bool`. The callee's allocations sit after an arbitrary
-  prefix `base` of allocations, which contains the caller's return place;
+  initialized `bool` slot holds `0` or `1`, and an initialized
+  `core::cmp::Ordering` slot holds the bit pattern `255`, `0`, or `1` of the
+  tag `-1`, `0`, or `1` (`ValidBits`), so its one byte decodes at its MiniRust
+  type. The callee's allocations sit after an arbitrary prefix `base` of
+  allocations, which contains the caller's return place;
 * the Anneal state has no borrows, protectors, call stack, active callee, or
   caller-owned referents (the fragment cannot create any).
 
@@ -50,45 +52,62 @@ open MiniRustSpec.LibSpecr
 open MiniRustSpec.Interp
 
 /-- MiniRust storage integer type of a MIR local declaration: its own integer
-type, or `u8` (the default) for a `bool` local, which occupies one byte with
-alignment one just like a `u8` (`Type::layout` gives `Bool` the layout
-`Sized(Size::from_bytes_const(1), Align::ONE)`). -/
+type, or `u8` (the default) for a `bool` or `core::cmp::Ordering` local, which
+occupies one byte with alignment one just like a `u8` (`Type::layout` gives
+`Bool` the layout `Sized(Size::from_bytes_const(1), Align::ONE)`, and
+`orderingTy` has size and alignment 1). -/
 def itOf (d : LocalDecl) : Gen.IntType := (intTypeOf d.ty).getD ⟨.Unsigned, ⟨1⟩⟩
 
-/-- MiniRust type of a fragment local declaration (`Type::Int(..)` or
-`Type::Bool`, as `minimize` translates it); the default is never used for
-fragment bodies. -/
+/-- MiniRust type of a fragment local declaration (`Type::Int(..)`,
+`Type::Bool`, or `orderingTy`, as `minimize` translates it); the default is
+never used for fragment bodies. -/
 def tyOf (d : LocalDecl) : Gen.Type := (scalarTypeOf d.ty).getD (.Int (itOf d))
 
 /-- Byte size of a fragment type. -/
 def tyBytes : Gen.Type → Nat
   | .Int it => it.size.bytes
+  | .Enum _ _ _ size _ => size.bytes
   | _ => 1
 
+/-- `Type::encode` of `Value::Int(int_from_bits(bits))` at `Type::Int(it)`:
+little-endian bytes without provenance. -/
+def scalarBytes (it : Gen.IntType) (bits : Nat) : List Byte :=
+  (leBytes bits it.size.bytes).map (fun b => .Init b none)
+
+/-- Whether a decoding result is a value (`Some(_)`, not `None` or a stop). -/
+def decodesOk : Interp (Option Val) → Bool
+  | .ok (some _) => true
+  | _ => false
+
+theorem decodesOk_iff (r : Interp (Option Val)) : decodesOk r = true ↔ ∃ v, r = .ok (some v) := by
+  rcases r with _ | (_ | v) <;> simp [decodesOk]
+
 /-- The bit patterns that encode a value of a fragment type: every in-range
-pattern for an integer type, and only `0` (`false`) and `1` (`true`) for
-`bool`, whose other byte values MiniRust's `decode` rejects. -/
+pattern for an integer type; only `0` (`false`) and `1` (`true`) for `bool`,
+whose other byte values MiniRust's `decode` rejects; and, for an enum (the
+fragment's only enum is `core::cmp::Ordering`, `orderingTy`), the in-range
+patterns whose little-endian bytes `Type::decode` accepts, that is, whose tag
+the enum's discriminator maps to a variant. -/
 def ValidBits : Gen.Type → Nat → Prop
   | .Int it, bits => bits < 2 ^ (8 * it.size.bytes)
   | .Bool, bits => bits < 2
+  | T@(.Enum _ _ _ size _), bits => bits < 2 ^ (8 * size.bytes) ∧
+      ∃ v, Type.decode T (scalarBytes ⟨.Unsigned, size⟩ bits) = .ok (some v)
   | _, _ => False
 
 /-- Decidable `ValidBits`. -/
 def validBits : Gen.Type → Nat → Bool
   | .Int it, bits => decide (bits < 2 ^ (8 * it.size.bytes))
   | .Bool, bits => decide (bits < 2)
+  | T@(.Enum _ _ _ size _), bits => decide (bits < 2 ^ (8 * size.bytes)) &&
+      decodesOk (Type.decode T (scalarBytes ⟨.Unsigned, size⟩ bits))
   | _, _ => false
 
 theorem validBits_iff (T : Gen.Type) (bits : Nat) : validBits T bits = true ↔ ValidBits T bits := by
-  cases T <;> simp [validBits, ValidBits]
+  cases T <;> simp [validBits, ValidBits, decodesOk_iff]
 
 instance (T : Gen.Type) (bits : Nat) : Decidable (ValidBits T bits) :=
   decidable_of_iff _ (validBits_iff T bits)
-
-/-- `Type::encode` of `Value::Int(int_from_bits(bits))` at `Type::Int(it)`:
-little-endian bytes without provenance. -/
-def scalarBytes (it : Gen.IntType) (bits : Nat) : List Byte :=
-  (leBytes bits it.size.bytes).map (fun b => .Init b none)
 
 /-- The contents of a freshly allocated MiniRust local: all `Uninit`. -/
 def uninitBytes (it : Gen.IntType) : List Byte := List.replicate it.size.bytes .Uninit

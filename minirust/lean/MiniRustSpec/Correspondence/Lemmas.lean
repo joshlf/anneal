@@ -67,24 +67,49 @@ theorem isBoolTy_intTypeOf {t : MirAst.Ty} (h : isBoolTy t = true) : intTypeOf t
   unfold intTypeOf intTyBytes
   split at h <;> simp_all
 
+theorem intTypeOf_isOrderingTy {t : MirAst.Ty} {it : Gen.IntType} (h : intTypeOf t = some it) :
+    isOrderingTy t = false := by
+  unfold intTypeOf intTyBytes at h
+  unfold isOrderingTy
+  split at h <;> simp_all
+
+theorem isOrderingTy_intTypeOf {t : MirAst.Ty} (h : isOrderingTy t = true) : intTypeOf t = none := by
+  unfold isOrderingTy at h
+  unfold intTypeOf intTyBytes
+  split at h <;> simp_all
+
+theorem isOrderingTy_isBoolTy {t : MirAst.Ty} (h : isOrderingTy t = true) : isBoolTy t = false := by
+  unfold isOrderingTy at h
+  unfold isBoolTy
+  split at h <;> simp_all
+
 theorem scalarTypeOf_int {t : MirAst.Ty} {it : Gen.IntType} (h : intTypeOf t = some it) :
     scalarTypeOf t = some (.Int it) := by
-  simp [scalarTypeOf, intTypeOf_isBoolTy h, h]
+  simp [scalarTypeOf, intTypeOf_isBoolTy h, intTypeOf_isOrderingTy h, h]
 
 theorem scalarTypeOf_bool {t : MirAst.Ty} (h : isBoolTy t = true) : scalarTypeOf t = some .Bool := by
   simp [scalarTypeOf, h]
 
-/-- A fragment scalar type is `bool` or an integer type. -/
+theorem scalarTypeOf_ordering {t : MirAst.Ty} (h : isOrderingTy t = true) :
+    scalarTypeOf t = some orderingTy := by
+  simp [scalarTypeOf, h, isOrderingTy_isBoolTy h]
+
+/-- A fragment type is `bool`, an integer type, or `core::cmp::Ordering`. -/
 theorem scalarTypeOf_cases {t : MirAst.Ty} {T : Gen.Type} (h : scalarTypeOf t = some T) :
-    (isBoolTy t = true ∧ T = .Bool) ∨ (∃ it, intTypeOf t = some it ∧ T = .Int it) := by
+    (isBoolTy t = true ∧ T = .Bool) ∨ (∃ it, intTypeOf t = some it ∧ T = .Int it) ∨
+      (isOrderingTy t = true ∧ T = orderingTy) := by
   unfold scalarTypeOf at h
   cases hb : isBoolTy t with
   | true => simp [hb] at h; exact .inl ⟨rfl, h.symm⟩
   | false =>
     simp only [hb, Bool.false_eq_true, ↓reduceIte] at h
-    cases hit : intTypeOf t with
-    | none => simp [hit] at h
-    | some it => simp [hit] at h; exact .inr ⟨it, rfl, h.symm⟩
+    cases ho : isOrderingTy t with
+    | true => simp [ho] at h; exact .inr (.inr ⟨rfl, h.symm⟩)
+    | false =>
+      simp only [ho, Bool.false_eq_true, ↓reduceIte] at h
+      cases hit : intTypeOf t with
+      | none => simp [hit] at h
+      | some it => simp [hit] at h; exact .inr (.inl ⟨it, rfl, h.symm⟩)
 
 theorem tyOf_int {d : LocalDecl} {it : Gen.IntType} (h : intTypeOf d.ty = some it) :
     tyOf d = .Int it ∧ itOf d = it := by
@@ -92,6 +117,18 @@ theorem tyOf_int {d : LocalDecl} {it : Gen.IntType} (h : intTypeOf d.ty = some i
 
 theorem tyOf_bool {d : LocalDecl} (h : isBoolTy d.ty = true) : tyOf d = .Bool ∧ itOf d = u8Ty := by
   simp [tyOf, itOf, scalarTypeOf_bool h, isBoolTy_intTypeOf h, u8Ty]
+
+theorem tyOf_ordering {d : LocalDecl} (h : isOrderingTy d.ty = true) :
+    tyOf d = orderingTy ∧ itOf d = u8Ty := by
+  simp [tyOf, itOf, scalarTypeOf_ordering h, isOrderingTy_intTypeOf h, u8Ty]
+
+/-- `Ordering` constants are outside the fragment: `translateOperand` reads
+only integer and `bool` scalars. -/
+theorem translateOperand_ordering_const {c : ConstOperand} (ho : isOrderingTy c.ty = true) :
+    translateOperand (.constant c) = none := by
+  simp only [translateOperand, isOrderingTy_isBoolTy ho, Bool.false_eq_true, ↓reduceIte,
+    isOrderingTy_intTypeOf ho]
+  split <;> simp_all
 
 /-- `tyOf` is the translated type of a fragment local. -/
 theorem tyOf_of_scalarTypeOf {d : LocalDecl} {T : Gen.Type} (h : scalarTypeOf d.ty = some T) :

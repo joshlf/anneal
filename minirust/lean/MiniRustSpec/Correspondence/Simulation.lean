@@ -491,18 +491,26 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
               hslotsA hrel.nlocals d hdi hb hokB hrel.borrows hrel.protectors
             exact ⟨_, hMok, hMnone, hAok, hAnone⟩
           | false =>
-            cases hit : intTypeOf d.ty with
-            | none => simp [hdi, hb, hit] at hok
-            | some it =>
-              have hitd : itOf d = it := (tyOf_int hit).2
-              have hok' : rvalueOk body.localDecls (itOf d) rv = true := by
-                rw [hitd]; simpa [hdi, hb, hit] using hok
-              have hint : intTypeOf d.ty = some (itOf d) := by rw [hitd]; exact hit
-              have hgood := hframe.decl_good i d hdi
-              obtain ⟨hMok, hMnone⟩ := evalStatement_assign hframe i d hdi hint rv hok' e he
-              obtain ⟨hAok, hAnone⟩ := evalStmt_assign s body.localDecls body.layouts i rv span
-                hslotsA hrel.nlocals d hdi hgood hok' hrel.borrows hrel.protectors
+            cases ho : isOrderingTy d.ty with
+            | true =>
+              have hokO : rvalueOkO body.localDecls rv = true := by simpa [hdi, hb, ho] using hok
+              obtain ⟨hMok, hMnone⟩ := evalStatement_assignO hframe i d hdi ho rv hokO e he
+              obtain ⟨hAok, hAnone⟩ := evalStmt_assignO s body.localDecls body.layouts i rv span
+                hslotsA hrel.nlocals d hdi ho hokO hrel.borrows hrel.protectors
               exact ⟨_, hMok, hMnone, hAok, hAnone⟩
+            | false =>
+              cases hit : intTypeOf d.ty with
+              | none => simp [hdi, hb, ho, hit] at hok
+              | some it =>
+                have hitd : itOf d = it := (tyOf_int hit).2
+                have hok' : rvalueOk body.localDecls (itOf d) rv = true := by
+                  rw [hitd]; simpa [hdi, hb, ho, hit] using hok
+                have hint : intTypeOf d.ty = some (itOf d) := by rw [hitd]; exact hit
+                have hgood := hframe.decl_good i d hdi
+                obtain ⟨hMok, hMnone⟩ := evalStatement_assign hframe i d hdi hint rv hok' e he
+                obtain ⟨hAok, hAnone⟩ := evalStmt_assign s body.localDecls body.layouts i rv span
+                  hslotsA hrel.nlocals d hdi hgood hok' hrel.borrows hrel.protectors
+                exact ⟨_, hMok, hMnone, hAok, hAnone⟩
         cases hr : rvB with
         | none =>
           rw [hAnone hr]

@@ -56,11 +56,15 @@ here.
 * `Terminator::Goto`, `Terminator::Switch`, `Terminator::Unreachable`, and
   `Terminator::Return` (`spec/lang/step/terminators.md`), including frame
   teardown, `storage_dead` of every local, and both stack-pop actions.
-* The representation relation for `Type::Int` and `Type::Bool`
-  (`spec/lang/representation.md`), `Type::layout` for those types
-  (`spec/lang/types.md`), and `BasicMemory`'s `load`, `store`, `deallocate`,
-  and `check_ptr` (`spec/mem/basic.md`), wrapped by `ConcurrentMemory`'s access
-  recording (`spec/mem/concurrent.md`).
+* The representation relation for `Type::Int`, `Type::Bool`, sized
+  `Type::Tuple`, and `Type::Enum` (including `decode_discriminant` and
+  `encode_discriminant`), and `Machine::check_value` for integers, Booleans,
+  tuples, and variants (`spec/lang/representation.md`); `Type::layout` for
+  those types and for unions (`spec/lang/types.md`); and `BasicMemory`'s
+  `load`, `store`, `deallocate`, and `check_ptr` (`spec/mem/basic.md`),
+  wrapped by `ConcurrentMemory`'s access recording (`spec/mem/concurrent.md`).
+  The recursion of these definitions over nested types, fields, and variants
+  is structural (Lean `mutual` blocks), so the kernel evaluates them.
 * The `x86_64` target (`spec/prelude/target.md`) as the instance of `T` and
   `BasicMemory<x86_64>` as the instance of `M`.
 
@@ -292,6 +296,13 @@ def writeSubsliceAtIndex {T : Type} (xs : List T) (start : Int) (src : List T) :
     pure (xs.take start.toNat ++ src ++ xs.drop (start.toNat + src.length))
   else specPanic "write_subslice_at_index out of range"
 
+/-- `Size::align_to(align)`: the least multiple of `align` that is at least
+`s`, `Size::from_bytes(self.bytes().next_multiple_of(align.bytes()))`, where
+`Int::next_multiple_of(other)` is `self.div_ceil(other) * other`. Alignments
+are positive, so `div_ceil(s, a)` is `(s + a - 1) / a`. -/
+def Size.align_to (s : Size) (a : Align) : Size :=
+  ⟨(s.bytes + a.bytes - 1) / a.bytes * a.bytes⟩
+
 /-! ## Target `x86_64` (`spec/prelude/target.md`)
 
 > "impl Target for x86_64 {
@@ -334,13 +345,36 @@ def IntType.align (t : IntType) : Interp Align :=
   | some a => pure ⟨min a.bytes x86_64.INT_MAX_ALIGN.bytes⟩
   | none => specPanic "Align::from_bytes(size).unwrap()"
 
+/-- `TupleHeadLayout::head_size_and_align` (`spec/lang/types.md`), the size
+and alignment of a tuple without an unsized tail:
+> "pub fn head_size_and_align(self) -> (Size, Align) {
+>     // This is equivalent to `full_size_and_align(ZERO, ONE)`.
+>     (self.end.align_to(self.align), self.align)
+> }" -/
+def TupleHeadLayout.head_size_and_align (l : TupleHeadLayout) : Size × Align :=
+  (Size.align_to l.end l.align, l.align)
+
 /-- `Type::layout::<x86_64>` for the interpreted types:
 > "Int(int_type) => Sized(int_type.size, int_type.align::<T>()),
->  Bool => Sized(Size::from_bytes_const(1), Align::ONE)," -/
+>  Bool => Sized(Size::from_bytes_const(1), Align::ONE),
+>  ..
+>  Union { size, align, .. } | Enum { size, align, .. } => Sized(size, align),
+>  Tuple { sized_head_layout, unsized_field, .. } => match unsized_field {
+>      None => {
+>          let (size, align) = sized_head_layout.head_size_and_align();
+>          Sized(size, align)
+>      }"
+A tuple with an unsized tail, pointers, arrays, slices, and trait objects are
+outside the fragment. -/
 def Type.layout : «Type» → Interp LayoutStrategy
   | .Int t => do pure (.Sized t.size (← IntType.align t))
   | .Bool => pure (.Sized ⟨1⟩ ⟨1⟩)
-  | _ => unsupported "Type::layout for a non-Int, non-Bool type"
+  | .Union _ _ size align => pure (.Sized size align)
+  | .Enum _ _ _ size align => pure (.Sized size align)
+  | .Tuple _ headLayout none =>
+    let (size, align) := TupleHeadLayout.head_size_and_align headLayout
+    pure (.Sized size align)
+  | _ => unsupported "Type::layout for a pointer, array, slice, trait object, or unsized tuple"
 
 /-- `LayoutStrategy::expect_size` (`spec/lang/types.md`):
 > "pub fn expect_size(self, msg: &str) -> Size {
@@ -379,7 +413,123 @@ def AbstractByte.data : Byte → Option UInt8
   | .Uninit => none
   | .Init b _ => some b
 
-/-- `Type::decode` for `Bool` and `Int`:
+/-- `Type::decode` for `Int` (`spec/lang/representation.md`):
+> "fn decode<M: Memory>(Type::Int(IntType { signed, size }): Self, bytes: ..) -> Option<Value<M>> {
+>     if bytes.len() != size.bytes() { panic!(..); }
+>     // Fails if any byte is `Uninit`.
+>     let bytes_data: List<u8> = bytes.try_map(|b| b.data())?;
+>     ret(Value::Int(M::T::ENDIANNESS.decode(signed, bytes_data)))
+> }"
+`Type.decode (.Int t)` is `Type.decodeInt t`; it is a definition of its own
+because `decodeDiscriminant` decodes tags at `Type::Int`. -/
+def Type.decodeInt : IntType → List Byte → Interp (Option Val)
+  | ⟨signed, size⟩, bytes =>
+    if bytes.length ≠ size.bytes then specPanic "decode of Type::Int with invalid length"
+    else
+      match bytes.mapM AbstractByte.data with
+      | some data => pure (some (.Int (Endianness.decode x86_64.ENDIANNESS signed data)))
+      | none => pure none
+
+/-- `Type::encode` for `Int` (`spec/lang/representation.md`):
+> "fn encode<M: Memory>(Type::Int(IntType { signed, size }): Self, val: Value<M>) -> .. {
+>     let Value::Int(i) = val else { panic!() };
+>     // `Endianness::encode` will do the integer's bound check.
+>     let bytes_data = M::T::ENDIANNESS.encode(signed, size, i).unwrap();
+>     bytes_data.map(|b| AbstractByte::Init(b, None))
+> }"
+`Type.encode (.Int t)` is `Type.encodeInt t`; it is a definition of its own
+because `encodeDiscriminant` encodes tags at `Type::Int`. -/
+def Type.encodeInt : IntType → Val → Interp (List Byte)
+  | ⟨signed, size⟩, .Int i =>
+    match Endianness.encode x86_64.ENDIANNESS signed size i with
+    | some data => pure (data.map (fun b => .Init b none))
+    | none => specPanic "Endianness::encode(..).unwrap()"
+  | _, _ => specPanic "encode: Type::Int with a non-Int value"
+
+mutual
+
+/-- `decode_discriminant` (`spec/lang/representation.md`), which walks an
+enum's `Discriminator` decision tree, reading tags through `accessor`:
+> "fn decode_discriminant<M: Memory>(
+>     mut accessor: impl FnMut(Offset, Size) -> Result<List<AbstractByte<M::Provenance>>>,
+>     discriminator: Discriminator
+> ) -> Result<Option<Int>> {
+>     match discriminator {
+>         Discriminator::Known(val) => ret(Some(val)),
+>         Discriminator::Invalid => ret(None),
+>         Discriminator::Branch { offset, value_type, children, fallback } => {
+>             let bytes = accessor(offset, value_type.size)?;
+>             let Some(Value::Int(val)) = Type::Int(value_type).decode::<M>(bytes)
+>                 else { return ret(None); };
+>             let next_discriminator = children.iter()
+>                 .find_map(|((start, end), child)|
+>                     if start <= val && val < end { Some(child) } else { None })
+>                 .unwrap_or(fallback);
+>             decode_discriminant::<M>(accessor, next_discriminator)
+>         }
+>     }
+> }"
+The only accessor in the fragment (the one of `Type::decode` for `Enum`) is a
+pure function of its arguments, so `accessor` maps into `Interp` without
+further state. To keep the recursion structural, the `Branch` case passes the
+result of recursing into `fallback` to `decodeDiscriminantChildren`, which
+returns it exactly when no child's range `[start, end)` contains the tag; Lean
+is pure, so this equals choosing `next_discriminator` first and recursing on
+it afterwards. -/
+def decodeDiscriminant (accessor : Offset → Size → Interp (List Byte)) :
+    Discriminator → Interp (Option Int)
+  | .Known val => pure (some val)
+  | .Invalid => pure none
+  | .Branch offset valueType fallback ⟨children⟩ => do
+    let bytes ← accessor offset valueType.size
+    match ← Type.decodeInt valueType bytes with
+    | some (.Int val) =>
+      decodeDiscriminantChildren accessor val (decodeDiscriminant accessor fallback) children
+    | _ => pure none
+
+/-- The choice of the next discriminator in `decode_discriminant`
+(`spec/lang/representation.md`), followed by the recursive call:
+> "let next_discriminator = children.iter()
+>     .find_map(|((start, end), child)|
+>         if start <= val && val < end { Some(child) } else { None })
+>     .unwrap_or(fallback);
+> decode_discriminant::<M>(accessor, next_discriminator)"
+`onFallback` is the result of the recursive call on `fallback`. -/
+def decodeDiscriminantChildren (accessor : Offset → Size → Interp (List Byte)) (val : Int)
+    (onFallback : Interp (Option Int)) :
+    List ((Int × Int) × Discriminator) → Interp (Option Int)
+  | [] => onFallback
+  | ((start, end_), child) :: rest =>
+    if start ≤ val ∧ val < end_ then decodeDiscriminant accessor child
+    else decodeDiscriminantChildren accessor val onFallback rest
+
+end
+
+/-- `encode_discriminant` (`spec/lang/representation.md`), which writes every
+tag of a variant's `tagger` through `accessor`:
+> "fn encode_discriminant<M: Memory>(
+>     mut accessor: impl FnMut(Offset, List<AbstractByte<M::Provenance>>) -> Result,
+>     tagger: Map<Offset, (IntType, Int)>
+> ) -> Result<()> {
+>     for (offset, (value_type, value)) in tagger.iter() {
+>         let bytes = Type::Int(value_type).encode::<M>(Value::Int(value));
+>         accessor(offset, bytes)?;
+>     }
+>     ret(())
+> }"
+The state that the `FnMut` accessor mutates (for `Type::encode` at `Enum`, the
+bytes being encoded) is threaded through explicitly as `s : σ`. -/
+def encodeDiscriminant {σ : Type} (accessor : σ → Offset → List Byte → Interp σ)
+    (tagger : Map Offset (IntType × Int)) (s : σ) : Interp σ :=
+  tagger.entries.foldlM (fun s entry => do
+    let (offset, (valueType, value)) := entry
+    let bytes ← Type.encodeInt valueType (.Int value)
+    accessor s offset bytes) s
+
+mutual
+
+/-- `Type::decode` for `Bool`, `Int` (`Type.decodeInt`), `Tuple`, and `Enum`
+(`spec/lang/representation.md`):
 > "fn decode<M: Memory>(Type::Bool: Self, bytes: ..) -> Option<Value<M>> {
 >     if bytes.len() != 1 { panic!(..); }
 >     ret(match bytes[0] {
@@ -387,14 +537,38 @@ def AbstractByte.data : Byte → Option UInt8
 >         AbstractByte::Init(1, _) => Value::Bool(true),
 >         _ => throw!(),
 >     })
-> }
-> ..
-> fn decode<M: Memory>(Type::Int(IntType { signed, size }): Self, bytes: ..) -> Option<Value<M>> {
->     if bytes.len() != size.bytes() { panic!(..); }
->     // Fails if any byte is `Uninit`.
->     let bytes_data: List<u8> = bytes.try_map(|b| b.data())?;
->     ret(Value::Int(M::T::ENDIANNESS.decode(signed, bytes_data)))
-> }" -/
+> }"
+> "fn decode<M: Memory>(
+>     Type::Tuple { sized_fields, sized_head_layout, unsized_field }: Self,
+>     bytes: List<AbstractByte<M::Provenance>>
+> ) -> Option<Value<M>> {
+>     assert!(unsized_field.is_none(), \"decode of Type::Tuple with unsized field\");
+>     let (size, _) = sized_head_layout.head_size_and_align();
+>     if bytes.len() != size.bytes() { panic!(\"decode of Type::Tuple with invalid length\"); }
+>     ret(Value::Tuple(
+>         sized_fields.try_map(|(offset, ty)| { .. })?
+>     ))
+> }"
+> "fn decode<M: Memory>(
+>     Type::Enum { variants, discriminator, size, .. }: Self,
+>     bytes: List<AbstractByte<M::Provenance>>
+> ) -> Option<Value<M>> {
+>     if bytes.len() != size.bytes() { panic!(\"decode of Type::Enum with invalid length\"); }
+>     ..
+>     let discriminant = decode_discriminant::<M>(
+>         |offset, size| ret(bytes.subslice_with_length(offset.bytes(), size.bytes())),
+>         discriminator
+>     ).unwrap()?;
+>     ..
+>     let Some(value) = variants[discriminant].ty.decode(bytes)
+>         else { return None };
+>     Some(Value::Variant { discriminant, data: value })
+> }"
+The fields of a tuple are decoded by `Type.decodeFields` and the data of an
+enum variant by `Type.decodeVariant`. `decode_discriminant` fails only if its
+accessor does; this accessor fails only by panicking (`subsliceWithLength` out
+of range), so `.unwrap()` is the propagation of that panic. Pointers, arrays,
+unions, and the unsized types are outside the fragment. -/
 def Type.decode : «Type» → List Byte → Interp (Option Val)
   | .Bool, bytes =>
     if bytes.length ≠ 1 then specPanic "decode of Type::Bool with invalid length"
@@ -403,50 +577,225 @@ def Type.decode : «Type» → List Byte → Interp (Option Val)
       | [.Init 0 _] => pure (some (.Bool false))
       | [.Init 1 _] => pure (some (.Bool true))
       | _ => pure none
-  | .Int ⟨signed, size⟩, bytes =>
-    if bytes.length ≠ size.bytes then specPanic "decode of Type::Int with invalid length"
-    else
-      match bytes.mapM AbstractByte.data with
-      | some data => pure (some (.Int (Endianness.decode x86_64.ENDIANNESS signed data)))
+  | .Int t, bytes => Type.decodeInt t bytes
+  | .Tuple fields headLayout unsizedField, bytes =>
+    match unsizedField with
+    | some _ => specPanic "decode of Type::Tuple with unsized field"
+    | none =>
+      let (size, _) := TupleHeadLayout.head_size_and_align headLayout
+      if bytes.length ≠ size.bytes then specPanic "decode of Type::Tuple with invalid length"
+      else do
+        match ← Type.decodeFields fields bytes with
+        | some vals => pure (some (.Tuple vals))
+        | none => pure none
+  | .Enum ⟨variants⟩ _ discriminator size _, bytes =>
+    if bytes.length ≠ size.bytes then specPanic "decode of Type::Enum with invalid length"
+    else do
+      let accessor := fun (offset : Offset) (size : Size) =>
+        subsliceWithLength bytes offset.bytes size.bytes
+      match ← decodeDiscriminant accessor discriminator with
       | none => pure none
-  | _, _ => unsupported "Type::decode for a non-Int, non-Bool type"
+      | some discriminant =>
+        match ← Type.decodeVariant variants discriminant bytes with
+        | some value => pure (some (.Variant discriminant value))
+        | none => pure none
+  | _, _ => unsupported "Type::decode for a pointer, array, slice, union, or trait object type"
 
-/-- `Type::encode` for `Bool` and `Int`:
+/-- The fields of `Type::decode` for `Tuple` (`spec/lang/representation.md`),
+each decoded from its own subslice:
+> "sized_fields.try_map(|(offset, ty)| {
+>     let subslice = bytes.subslice_with_length(
+>         offset.bytes(),
+>         ty.layout::<M::T>().expect_size(\"WF ensures all sized tuple fields are sized\").bytes()
+>     );
+>     ty.decode::<M>(subslice)
+> })?"
+`try_map` stops at the first field that does not decode (`None`). -/
+def Type.decodeFields : List (Offset × «Type») → List Byte → Interp (Option (List Val))
+  | [], _ => pure (some [])
+  | (offset, ty) :: rest, bytes => do
+    let size ← LayoutStrategy.expect_size (← Type.layout ty)
+      "WF ensures all sized tuple fields are sized"
+    let subslice ← subsliceWithLength bytes offset.bytes size.bytes
+    match ← Type.decode ty subslice with
+    | none => pure none
+    | some v =>
+      match ← Type.decodeFields rest bytes with
+      | none => pure none
+      | some vs => pure (some (v :: vs))
+
+/-- The variant data of `Type::decode` for `Enum`
+(`spec/lang/representation.md`):
+> "let Some(value) = variants[discriminant].ty.decode(bytes)
+>     else { return None };"
+`variants[discriminant]` (`Index` on `libspecr::Map`) is the entry for
+`discriminant` (the first one, as in `mapGet`) and panics if there is none,
+as in `mapIndex`. -/
+def Type.decodeVariant : List (Int × Variant) → Int → List Byte → Interp (Option Val)
+  | [], _, _ => specPanic "map index: missing key (variants[discriminant])"
+  | (d, ⟨ty, _⟩) :: rest, discriminant, bytes =>
+    if d = discriminant then Type.decode ty bytes
+    else Type.decodeVariant rest discriminant bytes
+
+end
+
+mutual
+
+/-- `Type::encode` for `Bool`, `Int` (`Type.encodeInt`), `Tuple`, and `Enum`
+(`spec/lang/representation.md`):
 > "fn encode<M: Memory>(Type::Bool: Self, val: Value<M>) -> .. {
 >     let Value::Bool(b) = val else { panic!() };
 >     list![AbstractByte::Init(if b { 1 } else { 0 }, None)]
-> }
-> ..
-> fn encode<M: Memory>(Type::Int(IntType { signed, size }): Self, val: Value<M>) -> .. {
->     let Value::Int(i) = val else { panic!() };
->     // `Endianness::encode` will do the integer's bound check.
->     let bytes_data = M::T::ENDIANNESS.encode(signed, size, i).unwrap();
->     bytes_data.map(|b| AbstractByte::Init(b, None))
-> }" -/
+> }"
+> "fn encode<M: Memory>(
+>     Type::Tuple { sized_fields, sized_head_layout, unsized_field }: Self,
+>     val: Value<M>
+> ) -> List<AbstractByte<M::Provenance>> {
+>     assert!(unsized_field.is_none(), \"encode of Type::Tuple with unsized field\");
+>     let (size, _) = sized_head_layout.head_size_and_align();
+>     let Value::Tuple(values) = val else { panic!() };
+>     assert_eq!(values.len(), sized_fields.len());
+>     let mut bytes = list![AbstractByte::Uninit; size.bytes()];
+>     ..
+>     bytes
+> }"
+> "fn encode<M: Memory>(
+>     Type::Enum { variants, .. }: Self,
+>     val: Value<M>
+> ) -> List<AbstractByte<M::Provenance>> {
+>     ..
+>     let (discriminant, data) = match val {
+>         Value::Variant { discriminant, data } => (discriminant, data),
+>         _ => panic!(),
+>     };
+>     ..
+>     let Variant { ty: variant, tagger } = variants[discriminant];
+>     let mut bytes = variant.encode(data);
+>     ..
+>     encode_discriminant::<M>(|offset, value_bytes| {
+>         bytes.write_subslice_at_index(offset.bytes(), value_bytes);
+>         ret(())
+>     }, tagger).unwrap();
+>     bytes
+> }"
+The fields of a tuple are encoded by `Type.encodeFields` and the variant of
+an enum by `Type.encodeVariant`. Pointers, arrays, unions, and the unsized
+types are outside the fragment. -/
 def Type.encode : «Type» → Val → Interp (List Byte)
   | .Bool, .Bool b => pure [.Init (if b then 1 else 0) none]
   | .Bool, _ => specPanic "encode: Type::Bool with a non-Bool value"
-  | .Int ⟨signed, size⟩, .Int i =>
-    match Endianness.encode x86_64.ENDIANNESS signed size i with
-    | some data => pure (data.map (fun b => .Init b none))
-    | none => specPanic "Endianness::encode(..).unwrap()"
-  | .Int _, _ => specPanic "encode: Type::Int with a non-Int value"
-  | _, _ => unsupported "Type::encode for a non-Int, non-Bool type"
+  | .Int t, val => Type.encodeInt t val
+  | .Tuple fields headLayout unsizedField, val =>
+    match unsizedField with
+    | some _ => specPanic "encode of Type::Tuple with unsized field"
+    | none =>
+      let (size, _) := TupleHeadLayout.head_size_and_align headLayout
+      match val with
+      | .Tuple values =>
+        if values.length ≠ fields.length then
+          specPanic "assertion failed: values.len() == sized_fields.len()"
+        else Type.encodeFields fields values (List.replicate size.bytes .Uninit)
+      | _ => specPanic "encode: Type::Tuple with a non-Tuple value"
+  | .Enum ⟨variants⟩ _ _ _ _, val =>
+    match val with
+    | .Variant discriminant data => Type.encodeVariant variants discriminant data
+    | _ => specPanic "encode: Type::Enum with a non-Variant value"
+  | _, _ => unsupported "Type::encode for a pointer, array, slice, union, or trait object type"
 
-/-- `Machine::check_value` for `Int` and `Bool`:
+/-- The field loop of `Type::encode` for `Tuple`
+(`spec/lang/representation.md`), which writes each field's encoding at its
+offset into `bytes` (initially all `Uninit`):
+> "for ((offset, ty), value) in sized_fields.zip(values) {
+>     bytes.write_subslice_at_index(offset.bytes(), ty.encode::<M>(value));
+> }" -/
+def Type.encodeFields : List (Offset × «Type») → List Val → List Byte → Interp (List Byte)
+  | (offset, ty) :: fields, value :: values, bytes => do
+    let fieldBytes ← Type.encode ty value
+    let bytes ← writeSubsliceAtIndex bytes offset.bytes fieldBytes
+    Type.encodeFields fields values bytes
+  | _, _, bytes => pure bytes
+
+/-- The variant of `Type::encode` for `Enum` (`spec/lang/representation.md`):
+> "let Variant { ty: variant, tagger } = variants[discriminant];
+> let mut bytes = variant.encode(data);"
+followed by writing the tag with `encode_discriminant`, whose accessor writes
+into `bytes` (`Map` indexing as in `Type.decodeVariant`). -/
+def Type.encodeVariant : List (Int × Variant) → Int → Val → Interp (List Byte)
+  | [], _, _ => specPanic "map index: missing key (variants[discriminant])"
+  | (d, ⟨ty, tagger⟩) :: rest, discriminant, data =>
+    if d = discriminant then do
+      let bytes ← Type.encode ty data
+      encodeDiscriminant
+        (fun bytes offset valueBytes => writeSubsliceAtIndex bytes offset.bytes valueBytes)
+        tagger bytes
+    else Type.encodeVariant rest discriminant data
+
+end
+
+mutual
+
+/-- `Machine::check_value` for `Int`, `Bool`, `Tuple`, and `Variant`
+(`spec/lang/representation.md`):
 > "(Value::Int(i), Type::Int(int_ty)) => {
 >     ensure_else_ub(int_ty.can_represent(i), \"Value::Int: invalid integer value\")?;
 > }
 > (Value::Bool(_), Type::Bool) => {},
 > ..
-> _ => panic!(\"Value: value does not match type\")" -/
+> (Value::Tuple(vals), Type::Tuple { sized_fields, unsized_field, .. }) => {
+>     assert!(unsized_field.is_none(), \"Value: unsized structs cannot be represented as values\");
+>     ensure_else_ub(vals.len() == sized_fields.len(), \"Value::Tuple: invalid number of fields\")?;
+>     ..
+> }
+> ..
+> (Value::Variant { discriminant, data }, Type::Enum { variants, .. }) => {
+>     ..
+> }
+> ..
+> _ => panic!(\"Value: value does not match type\")"
+The fields of a tuple are checked by `checkFields` and the data of a variant
+by `checkVariant`. Pointers, arrays, unions, and the unsized types are outside
+the fragment. -/
 def checkValue : Val → «Type» → Interp Unit
   | .Int i, .Int t =>
     if IntType.can_represent t i then pure () else ub "Value::Int: invalid integer value"
   | .Bool _, .Bool => pure ()
+  | .Tuple vals, .Tuple fields _ unsizedField =>
+    match unsizedField with
+    | some _ => specPanic "Value: unsized structs cannot be represented as values"
+    | none =>
+      if vals.length ≠ fields.length then ub "Value::Tuple: invalid number of fields"
+      else checkFields vals fields
+  | .Variant discriminant data, .Enum ⟨variants⟩ _ _ _ _ => checkVariant variants discriminant data
   | _, .Int _ => specPanic "Value: value does not match type"
   | _, .Bool => specPanic "Value: value does not match type"
-  | _, _ => unsupported "check_value for a non-Int, non-Bool type"
+  | _, .Tuple _ _ _ => specPanic "Value: value does not match type"
+  | _, .Enum _ _ _ _ _ => specPanic "Value: value does not match type"
+  | _, _ => unsupported "check_value for a pointer, array, slice, union, or trait object type"
+
+/-- The field loop of `check_value` for tuples (`spec/lang/representation.md`):
+> "for (val, (_, ty)) in vals.zip(sized_fields) {
+>     self.check_value(val, ty)?;
+> }" -/
+def checkFields : List Val → List (Offset × «Type») → Interp Unit
+  | val :: vals, (_, ty) :: fields => do
+    checkValue val ty
+    checkFields vals fields
+  | _, _ => pure ()
+
+/-- The variant lookup of `check_value` for enums
+(`spec/lang/representation.md`):
+> "let Some(variant) = variants.get(discriminant) else {
+>     throw_ub!(\"Value::Variant: invalid discrimant\");
+> };
+> self.check_value(data, variant.ty)?;"
+`variants.get(discriminant)` is the first entry for `discriminant`, as in
+`mapGet`. -/
+def checkVariant : List (Int × Variant) → Int → Val → Interp Unit
+  | [], _, _ => ub "Value::Variant: invalid discrimant"
+  | (d, ⟨ty, _⟩) :: rest, discriminant, data =>
+    if d = discriminant then checkValue data ty else checkVariant rest discriminant data
+
+end
 
 /-! ## `BasicMemory` (`spec/mem/basic.md`) -/
 
