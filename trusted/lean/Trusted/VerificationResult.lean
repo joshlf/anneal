@@ -692,8 +692,12 @@ def valueValidForRigidTy :
   | _ + 1, _, _, .fnDef _ _, v => Or (v = .unit) (v = .aggregate 0 .nil)
   | _ + 1, _, _, .closure _ _, v =>
     Or (v = .unit) (∃ vIdx fields, v = .aggregate vIdx fields)
-  | _ + 1, layouts, optLayoutIdx, .adt defPath _, _ =>
-    match stringEq defPath "core::convert::Infallible" with
+  | _ + 1, layouts, optLayoutIdx, .adt defPath _, v =>
+    match
+      Bool.or
+        (stringEq defPath "core::convert::Infallible")
+        (stringEq defPath "std::convert::Infallible")
+    with
     | true => False
     | false =>
       match optLayoutIdx with
@@ -702,7 +706,10 @@ def valueValidForRigidTy :
         | .some layout =>
           match layout.isUninhabited with
           | true => False
-          | false => True
+          | false =>
+            match Nat.beq layout.size.bytes 0, v with
+            | false, .unit => False
+            | _, _ => True
         | .none => True
       | .none => True
   | _ + 1, _, _, .param _ _, _ => True

@@ -1948,6 +1948,29 @@ pub fn caller_ffi_and_len(s: &[u8]) -> u32 {
             "snippet for <[u8]>::len must substitute concrete u8 element type even when polymorphic Mir/Core/slice_impl_T_len.lean is on disk:\n{slice_len_u8_snippet}"
         );
 
+        let ffi_checksum_snippet = crate::generate_external_spec_snippet(
+            &crate_a_dir,
+            Some(&cfg.units_dir),
+            "ffi_checksum",
+        )
+        .expect("generate external spec snippet for ffi_checksum");
+        assert!(
+            ffi_checksum_snippet
+                .contains("unsafe extern \"C\" fn external_spec_ffi_checksum(len: usize) -> u32;"),
+            "snippet for extern \"C\" ffi_checksum must preserve extern \"C\" ABI:\n{ffi_checksum_snippet}"
+        );
+
+        let un_authored_verify_override = fs::read_to_string(
+            gen_dir.join("Verify/CrateA/caller_with_external_specs.lean"),
+        )
+        .expect("read un-authored Verify/CrateA/caller_with_external_specs.lean");
+        assert!(
+            un_authored_verify_override.contains(
+                "theorem verified : ModularVerificationResult Obligations.CrateA.caller_with_external_specs.modularClaim"
+            ),
+            "un-authored Verify module for subject with #[external_spec] callees must target ModularVerificationResult:\n{un_authored_verify_override}"
+        );
+
         let generic_slice_len_snippet = crate::generate_external_spec_snippet(
             &crate_a_dir,
             Some(&cfg.units_dir),
@@ -2411,6 +2434,65 @@ example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (p : ProvenancePtr) :
   rintro ⟨_, _, _, h_meta, h_eq⟩
   cases h_eq
   rcases h_meta with ⟨_, _, h⟩ | ⟨_, _, h⟩ <;> cases h
+
+-- 7d. `valueValidForTy` rejects `Value.unit` for non-zero-sized inhabited `.adt`
+--     types while admitting `.unit` for zero-sized `.adt` types; `Unsize` faults
+--     with `.ub` on shared-to-mutable (`&[u8; 4] -> &mut [u8]`), element-mismatch
+--     (`&[u8; 4] -> &[u32]`), and `.disabled` borrow tags; and `CastKind.ptrToPtr`
+--     faults with `.ub` on thin-to-wide raw pointer casts.
+def sampleAdtLayoutTable : Trusted.Rustc.V2026_06_01.Layout.LayoutTable := {
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [
+    { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory, fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [] },
+    { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory, fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+  ]
+}
+
+example :
+    ¬ valueValidForTy sampleAdtLayoutTable
+      { kind := .adt "my_crate::WrapperU32" [], layoutIdx := 0 }
+      .unit :=
+  id
+
+example :
+    valueValidForTy sampleAdtLayoutTable
+      { kind := .adt "my_crate::WrapperU32" [], layoutIdx := 0 }
+      (.aggregate 0 [.scalar ⟨42, 4⟩]) ∧
+    valueValidForTy sampleAdtLayoutTable
+      { kind := .adt "my_crate::UnitMarker" [], layoutIdx := 1 }
+      .unit :=
+  ⟨trivial, trivial⟩
+
+example (p : ProvenancePtr) :
+    evalRvalue
+      [.init (.ptr p 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
+        { kind := .ref .mut (.slice (.uint .u8)), layoutIdx := 0 })
+      emptyMemory
+      (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.array (.uint .u8) 4), layoutIdx := 0 }, debugName := .none }]) = .ub ∧
+    evalRvalue
+      [.init (.ptr p 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
+        { kind := .ref .not (.slice (.uint .u32)), layoutIdx := 0 })
+      emptyMemory
+      (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.array (.uint .u8) 4), layoutIdx := 0 }, debugName := .none }]) = .ub ∧
+    evalRvalue
+      [.init (.ptr { allocId := 1, offsetBytes := 0 } 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
+        { kind := .ref .not (.slice (.uint .u8)), layoutIdx := 0 })
+      { emptyMemory with
+        borrows := [{ tag := 1, targetLocal := 5, targetProjection := .nil, perm := .disabled }] }
+      (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.array (.uint .u8) 4), layoutIdx := 0 }, debugName := .none }]) = .ub :=
+  ⟨rfl, rfl, rfl⟩
+
+example (p : ProvenancePtr) :
+    evalRvalue
+      [.init (.ptr p 8)]
+      (.cast .ptrToPtr (.move { local_ := 0, projection := .nil })
+        { kind := .rawPtr .not (.slice (.uint .u8)), layoutIdx := 0 })
+      emptyMemory = .ub :=
+  rfl
 
 -- 8. The FFI target has no captured body, so a call to it is a `MirCallE`
 --    interaction bound only by its external call contract, whose postcondition

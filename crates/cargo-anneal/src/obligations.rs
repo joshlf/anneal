@@ -1330,7 +1330,10 @@ pub fn render_verify_module_with_options(
              /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
              abbrev Certificate : Prop := ModularVerificationResult Obligations.{item}.modularClaim\n\n"
         ));
-    } else if authored.is_modular {
+    } else if authored.is_modular
+        || (!authored.has_specs
+            && (!bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty()))
+    {
         out.push_str(&format!(
             "/-- Kernel-checked modular verification certificate for `{def_id}`. -/\n\
              theorem verified : ModularVerificationResult Obligations.{item}.modularClaim :=\n  \
