@@ -1030,4 +1030,138 @@ theorem mir_b2_slice_stride_subslice_bounds_ptr_to_ptr_and_validity_corresponds
       ]) := by
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/--
+**Theorem L3.25 (`mir_a2_as_ptr_offset_deref_array_elem_bound_and_typed_unsize_corresponds`)**:
+Universal characterization of `A2` hardening for `BRIEF-1.4`:
+1. `ptrAllocByteBound?` and `BinOp.offset` compute the remaining byte bound
+   `(arrLen - baseIdx) * elemSz` from an element pointer (`targetProjection =
+   [.constantIndex 1 0 false]` on `[u32; 4]` -> `12` bytes), permitting in-bounds
+   multi-element offsets (`p1.offset(2)` -> `offsetBytes = 8`) and rejecting
+   offsets beyond the enclosing array (`p1.offset(4)` -> `.ub`);
+2. `resolveStackThinPtrTargetProj?` resolves `offsetBytes` on stack-backed thin
+   pointers across `evalPlaceRead`, `evalOperand`, `writePlaceValue`,
+   `resolveDerefWriteFullProj`, `invalidateDerefWriteBorrows`, and `evalRvalue`
+   (`.ref` / `.rawPtr`), shifting `baseIdx = 1` by `8 / 4 = 2` to access `arr[3]`,
+   rejecting one-past-the-end (`offsetBytes = 12`) and misaligned (`offsetBytes = 2`)
+   dereferences with `.ub`, and preserving disjoint borrows (`[0..2)`) while
+   disabling overlapping borrows (`arr[3]`) on dereferenced writes;
+3. Subslice fat-to-thin `slice::as_ptr()` pointers (`targetProjection =
+   [.subslice 1 3 false]`) dereference to `arr[1]` at `offsetBytes = 0`, `arr[2]`
+   at `offsetBytes = 4`, and fault with `.ub` at `offsetBytes = 8`;
+4. Typed `evalUnsizeCoercion` rejects `.dead` stack referents and out-of-bounds
+   backing arrays (`elemOffset + n > length elems`), and untyped `evalUnsizeCoercion`
+   rejects misaligned global byte offsets (`offsetBytes = 1` for `&[u32]`);
+5. `evalSliceFatPtrDerefBorrow` normalizes chained subslice/element projections
+   (`[.deref, .subslice 1 4 false, .constantIndex 1 0 false]` -> `arr[2]`), and
+   `CastKind.ptrToPtr` rejects 2-element fat pointers with non-8-byte metadata or
+   non-`rawPtr` target types with `.ub`.
+-/
+theorem mir_a2_as_ptr_offset_deref_array_elem_bound_and_typed_unsize_corresponds
+    (b0 b1 b2 b3 : Nat) :
+    let u32Kind : RigidTy := .uint .u32
+    let rawMutU32Ty : Ty := { kind := .rawPtr .mut u32Kind, layoutIdx := 0 }
+    let refSharedSliceU32Ty : Ty := { kind := .ref .not (.slice u32Kind), layoutIdx := 0 }
+    let arr4Val : Value :=
+      .aggregate 0 [.scalar ⟨b0, 4⟩, .scalar ⟨b1, 4⟩, .scalar ⟨b2, 4⟩, .scalar ⟨b3, 4⟩]
+    let arr4Updated3 : Value :=
+      .aggregate 0 [.scalar ⟨b0, 4⟩, .scalar ⟨b1, 4⟩, .scalar ⟨b2, 4⟩, .scalar ⟨99, 4⟩]
+    let elem1Borrow : BorrowEntry :=
+      { tag := 1, targetLocal := 0, targetProjection := [.constantIndex 1 0 false], perm := .active }
+    let sub0To2Borrow : BorrowEntry :=
+      { tag := 2, targetLocal := 0, targetProjection := [.subslice 0 2 false], perm := .frozen }
+    let elem3Borrow : BorrowEntry :=
+      { tag := 3, targetLocal := 0, targetProjection := [.constantIndex 3 0 false], perm := .frozen }
+    let sub1To3Borrow : BorrowEntry :=
+      { tag := 4, targetLocal := 0, targetProjection := [.subslice 1 3 false], perm := .frozen }
+    let fullArrBorrow : BorrowEntry :=
+      { tag := 5, targetLocal := 0, targetProjection := .nil, perm := .active }
+    let memElem1 : Memory := { emptyMemory with borrows := [elem1Borrow], nextTag := 2 }
+    let ptrElem1Decls : List LocalDecl := [
+      { mutability := .mut, ty := { kind := .array u32Kind 4, layoutIdx := 0 }, debugName := "" },
+      { mutability := .not, ty := rawMutU32Ty, debugName := "" },
+      { mutability := .not, ty := { kind := .int .isize, layoutIdx := 0 }, debugName := "" }
+    ]
+    let unsize4Decls : List LocalDecl := [
+      { mutability := .not, ty := { kind := .array u32Kind 2, layoutIdx := 0 }, debugName := "" },
+      { mutability := .not, ty := { kind := .ref .not (.array u32Kind 4), layoutIdx := 0 }, debugName := "" }
+    ]
+    let alloc9Bytes : CapturedAllocation := {
+      allocId := 8
+      bytes := [.some 0, .some 1, .some 0, .some 0, .some 0, .some 2, .some 0, .some 0, .some 0]
+      relocations := .nil
+      align := ⟨4⟩
+      mutability := .not
+    }
+    let slice4FatVal : Value :=
+      .aggregate 0 [.ptr { allocId := 5, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩]
+    -- 1. ptrAllocByteBound? & BinOp.offset on element pointer (&raw mut arr[1])
+    ptrAllocByteBound? [.init arr4Val] memElem1 ptrElem1Decls emptyLayoutTable
+      { allocId := 1, offsetBytes := 0 } = .some 12 ∧
+    evalRvalue
+      [.init arr4Val, .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .init (.scalar ⟨2, 8⟩)]
+      (.binaryOp .offset (.copy { local_ := 1, projection := .nil }) (.copy { local_ := 2, projection := .nil }))
+      memElem1 ptrElem1Decls =
+      .ok (.ptr { allocId := 1, offsetBytes := 8 } 8)
+        [.init arr4Val, .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .init (.scalar ⟨2, 8⟩)]
+        memElem1 ∧
+    evalRvalue
+      [.init arr4Val, .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .init (.scalar ⟨4, 8⟩)]
+      (.binaryOp .offset (.copy { local_ := 1, projection := .nil }) (.copy { local_ := 2, projection := .nil }))
+      memElem1 ptrElem1Decls = .ub ∧
+    -- 2. Offset thin-pointer deref read, OOB/misaligned UB, write, and scoped borrow invalidation
+    evalOperand [.init arr4Val, .init (.ptr { allocId := 1, offsetBytes := 8 } 8)]
+      (.copy { local_ := 1, projection := [.deref] }) [elem1Borrow] =
+      .ok (.scalar ⟨b3, 4⟩) [.init arr4Val, .init (.ptr { allocId := 1, offsetBytes := 8 } 8)] ∧
+    evalOperand [.init arr4Val, .init (.ptr { allocId := 1, offsetBytes := 12 } 8)]
+      (.copy { local_ := 1, projection := [.deref] }) [elem1Borrow] = .ub ∧
+    evalOperand [.init arr4Val, .init (.ptr { allocId := 1, offsetBytes := 2 } 8)]
+      (.copy { local_ := 1, projection := [.deref] }) [elem1Borrow] = .ub ∧
+    writePlaceValue [.init arr4Val, .init (.ptr { allocId := 1, offsetBytes := 8 } 8)]
+      [elem1Borrow] { local_ := 1, projection := [.deref] } (.scalar ⟨99, 4⟩) =
+      .ok [.init arr4Updated3, .init (.ptr { allocId := 1, offsetBytes := 8 } 8)] ∧
+    invalidateDerefWriteBorrows
+      [.init arr4Val, .init (.ptr { allocId := 1, offsetBytes := 8 } 8)]
+      [elem1Borrow, sub0To2Borrow, elem3Borrow]
+      { local_ := 1, projection := [.deref] } .nil =
+      [elem1Borrow, sub0To2Borrow, { elem3Borrow with perm := .disabled }] ∧
+    -- 3. Subslice fat-to-thin slice::as_ptr() deref at offsetBytes = 0, 4, and OOB 8
+    evalOperand [.init arr4Val, .init (.ptr { allocId := 4, offsetBytes := 0 } 8)]
+      (.copy { local_ := 1, projection := [.deref] }) [sub1To3Borrow] =
+      .ok (.scalar ⟨b1, 4⟩) [.init arr4Val, .init (.ptr { allocId := 4, offsetBytes := 0 } 8)] ∧
+    evalOperand [.init arr4Val, .init (.ptr { allocId := 4, offsetBytes := 4 } 8)]
+      (.copy { local_ := 1, projection := [.deref] }) [sub1To3Borrow] =
+      .ok (.scalar ⟨b2, 4⟩) [.init arr4Val, .init (.ptr { allocId := 4, offsetBytes := 4 } 8)] ∧
+    evalOperand [.init arr4Val, .init (.ptr { allocId := 4, offsetBytes := 8 } 8)]
+      (.copy { local_ := 1, projection := [.deref] }) [sub1To3Borrow] = .ub ∧
+    -- 4. Typed & untyped evalUnsizeCoercion liveness, bounds, and global alignment checks
+    evalRvalue [.dead, .init (.ptr { allocId := 5, offsetBytes := 0 } 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 1, projection := .nil }) refSharedSliceU32Ty)
+      { emptyMemory with borrows := [fullArrBorrow] } unsize4Decls = .ub ∧
+    evalRvalue
+      [.init (.aggregate 0 [.scalar ⟨b0, 4⟩, .scalar ⟨b1, 4⟩]),
+       .init (.ptr { allocId := 5, offsetBytes := 0 } 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 1, projection := .nil }) refSharedSliceU32Ty)
+      { emptyMemory with borrows := [fullArrBorrow] } unsize4Decls = .ub ∧
+    evalRvalue [.init (.ptr { allocId := 8, offsetBytes := 1 } 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil }) refSharedSliceU32Ty)
+      { emptyMemory with globals := [alloc9Bytes] } = .ub ∧
+    -- 5. Chained subslice/element borrow normalization & CastKind.ptrToPtr validation
+    evalRvalue [.init arr4Val, .init slice4FatVal]
+      (.ref .shared { local_ := 1, projection := [.deref, .subslice 1 4 false, .constantIndex 1 0 false] })
+      { emptyMemory with borrows := [fullArrBorrow], nextTag := 6 } =
+      .ok (.ptr { allocId := 6, offsetBytes := 0 } 8)
+        [.init arr4Val, .init slice4FatVal]
+        { emptyMemory with
+          borrows :=
+            { tag := 6, targetLocal := 0, targetProjection := [.constantIndex 2 0 false], perm := .frozen } ::
+              [fullArrBorrow]
+          nextTag := 7 } ∧
+    evalRvalue [.init (.aggregate 0 [.ptr { allocId := 5, offsetBytes := 0 } 8, .scalar ⟨4, 4⟩])]
+      (.cast .ptrToPtr (.copy { local_ := 0, projection := .nil }) rawMutU32Ty)
+      emptyMemory = .ub ∧
+    evalRvalue [.init slice4FatVal]
+      (.cast .ptrToPtr (.copy { local_ := 0, projection := .nil }) refSharedSliceU32Ty)
+      emptyMemory = .ub := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 end Correspondence.V2026_08_01.L3_PlacesAndBasicMem

@@ -1506,6 +1506,189 @@ def byteOffsetToElemIdx? (offsetBytes elemSz : Nat) : Option Nat :=
     | false => exactByteDivAux offsetBytes offsetBytes elemSz 0
 
 /--
+If `proj` ends with a forward `.constantIndex baseIdx minLen false`, split `proj`
+into `(initProj, baseIdx, minLen)`; otherwise return `.none`.
+-/
+@[reducible]
+def splitLastConstantIndex? : List ProjectionElem → Option (List ProjectionElem × Nat × Nat)
+  | .nil => .none
+  | .constantIndex baseIdx minLen false :: .nil => .some (.nil, baseIdx, minLen)
+  | elem :: rest =>
+    match splitLastConstantIndex? rest with
+    | .some (initProj, baseIdx, minLen) => .some (elem :: initProj, baseIdx, minLen)
+    | .none => .none
+
+/--
+Return `true` when `proj` ends with `.subslice`.
+-/
+@[reducible, simp]
+def endsWithSubslice : List ProjectionElem → Bool
+  | .nil => false
+  | .subslice _ _ _ :: .nil => true
+  | _ :: rest => endsWithSubslice rest
+
+/--
+Return `true` when dereferencing a stack-backed thin pointer with `BorrowEntry`
+`targetProjection` at `offsetBytes` requires array/subslice element offset
+resolution (`targetProjection` ends with `.subslice`, or `offsetBytes > 0` and
+`targetProjection` ends with `.constantIndex`).
+Reduces immediately to `false` when `targetProjection` is `.nil`.
+-/
+@[reducible, simp]
+def needsThinPtrElemResolution
+    (targetProjection : List ProjectionElem)
+    (offsetBytes : Nat) :
+    Bool :=
+  match targetProjection with
+  | .nil => false
+  | pHead :: pTail =>
+    let norm :=
+      normalizeSubsliceProjections (stripTransparentProjections (pHead :: pTail))
+    match endsWithSubslice norm with
+    | true => true
+    | false =>
+      match Nat.beq offsetBytes 0 with
+      | true => false
+      | false =>
+        match splitLastConstantIndex? norm with
+        | .some _ => true
+        | .none => false
+
+/--
+Return `true` when `proj` (after stripping transparent projections) begins with
+`.constantIndex`, `.index`, or `.subslice`.
+-/
+@[reducible]
+def startsWithArrayOrSliceProj (proj : List ProjectionElem) : Bool :=
+  match stripTransparentProjections proj with
+  | .constantIndex _ _ _ :: _ => true
+  | .index _ :: _ => true
+  | .subslice _ _ _ :: _ => true
+  | _ => false
+
+/--
+Resolve the effective target projection path on `entry.targetLocal` when
+dereferencing, writing through, or reborrowing a stack-backed thin pointer
+`Value.ptr ptrVal sz` (`BorrowEntry` `entry`) with post-deref projection suffix
+`restProj`.
+
+- When `ptrVal.offsetBytes == 0` and the pointer is not an element pointer into
+  a subslice or array (`isElemPtrAtZero == false`), returns the direct
+  concatenation `entry.targetProjection ++ restProj`.
+- When `ptrVal.offsetBytes > 0` (e.g. after `BinOp.offset` on `&raw const arr[i]`
+  or `slice.as_ptr().offset(k)`), or when `ptrVal.offsetBytes == 0` on an element
+  pointer into a `.subslice` (or into an `.array` when `pointeeTyOpt` is a
+  non-array element type), translates `ptrVal.offsetBytes` into an element index
+  via `byteOffsetToElemIdx?`, verifies in-bounds access against the backing
+  array/subslice aggregate (`elemIdx < length elems`), and returns the
+  normalized projection path (or `.none` on misaligned or out-of-bounds offset).
+-/
+@[reducible]
+def resolveStackThinPtrTargetProj?
+    (indexLocals : List LocalSlot)
+    (targetRootVal : Value)
+    (entry : BorrowEntry)
+    (ptrVal : ProvenancePtr)
+    (restProj : List ProjectionElem)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable)
+    (pointeeTyOpt : Option Ty := .none) :
+    Option (List ProjectionElem) :=
+  let rawFullProj :=
+    match entry.targetProjection with
+    | .nil => restProj
+    | ph :: pt => ph :: appendProjections pt restProj
+  let normTargetProj :=
+    normalizeSubsliceProjections (stripTransparentProjections entry.targetProjection)
+  let isElemPtrAtZero : Bool :=
+    match endsWithSubslice normTargetProj, pointeeTyOpt with
+    | false, .none => false
+    | _, _ =>
+      match startsWithArrayOrSliceProj restProj with
+      | true => false
+      | false =>
+        match endsWithSubslice normTargetProj with
+        | true => true
+        | false =>
+          match pointeeTyOpt with
+          | .none => false
+          | .some pointeeTy =>
+            let pointeeIsNotSeq :=
+              match pointeeTy.kind with
+              | .array _ _ => false
+              | .slice _ => false
+              | _ => true
+            match pointeeIsNotSeq with
+            | false => false
+            | true =>
+              match
+                placeTy
+                  localDecls
+                  layouts
+                  { local_ := entry.targetLocal, projection := normTargetProj }
+              with
+              | .some { kind := .array _ _, .. } => true
+              | .some { kind := .slice _, .. } => true
+              | _ => false
+  match Nat.beq ptrVal.offsetBytes 0, isElemPtrAtZero with
+  | true, false => .some rawFullProj
+  | _, _ =>
+    match splitLastConstantIndex? normTargetProj with
+    | .some (initProj, baseIdx, _) =>
+      match readProjectedValue indexLocals targetRootVal initProj with
+      | .ok (.aggregate 0 elems) =>
+        let elemSz := inferElemListByteStride elems
+        match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+        | .none => .none
+        | .some elemDelta =>
+          let idx := Nat.add baseIdx elemDelta
+          match Nat.ble (.succ idx) (length elems) with
+          | false => .none
+          | true =>
+            let elemProj := ProjectionElem.constantIndex idx 0 false :: restProj
+            let combined :=
+              match initProj with
+              | .nil => elemProj
+              | ph :: pt => ph :: appendProjections pt elemProj
+            .some (normalizeSubsliceProjections combined)
+      | _ => .none
+    | .none =>
+      match readProjectedValue indexLocals targetRootVal normTargetProj with
+      | .ok (.aggregate 0 elems) =>
+        let elemSz := inferElemListByteStride elems
+        match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+        | .none => .none
+        | .some elemOffset =>
+          match stripTransparentProjections restProj with
+          | .constantIndex relIdx minLen false :: tailProj =>
+            let idx := Nat.add elemOffset relIdx
+            let remLen := Nat.sub (length elems) elemOffset
+            match
+              Bool.and
+                (Nat.ble minLen remLen)
+                (Nat.ble (.succ idx) (length elems))
+            with
+            | false => .none
+            | true =>
+              let elemProj := ProjectionElem.constantIndex idx 0 false :: tailProj
+              let combined :=
+                match normTargetProj with
+                | .nil => elemProj
+                | ph :: pt => ph :: appendProjections pt elemProj
+              .some (normalizeSubsliceProjections combined)
+          | _ =>
+            match Nat.ble (.succ elemOffset) (length elems) with
+            | false => .none
+            | true =>
+              let elemProj := ProjectionElem.constantIndex elemOffset 0 false :: restProj
+              let combined :=
+                match normTargetProj with
+                | .nil => elemProj
+                | ph :: pt => ph :: appendProjections pt elemProj
+              .some (normalizeSubsliceProjections combined)
+      | _ => .none
+
+/--
 Dereference and project a slice fat pointer
 `Value.aggregate 0 [Value.ptr ptrVal ptrSz, Value.scalar lenSc]` through
 `borrows` or `globals`.
@@ -1651,26 +1834,44 @@ def evalPlaceRead
         | _ =>
           match get? locals entry.targetLocal with
           | .some (.init targetRootVal) =>
-            let fullProj :=
-              match entry.targetProjection with
-              | .nil => restProj
-              | ph :: pt => ph :: appendProjections pt restProj
-            match readProjectedValue locals targetRootVal fullProj with
-            | .ok fieldVal => .ok fieldVal locals
-            | .ub => .ub
-            | .unsupported => .unsupported
-          | .some _ => .ub
-          | .none =>
-            match get? callerLocals entry.targetLocal with
-            | .some (.init targetRootVal) =>
-              let fullProj :=
-                match entry.targetProjection with
-                | .nil => restProj
-                | ph :: pt => ph :: appendProjections pt restProj
+            match
+              resolveStackThinPtrTargetProj?
+                locals
+                targetRootVal
+                entry
+                ptrVal
+                restProj
+                localDecls
+                layouts
+                pointeeTyOpt
+            with
+            | .none => .ub
+            | .some fullProj =>
               match readProjectedValue locals targetRootVal fullProj with
               | .ok fieldVal => .ok fieldVal locals
               | .ub => .ub
               | .unsupported => .unsupported
+          | .some _ => .ub
+          | .none =>
+            match get? callerLocals entry.targetLocal with
+            | .some (.init targetRootVal) =>
+              match
+                resolveStackThinPtrTargetProj?
+                  locals
+                  targetRootVal
+                  entry
+                  ptrVal
+                  restProj
+                  localDecls
+                  layouts
+                  pointeeTyOpt
+              with
+              | .none => .ub
+              | .some fullProj =>
+                match readProjectedValue locals targetRootVal fullProj with
+                | .ok fieldVal => .ok fieldVal locals
+                | .ub => .ub
+                | .unsupported => .unsupported
             | _ => .ub
       | .none =>
         match lookupGlobalAlloc globals ptrVal.allocId with
@@ -1771,19 +1972,11 @@ def evalOperand
           match entry.perm with
           | .disabled => .ub
           | _ =>
-            match get? locals entry.targetLocal with
-            | .some (.init targetRootVal) =>
-              let fullProj :=
-                match entry.targetProjection with
-                | .nil => restProj
-                | ph :: pt => ph :: appendProjections pt restProj
-              match readProjectedValue locals targetRootVal fullProj with
-              | .ok fieldVal => .ok fieldVal locals
-              | .ub => .ub
-              | .unsupported => .unsupported
-            | .some _ => .ub
-            | .none =>
-              match get? callerLocals entry.targetLocal with
+            match
+              needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+            with
+            | false =>
+              match get? locals entry.targetLocal with
               | .some (.init targetRootVal) =>
                 let fullProj :=
                   match entry.targetProjection with
@@ -1793,7 +1986,55 @@ def evalOperand
                 | .ok fieldVal => .ok fieldVal locals
                 | .ub => .ub
                 | .unsupported => .unsupported
-              | _ => .ub
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  let fullProj :=
+                    match entry.targetProjection with
+                    | .nil => restProj
+                    | ph :: pt => ph :: appendProjections pt restProj
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | _ => .ub
+            | true =>
+              match get? locals entry.targetLocal with
+              | .some (.init targetRootVal) =>
+                match
+                  resolveStackThinPtrTargetProj?
+                    locals
+                    targetRootVal
+                    entry
+                    ptrVal
+                    restProj
+                with
+                | .none => .ub
+                | .some fullProj =>
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  match
+                    resolveStackThinPtrTargetProj?
+                      locals
+                      targetRootVal
+                      entry
+                      ptrVal
+                      restProj
+                  with
+                  | .none => .ub
+                  | .some fullProj =>
+                    match readProjectedValue locals targetRootVal fullProj with
+                    | .ok fieldVal => .ok fieldVal locals
+                    | .ub => .ub
+                    | .unsupported => .unsupported
+                | _ => .ub
         | .none =>
           match lookupGlobalAlloc globals ptrVal.allocId with
           | .some alloc =>
@@ -1848,19 +2089,11 @@ def evalOperand
           match entry.perm with
           | .disabled => .ub
           | _ =>
-            match get? locals entry.targetLocal with
-            | .some (.init targetRootVal) =>
-              let fullProj :=
-                match entry.targetProjection with
-                | .nil => restProj
-                | ph :: pt => ph :: appendProjections pt restProj
-              match readProjectedValue locals targetRootVal fullProj with
-              | .ok fieldVal => .ok fieldVal locals
-              | .ub => .ub
-              | .unsupported => .unsupported
-            | .some _ => .ub
-            | .none =>
-              match get? callerLocals entry.targetLocal with
+            match
+              needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+            with
+            | false =>
+              match get? locals entry.targetLocal with
               | .some (.init targetRootVal) =>
                 let fullProj :=
                   match entry.targetProjection with
@@ -1870,7 +2103,55 @@ def evalOperand
                 | .ok fieldVal => .ok fieldVal locals
                 | .ub => .ub
                 | .unsupported => .unsupported
-              | _ => .ub
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  let fullProj :=
+                    match entry.targetProjection with
+                    | .nil => restProj
+                    | ph :: pt => ph :: appendProjections pt restProj
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | _ => .ub
+            | true =>
+              match get? locals entry.targetLocal with
+              | .some (.init targetRootVal) =>
+                match
+                  resolveStackThinPtrTargetProj?
+                    locals
+                    targetRootVal
+                    entry
+                    ptrVal
+                    restProj
+                with
+                | .none => .ub
+                | .some fullProj =>
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  match
+                    resolveStackThinPtrTargetProj?
+                      locals
+                      targetRootVal
+                      entry
+                      ptrVal
+                      restProj
+                  with
+                  | .none => .ub
+                  | .some fullProj =>
+                    match readProjectedValue locals targetRootVal fullProj with
+                    | .ok fieldVal => .ok fieldVal locals
+                    | .ub => .ub
+                    | .unsupported => .unsupported
+                | _ => .ub
         | .none =>
           match lookupGlobalAlloc globals ptrVal.allocId with
           | .some alloc =>
@@ -2003,43 +2284,79 @@ def resolveDerefWriteFullProj
     match resolveIndexProjections indexLocals restProj with
     | .some rp => rp
     | .none => restProj
-  let effectiveSuffix :=
-    match ptrOrFatVal with
-    | .aggregate 0 (.ptr ptrVal 8 :: .scalar lenSc :: .nil) =>
-      let targetRootOpt : Option Value :=
-        match get? targetLocals entry.targetLocal with
-        | .some (.init v) => .some v
-        | .some _ => .none
-        | .none =>
-          match get? callerLocals entry.targetLocal with
-          | .some (.init v) => .some v
-          | _ => .none
+  let targetRootOpt : Option Value :=
+    match get? targetLocals entry.targetLocal with
+    | .some (.init v) => .some v
+    | .some _ => .none
+    | .none =>
+      match get? callerLocals entry.targetLocal with
+      | .some (.init v) => .some v
+      | _ => .none
+  match ptrOrFatVal with
+  | .ptr ptrVal _ =>
+    match
+      needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+    with
+    | false =>
+      let rawFull :=
+        match entry.targetProjection with
+        | .nil => resolvedRest
+        | ph :: pt => ph :: appendProjections pt resolvedRest
+      normalizeSubsliceProjections (stripTransparentProjections rawFull)
+    | true =>
       match targetRootOpt with
       | .some targetRootVal =>
         match
-          readProjectedValue
+          resolveStackThinPtrTargetProj?
             indexLocals
             targetRootVal
-            entry.targetProjection
+            entry
+            ptrVal
+            resolvedRest
         with
-        | .ok (.aggregate 0 elems) =>
-          let elemSz := inferElemListByteStride elems
-          match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
-          | .some elemOffset =>
-            .subslice
-              elemOffset
-              (Nat.add elemOffset lenSc.bits)
-              false ::
-              resolvedRest
-          | .none => resolvedRest
-        | _ => resolvedRest
-      | .none => resolvedRest
-    | _ => resolvedRest
-  let rawFull :=
-    match entry.targetProjection with
-    | .nil => effectiveSuffix
-    | ph :: pt => ph :: appendProjections pt effectiveSuffix
-  normalizeSubsliceProjections (stripTransparentProjections rawFull)
+        | .some resolvedFull => resolvedFull
+        | .none =>
+          let rawFull :=
+            match entry.targetProjection with
+            | .nil => resolvedRest
+            | ph :: pt => ph :: appendProjections pt resolvedRest
+          normalizeSubsliceProjections (stripTransparentProjections rawFull)
+      | .none =>
+        let rawFull :=
+          match entry.targetProjection with
+          | .nil => resolvedRest
+          | ph :: pt => ph :: appendProjections pt resolvedRest
+        normalizeSubsliceProjections (stripTransparentProjections rawFull)
+  | _ =>
+    let effectiveSuffix :=
+      match ptrOrFatVal with
+      | .aggregate 0 (.ptr ptrVal 8 :: .scalar lenSc :: .nil) =>
+        match targetRootOpt with
+        | .some targetRootVal =>
+          match
+            readProjectedValue
+              indexLocals
+              targetRootVal
+              entry.targetProjection
+          with
+          | .ok (.aggregate 0 elems) =>
+            let elemSz := inferElemListByteStride elems
+            match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+            | .some elemOffset =>
+              .subslice
+                elemOffset
+                (Nat.add elemOffset lenSc.bits)
+                false ::
+                resolvedRest
+            | .none => resolvedRest
+          | _ => resolvedRest
+        | .none => resolvedRest
+      | _ => resolvedRest
+    let rawFull :=
+      match entry.targetProjection with
+      | .nil => effectiveSuffix
+      | ph :: pt => ph :: appendProjections pt effectiveSuffix
+    normalizeSubsliceProjections (stripTransparentProjections rawFull)
 
 /--
 Update the referent root aggregate `targetRootVal` at `targetProjection` when
@@ -2151,31 +2468,58 @@ def writePlaceValue
         | .frozen => .ub
         | .disabled => .ub
         | _ =>
-          let fullProj :=
-            match entry.targetProjection with
-            | .nil => restProj
-            | ph :: pt => ph :: appendProjections pt restProj
-          match fullProj with
-          | .nil =>
-            match get? locals entry.targetLocal with
-            | .some .dead => .ub
-            | .some _ =>
-              match set? locals entry.targetLocal (.init val) with
-              | .some locals' => .ok locals'
+          match
+            needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+          with
+          | false =>
+            let fullProj :=
+              match entry.targetProjection with
+              | .nil => restProj
+              | ph :: pt => ph :: appendProjections pt restProj
+            match fullProj with
+            | .nil =>
+              match get? locals entry.targetLocal with
+              | .some .dead => .ub
+              | .some _ =>
+                match set? locals entry.targetLocal (.init val) with
+                | .some locals' => .ok locals'
+                | .none => .ub
               | .none => .ub
-            | .none => .ub
-          | pHead :: pTail =>
+            | pHead :: pTail =>
+              match get? locals entry.targetLocal with
+              | .some (.init targetRootVal) =>
+                match
+                  writeProjectedValue locals targetRootVal (pHead :: pTail) val
+                with
+                | .ok targetRootVal' =>
+                  match set? locals entry.targetLocal (.init targetRootVal') with
+                  | .some locals' => .ok locals'
+                  | .none => .ub
+                | .ub => .ub
+                | .unsupported => .unsupported
+              | _ => .ub
+          | true =>
             match get? locals entry.targetLocal with
             | .some (.init targetRootVal) =>
               match
-                writeProjectedValue locals targetRootVal (pHead :: pTail) val
+                resolveStackThinPtrTargetProj?
+                  locals
+                  targetRootVal
+                  entry
+                  ptrVal
+                  restProj
               with
-              | .ok targetRootVal' =>
-                match set? locals entry.targetLocal (.init targetRootVal') with
-                | .some locals' => .ok locals'
-                | .none => .ub
-              | .ub => .ub
-              | .unsupported => .unsupported
+              | .some (pHead :: pTail) =>
+                match
+                  writeProjectedValue locals targetRootVal (pHead :: pTail) val
+                with
+                | .ok targetRootVal' =>
+                  match set? locals entry.targetLocal (.init targetRootVal') with
+                  | .some locals' => .ok locals'
+                  | .none => .ub
+                | .ub => .ub
+                | .unsupported => .unsupported
+              | _ => .ub
             | _ => .ub
       | .none => .ub
     | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
@@ -2336,37 +2680,70 @@ def writeCallerPlaceValue
           match get? frameLocals entry.targetLocal with
           | .some _ => .ub
           | .none =>
-            let fullProj :=
-              match entry.targetProjection with
-              | .nil => restProj
-              | ph :: pt => ph :: appendProjections pt restProj
-            match fullProj with
-            | .nil =>
-              match get? callerLocals entry.targetLocal with
-              | .some .dead => .ub
-              | .some _ =>
-                match set? callerLocals entry.targetLocal (.init val) with
-                | .some callerLocals' => .ok callerLocals'
+            match
+              needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+            with
+            | false =>
+              let fullProj :=
+                match entry.targetProjection with
+                | .nil => restProj
+                | ph :: pt => ph :: appendProjections pt restProj
+              match fullProj with
+              | .nil =>
+                match get? callerLocals entry.targetLocal with
+                | .some .dead => .ub
+                | .some _ =>
+                  match set? callerLocals entry.targetLocal (.init val) with
+                  | .some callerLocals' => .ok callerLocals'
+                  | .none => .ub
                 | .none => .ub
-              | .none => .ub
-            | pHead :: pTail =>
+              | pHead :: pTail =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  match
+                    writeProjectedValue
+                      frameLocals
+                      targetRootVal
+                      (pHead :: pTail)
+                      val
+                  with
+                  | .ok targetRootVal' =>
+                    match
+                      set? callerLocals entry.targetLocal (.init targetRootVal')
+                    with
+                    | .some callerLocals' => .ok callerLocals'
+                    | .none => .ub
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | _ => .ub
+            | true =>
               match get? callerLocals entry.targetLocal with
               | .some (.init targetRootVal) =>
                 match
-                  writeProjectedValue
+                  resolveStackThinPtrTargetProj?
                     frameLocals
                     targetRootVal
-                    (pHead :: pTail)
-                    val
+                    entry
+                    ptrVal
+                    restProj
                 with
-                | .ok targetRootVal' =>
+                | .some (pHead :: pTail) =>
                   match
-                    set? callerLocals entry.targetLocal (.init targetRootVal')
+                    writeProjectedValue
+                      frameLocals
+                      targetRootVal
+                      (pHead :: pTail)
+                      val
                   with
-                  | .some callerLocals' => .ok callerLocals'
-                  | .none => .ub
-                | .ub => .ub
-                | .unsupported => .unsupported
+                  | .ok targetRootVal' =>
+                    match
+                      set? callerLocals entry.targetLocal (.init targetRootVal')
+                    with
+                    | .some callerLocals' => .ok callerLocals'
+                    | .none => .ub
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | _ => .ub
               | _ => .ub
       | .none => .ub
     | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
@@ -3024,10 +3401,41 @@ def evalUnsizeCoercion
         | .some srcTy =>
           match unsizeArrayToSliceSpec? srcTy.kind targetTy.kind with
           | .some n =>
-            .ok
-              (.aggregate 0 (.ptr ptrVal sz :: .scalar ⟨n, ptrBytes⟩ :: .nil))
-              locals'
-              mem
+            let stackTargetValid :=
+              match lookupBorrow mem.borrows ptrVal.tag with
+              | .none => true
+              | .some entry =>
+                let rootValOpt : Option Value :=
+                  match get? locals' entry.targetLocal with
+                  | .some (.init v) => .some v
+                  | .some _ => .none
+                  | .none =>
+                    match get? mem.callerLocals entry.targetLocal with
+                    | .some (.init v) => .some v
+                    | _ => .none
+                match rootValOpt with
+                | .some rootVal =>
+                  match readProjectedValue locals' rootVal entry.targetProjection with
+                  | .ok (.aggregate 0 elems) =>
+                    let elemSz := inferElemListByteStride elems
+                    match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+                    | .some elemOffset =>
+                      Nat.ble (Nat.add elemOffset n) (length elems)
+                    | .none => false
+                  | .ok .unit =>
+                    Bool.and
+                      (Nat.beq ptrVal.offsetBytes 0)
+                      (Nat.beq n 0)
+                  | .ok (.ptr _ _) => true
+                  | _ => false
+                | .none => false
+            match stackTargetValid with
+            | true =>
+              .ok
+                (.aggregate 0 (.ptr ptrVal sz :: .scalar ⟨n, ptrBytes⟩ :: .nil))
+                locals'
+                mem
+            | false => .ub
           | .none => .ub
         | .none =>
           match lookupBorrow mem.borrows ptrVal.tag with
@@ -3101,8 +3509,11 @@ def evalUnsizeCoercion
                 match Nat.beq elemSz 0 with
                 | true => .ub
                 | false =>
-                  match byteOffsetToElemIdx? remBytes elemSz with
-                  | .some elemCount =>
+                  match
+                    byteOffsetToElemIdx? ptrVal.offsetBytes elemSz,
+                    byteOffsetToElemIdx? remBytes elemSz
+                  with
+                  | .some _, .some elemCount =>
                     .ok
                       (.aggregate 0
                         (.ptr ptrVal sz ::
@@ -3110,7 +3521,7 @@ def evalUnsizeCoercion
                           .nil))
                       locals'
                       mem
-                  | .none => .ub
+                  | _, _ => .ub
               | _, _ => .ub
             | .none => .ub
   | .ok _ _ => .ub
@@ -3609,29 +4020,73 @@ def ptrAllocByteBound?
       match Nat.beq entry.rangeLen 0 with
       | false => .some (Nat.add entry.rangeOffset entry.rangeLen)
       | true =>
-        let targetPlace : Place := {
-          local_ := entry.targetLocal
-          projection := entry.targetProjection
-        }
-        match placeTy localDecls layouts targetPlace with
-        | .some projTy =>
-          match rigidTyByteSize layouts projTy with
-          | .some n => .some n
-          | .none =>
-            match get? locals entry.targetLocal with
-            | .some (.init rootVal) =>
-              projectedValueDefaultByteSize locals rootVal entry.targetProjection
-            | _ => .some 0
-        | .none =>
+        let rootValOpt : Option Value :=
           match get? locals entry.targetLocal with
-          | .some (.init rootVal) =>
-            projectedValueDefaultByteSize locals rootVal entry.targetProjection
-          | .some _ => .some 0
+          | .some (.init v) => .some v
+          | .some _ => .none
           | .none =>
             match get? mem.callerLocals entry.targetLocal with
-            | .some (.init rootVal) =>
-              projectedValueDefaultByteSize locals rootVal entry.targetProjection
+            | .some (.init v) => .some v
+            | _ => .none
+        let normTargetProj :=
+          normalizeSubsliceProjections (stripTransparentProjections entry.targetProjection)
+        match splitLastConstantIndex? normTargetProj with
+        | .some (initProj, baseIdx, _) =>
+          match rootValOpt with
+          | .some rootVal =>
+            match readProjectedValue locals rootVal initProj with
+            | .ok (.aggregate 0 elems) =>
+              match Nat.ble baseIdx (length elems) with
+              | false => .some 0
+              | true =>
+                let remElems := Nat.sub (length elems) baseIdx
+                let elemPlace : Place := {
+                  local_ := entry.targetLocal
+                  projection := normTargetProj
+                }
+                let elemSz :=
+                  match placeTy localDecls layouts elemPlace with
+                  | .some elemTy =>
+                    match rigidTyByteSize layouts elemTy with
+                    | .some n => n
+                    | .none => inferElemListByteStride elems
+                  | .none => inferElemListByteStride elems
+                .some (Nat.mul remElems elemSz)
             | _ => .some 0
+          | .none =>
+            let initPlace : Place := {
+              local_ := entry.targetLocal
+              projection := initProj
+            }
+            match placeTy localDecls layouts initPlace with
+            | .some { kind := .array elemKind arrLen, .. } =>
+              match Nat.ble baseIdx arrLen with
+              | false => .some 0
+              | true =>
+                let remElems := Nat.sub arrLen baseIdx
+                match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+                | .some elemSz => .some (Nat.mul remElems elemSz)
+                | .none => .some 0
+            | _ => .some 0
+        | .none =>
+          let targetPlace : Place := {
+            local_ := entry.targetLocal
+            projection := entry.targetProjection
+          }
+          match placeTy localDecls layouts targetPlace with
+          | .some projTy =>
+            match rigidTyByteSize layouts projTy with
+            | .some n => .some n
+            | .none =>
+              match rootValOpt with
+              | .some rootVal =>
+                projectedValueDefaultByteSize locals rootVal entry.targetProjection
+              | .none => .some 0
+          | .none =>
+            match rootValOpt with
+            | .some rootVal =>
+              projectedValueDefaultByteSize locals rootVal entry.targetProjection
+            | .none => .some 0
   | .none =>
     match lookupGlobalAlloc mem.globals ptrVal.allocId with
     | .some alloc => .some (length alloc.bytes)
@@ -3823,7 +4278,8 @@ def evalSliceFatPtrDerefBorrow
         (stripTransparentProjections restProj)
     with
     | .none => .ub
-    | .some resolvedRest =>
+    | .some rawResolvedRest =>
+      let resolvedRest := normalizeSubsliceProjections rawResolvedRest
       match lookupBorrow mem.borrows parentPtr.tag with
       | .some parentEntry =>
         let permOk :=
@@ -4210,23 +4666,64 @@ def evalRvalue
             match resolveIndexProjections locals restProj with
             | .none => .ub
             | .some resolvedProj =>
-              let tag := mem.nextTag
-              let fullProj :=
-                match parentEntry.targetProjection with
-                | .nil => resolvedProj
-                | ph :: pt => ph :: appendProjections pt resolvedProj
-              let entry : BorrowEntry := {
-                tag := tag
-                targetLocal := parentEntry.targetLocal
-                targetProjection := fullProj
-                perm := perm
-              }
-              let mem' := {
-                mem with
-                borrows := entry :: mem.borrows
-                nextTag := Nat.add tag 1
-              }
-              .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
+              match
+                needsThinPtrElemResolution
+                  parentEntry.targetProjection
+                  parentPtr.offsetBytes
+              with
+              | false =>
+                let tag := mem.nextTag
+                let fullProj :=
+                  match parentEntry.targetProjection with
+                  | .nil => resolvedProj
+                  | ph :: pt => ph :: appendProjections pt resolvedProj
+                let entry : BorrowEntry := {
+                  tag := tag
+                  targetLocal := parentEntry.targetLocal
+                  targetProjection := fullProj
+                  perm := perm
+                }
+                let mem' := {
+                  mem with
+                  borrows := entry :: mem.borrows
+                  nextTag := Nat.add tag 1
+                }
+                .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
+              | true =>
+                let targetRootOpt : Option Value :=
+                  match get? locals parentEntry.targetLocal with
+                  | .some (.init v) => .some v
+                  | .some _ => .none
+                  | .none =>
+                    match get? mem.callerLocals parentEntry.targetLocal with
+                    | .some (.init v) => .some v
+                    | _ => .none
+                match targetRootOpt with
+                | .none => .ub
+                | .some targetRootVal =>
+                  match
+                    resolveStackThinPtrTargetProj?
+                      locals
+                      targetRootVal
+                      parentEntry
+                      parentPtr
+                      resolvedProj
+                  with
+                  | .none => .ub
+                  | .some fullProj =>
+                    let tag := mem.nextTag
+                    let entry : BorrowEntry := {
+                      tag := tag
+                      targetLocal := parentEntry.targetLocal
+                      targetProjection := fullProj
+                      perm := perm
+                    }
+                    let mem' := {
+                      mem with
+                      borrows := entry :: mem.borrows
+                      nextTag := Nat.add tag 1
+                    }
+                    .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
         | .none => .ub
       | .some (.init (.aggregate 0 (.ptr parentPtr ptrSz :: .scalar lenSc :: .nil))) =>
         let isMut :=
@@ -4286,23 +4783,64 @@ def evalRvalue
             match resolveIndexProjections locals restProj with
             | .none => .ub
             | .some resolvedProj =>
-              let tag := mem.nextTag
-              let fullProj :=
-                match parentEntry.targetProjection with
-                | .nil => resolvedProj
-                | ph :: pt => ph :: appendProjections pt resolvedProj
-              let entry : BorrowEntry := {
-                tag := tag
-                targetLocal := parentEntry.targetLocal
-                targetProjection := fullProj
-                perm := perm
-              }
-              let mem' := {
-                mem with
-                borrows := entry :: mem.borrows
-                nextTag := Nat.add tag 1
-              }
-              .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
+              match
+                needsThinPtrElemResolution
+                  parentEntry.targetProjection
+                  parentPtr.offsetBytes
+              with
+              | false =>
+                let tag := mem.nextTag
+                let fullProj :=
+                  match parentEntry.targetProjection with
+                  | .nil => resolvedProj
+                  | ph :: pt => ph :: appendProjections pt resolvedProj
+                let entry : BorrowEntry := {
+                  tag := tag
+                  targetLocal := parentEntry.targetLocal
+                  targetProjection := fullProj
+                  perm := perm
+                }
+                let mem' := {
+                  mem with
+                  borrows := entry :: mem.borrows
+                  nextTag := Nat.add tag 1
+                }
+                .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
+              | true =>
+                let targetRootOpt : Option Value :=
+                  match get? locals parentEntry.targetLocal with
+                  | .some (.init v) => .some v
+                  | .some _ => .none
+                  | .none =>
+                    match get? mem.callerLocals parentEntry.targetLocal with
+                    | .some (.init v) => .some v
+                    | _ => .none
+                match targetRootOpt with
+                | .none => .ub
+                | .some targetRootVal =>
+                  match
+                    resolveStackThinPtrTargetProj?
+                      locals
+                      targetRootVal
+                      parentEntry
+                      parentPtr
+                      resolvedProj
+                  with
+                  | .none => .ub
+                  | .some fullProj =>
+                    let tag := mem.nextTag
+                    let entry : BorrowEntry := {
+                      tag := tag
+                      targetLocal := parentEntry.targetLocal
+                      targetProjection := fullProj
+                      perm := perm
+                    }
+                    let mem' := {
+                      mem with
+                      borrows := entry :: mem.borrows
+                      nextTag := Nat.add tag 1
+                    }
+                    .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
         | .none => .ub
       | .some (.init (.aggregate 0 (.ptr parentPtr ptrSz :: .scalar lenSc :: .nil))) =>
         let isMut :=
@@ -4381,10 +4919,20 @@ def evalRvalue
       | .rawPtr _ (.dynamic _) => .ub
       | _ => .ok (.ptr ptrVal sz) locals' mem
     | .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' =>
-      match isThinRawPtrTy targetTy with
-      | true => .ok (.ptr ptrVal sz) locals' mem
-      | false =>
-        .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
+      match
+        Bool.and
+          (Nat.beq sz 8)
+          (Nat.beq metaSc.sizeBytes 8)
+      with
+      | false => .ub
+      | true =>
+        match isThinRawPtrTy targetTy with
+        | true => .ok (.ptr ptrVal sz) locals' mem
+        | false =>
+          match targetTy.kind with
+          | .rawPtr _ _ =>
+            .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
+          | _ => .ub
     | .ok _ _ => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported

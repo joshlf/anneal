@@ -61,6 +61,8 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   setOrExtendFields writeProjectedValue
   sliceConstElemKind isScalarCompatibleProj uintRigidTyOfStride
   inferElemListByteStride exactByteDivAux byteOffsetToElemIdx?
+  splitLastConstantIndex? endsWithSubslice needsThinPtrElemResolution
+  startsWithArrayOrSliceProj resolveStackThinPtrTargetProj?
   evalGlobalDerefRead evalSliceFatPtrDerefRead evalPlaceRead
   evalOperand evalOperands
   extractDerefPtrVal? resolveDerefWriteFullProj writeSliceFatPtrTargetValue

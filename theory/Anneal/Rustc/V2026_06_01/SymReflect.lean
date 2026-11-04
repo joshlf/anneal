@@ -315,20 +315,25 @@ def evalSymPlaceCopy
         match entry.perm with
         | .disabled => .none
         | _ =>
-          match get? slots entry.targetLocal with
-          | .some (.concrete (.init targetRootVal)) =>
-            let fullProj :=
-              match entry.targetProjection with
-              | .nil => restProj
-              | ph :: pt => ph :: appendProjections pt restProj
-            match readProjectedPure targetRootVal fullProj with
-            | .some fieldVal => .some (.concrete fieldVal)
-            | .none => .none
-          | .some (.symArg idx) =>
-            match entry.targetProjection, restProj with
-            | .nil, .nil => .some (.symArg idx)
-            | _, _ => .none
-          | _ => .none
+          match
+            needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+          with
+          | false =>
+            match get? slots entry.targetLocal with
+            | .some (.concrete (.init targetRootVal)) =>
+              let fullProj :=
+                match entry.targetProjection with
+                | .nil => restProj
+                | ph :: pt => ph :: appendProjections pt restProj
+              match readProjectedPure targetRootVal fullProj with
+              | .some fieldVal => .some (.concrete fieldVal)
+              | .none => .none
+            | .some (.symArg idx) =>
+              match entry.targetProjection, restProj with
+              | .nil, .nil => .some (.symArg idx)
+              | _, _ => .none
+            | _ => .none
+          | true => .none
       | .none => .none
     | _ => .none
   | .nil =>
@@ -461,91 +466,102 @@ theorem evalSymPlaceCopy_sound_copy
                     rw [hPerm] at h
                     dsimp only [evalSymPlaceCopy] at h
                     dsimp only [evalOperand]
-                    rw [get?_concretizeSymSlots args slots entry.targetLocal]
-                    cases hTProj : entry.targetProjection with
-                    | nil =>
-                      rw [hTProj] at h
+                    cases hRes :
+                        needsThinPtrElemResolution
+                          entry.targetProjection
+                          ptrVal.offsetBytes with
+                    | true =>
+                      rw [hRes] at h
+                      nomatch h
+                    | false =>
+                      rw [hRes] at h
                       dsimp only [evalSymPlaceCopy] at h
                       dsimp only [evalOperand]
-                      cases hTarget : get? slots entry.targetLocal with
-                      | none =>
-                        rw [hTarget] at h
-                        nomatch h
-                      | some tSlot =>
-                        rw [hTarget] at h
-                        cases tSlot with
-                        | symPair0 _ _ => nomatch h
-                        | symArg idx =>
-                          dsimp only at h
-                          cases pTail with
-                          | cons _ _ => nomatch h
-                          | nil =>
-                            injection h with hEq
-                            subst hEq
-                            dsimp only [concretizeSymSlot, concretizeSymReadResult]
-                            cases get? args idx with
-                            | none => rfl
-                            | some v => rfl
-                        | concrete tcSlot =>
-                          cases tcSlot with
-                          | dead => nomatch h
-                          | uninit => nomatch h
-                          | init targetRootVal =>
-                            dsimp only at h
-                            dsimp only [concretizeSymSlot]
-                            cases hRead : readProjectedPure targetRootVal pTail with
-                            | none =>
-                              rw [hRead] at h
-                              nomatch h
-                            | some fieldVal =>
-                              rw [hRead] at h
-                              injection h with hEq
-                              subst hEq
-                              dsimp only [concretizeSymReadResult]
-                              rw [readProjectedPure_sound
-                                (concretizeSymSlots args slots)
-                                targetRootVal
-                                pTail
-                                fieldVal
-                                hRead]
-                    | cons ph pt =>
-                      rw [hTProj] at h
-                      dsimp only [evalSymPlaceCopy] at h
-                      dsimp only [evalOperand]
-                      cases hTarget : get? slots entry.targetLocal with
-                      | none =>
-                        rw [hTarget] at h
-                        nomatch h
-                      | some tSlot =>
-                        rw [hTarget] at h
-                        cases tSlot with
-                        | symArg idx | symPair0 _ idx =>
+                      rw [get?_concretizeSymSlots args slots entry.targetLocal]
+                      cases hTProj : entry.targetProjection with
+                      | nil =>
+                        rw [hTProj] at h
+                        dsimp only [evalSymPlaceCopy] at h
+                        dsimp only [evalOperand]
+                        cases hTarget : get? slots entry.targetLocal with
+                        | none =>
+                          rw [hTarget] at h
                           nomatch h
-                        | concrete tcSlot =>
-                          cases tcSlot with
-                          | dead => nomatch h
-                          | uninit => nomatch h
-                          | init targetRootVal =>
+                        | some tSlot =>
+                          rw [hTarget] at h
+                          cases tSlot with
+                          | symPair0 _ _ => nomatch h
+                          | symArg idx =>
                             dsimp only at h
-                            dsimp only [concretizeSymSlot]
-                            cases hRead :
-                                readProjectedPure
-                                  targetRootVal
-                                  (ph :: appendProjections pt pTail) with
-                            | none =>
-                              rw [hRead] at h
-                              nomatch h
-                            | some fieldVal =>
-                              rw [hRead] at h
+                            cases pTail with
+                            | cons _ _ => nomatch h
+                            | nil =>
                               injection h with hEq
                               subst hEq
-                              dsimp only [concretizeSymReadResult]
-                              rw [readProjectedPure_sound
-                                (concretizeSymSlots args slots)
-                                targetRootVal
-                                (ph :: appendProjections pt pTail)
-                                fieldVal
-                                hRead]
+                              dsimp only [concretizeSymSlot, concretizeSymReadResult]
+                              cases get? args idx with
+                              | none => rfl
+                              | some v => rfl
+                          | concrete tcSlot =>
+                            cases tcSlot with
+                            | dead => nomatch h
+                            | uninit => nomatch h
+                            | init targetRootVal =>
+                              dsimp only at h
+                              dsimp only [concretizeSymSlot]
+                              cases hRead : readProjectedPure targetRootVal pTail with
+                              | none =>
+                                rw [hRead] at h
+                                nomatch h
+                              | some fieldVal =>
+                                rw [hRead] at h
+                                injection h with hEq
+                                subst hEq
+                                dsimp only [concretizeSymReadResult]
+                                rw [readProjectedPure_sound
+                                  (concretizeSymSlots args slots)
+                                  targetRootVal
+                                  pTail
+                                  fieldVal
+                                  hRead]
+                      | cons ph pt =>
+                        rw [hTProj] at h
+                        dsimp only [evalSymPlaceCopy] at h
+                        dsimp only [evalOperand]
+                        cases hTarget : get? slots entry.targetLocal with
+                        | none =>
+                          rw [hTarget] at h
+                          nomatch h
+                        | some tSlot =>
+                          rw [hTarget] at h
+                          cases tSlot with
+                          | symArg idx | symPair0 _ idx =>
+                            nomatch h
+                          | concrete tcSlot =>
+                            cases tcSlot with
+                            | dead => nomatch h
+                            | uninit => nomatch h
+                            | init targetRootVal =>
+                              dsimp only at h
+                              dsimp only [concretizeSymSlot]
+                              cases hRead :
+                                  readProjectedPure
+                                    targetRootVal
+                                    (ph :: appendProjections pt pTail) with
+                              | none =>
+                                rw [hRead] at h
+                                nomatch h
+                              | some fieldVal =>
+                                rw [hRead] at h
+                                injection h with hEq
+                                subst hEq
+                                dsimp only [concretizeSymReadResult]
+                                rw [readProjectedPure_sound
+                                  (concretizeSymSlots args slots)
+                                  targetRootVal
+                                  (ph :: appendProjections pt pTail)
+                                  fieldVal
+                                  hRead]
       | field fIdx fTy =>
         dsimp only [evalSymPlaceCopy] at h
         dsimp only [evalOperand]
