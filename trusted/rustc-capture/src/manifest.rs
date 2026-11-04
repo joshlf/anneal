@@ -300,28 +300,39 @@ impl UnitCaptureManifest {
                 }
             };
             let mut trait_impls = Vec::new();
-            if let Some(JsonValue::Array(arr)) = entry_obj.get("trait_impls") {
-                for item in arr {
-                    let obj = item.as_object().ok_or_else(|| String::from("trait_impls entry must be an object"))?;
-                    let trait_method_def_path = get_string_field(obj, "trait_method_def_path")?;
-                    let impl_path = get_string_field(obj, "impl_path")?;
-                    let mut trait_args_lean = Vec::new();
-                    if let Some(JsonValue::Array(args)) = obj.get("trait_args_lean") {
-                        for arg in args {
-                            if let JsonValue::String(s) = arg {
-                                trait_args_lean.push(s.clone());
-                            } else {
-                                return Err(String::from("trait_args_lean elements must be strings"));
+            match entry_obj.get("trait_impls") {
+                None | Some(JsonValue::Null) => {}
+                Some(JsonValue::Array(arr)) => {
+                    for item in arr {
+                        let obj = item
+                            .as_object()
+                            .ok_or_else(|| String::from("trait_impls entry must be an object"))?;
+                        let trait_method_def_path =
+                            get_string_field(obj, "trait_method_def_path")?;
+                        let impl_path = get_string_field(obj, "impl_path")?;
+                        let mut trait_args_lean = Vec::new();
+                        if let Some(JsonValue::Array(args)) = obj.get("trait_args_lean") {
+                            for arg in args {
+                                if let JsonValue::String(s) = arg {
+                                    trait_args_lean.push(s.clone());
+                                } else {
+                                    return Err(String::from(
+                                        "trait_args_lean elements must be strings",
+                                    ));
+                                }
                             }
+                        } else {
+                            return Err(String::from("field 'trait_args_lean' must be an array"));
                         }
-                    } else {
-                        return Err(String::from("field 'trait_args_lean' must be an array"));
+                        trait_impls.push(ManifestTraitImplEntry {
+                            trait_method_def_path,
+                            trait_args_lean,
+                            impl_path,
+                        });
                     }
-                    trait_impls.push(ManifestTraitImplEntry {
-                        trait_method_def_path,
-                        trait_args_lean,
-                        impl_path,
-                    });
+                }
+                Some(_) => {
+                    return Err(String::from("field 'trait_impls' must be an array"));
                 }
             }
             unit_targets.push(UnitTargetRecord {
@@ -904,7 +915,12 @@ mod tests {
                     },
                     lean_module_name: String::from("Mir.Demo.f"),
                     item_kind: CapturedItemKind::Subject,
-                    associated_subject_def_id: None, trait_impls: vec![],
+                    associated_subject_def_id: None,
+                    trait_impls: vec![ManifestTraitImplEntry {
+                        trait_method_def_path: String::from("demo::MyTrait::f"),
+                        impl_path: String::from("demo::<T as MyTrait>::f"),
+                        trait_args_lean: vec![String::from(".rigid (.param ⟨0, \"T\"⟩)")],
+                    }],
                 },
                 UnitTargetRecord {
                     target: CapturedTarget {

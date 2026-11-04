@@ -1939,4 +1939,110 @@ mod tests {
         ));
         assert!(code.ends_with("end Mir.Demo.answer\n"));
     }
+
+    #[test]
+    fn emit_polymorphic_module_with_trait_impl_and_alias() {
+        let param_placeholder = IrTypeLayout {
+            size: IrSize { bytes: 0 },
+            align: IrAlign { bytes: 1 },
+            backend_repr: IrBackendRepr::Memory,
+            fields: IrFieldsShape::Primitive,
+            variants: IrVariantsShape::Single { index: 0 },
+            is_uninhabited: false,
+            field_layouts: vec![],
+        };
+        let tuple_layout = IrTypeLayout {
+            size: IrSize { bytes: 0 },
+            align: IrAlign { bytes: 1 },
+            backend_repr: IrBackendRepr::Memory,
+            fields: IrFieldsShape::Arbitrary {
+                offsets: vec![IrSize { bytes: 0 }, IrSize { bytes: 0 }],
+                memory_index: vec![0, 1],
+            },
+            variants: IrVariantsShape::Single { index: 0 },
+            is_uninhabited: false,
+            field_layouts: vec![0, 0],
+        };
+        let param_ty = IrTy {
+            kind: IrRigidTy::Param {
+                index: 0,
+                name: String::from("T"),
+            },
+            layout_idx: 0,
+        };
+        let alias_ty = IrTy {
+            kind: IrRigidTy::Alias {
+                def_path: String::from("demo::MyTrait::Assoc"),
+                args: vec![param_ty.kind.clone()],
+            },
+            layout_idx: 1,
+        };
+        let mir = IrCapturedMir {
+            def_path: String::from("demo::<Wrapper<T> as MyTrait>::method"),
+            phase: IrMirPhaseTag::RuntimeOptimized,
+            role: IrContractRole::Subject,
+            type_param_count: 1,
+            generic_params: vec![IrGenericParamDef {
+                index: 0,
+                name: String::from("T"),
+            }],
+            trait_impls: vec![IrTraitImplEntry {
+                trait_ref: IrTraitRef {
+                    def_path: String::from("demo::MyTrait::method"),
+                    args: vec![IrRigidTy::Adt(
+                        String::from("demo::Wrapper"),
+                        vec![param_ty.kind.clone()],
+                    )],
+                },
+                impl_path: String::from("demo::<Wrapper<T> as MyTrait>::method"),
+            }],
+            arg_count: 1,
+            local_decls: vec![
+                IrLocalDecl {
+                    mutability: IrMutability::Mut,
+                    ty: alias_ty,
+                    debug_name: None,
+                },
+                IrLocalDecl {
+                    mutability: IrMutability::Not,
+                    ty: param_ty,
+                    debug_name: Some(String::from("x")),
+                },
+            ],
+            basic_blocks: vec![IrBasicBlockData {
+                statements: vec![],
+                terminator: IrTerminator {
+                    kind: IrTerminatorKind::Return,
+                    span: String::from("<dummy>"),
+                    comment: None,
+                },
+                is_cleanup: false,
+            }],
+            fn_abi: IrFnAbi {
+                args: vec![IrArgAbi {
+                    layout: param_placeholder.clone(),
+                    mode: IrAbiPassMode::Direct,
+                }],
+                ret: IrArgAbi {
+                    layout: tuple_layout.clone(),
+                    mode: IrAbiPassMode::Direct,
+                },
+                conv: IrCallConv::Rust,
+                can_unwind: false,
+            },
+            layouts: IrLayoutTable {
+                pointer_bits: 64,
+                is_little_endian: true,
+                entries: vec![param_placeholder, tuple_layout],
+            },
+            allocations: vec![],
+        };
+
+        let code = emit_mir_lean_module("Mir.Demo.Wrapper_T_as_MyTrait_method", &mir);
+        assert!(code.contains("typeParamCount := 1"));
+        assert!(code.contains("genericParams := (List.cons { idx := 0, name := \"T\" } List.nil)"));
+        assert!(code.contains("traitImpls := (List.cons { traitRef := { defPath := \"demo::MyTrait::method\", args := (List.cons (RigidTy.adt \"demo::Wrapper\" (List.cons (RigidTy.param 0 \"T\") List.nil)) List.nil) }, implPath := \"demo::<Wrapper<T> as MyTrait>::method\" } List.nil)"));
+        assert!(code.contains("(RigidTy.alias \"demo::MyTrait::Assoc\" (List.cons (RigidTy.param 0 \"T\") List.nil))"));
+        assert!(code.contains("fieldLayouts := (List.cons 0 (List.cons 0 List.nil))"));
+    }
 }
