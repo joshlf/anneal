@@ -860,10 +860,10 @@ theorem mir_structural_completeness_brief_1_4_corresponds
     -- 4. AggregateKind.closure evaluates identically to AggregateKind.tuple
     evalRvalue locals (.aggregate (.closure closureDefPath) ops) mem localDecls layouts =
       evalRvalue locals (.aggregate .tuple ops) mem localDecls layouts ∧
-    -- 5. Rvalue.discriminant returns 0 on Value.unit, Value.scalar, and Value.ptr
+    -- 5. Rvalue.discriminant returns 0 on Value.unit, non-enum Value.scalar, and Value.ptr
     evalRvalue [.init .unit] (.discriminant p0) mem localDecls layouts =
       .ok (.scalar ⟨0, 8⟩) [.init .unit] mem ∧
-    evalRvalue [.init (.scalar sc)] (.discriminant p0) mem localDecls layouts =
+    evalRvalue [.init (.scalar sc)] (.discriminant p0) mem .nil layouts =
       .ok (.scalar ⟨0, 8⟩) [.init (.scalar sc)] mem ∧
     evalRvalue [.init (.ptr ptrVal ptrSz)] (.discriminant p0) mem localDecls layouts =
       .ok (.scalar ⟨0, 8⟩) [.init (.ptr ptrVal ptrSz)] mem := by
@@ -1282,5 +1282,149 @@ theorem mir_a2_as_ptr_offset_deref_array_elem_bound_and_typed_unsize_corresponds
       (.cast .ptrToPtr (.copy { local_ := 0, projection := .nil }) refSharedSliceU32Ty)
       emptyMemory = .ub := by
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/--
+**Theorem L3.26 (`mir_ordering_discriminant_subslice_alloc_bound_and_as_ptr_corresponds`)**:
+Universal characterization of `B3` hardening for `BRIEF-1.4`:
+1. `Rvalue.discriminant` on `core::cmp::Ordering` (`#[repr(i8)] enum Ordering { Less = -1, Equal = 0, Greater = 1 }`)
+   preserves the signed 1-byte discriminant scalar (`⟨255, 1⟩` for `Less`, `⟨0, 1⟩`
+   for `Equal`, `⟨1, 1⟩` for `Greater`) produced by `BinOp.cmp` (or 0-field
+   `Value.aggregate 0 []` / `1 []` / `2 []`), returns `⟨0, 8⟩` on single-variant
+   struct ADTs (`VariantsShape.single`) and primitive types, and faults with `.ub`
+   on uninhabited ADTs (`VariantsShape.empty`);
+2. `ptrAllocByteBound?` and `BinOp.offset` on a `.subslice 1 3 false` borrow of
+   `[u32; 4]` with non-empty `localDecls` enforce the 2-element subslice byte
+   bound (`8` bytes rather than the 4-element parent array's `16` bytes),
+   permitting `p.offset(2)` (`offsetBytes = 8`) while rejecting `p.offset(3)`
+   (`offsetBytes = 12`) with `.ub`;
+3. Casting a root-array slice fat pointer (`Unsize` of `&arr` / `&mut arr` with
+   `targetProjection = .nil`) to a thin element pointer via `CastKind.ptrToPtr`
+   (`slice::as_ptr` / `slice::as_mut_ptr`) or `CastKind.pointerCoercion "ArrayToPointer"`
+   derives a `.subslice 0 4 false` borrow entry, so `*p` at `offsetBytes = 0` and
+   `*(p.offset(2))` at `offsetBytes = 8` read/write individual elements (`arr[0]`
+   and `arr[2]`) in `evalOperand` and `writePlaceValue` instead of reading/overwriting
+   the whole array aggregate;
+4. `Rvalue.ref` and `Rvalue.rawPtr` support dereferenced reborrows (`&*p` and
+   `&(*p)[idx]`) on thin pointers backed by `mem.globals`.
+-/
+theorem mir_ordering_discriminant_subslice_alloc_bound_and_as_ptr_corresponds
+    (b0 b1 b2 b3 w2 : Nat) :
+    let arr4Val : Value :=
+      .aggregate 0 [.scalar ⟨b0, 4⟩, .scalar ⟨b1, 4⟩, .scalar ⟨b2, 4⟩, .scalar ⟨b3, 4⟩]
+    let arr4UpdatedVal : Value :=
+      .aggregate 0 [.scalar ⟨b0, 4⟩, .scalar ⟨b1, 4⟩, .scalar ⟨w2, 4⟩, .scalar ⟨b3, 4⟩]
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+    let arr4U32Ty : Ty := { kind := .array (.uint .u32) 4, layoutIdx := 0 }
+    let rawConstU32Ty : Ty := { kind := .rawPtr .not (.uint .u32), layoutIdx := 0 }
+    let rawMutU32Ty : Ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 }
+    let orderingTy : Ty := { kind := .adt "core::cmp::Ordering" .nil, layoutIdx := 0 }
+    let orderingDecl : List LocalDecl :=
+      [{ mutability := .not, ty := orderingTy, debugName := "" }]
+    let u32Decl : List LocalDecl :=
+      [{ mutability := .not, ty := u32Ty, debugName := "" }]
+    let singleAdtLayout : Trusted.Rustc.V2026_06_01.Layout.LayoutTable :=
+      { pointerBits := 64
+        isLittleEndian := true
+        entries := [{
+          size := ⟨4⟩
+          align := ⟨4⟩
+          backendRepr := .scalar (.initialized (.int 32 false) ⟨0, 4294967295⟩)
+          fields := .arbitrary [⟨0⟩] [0]
+          variants := .single 0
+          isUninhabited := false
+        }] }
+    let emptyAdtLayout : Trusted.Rustc.V2026_06_01.Layout.LayoutTable :=
+      { pointerBits := 64
+        isLittleEndian := true
+        entries := [{
+          size := ⟨0⟩
+          align := ⟨1⟩
+          backendRepr := .memory
+          fields := .primitive
+          variants := .empty
+          isUninhabited := true
+        }] }
+    let sub1To3Borrow : BorrowEntry :=
+      { tag := 4, targetLocal := 0, targetProjection := [.subslice 1 3 false], perm := .frozen }
+    let subOffsetDecls : List LocalDecl :=
+      [{ mutability := .not, ty := arr4U32Ty, debugName := "" },
+       { mutability := .not, ty := rawConstU32Ty, debugName := "" },
+       { mutability := .not, ty := { kind := .int .isize, layoutIdx := 0 }, debugName := "" }]
+    let fullMutBorrow : BorrowEntry :=
+      { tag := 5, targetLocal := 0, targetProjection := .nil, perm := .active }
+    let derivedElemBorrow : BorrowEntry :=
+      { tag := 6, targetLocal := 0, targetProjection := [.subslice 0 4 false], perm := .active }
+    let slice4MutFatVal : Value :=
+      .aggregate 0 [.ptr { allocId := 5, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩]
+    let globalArrAlloc : CapturedAllocation := {
+      allocId := 9
+      bytes := [.some 1, .some 0, .some 0, .some 0, .some 2, .some 0, .some 0, .some 0]
+      relocations := .nil
+      align := ⟨4⟩
+      mutability := .not
+    }
+    let globalArrPtrDecls : List LocalDecl :=
+      [{ mutability := .not,
+         ty := { kind := .ref .not (.array (.uint .u32) 2), layoutIdx := 0 },
+         debugName := "" }]
+    let p0 : Place := { local_ := 0, projection := .nil }
+    -- 1. Rvalue.discriminant on core::cmp::Ordering (scalar from BinOp.cmp & aggregate) vs single/empty/primitive
+    evalRvalue [.init (.scalar ⟨255, 1⟩)] (.discriminant p0) emptyMemory orderingDecl =
+      .ok (.scalar ⟨255, 1⟩) [.init (.scalar ⟨255, 1⟩)] emptyMemory ∧
+    evalRvalue [.init (.scalar ⟨0, 1⟩)] (.discriminant p0) emptyMemory orderingDecl =
+      .ok (.scalar ⟨0, 1⟩) [.init (.scalar ⟨0, 1⟩)] emptyMemory ∧
+    evalRvalue [.init (.scalar ⟨1, 1⟩)] (.discriminant p0) emptyMemory orderingDecl =
+      .ok (.scalar ⟨1, 1⟩) [.init (.scalar ⟨1, 1⟩)] emptyMemory ∧
+    evalRvalue [.init (.aggregate 0 .nil)] (.discriminant p0) emptyMemory orderingDecl =
+      .ok (.scalar ⟨255, 1⟩) [.init (.aggregate 0 .nil)] emptyMemory ∧
+    evalRvalue [.init (.scalar ⟨42, 4⟩)] (.discriminant p0) emptyMemory orderingDecl singleAdtLayout =
+      .ok (.scalar ⟨0, 8⟩) [.init (.scalar ⟨42, 4⟩)] emptyMemory ∧
+    evalRvalue [.init (.scalar ⟨42, 4⟩)] (.discriminant p0) emptyMemory orderingDecl emptyAdtLayout =
+      .ub ∧
+    evalRvalue [.init (.scalar ⟨42, 4⟩)] (.discriminant p0) emptyMemory u32Decl =
+      .ok (.scalar ⟨0, 8⟩) [.init (.scalar ⟨42, 4⟩)] emptyMemory ∧
+    -- 2. Subslice allocation byte bound with non-empty localDecls (8 bytes, not 16 bytes)
+    evalRvalue
+      [.init arr4Val, .init (.ptr { allocId := 4, offsetBytes := 0 } 8), .init (.scalar ⟨2, 8⟩)]
+      (.binaryOp .offset (.copy { local_ := 1, projection := .nil }) (.copy { local_ := 2, projection := .nil }))
+      { emptyMemory with borrows := [sub1To3Borrow] }
+      subOffsetDecls =
+      .ok (.ptr { allocId := 4, offsetBytes := 8 } 8)
+        [.init arr4Val, .init (.ptr { allocId := 4, offsetBytes := 0 } 8), .init (.scalar ⟨2, 8⟩)]
+        { emptyMemory with borrows := [sub1To3Borrow] } ∧
+    evalRvalue
+      [.init arr4Val, .init (.ptr { allocId := 4, offsetBytes := 0 } 8), .init (.scalar ⟨3, 8⟩)]
+      (.binaryOp .offset (.copy { local_ := 1, projection := .nil }) (.copy { local_ := 2, projection := .nil }))
+      { emptyMemory with borrows := [sub1To3Borrow] }
+      subOffsetDecls = .ub ∧
+    -- 3. Unsize -> CastKind.ptrToPtr (slice::as_mut_ptr) -> deref read/write at offset 0 and offset 8
+    evalRvalue
+      [.init arr4Val, .init slice4MutFatVal]
+      (.cast .ptrToPtr (.copy { local_ := 1, projection := .nil }) rawMutU32Ty)
+      { emptyMemory with borrows := [fullMutBorrow], nextTag := 6 } =
+      .ok (.ptr { allocId := 6, offsetBytes := 0 } 8)
+        [.init arr4Val, .init slice4MutFatVal]
+        { emptyMemory with borrows := [derivedElemBorrow, fullMutBorrow], nextTag := 7 } ∧
+    evalOperand
+      [.init arr4Val, .init (.ptr { allocId := 6, offsetBytes := 0 } 8)]
+      (.copy { local_ := 1, projection := [.deref] })
+      [derivedElemBorrow, fullMutBorrow] =
+      .ok (.scalar ⟨b0, 4⟩) [.init arr4Val, .init (.ptr { allocId := 6, offsetBytes := 0 } 8)] ∧
+    writePlaceValue
+      [.init arr4Val, .init (.ptr { allocId := 6, offsetBytes := 8 } 8)]
+      [derivedElemBorrow, fullMutBorrow]
+      { local_ := 1, projection := [.deref] }
+      (.scalar ⟨w2, 4⟩) =
+      .ok [.init arr4UpdatedVal, .init (.ptr { allocId := 6, offsetBytes := 8 } 8)] ∧
+    -- 4. Global thin pointer deref reborrow (&*p and &(*p)[1])
+    evalRvalue
+      [.init (.ptr { allocId := 9, offsetBytes := 0 } 8)]
+      (.ref .shared { local_ := 0, projection := [.deref, .constantIndex 1 0 false] })
+      { emptyMemory with globals := [globalArrAlloc] }
+      globalArrPtrDecls =
+      .ok (.ptr { allocId := 9, offsetBytes := 4 } 8)
+        [.init (.ptr { allocId := 9, offsetBytes := 0 } 8)]
+        { emptyMemory with globals := [globalArrAlloc] } := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Correspondence.V2026_06_01.L3_PlacesAndBasicMem

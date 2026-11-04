@@ -475,14 +475,12 @@ theorem evalSymPlaceCopy_sound_copy
                       nomatch h
                     | false =>
                       rw [hRes] at h
-                      dsimp only [evalSymPlaceCopy] at h
-                      dsimp only [evalOperand]
+                      dsimp only at h ⊢
                       rw [get?_concretizeSymSlots args slots entry.targetLocal]
                       cases hTProj : entry.targetProjection with
                       | nil =>
                         rw [hTProj] at h
-                        dsimp only [evalSymPlaceCopy] at h
-                        dsimp only [evalOperand]
+                        dsimp only at h ⊢
                         cases hTarget : get? slots entry.targetLocal with
                         | none =>
                           rw [hTarget] at h
@@ -526,8 +524,7 @@ theorem evalSymPlaceCopy_sound_copy
                                   hRead]
                       | cons ph pt =>
                         rw [hTProj] at h
-                        dsimp only [evalSymPlaceCopy] at h
-                        dsimp only [evalOperand]
+                        dsimp only at h ⊢
                         cases hTarget : get? slots entry.targetLocal with
                         | none =>
                           rw [hTarget] at h
