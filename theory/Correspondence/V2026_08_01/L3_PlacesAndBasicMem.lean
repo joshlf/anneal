@@ -855,4 +855,76 @@ theorem mir_slice_fat_ptr_write_reborrow_retag_and_edge_cases_corresponds
     evalBinOpOffset { allocId := 0, offsetBytes := 4 } 8 ⟨1, 8⟩ 4 (.some 0) = .none := by
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/--
+**Theorem L3.23 (`mir_subslice_disjoint_overlap_offset_borrow_and_unsize_mut_corresponds`)**:
+Universal characterization of `A1` hardening for `BRIEF-1.4` in `V2026_08_01`.
+-/
+theorem mir_subslice_disjoint_overlap_offset_borrow_and_unsize_mut_corresponds
+    (b0 b1 b2 b3 : Nat) :
+    let u32Kind : RigidTy := .uint .u32
+    let mutSliceTy : Ty := { kind := .ref .mut (.slice u32Kind), layoutIdx := 0 }
+    let mutArrDecl : List LocalDecl :=
+      [{ mutability := .not, ty := { kind := .ref .mut (.array u32Kind 2), layoutIdx := 0 }, debugName := "" }]
+    let frozenBorrows : List BorrowEntry :=
+      [{ tag := 1, targetLocal := 0, targetProjection := .nil, perm := .frozen }]
+    let activeBorrows : List BorrowEntry :=
+      [{ tag := 1, targetLocal := 0, targetProjection := .nil, perm := .active }]
+    let memFrozen : Memory := { emptyMemory with borrows := frozenBorrows, nextTag := 2 }
+    let memActive : Memory := { emptyMemory with borrows := activeBorrows, nextTag := 2 }
+    let arr4Val : Value :=
+      .aggregate 0 [.scalar ⟨b0, 4⟩, .scalar ⟨b1, 4⟩, .scalar ⟨b2, 4⟩, .scalar ⟨b3, 4⟩]
+    let offsetSliceFatVal : Value :=
+      .aggregate 0 [.ptr { allocId := 1, offsetBytes := 4 } 8, .scalar ⟨2, 8⟩]
+    let oobSliceFatVal : Value :=
+      .aggregate 0 [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨5, 8⟩]
+    let emptySliceFatVal : Value :=
+      .aggregate 0 [.ptr { allocId := 0, offsetBytes := 4 } 8, .scalar ⟨0, 8⟩]
+    let sEmptyRetag : MachineState := {
+      frame := {
+        blockIdx := 0
+        stmtIdx := 0
+        locals := [.init emptySliceFatVal]
+      }
+      memory := emptyMemory
+    }
+    -- 1. Disjoint vs overlapping subslice and element projections
+    projectionsOverlap [.subslice 0 2 false] [.subslice 2 4 false] = false ∧
+    projectionsOverlap [.subslice 0 2 false] [.constantIndex 2 0 false] = false ∧
+    projectionsOverlap [.subslice 2 4 false, .constantIndex 1 0 false] [.constantIndex 2 0 false] = false ∧
+    projectionsOverlap [.subslice 0 3 false] [.subslice 2 4 false] = true ∧
+    projectionsOverlap [.subslice 0 2 false] [.constantIndex 1 0 false] = true ∧
+    -- 2. Offset slice fat-pointer element borrow (&(*offset_slice)[1] -> index 1 + 1 = 2) and OOB backing array check
+    evalRvalue [.init arr4Val, .init offsetSliceFatVal]
+      (.ref .shared { local_ := 1, projection := [.deref, .constantIndex 1 0 false] })
+      memActive =
+      .ok (.ptr { allocId := 2, offsetBytes := 0 } 8)
+        [.init arr4Val, .init offsetSliceFatVal]
+        { emptyMemory with
+          borrows :=
+            { tag := 2, targetLocal := 0, targetProjection := [.constantIndex 2 0 false], perm := .frozen } ::
+              activeBorrows
+          nextTag := 3 } ∧
+    evalRvalue [.init arr4Val, .init oobSliceFatVal]
+      (.ref .shared { local_ := 1, projection := [.deref] })
+      memActive = .ub ∧
+    -- 3. Unsize coercion rejects .frozen tag for &mut [T] and supports Value.unit ([T; 0]) in untyped mode
+    evalRvalue [.init (.ptr { allocId := 1, offsetBytes := 0 } 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil }) mutSliceTy)
+      memFrozen mutArrDecl = .ub ∧
+    evalRvalue [.init .unit, .init (.ptr { allocId := 1, offsetBytes := 0 } 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 1, projection := .nil })
+        { kind := .ref .not (.slice (.tuple .nil)), layoutIdx := 0 })
+      memFrozen =
+      .ok (.aggregate 0 [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨0, 8⟩])
+        [.init .unit, .init (.ptr { allocId := 1, offsetBytes := 0 } 8)] memFrozen ∧
+    -- 4. evalPlaceLen rejects dead backing local and OOB slice metadata on stack borrows
+    evalRvalue [.dead, .init offsetSliceFatVal]
+      (.len { local_ := 1, projection := [.deref] }) memActive = .ub ∧
+    evalRvalue [.init arr4Val, .init oobSliceFatVal]
+      (.len { local_ := 1, projection := [.deref] }) memActive = .ub ∧
+    -- 5. StatementKind.retag succeeds on non-null empty slice fat pointer
+    evalStmt sEmptyRetag { kind := .retag .default { local_ := 0, projection := .nil }, span := "" } =
+      MirStepNode.step (advanceStmt sEmptyRetag sEmptyRetag.frame.locals) := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 end Correspondence.V2026_08_01.L3_PlacesAndBasicMem

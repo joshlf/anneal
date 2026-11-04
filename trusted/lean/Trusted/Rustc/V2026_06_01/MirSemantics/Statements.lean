@@ -799,11 +799,20 @@ def evalStmt
     | .ok ptrOrFatVal locals' =>
       match extractDerefPtrVal? ptrOrFatVal with
       | .some ptrVal =>
+        let isMutRefPlace :=
+          match placeTy localDecls layouts place with
+          | .some { kind := .ref .mut _, .. } => true
+          | _ => false
         match lookupBorrow s.memory.borrows ptrVal.tag with
         | .some entry =>
-          match entry.perm with
-          | .disabled => MirStepNode.fail .ub
-          | _ =>
+          let permOk :=
+            match entry.perm, isMutRefPlace with
+            | .disabled, _ => false
+            | .frozen, true => false
+            | _, _ => true
+          match permOk with
+          | false => MirStepNode.fail .ub
+          | true =>
             match retagKind with
             | .fnEntry =>
               let protId := s.memory.nextProtector
@@ -819,8 +828,34 @@ def evalStmt
             | _ => MirStepNode.step (advanceStmt s locals')
         | .none =>
           match lookupGlobalAlloc s.memory.globals ptrVal.allocId with
-          | .some _ => MirStepNode.step (advanceStmt s locals')
-          | .none => MirStepNode.fail .ub
+          | .some alloc =>
+            let mutOk :=
+              match isMutRefPlace, alloc.mutability with
+              | true, .not => false
+              | _, _ => true
+            let boundsOk :=
+              match ptrOrFatVal with
+              | .aggregate 0 (.ptr p 8 :: .scalar lenSc :: .nil) =>
+                Nat.ble (Nat.add p.offsetBytes lenSc.bits) (length alloc.bytes)
+              | _ =>
+                Nat.ble ptrVal.offsetBytes (length alloc.bytes)
+            match Bool.and mutOk boundsOk with
+            | true => MirStepNode.step (advanceStmt s locals')
+            | false => MirStepNode.fail .ub
+          | .none =>
+            let isNonNullEmptySlice :=
+              match ptrOrFatVal with
+              | .aggregate 0 (.ptr p 8 :: .scalar ⟨0, 8⟩ :: .nil) =>
+                Bool.and
+                  (Bool.not isMutRefPlace)
+                  (Bool.not
+                    (Bool.and
+                      (Nat.beq p.allocId 0)
+                      (Nat.beq p.offsetBytes 0)))
+              | _ => false
+            match isNonNullEmptySlice with
+            | true => MirStepNode.step (advanceStmt s locals')
+            | false => MirStepNode.fail .ub
       | .none => MirStepNode.fail .ub
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
@@ -969,7 +1004,11 @@ def evalStmt
             with
             | .ok callerLocals' =>
               let borrows' :=
-                invalidateDerefWriteBorrows locals₁ mem₁.borrows dst restProj
+                invalidateDerefWriteBorrows
+                  locals₁
+                  mem₁.borrows
+                  dst
+                  restProj
               MirStepNode.step
                 (advanceStmt
                   s
