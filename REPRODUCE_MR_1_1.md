@@ -36,7 +36,9 @@ as a pass.
   constants (`Constant::Bool`, only for the bytes `0` and `1`), the
   comparisons `Eq | Ne | Lt | Le | Gt | Ge` on two integers of one type or two
   `bool`s (`BinOp::Rel`), `!b` on a `bool` as `minimize`'s `build::not`
-  (`transmute::<bool>(1u8 - transmute::<u8>(b))`), and `SwitchInt` on a
+  (`transmute::<bool>(1u8 - transmute::<u8>(b))`), `Cast(CastKind::IntToInt)`
+  from a `bool` operand (`CastOp::IntToInt(int_ty)` on `transmute::<u8>(b)`,
+  matching `tooling/minimize/src/rvalue.rs`), and `SwitchInt` on a
   `bool` through `transmute::<u8>`, exactly as `tooling/minimize/src/bb.rs`
   does.
 - **Correspondence** (`Relation.lean`, `Lemmas.lean`, `MiniRustEval.lean`,
@@ -49,8 +51,11 @@ as a pass.
 - **Witnesses** (`Correspondence/Witness.lean`): `cmpNotSwitch` (signed `<`,
   `==`, `!b`, `b > false`, two `SwitchInt`s on `bool`, four blocks),
   `leNeGe` (`<=`, `!=`, `>=`, a `bool` return place that is also a switch
-  scrutinee), `uninitBool` (UB on an uninitialized `bool` in both
-  semantics), and ground-truth evaluations of the new operators.
+  scrutinee), `boolCastI8` (`Cast(CastKind::IntToInt)` from `bool` to `i8`
+  across both `true` and `false` branches plus `argsOk` rejection of invalid
+  `bool` byte `2`), `uninitBool`, `uninitBoolNot`, and `uninitBoolRel` (UB on
+  an uninitialized `bool` in `SwitchInt`, `UnaryOp(Not)`, and `BinaryOp(Eq)`
+  in both semantics), and ground-truth evaluations of the new operators.
 - **Audit** (`minirust/lean/MiniRustSpec/Audit.lean`): `#check_theorem_deps`
   logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, and `[WITNESS-AUDIT]` lines
   ending in `sorry_free=true`, and fails the build on `sorryAx` or any
@@ -133,8 +138,8 @@ Pass: three lines of the form
 
 ```text
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
-[SIMULATION-AUDIT] decls=36 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
-[WITNESS-AUDIT] decls=40 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+[SIMULATION-AUDIT] decls=37 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
+[WITNESS-AUDIT] decls=69 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
 ```
 
 (the axiom lists contain only `propext`, `Quot.sound`, and

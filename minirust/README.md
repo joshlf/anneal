@@ -168,8 +168,10 @@ restricted to the fragment checked by `inFragment`:
   `_i = BinaryOp(Add | Sub | Mul | Div | Rem | BitXor | BitAnd | BitOr | Shl | Shr | AddUnchecked | SubUnchecked | MulUnchecked | ShlUnchecked | ShrUnchecked, opL, opR)`,
   `_i = Cast(CastKind::IntToInt, op, targetTy)`, or `PlaceMention(_i)`,
   with `op`, `opL`, `opR` projection-free `copy _j` or integer constants (of `_i`'s
-  type for `Use`, `UnaryOp`, `opL`, and non-shift `opR`, or of any integer type
-  for shift `opR` and `Cast(IntToInt)`), for an integer `_i`;
+  type for `Use`, `UnaryOp`, `opL`, and non-shift `opR`, of any integer type
+  for shift `opR`, or of any integer or `bool` type for `Cast(IntToInt)`, where
+  `minimize` casts a `bool` by transmuting to `u8` and applying
+  `CastOp::IntToInt`), for an integer `_i`;
 * for a `bool` `_i`: `_i = Use(op)` and `_i = UnaryOp(Not, op)` with a `bool`
   operand, and `_i = BinaryOp(Eq | Ne | Lt | Le | Gt | Ge, opL, opR)` with two
   integer operands of one type or two `bool` operands (`copy _j`, or a `bool`
@@ -352,9 +354,13 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   (`cmpNot3_*`).
 * `leNeGe`, a `(u8, u8) -> bool` body whose `bool` return place is also the
   `SwitchInt` scrutinee, exercising `<=`, `!=`, `>=`, and `bool` returns
-  (`leNeGe250_*` returns `true`, `leNeGe5_*` returns `false`), and
-  `uninitBool`, whose switch on an uninitialized `bool` is UB in both
-  semantics (`uninitBool_minirust_ub_from_start`, `uninitBool_minirust_direct`).
+  (`leNeGe250_*` returns `true`, `leNeGe5_*` returns `false`), `boolCastI8`, a
+  `bool -> i8` body exercising `Cast(CastKind::IntToInt)` on `bool` across both
+  `true` and `false` branches plus `argsOk` rejection of invalid `bool` byte `2`
+  (`boolCastTrue_*`, `boolCastFalse_*`, `boolCastInvalidArg_rejected`), and
+  `uninitBool`, `uninitBoolNot`, and `uninitBoolRel`, whose `SwitchInt`,
+  `UnaryOp(Not)`, and `BinaryOp(Eq)` on an uninitialized `bool` are UB in both
+  semantics (`uninitBool*_minirust_ub_from_start`, `uninitBool*_minirust_direct`).
 * Ground-truth checks of the interpreted operators: signed and unsigned
   `BinOp::Rel`, `RelOp::Cmp` returning `i8`, `bool` ordering, a value-type
   mismatch being a spec panic, `CastOp::Transmute` between `bool` and `u8`
@@ -389,7 +395,7 @@ These are deliberate and are the first things to lift:
 * **Integers and `bool` only.** No three-way `Cmp` (`minimize` transmutes its
   `i8` result to the `Ordering` enum, and enum types are outside the
   interpretation), no `bool` arithmetic (`BitAnd`, `BitOr`, `BitXor` on
-  `bool` become `build::bool_and` and friends), no `bool`-to-integer casts, no
+  `bool` become `build::bool_and` and friends), no
   pointers, references, aggregates, other casts, checked arithmetic, calls,
   drops, or assertions.
 * **The interpretation is transcribed, not generated.** It is anchored to the

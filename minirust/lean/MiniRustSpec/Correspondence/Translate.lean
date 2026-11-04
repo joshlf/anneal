@@ -296,7 +296,7 @@ def boolNot (v : Gen.ValueExpr) : Gen.ValueExpr :=
 
 /-- `minimize`'s rvalue translation for `Use`, `UnaryOp(Neg | Not)` on
 integers, `UnaryOp(Not)` on `bool`, integer `BinaryOp`s, the comparison
-`BinaryOp`s, and `Cast(CastKind::IntToInt)` on integers
+`BinaryOp`s, and `Cast(CastKind::IntToInt)` on integers and `bool`
 (`tooling/minimize/src/rvalue.rs`):
 > "match rv {
 >      smir::Rvalue::Use(operand) => self.translate_operand_smir(operand, span),
@@ -335,6 +335,7 @@ integers, `UnaryOp(Not)` on `bool`, integer `BinaryOp`s, the comparison
 >                  };
 >                  let operand = match operand_ty {
 >                      Type::Int(_) => operand,
+>                      Type::Bool => build::transmute(operand, u8::get_type()),
 >                      ..
 >                  };
 >                  ValueExpr::UnOp {
@@ -346,9 +347,10 @@ where `build::neg(x)` is `ValueExpr::UnOp { operator: UnOp::Int(IntUnOp::Neg), o
 and `build::bit_not(x)` is `ValueExpr::UnOp { operator: UnOp::Int(IntUnOp::BitNot), operand: x }`.
 Like `minimize`, the translation dispatches on the operand type (`decls`
 gives the types of locals): integer arithmetic needs an integer left operand,
-`Not` means `build::not` exactly when the operand is a `bool`, and the
-comparisons apply to operands of any type. `bool` arithmetic (`bool_and` and
-friends) and `bool`-to-integer casts are outside the fragment. -/
+`Not` means `build::not` exactly when the operand is a `bool`, `IntToInt`
+casts a `bool` by first transmuting to `u8` (`boolToU8`) and then applying
+`CastOp::IntToInt(int_ty)`, and the comparisons apply to operands of any type.
+`bool` arithmetic (`bool_and` and friends) is outside the fragment. -/
 def translateRvalue (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Option Gen.ValueExpr
   | .use op => translateOperand op
   | .unaryOp uop op => do
@@ -374,6 +376,7 @@ def translateRvalue (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Option G
     let operand ← translateOperand op
     match operandType decls op with
     | some (.Int _) => pure (.UnOp (.Cast (.IntToInt intTy)) operand)
+    | some .Bool => pure (.UnOp (.Cast (.IntToInt intTy)) (boolToU8 operand))
     | _ => none
   | _ => none
 
@@ -569,6 +572,20 @@ def isShiftIntBinOp : Gen.IntBinOp → Bool
   | .Shl | .Shr | .ShlUnchecked | .ShrUnchecked => true
   | _ => false
 
+/-- Whether a fragment operand has MiniRust type `Type::Bool`. -/
+def operandIsBool (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
+  match operandType decls op with
+  | some .Bool => true
+  | _ => false
+
+/-- A projection-free `bool` operand: a `bool` local, or a `bool` constant
+that `minimize` can read (`0` or `1`). -/
+def operandOkB (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
+  match op with
+  | .copy ⟨j, []⟩ => decide (j < decls.length) && operandIsBool decls op
+  | .constant _ => operandIsBool decls op && (translateOperand op).isSome
+  | _ => false
+
 /-- Fragment rvalues of integer type `it`. -/
 def rvalueOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rvalue → Bool
   | .use op => operandOk decls it op
@@ -588,21 +605,7 @@ def rvalueOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rvalue 
     decide (intTypeOf targetTy = some it) &&
     match operandIntType decls op with
     | some srcIt => operandOk decls srcIt op
-    | none => false
-  | _ => false
-
-/-- Whether a fragment operand has MiniRust type `Type::Bool`. -/
-def operandIsBool (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
-  match operandType decls op with
-  | some .Bool => true
-  | _ => false
-
-/-- A projection-free `bool` operand: a `bool` local, or a `bool` constant
-that `minimize` can read (`0` or `1`). -/
-def operandOkB (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
-  match op with
-  | .copy ⟨j, []⟩ => decide (j < decls.length) && operandIsBool decls op
-  | .constant _ => operandIsBool decls op && (translateOperand op).isSome
+    | none => operandOkB decls op
   | _ => false
 
 /-- The operands of a fragment comparison: both integers of one type, or both

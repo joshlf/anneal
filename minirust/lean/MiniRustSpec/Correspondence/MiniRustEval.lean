@@ -831,7 +831,7 @@ theorem evalValue_operandT {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     obtain ⟨d, slot, hd, hs⟩ := h.slot_exists j hj
     have hspec := (translateFn_spec body f h.hf).2.1 j d hd
     have hTd : tyOf d = T := by
-      simp only [operandType, hd, Option.bind_some] at hty
+      simp only [operandType, hd] at hty
       rw [tyOf_of_scalarTypeOf hty]
     have hitd : itOf d = it := (h.decl_frag j d hd).unique (hTd ▸ hT)
     have hloc := hspec.2
@@ -933,7 +933,7 @@ def rvBits (decls : List LocalDecl) (locals : List LocalSlot) (it : Gen.IntType)
     let z ← intBinEval iop (intFromBits x it) (intFromBits y rhsIt) it
     pure (z % 2 ^ (8 * it.size.bytes)).toNat
   | .cast .intToInt op _ => do
-    let srcIt ← operandIntType decls op
+    let srcIt := (operandIntType decls op).getD u8Ty
     let x ← opBits locals op
     pure (intFromBits x srcIt % 2 ^ (8 * it.size.bytes)).toNat
   | _ => none
@@ -997,6 +997,13 @@ theorem translateRvalue_binary_int {decls : List LocalDecl} {it : Gen.IntType} {
       simp at he
       exact ⟨ea, eb, rfl, rfl, he.symm⟩
 
+/-- `build::bool_to_int::<u8>` (a transmute to `u8`) maps `false`/`true` to
+`0`/`1`. -/
+theorem evalValue_boolToU8 (m m1 : Mach) (e : Gen.ValueExpr) (b : Bool)
+    (he : evalValue m e = .ok ((.Bool b, .Bool), m1)) :
+    evalValue m (boolToU8 e) = .ok ((.Int (if b then 1 else 0), .Int u8Ty), m1) := by
+  cases b <;> simp [boolToU8, evalValue, he, evalUnOp] <;> rfl
+
 theorem translateRvalue_cast_int {decls : List LocalDecl} {srcIt it : Gen.IntType} {op : Operand}
     {targetTy : MirAst.Ty} {e : Gen.ValueExpr} (htgt : intTypeOf targetTy = some it)
     (hok : operandOk decls srcIt op = true)
@@ -1009,6 +1016,26 @@ theorem translateRvalue_cast_int {decls : List LocalDecl} {srcIt it : Gen.IntTyp
   | some eo =>
     simp only [heo, Option.bind_some, hty] at he
     simp at he
+    exact ⟨eo, rfl, he.symm⟩
+
+theorem translateRvalue_cast_bool {decls : List LocalDecl} {it : Gen.IntType} {op : Operand}
+    {targetTy : MirAst.Ty} {e : Gen.ValueExpr} (htgt : intTypeOf targetTy = some it)
+    (hok : operandOkB decls op = true)
+    (he : translateRvalue decls (.cast .intToInt op targetTy) = some e) :
+    ∃ eo, translateOperand op = some eo ∧ e = .UnOp (.Cast (.IntToInt it)) (boolToU8 eo) := by
+  have hty : operandType decls op = some .Bool := by
+    match op, hok with
+    | .copy ⟨j, []⟩, hok =>
+      simp only [operandOkB, Bool.and_eq_true, decide_eq_true_eq, operandIsBool_iff] at hok
+      exact hok.2
+    | .constant c, hok =>
+      simp only [operandOkB, Bool.and_eq_true, operandIsBool_iff] at hok
+      exact hok.1
+  simp only [translateRvalue, Option.bind_eq_bind, htgt, Option.bind_some] at he
+  cases heo : translateOperand op with
+  | none => simp [heo] at he
+  | some eo =>
+    simp [heo, hty] at he
     exact ⟨eo, rfl, he.symm⟩
 
 /-- Evaluating a translated fragment rvalue. -/
@@ -1098,7 +1125,34 @@ theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     simp only [rvalueOk, Bool.and_eq_true, decide_eq_true_eq] at hok
     obtain ⟨htgt, hsrc⟩ := hok
     cases hsrcIt : operandIntType body.localDecls op with
-    | none => simp [hsrcIt] at hsrc
+    | none =>
+      simp only [hsrcIt] at hsrc
+      obtain ⟨eo, heo, rfl⟩ := translateRvalue_cast_bool htgt hsrc he
+      obtain ⟨haok, hanone⟩ := evalValue_operandT h .bool op (operandOkB_T hsrc) eo heo
+      cases hxo : opBits locals op with
+      | none =>
+        refine ⟨fun r hr => by simp [rvBits, hsrcIt, hxo] at hr, fun _ => ?_⟩
+        obtain ⟨msg, hmsg⟩ := hanone hxo
+        exact ⟨msg, by simp [boolToU8, evalValue, hmsg]⟩
+      | some x =>
+        obtain ⟨hvx, m1, hm1, h1⟩ := haok x hxo
+        have hx2 : x < 2 := by simpa [ValidBits] using hvx
+        refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits, hsrcIt, hxo] at hnone⟩
+        simp [rvBits, hsrcIt, hxo] at hr
+        subst hr
+        have hpos := two_pow_pos (8 * it.size.bytes)
+        have hlt : (intFromBits x u8Ty % 2 ^ (8 * it.size.bytes)).toNat < 2 ^ (8 * it.size.bytes) := by
+          have h0 := Int.emod_nonneg (intFromBits x u8Ty) (Int.ne_of_gt hpos)
+          have hlt' := Int.emod_lt_of_pos (intFromBits x u8Ty) hpos
+          have : (((intFromBits x u8Ty % 2 ^ (8 * it.size.bytes)).toNat : Int)) < 2 ^ (8 * it.size.bytes) := by
+            rw [Int.toNat_of_nonneg h0]; exact hlt'
+          exact_mod_cast this
+        refine ⟨hlt, m1, ?_, h1⟩
+        have h8 := evalValue_boolToU8 m m1 eo (decide (x = 1)) (by simpa [valOf] using hm1)
+        have hxInt : (if decide (x = 1) then (1 : Int) else 0) = intFromBits x u8Ty := by
+          rcases (by omega : x = 0 ∨ x = 1) with rfl | rfl <;> rfl
+        rw [hxInt] at h8
+        simp [evalValue, h8, evalUnOp, evalCastOp, bringInBounds_eq_intFromBits it hgood]
     | some srcIt =>
       simp only [hsrcIt] at hsrc
       obtain ⟨eo, heo, rfl⟩ := translateRvalue_cast_int htgt hsrc he
@@ -1260,13 +1314,6 @@ theorem evalBinOp_rel_frag {T : Gen.Type} {it : Gen.IntType} (hT : FragTy T it) 
     evalBinOp (.Rel rel) (valOf T x, T) (valOf T y, T) =
       .ok (.Bool (relBool rel (cmpOf T x y)), .Bool) := by
   cases hT <;> simp [evalBinOp, valOf, cmpOf, evalRelOp_bool rel hrel]
-
-/-- `build::bool_to_int::<u8>` (a transmute to `u8`) maps `false`/`true` to
-`0`/`1`. -/
-theorem evalValue_boolToU8 (m m1 : Mach) (e : Gen.ValueExpr) (b : Bool)
-    (he : evalValue m e = .ok ((.Bool b, .Bool), m1)) :
-    evalValue m (boolToU8 e) = .ok ((.Int (if b then 1 else 0), .Int u8Ty), m1) := by
-  cases b <;> simp [boolToU8, evalValue, he, evalUnOp] <;> rfl
 
 /-- `build::not` negates a `bool`: both of its transmutes succeed because
 `1 - 0` and `1 - 1` are valid `bool` bytes. -/

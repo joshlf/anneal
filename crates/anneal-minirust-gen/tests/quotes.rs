@@ -817,6 +817,13 @@ fn bool_comparison_and_transmute_quotations_are_pinned() {
             "MiniRustSpec/Correspondence/Translate.lean",
         ),
         (
+            rvalue,
+            "let operand = match operand_ty { Type::Int(_) => operand, \
+             Type::Bool => build::transmute(operand, u8::get_type()),",
+            "Type::Bool => build::transmute(operand, i8::get_type()),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
             constant,
             "let val = ecx.read_scalar(&val).unwrap().to_bool().unwrap(); \
              ValueExpr::Constant(Constant::Bool(val), ty)",

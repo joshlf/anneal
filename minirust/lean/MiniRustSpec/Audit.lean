@@ -155,6 +155,7 @@ open MiniRustSpec.Correspondence in
   evalBinOp_rel_frag
   evalValue_boolNot
   evalValue_boolToU8
+  translateRvalue_cast_bool
   switch_spec
   typedLoad_local_bool
   typedLoad_local_bool_uninit
@@ -331,6 +332,7 @@ open MiniRustSpec.Correspondence.Witness in
   cmpNotNeg1_minirust_ret_from_start
   cmpNotNeg1_minirust_direct
   cmpNot3_anneal_ret
+  cmpNot3_noUB
   cmpNot3_minirust_ret_from_start
   cmpNot3_minirust_direct
   ctxBool_ok
@@ -338,22 +340,51 @@ open MiniRustSpec.Correspondence.Witness in
   leNeGe_inFragment
   leNeGe_translate
   leNeGe250_anneal_ret
+  leNeGe250_noUB
   leNeGe250_minirust_ret_from_start
   leNeGe250_minirust_direct
   leNeGe5_anneal_ret
+  leNeGe5_noUB
+  leNeGe5_minirust_ret_from_start
   leNeGe5_minirust_direct
+  ctxI8_ok_boolCast
+  boolCastI8_inFragment
+  boolCastI8_translate
+  boolCastInvalidArg_rejected
+  boolCastTrue_anneal_ret
+  boolCastTrue_noUB
+  boolCastTrue_minirust_ret_from_start
+  boolCastTrue_minirust_direct
+  boolCastFalse_anneal_ret
+  boolCastFalse_noUB
+  boolCastFalse_minirust_ret_from_start
+  boolCastFalse_minirust_direct
   uninitBool_inFragment
   uninitBool_translate
   uninitBool_anneal_ub
   uninitBool_minirust_ub_from_start
   uninitBool_minirust_direct
+  uninitBoolNot_inFragment
+  uninitBoolNot_translate
+  uninitBoolNot_anneal_ub
+  uninitBoolNot_minirust_ub_from_start
+  uninitBoolNot_minirust_direct
+  uninitBoolRel_inFragment
+  uninitBoolRel_translate
+  uninitBoolRel_anneal_ub
+  uninitBoolRel_minirust_ub_from_start
+  uninitBoolRel_minirust_direct
   relLt_signed
   relGt_unsigned
   relCmp_signed
   relCmp_unsigned
   relCmp_bool
   relLt_bool
+  relGt_bool
   relLe_bool
+  relGe_bool
+  relEq_bool
+  relNe_bool
   relGe_eq
   relNe_eq
   rel_mismatch
@@ -408,6 +439,7 @@ open MiniRustSpec.Correspondence in
   evalBinOp_rel_frag
   evalValue_boolNot
   evalValue_boolToU8
+  translateRvalue_cast_bool
   switch_spec
   typedStore_base_frag
 
@@ -420,27 +452,56 @@ open MiniRustSpec.Correspondence.Witness in
   cmpNotNeg1_minirust_ret_from_start
   cmpNotNeg1_minirust_direct
   cmpNot3_anneal_ret
+  cmpNot3_noUB
   cmpNot3_minirust_ret_from_start
   cmpNot3_minirust_direct
   leNeGe_inFragment
   leNeGe_translate
   leNeGe250_anneal_ret
+  leNeGe250_noUB
   leNeGe250_minirust_ret_from_start
   leNeGe250_minirust_direct
   leNeGe5_anneal_ret
+  leNeGe5_noUB
+  leNeGe5_minirust_ret_from_start
   leNeGe5_minirust_direct
+  boolCastI8_inFragment
+  boolCastI8_translate
+  boolCastInvalidArg_rejected
+  boolCastTrue_anneal_ret
+  boolCastTrue_noUB
+  boolCastTrue_minirust_ret_from_start
+  boolCastTrue_minirust_direct
+  boolCastFalse_anneal_ret
+  boolCastFalse_noUB
+  boolCastFalse_minirust_ret_from_start
+  boolCastFalse_minirust_direct
   uninitBool_inFragment
   uninitBool_translate
   uninitBool_anneal_ub
   uninitBool_minirust_ub_from_start
   uninitBool_minirust_direct
+  uninitBoolNot_inFragment
+  uninitBoolNot_translate
+  uninitBoolNot_anneal_ub
+  uninitBoolNot_minirust_ub_from_start
+  uninitBoolNot_minirust_direct
+  uninitBoolRel_inFragment
+  uninitBoolRel_translate
+  uninitBoolRel_anneal_ub
+  uninitBoolRel_minirust_ub_from_start
+  uninitBoolRel_minirust_direct
   relLt_signed
   relGt_unsigned
   relCmp_signed
   relCmp_unsigned
   relCmp_bool
   relLt_bool
+  relGt_bool
   relLe_bool
+  relGe_bool
+  relEq_bool
+  relNe_bool
   relGe_eq
   relNe_eq
   rel_mismatch

@@ -52,7 +52,7 @@ theorem evalOperand_fragT (decls : List LocalDecl) (locals : List LocalSlot)
     have hjl : j < locals.length := by rw [hn]; exact hj
     obtain ⟨d, hd⟩ : ∃ d, decls[j]? = some d := ⟨decls[j], by simp [hj]⟩
     have hTd : tyOf d = T := by
-      simp only [operandType, hd, Option.bind_some] at hty
+      simp only [operandType, hd] at hty
       exact tyOf_of_scalarTypeOf hty
     have hs : locals[j]? = some locals[j] := by simp [hjl]
     have hslot := hslots j d _ hd hs
@@ -1319,7 +1319,7 @@ theorem opBits_valid (decls : List LocalDecl) (locals : List LocalSlot) (hslots 
     obtain ⟨hj, hty⟩ := hok
     obtain ⟨d, hd⟩ : ∃ d, decls[j]? = some d := ⟨decls[j], by simp [hj]⟩
     have hTd : tyOf d = T := by
-      simp only [operandType, hd, Option.bind_some] at hty
+      simp only [operandType, hd] at hty
       exact tyOf_of_scalarTypeOf hty
     simp only [opBits] at hb
     match hs : locals[j]?, hb with
@@ -1444,6 +1444,32 @@ theorem operandIsSigned_of_operandOk (decls : List LocalDecl) (layouts : Layout.
   rcases intTypeOf_kind hit with ⟨⟨u, hu⟩, hs⟩ | ⟨⟨i, hi⟩, hs⟩
   · simp [hu, hs]
   · simp [hi, hs]
+
+/-- The signedness Anneal uses for a fragment operand of type `T`. -/
+def signedOf : Gen.Type → Bool
+  | .Int it => match it.signed with | .Unsigned => false | .Signed => true
+  | _ => false
+
+theorem operandIsSigned_of_OperandOkT (decls : List LocalDecl) (layouts : Layout.LayoutTable)
+    {T : Gen.Type} (op : Operand) (hok : OperandOkT decls T op) :
+    MirSemantics.operandIsSigned decls op layouts = signedOf T := by
+  have hty : ∃ ty, MirSemantics.operandTy decls layouts op = some ty ∧ scalarTypeOf ty = some T := by
+    match op, hok with
+    | .copy ⟨j, []⟩, hok =>
+      obtain ⟨hj, hty⟩ := hok
+      obtain ⟨d, hd⟩ : ∃ d, decls[j]? = some d := ⟨decls[j], by simp [hj]⟩
+      simp only [operandType, hd] at hty
+      exact ⟨d.ty, by simp [MirSemantics.operandTy, MirSemantics.placeTy, get?, hd,
+        MirSemantics.resolveProjectedTy], hty⟩
+    | .constant c, hok => exact ⟨c.ty, rfl, hok.1⟩
+  obtain ⟨ty, hty, hT⟩ := hty
+  simp only [MirSemantics.operandIsSigned, hty, MirSemantics.tyIsSigned]
+  rcases scalarTypeOf_cases hT with ⟨hb, rfl⟩ | ⟨it, hit, rfl⟩
+  · unfold isBoolTy at hb
+    split at hb <;> simp_all [signedOf]
+  · rcases intTypeOf_kind hit with ⟨⟨u, hu⟩, hs⟩ | ⟨⟨i, hi⟩, hs⟩
+    · simp [hu, hs, signedOf]
+    · simp [hi, hs, signedOf]
 
 theorem castBits_eq_toNat (srcIt it : Gen.IntType) (hsrcGood : GoodSize srcIt.size.bytes)
     (x : Nat) (hx : x < 2 ^ (8 * srcIt.size.bytes)) :
@@ -1590,7 +1616,30 @@ theorem evalRvalue_frag (decls : List LocalDecl) (locals : List LocalSlot)
     simp only [rvalueOk, Bool.and_eq_true, decide_eq_true_eq] at hok
     obtain ⟨htgt, hsrc⟩ := hok
     cases hsrcIt : operandIntType decls op with
-    | none => simp [hsrcIt] at hsrc
+    | none =>
+      simp only [hsrcIt] at hsrc
+      have hokT := operandOkB_T hsrc
+      obtain ⟨ha, hanone⟩ :=
+        evalOperand_fragT decls locals hslots hn .bool op hokT mem.borrows mem.globals layouts mem.callerLocals
+      have htgtBytes := intCastTargetBytes_of_intTypeOf htgt
+      have hsigned : MirSemantics.operandIsSigned decls op layouts = false :=
+        operandIsSigned_of_OperandOkT decls layouts op hokT
+      cases hxo : opBits locals op with
+      | none =>
+        refine ⟨fun r hr => by simp [rvBits, hsrcIt, hxo] at hr, fun _ => ?_⟩
+        simp [evalRvalue, hanone hxo]
+      | some x =>
+        refine ⟨fun r hr => ?_, fun h => by simp [rvBits, hsrcIt, hxo] at h⟩
+        simp [rvBits, hsrcIt, hxo] at hr
+        subst hr
+        have hx2 : x < 2 := by simpa [ValidBits] using opBits_valid decls locals hslots .bool op hokT x hxo
+        have hx : x < 2 ^ (8 * u8Ty.size.bytes) := by simp [u8Ty]; omega
+        have hcast := castBits_eq_toNat u8Ty it (Or.inl rfl) x hx
+        dsimp only [u8Ty] at hcast
+        have hbeq1 : Nat.beq u8Ty.size.bytes 0 = false := rfl
+        simp only [evalRvalue, ha x hxo, hbeq1, htgtBytes, hsigned]
+        rw [hcast]
+        rfl
     | some srcIt =>
       simp only [hsrcIt] at hsrc
       obtain ⟨ha, hanone⟩ :=
@@ -1701,32 +1750,6 @@ theorem evalScalarBinOp_rel_bool (op : MirAst.BinOp) (rel : Gen.RelOp)
     rcases (by omega : y = 0 ∨ y = 1) with rfl | rfl <;>
     cases op <;> simp [translateRelOp] at hrel <;> subst hrel <;> rfl
 
-/-- The signedness Anneal uses for a fragment operand of type `T`. -/
-def signedOf : Gen.Type → Bool
-  | .Int it => match it.signed with | .Unsigned => false | .Signed => true
-  | _ => false
-
-theorem operandIsSigned_of_OperandOkT (decls : List LocalDecl) (layouts : Layout.LayoutTable)
-    {T : Gen.Type} (op : Operand) (hok : OperandOkT decls T op) :
-    MirSemantics.operandIsSigned decls op layouts = signedOf T := by
-  have hty : ∃ ty, MirSemantics.operandTy decls layouts op = some ty ∧ scalarTypeOf ty = some T := by
-    match op, hok with
-    | .copy ⟨j, []⟩, hok =>
-      obtain ⟨hj, hty⟩ := hok
-      obtain ⟨d, hd⟩ : ∃ d, decls[j]? = some d := ⟨decls[j], by simp [hj]⟩
-      simp only [operandType, hd, Option.bind_some] at hty
-      exact ⟨d.ty, by simp [MirSemantics.operandTy, MirSemantics.placeTy, get?, hd,
-        MirSemantics.resolveProjectedTy], hty⟩
-    | .constant c, hok => exact ⟨c.ty, rfl, hok.1⟩
-  obtain ⟨ty, hty, hT⟩ := hty
-  simp only [MirSemantics.operandIsSigned, hty, MirSemantics.tyIsSigned]
-  rcases scalarTypeOf_cases hT with ⟨hb, rfl⟩ | ⟨it, hit, rfl⟩
-  · unfold isBoolTy at hb
-    split at hb <;> simp_all [signedOf]
-  · rcases intTypeOf_kind hit with ⟨⟨u, hu⟩, hs⟩ | ⟨⟨i, hi⟩, hs⟩
-    · simp [hu, hs, signedOf]
-    · simp [hi, hs, signedOf]
-
 theorem operandTy_of_OperandOkT (decls : List LocalDecl) (layouts : Layout.LayoutTable)
     {T : Gen.Type} (op : Operand) (hok : OperandOkT decls T op) :
     ∃ ty, MirSemantics.operandTy decls layouts op = some ty ∧ scalarTypeOf ty = some T := by
@@ -1734,7 +1757,7 @@ theorem operandTy_of_OperandOkT (decls : List LocalDecl) (layouts : Layout.Layou
   | .copy ⟨j, []⟩, hok =>
     obtain ⟨hj, hty⟩ := hok
     obtain ⟨d, hd⟩ : ∃ d, decls[j]? = some d := ⟨decls[j], by simp [hj]⟩
-    simp only [operandType, hd, Option.bind_some] at hty
+    simp only [operandType, hd] at hty
     exact ⟨d.ty, by simp [MirSemantics.operandTy, MirSemantics.placeTy, get?, hd,
       MirSemantics.resolveProjectedTy], hty⟩
   | .constant c, hok => exact ⟨c.ty, rfl, hok.1⟩

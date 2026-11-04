@@ -2276,6 +2276,9 @@ theorem cmpNot3_anneal_ret :
       (.normal (.scalar ⟨2, 1⟩, cmpNot3S0.memory)) :=
   runA_sound cmpNotSwitch 20 _ _ _ rfl
 
+theorem cmpNot3_noUB : MirNoUBTree (mirCallTree cmpNotSwitch cmpNot3Args) :=
+  runA_noUB cmpNotSwitch 20 _ _ _ rfl
+
 theorem cmpNot3_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n cmpNot3MInit = .ok m' ∧
       m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 2 } ∧
@@ -2393,6 +2396,9 @@ theorem leNeGe250_anneal_ret :
       (.normal (.scalar ⟨1, 1⟩, leNeGe250S0.memory)) :=
   runA_sound leNeGe 10 _ _ _ rfl
 
+theorem leNeGe250_noUB : MirNoUBTree (mirCallTree leNeGe leNeGe250Args) :=
+  runA_noUB leNeGe 10 _ _ _ rfl
+
 theorem leNeGe250_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n leNeGe250MInit = .ok m' ∧
       m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes u8 1 } ∧
@@ -2431,11 +2437,199 @@ theorem leNeGe5_anneal_ret :
       (.normal (.scalar ⟨0, 1⟩, leNeGe5S0.memory)) :=
   runA_sound leNeGe 10 _ _ _ rfl
 
+theorem leNeGe5_noUB : MirNoUBTree (mirCallTree leNeGe leNeGe5Args) :=
+  runA_noUB leNeGe 10 _ _ _ rfl
+
+theorem leNeGe5_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n leNeGe5MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes u8 0 } ∧
+      m'.threads = [thread1 ctxBool [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret leNeGe_inFragment leNeGe_translate ctxBool (ctxBool_ok rfl)
+      leNeGe5Args (by decide) leNeGe5MInit rfl rfl rfl leNeGe5_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [leNeGe] at hd; subst hd
+  simp [retPtr, ctxBool] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxBool] at hr; subst hr
+  have hbits : bits = 0 := by
+    simp [itOf, intTypeOf, intTyBytes, boolDecl, boolTy] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxBool, itOf, intTypeOf, intTyBytes, boolDecl, boolTy, u8]
+
 set_option maxRecDepth 8192 in
 theorem leNeGe5_minirust_direct :
     (Interp.steps 5 leNeGe5MInit).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAllocI8 with data := scalarBytes u8 0 }, [1]) := rfl
+
+/-! ### `bool`-to-integer cast (`CastKind::IntToInt` on `Type::Bool`) -/
+
+def fnAbiBoolToI8 : FnAbi :=
+  { args := [{ layout := boolLayout, mode := .direct }],
+    ret := { layout := i8Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+theorem ctxI8_ok_boolCast {body : CapturedMir} (h : body.localDecls = [i8Decl, boolDecl]) :
+    CtxOk body ctxI8 where
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | _ + 2, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MIR (`Runtime(PostCleanup)`) of
+```rust
+fn bool_cast_i8(mut b: bool) -> i8 {
+    b = !(b == false);         // bb0: _1 = Eq(copy _1, const false); _1 = Not(copy _1);
+                               //      switchInt(copy _1) -> [0: bb2, otherwise: bb1]
+    if b { b as i8 }           // bb1: _0 = Cast(IntToInt, copy _1, i8); return
+    else { b as i8 }           // bb2: _0 = Cast(IntToInt, copy _1, i8); return
+}
+```
+exercising `Cast(CastKind::IntToInt)` on `Type::Bool` (which `minimize` lowers
+by transmuting the `bool` to `u8` and then applying `CastOp::IntToInt`). -/
+def boolCastI8 : CapturedMir where
+  defPath := "witness::bool_cast_i8"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [i8Decl, boolDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 1) (.binaryOp .eq (.copy (local_ 1)) (constBool false))),
+        mkStmt (.assign (local_ 1) (.unaryOp .not (.copy (local_ 1))))],
+      terminator := mkTerm (.switchInt (.copy (local_ 1)) { branches := [(0, 2)], otherwise := 1 }),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.cast .intToInt (.copy (local_ 1)) i8Ty))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.cast .intToInt (.copy (local_ 1)) i8Ty))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiBoolToI8
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem boolCastI8_inFragment : inFragment boolCastI8 = true := by decide
+
+def boolCastI8Fn : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8), (localName 1, .Bool)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 1))
+        (.BinOp (.Rel .Eq) (.Load (.Local (localName 1))) (.Constant (.Bool false) .Bool)),
+      .Assign (.Local (localName 1))
+        (.UnOp (.Cast (.Transmute .Bool))
+          (.BinOp (.Int .Sub) (.Constant (.Int 1) (.Int u8))
+            (.UnOp (.Cast (.Transmute (.Int u8))) (.Load (.Local (localName 1))))))],
+      .Switch (.UnOp (.Cast (.Transmute (.Int u8))) (.Load (.Local (localName 1))))
+        ⟨[(0, bbName 2)]⟩ (bbName 1), .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 0))
+        (.UnOp (.Cast (.IntToInt i8))
+          (.UnOp (.Cast (.Transmute (.Int u8))) (.Load (.Local (localName 1)))))],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Local (localName 0))
+        (.UnOp (.Cast (.IntToInt i8))
+          (.UnOp (.Cast (.Transmute (.Int u8))) (.Load (.Local (localName 1)))))],
+      .Return, .Regular⟩),
+    (bbName 3, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 3
+  implicit_writes := true
+
+theorem boolCastI8_translate : translateFn boolCastI8 = some boolCastI8Fn := rfl
+
+/-- An invalid `bool` bit pattern (`2 >= 2`) is rejected by `argsOk`. -/
+theorem boolCastInvalidArg_rejected : argsOk boolCastI8 [.scalar ⟨2, 1⟩] = false := rfl
+
+/-- Input `b = true` (byte `1`): `!(true == false) = true`, casts `true as i8 = 1i8`. -/
+def boolCastTrueArgs : List Value := [.scalar ⟨1, 1⟩]
+def boolCastTrueS0 : MachineState := initMachineState boolCastI8 boolCastTrueArgs
+def boolCastTrueMInit : Mach :=
+  machineWithCtx ctxI8 boolCastI8 boolCastI8Fn boolCastTrueS0.frame.locals boolCastI8Fn.start
+
+theorem boolCastTrue_anneal_ret :
+    ReachesRet (mirCallTree boolCastI8 boolCastTrueArgs) [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
+      (.normal (.scalar ⟨1, 1⟩, boolCastTrueS0.memory)) :=
+  runA_sound boolCastI8 15 _ _ _ rfl
+
+theorem boolCastTrue_noUB : MirNoUBTree (mirCallTree boolCastI8 boolCastTrueArgs) :=
+  runA_noUB boolCastI8 15 _ _ _ rfl
+
+theorem boolCastTrue_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n boolCastTrueMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 1 } ∧
+      m'.threads = [thread1 ctxI8 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret boolCastI8_inFragment boolCastI8_translate ctxI8 (ctxI8_ok_boolCast rfl)
+      boolCastTrueArgs (by decide) boolCastTrueMInit rfl rfl rfl boolCastTrue_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [boolCastI8] at hd; subst hd
+  simp [retPtr, ctxI8] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8] at hr; subst hr
+  have hbits : bits = 1 := by
+    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxI8, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+
+set_option maxRecDepth 8192 in
+theorem boolCastTrue_minirust_direct :
+    (Interp.steps 6 boolCastTrueMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 1 }, [1]) := rfl
+
+/-- Input `b = false` (byte `0`): `!(false == false) = false`, casts `false as i8 = 0i8`. -/
+def boolCastFalseArgs : List Value := [.scalar ⟨0, 1⟩]
+def boolCastFalseS0 : MachineState := initMachineState boolCastI8 boolCastFalseArgs
+def boolCastFalseMInit : Mach :=
+  machineWithCtx ctxI8 boolCastI8 boolCastI8Fn boolCastFalseS0.frame.locals boolCastI8Fn.start
+
+theorem boolCastFalse_anneal_ret :
+    ReachesRet (mirCallTree boolCastI8 boolCastFalseArgs) [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
+      (.normal (.scalar ⟨0, 1⟩, boolCastFalseS0.memory)) :=
+  runA_sound boolCastI8 15 _ _ _ rfl
+
+theorem boolCastFalse_noUB : MirNoUBTree (mirCallTree boolCastI8 boolCastFalseArgs) :=
+  runA_noUB boolCastI8 15 _ _ _ rfl
+
+theorem boolCastFalse_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n boolCastFalseMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 0 } ∧
+      m'.threads = [thread1 ctxI8 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret boolCastI8_inFragment boolCastI8_translate ctxI8 (ctxI8_ok_boolCast rfl)
+      boolCastFalseArgs (by decide) boolCastFalseMInit rfl rfl rfl boolCastFalse_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [boolCastI8] at hd; subst hd
+  simp [retPtr, ctxI8] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8] at hr; subst hr
+  have hbits : bits = 0 := by
+    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxI8, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+
+set_option maxRecDepth 8192 in
+theorem boolCastFalse_minirust_direct :
+    (Interp.steps 6 boolCastFalseMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 0 }, [1]) := rfl
 
 /-! ### Reading an uninitialized `bool` -/
 
@@ -2511,6 +2705,114 @@ theorem uninitBool_minirust_direct :
     Interp.steps 2 uninitBoolMInit =
       .error (.ub "load at type but the data in memory violates the language invariant") := rfl
 
+/-- MIR of `fn uninit_bool_not() -> bool` whose entry block negates the
+uninitialized return place `_0` (`_0 = !copy _0` via `build::not`), faulting
+at the load of `_0` before the `u8` transmute. -/
+def uninitBoolNot : CapturedMir where
+  defPath := "witness::uninit_bool_not"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [boolDecl]
+  basicBlocks := [
+    { statements := [mkStmt (.assign (local_ 0) (.unaryOp .not (.copy (local_ 0))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiToBool
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem uninitBoolNot_inFragment : inFragment uninitBoolNot = true := by decide
+
+def uninitBoolNotFn : Gen.Function where
+  locals := ⟨[(localName 0, .Bool)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 0))
+        (.UnOp (.Cast (.Transmute .Bool))
+          (.BinOp (.Int .Sub) (.Constant (.Int 1) (.Int u8))
+            (.UnOp (.Cast (.Transmute (.Int u8))) (.Load (.Local (localName 0))))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem uninitBoolNot_translate : translateFn uninitBoolNot = some uninitBoolNotFn := rfl
+
+def uninitBoolNotS0 : MachineState := initMachineState uninitBoolNot []
+def uninitBoolNotMInit : Mach :=
+  machineWithCtx ctxBool uninitBoolNot uninitBoolNotFn uninitBoolNotS0.frame.locals uninitBoolNotFn.start
+
+theorem uninitBoolNot_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree uninitBoolNot []) tr u ∧ FaultNow u :=
+  faultsA_sound uninitBoolNot 3 _ (by decide)
+
+theorem uninitBoolNot_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n uninitBoolNotMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := uninitBoolNot_anneal_ub
+  exact mirCall_ub uninitBoolNot_inFragment uninitBoolNot_translate ctxBool (ctxBool_ok1 rfl) []
+    (by decide) uninitBoolNotMInit rfl rfl rfl hr hf
+
+set_option maxRecDepth 8192 in
+theorem uninitBoolNot_minirust_direct :
+    Interp.steps 2 uninitBoolNotMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") := rfl
+
+/-- MIR of `fn uninit_bool_rel() -> bool` whose entry block compares the
+uninitialized return place `_0` (`_0 = Eq(copy _0, const true)`), faulting at
+the load of `_0` in `BinOp::Rel`. -/
+def uninitBoolRel : CapturedMir where
+  defPath := "witness::uninit_bool_rel"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [boolDecl]
+  basicBlocks := [
+    { statements := [mkStmt (.assign (local_ 0) (.binaryOp .eq (.copy (local_ 0)) (constBool true)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiToBool
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem uninitBoolRel_inFragment : inFragment uninitBoolRel = true := by decide
+
+def uninitBoolRelFn : Gen.Function where
+  locals := ⟨[(localName 0, .Bool)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.Rel .Eq) (.Load (.Local (localName 0))) (.Constant (.Bool true) .Bool))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem uninitBoolRel_translate : translateFn uninitBoolRel = some uninitBoolRelFn := rfl
+
+def uninitBoolRelS0 : MachineState := initMachineState uninitBoolRel []
+def uninitBoolRelMInit : Mach :=
+  machineWithCtx ctxBool uninitBoolRel uninitBoolRelFn uninitBoolRelS0.frame.locals uninitBoolRelFn.start
+
+theorem uninitBoolRel_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree uninitBoolRel []) tr u ∧ FaultNow u :=
+  faultsA_sound uninitBoolRel 3 _ (by decide)
+
+theorem uninitBoolRel_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n uninitBoolRelMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := uninitBoolRel_anneal_ub
+  exact mirCall_ub uninitBoolRel_inFragment uninitBoolRel_translate ctxBool (ctxBool_ok1 rfl) []
+    (by decide) uninitBoolRelMInit rfl rfl rfl hr hf
+
+set_option maxRecDepth 8192 in
+theorem uninitBoolRel_minirust_direct :
+    Interp.steps 2 uninitBoolRelMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") := rfl
+
 /-! ### Ground truth for the interpreted operators
 
 Direct evaluations of the transcribed MiniRust operators, independent of the
@@ -2537,8 +2839,16 @@ theorem relCmp_bool : evalBinOp (.Rel .Cmp) (.Bool true, .Bool) (.Bool true, .Bo
 of `Gt`/`Lt`/`Eq`. -/
 theorem relLt_bool : evalBinOp (.Rel .Lt) (.Bool false, .Bool) (.Bool true, .Bool) =
     .ok (.Bool true, .Bool) := rfl
+theorem relGt_bool : evalBinOp (.Rel .Gt) (.Bool true, .Bool) (.Bool false, .Bool) =
+    .ok (.Bool true, .Bool) := rfl
 theorem relLe_bool : evalBinOp (.Rel .Le) (.Bool true, .Bool) (.Bool false, .Bool) =
     .ok (.Bool false, .Bool) := rfl
+theorem relGe_bool : evalBinOp (.Rel .Ge) (.Bool false, .Bool) (.Bool false, .Bool) =
+    .ok (.Bool true, .Bool) := rfl
+theorem relEq_bool : evalBinOp (.Rel .Eq) (.Bool false, .Bool) (.Bool false, .Bool) =
+    .ok (.Bool true, .Bool) := rfl
+theorem relNe_bool : evalBinOp (.Rel .Ne) (.Bool false, .Bool) (.Bool true, .Bool) =
+    .ok (.Bool true, .Bool) := rfl
 theorem relGe_eq : evalBinOp (.Rel .Ge) (.Int 7, .Int u8) (.Int 7, .Int u8) =
     .ok (.Bool true, .Bool) := rfl
 theorem relNe_eq : evalBinOp (.Rel .Ne) (.Int 7, .Int u8) (.Int 7, .Int u8) =
