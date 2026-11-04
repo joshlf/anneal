@@ -340,6 +340,13 @@ open MiniRustSpec.Correspondence.Witness in
   arrayU32IdxOob_anneal_ub
   arrayU32IdxOob_minirust_ub_from_start
   arrayU32IdxOob_minirust_direct
+  arrayConstIdxOobI8_inFragment
+  arrayConstIdxOobI8_translate
+  arrayConstIdxOob_anneal_ub
+  arrayConstIdxOob_minirust_ub_from_start
+  arrayConstIdxOob_minirust_direct
+  sizeMulInt_zero_neg
+  array_encode_decode_edge_cases
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -461,6 +468,13 @@ open MiniRustSpec.Correspondence.Witness in
   arrayU32IdxOob_anneal_ub
   arrayU32IdxOob_minirust_ub_from_start
   arrayU32IdxOob_minirust_direct
+  arrayConstIdxOobI8_inFragment
+  arrayConstIdxOobI8_translate
+  arrayConstIdxOob_anneal_ub
+  arrayConstIdxOob_minirust_ub_from_start
+  arrayConstIdxOob_minirust_direct
+  sizeMulInt_zero_neg
+  array_encode_decode_edge_cases
   zeroArrayI8_inFragment
   zeroArrayI8_translate
   zeroArrayOk_anneal_ret

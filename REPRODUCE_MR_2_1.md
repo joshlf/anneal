@@ -83,7 +83,8 @@ theorems it checked. The groups are:
   `writeProjectedValue_proj`, `typedStore_array_elem`, ...).
 - `WITNESS-AUDIT`: every `MR-2.1` witness theorem in
   `MiniRustSpec/Correspondence/Witness.lean` (`arrayOps*`, `arraySigned*`,
-  `arrayUninitIdx*`, `arrayU32Idx*`, `zeroArray*`).
+  `arrayUninitIdx*`, `arrayU32Idx*`, `zeroArray*`, `arrayConstIdxOob*`,
+  `sizeMulInt_zero_neg`, `array_encode_decode_edge_cases`).
 
 ```bash
 cd examples && anneal-lean-run --mode file --concurrency 3 -- lake env lean ../minirust/lean/MiniRustSpec/Audit.lean | grep -E '\[(ANCHOR|SIMULATION|WITNESS)-AUDIT\]|exhaustively verified'
@@ -92,10 +93,10 @@ cd examples && anneal-lean-run --mode file --concurrency 3 -- lake env lean ../m
 Expected audit summary lines:
 
 ```text
-MiniRustSpec.Audit: exhaustively verified standard axioms for 8179 declarations across all MiniRustSpec.* modules
+MiniRustSpec.Audit: exhaustively verified standard axioms for 8222 declarations across all MiniRustSpec.* modules
 [ANCHOR-AUDIT] decls=2 theorems=2 sorry_free=true standard_axioms_only=true
 [SIMULATION-AUDIT] decls=21 theorems=21 sorry_free=true standard_axioms_only=true
-[WITNESS-AUDIT] decls=46 theorems=46 sorry_free=true standard_axioms_only=true
+[WITNESS-AUDIT] decls=53 theorems=53 sorry_free=true standard_axioms_only=true
 ```
 
 ## 6. What the Witnesses Show
@@ -118,5 +119,12 @@ Each witness runs both semantics in the kernel (`decide`/`rfl`, no
 - `arrayUninitIdxI8`: an uninitialized index local raises UB; MiniRust's
   message is the failed `Load` of the index operand
   (`arrayUninitIdx_minirust_direct`), not the bounds check.
-- `zeroArrayI8`: `[i8; 0]` construction, copy, and `Len = 0`; indexing at `0`
-  raises out-of-bounds UB.
+- `zeroArrayI8`: `[i8; 0]` construction (`Aggregate(Array, [])` and
+  `Repeat(const 5i8, 0)`), copy, and `Len = 0`; indexing at `0` raises
+  out-of-bounds UB.
+- `arrayConstIdxOobI8` (plus `sizeMulInt_zero_neg` and
+  `array_encode_decode_edge_cases`): `PlaceMention(_1)` on an array local and
+  out-of-bounds `ConstantIndex` (`fromEnd = false, offset = 2 >= 2`) UB on
+  `[i8; 2]`, plus direct checks of `Size.mulInt` (`Size::ZERO * -1 =
+  Size::ZERO`), `Type.encode` length-mismatch ordering, and `Type.decode` on
+  uninitialized array elements.

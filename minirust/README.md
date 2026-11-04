@@ -174,8 +174,9 @@ restricted to the fragment checked by `inFragment`:
   `Cast(CastKind::IntToInt, op, targetTy)`, or (into a `usize` place)
   `Len(_j)` of an array local; for an array destination local `_i : [T; N]`,
   `Use(copy _j)` of an array local of the same type,
-  `Aggregate(Array(T), [op; N])`, or `Repeat(op, N)` with `N > 0`; or
-  `PlaceMention(_i)`; here `op`, `opL`, `opR` are `copy` of a scalar place or
+  `Aggregate(Array(T), [op; N])`, or `Repeat(op, N)` with `N > 0` (or `N = 0`
+  when `op` is a constant); or `PlaceMention(_i)` of an unprojected local `_i`
+  (scalar or array); here `op`, `opL`, `opR` are `copy` of a scalar place or
   integer constants (of the destination's type for `Use`, `UnaryOp`, `opL`,
   non-shift `opR`, and array elements, or of any integer type for shift `opR`
   and `Cast(IntToInt)`);
@@ -350,18 +351,21 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `mirCall_steps_error`, and direct checks of MiniRust's `"load at type but the
   data in memory violates the language invariant"` UB), alongside ground-truth
   checks of all four `IntBinOp::DivExact` outcomes.
-* `arrayOpsI8`, `arraySignedIdxI8`, `zeroArrayI8`, `arrayUninitIdxI8`, and
-  `arrayU32Idx`, bodies with `[i8; 3]`, `[i8; 2]`, `[i8; 0]`, and `[u32; 3]`
-  arguments exercising `Aggregate(Array)`, `Repeat`, whole-array copies,
-  `Len`, and `Index` / `ConstantIndex` (from the start and from the end) reads
-  and in-place element writes (`*_minirust_ret_from_start`, `*_noUB`, direct
-  runs, and byte-level checks that each in-place write rewrites exactly the
-  element's bytes at offset `index * size_of::<T>()` and leaves its siblings
+* `arrayOpsI8`, `arraySignedIdxI8`, `zeroArrayI8`, `arrayUninitIdxI8`,
+  `arrayU32Idx`, and `arrayConstIdxOobI8`, bodies with `[i8; 3]`, `[i8; 2]`,
+  `[i8; 0]`, and `[u32; 3]` arguments exercising `Aggregate(Array)`, `Repeat`
+  (including `[const 5i8; 0]`), whole-array copies, `PlaceMention` on an array
+  local, `Len`, and `Index` / `ConstantIndex` (from the start and from the end)
+  reads and in-place element writes (`*_minirust_ret_from_start`, `*_noUB`,
+  direct runs, and byte-level checks that each in-place write rewrites exactly
+  the element's bytes at offset `index * size_of::<T>()` and leaves its siblings
   intact: `arrayOpsOk_minirust_inplace_bytes`,
-  `arrayU32IdxOk_minirust_inplace_bytes`), plus UB for an out-of-bounds index
-  (`idx >= N`, including every index of `[i8; 0]`), a negative signed index,
-  and an uninitialized index local, each via `mirCall_ub` and a direct check
-  of MiniRust's `throw_ub!` message.
+  `arrayU32IdxOk_minirust_inplace_bytes`), plus UB for an out-of-bounds
+  `Index` or `ConstantIndex` (`idx >= N`, including every index of `[i8; 0]`),
+  a negative signed index, and an uninitialized index local, each via
+  `mirCall_ub` and a direct check of MiniRust's `throw_ub!` message, alongside
+  ground-truth checks of `Size.mulInt`, `Type.encode`, and `Type.decode`
+  (`sizeMulInt_zero_neg`, `array_encode_decode_edge_cases`).
 
 ### Gaps
 
@@ -388,9 +392,16 @@ These are deliberate and are the first things to lift:
   calls, drops, or assertions. Arrays appear only as arguments (no other
   locals exist) and never as the return place, and a place has at most one
   projection.
-* **`Repeat` with count `0` is excluded.** Anneal evaluates the operand once
-  before replicating it, while `minimize`'s `list![op; 0]` never evaluates it,
-  so the models disagree when the operand is UB (an uninitialized `copy`).
+* **`Repeat(copy p, 0)` is excluded (while `Repeat(const c, 0)` is included).**
+  Anneal evaluates `op` once before replicating it, while `minimize`'s
+  `list![op; 0]` never evaluates `op`, so the models disagree when `op` is a
+  `copy` that can fault (an uninitialized local or out-of-bounds array index),
+  whereas a constant operand never faults in either semantics.
+* **Projected `PlaceMention(_j[p])` is excluded (while `PlaceMention(_j)` is included).**
+  Anneal's `.placeMention` checks only `place.local_` and ignores
+  `place.projection`, whereas MiniRust's `eval_statement(PlaceMention(place))`
+  calls `eval_place(place)`, which evaluates index operands and bounds checks on
+  `PlaceExpr::Index`.
 * **`Len` does not evaluate its place in MiniRust.** `minimize` emits the
   constant `N` (its own `FIXME` notes the place might have UB), while Anneal
   reads the place; this is harmless only because array slots in the fragment

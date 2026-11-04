@@ -151,10 +151,14 @@ def Size.bits (s : Size) : Nat := 8 * s.bytes
 def Size.from_bytes (n : Int) : Option Size :=
   if 0 ≤ n then some ⟨n.toNat⟩ else none
 
-/-- `Size * Int` (`Mul<Int> for Size` in `libspecr`), which panics if the factor is negative. -/
+/-- `Size * Int` (`Mul<Int> for Size` in `libspecr`:
+`Size::from_bytes(self.bytes() * rhs).unwrap()`), which panics when the byte
+product `self.bytes() * rhs` is negative (`< 0`). Note that `Size::ZERO * n =
+Size::ZERO` even for negative `n`. -/
 def Size.mulInt (s : Size) (n : Int) : Interp Size :=
-  if 0 ≤ n then pure ⟨s.bytes * n.toNat⟩
-  else specPanic "Size * Int: negative factor"
+  match Size.from_bytes ((s.bytes : Int) * n) with
+  | some sz => pure sz
+  | none => specPanic "Size * Int: negative byte count"
 
 /-- `Align::from_bytes(n)`: `Some` iff `n` is a power of two. -/
 def alignFromBytes (n : Nat) : Option Align :=
@@ -292,6 +296,18 @@ def writeSubsliceAtIndex {T : Type} (xs : List T) (start : Int) (src : List T) :
   if 0 ≤ start ∧ start + src.length ≤ xs.length then
     pure (xs.take start.toNat ++ src ++ xs.drop (start.toNat + src.length))
   else specPanic "write_subslice_at_index out of range"
+
+/-- `List::try_map(f)` in `libspecr` lifted into `Interp`: applies `f`
+left-to-right and short-circuits on the first element that returns `none`. -/
+def tryMapM {α β : Type} [Monad m] (f : α → m (Option β)) : List α → m (Option (List β))
+  | [] => pure (some [])
+  | x :: xs => do
+    match ← f x with
+    | none => pure none
+    | some y =>
+      match ← tryMapM f xs with
+      | none => pure none
+      | some ys => pure (some (y :: ys))
 
 /-! ## Target `x86_64` (`spec/prelude/target.md`)
 
@@ -472,11 +488,10 @@ def Type.decode : «Type» → List Byte → Interp (Option Val)
     if bytes.length ≠ fullSize.bytes then
       specPanic "decode of Type::Array with invalid length"
     else do
-      let chunks ← (List.range count.toNat).mapM (fun i => do
-        let byteOffset ← Size.mulInt elemSize (Int.ofNat i)
-        subsliceWithLength bytes byteOffset.bytes elemSize.bytes)
-      let decoded ← chunks.mapM (fun elemBytes => Type.decode elem elemBytes)
-      pure ((decoded.mapM id).map Value.Tuple)
+      let chunks ← (List.range count.toNat).mapM (fun (i : Nat) =>
+        subsliceWithLength bytes ((i : Int) * (elemSize.bytes : Int)) elemSize.bytes)
+      let decoded ← tryMapM (fun elemBytes => Type.decode elem elemBytes) chunks
+      pure (decoded.map Value.Tuple)
   | _, _ => unsupported "Type::decode for a non-Int, non-Bool, non-Array type"
 
 /-- `Type::encode` for `Bool`, `Int`, and `Array`:
@@ -509,14 +524,14 @@ def Type.encode : «Type» → Val → Interp (List Byte)
     | some data => pure (data.map (fun b => .Init b none))
     | none => specPanic "Endianness::encode(..).unwrap()"
   | .Int _, _ => specPanic "encode: Type::Int with a non-Int value"
-  | .Array elem count, .Tuple values => do
-    let elemLayout ← Type.layout elem
-    let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures array element is sized"
+  | .Array elem count, .Tuple values =>
     if (values.length : Int) ≠ count then
       specPanic "encode: Type::Array length mismatch"
     else do
       let encoded ← values.mapM (fun value => do
         let bytes ← Type.encode elem value
+        let elemLayout ← Type.layout elem
+        let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures array element is sized"
         if bytes.length ≠ elemSize.bytes then
           specPanic "encode: Type::Array element byte length mismatch"
         else

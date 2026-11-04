@@ -582,7 +582,7 @@ def arrayRvalueOk (decls : List MirAst.LocalDecl) (elemIt : Gen.IntType) (count 
     ops.all (operandOk decls elemIt)
   | .repeat op n =>
     decide (n = count) &&
-    decide (0 < count) &&
+    (decide (0 < count) || match op with | .constant _ => true | _ => false) &&
     operandOk decls elemIt op
   | _ => false
 

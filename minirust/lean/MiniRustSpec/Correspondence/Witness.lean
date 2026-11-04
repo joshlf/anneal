@@ -2550,8 +2550,9 @@ theorem ctxI8_ok_zeroArray {body : CapturedMir}
 `[i8; 0]` (`_1`):
 * in `bb0`, constructs `_1 = []` via `Rvalue.aggregate (.array i8Ty) []` and
   copies `_1 = copy _1` via `Rvalue.use (.copy _1)`, then switches on `_2`;
-* when `_2 == 0` (`bb1`), computes `_2 = Len(_1)` (`= 0usize`), casts to `0i8`,
-  and returns;
+* when `_2 == 0` (`bb1`), constructs `_1 = [5i8; 0]` via
+  `Rvalue.repeat (constI8 5) 0`, computes `_2 = Len(_1)` (`= 0usize`), casts to
+  `0i8`, and returns;
 * when `_2 != 0` (`bb2`), sets `_2 = 0usize` and attempts to read `_1[_2]` at
   index `0`, raising out-of-bounds UB (`0 >= 0`). -/
 def zeroArrayI8 : CapturedMir where
@@ -2568,6 +2569,7 @@ def zeroArrayI8 : CapturedMir where
         { branches := [(0, 1)], otherwise := 2 }),
       isCleanup := false },
     { statements := [
+        mkStmt (.assign (local_ 1) (.repeat (constI8 5) 0)),
         mkStmt (.assign (local_ 2) (.len (local_ 1))),
         mkStmt (.assign (local_ 0) (.cast .intToInt (.copy (local_ 2)) i8Ty))],
       terminator := mkTerm .return_, isCleanup := false },
@@ -2595,6 +2597,7 @@ def zeroArrayI8Fn : Gen.Function where
       .Assign (.Local (localName 1)) (.Load (.Local (localName 1)))],
       .Switch (.Load (.Local (localName 2))) ⟨[(0, bbName 1)]⟩ (bbName 2), .Regular⟩),
     (bbName 1, ⟨[
+      .Assign (.Local (localName 1)) (.Tuple [] (.Array (.Int i8) 0)),
       .Assign (.Local (localName 2)) (.Constant (.Int 0) (.Int usizeIt)),
       .Assign (.Local (localName 0)) (.UnOp (.Cast (.IntToInt i8)) (.Load (.Local (localName 2))))],
       .Return, .Regular⟩),
@@ -2611,7 +2614,8 @@ theorem zeroArrayI8_translate : translateFn zeroArrayI8 = some zeroArrayI8Fn := 
 
 def initArrI8_0 : Value := .aggregate 0 []
 
-/-- `_2 = 0usize`: constructs `[i8; 0]`, reads `Len(_1) = 0`, and returns `0i8`. -/
+/-- `_2 = 0usize`: constructs `[i8; 0]`, repeats `[5i8; 0]`, reads `Len(_1) = 0`,
+and returns `0i8`. -/
 def zeroArrayOkS0 : MachineState :=
   initMachineState zeroArrayI8 [initArrI8_0, .scalar ⟨0, 8⟩]
 def zeroArrayOkMInit : Mach :=
@@ -2652,7 +2656,7 @@ theorem zeroArrayOk_minirust_ret_from_start :
   simp [ctxI8_3, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
 
 theorem zeroArrayOk_minirust_direct :
-    (Interp.steps 7 zeroArrayOkMInit).toOption.map
+    (Interp.steps 8 zeroArrayOkMInit).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAllocI8 with data := scalarBytes i8 0 }, [1]) := rfl
 
@@ -2914,5 +2918,81 @@ theorem arrayU32IdxOob_minirust_ub_from_start :
 
 theorem arrayU32IdxOob_minirust_direct :
     Interp.steps 2 arrayU32IdxOobMInit = .error (.ub "access to out-of-bounds index") := rfl
+
+/-! ## Out-of-bounds `ConstantIndex` (`fromEnd = false, offset >= count`), `PlaceMention` on an array local, and `Interp` representation checks -/
+
+/-- MIR (`Runtime(PostCleanup)`) of a function that executes `PlaceMention(_1)`
+on a `[i8; 2]` array local and then attempts to read `_1[2 of 2]`
+(`ProjectionElem.constantIndex 2 2 false`, where `fromEnd = false` and
+`offset = 2 >= 2`), raising out-of-bounds UB in both Anneal and MiniRust. -/
+def arrayConstIdxOobI8 : CapturedMir where
+  defPath := "witness::array_const_idx_oob_i8"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [i8Decl, arrI8_2Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.placeMention (local_ 1)),
+        mkStmt (.assign (local_ 0) (.use (.copy (placeConstIdx 1 2 2 false))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiArrayUninitIdx
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem arrayConstIdxOobI8_inFragment : inFragment arrayConstIdxOobI8 = true := by decide
+
+def arrayConstIdxOobI8Fn : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8), (localName 1, .Array (.Int i8) 2)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .PlaceMention (.Local (localName 1)),
+      .Assign (.Local (localName 0))
+        (.Load (.Index (.Local (localName 1)) (.Constant (.Int 2) (.Int usizeIt))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem arrayConstIdxOobI8_translate :
+    translateFn arrayConstIdxOobI8 = some arrayConstIdxOobI8Fn := rfl
+
+def arrayConstIdxOobS0 : MachineState := initMachineState arrayConstIdxOobI8 [initArrI8_2]
+def arrayConstIdxOobMInit : Mach :=
+  machineWithCtx ctxI8 arrayConstIdxOobI8 arrayConstIdxOobI8Fn
+    arrayConstIdxOobS0.frame.locals arrayConstIdxOobI8Fn.start
+
+theorem arrayConstIdxOob_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree arrayConstIdxOobI8 [initArrI8_2]) tr u ∧ FaultNow u :=
+  faultsA_sound arrayConstIdxOobI8 6 _ (by decide)
+
+theorem arrayConstIdxOob_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arrayConstIdxOobMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arrayConstIdxOob_anneal_ub
+  exact mirCall_ub arrayConstIdxOobI8_inFragment arrayConstIdxOobI8_translate ctxI8
+    (ctxI8_ok_arrayUninitIdx rfl) [initArrI8_2] (by decide)
+    arrayConstIdxOobMInit rfl rfl rfl hr hf
+
+theorem arrayConstIdxOob_minirust_direct :
+    Interp.steps 3 arrayConstIdxOobMInit = .error (.ub "access to out-of-bounds index") := rfl
+
+/-- `Size::ZERO * -1 = Size::ZERO` (`Size::from_bytes(0 * -1).unwrap()`), whereas
+multiplying a non-zero `Size` by `-1` panics with a negative byte count. -/
+theorem sizeMulInt_zero_neg :
+    Size.mulInt ⟨0⟩ (-1) = .ok ⟨0⟩ ∧
+    Size.mulInt ⟨1⟩ (-1) = .error (.specPanic "Size * Int: negative byte count") :=
+  ⟨rfl, rfl⟩
+
+/-- `Type.encode` on `Type::Array` checks `assert_eq!(values.len(), count)`
+before encoding elements or computing `elem.layout()`, and `Type.decode` on
+`Type::Array` returns `none` when an element chunk contains `.Uninit`. -/
+theorem array_encode_decode_edge_cases :
+    Type.encode (.Array (.Slice (.Int i8)) 2) (.Tuple []) =
+      .error (.specPanic "encode: Type::Array length mismatch") ∧
+    Type.decode (.Array (.Int i8) 2) [.Uninit, .Init 5 none] = .ok none :=
+  ⟨rfl, rfl⟩
 
 end MiniRustSpec.Correspondence.Witness

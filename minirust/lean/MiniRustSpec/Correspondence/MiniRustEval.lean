@@ -93,14 +93,6 @@ theorem translateFn_local_ty {body : CapturedMir} {f : Gen.Function} (hf : trans
   obtain ⟨ty', hty', hget⟩ := (translateFn_spec body f hf).2.1 i d hd
   rw [hty] at hty'; cases hty'; exact hget
 
-@[simp] theorem sizeMulInt_size (s : Size) (m : Nat) :
-    Size.mulInt s (Int.ofNat m) = .ok ⟨m * s.bytes⟩ := by
-  simp [Size.mulInt, Nat.mul_comm]
-
-@[simp] theorem sizeMulInt_natCast (s : Size) (m : Nat) :
-    Size.mulInt s (m : Int) = .ok ⟨m * s.bytes⟩ := by
-  simp [Size.mulInt, Nat.mul_comm]
-
 @[simp] theorem except_bind_ok {ε α β : Type} (x : α) (f : α → Except ε β) :
     (Except.ok x >>= f) = f x := rfl
 
@@ -118,6 +110,14 @@ theorem translateFn_local_ty {body : CapturedMir} {f : Gen.Function} (hf : trans
 
 @[simp] theorem zero_le_cast_mul (a b : Nat) : (0 : Int) ≤ (a : Int) * (b : Int) :=
   Int.mul_nonneg (Int.natCast_nonneg a) (Int.natCast_nonneg b)
+
+@[simp] theorem sizeMulInt_size (s : Size) (m : Nat) :
+    Size.mulInt s (Int.ofNat m) = .ok ⟨m * s.bytes⟩ := by
+  simp [Size.mulInt, Size.from_bytes, Nat.mul_comm]
+
+@[simp] theorem sizeMulInt_natCast (s : Size) (m : Nat) :
+    Size.mulInt s (m : Int) = .ok ⟨m * s.bytes⟩ := by
+  simp [Size.mulInt, Size.from_bytes, Nat.mul_comm]
 
 theorem layout_array_eq (elemIt : Gen.IntType) (count : Nat) (h : GoodSize elemIt.size.bytes) :
     Type.layout (.Array (.Int elemIt) (count : Int)) =
@@ -498,23 +498,15 @@ theorem mapM_range_prefix {ε α β : Type} (xs : List α) (f : α → β) (g : 
 
 theorem mapM_decode_valBytes (elemIt : Gen.IntType) (elems : List Value)
     (he : ∀ v ∈ elems, ElemOk elemIt v) :
-    (elems.map (valBytes elemIt)).mapM (Type.decode (.Int elemIt)) =
-      .ok (elems.map (fun v => some (valToMiniRust elemIt v))) := by
+    tryMapM (fun elemBytes => Type.decode (.Int elemIt) elemBytes)
+        (elems.map (valBytes elemIt)) =
+      .ok (some (elems.map (valToMiniRust elemIt))) := by
   induction elems with
   | nil => rfl
   | cons v vs ih =>
     have hv := decode_valBytes elemIt v (he v (by simp))
     have ih' := ih (fun x hx => he x (by simp [hx]))
-    simp only [List.map_cons, List.mapM_cons, bind, Except.bind, hv, ih', pure, Except.pure]
-
-theorem mapM_id_map_some {α β : Type} (f : α → β) (xs : List α) :
-    (xs.map (fun x => some (f x))).mapM id = some (xs.map f) := by
-  induction xs with
-  | nil => rfl
-  | cons x xs ih =>
-    simp only [List.map_cons, List.mapM_cons, Option.bind_eq_bind, id_eq, Option.pure_def]
-    rw [ih]
-    rfl
+    simp [tryMapM, hv, ih']
 
 theorem decode_array (elemIt : Gen.IntType) (hgood : GoodSize elemIt.size.bytes)
     (elems : List Value) (count : Nat) (hlen : elems.length = count)
@@ -525,23 +517,22 @@ theorem decode_array (elemIt : Gen.IntType) (hgood : GoodSize elemIt.size.bytes)
   have hblen : ((elems.map (valBytes elemIt)).flatten).length = count * elemIt.size.bytes := by
     rw [flatten_map_length (valBytes elemIt) elemIt.size.bytes elems
       (fun x _ => valBytes_length elemIt x), hlen]
-  have hchunks : (List.range count).mapM (fun i => do
-      let byteOffset ← Size.mulInt elemIt.size (Int.ofNat i)
-      subsliceWithLength ((elems.map (valBytes elemIt)).flatten) byteOffset.bytes elemIt.size.bytes) =
+  have hchunks : (List.range count).mapM (fun (i : Nat) =>
+      subsliceWithLength ((elems.map (valBytes elemIt)).flatten)
+        ((i : Int) * (elemIt.size.bytes : Int)) elemIt.size.bytes) =
       .ok (elems.map (valBytes elemIt)) := by
     subst hlen
     have hpref := mapM_range_prefix elems (valBytes elemIt)
-      (fun i => do
-        let byteOffset ← Size.mulInt elemIt.size (Int.ofNat i)
-        subsliceWithLength ((elems.map (valBytes elemIt)).flatten) byteOffset.bytes elemIt.size.bytes)
+      (fun (i : Nat) =>
+        subsliceWithLength ((elems.map (valBytes elemIt)).flatten)
+          ((i : Int) * (elemIt.size.bytes : Int)) elemIt.size.bytes)
       elems.length (Nat.le_refl _)
       (fun i hi => by
-        simp only [sizeMulInt_size, bind, Except.bind]
+        rw [← Int.natCast_mul]
         exact subsliceWithLength_flatten_map (valBytes elemIt) elemIt.size.bytes elems
           (fun x _ => valBytes_length elemIt x) i elems[i] (List.getElem?_eq_getElem hi))
     simpa [List.take_length] using hpref
   have hdec := mapM_decode_valBytes elemIt elems he
-  have hid := mapM_id_map_some (valToMiniRust elemIt) elems
   unfold Type.decode
   rw [layout_eq elemIt hgood]
   simp only [LayoutStrategy.expect_size, except_bind_ok, except_pure, sizeMulInt_natCast,
@@ -549,10 +540,11 @@ theorem decode_array (elemIt : Gen.IntType) (hgood : GoodSize elemIt.size.bytes)
   rw [hchunks]
   simp only [except_bind_ok]
   change (do
-    let elemOpts ← List.mapM (Type.decode (.Int elemIt)) (List.map (valBytes elemIt) elems)
-    pure ((elemOpts.mapM id).map Gen.Value.Tuple)) = _
+    let decoded ← tryMapM (fun elemBytes => Type.decode (.Int elemIt) elemBytes)
+      (elems.map (valBytes elemIt))
+    pure (decoded.map Gen.Value.Tuple)) = _
   rw [hdec]
-  simp [hid]
+  rfl
 
 theorem checkValue_forM_valToMiniRust (elemIt : Gen.IntType) (hgood : GoodSize elemIt.size.bytes)
     (elems : List Value) (he : ∀ v ∈ elems, ElemOk elemIt v) :
@@ -579,7 +571,9 @@ theorem encode_map_valToMiniRust (elemIt : Gen.IntType) (hgood : GoodSize elemIt
     (elems : List Value) (he : ∀ v ∈ elems, ElemOk elemIt v) :
     (elems.map (valToMiniRust elemIt)).mapM (fun value => do
       let bytes ← Type.encode (.Int elemIt) value
-      if bytes.length ≠ elemIt.size.bytes then
+      let elemLayout ← Type.layout (.Int elemIt)
+      let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures array element is sized"
+      if bytes.length ≠ elemSize.bytes then
         specPanic "encode: Type::Array element byte length mismatch"
       else
         pure bytes) = .ok (elems.map (valBytes elemIt)) := by
@@ -589,7 +583,7 @@ theorem encode_map_valToMiniRust (elemIt : Gen.IntType) (hgood : GoodSize elemIt
     have hv := encode_valToMiniRust elemIt hgood v (he v (by simp))
     have hlen := valBytes_length elemIt v
     have ih' := ih (fun x hx => he x (by simp [hx]))
-    rw [List.map_cons, List.mapM_cons, hv, ih']
+    rw [List.map_cons, List.mapM_cons, hv, ih', layout_eq elemIt hgood]
     simp [hlen]
 
 theorem encode_array (elemIt : Gen.IntType) (hgood : GoodSize elemIt.size.bytes)
@@ -600,8 +594,7 @@ theorem encode_array (elemIt : Gen.IntType) (hgood : GoodSize elemIt.size.bytes)
       .ok ((elems.map (valBytes elemIt)).flatten) := by
   have hm := encode_map_valToMiniRust elemIt hgood elems he
   unfold Type.encode
-  rw [layout_eq elemIt hgood]
-  simp only [expect_size_sized, except_bind_ok, List.length_map, hlen, ne_eq, not_true_eq_false, ↓reduceIte]
+  simp only [List.length_map, hlen, ne_eq, not_true_eq_false, ↓reduceIte]
   rw [hm]
   rfl
 
@@ -1799,8 +1792,8 @@ theorem evalValue_arrayRvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx
         refine ⟨hlen, he, m1, ?_, h1⟩
         simp [evalValue, hm1]
   | .repeat op n, hok, he =>
-    simp only [arrayRvalueOk, Bool.and_eq_true, decide_eq_true_eq] at hok
-    obtain ⟨⟨rfl, hposCnt⟩, hokOp⟩ := hok
+    simp only [arrayRvalueOk, Bool.and_eq_true, Bool.or_eq_true, decide_eq_true_eq] at hok
+    obtain ⟨⟨rfl, hcnt⟩, hokOp⟩ := hok
     have hopTy := operandIntType_of_operandOk hokOp
     simp only [translateRvalue, hopTy, Option.bind_eq_bind, Option.bind_some] at he
     cases heo : translateOperand body.localDecls op with
@@ -1812,8 +1805,16 @@ theorem evalValue_arrayRvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx
       cases hb : opBits locals op with
       | none =>
         refine ⟨fun elems hel => by simp [arrayRvElems, hb] at hel, fun _ => ?_⟩
-        obtain ⟨msg, hmsg⟩ := hrepNone hposCnt hb
-        exact ⟨msg, by simp [evalValue, hmsg]⟩
+        rcases hcnt with hposCnt | hconst
+        · obtain ⟨msg, hmsg⟩ := hrepNone hposCnt hb
+          exact ⟨msg, by simp [evalValue, hmsg]⟩
+        · cases op with
+          | copy _ => simp at hconst
+          | move _ => simp at hconst
+          | constant c =>
+            simp only [translateOperand] at heo
+            match hv : c.val, heo with
+            | .scalar (.int sc), heo => simp [opBits, hv] at hb
       | some b =>
         obtain ⟨hb_lt, m1, hm1, h1⟩ := hrepOk b hb
         refine ⟨fun elems hel => ?_, fun hnone => by simp [arrayRvElems, hb] at hnone⟩
