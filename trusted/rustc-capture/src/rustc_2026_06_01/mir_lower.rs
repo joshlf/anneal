@@ -2609,14 +2609,55 @@ fn record_referenced_alloc<'tcx>(
     }
     match tcx.global_alloc(alloc_id) {
         GlobalAlloc::Function { instance } => {
-            let inst_args = tcx.erase_and_anonymize_regions(instance.args);
-            let inst_args_opt = if !inst_args.has_escaping_bound_vars() {
-                Some(inst_args)
+            let raw_args = instance.args;
+            let effective_args = if let Some(p_substs) = parent_substs
+                && p_substs.len() == tcx.generics_of(owner_def_id).count()
+                && !raw_args.has_escaping_bound_vars()
+            {
+                rustc_middle::ty::EarlyBinder::bind(raw_args)
+                    .instantiate(tcx, p_substs)
+                    .skip_norm_wip()
+            } else {
+                raw_args
+            };
+            let inst_args = tcx.erase_and_anonymize_regions(effective_args);
+            let resolve_env = if !inst_args.has_non_region_param() {
+                rustc_middle::ty::TypingEnv::fully_monomorphized()
+            } else {
+                typing_env
+            };
+            let norm_args = if !inst_args.has_escaping_bound_vars() {
+                tcx.try_normalize_erasing_regions(
+                    resolve_env,
+                    rustc_middle::ty::Unnormalized::new_wip(inst_args),
+                )
+                .unwrap_or(inst_args)
+            } else {
+                inst_args
+            };
+            let inst_args_opt = if !norm_args.has_escaping_bound_vars() {
+                Some(norm_args)
             } else {
                 None
             };
             out.push((instance.def_id(), inst_args_opt));
-            for arg in inst_args.iter() {
+            if !norm_args.has_escaping_bound_vars()
+                && let Ok(Some(resolved)) = rustc_middle::ty::Instance::try_resolve(
+                    tcx,
+                    resolve_env,
+                    instance.def_id(),
+                    norm_args,
+                )
+            {
+                let res_args = tcx.erase_and_anonymize_regions(resolved.args);
+                let res_args_opt = if !res_args.has_escaping_bound_vars() {
+                    Some(res_args)
+                } else {
+                    None
+                };
+                out.push((resolved.def_id(), res_args_opt));
+            }
+            for arg in norm_args.iter() {
                 if let Some(arg_ty) = arg.as_type() {
                     record_referenced_ty(
                         tcx,

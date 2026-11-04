@@ -20,7 +20,7 @@ cargo test -p anneal-rustc-capture driver_captures_sysroot_core_slice_and_range_
 ## 3. Multi-Crate Dependency Graph Capture & Primary-Crate Obligation Scoping
 
 Run the `cargo-anneal` multi-crate workspace integration test where `crate_a` depends on `crate_b` and calls `crate_b::helper_add` alongside `core::slice` and `core::ops::RangeBounds` methods, verifying that:
-- `build_cargo_check_command` wraps the full dependency graph via `RUSTC_WRAPPER` and `RUSTC_WORKSPACE_WRAPPER`,
+- `build_cargo_check_command` wraps the full dependency graph via `RUSTC_WRAPPER` (clearing `RUSTC_WORKSPACE_WRAPPER` to avoid double-wrapping workspace members),
 - `Mir/CrateB/helper_add.lean`, `Mir/Core/*.lean`, and `Mir/CrateA/*.lean` are emitted and placed in `.anneal/generated/Mir/`,
 - Only primary-crate items (`crate_a`) generate `Obligations/CrateA/*.lean` and `Verify/CrateA/*.lean` proof obligations (while `crate_b` and `core` items are recorded with `"item_kind": "callee"`), and
 - All generated `.anneal/generated/Mir/**/*.lean` modules compile cleanly in the Lean 4 kernel (`lean`).
