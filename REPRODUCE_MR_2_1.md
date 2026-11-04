@@ -84,7 +84,7 @@ theorems it checked. The groups are:
 - `WITNESS-AUDIT`: every `MR-2.1` witness theorem in
   `MiniRustSpec/Correspondence/Witness.lean` (`arrayOps*`, `arraySigned*`,
   `arrayUninitIdx*`, `arrayU32Idx*`, `zeroArray*`, `arrayConstIdxOob*`,
-  `sizeMulInt_zero_neg`, `array_encode_decode_edge_cases`).
+  `arrayCompose*`, `sizeMulInt_zero_neg`, `array_encode_decode_edge_cases`).
 
 ```bash
 cd examples && anneal-lean-run --mode file --concurrency 3 -- lake env lean ../minirust/lean/MiniRustSpec/Audit.lean | grep -E '\[(ANCHOR|SIMULATION|WITNESS)-AUDIT\]|exhaustively verified'
@@ -93,10 +93,10 @@ cd examples && anneal-lean-run --mode file --concurrency 3 -- lake env lean ../m
 Expected audit summary lines:
 
 ```text
-MiniRustSpec.Audit: exhaustively verified standard axioms for 8222 declarations across all MiniRustSpec.* modules
+MiniRustSpec.Audit: exhaustively verified standard axioms for 8268 declarations across all MiniRustSpec.* modules
 [ANCHOR-AUDIT] decls=2 theorems=2 sorry_free=true standard_axioms_only=true
 [SIMULATION-AUDIT] decls=21 theorems=21 sorry_free=true standard_axioms_only=true
-[WITNESS-AUDIT] decls=53 theorems=53 sorry_free=true standard_axioms_only=true
+[WITNESS-AUDIT] decls=74 theorems=74 sorry_free=true standard_axioms_only=true
 ```
 
 ## 6. What the Witnesses Show
@@ -126,5 +126,16 @@ Each witness runs both semantics in the kernel (`decide`/`rfl`, no
   `array_encode_decode_edge_cases`): `PlaceMention(_1)` on an array local and
   out-of-bounds `ConstantIndex` (`fromEnd = false, offset = 2 >= 2`) UB on
   `[i8; 2]`, plus direct checks of `Size.mulInt` (`Size::ZERO * -1 =
-  Size::ZERO`), `Type.encode` length-mismatch ordering, and `Type.decode` on
-  uninitialized array elements.
+  Size::ZERO`), `Type.encode` length-mismatch ordering and 0-length array
+  encoding, `Type.decode` on uninitialized array elements, and `tryMapM`
+  left-to-right short-circuiting.
+- `arrayComposeI8` (`[i8; 2]`): composes projected array element operands
+  (`copy _1[proj]`) across `SwitchInt`, `Repeat`, `Aggregate(Array)`,
+  `UnaryOp(Neg)`, and `Cast(IntToInt)` (`arrayComposeOk_*`), and exercises the
+  UB paths of `evalStatement_assign_array` (`Aggregate(Array)` with an
+  uninitialized element operand in `arrayComposeAggUb_*`, and `Repeat` with an
+  out-of-bounds `ConstantIndex` operand in `arrayComposeRepeatUb_*`),
+  `evalStatement_assign_index` when the destination index is valid and the RHS
+  faults (`arrayComposeRhsUb_*`) or when both destination projection and RHS
+  fault (`arrayComposeBothUb_*`), and `SwitchInt` on an out-of-bounds projected
+  discriminant (`arrayComposeSwitchOobUb_*`).

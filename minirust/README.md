@@ -352,19 +352,26 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   data in memory violates the language invariant"` UB), alongside ground-truth
   checks of all four `IntBinOp::DivExact` outcomes.
 * `arrayOpsI8`, `arraySignedIdxI8`, `zeroArrayI8`, `arrayUninitIdxI8`,
-  `arrayU32Idx`, and `arrayConstIdxOobI8`, bodies with `[i8; 3]`, `[i8; 2]`,
-  `[i8; 0]`, and `[u32; 3]` arguments exercising `Aggregate(Array)`, `Repeat`
-  (including `[const 5i8; 0]`), whole-array copies, `PlaceMention` on an array
-  local, `Len`, and `Index` / `ConstantIndex` (from the start and from the end)
-  reads and in-place element writes (`*_minirust_ret_from_start`, `*_noUB`,
-  direct runs, and byte-level checks that each in-place write rewrites exactly
-  the element's bytes at offset `index * size_of::<T>()` and leaves its siblings
-  intact: `arrayOpsOk_minirust_inplace_bytes`,
-  `arrayU32IdxOk_minirust_inplace_bytes`), plus UB for an out-of-bounds
-  `Index` or `ConstantIndex` (`idx >= N`, including every index of `[i8; 0]`),
-  a negative signed index, and an uninitialized index local, each via
-  `mirCall_ub` and a direct check of MiniRust's `throw_ub!` message, alongside
-  ground-truth checks of `Size.mulInt`, `Type.encode`, and `Type.decode`
+  `arrayU32Idx`, `arrayConstIdxOobI8`, and `arrayComposeI8`, bodies with
+  `[i8; 3]`, `[i8; 2]`, `[i8; 0]`, and `[u32; 3]` arguments exercising
+  `Aggregate(Array)`, `Repeat` (including `[const 5i8; 0]`), whole-array copies,
+  `PlaceMention` on an array local, `Len`, and `Index` / `ConstantIndex` (from
+  the start and from the end) reads and in-place element writes
+  (`*_minirust_ret_from_start`, `*_noUB`, direct runs, and byte-level checks
+  that each in-place write rewrites exactly the element's bytes at offset
+  `index * size_of::<T>()` and leaves its siblings intact:
+  `arrayOpsOk_minirust_inplace_bytes`, `arrayU32IdxOk_minirust_inplace_bytes`),
+  projected array operands (`copy _1[proj]`) composed with `SwitchInt`,
+  `Repeat`, `Aggregate(Array)`, `UnaryOp(Neg)`, and `Cast(IntToInt)`
+  (`arrayComposeOk_*`), plus UB for an out-of-bounds `Index` or `ConstantIndex`
+  (`idx >= N`, including every index of `[i8; 0]` and projected `SwitchInt`
+  discriminants), a negative signed index, an uninitialized index local,
+  faulting array-producing rvalues (`Aggregate(Array)` and `Repeat` with
+  uninitialized or out-of-bounds element operands: `arrayComposeAggUb_*`,
+  `arrayComposeRepeatUb_*`), and in-place indexed writes with a faulting RHS
+  (`arrayComposeRhsUb_*`, `arrayComposeBothUb_*`), each via `mirCall_ub` and a
+  direct check of MiniRust's `throw_ub!` message, alongside ground-truth checks
+  of `Size.mulInt`, `Type.encode`, `Type.decode`, and `tryMapM`
   (`sizeMulInt_zero_neg`, `array_encode_decode_edge_cases`).
 
 ### Gaps
@@ -406,6 +413,15 @@ These are deliberate and are the first things to lift:
   constant `N` (its own `FIXME` notes the place might have UB), while Anneal
   reads the place; this is harmless only because array slots in the fragment
   are always initialized.
+* **Evaluation order of `Statement::Assign` (`destination` vs `source`).**
+  MiniRust's `eval_statement(Assign { destination, source })` evaluates
+  `eval_place(destination)` before `eval_value(source)`, whereas Anneal's
+  `evalStmt(.assign dst rv)` evaluates `evalRvalue` before `writeProjectedValue`.
+  Because neither expression evaluation mutates memory in the fragment, both
+  models raise UB under the exact same conditions (`projIdx = none ∨ rvBits = none`)
+  and produce identical stores otherwise (`StepRel.ub'` / `StepRel.tau'`),
+  differing only in which UB reason fires first when *both* the destination
+  projection and the RHS rvalue fault (`arrayComposeBothUb_*`).
 * **Index locals of non-`usize` type.** MIR requires `usize` index locals,
   but the fragment also accepts other integer types. Anneal indexes with the
   raw bit pattern and MiniRust with the decoded value, which agree for

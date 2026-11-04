@@ -2987,12 +2987,346 @@ theorem sizeMulInt_zero_neg :
   ⟨rfl, rfl⟩
 
 /-- `Type.encode` on `Type::Array` checks `assert_eq!(values.len(), count)`
-before encoding elements or computing `elem.layout()`, and `Type.decode` on
-`Type::Array` returns `none` when an element chunk contains `.Uninit`. -/
+before encoding elements or computing `elem.layout()` (so an empty 0-length
+array succeeds without querying `elem.layout()`), and `Type.decode` on
+`Type::Array` short-circuits left-to-right via `tryMapM` on the first `.Uninit`
+element chunk. -/
 theorem array_encode_decode_edge_cases :
     Type.encode (.Array (.Slice (.Int i8)) 2) (.Tuple []) =
       .error (.specPanic "encode: Type::Array length mismatch") ∧
-    Type.decode (.Array (.Int i8) 2) [.Uninit, .Init 5 none] = .ok none :=
-  ⟨rfl, rfl⟩
+    Type.encode (.Array (.Slice (.Int i8)) 0) (.Tuple []) = .ok [] ∧
+    Type.decode (.Array (.Int i8) 2) [.Uninit, .Init 5 none] = .ok none ∧
+    (tryMapM (fun x : Nat =>
+      if x = 0 then (.ok none : Interp (Option Val))
+      else .error (.specPanic "unreachable")) [0, 1] : Interp (Option (List Val))) =
+      .ok none :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-! ## Projected array operands across `SwitchInt`/`Repeat`/`Aggregate`/`UnaryOp`/`Cast`, faulting array rvalues, and faulting in-place write RHS -/
+
+def fnAbiArrayCompose : FnAbi :=
+  { args := [{ layout := arrI8_2Layout, mode := .direct },
+             { layout := usizeLayout, mode := .direct }],
+    ret := { layout := i8Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+theorem ctxI8_ok_arrayCompose {body : CapturedMir}
+    (h : body.localDecls = [i8Decl, arrI8_2Decl, usizeDecl]) : CtxOk body ctxI8_3 where
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | 2, hd => simp at hd; subst hd; decide
+    | _ + 3, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MIR (`Runtime(PostCleanup)`) of a function exercising projected array
+element operands (`copy _1[proj]`) across `SwitchInt`, `Repeat`,
+`Aggregate(Array)`, `UnaryOp(Neg)`, and `Cast(IntToInt)`, as well as the UB
+branches of `evalStatement_assign_array` (`Aggregate` and `Repeat` with a
+faulting operand) and `evalStatement_assign_index` (in-place indexed write with
+a faulting RHS, and when both destination projection and RHS fault):
+* `bb0`: `SwitchInt(copy _1[_2])` branches on `10 -> bb1`, `20 -> bb2`,
+  `30 -> bb3`, `40 -> bb4`, `otherwise -> bb5` (and faults in `bb0` if `_2 >= 2`);
+* `bb1`: `_1 = Repeat(copy _1[_2], 2)`,
+  `_1 = Aggregate(Array(i8), [copy _1[0 of 2], const 20i8])`,
+  `_1[_2] = UnaryOp(Neg, copy _1[-1 of 2])`,
+  `_0 = Cast(IntToInt, copy _1[0 of 2], i8Ty)`, then `Return`;
+* `bb2`: `_1 = Aggregate(Array(i8), [copy _1[0 of 2], copy _0])` (faults on
+  uninitialized `_0` in element `1`);
+* `bb3`: `_1 = Repeat(copy _1[2 of 2], 2)` (faults on out-of-bounds
+  `ConstantIndex` `2 >= 2`);
+* `bb4`: `_1[0 of 2] = BinaryOp(Div, copy _1[0 of 2], const 0i8)` (valid
+  destination index `0`, faulting RHS division by zero);
+* `bb5`: `_1[2 of 2] = BinaryOp(Div, copy _1[0 of 2], const 0i8)` (both
+  destination projection `2 >= 2` and RHS division by zero fault). -/
+def arrayComposeI8 : CapturedMir where
+  defPath := "witness::array_compose_i8"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [i8Decl, arrI8_2Decl, usizeDecl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.switchInt (.copy (placeIdx 1 2))
+        { branches := [(10, 1), (20, 2), (30, 3), (40, 4)], otherwise := 5 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 1) (.repeat (.copy (placeIdx 1 2)) 2)),
+        mkStmt (.assign (local_ 1)
+          (.aggregate (.array i8Ty) [.copy (placeConstIdx 1 0 2 false), constI8 20])),
+        mkStmt (.assign (placeIdx 1 2)
+          (.unaryOp .neg (.copy (placeConstIdx 1 1 2 true)))),
+        mkStmt (.assign (local_ 0)
+          (.cast .intToInt (.copy (placeConstIdx 1 0 2 false)) i8Ty))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 1)
+          (.aggregate (.array i8Ty) [.copy (placeConstIdx 1 0 2 false), .copy (local_ 0)]))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 1) (.repeat (.copy (placeConstIdx 1 2 2 false)) 2))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (placeConstIdx 1 0 2 false)
+          (.binaryOp .div (.copy (placeConstIdx 1 0 2 false)) (constI8 0)))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (placeConstIdx 1 2 2 false)
+          (.binaryOp .div (.copy (placeConstIdx 1 0 2 false)) (constI8 0)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiArrayCompose
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem arrayComposeI8_inFragment : inFragment arrayComposeI8 = true := by decide
+
+def arrayComposeI8Fn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int i8),
+    (localName 1, .Array (.Int i8) 2),
+    (localName 2, .Int usizeIt)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[],
+      .Switch (.Load (.Index (.Local (localName 1)) (.Load (.Local (localName 2)))))
+        ⟨[(10, bbName 1), (20, bbName 2), (30, bbName 3), (40, bbName 4)]⟩ (bbName 5),
+      .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 1))
+        (.Tuple [
+          .Load (.Index (.Local (localName 1)) (.Load (.Local (localName 2)))),
+          .Load (.Index (.Local (localName 1)) (.Load (.Local (localName 2))))]
+          (.Array (.Int i8) 2)),
+      .Assign (.Local (localName 1))
+        (.Tuple [
+          .Load (.Index (.Local (localName 1)) (.Constant (.Int 0) (.Int usizeIt))),
+          .Constant (.Int 20) (.Int i8)] (.Array (.Int i8) 2)),
+      .Assign (.Index (.Local (localName 1)) (.Load (.Local (localName 2))))
+        (.UnOp (.Int .Neg)
+          (.Load (.Index (.Local (localName 1)) (.Constant (.Int 1) (.Int usizeIt))))),
+      .Assign (.Local (localName 0))
+        (.UnOp (.Cast (.IntToInt i8))
+          (.Load (.Index (.Local (localName 1)) (.Constant (.Int 0) (.Int usizeIt)))))],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Local (localName 1))
+        (.Tuple [
+          .Load (.Index (.Local (localName 1)) (.Constant (.Int 0) (.Int usizeIt))),
+          .Load (.Local (localName 0))] (.Array (.Int i8) 2))],
+      .Return, .Regular⟩),
+    (bbName 3, ⟨[
+      .Assign (.Local (localName 1))
+        (.Tuple [
+          .Load (.Index (.Local (localName 1)) (.Constant (.Int 2) (.Int usizeIt))),
+          .Load (.Index (.Local (localName 1)) (.Constant (.Int 2) (.Int usizeIt)))]
+          (.Array (.Int i8) 2))],
+      .Return, .Regular⟩),
+    (bbName 4, ⟨[
+      .Assign (.Index (.Local (localName 1)) (.Constant (.Int 0) (.Int usizeIt)))
+        (.BinOp (.Int .Div)
+          (.Load (.Index (.Local (localName 1)) (.Constant (.Int 0) (.Int usizeIt))))
+          (.Constant (.Int 0) (.Int i8)))],
+      .Return, .Regular⟩),
+    (bbName 5, ⟨[
+      .Assign (.Index (.Local (localName 1)) (.Constant (.Int 2) (.Int usizeIt)))
+        (.BinOp (.Int .Div)
+          (.Load (.Index (.Local (localName 1)) (.Constant (.Int 0) (.Int usizeIt))))
+          (.Constant (.Int 0) (.Int i8)))],
+      .Return, .Regular⟩),
+    (bbName 6, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 6
+  implicit_writes := true
+
+theorem arrayComposeI8_translate : translateFn arrayComposeI8 = some arrayComposeI8Fn := rfl
+
+def initArrCompose10_20 : Value := .aggregate 0 [.scalar ⟨10, 1⟩, .scalar ⟨20, 1⟩]
+
+/-- `_1 = [10i8, 20i8]`, `_2 = 0usize`: switches on `_1[0] = 10` to `bb1`,
+repeats `_1[0]` into `[10, 10]`, rebuilds `[10, 20]`, negates `_1[-1 of 2] = 20`
+into `_1[0] = -20i8` (bits `236`), casts `_1[0]` to `i8`, and returns `-20i8`. -/
+def arrayComposeOkS0 : MachineState :=
+  initMachineState arrayComposeI8 [initArrCompose10_20, .scalar ⟨0, 8⟩]
+def arrayComposeOkMInit : Mach :=
+  machineWithCtx ctxI8_3 arrayComposeI8 arrayComposeI8Fn
+    arrayComposeOkS0.frame.locals arrayComposeI8Fn.start
+
+def arrayComposeOkTrace : List (Event MirEffect) :=
+  [⟨.inr (.inl (.emit (.event 10))), PUnit.unit⟩]
+
+theorem arrayComposeOk_anneal_ret :
+    ReachesRet (mirCallTree arrayComposeI8 [initArrCompose10_20, .scalar ⟨0, 8⟩])
+      arrayComposeOkTrace (.normal (.scalar ⟨236, 1⟩, arrayComposeOkS0.memory)) :=
+  runA_sound arrayComposeI8 12 _ _ _ rfl
+
+theorem arrayComposeOk_noUB :
+    MirNoUBTree (mirCallTree arrayComposeI8 [initArrCompose10_20, .scalar ⟨0, 8⟩]) :=
+  runA_noUB arrayComposeI8 12 _ _ _ rfl
+
+theorem arrayComposeOk_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n arrayComposeOkMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 236 } ∧
+      m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
+      (ctxI8_ok_arrayCompose rfl) [initArrCompose10_20, .scalar ⟨0, 8⟩] (by decide)
+      arrayComposeOkMInit rfl rfl rfl arrayComposeOk_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [arrayComposeI8] at hd; subst hd
+  simp [retPtr, ctxI8_3] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_3] at hr; subst hr
+  have hbits : bits = 236 := by
+    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxI8_3, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+
+theorem arrayComposeOk_minirust_direct :
+    (Interp.steps 7 arrayComposeOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 236 }, [1]) := rfl
+
+/-- `_1 = [10i8, 20i8]`, `_2 = 1usize`: switches on `_1[1] = 20` to `bb2` and
+faults when `Aggregate(Array)` evaluates its second operand `copy _0` while `_0`
+is `.uninit` (`evalStatement_assign_array` UB branch). -/
+def arrayComposeAggUbS0 : MachineState :=
+  initMachineState arrayComposeI8 [initArrCompose10_20, .scalar ⟨1, 8⟩]
+def arrayComposeAggUbMInit : Mach :=
+  machineWithCtx ctxI8_3 arrayComposeI8 arrayComposeI8Fn
+    arrayComposeAggUbS0.frame.locals arrayComposeI8Fn.start
+
+theorem arrayComposeAggUb_anneal_ub :
+    ∃ tr u,
+      Reaches (mirCallTree arrayComposeI8 [initArrCompose10_20, .scalar ⟨1, 8⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound arrayComposeI8 8 _ (by decide)
+
+theorem arrayComposeAggUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arrayComposeAggUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arrayComposeAggUb_anneal_ub
+  exact mirCall_ub arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
+    (ctxI8_ok_arrayCompose rfl) [initArrCompose10_20, .scalar ⟨1, 8⟩] (by decide)
+    arrayComposeAggUbMInit rfl rfl rfl hr hf
+
+theorem arrayComposeAggUb_minirust_direct :
+    Interp.steps 3 arrayComposeAggUbMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") := rfl
+
+/-- `_1 = [30i8, 20i8]`, `_2 = 0usize`: switches on `_1[0] = 30` to `bb3` and
+faults when `Repeat(copy _1[2 of 2], 2)` evaluates its out-of-bounds
+`ConstantIndex` operand (`evalStatement_assign_array` UB branch). -/
+def initArrCompose30_20 : Value := .aggregate 0 [.scalar ⟨30, 1⟩, .scalar ⟨20, 1⟩]
+
+def arrayComposeRepeatUbS0 : MachineState :=
+  initMachineState arrayComposeI8 [initArrCompose30_20, .scalar ⟨0, 8⟩]
+def arrayComposeRepeatUbMInit : Mach :=
+  machineWithCtx ctxI8_3 arrayComposeI8 arrayComposeI8Fn
+    arrayComposeRepeatUbS0.frame.locals arrayComposeI8Fn.start
+
+theorem arrayComposeRepeatUb_anneal_ub :
+    ∃ tr u,
+      Reaches (mirCallTree arrayComposeI8 [initArrCompose30_20, .scalar ⟨0, 8⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound arrayComposeI8 8 _ (by decide)
+
+theorem arrayComposeRepeatUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arrayComposeRepeatUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arrayComposeRepeatUb_anneal_ub
+  exact mirCall_ub arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
+    (ctxI8_ok_arrayCompose rfl) [initArrCompose30_20, .scalar ⟨0, 8⟩] (by decide)
+    arrayComposeRepeatUbMInit rfl rfl rfl hr hf
+
+theorem arrayComposeRepeatUb_minirust_direct :
+    Interp.steps 3 arrayComposeRepeatUbMInit =
+      .error (.ub "access to out-of-bounds index") := rfl
+
+/-- `_1 = [40i8, 20i8]`, `_2 = 0usize`: switches on `_1[0] = 40` to `bb4` and
+faults on the RHS division by zero in `_1[0 of 2] = Div(copy _1[0 of 2], 0i8)`
+while the destination projection `_1[0 of 2]` is in-bounds (`projIdx = some 0`,
+`rvBits = none` in `evalStatement_assign_index`). -/
+def initArrCompose40_20 : Value := .aggregate 0 [.scalar ⟨40, 1⟩, .scalar ⟨20, 1⟩]
+
+def arrayComposeRhsUbS0 : MachineState :=
+  initMachineState arrayComposeI8 [initArrCompose40_20, .scalar ⟨0, 8⟩]
+def arrayComposeRhsUbMInit : Mach :=
+  machineWithCtx ctxI8_3 arrayComposeI8 arrayComposeI8Fn
+    arrayComposeRhsUbS0.frame.locals arrayComposeI8Fn.start
+
+theorem arrayComposeRhsUb_anneal_ub :
+    ∃ tr u,
+      Reaches (mirCallTree arrayComposeI8 [initArrCompose40_20, .scalar ⟨0, 8⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound arrayComposeI8 8 _ (by decide)
+
+theorem arrayComposeRhsUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arrayComposeRhsUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arrayComposeRhsUb_anneal_ub
+  exact mirCall_ub arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
+    (ctxI8_ok_arrayCompose rfl) [initArrCompose40_20, .scalar ⟨0, 8⟩] (by decide)
+    arrayComposeRhsUbMInit rfl rfl rfl hr hf
+
+theorem arrayComposeRhsUb_minirust_direct :
+    Interp.steps 3 arrayComposeRhsUbMInit = .error (.ub "division by zero") := rfl
+
+/-- `_1 = [50i8, 20i8]`, `_2 = 0usize`: takes `otherwise` (`bb5`) where both the
+destination projection `_1[2 of 2]` (`2 >= 2`) and the RHS `Div(..., 0i8)` fault
+(`projIdx = none` and `rvBits = none`). Anneal faults on `evalRvalue` first and
+MiniRust faults on `eval_place(destination)` first, so both raise UB. -/
+def initArrCompose50_20 : Value := .aggregate 0 [.scalar ⟨50, 1⟩, .scalar ⟨20, 1⟩]
+
+def arrayComposeBothUbS0 : MachineState :=
+  initMachineState arrayComposeI8 [initArrCompose50_20, .scalar ⟨0, 8⟩]
+def arrayComposeBothUbMInit : Mach :=
+  machineWithCtx ctxI8_3 arrayComposeI8 arrayComposeI8Fn
+    arrayComposeBothUbS0.frame.locals arrayComposeI8Fn.start
+
+theorem arrayComposeBothUb_anneal_ub :
+    ∃ tr u,
+      Reaches (mirCallTree arrayComposeI8 [initArrCompose50_20, .scalar ⟨0, 8⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound arrayComposeI8 8 _ (by decide)
+
+theorem arrayComposeBothUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arrayComposeBothUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arrayComposeBothUb_anneal_ub
+  exact mirCall_ub arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
+    (ctxI8_ok_arrayCompose rfl) [initArrCompose50_20, .scalar ⟨0, 8⟩] (by decide)
+    arrayComposeBothUbMInit rfl rfl rfl hr hf
+
+theorem arrayComposeBothUb_minirust_direct :
+    Interp.steps 3 arrayComposeBothUbMInit =
+      .error (.ub "access to out-of-bounds index") := rfl
+
+/-- `_1 = [10i8, 20i8]`, `_2 = 2usize`: faults in `bb0` when `SwitchInt`
+evaluates its out-of-bounds projected discriminant `copy _1[_2]` (`2 >= 2`). -/
+def arrayComposeSwitchOobUbS0 : MachineState :=
+  initMachineState arrayComposeI8 [initArrCompose10_20, .scalar ⟨2, 8⟩]
+def arrayComposeSwitchOobUbMInit : Mach :=
+  machineWithCtx ctxI8_3 arrayComposeI8 arrayComposeI8Fn
+    arrayComposeSwitchOobUbS0.frame.locals arrayComposeI8Fn.start
+
+theorem arrayComposeSwitchOobUb_anneal_ub :
+    ∃ tr u,
+      Reaches (mirCallTree arrayComposeI8 [initArrCompose10_20, .scalar ⟨2, 8⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound arrayComposeI8 6 _ (by decide)
+
+theorem arrayComposeSwitchOobUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arrayComposeSwitchOobUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arrayComposeSwitchOobUb_anneal_ub
+  exact mirCall_ub arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
+    (ctxI8_ok_arrayCompose rfl) [initArrCompose10_20, .scalar ⟨2, 8⟩] (by decide)
+    arrayComposeSwitchOobUbMInit rfl rfl rfl hr hf
+
+theorem arrayComposeSwitchOobUb_minirust_direct :
+    Interp.steps 2 arrayComposeSwitchOobUbMInit =
+      .error (.ub "access to out-of-bounds index") := rfl
 
 end MiniRustSpec.Correspondence.Witness

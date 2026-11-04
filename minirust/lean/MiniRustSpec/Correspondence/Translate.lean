@@ -27,29 +27,38 @@ we choose the program that MiniRust's tooling would produce.
 
 The translation is defined only on the fragment checked by `inFragment`:
 
-* the body declares exactly the return place and the arguments
-  (`localDecls.length = argCount + 1`), all of integer type;
-* statements are `_i = Use(copy _j)`, `_i = Use(const c)`,
-  `_i = UnaryOp(uop, a)` with `uop ∈ {Neg, Not}`,
-  `_i = BinaryOp(op, a, b)` with
-  `op ∈ {Add, Sub, Mul, Div, Rem, BitXor, BitAnd, BitOr, Shl, Shr, AddUnchecked, SubUnchecked, MulUnchecked, ShlUnchecked, ShrUnchecked}`
-  (`a` of `_i`'s integer type `it`, and `b` of `it` for homogeneous binary
-  operators or of any integer type `rhsIt` for the shift operators
-  `Shl, Shr, ShlUnchecked, ShrUnchecked`),
-  `_i = Cast(IntToInt, a, targetTy)` (casting an operand `a` of any integer
-  type `srcIt` to the destination local's integer type `it`),
-  where every operand is `copy _j` (no projections) or an integer constant,
-  or `PlaceMention(_i)`;
-* terminators are `Goto`, `SwitchInt` on an integer operand (`copy _j` or
-  constant), `Unreachable`, or `Return`, and every jump target is a block of the
-  body;
+* the body is `Runtime(PostCleanup)` MIR and declares only the return place and
+  the arguments (`localDecls.length = argCount + 1`); the return place `_0` has
+  scalar integer type, and each local has either scalar integer type or
+  homogeneous 1D integer array type `[T; N]` whose total byte size
+  `N * size_of::<T>()` fits in signed 64-bit `isize` (`< 2^63`);
+* scalar places are either an unprojected integer local `_j` or a single-element
+  array indexing projection `_j[proj]` (`ProjectionElem.index _k` or
+  `ProjectionElem.constantIndex offset minLen fromEnd` satisfying `projOk`),
+  and scalar operands are `copy p` of a scalar place `p` or an integer constant;
+* statements are:
+  - scalar assignments `dst = rv` to a scalar place `dst` (`_i` or `_i[proj]`),
+    where `rv` is `Use(a)`, `UnaryOp(uop, a)` (`uop ∈ {Neg, Not}`),
+    `BinaryOp(op, a, b)` (`op` among the 15 integer `BinOp` variants, with `b`
+    of `dst`'s integer type `it` or of any integer type `rhsIt` for the shift
+    operators `Shl, Shr, ShlUnchecked, ShrUnchecked`),
+    `Cast(IntToInt, a, targetTy)`, or `Len(_j)` of an array local `_j` (into a
+    `usize` destination);
+  - array assignments `_i = rv` to an unprojected array local `_i : [T; N]`,
+    where `rv` is `Use(copy _j)` of an array local of the same type,
+    `Aggregate(Array(T), [op_0, .., op_{N-1}])`, or `Repeat(op, N)` with `N > 0`
+    (or `N = 0` when `op` is a constant);
+  - `PlaceMention(_i)` of an unprojected scalar or array local `_i`;
+* terminators are `Goto`, `SwitchInt` on any scalar integer operand (`copy p`
+  or constant), `Unreachable`, or `Return`, and every jump target is a block of
+  the body;
 * no block is a cleanup block.
 
-`Operand::Move` is excluded on purpose: `minimize` translates it exactly like
-`Copy` ("smir::Operand::Move(place) => ValueExpr::Load { .. }"), while Anneal's
-MIR semantics de-initializes the moved-from place. The two models genuinely
-disagree on later reads of a moved-from local, so `Move` cannot be in a
-lock-step fragment; `minirust/README.md` lists this and the other gaps.
+`Operand::Move`, `Repeat(copy p, 0)`, and projected `PlaceMention(_j[proj])`
+are excluded on purpose because `minimize` and Anneal's MIR semantics genuinely
+differ on them (`minimize` translates `Move` as `Load`, drops the operand of
+`list![op; 0]`, and evaluates projections in `PlaceMention`); `minirust/README.md`
+lists these and the other gaps.
 -/
 
 namespace MiniRustSpec.Correspondence
@@ -370,7 +379,9 @@ def translateRvalue (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Option G
 >      Statement::PlaceMention(place)
 >  }"
 where the elided part special-cases two pointer-provenance casts, which are
-outside the fragment. -/
+outside the fragment, and `PlaceMention` is restricted to unprojected locals
+`⟨i, []⟩` because Anneal's `.placeMention` checks only `place.local_` and
+ignores `place.projection`. -/
 def translateStatement (decls : List MirAst.LocalDecl) (s : MirAst.Statement) :
     Option Gen.Statement :=
   match s.kind with

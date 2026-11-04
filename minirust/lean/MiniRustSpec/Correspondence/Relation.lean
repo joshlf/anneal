@@ -27,10 +27,12 @@ MiniRust `Machine<BasicMemory<x86_64>>` in which:
   (`blockIdx`, `stmtIdx`);
 * every MIR local `_i` is live in both models. In MiniRust it is a pointer to
   its own `Stack` allocation whose bytes are the representation-relation
-  encoding of Anneal's slot: `Uninit` bytes for an uninitialized slot and the
-  little-endian bytes of the bit pattern for an initialized scalar. The
-  callee's allocations sit after an arbitrary prefix `base` of allocations,
-  which contains the caller's return place;
+  encoding of Anneal's slot (`declSlotData`): for scalar locals, `Uninit` bytes
+  when `.uninit` and the little-endian bytes of the bit pattern when
+  `.init (.scalar sc)`; for homogeneous array locals `[T; N]`, the concatenated
+  little-endian byte encodings of the `N` scalar elements in
+  `.init (.aggregate 0 elems)`. The callee's allocations sit after an arbitrary
+  prefix `base` of allocations, which contains the caller's return place;
 * the Anneal state has no borrows, protectors, call stack, active callee, or
   caller-owned referents (the fragment cannot create any).
 

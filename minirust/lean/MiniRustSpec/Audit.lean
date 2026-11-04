@@ -347,6 +347,28 @@ open MiniRustSpec.Correspondence.Witness in
   arrayConstIdxOob_minirust_direct
   sizeMulInt_zero_neg
   array_encode_decode_edge_cases
+  ctxI8_ok_arrayCompose
+  arrayComposeI8_inFragment
+  arrayComposeI8_translate
+  arrayComposeOk_anneal_ret
+  arrayComposeOk_noUB
+  arrayComposeOk_minirust_ret_from_start
+  arrayComposeOk_minirust_direct
+  arrayComposeAggUb_anneal_ub
+  arrayComposeAggUb_minirust_ub_from_start
+  arrayComposeAggUb_minirust_direct
+  arrayComposeRepeatUb_anneal_ub
+  arrayComposeRepeatUb_minirust_ub_from_start
+  arrayComposeRepeatUb_minirust_direct
+  arrayComposeRhsUb_anneal_ub
+  arrayComposeRhsUb_minirust_ub_from_start
+  arrayComposeRhsUb_minirust_direct
+  arrayComposeBothUb_anneal_ub
+  arrayComposeBothUb_minirust_ub_from_start
+  arrayComposeBothUb_minirust_direct
+  arrayComposeSwitchOobUb_anneal_ub
+  arrayComposeSwitchOobUb_minirust_ub_from_start
+  arrayComposeSwitchOobUb_minirust_direct
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -381,12 +403,16 @@ the logged flags can only ever read `true`; `decls` counts the names actually
 checked, so a receipt line cannot claim a theorem that is not in the group. -/
 elab "#audit_group " tag:str ids:ident* : command => do
   let env ← getEnv
+  let mut seen : Lean.NameSet := {}
   let mut decls : Nat := 0
   let mut theorems : Nat := 0
   let mut sorryFree := true
   let mut standardOnly := true
   for id in ids do
     let n ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo id
+    if seen.contains n then
+      throwError "duplicate declaration {n} in [{tag.getString}]"
+    seen := seen.insert n
     decls := decls + 1
     match env.find? n with
     | some (.thmInfo _) => theorems := theorems + 1
@@ -484,5 +510,26 @@ open MiniRustSpec.Correspondence.Witness in
   zeroArrayIdxUb_anneal_ub
   zeroArrayIdxUb_minirust_ub_from_start
   zeroArrayIdxUb_minirust_direct
+  arrayComposeI8_inFragment
+  arrayComposeI8_translate
+  arrayComposeOk_anneal_ret
+  arrayComposeOk_noUB
+  arrayComposeOk_minirust_ret_from_start
+  arrayComposeOk_minirust_direct
+  arrayComposeAggUb_anneal_ub
+  arrayComposeAggUb_minirust_ub_from_start
+  arrayComposeAggUb_minirust_direct
+  arrayComposeRepeatUb_anneal_ub
+  arrayComposeRepeatUb_minirust_ub_from_start
+  arrayComposeRepeatUb_minirust_direct
+  arrayComposeRhsUb_anneal_ub
+  arrayComposeRhsUb_minirust_ub_from_start
+  arrayComposeRhsUb_minirust_direct
+  arrayComposeBothUb_anneal_ub
+  arrayComposeBothUb_minirust_ub_from_start
+  arrayComposeBothUb_minirust_direct
+  arrayComposeSwitchOobUb_anneal_ub
+  arrayComposeSwitchOobUb_minirust_ub_from_start
+  arrayComposeSwitchOobUb_minirust_direct
 
 end MiniRustSpec.Audit

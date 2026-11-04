@@ -584,6 +584,11 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
               evalStmt_assign_index s body.localDecls body.layouts i proj rv span hslotsA
                 hrel.nlocals d hdi elemIt count ha hgood hproj hok' elems hsi hlen
                 hrel.borrows hrel.protectors
+            -- MiniRust evaluates `eval_place(destination)` before `eval_value(source)`,
+            -- whereas Anneal's `evalStmt` evaluates `evalRvalue` before `writeProjectedValue`.
+            -- Because neither expression evaluation mutates memory, both models raise UB iff
+            -- `projIdx = none ∨ rvBits = none` (differing only in the `.ub` message when both
+            -- `destination` and `source` fault) and produce identical stores otherwise.
             cases hidx : projIdx s.frame.locals count proj with
             | none =>
               rw [hAnone (.inl hidx)]
