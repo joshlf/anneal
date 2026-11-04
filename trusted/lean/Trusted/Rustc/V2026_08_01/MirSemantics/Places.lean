@@ -2223,8 +2223,15 @@ def hasTraitImplForDefPath
     | false => hasTraitImplForDefPath rest defPath
 
 /--
-Check whether `acc` already contains a matched `TraitImplEntry` with the same
-`implPath`.
+Insert `(entry, implTypeArgsOpt)` into `acc` when no entry with the same
+`implPath` is present, or upgrade an existing `(existingEntry, Option.none)`
+with the same `implPath` when `implTypeArgsOpt` is `Option.some _`.
+
+This deduplicates `TraitImplEntry` records by `implPath` while ensuring that an
+already-instantiated copy of a generic `TraitImplEntry` (whose parameter-free
+`traitRef.args` produces `Option.none` against the uninstantiated generic
+callee's `typeParamCount`) cannot shadow the raw generic `TraitImplEntry` for
+the same `implPath`.
 
 Reference (The Rust Reference, "Trait implementations"):
 <https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
@@ -2233,21 +2240,32 @@ Reference (The Rust Reference, "Trait implementations"):
 > that the optional generic type declarations are followed by a trait, followed
 > by the keyword `for`, followed by a path to a nominal type."
 -/
-def hasMatchingImplPath
-    (implPath : DefPath) :
-    List (TraitImplEntry × Option (List RigidTy)) → Bool
-  | .nil => false
-  | (entry, _) :: rest =>
-    match stringEq entry.implPath implPath with
-    | true => true
-    | false => hasMatchingImplPath implPath rest
+def upsertMatchingTraitImpl
+    (entry : TraitImplEntry)
+    (implTypeArgsOpt : Option (List RigidTy)) :
+    List (TraitImplEntry × Option (List RigidTy)) →
+    List (TraitImplEntry × Option (List RigidTy))
+  | .nil => [(entry, implTypeArgsOpt)]
+  | (existingEntry, existingArgsOpt) :: rest =>
+    match stringEq existingEntry.implPath entry.implPath with
+    | true =>
+      match existingArgsOpt, implTypeArgsOpt with
+      | Option.none, Option.some _ =>
+        (entry, implTypeArgsOpt) :: rest
+      | _, _ =>
+        (existingEntry, existingArgsOpt) :: rest
+    | false =>
+      (existingEntry, existingArgsOpt) ::
+        upsertMatchingTraitImpl entry implTypeArgsOpt rest
 
 /--
 Collect all `TraitImplEntry` records in `traitImpls` whose `traitRef.defPath`
 equals `defPath` and whose non-empty `traitRef.args` pattern-matches a prefix of
-`typeArgs`, deduplicating by `entry.implPath` in order of appearance and pairing
-each matched entry with its extracted `(implHeaderArgs ++ methodTypeArgs)` (or
-`Option.none` if parameter indices in the substitution are not contiguous).
+`typeArgs`, deduplicating by `entry.implPath` via `upsertMatchingTraitImpl` and
+pairing each matched entry with its validated effective type arguments (or
+`Option.none` if parameter indices are not contiguous, the target `implPath` is
+not in `callees`, or the extracted type-argument count does not match the
+target callee's `typeParamCount`).
 
 Reference (The Rust Reference, "Trait implementations"):
 <https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
@@ -2257,36 +2275,48 @@ Reference (The Rust Reference, "Trait implementations"):
 > by the keyword `for`, followed by a path to a nominal type."
 -/
 def collectMatchingTraitImpls
+    (callees : List CapturedMir)
     (traitImpls : List TraitImplEntry)
     (defPath : DefPath)
     (typeArgs : List RigidTy)
     (acc : List (TraitImplEntry × Option (List RigidTy)) := .nil) :
     List (TraitImplEntry × Option (List RigidTy)) :=
   match traitImpls with
-  | .nil => acc.reverse
+  | .nil => acc
   | entry :: rest =>
     if stringEq entry.traitRef.defPath defPath then
       match entry.traitRef.args with
-      | .nil => collectMatchingTraitImpls rest defPath typeArgs acc
+      | .nil => collectMatchingTraitImpls callees rest defPath typeArgs acc
       | _ :: _ =>
         match matchRigidTyPrefix entry.traitRef.args typeArgs .nil with
-        | Option.none => collectMatchingTraitImpls rest defPath typeArgs acc
+        | Option.none =>
+          collectMatchingTraitImpls callees rest defPath typeArgs acc
         | Option.some (subst, methodTypeArgs) =>
-          if hasMatchingImplPath entry.implPath acc then
-            collectMatchingTraitImpls rest defPath typeArgs acc
-          else
-            let implTypeArgsOpt :=
-              match extractImplTypeArgs subst subst.length with
-              | Option.some implHeaderArgs =>
-                Option.some (implHeaderArgs ++ methodTypeArgs)
-              | Option.none => Option.none
-            collectMatchingTraitImpls
-              rest
-              defPath
-              typeArgs
-              ((entry, implTypeArgsOpt) :: acc)
+          let rawImplTypeArgsOpt :=
+            match extractImplTypeArgs subst subst.length with
+            | Option.some implHeaderArgs =>
+              Option.some (implHeaderArgs ++ methodTypeArgs)
+            | Option.none => Option.none
+          let implTypeArgsOpt :=
+            match rawImplTypeArgsOpt, findCallee? callees entry.implPath with
+            | Option.some rawArgs, Option.some c =>
+              let effectiveTypeArgs :=
+                match stringEq entry.implPath defPath with
+                | true => typeArgs
+                | false => rawArgs
+              if effectiveTypeArgs.length == c.typeParamCount then
+                Option.some effectiveTypeArgs
+              else
+                Option.none
+            | _, _ => Option.none
+          collectMatchingTraitImpls
+            callees
+            rest
+            defPath
+            typeArgs
+            (upsertMatchingTraitImpl entry implTypeArgsOpt acc)
     else
-      collectMatchingTraitImpls rest defPath typeArgs acc
+      collectMatchingTraitImpls callees rest defPath typeArgs acc
 
 /--
 Check whether `candidateArgs` is a substitution instance of every matched
@@ -2393,7 +2423,11 @@ def resolveCalleeBodyAndArgs?
   | firstArg :: restArgs =>
     let allTraitImpls := extraTraitImpls ++ flatMapTraitImpls callees
     let matchedImpls :=
-      collectMatchingTraitImpls allTraitImpls defPath (firstArg :: restArgs)
+      collectMatchingTraitImpls
+        callees
+        allTraitImpls
+        defPath
+        (firstArg :: restArgs)
     match matchedImpls with
     | .nil =>
       match findCallee? callees defPath with

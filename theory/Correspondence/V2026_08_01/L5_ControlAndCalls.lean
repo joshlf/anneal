@@ -1308,6 +1308,13 @@ theorem mir_evalTerminator_inherited_default_and_subject_traitImpls_dispatch :
         traitImpls := [monoImplEntry] }
     let s0 : MachineState :=
       initMachineStateWithCallees subjectBody [.scalar ⟨42, 4⟩] [defaultComputeCallee, monoIdCallee]
+    let rangeImplEntry : TraitImplEntry :=
+      { traitRef :=
+          { defPath := "test::MyTrait::check"
+            args := [.adt "Range" [.param 0 "T"], .param 0 "T"] }
+        implPath := "test::<impl MyTrait<T> for Range<T>>::check" }
+    let instRangeImplEntry : TraitImplEntry :=
+      rangeImplEntry.instantiate [(.uint .usize, polyU64Layout)]
     lookupCallee [defaultDescribeCallee, polyIdCallee] emptyLayoutTable
       "test::Describe::describe" [.uint .u32] [blanketDescribeEntry, u32InheritsDefaultEntry] =
       .some (defaultDescribeCallee.instantiate [(.uint .u32, polyU32Layout)]) ∧
@@ -1323,11 +1330,15 @@ theorem mir_evalTerminator_inherited_default_and_subject_traitImpls_dispatch :
     lookupCallee [polyIdCallee] emptyLayoutTable
       "test::Describe::describe" [.uint .u32] [blanketDescribeEntry, u32InheritsDefaultEntry] =
       .none ∧
+    lookupCallee [rangeTraitImplCallee] emptyLayoutTable
+      "test::MyTrait::check" [.adt "Range" [.uint .usize], .uint .usize]
+      [instRangeImplEntry, rangeImplEntry] =
+      .some (rangeTraitImplCallee.instantiate [(.uint .usize, polyU64Layout)]) ∧
     s0.memory.traitImpls = [monoImplEntry] ∧
     stepMirFn subjectBody s0 =
       MirStepNode.step
         (pushCalleeFrame s0 subjectBody s0.frame.locals ⟨0, .nil⟩ 1 monoIdCallee [.scalar ⟨42, 4⟩]) := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /--
 Universal theorem that when `Self` in a trait-method call `(traitMethodDefPath, typeArgs)`
