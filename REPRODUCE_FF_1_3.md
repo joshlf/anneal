@@ -43,7 +43,9 @@ fixed-width `BitVec (8 * sz)` representations.
    - `isSignedNegative_eq_msb` (`@[simp]`)
    - `arithmeticShrBits_eq_sshiftRight` and
      `arithmeticShrBits_mod_eq_sshiftRight` (`@[simp]`)
-   - `signExtendBits_eq_bitVec` (`@[simp]`)
+   - `toNat_signExtend_of_le`, `toNat_signExtend_ofNat_of_le`,
+     `signExtendBits_of_le`, and unconditional `signExtendBits_eq_bitVec`
+     (`@[simp]`)
 
 4. **`ScalarValue` & `BitVec (8 * s.sizeBytes)` Isomorphism (Section 5)**:
    - `ScalarValue.toBitVec (s : ScalarValue) : BitVec (8 * s.sizeBytes)`
@@ -56,20 +58,24 @@ fixed-width `BitVec (8 * sz)` representations.
 5. **Pure Scalar Evaluators & Closed-Form `@[simp]` Lemmas (Sections 6–8)**:
    - Pure scalar evaluators `evalBinOp`, `evalBinOpChecked`, `evalUnOp`, and
      `evalCastValue` mirroring `Trusted.Rustc.V2026_06_01.MirSemantics`.
-   - Closed-form `@[simp]` lemmas for `evalBinOp` and `evalScalarBinOp` across
-     `.bitAnd`, `.bitOr`, `.bitXor`, `.shl`, `.shr` (both unsigned logical and
-     signed two's-complement arithmetic), `.shlUnchecked`, `.shrUnchecked`,
-     wrapping/checked arithmetic, and comparisons, including width-specialized
-     lemmas for `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, and `i64`.
+   - Closed-form `@[simp]` lemmas for `evalBinOp`, `evalScalarBinOp`,
+     `evalCastValue`, `evalExactDiv`, and `evalScalarExactDiv` across `.bitAnd`,
+     `.bitOr`, `.bitXor`, `.shl`, `.shr` (both unsigned logical and signed
+     two's-complement arithmetic), `.shlUnchecked` / `.shrUnchecked` (both
+     in-bounds `< 8 * sz` and out-of-bounds UB `8 * sz ≤ b`), wrapping/checked
+     arithmetic, and comparisons, including width-specialized lemmas for `u8`,
+     `u16`, `u32`, `u64`, `u128`, `usize`, `i8`, `i16`, `i32`, `i64`, `i128`,
+     and `isize`.
    - `BitVec (8 * sz)` homomorphism theorems (`evalBinOp_ofBitVec_*`,
      `evalBinOpChecked_ofBitVec_*`, `evalUnOp_ofBitVec_*`,
      `evalCastValue_ofBitVec_*`).
 
 6. **Bit Intrinsic Helpers (`BRIEF-1.2` Support, Section 9)**:
    - `ctpopLoop`, `cttzLoop`, `bitreverseLoop`, `ctlzBits`, and `bswapLoop`
-     along with width bounds (`ctpopLoop_le`, `cttzLoop_le`, `ctlzBits_le`,
-     `bitreverseLoop_lt_two_pow`, `bswapLoop_lt_two_pow`) and closed-form byte
-     swap equivalences (`bswapLoop_one`, `bswapLoop_two_eq_swapBytes16`,
+     along with width bounds (`ctpopLoop_le`, `cttzLoop_le`, `ctlzBits_le`),
+     zero-input `@[simp]` lemmas (`ctpopLoop_zero`, `cttzLoop_zero`,
+     `bitreverseLoop_zero`, `ctlzBits_zero`, `bswapLoop_zero`), and closed-form
+     byte swap equivalences (`bswapLoop_one`, `bswapLoop_two_eq_swapBytes16`,
      `bswapLoop_four_eq_swapBytes32`, `bswapLoop_eight_eq_swapBytes64`).
 
 7. **32-Bit Symbolic Header Extraction Benchmark (Section 10)**:
