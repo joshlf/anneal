@@ -700,9 +700,39 @@ def evalTerminator
                   calleeBody
                   argVals)
         | .none =>
-          MirStepNode.extCall
-            { defPath := target.defPath, args := argVals, memory := s.memory }
-            (resumeExternalCall s locals' destination targetBb unwind)
+          match stringEq target.defPath "core::intrinsics::exact_div" with
+          | true =>
+            match argVals with
+            | .scalar lhs :: .scalar rhs :: .nil =>
+              let isSigned :=
+                match argOps with
+                | lhsOp :: _ =>
+                  operandIsSigned
+                    bodyLocalDecls
+                    lhsOp
+                    bodyLayouts
+                | .nil => false
+              match evalExactDiv lhs rhs isSigned with
+              | .some retScalar =>
+                match writePlaceValue locals' s.memory.borrows destination (.scalar retScalar) with
+                | .ok updatedLocals =>
+                  MirStepNode.step {
+                    frame := {
+                      s.frame with
+                      blockIdx := targetBb
+                      stmtIdx := 0
+                      locals := updatedLocals
+                    }
+                    memory := s.memory
+                  }
+                | .ub => MirStepNode.fail .ub
+                | .unsupported => MirStepNode.unsupported
+              | .none => MirStepNode.fail .ub
+            | _ => MirStepNode.unsupported
+          | false =>
+            MirStepNode.extCall
+              { defPath := target.defPath, args := argVals, memory := s.memory }
+              (resumeExternalCall s locals' destination targetBb unwind)
   -- Diverging call (`target == Option.none`, return type `!`):
   -- `core::hint::unreachable_unchecked` (`library/core/src/hint.rs` at commit
   -- `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65` and The Rust Reference 1.98.0,

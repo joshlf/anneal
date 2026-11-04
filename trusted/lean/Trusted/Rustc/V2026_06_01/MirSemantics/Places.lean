@@ -1853,6 +1853,18 @@ Reference (The Rust Reference, "Function pointer types"):
 > via a coercion from both function items and non-capturing closures."
 -/
 @[reducible]
+
+def checkCalleeSig (callees : List CapturedMir) (p : DefPath) (fnInputs : List RigidTy) (fnAbi : CallConv) : Bool :=
+  match callees with
+  | .nil => true
+  | c :: rest =>
+    match stringEq c.defPath p with
+    | true =>
+      Bool.and
+        (Nat.beq (length fnInputs) c.argCount)
+        (callConvEq fnAbi c.fnAbi.conv)
+    | false => checkCalleeSig rest p fnInputs fnAbi
+
 def evalReifyFnPointer
     (locals : List LocalSlot)
     (op : Operand)
@@ -1874,16 +1886,19 @@ def evalReifyFnPointer
     | false => .ub
     | true =>
       match targetTy.kind with
-      | .fnPtr _ _ _ _ =>
+      | .fnPtr fnInputs _ _ fnAbi =>
         match extractFnItemTarget? (operandTy localDecls layouts op) with
         | .some (defPath, typeArgs) =>
-          let (allocId, mem') :=
-            internFnPtr mem defPath typeArgs (.some targetTy.kind)
-          let p : ProvenancePtr := {
-            allocId := allocId
-            offsetBytes := 0
-          }
-          .ok (.ptr p 8) locals' mem'
+          match checkCalleeSig mem.callees defPath fnInputs fnAbi with
+          | false => .ub
+          | true =>
+            let (allocId, mem') :=
+              internFnPtr mem defPath typeArgs (.some targetTy.kind)
+            let p : ProvenancePtr := {
+              allocId := allocId
+              offsetBytes := 0
+            }
+            .ok (.ptr p 8) locals' mem'
         | .none => .ub
       | _ => .ub
 

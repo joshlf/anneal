@@ -593,6 +593,7 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
         callerBody.layouts
         s.memory.callerLocals = .ok argVals (locals' argVals) →
       findCallee? s.memory.callees fnEntry.defPath = .none →
+      stringEq fnEntry.defPath "core::intrinsics::exact_div" = false →
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
         MirStepNode.extCall
           { defPath := fnEntry.defPath, args := argVals, memory := s.memory }
@@ -634,10 +635,10 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
       simp only [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc, hOffsetZero,
         hNoBorrow, hLookup, hCompatSite, hArgs, hFind, hCompatBody,
         Nat.beq_refl, Bool.and_self]
-  · intro hLookup hCompatSite hArgs hFindNone
+  · intro hLookup hCompatSite hArgs hFindNone hNotExactDiv
     refine ⟨?_, ?_⟩ <;>
       simp only [evalTerminator, resolveCallTarget, hNoDirect, hEvalFunc, hOffsetZero,
-        hNoBorrow, hLookup, hCompatSite, hArgs, hFindNone,
+        hNoBorrow, hLookup, hCompatSite, hArgs, hFindNone, hNotExactDiv,
         Nat.beq_refl, Bool.and_self]
   · intro hLookupNone
     refine ⟨?_, ?_⟩ <;>
