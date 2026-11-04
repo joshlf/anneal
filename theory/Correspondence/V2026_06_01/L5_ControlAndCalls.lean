@@ -1544,6 +1544,7 @@ theorem mir_evalTerminator_diverging_call_partition_and_cleanup_chain
     (defPath : DefPath)
     (argVals : List Value)
     (locals' calleeLocalsAfterPanic : List LocalSlot)
+    (calleeActiveProtectors : List Nat)
     (hFunc : extractCalleeDefPath? func = .some defPath)
     (hArgs :
       evalOperands
@@ -1562,13 +1563,15 @@ theorem mir_evalTerminator_diverging_call_partition_and_cleanup_chain
         (.cleanup callerCleanupBb)
         calleeBody
         argVals
+    let memInCallee : Memory :=
+      { s₁.memory with activeProtectors := calleeActiveProtectors }
     let s₂ : MachineState :=
       { frame :=
           { s₁.frame with
             blockIdx := calleeCleanupBb
             stmtIdx := 0
             locals := calleeLocalsAfterPanic }
-        memory := s₁.memory }
+        memory := memInCallee }
     let s₃ : MachineState :=
       { frame :=
           { s.frame with
@@ -1606,7 +1609,7 @@ theorem mir_evalTerminator_diverging_call_partition_and_cleanup_chain
         MirStepNode.extCall
           { defPath := defPath, args := argVals, memory := s.memory }
           (resumeExternalDivergingCall s locals' unwind)) ∧
-    (applyUnwindAction s₁ calleeLocalsAfterPanic s₁.memory (.cleanup calleeCleanupBb) =
+    (applyUnwindAction s₁ calleeLocalsAfterPanic memInCallee (.cleanup calleeCleanupBb) =
       .running s₂ ∧
      evalTerminator s₂ ⟨.unwindResume, span⟩ (.some calleeBody) =
       MirStepNode.step s₃ ∧
