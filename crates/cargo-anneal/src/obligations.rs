@@ -1330,6 +1330,14 @@ pub fn render_verify_module_with_options(
              /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
              abbrev Certificate : Prop := ModularVerificationResult Obligations.{item}.modularClaim\n\n"
         ));
+    } else if authored.is_modular {
+        out.push_str(&format!(
+            "/-- Kernel-checked modular verification certificate for `{def_id}`. -/\n\
+             theorem verified : ModularVerificationResult Obligations.{item}.modularClaim :=\n  \
+               (inferInstance : ModularItemProof \"{def_id}\" Obligations.{item}.modularClaim).verified\n\n\
+             /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
+             abbrev Certificate : Prop := ModularVerificationResult Obligations.{item}.modularClaim\n\n"
+        ));
     } else if !authored.has_specs && (bundle.has_rust_safe_total_attr() || authored.is_total) {
         let opt_req = if bundle.inline_requires.len() == 1 {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
@@ -1535,6 +1543,45 @@ pub fn render_crate_verify_module(crate_name: &str, bundles: &[SubjectObligation
 pub fn render_specs_template(bundle: &SubjectObligationBundle) -> String {
     let item = &bundle.item_module_suffix;
     let def_id = &bundle.subject.target.def_id;
+    if !bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty() {
+        return format!(
+            "import Trusted\n\
+             import Mir.{item}\n\
+             import Obligations.{item}\n\n\
+             namespace Specs.{item}\n\n\
+             set_option linter.unusedVariables false\n\n\
+             open Trusted.MirSemantics\n\
+             open Trusted.VerificationResult\n\n\
+             /-!\n\
+             Durable modular specification override module for `{def_id}`.\n\n\
+             `Obligations.{item}.defaultModularSpec` provides a `priority := low` default\n\
+             `ModularItemSpec \"{def_id}\"` instance lowered from Rust `#[spec]` and\n\
+             `#[external_spec]` companions. Declaring a normal-priority `ModularItemSpec`\n\
+             instance in this module overrides that default without modifying any\n\
+             generated file.\n\n\
+             To strengthen the contract while preserving Rust `#[spec]` and\n\
+             `#[external_spec]` companions, use `Obligations.{item}.refineModularSpec`.\n\
+             -/\n\n\
+             /-- Assumed external call-handler environment contract. -/\n\
+             def envAssumed (h : ExternalCallHandler) : Prop :=\n  \
+               Obligations.{item}.defaultModularSpec.envAssumed h\n\n\
+             /-- Precondition over the incoming argument list `args` and initial `mem`. -/\n\
+             def pre (args : List Value) (mem : Memory) : Prop :=\n  \
+               Obligations.{item}.defaultModularSpec.pre args mem\n\n\
+             /-- Postcondition relating `(args, mem)` to `(ret, mem')`. -/\n\
+             def post (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory) : Prop :=\n  \
+               Obligations.{item}.defaultModularSpec.post args mem ret mem'\n\n\
+             /-- Normal-priority `ModularItemSpec` instance overriding\n    \
+                 `Obligations.{item}.defaultModularSpec`.\n    \
+                 Alternatively, define `instance : ModularItemSpec \"{def_id}\" :=\n    \
+                 Obligations.{item}.refineModularSpec envAssumed extraPre extraPost`. -/\n\
+             instance : ModularItemSpec \"{def_id}\" where\n  \
+               envAssumed := envAssumed\n  \
+               pre := pre\n  \
+               post := post\n\n\
+             end Specs.{item}\n"
+        );
+    }
     format!(
         "import Trusted\n\
          import Mir.{item}\n\
@@ -2543,12 +2590,32 @@ mod tests {
             req_module_suffix: None,
             ens_module_suffix: None,
         });
+        let specs_template = render_specs_template(bundle);
+        assert!(
+            specs_template.contains("instance : ModularItemSpec \"my_crate::caller\" where")
+                && specs_template.contains("Obligations.MyCrate.caller.defaultModularSpec.envAssumed"),
+            "specs template for subject with external_spec_callees must emit ModularItemSpec:\n{specs_template}"
+        );
         let template = render_proof_template_with_options(bundle, AuthoredItemModules::default());
         assert!(
             template.contains(
                 "theorem verified : ModularVerificationResult Obligations.MyCrate.caller.modularClaim := by"
             ),
             "proof template for subject with external_spec_callees must target modularClaim:\n{template}"
+        );
+        let verify_mod = render_verify_module_with_options(
+            bundle,
+            AuthoredItemModules {
+                has_specs: true,
+                is_modular: true,
+                ..AuthoredItemModules::default()
+            },
+        );
+        assert!(
+            verify_mod.contains(
+                "theorem verified : ModularVerificationResult Obligations.MyCrate.caller.modularClaim :="
+            ),
+            "verify module with authored ModularItemSpec and no Proof must target modularClaim:\n{verify_mod}"
         );
     }
 }

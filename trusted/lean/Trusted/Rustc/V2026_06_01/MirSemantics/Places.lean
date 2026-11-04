@@ -1921,6 +1921,14 @@ def rigidTyMatchesCalleeDecl (typeArgs : List RigidTy) : Nat → RigidTy → Rig
       (Bool.and
         (rigidTyMatchesCalleeDecl typeArgs fuel a1 a2)
         (rigidTyMatchesCalleeDecl typeArgs fuel (.tuple as1) (.tuple as2)))
+  | .succ fuel, .fnPtr in1 out1 s1 abi1, .fnPtr in2 out2 s2 abi2 =>
+    Bool.and
+      (safetyEq s1 s2)
+      (Bool.and
+        (callConvEq abi1 abi2)
+        (Bool.and
+          (rigidTyMatchesCalleeDecl typeArgs fuel out1 out2)
+          (rigidTyMatchesCalleeDecl typeArgs fuel (.tuple in1) (.tuple in2))))
   | .succ _, callerTy, declTy => rigidTyEq callerTy declTy
 
 /--
@@ -2603,7 +2611,10 @@ def evalRvalue
                 locals
                 mem'
           | .none =>
-            .ok (.aggregate 0 (.ptr parentPtr sz :: .scalar metaSc :: .nil)) locals mem
+            match borrowKind, lookupGlobalAlloc mem.globals parentPtr.allocId with
+            | .shared, .some _ =>
+              .ok (.aggregate 0 (.ptr parentPtr sz :: .scalar metaSc :: .nil)) locals mem
+            | _, _ => .ub
         | _ :: _ => .ub
       | _ => .ub
     | _ =>
@@ -2693,7 +2704,10 @@ def evalRvalue
                 locals
                 mem'
           | .none =>
-            .ok (.aggregate 0 (.ptr parentPtr sz :: .scalar metaSc :: .nil)) locals mem
+            match mutability, lookupGlobalAlloc mem.globals parentPtr.allocId with
+            | .not, .some _ =>
+              .ok (.aggregate 0 (.ptr parentPtr sz :: .scalar metaSc :: .nil)) locals mem
+            | _, _ => .ub
         | _ :: _ => .ub
       | _ => .ub
     | _ =>

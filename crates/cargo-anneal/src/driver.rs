@@ -2167,34 +2167,55 @@ example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
   Or.inl ⟨rfl, Or.inl rfl⟩
 
 -- 6. The default input contract requires well-typed arguments: the `&[u8]`
---    parameter must be a wide (pointer, length) aggregate, not a thin pointer.
+--    parameter must be a wide (pointer, length) aggregate with a valid 64-bit
+--    `usize` length scalar (`sizeBytes = 8` and `bits < 2^64`), not a thin
+--    pointer or a wide pointer with wrong-width/out-of-range length metadata.
 example (p : ProvenancePtr) :
     Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.pre
       { defPath := "core::slice::<impl [T]>::is_empty"
         args := [.aggregate 0 [.ptr p 8, .scalar ⟨3, 8⟩]]
         memory := emptyMemory } :=
-  ⟨rfl, rfl, ⟨⟨p, 8, ⟨3, 8⟩, rfl⟩, trivial⟩, trivial⟩
+  ⟨rfl, rfl, ⟨⟨p, 8, 3, by decide, rfl⟩, trivial⟩, trivial⟩
 
 example (p : ProvenancePtr) :
     ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.pre
       { defPath := "core::slice::<impl [T]>::is_empty"
         args := [.ptr p 8]
         memory := emptyMemory } := by
-  rintro ⟨_, _, ⟨⟨_, _, _, h⟩, _⟩, _⟩
+  rintro ⟨_, _, ⟨⟨_, _, _, _, h⟩, _⟩, _⟩
   cases h
 
--- 7. Wide references, raw pointers, and generic pointees: slice and `str`
---    references must carry length metadata, while a pointee that may be
---    unsized (a generic parameter) admits both representations.
+example (p : ProvenancePtr) :
+    ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.pre
+      { defPath := "core::slice::<impl [T]>::is_empty"
+        args := [.aggregate 0 [.ptr p 8, .scalar ⟨3, 4⟩]]
+        memory := emptyMemory } := by
+  rintro ⟨_, _, ⟨⟨_, _, _, _, h⟩, _⟩, _⟩
+  cases h
+
+example (p : ProvenancePtr) :
+    ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.pre
+      { defPath := "core::slice::<impl [T]>::is_empty"
+        args := [.aggregate 0 [.ptr p 8, .scalar ⟨18446744073709551616, 8⟩]]
+        memory := emptyMemory } := by
+  rintro ⟨_, _, ⟨⟨_, _, len, h_lt, h_eq⟩, _⟩, _⟩
+  cases h_eq
+  exact absurd h_lt (by decide)
+
+-- 7. Wide references, raw pointers, generic pointees, and wide reborrow safety:
+--    slice and `str` references must carry 64-bit `usize` length metadata,
+--    reborrowing `&*s` on a dangling wide pointer faults with `.ub` while
+--    global or borrow-backed wide slices succeed, and `rigidTyMatchesCalleeDecl`
+--    recurses through generic `.fnPtr` types.
 example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (p : ProvenancePtr) :
     valueValidForTy L { kind := .ref .not .str, layoutIdx := 0 }
       (.aggregate 0 [.ptr p 8, .scalar ⟨5, 8⟩]) :=
-  ⟨p, 8, ⟨5, 8⟩, rfl⟩
+  ⟨p, 8, 5, by decide, rfl⟩
 
 example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (p : ProvenancePtr) :
     ¬ valueValidForTy L { kind := .rawPtr .mut (.slice (.uint .u8)), layoutIdx := 0 }
       (.ptr p 8) := by
-  rintro ⟨_, _, _, h⟩
+  rintro ⟨_, _, _, _, h⟩
   cases h
 
 example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (p : ProvenancePtr) :
@@ -2202,6 +2223,47 @@ example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (p : ProvenancePtr) :
     valueValidForTy L { kind := .ref .not (.param 0 "T"), layoutIdx := 0 }
       (.aggregate 0 [.ptr p 8, .scalar ⟨5, 8⟩]) :=
   ⟨Or.inl (Or.inl ⟨p, 8, rfl⟩), Or.inr ⟨p, 8, .scalar ⟨5, 8⟩, rfl⟩⟩
+
+example (p : ProvenancePtr) :
+    evalRvalue
+      [.init (.aggregate 0 [.ptr p 8, .scalar ⟨4, 8⟩])]
+      (.ref .shared { local_ := 0, projection := [.deref] })
+      emptyMemory = .ub :=
+  rfl
+
+example :
+    evalRvalue
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])]
+      (.ref .shared { local_ := 0, projection := [.deref] })
+      { emptyMemory with
+        globals := [{ allocId := 7, bytes := [], relocations := [], align := ⟨1⟩, mutability := .not }] } =
+    .ok
+      (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])]
+      { emptyMemory with
+        globals := [{ allocId := 7, bytes := [], relocations := [], align := ⟨1⟩, mutability := .not }] } :=
+  rfl
+
+example :
+    evalRvalue
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])]
+      (.ref (.mut false) { local_ := 0, projection := [.deref] })
+      { emptyMemory with
+        globals := [{ allocId := 7, bytes := [], relocations := [], align := ⟨1⟩, mutability := .not }] } = .ub :=
+  rfl
+
+example :
+    rigidTyMatchesCalleeDecl
+      [.uint .u32, .bool]
+      8
+      (.fnPtr [.uint .u32] .bool .safe .rust)
+      (.fnPtr [.param 0 "T"] (.param 1 "U") .safe .rust) = true ∧
+    rigidTyMatchesCalleeDecl
+      [.uint .u32, .bool]
+      8
+      (.fnPtr [.uint .u64] .bool .safe .rust)
+      (.fnPtr [.param 0 "T"] (.param 1 "U") .safe .rust) = false :=
+  ⟨rfl, rfl⟩
 
 -- 8. The FFI target has no captured body, so a call to it is a `MirCallE`
 --    interaction bound only by its external call contract, whose postcondition
@@ -2239,10 +2301,14 @@ instance callerFfiAndLenSpec : ModularItemSpec "crate_a::caller_ffi_and_len" :=
   Obligations.CrateA.caller_ffi_and_len.refineModularSpec
     Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum.holdsOn
     (fun args mem =>
-      (∃ p : ProvenancePtr, ∃ n : Nat,
+      ∃ offset : Nat, ∃ n : Nat,
         n < 18446744073709551616 ∧
-        args = [.aggregate 0 [.ptr p 8, .scalar { bits := n, sizeBytes := 8 }]]) ∧
-      mem = (initMachineState Mir.CrateA.caller_ffi_and_len.body args).memory)
+        args = [.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]] ∧
+        mem = {
+          (initMachineState Mir.CrateA.caller_ffi_and_len.body args).memory with
+          borrows := [{ tag := 1, targetLocal := 10, targetProjection := .nil, perm := .frozen }]
+          nextTag := 2
+        })
     (fun _ _ ret _ =>
       ∃ bits : Nat, bits < 4294967296 ∧ ret = .scalar { bits := bits, sizeBytes := 4 })
 
@@ -2256,7 +2322,7 @@ theorem callerFfiAndLen_verified :
     callerFfiAndLenSpec.post
     10
     ?_
-  rintro args mem ⟨_, ⟨p, n, hn, rfl⟩, rfl⟩
+  rintro args mem ⟨_, offset, n, hn, rfl, rfl⟩
   refine ⟨⟨rfl, rfl, ⟨⟨n, hn, rfl⟩, trivial⟩, trivial⟩, ?_⟩
   intro ans h_post
   cases ans with
@@ -2273,7 +2339,7 @@ theorem callerFfiAndLen_verified :
           frame := {
             blockIdx := 2
             stmtIdx := 0
-            locals := [.init retVal, .init (.aggregate 0 [.ptr p 8, .scalar { bits := n, sizeBytes := 8 }]), .uninit]
+            locals := [.init retVal, .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]), .uninit]
           }
           memory := memAfter
         })
@@ -2325,10 +2391,14 @@ instance : ModularItemSpec "crate_a::caller_ffi_and_len" :=
   Obligations.CrateA.caller_ffi_and_len.refineModularSpec
     Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum.holdsOn
     (fun args mem =>
-      (∃ p : ProvenancePtr, ∃ n : Nat,
+      ∃ offset : Nat, ∃ n : Nat,
         n < 18446744073709551616 ∧
-        args = [.aggregate 0 [.ptr p 8, .scalar { bits := n, sizeBytes := 8 }]]) ∧
-      mem = (initMachineState Mir.CrateA.caller_ffi_and_len.body args).memory)
+        args = [.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]] ∧
+        mem = {
+          (initMachineState Mir.CrateA.caller_ffi_and_len.body args).memory with
+          borrows := [{ tag := 1, targetLocal := 10, targetProjection := .nil, perm := .frozen }]
+          nextTag := 2
+        })
     (fun _ _ ret _ =>
       ∃ bits : Nat, bits < 4294967296 ∧ ret = .scalar { bits := bits, sizeBytes := 4 })
 
@@ -2366,7 +2436,7 @@ theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_l
     (inferInstance : ModularItemSpec "crate_a::caller_ffi_and_len").post
     10
     ?_
-  rintro args mem ⟨_, ⟨p, n, hn, rfl⟩, rfl⟩
+  rintro args mem ⟨_, offset, n, hn, rfl, rfl⟩
   refine ⟨⟨rfl, rfl, ⟨⟨n, hn, rfl⟩, trivial⟩, trivial⟩, ?_⟩
   intro ans h_post
   cases ans with
@@ -2383,7 +2453,7 @@ theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_l
           frame := {
             blockIdx := 2
             stmtIdx := 0
-            locals := [.init retVal, .init (.aggregate 0 [.ptr p 8, .scalar { bits := n, sizeBytes := 8 }]), .uninit]
+            locals := [.init retVal, .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]), .uninit]
           }
           memory := memAfter
         })
