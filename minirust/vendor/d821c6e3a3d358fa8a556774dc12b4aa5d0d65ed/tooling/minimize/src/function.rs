@@ -1,0 +1,210 @@
+use crate::*;
+
+/// Data regarding the currently translated function.
+pub struct FnCtxt<'cx, 'tcx> {
+    /// the body we intend to translate. substitutions are already applied.
+    pub body: rs::Body<'tcx>,
+    /// the ABI of this function
+    abi: &'tcx rs::FnAbi<'tcx, rs::Ty<'tcx>>,
+
+    /// the list of local variable declarations (StableMIR) used to retrieve the type of some
+    /// SMIR constructs.
+    pub locals_smir: Vec<smir::LocalDecl>,
+
+    pub cx: &'cx mut Ctxt<'tcx>,
+
+    /// associate names for each mir Local.
+    pub local_name_map: HashMap<rs::Local, LocalName>,
+
+    /// associate names for each basic block.
+    pub bb_name_map: HashMap<rs::BasicBlock, BbName>,
+
+    /// The next free number that can be used as name for a basic block
+    next_bb: u32,
+
+    /// The next free number that can be used as name for a local
+    next_local: u32,
+
+    pub locals: Map<LocalName, Type>,
+    pub blocks: Map<BbName, BasicBlock>,
+
+    /// Whether implicit writes are enabled. Set to false if the function has `#[rustc_no_writable]`.
+    implicit_writes: bool,
+}
+
+impl<'cx, 'tcx> std::ops::Deref for FnCtxt<'cx, 'tcx> {
+    type Target = Ctxt<'tcx>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.cx
+    }
+}
+
+impl<'cx, 'tcx> std::ops::DerefMut for FnCtxt<'cx, 'tcx> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.cx
+    }
+}
+
+impl<'cx, 'tcx> FnCtxt<'cx, 'tcx> {
+    pub fn new(instance: rs::Instance<'tcx>, cx: &'cx mut Ctxt<'tcx>) -> Self {
+        let body = cx.tcx.instance_mir(instance.def);
+        let implicit_writes = !rustc_hir::find_attr!(cx.tcx, instance.def_id(), RustcNoWritable);
+        // We eagerly instantiate everything upfront once.
+        // Then nothing else has to worry about generics.
+        let body = cx.tcx.instantiate_and_normalize_erasing_regions(
+            instance.args,
+            cx.typing_env(),
+            rs::EarlyBinder::bind(body.clone()),
+        );
+        let abi = cx
+            .tcx
+            .fn_abi_of_instance(cx.typing_env().as_query_input((instance, rs::List::empty())))
+            .unwrap();
+        let locals_smir = smir::stable(&body).locals().to_vec();
+
+        FnCtxt {
+            body,
+            abi,
+            cx,
+            local_name_map: Default::default(),
+            bb_name_map: Default::default(),
+            locals: Default::default(),
+            blocks: Default::default(),
+            locals_smir,
+            next_bb: 0,
+            next_local: 0,
+            implicit_writes,
+        }
+    }
+
+    pub fn fresh_bb_name(&mut self) -> BbName {
+        let name = self.next_bb;
+        self.next_bb = name.strict_add(1);
+        BbName(Name::from_internal(name))
+    }
+
+    pub fn fresh_local_name(&mut self) -> LocalName {
+        let name = self.next_local;
+        self.next_local = name.strict_add(1);
+        LocalName(Name::from_internal(name))
+    }
+
+    /// translates a function body.
+    /// Any fn calls occuring during this translation will be added to the `FnNameMap`.
+    pub fn translate(mut self) -> Function {
+        // associate names for each mir BB.
+        for bb_id in self.body.basic_blocks.indices() {
+            let bb_name = self.fresh_bb_name();
+            self.bb_name_map.insert(bb_id, bb_name);
+        }
+
+        for local_id in self.body.local_decls.indices() {
+            let local_name = self.fresh_local_name();
+            self.local_name_map.insert(local_id, local_name);
+        }
+
+        // convert mirs Local-types to minirust.
+        for (id, local_name) in &self.local_name_map {
+            let local_decl = &self.body.local_decls[*id];
+            let span = local_decl.source_info.span;
+            let ty = self.cx.translate_ty(local_decl.ty, span);
+            self.locals.insert(*local_name, ty);
+        }
+
+        let mut args = List::default(); // the locals that receive the function arguments
+        let mut init_statements: Vec<Statement> = Vec::new(); // statements which make up the first bb of the function
+
+        let spread_local_idx = self.body.spread_arg.map(|local| local.as_usize());
+
+        // The argument indices start at 1 since 0 is the return value.
+        for i in 1..=(self.body.arg_count) {
+            if Some(i) == spread_local_idx {
+                let spread_local = self.body.spread_arg.unwrap();
+                let spread_local_name = self.local_name_map[&spread_local];
+
+                let spread_decl = &self.body.local_decls[spread_local];
+                let (tuple_fields, span) = if let rs::TyKind::Tuple(fields) = spread_decl.ty.kind()
+                {
+                    (fields, spread_decl.source_info.span)
+                } else {
+                    panic!(
+                        "spread_arg local {spread_local:?} is not a tuple, has type: {:?}",
+                        spread_decl.ty
+                    );
+                };
+
+                // We need the spread argument to be storage live before we can write to its fields
+                init_statements.push(Statement::StorageLive(spread_local_name));
+
+                for (field_idx, field_ty_rs) in tuple_fields.iter().enumerate() {
+                    let temp_local = self.fresh_local_name();
+
+                    let field_ty = self.cx.translate_ty(field_ty_rs, span);
+                    self.locals.insert(temp_local, field_ty);
+
+                    args.push(temp_local);
+
+                    let destination = PlaceExpr::Field {
+                        root: GcCow::new(PlaceExpr::Local(spread_local_name)),
+                        field: Int::from(field_idx),
+                    };
+
+                    let source =
+                        ValueExpr::Load { source: GcCow::new(PlaceExpr::Local(temp_local)) };
+
+                    init_statements.push(Statement::Assign { destination, source });
+                }
+            } else {
+                args.push(LocalName(Name::from_internal(i as _)));
+            }
+        }
+
+        // the number of locals which are implicitly storage live.
+        let free_argc = self.body.arg_count + 1;
+
+        // add init basic block
+        let init_bb = self.fresh_bb_name();
+
+        // this block allocates all "always_storage_live_locals",
+        // except for those which are implicitly storage live in Minirust;
+        // like the return local and function args.
+        init_statements.extend(
+            rs::always_storage_live_locals(&self.body)
+                .iter()
+                .map(|loc| self.local_name_map[&loc])
+                .filter(|LocalName(i)| i.get_internal() as usize >= free_argc)
+                .map(Statement::StorageLive),
+        );
+
+        let init_blk = BasicBlock {
+            statements: init_statements.into_iter().collect(),
+            terminator: Terminator::Goto(self.bb_name_map[&rs::mir::START_BLOCK]),
+            kind: BbKind::Regular,
+        };
+
+        self.blocks.insert(init_bb, init_blk);
+
+        // convert MIR BBs to minirust.
+        for (id, bb_name) in self.bb_name_map.clone() {
+            let bb_data = &self.body.basic_blocks[id].clone(); // TODO fix clone
+            self.translate_bb(bb_name, bb_data);
+        }
+
+        // "The first local is the return value pointer, followed by arg_count locals for the function arguments, followed by any user-declared variables and temporaries."
+        // - https://doc.rust-lang.org/stable/nightly-rustc/rustc_middle/mir/struct.Body.html
+        let ret = LocalName(Name::from_internal(0));
+
+        let f = Function {
+            locals: self.locals,
+            args,
+            ret,
+            blocks: self.blocks,
+            start: init_bb,
+            calling_convention: translate_calling_convention(self.abi.conv),
+            implicit_writes: self.implicit_writes,
+        };
+
+        f
+    }
+}
