@@ -6,7 +6,7 @@ license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
 This file may not be copied, modified, or distributed except according to
 those terms. -->
 
-# Reproducing `MR-1.1`: Booleans, comparisons, `Cmp`, `!b`, `bool` bitwise ops, `bool` switches
+# Reproducing `MR-1.1`: `bool`, comparisons, `Cmp`, and `bool` switches
 
 This guide lets an independent reviewer check every claim of work unit
 `MR-1.1` from a clean checkout of branch `adv/mr-1-1`. Run all commands from
@@ -79,7 +79,11 @@ as a pass.
   (`evalScalarBinOp_cmp_int`, `evalScalarBinOp_cmp_bool`,
   `evalValue_translateCmp`). The single-step theorem `step_correspondence`
   and everything `Run.lean` derives from it (`mirCall_ret`, `mirCall_ub`,
-  `mirCall_noUB`, ...) hold for the extended fragment.
+  `mirCall_noUB`, ...) hold for the extended fragment. The brief's
+  `mirSimStep` is `step_correspondence` (`Simulation.lean`), and its
+  `mirSimRun` is the family of multi-step theorems in `Run.lean` (`run_ret`,
+  `run_ub`, `steps_outcome`, `mirNoUB_safe`, and their `_from_start` and
+  `mirCall_*` forms), all listed under `[SIMULATION-AUDIT]`.
 - **Witnesses** (`Correspondence/Witness.lean`): `cmpNotSwitch` (signed `<`,
   `==`, `!b`, `b > false`, two `SwitchInt`s on `bool`, four blocks),
   `leNeGe` (`<=`, `!=`, `>=`, a `bool` return place that is also a switch
@@ -184,22 +188,26 @@ The witnesses are ordinary Lean theorems; a reviewer can restate any of them
 with a different expected value and watch the kernel reject it. For example,
 save the following as a scratch file outside the repository and check it with
 `(cd examples && anneal-lean-run --mode file --concurrency 3 -- lake env lean /path/to/Scratch.lean)`;
-it must fail with a type mismatch, because both semantics return `-1i8` (byte
-`255`), not `1`:
+it must fail with a type mismatch, because after its 9 steps (the step count
+of `cmpNotNeg1_minirust_direct`, so the callee has returned) both semantics
+return `-1i8` (byte `255`), not `1`. As a control, replacing
+`scalarBytes i8 1` by `scalarBytes i8 255` must make it pass; if the control
+fails too, the step count is wrong and the negative check proves nothing.
 
 ```lean
 import MiniRustSpec.Correspondence.Witness
 open MiniRustSpec MiniRustSpec.Interp MiniRustSpec.Correspondence
 open MiniRustSpec.Correspondence.Witness
 set_option maxRecDepth 8192 in
-example : (Interp.steps 6 cmpNotNeg1MInit).toOption.map
+example : (Interp.steps 9 cmpNotNeg1MInit).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAllocI8 with data := scalarBytes i8 1 }, [1]) := rfl
 ```
 
-Likewise, `Cmp` on `(-1i8, 1i8)` returns `Less` (byte `255`), so claiming
-`Greater` (byte `1`, what an unsigned comparison of the bit patterns would
-give) must fail:
+Likewise, `Cmp` on `(-1i8, 1i8)` returns `Less` (byte `255`) after the 4 steps
+of `cmpSelLess_minirust_direct`, so claiming `Greater` (byte `1`, what an
+unsigned comparison of the bit patterns would give) must fail, while the
+control with `scalarBytes u8 255` must pass:
 
 ```lean
 import MiniRustSpec.Correspondence.Witness

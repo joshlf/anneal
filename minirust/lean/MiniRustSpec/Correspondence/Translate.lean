@@ -405,16 +405,19 @@ def translateBoolBitOp : MirAst.BinOp → Option Gen.IntBinOp
 /-- `build::bool_and`, `build::bool_or`, and `build::bool_xor`: transmute both
 `bool` operands to `u8` (`boolToU8`), apply `IntBinOp::{BitAnd, BitOr,
 BitXor}`, and transmute the resulting `0` or `1` back to `bool` (MiniRust's
-`tooling/miniutil/src/build/expr.rs`, lines 114-127 at the pinned commit,
-<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/expr.rs#L114-L127>):
+`tooling/miniutil/src/build/expr.rs`, lines 240-251 at the pinned commit,
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/expr.rs#L240-L251>):
 ```rust
 pub fn bool_and(l: ValueExpr, r: ValueExpr) -> ValueExpr {
+    // `l & r` is always 0 or 1, so safe to transmute back
     transmute(bit_and(bool_to_int::<u8>(l), bool_to_int::<u8>(r)), bool_ty())
 }
 pub fn bool_or(l: ValueExpr, r: ValueExpr) -> ValueExpr {
+    // `l | r` is always 0 or 1, so safe to transmute back
     transmute(bit_or(bool_to_int::<u8>(l), bool_to_int::<u8>(r)), bool_ty())
 }
 pub fn bool_xor(l: ValueExpr, r: ValueExpr) -> ValueExpr {
+    // `l ^ r` is always 0 or 1, so safe to transmute back
     transmute(bit_xor(bool_to_int::<u8>(l), bool_to_int::<u8>(r)), bool_ty())
 }
 ```
