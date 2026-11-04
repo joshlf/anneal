@@ -826,6 +826,91 @@ theorem signedLe_eq_sle (a b sz : Nat) :
   rw [signedLt_eq_slt, BitVec.slt_eq_decide, BitVec.sle_eq_decide, ← decide_not]
   exact decide_eq_decide.mpr Int.not_lt
 
+/--
+Closed-form `BitVec.msb` characterization of `signedOverflowAdd`: two's-complement
+addition overflows iff both operands have the same sign bit and the wrapped sum
+has the opposite sign bit.
+-/
+theorem signedOverflowAdd_eq_msb (a b sz : Nat) :
+    signedOverflowAdd a b sz =
+      (((BitVec.ofNat (8 * sz) a).msb == (BitVec.ofNat (8 * sz) b).msb) &&
+       ((BitVec.ofNat (8 * sz) a).msb !=
+        (BitVec.ofNat (8 * sz) a + BitVec.ofNat (8 * sz) b).msb)) := by
+  unfold signedOverflowAdd
+  dsimp only
+  have hsum :
+      BitVec.ofNat (8 * sz) (a.add b) =
+        BitVec.ofNat (8 * sz) a + BitVec.ofNat (8 * sz) b := by
+    apply BitVec.eq_of_toNat_eq
+    simp [BitVec.toNat_add, Nat.add_mod]
+  rw [isSignedNegative_wrapScalarBits, isSignedNegative_eq_msb,
+      isSignedNegative_eq_msb, isSignedNegative_eq_msb, hsum]
+  cases (BitVec.ofNat (8 * sz) a).msb <;>
+    cases (BitVec.ofNat (8 * sz) b).msb <;>
+    cases (BitVec.ofNat (8 * sz) a + BitVec.ofNat (8 * sz) b).msb <;> rfl
+
+/--
+Closed-form `BitVec.msb` characterization of `signedOverflowSub`: two's-complement
+subtraction overflows iff the operands have opposite sign bits and the wrapped
+difference has a sign bit opposite to the minuend.
+-/
+theorem signedOverflowSub_eq_msb (a b sz : Nat) :
+    signedOverflowSub a b sz =
+      (((BitVec.ofNat (8 * sz) a).msb != (BitVec.ofNat (8 * sz) b).msb) &&
+       ((BitVec.ofNat (8 * sz) a).msb !=
+        (BitVec.ofNat (8 * sz) a - BitVec.ofNat (8 * sz) b).msb)) := by
+  unfold signedOverflowSub
+  dsimp only
+  have ha_lt : a % 2 ^ (8 * sz) < 2 ^ (8 * sz) :=
+    Nat.mod_lt a (Nat.two_pow_pos (8 * sz))
+  have hb_lt : b % 2 ^ (8 * sz) < 2 ^ (8 * sz) :=
+    Nat.mod_lt b (Nat.two_pow_pos (8 * sz))
+  cases hble : (wrapScalarBits b (scalarModulus sz)).ble (wrapScalarBits a (scalarModulus sz)) with
+  | true =>
+    dsimp only
+    have hdiff :
+        BitVec.ofNat (8 * sz)
+          ((wrapScalarBits a (scalarModulus sz)).sub (wrapScalarBits b (scalarModulus sz))) =
+          BitVec.ofNat (8 * sz) a - BitVec.ofNat (8 * sz) b := by
+      rw [wrapScalarBits_eq_mod_modulus, wrapScalarBits_eq_mod_modulus,
+          scalarModulus_eq_two_pow] at hble ⊢
+      have hle : b % 2 ^ (8 * sz) ≤ a % 2 ^ (8 * sz) := Nat.le_of_ble_eq_true hble
+      apply BitVec.eq_of_toNat_eq
+      rw [BitVec.toNat_ofNat, BitVec.toNat_sub, BitVec.toNat_ofNat, BitVec.toNat_ofNat]
+      change (a % 2 ^ (8 * sz) - b % 2 ^ (8 * sz)) % 2 ^ (8 * sz) =
+        (2 ^ (8 * sz) - b % 2 ^ (8 * sz) + a % 2 ^ (8 * sz)) % 2 ^ (8 * sz)
+      have h1 : 2 ^ (8 * sz) - b % 2 ^ (8 * sz) + a % 2 ^ (8 * sz) =
+          2 ^ (8 * sz) + (a % 2 ^ (8 * sz) - b % 2 ^ (8 * sz)) := by omega
+      rw [h1, Nat.add_mod_left]
+    rw [isSignedNegative_wrapScalarBits, isSignedNegative_wrapScalarBits,
+        isSignedNegative_wrapScalarBits, isSignedNegative_eq_msb,
+        isSignedNegative_eq_msb, isSignedNegative_eq_msb, hdiff]
+    cases (BitVec.ofNat (8 * sz) a).msb <;>
+      cases (BitVec.ofNat (8 * sz) b).msb <;>
+      cases (BitVec.ofNat (8 * sz) a - BitVec.ofNat (8 * sz) b).msb <;> rfl
+  | false =>
+    dsimp only
+    have hdiff :
+        BitVec.ofNat (8 * sz)
+          (((scalarModulus sz).add (wrapScalarBits a (scalarModulus sz))).sub
+            (wrapScalarBits b (scalarModulus sz))) =
+          BitVec.ofNat (8 * sz) a - BitVec.ofNat (8 * sz) b := by
+      apply BitVec.eq_of_toNat_eq
+      rw [wrapScalarBits_eq_mod_modulus, wrapScalarBits_eq_mod_modulus,
+          scalarModulus_eq_two_pow, BitVec.toNat_ofNat, BitVec.toNat_sub,
+          BitVec.toNat_ofNat, BitVec.toNat_ofNat]
+      change (2 ^ (8 * sz) + a % 2 ^ (8 * sz) - b % 2 ^ (8 * sz)) % 2 ^ (8 * sz) =
+        (2 ^ (8 * sz) - b % 2 ^ (8 * sz) + a % 2 ^ (8 * sz)) % 2 ^ (8 * sz)
+      have h1 : 2 ^ (8 * sz) + a % 2 ^ (8 * sz) - b % 2 ^ (8 * sz) =
+          2 ^ (8 * sz) - b % 2 ^ (8 * sz) + a % 2 ^ (8 * sz) := by omega
+      rw [h1]
+    rw [isSignedNegative_wrapScalarBits, isSignedNegative_wrapScalarBits,
+        isSignedNegative_wrapScalarBits, isSignedNegative_eq_msb,
+        isSignedNegative_eq_msb, isSignedNegative_eq_msb, hdiff]
+    cases (BitVec.ofNat (8 * sz) a).msb <;>
+      cases (BitVec.ofNat (8 * sz) b).msb <;>
+      cases (BitVec.ofNat (8 * sz) a - BitVec.ofNat (8 * sz) b).msb <;> rfl
+
 /-! ## 5. `ScalarValue` & `BitVec (8 * s.sizeBytes)` Isomorphism -/
 
 /--
@@ -1682,6 +1767,35 @@ theorem evalBinOp_ge_signed {sz a b : Nat} (hsz : 0 < sz) :
   unfold evalBinOp
   simp [beq_zero_eq_false_of_pos hsz, signedLe_eq_sle]
 
+@[simp]
+theorem evalBinOp_cmp_unsigned {sz a b : Nat} (hsz : 0 < sz) :
+    evalBinOp .cmp ⟨a, sz⟩ ⟨b, sz⟩ false =
+      match Nat.beq a b with
+      | true => .some ⟨0, 1⟩
+      | false =>
+        match Nat.ble a b with
+        | true => .some ⟨255, 1⟩
+        | false => .some ⟨1, 1⟩ := by
+  unfold evalBinOp
+  simp [beq_zero_eq_false_of_pos hsz]
+
+@[simp]
+theorem evalBinOp_cmp_signed {sz a b : Nat} (hsz : 0 < sz) :
+    evalBinOp .cmp ⟨a, sz⟩ ⟨b, sz⟩ true =
+      match Nat.beq (a % (2 ^ (8 * sz))) (b % (2 ^ (8 * sz))) with
+      | true => .some ⟨0, 1⟩
+      | false =>
+        match (BitVec.ofNat (8 * sz) a).slt (BitVec.ofNat (8 * sz) b) with
+        | true => .some ⟨255, 1⟩
+        | false => .some ⟨1, 1⟩ := by
+  unfold evalBinOp
+  simp only [beq_zero_eq_false_of_pos hsz, Nat.beq_refl, signedLt_eq_slt]
+  have ha : BitVec.ofNat (8 * sz) (a % 2 ^ (8 * sz)) = BitVec.ofNat (8 * sz) a := by
+    apply BitVec.eq_of_toNat_eq; simp
+  have hb : BitVec.ofNat (8 * sz) (b % 2 ^ (8 * sz)) = BitVec.ofNat (8 * sz) b := by
+    apply BitVec.eq_of_toNat_eq; simp
+  rw [ha, hb]
+
 /-- Closed-form `@[simp]` lemmas for `evalCastValue` (unsigned and signed). -/
 @[simp]
 theorem evalCastValue_unsigned_apply {sz dstBytes a : Nat}
@@ -2397,6 +2511,41 @@ theorem evalScalarBinOp_ge_signed {sz a b : Nat} (hsz : 0 < sz)
   unfold evalScalarBinOp
   simp [beq_zero_eq_false_of_pos hsz, signedLe_eq_sle]
 
+@[simp]
+theorem evalScalarBinOp_cmp_unsigned {sz a b : Nat} (hsz : 0 < sz)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .cmp ⟨a, sz⟩ ⟨b, sz⟩ locals mem false =
+      match Nat.beq a b with
+      | true => .ok (.scalar ⟨0, 1⟩) locals mem
+      | false =>
+        match Nat.ble a b with
+        | true => .ok (.scalar ⟨255, 1⟩) locals mem
+        | false => .ok (.scalar ⟨1, 1⟩) locals mem := by
+  unfold evalScalarBinOp
+  simp [beq_zero_eq_false_of_pos hsz]
+  rfl
+
+@[simp]
+theorem evalScalarBinOp_cmp_signed {sz a b : Nat} (hsz : 0 < sz)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .cmp ⟨a, sz⟩ ⟨b, sz⟩ locals mem true =
+      match Nat.beq (a % (2 ^ (8 * sz))) (b % (2 ^ (8 * sz))) with
+      | true => .ok (.scalar ⟨0, 1⟩) locals mem
+      | false =>
+        match (BitVec.ofNat (8 * sz) a).slt (BitVec.ofNat (8 * sz) b) with
+        | true => .ok (.scalar ⟨255, 1⟩) locals mem
+        | false => .ok (.scalar ⟨1, 1⟩) locals mem := by
+  unfold evalScalarBinOp
+  simp only [beq_zero_eq_false_of_pos hsz, Nat.beq_refl,
+             wrapScalarBits_eq_mod_modulus, scalarModulus_eq_two_pow,
+             signedLt_eq_slt]
+  have ha : BitVec.ofNat (8 * sz) (a % 2 ^ (8 * sz)) = BitVec.ofNat (8 * sz) a := by
+    apply BitVec.eq_of_toNat_eq; simp
+  have hb : BitVec.ofNat (8 * sz) (b % 2 ^ (8 * sz)) = BitVec.ofNat (8 * sz) b := by
+    apply BitVec.eq_of_toNat_eq; simp
+  rw [ha, hb]
+  rfl
+
 /-- Closed-form `@[simp]` lemmas for `evalExactDiv` and `evalScalarExactDiv` (`BRIEF-1.2`). -/
 @[simp]
 theorem evalExactDiv_unsigned_apply {sz a b : Nat}
@@ -2708,7 +2857,34 @@ theorem evalExactDiv_ofBitVec_unsigned {sz : Nat} (hsz : 0 < sz)
   congr 1; congr 1
   rw [Nat.mod_eq_of_lt x.isLt, Nat.mod_eq_of_lt y.isLt, ← BitVec.toNat_udiv]
 
-/-- `evalBinOp` comparison operators (`.lt`, `.le`, `.gt`, `.ge`, unsigned and signed) commute with `ScalarValue.ofBitVec` and `BitVec` comparisons (`ult`, `ule`, `slt`, `sle`). -/
+/-- `evalBinOp` comparison operators (`.eq`, `.ne`, `.lt`, `.le`, `.gt`, `.ge`, unsigned and signed) commute with `ScalarValue.ofBitVec` and `BitVec` comparisons (`==`, `!=`, `ult`, `ule`, `slt`, `sle`). -/
+private theorem nat_beq_toNat_eq_beq {w : Nat} (x y : BitVec w) :
+    Nat.beq x.toNat y.toNat = (x == y) := by
+  cases h : Nat.beq x.toNat y.toNat with
+  | true =>
+    have heq : x = y := BitVec.eq_of_toNat_eq (Nat.eq_of_beq_eq_true h)
+    subst heq
+    simp
+  | false =>
+    refine (beq_eq_false_iff_ne.mpr (fun heq => ?_)).symm
+    subst heq
+    rw [Nat.beq_refl] at h
+    nomatch h
+
+@[simp]
+theorem evalBinOp_ofBitVec_eq {sz : Nat} (hsz : 0 < sz)
+    (x y : BitVec (8 * sz)) (isSigned : Bool) :
+    evalBinOp .eq (ScalarValue.ofBitVec sz x) (ScalarValue.ofBitVec sz y) isSigned =
+      .some (boolToScalar (x == y)) := by
+  rw [evalBinOp_eq_apply hsz, nat_beq_toNat_eq_beq]
+
+@[simp]
+theorem evalBinOp_ofBitVec_ne {sz : Nat} (hsz : 0 < sz)
+    (x y : BitVec (8 * sz)) (isSigned : Bool) :
+    evalBinOp .ne (ScalarValue.ofBitVec sz x) (ScalarValue.ofBitVec sz y) isSigned =
+      .some (boolToScalar (x != y)) := by
+  rw [evalBinOp_ne_apply hsz, nat_beq_toNat_eq_beq, bne]
+
 @[simp]
 theorem evalBinOp_ofBitVec_lt_unsigned {sz : Nat} (hsz : 0 < sz)
     (x y : BitVec (8 * sz)) :

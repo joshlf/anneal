@@ -49,6 +49,9 @@ fixed-width `BitVec (8 * sz)` representations.
    - `signedLt_eq_slt` and `signedLe_eq_sle` (`@[simp]`): unconditional
      `BitVec.slt` / `BitVec.sle` characterizations of two's-complement
      signed comparisons.
+   - `signedOverflowAdd_eq_msb` and `signedOverflowSub_eq_msb`: closed-form
+     `BitVec.msb` characterizations of signed two's-complement addition and
+     subtraction overflow.
 
 4. **`ScalarValue` & `BitVec (8 * s.sizeBytes)` Isomorphism (Section 5)**:
    - `ScalarValue.toBitVec (s : ScalarValue) : BitVec (8 * s.sizeBytes)`
@@ -70,12 +73,14 @@ fixed-width `BitVec (8 * sz)` representations.
      (`.add`, `.sub`, `.mul`, `.addWithOverflow`, `.subWithOverflow`,
      `.mulWithOverflow`, `.addUnchecked`, `.subUnchecked`, `.mulUnchecked`,
      `.div`, `.rem`), unary operations (`.not`, `.neg`), and comparisons (`.eq`,
-     `.ne`, `.lt`, `.le`, `.gt`, `.ge`), including width-specialized lemmas for
-     `u8`, `u16`, `u32`, `u64`, `u128`, `usize`, `i8`, `i16`, `i32`, `i64`,
-     `i128`, and `isize`.
-   - `BitVec (8 * sz)` homomorphism theorems (`evalBinOp_ofBitVec_*`,
-     `evalExactDiv_ofBitVec_unsigned`, `evalBinOpChecked_ofBitVec_*`,
-     `evalUnOp_ofBitVec_*`, `evalCastValue_ofBitVec_*`).
+     `.ne`, `.lt`, `.le`, `.gt`, `.ge`, `.cmp`), including width-specialized
+     lemmas for `u8`, `u16`, `u32`, `u64`, `u128`, `usize`, `i8`, `i16`, `i32`,
+     `i64`, `i128`, and `isize`.
+   - `BitVec (8 * sz)` homomorphism theorems (`evalBinOp_ofBitVec_*` including
+     `.addUnchecked` / `.subUnchecked` / `.mulUnchecked` / `.eq` / `.ne` /
+     `.lt` / `.le` / `.gt` / `.ge`, `evalExactDiv_ofBitVec_unsigned`,
+     `evalBinOpChecked_ofBitVec_*`, `evalUnOp_ofBitVec_*`,
+     `evalCastValue_ofBitVec_*`).
 
 6. **Bit Intrinsic Helpers (`BRIEF-1.2` Support, Section 9)**:
    - `ctpopLoop`, `cttzLoop`, `bitreverseLoop`, `ctlzBits`, and `bswapLoop`
