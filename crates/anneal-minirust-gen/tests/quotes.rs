@@ -1163,3 +1163,270 @@ fn enum_tuple_and_cmp_quotations_are_pinned() {
         );
     }
 }
+
+/// The upstream items behind checked integer arithmetic (`IntWithOverflow`),
+/// `(Int, bool)` 2-tuples (`IntType::with_overflow`, `ValueExpr::Tuple`), and
+/// field projections (`PlaceExpr::Field`, `ptr_offset_inbounds`,
+/// `LayoutStrategy::compute_size_and_align`) (`MR-1.2`).
+#[test]
+fn with_overflow_tuple_and_field_quotations_are_pinned() {
+    let corpus = corpus();
+    let ops = "spec/lang/step/operators.md";
+    let exprs = "spec/lang/step/expressions.md";
+    let types = "spec/lang/types.md";
+    let ptr = "spec/mem/pointer.md";
+    let basic = "spec/mem/basic.md";
+    let iface = "spec/mem/interface.md";
+    let conc = "spec/mem/concurrent.md";
+    let mach = "spec/lang/machine.md";
+    let rvalue = "tooling/minimize/src/rvalue.rs";
+    let min_ty = "tooling/minimize/src/ty.rs";
+
+    // (cited file, genuine quotation, tampered quotation, Lean file quoting it)
+    let cases: &[(&str, &str, &str, &str)] = &[
+        // `IntType::with_overflow` constructs `(self, bool)` with trailing padding
+        // up to `self.size + Size::from_bytes(align.bytes()).unwrap()`.
+        (
+            types,
+            "pub fn with_overflow<T: Target>(&self) -> Type { \
+             let fields = list![(Size::ZERO, Type::Int(*self)), (self.size, Type::Bool)]; \
+             let align = self.align::<T>(); \
+             let size = self.size + Size::from_bytes(align.bytes()).unwrap(); \
+             Type::Tuple { \
+                 sized_fields: fields, \
+                 sized_head_layout: TupleHeadLayout { end: size, align, packed_align: None, }, \
+                 unsized_field: None, \
+             } }",
+            "let size = self.size + Size::from_bytes_const(1);",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `TupleHeadLayout::{capped_tail_align, tail_offset, full_size_and_align}` and
+        // `LayoutStrategy::{is_sized, compute_size_and_align}`.
+        (
+            types,
+            "fn capped_tail_align(self, tail_align: Align) -> Align { \
+             match self.packed_align { \
+                 Some(packed_align) => tail_align.min(packed_align), \
+                 None => tail_align, \
+             } }",
+            "Some(packed_align) => tail_align.max(packed_align),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
+            "pub fn tail_offset(self, tail_align: Align) -> Offset { \
+             let capped_tail_align = self.capped_tail_align(tail_align); \
+             let tail_offset = self.end.align_to(capped_tail_align); \
+             tail_offset }",
+            "let tail_offset = self.end;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
+            "pub fn full_size_and_align(self, tail_size: Size, tail_align: Align) -> (Size, Align) { \
+             let capped_tail_align = self.capped_tail_align(tail_align); \
+             let align = capped_tail_align.max(self.align); \
+             let tail_offset = self.tail_offset(tail_align); \
+             let end = tail_offset + tail_size; \
+             let size = end.align_to(align); \
+             (size, align) }",
+            "let align = capped_tail_align.min(self.align);",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
+            "pub fn is_sized(self) -> bool { \
+             matches!(self, LayoutStrategy::Sized(..)) }",
+            "matches!(self, LayoutStrategy::Tuple { .. })",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
+            "(LayoutStrategy::Tuple { head, tail }, Some(meta)) => { \
+             let (tail_size, tail_align) = tail.compute_size_and_align(Some(meta), vtables); \
+             head.full_size_and_align(tail_size, tail_align) }",
+            "head.head_size_and_align()",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `ThinPointer::{wrapping_offset, widen}`, `dereferenceable`, `signed_dereferenceable`.
+        (
+            ptr,
+            "pub fn wrapping_offset<T: Target>(self, offset: Int) -> Self { \
+             let addr = self.addr + offset; \
+             let addr = addr.bring_in_bounds(Unsigned, T::PTR_SIZE); \
+             ThinPointer { addr, ..self } }",
+            "let addr = addr.bring_in_bounds(Signed, T::PTR_SIZE);",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            ptr,
+            "pub fn widen(self, metadata: Option<PointerMeta<Provenance>>) -> Pointer<Provenance> { \
+             Pointer { thin_pointer: self, metadata, } }",
+            "Pointer { thin_pointer: self, metadata: None, }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            basic,
+            "fn dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Size) -> Result { \
+             self.check_ptr(ptr, len)?; ret(()) }",
+            "self.check_ptr(ptr, Size::ZERO)?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            iface,
+            "fn signed_dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Int) -> Result { \
+             if len > 0 { \
+                 self.dereferenceable(ptr, Size::from_bytes(len).unwrap()) \
+             } else { \
+                 let begin_ptr = ThinPointer { addr: ptr.addr + len, ..ptr }; \
+                 self.dereferenceable(begin_ptr, Size::from_bytes(-len).unwrap()) \
+             } }",
+            "let begin_ptr = ThinPointer { addr: ptr.addr - len, ..ptr };",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            conc,
+            "pub fn signed_dereferenceable(&self, ptr: ThinPointer<M::Provenance>, len: Int) -> Result { \
+             self.memory.signed_dereferenceable(ptr, len) }",
+            "self.memory.signed_dereferenceable(ptr, -len)",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `Machine::{vtable_lookup, compute_size, compute_align}`.
+        (
+            mach,
+            "fn compute_size(&self, layout: LayoutStrategy, meta: Option<PointerMeta<M::Provenance>>) -> Size { \
+             let (size, _) = layout.compute_size_and_align(meta, self.vtable_lookup()); \
+             size }",
+            "let (_, size) = layout.compute_size_and_align(meta, self.vtable_lookup());",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            mach,
+            "fn compute_align(&self, layout: LayoutStrategy, meta: Option<PointerMeta<M::Provenance>>) -> Align { \
+             let (_, align) = layout.compute_size_and_align(meta, self.vtable_lookup()); \
+             align }",
+            "let (align, _) = layout.compute_size_and_align(meta, self.vtable_lookup());",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `Machine::ptr_offset_inbounds` and `Machine::eval_place` (`PlaceExpr::Field`).
+        (
+            ops,
+            "fn ptr_offset_inbounds(&self, ptr: ThinPointer<M::Provenance>, offset: Int) -> Result<ThinPointer<M::Provenance>> { \
+             self.mem.signed_dereferenceable(ptr, offset)?; \
+             assert!(offset.in_bounds(Signed, M::T::PTR_SIZE)); \
+             assert!((ptr.addr + offset).in_bounds(Unsigned, M::T::PTR_SIZE)); \
+             ret(ThinPointer { addr: ptr.addr + offset, ..ptr }) }",
+            "assert!(offset.in_bounds(Unsigned, M::T::PTR_SIZE));",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            exprs,
+            "fn eval_place(&mut self, PlaceExpr::Field { root, field }: PlaceExpr) -> Result<(Place<M>, Type)> { \
+             let (root, ty) = self.eval_place(root)?; \
+             let (offset, field_ty) = match ty { \
+                 Type::Tuple { sized_fields, unsized_field, sized_head_layout } => { \
+                     if field >= 0 && field < sized_fields.len() { \
+                         sized_fields[field] \
+                     } else if field == sized_fields.len() {",
+            "if field >= 0 && field <= sized_fields.len() { sized_fields[field] }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            exprs,
+            "assert!(offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata)); \
+             let ptr = self.ptr_offset_inbounds(root.ptr.thin_pointer, offset.bytes())?;",
+            "let ptr = self.ptr_offset_inbounds(root.ptr.thin_pointer, -offset.bytes())?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `Machine::eval_bin_op` for `BinOp::IntWithOverflow` and `Machine::eval_value` for `ValueExpr::Tuple`.
+        (
+            ops,
+            "let result = match op { \
+                 IntBinOpWithOverflow::Add => left + right, \
+                 IntBinOpWithOverflow::Sub => left - right, \
+                 IntBinOpWithOverflow::Mul => left * right, \
+             }; \
+             let overflow = !int_ty.can_represent(result); \
+             let result = int_ty.bring_in_bounds(result); \
+             let value = Value::Tuple(list![Value::Int::<M>(result), Value::Bool::<M>(overflow)]); \
+             let ty = int_ty.with_overflow::<M::T>(); \
+             ret((value, ty))",
+            "let overflow = int_ty.can_represent(result);",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            exprs,
+            "fn eval_value(&mut self, ValueExpr::Tuple(exprs, ty): ValueExpr) -> Result<(Value<M>, Type)> { \
+             let vals = exprs.try_map(|e| self.eval_value(e))?.map(|e| e.0); \
+             ret((Value::Tuple(vals), ty)) }",
+            "let vals = exprs.try_map(|e| self.eval_value(e))?.map(|e| e.1);",
+            "MiniRustSpec/Interp.lean",
+        ),
+        // `minimize`: `Tuple` layout, `ProjectionElem::Field`, `CheckedBinaryOp`, `AggregateKind::Tuple`.
+        (
+            min_ty,
+            "fn tuple_from_layout(&mut self, layout: rs::TyAndLayout<'tcx>, span: rs::Span) -> Type { \
+             let size = translate_size(layout.size); \
+             let align = translate_align(layout.align.abi);",
+            "let size = translate_align(layout.align.abi);",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            rvalue,
+            "smir::ProjectionElem::Field(f, _ty) => { \
+             let indirected = GcCow::new(expr); \
+             PlaceExpr::Field { root: indirected, field: (*f).into() } }",
+            "PlaceExpr::Field { root: indirected, field: Int::ZERO }",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            rvalue,
+            "smir::Rvalue::CheckedBinaryOp(op, l, r) => { \
+             let l = GcCow::new(self.translate_operand_smir(l, span)); \
+             let r = GcCow::new(self.translate_operand_smir(r, span)); \
+             let op = match op { \
+                 smir::BinOp::Add => BinOp::IntWithOverflow(IntBinOpWithOverflow::Add), \
+                 smir::BinOp::Sub => BinOp::IntWithOverflow(IntBinOpWithOverflow::Sub), \
+                 smir::BinOp::Mul => BinOp::IntWithOverflow(IntBinOpWithOverflow::Mul), \
+                 x => panic!(\"CheckedBinaryOp {x:?} not supported.\"), \
+             }; \
+             ValueExpr::BinOp { operator: op, left: l, right: r } }",
+            "smir::BinOp::Sub => BinOp::IntWithOverflow(IntBinOpWithOverflow::Add),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            rvalue,
+            "Type::Tuple { .. } | Type::Array { .. } => { \
+             let ops: List<_> = operands.iter().map(|x| self.translate_operand_smir(x, span)).collect(); \
+             ValueExpr::Tuple(ops, ty) }",
+            "Type::Tuple { .. } | Type::Array { .. } => { ValueExpr::Tuple(list![], ty) }",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+    ];
+
+    let lean_root = minirust_dir().join("lean");
+    for (file, genuine, tampered, lean_file) in cases {
+        assert_eq!(
+            missing_piece_in(&corpus, Some(file), genuine),
+            None,
+            "genuine quotation not found in `{file}`: {genuine}"
+        );
+        assert!(
+            missing_piece_in(&corpus, Some(file), tampered).is_some(),
+            "tampered quotation unexpectedly found in `{file}`: {tampered}"
+        );
+        let other = if *file == ops { types } else { ops };
+        assert!(
+            missing_piece_in(&corpus, Some(other), genuine).is_some(),
+            "quotation from `{file}` also matches `{other}`: {genuine}"
+        );
+        let lean = std::fs::read_to_string(lean_root.join(lean_file)).unwrap();
+        let lean_squashed = squash(&lean.replace("\\\"", "\"").replace("\n>", "\n"));
+        let first_piece = squash(genuine.split("..").next().unwrap());
+        let probe: String = first_piece.chars().take(40).collect();
+        assert!(
+            lean_squashed.contains(&probe),
+            "`{lean_file}` no longer quotes `{probe}`"
+        );
+    }
+}

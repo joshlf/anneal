@@ -38,8 +38,16 @@ here.
   `Stop.unsupported` instead of resolving the choice.
 * `Statement::Assign` and `Statement::PlaceMention`
   (`spec/lang/step/statements.md`).
-* `PlaceExpr::Local` (`spec/lang/step/expressions.md`).
-* `ValueExpr::Constant` for `Constant::Int`/`Constant::Bool`, `ValueExpr::Load`,
+* `PlaceExpr::Local` and `PlaceExpr::Field` (`spec/lang/step/expressions.md`),
+  including `Machine::ptr_offset_inbounds` (`spec/lang/step/operators.md`),
+  `ThinPointer::wrapping_offset` and `ThinPointer::widen`
+  (`spec/mem/pointer.md`), `Memory::dereferenceable` and
+  `Memory::signed_dereferenceable` (`spec/mem/basic.md`,
+  `spec/mem/concurrent.md`, `spec/mem/interface.md`), and
+  `Machine::vtable_lookup`, `Machine::compute_size`, and
+  `Machine::compute_align` (`spec/lang/machine.md`).
+* `ValueExpr::Constant` for `Constant::Int`/`Constant::Bool`,
+  `ValueExpr::Tuple`, `ValueExpr::Load`,
   `ValueExpr::UnOp` with `UnOp::Int` (all `IntUnOp` variants: `Neg`, `BitNot`,
   `CountOnes`) and `UnOp::Cast` (both `CastOp` variants: `IntToInt` and
   `Transmute`, the latter through `Machine::transmute`, i.e. `encode` at the
@@ -47,8 +55,10 @@ here.
   `ValueExpr::BinOp` with `BinOp::Int` (all `IntBinOp` variants: `Add`,
   `AddUnchecked`, `Sub`, `SubUnchecked`, `Mul`, `MulUnchecked`, `Div`,
   `DivExact`, `Rem`, `Shl`, `Shr`, `ShlUnchecked`, `ShrUnchecked`, `BitAnd`,
-  `BitOr`, `BitXor`) and `BinOp::Rel` (all `RelOp` variants: `Lt`, `Gt`, `Le`,
-  `Ge`, `Eq`, `Ne`, `Cmp`) on integers and Booleans
+  `BitOr`, `BitXor`), `BinOp::IntWithOverflow` (all `IntBinOpWithOverflow`
+  variants: `Add`, `Sub`, `Mul`, returning `(Value::Int(result), Value::Bool(overflow))`
+  at `IntType::with_overflow`), and `BinOp::Rel` (all `RelOp` variants: `Lt`,
+  `Gt`, `Le`, `Ge`, `Eq`, `Ne`, `Cmp`) on integers and Booleans
   (`spec/lang/step/expressions.md`, `spec/lang/step/operators.md`). MiniRust
   has no Boolean negation operator: `minimize` expresses `!b` with transmutes
   and integer subtraction (see `MiniRustSpec.Correspondence.Translate`), so
@@ -348,6 +358,70 @@ def IntType.align (t : IntType) : Interp Align :=
   | some a => pure ⟨min a.bytes x86_64.INT_MAX_ALIGN.bytes⟩
   | none => specPanic "Align::from_bytes(size).unwrap()"
 
+/-- `IntType::with_overflow::<x86_64>` (`spec/lang/types.md`):
+> "pub fn with_overflow<T: Target>(&self) -> Type {
+>     // Define a tuple type with two fields: An integer followed directly by a boolean.
+>     let fields = list![(Size::ZERO, Type::Int(*self)), (self.size, Type::Bool)];
+>     // Alignment is always the one of the integer as boolean has align requirement 1.
+>     let align = self.align::<T>();
+>     // The total size is `self.size + 1` rounded up to the next multiple of `align`.
+>     // Since `self.size` is already a multiple of `align`, we can compute this as follows:
+>     let size = self.size + Size::from_bytes(align.bytes()).unwrap();
+>     Type::Tuple {
+>         sized_fields: fields,
+>         sized_head_layout: TupleHeadLayout {
+>             end: size,
+>             align,
+>             packed_align: None,
+>         },
+>         unsized_field: None,
+>     }
+> }" -/
+def IntType.with_overflow (t : IntType) : Interp «Type» := do
+  let size := t.size
+  let align ← IntType.align t
+  pure (.Tuple [(⟨0⟩, .Int t), (size, .Bool)] ⟨⟨size.bytes + align.bytes⟩, align, none⟩ none)
+
+/-- `TupleHeadLayout::capped_tail_align` (`spec/lang/types.md`):
+> "fn capped_tail_align(self, tail_align: Align) -> Align {
+>     match self.packed_align {
+>         Some(packed_align) => tail_align.min(packed_align),
+>         None => tail_align,
+>     }
+> }" -/
+def TupleHeadLayout.capped_tail_align (l : TupleHeadLayout) (tailAlign : Align) : Align :=
+  match l.packed_align with
+  | some packedAlign => ⟨min tailAlign.bytes packedAlign.bytes⟩
+  | none => tailAlign
+
+/-- `TupleHeadLayout::tail_offset` (`spec/lang/types.md`):
+> "pub fn tail_offset(self, tail_align: Align) -> Offset {
+>     let capped_tail_align = self.capped_tail_align(tail_align);
+>     let tail_offset = self.end.align_to(capped_tail_align);
+>     tail_offset
+> }" -/
+def TupleHeadLayout.tail_offset (l : TupleHeadLayout) (tailAlign : Align) : Offset :=
+  let cappedTailAlign := TupleHeadLayout.capped_tail_align l tailAlign
+  Size.align_to l.end cappedTailAlign
+
+/-- `TupleHeadLayout::full_size_and_align` (`spec/lang/types.md`):
+> "pub fn full_size_and_align(self, tail_size: Size, tail_align: Align) -> (Size, Align) {
+>     let capped_tail_align = self.capped_tail_align(tail_align);
+>     let align = capped_tail_align.max(self.align);
+>     let tail_offset = self.tail_offset(tail_align);
+>     let end = tail_offset + tail_size;
+>     let size = end.align_to(align);
+>     (size, align)
+> }" -/
+def TupleHeadLayout.full_size_and_align (l : TupleHeadLayout) (tailSize : Size) (tailAlign : Align) :
+    Size × Align :=
+  let cappedTailAlign := TupleHeadLayout.capped_tail_align l tailAlign
+  let align : Align := ⟨max cappedTailAlign.bytes l.align.bytes⟩
+  let tailOffset := TupleHeadLayout.tail_offset l tailAlign
+  let end_ : Size := ⟨tailOffset.bytes + tailSize.bytes⟩
+  let size := Size.align_to end_ align
+  (size, align)
+
 /-- `TupleHeadLayout::head_size_and_align` (`spec/lang/types.md`), the size
 and alignment of a tuple without an unsized tail:
 > "pub fn head_size_and_align(self) -> (Size, Align) {
@@ -356,6 +430,14 @@ and alignment of a tuple without an unsized tail:
 > }" -/
 def TupleHeadLayout.head_size_and_align (l : TupleHeadLayout) : Size × Align :=
   (Size.align_to l.end l.align, l.align)
+
+/-- `LayoutStrategy::is_sized` (`spec/lang/types.md`):
+> "pub fn is_sized(self) -> bool {
+>     matches!(self, LayoutStrategy::Sized(..))
+> }" -/
+def LayoutStrategy.is_sized : LayoutStrategy → Bool
+  | .Sized _ _ => true
+  | _ => false
 
 /-- `LayoutStrategy::expect_size` (`spec/lang/types.md`):
 > "pub fn expect_size(self, msg: &str) -> Size {
@@ -380,6 +462,41 @@ def LayoutStrategy.expect_align (l : LayoutStrategy) (msg : String) : Interp Ali
   match l with
   | .Sized _ align => pure align
   | _ => specPanic ("expect_align called on unsized type: " ++ msg)
+
+/-- `LayoutStrategy::compute_size_and_align` (`spec/lang/types.md`):
+> "pub fn compute_size_and_align<Provenance>(
+>     self,
+>     meta: Option<PointerMeta<Provenance>>,
+>     vtables: impl FnOnce(ThinPointer<Provenance>) -> VTable,
+> ) -> (Size, Align) {
+>     match (self, meta) {
+>         (LayoutStrategy::Sized(size, align), None) => (size, align),
+>         (LayoutStrategy::Slice(elem_size, align), Some(PointerMeta::ElementCount(count))) => (count * elem_size, align),
+>         (LayoutStrategy::TraitObject(..), Some(PointerMeta::VTablePointer(vtable_ptr))) => {
+>             let vtable = vtables(vtable_ptr);
+>             (vtable.size, vtable.align)
+>         }
+>         (LayoutStrategy::Tuple { head, tail }, Some(meta)) => {
+>             let (tail_size, tail_align) = tail.compute_size_and_align(Some(meta), vtables);
+>             head.full_size_and_align(tail_size, tail_align)
+>         }
+>         _ => panic!(\"pointer meta data does not match type\"),
+>     }
+> }" -/
+def LayoutStrategy.compute_size_and_align (vtables : Ptr → Interp VTable) :
+    LayoutStrategy → Option (PointerMeta Prov) → Interp (Size × Align)
+  | .Sized size align, none => pure (size, align)
+  | .Slice elemSize align, some (.ElementCount count) =>
+    let bytes : Int := count * (elemSize.bytes : Int)
+    if 0 ≤ bytes then pure (⟨bytes.toNat⟩, align)
+    else specPanic "Size::from_bytes(count * elem_size.bytes()).unwrap()"
+  | .TraitObject _, some (.VTablePointer vtablePtr) => do
+    let vtable ← vtables vtablePtr
+    pure (vtable.size, vtable.align)
+  | .Tuple head tail, some metadata => do
+    let (tailSize, tailAlign) ← LayoutStrategy.compute_size_and_align vtables tail (some metadata)
+    pure (TupleHeadLayout.full_size_and_align head tailSize tailAlign)
+  | _, _ => specPanic "pointer meta data does not match type"
 
 /-- `Type::layout::<x86_64>` for the interpreted types (`spec/lang/types.md`):
 > "Int(int_type) => Sized(int_type.size, int_type.align::<T>()),
@@ -996,6 +1113,54 @@ def BM.load (mem : BM) (ptr : Ptr) (len : Size) (align : Align) : Interp (List B
       let bytes ← subsliceWithLength allocation.data offset.bytes len.bytes
       pure (bytes, { mem with allocations := allocations })
 
+/-- `ThinPointer::wrapping_offset::<x86_64>` (`spec/mem/pointer.md`):
+> "pub fn wrapping_offset<T: Target>(self, offset: Int) -> Self {
+>     let addr = self.addr + offset;
+>     let addr = addr.bring_in_bounds(Unsigned, T::PTR_SIZE);
+>     ThinPointer { addr, ..self }
+> }" -/
+def ThinPointer.wrapping_offset (ptr : Ptr) (offset : Int) : Ptr :=
+  let addr := ptr.addr + offset
+  let addr := bringInBounds addr .Unsigned x86_64.PTR_SIZE
+  { ptr with addr := addr }
+
+/-- `ThinPointer::widen` (`spec/mem/pointer.md`):
+> "pub fn widen(self, metadata: Option<PointerMeta<Provenance>>) -> Pointer<Provenance> {
+>     Pointer {
+>         thin_pointer: self,
+>         metadata,
+>     }
+> }" -/
+def ThinPointer.widen (ptr : Ptr) (metadata : Option (PointerMeta Prov)) : Pointer Prov :=
+  { thin_pointer := ptr, metadata := metadata }
+
+/-- `BasicMemory::dereferenceable` (`spec/mem/basic.md`):
+> "fn dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Size) -> Result {
+>     self.check_ptr(ptr, len)?;
+>     ret(())
+> }" -/
+def BM.dereferenceable (mem : BM) (ptr : Ptr) (len : Size) : Interp Unit := do
+  let _ ← BM.check_ptr mem ptr len
+  pure ()
+
+/-- `Memory::signed_dereferenceable` for `BasicMemory` (`spec/mem/interface.md`):
+> "fn signed_dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Int) -> Result {
+>     if len > 0 {
+>         self.dereferenceable(ptr, Size::from_bytes(len).unwrap())
+>     } else {
+>         // Compute a pointer to the beginning of the range, and check `dereferenceable` from there.
+>         let begin_ptr = ThinPointer { addr: ptr.addr + len, ..ptr };
+>         // `ptr.addr + len` might be negative, but then `dereferenceable` will surely fail.
+>         self.dereferenceable(begin_ptr, Size::from_bytes(-len).unwrap())
+>     }
+> }" -/
+def BM.signed_dereferenceable (mem : BM) (ptr : Ptr) (len : Int) : Interp Unit :=
+  if len > 0 then
+    BM.dereferenceable mem ptr ⟨len.toNat⟩
+  else
+    let beginPtr : Ptr := { ptr with addr := ptr.addr + len }
+    BM.dereferenceable mem beginPtr ⟨(-len).toNat⟩
+
 /-- `BasicMemory::deallocate` (with the trivial `handle_extra`):
 > "let Some((id, prov_extra)) = ptr.provenance else { throw_ub!(\"deallocating invalid pointer\") };
 >  let mut allocation = self.allocations[id.0];
@@ -1053,6 +1218,20 @@ def CM.load (cm : ConcurrentMemory BM) (ptr : Ptr) (len : Size) (align : Align)
 def CM.deallocate (cm : ConcurrentMemory BM) (ptr : Ptr) (kind : AllocationKind) (size : Size)
     (align : Align) : Interp (ConcurrentMemory BM) := do
   pure { cm with memory := ← BM.deallocate cm.memory ptr kind size align }
+
+/-- `ConcurrentMemory::dereferenceable` (`spec/mem/concurrent.md`):
+> "pub fn dereferenceable(&self, ptr: ThinPointer<M::Provenance>, len: Size) -> Result {
+>     self.memory.dereferenceable(ptr, len)
+> }" -/
+def CM.dereferenceable (cm : ConcurrentMemory BM) (ptr : Ptr) (len : Size) : Interp Unit :=
+  BM.dereferenceable cm.memory ptr len
+
+/-- `ConcurrentMemory::signed_dereferenceable` (`spec/mem/concurrent.md`):
+> "pub fn signed_dereferenceable(&self, ptr: ThinPointer<M::Provenance>, len: Int) -> Result {
+>     self.memory.signed_dereferenceable(ptr, len)
+> }" -/
+def CM.signed_dereferenceable (cm : ConcurrentMemory BM) (ptr : Ptr) (len : Int) : Interp Unit :=
+  BM.signed_dereferenceable cm.memory ptr len
 
 /-- `Access::races`:
 > "if self.ty == AccessType::Load && other.ty == AccessType::Load { return false; }
@@ -1153,6 +1332,42 @@ and `Machine::jump_to_block` (`spec/lang/step/terminators.md`):
 def jumpToBlock (m : Mach) (b : BbName) : Interp Mach :=
   mutateCurFrame m (fun fr => { fr with next_block := b, next_stmt := 0 })
 
+/-- `Machine::vtable_lookup` (`spec/lang/machine.md`):
+> "fn vtable_lookup(&self) -> impl Fn(ThinPointer<M::Provenance>) -> VTable + 'static {
+>     // This copies the data to return a static closure, as it is used in mutate functions, which mutably borrow self.
+>     let ptrs = self.vtable_ptrs;
+>     let vtables = self.prog.vtables;
+>     move |ptr| {
+>         let (name, _) = ptrs.iter().find(|(_, vtable_ptr)| *vtable_ptr == ptr).unwrap();
+>         let vtable = vtables[name];
+>         vtable
+>     }
+> }" -/
+def vtableLookup (m : Mach) (ptr : Ptr) : Interp VTable := do
+  match m.vtable_ptrs.entries.find? (fun (_, (vtablePtr : Ptr)) => decide (vtablePtr = ptr)) with
+  | some (name, _) => mapIndex m.prog.vtables name "vtables[name]"
+  | none => specPanic "ptrs.iter().find(|(_, vtable_ptr)| *vtable_ptr == ptr).unwrap()"
+
+/-- `Machine::compute_size` (`spec/lang/machine.md`):
+> "fn compute_size(&self, layout: LayoutStrategy, meta: Option<PointerMeta<M::Provenance>>) -> Size {
+>     let (size, _) = layout.compute_size_and_align(meta, self.vtable_lookup());
+>     size
+> }" -/
+def computeSize (m : Mach) (layout : LayoutStrategy) (metadata : Option (PointerMeta Prov)) :
+    Interp Size := do
+  let (size, _) ← LayoutStrategy.compute_size_and_align (vtableLookup m) layout metadata
+  pure size
+
+/-- `Machine::compute_align` (`spec/lang/machine.md`):
+> "fn compute_align(&self, layout: LayoutStrategy, meta: Option<PointerMeta<M::Provenance>>) -> Align {
+>     let (_, align) = layout.compute_size_and_align(meta, self.vtable_lookup());
+>     align
+> }" -/
+def computeAlign (m : Mach) (layout : LayoutStrategy) (metadata : Option (PointerMeta Prov)) :
+    Interp Align := do
+  let (_, align) ← LayoutStrategy.compute_size_and_align (vtableLookup m) layout metadata
+  pure align
+
 /-! ## Typed memory access (`spec/lang/representation.md`) -/
 
 /-- `Machine::typed_load`:
@@ -1210,20 +1425,98 @@ def transmute (val : Val) (type1 type2 : «Type») : Interp Val := do
 
 /-! ## Places and values (`spec/lang/step/expressions.md`) -/
 
-/-- `Machine::eval_place` for `PlaceExpr::Local`:
+/-- `Machine::ptr_offset_inbounds` (`spec/lang/step/operators.md`):
+> "fn ptr_offset_inbounds(&self, ptr: ThinPointer<M::Provenance>, offset: Int) -> Result<ThinPointer<M::Provenance>> {
+>     // Ensure dereferenceability.
+>     self.mem.signed_dereferenceable(ptr, offset)?;
+>     // This also ensures that `offset` fits in an `isize`, since no allocation
+>     // can be bigger than `isize`, and it ensures that the arithmetic does not overflow, since no
+>     // allocation wraps around the edge of the address space.
+>     assert!(offset.in_bounds(Signed, M::T::PTR_SIZE));
+>     assert!((ptr.addr + offset).in_bounds(Unsigned, M::T::PTR_SIZE));
+>     // All checked!
+>     ret(ThinPointer { addr: ptr.addr + offset, ..ptr })
+> }" -/
+def ptrOffsetInbounds (m : Mach) (ptr : Ptr) (offset : Int) : Interp Ptr := do
+  CM.signed_dereferenceable m.mem ptr offset
+  if !inBounds offset .Signed x86_64.PTR_SIZE then
+    specPanic "assertion failed: offset.in_bounds(Signed, M::T::PTR_SIZE)"
+  else if !inBounds (ptr.addr + offset) .Unsigned x86_64.PTR_SIZE then
+    specPanic "assertion failed: (ptr.addr + offset).in_bounds(Unsigned, M::T::PTR_SIZE)"
+  else
+    pure { ptr with addr := ptr.addr + offset }
+
+/-- `Machine::eval_place` for `PlaceExpr::Local` and `PlaceExpr::Field`
+(`spec/lang/step/expressions.md`):
 > "let ty = self.cur_frame().func.locals[name];
 >  let Some(ptr) = self.cur_frame().locals.get(name) else {
 >      throw_ub!(\"access to a dead local\");
 >  };
->  ret((Place { ptr: ptr.widen(None), aligned: true }, ty))" -/
+>  ret((Place { ptr: ptr.widen(None), aligned: true }, ty))"
+> "fn eval_place(&mut self, PlaceExpr::Field { root, field }: PlaceExpr) -> Result<(Place<M>, Type)> {
+>     let (root, ty) = self.eval_place(root)?;
+>     let (offset, field_ty) = match ty {
+>         Type::Tuple { sized_fields, unsized_field, sized_head_layout } => {
+>             if field >= 0 && field < sized_fields.len() {
+>                 sized_fields[field]
+>             } else if field == sized_fields.len() {
+>                 let tail_ty = unsized_field.expect(\"field projection to non-existing unsized tail\");
+>                 let tail_align = self.compute_align(tail_ty.layout::<M::T>(), root.ptr.metadata);
+>                 let offset = sized_head_layout.tail_offset(tail_align);
+>                 (offset, tail_ty)
+>             } else {
+>                 panic!(\"field projection to invalid field\");
+>             }
+>         }
+>         Type::Union { fields, .. } => fields[field],
+>         _ => panic!(\"field projection on non-projectable type\"),
+>     };
+>     assert!(offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata));
+>
+>     let ptr = self.ptr_offset_inbounds(root.ptr.thin_pointer, offset.bytes())?;
+>     let ptr = if !field_ty.layout::<M::T>().is_sized() {
+>         // Unsized fields should retain the metadata
+>         ptr.widen(root.ptr.metadata)
+>     } else {
+>         ptr.widen(None)
+>     };
+>     ret((Place { ptr, ..root }, field_ty))
+> }" -/
 def evalPlace (m : Mach) : PlaceExpr → Interp (Place BM × «Type»)
   | .Local name => do
     let fr ← curFrame m
     let ty ← mapIndex fr.func.locals name "self.cur_frame().func.locals[name]"
     match mapGet fr.locals name with
     | none => ub "access to a dead local"
-    | some ptr => pure ({ ptr := { thin_pointer := ptr, metadata := none }, aligned := true }, ty)
-  | _ => unsupported "eval_place for a non-Local place expression"
+    | some ptr => pure ({ ptr := ThinPointer.widen ptr none, aligned := true }, ty)
+  | .Field root field => do
+    let (root, ty) ← evalPlace m root
+    let (offset, fieldTy) ← match ty with
+      | .Tuple sizedFields sizedHeadLayout unsizedField =>
+        if 0 ≤ field ∧ field < (sizedFields.length : Int) then
+          listIndex sizedFields field "sized_fields[field]"
+        else if field = (sizedFields.length : Int) then
+          match unsizedField with
+          | none => specPanic "field projection to non-existing unsized tail"
+          | some tailTy => do
+            let tailAlign ← computeAlign m (← Type.layout tailTy) root.ptr.metadata
+            let offset := TupleHeadLayout.tail_offset sizedHeadLayout tailAlign
+            pure (offset, tailTy)
+        else
+          specPanic "field projection to invalid field"
+      | .Union fields _ _ _ => listIndex fields field "fields[field]"
+      | _ => specPanic "field projection on non-projectable type"
+    let rootSize ← computeSize m (← Type.layout ty) root.ptr.metadata
+    if !(offset.bytes ≤ rootSize.bytes) then
+      specPanic "assertion failed: offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata)"
+    else do
+      let ptr ← ptrOffsetInbounds m root.ptr.thin_pointer (offset.bytes : Int)
+      let ptr := if !LayoutStrategy.is_sized (← Type.layout fieldTy) then
+          ThinPointer.widen ptr root.ptr.metadata
+        else
+          ThinPointer.widen ptr none
+      pure ({ root with ptr := ptr }, fieldTy)
+  | _ => unsupported "eval_place for a place expression other than Local or Field"
 
 /-- `Machine::place_load`:
 > "if !place.aligned { throw_ub!(\"loading from a place based on a misaligned pointer\"); }
@@ -1498,6 +1791,19 @@ def evalIntBinOp (op : IntBinOp) (left right : Int) (leftTy : IntType) : Interp 
   | .BitOr => pure (intBitOr left right)
   | .BitXor => pure (intBitXor left right)
 
+/-- The arithmetic operation of `Machine::eval_bin_op` for
+`BinOp::IntWithOverflow` (`spec/lang/step/operators.md`):
+> "let result = match op {
+>     IntBinOpWithOverflow::Add => left + right,
+>     IntBinOpWithOverflow::Sub => left - right,
+>     IntBinOpWithOverflow::Mul => left * right,
+> };" -/
+def evalIntBinOpWithOverflow (op : IntBinOpWithOverflow) (left right : Int) : Int :=
+  match op with
+  | .Add => left + right
+  | .Sub => left - right
+  | .Mul => left * right
+
 /-- `Machine::eval_rel_op` (`spec/lang/step/operators.md`), which turns the
 outcome of a comparison into the result value:
 > "fn eval_rel_op(rel: RelOp, ord: std::cmp::Ordering) -> (Value<M>, Type) {
@@ -1536,7 +1842,8 @@ def evalRelOp (rel : RelOp) (ord : Ordering) : Val × «Type» :=
       | .gt => 1
     (.Int val, .Int IntType.I8)
 
-/-- `Machine::eval_bin_op` for `BinOp::Int` and `BinOp::Rel` (`spec/lang/step/operators.md`):
+/-- `Machine::eval_bin_op` for `BinOp::Int`, `BinOp::IntWithOverflow`, and
+`BinOp::Rel` (`spec/lang/step/operators.md`):
 > "let Type::Int(int_ty) = l_ty else { panic!(\"non-integer input to integer operation\") };
 >  let Value::Int(left) = left else { panic!(..) };
 >  let Value::Int(right) = right else { panic!(..) };
@@ -1545,6 +1852,31 @@ def evalRelOp (rel : RelOp) (ord : Ordering) : Val × «Type» :=
 >  // Put the result into the right range (in case of overflow).
 >  let result = int_ty.bring_in_bounds(result);
 >  ret((Value::Int(result), Type::Int(int_ty)))"
+for `BinOp::IntWithOverflow`:
+> "fn eval_bin_op(
+>     &self,
+>     BinOp::IntWithOverflow(op): BinOp,
+>     (left, l_ty): (Value<M>, Type),
+>     (right, _r_ty): (Value<M>, Type)
+> ) -> Result<(Value<M>, Type)> {
+>     let Type::Int(int_ty) = l_ty else { panic!(\"non-integer input to integer operation\") };
+>     let Value::Int(left) = left else { panic!(\"non-integer input to integer operation\") };
+>     let Value::Int(right) = right else { panic!(\"non-integer input to integer operation\") };
+>
+>     // Perform the operation.
+>     let result = match op {
+>         IntBinOpWithOverflow::Add => left + right,
+>         IntBinOpWithOverflow::Sub => left - right,
+>         IntBinOpWithOverflow::Mul => left * right,
+>     };
+>     let overflow = !int_ty.can_represent(result);
+>     // Put the result into the right range (in case of overflow).
+>     let result = int_ty.bring_in_bounds(result);
+>     // Pack result and overflow bool into tuple.
+>     let value = Value::Tuple(list![Value::Int::<M>(result), Value::Bool::<M>(overflow)]);
+>     let ty = int_ty.with_overflow::<M::T>();
+>     ret((value, ty))
+> }"
 and, for `BinOp::Rel`:
 > "fn eval_bin_op(
 >     &self,
@@ -1575,19 +1907,34 @@ def evalBinOp (op : BinOp) (l : Val × «Type») (r : Val × «Type») : Interp 
     let result ← evalIntBinOp op left right intTy
     pure (.Int (IntType.bring_in_bounds intTy result), .Int intTy)
   | .Int _, _, _ => specPanic "non-integer input to integer operation"
+  | .IntWithOverflow op, (.Int left, .Int intTy), (.Int right, _) => do
+    let result := evalIntBinOpWithOverflow op left right
+    let overflow := !IntType.can_represent intTy result
+    let result := IntType.bring_in_bounds intTy result
+    let value : Val := .Tuple [.Int result, .Bool overflow]
+    let ty ← IntType.with_overflow intTy
+    pure (value, ty)
+  | .IntWithOverflow _, _, _ => specPanic "non-integer input to integer operation"
   | .Rel relOp, (left, lTy), (right, _) =>
     match lTy, left, right with
     | .Int _, .Int left, .Int right => pure (evalRelOp relOp (intCmp left right))
     | .Bool, .Bool left, .Bool right => pure (evalRelOp relOp (boolCmp left right))
     | .Ptr _, .Ptr _, .Ptr _ => unsupported "BinOp::Rel on pointers (compare_ptr)"
     | _, _, _ => specPanic "relational operator on incomparable type or value-type mismatch"
-  | _, _, _ => unsupported "eval_bin_op for an operator outside BinOp::Int and BinOp::Rel"
+  | _, _, _ => unsupported "eval_bin_op for an operator outside BinOp::Int, BinOp::IntWithOverflow, and BinOp::Rel"
 
 /-! ## Value expressions (`spec/lang/step/expressions.md`) -/
 
-/-- `Machine::eval_value` for `Constant`, `Load`, `UnOp`, and `BinOp`:
+mutual
+
+/-- `Machine::eval_value` for `Constant`, `Tuple`, `Load`, `UnOp`, and `BinOp`:
 > "fn eval_value(&mut self, ValueExpr::Constant(constant, ty): ValueExpr) -> .. {
 >     ret((self.eval_constant(constant)?, ty))
+> }
+> ..
+> fn eval_value(&mut self, ValueExpr::Tuple(exprs, ty): ValueExpr) -> Result<(Value<M>, Type)> {
+>     let vals = exprs.try_map(|e| self.eval_value(e))?.map(|e| e.0);
+>     ret((Value::Tuple(vals), ty))
 > }
 > ..
 > fn eval_value(&mut self, ValueExpr::Load { source }: ValueExpr) -> .. {
@@ -1610,6 +1957,9 @@ def evalBinOp (op : BinOp) (l : Val × «Type») (r : Val × «Type») : Interp 
 > }" -/
 def evalValue (m : Mach) : ValueExpr → Interp ((Val × «Type») × Mach)
   | .Constant c ty => do pure ((← evalConstant c, ty), m)
+  | .Tuple exprs ty => do
+    let (vals, m) ← evalValues m exprs
+    pure ((.Tuple vals, ty), m)
   | .Load source => do
     let (place, ty) ← evalPlace m source
     let (v, m) ← placeLoad m place ty
@@ -1622,6 +1972,18 @@ def evalValue (m : Mach) : ValueExpr → Interp ((Val × «Type») × Mach)
     let (r, m) ← evalValue m right
     pure (← evalBinOp operator l r, m)
   | _ => unsupported "eval_value for an expression outside the fragment"
+
+/-- The element loop of `Machine::eval_value` for `ValueExpr::Tuple`
+(`spec/lang/step/expressions.md`):
+> "let vals = exprs.try_map(|e| self.eval_value(e))?.map(|e| e.0);" -/
+def evalValues (m : Mach) : List ValueExpr → Interp (List Val × Mach)
+  | [] => pure ([], m)
+  | e :: es => do
+    let ((val, _), m) ← evalValue m e
+    let (vals, m) ← evalValues m es
+    pure (val :: vals, m)
+
+end
 
 /-! ## Statements (`spec/lang/step/statements.md`) -/
 

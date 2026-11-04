@@ -149,16 +149,17 @@ theorem evalReturn_callee {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     (haddr : ctx.addrs.getD 0 0 % ((itOf d).size.bytes : Int) = 0)
     (r : Nat) (a : Gen.Allocation) (hp : ctx.retPtr.provenance = some (⟨(r : Int)⟩, ()))
     (hr : ctx.base[r]? = some a) (hlive : a.live = true) (haddrr : a.addr = ctx.retPtr.addr)
-    (hlenr : a.data.length = (itOf d).size.bytes)
+    (hlenr : a.data.length = tyBytes (tyOf d))
     (halr : ctx.retPtr.addr % ((itOf d).size.bytes : Int) = 0) :
-    (∀ sc, locals[0]? = some (.init (.scalar sc)) →
+    (∀ v, locals[0]? = some (.init v) →
       ∃ m', evalReturn m = .ok m' ∧
         Shape m' ctx [{ ctx.caller with next_block := ctx.nextBlock, next_stmt := 0 }]
-          (ctx.base.set r { a with data := scalarBytes (itOf d) sc.bits } ++
+          (ctx.base.set r { a with data := declSlotData d (.init v) } ++
             (localAllocs ctx body.localDecls locals).map kill)) ∧
     (locals[0]? = some .uninit → ∃ msg, evalReturn m = .error (.ub msg)) := by
   have hn0 : 0 < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
-  have hT := h.decl_frag 0 d hd
+  have hT := h.decl_localTy 0 d hd
+  have hdScalar := h.decl_scalar 0 d hd
   have hspec := translateFn_spec body f h.hf
   have hloc0 := (hspec.2.1 0 d hd).2
   have hact : activeThread m =
@@ -196,12 +197,10 @@ theorem evalReturn_callee {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
       hlocPtr]
     rfl
   constructor
-  · intro sc hsc
-    rw [hsc] at hs0
+  · intro v hv
+    rw [hv] at hs0
     cases hs0
-    obtain ⟨_, hb⟩ := hslot0
-    obtain ⟨m4, hm4, hs4⟩ := typedLoad_local_frag hs3 0 hT sc.bits hb
-      (by simpa [slotData] using hL0) _ hal0
+    obtain ⟨m4, hm4, hs4⟩ := typedLoad_local_localTy hs3 0 d hdScalar v hslot0 hL0 _ hal0
     have hlenL : (localAllocs ctx body.localDecls locals).length = body.localDecls.length := by
       simp [localAllocs, localAllocsFrom_length, h.nlocals]
     obtain ⟨cm5, hcm5, hcm5mem⟩ := deallocAll_callee ctx
@@ -213,18 +212,19 @@ theorem evalReturn_callee {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
         intro i hi
         rw [List.mem_range] at hi
         obtain ⟨di, sloti, hdi, hsi⟩ := h.slot_exists i hi
-        refine ⟨tyOf di, itOf di, _, (hspec.2.1 i di hdi).2, h.decl_frag i di hdi,
-          h.localAllocs_get i di sloti hdi hsi, rfl, rfl, rfl, slotData_length _ _, rfl⟩)
+        refine ⟨tyOf di, itOf di, _, (hspec.2.1 i di hdi).2, h.decl_localTy i di hdi,
+          h.localAllocs_get i di sloti hdi hsi, rfl, rfl, rfl,
+          declSlotData_length (h.decl_scalar i di hdi) sloti, rfl⟩)
     rw [← hlenL, killAt_range] at hcm5mem
     have hs5 : Shape { m4 with mem := cm5 } ctx [ctx.caller]
         (ctx.base ++ (localAllocs ctx body.localDecls locals).map kill) :=
       ⟨hs4.threads, hs4.active, hcm5mem⟩
     have hact5 : activeThread { m4 with mem := cm5 } = .ok (thread1 ctx [ctx.caller]) := by
       simp [activeThread, listIndex, hs4.threads, hs4.active]
-    have hst := typedStore_base_frag hs5 ctx.retPtr r a hp hr hlive haddrr hT hlenr sc.bits hb
-      ⟨(itOf d).size.bytes⟩ (by simp only [Align.is_aligned, halr]; rfl)
-    have hs6 := withMem_shape (allocs' := ctx.base.set r { a with data := scalarBytes (itOf d) sc.bits } ++
-        (localAllocs ctx body.localDecls locals).map kill) hs5 ⟨.Store, .None, ctx.retPtr.addr, (itOf d).size⟩
+    obtain ⟨acc, hst⟩ := typedStore_base_localTy hs5 ctx.retPtr r a hp hr hlive haddrr d hdScalar
+      hlenr v hslot0 ⟨(itOf d).size.bytes⟩ (by simp only [Align.is_aligned, halr]; rfl)
+    have hs6 := withMem_shape (allocs' := ctx.base.set r { a with data := declSlotData d (.init v) } ++
+        (localAllocs ctx body.localDecls locals).map kill) hs5 acc
     obtain ⟨m7, hm7, hs7⟩ := mutateCurFrame_single hs6
       (fun fr => { fr with next_block := ctx.nextBlock, next_stmt := 0 })
     refine ⟨m7, ?_, hs7⟩
@@ -236,8 +236,7 @@ theorem evalReturn_callee {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
   · intro hu
     rw [hu] at hs0
     cases hs0
-    obtain ⟨msg, hmsg⟩ := typedLoad_local_frag_uninit hs3 0 hT
-      (by simpa [slotData] using hL0) _ hal0
+    obtain ⟨msg, hmsg⟩ := typedLoad_local_localTy_uninit hs3 0 d hdScalar hL0 _ hal0
     exact ⟨msg, by rw [hprefix, hmsg]; rfl⟩
 
 /-! ## Shapes of fragment statements and terminators -/
@@ -440,7 +439,7 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
       (ctx.base ++ localAllocs ctx body.localDecls s.frame.locals) :=
     ⟨hrel.threads, hrel.active, hrel.allocs⟩
   have hframe : FrameOk body f ctx s.frame.locals (resetPick m) s.frame.blockIdx s.frame.stmtIdx :=
-    ⟨hf, resetPick_shape hshape, hrel.nlocals, hrel.slots⟩
+    ⟨hf, resetPick_shape hshape, hrel.nlocals, hrel.slots, hrel.addrs⟩
   have hslotsA : SlotsOk body.localDecls s.frame.locals := hrel.slots
   rw [step_callee hshape tb hgetb]
   have hstmt_le := hrel.stmt bb hbb
@@ -468,77 +467,120 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
       cases hdi : body.localDecls[i]? with
       | none => simp [hdi] at hok
       | some d =>
-        obtain ⟨rvB, hMok, hMnone, hAok, hAnone⟩ : ∃ rvB : Option Nat,
-            (∀ r, rvB = some r →
-              ∃ m', evalStatement (resetPick m) (.Assign (.Local (localName i)) e) = .ok m' ∧
-                FrameOk body f ctx (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩)))
-                  m' s.frame.blockIdx s.frame.stmtIdx) ∧
-            (rvB = none →
-              ∃ msg, evalStatement (resetPick m) (.Assign (.Local (localName i)) e) = .error (.ub msg)) ∧
-            (∀ r, rvB = some r →
-              evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ body.localDecls body.layouts =
-                .tau (.running (advanceStmt s
-                  (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩)))
-                  { s.memory with borrows := [] }))) ∧
-            (rvB = none →
-              evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ body.localDecls body.layouts =
-                MirStepNode.fail .ub) := by
-          cases hb : isBoolTy d.ty with
-          | true =>
-            have hokB : rvalueOkB body.localDecls rv = true := by simpa [hdi, hb] using hok
-            obtain ⟨hMok, hMnone⟩ := evalStatement_assignB hframe i d hdi hb rv hokB e he
-            obtain ⟨hAok, hAnone⟩ := evalStmt_assignB s body.localDecls body.layouts i rv span
-              hslotsA hrel.nlocals d hdi hb hokB hrel.borrows hrel.protectors
-            exact ⟨_, hMok, hMnone, hAok, hAnone⟩
-          | false =>
-            cases ho : isOrderingTy d.ty with
+        cases htup : intBoolTupleOf d.ty with
+        | some it =>
+          have hb := intBoolTupleOf_isBoolTy htup
+          have ho := intBoolTupleOf_isOrderingTy htup
+          have hitd : itOf d = it := (tyOf_tuple htup).2
+          have htup' : intBoolTupleOf d.ty = some (itOf d) := by rw [hitd]; exact htup
+          have hokT : rvalueOkTuple body.localDecls (itOf d) rv = true := by
+            rw [hitd]; simpa [hdi, hb, ho, htup] using hok
+          have hgood := hframe.decl_good i d hdi
+          obtain ⟨hMok, hMnone⟩ := evalStatement_assignTuple hframe i d hdi htup' rv hokT e he
+          obtain ⟨hAok, hAnone⟩ := evalStmt_assignTuple s body.localDecls body.layouts i rv span
+            hslotsA hrel.nlocals d hdi hgood hokT hrel.borrows hrel.protectors
+          cases hr : rvTupleBits s.frame.locals (itOf d) rv with
+          | none =>
+            rw [hAnone hr]
+            obtain ⟨msg, hmsg⟩ := hMnone hr
+            exact StepRel.ub' msg (by simp [hne, listIndex_nat _ _ _ htst, hmsg])
+          | some pair =>
+            obtain ⟨bits, b⟩ := pair
+            rw [hAok bits b hr]
+            obtain ⟨m3, hm3, h3⟩ := hMok bits b hr
+            obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3.shape
+            refine StepRel.tau' m4 (by simp [hne, listIndex_nat _ _ _ htst, hm3, hm4, check_after h4]) ?_
+            have hn' : (s.frame.locals.set i
+                (.init (.aggregate 0 [.scalar ⟨bits, (itOf d).size.bytes⟩, .scalar ⟨b, 1⟩]))).length =
+                body.localDecls.length := by
+              simp [hrel.nlocals]
+            exact {
+              threads := h4.threads
+              active := h4.active
+              allocs := h4.allocs
+              blk := hrel.blk
+              stmt := hstmt'
+              nlocals := hn'
+              slots := h3.slots
+              addrs := hrel.addrs
+              ret := hrel.ret
+              borrows := rfl
+              callStack := hrel.callStack
+              activeCallee := hrel.activeCallee
+              protectors := hrel.protectors
+              callerLocals := hrel.callerLocals }
+        | none =>
+          obtain ⟨rvB, hMok, hMnone, hAok, hAnone⟩ : ∃ rvB : Option Nat,
+              (∀ r, rvB = some r →
+                ∃ m', evalStatement (resetPick m) (.Assign (.Local (localName i)) e) = .ok m' ∧
+                  FrameOk body f ctx (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩)))
+                    m' s.frame.blockIdx s.frame.stmtIdx) ∧
+              (rvB = none →
+                ∃ msg, evalStatement (resetPick m) (.Assign (.Local (localName i)) e) = .error (.ub msg)) ∧
+              (∀ r, rvB = some r →
+                evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ body.localDecls body.layouts =
+                  .tau (.running (advanceStmt s
+                    (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩)))
+                    { s.memory with borrows := [] }))) ∧
+              (rvB = none →
+                evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ body.localDecls body.layouts =
+                  MirStepNode.fail .ub) := by
+            cases hb : isBoolTy d.ty with
             | true =>
-              have hokO : rvalueOkO body.localDecls rv = true := by simpa [hdi, hb, ho] using hok
-              obtain ⟨hMok, hMnone⟩ := evalStatement_assignO hframe i d hdi ho rv hokO e he
-              obtain ⟨hAok, hAnone⟩ := evalStmt_assignO s body.localDecls body.layouts i rv span
-                hslotsA hrel.nlocals d hdi ho hokO hrel.borrows hrel.protectors
+              have hokB : rvalueOkB body.localDecls rv = true := by simpa [hdi, hb] using hok
+              obtain ⟨hMok, hMnone⟩ := evalStatement_assignB hframe i d hdi hb rv hokB e he
+              obtain ⟨hAok, hAnone⟩ := evalStmt_assignB s body.localDecls body.layouts i rv span
+                hslotsA hrel.nlocals d hdi hb hokB hrel.borrows hrel.protectors
               exact ⟨_, hMok, hMnone, hAok, hAnone⟩
             | false =>
-              cases hit : intTypeOf d.ty with
-              | none => simp [hdi, hb, ho, hit] at hok
-              | some it =>
-                have hitd : itOf d = it := (tyOf_int hit).2
-                have hok' : rvalueOk body.localDecls (itOf d) rv = true := by
-                  rw [hitd]; simpa [hdi, hb, ho, hit] using hok
-                have hint : intTypeOf d.ty = some (itOf d) := by rw [hitd]; exact hit
-                have hgood := hframe.decl_good i d hdi
-                obtain ⟨hMok, hMnone⟩ := evalStatement_assign hframe i d hdi hint rv hok' e he
-                obtain ⟨hAok, hAnone⟩ := evalStmt_assign s body.localDecls body.layouts i rv span
-                  hslotsA hrel.nlocals d hdi hgood hok' hrel.borrows hrel.protectors
+              cases ho : isOrderingTy d.ty with
+              | true =>
+                have hokO : rvalueOkO body.localDecls rv = true := by simpa [hdi, hb, ho] using hok
+                obtain ⟨hMok, hMnone⟩ := evalStatement_assignO hframe i d hdi ho rv hokO e he
+                obtain ⟨hAok, hAnone⟩ := evalStmt_assignO s body.localDecls body.layouts i rv span
+                  hslotsA hrel.nlocals d hdi ho hokO hrel.borrows hrel.protectors
                 exact ⟨_, hMok, hMnone, hAok, hAnone⟩
-        cases hr : rvB with
-        | none =>
-          rw [hAnone hr]
-          obtain ⟨msg, hmsg⟩ := hMnone hr
-          exact StepRel.ub' msg (by simp [hne, listIndex_nat _ _ _ htst, hmsg])
-        | some r =>
-          rw [hAok r hr]
-          obtain ⟨m3, hm3, h3⟩ := hMok r hr
-          obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3.shape
-          refine StepRel.tau' m4 (by simp [hne, listIndex_nat _ _ _ htst, hm3, hm4, check_after h4]) ?_
-          have hn' : (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩))).length =
-              body.localDecls.length := by
-            simp [hrel.nlocals]
-          exact {
-            threads := h4.threads
-            active := h4.active
-            allocs := h4.allocs
-            blk := hrel.blk
-            stmt := hstmt'
-            nlocals := hn'
-            slots := h3.slots
-            addrs := hrel.addrs
-            ret := hrel.ret
-            borrows := rfl
-            callStack := hrel.callStack
-            activeCallee := hrel.activeCallee
-            protectors := hrel.protectors
-            callerLocals := hrel.callerLocals }
+              | false =>
+                cases hit : intTypeOf d.ty with
+                | none => simp [hdi, hb, ho, htup, hit] at hok
+                | some it =>
+                  have hitd : itOf d = it := (tyOf_int hit).2
+                  have hok' : rvalueOk body.localDecls (itOf d) rv = true := by
+                    rw [hitd]; simpa [hdi, hb, ho, htup, hit] using hok
+                  have hint : intTypeOf d.ty = some (itOf d) := by rw [hitd]; exact hit
+                  have hgood := hframe.decl_good i d hdi
+                  obtain ⟨hMok, hMnone⟩ := evalStatement_assign hframe i d hdi hint rv hok' e he
+                  obtain ⟨hAok, hAnone⟩ := evalStmt_assign s body.localDecls body.layouts i rv span
+                    hslotsA hrel.nlocals d hdi hgood hok' hrel.borrows hrel.protectors
+                  exact ⟨_, hMok, hMnone, hAok, hAnone⟩
+          cases hr : rvB with
+          | none =>
+            rw [hAnone hr]
+            obtain ⟨msg, hmsg⟩ := hMnone hr
+            exact StepRel.ub' msg (by simp [hne, listIndex_nat _ _ _ htst, hmsg])
+          | some r =>
+            rw [hAok r hr]
+            obtain ⟨m3, hm3, h3⟩ := hMok r hr
+            obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3.shape
+            refine StepRel.tau' m4 (by simp [hne, listIndex_nat _ _ _ htst, hm3, hm4, check_after h4]) ?_
+            have hn' : (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩))).length =
+                body.localDecls.length := by
+              simp [hrel.nlocals]
+            exact {
+              threads := h4.threads
+              active := h4.active
+              allocs := h4.allocs
+              blk := hrel.blk
+              stmt := hstmt'
+              nlocals := hn'
+              slots := h3.slots
+              addrs := hrel.addrs
+              ret := hrel.ret
+              borrows := rfl
+              callStack := hrel.callStack
+              activeCallee := hrel.activeCallee
+              protectors := hrel.protectors
+              callerLocals := hrel.callerLocals }
     · ------------------------------------------------------------ placeMention
       obtain ⟨kind, span⟩ := st
       simp only at hkind
@@ -621,7 +663,7 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
       have hn0 : 0 < body.localDecls.length := by omega
       obtain ⟨d0, hd0⟩ : ∃ d, body.localDecls[0]? = some d := ⟨_, List.getElem?_eq_getElem hn0⟩
       obtain ⟨r0, a0, hp, hr0, hlive, haddrr, hlenr, halr⟩ := hrel.ret d0 hd0
-      have hRet := evalReturn_callee hframe d0 hd0 (hrel.addrs 0 d0 hd0) r0 a0 hp hr0 hlive haddrr
+      have hRet := evalReturn_callee hframe d0 hd0 (hrel.addrs 0 d0 hd0).1 r0 a0 hp hr0 hlive haddrr
         hlenr halr
       obtain ⟨_, slot0, _, hs0⟩ := hframe.slot_exists 0 hn0
       have hslot0 := hrel.slots 0 d0 slot0 hd0 hs0
@@ -632,19 +674,14 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
         rw [hA]
         obtain ⟨msg, hmsg⟩ := hRet.2 hs0
         exact StepRel.ub' msg (by simp [htt, Interp.evalTerminator, hmsg])
-      | .init (.scalar sc), hsc, hs0 =>
-        obtain ⟨hsz0, _⟩ := hsc
-        have hsz : sc.sizeBytes = (itOf d0).size.bytes :=
-          hsz0.trans (hframe.decl_frag 0 d0 hd0).tyBytes
+      | .init v, hv0, hs0 =>
         have hA : evalTerminator s bb.terminator (some body) =
-            MirStepNode.retNormal (.scalar sc) s.memory := by
+            MirStepNode.retNormal v s.memory := by
           simp [MirSemantics.evalTerminator, hk, get?, hs0, hrel.callStack]
         rw [hA]
-        obtain ⟨m', hm', hs'⟩ := hRet.1 sc hs0
-        have hv : Value.scalar sc = .scalar ⟨sc.bits, (itOf d0).size.bytes⟩ := by
-          rw [← hsz]
+        obtain ⟨m', hm', hs'⟩ := hRet.1 v hs0
         exact StepRel.ret' m' (by simp [htt, Interp.evalTerminator, hm', check_after hs'])
-          ⟨sc.bits, r0, a0, d0, hd0, hv, hp, hr0, hs'.threads, hs'.allocs⟩
+          ⟨r0, a0, d0, hd0, hv0, hp, hr0, hs'.threads, hs'.allocs⟩
 
 /-! ## Entry block (`f.start`) -/
 
@@ -713,11 +750,17 @@ theorem initLocalsAux_one_spec (ds : List LocalDecl) (vs : List Value)
       obtain ⟨hv, hvs⟩ := h
       obtain ⟨hlen, hslots⟩ := ih vs hvs
       have hvslot : SlotOk (tyOf d) (.init v) := by
-        cases v with
-        | scalar sc =>
+        match v, hv with
+        | .scalar sc, hv =>
           simp only [argOk, Bool.and_eq_true, decide_eq_true_eq] at hv
           exact ⟨hv.1, (validBits_iff _ _).mp hv.2⟩
-        | _ => simp [argOk] at hv
+        | .aggregate 0 [.scalar sc0, .scalar sc1], hv =>
+          simp only [argOk] at hv
+          cases ht : tupleIntOfTy (tyOf d) with
+          | none => simp [ht] at hv
+          | some it =>
+            simp only [ht, Bool.and_eq_true, decide_eq_true_eq] at hv
+            exact ⟨it, ht, hv.1.1.1, hv.1.1.2, hv.1.2, hv.2⟩
       have hcons : initLocalsAux 1 (d :: ds) (v :: vs) = .init v :: initLocalsAux 1 ds vs := rfl
       rw [hcons]
       refine ⟨by simp [hlen], fun k d' slot' hd' hs' => ?_⟩

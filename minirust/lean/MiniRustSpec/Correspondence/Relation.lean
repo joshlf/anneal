@@ -52,27 +52,46 @@ open MiniRustSpec.LibSpecr
 open MiniRustSpec.Interp
 
 /-- MiniRust storage integer type of a MIR local declaration: its own integer
-type, or `u8` (the default) for a `bool` or `core::cmp::Ordering` local, which
-occupies one byte with alignment one just like a `u8` (`Type::layout` gives
-`Bool` the layout `Sized(Size::from_bytes_const(1), Align::ONE)`, and
-`orderingTy` has size and alignment 1). -/
-def itOf (d : LocalDecl) : Gen.IntType := (intTypeOf d.ty).getD ⟨.Unsigned, ⟨1⟩⟩
+type, the field-0 integer type `it` for an `(it, bool)` 2-tuple local (whose
+alignment is `it.size.bytes`), or `u8` (the default) for a `bool` or
+`core::cmp::Ordering` local, which occupies one byte with alignment one just
+like a `u8` (`Type::layout` gives `Bool` the layout
+`Sized(Size::from_bytes_const(1), Align::ONE)`, and `orderingTy` has size and
+alignment 1). -/
+def itOf (d : LocalDecl) : Gen.IntType :=
+  ((intTypeOf d.ty).or (intBoolTupleOf d.ty)).getD ⟨.Unsigned, ⟨1⟩⟩
 
 /-- MiniRust type of a fragment local declaration (`Type::Int(..)`,
-`Type::Bool`, or `orderingTy`, as `minimize` translates it); the default is
-never used for fragment bodies. -/
+`Type::Bool`, `orderingTy`, or `intBoolTupleTy`, as `minimize` translates it);
+the default is never used for fragment bodies. -/
 def tyOf (d : LocalDecl) : Gen.Type := (scalarTypeOf d.ty).getD (.Int (itOf d))
 
 /-- Byte size of a fragment type. -/
 def tyBytes : Gen.Type → Nat
   | .Int it => it.size.bytes
   | .Enum _ _ _ size _ => size.bytes
+  | .Tuple _ ⟨end_, _, _⟩ _ => end_.bytes
   | _ => 1
+
+/-- Whether a MiniRust type is `intBoolTupleTy it`, returning `it`. -/
+def tupleIntOfTy : Gen.Type → Option Gen.IntType
+  | .Tuple [(⟨0⟩, .Int it), (off1, .Bool)] ⟨end_, align, none⟩ none =>
+    if off1 = it.size ∧ end_ = ⟨it.size.bytes + it.size.bytes⟩ ∧ align = ⟨it.size.bytes⟩ then
+      some it
+    else none
+  | _ => none
 
 /-- `Type::encode` of `Value::Int(int_from_bits(bits))` at `Type::Int(it)`:
 little-endian bytes without provenance. -/
 def scalarBytes (it : Gen.IntType) (bits : Nat) : List Byte :=
   (leBytes bits it.size.bytes).map (fun b => .Init b none)
+
+/-- `Type::encode` of `Value::Tuple([Value::Int(intFromBits bits it), Value::Bool(b == 1)])`
+at `intBoolTupleTy it`: field 0's `it.size.bytes` little-endian bytes at offset
+`0`, field 1's `0`/`1` byte at offset `it.size.bytes`, and `it.size.bytes - 1`
+trailing `AbstractByte::Uninit` padding bytes (`spec/lang/representation.md`). -/
+def tupleBytes (it : Gen.IntType) (bits b : Nat) : List Byte :=
+  scalarBytes it bits ++ scalarBytes u8Ty b ++ List.replicate (it.size.bytes - 1) .Uninit
 
 /-- Whether a decoding result is a value (`Some(_)`, not `None` or a stop). -/
 def decodesOk : Interp (Option Val) → Bool
@@ -112,17 +131,34 @@ instance (T : Gen.Type) (bits : Nat) : Decidable (ValidBits T bits) :=
 /-- The contents of a freshly allocated MiniRust local: all `Uninit`. -/
 def uninitBytes (it : Gen.IntType) : List Byte := List.replicate it.size.bytes .Uninit
 
-/-- MiniRust bytes corresponding to an Anneal local slot (meaningful for
-fragment slots, see `SlotOk`). -/
+/-- MiniRust bytes corresponding to an Anneal scalar local slot (meaningful for
+scalar fragment slots, see `SlotOk`). -/
 def slotData (it : Gen.IntType) : LocalSlot → List Byte
   | .init (.scalar sc) => scalarBytes it sc.bits
   | _ => uninitBytes it
 
-/-- Fragment slots of type `T`: live, and holding either nothing or a scalar
-of `T`'s size whose bit pattern encodes a value of `T` (`ValidBits`). -/
+/-- MiniRust bytes corresponding to an Anneal `(it, bool)` 2-tuple local slot. -/
+def tupleSlotData (it : Gen.IntType) : LocalSlot → List Byte
+  | .init (.aggregate 0 [.scalar sc0, .scalar sc1]) => tupleBytes it sc0.bits sc1.bits
+  | _ => List.replicate (it.size.bytes + it.size.bytes) .Uninit
+
+/-- MiniRust bytes corresponding to an Anneal local slot of declaration `d`. -/
+def declSlotData (d : LocalDecl) (slot : LocalSlot) : List Byte :=
+  match intBoolTupleOf d.ty with
+  | some it => tupleSlotData it slot
+  | none => slotData (itOf d) slot
+
+/-- Fragment slots of type `T`: live, and holding either nothing, a scalar of
+`T`'s size whose bit pattern encodes a value of `T` (`ValidBits`), or (when
+`T = intBoolTupleTy it`) a 2-tuple aggregate `(sc0, sc1)` of an in-range integer
+scalar `sc0` of size `it.size.bytes` and a boolean scalar `sc1` (`0` or `1`). -/
 def SlotOk (T : Gen.Type) : LocalSlot → Prop
   | .uninit => True
   | .init (.scalar sc) => sc.sizeBytes = tyBytes T ∧ ValidBits T sc.bits
+  | .init (.aggregate 0 [.scalar sc0, .scalar sc1]) =>
+    ∃ it, tupleIntOfTy T = some it ∧
+      sc0.sizeBytes = it.size.bytes ∧ sc0.bits < 2 ^ (8 * it.size.bytes) ∧
+      sc1.sizeBytes = 1 ∧ sc1.bits < 2
   | _ => False
 
 /-- The parts of the MiniRust machine that the callee's execution does not
@@ -151,7 +187,7 @@ def localAlloc (ctx : Ctx) (i : Nat) (it : Gen.IntType) (data : List Byte) : Gen
 /-- The callee's allocations for locals `_i, _(i+1), ..`, in local order. -/
 def localAllocsFrom (ctx : Ctx) : Nat → List LocalDecl → List LocalSlot → List Gen.Allocation
   | i, d :: ds, slot :: slots =>
-    localAlloc ctx i (itOf d) (slotData (itOf d) slot) :: localAllocsFrom ctx (i + 1) ds slots
+    localAlloc ctx i (itOf d) (declSlotData d slot) :: localAllocsFrom ctx (i + 1) ds slots
   | _, _, _ => []
 
 /-- The callee's allocations, one per local, in local order. -/
@@ -173,12 +209,18 @@ def calleeFrame (f : Gen.Function) (ctx : Ctx) (n blk stmt : Nat) : Frame :=
 def thread1 (ctx : Ctx) (frames : List Frame) : Gen.Thread BM :=
   { stack := frames, state := .Enabled, unwind_payloads := ctx.payloads }
 
+/-- Address well-formedness for local `_i` of storage integer type `it`:
+aligned to `it.size.bytes` and within `[0, 2^64)` so field-projection
+`ptr_offset_inbounds` does not wrap around `2^64`. -/
+@[reducible] def AddrOk (addr : Int) (it : Gen.IntType) : Prop :=
+  addr % (it.size.bytes : Int) = 0 ∧ 0 ≤ addr ∧ addr + (it.size.bytes : Int) < 2 ^ 64
+
 /-- The caller's return place: a live allocation in `base`, large enough for
-the callee's return type and aligned for it. -/
-def RetPlaceOk (ctx : Ctx) (it : Gen.IntType) : Prop :=
+the callee's return type `T` and aligned for `it`. -/
+def RetPlaceOk (ctx : Ctx) (T : Gen.Type) (it : Gen.IntType) : Prop :=
   ∃ (r : Nat) (a : Gen.Allocation), ctx.retPtr.provenance = some (⟨(r : Int)⟩, ()) ∧
     ctx.base[r]? = some a ∧ a.live = true ∧ a.addr = ctx.retPtr.addr ∧
-    a.data.length = it.size.bytes ∧ ctx.retPtr.addr % (it.size.bytes : Int) = 0
+    a.data.length = tyBytes T ∧ ctx.retPtr.addr % (it.size.bytes : Int) = 0
 
 /-- The state relation; see the module docs. -/
 structure StateRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : MachineState)
@@ -193,8 +235,8 @@ structure StateRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : Mach
   slots : ∀ (i : Nat) d slot, body.localDecls[i]? = some d → s.frame.locals[i]? = some slot →
     SlotOk (tyOf d) slot
   addrs : ∀ (i : Nat) d, body.localDecls[i]? = some d →
-    ctx.addrs.getD i 0 % ((itOf d).size.bytes : Int) = 0
-  ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (itOf d)
+    AddrOk (ctx.addrs.getD i 0) (itOf d)
+  ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (tyOf d) (itOf d)
   borrows : s.memory.borrows = []
   callStack : s.memory.callStack = []
   activeCallee : s.memory.activeCallee = none
@@ -220,8 +262,8 @@ structure StartRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : Mach
   slots : ∀ (i : Nat) d slot, body.localDecls[i]? = some d → s.frame.locals[i]? = some slot →
     SlotOk (tyOf d) slot
   addrs : ∀ (i : Nat) d, body.localDecls[i]? = some d →
-    ctx.addrs.getD i 0 % ((itOf d).size.bytes : Int) = 0
-  ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (itOf d)
+    AddrOk (ctx.addrs.getD i 0) (itOf d)
+  ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (tyOf d) (itOf d)
   borrows : s.memory.borrows = []
   callStack : s.memory.callStack = []
   activeCallee : s.memory.activeCallee = none
@@ -229,18 +271,25 @@ structure StartRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : Mach
   callerLocals : s.memory.callerLocals = []
 
 /-- Well-formed caller context for executing `body`: every callee local address
-is aligned for its integer type, and the caller's return place is a live,
+is aligned for its storage type, and the caller's return place is a live,
 aligned allocation of `_0`'s byte size. -/
 structure CtxOk (body : CapturedMir) (ctx : Ctx) : Prop where
   addrs : ∀ (i : Nat) d, body.localDecls[i]? = some d →
-    ctx.addrs.getD i 0 % ((itOf d).size.bytes : Int) = 0
-  ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (itOf d)
+    AddrOk (ctx.addrs.getD i 0) (itOf d)
+  ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (tyOf d) (itOf d)
 
 /-- Decidable well-typedness of an incoming argument `v` for a parameter of
 fragment type `T`: a scalar of `T`'s size whose bit pattern encodes a value of
-`T` (for `bool`, only `0` and `1`). -/
+`T` (for `bool`, only `0` and `1`), or a 2-tuple aggregate `(sc0, sc1)` when
+`T = intBoolTupleTy it`. -/
 def argOk (T : Gen.Type) : Value → Bool
   | .scalar sc => decide (sc.sizeBytes = tyBytes T) && validBits T sc.bits
+  | .aggregate 0 [.scalar sc0, .scalar sc1] =>
+    match tupleIntOfTy T with
+    | some it =>
+      decide (sc0.sizeBytes = it.size.bytes) && decide (sc0.bits < 2 ^ (8 * it.size.bytes)) &&
+      decide (sc1.sizeBytes = 1) && decide (sc1.bits < 2)
+    | none => false
   | _ => false
 
 /-- Decidable well-typedness of argument values `args` against parameter
@@ -258,12 +307,12 @@ def argsOk (body : CapturedMir) (args : List Value) : Bool :=
 the callee frame is gone, the caller continues at `nextBlock`, the return
 place holds the encoding of `v`, and every callee allocation is dead. -/
 def ReturnRel (body : CapturedMir) (ctx : Ctx) (s : MachineState) (v : Value) (m : Mach) : Prop :=
-  ∃ (bits r : Nat) (a : Gen.Allocation) (d : LocalDecl),
-    body.localDecls[0]? = some d ∧ v = .scalar ⟨bits, (itOf d).size.bytes⟩ ∧
+  ∃ (r : Nat) (a : Gen.Allocation) (d : LocalDecl),
+    body.localDecls[0]? = some d ∧ SlotOk (tyOf d) (.init v) ∧
     ctx.retPtr.provenance = some (⟨(r : Int)⟩, ()) ∧ ctx.base[r]? = some a ∧
     m.threads = [thread1 ctx [{ ctx.caller with next_block := ctx.nextBlock, next_stmt := 0 }]] ∧
     m.mem.memory.allocations =
-      ctx.base.set r { a with data := scalarBytes (itOf d) bits } ++
+      ctx.base.set r { a with data := declSlotData d (.init v) } ++
         (localAllocs ctx body.localDecls s.frame.locals).map (fun a => { a with live := false })
 
 /-- How one Anneal step and one MiniRust step correspond:

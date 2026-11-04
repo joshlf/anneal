@@ -122,12 +122,19 @@ executable meaning of the fragment is `Interp.lean`.
 `Interp.lean` transcribes, against the *generated* types, the specr-lang
 functions needed to run the fragment below on `Machine<BasicMemory<x86_64>>`:
 `Machine::step` (single enabled thread), `Statement::{Assign, PlaceMention}`,
-`PlaceExpr::Local`, `ValueExpr::{Constant, Load, UnOp, BinOp}` with
+`PlaceExpr::{Local, Field}` (`PlaceExpr::Field` indexing `(offset, field_ty)`
+and offsetting the pointer via `Machine::ptr_offset_inbounds` and
+`ConcurrentMemory::signed_dereferenceable` / `BasicMemory::signed_dereferenceable`),
+`ValueExpr::{Constant, Load, Tuple, UnOp, BinOp}` (`ValueExpr::Tuple` checking
+each field value's type against `Type::Tuple`) with
 `IntUnOp::{Neg, BitNot, CountOnes}` (all 3 `IntUnOp` variants),
 `CastOp::{IntToInt, Transmute}` (both `CastOp` variants; `Transmute` runs
 `Machine::transmute`, which encodes the value at the old type and decodes
 and checks it at the new one),
 `IntBinOp::{Add, AddUnchecked, Sub, SubUnchecked, Mul, MulUnchecked, Div, DivExact, Rem, Shl, Shr, ShlUnchecked, ShrUnchecked, BitAnd, BitOr, BitXor}` (all 16 `IntBinOp` variants),
+`BinOp::IntWithOverflow` with `IntBinOpWithOverflow::{Add, Sub, Mul}` (all 3
+`IntBinOpWithOverflow` variants, through `Machine::eval_int_bin_op_with_overflow`
+and `IntType::with_overflow`, returning `(Value::Int(res_wrapped), Value::Bool(res != res_wrapped))` at `ty.with_overflow()`),
 `BinOp::Rel` with `RelOp::{Lt, Gt, Le, Ge, Eq, Ne, Cmp}` (all 7 `RelOp`
 variants, through `Machine::eval_rel_op`) on integers and Booleans (pointer
 comparison is `unsupported`),
@@ -136,11 +143,12 @@ frame teardown and both stack-pop actions, the representation relation
 (`Type::{decode, encode}`) for `Int`, `Bool`, sized `Tuple`, `Union`, `Enum`
 (through `decode_discriminant` and `encode_discriminant`), `Slice`, and
 `TraitObject`, `check_value` for those types, `Type::layout` (also for unsized
-tuples, slices, and trait objects), `BasicMemory`'s `check_ptr`,
-`load`, `store`, and `deallocate`, and `ConcurrentMemory`'s access log and
-data-race check. The recursion over nested types, tuple fields, union chunks,
-enum variants, and discriminator trees is structural (Lean `mutual` blocks), so
-the kernel evaluates it.
+tuples, slices, and trait objects) and `LayoutStrategy::compute_size_and_align`
+/ `TupleHeadLayout::full_size_and_align`, `BasicMemory`'s `check_ptr`,
+`dereferenceable`, `signed_dereferenceable`, `load`, `store`, and `deallocate`,
+and `ConcurrentMemory`'s access log and data-race check. The recursion over
+nested types, tuple fields, union chunks, enum variants, and discriminator trees
+is structural (Lean `mutual` blocks), so the kernel evaluates it.
 MiniRust has no Boolean `!`: `UnOp::Int` on a `Value::Bool` is a spec panic,
 as upstream, and `minimize` expresses `!b` with transmutes instead (see below).
 Every definition quotes the upstream code it transcribes and cites its exact
@@ -152,7 +160,7 @@ comments; `..` marks elided code). Effects are
 (a panic in the spec, which upstream calls a spec bug), and
 `Stop.unsupported` (outside the interpreted fragment; never silently wrong).
 
-`Anchors.lean` lists the 50 upstream items that `Interp.lean` transcribes,
+`Anchors.lean` lists the 55 upstream items that `Interp.lean` transcribes,
 each with its file path, item name, line, and token hash, and proves by `decide`
 that the generated model contains them unchanged (`anchors_ok`) with no
 duplicate entries (`anchors_nodup`). Re-pinning MiniRust therefore breaks
@@ -169,25 +177,28 @@ restricted to the fragment checked by `inFragment`:
 
 * the body is `Runtime(PostCleanup)` MIR and declares only the return place
   and the arguments, all of integer type (`u8`..`u128`, `i8`..`i128`,
-  `usize`, `isize`), `bool`, or `core::cmp::Ordering`;
+  `usize`, `isize`), `bool`, `core::cmp::Ordering`, or a 2-tuple `(Int, bool)`
+  for any integer type `Int`;
 * statements are `_i = Use(op)`, `_i = UnaryOp(Neg | Not, op)`,
   `_i = BinaryOp(Add | Sub | Mul | Div | Rem | BitXor | BitAnd | BitOr | Shl | Shr | AddUnchecked | SubUnchecked | MulUnchecked | ShlUnchecked | ShrUnchecked, opL, opR)`,
   `_i = Cast(CastKind::IntToInt, op, targetTy)`, or `PlaceMention(_i)`,
-  with `op`, `opL`, `opR` projection-free `copy _j` or integer constants (of `_i`'s
-  type for `Use`, `UnaryOp`, `opL`, and non-shift `opR`, of any integer type
-  for shift `opR`, or of any integer or `bool` type for `Cast(IntToInt)`, where
-  `minimize` casts a `bool` by transmuting to `u8` and applying
-  `CastOp::IntToInt`), for an integer `_i`;
+  with `op`, `opL`, `opR` projection-free `copy _j`, tuple field projection
+  `copy (_j.0)` (for an integer operand from a `(Int, bool)` local) or
+  `copy (_j.1)` (for a `bool` operand from a `(Int, bool)` local), or integer
+  constants (of `_i`'s type for `Use`, `UnaryOp`, `opL`, and non-shift `opR`,
+  of any integer type for shift `opR`, or of any integer or `bool` type for
+  `Cast(IntToInt)`, where `minimize` casts a `bool` by transmuting to `u8` and
+  applying `CastOp::IntToInt`), for an integer `_i`;
 * for a `bool` `_i`: `_i = Use(op)`, `_i = UnaryOp(Not, op)`, and
   `_i = BinaryOp(BitAnd | BitOr | BitXor, opL, opR)` with `bool` operands, and
   `_i = BinaryOp(Eq | Ne | Lt | Le | Gt | Ge, opL, opR)` with two integer
-  operands of one type or two `bool` operands (`copy _j`, or a `bool` constant
-  `0`/`1`). `minimize` translates the comparisons to `BinOp::Rel`, `!b` to
-  `build::not(b)` (a transmute of `1u8 - transmute::<u8>(b)` back to `bool`),
-  `BitAnd | BitOr | BitXor` on `bool` to `build::bool_and`, `build::bool_or`,
-  and `build::bool_xor` (`boolBitOp`: integer `BitAnd | BitOr | BitXor` on the
-  `transmute::<u8>` views, transmuted back to `bool`), and a `bool` constant
-  to `Constant::Bool`;
+  operands of one type or two `bool` operands (`copy _j`, `copy (_j.0)`,
+  `copy (_j.1)`, or a `bool` constant `0`/`1`). `minimize` translates the
+  comparisons to `BinOp::Rel`, `!b` to `build::not(b)` (a transmute of
+  `1u8 - transmute::<u8>(b)` back to `bool`), `BitAnd | BitOr | BitXor` on
+  `bool` to `build::bool_and`, `build::bool_or`, and `build::bool_xor`
+  (`boolBitOp`: integer `BitAnd | BitOr | BitXor` on the `transmute::<u8>`
+  views, transmuted back to `bool`), and a `bool` constant to `Constant::Bool`;
 * for a `core::cmp::Ordering` `_i`: `_i = Use(copy _j)` of an `Ordering`
   local, and the three-way comparison `_i = BinaryOp(Cmp, opL, opR)` of two
   integer operands of one type or two `bool` operands. MiniRust's `RelOp::Cmp`
@@ -196,10 +207,16 @@ restricted to the fragment checked by `inFragment`:
   directly encoded `i8` tag, built as `translate_enum` does for
   `#[repr(i8)] enum Ordering { Less = -1, Equal = 0, Greater = 1 }`), so the
   tag is re-validated by `decode_discriminant`;
+* for a 2-tuple `(Int, bool)` `_i`: `_i = Use(copy _j)` of a `(Int, bool)`
+  local of the same type, `_i = BinaryOp(AddWithOverflow | SubWithOverflow | MulWithOverflow, opL, opR)`
+  with two integer operands `opL`, `opR` of type `Int` (`BinOp::IntWithOverflow`),
+  and `_i = Aggregate(AggregateKind::Tuple, [opInt, opBool])` (`ValueExpr::Tuple`
+  at `IntType::with_overflow`); field projections `_j.0` and `_j.1` translate to
+  `PlaceExpr::Field(PlaceExpr::Local(_j), 0)` and `PlaceExpr::Field(PlaceExpr::Local(_j), 1)`;
 * terminators are `Goto`, `SwitchInt` on any integer or `bool` fragment operand
-  (`copy _j` or constant) with distinct in-range values (`minimize` switches
-  on `transmute::<u8>(b)` for a `bool`), `Return`, and `Unreachable`; all
-  targets are blocks of the body; no cleanup blocks.
+  (`copy _j`, `copy (_j.0)`, `copy (_j.1)`, or constant) with distinct in-range
+  values (`minimize` switches on `transmute::<u8>(b)` for a `bool`), `Return`,
+  and `Unreachable`; all targets are blocks of the body; no cleanup blocks.
 
 ### States
 
@@ -395,12 +412,39 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   invalid `Ordering` tag bytes `2` and `128` in `boolBitOrdInvalidTag_rejected`);
   and `uninitOrdering`, whose return of an uninitialized `Ordering` is UB in
   both semantics (`uninitOrdering_*`).
+* `checkedArithI8`, a signed `i8` body with a `(i8, bool)` local `_3` and a
+  `bool` local `_4`, exercising `AddWithOverflow`, `SubWithOverflow`, and
+  `MulWithOverflow`, field projections `_3.0` and `_3.1` in `Use`, `BinaryOp`,
+  `UnaryOp`, and `SwitchInt`, across no-overflow inputs (`checkedArithOk_*`),
+  `INT_MAX + 1` (`127i8 + 1i8 = (-128i8, true)`, `checkedArithAddOv_*`),
+  `INT_MIN - 1` (`-128i8 - 1i8 = (127i8, true)`, `checkedArithSubOv_*`), and
+  signed multiplication overflow (`64i8 * 2i8 = (-128i8, true)`,
+  `checkedArithMulOv_*`), plus `argsOk` rejection of an invalid `bool` byte in
+  a tuple argument (`checkedArithInvalidTupleArg_rejected`).
+* `checkedTupleU32`, a `(u32, u32) -> (u32, bool)` body returning a padded
+  8-byte `(u32, bool)` 2-tuple in `_0`, exercising `PlaceMention(_0)` on the
+  uninitialized tuple return place, unsigned `0u32 - 1u32 = (u32::MAX, true)`
+  underflow followed by `u32::MAX + 1u32 = (0u32, true)` overflow
+  (`checkedTupleUnderAddOv_*`), unsigned multiplication overflow
+  `65536u32 * 65536u32 = (0u32, true)` and `Aggregate(Tuple, [copy (_0.0), copy (_0.1)])`
+  (`checkedTupleMulOv_*`), and no-overflow execution (`checkedTupleOk_*`),
+  writing 4-byte `u32` at offset `0`, 1-byte `bool` at offset `4`, and 3
+  trailing `AbstractByte::Uninit` padding bytes at offsets `5..8`; plus
+  `uninitTupleField0` and `uninitTupleField1`, whose reads of `_0.0` and `_0.1`
+  from an uninitialized `(u32, bool)` local raise UB in both semantics.
 * Ground-truth checks of the interpreted operators: signed and unsigned
   `BinOp::Rel`, `RelOp::Cmp` returning `i8`, `bool` ordering, a value-type
   mismatch being a spec panic, `CastOp::Transmute` between `bool` and `u8`
   (including the invalid byte `2` and a size mismatch, both UB),
-  `Type::Bool` decoding, and `UnOp::Int` on a `bool` being a spec panic
-  (`relLt_signed`, ..., `bitNot_bool_panics`); and of the representation of
+  `Type::Bool` decoding, `UnOp::Int` on a `bool` being a spec panic
+  (`relLt_signed`, ..., `bitNot_bool_panics`), `IntType::with_overflow` layouts
+  and encodings on `i8` and `u32`, `TupleHeadLayout::full_size_and_align` and
+  `LayoutStrategy::compute_size_and_align` on sized and unsized layouts,
+  `BinOp::IntWithOverflow` on `INT_MAX + 1`, `INT_MIN - 1`, `UINT_MAX + 1`,
+  `0 - 1`, and multiplication overflow, `Machine::ptr_offset_inbounds` in-bounds
+  and out-of-bounds UB, `ValueExpr::Tuple`, and `PlaceExpr::Field`
+  (`withOverflow_i8_layout`, ..., `evalValue_tuple_and_evalPlace_field`); and of
+  the representation of
   enums, tuples, unions, slices, and trait objects: exactly the bytes `0`, `1`,
   `255` are valid at `orderingTy` (`ordering_validTags`), decoding, encoding,
   `check_value`, and transmutes at `orderingTy` (including invalid tags, an
@@ -443,14 +487,16 @@ These are deliberate and are the first things to lift:
 * **Branch observations.** Anneal's `switchInt` emits the scrutinee as a
   visible leakage event; MiniRust has no counterpart, so `StepRel` matches it
   with an ordinary MiniRust step.
-* **Integers, `bool`, and `Ordering` only.** An `Ordering` local is written
-  by `Cmp` or `Use(copy _j)` and read by `Use` or `Return` (no `Ordering`
-  constants, `Discriminant`, or `SwitchInt` on it); `Type::Enum`,
-  `Type::Tuple`, and `Type::Union` are interpreted only as representations
-  (layout, `decode`, `encode`, `check_value`), without `ValueExpr::{Tuple,
-  Union, Variant, GetDiscriminant}`, `Statement::SetDiscriminant`, or field and
-  downcast projections. There are no pointers, references, other aggregates,
-  other casts, checked arithmetic, calls, drops, or assertions.
+* **Integers, `bool`, `Ordering`, and `(Int, bool)` 2-tuples only.** An
+  `Ordering` local is written by `Cmp` or `Use(copy _j)` and read by `Use` or
+  `Return` (no `Ordering` constants, `Discriminant`, or `SwitchInt` on it);
+  `Type::Enum` and `Type::Union` are interpreted only as representations
+  (layout, `decode`, `encode`, `check_value`), without `ValueExpr::{Union,
+  Variant, GetDiscriminant}`, `Statement::SetDiscriminant`, or downcast
+  projections, and `Type::Tuple` / `ValueExpr::Tuple` / `PlaceExpr::Field` are
+  connected to the correspondence for `(Int, bool)` 2-tuples (not general nested
+  tuples or field-wise writes `_i.0 = ...`). There are no pointers, references,
+  other aggregates, other casts, calls, drops, or assertions.
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.

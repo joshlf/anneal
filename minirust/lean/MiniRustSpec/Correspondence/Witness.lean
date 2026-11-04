@@ -86,6 +86,15 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
   `mirCall_steps_error`, and direct checks of MiniRust's `"load at type but the
   data in memory violates the language invariant"` UB), alongside ground-truth
   checks of all four `IntBinOp::DivExact` outcomes.
+* `checkedArithI8`, `checkedTupleU32`, `uninitTupleField0`, and
+  `uninitTupleField1`: checked integer arithmetic (`AddWithOverflow`,
+  `SubWithOverflow`, `MulWithOverflow`), `(Int, bool)` 2-tuple locals and
+  return places (including `IntType::with_overflow` trailing `Uninit` padding
+  bytes on `(u32, bool)`), `Rvalue::Aggregate(Tuple, ..)` (`ValueExpr::Tuple`),
+  and `.0` / `.1` field projections (`PlaceExpr::Field`) across no-overflow and
+  overflow boundary inputs (`INT_MAX + 1`, `INT_MIN - 1`, `UINT_MAX + 1`,
+  `0 - 1`, and signed/unsigned multiplication overflow), plus UB on reading
+  `.0` or `.1` from an uninitialized tuple local.
 -/
 
 namespace MiniRustSpec.Correspondence.Witness
@@ -319,18 +328,14 @@ theorem sumTo_minirust_ret :
       m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     run_ret sumTo_inFragment sumTo_translate ctx0 sumToS0 sumToM0 sumTo_rel sumTo_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [sumTo] at hd; subst hd
   simp [retPtr, ctx0] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctx0] at hr; subst hr
-  have hbits : bits = 6 := by
-    simp [itOf, intTypeOf, intTyBytes, u32Decl, u32Ty] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctx0, itOf, intTypeOf, intTyBytes, u32Decl, u32Ty, u32]
+  rw [hallocs]; rfl
 
 /-- The same return, computed directly by running the MiniRust interpretation
 for 16 steps (one per Anneal step). -/
@@ -348,18 +353,14 @@ theorem sumTo_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret sumTo_inFragment sumTo_translate ctx0 (ctx0_ok2 rfl) [.scalar ⟨3, 4⟩]
       (by decide) sumToMInit rfl rfl rfl sumTo_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [sumTo] at hd; subst hd
   simp [retPtr, ctx0] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctx0] at hr; subst hr
-  have hbits : bits = 6 := by
-    simp [itOf, intTypeOf, intTyBytes, u32Decl, u32Ty] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctx0, itOf, intTypeOf, intTyBytes, u32Decl, u32Ty, u32]
+  rw [hallocs]; rfl
 
 /-- Direct 17-step run from `f.start` (init block + 16 MIR steps). -/
 theorem sumTo_minirust_direct_from_start :
@@ -519,18 +520,14 @@ theorem negMention5_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     run_ret_from_start negMention_inFragment negMention_translate ctx0 negMention5S0
       negMention5MInit negMention5_startRel negMention5_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [negMention] at hd; subst hd
   simp [retPtr, ctx0] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctx0] at hr; subst hr
-  have hbits : bits = 4294967291 := by
-    simp [itOf, intTypeOf, intTyBytes, u32Decl, u32Ty] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctx0, itOf, intTypeOf, intTyBytes, u32Decl, u32Ty, u32]
+  rw [hallocs]; rfl
 
 theorem negMention5_minirust_direct :
     (Interp.steps 5 negMention5MInit).toOption.map
@@ -691,18 +688,14 @@ theorem signedEdgeMin_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret signedEdge_inFragment signedEdge_translate ctxI8 (ctxI8_ok2 rfl)
       [.scalar ⟨128, 1⟩] (by decide) signedEdgeMinMInit rfl rfl rfl signedEdgeMin_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [signedEdge] at hd; subst hd
   simp [retPtr, ctxI8] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxI8] at hr; subst hr
-  have hbits : bits = 127 := by
-    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxI8, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+  rw [hallocs]; rfl
 
 /-- End-to-end `MirNoUBTree` safety transfer: any error within `n` MiniRust
 steps from `f.start` occurs strictly after `k < n` steps at which MiniRust has
@@ -741,18 +734,14 @@ theorem signedEdgeOne_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret signedEdge_inFragment signedEdge_translate ctxI8 (ctxI8_ok2 rfl)
       [.scalar ⟨1, 1⟩] (by decide) signedEdgeOneMInit rfl rfl rfl signedEdgeOne_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [signedEdge] at hd; subst hd
   simp [retPtr, ctxI8] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxI8] at hr; subst hr
-  have hbits : bits = 2 := by
-    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxI8, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+  rw [hallocs]; rfl
 
 theorem signedEdgeOne_minirust_direct :
     (Interp.steps 5 signedEdgeOneMInit).toOption.map
@@ -861,18 +850,14 @@ theorem castBitNot4_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret castBitNot_inFragment castBitNot_translate ctx0 (ctx0_ok_u32_i8 rfl)
       [.scalar ⟨4, 1⟩] (by decide) castBitNot4MInit rfl rfl rfl castBitNot4_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [castBitNot] at hd; subst hd
   simp [retPtr, ctx0] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctx0] at hr; subst hr
-  have hbits : bits = 4 := by
-    simp [itOf, intTypeOf, intTyBytes, u32Decl, u32Ty] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctx0, itOf, intTypeOf, intTyBytes, u32Decl, u32Ty, u32]
+  rw [hallocs]; rfl
 
 theorem castBitNot4_minirust_direct :
     (Interp.steps 7 castBitNot4MInit).toOption.map
@@ -1039,18 +1024,14 @@ theorem divRemNeg7_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret divRemI8_inFragment divRemI8_translate ctxI8_3 (ctxI8_ok3 rfl)
       [.scalar ⟨249, 1⟩, .scalar ⟨3, 1⟩] (by decide) divRemNeg7MInit rfl rfl rfl divRemNeg7_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [divRemI8] at hd; subst hd
   simp [retPtr, ctxI8_3] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxI8_3] at hr; subst hr
-  have hbits : bits = 255 := by
-    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxI8_3, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+  rw [hallocs]; rfl
 
 theorem divRemNeg7_minirust_direct :
     (Interp.steps 6 divRemNeg7MInit).toOption.map
@@ -1077,18 +1058,14 @@ theorem divRemMinOne_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret divRemI8_inFragment divRemI8_translate ctxI8_3 (ctxI8_ok3 rfl)
       [.scalar ⟨128, 1⟩, .scalar ⟨1, 1⟩] (by decide) divRemMinOneMInit rfl rfl rfl divRemMinOne_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [divRemI8] at hd; subst hd
   simp [retPtr, ctxI8_3] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxI8_3] at hr; subst hr
-  have hbits : bits = 128 := by
-    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxI8_3, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+  rw [hallocs]; rfl
 
 theorem divRemMinOne_minirust_direct :
     (Interp.steps 5 divRemMinOneMInit).toOption.map
@@ -1285,18 +1262,14 @@ theorem uncheckedOk_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret uncheckedArithI8_inFragment uncheckedArithI8_translate ctxI8_3 (ctxI8_ok3 rfl)
       [.scalar ⟨64, 1⟩, .scalar ⟨254, 1⟩] (by decide) uncheckedOkMInit rfl rfl rfl uncheckedOk_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [uncheckedArithI8] at hd; subst hd
   simp [retPtr, ctxI8_3] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxI8_3] at hr; subst hr
-  have hbits : bits = 1 := by
-    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxI8_3, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+  rw [hallocs]; rfl
 
 theorem uncheckedOk_minirust_direct :
     (Interp.steps 5 uncheckedOkMInit).toOption.map
@@ -1526,18 +1499,14 @@ theorem shiftOk_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret shiftI8_inFragment shiftI8_translate ctxI8_3 (ctxI8_ok3 rfl)
       [.scalar ⟨192, 1⟩, .scalar ⟨3, 1⟩] (by decide) shiftOkMInit rfl rfl rfl shiftOk_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [shiftI8] at hd; subst hd
   simp [retPtr, ctxI8_3] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxI8_3] at hr; subst hr
-  have hbits : bits = 224 := by
-    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxI8_3, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+  rw [hallocs]; rfl
 
 theorem shiftOk_minirust_direct :
     (Interp.steps 6 shiftOkMInit).toOption.map
@@ -1725,18 +1694,14 @@ theorem bitwiseNeg_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret bitwiseI8_inFragment bitwiseI8_translate ctxI8_3 (ctxI8_ok3 rfl)
       [.scalar ⟨170, 1⟩, .scalar ⟨241, 1⟩] (by decide) bitwiseNegMInit rfl rfl rfl bitwiseNeg_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [bitwiseI8] at hd; subst hd
   simp [retPtr, ctxI8_3] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxI8_3] at hr; subst hr
-  have hbits : bits = 96 := by
-    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxI8_3, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+  rw [hallocs]; rfl
 
 theorem bitwiseNeg_minirust_direct :
     (Interp.steps 5 bitwiseNegMInit).toOption.map
@@ -1877,18 +1842,14 @@ theorem heteroShiftOk_minirust_ret_from_start :
     mirCall_ret heteroShiftSwitch_inFragment heteroShiftSwitch_translate ctxI8_3
       (ctxI8_ok_hetero rfl) [.scalar ⟨192, 1⟩, .scalar ⟨3, 4⟩] (by decide)
       heteroShiftOkMInit rfl rfl rfl heteroShiftOk_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [heteroShiftSwitch] at hd; subst hd
   simp [retPtr, ctxI8_3] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxI8_3] at hr; subst hr
-  have hbits : bits = 224 := by
-    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxI8_3, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+  rw [hallocs]; rfl
 
 theorem heteroShiftOk_minirust_direct :
     (Interp.steps 7 heteroShiftOkMInit).toOption.map
@@ -2243,18 +2204,14 @@ theorem cmpNotNeg1_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret cmpNotSwitch_inFragment cmpNotSwitch_translate ctxI8_4 (ctxI8_ok_cmpNot rfl)
       cmpNotNeg1Args (by decide) cmpNotNeg1MInit rfl rfl rfl cmpNotNeg1_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [cmpNotSwitch] at hd; subst hd
   simp [retPtr, ctxI8_4] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxI8_4] at hr; subst hr
-  have hbits : bits = 255 := by
-    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxI8_4, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+  rw [hallocs]; rfl
 
 set_option maxRecDepth 8192 in
 /-- The same return, computed directly: 9 MiniRust steps (the entry block,
@@ -2286,18 +2243,14 @@ theorem cmpNot3_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret cmpNotSwitch_inFragment cmpNotSwitch_translate ctxI8_4 (ctxI8_ok_cmpNot rfl)
       cmpNot3Args (by decide) cmpNot3MInit rfl rfl rfl cmpNot3_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [cmpNotSwitch] at hd; subst hd
   simp [retPtr, ctxI8_4] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxI8_4] at hr; subst hr
-  have hbits : bits = 2 := by
-    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxI8_4, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+  rw [hallocs]; rfl
 
 set_option maxRecDepth 8192 in
 theorem cmpNot3_minirust_direct :
@@ -2406,18 +2359,14 @@ theorem leNeGe250_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret leNeGe_inFragment leNeGe_translate ctxBool (ctxBool_ok rfl)
       leNeGe250Args (by decide) leNeGe250MInit rfl rfl rfl leNeGe250_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [leNeGe] at hd; subst hd
   simp [retPtr, ctxBool] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxBool] at hr; subst hr
-  have hbits : bits = 1 := by
-    simp [itOf, intTypeOf, intTyBytes, boolDecl, boolTy] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxBool, itOf, intTypeOf, intTyBytes, boolDecl, boolTy, u8]
+  rw [hallocs]; rfl
 
 set_option maxRecDepth 8192 in
 theorem leNeGe250_minirust_direct :
@@ -2447,18 +2396,14 @@ theorem leNeGe5_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret leNeGe_inFragment leNeGe_translate ctxBool (ctxBool_ok rfl)
       leNeGe5Args (by decide) leNeGe5MInit rfl rfl rfl leNeGe5_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [leNeGe] at hd; subst hd
   simp [retPtr, ctxBool] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxBool] at hr; subst hr
-  have hbits : bits = 0 := by
-    simp [itOf, intTypeOf, intTyBytes, boolDecl, boolTy] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxBool, itOf, intTypeOf, intTyBytes, boolDecl, boolTy, u8]
+  rw [hallocs]; rfl
 
 set_option maxRecDepth 8192 in
 theorem leNeGe5_minirust_direct :
@@ -2572,18 +2517,14 @@ theorem boolCastTrue_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret boolCastI8_inFragment boolCastI8_translate ctxI8 (ctxI8_ok_boolCast rfl)
       boolCastTrueArgs (by decide) boolCastTrueMInit rfl rfl rfl boolCastTrue_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [boolCastI8] at hd; subst hd
   simp [retPtr, ctxI8] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxI8] at hr; subst hr
-  have hbits : bits = 1 := by
-    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxI8, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+  rw [hallocs]; rfl
 
 set_option maxRecDepth 8192 in
 theorem boolCastTrue_minirust_direct :
@@ -2612,18 +2553,14 @@ theorem boolCastFalse_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret boolCastI8_inFragment boolCastI8_translate ctxI8 (ctxI8_ok_boolCast rfl)
       boolCastFalseArgs (by decide) boolCastFalseMInit rfl rfl rfl boolCastFalse_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [boolCastI8] at hd; subst hd
   simp [retPtr, ctxI8] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxI8] at hr; subst hr
-  have hbits : bits = 0 := by
-    simp [itOf, intTypeOf, intTyBytes, i8Decl, i8Ty] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxI8, itOf, intTypeOf, intTyBytes, i8Decl, i8Ty, i8]
+  rw [hallocs]; rfl
 
 set_option maxRecDepth 8192 in
 theorem boolCastFalse_minirust_direct :
@@ -2924,18 +2861,14 @@ theorem cmpSelLess_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret cmpSel_inFragment cmpSel_translate ctxI8_4 (ctxI8_ok_cmpSel rfl)
       cmpSelLessArgs (by decide) cmpSelLessMInit rfl rfl rfl cmpSelLess_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [cmpSel] at hd; subst hd
   simp [retPtr, ctxI8_4] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxI8_4] at hr; subst hr
-  have hbits : bits = 255 := by
-    simp [itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxI8_4, itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW, u8]
+  rw [hallocs]; rfl
 
 set_option maxRecDepth 8192 in
 theorem cmpSelLess_minirust_direct :
@@ -2964,18 +2897,14 @@ theorem cmpSelEqual_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret cmpSel_inFragment cmpSel_translate ctxI8_4 (ctxI8_ok_cmpSel rfl)
       cmpSelEqualArgs (by decide) cmpSelEqualMInit rfl rfl rfl cmpSelEqual_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [cmpSel] at hd; subst hd
   simp [retPtr, ctxI8_4] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxI8_4] at hr; subst hr
-  have hbits : bits = 0 := by
-    simp [itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxI8_4, itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW, u8]
+  rw [hallocs]; rfl
 
 set_option maxRecDepth 8192 in
 theorem cmpSelEqual_minirust_direct :
@@ -3004,18 +2933,14 @@ theorem cmpSelGreater_minirust_ret_from_start :
   obtain ⟨n, s', m', hsteps, hret⟩ :=
     mirCall_ret cmpSel_inFragment cmpSel_translate ctxI8_4 (ctxI8_ok_cmpSel rfl)
       cmpSelGreaterArgs (by decide) cmpSelGreaterMInit rfl rfl rfl cmpSelGreater_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [cmpSel] at hd; subst hd
   simp [retPtr, ctxI8_4] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxI8_4] at hr; subst hr
-  have hbits : bits = 1 := by
-    simp [itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxI8_4, itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW, u8]
+  rw [hallocs]; rfl
 
 set_option maxRecDepth 8192 in
 theorem cmpSelGreater_minirust_direct :
@@ -3205,18 +3130,14 @@ theorem boolBitOrdUseCmp_minirust_ret_from_start :
     mirCall_ret boolBitOrdUse_inFragment boolBitOrdUse_translate ctxI8_4
       (ctxI8_ok_boolBitOrdUse rfl) boolBitOrdUseCmpArgs (by decide) boolBitOrdUseCmpMInit
       rfl rfl rfl boolBitOrdUseCmp_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [boolBitOrdUse] at hd; subst hd
   simp [retPtr, ctxI8_4] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxI8_4] at hr; subst hr
-  have hbits : bits = 1 := by
-    simp [itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxI8_4, itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW, u8]
+  rw [hallocs]; rfl
 
 set_option maxRecDepth 8192 in
 theorem boolBitOrdUseCmp_minirust_direct :
@@ -3249,18 +3170,14 @@ theorem boolBitOrdUseCopy_minirust_ret_from_start :
     mirCall_ret boolBitOrdUse_inFragment boolBitOrdUse_translate ctxI8_4
       (ctxI8_ok_boolBitOrdUse rfl) boolBitOrdUseCopyArgs (by decide) boolBitOrdUseCopyMInit
       rfl rfl rfl boolBitOrdUseCopy_anneal_ret
-  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
   simp [boolBitOrdUse] at hd; subst hd
   simp [retPtr, ctxI8_4] at hp
   have hr0 : r = 0 := by omega
   subst hr0
   simp [ctxI8_4] at hr; subst hr
-  have hbits : bits = 255 := by
-    simp [itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW] at hv; omega
-  subst hbits
   refine ⟨n, m', hsteps, ?_, hthr⟩
-  rw [hallocs]
-  simp [ctxI8_4, itOf, intTypeOf, intTyBytes, orderingDecl, orderingTyW, u8]
+  rw [hallocs]; rfl
 
 set_option maxRecDepth 8192 in
 theorem boolBitOrdUseCopy_minirust_direct :
@@ -3587,5 +3504,781 @@ set_option maxRecDepth 8192 in
 theorem transmute_union_paddedPair_uninit_ub :
     evalCastOp (.Transmute paddedPairTy) (.Union [[.Init 254 none], [.Uninit]], unionPaddedTy) =
       .error (.ub "transmuted value is not valid at new type") := rfl
+
+/-! ## Checked integer arithmetic (`AddWithOverflow`, `SubWithOverflow`, `MulWithOverflow`) and `(Int, bool)` 2-tuples -/
+
+def i8BoolTupleTyW : Ty := { kind := .tuple [.int .i8, .bool], layoutIdx := 0 }
+def i8BoolTupleDecl : LocalDecl := { mutability := .mut, ty := i8BoolTupleTyW, debugName := none }
+def u32BoolTupleTyW : Ty := { kind := .tuple [.uint .u32, .bool], layoutIdx := 0 }
+def u32BoolTupleDecl : LocalDecl := { mutability := .mut, ty := u32BoolTupleTyW, debugName := none }
+
+def field0I8 (i : Nat) : Place := { local_ := i, projection := [.field 0 i8Ty] }
+def field0U32 (i : Nat) : Place := { local_ := i, projection := [.field 0 u32Ty] }
+def field1 (i : Nat) : Place := { local_ := i, projection := [.field 1 boolTy] }
+
+/-- The callee's 5 locals live at addresses `128`, `256`, `384`, `512`, and `640`. -/
+def ctxI8_5 : Ctx :=
+  { caller := callerFrameI8, payloads := [], base := [retAllocI8],
+    addrs := [128, 256, 384, 512, 640],
+    nextBlock := bbName 7, unwindBlock := none, retPtr := retPtr }
+
+theorem ctxI8_ok_checkedArith {body : CapturedMir}
+    (h : body.localDecls = [i8Decl, i8Decl, i8Decl, i8BoolTupleDecl, boolDecl]) :
+    CtxOk body ctxI8_5 where
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | 2, hd => simp at hd; subst hd; decide
+    | 3, hd => simp at hd; subst hd; decide
+    | 4, hd => simp at hd; subst hd; decide
+    | _ + 5, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def fnAbiCheckedArithI8 : FnAbi :=
+  { args := [{ layout := i8Layout, mode := .direct }, { layout := i8Layout, mode := .direct },
+      { layout := i8Layout, mode := .direct }, { layout := boolLayout, mode := .direct }],
+    ret := { layout := i8Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+/-- MIR (`Runtime(PostCleanup)`) of
+```rust
+fn checked_arith_i8(x: i8, y: i8, mut t: (i8, bool), mut ov: bool) -> i8 {
+    t = AddWithOverflow(x, y);                     // bb0: _3 = AddWithOverflow(copy _1, copy _2)
+    ov = t.1;                                      //      _4 = Use(copy (_3.1))
+    if ov {                                        //      switchInt(copy _4) -> [0: bb1, otherwise: bb3]
+        return t.0;                                // bb3: _0 = Use(copy (_3.0)); return
+    }
+    t = SubWithOverflow(t.0, 1i8);                 // bb1: _3 = SubWithOverflow(copy (_3.0), const 1i8)
+    if t.1 {                                       //      switchInt(copy (_3.1)) -> [0: bb2, otherwise: bb3]
+        return t.0;
+    }
+    t = MulWithOverflow(t.0, 2i8);                 // bb2: _3 = MulWithOverflow(copy (_3.0), const 2i8)
+    if t.1 {                                       //      switchInt(copy (_3.1)) -> [0: bb3, otherwise: bb4]
+        return -t.0;                               // bb4: _0 = Neg(copy (_3.0)); return
+    }
+    t.0                                            // bb3: _0 = Use(copy (_3.0)); return
+}
+```
+Exercises `AddWithOverflow`, `SubWithOverflow`, and `MulWithOverflow` on signed
+`i8`, field projections `_3.0` and `_3.1` in `Rvalue::Use`, `Rvalue::BinaryOp`,
+`Rvalue::UnaryOp`, and `TerminatorKind::SwitchInt`, both without overflow and
+on `INT_MAX + 1`, `INT_MIN - 1`, and signed multiplication overflow. -/
+def checkedArithI8 : CapturedMir where
+  defPath := "witness::checked_arith_i8"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 4
+  localDecls := [i8Decl, i8Decl, i8Decl, i8BoolTupleDecl, boolDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 3) (.binaryOp .addWithOverflow (.copy (local_ 1)) (.copy (local_ 2)))),
+        mkStmt (.assign (local_ 4) (.use (.copy (field1 3))))],
+      terminator := mkTerm (.switchInt (.copy (local_ 4)) { branches := [(0, 1)], otherwise := 3 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 3) (.binaryOp .subWithOverflow (.copy (field0I8 3)) (constI8 1)))],
+      terminator := mkTerm (.switchInt (.copy (field1 3)) { branches := [(0, 2)], otherwise := 3 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 3) (.binaryOp .mulWithOverflow (.copy (field0I8 3)) (constI8 2)))],
+      terminator := mkTerm (.switchInt (.copy (field1 3)) { branches := [(0, 3)], otherwise := 4 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.copy (field0I8 3))))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.unaryOp .neg (.copy (field0I8 3))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiCheckedArithI8
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem checkedArithI8_inFragment : inFragment checkedArithI8 = true := by decide
+
+def checkedArithI8Fn : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8), (localName 1, .Int i8), (localName 2, .Int i8),
+    (localName 3, intBoolTupleTy i8), (localName 4, .Bool)]⟩
+  args := [localName 1, localName 2, localName 3, localName 4]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 3))
+        (.BinOp (.IntWithOverflow .Add) (.Load (.Local (localName 1))) (.Load (.Local (localName 2)))),
+      .Assign (.Local (localName 4))
+        (.Load (.Field (.Local (localName 3)) 1))],
+      .Switch (.UnOp (.Cast (.Transmute (.Int u8))) (.Load (.Local (localName 4))))
+        ⟨[(0, bbName 1)]⟩ (bbName 3), .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 3))
+        (.BinOp (.IntWithOverflow .Sub)
+          (.Load (.Field (.Local (localName 3)) 0))
+          (.Constant (.Int 1) (.Int i8)))],
+      .Switch
+        (.UnOp (.Cast (.Transmute (.Int u8)))
+          (.Load (.Field (.Local (localName 3)) 1)))
+        ⟨[(0, bbName 2)]⟩ (bbName 3), .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Local (localName 3))
+        (.BinOp (.IntWithOverflow .Mul)
+          (.Load (.Field (.Local (localName 3)) 0))
+          (.Constant (.Int 2) (.Int i8)))],
+      .Switch
+        (.UnOp (.Cast (.Transmute (.Int u8)))
+          (.Load (.Field (.Local (localName 3)) 1)))
+        ⟨[(0, bbName 3)]⟩ (bbName 4), .Regular⟩),
+    (bbName 3, ⟨[
+      .Assign (.Local (localName 0))
+        (.Load (.Field (.Local (localName 3)) 0))],
+      .Return, .Regular⟩),
+    (bbName 4, ⟨[
+      .Assign (.Local (localName 0))
+        (.UnOp (.Int .Neg)
+          (.Load (.Field (.Local (localName 3)) 0)))],
+      .Return, .Regular⟩),
+    (bbName 5, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 5
+  implicit_writes := true
+
+theorem checkedArithI8_translate : translateFn checkedArithI8 = some checkedArithI8Fn := rfl
+
+/-- An invalid `bool` bit pattern (`2 >= 2`) in field 1 of a `(i8, bool)` tuple
+argument is rejected by `argsOk`. -/
+theorem checkedArithInvalidTupleArg_rejected :
+    argsOk checkedArithI8
+      [.scalar ⟨30, 1⟩, .scalar ⟨20, 1⟩, .aggregate 0 [.scalar ⟨0, 1⟩, .scalar ⟨2, 1⟩], .scalar ⟨0, 1⟩] =
+      false := rfl
+
+/-- No-overflow input `(30i8, 20i8)`:
+`30 + 20 = (50, false)`, `50 - 1 = (49, false)`, `49 * 2 = (98, false) -> 98i8`. -/
+def checkedArithOkArgs : List Value :=
+  [.scalar ⟨30, 1⟩, .scalar ⟨20, 1⟩, .aggregate 0 [.scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩], .scalar ⟨0, 1⟩]
+def checkedArithOkS0 : MachineState := initMachineState checkedArithI8 checkedArithOkArgs
+def checkedArithOkMInit : Mach :=
+  machineWithCtx ctxI8_5 checkedArithI8 checkedArithI8Fn checkedArithOkS0.frame.locals
+    checkedArithI8Fn.start
+
+def checkedArithOkTrace : List (Event MirEffect) :=
+  [0, 0, 0].map (fun b => ⟨.inr (.inl (.emit (.event b))), PUnit.unit⟩)
+
+theorem checkedArithOk_anneal_ret :
+    ReachesRet (mirCallTree checkedArithI8 checkedArithOkArgs) checkedArithOkTrace
+      (.normal (.scalar ⟨98, 1⟩, checkedArithOkS0.memory)) :=
+  runA_sound checkedArithI8 20 _ _ _ rfl
+
+theorem checkedArithOk_noUB : MirNoUBTree (mirCallTree checkedArithI8 checkedArithOkArgs) :=
+  runA_noUB checkedArithI8 20 _ _ _ rfl
+
+theorem checkedArithOk_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n checkedArithOkMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 98 } ∧
+      m'.threads = [thread1 ctxI8_5 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret checkedArithI8_inFragment checkedArithI8_translate ctxI8_5
+      (ctxI8_ok_checkedArith rfl) checkedArithOkArgs (by decide) checkedArithOkMInit
+      rfl rfl rfl checkedArithOk_anneal_ret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [checkedArithI8] at hd; subst hd
+  simp [retPtr, ctxI8_5] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_5] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+set_option maxRecDepth 8192 in
+theorem checkedArithOk_minirust_direct :
+    (Interp.steps 10 checkedArithOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 98 }, [1]) := rfl
+
+/-- Signed addition overflow (`INT_MAX + 1`): `(127i8, 1i8)` computes
+`AddWithOverflow(127i8, 1i8) = (-128i8, true)` (bits `128`, flag `1`),
+branches on `_4 = _3.1 = true` to `bb3`, and returns `_3.0 = -128i8`. -/
+def checkedArithAddOvArgs : List Value :=
+  [.scalar ⟨127, 1⟩, .scalar ⟨1, 1⟩, .aggregate 0 [.scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩], .scalar ⟨0, 1⟩]
+def checkedArithAddOvS0 : MachineState := initMachineState checkedArithI8 checkedArithAddOvArgs
+def checkedArithAddOvMInit : Mach :=
+  machineWithCtx ctxI8_5 checkedArithI8 checkedArithI8Fn checkedArithAddOvS0.frame.locals
+    checkedArithI8Fn.start
+
+theorem checkedArithAddOv_anneal_ret :
+    ReachesRet (mirCallTree checkedArithI8 checkedArithAddOvArgs)
+      [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
+      (.normal (.scalar ⟨128, 1⟩, checkedArithAddOvS0.memory)) :=
+  runA_sound checkedArithI8 20 _ _ _ rfl
+
+theorem checkedArithAddOv_noUB : MirNoUBTree (mirCallTree checkedArithI8 checkedArithAddOvArgs) :=
+  runA_noUB checkedArithI8 20 _ _ _ rfl
+
+theorem checkedArithAddOv_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n checkedArithAddOvMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 128 } ∧
+      m'.threads = [thread1 ctxI8_5 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret checkedArithI8_inFragment checkedArithI8_translate ctxI8_5
+      (ctxI8_ok_checkedArith rfl) checkedArithAddOvArgs (by decide) checkedArithAddOvMInit
+      rfl rfl rfl checkedArithAddOv_anneal_ret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [checkedArithI8] at hd; subst hd
+  simp [retPtr, ctxI8_5] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_5] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+set_option maxRecDepth 8192 in
+theorem checkedArithAddOv_minirust_direct :
+    (Interp.steps 6 checkedArithAddOvMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 128 }, [1]) := rfl
+
+/-- Signed subtraction underflow (`INT_MIN - 1`): `(-128i8, 0i8)` (bits `128, 0`)
+computes `AddWithOverflow(-128i8, 0i8) = (-128i8, false)`, then in `bb1`
+`SubWithOverflow(-128i8, 1i8) = (127i8, true)` (bits `127`, flag `1`),
+branches on `_3.1 = true` to `bb3`, and returns `_3.0 = 127i8`. -/
+def checkedArithSubOvArgs : List Value :=
+  [.scalar ⟨128, 1⟩, .scalar ⟨0, 1⟩, .aggregate 0 [.scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩], .scalar ⟨0, 1⟩]
+def checkedArithSubOvS0 : MachineState := initMachineState checkedArithI8 checkedArithSubOvArgs
+def checkedArithSubOvMInit : Mach :=
+  machineWithCtx ctxI8_5 checkedArithI8 checkedArithI8Fn checkedArithSubOvS0.frame.locals
+    checkedArithI8Fn.start
+
+def checkedArithSubOvTrace : List (Event MirEffect) :=
+  [0, 1].map (fun b => ⟨.inr (.inl (.emit (.event b))), PUnit.unit⟩)
+
+theorem checkedArithSubOv_anneal_ret :
+    ReachesRet (mirCallTree checkedArithI8 checkedArithSubOvArgs) checkedArithSubOvTrace
+      (.normal (.scalar ⟨127, 1⟩, checkedArithSubOvS0.memory)) :=
+  runA_sound checkedArithI8 20 _ _ _ rfl
+
+theorem checkedArithSubOv_noUB : MirNoUBTree (mirCallTree checkedArithI8 checkedArithSubOvArgs) :=
+  runA_noUB checkedArithI8 20 _ _ _ rfl
+
+theorem checkedArithSubOv_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n checkedArithSubOvMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 127 } ∧
+      m'.threads = [thread1 ctxI8_5 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret checkedArithI8_inFragment checkedArithI8_translate ctxI8_5
+      (ctxI8_ok_checkedArith rfl) checkedArithSubOvArgs (by decide) checkedArithSubOvMInit
+      rfl rfl rfl checkedArithSubOv_anneal_ret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [checkedArithI8] at hd; subst hd
+  simp [retPtr, ctxI8_5] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_5] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+set_option maxRecDepth 8192 in
+theorem checkedArithSubOv_minirust_direct :
+    (Interp.steps 8 checkedArithSubOvMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 127 }, [1]) := rfl
+
+/-- Signed multiplication overflow: `(65i8, 0i8)` computes `65 + 0 = (65, false)`,
+`65 - 1 = (64, false)`, and `MulWithOverflow(64i8, 2i8) = (-128i8, true)`
+(since `64 * 2 = 128` overflows `i8` and wraps to `-128i8`, bits `128`),
+branches to `bb4`, and returns `-(-128i8) = -128i8` (bits `128`). -/
+def checkedArithMulOvArgs : List Value :=
+  [.scalar ⟨65, 1⟩, .scalar ⟨0, 1⟩, .aggregate 0 [.scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩], .scalar ⟨0, 1⟩]
+def checkedArithMulOvS0 : MachineState := initMachineState checkedArithI8 checkedArithMulOvArgs
+def checkedArithMulOvMInit : Mach :=
+  machineWithCtx ctxI8_5 checkedArithI8 checkedArithI8Fn checkedArithMulOvS0.frame.locals
+    checkedArithI8Fn.start
+
+def checkedArithMulOvTrace : List (Event MirEffect) :=
+  [0, 0, 1].map (fun b => ⟨.inr (.inl (.emit (.event b))), PUnit.unit⟩)
+
+theorem checkedArithMulOv_anneal_ret :
+    ReachesRet (mirCallTree checkedArithI8 checkedArithMulOvArgs) checkedArithMulOvTrace
+      (.normal (.scalar ⟨128, 1⟩, checkedArithMulOvS0.memory)) :=
+  runA_sound checkedArithI8 20 _ _ _ rfl
+
+theorem checkedArithMulOv_noUB : MirNoUBTree (mirCallTree checkedArithI8 checkedArithMulOvArgs) :=
+  runA_noUB checkedArithI8 20 _ _ _ rfl
+
+theorem checkedArithMulOv_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n checkedArithMulOvMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 128 } ∧
+      m'.threads = [thread1 ctxI8_5 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret checkedArithI8_inFragment checkedArithI8_translate ctxI8_5
+      (ctxI8_ok_checkedArith rfl) checkedArithMulOvArgs (by decide) checkedArithMulOvMInit
+      rfl rfl rfl checkedArithMulOv_anneal_ret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [checkedArithI8] at hd; subst hd
+  simp [retPtr, ctxI8_5] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_5] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+set_option maxRecDepth 8192 in
+theorem checkedArithMulOv_minirust_direct :
+    (Interp.steps 10 checkedArithMulOvMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 128 }, [1]) := rfl
+
+/-! ### Padded `(u32, bool)` 2-tuples, `Aggregate(Tuple)`, `UINT_MAX + 1`, `0 - 1`, and `u32` multiplication overflow -/
+
+/-- Caller return allocation for `(u32, bool)`: size `8` bytes, alignment `4`. -/
+def retAllocTupleU32 : Gen.Allocation :=
+  { data := List.replicate 8 .Uninit, addr := 64, align := ⟨4⟩, kind := .Stack, live := true,
+    extra := () }
+
+def callerFnTupleU32 : Gen.Function where
+  locals := ⟨[(localName 0, intBoolTupleTy u32)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[]⟩
+  start := bbName 0
+  implicit_writes := true
+
+def callerFrameTupleU32 : Frame :=
+  { func := callerFnTupleU32, locals := ⟨[(localName 0, retPtr)]⟩, stack_pop_action := .BottomOfStack,
+    next_block := bbName 0, next_stmt := 0, extra := () }
+
+def ctxTupleU32 : Ctx :=
+  { caller := callerFrameTupleU32, payloads := [], base := [retAllocTupleU32],
+    addrs := [128, 256, 384],
+    nextBlock := bbName 7, unwindBlock := none, retPtr := retPtr }
+
+theorem ctxTupleU32_ok {body : CapturedMir}
+    (h : body.localDecls = [u32BoolTupleDecl, u32Decl, u32Decl]) :
+    CtxOk body ctxTupleU32 where
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | 2, hd => simp at hd; subst hd; decide
+    | _ + 3, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAllocTupleU32, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MIR (`Runtime(PostCleanup)`) of
+```rust
+fn checked_tuple_u32(x: u32, y: u32) -> (u32, bool) {
+    // bb0: PlaceMention(_0) (while _0: (u32, bool) is uninit)
+    let mut t: (u32, bool) = SubWithOverflow(x, y); // _0 = SubWithOverflow(copy _1, copy _2)
+    if t.1 {                                        // switchInt(copy (_0.1)) -> [0: bb1, otherwise: bb2]
+        return AddWithOverflow(t.0, 1u32);          // bb2: _0 = AddWithOverflow(copy (_0.0), const 1u32); return
+    }
+    t = MulWithOverflow(t.0, y);                    // bb1: _0 = MulWithOverflow(copy (_0.0), copy _2)
+    (t.0, t.1)                                      //      _0 = Aggregate(Tuple, [copy (_0.0), copy (_0.1)]); return
+}
+```
+Exercises:
+* `PlaceMention(_0)` on the uninitialized `(u32, bool)` return place `_0`;
+* unsigned `0u32 - 1u32 = (u32::MAX, true)` underflow followed by `u32::MAX + 1u32 = (0u32, true)` overflow;
+* unsigned `65536u32 * 65536u32 = (0u32, true)` multiplication overflow;
+* `Rvalue::Aggregate(AggregateKind::Tuple, [copy (_0.0), copy (_0.1)])` (`ValueExpr::Tuple`);
+* returning a padded `(u32, bool)` tuple in `_0` (writing 4-byte `u32` at offset `0`, 1-byte `bool` at offset `4`, and 3 trailing `AbstractByte::Uninit` padding bytes at offsets `5..8`). -/
+def checkedTupleU32 : CapturedMir where
+  defPath := "witness::checked_tuple_u32"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32BoolTupleDecl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.placeMention (local_ 0)),
+        mkStmt (.assign (local_ 0) (.binaryOp .subWithOverflow (.copy (local_ 1)) (.copy (local_ 2))))],
+      terminator := mkTerm (.switchInt (.copy (field1 0)) { branches := [(0, 1)], otherwise := 2 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .mulWithOverflow (.copy (field0U32 0)) (.copy (local_ 2)))),
+        mkStmt (.assign (local_ 0) (.aggregate .tuple [.copy (field0U32 0), .copy (field1 0)]))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .addWithOverflow (.copy (field0U32 0)) (constU32 1)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem checkedTupleU32_inFragment : inFragment checkedTupleU32 = true := by decide
+
+def checkedTupleU32Fn : Gen.Function where
+  locals := ⟨[(localName 0, intBoolTupleTy u32), (localName 1, .Int u32), (localName 2, .Int u32)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .PlaceMention (.Local (localName 0)),
+      .Assign (.Local (localName 0))
+        (.BinOp (.IntWithOverflow .Sub) (.Load (.Local (localName 1))) (.Load (.Local (localName 2))))],
+      .Switch
+        (.UnOp (.Cast (.Transmute (.Int u8)))
+          (.Load (.Field (.Local (localName 0)) 1)))
+        ⟨[(0, bbName 1)]⟩ (bbName 2), .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.IntWithOverflow .Mul)
+          (.Load (.Field (.Local (localName 0)) 0))
+          (.Load (.Local (localName 2)))),
+      .Assign (.Local (localName 0))
+        (.Tuple [
+          .Load (.Field (.Local (localName 0)) 0),
+          .Load (.Field (.Local (localName 0)) 1)]
+          (intBoolTupleTy u32))],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.IntWithOverflow .Add)
+          (.Load (.Field (.Local (localName 0)) 0))
+          (.Constant (.Int 1) (.Int u32)))],
+      .Return, .Regular⟩),
+    (bbName 3, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 3
+  implicit_writes := true
+
+theorem checkedTupleU32_translate : translateFn checkedTupleU32 = some checkedTupleU32Fn := rfl
+
+/-- Unsigned underflow `0u32 - 1u32 = (4294967295u32, true)` followed by
+`UINT_MAX + 1` (`4294967295u32 + 1u32 = (0u32, true)`), returning `(0u32, true)`
+encoded as `tupleBytes u32 0 1` (with 3 trailing `Uninit` padding bytes). -/
+def checkedTupleUnderAddOvArgs : List Value := [.scalar ⟨0, 4⟩, .scalar ⟨1, 4⟩]
+def checkedTupleUnderAddOvS0 : MachineState :=
+  initMachineState checkedTupleU32 checkedTupleUnderAddOvArgs
+def checkedTupleUnderAddOvMInit : Mach :=
+  machineWithCtx ctxTupleU32 checkedTupleU32 checkedTupleU32Fn
+    checkedTupleUnderAddOvS0.frame.locals checkedTupleU32Fn.start
+
+theorem checkedTupleUnderAddOv_anneal_ret :
+    ReachesRet (mirCallTree checkedTupleU32 checkedTupleUnderAddOvArgs)
+      [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
+      (.normal (.aggregate 0 [.scalar ⟨0, 4⟩, .scalar ⟨1, 1⟩], checkedTupleUnderAddOvS0.memory)) :=
+  runA_sound checkedTupleU32 15 _ _ _ rfl
+
+theorem checkedTupleUnderAddOv_noUB :
+    MirNoUBTree (mirCallTree checkedTupleU32 checkedTupleUnderAddOvArgs) :=
+  runA_noUB checkedTupleU32 15 _ _ _ rfl
+
+theorem checkedTupleUnderAddOv_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n checkedTupleUnderAddOvMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocTupleU32 with data := tupleBytes u32 0 1 } ∧
+      m'.threads = [thread1 ctxTupleU32 [{ callerFrameTupleU32 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret checkedTupleU32_inFragment checkedTupleU32_translate ctxTupleU32
+      (ctxTupleU32_ok rfl) checkedTupleUnderAddOvArgs (by decide) checkedTupleUnderAddOvMInit
+      rfl rfl rfl checkedTupleUnderAddOv_anneal_ret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [checkedTupleU32] at hd; subst hd
+  simp [retPtr, ctxTupleU32] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxTupleU32] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+set_option maxRecDepth 8192 in
+theorem checkedTupleUnderAddOv_minirust_direct :
+    (Interp.steps 6 checkedTupleUnderAddOvMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocTupleU32 with data := tupleBytes u32 0 1 }, [1]) := rfl
+
+/-- Unsigned multiplication overflow `(131072u32, 65536u32)`:
+`131072u32 - 65536u32 = (65536u32, false)`, then
+`MulWithOverflow(65536u32, 65536u32) = (0u32, true)` (`2^16 * 2^16 = 2^32`),
+repackaged via `Aggregate(Tuple, [copy (_0.0), copy (_0.1)])` and returned. -/
+def checkedTupleMulOvArgs : List Value := [.scalar ⟨131072, 4⟩, .scalar ⟨65536, 4⟩]
+def checkedTupleMulOvS0 : MachineState :=
+  initMachineState checkedTupleU32 checkedTupleMulOvArgs
+def checkedTupleMulOvMInit : Mach :=
+  machineWithCtx ctxTupleU32 checkedTupleU32 checkedTupleU32Fn
+    checkedTupleMulOvS0.frame.locals checkedTupleU32Fn.start
+
+theorem checkedTupleMulOv_anneal_ret :
+    ReachesRet (mirCallTree checkedTupleU32 checkedTupleMulOvArgs)
+      [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
+      (.normal (.aggregate 0 [.scalar ⟨0, 4⟩, .scalar ⟨1, 1⟩], checkedTupleMulOvS0.memory)) :=
+  runA_sound checkedTupleU32 15 _ _ _ rfl
+
+theorem checkedTupleMulOv_noUB :
+    MirNoUBTree (mirCallTree checkedTupleU32 checkedTupleMulOvArgs) :=
+  runA_noUB checkedTupleU32 15 _ _ _ rfl
+
+theorem checkedTupleMulOv_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n checkedTupleMulOvMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocTupleU32 with data := tupleBytes u32 0 1 } ∧
+      m'.threads = [thread1 ctxTupleU32 [{ callerFrameTupleU32 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret checkedTupleU32_inFragment checkedTupleU32_translate ctxTupleU32
+      (ctxTupleU32_ok rfl) checkedTupleMulOvArgs (by decide) checkedTupleMulOvMInit
+      rfl rfl rfl checkedTupleMulOv_anneal_ret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [checkedTupleU32] at hd; subst hd
+  simp [retPtr, ctxTupleU32] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxTupleU32] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+set_option maxRecDepth 8192 in
+theorem checkedTupleMulOv_minirust_direct :
+    (Interp.steps 7 checkedTupleMulOvMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocTupleU32 with data := tupleBytes u32 0 1 }, [1]) := rfl
+
+/-- No-overflow input `(10u32, 3u32)`: `10 - 3 = (7, false)`, `7 * 3 = (21, false)`,
+repackaged via `Aggregate(Tuple)` and returned as `tupleBytes u32 21 0`. -/
+def checkedTupleOkArgs : List Value := [.scalar ⟨10, 4⟩, .scalar ⟨3, 4⟩]
+def checkedTupleOkS0 : MachineState :=
+  initMachineState checkedTupleU32 checkedTupleOkArgs
+def checkedTupleOkMInit : Mach :=
+  machineWithCtx ctxTupleU32 checkedTupleU32 checkedTupleU32Fn
+    checkedTupleOkS0.frame.locals checkedTupleU32Fn.start
+
+theorem checkedTupleOk_anneal_ret :
+    ReachesRet (mirCallTree checkedTupleU32 checkedTupleOkArgs)
+      [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
+      (.normal (.aggregate 0 [.scalar ⟨21, 4⟩, .scalar ⟨0, 1⟩], checkedTupleOkS0.memory)) :=
+  runA_sound checkedTupleU32 15 _ _ _ rfl
+
+theorem checkedTupleOk_noUB :
+    MirNoUBTree (mirCallTree checkedTupleU32 checkedTupleOkArgs) :=
+  runA_noUB checkedTupleU32 15 _ _ _ rfl
+
+theorem checkedTupleOk_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n checkedTupleOkMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocTupleU32 with data := tupleBytes u32 21 0 } ∧
+      m'.threads = [thread1 ctxTupleU32 [{ callerFrameTupleU32 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret checkedTupleU32_inFragment checkedTupleU32_translate ctxTupleU32
+      (ctxTupleU32_ok rfl) checkedTupleOkArgs (by decide) checkedTupleOkMInit
+      rfl rfl rfl checkedTupleOk_anneal_ret
+  obtain ⟨r, a, d, hd, _hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [checkedTupleU32] at hd; subst hd
+  simp [retPtr, ctxTupleU32] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxTupleU32] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+set_option maxRecDepth 8192 in
+theorem checkedTupleOk_minirust_direct :
+    (Interp.steps 7 checkedTupleOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocTupleU32 with data := tupleBytes u32 21 0 }, [1]) := rfl
+
+/-! ### Reading `.0` or `.1` from an uninitialized `(u32, bool)` tuple local -/
+
+theorem ctxTupleU32_ok1 {body : CapturedMir}
+    (h : body.localDecls = [u32BoolTupleDecl]) : CtxOk body ctxTupleU32 where
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | _ + 1, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAllocTupleU32, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MIR of `fn uninit_tuple_field0() -> (u32, bool)` whose entry block reads
+`_0.0` from the uninitialized `(u32, bool)` return place `_0`
+(`_0 = AddWithOverflow(copy (_0.0), const 1u32)`), raising UB in both Anneal and
+MiniRust. -/
+def uninitTupleField0 : CapturedMir where
+  defPath := "witness::uninit_tuple_field0"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u32BoolTupleDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .addWithOverflow (.copy (field0U32 0)) (constU32 1)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 0
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem uninitTupleField0_inFragment : inFragment uninitTupleField0 = true := by decide
+
+def uninitTupleField0Fn : Gen.Function where
+  locals := ⟨[(localName 0, intBoolTupleTy u32)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.IntWithOverflow .Add)
+          (.Load (.Field (.Local (localName 0)) 0))
+          (.Constant (.Int 1) (.Int u32)))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem uninitTupleField0_translate : translateFn uninitTupleField0 = some uninitTupleField0Fn := rfl
+
+def uninitTupleField0S0 : MachineState := initMachineState uninitTupleField0 []
+def uninitTupleField0MInit : Mach :=
+  machineWithCtx ctxTupleU32 uninitTupleField0 uninitTupleField0Fn
+    uninitTupleField0S0.frame.locals uninitTupleField0Fn.start
+
+theorem uninitTupleField0_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree uninitTupleField0 []) tr u ∧ FaultNow u :=
+  faultsA_sound uninitTupleField0 3 _ (by decide)
+
+theorem uninitTupleField0_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n uninitTupleField0MInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := uninitTupleField0_anneal_ub
+  exact mirCall_ub uninitTupleField0_inFragment uninitTupleField0_translate ctxTupleU32
+    (ctxTupleU32_ok1 rfl) [] (by decide) uninitTupleField0MInit rfl rfl rfl hr hf
+
+set_option maxRecDepth 8192 in
+theorem uninitTupleField0_minirust_direct :
+    Interp.steps 2 uninitTupleField0MInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") := rfl
+
+/-- MIR of `fn uninit_tuple_field1() -> (u32, bool)` whose entry block switches
+on `_0.1` (at offset `4`) from the uninitialized `(u32, bool)` return place
+`_0`, raising UB in both Anneal and MiniRust. -/
+def uninitTupleField1 : CapturedMir where
+  defPath := "witness::uninit_tuple_field1"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u32BoolTupleDecl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.switchInt (.copy (field1 0)) { branches := [(0, 1)], otherwise := 1 }),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 0
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem uninitTupleField1_inFragment : inFragment uninitTupleField1 = true := by decide
+
+def uninitTupleField1Fn : Gen.Function where
+  locals := ⟨[(localName 0, intBoolTupleTy u32)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[],
+      .Switch
+        (.UnOp (.Cast (.Transmute (.Int u8)))
+          (.Load (.Field (.Local (localName 0)) 1)))
+        ⟨[(0, bbName 1)]⟩ (bbName 1), .Regular⟩),
+    (bbName 1, ⟨[], .Return, .Regular⟩),
+    (bbName 2, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 2
+  implicit_writes := true
+
+theorem uninitTupleField1_translate : translateFn uninitTupleField1 = some uninitTupleField1Fn := rfl
+
+def uninitTupleField1S0 : MachineState := initMachineState uninitTupleField1 []
+def uninitTupleField1MInit : Mach :=
+  machineWithCtx ctxTupleU32 uninitTupleField1 uninitTupleField1Fn
+    uninitTupleField1S0.frame.locals uninitTupleField1Fn.start
+
+theorem uninitTupleField1_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree uninitTupleField1 []) tr u ∧ FaultNow u :=
+  faultsA_sound uninitTupleField1 3 _ (by decide)
+
+theorem uninitTupleField1_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n uninitTupleField1MInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := uninitTupleField1_anneal_ub
+  exact mirCall_ub uninitTupleField1_inFragment uninitTupleField1_translate ctxTupleU32
+    (ctxTupleU32_ok1 rfl) [] (by decide) uninitTupleField1MInit rfl rfl rfl hr hf
+
+set_option maxRecDepth 8192 in
+theorem uninitTupleField1_minirust_direct :
+    Interp.steps 2 uninitTupleField1MInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") := rfl
+
+/-! ### Ground truth for `IntType::with_overflow`, `BinOpIntWithOverflow`, `ValueExpr::Tuple`, and `PlaceExpr::Field` -/
+
+/-- `IntType::with_overflow` layout on `i8` (size `2`, align `1`, no trailing
+padding) and on `u32` (size `8`, align `4`, field `0` at offset `0`, field `1`
+at offset `4`, and `3` trailing `AbstractByte::Uninit` padding bytes). -/
+theorem withOverflow_i8_layout :
+    IntType.with_overflow i8 = .ok (intBoolTupleTy i8) ∧
+      Type.layout (intBoolTupleTy i8) = .ok (.Sized ⟨2⟩ ⟨1⟩) := ⟨rfl, rfl⟩
+
+theorem withOverflow_u32_layout :
+    IntType.with_overflow u32 = .ok (intBoolTupleTy u32) ∧
+      Type.layout (intBoolTupleTy u32) = .ok (.Sized ⟨8⟩ ⟨4⟩) ∧
+      Type.encode (intBoolTupleTy u32) (.Tuple [.Int 0x01020304, .Bool true]) =
+        .ok [.Init 4 none, .Init 3 none, .Init 2 none, .Init 1 none,
+             .Init 1 none, .Uninit, .Uninit, .Uninit] := ⟨rfl, rfl, rfl⟩
+
+/-- `TupleHeadLayout::full_size_and_align` and `LayoutStrategy::compute_size_and_align`
+handle both `Sized` (`tail = none`) and `Unsized` (`Slice` / `TraitObject`) layouts. -/
+theorem tupleHeadLayout_full_sized_and_slice :
+    TupleHeadLayout.full_size_and_align ⟨⟨5⟩, ⟨4⟩, none⟩ ⟨0⟩ ⟨1⟩ = (⟨8⟩, ⟨4⟩) ∧
+      TupleHeadLayout.full_size_and_align ⟨⟨5⟩, ⟨4⟩, some ⟨2⟩⟩ ⟨6⟩ ⟨2⟩ = (⟨12⟩, ⟨4⟩) ∧
+      LayoutStrategy.compute_size_and_align (vtableLookup checkedTupleOkMInit)
+        (.Slice ⟨2⟩ ⟨2⟩) (some (.ElementCount 3)) = .ok (⟨6⟩, ⟨2⟩) := ⟨rfl, rfl, rfl⟩
+
+/-- Direct ground-truth evaluations of `evalBinOp (.IntWithOverflow ..)` on
+`INT_MAX + 1`, `INT_MIN - 1`, `UINT_MAX + 1`, `0 - 1`, and signed/unsigned
+multiplication overflow. -/
+theorem evalBinOp_addWithOverflow_i8_max :
+    evalBinOp (.IntWithOverflow .Add) (.Int 127, .Int i8) (.Int 1, .Int i8) =
+      .ok (.Tuple [.Int (-128), .Bool true], intBoolTupleTy i8) := rfl
+
+theorem evalBinOp_subWithOverflow_i8_min :
+    evalBinOp (.IntWithOverflow .Sub) (.Int (-128), .Int i8) (.Int 1, .Int i8) =
+      .ok (.Tuple [.Int 127, .Bool true], intBoolTupleTy i8) := rfl
+
+theorem evalBinOp_addWithOverflow_u32_max :
+    evalBinOp (.IntWithOverflow .Add) (.Int 4294967295, .Int u32) (.Int 1, .Int u32) =
+      .ok (.Tuple [.Int 0, .Bool true], intBoolTupleTy u32) := rfl
+
+theorem evalBinOp_subWithOverflow_u32_zero :
+    evalBinOp (.IntWithOverflow .Sub) (.Int 0, .Int u32) (.Int 1, .Int u32) =
+      .ok (.Tuple [.Int 4294967295, .Bool true], intBoolTupleTy u32) := rfl
+
+theorem evalBinOp_mulWithOverflow_i8_min :
+    evalBinOp (.IntWithOverflow .Mul) (.Int (-128), .Int i8) (.Int (-1), .Int i8) =
+      .ok (.Tuple [.Int (-128), .Bool true], intBoolTupleTy i8) := rfl
+
+theorem evalBinOp_mulWithOverflow_u32 :
+    evalBinOp (.IntWithOverflow .Mul) (.Int 65536, .Int u32) (.Int 65536, .Int u32) =
+      .ok (.Tuple [.Int 0, .Bool true], intBoolTupleTy u32) := rfl
+
+/-- `ptrOffsetInbounds` offsets a valid pointer within its live allocation and
+rejects out-of-bounds or negative offsets with UB, and `evalValue` / `evalPlace`
+evaluate `ValueExpr::Tuple` and `PlaceExpr::Field` on `(u32, bool)`. -/
+theorem ptrOffsetInbounds_ok_and_oob :
+    ptrOffsetInbounds checkedTupleOkMInit
+      { addr := 384, provenance := some (⟨3⟩, ()) } 4 =
+      .ok { addr := 388, provenance := some (⟨3⟩, ()) } ∧
+    ptrOffsetInbounds checkedTupleOkMInit
+      { addr := 384, provenance := some (⟨3⟩, ()) } 9 =
+      .error (.ub "dereferencing pointer outside the bounds of its allocation") ∧
+    ptrOffsetInbounds checkedTupleOkMInit
+      { addr := 384, provenance := some (⟨3⟩, ()) } (-1) =
+      .error (.ub "dereferencing pointer outside the bounds of its allocation") := ⟨rfl, rfl, rfl⟩
+
+theorem evalValue_tuple_and_evalPlace_field :
+    evalValue checkedTupleOkMInit
+      (.Tuple [.Constant (.Int 42) (.Int u32), .Constant (.Bool true) .Bool]
+        (intBoolTupleTy u32)) =
+      .ok ((.Tuple [.Int 42, .Bool true], intBoolTupleTy u32), checkedTupleOkMInit) ∧
+    evalPlace checkedTupleOkMInit (.Field (.Local (localName 0)) 0) =
+      .ok ({ ptr := { thin_pointer := { addr := 128, provenance := some (⟨1⟩, ()) }, metadata := none },
+             aligned := true }, .Int u32) ∧
+    evalPlace checkedTupleOkMInit (.Field (.Local (localName 0)) 1) =
+      .ok ({ ptr := { thin_pointer := { addr := 132, provenance := some (⟨1⟩, ()) }, metadata := none },
+             aligned := true }, .Bool) := ⟨rfl, rfl, rfl⟩
 
 end MiniRustSpec.Correspondence.Witness

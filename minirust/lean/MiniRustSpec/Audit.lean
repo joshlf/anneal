@@ -200,6 +200,36 @@ open MiniRustSpec.Correspondence in
   evalStmt_assignO
   translateOperand_ordering_const
   scalarTypeOf_cases
+  head_size_and_align_tuple
+  layout_tuple
+  withOverflow_eq
+  checkValue_tuple
+  encode_tuple
+  decode_tuple
+  decode_tuple_uninit
+  typedLoad_local_tuple
+  typedLoad_local_tuple_uninit
+  typedStore_local_tuple
+  typedLoad_local_localTy
+  typedLoad_local_localTy_uninit
+  evalPlace_field0
+  evalPlace_field1
+  typedLoad_local_tuple_field0
+  typedLoad_local_tuple_field0_uninit
+  typedLoad_local_tuple_field1
+  typedLoad_local_tuple_field1_uninit
+  evalBinOp_intWithOverflow
+  translateRvalue_checked
+  translateRvalue_tuple_agg
+  evalValue_operandTuple
+  evalValue_rvalueTuple
+  evalStatement_assignTuple
+  typedStore_base_tuple
+  typedStore_base_localTy
+  evalOperand_fragTuple
+  evalScalarBinOp_checked
+  evalRvalue_fragTuple
+  evalStmt_assignTuple
 
 open MiniRustSpec.Correspondence.Witness in
 #assert_standard_axioms
@@ -503,6 +533,63 @@ open MiniRustSpec.Correspondence.Witness in
   transmute_union_paddedPair
   transmute_paddedPair_union
   transmute_union_paddedPair_uninit_ub
+  ctxI8_ok_checkedArith
+  checkedArithI8_inFragment
+  checkedArithI8_translate
+  checkedArithInvalidTupleArg_rejected
+  checkedArithOk_anneal_ret
+  checkedArithOk_noUB
+  checkedArithOk_minirust_ret_from_start
+  checkedArithOk_minirust_direct
+  checkedArithAddOv_anneal_ret
+  checkedArithAddOv_noUB
+  checkedArithAddOv_minirust_ret_from_start
+  checkedArithAddOv_minirust_direct
+  checkedArithSubOv_anneal_ret
+  checkedArithSubOv_noUB
+  checkedArithSubOv_minirust_ret_from_start
+  checkedArithSubOv_minirust_direct
+  checkedArithMulOv_anneal_ret
+  checkedArithMulOv_noUB
+  checkedArithMulOv_minirust_ret_from_start
+  checkedArithMulOv_minirust_direct
+  ctxTupleU32_ok
+  checkedTupleU32_inFragment
+  checkedTupleU32_translate
+  checkedTupleUnderAddOv_anneal_ret
+  checkedTupleUnderAddOv_noUB
+  checkedTupleUnderAddOv_minirust_ret_from_start
+  checkedTupleUnderAddOv_minirust_direct
+  checkedTupleMulOv_anneal_ret
+  checkedTupleMulOv_noUB
+  checkedTupleMulOv_minirust_ret_from_start
+  checkedTupleMulOv_minirust_direct
+  checkedTupleOk_anneal_ret
+  checkedTupleOk_noUB
+  checkedTupleOk_minirust_ret_from_start
+  checkedTupleOk_minirust_direct
+  ctxTupleU32_ok1
+  uninitTupleField0_inFragment
+  uninitTupleField0_translate
+  uninitTupleField0_anneal_ub
+  uninitTupleField0_minirust_ub_from_start
+  uninitTupleField0_minirust_direct
+  uninitTupleField1_inFragment
+  uninitTupleField1_translate
+  uninitTupleField1_anneal_ub
+  uninitTupleField1_minirust_ub_from_start
+  uninitTupleField1_minirust_direct
+  withOverflow_i8_layout
+  withOverflow_u32_layout
+  tupleHeadLayout_full_sized_and_slice
+  evalBinOp_addWithOverflow_i8_max
+  evalBinOp_subWithOverflow_i8_min
+  evalBinOp_addWithOverflow_u32_max
+  evalBinOp_subWithOverflow_u32_zero
+  evalBinOp_mulWithOverflow_i8_min
+  evalBinOp_mulWithOverflow_u32
+  ptrOffsetInbounds_ok_and_oob
+  evalValue_tuple_and_evalPlace_field
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -565,6 +652,36 @@ open MiniRustSpec.Correspondence in
   evalValue_translateCmp
   validBits_ordering
   typedStore_base_byte
+  head_size_and_align_tuple
+  layout_tuple
+  withOverflow_eq
+  checkValue_tuple
+  encode_tuple
+  decode_tuple
+  decode_tuple_uninit
+  typedLoad_local_tuple
+  typedLoad_local_tuple_uninit
+  typedStore_local_tuple
+  typedLoad_local_localTy
+  typedLoad_local_localTy_uninit
+  evalPlace_field0
+  evalPlace_field1
+  typedLoad_local_tuple_field0
+  typedLoad_local_tuple_field0_uninit
+  typedLoad_local_tuple_field1
+  typedLoad_local_tuple_field1_uninit
+  evalBinOp_intWithOverflow
+  translateRvalue_checked
+  translateRvalue_tuple_agg
+  evalValue_operandTuple
+  evalValue_rvalueTuple
+  evalStatement_assignTuple
+  typedStore_base_tuple
+  typedStore_base_localTy
+  evalOperand_fragTuple
+  evalScalarBinOp_checked
+  evalRvalue_fragTuple
+  evalStmt_assignTuple
 
 open MiniRustSpec.Correspondence.Witness in
 #check_theorem_deps "[WITNESS-AUDIT]"
@@ -706,6 +823,63 @@ open MiniRustSpec.Correspondence.Witness in
   transmute_union_paddedPair
   transmute_paddedPair_union
   transmute_union_paddedPair_uninit_ub
+  ctxI8_ok_checkedArith
+  checkedArithI8_inFragment
+  checkedArithI8_translate
+  checkedArithInvalidTupleArg_rejected
+  checkedArithOk_anneal_ret
+  checkedArithOk_noUB
+  checkedArithOk_minirust_ret_from_start
+  checkedArithOk_minirust_direct
+  checkedArithAddOv_anneal_ret
+  checkedArithAddOv_noUB
+  checkedArithAddOv_minirust_ret_from_start
+  checkedArithAddOv_minirust_direct
+  checkedArithSubOv_anneal_ret
+  checkedArithSubOv_noUB
+  checkedArithSubOv_minirust_ret_from_start
+  checkedArithSubOv_minirust_direct
+  checkedArithMulOv_anneal_ret
+  checkedArithMulOv_noUB
+  checkedArithMulOv_minirust_ret_from_start
+  checkedArithMulOv_minirust_direct
+  ctxTupleU32_ok
+  checkedTupleU32_inFragment
+  checkedTupleU32_translate
+  checkedTupleUnderAddOv_anneal_ret
+  checkedTupleUnderAddOv_noUB
+  checkedTupleUnderAddOv_minirust_ret_from_start
+  checkedTupleUnderAddOv_minirust_direct
+  checkedTupleMulOv_anneal_ret
+  checkedTupleMulOv_noUB
+  checkedTupleMulOv_minirust_ret_from_start
+  checkedTupleMulOv_minirust_direct
+  checkedTupleOk_anneal_ret
+  checkedTupleOk_noUB
+  checkedTupleOk_minirust_ret_from_start
+  checkedTupleOk_minirust_direct
+  ctxTupleU32_ok1
+  uninitTupleField0_inFragment
+  uninitTupleField0_translate
+  uninitTupleField0_anneal_ub
+  uninitTupleField0_minirust_ub_from_start
+  uninitTupleField0_minirust_direct
+  uninitTupleField1_inFragment
+  uninitTupleField1_translate
+  uninitTupleField1_anneal_ub
+  uninitTupleField1_minirust_ub_from_start
+  uninitTupleField1_minirust_direct
+  withOverflow_i8_layout
+  withOverflow_u32_layout
+  tupleHeadLayout_full_sized_and_slice
+  evalBinOp_addWithOverflow_i8_max
+  evalBinOp_subWithOverflow_i8_min
+  evalBinOp_addWithOverflow_u32_max
+  evalBinOp_subWithOverflow_u32_zero
+  evalBinOp_mulWithOverflow_i8_min
+  evalBinOp_mulWithOverflow_u32
+  ptrOffsetInbounds_ok_and_oob
+  evalValue_tuple_and_evalPlace_field
   sumTo_minirust_ret_from_start
   castBitNot4_minirust_ret_from_start
   uninitSwitchUb_minirust_ub_from_start

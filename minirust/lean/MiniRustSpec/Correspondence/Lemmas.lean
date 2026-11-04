@@ -83,9 +83,45 @@ theorem isOrderingTy_isBoolTy {t : MirAst.Ty} (h : isOrderingTy t = true) : isBo
   unfold isBoolTy
   split at h <;> simp_all
 
+theorem intTypeOf_intBoolTupleOf {t : MirAst.Ty} {it : Gen.IntType} (h : intTypeOf t = some it) :
+    intBoolTupleOf t = none := by
+  unfold intTypeOf intTyBytes at h
+  unfold intBoolTupleOf
+  split at h <;> simp_all
+
+theorem intBoolTupleOf_intTypeOf {t : MirAst.Ty} {it : Gen.IntType}
+    (h : intBoolTupleOf t = some it) : intTypeOf t = none := by
+  unfold intBoolTupleOf at h
+  unfold intTypeOf intTyBytes
+  split at h <;> simp_all
+
+theorem intBoolTupleOf_isBoolTy {t : MirAst.Ty} {it : Gen.IntType}
+    (h : intBoolTupleOf t = some it) : isBoolTy t = false := by
+  unfold intBoolTupleOf at h
+  unfold isBoolTy
+  split at h <;> simp_all
+
+theorem isBoolTy_intBoolTupleOf {t : MirAst.Ty} (h : isBoolTy t = true) :
+    intBoolTupleOf t = none := by
+  unfold isBoolTy at h
+  unfold intBoolTupleOf
+  split at h <;> simp_all
+
+theorem intBoolTupleOf_isOrderingTy {t : MirAst.Ty} {it : Gen.IntType}
+    (h : intBoolTupleOf t = some it) : isOrderingTy t = false := by
+  unfold intBoolTupleOf at h
+  unfold isOrderingTy
+  split at h <;> simp_all
+
+theorem isOrderingTy_intBoolTupleOf {t : MirAst.Ty} (h : isOrderingTy t = true) :
+    intBoolTupleOf t = none := by
+  unfold isOrderingTy at h
+  unfold intBoolTupleOf
+  split at h <;> simp_all
+
 theorem scalarTypeOf_int {t : MirAst.Ty} {it : Gen.IntType} (h : intTypeOf t = some it) :
     scalarTypeOf t = some (.Int it) := by
-  simp [scalarTypeOf, intTypeOf_isBoolTy h, intTypeOf_isOrderingTy h, h]
+  simp [scalarTypeOf, intTypeOf_isBoolTy h, intTypeOf_isOrderingTy h, intTypeOf_intBoolTupleOf h, h]
 
 theorem scalarTypeOf_bool {t : MirAst.Ty} (h : isBoolTy t = true) : scalarTypeOf t = some .Bool := by
   simp [scalarTypeOf, h]
@@ -94,33 +130,71 @@ theorem scalarTypeOf_ordering {t : MirAst.Ty} (h : isOrderingTy t = true) :
     scalarTypeOf t = some orderingTy := by
   simp [scalarTypeOf, h, isOrderingTy_isBoolTy h]
 
-/-- A fragment type is `bool`, an integer type, or `core::cmp::Ordering`. -/
+theorem scalarTypeOf_tuple {t : MirAst.Ty} {it : Gen.IntType} (h : intBoolTupleOf t = some it) :
+    scalarTypeOf t = some (intBoolTupleTy it) := by
+  simp [scalarTypeOf, intBoolTupleOf_isBoolTy h, intBoolTupleOf_isOrderingTy h, h]
+
+/-- A fragment type is `bool`, an integer type, `core::cmp::Ordering`, or a
+2-tuple `(Int, bool)`. -/
 theorem scalarTypeOf_cases {t : MirAst.Ty} {T : Gen.Type} (h : scalarTypeOf t = some T) :
     (isBoolTy t = true ∧ T = .Bool) ∨ (∃ it, intTypeOf t = some it ∧ T = .Int it) ∨
-      (isOrderingTy t = true ∧ T = orderingTy) := by
+      (isOrderingTy t = true ∧ T = orderingTy) ∨
+      (∃ it, intBoolTupleOf t = some it ∧ T = intBoolTupleTy it) := by
   unfold scalarTypeOf at h
   cases hb : isBoolTy t with
   | true => simp [hb] at h; exact .inl ⟨rfl, h.symm⟩
   | false =>
     simp only [hb, Bool.false_eq_true, ↓reduceIte] at h
     cases ho : isOrderingTy t with
-    | true => simp [ho] at h; exact .inr (.inr ⟨rfl, h.symm⟩)
+    | true => simp [ho] at h; exact .inr (.inr (.inl ⟨rfl, h.symm⟩))
     | false =>
       simp only [ho, Bool.false_eq_true, ↓reduceIte] at h
-      cases hit : intTypeOf t with
-      | none => simp [hit] at h
-      | some it => simp [hit] at h; exact .inr (.inl ⟨it, rfl, h.symm⟩)
+      cases htup : intBoolTupleOf t with
+      | some it => simp [htup] at h; exact .inr (.inr (.inr ⟨it, rfl, h.symm⟩))
+      | none =>
+        simp only [htup] at h
+        cases hit : intTypeOf t with
+        | none => simp [hit] at h
+        | some it => simp [hit] at h; exact .inr (.inl ⟨it, rfl, h.symm⟩)
 
 theorem tyOf_int {d : LocalDecl} {it : Gen.IntType} (h : intTypeOf d.ty = some it) :
     tyOf d = .Int it ∧ itOf d = it := by
   simp [tyOf, itOf, scalarTypeOf_int h, h]
 
 theorem tyOf_bool {d : LocalDecl} (h : isBoolTy d.ty = true) : tyOf d = .Bool ∧ itOf d = u8Ty := by
-  simp [tyOf, itOf, scalarTypeOf_bool h, isBoolTy_intTypeOf h, u8Ty]
+  simp [tyOf, itOf, scalarTypeOf_bool h, isBoolTy_intTypeOf h, isBoolTy_intBoolTupleOf h, u8Ty]
 
 theorem tyOf_ordering {d : LocalDecl} (h : isOrderingTy d.ty = true) :
     tyOf d = orderingTy ∧ itOf d = u8Ty := by
-  simp [tyOf, itOf, scalarTypeOf_ordering h, isOrderingTy_intTypeOf h, u8Ty]
+  simp [tyOf, itOf, scalarTypeOf_ordering h, isOrderingTy_intTypeOf h, isOrderingTy_intBoolTupleOf h, u8Ty]
+
+theorem tyOf_tuple {d : LocalDecl} {it : Gen.IntType} (h : intBoolTupleOf d.ty = some it) :
+    tyOf d = intBoolTupleTy it ∧ itOf d = it := by
+  simp [tyOf, itOf, scalarTypeOf_tuple h, intBoolTupleOf_intTypeOf h, h]
+
+@[simp] theorem tupleIntOfTy_intBoolTupleTy (it : Gen.IntType) :
+    tupleIntOfTy (intBoolTupleTy it) = some it := by
+  simp [intBoolTupleTy, tupleIntOfTy]
+
+@[simp] theorem tupleIntOfTy_int (it : Gen.IntType) : tupleIntOfTy (.Int it) = none := rfl
+@[simp] theorem tupleIntOfTy_bool : tupleIntOfTy .Bool = none := rfl
+@[simp] theorem tupleIntOfTy_orderingTy : tupleIntOfTy orderingTy = none := rfl
+
+theorem declSlotData_of_none {d : LocalDecl} (h : intBoolTupleOf d.ty = none) (slot : LocalSlot) :
+    declSlotData d slot = slotData (itOf d) slot := by
+  simp [declSlotData, h]
+
+theorem declSlotData_of_some {d : LocalDecl} {it : Gen.IntType} (h : intBoolTupleOf d.ty = some it)
+    (slot : LocalSlot) : declSlotData d slot = tupleSlotData it slot := by
+  simp [declSlotData, h]
+
+/-- `2-tuple` constants are outside the fragment: `translateOperand` reads
+only integer and `bool` scalars. -/
+theorem translateOperand_tuple_const {c : ConstOperand} {it : Gen.IntType}
+    (ht : intBoolTupleOf c.ty = some it) : translateOperand (.constant c) = none := by
+  simp only [translateOperand, intBoolTupleOf_isBoolTy ht, Bool.false_eq_true, ↓reduceIte,
+    intBoolTupleOf_intTypeOf ht]
+  split <;> simp_all
 
 /-- `Ordering` constants are outside the fragment: `translateOperand` reads
 only integer and `bool` scalars. -/

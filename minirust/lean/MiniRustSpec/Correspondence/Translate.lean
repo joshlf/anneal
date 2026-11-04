@@ -28,9 +28,9 @@ we choose the program that MiniRust's tooling would produce.
 The translation is defined only on the fragment checked by `inFragment`:
 
 * the body declares exactly the return place and the arguments
-  (`localDecls.length = argCount + 1`), all of integer, `bool`, or
-  `core::cmp::Ordering` type;
-* statements are `_i = Use(copy _j)`, `_i = Use(const c)`,
+  (`localDecls.length = argCount + 1`), all of integer, `bool`,
+  `core::cmp::Ordering`, or `(Int, bool)` 2-tuple type;
+* statements are `_i = Use(copy _j)`, `_i = Use(copy (_j.0))`, `_i = Use(const c)`,
   `_i = UnaryOp(uop, a)` with `uop ∈ {Neg, Not}`,
   `_i = BinaryOp(op, a, b)` with
   `op ∈ {Add, Sub, Mul, Div, Rem, BitXor, BitAnd, BitOr, Shl, Shr, AddUnchecked, SubUnchecked, MulUnchecked, ShlUnchecked, ShrUnchecked}`
@@ -45,8 +45,13 @@ The translation is defined only on the fragment checked by `inFragment`:
   `_i = BinaryOp(Eq | Ne | Lt | Le | Gt | Ge, a, b)` of two integer operands
   of one type or of two `bool` operands; for an `Ordering` `_i`, `_i =
   Use(copy _j)` of an `Ordering` local and the three-way comparison
-  `_i = BinaryOp(Cmp, a, b)` of such operands; every operand is `copy _j` (no
-  projections) or a scalar constant; or `PlaceMention(_i)`;
+  `_i = BinaryOp(Cmp, a, b)` of such operands; for an `(it, bool)` 2-tuple `_i`,
+  `_i = Use(copy _j)` of an `(it, bool)` local, the checked integer operations
+  `_i = BinaryOp(AddWithOverflow | SubWithOverflow | MulWithOverflow, a, b)` of
+  two integer operands of type `it`, and `_i = Aggregate(Tuple, [a, b])` of an
+  integer operand `a` of type `it` and a `bool` operand `b`; every operand is
+  `copy _j`, a 2-tuple field projection `copy (_j.0)` or `copy (_j.1)`, or a
+  scalar constant; or `PlaceMention(_i)`;
 * terminators are `Goto`, `SwitchInt` on an integer or `bool` operand
   (`copy _j` or constant), `Unreachable`, or `Return`, and every jump target is
   a block of the body;
@@ -210,6 +215,42 @@ def orderingTy : Gen.Type :=
       ⟨[((-1, 0), .Known (-1)), ((0, 1), .Known 0), ((1, 2), .Known 1)]⟩)
     ⟨1⟩ ⟨1⟩
 
+/-- Whether a MIR type is a 2-tuple `(Int, bool)` (`rs::TyKind::Tuple` of an
+integer type and `bool`), returning the integer type of field 0. -/
+def intBoolTupleOf (t : MirAst.Ty) : Option Gen.IntType :=
+  match t.kind with
+  | .tuple [t0, .bool] => (intTyBytes t0).map (fun (s, n) => ⟨s, ⟨n⟩⟩)
+  | _ => none
+
+/-- `minimize`'s translation of a 2-tuple `(Int, bool)` where field 0 has
+integer type `it` (`tooling/minimize/src/ty.rs`):
+> "rs::TyKind::Tuple(..) => {
+>      let layout = self.rs_layout_of(ty);
+>      self.tuple_from_layout(layout, span)
+>  }"
+with `tuple_from_layout` (`tooling/minimize/src/ty.rs`):
+> "fn tuple_from_layout(&mut self, layout: rs::TyAndLayout<'tcx>, span: rs::Span) -> Type {
+>      let size = translate_size(layout.size);
+>      let align = translate_align(layout.align.abi);
+>      let fields: Vec<(Size, Type)> = (0..layout.fields.count())
+>          .map(|i| {
+>              let ty = layout.field(self, i).ty;
+>              let ty = self.translate_ty(ty, span);
+>              let offset = layout.fields.offset(i);
+>              let offset = translate_size(offset);
+>              (offset, ty)
+>          })
+>          .collect();
+>      build::tuple_ty(&fields, size, align)
+>  }"
+For `(it, bool)` on `x86_64`, field 0 (`Type::Int(it)`) is at offset `0`,
+field 1 (`Type::Bool`) is at offset `it.size`, the overall alignment is
+`it.size.bytes` (a power of two), and the overall size is rounded up to the
+alignment (`2 * it.size.bytes`), matching `IntType::with_overflow`
+(`MiniRustSpec.Interp.IntType.with_overflow`). -/
+def intBoolTupleTy (it : Gen.IntType) : Gen.Type :=
+  .Tuple [(⟨0⟩, .Int it), (it.size, .Bool)] ⟨⟨it.size.bytes + it.size.bytes⟩, ⟨it.size.bytes⟩, none⟩ none
+
 /-- `minimize`'s type translation for the fragment's types
 (`tooling/minimize/src/ty.rs`):
 > "rs::TyKind::Bool => Type::Bool,
@@ -221,11 +262,15 @@ def orderingTy : Gen.Type :=
 >      let sz = rs::abi::Integer::from_uint_ty(&self.tcx, *t).size();
 >      Type::Int(IntType { size: translate_size(sz), signed: Signedness::Unsigned })
 >  }"
-and `core::cmp::Ordering`, whose translation is `orderingTy`. -/
+`core::cmp::Ordering`, whose translation is `orderingTy`, and 2-tuples
+`(Int, bool)`, whose translation is `intBoolTupleTy`. -/
 def scalarTypeOf (t : MirAst.Ty) : Option Gen.Type :=
   if isBoolTy t then some .Bool
   else if isOrderingTy t then some orderingTy
-  else (intTypeOf t).map .Int
+  else
+    match intBoolTupleOf t with
+    | some it => some (intBoolTupleTy it)
+    | none => (intTypeOf t).map .Int
 
 /-- `minimize`'s `int_from_bits(bits, int_ty)`: interpret a `u128` bit pattern as
 the mathematical integer it encodes at type `int_ty` (two's complement for
@@ -236,16 +281,50 @@ def intFromBits (bits : Nat) (it : Gen.IntType) : Int :=
   | .Signed =>
     if bits < 2 ^ (8 * it.size.bytes - 1) then bits else (bits : Int) - 2 ^ (8 * it.size.bytes)
 
-/-- Type of a fragment operand: `copy _j` has `_j`'s declared type; a constant
-carries its type. -/
+/-- `minimize`'s place translation for locals and single-level field
+projections (`tooling/minimize/src/rvalue.rs`):
+> "let expr = PlaceExpr::Local(self.local_name_map[&place.local.into()]);
+>  let place_ty = self.locals_smir[place.local].ty;
+>  // Fold over all projections
+>  let (expr, _place_ty) =
+>      place.projection.iter().fold((expr, place_ty), |(expr, place_ty), proj| {
+>          let this_ty = proj.ty(place_ty).unwrap();
+>          let this_expr = match proj {
+>              smir::ProjectionElem::Field(f, _ty) => {
+>                  let indirected = GcCow::new(expr);
+>                  PlaceExpr::Field { root: indirected, field: (*f).into() }
+>              }" -/
+def translatePlace : MirAst.Place → Option Gen.PlaceExpr
+  | ⟨j, []⟩ => some (.Local (localName j))
+  | ⟨j, [.field f _]⟩ => some (.Field (.Local (localName j)) (f : Int))
+  | _ => none
+
+/-- Integer type of a fragment operand: `copy _j` has `_j`'s declared type,
+`copy (_j.0)` on an `(it, bool)` local has type `it`, and a constant carries
+its type. -/
 def operandIntType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.IntType
   | .copy ⟨j, []⟩ => decls[j]? >>= fun d => intTypeOf d.ty
+  | .copy ⟨j, [.field 0 fTy]⟩ => do
+    let d ← decls[j]?
+    let it ← intBoolTupleOf d.ty
+    let fIt ← intTypeOf fTy
+    if fIt == it then some it else none
   | .constant c => intTypeOf c.ty
   | _ => none
 
-/-- MiniRust type (an integer type or `Type::Bool`) of a fragment operand. -/
+/-- MiniRust type of a fragment operand (including `copy (_j.0)` and
+`copy (_j.1)` field projections on an `(it, bool)` tuple local). -/
 def operandType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.Type
   | .copy ⟨j, []⟩ => decls[j]? >>= fun d => scalarTypeOf d.ty
+  | .copy ⟨j, [.field 0 fTy]⟩ => do
+    let d ← decls[j]?
+    let it ← intBoolTupleOf d.ty
+    let fIt ← intTypeOf fTy
+    if fIt == it then some (.Int it) else none
+  | .copy ⟨j, [.field 1 fTy]⟩ => do
+    let d ← decls[j]?
+    let _ ← intBoolTupleOf d.ty
+    if isBoolTy fTy then some .Bool else none
   | .constant c => scalarTypeOf c.ty
   | _ => none
 
@@ -253,18 +332,18 @@ def operandType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.
 > "smir::Operand::Constant(c) => self.translate_const_smir(&c.const_, span),
 >  smir::Operand::Copy(place) =>
 >      ValueExpr::Load { source: GcCow::new(self.translate_place_smir(place, span)) },"
-restricted to projection-free places (`PlaceExpr::Local`) and scalar
-constants. For an integer constant, `translate_const_val`
-(`tooling/minimize/src/constant.rs`) reads the scalar at the constant's type,
-which is `Constant::Int(int_from_bits(..))`; for a `bool` constant it reads a
-`bool`, which rustc's `Scalar::to_bool` accepts only for the one-byte patterns
-`0` and `1`:
+restricted to fragment places (`PlaceExpr::Local` and `PlaceExpr::Field`, see
+`translatePlace`) and scalar constants. For an integer constant,
+`translate_const_val` (`tooling/minimize/src/constant.rs`) reads the scalar at
+the constant's type, which is `Constant::Int(int_from_bits(..))`; for a `bool`
+constant it reads a `bool`, which rustc's `Scalar::to_bool` accepts only for
+the one-byte patterns `0` and `1`:
 > "Type::Bool => {
 >      let val = ecx.read_scalar(&val).unwrap().to_bool().unwrap();
 >      ValueExpr::Constant(Constant::Bool(val), ty)
 >  }" (`tooling/minimize/src/constant.rs`) -/
 def translateOperand : MirAst.Operand → Option Gen.ValueExpr
-  | .copy ⟨j, []⟩ => some (.Load (.Local (localName j)))
+  | .copy p => (translatePlace p).map .Load
   | .constant c =>
     if isBoolTy c.ty then
       match c.val with
@@ -447,11 +526,33 @@ translation of `Ordering` is `orderingTy`. MiniRust thus computes the `i8`
 def translateCmp (l r : Gen.ValueExpr) : Gen.ValueExpr :=
   .UnOp (.Cast (.Transmute orderingTy)) (.BinOp (.Rel .Cmp) l r)
 
+/-- `minimize`'s checked binary-operator translation for integer operands
+(`tooling/minimize/src/rvalue.rs`):
+> "smir::Rvalue::CheckedBinaryOp(op, l, r) => {
+>      let l = GcCow::new(self.translate_operand_smir(l, span));
+>      let r = GcCow::new(self.translate_operand_smir(r, span));
+>      let op = match op {
+>          smir::BinOp::Add => BinOp::IntWithOverflow(IntBinOpWithOverflow::Add),
+>          smir::BinOp::Sub => BinOp::IntWithOverflow(IntBinOpWithOverflow::Sub),
+>          smir::BinOp::Mul => BinOp::IntWithOverflow(IntBinOpWithOverflow::Mul),
+>          x => panic!(\"CheckedBinaryOp {x:?} not supported.\"),
+>      };
+>      ValueExpr::BinOp { operator: op, left: l, right: r }
+>  }"
+In `stable_mir` / `rustc_public`, `CheckedBinaryOp(Add | Sub | Mul, l, r)` is
+represented as `Rvalue::BinaryOp(AddWithOverflow | SubWithOverflow | MulWithOverflow, l, r)`. -/
+def translateCheckedBinOp : MirAst.BinOp → Option Gen.IntBinOpWithOverflow
+  | .addWithOverflow => some .Add
+  | .subWithOverflow => some .Sub
+  | .mulWithOverflow => some .Mul
+  | _ => none
+
 /-- `minimize`'s rvalue translation for `Use`, `UnaryOp(Neg | Not)` on
-integers, `UnaryOp(Not)` on `bool`, integer `BinaryOp`s, `bool` bitwise
-`BinaryOp`s (`BitAnd | BitOr | BitXor` via `boolBitOp`), the comparison
-`BinaryOp`s (including the three-way `Cmp`, `translateCmp`), and
-`Cast(CastKind::IntToInt)` on integers and `bool`
+integers, `UnaryOp(Not)` on `bool`, integer `BinaryOp`s, checked integer
+`BinaryOp`s (`AddWithOverflow | SubWithOverflow | MulWithOverflow`), `bool`
+bitwise `BinaryOp`s (`BitAnd | BitOr | BitXor` via `boolBitOp`), the comparison
+`BinaryOp`s (including the three-way `Cmp`, `translateCmp`), `Aggregate` on
+2-tuples `(Int, bool)`, and `Cast(CastKind::IntToInt)` on integers and `bool`
 (`tooling/minimize/src/rvalue.rs`):
 > "match rv {
 >      smir::Rvalue::Use(operand) => self.translate_operand_smir(operand, span),
@@ -476,6 +577,20 @@ integers, `UnaryOp(Not)` on `bool`, integer `BinaryOp`s, `bool` bitwise
 >              (Neg, Type::Int(_)) => build::neg(operand),
 >              (Not, Type::Int(_)) => build::bit_not(operand),
 >              (Not, Type::Bool) => build::not(operand),
+>              ..
+>          }
+>      }
+>      ..
+>      smir::Rvalue::Aggregate(agg, operands) => {
+>          let ty = rv.ty(&self.locals_smir).unwrap();
+>          let ty = self.translate_ty_smir(ty, span);
+>          match ty {
+>              ..
+>              Type::Tuple { .. } | Type::Array { .. } => {
+>                  let ops: List<_> =
+>                      operands.iter().map(|x| self.translate_operand_smir(x, span)).collect();
+>                  ValueExpr::Tuple(ops, ty)
+>              }
 >              ..
 >          }
 >      }
@@ -533,9 +648,17 @@ def translateRvalue (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Option G
           pure (boolBitOp biop el er)
         | _ => none
       | none =>
-        match op with
-        | .cmp => pure (translateCmp el er)
-        | _ => none
+        match translateCheckedBinOp op with
+        | some cop => pure (.BinOp (.IntWithOverflow cop) el er)
+        | none =>
+          match op with
+          | .cmp => pure (translateCmp el er)
+          | _ => none
+  | .aggregate .tuple [op0, op1] => do
+    let e0 ← translateOperand op0
+    let e1 ← translateOperand op1
+    let it ← operandIntType decls op0
+    pure (.Tuple [e0, e1] (intBoolTupleTy it))
   | .cast .intToInt op targetTy => do
     let intTy ← intTypeOf targetTy
     let operand ← translateOperand op
@@ -718,10 +841,12 @@ def translateFn (body : MirAst.CapturedMir) : Option Gen.Function := do
 
 /-! ## The fragment -/
 
-/-- A projection-free integer operand of type `it`. -/
+/-- A fragment integer operand of type `it`: an integer local `copy _j`, field
+0 `copy (_j.0)` of an `(it, bool)` tuple local, or an integer constant. -/
 def operandOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) (op : MirAst.Operand) : Bool :=
   match op with
-  | .copy ⟨j, []⟩ => decide (j < decls.length) && decide (operandIntType decls op = some it)
+  | .copy ⟨j, []⟩ | .copy ⟨j, [.field 0 _]⟩ =>
+    decide (j < decls.length) && decide (operandIntType decls op = some it)
   | .constant _ =>
     decide (operandIntType decls op = some it) && (translateOperand op).isSome
   | _ => false
@@ -743,11 +868,13 @@ def operandIsBool (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :
   | some .Bool => true
   | _ => false
 
-/-- A projection-free `bool` operand: a `bool` local, or a `bool` constant
-that `minimize` can read (`0` or `1`). -/
+/-- A fragment `bool` operand: a `bool` local `copy _j`, field 1 `copy (_j.1)`
+of an `(Int, bool)` tuple local, or a `bool` constant that `minimize` can read
+(`0` or `1`). -/
 def operandOkB (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
   match op with
-  | .copy ⟨j, []⟩ => decide (j < decls.length) && operandIsBool decls op
+  | .copy ⟨j, []⟩ | .copy ⟨j, [.field 1 _]⟩ =>
+    decide (j < decls.length) && operandIsBool decls op
   | .constant _ => operandIsBool decls op && (translateOperand op).isSome
   | _ => false
 
@@ -818,10 +945,34 @@ def rvalueOkO (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Bool
   | .binaryOp .cmp a b => relOperandsOk decls a b
   | _ => false
 
+/-- Field-0 integer type of a projection-free `(Int, bool)` 2-tuple operand. -/
+def operandTupleIntType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.IntType
+  | .copy ⟨j, []⟩ => decls[j]? >>= fun d => intBoolTupleOf d.ty
+  | _ => none
+
+/-- A projection-free `(Int, bool)` 2-tuple operand of field-0 integer type `it`. -/
+def operandOkTuple (decls : List MirAst.LocalDecl) (it : Gen.IntType) (op : MirAst.Operand) : Bool :=
+  match op with
+  | .copy ⟨j, []⟩ =>
+    decide (j < decls.length) && decide (operandTupleIntType decls op = some it)
+  | _ => false
+
+/-- Fragment rvalues of 2-tuple type `(it, bool)`: a 2-tuple operand, a
+checked binary operation `AddWithOverflow | SubWithOverflow | MulWithOverflow`
+on two integer operands of type `it`, or a 2-tuple aggregate `(a, b)` of an
+integer operand of type `it` and a `bool` operand. -/
+def rvalueOkTuple (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rvalue → Bool
+  | .use op => operandOkTuple decls it op
+  | .binaryOp op a b =>
+    (translateCheckedBinOp op).isSome && operandOk decls it a && operandOk decls it b
+  | .aggregate .tuple [a, b] => operandOk decls it a && operandOkB decls b
+  | _ => false
+
 /-- Fragment statements, type-checked against the destination's type: an
 integer destination takes an integer rvalue (`rvalueOk`), a `bool`
-destination takes a `bool` rvalue (`rvalueOkB`), and an `Ordering`
-destination takes a three-way comparison (`rvalueOkO`). -/
+destination takes a `bool` rvalue (`rvalueOkB`), an `Ordering` destination
+takes a three-way comparison (`rvalueOkO`), and an `(it, bool)` 2-tuple
+destination takes a 2-tuple rvalue (`rvalueOkTuple`). -/
 def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement) : Bool :=
   match s.kind with
   | .assign ⟨i, []⟩ rv =>
@@ -831,9 +982,12 @@ def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement) : Bool :=
       if isBoolTy d.ty then rvalueOkB decls rv
       else if isOrderingTy d.ty then rvalueOkO decls rv
       else
-        match intTypeOf d.ty with
-        | none => false
-        | some it => rvalueOk decls it rv
+        match intBoolTupleOf d.ty with
+        | some it => rvalueOkTuple decls it rv
+        | none =>
+          match intTypeOf d.ty with
+          | none => false
+          | some it => rvalueOk decls it rv
   | .placeMention ⟨i, []⟩ => decide (i < decls.length)
   | _ => false
 
