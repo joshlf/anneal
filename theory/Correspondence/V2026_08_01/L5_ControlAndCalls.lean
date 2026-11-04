@@ -1608,6 +1608,14 @@ theorem mir_evalTerminator_diverging_call_partition_and_cleanup_chain
         | .running nextState => MirStepNode.step nextState
         | .halted out => MirStepNode.retOutcome out
         | .faulted fk => MirStepNode.fail fk) ∧
+    (findCallee? s.memory.callees defPath = .none →
+      isUnreachableCallTarget defPath = false →
+      isAbortingPanicDefPath defPath = false →
+      isUnwindingPanicDefPath defPath = false →
+      evalTerminator s ⟨.call func argOps destination .none unwind, span⟩ (.some callerBody) =
+        MirStepNode.extCall
+          { defPath := defPath, args := argVals, memory := s.memory }
+          (resumeExternalDivergingCall s locals' unwind)) ∧
     (applyUnwindAction s₁ calleeLocalsAfterPanic s₁.memory (.cleanup calleeCleanupBb) =
       .running s₂ ∧
      evalTerminator s₂ ⟨.unwindResume, span⟩ (.some calleeBody) =
@@ -1618,7 +1626,7 @@ theorem mir_evalTerminator_diverging_call_partition_and_cleanup_chain
      evalTerminator s₃ ⟨.unwindTerminate, span⟩ (.some callerBody) =
        MirStepNode.retOutcome .abort) := by
   dsimp only
-  refine ⟨?_, ?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
   · intro hFindNone hUnreach
     simp only [evalTerminator, resolveCallTarget, hFunc, hArgs, hFindNone, hUnreach]
   · intro hFindNone hNotUnreach hAbort
@@ -1627,6 +1635,9 @@ theorem mir_evalTerminator_diverging_call_partition_and_cleanup_chain
     simp only [evalTerminator, resolveCallTarget, hFunc, hArgs, hFindNone,
       hNotUnreach, hNotAbort, hPanic]
     cases applyUnwindAction s locals' s.memory unwind <;> rfl
+  · intro hFindNone hNotUnreach hNotAbort hNotPanic
+    simp only [evalTerminator, resolveCallTarget, hFunc, hArgs, hFindNone,
+      hNotUnreach, hNotAbort, hNotPanic]
   · refine ⟨rfl, ?_, ?_, rfl⟩
     · simp [evalTerminator, pushDivergingCalleeFrame, unwindFromCallStack, restoreCallerProtectors]
     · intro hNil
