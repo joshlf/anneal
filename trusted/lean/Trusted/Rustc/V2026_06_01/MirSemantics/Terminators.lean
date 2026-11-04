@@ -1025,11 +1025,56 @@ def resolveIntrinsicShiftSigned
     | _ => .none
 
 /--
-Look up a `TypeLayout` for `ty : RigidTy` by scanning `localDecls` for a
-declaration with `rigidTyEq decl.ty.kind ty`, returning `.none` when no local of
-type `ty` carries a layout. There is deliberately no positional fallback: an
-unrelated entry such as `layouts.entries[0]` (often the return place's layout)
-would silently report the wrong size and alignment.
+Check whether any element of `ks` satisfies `pred`.
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Most types have a fixed size that is known at compile time and implement the
+> trait `Sized`."
+-/
+@[reducible]
+def anyUnsizedRigidTy (pred : RigidTy → Bool) : List RigidTy → Bool
+  | .nil => false
+  | k :: rest =>
+    match pred k with
+    | true => true
+    | false => anyUnsizedRigidTy pred rest
+
+/--
+Fuel-bounded check for whether `ty` is unsized (`.slice`, `.str`, `.dynamic`,
+`.foreign`) or is a compound array/tuple containing an unsized type.
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Most types have a fixed size that is known at compile time and implement the
+> trait `Sized`. A type with a size that is known only at run-time is called a
+> dynamically sized type (DST) or, informally, an unsized type."
+-/
+@[reducible]
+def isUnsizedRigidTy : Nat → RigidTy → Bool
+  | .zero, _ => false
+  | .succ fuel', ty =>
+    match ty with
+    | .slice _ => true
+    | .str => true
+    | .dynamic _ => true
+    | .foreign _ => true
+    | .array elemTy _ => isUnsizedRigidTy fuel' elemTy
+    | .tuple ks => anyUnsizedRigidTy (isUnsizedRigidTy fuel') ks
+    | _ => false
+
+/--
+Look up a `TypeLayout` for a sized `ty : RigidTy` by scanning `localDecls` for a
+declaration with `rigidTyEq decl.ty.kind ty`, returning `.none` when `ty` is
+unsized (`isUnsizedRigidTy 8 ty = true`) or when no local of type `ty` carries a
+layout. Rejecting unsized types here is essential because `rustc-capture` lowers
+`tcx.layout_of` for unsized locals (recording the static prefix layout or a ZST
+fallback layout), which must never be treated as the complete static layout of
+an unsized type. There is also deliberately no positional fallback: an unrelated
+entry such as `layouts.entries[0]` (often the return place's layout) would
+silently report the wrong size and alignment.
 
 Reference (`compiler/rustc_middle/src/ty/layout.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -1046,7 +1091,7 @@ def findDeclLayoutForRigidTy
   match localDecls with
   | .nil => .none
   | decl :: rest =>
-    match rigidTyEq decl.ty.kind ty with
+    match Bool.and (Bool.not (isUnsizedRigidTy 8 ty)) (rigidTyEq decl.ty.kind ty) with
     | true =>
       match LayoutTable.lookup layouts decl.ty.layoutIdx with
       | .some l => .some l
@@ -1283,47 +1328,6 @@ def intrinsicRigidTyByteSize
   intrinsicRigidTyByteSizeAux 8 localDecls layouts ty
 
 /--
-Check whether any element of `ks` satisfies `pred`.
-
-Reference (The Rust Reference, "Dynamically Sized Types"):
-<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
-
-> "Most types have a fixed size that is known at compile time and implement the
-> trait `Sized`."
--/
-@[reducible]
-def anyUnsizedRigidTy (pred : RigidTy → Bool) : List RigidTy → Bool
-  | .nil => false
-  | k :: rest =>
-    match pred k with
-    | true => true
-    | false => anyUnsizedRigidTy pred rest
-
-/--
-Fuel-bounded check for whether `ty` is unsized (`.slice`, `.str`, `.dynamic`,
-`.foreign`) or is a compound array/tuple containing an unsized type.
-
-Reference (The Rust Reference, "Dynamically Sized Types"):
-<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
-
-> "Most types have a fixed size that is known at compile time and implement the
-> trait `Sized`. A type with a size that is known only at run-time is called a
-> dynamically sized type (DST) or, informally, an unsized type."
--/
-@[reducible]
-def isUnsizedRigidTy : Nat → RigidTy → Bool
-  | .zero, _ => false
-  | .succ fuel', ty =>
-    match ty with
-    | .slice _ => true
-    | .str => true
-    | .dynamic _ => true
-    | .foreign _ => true
-    | .array elemTy _ => isUnsizedRigidTy fuel' elemTy
-    | .tuple ks => anyUnsizedRigidTy (isUnsizedRigidTy fuel') ks
-    | _ => false
-
-/--
 Step for a pointer intrinsic whose pointee or slice element type `ty` has no
 size or alignment the model can resolve. Every caller needs a sized `ty`:
 `arith_offset::<T>` and slice elements require `T: Sized`, and `size_of_val` and
@@ -1349,11 +1353,13 @@ def intrinsicUnresolvedLayoutStep (ty : RigidTy) : MirStepNode :=
   | false => MirStepNode.unsupported
 
 /--
-Return the last element of `ks`, or `.none` when `ks` is empty.
+Return the last element of `ks` when every preceding element is sized
+(`isUnsized k = false`), or `.none` when `ks` is empty or has an unsized prefix
+element.
 
-A tuple can be unsized only through its last element, so the unsized-tail
-checks `intrinsicTailIsExtern` and `intrinsicTailMayBeUnsized` inspect only
-that element.
+A tuple can be unsized only through its last element; a tuple with an unsized
+non-last field (such as `([u8], [u8])` or `([u8], ExternType)`) is ill-formed
+and cannot be a valid dynamically sized type.
 
 Reference (The Rust Reference, "Dynamically Sized Types"):
 <https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
@@ -1362,16 +1368,20 @@ Reference (The Rust Reference, "Dynamically Sized Types"):
 > DST."
 -/
 @[reducible]
-def intrinsicLastRigidTy? : List RigidTy → Option RigidTy
+def intrinsicLastRigidTy? (isUnsized : RigidTy → Bool) : List RigidTy → Option RigidTy
   | .nil => .none
   | k :: .nil => .some k
-  | _ :: rest => intrinsicLastRigidTy? rest
+  | k :: rest =>
+    match isUnsized k with
+    | true => .none
+    | false => intrinsicLastRigidTy? isUnsized rest
 
 /--
 Fuel-bounded check for whether the unsized tail of `ty` may be an extern type:
-`ty` is `.foreign` itself, or `ty` is a tuple whose last element's tail may be
-one. Exhausting `fuel` answers `true`, so the caller steps to
-`MirStepNode.unsupported` rather than computing a layout.
+`ty` is `.foreign` itself, or `ty` is a tuple whose prefix fields are sized and
+whose last element's tail may be an extern type. Exhausting `fuel` answers
+`true`, so the caller steps to `MirStepNode.unsupported` rather than computing a
+layout.
 
 `rustc` passes pointers to extern-type tails as thin pointers, and `core`
 documents that `size_of_val` and `align_of_val` on such a value are always safe
@@ -1408,7 +1418,7 @@ def intrinsicTailIsExtern : Nat → RigidTy → Bool
     match ty with
     | .foreign _ => true
     | .tuple ks =>
-      match intrinsicLastRigidTy? ks with
+      match intrinsicLastRigidTy? (isUnsizedRigidTy fuel') ks with
       | .some k => intrinsicTailIsExtern fuel' k
       | .none => false
     | _ => false
@@ -1417,8 +1427,8 @@ def intrinsicTailIsExtern : Nat → RigidTy → Bool
 Fuel-bounded check for whether `ty` may be a dynamically sized type whose
 pointers are wide (`Value.aggregate 0 [.ptr p 8, metadata]`): a slice, `str`,
 or `dyn Trait`; an ADT, whose fields `RigidTy.adt` does not record; an
-unrecognized `.other` type; or a tuple whose last element may be one.
-Exhausting `fuel` answers `true`.
+unrecognized `.other` type; or a tuple whose prefix fields are sized and whose
+last element may be one. Exhausting `fuel` answers `true`.
 
 `size_of_val` and `align_of_val` dispatch top-level `[T]`, `str`, and
 `dyn Trait` pointees themselves. When they receive a wide pointer to any other
@@ -1426,8 +1436,8 @@ pointee, a well-typed program can only be passing a struct or tuple that ends
 in an unsized field. `rustc` computes the size and alignment of such a value
 from the offsets of its statically sized fields and the metadata of its tail,
 which the model does not track, so the step is `MirStepNode.unsupported`. A
-wide pointer to a type that cannot end in an unsized field, such as `u64`, is
-malformed and faults with `.ub`.
+wide pointer to a type that cannot end in an unsized field, such as `u64` or a
+tuple with an unsized non-last field, is malformed and faults with `.ub`.
 
 Reference (`library/core/src/mem/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -1450,10 +1460,32 @@ def intrinsicTailMayBeUnsized : Nat → RigidTy → Bool
     | .adt _ _ => true
     | .other _ => true
     | .tuple ks =>
-      match intrinsicLastRigidTy? ks with
+      match intrinsicLastRigidTy? (isUnsizedRigidTy fuel') ks with
       | .some k => intrinsicTailMayBeUnsized fuel' k
       | .none => false
     | _ => false
+
+/--
+Check whether `metaVal` is a well-formed wide-pointer metadata component: a
+scalar length (`.scalar _`, for slice-tailed DSTs) or an 8-byte vtable pointer
+(`.ptr _ 8`, for `dyn Trait` or trait-object-tailed DSTs). Any other `Value`
+(such as `.unit`, `.aggregate _ _`, or a non-64-bit pointer) is malformed and
+faults with `.ub`.
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Pointers to DSTs are sized, but have twice the size of pointers to sized
+> types:
+>
+> * Pointers to slices also store the number of elements of the slice.
+> * Pointers to trait objects also store a pointer to a vtable."
+-/
+@[reducible]
+def isValidWidePtrMetaVal : Value → Bool
+  | .scalar _ => true
+  | .ptr _ ptrSz => Nat.beq ptrSz 8
+  | _ => false
 
 /--
 Step for `size_of_val` or `align_of_val` when the pointer argument is a
@@ -1995,8 +2027,8 @@ def evalNonSelectIntrinsicCall
       -- model does not track; malformed non-wide pointers still fault with `.ub`.
       | .some (.dynamic _) =>
         match ptrArgVal with
-        | .aggregate 0 (.ptr _ ptrSz :: _ :: .nil) =>
-          match Nat.beq ptrSz 8 with
+        | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
+          match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
           | false => MirStepNode.fail .ub
           | true => MirStepNode.unsupported
         | _ => MirStepNode.fail .ub
@@ -2016,8 +2048,8 @@ def evalNonSelectIntrinsicCall
                 | false =>
                   writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨sz, 8⟩)
               | .none => intrinsicUnresolvedLayoutStep pointeeTy
-        | .aggregate 0 (.ptr _ ptrSz :: _ :: .nil) =>
-          match Nat.beq ptrSz 8 with
+        | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
+          match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
           | false => MirStepNode.fail .ub
           | true => intrinsicWidePointeeStep pointeeTy
         | _ => MirStepNode.fail .ub
@@ -2063,8 +2095,8 @@ def evalNonSelectIntrinsicCall
       -- model does not track; malformed non-wide pointers still fault with `.ub`.
       | .some (.dynamic _) =>
         match ptrArgVal with
-        | .aggregate 0 (.ptr _ ptrSz :: _ :: .nil) =>
-          match Nat.beq ptrSz 8 with
+        | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
+          match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
           | false => MirStepNode.fail .ub
           | true => MirStepNode.unsupported
         | _ => MirStepNode.fail .ub
@@ -2082,14 +2114,73 @@ def evalNonSelectIntrinsicCall
                 writeIntrinsicReturn s locals' destination targetBb
                   (.scalar ⟨alignBytes, 8⟩)
               | .none => intrinsicUnresolvedLayoutStep pointeeTy
-        | .aggregate 0 (.ptr _ ptrSz :: _ :: .nil) =>
-          match Nat.beq ptrSz 8 with
+        | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
+          match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
           | false => MirStepNode.fail .ub
           | true => intrinsicWidePointeeStep pointeeTy
         | _ => MirStepNode.fail .ub
       | .none => MirStepNode.fail .ub
     | _ => MirStepNode.fail .ub
   | .constEvalSelect => MirStepNode.fail .ub
+
+/--
+Test whether `kind` is parameterized by the pointee type `T` of its first
+pointer argument (`arith_offset<T>`, `size_of_val<T>`, `align_of_val<T>`)
+rather than by the value type of its first argument.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L899-L916>
+
+> "pub const unsafe fn arith_offset<T>(dst: *const T, offset: isize) -> *const T;"
+-/
+@[reducible]
+def isPtrPointeeIntrinsicKind : RustIntrinsicKind → Bool
+  | .arithOffset => true
+  | .sizeOfVal => true
+  | .alignOfVal => true
+  | _ => false
+
+/--
+Supply fallback `typeArgs` for a runtime intrinsic target `rtTarget` dispatched
+by `const_eval_select` when `rtTarget.typeArgs` is empty and `const_eval_select`
+carries `ARG = .tuple elemTys`:
+- For pointer-parameterized intrinsics (`isPtrPointee = true`), extracts the
+  pointee `T` from the first tuple element `.rawPtr _ T` or `.ref _ T`.
+- For value-parameterized intrinsics (`isPtrPointee = false`), forwards
+  `elemTys` so that `T` (and shift count type `U` for
+  `unchecked_shl`/`unchecked_shr`) are available to `resolveIntrinsicIsSigned`
+  and `resolveIntrinsicShiftSigned`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2798-L2824>
+
+> "pub const unsafe fn const_eval_select<ARG: Tuple, F, G, RET>(
+>     arg: ARG,
+>     called_in_const: F,
+>     called_at_rt: G,
+> ) -> RET"
+-/
+@[reducible]
+def withConstEvalSelectIntrinsicTypeArgs
+    (rtTarget : ResolvedCallTarget)
+    (tupleTyOpt : Option RigidTy)
+    (isPtrPointee : Bool) :
+    ResolvedCallTarget :=
+  match rtTarget.typeArgs with
+  | _ :: _ => rtTarget
+  | .nil =>
+    match tupleTyOpt with
+    | .some (.tuple elemTys) =>
+      match isPtrPointee with
+      | false => { rtTarget with typeArgs := elemTys }
+      | true =>
+        match elemTys with
+        | .rawPtr _ pointeeTy :: _ => { rtTarget with typeArgs := pointeeTy :: .nil }
+        | .ref _ pointeeTy :: _ => { rtTarget with typeArgs := pointeeTy :: .nil }
+        | _ => rtTarget
+    | _ => rtTarget
 
 /--
 Test whether `defPath` is an unreachable hint or intrinsic
@@ -2327,7 +2418,9 @@ def evalDirectRustIntrinsic?
                  | true =>
                    match unpackedArgs with
                    | .scalar lhs :: .scalar rhs :: .nil =>
-                     match resolveIntrinsicIsSigned rtTarget bodyLocalDecls bodyLayouts .nil with
+                     let rtTarget' :=
+                       withConstEvalSelectIntrinsicTypeArgs rtTarget tupleTyOpt false
+                     match resolveIntrinsicIsSigned rtTarget' bodyLocalDecls bodyLayouts .nil with
                      | .none => MirStepNode.unsupported
                      | .some isSigned =>
                        writeIntrinsicScalarResult
@@ -2341,10 +2434,15 @@ def evalDirectRustIntrinsic?
                    match classifyRustIntrinsic? rtTarget.defPath with
                    | .some .constEvalSelect => MirStepNode.fail .ub
                    | .some rtKind =>
+                     let rtTarget' :=
+                       withConstEvalSelectIntrinsicTypeArgs
+                         rtTarget
+                         tupleTyOpt
+                         (isPtrPointeeIntrinsicKind rtKind)
                      evalNonSelectIntrinsicCall
                        rtKind
                        s
-                       rtTarget
+                       rtTarget'
                        bodyLocalDecls
                        bodyLayouts
                        .nil

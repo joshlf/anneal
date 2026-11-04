@@ -1496,7 +1496,11 @@ def evalWrappingSub (lhs rhs : ScalarInt) : Option ScalarInt :=
     let modulus := scalarModulus sz
     let ca := wrapScalarBits lhs.bits modulus
     let cb := wrapScalarBits rhs.bits modulus
-    .some ⟨wrapScalarBits (Nat.add ca (Nat.sub modulus cb)) modulus, sz⟩
+    let wrappedDiff :=
+      match Nat.ble cb ca with
+      | true => wrapScalarBits (Nat.sub ca cb) modulus
+      | false => wrapScalarBits (Nat.sub (Nat.add modulus ca) cb) modulus
+    .some ⟨wrappedDiff, sz⟩
 
 /--
 Evaluate `core::intrinsics::wrapping_mul(lhs, rhs)` modulo
@@ -1691,13 +1695,21 @@ def evalUncheckedSub
     match isSigned with
     | false =>
       match Nat.ble cb ca with
-      | true => .some ⟨Nat.sub ca cb, sz⟩
+      | true =>
+        let diff := Nat.sub ca cb
+        match Nat.ble modulus diff with
+        | true => .none
+        | false => .some ⟨diff, sz⟩
       | false => .none
     | true =>
       match signedOverflowSub ca cb sz with
       | true => .none
       | false =>
-        .some ⟨wrapScalarBits (Nat.add ca (Nat.sub modulus cb)) modulus, sz⟩
+        let wrappedDiff :=
+          match Nat.ble cb ca with
+          | true => wrapScalarBits (Nat.sub ca cb) modulus
+          | false => wrapScalarBits (Nat.sub (Nat.add modulus ca) cb) modulus
+        .some ⟨wrappedDiff, sz⟩
 
 /--
 Evaluate `core::intrinsics::unchecked_mul(lhs, rhs)`, returning `.none`
@@ -1775,10 +1787,12 @@ def evalUncheckedDiv
     | true => .none
     | false =>
       match isSigned with
-      | false => .some ⟨Nat.div ca cb, sz⟩
+      | false => .some ⟨wrapScalarBits (Nat.div ca cb) modulus, sz⟩
       | true =>
-        let half := signedHalfModulus sz
-        match Bool.and (Nat.beq ca half) (Nat.beq cb (Nat.sub modulus 1)) with
+        let numBits := Nat.mul sz 8
+        let minSigned := scalarPow2 (Nat.sub numBits 1)
+        let minusOne := Nat.sub modulus 1
+        match Bool.and (Nat.beq ca minSigned) (Nat.beq cb minusOne) with
         | true => .none
         | false =>
           let negA := isSignedNegative ca sz
@@ -1830,10 +1844,12 @@ def evalUncheckedRem
     | true => .none
     | false =>
       match isSigned with
-      | false => .some ⟨Nat.mod ca cb, sz⟩
+      | false => .some ⟨wrapScalarBits (Nat.mod ca cb) modulus, sz⟩
       | true =>
-        let half := signedHalfModulus sz
-        match Bool.and (Nat.beq ca half) (Nat.beq cb (Nat.sub modulus 1)) with
+        let numBits := Nat.mul sz 8
+        let minSigned := scalarPow2 (Nat.sub numBits 1)
+        let minusOne := Nat.sub modulus 1
+        match Bool.and (Nat.beq ca minSigned) (Nat.beq cb minusOne) with
         | true => .none
         | false =>
           let negA := isSignedNegative ca sz

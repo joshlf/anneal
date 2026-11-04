@@ -2968,4 +2968,397 @@ theorem mir_evalTerminator_intrinsic_signedness_fails_closed
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicShiftSigned, operandTy, placeTy]
 
+/--
+Lift an `Option ScalarInt` returned by a scalar intrinsic evaluator to an
+`RvalueEvalResult` (`.some sc ↦ .ok (.scalar sc) locals mem`, `.none ↦ .ub`),
+matching `evalScalarBinOp`'s return type.
+-/
+@[reducible]
+def liftIntrinsicScalarResult
+    (res : Option ScalarInt)
+    (locals : List LocalSlot)
+    (mem : Memory) :
+    RvalueEvalResult :=
+  match res with
+  | .some sc => .ok (.scalar sc) locals mem
+  | .none => .ub
+
+/--
+**Theorem L5.27 (`mir_intrinsic_scalars_agree_with_evalScalarBinOp`)**:
+Universal correspondence between the `CallConv.rustIntrinsic` scalar evaluators
+and `evalScalarBinOp` across all 11 operations lowered by `rustc`'s
+`LowerIntrinsics` pass (`wrapping_add`, `wrapping_sub`, `wrapping_mul`,
+`unchecked_add`, `unchecked_sub`, `unchecked_mul`, `unchecked_div`,
+`unchecked_rem`, `unchecked_shl`, `unchecked_shr`, `three_way_compare`). For
+any canonical equal-width non-zero-byte `ScalarInt` operands `lhs` and `rhs` and
+any signedness `isSigned : Bool`, evaluating the intrinsic before
+`LowerIntrinsics` produces the exact same result (or `.ub` fault) as evaluating
+the corresponding `Rvalue.binaryOp` after `LowerIntrinsics`.
+-/
+theorem mir_intrinsic_scalars_agree_with_evalScalarBinOp
+    (lhs rhs : ScalarInt)
+    (locals : List LocalSlot)
+    (mem : Memory)
+    (isSigned : Bool)
+    (hNonZero : Nat.beq lhs.sizeBytes 0 = false)
+    (hSameSz : Nat.beq lhs.sizeBytes rhs.sizeBytes = true)
+    (hEqSz : rhs.sizeBytes = lhs.sizeBytes)
+    (hCanonL : wrapScalarBits lhs.bits (scalarModulus lhs.sizeBytes) = lhs.bits)
+    (hCanonR : wrapScalarBits rhs.bits (scalarModulus lhs.sizeBytes) = rhs.bits) :
+    liftIntrinsicScalarResult (evalWrappingAdd lhs rhs) locals mem =
+      evalScalarBinOp .add lhs rhs locals mem isSigned ∧
+    liftIntrinsicScalarResult (evalWrappingSub lhs rhs) locals mem =
+      evalScalarBinOp .sub lhs rhs locals mem isSigned ∧
+    liftIntrinsicScalarResult (evalWrappingMul lhs rhs) locals mem =
+      evalScalarBinOp .mul lhs rhs locals mem isSigned ∧
+    liftIntrinsicScalarResult (evalUncheckedAdd lhs rhs isSigned) locals mem =
+      evalScalarBinOp .addUnchecked lhs rhs locals mem isSigned ∧
+    liftIntrinsicScalarResult (evalUncheckedSub lhs rhs isSigned) locals mem =
+      evalScalarBinOp .subUnchecked lhs rhs locals mem isSigned ∧
+    liftIntrinsicScalarResult (evalUncheckedMul lhs rhs isSigned) locals mem =
+      evalScalarBinOp .mulUnchecked lhs rhs locals mem isSigned ∧
+    liftIntrinsicScalarResult (evalUncheckedDiv lhs rhs isSigned) locals mem =
+      evalScalarBinOp .div lhs rhs locals mem isSigned ∧
+    liftIntrinsicScalarResult (evalUncheckedRem lhs rhs isSigned) locals mem =
+      evalScalarBinOp .rem lhs rhs locals mem isSigned ∧
+    liftIntrinsicScalarResult (evalUncheckedShl lhs rhs false) locals mem =
+      evalScalarBinOp .shlUnchecked lhs rhs locals mem isSigned ∧
+    liftIntrinsicScalarResult (evalUncheckedShr lhs rhs isSigned false) locals mem =
+      evalScalarBinOp .shrUnchecked lhs rhs locals mem isSigned ∧
+    liftIntrinsicScalarResult (evalThreeWayCompare lhs rhs isSigned) locals mem =
+      evalScalarBinOp .cmp lhs rhs locals mem isSigned := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · unfold liftIntrinsicScalarResult evalWrappingAdd evalScalarBinOp
+    simp only [hNonZero, hSameSz, hCanonL, hCanonR, Bool.not_true, Bool.or_false]
+  · unfold liftIntrinsicScalarResult evalWrappingSub evalScalarBinOp
+    simp only [hNonZero, hSameSz, hCanonL, hCanonR, Bool.not_true, Bool.or_false]
+    cases Nat.ble rhs.bits lhs.bits <;> rfl
+  · unfold liftIntrinsicScalarResult evalWrappingMul evalScalarBinOp
+    simp only [hNonZero, hSameSz, hCanonL, hCanonR, Bool.not_true, Bool.or_false]
+  · unfold liftIntrinsicScalarResult evalUncheckedAdd evalScalarBinOp
+    simp only [hNonZero, hSameSz, hCanonL, hCanonR, Bool.not_true, Bool.or_false]
+    cases isSigned
+    · cases Nat.ble (scalarModulus lhs.sizeBytes) (Nat.add lhs.bits rhs.bits) <;> rfl
+    · cases signedOverflowAdd lhs.bits rhs.bits lhs.sizeBytes <;> rfl
+  · unfold liftIntrinsicScalarResult evalUncheckedSub evalScalarBinOp
+    simp only [hNonZero, hSameSz, hCanonL, hCanonR, Bool.not_true, Bool.or_false]
+    cases isSigned
+    · cases Nat.ble rhs.bits lhs.bits
+      · rfl
+      · cases Nat.ble (scalarModulus lhs.sizeBytes) (Nat.sub lhs.bits rhs.bits) <;> rfl
+    · cases signedOverflowSub lhs.bits rhs.bits lhs.sizeBytes <;> rfl
+  · unfold liftIntrinsicScalarResult evalUncheckedMul evalScalarBinOp
+    simp only [hNonZero, hSameSz, hCanonL, hCanonR, Bool.not_true, Bool.or_false]
+    cases isSigned
+    · cases Nat.ble (scalarModulus lhs.sizeBytes) (Nat.mul lhs.bits rhs.bits) <;> rfl
+    · cases signedOverflowMul lhs.bits rhs.bits lhs.sizeBytes <;> rfl
+  · unfold liftIntrinsicScalarResult evalUncheckedDiv evalScalarBinOp evalSignedDiv
+    simp only [hNonZero, hSameSz, hCanonL, hCanonR, Bool.not_true, Bool.or_false]
+    cases Nat.beq rhs.bits 0
+    · cases isSigned
+      · rfl
+      · cases
+          Bool.and
+            (Nat.beq lhs.bits (scalarPow2 (Nat.sub (Nat.mul lhs.sizeBytes 8) 1)))
+            (Nat.beq rhs.bits (Nat.sub (scalarModulus lhs.sizeBytes) 1)) <;> rfl
+    · rfl
+  · unfold liftIntrinsicScalarResult evalUncheckedRem evalScalarBinOp evalSignedRem
+    simp only [hNonZero, hSameSz, hCanonL, hCanonR, Bool.not_true, Bool.or_false]
+    cases Nat.beq rhs.bits 0
+    · cases isSigned
+      · rfl
+      · cases
+          Bool.and
+            (Nat.beq lhs.bits (scalarPow2 (Nat.sub (Nat.mul lhs.sizeBytes 8) 1)))
+            (Nat.beq rhs.bits (Nat.sub (scalarModulus lhs.sizeBytes) 1)) <;> rfl
+    · rfl
+  · unfold liftIntrinsicScalarResult evalUncheckedShl evalScalarBinOp
+    simp only [hEqSz, hNonZero, hCanonL, hCanonR, Bool.or_false, Bool.false_and, Bool.false_or]
+    cases Nat.ble (Nat.mul lhs.sizeBytes 8) rhs.bits <;> rfl
+  · unfold liftIntrinsicScalarResult evalUncheckedShr evalScalarBinOp
+    simp only [hEqSz, hNonZero, hCanonL, hCanonR, Bool.or_false, Bool.false_and, Bool.false_or]
+    cases Nat.ble (Nat.mul lhs.sizeBytes 8) rhs.bits <;> rfl
+  · unfold liftIntrinsicScalarResult evalThreeWayCompare evalScalarBinOp
+    simp only [hNonZero, hSameSz, hCanonL, hCanonR, Bool.not_true, Bool.or_false]
+    cases isSigned <;> cases Nat.beq lhs.bits rhs.bits
+    · cases Nat.ble lhs.bits rhs.bits <;> rfl
+    · rfl
+    · cases signedLt lhs.bits rhs.bits lhs.sizeBytes <;> rfl
+    · rfl
+
+/--
+**Theorem L5.28 (`mir_evalTerminator_dst_prefix_meta_decl_and_select_typeArgs_corresponds`)**:
+Correspondence for DST layout-lookup filtering, non-last tuple field DST
+validation, wide-pointer metadata validation, and `const_eval_select` tuple
+type-argument propagation:
+1. `findDeclLayoutForRigidTy`, `intrinsicRigidTyByteSize`, and
+   `intrinsicRigidTyAlign` reject unsized types (`[u8]` and `(u32, [u8])`) even
+   when `localDecls` contains a declaration of that unsized type with a layout
+   table entry;
+2. `size_of_val` and `align_of_val` fault with `MirStepNode.fail .ub` (rather
+   than `.unsupported`) on tuples with an unsized non-last field
+   (`([u8], ExternType)` with a thin pointer and `([u8], [u8])` with a wide
+   pointer);
+3. `size_of_val` and `align_of_val` fault with `MirStepNode.fail .ub` when a
+   wide pointer to `dyn Trait` or `(u32, [u8])` carries non-scalar/non-pointer
+   metadata (`.unit`), while an 8-byte vtable pointer `.ptr ptrVal 8` on
+   `dyn Trait` steps to `MirStepNode.unsupported`;
+4. `const_eval_select` with `ARG = (i32, i32)` or `(*const u32, isize)` in
+   `target.typeArgs` forwards the argument/pointee types to an unlinked
+   runtime intrinsic target (`exact_div`, `unchecked_add`, `arith_offset`) whose
+   own `rtTarget.typeArgs` is `.nil`.
+-/
+theorem mir_evalTerminator_dst_prefix_meta_decl_and_select_typeArgs_corresponds
+    (lhs rhs : ScalarInt)
+    (ptrVal : ProvenancePtr)
+    (offsetSc : ScalarInt)
+    (targetBb : BasicBlockIdx)
+    (unwind : UnwindAction)
+    (span : String) :
+    let fakeLayout : TypeLayout :=
+      { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory,
+        fields := .primitive, variants := .single 0, isUninhabited := false }
+    let unsizedDecls : List LocalDecl :=
+      [ { mutability := .mut, ty := { kind := .slice (.uint .u8), layoutIdx := 0 }, debugName := none },
+        { mutability := .mut,
+          ty := { kind := .tuple [.uint .u32, .slice (.uint .u8)], layoutIdx := 0 },
+          debugName := none } ]
+    let unsizedTable : LayoutTable := { emptyLayoutTable with entries := [fakeLayout] }
+    let dest : Place := { local_ := 0, projection := .nil }
+    let thinOps : List Operand := [.copy { local_ := 1, projection := .nil }]
+    let fatValidOps : List Operand := [.copy { local_ := 2, projection := .nil }]
+    let fatBadMetaOps : List Operand := [.copy { local_ := 3, projection := .nil }]
+    let fatVtableOps : List Operand := [.copy { local_ := 4, projection := .nil }]
+    let constFnOp : Operand :=
+      .constant { ty := { kind := .fnDef "core::ct_callee" .nil, layoutIdx := 0 }, val := .zeroSized }
+    let rtExactDivOp : Operand :=
+      .constant { ty := { kind := .fnDef "core::intrinsics::exact_div" .nil, layoutIdx := 0 }, val := .zeroSized }
+    let rtUncheckedAddOp : Operand :=
+      .constant { ty := { kind := .fnDef "core::intrinsics::unchecked_add" .nil, layoutIdx := 0 }, val := .zeroSized }
+    let rtArithOffsetOp : Operand :=
+      .constant { ty := { kind := .fnDef "core::intrinsics::arith_offset" .nil, layoutIdx := 0 }, val := .zeroSized }
+    let selectIntOps : List Operand := [
+      .copy { local_ := 5, projection := .nil },
+      constFnOp,
+      rtExactDivOp
+    ]
+    let selectAddOps : List Operand := [
+      .copy { local_ := 5, projection := .nil },
+      constFnOp,
+      rtUncheckedAddOp
+    ]
+    let selectPtrOps : List Operand := [
+      .copy { local_ := 6, projection := .nil },
+      constFnOp,
+      rtArithOffsetOp
+    ]
+    let locals : List LocalSlot := [
+      .uninit,
+      .init (.ptr ptrVal 8),
+      .init (.aggregate 0 [.ptr ptrVal 8, .scalar ⟨4, 8⟩]),
+      .init (.aggregate 0 [.ptr ptrVal 8, .unit]),
+      .init (.aggregate 0 [.ptr ptrVal 8, .ptr ptrVal 8]),
+      .init (.aggregate 0 [.scalar lhs, .scalar rhs]),
+      .init (.aggregate 0 [.ptr ptrVal 8, .scalar offsetSc])
+    ]
+    let s : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := locals }
+      memory := emptyMemory
+    }
+    findDeclLayoutForRigidTy unsizedDecls unsizedTable (.slice (.uint .u8)) = .none ∧
+    findDeclLayoutForRigidTy unsizedDecls unsizedTable
+      (.tuple [.uint .u32, .slice (.uint .u8)]) = .none ∧
+    intrinsicRigidTyByteSize unsizedDecls unsizedTable (.slice (.uint .u8)) = .none ∧
+    intrinsicRigidTyAlign unsizedDecls unsizedTable
+      (.tuple [.uint .u32, .slice (.uint .u8)]) = .none ∧
+    evalTerminator s
+        (mkIntrinsicCallTerm "core::intrinsics::size_of_val"
+          [.tuple [.slice (.uint .u8), .foreign "test::Opaque"]]
+          thinOps dest targetBb unwind span) .none =
+      MirStepNode.fail .ub ∧
+    evalTerminator s
+        (mkIntrinsicCallTerm "core::intrinsics::align_of_val"
+          [.tuple [.slice (.uint .u8), .foreign "test::Opaque"]]
+          thinOps dest targetBb unwind span) .none =
+      MirStepNode.fail .ub ∧
+    evalTerminator s
+        (mkIntrinsicCallTerm "core::intrinsics::size_of_val"
+          [.tuple [.slice (.uint .u8), .slice (.uint .u8)]]
+          fatValidOps dest targetBb unwind span) .none =
+      MirStepNode.fail .ub ∧
+    evalTerminator s
+        (mkIntrinsicCallTerm "core::intrinsics::align_of_val"
+          [.tuple [.slice (.uint .u8), .slice (.uint .u8)]]
+          fatValidOps dest targetBb unwind span) .none =
+      MirStepNode.fail .ub ∧
+    evalTerminator s
+        (mkIntrinsicCallTerm "core::intrinsics::size_of_val"
+          [.dynamic "core::fmt::Debug"]
+          fatBadMetaOps dest targetBb unwind span) .none =
+      MirStepNode.fail .ub ∧
+    evalTerminator s
+        (mkIntrinsicCallTerm "core::intrinsics::align_of_val"
+          [.dynamic "core::fmt::Debug"]
+          fatBadMetaOps dest targetBb unwind span) .none =
+      MirStepNode.fail .ub ∧
+    evalTerminator s
+        (mkIntrinsicCallTerm "core::intrinsics::size_of_val"
+          [.tuple [.uint .u32, .slice (.uint .u8)]]
+          fatBadMetaOps dest targetBb unwind span) .none =
+      MirStepNode.fail .ub ∧
+    evalTerminator s
+        (mkIntrinsicCallTerm "core::intrinsics::align_of_val"
+          [.tuple [.uint .u32, .slice (.uint .u8)]]
+          fatBadMetaOps dest targetBb unwind span) .none =
+      MirStepNode.fail .ub ∧
+    evalTerminator s
+        (mkIntrinsicCallTerm "core::intrinsics::size_of_val"
+          [.dynamic "core::fmt::Debug"]
+          fatVtableOps dest targetBb unwind span) .none =
+      MirStepNode.unsupported ∧
+    evalTerminator s
+        (mkIntrinsicCallTerm "core::intrinsics::const_eval_select"
+          [.tuple [.int .i32, .int .i32]]
+          selectIntOps dest targetBb unwind span) .none =
+      (match evalExactDiv lhs rhs true with
+       | .some ret =>
+         MirStepNode.step {
+           frame := {
+             blockIdx := targetBb
+             stmtIdx := 0
+             locals := .init (.scalar ret) :: locals.tail
+           }
+           memory := emptyMemory
+         }
+       | .none => MirStepNode.fail .ub) ∧
+    evalTerminator s
+        (mkIntrinsicCallTerm "core::intrinsics::const_eval_select"
+          [.tuple [.int .i32, .int .i32]]
+          selectAddOps dest targetBb unwind span) .none =
+      (match evalUncheckedAdd lhs rhs true with
+       | .some ret =>
+         MirStepNode.step {
+           frame := {
+             blockIdx := targetBb
+             stmtIdx := 0
+             locals := .init (.scalar ret) :: locals.tail
+           }
+           memory := emptyMemory
+         }
+       | .none => MirStepNode.fail .ub) ∧
+    evalTerminator s
+        (mkIntrinsicCallTerm "core::intrinsics::const_eval_select"
+          [.tuple [.rawPtr .not (.uint .u32), .int .isize]]
+          selectPtrOps dest targetBb unwind span) .none =
+      (match evalArithOffset ptrVal 8 offsetSc 4 with
+       | .some ptr' =>
+         MirStepNode.step {
+           frame := {
+             blockIdx := targetBb
+             stmtIdx := 0
+             locals := .init (.ptr ptr' 8) :: locals.tail
+           }
+           memory := emptyMemory
+         }
+       | .none => MirStepNode.fail .ub) := by
+  dsimp only
+  refine ⟨rfl, rfl, rfl, rfl, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
+    have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
+    have hSz :
+        intrinsicRigidTyByteSize .nil emptyLayoutTable
+          (.tuple [.slice (.uint .u8), .foreign "test::Opaque"]) = .none :=
+      rfl
+    unfold evalTerminator mkIntrinsicCallTerm
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+      readProjectedValue, emptyMemory, get?, findCallee?, isDirectExactDivTarget,
+      evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall, hSz,
+      intrinsicUnresolvedLayoutStep]
+  · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
+    have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
+    have hAl :
+        intrinsicRigidTyAlign .nil emptyLayoutTable
+          (.tuple [.slice (.uint .u8), .foreign "test::Opaque"]) = .none :=
+      rfl
+    unfold evalTerminator mkIntrinsicCallTerm
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+      readProjectedValue, emptyMemory, get?, findCallee?, isDirectExactDivTarget,
+      evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall, hAl,
+      intrinsicUnresolvedLayoutStep]
+  · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
+    have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
+    unfold evalTerminator mkIntrinsicCallTerm
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+      readProjectedValue, emptyMemory, get?, findCallee?, isDirectExactDivTarget,
+      evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
+      intrinsicWidePointeeStep]
+  · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
+    have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
+    unfold evalTerminator mkIntrinsicCallTerm
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+      readProjectedValue, emptyMemory, get?, findCallee?, isDirectExactDivTarget,
+      evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
+      intrinsicWidePointeeStep]
+  · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
+    have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
+    unfold evalTerminator mkIntrinsicCallTerm
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+      readProjectedValue, emptyMemory, get?, findCallee?, isDirectExactDivTarget,
+      evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
+  · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
+    have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
+    unfold evalTerminator mkIntrinsicCallTerm
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+      readProjectedValue, emptyMemory, get?, findCallee?, isDirectExactDivTarget,
+      evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
+  · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
+    have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
+    unfold evalTerminator mkIntrinsicCallTerm
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+      readProjectedValue, emptyMemory, get?, findCallee?, isDirectExactDivTarget,
+      evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
+  · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
+    have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
+    unfold evalTerminator mkIntrinsicCallTerm
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+      readProjectedValue, emptyMemory, get?, findCallee?, isDirectExactDivTarget,
+      evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
+  · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
+    have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
+    unfold evalTerminator mkIntrinsicCallTerm
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+      readProjectedValue, emptyMemory, get?, findCallee?, isDirectExactDivTarget,
+      evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
+  · have hSel : classifyRustIntrinsic? "core::intrinsics::const_eval_select" = .some .constEvalSelect := rfl
+    have hEx1 : stringEq "core::intrinsics::const_eval_select" "core::intrinsics::exact_div" = false := rfl
+    have hEx2 : stringEq "core::intrinsics::exact_div" "core::intrinsics::exact_div" = true := rfl
+    unfold evalTerminator mkIntrinsicCallTerm
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+      evalConstValue, readProjectedValue, emptyMemory, get?, findCallee?, isDirectExactDivTarget,
+      evalDirectRustIntrinsic?, hSel, hEx1, hEx2, unpackConstEvalSelectArgs?,
+      resolveConstEvalSelectTarget?, length]
+    cases evalExactDiv lhs rhs true <;> rfl
+  · have hSel : classifyRustIntrinsic? "core::intrinsics::const_eval_select" = .some .constEvalSelect := rfl
+    have hEx1 : stringEq "core::intrinsics::const_eval_select" "core::intrinsics::exact_div" = false := rfl
+    have hEx2 : stringEq "core::intrinsics::unchecked_add" "core::intrinsics::exact_div" = false := rfl
+    have hAdd : classifyRustIntrinsic? "core::intrinsics::unchecked_add" = .some .uncheckedAdd := rfl
+    unfold evalTerminator mkIntrinsicCallTerm
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+      evalConstValue, readProjectedValue, emptyMemory, get?, findCallee?, isDirectExactDivTarget,
+      evalDirectRustIntrinsic?, hSel, hEx1, hEx2, hAdd, unpackConstEvalSelectArgs?,
+      resolveConstEvalSelectTarget?, evalNonSelectIntrinsicCall, length]
+    cases evalUncheckedAdd lhs rhs true <;> rfl
+  · have hSel : classifyRustIntrinsic? "core::intrinsics::const_eval_select" = .some .constEvalSelect := rfl
+    have hEx1 : stringEq "core::intrinsics::const_eval_select" "core::intrinsics::exact_div" = false := rfl
+    have hEx2 : stringEq "core::intrinsics::arith_offset" "core::intrinsics::exact_div" = false := rfl
+    have hOff : classifyRustIntrinsic? "core::intrinsics::arith_offset" = .some .arithOffset := rfl
+    unfold evalTerminator mkIntrinsicCallTerm
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+      evalConstValue, readProjectedValue, emptyMemory, get?, findCallee?, isDirectExactDivTarget,
+      evalDirectRustIntrinsic?, hSel, hEx1, hEx2, hOff, unpackConstEvalSelectArgs?,
+      resolveConstEvalSelectTarget?, evalNonSelectIntrinsicCall,
+      intrinsicRigidTyByteSize, intrinsicRigidTyByteSizeAux,
+      rigidTyKindByteSize, intCastTargetBytes, length]
+    cases evalArithOffset ptrVal 8 offsetSc 4 <;> rfl
+
 end Correspondence.V2026_06_01.L5_ControlAndCalls
