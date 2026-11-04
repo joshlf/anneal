@@ -99,6 +99,12 @@ theorem translateFn_local_ty {body : CapturedMir} {f : Gen.Function} (hf : trans
 @[simp] theorem except_pure {ε α : Type} (x : α) :
     (pure x : Except ε α) = Except.ok x := rfl
 
+@[simp] theorem ensureElseUb_true (msg : String) :
+    ensureElseUb true msg = .ok () := rfl
+
+@[simp] theorem ensureElseUb_false (msg : String) :
+    ensureElseUb false msg = .error (.ub msg) := rfl
+
 @[simp] theorem int_add_sub_cancel_left (a b : Int) : a + b - a = b := by omega
 
 @[simp] theorem toNat_cast_mul (a b : Nat) : ((a : Int) * (b : Int)).toNat = a * b := by

@@ -3004,6 +3004,10 @@ array succeeds without querying `elem.layout()`), and `Type.decode` on
 element chunk. -/
 theorem array_encode_decode_edge_cases :
     checkValue (.Tuple []) (.Array (.Slice (.Int i8)) 0) = .ok () ∧
+    checkValue (.Tuple []) (.Array (.Int i8) 1) =
+      .error (.ub "Value::Tuple: invalid number of elements") ∧
+    checkValue (.Tuple [.Int 200]) (.Array (.Int i8) 1) =
+      .error (.ub "Value::Int: invalid integer value") ∧
     Type.encode (.Array (.Slice (.Int i8)) 2) (.Tuple []) =
       .error (.specPanic "encode: Type::Array length mismatch") ∧
     Type.encode (.Array (.Slice (.Int i8)) 0) (.Tuple []) = .ok [] ∧
@@ -3017,7 +3021,7 @@ theorem array_encode_decode_edge_cases :
       if x = 0 then (.ok none : Interp (Option Val))
       else .error (.specPanic "unreachable")) [0, 1] : Interp (Option (List Val))) =
       .ok none :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ## Projected array operands across `SwitchInt`/`Repeat`/`Aggregate`/`UnaryOp`/`Cast`, faulting array rvalues, and faulting in-place write RHS -/
 

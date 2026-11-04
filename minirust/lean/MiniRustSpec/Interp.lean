@@ -540,6 +540,14 @@ def Type.encode : «Type» → Val → Interp (List Byte)
   | .Array _ _, _ => specPanic "encode: Type::Array with a non-Tuple value"
   | _, _ => unsupported "Type::encode for a non-Int, non-Bool, non-Array type"
 
+/-- `ensure_else_ub` (`spec/lang/representation.md`):
+> "fn ensure_else_ub(b: bool, msg: &str) -> Result<()> {
+>     if !b { throw_ub!(\"{}\", msg); }
+>     ret(())
+> }" -/
+def ensureElseUb (b : Bool) (msg : String) : Interp Unit :=
+  if b then pure () else ub msg
+
 /-- `Machine::check_value` for `Int`, `Bool`, and `Array`:
 > "(Value::Int(i), Type::Int(int_ty)) => {
 >     ensure_else_ub(int_ty.can_represent(i), \"Value::Int: invalid integer value\")?;
@@ -556,13 +564,11 @@ def Type.encode : «Type» → Val → Interp (List Byte)
 > _ => panic!(\"Value: value does not match type\")" -/
 def checkValue : Val → «Type» → Interp Unit
   | .Int i, .Int t =>
-    if IntType.can_represent t i then pure () else ub "Value::Int: invalid integer value"
+    ensureElseUb (IntType.can_represent t i) "Value::Int: invalid integer value"
   | .Bool _, .Bool => pure ()
-  | .Tuple vals, .Array elem count =>
-    if (vals.length : Int) = count then
-      vals.forM (fun val => checkValue val elem)
-    else
-      ub "Value::Tuple: invalid number of elements"
+  | .Tuple vals, .Array elem count => do
+    ensureElseUb (decide ((vals.length : Int) = count)) "Value::Tuple: invalid number of elements"
+    vals.forM (fun val => checkValue val elem)
   | _, .Int _ => specPanic "Value: value does not match type"
   | _, .Bool => specPanic "Value: value does not match type"
   | _, .Array _ _ => specPanic "Value: value does not match type"

@@ -742,6 +742,7 @@ fn mr_2_1_array_quotations_are_pinned_and_tamper_checked() {
         ("spec/lang/types.md", "Array { elem, count } => Sized("),
         ("spec/lang/representation.md", "fn decode<M: Memory>(Type::Array { elem, count }: Self,"),
         ("spec/lang/representation.md", "fn encode<M: Memory>(Type::Array { elem, count }: Self,"),
+        ("spec/lang/representation.md", "fn ensure_else_ub(b: bool, msg: &str) -> Result<()>"),
         ("spec/lang/representation.md", "(Value::Tuple(vals), Type::Array { elem, count }) =>"),
         ("spec/mem/basic.md", "fn dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Size)"),
         ("spec/mem/interface.md", "fn signed_dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Int)"),
