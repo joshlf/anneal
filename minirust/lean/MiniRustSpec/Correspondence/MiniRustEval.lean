@@ -235,7 +235,7 @@ theorem canRepresent_intFromBits (it : Gen.IntType) (bits : Nat) (hgood : GoodSi
 
 theorem checkValue_int {t : Gen.IntType} {i : Int} (h : IntType.can_represent t i = true) :
     checkValue (.Int i) (.Int t) = .ok () := by
-  simp only [checkValue, h, ite_true]; rfl
+  simp only [checkValue, ensureElseUb, h]; rfl
 
 theorem checkValue_bool (b : Bool) : checkValue (.Bool b) .Bool = .ok () := rfl
 

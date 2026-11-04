@@ -152,7 +152,7 @@ comments; `..` marks elided code). Effects are
 (a panic in the spec, which upstream calls a spec bug), and
 `Stop.unsupported` (outside the interpreted fragment; never silently wrong).
 
-`Anchors.lean` lists the 49 upstream items that `Interp.lean` transcribes,
+`Anchors.lean` lists the 50 upstream items that `Interp.lean` transcribes,
 each with its file path, item name, line, and token hash, and proves by `decide`
 that the generated model contains them unchanged (`anchors_ok`) with no
 duplicate entries (`anchors_nodup`). Re-pinning MiniRust therefore breaks
@@ -378,9 +378,11 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `bool` across both `true` and `false` branches, plus `argsOk` rejection of
   the invalid `bool` byte `2` (`boolCastTrue_*`, `boolCastFalse_*`,
   `boolCastInvalidArg_rejected`).
-* `uninitBool`, `uninitBoolNot`, `uninitBoolRel`, and `uninitBoolBitAnd`, whose
-  `SwitchInt`, `UnaryOp(Not)`, `BinaryOp(Eq)`, and `BinaryOp(BitAnd)` on an
-  uninitialized `bool` are UB in both semantics
+* `uninitBool`, `uninitBoolNot`, `uninitBoolRel`, `uninitBoolBitAnd`, and
+  `uninitBoolBitOrRhs`, whose `SwitchInt`, `UnaryOp(Not)`, `BinaryOp(Eq)`,
+  `BinaryOp(BitAnd)` (uninitialized LHS), and `BinaryOp(BitOr)` (`const true`
+  LHS, uninitialized RHS — confirming MIR `BitOr` on `bool` does not
+  short-circuit) on an uninitialized `bool` are UB in both semantics
   (`uninitBool*_minirust_ub_from_start`, `uninitBool*_minirust_direct`).
 * `cmpSel` and `boolBitOrdUse`, `(i8, i8, bool) -> Ordering` and
   `(bool, u8, Ordering) -> Ordering` bodies that switch on `bool` (including
@@ -406,11 +408,15 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `fallback` continuation in `decodeDiscriminant_short_circuits`), a padded
   `(i8, bool)` tuple whose size rounds up to its alignment and whose padding
   encodes as `Uninit` and is ignored by decoding (`decode_ordering_less`, ...,
-  `checkValue_tuple_arity`), `Type::Union` chunk decoding, encoding, and
-  `check_value` (`layout_union`, `decode_union`, `encode_union`,
-  `checkValue_union_chunk_size`, `checkValue_union_chunk_data`), and unsized
-  `Slice`, `TraitObject`, and unsized `Tuple` layouts and `specPanic`s
-  (`layout_slice`, ..., `checkValue_unsized_panics`).
+  `checkValue_tuple_arity`), `Type::Union` chunk decoding, encoding,
+  `check_value`, and `CastOp::Transmute` round-tripping with `paddedPairTy`
+  (including UB when an `Uninit` union chunk overlaps a non-padding tuple
+  field; `layout_union`, `decode_union`, `encode_union`,
+  `checkValue_union_chunk_size`, `checkValue_union_chunk_data`,
+  `transmute_union_paddedPair`, `transmute_paddedPair_union`,
+  `transmute_union_paddedPair_uninit_ub`), and unsized `Slice`, `TraitObject`,
+  and unsized `Tuple` layouts and `specPanic`s (`layout_slice`, ...,
+  `checkValue_unsized_panics`).
 
 `Audit.lean` logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, and
 `[WITNESS-AUDIT]` lines ending in `sorry_free=true` (via

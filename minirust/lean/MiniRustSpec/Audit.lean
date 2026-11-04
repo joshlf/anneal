@@ -449,6 +449,11 @@ open MiniRustSpec.Correspondence.Witness in
   uninitBoolBitAnd_anneal_ub
   uninitBoolBitAnd_minirust_ub_from_start
   uninitBoolBitAnd_minirust_direct
+  uninitBoolBitOrRhs_inFragment
+  uninitBoolBitOrRhs_translate
+  uninitBoolBitOrRhs_anneal_ub
+  uninitBoolBitOrRhs_minirust_ub_from_start
+  uninitBoolBitOrRhs_minirust_direct
   relLt_signed
   relGt_unsigned
   relCmp_signed
@@ -495,6 +500,9 @@ open MiniRustSpec.Correspondence.Witness in
   encode_union
   checkValue_union_chunk_size
   checkValue_union_chunk_data
+  transmute_union_paddedPair
+  transmute_paddedPair_union
+  transmute_union_paddedPair_uninit_ub
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -644,6 +652,11 @@ open MiniRustSpec.Correspondence.Witness in
   uninitBoolBitAnd_anneal_ub
   uninitBoolBitAnd_minirust_ub_from_start
   uninitBoolBitAnd_minirust_direct
+  uninitBoolBitOrRhs_inFragment
+  uninitBoolBitOrRhs_translate
+  uninitBoolBitOrRhs_anneal_ub
+  uninitBoolBitOrRhs_minirust_ub_from_start
+  uninitBoolBitOrRhs_minirust_direct
   relLt_signed
   relGt_unsigned
   relCmp_signed
@@ -690,6 +703,9 @@ open MiniRustSpec.Correspondence.Witness in
   encode_union
   checkValue_union_chunk_size
   checkValue_union_chunk_data
+  transmute_union_paddedPair
+  transmute_paddedPair_union
+  transmute_union_paddedPair_uninit_ub
   sumTo_minirust_ret_from_start
   castBitNot4_minirust_ret_from_start
   uninitSwitchUb_minirust_ub_from_start

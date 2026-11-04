@@ -56,15 +56,18 @@ here.
 * `Terminator::Goto`, `Terminator::Switch`, `Terminator::Unreachable`, and
   `Terminator::Return` (`spec/lang/step/terminators.md`), including frame
   teardown, `storage_dead` of every local, and both stack-pop actions.
-* The representation relation for `Type::Int`, `Type::Bool`, sized
-  `Type::Tuple`, and `Type::Enum` (including `decode_discriminant` and
-  `encode_discriminant`), and `Machine::check_value` for integers, Booleans,
-  tuples, and variants (`spec/lang/representation.md`); `Type::layout` for
-  those types and for unions (`spec/lang/types.md`); and `BasicMemory`'s
-  `load`, `store`, `deallocate`, and `check_ptr` (`spec/mem/basic.md`),
-  wrapped by `ConcurrentMemory`'s access recording (`spec/mem/concurrent.md`).
-  The recursion of these definitions over nested types, fields, and variants
-  is structural (Lean `mutual` blocks), so the kernel evaluates them.
+* The representation relation (`Type::{decode, encode}`) for `Type::Int`,
+  `Type::Bool`, sized and unsized `Type::Tuple`, `Type::Union`
+  (`Type.encodeUnionChunks`), `Type::Enum` (including `decode_discriminant`
+  and `encode_discriminant`), `Type::Slice`, and `Type::TraitObject`, and
+  `Machine::check_value` (with `ensure_else_ub` and `checkUnionChunks`) for
+  those types (`spec/lang/representation.md`); `Type::layout` for all of them
+  (`spec/lang/types.md`); and `BasicMemory`'s `load`, `store`, `deallocate`,
+  and `check_ptr` (`spec/mem/basic.md`), wrapped by `ConcurrentMemory`'s
+  access recording (`spec/mem/concurrent.md`). The recursion of these
+  definitions over nested types, tuple fields, union chunks, enum variants,
+  and discriminator trees is structural (Lean `mutual` blocks), so the kernel
+  evaluates them.
 * The `x86_64` target (`spec/prelude/target.md`) as the instance of `T` and
   `BasicMemory<x86_64>` as the instance of `M`.
 
@@ -817,14 +820,23 @@ def Type.encodeVariant : List (Int × Variant) → Int → Val → Interp (List 
 
 end
 
+/-- `ensure_else_ub` (`spec/lang/representation.md`):
+> "/// Ensures the given boolean is true or else raises UB.
+> fn ensure_else_ub(b: bool, msg: &str) -> Result<()> {
+>     if !b { throw_ub!(\"{}\", msg); }
+>     ret(())
+> }" -/
+def ensureElseUb (b : Bool) (msg : String) : Interp Unit :=
+  if !b then ub msg else pure ()
+
 /-- The chunk loop of `check_value` for unions (`spec/lang/representation.md`):
 > "for (data, (_, size)) in chunk_data.zip(chunks) {
 >     ensure_else_ub(data.len() == size.bytes(), \"Value::Union: invalid chunk data\")?;
 > }" -/
 def checkUnionChunks : List (List Byte) → List (Offset × Size) → Interp Unit
-  | data :: chunkData, (_, size) :: chunks =>
-    if data.length ≠ size.bytes then ub "Value::Union: invalid chunk data"
-    else checkUnionChunks chunkData chunks
+  | data :: chunkData, (_, size) :: chunks => do
+    ensureElseUb (data.length == size.bytes) "Value::Union: invalid chunk data"
+    checkUnionChunks chunkData chunks
   | _, _ => pure ()
 
 mutual
@@ -857,17 +869,17 @@ The fields of a tuple are checked by `checkFields`, the chunks of a union by
 arrays are outside the fragment. -/
 def checkValue : Val → «Type» → Interp Unit
   | .Int i, .Int t =>
-    if IntType.can_represent t i then pure () else ub "Value::Int: invalid integer value"
+    ensureElseUb (IntType.can_represent t i) "Value::Int: invalid integer value"
   | .Bool _, .Bool => pure ()
   | .Tuple vals, .Tuple fields _ unsizedField =>
     match unsizedField with
     | some _ => specPanic "Value: unsized structs cannot be represented as values"
-    | none =>
-      if vals.length ≠ fields.length then ub "Value::Tuple: invalid number of fields"
-      else checkFields vals fields
-  | .Union chunkData, .Union _ chunks _ _ =>
-    if chunkData.length ≠ chunks.length then ub "Value::Union: invalid chunk size"
-    else checkUnionChunks chunkData chunks
+    | none => do
+      ensureElseUb (vals.length == fields.length) "Value::Tuple: invalid number of fields"
+      checkFields vals fields
+  | .Union chunkData, .Union _ chunks _ _ => do
+    ensureElseUb (chunkData.length == chunks.length) "Value::Union: invalid chunk size"
+    checkUnionChunks chunkData chunks
   | .Variant discriminant data, .Enum ⟨variants⟩ _ _ _ _ => checkVariant variants discriminant data
   | _, .Slice _ => specPanic "Value: slices cannot be represented as values"
   | _, .TraitObject _ => specPanic "Value: trait objects cannot be represented as values"

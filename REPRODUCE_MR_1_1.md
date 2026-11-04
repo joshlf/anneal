@@ -43,9 +43,10 @@ as a pass.
   `impl_Type__decode_6` (unions, `:322`),
   `fn_decode_discriminant` (`:353`), `fn_encode_discriminant` (`:377`),
   `impl_Type__decode_7` (enums, `:393`), `impl_Type__decode_8` (slices, `:441`),
-  `impl_Type__decode_9` (trait objects, `:450`), and
+  `impl_Type__decode_9` (trait objects, `:450`),
+  `fn_ensure_else_ub` (`:482`), and
   `impl_TupleHeadLayout__capped_tail_align` (`spec/lang/types.md:200`),
-  pinned by token hash and checked by `decide` (49 anchors in total).
+  pinned by token hash and checked by `decide` (50 anchors in total).
 - **Quotation checks** (`crates/anneal-minirust-gen/tests/quotes.rs`):
   `bool_comparison_and_transmute_quotations_are_pinned` and
   `enum_tuple_and_cmp_quotations_are_pinned` check each new upstream
@@ -92,9 +93,11 @@ as a pass.
   `leNeGe` (`<=`, `!=`, `>=`, a `bool` return place that is also a switch
   scrutinee), `boolCastI8` (`Cast(CastKind::IntToInt)` from `bool` to `i8`
   across both `true` and `false` branches plus `argsOk` rejection of invalid
-  `bool` byte `2`), `uninitBool`, `uninitBoolNot`, `uninitBoolRel`, and
-  `uninitBoolBitAnd` (UB on an uninitialized `bool` in `SwitchInt`,
-  `UnaryOp(Not)`, `BinaryOp(Eq)`, and `BinaryOp(BitAnd)` in both semantics),
+  `bool` byte `2`), `uninitBool`, `uninitBoolNot`, `uninitBoolRel`,
+  `uninitBoolBitAnd`, and `uninitBoolBitOrRhs` (UB on an uninitialized `bool`
+  in `SwitchInt`, `UnaryOp(Not)`, `BinaryOp(Eq)`, `BinaryOp(BitAnd)` on the LHS,
+  and non-short-circuiting `BinaryOp(BitOr)` with `const true` on the LHS and
+  an uninitialized `bool` on the RHS in both semantics),
   `cmpSel` (an `Ordering` return place receiving a signed `i8` `Cmp` or a
   `bool` `Cmp`; the inputs `(-1, 1, true)`, `(7, 7, true)`, and `(0, 0, false)`
   return `Less`, `Equal`, and `Greater` in both semantics), `boolBitOrdUse`
@@ -104,8 +107,9 @@ as a pass.
   invalid `Ordering` tag bytes `2` and `128`), `uninitOrdering` (returning an
   uninitialized `Ordering` is UB in both semantics), and ground-truth
   evaluations of the new operators, `decodeDiscriminant` short-circuiting
-  (`decodeDiscriminant_short_circuits`), and the enum, tuple, union, slice,
-  and trait-object representations.
+  (`decodeDiscriminant_short_circuits`), and the enum, tuple, union (including
+  union↔tuple `CastOp::Transmute` round-trips and uninitialized-chunk UB),
+  slice, and trait-object representations.
 - **Audit** (`minirust/lean/MiniRustSpec/Audit.lean`): `#check_theorem_deps`
   verifies that every listed declaration is a distinct `theorem`
   (`ConstantInfo.thmInfo`), logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, and
@@ -180,8 +184,8 @@ Pass: four lines of the form
 ```text
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
 [SIMULATION-AUDIT] decls=51 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
-[WITNESS-AUDIT] decls=133 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-MiniRustSpec.Audit: exhaustively verified standard axioms for 8554 declarations across all MiniRustSpec.* modules
+[WITNESS-AUDIT] decls=141 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+MiniRustSpec.Audit: exhaustively verified standard axioms for 8568 declarations across all MiniRustSpec.* modules
 ```
 
 (the axiom lists contain only `propext`, `Quot.sound`, and

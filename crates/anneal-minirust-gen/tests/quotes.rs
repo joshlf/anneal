@@ -950,7 +950,15 @@ fn enum_tuple_and_cmp_quotations_are_pinned() {
             "let mut bytes = list![AbstractByte::Init(0, None); size.bytes()];",
             "MiniRustSpec/Interp.lean",
         ),
-        // `check_value` for variants and tuples.
+        // `check_value` for variants and tuples, and `ensure_else_ub`.
+        (
+            repr,
+            "fn ensure_else_ub(b: bool, msg: &str) -> Result<()> { \
+             if !b { throw_ub!(\"{}\", msg); } ret(()) }",
+            "fn ensure_else_ub(b: bool, msg: &str) -> Result<()> { \
+             if !b { panic!(\"{}\", msg); } ret(()) }",
+            "MiniRustSpec/Interp.lean",
+        ),
         (
             repr,
             "let Some(variant) = variants.get(discriminant) else { \

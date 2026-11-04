@@ -3322,6 +3322,62 @@ theorem uninitBoolBitAnd_minirust_direct :
     Interp.steps 2 uninitBoolBitAndMInit =
       .error (.ub "load at type but the data in memory violates the language invariant") := rfl
 
+/-- MIR of `fn uninit_bool_bitor_rhs() -> bool` whose entry block applies
+`BitOr(const true, copy _0)` (`build::bool_or`) to an initialized LHS `true`
+and the uninitialized return place `_0` on the RHS, confirming that MIR
+`BinaryOp(BitOr)` on `bool` does not short-circuit and faults when loading the
+uninitialized RHS operand `_0`. -/
+def uninitBoolBitOrRhs : CapturedMir where
+  defPath := "witness::uninit_bool_bitor_rhs"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [boolDecl]
+  basicBlocks := [
+    { statements := [mkStmt (.assign (local_ 0) (.binaryOp .bitOr (constBool true) (.copy (local_ 0))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiToBool
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem uninitBoolBitOrRhs_inFragment : inFragment uninitBoolBitOrRhs = true := by decide
+
+def uninitBoolBitOrRhsFn : Gen.Function where
+  locals := ⟨[(localName 0, .Bool)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 0))
+        (boolBitOp .BitOr (.Constant (.Bool true) .Bool) (.Load (.Local (localName 0))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem uninitBoolBitOrRhs_translate : translateFn uninitBoolBitOrRhs = some uninitBoolBitOrRhsFn := rfl
+
+def uninitBoolBitOrRhsS0 : MachineState := initMachineState uninitBoolBitOrRhs []
+def uninitBoolBitOrRhsMInit : Mach :=
+  machineWithCtx ctxBool uninitBoolBitOrRhs uninitBoolBitOrRhsFn uninitBoolBitOrRhsS0.frame.locals
+    uninitBoolBitOrRhsFn.start
+
+theorem uninitBoolBitOrRhs_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree uninitBoolBitOrRhs []) tr u ∧ FaultNow u :=
+  faultsA_sound uninitBoolBitOrRhs 3 _ (by decide)
+
+theorem uninitBoolBitOrRhs_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n uninitBoolBitOrRhsMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := uninitBoolBitOrRhs_anneal_ub
+  exact mirCall_ub uninitBoolBitOrRhs_inFragment uninitBoolBitOrRhs_translate ctxBool (ctxBool_ok1 rfl) []
+    (by decide) uninitBoolBitOrRhsMInit rfl rfl rfl hr hf
+
+set_option maxRecDepth 8192 in
+theorem uninitBoolBitOrRhs_minirust_direct :
+    Interp.steps 2 uninitBoolBitOrRhsMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") := rfl
+
 /-! ### Ground truth for the interpreted operators
 
 Direct evaluations of the transcribed MiniRust operators, independent of the
@@ -3512,5 +3568,24 @@ theorem checkValue_union_chunk_size :
 theorem checkValue_union_chunk_data :
     checkValue (.Union [[.Init 254 none], [.Init 1 none, .Init 2 none]]) unionPaddedTy =
       .error (.ub "Value::Union: invalid chunk data") := rfl
+
+set_option maxRecDepth 8192 in
+/-- `CastOp::Transmute` between `unionPaddedTy` and `paddedPairTy` (both of size
+`4` and alignment `2`, with active fields/chunks at offsets `0` and `2` and
+padding/gaps at offsets `1` and `3`): transmuting a union with valid `i8` and
+`bool` chunk bytes produces the corresponding tuple (and vice versa), whereas
+transmuting a union whose second chunk at offset `2` is `Uninit` raises UB
+because `paddedPairTy`'s `bool` field at offset `2` fails `Type::decode`. -/
+theorem transmute_union_paddedPair :
+    evalCastOp (.Transmute paddedPairTy) (.Union [[.Init 254 none], [.Init 1 none]], unionPaddedTy) =
+      .ok (.Tuple [.Int (-2), .Bool true], paddedPairTy) := rfl
+set_option maxRecDepth 8192 in
+theorem transmute_paddedPair_union :
+    evalCastOp (.Transmute unionPaddedTy) (.Tuple [.Int (-2), .Bool true], paddedPairTy) =
+      .ok (.Union [[.Init 254 none], [.Init 1 none]], unionPaddedTy) := rfl
+set_option maxRecDepth 8192 in
+theorem transmute_union_paddedPair_uninit_ub :
+    evalCastOp (.Transmute paddedPairTy) (.Union [[.Init 254 none], [.Uninit]], unionPaddedTy) =
+      .error (.ub "transmuted value is not valid at new type") := rfl
 
 end MiniRustSpec.Correspondence.Witness
