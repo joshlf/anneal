@@ -3558,7 +3558,10 @@ homogeneous binary intrinsic second-operand signedness resolution:
    homogeneous binary intrinsics (`exact_div`, `saturating_add`, `unchecked_add`)
    resolve `isSigned = true` from the second operand, whereas `unchecked_shr`
    (`sameRhsTy = false`) does not conflate `U` with `T` and steps to
-   `MirStepNode.unsupported`.
+   `MirStepNode.unsupported`;
+5. When `const_eval_select` dispatches to `"std::hint::unreachable_unchecked"`
+   (the visible `std` re-export path in `std`-linked crates), execution faults
+   immediately with `MirStepNode.fail .ub`.
 -/
 theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
     (ptrVal : ProvenancePtr)
@@ -3591,6 +3594,10 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
       .constant
         { ty := { kind := .fnDef "core::intrinsics::align_of_val" .nil, layoutIdx := 0 },
           val := .zeroSized }
+    let rtStdUnreachOp : Operand :=
+      .constant
+        { ty := { kind := .fnDef "std::hint::unreachable_unchecked" .nil, layoutIdx := 0 },
+          val := .zeroSized }
     let selectSizeOps : List Operand := [
       .copy { local_ := 6, projection := .nil },
       constFnOp,
@@ -3600,6 +3607,11 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
       .copy { local_ := 6, projection := .nil },
       constFnOp,
       rtAlignOfValOp
+    ]
+    let selectStdUnreachOps : List Operand := [
+      .copy { local_ := 3, projection := .nil },
+      constFnOp,
+      rtStdUnreachOp
     ]
     let rhsSignedConstOp : Operand :=
       .constant { ty := { kind := .int .i32, layoutIdx := 0 }, val := .scalar (.int rhs) }
@@ -3724,9 +3736,14 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
     evalTerminator s
         (mkIntrinsicCallTerm "core::intrinsics::unchecked_shr" .nil
           binMixedOps dest targetBb unwind span) .none =
-      MirStepNode.unsupported := by
+      MirStepNode.unsupported ∧
+    evalTerminator s
+        (mkIntrinsicCallTerm "core::intrinsics::const_eval_select"
+          [.tuple .nil]
+          selectStdUnreachOps dest targetBb unwind span) .none =
+      MirStepNode.fail .ub := by
   dsimp only
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · have h : classifyRustIntrinsic? "core::intrinsics::arith_offset" = .some .arithOffset := rfl
     have hEx : stringEq "core::intrinsics::arith_offset" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
@@ -3854,5 +3871,14 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
       evalConstValue, readProjectedValue, emptyMemory, get?, findCallee?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicIsSigned, operandTy, placeTy]
+  · have hSel : classifyRustIntrinsic? "core::intrinsics::const_eval_select" = .some .constEvalSelect := rfl
+    have hEx1 : stringEq "core::intrinsics::const_eval_select" "core::intrinsics::exact_div" = false := rfl
+    have hEx2 : stringEq "std::hint::unreachable_unchecked" "core::intrinsics::exact_div" = false := rfl
+    have hUnr : classifyRustIntrinsic? "std::hint::unreachable_unchecked" = .none := rfl
+    unfold evalTerminator mkIntrinsicCallTerm
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+      evalConstValue, readProjectedValue, emptyMemory, get?, findCallee?, isDirectExactDivTarget,
+      evalDirectRustIntrinsic?, hSel, hEx1, hEx2, hUnr, resolveConstEvalSelectTarget?, length]
+    rfl
 
 end Correspondence.V2026_06_01.L5_ControlAndCalls

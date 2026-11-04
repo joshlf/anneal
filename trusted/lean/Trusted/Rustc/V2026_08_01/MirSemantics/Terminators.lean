@@ -2334,8 +2334,9 @@ def constEvalSelectTupleArgOps : Option RigidTy → List Operand
 
 /--
 Test whether `defPath` is an unreachable hint or intrinsic
-(`"core::hint::unreachable_unchecked"` or `"core::intrinsics::unreachable"`),
-reaching which is immediate undefined behavior (`MirStepNode.fail .ub`).
+(`"core::hint::unreachable_unchecked"`, `"std::hint::unreachable_unchecked"`, or
+`"core::intrinsics::unreachable"`), reaching which is immediate undefined
+behavior (`MirStepNode.fail .ub`).
 
 Reference (`library/core/src/hint.rs` and `library/core/src/intrinsics/mod.rs`
 at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -2351,7 +2352,9 @@ at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 def isUnreachableCallTarget (defPath : DefPath) : Bool :=
   Bool.or
     (stringEq defPath "core::hint::unreachable_unchecked")
-    (stringEq defPath "core::intrinsics::unreachable")
+    (Bool.or
+      (stringEq defPath "std::hint::unreachable_unchecked")
+      (stringEq defPath "core::intrinsics::unreachable"))
 
 /--
 Test whether `defPath` is a non-unwinding (aborting) panic or abort entrypoint
