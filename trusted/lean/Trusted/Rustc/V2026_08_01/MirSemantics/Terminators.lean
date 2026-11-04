@@ -1112,27 +1112,27 @@ def evalTerminator
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
       | .ok argVals locals' =>
-        match isUnreachableCallTarget target.defPath with
-        | true => MirStepNode.fail .ub
-        | false =>
-          match findCallee? s.memory.callees target.defPath with
-          | .some calleeBody =>
-            match checkCalleeTargetCompatible target calleeBody (length argVals) with
-            | false => MirStepNode.fail .ub
-            | true =>
-              match currentBody with
-              | .none => MirStepNode.unsupported
-              | .some callerBody =>
-                MirStepNode.step
-                  (pushDivergingCalleeFrame
-                    s
-                    callerBody
-                    locals'
-                    destination
-                    unwind
-                    calleeBody
-                    argVals)
-          | .none =>
+        match findCallee? s.memory.callees target.defPath with
+        | .some calleeBody =>
+          match checkCalleeTargetCompatible target calleeBody (length argVals) with
+          | false => MirStepNode.fail .ub
+          | true =>
+            match currentBody with
+            | .none => MirStepNode.unsupported
+            | .some callerBody =>
+              MirStepNode.step
+                (pushDivergingCalleeFrame
+                  s
+                  callerBody
+                  locals'
+                  destination
+                  unwind
+                  calleeBody
+                  argVals)
+        | .none =>
+          match isUnreachableCallTarget target.defPath with
+          | true => MirStepNode.fail .ub
+          | false =>
             match isAbortingPanicDefPath target.defPath with
             | true => MirStepNode.retOutcome .abort
             | false =>

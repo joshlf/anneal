@@ -307,9 +307,11 @@ theorem mir_evalTerminator_call_transparent_and_unreachable_unchecked
     (destination : Place) (unwind : UnwindAction) (span : String)
     (currentBody : Option CapturedMir) :
     (extractCalleeDefPath? func = .some "core::hint::unreachable_unchecked" →
+      findCallee? s.memory.callees "core::hint::unreachable_unchecked" = .none →
       evalTerminator s ⟨.call func .nil destination .none unwind, span⟩ currentBody =
         MirStepNode.fail .ub) ∧
     (extractCalleeDefPath? func = .some "core::intrinsics::unreachable" →
+      findCallee? s.memory.callees "core::intrinsics::unreachable" = .none →
       evalTerminator s ⟨.call func .nil destination .none unwind, span⟩ currentBody =
         MirStepNode.fail .ub) ∧
     (∀ (defPath : DefPath) (targetBb : BasicBlockIdx)
@@ -346,10 +348,10 @@ theorem mir_evalTerminator_call_transparent_and_unreachable_unchecked
   have hUnreach1 : isUnreachableCallTarget "core::hint::unreachable_unchecked" = true := by decide
   have hUnreach2 : isUnreachableCallTarget "core::intrinsics::unreachable" = true := by decide
   refine ⟨?_, ?_, ?_⟩
-  · intro hUnreach
-    simp only [evalTerminator, resolveCallTarget, hUnreach, evalOperands, hUnreach1]
-  · intro hUnreach
-    simp only [evalTerminator, resolveCallTarget, hUnreach, evalOperands, hUnreach2]
+  · intro hUnreach hFind
+    simp only [evalTerminator, resolveCallTarget, hUnreach, evalOperands, hFind, hUnreach1]
+  · intro hUnreach hFind
+    simp only [evalTerminator, resolveCallTarget, hUnreach, evalOperands, hFind, hUnreach2]
   · intro defPath targetBb calleeBody callerBody argVals locals' hFunc hCurr hArgs hFind
     dsimp only
     subst hCurr
@@ -957,6 +959,7 @@ theorem mir_evalTerminator_diverging_call_args_and_unreachable
         MirStepNode.fail .ub) ∧
     (∀ (argVals : List Value) (locals' : List LocalSlot),
       extractCalleeDefPath? func = .some "core::hint::unreachable_unchecked" →
+      findCallee? s.memory.callees "core::hint::unreachable_unchecked" = .none →
       evalOperands
         s.frame.locals
         argOps
@@ -968,6 +971,7 @@ theorem mir_evalTerminator_diverging_call_args_and_unreachable
         MirStepNode.fail .ub) ∧
     (∀ (argVals : List Value) (locals' : List LocalSlot),
       extractCalleeDefPath? func = .some "core::intrinsics::unreachable" →
+      findCallee? s.memory.callees "core::intrinsics::unreachable" = .none →
       evalOperands
         s.frame.locals
         argOps
@@ -984,10 +988,10 @@ theorem mir_evalTerminator_diverging_call_args_and_unreachable
     simp only [evalTerminator, bodyLocalDeclsOf, hResolveUb]
   · intro target localsAfterFunc hResolveOk hArgsUb
     simp only [evalTerminator, bodyLocalDeclsOf, hResolveOk, hArgsUb]
-  · intro argVals locals' hFunc hArgsOk
-    simp only [evalTerminator, resolveCallTarget, hFunc, hArgsOk, hUnreach1]
-  · intro argVals locals' hFunc hArgsOk
-    simp only [evalTerminator, resolveCallTarget, hFunc, hArgsOk, hUnreach2]
+  · intro argVals locals' hFunc hFind hArgsOk
+    simp only [evalTerminator, resolveCallTarget, hFunc, hArgsOk, hFind, hUnreach1]
+  · intro argVals locals' hFunc hFind hArgsOk
+    simp only [evalTerminator, resolveCallTarget, hFunc, hArgsOk, hFind, hUnreach2]
 
 /--
 Universal characterization of diverging `TerminatorKind.call` (`target = .none`)
@@ -1018,7 +1022,6 @@ theorem mir_evalTerminator_diverging_call_linked_callee_corresponds
     (argVals : List Value)
     (locals' : List LocalSlot)
     (hFunc : extractCalleeDefPath? func = .some defPath)
-    (hNotUnreach : isUnreachableCallTarget defPath = false)
     (hArgs :
       evalOperands
         s.frame.locals
@@ -1066,7 +1069,7 @@ theorem mir_evalTerminator_diverging_call_linked_callee_corresponds
         MirStepNode.retOutcome .panic) := by
   dsimp only
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
-  · simp only [evalTerminator, resolveCallTarget, hFunc, hArgs, hNotUnreach, hFind,
+  · simp only [evalTerminator, resolveCallTarget, hFunc, hArgs, hFind,
       checkCalleeTargetCompatible]
   · intro retVal calleeLocals hRet0
     simp [evalTerminator, pushDivergingCalleeFrame, hRet0]
