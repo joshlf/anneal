@@ -78,12 +78,11 @@ def initMachineStateWithMemory
 Verify that a `ScalarInt` is a valid 4-byte Unicode scalar value
 (`0x0000..=0xD7FF` or `0xE000..=0x10FFFF`).
 
-Reference (The Rust Reference, "Textual types"):
-<https://doc.rust-lang.org/1.98.0/reference/types/textual.html>
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
 
-> "A value of type char is a Unicode scalar value (i.e. a code point that is not
-> a surrogate), represented as a 32-bit unsigned word in the 0x0000 to 0xD7FF or
-> 0xE000 to 0x10FFFF range."
+> "A char value must not be a surrogate (i.e., must not be in the range
+> 0xD800..=0xDFFF) and must be equal to or less than char::MAX."
 -/
 @[reducible, simp]
 def isValidChar (sv : ScalarInt) : Prop :=
@@ -98,7 +97,8 @@ targets).
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
 
-> "The size of the referenced value cannot exceed `isize::MAX`."
+> "Furthermore, for wide references and Box<T>, slice metadata is invalid if it
+> makes the total size of the pointed-to value bigger than isize::MAX."
 -/
 @[reducible, simp]
 def maxIsizeBytes (ptrBits : Nat) : Nat :=
@@ -140,6 +140,49 @@ def sigWorklistHasTypeParam : Nat → List RigidTy → Bool
     | _ => sigWorklistHasTypeParam fuel' rest
 
 /--
+Test whether any `RigidTy` in a worklist contains an uninstantiated
+`RigidTy.param`, an unnormalized `RigidTy.alias`, or a `RigidTy.other` type
+that `anneal-rustc-capture` could not lower. Exhausting `fuel` on a nonempty
+worklist answers `true`, so callers that gate certificates fail closed.
+-/
+@[reducible, simp]
+def sigWorklistHasUnresolvedTy : Nat → List RigidTy → Bool
+  | _, .nil => false
+  | 0, _ :: _ => true
+  | fuel' + 1, k :: rest =>
+    match k with
+    | .param _ _ | .alias _ _ | .other _ => true
+    | .tuple inner | .adt _ inner | .fnDef _ inner | .closure _ inner =>
+      sigWorklistHasUnresolvedTy fuel' (List.append inner rest)
+    | .array inner _ | .slice inner | .ref _ inner | .rawPtr _ inner =>
+      sigWorklistHasUnresolvedTy fuel' (inner :: rest)
+    | .fnPtr inputs output _ _ =>
+      sigWorklistHasUnresolvedTy fuel' (output :: List.append inputs rest)
+    | _ => sigWorklistHasUnresolvedTy fuel' rest
+
+/--
+Test whether `RigidTy.computeLayout` can synthesize the layout of every
+by-value component in a worklist from the type alone: scalars, `!`, function
+items and pointers, references and raw pointers (whose pointee never affects
+their size beyond the slice/`str`/`dyn` metadata `computeLayout` inspects), and
+arrays and tuples of such types. ADTs, closures, and unsized or unlowered types
+need a captured `rustc` layout, because their field types, field order, and
+niche or tag encoding are not recorded in `RigidTy`.
+-/
+@[reducible, simp]
+def sigLayoutSynthesizable : Nat → List RigidTy → Bool
+  | _, .nil => true
+  | 0, _ :: _ => false
+  | fuel' + 1, k :: rest =>
+    match k with
+    | .bool | .char | .int _ | .uint _ | .float _ | .never
+    | .fnDef _ _ | .fnPtr _ _ _ _ | .ref _ _ | .rawPtr _ _ =>
+      sigLayoutSynthesizable fuel' rest
+    | .tuple inner => sigLayoutSynthesizable fuel' (List.append inner rest)
+    | .array inner _ => sigLayoutSynthesizable fuel' (inner :: rest)
+    | _ => false
+
+/--
 Test whether `val` lies within `range : WrappingRange` (`@[reducible]` for
 `dsimp` reduction).
 -/
@@ -150,16 +193,17 @@ def sigWrappingRangeContains (range : WrappingRange) (val : Nat) : Bool :=
   | false => Nat.ble range.start val || Nat.ble val range.end_
 
 /--
-Byte width of a `PrimitiveKind` scalar (`@[reducible]` for `dsimp` reduction).
+Byte width of a `PrimitiveKind` scalar (`@[reducible]` for `dsimp` reduction;
+`decide (0 < bits)` also reduces under `simp` on literal widths).
 -/
 @[reducible, simp]
 def sigPrimitiveByteWidth : PrimitiveKind → Option Nat
   | .int bits _ =>
-    match Nat.beq (bits % 8) 0 && Nat.blt 0 bits with
+    match Nat.beq (bits % 8) 0 && decide (0 < bits) with
     | true => .some (bits / 8)
     | false => .none
   | .float bits =>
-    match Nat.beq (bits % 8) 0 && Nat.blt 0 bits with
+    match Nat.beq (bits % 8) 0 && decide (0 < bits) with
     | true => .some (bits / 8)
     | false => .none
   | .pointer _ => .none
@@ -202,13 +246,42 @@ def tagMatchesScalarLayout (sl : ScalarLayout) (bits : Nat) : Prop :=
   | .union _ => True
 
 /--
+Test whether `sl` is a pointer-typed scalar (`Primitive::Pointer`), whose byte
+width is the target pointer width rather than a property of the primitive.
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1379-L1393>
+
+> "Pointer(AddressSpace),"
+-/
+@[reducible, simp]
+def sigScalarLayoutIsPointer : ScalarLayout → Bool
+  | .initialized (.pointer _) _ => true
+  | .union (.pointer _) => true
+  | _ => false
+
+/--
 Validate a `Value` against a single `ScalarLayout` component (used for scalar
 and scalar-pair struct fields when only `BackendRepr` metadata is present).
+
+Pointer-typed scalars (`sigScalarLayoutIsPointer`) have no primitive byte
+width, so they accept a provenance pointer `.ptr` of nonzero width or a
+`.scalar` address satisfying the recorded `WrappingRange` (which rejects null
+for `&T`, `NonNull<T>`, and function pointers).
 -/
 @[reducible, simp]
 def valueMatchesScalarLayout (sl : ScalarLayout) (val : Value) : Prop :=
   match sigScalarLayoutByteWidth sl with
-  | .none => False
+  | .none =>
+    sigScalarLayoutIsPointer sl = true ∧
+      match val with
+      | .scalar sv =>
+        0 < sv.sizeBytes ∧
+          sv.bits < 2 ^ (sv.sizeBytes * 8) ∧
+          tagMatchesScalarLayout sl sv.bits
+      | .ptr _ ptrSz => 0 < ptrSz
+      | _ => False
   | .some expectedBytes =>
     match val with
     | .scalar sv =>
@@ -216,13 +289,6 @@ def valueMatchesScalarLayout (sl : ScalarLayout) (val : Value) : Prop :=
         sv.sizeBytes = expectedBytes ∧
         sv.bits < 2 ^ (sv.sizeBytes * 8) ∧
         tagMatchesScalarLayout sl sv.bits
-    | .ptr _ ptrSz =>
-      0 < expectedBytes ∧
-        ptrSz = expectedBytes ∧
-        match sl with
-        | .initialized (.pointer _) _ => True
-        | .union (.pointer _) => True
-        | _ => False
     | _ => False
 
 /--
@@ -296,7 +362,8 @@ def sigStringEq (a b : String) : Bool :=
 
 /--
 Search `decls` for the first `LocalDecl` whose `ty.kind` is an `.adt` with
-definition path `adtDefPath`, returning its `layoutIdx`.
+definition path `adtDefPath`, returning its `layoutIdx`. Only sound for
+non-generic ADTs, whose definition path determines the type.
 -/
 @[reducible, simp]
 def findAdtDeclLayoutIdx (adtDefPath : String) : List LocalDecl → Option LayoutIdx
@@ -310,46 +377,22 @@ def findAdtDeclLayoutIdx (adtDefPath : String) : List LocalDecl → Option Layou
     | _ => findAdtDeclLayoutIdx adtDefPath rest
 
 /--
-Test whether any `LocalDecl` in `decls` references layout table slot `idx`.
--/
-@[reducible, simp]
-def localDeclsUseLayoutIdx : List LocalDecl → LayoutIdx → Bool
-  | .nil, _ => false
-  | d :: rest, idx =>
-    match Nat.beq d.ty.layoutIdx idx with
-    | true => true
-    | false => localDeclsUseLayoutIdx rest idx
-
-/--
-Find the first non-placeholder `TypeLayout` in `entries` (starting at index
-`currIdx`) that is not directly referenced by any `LocalDecl` in `decls`.
-`anneal-rustc-capture` interns pointee layouts of `&T` / `*const T` parameters
-into `body.layouts.entries` immediately after the reference layout.
--/
-@[reducible, simp]
-def findUnusedLayoutInTable
-    (decls : List LocalDecl) :
-    List TypeLayout → Nat → Option TypeLayout
-  | .nil, _ => .none
-  | l :: rest, currIdx =>
-    match
-      Bool.or
-        (localDeclsUseLayoutIdx decls currIdx)
-        (sigIsParamPlaceholder l)
-    with
-    | false => .some l
-    | true => findUnusedLayoutInTable decls rest (currIdx + 1)
-
-/--
 Resolve the concrete `TypeLayout` of an inner `RigidTy` `childKind` (such as a
 reference pointee, slice/array element, tuple element, or ADT field) inside
-`parentLayout` (at `parentLayoutIdx`) within `body`.
+`parentLayout` within `body`, or `.none` when no layout is recorded.
+
+Layouts come from `parentLayout.fieldLayouts` (interned by
+`anneal-rustc-capture` in source field order), from a `LocalDecl` of the same
+non-generic ADT, or from `RigidTy.computeLayout` when `sigLayoutSynthesizable`
+holds. Layout table adjacency carries no type information, because
+`LayoutTableBuilder::intern_ir_layout` deduplicates equal entries, and a
+layout is never synthesized for an ADT from its type arguments alone.
 -/
 @[reducible, simp]
 def resolveChildLayout
     (body : CapturedMir)
     (parentLayout : TypeLayout)
-    (parentLayoutIdx : LayoutIdx)
+    (_parentLayoutIdx : LayoutIdx)
     (fieldPos : Option Nat)
     (childKind : RigidTy) :
     Option TypeLayout :=
@@ -405,6 +448,7 @@ def resolveChildLayout
         with
         | true, innerKind :: .nil =>
           match
+            sigLayoutSynthesizable 64 (innerKind :: .nil),
             RigidTy.computeLayout
               body.layouts.pointerBits
               body.layouts.entries
@@ -412,7 +456,7 @@ def resolveChildLayout
               .none
               innerKind
           with
-          | .some innerL =>
+          | true, .some innerL =>
             .some
               { size := innerL.size
                 align := innerL.align
@@ -420,7 +464,7 @@ def resolveChildLayout
                 fields := .union 2
                 variants := .single 0
                 isUninhabited := innerL.isUninhabited }
-          | .none => .none
+          | _, _ => .none
         | _, _ =>
           match
             Bool.or
@@ -429,44 +473,32 @@ def resolveChildLayout
             adtArgs
           with
           | true, idxKind :: .nil =>
-            RigidTy.computeLayout
-              body.layouts.pointerBits
-              body.layouts.entries
-              .nil
-              .none
-              (.tuple (idxKind :: idxKind :: .nil))
-          | _, _ =>
-            let nextIdx := parentLayoutIdx + 1
-            let fallback :=
-              match findAdtDeclLayoutIdx adtDefPath body.localDecls with
-              | .some declIdx => sigGet? body.layouts.entries declIdx
-              | .none => .none
-            let candOpt : Option TypeLayout :=
-              match localDeclsUseLayoutIdx body.localDecls nextIdx with
-              | false =>
-                match sigGet? body.layouts.entries nextIdx with
-                | .some candL =>
-                  match sigIsParamPlaceholder candL with
-                  | false => .some candL
-                  | true => fallback
-                | .none => fallback
-              | true => fallback
-            match candOpt with
-            | .some candL => .some candL
-            | .none =>
+            match sigLayoutSynthesizable 64 (idxKind :: .nil) with
+            | true =>
               RigidTy.computeLayout
                 body.layouts.pointerBits
                 body.layouts.entries
                 .nil
                 .none
-                childKind
+                (.tuple (idxKind :: idxKind :: .nil))
+            | false => .none
+          | _, _ =>
+            match adtArgs with
+            | .nil =>
+              match findAdtDeclLayoutIdx adtDefPath body.localDecls with
+              | .some declIdx => sigGet? body.layouts.entries declIdx
+              | .none => .none
+            | _ :: _ => .none
       | _ =>
-        RigidTy.computeLayout
-          body.layouts.pointerBits
-          body.layouts.entries
-          .nil
-          .none
-          childKind
+        match sigLayoutSynthesizable 64 (childKind :: .nil) with
+        | true =>
+          RigidTy.computeLayout
+            body.layouts.pointerBits
+            body.layouts.entries
+            .nil
+            .none
+            childKind
+        | false => .none
 
 /--
 Check whether Tree Borrows permission `perm` permits a reference with mutability
@@ -482,10 +514,103 @@ def borrowPermAllowsRef : Mutability → TreeBorrowPerm → Bool
   | .mut, _ => false
 
 /--
+Liveness check for a reference `p` whose pointee layout is not recorded in
+`body.layouts`: `p` must point into a live global allocation, or carry a
+`BorrowEntry` tag whose Tree Borrows permission admits a reference with
+mutability `refMut` and whose borrowed range contains `p.offsetBytes`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "A reference or Box<T> must be aligned and non-null, it cannot be dangling,
+> and it must point to a valid value"
+-/
+@[reducible, simp]
+def sigPtrLiveForRef
+    (mem : Memory) (refMut : Mutability) (p : ProvenancePtr) : Prop :=
+  match sigLookupGlobalAlloc mem.globals p.allocId with
+  | .some alloc => p.offsetBytes ≤ alloc.bytes.length
+  | .none =>
+    match sigLookupBorrow mem.borrows p.allocId with
+    | .some entry =>
+      borrowPermAllowsRef refMut entry.perm = true ∧
+        p.offsetBytes ≤ entry.rangeOffset + entry.rangeLen
+    | .none => False
+
+/--
+Test whether `adtDefPath` names `Option<T>` or `Result<T, E>`, the standard
+enums whose variant payloads are exactly their type arguments in declaration
+order (`None`, `Some(T)`; `Ok(T)`, `Err(E)`). `anneal-rustc-capture` renders
+their paths with either the `core` or the `std` prefix.
+
+`TypeLayout` records no field layouts for multi-variant enums, and the payload
+types of other enums need not follow their type arguments:
+`enum E<T> { A(u8, T), B }` has a `u8` payload field, and `ControlFlow<B, C>`
+declares `Continue(C)` before `Break(B)`. Typing those payloads positionally
+would reject valid values and accept invalid ones, so
+`valueMatchesRigidTyAndLayout` types enum payloads through
+`selectVariantTypeArgs` only when this test holds and checks other enum
+payloads structurally (`valueMatchesUntypedField`).
+
+Reference (`library/core/src/option.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/option.rs#L597-L606>
+
+> "pub enum Option<T> {
+>     /// No value.
+>     #[lang = "None"]
+>     #[stable(feature = "rust1", since = "1.0.0")]
+>     None,
+>     /// Some value of type `T`.
+>     #[lang = "Some"]
+>     #[stable(feature = "rust1", since = "1.0.0")]
+>     Some(#[stable(feature = "rust1", since = "1.0.0")] T),
+> }"
+
+Reference (`library/core/src/result.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/result.rs#L557-L567>
+
+> "pub enum Result<T, E> {
+>     /// Contains the success value
+>     #[lang = "Ok"]
+>     #[stable(feature = "rust1", since = "1.0.0")]
+>     Ok(#[stable(feature = "rust1", since = "1.0.0")] T),
+>
+>     /// Contains the error value
+>     #[lang = "Err"]
+>     #[stable(feature = "rust1", since = "1.0.0")]
+>     Err(#[stable(feature = "rust1", since = "1.0.0")] E),
+> }"
+
+Reference (`library/core/src/ops/control_flow.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ops/control_flow.rs#L89-L98>
+
+> "pub enum ControlFlow<B, C = ()> {
+>     /// Move on to the next phase of the operation as normal.
+>     #[stable(feature = "control_flow_enum_type", since = "1.55.0")]
+>     #[lang = "Continue"]
+>     Continue(C),
+>     /// Exit the operation without running subsequent phases.
+>     #[stable(feature = "control_flow_enum_type", since = "1.55.0")]
+>     #[lang = "Break"]
+>     Break(B),
+>     // Yes, the order of the variants doesn't match the type parameters."
+-/
+@[reducible, simp]
+def sigEnumPayloadsAreTypeArgs (adtDefPath : String) : Bool :=
+  sigStringEq adtDefPath "core::option::Option" ||
+    sigStringEq adtDefPath "std::option::Option" ||
+    sigStringEq adtDefPath "core::result::Result" ||
+    sigStringEq adtDefPath "std::result::Result"
+
+/--
 Select the remaining generic type arguments `adtArgs` applicable to variant
 `variantIdx` of a multi-variant enum (`VariantsShape.multiple`), skipping
 zero-field variants (such as `Option::None`) and advancing across payload
-variants (such as `Result::Ok(T)` before `Result::Err(E)`).
+variants (such as `Result::Ok(T)` before `Result::Err(E)`). Only meaningful for
+enums satisfying `sigEnumPayloadsAreTypeArgs`.
 -/
 @[reducible, simp]
 def selectVariantTypeArgs :
@@ -540,6 +665,38 @@ def valueMatchesUntypedField : Nat → Value → Prop
     arrayElemsMatchWith (valueMatchesUntypedField fuel') fields
 
 /--
+Unwrap single-field aggregates (newtypes such as `struct W(T)`) up to `fuel`
+levels, returning the innermost value.
+-/
+@[reducible, simp]
+def sigUnwrapNewtype : Nat → Value → Value
+  | 0, v => v
+  | fuel' + 1, .aggregate _ (inner :: .nil) => sigUnwrapNewtype fuel' inner
+  | _ + 1, v => v
+
+/--
+Check a single-field aggregate against the scalar `WrappingRange` recorded on
+its own layout (`BackendRepr.scalar`). This carries niches such as the nonzero
+range of `NonNull<T>` and `NonZero<T>`, which the field's own layout (`*const T`
+or the primitive integer) does not record.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "If a type has a custom range of a valid values, then a valid value must be in
+> that range. In the standard library, this affects NonNull<T> and NonZero<T>."
+-/
+@[reducible, simp]
+def sigScalarNicheHolds (layout : TypeLayout) (fields : List Value) : Prop :=
+  match layout.backendRepr, fields with
+  | .scalar sl, f :: .nil =>
+    match sigUnwrapNewtype 8 f with
+    | .scalar sv => valueMatchesScalarLayout sl (.scalar sv)
+    | .ptr p ptrSz => valueMatchesScalarLayout sl (.ptr p ptrSz)
+    | _ => True
+  | _, _ => True
+
+/--
 Recursively validate each field of an untyped ADT against `parentLayout` using
 `layoutPred` when `fieldLayouts` is populated.
 -/
@@ -572,10 +729,13 @@ def adtFieldsLayoutOnlyWith
       adtFieldsLayoutOnlyWith fuel' body parentLayout layoutPred (pos + 1) restV
 
 /--
-Recursively validate each element of an untyped ADT with `FieldsShape.array`.
+Recursively validate each element of an untyped ADT with `FieldsShape.array`,
+falling back to `valueMatchesUntypedField` for non-scalar elements (such as
+pointers or nested aggregates) when no element layout is recorded.
 -/
 @[reducible, simp]
 def adtArrayLayoutOnlyWith
+    (fuel' : Nat)
     (body : CapturedMir)
     (parentLayout : TypeLayout)
     (strideBytes : Nat)
@@ -593,9 +753,9 @@ def adtArrayLayoutOnlyWith
           sv.sizeBytes = strideBytes ∧
             0 < sv.sizeBytes ∧
             sv.bits < 2 ^ (sv.sizeBytes * 8)
-        | _ => False
+        | _ => valueMatchesUntypedField fuel' e
     elemOk ∧
-      adtArrayLayoutOnlyWith body parentLayout strideBytes layoutPred rest
+      adtArrayLayoutOnlyWith fuel' body parentLayout strideBytes layoutPred rest
 
 /--
 Validate a `Value` when only its `TypeLayout` (from `fieldLayouts`) is known.
@@ -657,6 +817,7 @@ def valueMatchesLayoutOnly :
           | _ :: _ =>
             vIdx = expectedVar ∧
               fields.length = offsets.length ∧
+              sigScalarNicheHolds layout fields ∧
               adtFieldsLayoutOnlyWith fuel' body layout recPred 0 fields
         | .array stride count =>
           match Nat.beq count 0 with
@@ -665,7 +826,8 @@ def valueMatchesLayoutOnly :
           | false =>
             vIdx = expectedVar ∧
               fields.length = count ∧
-              adtArrayLayoutOnlyWith body layout stride.bytes recPred fields
+              adtArrayLayoutOnlyWith
+                fuel' body layout stride.bytes recPred fields
         | .union count =>
           0 < count ∧
             vIdx = expectedVar ∧
@@ -752,8 +914,18 @@ def adtArrayElemsMatchWith
         mem rest
 
 /--
-Recursively validate each field of an ADT variant against `adtArgs`,
-`parentLayout.fieldLayouts`, or `parentLayout.backendRepr`.
+Recursively validate each field of an ADT variant against
+`parentLayout.fieldLayouts`, `adtArgs`, or `parentLayout.backendRepr`.
+
+A field layout captured by `anneal-rustc-capture` (`fieldLayouts`, interned from
+`ty_and_layout_field` in source field order) is authoritative, because ADT field
+types need not coincide with the ADT's type arguments (for example
+`NonNull<T> { pointer: *const T }` or `struct S<T> { len: usize, data: T }`).
+Only fields without a captured layout (enum payloads) are matched positionally
+against `adtArgs`, repeating the last argument for trailing fields. For enum
+payloads, callers pass `selectVariantTypeArgs` only when
+`sigEnumPayloadsAreTypeArgs` holds and `.nil` otherwise, which checks the
+payload structurally.
 -/
 @[reducible, simp]
 def adtFieldsMatchWith
@@ -766,40 +938,36 @@ def adtFieldsMatchWith
     Nat → List RigidTy → List Value → Prop
   | _, _, .nil => True
   | pos, adtArgs, v :: restV =>
-    let (fieldOk, nextAdtArgs) : Prop × List RigidTy :=
+    let nextAdtArgs : List RigidTy :=
       match adtArgs with
-      | argKind :: restArgs =>
-        let nextArgs :=
-          match restArgs with
-          | .nil => argKind :: .nil
-          | _ => restArgs
-        let ok :=
+      | _ :: restArgs@(_ :: _) => restArgs
+      | _ => adtArgs
+    let fieldOk : Prop :=
+      match sigGet? parentLayout.fieldLayouts pos with
+      | .some fIdx =>
+        valueMatchesLayoutOnly
+          fuel' body (sigGet? body.layouts.entries fIdx) fIdx v mem
+      | .none =>
+        match adtArgs with
+        | argKind :: _ =>
           tyPred
             argKind
             (resolveChildLayout
               body parentLayout parentLayoutIdx (.some pos) argKind)
             parentLayoutIdx
             v
-        (ok, nextArgs)
-      | .nil =>
-        let ok :=
-          match sigGet? parentLayout.fieldLayouts pos with
-          | .some fIdx =>
-            valueMatchesLayoutOnly
-              fuel' body (sigGet? body.layouts.entries fIdx) fIdx v mem
-          | .none =>
-            match parentLayout.variants, parentLayout.backendRepr with
-            | .single _, .scalar sl =>
-              match pos, restV with
-              | 0, .nil => valueMatchesScalarLayout sl v
-              | _, _ => valueMatchesUntypedField fuel' v
-            | .single _, .scalarPair sl0 sl1 =>
-              match pos with
-              | 0 => valueMatchesScalarLayout sl0 v
-              | 1 => valueMatchesScalarLayout sl1 v
-              | _ => valueMatchesUntypedField fuel' v
+        | .nil =>
+          match parentLayout.variants, parentLayout.backendRepr with
+          | .single _, .scalar sl =>
+            match pos, restV with
+            | 0, .nil => valueMatchesScalarLayout sl v
             | _, _ => valueMatchesUntypedField fuel' v
-        (ok, .nil)
+          | .single _, .scalarPair sl0 sl1 =>
+            match pos with
+            | 0 => valueMatchesScalarLayout sl0 v
+            | 1 => valueMatchesScalarLayout sl1 v
+            | _ => valueMatchesUntypedField fuel' v
+          | _, _ => valueMatchesUntypedField fuel' v
     fieldOk ∧
       adtFieldsMatchWith
         fuel' body parentLayout parentLayoutIdx tyPred mem (pos + 1)
@@ -815,20 +983,34 @@ invalid `bool` / `char` / discriminant bit patterns, misaligned or out-of-bounds
 references `&T` / `&mut T`, and wide slices `&[T]` / `&mut [T]` / `&str` whose
 byte length exceeds `isize::MAX` or the backing allocation in `mem`.
 
+When `body.layouts` records no layout for a nested type (such as an ADT reached
+only through a reference or an enum payload), the value is checked structurally
+with `valueMatchesUntypedField`, and a reference to it must still point into a
+live allocation or compatible borrow (`sigPtrLiveForRef`), instead of rejecting
+every value and leaving signature-typed preconditions unsatisfiable.
+
+Wide `&dyn Trait` references are checked the same way: their data pointer must
+be live, and their vtable word must be non-null. `Memory` models no vtables, so
+whether that word points to a vtable for `Trait` is not checked.
+
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
 
-> "Producing an invalid value, even in private fields and locals. 'Producing' a
-> value happens any time a value is assigned to or read from a place, passed to
-> a function/primitive operation or returned from a function/primitive
-> operation."
+> "Producing an invalid value. “Producing” a value happens any time a value is
+> assigned to or read from a place, passed to a function/primitive operation or
+> returned from a function/primitive operation."
+
+> "dyn Trait metadata must be a pointer to a compiler-generated vtable for
+> Trait."
 -/
 @[reducible, simp]
 def valueMatchesRigidTyAndLayout :
     Nat → CapturedMir → RigidTy → Option TypeLayout → LayoutIdx → Value →
       Memory → Prop
   | 0, _, _, _, _, _, _ => False
-  | _ + 1, _, _, .none, _, _, _ => False
+  | fuel' + 1, _, kind, .none, _, val, _ =>
+    sigWorklistHasTypeParam 8 (kind :: .nil) = false ∧
+      valueMatchesUntypedField fuel' val
   | _ + 1, body, kind, .some layout, layoutIdx, .unit, _ =>
     layout.isUninhabited = false ∧
       sigIsParamPlaceholder layout = false ∧
@@ -839,7 +1021,7 @@ def valueMatchesRigidTyAndLayout :
         len = 0 ∧
           layout.size.bytes = 0 ∧
           match resolveChildLayout body layout layoutIdx (.some 0) elemKind with
-          | .none => False
+          | .none => sigWorklistHasTypeParam 8 (elemKind :: .nil) = false
           | .some elemLayout =>
             elemLayout.isUninhabited = false ∧
               sigIsParamPlaceholder elemLayout = false
@@ -905,14 +1087,19 @@ def valueMatchesRigidTyAndLayout :
         | .slice _ | .str | .dynamic _ | .param _ _ | .alias _ _ => False
         | _ => ptrSz = layout.size.bytes ∧ 0 < ptrSz
       | .ref refMut pointee =>
+        -- A thin `.ptr` cannot carry the metadata of `&[T]`, `&str`, or
+        -- `&dyn Trait`, and no value of `!` exists for `&!` to point to.
+        -- `&ExternType` (`.foreign`) is thin and falls through: its pointee
+        -- layout is never recorded, so `sigPtrLiveForRef` checks it.
         match pointee with
-        | .slice _ | .str | .dynamic _ | .foreign _ | .other _
+        | .slice _ | .str | .dynamic _ | .other _
         | .param _ _ | .alias _ _ | .never => False
         | _ =>
           ptrSz = layout.size.bytes ∧
             0 < ptrSz ∧
+            sigWorklistHasTypeParam 8 (pointee :: .nil) = false ∧
             match resolveChildLayout body layout layoutIdx .none pointee with
-            | .none => False
+            | .none => sigPtrLiveForRef mem refMut p
             | .some pointeeLayout =>
               pointeeLayout.isUninhabited = false ∧
                 sigIsParamPlaceholder pointeeLayout = false ∧
@@ -973,7 +1160,9 @@ def valueMatchesRigidTyAndLayout :
                 match
                   resolveChildLayout body layout layoutIdx .none elemKind
                 with
-                | .none => False
+                | .none =>
+                  sigWorklistHasTypeParam 8 (elemKind :: .nil) = false ∧
+                    sigPtrLiveForRef mem refMut p
                 | .some elemLayout =>
                   let sliceBytes := len_sv.bits * elemLayout.size.bytes
                   elemLayout.isUninhabited = false ∧
@@ -1025,6 +1214,18 @@ def valueMatchesRigidTyAndLayout :
                       p.offsetBytes + len_sv.bits ≤
                         entry.rangeOffset + entry.rangeLen
                   | .none => False
+            | .dynamic _ =>
+              -- For `&dyn Trait`, the metadata word is the vtable pointer.
+              -- `Memory` models no vtables, so the pointer is only required to
+              -- be non-null (a null word points to no vtable at all), and the
+              -- data pointer, whose pointee layout is known only from the
+              -- vtable, must be live (`sigPtrLiveForRef`).
+              0 < ptrSz ∧
+                len_sv.sizeBytes = ptrSz ∧
+                ptrSz * 2 = layout.size.bytes ∧
+                0 < len_sv.bits ∧
+                len_sv.bits < 2 ^ (len_sv.sizeBytes * 8) ∧
+                sigPtrLiveForRef mem refMut p
             | _ => False
           | _ => False
       | .rawPtr _ pointee =>
@@ -1048,7 +1249,10 @@ def valueMatchesRigidTyAndLayout :
           match
             resolveChildLayout body layout layoutIdx (.some 0) elemKind
           with
-          | .none => False
+          | .none =>
+            sigWorklistHasTypeParam 8 (elemKind :: .nil) = false ∧
+              fields.length = len ∧
+              arrayElemsMatchWith (valueMatchesUntypedField fuel') fields
           | .some elemLayout =>
             elemLayout.isUninhabited = false ∧
               sigIsParamPlaceholder elemLayout = false ∧
@@ -1076,7 +1280,7 @@ def valueMatchesRigidTyAndLayout :
             fields.length = upvarKinds.length ∧
               tupleFieldsMatchWith
                 body layout layoutIdx recTyPred 0 upvarKinds fields
-      | .adt _ adtArgs =>
+      | .adt adtDefPath adtArgs =>
         sigWorklistHasTypeParam 8 adtArgs = false ∧
           match layout.variants with
           | .empty => False
@@ -1090,6 +1294,7 @@ def valueMatchesRigidTyAndLayout :
               | _ :: _ =>
                 vIdx = expectedVar ∧
                   fields.length = offsets.length ∧
+                  sigScalarNicheHolds layout fields ∧
                   adtFieldsMatchWith
                     fuel' body layout layoutIdx recTyPred mem 0 adtArgs fields
             | .array stride count =>
@@ -1121,7 +1326,9 @@ def valueMatchesRigidTyAndLayout :
                     recTyPred
                     mem
                     (variantFieldBaseOffset vIdx variantShapes)
-                    (selectVariantTypeArgs vIdx variantShapes adtArgs)
+                    (match sigEnumPayloadsAreTypeArgs adtDefPath with
+                     | true => selectVariantTypeArgs vIdx variantShapes adtArgs
+                     | false => .nil)
                     fields
               | .some .primitive => fields = .nil
               | _ => False
@@ -1134,7 +1341,8 @@ Structurally validate `val` against `ty : Ty` and its `layoutIdx` entry in
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
 
-> "It is undefined behavior to produce an invalid value of any type."
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
 -/
 @[reducible, simp]
 def valueMatchesTyAndLayout
@@ -1213,6 +1421,42 @@ def retMatchesSignature
   | .cons retDecl _ =>
     valueMatchesTyAndLayout
       defaultSignatureFuel body retDecl.ty retDecl.ty.layoutIdx ret mem
+
+/-- Collect the `RigidTy` kinds of the first `n` `LocalDecl`s in `decls`. -/
+@[reducible, simp]
+def sigLeadingDeclKinds : Nat → List LocalDecl → List RigidTy
+  | 0, _ => .nil
+  | _ + 1, .nil => .nil
+  | n + 1, d :: rest => d.ty.kind :: sigLeadingDeclKinds n rest
+
+/--
+Test whether `body` is monomorphic (`typeParamCount = 0`) and its signature
+locals `_0..=argCount` mention no uninstantiated `RigidTy.param`, unnormalized
+`RigidTy.alias`, or unlowered `RigidTy.other` type.
+
+`argsMatchSignature` rejects every value of such a type, so the monomorphic
+signature-typed claims (`statefulClaim`, `totalClaim`, `modularClaim`, and
+`ubExceptionClaim`, which instantiate at `List.nil`) would have unsatisfiable
+preconditions. Generated `Verify.<Item>` modules require this test to hold for
+those certificates, so generic items are verified through `poly*Claim`.
+
+Reference (`compiler/rustc_middle/src/ty/sty.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/sty.rs#L36-L46>
+
+> "pub struct ParamTy {
+>     pub index: u32,
+>     pub name: Symbol,
+> }"
+-/
+@[reducible, simp]
+def signatureIsMonomorphic (body : CapturedMir) : Bool :=
+  Bool.and
+    (Nat.beq body.typeParamCount 0)
+    (Bool.not
+      (sigWorklistHasUnresolvedTy
+        4096
+        (sigLeadingDeclKinds (body.argCount + 1) body.localDecls)))
 
 /--
 When `body.typeParamCount = 0`, any `typeArgs : TypeSubst` with

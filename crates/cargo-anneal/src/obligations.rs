@@ -969,6 +969,28 @@ pub fn render_verify_module(bundle: &SubjectObligationBundle) -> String {
     )
 }
 
+/// Render the kernel-checked `signatureMonomorphic` guard emitted beside every
+/// monomorphic signature-typed certificate (`statefulClaim`, `totalClaim`,
+/// `modularClaim`, and `ubExceptionClaim`).
+///
+/// Those claims instantiate `Mir.<Item>.body` at `List.nil` and conjoin
+/// `argsMatchSignature`, which rejects every value of an uninstantiated
+/// `RigidTy.param` (or unlowered `RigidTy.other`) type. Without the guard, a
+/// generic item's monomorphic certificate would have an unsatisfiable
+/// precondition and hold vacuously; with it, `lake build` rejects the
+/// `Verify.<Item>` module and generic items must use a `poly*Claim` surface.
+fn render_monomorphic_signature_guard(item: &str) -> String {
+    format!(
+        "/-- Kernel-checked guard: the monomorphic signature-typed claims instantiate\n    \
+            `Mir.{item}.body` at `List.nil`, so they are only meaningful when its\n    \
+            signature mentions no uninstantiated generic parameter. Generic items must\n    \
+            be verified through `Obligations.{item}.poly*Claim`. -/\n\
+         theorem signatureMonomorphic :\n    \
+             Trusted.VerificationResult.signatureIsMonomorphic Mir.{item}.body = true := by\n  \
+           decide\n\n"
+    )
+}
+
 /// Render the disposable `.anneal/generated/Verify/<Item>.lean` module for
 /// `bundle` and `authored`.
 ///
@@ -978,6 +1000,9 @@ pub fn render_verify_module(bundle: &SubjectObligationBundle) -> String {
 /// certificate referencing `Assumptions.<Item>.rust_trusted_contract` (for
 /// `#[spec(trusted, ...)]`) or a `priority := low` `defaultProof` instance
 /// attempting automatic symbolic reflection and bounded `WP` discharge.
+///
+/// Monomorphic signature-typed certificates are accompanied by
+/// `render_monomorphic_signature_guard`.
 pub fn render_verify_module_with_options(
     bundle: &SubjectObligationBundle,
     authored: AuthoredItemModules,
@@ -1073,6 +1098,7 @@ pub fn render_verify_module_with_options(
                  /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
                  abbrev Certificate : Prop := UbExceptionVerificationResult Obligations.{item}.ubExceptionClaim\n\n"
             ));
+            out.push_str(&render_monomorphic_signature_guard(item));
         } else if authored.is_modular {
             out.push_str(&format!(
                 "/-- Kernel-checked modular verification certificate for `{def_id}`. -/\n\
@@ -1081,6 +1107,7 @@ pub fn render_verify_module_with_options(
                  /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
                  abbrev Certificate : Prop := ModularVerificationResult Obligations.{item}.modularClaim\n\n"
             ));
+            out.push_str(&render_monomorphic_signature_guard(item));
         } else if authored.is_equiv {
             out.push_str(&format!(
                 "/-- Kernel-checked behavioral-equivalence verification certificate for `{def_id}`. -/\n\
@@ -1097,6 +1124,7 @@ pub fn render_verify_module_with_options(
                  /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
                  abbrev Certificate : Prop := TotalVerificationResult Obligations.{item}.totalClaim\n\n"
             ));
+            out.push_str(&render_monomorphic_signature_guard(item));
         } else if authored.is_stateful {
             out.push_str(&format!(
                 "/-- Kernel-checked stateful verification certificate for `{def_id}`. -/\n\
@@ -1105,6 +1133,7 @@ pub fn render_verify_module_with_options(
                  /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
                  abbrev Certificate : Prop := StatefulVerificationResult Obligations.{item}.statefulClaim\n\n"
             ));
+            out.push_str(&render_monomorphic_signature_guard(item));
         } else {
             out.push_str(&format!(
                 "/-- Kernel-checked verification certificate for `{def_id}`. -/\n\
@@ -1124,6 +1153,7 @@ pub fn render_verify_module_with_options(
                  /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
                  abbrev Certificate : Prop := TotalVerificationResult Obligations.{item}.totalClaim\n\n"
             ));
+            out.push_str(&render_monomorphic_signature_guard(item));
         } else {
             out.push_str(&format!(
                 "/-- Conditional verification certificate for `{def_id}` backed by\n    \
@@ -1203,6 +1233,7 @@ pub fn render_verify_module_with_options(
              /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
              abbrev Certificate : Prop := ModularVerificationResult Obligations.{item}.modularClaim\n\n"
         ));
+        out.push_str(&render_monomorphic_signature_guard(item));
     } else if !authored.has_specs && (bundle.has_rust_safe_total_attr() || authored.is_total) {
         let opt_req = if bundle.inline_requires.len() == 1 {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
@@ -1255,6 +1286,7 @@ pub fn render_verify_module_with_options(
              /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
              abbrev Certificate : Prop := TotalVerificationResult Obligations.{item}.totalClaim\n\n"
         ));
+        out.push_str(&render_monomorphic_signature_guard(item));
     } else {
         let opt_req = if bundle.inline_requires.len() == 1 {
             let req_suf = derive_item_module_suffix(&bundle.inline_requires[0]);
@@ -1805,6 +1837,12 @@ mod tests {
              theorem verified : StatefulVerificationResult Obligations.MyCrate.math.inc.statefulClaim :=\n  \
                Proof.MyCrate.math.inc.verified"
         ));
+        assert!(verify_stateful.contains(
+            "theorem signatureMonomorphic :\n    \
+               Trusted.VerificationResult.signatureIsMonomorphic Mir.MyCrate.math.inc.body = true := by\n  \
+               decide"
+        ));
+        assert!(!verify_stateless.contains("signatureMonomorphic"));
     }
 
     #[test]
@@ -1951,6 +1989,9 @@ mod tests {
         assert!(verify_equiv.contains(
             "abbrev Certificate : Prop := StatefulEquivVerificationResult Obligations.MyCrate.math.inc.equivClaim"
         ));
+        assert!(verify_modular.contains("theorem signatureMonomorphic :"));
+        assert!(verify_ub_exc.contains("theorem signatureMonomorphic :"));
+        assert!(!verify_equiv.contains("signatureMonomorphic"));
 
         let crate_verify = render_crate_verify_module("my_crate", &bundles);
         assert!(!crate_verify.contains("import Anneal"));
@@ -2107,6 +2148,9 @@ mod tests {
             "theorem verified : TotalVerificationResult Obligations.MyCrate.math.inc.totalClaim :=\n  \
                (inferInstance : TotalItemProof \"my_crate::math::inc\" Obligations.MyCrate.math.inc.totalClaim).verified"
         ));
+        assert!(total_verify.contains("theorem signatureMonomorphic :"));
+        assert!(caller_verify.contains("theorem signatureMonomorphic :"));
+        assert!(!verify_trusted.contains("signatureMonomorphic"));
     }
 
     #[test]
@@ -2214,5 +2258,6 @@ mod tests {
                  Obligations.MyCrate.math.inc.artifactIdentity\n    \
                  Proof.MyCrate.math.inc.verified"
         ));
+        assert!(!verify_poly.contains("signatureMonomorphic"));
     }
 }

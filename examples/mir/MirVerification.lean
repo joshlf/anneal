@@ -1427,11 +1427,385 @@ theorem example_signature_predicates_and_polymorphic_obligations :
     Trusted.Rustc.V2026_06_01.MirAst.FnAbi.instantiate,
     dropGenericParams,
     CapturedMir.instantiate
+  ] <;> decide
+
+/-! ## 12. Signature Predicates over Capture-Shaped Layout Tables: Pointer Fields, Captured Field Layouts, Unrecorded Pointee Layouts & the Monomorphic Signature Guard -/
+
+/-- `struct Cursor<'a> { buf: &'a [u8], pos: usize }` as interned by
+`anneal-rustc-capture` (`fieldLayouts` in source field order). -/
+@[reducible]
+def rcCursorTypeLayout : TypeLayout := {
+  size := { bytes := 24 }
+  align := { bytes := 8 }
+  backendRepr := .memory
+  fields := .arbitrary [{ bytes := 0 }, { bytes := 16 }] [0, 1]
+  variants := .single 0
+  isUninhabited := false
+  fieldLayouts := [2, 0]
+}
+
+/-- `NonNull<u8> { pointer: *const u8 }`: the nonzero niche lives on the struct
+layout, while the captured field layout is the nullable `*const u8`. -/
+@[reducible]
+def rcNonNullU8TypeLayout : TypeLayout := {
+  size := { bytes := 8 }
+  align := { bytes := 8 }
+  backendRepr :=
+    .scalar (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 })
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .single 0
+  isUninhabited := false
+  fieldLayouts := [3]
+}
+
+/-- `struct Usercopy { a: usize, b: usize }` with captured field layouts. -/
+@[reducible]
+def rcUsercopyTypeLayout : TypeLayout := {
+  size := { bytes := 16 }
+  align := { bytes := 8 }
+  backendRepr := .scalarPair
+    (.initialized (.int 64 false) { start := 0, end_ := 18446744073709551615 })
+    (.initialized (.int 64 false) { start := 0, end_ := 18446744073709551615 })
+  fields := .arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1]
+  variants := .single 0
+  isUninhabited := false
+  fieldLayouts := [0, 0]
+}
+
+/-- `&dyn core::fmt::Debug`: a non-null data pointer and a non-null vtable
+pointer. -/
+@[reducible]
+def rcWideDynTypeLayout : TypeLayout := {
+  size := { bytes := 16 }
+  align := { bytes := 8 }
+  backendRepr := .scalarPair
+    (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 })
+    (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 })
+  fields := .arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1]
+  variants := .single 0
+  isUninhabited := false
+}
+
+/-- `Option<bool>`, whose `None` variant occupies the bool niche value `2`. -/
+@[reducible]
+def rcOptionBoolTypeLayout : TypeLayout := {
+  size := { bytes := 1 }
+  align := { bytes := 1 }
+  backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 2 })
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .multiple
+    (.initialized (.int 8 false) { start := 0, end_ := 2 })
+    0
+    [.arbitrary [] [], .arbitrary [{ bytes := 0 }] [0]]
+  isUninhabited := false
+}
+
+/-- `enum Tagged<T> { Data(u8, T), Empty }` at `T = bool`, with an explicit
+`u8` tag. -/
+@[reducible]
+def rcTaggedBoolTypeLayout : TypeLayout := {
+  size := { bytes := 3 }
+  align := { bytes := 1 }
+  backendRepr := .memory
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .multiple
+    (.initialized (.int 8 false) { start := 0, end_ := 1 })
+    0
+    [.arbitrary [{ bytes := 1 }, { bytes := 2 }] [0, 1], .arbitrary [] []]
+  isUninhabited := false
+}
+
+/-- `ControlFlow<u8, bool>`: `Continue(bool)` is variant `0` and `Break(u8)` is
+variant `1`, the reverse of the type-argument order. -/
+@[reducible]
+def rcControlFlowU8BoolTypeLayout : TypeLayout := {
+  size := { bytes := 2 }
+  align := { bytes := 1 }
+  backendRepr := .scalarPair
+    (.initialized (.int 8 false) { start := 0, end_ := 1 })
+    (.initialized (.int 8 false) { start := 0, end_ := 255 })
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .multiple
+    (.initialized (.int 8 false) { start := 0, end_ := 1 })
+    0
+    [.arbitrary [{ bytes := 1 }] [0], .arbitrary [{ bytes := 1 }] [0]]
+  isUninhabited := false
+}
+
+/-- Deduplicated layout table shaped like `anneal-rustc-capture` output: no
+pointee layout is interned next to the shared thin-pointer slot `1`. -/
+@[reducible]
+def rcLayoutTable : LayoutTable := {
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [
+    sigUsizeTypeLayout,           -- 0: usize
+    sigThinPtrTypeLayout,         -- 1: &Usercopy (shared by every thin reference)
+    sigWideSliceTypeLayout,       -- 2: &[u8]
+    sigRawPtrTypeLayout,          -- 3: *const u8
+    rcCursorTypeLayout,           -- 4: Cursor<'_>
+    rcNonNullU8TypeLayout,        -- 5: NonNull<u8>
+    rcUsercopyTypeLayout,         -- 6: Usercopy
+    rcWideDynTypeLayout,          -- 7: &dyn Debug / &mut dyn Debug
+    rcOptionBoolTypeLayout,       -- 8: Option<bool>
+    rcTaggedBoolTypeLayout,       -- 9: Tagged<bool>
+    rcControlFlowU8BoolTypeLayout -- 10: ControlFlow<u8, bool>
   ]
-  change
-    2 * (8 / 8) ≤ 9223372036854775807 ∧
-      (0 < 8 ∧ 8 = 8) ∧
-      2 * (8 / 8) ≤ 9223372036854775807
+}
+
+@[reducible]
+def mkRcBody (argTys : List Ty) (retTy : Ty) (extraLocals : List Ty := []) :
+    CapturedMir := {
+  defPath := "demo::rc_suite"
+  argCount := argTys.length
+  localDecls :=
+    mkDecl .mut retTy ::
+      List.append (argTys.map (mkDecl .not)) (extraLocals.map (mkDecl .mut))
+  basicBlocks := []
+  phase := .runtimePostCleanup
+  role := .subject
+  fnAbi := defaultU32FnAbi
+  layouts := rcLayoutTable
+  allocations := []
+}
+
+@[reducible]
+def rcMem : Memory := {
+  emptyMemory with
+  globals := [
+    { allocId := 10
+      bytes := [some 1, some 2, some 3, some 4]
+      relocations := []
+      align := { bytes := 1 }
+      mutability := .not }
+  ]
+  borrows := [
+    { tag := 20
+      targetLocal := 0
+      targetProjection := []
+      perm := .frozen
+      rangeOffset := 0
+      rangeLen := 16 },
+    { tag := 22
+      targetLocal := 0
+      targetProjection := []
+      perm := .disabled
+      rangeOffset := 0
+      rangeLen := 16 },
+    { tag := 23
+      targetLocal := 1
+      targetProjection := []
+      perm := .frozen
+      rangeOffset := 0
+      rangeLen := 8 }
+  ]
+  callerLocals := [
+    .init (.aggregate 0 [.scalar ⟨1, 8⟩, .scalar ⟨2, 8⟩]),
+    .init (.aggregate 0 [.scalar ⟨1, 8⟩])
+  ]
+}
+
+@[reducible]
+def rcUsizeTy : Ty := { kind := .uint .usize, layoutIdx := 0 }
+
+@[reducible]
+def rcRefUsercopyTy : Ty :=
+  { kind := .ref .not (.adt "usercopy::Usercopy" []), layoutIdx := 1 }
+
+@[reducible]
+def rcUsercopyTy : Ty := { kind := .adt "usercopy::Usercopy" [], layoutIdx := 6 }
+
+/--
+Kernel-checked signature validation over a capture-shaped layout table:
+1. Struct fields of pointer type (`Cursor { buf: &[u8], .. }`) validate against
+   their pointer `ScalarLayout` and its `WrappingRange` (null `buf` rejected).
+2. Captured field layouts are authoritative over type arguments:
+   `NonNull<u8>`'s field is a `*const u8`, and the struct-level nonzero niche
+   rejects a null pointer.
+3. A `&Usercopy` receiver whose pointee layout is not recorded must point into
+   a live borrow with compatible permission (dangling and `.disabled`
+   references are rejected), and when a `Usercopy` local records the layout,
+   the borrowed caller value is validated against it.
+-/
+theorem example_capture_shaped_signature_predicates :
+    argsMatchSignature
+      (mkRcBody [{ kind := .adt "demo::Cursor" [], layoutIdx := 4 }] rcUsizeTy)
+      [.aggregate 0 [.aggregate 0 [.ptr ⟨10, 0⟩ 8, .scalar ⟨4, 8⟩], .scalar ⟨0, 8⟩]]
+      rcMem ∧
+    ¬ argsMatchSignature
+      (mkRcBody [{ kind := .adt "demo::Cursor" [], layoutIdx := 4 }] rcUsizeTy)
+      [.aggregate 0 [.aggregate 0 [.scalar ⟨0, 8⟩, .scalar ⟨4, 8⟩], .scalar ⟨0, 8⟩]]
+      rcMem ∧
+    argsMatchSignature
+      (mkRcBody
+        [{ kind := .adt "core::ptr::non_null::NonNull" [.uint .u8], layoutIdx := 5 }]
+        rcUsizeTy)
+      [.aggregate 0 [.ptr ⟨10, 0⟩ 8]]
+      rcMem ∧
+    ¬ argsMatchSignature
+      (mkRcBody
+        [{ kind := .adt "core::ptr::non_null::NonNull" [.uint .u8], layoutIdx := 5 }]
+        rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨0, 8⟩]]
+      rcMem ∧
+    argsMatchSignature (mkRcBody [rcRefUsercopyTy] rcUsizeTy) [.ptr ⟨20, 0⟩ 8] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefUsercopyTy] rcUsizeTy) [.ptr ⟨99, 0⟩ 8] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefUsercopyTy] rcUsizeTy) [.ptr ⟨22, 0⟩ 8] rcMem ∧
+    argsMatchSignature
+      (mkRcBody [rcRefUsercopyTy] rcUsizeTy [rcUsercopyTy]) [.ptr ⟨20, 0⟩ 8] rcMem ∧
+    ¬ argsMatchSignature
+      (mkRcBody [rcRefUsercopyTy] rcUsizeTy [rcUsercopyTy]) [.ptr ⟨23, 0⟩ 8] rcMem ∧
+    ¬ argsMatchSignature
+      (mkRcBody [rcRefUsercopyTy] rcUsizeTy [rcUsercopyTy]) [.ptr ⟨20, 8⟩ 8] rcMem := by
+  set_option linter.unusedSimpArgs false in
+  simp [
+    emptyMemory,
+    rcMem,
+    rcLayoutTable,
+    mkRcBody,
+    rcUsizeTy,
+    rcRefUsercopyTy,
+    rcUsercopyTy,
+    rcCursorTypeLayout,
+    rcNonNullU8TypeLayout,
+    rcUsercopyTypeLayout,
+    sigUsizeTypeLayout,
+    sigThinPtrTypeLayout,
+    sigWideSliceTypeLayout,
+    sigRawPtrTypeLayout
+  ] <;> decide
+
+@[reducible]
+def rcRefDynTy (m : Mutability) : Ty :=
+  { kind := .ref m (.dynamic "core::fmt::Debug"), layoutIdx := 7 }
+
+@[reducible]
+def rcRefExternTy : Ty :=
+  { kind := .ref .not (.foreign "demo::Opaque"), layoutIdx := 1 }
+
+/--
+Kernel-checked validation of references whose pointee layout is known only at
+run time, which are inhabited and therefore must not make signature-typed
+preconditions unsatisfiable:
+1. `&dyn Trait` is a wide pointer whose data pointer must be live and whose
+   vtable word must be non-null. Thin pointers, null vtables, dangling data
+   pointers, and `&mut dyn Trait` through a frozen borrow are rejected.
+2. `&ExternType` is a thin pointer that must point into a live allocation.
+-/
+theorem example_dyn_and_extern_reference_signatures :
+    argsMatchSignature (mkRcBody [rcRefDynTy .not] rcUsizeTy)
+      [.aggregate 0 [.ptr ⟨10, 0⟩ 8, .scalar ⟨0x5000, 8⟩]] rcMem ∧
+    argsMatchSignature (mkRcBody [rcRefDynTy .not] rcUsizeTy)
+      [.aggregate 0 [.ptr ⟨20, 0⟩ 8, .scalar ⟨0x5000, 8⟩]] rcMem ∧
+    retMatchesSignature (mkRcBody [] (rcRefDynTy .not))
+      (.aggregate 0 [.ptr ⟨10, 0⟩ 8, .scalar ⟨0x5000, 8⟩]) rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefDynTy .not] rcUsizeTy)
+      [.aggregate 0 [.ptr ⟨10, 0⟩ 8, .scalar ⟨0, 8⟩]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefDynTy .not] rcUsizeTy)
+      [.aggregate 0 [.ptr ⟨99, 0⟩ 8, .scalar ⟨0x5000, 8⟩]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefDynTy .not] rcUsizeTy)
+      [.ptr ⟨10, 0⟩ 8] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefDynTy .mut] rcUsizeTy)
+      [.aggregate 0 [.ptr ⟨20, 0⟩ 8, .scalar ⟨0x5000, 8⟩]] rcMem ∧
+    argsMatchSignature (mkRcBody [rcRefExternTy] rcUsizeTy) [.ptr ⟨10, 0⟩ 8] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefExternTy] rcUsizeTy) [.ptr ⟨99, 0⟩ 8] rcMem := by
+  set_option linter.unusedSimpArgs false in
+  simp [
+    emptyMemory,
+    rcMem,
+    rcLayoutTable,
+    mkRcBody,
+    rcUsizeTy,
+    rcRefDynTy,
+    rcRefExternTy,
+    rcCursorTypeLayout,
+    rcNonNullU8TypeLayout,
+    rcUsercopyTypeLayout,
+    rcWideDynTypeLayout,
+    sigUsizeTypeLayout,
+    sigThinPtrTypeLayout,
+    sigWideSliceTypeLayout,
+    sigRawPtrTypeLayout
+  ] <;> decide
+
+@[reducible]
+def rcOptionBoolTy : Ty :=
+  { kind := .adt "core::option::Option" [.bool], layoutIdx := 8 }
+
+@[reducible]
+def rcTaggedBoolTy : Ty := { kind := .adt "demo::Tagged" [.bool], layoutIdx := 9 }
+
+@[reducible]
+def rcControlFlowU8BoolTy : Ty :=
+  { kind := .adt "core::ops::control_flow::ControlFlow" [.uint .u8, .bool],
+    layoutIdx := 10 }
+
+/--
+Kernel-checked typing of multi-variant enum payloads, for which
+`anneal-rustc-capture` records no field layouts:
+1. `Option<T>` and `Result<T, E>` payloads are exactly their type arguments, so
+   `Some(2)` is rejected as an `Option<bool>`.
+2. Other generic enums are checked structurally, because their payload types
+   need not follow their type arguments: `Tagged<bool>::Data(200, true)` has a
+   `u8` field, and `ControlFlow<u8, bool>::Break(200)` is variant `1` although
+   `u8` is the first type argument. Variant indices and payload arity are still
+   checked.
+-/
+theorem example_generic_enum_payload_signatures :
+    retMatchesSignature (mkRcBody [] rcOptionBoolTy)
+      (.aggregate 1 [.scalar ⟨1, 1⟩]) rcMem ∧
+    retMatchesSignature (mkRcBody [] rcOptionBoolTy) (.aggregate 0 []) rcMem ∧
+    ¬ retMatchesSignature (mkRcBody [] rcOptionBoolTy)
+      (.aggregate 1 [.scalar ⟨2, 1⟩]) rcMem ∧
+    argsMatchSignature (mkRcBody [rcTaggedBoolTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨200, 1⟩, .scalar ⟨1, 1⟩]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcTaggedBoolTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨200, 1⟩]] rcMem ∧
+    argsMatchSignature (mkRcBody [rcControlFlowU8BoolTy] rcUsizeTy)
+      [.aggregate 1 [.scalar ⟨200, 1⟩]] rcMem ∧
+    argsMatchSignature (mkRcBody [rcControlFlowU8BoolTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨1, 1⟩]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcControlFlowU8BoolTy] rcUsizeTy)
+      [.aggregate 2 [.scalar ⟨200, 1⟩]] rcMem := by
+  set_option linter.unusedSimpArgs false in
+  simp [
+    emptyMemory,
+    rcMem,
+    rcLayoutTable,
+    mkRcBody,
+    rcUsizeTy,
+    rcOptionBoolTy,
+    rcTaggedBoolTy,
+    rcControlFlowU8BoolTy,
+    rcCursorTypeLayout,
+    rcNonNullU8TypeLayout,
+    rcUsercopyTypeLayout,
+    rcWideDynTypeLayout,
+    rcOptionBoolTypeLayout,
+    rcTaggedBoolTypeLayout,
+    rcControlFlowU8BoolTypeLayout,
+    sigUsizeTypeLayout,
+    sigThinPtrTypeLayout,
+    sigWideSliceTypeLayout,
+    sigRawPtrTypeLayout
+  ] <;> decide
+
+/--
+The monomorphic signature guard emitted beside `statefulClaim`, `totalClaim`,
+`modularClaim`, and `ubExceptionClaim` certificates rejects generic bodies and
+unlowered signature types, and accepts monomorphic and instantiated bodies
+(including the `&dyn Trait` signature validated above).
+-/
+theorem example_signature_monomorphic_guard :
+    signatureIsMonomorphic
+        (mkRcBody [{ kind := .adt "demo::Cursor" [], layoutIdx := 4 }] rcUsizeTy) =
+      true ∧
+    signatureIsMonomorphic (mkRcBody [rcRefDynTy .not] rcUsizeTy) = true ∧
+    signatureIsMonomorphic polySwapPairMirBody = false ∧
+    signatureIsMonomorphic polySwapPairU32MirBody = true ∧
+    signatureIsMonomorphic
+        (mkRcBody [{ kind := .other "T", layoutIdx := 0 }] rcUsizeTy) =
+      false := by
   decide
 
 end AnnealExamples.MirVerification
