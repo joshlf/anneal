@@ -299,6 +299,133 @@ theorem wpMirModularSym_mono
     wpMirModularSym contract f₂ body s post :=
   wpMirExecModularSym_mono h_le h
 
+/-- Kleene fuel monotonicity for `Lower.wpMirTraceBounded`. -/
+theorem wpMirTraceBounded_mono
+    {f₁ f₂ : Nat} (h_le : f₁ ≤ f₂)
+    {body : CapturedMir} {s : MachineState}
+    {post : List (Event MirEffect) → MirOutcome → Prop}
+    (h : wpMirTraceBounded f₁ body s post) :
+    wpMirTraceBounded f₂ body s post :=
+  wpCoalBounded_mono_fuel h_le h
+
+/-- Kleene fuel monotonicity for `Lower.wpMirSilentBounded`. -/
+theorem wpMirSilentBounded_mono
+    {f₁ f₂ : Nat} (h_le : f₁ ≤ f₂)
+    {body : CapturedMir} {s : MachineState} {post : MirOutcome → Prop}
+    (h : wpMirSilentBounded f₁ body s post) :
+    wpMirSilentBounded f₂ body s post :=
+  wpCoalBounded_mono_fuel h_le h
+
+/-- Postcondition weakening for `wpMirExecUbWaivedSym`. -/
+theorem wpMirExecUbWaivedSym_mono_post
+    {fuel : Nat} {body : CapturedMir} {st : MirExecState}
+    {P Q : MirOutcome → Prop}
+    (h_imp : ∀ out, P out → Q out)
+    (h : wpMirExecUbWaivedSym fuel body st P) :
+    wpMirExecUbWaivedSym fuel body st Q := by
+  rw [wpMirExecUbWaivedSym_eq_wpCoalBounded] at h ⊢
+  exact wpCoalBounded_mono_both (Nat.le_refl fuel) (fun out _ hp => h_imp out hp) h
+
+/-- Postcondition weakening for `wpMirUbWaivedSym`. -/
+theorem wpMirUbWaivedSym_mono_post
+    {fuel : Nat} {body : CapturedMir} {s : MachineState}
+    {P Q : MirOutcome → Prop}
+    (h_imp : ∀ out, P out → Q out)
+    (h : wpMirUbWaivedSym fuel body s P) :
+    wpMirUbWaivedSym fuel body s Q :=
+  wpMirExecUbWaivedSym_mono_post h_imp h
+
+/-- Postcondition weakening for `wpMirExecModularSym`. -/
+theorem wpMirExecModularSym_mono_post
+    {contract : MirCallContract} {fuel : Nat} {body : CapturedMir}
+    {st : MirExecState} {P Q : MirOutcome → Prop}
+    (h_imp : ∀ out, P out → Q out)
+    (h : wpMirExecModularSym contract fuel body st P) :
+    wpMirExecModularSym contract fuel body st Q := by
+  rw [wpMirExecModularSym_eq_wpCoalBounded] at h ⊢
+  exact wpCoalBounded_mono_both (Nat.le_refl fuel) (fun out _ hp => h_imp out hp) h
+
+/-- Postcondition weakening for `wpMirModularSym`. -/
+theorem wpMirModularSym_mono_post
+    {contract : MirCallContract} {fuel : Nat} {body : CapturedMir}
+    {s : MachineState} {P Q : MirOutcome → Prop}
+    (h_imp : ∀ out, P out → Q out)
+    (h : wpMirModularSym contract fuel body s P) :
+    wpMirModularSym contract fuel body s Q :=
+  wpMirExecModularSym_mono_post h_imp h
+
+/-- Every strict `wpMirExecSym` proof implies `wpMirExecUbWaivedSym`. -/
+theorem wpMirExecUbWaivedSym_of_wpMirExecSym
+    {fuel : Nat} {body : CapturedMir} {st : MirExecState}
+    {post : MirOutcome → Prop}
+    (h : wpMirExecSym fuel body st post) :
+    wpMirExecUbWaivedSym fuel body st post := by
+  rw [wpMirExecSym_eq_wpCoalBounded] at h
+  rw [wpMirExecUbWaivedSym_eq_wpCoalBounded]
+  induction fuel generalizing st with
+  | zero => exact False.elim h
+  | succ fuel' ih =>
+    unfold wpCoalBounded at h ⊢
+    cases h_step : stepMirState body st with
+    | ret out =>
+      simp only [h_step] at h ⊢
+      exact h
+    | tau st' =>
+      simp only [h_step] at h ⊢
+      exact ih h
+    | vis i k =>
+      simp only [h_step] at h ⊢
+      rcases i with f | (e | c)
+      · exact False.elim h
+      · cases e
+        exact ih h
+      · cases c
+        intro ans
+        exact ih (h ans)
+
+/-- Every strict `wpMirSym` proof implies `wpMirUbWaivedSym`. -/
+theorem wpMirUbWaivedSym_of_wpMirSym
+    {fuel : Nat} {body : CapturedMir} {s : MachineState}
+    {post : MirOutcome → Prop}
+    (h : wpMirSym fuel body s post) :
+    wpMirUbWaivedSym fuel body s post :=
+  wpMirExecUbWaivedSym_of_wpMirExecSym h
+
+/-- Every call-free `wpMirExecNoCallSym` proof implies `wpMirExecModularSym`. -/
+theorem wpMirExecModularSym_of_wpMirExecNoCallSym
+    {contract : MirCallContract} {fuel : Nat} {body : CapturedMir}
+    {st : MirExecState} {post : MirOutcome → Prop}
+    (h : wpMirExecNoCallSym fuel body st post) :
+    wpMirExecModularSym contract fuel body st post := by
+  rw [wpMirExecNoCallSym_eq_wpCoalBounded] at h
+  rw [wpMirExecModularSym_eq_wpCoalBounded]
+  induction fuel generalizing st with
+  | zero => exact False.elim h
+  | succ fuel' ih =>
+    unfold wpCoalBounded at h ⊢
+    cases h_step : stepMirState body st with
+    | ret out =>
+      simp only [h_step] at h ⊢
+      exact h
+    | tau st' =>
+      simp only [h_step] at h ⊢
+      exact ih h
+    | vis i k =>
+      simp only [h_step] at h ⊢
+      rcases i with f | (e | c)
+      · exact False.elim h
+      · cases e
+        exact ih h
+      · exact False.elim h
+
+/-- Every call-free `wpMirNoCallSym` proof implies `wpMirModularSym`. -/
+theorem wpMirModularSym_of_wpMirNoCallSym
+    {contract : MirCallContract} {fuel : Nat} {body : CapturedMir}
+    {s : MachineState} {post : MirOutcome → Prop}
+    (h : wpMirNoCallSym fuel body s post) :
+    wpMirModularSym contract fuel body s post :=
+  wpMirExecModularSym_of_wpMirExecNoCallSym h
+
 /-! ### Conjunction and Excluded-Miracle Laws for `wpMirExecSym` -/
 
 /-- Conjunction of two `wpMirExecSym` proofs at the same fuel budget. -/
@@ -2258,6 +2385,61 @@ theorem rootActiveMemory_withDefaultCallees
       RootActiveMemory mem := by
   cases callees <;> rfl
 
+/--
+Smyth `Partial` behavior of `body` on `args` with linked `callees`, projected
+from `mirCallTreeWithCallees` (matching `adv/brief-3-2`).
+-/
+def MirExecPartialWithCallees
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (args : List Value) :
+    Trusted.Refinement.Partial (Trusted.Refinement.BehaviorSet (List (Event MirEffect) × MirOutcome)) :=
+  (mirCallTreeWithCallees body args callees).toPartial
+
+/--
+Pointwise Smyth refinement claim with linked `callees` and separate `safetyPre`
+and `pre` (matching `adv/brief-3-2`).
+-/
+def MirContractHoldsWithSafetyAndCallees
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (safetyPre pre : List Value → Prop)
+    (post : List Value → Value → Prop) : Prop :=
+  MirExecPartialWithCallees body callees ≤ MirContractSpec safetyPre pre post
+
+/--
+Pointwise Smyth refinement claim with linked `callees` (`safetyPre := pre`,
+matching `adv/brief-3-2`).
+-/
+def MirContractHoldsWithCallees
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Prop)
+    (post : List Value → Value → Prop) : Prop :=
+  MirContractHoldsWithSafetyAndCallees body callees pre pre post
+
+/--
+Companion boolean contract helper predicate with linked `callees` (matching
+`adv/brief-3-2`): on `args`, `specBody` with `callees` is `TreeSafe` and every
+normal return yields `true` (`.scalar ⟨1, 1⟩`).
+-/
+def MirBoolPredicateHoldsWithCallees
+    (specBody : CapturedMir)
+    (callees : List CapturedMir)
+    (args : List Value) : Prop :=
+  MirContractHoldsWithCallees
+    specBody
+    callees
+    (· = args)
+    (fun _ ret => ret = .scalar { bits := 1, sizeBytes := 1 })
+
+@[simp]
+theorem mirBoolPredicateHoldsWithCallees_nil
+    (specBody : CapturedMir) (args : List Value) :
+    MirBoolPredicateHoldsWithCallees specBody [] args =
+      MirBoolPredicateHolds specBody args :=
+  rfl
+
 /-! ## 7. Fuel-Free Adequacy Bridges (`DWP`, `DWLP`, `VerificationResult`) -/
 
 /--
@@ -2389,6 +2571,44 @@ theorem mirBoolPredicateHolds_iff_wpConverges
   · exact mirBoolPredicateHolds_of_wpConverges specBody args
 
 /--
+Prove `MirBoolPredicateHoldsWithCallees specBody callees args` from
+`DWP mirDefaultWP`.
+-/
+theorem mirBoolPredicateHoldsWithCallees_of_dwp
+    (specBody : CapturedMir) (callees : List CapturedMir) (args : List Value)
+    (h_dwp :
+      DWP mirDefaultWP (mirCallTreeWithCallees specBody args callees)
+        (fun out _ =>
+          ∀ retVal mem',
+            out = .normal (retVal, mem') →
+            retVal = .scalar { bits := 1, sizeBytes := 1 })
+        PUnit.unit) :
+    MirBoolPredicateHoldsWithCallees specBody callees args := by
+  intro a h_eq
+  subst h_eq
+  have h_adeq := dwlp_pure_adequacy h_dwp.toDWLP
+  exact ⟨h_adeq.1, fun outPair h_ret _ retVal mem' h_out =>
+    h_adeq.2 outPair.1 outPair.2 h_ret retVal mem' h_out⟩
+
+/--
+Fuel-free sufficiency bridge for `MirBoolPredicateHoldsWithCallees specBody callees args`.
+-/
+theorem mirBoolPredicateHoldsWithCallees_of_wpConverges
+    (specBody : CapturedMir) (callees : List CapturedMir) (args : List Value)
+    (h :
+      MirWpConverges specBody
+        (initMachineStateWithCallees specBody args callees)
+        (mirSafePost
+          (fun retVal _ => retVal = .scalar { bits := 1, sizeBytes := 1 }))) :
+    MirBoolPredicateHoldsWithCallees specBody callees args := by
+  refine mirBoolPredicateHoldsWithCallees_of_dwp specBody callees args ?_
+  have h_conv :=
+    MirWpConverges.mono
+      (fun out ho => (mirSafePost_iff_forall_normal _ out).1 ho)
+      h
+  exact dwp_mirCallTreeWithCallees_of_mirWpConverges h_conv
+
+/--
 Discharge a stateless `VerificationResult c` from fuel-free `MirWpConverges`
 (`mirSafePost`: panics/unwinds are safe defined behavior; normal returns must
 satisfy `c.post args retVal`).
@@ -2518,6 +2738,454 @@ theorem verifyStatefulEquivMir_of_wpConverges
   verifyStatefulEquivViaPureModel c model
     (fun args mem h_pre => dwp_of_mirNoCallWpConverges (h_impl args mem h_pre))
     (fun args mem h_pre => dwp_of_mirNoCallWpConverges (h_spec args mem h_pre))
+
+/-! ### Fuel-Free UB-Waived, Modular, Trace & Scalar Discharge Combinators -/
+
+/--
+Fuel-free UB-waived symbolic weakest precondition over `MachineState`, defined
+as the Kleene supremum `∃ fuel : Nat, wpMirUbWaivedSym fuel body s post`.
+-/
+def MirUbWaivedWpConverges
+    (body : CapturedMir) (s : MachineState) (post : MirOutcome → Prop) : Prop :=
+  ∃ fuel : Nat, wpMirUbWaivedSym fuel body s post
+
+/-- Lift a bounded `wpMirUbWaivedSym` proof into `MirUbWaivedWpConverges`. -/
+theorem MirUbWaivedWpConverges.of_wpMirUbWaivedSym
+    {fuel : Nat} {body : CapturedMir} {s : MachineState}
+    {post : MirOutcome → Prop}
+    (h : wpMirUbWaivedSym fuel body s post) :
+    MirUbWaivedWpConverges body s post :=
+  ⟨fuel, h⟩
+
+/-- Every strict `MirWpConverges` proof implies `MirUbWaivedWpConverges`. -/
+theorem MirUbWaivedWpConverges.of_mirWpConverges
+    {body : CapturedMir} {s : MachineState} {post : MirOutcome → Prop}
+    (h : MirWpConverges body s post) :
+    MirUbWaivedWpConverges body s post := by
+  rcases h with ⟨fuel, h_wp⟩
+  exact ⟨fuel, wpMirUbWaivedSym_of_wpMirSym h_wp⟩
+
+/-- Postcondition monotonicity for `MirUbWaivedWpConverges`. -/
+theorem MirUbWaivedWpConverges.mono
+    {body : CapturedMir} {s : MachineState} {P Q : MirOutcome → Prop}
+    (h_imp : ∀ out, P out → Q out)
+    (h : MirUbWaivedWpConverges body s P) :
+    MirUbWaivedWpConverges body s Q := by
+  rcases h with ⟨fuel, h_wp⟩
+  exact ⟨fuel, wpMirUbWaivedSym_mono_post h_imp h_wp⟩
+
+/--
+Fuel-free sequential composition (`MirUbWaivedWpConverges.bind`) composing a
+call-free `MirStepsConverges` prefix with a `MirUbWaivedWpConverges`
+continuation.
+-/
+theorem MirUbWaivedWpConverges.bind
+    {body : CapturedMir} {s : MachineState}
+    {mid : MachineState → Prop} {post : MirOutcome → Prop}
+    (h₁ : MirStepsConverges body s mid post)
+    (h₂ : ∀ s', mid s' → MirUbWaivedWpConverges body s' post) :
+    MirUbWaivedWpConverges body s post := by
+  rcases h₁ with ⟨f₁, hf₁⟩
+  suffices ∀ st : MirExecState,
+      wpMirExecStepsSym f₁ body st
+        (fun
+          | .running s' => mid s'
+          | .halted out => post out
+          | .faulted _ => False)
+        post →
+      ∃ f : Nat, wpMirExecUbWaivedSym f body st post from
+    this (.running s) hf₁
+  clear hf₁
+  induction f₁ with
+  | zero =>
+    intro st h_st
+    cases st with
+    | running s' => exact h₂ s' h_st
+    | halted out => exact ⟨1, h_st⟩
+    | faulted _ => exact False.elim h_st
+  | succ f₁' ih =>
+    intro st h_st
+    unfold wpMirExecStepsSym at h_st
+    have h_ex :
+        evalSymNodeTreeNoCall
+          (fun st' => ∃ f, wpMirExecUbWaivedSym f body st' post)
+          post
+          (stepMirExecSymTree body st) := by
+      refine evalSymNodeTreeNoCall_mono ?_ (fun _ hp => hp) h_st
+      intro st' h_st'
+      exact ih st' h_st'
+    rcases evalSymNodeTreeNoCall_exists_fuel (stepMirExecSymTree body st) h_ex with
+      ⟨f₂, hf₂⟩
+    refine ⟨f₂ + 1, ?_⟩
+    unfold wpMirExecUbWaivedSym
+    rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq] at hf₂
+    rw [evalSymNodeTreeUbWaived_eq, stepMirExecSymTree_eval, evalNodeUbWaivedWP_eq]
+    cases h_step : stepMirState body st with
+    | ret out =>
+      simp only [h_step] at hf₂ ⊢
+      exact hf₂
+    | tau st' =>
+      simp only [h_step] at hf₂ ⊢
+      exact hf₂
+    | vis i k =>
+      simp only [h_step] at hf₂ ⊢
+      rcases i with f | (e | c)
+      · exact False.elim hf₂
+      · cases e
+        exact hf₂
+      · exact False.elim hf₂
+
+/-- Partial-correctness (`DWLP mirUbWaivedWP`) soundness of `MirUbWaivedWpConverges`. -/
+theorem dwlp_of_mirUbWaivedWpConverges
+    {body : CapturedMir} {s : MachineState} {post : MirOutcome → Prop}
+    (h : MirUbWaivedWpConverges body s post) :
+    DWLP mirUbWaivedWP (mirTree body s) (fun out _ => post out) PUnit.unit := by
+  rcases h with ⟨fuel, h_wp⟩
+  rw [wpMirUbWaivedSym_eq_wpMirUbWaivedBounded] at h_wp
+  exact dwlp_cofix_of_wpCoalBounded h_wp
+
+/--
+Fuel-free discharge of `UbExceptionVerificationResult c` from `MirWpConverges`
+on `c.pre ∧ c.strictSafetyPre` and `MirUbWaivedWpConverges` across `c.pre`.
+-/
+theorem verifyUbExceptionMir_of_wpConverges
+    (c : UbExceptionClaim)
+    (h_strict :
+      ∀ (args : List Value) (mem : Memory),
+        c.pre args mem →
+        c.strictSafetyPre args mem →
+        MirWpConverges c.body
+          (initMachineStateWithMemory c.body args mem)
+          (mirSafePost (c.post args mem)))
+    (h_waived :
+      ∀ (args : List Value) (mem : Memory),
+        c.pre args mem →
+        MirUbWaivedWpConverges c.body
+          (initMachineStateWithMemory c.body args mem)
+          (mirSafePost (c.post args mem))) :
+    UbExceptionVerificationResult c := by
+  refine verifyUbExceptionByDWLP c
+    (fun args mem h_pre h_sp => ?_)
+    (fun args mem h_pre => ?_)
+  · exact dwlp_of_mirWpConverges
+      (MirWpConverges.mono
+        (fun out ho => (mirSafePost_iff_forall_normal _ out).1 ho)
+        (h_strict args mem h_pre h_sp))
+  · exact dwlp_of_mirUbWaivedWpConverges
+      (MirUbWaivedWpConverges.mono
+        (fun out ho => (mirSafePost_iff_forall_normal _ out).1 ho)
+        (h_waived args mem h_pre))
+
+/--
+Fuel-free modular call-contract weakest precondition over `MachineState`.
+-/
+def MirModularWpConverges
+    (contract : MirCallContract) (body : CapturedMir) (s : MachineState)
+    (post : MirOutcome → Prop) : Prop :=
+  ∃ fuel : Nat, wpMirModularSym contract fuel body s post
+
+/-- Lift a bounded `wpMirModularSym` proof into `MirModularWpConverges`. -/
+theorem MirModularWpConverges.of_wpMirModularSym
+    {contract : MirCallContract} {fuel : Nat} {body : CapturedMir}
+    {s : MachineState} {post : MirOutcome → Prop}
+    (h : wpMirModularSym contract fuel body s post) :
+    MirModularWpConverges contract body s post :=
+  ⟨fuel, h⟩
+
+/-- Every call-free `MirNoCallWpConverges` proof implies `MirModularWpConverges`. -/
+theorem MirModularWpConverges.of_noCall
+    {contract : MirCallContract} {body : CapturedMir} {s : MachineState}
+    {post : MirOutcome → Prop}
+    (h : MirNoCallWpConverges body s post) :
+    MirModularWpConverges contract body s post := by
+  rcases h with ⟨fuel, h_wp⟩
+  exact ⟨fuel, wpMirModularSym_of_wpMirNoCallSym h_wp⟩
+
+/-- Postcondition monotonicity for `MirModularWpConverges`. -/
+theorem MirModularWpConverges.mono
+    {contract : MirCallContract} {body : CapturedMir} {s : MachineState}
+    {P Q : MirOutcome → Prop}
+    (h_imp : ∀ out, P out → Q out)
+    (h : MirModularWpConverges contract body s P) :
+    MirModularWpConverges contract body s Q := by
+  rcases h with ⟨fuel, h_wp⟩
+  exact ⟨fuel, wpMirModularSym_mono_post h_imp h_wp⟩
+
+/--
+Fuel-free sequential composition (`MirModularWpConverges.bind`) composing a
+call-free `MirStepsConverges` prefix with a `MirModularWpConverges`
+continuation.
+-/
+theorem MirModularWpConverges.bind
+    {contract : MirCallContract} {body : CapturedMir} {s : MachineState}
+    {mid : MachineState → Prop} {post : MirOutcome → Prop}
+    (h₁ : MirStepsConverges body s mid post)
+    (h₂ : ∀ s', mid s' → MirModularWpConverges contract body s' post) :
+    MirModularWpConverges contract body s post := by
+  rcases h₁ with ⟨f₁, hf₁⟩
+  suffices ∀ st : MirExecState,
+      wpMirExecStepsSym f₁ body st
+        (fun
+          | .running s' => mid s'
+          | .halted out => post out
+          | .faulted _ => False)
+        post →
+      ∃ f : Nat, wpMirExecModularSym contract f body st post from
+    this (.running s) hf₁
+  clear hf₁
+  induction f₁ with
+  | zero =>
+    intro st h_st
+    cases st with
+    | running s' => exact h₂ s' h_st
+    | halted out => exact ⟨1, h_st⟩
+    | faulted _ => exact False.elim h_st
+  | succ f₁' ih =>
+    intro st h_st
+    unfold wpMirExecStepsSym at h_st
+    have h_ex :
+        evalSymNodeTreeNoCall
+          (fun st' => ∃ f, wpMirExecModularSym contract f body st' post)
+          post
+          (stepMirExecSymTree body st) := by
+      refine evalSymNodeTreeNoCall_mono ?_ (fun _ hp => hp) h_st
+      intro st' h_st'
+      exact ih st' h_st'
+    rcases evalSymNodeTreeNoCall_exists_fuel (stepMirExecSymTree body st) h_ex with
+      ⟨f₂, hf₂⟩
+    refine ⟨f₂ + 1, ?_⟩
+    unfold wpMirExecModularSym
+    rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq] at hf₂
+    rw [evalSymNodeTreeModular_eq, stepMirExecSymTree_eval, evalNodeModularWP_eq]
+    cases h_step : stepMirState body st with
+    | ret out =>
+      simp only [h_step] at hf₂ ⊢
+      exact hf₂
+    | tau st' =>
+      simp only [h_step] at hf₂ ⊢
+      exact hf₂
+    | vis i k =>
+      simp only [h_step] at hf₂ ⊢
+      rcases i with f | (e | c)
+      · exact False.elim hf₂
+      · cases e
+        exact hf₂
+      · exact False.elim hf₂
+
+/--
+Partial-correctness (`DWLP (mirModularWP contract.toCallContract)`) soundness of
+`MirModularWpConverges`.
+-/
+theorem dwlp_of_mirModularWpConverges
+    {contract : MirCallContract} {body : CapturedMir} {s : MachineState}
+    {post : MirOutcome → Prop}
+    (h : MirModularWpConverges contract body s post) :
+    DWLP (mirModularWP contract.toCallContract) (mirTree body s)
+      (fun out _ => post out) PUnit.unit := by
+  rcases h with ⟨fuel, h_wp⟩
+  rw [wpMirModularSym, wpMirExecModularSym_eq_wpCoalBounded] at h_wp
+  exact dwlp_cofix_of_wpCoalBounded h_wp
+
+/--
+Fuel-free discharge of `ModularVerificationResult` for `body` under
+`contract.holdsOn` from `MirModularWpConverges`.
+-/
+theorem verifyModularContractMir_of_wpConverges
+    (contract : MirCallContract)
+    (body : CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        pre args mem →
+        MirModularWpConverges contract body
+          (initMachineStateWithMemory body args mem)
+          (mirSafePost (post args mem))) :
+    ModularVerificationResult
+      { body := body
+        envAssumed := contract.holdsOn
+        pre := pre
+        post := post } := by
+  refine verifyModularContractByDWLP contract body pre post
+    (fun args mem h_pre => ?_)
+  exact dwlp_of_mirModularWpConverges
+    (MirModularWpConverges.mono
+      (fun out ho => (mirSafePost_iff_forall_normal _ out).1 ho)
+      (h_wp args mem h_pre))
+
+/--
+Fuel-free trace-aware weakest precondition over `MachineState`.
+-/
+def MirTraceWpConverges
+    (body : CapturedMir) (s : MachineState)
+    (post : List (Event MirEffect) → MirOutcome → Prop) : Prop :=
+  ∃ fuel : Nat, wpMirTraceBounded fuel body s post
+
+/-- Postcondition monotonicity for `MirTraceWpConverges`. -/
+theorem MirTraceWpConverges.mono
+    {body : CapturedMir} {s : MachineState}
+    {P Q : List (Event MirEffect) → MirOutcome → Prop}
+    (h_imp : ∀ tr out, P tr out → Q tr out)
+    (h : MirTraceWpConverges body s P) :
+    MirTraceWpConverges body s Q := by
+  rcases h with ⟨fuel, h_wp⟩
+  refine ⟨fuel, ?_⟩
+  exact wpCoalBounded_mono_both (Nat.le_refl fuel)
+    (fun out tr hp => h_imp tr out hp) h_wp
+
+/-- Partial-correctness (`DWLP mirTraceWP`) soundness of `MirTraceWpConverges`. -/
+theorem dwlp_of_mirTraceWpConverges
+    {body : CapturedMir} {s : MachineState}
+    {post : List (Event MirEffect) → MirOutcome → Prop}
+    (h : MirTraceWpConverges body s post) :
+    DWLP mirTraceWP (mirTree body s) (fun out tr => post tr out) [] := by
+  rcases h with ⟨fuel, h_wp⟩
+  exact dwlp_cofix_of_wpCoalBounded h_wp
+
+/--
+Fuel-free discharge of `TraceVerificationResult c` from `MirTraceWpConverges`.
+-/
+theorem verifyTraceMir_of_wpConverges
+    (c : TraceClaim)
+    (h_wp :
+      ∀ (args : List Value) (mem : Memory),
+        c.pre args mem →
+        MirTraceWpConverges c.body
+          (initMachineStateWithMemory c.body args mem)
+          (fun tr out => c.post args mem tr out)) :
+    TraceVerificationResult c :=
+  verifyTraceByDWLP c (fun args mem h_pre =>
+    dwlp_of_mirTraceWpConverges (h_wp args mem h_pre))
+
+/--
+Fuel-free discharge of a stateless `VerificationResult c` when `c.pre args`
+pins `args` to `expectedArgs`.
+-/
+theorem dischargeStatelessEq_of_wpConverges
+    (c : Claim)
+    (expectedArgs : List Value)
+    (h_pre : ∀ args : List Value, c.pre args → args = expectedArgs)
+    (h_eval :
+      MirWpConverges c.body (initMachineState c.body expectedArgs)
+        (mirNormalPost (fun retVal _ => c.post expectedArgs retVal))) :
+    VerificationResult c :=
+  verifyMirNoPanic_of_wpConverges c (fun args hp => by
+    rw [h_pre args hp]
+    exact h_eval)
+
+/--
+Fuel-free discharge of a stateful `StatefulVerificationResult c` when
+`c.pre args mem` pins `(args, mem)` to `(expectedArgs, expectedMem)`.
+-/
+theorem dischargeStatefulEq_of_wpConverges
+    (c : StatefulClaim)
+    (expectedArgs : List Value)
+    (expectedMem : Memory)
+    (h_pre :
+      ∀ (args : List Value) (mem : Memory),
+        c.pre args mem → args = expectedArgs ∧ mem = expectedMem)
+    (h_eval :
+      MirWpConverges c.body
+        (initMachineStateWithMemory c.body expectedArgs expectedMem)
+        (mirNormalPost (c.post expectedArgs expectedMem))) :
+    StatefulVerificationResult c :=
+  verifyStatefulMirNoPanic_of_wpConverges c (fun args mem hp => by
+    rcases h_pre args mem hp with ⟨rfl, rfl⟩
+    exact h_eval)
+
+/--
+Fuel-free verification of a 1-argument scalar function across all canonical
+`width`-byte inputs.
+-/
+theorem verifyWellTypedScalarArg1_of_wpConverges
+    (c : Claim) (width : Nat)
+    (h_pre : ∀ args : List Value, c.pre args → WellTypedScalarArg1 width args)
+    (h_sym :
+      ∀ b : Nat,
+        b < scalarModulus width →
+        c.pre [.scalar { bits := b, sizeBytes := width }] →
+        MirWpConverges c.body
+          (initMachineState c.body [.scalar { bits := b, sizeBytes := width }])
+          (mirNormalPost
+            (fun retVal _ =>
+              c.post [.scalar { bits := b, sizeBytes := width }] retVal))) :
+    VerificationResult c :=
+  verifyMirNoPanic_of_wpConverges c (fun args hp => by
+    rcases h_pre args hp with ⟨b, hb, rfl⟩
+    exact h_sym b hb hp)
+
+/-- Safe-panic fuel-free variant of `verifyWellTypedScalarArg1_of_wpConverges`. -/
+theorem verifyWellTypedSafeScalarArg1_of_wpConverges
+    (c : Claim) (width : Nat)
+    (h_pre : ∀ args : List Value, c.pre args → WellTypedScalarArg1 width args)
+    (h_sym :
+      ∀ b : Nat,
+        b < scalarModulus width →
+        c.pre [.scalar { bits := b, sizeBytes := width }] →
+        MirWpConverges c.body
+          (initMachineState c.body [.scalar { bits := b, sizeBytes := width }])
+          (mirSafePost
+            (fun retVal _ =>
+              c.post [.scalar { bits := b, sizeBytes := width }] retVal))) :
+    VerificationResult c :=
+  verifyMirSafe_of_wpConverges c (fun args hp => by
+    rcases h_pre args hp with ⟨b, hb, rfl⟩
+    exact h_sym b hb hp)
+
+/--
+Fuel-free verification of a 2-argument scalar function across all canonical
+`(w1, w2)`-byte inputs.
+-/
+theorem verifyWellTypedScalarArg2_of_wpConverges
+    (c : Claim) (w1 w2 : Nat)
+    (h_pre : ∀ args : List Value, c.pre args → WellTypedScalarArg2 w1 w2 args)
+    (h_sym :
+      ∀ b1 b2 : Nat,
+        b1 < scalarModulus w1 →
+        b2 < scalarModulus w2 →
+        c.pre
+          [ .scalar { bits := b1, sizeBytes := w1 }
+          , .scalar { bits := b2, sizeBytes := w2 } ] →
+        MirWpConverges c.body
+          (initMachineState c.body
+            [ .scalar { bits := b1, sizeBytes := w1 }
+            , .scalar { bits := b2, sizeBytes := w2 } ])
+          (mirNormalPost
+            (fun retVal _ =>
+              c.post
+                [ .scalar { bits := b1, sizeBytes := w1 }
+                , .scalar { bits := b2, sizeBytes := w2 } ]
+                retVal))) :
+    VerificationResult c :=
+  verifyMirNoPanic_of_wpConverges c (fun args hp => by
+    rcases h_pre args hp with ⟨b1, b2, hb1, hb2, rfl⟩
+    exact h_sym b1 b2 hb1 hb2 hp)
+
+/-- Safe-panic fuel-free variant of `verifyWellTypedScalarArg2_of_wpConverges`. -/
+theorem verifyWellTypedSafeScalarArg2_of_wpConverges
+    (c : Claim) (w1 w2 : Nat)
+    (h_pre : ∀ args : List Value, c.pre args → WellTypedScalarArg2 w1 w2 args)
+    (h_sym :
+      ∀ b1 b2 : Nat,
+        b1 < scalarModulus w1 →
+        b2 < scalarModulus w2 →
+        c.pre
+          [ .scalar { bits := b1, sizeBytes := w1 }
+          , .scalar { bits := b2, sizeBytes := w2 } ] →
+        MirWpConverges c.body
+          (initMachineState c.body
+            [ .scalar { bits := b1, sizeBytes := w1 }
+            , .scalar { bits := b2, sizeBytes := w2 } ])
+          (mirSafePost
+            (fun retVal _ =>
+              c.post
+                [ .scalar { bits := b1, sizeBytes := w1 }
+                , .scalar { bits := b2, sizeBytes := w2 } ]
+                retVal))) :
+    VerificationResult c :=
+  verifyMirSafe_of_wpConverges c (fun args hp => by
+    rcases h_pre args hp with ⟨b1, b2, hb1, hb2, rfl⟩
+    exact h_sym b1 b2 hb1 hb2 hp)
 
 /-! ## 8. Concrete Multi-Block Fuel-Free Verification Witnesses -/
 
@@ -2845,6 +3513,99 @@ theorem verify_multiBlockPipelineTotalClaim :
       | panic => exact False.elim ho
       | abort => exact False.elim ho)
     (multiBlockPipeline_wpConverges b mem h_root)
+
+/--
+Stage 2 call-free convergence (`MirNoCallWpConverges`) for
+`multiBlockPipelineBody` from `multiBlockMidState b mem`.
+-/
+theorem multiBlockPipeline_stage2_noCallWpConverges
+    (b : Nat) (mem : Memory) (h_root : RootActiveMemory mem) :
+    MirNoCallWpConverges multiBlockPipelineBody
+      (multiBlockMidState b mem)
+      (mirNormalPost
+        (fun retVal mem' =>
+          retVal = .scalar { bits := b, sizeBytes := 4 } ∧ mem' = mem)) := by
+  rcases mem with
+    ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
+     activeCallee, activeProtectors, nextProtector, callerLocals⟩
+  rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
+  refine ⟨3, ?_⟩
+  dsimp [initMachineState, initMachineStateWithMemory, initLocals, initLocalsAux,
+    List.length, multiBlockMidState, advanceStmt, Trusted.Sequence.set?,
+    multiBlockPipelineBody, Trusted.Sequence.get?]
+  dsimp [wpMirNoCallSym, wpMirExecNoCallSym]
+  simp [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval,
+    evalNodeNoCallWP_eq, stepMirState, stepMirFn, Trusted.Sequence.get?, evalStmt,
+    evalRvalue, evalOperand, evalTerminator, writePlaceValue,
+    invalidateConflictingBorrows, get?, List.length,
+    Trusted.Sequence.length, BEq.beq, advanceStmt, Trusted.Sequence.set?,
+    evalNodeNoCallWP, MirStepNode.step, MirStepNode.retNormal, mirNormalPost]
+
+/--
+Fuel-free call-forbidding sequential composition (`MirNoCallWpConverges.bind`)
+of Stage 1 and Stage 2 for `multiBlockPipelineBody`.
+-/
+theorem multiBlockPipeline_noCallWpConverges
+    (b : Nat) (mem : Memory) (h_root : RootActiveMemory mem) :
+    MirNoCallWpConverges multiBlockPipelineBody
+      (initMachineStateWithMemory multiBlockPipelineBody
+        [.scalar { bits := b, sizeBytes := 4 }] mem)
+      (mirNormalPost
+        (fun retVal mem' =>
+          retVal = .scalar { bits := b, sizeBytes := 4 } ∧ mem' = mem)) :=
+  MirNoCallWpConverges.bind
+    (multiBlockPipeline_stage1_converges b mem h_root)
+    (fun _ h_eq => h_eq ▸ multiBlockPipeline_stage2_noCallWpConverges b mem h_root)
+
+/--
+Relational `StatefulEquivClaim` for `multiBlockPipelineBody` over any
+`RootActiveMemory mem`.
+-/
+def multiBlockPipelineEquivClaim : StatefulEquivClaim where
+  implBody := multiBlockPipelineBody
+  specBody := multiBlockPipelineBody
+  pre args mem := WellTypedScalarArg1 4 args ∧ RootActiveMemory mem
+  post args mem retVal mem' := args = [retVal] ∧ mem' = mem
+
+/-- Non-vacuity witness for `multiBlockPipelineEquivClaim.pre`. -/
+theorem multiBlockPipelineEquivClaim_nonVacuous :
+    ∃ (args : List Value) (mem : Memory),
+      multiBlockPipelineEquivClaim.pre args mem :=
+  multiBlockPipelineStatefulClaim_nonVacuous
+
+/--
+Fuel-free discharge of `StatefulEquivVerificationResult multiBlockPipelineEquivClaim`
+using `verifyStatefulEquivMir_of_wpConverges` and `MirNoCallWpConverges.bind`.
+-/
+theorem verify_multiBlockPipelineEquivClaim :
+    StatefulEquivVerificationResult multiBlockPipelineEquivClaim := by
+  refine verifyStatefulEquivMir_of_wpConverges
+    multiBlockPipelineEquivClaim
+    (fun args mem => (args.headD .unit, mem))
+    (fun args mem h_pre => ?_)
+    (fun args mem h_pre => ?_)
+  · rcases h_pre with ⟨⟨b, _, rfl⟩, h_root⟩
+    refine MirNoCallWpConverges.mono ?_
+      (multiBlockPipeline_noCallWpConverges b mem h_root)
+    intro out ho
+    cases out with
+    | normal rv =>
+      rcases rv with ⟨retVal, mem'⟩
+      rcases ho with ⟨rfl, rfl⟩
+      exact ⟨rfl, rfl, rfl⟩
+    | panic => exact False.elim ho
+    | abort => exact False.elim ho
+  · rcases h_pre with ⟨⟨b, _, rfl⟩, h_root⟩
+    refine MirNoCallWpConverges.mono ?_
+      (multiBlockPipeline_noCallWpConverges b mem h_root)
+    intro out ho
+    cases out with
+    | normal rv =>
+      rcases rv with ⟨retVal, mem'⟩
+      rcases ho with ⟨rfl, rfl⟩
+      rfl
+    | panic => exact False.elim ho
+    | abort => exact False.elim ho
 
 end ConcreteWitnesses
 
