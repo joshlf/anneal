@@ -780,6 +780,7 @@ def evalStmt
   | .nop => MirStepNode.step (advanceStmt s s.frame.locals)
   | .coverage => MirStepNode.step (advanceStmt s s.frame.locals)
   | .constEvalCounter => MirStepNode.step (advanceStmt s s.frame.locals)
+  | .backwardIncompatibleDropHint _ => MirStepNode.step (advanceStmt s s.frame.locals)
   | .placeMention place =>
     match get? s.frame.locals place.local_ with
     | .none => MirStepNode.fail .ub
@@ -1018,6 +1019,5 @@ def evalStmt
         | .none => MirStepNode.fail .ub
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
-  | _ => MirStepNode.unsupported
 
 end Trusted.Rustc.V2026_06_01.MirSemantics

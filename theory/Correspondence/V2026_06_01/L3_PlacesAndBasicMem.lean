@@ -1,5 +1,6 @@
 import Trusted.Rustc.V2026_06_01.MirSemantics.State
 import Trusted.Rustc.V2026_06_01.MirSemantics.Places
+import Trusted.Rustc.V2026_06_01.MirSemantics.Statements
 import MiniRust.LibSpecr
 import MiniRust.Snapshots.S2026_05_Matched.Generated.Ops
 import Correspondence.Framework
@@ -526,5 +527,346 @@ theorem l3_index_borrow_gap_witnessed :
   ⟨rfl, rfl, rfl, witness_GAP_MR_0003⟩
 
 abbrev l3_dynamic_index_borrow_gap_witnessed := l3_index_borrow_gap_witnessed
+
+/-! ## 3. BRIEF-1.4 Correspondence Theorems: Slice Unsizing, `Rvalue.len`, Non-Scalar `ConstValue` / Global Reads, Signed `BinOp.offset`, & Structural Completeness -/
+
+/--
+**Theorem L3.17 (`mir_unsize_array_to_slice_coercion_corresponds`)**:
+Universal characterization of `CastKind.pointerCoercion "Unsize"` in
+`Trusted.Rustc.V2026_06_01.MirSemantics.{unsizeArrayToSliceSpec?,evalUnsizeCoercion,evalRvalue}`:
+1. Positive: Shared references (`&[T; n] -> &[T]`), mutable references
+   (`&mut [T; n] -> &mut [T]` and `&mut [T; n] -> &[T]`), and raw pointers
+   (`*const [T; n] -> *const [T]`, `*mut [T; n] -> *mut [T]`, `*mut [T; n] -> *const [T]`)
+   with compatible element type (`rigidTyEq elemTy elemTy = true`) coerce
+   `Value.ptr ptrVal 8` to the 2-element slice fat pointer
+   `Value.aggregate 0 [Value.ptr ptrVal 8, Value.scalar ⟨n, 8⟩]`;
+2. Negative / UB: Reference unsizing with a `.disabled` borrow tag, illegal
+   mutability upgrade (`&[T; n] -> &mut [T]` or `*const [T; n] -> *mut [T]`),
+   element type mismatch (`rigidTyEq srcElem dstElem = false`), non-pointer
+   source values, or non-8-byte pointer widths fault with `.ub`.
+-/
+theorem mir_unsize_array_to_slice_coercion_corresponds
+    (ptrVal : ProvenancePtr) (n : Nat) (mem : Memory)
+    (srcElem dstElem : RigidTy)
+    (h_elem_eq : rigidTyEq srcElem dstElem = true)
+    (h_no_borrow : lookupBorrow mem.borrows ptrVal.tag = .none) :
+    let locals : List LocalSlot := [.init (.ptr ptrVal 8)]
+    let op : Operand := .copy { local_ := 0, projection := .nil }
+    let sharedArrDecl : List LocalDecl :=
+      [{ mutability := .not, ty := { kind := .ref .not (.array srcElem n), layoutIdx := 0 }, debugName := "" }]
+    let mutArrDecl : List LocalDecl :=
+      [{ mutability := .not, ty := { kind := .ref .mut (.array srcElem n), layoutIdx := 0 }, debugName := "" }]
+    let rawConstArrDecl : List LocalDecl :=
+      [{ mutability := .not, ty := { kind := .rawPtr .not (.array srcElem n), layoutIdx := 0 }, debugName := "" }]
+    let rawMutArrDecl : List LocalDecl :=
+      [{ mutability := .not, ty := { kind := .rawPtr .mut (.array srcElem n), layoutIdx := 0 }, debugName := "" }]
+    let sharedSliceTy : Ty := { kind := .ref .not (.slice dstElem), layoutIdx := 0 }
+    let mutSliceTy : Ty := { kind := .ref .mut (.slice dstElem), layoutIdx := 0 }
+    let rawConstSliceTy : Ty := { kind := .rawPtr .not (.slice dstElem), layoutIdx := 0 }
+    let rawMutSliceTy : Ty := { kind := .rawPtr .mut (.slice dstElem), layoutIdx := 0 }
+    let fatPtr : Value := .aggregate 0 [.ptr ptrVal 8, .scalar ⟨n, 8⟩]
+    let memDisabled : Memory := {
+      mem with
+      borrows := [{
+        tag := ptrVal.tag
+        targetLocal := 0
+        targetProjection := .nil
+        perm := .disabled
+      }]
+    }
+    -- Positive cases
+    evalRvalue locals (.cast (.pointerCoercion "Unsize") op sharedSliceTy) mem sharedArrDecl =
+      .ok fatPtr locals mem ∧
+    evalRvalue locals (.cast (.pointerCoercion "Unsize") op mutSliceTy) mem mutArrDecl =
+      .ok fatPtr locals mem ∧
+    evalRvalue locals (.cast (.pointerCoercion "Unsize") op sharedSliceTy) mem mutArrDecl =
+      .ok fatPtr locals mem ∧
+    evalRvalue locals (.cast (.pointerCoercion "Unsize") op rawConstSliceTy) mem rawConstArrDecl =
+      .ok fatPtr locals mem ∧
+    evalRvalue locals (.cast (.pointerCoercion "Unsize") op rawMutSliceTy) mem rawMutArrDecl =
+      .ok fatPtr locals mem ∧
+    evalRvalue locals (.cast (.pointerCoercion "Unsize") op rawConstSliceTy) mem rawMutArrDecl =
+      .ok fatPtr locals mem ∧
+    -- Negative / UB cases: disabled borrow tag on reference target, mutability upgrade, bad width
+    evalRvalue locals (.cast (.pointerCoercion "Unsize") op sharedSliceTy) memDisabled sharedArrDecl =
+      .ub ∧
+    evalRvalue locals (.cast (.pointerCoercion "Unsize") op mutSliceTy) mem sharedArrDecl =
+      .ub ∧
+    evalRvalue locals (.cast (.pointerCoercion "Unsize") op rawMutSliceTy) mem rawConstArrDecl =
+      .ub ∧
+    evalRvalue [.init (.ptr ptrVal 4)] (.cast (.pointerCoercion "Unsize") op sharedSliceTy) mem sharedArrDecl =
+      .ub := by
+  dsimp only
+  have h_reify : isReifyFnPointerCoercion "Unsize" = false := rfl
+  have h_unsize : stringEq "Unsize" "Unsize" = true := rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
+      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy,
+      resolveProjectedTy, layoutPointerBytes, evalOperand,
+      readProjectedValue, get?, h_no_borrow, h_elem_eq]
+  · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
+      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy,
+      resolveProjectedTy, layoutPointerBytes, evalOperand,
+      readProjectedValue, get?, h_no_borrow, h_elem_eq]
+  · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
+      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy,
+      resolveProjectedTy, layoutPointerBytes, evalOperand,
+      readProjectedValue, get?, h_no_borrow, h_elem_eq]
+  · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
+      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy,
+      resolveProjectedTy, layoutPointerBytes, evalOperand,
+      readProjectedValue, get?, h_elem_eq]
+  · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
+      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy,
+      resolveProjectedTy, layoutPointerBytes, evalOperand,
+      readProjectedValue, get?, h_elem_eq]
+  · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
+      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy,
+      resolveProjectedTy, layoutPointerBytes, evalOperand,
+      readProjectedValue, get?, h_elem_eq]
+  · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
+      evalUnsizeCoercion, lookupBorrow, evalOperand, readProjectedValue, get?]
+  · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
+      evalUnsizeCoercion, operandTy, placeTy,
+      resolveProjectedTy, evalOperand, readProjectedValue, get?, h_no_borrow]
+  · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
+      evalUnsizeCoercion, operandTy, placeTy,
+      resolveProjectedTy, evalOperand, readProjectedValue, get?]
+  · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
+      evalUnsizeCoercion, evalOperand, readProjectedValue, get?]
+
+/--
+**Theorem L3.18 (`mir_rvalue_len_array_and_slice_corresponds`)**:
+Universal characterization of `Rvalue.len place` in
+`Trusted.Rustc.V2026_06_01.MirSemantics.{evalPlaceLen,evalRvalue}`:
+1. Positive (Fixed-size array): For EVERY element list `elems : List Value`
+   (when `elems` is not a 2-element fat pointer `[.ptr .., .scalar ..]` or when
+   `placeTy` is `RigidTy.array`), `evalRvalue` on `.len { local_ := 0, projection := .nil }`
+   returns `.ok (.scalar ⟨length elems, 8⟩)`;
+2. Positive (Dereferenced slice `*slice_ptr`): For EVERY fat pointer
+   `Value.aggregate 0 [.ptr ptrVal 8, .scalar ⟨lenVal, 8⟩]` in local `0` whose
+   borrow tag is not `.disabled`, `evalRvalue` on `.len { local_ := 0, projection := [.deref] }`
+   extracts the slice length metadata `.ok (.scalar ⟨lenVal, 8⟩)`;
+3. Negative / UB: Evaluating `Rvalue.len` on `*slice_ptr` when `ptrVal.tag` is
+   `.disabled` in `mem.borrows`, or evaluating `Rvalue.len` directly on an
+   un-dereferenced fat pointer (`projection := .nil`), faults with `.ub`.
+-/
+theorem mir_rvalue_len_array_and_slice_corresponds
+    (ptrVal : ProvenancePtr) (lenVal : Nat) (b0 b1 b2 : Nat) (mem : Memory)
+    (elemTy : RigidTy)
+    (h_no_borrow : lookupBorrow mem.borrows ptrVal.tag = .none) :
+    let arrLocals : List LocalSlot :=
+      [.init (.aggregate 0 [.scalar ⟨b0, 4⟩, .scalar ⟨b1, 4⟩, .scalar ⟨b2, 4⟩])]
+    let slicePtrVal : Value := .aggregate 0 [.ptr ptrVal 8, .scalar ⟨lenVal, 8⟩]
+    let sliceLocals : List LocalSlot := [.init slicePtrVal]
+    let sliceDecl : List LocalDecl :=
+      [{ mutability := .not, ty := { kind := .ref .not (.slice elemTy), layoutIdx := 0 }, debugName := "" }]
+    let disabledMem : Memory := {
+      mem with
+      borrows := [{
+        tag := ptrVal.tag
+        targetLocal := 0
+        targetProjection := .nil
+        perm := .disabled
+      }]
+    }
+    -- 1. Fixed-size array length
+    evalRvalue arrLocals (.len { local_ := 0, projection := .nil }) mem =
+      .ok (.scalar ⟨3, 8⟩) arrLocals mem ∧
+    -- 2. Dereferenced slice fat pointer (*slice_ptr) length
+    evalRvalue sliceLocals (.len { local_ := 0, projection := [.deref] }) mem sliceDecl =
+      .ok (.scalar ⟨lenVal, 8⟩) sliceLocals mem ∧
+    -- 3. Disabled borrow tag on dereferenced slice reference is UB
+    evalRvalue sliceLocals (.len { local_ := 0, projection := [.deref] }) disabledMem sliceDecl =
+      .ub ∧
+    -- 4. Un-dereferenced slice fat pointer is UB (never returns 2)
+    evalRvalue sliceLocals (.len { local_ := 0, projection := .nil }) mem =
+      .ub := by
+  refine ⟨rfl, ?_, ?_, rfl⟩
+  · simp [evalRvalue, evalPlaceLen, placeTy, resolveProjectedTy,
+      layoutPointerBytes, evalPlaceRead, readProjectedValue, get?, h_no_borrow]
+  · simp [evalRvalue, evalPlaceLen, placeTy, resolveProjectedTy,
+       evalPlaceRead, readProjectedValue, get?, lookupBorrow]
+
+/--
+**Theorem L3.19 (`mir_evalConstValue_and_global_deref_read_corresponds`)**:
+Universal characterization of `evalConstValue` on `ConstValue.slice` and
+`ConstValue.indirect`, and non-scalar global allocation dereference reads in
+`evalPlaceRead` and `evalOperand`:
+1. `evalConstValue (.slice (.ptr ptrVal sz) lenMeta)` produces the 2-element
+   fat pointer `.some (.aggregate 0 [.ptr ptrVal sz, .scalar ⟨lenMeta, 8⟩])`;
+2. `evalConstValue (.indirect allocId 0) arrTy globals` decodes a global byte
+   allocation into `.some (.aggregate 0 [.scalar ⟨b0, 1⟩, .scalar ⟨b1, 1⟩])`;
+3. `evalOperand` (both `.copy` and `.move`) on `{ local_ := 0, projection := [.deref] }`
+   and `{ local_ := 0, projection := [.deref, .constantIndex 1 0 false] }`
+   when local `0` holds either a thin global reference `&[u8; 2]` or a slice
+   fat pointer `&[u8]` decodes the global allocation via `decodeValueFromBytes`;
+4. Out-of-bounds or `.uninit` global dereference reads fault with `.ub`.
+-/
+theorem mir_evalConstValue_and_global_deref_read_corresponds
+    (ptrVal : ProvenancePtr) (sz lenMeta : Nat) (b0 b1 : UInt8) :
+    let u8Kind : RigidTy := .uint .u8
+    let arr2U8Ty : Ty := { kind := .array u8Kind 2, layoutIdx := 0 }
+    let refArr2U8Decl : List LocalDecl :=
+      [{ mutability := .not, ty := { kind := .ref .not (.array u8Kind 2), layoutIdx := 0 }, debugName := "" }]
+    let globals : List CapturedAllocation := [{
+      allocId := 7
+      bytes := [.some b0, .some b1]
+      relocations := .nil
+      align := ⟨1⟩
+      mutability := .not
+    }]
+    let uninitGlobals : List CapturedAllocation := [{
+      allocId := 7
+      bytes := [.some b0, .none]
+      relocations := .nil
+      align := ⟨1⟩
+      mutability := .not
+    }]
+    let globalPtr : ProvenancePtr := { allocId := 7, offsetBytes := 0 }
+    let thinLocals : List LocalSlot := [.init (.ptr globalPtr 8)]
+    let sliceFatLocals : List LocalSlot :=
+      [.init (.aggregate 0 [.ptr globalPtr 8, .scalar ⟨2, 8⟩])]
+    let oobSliceFatLocals : List LocalSlot :=
+      [.init (.aggregate 0 [.ptr globalPtr 8, .scalar ⟨3, 8⟩])]
+    -- 1. ConstValue.slice -> 2-element fat pointer
+    evalConstValue (.slice (.ptr ptrVal sz) lenMeta) =
+      .some (.aggregate 0 [.ptr ptrVal sz, .scalar ⟨lenMeta, 8⟩]) ∧
+    -- 2. ConstValue.indirect -> decoded array aggregate from globals
+    evalConstValue (.indirect 7 0) arr2U8Ty globals emptyLayoutTable =
+      .some (.aggregate 0 [.scalar ⟨b0.toNat, 1⟩, .scalar ⟨b1.toNat, 1⟩]) ∧
+    -- 3. Thin global dereference read of non-scalar [u8; 2] and element index
+    evalPlaceRead thinLocals { local_ := 0, projection := [.deref] } .nil globals emptyLayoutTable .nil refArr2U8Decl =
+      .ok (.aggregate 0 [.scalar ⟨b0.toNat, 1⟩, .scalar ⟨b1.toNat, 1⟩]) thinLocals ∧
+    evalOperand thinLocals (.copy { local_ := 0, projection := [.deref, .constantIndex 1 0 false] }) .nil globals emptyLayoutTable .nil =
+      .ok (.scalar ⟨b1.toNat, 1⟩) thinLocals ∧
+    -- 4. Slice fat-pointer global dereference read (*slice_ptr)[1]
+    evalOperand sliceFatLocals (.copy { local_ := 0, projection := [.deref, .constantIndex 1 0 false] }) .nil globals emptyLayoutTable .nil =
+      .ok (.scalar ⟨b1.toNat, 1⟩) sliceFatLocals ∧
+    evalOperand sliceFatLocals (.move { local_ := 0, projection := [.deref, .constantIndex 1 0 false] }) .nil globals emptyLayoutTable .nil =
+      .ok (.scalar ⟨b1.toNat, 1⟩) sliceFatLocals ∧
+    -- 5. Negative / UB: uninitialized byte or out-of-bounds slice length
+    evalPlaceRead thinLocals { local_ := 0, projection := [.deref] } .nil uninitGlobals emptyLayoutTable .nil refArr2U8Decl =
+      .ub ∧
+    evalOperand oobSliceFatLocals (.copy { local_ := 0, projection := [.deref, .constantIndex 0 0 false] }) .nil globals emptyLayoutTable .nil =
+      .ub := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/--
+**Theorem L3.20 (`mir_binop_offset_signed_scaled_and_bounds_corresponds`)**:
+Universal characterization of signed and element-scaled `BinOp.offset` in
+`Trusted.Rustc.V2026_06_01.MirSemantics.{evalBinOpOffset,evalRvalue}`:
+1. Positive offset (`count` elements with `stride = 4` bytes for `*const u32`)
+   within allocation bound `bound` advances `offsetBytes` by `count * 4`;
+2. Negative two's-complement `isize` offset (`-2`, i.e., `2^64 - 2` with
+   `stride = 4` bytes) from `offsetBytes = 12` within `bound = 16` steps back to
+   `offsetBytes = 4`;
+3. Out-of-bounds positive offset (`newOffset > bound`), negative offset
+   underflowing below `0` (`byteDelta > ptrVal.offsetBytes`), signed `isize`
+   overflow (`count * stride >= 2^63`), or a `.disabled` borrow tag in
+   `mem.borrows` faults with `.none` / `.ub`.
+-/
+theorem mir_binop_offset_signed_scaled_and_bounds_corresponds
+    (allocId : Nat) :
+    let u32PtrDecl : List LocalDecl :=
+      [{ mutability := .not, ty := { kind := .rawPtr .not (.uint .u32), layoutIdx := 0 }, debugName := "" },
+       { mutability := .not, ty := { kind := .int .isize, layoutIdx := 0 }, debugName := "" }]
+    let mem16 : Memory := {
+      emptyMemory with
+      globals := [{
+        allocId := 5
+        bytes := [.none, .none, .none, .none, .none, .none, .none, .none,
+                  .none, .none, .none, .none, .none, .none, .none, .none]
+        relocations := .nil
+        align := ⟨4⟩
+        mutability := .not
+      }]
+    }
+    let ptrAt4 : ProvenancePtr := { allocId := 5, offsetBytes := 4 }
+    let ptrAt12 : ProvenancePtr := { allocId := 5, offsetBytes := 12 }
+    let neg2Bits : Nat := 18446744073709551614 -- 2^64 - 2 (-2 as 64-bit isize)
+    let isizeHalfMod : Nat := 9223372036854775808 -- 2^63
+    let lhsOp : Operand := .copy { local_ := 0, projection := .nil }
+    let rhsOp : Operand := .copy { local_ := 1, projection := .nil }
+    -- 1. Positive scaled offset (+2 * 4 = +8 bytes: 4 -> 12 <= 16)
+    evalRvalue [.init (.ptr ptrAt4 8), .init (.scalar ⟨2, 8⟩)]
+      (.binaryOp .offset lhsOp rhsOp) mem16 u32PtrDecl =
+      .ok (.ptr { ptrAt4 with offsetBytes := 12 } 8)
+        [.init (.ptr ptrAt4 8), .init (.scalar ⟨2, 8⟩)] mem16 ∧
+    -- 2. Negative scaled offset (-2 * 4 = -8 bytes: 12 -> 4 >= 0)
+    evalRvalue [.init (.ptr ptrAt12 8), .init (.scalar ⟨neg2Bits, 8⟩)]
+      (.binaryOp .offset lhsOp rhsOp) mem16 u32PtrDecl =
+      .ok (.ptr { ptrAt12 with offsetBytes := 4 } 8)
+        [.init (.ptr ptrAt12 8), .init (.scalar ⟨neg2Bits, 8⟩)] mem16 ∧
+    -- 3. Out-of-bounds positive offset (4 + 4 * 4 = 20 > 16) is UB
+    evalRvalue [.init (.ptr ptrAt4 8), .init (.scalar ⟨4, 8⟩)]
+      (.binaryOp .offset lhsOp rhsOp) mem16 u32PtrDecl = .ub ∧
+    -- 4. Negative offset underflowing below 0 (4 - 2 * 4 < 0) is UB
+    evalRvalue [.init (.ptr ptrAt4 8), .init (.scalar ⟨neg2Bits, 8⟩)]
+      (.binaryOp .offset lhsOp rhsOp) mem16 u32PtrDecl = .ub ∧
+    -- 5. Signed isize overflow (count * stride >= 2^63) is UB
+    evalBinOpOffset { allocId := allocId, offsetBytes := 0 } 8
+      ⟨isizeHalfMod, 8⟩ 1 (.some 16) = .none ∧
+    -- 6. Disabled borrow tag on pointer operand is UB
+    evalRvalue [.init (.ptr { allocId := 9, offsetBytes := 0 } 8), .init (.scalar ⟨0, 8⟩)]
+      (.binaryOp .offset lhsOp rhsOp)
+      { mem16 with borrows := [{ tag := 9, targetLocal := 0, targetProjection := .nil, perm := .disabled }] }
+      u32PtrDecl = .ub := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/--
+**Theorem L3.21 (`mir_structural_completeness_brief_1_4_corresponds`)**:
+Universal characterization of the `BRIEF-1.4` structural completeness constructs:
+1. `StatementKind.backwardIncompatibleDropHint` steps as a no-op advancing `stmtIdx`;
+2. `ProjectionElem.unwrapUnsafeBinder` and `Rvalue.wrapUnsafeBinder` act as
+   transparent value identities in `readProjectedValue`, `writeProjectedValue`,
+   and `evalRvalue`;
+3. `writeProjectedValue` on `ProjectionElem.subslice` splices in-bounds subslice
+   aggregates and faults with `.ub` on length mismatch or out-of-bounds indices;
+4. `evalRvalue` evaluates `AggregateKind.closure` to `Value.aggregate 0 vals`;
+5. `Rvalue.discriminant` returns `0` (`ScalarInt` `⟨0, 8⟩`) on single-variant
+   non-aggregate values (`Value.unit`, `Value.scalar`, and `Value.ptr`).
+-/
+theorem mir_structural_completeness_brief_1_4_corresponds
+    (s : MachineState) (dropPlace : Place) (span : String)
+    (locals : List LocalSlot) (v newVal v0 v1 v2 v3 w1 w2 : Value)
+    (binderTy : Ty) (rest : List ProjectionElem)
+    (op : Operand) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (closureDefPath : DefPath) (ops : List Operand)
+    (sc : ScalarVal) (ptrVal : ProvenancePtr) (ptrSz : Nat) :
+    let p0 : Place := { local_ := 0, projection := .nil }
+    -- 1. StatementKind.backwardIncompatibleDropHint steps as a no-op
+    evalStmt s { kind := .backwardIncompatibleDropHint dropPlace, span := span } =
+      MirStepNode.step (advanceStmt s s.frame.locals) ∧
+    -- 2. ProjectionElem.unwrapUnsafeBinder and Rvalue.wrapUnsafeBinder are transparent identities
+    readProjectedValue locals v (.unwrapUnsafeBinder binderTy :: rest) =
+      readProjectedValue locals v rest ∧
+    writeProjectedValue locals v (.unwrapUnsafeBinder binderTy :: rest) newVal =
+      writeProjectedValue locals v rest newVal ∧
+    evalRvalue locals (.wrapUnsafeBinder op binderTy) mem localDecls layouts =
+      evalRvalue locals (.use op) mem localDecls layouts ∧
+    -- 3. writeProjectedValue on ProjectionElem.subslice (positive splice + negative UB)
+    writeProjectedValue locals (.aggregate 0 [v0, v1, v2, v3])
+      [.subslice 1 3 false] (.aggregate 0 [w1, w2]) =
+      .ok (.aggregate 0 [v0, w1, w2, v3]) ∧
+    writeProjectedValue locals (.aggregate 0 [v0, v1, v2, v3])
+      [.subslice 1 1 true] (.aggregate 0 [w1, w2]) =
+      .ok (.aggregate 0 [v0, w1, w2, v3]) ∧
+    writeProjectedValue locals (.aggregate 0 [v0, v1, v2, v3])
+      [.subslice 1 3 false] (.aggregate 0 [w1]) = .ub ∧
+    writeProjectedValue locals (.aggregate 0 [v0, v1])
+      [.subslice 2 2 true] (.aggregate 0 []) = .ub ∧
+    -- 4. AggregateKind.closure evaluates identically to AggregateKind.tuple
+    evalRvalue locals (.aggregate (.closure closureDefPath) ops) mem localDecls layouts =
+      evalRvalue locals (.aggregate .tuple ops) mem localDecls layouts ∧
+    -- 5. Rvalue.discriminant returns 0 on Value.unit, Value.scalar, and Value.ptr
+    evalRvalue [.init .unit] (.discriminant p0) mem localDecls layouts =
+      .ok (.scalar ⟨0, 8⟩) [.init .unit] mem ∧
+    evalRvalue [.init (.scalar sc)] (.discriminant p0) mem localDecls layouts =
+      .ok (.scalar ⟨0, 8⟩) [.init (.scalar sc)] mem ∧
+    evalRvalue [.init (.ptr ptrVal ptrSz)] (.discriminant p0) mem localDecls layouts =
+      .ok (.scalar ⟨0, 8⟩) [.init (.ptr ptrVal ptrSz)] mem := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Correspondence.V2026_06_01.L3_PlacesAndBasicMem

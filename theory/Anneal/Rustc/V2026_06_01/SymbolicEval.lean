@@ -1021,13 +1021,7 @@ def evalRvalueSymTree
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
-            .leaf (.ok
-              (.ptr
-                { ptrVal with
-                  offsetBytes := Nat.add ptrVal.offsetBytes offsetSc.bits }
-                sz)
-              locals₂
-              mem)
+            .leaf (evalPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp ptrVal sz offsetSc)
           | _ => .leaf .unsupported
         | _, _ => .leaf .unsupported
       | .ub => .leaf .ub
