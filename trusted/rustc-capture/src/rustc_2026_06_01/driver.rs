@@ -540,6 +540,9 @@ fn collect_local_source_digests(
     tcx: TyCtxt<'_>,
     is_primary_package: bool,
 ) -> Vec<(String, String)> {
+    if !is_primary_package {
+        return Vec::new();
+    }
     let source_map = tcx.sess.source_map();
     let files = source_map.files();
     let cwd = env::current_dir().ok();

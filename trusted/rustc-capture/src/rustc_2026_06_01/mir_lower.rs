@@ -113,14 +113,21 @@ pub fn canonical_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
         }
     } else {
         let crate_name = tcx.crate_name(def_id.krate).to_string();
-        if (crate_name == "core" || crate_name == "alloc")
-            && let Some(rest) = raw.strip_prefix("std::")
-        {
-            format!("{crate_name}::{rest}")
-        } else if !raw.starts_with(&format!("{crate_name}::")) && !raw.starts_with('<') {
-            format!("{crate_name}::{raw}")
+        let normalized = if crate_name == "core" || crate_name == "alloc" {
+            let s = if let Some(rest) = raw.strip_prefix("std::") {
+                format!("{crate_name}::{rest}")
+            } else {
+                raw
+            };
+            s.replace("<std::", &format!("<{crate_name}::"))
+                .replace(" as std::", &format!(" as {crate_name}::"))
         } else {
             raw
+        };
+        if !normalized.starts_with(&format!("{crate_name}::")) && !normalized.starts_with('<') {
+            format!("{crate_name}::{normalized}")
+        } else {
+            normalized
         }
     }
 }

@@ -1503,12 +1503,6 @@ mod tests {
         fs::create_dir_all(crate_b_dir.join("src")).expect("create crate_b/src");
 
         fs::write(
-            root.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"crate_a\", \"crate_b\"]\nresolver = \"2\"\n",
-        )
-        .expect("write workspace Cargo.toml");
-
-        fs::write(
             crate_b_dir.join("Cargo.toml"),
             "[package]\nname = \"crate_b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
         )
@@ -1526,19 +1520,19 @@ mod tests {
         .expect("write crate_a/Cargo.toml");
         fs::write(
             crate_a_dir.join("src/lib.rs"),
-            "#![no_std]\npub fn slice_len_plus_helper(s: &[u8], extra: usize) -> usize {\n    let len_fn: fn(&[u8]) -> usize = <[u8]>::len;\n    crate_b::helper_add(len_fn(s) + (s.as_ptr() as usize), extra)\n}\n",
+            "use std::ops::{Range, RangeBounds};\npub fn slice_len_plus_helper(s: &[u8], extra: usize) -> usize {\n    let len_fn: fn(&[u8]) -> usize = <[u8]>::len;\n    let r: Range<usize> = 0..512;\n    let bonus = RangeBounds::contains(&r, &extra) as usize;\n    crate_b::helper_add(len_fn(s) + (s.as_ptr() as usize) + bonus, extra)\n}\n",
         )
         .expect("write crate_a/src/lib.rs");
 
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root");
         let mut cfg = CaptureDriverConfig::new(&crate_a_dir);
         cfg.manifest_path = Some(crate_a_dir.join("Cargo.toml"));
         let wrapper = resolve_rustc_wrapper(&cfg);
         if !wrapper.is_file() {
             // Ensure `anneal-rustc-capture` is built if running unit test standalone.
-            let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .and_then(Path::parent)
-                .expect("repo root");
             let status = Command::new("cargo")
                 .args(["build", "-p", "anneal-rustc-capture"])
                 .current_dir(repo_root)
@@ -1631,6 +1625,44 @@ mod tests {
                 .exists(),
             "sysroot core must not generate Verify/Core obligations"
         );
+
+        // 5. Verify that every generated `.anneal/generated/Mir/**/*.lean` module
+        // (`Mir/CrateA/*`, `Mir/CrateB/*`, `Mir/Core/*`) compiles cleanly in the
+        // Lean 4 kernel (`lean`).
+        let examples_dir = repo_root.join("examples");
+        let lean_lib_dir = examples_dir.join(".lake/build/lib/lean");
+        let lean_bin = if let Ok(home) = std::env::var("HOME") {
+            let elan_lean = PathBuf::from(home).join(".elan/bin/lean");
+            if elan_lean.exists() {
+                elan_lean
+            } else {
+                PathBuf::from("lean")
+            }
+        } else {
+            PathBuf::from("lean")
+        };
+        let gen_dir = crate_a_dir.join(".anneal/generated");
+        let lean_path_env = format!("{}:{}", lean_lib_dir.display(), gen_dir.display());
+        for mir_file in &scaffold_report.generated_mir_files {
+            let dst_olean = mir_file.with_extension("olean");
+            let out = Command::new(&lean_bin)
+                .current_dir(&gen_dir)
+                .env("LEAN_PATH", &lean_path_env)
+                .arg("-R")
+                .arg(&gen_dir)
+                .arg("-o")
+                .arg(&dst_olean)
+                .arg(mir_file)
+                .output()
+                .expect("compile scaffolded Mir module with lean");
+            assert!(
+                out.status.success(),
+                "lean failed on {}:\nstdout: {}\nstderr: {}",
+                mir_file.display(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
 
         let _ = fs::remove_dir_all(&root);
     }
