@@ -440,6 +440,10 @@ theorem mir_evalRvalue_reifyFnPointer_and_fnPtrToPtr_chain
     let fnItemTy : Ty := { kind := .fnDef defPath typeArgs, layoutIdx := 0 }
     let fnPtrKind : RigidTy := .fnPtr sigInputs sigOut sigSafety sigAbi
     let fnPtrTy : Ty := { kind := fnPtrKind, layoutIdx := 0 }
+    let safeFnPtrKind : RigidTy := .fnPtr sigInputs sigOut .safe sigAbi
+    let safeFnPtrTy : Ty := { kind := safeFnPtrKind, layoutIdx := 0 }
+    let unsafeFnPtrKind : RigidTy := .fnPtr sigInputs sigOut .unsafe_ sigAbi
+    let unsafeFnPtrTy : Ty := { kind := unsafeFnPtrKind, layoutIdx := 0 }
     let intrinsicFnPtrTy : Ty :=
       { kind := .fnPtr sigInputs sigOut sigSafety .rustIntrinsic, layoutIdx := 0 }
     let rawConstUnitTy : Ty := { kind := .rawPtr .not (.tuple .nil), layoutIdx := 0 }
@@ -451,8 +455,14 @@ theorem mir_evalRvalue_reifyFnPointer_and_fnPtrToPtr_chain
         defPath := defPath
         typeArgs := typeArgs
         fnSig := .some fnPtrKind }
+    let expectedSafeEntry : FnPtrEntry :=
+      { allocId := fnPtrAllocBase
+        defPath := defPath
+        typeArgs := typeArgs
+        fnSig := .some safeFnPtrKind }
     let expectedPtr : ProvenancePtr := { allocId := fnPtrAllocBase, offsetBytes := 0 }
     let memAfterReify : Memory := { emptyMemory with fnPtrs := [expectedEntry] }
+    let memAfterSafeReify : Memory := { emptyMemory with fnPtrs := [expectedSafeEntry] }
     (evalRvalue
         locals
         (.cast (.pointerCoercion "ReifyFnPointer") fnConstOp fnPtrTy)
@@ -460,9 +470,19 @@ theorem mir_evalRvalue_reifyFnPointer_and_fnPtrToPtr_chain
       .ok (.ptr expectedPtr 8) locals memAfterReify) ∧
     (evalRvalue
         locals
-        (.cast (.pointerCoercion "ReifyFnPointer(Safe)") fnConstOp fnPtrTy)
+        (.cast (.pointerCoercion "ReifyFnPointer(Safe)") fnConstOp safeFnPtrTy)
         emptyMemory =
-      .ok (.ptr expectedPtr 8) locals memAfterReify) ∧
+      .ok (.ptr expectedPtr 8) locals memAfterSafeReify) ∧
+    (evalRvalue
+        locals
+        (.cast (.pointerCoercion "ReifyFnPointer(Safe)") fnConstOp unsafeFnPtrTy)
+        emptyMemory =
+      .ub) ∧
+    (evalRvalue
+        locals
+        (.cast (.pointerCoercion "ReifyFnPointer(Unsafe)") fnConstOp safeFnPtrTy)
+        emptyMemory =
+      .ub) ∧
     (evalRvalue
         locals
         (.cast (.pointerCoercion "ReifyFnPointer") fnConstOp intrinsicFnPtrTy)
@@ -493,19 +513,35 @@ theorem mir_evalRvalue_reifyFnPointer_and_fnPtrToPtr_chain
       .ub) := by
   have hReify1 : isReifyFnPointerCoercion "ReifyFnPointer" = true := by decide
   have hReify2 : isReifyFnPointerCoercion "ReifyFnPointer(Safe)" = true := by decide
+  have hReify3 : isReifyFnPointerCoercion "ReifyFnPointer(Unsafe)" = true := by decide
   have hNeUnsafe1 : stringEq "ReifyFnPointer" "UnsafeFnPointer" = false := by decide
   have hNeUnsafe2 : stringEq "ReifyFnPointer(Safe)" "UnsafeFnPointer" = false := by decide
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
-  · simp [evalRvalue, evalReifyFnPointer, hReify1, hNeUnsafe1, hNotIntrinsic, emptyMemory,
-      extractFnItemTarget?, checkCalleeSig,
+  have hNeUnsafe3 : stringEq "ReifyFnPointer(Unsafe)" "UnsafeFnPointer" = false := by decide
+  have hSafeCompat1 :
+      reifyCoercionSafetyCompatible "ReifyFnPointer" sigSafety = true := by
+    simp [reifyCoercionSafetyCompatible]
+    rfl
+  have hSafeCompat2 :
+      reifyCoercionSafetyCompatible "ReifyFnPointer(Safe)" .safe = true := by decide
+  have hSafeCompat3 :
+      reifyCoercionSafetyCompatible "ReifyFnPointer(Safe)" .unsafe_ = false := by decide
+  have hSafeCompat4 :
+      reifyCoercionSafetyCompatible "ReifyFnPointer(Unsafe)" .safe = false := by decide
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · simp [evalRvalue, evalReifyFnPointer, hReify1, hNeUnsafe1, hNotIntrinsic,
+      hSafeCompat1, emptyMemory, extractFnItemTarget?, checkCalleeSig,
       findFnPtrEntry?, nextFnPtrAllocId, evalOperand, evalConstValue]
-  · simp [evalRvalue, evalReifyFnPointer, hReify2, hNeUnsafe2, hNotIntrinsic, emptyMemory,
-      extractFnItemTarget?, checkCalleeSig,
+  · simp [evalRvalue, evalReifyFnPointer, hReify2, hNeUnsafe2, hNotIntrinsic,
+      hSafeCompat2, emptyMemory, extractFnItemTarget?, checkCalleeSig,
       findFnPtrEntry?, nextFnPtrAllocId, evalOperand, evalConstValue]
+  · simp [evalRvalue, evalReifyFnPointer, hReify2, hNeUnsafe2, hNotIntrinsic,
+      hSafeCompat3, evalOperand, evalConstValue]
+  · simp [evalRvalue, evalReifyFnPointer, hReify3, hNeUnsafe3, hNotIntrinsic,
+      hSafeCompat4, evalOperand, evalConstValue]
   · simp [evalRvalue, evalReifyFnPointer, hReify1, hNeUnsafe1,
       evalOperand, evalConstValue]
   · simp [evalRvalue, evalFnPtrToPtr, evalOperand, get?, readProjectedValue,
-      isThinRawPtrTy, emptyMemory, lookupBorrow, lookupFnPtr]
+      isThinRawPtrTy, emptyMemory, lookupBorrow, lookupFnPtr, hNotIntrinsic]
   · simp [evalRvalue, evalOperand, get?, readProjectedValue]
   · simp [evalRvalue, evalOperand, get?, readProjectedValue]
   · simp [evalRvalue, evalFnPtrToPtr, evalOperand, get?, readProjectedValue,
@@ -550,8 +586,15 @@ theorem mir_evalRvalue_reifyFnPointer_callee_sig_and_unsafeFnPointer_corresponds
         defPath := defPath
         typeArgs := .nil
         fnSig := .some unsafeFnKind }
+    let intrinsicEntry : FnPtrEntry :=
+      { allocId := fnPtrAllocBase
+        defPath := defPath
+        typeArgs := .nil
+        fnSig := .some (.fnPtr [.uint .u64] (.uint .u64) .safe .rustIntrinsic) }
+    let rawConstUnitTy : Ty := { kind := .rawPtr .not (.tuple .nil), layoutIdx := 0 }
     let expectedPtr : ProvenancePtr := { allocId := fnPtrAllocBase, offsetBytes := 0 }
     let memWithSafe : Memory := { emptyMemory with fnPtrs := [safeEntry] }
+    let memWithIntrinsic : Memory := { emptyMemory with fnPtrs := [intrinsicEntry] }
     (checkCalleeSig mem.callees defPath sigInputs sigOut sigAbi = false →
       evalRvalue
         locals
@@ -567,21 +610,32 @@ theorem mir_evalRvalue_reifyFnPointer_callee_sig_and_unsafeFnPointer_corresponds
         (.cast (.pointerCoercion "UnsafeFnPointer") (.copy ⟨0, .nil⟩) safeFnTy)
         memWithSafe =
       .ub) ∧
+    (evalRvalue
+        [.init (.ptr expectedPtr 8)]
+        (.cast .fnPtrToPtr (.copy ⟨0, .nil⟩) rawConstUnitTy)
+        memWithIntrinsic =
+      .ub) ∧
     (fnEntryCompatibleWithCallSite unsafeEntry 1 (.some safeFnTy) = false) := by
   have hReify : isReifyFnPointerCoercion "ReifyFnPointer" = true := by decide
   have hReifyUnsafe : isReifyFnPointerCoercion "UnsafeFnPointer" = true := by decide
   have hEqUnsafe : stringEq "UnsafeFnPointer" "UnsafeFnPointer" = true := by decide
-  refine ⟨?_, ?_, ?_, ?_⟩
+  have hSafeCompat :
+      reifyCoercionSafetyCompatible "ReifyFnPointer" sigSafety = true := by
+    simp [reifyCoercionSafetyCompatible]
+    rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
   · intro hSigFalse
     have hNeUnsafe : stringEq "ReifyFnPointer" "UnsafeFnPointer" = false := by decide
-    simp [evalRvalue, evalReifyFnPointer, hReify, hNeUnsafe, hNotIntrinsic, hSigFalse,
-      extractFnItemTarget?, evalOperand, evalConstValue]
+    simp [evalRvalue, evalReifyFnPointer, hReify, hNeUnsafe, hNotIntrinsic,
+      hSafeCompat, hSigFalse, extractFnItemTarget?, evalOperand, evalConstValue]
   · simp [evalRvalue, evalReifyFnPointer, hReifyUnsafe, hEqUnsafe, evalUnsafeFnPointer,
       evalOperand, get?, readProjectedValue, emptyMemory, lookupBorrow,
       lookupFnPtr, callConvEq, rigidTyListEq, rigidTyEq,
       rigidTyListEqAux, rigidTyEqAux, uintTyEq]
   · simp [evalRvalue, evalReifyFnPointer, hReifyUnsafe, hEqUnsafe, evalUnsafeFnPointer,
       evalOperand, get?, readProjectedValue]
+  · simp [evalRvalue, evalFnPtrToPtr, evalOperand, get?, readProjectedValue,
+      isThinRawPtrTy, emptyMemory, lookupBorrow, lookupFnPtr, callConvEq]
   · rfl
 
 /--

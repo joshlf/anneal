@@ -1843,12 +1843,12 @@ def calleeParamTysMatch : List RigidTy → List LocalDecl → Bool
       (calleeParamTysMatch restInputs restDecls)
 
 /--
-Validate that a callee's `localDecls` (when populated with at least
-`argCount + 1` declarations for `_0` and `_1..=argCount`) match the expected
-function-pointer parameter types `fnInputs` and return type `fnOutput`.
+Validate that a callee's `localDecls` (when non-empty) has at least `argCount`
+parameter declarations after `_0` and matches the expected function-pointer
+parameter types `fnInputs` and return type `fnOutput`.
 
-When `localDecls` is empty or has fewer than `argCount + 1` declarations (as in
-synthetic stub bodies that omit `localDecls`), returns `true`.
+When `localDecls` is `.nil` (as in synthetic stub bodies that omit
+`localDecls`), returns `true`.
 
 Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -1867,12 +1867,55 @@ def calleeLocalDeclsCompatible
   match localDecls with
   | .nil => true
   | retDecl :: paramDecls =>
-    match Nat.ble argCount (length paramDecls) with
-    | false => true
-    | true =>
-      Bool.and
+    Bool.and
+      (Nat.ble argCount (length paramDecls))
+      (Bool.and
         (rigidTyEq fnOutput retDecl.ty.kind)
-        (calleeParamTysMatch fnInputs paramDecls)
+        (calleeParamTysMatch fnInputs paramDecls))
+
+/--
+Check whether an explicit `ReifyFnPointer(Safety)` or `ClosureFnPointer(Safety)`
+coercion tag is compatible with the target function-pointer `Safety` qualifier
+`fnSafety`.
+
+Unparameterized `"ReifyFnPointer"` and `"ClosureFnPointer"` tags accept both
+`.safe` and `.unsafe_`; `"ReifyFnPointer(Safe)"` / `"ClosureFnPointer(Safe)"`
+require `fnSafety = .safe`; `"ReifyFnPointer(Unsafe)"` /
+`"ClosureFnPointer(Unsafe)"` require `fnSafety = .unsafe_`.
+
+Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L18-L41>
+
+> "pub enum PointerCoercion {
+>     /// Go from a fn-item type to a fn-pointer type.
+>     ReifyFnPointer(Safety),
+>
+>     /// Go from a safe fn pointer to an unsafe fn pointer.
+>     UnsafeFnPointer,
+>
+>     /// Go from a non-capturing closure to a fn pointer or an unsafe fn pointer.
+>     /// It cannot convert a closure that requires unsafe.
+>     ClosureFnPointer(Safety),"
+-/
+def reifyCoercionSafetyCompatible
+    (coercionKind : String)
+    (fnSafety : Safety) :
+    Bool :=
+  match
+    Bool.or
+      (stringEq coercionKind "ReifyFnPointer(Safe)")
+      (stringEq coercionKind "ClosureFnPointer(Safe)")
+  with
+  | true => safetyEq fnSafety .safe
+  | false =>
+    match
+      Bool.or
+        (stringEq coercionKind "ReifyFnPointer(Unsafe)")
+        (stringEq coercionKind "ClosureFnPointer(Unsafe)")
+    with
+    | true => safetyEq fnSafety .unsafe_
+    | false => true
 
 /--
 Validate that a linked callee `p` in `callees` (when present) is compatible with
@@ -2038,10 +2081,14 @@ def evalReifyFnPointer
       | false => .ub
       | true =>
         match targetTy.kind with
-        | .fnPtr fnInputs fnOutput _ fnAbi =>
-          match callConvEq fnAbi .rustIntrinsic with
-          | true => .ub
-          | false =>
+        | .fnPtr fnInputs fnOutput fnSafety fnAbi =>
+          match
+            Bool.and
+              (Bool.not (callConvEq fnAbi .rustIntrinsic))
+              (reifyCoercionSafetyCompatible coercionKind fnSafety)
+          with
+          | false => .ub
+          | true =>
             match extractFnItemTarget? (operandTy localDecls layouts op) with
             | .some (defPath, typeArgs) =>
               match
@@ -2071,8 +2118,9 @@ to a thin raw pointer (`*const T` or `*mut T`), preserving its `ProvenancePtr`
 `CastKind.pointerExposeProvenance` casts succeed deterministically.
 
 Faults with `.ub` if `targetTy` is not a thin raw pointer, if `op`'s known
-`operandTy` is not `RigidTy.fnPtr`, or if `op` does not evaluate to an 8-byte
-function pointer at offset `0` (disjoint from stack borrows in `mem.borrows`).
+`operandTy` is not `RigidTy.fnPtr` with a non-intrinsic `CallConv`, or if `op`
+does not evaluate to an 8-byte function pointer at offset `0` (disjoint from
+stack borrows in `mem.borrows`).
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -2101,7 +2149,8 @@ def evalFnPtrToPtr
     let validSrcTy :=
       match operandTy localDecls layouts op with
       | .none => true
-      | .some { kind := .fnPtr _ _ _ _, .. } => true
+      | .some { kind := .fnPtr _ _ _ srcAbi, .. } =>
+        Bool.not (callConvEq srcAbi .rustIntrinsic)
       | .some _ => false
     let validPtr :=
       Bool.and
@@ -2115,7 +2164,12 @@ def evalFnPtrToPtr
              | .nil => isFnPtrAllocId ptrVal.allocId
              | _ :: _ =>
                match lookupFnPtr mem.fnPtrs ptrVal.allocId with
-               | .some _ => true
+               | .some entry =>
+                 match entry.fnSig with
+                 | .none => true
+                 | .some (.fnPtr _ _ _ sigAbi) =>
+                   Bool.not (callConvEq sigAbi .rustIntrinsic)
+                 | .some _ => false
                | .none => false))
     match Bool.and validTargetTy (Bool.and validSrcTy validPtr) with
     | true => .ok (.ptr ptrVal 8) locals' mem
