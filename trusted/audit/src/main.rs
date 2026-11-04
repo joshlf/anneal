@@ -73,9 +73,6 @@ fn resolve_checkout(explicit: Option<PathBuf>) -> Result<PathBuf, (u8, String)> 
     if let Some(root) = explicit {
         return Ok(root);
     }
-    if Path::new("trusted/lean/foundation-lock.json").is_file() {
-        return Ok(PathBuf::from("."));
-    }
     if let Ok(exe) = env::current_exe()
         && let Some(tc_root) = exe.parent().and_then(Path::parent)
     {
@@ -91,6 +88,9 @@ fn resolve_checkout(explicit: Option<PathBuf>) -> Result<PathBuf, (u8, String)> 
             .is_file()
     {
         return Ok(workspace_root.to_path_buf());
+    }
+    if Path::new("trusted/lean/foundation-lock.json").is_file() {
+        return Ok(PathBuf::from("."));
     }
     Ok(PathBuf::from("."))
 }

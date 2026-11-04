@@ -84,21 +84,23 @@ impl TempFixture {
         let root = dir.path().to_path_buf();
         fs::create_dir_all(root.join("trusted/audit")).unwrap();
         fs::create_dir_all(root.join("trusted/lean")).unwrap();
-        fs::copy(
-            checkout.join("trusted/lean/lean-toolchain"),
-            root.join("trusted/lean/lean-toolchain"),
-        )
-        .unwrap();
-        fs::copy(
-            checkout.join("trusted/lean/foundation-lock.json"),
-            root.join("trusted/lean/foundation-lock.json"),
-        )
-        .unwrap();
-        fs::copy(
-            checkout.join("trusted/audit/TrustedBoundary.lean"),
-            root.join("trusted/audit/TrustedBoundary.lean"),
-        )
-        .unwrap();
+        fs::create_dir_all(root.join("trusted/rustc-capture")).unwrap();
+        fs::create_dir_all(root.join("trusted/cargo-anneal")).unwrap();
+        for rel in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "flake.nix",
+            "flake.lock",
+            "trusted/root-manifest.sha256",
+            "trusted/audit/Cargo.toml",
+            "trusted/rustc-capture/Cargo.toml",
+            "trusted/cargo-anneal/Cargo.toml",
+            "trusted/lean/lean-toolchain",
+            "trusted/lean/foundation-lock.json",
+            "trusted/audit/TrustedBoundary.lean",
+        ] {
+            fs::copy(checkout.join(rel), root.join(rel)).unwrap();
+        }
         fs::write(
             root.join("trusted/lean/Trusted.lean"),
             source.unwrap_or(HEADER).as_bytes(),
@@ -265,7 +267,7 @@ fn audits_positive_fixture_under_hostile_ambient_paths() {
         .filter_map(Json::as_str)
         .collect();
     let expected_axioms: BTreeSet<&str> =
-        ["Classical.choice", "Quot.sound", "propext"]
+        ["Quot.sound", "propext"]
             .into_iter()
             .collect();
     assert!(inferred_deps.iter().any(|n| n.contains("instWrap")));
@@ -946,10 +948,22 @@ fn rejects_cargo_workspace_members_and_path_deps_outside_trusted() {
     );
     fs::remove_file(fix.root.join("Cargo.lock")).unwrap();
 
-    // `trusted/root-manifest.sha256` verification and mismatch detection.
+    // `trusted/root-manifest.sha256` verification, unconditional presence, and
+    // mismatch detection.
     fs::copy(checkout.join("Cargo.lock"), fix.root.join("Cargo.lock")).unwrap();
     fs::copy(checkout.join("flake.nix"), fix.root.join("flake.nix")).unwrap();
     fs::copy(checkout.join("flake.lock"), fix.root.join("flake.lock")).unwrap();
+    fs::remove_file(fix.root.join("trusted/root-manifest.sha256")).unwrap();
+    let err_missing_manifest = fix
+        .check_expected(Some(1), Some("cargo-boundary"), Some(false))
+        .unwrap_err();
+    assert!(
+        err_missing_manifest
+            .message
+            .contains("root-manifest.sha256"),
+        "unexpected error: {err_missing_manifest}"
+    );
+
     fs::copy(
         checkout.join("trusted/root-manifest.sha256"),
         fix.root.join("trusted/root-manifest.sha256"),
@@ -977,7 +991,7 @@ fn rejects_cargo_workspace_members_and_path_deps_outside_trusted() {
 fn enforces_crate_verification_mir_crate_and_exact_theorem_type() {
     let hm = header_with_macro();
     let fix = TempFixture::new(Some(&format!(
-        "{hm}namespace Trusted\n@[vetted] structure Crate where tag : Nat\n@[vetted] def CrateTheorem (_ : Crate) : Prop := True\nend Trusted\n"
+        "{hm}namespace Trusted\n@[vetted] structure EmittedArtifact where\n  path : String\n  contents : String\n  expected : String\n@[vetted] structure Crate where\n  tag : Nat\n  artifacts : List EmittedArtifact := []\n@[vetted] def CrateTheorem (_ : Crate) : Prop := True\nend Trusted\n"
     )));
     fs::create_dir_all(fix.root.join("theory")).unwrap();
     fs::write(
@@ -1001,14 +1015,23 @@ fn enforces_crate_verification_mir_crate_and_exact_theorem_type() {
         crate_dir
     };
 
+    let shared_cache = fix.root.join("shared-prefix-cache");
+    let mut chk_init_cache = Checker::new(&fix.root, None).unwrap();
+    chk_init_cache.build_prefix_cache(&shared_cache).unwrap();
+    let new_cached_checker = || {
+        let mut c = Checker::new(&fix.root, None).unwrap();
+        c.set_prefix_cache_dir(Some(shared_cache.clone()));
+        c
+    };
+
     // 1. Valid crate verification using `Anneal.prove_crate` in Proof.
     let c_ok = write_crate(
         &fix.root,
         "crate-ok",
-        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0 }\nend Mir\n",
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0, artifacts := [{ path := \"src/lib.rs\", contents := \"pub fn id(x: usize) -> usize { x }\\n\", expected := \"pub fn id(x: usize) -> usize { x }\\n\" }] }\nend Mir\n",
         "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
     );
-    let mut chk_ok = Checker::new(&fix.root, None).unwrap();
+    let mut chk_ok = new_cached_checker();
     let rep_ok = chk_ok.verify_crate(&c_ok).unwrap();
     let cv_ok = rep_ok.get("crateVerification").unwrap();
     assert_eq!(
@@ -1024,7 +1047,7 @@ fn enforces_crate_verification_mir_crate_and_exact_theorem_type() {
         "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0 }\nend Mir\n",
         "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : True := True.intro\nend Proof\n",
     );
-    let mut chk_wrong_ty = Checker::new(&fix.root, None).unwrap();
+    let mut chk_wrong_ty = new_cached_checker();
     let err_wrong_ty = chk_wrong_ty.verify_crate(&c_wrong_ty).unwrap_err();
     assert_eq!(err_wrong_ty.code, 1);
     assert_eq!(err_wrong_ty.phase, "audit");
@@ -1041,7 +1064,7 @@ fn enforces_crate_verification_mir_crate_and_exact_theorem_type() {
         "prelude\nimport Trusted\nnamespace Mir\ntheorem crate : True := True.intro\nend Mir\n",
         "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : True := Mir.crate\nend Proof\n",
     );
-    let mut chk_mir_thm = Checker::new(&fix.root, None).unwrap();
+    let mut chk_mir_thm = new_cached_checker();
     let err_mir_thm = chk_mir_thm.verify_crate(&c_mir_thm).unwrap_err();
     assert_eq!(err_mir_thm.code, 1);
     assert_eq!(err_mir_thm.phase, "audit");
@@ -1059,7 +1082,7 @@ fn enforces_crate_verification_mir_crate_and_exact_theorem_type() {
         "prelude\nimport Trusted\nimport Anneal\nnamespace Mir\ndef crate : Trusted.Crate := { tag := Anneal.untrustedTag }\nend Mir\n",
         "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
     );
-    let mut chk_mir_imp = Checker::new(&fix.root, None).unwrap();
+    let mut chk_mir_imp = new_cached_checker();
     let err_mir_imp = chk_mir_imp.verify_crate(&c_mir_imp).unwrap_err();
     assert_eq!(err_mir_imp.code, 1);
     assert_eq!(err_mir_imp.phase, "preflight");
@@ -1076,7 +1099,7 @@ fn enforces_crate_verification_mir_crate_and_exact_theorem_type() {
         "prelude\nimport Trusted\nnamespace Mir\ndef crate.{u} : Trusted.Crate := let _ : Sort (u + 1) := PUnit.{u + 1}; { tag := 0 }\nend Mir\n",
         "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate.{0} := Anneal.prove_crate Mir.crate.{0}\nend Proof\n",
     );
-    let mut chk_mir_univ = Checker::new(&fix.root, None).unwrap();
+    let mut chk_mir_univ = new_cached_checker();
     let err_mir_univ = chk_mir_univ.verify_crate(&c_mir_univ).unwrap_err();
     assert_eq!(err_mir_univ.code, 1);
     assert_eq!(err_mir_univ.phase, "audit");
@@ -1087,14 +1110,15 @@ fn enforces_crate_verification_mir_crate_and_exact_theorem_type() {
         "unexpected error: {err_mir_univ}"
     );
 
-    // 6. `Mir.crate` reaching `Classical.choice` is rejected.
+    // 6. `Mir.crate` or `Proof.verify_crate` reaching `Classical.choice` is
+    // rejected.
     let c_mir_ax = write_crate(
         &fix.root,
         "crate-mir-ax",
-        "prelude\nimport Trusted\nnamespace Mir\nnoncomputable def crate : Trusted.Crate := { tag := Classical.choice ⟨0⟩ }\nend Mir\n",
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := let _ : True := Classical.choice ⟨True.intro⟩; { tag := 0 }\nend Mir\n",
         "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
     );
-    let mut chk_mir_ax = Checker::new(&fix.root, None).unwrap();
+    let mut chk_mir_ax = new_cached_checker();
     let err_mir_ax = chk_mir_ax.verify_crate(&c_mir_ax).unwrap_err();
     assert_eq!(err_mir_ax.code, 1);
     assert_eq!(err_mir_ax.phase, "audit");
@@ -1103,6 +1127,167 @@ fn enforces_crate_verification_mir_crate_and_exact_theorem_type() {
             .message
             .contains("unapproved axiom Classical.choice from Init.Prelude"),
         "unexpected error: {err_mir_ax}"
+    );
+
+    let c_proof_choice = write_crate(
+        &fix.root,
+        "crate-proof-choice",
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0, artifacts := [{ path := \"src/lib.rs\", contents := \"pub fn id(x: usize) -> usize { x }\\n\", expected := \"pub fn id(x: usize) -> usize { x }\\n\" }] }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := let _ : Nat := Classical.choice ⟨0⟩; Anneal.prove_crate Mir.crate\nend Proof\n",
+    );
+    let mut chk_proof_choice = new_cached_checker();
+    let err_proof_choice =
+        chk_proof_choice.verify_crate(&c_proof_choice).unwrap_err();
+    assert_eq!(err_proof_choice.code, 1);
+    assert_eq!(err_proof_choice.phase, "audit");
+    assert!(
+        err_proof_choice
+            .message
+            .contains("unapproved axiom Classical.choice from Init.Prelude"),
+        "unexpected error: {err_proof_choice}"
+    );
+
+    // 6b. `Trusted.EmittedArtifact` on-disk byte verification: matching file
+    // succeeds; drifted file, `..` path traversal, non-literal `expected`,
+    // `contents != expected`, dead `let _ := Trusted.EmittedArtifact.mk`,
+    // empty `artifacts := []`, and missing `src/lib.rs` are rejected.
+    let c_art = write_crate(
+        &fix.root,
+        "crate-art",
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0, artifacts := [{ path := \"src/lib.rs\", contents := \"pub fn id(x: usize) -> usize { x }\\n\", expected := \"pub fn id(x: usize) -> usize { x }\\n\" }] }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
+    );
+    let mut chk_art_ok = new_cached_checker();
+    let rep_art_ok = chk_art_ok.verify_crate(&c_art).unwrap();
+    assert_eq!(
+        rep_art_ok
+            .get("crateVerification")
+            .and_then(|cv| cv.get("emittedArtifacts")),
+        Some(&json!([[
+            "src/lib.rs",
+            "pub fn id(x: usize) -> usize { x }\n"
+        ]]))
+    );
+
+    fs::write(c_art.join("src/lib.rs"), b"pub fn id(x: usize) -> usize { 0 }\n")
+        .unwrap();
+    let mut chk_art_drift = new_cached_checker();
+    let err_art_drift = chk_art_drift.verify_crate(&c_art).unwrap_err();
+    assert_eq!(err_art_drift.code, 1);
+    assert_eq!(err_art_drift.phase, "artifact-check");
+    assert!(
+        err_art_drift
+            .message
+            .contains("emitted artifact src/lib.rs on disk does not match expected contents in Mir.crate"),
+        "unexpected error: {err_art_drift}"
+    );
+
+    let c_art_traversal = write_crate(
+        &fix.root,
+        "crate-art-traversal",
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0, artifacts := [{ path := \"../crate-ok/src/lib.rs\", contents := \"x\", expected := \"x\" }] }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
+    );
+    let mut chk_art_traversal = new_cached_checker();
+    let err_art_traversal =
+        chk_art_traversal.verify_crate(&c_art_traversal).unwrap_err();
+    assert_eq!(err_art_traversal.code, 1);
+    assert_eq!(err_art_traversal.phase, "artifact-check");
+    assert!(
+        err_art_traversal
+            .message
+            .contains("emitted artifact path must be a normalized crate-relative path"),
+        "unexpected error: {err_art_traversal}"
+    );
+
+    let c_art_nonlit = write_crate(
+        &fix.root,
+        "crate-art-nonlit",
+        "prelude\nimport Trusted\nnamespace Mir\ndef dynStr : String := \"x\"\ndef crate : Trusted.Crate := { tag := 0, artifacts := [{ path := \"src/lib.rs\", contents := \"x\", expected := dynStr }] }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
+    );
+    let mut chk_art_nonlit = new_cached_checker();
+    let err_art_nonlit =
+        chk_art_nonlit.verify_crate(&c_art_nonlit).unwrap_err();
+    assert_eq!(err_art_nonlit.code, 1);
+    assert_eq!(err_art_nonlit.phase, "audit");
+    assert!(
+        err_art_nonlit
+            .message
+            .contains("Trusted.EmittedArtifact path and expected fields in Mir.crate must be string literals"),
+        "unexpected error: {err_art_nonlit}"
+    );
+
+    let c_art_mismatch = write_crate(
+        &fix.root,
+        "crate-art-mismatch",
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0, artifacts := [{ path := \"src/lib.rs\", contents := \"spoof\", expected := \"pub fn id(x: usize) -> usize { x }\\n\" }] }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
+    );
+    let mut chk_art_mismatch = new_cached_checker();
+    let err_art_mismatch =
+        chk_art_mismatch.verify_crate(&c_art_mismatch).unwrap_err();
+    assert_eq!(err_art_mismatch.code, 1);
+    assert_eq!(err_art_mismatch.phase, "audit");
+    assert!(
+        err_art_mismatch
+            .message
+            .contains("Mir.crate contains an EmittedArtifact whose contents and expected literals differ"),
+        "unexpected error: {err_art_mismatch}"
+    );
+
+    let c_art_dead_let = write_crate(
+        &fix.root,
+        "crate-art-dead-let",
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := let _ := Trusted.EmittedArtifact.mk \"src/lib.rs\" \"pub fn id(x: usize) -> usize { x }\\n\" \"pub fn id(x: usize) -> usize { x }\\n\"; { tag := 0, artifacts := [] }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
+    );
+    let mut chk_art_dead_let = new_cached_checker();
+    let err_art_dead_let =
+        chk_art_dead_let.verify_crate(&c_art_dead_let).unwrap_err();
+    assert_eq!(err_art_dead_let.code, 1);
+    assert_eq!(err_art_dead_let.phase, "audit");
+    assert!(
+        err_art_dead_let
+            .message
+            .contains("Mir.crate contains unverified Trusted.EmittedArtifact.mk outside its artifacts list spine"),
+        "unexpected error: {err_art_dead_let}"
+    );
+
+    let c_art_empty = write_crate(
+        &fix.root,
+        "crate-art-empty",
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0, artifacts := [] }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
+    );
+    let mut chk_art_empty = new_cached_checker();
+    let err_art_empty = chk_art_empty.verify_crate(&c_art_empty).unwrap_err();
+    assert_eq!(err_art_empty.code, 1);
+    assert_eq!(err_art_empty.phase, "audit");
+    assert!(
+        err_art_empty
+            .message
+            .contains("Mir.crate must emit at least one Trusted.EmittedArtifact"),
+        "unexpected error: {err_art_empty}"
+    );
+
+    let c_art_no_librs = write_crate(
+        &fix.root,
+        "crate-art-no-librs",
+        "prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := { tag := 0, artifacts := [{ path := \"src/other.rs\", contents := \"// other\\n\", expected := \"// other\\n\" }] }\nend Mir\n",
+        "prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
+    );
+    fs::write(c_art_no_librs.join("src/other.rs"), b"// other\n").unwrap();
+    let mut chk_art_no_librs = new_cached_checker();
+    let err_art_no_librs =
+        chk_art_no_librs.verify_crate(&c_art_no_librs).unwrap_err();
+    assert_eq!(err_art_no_librs.code, 1);
+    assert_eq!(err_art_no_librs.phase, "artifact-check");
+    assert!(
+        err_art_no_librs
+            .message
+            .contains("Mir.crate emittedArtifacts must include src/lib.rs"),
+        "unexpected error: {err_art_no_librs}"
     );
 
     // 7. `--prefix-cache-dir` validates `keySha256` and `artifactDigests`,
@@ -1227,6 +1412,15 @@ fn enforces_vetted_vs_candidate_non_contamination_and_trust_policy() {
         );
     }
 
+    let shared_cache = fix.root.join("shared-prefix-cache");
+    let mut chk_init_cache = Checker::new(&fix.root, None).unwrap();
+    chk_init_cache.build_prefix_cache(&shared_cache).unwrap();
+    let new_cached_checker = || {
+        let mut c = Checker::new(&fix.root, None).unwrap();
+        c.set_prefix_cache_dir(Some(shared_cache.clone()));
+        c
+    };
+
     // 1. Crate using only `@[vetted]` constructor `base` (and general dependent
     // theorem `Anneal.prove_crate Mir.crate`) passes on Stable with zero active
     // candidate features.
@@ -1245,7 +1439,7 @@ fn enforces_vetted_vs_candidate_non_contamination_and_trust_policy() {
         b"prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
     )
     .unwrap();
-    let mut chk_base = Checker::new(&fix.root, None).unwrap();
+    let mut chk_base = new_cached_checker();
     let rep_base = chk_base
         .verify_crate_with_policy(&c_base, Some(ReleaseChannel::Stable), None)
         .unwrap();
@@ -1275,7 +1469,7 @@ fn enforces_vetted_vs_candidate_non_contamination_and_trust_policy() {
     )
     .unwrap();
 
-    let mut chk_ext1 = Checker::new(&fix.root, None).unwrap();
+    let mut chk_ext1 = new_cached_checker();
     let err_ext1 = chk_ext1.verify_crate(&c_ext).unwrap_err();
     assert_eq!(err_ext1.code, 1);
     assert_eq!(err_ext1.phase, "candidate-policy");
@@ -1285,7 +1479,7 @@ fn enforces_vetted_vs_candidate_non_contamination_and_trust_policy() {
             .contains("candidate-trusted feature `mir_semantics` is not enabled")
     );
 
-    let mut chk_ext2 = Checker::new(&fix.root, None).unwrap();
+    let mut chk_ext2 = new_cached_checker();
     let allow_list = vec!["mir_semantics".to_string(), "memory".to_string()];
     let rep_ext2 = chk_ext2
         .verify_crate_with_policy(
@@ -1301,7 +1495,7 @@ fn enforces_vetted_vs_candidate_non_contamination_and_trust_policy() {
         Some(&json!(["memory"]))
     );
 
-    let mut chk_ext3 = Checker::new(&fix.root, None).unwrap();
+    let mut chk_ext3 = new_cached_checker();
     let allow_all = vec!["*".to_string()];
     let err_ext3 = chk_ext3
         .verify_crate_with_policy(
@@ -1338,7 +1532,7 @@ fn enforces_vetted_vs_candidate_non_contamination_and_trust_policy() {
         b"prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem helper (c : Trusted.Crate) : (let _ : Prop := Trusted.evalExt Trusted.ExtPayload.mk; Trusted.CrateTheorem c) :=\n  match c with\n  | .base => True.intro\n  | .other => True.intro\n  | .ext _ => True.intro\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
     )
     .unwrap();
-    let mut chk_splitter = Checker::new(&fix.root, None).unwrap();
+    let mut chk_splitter = new_cached_checker();
     let err_splitter = chk_splitter
         .verify_crate_with_policy(
             &c_splitter,
@@ -1351,4 +1545,168 @@ fn enforces_vetted_vs_candidate_non_contamination_and_trust_policy() {
         "unexpected splitter error: {err_splitter}"
     );
     assert_eq!(err_splitter.phase, "candidate-policy");
+
+    // 4. Equational theorem laundering:
+    // - Part A: A `@[vetted]` theorem referencing the compiler-generated
+    //   equational theorem (`CrateTheorem.eq_1`) of a guarded declaration
+    //   outside a `Trusted.candidate` guard is rejected in `"audit"`.
+    let mut f_eq_launder = TempFixture::new(Some(&format!(
+        "{trusted_src}\nnamespace Trusted\n@[vetted] theorem badEq (p : ExtPayload) : CrateTheorem (.ext p) = evalExt p := CrateTheorem.eq_1 p\nend Trusted\n"
+    )));
+    let err_eq_launder = f_eq_launder
+        .check_expected(Some(1), Some("audit"), Some(true))
+        .unwrap_err();
+    assert!(
+        err_eq_launder
+            .message
+            .contains("without a Trusted.candidate guard")
+            || err_eq_launder.message.contains("in its type"),
+        "unexpected error for eq theorem laundering: {err_eq_launder}"
+    );
+
+    // - Part B: A `private def sneak` in `Proof` whose guarded candidate arm is
+    //   only reached via its compiler-generated equational theorem
+    //   `Proof.sneak.eq_1` still activates `mir_semantics` and is rejected on
+    //   Stable.
+    let c_priv_eq = fix.root.join("crate-priv-eq");
+    fs::create_dir_all(c_priv_eq.join("src")).unwrap();
+    fs::create_dir_all(c_priv_eq.join(".anneal")).unwrap();
+    fs::write(
+        c_priv_eq.join("src/lib.rs"),
+        b"pub fn id(x: usize) -> usize { x }\n",
+    )
+    .unwrap();
+    fs::write(
+        c_priv_eq.join(".anneal/Mir.lean"),
+        b"prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := Trusted.Crate.base\nend Mir\n",
+    )
+    .unwrap();
+    fs::write(
+        c_priv_eq.join(".anneal/Proof.lean"),
+        b"prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\nprivate def sneak (c : Trusted.Crate) : Prop :=\n  match c with\n  | .ext p => Trusted.candidate \"mir_semantics\" (Trusted.evalExt p)\n  | _ => True\ntheorem use_sneak_eq : sneak .base = True := sneak.eq_2 Trusted.Crate.base (fun _ h => nomatch h)\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_crate Mir.crate\nend Proof\n",
+    )
+    .unwrap();
+    let mut chk_priv_eq = new_cached_checker();
+    let err_priv_eq = chk_priv_eq
+        .verify_crate_with_policy(
+            &c_priv_eq,
+            Some(ReleaseChannel::Stable),
+            Some(&allow_all),
+        )
+        .unwrap_err();
+    assert_eq!(err_priv_eq.code, 1);
+    assert_eq!(err_priv_eq.phase, "candidate-policy");
+    assert!(
+        err_priv_eq
+            .message
+            .contains("stable release channel forbids candidate-trusted features"),
+        "unexpected error for private eq theorem reachability: {err_priv_eq}"
+    );
+
+    // 5. Cross-candidate feature isolation:
+    // - Part A: A `@[candidate mir_semantics]` declaration referencing a
+    //   `@[candidate memory]` declaration without a `Trusted.candidate
+    //   "memory"` guard is rejected in `"audit"`.
+    let mut f_cross_cand = TempFixture::new(Some(&format!(
+        "{hm}namespace Trusted\n@[candidate memory] def memHelper : Prop := True\n@[candidate mir_semantics] def ownHelper : Prop := memHelper\nend Trusted\n"
+    )));
+    let err_cross_cand = f_cross_cand
+        .check_expected(Some(1), Some("audit"), Some(true))
+        .unwrap_err();
+    assert!(
+        err_cross_cand.message.contains(
+            "references candidate:memory declaration Trusted.memHelper without a Trusted.candidate guard"
+        ),
+        "unexpected error for cross-candidate contamination: {err_cross_cand}"
+    );
+
+    // - Part B: A `@[candidate mir_semantics]` declaration that guards a
+    //   `candidate:memory` constructor arm with `Trusted.candidate "memory"` is
+    //   accepted, and using `evalOwn` on a non-`memory` constructor activates
+    //   only `"mir_semantics"` (not `"memory"`).
+    let cross_ok_src = format!(
+        "{hm}namespace Trusted\n\
+         @[vetted] def candidate (_feature : String) {{α : Sort u}} (x : α) : α := x\n\
+         @[candidate memory] inductive MemPayload where\n  \
+           | mk : MemPayload\n\
+         @[vetted] inductive Crate where\n  \
+           | base : Crate\n  \
+           | @[candidate mir_semantics] own : Crate\n  \
+           | @[candidate memory] mem (p : MemPayload) : Crate\n\
+         @[candidate memory] def evalMem (_ : MemPayload) : Prop := True\n\
+         @[candidate mir_semantics] def evalOwn (c : Crate) : Prop :=\n  \
+           match c with\n  \
+           | .mem p => Trusted.candidate \"memory\" (evalMem p)\n  \
+           | _ => True\n\
+         @[vetted] def CrateTheorem (c : Crate) : Prop :=\n  \
+           match c with\n  \
+           | .own => Trusted.candidate \"mir_semantics\" (evalOwn c)\n  \
+           | .mem p => Trusted.candidate \"memory\" (evalMem p)\n  \
+           | .base => True\n\
+         end Trusted\n"
+    );
+    let fix_cross = TempFixture::new(Some(&cross_ok_src));
+    fs::create_dir_all(fix_cross.root.join("theory")).unwrap();
+    fs::write(
+        fix_cross.root.join("theory/Anneal.lean"),
+        b"prelude\nimport Trusted\nnamespace Anneal\ntheorem prove_own : Trusted.CrateTheorem .own := True.intro\nend Anneal\n",
+    )
+    .unwrap();
+    let c_cross = fix_cross.root.join("crate-cross");
+    fs::create_dir_all(c_cross.join("src")).unwrap();
+    fs::create_dir_all(c_cross.join(".anneal")).unwrap();
+    fs::write(c_cross.join("src/lib.rs"), b"pub fn id(x: usize) -> usize { x }\n")
+        .unwrap();
+    fs::write(
+        c_cross.join(".anneal/Mir.lean"),
+        b"prelude\nimport Trusted\nnamespace Mir\ndef crate : Trusted.Crate := Trusted.Crate.own\nend Mir\n",
+    )
+    .unwrap();
+    fs::write(
+        c_cross.join(".anneal/Proof.lean"),
+        b"prelude\nimport Trusted\nimport Anneal\nimport Mir\nnamespace Proof\ntheorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.prove_own\nend Proof\n",
+    )
+    .unwrap();
+    let mut chk_cross = Checker::new(&fix_cross.root, None).unwrap();
+    let allow_own_only = vec!["mir_semantics".to_string()];
+    let rep_cross = chk_cross
+        .verify_crate_with_policy(
+            &c_cross,
+            Some(ReleaseChannel::Alpha),
+            Some(&allow_own_only),
+        )
+        .unwrap();
+    assert_eq!(
+        rep_cross
+            .get("crateVerification")
+            .and_then(|cv| cv.get("candidateFeatures")),
+        Some(&json!(["mir_semantics"]))
+    );
+
+    // 6. Positional eliminator minor-premise indexing and eta-reduced `.match_N`
+    // telescope alignment:
+    // - An indexed extensible inductive (`Idx : Nat → Type`) assigns `"vetted"`
+    //   to `vCtor`'s minor premise and `"candidate:mir_semantics"` to `cCtor`'s
+    //   minor premise, rejecting a `Trusted.candidate` guard in `vCtor`'s minor
+    //   premise.
+    let mut f_idx_elim = TempFixture::new(Some(&format!(
+        "{hm}namespace Trusted\n\
+         @[vetted] def candidate (_feature : String) {{α : Sort u}} (x : α) : α := x\n\
+         @[vetted] inductive Idx : Nat → Type where\n  \
+           | vCtor : Idx 0\n  \
+           | @[candidate mir_semantics] cCtor : Idx 0\n\
+         @[candidate mir_semantics] def candProp : Prop := True\n\
+         @[vetted] def badIdx (n : Nat) (x : Idx n) : Prop :=\n  \
+           @Idx.casesOn (fun _ _ => Prop) n x (Trusted.candidate \"mir_semantics\" candProp) (Trusted.candidate \"mir_semantics\" candProp)\n\
+         end Trusted\n"
+    )));
+    let err_idx_elim = f_idx_elim
+        .check_expected(Some(1), Some("audit"), Some(true))
+        .unwrap_err();
+    assert!(
+        err_idx_elim
+            .message
+            .contains("is only permitted inside a candidate:mir_semantics eliminator minor premise"),
+        "unexpected error for indexed eliminator minor-premise alignment: {err_idx_elim}"
+    );
 }

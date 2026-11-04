@@ -74,14 +74,17 @@ def expandTrustDeclaration : Lean.Macro := fun stx =>
     match attrsNode.getArgs[0]? with
     | none => (false, mods)
     | some inner =>
-      let (changed, kept) := (inner.getArg 1).getArgs.foldl (init := (false, #[])) fun (chg, acc) elem =>
-        if elem.getKind == `Lean.Parser.Term.attrInstance then
-          let attr := elem.getArg 1
-          if attr.getKind == `Lean.Parser.Attr.simple &&
-              ((attr.getArg 0).getId == `vetted || (attr.getArg 0).getId == `candidate) then
-            (true, acc)
-          else (chg, acc.push elem)
-        else (chg, acc)
+      let (changed, kept) :=
+        (inner.getArg 1).getArgs.foldl (init := (false, #[]))
+          fun (chg, acc) elem =>
+            if elem.getKind == `Lean.Parser.Term.attrInstance then
+              let attr := elem.getArg 1
+              let id := (attr.getArg 0).getId
+              if attr.getKind == `Lean.Parser.Attr.simple &&
+                  (id == `vetted || id == `candidate) then
+                (true, acc)
+              else (chg, acc.push elem)
+            else (chg, acc)
       if !changed then (false, mods) else
         -- If every attribute on `mods` was a trust-tier attribute, replace the
         -- optional `attributes` node with an empty null node; otherwise rebuild
@@ -100,10 +103,13 @@ def expandTrustDeclaration : Lean.Macro := fun stx =>
       let (mc, mods') := stripAttrs (s.getArg 0)
       let decl := s.getArg 1
       let (dc, decl') :=
-        if decl.getKind != `Lean.Parser.Command.inductive then (false, decl) else
-          let (cc, ctors') := (decl.getArg 4).getArgs.foldl (init := (false, #[])) fun (c, acc) ctor =>
-            let (kc, m') := stripAttrs (ctor.getArg 2)
-            (c || kc, acc.push (if kc then ctor.setArg 2 m' else ctor))
+        if decl.getKind != `Lean.Parser.Command.inductive then (false, decl)
+        else
+          let (cc, ctors') :=
+            (decl.getArg 4).getArgs.foldl (init := (false, #[]))
+              fun (c, acc) ctor =>
+                let (kc, m') := stripAttrs (ctor.getArg 2)
+                (c || kc, acc.push (if kc then ctor.setArg 2 m' else ctor))
           (cc, if cc then decl.setArg 4 (Lean.mkNullNode ctors') else decl)
       (mc || dc, if mc || dc then (s.setArg 0 mods').setArg 1 decl' else s)
   -- For `mutual ... end` blocks, strip every member declaration in
@@ -111,10 +117,13 @@ def expandTrustDeclaration : Lean.Macro := fun stx =>
   -- `throwUnsupported` so macro expansion terminates and hands the cleaned
   -- syntax to Lean's built-in command elaborator.
   if stx.getKind == `Lean.Parser.Command.mutual then
-    let (mc, items') := (stx.getArg 1).getArgs.foldl (init := (false, #[])) fun (c, acc) item =>
-      let (ic, item') := stripDecl item
-      (c || ic, acc.push item')
-    if mc then pure (stx.setArg 1 (Lean.mkNullNode items')) else Lean.Macro.throwUnsupported
+    let (mc, items') :=
+      (stx.getArg 1).getArgs.foldl (init := (false, #[]))
+        fun (c, acc) item =>
+          let (ic, item') := stripDecl item
+          (c || ic, acc.push item')
+    if mc then pure (stx.setArg 1 (Lean.mkNullNode items'))
+    else Lean.Macro.throwUnsupported
   else
     let (c, stx') := stripDecl stx
     if c then pure stx' else Lean.Macro.throwUnsupported
