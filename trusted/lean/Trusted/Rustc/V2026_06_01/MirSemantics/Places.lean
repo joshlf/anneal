@@ -1976,13 +1976,63 @@ def reifyCoercionSafetyCompatible
     | false => true
 
 /--
+Construct a placeholder `TypeSubst` pairing each `RigidTy` in `typeArgs` with a
+zero-sized placeholder `TypeLayout` so `RigidTy.instantiate` can substitute
+generic type parameters when checking function-pointer signatures in
+`checkCalleeSig`.
+
+Reference (`compiler/rustc_middle/src/ty/generic_args.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/generic_args.rs#L17-L25>
+
+> "/// An entity in the Rust type system, which can be one of
+> /// several kinds (types, lifetimes, and consts)."
+-/
+def typeSubstOfRigidTys : List RigidTy → TypeSubst
+  | .nil => .nil
+  | ty :: rest =>
+    (ty,
+      { size := ⟨0⟩
+        align := ⟨1⟩
+        backendRepr := .memory
+        fields := .primitive
+        variants := .single 0
+        isUninhabited := false }) :: typeSubstOfRigidTys rest
+
+/--
+Substitute generic type parameters (`RigidTy.param`) in the `ty.kind` of each
+`LocalDecl` using `subst`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L220-L234>
+
+> "pub struct LocalDecl<'tcx> {
+>     pub mutability: Mutability,
+>     pub local_info: ClearCrossCrate<Box<LocalInfo<'tcx>>>,
+>     pub ty: Ty<'tcx>,
+>     pub user_ty: Option<Box<UserTypeProjections>>,
+>     pub source_info: SourceInfo,
+> }"
+-/
+def instantiateLocalDeclKinds
+    (subst : TypeSubst) :
+    List LocalDecl → List LocalDecl
+  | .nil => .nil
+  | d :: rest =>
+    { d with ty := { d.ty with kind := d.ty.kind.instantiate subst } } ::
+      instantiateLocalDeclKinds subst rest
+
+/--
 Validate that a linked callee `p` in `callees` (when present) is compatible with
 the target function-pointer signature `(fnInputs, fnOutput, fnAbi)` during
 `ReifyFnPointer`:
 1. Rejects `CallConv.rustIntrinsic` callees (compiler intrinsics cannot be
    coerced to function pointers).
 2. Requires `length fnInputs == c.argCount` and `callConvEq fnAbi c.fnAbi.conv`.
-3. Requires `calleeLocalDeclsCompatible c.localDecls c.argCount fnInputs fnOutput`.
+3. Requires `length typeArgs == c.typeParamCount` and checks
+   `calleeLocalDeclsCompatible` on `c.localDecls` (instantiated with `typeArgs`
+   when `c.typeParamCount > 0`).
 
 Reference (The Rust Reference, "Function pointer types"):
 <https://doc.rust-lang.org/1.98.0/reference/types/function-pointer.html>
@@ -1995,25 +2045,41 @@ def checkCalleeSig
     (p : DefPath)
     (fnInputs : List RigidTy)
     (fnOutput : RigidTy)
-    (fnAbi : CallConv) :
+    (fnAbi : CallConv)
+    (typeArgs : List RigidTy := .nil) :
     Bool :=
   match callees with
   | .nil => true
   | c :: rest =>
     match stringEq c.defPath p with
     | true =>
+      let declsCompatible :=
+        match c.typeParamCount, typeArgs with
+        | 0, .nil =>
+          calleeLocalDeclsCompatible
+            c.localDecls
+            c.argCount
+            fnInputs
+            fnOutput
+        | 0, _ :: _ => false
+        | .succ _, _ =>
+          Bool.and
+            (Nat.beq (length typeArgs) c.typeParamCount)
+            (calleeLocalDeclsCompatible
+              (instantiateLocalDeclKinds
+                (typeSubstOfRigidTys typeArgs)
+                c.localDecls)
+              c.argCount
+              fnInputs
+              fnOutput)
       Bool.and
         (Bool.not (callConvEq c.fnAbi.conv .rustIntrinsic))
         (Bool.and
           (Nat.beq (length fnInputs) c.argCount)
           (Bool.and
             (callConvEq fnAbi c.fnAbi.conv)
-            (calleeLocalDeclsCompatible
-              c.localDecls
-              c.argCount
-              fnInputs
-              fnOutput)))
-    | false => checkCalleeSig rest p fnInputs fnOutput fnAbi
+            declsCompatible))
+    | false => checkCalleeSig rest p fnInputs fnOutput fnAbi typeArgs
 
 /--
 Evaluate `CastKind.pointerCoercion "UnsafeFnPointer"`, coercing a safe
@@ -2170,6 +2236,7 @@ def evalReifyFnPointer
                     fnInputs
                     fnOutput
                     fnAbi
+                    typeArgs
                 with
                 | false => .ub
                 | true =>

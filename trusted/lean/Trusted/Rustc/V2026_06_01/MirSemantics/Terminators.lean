@@ -217,6 +217,68 @@ def callerParamSubst (idx : Nat) : List TypeLayout → TypeSubst
   | .nil => .nil
   | l :: ls => (.param idx "", l) :: callerParamSubst (idx + 1) ls
 
+mutual
+/--
+Check that every `RigidTy.param idx _` occurring in `argTy` satisfies
+`idx < numCallerEntries`, ensuring that generic type arguments containing
+unbound parameters (even inside `.ref`, `.rawPtr`, `.fnPtr`, or `.fnDef`) cannot
+bypass layout resolution when `callerLayouts` lacks an entry for `idx`.
+
+Reference (`compiler/rustc_middle/src/ty/sty.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/sty.rs#L36-L46>
+
+> "pub struct ParamTy {
+>     pub index: u32,
+>     pub name: Symbol,
+> }"
+-/
+def allParamsInCallerLayouts (numCallerEntries : Nat) : RigidTy → Bool
+  | .param idx _ => Nat.blt idx numCallerEntries
+  | .alias _ a => allParamsInCallerLayoutsList numCallerEntries a
+  | .tuple fields => allParamsInCallerLayoutsList numCallerEntries fields
+  | .array elem _ => allParamsInCallerLayouts numCallerEntries elem
+  | .slice elem => allParamsInCallerLayouts numCallerEntries elem
+  | .ref _ pointee => allParamsInCallerLayouts numCallerEntries pointee
+  | .rawPtr _ pointee => allParamsInCallerLayouts numCallerEntries pointee
+  | .adt _ a => allParamsInCallerLayoutsList numCallerEntries a
+  | .fnDef _ a => allParamsInCallerLayoutsList numCallerEntries a
+  | .fnPtr inputs output _ _ =>
+    Bool.and
+      (allParamsInCallerLayoutsList numCallerEntries inputs)
+      (allParamsInCallerLayouts numCallerEntries output)
+  | .closure _ upvars => allParamsInCallerLayoutsList numCallerEntries upvars
+  | .bool => true
+  | .char => true
+  | .int _ => true
+  | .uint _ => true
+  | .float _ => true
+  | .never => true
+  | .str => true
+  | .dynamic _ => true
+  | .foreign _ => true
+  | .other _ => true
+
+/--
+Check that every `RigidTy` in a list satisfies `allParamsInCallerLayouts`.
+
+Reference (`compiler/rustc_middle/src/ty/sty.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/sty.rs#L36-L46>
+
+> "pub struct ParamTy {
+>     pub index: u32,
+>     pub name: Symbol,
+> }"
+-/
+def allParamsInCallerLayoutsList (numCallerEntries : Nat) : List RigidTy → Bool
+  | .nil => true
+  | t :: ts =>
+    Bool.and
+      (allParamsInCallerLayouts numCallerEntries t)
+      (allParamsInCallerLayoutsList numCallerEntries ts)
+end
+
 /--
 Resolve a direct or indirect call target `(defPath, typeArgs)` against `callees`
 and registered `TraitImplEntry` tables (`extraTraitImpls` and `c.traitImpls`),
@@ -231,7 +293,13 @@ Reference (The Rust Reference, "Call expressions"):
 > traits, followed by a parenthesized comma-separated list of argument
 > expressions."
 -/
-def lookupCallee (callees : List CapturedMir) (callerLayouts : LayoutTable) (defPath : DefPath) (typeArgs : List RigidTy) (extraTraitImpls : List TraitImplEntry := .nil) : Option CapturedMir :=
+def lookupCallee
+    (callees : List CapturedMir)
+    (callerLayouts : LayoutTable)
+    (defPath : DefPath)
+    (typeArgs : List RigidTy)
+    (extraTraitImpls : List TraitImplEntry := .nil) :
+    Option CapturedMir :=
   let directMatchOpt := match findCallee? callees defPath with
     | Option.some c => Option.some (c, typeArgs)
     | Option.none =>
@@ -275,19 +343,17 @@ def lookupCallee (callees : List CapturedMir) (callerLayouts : LayoutTable) (def
     else if effectiveTypeArgs.length != calleeBody.typeParamCount then
       Option.none
     else
-      let rec resolveLayouts : List RigidTy → List TypeLayout → Option (List TypeLayout)
+      let rec resolveLayouts :
+          List RigidTy → List TypeLayout → Option (List TypeLayout)
         | .nil, acc => Option.some acc.reverse
         | argTy :: rest, acc =>
           match
-            RigidTy.computeLayout
-              callerLayouts.pointerBits
-              callerLayouts.entries
-              .nil
-              Option.none
+            allParamsInCallerLayouts
+              (length callerLayouts.entries)
               argTy
           with
-          | Option.some l => resolveLayouts rest (l :: acc)
-          | Option.none =>
+          | false => Option.none
+          | true =>
             match
               RigidTy.computeLayout
                 callerLayouts.pointerBits
