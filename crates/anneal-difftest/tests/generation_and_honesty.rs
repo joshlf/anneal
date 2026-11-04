@@ -1292,6 +1292,7 @@ fn campaign_runner_reports_not_evaluated_and_fails() {
         &[
             "--profile",
             "smoke",
+            "--compile-only",
             "--x20-uri",
             "",
             "--junit-xml",
@@ -1412,6 +1413,7 @@ fi
         &[
             "--profile",
             "smoke",
+            "--compile-only",
             "--x20-uri",
             "",
             "--junit-xml",
@@ -1471,7 +1473,7 @@ fn campaign_runner_syncs_x20_only_when_asked() {
         &stub,
         &[],
         &[],
-        &["--profile", "smoke"],
+        &["--profile", "smoke", "--compile-only"],
         &dir.join("default"),
     );
     assert_eq!(
@@ -1501,7 +1503,7 @@ fn campaign_runner_syncs_x20_only_when_asked() {
         &stub,
         &[],
         &[],
-        &["--profile", "smoke", "--x20-uri", base],
+        &["--profile", "smoke", "--compile-only", "--x20-uri", base],
         &explicit,
     );
     assert_eq!(

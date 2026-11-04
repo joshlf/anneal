@@ -658,6 +658,29 @@ impl MiriToolchain {
     }
 }
 
+fn find_executable_in_path(tool_name: &str) -> Option<PathBuf> {
+    let path_var = env::var_os("ANNEAL_CALLER_PATH").or_else(|| env::var_os("PATH"))?;
+    for dir in env::split_paths(&path_var) {
+        let candidate = dir.join(tool_name);
+        if candidate.is_file() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = fs::metadata(&candidate)
+                    && (meta.permissions().mode() & 0o111) != 0
+                {
+                    return Some(candidate);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 fn resolve_tool_path(
     explicit: Option<&Path>,
     env_var: &str,
@@ -683,6 +706,23 @@ fn resolve_tool_path(
             "{env_var} points to non-existent {tool_name} binary: {}",
             p.display()
         ));
+    }
+    if tool_name == "miri" {
+        if let Some(path_miri) = find_executable_in_path("miri") {
+            let is_cargo_proxy = env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".cargo/bin/miri"))
+                .is_some_and(|p| p == path_miri);
+            if !is_cargo_proxy {
+                return Ok(path_miri);
+            }
+        } else if find_executable_in_path("cargo-miri").is_none() {
+            return Err(
+                "could not locate 'miri' or 'cargo-miri' on PATH \
+                 (set ANNEAL_MIRI_BIN or add Miri to PATH)"
+                    .to_string(),
+            );
+        }
     }
     if let Ok(home) = env::var("HOME") {
         let toolchains_dir = PathBuf::from(home).join(".rustup/toolchains");

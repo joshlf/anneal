@@ -17,10 +17,11 @@
 # point the Kokoro V2 `.cfg` build_file at `anneal/ci/kokoro_diff_test.sh` and
 # set `ANNEAL_DIFF_TEST_GCS_BUCKET` if using GCS state sync.
 #
-# The campaign runner exits 3 when it performed no oracle comparison, which is
-# every run: the harnesses only generate and compile candidates. This script
-# syncs state even when the runner fails, then exits with the runner's status,
-# so the job fails instead of passing an unevaluated run.
+# The campaign runner runs live Miri + Anneal oracle comparisons for
+# `miri-difftest` (exiting 4 on unquarantined divergences, 2 on harness or
+# red-flag vacuity failure, or 3 when invoked with `--compile-only`). This
+# script syncs state even when the runner exits non-zero, then exits with the
+# runner's status.
 
 set -euo pipefail
 
