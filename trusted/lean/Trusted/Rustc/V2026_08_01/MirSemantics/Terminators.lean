@@ -786,8 +786,14 @@ def isUnreachableCallTarget (defPath : DefPath) : Bool :=
 Test whether `defPath` is a non-unwinding (aborting) panic or abort entrypoint
 in `core` (`"core::panicking::panic_nounwind"`,
 `"core::panicking::panic_nounwind_fmt"`,
+`"core::panicking::panic_nounwind_fmt::panic_impl"`,
 `"core::panicking::panic_nounwind_nobacktrace"`,
-`"core::panicking::panic_in_cleanup"`, or `"core::intrinsics::abort"`).
+`"core::panicking::panic_in_cleanup"`,
+`"core::panicking::panic_cannot_unwind"`,
+`"core::panicking::panic_misaligned_pointer_dereference"`,
+`"core::panicking::panic_null_pointer_dereference"`,
+`"core::panicking::panic_invalid_enum_construction"`, or
+`"core::intrinsics::abort"`).
 
 Reference (`library/core/src/panicking.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -805,17 +811,34 @@ def isAbortingPanicDefPath (defPath : DefPath) : Bool :=
     (Bool.or
       (stringEq defPath "core::panicking::panic_nounwind_fmt")
       (Bool.or
-        (stringEq defPath "core::panicking::panic_nounwind_nobacktrace")
+        (stringEq defPath "core::panicking::panic_nounwind_fmt::panic_impl")
         (Bool.or
-          (stringEq defPath "core::panicking::panic_in_cleanup")
-          (stringEq defPath "core::intrinsics::abort"))))
+          (stringEq defPath "core::panicking::panic_nounwind_nobacktrace")
+          (Bool.or
+            (stringEq defPath "core::panicking::panic_in_cleanup")
+            (Bool.or
+              (stringEq defPath "core::panicking::panic_cannot_unwind")
+              (Bool.or
+                (stringEq defPath "core::panicking::panic_misaligned_pointer_dereference")
+                (Bool.or
+                  (stringEq defPath "core::panicking::panic_null_pointer_dereference")
+                  (Bool.or
+                    (stringEq defPath "core::panicking::panic_invalid_enum_construction")
+                    (stringEq defPath "core::intrinsics::abort")))))))))
 
 /--
 Test whether `defPath` is a standard unwinding panic entrypoint in `core`
 (`"core::panicking::panic"`, `"core::panicking::panic_fmt"`,
-`"core::panicking::assert_failed"`, `"core::slice::index::slice_index_fail"`,
-`"core::panicking::panic_bounds_check"`, `"core::panicking::panic_explicit"`, or
-`"core::panicking::panic_display"`).
+`"core::panicking::panic_fmt::panic_impl"`,
+`"core::panicking::const_panic_fmt"`,
+`"core::panicking::assert_failed"`, `"core::panicking::assert_failed_inner"`,
+`"core::panicking::assert_matches_failed"`,
+`"core::slice::index::slice_index_fail"`,
+`"core::panicking::panic_bounds_check"`, `"core::panicking::panic_explicit"`,
+`"core::panicking::panic_display"`, `"core::panicking::panic_str_2015"`,
+`"core::panicking::unreachable_display"`, `"core::option::unwrap_failed"`,
+`"core::option::expect_failed"`, `"core::result::unwrap_failed"`, or
+`"core::panicking::panic_const::*"`).
 
 Reference (`library/core/src/panicking.rs` and `library/core/src/slice/index.rs`
 at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -833,14 +856,52 @@ def isUnwindingPanicDefPath (defPath : DefPath) : Bool :=
     (Bool.or
       (stringEq defPath "core::panicking::panic_fmt")
       (Bool.or
-        (stringEq defPath "core::panicking::assert_failed")
+        (stringEq defPath "core::panicking::panic_fmt::panic_impl")
         (Bool.or
-          (stringEq defPath "core::slice::index::slice_index_fail")
+          (stringEq defPath "core::panicking::const_panic_fmt")
           (Bool.or
-            (stringEq defPath "core::panicking::panic_bounds_check")
+            (stringEq defPath "core::panicking::assert_failed")
             (Bool.or
-              (stringEq defPath "core::panicking::panic_explicit")
-              (stringEq defPath "core::panicking::panic_display"))))))
+              (stringEq defPath "core::panicking::assert_failed_inner")
+              (Bool.or
+                (stringEq defPath "core::panicking::assert_matches_failed")
+                (Bool.or
+                  (stringEq defPath "core::slice::index::slice_index_fail")
+                  (Bool.or
+                    (stringEq defPath "core::panicking::panic_bounds_check")
+                    (Bool.or
+                      (stringEq defPath "core::panicking::panic_explicit")
+                      (Bool.or
+                        (stringEq defPath "core::panicking::panic_display")
+                        (Bool.or
+                          (stringEq defPath "core::panicking::panic_str_2015")
+                          (Bool.or
+                            (stringEq defPath "core::panicking::unreachable_display")
+                            (Bool.or
+                              (stringEq defPath "core::option::unwrap_failed")
+                              (Bool.or
+                                (stringEq defPath "core::option::expect_failed")
+                                (Bool.or
+                                  (stringEq defPath "core::result::unwrap_failed")
+                                  (Bool.or
+                                    (stringEq defPath "core::panicking::panic_const::panic_const_add_overflow")
+                                    (Bool.or
+                                      (stringEq defPath "core::panicking::panic_const::panic_const_sub_overflow")
+                                      (Bool.or
+                                        (stringEq defPath "core::panicking::panic_const::panic_const_mul_overflow")
+                                        (Bool.or
+                                          (stringEq defPath "core::panicking::panic_const::panic_const_div_overflow")
+                                          (Bool.or
+                                            (stringEq defPath "core::panicking::panic_const::panic_const_rem_overflow")
+                                            (Bool.or
+                                              (stringEq defPath "core::panicking::panic_const::panic_const_neg_overflow")
+                                              (Bool.or
+                                                (stringEq defPath "core::panicking::panic_const::panic_const_shr_overflow")
+                                                (Bool.or
+                                                  (stringEq defPath "core::panicking::panic_const::panic_const_shl_overflow")
+                                                  (Bool.or
+                                                    (stringEq defPath "core::panicking::panic_const::panic_const_div_by_zero")
+                                                    (stringEq defPath "core::panicking::panic_const::panic_const_rem_by_zero")))))))))))))))))))))))))
 
 /--
 Execute a basic-block `Terminator` from state `s`.

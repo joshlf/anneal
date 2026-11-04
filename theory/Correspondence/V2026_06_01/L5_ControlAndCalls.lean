@@ -1168,8 +1168,10 @@ theorem mir_evalTerminator_diverging_call_panic_entrypoints
     (∀ pAbort : DefPath,
       (pAbort = "core::panicking::panic_nounwind" ∨
        pAbort = "core::panicking::panic_nounwind_fmt" ∨
+       pAbort = "core::panicking::panic_nounwind_fmt::panic_impl" ∨
        pAbort = "core::panicking::panic_nounwind_nobacktrace" ∨
        pAbort = "core::panicking::panic_in_cleanup" ∨
+       pAbort = "core::panicking::panic_cannot_unwind" ∨
        pAbort = "core::intrinsics::abort") →
       findCallee? s.memory.callees pAbort = .none →
       evalTerminator
@@ -1179,11 +1181,15 @@ theorem mir_evalTerminator_diverging_call_panic_entrypoints
     (∀ p : DefPath,
       (p = "core::panicking::panic" ∨
        p = "core::panicking::panic_fmt" ∨
+       p = "core::panicking::panic_fmt::panic_impl" ∨
        p = "core::panicking::assert_failed" ∨
        p = "core::slice::index::slice_index_fail" ∨
        p = "core::panicking::panic_bounds_check" ∨
        p = "core::panicking::panic_explicit" ∨
-       p = "core::panicking::panic_display") →
+       p = "core::panicking::panic_display" ∨
+       p = "core::option::unwrap_failed" ∨
+       p = "core::result::unwrap_failed" ∨
+       p = "core::panicking::panic_const::panic_const_add_overflow") →
       findCallee? s.memory.callees p = .none →
       (s.memory.callStack = .nil →
         evalTerminator s ⟨.call (mkFnOp p) argOps destination .none .continue_, span⟩ (.some callerBody) =
@@ -1212,7 +1218,7 @@ theorem mir_evalTerminator_diverging_call_panic_entrypoints
     have hpAbortFlags :
         isUnreachableCallTarget pAbort = false ∧
         isAbortingPanicDefPath pAbort = true := by
-      rcases hpAbort with rfl | rfl | rfl | rfl | rfl <;> decide
+      rcases hpAbort with rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide
     rcases hpAbortFlags with ⟨hNotUnreach, hAbort⟩
     simp only [evalTerminator, resolveCallTarget, extractCalleeDefPath?,
       extractCalleeTypeArgs, hArgs, hFindNone, hNotUnreach, hAbort]
@@ -1221,7 +1227,7 @@ theorem mir_evalTerminator_diverging_call_panic_entrypoints
         isUnreachableCallTarget p = false ∧
         isAbortingPanicDefPath p = false ∧
         isUnwindingPanicDefPath p = true := by
-      rcases hp with rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide
+      rcases hp with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide
     rcases hpFlags with ⟨hNotUnreach, hNotAbort, hUnwindPanic⟩
     refine ⟨?_, ?_, ?_, ?_, ?_⟩
     · intro hRoot
@@ -1367,5 +1373,110 @@ theorem mir_evalTerminator_unwindResume_and_unwindTerminate_corresponds
     simp [evalTerminator, hStack, hUnwind]
   · intro hStack hUnwind1 hUnwind2
     simp [evalTerminator, hStack, hUnwind1, hUnwind2]
+
+/--
+Universal characterization of interprocedural unwind propagation out of a
+non-diverging linked callee (`pushCalleeFrame`, `target = .some targetBb`) and
+external call/tail-call continuation handlers (`resumeExternalCall` and
+`resumeExternalTailCall`):
+1. When a caller invokes a linked `calleeBody` via `pushCalleeFrame` with
+   `unwind : UnwindAction` and `calleeBody` unwinds via `TerminatorKind.unwindResume`
+   OR via a failing `TerminatorKind.assert` with `.continue_`, execution pops
+   the saved caller frame, restores `callerBody` and `s.memory.activeProtectors`,
+   and dispatches the caller's `unwind` (`.cleanup cleanupBb`, `.terminate`,
+   `.unreachable`, or `.continue_`).
+2. `resumeExternalCall` on `.panicked memAfter` transitions via
+   `applyUnwindAction s locals' memAfter unwind` and on `.aborted` halts with
+   `.halted .abort`.
+3. `resumeExternalTailCall` on `.panicked memAfter` unwinds via
+   `unwindFromCallStack memAfter.callStack memAfter` and on `.aborted` halts
+   with `.halted .abort`.
+-/
+theorem mir_evalTerminator_callee_unwind_and_external_resume_corresponds
+    (s : MachineState)
+    (destination : Place)
+    (targetBb cleanupBb assertTargetBb : BasicBlockIdx)
+    (unwind : UnwindAction)
+    (span : String)
+    (callerBody calleeBody : CapturedMir)
+    (argVals : List Value)
+    (locals' calleeLocalsAfterCond : List LocalSlot)
+    (cond : Operand) :
+    let enteredState :=
+      pushCalleeFrame s callerBody locals' destination targetBb calleeBody argVals unwind
+    (unwind = .cleanup cleanupBb →
+      evalTerminator enteredState ⟨.unwindResume, span⟩ (.some calleeBody) =
+        MirStepNode.step
+          { frame :=
+              { s.frame with
+                blockIdx := cleanupBb
+                stmtIdx := 0
+                locals := locals' }
+            memory :=
+              { s.memory with
+                callStack := s.memory.callStack
+                activeCallee := .some callerBody
+                activeProtectors := s.memory.activeProtectors } }) ∧
+    (unwind = .terminate →
+      evalTerminator enteredState ⟨.unwindResume, span⟩ (.some calleeBody) =
+        MirStepNode.retOutcome .abort) ∧
+    (unwind = .unreachable →
+      evalTerminator enteredState ⟨.unwindResume, span⟩ (.some calleeBody) =
+        MirStepNode.fail .ub) ∧
+    (unwind = .continue_ →
+      s.memory.callStack = .nil →
+      evalTerminator enteredState ⟨.unwindResume, span⟩ (.some calleeBody) =
+        MirStepNode.retOutcome .panic) ∧
+    (unwind = .cleanup cleanupBb →
+      evalOperand
+        enteredState.frame.locals
+        cond
+        enteredState.memory.borrows
+        enteredState.memory.globals
+        calleeBody.layouts
+        enteredState.memory.callerLocals =
+          .ok (.scalar { bits := 0, sizeBytes := 1 }) calleeLocalsAfterCond →
+      evalTerminator
+        enteredState
+        ⟨.assert cond true assertTargetBb .continue_, span⟩
+        (.some calleeBody) =
+        MirStepNode.step
+          { frame :=
+              { s.frame with
+                blockIdx := cleanupBb
+                stmtIdx := 0
+                locals := locals' }
+            memory :=
+              { s.memory with
+                callStack := s.memory.callStack
+                activeCallee := .some callerBody
+                activeProtectors := s.memory.activeProtectors } }) ∧
+    (∀ memAfter : Memory,
+      resumeExternalCall s locals' destination targetBb unwind (.panicked memAfter) =
+        applyUnwindAction s locals' memAfter unwind ∧
+      resumeExternalCall s locals' destination targetBb unwind .aborted = .halted .abort ∧
+      resumeExternalTailCall (.panicked memAfter) =
+        unwindFromCallStack memAfter.callStack memAfter ∧
+      resumeExternalTailCall .aborted = .halted .abort) := by
+  dsimp only
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro hUnwind
+    subst hUnwind
+    simp [evalTerminator, pushCalleeFrame, unwindFromCallStack, restoreCallerProtectors]
+  · intro hUnwind
+    subst hUnwind
+    simp [evalTerminator, pushCalleeFrame, unwindFromCallStack]
+  · intro hUnwind
+    subst hUnwind
+    simp [evalTerminator, pushCalleeFrame, unwindFromCallStack]
+  · intro hUnwind hNil
+    subst hUnwind
+    simp [evalTerminator, pushCalleeFrame, unwindFromCallStack, hNil]
+  · intro hUnwind hCond
+    subst hUnwind
+    simp only [evalTerminator, hCond]
+    rfl
+  · intro memAfter
+    exact ⟨rfl, rfl, rfl, rfl⟩
 
 end Correspondence.V2026_06_01.L5_ControlAndCalls
