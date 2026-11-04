@@ -4,24 +4,24 @@
 
 `theory/Anneal/MirFuelFree.lean` (imported by `theory/Anneal.lean` without modifying `SymbolicEval.lean`) establishes:
 
-1. **Kleene Fuel Monotonicity**:
-   - `wpCoalBounded_mono_fuel` and `wpCoalBounded_mono_both` across `.ret`, `.tau`, and `.vis` branches.
-   - `wpMirExecSym_mono`, `wpMirSym_mono`, `wpMirBounded_mono`, `wpMirExecNoCallSym_mono`, `wpMirNoCallSym_mono`, `wpMirExecUbWaivedSym_mono`, `wpMirUbWaivedSym_mono`, `wpMirExecModularSym_mono`, `wpMirModularSym_mono`, `wpMirTraceBounded_mono`, `wpMirSilentBounded_mono`.
+1. **Kleene Fuel Monotonicity & Conjunction**:
+   - `wpCoalBounded_mono_fuel`, `wpCoalBounded_mono_both`, and `wpCoalBounded_conj` across `.ret`, `.tau`, and `.vis` branches.
+   - `wpMirExecSym_mono`, `wpMirSym_mono`, `wpMirBounded_mono`, `wpMirExecNoCallSym_mono`, `wpMirNoCallSym_mono`, `wpMirExecUbWaivedSym_mono`, `wpMirUbWaivedSym_mono`, `wpMirExecModularSym_mono`, `wpMirModularSym_mono`, `wpMirExecTraceSym_mono`, `wpMirTraceSym_mono`, `wpMirTraceBounded_mono`, `wpMirSilentBounded_mono`.
    - `runMirExecBounded_mono`, `runMirBounded_mono`, `runMirExecBounded_det`, `runMirBounded_det`, `runMirTauToRet_mono`, `runMirTauToBlock_mono`, `runMirToBlock_mono`, `runMirToBinarySwitch_mono`, `checkMirBoolExecBounded_mono`, `checkMirBoolBounded_mono`.
 2. **Fuel-Free Predicates & Determinism (`MirWpConverges`, `MirConverges`, `MirNoCallWpConverges`, `MirUbWaivedWpConverges`, `MirModularWpConverges`, `MirTraceWpConverges`)**:
-   - `MirWpConverges`, `MirExecWpConverges`, `MirConverges`, `MirExecConverges`, `MirNoCallWpConverges`, `MirUbWaivedWpConverges`, `MirModularWpConverges`, `MirTraceWpConverges`.
-   - `MirWpConverges.mono`, `MirWpConverges.of_wpMirSym`, `MirWpConverges.of_mirConverges`, `MirWpConverges.conj`, `MirWpConverges.not_false`, `MirWpConverges.exists_outcome`, `MirConverges.det`, `MirConverges.iff_wpConverges_of_det`.
+   - `MirWpConverges`, `MirExecWpConverges`, `MirConverges`, `MirExecConverges`, `MirNoCallWpConverges`, `MirUbWaivedWpConverges`, `MirModularWpConverges`, `MirTraceWpConverges`, `MirTraceStepsConverges`.
+   - `MirWpConverges.mono`, `MirWpConverges.of_wpMirSym`, `MirWpConverges.of_mirConverges`, `MirWpConverges.conj`, `MirUbWaivedWpConverges.conj`, `MirModularWpConverges.conj`, `MirTraceWpConverges.conj`, `MirWpConverges.not_false`, `MirWpConverges.exists_outcome`, `MirConverges.det`, `MirConverges.iff_wpConverges_of_det`.
 3. **Fuel-Free Step & Sequential Composition (`step` & `bind`)**:
    - `MirWpConverges.step`, `MirWpConverges.step_tau`, `MirWpConverges.step_emit`, `MirWpConverges.ret_of_step`, `MirWpConverges.bind`, `MirWpConverges.bind_reachState`.
-   - `MirStepsConverges.step`, `MirStepsConverges.trans`, `MirReachState.refl`, `MirReachState.trans`, `MirNoCallWpConverges.step`, `MirNoCallWpConverges.bind`, `MirUbWaivedWpConverges.bind`, `MirModularWpConverges.bind`, `MirConverges.bind`.
+   - `MirStepsConverges.step`, `MirStepsConverges.trans`, `MirReachState.refl`, `MirReachState.trans`, `MirNoCallWpConverges.step`, `MirNoCallWpConverges.bind`, `MirUbWaivedWpConverges.step`, `MirUbWaivedWpConverges.bind`, `MirModularWpConverges.step`, `MirModularWpConverges.bind`, `MirTraceWpConverges.step`, `MirTraceWpConverges.bind`, `MirTraceWpConverges.bind_silent`, `MirConverges.bind`.
 4. **Callee-Aware (`BRIEF-3.2`) State Initialization & Adequacy Bridges Across All 7 Trusted Certificates**:
    - `Memory.withDefaultCallees`, `initMachineStateWithMemoryAndCallees`, `mirCallTreeWithCallees`, `mirStatefulTreeWithCallees`, `MirBoolPredicateHoldsWithCallees`, `RootActiveMemory`.
    - `dwp_of_mirWpConverges`, `dwlp_of_mirWpConverges`, `dwp_mirCallTreeWithCallees_of_mirWpConverges`, `dwp_mirStatefulTreeWithCallees_of_mirWpConverges`, `dwp_of_mirNoCallWpConverges`, `dwlp_of_mirUbWaivedWpConverges`, `dwlp_of_mirModularWpConverges`, `dwlp_of_mirTraceWpConverges`, `mirBoolPredicateHoldsWithCallees_of_wpConverges`.
    - `verifyMirSafe_of_wpConverges`, `verifyMirNoPanic_of_wpConverges`, `verifyStatefulMirSafe_of_wpConverges`, `verifyStatefulMirNoPanic_of_wpConverges`, `verifyTotalMir_of_wpConverges`, `verifyStatefulEquivMir_of_wpConverges`, `verifyUbExceptionMir_of_wpConverges`, `verifyModularContractMir_of_wpConverges`, `verifyTraceMir_of_wpConverges`.
    - `dischargeStatelessEq_of_wpConverges`, `dischargeStatefulEq_of_wpConverges`, `verifyWellTypedScalarArg1_of_wpConverges`, `verifyWellTypedSafeScalarArg1_of_wpConverges`, `verifyWellTypedScalarArg2_of_wpConverges`, `verifyWellTypedSafeScalarArg2_of_wpConverges`.
-5. **Concrete Multi-Block Fuel-Free Verification Witnesses**:
-   - `multiBlockPipeline_stage1_converges`, `multiBlockPipeline_stage2_converges`, `multiBlockPipeline_wpConverges`, `multiBlockPipeline_noCallWpConverges`, `multiBlockPipeline_converges`, `multiBlockPipeline_withMemoryAndCallees_wpConverges`, `multiBlockPipeline_withCallees_wpConverges`.
-   - `verify_multiBlockPipelineClaim`, `verify_multiBlockPipelineStatefulClaim`, `verify_multiBlockPipelineTotalClaim`, `verify_multiBlockPipelineEquivClaim`.
+5. **Concrete Multi-Block Fuel-Free Verification Witnesses (All 7 Trusted Certificates)**:
+   - `multiBlockPipeline_stage1_converges`, `multiBlockPipeline_stage2_converges`, `multiBlockPipeline_wpConverges`, `multiBlockPipeline_noCallWpConverges`, `multiBlockPipeline_ubWaivedWpConverges`, `multiBlockPipeline_modularWpConverges`, `multiBlockPipeline_traceWpConverges`, `multiBlockPipeline_converges`, `multiBlockPipeline_withMemoryAndCallees_wpConverges`, `multiBlockPipeline_withCallees_wpConverges`.
+   - `verify_multiBlockPipelineClaim`, `verify_multiBlockPipelineStatefulClaim`, `verify_multiBlockPipelineTotalClaim`, `verify_multiBlockPipelineEquivClaim`, `verify_multiBlockPipelineUbExceptionClaim`, `verify_multiBlockPipelineModularClaim`, `verify_multiBlockPipelineTraceClaim`.
 
 ## Step-by-Step Verification Commands
 
