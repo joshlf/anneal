@@ -963,9 +963,11 @@ def intrinsicIntSignedness? (allowChar : Bool) : RigidTy → Option Bool
 Resolve the signedness of the primary type parameter `T` of a
 `CallConv.rustIntrinsic` call with `intrinsicIntSignedness? allowChar`. The first
 monomorphized type argument in `target.typeArgs` is authoritative when present;
-otherwise the type of the first argument operand is used. Returns `.none`, which
-callers turn into `MirStepNode.unsupported`, when neither source names an
-accepted type.
+otherwise the type of the first argument operand is used, or the type of the
+second argument operand when `sameRhsTy = true` (for homogeneous binary
+intrinsics `f<T>(x: T, y: T)` whose first operand is untyped). Returns `.none`,
+which callers turn into `MirStepNode.unsupported`, when none of these sources
+names an accepted type.
 
 Reference (The Rust Reference, "Numeric types"):
 <https://doc.rust-lang.org/1.98.0/reference/types/numeric.html>
@@ -979,16 +981,23 @@ def resolveIntrinsicIsSigned
     (bodyLocalDecls : List LocalDecl)
     (bodyLayouts : LayoutTable)
     (argOps : List Operand)
-    (allowChar : Bool := false) :
+    (allowChar : Bool := false)
+    (sameRhsTy : Bool := true) :
     Option Bool :=
   match target.typeArgs with
   | firstTy :: _ => intrinsicIntSignedness? allowChar firstTy
   | .nil =>
     match argOps with
-    | lhsOp :: _ =>
+    | lhsOp :: restOps =>
       match operandTy bodyLocalDecls bodyLayouts lhsOp with
       | .some ty => intrinsicIntSignedness? allowChar ty.kind
-      | .none => .none
+      | .none =>
+        match sameRhsTy, restOps with
+        | true, rhsOp :: _ =>
+          match operandTy bodyLocalDecls bodyLayouts rhsOp with
+          | .some ty => intrinsicIntSignedness? allowChar ty.kind
+          | .none => .none
+        | _, _ => .none
     | .nil => .none
 
 /--
@@ -1488,6 +1497,32 @@ def isValidWidePtrMetaVal : Value → Bool
   | _ => false
 
 /--
+Check whether `ptrArgVal` has the runtime value representation of a valid thin
+or wide pointer argument (`*const T` for some `T: ?Sized`) on a 64-bit target:
+either an 8-byte thin pointer (`.ptr _ 8`) or a 2-field wide pointer
+(`.aggregate 0 [.ptr _ 8, metaVal]`) with well-formed metadata
+(`isValidWidePtrMetaVal metaVal`). Any other `Value` (such as `.scalar _`,
+`.unit`, a non-64-bit pointer, or a wide pointer with malformed metadata) cannot
+represent `*const T` for any `T: ?Sized` and faults with `.ub` even when the
+pointee type `T` is unknown.
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html#r-dynamic-sized.pointer-types>
+
+> "Pointer types to DSTs are sized but have twice the size of pointers to sized
+> types
+>
+> * Pointers to slices and `str` also store the number of elements.
+> * Pointers to trait objects also store a pointer to a vtable."
+-/
+@[reducible]
+def isValidIntrinsicPtrArgVal : Value → Bool
+  | .ptr _ ptrSz => Nat.beq ptrSz 8
+  | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
+    Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal)
+  | _ => false
+
+/--
 Step for `size_of_val` or `align_of_val` when the pointer argument is a
 well-formed wide pointer but the pointee `ty` is not `[T]`, `str`, or
 `dyn Trait`: `MirStepNode.unsupported` when `intrinsicTailMayBeUnsized` admits a
@@ -1964,7 +1999,7 @@ def evalNonSelectIntrinsicCall
     match argVals with
     | .scalar lhs :: .scalar rhs :: .nil =>
       match
-        resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps,
+        resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps (sameRhsTy := false),
         resolveIntrinsicShiftSigned target bodyLocalDecls bodyLayouts argOps
       with
       | .some lhsSigned, .some rhsSigned =>
@@ -2081,7 +2116,10 @@ def evalNonSelectIntrinsicCall
           | false => MirStepNode.fail .ub
           | true => intrinsicWidePointeeStep pointeeTy
         | _ => MirStepNode.fail .ub
-      | .none => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
+      | .none =>
+        match isValidIntrinsicPtrArgVal ptrArgVal with
+        | false => MirStepNode.fail .ub
+        | true => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
     | _ => MirStepNode.fail .ub
   | .alignOfVal =>
     match argVals with
@@ -2147,7 +2185,10 @@ def evalNonSelectIntrinsicCall
           | false => MirStepNode.fail .ub
           | true => intrinsicWidePointeeStep pointeeTy
         | _ => MirStepNode.fail .ub
-      | .none => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
+      | .none =>
+        match isValidIntrinsicPtrArgVal ptrArgVal with
+        | false => MirStepNode.fail .ub
+        | true => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
     | _ => MirStepNode.fail .ub
   | .constEvalSelect => MirStepNode.fail .ub
 
@@ -2237,6 +2278,52 @@ def withConstEvalSelectIntrinsicTypeArgs
         | .ref _ pointeeTy :: _ => { rtTarget with typeArgs := pointeeTy :: .nil }
         | _ => rtTarget
     | _ => rtTarget
+
+/--
+Construct synthetic zero-sized constant `Operand`s carrying the element types
+`elemTys` of a `const_eval_select` argument tuple `ARG = .tuple elemTys`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2400-L2408>
+
+> "#[rustc_intrinsic]
+> pub const fn const_eval_select<ARG: Tuple, F, G, RET>(
+>     _arg: ARG,
+>     _called_in_const: F,
+>     _called_at_rt: G,
+> ) -> RET"
+-/
+@[reducible]
+def rigidTysToZeroSizedOps : List RigidTy → List Operand
+  | .nil => .nil
+  | ty :: rest =>
+    .constant { ty := { kind := ty, layoutIdx := 0 }, val := .zeroSized } ::
+      rigidTysToZeroSizedOps rest
+
+/--
+Extract synthetic argument `Operand`s from `const_eval_select`'s first type
+argument `tupleTyOpt` (`ARG = .tuple elemTys`), or `.nil` when `tupleTyOpt` is
+absent. Passing these operands to `evalNonSelectIntrinsicCall` ensures that
+`intrinsicMissingPointeeStep` observes the known first-argument type from `ARG`
+(and faults with `MirStepNode.fail .ub` when `ARG` passes a non-pointer type to
+`arith_offset`, `size_of_val`, or `align_of_val`).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2400-L2408>
+
+> "#[rustc_intrinsic]
+> pub const fn const_eval_select<ARG: Tuple, F, G, RET>(
+>     _arg: ARG,
+>     _called_in_const: F,
+>     _called_at_rt: G,
+> ) -> RET"
+-/
+@[reducible]
+def constEvalSelectTupleArgOps : Option RigidTy → List Operand
+  | .some (.tuple elemTys) => rigidTysToZeroSizedOps elemTys
+  | _ => .nil
 
 /--
 Test whether `defPath` is an unreachable hint or intrinsic
@@ -2470,13 +2557,14 @@ def evalDirectRustIntrinsic?
                    { defPath := rtTarget.defPath, args := unpackedArgs, memory := s.memory }
                    (resumeExternalCall s locals' destination targetBb unwind)
                | false =>
+                 let selectArgOps := constEvalSelectTupleArgOps tupleTyOpt
                  match isDirectExactDivTarget rtTarget with
                  | true =>
                    match unpackedArgs with
                    | .scalar lhs :: .scalar rhs :: .nil =>
                      let rtTarget' :=
                        withConstEvalSelectIntrinsicTypeArgs rtTarget tupleTyOpt false
-                     match resolveIntrinsicIsSigned rtTarget' bodyLocalDecls bodyLayouts .nil with
+                     match resolveIntrinsicIsSigned rtTarget' bodyLocalDecls bodyLayouts selectArgOps with
                      | .none => MirStepNode.unsupported
                      | .some isSigned =>
                        writeIntrinsicScalarResult
@@ -2501,7 +2589,7 @@ def evalDirectRustIntrinsic?
                        rtTarget'
                        bodyLocalDecls
                        bodyLayouts
-                       .nil
+                       selectArgOps
                        unpackedArgs
                        locals'
                        destination

@@ -74,12 +74,14 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   intrinsicRigidTyAlignAux intrinsicRigidTyAlign
   anyUnsizedRigidTy isUnsizedRigidTy intrinsicUnresolvedLayoutStep
   intrinsicLastRigidTy? intrinsicTailIsExtern intrinsicTailMayBeUnsized
-  intrinsicWidePointeeStep
+  isValidWidePtrMetaVal isValidIntrinsicPtrArgVal intrinsicWidePointeeStep
   resolveIntrinsicPointeeTy? intrinsicMissingPointeeStep
   allZeroSizedUnitElemTys isZeroSizedUnitElemTy
   unpackConstEvalSelectArgs? resolveConstEvalSelectTarget?
   writeIntrinsicReturn writeIntrinsicScalarResult
-  evalNonSelectIntrinsicCall evalDirectRustIntrinsic?
+  evalNonSelectIntrinsicCall isPtrPointeeIntrinsicKind
+  withConstEvalSelectIntrinsicTypeArgs rigidTysToZeroSizedOps
+  constEvalSelectTupleArgOps evalDirectRustIntrinsic?
   isUnreachableCallTarget isAbortingPanicDefPath
   isUnwindingPanicDefPath evalTerminator
   initMachineState initMachineStateWithCallees
