@@ -1502,7 +1502,7 @@ pub fn run_lake_verify_targets(dot_anneal_dir: &Path, targets: &[String]) -> Res
     for target in targets {
         cmd.arg(target);
     }
-    let status = cmd.status().map_err(|err| {
+    let output = cmd.output().map_err(|err| {
         format!(
             "failed to execute '{}' in {}: {}",
             lake_bin.display(),
@@ -1510,9 +1510,12 @@ pub fn run_lake_verify_targets(dot_anneal_dir: &Path, targets: &[String]) -> Res
             err
         )
     })?;
-    if !status.success() {
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "lake build failed with status {status} in {}",
+            "lake build failed with status {} in {}:\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status,
             dot_anneal_dir.display()
         ));
     }

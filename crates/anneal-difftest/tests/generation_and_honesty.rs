@@ -958,20 +958,23 @@ fn input_builder_schedule_and_shrinker_edge_cases() {
 #[test]
 fn harness_binaries_report_no_oracle_comparison() {
     let dir = unique_temp_dir("binaries");
-    for (harness, bin, allowed) in [
+    for (harness, bin, extra_flags, allowed) in [
         (
             "miri-difftest",
             env!("CARGO_BIN_EXE_miri-difftest"),
+            &["--compile-only"][..],
             MIRI_JSON_KEYS,
         ),
         (
             "itree-difftest",
             env!("CARGO_BIN_EXE_itree-difftest"),
+            &[][..],
             ITREE_JSON_KEYS,
         ),
     ] {
         let json_path = dir.join(format!("{harness}.json"));
         let out = Command::new(bin)
+            .args(extra_flags)
             .args([
                 "--batches",
                 "1",
@@ -995,8 +998,9 @@ fn harness_binaries_report_no_oracle_comparison() {
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert_binary_stdout_is_honest(harness, &stdout, &fields, &mutators);
 
-        // The binaries write no findings, so `--findings-dir` must be rejected.
+        // Compile-only mode writes no findings, so `--findings-dir` must be rejected.
         let rejected = Command::new(bin)
+            .args(extra_flags)
             .args(["--findings-dir"])
             .arg(dir.join("findings"))
             .output()
@@ -1088,7 +1092,11 @@ fn compile_counts_come_from_rustc() {
 
     let run = |bin: &str, rustc: &Path, name: &str| -> Vec<(String, String)> {
         let json_path = dir.join(format!("{name}.json"));
-        let out = Command::new(bin)
+        let mut cmd = Command::new(bin);
+        if bin == env!("CARGO_BIN_EXE_miri-difftest") {
+            cmd.arg("--compile-only");
+        }
+        let out = cmd
             .args([
                 "--batches",
                 "2",

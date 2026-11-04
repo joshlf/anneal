@@ -8,11 +8,16 @@ version = "0.1.0"
 dependencies = [
  "arbitrary",
  "arbtest",
+ "cargo-anneal",
  "prettyplease",
  "proc-macro2",
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "anneal-rustc-capture"
+version = "0.1.0-alpha.1"
 
 [[package]]
 name = "arbitrary"
@@ -30,6 +35,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a3be567977128c0f71ad1462d9624ccda712193d124e944252f0c5789a06d46"
 dependencies = [
  "arbitrary",
+]
+
+[[package]]
+name = "cargo-anneal"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "anneal-rustc-capture",
 ]
 
 [[package]]

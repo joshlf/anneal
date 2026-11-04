@@ -482,6 +482,7 @@ def main() -> int:
                     str(profile.miri_batch_size),
                     "--seed",
                     f"0x{miri_seed:08x}",
+                    "--compile-only",
                 ],
                 run_tmp_path / "miri_difftest_out.json",
             )
