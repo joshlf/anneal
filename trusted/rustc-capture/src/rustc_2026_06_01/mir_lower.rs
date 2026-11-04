@@ -259,13 +259,30 @@ pub fn lower_mir_body<'tcx>(
         local_layouts.push(layout);
     }
 
-    let fn_abi = extract_fn_abi_for_body(
+    let mut fn_abi = extract_fn_abi_for_body(
         tcx,
         def_id,
         ctx.layout_builder.typing_env(),
         body.arg_count,
         &local_layouts,
     );
+    if matches!(role, IrContractRole::ExternalSpec(_))
+        && fn_abi.conv == crate::lean_emit::IrCallConv::Rust
+        && fn_abi.can_unwind
+        && let Some(target_def_id) =
+            crate::rustc_2026_06_01::specs::resolve_sidecar_target_def_id_from_body(
+                tcx, def_id, body, true,
+            )
+        && let Some((target_conv, target_can_unwind)) =
+            crate::rustc_2026_06_01::layout_lower::extract_fn_conv_and_unwind(
+                tcx,
+                target_def_id,
+                ctx.layout_builder.typing_env(),
+            )
+    {
+        fn_abi.conv = target_conv;
+        fn_abi.can_unwind = target_can_unwind;
+    }
     if type_param_count == 0 {
         for arg in &fn_abi.args {
             ctx.layout_builder.intern_ir_layout(arg.layout.clone());

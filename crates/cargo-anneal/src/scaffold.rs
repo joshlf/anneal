@@ -299,6 +299,8 @@ struct CalleeGraph<'a> {
     trait_impls_by_method: &'a BTreeMap<String, Vec<String>>,
     /// Explicit `#[external_spec(for = <target>)]` overrides keyed by target.
     external_spec_contracts: &'a BTreeMap<String, ExternalSpecContractRef>,
+    /// Sibling `#[spec(trusted)]` subjects keyed by canonical `def_id`.
+    trusted_callees: &'a BTreeMap<String, CalleeContractRef>,
 }
 
 /// Mutable worklist state of one transitive callee closure.
@@ -306,22 +308,33 @@ struct CalleeGraph<'a> {
 struct CalleeClosureState {
     visited: BTreeSet<String>,
     ext_seen: BTreeSet<String>,
+    trusted_seen: BTreeSet<String>,
     queue: VecDeque<String>,
     external_specs: Vec<ExternalSpecContractRef>,
+    trusted_callees: Vec<CalleeContractRef>,
 }
 
 impl CalleeGraph<'_> {
     /// Record a reference to `r` found in a body reachable from
     /// `subject_def_id`: an overridden target is recorded as an external spec
-    /// (and not traversed), a linkable body is queued once, and a trait method
-    /// additionally queues (or records as overridden) each of its captured
-    /// implementations.
+    /// (and not traversed), a `#[spec(trusted)]` sibling is recorded as a
+    /// called callee (and not traversed), a linkable body is queued once, and
+    /// a trait method additionally queues (or records as overridden/trusted)
+    /// each of its captured implementations.
     fn enqueue_ref(&self, r: &str, subject_def_id: &str, state: &mut CalleeClosureState) {
         if r != subject_def_id
             && let Some(ext) = self.external_spec_contracts.get(r)
         {
             if state.ext_seen.insert(r.to_string()) {
                 state.external_specs.push(ext.clone());
+            }
+            return;
+        }
+        if r != subject_def_id
+            && let Some(tr) = self.trusted_callees.get(r)
+        {
+            if state.trusted_seen.insert(r.to_string()) {
+                state.trusted_callees.push(tr.clone());
             }
             return;
         }
@@ -338,6 +351,14 @@ impl CalleeGraph<'_> {
                     }
                     continue;
                 }
+                if impl_id != subject_def_id
+                    && let Some(tr) = self.trusted_callees.get(impl_id)
+                {
+                    if state.trusted_seen.insert(impl_id.clone()) {
+                        state.trusted_callees.push(tr.clone());
+                    }
+                    continue;
+                }
                 if self.callable_by_def_id.contains_key(impl_id)
                     && state.visited.insert(impl_id.clone())
                 {
@@ -349,13 +370,18 @@ impl CalleeGraph<'_> {
 
     /// Compute the cycle-safe breadth-first closure of linkable callee bodies
     /// reachable from `root_refs`, returning the linked bodies in discovery
-    /// order together with the overridden `#[external_spec]` targets reached.
+    /// order together with the overridden `#[external_spec]` targets and
+    /// `#[spec(trusted)]` sibling callees reached.
     fn closure(
         &self,
         root_refs: &[String],
         subject_def_id: &str,
         read_outgoing: &mut dyn FnMut(&Path) -> Vec<String>,
-    ) -> (Vec<TransitiveCalleeRef>, Vec<ExternalSpecContractRef>) {
+    ) -> (
+        Vec<TransitiveCalleeRef>,
+        Vec<ExternalSpecContractRef>,
+        Vec<CalleeContractRef>,
+    ) {
         let mut state = CalleeClosureState::default();
         for r in root_refs {
             self.enqueue_ref(r, subject_def_id, &mut state);
@@ -375,7 +401,7 @@ impl CalleeGraph<'_> {
                 self.enqueue_ref(r, subject_def_id, &mut state);
             }
         }
-        (linked, state.external_specs)
+        (linked, state.external_specs, state.trusted_callees)
     }
 }
 
@@ -403,17 +429,22 @@ fn populate_called_callees(
         .map(|b| b.subject.target.def_id.clone())
         .collect();
 
-    let trusted_callee_candidates: Vec<CalleeContractRef> = bundles
+    let trusted_callees_by_def_id: BTreeMap<String, CalleeContractRef> = bundles
         .iter()
         .filter(|b| {
             b.has_rust_trusted_attr()
                 && !external_spec_contracts.contains_key(&b.subject.target.def_id)
         })
-        .map(|b| CalleeContractRef {
-            def_id: b.subject.target.def_id.clone(),
-            item_module_suffix: b.item_module_suffix.clone(),
-            req_module_suffix: b.inline_requires.first().map(derive_item_module_suffix),
-            ens_module_suffix: b.inline_ensures.first().map(derive_item_module_suffix),
+        .map(|b| {
+            (
+                b.subject.target.def_id.clone(),
+                CalleeContractRef {
+                    def_id: b.subject.target.def_id.clone(),
+                    item_module_suffix: b.item_module_suffix.clone(),
+                    req_module_suffix: b.inline_requires.first().map(derive_item_module_suffix),
+                    ens_module_suffix: b.inline_ensures.first().map(derive_item_module_suffix),
+                },
+            )
         })
         .collect();
 
@@ -455,6 +486,7 @@ fn populate_called_callees(
         callable_by_def_id: &callable_by_def_id,
         trait_impls_by_method: &trait_impls_by_method,
         external_spec_contracts: &external_spec_contracts,
+        trusted_callees: &trusted_callees_by_def_id,
     };
 
     let mut outgoing_cache: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
@@ -472,17 +504,12 @@ fn populate_called_callees(
 
     for bundle in bundles.iter_mut() {
         let root_refs = read_outgoing(&bundle.item_rel_path);
-        for cand in &trusted_callee_candidates {
-            if cand.def_id != bundle.subject.target.def_id && root_refs.contains(&cand.def_id) {
-                bundle.called_callees.push(cand.clone());
-            }
-        }
-
         let subject_def_id = bundle.subject.target.def_id.clone();
-        let (linked, external_specs) =
+        let (linked, external_specs, trusted_callees) =
             graph.closure(&root_refs, &subject_def_id, &mut read_outgoing);
         bundle.transitive_callees = linked;
         bundle.external_spec_callees = external_specs;
+        bundle.called_callees = trusted_callees;
 
         let mut companion_suffixes: Vec<String> = Vec::new();
         for companion in bundle.inline_requires.iter().chain(bundle.inline_ensures.iter()) {
@@ -511,7 +538,7 @@ fn populate_called_callees(
         // Overridden targets reached only from predicates are not added to the
         // modular environment: predicates are evaluated by
         // `MirBoolPredicateHoldsWithCallees`, which has no handler.
-        let (spec_linked, _predicate_external_specs) =
+        let (spec_linked, _predicate_external_specs, _predicate_trusted_callees) =
             graph.closure(&spec_root_refs, &subject_def_id, &mut read_outgoing);
         bundle.spec_callees = spec_linked;
     }
@@ -1975,6 +2002,87 @@ mod tests {
         assert!(
             obligations.contains("envAssumed := fun _ => True"),
             "a target reached only from a predicate is not assumed in the modular environment:\n{obligations}"
+        );
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn transitive_trusted_sibling_callee_is_abstracted_in_modular_environment() {
+        let workspace = unique_temp_dir("transitive-trusted-callee");
+        let unit_dir = workspace.join("target/anneal/units/my_crate-01");
+        fs::create_dir_all(unit_dir.join("Mir/MyCrate")).expect("create Mir/MyCrate");
+
+        let write_mir = |rel: &str, body_refs: &[&str]| {
+            let mut txt = String::from("prelude\nimport Init.Core\nimport Trusted\n");
+            for r in body_refs {
+                txt.push_str(&format!("-- call .fnDef \"{r}\" []\n"));
+            }
+            fs::write(unit_dir.join(rel), txt).expect("write mir file");
+        };
+        // `caller` calls `linked_mid`, which in turn calls `#[spec(trusted)]`
+        // sibling `trusted_leaf`.
+        write_mir("Mir/MyCrate/caller.lean", &["my_crate::linked_mid"]);
+        write_mir("Mir/MyCrate/linked_mid.lean", &["my_crate::trusted_leaf"]);
+        write_mir("Mir/MyCrate/trusted_leaf.lean", &[]);
+        write_mir("Mir/MyCrate/__anneal_attr_trusted_trusted_leaf.lean", &[]);
+
+        let rec = |def_id: &str, rel: &str, module: &str, kind, assoc: Option<&str>| {
+            UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id: def_id.to_string(),
+                    mir_module_path: rel.to_string(),
+                    mir_module_sha256: String::new(),
+                },
+                lean_module_name: module.to_string(),
+                item_kind: kind,
+                associated_subject_def_id: assoc.map(str::to_string),
+                trait_impls: Vec::new(),
+            }
+        };
+        let records = vec![
+            rec(
+                "my_crate::caller",
+                "Mir/MyCrate/caller.lean",
+                "Mir.MyCrate.caller",
+                CapturedItemKind::Subject,
+                None,
+            ),
+            rec(
+                "my_crate::linked_mid",
+                "Mir/MyCrate/linked_mid.lean",
+                "Mir.MyCrate.linked_mid",
+                CapturedItemKind::Subject,
+                None,
+            ),
+            rec(
+                "my_crate::trusted_leaf",
+                "Mir/MyCrate/trusted_leaf.lean",
+                "Mir.MyCrate.trusted_leaf",
+                CapturedItemKind::Subject,
+                None,
+            ),
+            rec(
+                "my_crate::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_trusted_trusted_leaf",
+                "Mir/MyCrate/__anneal_attr_trusted_trusted_leaf.lean",
+                "Mir.MyCrate.__anneal_attr_trusted_trusted_leaf",
+                CapturedItemKind::ExternalSpec,
+                Some("my_crate::trusted_leaf"),
+            ),
+        ];
+
+        scaffold_workspace(&workspace, &records)
+            .expect("scaffold workspace with transitive trusted callee");
+        let caller_ob =
+            fs::read_to_string(workspace.join(".anneal/generated/Obligations/MyCrate/caller.lean"))
+                .expect("read caller obligations");
+        assert!(
+            caller_ob.contains("def defaultCallees : List CapturedMir :=\n  [Mir.MyCrate.linked_mid.body]"),
+            "caller must link linked_mid and exclude trusted_leaf from defaultCallees:\n{caller_ob}"
+        );
+        assert!(
+            caller_ob.contains("envAssumed := Obligations.MyCrate.trusted_leaf.defaultCallContract.holdsOn"),
+            "caller must assume transitive trusted_leaf's defaultCallContract in envAssumed:\n{caller_ob}"
         );
 
         let _ = fs::remove_dir_all(&workspace);

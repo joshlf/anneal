@@ -575,6 +575,132 @@ def pointerValueValid (pointee : RigidTy) (v : Value) : Prop :=
         (∃ p sz metadata, v = .aggregate 0 (.ptr p sz :: metadata :: .nil))
 
 /--
+Pointwise element validity predicate over a tuple's `List RigidTy` field types
+and `List Value` runtime field values.
+
+Reference (The Rust Reference, "Tuple types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/tuple.html>
+
+> "Tuple types are a family of structural types for heterogeneous lists of
+> other types."
+-/
+@[reducible]
+def valuesMatchElemPred (P : RigidTy → Value → Prop) :
+    List RigidTy → List Value → Prop
+  | .nil, .nil => True
+  | ty :: tys, v :: vs => And (P ty v) (valuesMatchElemPred P tys vs)
+  | _, _ => False
+
+/--
+Homogeneous element validity predicate over an array's `List Value` elements.
+
+Reference (The Rust Reference, "Array types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/array.html>
+
+> "An array is a fixed-size sequence of `N` elements of type `T`."
+-/
+@[reducible]
+def valuesAllSatisfyPred (P : Value → Prop) : List Value → Prop
+  | .nil => True
+  | v :: vs => And (P v) (valuesAllSatisfyPred P vs)
+
+/--
+Whether every `RigidTy` in a list of tuple field types admits `Value.unit`
+(so the composite tuple is zero-sized and may be represented by `Value.unit`).
+-/
+@[reducible]
+def typesAllAdmitUnit (P : RigidTy → Value → Prop) : List RigidTy → Prop
+  | .nil => True
+  | ty :: tys => And (P ty .unit) (typesAllAdmitUnit P tys)
+
+/--
+Fuel-bounded recursive runtime `Value` validity predicate against a `RigidTy`,
+an optional top-level `layoutIdx` in `layouts`, and `LayoutTable`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Producing an invalid value. Producing a value happens any time a value is
+> assigned to or read from a place, passed to a function/primitive operation or
+> returned from a function/primitive operation."
+-/
+def valueValidForRigidTy :
+    Nat →
+    Trusted.Rustc.V2026_06_01.Layout.LayoutTable →
+    Option Nat →
+    RigidTy →
+    Value →
+    Prop
+  | 0, _, _, _, _ => True
+  | _ + 1, _, _, .bool, v =>
+    ∃ b : Nat, b < 2 ∧ v = .scalar { bits := b, sizeBytes := 1 }
+  | _ + 1, _, _, .char, v =>
+    ∃ cp : Nat,
+      (cp < 0xD800 ∨ (0xE000 ≤ cp ∧ cp ≤ 0x10FFFF)) ∧
+      v = .scalar { bits := cp, sizeBytes := 4 }
+  | _ + 1, _, _, .int w, v =>
+    match intCastTargetBytes (.int w) with
+    | .some bytes =>
+      ∃ bits : Nat,
+        bits < scalarModulus bytes ∧
+        v = .scalar { bits := bits, sizeBytes := bytes }
+    | .none => ∃ sv, v = .scalar sv
+  | _ + 1, _, _, .uint w, v =>
+    match intCastTargetBytes (.uint w) with
+    | .some bytes =>
+      ∃ bits : Nat,
+        bits < scalarModulus bytes ∧
+        v = .scalar { bits := bits, sizeBytes := bytes }
+    | .none => ∃ sv, v = .scalar sv
+  | _ + 1, _, _, .float _, v => ∃ sv, v = .scalar sv
+  | _ + 1, _, _, .never, _ => False
+  | _ + 1, _, _, .tuple .nil, v => Or (v = .unit) (v = .aggregate 0 .nil)
+  | fuel + 1, layouts, _, .tuple (elemTy :: restTys), v =>
+    Or
+      (v = .unit ∧
+        typesAllAdmitUnit
+          (valueValidForRigidTy fuel layouts .none)
+          (elemTy :: restTys))
+      (∃ fields,
+        v = .aggregate 0 fields ∧
+        Trusted.Sequence.length fields = Trusted.Sequence.length (elemTy :: restTys) ∧
+        valuesMatchElemPred
+          (valueValidForRigidTy fuel layouts .none)
+          (elemTy :: restTys)
+          fields)
+  | fuel + 1, layouts, _, .array elemTy len, v =>
+    Or
+      (v = .unit ∧
+        (len = 0 ∨ valueValidForRigidTy fuel layouts .none elemTy .unit))
+      (∃ elems,
+        v = .aggregate 0 elems ∧
+        Trusted.Sequence.length elems = len ∧
+        valuesAllSatisfyPred
+          (valueValidForRigidTy fuel layouts .none elemTy)
+          elems)
+  | _ + 1, _, _, .ref _ pointee, v => pointerValueValid pointee v
+  | _ + 1, _, _, .rawPtr _ pointee, v => pointerValueValid pointee v
+  | _ + 1, _, _, .fnPtr _ _ _ _, v => thinPointerValueValid v
+  | _ + 1, _, _, .fnDef _ _, v => Or (v = .unit) (v = .aggregate 0 .nil)
+  | _ + 1, _, _, .closure _ _, v =>
+    Or (v = .unit) (∃ vIdx fields, v = .aggregate vIdx fields)
+  | _ + 1, layouts, .some layoutIdx, .adt _ _, _ =>
+    match Trusted.Sequence.get? layouts.entries layoutIdx with
+    | .some layout =>
+      match layout.isUninhabited with
+      | true => False
+      | false => True
+    | .none => True
+  | _ + 1, _, .none, .adt _ _, _ => True
+  | _ + 1, _, _, .param _ _, _ => True
+  | _ + 1, _, _, .alias _ _, _ => True
+  | _ + 1, _, _, .slice _, _ => True
+  | _ + 1, _, _, .str, _ => True
+  | _ + 1, _, _, .dynamic _, _ => True
+  | _ + 1, _, _, .foreign _, _ => True
+  | _ + 1, _, _, .other _, _ => True
+
+/--
 Well-typed runtime `Value` validity predicate against a captured MIR `Ty` and
 `LayoutTable`, used to type the arguments and return value of default
 `#[external_spec]` call contracts.
@@ -591,7 +717,7 @@ representation that `MirSemantics` can produce for a valid value of `ty`:
   aggregates for slices, `str`, and `dyn Trait`), and function pointers are
   thin pointers;
 - tuples and arrays are `Value.unit` (zero-sized constants) or aggregates of the
-  declared arity;
+  declared arity whose elements recursively satisfy `valueValidForRigidTy`;
 - ADTs with an uninhabited layout have no valid value;
 - `!` has no valid value; and
 - generic parameters, aliases, unsized types (which are never passed or returned
@@ -614,62 +740,7 @@ def valueValidForTy
     (layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
     (ty : Ty)
     (v : Value) : Prop :=
-  match ty.kind with
-  | .bool =>
-    ∃ b : Nat, b < 2 ∧ v = .scalar { bits := b, sizeBytes := 1 }
-  | .char =>
-    ∃ cp : Nat,
-      (cp < 0xD800 ∨ (0xE000 ≤ cp ∧ cp ≤ 0x10FFFF)) ∧
-      v = .scalar { bits := cp, sizeBytes := 4 }
-  | .int w =>
-    match intCastTargetBytes (.int w) with
-    | .some bytes =>
-      ∃ bits : Nat,
-        bits < scalarModulus bytes ∧
-        v = .scalar { bits := bits, sizeBytes := bytes }
-    | .none => ∃ sv, v = .scalar sv
-  | .uint w =>
-    match intCastTargetBytes (.uint w) with
-    | .some bytes =>
-      ∃ bits : Nat,
-        bits < scalarModulus bytes ∧
-        v = .scalar { bits := bits, sizeBytes := bytes }
-    | .none => ∃ sv, v = .scalar sv
-  | .float _ => ∃ sv, v = .scalar sv
-  | .never => False
-  | .tuple elemTys =>
-    match elemTys with
-    | .nil => Or (v = .unit) (v = .aggregate 0 .nil)
-    | _ :: _ =>
-      Or (v = .unit)
-        (∃ fields,
-          v = .aggregate 0 fields ∧
-          Trusted.Sequence.length fields = Trusted.Sequence.length elemTys)
-  | .array _ len =>
-    Or (v = .unit)
-      (∃ elems,
-        v = .aggregate 0 elems ∧
-        Trusted.Sequence.length elems = len)
-  | .ref _ pointee => pointerValueValid pointee v
-  | .rawPtr _ pointee => pointerValueValid pointee v
-  | .fnPtr _ _ _ _ => thinPointerValueValid v
-  | .fnDef _ _ => Or (v = .unit) (v = .aggregate 0 .nil)
-  | .closure _ _ =>
-    Or (v = .unit) (∃ vIdx fields, v = .aggregate vIdx fields)
-  | .adt _ _ =>
-    match Trusted.Sequence.get? layouts.entries ty.layoutIdx with
-    | .some layout =>
-      match layout.isUninhabited with
-      | true => False
-      | false => True
-    | .none => True
-  | .param _ _ => True
-  | .alias _ _ => True
-  | .slice _ => True
-  | .str => True
-  | .dynamic _ => True
-  | .foreign _ => True
-  | .other _ => True
+  valueValidForRigidTy 8 layouts (.some ty.layoutIdx) ty.kind v
 
 /--
 Return-local layout and type validity predicate for local `_0` (`decl`) under
@@ -749,8 +820,10 @@ def argsMatchCalleeParamTys
 /--
 Frame condition relating the `Memory` at an external call site (`before`) to the
 `Memory` handed back by the callee (`after`): an external callee may mutate heap,
-global, borrow-tag, and caller-owned referent state, but it returns (or unwinds)
-to the same suspended call stack, active body, and immutable callee code table.
+global, fresh tag/protector counters, and caller-owned referent state, but it
+returns (or unwinds) to the same suspended call stack, active body, immutable
+callee code table, active caller protectors, caller stack-local borrows, and
+reified function-pointer table.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -766,7 +839,58 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 def callFramePreserved (before after : Memory) : Prop :=
   And (after.callees = before.callees)
     (And (after.callStack = before.callStack)
-      (after.activeCallee = before.activeCallee))
+      (And (after.activeCallee = before.activeCallee)
+        (And (after.activeProtectors = before.activeProtectors)
+          (And (after.borrows = before.borrows)
+            (after.fnPtrs = before.fnPtrs)))))
+
+/--
+Check whether any local declaration in `decls` is a signature-check function
+pointer with a non-unwinding ABI (`RigidTy.fnPtr _ _ _ .c` or
+`RigidTy.fnPtr _ _ _ .rustIntrinsic`).
+
+Reference (The Rust Reference, "External blocks - ABI"):
+<https://doc.rust-lang.org/1.98.0/reference/items/external-blocks.html#abi>
+
+> "The strings that end with `-unwind` ... are the same as the corresponding ABI
+> strings without `-unwind`, except that they allow the called function to
+> safely unwind the stack (for example, via a Rust panic or a C++ exception)
+> through the foreign frame into the caller's frame."
+-/
+@[reducible]
+def localDeclsHaveNounwindFnPtr : List LocalDecl → Bool
+  | .nil => false
+  | decl :: rest =>
+    match decl.ty.kind with
+    | .fnPtr _ _ _ .c => true
+    | .fnPtr _ _ _ .rustIntrinsic => true
+    | _ => localDeclsHaveNounwindFnPtr rest
+
+/--
+Determine from a captured `#[external_spec]` `sidecarBody` whether the target
+function's ABI permits stack unwinding (`.panicked`): returns `false` when the
+sidecar's own `fnAbi.canUnwind` is `false`, when `sidecarBody.fnAbi.conv` is
+`.c` or `.rustIntrinsic`, or when the sidecar's signature-check local has type
+`RigidTy.fnPtr _ _ _ .c`; returns `true` otherwise (such as `CallConv.rust` and
+`extern "C-unwind"`).
+
+Reference (The Rust Reference, "External blocks - ABI"):
+<https://doc.rust-lang.org/1.98.0/reference/items/external-blocks.html#abi>
+
+> "The strings that end with `-unwind` ... are the same as the corresponding ABI
+> strings without `-unwind`, except that they allow the called function to
+> safely unwind the stack (for example, via a Rust panic or a C++ exception)
+> through the foreign frame into the caller's frame."
+-/
+@[reducible]
+def sidecarTargetCanUnwind (sidecarBody : CapturedMir) : Bool :=
+  match sidecarBody.fnAbi.canUnwind with
+  | false => false
+  | true =>
+    match sidecarBody.fnAbi.conv with
+    | .c => false
+    | .rustIntrinsic => false
+    | _ => Bool.not (localDeclsHaveNounwindFnPtr sidecarBody.localDecls)
 
 /--
 Well-typed modular `MirCallContract` for an `#[external_spec(for = <target>)]`
@@ -779,9 +903,11 @@ optional `requires` clause `extraPre`. The postcondition assumes only what holds
 of every Rust or FFI callee with that signature: a normal return yields a value
 satisfying the return type and layout (`retMatchesCalleeReturnTy`) and the
 optional `ensures` clause `extraPost`, with arbitrary heap mutation but the same
-call frame (`callFramePreserved`); unwinding preserves the call frame; and
-aborting is unconstrained. It does not assume that the callee leaves memory
-unchanged or never panics, since neither follows from a signature or from
+call frame (`callFramePreserved`); unwinding is permitted when the target ABI
+can unwind (`sidecarTargetCanUnwind sidecarBody = true`, preserving the call
+frame) and forbidden for nounwind ABIs (`extern "C"`); and aborting is
+unconstrained. It does not assume that the callee leaves memory unchanged or
+that a Rust `fn` never panics, since neither follows from a signature or from
 `requires`/`ensures` clauses over arguments and return values.
 
 Reference (The Rust Reference, "Call expressions"):
@@ -814,7 +940,10 @@ def externalSpecCallContract
       And (callFramePreserved req.memory memAfter)
         (And (retMatchesCalleeReturnTy sidecarBody retVal)
           (extraPost req.args retVal))
-    | .panicked memAfter => callFramePreserved req.memory memAfter
+    | .panicked memAfter =>
+      match sidecarTargetCanUnwind sidecarBody with
+      | true => callFramePreserved req.memory memAfter
+      | false => False
     | .aborted => True
 
 /--

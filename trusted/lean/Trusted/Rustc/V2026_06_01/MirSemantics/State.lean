@@ -847,6 +847,7 @@ def rigidTyEqAux : Nat → RigidTy → RigidTy → Bool
       Bool.and (stringEq d₁ d₂) (rigidTyListEqAux fuel up₁ up₂)
     | .dynamic d₁, .dynamic d₂ => stringEq d₁ d₂
     | .foreign d₁, .foreign d₂ => stringEq d₁ d₂
+    | .param i₁ n₁, .param i₂ n₂ => Bool.and (Nat.beq i₁ i₂) (stringEq n₁ n₂)
     | .other r₁, .other r₂ => stringEq r₁ r₂
     | _, _ => false
 

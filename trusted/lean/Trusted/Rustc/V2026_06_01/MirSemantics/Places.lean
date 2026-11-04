@@ -1881,8 +1881,44 @@ def isThinRawPtrTy (ty : Ty) : Bool :=
   | _ => false
 
 /--
+Test whether a monomorphized caller `RigidTy` matches a (possibly polymorphic)
+callee declaration `RigidTy` up to generic type parameters (`RigidTy.param`).
+
+Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/mod.rs#L225-L246>
+
+> "/// The first local is the return value pointer, followed by `arg_count`
+> /// locals for the function arguments, followed by any user-declared
+> /// variables and temporaries."
+-/
+def rigidTyMatchesCalleeDecl : Nat → RigidTy → RigidTy → Bool
+  | .zero, callerTy, declTy => rigidTyEq callerTy declTy
+  | .succ _, _, .param _ _ => true
+  | .succ fuel, .ref m1 t1, .ref m2 t2 =>
+    Bool.and (mutabilityEq m1 m2) (rigidTyMatchesCalleeDecl fuel t1 t2)
+  | .succ fuel, .rawPtr m1 t1, .rawPtr m2 t2 =>
+    Bool.and (mutabilityEq m1 m2) (rigidTyMatchesCalleeDecl fuel t1 t2)
+  | .succ fuel, .slice t1, .slice t2 =>
+    rigidTyMatchesCalleeDecl fuel t1 t2
+  | .succ fuel, .array t1 n1, .array t2 n2 =>
+    Bool.and (Nat.beq n1 n2) (rigidTyMatchesCalleeDecl fuel t1 t2)
+  | .succ fuel, .tuple (t1 :: ts1), .tuple (t2 :: ts2) =>
+    Bool.and
+      (rigidTyMatchesCalleeDecl fuel t1 t2)
+      (rigidTyMatchesCalleeDecl fuel (.tuple ts1) (.tuple ts2))
+  | .succ fuel, .adt p1 (a1 :: as1), .adt p2 (a2 :: as2) =>
+    Bool.and
+      (stringEq p1 p2)
+      (Bool.and
+        (rigidTyMatchesCalleeDecl fuel a1 a2)
+        (rigidTyMatchesCalleeDecl fuel (.tuple as1) (.tuple as2)))
+  | .succ _, callerTy, declTy => rigidTyEq callerTy declTy
+
+/--
 Check that `fnInputs` pointwise match the `RigidTy` kinds of the leading
-parameter declarations in `paramDecls`.
+parameter declarations in `paramDecls` (allowing generic `RigidTy.param` slots
+in polymorphic `CapturedMir` bodies).
 
 Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -1897,7 +1933,7 @@ def calleeParamTysMatch : List RigidTy → List LocalDecl → Bool
   | _ :: _, .nil => false
   | inputTy :: restInputs, decl :: restDecls =>
     Bool.and
-      (rigidTyEq inputTy decl.ty.kind)
+      (rigidTyMatchesCalleeDecl 8 inputTy decl.ty.kind)
       (calleeParamTysMatch restInputs restDecls)
 
 /--
@@ -1928,7 +1964,7 @@ def calleeLocalDeclsCompatible
     Bool.and
       (Nat.ble argCount (length paramDecls))
       (Bool.and
-        (rigidTyEq fnOutput retDecl.ty.kind)
+        (rigidTyMatchesCalleeDecl 8 fnOutput retDecl.ty.kind)
         (calleeParamTysMatch fnInputs paramDecls))
 
 /--
@@ -2523,6 +2559,38 @@ def evalRvalue
               }
               .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
         | .none => .ub
+      | .some (.init (.aggregate 0 (.ptr parentPtr sz :: .scalar metaSc :: .nil))) =>
+        match restProj with
+        | .nil =>
+          match lookupBorrow mem.borrows parentPtr.tag with
+          | .some parentEntry =>
+            match parentEntry.perm, borrowKind with
+            | .disabled, _ => .ub
+            | .frozen, .mut _ => .ub
+            | _, _ =>
+              let tag := mem.nextTag
+              let entry : BorrowEntry := {
+                tag := tag
+                targetLocal := parentEntry.targetLocal
+                targetProjection := parentEntry.targetProjection
+                perm := perm
+                rangeOffset := parentEntry.rangeOffset
+                rangeLen := parentEntry.rangeLen
+              }
+              let mem' := {
+                mem with
+                borrows := entry :: mem.borrows
+                nextTag := Nat.add tag 1
+              }
+              .ok
+                (.aggregate 0
+                  (.ptr { allocId := tag, offsetBytes := parentPtr.offsetBytes } sz ::
+                    .scalar metaSc :: .nil))
+                locals
+                mem'
+          | .none =>
+            .ok (.aggregate 0 (.ptr parentPtr sz :: .scalar metaSc :: .nil)) locals mem
+        | _ :: _ => .ub
       | _ => .ub
     | _ =>
       match get? locals place.local_ with
@@ -2581,6 +2649,38 @@ def evalRvalue
               }
               .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
         | .none => .ub
+      | .some (.init (.aggregate 0 (.ptr parentPtr sz :: .scalar metaSc :: .nil))) =>
+        match restProj with
+        | .nil =>
+          match lookupBorrow mem.borrows parentPtr.tag with
+          | .some parentEntry =>
+            match parentEntry.perm, mutability with
+            | .disabled, _ => .ub
+            | .frozen, .mut => .ub
+            | _, _ =>
+              let tag := mem.nextTag
+              let entry : BorrowEntry := {
+                tag := tag
+                targetLocal := parentEntry.targetLocal
+                targetProjection := parentEntry.targetProjection
+                perm := perm
+                rangeOffset := parentEntry.rangeOffset
+                rangeLen := parentEntry.rangeLen
+              }
+              let mem' := {
+                mem with
+                borrows := entry :: mem.borrows
+                nextTag := Nat.add tag 1
+              }
+              .ok
+                (.aggregate 0
+                  (.ptr { allocId := tag, offsetBytes := parentPtr.offsetBytes } sz ::
+                    .scalar metaSc :: .nil))
+                locals
+                mem'
+          | .none =>
+            .ok (.aggregate 0 (.ptr parentPtr sz :: .scalar metaSc :: .nil)) locals mem
+        | _ :: _ => .ub
       | _ => .ub
     | _ =>
       match get? locals place.local_ with

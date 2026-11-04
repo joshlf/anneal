@@ -1625,7 +1625,10 @@ pub fn render_proof_template_with_options(
                sorry\n\n\
              end Proof.{item}\n"
         ));
-    } else if authored.is_modular {
+    } else if authored.is_modular
+        || (!authored.has_specs
+            && (!bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty()))
+    {
         out.push_str(&format!(
             "/-!\n\
              Durable modular proof module for `{def_id}`.\n\n\
@@ -2527,5 +2530,25 @@ mod tests {
             "MirBoolPredicateHolds Mir.MyCrate.math.__anodized_fn_ensures_inc.body \
              (List.append args (List.cons ret List.nil))"
         ));
+    }
+
+    #[test]
+    fn render_proof_template_emits_modular_claim_when_bundle_has_abstracted_callees() {
+        let records = vec![record("my_crate::caller", CapturedItemKind::Subject, None)];
+        let mut bundles = group_subject_obligations(&records);
+        let bundle = &mut bundles[0];
+        bundle.external_spec_callees.push(ExternalSpecContractRef {
+            target_def_id: "dep::ffi_op".to_string(),
+            sidecar_module_suffix: "MyCrate.ext_ffi_op".to_string(),
+            req_module_suffix: None,
+            ens_module_suffix: None,
+        });
+        let template = render_proof_template_with_options(bundle, AuthoredItemModules::default());
+        assert!(
+            template.contains(
+                "theorem verified : ModularVerificationResult Obligations.MyCrate.caller.modularClaim := by"
+            ),
+            "proof template for subject with external_spec_callees must target modularClaim:\n{template}"
+        );
     }
 }

@@ -1706,6 +1706,14 @@ pub fn helper_add(x: usize, y: usize) -> usize {
 pub fn overridden_dep(x: usize) -> usize {
     x.wrapping_add(5)
 }
+
+pub fn slice_len<T>(s: &[T]) -> usize {
+    // A direct `s.len()` is lowered to `PtrMetadata` by rustc; calling through
+    // a function pointer keeps a real call to `core::slice::<impl [T]>::len` in
+    // the MIR.
+    let len_fn: fn(&[T]) -> usize = <[T]>::len;
+    len_fn(s)
+}
 "#,
         )
         .expect("write crate_b/src/lib.rs");
@@ -1740,8 +1748,7 @@ pub fn ext_slice_is_empty(s: &[u8]) -> bool {
 }
 
 pub fn caller_default_callees(s: &[u8], extra: usize) -> usize {
-    let len_fn: fn(&[u8]) -> usize = <[u8]>::len;
-    crate_b::helper_add(len_fn(s), extra)
+    crate_b::helper_add(crate_b::slice_len(s), extra)
 }
 
 pub fn caller_with_external_specs(s: &[u8], x: usize) -> usize {
@@ -1761,10 +1768,7 @@ pub unsafe fn ext_ffi_checksum(len: usize) -> u32 {
 }
 
 pub fn caller_ffi_and_len(s: &[u8]) -> u32 {
-    // A direct `s.len()` is lowered to `PtrMetadata` by rustc; calling through
-    // a function pointer keeps a real call to `<[T]>::len` in the MIR.
-    let len_fn: fn(&[u8]) -> usize = <[u8]>::len;
-    unsafe { ffi_checksum(len_fn(s)) }
+    unsafe { ffi_checksum(crate_b::slice_len(s)) }
 }
 "#,
         )
@@ -1947,15 +1951,26 @@ pub fn caller_ffi_and_len(s: &[u8]) -> u32 {
         } else {
             PathBuf::from("lean")
         };
-        let lean_path_env = format!("{}:{}", lean_lib_dir.display(), gen_dir.display());
+        let proofs_dir = crate_a_dir.join("anneal/proofs");
+        let lean_path_env = format!(
+            "{}:{}:{}",
+            lean_lib_dir.display(),
+            gen_dir.display(),
+            proofs_dir.display()
+        );
 
         let compile_lean_file = |lean_file: &Path| {
             let dst_olean = lean_file.with_extension("olean");
+            let root_dir = if lean_file.starts_with(&proofs_dir) {
+                &proofs_dir
+            } else {
+                &gen_dir
+            };
             let out = Command::new(&lean_bin)
                 .current_dir(&gen_dir)
                 .env("LEAN_PATH", &lean_path_env)
                 .arg("-R")
-                .arg(&gen_dir)
+                .arg(root_dir)
                 .arg("-o")
                 .arg(&dst_olean)
                 .arg(lean_file)
@@ -1979,6 +1994,7 @@ pub fn caller_ffi_and_len(s: &[u8]) -> u32 {
 
         let verify_brief_3_2_path = gen_dir.join("VerifyBrief32.lean");
         let verify_brief_3_2_src = r#"import Trusted
+import Anneal
 import Obligations.CrateA.caller_default_callees
 import Obligations.CrateA.caller_with_external_specs
 import Obligations.CrateA.caller_ffi_and_len
@@ -2038,7 +2054,7 @@ example (sVal : Value) :
     Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
       { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
       (.returned (.scalar ⟨1, 1⟩) emptyMemory) :=
-  ⟨⟨rfl, rfl, rfl⟩, ⟨1, by decide, rfl⟩, trivial⟩
+  ⟨⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, ⟨1, by decide, rfl⟩, trivial⟩
 
 example (sVal : Value) :
     ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
@@ -2055,19 +2071,82 @@ example (sVal : Value) :
     Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
       { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
       (.returned (.scalar ⟨0, 1⟩) { emptyMemory with nextAllocId := 7, nextTag := 9 }) :=
-  ⟨⟨rfl, rfl, rfl⟩, ⟨0, by decide, rfl⟩, trivial⟩
+  ⟨⟨rfl, rfl, rfl, rfl, rfl, rfl⟩, ⟨0, by decide, rfl⟩, trivial⟩
 
 example (sVal : Value) :
     Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
       { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
       (.panicked { emptyMemory with nextTag := 3 }) :=
-  ⟨rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 example (sVal : Value) :
     Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
       { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
       .aborted :=
   trivial
+
+-- 5b. `callFramePreserved` rejects external call responses that clobber the
+--     caller's `activeProtectors`, `borrows`, or `fnPtrs` tables.
+example (sVal : Value) :
+    ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
+      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      (.returned (.scalar ⟨0, 1⟩) { emptyMemory with activeProtectors := [1] }) := by
+  rintro ⟨⟨_, _, _, h_prot, _, _⟩, _, _⟩
+  cases h_prot
+
+-- 5c. `valueValidForTy` recursively validates nested element types of `.tuple`
+--     and `.array` values, rejecting ill-typed elements and non-ZST `.unit`
+--     while still admitting `.unit` for zero-sized tuples and empty arrays.
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    valueValidForTy L { kind := .tuple [.uint .u8, .bool], layoutIdx := 0 }
+      (.aggregate 0 [.scalar ⟨255, 1⟩, .scalar ⟨1, 1⟩]) :=
+  Or.inr ⟨[.scalar ⟨255, 1⟩, .scalar ⟨1, 1⟩], rfl, rfl, ⟨255, by decide, rfl⟩, ⟨1, by decide, rfl⟩, trivial⟩
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    ¬ valueValidForTy L { kind := .tuple [.uint .u8, .bool], layoutIdx := 0 }
+      (.aggregate 0 [.scalar ⟨255, 1⟩, .scalar ⟨2, 1⟩]) := by
+  rintro (⟨h_unit, _⟩ | ⟨fields, h_agg, _, h_elems⟩)
+  · cases h_unit
+  · cases h_agg
+    rcases h_elems with ⟨_, ⟨b, hb_lt, h_eq⟩, _⟩
+    cases h_eq
+    omega
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    ¬ valueValidForTy L { kind := .tuple [.uint .u8, .bool], layoutIdx := 0 } .unit := by
+  rintro (⟨_, ⟨bits, _, h_sc⟩, _⟩ | ⟨fields, h_agg, _⟩)
+  · cases h_sc
+  · cases h_agg
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    valueValidForTy L { kind := .tuple [.tuple [], .tuple []], layoutIdx := 0 } .unit :=
+  Or.inl ⟨rfl, Or.inl rfl, Or.inl rfl, trivial⟩
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    valueValidForTy L { kind := .array .bool 2, layoutIdx := 0 }
+      (.aggregate 0 [.scalar ⟨0, 1⟩, .scalar ⟨1, 1⟩]) :=
+  Or.inr ⟨[.scalar ⟨0, 1⟩, .scalar ⟨1, 1⟩], rfl, rfl, ⟨0, by decide, rfl⟩, ⟨1, by decide, rfl⟩, trivial⟩
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    ¬ valueValidForTy L { kind := .array .bool 2, layoutIdx := 0 }
+      (.aggregate 0 [.scalar ⟨0, 1⟩, .scalar ⟨2, 1⟩]) := by
+  rintro (⟨h_unit, _⟩ | ⟨elems, h_agg, _, h_elems⟩)
+  · cases h_unit
+  · cases h_agg
+    rcases h_elems with ⟨_, ⟨b, hb_lt, h_eq⟩, _⟩
+    cases h_eq
+    omega
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    ¬ valueValidForTy L { kind := .array .bool 2, layoutIdx := 0 } .unit := by
+  rintro (⟨_, h_len | ⟨b, _, h_sc⟩⟩ | ⟨elems, h_agg, _⟩)
+  · cases h_len
+  · cases h_sc
+  · cases h_agg
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    valueValidForTy L { kind := .array (.uint .u8) 0, layoutIdx := 0 } .unit :=
+  Or.inl ⟨rfl, Or.inl rfl⟩
 
 -- 6. The default input contract requires well-typed arguments: the `&[u8]`
 --    parameter must be a wide (pointer, length) aggregate, not a thin pointer.
@@ -2108,7 +2187,8 @@ example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (p : ProvenancePtr) :
 
 -- 8. The FFI target has no captured body, so a call to it is a `MirCallE`
 --    interaction bound only by its external call contract, whose postcondition
---    types the `u32` result.
+--    types the `u32` result and forbids `.panicked` for `extern "C"` (nounwind)
+--    targets.
 example (lenVal : Value) :
     ¬ Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum.post
       { defPath := "ffi_checksum", args := [lenVal], memory := emptyMemory }
@@ -2116,6 +2196,12 @@ example (lenVal : Value) :
   rintro ⟨_, ⟨bits, h_lt, h_ret⟩, _⟩
   cases h_ret
   exact absurd h_lt (by decide)
+
+example (lenVal : Value) (memAfter : Memory) :
+    ¬ Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum.post
+      { defPath := "ffi_checksum", args := [lenVal], memory := emptyMemory }
+      (.panicked memAfter) :=
+  id
 
 -- 9. Every abstracted callee is assumed in the modular environment.
 example (h : ExternalCallHandler)
@@ -2127,10 +2213,192 @@ example (h : ExternalCallHandler)
   first
   | exact ⟨h1, h2⟩
   | exact ⟨h2, h1⟩
+
+-- 10. End-to-end modular proof of `caller_ffi_and_len`: steps through
+--     `crate_b::slice_len` and `core::slice::<impl [T]>::len` via `defaultCallees`
+--     and discharges `ffi_checksum` via `externalCallContract_CrateA_ext_ffi_checksum`.
+instance callerFfiAndLenSpec : ModularItemSpec "crate_a::caller_ffi_and_len" :=
+  Obligations.CrateA.caller_ffi_and_len.refineModularSpec
+    Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum.holdsOn
+    (fun args mem =>
+      (∃ p : ProvenancePtr, ∃ n : Nat,
+        n < 18446744073709551616 ∧
+        args = [.aggregate 0 [.ptr p 8, .scalar { bits := n, sizeBytes := 8 }]]) ∧
+      mem = (initMachineState Mir.CrateA.caller_ffi_and_len.body args).memory)
+    (fun _ _ ret _ =>
+      ∃ bits : Nat, bits < 4294967296 ∧ ret = .scalar { bits := bits, sizeBytes := 4 })
+
+theorem callerFfiAndLen_verified :
+    ModularVerificationResult Obligations.CrateA.caller_ffi_and_len.modularClaim := by
+  refine Anneal.Rustc.V2026_06_01.SymbolicEval.verifyModularContractWithCalleesMirSym
+    Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
+    Mir.CrateA.caller_ffi_and_len.body
+    Obligations.CrateA.caller_ffi_and_len.defaultCallees
+    callerFfiAndLenSpec.pre
+    callerFfiAndLenSpec.post
+    10
+    ?_
+  rintro args mem ⟨_, ⟨p, n, hn, rfl⟩, rfl⟩
+  refine ⟨⟨rfl, rfl, ⟨⟨n, hn, rfl⟩, trivial⟩, trivial⟩, ?_⟩
+  intro ans h_post
+  cases ans with
+  | returned retVal memAfter =>
+    rcases h_post with ⟨⟨_, h_stack, h_active, _, _, _⟩, h_ret, _⟩
+    have h_act : memAfter.activeCallee = .some Mir.CrateA.caller_ffi_and_len.body := h_active
+    have h_stk : memAfter.callStack = .nil := h_stack
+    change
+      Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+        Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
+        1
+        Mir.CrateA.caller_ffi_and_len.body
+        (.running {
+          frame := {
+            blockIdx := 2
+            stmtIdx := 0
+            locals := [.init retVal, .init (.aggregate 0 [.ptr p 8, .scalar { bits := n, sizeBytes := 8 }]), .uninit]
+          }
+          memory := memAfter
+        })
+        _
+    unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+    dsimp only [
+      Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTreeModular,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirSymTree,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.evalTerminatorSymTree,
+      evalTerminator
+    ]
+    rw [h_act, h_stk]
+    intro r m h_out
+    cases h_out
+    exact ⟨trivial, h_ret⟩
+  | panicked memAfter =>
+    exact False.elim h_post
+  | aborted =>
+    intro r m h_out
+    nomatch h_out
 "#;
         fs::write(&verify_brief_3_2_path, verify_brief_3_2_src.as_bytes())
             .expect("write VerifyBrief32.lean");
         compile_lean_file(&verify_brief_3_2_path);
+
+        // Also author `Specs/CrateA/caller_ffi_and_len.lean` and `Proof/CrateA/caller_ffi_and_len.lean`
+        // so `refresh_workspace_assembly` generates `Verify/CrateA/caller_ffi_and_len.lean` and the
+        // Lean 4 kernel checks the full generated verification chain end-to-end.
+        let caller_ffi_specs_path = crate_a_dir
+            .join("anneal/proofs/Specs/CrateA/caller_ffi_and_len.lean");
+        fs::create_dir_all(caller_ffi_specs_path.parent().expect("specs parent"))
+            .expect("create Specs/CrateA");
+        fs::write(
+            &caller_ffi_specs_path,
+            r#"import Trusted.VerificationResult
+import Mir.CrateA.caller_ffi_and_len
+import Obligations.CrateA.caller_ffi_and_len
+
+namespace Specs.CrateA.caller_ffi_and_len
+
+open Trusted
+open Trusted.Sequence
+open Trusted.VerificationResult
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+
+instance : ModularItemSpec "crate_a::caller_ffi_and_len" :=
+  Obligations.CrateA.caller_ffi_and_len.refineModularSpec
+    Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum.holdsOn
+    (fun args mem =>
+      (∃ p : ProvenancePtr, ∃ n : Nat,
+        n < 18446744073709551616 ∧
+        args = [.aggregate 0 [.ptr p 8, .scalar { bits := n, sizeBytes := 8 }]]) ∧
+      mem = (initMachineState Mir.CrateA.caller_ffi_and_len.body args).memory)
+    (fun _ _ ret _ =>
+      ∃ bits : Nat, bits < 4294967296 ∧ ret = .scalar { bits := bits, sizeBytes := 4 })
+
+end Specs.CrateA.caller_ffi_and_len
+"#,
+        )
+        .expect("write Specs/CrateA/caller_ffi_and_len.lean");
+
+        let caller_ffi_proof_path = crate_a_dir
+            .join("anneal/proofs/Proof/CrateA/caller_ffi_and_len.lean");
+        fs::create_dir_all(caller_ffi_proof_path.parent().expect("proof parent"))
+            .expect("create Proof/CrateA");
+        fs::write(
+            &caller_ffi_proof_path,
+            r#"import Trusted.VerificationResult
+import Anneal.Rustc.V2026_06_01.SymbolicEval
+import Mir.CrateA.caller_ffi_and_len
+import Obligations.CrateA.caller_ffi_and_len
+import Specs.CrateA.caller_ffi_and_len
+
+namespace Proof.CrateA.caller_ffi_and_len
+
+open Trusted
+open Trusted.Sequence
+open Trusted.VerificationResult
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+
+theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_len.modularClaim := by
+  refine Anneal.Rustc.V2026_06_01.SymbolicEval.verifyModularContractWithCalleesMirSym
+    Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
+    Mir.CrateA.caller_ffi_and_len.body
+    Obligations.CrateA.caller_ffi_and_len.defaultCallees
+    (inferInstance : ModularItemSpec "crate_a::caller_ffi_and_len").pre
+    (inferInstance : ModularItemSpec "crate_a::caller_ffi_and_len").post
+    10
+    ?_
+  rintro args mem ⟨_, ⟨p, n, hn, rfl⟩, rfl⟩
+  refine ⟨⟨rfl, rfl, ⟨⟨n, hn, rfl⟩, trivial⟩, trivial⟩, ?_⟩
+  intro ans h_post
+  cases ans with
+  | returned retVal memAfter =>
+    rcases h_post with ⟨⟨_, h_stack, h_active, _, _, _⟩, h_ret, _⟩
+    have h_act : memAfter.activeCallee = .some Mir.CrateA.caller_ffi_and_len.body := h_active
+    have h_stk : memAfter.callStack = .nil := h_stack
+    change
+      Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+        Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
+        1
+        Mir.CrateA.caller_ffi_and_len.body
+        (.running {
+          frame := {
+            blockIdx := 2
+            stmtIdx := 0
+            locals := [.init retVal, .init (.aggregate 0 [.ptr p 8, .scalar { bits := n, sizeBytes := 8 }]), .uninit]
+          }
+          memory := memAfter
+        })
+        _
+    unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+    dsimp only [
+      Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTreeModular,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirSymTree,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.evalTerminatorSymTree,
+      evalTerminator
+    ]
+    rw [h_act, h_stk]
+    intro r m h_out
+    cases h_out
+    exact ⟨trivial, h_ret⟩
+  | panicked memAfter =>
+    exact False.elim h_post
+  | aborted =>
+    intro r m h_out
+    nomatch h_out
+
+end Proof.CrateA.caller_ffi_and_len
+"#,
+        )
+        .expect("write Proof/CrateA/caller_ffi_and_len.lean");
+
+        crate::scaffold::refresh_workspace_assembly(&crate_a_dir)
+            .expect("refresh workspace assembly after authoring caller_ffi_and_len");
+        compile_lean_file(&caller_ffi_specs_path);
+        compile_lean_file(&gen_dir.join("Obligations/CrateA/caller_ffi_and_len.lean"));
+        compile_lean_file(&caller_ffi_proof_path);
+        compile_lean_file(&gen_dir.join("Verify/CrateA/caller_ffi_and_len.lean"));
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -218,7 +218,7 @@ impl CrateContractIndex {
                     && let Some(&sidecar_local_id) =
                         local_def_ids_by_parent.get(&(parent, spec_ident.to_owned()))
                     && let Some(from_mir) =
-                        resolve_external_spec_target_from_sidecar(tcx, sidecar_local_id)
+                        resolve_external_spec_target_from_sidecar(tcx, sidecar_local_id, &raw_target)
                 {
                     from_mir
                 } else {
@@ -463,14 +463,16 @@ fn extract_sidecar_target_fn_def<'tcx>(
     tcx: TyCtxt<'tcx>,
     sidecar_def_id: DefId,
     mut ty: rustc_middle::ty::Ty<'tcx>,
+    resolve_trait_impl: bool,
 ) -> Option<DefId> {
+    use rustc_middle::ty::TypeVisitableExt;
     loop {
         match ty.kind() {
             rustc_middle::ty::TyKind::Ref(_, inner, _)
             | rustc_middle::ty::TyKind::RawPtr(inner, _) => {
                 ty = *inner;
             }
-            rustc_middle::ty::TyKind::FnDef(def_id, _) => {
+            rustc_middle::ty::TyKind::FnDef(def_id, args) => {
                 if *def_id == sidecar_def_id {
                     return None;
                 }
@@ -482,6 +484,38 @@ fn extract_sidecar_target_fn_def<'tcx>(
                 {
                     return None;
                 }
+                if resolve_trait_impl
+                    && tcx
+                        .opt_parent(*def_id)
+                        .is_some_and(|p| matches!(tcx.def_kind(p), DefKind::Trait))
+                {
+                    let typing_env = rustc_middle::ty::TypingEnv::post_analysis(tcx, sidecar_def_id);
+                    let erased_args = tcx.erase_and_anonymize_regions(*args);
+                    let resolve_env = if !erased_args.has_non_region_param() {
+                        rustc_middle::ty::TypingEnv::fully_monomorphized()
+                    } else {
+                        typing_env
+                    };
+                    let norm_args = if !erased_args.has_escaping_bound_vars() {
+                        tcx.try_normalize_erasing_regions(
+                            resolve_env,
+                            rustc_middle::ty::Unnormalized::new_wip(erased_args),
+                        )
+                        .unwrap_or(erased_args)
+                    } else {
+                        erased_args
+                    };
+                    if !norm_args.has_escaping_bound_vars()
+                        && let Ok(Some(instance)) = rustc_middle::ty::Instance::try_resolve(
+                            tcx,
+                            resolve_env,
+                            *def_id,
+                            norm_args,
+                        )
+                    {
+                        return Some(instance.def_id());
+                    }
+                }
                 return Some(*def_id);
             }
             _ => return None,
@@ -489,18 +523,17 @@ fn extract_sidecar_target_fn_def<'tcx>(
     }
 }
 
-/// Resolves the canonical `def_path` of the target function referenced inside an
-/// `#[external_spec(for = <target>)]` sidecar function's signature-check
-/// statement.
-fn resolve_external_spec_target_from_sidecar(
-    tcx: TyCtxt<'_>,
-    sidecar_local_def_id: LocalDefId,
-) -> Option<String> {
-    let sidecar_def_id = sidecar_local_def_id.to_def_id();
-    let body = query_post_cleanup_mir(tcx, sidecar_local_def_id);
+pub(crate) fn resolve_sidecar_target_def_id_from_body<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sidecar_def_id: DefId,
+    body: &rustc_middle::mir::Body<'tcx>,
+    resolve_trait_impl: bool,
+) -> Option<DefId> {
     for decl in &body.local_decls {
-        if let Some(target_def_id) = extract_sidecar_target_fn_def(tcx, sidecar_def_id, decl.ty) {
-            return Some(canonical_def_path(tcx, target_def_id));
+        if let Some(target_def_id) =
+            extract_sidecar_target_fn_def(tcx, sidecar_def_id, decl.ty, resolve_trait_impl)
+        {
+            return Some(target_def_id);
         }
     }
     for bb in body.basic_blocks.iter() {
@@ -508,13 +541,37 @@ fn resolve_external_spec_target_from_sidecar(
             func: rustc_middle::mir::Operand::Constant(c),
             ..
         } = &bb.terminator().kind
-            && let Some(target_def_id) =
-                extract_sidecar_target_fn_def(tcx, sidecar_def_id, c.const_.ty())
+            && let Some(target_def_id) = extract_sidecar_target_fn_def(
+                tcx,
+                sidecar_def_id,
+                c.const_.ty(),
+                resolve_trait_impl,
+            )
         {
-            return Some(canonical_def_path(tcx, target_def_id));
+            return Some(target_def_id);
         }
     }
     None
+}
+
+/// Resolves the canonical `def_path` of the target function referenced inside an
+/// `#[external_spec(for = <target>)]` sidecar function's signature-check
+/// statement.
+///
+/// When `raw_target` specifies a concrete trait-impl projection (`<Type as Trait>::method`),
+/// resolves the trait method `FnDef` through `rustc_middle::ty::Instance::try_resolve`
+/// so the contract targets only that specific implementation rather than every
+/// implementation of the trait method.
+fn resolve_external_spec_target_from_sidecar(
+    tcx: TyCtxt<'_>,
+    sidecar_local_def_id: LocalDefId,
+    raw_target: &str,
+) -> Option<String> {
+    let sidecar_def_id = sidecar_local_def_id.to_def_id();
+    let resolve_trait_impl = raw_target.contains(" as ") || raw_target.trim_start().starts_with('<');
+    let body = query_post_cleanup_mir(tcx, sidecar_local_def_id);
+    resolve_sidecar_target_def_id_from_body(tcx, sidecar_def_id, body, resolve_trait_impl)
+        .map(|target_def_id| canonical_def_path(tcx, target_def_id))
 }
 
 pub(crate) fn normalize_target_path(

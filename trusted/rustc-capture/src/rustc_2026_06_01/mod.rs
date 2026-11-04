@@ -641,6 +641,26 @@ pub unsafe fn ext_raw_parts_mut<'a>(data: *mut u8, len: usize) -> &'a mut [u8] {
     let _ = (data, len);
     unreachable!()
 }
+
+pub trait MyTrait {
+    fn trait_op(&self) -> u32;
+}
+
+pub struct LocalStruct(pub u32);
+
+impl MyTrait for LocalStruct {
+    fn trait_op(&self) -> u32 {
+        self.0
+    }
+}
+
+pub const __ANNEAL_EXT_SPEC_TARGET_ext_trait_impl_op: &str = "<LocalStruct as MyTrait>::trait_op";
+pub fn ext_trait_impl_op(s: &LocalStruct) -> u32 {
+    let _: fn(&LocalStruct) -> u32 =
+        *::core::hint::black_box(&<LocalStruct as MyTrait>::trait_op);
+    let _ = (s,);
+    unreachable!()
+}
 "#;
         fs::write(&src_path, sample_rust.as_bytes()).expect("write ext_spec_lib.rs");
 
@@ -710,6 +730,17 @@ pub unsafe fn ext_raw_parts_mut<'a>(data: *mut u8, len: usize) -> &'a mut [u8] {
         assert_eq!(
             raw_parts_ext.associated_subject_def_id.as_deref(),
             Some("core::slice::from_raw_parts_mut")
+        );
+
+        let trait_impl_ext = parsed
+            .unit_targets
+            .iter()
+            .find(|t| t.target.def_id == "ext_spec_demo::ext_trait_impl_op")
+            .expect("find ext_trait_impl_op");
+        assert_eq!(trait_impl_ext.item_kind, CapturedItemKind::ExternalSpec);
+        assert_eq!(
+            trait_impl_ext.associated_subject_def_id.as_deref(),
+            Some("ext_spec_demo::<LocalStruct as MyTrait>::trait_op")
         );
 
         let _ = fs::remove_dir_all(&temp_root);
