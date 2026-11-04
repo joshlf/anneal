@@ -2913,14 +2913,21 @@ theorem MirUbWaivedWpConverges.conj
   rw [wpMirUbWaivedSym_eq_wpMirUbWaivedBounded]
   exact wpCoalBounded_conj h₁' h₂'
 
+/-- Total-correctness (`DWP mirUbWaivedWP`) soundness of `MirUbWaivedWpConverges`. -/
+theorem dwp_of_mirUbWaivedWpConverges
+    {body : CapturedMir} {s : MachineState} {post : MirOutcome → Prop}
+    (h : MirUbWaivedWpConverges body s post) :
+    DWP mirUbWaivedWP (mirTree body s) (fun out _ => post out) PUnit.unit := by
+  rcases h with ⟨fuel, h_wp⟩
+  rw [wpMirUbWaivedSym_eq_wpMirUbWaivedBounded] at h_wp
+  exact dwp_cofix_of_wpCoalBounded fuel h_wp
+
 /-- Partial-correctness (`DWLP mirUbWaivedWP`) soundness of `MirUbWaivedWpConverges`. -/
 theorem dwlp_of_mirUbWaivedWpConverges
     {body : CapturedMir} {s : MachineState} {post : MirOutcome → Prop}
     (h : MirUbWaivedWpConverges body s post) :
-    DWLP mirUbWaivedWP (mirTree body s) (fun out _ => post out) PUnit.unit := by
-  rcases h with ⟨fuel, h_wp⟩
-  rw [wpMirUbWaivedSym_eq_wpMirUbWaivedBounded] at h_wp
-  exact dwlp_cofix_of_wpCoalBounded h_wp
+    DWLP mirUbWaivedWP (mirTree body s) (fun out _ => post out) PUnit.unit :=
+  (dwp_of_mirUbWaivedWpConverges h).toDWLP
 
 /--
 Fuel-free discharge of `UbExceptionVerificationResult c` from `MirWpConverges`
@@ -3105,6 +3112,20 @@ theorem MirModularWpConverges.conj
   exact wpCoalBounded_conj h₁' h₂'
 
 /--
+Total-correctness (`DWP (mirModularWP contract.toCallContract)`) soundness of
+`MirModularWpConverges`.
+-/
+theorem dwp_of_mirModularWpConverges
+    {contract : MirCallContract} {body : CapturedMir} {s : MachineState}
+    {post : MirOutcome → Prop}
+    (h : MirModularWpConverges contract body s post) :
+    DWP (mirModularWP contract.toCallContract) (mirTree body s)
+      (fun out _ => post out) PUnit.unit := by
+  rcases h with ⟨fuel, h_wp⟩
+  rw [wpMirModularSym, wpMirExecModularSym_eq_wpCoalBounded] at h_wp
+  exact dwp_cofix_of_wpCoalBounded fuel h_wp
+
+/--
 Partial-correctness (`DWLP (mirModularWP contract.toCallContract)`) soundness of
 `MirModularWpConverges`.
 -/
@@ -3113,10 +3134,8 @@ theorem dwlp_of_mirModularWpConverges
     {post : MirOutcome → Prop}
     (h : MirModularWpConverges contract body s post) :
     DWLP (mirModularWP contract.toCallContract) (mirTree body s)
-      (fun out _ => post out) PUnit.unit := by
-  rcases h with ⟨fuel, h_wp⟩
-  rw [wpMirModularSym, wpMirExecModularSym_eq_wpCoalBounded] at h_wp
-  exact dwlp_cofix_of_wpCoalBounded h_wp
+      (fun out _ => post out) PUnit.unit :=
+  (dwp_of_mirModularWpConverges h).toDWLP
 
 /--
 Fuel-free discharge of `ModularVerificationResult` for `body` under
@@ -3649,6 +3668,211 @@ theorem MirTraceStepsConverges.of_stepsConverges
       · exact False.elim h_st
 
 /--
+Trace-prefix shift invariance for `wpMirExecTraceStepsSym`: starting at trace
+`tr₁ ++ tr₂` is equivalent to starting at `tr₂` with shifted intermediate and
+final trace predicates.
+-/
+theorem wpMirExecTraceStepsSym_append
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (tr₁ tr₂ : List (Event MirEffect))
+    (mid : MirExecState → List (Event MirEffect) → Prop)
+    (post : List (Event MirEffect) → MirOutcome → Prop) :
+    wpMirExecTraceStepsSym fuel body st (tr₁ ++ tr₂) mid post ↔
+      wpMirExecTraceStepsSym fuel body st tr₂
+        (fun st' tr => mid st' (tr₁ ++ tr))
+        (fun tr out => post (tr₁ ++ tr) out) := by
+  induction fuel generalizing st tr₂ with
+  | zero => exact Iff.rfl
+  | succ fuel' ih =>
+    unfold wpMirExecTraceStepsSym
+    rw [evalSymNodeTreeTraceNoCall_eq, evalSymNodeTreeTraceNoCall_eq, stepMirExecSymTree_eval]
+    cases stepMirState body st with
+    | ret _ => exact Iff.rfl
+    | tau st' => exact ih st' tr₂
+    | vis i k =>
+      rcases i with f | (e | c)
+      · exact Iff.rfl
+      · cases e
+        dsimp [evalNodeTraceNoCallWP]
+        rw [List.append_assoc]
+        exact ih (k PUnit.unit) _
+      · exact Iff.rfl
+
+/--
+Fuel-free transitivity of `MirTraceStepsConverges` across multi-stage
+trace-accumulating executions.
+-/
+theorem MirTraceStepsConverges.trans
+    {body : CapturedMir} {s : MachineState}
+    {mid₁ mid₂ : MachineState → List (Event MirEffect) → Prop}
+    {post : List (Event MirEffect) → MirOutcome → Prop}
+    (h₁ : MirTraceStepsConverges body s mid₁ post)
+    (h₂ :
+      ∀ s' tr₁,
+        mid₁ s' tr₁ →
+        MirTraceStepsConverges body s'
+          (fun s'' tr₂ => mid₂ s'' (tr₁ ++ tr₂))
+          (fun tr₂ out => post (tr₁ ++ tr₂) out)) :
+    MirTraceStepsConverges body s mid₂ post := by
+  rcases h₁ with ⟨f₁, hf₁⟩
+  suffices ∀ (st : MirExecState) (tr : List (Event MirEffect)),
+      wpMirExecTraceStepsSym f₁ body st tr
+        (fun
+          | .running s', tr' => mid₁ s' tr'
+          | .halted out, tr' => post tr' out
+          | .faulted _, _ => False)
+        post →
+      ∃ f : Nat,
+        wpMirExecTraceStepsSym f body st tr
+          (fun
+            | .running s', tr' => mid₂ s' tr'
+            | .halted out, tr' => post tr' out
+            | .faulted _, _ => False)
+          post from
+    this (.running s) [] hf₁
+  clear hf₁
+  induction f₁ with
+  | zero =>
+    intro st tr h_st
+    cases st with
+    | running s' =>
+      rcases h₂ s' tr h_st with ⟨f₂, hf₂⟩
+      refine ⟨f₂, ?_⟩
+      have h_mid_eq :
+          (fun (st' : MirExecState) (tr₁ : List (Event MirEffect)) =>
+            (fun
+              | MirExecState.running s'', tr' => mid₂ s'' tr'
+              | MirExecState.halted out, tr' => post tr' out
+              | MirExecState.faulted _, _ => False) st' (tr ++ tr₁)) =
+          (fun
+            | MirExecState.running s'', tr₁ => mid₂ s'' (tr ++ tr₁)
+            | MirExecState.halted out, tr₁ => post (tr ++ tr₁) out
+            | MirExecState.faulted _, _ => False) := by
+        funext st' tr₁
+        cases st' <;> rfl
+      have h_app :=
+        (wpMirExecTraceStepsSym_append f₂ body (.running s') tr []
+          (fun
+            | .running s'', tr' => mid₂ s'' tr'
+            | .halted out, tr' => post tr' out
+            | .faulted _, _ => False)
+          post).2 (h_mid_eq.symm ▸ hf₂)
+      simpa only [List.append_nil] using h_app
+    | halted out => exact ⟨0, h_st⟩
+    | faulted _ => exact False.elim h_st
+  | succ f₁' ih =>
+    intro st tr h_st
+    unfold wpMirExecTraceStepsSym at h_st
+    have h_ex :
+        evalSymNodeTreeTraceNoCall
+          (fun st' tr' =>
+            ∃ f,
+              wpMirExecTraceStepsSym f body st' tr'
+                (fun
+                  | .running s', tr'' => mid₂ s' tr''
+                  | .halted out, tr'' => post tr'' out
+                  | .faulted _, _ => False)
+                post)
+          post tr
+          (stepMirExecSymTree body st) := by
+      refine evalSymNodeTreeTraceNoCall_mono ?_ (fun _ _ hp => hp) h_st
+      intro st' tr' h_st'
+      exact ih st' tr' h_st'
+    rcases evalSymNodeTreeTraceNoCall_exists_fuel (stepMirExecSymTree body st) h_ex with
+      ⟨f₂, hf₂⟩
+    exact ⟨f₂ + 1, hf₂⟩
+
+/--
+Single-step symbolic unfolding rule for `MirTraceStepsConverges`.
+-/
+theorem MirTraceStepsConverges.step
+    {body : CapturedMir} {s : MachineState}
+    {mid : MachineState → List (Event MirEffect) → Prop}
+    {post : List (Event MirEffect) → MirOutcome → Prop}
+    (h :
+      evalSymNodeTreeTraceNoCall
+        (fun
+          | .running s', tr₁ =>
+            MirTraceStepsConverges body s'
+              (fun s'' tr₂ => mid s'' (tr₁ ++ tr₂))
+              (fun tr₂ out => post (tr₁ ++ tr₂) out)
+          | .halted out, tr₁ => post tr₁ out
+          | .faulted _, _ => False)
+        post []
+        (stepMirSymTree body s)) :
+    MirTraceStepsConverges body s mid post :=
+  MirTraceStepsConverges.trans
+    (mid₁ := fun s' tr₁ =>
+      MirTraceStepsConverges body s'
+        (fun s'' tr₂ => mid s'' (tr₁ ++ tr₂))
+        (fun tr₂ out => post (tr₁ ++ tr₂) out))
+    ⟨1, h⟩
+    (fun _ _ h_next => h_next)
+
+/-- Single-step silent `.tau` transition rule for `MirTraceStepsConverges`. -/
+theorem MirTraceStepsConverges.step_tau
+    {body : CapturedMir} {s s' : MachineState}
+    {mid : MachineState → List (Event MirEffect) → Prop}
+    {post : List (Event MirEffect) → MirOutcome → Prop}
+    (h_step : stepMirFn body s = .tau (.running s'))
+    (h_next : MirTraceStepsConverges body s' mid post) :
+    MirTraceStepsConverges body s mid post := by
+  rcases h_next with ⟨fuel, h_wp⟩
+  refine ⟨fuel + 1, ?_⟩
+  unfold wpMirTraceStepsSym wpMirExecTraceStepsSym
+  rw [evalSymNodeTreeTraceNoCall_eq, stepMirExecSymTree_eval]
+  dsimp only [stepMirState]
+  rw [h_step]
+  exact h_wp
+
+/-- Single-step `MirObs.event` emission rule for `MirTraceStepsConverges`. -/
+theorem MirTraceStepsConverges.step_emit
+    {body : CapturedMir} {s s' : MachineState} {ev : Nat}
+    {mid : MachineState → List (Event MirEffect) → Prop}
+    {post : List (Event MirEffect) → MirOutcome → Prop}
+    (h_step : stepMirFn body s = MirStepNode.emitStep (.event ev) s')
+    (h_next :
+      MirTraceStepsConverges body s'
+        (fun s'' tr₂ =>
+          mid s'' ([⟨.inr (.inl (.emit (.event ev))), PUnit.unit⟩] ++ tr₂))
+        (fun tr₂ out =>
+          post ([⟨.inr (.inl (.emit (.event ev))), PUnit.unit⟩] ++ tr₂) out)) :
+    MirTraceStepsConverges body s mid post := by
+  refine MirTraceStepsConverges.step ?_
+  rw [evalSymNodeTreeTraceNoCall_eq, stepMirSymTree_eval, h_step]
+  dsimp [MirStepNode.emitStep]
+  exact h_next
+
+/--
+Every `runMirTauToBlock fuel body targetBlock s = some s'` execution witnesses
+`MirTraceStepsConverges body s (fun s₁ tr => s₁ = s' ∧ tr = []) post`.
+-/
+theorem MirTraceStepsConverges.of_runMirTauToBlock
+    {fuel : Nat} {body : CapturedMir} {targetBlock : BasicBlockIdx}
+    {s s' : MachineState}
+    {post : List (Event MirEffect) → MirOutcome → Prop}
+    (h : runMirTauToBlock fuel body targetBlock s = some s') :
+    MirTraceStepsConverges body s (fun s₁ tr => s₁ = s' ∧ tr = []) post := by
+  induction fuel generalizing s with
+  | zero => nomatch h
+  | succ fuel' ih =>
+    unfold runMirTauToBlock at h
+    split at h
+    · injection h with h_eq
+      subst h_eq
+      exact ⟨0, rfl, rfl⟩
+    · cases h_step : stepMirFn body s with
+      | ret _ => simp only [h_step] at h; nomatch h
+      | vis _ _ => simp only [h_step] at h; nomatch h
+      | tau execNext =>
+        simp only [h_step] at h
+        cases execNext with
+        | running s₁ =>
+          exact MirTraceStepsConverges.step_tau h_step (ih h)
+        | halted _ => nomatch h
+        | faulted _ => nomatch h
+
+/--
 Fuel-free trace-aware weakest precondition over `MachineState`.
 -/
 def MirTraceWpConverges
@@ -3826,14 +4050,69 @@ theorem MirTraceWpConverges.step
     ⟨1, h⟩
     (fun _ _ h_next => h_next)
 
+/-- Total-correctness (`DWP mirTraceWP`) soundness of `MirTraceWpConverges`. -/
+theorem dwp_of_mirTraceWpConverges
+    {body : CapturedMir} {s : MachineState}
+    {post : List (Event MirEffect) → MirOutcome → Prop}
+    (h : MirTraceWpConverges body s post) :
+    DWP mirTraceWP (mirTree body s) (fun out tr => post tr out) [] := by
+  rcases h with ⟨fuel, h_wp⟩
+  exact dwp_cofix_of_wpCoalBounded fuel h_wp
+
 /-- Partial-correctness (`DWLP mirTraceWP`) soundness of `MirTraceWpConverges`. -/
 theorem dwlp_of_mirTraceWpConverges
     {body : CapturedMir} {s : MachineState}
     {post : List (Event MirEffect) → MirOutcome → Prop}
     (h : MirTraceWpConverges body s post) :
-    DWLP mirTraceWP (mirTree body s) (fun out tr => post tr out) [] := by
-  rcases h with ⟨fuel, h_wp⟩
-  exact dwlp_cofix_of_wpCoalBounded h_wp
+    DWLP mirTraceWP (mirTree body s) (fun out tr => post tr out) [] :=
+  (dwp_of_mirTraceWpConverges h).toDWLP
+
+/--
+Every `runMirTauToRet fuel body s = some out` execution witnesses
+`MirTraceWpConverges body s (fun tr out' => tr = [] ∧ out' = out)`.
+-/
+theorem MirTraceWpConverges.of_runMirTauToRet
+    {fuel : Nat} {body : CapturedMir} {s : MachineState} {out : MirOutcome}
+    (h_run : runMirTauToRet fuel body s = some out) :
+    MirTraceWpConverges body s (fun tr out' => tr = [] ∧ out' = out) := by
+  induction fuel generalizing s with
+  | zero => nomatch h_run
+  | succ fuel' ih =>
+    unfold runMirTauToRet at h_run
+    cases h_step : stepMirFn body s with
+    | ret out₀ =>
+      simp only [h_step] at h_run
+      injection h_run with h_eq
+      subst h_eq
+      refine MirTraceWpConverges.of_wpMirTraceSym (fuel := 1) ?_
+      unfold wpMirTraceSym wpMirExecTraceSym
+      rw [evalSymNodeTreeTrace_eq, stepMirExecSymTree_eval]
+      dsimp only [stepMirState]
+      rw [h_step]
+      exact ⟨rfl, rfl⟩
+    | vis _ _ =>
+      simp only [h_step] at h_run; nomatch h_run
+    | tau execNext =>
+      simp only [h_step] at h_run
+      cases execNext with
+      | running s' =>
+        exact MirTraceWpConverges.bind_silent
+          (MirTraceStepsConverges.step_tau h_step
+            (MirTraceStepsConverges.refl ⟨rfl, rfl⟩))
+          (fun _ h_eq => h_eq ▸ ih h_run)
+      | halted out₀ =>
+        injection h_run with h_eq
+        subst h_eq
+        refine MirTraceWpConverges.of_wpMirTraceSym (fuel := 2) ?_
+        unfold wpMirTraceSym wpMirExecTraceSym
+        rw [evalSymNodeTreeTrace_eq, stepMirExecSymTree_eval]
+        dsimp only [stepMirState]
+        rw [h_step]
+        dsimp only [evalNodeTraceWP]
+        unfold wpMirExecTraceSym
+        rw [evalSymNodeTreeTrace_eq, stepMirExecSymTree_eval]
+        exact ⟨rfl, rfl⟩
+      | faulted _ => nomatch h_run
 
 /--
 Fuel-free discharge of `TraceVerificationResult c` from `MirTraceWpConverges`.
@@ -4738,6 +5017,189 @@ theorem verify_multiBlockPipelineTraceClaim :
     (multiBlockPipeline_traceWpConverges b mem h_root)
   intro tr out ⟨h_tr, h_out⟩
   refine ⟨h_tr, ?_⟩
+  cases out with
+  | normal rv =>
+    rcases rv with ⟨retVal, mem'⟩
+    rcases h_out with ⟨rfl, rfl⟩
+    exact ⟨rfl, rfl⟩
+  | panic => exact False.elim h_out
+  | abort => exact False.elim h_out
+
+/--
+Concrete 3-block branching `CapturedMir` pipeline (`bb0 -> bb1 -> bb2`) whose
+`bb0` terminator is a `switchInt` on `_1`, emitting a non-empty `MirObsE`
+branch observation event `⟨.inr (.inl (.emit (.event b))), PUnit.unit⟩` in
+Stage 1 before moving `_1` into `_0` in `bb1` and returning in `bb2`.
+-/
+def branchingTracePipelineBody : CapturedMir :=
+  { defPath := "Anneal::MirFuelFree::branchingTracePipeline"
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 1
+    localDecls :=
+      [ { mutability := .mut, ty := u32Ty, debugName := some "_0" }
+      , { mutability := .not, ty := u32Ty, debugName := some "x" } ]
+    basicBlocks :=
+      [ { statements := []
+          terminator :=
+            { kind :=
+                .switchInt
+                  (.copy { local_ := 1, projection := [] })
+                  { branches := [], otherwise := 1 }
+              span := "MirFuelFree.lean:branch:bb0:0" }
+          isCleanup := false }
+      , { statements :=
+            [ { kind :=
+                  .assign
+                    { local_ := 0, projection := [] }
+                    (.use (.move { local_ := 1, projection := [] }))
+                span := "MirFuelFree.lean:branch:bb1:0" } ]
+          terminator := { kind := .goto 2, span := "MirFuelFree.lean:branch:bb1:1" }
+          isCleanup := false }
+      , { statements := []
+          terminator := { kind := .return_, span := "MirFuelFree.lean:branch:bb2:0" }
+          isCleanup := false } ]
+    fnAbi :=
+      { args := [{ layout := u32Layout, mode := .direct }]
+        ret := { layout := u32Layout, mode := .direct }
+        conv := .rust
+        canUnwind := true }
+    layouts :=
+      { pointerBits := 64
+        isLittleEndian := true
+        entries := [u32Layout] }
+    allocations := [] }
+
+/-- Intermediate `MachineState` at `bb1` for `branchingTracePipelineBody`. -/
+def branchingTraceMidState (b : Nat) (mem : Memory) : MachineState :=
+  { frame :=
+      { blockIdx := 1
+        stmtIdx := 0
+        locals :=
+          [ .uninit
+          , .init (.scalar { bits := b, sizeBytes := 4 }) ] }
+    memory := mem }
+
+/--
+Stage 1 (`bb0 -> bb1`) of `branchingTracePipelineBody`: executes `.switchInt`
+on `_1`, reaching `branchingTraceMidState b mem` while emitting the non-empty
+trace `[⟨.inr (.inl (.emit (.event b))), PUnit.unit⟩]`.
+-/
+theorem branchingTracePipeline_stage1_traceStepsConverges
+    (b : Nat) (mem : Memory) (h_root : RootActiveMemory mem) :
+    MirTraceStepsConverges branchingTracePipelineBody
+      (initMachineStateWithMemory branchingTracePipelineBody
+        [.scalar { bits := b, sizeBytes := 4 }] mem)
+      (fun s' tr =>
+        s' = branchingTraceMidState b mem ∧
+        tr = [⟨.inr (.inl (.emit (.event b))), PUnit.unit⟩])
+      (fun tr out =>
+        tr = [⟨.inr (.inl (.emit (.event b))), PUnit.unit⟩] ∧
+        mirNormalPost
+          (fun retVal mem' =>
+            retVal = .scalar { bits := b, sizeBytes := 4 } ∧ mem' = mem)
+          out) := by
+  rcases mem with
+    ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
+     activeCallee, activeProtectors, nextProtector, callerLocals⟩
+  rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
+  refine ⟨1, ?_⟩
+  dsimp [initMachineState, initMachineStateWithMemory, initLocals, initLocalsAux,
+    List.length, branchingTraceMidState, advanceStmt, Trusted.Sequence.set?,
+    branchingTracePipelineBody, Trusted.Sequence.get?]
+  dsimp [wpMirTraceStepsSym, wpMirExecTraceStepsSym]
+  simp [evalSymNodeTreeTraceNoCall_eq, stepMirExecSymTree_eval,
+    evalNodeTraceNoCallWP, stepMirState, stepMirFn, Trusted.Sequence.get?,
+    evalOperand, evalTerminator, readProjectedValue,
+    lookupSwitchTarget, get?, List.length, Trusted.Sequence.length, BEq.beq,
+    MirStepNode.emitStep]
+
+/--
+Stage 2 (`bb1 -> bb2 -> return`) of `branchingTracePipelineBody` from
+`branchingTraceMidState b mem`.
+-/
+theorem branchingTracePipeline_stage2_traceWpConverges
+    (b : Nat) (mem : Memory) (h_root : RootActiveMemory mem) :
+    MirTraceWpConverges branchingTracePipelineBody
+      (branchingTraceMidState b mem)
+      (fun tr₂ out =>
+        tr₂ = [] ∧
+        mirNormalPost
+          (fun retVal mem' =>
+            retVal = .scalar { bits := b, sizeBytes := 4 } ∧ mem' = mem)
+          out) := by
+  refine MirTraceWpConverges.of_wpMirTraceSym (fuel := 3) ?_
+  rcases mem with
+    ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
+     activeCallee, activeProtectors, nextProtector, callerLocals⟩
+  rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
+  dsimp [initMachineState, initMachineStateWithMemory, initLocals, initLocalsAux,
+    List.length, branchingTraceMidState, advanceStmt, Trusted.Sequence.set?,
+    branchingTracePipelineBody, Trusted.Sequence.get?]
+  dsimp [wpMirTraceSym, wpMirExecTraceSym]
+  simp [evalSymNodeTreeTrace_eq, stepMirExecSymTree_eval,
+    evalNodeTraceWP, stepMirState, stepMirFn, Trusted.Sequence.get?,
+    evalStmt, evalRvalue, evalOperand, evalTerminator, writePlaceValue,
+    invalidateConflictingBorrows, get?, List.length,
+    Trusted.Sequence.length, BEq.beq, advanceStmt, Trusted.Sequence.set?,
+    MirStepNode.step, MirStepNode.retNormal, mirNormalPost]
+
+/--
+Fuel-free non-empty trace composition (`MirTraceWpConverges.bind`) chaining
+Stage 1 (`tr₁ = [⟨.inr (.inl (.emit (.event b))), PUnit.unit⟩]`) with Stage 2
+(`tr₂ = []`) into `tr = [⟨.inr (.inl (.emit (.event b))), PUnit.unit⟩]`.
+-/
+theorem branchingTracePipeline_traceWpConverges
+    (b : Nat) (mem : Memory) (h_root : RootActiveMemory mem) :
+    MirTraceWpConverges branchingTracePipelineBody
+      (initMachineStateWithMemory branchingTracePipelineBody
+        [.scalar { bits := b, sizeBytes := 4 }] mem)
+      (fun tr out =>
+        tr = [⟨.inr (.inl (.emit (.event b))), PUnit.unit⟩] ∧
+        mirNormalPost
+          (fun retVal mem' =>
+            retVal = .scalar { bits := b, sizeBytes := 4 } ∧ mem' = mem)
+          out) := by
+  refine MirTraceWpConverges.bind
+    (branchingTracePipeline_stage1_traceStepsConverges b mem h_root)
+    (fun s' tr₁ ⟨h_s', h_tr₁⟩ => ?_)
+  subst h_s' h_tr₁
+  refine MirTraceWpConverges.mono ?_
+    (branchingTracePipeline_stage2_traceWpConverges b mem h_root)
+  intro tr₂ out ⟨h_tr₂, h_out⟩
+  subst h_tr₂
+  exact ⟨rfl, h_out⟩
+
+/--
+Non-empty event-emitting `TraceClaim` for `branchingTracePipelineBody`.
+-/
+def branchingTracePipelineTraceClaim : TraceClaim where
+  body := branchingTracePipelineBody
+  pre args mem := WellTypedScalarArg1 4 args ∧ RootActiveMemory mem
+  post args mem tr out :=
+    (∃ b : Nat,
+      args = [.scalar { bits := b, sizeBytes := 4 }] ∧
+      tr = [⟨.inr (.inl (.emit (.event b))), PUnit.unit⟩]) ∧
+    mirNormalPost (fun retVal mem' => args = [retVal] ∧ mem' = mem) out
+
+/-- Non-vacuity witness for `branchingTracePipelineTraceClaim.pre`. -/
+theorem branchingTracePipelineTraceClaim_nonVacuous :
+    ∃ args mem, branchingTracePipelineTraceClaim.pre args mem :=
+  multiBlockPipelineStatefulClaim_nonVacuous
+
+/--
+Fuel-free discharge of `TraceVerificationResult branchingTracePipelineTraceClaim`
+via `verifyTraceMir_of_wpConverges` and `MirTraceWpConverges.bind`.
+-/
+theorem verify_branchingTracePipelineTraceClaim :
+    TraceVerificationResult branchingTracePipelineTraceClaim := by
+  refine verifyTraceMir_of_wpConverges branchingTracePipelineTraceClaim
+    (fun args mem h_pre => ?_)
+  rcases h_pre with ⟨⟨b, _, rfl⟩, h_root⟩
+  refine MirTraceWpConverges.mono ?_
+    (branchingTracePipeline_traceWpConverges b mem h_root)
+  intro tr out ⟨h_tr, h_out⟩
+  refine ⟨⟨b, rfl, h_tr⟩, ?_⟩
   cases out with
   | normal rv =>
     rcases rv with ⟨retVal, mem'⟩
