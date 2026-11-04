@@ -1363,11 +1363,12 @@ pub fn generate_miri_batch(
 /// user-provided seeds) that do not invoke unmodeled external calls.
 ///
 /// Crucially, this list includes ALL Miri-passing seeds in
-/// `tests/miri-diff/corpus/src/lib.rs`—including those with `known_anneal_bug`
-/// divergences (`pass_ptr_offset_within_array`,
+/// `tests/miri-diff/corpus/src/lib.rs`—including both agreeing Tree Borrows
+/// parent/child seeds (`tb_child_write_then_parent_read`,
+/// `tb_child_write_then_parent_write`, `safe_reborrow_then_parent_write`) and
+/// seeds with `known_anneal_bug` divergences (`pass_ptr_offset_within_array`,
 /// `pass_copy_nonoverlapping_uninit_bytes_to_uninit`,
-/// `pass_tb_unsafe_cell_shared_mutation`, `tb_child_write_then_parent_read`,
-/// `tb_child_write_then_parent_write`, `safe_reborrow_then_parent_write`).
+/// `pass_tb_unsafe_cell_shared_mutation`).
 pub fn collect_non_fault_seed_indices(seeds: &[&str]) -> Vec<usize> {
     seeds
         .iter()

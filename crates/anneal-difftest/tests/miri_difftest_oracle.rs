@@ -108,19 +108,19 @@ assert data["total_candidates"] == 77
 assert data["compiled_candidates"] == 77
 assert data["compile_failed_candidates"] == 0
 assert data["compared_candidates"] == 73
-assert data["agree_count"] == 60
-assert data["diverge_count"] == 13
-assert data["kernel_confirmed_divergences"] == 13
+assert data["agree_count"] == 65
+assert data["diverge_count"] == 8
+assert data["kernel_confirmed_divergences"] == 8
 assert data["not_compared_count"] == 4
 
 div_classes = data["divergence_classes"]
 assert div_classes == {
-    "false_positive_ub": 5,
+    "false_positive_ub": 2,
     "missed_ub": 5,
     "panic_site_mismatch": 0,
     "panic_vs_return": 0,
     "return_vs_panic": 0,
-    "ub_location_mismatch": 2,
+    "ub_location_mismatch": 0,
     "wrong_value": 1,
 }, f"unexpected divergence_classes: {div_classes}"
 
@@ -148,11 +148,6 @@ expected_findings = {
     "ub_ptr_offset_negative_before_start": "missed_ub",
     "ub_unaligned_ptr_read_u32": "missed_ub",
     "pass_tb_unsafe_cell_shared_mutation": "false_positive_ub",
-    "ub_tb_use_frozen_mut_after_parent_read": "ub_location_mismatch",
-    "ub_tb_conflicting_active_mut_borrows": "ub_location_mismatch",
-    "tb_child_write_then_parent_read": "false_positive_ub",
-    "tb_child_write_then_parent_write": "false_positive_ub",
-    "safe_reborrow_then_parent_write": "false_positive_ub",
 }
 
 manifest = tomllib.loads(manifest_path.read_text())
@@ -174,7 +169,7 @@ manifest_ext = {
 assert len(manifest_ext) == 4, f"expected 4 externalCall entries in manifest, got {manifest_ext}"
 
 findings = data["findings"]
-assert len(findings) == 13
+assert len(findings) == 8
 actual_map = {f["fn_name"]: f["divergence_class"] for f in findings}
 assert actual_map == expected_findings, f"mismatch: {actual_map} vs {expected_findings}"
 

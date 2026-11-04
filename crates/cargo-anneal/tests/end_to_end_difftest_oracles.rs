@@ -458,7 +458,13 @@ path = \"src/lib.rs\"
 )]
 #![feature(core_intrinsics)]
 
-use core::intrinsics::exact_div;
+use core::intrinsics::{exact_div, offset};
+
+#[repr(C)]
+struct PairU32 {
+    a: u32,
+    b: u32,
+}
 
 pub fn canary_pass_unit() {}
 
@@ -522,6 +528,26 @@ pub fn ub_tb_use_frozen_mut_after_parent_read() -> u32 {
     unsafe { *root }
 }
 
+pub fn ub_tb_conflicting_active_mut_borrows() -> u32 {
+    let mut x: u32 = 1;
+    let p1: *mut u32 = &raw mut x;
+    let r2: &mut u32 = unsafe { &mut *p1 };
+    *r2 = 2;
+    unsafe {
+        *p1 = 3;
+    }
+    *r2
+}
+
+pub fn pass_ptr_offset_within_array() -> u32 {
+    let pair = PairU32 { a: 100, b: 300 };
+    let base: *const u32 = &raw const pair.a;
+    unsafe {
+        let p1 = offset(base, 1isize);
+        *p1
+    }
+}
+
 pub fn canary_external_call_exact_div() -> u32 {
     unsafe { exact_div(20u32, 4u32) }
 }
@@ -529,7 +555,7 @@ pub fn canary_external_call_exact_div() -> u32 {
     fs::write(corpus_root.join("src/lib.rs"), lib_rs).expect("write src/lib.rs");
 
     let discovered = discover_zero_arg_pub_fns(lib_rs);
-    assert_eq!(discovered.len(), 10);
+    assert_eq!(discovered.len(), 12);
     let items: Vec<OracleItemSpec> = discovered
         .into_iter()
         .map(OracleItemSpec::new)
@@ -550,8 +576,9 @@ pub fn canary_external_call_exact_div() -> u32 {
     let report = run_difftest_oracle_pipeline(&config, &items)
         .expect("run Miri + Anneal oracle pipeline on canary corpus");
 
-    // 5 Agree + 4 Diverge (3 FalsePositiveUb + 1 UbLocationMismatch)
-    // + 1 NotCompared = 10
+    // 10 Agree (5 base canaries + 5 Tree Borrows parent/child items)
+    // + 1 Diverge (`pass_ptr_offset_within_array`)
+    // + 1 NotCompared (`canary_external_call_exact_div`) = 12
     for item in &report.items {
         println!(
             "ORACLE_CANARY\t{}\tmiri={}\tanneal={}\tverdict={:?}\tkernel_confirmed={}",
@@ -562,9 +589,9 @@ pub fn canary_external_call_exact_div() -> u32 {
             item.kernel_confirmed
         );
     }
-    assert_eq!(report.items.len(), 10);
-    assert_eq!(report.agree_count, 5);
-    assert_eq!(report.diverge_count, 4);
+    assert_eq!(report.items.len(), 12);
+    assert_eq!(report.agree_count, 10);
+    assert_eq!(report.diverge_count, 1);
     assert_eq!(report.not_compared_count, 1);
     let confirm_path = report
         .confirm_module_path
@@ -575,21 +602,14 @@ pub fn canary_external_call_exact_div() -> u32 {
         "divergent items must be kernel-certified in MiriOracleConfirm.lean"
     );
     let confirm_text = fs::read_to_string(confirm_path).expect("read MiriOracleConfirm.lean");
-    for div_name in [
-        "tb_child_write_then_parent_read",
-        "tb_child_write_then_parent_write",
-        "safe_reborrow_then_parent_write",
-        "ub_tb_use_frozen_mut_after_parent_read",
-    ] {
-        assert!(
-            confirm_text.contains(&format!("theorem confirm_tag_{div_name}")),
-            "missing confirm_tag_{div_name} in MiriOracleConfirm.lean"
-        );
-        assert!(
-            confirm_text.contains(&format!("theorem confirm_probe_{div_name}")),
-            "missing confirm_probe_{div_name} in MiriOracleConfirm.lean"
-        );
-    }
+    assert!(
+        confirm_text.contains("theorem confirm_tag_pass_ptr_offset_within_array"),
+        "missing confirm_tag_pass_ptr_offset_within_array in MiriOracleConfirm.lean"
+    );
+    assert!(
+        confirm_text.contains("theorem confirm_probe_pass_ptr_offset_within_array"),
+        "missing confirm_probe_pass_ptr_offset_within_array in MiriOracleConfirm.lean"
+    );
     let probe_path = corpus_root.join(".anneal/oracle/MiriOracleProbe.lean");
     assert!(
         probe_path.is_file(),
@@ -597,7 +617,7 @@ pub fn canary_external_call_exact_div() -> u32 {
         probe_path.display()
     );
 
-    // Verify the 5 agreeing canaries:
+    // Verify the 5 base agreeing canaries:
     assert_eq!(
         report.item("canary_pass_unit").unwrap().verdict,
         ComparisonVerdict::Agree
@@ -622,57 +642,73 @@ pub fn canary_external_call_exact_div() -> u32 {
     let ub_null = report.item("canary_ub_null_deref").unwrap();
     assert_eq!(ub_null.verdict, ComparisonVerdict::Agree);
     if let MiriOutcome::Ub { pos: Some(pos), .. } = &ub_null.miri {
-        assert_eq!(pos.line, 31, "Miri UB line must skip line-30 cast warning");
+        assert_eq!(pos.line, 37, "Miri UB line must skip line-36 cast warning");
     } else {
         panic!("expected MiriOutcome::Ub with pos on canary_ub_null_deref");
     }
 
-    // Verify the 3 Tree Borrows FalsePositiveUb counterexamples:
-    for (name, expected_line) in [
-        ("tb_child_write_then_parent_read", 39u32),
-        ("tb_child_write_then_parent_write", 49u32),
-        ("safe_reborrow_then_parent_write", 61u32),
+    // Verify the 3 Tree Borrows parent/child passing counterexamples now AGREE:
+    for (name, expected_bits) in [
+        ("tb_child_write_then_parent_read", 1u128),
+        ("tb_child_write_then_parent_write", 3u128),
+        ("safe_reborrow_then_parent_write", 7u128),
     ] {
         let item_rep = report.item(name).unwrap();
-        assert!(item_rep.kernel_confirmed, "{name} must be kernel-confirmed");
-        match &item_rep.verdict {
-            ComparisonVerdict::Diverge(DivergenceKind::FalsePositiveUb {
-                anneal_span: Some(span),
-                ..
-            }) => {
-                assert_eq!(
-                    span.start_line, expected_line,
-                    "unexpected false-positive UB line for {name}: {span:?}"
+        assert_eq!(
+            item_rep.verdict,
+            ComparisonVerdict::Agree,
+            "{name} must agree with Miri under hierarchical Tree Borrows"
+        );
+        assert_eq!(
+            item_rep.anneal,
+            AnnealOutcome::PassScalar {
+                bits: expected_bits,
+                size_bytes: 4
+            }
+        );
+    }
+
+    // Verify the 2 Tree Borrows parent/child UB tests agree on BOTH verdict AND
+    // exact UB source location:
+    for (name, expected_ub_line) in [
+        ("ub_tb_use_frozen_mut_after_parent_read", 77u32),
+        ("ub_tb_conflicting_active_mut_borrows", 89u32),
+    ] {
+        let item_rep = report.item(name).unwrap();
+        assert_eq!(
+            item_rep.verdict,
+            ComparisonVerdict::Agree,
+            "{name} must agree with Miri on both UB verdict and source location"
+        );
+        match (&item_rep.miri, &item_rep.anneal) {
+            (
+                MiriOutcome::Ub {
+                    pos: Some(m_pos), ..
+                },
+                AnnealOutcome::Ub {
+                    span: Some(a_span),
+                },
+            ) => {
+                assert_eq!(m_pos.line, expected_ub_line);
+                assert!(
+                    a_span.contains_pos(m_pos),
+                    "Anneal span {a_span:?} must contain Miri pos {m_pos:?}"
                 );
             }
-            other => panic!("expected FalsePositiveUb for {name}, got {other:?}"),
+            other => panic!("expected matching UB with spans for {name}, got {other:?}"),
         }
     }
 
-    // Verify the masked early-UB Tree Borrows test (`UbLocationMismatch`):
-    let masked_tb = report
-        .item("ub_tb_use_frozen_mut_after_parent_read")
-        .unwrap();
-    assert!(masked_tb.kernel_confirmed);
-    match &masked_tb.verdict {
-        ComparisonVerdict::Diverge(DivergenceKind::UbLocationMismatch {
-            miri_pos: Some(m_pos),
-            anneal_span: Some(a_span),
-            ..
-        }) => {
-            assert_eq!(
-                m_pos.line, 71,
-                "Miri faults at line 71 (`*r = 2`) when writing through Frozen child"
-            );
-            assert_eq!(
-                a_span.start_line, 70,
-                "Anneal faults early at line 70 (`*root`) when reading parent"
-            );
-        }
-        other => panic!(
-            "expected UbLocationMismatch for ub_tb_use_frozen_mut_after_parent_read, got {other:?}"
-        ),
-    }
+    // Verify the divergent pointer-offset item is kernel-confirmed:
+    let ptr_offset = report.item("pass_ptr_offset_within_array").unwrap();
+    assert!(ptr_offset.kernel_confirmed);
+    assert_eq!(
+        ptr_offset.verdict,
+        ComparisonVerdict::Diverge(DivergenceKind::WrongValue {
+            miri: "pass:scalar:300:4".to_string(),
+            anneal: "pass:scalar:100:4".to_string(),
+        })
+    );
 
     // Verify the external-call item is NotCompared (never Agree):
     let ext_call = report.item("canary_external_call_exact_div").unwrap();
@@ -688,9 +724,11 @@ pub fn canary_external_call_exact_div() -> u32 {
     // `confirm_anneal_outcomes_in_kernel` must fail Lean kernel type-checking.
     let tampered_tag = vec![(
         OracleItemSpec::new("tb_child_write_then_parent_read"),
-        AnnealOutcome::PassScalar {
-            bits: 1,
-            size_bytes: 4,
+        AnnealOutcome::Ub {
+            span: Some(
+                SourceSpan::parse_anneal_span("src/lib.rs:45:5: 45:25")
+                    .expect("parse tampered span"),
+            ),
         },
     )];
     let confirm_err = confirm_anneal_outcomes_in_kernel(
@@ -705,10 +743,10 @@ pub fn canary_external_call_exact_div() -> u32 {
     );
 
     // Negative check 2: keeping `AnnealOutcome::Ub` (matching `MirDiffTag.ub`)
-    // but tampering with the source span must also fail Lean kernel
-    // type-checking (`confirm_probe_<name>`).
+    // on `ub_tb_use_frozen_mut_after_parent_read` but tampering with the source
+    // span must also fail Lean kernel type-checking (`confirm_probe_<name>`).
     let tampered_span = vec![(
-        OracleItemSpec::new("tb_child_write_then_parent_read"),
+        OracleItemSpec::new("ub_tb_use_frozen_mut_after_parent_read"),
         AnnealOutcome::Ub {
             span: Some(
                 SourceSpan::parse_anneal_span("src/lib.rs:99:1: 99:5")

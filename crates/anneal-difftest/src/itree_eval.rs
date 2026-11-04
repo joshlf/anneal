@@ -376,13 +376,21 @@ pub fn compile_rust_strict_opt(label: &str, opt_level: &str, source: &str) -> bo
 
 /// Runs `anneal-mir-instrument` (`--edition=2024 --crate-type=lib -D warnings
 /// -C opt-level=<level>`) on `source` and reports whether it compiled cleanly.
+/// Respects an explicit `RUSTC` environment override when present.
 pub fn compile_rust_mir_instrumented(label: &str, opt_level: &str, source: &str) -> bool {
-    let repo_root = default_repo_root();
-    let Ok(driver_bin) = ensure_mir_instrument_bin(&repo_root) else {
-        return false;
+    let driver_bin = if let Ok(v) = env::var("RUSTC")
+        && !v.trim().is_empty()
+    {
+        PathBuf::from(v)
+    } else {
+        let repo_root = default_repo_root();
+        let Ok(bin) = ensure_mir_instrument_bin(&repo_root) else {
+            return false;
+        };
+        bin
     };
     let tmp_dir = env::temp_dir().join(format!(
-        "anneal_itree_mir_inst_{}_{}_o{}",
+        "anneal_itree_difftest_{}_{}_o{}",
         std::process::id(),
         label,
         opt_level

@@ -697,10 +697,10 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
     //   shares fingerprint `RawPtrOffsetMutator:missed_ub:MirDiffTag.normalScalar`
     //   and is NOT quarantined -> the fingerprint MUST remain unquarantined and
     //   point to Finding 1's reproducer.
-    // - Finding 2 (`tb_child_write_then_parent_write__b0_c6`) faults in Anneal
-    //   at line 4 (seed body `*p1 = 3;`) and later panics in Miri at line 6
+    // - Finding 2 (`pass_ptr_offset_within_array__b0_c6`) faults in Anneal
+    //   at line 2 (seed body `*p1`) and later panics in Miri at line 4
     //   (appended `__miri_valid_52335` tail) -> earliest-line attribution must
-    //   assign cause `tb_child_write_then_parent_write`, not
+    //   assign cause `pass_ptr_offset_within_array`, not
     //   `BitValidityTransmuteMutator`.
     let repro_dir = dir.join("collision_repros");
     fs::create_dir_all(&repro_dir).expect("create collision_repros");
@@ -767,8 +767,8 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
             }},
             {{
                 "finding_id": "f2",
-                "fn_name": "tb_child_write_then_parent_write__b0_c6",
-                "seed_name": "tb_child_write_then_parent_write",
+                "fn_name": "pass_ptr_offset_within_array__b0_c6",
+                "seed_name": "pass_ptr_offset_within_array",
                 "applied_mutators": ["BitValidityTransmuteMutator"],
                 "divergence_class": "false_positive_ub",
                 "miri_outcome": "panic@src/lib.rs:4:5",
@@ -777,7 +777,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
                 "anneal_outcome": "ub@src/lib.rs:2:5",
                 "anneal_lean_tag": "MirDiffTag.ub",
                 "anneal_span": "src/lib.rs:2:5",
-                "mutant_source": "pub fn f2() -> u32 {{\n    *p1 = 3;\n    let __tail: u32 = 0;\n    let __miri_valid_52335: u32 = __panic_arr[__panic_idx];\n    __tail ^ __miri_valid_52335\n}}\n",
+                "mutant_source": "pub fn f2() -> u32 {{\n    *p1;\n    let __tail: u32 = 0;\n    let __miri_valid_52335: u32 = __panic_arr[__panic_idx];\n    __tail ^ __miri_valid_52335\n}}\n",
                 "kernel_confirmed": true,
                 "repro_path": "{}"
             }}
@@ -820,13 +820,13 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
     );
     assert!(
         stdout_coll.contains("Status: DIVERGENCE DETECTED (2 unquarantined distinct, 3 raw)."),
-        "both RawPtrOffsetMutator (via f1) and tb_child_write_then_parent_write (via f2) must be unquarantined:\n{stdout_coll}"
+        "both RawPtrOffsetMutator (via f1) and pass_ptr_offset_within_array (via f2) must be unquarantined:\n{stdout_coll}"
     );
     assert!(
         stdout_coll.contains(
-            "| `tb_child_write_then_parent_write:false_positive_ub:MirDiffTag.ub` | `false_positive_ub` | 1 |"
+            "| `pass_ptr_offset_within_array:false_positive_ub:MirDiffTag.ub` | `false_positive_ub` | 1 |"
         ),
-        "f2 must be attributed to tb_child_write_then_parent_write, not BitValidityTransmuteMutator:\n{stdout_coll}"
+        "f2 must be attributed to pass_ptr_offset_within_array, not BitValidityTransmuteMutator:\n{stdout_coll}"
     );
     assert!(
         stdout_coll.contains(&format!("`{}`", repro1.display())),

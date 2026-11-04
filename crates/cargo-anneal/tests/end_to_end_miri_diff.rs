@@ -19,29 +19,27 @@
 //! 2. Full 77-test differential execution (`run_miri_diff_suite`):
 //!    - Captures MIR from `tests/miri-diff/corpus` with Miri-matching flags
 //!      (`-Zmir-opt-level=0 -C debug-assertions=off -C overflow-checks=on`).
-//!    - Proves `TotalVerificationResult` for all 26 non-bug `pass` tests.
+//!    - Proves `TotalVerificationResult` for all 29 non-bug `pass` tests.
 //!    - Proves `StatefulVerificationResult` (`post := False`) and
 //!      `¬ TotalClaim.holds` for all 9 non-bug `panic` tests.
 //!    - Proves `¬ StatefulClaim.holds ∧ ¬ TotalClaim.holds` via
 //!      `refuteMirPointByStrictUB` and verifies Miri UB fault locations via
-//!      `MiriOracleProbe.lean` for all 25 non-bug `ub` tests.
+//!      `MiriOracleProbe.lean` for all 27 non-bug `ub` tests.
 //!    - Enforces `evalMirDiffTagBounded` / `probeMirDiffExecBounded` equality
-//!      ratchets for all 17 open Anneal bugs (`[tests.known_anneal_bug]`),
-//!      including the 2 Tree Borrows `ub_location_mismatch` entries and the 3
-//!      Tree Borrows false-positive UB counterexamples.
+//!      ratchets for all 12 open Anneal bugs (`[tests.known_anneal_bug]`).
 //!    - Runs `trusted/audit/TrustedBoundary.lean` in `verify-audit` mode
 //!      (statement-origin isolation, zero `sorryAx`, zero `axiom`, and full
 //!      Lean 4 kernel replay at `trustLevel := 0`).
 //! 3. Negative ratification checks:
 //!    - Verifies that `refuteMirPointByStrictUB` rejects non-UB outcomes
 //!      (such as `externalCall` or normal return).
-//!    - Verifies that reintroducing either fixed `known_anneal_bug` ratchet
-//!      (`pass_uninit_union_write_then_read` or
-//!      `pass_ref_array_elem_temp_index`) fails to build in Lake.
-//!    - Verifies that masking the UB location check on a Tree Borrows
-//!      `ub_location_mismatch` test (either tampering with
-//!      `observed_anneal_ub_span` or removing its `known_anneal_bug` block)
-//!      fails verification.
+//!    - Verifies that reintroducing any fixed `known_anneal_bug` ratchet
+//!      (`pass_uninit_union_write_then_read`, `pass_ref_array_elem_temp_index`,
+//!      `tb_child_write_then_parent_read`, `tb_child_write_then_parent_write`,
+//!      or `safe_reborrow_then_parent_write`) fails to build in Lake.
+//!    - Verifies that reintroducing a stale `ub_location_mismatch` ratchet on
+//!      `ub_tb_use_frozen_mut_after_parent_read` (`src/lib.rs:606:23: 606:28`)
+//!      fails to build in Lake.
 
 use std::env;
 use std::fs;
@@ -127,7 +125,7 @@ fn miri_diff_manifest_validation_rejects_stale_bugs_and_bad_paths() {
         .iter()
         .filter(|t| t.known_anneal_bug.is_some())
         .count();
-    assert_eq!(bug_count, 17);
+    assert_eq!(bug_count, 12);
 
     // Every `ub` test must have `miri_ub_span` recorded, and no non-`ub` test
     // may have `miri_ub_span`.
@@ -414,12 +412,12 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
 
     let report = run_miri_diff_suite(&config).expect("77-test Miri differential suite must pass");
     assert_eq!(report.total_tests, 77);
-    assert_eq!(report.verified_pass_count, 26);
+    assert_eq!(report.verified_pass_count, 29);
     assert_eq!(report.verified_panic_count, 9);
-    assert_eq!(report.verified_strict_ub_count, 25);
-    assert_eq!(report.ratcheted_known_bug_count, 17);
-    // 26 pass + 9 panic + 1 helper (`helper_add_ten`) = 36 certificate modules
-    assert_eq!(report.audited_certificate_modules.len(), 36);
+    assert_eq!(report.verified_strict_ub_count, 27);
+    assert_eq!(report.ratcheted_known_bug_count, 12);
+    // 29 pass + 9 panic + 1 helper (`helper_add_ten`) = 39 certificate modules
+    assert_eq!(report.audited_certificate_modules.len(), 39);
 
     let summary = render_miri_diff_report(&report);
     assert!(summary.contains("Total corpus tests:              77"));
@@ -474,6 +472,27 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
             "arrays_slices_and_indexing",
             "tests/pass/arrays.rs",
             25u128,
+            4u32,
+        ),
+        (
+            "tb_child_write_then_parent_read",
+            "tree_borrows",
+            "tests/pass/tree_borrows/reserved.rs",
+            1u128,
+            4u32,
+        ),
+        (
+            "tb_child_write_then_parent_write",
+            "tree_borrows",
+            "tests/pass/tree_borrows/reserved.rs",
+            3u128,
+            4u32,
+        ),
+        (
+            "safe_reborrow_then_parent_write",
+            "tree_borrows",
+            "tests/pass/tree_borrows/reborrow-is-read.rs",
+            7u128,
             4u32,
         ),
     ] {
@@ -558,13 +577,13 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
         "known_anneal_bug_ratchet must fail when Anneal's behavior no longer matches observed_anneal_tag"
     );
 
-    // Negative check 4: Masking the UB location check on a Tree Borrows
-    // `ub_location_mismatch` test (e.g. tampering with `observed_anneal_ub_span`
-    // in the kernel ratchet theorem) must fail in Lake.
+    // Negative check 4: Reintroducing the stale `ub_location_mismatch` ratchet on
+    // `ub_tb_use_frozen_mut_after_parent_read` (`src/lib.rs:606:23: 606:28`) must
+    // fail in Lake now that Anneal faults at Miri's exact span (`src/lib.rs:607:5`).
     let wrong_span_entry = MiriDiffTestEntry {
         name: "ub_tb_use_frozen_mut_after_parent_read".to_string(),
-        category: "tree_borrows_and_aliasing".to_string(),
-        upstream_path: "tests/fail/tree_borrows/reserved-immut-protected.rs".to_string(),
+        category: "tree_borrows".to_string(),
+        upstream_path: "tests/fail/both_borrows/outdated_local.rs".to_string(),
         miri_verdict: MiriDiffVerdictSpec::Ub,
         miri_ub_span: Some(
             SourcePos::parse_rustc_pos("src/lib.rs:607:5").expect("parse miri_ub_span"),
@@ -575,51 +594,31 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
             bug_class: "ub_location_mismatch".to_string(),
             observed_anneal_tag: MiriDiffVerdictSpec::Ub,
             observed_anneal_ub_span: Some(
-                SourceSpan::parse_anneal_span("src/lib.rs:607:5: 607:10")
-                    .expect("parse wrong observed_anneal_ub_span"),
+                SourceSpan::parse_anneal_span("src/lib.rs:606:23: 606:28")
+                    .expect("parse stale observed_anneal_ub_span"),
             ),
             suspected_component: "Trusted.Rustc.V2026_06_01.MirSemantics.Places".to_string(),
-            summary: "Tampered observed_anneal_ub_span must fail kernel rfl.".to_string(),
+            summary: "Stale observed_anneal_ub_span must fail kernel rfl.".to_string(),
         }),
     };
+    let orig_ub_tb_path = verify_dir.join("ub_tb_use_frozen_mut_after_parent_read.lean");
+    let orig_ub_tb_content =
+        fs::read_to_string(&orig_ub_tb_path).expect("read original ub_tb verify module");
     let (wrong_span_lean, _) = render_miri_diff_verify_module(
         "MiriDiffCorpus",
         "miri_diff_corpus::ub_tb_use_frozen_mut_after_parent_read",
         &wrong_span_entry,
     )
     .expect("render wrong span ratchet module");
-    fs::write(
-        verify_dir.join("ub_tb_use_frozen_mut_after_parent_read.lean"),
-        wrong_span_lean,
-    )
-    .expect("write wrong span ratchet module");
+    fs::write(&orig_ub_tb_path, wrong_span_lean).expect("write wrong span ratchet module");
     let wrong_span_res = run_lake_verify_targets(
         &dot_anneal,
         &["Verify.MiriDiffCorpus.ub_tb_use_frozen_mut_after_parent_read".to_string()],
     );
+    fs::write(&orig_ub_tb_path, orig_ub_tb_content).expect("restore original ub_tb verify module");
     assert!(
         wrong_span_res.is_err(),
-        "known_anneal_bug_ratchet must fail when observed_anneal_ub_span is tampered with"
-    );
-
-    // Negative check 4b: Removing the `known_anneal_bug` (`ub_location_mismatch`)
-    // block from `ub_tb_use_frozen_mut_after_parent_read` must fail
-    // `verify_miri_diff_ub_locations` because Anneal faults one statement early
-    // (`src/lib.rs:606:23: 606:28` vs Miri `src/lib.rs:607:5`).
-    let mut unmasked_tb_manifest =
-        load_miri_diff_manifest(&manifest_path).expect("load checked-in manifest");
-    let tb_entry = unmasked_tb_manifest
-        .tests
-        .iter_mut()
-        .find(|t| t.name == "ub_tb_use_frozen_mut_after_parent_read")
-        .expect("find ub_tb_use_frozen_mut_after_parent_read");
-    tb_entry.known_anneal_bug = None;
-    let unmasked_err =
-        verify_miri_diff_ub_locations(&dot_anneal, "MiriDiffCorpus", &unmasked_tb_manifest)
-            .expect_err("removing ub_location_mismatch must fail UB location verification");
-    assert!(
-        unmasked_err.contains("UB location mismatch on 'ub_tb_use_frozen_mut_after_parent_read'"),
-        "unexpected error: {unmasked_err}"
+        "known_anneal_bug_ratchet must fail when stale observed_anneal_ub_span is reintroduced"
     );
 
     // Negative check 5: Corrupting `miri_ub_span` on a passing strict UB test
