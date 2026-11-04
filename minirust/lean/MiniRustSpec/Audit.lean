@@ -322,6 +322,24 @@ open MiniRustSpec.Correspondence.Witness in
   zeroArrayIdxUb_anneal_ub
   zeroArrayIdxUb_minirust_ub_from_start
   zeroArrayIdxUb_minirust_direct
+  arrayOpsOk_minirust_inplace_bytes
+  ctxI8_ok_arrayUninitIdx
+  arrayUninitIdxI8_inFragment
+  arrayUninitIdxI8_translate
+  arrayUninitIdx_anneal_ub
+  arrayUninitIdx_minirust_ub_from_start
+  arrayUninitIdx_minirust_direct
+  ctxU32_ok_arrayU32Idx
+  arrayU32Idx_inFragment
+  arrayU32Idx_translate
+  arrayU32IdxOk_anneal_ret
+  arrayU32IdxOk_noUB
+  arrayU32IdxOk_minirust_ret_from_start
+  arrayU32IdxOk_minirust_direct
+  arrayU32IdxOk_minirust_inplace_bytes
+  arrayU32IdxOob_anneal_ub
+  arrayU32IdxOob_minirust_ub_from_start
+  arrayU32IdxOob_minirust_direct
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -344,10 +362,113 @@ elab "#assert_all_minirustspec_standard_axioms" : command => do
             throwError "{c} (in {modName}) depends on the non-standard axiom {a}"
         checked := checked + 1
   logInfo m!"MiniRustSpec.Audit: exhaustively verified standard axioms for {checked} declarations across all MiniRustSpec.* modules"
-  logInfo m!"[ANCHOR-AUDIT] sorry_free=true anchors_ok=true anchors_nodup=true"
-  logInfo m!"[SIMULATION-AUDIT] sorry_free=true step_correspondence=true mirCall_ret=true mirCall_ub=true"
-  logInfo m!"[WITNESS-AUDIT] sorry_free=true arrayOpsOk=true arrayOpsOob=true arraySignedIdx=true zeroArray=true"
 
 #assert_all_minirustspec_standard_axioms
+
+/-- Audit a named group of theorems and log a receipt line computed from the
+audit itself:
+`[<tag>] decls=<n> theorems=<n> sorry_free=<b> standard_axioms_only=<b>`.
+The command fails unless every listed name resolves to a theorem whose axiom
+closure contains only the standard axioms (so in particular no `sorryAx`), so
+the logged flags can only ever read `true`; `decls` counts the names actually
+checked, so a receipt line cannot claim a theorem that is not in the group. -/
+elab "#audit_group " tag:str ids:ident* : command => do
+  let env ← getEnv
+  let mut decls : Nat := 0
+  let mut theorems : Nat := 0
+  let mut sorryFree := true
+  let mut standardOnly := true
+  for id in ids do
+    let n ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo id
+    decls := decls + 1
+    match env.find? n with
+    | some (.thmInfo _) => theorems := theorems + 1
+    | _ => throwError "{n} is not a theorem"
+    let axs ← liftCoreM <| Lean.collectAxioms n
+    if axs.contains ``sorryAx then
+      sorryFree := false
+    unless axs.all (fun a => a == ``propext || a == ``Quot.sound || a == ``Classical.choice) do
+      standardOnly := false
+      logError m!"{n} depends on non-standard axioms: {axs.toList}"
+  unless sorryFree && standardOnly do
+    throwError "[{tag.getString}] audit failed"
+  logInfo m!"[{tag.getString}] decls={decls} theorems={theorems} sorry_free={sorryFree} standard_axioms_only={standardOnly}"
+
+#audit_group "ANCHOR-AUDIT"
+  MiniRustSpec.Anchors.anchors_ok
+  MiniRustSpec.Anchors.anchors_nodup
+
+open MiniRustSpec.Correspondence in
+#audit_group "SIMULATION-AUDIT"
+  step_correspondence
+  initMachineState_startRel
+  mirCall_ret
+  mirCall_ub
+  mirCall_noUB
+  mirCall_progress
+  mirCall_steps_error
+  mirCall_outcome
+  evalPlace_proj
+  evalStatement_assign_array
+  evalStatement_assign_index
+  evalValue_arrayRvalue
+  typedLoad_array_local
+  typedLoad_array_elem
+  typedStore_array_local
+  typedStore_array_elem
+  evalStmt_assign_array
+  evalStmt_assign_index
+  evalRvalue_array_frag
+  readProjectedValue_proj
+  writeProjectedValue_proj
+
+open MiniRustSpec.Correspondence.Witness in
+#audit_group "WITNESS-AUDIT"
+  arrayOpsI8_inFragment
+  arrayOpsI8_translate
+  arrayOpsOk_anneal_ret
+  arrayOpsOk_noUB
+  arrayOpsOk_minirust_ret_from_start
+  arrayOpsOk_minirust_direct
+  arrayOpsOk_minirust_inplace_bytes
+  arrayOpsOob_anneal_ub
+  arrayOpsOob_minirust_ub_from_start
+  arrayOpsOob_minirust_direct
+  arrayOpsOob_converse_error
+  arraySignedIdxI8_inFragment
+  arraySignedIdxI8_translate
+  arraySignedIdxOk_anneal_ret
+  arraySignedIdxOk_minirust_ret_from_start
+  arraySignedIdxOk_minirust_direct
+  arraySignedNegUb_anneal_ub
+  arraySignedNegUb_minirust_ub_from_start
+  arraySignedNegUb_minirust_direct
+  arraySignedOobUb_anneal_ub
+  arraySignedOobUb_minirust_ub_from_start
+  arraySignedOobUb_minirust_direct
+  arrayUninitIdxI8_inFragment
+  arrayUninitIdxI8_translate
+  arrayUninitIdx_anneal_ub
+  arrayUninitIdx_minirust_ub_from_start
+  arrayUninitIdx_minirust_direct
+  arrayU32Idx_inFragment
+  arrayU32Idx_translate
+  arrayU32IdxOk_anneal_ret
+  arrayU32IdxOk_noUB
+  arrayU32IdxOk_minirust_ret_from_start
+  arrayU32IdxOk_minirust_direct
+  arrayU32IdxOk_minirust_inplace_bytes
+  arrayU32IdxOob_anneal_ub
+  arrayU32IdxOob_minirust_ub_from_start
+  arrayU32IdxOob_minirust_direct
+  zeroArrayI8_inFragment
+  zeroArrayI8_translate
+  zeroArrayOk_anneal_ret
+  zeroArrayOk_noUB
+  zeroArrayOk_minirust_ret_from_start
+  zeroArrayOk_minirust_direct
+  zeroArrayIdxUb_anneal_ub
+  zeroArrayIdxUb_minirust_ub_from_start
+  zeroArrayIdxUb_minirust_direct
 
 end MiniRustSpec.Audit

@@ -54,8 +54,10 @@ here.
   `Terminator::Return` (`spec/lang/step/terminators.md`), including frame
   teardown, `storage_dead` of every local, and both stack-pop actions.
 * The representation relation for `Type::Int`, `Type::Bool`, and `Type::Array`
-  (`spec/lang/representation.md`), `Type::layout` for those types
-  (`spec/lang/types.md`), and `BasicMemory`'s `load`, `store`, `deallocate`,
+  (`spec/lang/representation.md`), `Type::layout` for those types and
+  `LayoutStrategy::compute_size_and_align` for `Sized` layouts
+  (`spec/lang/types.md`, with `Machine::compute_size` from
+  `spec/lang/machine.md`), and `BasicMemory`'s `load`, `store`, `deallocate`,
   `dereferenceable`, `signed_dereferenceable`, and `check_ptr`
   (`spec/mem/basic.md`, `spec/mem/interface.md`), wrapped by
   `ConcurrentMemory`'s access recording (`spec/mem/concurrent.md`).
@@ -352,6 +354,39 @@ def LayoutStrategy.expect_align (l : LayoutStrategy) (msg : String) : Interp Ali
   match l with
   | .Sized _ align => pure align
   | _ => specPanic s!"expect_align called on unsized type: {msg}"
+
+/-- `LayoutStrategy::compute_size_and_align` (`spec/lang/types.md`) for the
+interpreted `Sized` layouts. The unsized strategies (`Slice`, `TraitObject`,
+`Tuple`) are outside the fragment, and with only `Sized` layouts the `vtables`
+lookup is never consulted, so it is not modelled:
+> "pub fn compute_size_and_align<Provenance>(
+>     self,
+>     meta: Option<PointerMeta<Provenance>>,
+>     vtables: impl FnOnce(ThinPointer<Provenance>) -> VTable,
+> ) -> (Size, Align) {
+>     match (self, meta) {
+>         (LayoutStrategy::Sized(size, align), None) => (size, align),
+>         ..
+>         _ => panic!(\"pointer meta data does not match type\"),
+>     }
+> }" -/
+def LayoutStrategy.compute_size_and_align (l : LayoutStrategy)
+    (metadata : Option (PointerMeta Prov)) : Interp (Size × Align) :=
+  match l, metadata with
+  | .Sized size align, none => pure (size, align)
+  | .Sized _ _, some _ => specPanic "pointer meta data does not match type"
+  | _, _ => unsupported "LayoutStrategy::compute_size_and_align for an unsized layout"
+
+/-- `Machine::compute_size` (`spec/lang/machine.md`), with the vtable lookup
+omitted as in `LayoutStrategy.compute_size_and_align`:
+> "fn compute_size(&self, layout: LayoutStrategy, meta: Option<PointerMeta<M::Provenance>>) -> Size {
+>     let (size, _) = layout.compute_size_and_align(meta, self.vtable_lookup());
+>     size
+> }" -/
+def computeSize (layout : LayoutStrategy) (metadata : Option (PointerMeta Prov)) :
+    Interp Size := do
+  let (size, _) ← LayoutStrategy.compute_size_and_align layout metadata
+  pure size
 
 /-- `Type::layout::<x86_64>` for the interpreted types:
 > "Int(int_type) => Sized(int_type.size, int_type.align::<T>()),
@@ -1155,7 +1190,11 @@ mutual
 >
 >      let elem_size = elem_ty.layout::<M::T>().expect_size(\"WF ensures array & slice elements are sized\");
 >      let offset = index * elem_size;
->      ..
+>      assert!(
+>          offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata),
+>          \"sanity check: the indexed offset should not be outside what the type allows.\"
+>      );
+>
 >      let ptr = self.ptr_offset_inbounds(root.ptr.thin_pointer, offset.bytes())?;
 >      ret((Place { ptr: ptr.widen(None), ..root }, elem_ty))
 >  }" -/
@@ -1182,8 +1221,12 @@ def evalPlace (m : Mach) : PlaceExpr → Interp ((Place BM × «Type») × Mach)
       let elemLayout ← Type.layout elemTy
       let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures array & slice elements are sized"
       let offset ← Size.mulInt elemSize idx
-      let ptr ← ptrOffsetInbounds m rootPlace.ptr.thin_pointer offset.bytes
-      pure (({ rootPlace with ptr := { thin_pointer := ptr, metadata := none } }, elemTy), m)
+      let size ← computeSize (← Type.layout ty) rootPlace.ptr.metadata
+      if offset.bytes ≤ size.bytes then
+        let ptr ← ptrOffsetInbounds m rootPlace.ptr.thin_pointer offset.bytes
+        pure (({ rootPlace with ptr := { thin_pointer := ptr, metadata := none } }, elemTy), m)
+      else
+        specPanic "sanity check: the indexed offset should not be outside what the type allows."
   | _ => unsupported "eval_place for a non-Local, non-Index place expression"
 
 /-- Left-to-right element evaluation `exprs.try_map(|e| self.eval_value(e))?.map(|e| e.0)`

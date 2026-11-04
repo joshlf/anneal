@@ -1232,10 +1232,13 @@ theorem evalPlace_proj {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
             rw [hitd] at hL1
             have hptr := ptrOffsetInbounds_elem h1.shape j sc.bits elemIt (declSlotData d slot) hL1
               hoff_le hoff_bound haddr0 (by rw [hdlen]; exact haddrMax)
+            have hsz : ¬ (count * elemIt.size.bytes < sc.bits * elemIt.size.bytes) :=
+              Nat.not_lt.mpr (Nat.mul_le_mul_right _ (by omega))
             refine ⟨hlt, m1, ?_, h1⟩
             rw [evalPlace]
             simp [hplaceBase, evalValue, hplaceIdx, placeLoad, hm1, hib, hnot_le,
-              layout_eq _ hgood, hptr]
+              layout_eq _ hgood, layout_array_eq _ _ hgood, computeSize,
+              LayoutStrategy.compute_size_and_align, hsz, hptr]
           · refine ⟨fun idx hidx => by simp [projIdx, hslotIdx, hlt] at hidx, fun _ => ?_⟩
             have hoob : intFromBits sc.bits idxIt < 0 ∨ intFromBits sc.bits idxIt ≥ (count : Int) := by
               unfold intFromBits
@@ -1279,9 +1282,13 @@ theorem evalPlace_proj {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
       rw [hitd] at hL
       have hptr := ptrOffsetInbounds_elem h.shape j idx elemIt (declSlotData d slot) hL
         hoff_le hoff_bound haddr0 (by rw [hdlen]; exact haddrMax)
+      have hsz : ¬ (count * elemIt.size.bytes < idx * elemIt.size.bytes) :=
+        Nat.not_lt.mpr (Nat.mul_le_mul_right _ (by omega))
       refine ⟨hidx_lt, m, ?_, h⟩
       rw [evalPlace]
-      simp [hplaceBase, evalValue, evalConstant, hnot_le, layout_eq _ hgood, hptr]
+      simp [hplaceBase, evalValue, evalConstant, hnot_le, layout_eq _ hgood,
+        layout_array_eq _ _ hgood, computeSize, LayoutStrategy.compute_size_and_align, hsz,
+        hptr]
     · refine ⟨fun idx' hidx' => by simp [projIdx, hnot_min, hidx_eq, hidx_lt] at hidx', fun _ => ?_⟩
       have hle_cnt : count ≤ idx := Nat.le_of_not_lt hidx_lt
       refine ⟨"access to out-of-bounds index", ?_⟩

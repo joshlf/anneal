@@ -147,11 +147,19 @@ def intFromBits (bits : Nat) (it : Gen.IntType) : Int :=
 >      let i = GcCow::new(i);
 >      let root = GcCow::new(expr);
 >      PlaceExpr::Index { root, index: i }
+>  }
+>  ..
+>  smir::ProjectionElem::ConstantIndex { .. }
+>  | smir::ProjectionElem::Subslice { .. }
+>  | smir::ProjectionElem::OpaqueCast(_) => {
+>      rs::span_bug!(span, \"Place Projection not supported: {:?}\", proj);
 >  }"
-For `ProjectionElem::ConstantIndex { offset, min_length, from_end }` on a
-fixed-size array `[T; count]`, the constant index `idx` (`count - offset` when
-`from_end` is true, or `offset` when `from_end` is false) lowers to
-`PlaceExpr::Index` with a `usize` constant index expression. -/
+Upstream `minimize` rejects `ProjectionElem::ConstantIndex`, so its lowering
+here is an extension rather than a transcription: for
+`ConstantIndex { offset, min_length, from_end }` on a fixed-size array
+`[T; count]`, the index that MIR defines for the projection (`count - offset`
+when `from_end` is true, or `offset` when `from_end` is false) becomes a
+`usize` constant index expression of `PlaceExpr::Index`. -/
 def translatePlace (decls : List MirAst.LocalDecl) : MirAst.Place → Option Gen.PlaceExpr
   | ⟨i, []⟩ => some (.Local (localName i))
   | ⟨i, [.index idxLocal]⟩ =>

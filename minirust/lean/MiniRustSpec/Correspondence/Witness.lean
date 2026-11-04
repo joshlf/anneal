@@ -93,7 +93,18 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
   and `fromEnd = true`) for both reads and in-place element writes preserving
   sibling elements, plus out-of-bounds (`idx >= count`), negative signed index
   (`idx < 0`), and zero-length array (`[i8; 0]`) construction, `Len`, and
-  indexing UB.
+  indexing UB, with a byte-level check that the in-place writes leave the
+  sibling bytes of MiniRust's array allocation intact
+  (`arrayOpsOk_minirust_inplace_bytes`).
+* `arrayUninitIdxI8`: an index local that is still uninitialized (`_1[_0]`
+  before `_0` is written) raises UB on both sides; MiniRust's `Load` of the
+  index operand fails the validity invariant before the bounds check.
+* `arrayU32Idx`: a multi-byte element type (`[u32; 3]`), so that the byte
+  offset `index * elem_size` of `PlaceExpr::Index` is exercised with
+  `elem_size = 4` (all other array witnesses use 1-byte `i8` elements, for
+  which the offset equals the index): an in-place write at index `2` lands at
+  byte offset `8` and leaves the first two elements intact, and index `3`
+  raises out-of-bounds UB on both sides.
 -/
 
 namespace MiniRustSpec.Correspondence.Witness
@@ -2321,6 +2332,21 @@ theorem arrayOpsOk_minirust_direct :
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAllocI8 with data := scalarBytes i8 40 }, [1]) := rfl
 
+/-- Byte-level view of the in-place element writes of `arrayOpsI8` on the
+input of `arrayOpsOkArgs`. MiniRust's allocation `3` is `_2`'s (after the
+caller's return allocation and those of `_0` and `_1`). After step `4`
+(`_2 = copy _1`) it holds the bytes of `[3, 10, 20]`; step `5`
+(`_2[_4] = _2[_4] + 7`) rewrites only the byte at offset `1`, giving
+`[3, 17, 20]`; step `6` (`_2[-1 of 3] = _2[-1 of 3] - _2[0 of 3]`) rewrites
+only the byte at offset `2`, giving `[3, 17, 17]`. Each store leaves the
+sibling bytes before and after the written element unchanged. -/
+theorem arrayOpsOk_minirust_inplace_bytes :
+    [4, 5, 6].map (fun k => (Interp.steps k arrayOpsOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[3]?).map (·.data))) =
+      [some (some (scalarBytes i8 3 ++ scalarBytes i8 10 ++ scalarBytes i8 20)),
+       some (some (scalarBytes i8 3 ++ scalarBytes i8 17 ++ scalarBytes i8 20)),
+       some (some (scalarBytes i8 3 ++ scalarBytes i8 17 ++ scalarBytes i8 17))] := rfl
+
 /-- Out-of-bounds `Index` (`_4 = 3usize >= 3`) on `arrayOpsI8`: raises UB on
 `_2[_4]`. -/
 def arrayOpsOobArgs : List Value :=
@@ -2653,5 +2679,240 @@ theorem zeroArrayIdxUb_minirust_ub_from_start :
 
 theorem zeroArrayIdxUb_minirust_direct :
     Interp.steps 6 zeroArrayIdxUbMInit = .error (.ub "access to out-of-bounds index") := rfl
+
+/-! ## Uninitialized index local (`_1[_0]` while `_0` is still `.uninit`) -/
+
+def fnAbiArrayUninitIdx : FnAbi :=
+  { args := [{ layout := arrI8_2Layout, mode := .direct }],
+    ret := { layout := i8Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+theorem ctxI8_ok_arrayUninitIdx {body : CapturedMir}
+    (h : body.localDecls = [i8Decl, arrI8_2Decl]) : CtxOk body ctxI8 where
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | _ + 2, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MIR (`Runtime(PostCleanup)`) of a function that indexes `[i8; 2]` with the
+return place `_0` as the index local before `_0` is ever written: first in the
+in-place element write `_1[_0] = const 7_i8`, then in the read
+`_0 = copy _1[_0]`. MiniRust evaluates the destination place first, so the
+`Load` of the index operand `_0` fails the validity invariant before the
+bounds check or the store happen; Anneal's projection finds `_0` `.uninit`
+and faults. -/
+def arrayUninitIdxI8 : CapturedMir where
+  defPath := "witness::array_uninit_idx_i8"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [i8Decl, arrI8_2Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (placeIdx 1 0) (.use (constI8 7))),
+        mkStmt (.assign (local_ 0) (.use (.copy (placeIdx 1 0))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiArrayUninitIdx
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem arrayUninitIdxI8_inFragment : inFragment arrayUninitIdxI8 = true := by decide
+
+def arrayUninitIdxI8Fn : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8), (localName 1, .Array (.Int i8) 2)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Index (.Local (localName 1)) (.Load (.Local (localName 0))))
+        (.Constant (.Int 7) (.Int i8)),
+      .Assign (.Local (localName 0))
+        (.Load (.Index (.Local (localName 1)) (.Load (.Local (localName 0)))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem arrayUninitIdxI8_translate :
+    translateFn arrayUninitIdxI8 = some arrayUninitIdxI8Fn := rfl
+
+def arrayUninitIdxS0 : MachineState := initMachineState arrayUninitIdxI8 [initArrI8_2]
+def arrayUninitIdxMInit : Mach :=
+  machineWithCtx ctxI8 arrayUninitIdxI8 arrayUninitIdxI8Fn
+    arrayUninitIdxS0.frame.locals arrayUninitIdxI8Fn.start
+
+theorem arrayUninitIdx_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree arrayUninitIdxI8 [initArrI8_2]) tr u ∧ FaultNow u :=
+  faultsA_sound arrayUninitIdxI8 6 _ (by decide)
+
+theorem arrayUninitIdx_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arrayUninitIdxMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arrayUninitIdx_anneal_ub
+  exact mirCall_ub arrayUninitIdxI8_inFragment arrayUninitIdxI8_translate ctxI8
+    (ctxI8_ok_arrayUninitIdx rfl) [initArrI8_2] (by decide)
+    arrayUninitIdxMInit rfl rfl rfl hr hf
+
+/-- The UB is the failed `Load` of the uninitialized index operand, not the
+bounds check (`"access to out-of-bounds index"`). -/
+theorem arrayUninitIdx_minirust_direct :
+    Interp.steps 2 arrayUninitIdxMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") := rfl
+
+/-! ## Multi-byte elements (`[u32; 3]`): byte offset `index * elem_size` -/
+
+def arrU32_3Ty : Ty := { kind := .array (.uint .u32) 3, layoutIdx := 0 }
+def arrU32_3Decl : LocalDecl := { mutability := .mut, ty := arrU32_3Ty, debugName := none }
+
+def arrU32_3Layout : TypeLayout :=
+  { size := { bytes := 12 }, align := { bytes := 4 }, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false }
+
+def fnAbiArrayU32Idx : FnAbi :=
+  { args := [{ layout := arrU32_3Layout, mode := .direct },
+             { layout := usizeLayout, mode := .direct }],
+    ret := { layout := u32Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+/-- The callee's locals live at addresses `128` (`_0`), `256` (`_1`, twelve
+bytes), and `384` (`_2`). -/
+def ctxU32_3 : Ctx := { ctx0 with addrs := [128, 256, 384] }
+
+theorem ctxU32_ok_arrayU32Idx {body : CapturedMir}
+    (h : body.localDecls = [u32Decl, arrU32_3Decl, usizeDecl]) : CtxOk body ctxU32_3 where
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | 2, hd => simp at hd; subst hd; decide
+    | _ + 3, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MIR (`Runtime(PostCleanup)`) of a function that writes
+`const 0x04030201_u32` into `_1[_2]` of a `[u32; 3]` argument and returns
+`_1[_2] + _1[0 of 3]`. -/
+def arrayU32Idx : CapturedMir where
+  defPath := "witness::array_u32_idx"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, arrU32_3Decl, usizeDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (placeIdx 1 2) (.use (constU32 0x04030201))),
+        mkStmt (.assign (local_ 0)
+          (.binaryOp .add (.copy (placeIdx 1 2)) (.copy (placeConstIdx 1 0 3 false))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiArrayU32Idx
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem arrayU32Idx_inFragment : inFragment arrayU32Idx = true := by decide
+
+def arrayU32IdxFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Array (.Int u32) 3),
+    (localName 2, .Int usizeIt)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Index (.Local (localName 1)) (.Load (.Local (localName 2))))
+        (.Constant (.Int 0x04030201) (.Int u32)),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add)
+          (.Load (.Index (.Local (localName 1)) (.Load (.Local (localName 2)))))
+          (.Load (.Index (.Local (localName 1)) (.Constant (.Int 0) (.Int usizeIt)))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem arrayU32Idx_translate : translateFn arrayU32Idx = some arrayU32IdxFn := rfl
+
+def initArrU32_3 : Value := .aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩]
+
+/-- Index `_2 = 2usize`: `_1 = [10, 20, 0x04030201]`, returning
+`0x04030201 + 10 = 0x0403020b`. -/
+def arrayU32IdxOkS0 : MachineState :=
+  initMachineState arrayU32Idx [initArrU32_3, .scalar ⟨2, 8⟩]
+def arrayU32IdxOkMInit : Mach :=
+  machineWithCtx ctxU32_3 arrayU32Idx arrayU32IdxFn arrayU32IdxOkS0.frame.locals
+    arrayU32IdxFn.start
+
+theorem arrayU32IdxOk_anneal_ret :
+    ReachesRet (mirCallTree arrayU32Idx [initArrU32_3, .scalar ⟨2, 8⟩]) []
+      (.normal (.scalar ⟨0x0403020b, 4⟩, arrayU32IdxOkS0.memory)) :=
+  runA_sound arrayU32Idx 8 _ _ _ rfl
+
+theorem arrayU32IdxOk_noUB :
+    MirNoUBTree (mirCallTree arrayU32Idx [initArrU32_3, .scalar ⟨2, 8⟩]) :=
+  runA_noUB arrayU32Idx 8 _ _ _ rfl
+
+theorem arrayU32IdxOk_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n arrayU32IdxOkMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 0x0403020b } ∧
+      m'.threads = [thread1 ctxU32_3 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret arrayU32Idx_inFragment arrayU32Idx_translate ctxU32_3
+      (ctxU32_ok_arrayU32Idx rfl) [initArrU32_3, .scalar ⟨2, 8⟩] (by decide)
+      arrayU32IdxOkMInit rfl rfl rfl arrayU32IdxOk_anneal_ret
+  obtain ⟨bits, r, a, d, hd, hv, hp, hr, hthr, hallocs⟩ := hret
+  simp [arrayU32Idx] at hd; subst hd
+  simp [retPtr, ctxU32_3, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxU32_3, ctx0] at hr; subst hr
+  have hbits : bits = 0x0403020b := by
+    simp [itOf, intTypeOf, intTyBytes, u32Decl, u32Ty] at hv; omega
+  subst hbits
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]
+  simp [ctxU32_3, ctx0, itOf, intTypeOf, intTyBytes, u32Decl, u32Ty, u32]
+
+theorem arrayU32IdxOk_minirust_direct :
+    (Interp.steps 4 arrayU32IdxOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 0x0403020b }, [1]) := rfl
+
+/-- Byte-level view of the in-place write: MiniRust's allocation `2` is `_1`'s
+(after the caller's return allocation and `_0`'s). Before step `2` it holds
+the little-endian bytes of `[10, 20, 30]`; step `2` (`_1[_2] = 0x04030201`
+with `_2 = 2`) rewrites exactly bytes `8..12` (`2 * size_of::<u32>()`) to
+`01 02 03 04`, leaving bytes `0..8` (elements `0` and `1`) unchanged. -/
+theorem arrayU32IdxOk_minirust_inplace_bytes :
+    [1, 2].map (fun k => (Interp.steps k arrayU32IdxOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[2]?).map (·.data))) =
+      [some (some (scalarBytes u32 10 ++ scalarBytes u32 20 ++ scalarBytes u32 30)),
+       some (some (scalarBytes u32 10 ++ scalarBytes u32 20 ++
+         [.Init 1 none, .Init 2 none, .Init 3 none, .Init 4 none]))] := rfl
+
+/-- Index `_2 = 3usize` (`3 >= 3`): out-of-bounds UB on the in-place write. -/
+def arrayU32IdxOobS0 : MachineState :=
+  initMachineState arrayU32Idx [initArrU32_3, .scalar ⟨3, 8⟩]
+def arrayU32IdxOobMInit : Mach :=
+  machineWithCtx ctxU32_3 arrayU32Idx arrayU32IdxFn arrayU32IdxOobS0.frame.locals
+    arrayU32IdxFn.start
+
+theorem arrayU32IdxOob_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree arrayU32Idx [initArrU32_3, .scalar ⟨3, 8⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound arrayU32Idx 6 _ (by decide)
+
+theorem arrayU32IdxOob_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arrayU32IdxOobMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arrayU32IdxOob_anneal_ub
+  exact mirCall_ub arrayU32Idx_inFragment arrayU32Idx_translate ctxU32_3
+    (ctxU32_ok_arrayU32Idx rfl) [initArrU32_3, .scalar ⟨3, 8⟩] (by decide)
+    arrayU32IdxOobMInit rfl rfl rfl hr hf
+
+theorem arrayU32IdxOob_minirust_direct :
+    Interp.steps 2 arrayU32IdxOobMInit = .error (.ub "access to out-of-bounds index") := rfl
 
 end MiniRustSpec.Correspondence.Witness

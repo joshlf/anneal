@@ -122,13 +122,18 @@ executable meaning of the fragment is `Interp.lean`.
 `Interp.lean` transcribes, against the *generated* types, the specr-lang
 functions needed to run the fragment below on `Machine<BasicMemory<x86_64>>`:
 `Machine::step` (single enabled thread), `Statement::{Assign, PlaceMention}`,
-`PlaceExpr::Local`, `ValueExpr::{Constant, Load, UnOp, BinOp}` with
+`PlaceExpr::{Local, Index}` (`Index` on `Type::Array` only, with
+`Machine::ptr_offset_inbounds`, `Memory::{dereferenceable,
+signed_dereferenceable}`, and the `Machine::compute_size` sanity check),
+`ValueExpr::{Constant, Tuple, Load, UnOp, BinOp}` with
 `IntUnOp::{Neg, BitNot, CountOnes}` (all 3 `IntUnOp` variants), `CastOp::IntToInt`, and
 `IntBinOp::{Add, AddUnchecked, Sub, SubUnchecked, Mul, MulUnchecked, Div, DivExact, Rem, Shl, Shr, ShlUnchecked, ShrUnchecked, BitAnd, BitOr, BitXor}` (all 16 `IntBinOp` variants),
 `Terminator::{Goto, Switch, Return, Unreachable}` including
 frame teardown and both stack-pop actions, the representation relation for
-`Int` and `Bool`, `Type::layout`, `BasicMemory`'s `check_ptr`, `load`, `store`,
-and `deallocate`, and `ConcurrentMemory`'s access log and data-race check.
+`Int`, `Bool`, and `Array`, `Type::layout`, `LayoutStrategy::compute_size_and_align`
+for `Sized` layouts, `BasicMemory`'s `check_ptr`, `load`, `store`,
+`deallocate`, and `dereferenceable`, and `ConcurrentMemory`'s access log and
+data-race check.
 Every definition quotes the upstream code it transcribes and cites its exact
 vendored source file, and `crates/anneal-minirust-gen/tests/quotes.rs` parses
 every Lean doc comment (`/-! ... -/` and `/-- ... -/`) and checks each quoted
@@ -138,7 +143,7 @@ comments; `..` marks elided code). Effects are
 (a panic in the spec, which upstream calls a spec bug), and
 `Stop.unsupported` (outside the interpreted fragment; never silently wrong).
 
-`Anchors.lean` lists the 39 upstream items that `Interp.lean` transcribes,
+`Anchors.lean` lists the 44 upstream items that `Interp.lean` transcribes,
 each with its file path, item name, line, and token hash, and proves by `decide`
 that the generated model contains them unchanged (`anchors_ok`) with no
 duplicate entries (`anchors_nodup`). Re-pinning MiniRust therefore breaks
@@ -154,17 +159,36 @@ quoted in the doc comments, quotations checked by `tests/quotes.rs`)
 restricted to the fragment checked by `inFragment`:
 
 * the body is `Runtime(PostCleanup)` MIR and declares only the return place
-  and the arguments, all of integer type (`u8`..`u128`, `i8`..`i128`,
-  `usize`, `isize`);
-* statements are `_i = Use(op)`, `_i = UnaryOp(Neg | Not, op)`,
-  `_i = BinaryOp(Add | Sub | Mul | Div | Rem | BitXor | BitAnd | BitOr | Shl | Shr | AddUnchecked | SubUnchecked | MulUnchecked | ShlUnchecked | ShrUnchecked, opL, opR)`,
-  `_i = Cast(CastKind::IntToInt, op, targetTy)`, or `PlaceMention(_i)`,
-  with `op`, `opL`, `opR` projection-free `copy _j` or integer constants (of `_i`'s
-  type for `Use`, `UnaryOp`, `opL`, and non-shift `opR`, or of any integer type
-  for shift `opR` and `Cast(IntToInt)`);
-* terminators are `Goto`, `SwitchInt` on any integer fragment operand (`copy _j`
-  or constant) with distinct in-range values, `Return`, and `Unreachable`; all
-  targets are blocks of the body; no cleanup blocks.
+  and the arguments; the return place has integer type (`u8`..`u128`,
+  `i8`..`i128`, `usize`, `isize`), and each argument has integer type or is a
+  one-dimensional array `[T; N]` of an integer type `T` whose byte size
+  `N * size_of::<T>()` is below `2^63`;
+* scalar places are an integer local `_j` or one array element `_j[p]`, where
+  `p` is `Index(_k)` (`_k` an integer local; a signed `_k` is accepted only
+  when `N <= 2^(bits(_k) - 1)`, see the gaps) or
+  `ConstantIndex { offset, min_length, from_end }` with `min_length <= N`,
+  `offset < 2^63`, and, for `from_end`, `1 <= offset <= N`;
+* statements are, for a scalar destination place, `Use(op)`,
+  `UnaryOp(Neg | Not, op)`,
+  `BinaryOp(Add | Sub | Mul | Div | Rem | BitXor | BitAnd | BitOr | Shl | Shr | AddUnchecked | SubUnchecked | MulUnchecked | ShlUnchecked | ShrUnchecked, opL, opR)`,
+  `Cast(CastKind::IntToInt, op, targetTy)`, or (into a `usize` place)
+  `Len(_j)` of an array local; for an array destination local `_i : [T; N]`,
+  `Use(copy _j)` of an array local of the same type,
+  `Aggregate(Array(T), [op; N])`, or `Repeat(op, N)` with `N > 0`; or
+  `PlaceMention(_i)`; here `op`, `opL`, `opR` are `copy` of a scalar place or
+  integer constants (of the destination's type for `Use`, `UnaryOp`, `opL`,
+  non-shift `opR`, and array elements, or of any integer type for shift `opR`
+  and `Cast(IntToInt)`);
+* terminators are `Goto`, `SwitchInt` on any integer fragment operand (`copy`
+  of a scalar place, or a constant) with distinct in-range values, `Return`,
+  and `Unreachable`; all targets are blocks of the body; no cleanup blocks.
+
+`minimize` translates `Index(_k)` to `PlaceExpr::Index` with index
+`Load(_k)`, `Aggregate(Array)` and `Repeat(op, N)` to `ValueExpr::Tuple` (the
+latter with `N` copies of `op`), and `Len` of an array to the constant `N`.
+Upstream `minimize` rejects `ConstantIndex` (`span_bug!`); `translateFn`
+lowers it to `PlaceExpr::Index` with the constant `usize` index `offset` (or
+`N - offset` when `from_end`), which is the index MIR defines for it.
 
 ### States
 
@@ -175,12 +199,15 @@ MiniRust machine has one enabled thread whose stack is `[caller, callee]`; the
 callee runs `f` at the corresponding program point; every MIR local `_i` is a
 live MiniRust local pointing to its own `Stack` allocation whose bytes are the
 encoding of Anneal's slot (`Uninit` bytes for an uninitialized slot,
-little-endian bytes for an initialized scalar); the caller's return place is a
+little-endian bytes for an initialized scalar, and the concatenated element
+encodings for an array, whose slots are always initialized); the caller's
+return place is a
 live, large-enough, aligned allocation (`CtxOk`); and Anneal's memory has no
 borrows, protectors, call stack, or caller-owned referents. `ctx` fixes
 everything the callee does not determine: caller frame, unwind payloads, the
 allocations below the callee's locals, the locals' addresses (arbitrary,
-subject only to alignment, so every MiniRust address choice is covered), and
+subject only to alignment and, for arrays, to the whole array lying within
+the 64-bit address space, so every MiniRust address choice is covered), and
 the caller's continuation.
 
 ### Theorems
@@ -323,6 +350,18 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `mirCall_steps_error`, and direct checks of MiniRust's `"load at type but the
   data in memory violates the language invariant"` UB), alongside ground-truth
   checks of all four `IntBinOp::DivExact` outcomes.
+* `arrayOpsI8`, `arraySignedIdxI8`, `zeroArrayI8`, `arrayUninitIdxI8`, and
+  `arrayU32Idx`, bodies with `[i8; 3]`, `[i8; 2]`, `[i8; 0]`, and `[u32; 3]`
+  arguments exercising `Aggregate(Array)`, `Repeat`, whole-array copies,
+  `Len`, and `Index` / `ConstantIndex` (from the start and from the end) reads
+  and in-place element writes (`*_minirust_ret_from_start`, `*_noUB`, direct
+  runs, and byte-level checks that each in-place write rewrites exactly the
+  element's bytes at offset `index * size_of::<T>()` and leaves its siblings
+  intact: `arrayOpsOk_minirust_inplace_bytes`,
+  `arrayU32IdxOk_minirust_inplace_bytes`), plus UB for an out-of-bounds index
+  (`idx >= N`, including every index of `[i8; 0]`), a negative signed index,
+  and an uninitialized index local, each via `mirCall_ub` and a direct check
+  of MiniRust's `throw_ub!` message.
 
 ### Gaps
 
@@ -343,9 +382,25 @@ These are deliberate and are the first things to lift:
 * **Branch observations.** Anneal's `switchInt` emits the scrutinee as a
   visible leakage event; MiniRust has no counterpart, so `StepRel` matches it
   with an ordinary MiniRust step.
-* **Integers only.** No `bool` discriminants (`minimize` inserts a transmute),
-  no pointers, references, aggregates, non-integer casts, comparisons,
-  checked arithmetic, calls, drops, or assertions.
+* **Integers and integer arrays only.** No `bool` discriminants (`minimize`
+  inserts a transmute), no pointers, references, tuples, structs, enums,
+  slices, nested arrays, non-integer casts, comparisons, checked arithmetic,
+  calls, drops, or assertions. Arrays appear only as arguments (no other
+  locals exist) and never as the return place, and a place has at most one
+  projection.
+* **`Repeat` with count `0` is excluded.** Anneal evaluates the operand once
+  before replicating it, while `minimize`'s `list![op; 0]` never evaluates it,
+  so the models disagree when the operand is UB (an uninitialized `copy`).
+* **`Len` does not evaluate its place in MiniRust.** `minimize` emits the
+  constant `N` (its own `FIXME` notes the place might have UB), while Anneal
+  reads the place; this is harmless only because array slots in the fragment
+  are always initialized.
+* **Index locals of non-`usize` type.** MIR requires `usize` index locals,
+  but the fragment also accepts other integer types. Anneal indexes with the
+  raw bit pattern and MiniRust with the decoded value, which agree for
+  unsigned types and, for a signed type, as long as `N <= 2^(bits - 1)` (a
+  negative index then has a bit pattern `>= N`), which the fragment
+  requires.
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.
