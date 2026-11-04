@@ -46,6 +46,18 @@ jobs:
       - name: Run todo check
         run: ./ci/check_todo.sh
 
+  # FIXME(#87): We must address all blockers listed in #87 before permitting
+  # stable releases.
+  check-non-stable-version:
+    runs-on: ubuntu-latest
+    name: Check for non-stable cargo-anneal version
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify non-stable pre-release version
+        run: ./ci/check_non_stable_version.sh
+
   rust-unit-tests:
     runs-on: ubuntu-latest
     name: Rust workspace unit tests
@@ -195,7 +207,7 @@ jobs:
       # success in branch protection, so this aggregation must fail closed.
       if: ${{ always() }}
       runs-on: ubuntu-latest
-      needs: [check-todo, rust-unit-tests, tutor-chapters, end-to-end-verification]
+      needs: [check-todo, check-non-stable-version, rust-unit-tests, tutor-chapters, end-to-end-verification]
       steps:
         - name: Reject workflow cancellation
           if: ${{ cancelled() }}
