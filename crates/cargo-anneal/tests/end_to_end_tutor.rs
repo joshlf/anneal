@@ -559,11 +559,11 @@ fn tutor_chapters_match_the_tutor_workflow() {
     let bin_dir_arg = bin_dir.to_str().expect("utf8 bin dir");
     let output = run_tutor_workflow(
         &checkout_root,
-        &["check", "--no-build", "--bin-dir", bin_dir_arg],
+        &["run", "--no-build", "--bin-dir", bin_dir_arg],
     );
     assert!(
         output.status.success(),
-        "`{TUTOR_WORKFLOW_SCRIPT} check` failed:\nstdout:\n{}\nstderr:\n{}",
+        "`{TUTOR_WORKFLOW_SCRIPT} run` failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );

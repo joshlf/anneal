@@ -3333,7 +3333,10 @@ theorem dischargeRustTotalPinnedContractAuto
       intro _ _ h
       first
       | exact h
-      | exact ⟨⟨h.1, True.intro⟩, h.2⟩)
+      | exact h.1
+      | exact ⟨⟨h.1, True.intro⟩, h.2⟩
+      | exact ⟨⟨h.1.1, True.intro⟩, h.1.2⟩
+      | exact ⟨⟨h.2.1, True.intro⟩, h.1.2⟩)
     (h_check :
       checkMirAutoPinnedSpec
         subjectFuel specFuel c.body optReqBody optEnsBody = true := by rfl)
@@ -4108,7 +4111,10 @@ theorem dischargeRustTotalBoundedRange1Auto
             (Trusted.Sequence.length args = c.body.argCount)
             (MirBoolPredicateHolds reqBody args))
           (mem = (initMachineState c.body args).memory) := by
-      intro _ _ h; exact h)
+      intro _ _ h
+      first
+      | exact h
+      | exact h.1)
     (h_check :
       checkMirAutoBoundedRange1Spec
         subjectFuel specFuel c.body reqBody optEnsBody = true := by rfl)
@@ -5285,7 +5291,10 @@ theorem dischargeRustTotalSymRange1Auto
             (Trusted.Sequence.length args = c.body.argCount)
             (MirBoolPredicateHolds reqBody args))
           (mem = (initMachineState c.body args).memory) := by
-      intro _ _ h; exact h)
+      intro _ _ h
+      first
+      | exact h
+      | exact h.1)
     (h_bound :
       checkMirAutoSymRange1Bound specFuel c.body reqBody optEnsBody = true := by rfl)
     (h_sym :
@@ -5728,7 +5737,10 @@ theorem dischargeRustModularContractAuto
       intro _ _ h
       first
       | exact h
-      | exact ⟨⟨h.1, True.intro⟩, h.2⟩)
+      | exact h.1
+      | exact ⟨⟨h.1, True.intro⟩, h.2⟩
+      | exact ⟨⟨h.1.1, True.intro⟩, h.1.2⟩
+      | exact ⟨⟨h.2.1, True.intro⟩, h.1.2⟩)
     (h_call_pre :
       ∀ req : MirCallReq,
         req.defPath = calleeDefPath →
@@ -5851,7 +5863,10 @@ theorem dischargeRustModularBoundedRange1Auto
             (Trusted.Sequence.length args = subjectBody.argCount)
             (MirBoolPredicateHolds subjectReqBody args))
           (mem = (initMachineState subjectBody args).memory) := by
-      intro _ _ h; exact h)
+      intro _ _ h
+      first
+      | exact h
+      | exact h.1)
     (h_call_pre :
       ∀ req : MirCallReq,
         req.defPath = calleeDefPath →

@@ -510,19 +510,34 @@ pub fn render_obligations_module_with_options(
     ));
 
     out.push_str(&format!(
-        "/-- Low-priority default `StatefulItemSpec` instance for `{def_id}`. -/\n"
+        "/-- Signature-typed stateful precondition for `{def_id}` instantiated at\n    \
+            `typeArgs : Trusted.MirAst.TypeSubst`. -/\n\
+         @[reducible, simp]\n\
+         def sigPre\n    \
+             (typeArgs : Trusted.MirAst.TypeSubst)\n    \
+             (args : List Value)\n    \
+             (mem : Memory) : Prop :=\n  \
+           And (defaultPre args)\n      \
+               (Trusted.VerificationResult.argsMatchSignature\n        \
+                 (Mir.{item}.body.instantiate typeArgs) args mem)\n\n\
+         /-- Signature-typed stateful postcondition for `{def_id}` instantiated at\n    \
+             `typeArgs : Trusted.MirAst.TypeSubst`. -/\n\
+         @[reducible, simp]\n\
+         def sigPost\n    \
+             (typeArgs : Trusted.MirAst.TypeSubst)\n    \
+             (args : List Value)\n    \
+             (ret : Value)\n    \
+             (mem : Memory) : Prop :=\n  \
+           And (defaultPost args ret)\n      \
+               (Trusted.VerificationResult.retMatchesSignature\n        \
+                 (Mir.{item}.body.instantiate typeArgs) ret mem)\n\n\
+         /-- Low-priority default `StatefulItemSpec` instance for `{def_id}`. -/\n"
     ));
     out.push_str(&format!(
         "instance (priority := low) defaultStatefulSpec :\n    \
            StatefulItemSpec \"{def_id}\" where\n  \
-           pre := fun args mem =>\n    \
-             And (defaultPre args)\n    \
-                 (∀ (typeArgs : Trusted.MirAst.TypeSubst), typeArgs.length = Mir.{item}.body.typeParamCount →\n    \
-                    Trusted.VerificationResult.argsMatchSignature (Mir.{item}.body.instantiate typeArgs) args mem)\n  \
-           post := fun args _ ret mem =>\n    \
-             And (defaultPost args ret)\n    \
-                 (∀ (typeArgs : Trusted.MirAst.TypeSubst), typeArgs.length = Mir.{item}.body.typeParamCount →\n    \
-                    Trusted.VerificationResult.retMatchesSignature (Mir.{item}.body.instantiate typeArgs) ret mem)\n\n"
+           pre := fun args mem => sigPre List.nil args mem\n  \
+           post := fun args _ ret mem => sigPost List.nil args ret mem\n\n"
     ));
 
     out.push_str(&format!(
@@ -533,12 +548,8 @@ pub fn render_obligations_module_with_options(
            TotalItemSpec \"{def_id}\" where\n  \
            pre := fun args mem =>\n    \
              And (And (defaultPre args) (mem = (initMachineState Mir.{item}.body args).memory))\n    \
-                 (∀ (typeArgs : Trusted.MirAst.TypeSubst), typeArgs.length = Mir.{item}.body.typeParamCount →\n    \
-                    Trusted.VerificationResult.argsMatchSignature (Mir.{item}.body.instantiate typeArgs) args mem)\n  \
-           post := fun args _ ret mem =>\n    \
-             And (defaultPost args ret)\n    \
-                 (∀ (typeArgs : Trusted.MirAst.TypeSubst), typeArgs.length = Mir.{item}.body.typeParamCount →\n    \
-                    Trusted.VerificationResult.retMatchesSignature (Mir.{item}.body.instantiate typeArgs) ret mem)\n\n"
+                 (Trusted.VerificationResult.argsMatchSignature (Mir.{item}.body.instantiate List.nil) args mem)\n  \
+           post := fun args _ ret _ => defaultPost args ret\n\n"
     ));
 
     let default_env_assumed = if let Some(callee) = bundle.called_callees.first() {
@@ -559,12 +570,8 @@ pub fn render_obligations_module_with_options(
            envAssumed := {default_env_assumed}\n  \
            pre := fun args mem =>\n    \
              And (And (defaultPre args) (mem = (initMachineState Mir.{item}.body args).memory))\n    \
-                 (∀ (typeArgs : Trusted.MirAst.TypeSubst), typeArgs.length = Mir.{item}.body.typeParamCount →\n    \
-                    Trusted.VerificationResult.argsMatchSignature (Mir.{item}.body.instantiate typeArgs) args mem)\n  \
-           post := fun args _ ret mem =>\n    \
-             And (defaultPost args ret)\n    \
-                 (∀ (typeArgs : Trusted.MirAst.TypeSubst), typeArgs.length = Mir.{item}.body.typeParamCount →\n    \
-                    Trusted.VerificationResult.retMatchesSignature (Mir.{item}.body.instantiate typeArgs) ret mem)\n\n"
+                 (Trusted.VerificationResult.argsMatchSignature (Mir.{item}.body.instantiate List.nil) args mem)\n  \
+           post := fun args _ ret _ => defaultPost args ret\n\n"
     ));
 
     out.push_str(&format!(
@@ -573,15 +580,9 @@ pub fn render_obligations_module_with_options(
     out.push_str(&format!(
         "instance (priority := low) defaultUbExceptionSpec :\n    \
            UbExceptionItemSpec \"{def_id}\" where\n  \
-           pre := fun args mem =>\n    \
-             And (defaultPre args)\n    \
-                 (∀ (typeArgs : Trusted.MirAst.TypeSubst), typeArgs.length = Mir.{item}.body.typeParamCount →\n    \
-                    Trusted.VerificationResult.argsMatchSignature (Mir.{item}.body.instantiate typeArgs) args mem)\n  \
+           pre := fun args mem => sigPre List.nil args mem\n  \
            strictSafetyPre := fun _ _ => False\n  \
-           post := fun args _ ret mem =>\n    \
-             And (defaultPost args ret)\n    \
-                 (∀ (typeArgs : Trusted.MirAst.TypeSubst), typeArgs.length = Mir.{item}.body.typeParamCount →\n    \
-                    Trusted.VerificationResult.retMatchesSignature (Mir.{item}.body.instantiate typeArgs) ret mem)\n\n"
+           post := fun args _ ret mem => sigPost List.nil args ret mem\n\n"
     ));
 
     out.push_str(&format!(
@@ -766,6 +767,105 @@ pub fn render_obligations_module_with_options(
     out.push_str(&format!(
         "def ubExceptionClaim [spec : UbExceptionItemSpec \"{def_id}\"] : UbExceptionClaim :=\n  \
            {{ body := Mir.{item}.body, pre := spec.pre, strictSafetyPre := spec.strictSafetyPre, post := spec.post }}\n\n"
+    ));
+
+    out.push_str(&format!(
+        "/-- Verification claim for `{def_id}` instantiated at `typeArgs`. -/\n\
+         def claimFor\n    \
+             [spec : ItemSpec \"{def_id}\"]\n    \
+             (typeArgs : Trusted.MirAst.TypeSubst) : Claim :=\n  \
+           {{ body := Mir.{item}.body.instantiate typeArgs\n    \
+             pre := fun args =>\n      \
+               And (spec.pre args)\n          \
+                   (Trusted.VerificationResult.argsMatchSignature\n            \
+                     (Mir.{item}.body.instantiate typeArgs)\n            \
+                     args\n            \
+                     (initMachineState (Mir.{item}.body.instantiate typeArgs) args).memory)\n    \
+             post := fun args ret =>\n      \
+               And (spec.post args ret)\n          \
+                   (Trusted.VerificationResult.retMatchesSignature\n            \
+                     (Mir.{item}.body.instantiate typeArgs)\n            \
+                     ret\n            \
+                     (initMachineState (Mir.{item}.body.instantiate typeArgs) args).memory) }}\n\n\
+         /-- Universally quantified polymorphic verification proposition for `{def_id}`\n    \
+             over all `typeArgs : Trusted.MirAst.TypeSubst` of length\n    \
+             `Mir.{item}.body.typeParamCount`. -/\n\
+         def polyClaim [spec : ItemSpec \"{def_id}\"] : Prop :=\n  \
+           ∀ (typeArgs : Trusted.MirAst.TypeSubst),\n    \
+             typeArgs.length = Mir.{item}.body.typeParamCount →\n      \
+               VerificationResult (claimFor typeArgs)\n\n\
+         /-- Stateful verification claim for `{def_id}` instantiated at `typeArgs`. -/\n\
+         def statefulClaimFor (typeArgs : Trusted.MirAst.TypeSubst) : StatefulClaim :=\n  \
+           {{ body := Mir.{item}.body.instantiate typeArgs\n    \
+             pre := fun args mem => sigPre typeArgs args mem\n    \
+             post := fun args _ ret mem => sigPost typeArgs args ret mem }}\n\n\
+         /-- Universally quantified polymorphic stateful verification proposition for\n    \
+             `{def_id}` over all `typeArgs : Trusted.MirAst.TypeSubst` of length\n    \
+             `Mir.{item}.body.typeParamCount`. -/\n\
+         def polyStatefulClaim : Prop :=\n  \
+           ∀ (typeArgs : Trusted.MirAst.TypeSubst),\n    \
+             typeArgs.length = Mir.{item}.body.typeParamCount →\n      \
+               StatefulVerificationResult (statefulClaimFor typeArgs)\n\n\
+         /-- Total-correctness verification claim for `{def_id}` instantiated at\n    \
+             `typeArgs`. -/\n\
+         def totalClaimFor (typeArgs : Trusted.MirAst.TypeSubst) : TotalClaim :=\n  \
+           {{ body := Mir.{item}.body.instantiate typeArgs\n    \
+             pre := fun args mem =>\n      \
+               And (And (defaultPre args)\n                \
+                        (mem = (initMachineState (Mir.{item}.body.instantiate typeArgs) args).memory))\n          \
+                   (Trusted.VerificationResult.argsMatchSignature\n            \
+                     (Mir.{item}.body.instantiate typeArgs) args mem)\n    \
+             post := fun args _ ret mem => sigPost typeArgs args ret mem }}\n\n\
+         /-- Universally quantified polymorphic total-correctness verification\n    \
+             proposition for `{def_id}` over all `typeArgs : Trusted.MirAst.TypeSubst`\n    \
+             of length `Mir.{item}.body.typeParamCount`. -/\n\
+         def polyTotalClaim : Prop :=\n  \
+           ∀ (typeArgs : Trusted.MirAst.TypeSubst),\n    \
+             typeArgs.length = Mir.{item}.body.typeParamCount →\n      \
+               TotalVerificationResult (totalClaimFor typeArgs)\n\n\
+         /-- Modular verification claim for `{def_id}` instantiated at `typeArgs`. -/\n\
+         def modularClaimFor\n    \
+             [spec : ModularItemSpec \"{def_id}\"]\n    \
+             (typeArgs : Trusted.MirAst.TypeSubst) : ModularClaim :=\n  \
+           {{ body := Mir.{item}.body.instantiate typeArgs\n    \
+             envAssumed := spec.envAssumed\n    \
+             pre := fun args mem =>\n      \
+               And (spec.pre args mem)\n          \
+                   (Trusted.VerificationResult.argsMatchSignature\n            \
+                     (Mir.{item}.body.instantiate typeArgs) args mem)\n    \
+             post := fun args m0 ret m1 =>\n      \
+               And (spec.post args m0 ret m1)\n          \
+                   (Trusted.VerificationResult.retMatchesSignature\n            \
+                     (Mir.{item}.body.instantiate typeArgs) ret m1) }}\n\n\
+         /-- Universally quantified polymorphic modular verification proposition for\n    \
+             `{def_id}` over all `typeArgs : Trusted.MirAst.TypeSubst` of length\n    \
+             `Mir.{item}.body.typeParamCount`. -/\n\
+         def polyModularClaim [spec : ModularItemSpec \"{def_id}\"] : Prop :=\n  \
+           ∀ (typeArgs : Trusted.MirAst.TypeSubst),\n    \
+             typeArgs.length = Mir.{item}.body.typeParamCount →\n      \
+               ModularVerificationResult (modularClaimFor typeArgs)\n\n\
+         /-- Scoped UB-exception verification claim for `{def_id}` instantiated at\n    \
+             `typeArgs`. -/\n\
+         def ubExceptionClaimFor\n    \
+             [spec : UbExceptionItemSpec \"{def_id}\"]\n    \
+             (typeArgs : Trusted.MirAst.TypeSubst) : UbExceptionClaim :=\n  \
+           {{ body := Mir.{item}.body.instantiate typeArgs\n    \
+             pre := fun args mem =>\n      \
+               And (spec.pre args mem)\n          \
+                   (Trusted.VerificationResult.argsMatchSignature\n            \
+                     (Mir.{item}.body.instantiate typeArgs) args mem)\n    \
+             strictSafetyPre := spec.strictSafetyPre\n    \
+             post := fun args m0 ret m1 =>\n      \
+               And (spec.post args m0 ret m1)\n          \
+                   (Trusted.VerificationResult.retMatchesSignature\n            \
+                     (Mir.{item}.body.instantiate typeArgs) ret m1) }}\n\n\
+         /-- Universally quantified polymorphic UB-exception verification proposition\n    \
+             for `{def_id}` over all `typeArgs : Trusted.MirAst.TypeSubst` of length\n    \
+             `Mir.{item}.body.typeParamCount`. -/\n\
+         def polyUbExceptionClaim [spec : UbExceptionItemSpec \"{def_id}\"] : Prop :=\n  \
+           ∀ (typeArgs : Trusted.MirAst.TypeSubst),\n    \
+             typeArgs.length = Mir.{item}.body.typeParamCount →\n      \
+               UbExceptionVerificationResult (ubExceptionClaimFor typeArgs)\n\n"
     ));
 
     out.push_str(&format!("end Obligations.{item}\n"));
@@ -1057,8 +1157,8 @@ pub fn render_verify_module_with_options(
                      Obligations.{item}.totalClaim 64 (by\n            \
                        intro _ _ _\n            \
                        first\n            \
-                       | exact True.intro\n            \
-                       | simp; try omega)\n"
+                       | (simp; try omega; done)\n            \
+                       | exact True.intro)\n"
         ));
         out.push_str(&format!(
             "/-- Low-priority fallback `TotalItemProof` instance attempting\n    \
@@ -1114,8 +1214,8 @@ pub fn render_verify_module_with_options(
             "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.verifyByWP Obligations.{item}.claim 64 (by\n          \
                      intro _ _\n          \
                      first\n          \
-                     | exact True.intro\n          \
-                     | simp; try omega)\n"
+                     | (simp; try omega; done)\n          \
+                     | exact True.intro)\n"
         ));
         out.push_str(&format!(
             "/-- Low-priority fallback `ItemProof` instance attempting bounded\n    \
@@ -1903,6 +2003,85 @@ mod tests {
         assert!(total_verify.contains(
             "theorem verified : TotalVerificationResult Obligations.MyCrate.math.inc.totalClaim :=\n  \
                (inferInstance : TotalItemProof \"my_crate::math::inc\" Obligations.MyCrate.math.inc.totalClaim).verified"
+        ));
+    }
+
+    #[test]
+    fn renders_signature_and_polymorphic_obligations() {
+        let records = sample_records();
+        let bundles = group_subject_obligations(&records);
+        let bundle = &bundles[0];
+
+        let obligations = render_obligations_module(bundle);
+        assert!(obligations.contains(
+            "def sigPre\n    \
+                 (typeArgs : Trusted.MirAst.TypeSubst)\n    \
+                 (args : List Value)\n    \
+                 (mem : Memory) : Prop :=\n  \
+               And (defaultPre args)\n      \
+                   (Trusted.VerificationResult.argsMatchSignature\n        \
+                     (Mir.MyCrate.math.inc.body.instantiate typeArgs) args mem)"
+        ));
+        assert!(obligations.contains(
+            "def sigPost\n    \
+                 (typeArgs : Trusted.MirAst.TypeSubst)\n    \
+                 (args : List Value)\n    \
+                 (ret : Value)\n    \
+                 (mem : Memory) : Prop :=\n  \
+               And (defaultPost args ret)\n      \
+                   (Trusted.VerificationResult.retMatchesSignature\n        \
+                     (Mir.MyCrate.math.inc.body.instantiate typeArgs) ret mem)"
+        ));
+        assert!(obligations.contains(
+            "def claimFor\n    \
+                 [spec : ItemSpec \"my_crate::math::inc\"]\n    \
+                 (typeArgs : Trusted.MirAst.TypeSubst) : Claim :="
+        ));
+        assert!(obligations.contains(
+            "def polyClaim [spec : ItemSpec \"my_crate::math::inc\"] : Prop :=\n  \
+               ∀ (typeArgs : Trusted.MirAst.TypeSubst),\n    \
+                 typeArgs.length = Mir.MyCrate.math.inc.body.typeParamCount →\n      \
+                   VerificationResult (claimFor typeArgs)"
+        ));
+        assert!(obligations.contains(
+            "def statefulClaimFor (typeArgs : Trusted.MirAst.TypeSubst) : StatefulClaim :="
+        ));
+        assert!(obligations.contains(
+            "def polyStatefulClaim : Prop :=\n  \
+               ∀ (typeArgs : Trusted.MirAst.TypeSubst),\n    \
+                 typeArgs.length = Mir.MyCrate.math.inc.body.typeParamCount →\n      \
+                   StatefulVerificationResult (statefulClaimFor typeArgs)"
+        ));
+        assert!(obligations.contains(
+            "def totalClaimFor (typeArgs : Trusted.MirAst.TypeSubst) : TotalClaim :="
+        ));
+        assert!(obligations.contains(
+            "def polyTotalClaim : Prop :=\n  \
+               ∀ (typeArgs : Trusted.MirAst.TypeSubst),\n    \
+                 typeArgs.length = Mir.MyCrate.math.inc.body.typeParamCount →\n      \
+                   TotalVerificationResult (totalClaimFor typeArgs)"
+        ));
+        assert!(obligations.contains(
+            "def modularClaimFor\n    \
+                 [spec : ModularItemSpec \"my_crate::math::inc\"]\n    \
+                 (typeArgs : Trusted.MirAst.TypeSubst) : ModularClaim :="
+        ));
+        assert!(obligations.contains(
+            "def polyModularClaim [spec : ModularItemSpec \"my_crate::math::inc\"] : Prop :=\n  \
+               ∀ (typeArgs : Trusted.MirAst.TypeSubst),\n    \
+                 typeArgs.length = Mir.MyCrate.math.inc.body.typeParamCount →\n      \
+                   ModularVerificationResult (modularClaimFor typeArgs)"
+        ));
+        assert!(obligations.contains(
+            "def ubExceptionClaimFor\n    \
+                 [spec : UbExceptionItemSpec \"my_crate::math::inc\"]\n    \
+                 (typeArgs : Trusted.MirAst.TypeSubst) : UbExceptionClaim :="
+        ));
+        assert!(obligations.contains(
+            "def polyUbExceptionClaim [spec : UbExceptionItemSpec \"my_crate::math::inc\"] : Prop :=\n  \
+               ∀ (typeArgs : Trusted.MirAst.TypeSubst),\n    \
+                 typeArgs.length = Mir.MyCrate.math.inc.body.typeParamCount →\n      \
+                   UbExceptionVerificationResult (ubExceptionClaimFor typeArgs)"
         ));
     }
 }

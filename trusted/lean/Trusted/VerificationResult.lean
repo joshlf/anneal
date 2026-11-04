@@ -1,6 +1,8 @@
 import Trusted.Refinement
 import Trusted.Effect
 import Trusted.ITree
+import Trusted.Sequence
+import Trusted.Layout
 import Trusted.MirAst
 import Trusted.MirSemantics
 
@@ -9,6 +11,8 @@ namespace Trusted.VerificationResult
 open Trusted.Refinement
 open Trusted.Effect
 open Trusted.ITree
+open Trusted.Sequence
+open Trusted.Layout
 open Trusted.MirAst
 open Trusted.MirSemantics
 
@@ -71,110 +75,1059 @@ def initMachineStateWithMemory
   }
 
 /--
-Verifies that a `ScalarInt` is a valid Unicode scalar value.
+Verify that a `ScalarInt` is a valid 4-byte Unicode scalar value
+(`0x0000..=0xD7FF` or `0xE000..=0x10FFFF`).
+
+Reference (The Rust Reference, "Textual types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/textual.html>
+
+> "A value of type char is a Unicode scalar value (i.e. a code point that is not
+> a surrogate), represented as a 32-bit unsigned word in the 0x0000 to 0xD7FF or
+> 0xE000 to 0x10FFFF range."
 -/
-@[reducible]
+@[reducible, simp]
 def isValidChar (sv : ScalarInt) : Prop :=
-  sv.sizeBytes = 4 ∧ (sv.bits ≤ 0xD7FF ∨ (0xE000 ≤ sv.bits ∧ sv.bits ≤ 0x10FFFF))
+  sv.sizeBytes = 4 ∧
+    (sv.bits ≤ 0xD7FF ∨ (0xE000 ≤ sv.bits ∧ sv.bits ≤ 0x10FFFF))
 
 /--
-Structurally validates a single value against its `Ty` and `TypeLayout`, recursively traversing aggregates.
+Maximum signed `isize::MAX` byte count for allocations and wide slices on target
+pointer bit-width `ptrBits` (`2^31 - 1` on 32-bit targets, `2^63 - 1` on 64-bit
+targets).
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "The size of the referenced value cannot exceed `isize::MAX`."
 -/
-@[simp]
-def valueMatchesTyAndLayout (fuel : Nat) (body : CapturedMir) (ty : Ty) (layoutIdx : LayoutIdx) (val : Value) (mem : Memory) : Prop :=
-  match fuel with
-  | 0 => True
-  | fuel' + 1 =>
-    match body.layouts.lookup layoutIdx with
-    | .none => False
-    | .some layout =>
-      match val with
-      | .unit => layout.size.bytes = 0
-      | .scalar sv =>
-        match ty.kind with
-        | .bool => sv.sizeBytes = layout.size.bytes ∧ (sv.bits = 0 ∨ sv.bits = 1)
-        | .char => isValidChar sv
-        | .int _ => sv.sizeBytes = layout.size.bytes ∧ sv.bits < 2^(sv.sizeBytes * 8)
-        | .uint _ => sv.sizeBytes = layout.size.bytes ∧ sv.bits < 2^(sv.sizeBytes * 8)
-        | .float _ => sv.sizeBytes = layout.size.bytes ∧ sv.bits < 2^(sv.sizeBytes * 8)
-        | .rawPtr _ _ => sv.sizeBytes = layout.size.bytes
-        | .fnPtr _ _ _ _ => sv.sizeBytes = layout.size.bytes
-        | _ => True
-      | .ptr p sz =>
-        match ty.kind with
-        | .ref _ _ =>
-          match sz with
-          | 0 => True
-          | _ =>
-            match lookupGlobalAlloc mem.globals p.allocId with
-            | .none => False
-            | .some alloc => p.offsetBytes + sz ≤ alloc.bytes.length
-        | .rawPtr _ _ => True
-        | .fnPtr _ _ _ _ => p.offsetBytes = 0
-        | _ => True
-      | .aggregate variantIdx fields =>
-        match ty.kind with
-        | .ref _ (.slice _) =>
-          match fields with
-          | .cons (.ptr p sz) (.cons (.scalar len_sv) .nil) =>
-            match lookupGlobalAlloc mem.globals p.allocId with
-            | .some alloc =>
-              len_sv.bits ≤ 9223372036854775807 ∧ 
-              p.offsetBytes + len_sv.bits * sz ≤ alloc.bytes.length
-            | .none => False
+@[reducible, simp]
+def maxIsizeBytes (ptrBits : Nat) : Nat :=
+  match Nat.beq ptrBits 32 with
+  | true => 2147483647
+  | false => 9223372036854775807
+
+/--
+Test whether `layout` is the synthetic generic-parameter placeholder entry
+(`size = 0`, `variants = .empty`, `isUninhabited = false`) emitted for an
+unsubstituted `RigidTy.param` (`@[reducible]` for `dsimp` reduction).
+-/
+@[reducible, simp]
+def sigIsParamPlaceholder (layout : TypeLayout) : Bool :=
+  match layout.variants with
+  | .empty => Nat.beq layout.size.bytes 0 && !layout.isUninhabited
+  | _ => false
+
+/--
+Test whether `val` lies within `range : WrappingRange` (`@[reducible]` for
+`dsimp` reduction).
+-/
+@[reducible, simp]
+def sigWrappingRangeContains (range : WrappingRange) (val : Nat) : Bool :=
+  match Nat.ble range.start range.end_ with
+  | true => Nat.ble range.start val && Nat.ble val range.end_
+  | false => Nat.ble range.start val || Nat.ble val range.end_
+
+/--
+Byte width of a `PrimitiveKind` scalar (`@[reducible]` for `dsimp` reduction).
+-/
+@[reducible, simp]
+def sigPrimitiveByteWidth : PrimitiveKind → Option Nat
+  | .int bits _ =>
+    match Nat.beq (bits % 8) 0 && Nat.blt 0 bits with
+    | true => .some (bits / 8)
+    | false => .none
+  | .float bits =>
+    match Nat.beq (bits % 8) 0 && Nat.blt 0 bits with
+    | true => .some (bits / 8)
+    | false => .none
+  | .pointer _ => .none
+
+/--
+Byte width of a `ScalarLayout` (`@[reducible]` for `dsimp` reduction).
+-/
+@[reducible, simp]
+def sigScalarLayoutByteWidth : ScalarLayout → Option Nat
+  | .initialized prim _ => sigPrimitiveByteWidth prim
+  | .union prim => sigPrimitiveByteWidth prim
+
+/--
+Check that a scalar bit pattern `bits` satisfies any `WrappingRange` validity
+constraint recorded on `repr`
+(`BackendRepr.scalar (.initialized _ validRange)`).
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1539-L1559>
+
+> "Initialized { value: Primitive, valid_range: WrappingRange }"
+-/
+@[reducible, simp]
+def scalarMatchesBackendRepr (repr : BackendRepr) (bits : Nat) : Prop :=
+  match repr with
+  | .scalar (.initialized _ validRange) =>
+    sigWrappingRangeContains validRange bits = true
+  | _ => True
+
+/--
+Check that a scalar or enum discriminant bit pattern `bits` satisfies the
+`WrappingRange` constraint of `sl : ScalarLayout`.
+-/
+@[reducible, simp]
+def tagMatchesScalarLayout (sl : ScalarLayout) (bits : Nat) : Prop :=
+  match sl with
+  | .initialized _ validRange =>
+    sigWrappingRangeContains validRange bits = true
+  | .union _ => True
+
+/--
+Validate a `Value` against a single `ScalarLayout` component (used for scalar
+and scalar-pair struct fields when only `BackendRepr` metadata is present).
+-/
+@[reducible, simp]
+def valueMatchesScalarLayout (sl : ScalarLayout) (val : Value) : Prop :=
+  match sigScalarLayoutByteWidth sl with
+  | .none => False
+  | .some expectedBytes =>
+    match val with
+    | .scalar sv =>
+      0 < expectedBytes ∧
+        sv.sizeBytes = expectedBytes ∧
+        sv.bits < 2 ^ (sv.sizeBytes * 8) ∧
+        tagMatchesScalarLayout sl sv.bits
+    | .ptr _ ptrSz =>
+      0 < expectedBytes ∧
+        ptrSz = expectedBytes ∧
+        match sl with
+        | .initialized (.pointer _) _ => True
+        | .union (.pointer _) => True
+        | _ => False
+    | _ => False
+
+/--
+Look up the element at 0-based index `idx` in `xs` by structural recursion on
+`xs` (`@[reducible]` so `dsimp` unfolds concrete layout and variant lookups).
+-/
+@[reducible, simp]
+def sigGet? {α : Type u} : List α → Nat → Option α
+  | .nil, _ => .none
+  | x :: _, 0 => .some x
+  | _ :: xs, n + 1 => sigGet? xs n
+
+/--
+Look up the global `CapturedAllocation` with identifier `id` in `globals`
+(`@[reducible]` for `dsimp` reduction).
+-/
+@[reducible, simp]
+def sigLookupGlobalAlloc :
+    List CapturedAllocation → AllocId → Option CapturedAllocation
+  | .nil, _ => .none
+  | a :: rest, id =>
+    match Nat.beq a.allocId id with
+    | true => .some a
+    | false => sigLookupGlobalAlloc rest id
+
+/--
+Look up the `BorrowEntry` with provenance tag `tag` in `borrows` (`@[reducible]`
+for `dsimp` reduction).
+-/
+@[reducible, simp]
+def sigLookupBorrow : List BorrowEntry → Nat → Option BorrowEntry
+  | .nil, _ => .none
+  | entry :: rest, tag =>
+    match Nat.beq entry.tag tag with
+    | true => .some entry
+    | false => sigLookupBorrow rest tag
+
+/--
+Byte width of an unsigned integer type `UintTy` on a target with pointer
+bit-width `ptrBits` (`@[reducible]` for `dsimp` reduction).
+-/
+@[reducible, simp]
+def sigUintByteWidth (ptrBits : Nat) : UintTy → Nat
+  | .u8 => 1
+  | .u16 => 2
+  | .u32 => 4
+  | .u64 => 8
+  | .u128 => 16
+  | .usize => Nat.div ptrBits 8
+
+/--
+Byte width of a signed integer type `IntTy` on a target with pointer bit-width
+`ptrBits` (`@[reducible]` for `dsimp` reduction).
+-/
+@[reducible, simp]
+def sigIntByteWidth (ptrBits : Nat) : IntTy → Nat
+  | .i8 => 1
+  | .i16 => 2
+  | .i32 => 4
+  | .i64 => 8
+  | .i128 => 16
+  | .isize => Nat.div ptrBits 8
+
+/--
+Search `decls` for the first `LocalDecl` whose `ty.kind` is an `.adt`, returning
+its `layoutIdx`.
+-/
+@[reducible, simp]
+def findAdtDeclLayoutIdx : List LocalDecl → Option LayoutIdx
+  | .nil => .none
+  | d :: rest =>
+    match d.ty.kind with
+    | .adt _ _ => .some d.ty.layoutIdx
+    | _ => findAdtDeclLayoutIdx rest
+
+/--
+Test whether any `LocalDecl` in `decls` references layout table slot `idx`.
+-/
+@[reducible, simp]
+def localDeclsUseLayoutIdx : List LocalDecl → LayoutIdx → Bool
+  | .nil, _ => false
+  | d :: rest, idx =>
+    match Nat.beq d.ty.layoutIdx idx with
+    | true => true
+    | false => localDeclsUseLayoutIdx rest idx
+
+/--
+Find the first non-placeholder `TypeLayout` in `entries` (starting at index
+`currIdx`) that is not directly referenced by any `LocalDecl` in `decls`.
+`anneal-rustc-capture` interns pointee layouts of `&T` / `*const T` parameters
+into `body.layouts.entries` immediately after the reference layout.
+-/
+@[reducible, simp]
+def findUnusedLayoutInTable
+    (decls : List LocalDecl) :
+    List TypeLayout → Nat → Option TypeLayout
+  | .nil, _ => .none
+  | l :: rest, currIdx =>
+    match
+      Bool.or
+        (localDeclsUseLayoutIdx decls currIdx)
+        (sigIsParamPlaceholder l)
+    with
+    | false => .some l
+    | true => findUnusedLayoutInTable decls rest (currIdx + 1)
+
+/--
+Resolve the concrete `TypeLayout` of an inner `RigidTy` `childKind` (such as a
+reference pointee, slice/array element, tuple element, or ADT field) inside
+`parentLayout` (at `parentLayoutIdx`) within `body`.
+-/
+@[reducible, simp]
+def resolveChildLayout
+    (body : CapturedMir)
+    (parentLayout : TypeLayout)
+    (parentLayoutIdx : LayoutIdx)
+    (fieldPos : Option Nat)
+    (childKind : RigidTy) :
+    Option TypeLayout :=
+  let fromFieldLayouts : Option TypeLayout :=
+    match fieldPos with
+    | .some pos =>
+      match sigGet? parentLayout.fieldLayouts pos with
+      | .some fIdx => sigGet? body.layouts.entries fIdx
+      | .none => .none
+    | .none =>
+      match parentLayout.fieldLayouts with
+      | fIdx :: .nil => sigGet? body.layouts.entries fIdx
+      | _ => .none
+  match fromFieldLayouts with
+  | .some l => .some l
+  | .none =>
+    let effPtrBits :=
+      match Nat.beq body.layouts.pointerBits 0 with
+      | true => 64
+      | false => body.layouts.pointerBits
+    match childKind with
+    | .uint w =>
+      let sz := maxNat 1 (sigUintByteWidth effPtrBits w)
+      let bits := sz * 8
+      .some
+        { size := ⟨sz⟩
+          align := ⟨sz⟩
+          backendRepr :=
+            .scalar (.initialized (.int bits false) ⟨0, 2 ^ bits - 1⟩)
+          fields := .primitive
+          variants := .single 0
+          isUninhabited := false }
+    | .int w =>
+      let sz := maxNat 1 (sigIntByteWidth effPtrBits w)
+      let bits := sz * 8
+      .some
+        { size := ⟨sz⟩
+          align := ⟨sz⟩
+          backendRepr :=
+            .scalar (.initialized (.int bits true) ⟨0, 2 ^ bits - 1⟩)
+          fields := .primitive
+          variants := .single 0
+          isUninhabited := false }
+    | .adt _ adtArgs =>
+      let nextIdx := parentLayoutIdx + 1
+      let fallback :=
+        match findAdtDeclLayoutIdx body.localDecls with
+        | .some declIdx => sigGet? body.layouts.entries declIdx
+        | .none =>
+          findUnusedLayoutInTable body.localDecls body.layouts.entries 0
+      let candOpt : Option TypeLayout :=
+        match localDeclsUseLayoutIdx body.localDecls nextIdx with
+        | false =>
+          match sigGet? body.layouts.entries nextIdx with
+          | .some candL =>
+            match sigIsParamPlaceholder candL with
+            | false => .some candL
+            | true => fallback
+          | .none => fallback
+        | true => fallback
+      match adtArgs with
+      | .nil => candOpt
+      | _ :: _ =>
+        RigidTy.computeLayout
+          body.layouts.pointerBits
+          body.layouts.entries
+          .nil
+          candOpt
+          childKind
+    | _ =>
+      RigidTy.computeLayout
+        body.layouts.pointerBits
+        body.layouts.entries
+        .nil
+        .none
+        childKind
+
+/--
+Check whether Tree Borrows permission `perm` permits a reference with mutability
+`refMut` (`&T` allows `.active`, `.reserved`, and `.frozen`; `&mut T` requires
+`.active` or `.reserved`).
+-/
+@[reducible, simp]
+def borrowPermAllowsRef : Mutability → TreeBorrowPerm → Bool
+  | .not, .disabled => false
+  | .not, _ => true
+  | .mut, .active => true
+  | .mut, .reserved => true
+  | .mut, _ => false
+
+/--
+Select the remaining generic type arguments `adtArgs` applicable to variant
+`variantIdx` of a multi-variant enum (`VariantsShape.multiple`), skipping
+zero-field variants (such as `Option::None`) and advancing across payload
+variants (such as `Result::Ok(T)` before `Result::Err(E)`).
+-/
+@[reducible, simp]
+def selectVariantTypeArgs :
+    Nat → List FieldsShape → List RigidTy → List RigidTy
+  | 0, _, adtArgs => adtArgs
+  | _ + 1, .nil, adtArgs => adtArgs
+  | v + 1, .arbitrary .nil _ :: restShapes, adtArgs =>
+    selectVariantTypeArgs v restShapes adtArgs
+  | v + 1, .primitive :: restShapes, adtArgs =>
+    selectVariantTypeArgs v restShapes adtArgs
+  | v + 1, _ :: restShapes, adtArgs =>
+    let nextArgs :=
+      match adtArgs with
+      | _ :: tail@(_ :: _) => tail
+      | _ => adtArgs
+    selectVariantTypeArgs v restShapes nextArgs
+
+/--
+Recursively validate every `Value` in a list using `elemPred`.
+-/
+@[reducible, simp]
+def arrayElemsMatchWith (elemPred : Value → Prop) : List Value → Prop
+  | .nil => True
+  | e :: rest => elemPred e ∧ arrayElemsMatchWith elemPred rest
+
+/--
+Validate an untyped interior field `Value` when neither `adtArgs` nor
+`fieldLayouts` nor `Scalar`/`ScalarPair` `BackendRepr` specifies its layout.
+-/
+@[reducible, simp]
+def valueMatchesUntypedField : Nat → Value → Prop
+  | 0, _ => False
+  | _ + 1, .unit => True
+  | _ + 1, .scalar sv =>
+    0 < sv.sizeBytes ∧ sv.bits < 2 ^ (sv.sizeBytes * 8)
+  | _ + 1, .ptr _ ptrSz => 0 < ptrSz
+  | fuel' + 1, .aggregate _ fields =>
+    arrayElemsMatchWith (valueMatchesUntypedField fuel') fields
+
+/--
+Recursively validate each field of an untyped ADT against `parentLayout` using
+`layoutPred` when `fieldLayouts` is populated.
+-/
+@[reducible, simp]
+def adtFieldsLayoutOnlyWith
+    (fuel' : Nat)
+    (body : CapturedMir)
+    (parentLayout : TypeLayout)
+    (layoutPred : Option TypeLayout → LayoutIdx → Value → Prop) :
+    Nat → List Value → Prop
+  | _, .nil => True
+  | pos, v :: restV =>
+    let ok : Prop :=
+      match sigGet? parentLayout.fieldLayouts pos with
+      | .some fIdx =>
+        layoutPred (sigGet? body.layouts.entries fIdx) fIdx v
+      | .none =>
+        match parentLayout.variants, parentLayout.backendRepr with
+        | .single _, .scalar sl =>
+          match pos, restV with
+          | 0, .nil => valueMatchesScalarLayout sl v
+          | _, _ => valueMatchesUntypedField fuel' v
+        | .single _, .scalarPair sl0 sl1 =>
+          match pos with
+          | 0 => valueMatchesScalarLayout sl0 v
+          | 1 => valueMatchesScalarLayout sl1 v
+          | _ => valueMatchesUntypedField fuel' v
+        | _, _ => valueMatchesUntypedField fuel' v
+    ok ∧
+      adtFieldsLayoutOnlyWith fuel' body parentLayout layoutPred (pos + 1) restV
+
+/--
+Recursively validate each element of an untyped ADT with `FieldsShape.array`.
+-/
+@[reducible, simp]
+def adtArrayLayoutOnlyWith
+    (body : CapturedMir)
+    (parentLayout : TypeLayout)
+    (strideBytes : Nat)
+    (layoutPred : Option TypeLayout → LayoutIdx → Value → Prop) :
+    List Value → Prop
+  | .nil => True
+  | e :: rest =>
+    let elemOk : Prop :=
+      match parentLayout.fieldLayouts with
+      | fIdx :: _ =>
+        layoutPred (sigGet? body.layouts.entries fIdx) fIdx e
+      | .nil =>
+        match e with
+        | .scalar sv =>
+          sv.sizeBytes = strideBytes ∧
+            0 < sv.sizeBytes ∧
+            sv.bits < 2 ^ (sv.sizeBytes * 8)
+        | _ => False
+    elemOk ∧
+      adtArrayLayoutOnlyWith body parentLayout strideBytes layoutPred rest
+
+/--
+Validate a `Value` when only its `TypeLayout` (from `fieldLayouts`) is known.
+-/
+@[reducible, simp]
+def valueMatchesLayoutOnly :
+    Nat → CapturedMir → Option TypeLayout → LayoutIdx → Value → Memory → Prop
+  | 0, _, _, _, _, _ => False
+  | _ + 1, _, .none, _, _, _ => False
+  | _ + 1, _, .some layout, _, .unit, _ =>
+    layout.isUninhabited = false ∧
+      sigIsParamPlaceholder layout = false ∧
+      match layout.variants, layout.fields with
+      | .single 0, .arbitrary .nil _ => layout.size.bytes = 0
+      | .single 0, .array _ 0 => layout.size.bytes = 0
+      | _, _ => False
+  | _ + 1, _, .some layout, _, .scalar sv, _ =>
+    layout.isUninhabited = false ∧
+      sigIsParamPlaceholder layout = false ∧
+      match layout.variants, layout.fields with
+      | .single _, .primitive =>
+        match layout.backendRepr with
+        | .scalar sl =>
+          valueMatchesScalarLayout sl (.scalar sv) ∧
+            sv.sizeBytes = layout.size.bytes
+        | _ => False
+      | .single _, .union count =>
+        0 < count ∧
+          sv.sizeBytes = layout.size.bytes ∧
+          0 < sv.sizeBytes ∧
+          sv.bits < 2 ^ (sv.sizeBytes * 8)
+      | _, _ => False
+  | _ + 1, _, .some layout, _, .ptr p ptrSz, _ =>
+    layout.isUninhabited = false ∧
+      sigIsParamPlaceholder layout = false ∧
+      match layout.variants, layout.fields, layout.backendRepr with
+      | .single _, .primitive, .scalar sl =>
+        valueMatchesScalarLayout sl (.ptr p ptrSz) ∧
+          ptrSz = layout.size.bytes
+      | _, _, _ => False
+  | fuel' + 1, body, .some layout, _layoutIdx, .aggregate vIdx fields, mem =>
+    layout.isUninhabited = false ∧
+      sigIsParamPlaceholder layout = false ∧
+      let recPred := fun optFl fIdx v =>
+        valueMatchesLayoutOnly fuel' body optFl fIdx v mem
+      match layout.variants with
+      | .empty => False
+      | .single expectedVar =>
+        match layout.fields with
+        | .primitive => False
+        | .arbitrary offsets _ =>
+          match offsets with
+          | .nil =>
+            layout.size.bytes = 0 ∧ vIdx = expectedVar ∧ fields = .nil
+          | _ :: _ =>
+            vIdx = expectedVar ∧
+              fields.length = offsets.length ∧
+              adtFieldsLayoutOnlyWith fuel' body layout recPred 0 fields
+        | .array stride count =>
+          match count with
+          | 0 =>
+            layout.size.bytes = 0 ∧ vIdx = expectedVar ∧ fields = .nil
+          | _ + 1 =>
+            vIdx = expectedVar ∧
+              fields.length = count ∧
+              adtArrayLayoutOnlyWith body layout stride.bytes recPred fields
+        | .union count =>
+          0 < count ∧
+            match fields with
+            | .cons fVal .nil =>
+              vIdx = expectedVar ∧
+                adtFieldsLayoutOnlyWith
+                  fuel' body layout recPred 0 (.cons fVal .nil)
+            | _ => False
+      | .multiple tag _ variantShapes =>
+        vIdx < variantShapes.length ∧
+          tagMatchesScalarLayout tag vIdx ∧
+          match sigGet? variantShapes vIdx with
+          | .some (.arbitrary varOffsets _) =>
+            fields.length = varOffsets.length ∧
+              adtFieldsLayoutOnlyWith fuel' body layout recPred 0 fields
+          | .some .primitive => fields = .nil
           | _ => False
-        | .ref _ .str =>
-          match fields with
-          | .cons (.ptr p sz) (.cons (.scalar len_sv) .nil) =>
-            match lookupGlobalAlloc mem.globals p.allocId with
-            | .some alloc =>
-              len_sv.bits ≤ 9223372036854775807 ∧
-              p.offsetBytes + len_sv.bits ≤ alloc.bytes.length
-            | .none => False
+
+/--
+Recursively validate each field of a tuple or closure aggregate against its
+corresponding `RigidTy` and resolved field `TypeLayout`.
+-/
+@[reducible, simp]
+def tupleFieldsMatchWith
+    (body : CapturedMir)
+    (parentLayout : TypeLayout)
+    (parentLayoutIdx : LayoutIdx)
+    (tyPred : RigidTy → Option TypeLayout → LayoutIdx → Value → Prop) :
+    Nat → List RigidTy → List Value → Prop
+  | _, .nil, .nil => True
+  | pos, k :: restK, v :: restV =>
+    tyPred
+      k
+      (resolveChildLayout body parentLayout parentLayoutIdx (.some pos) k)
+      parentLayoutIdx
+      v ∧
+      tupleFieldsMatchWith
+        body parentLayout parentLayoutIdx tyPred (pos + 1) restK restV
+  | _, _, _ => False
+
+/--
+Recursively validate each element of an ADT with `FieldsShape.array`.
+-/
+@[reducible, simp]
+def adtArrayElemsMatchWith
+    (fuel' : Nat)
+    (body : CapturedMir)
+    (parentLayout : TypeLayout)
+    (parentLayoutIdx : LayoutIdx)
+    (strideBytes : Nat)
+    (adtArgs : List RigidTy)
+    (tyPred : RigidTy → Option TypeLayout → LayoutIdx → Value → Prop)
+    (mem : Memory) :
+    List Value → Prop
+  | .nil => True
+  | e :: rest =>
+    let elemOk : Prop :=
+      match adtArgs with
+      | elemKind :: _ =>
+        tyPred
+          elemKind
+          (resolveChildLayout
+            body parentLayout parentLayoutIdx (.some 0) elemKind)
+          parentLayoutIdx
+          e
+      | .nil =>
+        match parentLayout.fieldLayouts with
+        | fIdx :: _ =>
+          valueMatchesLayoutOnly
+            fuel' body (sigGet? body.layouts.entries fIdx) fIdx e mem
+        | .nil =>
+          match e with
+          | .scalar sv =>
+            sv.sizeBytes = strideBytes ∧
+              0 < sv.sizeBytes ∧
+              sv.bits < 2 ^ (sv.sizeBytes * 8)
           | _ => False
-        | .rawPtr _ (.slice _) => True
-        | .rawPtr _ .str => True
-        | _ => True
+    elemOk ∧
+      adtArrayElemsMatchWith
+        fuel' body parentLayout parentLayoutIdx strideBytes adtArgs tyPred
+        mem rest
 
 /--
-Recursively validates that all arguments match their expected signature types.
+Recursively validate each field of an ADT variant against `adtArgs`,
+`parentLayout.fieldLayouts`, or `parentLayout.backendRepr`.
 -/
-@[reducible]
-def argsMatchSignatureAux (fuel : Nat) (body : CapturedMir) (args : List Value) (decls : List LocalDecl) (mem : Memory) : Prop :=
-  match fuel with
-  | 0 => True
-  | fuel' + 1 =>
-    match args, decls with
-    | .nil, _ => True
-    | .cons a restA, .cons d restD =>
-      valueMatchesTyAndLayout fuel' body d.ty d.ty.layoutIdx a mem ∧ argsMatchSignatureAux fuel' body restA restD mem
-    | _, _ => False
+@[reducible, simp]
+def adtFieldsMatchWith
+    (fuel' : Nat)
+    (body : CapturedMir)
+    (parentLayout : TypeLayout)
+    (parentLayoutIdx : LayoutIdx)
+    (tyPred : RigidTy → Option TypeLayout → LayoutIdx → Value → Prop)
+    (mem : Memory) :
+    Nat → List RigidTy → List Value → Prop
+  | _, _, .nil => True
+  | pos, adtArgs, v :: restV =>
+    let (fieldOk, nextAdtArgs) : Prop × List RigidTy :=
+      match adtArgs with
+      | argKind :: restArgs =>
+        let nextArgs :=
+          match restArgs with
+          | .nil => argKind :: .nil
+          | _ => restArgs
+        let ok :=
+          tyPred
+            argKind
+            (resolveChildLayout
+              body parentLayout parentLayoutIdx (.some pos) argKind)
+            parentLayoutIdx
+            v
+        (ok, nextArgs)
+      | .nil =>
+        let ok :=
+          match sigGet? parentLayout.fieldLayouts pos with
+          | .some fIdx =>
+            valueMatchesLayoutOnly
+              fuel' body (sigGet? body.layouts.entries fIdx) fIdx v mem
+          | .none =>
+            match parentLayout.variants, parentLayout.backendRepr with
+            | .single _, .scalar sl =>
+              match pos, restV with
+              | 0, .nil => valueMatchesScalarLayout sl v
+              | _, _ => valueMatchesUntypedField fuel' v
+            | .single _, .scalarPair sl0 sl1 =>
+              match pos with
+              | 0 => valueMatchesScalarLayout sl0 v
+              | 1 => valueMatchesScalarLayout sl1 v
+              | _ => valueMatchesUntypedField fuel' v
+            | _, _ => valueMatchesUntypedField fuel' v
+        (ok, .nil)
+    fieldOk ∧
+      adtFieldsMatchWith
+        fuel' body parentLayout parentLayoutIdx tyPred mem (pos + 1)
+        nextAdtArgs restV
 
 /--
-Verifies that all `args` match the signature types and layouts.
+Structurally validate a `Value` against a concrete `RigidTy` and `TypeLayout`
+in `mem` with recursion depth bound `fuel`.
+
+Rejects uninstantiated generic parameters (`RigidTy.param` and
+`sigIsParamPlaceholder`), uninhabited types (`!` and empty enums),
+invalid `bool` / `char` / discriminant bit patterns, misaligned or out-of-bounds
+references `&T` / `&mut T`, and wide slices `&[T]` / `&mut [T]` / `&str` whose
+byte length exceeds `isize::MAX` or the backing allocation in `mem`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Producing an invalid value, even in private fields and locals. 'Producing' a
+> value happens any time a value is assigned to or read from a place, passed to
+> a function/primitive operation or returned from a function/primitive
+> operation."
 -/
-@[reducible]
-def argsMatchSignature (body : CapturedMir) (args : List Value) (mem : Memory) : Prop :=
+@[reducible, simp]
+def valueMatchesRigidTyAndLayout :
+    Nat → CapturedMir → RigidTy → Option TypeLayout → LayoutIdx → Value →
+      Memory → Prop
+  | 0, _, _, _, _, _, _ => False
+  | _ + 1, _, _, .none, _, _, _ => False
+  | _ + 1, body, kind, .some layout, layoutIdx, .unit, _ =>
+    layout.isUninhabited = false ∧
+      sigIsParamPlaceholder layout = false ∧
+      match kind with
+      | .fnDef _ _ | .tuple .nil | .closure _ .nil =>
+        layout.size.bytes = 0
+      | .array elemKind 0 =>
+        layout.size.bytes = 0 ∧
+          match resolveChildLayout body layout layoutIdx (.some 0) elemKind with
+          | .none => False
+          | .some elemLayout =>
+            elemLayout.isUninhabited = false ∧
+              sigIsParamPlaceholder elemLayout = false
+      | .adt _ _ =>
+        match layout.variants, layout.fields with
+        | .single 0, .arbitrary .nil _ => layout.size.bytes = 0
+        | .single 0, .array _ 0 => layout.size.bytes = 0
+        | _, _ => False
+      | _ => False
+  | _ + 1, _, kind, .some layout, _, .scalar sv, _ =>
+    layout.isUninhabited = false ∧
+      sigIsParamPlaceholder layout = false ∧
+      match kind with
+      | .bool =>
+        layout.size.bytes = 1 ∧
+          sv.sizeBytes = 1 ∧
+          (sv.bits = 0 ∨ sv.bits = 1) ∧
+          scalarMatchesBackendRepr layout.backendRepr sv.bits
+      | .char =>
+        layout.size.bytes = 4 ∧
+          isValidChar sv ∧
+          scalarMatchesBackendRepr layout.backendRepr sv.bits
+      | .int _ | .uint _ | .float _ =>
+        sv.sizeBytes = layout.size.bytes ∧
+          0 < sv.sizeBytes ∧
+          sv.bits < 2 ^ (sv.sizeBytes * 8) ∧
+          scalarMatchesBackendRepr layout.backendRepr sv.bits
+      | .fnPtr _ _ _ _ =>
+        sv.sizeBytes = layout.size.bytes ∧
+          0 < sv.bits ∧
+          sv.bits < 2 ^ (sv.sizeBytes * 8) ∧
+          scalarMatchesBackendRepr layout.backendRepr sv.bits
+      | .rawPtr _ pointee =>
+        match pointee with
+        | .slice _ | .str | .dynamic _ | .param _ _ | .alias _ _ => False
+        | _ =>
+          sv.sizeBytes = layout.size.bytes ∧
+            0 < sv.sizeBytes ∧
+            sv.bits < 2 ^ (sv.sizeBytes * 8)
+      | .adt _ _ =>
+        match layout.variants, layout.fields with
+        | .single _, .union count =>
+          0 < count ∧
+            sv.sizeBytes = layout.size.bytes ∧
+            0 < sv.sizeBytes ∧
+            sv.bits < 2 ^ (sv.sizeBytes * 8)
+        | _, _ => False
+      | _ => False
+  | fuel' + 1, body, kind, .some layout, layoutIdx, .ptr p ptrSz, mem =>
+    layout.isUninhabited = false ∧
+      sigIsParamPlaceholder layout = false ∧
+      match kind with
+      | .fnPtr _ _ _ _ =>
+        ptrSz = layout.size.bytes ∧ 0 < ptrSz ∧ p.offsetBytes = 0
+      | .rawPtr _ pointee =>
+        match pointee with
+        | .slice _ | .str | .dynamic _ | .param _ _ | .alias _ _ => False
+        | _ => ptrSz = layout.size.bytes ∧ 0 < ptrSz
+      | .ref refMut pointee =>
+        match pointee with
+        | .slice _ | .str | .dynamic _ | .foreign _ | .other _
+        | .param _ _ | .alias _ _ | .never => False
+        | _ =>
+          ptrSz = layout.size.bytes ∧
+            0 < ptrSz ∧
+            match resolveChildLayout body layout layoutIdx .none pointee with
+            | .none => False
+            | .some pointeeLayout =>
+              pointeeLayout.isUninhabited = false ∧
+                sigIsParamPlaceholder pointeeLayout = false ∧
+                0 < pointeeLayout.align.bytes ∧
+                p.offsetBytes % pointeeLayout.align.bytes = 0 ∧
+                match sigLookupGlobalAlloc mem.globals p.allocId with
+                | .some alloc =>
+                  p.offsetBytes + pointeeLayout.size.bytes ≤ alloc.bytes.length
+                | .none =>
+                  match sigLookupBorrow mem.borrows p.allocId with
+                  | .some entry =>
+                    borrowPermAllowsRef refMut entry.perm = true ∧
+                      match sigGet? mem.callerLocals entry.targetLocal with
+                      | .some (.init targetVal) =>
+                        valueMatchesRigidTyAndLayout
+                          fuel'
+                          body
+                          pointee
+                          (.some pointeeLayout)
+                          layoutIdx
+                          targetVal
+                          mem
+                      | _ =>
+                        0 < entry.rangeLen ∧
+                          p.offsetBytes + pointeeLayout.size.bytes ≤
+                            entry.rangeOffset + entry.rangeLen
+                  | .none => False
+      | _ => False
+  | fuel' + 1,
+    body,
+    kind,
+    .some layout,
+    layoutIdx,
+    .aggregate vIdx fields,
+    mem =>
+    layout.isUninhabited = false ∧
+      sigIsParamPlaceholder layout = false ∧
+      let recTyPred := fun childKind childOptLayout childIdx childVal =>
+        valueMatchesRigidTyAndLayout
+          fuel' body childKind childOptLayout childIdx childVal mem
+      match kind with
+      | .fnDef _ _ =>
+        layout.size.bytes = 0 ∧ vIdx = 0 ∧ fields = .nil
+      | .ref refMut pointee =>
+        vIdx = 0 ∧
+          match fields with
+          | .cons (.ptr p ptrSz) (.cons (.scalar len_sv) .nil) =>
+            match pointee with
+            | .slice elemKind =>
+              let maxBytes := maxIsizeBytes body.layouts.pointerBits
+              0 < ptrSz ∧
+                len_sv.sizeBytes = ptrSz ∧
+                ptrSz * 2 = layout.size.bytes ∧
+                match
+                  resolveChildLayout body layout layoutIdx .none elemKind
+                with
+                | .none => False
+                | .some elemLayout =>
+                  let sliceBytes := len_sv.bits * elemLayout.size.bytes
+                  elemLayout.isUninhabited = false ∧
+                    sigIsParamPlaceholder elemLayout = false ∧
+                    0 < elemLayout.align.bytes ∧
+                    p.offsetBytes % elemLayout.align.bytes = 0 ∧
+                    sliceBytes ≤ maxBytes ∧
+                    match sigLookupGlobalAlloc mem.globals p.allocId with
+                    | .some alloc =>
+                      p.offsetBytes + sliceBytes ≤ alloc.bytes.length
+                    | .none =>
+                      match sigLookupBorrow mem.borrows p.allocId with
+                      | .some entry =>
+                        borrowPermAllowsRef refMut entry.perm = true ∧
+                          match sigGet? mem.callerLocals entry.targetLocal with
+                          | .some (.init (.aggregate 0 elems)) =>
+                            len_sv.bits ≤ elems.length ∧
+                              arrayElemsMatchWith
+                                (fun e =>
+                                  recTyPred
+                                    elemKind (.some elemLayout) layoutIdx e)
+                                elems
+                          | _ =>
+                            0 < entry.rangeLen ∧
+                              p.offsetBytes + sliceBytes ≤
+                                entry.rangeOffset + entry.rangeLen
+                      | .none => False
+            | .str =>
+              0 < ptrSz ∧
+                len_sv.sizeBytes = ptrSz ∧
+                ptrSz * 2 = layout.size.bytes ∧
+                len_sv.bits ≤ maxIsizeBytes body.layouts.pointerBits ∧
+                match sigLookupGlobalAlloc mem.globals p.allocId with
+                | .some alloc =>
+                  p.offsetBytes + len_sv.bits ≤ alloc.bytes.length
+                | .none =>
+                  match sigLookupBorrow mem.borrows p.allocId with
+                  | .some entry =>
+                    borrowPermAllowsRef refMut entry.perm = true ∧
+                      0 < entry.rangeLen ∧
+                      p.offsetBytes + len_sv.bits ≤
+                        entry.rangeOffset + entry.rangeLen
+                  | .none => False
+            | _ => False
+          | _ => False
+      | .rawPtr _ pointee =>
+        vIdx = 0 ∧
+          match pointee, fields with
+          | .slice _, .cons ptrVal (.cons (.scalar meta_sv) .nil)
+          | .str, .cons ptrVal (.cons (.scalar meta_sv) .nil)
+          | .dynamic _, .cons ptrVal (.cons (.scalar meta_sv) .nil) =>
+            0 < meta_sv.sizeBytes ∧
+              meta_sv.sizeBytes * 2 = layout.size.bytes ∧
+              meta_sv.bits < 2 ^ (meta_sv.sizeBytes * 8) ∧
+              match ptrVal with
+              | .ptr _ ptrSz => ptrSz = meta_sv.sizeBytes
+              | .scalar addr_sv =>
+                addr_sv.sizeBytes = meta_sv.sizeBytes ∧
+                  addr_sv.bits < 2 ^ (addr_sv.sizeBytes * 8)
+              | _ => False
+          | _, _ => False
+      | .array elemKind len =>
+        vIdx = 0 ∧
+          match
+            resolveChildLayout body layout layoutIdx (.some 0) elemKind
+          with
+          | .none => False
+          | .some elemLayout =>
+            elemLayout.isUninhabited = false ∧
+              sigIsParamPlaceholder elemLayout = false ∧
+              match len with
+              | 0 => layout.size.bytes = 0 ∧ fields = .nil
+              | _ + 1 =>
+                fields.length = len ∧
+                  arrayElemsMatchWith
+                    (fun e =>
+                      recTyPred elemKind (.some elemLayout) layoutIdx e)
+                    fields
+      | .tuple fieldKinds =>
+        vIdx = 0 ∧
+          match fieldKinds with
+          | .nil => layout.size.bytes = 0 ∧ fields = .nil
+          | _ :: _ =>
+            fields.length = fieldKinds.length ∧
+              tupleFieldsMatchWith
+                body layout layoutIdx recTyPred 0 fieldKinds fields
+      | .closure _ upvarKinds =>
+        vIdx = 0 ∧
+          match upvarKinds with
+          | .nil => layout.size.bytes = 0 ∧ fields = .nil
+          | _ :: _ =>
+            fields.length = upvarKinds.length ∧
+              tupleFieldsMatchWith
+                body layout layoutIdx recTyPred 0 upvarKinds fields
+      | .adt _ adtArgs =>
+        match layout.variants with
+        | .empty => False
+        | .single expectedVar =>
+          match layout.fields with
+          | .primitive => False
+          | .arbitrary offsets _ =>
+            match offsets with
+            | .nil =>
+              layout.size.bytes = 0 ∧ vIdx = expectedVar ∧ fields = .nil
+            | _ :: _ =>
+              vIdx = expectedVar ∧
+                fields.length = offsets.length ∧
+                adtFieldsMatchWith
+                  fuel' body layout layoutIdx recTyPred mem 0 adtArgs fields
+          | .array stride count =>
+            match count with
+            | 0 =>
+              layout.size.bytes = 0 ∧ vIdx = expectedVar ∧ fields = .nil
+            | _ + 1 =>
+              vIdx = expectedVar ∧
+                fields.length = count ∧
+                adtArrayElemsMatchWith
+                  fuel' body layout layoutIdx stride.bytes adtArgs recTyPred
+                  mem fields
+          | .union count =>
+            0 < count ∧
+              match fields with
+              | .cons fVal .nil =>
+                vIdx = expectedVar ∧
+                  adtFieldsMatchWith
+                    fuel' body layout layoutIdx recTyPred mem 0 adtArgs
+                    (.cons fVal .nil)
+              | _ => False
+        | .multiple tag _ variantShapes =>
+          vIdx < variantShapes.length ∧
+            tagMatchesScalarLayout tag vIdx ∧
+            match sigGet? variantShapes vIdx with
+            | .some (.arbitrary varOffsets _) =>
+              fields.length = varOffsets.length ∧
+                adtFieldsMatchWith
+                  fuel'
+                  body
+                  layout
+                  layoutIdx
+                  recTyPred
+                  mem
+                  0
+                  (selectVariantTypeArgs vIdx variantShapes adtArgs)
+                  fields
+            | .some .primitive => fields = .nil
+            | _ => False
+      | _ => False
+
+/--
+Structurally validate `val` against `ty : Ty` and its `layoutIdx` entry in
+`body.layouts` and `mem`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "It is undefined behavior to produce an invalid value of any type."
+-/
+@[reducible, simp]
+def valueMatchesTyAndLayout
+    (fuel : Nat)
+    (body : CapturedMir)
+    (ty : Ty)
+    (layoutIdx : LayoutIdx)
+    (val : Value)
+    (mem : Memory) : Prop :=
+  valueMatchesRigidTyAndLayout
+    fuel body ty.kind (sigGet? body.layouts.entries layoutIdx) layoutIdx val mem
+
+/--
+Default structural recursion depth for `argsMatchSignature` and
+`retMatchesSignature`.
+-/
+@[reducible, simp]
+def defaultSignatureFuel : Nat := 8
+
+/--
+Recursively validate that each argument in `args` matches its corresponding
+parameter `LocalDecl` in `decls` (`_1..=argCount`).
+-/
+@[reducible, simp]
+def argsMatchSignatureAux
+    (fuel : Nat)
+    (body : CapturedMir)
+    (args : List Value)
+    (decls : List LocalDecl)
+    (mem : Memory) : Prop :=
+  match args, decls with
+  | .nil, _ => True
+  | .cons a restA, .cons d restD =>
+    valueMatchesTyAndLayout fuel body d.ty d.ty.layoutIdx a mem ∧
+      argsMatchSignatureAux fuel body restA restD mem
+  | .cons _ _, .nil => False
+
+/--
+Verify that `args` has length `body.argCount` and that each argument `args[i]`
+structurally matches parameter local `_{i+1}` (`body.localDecls[i+1]`) and its
+`TypeLayout` in `mem`.
+
+Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/mod.rs#L223-L234>
+
+> "The first local is the return value pointer, followed by `arg_count`
+> locals for the function arguments, followed by any user-declared
+> variables and temporaries."
+-/
+@[reducible, simp]
+def argsMatchSignature
+    (body : CapturedMir) (args : List Value) (mem : Memory) : Prop :=
   args.length = body.argCount ∧
-  match body.localDecls with
-  | .nil => False
-  | .cons _ argDecls => argsMatchSignatureAux 100 body args argDecls mem
+    match body.localDecls with
+    | .nil => False
+    | .cons _ argDecls =>
+      argsMatchSignatureAux defaultSignatureFuel body args argDecls mem
 
 /--
-Verifies that `ret` matches the return signature type and layout.
+Verify that return value `ret` structurally matches return local `_0`
+`body.localDecls[0]` and its `TypeLayout` in `mem`.
+
+Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/mod.rs#L223-L227>
+
+> "The first local is the return value pointer, followed by `arg_count`
+> locals for the function arguments"
 -/
-@[reducible]
-def retMatchesSignature (body : CapturedMir) (ret : Value) (mem : Memory) : Prop :=
+@[reducible, simp]
+def retMatchesSignature
+    (body : CapturedMir) (ret : Value) (mem : Memory) : Prop :=
   match body.localDecls with
   | .nil => False
   | .cons retDecl _ =>
-    valueMatchesTyAndLayout 100 body retDecl.ty retDecl.ty.layoutIdx ret mem
+    valueMatchesTyAndLayout
+      defaultSignatureFuel body retDecl.ty retDecl.ty.layoutIdx ret mem
 
-@[simp] theorem argsMatchSignatureAux_nil (fuel : Nat) (body : CapturedMir) (decls : List LocalDecl) (mem : Memory) : argsMatchSignatureAux (fuel + 1) body .nil decls mem = True := by
-  cases decls <;> simp [argsMatchSignatureAux]
+/--
+When `body.typeParamCount = 0`, any `typeArgs : TypeSubst` with
+`typeArgs.length = body.typeParamCount` is equal to `.nil`.
+-/
+theorem typeSubst_eq_nil_of_length_eq_zero :
+    ∀ (typeArgs : TypeSubst),
+      typeArgs.length = 0 → typeArgs = .nil
+  | .nil, _ => rfl
+  | _ :: _, h => by cases h
 
-@[simp] theorem argsMatchSignatureAux_cons (fuel : Nat) (body : CapturedMir) (a : Value) (restA : List Value) (d : LocalDecl) (restD : List LocalDecl) (mem : Memory) : argsMatchSignatureAux (fuel + 1) body (.cons a restA) (.cons d restD) mem = (valueMatchesTyAndLayout fuel body d.ty d.ty.layoutIdx a mem ∧ argsMatchSignatureAux fuel body restA restD mem) := by
-  simp [argsMatchSignatureAux]
+/--
+For a monomorphic `body` (`body.typeParamCount = 0`), instantiating `body` with
+any `typeArgs` of length `body.typeParamCount` leaves `body` unchanged.
+-/
+@[simp]
+theorem instantiate_eq_self_of_typeParamCount_zero
+    (body : CapturedMir)
+    (typeArgs : TypeSubst)
+    (hZero : body.typeParamCount = 0)
+    (hLen : typeArgs.length = body.typeParamCount) :
+    body.instantiate typeArgs = body := by
+  have hNil : typeArgs = .nil :=
+    typeSubst_eq_nil_of_length_eq_zero typeArgs (Eq.trans hLen hZero)
+  subst hNil
+  exact CapturedMir.instantiate_nil body
 
 /-- Fundamental coinductive interaction tree of `body` from `(args, mem)`. -/
 def mirStatefulTree

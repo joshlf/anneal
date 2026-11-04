@@ -3537,5 +3537,474 @@ theorem refuteMirPointByStrictUB
   ⟨refuteStatefulClaimByStrictUB _ fuel args mem ⟨rfl, rfl⟩ h_ub,
    refuteTotalClaimByStrictUB _ fuel args mem ⟨rfl, rfl⟩ h_ub⟩
 
+/-!
+## Signature & Polymorphic Obligation Adapter Lemmas and Kernel Checks
+-/
+
+/--
+For a 1-argument `CapturedMir` body with `localDecls = retDecl :: d1 :: rest`,
+`argsMatchSignature body [a] mem` reduces to `body.argCount = 1` and
+`valueMatchesTyAndLayout defaultSignatureFuel body d1.ty d1.ty.layoutIdx a mem`.
+-/
+@[simp]
+theorem argsMatchSignature_singleton
+    (body : CapturedMir)
+    (retDecl d1 : LocalDecl)
+    (rest : List LocalDecl)
+    (a : Value)
+    (mem : Memory)
+    (hDecls : body.localDecls = retDecl :: d1 :: rest)
+    (hArgCount : body.argCount = 1) :
+    Trusted.VerificationResult.argsMatchSignature body [a] mem ↔
+      Trusted.VerificationResult.valueMatchesTyAndLayout
+        Trusted.VerificationResult.defaultSignatureFuel
+        body d1.ty d1.ty.layoutIdx a mem := by
+  simp [Trusted.VerificationResult.argsMatchSignature, hDecls, hArgCount]
+
+section SignatureValidationTests
+
+open Trusted.VerificationResult
+
+@[reducible]
+private def testLayoutU32 : TypeLayout :=
+  { size := ⟨4⟩
+    align := ⟨4⟩
+    backendRepr :=
+      .scalar (.initialized (.int 32 false) ⟨0, 4294967295⟩)
+    fields := .primitive
+    variants := .single 0
+    isUninhabited := false }
+
+@[reducible]
+private def testLayoutBool : TypeLayout :=
+  { size := ⟨1⟩
+    align := ⟨1⟩
+    backendRepr :=
+      .scalar (.initialized (.int 8 false) ⟨0, 1⟩)
+    fields := .primitive
+    variants := .single 0
+    isUninhabited := false }
+
+@[reducible]
+private def testLayoutChar : TypeLayout :=
+  { size := ⟨4⟩
+    align := ⟨4⟩
+    backendRepr :=
+      .scalar (.initialized (.int 32 false) ⟨0, 1114111⟩)
+    fields := .primitive
+    variants := .single 0
+    isUninhabited := false }
+
+@[reducible]
+private def testLayoutRefU32 : TypeLayout :=
+  { size := ⟨8⟩
+    align := ⟨8⟩
+    backendRepr :=
+      .scalar (.initialized (.pointer 0) ⟨1, 18446744073709551615⟩)
+    fields := .primitive
+    variants := .single 0
+    isUninhabited := false
+    fieldLayouts := [0] }
+
+@[reducible]
+private def testLayoutSliceU32 : TypeLayout :=
+  { size := ⟨16⟩
+    align := ⟨8⟩
+    backendRepr :=
+      .scalarPair
+        (.initialized (.pointer 0) ⟨1, 18446744073709551615⟩)
+        (.initialized (.int 64 false) ⟨0, 18446744073709551615⟩)
+    fields := .arbitrary [⟨0⟩, ⟨8⟩] [0, 1]
+    variants := .single 0
+    isUninhabited := false
+    fieldLayouts := [0] }
+
+@[reducible]
+private def testLayoutArrayU32x2 : TypeLayout :=
+  { size := ⟨8⟩
+    align := ⟨4⟩
+    backendRepr := .memory
+    fields := .array ⟨4⟩ 2
+    variants := .single 0
+    isUninhabited := false
+    fieldLayouts := [0] }
+
+@[reducible]
+private def testLayoutTupleU32Bool : TypeLayout :=
+  { size := ⟨8⟩
+    align := ⟨4⟩
+    backendRepr :=
+      .scalarPair
+        (.initialized (.int 32 false) ⟨0, 4294967295⟩)
+        (.initialized (.int 8 false) ⟨0, 1⟩)
+    fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1]
+    variants := .single 0
+    isUninhabited := false
+    fieldLayouts := [0, 1] }
+
+@[reducible]
+private def testLayoutOptionU32 : TypeLayout :=
+  { size := ⟨8⟩
+    align := ⟨4⟩
+    backendRepr :=
+      .scalarPair
+        (.initialized (.int 32 false) ⟨0, 1⟩)
+        (.initialized (.int 32 false) ⟨0, 4294967295⟩)
+    fields := .arbitrary [⟨0⟩] [0]
+    variants :=
+      .multiple
+        (.initialized (.int 32 false) ⟨0, 1⟩)
+        0
+        [.arbitrary [] [], .arbitrary [⟨4⟩] [0]]
+    isUninhabited := false }
+
+@[reducible]
+private def testLayoutResultU32Bool : TypeLayout :=
+  { size := ⟨8⟩
+    align := ⟨4⟩
+    backendRepr :=
+      .scalarPair
+        (.initialized (.int 32 false) ⟨0, 1⟩)
+        (.initialized (.int 32 false) ⟨0, 4294967295⟩)
+    fields := .arbitrary [⟨0⟩] [0]
+    variants :=
+      .multiple
+        (.initialized (.int 32 false) ⟨0, 1⟩)
+        0
+        [.arbitrary [⟨4⟩] [0], .arbitrary [⟨4⟩] [0]]
+    isUninhabited := false }
+
+@[reducible]
+private def testLayoutFnPtr : TypeLayout :=
+  { size := ⟨8⟩
+    align := ⟨8⟩
+    backendRepr :=
+      .scalar (.initialized (.pointer 0) ⟨1, 18446744073709551615⟩)
+    fields := .primitive
+    variants := .single 0
+    isUninhabited := false }
+
+@[reducible]
+private def testLayoutPlaceholder : TypeLayout :=
+  { size := ⟨0⟩
+    align := ⟨0⟩
+    backendRepr := .memory
+    fields := .primitive
+    variants := .empty
+    isUninhabited := false }
+
+@[reducible]
+private def testLayoutTable : LayoutTable :=
+  { pointerBits := 64
+    isLittleEndian := true
+    entries :=
+      [ testLayoutU32
+      , testLayoutBool
+      , testLayoutChar
+      , testLayoutRefU32
+      , testLayoutSliceU32
+      , testLayoutArrayU32x2
+      , testLayoutTupleU32Bool
+      , testLayoutOptionU32
+      , testLayoutResultU32Bool
+      , testLayoutFnPtr
+      , testLayoutPlaceholder
+      ] }
+
+@[reducible]
+private def mkTestBody (argTy retTy : Ty) (tParams : Nat := 0) : CapturedMir :=
+  { defPath := "test::item"
+    phase := .runtimeOptimized
+    role := .subject
+    argCount := 1
+    localDecls :=
+      [ { mutability := .mut, ty := retTy, debugName := .none }
+      , { mutability := .not, ty := argTy, debugName := .none }
+      ]
+    basicBlocks := []
+    fnAbi :=
+      { args := []
+        ret := { layout := testLayoutU32, mode := .direct }
+        conv := .rust
+        canUnwind := true }
+    layouts := testLayoutTable
+    allocations := []
+    typeParamCount := tParams }
+
+@[reducible]
+private def testLiveMem8 : Memory :=
+  { emptyMemory with
+    globals :=
+      [ { allocId := 1
+          bytes :=
+            [ .some 1, .some 0, .some 0, .some 0
+            , .some 2, .some 0, .some 0, .some 0 ]
+          relocations := []
+          align := ⟨4⟩
+          mutability := .mut } ]
+    borrows :=
+      [ { tag := 2
+          targetLocal := 0
+          targetProjection := []
+          perm := .active } ]
+    callerLocals :=
+      [ .init (.scalar ⟨77, 4⟩) ] }
+
+/-- Valid `bool`, `char`, and `u32` scalars satisfy `argsMatchSignature`, while
+invalid `bool` (`2`), surrogate `char` (`0xD800`), and oversized `u32` bit
+patterns are rejected. -/
+theorem sig_scalars_validated :
+    argsMatchSignature
+      (mkTestBody ⟨.bool, 1⟩ ⟨.bool, 1⟩) [.scalar ⟨1, 1⟩] emptyMemory ∧
+    ¬ argsMatchSignature
+      (mkTestBody ⟨.bool, 1⟩ ⟨.bool, 1⟩) [.scalar ⟨2, 1⟩] emptyMemory ∧
+    argsMatchSignature
+      (mkTestBody ⟨.char, 2⟩ ⟨.char, 2⟩) [.scalar ⟨0x41, 4⟩] emptyMemory ∧
+    ¬ argsMatchSignature
+      (mkTestBody ⟨.char, 2⟩ ⟨.char, 2⟩) [.scalar ⟨0xD800, 4⟩] emptyMemory ∧
+    argsMatchSignature
+      (mkTestBody ⟨.uint .u32, 0⟩ ⟨.uint .u32, 0⟩)
+      [.scalar ⟨42, 4⟩] emptyMemory ∧
+    ¬ argsMatchSignature
+      (mkTestBody ⟨.uint .u32, 0⟩ ⟨.uint .u32, 0⟩)
+      [.scalar ⟨42, 1⟩] emptyMemory := by
+  dsimp [emptyMemory]; decide
+
+/-- Thin references `&u32` and `&mut u32` require a live, aligned allocation in
+`mem.globals` or `mem.borrows`; unallocated or misaligned pointers are rejected. -/
+theorem sig_thin_ref_validated :
+    argsMatchSignature
+      (mkTestBody ⟨.ref .not (.uint .u32), 3⟩ ⟨.uint .u32, 0⟩)
+      [.ptr ⟨1, 0⟩ 8]
+      testLiveMem8 ∧
+    argsMatchSignature
+      (mkTestBody ⟨.ref .mut (.uint .u32), 3⟩ ⟨.uint .u32, 0⟩)
+      [.ptr ⟨2, 0⟩ 8]
+      testLiveMem8 ∧
+    ¬ argsMatchSignature
+      (mkTestBody ⟨.ref .not (.uint .u32), 3⟩ ⟨.uint .u32, 0⟩)
+      [.ptr ⟨1, 2⟩ 8]
+      testLiveMem8 ∧
+    ¬ argsMatchSignature
+      (mkTestBody ⟨.ref .not (.uint .u32), 3⟩ ⟨.uint .u32, 0⟩)
+      [.ptr ⟨77, 0⟩ 8]
+      testLiveMem8 := by
+  dsimp [emptyMemory]; decide
+
+/-- Wide slices `&[u32]` require a 2-field aggregate `(dataPtr, len)` backed by
+a live allocation of at least `len * 4` bytes with `len * 4 <= maxIsizeBytes`. -/
+theorem sig_wide_slice_validated :
+    argsMatchSignature
+      (mkTestBody ⟨.ref .not (.slice (.uint .u32)), 4⟩ ⟨.uint .u32, 0⟩)
+      [.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]]
+      testLiveMem8 ∧
+    ¬ argsMatchSignature
+      (mkTestBody ⟨.ref .not (.slice (.uint .u32)), 4⟩ ⟨.uint .u32, 0⟩)
+      [.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨3, 8⟩]]
+      testLiveMem8 ∧
+    ¬ argsMatchSignature
+      (mkTestBody ⟨.ref .not (.slice (.uint .u32)), 4⟩ ⟨.uint .u32, 0⟩)
+      [.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨0x4000000000000000, 8⟩]]
+      testLiveMem8 := by
+  dsimp [emptyMemory]; decide
+
+/-- Fixed-size arrays `[u32; 2]`, tuples `(u32, bool)`, `Option<u32>`,
+`Result<u32, bool>`, raw pointers `*const u32`, and `FnPtr` are structurally
+constrained by `argsMatchSignature` and `retMatchesSignature`. -/
+theorem sig_composites_and_adts_validated :
+    argsMatchSignature
+      (mkTestBody ⟨.array (.uint .u32) 2, 5⟩ ⟨.uint .u32, 0⟩)
+      [.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩]]
+      emptyMemory ∧
+    ¬ argsMatchSignature
+      (mkTestBody ⟨.array (.uint .u32) 2, 5⟩ ⟨.uint .u32, 0⟩)
+      [.aggregate 0 [.scalar ⟨10, 4⟩]]
+      emptyMemory ∧
+    argsMatchSignature
+      (mkTestBody ⟨.tuple [.uint .u32, .bool], 6⟩ ⟨.uint .u32, 0⟩)
+      [.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨1, 1⟩]]
+      emptyMemory ∧
+    ¬ argsMatchSignature
+      (mkTestBody ⟨.tuple [.uint .u32, .bool], 6⟩ ⟨.uint .u32, 0⟩)
+      [.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨2, 1⟩]]
+      emptyMemory ∧
+    argsMatchSignature
+      (mkTestBody ⟨.adt "core::option::Option" [.uint .u32], 7⟩ ⟨.uint .u32, 0⟩)
+      [.aggregate 0 []]
+      emptyMemory ∧
+    argsMatchSignature
+      (mkTestBody ⟨.adt "core::option::Option" [.uint .u32], 7⟩ ⟨.uint .u32, 0⟩)
+      [.aggregate 1 [.scalar ⟨99, 4⟩]]
+      emptyMemory ∧
+    ¬ argsMatchSignature
+      (mkTestBody ⟨.adt "core::option::Option" [.uint .u32], 7⟩ ⟨.uint .u32, 0⟩)
+      [.aggregate 2 []]
+      emptyMemory ∧
+    retMatchesSignature
+      (mkTestBody
+        ⟨.uint .u32, 0⟩
+        ⟨.adt "core::result::Result" [.uint .u32, .bool], 8⟩)
+      (.aggregate 0 [.scalar ⟨7, 4⟩])
+      emptyMemory ∧
+    retMatchesSignature
+      (mkTestBody
+        ⟨.uint .u32, 0⟩
+        ⟨.adt "core::result::Result" [.uint .u32, .bool], 8⟩)
+      (.aggregate 1 [.scalar ⟨1, 1⟩])
+      emptyMemory ∧
+    ¬ retMatchesSignature
+      (mkTestBody
+        ⟨.uint .u32, 0⟩
+        ⟨.adt "core::result::Result" [.uint .u32, .bool], 8⟩)
+      (.aggregate 1 [.scalar ⟨2, 1⟩])
+      emptyMemory ∧
+    argsMatchSignature
+      (mkTestBody ⟨.rawPtr .not (.uint .u32), 3⟩ ⟨.uint .u32, 0⟩)
+      [.ptr ⟨1, 0⟩ 8]
+      emptyMemory ∧
+    argsMatchSignature
+      (mkTestBody
+        ⟨.fnPtr [.uint .u32] (.uint .u32) .safe .rust, 9⟩
+        ⟨.uint .u32, 0⟩)
+      [.ptr ⟨99, 0⟩ 8]
+      testLiveMem8 ∧
+    ¬ argsMatchSignature
+      (mkTestBody
+        ⟨.fnPtr [.uint .u32] (.uint .u32) .safe .rust, 9⟩
+        ⟨.uint .u32, 0⟩)
+      [.ptr ⟨99, 4⟩ 8]
+      testLiveMem8 := by
+  set_option linter.unusedSimpArgs false in
+  simp [
+    emptyMemory,
+    TypeLayout.isParamPlaceholder,
+    wrappingRangeContains,
+    primitiveKindByteWidth,
+    scalarLayoutByteWidth,
+    alignUp,
+    maxNat
+  ]
+
+/-- Uninstantiated `RigidTy.param` is rejected (`False`), while instantiating
+`polyBody` via `CapturedMir.instantiate` computes the concrete `TypeLayout` and
+validates arguments and return values against the substituted type. -/
+theorem sig_polymorphic_instantiate_validated :
+    let polyBody := mkTestBody ⟨.param 0 "T", 10⟩ ⟨.param 0 "T", 10⟩ 1
+    let subst : TypeSubst := [(.uint .u32, testLayoutU32)]
+    ¬ argsMatchSignature polyBody [.scalar ⟨42, 4⟩] emptyMemory ∧
+    argsMatchSignature
+      (polyBody.instantiate subst)
+      [.scalar ⟨42, 4⟩]
+      emptyMemory ∧
+    retMatchesSignature
+      (polyBody.instantiate subst)
+      (.scalar ⟨42, 4⟩)
+      emptyMemory ∧
+    ¬ argsMatchSignature
+      (polyBody.instantiate subst)
+      [.scalar ⟨1, 1⟩]
+      emptyMemory := by
+  set_option linter.unusedSimpArgs false in
+  simp [
+    emptyMemory,
+    TypeLayout.isParamPlaceholder,
+    wrappingRangeContains,
+    primitiveKindByteWidth,
+    scalarLayoutByteWidth,
+    alignUp,
+    maxNat,
+    Trusted.Sequence.get?,
+    Trusted.Sequence.length,
+    UintTy.byteWidth,
+    UintTy.bitWidth,
+    IntTy.byteWidth,
+    IntTy.bitWidth,
+    FloatTy.byteWidth,
+    appendTypeLayouts,
+    setTypeLayoutAt,
+    lookupFieldLayouts,
+    computeArbitraryFieldsAux,
+    computeUnionSizeAndAlign,
+    computeAggregateBackendRepr,
+    tagScalarByteWidth,
+    recomputeVariantShapesAux,
+    TypeLayout.recomputeFromFieldLayouts,
+    Trusted.Rustc.V2026_06_01.Layout.substitutePlaceholderEntries,
+    Trusted.Rustc.V2026_06_01.Layout.recomputeEntriesWith,
+    LayoutTable.appendParamLayouts,
+    LayoutTable.lookup,
+    TypeSubst.lookup,
+    TypeSubst.layouts,
+    TypeSubst.length,
+    RigidTy.instantiate,
+    RigidTy.instantiateList,
+    RigidTy.hasSubstParam,
+    RigidTy.hasSubstParamList,
+    RigidTy.isCompoundSubstParam,
+    RigidTy.isTrivialZst,
+    RigidTy.computeLayout,
+    RigidTy.computeLayoutList,
+    Trusted.Rustc.V2026_06_01.Layout.LayoutTable.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.LayoutTable.instantiate,
+    Ty.instantiate,
+    ConstOperand.instantiate,
+    TraitRef.instantiate,
+    TraitImplEntry.instantiate,
+    TraitImplEntry.instantiateList,
+    Trusted.Rustc.V2026_06_01.MirAst.ProjectionElem.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.ProjectionElem.instantiateList,
+    Trusted.Rustc.V2026_06_01.MirAst.Place.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.Operand.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.Operand.instantiateList,
+    Trusted.Rustc.V2026_06_01.MirAst.AggregateKind.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.Rvalue.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.NonDivergingIntrinsic.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.StatementKind.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.Statement.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.Statement.instantiateList,
+    Trusted.Rustc.V2026_06_01.MirAst.TerminatorKind.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.Terminator.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData.instantiateList,
+    Trusted.Rustc.V2026_06_01.MirAst.LocalDecl.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.LocalDecl.instantiateList,
+    Trusted.Rustc.V2026_06_01.MirAst.appendTys,
+    Trusted.Rustc.V2026_06_01.MirAst.ProjectionElem.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.ProjectionElem.collectTysList,
+    Trusted.Rustc.V2026_06_01.MirAst.Place.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.Operand.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.Operand.collectTysList,
+    Trusted.Rustc.V2026_06_01.MirAst.AggregateKind.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.Rvalue.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.NonDivergingIntrinsic.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.StatementKind.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.Statement.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.Statement.collectTysList,
+    Trusted.Rustc.V2026_06_01.MirAst.TerminatorKind.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.Terminator.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData.collectTysList,
+    Trusted.Rustc.V2026_06_01.MirAst.LocalDecl.collectTysList,
+    Trusted.Rustc.V2026_06_01.MirAst.collectBodyTys,
+    Trusted.Rustc.V2026_06_01.MirAst.hasNonParamTyAtIdx,
+    Trusted.Rustc.V2026_06_01.MirAst.hasCompoundParamTyAtIdx,
+    Trusted.Rustc.V2026_06_01.MirAst.substituteTyParamLayoutsAux,
+    Trusted.Rustc.V2026_06_01.MirAst.recomputeTyCompoundLayoutsAux,
+    Trusted.Rustc.V2026_06_01.MirAst.hasNonParamDeclAtIdx,
+    Trusted.Rustc.V2026_06_01.MirAst.hasCompoundParamDeclAtIdx,
+    Trusted.Rustc.V2026_06_01.MirAst.substituteDeclParamLayoutsAux,
+    Trusted.Rustc.V2026_06_01.MirAst.recomputeDeclCompoundLayoutsAux,
+    LayoutTable.instantiateForBody,
+    LayoutTable.instantiateForDecls,
+    Trusted.Rustc.V2026_06_01.MirAst.ArgAbi.recomputeMode,
+    Trusted.Rustc.V2026_06_01.MirAst.ArgAbi.instantiateForDecl,
+    Trusted.Rustc.V2026_06_01.MirAst.ArgAbi.instantiateListForDecls,
+    Trusted.Rustc.V2026_06_01.MirAst.FnAbi.instantiate,
+    dropGenericParams,
+    CapturedMir.instantiate
+  ]
+
+end SignatureValidationTests
+
 end Anneal.Rustc.V2026_06_01.SymbolicEval
 
