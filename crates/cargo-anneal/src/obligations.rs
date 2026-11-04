@@ -48,6 +48,10 @@ pub struct AuthoredItemModules {
     /// Whether the authored specification or proof targets the scoped
     /// UB-exception surface (`UbExceptionItemSpec` / `UbExceptionVerificationResult`).
     pub is_ub_exception: bool,
+    /// Whether the authored proof or specification targets the universally
+    /// quantified polymorphic surface (`polyClaim`, `polyStatefulClaim`,
+    /// `polyTotalClaim`, `polyModularClaim`, or `polyUbExceptionClaim`).
+    pub is_polymorphic: bool,
 }
 
 /// Reference to a sibling verified callee invoked by a subject's MIR body.
@@ -457,6 +461,39 @@ pub fn render_obligations_module_with_options(
         "True".to_string()
     };
 
+    let default_pre_for_expr = if has_contract_companions {
+        let mut clauses = Vec::with_capacity(bundle.inline_requires.len() + 1);
+        clauses.push(format!(
+            "Trusted.Sequence.length args = (Mir.{item}.body.instantiate typeArgs).argCount"
+        ));
+        for req in &bundle.inline_requires {
+            let req_suffix = derive_item_module_suffix(req);
+            clauses.push(format!(
+                "MirBoolPredicateHolds (Mir.{req_suffix}.body.instantiate typeArgs) args"
+            ));
+        }
+        conjoin_prop_clauses(&clauses)
+    } else {
+        "True".to_string()
+    };
+
+    let default_post_for_expr = if !bundle.inline_ensures.is_empty() {
+        let clauses: Vec<String> = bundle
+            .inline_ensures
+            .iter()
+            .map(|ens| {
+                let ens_suffix = derive_item_module_suffix(ens);
+                format!(
+                    "MirBoolPredicateHolds (Mir.{ens_suffix}.body.instantiate typeArgs) \
+                     (List.append args (List.cons ret List.nil))"
+                )
+            })
+            .collect();
+        conjoin_prop_clauses(&clauses)
+    } else {
+        "True".to_string()
+    };
+
     out.push_str(&format!(
         "/-- Default precondition lowered automatically from Rust `#[spec]` /\n    \
             `#[external_spec]` `requires` companions for `{def_id}` (or `True`\n    \
@@ -472,6 +509,24 @@ pub fn render_obligations_module_with_options(
     ));
     out.push_str("def defaultPost (args : List Value) (ret : Value) : Prop :=\n");
     out.push_str(&format!("  {default_post_expr}\n\n"));
+
+    out.push_str(&format!(
+        "/-- Polymorphic default precondition for `{def_id}` instantiated at\n    \
+            `typeArgs : Trusted.MirAst.TypeSubst`. -/\n\
+         @[reducible, simp]\n\
+         def defaultPreFor\n    \
+             (typeArgs : Trusted.MirAst.TypeSubst)\n    \
+             (args : List Value) : Prop :=\n  \
+           {default_pre_for_expr}\n\n\
+         /-- Polymorphic default postcondition for `{def_id}` instantiated at\n    \
+             `typeArgs : Trusted.MirAst.TypeSubst`. -/\n\
+         @[reducible, simp]\n\
+         def defaultPostFor\n    \
+             (typeArgs : Trusted.MirAst.TypeSubst)\n    \
+             (args : List Value)\n    \
+             (ret : Value) : Prop :=\n  \
+           {default_post_for_expr}\n\n"
+    ));
 
     out.push_str(&format!(
         "/-- Trusted `requires` predicate lowered from companion `#[spec]` and\n    \
@@ -517,7 +572,7 @@ pub fn render_obligations_module_with_options(
              (typeArgs : Trusted.MirAst.TypeSubst)\n    \
              (args : List Value)\n    \
              (mem : Memory) : Prop :=\n  \
-           And (defaultPre args)\n      \
+           And (defaultPreFor typeArgs args)\n      \
                (Trusted.VerificationResult.argsMatchSignature\n        \
                  (Mir.{item}.body.instantiate typeArgs) args mem)\n\n\
          /-- Signature-typed stateful postcondition for `{def_id}` instantiated at\n    \
@@ -528,7 +583,7 @@ pub fn render_obligations_module_with_options(
              (args : List Value)\n    \
              (ret : Value)\n    \
              (mem : Memory) : Prop :=\n  \
-           And (defaultPost args ret)\n      \
+           And (defaultPostFor typeArgs args ret)\n      \
                (Trusted.VerificationResult.retMatchesSignature\n        \
                  (Mir.{item}.body.instantiate typeArgs) ret mem)\n\n\
          /-- Low-priority default `StatefulItemSpec` instance for `{def_id}`. -/\n"
@@ -769,6 +824,7 @@ pub fn render_obligations_module_with_options(
            {{ body := Mir.{item}.body, pre := spec.pre, strictSafetyPre := spec.strictSafetyPre, post := spec.post }}\n\n"
     ));
 
+    let sha = &bundle.subject.target.mir_module_sha256;
     out.push_str(&format!(
         "/-- Verification claim for `{def_id}` instantiated at `typeArgs`. -/\n\
          def claimFor\n    \
@@ -811,7 +867,7 @@ pub fn render_obligations_module_with_options(
          def totalClaimFor (typeArgs : Trusted.MirAst.TypeSubst) : TotalClaim :=\n  \
            {{ body := Mir.{item}.body.instantiate typeArgs\n    \
              pre := fun args mem =>\n      \
-               And (And (defaultPre args)\n                \
+               And (And (defaultPreFor typeArgs args)\n                \
                         (mem = (initMachineState (Mir.{item}.body.instantiate typeArgs) args).memory))\n          \
                    (Trusted.VerificationResult.argsMatchSignature\n            \
                      (Mir.{item}.body.instantiate typeArgs) args mem)\n    \
@@ -829,14 +885,8 @@ pub fn render_obligations_module_with_options(
              (typeArgs : Trusted.MirAst.TypeSubst) : ModularClaim :=\n  \
            {{ body := Mir.{item}.body.instantiate typeArgs\n    \
              envAssumed := spec.envAssumed\n    \
-             pre := fun args mem =>\n      \
-               And (spec.pre args mem)\n          \
-                   (Trusted.VerificationResult.argsMatchSignature\n            \
-                     (Mir.{item}.body.instantiate typeArgs) args mem)\n    \
-             post := fun args m0 ret m1 =>\n      \
-               And (spec.post args m0 ret m1)\n          \
-                   (Trusted.VerificationResult.retMatchesSignature\n            \
-                     (Mir.{item}.body.instantiate typeArgs) ret m1) }}\n\n\
+             pre := fun args mem => sigPre typeArgs args mem\n    \
+             post := fun args _ ret m1 => sigPost typeArgs args ret m1 }}\n\n\
          /-- Universally quantified polymorphic modular verification proposition for\n    \
              `{def_id}` over all `typeArgs : Trusted.MirAst.TypeSubst` of length\n    \
              `Mir.{item}.body.typeParamCount`. -/\n\
@@ -850,22 +900,27 @@ pub fn render_obligations_module_with_options(
              [spec : UbExceptionItemSpec \"{def_id}\"]\n    \
              (typeArgs : Trusted.MirAst.TypeSubst) : UbExceptionClaim :=\n  \
            {{ body := Mir.{item}.body.instantiate typeArgs\n    \
-             pre := fun args mem =>\n      \
-               And (spec.pre args mem)\n          \
-                   (Trusted.VerificationResult.argsMatchSignature\n            \
-                     (Mir.{item}.body.instantiate typeArgs) args mem)\n    \
+             pre := fun args mem => sigPre typeArgs args mem\n    \
              strictSafetyPre := spec.strictSafetyPre\n    \
-             post := fun args m0 ret m1 =>\n      \
-               And (spec.post args m0 ret m1)\n          \
-                   (Trusted.VerificationResult.retMatchesSignature\n            \
-                     (Mir.{item}.body.instantiate typeArgs) ret m1) }}\n\n\
+             post := fun args _ ret m1 => sigPost typeArgs args ret m1 }}\n\n\
          /-- Universally quantified polymorphic UB-exception verification proposition\n    \
              for `{def_id}` over all `typeArgs : Trusted.MirAst.TypeSubst` of length\n    \
              `Mir.{item}.body.typeParamCount`. -/\n\
          def polyUbExceptionClaim [spec : UbExceptionItemSpec \"{def_id}\"] : Prop :=\n  \
            ∀ (typeArgs : Trusted.MirAst.TypeSubst),\n    \
              typeArgs.length = Mir.{item}.body.typeParamCount →\n      \
-               UbExceptionVerificationResult (ubExceptionClaimFor typeArgs)\n\n"
+               UbExceptionVerificationResult (ubExceptionClaimFor typeArgs)\n\n\
+         /-- Audited artifact identity for `{def_id}`. -/\n\
+         def artifactIdentity : ArtifactIdentity where\n  \
+           defPath := \"{def_id}\"\n  \
+           mirDialect := \"V2026_06_01\"\n  \
+           mirModuleSha256 := \"{sha}\"\n\n\
+         /-- Package a polymorphic item proposition `P` into a single-item\n    \
+             `CrateClaim` for `Verify.{item}.verified` auditing. -/\n\
+         def polyCertificate (P : Prop) : CrateClaim where\n  \
+           crateName := \"{def_id}\"\n  \
+           mirDialect := \"V2026_06_01\"\n  \
+           items := [{{ identity := artifactIdentity, certificate := P }}]\n\n"
     ));
 
     out.push_str(&format!("end Obligations.{item}\n"));
@@ -985,7 +1040,32 @@ pub fn render_verify_module_with_options(
     ));
 
     if authored.has_proof {
-        if authored.is_ub_exception {
+        if authored.is_polymorphic {
+            let poly_prop = if authored.is_ub_exception {
+                format!("Obligations.{item}.polyUbExceptionClaim")
+            } else if authored.is_modular {
+                format!("Obligations.{item}.polyModularClaim")
+            } else if authored.is_total {
+                format!("Obligations.{item}.polyTotalClaim")
+            } else if authored.is_stateful {
+                format!("Obligations.{item}.polyStatefulClaim")
+            } else {
+                format!("Obligations.{item}.polyClaim")
+            };
+            out.push_str(&format!(
+                "/-- Kernel-checked polymorphic verification certificate for `{def_id}`. -/\n\
+                 theorem verified :\n    \
+                     CrateVerificationResult\n      \
+                       (Obligations.{item}.polyCertificate {poly_prop}) :=\n  \
+                   mkPolyVerificationResult\n    \
+                     Obligations.{item}.artifactIdentity\n    \
+                     Proof.{item}.verified\n\n\
+                 /-- Proposition verified by `Verify.{item}.verified` for whole-crate rollup. -/\n\
+                 abbrev Certificate : Prop :=\n  \
+                   CrateVerificationResult\n    \
+                     (Obligations.{item}.polyCertificate {poly_prop})\n\n"
+            ));
+        } else if authored.is_ub_exception {
             out.push_str(&format!(
                 "/-- Kernel-checked scoped UB-exception verification certificate for `{def_id}`. -/\n\
                  theorem verified : UbExceptionVerificationResult Obligations.{item}.ubExceptionClaim :=\n  \
@@ -1386,7 +1466,30 @@ pub fn render_proof_template_with_options(
          open Anneal.FunctionalTranslation\n\n"
     ));
 
-    if authored.is_ub_exception {
+    if authored.is_polymorphic {
+        let poly_prop = if authored.is_ub_exception {
+            format!("Obligations.{item}.polyUbExceptionClaim")
+        } else if authored.is_modular {
+            format!("Obligations.{item}.polyModularClaim")
+        } else if authored.is_total {
+            format!("Obligations.{item}.polyTotalClaim")
+        } else if authored.is_stateful {
+            format!("Obligations.{item}.polyStatefulClaim")
+        } else {
+            format!("Obligations.{item}.polyClaim")
+        };
+        out.push_str(&format!(
+            "/-!\n\
+             Durable polymorphic proof module for `{def_id}`.\n\n\
+             Replace `sorry` below with a kernel-checked proof discharging\n\
+             `{poly_prop}`.\n\
+             -/\n\n\
+             /-- Polymorphic verification proof discharging `{poly_prop}`. -/\n\
+             theorem verified : {poly_prop} := by\n  \
+               sorry\n\n\
+             end Proof.{item}\n"
+        ));
+    } else if authored.is_ub_exception {
         out.push_str(&format!(
             "/-!\n\
              Durable scoped UB-exception proof module for `{def_id}`.\n\n\
@@ -2018,7 +2121,7 @@ mod tests {
                  (typeArgs : Trusted.MirAst.TypeSubst)\n    \
                  (args : List Value)\n    \
                  (mem : Memory) : Prop :=\n  \
-               And (defaultPre args)\n      \
+               And (defaultPreFor typeArgs args)\n      \
                    (Trusted.VerificationResult.argsMatchSignature\n        \
                      (Mir.MyCrate.math.inc.body.instantiate typeArgs) args mem)"
         ));
@@ -2028,7 +2131,7 @@ mod tests {
                  (args : List Value)\n    \
                  (ret : Value)\n    \
                  (mem : Memory) : Prop :=\n  \
-               And (defaultPost args ret)\n      \
+               And (defaultPostFor typeArgs args ret)\n      \
                    (Trusted.VerificationResult.retMatchesSignature\n        \
                      (Mir.MyCrate.math.inc.body.instantiate typeArgs) ret mem)"
         ));
@@ -2082,6 +2185,34 @@ mod tests {
                ∀ (typeArgs : Trusted.MirAst.TypeSubst),\n    \
                  typeArgs.length = Mir.MyCrate.math.inc.body.typeParamCount →\n      \
                    UbExceptionVerificationResult (ubExceptionClaimFor typeArgs)"
+        ));
+        assert!(obligations.contains(
+            "def artifactIdentity : ArtifactIdentity where\n  \
+               defPath := \"my_crate::math::inc\"\n  \
+               mirDialect := \"V2026_06_01\""
+        ));
+        assert!(obligations.contains(
+            "def polyCertificate (P : Prop) : CrateClaim where\n  \
+               crateName := \"my_crate::math::inc\"\n  \
+               mirDialect := \"V2026_06_01\"\n  \
+               items := [{ identity := artifactIdentity, certificate := P }]"
+        ));
+
+        let verify_poly = render_verify_module_with_options(
+            bundle,
+            AuthoredItemModules {
+                has_proof: true,
+                is_polymorphic: true,
+                ..AuthoredItemModules::default()
+            },
+        );
+        assert!(verify_poly.contains(
+            "theorem verified :\n    \
+                 CrateVerificationResult\n      \
+                   (Obligations.MyCrate.math.inc.polyCertificate Obligations.MyCrate.math.inc.polyClaim) :=\n  \
+               mkPolyVerificationResult\n    \
+                 Obligations.MyCrate.math.inc.artifactIdentity\n    \
+                 Proof.MyCrate.math.inc.verified"
         ));
     }
 }

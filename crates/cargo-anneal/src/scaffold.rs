@@ -244,6 +244,13 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
     let proof_is_stateful = proof_text.as_deref().is_some_and(|text| {
         text.contains("statefulClaim") || text.contains("StatefulVerificationResult")
     });
+    let is_polymorphic = proof_text.as_deref().is_some_and(|text| {
+        text.contains("polyClaim")
+            || text.contains("polyStatefulClaim")
+            || text.contains("polyTotalClaim")
+            || text.contains("polyModularClaim")
+            || text.contains("polyUbExceptionClaim")
+    });
 
     AuthoredItemModules {
         has_specs,
@@ -260,6 +267,7 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
         is_equiv,
         is_modular,
         is_ub_exception,
+        is_polymorphic,
     }
 }
 

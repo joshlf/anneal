@@ -749,8 +749,10 @@ def valueMatchesRigidTyAndLayout :
               sigIsParamPlaceholder elemLayout = false
       | .adt _ _ =>
         match layout.variants, layout.fields with
-        | .single 0, .arbitrary .nil _ => layout.size.bytes = 0
-        | .single 0, .array _ 0 => layout.size.bytes = 0
+        | .single expectedVar, .arbitrary .nil _ =>
+          expectedVar = 0 ∧ layout.size.bytes = 0
+        | .single expectedVar, .array _ count =>
+          expectedVar = 0 ∧ count = 0 ∧ layout.size.bytes = 0
         | _, _ => False
       | _ => False
   | _ + 1, _, kind, .some layout, _, .scalar sv, _ =>
@@ -823,8 +825,12 @@ def valueMatchesRigidTyAndLayout :
                   match sigLookupBorrow mem.borrows p.allocId with
                   | .some entry =>
                     borrowPermAllowsRef refMut entry.perm = true ∧
-                      match sigGet? mem.callerLocals entry.targetLocal with
-                      | .some (.init targetVal) =>
+                      match
+                        entry.targetProjection,
+                        Nat.beq p.offsetBytes 0,
+                        sigGet? mem.callerLocals entry.targetLocal
+                      with
+                      | .nil, true, .some (.init targetVal) =>
                         valueMatchesRigidTyAndLayout
                           fuel'
                           body
@@ -833,7 +839,7 @@ def valueMatchesRigidTyAndLayout :
                           layoutIdx
                           targetVal
                           mem
-                      | _ =>
+                      | _, _, _ =>
                         0 < entry.rangeLen ∧
                           p.offsetBytes + pointeeLayout.size.bytes ≤
                             entry.rangeOffset + entry.rangeLen
@@ -883,13 +889,21 @@ def valueMatchesRigidTyAndLayout :
                       | .some entry =>
                         borrowPermAllowsRef refMut entry.perm = true ∧
                           match sigGet? mem.callerLocals entry.targetLocal with
-                          | .some (.init (.aggregate 0 elems)) =>
-                            len_sv.bits ≤ elems.length ∧
-                              arrayElemsMatchWith
-                                (fun e =>
-                                  recTyPred
-                                    elemKind (.some elemLayout) layoutIdx e)
-                                elems
+                          | .some (.init (.aggregate aggVar elems)) =>
+                            match Nat.beq aggVar 0 with
+                            | true =>
+                              len_sv.bits ≤ elems.length ∧
+                                p.offsetBytes + sliceBytes ≤
+                                  elems.length * elemLayout.size.bytes ∧
+                                arrayElemsMatchWith
+                                  (fun e =>
+                                    recTyPred
+                                      elemKind (.some elemLayout) layoutIdx e)
+                                  elems
+                            | false =>
+                              0 < entry.rangeLen ∧
+                                p.offsetBytes + sliceBytes ≤
+                                  entry.rangeOffset + entry.rangeLen
                           | _ =>
                             0 < entry.rangeLen ∧
                               p.offsetBytes + sliceBytes ≤
@@ -938,9 +952,9 @@ def valueMatchesRigidTyAndLayout :
           | .some elemLayout =>
             elemLayout.isUninhabited = false ∧
               sigIsParamPlaceholder elemLayout = false ∧
-              match len with
-              | 0 => layout.size.bytes = 0 ∧ fields = .nil
-              | _ + 1 =>
+              match Nat.beq len 0 with
+              | true => layout.size.bytes = 0 ∧ fields = .nil
+              | false =>
                 fields.length = len ∧
                   arrayElemsMatchWith
                     (fun e =>
@@ -978,10 +992,10 @@ def valueMatchesRigidTyAndLayout :
                 adtFieldsMatchWith
                   fuel' body layout layoutIdx recTyPred mem 0 adtArgs fields
           | .array stride count =>
-            match count with
-            | 0 =>
+            match Nat.beq count 0 with
+            | true =>
               layout.size.bytes = 0 ∧ vIdx = expectedVar ∧ fields = .nil
-            | _ + 1 =>
+            | false =>
               vIdx = expectedVar ∧
                 fields.length = count ∧
                 adtArrayElemsMatchWith
@@ -1657,5 +1671,19 @@ def CrateClaim.holds (c : CrateClaim) : Prop :=
 /-- Audited whole-crate verification certificate checked by `TrustedBoundary.lean`. -/
 structure CrateVerificationResult (c : CrateClaim) : Prop where
   proof : c.holds
+
+/--
+Package a universally quantified polymorphic item proof `h : P` into an
+audited `CrateVerificationResult` certificate for `Verify.<Item>.verified`.
+-/
+theorem mkPolyVerificationResult
+    (id : ArtifactIdentity)
+    {P : Prop}
+    (h : P) :
+    CrateVerificationResult
+      { crateName := id.defPath
+        mirDialect := id.mirDialect
+        items := [{ identity := id, certificate := P }] } :=
+  { proof := And.intro (by intro hc; nomatch hc) (And.intro h True.intro) }
 
 end Trusted.VerificationResult

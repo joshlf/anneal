@@ -4004,6 +4004,55 @@ theorem sig_polymorphic_instantiate_validated :
     CapturedMir.instantiate
   ]
 
+/-- Sub-borrows into composite caller locals (`targetProjection != []` or
+nonzero `offsetBytes`) and offset slice borrows (`&arr[1..3]`) check the
+sub-range bounds against `entry.rangeOffset + entry.rangeLen` and array element
+byte capacity. -/
+theorem sig_subborrow_and_slice_offset_validated :
+    let subBorrowMem : Memory :=
+      { emptyMemory with
+        borrows :=
+          [ { tag := 3
+              targetLocal := 0
+              targetProjection := [.index 1]
+              perm := .active
+              rangeOffset := 4
+              rangeLen := 4 }
+          , { tag := 4
+              targetLocal := 0
+              targetProjection := []
+              perm := .frozen
+              rangeOffset := 0
+              rangeLen := 8 } ]
+        callerLocals :=
+          [ .init (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩]) ] }
+    argsMatchSignature
+      (mkTestBody ⟨.ref .mut (.uint .u32), 3⟩ ⟨.uint .u32, 0⟩)
+      [.ptr ⟨3, 4⟩ 8]
+      subBorrowMem ∧
+    ¬ argsMatchSignature
+      (mkTestBody ⟨.ref .mut (.uint .u32), 3⟩ ⟨.uint .u32, 0⟩)
+      [.ptr ⟨3, 8⟩ 8]
+      subBorrowMem ∧
+    argsMatchSignature
+      (mkTestBody ⟨.ref .not (.slice (.uint .u32)), 4⟩ ⟨.uint .u32, 0⟩)
+      [.aggregate 0 [.ptr ⟨4, 4⟩ 8, .scalar ⟨1, 8⟩]]
+      subBorrowMem ∧
+    ¬ argsMatchSignature
+      (mkTestBody ⟨.ref .not (.slice (.uint .u32)), 4⟩ ⟨.uint .u32, 0⟩)
+      [.aggregate 0 [.ptr ⟨4, 4⟩ 8, .scalar ⟨2, 8⟩]]
+      subBorrowMem := by
+  set_option linter.unusedSimpArgs false in
+  simp [
+    emptyMemory,
+    TypeLayout.isParamPlaceholder,
+    wrappingRangeContains,
+    primitiveKindByteWidth,
+    scalarLayoutByteWidth,
+    alignUp,
+    maxNat
+  ]
+
 end SignatureValidationTests
 
 end Anneal.Rustc.V2026_06_01.SymbolicEval
