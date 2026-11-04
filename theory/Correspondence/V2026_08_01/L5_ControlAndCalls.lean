@@ -327,7 +327,8 @@ theorem mir_evalTerminator_call_transparent_and_unreachable_unchecked
                 activeCallee := .some calleeBody } }) := by
   refine ⟨?_, ?_⟩
   · intro hUnreach
-    simp [evalTerminator, evalCallTerminator, hUnreach]
+    have hStr : stringEq "core::hint::unreachable_unchecked" "core::hint::unreachable_unchecked" = true := by decide
+    simp [evalTerminator, evalCallTerminator, resolveCallTarget, hUnreach, hStr]
   · intro defPath targetBb calleeBody callerBody argVals locals' hFunc hCurr hArgs hFind
     dsimp only
     subst hCurr
@@ -381,14 +382,16 @@ theorem mir_evalTerminator_exact_div_intrinsic_corresponds
   · intro retVal hExact
     unfold emptyMemory at hExact
     unfold evalTerminator
-    simp [extractCalleeDefPath?, evalOperands, evalOperand, readProjectedValue,
-      emptyMemory, get?, findCallee?, hStr, operandIsSigned, operandTy, placeTy,
+    simp [evalCallTerminator, resolveCallTarget, isDirectExactDivTarget, extractCalleeDefPath?,
+      extractCalleeTypeArgs, findCallee?, evalOperands, evalOperand, readProjectedValue,
+      emptyMemory, get?, lookupCallee, hStr, operandIsSigned, operandTy, placeTy,
       hExact, writePlaceValue, set?]
   · intro hUb
     unfold emptyMemory at hUb
     unfold evalTerminator
-    simp [extractCalleeDefPath?, evalOperands, evalOperand, readProjectedValue,
-      emptyMemory, get?, findCallee?, hStr, operandIsSigned, operandTy, placeTy, hUb]
+    simp [evalCallTerminator, resolveCallTarget, isDirectExactDivTarget, extractCalleeDefPath?,
+      extractCalleeTypeArgs, findCallee?, evalOperands, evalOperand, readProjectedValue,
+      emptyMemory, get?, lookupCallee, hStr, operandIsSigned, operandTy, placeTy, hUb]
 
 /-- Universal correspondence of `TerminatorKind.switchInt`. -/
 theorem evalTerminator_switchInt_agrees_with_generated
@@ -899,16 +902,336 @@ theorem mir_evalTerminator_indirect_call_nonZeroOffset_or_borrow_is_ub
 
 /-! ## 4. End-to-End Theorems for Polymorphic Calls and Trait Methods -/
 
-theorem mir_evalTerminator_direct_generic_function_call (s : MachineState) :
-    True := by sorry
+/-- Concrete `u32` layout computed by `RigidTy.computeLayout` on 64-bit targets. -/
+private def polyU32Layout : TypeLayout :=
+  { size := ⟨4⟩
+    align := ⟨4⟩
+    backendRepr := .scalar (.initialized (.int 32 false) ⟨0, 4294967295⟩)
+    fields := .primitive
+    variants := .single 0
+    isUninhabited := false }
 
-theorem mir_evalTerminator_trait_method_dispatch (s : MachineState) :
-    True := by sorry
+/-- Concrete `u64` / `usize` layout computed by `RigidTy.computeLayout` on 64-bit targets. -/
+private def polyU64Layout : TypeLayout :=
+  { size := ⟨8⟩
+    align := ⟨8⟩
+    backendRepr := .scalar (.initialized (.int 64 false) ⟨0, 18446744073709551615⟩)
+    fields := .primitive
+    variants := .single 0
+    isUninhabited := false }
 
-theorem mir_evalTerminator_uninstantiated_trait_method_extCall (s : MachineState) :
-    True := by sorry
+/-- Polymorphic identity callee `fn id<T>(x: T) -> T` (`typeParamCount = 1`). -/
+private def polyIdCallee : CapturedMir :=
+  { defPath := "test::id"
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 1
+    localDecls :=
+      [ { mutability := .mut, ty := { kind := .param 0 "T", layoutIdx := 0 }, debugName := .none },
+        { mutability := .not, ty := { kind := .param 0 "T", layoutIdx := 0 }, debugName := .some "x" } ]
+    basicBlocks :=
+      [ { statements := []
+          terminator := { kind := .return_, span := "id" }
+          isCleanup := false } ]
+    fnAbi :=
+      { args := [{ layout := polyU32Layout, mode := .direct }]
+        ret := { layout := polyU32Layout, mode := .direct }
+        conv := .rust
+        canUnwind := true }
+    layouts := emptyLayoutTable
+    allocations := .nil
+    typeParamCount := 1
+    genericParams := [{ idx := 0, name := "T" }]
+    traitImpls := .nil }
 
-theorem mir_evalTerminator_indirect_polymorphic_fnptr_call (s : MachineState) :
-    True := by sorry
+/-- Monomorphic identity callee `fn mono_id(x: u32) -> u32` (`typeParamCount = 0`). -/
+private def monoIdCallee : CapturedMir :=
+  { polyIdCallee with
+    defPath := "test::mono_id"
+    localDecls :=
+      [ { mutability := .mut, ty := { kind := .uint .u32, layoutIdx := 0 }, debugName := .none },
+        { mutability := .not, ty := { kind := .uint .u32, layoutIdx := 0 }, debugName := .some "x" } ]
+    typeParamCount := 0
+    genericParams := .nil }
+
+/-- Polymorphic trait-impl body `impl<T> MyTrait for Range<T>` (`typeParamCount = 1`). -/
+private def rangeTraitImplCallee : CapturedMir :=
+  { polyIdCallee with
+    defPath := "test::<impl MyTrait<T> for Range<T>>::check" }
+
+/-- Two-parameter trait-impl body `impl<A, B> BiTrait<B> for Wrapper<A>` (`typeParamCount = 2`). -/
+private def biTraitImplCallee : CapturedMir :=
+  { polyIdCallee with
+    defPath := "test::<impl BiTrait<B> for Wrapper<A>>::combine"
+    argCount := 2
+    localDecls :=
+      [ { mutability := .mut, ty := { kind := .param 0 "A", layoutIdx := 0 }, debugName := .none },
+        { mutability := .not, ty := { kind := .param 0 "A", layoutIdx := 0 }, debugName := .some "a" },
+        { mutability := .not, ty := { kind := .param 1 "B", layoutIdx := 0 }, debugName := .some "b" } ]
+    typeParamCount := 2
+    genericParams := [{ idx := 0, name := "A" }, { idx := 1, name := "B" }] }
+
+/--
+End-to-end characterization of direct polymorphic function calls (`.call` and
+`.tailCall`) and `typeArgs` arity checking in `lookupCallee`:
+1. Universal `.call` and `.tailCall` stepping when `lookupCallee` instantiates a
+   polymorphic callee `polyCallee` with `typeArgs`;
+2. Concrete instantiation of `polyIdCallee` (`id<T>`) at `typeArgs = [.uint .u32]`
+   produces a monomorphized body (`typeParamCount = 0`) whose return and argument
+   locals have `kind = .uint .u32`; and
+3. Arity mismatches (calling `id<T>` with `[]` or `[u32, u64]`, or calling
+   monomorphic `monoIdCallee` with `[u32]`) cleanly return `lookupCallee = .none`.
+-/
+theorem mir_evalTerminator_direct_generic_function_call
+    (s : MachineState)
+    (func : Operand)
+    (defPath : DefPath)
+    (typeArgs : List RigidTy)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx)
+    (unwind : UnwindAction)
+    (span : String)
+    (callerBody instCallee : CapturedMir)
+    (hExtractDef : extractCalleeDefPath? func = .some defPath)
+    (hExtractArgs : extractCalleeTypeArgs func = typeArgs)
+    (hArgs :
+      evalOperands
+        s.frame.locals
+        argOps
+        s.memory.borrows
+        s.memory.globals
+        callerBody.layouts
+        s.memory.callerLocals = .ok argVals locals')
+    (hLookup :
+      lookupCallee s.memory.callees callerBody.layouts defPath typeArgs s.memory.traitImpls =
+        .some instCallee) :
+    (evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
+      MirStepNode.step
+        (pushCalleeFrame s callerBody locals' destination targetBb instCallee argVals) ∧
+     evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
+      MirStepNode.step (enterTailCalleeFrame s.memory instCallee argVals)) ∧
+    lookupCallee [polyIdCallee] emptyLayoutTable "test::id" [.uint .u32] .nil =
+      .some (polyIdCallee.instantiate [(.uint .u32, polyU32Layout)]) ∧
+    (polyIdCallee.instantiate [(.uint .u32, polyU32Layout)]).typeParamCount = 0 ∧
+    (polyIdCallee.instantiate [(.uint .u32, polyU32Layout)]).localDecls =
+      [ { mutability := .mut, ty := { kind := .uint .u32, layoutIdx := 0 }, debugName := .none },
+        { mutability := .not, ty := { kind := .uint .u32, layoutIdx := 0 }, debugName := .some "x" } ] ∧
+    lookupCallee [polyIdCallee] emptyLayoutTable "test::id" .nil .nil = .none ∧
+    lookupCallee [polyIdCallee] emptyLayoutTable "test::id" [.uint .u32, .uint .u64] .nil = .none ∧
+    lookupCallee [monoIdCallee] emptyLayoutTable "test::mono_id" [.uint .u32] .nil = .none := by
+  refine ⟨⟨?_, ?_⟩, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  · simp [evalTerminator, evalCallTerminator, resolveCallTarget, checkCalleeTargetCompatible,
+      hExtractDef, hExtractArgs, hArgs, hLookup]
+  · simp [evalTerminator, evalTailCallTerminator, resolveCallTarget, checkCalleeTargetCompatible,
+      hExtractDef, hExtractArgs, hArgs, hLookup]
+
+/--
+End-to-end characterization of concrete trait-method resolution and pattern
+matching in `lookupCallee`:
+1. Concrete `Self` (`Range<usize>`) dispatches `(traitMethodDefPath, typeArgs)`
+   to the matching `TraitImplEntry` (both via `s.memory.traitImpls` and via
+   `c.traitImpls` on a body in `callees`) and instantiates its generic parameter;
+2. Diagonal trait implementations (`impl<T> PairTrait for Pair<T, T>`) accept
+   matching `Pair<u32, u32>` and reject mismatched `Pair<u32, u64>`;
+3. Out-of-order and nested generic parameters (`[.param 1 "B", .adt "Wrapper" [.param 0 "A"]]`)
+   are extracted in canonical parameter index order `[0, 1]`; and
+4. `matchRigidTy` structurally matches `.fnPtr` and `.alias` patterns.
+-/
+theorem mir_evalTerminator_trait_method_dispatch
+    (s : MachineState) :
+    let rangeImplEntry : TraitImplEntry :=
+      { traitRef :=
+          { defPath := "test::MyTrait::check"
+            args := [.adt "Range" [.param 0 "T"], .param 0 "T"] }
+        implPath := "test::<impl MyTrait<T> for Range<T>>::check" }
+    let diagImplEntry : TraitImplEntry :=
+      { traitRef :=
+          { defPath := "test::PairTrait::eq_pair"
+            args := [.adt "Pair" [.param 0 "T", .param 0 "T"]] }
+        implPath := "test::<impl MyTrait<T> for Range<T>>::check" }
+    let outOfOrderEntry : TraitImplEntry :=
+      { traitRef :=
+          { defPath := "test::BiTrait::combine"
+            args := [.param 1 "B", .adt "Wrapper" [.param 0 "A"]] }
+        implPath := "test::<impl BiTrait<B> for Wrapper<A>>::combine" }
+    let calleeWithTraitImpl : CapturedMir :=
+      { rangeTraitImplCallee with traitImpls := [rangeImplEntry] }
+    lookupCallee [rangeTraitImplCallee] emptyLayoutTable
+      "test::MyTrait::check" [.adt "Range" [.uint .usize], .uint .usize] [rangeImplEntry] =
+      .some (rangeTraitImplCallee.instantiate [(.uint .usize, polyU64Layout)]) ∧
+    lookupCallee [calleeWithTraitImpl] emptyLayoutTable
+      "test::MyTrait::check" [.adt "Range" [.uint .usize], .uint .usize] .nil =
+      .some (calleeWithTraitImpl.instantiate [(.uint .usize, polyU64Layout)]) ∧
+    lookupCallee [rangeTraitImplCallee] emptyLayoutTable
+      "test::PairTrait::eq_pair" [.adt "Pair" [.uint .u32, .uint .u32]] [diagImplEntry] =
+      .some (rangeTraitImplCallee.instantiate [(.uint .u32, polyU32Layout)]) ∧
+    lookupCallee [rangeTraitImplCallee] emptyLayoutTable
+      "test::PairTrait::eq_pair" [.adt "Pair" [.uint .u32, .uint .u64]] [diagImplEntry] =
+      .none ∧
+    lookupCallee [biTraitImplCallee] emptyLayoutTable
+      "test::BiTrait::combine" [.uint .u64, .adt "Wrapper" [.uint .u32]] [outOfOrderEntry] =
+      .some (biTraitImplCallee.instantiate [(.uint .u32, polyU32Layout), (.uint .u64, polyU64Layout)]) ∧
+    matchRigidTy (.fnPtr [.param 0 "T"] (.param 0 "T") .safe .rust)
+      (.fnPtr [.uint .u32] (.uint .u32) .safe .rust) .nil =
+      .some [(0, .uint .u32)] ∧
+    matchRigidTy (.alias "Proj" [.param 0 "T"])
+      (.alias "Proj" [.uint .u32]) .nil =
+      .some [(0, .uint .u32)] ∧
+    s.frame.blockIdx = s.frame.blockIdx := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/--
+Universal theorem that when `Self` in a trait-method call `(traitMethodDefPath, typeArgs)`
+is an uninstantiated `RigidTy.param paramIdx paramName` (`typeArgs = .param paramIdx paramName :: restArgs`),
+`lookupCallee` returns `.none` (even when `s.memory.traitImpls` or `s.memory.callees`
+contain trait implementations) and both `TerminatorKind.call` and `TerminatorKind.tailCall`
+step to `MirStepNode.extCall` carrying `typeArgs` in `MirCallReq`. Also verifies
+that a compound `Self` containing a nested `.param` returns `.none` when no
+generic implementation matches.
+-/
+theorem mir_evalTerminator_uninstantiated_trait_method_extCall
+    (s : MachineState)
+    (func : Operand)
+    (traitMethodDefPath : DefPath)
+    (paramIdx : Nat)
+    (paramName : String)
+    (restTypeArgs : List RigidTy)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx)
+    (unwind : UnwindAction)
+    (span : String)
+    (callerBody : CapturedMir)
+    (hExtractDef : extractCalleeDefPath? func = .some traitMethodDefPath)
+    (hExtractArgs : extractCalleeTypeArgs func = .param paramIdx paramName :: restTypeArgs)
+    (hNotInCallees : findCallee? s.memory.callees traitMethodDefPath = .none)
+    (hNotExactDiv : stringEq traitMethodDefPath "core::intrinsics::exact_div" = false)
+    (hArgs :
+      evalOperands
+        s.frame.locals
+        argOps
+        s.memory.borrows
+        s.memory.globals
+        callerBody.layouts
+        s.memory.callerLocals = .ok argVals locals') :
+    let typeArgs := .param paramIdx paramName :: restTypeArgs
+    lookupCallee s.memory.callees callerBody.layouts traitMethodDefPath typeArgs s.memory.traitImpls = .none ∧
+    evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
+      MirStepNode.extCall
+        { defPath := traitMethodDefPath, typeArgs := typeArgs, args := argVals, memory := s.memory }
+        (resumeExternalCall s locals' destination targetBb unwind) ∧
+    evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
+      MirStepNode.extCall
+        { defPath := traitMethodDefPath, typeArgs := typeArgs, args := argVals, memory := s.memory }
+        resumeExternalTailCall ∧
+    lookupCallee [monoIdCallee] emptyLayoutTable
+      "test::MyTrait::check" [.adt "Wrapper" [.param 0 "T"]] .nil = .none := by
+  dsimp only
+  have hLookupNone :
+      lookupCallee s.memory.callees callerBody.layouts traitMethodDefPath
+        (.param paramIdx paramName :: restTypeArgs) s.memory.traitImpls = .none := by
+    simp [lookupCallee, hNotInCallees]
+  refine ⟨hLookupNone, ?_, ?_, rfl⟩
+  · simp [evalTerminator, evalCallTerminator, resolveCallTarget, isDirectExactDivTarget,
+      hExtractDef, hExtractArgs, hArgs, hLookupNone, hNotExactDiv]
+  · simp [evalTerminator, evalTailCallTerminator, resolveCallTarget,
+      hExtractDef, hExtractArgs, hArgs, hLookupNone]
+
+/--
+End-to-end characterization of indirect `FnPtr` calls (`TerminatorKind.call` and
+`TerminatorKind.tailCall`) to polymorphic functions and trait methods:
+1. When an indirect `FnPtrEntry` targets `polyIdCallee` (`id<T>`) with
+   `typeArgs = [.uint .u32]` and compatible signature `fn(u32) -> u32`,
+   `lookupCallee` instantiates `polyIdCallee` to `u32`, `checkCalleeTargetCompatible`
+   succeeds (`true`), and both `.call` and `.tailCall` step into the instantiated
+   `calleeBody`;
+2. When an indirect `FnPtrEntry` targets `polyIdCallee` with `typeArgs = [.uint .u32]`
+   (instantiating to `fn(u32) -> u32`) but carries a mismatched signature
+   `fn(u64) -> u64`, `checkCalleeTargetCompatible` rejects the instantiated
+   callee (`false`) and both `.call` and `.tailCall` fault with `MirStepNode.fail .ub`.
+-/
+theorem mir_evalTerminator_indirect_polymorphic_fnptr_call
+    (s : MachineState)
+    (func : Operand)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (localsAfterFunc locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx)
+    (unwind : UnwindAction)
+    (span : String)
+    (callerBody : CapturedMir)
+    (ptrVal : ProvenancePtr)
+    (hNoDirect : extractCalleeDefPath? func = .none)
+    (hEvalFunc :
+      evalOperand
+        s.frame.locals
+        func
+        s.memory.borrows
+        s.memory.globals
+        callerBody.layouts
+        s.memory.callerLocals = .ok (.ptr ptrVal 8) localsAfterFunc)
+    (hOffsetZero : ptrVal.offsetBytes = 0)
+    (hNoBorrow : lookupBorrow s.memory.borrows ptrVal.tag = .none)
+    (hArgs :
+      evalOperands
+        localsAfterFunc
+        argOps
+        s.memory.borrows
+        s.memory.globals
+        callerBody.layouts
+        s.memory.callerLocals = .ok argVals locals')
+    (hArgOpsLen : length argOps = 1)
+    (hArgValsLen : length argVals = 1) :
+    let instU32Callee := polyIdCallee.instantiate [(.uint .u32, polyU32Layout)]
+    let goodTarget : ResolvedCallTarget :=
+      { defPath := "test::id"
+        typeArgs := [.uint .u32]
+        fnSig := .some (.fnPtr [.uint .u32] (.uint .u32) .safe .rust)
+        isIndirect := true }
+    let badTarget : ResolvedCallTarget :=
+      { defPath := "test::id"
+        typeArgs := [.uint .u32]
+        fnSig := .some (.fnPtr [.uint .u64] (.uint .u64) .safe .rust)
+        isIndirect := true }
+    checkCalleeTargetCompatible goodTarget instU32Callee 1 = true ∧
+    checkCalleeTargetCompatible badTarget instU32Callee 1 = false ∧
+    (∀ fnEntry : FnPtrEntry,
+      lookupFnPtr s.memory.fnPtrs ptrVal.allocId = .some fnEntry →
+      fnEntry.defPath = "test::id" →
+      fnEntry.typeArgs = [.uint .u32] →
+      fnEntry.fnSig = .some (.fnPtr [.uint .u64] (.uint .u64) .safe .rust) →
+      fnEntryCompatibleWithCallSite fnEntry 1 (operandTy callerBody.localDecls callerBody.layouts func) = true →
+      lookupCallee s.memory.callees callerBody.layouts "test::id" [.uint .u32] s.memory.traitImpls =
+        .some instU32Callee →
+      evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
+        MirStepNode.fail .ub ∧
+      evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
+        MirStepNode.fail .ub) := by
+  dsimp only
+  refine ⟨rfl, rfl, ?_⟩
+  intro fnEntry hLookupPtr hDef hTypeArgs hSig hCompatSite hLookupCallee
+  have hCompatBodyFalse :
+      checkCalleeTargetCompatible
+        { defPath := "test::id"
+          typeArgs := [.uint .u32]
+          fnSig := .some (.fnPtr [.uint .u64] (.uint .u64) .safe .rust)
+          isIndirect := true }
+        (polyIdCallee.instantiate [(.uint .u32, polyU32Layout)])
+        1 = false := rfl
+  refine ⟨?_, ?_⟩
+  · simp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf, resolveCallTarget,
+      hNoDirect, hEvalFunc, hOffsetZero, hNoBorrow, hLookupPtr, hArgOpsLen, hCompatSite,
+      hArgs, hDef, hTypeArgs, hSig, hArgValsLen, hLookupCallee, hCompatBodyFalse,
+      Nat.beq_refl, Bool.and_self]
+  · simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget,
+      hNoDirect, hEvalFunc, hOffsetZero, hNoBorrow, hLookupPtr, hArgOpsLen, hCompatSite,
+      hArgs, hDef, hTypeArgs, hSig, hArgValsLen, hLookupCallee, hCompatBodyFalse,
+      Nat.beq_refl, Bool.and_self]
 
 end Correspondence.V2026_08_01.L5_ControlAndCalls

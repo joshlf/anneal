@@ -48,7 +48,20 @@ def findCallee? : List CapturedMir → DefPath → Option CapturedMir
     | false => findCallee? rest defPath
 
 mutual
-/-- Match generic parameter pattern against concrete type. -/
+/--
+Match a potentially parametric pattern `pat : RigidTy` from a `TraitImplEntry`
+header (`TraitRef.args`) against a call-site type argument `arg : RigidTy`,
+accumulating `(paramIdx, boundTy)` bindings in `subst` and enforcing equality
+when the same `RigidTy.param` index occurs multiple times (rejecting mismatched
+diagonal instantiations such as `Pair<u32, u64>` against `Pair<T, T>`).
+
+Reference (The Rust Reference, "Trait implementations"):
+<https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
+
+> "A trait implementation is defined like an inherent implementation, except
+> that the optional generic parameters are followed by a trait, followed by the
+> keyword `for`, followed by the implementing type."
+-/
 def matchRigidTy (pat arg : RigidTy) (subst : List (Nat × RigidTy)) : Option (List (Nat × RigidTy)) :=
   match pat with
   | .param pIdx _ =>
@@ -91,14 +104,40 @@ def matchRigidTy (pat arg : RigidTy) (subst : List (Nat × RigidTy)) : Option (L
     | .fnDef aDefPath aArgs =>
       if stringEq pDefPath aDefPath then matchRigidTyList pArgs aArgs subst else Option.none
     | _ => Option.none
+  | .fnPtr pIns pOut pSaf pAbi =>
+    match arg with
+    | .fnPtr aIns aOut aSaf aAbi =>
+      if Bool.and (safetyEq pSaf aSaf) (callConvEq pAbi aAbi) then
+        match matchRigidTyList pIns aIns subst with
+        | Option.some s => matchRigidTy pOut aOut s
+        | Option.none => Option.none
+      else
+        Option.none
+    | _ => Option.none
   | .closure pDefPath pUpvars =>
     match arg with
     | .closure aDefPath aUpvars =>
       if stringEq pDefPath aDefPath then matchRigidTyList pUpvars aUpvars subst else Option.none
     | _ => Option.none
+  | .alias pDefPath pArgs =>
+    match arg with
+    | .alias aDefPath aArgs =>
+      if stringEq pDefPath aDefPath then matchRigidTyList pArgs aArgs subst else Option.none
+    | _ => Option.none
   | _ =>
     if rigidTyEq pat arg then Option.some subst else Option.none
 
+/--
+Pointwise pattern matching of `pats : List RigidTy` against `args : List RigidTy`,
+threading parameter bindings `subst`.
+
+Reference (The Rust Reference, "Trait implementations"):
+<https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
+
+> "A trait implementation is defined like an inherent implementation, except
+> that the optional generic parameters are followed by a trait, followed by the
+> keyword `for`, followed by the implementing type."
+-/
 def matchRigidTyList (pats args : List RigidTy) (subst : List (Nat × RigidTy)) : Option (List (Nat × RigidTy)) :=
   match pats, args with
   | .nil, .nil => Option.some subst
@@ -109,27 +148,52 @@ def matchRigidTyList (pats args : List RigidTy) (subst : List (Nat × RigidTy)) 
   | _, _ => Option.none
 end
 
+/--
+Extract the `count` generic type arguments of an `impl` method body in canonical
+parameter-index order `0 .. count - 1` from pattern-matching substitution `subst`.
+
+Reference (The Rust Reference, "Generic parameters"):
+<https://doc.rust-lang.org/1.98.0/reference/items/generics.html>
+
+> "Functions, type aliases, structs, enumerations, unions, traits, and
+> implementations may be parameterized by types, constants, and lifetimes."
+-/
 def extractImplTypeArgs (subst : List (Nat × RigidTy)) (count : Nat) : Option (List RigidTy) :=
-  let rec loop : Nat → List RigidTy → Option (List RigidTy)
-    | 0, acc => Option.some acc
-    | i + 1, acc =>
-      let rec lookupSubst (idx : Nat) : List (Nat × RigidTy) → Option RigidTy
-        | .nil => Option.none
-        | (k, v) :: rest => if k == idx then Option.some v else lookupSubst idx rest
-      match lookupSubst i subst with
-      | Option.some t => loop i (t :: acc)
-      | Option.none => Option.none
-  loop count .nil
+  if subst.length != count then
+    Option.none
+  else
+    let rec loop : Nat → List RigidTy → Option (List RigidTy)
+      | 0, acc => Option.some acc
+      | i + 1, acc =>
+        let rec lookupSubst (idx : Nat) : List (Nat × RigidTy) → Option RigidTy
+          | .nil => Option.none
+          | (k, v) :: rest => if k == idx then Option.some v else lookupSubst idx rest
+        match lookupSubst i subst with
+        | Option.some t => loop i (t :: acc)
+        | Option.none => Option.none
+    loop count .nil
 
 /--
-Polymorphic Callee & Trait-Method Resolution.
+Resolve a direct or indirect call target `(defPath, typeArgs)` against `callees`
+and registered `TraitImplEntry` tables (`extraTraitImpls` and `c.traitImpls`),
+instantiating polymorphic `CapturedMir` bodies via `CapturedMir.instantiate`
+using `callerLayouts`.
+
+Reference (The Rust Reference, "Call expressions"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/call-expr.html>
+
+> "A call expression calls a function. It consists of an expression with a
+> function type or a type that implements one of the Fn, FnMut, or FnOnce
+> traits, followed by a parenthesized comma-separated list of argument
+> expressions."
 -/
 def lookupCallee (callees : List CapturedMir) (callerLayouts : LayoutTable) (defPath : DefPath) (typeArgs : List RigidTy) (extraTraitImpls : List TraitImplEntry := .nil) : Option CapturedMir :=
   let directMatchOpt := match findCallee? callees defPath with
     | Option.some c => Option.some (c, typeArgs)
     | Option.none =>
-      match typeArgs.head? with
-      | Option.some (.param _ _) => Option.none
+      match typeArgs with
+      | .nil => Option.none
+      | .param _ _ :: _ => Option.none
       | _ =>
         let rec flatMapTraitImpls : List CapturedMir → List TraitImplEntry
           | .nil => .nil
@@ -783,7 +847,7 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 >     fn_span: Span,
 > },"
 -/
-def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operand) (destination : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction) (currentBody : Option CapturedMir) : MirStepNode :=
+def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operand) (destination : Place) (target : Option BasicBlockIdx) (unwind : UnwindAction) (currentBody : Option CapturedMir) : MirStepNode :=
   let bodyLocalDecls := bodyLocalDeclsOf currentBody
   let bodyLayouts : LayoutTable :=
     match currentBody with
@@ -799,71 +863,87 @@ def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operan
   with
   | .ub => MirStepNode.fail .ub
   | .unsupported => MirStepNode.unsupported
-  | .ok target localsAfterFunc =>
-    match
-      evalOperands
-        localsAfterFunc
-        argOps
-        s.memory.borrows
-        s.memory.globals
-        bodyLayouts
-        s.memory.callerLocals
-    with
-    | .ub => MirStepNode.fail .ub
-    | .unsupported => MirStepNode.unsupported
-    | .ok argVals locals' =>
-      match lookupCallee s.memory.callees bodyLayouts target.defPath target.typeArgs s.memory.traitImpls with
-      | .some calleeBody =>
-        match checkCalleeTargetCompatible target calleeBody (length argVals) with
-        | false => MirStepNode.fail .ub
-        | true =>
-          match currentBody with
-          | .none => MirStepNode.unsupported
-          | .some callerBody =>
-            MirStepNode.step
-              (pushCalleeFrame
-                s
-                callerBody
-                locals'
-                destination
-                targetBb
-                calleeBody
-                argVals)
-      | .none =>
-        match isDirectExactDivTarget target with
-        | true =>
-          match argVals with
-          | .scalar lhs :: .scalar rhs :: .nil =>
-            let isSigned :=
-              match argOps with
-              | lhsOp :: _ =>
-                operandIsSigned
-                  bodyLocalDecls
-                  lhsOp
-                  bodyLayouts
-              | .nil => false
-            match evalExactDiv lhs rhs isSigned with
-            | .some retScalar =>
-              match writePlaceValue locals' s.memory.borrows destination (.scalar retScalar) with
-              | .ok updatedLocals =>
-                MirStepNode.step {
-                  frame := {
-                    s.frame with
-                    blockIdx := targetBb
-                    stmtIdx := 0
-                    locals := updatedLocals
+  | .ok resolvedTarget localsAfterFunc =>
+    match target with
+    | .none =>
+      match stringEq resolvedTarget.defPath "core::hint::unreachable_unchecked" with
+      | true => MirStepNode.fail .ub
+      | false => MirStepNode.unsupported
+    | .some targetBb =>
+      match
+        evalOperands
+          localsAfterFunc
+          argOps
+          s.memory.borrows
+          s.memory.globals
+          bodyLayouts
+          s.memory.callerLocals
+      with
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+      | .ok argVals locals' =>
+        match lookupCallee s.memory.callees bodyLayouts resolvedTarget.defPath resolvedTarget.typeArgs s.memory.traitImpls with
+        | .some calleeBody =>
+          match checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) with
+          | false => MirStepNode.fail .ub
+          | true =>
+            match currentBody with
+            | .none => MirStepNode.unsupported
+            | .some callerBody =>
+              MirStepNode.step
+                (pushCalleeFrame
+                  s
+                  callerBody
+                  locals'
+                  destination
+                  targetBb
+                  calleeBody
+                  argVals)
+        | .none =>
+          match isDirectExactDivTarget resolvedTarget with
+          | true =>
+            match argVals with
+            | .scalar lhs :: .scalar rhs :: .nil =>
+              let isSigned :=
+                match argOps with
+                | lhsOp :: _ =>
+                  operandIsSigned
+                    bodyLocalDecls
+                    lhsOp
+                    bodyLayouts
+                | .nil => false
+              match evalExactDiv lhs rhs isSigned with
+              | .some retScalar =>
+                match writePlaceValue locals' s.memory.borrows destination (.scalar retScalar) with
+                | .ok updatedLocals =>
+                  MirStepNode.step {
+                    frame := {
+                      s.frame with
+                      blockIdx := targetBb
+                      stmtIdx := 0
+                      locals := updatedLocals
+                    }
+                    memory := s.memory
                   }
-                  memory := s.memory
-                }
-              | .ub => MirStepNode.fail .ub
-              | .unsupported => MirStepNode.unsupported
-            | .none => MirStepNode.fail .ub
-          | _ => MirStepNode.unsupported
-        | false =>
-          MirStepNode.extCall
-            { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
-            (resumeExternalCall s locals' destination targetBb unwind)
+                | .ub => MirStepNode.fail .ub
+                | .unsupported => MirStepNode.unsupported
+              | .none => MirStepNode.fail .ub
+            | _ => MirStepNode.unsupported
+          | false =>
+            MirStepNode.extCall
+              { defPath := resolvedTarget.defPath, typeArgs := resolvedTarget.typeArgs, args := argVals, memory := s.memory }
+              (resumeExternalCall s locals' destination targetBb unwind)
 
+/--
+Evaluate a `TerminatorKind.tailCall` terminator, resolving direct or indirect
+function targets and polymorphic/trait-method callees via `lookupCallee`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L855-L868>
+
+> "/// Block ends with the call of a function, which is a tail call."
+-/
 def evalTailCallTerminator (s : MachineState) (func : Operand) (argOps : List Operand) (currentBody : Option CapturedMir) : MirStepNode :=
   let bodyLocalDecls := bodyLocalDeclsOf currentBody
   let bodyLayouts : LayoutTable :=
@@ -904,6 +984,20 @@ def evalTailCallTerminator (s : MachineState) (func : Operand) (argOps : List Op
           { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
           resumeExternalTailCall
 
+/--
+Evaluate basic-block `Terminator` `term` in `s`, producing the next
+`MirStepNode` transition.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L812-L853>
+
+> "/// Returns from the function. ...
+> Return,
+> ...
+> /// Block ends with the call of a function.
+> Call { ... },"
+-/
 def evalTerminator
     (s : MachineState)
     (term : Terminator)
@@ -1001,28 +1095,8 @@ def evalTerminator
           | .ub => MirStepNode.fail .ub
           | .unsupported => MirStepNode.unsupported
         | _ => MirStepNode.fail .ub
-  | .call func argOps destination (.some targetBb) unwind =>
-    evalCallTerminator s func argOps destination targetBb unwind currentBody
-  | .call func argOps _ .none _ =>
-    let bodyLocalDecls := bodyLocalDeclsOf currentBody
-    let bodyLayouts : LayoutTable :=
-      match currentBody with
-      | .some b => b.layouts
-      | .none => emptyLayoutTable
-    match
-      resolveCallTarget
-        s
-        func
-        (length argOps)
-        bodyLocalDecls
-        bodyLayouts
-    with
-    | .ub => MirStepNode.fail .ub
-    | .unsupported => MirStepNode.unsupported
-    | .ok target _ =>
-      match target.defPath with
-      | "core::hint::unreachable_unchecked" => MirStepNode.fail .ub
-      | _ => MirStepNode.unsupported
+  | .call func argOps destination target unwind =>
+    evalCallTerminator s func argOps destination target unwind currentBody
   | .tailCall func argOps =>
     evalTailCallTerminator s func argOps currentBody
   | .assert cond expected target unwind =>
