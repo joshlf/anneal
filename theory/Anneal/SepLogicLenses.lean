@@ -57,11 +57,14 @@ model. No proof here destructures the `Memory` record.
    `LiftLensStmts`, and the control-flow judgment `LiftLensBlock` (`return_`,
    `goto`, `assert`, `switchInt`, and `drop_local`). The theorem
    `mirWpConverges_of_sepLenses` turns a lifting derivation into fuel-free
-   convergence on real memory, and
+   convergence on real memory.
    `LiftDerefWrite.evalStmt_treeLens_putGet_and_frame` connects lifted deref
-   writes directly to Section 1 `PutGet` and `IndependentLenses`. The `k`-ary
-   bridges over `sepConjBindings` (`sepLensStateInv_of_sepConjBindings`,
-   `sepConjBindings_preserved`, `sepConjBindings_entails_independentLensFamily`,
+   writes to Section 1 `PutGet` and `IndependentLenses`, and
+   `LiftLensStmt.evalStmt_treeLens_views` shows that every lifted statement,
+   retags included, is state passing on `treeMemoryPtrMutLens` views. The
+   `k`-ary bridges over `sepConjBindings`
+   (`sepLensStateInv_of_sepConjBindings`, `sepConjBindings_preserved`,
+   `sepConjBindings_entails_independentLensFamily`,
    `sepConjBindings_entails_independentTreeLensFamily`) generalize the unary and
    binary ones, and `verifyStatefulMir_of_sepLenses_supportedFrame` and
    `verifyTotalMir_of_sepLenses_supportedFrame` frame any
@@ -4246,9 +4249,68 @@ theorem LiftDerefWrite.evalStmt_treeLens_putGet_and_frame
     fun rp₂ codec₂ b hMem₂ hNe => ?_⟩
   have hPair : ValidTreeMutBorrowLensPair rp rp₂ codec codec₂ s.memory :=
     hInv.validTreeMutBorrowLensPair hMem₁ hMem₂ hNe.symm
-  rw [(treeMemoryPtrMutLens_independent_of_ne_alloc rp rp₂ codec codec₂).readView_right_of_writeBack_left
-    a s.memory hPair]
+  have hIndep :=
+    treeMemoryPtrMutLens_independent_of_ne_alloc rp rp₂ codec codec₂
+  rw [hIndep.readView_right_of_writeBack_left a s.memory hPair]
   exact hInv.treeLens_readView hMem₂
+
+/--
+Every lifted statement is pure `MutLens` state passing: `evalStmt` steps to a
+memory `m'` whose `I-10` lens views are exactly the post lens state
+`entries'`, and every entry of `entries'` is a valid `treeMemoryPtrMutLens`
+domain point of `m'`. This covers lifted dereference reads and writes, pure
+assignments, `StorageLive`/`StorageDead`, `Nop`, and Tree Borrows retags.
+-/
+theorem LiftLensStmt.evalStmt_treeLens_views
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {env env' : PureEnv} {entries₀ entries entries' : List (RawPtrVal × Value)}
+    {stmt : Statement} {s : MachineState} {m₀ : Memory}
+    (hStmt : LiftLensStmt localDecls layouts env entries stmt env' entries')
+    (hEnv : s.frame.locals = env)
+    (hInv : SepLensStateInv env.length entries s.memory)
+    (hFrame : LensFramePreserved entries₀ m₀ s.memory)
+    (hKeys : entries.map Prod.fst = entries₀.map Prod.fst) :
+    ∃ m' : Memory,
+      evalStmt s stmt localDecls layouts =
+        MirStepNode.step (advanceStmt s env' m') ∧
+      ∀ {α : Type} (rp : RawPtrVal) (codec : ValueCodec α) (a : α),
+        (rp, codec.encode a) ∈ entries' →
+        ValidTreeMutBorrowLens rp codec m' ∧
+        (treeMemoryPtrMutLens rp codec).readView m' = a := by
+  rcases hStmt.evalStmt_step hEnv hInv hFrame hKeys with
+    ⟨m', hEval, _, hInv', _, _⟩
+  exact ⟨m', hEval, fun _ _ _ hMem =>
+    ⟨hInv'.validTreeMutBorrowLens hMem, hInv'.treeLens_readView hMem⟩⟩
+
+/--
+Tree Borrows retags are the identity on the lens state. A lifted `Retag(_p)`
+leaves `env` and `entries` unchanged, and `evalStmt` steps to a memory `m'`
+(which may attach a function-entry protector in the borrow table) on which
+every tracked pointer keeps a valid `I-10` lens with the same view as before.
+-/
+theorem LiftRetag.evalStmt_treeLens_views
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {env env' : PureEnv} {entries entries' : List (RawPtrVal × Value)}
+    {stmt : Statement} {s : MachineState}
+    (hRetag : LiftRetag localDecls layouts env entries stmt env' entries')
+    (hEnv : s.frame.locals = env)
+    (hInv : SepLensStateInv env.length entries s.memory) :
+    env' = env ∧ entries' = entries ∧
+    ∃ m' : Memory,
+      evalStmt s stmt localDecls layouts =
+        MirStepNode.step (advanceStmt s env m') ∧
+      ∀ {α : Type} (rp : RawPtrVal) (codec : ValueCodec α) (a : α),
+        (rp, codec.encode a) ∈ entries →
+        ValidTreeMutBorrowLens rp codec m' ∧
+        (treeMemoryPtrMutLens rp codec).readView m' =
+          (treeMemoryPtrMutLens rp codec).readView s.memory := by
+  have hGen := (LiftLensStmt.retag hRetag).evalStmt_treeLens_views hEnv hInv
+    (LensFramePreserved.refl entries s.memory) rfl
+  cases hRetag
+  rcases hGen with ⟨m', hEval, hViews⟩
+  refine ⟨rfl, rfl, m', hEval, fun rp codec a hMem => ?_⟩
+  rw [hInv.treeLens_readView hMem]
+  exact hViews rp codec a hMem
 
 /--
 `I-10`-aware binary separation-to-lens bridge under `TreeExclusiveBorrow`.
@@ -6069,6 +6131,18 @@ def i32NegBits (x : Nat) : Nat :=
     (Nat.sub (scalarModulus 4) (wrapScalarBits x (scalarModulus 4)))
     (scalarModulus 4)
 
+/--
+`i32NegBits` is two's-complement negation: it is canonical and adding the
+original bits gives `0` modulo `2^32`, so `negAssignI32Post` states that `*x`
+ends as the wrapping negation of `x_old`.
+-/
+theorem i32NegBits_spec (x : Nat) :
+    i32NegBits x < 4294967296 ∧ (i32NegBits x + x) % 4294967296 = 0 := by
+  have hM : scalarModulus 4 = 4294967296 := rfl
+  simp only [i32NegBits, Anneal.Scalars.wrapScalarBits_eq_mod_modulus, hM,
+    Nat.sub_eq]
+  omega
+
 def negAssignI32Pre (x_ptr : RawPtrVal) (x_old : Nat) (R_frame : SepProp) :
     List Value → Memory → Prop :=
   fun args m₀ =>
@@ -6146,9 +6220,13 @@ theorem neg_assign_i32_total
 /--
 Two-block `Runtime(PostCleanup)` MIR body exercising `LiftLensBlock.drop_local`
 and `mirWpConverges_drop_of_lens`:
-- `bb0` (index `0`):
-  `StorageLive(_3); _3 = copy _2; (*_1) = Add(copy (*_1), copy _3); drop(_3) -> bb1`
+- `bb0` (index `0`): `StorageLive(_3); _3 = copy _2;
+  (*_1) = Add(copy (*_1), copy _3); drop(_3) -> bb1`
 - `bb1` (index `1`): `StorageDead(_3); _0 = const (); return`
+
+This body is hand-written, not captured: rustc elaborates away `drop` of
+locals without drop glue such as `u32`, so no captured body reaches the
+`drop_local` rule with a `u32` temporary.
 -/
 def drop_temp_assign : CapturedMir where
   defPath := "demo::drop_temp_assign"

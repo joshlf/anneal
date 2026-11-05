@@ -113,6 +113,13 @@ The module is imported by `theory/Anneal.lean` and registered in
   `ValidTreeMutBorrowLens rp codec m'`, reading back through `rp`'s lens yields
   `a`, and reading through any distinct lens entry `rp₂ ≠ rp` continues to
   yield its unchanged value `b`.
+- Every lifted statement is lens-state passing:
+  `LiftLensStmt.evalStmt_treeLens_views` shows that `evalStmt` steps to a
+  memory whose `treeMemoryPtrMutLens` views are exactly the post lens state,
+  each a valid lens domain point. `LiftRetag.evalStmt_treeLens_views`
+  specializes this to Tree Borrows retags: the lens state is unchanged, and
+  every tracked pointer keeps a valid lens with the same view even when the
+  retag attaches a function-entry protector.
 - General `List` / indexed composition:
   - `MutBorrowBinding`, `sepConjList`, and `sepConjBindings` (the `k`-ary,
     heterogeneous separating conjunction, right-nested like the binary form).
@@ -168,8 +175,8 @@ theorem is proved by `mirWpConverges_of_sepLenses` from a lifting derivation
 | `max_assign_u32` | bb0: `StorageLive(_3); _3 = Lt(copy (*_1), copy _2); switchInt(move _3) -> [0: bb2, otherwise: bb1]`; bb1: `(*_1) = copy _2; goto -> bb2`; bb2: `StorageDead(_3); _0 = const (); return` | `max_assign_u32_mirWpConverges`, `max_assign_u32_verified`, `max_assign_u32_total` |
 | `not_assign` | `(*_1) = Not(copy (*_1)); _0 = const (); return` | `not_assign_mirWpConverges`, `not_assign_verified`, `not_assign_total` |
 | `widen_assign` (`x: &mut u64`) | `(*_1) = copy _2 as u64 (IntToInt); _0 = const (); return` | `widen_assign_mirWpConverges`, `widen_assign_verified`, `widen_assign_total` |
-| `neg_assign_i32` (`x: &mut i32`) | `(*_1) = Neg(copy (*_1)); _0 = const (); return` | `neg_assign_i32_mirWpConverges`, `neg_assign_i32_verified`, `neg_assign_i32_total` |
-| `drop_temp_assign` | bb0: `StorageLive(_3); _3 = Add(copy (*_1), copy _2); drop(_3) -> bb1`; bb1: `(*_1) = copy _3; StorageDead(_3); _0 = const (); return` | `drop_temp_assign_mirWpConverges`, `drop_temp_assign_verified`, `drop_temp_assign_total` |
+| `neg_assign_i32` (`x: &mut i32`) | `(*_1) = Neg(copy (*_1)); _0 = const (); return` | `neg_assign_i32_mirWpConverges`, `neg_assign_i32_verified`, `neg_assign_i32_total`, `i32NegBits_spec` |
+| `drop_temp_assign` (hand-written) | bb0: `StorageLive(_3); _3 = copy _2; (*_1) = Add(copy (*_1), copy _3); drop(_3) -> bb1`; bb1: `StorageDead(_3); _0 = const (); return` | `drop_temp_assign_mirWpConverges`, `drop_temp_assign_verified`, `drop_temp_assign_total` |
 
 Non-vacuity: `add_assign_demo_pre` and `add_assign_demo_runs` instantiate the
 `add_assign` precondition on a concrete memory whose borrow table is an `I-10`
@@ -204,6 +211,9 @@ that the parent stays active after the child's write. `swap_u32_demo_pre` and
   preserved only for non-aggregate codecs (`h_not_agg`).
 - Anneal's `rustc` capture does not request retag statements;
   `add_assign_retag` models `-Zmir-emit-retag` output to exercise `LiftRetag`.
+- `drop_temp_assign` is hand-written: rustc elaborates away `drop` of locals
+  without drop glue such as `u32`, so it only exercises
+  `LiftLensBlock.drop_local`.
 
 ## 3. Environment
 
@@ -265,6 +275,9 @@ open Anneal.SepLogicLenses
 #print axioms neg_assign_i32_total
 #print axioms drop_temp_assign_verified
 #print axioms drop_temp_assign_total
+#print axioms LiftLensStmt.evalStmt_treeLens_views
+#print axioms LiftRetag.evalStmt_treeLens_views
+#print axioms i32NegBits_spec
 #print axioms LiftDerefWrite.evalStmt_eq_treeLens_writeBack
 #print axioms LiftDerefWrite.evalStmt_treeLens_putGet_and_frame
 #print axioms LiftDerefRead.evalOperand_eq_treeLens_readView
@@ -301,5 +314,6 @@ Expected: no output.
 | A1 | `ff41a` | `gemini-launch-candidate-high` | Closed Section 1 / Section 2 `I-10` exclusivity gap via `treeMemoryPtrMutLens` and `sepConjBindings_entails_independentTreeLensFamily`; added `LiftLensBlock.switchInt` and `drop_local`; added `LiftLensRvalue.unaryOp_not`, `unaryOp_neg`, and `cast_intToInt`; added `add_assign_retag_verified`/`total`, 3-block `max_assign_u32` (`switchInt`), and `treeMemoryPtrMutLens_putGet_addAssignDemoMem`. |
 | B2 | `ff41b` | `opus-5.5-max` | MIR deref accesses proved equal to `treeMemoryPtrMutLens` reads and write-backs; `I-10` read freezing in `stepTreeBorrowHierarchyAccess?`; pairwise `DisjointFootprints` and distinct `targetLocal`s; `not_assign` and `widen_assign` witnesses exercising the unary and cast rules; documentation fixes. |
 | A2 | `ff41a` | `gemini-launch-candidate-high` | Factored strict and tree `MutLens` proofs through `rawPtrMutLens`, `LawfulMutLens.of_sub_agree`, and `IndependentLenses.of_sub_agree`; added `SepLensStateInv.validTreeMutBorrowLens`/`Pair` and `LiftDerefWrite.evalStmt_treeLens_putGet_and_frame`; added `treeMemoryPtrMutLens_writeBack_agreeOnFootprint_family`/`supportedBy_family` and `verifyTotalMir_of_sepLenses_supportedFrame`; added `not_assign_total`, `widen_assign_total`, `neg_assign_i32` (`unaryOp_neg`), and `drop_temp_assign` (`drop_local`). |
+| B3 | `ff41b` | `opus-5.5-max` | Every lifted statement proved to be lens-state passing on `treeMemoryPtrMutLens` views (`LiftLensStmt.evalStmt_treeLens_views`), retags proved to be the identity on lens views (`LiftRetag.evalStmt_treeLens_views`), `i32NegBits_spec`, corrected `drop_temp_assign` MIR shape and marked it hand-written, comment rewraps. |
 
 No pass so far ran under `[diversity-reduced]` or a fallback model.
