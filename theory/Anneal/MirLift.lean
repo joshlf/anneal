@@ -187,7 +187,8 @@ macro_rules
            Anneal.MirLiftCore.callFrameMem,
            Anneal.MirLiftCore.tailCallFrameMem,
            Anneal.MirLiftCore.returnFrameMem,
-           restoreCallerProtectors, Option.getD, List.set, Nat.add]))
+           restoreCallerProtectors, lookupSwitchTarget,
+           Option.getD, List.set, Nat.add]))
 
 /-- Lift a whole execution from an entry `LiftFrame` goal to the root return. -/
 syntax (name := liftFrame) "lift_frame" : tactic
@@ -488,17 +489,20 @@ def dropLoopBody : CapturedMir := makeDropLoopBody "dropLoop"
 /-! ## Linked-callee mode: polymorphic indirect-call benchmark (`FF-3.3`) -/
 
 -- `liftIndirectCallerMir` reifies `lift_poly_id::<u32>` into a function
--- pointer and calls it indirectly; `liftDirectCallerMir` calls the same generic
--- callee through its function-item constant; `liftPolyLayoutCallerMir`
--- exercises projected `ReifyFnPointer`, `UnsafeFnPointer`, `FnPtrToPtr`
--- followed by a byte-level `Transmute` provenance round-trip, indirect
--- `tailCall`, local fn-item calls, projected `drop`, and polymorphic compound
--- layout recomputation (`LayoutTable.instantiateForBody`) on `Wrapper<T>`;
--- `liftClosureAndTraitCallerMir` calls a `ClosureFnPointer` coercion, a reified
--- trait method resolved through `TraitImplEntry`, and the inline
--- `core::intrinsics::exact_div` intrinsic; `liftPolyApplyCallerMir` passes
--- reified function pointers to the generic higher-order `lift_poly_apply` at
--- two instantiations (see `Anneal.MirLiftBench`).
+-- pointer and calls it indirectly; `liftDirectCallerMir` calls and tail-calls
+-- the same generic callee through its function-item constant;
+-- `liftPolyLayoutCallerMir` exercises projected `ReifyFnPointer`,
+-- `UnsafeFnPointer`, `FnPtrToPtr` followed by a byte-level `Transmute`
+-- provenance round-trip, indirect `tailCall`, local fn-item calls, projected
+-- `drop`, and polymorphic compound layout recomputation
+-- (`LayoutTable.instantiateForBody`) on `Wrapper<T>`;
+-- `liftClosureAndTraitCallerMir` calls a `ClosureFnPointer` coercion (which
+-- tail-calls a local fn item via `tailCallFnItem`), a reified trait method
+-- resolved through `TraitImplEntry`, the inline `core::intrinsics::exact_div`
+-- intrinsic, and `drop`/`assert`/`switchInt`/`goto`; `liftPolyApplyCallerMir`
+-- passes reified function pointers to the generic higher-order
+-- `lift_poly_apply` at two instantiations and writes their return values into
+-- projected tuple fields `_2.0` and `_2.1` (see `Anneal.MirLiftBench`).
 #mir_lift (callees := [liftPolyIdMir]) liftIndirectCallerMir
 #mir_lift (callees := [liftPolyIdMir]) liftDirectCallerMir
 #mir_lift (callees := liftPolyLayoutCallees) liftPolyLayoutCallerMir
@@ -530,6 +534,12 @@ example :
         liftClosureAndTraitCallees)
       (mirNormalPost (fun retVal _ => retVal = .scalar ⟨7, 4⟩)) :=
   liftClosureAndTraitCallerMir_lift_sound
+
+example :
+    MirWpConverges liftPolyApplyCallerMir
+      (initMachineStateWithCallees liftPolyApplyCallerMir [] liftPolyApplyCallees)
+      (mirNormalPost (fun retVal _ => retVal = .scalar ⟨7, 4⟩)) :=
+  liftPolyApplyCallerMir_lift_sound
 
 /--
 info: 'liftIndirectCallerMir_lift_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
@@ -569,11 +579,24 @@ example :
         post := fun _ ret => ret = Value.scalar ⟨7, 4⟩ } :=
   liftIndirectCallerMir_verified
 
+example :
+    Trusted.VerificationResult.VerificationResult
+      { body := liftPolyApplyCallerMir, callees := liftPolyApplyCallees,
+        pre := fun args => args = [],
+        post := fun _ ret => ret = Value.scalar ⟨7, 4⟩ } :=
+  liftPolyApplyCallerMir_verified
+
 /--
 info: 'liftIndirectCallerMir_verified' depends on axioms: [propext, Classical.choice, Quot.sound]
 -/
 #guard_msgs in
 #print axioms liftIndirectCallerMir_verified
+
+/--
+info: 'liftPolyApplyCallerMir_verified' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs in
+#print axioms liftPolyApplyCallerMir_verified
 
 -- Without the linked callee, the indirect call does not lift.
 example : True := by

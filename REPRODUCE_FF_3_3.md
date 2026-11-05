@@ -54,7 +54,9 @@ This builds the frame-lifting rules (`LiftFrame`, `LiftStmtMem` /
 - `liftIndirectCaller_wpConverges`: the caller reifies the generic
   `lift_poly_id::<u32>` into `_1 : fn(u32) -> u32`, calls it indirectly with
   `7`, and returns `7_u32` from `initMachineStateWithCallees`.
-- `liftDirectCaller_wpConverges`: the same generic callee called directly.
+- `liftDirectCaller_wpConverges`: calls and tail-calls the same generic callee
+  directly through its function-item constant (`LiftTerminator.callDirect` and
+  `LiftTerminator.tailCallDirect`).
 - `liftPolyWrapperTransmute_uninstantiated_fails`: proves that `evalPureStmt`
   on the uninstantiated generic `liftPolyWrapperTransmuteMir` returns `none`
   because `Wrapper<T>` has a 0-byte placeholder layout prior to
@@ -73,18 +75,23 @@ This builds the frame-lifting rules (`LiftFrame`, `LiftStmtMem` /
   `CastKind.transmute`.
 - `liftClosureAndTraitCaller_wpConverges`: exercises non-capturing closure
   coercion (`PointerCoercion("ClosureFnPointer")` on
-  `RigidTy.closure "ff33::closure_id" []`), generic trait-method function
-  pointer reification and indirect dispatch (`TraitImplEntry` mapping
+  `RigidTy.closure "ff33::closure_id" []`), local function-item tail calls
+  (`LiftTerminator.tailCallFnItem`), generic trait-method function pointer
+  reification and indirect dispatch (`TraitImplEntry` mapping
   `"ff33::ApplyTrait::apply"` to `"ff33::lift_poly_id"` in `checkCalleeSig`
-  and `lookupCallee`), and inline `core::intrinsics::exact_div::<u32>` calls
-  (`LiftTerminator.callExactDiv`).
+  and `lookupCallee`), inline `core::intrinsics::exact_div::<u32>` calls
+  (`LiftTerminator.callExactDiv`), and `LiftTerminator.drop`,
+  `LiftTerminator.assert`, `LiftTerminator.switchInt`, and
+  `LiftTerminator.goto`.
 - `liftPolyApplyCaller_wpConverges`: higher-order polymorphic indirect calls.
   The caller passes reified `lift_poly_id::<u32>` and `lift_poly_id::<u8>` to
   the generic `lift_poly_apply::<u32>` and `lift_poly_apply::<u8>`, which call
-  their `f : fn(T) -> T` parameter, and returns `3 + (4_u8 as u32)`. It covers
+  their `f : fn(T) -> T` parameter, writes the results into projected tuple
+  fields `_2.0` and `_2.1`, and returns `3 + (4_u8 as u32)`. It covers
   function pointers crossing frames as arguments, signature checks against the
   instantiated parameter type, one generic callee instantiated at two layouts,
-  and returns two frames deep.
+  returns two frames deep, and `LiftTerminator.returnToCaller` writing into
+  projected `caller.destination` places.
 - `liftIndirectCaller_verified`, `liftPolyLayoutCaller_verified`,
   `liftClosureAndTraitCaller_verified`, and `liftPolyApplyCaller_verified`: the
   trusted `VerificationResult` certificates for those claims.
@@ -118,30 +125,29 @@ The build runs:
 Each linked-callee `#mir_lift` defines `<item>_model` (the synthesized return
 value) and proves `<item>_lift_sound` (`MirWpConverges` from
 `initMachineStateWithCallees`) and `<item>_verified` (the trusted
-`VerificationResult` of the closed claim with the callees linked). Six
+`VerificationResult` of the closed claim with the callees linked). Seven
 `#guard_msgs` checks pin the axioms of generated theorems to
 `[propext, Classical.choice, Quot.sound]`, so the build fails if `sorryAx` or a
 custom axiom appears. The call-free `#mir_lift` tests from FF-3.2 run in the
 same module.
 
 The module also checks rejections. `lift_frame` fails without the linked
-callee, with a wrong expected value, on the two signature-mismatch bodies in
-`Anneal.MirLiftBench` (`liftBadReifySigMir` reifies `lift_poly_id::<u32>` at
-`fn(u8) -> u8`; `liftBadCallSigMir` calls a `fn(u32) -> u32` through a local
-declared `fn(u8) -> u8`), which `liftBadReifySig_not_converges` and
-`liftBadCallSig_not_converges` prove are undefined behavior, on
-`liftBadPolyApplySigMir`, and on the two diverging-call bodies
-`liftBadDivergingReturnMir` and `liftDivergingPanicCallerMir`. A `#guard_msgs`
-check confirms that `#mir_lift` refuses a body that takes arguments
-(`liftPolyIdMir`), because both modes run the body on the empty argument list.
-`multiCalleeBody` calls a `u32` constant, which is also undefined behavior:
-`multiCalleeBody_not_converges` proves that it does not converge,
-`multiCalleeBody_residual_false` refutes the universally quantified residual
-hypothesis that a residual abstraction of its call block would assume, and a
-`#guard_msgs` check confirms that `#mir_lift (residual := true)` refuses bodies
-that need the memory-carrying mode. A final `run_meta` check fails the build
-unless `LiftBlock`, `LiftResidualBlock`, `LiftStmtsTerminator`, and `LiftFrame`
-are still irreducible after every `#mir_lift` in the module.
+callee, with a wrong expected value, on the signature-mismatch bodies in
+`Anneal.MirLiftBench` (`liftBadReifySigMir`, `liftBadCallSigMir`, and
+`liftBadPolyApplySigMir`), on the two diverging-call bodies
+`liftBadDivergingReturnMir` and `liftDivergingPanicCallerMir`, and on
+`liftBadNullFnPtrTransmuteMir`, `liftBadExactDivMir`, and
+`liftBadCleanupReturnMir`. A `#guard_msgs` check confirms that `#mir_lift`
+refuses a body that takes arguments (`liftPolyIdMir`), because both modes run
+the body on the empty argument list. `multiCalleeBody` calls a `u32` constant,
+which is also undefined behavior: `multiCalleeBody_not_converges` proves that
+it does not converge, `multiCalleeBody_residual_false` refutes the universally
+quantified residual hypothesis that a residual abstraction of its call block
+would assume, and a `#guard_msgs` check confirms that
+`#mir_lift (residual := true)` refuses bodies that need the memory-carrying
+mode. A final `run_meta` check fails the build unless `LiftBlock`,
+`LiftResidualBlock`, `LiftStmtsTerminator`, and `LiftFrame` are still
+irreducible after every `#mir_lift` in the module.
 
 ## 5. Inspect the generated declarations (optional)
 
