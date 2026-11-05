@@ -1669,7 +1669,7 @@ theorem polyId_all_typeArgs_verified :
       typeArgs.length = 1 →
       VerificationResult (polyIdClaimFor typeArgs) := by
   refine verifyPolyMirNoPanicSym polyIdMir polyIdClaimFor 8 ?_
-  rintro typeArgs _ _ ⟨v, rfl⟩
+  rintro typeArgs _ args s rfl ⟨v, rfl⟩ h_ctx
   rfl
 
 /--

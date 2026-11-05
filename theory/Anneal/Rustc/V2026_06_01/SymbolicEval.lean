@@ -4149,17 +4149,19 @@ theorem linkVerifiedTraitOrPolyContractMirCalleeWithCalleesSym
 /-! ## 15. `O(1)` Block & Callee Lookup Context Lemmas, Indirect `FnPtr` & Diverging Call Stepping, and Polymorphic Claim Combinators -/
 
 /--
-`O(1)` basic-block lookup context hypothesis (`BlockCtx body idx bb`): records
-that basic block `idx` in `body.basicBlocks` is `bb`, avoiding repeated linear
-list traversal of `body.basicBlocks` during symbolic execution.
--/
-/--
 `O(1)` active callee normalization hypothesis (`ActiveCalleeCtx s body instBody`):
 records that `s.memory.activeCallee.getD body = instBody`, avoiding repeated
 evaluation and WHNF unrolling of `.getD` and `CapturedMir.instantiate` across steps.
 -/
 def ActiveCalleeCtx (s : MachineState) (body instBody : CapturedMir) : Prop :=
   s.memory.activeCallee.getD body = instBody
+
+theorem ActiveCalleeCtx.init {body args callees} :
+  ActiveCalleeCtx (initMachineStateWithCallees body args callees) body body := by unfold ActiveCalleeCtx; cases callees <;> rfl
+
+theorem ActiveCalleeCtx.initMem {body args mem callees} :
+  ActiveCalleeCtx (initMachineStateWithMemoryAndCallees body args mem callees) body (mem.activeCallee.getD body) := by unfold ActiveCalleeCtx; cases callees <;> rfl
+
 
 theorem stepMirSymTree_of_activeCalleeCtx
     {body instBody : CapturedMir}
@@ -4182,6 +4184,11 @@ theorem stepMirSymTree_of_activeCalleeCtx
   unfold stepMirSymTree
   rw [h_ctx]
 
+/--
+`O(1)` basic-block lookup context hypothesis (`BlockCtx body idx bb`): records
+that basic block `idx` in `body.basicBlocks` is `bb`, avoiding repeated linear
+list traversal of `body.basicBlocks` during symbolic execution.
+-/
 def BlockCtx (body : CapturedMir) (idx : BasicBlockIdx) (bb : BasicBlockData) : Prop :=
   get? body.basicBlocks idx = .some bb
 
@@ -4651,16 +4658,17 @@ theorem verifyPolyMirSym
     (h_wp :
       ∀ (typeArgs : TypeSubst),
         typeArgs.length = polyBody.typeParamCount →
-        ∀ (args : List Value),
+        ∀ (args : List Value) (s : MachineState),
+          s = initMachineStateWithCallees
+            (claimFor typeArgs).body args (claimFor typeArgs).callees →
           (claimFor typeArgs).pre args →
-          wpMirSym fuel (claimFor typeArgs).body
-            (initMachineStateWithCallees
-              (claimFor typeArgs).body args (claimFor typeArgs).callees)
+          ActiveCalleeCtx s (claimFor typeArgs).body (claimFor typeArgs).body →
+          wpMirSym fuel (claimFor typeArgs).body s
             (mirSafePost (fun retVal _ => (claimFor typeArgs).post args retVal))) :
     ∀ (typeArgs : TypeSubst),
       typeArgs.length = polyBody.typeParamCount →
       VerificationResult (claimFor typeArgs) :=
-  fun typeArgs h_len => verifyMirSafeSym (claimFor typeArgs) fuel (h_wp typeArgs h_len)
+  fun typeArgs h_len => verifyMirSafeSym (claimFor typeArgs) fuel (fun args h_pre => h_wp typeArgs h_len args _ rfl h_pre ActiveCalleeCtx.init)
 
 /--
 Panic-forbidding variant of `verifyPolyMirSym` (`mirNormalPost`).
@@ -4672,16 +4680,17 @@ theorem verifyPolyMirNoPanicSym
     (h_wp :
       ∀ (typeArgs : TypeSubst),
         typeArgs.length = polyBody.typeParamCount →
-        ∀ (args : List Value),
+        ∀ (args : List Value) (s : MachineState),
+          s = initMachineStateWithCallees
+            (claimFor typeArgs).body args (claimFor typeArgs).callees →
           (claimFor typeArgs).pre args →
-          wpMirSym fuel (claimFor typeArgs).body
-            (initMachineStateWithCallees
-              (claimFor typeArgs).body args (claimFor typeArgs).callees)
+          ActiveCalleeCtx s (claimFor typeArgs).body (claimFor typeArgs).body →
+          wpMirSym fuel (claimFor typeArgs).body s
             (mirNormalPost (fun retVal _ => (claimFor typeArgs).post args retVal))) :
     ∀ (typeArgs : TypeSubst),
       typeArgs.length = polyBody.typeParamCount →
       VerificationResult (claimFor typeArgs) :=
-  fun typeArgs h_len => verifyMirNoPanicSym (claimFor typeArgs) fuel (h_wp typeArgs h_len)
+  fun typeArgs h_len => verifyMirNoPanicSym (claimFor typeArgs) fuel (fun args h_pre => h_wp typeArgs h_len args _ rfl h_pre ActiveCalleeCtx.init)
 
 /--
 Verify a universally quantified polymorphic stateful claim
@@ -4695,20 +4704,18 @@ theorem verifyPolyStatefulMirSym
     (h_wp :
       ∀ (typeArgs : TypeSubst),
         typeArgs.length = polyBody.typeParamCount →
-        ∀ (args : List Value) (mem : Memory),
+        ∀ (args : List Value) (mem : Memory) (s : MachineState),
+          s = initMachineStateWithMemoryAndCallees
+            (statefulClaimFor typeArgs).body args mem (statefulClaimFor typeArgs).callees →
           (statefulClaimFor typeArgs).pre args mem →
-          wpMirSym fuel (statefulClaimFor typeArgs).body
-            (initMachineStateWithMemoryAndCallees
-              (statefulClaimFor typeArgs).body
-              args
-              mem
-              (statefulClaimFor typeArgs).callees)
+          ActiveCalleeCtx s (statefulClaimFor typeArgs).body (mem.activeCallee.getD (statefulClaimFor typeArgs).body) →
+          wpMirSym fuel (statefulClaimFor typeArgs).body s
             (mirSafePost ((statefulClaimFor typeArgs).post args mem))) :
     ∀ (typeArgs : TypeSubst),
       typeArgs.length = polyBody.typeParamCount →
       StatefulVerificationResult (statefulClaimFor typeArgs) :=
   fun typeArgs h_len =>
-    verifyStatefulMirSym (statefulClaimFor typeArgs) fuel (h_wp typeArgs h_len)
+    verifyStatefulMirSym (statefulClaimFor typeArgs) fuel (fun args mem h_pre => h_wp typeArgs h_len args mem _ rfl h_pre ActiveCalleeCtx.initMem)
 
 /--
 Panic-forbidding variant of `verifyPolyStatefulMirSym` (`mirNormalPost`).
@@ -4720,20 +4727,18 @@ theorem verifyPolyStatefulMirNoPanicSym
     (h_wp :
       ∀ (typeArgs : TypeSubst),
         typeArgs.length = polyBody.typeParamCount →
-        ∀ (args : List Value) (mem : Memory),
+        ∀ (args : List Value) (mem : Memory) (s : MachineState),
+          s = initMachineStateWithMemoryAndCallees
+            (statefulClaimFor typeArgs).body args mem (statefulClaimFor typeArgs).callees →
           (statefulClaimFor typeArgs).pre args mem →
-          wpMirSym fuel (statefulClaimFor typeArgs).body
-            (initMachineStateWithMemoryAndCallees
-              (statefulClaimFor typeArgs).body
-              args
-              mem
-              (statefulClaimFor typeArgs).callees)
+          ActiveCalleeCtx s (statefulClaimFor typeArgs).body (mem.activeCallee.getD (statefulClaimFor typeArgs).body) →
+          wpMirSym fuel (statefulClaimFor typeArgs).body s
             (mirNormalPost ((statefulClaimFor typeArgs).post args mem))) :
     ∀ (typeArgs : TypeSubst),
       typeArgs.length = polyBody.typeParamCount →
       StatefulVerificationResult (statefulClaimFor typeArgs) :=
   fun typeArgs h_len =>
-    verifyStatefulMirNoPanicSym (statefulClaimFor typeArgs) fuel (h_wp typeArgs h_len)
+    verifyStatefulMirNoPanicSym (statefulClaimFor typeArgs) fuel (fun args mem h_pre => h_wp typeArgs h_len args mem _ rfl h_pre ActiveCalleeCtx.initMem)
 
 /--
 Verify a universally quantified polymorphic total-correctness claim
@@ -4747,20 +4752,18 @@ theorem verifyPolyTotalMirSym
     (h_wp :
       ∀ (typeArgs : TypeSubst),
         typeArgs.length = polyBody.typeParamCount →
-        ∀ (args : List Value) (mem : Memory),
+        ∀ (args : List Value) (mem : Memory) (s : MachineState),
+          s = initMachineStateWithMemoryAndCallees
+            (totalClaimFor typeArgs).body args mem (totalClaimFor typeArgs).callees →
           (totalClaimFor typeArgs).pre args mem →
-          wpMirSym fuel (totalClaimFor typeArgs).body
-            (initMachineStateWithMemoryAndCallees
-              (totalClaimFor typeArgs).body
-              args
-              mem
-              (totalClaimFor typeArgs).callees)
+          ActiveCalleeCtx s (totalClaimFor typeArgs).body (mem.activeCallee.getD (totalClaimFor typeArgs).body) →
+          wpMirSym fuel (totalClaimFor typeArgs).body s
             (mirNormalPost ((totalClaimFor typeArgs).post args mem))) :
     ∀ (typeArgs : TypeSubst),
       typeArgs.length = polyBody.typeParamCount →
       TotalVerificationResult (totalClaimFor typeArgs) :=
   fun typeArgs h_len =>
-    verifyTotalMirSym (totalClaimFor typeArgs) fuel (h_wp typeArgs h_len)
+    verifyTotalMirSym (totalClaimFor typeArgs) fuel (fun args mem h_pre => h_wp typeArgs h_len args mem _ rfl h_pre ActiveCalleeCtx.initMem)
 
 /--
 Verify a universally quantified polymorphic scoped UB-exception claim
@@ -4774,15 +4777,13 @@ theorem verifyPolyUbExceptionMirSym
     (h_strict :
       ∀ (typeArgs : TypeSubst),
         typeArgs.length = polyBody.typeParamCount →
-        ∀ (args : List Value) (mem : Memory),
+        ∀ (args : List Value) (mem : Memory) (s : MachineState),
+          s = initMachineStateWithMemoryAndCallees
+            (ubExceptionClaimFor typeArgs).body args mem (ubExceptionClaimFor typeArgs).callees →
           (ubExceptionClaimFor typeArgs).pre args mem →
           (ubExceptionClaimFor typeArgs).strictSafetyPre args mem →
-          wpMirSym fuel (ubExceptionClaimFor typeArgs).body
-            (initMachineStateWithMemoryAndCallees
-              (ubExceptionClaimFor typeArgs).body
-              args
-              mem
-              (ubExceptionClaimFor typeArgs).callees)
+          ActiveCalleeCtx s (ubExceptionClaimFor typeArgs).body (mem.activeCallee.getD (ubExceptionClaimFor typeArgs).body) →
+          wpMirSym fuel (ubExceptionClaimFor typeArgs).body s
             (fun out =>
               ∀ retVal mem', out = .normal (retVal, mem') →
                 (ubExceptionClaimFor typeArgs).post args mem retVal mem'))
@@ -4807,7 +4808,7 @@ theorem verifyPolyUbExceptionMirSym
     verifyUbExceptionMirSym
       (ubExceptionClaimFor typeArgs)
       fuel
-      (h_strict typeArgs h_len)
+      (fun args mem h_pre h_strict_pre => h_strict typeArgs h_len args mem _ rfl h_pre h_strict_pre ActiveCalleeCtx.initMem)
       (h_waived typeArgs h_len)
 
 /--
