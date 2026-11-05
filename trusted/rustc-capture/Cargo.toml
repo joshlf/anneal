@@ -6,8 +6,24 @@
 # This file may not be copied, modified, or distributed except according to
 # those terms.
 
+# `anneal-rustc-capture` as a `rustc_driver` wrapper. It has no crates.io
+# dependencies: the only crates it links are the pinned toolchain's
+# `rustc-dev` libraries (`#![feature(rustc_private)]`), so the trusted
+# computing base of the capture is this crate plus the pinned toolchain.
+#
+# Build with the pinned toolchain:
+#
+#   T=~/.cache/.anneal/toolchain/<hash>/rust
+#   RUSTC=$T/bin/rustc $T/bin/cargo build --offline --release
+
 [package]
 name = "anneal-rustc-capture"
 version = "0.1.0"
 edition = "2024"
 publish = false
+
+[dependencies]
+
+[[bin]]
+name = "anneal-rustc-capture"
+path = "src/main.rs"

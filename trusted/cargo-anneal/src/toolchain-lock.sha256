@@ -1,0 +1,37 @@
+# Copyright 2026 The Fuchsia Authors
+#
+# Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+# <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+# license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+# This file may not be copied, modified, or distributed except according to
+# those terms.
+#
+# SHA-256 digests of every executable and shared library that `cargo-anneal`
+# loads from the toolchain directory, as `<arch>-<os>/<toolchain-relative path>`.
+# A path ending in `/` locks the directory's top-level entry names (one per
+# line, byte order) rather than file bytes; these are the RUNPATH and sysroot
+# library directories of the locked executables. (`Init.*` `.olean` modules are
+# additionally locked by `trusted/lean/foundation-lock.json`.)
+#
+# Lean 4.34.1: `lean` and the libraries its RUNPATH ($ORIGIN/../lib/lean)
+# resolves. `lean/bin/lean` must also match foundation-lock.json.
+e8baaa71855a616dc351028f3ad2200051b0671f423a1696a100e809302d5550  x86_64-linux/lean/bin/lean
+dfe7a2a8950f01e7f89cfe9f7e6ab226244ae1a195532529f9082de2541d95fc  x86_64-linux/lean/lib/
+ab7b3f984e2f9e1e1453ad00aa71c67eb30912ed8628d4b422c04902e769363d  x86_64-linux/lean/lib/lean/
+6b30cc963d065fc9d2f87f7e9cbe0682b23000ae5425bccd769c5d477fa74f13  x86_64-linux/lean/lib/lean/libleanshared.so
+69e900c025f40bf05c14f5b9ec48071b3130e34c96a7c45ee2eb5b6f307e19e6  x86_64-linux/lean/lib/lean/libleanshared_1.so
+38d0a03750b2e8d51161885ad597a8b4f6d3b85215c5a52aecd2b3753273cf3f  x86_64-linux/lean/lib/lean/libleanshared_2.so
+07f8c1156271ab6ec36c14c3031b5572329325d5f73dde3e89a1615d88f4e5cb  x86_64-linux/lean/lib/lean/libInit_shared.so
+#
+# rustc 1.98.0-nightly (f8a08b688 2026-05-30): `rustc`, `cargo`, the shared
+# libraries `rustc` and `anneal-rustc-capture` load from `rust/lib`, and the
+# target sysroot libraries (`core`, `std`).
+34dfb2ba46cb0a87e7059f484cdfc1d2928df449144acdbc57c8811be9aa41d1  x86_64-linux/rust/bin/rustc
+aefd6dfc1d3b262849680177e408eab81df348717e68065e68fe59ffe39b15e1  x86_64-linux/rust/bin/cargo
+1f3ac5968782c12fbf9df6701ed5915242abb8455044e5dac8ab2a68fd155547  x86_64-linux/rust/lib/librustc_driver-5d5a3c5207375ffc.so
+10b13617cc45091d9707991b67fda2993cbaece5c55165a9d055d0403233d481  x86_64-linux/rust/lib/libLLVM.so.22.1-rust-1.98.0-nightly
+33d53613d9f48ef404eb883ed1dc9e33db2990609346365e6ecd27535aa1c4c7  x86_64-linux/rust/lib/libLLVM-22-rust-1.98.0-nightly.so
+86773a3dc165b00d30691a90bf24996ddf552a42c3cadd59bdcb5ca0fa9cc565  x86_64-linux/rust/lib/
+7ab4e8de59915f1fb2d01db04766ab011fd12aa7e0cfc710b49d735228bd3ece  x86_64-linux/rust/lib/rustlib/x86_64-unknown-linux-gnu/lib/
+075a6241e160401947b12461a361c29172154b2485d49455adb6e4ebdd55609d  x86_64-linux/rust/lib/rustlib/x86_64-unknown-linux-gnu/lib/libcore-9b5ee718dbd50930.rlib
+87d733e1e450b4fb11ffe04063e9390efb8fca2728ca715d90a40b485d2d8fc1  x86_64-linux/rust/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-1ee7395f7ada8841.rlib
