@@ -11,5 +11,7 @@ resolver = "2"
 members = [
     "trusted/audit",
     "trusted/cargo-anneal",
+]
+exclude = [
     "trusted/rustc-capture",
 ]
