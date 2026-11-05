@@ -171,14 +171,17 @@ inductive LiftStmt : CapturedMir → BasicBlockIdx → Nat → PureEnv → State
 def LiftBlock (body : CapturedMir) (bbIdx : BasicBlockIdx) (env : PureEnv) (post : Value → Prop) (fuel : Nat) : Prop :=
   wpPureMirExec fuel body { bb := bbIdx, stmtIdx := 0, env := env } post
 
+
 def LiftResidualBlock (body : CapturedMir) (bbIdx : BasicBlockIdx) (env : PureEnv) (post : Value → Prop) (fuel : Nat) : Prop :=
   LiftBlock body bbIdx env post fuel
 
-theorem LiftResidualBlock.to_LiftBlock {body : CapturedMir} {bbIdx : BasicBlockIdx} {env : PureEnv} {post : Value → Prop} {fuel : Nat}
-  (h : ∀ env, LiftResidualBlock body bbIdx env post fuel) : LiftBlock body bbIdx env post fuel := h env
+theorem LiftResidualBlock.to_LiftBlock {body : CapturedMir} {bbIdx : BasicBlockIdx} {env : PureEnv} {post : Value → Prop} {f1 f2 : Nat}
+  (h : ∀ env, LiftResidualBlock body bbIdx env post f1) (h_le : f1 ≤ f2) : LiftBlock body bbIdx env post f2 :=
+  wpMirExecSym_mono h_le (h env)
 
 def LiftStmtsTerminator (body : CapturedMir) (bbIdx : BasicBlockIdx) (stmtIdx : Nat) (env : PureEnv) (stmts : List Statement) (term : Terminator) (post : Value → Prop) (fuel : Nat) : Prop :=
   wpMirExecSym fuel body (.running (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } emptyMemory)) (mirNormalPost (fun retVal _ => post retVal))
+
 
 theorem LiftBlock.of_lookup {body : CapturedMir} {bbIdx : BasicBlockIdx} {env : PureEnv} {post : Value → Prop} {fuel : Nat}
   (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
@@ -344,24 +347,29 @@ theorem LiftStmtsTerminator.cons {body : CapturedMir} {bbIdx : BasicBlockIdx} {s
 
 
 
-theorem LiftStmtsTerminator.term_drop {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv} {place : Place} {target : BasicBlockIdx} {unwind : UnwindAction} {span : String} {post : Value → Prop} {fuel : Nat}
+theorem LiftStmtsTerminator.term_drop {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv} {place : Place} {target : BasicBlockIdx} {unwind : UnwindAction} {span : String} {post : Value → Prop} {fuel : Nat} {slot : LocalSlot}
   (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some { statements := stmts, terminator := { kind := .drop place target unwind, span := span }, isCleanup := false })
   (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
   (h_end : stmtIdx = List.length stmts)
-  (h_eval : evalPureTerminator body bbIdx (List.length stmts) env { kind := .drop place target unwind, span := span } = .step (PureState.toMachineState { bb := target, stmtIdx := 0, env := env' } emptyMemory))
+  (h_get : Trusted.Sequence.get? env place.local_ = some slot)
+  (h_not_dead : slot ≠ .dead)
+  (h_proj : place.projection = [])
+  (h_set : Trusted.Sequence.set? env place.local_ .uninit = some env')
   (h_next : LiftBlock body target env' post fuel) :
   LiftStmtsTerminator body bbIdx stmtIdx env stmts { kind := .drop place target unwind, span := span } post (fuel + 1) := by
-  dsimp [evalPureTerminator] at h_eval
-  dsimp [LiftStmtsTerminator, wpMirExecSym, stepMirExecSymTree, stepMirSymTree, PureState.toMachineState, emptyMemory] at h_eval ⊢
+  dsimp [LiftStmtsTerminator, wpMirExecSym, stepMirExecSymTree, stepMirSymTree, PureState.toMachineState, emptyMemory]
   subst h_end
   rcases h_phase with hp | hp <;> rw [hp, h_bb] <;> dsimp [Trusted.Sequence.get?, List.length, beq_iff_eq]
-  · simp [evalTerminatorSymTree, get_length_none_seq, get_length_none_list, ite_length_eq]
-    rw [h_eval]
-    rw [evalSymNodeTree_eq]
-    dsimp [evalNodeWP]
-    exact h_next
-  · simp [evalTerminatorSymTree, get_length_none_seq, get_length_none_list, ite_length_eq]
-    rw [h_eval]
-    rw [evalSymNodeTree_eq]
-    dsimp [evalNodeWP]
-    exact h_next
+  · simp [evalTerminatorSymTree, get_length_none_seq, get_length_none_list, ite_length_eq, evalTerminator]
+    rw [h_get]
+    cases slot
+    · contradiction
+    · rw [h_proj]; simp; rw [h_set]; exact h_next
+    · rw [h_proj]; simp; rw [h_set]; exact h_next
+  · simp [evalTerminatorSymTree, get_length_none_seq, get_length_none_list, ite_length_eq, evalTerminator]
+    rw [h_get]
+    cases slot
+    · contradiction
+    · rw [h_proj]; simp; rw [h_set]; exact h_next
+    · rw [h_proj]; simp; rw [h_set]; exact h_next
+

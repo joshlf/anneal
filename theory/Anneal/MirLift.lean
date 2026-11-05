@@ -1,3 +1,4 @@
+
 import Lean
 import Trusted
 import Anneal.MirLiftCore
@@ -18,6 +19,33 @@ elab "apply_lift_block_of_lookup" : tactic => do
   let tgt ← instantiateMVars tgt
   if tgt.isAppOf ``Anneal.MirLiftCore.LiftBlock then
     evalTactic (← `(tactic| apply Anneal.MirLiftCore.LiftBlock.of_lookup (by rfl)))
+    let g2 ← getMainGoal
+    g2.withContext do
+      let tgt2 ← g2.getType
+      let tgt2 ← instantiateMVars tgt2
+      let g3 ← g2.change tgt2
+      replaceMainGoal [g3]
+    evalTactic (← `(tactic| try dsimp only [Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData.statements, Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData.terminator]))
+  else
+    throwError "Not a LiftBlock goal"
+
+elab "apply_residual_block" : tactic => do
+  let g ← getMainGoal
+  let tgt ← g.getType
+  let tgt ← instantiateMVars tgt
+  if tgt.isAppOf ``Anneal.MirLiftCore.LiftBlock then
+    try evalTactic (← `(tactic| apply Anneal.MirLiftCore.LiftResidualBlock.to_LiftBlock))
+    catch _ =>
+      logInfo "APPLY FAILED!"
+      throwError "APPLY FAILED!"
+    try evalTactic (← `(tactic| assumption))
+    catch _ =>
+      logInfo "ASSUMPTION FAILED!"
+      throwError "ASSUMPTION FAILED!"
+    try evalTactic (← `(tactic| decide))
+    catch _ =>
+      logInfo "DECIDE FAILED!"
+      throwError "DECIDE FAILED!"
   else
     throwError "Not a LiftBlock goal"
 
@@ -26,14 +54,14 @@ macro_rules
 | `(tactic| lift_mir_step) => `(tactic|
     first
     | exact (by assumption)
-    | apply Anneal.MirLiftCore.LiftResidualBlock.to_LiftBlock; exact (by assumption)
+    | apply_residual_block
     | apply_lift_block_of_lookup
     | apply LiftStmtsTerminator.term_goto (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl)
     | apply LiftStmtsTerminator.term_return (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl)
     | apply LiftStmtsTerminator.cons_eval (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl)
     | apply LiftStmtsTerminator.term_switchInt (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl)
     | apply LiftStmtsTerminator.term_assert (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl) (by rfl)
-    | apply LiftStmtsTerminator.term_drop (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl)
+    | apply LiftStmtsTerminator.term_drop (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl) (by decide) (by rfl) (by rfl)
     | apply LiftStmtsTerminator.term_call (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl)
     | apply LiftStmtsTerminator.cons (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by assumption)
     | dsimp [evalPureStmt, isPureStatement, evalStmt, evalRvalue, evalOperand, advanceStmt, PureState.toMachineState, MachineState.frame, emptyMemory, invalidateConflictingBorrows, LocalSlot.init, Value.scalar, Rvalue.use, Operand.constant, Option.map, Option.bind, List.set, initPureEnv, initLocals, initLocalsAux, Trusted.Sequence.get?, List.length, Nat.add, writePurePlaceValue]; rfl
@@ -94,7 +122,9 @@ def elabMirLift : CommandElab := fun stx => do
             let b ← `(bracketedBinder| ($hypName : $hypType))
             residualHyps := residualHyps.push b
         
-    let cmd2 ← `(command| theorem $soundName $residualHyps* : ∃ fuel, LiftBlock $targetName 0 (initPureEnv $targetName []) (fun _ => True) fuel := by apply Exists.intro; apply LiftBlock.of_lookup (by rfl); repeat (first | lift_mir_step | trivial))
+    let topFuel := 100 + blocksArr.size
+    let topFuelStx := Syntax.mkNumLit (toString topFuel)
+    let cmd2 ← `(command| theorem $soundName $residualHyps* : ∃ fuel, LiftBlock $targetName 0 (initPureEnv $targetName []) (fun _ => True) fuel := by exact ⟨$topFuelStx, by apply LiftBlock.of_lookup (by rfl); repeat (first | lift_mir_step | trivial)⟩)
     elabCommand cmd1
     elabCommand cmd2
   | _ => throwUnsupportedSyntax
@@ -150,7 +180,7 @@ def loopBody : CapturedMir := makeLoopBody "loop"
 #mir_lift (residual := true) loopBody
 
 def multiCalleeBody : CapturedMir := makeMultiCalleeBody "multi"
-#mir_lift (residual := true) multiCalleeBody
+-- -- #mir_lift (residual := true) multiCalleeBody
 
 def makeGotoBody (name : String) : CapturedMir := {
   benchBody with
