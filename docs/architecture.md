@@ -191,10 +191,9 @@ vs. `theory/`) and the separation between **language-agnostic verification
 machinery** (`Framework/`) and **Rust-specific semantics** (`Rust/`).
 [`trusted/`](../trusted) houses the CI boundary auditor (`trusted/audit/`), CLI
 orchestrator (`trusted/cargo-anneal/`), capture entrypoint
-(`trusted/rustc-capture/`), and foundational trust-attribute declarations
-(`trusted/lean/`); the `Framework/`, `Rust/`, per-version capture subcrates,
-and `theory/` subdirectories below show the target layout as the pipeline is
-populated:
+(`trusted/rustc-capture/`), and foundational Lean prelude (`trusted/lean/`);
+the `Framework/`, `Rust/`, per-version capture subcrates, and `theory/`
+subdirectories below show the target layout as the pipeline is populated:
 
 ```text
 anneal/
@@ -211,7 +210,6 @@ anneal/
 │   │   ├── foundation-lock.json    # SHA-256 pins for lean binary & Init.*
 │   │   ├── Trusted.lean            # Root TCB prelude import
 │   │   └── Trusted/
-│   │       ├── Attributes.lean     # @[vetted] & @[candidate <feat>] support
 │   │       ├── Framework/          # Language-agnostic transition systems,
 │   │       │                       # Abstracts/Compiles, & VerificationResult
 │   │       └── Rust/               # Captured MIR AST, CaptureProfile, memory
