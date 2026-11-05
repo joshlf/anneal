@@ -167,6 +167,7 @@ fn end_to_end_four_demo_user_journeys() {
         manifest_path: None,
         units_dir: units_dir.clone(),
         rustc_wrapper: Some(wrapper_bin.clone()),
+        out_dir: None,
         anneal_repo_root: Some(checkout_root.clone()),
         from_existing_units: false,
         init_specs: false,

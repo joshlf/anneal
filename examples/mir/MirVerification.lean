@@ -65,6 +65,7 @@ private def fnItemOperand (defPath : DefPath) : Operand :=
 private def u32ConstOperand (n : Nat) : Operand :=
   .constant { ty := u32MirTy, val := .scalar (.int { bits := n, sizeBytes := 4 }) }
 
+@[reducible, simp]
 private def defaultU32TypeLayout : TypeLayout := {
   size := { bytes := 4 }
   align := { bytes := 4 }
@@ -74,6 +75,7 @@ private def defaultU32TypeLayout : TypeLayout := {
   isUninhabited := false
 }
 
+@[reducible, simp]
 private def defaultU32FnAbi : FnAbi := {
   args := []
   ret := { layout := defaultU32TypeLayout, mode := .direct }
@@ -81,12 +83,15 @@ private def defaultU32FnAbi : FnAbi := {
   canUnwind := false
 }
 
+@[reducible, simp]
 private def mkDecl (mutability : Mutability) (ty : Ty) : LocalDecl :=
   { mutability, ty, debugName := none }
 
+@[reducible, simp]
 private def mkStmt (kind : StatementKind) : Statement :=
   { kind, span := "MirVerification.lean" }
 
+@[reducible, simp]
 private def mkTerm (kind : TerminatorKind) : Terminator :=
   { kind, span := "MirVerification.lean" }
 
@@ -1041,5 +1046,941 @@ theorem example_polymorphic_mir_instantiate_and_verify :
      (.tuple [.param 0 "T", .param 1 "U"]),
    rfl,
    polySwapPairU32Claim_verified⟩
+
+/-! ## 11. Signature-Typed Predicates (`argsMatchSignature`, `retMatchesSignature`) across Slices, Struct Refs, ADTs, Raw/Fn Pointers & Polymorphic Bodies -/
+
+@[reducible]
+def sigU8TypeLayout : TypeLayout := {
+  size := { bytes := 1 }
+  align := { bytes := 1 }
+  backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 })
+  fields := .primitive
+  variants := .single 0
+  isUninhabited := false
+}
+
+@[reducible]
+def sigUsizeTypeLayout : TypeLayout := {
+  size := { bytes := 8 }
+  align := { bytes := 8 }
+  backendRepr := .scalar (.initialized (.int 64 false) { start := 0, end_ := 18446744073709551615 })
+  fields := .primitive
+  variants := .single 0
+  isUninhabited := false
+}
+
+@[reducible]
+def sigThinPtrTypeLayout : TypeLayout := {
+  size := { bytes := 8 }
+  align := { bytes := 8 }
+  backendRepr := .scalar (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 })
+  fields := .primitive
+  variants := .single 0
+  isUninhabited := false
+}
+
+@[reducible]
+def sigRawPtrTypeLayout : TypeLayout := {
+  size := { bytes := 8 }
+  align := { bytes := 8 }
+  backendRepr := .scalar (.initialized (.pointer 0) { start := 0, end_ := 18446744073709551615 })
+  fields := .primitive
+  variants := .single 0
+  isUninhabited := false
+}
+
+@[reducible]
+def sigWideSliceTypeLayout : TypeLayout := {
+  size := { bytes := 16 }
+  align := { bytes := 8 }
+  backendRepr := .scalarPair
+    (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 })
+    (.initialized (.int 64 false) { start := 0, end_ := 18446744073709551615 })
+  fields := .arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1]
+  variants := .single 0
+  isUninhabited := false
+}
+
+@[reducible]
+def sigUsercopyStructTypeLayout : TypeLayout := {
+  size := { bytes := 16 }
+  align := { bytes := 8 }
+  backendRepr := .scalarPair
+    (.initialized (.int 64 false) { start := 0, end_ := 18446744073709551615 })
+    (.initialized (.int 64 false) { start := 0, end_ := 18446744073709551615 })
+  fields := .arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1]
+  variants := .single 0
+  isUninhabited := false
+  fieldLayouts := [1, 1]
+}
+
+@[reducible]
+def sigOptionU32TypeLayout : TypeLayout := {
+  size := { bytes := 8 }
+  align := { bytes := 4 }
+  backendRepr := .scalarPair
+    (.initialized (.int 32 false) { start := 0, end_ := 1 })
+    (.initialized (.int 32 false) { start := 0, end_ := 4294967295 })
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .multiple
+    (.initialized (.int 32 false) { start := 0, end_ := 1 })
+    0
+    [.arbitrary [] [], .arbitrary [{ bytes := 4 }] [0]]
+  isUninhabited := false
+}
+
+@[reducible]
+def sigResultSliceSplitTypeLayout : TypeLayout := {
+  size := { bytes := 40 }
+  align := { bytes := 8 }
+  backendRepr := .memory
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .multiple
+    (.initialized (.int 64 false) { start := 0, end_ := 1 })
+    0
+    [.arbitrary [{ bytes := 8 }] [0], .arbitrary [{ bytes := 8 }] [0]]
+  isUninhabited := false
+}
+
+@[reducible]
+def sigSuiteLayoutTable : LayoutTable := {
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [
+    sigU8TypeLayout,               -- 0: u8
+    sigUsizeTypeLayout,            -- 1: usize
+    sigThinPtrTypeLayout,          -- 2: &T / fn(...) -> usize
+    sigUsercopyStructTypeLayout,   -- 3: Usercopy (immediately after slot 2 for &Usercopy)
+    sigWideSliceTypeLayout,        -- 4: &[u8] / &mut [MaybeUninit<u8>]
+    sigOptionU32TypeLayout,        -- 5: Option<u32>
+    sigResultSliceSplitTypeLayout, -- 6: Result<&[u8], (&[u8], &[MaybeUninit<u8>])>
+    sigRawPtrTypeLayout,           -- 7: *mut u8 / *const u8
+    paramTPlaceholderLayout        -- 8: generic param T placeholder
+  ]
+}
+
+@[reducible]
+def mkSigSuiteBody (argTys : List Ty) (retTy : Ty) (tParams : Nat := 0) : CapturedMir := {
+  defPath := "demo::sig_suite"
+  argCount := argTys.length
+  typeParamCount := tParams
+  localDecls := mkDecl .mut retTy :: argTys.map (mkDecl .not)
+  basicBlocks := []
+  phase := .runtimePostCleanup
+  role := .subject
+  fnAbi := defaultU32FnAbi
+  layouts := sigSuiteLayoutTable
+  allocations := []
+}
+
+@[reducible]
+def sigSuiteLiveMem : Memory := {
+  emptyMemory with
+  globals := [
+    { allocId := 10
+      bytes := [some 1, some 2, some 3, some 4]
+      relocations := []
+      align := { bytes := 1 }
+      mutability := .not },
+    { allocId := 11
+      bytes := [none, none, none, none]
+      relocations := []
+      align := { bytes := 1 }
+      mutability := .mut }
+  ]
+  borrows := [
+    { tag := 20
+      targetLocal := 0
+      targetProjection := []
+      perm := .frozen
+      rangeOffset := 0
+      rangeLen := 16 },
+    { tag := 21
+      targetLocal := 1
+      targetProjection := []
+      perm := .active
+      rangeOffset := 0
+      rangeLen := 4 }
+  ]
+  callerLocals := [
+    .init (.aggregate 0 [.scalar ⟨0x1000, 8⟩, .scalar ⟨0x2000, 8⟩]),
+    .init (.aggregate 0 [
+      .aggregate 0 [.unit],
+      .aggregate 0 [.scalar ⟨99, 1⟩]
+    ])
+  ]
+}
+
+/--
+Kernel-checked verification across all five `BRIEF-4.1` signature obligation
+categories:
+1. Wide slice parameters (`&[u8]`, `&mut [MaybeUninit<u8>]`, including
+   uninitialized `MaybeUninit::uninit()` elements),
+2. Struct reference parameters (`&Usercopy`, `&Range<usize>`),
+3. ADT return types (`Option<u32>`,
+   `Result<&[u8], (&[u8], &[MaybeUninit<u8>])>`),
+4. Raw pointers (`*mut u8`, `*const u8`) and function pointers
+   (`fn(*mut u8, *const u8, usize) -> usize`),
+5. Polymorphic functions (`body.typeParamCount > 0`) before and after
+   `CapturedMir.instantiate`.
+-/
+theorem example_signature_predicates_and_polymorphic_obligations :
+    -- 1. Wide slice parameters: &[u8] and &mut [MaybeUninit<u8>]
+    argsMatchSignature
+      (mkSigSuiteBody
+        [{ kind := .ref .not (.slice (.uint .u8)), layoutIdx := 4 },
+         { kind := .ref .mut (.slice (.adt "core::mem::maybe_uninit::MaybeUninit" [.uint .u8])),
+           layoutIdx := 4 }]
+        { kind := .uint .usize, layoutIdx := 1 })
+      [.aggregate 0 [.ptr ⟨10, 0⟩ 8, .scalar ⟨4, 8⟩],
+       .aggregate 0 [.ptr ⟨21, 0⟩ 8, .scalar ⟨2, 8⟩]]
+      sigSuiteLiveMem ∧
+    ¬ argsMatchSignature
+      (mkSigSuiteBody
+        [{ kind := .ref .not (.slice (.uint .u8)), layoutIdx := 4 }]
+        { kind := .uint .usize, layoutIdx := 1 })
+      [.aggregate 0 [.ptr ⟨10, 0⟩ 8, .scalar ⟨5, 8⟩]]
+      sigSuiteLiveMem ∧
+    -- 2. Struct reference parameters: &Usercopy and &Range<usize>
+    argsMatchSignature
+      (mkSigSuiteBody
+        [{ kind := .ref .not (.adt "usercopy::Usercopy" []), layoutIdx := 2 },
+         { kind := .ref .not (.adt "core::ops::range::Range" [.uint .usize]), layoutIdx := 2 }]
+        { kind := .uint .usize, layoutIdx := 1 })
+      [.ptr ⟨20, 0⟩ 8, .ptr ⟨20, 0⟩ 8]
+      sigSuiteLiveMem ∧
+    ¬ argsMatchSignature
+      (mkSigSuiteBody
+        [{ kind := .ref .not (.adt "core::ops::range::Range" [.uint .usize]), layoutIdx := 2 }]
+        { kind := .uint .usize, layoutIdx := 1 })
+      [.ptr ⟨20, 4⟩ 8]
+      sigSuiteLiveMem ∧
+    -- 3. ADT return types: Option<u32> and Result<&[u8], (&[u8], &[MaybeUninit<u8>])>
+    retMatchesSignature
+      (mkSigSuiteBody [] { kind := .adt "core::option::Option" [.uint .u32], layoutIdx := 5 })
+      (.aggregate 0 [])
+      sigSuiteLiveMem ∧
+    retMatchesSignature
+      (mkSigSuiteBody [] { kind := .adt "core::option::Option" [.uint .u32], layoutIdx := 5 })
+      (.aggregate 1 [.scalar ⟨42, 4⟩])
+      sigSuiteLiveMem ∧
+    retMatchesSignature
+      (mkSigSuiteBody []
+        { kind := .adt "core::result::Result"
+            [.ref .not (.slice (.uint .u8)),
+             .tuple [
+               .ref .not (.slice (.uint .u8)),
+               .ref .not (.slice (.adt "core::mem::maybe_uninit::MaybeUninit" [.uint .u8]))
+             ]],
+          layoutIdx := 6 })
+      (.aggregate 0 [.aggregate 0 [.ptr ⟨10, 0⟩ 8, .scalar ⟨4, 8⟩]])
+      sigSuiteLiveMem ∧
+    retMatchesSignature
+      (mkSigSuiteBody []
+        { kind := .adt "core::result::Result"
+            [.ref .not (.slice (.uint .u8)),
+             .tuple [
+               .ref .not (.slice (.uint .u8)),
+               .ref .not (.slice (.adt "core::mem::maybe_uninit::MaybeUninit" [.uint .u8]))
+             ]],
+          layoutIdx := 6 })
+      (.aggregate 1 [
+        .aggregate 0 [
+          .aggregate 0 [.ptr ⟨10, 0⟩ 8, .scalar ⟨2, 8⟩],
+          .aggregate 0 [.ptr ⟨21, 0⟩ 8, .scalar ⟨2, 8⟩]
+        ]])
+      sigSuiteLiveMem ∧
+    -- 4. Raw pointers (*mut u8, *const u8) and fn(*mut u8, *const u8, usize) -> usize
+    argsMatchSignature
+      (mkSigSuiteBody
+        [{ kind := .rawPtr .mut (.uint .u8), layoutIdx := 7 },
+         { kind := .rawPtr .not (.uint .u8), layoutIdx := 7 },
+         { kind := .fnPtr
+             [.rawPtr .mut (.uint .u8), .rawPtr .not (.uint .u8), .uint .usize]
+             (.uint .usize) .unsafe_ .rust,
+           layoutIdx := 2 }]
+        { kind := .uint .usize, layoutIdx := 1 })
+      [.scalar ⟨0, 8⟩, .ptr ⟨999, 3⟩ 8, .ptr ⟨77, 0⟩ 8]
+      emptyMemory ∧
+    ¬ argsMatchSignature
+      (mkSigSuiteBody
+        [{ kind := .fnPtr
+             [.rawPtr .mut (.uint .u8), .rawPtr .not (.uint .u8), .uint .usize]
+             (.uint .usize) .unsafe_ .rust,
+           layoutIdx := 2 }]
+        { kind := .uint .usize, layoutIdx := 1 })
+      [.scalar ⟨0, 8⟩]
+      emptyMemory ∧
+    -- 5. Polymorphic body before and after CapturedMir.instantiate
+    ¬ argsMatchSignature
+      polySwapPairMirBody
+      [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩]
+      emptyMemory ∧
+    argsMatchSignature
+      polySwapPairU32MirBody
+      [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩]
+      emptyMemory ∧
+    retMatchesSignature
+      polySwapPairU32MirBody
+      (.aggregate 0 [.scalar ⟨20, 4⟩, .scalar ⟨10, 4⟩])
+      emptyMemory ∧
+    ¬ argsMatchSignature
+      polySwapPairU32MirBody
+      [.scalar ⟨10, 1⟩, .scalar ⟨20, 4⟩]
+      emptyMemory := by
+  set_option linter.unusedSimpArgs false in
+  simp [
+    emptyMemory,
+    TypeLayout.isParamPlaceholder,
+    wrappingRangeContains,
+    primitiveKindByteWidth,
+    scalarLayoutByteWidth,
+    alignUp,
+    maxNat,
+    pow2Nat,
+    Trusted.Sequence.get?,
+    Trusted.Sequence.length,
+    UintTy.byteWidth,
+    UintTy.bitWidth,
+    IntTy.byteWidth,
+    IntTy.bitWidth,
+    FloatTy.byteWidth,
+    appendTypeLayouts,
+    setTypeLayoutAt,
+    lookupFieldLayouts,
+    computeArbitraryFieldsAux,
+    computeUnionSizeAndAlign,
+    computeAggregateBackendRepr,
+    tagScalarByteWidth,
+    recomputeVariantShapesAux,
+    TypeLayout.recomputeFromFieldLayouts,
+    Trusted.Rustc.V2026_06_01.Layout.substitutePlaceholderEntries,
+    Trusted.Rustc.V2026_06_01.Layout.recomputeEntriesWith,
+    LayoutTable.appendParamLayouts,
+    LayoutTable.lookup,
+    TypeSubst.lookup,
+    TypeSubst.layouts,
+    TypeSubst.length,
+    RigidTy.instantiate,
+    RigidTy.instantiateList,
+    RigidTy.hasSubstParam,
+    RigidTy.hasSubstParamList,
+    RigidTy.isCompoundSubstParam,
+    RigidTy.isTrivialZst,
+    RigidTy.computeLayout,
+    RigidTy.computeLayoutList,
+    Trusted.Rustc.V2026_06_01.Layout.LayoutTable.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.LayoutTable.instantiate,
+    Ty.instantiate,
+    ConstOperand.instantiate,
+    TraitRef.instantiate,
+    TraitImplEntry.instantiate,
+    TraitImplEntry.instantiateList,
+    Trusted.Rustc.V2026_06_01.MirAst.ProjectionElem.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.ProjectionElem.instantiateList,
+    Trusted.Rustc.V2026_06_01.MirAst.Place.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.Operand.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.Operand.instantiateList,
+    Trusted.Rustc.V2026_06_01.MirAst.AggregateKind.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.Rvalue.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.NonDivergingIntrinsic.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.StatementKind.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.Statement.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.Statement.instantiateList,
+    Trusted.Rustc.V2026_06_01.MirAst.TerminatorKind.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.Terminator.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData.instantiateList,
+    Trusted.Rustc.V2026_06_01.MirAst.LocalDecl.instantiate,
+    Trusted.Rustc.V2026_06_01.MirAst.LocalDecl.instantiateList,
+    Trusted.Rustc.V2026_06_01.MirAst.appendTys,
+    Trusted.Rustc.V2026_06_01.MirAst.ProjectionElem.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.ProjectionElem.collectTysList,
+    Trusted.Rustc.V2026_06_01.MirAst.Place.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.Operand.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.Operand.collectTysList,
+    Trusted.Rustc.V2026_06_01.MirAst.AggregateKind.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.Rvalue.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.NonDivergingIntrinsic.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.StatementKind.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.Statement.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.Statement.collectTysList,
+    Trusted.Rustc.V2026_06_01.MirAst.TerminatorKind.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.Terminator.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData.collectTys,
+    Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData.collectTysList,
+    Trusted.Rustc.V2026_06_01.MirAst.LocalDecl.collectTysList,
+    Trusted.Rustc.V2026_06_01.MirAst.collectBodyTys,
+    Trusted.Rustc.V2026_06_01.MirAst.hasNonParamTyAtIdx,
+    Trusted.Rustc.V2026_06_01.MirAst.hasCompoundParamTyAtIdx,
+    Trusted.Rustc.V2026_06_01.MirAst.substituteTyParamLayoutsAux,
+    Trusted.Rustc.V2026_06_01.MirAst.recomputeTyCompoundLayoutsAux,
+    Trusted.Rustc.V2026_06_01.MirAst.hasNonParamDeclAtIdx,
+    Trusted.Rustc.V2026_06_01.MirAst.hasCompoundParamDeclAtIdx,
+    Trusted.Rustc.V2026_06_01.MirAst.substituteDeclParamLayoutsAux,
+    Trusted.Rustc.V2026_06_01.MirAst.recomputeDeclCompoundLayoutsAux,
+    LayoutTable.instantiateForBody,
+    LayoutTable.instantiateForDecls,
+    Trusted.Rustc.V2026_06_01.MirAst.ArgAbi.recomputeMode,
+    Trusted.Rustc.V2026_06_01.MirAst.ArgAbi.instantiateForDecl,
+    Trusted.Rustc.V2026_06_01.MirAst.ArgAbi.instantiateListForDecls,
+    Trusted.Rustc.V2026_06_01.MirAst.FnAbi.instantiate,
+    dropGenericParams,
+    CapturedMir.instantiate
+  ] <;> decide
+
+/-! ## 12. Signature Predicates over Capture-Shaped Layout Tables: Pointer Fields, Captured Field Layouts, Unrecorded Pointee Layouts & the Monomorphic Signature Guard -/
+
+/-- `struct Cursor<'a> { buf: &'a [u8], pos: usize }` as interned by
+`anneal-rustc-capture` (`fieldLayouts` in source field order). -/
+@[reducible]
+def rcCursorTypeLayout : TypeLayout := {
+  size := { bytes := 24 }
+  align := { bytes := 8 }
+  backendRepr := .memory
+  fields := .arbitrary [{ bytes := 0 }, { bytes := 16 }] [0, 1]
+  variants := .single 0
+  isUninhabited := false
+  fieldLayouts := [2, 0]
+}
+
+/-- `NonNull<u8> { pointer: *const u8 }`: the nonzero niche lives on the struct
+layout, while the captured field layout is the nullable `*const u8`. -/
+@[reducible]
+def rcNonNullU8TypeLayout : TypeLayout := {
+  size := { bytes := 8 }
+  align := { bytes := 8 }
+  backendRepr :=
+    .scalar (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 })
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .single 0
+  isUninhabited := false
+  fieldLayouts := [3]
+}
+
+/-- `struct Usercopy { a: usize, b: usize }` with captured field layouts. -/
+@[reducible]
+def rcUsercopyTypeLayout : TypeLayout := {
+  size := { bytes := 16 }
+  align := { bytes := 8 }
+  backendRepr := .scalarPair
+    (.initialized (.int 64 false) { start := 0, end_ := 18446744073709551615 })
+    (.initialized (.int 64 false) { start := 0, end_ := 18446744073709551615 })
+  fields := .arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1]
+  variants := .single 0
+  isUninhabited := false
+  fieldLayouts := [0, 0]
+}
+
+/-- `&dyn core::fmt::Debug`: a non-null data pointer and a non-null vtable
+pointer. -/
+@[reducible]
+def rcWideDynTypeLayout : TypeLayout := {
+  size := { bytes := 16 }
+  align := { bytes := 8 }
+  backendRepr := .scalarPair
+    (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 })
+    (.initialized (.pointer 0) { start := 1, end_ := 18446744073709551615 })
+  fields := .arbitrary [{ bytes := 0 }, { bytes := 8 }] [0, 1]
+  variants := .single 0
+  isUninhabited := false
+}
+
+/-- `Option<bool>`, whose `None` variant occupies the bool niche value `2`. -/
+@[reducible]
+def rcOptionBoolTypeLayout : TypeLayout := {
+  size := { bytes := 1 }
+  align := { bytes := 1 }
+  backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 2 })
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .multiple
+    (.initialized (.int 8 false) { start := 0, end_ := 2 })
+    0
+    [.arbitrary [] [], .arbitrary [{ bytes := 0 }] [0]]
+  isUninhabited := false
+}
+
+/-- `enum Tagged<T> { Data(u8, T), Empty }` at `T = bool`, with an explicit
+`u8` tag. -/
+@[reducible]
+def rcTaggedBoolTypeLayout : TypeLayout := {
+  size := { bytes := 3 }
+  align := { bytes := 1 }
+  backendRepr := .memory
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .multiple
+    (.initialized (.int 8 false) { start := 0, end_ := 1 })
+    0
+    [.arbitrary [{ bytes := 1 }, { bytes := 2 }] [0, 1], .arbitrary [] []]
+  isUninhabited := false
+}
+
+/-- `ControlFlow<u8, bool>`: `Continue(bool)` is variant `0` and `Break(u8)` is
+variant `1`, the reverse of the type-argument order. -/
+@[reducible]
+def rcControlFlowU8BoolTypeLayout : TypeLayout := {
+  size := { bytes := 2 }
+  align := { bytes := 1 }
+  backendRepr := .scalarPair
+    (.initialized (.int 8 false) { start := 0, end_ := 1 })
+    (.initialized (.int 8 false) { start := 0, end_ := 255 })
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .multiple
+    (.initialized (.int 8 false) { start := 0, end_ := 1 })
+    0
+    [.arbitrary [{ bytes := 1 }] [0], .arbitrary [{ bytes := 1 }] [0]]
+  isUninhabited := false
+}
+
+/-- `struct TaggedStruct<T> { tag: u8, val: T }` at `T = bool` without captured
+`fieldLayouts` (e.g. after layout instantiation or beyond the capture recursion
+depth): its `ScalarPair` `backendRepr` validates `tag: u8` (`0..=255`) and
+`val: bool` (`0..=1`) instead of mistyping field `0` positionally as `T = bool`. -/
+@[reducible]
+def rcTaggedStructBoolTypeLayout : TypeLayout := {
+  size := { bytes := 2 }
+  align := { bytes := 1 }
+  backendRepr := .scalarPair
+    (.initialized (.int 8 false) { start := 0, end_ := 255 })
+    (.initialized (.int 8 false) { start := 0, end_ := 1 })
+  fields := .arbitrary [{ bytes := 0 }, { bytes := 1 }] [0, 1]
+  variants := .single 0
+  isUninhabited := false
+}
+
+/-- `Cell<u32>` without captured `fieldLayouts`: its only field is an
+`UnsafeCell<u32>`, not a `u32`. -/
+@[reducible]
+def rcCellU32TypeLayout : TypeLayout := {
+  size := { bytes := 4 }
+  align := { bytes := 4 }
+  backendRepr := .scalar (.initialized (.int 32 false) { start := 0, end_ := 4294967295 })
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .single 0
+  isUninhabited := false
+}
+
+/-- `UnsafeCell<bool>` without captured `fieldLayouts`: its only field is a
+`bool`. -/
+@[reducible]
+def rcUnsafeCellBoolTypeLayout : TypeLayout := {
+  size := { bytes := 1 }
+  align := { bytes := 1 }
+  backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 1 })
+  fields := .arbitrary [{ bytes := 0 }] [0]
+  variants := .single 0
+  isUninhabited := false
+}
+
+/-- `struct Reordered { a: u8, b: u32 }` without captured `fieldLayouts`: rustc
+places `b` at offset `0`, so the first `ScalarPair` component is `b`. -/
+@[reducible]
+def rcReorderedTypeLayout : TypeLayout := {
+  size := { bytes := 8 }
+  align := { bytes := 4 }
+  backendRepr := .scalarPair
+    (.initialized (.int 32 false) { start := 0, end_ := 4294967295 })
+    (.initialized (.int 8 false) { start := 0, end_ := 255 })
+  fields := .arbitrary [{ bytes := 4 }, { bytes := 0 }] [1, 0]
+  variants := .single 0
+  isUninhabited := false
+}
+
+/-- Deduplicated layout table shaped like `anneal-rustc-capture` output: no
+pointee layout is interned next to the shared thin-pointer slot `1`. -/
+@[reducible]
+def rcLayoutTable : LayoutTable := {
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [
+    sigUsizeTypeLayout,           -- 0: usize
+    sigThinPtrTypeLayout,         -- 1: &Usercopy (shared by every thin reference)
+    sigWideSliceTypeLayout,       -- 2: &[u8]
+    sigRawPtrTypeLayout,          -- 3: *const u8
+    rcCursorTypeLayout,           -- 4: Cursor<'_>
+    rcNonNullU8TypeLayout,        -- 5: NonNull<u8>
+    rcUsercopyTypeLayout,         -- 6: Usercopy
+    rcWideDynTypeLayout,          -- 7: &dyn Debug / &mut dyn Debug
+    rcOptionBoolTypeLayout,       -- 8: Option<bool>
+    rcTaggedBoolTypeLayout,       -- 9: Tagged<bool>
+    rcControlFlowU8BoolTypeLayout, -- 10: ControlFlow<u8, bool>
+    rcTaggedStructBoolTypeLayout,  -- 11: TaggedStruct<bool> (without fieldLayouts)
+    rcCellU32TypeLayout,           -- 12: Cell<u32> (without fieldLayouts)
+    rcUnsafeCellBoolTypeLayout,    -- 13: UnsafeCell<bool> (without fieldLayouts)
+    rcReorderedTypeLayout          -- 14: Reordered (without fieldLayouts)
+  ]
+}
+
+@[reducible]
+def mkRcBody (argTys : List Ty) (retTy : Ty) (extraLocals : List Ty := []) :
+    CapturedMir := {
+  defPath := "demo::rc_suite"
+  argCount := argTys.length
+  localDecls :=
+    mkDecl .mut retTy ::
+      List.append (argTys.map (mkDecl .not)) (extraLocals.map (mkDecl .mut))
+  basicBlocks := []
+  phase := .runtimePostCleanup
+  role := .subject
+  fnAbi := defaultU32FnAbi
+  layouts := rcLayoutTable
+  allocations := []
+}
+
+@[reducible]
+def rcMem : Memory := {
+  emptyMemory with
+  globals := [
+    { allocId := 10
+      bytes := [some 1, some 2, some 3, some 4]
+      relocations := []
+      align := { bytes := 1 }
+      mutability := .not }
+  ]
+  borrows := [
+    { tag := 20
+      targetLocal := 0
+      targetProjection := []
+      perm := .frozen
+      rangeOffset := 0
+      rangeLen := 16 },
+    { tag := 22
+      targetLocal := 0
+      targetProjection := []
+      perm := .disabled
+      rangeOffset := 0
+      rangeLen := 16 },
+    { tag := 23
+      targetLocal := 1
+      targetProjection := []
+      perm := .frozen
+      rangeOffset := 0
+      rangeLen := 8 },
+    { tag := 24
+      targetLocal := 0
+      targetProjection := [.field 1 { kind := .uint .usize, layoutIdx := 0 }]
+      perm := .frozen
+      rangeOffset := 8
+      rangeLen := 8 },
+    -- Projection-governed sub-place borrows, as `Rvalue.ref` creates them
+    -- (`&usercopy.b` resolves; field `5` does not exist).
+    { tag := 25
+      targetLocal := 0
+      targetProjection := [.field 1 { kind := .uint .usize, layoutIdx := 0 }]
+      perm := .frozen },
+    { tag := 26
+      targetLocal := 0
+      targetProjection := [.field 5 { kind := .uint .usize, layoutIdx := 0 }]
+      perm := .frozen },
+    { tag := 27
+      targetLocal := 0
+      targetProjection := [.subslice 1 2 false]
+      perm := .frozen }
+  ]
+  callerLocals := [
+    .init (.aggregate 0 [.scalar ⟨1, 8⟩, .scalar ⟨2, 8⟩]),
+    .init (.aggregate 0 [.scalar ⟨1, 8⟩])
+  ]
+}
+
+@[reducible]
+def rcUsizeTy : Ty := { kind := .uint .usize, layoutIdx := 0 }
+
+@[reducible]
+def rcRefUsercopyTy : Ty :=
+  { kind := .ref .not (.adt "usercopy::Usercopy" []), layoutIdx := 1 }
+
+@[reducible]
+def rcUsercopyTy : Ty := { kind := .adt "usercopy::Usercopy" [], layoutIdx := 6 }
+
+/--
+Kernel-checked signature validation over a capture-shaped layout table:
+1. Struct fields of pointer type (`Cursor { buf: &[u8], .. }`) validate against
+   their pointer `ScalarLayout` and its `WrappingRange` (null `buf` rejected).
+2. Captured field layouts are authoritative over type arguments:
+   `NonNull<u8>`'s field is a `*const u8`, and the struct-level nonzero niche
+   rejects a null pointer.
+3. A `&Usercopy` receiver whose pointee layout is not recorded must point into
+   a live borrow with compatible permission and within `[rangeOffset, rangeOffset + rangeLen]`
+   (dangling, `.disabled`, and before-`rangeOffset` references are rejected), and when
+   a `Usercopy` local records the layout, the borrowed caller value is validated against it.
+-/
+theorem example_capture_shaped_signature_predicates :
+    argsMatchSignature
+      (mkRcBody [{ kind := .adt "demo::Cursor" [], layoutIdx := 4 }] rcUsizeTy)
+      [.aggregate 0 [.aggregate 0 [.ptr ⟨10, 0⟩ 8, .scalar ⟨4, 8⟩], .scalar ⟨0, 8⟩]]
+      rcMem ∧
+    ¬ argsMatchSignature
+      (mkRcBody [{ kind := .adt "demo::Cursor" [], layoutIdx := 4 }] rcUsizeTy)
+      [.aggregate 0 [.aggregate 0 [.scalar ⟨0, 8⟩, .scalar ⟨4, 8⟩], .scalar ⟨0, 8⟩]]
+      rcMem ∧
+    argsMatchSignature
+      (mkRcBody
+        [{ kind := .adt "core::ptr::non_null::NonNull" [.uint .u8], layoutIdx := 5 }]
+        rcUsizeTy)
+      [.aggregate 0 [.ptr ⟨10, 0⟩ 8]]
+      rcMem ∧
+    ¬ argsMatchSignature
+      (mkRcBody
+        [{ kind := .adt "core::ptr::non_null::NonNull" [.uint .u8], layoutIdx := 5 }]
+        rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨0, 8⟩]]
+      rcMem ∧
+    argsMatchSignature (mkRcBody [rcRefUsercopyTy] rcUsizeTy) [.ptr ⟨20, 0⟩ 8] rcMem ∧
+    argsMatchSignature (mkRcBody [rcRefUsercopyTy] rcUsizeTy) [.ptr ⟨24, 8⟩ 8] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefUsercopyTy] rcUsizeTy) [.ptr ⟨24, 0⟩ 8] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefUsercopyTy] rcUsizeTy) [.ptr ⟨99, 0⟩ 8] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefUsercopyTy] rcUsizeTy) [.ptr ⟨22, 0⟩ 8] rcMem ∧
+    argsMatchSignature
+      (mkRcBody [rcRefUsercopyTy] rcUsizeTy [rcUsercopyTy]) [.ptr ⟨20, 0⟩ 8] rcMem ∧
+    ¬ argsMatchSignature
+      (mkRcBody [rcRefUsercopyTy] rcUsizeTy [rcUsercopyTy]) [.ptr ⟨23, 0⟩ 8] rcMem ∧
+    ¬ argsMatchSignature
+      (mkRcBody [rcRefUsercopyTy] rcUsizeTy [rcUsercopyTy]) [.ptr ⟨20, 8⟩ 8] rcMem := by
+  set_option linter.unusedSimpArgs false in
+  simp [
+    emptyMemory,
+    rcMem,
+    rcLayoutTable,
+    mkRcBody,
+    rcUsizeTy,
+    rcRefUsercopyTy,
+    rcUsercopyTy,
+    rcCursorTypeLayout,
+    rcNonNullU8TypeLayout,
+    rcUsercopyTypeLayout,
+    sigUsizeTypeLayout,
+    sigThinPtrTypeLayout,
+    sigWideSliceTypeLayout,
+    sigRawPtrTypeLayout
+  ] <;> decide
+
+@[reducible]
+def rcRefDynTy (m : Mutability) : Ty :=
+  { kind := .ref m (.dynamic "core::fmt::Debug"), layoutIdx := 7 }
+
+@[reducible]
+def rcRefExternTy : Ty :=
+  { kind := .ref .not (.foreign "demo::Opaque"), layoutIdx := 1 }
+
+/--
+Kernel-checked validation of references whose pointee layout is known only at
+run time, which are inhabited and therefore must not make signature-typed
+preconditions unsatisfiable:
+1. `&dyn Trait` is a wide pointer whose data pointer must be live and whose
+   vtable word must be non-null. Thin pointers, null vtables, dangling data
+   pointers, and `&mut dyn Trait` through a frozen borrow are rejected.
+2. `&ExternType` is a thin pointer that must point into a live allocation.
+-/
+theorem example_dyn_and_extern_reference_signatures :
+    argsMatchSignature (mkRcBody [rcRefDynTy .not] rcUsizeTy)
+      [.aggregate 0 [.ptr ⟨10, 0⟩ 8, .scalar ⟨0x5000, 8⟩]] rcMem ∧
+    argsMatchSignature (mkRcBody [rcRefDynTy .not] rcUsizeTy)
+      [.aggregate 0 [.ptr ⟨20, 0⟩ 8, .scalar ⟨0x5000, 8⟩]] rcMem ∧
+    retMatchesSignature (mkRcBody [] (rcRefDynTy .not))
+      (.aggregate 0 [.ptr ⟨10, 0⟩ 8, .scalar ⟨0x5000, 8⟩]) rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefDynTy .not] rcUsizeTy)
+      [.aggregate 0 [.ptr ⟨10, 0⟩ 8, .scalar ⟨0, 8⟩]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefDynTy .not] rcUsizeTy)
+      [.aggregate 0 [.ptr ⟨99, 0⟩ 8, .scalar ⟨0x5000, 8⟩]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefDynTy .not] rcUsizeTy)
+      [.ptr ⟨10, 0⟩ 8] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefDynTy .mut] rcUsizeTy)
+      [.aggregate 0 [.ptr ⟨20, 0⟩ 8, .scalar ⟨0x5000, 8⟩]] rcMem ∧
+    argsMatchSignature (mkRcBody [rcRefExternTy] rcUsizeTy) [.ptr ⟨10, 0⟩ 8] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefExternTy] rcUsizeTy) [.ptr ⟨99, 0⟩ 8] rcMem := by
+  set_option linter.unusedSimpArgs false in
+  simp [
+    emptyMemory,
+    rcMem,
+    rcLayoutTable,
+    mkRcBody,
+    rcUsizeTy,
+    rcRefDynTy,
+    rcRefExternTy,
+    rcCursorTypeLayout,
+    rcNonNullU8TypeLayout,
+    rcUsercopyTypeLayout,
+    rcWideDynTypeLayout,
+    sigUsizeTypeLayout,
+    sigThinPtrTypeLayout,
+    sigWideSliceTypeLayout,
+    sigRawPtrTypeLayout
+  ] <;> decide
+
+@[reducible]
+def rcOptionBoolTy : Ty :=
+  { kind := .adt "core::option::Option" [.bool], layoutIdx := 8 }
+
+@[reducible]
+def rcTaggedBoolTy : Ty := { kind := .adt "demo::Tagged" [.bool], layoutIdx := 9 }
+
+@[reducible]
+def rcControlFlowU8BoolTy : Ty :=
+  { kind := .adt "core::ops::control_flow::ControlFlow" [.uint .u8, .bool],
+    layoutIdx := 10 }
+
+@[reducible]
+def rcTaggedStructBoolTy : Ty :=
+  { kind := .adt "demo::TaggedStruct" [.bool], layoutIdx := 11 }
+
+/--
+Kernel-checked typing of multi-variant enum payloads and single-variant generic
+structs without captured `fieldLayouts`:
+1. `Option<T>` and `Result<T, E>` payloads are exactly their type arguments, so
+   `Some(2)` is rejected as an `Option<bool>`.
+2. Other generic enums are checked structurally, because their payload types
+   need not follow their type arguments: `Tagged<bool>::Data(200, true)` has a
+   `u8` field, and `ControlFlow<u8, bool>::Break(200)` is variant `1` although
+   `u8` is the first type argument. Variant indices and payload arity are still
+   checked.
+3. Single-variant generic structs without captured `fieldLayouts` (other than
+   standard-library single-type wrappers `Range`/`ManuallyDrop`/`UnsafeCell`/`Cell`)
+   validate against `parentLayout.backendRepr` rather than positional `adtArgs`, so
+   `TaggedStruct<bool> { tag: 200, val: true }` is accepted and `val = 2` is rejected.
+-/
+theorem example_generic_enum_payload_signatures :
+    retMatchesSignature (mkRcBody [] rcOptionBoolTy)
+      (.aggregate 1 [.scalar ⟨1, 1⟩]) rcMem ∧
+    retMatchesSignature (mkRcBody [] rcOptionBoolTy) (.aggregate 0 []) rcMem ∧
+    ¬ retMatchesSignature (mkRcBody [] rcOptionBoolTy)
+      (.aggregate 1 [.scalar ⟨2, 1⟩]) rcMem ∧
+    argsMatchSignature (mkRcBody [rcTaggedBoolTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨200, 1⟩, .scalar ⟨1, 1⟩]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcTaggedBoolTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨200, 1⟩]] rcMem ∧
+    argsMatchSignature (mkRcBody [rcControlFlowU8BoolTy] rcUsizeTy)
+      [.aggregate 1 [.scalar ⟨200, 1⟩]] rcMem ∧
+    argsMatchSignature (mkRcBody [rcControlFlowU8BoolTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨1, 1⟩]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcControlFlowU8BoolTy] rcUsizeTy)
+      [.aggregate 2 [.scalar ⟨200, 1⟩]] rcMem ∧
+    argsMatchSignature (mkRcBody [rcTaggedStructBoolTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨200, 1⟩, .scalar ⟨1, 1⟩]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcTaggedStructBoolTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨200, 1⟩, .scalar ⟨2, 1⟩]] rcMem := by
+  set_option linter.unusedSimpArgs false in
+  simp [
+    emptyMemory,
+    rcMem,
+    rcLayoutTable,
+    mkRcBody,
+    rcUsizeTy,
+    rcOptionBoolTy,
+    rcTaggedBoolTy,
+    rcControlFlowU8BoolTy,
+    rcTaggedStructBoolTy,
+    rcCursorTypeLayout,
+    rcNonNullU8TypeLayout,
+    rcUsercopyTypeLayout,
+    rcWideDynTypeLayout,
+    rcOptionBoolTypeLayout,
+    rcTaggedBoolTypeLayout,
+    rcControlFlowU8BoolTypeLayout,
+    rcTaggedStructBoolTypeLayout,
+    sigUsizeTypeLayout,
+    sigThinPtrTypeLayout,
+    sigWideSliceTypeLayout,
+    sigRawPtrTypeLayout
+  ] <;> decide
+
+@[reducible]
+def rcCellU32Ty : Ty := { kind := .adt "core::cell::Cell" [.uint .u32], layoutIdx := 12 }
+
+@[reducible]
+def rcUnsafeCellBoolTy : Ty :=
+  { kind := .adt "core::cell::UnsafeCell" [.bool], layoutIdx := 13 }
+
+@[reducible]
+def rcReorderedTy : Ty := { kind := .adt "demo::Reordered" [], layoutIdx := 14 }
+
+@[reducible]
+def rcRefUsizeTy : Ty := { kind := .ref .not (.uint .usize), layoutIdx := 1 }
+
+@[reducible]
+def rcRefOpaqueTy : Ty := { kind := .ref .not (.adt "demo::Opaque" []), layoutIdx := 1 }
+
+@[reducible]
+def rcRefSliceUsizeTy : Ty := { kind := .ref .not (.slice (.uint .usize)), layoutIdx := 2 }
+
+/--
+Kernel-checked validation of aggregates without captured field layouts and of
+references to borrowed sub-places:
+1. `Cell<u32>` holds an `UnsafeCell<u32>`, not a `u32`, so its field is checked
+   against the `u32` scalar after unwrapping the newtype; `UnsafeCell<T>` holds
+   a `T` and is typed by its type argument.
+2. `struct Reordered { a: u8, b: u32 }` places `b` at offset `0`, so `b` is
+   checked against the first `ScalarPair` component and `a` against the second.
+3. Borrowing the sub-place `usercopy.b` records the projection `[.field 1]`, and
+   borrowing a subslice records `[.subslice 1 2 false]`. The projected caller
+   value is validated against a known pointee or slice element type, a pointee
+   of unrecorded layout only requires the projection to resolve, and an
+   unresolvable projection or oversized subslice length is rejected.
+-/
+theorem example_layoutless_fields_and_subplace_borrows :
+    argsMatchSignature (mkRcBody [rcCellU32Ty] rcUsizeTy)
+      [.aggregate 0 [.aggregate 0 [.scalar ⟨5, 4⟩]]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcCellU32Ty] rcUsizeTy)
+      [.aggregate 0 [.aggregate 0 [.scalar ⟨5, 1⟩]]] rcMem ∧
+    argsMatchSignature (mkRcBody [rcUnsafeCellBoolTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨1, 1⟩]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcUnsafeCellBoolTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨2, 1⟩]] rcMem ∧
+    argsMatchSignature (mkRcBody [rcReorderedTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨5, 1⟩, .scalar ⟨70000, 4⟩]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcReorderedTy] rcUsizeTy)
+      [.aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨70000, 4⟩]] rcMem ∧
+    argsMatchSignature (mkRcBody [rcRefUsizeTy] rcUsizeTy) [.ptr ⟨25, 0⟩ 8] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefUsizeTy] rcUsizeTy) [.ptr ⟨26, 0⟩ 8] rcMem ∧
+    argsMatchSignature (mkRcBody [rcRefOpaqueTy] rcUsizeTy) [.ptr ⟨25, 0⟩ 8] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefOpaqueTy] rcUsizeTy) [.ptr ⟨26, 0⟩ 8] rcMem ∧
+    argsMatchSignature (mkRcBody [rcRefSliceUsizeTy] rcUsizeTy)
+      [.aggregate 0 [.ptr ⟨27, 0⟩ 8, .scalar ⟨1, 8⟩]] rcMem ∧
+    ¬ argsMatchSignature (mkRcBody [rcRefSliceUsizeTy] rcUsizeTy)
+      [.aggregate 0 [.ptr ⟨27, 0⟩ 8, .scalar ⟨2, 8⟩]] rcMem := by
+  set_option linter.unusedSimpArgs false in
+  simp [
+    emptyMemory,
+    rcMem,
+    rcLayoutTable,
+    mkRcBody,
+    rcUsizeTy,
+    rcCellU32Ty,
+    rcUnsafeCellBoolTy,
+    rcReorderedTy,
+    rcRefUsizeTy,
+    rcRefOpaqueTy,
+    rcRefSliceUsizeTy,
+    rcCellU32TypeLayout,
+    rcUnsafeCellBoolTypeLayout,
+    rcReorderedTypeLayout,
+    readProjectedValue,
+    extractSubslice,
+    takeValues,
+    dropValues,
+    Trusted.Sequence.get?,
+    Trusted.Sequence.length,
+    sigUsizeTypeLayout,
+    sigThinPtrTypeLayout,
+    sigWideSliceTypeLayout
+  ] <;> decide
+
+/--
+The monomorphic signature guard emitted beside `statefulClaim`, `totalClaim`,
+`modularClaim`, and `ubExceptionClaim` certificates rejects generic bodies and
+unlowered signature types, and accepts monomorphic and instantiated bodies
+(including the `&dyn Trait` signature validated above).
+-/
+theorem example_signature_monomorphic_guard :
+    signatureIsMonomorphic
+        (mkRcBody [{ kind := .adt "demo::Cursor" [], layoutIdx := 4 }] rcUsizeTy) =
+      true ∧
+    signatureIsMonomorphic (mkRcBody [rcRefDynTy .not] rcUsizeTy) = true ∧
+    signatureIsMonomorphic polySwapPairMirBody = false ∧
+    signatureIsMonomorphic polySwapPairU32MirBody = true ∧
+    signatureIsMonomorphic
+        (mkRcBody [{ kind := .other "T", layoutIdx := 0 }] rcUsizeTy) =
+      false := by
+  decide
 
 end AnnealExamples.MirVerification

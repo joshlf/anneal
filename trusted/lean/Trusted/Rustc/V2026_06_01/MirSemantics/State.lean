@@ -192,15 +192,19 @@ structure BorrowEntry : Type where
 
 /--
 Saved caller activation record pushed onto `Memory.callStack` when executing a
-non-diverging `TerminatorKind.call` and popped by `TerminatorKind.return_`.
+`TerminatorKind.call` and popped by `TerminatorKind.return_` or stack unwinding
+(`applyUnwindAction` on `.continue_` / `TerminatorKind.unwindResume`).
 
 Snapshots the caller's active lifetime protectors so that protectors activated
 via `RetagKind.fnEntry` during the callee frame are deactivated upon
-`TerminatorKind.return_`.
+`TerminatorKind.return_` or unwind, records `returnUnwind : UnwindAction` to
+dispatch when the callee unwinds into this caller frame, and records
+`isDiverging : Bool` (`true` when `target = .none`) so returning normally from a
+diverging call faults with `MirStepNode.fail .ub`.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L812-L818>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L812-L853>
 
 > "/// Returns from the function.
 > ///
@@ -208,22 +212,38 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 > /// Returning very likely at least assigns the value currently in the return
 > /// place (`_0`) to the place specified in the associated `Call` terminator
 > /// in the calling function, as if assigned via `dest = move _0`.
-> Return,"
+> Return,
+> ...
+> Call {
+>     func: Operand<'tcx>,
+>     args: Box<[Spanned<Operand<'tcx>>]>,
+>     destination: Place<'tcx>,
+>     target: Option<BasicBlock>,
+>     unwind: UnwindAction,
+>     call_source: CallSource,
+>     fn_span: Span,
+> },"
 -/
 structure SavedCallerFrame : Type where
-  /-- Caller `CapturedMir` body to restore on `TerminatorKind.return_`. -/
+  /-- Caller `CapturedMir` body to restore on `TerminatorKind.return_` or unwind. -/
   callerBody : CapturedMir
   /-- Caller `StackFrame` after evaluating the call's argument operands. -/
   frame : StackFrame
   /-- Caller destination `Place` receiving the callee's `_0` return value. -/
   destination : Place
-  /-- Caller basic block index jumped to after writing `destination`. -/
-  returnTarget : BasicBlockIdx
+  /-- Caller basic block index jumped to after writing `destination` when
+      `isDiverging == false`. -/
+  returnTarget : BasicBlockIdx := 0
   /-- Optional caller lifetime protector identifier preserved across the call. -/
   callerProtector : Option Nat := .none
   /-- Snapshot of active lifetime protectors prior to entering the callee frame,
-      restored on `TerminatorKind.return_`. -/
+      restored on `TerminatorKind.return_` or unwind. -/
   calleeProtectors : List Nat := .nil
+  /-- Unwind action to apply in the caller frame when the callee unwinds. -/
+  returnUnwind : UnwindAction := .continue_
+  /-- True when pushed by a diverging call (`target = .none`), where returning
+      normally via `TerminatorKind.return_` is undefined behavior. -/
+  isDiverging : Bool := false
 
 /--
 Reified function-pointer table entry in `Memory.fnPtrs`, modeling

@@ -1123,7 +1123,7 @@ theorem verified :
       evalRvalueFast,
       evalOperandFast, evalConstValue,
       evalScalarBinOp, evalUnaryNot,
-      operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
+      operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
       intCastTargetBytes, shiftLeftBits, shiftRightUnsignedBits, scalarPow2_eight,
       scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
       mul_1_8, mul_2_8, mul_4_8, mul_8_8, mul_0_2, mul_1_2, mul_2_2, mul_3_2,

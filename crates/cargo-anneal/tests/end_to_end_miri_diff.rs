@@ -107,7 +107,7 @@ fn miri_diff_manifest_validation_rejects_stale_bugs_and_bad_paths() {
         .iter()
         .filter(|t| t.known_anneal_bug.is_some())
         .count();
-    assert_eq!(bug_count, 14);
+    assert_eq!(bug_count, 12);
 
     // A stale `known_anneal_bug` whose `observed_anneal_tag` equals `miri_verdict`
     // must be rejected at parse time.
@@ -174,12 +174,12 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
 
     let report = run_miri_diff_suite(&config).expect("74-test Miri differential suite must pass");
     assert_eq!(report.total_tests, 74);
-    assert_eq!(report.verified_pass_count, 24);
+    assert_eq!(report.verified_pass_count, 26);
     assert_eq!(report.verified_panic_count, 9);
     assert_eq!(report.verified_strict_ub_count, 27);
-    assert_eq!(report.ratcheted_known_bug_count, 14);
-    // 24 pass + 9 panic + 1 helper (`helper_add_ten`) = 34 certificate modules
-    assert_eq!(report.audited_certificate_modules.len(), 34);
+    assert_eq!(report.ratcheted_known_bug_count, 12);
+    // 26 pass + 9 panic + 1 helper (`helper_add_ten`) = 36 certificate modules
+    assert_eq!(report.audited_certificate_modules.len(), 36);
 
     let summary = render_miri_diff_report(&report);
     assert!(summary.contains("Total corpus tests:              74"));

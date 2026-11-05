@@ -221,7 +221,7 @@ theorem verifyByDWLP
     (h_dwlp :
       ∀ args : List Value,
         c.pre args →
-        DWLP mirDefaultWP (mirCallTree c.body args)
+        DWLP mirDefaultWP (mirCallTreeWithCallees c.body args c.callees)
           (fun out _ =>
             ∀ retVal mem', out = .normal (retVal, mem') → c.post args retVal)
           PUnit.unit) :
@@ -237,11 +237,30 @@ theorem verifyMirBounded
     (h_wp :
       ∀ args : List Value,
         c.pre args →
-        wpMirBounded fuel c.body (initMachineState c.body args)
+        wpMirBounded fuel c.body
+          (initMachineStateWithCallees c.body args c.callees)
           (fun out =>
             ∀ retVal mem', out = .normal (retVal, mem') → c.post args retVal)) :
     VerificationResult c :=
   verifyByDWLP c (fun args h_pre => dwlp_cofix_of_wpCoalBounded (h_wp args h_pre))
+
+/-- Prove `MirBoolPredicateHoldsWithCallees specBody callees args` from `DWP mirDefaultWP`. -/
+theorem mirBoolPredicateHoldsWithCallees_of_dwp
+    (specBody : CapturedMir) (callees : List CapturedMir) (args : List Value)
+    (h_dwp :
+      DWP mirDefaultWP (mirCallTreeWithCallees specBody args callees)
+        (fun out _ =>
+          ∀ retVal mem',
+            out = .normal (retVal, mem') →
+            retVal = .scalar { bits := 1, sizeBytes := 1 })
+        PUnit.unit) :
+    MirBoolPredicateHoldsWithCallees specBody callees args :=
+  (verifyByDWLP
+    { body := specBody
+      pre := (· = args)
+      post := fun _ ret => ret = .scalar { bits := 1, sizeBytes := 1 }
+      callees := callees }
+    (fun _ h_eq => h_eq ▸ h_dwp.toDWLP)).proof
 
 /-- Prove `MirBoolPredicateHolds specBody args` from `DWP mirDefaultWP`. -/
 theorem mirBoolPredicateHolds_of_dwp
@@ -254,11 +273,24 @@ theorem mirBoolPredicateHolds_of_dwp
             retVal = .scalar { bits := 1, sizeBytes := 1 })
         PUnit.unit) :
     MirBoolPredicateHolds specBody args :=
-  (verifyByDWLP
-    { body := specBody
-      pre := (· = args)
-      post := fun _ ret => ret = .scalar { bits := 1, sizeBytes := 1 } }
-    (fun _ h_eq => h_eq ▸ h_dwp.toDWLP)).proof
+  mirBoolPredicateHoldsWithCallees_of_dwp specBody .nil args h_dwp
+
+/-- Prove `MirBoolPredicateHoldsWithCallees specBody callees args` from `wpMirBounded`. -/
+theorem mirBoolPredicateHoldsWithCallees_of_bounded
+    (fuel : Nat)
+    (specBody : CapturedMir)
+    (callees : List CapturedMir)
+    (args : List Value)
+    (h_wp :
+      wpMirBounded fuel specBody
+        (initMachineStateWithCallees specBody args callees)
+        (fun out =>
+          ∀ retVal mem',
+            out = .normal (retVal, mem') →
+            retVal = .scalar { bits := 1, sizeBytes := 1 })) :
+    MirBoolPredicateHoldsWithCallees specBody callees args :=
+  mirBoolPredicateHoldsWithCallees_of_dwp
+    specBody callees args (dwp_cofix_of_wpCoalBounded fuel h_wp)
 
 /-- Prove `MirBoolPredicateHolds specBody args` from `wpMirBounded`. -/
 theorem mirBoolPredicateHolds_of_bounded
@@ -270,7 +302,7 @@ theorem mirBoolPredicateHolds_of_bounded
             out = .normal (retVal, mem') →
             retVal = .scalar { bits := 1, sizeBytes := 1 })) :
     MirBoolPredicateHolds specBody args :=
-  mirBoolPredicateHolds_of_dwp specBody args (dwp_cofix_of_wpCoalBounded fuel h_wp)
+  mirBoolPredicateHoldsWithCallees_of_bounded fuel specBody .nil args h_wp
 
 /-- Prove a stateful `StatefulVerificationResult c` from `DWLP mirDefaultWP`. -/
 theorem verifyStatefulByDWLP
@@ -278,7 +310,7 @@ theorem verifyStatefulByDWLP
     (h_dwlp :
       ∀ args mem,
         c.pre args mem →
-        DWLP mirDefaultWP (mirStatefulTree c.body args mem)
+        DWLP mirDefaultWP (mirStatefulTreeWithCallees c.body args mem c.callees)
           (fun out _ =>
             ∀ retVal mem',
               out = .normal (retVal, mem') → c.post args mem retVal mem')
@@ -295,7 +327,8 @@ theorem verifyStatefulMirBounded
     (h_wp :
       ∀ args mem,
         c.pre args mem →
-        wpMirBounded fuel c.body (initMachineStateWithMemory c.body args mem)
+        wpMirBounded fuel c.body
+          (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
           (fun out =>
             ∀ retVal mem',
               out = .normal (retVal, mem') → c.post args mem retVal mem')) :
@@ -309,7 +342,7 @@ theorem verifyTraceByDWLP
     (h_dwlp :
       ∀ args mem,
         c.pre args mem →
-        DWLP mirTraceWP (mirStatefulTree c.body args mem)
+        DWLP mirTraceWP (mirStatefulTreeWithCallees c.body args mem c.callees)
           (fun out tr => c.post args mem tr out) []) :
     TraceVerificationResult c := by
   refine ⟨fun args mem h_pre => ?_⟩
@@ -322,7 +355,8 @@ theorem verifyTraceMirBounded
     (h_wp :
       ∀ args mem,
         c.pre args mem →
-        wpMirTraceBounded fuel c.body (initMachineStateWithMemory c.body args mem)
+        wpMirTraceBounded fuel c.body
+          (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
           (fun tr out => c.post args mem tr out)) :
     TraceVerificationResult c :=
   verifyTraceByDWLP c
@@ -334,7 +368,7 @@ theorem verifyTotalByDWP
     (h_dwp :
       ∀ args mem,
         c.pre args mem →
-        DWP mirDefaultWP (mirStatefulTree c.body args mem)
+        DWP mirDefaultWP (mirStatefulTreeWithCallees c.body args mem c.callees)
           (fun out _ =>
             ∃ retVal mem',
               out = .normal (retVal, mem') ∧ c.post args mem retVal mem')
@@ -348,7 +382,8 @@ theorem verifyTotalMirBounded
     (h_wp :
       ∀ args mem,
         c.pre args mem →
-        wpMirBounded fuel c.body (initMachineStateWithMemory c.body args mem)
+        wpMirBounded fuel c.body
+          (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
           (fun out =>
             ∃ retVal mem',
               out = .normal (retVal, mem') ∧ c.post args mem retVal mem')) :
@@ -379,6 +414,38 @@ private theorem handleMirExternalCalls_links_modularWP
   | .inr (.inr (.call req)), Q, .unit, h_wp => h_env req Q h_wp.1 h_wp.2
 
 /--
+Prove a `ModularVerificationResult` with linked `callees` against
+`envSatisfiesContract C` from `DWLP (mirModularWP C)` by linking
+`handleMirExternalCalls` via `dwlp_interp`.
+-/
+theorem verifyModularWithCalleesByDWLP
+    (C : CallContract MirCallReq (fun _ => MirCallAns))
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (h_dwlp :
+      ∀ args mem,
+        pre args mem →
+        DWLP (mirModularWP C)
+          (mirStatefulTreeWithCallees body args mem callees)
+          (fun out _ =>
+            ∀ retVal mem',
+              out = .normal (retVal, mem') → post args mem retVal mem')
+          PUnit.unit) :
+    ModularVerificationResult
+      { body, envAssumed := envSatisfiesContract C, pre, post, callees } := by
+  refine ⟨fun h h_env args mem h_pre => ?_⟩
+  have h_interp :=
+    dwlp_interp
+      (handleMirExternalCalls h)
+      (handleMirExternalCalls_links_modularWP C h h_env)
+      (h_dwlp args mem h_pre)
+  have h_adeq := dwlp_pure_adequacy h_interp
+  exact ⟨h_adeq.1, fun outPair h_ret _ retVal mem' h_out =>
+    h_adeq.2 outPair.1 outPair.2 h_ret retVal mem' h_out⟩
+
+/--
 Prove a `ModularVerificationResult` against `envSatisfiesContract C` from
 `DWLP (mirModularWP C)` by linking `handleMirExternalCalls` via `dwlp_interp`.
 -/
@@ -396,16 +463,29 @@ theorem verifyModularByDWLP
               out = .normal (retVal, mem') → post args mem retVal mem')
           PUnit.unit) :
     ModularVerificationResult
-      { body, envAssumed := envSatisfiesContract C, pre, post } := by
-  refine ⟨fun h h_env args mem h_pre => ?_⟩
-  have h_interp :=
-    dwlp_interp
-      (handleMirExternalCalls h)
-      (handleMirExternalCalls_links_modularWP C h h_env)
-      (h_dwlp args mem h_pre)
-  have h_adeq := dwlp_pure_adequacy h_interp
-  exact ⟨h_adeq.1, fun outPair h_ret _ retVal mem' h_out =>
-    h_adeq.2 outPair.1 outPair.2 h_ret retVal mem' h_out⟩
+      { body, envAssumed := envSatisfiesContract C, pre, post } :=
+  verifyModularWithCalleesByDWLP C body .nil pre post h_dwlp
+
+/-- Prove a `ModularVerificationResult` with linked `callees` from `wpMirModularBounded`. -/
+theorem verifyModularWithCalleesMirBounded
+    (C : CallContract MirCallReq (fun _ => MirCallAns))
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ args mem,
+        pre args mem →
+        wpMirModularBounded fuel C body
+          (initMachineStateWithMemoryAndCallees body args mem callees)
+          (fun out =>
+            ∀ retVal mem',
+              out = .normal (retVal, mem') → post args mem retVal mem')) :
+    ModularVerificationResult
+      { body, envAssumed := envSatisfiesContract C, pre, post, callees } :=
+  verifyModularWithCalleesByDWLP C body callees pre post
+    (fun args mem h_pre => dwlp_cofix_of_wpCoalBounded (h_wp args mem h_pre))
 
 /-- Prove a `ModularVerificationResult` from `wpMirModularBounded`. -/
 theorem verifyModularMirBounded
@@ -424,8 +504,7 @@ theorem verifyModularMirBounded
               out = .normal (retVal, mem') → post args mem retVal mem')) :
     ModularVerificationResult
       { body, envAssumed := envSatisfiesContract C, pre, post } :=
-  verifyModularByDWLP C body pre post
-    (fun args mem h_pre => dwlp_cofix_of_wpCoalBounded (h_wp args mem h_pre))
+  verifyModularWithCalleesMirBounded C body .nil pre post fuel h_wp
 
 private theorem dwlp_ubWaived_reaches
     {t u : ITree MirEffect MirOutcome} {tr : List (Event MirEffect)}
@@ -474,7 +553,7 @@ theorem verifyUbExceptionByDWLP
       ∀ args mem,
         c.pre args mem →
         c.strictSafetyPre args mem →
-        DWLP mirDefaultWP (mirStatefulTree c.body args mem)
+        DWLP mirDefaultWP (mirStatefulTreeWithCallees c.body args mem c.callees)
           (fun out _ =>
             ∀ retVal mem',
               out = .normal (retVal, mem') → c.post args mem retVal mem')
@@ -482,7 +561,7 @@ theorem verifyUbExceptionByDWLP
     (h_waived :
       ∀ args mem,
         c.pre args mem →
-        DWLP mirUbWaivedWP (mirStatefulTree c.body args mem)
+        DWLP mirUbWaivedWP (mirStatefulTreeWithCallees c.body args mem c.callees)
           (fun out _ =>
             ∀ retVal mem',
               out = .normal (retVal, mem') → c.post args mem retVal mem')
@@ -508,14 +587,16 @@ theorem verifyUbExceptionMirBounded
       ∀ args mem,
         c.pre args mem →
         c.strictSafetyPre args mem →
-        wpMirBounded fuel c.body (initMachineStateWithMemory c.body args mem)
+        wpMirBounded fuel c.body
+          (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
           (fun out =>
             ∀ retVal mem',
               out = .normal (retVal, mem') → c.post args mem retVal mem'))
     (h_waived :
       ∀ args mem,
         c.pre args mem →
-        wpMirUbWaivedBounded fuel c.body (initMachineStateWithMemory c.body args mem)
+        wpMirUbWaivedBounded fuel c.body
+          (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
           (fun out =>
             ∀ retVal mem',
               out = .normal (retVal, mem') → c.post args mem retVal mem')) :
@@ -583,6 +664,54 @@ theorem envSatisfiesContract_of_holdsOn
     (fun tr ans h_r => h_post_imp ans (h_ret tr ans h_r))
 
 /--
+Convert `envSatisfiesContract C.toCallContract h` into the trusted rely
+predicate `C.holdsOn h`.
+-/
+theorem holdsOn_of_envSatisfiesContract
+    (C : MirCallContract) (h : ExternalCallHandler)
+    (h_env : envSatisfiesContract C.toCallContract h) :
+    C.holdsOn h := by
+  intro req h_pre
+  have h_dwlp :
+      DWLP mirClosedWP (h req) (fun ans _ => C.post req ans) PUnit.unit :=
+    h_env req (fun ans _ => C.post req ans) h_pre (fun _ hp => hp)
+  exact dwlp_pure_adequacy h_dwlp
+
+/--
+Exact equivalence between `C.holdsOn h` and
+`envSatisfiesContract C.toCallContract h`.
+-/
+theorem holdsOn_iff_envSatisfiesContract
+    (C : MirCallContract) (h : ExternalCallHandler) :
+    C.holdsOn h ↔ envSatisfiesContract C.toCallContract h :=
+  ⟨envSatisfiesContract_of_holdsOn C h, holdsOn_of_envSatisfiesContract C h⟩
+
+/--
+Prove a `ModularVerificationResult` with linked `callees` against `C.holdsOn`
+(`MirCallContract`) from `DWLP (mirModularWP C.toCallContract)`.
+-/
+theorem verifyModularContractWithCalleesByDWLP
+    (C : MirCallContract)
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (h_dwlp :
+      ∀ args mem,
+        pre args mem →
+        DWLP (mirModularWP C.toCallContract)
+          (mirStatefulTreeWithCallees body args mem callees)
+          (fun out _ =>
+            ∀ retVal mem',
+              out = .normal (retVal, mem') → post args mem retVal mem')
+          PUnit.unit) :
+    ModularVerificationResult
+      { body, envAssumed := C.holdsOn, pre, post, callees } :=
+  ⟨fun h h_on =>
+    (verifyModularWithCalleesByDWLP C.toCallContract body callees pre post h_dwlp).proof
+      h (envSatisfiesContract_of_holdsOn C h h_on)⟩
+
+/--
 Prove a `ModularVerificationResult` against `C.holdsOn` (`MirCallContract`) from
 `DWLP (mirModularWP C.toCallContract)`.
 -/
@@ -601,9 +730,31 @@ theorem verifyModularContractByDWLP
           PUnit.unit) :
     ModularVerificationResult
       { body, envAssumed := C.holdsOn, pre, post } :=
-  ⟨fun h h_on =>
-    (verifyModularByDWLP C.toCallContract body pre post h_dwlp).proof
-      h (envSatisfiesContract_of_holdsOn C h h_on)⟩
+  verifyModularContractWithCalleesByDWLP C body .nil pre post h_dwlp
+
+/--
+Prove a `ModularVerificationResult` with linked `callees` against `C.holdsOn`
+(`MirCallContract`) from fuel-bounded `wpMirModularBounded`.
+-/
+theorem verifyModularContractWithCalleesMirBounded
+    (C : MirCallContract)
+    (body : CapturedMir)
+    (callees : List CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (fuel : Nat)
+    (h_wp :
+      ∀ args mem,
+        pre args mem →
+        wpMirModularBounded fuel C.toCallContract body
+          (initMachineStateWithMemoryAndCallees body args mem callees)
+          (fun out =>
+            ∀ retVal mem',
+              out = .normal (retVal, mem') → post args mem retVal mem')) :
+    ModularVerificationResult
+      { body, envAssumed := C.holdsOn, pre, post, callees } :=
+  verifyModularContractWithCalleesByDWLP C body callees pre post
+    (fun args mem h_pre => dwlp_cofix_of_wpCoalBounded (h_wp args mem h_pre))
 
 /--
 Prove a `ModularVerificationResult` against `C.holdsOn` (`MirCallContract`) from
@@ -625,8 +776,7 @@ theorem verifyModularContractMirBounded
               out = .normal (retVal, mem') → post args mem retVal mem')) :
     ModularVerificationResult
       { body, envAssumed := C.holdsOn, pre, post } :=
-  verifyModularContractByDWLP C body pre post
-    (fun args mem h_pre => dwlp_cofix_of_wpCoalBounded (h_wp args mem h_pre))
+  verifyModularContractWithCalleesMirBounded C body .nil pre post fuel h_wp
 
 /-! ## 3. Horizontal Caller–Callee Linking via `ITree.interp` -/
 
@@ -761,6 +911,964 @@ theorem linkVerifiedMirCallee
       C calleeBody fallback h_callee h_fallback)
 
 /--
+Initial `MachineState` for executing `calleeBody` inside an isolated
+`ExternalCallHandler` frame (`MirCallE`), populating `callees := calleeCallees`
+and `traitImpls := calleeBody.traitImpls ++ callerMem.traitImpls` (so generic
+callees can dispatch trait methods registered in either the callee or the caller
+crate, deduplicated by `upsertMatchingTraitImpl`) while resetting
+`callStack := .nil`, `activeCallee := .none`, and `activeProtectors := .nil` so
+`calleeBody` executes as the root of its own interaction tree even when
+`callerMem` is symbolic or inside a nested caller stack frame.
+-/
+@[reducible, simp]
+def enterExternalCalleeState
+    (calleeBody : CapturedMir)
+    (args : List Value)
+    (callerMem : Memory)
+    (calleeCallees : List CapturedMir := .nil) : MachineState :=
+  initMachineStateWithMemory calleeBody args
+    { callerMem with
+      callees := calleeCallees
+      traitImpls := calleeBody.traitImpls ++ callerMem.traitImpls
+      callStack := .nil
+      activeCallee := .none
+      activeProtectors := .nil }
+
+/--
+Coinductive interaction tree for executing `calleeBody` inside an isolated
+`ExternalCallHandler` frame (`enterExternalCalleeState`).
+-/
+def mirExternalCalleeTree
+    (calleeBody : CapturedMir)
+    (args : List Value)
+    (callerMem : Memory)
+    (calleeCallees : List CapturedMir := .nil) :
+    ITree MirEffect MirOutcome :=
+  mirTree calleeBody
+    (enterExternalCalleeState calleeBody args callerMem calleeCallees)
+
+/--
+Restore the caller's call-frame and trait-table fields (`callees`, `traitImpls`,
+`callStack`, `activeCallee`, `activeProtectors`) onto the post-call memory
+`after` returned by an external callee, while preserving all heap, borrow,
+global, and `fnPtrs` updates produced by the callee.
+-/
+@[reducible, simp]
+def restoreCallerMemoryFrame (before after : Memory) : Memory :=
+  { after with
+    callees := before.callees
+    traitImpls := before.traitImpls
+    callStack := before.callStack
+    activeCallee := before.activeCallee
+    activeProtectors := before.activeProtectors }
+
+/--
+Stronger call-frame preservation predicate that preserves both
+`callFramePreserved` (`callees`, `callStack`, `activeCallee`,
+`activeProtectors`, and `fnPtrs` suffix) and `traitImpls`.
+-/
+@[reducible, simp]
+def callFrameAndTraitsPreserved (before after : Memory) : Prop :=
+  And (callFramePreserved before after) (after.traitImpls = before.traitImpls)
+
+theorem callFramePreserved_restoreCallerMemoryFrame
+    (before after : Memory)
+    (fresh : List FnPtrEntry)
+    (h_fnPtrs : after.fnPtrs = List.append fresh before.fnPtrs) :
+    callFramePreserved before (restoreCallerMemoryFrame before after) :=
+  ⟨rfl, rfl, rfl, rfl, fresh, h_fnPtrs⟩
+
+@[simp]
+theorem callFramePreserved_restoreCallerMemoryFrame_same_fnPtrs
+    (before after : Memory)
+    (h_fnPtrs : after.fnPtrs = before.fnPtrs) :
+    callFramePreserved before (restoreCallerMemoryFrame before after) :=
+  callFramePreserved_restoreCallerMemoryFrame before after .nil h_fnPtrs
+
+theorem callFrameAndTraitsPreserved_restoreCallerMemoryFrame
+    (before after : Memory)
+    (fresh : List FnPtrEntry)
+    (h_fnPtrs : after.fnPtrs = List.append fresh before.fnPtrs) :
+    callFrameAndTraitsPreserved before (restoreCallerMemoryFrame before after) :=
+  ⟨callFramePreserved_restoreCallerMemoryFrame before after fresh h_fnPtrs, rfl⟩
+
+@[simp]
+theorem callFrameAndTraitsPreserved_restoreCallerMemoryFrame_same_fnPtrs
+    (before after : Memory)
+    (h_fnPtrs : after.fnPtrs = before.fnPtrs) :
+    callFrameAndTraitsPreserved before (restoreCallerMemoryFrame before after) :=
+  callFrameAndTraitsPreserved_restoreCallerMemoryFrame before after .nil h_fnPtrs
+
+/--
+Polymorphic and trait-preserving extension of `externalSpecCallContract` that
+additionally constrains `req.typeArgs = expectedTypeArgs` in `pre` and
+preserves `memAfter.traitImpls = req.memory.traitImpls` (`callFrameAndTraitsPreserved`)
+in `post`, enabling post-call polymorphic and trait-method calls in `c.callees`
+to reduce by WHNF without manual rewrites.
+-/
+def polyExternalSpecCallContract
+    (targetDefPath : DefPath)
+    (expectedTypeArgs : List RigidTy)
+    (sidecarBody : CapturedMir)
+    (extraPre : List Value → Prop := fun _ => True)
+    (extraPost : List Value → Value → Prop := fun _ _ => True) :
+    MirCallContract where
+  pre req :=
+    And (req.defPath = targetDefPath)
+      (And (req.typeArgs = expectedTypeArgs)
+        (And (Trusted.Sequence.length req.args = sidecarBody.argCount)
+          (And (argsMatchCalleeParamTys sidecarBody req.args)
+            (extraPre req.args))))
+  post req ans :=
+    match ans with
+    | .returned retVal memAfter =>
+      And (callFrameAndTraitsPreserved req.memory memAfter)
+        (And (retMatchesCalleeReturnTy sidecarBody retVal)
+          (extraPost req.args retVal))
+    | .panicked memAfter =>
+      match sidecarTargetCanUnwind sidecarBody with
+      | true => callFrameAndTraitsPreserved req.memory memAfter
+      | false => False
+    | .aborted => True
+
+/--
+Convert a linked callee `MirOutcome` into a `MirCallAns` that restores the
+caller's `callees`, `traitImpls`, `callStack`, `activeCallee`, and
+`activeProtectors` from `callerMem`.
+-/
+@[reducible, simp]
+def outcomeToRestoredCallAns (callerMem : Memory) : MirOutcome → MirCallAns
+  | .normal (retVal, mem') =>
+    .returned retVal (restoreCallerMemoryFrame callerMem mem')
+  | .panic => .panicked callerMem
+  | .abort => .aborted
+
+/--
+Wrap a call-free callee tree `t` as an `ITree MirClosedEffect MirCallAns`
+that restores the caller's frame fields from `callerMem` via
+`outcomeToRestoredCallAns`.
+-/
+def closeMirTreeRestoringFrame
+    (callerMem : Memory) (t : ITree MirEffect MirOutcome) :
+    ITree MirClosedEffect MirCallAns :=
+  ITree.interp failUnlinkedCalls t >>= fun out =>
+    pure (outcomeToRestoredCallAns callerMem out)
+
+/-- Lift `DWLP mirNoCallWP` on a call-free callee tree to `closeMirTreeRestoringFrame`. -/
+theorem dwlp_closeMirTreeRestoringFrame
+    {callerMem : Memory} {t : ITree MirEffect MirOutcome}
+    {Q : MirCallAns → PUnit → Prop}
+    (h_dwlp :
+      DWLP mirNoCallWP t
+        (fun out _ => Q (outcomeToRestoredCallAns callerMem out) PUnit.unit)
+        PUnit.unit) :
+    DWLP mirClosedWP (closeMirTreeRestoringFrame callerMem t) Q PUnit.unit := by
+  unfold closeMirTreeRestoringFrame
+  apply DWLP.bind
+  exact DWLP.mono (fun _ _ hq => DWLP.ret hq)
+    (dwlp_interp failUnlinkedCalls failUnlinkedCalls_links_noCallWP h_dwlp)
+
+/--
+Extend a fallback `ExternalCallHandler` by linking calls targeting
+`calleeBody.defPath` to `calleeBody`'s isolated `mirExternalCalleeTree` with its
+own linked helper table `calleeCallees`, restoring the caller's frame fields
+upon return via `closeMirTreeRestoringFrame`.
+-/
+def linkCalleeWithCalleesHandler
+    (calleeBody : CapturedMir)
+    (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler) :
+    ExternalCallHandler :=
+  fun req =>
+    if req.defPath = calleeBody.defPath then
+      closeMirTreeRestoringFrame req.memory
+        (mirExternalCalleeTree calleeBody req.args req.memory calleeCallees)
+    else
+      fallback req
+
+/--
+Resolve and instantiate `calleeBody` for an external call request `req` using
+the caller's `callerLayouts : LayoutTable` and optional `extraTraitImpls` via
+`lookupCallee`, falling back to `calleeBody` when uninstantiated.
+-/
+def instantiateCalleeForReq
+    (calleeBody : CapturedMir)
+    (callerLayouts : LayoutTable)
+    (req : MirCallReq)
+    (extraTraitImpls : List TraitImplEntry := .nil) : CapturedMir :=
+  (lookupCallee [calleeBody] callerLayouts req.defPath req.typeArgs extraTraitImpls).getD calleeBody
+
+/--
+Extend a fallback `ExternalCallHandler` by linking calls targeting
+`calleeBody.defPath` to the monomorphized instance
+`instantiateCalleeForReq calleeBody callerLayouts req extraTraitImpls` in an
+isolated `mirExternalCalleeTree` with linked helper table `calleeCallees`,
+restoring the caller's frame fields upon return.
+-/
+def linkPolyCalleeWithCalleesHandler
+    (calleeBody : CapturedMir)
+    (callerLayouts : LayoutTable)
+    (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (extraTraitImpls : List TraitImplEntry := .nil) :
+    ExternalCallHandler :=
+  fun req =>
+    if req.defPath = calleeBody.defPath then
+      closeMirTreeRestoringFrame req.memory
+        (mirExternalCalleeTree
+          (instantiateCalleeForReq calleeBody callerLayouts req extraTraitImpls)
+          req.args
+          req.memory
+          calleeCallees)
+    else
+      fallback req
+
+/--
+Extend a fallback `ExternalCallHandler` by linking any call request `req`
+(direct generic or trait-method dispatch) that resolves via
+`lookupCallee [calleeBody] callerLayouts req.defPath req.typeArgs extraTraitImpls`
+to `.some instBody`, executing `instBody` in an isolated `mirExternalCalleeTree`
+with `calleeCallees` and restoring the caller's frame fields upon return.
+-/
+def linkTraitOrPolyCalleeWithCalleesHandler
+    (calleeBody : CapturedMir)
+    (callerLayouts : LayoutTable)
+    (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (extraTraitImpls : List TraitImplEntry := .nil) :
+    ExternalCallHandler :=
+  fun req =>
+    match lookupCallee [calleeBody] callerLayouts req.defPath req.typeArgs extraTraitImpls with
+    | .some instBody =>
+      closeMirTreeRestoringFrame req.memory
+        (mirExternalCalleeTree instBody req.args req.memory calleeCallees)
+    | .none =>
+      fallback req
+
+/--
+Horizontal handler-discharge lemma establishing `envSatisfiesContract C` for
+`linkCalleeWithCalleesHandler calleeBody calleeCallees fallback`.
+-/
+theorem envSatisfiesContract_linkCalleeWithCalleesHandler
+    (C : CallContract MirCallReq (fun _ => MirCallAns))
+    (calleeBody : CapturedMir)
+    (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (h_callee :
+      ∀ req : MirCallReq,
+        req.defPath = calleeBody.defPath →
+        C.pre req →
+        DWLP mirNoCallWP
+          (mirExternalCalleeTree calleeBody req.args req.memory calleeCallees)
+          (fun out _ => C.post req (outcomeToRestoredCallAns req.memory out))
+          PUnit.unit)
+    (h_fallback :
+      ∀ (req : MirCallReq) (Q : MirCallAns → PUnit → Prop),
+        req.defPath ≠ calleeBody.defPath →
+        C.pre req →
+        (∀ ans : MirCallAns, C.post req ans → Q ans PUnit.unit) →
+        DWLP mirClosedWP (fallback req) Q PUnit.unit) :
+    envSatisfiesContract C
+      (linkCalleeWithCalleesHandler calleeBody calleeCallees fallback) := by
+  intro req Q h_pre h_post_imp
+  unfold linkCalleeWithCalleesHandler
+  split
+  · next h_eq =>
+    apply dwlp_closeMirTreeRestoringFrame
+    exact DWLP.mono
+      (fun out _ h_cpost => h_post_imp (outcomeToRestoredCallAns req.memory out) h_cpost)
+      (h_callee req h_eq h_pre)
+  · next h_ne =>
+    exact h_fallback req Q h_ne h_pre h_post_imp
+
+/--
+Horizontal handler-discharge lemma establishing `envSatisfiesContract C` for
+polymorphic `linkPolyCalleeWithCalleesHandler`.
+-/
+theorem envSatisfiesContract_linkPolyCalleeWithCalleesHandler
+    (C : CallContract MirCallReq (fun _ => MirCallAns))
+    (calleeBody : CapturedMir)
+    (callerLayouts : LayoutTable)
+    (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (extraTraitImpls : List TraitImplEntry := .nil)
+    (h_callee :
+      ∀ req : MirCallReq,
+        req.defPath = calleeBody.defPath →
+        C.pre req →
+        DWLP mirNoCallWP
+          (mirExternalCalleeTree
+            (instantiateCalleeForReq calleeBody callerLayouts req extraTraitImpls)
+            req.args
+            req.memory
+            calleeCallees)
+          (fun out _ => C.post req (outcomeToRestoredCallAns req.memory out))
+          PUnit.unit)
+    (h_fallback :
+      ∀ (req : MirCallReq) (Q : MirCallAns → PUnit → Prop),
+        req.defPath ≠ calleeBody.defPath →
+        C.pre req →
+        (∀ ans : MirCallAns, C.post req ans → Q ans PUnit.unit) →
+        DWLP mirClosedWP (fallback req) Q PUnit.unit) :
+    envSatisfiesContract C
+      (linkPolyCalleeWithCalleesHandler
+        calleeBody callerLayouts calleeCallees fallback extraTraitImpls) := by
+  intro req Q h_pre h_post_imp
+  unfold linkPolyCalleeWithCalleesHandler
+  split
+  · next h_eq =>
+    apply dwlp_closeMirTreeRestoringFrame
+    exact DWLP.mono
+      (fun out _ h_cpost => h_post_imp (outcomeToRestoredCallAns req.memory out) h_cpost)
+      (h_callee req h_eq h_pre)
+  · next h_ne =>
+    exact h_fallback req Q h_ne h_pre h_post_imp
+
+/--
+Horizontal handler-discharge lemma establishing `envSatisfiesContract C` for
+trait-or-polymorphic `linkTraitOrPolyCalleeWithCalleesHandler`.
+-/
+theorem envSatisfiesContract_linkTraitOrPolyCalleeWithCalleesHandler
+    (C : CallContract MirCallReq (fun _ => MirCallAns))
+    (calleeBody : CapturedMir)
+    (callerLayouts : LayoutTable)
+    (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (extraTraitImpls : List TraitImplEntry := .nil)
+    (h_callee :
+      ∀ (req : MirCallReq) (instBody : CapturedMir),
+        lookupCallee [calleeBody] callerLayouts req.defPath req.typeArgs extraTraitImpls =
+          .some instBody →
+        C.pre req →
+        DWLP mirNoCallWP
+          (mirExternalCalleeTree instBody req.args req.memory calleeCallees)
+          (fun out _ => C.post req (outcomeToRestoredCallAns req.memory out))
+          PUnit.unit)
+    (h_fallback :
+      ∀ (req : MirCallReq) (Q : MirCallAns → PUnit → Prop),
+        lookupCallee [calleeBody] callerLayouts req.defPath req.typeArgs extraTraitImpls =
+          .none →
+        C.pre req →
+        (∀ ans : MirCallAns, C.post req ans → Q ans PUnit.unit) →
+        DWLP mirClosedWP (fallback req) Q PUnit.unit) :
+    envSatisfiesContract C
+      (linkTraitOrPolyCalleeWithCalleesHandler
+        calleeBody callerLayouts calleeCallees fallback extraTraitImpls) := by
+  intro req Q h_pre h_post_imp
+  unfold linkTraitOrPolyCalleeWithCalleesHandler
+  cases h_lk : lookupCallee [calleeBody] callerLayouts req.defPath req.typeArgs extraTraitImpls with
+  | some instBody =>
+    apply dwlp_closeMirTreeRestoringFrame
+    exact DWLP.mono
+      (fun out _ h_cpost => h_post_imp (outcomeToRestoredCallAns req.memory out) h_cpost)
+      (h_callee req instBody h_lk h_pre)
+  | none =>
+    exact h_fallback req Q h_lk h_pre h_post_imp
+
+/--
+Establish `C.holdsOn (linkCalleeWithCalleesHandler calleeBody calleeCallees fallback)`
+from `DWLP mirNoCallWP` on `calleeBody` with `calleeCallees` and `C.holdsOn fallback`
+on other paths.
+-/
+theorem holdsOn_linkCalleeWithCalleesHandler
+    (C : MirCallContract)
+    (calleeBody : CapturedMir)
+    (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (h_callee :
+      ∀ req : MirCallReq,
+        req.defPath = calleeBody.defPath →
+        C.pre req →
+        DWLP mirNoCallWP
+          (mirExternalCalleeTree calleeBody req.args req.memory calleeCallees)
+          (fun out _ => C.post req (outcomeToRestoredCallAns req.memory out))
+          PUnit.unit)
+    (h_fallback :
+      ∀ req : MirCallReq,
+        req.defPath ≠ calleeBody.defPath →
+        C.pre req →
+        TreeSafe (fallback req) ∧
+        ∀ tr ans, ReachesRet (fallback req) tr ans → C.post req ans) :
+    C.holdsOn
+      (linkCalleeWithCalleesHandler calleeBody calleeCallees fallback) := by
+  apply holdsOn_of_envSatisfiesContract
+  refine envSatisfiesContract_linkCalleeWithCalleesHandler
+    C.toCallContract calleeBody calleeCallees fallback h_callee ?_
+  intro req Q h_ne h_pre h_post_imp
+  rcases h_fallback req h_ne h_pre with ⟨h_safe, h_ret⟩
+  exact dwlp_mirClosedWP_of_treeSafe_reachesRet h_safe
+    (fun tr ans h_r => h_post_imp ans (h_ret tr ans h_r))
+
+/--
+Establish `C.holdsOn (linkPolyCalleeWithCalleesHandler ...)` from `DWLP mirNoCallWP`
+on `instantiateCalleeForReq` with `calleeCallees` and `C.holdsOn fallback` on
+other paths.
+-/
+theorem holdsOn_linkPolyCalleeWithCalleesHandler
+    (C : MirCallContract)
+    (calleeBody : CapturedMir)
+    (callerLayouts : LayoutTable)
+    (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (extraTraitImpls : List TraitImplEntry := .nil)
+    (h_callee :
+      ∀ req : MirCallReq,
+        req.defPath = calleeBody.defPath →
+        C.pre req →
+        DWLP mirNoCallWP
+          (mirExternalCalleeTree
+            (instantiateCalleeForReq calleeBody callerLayouts req extraTraitImpls)
+            req.args
+            req.memory
+            calleeCallees)
+          (fun out _ => C.post req (outcomeToRestoredCallAns req.memory out))
+          PUnit.unit)
+    (h_fallback :
+      ∀ req : MirCallReq,
+        req.defPath ≠ calleeBody.defPath →
+        C.pre req →
+        TreeSafe (fallback req) ∧
+        ∀ tr ans, ReachesRet (fallback req) tr ans → C.post req ans) :
+    C.holdsOn
+      (linkPolyCalleeWithCalleesHandler
+        calleeBody callerLayouts calleeCallees fallback extraTraitImpls) := by
+  apply holdsOn_of_envSatisfiesContract
+  refine envSatisfiesContract_linkPolyCalleeWithCalleesHandler
+    C.toCallContract calleeBody callerLayouts calleeCallees fallback extraTraitImpls h_callee ?_
+  intro req Q h_ne h_pre h_post_imp
+  rcases h_fallback req h_ne h_pre with ⟨h_safe, h_ret⟩
+  exact dwlp_mirClosedWP_of_treeSafe_reachesRet h_safe
+    (fun tr ans h_r => h_post_imp ans (h_ret tr ans h_r))
+
+/--
+Establish `C.holdsOn (linkTraitOrPolyCalleeWithCalleesHandler ...)` from
+`DWLP mirNoCallWP` on resolved `instBody` instances and `C.holdsOn fallback`
+when `lookupCallee` returns `.none`.
+-/
+theorem holdsOn_linkTraitOrPolyCalleeWithCalleesHandler
+    (C : MirCallContract)
+    (calleeBody : CapturedMir)
+    (callerLayouts : LayoutTable)
+    (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (extraTraitImpls : List TraitImplEntry := .nil)
+    (h_callee :
+      ∀ (req : MirCallReq) (instBody : CapturedMir),
+        lookupCallee [calleeBody] callerLayouts req.defPath req.typeArgs extraTraitImpls =
+          .some instBody →
+        C.pre req →
+        DWLP mirNoCallWP
+          (mirExternalCalleeTree instBody req.args req.memory calleeCallees)
+          (fun out _ => C.post req (outcomeToRestoredCallAns req.memory out))
+          PUnit.unit)
+    (h_fallback :
+      ∀ req : MirCallReq,
+        lookupCallee [calleeBody] callerLayouts req.defPath req.typeArgs extraTraitImpls =
+          .none →
+        C.pre req →
+        TreeSafe (fallback req) ∧
+        ∀ tr ans, ReachesRet (fallback req) tr ans → C.post req ans) :
+    C.holdsOn
+      (linkTraitOrPolyCalleeWithCalleesHandler
+        calleeBody callerLayouts calleeCallees fallback extraTraitImpls) := by
+  apply holdsOn_of_envSatisfiesContract
+  refine envSatisfiesContract_linkTraitOrPolyCalleeWithCalleesHandler
+    C.toCallContract calleeBody callerLayouts calleeCallees fallback extraTraitImpls h_callee ?_
+  intro req Q h_none h_pre h_post_imp
+  rcases h_fallback req h_none h_pre with ⟨h_safe, h_ret⟩
+  exact dwlp_mirClosedWP_of_treeSafe_reachesRet h_safe
+    (fun tr ans h_r => h_post_imp ans (h_ret tr ans h_r))
+
+/--
+Horizontal caller–callee linking theorem with non-empty `callerCallees` and
+`calleeCallees` under `C.holdsOn`: combines a modularly verified caller
+`ModularVerificationResult` with a verified callee `calleeBody` (stepping
+through `calleeCallees` in an isolated frame and restoring the caller's frame
+fields upon return) to obtain closed-effect partial refinement on
+`mirHandledTreeWithCallees`.
+-/
+theorem linkVerifiedContractMirCalleeWithCallees
+    {C : MirCallContract}
+    {callerBody : CapturedMir}
+    {callerCallees : List CapturedMir}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (h_caller :
+      ModularVerificationResult
+        { body := callerBody
+          envAssumed := C.holdsOn
+          pre := pre
+          post := post
+          callees := callerCallees })
+    (calleeBody : CapturedMir)
+    (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (h_callee :
+      ∀ req : MirCallReq,
+        req.defPath = calleeBody.defPath →
+        C.pre req →
+        DWLP mirNoCallWP
+          (mirExternalCalleeTree calleeBody req.args req.memory calleeCallees)
+          (fun out _ => C.post req (outcomeToRestoredCallAns req.memory out))
+          PUnit.unit)
+    (h_fallback :
+      ∀ req : MirCallReq,
+        req.defPath ≠ calleeBody.defPath →
+        C.pre req →
+        TreeSafe (fallback req) ∧
+        ∀ tr ans, ReachesRet (fallback req) tr ans → C.post req ans) :
+    (fun args mem =>
+      (mirHandledTreeWithCallees callerBody args mem callerCallees
+        (linkCalleeWithCalleesHandler calleeBody calleeCallees fallback)).toPartial) ≤
+      MirClosedStatefulContractSpec pre pre post :=
+  h_caller.proof
+    (linkCalleeWithCalleesHandler calleeBody calleeCallees fallback)
+    (holdsOn_linkCalleeWithCalleesHandler
+      C calleeBody calleeCallees fallback h_callee h_fallback)
+
+/--
+Polymorphic horizontal caller–callee linking theorem with `callerCallees` and
+`calleeCallees` under `C.holdsOn`: links each call request `req` targeting
+`calleeBody.defPath` to the monomorphized body
+`instantiateCalleeForReq calleeBody callerBody.layouts req callerBody.traitImpls`.
+-/
+theorem linkVerifiedPolyContractMirCalleeWithCallees
+    {C : MirCallContract}
+    {callerBody : CapturedMir}
+    {callerCallees : List CapturedMir}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (h_caller :
+      ModularVerificationResult
+        { body := callerBody
+          envAssumed := C.holdsOn
+          pre := pre
+          post := post
+          callees := callerCallees })
+    (calleeBody : CapturedMir)
+    (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (h_callee :
+      ∀ req : MirCallReq,
+        req.defPath = calleeBody.defPath →
+        C.pre req →
+        DWLP mirNoCallWP
+          (mirExternalCalleeTree
+            (instantiateCalleeForReq calleeBody callerBody.layouts req callerBody.traitImpls)
+            req.args
+            req.memory
+            calleeCallees)
+          (fun out _ => C.post req (outcomeToRestoredCallAns req.memory out))
+          PUnit.unit)
+    (h_fallback :
+      ∀ req : MirCallReq,
+        req.defPath ≠ calleeBody.defPath →
+        C.pre req →
+        TreeSafe (fallback req) ∧
+        ∀ tr ans, ReachesRet (fallback req) tr ans → C.post req ans) :
+    (fun args mem =>
+      (mirHandledTreeWithCallees callerBody args mem callerCallees
+        (linkPolyCalleeWithCalleesHandler
+          calleeBody callerBody.layouts calleeCallees fallback callerBody.traitImpls)).toPartial) ≤
+      MirClosedStatefulContractSpec pre pre post :=
+  h_caller.proof
+    (linkPolyCalleeWithCalleesHandler
+      calleeBody callerBody.layouts calleeCallees fallback callerBody.traitImpls)
+    (holdsOn_linkPolyCalleeWithCalleesHandler
+      C calleeBody callerBody.layouts calleeCallees fallback callerBody.traitImpls
+      h_callee h_fallback)
+
+/--
+Trait-or-polymorphic horizontal caller–callee linking theorem with
+`callerCallees` and `calleeCallees` under `C.holdsOn`.
+-/
+theorem linkVerifiedTraitOrPolyContractMirCalleeWithCallees
+    {C : MirCallContract}
+    {callerBody : CapturedMir}
+    {callerCallees : List CapturedMir}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (h_caller :
+      ModularVerificationResult
+        { body := callerBody
+          envAssumed := C.holdsOn
+          pre := pre
+          post := post
+          callees := callerCallees })
+    (calleeBody : CapturedMir)
+    (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (h_callee :
+      ∀ (req : MirCallReq) (instBody : CapturedMir),
+        lookupCallee [calleeBody] callerBody.layouts req.defPath req.typeArgs callerBody.traitImpls =
+          .some instBody →
+        C.pre req →
+        DWLP mirNoCallWP
+          (mirExternalCalleeTree instBody req.args req.memory calleeCallees)
+          (fun out _ => C.post req (outcomeToRestoredCallAns req.memory out))
+          PUnit.unit)
+    (h_fallback :
+      ∀ req : MirCallReq,
+        lookupCallee [calleeBody] callerBody.layouts req.defPath req.typeArgs callerBody.traitImpls =
+          .none →
+        C.pre req →
+        TreeSafe (fallback req) ∧
+        ∀ tr ans, ReachesRet (fallback req) tr ans → C.post req ans) :
+    (fun args mem =>
+      (mirHandledTreeWithCallees callerBody args mem callerCallees
+        (linkTraitOrPolyCalleeWithCalleesHandler
+          calleeBody callerBody.layouts calleeCallees fallback callerBody.traitImpls)).toPartial) ≤
+      MirClosedStatefulContractSpec pre pre post :=
+  h_caller.proof
+    (linkTraitOrPolyCalleeWithCalleesHandler
+      calleeBody callerBody.layouts calleeCallees fallback callerBody.traitImpls)
+    (holdsOn_linkTraitOrPolyCalleeWithCalleesHandler
+      C calleeBody callerBody.layouts calleeCallees fallback callerBody.traitImpls
+      h_callee h_fallback)
+
+/--
+Fuel-bounded specialization of `linkVerifiedContractMirCalleeWithCallees` via
+`wpMirNoCallBounded`.
+-/
+theorem linkVerifiedContractMirCalleeWithCalleesBounded
+    {C : MirCallContract}
+    {callerBody : CapturedMir}
+    {callerCallees : List CapturedMir}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (h_caller :
+      ModularVerificationResult
+        { body := callerBody
+          envAssumed := C.holdsOn
+          pre := pre
+          post := post
+          callees := callerCallees })
+    (calleeBody : CapturedMir)
+    (calleeCallees : List CapturedMir)
+    (calleeFuel : Nat)
+    (fallback : ExternalCallHandler)
+    (h_callee :
+      ∀ req : MirCallReq,
+        req.defPath = calleeBody.defPath →
+        C.pre req →
+        wpMirNoCallBounded calleeFuel calleeBody
+          (enterExternalCalleeState
+            calleeBody req.args req.memory calleeCallees)
+          (fun out => C.post req (outcomeToRestoredCallAns req.memory out)))
+    (h_fallback :
+      ∀ req : MirCallReq,
+        req.defPath ≠ calleeBody.defPath →
+        C.pre req →
+        TreeSafe (fallback req) ∧
+        ∀ tr ans, ReachesRet (fallback req) tr ans → C.post req ans) :
+    (fun args mem =>
+      (mirHandledTreeWithCallees callerBody args mem callerCallees
+        (linkCalleeWithCalleesHandler calleeBody calleeCallees fallback)).toPartial) ≤
+      MirClosedStatefulContractSpec pre pre post :=
+  linkVerifiedContractMirCalleeWithCallees
+    h_caller calleeBody calleeCallees fallback
+    (fun req h_eq h_pre =>
+      dwlp_cofix_of_wpCoalBounded (h_callee req h_eq h_pre))
+    h_fallback
+
+/--
+Fuel-bounded specialization of `linkVerifiedPolyContractMirCalleeWithCallees`
+via `wpMirNoCallBounded`.
+-/
+theorem linkVerifiedPolyContractMirCalleeWithCalleesBounded
+    {C : MirCallContract}
+    {callerBody : CapturedMir}
+    {callerCallees : List CapturedMir}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (h_caller :
+      ModularVerificationResult
+        { body := callerBody
+          envAssumed := C.holdsOn
+          pre := pre
+          post := post
+          callees := callerCallees })
+    (calleeBody : CapturedMir)
+    (calleeCallees : List CapturedMir)
+    (calleeFuel : Nat)
+    (fallback : ExternalCallHandler)
+    (h_callee :
+      ∀ req : MirCallReq,
+        req.defPath = calleeBody.defPath →
+        C.pre req →
+        wpMirNoCallBounded calleeFuel
+          (instantiateCalleeForReq calleeBody callerBody.layouts req callerBody.traitImpls)
+          (enterExternalCalleeState
+            (instantiateCalleeForReq calleeBody callerBody.layouts req callerBody.traitImpls)
+            req.args
+            req.memory
+            calleeCallees)
+          (fun out => C.post req (outcomeToRestoredCallAns req.memory out)))
+    (h_fallback :
+      ∀ req : MirCallReq,
+        req.defPath ≠ calleeBody.defPath →
+        C.pre req →
+        TreeSafe (fallback req) ∧
+        ∀ tr ans, ReachesRet (fallback req) tr ans → C.post req ans) :
+    (fun args mem =>
+      (mirHandledTreeWithCallees callerBody args mem callerCallees
+        (linkPolyCalleeWithCalleesHandler
+          calleeBody callerBody.layouts calleeCallees fallback callerBody.traitImpls)).toPartial) ≤
+      MirClosedStatefulContractSpec pre pre post :=
+  linkVerifiedPolyContractMirCalleeWithCallees
+    h_caller calleeBody calleeCallees fallback
+    (fun req h_eq h_pre =>
+      dwlp_cofix_of_wpCoalBounded (h_callee req h_eq h_pre))
+    h_fallback
+
+/--
+Fuel-bounded specialization of `linkVerifiedTraitOrPolyContractMirCalleeWithCallees`
+via `wpMirNoCallBounded`.
+-/
+theorem linkVerifiedTraitOrPolyContractMirCalleeWithCalleesBounded
+    {C : MirCallContract}
+    {callerBody : CapturedMir}
+    {callerCallees : List CapturedMir}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (h_caller :
+      ModularVerificationResult
+        { body := callerBody
+          envAssumed := C.holdsOn
+          pre := pre
+          post := post
+          callees := callerCallees })
+    (calleeBody : CapturedMir)
+    (calleeCallees : List CapturedMir)
+    (calleeFuel : Nat)
+    (fallback : ExternalCallHandler)
+    (h_callee :
+      ∀ (req : MirCallReq) (instBody : CapturedMir),
+        lookupCallee [calleeBody] callerBody.layouts req.defPath req.typeArgs callerBody.traitImpls =
+          .some instBody →
+        C.pre req →
+        wpMirNoCallBounded calleeFuel
+          instBody
+          (enterExternalCalleeState instBody req.args req.memory calleeCallees)
+          (fun out => C.post req (outcomeToRestoredCallAns req.memory out)))
+    (h_fallback :
+      ∀ req : MirCallReq,
+        lookupCallee [calleeBody] callerBody.layouts req.defPath req.typeArgs callerBody.traitImpls =
+          .none →
+        C.pre req →
+        TreeSafe (fallback req) ∧
+        ∀ tr ans, ReachesRet (fallback req) tr ans → C.post req ans) :
+    (fun args mem =>
+      (mirHandledTreeWithCallees callerBody args mem callerCallees
+        (linkTraitOrPolyCalleeWithCalleesHandler
+          calleeBody callerBody.layouts calleeCallees fallback callerBody.traitImpls)).toPartial) ≤
+      MirClosedStatefulContractSpec pre pre post :=
+  linkVerifiedTraitOrPolyContractMirCalleeWithCallees
+    h_caller calleeBody calleeCallees fallback
+    (fun req instBody h_lk h_pre =>
+      dwlp_cofix_of_wpCoalBounded (h_callee req instBody h_lk h_pre))
+    h_fallback
+
+/--
+Extend a fallback `ExternalCallHandler` by linking any call request `req`
+(direct generic or trait-method dispatch) that resolves via
+`lookupCallee calleeTable callerLayouts req.defPath req.typeArgs extraTraitImpls`
+across a multi-callee table `calleeTable : List CapturedMir` to `.some instBody`,
+executing `instBody` in an isolated `mirExternalCalleeTree` with `calleeCallees`
+and restoring the caller's frame fields upon return.
+-/
+def linkCalleeTableWithCalleesHandler
+    (calleeTable : List CapturedMir)
+    (callerLayouts : LayoutTable)
+    (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (extraTraitImpls : List TraitImplEntry := .nil) :
+    ExternalCallHandler :=
+  fun req =>
+    match lookupCallee calleeTable callerLayouts req.defPath req.typeArgs extraTraitImpls with
+    | .some instBody =>
+      closeMirTreeRestoringFrame req.memory
+        (mirExternalCalleeTree instBody req.args req.memory calleeCallees)
+    | .none =>
+      fallback req
+
+/--
+Horizontal handler-discharge lemma establishing `envSatisfiesContract C` for
+multi-callee `linkCalleeTableWithCalleesHandler`.
+-/
+theorem envSatisfiesContract_linkCalleeTableWithCalleesHandler
+    (C : CallContract MirCallReq (fun _ => MirCallAns))
+    (calleeTable : List CapturedMir)
+    (callerLayouts : LayoutTable)
+    (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (extraTraitImpls : List TraitImplEntry := .nil)
+    (h_callee :
+      ∀ (req : MirCallReq) (instBody : CapturedMir),
+        lookupCallee calleeTable callerLayouts req.defPath req.typeArgs extraTraitImpls =
+          .some instBody →
+        C.pre req →
+        DWLP mirNoCallWP
+          (mirExternalCalleeTree instBody req.args req.memory calleeCallees)
+          (fun out _ => C.post req (outcomeToRestoredCallAns req.memory out))
+          PUnit.unit)
+    (h_fallback :
+      ∀ (req : MirCallReq) (Q : MirCallAns → PUnit → Prop),
+        lookupCallee calleeTable callerLayouts req.defPath req.typeArgs extraTraitImpls =
+          .none →
+        C.pre req →
+        (∀ ans : MirCallAns, C.post req ans → Q ans PUnit.unit) →
+        DWLP mirClosedWP (fallback req) Q PUnit.unit) :
+    envSatisfiesContract C
+      (linkCalleeTableWithCalleesHandler
+        calleeTable callerLayouts calleeCallees fallback extraTraitImpls) := by
+  intro req Q h_pre h_post_imp
+  unfold linkCalleeTableWithCalleesHandler
+  cases h_lk : lookupCallee calleeTable callerLayouts req.defPath req.typeArgs extraTraitImpls with
+  | some instBody =>
+    apply dwlp_closeMirTreeRestoringFrame
+    exact DWLP.mono
+      (fun out _ h_cpost => h_post_imp (outcomeToRestoredCallAns req.memory out) h_cpost)
+      (h_callee req instBody h_lk h_pre)
+  | none =>
+    exact h_fallback req Q h_lk h_pre h_post_imp
+
+/--
+Establish `C.holdsOn (linkCalleeTableWithCalleesHandler ...)` from
+`DWLP mirNoCallWP` on resolved `instBody` instances in `calleeTable` and
+`C.holdsOn fallback` when `lookupCallee` returns `.none`.
+-/
+theorem holdsOn_linkCalleeTableWithCalleesHandler
+    (C : MirCallContract)
+    (calleeTable : List CapturedMir)
+    (callerLayouts : LayoutTable)
+    (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (extraTraitImpls : List TraitImplEntry := .nil)
+    (h_callee :
+      ∀ (req : MirCallReq) (instBody : CapturedMir),
+        lookupCallee calleeTable callerLayouts req.defPath req.typeArgs extraTraitImpls =
+          .some instBody →
+        C.pre req →
+        DWLP mirNoCallWP
+          (mirExternalCalleeTree instBody req.args req.memory calleeCallees)
+          (fun out _ => C.post req (outcomeToRestoredCallAns req.memory out))
+          PUnit.unit)
+    (h_fallback :
+      ∀ req : MirCallReq,
+        lookupCallee calleeTable callerLayouts req.defPath req.typeArgs extraTraitImpls =
+          .none →
+        C.pre req →
+        TreeSafe (fallback req) ∧
+        ∀ tr ans, ReachesRet (fallback req) tr ans → C.post req ans) :
+    C.holdsOn
+      (linkCalleeTableWithCalleesHandler
+        calleeTable callerLayouts calleeCallees fallback extraTraitImpls) := by
+  apply holdsOn_of_envSatisfiesContract
+  refine envSatisfiesContract_linkCalleeTableWithCalleesHandler
+    C.toCallContract calleeTable callerLayouts calleeCallees fallback extraTraitImpls h_callee ?_
+  intro req Q h_none h_pre h_post_imp
+  rcases h_fallback req h_none h_pre with ⟨h_safe, h_ret⟩
+  exact dwlp_mirClosedWP_of_treeSafe_reachesRet h_safe
+    (fun tr ans h_r => h_post_imp ans (h_ret tr ans h_r))
+
+/--
+Multi-callee horizontal caller–callee linking theorem with `callerCallees`,
+`calleeTable`, and `calleeCallees` under `C.holdsOn`.
+-/
+theorem linkVerifiedCalleeTableWithCallees
+    {C : MirCallContract}
+    {callerBody : CapturedMir}
+    {callerCallees : List CapturedMir}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (h_caller :
+      ModularVerificationResult
+        { body := callerBody
+          envAssumed := C.holdsOn
+          pre := pre
+          post := post
+          callees := callerCallees })
+    (calleeTable : List CapturedMir)
+    (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (h_callee :
+      ∀ (req : MirCallReq) (instBody : CapturedMir),
+        lookupCallee calleeTable callerBody.layouts req.defPath req.typeArgs callerBody.traitImpls =
+          .some instBody →
+        C.pre req →
+        DWLP mirNoCallWP
+          (mirExternalCalleeTree instBody req.args req.memory calleeCallees)
+          (fun out _ => C.post req (outcomeToRestoredCallAns req.memory out))
+          PUnit.unit)
+    (h_fallback :
+      ∀ req : MirCallReq,
+        lookupCallee calleeTable callerBody.layouts req.defPath req.typeArgs callerBody.traitImpls =
+          .none →
+        C.pre req →
+        TreeSafe (fallback req) ∧
+        ∀ tr ans, ReachesRet (fallback req) tr ans → C.post req ans) :
+    (fun args mem =>
+      (mirHandledTreeWithCallees callerBody args mem callerCallees
+        (linkCalleeTableWithCalleesHandler
+          calleeTable callerBody.layouts calleeCallees fallback callerBody.traitImpls)).toPartial) ≤
+      MirClosedStatefulContractSpec pre pre post :=
+  h_caller.proof
+    (linkCalleeTableWithCalleesHandler
+      calleeTable callerBody.layouts calleeCallees fallback callerBody.traitImpls)
+    (holdsOn_linkCalleeTableWithCalleesHandler
+      C calleeTable callerBody.layouts calleeCallees fallback callerBody.traitImpls
+      h_callee h_fallback)
+
+/--
+Fuel-bounded specialization of `linkVerifiedCalleeTableWithCallees` via
+`wpMirNoCallBounded`.
+-/
+theorem linkVerifiedCalleeTableWithCalleesBounded
+    {C : MirCallContract}
+    {callerBody : CapturedMir}
+    {callerCallees : List CapturedMir}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (h_caller :
+      ModularVerificationResult
+        { body := callerBody
+          envAssumed := C.holdsOn
+          pre := pre
+          post := post
+          callees := callerCallees })
+    (calleeTable : List CapturedMir)
+    (calleeCallees : List CapturedMir)
+    (calleeFuel : Nat)
+    (fallback : ExternalCallHandler)
+    (h_callee :
+      ∀ (req : MirCallReq) (instBody : CapturedMir),
+        lookupCallee calleeTable callerBody.layouts req.defPath req.typeArgs callerBody.traitImpls =
+          .some instBody →
+        C.pre req →
+        wpMirNoCallBounded calleeFuel
+          instBody
+          (enterExternalCalleeState instBody req.args req.memory calleeCallees)
+          (fun out => C.post req (outcomeToRestoredCallAns req.memory out)))
+    (h_fallback :
+      ∀ req : MirCallReq,
+        lookupCallee calleeTable callerBody.layouts req.defPath req.typeArgs callerBody.traitImpls =
+          .none →
+        C.pre req →
+        TreeSafe (fallback req) ∧
+        ∀ tr ans, ReachesRet (fallback req) tr ans → C.post req ans) :
+    (fun args mem =>
+      (mirHandledTreeWithCallees callerBody args mem callerCallees
+        (linkCalleeTableWithCalleesHandler
+          calleeTable callerBody.layouts calleeCallees fallback callerBody.traitImpls)).toPartial) ≤
+      MirClosedStatefulContractSpec pre pre post :=
+  linkVerifiedCalleeTableWithCallees
+    h_caller calleeTable calleeCallees fallback
+    (fun req instBody h_lk h_pre =>
+      dwlp_cofix_of_wpCoalBounded (h_callee req instBody h_lk h_pre))
+    h_fallback
+
+/--
 Idealized UB-exception call handler for a scoped `c : UbExceptionClaim`:
 routes calls matching `c.body.defPath` to a deterministic specification witness
 `excModel req.args req.memory` (isolating callers from the exempted callee's
@@ -792,7 +1900,10 @@ theorem holdsOn_ubExceptionModelHandler
       ∀ args mem,
         c.pre args mem →
         (∀ tr retVal mem',
-          ReachesRet (mirStatefulTree c.body args mem) tr (.normal (retVal, mem')) →
+          ReachesRet
+            (mirStatefulTreeWithCallees c.body args mem c.callees)
+            tr
+            (.normal (retVal, mem')) →
           c.post args mem retVal mem') →
         c.post args mem (excModel args mem).1 (excModel args mem).2) :
     c.callContract.holdsOn (ubExceptionModelHandler c excModel fallback) := by
@@ -806,6 +1917,53 @@ theorem holdsOn_ubExceptionModelHandler
     DWLP.ret ⟨(excModel req.args req.memory).1, (excModel req.args req.memory).2,
       rfl, h_model req.args req.memory h_pre (h_callee.proof.2 req.args req.memory h_pre)⟩
   exact dwlp_pure_adequacy h_dwlp
+
+/--
+Horizontal caller–callee linking theorem with `callerCallees` for a scoped
+UB-exception callee: links a caller verified via `ModularVerificationResult`
+(with `callerCallees`) against `c.callContract.holdsOn` with a callee verified
+via `UbExceptionVerificationResult c`.
+-/
+theorem linkUbExceptionCalleeWithCallees
+    {c : UbExceptionClaim}
+    {callerBody : CapturedMir}
+    {callerCallees : List CapturedMir}
+    {pre : List Value → Memory → Prop}
+    {post : List Value → Memory → Value → Memory → Prop}
+    (h_caller :
+      ModularVerificationResult
+        { body := callerBody
+          envAssumed := c.callContract.holdsOn
+          pre := pre
+          post := post
+          callees := callerCallees })
+    (h_callee : UbExceptionVerificationResult c)
+    (excModel : List Value → Memory → Value × Memory)
+    (fallback : ExternalCallHandler)
+    (h_model :
+      ∀ args mem,
+        c.pre args mem →
+        (∀ tr retVal mem',
+          ReachesRet
+            (mirStatefulTreeWithCallees c.body args mem c.callees)
+            tr
+            (.normal (retVal, mem')) →
+          c.post args mem retVal mem') →
+        c.post args mem (excModel args mem).1 (excModel args mem).2) :
+    ((fun args mem =>
+      (mirHandledTreeWithCallees callerBody args mem callerCallees
+        (ubExceptionModelHandler c excModel fallback)).toPartial) ≤
+      MirClosedStatefulContractSpec pre pre post) ∧
+    MirStatefulContractHoldsWithSafetyAndCallees
+      c.body
+      c.callees
+      (fun args mem => c.pre args mem ∧ c.strictSafetyPre args mem)
+      c.pre
+      c.post :=
+  ⟨h_caller.proof
+    (ubExceptionModelHandler c excModel fallback)
+    (holdsOn_ubExceptionModelHandler h_callee excModel fallback h_model),
+   h_callee.proof.1⟩
 
 /--
 Horizontal caller–callee linking theorem for a scoped UB-exception callee:
@@ -834,22 +1992,23 @@ theorem linkUbExceptionCallee
       ∀ args mem,
         c.pre args mem →
         (∀ tr retVal mem',
-          ReachesRet (mirStatefulTree c.body args mem) tr (.normal (retVal, mem')) →
+          ReachesRet
+            (mirStatefulTreeWithCallees c.body args mem c.callees)
+            tr
+            (.normal (retVal, mem')) →
           c.post args mem retVal mem') →
         c.post args mem (excModel args mem).1 (excModel args mem).2) :
     ((fun args mem =>
       (mirHandledTree callerBody args mem
         (ubExceptionModelHandler c excModel fallback)).toPartial) ≤
       MirClosedStatefulContractSpec pre pre post) ∧
-    MirStatefulContractHoldsWithSafety
+    MirStatefulContractHoldsWithSafetyAndCallees
       c.body
+      c.callees
       (fun args mem => c.pre args mem ∧ c.strictSafetyPre args mem)
       c.pre
       c.post :=
-  ⟨h_caller.proof
-    (ubExceptionModelHandler c excModel fallback)
-    (holdsOn_ubExceptionModelHandler h_callee excModel fallback h_model),
-   h_callee.proof.1⟩
+  linkUbExceptionCalleeWithCallees h_caller h_callee excModel fallback h_model
 
 /-! ## 4. Program-to-Program Behavioral Equivalence & Whole-Crate Rollup -/
 
@@ -965,19 +2124,25 @@ theorem verifyStatefulEquivByWeakRefAndTotal
       ∀ args mem,
         c.pre args mem →
         WeakRef
-          (mirObsErasedStatefulTree c.implBody args mem)
-          (mirObsErasedStatefulTree c.specBody args mem))
+          (mirObsErasedStatefulTreeWithCallees c.implBody args mem c.implCallees)
+          (mirObsErasedStatefulTreeWithCallees c.specBody args mem c.specCallees))
     (h_total :
       ∀ args mem,
         c.pre args mem →
-        DWP mirDefaultWP (mirStatefulTree c.implBody args mem)
+        DWP mirDefaultWP
+          (mirStatefulTreeWithCallees c.implBody args mem c.implCallees)
           (fun out _ =>
             ∃ retVal mem',
               out = .normal (retVal, mem') ∧ c.post args mem retVal mem')
           PUnit.unit) :
     StatefulEquivVerificationResult c :=
   ⟨⟨fun args mem h_pre => WeakRef.toPartial_le (h_ref args mem h_pre),
-    (verifyTotalByDWP { body := c.implBody, pre := c.pre, post := c.post } h_total).proof⟩⟩
+    (verifyTotalByDWP
+      { body := c.implBody
+        pre := c.pre
+        post := c.post
+        callees := c.implCallees }
+      h_total).proof⟩⟩
 
 /--
 Relational pure-model equivalence bridge (`verifyStatefulEquivViaPureModel`):
@@ -995,7 +2160,8 @@ theorem verifyStatefulEquivViaPureModel
     (h_impl :
       ∀ args mem,
         c.pre args mem →
-        DWP mirNoCallWP (mirStatefulTree c.implBody args mem)
+        DWP mirNoCallWP
+          (mirStatefulTreeWithCallees c.implBody args mem c.implCallees)
           (fun out _ =>
             out = .normal (model args mem) ∧
             c.post args mem (model args mem).1 (model args mem).2)
@@ -1003,7 +2169,8 @@ theorem verifyStatefulEquivViaPureModel
     (h_spec :
       ∀ args mem,
         c.pre args mem →
-        DWP mirNoCallWP (mirStatefulTree c.specBody args mem)
+        DWP mirNoCallWP
+          (mirStatefulTreeWithCallees c.specBody args mem c.specCallees)
           (fun out _ => out = .normal (model args mem))
           PUnit.unit) :
     StatefulEquivVerificationResult c := by
@@ -1040,7 +2207,7 @@ theorem verifyStatefulEquivMirBounded
       ∀ args mem,
         c.pre args mem →
         wpMirNoCallBounded implFuel c.implBody
-          (initMachineStateWithMemory c.implBody args mem)
+          (initMachineStateWithMemoryAndCallees c.implBody args mem c.implCallees)
           (fun out =>
             out = .normal (model args mem) ∧
             c.post args mem (model args mem).1 (model args mem).2))
@@ -1048,7 +2215,7 @@ theorem verifyStatefulEquivMirBounded
       ∀ args mem,
         c.pre args mem →
         wpMirNoCallBounded specFuel c.specBody
-          (initMachineStateWithMemory c.specBody args mem)
+          (initMachineStateWithMemoryAndCallees c.specBody args mem c.specCallees)
           (fun out => out = .normal (model args mem))) :
     StatefulEquivVerificationResult c :=
   verifyStatefulEquivViaPureModel c model

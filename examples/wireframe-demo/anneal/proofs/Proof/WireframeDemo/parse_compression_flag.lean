@@ -268,7 +268,7 @@ private def evalRvalueSymTreeFast
           tag := tag
           targetLocal := p.local_
           targetProjection := .nil
-          perm := .frozen
+          perm := sharedBorrowPerm localDecls layouts { local_ := p.local_, projection := .nil }
         }
         let mem' := {
           mem with
@@ -752,6 +752,12 @@ private theorem hold_mirBool_ensures
   rw [wpMirExecSym_eq_gen, wpStartBlock0_eq False ensCtx ensBB0 _ fuel args rfl rfl rfl rfl]
   exact h.val
 
+
+private theorem reqCtx_localDecls : reqCtx.localDecls = Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body.localDecls := rfl
+private theorem reqCtx_layouts : reqCtx.layouts = Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body.layouts := rfl
+private theorem reqCtx_body_layouts : reqCtx.body.layouts = Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body.layouts := rfl
+private theorem reqCtx_phase : reqCtx.body.phase = Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body.phase := rfl
+
 private theorem hold_mirBool_req
     (fuel : Nat) (args : List Value)
     (h : Hold
@@ -838,11 +844,12 @@ private theorem wpReq_imp_zero_or_one (b : Nat) :
           [.scalar { bits := b, sizeBytes := 1 }]).memory) →
     b = 0 ∨ b = 1 := by
   dsimp only [Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body,
+    reqCtx_localDecls, reqCtx_layouts, reqCtx_body_layouts, reqCtx_phase,
     reqBB0, wpBlockLinear, wpBlockStep, evalSymNodeTree,
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
     evalRvalueSymTreeFast,
     evalOperandFast, evalOperandsFast, evalConstValue,
-    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree,
+    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
     evalTerminatorSymTreeFast,
     lookupSwitchTargetTree, applyUnwindAction,
     MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
@@ -853,6 +860,11 @@ private theorem wpReq_imp_zero_or_one (b : Nat) :
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
     invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.layouts,
+    Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.layouts,
+    Mir.WireframeDemo.parse_compression_flag.layouts,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
+    reqCtx, ensCtx, parseCtx,
     mirSafePost,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
@@ -892,7 +904,7 @@ private theorem ensures_holds_one :
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
     evalRvalueSymTreeFast,
     evalOperandFast, evalOperandsFast, evalConstValue,
-    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree,
+    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
     evalTerminatorSymTreeFast,
     lookupSwitchTargetTree, applyUnwindAction,
     MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
@@ -903,6 +915,11 @@ private theorem ensures_holds_one :
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
     invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.layouts,
+    Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.layouts,
+    Mir.WireframeDemo.parse_compression_flag.layouts,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
+    reqCtx, ensCtx, parseCtx,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -924,7 +941,7 @@ private theorem ensures_holds_zero :
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
     evalRvalueSymTreeFast,
     evalOperandFast, evalOperandsFast, evalConstValue,
-    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree,
+    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
     evalTerminatorSymTreeFast,
     lookupSwitchTargetTree, applyUnwindAction,
     MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
@@ -935,6 +952,11 @@ private theorem ensures_holds_zero :
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
     invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.layouts,
+    Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.layouts,
+    Mir.WireframeDemo.parse_compression_flag.layouts,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
+    reqCtx, ensCtx, parseCtx,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1005,13 +1027,16 @@ theorem verified : VerificationResult Obligations.WireframeDemo.parse_compressio
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
     evalRvalueSymTreeFast,
     evalOperandFast, evalOperandsFast, evalConstValue,
-    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree,
+    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
     evalTerminatorSymTreeFast,
     lookupSwitchTargetTree, applyUnwindAction,
     MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
     initMachineState, initLocals, initLocalsAux, emptyMemory,
     readProjectedValue_nil, readProjectedValue_field,
     invalidateConflictingBorrows, mirNormalPost, boolToScalar,
+    Mir.WireframeDemo.parse_compression_flag.layouts,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
+    reqCtx, ensCtx, parseCtx,
     Obligations.WireframeDemo.parse_compression_flag.claim,
     Obligations.WireframeDemo.parse_compression_flag.refineSafeSpec,
     Obligations.WireframeDemo.parse_compression_flag.rustEnsures,
@@ -1047,11 +1072,12 @@ theorem nonVacuousRequires :
   apply Hold.val
   refine hold_mirBool_req 28 _ ?_
   dsimp only [Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body,
+    reqCtx_localDecls, reqCtx_layouts, reqCtx_body_layouts, reqCtx_phase,
     reqBB0, wpBlockLinear, wpBlockStep, evalSymNodeTree,
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
     evalRvalueSymTreeFast,
     evalOperandFast, evalOperandsFast, evalConstValue,
-    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree,
+    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
     evalTerminatorSymTreeFast,
     lookupSwitchTargetTree, applyUnwindAction,
     MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
@@ -1062,6 +1088,11 @@ theorem nonVacuousRequires :
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
     invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+    Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.layouts,
+    Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.layouts,
+    Mir.WireframeDemo.parse_compression_flag.layouts,
+    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
+    reqCtx, ensCtx, parseCtx,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,

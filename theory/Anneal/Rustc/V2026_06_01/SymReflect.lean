@@ -3049,6 +3049,42 @@ theorem optMirBoolPredicateHolds_of_checkBounded
   | none => exact True.intro
   | some body => exact mirBoolPredicateHolds_of_checkBounded fuel body args h
 
+/-- Optional boolean predicate holding with linked `specCallees`:
+`MirBoolPredicateHoldsWithCallees body specCallees args` when
+`optBody = .some body`, and `True` when `optBody = .none`. -/
+def OptMirBoolPredicateHoldsWithCallees
+    (optBody : Option CapturedMir)
+    (specCallees : List CapturedMir)
+    (args : List Value) :
+    Prop :=
+  match optBody with
+  | .some body => MirBoolPredicateHoldsWithCallees body specCallees args
+  | .none => True
+
+/-- Computable bounded boolean checker for `OptMirBoolPredicateHoldsWithCallees`. -/
+def checkOptMirBoolWithCalleesBounded
+    (fuel : Nat)
+    (optBody : Option CapturedMir)
+    (specCallees : List CapturedMir)
+    (args : List Value) :
+    Bool :=
+  match optBody with
+  | .some body => checkMirBoolWithCalleesBounded fuel body specCallees args
+  | .none => true
+
+theorem optMirBoolPredicateHoldsWithCallees_of_checkBounded
+    (fuel : Nat)
+    (optBody : Option CapturedMir)
+    (specCallees : List CapturedMir)
+    (args : List Value)
+    (h : checkOptMirBoolWithCalleesBounded fuel optBody specCallees args = true) :
+    OptMirBoolPredicateHoldsWithCallees optBody specCallees args := by
+  cases optBody with
+  | none => exact True.intro
+  | some body =>
+    exact mirBoolPredicateHoldsWithCallees_of_checkBounded
+      fuel body specCallees args h
+
 /-- Collect `(idx, sc)` scalar equality pins discovered along the true branch of
 `body` within `fuel` symbolic steps from `st`. -/
 def collectSymPinsLoop :
@@ -3138,12 +3174,13 @@ theorem checkOptMirRequiresPinsScalars_sound
     | nil => rfl
     | cons _ _ => nomatch hExp0
 
-/-- Computable check that `subjectBody` evaluates on `args` within `subjectFuel`
-steps to a normal return value `retVal` satisfying
+/-- Computable check that `subjectBody` evaluates on `args` with `callees`
+within `subjectFuel` steps to a normal return value `retVal` satisfying
 `checkOptMirBoolBounded specFuel optEnsBody (args ++ [retVal])`. -/
-def checkMirRustPinnedSpecOpt
+def checkMirRustPinnedSpecOptWithCallees
     (subjectFuel specFuel : Nat)
     (subjectBody : CapturedMir)
+    (callees : List CapturedMir)
     (optEnsBody : Option CapturedMir)
     (args : List Value) :
     Bool :=
@@ -3160,25 +3197,39 @@ def checkMirRustPinnedSpecOpt
       | .vis (.inl _) _ => false
       | .vis (.inr (.inl _)) k => loop fuel' (k PUnit.unit)
       | .vis (.inr (.inr _)) _ => false
-  loop subjectFuel (.running (initMachineState subjectBody args))
+  loop subjectFuel (.running (initMachineStateWithCallees subjectBody args callees))
 
-theorem wpMirBounded_normal_of_checkMirRustPinnedSpecOpt
+/-- Computable check that `subjectBody` evaluates on `args` within `subjectFuel`
+steps to a normal return value `retVal` satisfying
+`checkOptMirBoolBounded specFuel optEnsBody (args ++ [retVal])`. -/
+def checkMirRustPinnedSpecOpt
     (subjectFuel specFuel : Nat)
     (subjectBody : CapturedMir)
     (optEnsBody : Option CapturedMir)
+    (args : List Value) :
+    Bool :=
+  checkMirRustPinnedSpecOptWithCallees
+    subjectFuel specFuel subjectBody .nil optEnsBody args
+
+theorem wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithCallees
+    (subjectFuel specFuel : Nat)
+    (subjectBody : CapturedMir)
+    (callees : List CapturedMir)
+    (optEnsBody : Option CapturedMir)
     (args : List Value)
     (h_ok :
-      checkMirRustPinnedSpecOpt
-        subjectFuel specFuel subjectBody optEnsBody args = true) :
-    wpMirBounded subjectFuel subjectBody (initMachineState subjectBody args)
+      checkMirRustPinnedSpecOptWithCallees
+        subjectFuel specFuel subjectBody callees optEnsBody args = true) :
+    wpMirBounded subjectFuel subjectBody
+      (initMachineStateWithCallees subjectBody args callees)
       (fun out =>
         ∃ retVal mem',
           out = .normal (retVal, mem') ∧
           OptMirBoolPredicateHolds optEnsBody (args ++ [retVal])) := by
-  unfold checkMirRustPinnedSpecOpt at h_ok
+  unfold checkMirRustPinnedSpecOptWithCallees at h_ok
   unfold wpMirBounded
   suffices ∀ (fuel : Nat) (st : MirExecState),
-      checkMirRustPinnedSpecOpt.loop
+      checkMirRustPinnedSpecOptWithCallees.loop
         specFuel subjectBody optEnsBody args fuel st = true →
       wpCoalBounded fuel mirDefaultWP (stepMirState subjectBody)
         (fun out _ =>
@@ -3192,7 +3243,7 @@ theorem wpMirBounded_normal_of_checkMirRustPinnedSpecOpt
   | zero => intro _ h; nomatch h
   | succ fuel' ih =>
     intro st h
-    unfold checkMirRustPinnedSpecOpt.loop at h
+    unfold checkMirRustPinnedSpecOptWithCallees.loop at h
     unfold wpCoalBounded
     cases h_step : stepMirState subjectBody st with
     | ret out =>
@@ -3216,6 +3267,48 @@ theorem wpMirBounded_normal_of_checkMirRustPinnedSpecOpt
         exact ih (k PUnit.unit) h
       · nomatch h
 
+theorem wpMirBounded_normal_of_checkMirRustPinnedSpecOpt
+    (subjectFuel specFuel : Nat)
+    (subjectBody : CapturedMir)
+    (optEnsBody : Option CapturedMir)
+    (args : List Value)
+    (h_ok :
+      checkMirRustPinnedSpecOpt
+        subjectFuel specFuel subjectBody optEnsBody args = true) :
+    wpMirBounded subjectFuel subjectBody (initMachineState subjectBody args)
+      (fun out =>
+        ∃ retVal mem',
+          out = .normal (retVal, mem') ∧
+          OptMirBoolPredicateHolds optEnsBody (args ++ [retVal])) :=
+  wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithCallees
+    subjectFuel specFuel subjectBody .nil optEnsBody args h_ok
+
+theorem wpMirBounded_safe_of_checkMirRustPinnedSpecOptWithCallees
+    (subjectFuel specFuel : Nat)
+    (subjectBody : CapturedMir)
+    (callees : List CapturedMir)
+    (optEnsBody : Option CapturedMir)
+    (args : List Value)
+    (h_ok :
+      checkMirRustPinnedSpecOptWithCallees
+        subjectFuel specFuel subjectBody callees optEnsBody args = true) :
+    wpMirBounded subjectFuel subjectBody
+      (initMachineStateWithCallees subjectBody args callees)
+      (fun out =>
+        ∀ retVal mem',
+          out = .normal (retVal, mem') →
+          OptMirBoolPredicateHolds optEnsBody (args ++ [retVal])) := by
+  have h_norm :=
+    wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithCallees
+      subjectFuel specFuel subjectBody callees optEnsBody args h_ok
+  rw [← wpMirSym_eq_wpMirBounded] at h_norm ⊢
+  refine wpMirSym_mono ?_ h_norm
+  intro out ⟨rv, m, h_out, h_ens⟩ retVal mem' h_eq
+  rw [h_out] at h_eq
+  injection h_eq with h_pair
+  cases h_pair
+  exact h_ens
+
 theorem wpMirBounded_safe_of_checkMirRustPinnedSpecOpt
     (subjectFuel specFuel : Nat)
     (subjectBody : CapturedMir)
@@ -3228,17 +3321,25 @@ theorem wpMirBounded_safe_of_checkMirRustPinnedSpecOpt
       (fun out =>
         ∀ retVal mem',
           out = .normal (retVal, mem') →
-          OptMirBoolPredicateHolds optEnsBody (args ++ [retVal])) := by
-  have h_norm :=
-    wpMirBounded_normal_of_checkMirRustPinnedSpecOpt
-      subjectFuel specFuel subjectBody optEnsBody args h_ok
-  rw [← wpMirSym_eq_wpMirBounded] at h_norm ⊢
-  refine wpMirSym_mono ?_ h_norm
-  intro out ⟨rv, m, h_out, h_ens⟩ retVal mem' h_eq
-  rw [h_out] at h_eq
-  injection h_eq with h_pair
-  cases h_pair
-  exact h_ens
+          OptMirBoolPredicateHolds optEnsBody (args ++ [retVal])) :=
+  wpMirBounded_safe_of_checkMirRustPinnedSpecOptWithCallees
+    subjectFuel specFuel subjectBody .nil optEnsBody args h_ok
+
+/-- Closed-term checker that automatically extracts pinned arguments from
+`optReqBody` and verifies `subjectBody` (with `callees`) against `optEnsBody`. -/
+def checkMirAutoPinnedSpecWithCallees
+    (subjectFuel specFuel : Nat)
+    (subjectBody : CapturedMir)
+    (callees : List CapturedMir)
+    (optReqBody optEnsBody : Option CapturedMir) :
+    Bool :=
+  let expected := extractOptMirRequiresPins specFuel optReqBody
+  Bool.and
+    (Nat.beq subjectBody.argCount (length expected))
+    (Bool.and
+      (checkOptMirRequiresPinsScalars specFuel optReqBody expected)
+      (checkMirRustPinnedSpecOptWithCallees
+        subjectFuel specFuel subjectBody callees optEnsBody (mapScalarValues expected)))
 
 /-- Closed-term checker that automatically extracts pinned arguments from
 `optReqBody` and verifies `subjectBody` against `optEnsBody`. -/
@@ -3247,13 +3348,8 @@ def checkMirAutoPinnedSpec
     (subjectBody : CapturedMir)
     (optReqBody optEnsBody : Option CapturedMir) :
     Bool :=
-  let expected := extractOptMirRequiresPins specFuel optReqBody
-  Bool.and
-    (Nat.beq subjectBody.argCount (length expected))
-    (Bool.and
-      (checkOptMirRequiresPinsScalars specFuel optReqBody expected)
-      (checkMirRustPinnedSpecOpt
-        subjectFuel specFuel subjectBody optEnsBody (mapScalarValues expected)))
+  checkMirAutoPinnedSpecWithCallees
+    subjectFuel specFuel subjectBody .nil optReqBody optEnsBody
 
 /-- One-call automatic discharge combinator for stateless `Claim`s with pinned
 (or 0-argument) `requires` and optional `ensures` (`:= by rfl`). -/
@@ -3272,8 +3368,8 @@ theorem dischargeRustPinnedContractAuto
       | exact h
       | exact ⟨h, True.intro⟩)
     (h_check :
-      checkMirAutoPinnedSpec
-        subjectFuel specFuel c.body optReqBody optEnsBody = true := by rfl)
+      checkMirAutoPinnedSpecWithCallees
+        subjectFuel specFuel c.body c.callees optReqBody optEnsBody = true := by rfl)
     (h_post :
       ∀ (args : List Value) (ret : Value),
         OptMirBoolPredicateHolds optEnsBody (args ++ [ret]) →
@@ -3285,7 +3381,7 @@ theorem dischargeRustPinnedContractAuto
     VerificationResult c := by
   refine verifyMirBounded c subjectFuel (fun args hp => ?_)
   rcases h_pre args hp with ⟨h_len_body, h_req⟩
-  dsimp only [checkMirAutoPinnedSpec] at h_check
+  dsimp only [checkMirAutoPinnedSpecWithCallees] at h_check
   let expected := extractOptMirRequiresPins specFuel optReqBody
   cases hArgEq : Nat.beq c.body.argCount (length expected) with
   | false =>
@@ -3308,8 +3404,8 @@ theorem dischargeRustPinnedContractAuto
           specFuel optReqBody expected args hPins h_len h_req
       subst h_args
       have h_wp :=
-        wpMirBounded_safe_of_checkMirRustPinnedSpecOpt
-          subjectFuel specFuel c.body optEnsBody (mapScalarValues expected) h_check
+        wpMirBounded_safe_of_checkMirRustPinnedSpecOptWithCallees
+          subjectFuel specFuel c.body c.callees optEnsBody (mapScalarValues expected) h_check
       rw [← wpMirSym_eq_wpMirBounded] at h_wp ⊢
       exact wpMirSym_mono
         (fun out ho retVal mem' h_out =>
@@ -3333,10 +3429,13 @@ theorem dischargeRustTotalPinnedContractAuto
       intro _ _ h
       first
       | exact h
-      | exact ⟨⟨h.1, True.intro⟩, h.2⟩)
+      | exact h.1
+      | exact ⟨⟨h.1, True.intro⟩, h.2⟩
+      | exact ⟨⟨h.1.1, True.intro⟩, h.1.2⟩
+      | exact ⟨⟨h.2.1, True.intro⟩, h.1.2⟩)
     (h_check :
-      checkMirAutoPinnedSpec
-        subjectFuel specFuel c.body optReqBody optEnsBody = true := by rfl)
+      checkMirAutoPinnedSpecWithCallees
+        subjectFuel specFuel c.body c.callees optReqBody optEnsBody = true := by rfl)
     (h_post :
       ∀ (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory),
         OptMirBoolPredicateHolds optEnsBody (args ++ [ret]) →
@@ -3349,7 +3448,7 @@ theorem dischargeRustTotalPinnedContractAuto
   refine verifyTotalMirBounded c subjectFuel (fun args mem hp => ?_)
   rcases h_pre args mem hp with ⟨⟨h_len_body, h_req⟩, h_mem⟩
   subst h_mem
-  dsimp only [checkMirAutoPinnedSpec] at h_check
+  dsimp only [checkMirAutoPinnedSpecWithCallees] at h_check
   let expected := extractOptMirRequiresPins specFuel optReqBody
   cases hArgEq : Nat.beq c.body.argCount (length expected) with
   | false =>
@@ -3372,17 +3471,287 @@ theorem dischargeRustTotalPinnedContractAuto
           specFuel optReqBody expected args hPins h_len h_req
       subst h_args
       have h_wp :=
-        wpMirBounded_normal_of_checkMirRustPinnedSpecOpt
-          subjectFuel specFuel c.body optEnsBody (mapScalarValues expected) h_check
-      change
-        wpMirBounded subjectFuel c.body
-          (initMachineState c.body (mapScalarValues expected))
-          (fun out =>
-            ∃ retVal mem',
-              out = .normal (retVal, mem') ∧
-              c.post (mapScalarValues expected)
-                (initMachineState c.body (mapScalarValues expected)).memory
-                retVal mem')
+        wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithCallees
+          subjectFuel specFuel c.body c.callees optEnsBody (mapScalarValues expected) h_check
+      have h_init_eq :
+          initMachineStateWithMemoryAndCallees c.body (mapScalarValues expected)
+            (initMachineState c.body (mapScalarValues expected)).memory c.callees =
+          initMachineStateWithCallees c.body (mapScalarValues expected) c.callees := by
+        cases c.callees <;> rfl
+      rw [h_init_eq]
+      rw [← wpMirSym_eq_wpMirBounded] at h_wp ⊢
+      exact wpMirSym_mono
+        (fun out ⟨rv, m', h_out, h_ens⟩ =>
+          ⟨rv, m', h_out,
+            h_post (mapScalarValues expected)
+              (initMachineState c.body (mapScalarValues expected)).memory
+              rv m' h_ens⟩)
+        h_wp
+
+/-- Computable check that `subjectBody` evaluates on `args` with `callees`
+within `subjectFuel` steps to a normal return value `retVal` satisfying
+`checkOptMirBoolWithCalleesBounded specFuel optEnsBody specCallees (args ++ [retVal])`. -/
+def checkMirRustPinnedSpecOptWithSpecCallees
+    (subjectFuel specFuel : Nat)
+    (subjectBody : CapturedMir)
+    (callees specCallees : List CapturedMir)
+    (optEnsBody : Option CapturedMir)
+    (args : List Value) :
+    Bool :=
+  let rec loop (fuel : Nat) (st : MirExecState) : Bool :=
+    match fuel with
+    | 0 => false
+    | fuel' + 1 =>
+      match stepMirState subjectBody st with
+      | .ret (.normal (retVal, _)) =>
+        checkOptMirBoolWithCalleesBounded
+          specFuel optEnsBody specCallees (args ++ [retVal])
+      | .ret .panic => false
+      | .ret .abort => false
+      | .tau st' => loop fuel' st'
+      | .vis (.inl _) _ => false
+      | .vis (.inr (.inl _)) k => loop fuel' (k PUnit.unit)
+      | .vis (.inr (.inr _)) _ => false
+  loop subjectFuel (.running (initMachineStateWithCallees subjectBody args callees))
+
+theorem wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithSpecCallees
+    (subjectFuel specFuel : Nat)
+    (subjectBody : CapturedMir)
+    (callees specCallees : List CapturedMir)
+    (optEnsBody : Option CapturedMir)
+    (args : List Value)
+    (h_ok :
+      checkMirRustPinnedSpecOptWithSpecCallees
+        subjectFuel specFuel subjectBody callees specCallees optEnsBody args = true) :
+    wpMirBounded subjectFuel subjectBody
+      (initMachineStateWithCallees subjectBody args callees)
+      (fun out =>
+        ∃ retVal mem',
+          out = .normal (retVal, mem') ∧
+          OptMirBoolPredicateHoldsWithCallees
+            optEnsBody specCallees (args ++ [retVal])) := by
+  unfold checkMirRustPinnedSpecOptWithSpecCallees at h_ok
+  unfold wpMirBounded
+  suffices ∀ (fuel : Nat) (st : MirExecState),
+      checkMirRustPinnedSpecOptWithSpecCallees.loop
+        specFuel subjectBody specCallees optEnsBody args fuel st = true →
+      wpCoalBounded fuel mirDefaultWP (stepMirState subjectBody)
+        (fun out _ =>
+          ∃ retVal mem',
+            out = .normal (retVal, mem') ∧
+            OptMirBoolPredicateHoldsWithCallees
+              optEnsBody specCallees (args ++ [retVal]))
+        st PUnit.unit from
+    this subjectFuel _ h_ok
+  intro fuel
+  induction fuel with
+  | zero => intro _ h; nomatch h
+  | succ fuel' ih =>
+    intro st h
+    unfold checkMirRustPinnedSpecOptWithSpecCallees.loop at h
+    unfold wpCoalBounded
+    cases h_step : stepMirState subjectBody st with
+    | ret out =>
+      simp only [h_step] at h ⊢
+      cases out with
+      | normal p =>
+        rcases p with ⟨rv, m⟩
+        exact ⟨rv, m, rfl,
+          optMirBoolPredicateHoldsWithCallees_of_checkBounded
+            specFuel optEnsBody specCallees (args ++ [rv]) h⟩
+      | panic => nomatch h
+      | abort => nomatch h
+    | tau st' =>
+      simp only [h_step] at h ⊢
+      exact ih st' h
+    | vis i k =>
+      simp only [h_step] at h ⊢
+      rcases i with f | (e | c)
+      · nomatch h
+      · cases e
+        exact ih (k PUnit.unit) h
+      · nomatch h
+
+theorem wpMirBounded_safe_of_checkMirRustPinnedSpecOptWithSpecCallees
+    (subjectFuel specFuel : Nat)
+    (subjectBody : CapturedMir)
+    (callees specCallees : List CapturedMir)
+    (optEnsBody : Option CapturedMir)
+    (args : List Value)
+    (h_ok :
+      checkMirRustPinnedSpecOptWithSpecCallees
+        subjectFuel specFuel subjectBody callees specCallees optEnsBody args = true) :
+    wpMirBounded subjectFuel subjectBody
+      (initMachineStateWithCallees subjectBody args callees)
+      (fun out =>
+        ∀ retVal mem',
+          out = .normal (retVal, mem') →
+          OptMirBoolPredicateHoldsWithCallees
+            optEnsBody specCallees (args ++ [retVal])) := by
+  have h_norm :=
+    wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithSpecCallees
+      subjectFuel specFuel subjectBody callees specCallees optEnsBody args h_ok
+  rw [← wpMirSym_eq_wpMirBounded] at h_norm ⊢
+  refine wpMirSym_mono ?_ h_norm
+  intro out ⟨rv, m, h_out, h_ens⟩ retVal mem' h_eq
+  rw [h_out] at h_eq
+  injection h_eq with h_pair
+  cases h_pair
+  exact h_ens
+
+/-- Closed-term checker that automatically extracts pinned arguments from
+`optReqBody` and verifies `subjectBody` (with `callees`) against `optEnsBody`
+(with `specCallees`). -/
+def checkMirAutoPinnedSpecWithSpecCallees
+    (subjectFuel specFuel : Nat)
+    (subjectBody : CapturedMir)
+    (callees specCallees : List CapturedMir)
+    (optReqBody optEnsBody : Option CapturedMir) :
+    Bool :=
+  let expected := extractOptMirRequiresPins specFuel optReqBody
+  Bool.and
+    (Nat.beq subjectBody.argCount (length expected))
+    (Bool.and
+      (checkOptMirRequiresPinsScalars specFuel optReqBody expected)
+      (checkMirRustPinnedSpecOptWithSpecCallees
+        subjectFuel specFuel subjectBody callees specCallees optEnsBody
+        (mapScalarValues expected)))
+
+/-- One-call automatic discharge combinator for stateless `Claim`s with pinned
+`requires` and optional `ensures` calling helpers in `specCallees`. -/
+theorem dischargeRustPinnedContractWithSpecCalleesAuto
+    (c : Claim)
+    (subjectFuel specFuel : Nat)
+    (specCallees : List CapturedMir)
+    (optReqBody optEnsBody : Option CapturedMir)
+    (h_pre :
+      ∀ args : List Value,
+        c.pre args →
+        And
+          (Trusted.Sequence.length args = c.body.argCount)
+          (OptMirBoolPredicateHolds optReqBody args) := by
+      intro _ h
+      first
+      | exact h
+      | exact ⟨h, True.intro⟩)
+    (h_check :
+      checkMirAutoPinnedSpecWithSpecCallees
+        subjectFuel specFuel c.body c.callees specCallees
+        optReqBody optEnsBody = true := by rfl)
+    (h_post :
+      ∀ (args : List Value) (ret : Value),
+        OptMirBoolPredicateHoldsWithCallees
+          optEnsBody specCallees (args ++ [ret]) →
+        c.post args ret := by
+      intro _ _ h
+      first
+      | exact h
+      | exact True.intro) :
+    VerificationResult c := by
+  refine verifyMirBounded c subjectFuel (fun args hp => ?_)
+  rcases h_pre args hp with ⟨h_len_body, h_req⟩
+  dsimp only [checkMirAutoPinnedSpecWithSpecCallees] at h_check
+  let expected := extractOptMirRequiresPins specFuel optReqBody
+  cases hArgEq : Nat.beq c.body.argCount (length expected) with
+  | false =>
+    rw [hArgEq] at h_check
+    nomatch h_check
+  | true =>
+    rw [hArgEq] at h_check
+    dsimp only [Bool.and] at h_check
+    cases hPins : checkOptMirRequiresPinsScalars specFuel optReqBody expected with
+    | false =>
+      rw [hPins] at h_check
+      nomatch h_check
+    | true =>
+      rw [hPins] at h_check
+      dsimp only [Bool.and] at h_check
+      have h_len : length args = length expected :=
+        Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArgEq)
+      have h_args : args = mapScalarValues expected :=
+        checkOptMirRequiresPinsScalars_sound
+          specFuel optReqBody expected args hPins h_len h_req
+      subst h_args
+      have h_wp :=
+        wpMirBounded_safe_of_checkMirRustPinnedSpecOptWithSpecCallees
+          subjectFuel specFuel c.body c.callees specCallees optEnsBody
+          (mapScalarValues expected) h_check
+      rw [← wpMirSym_eq_wpMirBounded] at h_wp ⊢
+      exact wpMirSym_mono
+        (fun out ho retVal mem' h_out =>
+          h_post (mapScalarValues expected) retVal (ho retVal mem' h_out))
+        h_wp
+
+/-- One-call automatic discharge combinator for `TotalClaim`s
+(`#[spec(safe_total, ...)]`) with pinned `requires` and optional `ensures`
+calling helpers in `specCallees`. -/
+theorem dischargeRustTotalPinnedContractWithSpecCalleesAuto
+    (c : TotalClaim)
+    (subjectFuel specFuel : Nat)
+    (specCallees : List CapturedMir)
+    (optReqBody optEnsBody : Option CapturedMir)
+    (h_pre :
+      ∀ (args : List Value) (mem : Memory),
+        c.pre args mem →
+        And
+          (And
+            (Trusted.Sequence.length args = c.body.argCount)
+            (OptMirBoolPredicateHolds optReqBody args))
+          (mem = (initMachineState c.body args).memory) := by
+      intro _ _ h
+      first
+      | exact h
+      | exact ⟨⟨h.1, True.intro⟩, h.2⟩
+      | exact h.1)
+    (h_check :
+      checkMirAutoPinnedSpecWithSpecCallees
+        subjectFuel specFuel c.body c.callees specCallees
+        optReqBody optEnsBody = true := by rfl)
+    (h_post :
+      ∀ (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory),
+        OptMirBoolPredicateHoldsWithCallees
+          optEnsBody specCallees (args ++ [ret]) →
+        c.post args mem ret mem' := by
+      intro _ _ _ _ h
+      first
+      | exact h
+      | exact True.intro) :
+    TotalVerificationResult c := by
+  refine verifyTotalMirBounded c subjectFuel (fun args mem hp => ?_)
+  rcases h_pre args mem hp with ⟨⟨h_len_body, h_req⟩, h_mem⟩
+  subst h_mem
+  dsimp only [checkMirAutoPinnedSpecWithSpecCallees] at h_check
+  let expected := extractOptMirRequiresPins specFuel optReqBody
+  cases hArgEq : Nat.beq c.body.argCount (length expected) with
+  | false =>
+    rw [hArgEq] at h_check
+    nomatch h_check
+  | true =>
+    rw [hArgEq] at h_check
+    dsimp only [Bool.and] at h_check
+    cases hPins : checkOptMirRequiresPinsScalars specFuel optReqBody expected with
+    | false =>
+      rw [hPins] at h_check
+      nomatch h_check
+    | true =>
+      rw [hPins] at h_check
+      dsimp only [Bool.and] at h_check
+      have h_len : length args = length expected :=
+        Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArgEq)
+      have h_args : args = mapScalarValues expected :=
+        checkOptMirRequiresPinsScalars_sound
+          specFuel optReqBody expected args hPins h_len h_req
+      subst h_args
+      have h_wp :=
+        wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithSpecCallees
+          subjectFuel specFuel c.body c.callees specCallees optEnsBody
+          (mapScalarValues expected) h_check
+      have h_init_eq :
+          initMachineStateWithMemoryAndCallees c.body (mapScalarValues expected)
+            (initMachineState c.body (mapScalarValues expected)).memory c.callees =
+          initMachineStateWithCallees c.body (mapScalarValues expected) c.callees := by
+        cases c.callees <;> rfl
+      rw [h_init_eq]
       rw [← wpMirSym_eq_wpMirBounded] at h_wp ⊢
       exact wpMirSym_mono
         (fun out ⟨rv, m', h_out, h_ens⟩ =>
@@ -4001,10 +4370,13 @@ theorem checkAllScalarRange1_at_sound
           specFuel reqBody checkFn sz k b (Nat.le_of_lt_succ hLt) hAll hReq
 
 /-- Closed-term checker that automatically extracts an upper bound `b ≤ K` from
-`reqBody` and verifies `subjectBody` against `optEnsBody` for all `0 ≤ b ≤ K`. -/
-def checkMirAutoBoundedRange1Spec
+`reqBody` and verifies `subjectBody` (with `callees`) against `optEnsBody` for
+all `0 ≤ b ≤ K`. -/
+def checkMirAutoBoundedRange1SpecWithCallees
     (subjectFuel specFuel : Nat)
-    (subjectBody reqBody : CapturedMir)
+    (subjectBody : CapturedMir)
+    (callees : List CapturedMir)
+    (reqBody : CapturedMir)
     (optEnsBody : Option CapturedMir) :
     Bool :=
   match extractMirUpperBound1 specFuel reqBody with
@@ -4017,9 +4389,20 @@ def checkMirAutoBoundedRange1Spec
         (checkAllScalarRange1
           specFuel
           reqBody
-          (checkMirRustPinnedSpecOpt subjectFuel specFuel subjectBody optEnsBody)
+          (checkMirRustPinnedSpecOptWithCallees
+            subjectFuel specFuel subjectBody callees optEnsBody)
           boundSc.sizeBytes
           boundSc.bits))
+
+/-- Closed-term checker that automatically extracts an upper bound `b ≤ K` from
+`reqBody` and verifies `subjectBody` against `optEnsBody` for all `0 ≤ b ≤ K`. -/
+def checkMirAutoBoundedRange1Spec
+    (subjectFuel specFuel : Nat)
+    (subjectBody reqBody : CapturedMir)
+    (optEnsBody : Option CapturedMir) :
+    Bool :=
+  checkMirAutoBoundedRange1SpecWithCallees
+    subjectFuel specFuel subjectBody .nil reqBody optEnsBody
 
 /-- One-call automatic discharge combinator for 1-argument unsigned `Claim`s
 with a bounded inequality precondition (`requires: x < K` or `x <= K`). -/
@@ -4036,8 +4419,8 @@ theorem dischargeRustBoundedRange1Auto
           (MirBoolPredicateHolds reqBody args) := by
       intro _ h; exact h)
     (h_check :
-      checkMirAutoBoundedRange1Spec
-        subjectFuel specFuel c.body reqBody optEnsBody = true := by rfl)
+      checkMirAutoBoundedRange1SpecWithCallees
+        subjectFuel specFuel c.body c.callees reqBody optEnsBody = true := by rfl)
     (h_post :
       ∀ (args : List Value) (ret : Value),
         OptMirBoolPredicateHolds optEnsBody (args ++ [ret]) →
@@ -4049,7 +4432,7 @@ theorem dischargeRustBoundedRange1Auto
     VerificationResult c := by
   refine verifyMirBounded c subjectFuel (fun args hp => ?_)
   rcases h_pre args hp with ⟨h_len_body, h_req⟩
-  dsimp only [checkMirAutoBoundedRange1Spec] at h_check
+  dsimp only [checkMirAutoBoundedRange1SpecWithCallees] at h_check
   cases hExt : extractMirUpperBound1 specFuel reqBody with
   | none =>
     rw [hExt] at h_check
@@ -4079,11 +4462,12 @@ theorem dischargeRustBoundedRange1Auto
         have hRun :=
           checkAllScalarRange1_at_sound
             specFuel reqBody
-            (checkMirRustPinnedSpecOpt subjectFuel specFuel c.body optEnsBody)
+            (checkMirRustPinnedSpecOptWithCallees
+              subjectFuel specFuel c.body c.callees optEnsBody)
             boundSc.sizeBytes boundSc.bits b hBle h_check h_req
         have h_wp :=
-          wpMirBounded_safe_of_checkMirRustPinnedSpecOpt
-            subjectFuel specFuel c.body optEnsBody
+          wpMirBounded_safe_of_checkMirRustPinnedSpecOptWithCallees
+            subjectFuel specFuel c.body c.callees optEnsBody
             [.scalar { bits := b, sizeBytes := boundSc.sizeBytes }]
             hRun
         rw [← wpMirSym_eq_wpMirBounded] at h_wp ⊢
@@ -4108,10 +4492,13 @@ theorem dischargeRustTotalBoundedRange1Auto
             (Trusted.Sequence.length args = c.body.argCount)
             (MirBoolPredicateHolds reqBody args))
           (mem = (initMachineState c.body args).memory) := by
-      intro _ _ h; exact h)
+      intro _ _ h
+      first
+      | exact h
+      | exact h.1)
     (h_check :
-      checkMirAutoBoundedRange1Spec
-        subjectFuel specFuel c.body reqBody optEnsBody = true := by rfl)
+      checkMirAutoBoundedRange1SpecWithCallees
+        subjectFuel specFuel c.body c.callees reqBody optEnsBody = true := by rfl)
     (h_post :
       ∀ (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory),
         OptMirBoolPredicateHolds optEnsBody (args ++ [ret]) →
@@ -4124,7 +4511,7 @@ theorem dischargeRustTotalBoundedRange1Auto
   refine verifyTotalMirBounded c subjectFuel (fun args mem hp => ?_)
   rcases h_pre args mem hp with ⟨⟨h_len_body, h_req⟩, h_mem⟩
   subst h_mem
-  dsimp only [checkMirAutoBoundedRange1Spec] at h_check
+  dsimp only [checkMirAutoBoundedRange1SpecWithCallees] at h_check
   cases hExt : extractMirUpperBound1 specFuel reqBody with
   | none =>
     rw [hExt] at h_check
@@ -4154,21 +4541,212 @@ theorem dischargeRustTotalBoundedRange1Auto
         have hRun :=
           checkAllScalarRange1_at_sound
             specFuel reqBody
-            (checkMirRustPinnedSpecOpt subjectFuel specFuel c.body optEnsBody)
+            (checkMirRustPinnedSpecOptWithCallees
+              subjectFuel specFuel c.body c.callees optEnsBody)
             boundSc.sizeBytes boundSc.bits b hBle h_check h_req
         have h_wp :=
-          wpMirBounded_normal_of_checkMirRustPinnedSpecOpt
-            subjectFuel specFuel c.body optEnsBody
+          wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithCallees
+            subjectFuel specFuel c.body c.callees optEnsBody
             [.scalar { bits := b, sizeBytes := boundSc.sizeBytes }]
             hRun
         let argsB : List Value := [.scalar { bits := b, sizeBytes := boundSc.sizeBytes }]
-        change
-          wpMirBounded subjectFuel c.body
-            (initMachineState c.body argsB)
-            (fun out =>
-              ∃ retVal mem',
-                out = .normal (retVal, mem') ∧
-                c.post argsB (initMachineState c.body argsB).memory retVal mem')
+        have h_init_eq :
+            initMachineStateWithMemoryAndCallees c.body argsB
+              (initMachineState c.body argsB).memory c.callees =
+            initMachineStateWithCallees c.body argsB c.callees := by
+          cases c.callees <;> rfl
+        rw [h_init_eq]
+        rw [← wpMirSym_eq_wpMirBounded] at h_wp ⊢
+        exact wpMirSym_mono
+          (fun out ⟨rv, m', h_out, h_ens⟩ =>
+            ⟨rv, m', h_out,
+              h_post argsB (initMachineState c.body argsB).memory rv m' h_ens⟩)
+          h_wp
+
+/-- Closed-term checker that automatically extracts an upper bound `b ≤ K` from
+`reqBody` and verifies `subjectBody` (with `callees`) against `optEnsBody`
+(with `specCallees`) for all `0 ≤ b ≤ K`. -/
+def checkMirAutoBoundedRange1SpecWithSpecCallees
+    (subjectFuel specFuel : Nat)
+    (subjectBody : CapturedMir)
+    (callees specCallees : List CapturedMir)
+    (reqBody : CapturedMir)
+    (optEnsBody : Option CapturedMir) :
+    Bool :=
+  match extractMirUpperBound1 specFuel reqBody with
+  | .none => false
+  | .some boundSc =>
+    Bool.and
+      (Nat.beq subjectBody.argCount 1)
+      (Bool.and
+        (checkMirUpperBound1 specFuel reqBody boundSc)
+        (checkAllScalarRange1
+          specFuel
+          reqBody
+          (checkMirRustPinnedSpecOptWithSpecCallees
+            subjectFuel specFuel subjectBody callees specCallees optEnsBody)
+          boundSc.sizeBytes
+          boundSc.bits))
+
+/-- One-call automatic discharge combinator for 1-argument unsigned `Claim`s
+with a bounded inequality precondition (`requires: x < K` or `x <= K`) and an
+optional `ensures` calling helpers in `specCallees`. -/
+theorem dischargeRustBoundedRange1WithSpecCalleesAuto
+    (c : Claim)
+    (subjectFuel specFuel : Nat)
+    (specCallees : List CapturedMir)
+    (reqBody : CapturedMir)
+    (optEnsBody : Option CapturedMir)
+    (h_pre :
+      ∀ args : List Value,
+        c.pre args →
+        And
+          (Trusted.Sequence.length args = c.body.argCount)
+          (MirBoolPredicateHolds reqBody args) := by
+      intro _ h; exact h)
+    (h_check :
+      checkMirAutoBoundedRange1SpecWithSpecCallees
+        subjectFuel specFuel c.body c.callees specCallees reqBody optEnsBody = true := by rfl)
+    (h_post :
+      ∀ (args : List Value) (ret : Value),
+        OptMirBoolPredicateHoldsWithCallees
+          optEnsBody specCallees (args ++ [ret]) →
+        c.post args ret := by
+      intro _ _ h
+      first
+      | exact h
+      | exact True.intro) :
+    VerificationResult c := by
+  refine verifyMirBounded c subjectFuel (fun args hp => ?_)
+  rcases h_pre args hp with ⟨h_len_body, h_req⟩
+  dsimp only [checkMirAutoBoundedRange1SpecWithSpecCallees] at h_check
+  cases hExt : extractMirUpperBound1 specFuel reqBody with
+  | none =>
+    rw [hExt] at h_check
+    nomatch h_check
+  | some boundSc =>
+    rw [hExt] at h_check
+    dsimp only at h_check
+    cases hArg1 : Nat.beq c.body.argCount 1 with
+    | false =>
+      rw [hArg1] at h_check
+      nomatch h_check
+    | true =>
+      rw [hArg1] at h_check
+      dsimp only [Bool.and] at h_check
+      cases hUb : checkMirUpperBound1 specFuel reqBody boundSc with
+      | false =>
+        rw [hUb] at h_check
+        nomatch h_check
+      | true =>
+        rw [hUb] at h_check
+        dsimp only [Bool.and] at h_check
+        have h_len1 : length args = 1 :=
+          Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArg1)
+        rcases checkMirUpperBound1_sound
+          specFuel reqBody boundSc args hUb h_len1 h_req with ⟨b, hBle, hArgs⟩
+        subst hArgs
+        have hRun :=
+          checkAllScalarRange1_at_sound
+            specFuel reqBody
+            (checkMirRustPinnedSpecOptWithSpecCallees
+              subjectFuel specFuel c.body c.callees specCallees optEnsBody)
+            boundSc.sizeBytes boundSc.bits b hBle h_check h_req
+        have h_wp :=
+          wpMirBounded_safe_of_checkMirRustPinnedSpecOptWithSpecCallees
+            subjectFuel specFuel c.body c.callees specCallees optEnsBody
+            [.scalar { bits := b, sizeBytes := boundSc.sizeBytes }]
+            hRun
+        rw [← wpMirSym_eq_wpMirBounded] at h_wp ⊢
+        exact wpMirSym_mono
+          (fun out ho retVal mem' h_out =>
+            h_post [.scalar { bits := b, sizeBytes := boundSc.sizeBytes }] retVal
+              (ho retVal mem' h_out))
+          h_wp
+
+/-- One-call automatic discharge combinator for 1-argument unsigned `TotalClaim`s
+(`#[spec(safe_total, ...)]`) with a bounded inequality precondition
+(`requires: x < K` or `x <= K`) and an optional `ensures` calling helpers in
+`specCallees`. -/
+theorem dischargeRustTotalBoundedRange1WithSpecCalleesAuto
+    (c : TotalClaim)
+    (subjectFuel specFuel : Nat)
+    (specCallees : List CapturedMir)
+    (reqBody : CapturedMir)
+    (optEnsBody : Option CapturedMir)
+    (h_pre :
+      ∀ (args : List Value) (mem : Memory),
+        c.pre args mem →
+        And
+          (And
+            (Trusted.Sequence.length args = c.body.argCount)
+            (MirBoolPredicateHolds reqBody args))
+          (mem = (initMachineState c.body args).memory) := by
+      intro _ _ h
+      first
+      | exact h
+      | exact h.1)
+    (h_check :
+      checkMirAutoBoundedRange1SpecWithSpecCallees
+        subjectFuel specFuel c.body c.callees specCallees reqBody optEnsBody = true := by rfl)
+    (h_post :
+      ∀ (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory),
+        OptMirBoolPredicateHoldsWithCallees
+          optEnsBody specCallees (args ++ [ret]) →
+        c.post args mem ret mem' := by
+      intro _ _ _ _ h
+      first
+      | exact h
+      | exact True.intro) :
+    TotalVerificationResult c := by
+  refine verifyTotalMirBounded c subjectFuel (fun args mem hp => ?_)
+  rcases h_pre args mem hp with ⟨⟨h_len_body, h_req⟩, h_mem⟩
+  subst h_mem
+  dsimp only [checkMirAutoBoundedRange1SpecWithSpecCallees] at h_check
+  cases hExt : extractMirUpperBound1 specFuel reqBody with
+  | none =>
+    rw [hExt] at h_check
+    nomatch h_check
+  | some boundSc =>
+    rw [hExt] at h_check
+    dsimp only at h_check
+    cases hArg1 : Nat.beq c.body.argCount 1 with
+    | false =>
+      rw [hArg1] at h_check
+      nomatch h_check
+    | true =>
+      rw [hArg1] at h_check
+      dsimp only [Bool.and] at h_check
+      cases hUb : checkMirUpperBound1 specFuel reqBody boundSc with
+      | false =>
+        rw [hUb] at h_check
+        nomatch h_check
+      | true =>
+        rw [hUb] at h_check
+        dsimp only [Bool.and] at h_check
+        have h_len1 : length args = 1 :=
+          Eq.trans h_len_body (Nat.eq_of_beq_eq_true hArg1)
+        rcases checkMirUpperBound1_sound
+          specFuel reqBody boundSc args hUb h_len1 h_req with ⟨b, hBle, hArgs⟩
+        subst hArgs
+        have hRun :=
+          checkAllScalarRange1_at_sound
+            specFuel reqBody
+            (checkMirRustPinnedSpecOptWithSpecCallees
+              subjectFuel specFuel c.body c.callees specCallees optEnsBody)
+            boundSc.sizeBytes boundSc.bits b hBle h_check h_req
+        have h_wp :=
+          wpMirBounded_normal_of_checkMirRustPinnedSpecOptWithSpecCallees
+            subjectFuel specFuel c.body c.callees specCallees optEnsBody
+            [.scalar { bits := b, sizeBytes := boundSc.sizeBytes }]
+            hRun
+        let argsB : List Value := [.scalar { bits := b, sizeBytes := boundSc.sizeBytes }]
+        have h_init_eq :
+            initMachineStateWithMemoryAndCallees c.body argsB
+              (initMachineState c.body argsB).memory c.callees =
+            initMachineStateWithCallees c.body argsB c.callees := by
+          cases c.callees <;> rfl
+        rw [h_init_eq]
         rw [← wpMirSym_eq_wpMirBounded] at h_wp ⊢
         exact wpMirSym_mono
           (fun out ⟨rv, m', h_out, h_ens⟩ =>
@@ -5212,8 +5790,9 @@ theorem dischargeRustSymRange1Auto
       ∀ (b : Nat),
         b ≤ peekMirUpperBoundBits reqBody →
         wpMirSym subjectFuel c.body
-          (initMachineState c.body
-            [.scalar { bits := b, sizeBytes := peekMirUpperBoundSz reqBody }])
+          (initMachineStateWithCallees c.body
+            [.scalar { bits := b, sizeBytes := peekMirUpperBoundSz reqBody }]
+            c.callees)
           (mirNormalPost (symOptEnsuresUpperPost optEnsBody)) := by
       intro b hBle
       (conv at hBle => rhs; whnf)
@@ -5285,15 +5864,19 @@ theorem dischargeRustTotalSymRange1Auto
             (Trusted.Sequence.length args = c.body.argCount)
             (MirBoolPredicateHolds reqBody args))
           (mem = (initMachineState c.body args).memory) := by
-      intro _ _ h; exact h)
+      intro _ _ h
+      first
+      | exact h
+      | exact h.1)
     (h_bound :
       checkMirAutoSymRange1Bound specFuel c.body reqBody optEnsBody = true := by rfl)
     (h_sym :
       ∀ (b : Nat),
         b ≤ peekMirUpperBoundBits reqBody →
         wpMirSym subjectFuel c.body
-          (initMachineState c.body
-            [.scalar { bits := b, sizeBytes := peekMirUpperBoundSz reqBody }])
+          (initMachineStateWithCallees c.body
+            [.scalar { bits := b, sizeBytes := peekMirUpperBoundSz reqBody }]
+            c.callees)
           (mirNormalPost (symOptEnsuresUpperPost optEnsBody)) := by
       intro b hBle
       (conv at hBle => rhs; whnf)
@@ -5338,10 +5921,16 @@ theorem dischargeRustTotalSymRange1Auto
         specFuel reqBody (peekMirUpperBound reqBody) args hReqUb h_len1 h_req with ⟨b, hBle, hArgs⟩
       subst hArgs
       let v0 : Value := .scalar { bits := b, sizeBytes := peekMirUpperBoundSz reqBody }
-      change
-        wpMirSym subjectFuel c.body
-          (initMachineState c.body [v0])
-          (mirNormalPost (c.post [v0] (initMachineState c.body [v0]).memory))
+      change wpMirSym subjectFuel c.body
+        (initMachineStateWithMemoryAndCallees c.body [v0]
+          (initMachineState c.body [v0]).memory c.callees)
+        (mirNormalPost (c.post [v0] (initMachineState c.body [v0]).memory))
+      have h_init_eq :
+          initMachineStateWithMemoryAndCallees c.body [v0]
+            (initMachineState c.body [v0]).memory c.callees =
+          initMachineStateWithCallees c.body [v0] c.callees := by
+        cases c.callees <;> rfl
+      rw [h_init_eq]
       exact wpMirSym_mono
         (fun out ho => by
           cases out with
@@ -5553,12 +6142,13 @@ def checkMirRustModularPinnedSpec
     (calleeArgCount : Nat)
     (optCalleeReqBody : Option CapturedMir)
     (calleeEnsBody : CapturedMir)
-    (args : List Value) :
+    (args : List Value)
+    (callees : List CapturedMir := .nil) :
     Bool :=
   checkMirRustModularPinnedSpecLoop
     specFuel subjectBody optSubjectEnsBody
     calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody args
-    subjectFuel (.running (initMachineState subjectBody args))
+    subjectFuel (.running (initMachineStateWithCallees subjectBody args callees))
 
 theorem wpMirModularBounded_of_checkMirRustModularPinnedSpec
     (C : MirCallContract)
@@ -5587,12 +6177,13 @@ theorem wpMirModularBounded_of_checkMirRustModularPinnedSpec
       ∀ (retVal : Value) (mem' : Memory),
         OptMirBoolPredicateHolds optSubjectEnsBody (args ++ [retVal]) →
         Q (.normal (retVal, mem')))
+    (callees : List CapturedMir := .nil)
     (h_ok :
       checkMirRustModularPinnedSpec
         subjectFuel specFuel subjectBody optSubjectEnsBody
-        calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody args = true) :
+        calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody args callees = true) :
     wpMirModularBounded subjectFuel C.toCallContract subjectBody
-      (initMachineState subjectBody args) Q := by
+      (initMachineStateWithCallees subjectBody args callees) Q := by
   unfold checkMirRustModularPinnedSpec at h_ok
   unfold wpMirModularBounded
   suffices ∀ (fuel : Nat) (st : MirExecState),
@@ -5692,7 +6283,8 @@ def checkMirAutoModularPinnedSpec
     (calleeDefPath : String)
     (calleeArgCount : Nat)
     (optCalleeReqBody : Option CapturedMir)
-    (calleeEnsBody : CapturedMir) :
+    (calleeEnsBody : CapturedMir)
+    (callees : List CapturedMir := .nil) :
     Bool :=
   let expected := extractOptMirRequiresPins specFuel optSubjectReqBody
   Bool.and
@@ -5702,7 +6294,7 @@ def checkMirAutoModularPinnedSpec
       (checkMirRustModularPinnedSpec
         subjectFuel specFuel subjectBody optSubjectEnsBody
         calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody
-        (mapScalarValues expected)))
+        (mapScalarValues expected) callees))
 
 /-- One-call automatic discharge combinator for a modular caller (`ModularClaim`)
 with pinned (or 0-argument) `requires` invoking a sibling callee `C`. -/
@@ -5717,6 +6309,7 @@ theorem dischargeRustModularContractAuto
     (calleeArgCount : Nat)
     (optCalleeReqBody : Option CapturedMir)
     (calleeEnsBody : CapturedMir)
+    (callees : List CapturedMir := .nil)
     (h_pre :
       ∀ (args : List Value) (mem : Memory),
         pre args mem →
@@ -5728,7 +6321,10 @@ theorem dischargeRustModularContractAuto
       intro _ _ h
       first
       | exact h
-      | exact ⟨⟨h.1, True.intro⟩, h.2⟩)
+      | exact h.1
+      | exact ⟨⟨h.1, True.intro⟩, h.2⟩
+      | exact ⟨⟨h.1.1, True.intro⟩, h.1.2⟩
+      | exact ⟨⟨h.2.1, True.intro⟩, h.1.2⟩)
     (h_call_pre :
       ∀ req : MirCallReq,
         req.defPath = calleeDefPath →
@@ -5738,18 +6334,22 @@ theorem dischargeRustModularContractAuto
       intro _ h_path h_len h_req
       first
       | exact ⟨h_path, h_len, h_req⟩
-      | exact ⟨h_path, h_len⟩)
+      | exact ⟨h_path, h_len⟩
+      | exact ⟨h_path, h_len, True.intro⟩)
     (h_call_post :
       ∀ (req : MirCallReq) (ans : MirCallAns),
         C.post req ans →
         ∃ retVal,
           And (ans = .returned retVal req.memory)
             (MirBoolPredicateHolds calleeEnsBody (req.args ++ [retVal])) := by
-      intro _ _ h; exact h)
+      intro _ _ h
+      first
+      | exact h
+      | (rcases h with ⟨rv, hAns, _, hEns⟩; exact ⟨rv, hAns, hEns⟩))
     (h_check :
       checkMirAutoModularPinnedSpec
         subjectFuel specFuel subjectBody optSubjectReqBody optSubjectEnsBody
-        calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody = true := by rfl)
+        calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody callees = true := by rfl)
     (h_post :
       ∀ (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory),
         OptMirBoolPredicateHolds optSubjectEnsBody (args ++ [ret]) →
@@ -5759,8 +6359,8 @@ theorem dischargeRustModularContractAuto
       | exact h
       | exact True.intro) :
     ModularVerificationResult
-      { body := subjectBody, envAssumed := C.holdsOn, pre := pre, post := post } := by
-  refine verifyModularContractMirBounded C subjectBody pre post subjectFuel (fun args mem hp => ?_)
+      { body := subjectBody, envAssumed := C.holdsOn, pre := pre, post := post, callees := callees } := by
+  refine verifyModularContractWithCalleesMirBounded C subjectBody callees pre post subjectFuel (fun args mem hp => ?_)
   rcases h_pre args mem hp with ⟨⟨h_len_body, h_req⟩, h_mem⟩
   subst h_mem
   dsimp only [checkMirAutoModularPinnedSpec] at h_check
@@ -5786,6 +6386,12 @@ theorem dischargeRustModularContractAuto
           specFuel optSubjectReqBody expected args hPins h_len h_req
       subst h_args
       let argsPin := mapScalarValues expected
+      have h_init_eq :
+          initMachineStateWithMemoryAndCallees subjectBody argsPin
+            (initMachineState subjectBody argsPin).memory callees =
+          initMachineStateWithCallees subjectBody argsPin callees := by
+        cases callees <;> rfl
+      rw [h_init_eq]
       exact wpMirModularBounded_of_checkMirRustModularPinnedSpec
         C subjectFuel specFuel subjectBody optSubjectEnsBody
         calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody
@@ -5799,6 +6405,7 @@ theorem dischargeRustModularContractAuto
           injection hOut with hPair
           cases hPair
           exact h_post argsPin (initMachineState subjectBody argsPin).memory retVal mem' hEns)
+        callees
         h_check
 
 /-- Closed-term checker for a 1-argument unsigned caller with bounded inequality
@@ -5810,7 +6417,8 @@ def checkMirAutoModularBoundedRange1Spec
     (calleeDefPath : String)
     (calleeArgCount : Nat)
     (optCalleeReqBody : Option CapturedMir)
-    (calleeEnsBody : CapturedMir) :
+    (calleeEnsBody : CapturedMir)
+    (callees : List CapturedMir := .nil) :
     Bool :=
   match extractMirUpperBound1 specFuel subjectReqBody with
   | .none => false
@@ -5822,9 +6430,10 @@ def checkMirAutoModularBoundedRange1Spec
         (checkAllScalarRange1
           specFuel
           subjectReqBody
-          (checkMirRustModularPinnedSpec
-            subjectFuel specFuel subjectBody optSubjectEnsBody
-            calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody)
+          (fun args =>
+            checkMirRustModularPinnedSpec
+              subjectFuel specFuel subjectBody optSubjectEnsBody
+              calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody args callees)
           boundSc.sizeBytes
           boundSc.bits))
 
@@ -5843,6 +6452,7 @@ theorem dischargeRustModularBoundedRange1Auto
     (calleeArgCount : Nat)
     (optCalleeReqBody : Option CapturedMir)
     (calleeEnsBody : CapturedMir)
+    (callees : List CapturedMir := .nil)
     (h_pre :
       ∀ (args : List Value) (mem : Memory),
         pre args mem →
@@ -5851,7 +6461,10 @@ theorem dischargeRustModularBoundedRange1Auto
             (Trusted.Sequence.length args = subjectBody.argCount)
             (MirBoolPredicateHolds subjectReqBody args))
           (mem = (initMachineState subjectBody args).memory) := by
-      intro _ _ h; exact h)
+      intro _ _ h
+      first
+      | exact h
+      | exact h.1)
     (h_call_pre :
       ∀ req : MirCallReq,
         req.defPath = calleeDefPath →
@@ -5861,18 +6474,22 @@ theorem dischargeRustModularBoundedRange1Auto
       intro _ h_path h_len h_req
       first
       | exact ⟨h_path, h_len, h_req⟩
-      | exact ⟨h_path, h_len⟩)
+      | exact ⟨h_path, h_len⟩
+      | exact ⟨h_path, h_len, True.intro⟩)
     (h_call_post :
       ∀ (req : MirCallReq) (ans : MirCallAns),
         C.post req ans →
         ∃ retVal,
           And (ans = .returned retVal req.memory)
             (MirBoolPredicateHolds calleeEnsBody (req.args ++ [retVal])) := by
-      intro _ _ h; exact h)
+      intro _ _ h
+      first
+      | exact h
+      | (rcases h with ⟨rv, hAns, _, hEns⟩; exact ⟨rv, hAns, hEns⟩))
     (h_check :
       checkMirAutoModularBoundedRange1Spec
         subjectFuel specFuel subjectBody subjectReqBody optSubjectEnsBody
-        calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody = true := by rfl)
+        calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody callees = true := by rfl)
     (h_post :
       ∀ (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory),
         OptMirBoolPredicateHolds optSubjectEnsBody (args ++ [ret]) →
@@ -5882,8 +6499,8 @@ theorem dischargeRustModularBoundedRange1Auto
       | exact h
       | exact True.intro) :
     ModularVerificationResult
-      { body := subjectBody, envAssumed := C.holdsOn, pre := pre, post := post } := by
-  refine verifyModularContractMirBounded C subjectBody pre post subjectFuel (fun args mem hp => ?_)
+      { body := subjectBody, envAssumed := C.holdsOn, pre := pre, post := post, callees := callees } := by
+  refine verifyModularContractWithCalleesMirBounded C subjectBody callees pre post subjectFuel (fun args mem hp => ?_)
   rcases h_pre args mem hp with ⟨⟨h_len_body, h_req⟩, h_mem⟩
   subst h_mem
   dsimp only [checkMirAutoModularBoundedRange1Spec] at h_check
@@ -5916,11 +6533,18 @@ theorem dischargeRustModularBoundedRange1Auto
         have hRun :=
           checkAllScalarRange1_at_sound
             specFuel subjectReqBody
-            (checkMirRustModularPinnedSpec
-              subjectFuel specFuel subjectBody optSubjectEnsBody
-              calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody)
+            (fun args =>
+              checkMirRustModularPinnedSpec
+                subjectFuel specFuel subjectBody optSubjectEnsBody
+                calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody args callees)
             boundSc.sizeBytes boundSc.bits b hBle h_check h_req
         let argsB : List Value := [.scalar { bits := b, sizeBytes := boundSc.sizeBytes }]
+        have h_init_eq :
+            initMachineStateWithMemoryAndCallees subjectBody argsB
+              (initMachineState subjectBody argsB).memory callees =
+            initMachineStateWithCallees subjectBody argsB callees := by
+          cases callees <;> rfl
+        rw [h_init_eq]
         exact wpMirModularBounded_of_checkMirRustModularPinnedSpec
           C subjectFuel specFuel subjectBody optSubjectEnsBody
           calleeDefPath calleeArgCount optCalleeReqBody calleeEnsBody
@@ -5934,6 +6558,7 @@ theorem dischargeRustModularBoundedRange1Auto
             injection hOut with hPair
             cases hPair
             exact h_post argsB (initMachineState subjectBody argsB).memory retVal mem' hEns)
+          callees
           hRun
 
 end PinChecker
@@ -5964,17 +6589,19 @@ theorem dischargeRustEqScalar1
         reqBody
         [{ bits := constVal, sizeBytes := width }] = true := by rfl)
     (h_check :
-      checkMirRustPinnedSpec
+      checkMirRustPinnedSpecWithCallees
         subjectFuel
         specFuel
         c.body
         ensBody
+        c.callees
         [.scalar { bits := constVal, sizeBytes := width }] =
         true := by rfl)
     (h_post :
       ∀ ret : Value,
-        MirBoolPredicateHolds
+        MirBoolPredicateHoldsWithCallees
           ensBody
+          c.callees
           ([.scalar { bits := constVal, sizeBytes := width }] ++ [ret]) →
         c.post [.scalar { bits := constVal, sizeBytes := width }] ret := by
       intro _ h; exact h) :
@@ -5987,8 +6614,8 @@ theorem dischargeRustEqScalar1
       h_pins h_len h_req
   subst h_args
   have h_wp :=
-    wpMirBounded_of_checkMirRustPinnedSpec
-      subjectFuel specFuel c.body ensBody
+    wpMirBounded_of_checkMirRustPinnedSpecWithCallees
+      subjectFuel specFuel c.body ensBody c.callees
       [.scalar { bits := constVal, sizeBytes := width }]
       h_check
   exact wpMirSym_eq_wpMirBounded subjectFuel c.body _ _ ▸
@@ -6036,18 +6663,20 @@ theorem dischargeRustEqScalar2
         [ { bits := c1, sizeBytes := w1 }
         , { bits := c2, sizeBytes := w2 } ] = true := by rfl)
     (h_check :
-      checkMirRustPinnedSpec
+      checkMirRustPinnedSpecWithCallees
         subjectFuel
         specFuel
         c.body
         ensBody
+        c.callees
         [ .scalar { bits := c1, sizeBytes := w1 }
         , .scalar { bits := c2, sizeBytes := w2 } ] =
         true := by rfl)
     (h_post :
       ∀ ret : Value,
-        MirBoolPredicateHolds
+        MirBoolPredicateHoldsWithCallees
           ensBody
+          c.callees
           ([ .scalar { bits := c1, sizeBytes := w1 }
            , .scalar { bits := c2, sizeBytes := w2 } ] ++ [ret]) →
         c.post
@@ -6069,8 +6698,8 @@ theorem dischargeRustEqScalar2
       args h_pins h_len h_req
   subst h_args
   have h_wp :=
-    wpMirBounded_of_checkMirRustPinnedSpec
-      subjectFuel specFuel c.body ensBody
+    wpMirBounded_of_checkMirRustPinnedSpecWithCallees
+      subjectFuel specFuel c.body ensBody c.callees
       [ .scalar { bits := c1, sizeBytes := w1 }
       , .scalar { bits := c2, sizeBytes := w2 } ]
       h_check

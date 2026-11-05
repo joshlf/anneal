@@ -59,9 +59,11 @@ def initMachineState (body : CapturedMir) (args : List Value) : MachineState :=
 /--
 Initial `MachineState` for a `CapturedMir` body with argument values `args` and
 available callee bodies `callees` for inline `TerminatorKind.call` resolution.
-`Memory.traitImpls` starts as `body.traitImpls`: `lookupCallee` otherwise reads
-`TraitImplEntry` records only from bodies in `callees`, so trait-method calls
-made by `body` itself would ignore the implementations recorded on `body`.
+When `callees` is non-empty, `Memory.traitImpls` starts as `body.traitImpls`:
+`lookupCallee` otherwise reads `TraitImplEntry` records only from bodies in
+`callees`, so trait-method calls made by `body` itself would ignore the
+implementations recorded on `body`. When `callees` is `[]`, this reduces
+definitionally to `initMachineState body args`.
 
 Reference (The Rust Reference, "Call expressions"):
 <https://doc.rust-lang.org/1.98.0/reference/expressions/call-expr.html>
@@ -76,22 +78,25 @@ def initMachineStateWithCallees
     (args : List Value)
     (callees : List CapturedMir) :
     MachineState :=
-  { frame := {
-      blockIdx := 0
-      stmtIdx := 0
-      locals := initLocalsAux 0 body.localDecls args
+  match callees with
+  | [] => initMachineState body args
+  | _ :: _ =>
+    { frame := {
+        blockIdx := 0
+        stmtIdx := 0
+        locals := initLocalsAux 0 body.localDecls args
+      }
+      memory := {
+        nextAllocId := length body.allocations
+        globals := body.allocations
+        borrows := []
+        nextTag := 1
+        callees := callees
+        callStack := []
+        activeCallee := none
+        traitImpls := body.traitImpls
+      }
     }
-    memory := {
-      nextAllocId := length body.allocations
-      globals := body.allocations
-      borrows := []
-      nextTag := 1
-      callees := callees
-      callStack := []
-      activeCallee := none
-      traitImpls := body.traitImpls
-    }
-  }
 
 /--
 One-step MIR coalgebra transition from an active `MachineState`.

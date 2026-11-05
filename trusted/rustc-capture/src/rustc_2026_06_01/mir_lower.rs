@@ -82,7 +82,7 @@ pub fn canonical_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
                 adt_type_param_count != impl_type_param_indices.len()
                     || adt_type_param_indices.as_ref() != Some(&impl_type_param_indices)
             }
-            _ => true,
+            _ => false,
         };
         if has_specialized_self_ty {
             let item_name = tcx.item_name(def_id);
@@ -112,7 +112,23 @@ pub fn canonical_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
             format!("{crate_name}::{raw}")
         }
     } else {
-        raw
+        let crate_name = tcx.crate_name(def_id.krate).to_string();
+        let normalized = if crate_name == "core" || crate_name == "alloc" {
+            let s = if let Some(rest) = raw.strip_prefix("std::") {
+                format!("{crate_name}::{rest}")
+            } else {
+                raw
+            };
+            s.replace("<std::", &format!("<{crate_name}::"))
+                .replace(" as std::", &format!(" as {crate_name}::"))
+        } else {
+            raw
+        };
+        if !normalized.starts_with(&format!("{crate_name}::")) && !normalized.starts_with('<') {
+            format!("{crate_name}::{normalized}")
+        } else {
+            normalized
+        }
     }
 }
 
@@ -243,13 +259,30 @@ pub fn lower_mir_body<'tcx>(
         local_layouts.push(layout);
     }
 
-    let fn_abi = extract_fn_abi_for_body(
+    let mut fn_abi = extract_fn_abi_for_body(
         tcx,
         def_id,
         ctx.layout_builder.typing_env(),
         body.arg_count,
         &local_layouts,
     );
+    if matches!(role, IrContractRole::ExternalSpec(_))
+        && fn_abi.conv == crate::lean_emit::IrCallConv::Rust
+        && fn_abi.can_unwind
+        && let Some(target_def_id) =
+            crate::rustc_2026_06_01::specs::resolve_sidecar_target_def_id_from_body(
+                tcx, def_id, body, true,
+            )
+        && let Some((target_conv, target_can_unwind)) =
+            crate::rustc_2026_06_01::layout_lower::extract_fn_conv_and_unwind(
+                tcx,
+                target_def_id,
+                ctx.layout_builder.typing_env(),
+            )
+    {
+        fn_abi.conv = target_conv;
+        fn_abi.can_unwind = target_can_unwind;
+    }
     if type_param_count == 0 {
         for arg in &fn_abi.args {
             ctx.layout_builder.intern_ir_layout(arg.layout.clone());
@@ -454,7 +487,7 @@ struct MirLowerCtx<'tcx> {
     layout_builder: LayoutTableBuilder<'tcx>,
     param_index_map: BTreeMap<u32, u32>,
     pending_allocs: Vec<AllocId>,
-    seen_allocs: BTreeSet<u64>,
+    alloc_id_map: BTreeMap<u64, u64>,
 }
 
 impl<'tcx> MirLowerCtx<'tcx> {
@@ -468,16 +501,19 @@ impl<'tcx> MirLowerCtx<'tcx> {
             ),
             param_index_map,
             pending_allocs: Vec::new(),
-            seen_allocs: BTreeSet::new(),
+            alloc_id_map: BTreeMap::new(),
         }
     }
 
     fn record_alloc_id(&mut self, alloc_id: AllocId) -> u64 {
         let raw_id = alloc_id.0.get();
-        if self.seen_allocs.insert(raw_id) {
-            self.pending_allocs.push(alloc_id);
+        if let Some(&mapped) = self.alloc_id_map.get(&raw_id) {
+            return mapped;
         }
-        raw_id
+        let next_id = (self.alloc_id_map.len() as u64) + 1;
+        self.alloc_id_map.insert(raw_id, next_id);
+        self.pending_allocs.push(alloc_id);
+        next_id
     }
 
     /// Lowers `rustc_middle::mir::LocalDecl` into `IrLocalDecl`.
@@ -1253,19 +1289,22 @@ impl<'tcx> MirLowerCtx<'tcx> {
         while cursor < self.pending_allocs.len() {
             let alloc_id = self.pending_allocs[cursor];
             cursor += 1;
-            let raw_id = alloc_id.0.get();
-            if out_by_id.contains_key(&raw_id) {
+            let mapped_id = self.record_alloc_id(alloc_id);
+            if out_by_id.contains_key(&mapped_id) {
                 continue;
             }
-            if let Some(captured) = self.extract_global_alloc(alloc_id) {
-                out_by_id.insert(raw_id, captured);
+            if let Some(captured) = self.extract_global_alloc(alloc_id, mapped_id) {
+                out_by_id.insert(mapped_id, captured);
             }
         }
         out_by_id.into_values().collect()
     }
 
-    fn extract_global_alloc(&mut self, alloc_id: AllocId) -> Option<IrCapturedAllocation> {
-        let raw_id = alloc_id.0.get();
+    fn extract_global_alloc(
+        &mut self,
+        alloc_id: AllocId,
+        mapped_id: u64,
+    ) -> Option<IrCapturedAllocation> {
         let const_alloc = match self.tcx.global_alloc(alloc_id) {
             GlobalAlloc::Memory(mem) => mem,
             GlobalAlloc::Static(def_id) => {
@@ -1316,7 +1355,7 @@ impl<'tcx> MirLowerCtx<'tcx> {
         }
 
         Some(IrCapturedAllocation {
-            alloc_id: raw_id,
+            alloc_id: mapped_id,
             bytes,
             relocations,
             align: lower_align(alloc.align),
@@ -2411,3 +2450,601 @@ fn format_span(tcx: TyCtxt<'_>, span: rustc_span::Span) -> String {
     }
     tcx.sess.source_map().span_to_diagnostic_string(span)
 }
+
+/// Returns `true` if `def_id` is a non-local function or method whose `.rmeta`
+/// MIR body is available and should be extracted into `Mir/<CalleeCrate>/<Item>.lean`.
+///
+/// Compiler intrinsics (`#[rustc_intrinsic]`) and foreign items (`extern "C"`)
+/// are excluded so that intrinsic calls continue to dispatch through
+/// `CallConv.rustIntrinsic` in `trusted/lean/Rustc/V2026_06_01/Terminators.lean`.
+pub fn should_capture_non_local_callee(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    if def_id.is_local() {
+        return false;
+    }
+    if !matches!(
+        tcx.def_kind(def_id),
+        DefKind::Fn | DefKind::AssocFn | DefKind::Closure
+    ) {
+        return false;
+    }
+    if tcx.is_foreign_item(def_id) || tcx.is_constructor(def_id) {
+        return false;
+    }
+    if tcx.is_intrinsic(def_id, tcx.item_name(def_id)) {
+        return false;
+    }
+    if !tcx.is_mir_available(def_id) {
+        return false;
+    }
+    let def_path = canonical_def_path(tcx, def_id);
+    if def_path.starts_with("core::panicking::")
+        || def_path.starts_with("std::panicking::")
+        || def_path.starts_with("core::fmt::")
+        || def_path.starts_with("std::fmt::")
+        || def_path.starts_with("alloc::fmt::")
+        || def_path.starts_with("core::ub_checks::")
+        || def_path.ends_with("::precondition_check")
+    {
+        return false;
+    }
+    true
+}
+
+/// Returns a deterministic `(CrateNum, DefIndex)` ordering key for `DefId`.
+pub fn def_id_sort_key(def_id: DefId) -> (u32, u32) {
+    (def_id.krate.as_u32(), def_id.index.as_u32())
+}
+
+fn record_referenced_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner_def_id: DefId,
+    typing_env: rustc_middle::ty::TypingEnv<'tcx>,
+    parent_substs: Option<rustc_middle::ty::GenericArgsRef<'tcx>>,
+    ty: Ty<'tcx>,
+    out: &mut Vec<(DefId, Option<rustc_middle::ty::GenericArgsRef<'tcx>>)>,
+) {
+    use rustc_middle::ty::TypeVisitableExt;
+    let instantiated_ty = if let Some(p_substs) = parent_substs
+        && p_substs.len() == tcx.generics_of(owner_def_id).count()
+        && !ty.has_escaping_bound_vars()
+    {
+        rustc_middle::ty::EarlyBinder::bind(ty)
+            .instantiate(tcx, p_substs)
+            .skip_norm_wip()
+    } else {
+        ty
+    };
+    let ty_resolve_env = if !instantiated_ty.has_non_region_param() {
+        rustc_middle::ty::TypingEnv::fully_monomorphized()
+    } else {
+        typing_env
+    };
+    let effective_ty = if !instantiated_ty.has_escaping_bound_vars() {
+        tcx.try_normalize_erasing_regions(
+            ty_resolve_env,
+            rustc_middle::ty::Unnormalized::new_wip(instantiated_ty),
+        )
+        .unwrap_or(instantiated_ty)
+    } else {
+        instantiated_ty
+    };
+
+    for arg in effective_ty.walk() {
+        let Some(inner_ty) = arg.as_type() else {
+            continue;
+        };
+        match *inner_ty.kind() {
+            TyKind::FnDef(callee_def_id, raw_substs) => {
+                let effective_substs = if let Some(p_substs) = parent_substs
+                    && p_substs.len() == tcx.generics_of(owner_def_id).count()
+                    && !raw_substs.has_escaping_bound_vars()
+                {
+                    rustc_middle::ty::EarlyBinder::bind(raw_substs)
+                        .instantiate(tcx, p_substs)
+                        .skip_norm_wip()
+                } else {
+                    raw_substs
+                };
+                let erased_substs = tcx.erase_and_anonymize_regions(effective_substs);
+                let resolve_env = if !erased_substs.has_non_region_param() {
+                    rustc_middle::ty::TypingEnv::fully_monomorphized()
+                } else {
+                    typing_env
+                };
+                let norm_substs = if !erased_substs.has_escaping_bound_vars() {
+                    tcx.try_normalize_erasing_regions(
+                        resolve_env,
+                        rustc_middle::ty::Unnormalized::new_wip(erased_substs),
+                    )
+                    .unwrap_or(erased_substs)
+                } else {
+                    erased_substs
+                };
+                let callee_substs_opt = if !norm_substs.has_escaping_bound_vars() {
+                    Some(norm_substs)
+                } else {
+                    None
+                };
+                out.push((callee_def_id, callee_substs_opt));
+
+                if !norm_substs.has_escaping_bound_vars()
+                    && let Ok(Some(instance)) = rustc_middle::ty::Instance::try_resolve(
+                        tcx,
+                        resolve_env,
+                        callee_def_id,
+                        norm_substs,
+                    )
+                {
+                    let resolved_id = instance.def_id();
+                    let inst_args = tcx.erase_and_anonymize_regions(instance.args);
+                    let inst_args_opt = if !inst_args.has_escaping_bound_vars() {
+                        Some(inst_args)
+                    } else {
+                        None
+                    };
+                    out.push((resolved_id, inst_args_opt));
+                }
+            }
+            TyKind::Closure(closure_def_id, raw_substs)
+            | TyKind::CoroutineClosure(closure_def_id, raw_substs)
+            | TyKind::Coroutine(closure_def_id, raw_substs) => {
+                let effective_substs = if let Some(p_substs) = parent_substs
+                    && p_substs.len() == tcx.generics_of(owner_def_id).count()
+                    && !raw_substs.has_escaping_bound_vars()
+                {
+                    rustc_middle::ty::EarlyBinder::bind(raw_substs)
+                        .instantiate(tcx, p_substs)
+                        .skip_norm_wip()
+                } else {
+                    raw_substs
+                };
+                let erased_substs = tcx.erase_and_anonymize_regions(effective_substs);
+                let closure_substs_opt = if !erased_substs.has_escaping_bound_vars() {
+                    Some(erased_substs)
+                } else {
+                    None
+                };
+                out.push((closure_def_id, closure_substs_opt));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn record_referenced_alloc<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner_def_id: DefId,
+    typing_env: rustc_middle::ty::TypingEnv<'tcx>,
+    parent_substs: Option<rustc_middle::ty::GenericArgsRef<'tcx>>,
+    alloc_id: AllocId,
+    visited_allocs: &mut BTreeSet<AllocId>,
+    out: &mut Vec<(DefId, Option<rustc_middle::ty::GenericArgsRef<'tcx>>)>,
+) {
+    use rustc_middle::ty::TypeVisitableExt;
+    if !visited_allocs.insert(alloc_id) {
+        return;
+    }
+    match tcx.global_alloc(alloc_id) {
+        GlobalAlloc::Function { instance } => {
+            let raw_args = instance.args;
+            let effective_args = if let Some(p_substs) = parent_substs
+                && p_substs.len() == tcx.generics_of(owner_def_id).count()
+                && !raw_args.has_escaping_bound_vars()
+            {
+                rustc_middle::ty::EarlyBinder::bind(raw_args)
+                    .instantiate(tcx, p_substs)
+                    .skip_norm_wip()
+            } else {
+                raw_args
+            };
+            let inst_args = tcx.erase_and_anonymize_regions(effective_args);
+            let resolve_env = if !inst_args.has_non_region_param() {
+                rustc_middle::ty::TypingEnv::fully_monomorphized()
+            } else {
+                typing_env
+            };
+            let norm_args = if !inst_args.has_escaping_bound_vars() {
+                tcx.try_normalize_erasing_regions(
+                    resolve_env,
+                    rustc_middle::ty::Unnormalized::new_wip(inst_args),
+                )
+                .unwrap_or(inst_args)
+            } else {
+                inst_args
+            };
+            let inst_args_opt = if !norm_args.has_escaping_bound_vars() {
+                Some(norm_args)
+            } else {
+                None
+            };
+            out.push((instance.def_id(), inst_args_opt));
+            if !norm_args.has_escaping_bound_vars()
+                && let Ok(Some(resolved)) = rustc_middle::ty::Instance::try_resolve(
+                    tcx,
+                    resolve_env,
+                    instance.def_id(),
+                    norm_args,
+                )
+            {
+                let res_args = tcx.erase_and_anonymize_regions(resolved.args);
+                let res_args_opt = if !res_args.has_escaping_bound_vars() {
+                    Some(res_args)
+                } else {
+                    None
+                };
+                out.push((resolved.def_id(), res_args_opt));
+            }
+            for arg in norm_args.iter() {
+                if let Some(arg_ty) = arg.as_type() {
+                    record_referenced_ty(
+                        tcx,
+                        owner_def_id,
+                        typing_env,
+                        parent_substs,
+                        arg_ty,
+                        out,
+                    );
+                }
+            }
+        }
+        GlobalAlloc::Memory(mem) => {
+            for &(_, prov) in mem.inner().provenance().ptrs().iter() {
+                record_referenced_alloc(
+                    tcx,
+                    owner_def_id,
+                    typing_env,
+                    parent_substs,
+                    prov.alloc_id(),
+                    visited_allocs,
+                    out,
+                );
+            }
+        }
+        GlobalAlloc::Static(def_id) => {
+            if !tcx.is_foreign_item(def_id)
+                && let Ok(mem) = tcx.eval_static_initializer(def_id)
+            {
+                for &(_, prov) in mem.inner().provenance().ptrs().iter() {
+                    record_referenced_alloc(
+                        tcx,
+                        owner_def_id,
+                        typing_env,
+                        parent_substs,
+                        prov.alloc_id(),
+                        visited_allocs,
+                        out,
+                    );
+                }
+            }
+        }
+        GlobalAlloc::VTable(ty, dyn_ty) => {
+            record_referenced_ty(tcx, owner_def_id, typing_env, parent_substs, ty, out);
+            if let Some(principal) = dyn_ty.principal() {
+                for arg in principal.skip_binder().args.iter() {
+                    if let Some(arg_ty) = arg.as_type() {
+                        record_referenced_ty(
+                            tcx,
+                            owner_def_id,
+                            typing_env,
+                            parent_substs,
+                            arg_ty,
+                            out,
+                        );
+                    }
+                }
+            }
+        }
+        GlobalAlloc::TypeId { .. } => {}
+    }
+}
+
+fn record_referenced_operand<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner_def_id: DefId,
+    typing_env: rustc_middle::ty::TypingEnv<'tcx>,
+    parent_substs: Option<rustc_middle::ty::GenericArgsRef<'tcx>>,
+    op: &Operand<'tcx>,
+    visited_allocs: &mut BTreeSet<AllocId>,
+    out: &mut Vec<(DefId, Option<rustc_middle::ty::GenericArgsRef<'tcx>>)>,
+) {
+    use rustc_middle::ty::TypeVisitableExt;
+    if let Operand::Constant(c) = op {
+        record_referenced_ty(
+            tcx,
+            owner_def_id,
+            typing_env,
+            parent_substs,
+            c.const_.ty(),
+            out,
+        );
+        if let Const::Unevaluated(uneval, _) = c.const_ {
+            for arg in uneval.args.iter() {
+                if let Some(arg_ty) = arg.as_type() {
+                    record_referenced_ty(
+                        tcx,
+                        owner_def_id,
+                        typing_env,
+                        parent_substs,
+                        arg_ty,
+                        out,
+                    );
+                }
+            }
+        }
+        let effective_const = if let Some(p_substs) = parent_substs
+            && p_substs.len() == tcx.generics_of(owner_def_id).count()
+            && !c.const_.has_escaping_bound_vars()
+        {
+            rustc_middle::ty::EarlyBinder::bind(c.const_)
+                .instantiate(tcx, p_substs)
+                .skip_norm_wip()
+        } else {
+            c.const_
+        };
+        let eval_env = if !effective_const.has_non_region_param() {
+            rustc_middle::ty::TypingEnv::fully_monomorphized()
+        } else {
+            typing_env
+        };
+        let cv_opt = match effective_const {
+            Const::Val(cv, _) => Some(cv),
+            _ if !effective_const.has_escaping_bound_vars() => {
+                effective_const.eval(tcx, eval_env, c.span).ok()
+            }
+            _ => None,
+        };
+        if let Some(cv) = cv_opt {
+            match cv {
+                ConstValue::Scalar(Scalar::Ptr(ptr, _)) => {
+                    let (prov, _) = ptr.prov_and_relative_offset();
+                    record_referenced_alloc(
+                        tcx,
+                        owner_def_id,
+                        typing_env,
+                        parent_substs,
+                        prov.alloc_id(),
+                        visited_allocs,
+                        out,
+                    );
+                }
+                ConstValue::Slice { alloc_id, .. } | ConstValue::Indirect { alloc_id, .. } => {
+                    record_referenced_alloc(
+                        tcx,
+                        owner_def_id,
+                        typing_env,
+                        parent_substs,
+                        alloc_id,
+                        visited_allocs,
+                        out,
+                    );
+                }
+                ConstValue::ZeroSized | ConstValue::Scalar(Scalar::Int(_)) => {}
+            }
+        }
+    }
+}
+
+/// Collects all callable `(DefId, Option<GenericArgsRef>)` pairs referenced by
+/// `body` (across `Call` and `TailCall` terminators, `FnDef` constant operands
+/// and local declarations, and concrete trait method resolutions when
+/// `FnDef(def_id, args)` resolves via `rustc_middle::ty::Instance::try_resolve`
+/// to a concrete implementation). When `parent_substs` is provided from a
+/// caller's call-site instantiation, inner `FnDef` substitutions are
+/// instantiated with `parent_substs` so default trait methods (such as
+/// `RangeBounds::contains`) also resolve their transitive trait method calls
+/// (such as `<Range<T> as RangeBounds<T>>::start_bound` and `end_bound`).
+pub fn collect_referenced_callees<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner_def_id: DefId,
+    body: &Body<'tcx>,
+    parent_substs: Option<rustc_middle::ty::GenericArgsRef<'tcx>>,
+) -> Vec<(DefId, Option<rustc_middle::ty::GenericArgsRef<'tcx>>)> {
+    use rustc_middle::ty::TypeVisitableExt;
+    let typing_env = rustc_middle::ty::TypingEnv::post_analysis(tcx, owner_def_id);
+    let mut visited_allocs = BTreeSet::new();
+    let mut out = Vec::new();
+
+    for decl in &body.local_decls {
+        record_referenced_ty(
+            tcx,
+            owner_def_id,
+            typing_env,
+            parent_substs,
+            decl.ty,
+            &mut out,
+        );
+    }
+
+    for bb in body.basic_blocks.iter() {
+        for stmt in &bb.statements {
+            match &stmt.kind {
+                StatementKind::Assign(assign_box) => {
+                    let (_, ref rvalue) = **assign_box;
+                    match rvalue {
+                        Rvalue::Use(op, _)
+                        | Rvalue::Repeat(op, _)
+                        | Rvalue::Cast(_, op, _)
+                        | Rvalue::UnaryOp(_, op)
+                        | Rvalue::WrapUnsafeBinder(op, _) => {
+                            record_referenced_operand(
+                                tcx,
+                                owner_def_id,
+                                typing_env,
+                                parent_substs,
+                                op,
+                                &mut visited_allocs,
+                                &mut out,
+                            );
+                        }
+                        Rvalue::BinaryOp(_, bin_ops) => {
+                            record_referenced_operand(
+                                tcx,
+                                owner_def_id,
+                                typing_env,
+                                parent_substs,
+                                &bin_ops.0,
+                                &mut visited_allocs,
+                                &mut out,
+                            );
+                            record_referenced_operand(
+                                tcx,
+                                owner_def_id,
+                                typing_env,
+                                parent_substs,
+                                &bin_ops.1,
+                                &mut visited_allocs,
+                                &mut out,
+                            );
+                        }
+                        Rvalue::Aggregate(kind, ops) => {
+                            if let AggregateKind::Closure(closure_def_id, substs)
+                            | AggregateKind::CoroutineClosure(closure_def_id, substs)
+                            | AggregateKind::Coroutine(closure_def_id, substs) = **kind
+                            {
+                                let effective_substs = if let Some(p_substs) = parent_substs
+                                    && p_substs.len() == tcx.generics_of(owner_def_id).count()
+                                    && !substs.has_escaping_bound_vars()
+                                {
+                                    rustc_middle::ty::EarlyBinder::bind(substs)
+                                        .instantiate(tcx, p_substs)
+                                        .skip_norm_wip()
+                                } else {
+                                    substs
+                                };
+                                let erased_substs =
+                                    tcx.erase_and_anonymize_regions(effective_substs);
+                                let closure_substs_opt = if !erased_substs.has_escaping_bound_vars()
+                                {
+                                    Some(erased_substs)
+                                } else {
+                                    None
+                                };
+                                out.push((closure_def_id, closure_substs_opt));
+                                for arg in erased_substs.iter() {
+                                    if let Some(inner_ty) = arg.as_type() {
+                                        record_referenced_ty(
+                                            tcx,
+                                            owner_def_id,
+                                            typing_env,
+                                            parent_substs,
+                                            inner_ty,
+                                            &mut out,
+                                        );
+                                    }
+                                }
+                            }
+                            for op in ops {
+                                record_referenced_operand(
+                                    tcx,
+                                    owner_def_id,
+                                    typing_env,
+                                    parent_substs,
+                                    op,
+                                    &mut visited_allocs,
+                                    &mut out,
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                StatementKind::Intrinsic(ndi) => match &**ndi {
+                    NonDivergingIntrinsic::Assume(op) => {
+                        record_referenced_operand(
+                            tcx,
+                            owner_def_id,
+                            typing_env,
+                            parent_substs,
+                            op,
+                            &mut visited_allocs,
+                            &mut out,
+                        );
+                    }
+                    NonDivergingIntrinsic::CopyNonOverlapping(cno) => {
+                        record_referenced_operand(
+                            tcx,
+                            owner_def_id,
+                            typing_env,
+                            parent_substs,
+                            &cno.src,
+                            &mut visited_allocs,
+                            &mut out,
+                        );
+                        record_referenced_operand(
+                            tcx,
+                            owner_def_id,
+                            typing_env,
+                            parent_substs,
+                            &cno.dst,
+                            &mut visited_allocs,
+                            &mut out,
+                        );
+                        record_referenced_operand(
+                            tcx,
+                            owner_def_id,
+                            typing_env,
+                            parent_substs,
+                            &cno.count,
+                            &mut visited_allocs,
+                            &mut out,
+                        );
+                    }
+                },
+                _ => {}
+            }
+        }
+        if let Some(ref terminator) = bb.terminator {
+            match &terminator.kind {
+                TerminatorKind::Call { func, args, .. }
+                | TerminatorKind::TailCall { func, args, .. } => {
+                    record_referenced_operand(
+                        tcx,
+                        owner_def_id,
+                        typing_env,
+                        parent_substs,
+                        func,
+                        &mut visited_allocs,
+                        &mut out,
+                    );
+                    for arg in args {
+                        record_referenced_operand(
+                            tcx,
+                            owner_def_id,
+                            typing_env,
+                            parent_substs,
+                            &arg.node,
+                            &mut visited_allocs,
+                            &mut out,
+                        );
+                    }
+                }
+                TerminatorKind::SwitchInt { discr, .. } => {
+                    record_referenced_operand(
+                        tcx,
+                        owner_def_id,
+                        typing_env,
+                        parent_substs,
+                        discr,
+                        &mut visited_allocs,
+                        &mut out,
+                    );
+                }
+                TerminatorKind::Assert { cond, .. } => {
+                    record_referenced_operand(
+                        tcx,
+                        owner_def_id,
+                        typing_env,
+                        parent_substs,
+                        cond,
+                        &mut visited_allocs,
+                        &mut out,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    out
+}
+

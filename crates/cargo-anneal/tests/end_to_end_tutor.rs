@@ -361,6 +361,7 @@ end Proof.FrameTutor.pin_magic
         manifest_path: None,
         units_dir: units_dir.clone(),
         rustc_wrapper: Some(wrapper_bin.clone()),
+        out_dir: None,
         anneal_repo_root: Some(checkout_root.clone()),
         from_existing_units: true,
         init_specs: false,
@@ -558,11 +559,11 @@ fn tutor_chapters_match_the_tutor_workflow() {
     let bin_dir_arg = bin_dir.to_str().expect("utf8 bin dir");
     let output = run_tutor_workflow(
         &checkout_root,
-        &["check", "--no-build", "--bin-dir", bin_dir_arg],
+        &["run", "--no-build", "--bin-dir", bin_dir_arg],
     );
     assert!(
         output.status.success(),
-        "`{TUTOR_WORKFLOW_SCRIPT} check` failed:\nstdout:\n{}\nstderr:\n{}",
+        "`{TUTOR_WORKFLOW_SCRIPT} run` failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );

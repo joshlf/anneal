@@ -1869,8 +1869,252 @@ def isThinRawPtrTy (ty : Ty) : Bool :=
   | _ => false
 
 /--
-Check that `fnInputs` pointwise match the `RigidTy` kinds of the leading
-parameter declarations in `paramDecls`.
+Test whether `ty` is a wide raw pointer type (`RigidTy.rawPtr _ pointee` where
+`pointee` is a dynamically-sized `.slice _`, `.str`, or `.dynamic _`).
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Pointer types to DSTs are sized but have twice the size of pointers to sized
+> types"
+-/
+def isWideRawPtrTy (ty : Ty) : Bool :=
+  match ty.kind with
+  | .rawPtr _ (.slice _) => true
+  | .rawPtr _ .str => true
+  | .rawPtr _ (.dynamic _) => true
+  | _ => false
+
+/--
+Test whether `v` is valid second-word metadata for a wide pointer (`Value.scalar`
+for slice/`str` length or vtable address, or `Value.ptr` for vtable provenance).
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Pointer types to DSTs are sized but have twice the size of pointers to sized
+> types"
+-/
+@[reducible]
+def isWidePtrMetadata : Value → Bool
+  | .scalar _ => true
+  | .ptr _ _ => true
+  | _ => false
+
+/--
+Test whether `kind` is a slice or `str` reference or raw pointer (`&[T]`,
+`&mut [T]`, `*const [T]`, `*mut [T]`, `&str`, `&mut str`, `*const str`, or
+`*mut str`), which is always represented at runtime as a wide pointer
+aggregate `[ptr, len]`.
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Pointer types to DSTs are sized but have twice the size of pointers to sized
+> types"
+-/
+@[reducible]
+def isSlicePtrOrRefKind : RigidTy → Bool
+  | .ref _ (.slice _) => true
+  | .rawPtr _ (.slice _) => true
+  | .ref _ .str => true
+  | .rawPtr _ .str => true
+  | _ => false
+
+/--
+Test whether `kind` is a trait-object reference or raw pointer (`&dyn Trait`,
+`&mut dyn Trait`, `*const dyn Trait`, or `*mut dyn Trait`), which requires
+wide-pointer vtable metadata.
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Pointer types to DSTs are sized but have twice the size of pointers to sized
+> types"
+-/
+@[reducible]
+def isDynPtrOrRefKind : RigidTy → Bool
+  | .ref _ (.dynamic _) => true
+  | .rawPtr _ (.dynamic _) => true
+  | _ => false
+
+/--
+Test whether `kind` is a reference or raw pointer whose pointee is statically
+known to be thin (not a slice, `str`, `dyn Trait`, generic parameter, alias,
+ADT with a potentially unsized tail, or non-empty tuple).
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Pointer types to DSTs are sized but have twice the size of pointers to sized
+> types"
+-/
+@[reducible]
+def isStrictlyThinPtrOrRefKind : RigidTy → Bool
+  | .ref _ (.slice _) => false
+  | .ref _ .str => false
+  | .ref _ (.dynamic _) => false
+  | .ref _ (.param _ _) => false
+  | .ref _ (.alias _ _) => false
+  | .ref _ (.adt _ _) => false
+  | .ref _ (.tuple (_ :: _)) => false
+  | .ref _ _ => true
+  | .rawPtr _ (.slice _) => false
+  | .rawPtr _ .str => false
+  | .rawPtr _ (.dynamic _) => false
+  | .rawPtr _ (.param _ _) => false
+  | .rawPtr _ (.alias _ _) => false
+  | .rawPtr _ (.adt _ _) => false
+  | .rawPtr _ (.tuple (_ :: _)) => false
+  | .rawPtr _ _ => true
+  | _ => false
+
+/--
+Check that an unsizing coercion preserves pointer mutability rules (`&mut` / `*mut`
+can coerce to shared or mutable, whereas shared `&` / `*const` can only coerce to
+shared/const).
+
+Reference (The Rust Reference, "Unsized Coercions"):
+<https://doc.rust-lang.org/1.98.0/reference/type-coercions.html#unsized-coercions>
+
+> "The following coercions are called `unsized coercions`...
+> * `&T` to `&U`
+> * `&mut T` to `&mut U`
+> * `&mut T` to `&U`
+> * `*const T` to `*const U`
+> * `*mut T` to `*mut U`
+> * `*mut T` to `*const U`"
+-/
+@[reducible]
+def unsizeMutabilityCompatible (srcMut dstMut : Mutability) : Bool :=
+  Bool.or (mutabilityEq srcMut .mut) (mutabilityEq dstMut .not)
+
+/--
+Check that a pointer coercion from `opTy` to `targetKind` obeys Rust pointer
+mutability and reference/raw-pointer direction rules (no coercion upgrades
+shared/const `.not` to `.mut`, and a raw pointer is never coerced to a
+reference).
+
+Reference (The Rust Reference, "Type coercions"):
+<https://doc.rust-lang.org/1.98.0/reference/type-coercions.html#coercion-types>
+
+> "* `&mut T` to `&T`
+> * `*mut T` to `*const T`
+> * `&T` to `*const T`
+> * `&mut T` to `*mut T`"
+-/
+@[reducible]
+def pointerCoercionTypesCompatible
+    (opTy : Option Ty)
+    (targetKind : RigidTy) :
+    Bool :=
+  match opTy with
+  | .none => true
+  | .some { kind := .ref srcMut _, .. } =>
+    match targetKind with
+    | .ref dstMut _ => unsizeMutabilityCompatible srcMut dstMut
+    | .rawPtr dstMut _ => unsizeMutabilityCompatible srcMut dstMut
+    | _ => true
+  | .some { kind := .rawPtr srcMut _, .. } =>
+    match targetKind with
+    | .ref _ _ => false
+    | .rawPtr dstMut _ => unsizeMutabilityCompatible srcMut dstMut
+    | _ => true
+  | .some _ => true
+
+/--
+Check that a pointer with provenance tag `tag` in `borrows` is not `.disabled`
+(and is not `.frozen` when coerced to a mutable reference or mutable raw pointer).
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+-/
+@[reducible]
+def unsizeBorrowPermCompatible
+    (borrows : List BorrowEntry)
+    (tag : Nat)
+    (targetKind : RigidTy) :
+    Bool :=
+  match lookupBorrow borrows tag with
+  | .none => true
+  | .some entry =>
+    match entry.perm, targetKind with
+    | .disabled, _ => false
+    | .frozen, .ref .mut _ => false
+    | .frozen, .rawPtr .mut _ => false
+    | _, _ => true
+
+/--
+When coercing a fixed-size array reference or raw pointer (`&[T; n]` or
+`*const [T; n]`) to a slice reference or raw pointer (`&[T]` or `*const [T]`)
+via `PointerCoercion::Unsize`, validate source/target mutability, element type
+equality, 64-bit `usize` length range (`n < scalarModulus 8`), and Tree Borrows
+tag permission, and extract the static array length `n` for the resulting wide
+pointer's metadata.
+
+Reference (The Rust Reference, "Unsized Coercions"):
+<https://doc.rust-lang.org/1.98.0/reference/type-coercions.html#unsized-coercions>
+
+> "* `[T; n]` to `[T]`."
+-/
+@[reducible]
+def unsizeArrayLen?
+    (coercionKind : String)
+    (opTy : Option Ty)
+    (targetKind : RigidTy)
+    (borrows : List BorrowEntry := .nil)
+    (tag : Nat := 0) :
+    Option Nat :=
+  match
+    Bool.and
+      (stringEq coercionKind "Unsize")
+      (unsizeBorrowPermCompatible borrows tag targetKind)
+  with
+  | false => .none
+  | true =>
+    match targetKind, opTy with
+    | .ref dstMut (.slice dstElem), .some { kind := .ref srcMut (.array srcElem n), .. } =>
+      match
+        Bool.and
+          (Nat.blt n (scalarModulus 8))
+          (Bool.and
+            (unsizeMutabilityCompatible srcMut dstMut)
+            (rigidTyEq srcElem dstElem))
+      with
+      | true => .some n
+      | false => .none
+    | .rawPtr dstMut (.slice dstElem), .some { kind := .rawPtr srcMut (.array srcElem n), .. } =>
+      match
+        Bool.and
+          (Nat.blt n (scalarModulus 8))
+          (Bool.and
+            (unsizeMutabilityCompatible srcMut dstMut)
+            (rigidTyEq srcElem dstElem))
+      with
+      | true => .some n
+      | false => .none
+    | .rawPtr dstMut (.slice dstElem), .some { kind := .ref srcMut (.array srcElem n), .. } =>
+      match
+        Bool.and
+          (Nat.blt n (scalarModulus 8))
+          (Bool.and
+            (unsizeMutabilityCompatible srcMut dstMut)
+            (rigidTyEq srcElem dstElem))
+      with
+      | true => .some n
+      | false => .none
+    | _, _ => .none
+
+/--
+Test whether a monomorphized caller `RigidTy` matches a (possibly polymorphic)
+callee declaration `RigidTy` once every generic parameter `.param idx _` in the
+declaration is resolved to `typeArgs[idx]`, the monomorphized type arguments of
+the call target (`ResolvedCallTarget.typeArgs`, recorded for reified function
+pointers in `FnPtrEntry.typeArgs`). A parameter without a type argument fails
+closed, so a polymorphic body is only accepted at the instantiation it was
+reified for.
 
 Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -1880,13 +2124,78 @@ Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
 > /// locals for the function arguments, followed by any user-declared
 > /// variables and temporaries."
 -/
-def calleeParamTysMatch : List RigidTy → List LocalDecl → Bool
+def rigidTyMatchesCalleeDecl (typeArgs : List RigidTy) : Nat → RigidTy → RigidTy → Bool
+  | .zero, callerTy, declTy => rigidTyEq callerTy declTy
+  | .succ _, callerTy, .param idx _ =>
+    match get? typeArgs idx with
+    | .some argTy => rigidTyEq callerTy argTy
+    | .none => false
+  | .succ fuel, .ref m1 t1, .ref m2 t2 =>
+    Bool.and (mutabilityEq m1 m2) (rigidTyMatchesCalleeDecl typeArgs fuel t1 t2)
+  | .succ fuel, .rawPtr m1 t1, .rawPtr m2 t2 =>
+    Bool.and (mutabilityEq m1 m2) (rigidTyMatchesCalleeDecl typeArgs fuel t1 t2)
+  | .succ fuel, .slice t1, .slice t2 =>
+    rigidTyMatchesCalleeDecl typeArgs fuel t1 t2
+  | .succ fuel, .array t1 n1, .array t2 n2 =>
+    Bool.and (Nat.beq n1 n2) (rigidTyMatchesCalleeDecl typeArgs fuel t1 t2)
+  | .succ fuel, .tuple (t1 :: ts1), .tuple (t2 :: ts2) =>
+    Bool.and
+      (rigidTyMatchesCalleeDecl typeArgs fuel t1 t2)
+      (rigidTyMatchesCalleeDecl typeArgs fuel (.tuple ts1) (.tuple ts2))
+  | .succ fuel, .adt p1 (a1 :: as1), .adt p2 (a2 :: as2) =>
+    Bool.and
+      (stringEq p1 p2)
+      (Bool.and
+        (rigidTyMatchesCalleeDecl typeArgs fuel a1 a2)
+        (rigidTyMatchesCalleeDecl typeArgs fuel (.tuple as1) (.tuple as2)))
+  | .succ fuel, .fnDef p1 (a1 :: as1), .fnDef p2 (a2 :: as2) =>
+    Bool.and
+      (stringEq p1 p2)
+      (Bool.and
+        (rigidTyMatchesCalleeDecl typeArgs fuel a1 a2)
+        (rigidTyMatchesCalleeDecl typeArgs fuel (.tuple as1) (.tuple as2)))
+  | .succ fuel, .closure p1 (a1 :: as1), .closure p2 (a2 :: as2) =>
+    Bool.and
+      (stringEq p1 p2)
+      (Bool.and
+        (rigidTyMatchesCalleeDecl typeArgs fuel a1 a2)
+        (rigidTyMatchesCalleeDecl typeArgs fuel (.tuple as1) (.tuple as2)))
+  | .succ fuel, .alias p1 (a1 :: as1), .alias p2 (a2 :: as2) =>
+    Bool.and
+      (stringEq p1 p2)
+      (Bool.and
+        (rigidTyMatchesCalleeDecl typeArgs fuel a1 a2)
+        (rigidTyMatchesCalleeDecl typeArgs fuel (.tuple as1) (.tuple as2)))
+  | .succ fuel, .fnPtr in1 out1 s1 abi1, .fnPtr in2 out2 s2 abi2 =>
+    Bool.and
+      (safetyEq s1 s2)
+      (Bool.and
+        (callConvEq abi1 abi2)
+        (Bool.and
+          (rigidTyMatchesCalleeDecl typeArgs fuel out1 out2)
+          (rigidTyMatchesCalleeDecl typeArgs fuel (.tuple in1) (.tuple in2))))
+  | .succ _, callerTy, declTy => rigidTyEq callerTy declTy
+
+/--
+Check that `fnInputs` pointwise match the `RigidTy` kinds of the leading
+parameter declarations in `paramDecls`, resolving generic `RigidTy.param` slots
+of polymorphic `CapturedMir` bodies through `typeArgs`.
+
+Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/mod.rs#L225-L246>
+
+> "/// The first local is the return value pointer, followed by `arg_count`
+> /// locals for the function arguments, followed by any user-declared
+> /// variables and temporaries."
+-/
+def calleeParamTysMatch (typeArgs : List RigidTy) : List RigidTy → List LocalDecl → Bool
   | .nil, _ => true
   | _ :: _, .nil => false
   | inputTy :: restInputs, decl :: restDecls =>
     Bool.and
-      (rigidTyEq inputTy decl.ty.kind)
-      (calleeParamTysMatch restInputs restDecls)
+      (rigidTyMatchesCalleeDecl typeArgs 8 inputTy decl.ty.kind)
+      (calleeParamTysMatch typeArgs restInputs restDecls)
 
 /--
 Validate that a callee's `localDecls` (when non-empty) has at least `argCount`
@@ -1905,6 +2214,7 @@ Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
 > /// variables and temporaries."
 -/
 def calleeLocalDeclsCompatible
+    (typeArgs : List RigidTy)
     (localDecls : List LocalDecl)
     (argCount : Nat)
     (fnInputs : List RigidTy)
@@ -1916,8 +2226,8 @@ def calleeLocalDeclsCompatible
     Bool.and
       (Nat.ble argCount (length paramDecls))
       (Bool.and
-        (rigidTyEq fnOutput retDecl.ty.kind)
-        (calleeParamTysMatch fnInputs paramDecls))
+        (rigidTyMatchesCalleeDecl typeArgs 8 fnOutput retDecl.ty.kind)
+        (calleeParamTysMatch typeArgs fnInputs paramDecls))
 
 /--
 Check whether an explicit `ReifyFnPointer(Safety)` or `ClosureFnPointer(Safety)`
@@ -2547,6 +2857,7 @@ def checkCalleeSig
         match c.typeParamCount, effectiveTypeArgs with
         | 0, .nil =>
           calleeLocalDeclsCompatible
+            .nil
             c.localDecls
             c.argCount
             fnInputs
@@ -2556,6 +2867,7 @@ def checkCalleeSig
           Bool.and
             (Nat.beq (length effectiveTypeArgs) c.typeParamCount)
             (calleeLocalDeclsCompatible
+              effectiveTypeArgs
               (instantiateLocalDeclKinds
                 (typeSubstOfRigidTys effectiveTypeArgs)
                 c.localDecls)
@@ -2679,10 +2991,47 @@ def evalReifyFnPointer
     RvalueEvalResult :=
   match isReifyFnPointerCoercion coercionKind with
   | false =>
+    let opTy := operandTy localDecls layouts op
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok (.ptr ptrVal sz) locals' => .ok (.ptr ptrVal sz) locals' mem
-    | .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' =>
-      .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
+    | .ok (.ptr ptrVal sz) locals' =>
+      match
+        unsizeArrayLen?
+          coercionKind
+          opTy
+          targetTy.kind
+          mem.borrows
+          ptrVal.tag
+      with
+      | .some n =>
+        .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar ⟨n, 8⟩ :: .nil)) locals' mem
+      | .none =>
+        match isSlicePtrOrRefKind targetTy.kind with
+        | true => .ub
+        | false =>
+          match
+            Bool.and
+              (unsizeBorrowPermCompatible mem.borrows ptrVal.tag targetTy.kind)
+              (pointerCoercionTypesCompatible opTy targetTy.kind)
+          with
+          | false => .ub
+          | true =>
+            match isDynPtrOrRefKind targetTy.kind with
+            | true => .unsupported
+            | false => .ok (.ptr ptrVal sz) locals' mem
+    | .ok (.aggregate 0 (.ptr ptrVal sz :: metaVal :: .nil)) locals' =>
+      match isWidePtrMetadata metaVal with
+      | true =>
+        match
+          Bool.and
+            (unsizeBorrowPermCompatible mem.borrows ptrVal.tag targetTy.kind)
+            (Bool.and
+              (pointerCoercionTypesCompatible opTy targetTy.kind)
+              (Bool.not (isStrictlyThinPtrOrRefKind targetTy.kind)))
+        with
+        | true =>
+          .ok (.aggregate 0 (.ptr ptrVal sz :: metaVal :: .nil)) locals' mem
+        | false => .ub
+      | false => .unsupported
     | .ok _ _ => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported
@@ -3059,6 +3408,46 @@ def evalRvalue
               }
               .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
         | .none => .ub
+      | .some (.init (.aggregate 0 (.ptr parentPtr sz :: metaVal :: .nil))) =>
+        match isWidePtrMetadata metaVal, restProj with
+        | true, .nil =>
+          match lookupBorrow mem.borrows parentPtr.tag with
+          | .some parentEntry =>
+            match parentEntry.perm, borrowKind with
+            | .disabled, _ => .ub
+            | .frozen, .mut _ => .ub
+            | _, _ =>
+              let tag := mem.nextTag
+              let entry : BorrowEntry := {
+                tag := tag
+                targetLocal := parentEntry.targetLocal
+                targetProjection := parentEntry.targetProjection
+                perm := perm
+                rangeOffset := parentEntry.rangeOffset
+                rangeLen := parentEntry.rangeLen
+              }
+              let mem' := {
+                mem with
+                borrows := entry :: mem.borrows
+                nextTag := Nat.add tag 1
+              }
+              .ok
+                (.aggregate 0
+                  (.ptr { allocId := tag, offsetBytes := parentPtr.offsetBytes } sz ::
+                    metaVal :: .nil))
+                locals
+                mem'
+          | .none =>
+            match borrowKind, lookupGlobalAlloc mem.globals parentPtr.allocId with
+            | .shared, .some _ =>
+              .ok (.aggregate 0 (.ptr parentPtr sz :: metaVal :: .nil)) locals mem
+            | .mut _, .some alloc =>
+              match alloc.mutability with
+              | .mut =>
+                .ok (.aggregate 0 (.ptr parentPtr sz :: metaVal :: .nil)) locals mem
+              | .not => .ub
+            | _, _ => .ub
+        | _, _ => .ub
       | _ => .ub
     | _ =>
       match get? locals place.local_ with
@@ -3117,6 +3506,46 @@ def evalRvalue
               }
               .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
         | .none => .ub
+      | .some (.init (.aggregate 0 (.ptr parentPtr sz :: metaVal :: .nil))) =>
+        match isWidePtrMetadata metaVal, restProj with
+        | true, .nil =>
+          match lookupBorrow mem.borrows parentPtr.tag with
+          | .some parentEntry =>
+            match parentEntry.perm, mutability with
+            | .disabled, _ => .ub
+            | .frozen, .mut => .ub
+            | _, _ =>
+              let tag := mem.nextTag
+              let entry : BorrowEntry := {
+                tag := tag
+                targetLocal := parentEntry.targetLocal
+                targetProjection := parentEntry.targetProjection
+                perm := perm
+                rangeOffset := parentEntry.rangeOffset
+                rangeLen := parentEntry.rangeLen
+              }
+              let mem' := {
+                mem with
+                borrows := entry :: mem.borrows
+                nextTag := Nat.add tag 1
+              }
+              .ok
+                (.aggregate 0
+                  (.ptr { allocId := tag, offsetBytes := parentPtr.offsetBytes } sz ::
+                    metaVal :: .nil))
+                locals
+                mem'
+          | .none =>
+            match mutability, lookupGlobalAlloc mem.globals parentPtr.allocId with
+            | .not, .some _ =>
+              .ok (.aggregate 0 (.ptr parentPtr sz :: metaVal :: .nil)) locals mem
+            | .mut, .some alloc =>
+              match alloc.mutability with
+              | .mut =>
+                .ok (.aggregate 0 (.ptr parentPtr sz :: metaVal :: .nil)) locals mem
+              | .not => .ub
+            | _, _ => .ub
+        | _, _ => .ub
       | _ => .ub
     | _ =>
       match get? locals place.local_ with
@@ -3167,11 +3596,23 @@ def evalRvalue
     | .ok _ _ => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported
-  | .cast .ptrToPtr op _ =>
+  | .cast .ptrToPtr op targetTy =>
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok (.ptr ptrVal sz) locals' => .ok (.ptr ptrVal sz) locals' mem
-    | .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' =>
-      .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
+    | .ok (.ptr ptrVal sz) locals' =>
+      match isThinRawPtrTy targetTy with
+      | true => .ok (.ptr ptrVal sz) locals' mem
+      | false => .ub
+    | .ok (.aggregate 0 (.ptr ptrVal sz :: metaVal :: .nil)) locals' =>
+      match isWidePtrMetadata metaVal with
+      | true =>
+        match isThinRawPtrTy targetTy with
+        | true => .ok (.ptr ptrVal sz) locals' mem
+        | false =>
+          match isWideRawPtrTy targetTy with
+          | true =>
+            .ok (.aggregate 0 (.ptr ptrVal sz :: metaVal :: .nil)) locals' mem
+          | false => .ub
+      | false => .unsupported
     | .ok _ _ => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported

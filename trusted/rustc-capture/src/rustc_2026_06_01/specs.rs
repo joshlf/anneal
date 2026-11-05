@@ -25,7 +25,7 @@ use rustc_middle::ty::TyCtxt;
 
 use crate::lean_emit::IrContractRole;
 use crate::manifest::CapturedItemKind;
-use crate::rustc_2026_06_01::mir_lower::canonical_def_path;
+use crate::rustc_2026_06_01::mir_lower::{canonical_def_path, query_post_cleanup_mir};
 
 /// Prefix emitted by `anodized` for synthetic precondition companion functions.
 pub const ANODIZED_REQUIRES_PREFIX: &str = "__anodized_fn_requires_";
@@ -188,6 +188,7 @@ impl CrateContractIndex {
     pub fn build(tcx: TyCtxt<'_>, local_defs: &[LocalDefId]) -> Self {
         let crate_name = tcx.crate_name(LOCAL_CRATE).to_string();
         let mut siblings_by_parent = BTreeMap::new();
+        let mut local_def_ids_by_parent = BTreeMap::new();
         let mut local_def_paths = BTreeSet::new();
 
         for &local_def_id in local_defs {
@@ -196,7 +197,8 @@ impl CrateContractIndex {
             local_def_paths.insert(def_path.clone());
             if let Some(ident) = item_short_name(tcx, def_id) {
                 let parent = opt_parent_key(tcx, def_id);
-                siblings_by_parent.insert((parent, ident), def_path);
+                siblings_by_parent.insert((parent, ident.clone()), def_path);
+                local_def_ids_by_parent.insert((parent, ident), local_def_id);
             }
         }
 
@@ -212,13 +214,22 @@ impl CrateContractIndex {
             if let Some(spec_ident) = ident.strip_prefix(ANNEAL_EXT_SPEC_TARGET_PREFIX) {
                 let raw_target =
                     eval_const_str_item(tcx, def_id).unwrap_or_else(|| spec_ident.to_owned());
-                let resolved_target = normalize_target_path(
-                    &crate_name,
-                    &raw_target,
-                    parent,
-                    &siblings_by_parent,
-                    &local_def_paths,
-                );
+                let resolved_target = if !spec_ident.starts_with("__anneal_attr_")
+                    && let Some(&sidecar_local_id) =
+                        local_def_ids_by_parent.get(&(parent, spec_ident.to_owned()))
+                    && let Some(from_mir) =
+                        resolve_external_spec_target_from_sidecar(tcx, sidecar_local_id, &raw_target)
+                {
+                    from_mir
+                } else {
+                    normalize_target_path(
+                        &crate_name,
+                        &raw_target,
+                        parent,
+                        &siblings_by_parent,
+                        &local_def_paths,
+                    )
+                };
                 external_spec_targets.insert((parent, spec_ident.to_owned()), resolved_target);
             } else if let Some(model_ident) = ident.strip_prefix(ANNEAL_MODEL_PREFIX) {
                 let target_ident =
@@ -448,6 +459,121 @@ impl CrateContractIndex {
     }
 }
 
+fn extract_sidecar_target_fn_def<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sidecar_def_id: DefId,
+    mut ty: rustc_middle::ty::Ty<'tcx>,
+    resolve_trait_impl: bool,
+) -> Option<DefId> {
+    use rustc_middle::ty::TypeVisitableExt;
+    loop {
+        match ty.kind() {
+            rustc_middle::ty::TyKind::Ref(_, inner, _)
+            | rustc_middle::ty::TyKind::RawPtr(inner, _) => {
+                ty = *inner;
+            }
+            rustc_middle::ty::TyKind::FnDef(def_id, args) => {
+                if *def_id == sidecar_def_id {
+                    return None;
+                }
+                let path = canonical_def_path(tcx, *def_id);
+                if path == "core::hint::black_box"
+                    || path.starts_with("core::panicking::")
+                    || path.starts_with("core::fmt::")
+                    || path.contains("__anodized_fn_")
+                {
+                    return None;
+                }
+                if resolve_trait_impl
+                    && tcx
+                        .opt_parent(*def_id)
+                        .is_some_and(|p| matches!(tcx.def_kind(p), DefKind::Trait))
+                {
+                    let typing_env = rustc_middle::ty::TypingEnv::post_analysis(tcx, sidecar_def_id);
+                    let erased_args = tcx.erase_and_anonymize_regions(*args);
+                    let resolve_env = if !erased_args.has_non_region_param() {
+                        rustc_middle::ty::TypingEnv::fully_monomorphized()
+                    } else {
+                        typing_env
+                    };
+                    let norm_args = if !erased_args.has_escaping_bound_vars() {
+                        tcx.try_normalize_erasing_regions(
+                            resolve_env,
+                            rustc_middle::ty::Unnormalized::new_wip(erased_args),
+                        )
+                        .unwrap_or(erased_args)
+                    } else {
+                        erased_args
+                    };
+                    if !norm_args.has_escaping_bound_vars()
+                        && let Ok(Some(instance)) = rustc_middle::ty::Instance::try_resolve(
+                            tcx,
+                            resolve_env,
+                            *def_id,
+                            norm_args,
+                        )
+                    {
+                        return Some(instance.def_id());
+                    }
+                }
+                return Some(*def_id);
+            }
+            _ => return None,
+        }
+    }
+}
+
+pub(crate) fn resolve_sidecar_target_def_id_from_body<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    sidecar_def_id: DefId,
+    body: &rustc_middle::mir::Body<'tcx>,
+    resolve_trait_impl: bool,
+) -> Option<DefId> {
+    for decl in &body.local_decls {
+        if let Some(target_def_id) =
+            extract_sidecar_target_fn_def(tcx, sidecar_def_id, decl.ty, resolve_trait_impl)
+        {
+            return Some(target_def_id);
+        }
+    }
+    for bb in body.basic_blocks.iter() {
+        if let rustc_middle::mir::TerminatorKind::Call {
+            func: rustc_middle::mir::Operand::Constant(c),
+            ..
+        } = &bb.terminator().kind
+            && let Some(target_def_id) = extract_sidecar_target_fn_def(
+                tcx,
+                sidecar_def_id,
+                c.const_.ty(),
+                resolve_trait_impl,
+            )
+        {
+            return Some(target_def_id);
+        }
+    }
+    None
+}
+
+/// Resolves the canonical `def_path` of the target function referenced inside an
+/// `#[external_spec(for = <target>)]` sidecar function's signature-check
+/// statement.
+///
+/// When `raw_target` specifies a concrete trait-impl projection (`<Type as Trait>::method`),
+/// resolves the trait method `FnDef` through `rustc_middle::ty::Instance::try_resolve`
+/// so the contract targets only that specific implementation rather than every
+/// implementation of the trait method.
+fn resolve_external_spec_target_from_sidecar(
+    tcx: TyCtxt<'_>,
+    sidecar_local_def_id: LocalDefId,
+    raw_target: &str,
+) -> Option<String> {
+    let sidecar_def_id = sidecar_local_def_id.to_def_id();
+    let resolve_trait_impl = raw_target.contains(" as ") || raw_target.trim_start().starts_with('<');
+    let body = query_post_cleanup_mir(tcx, sidecar_local_def_id);
+    resolve_sidecar_target_def_id_from_body(tcx, sidecar_def_id, body, resolve_trait_impl)
+        .map(|target_def_id| canonical_def_path(tcx, target_def_id))
+}
+
 pub(crate) fn normalize_target_path(
     crate_name: &str,
     raw_target: &str,
@@ -455,7 +581,7 @@ pub(crate) fn normalize_target_path(
     siblings_by_parent: &BTreeMap<(ParentKey, String), String>,
     local_def_paths: &BTreeSet<String>,
 ) -> String {
-    let cleaned = raw_target
+    let mut cleaned = raw_target
         .split("::")
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -463,6 +589,33 @@ pub(crate) fn normalize_target_path(
         .join("::");
     if cleaned.is_empty() {
         return crate_name.to_owned();
+    }
+    if let Some(rest) = cleaned.strip_prefix("crate::") {
+        cleaned = format!("{crate_name}::{rest}");
+    } else if let Some(rest) = cleaned.strip_prefix("self::") {
+        if let Some(sibling) = siblings_by_parent.get(&(parent, rest.to_owned())) {
+            return sibling.clone();
+        }
+        cleaned = format!("{crate_name}::{rest}");
+    }
+    for std_mod in [
+        "slice", "ops", "ptr", "mem", "cmp", "option", "result", "num", "convert", "default",
+        "iter", "marker", "hint", "cell", "char", "str", "array", "clone", "hash", "fmt", "any",
+        "arch", "ascii", "borrow", "ffi", "future", "pin", "sync::atomic",
+    ] {
+        let std_prefix = format!("std::{std_mod}::");
+        if let Some(rest) = cleaned.strip_prefix(&std_prefix) {
+            cleaned = format!("core::{std_mod}::{rest}");
+            break;
+        }
+    }
+    if let Some((bracket_head, method)) = cleaned.rsplit_once(">::")
+        && let Some(inner) = bracket_head.strip_prefix('<')
+        && inner.starts_with('[')
+        && inner.ends_with(']')
+        && !inner.contains(" as ")
+    {
+        return format!("core::slice::<impl [T]>::{method}");
     }
     if local_def_paths.contains(&cleaned) || cleaned.starts_with(&format!("{crate_name}::")) {
         return cleaned;

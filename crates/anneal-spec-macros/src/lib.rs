@@ -527,10 +527,14 @@ fn expand_external_spec(args: TokenStream2, input: TokenStream2) -> Result<Token
         block: Box::new(fallback_body),
     };
 
+    let had_no_spec_fields = ext_args.spec_fields.fields.is_empty();
+    let sig_before = item_fn.sig.to_token_stream().to_string();
+
     // Parse the `anodized` specification fields against the sidecar signature
     // first so any `Spec!(T)` refinement markers are stripped from parameter
     // and return types before constructing the signature check.
     let spec = FnSpec::from_spec_and_signature(ext_args.spec_fields, &mut item_fn.sig)?;
+    let sig_unchanged = item_fn.sig.to_token_stream().to_string() == sig_before;
 
     let sig_check_stmt = build_signature_check_stmt(&item_fn.sig, &ext_args.target_path)?;
     item_fn.block.stmts.insert(0, sig_check_stmt);
@@ -543,8 +547,12 @@ fn expand_external_spec(args: TokenStream2, input: TokenStream2) -> Result<Token
     let marker_ident = format_ident!("__ANNEAL_EXT_SPEC_TARGET_{}", item_fn.sig.ident);
     let target_str = &ext_args.target_path_str;
 
-    let instrumented_fn = EMBED_MODE.instrument_item_fn(spec, item_fn)?;
-    let instrumented_fn = rewrite_anodized_root_paths(instrumented_fn)?;
+    let instrumented_fn = if had_no_spec_fields && sig_unchanged {
+        quote!(#item_fn)
+    } else {
+        let raw = EMBED_MODE.instrument_item_fn(spec, item_fn)?;
+        rewrite_anodized_root_paths(raw)?
+    };
 
     Ok(quote! {
         #[doc(hidden)]
@@ -577,7 +585,8 @@ fn build_signature_check_stmt(sig: &Signature, target_path: &ExprPath) -> Result
 
     if !uses_impl_trait {
         Ok(parse_quote! {
-            let _: #unsafety #abi fn(#(#input_tys),*) #output = #target_path;
+            let _: #unsafety #abi fn(#(#input_tys),*) #output =
+                *::core::hint::black_box(&#target_path);
         })
     } else {
         // Function pointer types cannot mention `impl Trait`, so fall back to a
@@ -592,7 +601,7 @@ fn build_signature_check_stmt(sig: &Signature, target_path: &ExprPath) -> Result
             parse_quote!(#target_path(#(#fake_args),*))
         };
         Ok(parse_quote! {
-            if false {
+            if ::core::hint::black_box(false) {
                 return #call_expr;
             }
         })
@@ -1430,6 +1439,26 @@ mod tests {
         assert!(expanded.contains("__anodized_fn_qualifiers_spec_wrapping"));
         assert!(expanded.contains("__anodized_fn_requires_spec_wrapping"));
         assert!(expanded.contains("__anodized_fn_ensures_spec_wrapping"));
+    }
+
+    #[test]
+    fn external_spec_supports_clauseless_declaration() {
+        let args = quote! {
+            for = core::slice::from_raw_parts_mut
+        };
+        let input = quote! {
+            unsafe fn spec_from_raw_parts_mut<'a, T>(data: *mut T, len: usize) -> &'a mut [T];
+        };
+
+        let expanded = expand_external_spec(args, input)
+            .expect("clause-less expand_external_spec should succeed")
+            .to_string();
+
+        assert!(expanded.contains("__ANNEAL_EXT_SPEC_TARGET_spec_from_raw_parts_mut"));
+        assert!(expanded.contains("\"core::slice::from_raw_parts_mut\""));
+        assert!(expanded.contains("fn spec_from_raw_parts_mut"));
+        assert!(!expanded.contains("__anodized_fn_requires_spec_from_raw_parts_mut"));
+        assert!(!expanded.contains("__anodized_fn_ensures_spec_from_raw_parts_mut"));
     }
 
     #[test]
