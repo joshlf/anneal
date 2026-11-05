@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 exocrate::config! {
     const CONFIG: Config = Config {
-        rel_dir_path: [".anneal", "toolchain"],
+        rel_dir_path: ["anneal", "toolchain"],
         versioned_files: &["../Cargo.toml"],
     };
 }

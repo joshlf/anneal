@@ -1147,7 +1147,7 @@ pub fn default_lean_path() -> PathBuf {
         .into_iter()
         .chain(std::iter::once(home.clone()))
     {
-        let tc_base = base.join(".anneal/toolchain");
+        let tc_base = base.join("anneal/toolchain");
         if let Ok(entries) = fs::read_dir(&tc_base) {
             let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = entries
                 .filter_map(Result::ok)
