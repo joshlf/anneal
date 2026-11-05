@@ -3593,6 +3593,17 @@ theorem paddedStructOk_minirust_padding_bytes :
             .Init 5 none, .Init 6 none, .Uninit, .Uninit] :=
   ⟨rfl, rfl, rfl⟩
 
+/-- On `Terminator::Return` at step `7` of `paddedStructOps`, `evalReturn` calls
+`storageDead` on every callee local (`_0`..`_2`, allocations `1..=3`), verifying
+`BM.deallocate` against each local's layout (`size = 12, align = 4` for the two
+`Padded(u8, u32, u16)` struct locals `_1` and `_2` at allocations `2` and `3`)
+and marking all three callee stack allocations `live = false` while keeping the
+caller's return allocation `0` `live = true`. -/
+theorem paddedStructOk_minirust_ret_dealloc :
+    (Interp.steps 7 paddedStructOkMInit).toOption.map
+        (fun m => m.mem.memory.allocations.map (fun a => (a.live, a.data.length))) =
+      some [(true, 4), (false, 4), (false, 12), (false, 12)] := rfl
+
 /-! ## Nested padded tuples `((u8, u32), u16, ())`, zero-sized `()`, nested `Field` projections (`_4.0.1`), and tuple UB paths -/
 
 def innerTupleLayout : TypeLayout :=
@@ -3888,6 +3899,17 @@ theorem nestedTupleOk_minirust_padding_bytes :
       some [] :=
   ⟨rfl, rfl, rfl, rfl⟩
 
+/-- On `Terminator::Return` at step `13` of `nestedTupleOps`, `evalReturn` calls
+`storageDead` on every callee local (`_0`..`_4`, allocations `1..=5`), verifying
+`BM.deallocate` against each local's layout (`size = 8, align = 4` for
+`_2 : (u8, u32)`, `size = 0, align = 1` for `_3 : ()`, and `size = 12, align = 4`
+for `_4 : ((u8, u32), u16, ())`) and marking all five callee stack allocations
+`live = false` while keeping the caller's return allocation `0` `live = true`. -/
+theorem nestedTupleOk_minirust_ret_dealloc :
+    (Interp.steps 13 nestedTupleOkMInit).toOption.map
+        (fun m => m.mem.memory.allocations.map (fun a => (a.live, a.data.length))) =
+      some [(true, 4), (false, 4), (false, 4), (false, 8), (false, 0), (false, 12)] := rfl
+
 /-- `_1 = 1u32`: branches to `bb2` and faults when `Aggregate(Tuple)` evaluates
 its second operand `copy _0` while `_0` is `.uninit`. -/
 def nestedTupleAggUbS0 : MachineState := initMachineState nestedTupleOps (nestedArgs 1)
@@ -3910,6 +3932,16 @@ theorem nestedTupleAggUb_minirust_direct :
     Interp.steps 3 nestedTupleAggUbMInit =
       .error (.ub "load at type but the data in memory violates the language invariant") := rfl
 
+theorem nestedTupleAggUb_converse_error :
+    (∃ msg, Stop.ub "load at type but the data in memory violates the language invariant" = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree nestedTupleOps (nestedArgs 1)) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 3 ∧ Interp.steps k nestedTupleAggUbMInit = .ok mRet ∧
+      ReturnRel nestedTupleOps ctxNested5 s' v mRet ∧
+      ReachesRet (mirCallTree nestedTupleOps (nestedArgs 1)) tr (.normal (v, mem))) :=
+  mirCall_steps_error nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
+    (ctxNested5_ok rfl rfl) (nestedArgs 1) (by decide)
+    nestedTupleAggUbMInit rfl rfl rfl nestedTupleAggUb_minirust_direct
+
 /-- `_1 = 2u32`: branches to `bb3` and faults on division by zero in the RHS of
 `_2.1 = Div(copy _1, const 0_u32)`. -/
 def nestedTupleFieldRhsUbS0 : MachineState := initMachineState nestedTupleOps (nestedArgs 2)
@@ -3930,6 +3962,16 @@ theorem nestedTupleFieldRhsUb_minirust_ub_from_start :
 
 theorem nestedTupleFieldRhsUb_minirust_direct :
     Interp.steps 4 nestedTupleFieldRhsUbMInit = .error (.ub "division by zero") := rfl
+
+theorem nestedTupleFieldRhsUb_converse_error :
+    (∃ msg, Stop.ub "division by zero" = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree nestedTupleOps (nestedArgs 2)) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 4 ∧ Interp.steps k nestedTupleFieldRhsUbMInit = .ok mRet ∧
+      ReturnRel nestedTupleOps ctxNested5 s' v mRet ∧
+      ReachesRet (mirCallTree nestedTupleOps (nestedArgs 2)) tr (.normal (v, mem))) :=
+  mirCall_steps_error nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
+    (ctxNested5_ok rfl rfl) (nestedArgs 2) (by decide)
+    nestedTupleFieldRhsUbMInit rfl rfl rfl nestedTupleFieldRhsUb_minirust_direct
 
 /-- `_1 = 3u32`: branches to `bb4` and faults when `_4.0 = Aggregate(Tuple, [copy _4.0.0, copy _0])`
 evaluates its uninitialized second operand `copy _0`. -/
@@ -3952,6 +3994,16 @@ theorem nestedTupleCopyUninitUb_minirust_ub_from_start :
 theorem nestedTupleCopyUninitUb_minirust_direct :
     Interp.steps 3 nestedTupleCopyUninitUbMInit =
       .error (.ub "load at type but the data in memory violates the language invariant") := rfl
+
+theorem nestedTupleCopyUninitUb_converse_error :
+    (∃ msg, Stop.ub "load at type but the data in memory violates the language invariant" = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree nestedTupleOps (nestedArgs 3)) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 3 ∧ Interp.steps k nestedTupleCopyUninitUbMInit = .ok mRet ∧
+      ReturnRel nestedTupleOps ctxNested5 s' v mRet ∧
+      ReachesRet (mirCallTree nestedTupleOps (nestedArgs 3)) tr (.normal (v, mem))) :=
+  mirCall_steps_error nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
+    (ctxNested5_ok rfl rfl) (nestedArgs 3) (by decide)
+    nestedTupleCopyUninitUbMInit rfl rfl rfl nestedTupleCopyUninitUb_minirust_direct
 
 def unsizedSliceTupleTy : Gen.Type :=
   .Tuple [(⟨0⟩, .Int u8)]

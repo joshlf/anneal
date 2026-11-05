@@ -400,6 +400,7 @@ open MiniRustSpec.Correspondence.Witness in
   paddedStructOk_minirust_ret_from_start
   paddedStructOk_minirust_direct
   paddedStructOk_minirust_padding_bytes
+  paddedStructOk_minirust_ret_dealloc
   ctxNested5_ok
   nestedTupleOps_inFragment
   nestedTupleOps_translate
@@ -408,15 +409,19 @@ open MiniRustSpec.Correspondence.Witness in
   nestedTupleOk_minirust_ret_from_start
   nestedTupleOk_minirust_direct
   nestedTupleOk_minirust_padding_bytes
+  nestedTupleOk_minirust_ret_dealloc
   nestedTupleAggUb_anneal_ub
   nestedTupleAggUb_minirust_ub_from_start
   nestedTupleAggUb_minirust_direct
+  nestedTupleAggUb_converse_error
   nestedTupleFieldRhsUb_anneal_ub
   nestedTupleFieldRhsUb_minirust_ub_from_start
   nestedTupleFieldRhsUb_minirust_direct
+  nestedTupleFieldRhsUb_converse_error
   nestedTupleCopyUninitUb_anneal_ub
   nestedTupleCopyUninitUb_minirust_ub_from_start
   nestedTupleCopyUninitUb_minirust_direct
+  nestedTupleCopyUninitUb_converse_error
   tuple_encode_decode_place_edge_cases
 
 #assert_standard_axioms
@@ -605,6 +610,7 @@ open MiniRustSpec.Correspondence.Witness in
   paddedStructOk_minirust_ret_from_start
   paddedStructOk_minirust_direct
   paddedStructOk_minirust_padding_bytes
+  paddedStructOk_minirust_ret_dealloc
   nestedTupleOps_inFragment
   nestedTupleOps_translate
   nestedTupleOk_anneal_ret
@@ -612,15 +618,19 @@ open MiniRustSpec.Correspondence.Witness in
   nestedTupleOk_minirust_ret_from_start
   nestedTupleOk_minirust_direct
   nestedTupleOk_minirust_padding_bytes
+  nestedTupleOk_minirust_ret_dealloc
   nestedTupleAggUb_anneal_ub
   nestedTupleAggUb_minirust_ub_from_start
   nestedTupleAggUb_minirust_direct
+  nestedTupleAggUb_converse_error
   nestedTupleFieldRhsUb_anneal_ub
   nestedTupleFieldRhsUb_minirust_ub_from_start
   nestedTupleFieldRhsUb_minirust_direct
+  nestedTupleFieldRhsUb_converse_error
   nestedTupleCopyUninitUb_anneal_ub
   nestedTupleCopyUninitUb_minirust_ub_from_start
   nestedTupleCopyUninitUb_minirust_direct
+  nestedTupleCopyUninitUb_converse_error
   tuple_encode_decode_place_edge_cases
 
 end MiniRustSpec.Audit
