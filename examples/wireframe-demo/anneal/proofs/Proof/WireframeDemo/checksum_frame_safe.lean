@@ -3,12 +3,13 @@ import Anneal
 import Mir.WireframeDemo.checksum_frame_safe
 import Specs.WireframeDemo.checksum_frame_safe
 import Obligations.WireframeDemo.checksum_frame_safe
+set_option maxHeartbeats 4000000
 
 namespace Proof.WireframeDemo.checksum_frame_safe
 
 set_option linter.all false
 set_option maxRecDepth 200000
-set_option maxHeartbeats 200000
+set_option maxHeartbeats 4000000
 
 open Trusted.Sequence
 open Trusted.Rustc.V2026_06_01.Layout
@@ -223,7 +224,7 @@ private def evalOperandFast (ctx : BlockCtx) (locals : List LocalSlot) (op : Ope
                 | .some (.init targetRootVal) =>
                   match
                     resolveStackThinPtrTargetProj?
-                      callerLocals
+                      locals
                       targetRootVal
                       entry
                       ptrVal
@@ -340,7 +341,7 @@ private def evalOperandFast (ctx : BlockCtx) (locals : List LocalSlot) (op : Ope
                 | .some (.init targetRootVal) =>
                   match
                     resolveStackThinPtrTargetProj?
-                      callerLocals
+                      locals
                       targetRootVal
                       entry
                       ptrVal
@@ -521,6 +522,9 @@ private theorem evalRvalueFast_eq
       | _ => rfl
     | neg => rfl
     | ptrMetadata => rfl
+  | ref bk p =>
+    dsimp only [evalRvalueFast, evalRvalue]
+    cases bk <;> cases p.projection <;> rfl
   | _ => rfl
 
 private def finishAssignStmtNodeFast
@@ -1270,8 +1274,7 @@ theorem verified :
       hb0, hb1, hb2, hb3, hb4, hb5, hb6, hb7,
       rfl, h_callee, h_stack, h_borrows, h_caller⟩
   rcases mem with
-    ⟨nextAllocId, globals, borrows, nextTag, callees,
-      callStack, activeCallee, activeProtectors, nextProtector, callerLocals⟩
+    ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack, activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩
   dsimp at h_callee h_stack h_borrows h_caller
   subst h_callee h_stack h_borrows h_caller
   refine ⟨.scalar ⟨bigEndianWordSum4 b0 b1 b2 b3 b4 b5 b6 b7, 4⟩, ?_, ?_⟩
@@ -1288,6 +1291,7 @@ theorem verified :
       evalRvalueFast,
       evalOperandFast, evalConstValue,
       evalScalarBinOp, evalUnaryNot,
+      Trusted.Effect.SumE, Trusted.Effect.Effect.I, Trusted.Effect.Effect.O, Trusted.Rustc.V2026_06_01.MirSemantics.MirEffect,
       operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
       intCastTargetBytes, shiftLeftBits, shiftRightUnsignedBits, scalarPow2_eight,
       scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
@@ -1300,6 +1304,7 @@ theorem verified :
       rootFrame8Ptr, frame8Value, sharedFrame8Borrow, frame8SlotIdx,
       readProjectedValue_nil, readProjectedValue_field, readProjectedValue_index,
       ProvenancePtr.tag, lookupBorrow, appendProjections, stripTransparentProjections,
+      freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, BlockCtx.localDecls, BlockCtx.layouts, BlockCtx.body, not, Bool.rec, Bool.casesOn, safeCtx,
       projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
       byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
       isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
