@@ -6,3 +6,9 @@ publish = false
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+anneal-trace = { path = "../../../crates/anneal-trace" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(anneal_trace_ext)'] }

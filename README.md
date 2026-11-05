@@ -32,16 +32,38 @@ no errors, then the verified code is correct. [`DESIGN.md`](DESIGN.md) defines a
 2. if the trusted code in its **TCB** is correct, and its trusted assumptions
    are jointly valid, then its requested **claim** holds.
 
-The [`trusted/`](trusted/README.md) directory isolates every part of Anneal on
-which those two assertions depend without checked evidence. The invariant of
-`trusted/` is that **auditing `trusted/` alone is sufficient to verify that
-Anneal upholds [`PRINCIPLES.md`](PRINCIPLES.md) and [`DESIGN.md`](DESIGN.md)**:
-an auditor never needs to inspect code outside `trusted/` to trust a
+The [`trusted/`](trusted/README.md) directory isolates every first-party
+component of Anneal on which those two assertions depend without checked
+evidence. The invariant of `trusted/` is that **auditing `trusted/` and its
+explicit, pinned dependency manifest is sufficient to verify that Anneal upholds
+[`PRINCIPLES.md`](PRINCIPLES.md) and [`DESIGN.md`](DESIGN.md)**: an auditor
+never needs to inspect first-party code outside `trusted/` to trust a
 verification result. This must remain true in the face of adversarial
 implementations in any other part of the repository.
 
+To keep the human audit surface tractable and reliable, `trusted/` permits
+battle-tested, widely-used external libraries for routine utilities (such as
+command-line flag parsing, serialization, and trace logging). Using established
+libraries for generic infrastructure is strongly preferred over hand-rolling
+bespoke implementations inside `trusted/`, which inflates audit burden and
+invites defect-prone reinvented wheels.
+
 (Currently, `.github` is an exception to this rule, although we aim to tighten
 that as well.)
+
+## Design documentation
+
+- [`PRINCIPLES.md`](PRINCIPLES.md): Anneal's mission, correctness promise, and
+  decision-making priority order.
+- [`DESIGN.md`](DESIGN.md): Durable architectural design contract and invariants.
+- [`docs/design.md`](docs/design.md): Overall system design, end-to-end
+  verification workflow, library-centric verification, multi-modal
+  specifications, and incremental adoption.
+- [`docs/architecture.md`](docs/architecture.md): The three-stage MIR pipeline,
+  repository layout, `rustc` extraction lifecycle, and multi-version toolchain
+  strategy.
+- [`docs/trust-model.md`](docs/trust-model.md): The `trusted/` vs. `theory/`
+  boundary, Statement-Origin Separation, and repository CI boundary auditing.
 
 ## Repository layout and trust boundary
 

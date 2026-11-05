@@ -181,6 +181,7 @@ fn end_to_end_four_demo_user_journeys() {
         item_filter: None,
         allow_impl_edit: None,
         filter: None,
+        out_dir: None,
         extra_cargo_args: Vec::new(),
     };
 

@@ -352,7 +352,19 @@ def evalCopySingleDirect
 
 /--
 Evaluate `copy_nonoverlapping` once `srcVal`, `dstVal`, and scalar `countBits`
-have been evaluated into `locals₃`.
+have been evaluated into `locals₃`, supporting direct element copies,
+byte-encoded copies into initialized or union destinations, and untyped copies
+of uninitialized union bytes (`FieldsShape.union`) into a union destination.
+
+Reference (`core::intrinsics::copy_nonoverlapping`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.copy_nonoverlapping.html>
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "The following is a non-exhaustive list of invalid values:
+> - A value of any type, other than a union or raw pointer, with uninitialized
+>   bytes (except for padding bytes, which may be uninitialized)."
 -/
 def evalCopyNonOverlappingWithCount
     (s : MachineState)
@@ -677,6 +689,109 @@ def evalCopyNonOverlappingWithCount
                     writeDstVal (.aggregate 0 dstElems')
               | .ok srcSubVal, .ok dstSubVal =>
                 copyViaBytes srcSubVal dstSubVal
+              | .ok srcSubVal, .ub =>
+                match Nat.beq dstStart 0 with
+                | true => copyViaBytes srcSubVal .unit
+                | false => MirStepNode.fail .ub
+              | .ub, _ =>
+                match
+                  srcRootVal,
+                  dstRootVal,
+                  srcEntry.targetProjection,
+                  dstEntry.targetProjection
+                with
+                | .aggregate _ srcFields,
+                  .aggregate dstVar dstFields,
+                  .field _ srcFieldTy :: .nil,
+                  .field _ dstFieldTy :: .nil =>
+                  let overlaps :=
+                    match Nat.beq srcPtr.tag dstPtr.tag with
+                    | true => true
+                    | false =>
+                      Nat.beq srcEntry.targetLocal dstEntry.targetLocal
+                  match overlaps with
+                  | true => MirStepNode.fail .ub
+                  | false =>
+                    let elemBytesOpt : Option Nat :=
+                      match operandPointeeTy localDecls layouts src with
+                      | .some pt => rigidTyByteSize layouts pt
+                      | .none => .some 1
+                    match
+                      elemBytesOpt,
+                      rigidTyByteSize layouts srcFieldTy,
+                      rigidTyByteSize layouts dstFieldTy
+                    with
+                    | .some elemSz, .some srcPlaceBytes, .some dstPlaceBytes =>
+                      let copyByteLen := Nat.mul n elemSz
+                      let inBounds :=
+                        Bool.and
+                          (Nat.ble (Nat.add srcStart copyByteLen) srcPlaceBytes)
+                          (Nat.ble (Nat.add dstStart copyByteLen) dstPlaceBytes)
+                      match inBounds with
+                      | false => MirStepNode.fail .ub
+                      | true =>
+                        match
+                          encodeUnionFieldsWith
+                            (encodeUntypedValueToBytes defaultCodecFuel)
+                            srcPlaceBytes
+                            srcFields
+                        with
+                        | .none => MirStepNode.fail .ub
+                        | .some srcUnionBytes =>
+                          match
+                            sliceAbstractBytes srcUnionBytes srcStart copyByteLen
+                          with
+                          | .none => MirStepNode.fail .ub
+                          | .some copiedBytes =>
+                            match
+                              Bool.and
+                                (Nat.beq dstStart 0)
+                                (Nat.beq copyByteLen dstPlaceBytes),
+                              decodeValueFromBytes
+                                defaultCodecFuel
+                                layouts
+                                dstFieldTy
+                                copiedBytes
+                            with
+                            | true, .some decodedVal => writeDstVal decodedVal
+                            | _, _ =>
+                              let dstIsUnion : Bool :=
+                                match get? localDecls dstEntry.targetLocal with
+                                | .some decl =>
+                                  match
+                                    LayoutTable.lookup layouts decl.ty.layoutIdx
+                                  with
+                                  | .some l =>
+                                    match l.fields with
+                                    | .union _ => true
+                                    | _ => false
+                                  | .none => false
+                                | .none => false
+                              match dstIsUnion with
+                              | false => MirStepNode.fail .ub
+                              | true =>
+                                let resetUnion :=
+                                  Value.aggregate dstVar (takeValues 1 dstFields)
+                                match
+                                  set?
+                                    locals₃
+                                    dstEntry.targetLocal
+                                    (.init resetUnion)
+                                with
+                                | .some locals₄ =>
+                                  let borrows' :=
+                                    invalidateConflictingBorrows
+                                      s.memory.borrows
+                                      dstEntry.targetLocal
+                                      (.some dstPtr.tag)
+                                  MirStepNode.step
+                                    (advanceStmt
+                                      s
+                                      locals₄
+                                      { s.memory with borrows := borrows' })
+                                | .none => MirStepNode.fail .ub
+                    | _, _, _ => MirStepNode.fail .ub
+                | _, _, _, _ => MirStepNode.fail .ub
               | _, _ => MirStepNode.fail .ub
             | _, _ => MirStepNode.fail .ub
       | _, _ => MirStepNode.fail .ub

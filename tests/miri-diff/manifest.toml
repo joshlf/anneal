@@ -151,6 +151,7 @@ name = "ub_unchecked_add_overflow_u32"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/unchecked_add1.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:203:14"
 fuel = 128
 
 [[tests]]
@@ -158,6 +159,7 @@ name = "ub_unchecked_add_overflow_i32"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/unchecked_add2.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:208:14"
 fuel = 128
 
 [[tests]]
@@ -165,6 +167,7 @@ name = "ub_unchecked_sub_underflow_u32"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/unchecked_sub1.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:213:14"
 fuel = 128
 
 [[tests]]
@@ -172,6 +175,7 @@ name = "ub_unchecked_mul_overflow_u16"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/unchecked_mul1.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:218:14"
 fuel = 128
 
 [[tests]]
@@ -179,6 +183,7 @@ name = "ub_unchecked_shl_overflow"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/unchecked_shl.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:223:14"
 fuel = 128
 
 [[tests]]
@@ -186,6 +191,7 @@ name = "ub_unchecked_shr_overflow"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/unchecked_shr.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:228:14"
 fuel = 128
 
 [[tests]]
@@ -193,6 +199,7 @@ name = "ub_unchecked_div_by_zero"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/div-by-zero.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:233:14"
 fuel = 128
 
 [[tests]]
@@ -200,6 +207,7 @@ name = "ub_unchecked_div_signed_min_overflow"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/unchecked_div1.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:238:14"
 fuel = 128
 
 [[tests]]
@@ -207,6 +215,7 @@ name = "ub_unchecked_rem_by_zero"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/rem-by-zero.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:243:14"
 fuel = 128
 
 [[tests]]
@@ -214,6 +223,7 @@ name = "ub_exact_div_non_multiple"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/exact_div1.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:248:14"
 fuel = 128
 
 [[tests]]
@@ -256,6 +266,7 @@ name = "ub_transmute_invalid_bool"
 category = "type_validity_and_transmute"
 upstream_path = "tests/fail/validity/invalid_bool.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:294:28"
 fuel = 128
 
 [[tests]]
@@ -263,6 +274,7 @@ name = "ub_transmute_invalid_char_surrogate"
 category = "type_validity_and_transmute"
 upstream_path = "tests/fail/validity/invalid_char.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:300:28"
 fuel = 128
 
 [[tests]]
@@ -270,6 +282,7 @@ name = "ub_transmute_invalid_char_out_of_range"
 category = "type_validity_and_transmute"
 upstream_path = "tests/fail/validity/invalid_char.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:306:28"
 fuel = 128
 
 [[tests]]
@@ -277,6 +290,7 @@ name = "ub_transmute_invalid_enum_tag"
 category = "type_validity_and_transmute"
 upstream_path = "tests/fail/validity/invalid_enum_tag.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:312:32"
 fuel = 128
 
 [[tests]]
@@ -284,6 +298,7 @@ name = "ub_transmute_invalid_bool_through_ptr"
 category = "type_validity_and_transmute"
 upstream_path = "tests/fail/validity/transmute_through_ptr.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:323:5"
 fuel = 128
 [tests.known_anneal_bug]
 status = "open_bug"
@@ -305,18 +320,13 @@ category = "uninit_and_padding"
 upstream_path = "tests/pass/move-uninit-primval.rs"
 miri_verdict = "pass:scalar:5:4"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "completeness_false_positive_ub"
-observed_anneal_tag = "ub"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Places"
-summary = "Union storage for Uninit<[u8; 4]> is represented as a 1-field unit aggregate rather than raw byte/variant storage, causing copy_nonoverlapping and field assignment on union fields to fault with FailureKind.ub."
 
 [[tests]]
 name = "ub_read_uninit_u32"
 category = "uninit_and_padding"
 upstream_path = "tests/fail/validity/uninit_integer.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:357:14"
 fuel = 128
 
 [[tests]]
@@ -324,6 +334,7 @@ name = "ub_read_uninit_bool"
 category = "uninit_and_padding"
 upstream_path = "tests/fail/validity/invalid_bool_uninit.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:363:14"
 fuel = 128
 
 [[tests]]
@@ -331,6 +342,7 @@ name = "ub_read_uninit_byte_from_array"
 category = "uninit_and_padding"
 upstream_path = "tests/fail/uninit/uninit_byte_read.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:369:14"
 fuel = 128
 
 [[tests]]
@@ -338,6 +350,7 @@ name = "ub_read_struct_padding_byte"
 category = "uninit_and_padding"
 upstream_path = "tests/fail/uninit/padding-struct.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:378:35"
 fuel = 128
 
 [[tests]]
@@ -400,6 +413,7 @@ name = "ub_deref_null_ptr_read"
 category = "places_projections_and_pointers"
 upstream_path = "tests/fail/dangling_pointers/null_pointer_deref.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:445:14"
 fuel = 128
 
 [[tests]]
@@ -407,6 +421,7 @@ name = "ub_deref_null_ptr_write"
 category = "places_projections_and_pointers"
 upstream_path = "tests/fail/dangling_pointers/null_pointer_write.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:452:9"
 fuel = 128
 
 [[tests]]
@@ -414,6 +429,7 @@ name = "ub_deref_dead_local_ptr"
 category = "places_projections_and_pointers"
 upstream_path = "tests/fail/dangling_pointers/storage_dead_dangling.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:462:14"
 fuel = 128
 
 [[tests]]
@@ -421,6 +437,7 @@ name = "ub_ptr_offset_oob_read"
 category = "places_projections_and_pointers"
 upstream_path = "tests/fail/dangling_pointers/out_of_bounds_read.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:471:9"
 fuel = 128
 [tests.known_anneal_bug]
 status = "open_bug"
@@ -434,6 +451,7 @@ name = "ub_ptr_offset_oob_write"
 category = "places_projections_and_pointers"
 upstream_path = "tests/fail/dangling_pointers/out_of_bounds_write.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:481:9"
 fuel = 128
 [tests.known_anneal_bug]
 status = "open_bug"
@@ -447,6 +465,7 @@ name = "ub_ptr_offset_negative_before_start"
 category = "places_projections_and_pointers"
 upstream_path = "tests/fail/intrinsics/ptr_offset_out_of_bounds_neg.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:490:22"
 fuel = 128
 [tests.known_anneal_bug]
 status = "open_bug"
@@ -460,6 +479,7 @@ name = "ub_unaligned_ptr_read_u32"
 category = "places_projections_and_pointers"
 upstream_path = "tests/fail/unaligned_pointers/unaligned_ptr1.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:504:9"
 fuel = 128
 [tests.known_anneal_bug]
 status = "open_bug"
@@ -494,6 +514,7 @@ name = "ub_assume_false"
 category = "intrinsics"
 upstream_path = "tests/fail/intrinsics/assume.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:545:9"
 fuel = 128
 
 [[tests]]
@@ -501,6 +522,7 @@ name = "ub_copy_nonoverlapping_overlapping"
 category = "intrinsics"
 upstream_path = "tests/fail/intrinsics/copy_overlapping.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:555:9"
 fuel = 128
 
 [[tests]]
@@ -508,6 +530,7 @@ name = "ub_unreachable_executed"
 category = "intrinsics"
 upstream_path = "tests/fail/unreachable.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:562:14"
 fuel = 128
 
 [[tests]]
@@ -530,18 +553,13 @@ category = "tree_borrows"
 upstream_path = "tests/pass/both_borrows/interior_mutability.rs"
 miri_verdict = "pass:scalar:42:4"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "completeness_false_positive_ub"
-observed_anneal_tag = "ub"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Memory"
-summary = "BorrowKind.shared unconditionally assigns Tree Borrows Permission.frozen without checking whether the pointee type contains UnsafeCell (!Freeze), rejecting valid interior-mutable writes with FailureKind.ub."
 
 [[tests]]
 name = "ub_tb_use_frozen_mut_after_parent_read"
 category = "tree_borrows"
 upstream_path = "tests/fail/both_borrows/outdated_local.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:607:5"
 fuel = 128
 
 [[tests]]
@@ -549,6 +567,7 @@ name = "ub_tb_write_through_shared_ref_cast_mut"
 category = "tree_borrows"
 upstream_path = "tests/fail/both_borrows/shr_frozen_violation1.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:617:9"
 fuel = 128
 
 [[tests]]
@@ -556,6 +575,7 @@ name = "ub_tb_conflicting_active_mut_borrows"
 category = "tree_borrows"
 upstream_path = "tests/fail/both_borrows/aliasing_mut1.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:631:5"
 fuel = 128
 
 [[tests]]
@@ -563,6 +583,28 @@ name = "ub_tb_parent_write_disables_shared_ref"
 category = "tree_borrows"
 upstream_path = "tests/fail/tree_borrows/parent_read_freezes_raw_mut.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:642:5"
+fuel = 128
+
+[[tests]]
+name = "tb_child_write_then_parent_read"
+category = "tree_borrows"
+upstream_path = "tests/pass/tree_borrows/reserved.rs"
+miri_verdict = "pass:scalar:1:4"
+fuel = 128
+
+[[tests]]
+name = "tb_child_write_then_parent_write"
+category = "tree_borrows"
+upstream_path = "tests/pass/tree_borrows/reserved.rs"
+miri_verdict = "pass:scalar:3:4"
+fuel = 128
+
+[[tests]]
+name = "safe_reborrow_then_parent_write"
+category = "tree_borrows"
+upstream_path = "tests/pass/tree_borrows/reborrow-is-read.rs"
+miri_verdict = "pass:scalar:7:4"
 fuel = 128
 
 [[tests]]

@@ -89,10 +89,16 @@ private def evalOperandFast (locals : List LocalSlot) (op : Operand)
   match op with
   | .constant c =>
     match c.val with
-    | .indirect _ _ => evalOperandFallback locals (.constant c) borrows globals layouts callerLocals
-    | .slice _ _ => evalOperandFallback locals (.constant c) borrows globals layouts callerLocals
+    | .indirect allocId offset =>
+      match lookupGlobalAlloc globals allocId with
+      | .some _ =>
+        match evalConstValue (.indirect allocId offset) c.ty globals layouts with
+        | .some v => .ok v locals
+        | .none => .ub
+      | .none => .unsupported
+    | .unevaluated _ => .unsupported
     | cv =>
-      match evalConstValue cv with
+      match evalConstValue cv c.ty globals layouts with
       | .some v => .ok v locals
       | .none => .unsupported
   | .copy p =>
@@ -105,19 +111,11 @@ private def evalOperandFast (locals : List LocalSlot) (op : Operand)
           match entry.perm with
           | .disabled => .ub
           | _ =>
-            match get? locals entry.targetLocal with
-            | .some (.init targetRootVal) =>
-              let fullProj :=
-                match entry.targetProjection with
-                | .nil => restProj
-                | ph :: pt => ph :: appendProjections pt restProj
-              match readProjectedValue locals targetRootVal fullProj with
-              | .ok fieldVal => .ok fieldVal locals
-              | .ub => .ub
-              | .unsupported => .unsupported
-            | .some _ => .ub
-            | .none =>
-              match get? callerLocals entry.targetLocal with
+            match
+              needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+            with
+            | false =>
+              match get? locals entry.targetLocal with
               | .some (.init targetRootVal) =>
                 let fullProj :=
                   match entry.targetProjection with
@@ -127,8 +125,79 @@ private def evalOperandFast (locals : List LocalSlot) (op : Operand)
                 | .ok fieldVal => .ok fieldVal locals
                 | .ub => .ub
                 | .unsupported => .unsupported
-              | _ => .ub
-        | .none => evalDerefGlobalFallback globals ptrVal sz locals restProj
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  let fullProj :=
+                    match entry.targetProjection with
+                    | .nil => restProj
+                    | ph :: pt => ph :: appendProjections pt restProj
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | _ => .ub
+            | true =>
+              match get? locals entry.targetLocal with
+              | .some (.init targetRootVal) =>
+                match
+                  resolveStackThinPtrTargetProj?
+                    locals
+                    targetRootVal
+                    entry
+                    ptrVal
+                    restProj
+                with
+                | .none => .ub
+                | .some fullProj =>
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  match
+                    resolveStackThinPtrTargetProj?
+                      locals
+                      targetRootVal
+                      entry
+                      ptrVal
+                      restProj
+                  with
+                  | .none => .ub
+                  | .some fullProj =>
+                    match readProjectedValue locals targetRootVal fullProj with
+                    | .ok fieldVal => .ok fieldVal locals
+                    | .ub => .ub
+                    | .unsupported => .unsupported
+                | _ => .ub
+        | .none =>
+          match lookupGlobalAlloc globals ptrVal.allocId with
+          | .some alloc =>
+            evalGlobalDerefRead
+              locals
+              alloc
+              ptrVal.offsetBytes
+              sz
+              restProj
+              layouts
+              .none
+          | .none => .ub
+      | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
+        evalSliceFatPtrDerefRead
+          locals
+          ptrVal
+          ptrSz
+          lenSc
+          restProj
+          borrows
+          globals
+          layouts
+          callerLocals
+          .none
       | _ => .ub
     | _ =>
       match get? locals p.local_ with
@@ -151,7 +220,113 @@ private def evalOperandFast (locals : List LocalSlot) (op : Operand)
       | .some .uninit => .ub
       | .some .dead => .ub
       | .none => .ub
-    | _ => evalOperandFallback locals (.move p) borrows globals layouts callerLocals
+    | .deref :: restProj =>
+      match get? locals p.local_ with
+      | .some (.init (.ptr ptrVal sz)) =>
+        match lookupBorrow borrows ptrVal.tag with
+        | .some entry =>
+          match entry.perm with
+          | .disabled => .ub
+          | _ =>
+            match
+              needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+            with
+            | false =>
+              match get? locals entry.targetLocal with
+              | .some (.init targetRootVal) =>
+                let fullProj :=
+                  match entry.targetProjection with
+                  | .nil => restProj
+                  | ph :: pt => ph :: appendProjections pt restProj
+                match readProjectedValue locals targetRootVal fullProj with
+                | .ok fieldVal => .ok fieldVal locals
+                | .ub => .ub
+                | .unsupported => .unsupported
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  let fullProj :=
+                    match entry.targetProjection with
+                    | .nil => restProj
+                    | ph :: pt => ph :: appendProjections pt restProj
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | _ => .ub
+            | true =>
+              match get? locals entry.targetLocal with
+              | .some (.init targetRootVal) =>
+                match
+                  resolveStackThinPtrTargetProj?
+                    locals
+                    targetRootVal
+                    entry
+                    ptrVal
+                    restProj
+                with
+                | .none => .ub
+                | .some fullProj =>
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  match
+                    resolveStackThinPtrTargetProj?
+                      locals
+                      targetRootVal
+                      entry
+                      ptrVal
+                      restProj
+                  with
+                  | .none => .ub
+                  | .some fullProj =>
+                    match readProjectedValue locals targetRootVal fullProj with
+                    | .ok fieldVal => .ok fieldVal locals
+                    | .ub => .ub
+                    | .unsupported => .unsupported
+                | _ => .ub
+        | .none =>
+          match lookupGlobalAlloc globals ptrVal.allocId with
+          | .some alloc =>
+            evalGlobalDerefRead
+              locals
+              alloc
+              ptrVal.offsetBytes
+              sz
+              restProj
+              layouts
+              .none
+          | .none => .ub
+      | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
+        evalSliceFatPtrDerefRead
+          locals
+          ptrVal
+          ptrSz
+          lenSc
+          restProj
+          borrows
+          globals
+          layouts
+          callerLocals
+          .none
+      | _ => .ub
+    | _ =>
+      match get? locals p.local_ with
+      | .some (.init rootVal) =>
+        match readProjectedValue locals rootVal p.projection with
+        | .ok fieldVal => .ok fieldVal locals
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | .some .uninit => .ub
+      | .some .dead => .ub
+      | .none => .ub
+
 
 private theorem evalOperandFast_eq (locals : List LocalSlot) (op : Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
@@ -174,7 +349,9 @@ private theorem evalOperandFast_eq (locals : List LocalSlot) (op : Operand)
     | cons hd _ => cases hd <;> rfl
   | move p =>
     rcases p with ⟨loc, proj⟩
-    cases proj <;> rfl
+    cases proj with
+    | nil => rfl
+    | cons hd _ => cases hd <;> rfl
 
 private def evalOperandsFast
     (locals : List LocalSlot) (ops : List Operand)
@@ -253,7 +430,15 @@ private def evalRvalueSymTreeFast
   match rv with
   | .use op =>
     match evalOperandFast locals op mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok v locals' => .leaf (.ok v locals' mem)
+    | .ok v locals' =>
+      .leaf (match op, mem.borrows with
+      | .copy { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
+        let borrows' := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows)
+        .ok v locals' { mem with borrows := borrows' }
+      | .move { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
+        let borrows' := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows)
+        .ok v locals' { mem with borrows := borrows' }
+      | _, _ => .ok v locals' mem)
     | .ub => .leaf .ub
     | .unsupported => .leaf .unsupported
   | .ref bk p =>
@@ -303,7 +488,7 @@ private def evalRvalueSymTreeFast
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
-            .leaf (.ok (.ptr { ptrVal with offsetBytes := Nat.add ptrVal.offsetBytes offsetSc.bits } sz) locals₂ mem)
+            .leaf (evalPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp ptrVal sz offsetSc)
           | _ => .leaf .unsupported
         | _, _ => .leaf .unsupported
       | .ub => .leaf .ub
@@ -752,12 +937,6 @@ private theorem hold_mirBool_ensures
   rw [wpMirExecSym_eq_gen, wpStartBlock0_eq False ensCtx ensBB0 _ fuel args rfl rfl rfl rfl]
   exact h.val
 
-
-private theorem reqCtx_localDecls : reqCtx.localDecls = Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body.localDecls := rfl
-private theorem reqCtx_layouts : reqCtx.layouts = Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body.layouts := rfl
-private theorem reqCtx_body_layouts : reqCtx.body.layouts = Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body.layouts := rfl
-private theorem reqCtx_phase : reqCtx.body.phase = Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body.phase := rfl
-
 private theorem hold_mirBool_req
     (fuel : Nat) (args : List Value)
     (h : Hold
@@ -844,12 +1023,11 @@ private theorem wpReq_imp_zero_or_one (b : Nat) :
           [.scalar { bits := b, sizeBytes := 1 }]).memory) →
     b = 0 ∨ b = 1 := by
   dsimp only [Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body,
-    reqCtx_localDecls, reqCtx_layouts, reqCtx_body_layouts, reqCtx_phase,
-    reqBB0, wpBlockLinear, wpBlockStep, evalSymNodeTree,
+    reqCtx, BlockCtx.localDecls, BlockCtx.layouts, BlockCtx.body, reqBB0, wpBlockLinear, wpBlockStep, evalSymNodeTree,
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
     evalRvalueSymTreeFast,
     evalOperandFast, evalOperandsFast, evalConstValue,
-    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
+    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree,
     evalTerminatorSymTreeFast,
     lookupSwitchTargetTree, applyUnwindAction,
     MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
@@ -859,18 +1037,13 @@ private theorem wpReq_imp_zero_or_one (b : Nat) :
     projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
-    invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
-    Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.layouts,
-    Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.layouts,
-    Mir.WireframeDemo.parse_compression_flag.layouts,
-    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
-    reqCtx, ensCtx, parseCtx,
+    freezeDerefReadBorrowsAt, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, lookupBorrow, resolveStackThinPtrTargetProj?, endsWithSubslice, stripTransparentProjections, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, appendProjections, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, placeTy, tyIsFreeze,
     mirSafePost,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
     List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-    get?, set?, length, Nat.add, Nat.mul, Nat.beq, Bool.and, Bool.or,
+    get?, set?, length, Nat.add, Nat.mul, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble,
     bitwiseAndBits_one_one, bitwiseAndBits_one_zero,
     ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
     Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
@@ -904,7 +1077,7 @@ private theorem ensures_holds_one :
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
     evalRvalueSymTreeFast,
     evalOperandFast, evalOperandsFast, evalConstValue,
-    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
+    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree,
     evalTerminatorSymTreeFast,
     lookupSwitchTargetTree, applyUnwindAction,
     MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
@@ -914,17 +1087,12 @@ private theorem ensures_holds_one :
     projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
-    invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
-    Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.layouts,
-    Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.layouts,
-    Mir.WireframeDemo.parse_compression_flag.layouts,
-    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
-    reqCtx, ensCtx, parseCtx,
+    freezeDerefReadBorrowsAt, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, lookupBorrow, resolveStackThinPtrTargetProj?, endsWithSubslice, stripTransparentProjections, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, appendProjections, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, placeTy, tyIsFreeze,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
     List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-    get?, set?, length, Nat.add, Nat.mul, Nat.beq, Bool.and, Bool.or,
+    get?, set?, length, Nat.add, Nat.mul, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble,
     bitwiseAndBits_one_one, bitwiseAndBits_one_zero,
     ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
     Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
@@ -941,7 +1109,7 @@ private theorem ensures_holds_zero :
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
     evalRvalueSymTreeFast,
     evalOperandFast, evalOperandsFast, evalConstValue,
-    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
+    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree,
     evalTerminatorSymTreeFast,
     lookupSwitchTargetTree, applyUnwindAction,
     MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
@@ -951,17 +1119,12 @@ private theorem ensures_holds_zero :
     projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
-    invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
-    Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.layouts,
-    Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.layouts,
-    Mir.WireframeDemo.parse_compression_flag.layouts,
-    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
-    reqCtx, ensCtx, parseCtx,
+    freezeDerefReadBorrowsAt, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, lookupBorrow, resolveStackThinPtrTargetProj?, endsWithSubslice, stripTransparentProjections, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, appendProjections, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, placeTy, tyIsFreeze,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
     List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-    get?, set?, length, Nat.add, Nat.mul, Nat.beq, Bool.and, Bool.or,
+    get?, set?, length, Nat.add, Nat.mul, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble,
     bitwiseAndBits_one_one, bitwiseAndBits_one_zero,
     ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
     Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
@@ -1027,16 +1190,13 @@ theorem verified : VerificationResult Obligations.WireframeDemo.parse_compressio
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
     evalRvalueSymTreeFast,
     evalOperandFast, evalOperandsFast, evalConstValue,
-    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
+    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree,
     evalTerminatorSymTreeFast,
     lookupSwitchTargetTree, applyUnwindAction,
     MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
     initMachineState, initLocals, initLocalsAux, emptyMemory,
     readProjectedValue_nil, readProjectedValue_field,
     invalidateConflictingBorrows, mirNormalPost, boolToScalar,
-    Mir.WireframeDemo.parse_compression_flag.layouts,
-    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
-    reqCtx, ensCtx, parseCtx,
     Obligations.WireframeDemo.parse_compression_flag.claim,
     Obligations.WireframeDemo.parse_compression_flag.refineSafeSpec,
     Obligations.WireframeDemo.parse_compression_flag.rustEnsures,
@@ -1045,7 +1205,7 @@ theorem verified : VerificationResult Obligations.WireframeDemo.parse_compressio
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
     List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-    get?, set?, length, Nat.add, Nat.mul, Nat.beq, Bool.and, Bool.or,
+    get?, set?, length, Nat.add, Nat.mul, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble,
     bitwiseAndBits_one_one, bitwiseAndBits_one_zero,
     ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
     Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
@@ -1072,12 +1232,11 @@ theorem nonVacuousRequires :
   apply Hold.val
   refine hold_mirBool_req 28 _ ?_
   dsimp only [Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body,
-    reqCtx_localDecls, reqCtx_layouts, reqCtx_body_layouts, reqCtx_phase,
-    reqBB0, wpBlockLinear, wpBlockStep, evalSymNodeTree,
+    reqCtx, BlockCtx.localDecls, BlockCtx.layouts, BlockCtx.body, reqBB0, wpBlockLinear, wpBlockStep, evalSymNodeTree,
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
     evalRvalueSymTreeFast,
     evalOperandFast, evalOperandsFast, evalConstValue,
-    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
+    evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree,
     evalTerminatorSymTreeFast,
     lookupSwitchTargetTree, applyUnwindAction,
     MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
@@ -1087,17 +1246,12 @@ theorem nonVacuousRequires :
     projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
-    invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
-    Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.layouts,
-    Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.layouts,
-    Mir.WireframeDemo.parse_compression_flag.layouts,
-    sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
-    reqCtx, ensCtx, parseCtx,
+    freezeDerefReadBorrowsAt, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, lookupBorrow, resolveStackThinPtrTargetProj?, endsWithSubslice, stripTransparentProjections, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, appendProjections, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, placeTy, tyIsFreeze,
     boolToScalar,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
     List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-    get?, set?, length, Nat.add, Nat.mul, Nat.beq, Bool.and, Bool.or,
+    get?, set?, length, Nat.add, Nat.mul, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble,
     bitwiseAndBits_one_one, bitwiseAndBits_one_zero,
     ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
     Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]

@@ -109,13 +109,16 @@ CFGs, `#[anneal_spec::spec]` functions, bitwise operations, or loops:
    `(fuel : Nat) (h_fuel : fuel = N)`, `rcases` and `subst` all `Memory` fields
    first (`activeCallee = none`, `callerLocals`, `borrows`), and `subst h_fuel`
    last so kernel `whnf` never unfolds `N` steps over an abstract `mem : Memory`.
-6. **Never Run `trace.profiler.threshold 1` on Symbolic MIR Proofs**:
+6. **Never Run `trace.profiler.threshold 1` or Unbounded CLI `lean` on Symbolic MIR Proofs**:
    Low profiler thresholds recursively format huge nested MIR ASTs at thousands
    of elaborator steps, writing hundreds of megabytes of trace output and
    stalling background commands for hours. Prefer `lean_goal` and
-   `lean_multi_attempt`; if CLI profiling is ever required, keep
-   `trace.profiler.threshold >= 100` with `set_option pp.deepTerms false` and
-   `timeout 30s`.
+   `lean_multi_attempt`; if CLI execution or profiling is ever required, wrap
+   `lake` / `lean` in `anneal-lean-run --mode file --concurrency <W> -- ...`
+   (which enforces a hardware-matched `MemoryMax`, `MemorySwapMax=0`,
+   `LEAN_NUM_THREADS`, and wall-clock timeout—unlike `lean -M`, which does not
+   cap total process RSS or prevent swap thrashing) and keep
+   `trace.profiler.threshold >= 100` with `set_option pp.deepTerms false`.
 
 ---
 

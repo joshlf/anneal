@@ -1,0 +1,21 @@
+[package]
+name = "anneal-minirust-gen"
+version = "0.1.0-alpha.1"
+edition = "2024"
+description = "Mechanical translator from pinned upstream MiniRust specification sources (`spec/**/*.md`) to one-to-one Lean 4 declarations."
+license = "BSD-2-Clause OR Apache-2.0 OR MIT"
+repository = "https://github.com/joshlf/anneal"
+publish = false
+
+[lib]
+name = "anneal_minirust_gen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "anneal-minirust-gen"
+path = "src/main.rs"
+
+[dependencies]
+proc-macro2 = { version = "1.0", features = ["span-locations"] }
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "extra-traits", "printing", "parsing"] }

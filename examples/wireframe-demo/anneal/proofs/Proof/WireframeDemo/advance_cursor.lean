@@ -3,6 +3,7 @@ import Anneal
 import Mir.WireframeDemo.advance_cursor
 import Specs.WireframeDemo.advance_cursor
 import Obligations.WireframeDemo.advance_cursor
+set_option maxHeartbeats 4000000
 
 namespace Proof.WireframeDemo.advance_cursor
 
@@ -101,16 +102,18 @@ theorem verified :
       evalRvalueSymTree, evalRvalue, evalRvalueWithMemory,
       evalOperand, evalOperands, evalConstValue,
       evalScalarBinOpSymTree, evalUnaryNotSymTree, evalUnaryNot,
+      Trusted.Effect.SumE,
       evalTerminatorSymTree, evalTerminator,
       lookupSwitchTargetTree, lookupSwitchTarget, applyUnwindAction,
       MirStepNode.step, MirStepNode.retNormal,
       SymTree.bind,
       initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux,
-      readProjectedValue, evalPlaceWrite, evalCallerPlaceWrite,
+      readProjectedValue, sharedBorrowPerm, placeTy, tyIsFreeze, evalPlaceWrite, evalCallerPlaceWrite,
       writePlaceValue, writeProjectedValue, invalidateDerefWriteBorrows,
       operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, placeIsSigned, resolveProjectedTy,
       tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, ProvenancePtr.tag,
       lookupBorrow, appendProjections, stripTransparentProjections,
+      freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, BlockCtx.localDecls, BlockCtx.layouts, BlockCtx.body, not, Bool.rec, Bool.casesOn, advCtx,
       projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
       byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
       isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
@@ -119,7 +122,7 @@ theorem verified :
       GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
       HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
       List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-      get?, set?, length, Nat.add, Nat.beq, Bool.and, Bool.or,
+      get?, set?, length, Nat.add, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble,
       ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
       Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
     have h_ble_inv : Nat.ble offset limit = true := Nat.ble_eq_true_of_le h_inv
@@ -174,15 +177,17 @@ theorem verified :
         evalRvalueSymTree, evalRvalue, evalRvalueWithMemory,
         evalOperand, evalOperands, evalConstValue,
         evalScalarBinOpSymTree, evalUnaryNotSymTree, evalUnaryNot,
+      Trusted.Effect.SumE,
         evalTerminatorSymTree, evalTerminator,
         lookupSwitchTargetTree, lookupSwitchTarget, applyUnwindAction,
         MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
-        readProjectedValue, evalPlaceWrite, evalCallerPlaceWrite,
+        readProjectedValue, sharedBorrowPerm, placeTy, tyIsFreeze, evalPlaceWrite, evalCallerPlaceWrite,
         writePlaceValue, writeProjectedValue, invalidateDerefWriteBorrows,
         operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, placeIsSigned, resolveProjectedTy,
         tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, ProvenancePtr.tag,
         lookupBorrow, appendProjections, stripTransparentProjections,
-        projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
+        freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, BlockCtx.localDecls, BlockCtx.layouts, BlockCtx.body, not, Bool.rec, Bool.casesOn, advCtx,
+      projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
         byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
         isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
         invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
@@ -190,7 +195,7 @@ theorem verified :
         GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
         HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
         List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-        get?, set?, length, Nat.add, Nat.beq, Bool.and, Bool.or,
+        get?, set?, length, Nat.add, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble,
         ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
         Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
       dsimp only [StatefulItemSpec.post,

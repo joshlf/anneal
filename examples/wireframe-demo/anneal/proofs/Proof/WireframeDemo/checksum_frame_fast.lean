@@ -5,12 +5,13 @@ import Mir.WireframeDemo.checksum_frame_fast
 import Specs.WireframeDemo.checksum_frame_safe
 import Specs.WireframeDemo.checksum_frame_fast
 import Obligations.WireframeDemo.checksum_frame_fast
+set_option maxHeartbeats 4000000
 
 namespace Proof.WireframeDemo.checksum_frame_fast
 
 set_option linter.all false
 set_option maxRecDepth 200000
-set_option maxHeartbeats 200000
+set_option maxHeartbeats 4000000
 
 open Trusted.Sequence
 open Trusted.Rustc.V2026_06_01.Layout
@@ -180,10 +181,16 @@ private def evalOperandFast (ctx : BlockCtx) (locals : List LocalSlot) (op : Ope
   match op with
   | .constant c =>
     match c.val with
-    | .indirect _ _ => evalOperandFallback locals (.constant c) borrows globals ctx.layouts callerLocals
-    | .slice _ _ => evalOperandFallback locals (.constant c) borrows globals ctx.layouts callerLocals
+    | .indirect allocId offset =>
+      match lookupGlobalAlloc globals allocId with
+      | .some _ =>
+        match evalConstValue (.indirect allocId offset) c.ty globals (BlockCtx.layouts ctx) with
+        | .some v => .ok v locals
+        | .none => .ub
+      | .none => .unsupported
+    | .unevaluated _ => .unsupported
     | cv =>
-      match evalConstValue cv with
+      match evalConstValue cv c.ty globals (BlockCtx.layouts ctx) with
       | .some v => .ok v locals
       | .none => .unsupported
   | .copy p =>
@@ -196,19 +203,11 @@ private def evalOperandFast (ctx : BlockCtx) (locals : List LocalSlot) (op : Ope
           match entry.perm with
           | .disabled => .ub
           | _ =>
-            match get? locals entry.targetLocal with
-            | .some (.init targetRootVal) =>
-              let fullProj :=
-                match entry.targetProjection with
-                | .nil => restProj
-                | ph :: pt => ph :: appendProjections pt restProj
-              match readProjectedValue locals targetRootVal fullProj with
-              | .ok fieldVal => .ok fieldVal locals
-              | .ub => .ub
-              | .unsupported => .unsupported
-            | .some _ => .ub
-            | .none =>
-              match get? callerLocals entry.targetLocal with
+            match
+              needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+            with
+            | false =>
+              match get? locals entry.targetLocal with
               | .some (.init targetRootVal) =>
                 let fullProj :=
                   match entry.targetProjection with
@@ -218,8 +217,79 @@ private def evalOperandFast (ctx : BlockCtx) (locals : List LocalSlot) (op : Ope
                 | .ok fieldVal => .ok fieldVal locals
                 | .ub => .ub
                 | .unsupported => .unsupported
-              | _ => .ub
-        | .none => evalDerefGlobalFallback globals ptrVal sz locals restProj
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  let fullProj :=
+                    match entry.targetProjection with
+                    | .nil => restProj
+                    | ph :: pt => ph :: appendProjections pt restProj
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | _ => .ub
+            | true =>
+              match get? locals entry.targetLocal with
+              | .some (.init targetRootVal) =>
+                match
+                  resolveStackThinPtrTargetProj?
+                    locals
+                    targetRootVal
+                    entry
+                    ptrVal
+                    restProj
+                with
+                | .none => .ub
+                | .some fullProj =>
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  match
+                    resolveStackThinPtrTargetProj?
+                      locals
+                      targetRootVal
+                      entry
+                      ptrVal
+                      restProj
+                  with
+                  | .none => .ub
+                  | .some fullProj =>
+                    match readProjectedValue locals targetRootVal fullProj with
+                    | .ok fieldVal => .ok fieldVal locals
+                    | .ub => .ub
+                    | .unsupported => .unsupported
+                | _ => .ub
+        | .none =>
+          match lookupGlobalAlloc globals ptrVal.allocId with
+          | .some alloc =>
+            evalGlobalDerefRead
+              locals
+              alloc
+              ptrVal.offsetBytes
+              sz
+              restProj
+              (BlockCtx.layouts ctx)
+              .none
+          | .none => .ub
+      | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
+        evalSliceFatPtrDerefRead
+          locals
+          ptrVal
+          ptrSz
+          lenSc
+          restProj
+          borrows
+          globals
+          (BlockCtx.layouts ctx)
+          callerLocals
+          .none
       | _ => .ub
     | _ =>
       match get? locals p.local_ with
@@ -242,17 +312,113 @@ private def evalOperandFast (ctx : BlockCtx) (locals : List LocalSlot) (op : Ope
       | .some .uninit => .ub
       | .some .dead => .ub
       | .none => .ub
-    | .field idx ty :: rest =>
+    | .deref :: restProj =>
+      match get? locals p.local_ with
+      | .some (.init (.ptr ptrVal sz)) =>
+        match lookupBorrow borrows ptrVal.tag with
+        | .some entry =>
+          match entry.perm with
+          | .disabled => .ub
+          | _ =>
+            match
+              needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+            with
+            | false =>
+              match get? locals entry.targetLocal with
+              | .some (.init targetRootVal) =>
+                let fullProj :=
+                  match entry.targetProjection with
+                  | .nil => restProj
+                  | ph :: pt => ph :: appendProjections pt restProj
+                match readProjectedValue locals targetRootVal fullProj with
+                | .ok fieldVal => .ok fieldVal locals
+                | .ub => .ub
+                | .unsupported => .unsupported
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  let fullProj :=
+                    match entry.targetProjection with
+                    | .nil => restProj
+                    | ph :: pt => ph :: appendProjections pt restProj
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | _ => .ub
+            | true =>
+              match get? locals entry.targetLocal with
+              | .some (.init targetRootVal) =>
+                match
+                  resolveStackThinPtrTargetProj?
+                    locals
+                    targetRootVal
+                    entry
+                    ptrVal
+                    restProj
+                with
+                | .none => .ub
+                | .some fullProj =>
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  match
+                    resolveStackThinPtrTargetProj?
+                      locals
+                      targetRootVal
+                      entry
+                      ptrVal
+                      restProj
+                  with
+                  | .none => .ub
+                  | .some fullProj =>
+                    match readProjectedValue locals targetRootVal fullProj with
+                    | .ok fieldVal => .ok fieldVal locals
+                    | .ub => .ub
+                    | .unsupported => .unsupported
+                | _ => .ub
+        | .none =>
+          match lookupGlobalAlloc globals ptrVal.allocId with
+          | .some alloc =>
+            evalGlobalDerefRead
+              locals
+              alloc
+              ptrVal.offsetBytes
+              sz
+              restProj
+              (BlockCtx.layouts ctx)
+              .none
+          | .none => .ub
+      | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
+        evalSliceFatPtrDerefRead
+          locals
+          ptrVal
+          ptrSz
+          lenSc
+          restProj
+          borrows
+          globals
+          (BlockCtx.layouts ctx)
+          callerLocals
+          .none
+      | _ => .ub
+    | _ =>
       match get? locals p.local_ with
       | .some (.init rootVal) =>
-        match readProjectedValue locals rootVal (.field idx ty :: rest) with
+        match readProjectedValue locals rootVal p.projection with
         | .ok fieldVal => .ok fieldVal locals
         | .ub => .ub
         | .unsupported => .unsupported
       | .some .uninit => .ub
       | .some .dead => .ub
       | .none => .ub
-    | _ => evalOperandFallback locals (.move p) borrows globals ctx.layouts callerLocals
+
 
 private theorem evalOperandFast_eq (ctx : BlockCtx) (locals : List LocalSlot) (op : Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
@@ -445,6 +611,9 @@ private theorem evalRvalueFast_eq
       | _ => rfl
     | neg => rfl
     | ptrMetadata => rfl
+  | ref bk p =>
+    dsimp only [evalRvalueFast, evalRvalue]
+    cases bk <;> cases p.projection <;> rfl
   | _ => rfl
 
 private def finishAssignStmtNodeFast
@@ -1336,8 +1505,7 @@ private theorem impl_verified :
       hb0, hb1, hb2, hb3, hb4, hb5, hb6, hb7,
       rfl, h_callee, h_stack, h_borrows, h_caller⟩
   rcases mem with
-    ⟨nextAllocId, globals, borrows, nextTag, callees,
-      callStack, activeCallee, activeProtectors, nextProtector, callerLocals⟩
+    ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack, activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩
   dsimp at h_callee h_stack h_borrows h_caller
   subst h_callee h_stack h_borrows h_caller
   rw [checksumModel_eq_of_callerLocals _ _ b0 b1 b2 b3 b4 b5 b6 b7 rfl]
@@ -1359,7 +1527,8 @@ private theorem impl_verified :
       evalRvalueFast, evalByteCastAfterOperand_frame8, frame4WordsLE,
       evalOperandFast, evalConstValue,
       evalScalarBinOp, evalUnaryNot,
-      operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
+      Trusted.Effect.SumE,
+      operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
       intCastTargetBytes, shiftLeftBits, shiftRightUnsignedBits, scalarPow2_eight,
       scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
       mul_1_8, mul_2_8, mul_4_8, mul_8_8, mul_0_2, mul_1_2, mul_2_2, mul_3_2,
@@ -1371,6 +1540,7 @@ private theorem impl_verified :
       rootFrame8Ptr, frame8Value, sharedFrame8Borrow, frame8SlotIdx,
       readProjectedValue_nil, readProjectedValue_field, readProjectedValue_index,
       ProvenancePtr.tag, lookupBorrow, appendProjections, stripTransparentProjections,
+      freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, BlockCtx.localDecls, BlockCtx.layouts, BlockCtx.body, not, Bool.rec, Bool.casesOn, fastCtx,
       projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
       byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
       isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
@@ -1480,8 +1650,7 @@ private theorem spec_verified :
       hb0, hb1, hb2, hb3, hb4, hb5, hb6, hb7,
       rfl, h_callee, h_stack, h_borrows, h_caller⟩
   rcases mem with
-    ⟨nextAllocId, globals, borrows, nextTag, callees,
-      callStack, activeCallee, activeProtectors, nextProtector, callerLocals⟩
+    ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack, activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩
   dsimp at h_callee h_stack h_borrows h_caller
   subst h_callee h_stack h_borrows h_caller
   rw [checksumModel_eq_of_callerLocals _ _ b0 b1 b2 b3 b4 b5 b6 b7 rfl]
@@ -1498,7 +1667,8 @@ private theorem spec_verified :
     evalRvalueFast,
     evalOperandFast, evalConstValue,
     evalScalarBinOp, evalUnaryNot,
-    operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
+      Trusted.Effect.SumE,
+    operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
     intCastTargetBytes, shiftLeftBits, shiftRightUnsignedBits, scalarPow2_eight,
     scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
     mul_1_8, mul_2_8, mul_4_8, mul_8_8, mul_0_2, mul_1_2, mul_2_2, mul_3_2,
@@ -1510,7 +1680,8 @@ private theorem spec_verified :
     rootFrame8Ptr, frame8Value, sharedFrame8Borrow, frame8SlotIdx,
     readProjectedValue_nil, readProjectedValue_field, readProjectedValue_index,
     ProvenancePtr.tag, lookupBorrow, appendProjections, stripTransparentProjections,
-    projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
+    freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, BlockCtx.localDecls, BlockCtx.layouts, BlockCtx.body, not, Bool.rec, Bool.casesOn, fastCtx,
+      projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
     invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,

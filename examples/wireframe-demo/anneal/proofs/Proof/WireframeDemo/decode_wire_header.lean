@@ -61,15 +61,116 @@ private def evalOperandFast (locals : List LocalSlot) (op : Operand)
   match op with
   | .constant c =>
     match c.val with
-    | .indirect _ _ => evalOperandFallback locals (.constant c) borrows globals layouts callerLocals
-    | .slice _ _ => evalOperandFallback locals (.constant c) borrows globals layouts callerLocals
+    | .indirect allocId offset =>
+      match lookupGlobalAlloc globals allocId with
+      | .some _ =>
+        match evalConstValue (.indirect allocId offset) c.ty globals layouts with
+        | .some v => .ok v locals
+        | .none => .ub
+      | .none => .unsupported
+    | .unevaluated _ => .unsupported
     | cv =>
-      match evalConstValue cv with
+      match evalConstValue cv c.ty globals layouts with
       | .some v => .ok v locals
       | .none => .unsupported
   | .copy p =>
     match p.projection with
-    | .deref :: _ => evalOperandFallback locals (.copy p) borrows globals layouts callerLocals
+    | .deref :: restProj =>
+      match get? locals p.local_ with
+      | .some (.init (.ptr ptrVal sz)) =>
+        match lookupBorrow borrows ptrVal.tag with
+        | .some entry =>
+          match entry.perm with
+          | .disabled => .ub
+          | _ =>
+            match
+              needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+            with
+            | false =>
+              match get? locals entry.targetLocal with
+              | .some (.init targetRootVal) =>
+                let fullProj :=
+                  match entry.targetProjection with
+                  | .nil => restProj
+                  | ph :: pt => ph :: appendProjections pt restProj
+                match readProjectedValue locals targetRootVal fullProj with
+                | .ok fieldVal => .ok fieldVal locals
+                | .ub => .ub
+                | .unsupported => .unsupported
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  let fullProj :=
+                    match entry.targetProjection with
+                    | .nil => restProj
+                    | ph :: pt => ph :: appendProjections pt restProj
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | _ => .ub
+            | true =>
+              match get? locals entry.targetLocal with
+              | .some (.init targetRootVal) =>
+                match
+                  resolveStackThinPtrTargetProj?
+                    locals
+                    targetRootVal
+                    entry
+                    ptrVal
+                    restProj
+                with
+                | .none => .ub
+                | .some fullProj =>
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  match
+                    resolveStackThinPtrTargetProj?
+                      locals
+                      targetRootVal
+                      entry
+                      ptrVal
+                      restProj
+                  with
+                  | .none => .ub
+                  | .some fullProj =>
+                    match readProjectedValue locals targetRootVal fullProj with
+                    | .ok fieldVal => .ok fieldVal locals
+                    | .ub => .ub
+                    | .unsupported => .unsupported
+                | _ => .ub
+        | .none =>
+          match lookupGlobalAlloc globals ptrVal.allocId with
+          | .some alloc =>
+            evalGlobalDerefRead
+              locals
+              alloc
+              ptrVal.offsetBytes
+              sz
+              restProj
+              layouts
+              .none
+          | .none => .ub
+      | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
+        evalSliceFatPtrDerefRead
+          locals
+          ptrVal
+          ptrSz
+          lenSc
+          restProj
+          borrows
+          globals
+          layouts
+          callerLocals
+          .none
+      | _ => .ub
     | _ =>
       match get? locals p.local_ with
       | .some (.init rootVal) =>
@@ -91,7 +192,113 @@ private def evalOperandFast (locals : List LocalSlot) (op : Operand)
       | .some .uninit => .ub
       | .some .dead => .ub
       | .none => .ub
-    | _ => evalOperandFallback locals (.move p) borrows globals layouts callerLocals
+    | .deref :: restProj =>
+      match get? locals p.local_ with
+      | .some (.init (.ptr ptrVal sz)) =>
+        match lookupBorrow borrows ptrVal.tag with
+        | .some entry =>
+          match entry.perm with
+          | .disabled => .ub
+          | _ =>
+            match
+              needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+            with
+            | false =>
+              match get? locals entry.targetLocal with
+              | .some (.init targetRootVal) =>
+                let fullProj :=
+                  match entry.targetProjection with
+                  | .nil => restProj
+                  | ph :: pt => ph :: appendProjections pt restProj
+                match readProjectedValue locals targetRootVal fullProj with
+                | .ok fieldVal => .ok fieldVal locals
+                | .ub => .ub
+                | .unsupported => .unsupported
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  let fullProj :=
+                    match entry.targetProjection with
+                    | .nil => restProj
+                    | ph :: pt => ph :: appendProjections pt restProj
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | _ => .ub
+            | true =>
+              match get? locals entry.targetLocal with
+              | .some (.init targetRootVal) =>
+                match
+                  resolveStackThinPtrTargetProj?
+                    locals
+                    targetRootVal
+                    entry
+                    ptrVal
+                    restProj
+                with
+                | .none => .ub
+                | .some fullProj =>
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  match
+                    resolveStackThinPtrTargetProj?
+                      locals
+                      targetRootVal
+                      entry
+                      ptrVal
+                      restProj
+                  with
+                  | .none => .ub
+                  | .some fullProj =>
+                    match readProjectedValue locals targetRootVal fullProj with
+                    | .ok fieldVal => .ok fieldVal locals
+                    | .ub => .ub
+                    | .unsupported => .unsupported
+                | _ => .ub
+        | .none =>
+          match lookupGlobalAlloc globals ptrVal.allocId with
+          | .some alloc =>
+            evalGlobalDerefRead
+              locals
+              alloc
+              ptrVal.offsetBytes
+              sz
+              restProj
+              layouts
+              .none
+          | .none => .ub
+      | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
+        evalSliceFatPtrDerefRead
+          locals
+          ptrVal
+          ptrSz
+          lenSc
+          restProj
+          borrows
+          globals
+          layouts
+          callerLocals
+          .none
+      | _ => .ub
+    | _ =>
+      match get? locals p.local_ with
+      | .some (.init rootVal) =>
+        match readProjectedValue locals rootVal p.projection with
+        | .ok fieldVal => .ok fieldVal locals
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | .some .uninit => .ub
+      | .some .dead => .ub
+      | .none => .ub
+
 
 private theorem evalOperandFast_eq (locals : List LocalSlot) (op : Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
@@ -114,7 +321,9 @@ private theorem evalOperandFast_eq (locals : List LocalSlot) (op : Operand)
     | cons hd _ => cases hd <;> rfl
   | move p =>
     rcases p with ⟨loc, proj⟩
-    cases proj <;> rfl
+    cases proj with
+    | nil => rfl
+    | cons hd _ => cases hd <;> rfl
 
 private def evalRvalueFallback (locals : List LocalSlot) (rv : Rvalue)
     (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) : RvalueEvalResult :=
@@ -126,7 +335,15 @@ private def evalRvalueSymTreeFast
   match rv with
   | .use op =>
     match evalOperandFast locals op mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok v locals' => .leaf (.ok v locals' mem)
+    | .ok v locals' =>
+      .leaf (match op, mem.borrows with
+      | .copy { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
+        let borrows' := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows)
+        .ok v locals' { mem with borrows := borrows' }
+      | .move { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
+        let borrows' := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows)
+        .ok v locals' { mem with borrows := borrows' }
+      | _, _ => .ok v locals' mem)
     | .ub => .leaf .ub
     | .unsupported => .leaf .unsupported
   | .cast .transmute op targetTy =>
@@ -143,7 +360,7 @@ private def evalRvalueSymTreeFast
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
-            .leaf (.ok (.ptr { ptrVal with offsetBytes := Nat.add ptrVal.offsetBytes offsetSc.bits } sz) locals₂ mem)
+            .leaf (evalPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp ptrVal sz offsetSc)
           | _ => .leaf .unsupported
         | _, _ => .leaf .unsupported
       | .ub => .leaf .ub
@@ -463,7 +680,7 @@ private theorem evalByteCast_wireHeader
     (l0 : LocalSlot) (restLocals : List LocalSlot) (mem : Memory) :
     evalByteCast
       (l0 :: .init (rawHeaderValue 1 b1 b2 b3) :: restLocals)
-      (.copy { local_ := 1, projection := [] })
+      (.copy { local_ := 1, projection := .nil })
       { kind := .adt "wireframe_demo::WireHeader" [], layoutIdx := 5 }
       mem
       Mir.WireframeDemo.decode_wire_header.body.localDecls
@@ -496,7 +713,7 @@ private theorem evalByteCast_wireHeader
   have h_enc :
       encodeValueToBytes defaultCodecFuel
         Mir.WireframeDemo.decode_wire_header.layouts
-        { kind := .array (.uint .u8) 4, layoutIdx := 1 }
+        { kind := .array (.uint .u8) 4, layoutIdx := 2 }
         (rawHeaderValue 1 b1 b2 b3) =
       some
         [ .init 1 none
@@ -508,12 +725,12 @@ private theorem evalByteCast_wireHeader
         { kind := .adt "wireframe_demo::WireHeader" [], layoutIdx := 5 } = some 4 := rfl
   have h_src :
       rigidTyByteSize Mir.WireframeDemo.decode_wire_header.layouts
-        { kind := .array (.uint .u8) 4, layoutIdx := 1 } = some 4 := rfl
+        { kind := .array (.uint .u8) 4, layoutIdx := 2 } = some 4 := rfl
   have h_op :
       operandTy Mir.WireframeDemo.decode_wire_header.body.localDecls
         Mir.WireframeDemo.decode_wire_header.layouts
-        (.copy { local_ := 1, projection := [] }) =
-      some { kind := .array (.uint .u8) 4, layoutIdx := 1 } := rfl
+        (.copy { local_ := 1, projection := .nil }) =
+      some { kind := .array (.uint .u8) 4, layoutIdx := 2 } := rfl
   unfold evalByteCast
   dsimp only [evalOperand, readProjectedValue, get?,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal]
@@ -540,7 +757,7 @@ private theorem evalByteCast_wireHeader_any
             , .scalar { bits := b2, sizeBytes := 1 }
             , .scalar { bits := b3, sizeBytes := 1 } ]) ::
         restLocals)
-      (.copy { local_ := 1, projection := [] })
+      (.copy { local_ := 1, projection := .nil })
       { kind := .adt "wireframe_demo::WireHeader" [], layoutIdx := 5 }
       mem decls lyts =
     .ok
@@ -616,12 +833,12 @@ private theorem wp_valid_header
       initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, emptyMemory,
       readProjectedValue_nil, readProjectedValue_field, readProjectedValue_index,
       writePlaceValue,
-      operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, tyIsSigned,
+      operandIsSigned, operandTy, sharedBorrowPerm, placeTy, resolveProjectedTy, tyIsSigned,
       invalidateConflictingBorrows, mirNormalPost,
       GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
       HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
       List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-      get?, set?, length, Nat.add, Nat.ble, Nat.beq, Bool.and, Bool.or, Bool.not,
+      get?, set?, length, Nat.add, Nat.ble, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble, Bool.not,
       ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
       Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
     refine hold_wpDecode_step 1 11 _ _ ?_
@@ -647,11 +864,11 @@ private theorem wp_valid_header
       MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
       readProjectedValue_nil, readProjectedValue_field, readProjectedValue_index,
       writePlaceValue,
-      operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, tyIsSigned,
+      operandIsSigned, operandTy, sharedBorrowPerm, placeTy, resolveProjectedTy, tyIsSigned,
       invalidateConflictingBorrows, mirNormalPost,
       GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
       List.length, List.set, Option.getD,
-      get?, set?, length, Nat.add, Nat.beq, Bool.and, Bool.or, Bool.not,
+      get?, set?, length, Nat.add, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble, Bool.not,
       ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
       Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
     cases h_len : Nat.ble (b2 + 256 * b3) 1024
@@ -743,11 +960,11 @@ private theorem wp_valid_header
       MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
       readProjectedValue_nil, readProjectedValue_field, readProjectedValue_index,
       writePlaceValue,
-      operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, tyIsSigned,
+      operandIsSigned, operandTy, sharedBorrowPerm, placeTy, resolveProjectedTy, tyIsSigned,
       invalidateConflictingBorrows, mirNormalPost,
       GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
       List.length, List.set, Option.getD,
-      get?, set?, length, Nat.add, Nat.beq, Bool.and, Bool.or, Bool.not,
+      get?, set?, length, Nat.add, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble, Bool.not,
       ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
       Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
     cases h_len : Nat.ble (b2 + 256 * b3) 1024
@@ -851,12 +1068,12 @@ private theorem wp_invalid_b1 (b1' b2 b3 : Nat) :
     initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, emptyMemory,
     readProjectedValue_nil, readProjectedValue_field, readProjectedValue_index,
     writePlaceValue,
-    operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, tyIsSigned,
+    operandIsSigned, operandTy, sharedBorrowPerm, placeTy, resolveProjectedTy, tyIsSigned,
     invalidateConflictingBorrows, mirNormalPost,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
     List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-    get?, set?, length, Nat.add, Nat.ble, Nat.beq, Bool.and, Bool.or, Bool.not,
+    get?, set?, length, Nat.add, Nat.ble, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble, Bool.not,
     ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
     Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq,
     ItemSpec.post,
@@ -899,12 +1116,12 @@ private theorem wp_invalid_b0 (b0 b1 b2 b3 : Nat) (h_v1 : b0 ≠ 1) :
       initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, emptyMemory,
       readProjectedValue_nil, readProjectedValue_field, readProjectedValue_index,
       writePlaceValue,
-      operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, tyIsSigned,
+      operandIsSigned, operandTy, sharedBorrowPerm, placeTy, resolveProjectedTy, tyIsSigned,
       invalidateConflictingBorrows, mirNormalPost,
       GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
       HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
       List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-      get?, set?, length, Nat.add, Nat.ble, Nat.beq, Bool.and, Bool.or, Bool.not,
+      get?, set?, length, Nat.add, Nat.ble, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble, Bool.not,
       ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
       Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq,
       ItemSpec.post,
@@ -935,12 +1152,12 @@ private theorem wp_invalid_b0 (b0 b1 b2 b3 : Nat) (h_v1 : b0 ≠ 1) :
       initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, emptyMemory,
       readProjectedValue_nil, readProjectedValue_field, readProjectedValue_index,
       writePlaceValue,
-      operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, tyIsSigned,
+      operandIsSigned, operandTy, sharedBorrowPerm, placeTy, resolveProjectedTy, tyIsSigned,
       invalidateConflictingBorrows, mirNormalPost,
       GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
       HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
       List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-      get?, set?, length, Nat.add, Nat.ble, Nat.beq, Bool.and, Bool.or, Bool.not,
+      get?, set?, length, Nat.add, Nat.ble, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble, Bool.not,
       ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
       Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq,
       ItemSpec.post,

@@ -3,6 +3,19 @@
 version = 4
 
 [[package]]
+name = "anneal-minirust-gen"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "anneal-mir-instrument"
+version = "0.1.0"
+
+[[package]]
 name = "anneal-rustc-capture"
 version = "0.1.0-alpha.1"
 
@@ -26,6 +39,10 @@ dependencies = [
 
 [[package]]
 name = "anneal-specr-lean"
+version = "0.1.0-alpha.1"
+
+[[package]]
+name = "anneal-trace"
 version = "0.1.0-alpha.1"
 
 [[package]]
@@ -89,6 +106,7 @@ name = "cargo-anneal"
 version = "0.1.0-alpha.1"
 dependencies = [
  "anneal-rustc-capture",
+ "anneal-trace",
 ]
 
 [[package]]

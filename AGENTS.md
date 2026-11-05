@@ -4,7 +4,6 @@ Read this file before changing the repository. It is the entry point for agent
 and contributor work throughout this tree; read any more specific instructions
 in the directory you change as well.
 
-## Understand the architecture and trust boundary
 ## Project principles
 
 Before designing, modifying, or reviewing repository artifacts, read and
@@ -52,13 +51,16 @@ applies, follow all of them.
 
 | Activity | Required skills |
 | :--- | :--- |
+| Reviewing code, commits, or pull requests, or auditing changes for trust-boundary compliance | [`trust-review`](skills/trust-review/SKILL.md) |
 | Writing, revising, or reviewing any technical prose (documentation, code comments, commit messages, PR descriptions, or issue bodies) | [`reader-oriented-explanation`](skills/reader-oriented-explanation/SKILL.md), [`williams-style`](skills/williams-style/SKILL.md) |
 | Adding, revising, or reviewing explanatory inline (`//`, `--`) or documentation (`///`, `//!`, `/--`, `/-!`) code comments | [`comment-guidelines`](skills/comment-guidelines/SKILL.md), [`reader-oriented-explanation`](skills/reader-oriented-explanation/SKILL.md), [`williams-style`](skills/williams-style/SKILL.md) |
 | Structuring commits, drafting or revising commit messages, rebasing or amending commits, or managing GHerrit branches and stacks | [`source-control`](skills/source-control/SKILL.md), [`commit-message`](skills/commit-message/SKILL.md), [`authorship-disclosure`](skills/authorship-disclosure/SKILL.md), [`reader-oriented-explanation`](skills/reader-oriented-explanation/SKILL.md), [`williams-style`](skills/williams-style/SKILL.md) |
 | Preparing or updating Git commits, pull request descriptions, or other externally visible prose | [`authorship-disclosure`](skills/authorship-disclosure/SKILL.md) |
 | Designing, simplifying, or generalizing conceptual models, semantic interfaces, schemas, protocols, or instructions | [`model-refinement`](skills/model-refinement/SKILL.md) |
 | Coordinating multi-agent conceptual model refinement across theories, software designs, schemas, protocols, or instructions | [`swarm-model-refinement`](skills/swarm-model-refinement/SKILL.md), [`model-refinement`](skills/model-refinement/SKILL.md) |
+| Creating, revising, evaluating, or retiring agent skills or maintainer guidance | [`skill-authorship`](skills/skill-authorship/SKILL.md), [`model-refinement`](skills/model-refinement/SKILL.md) |
 | Running $N$-round adversarial implementation, critique, and repair between two frontier models in shared git worktree(s) | [`adversarial-rounds`](skills/adversarial-rounds/SKILL.md) |
+| Orchestrating multi-tier supervisor and leaf agent workflows across worktrees with quota-aware model pools and hardware-matched `lake`/`lean` bounds | [`hierarchical-supervision`](skills/hierarchical-supervision/SKILL.md), [`adversarial-rounds`](skills/adversarial-rounds/SKILL.md) |
 | Leading or directing ambiguous engineering efforts, recovering requirements, developing or evaluating architecture, or recovering technical understanding after context loss | [`tech-lead`](skills/tech-lead/SKILL.md), [`reader-oriented-explanation`](skills/reader-oriented-explanation/SKILL.md), [`williams-style`](skills/williams-style/SKILL.md) |
 
 ## Architecture and trust boundary
@@ -67,9 +69,12 @@ Anneal verifies Rust programs (including unsafe code) by extracting typed
 `Runtime(PostCleanup)` MIR and compiler facts via a thin `rustc_driver` wrapper
 and checking per-item `VerificationResult` theorems inside the Lean 4 kernel.
 
-Start with [`PRINCIPLES.md`](PRINCIPLES.md), [`DESIGN.md`](DESIGN.md), and
-[README.md](README.md) for the normative project principles, design contract,
-repository map, and links to the
+Start with [`PRINCIPLES.md`](PRINCIPLES.md), [`DESIGN.md`](DESIGN.md),
+[README.md](README.md), [`docs/design.md`](docs/design.md),
+[`docs/architecture.md`](docs/architecture.md), and
+[`docs/trust-model.md`](docs/trust-model.md) for the normative project
+principles, design contract, three-stage MIR pipeline, trust model, repository
+map, and links to the
 architecture issues ([#1](https://github.com/joshlf/anneal/issues/1),
 [#100](https://github.com/joshlf/anneal/issues/100),
 [#99](https://github.com/joshlf/anneal/issues/99),
@@ -89,6 +94,12 @@ Before placing or modifying code, check whether it belongs inside
 - All derived definitions, program transformations (`VerifierPass`, `ExactPass`),
   certificate checkers (`VerifiedChecker`), program logics (`WP`), tactics, and
   CLI orchestration belong outside `trusted/`.
+
+When reviewing code or auditing changes before committing, run a dedicated
+[`trust-review`](skills/trust-review/SKILL.md) pass both to verify that code
+outside `trusted/`, `ci/`, and `.github/` cannot bypass trust auditing and to
+audit any changes inside `trusted/`, `ci/`, `.github/`, or pinned root
+manifests.
 
 ## Required writing skills
 
@@ -136,11 +147,28 @@ locked and audited.
 
 ## Commenting in `trusted/`
 
-Because auditing `trusted/` alone must suffice to verify that Anneal upholds
-[`PRINCIPLES.md`](PRINCIPLES.md), all code in `trusted/` will undergo careful
-human review. Human understanding is therefore paramount in `trusted/`: comment
-liberally using `comment-guidelines` (and its companion writing skills) so a
-human auditor can verify the design rationale, invariants, assumptions, contracts,
-and subtle semantic or implementation choices without reconstructing unstated context.
-Include Lean comment markers (`--`, `/--`, `/-!`) alongside Rust comment markers
-(`//`, `///`, `//!`).
+Because auditing `trusted/` and its explicit, pinned dependency manifest must
+suffice to verify that Anneal upholds [`PRINCIPLES.md`](PRINCIPLES.md), all code
+in `trusted/` will undergo careful human review. Human understanding is
+therefore paramount in `trusted/`: comment liberally using
+[`comment-guidelines`](skills/comment-guidelines/SKILL.md) (and its companion
+writing skills in the table above) so a human auditor can verify the design
+rationale, invariants, assumptions, contracts, and subtle semantic or
+implementation choices without reconstructing unstated context. Include Lean
+comment markers (`--`, `/--`, `/-!`) alongside Rust comment markers (`//`,
+`///`, `//!`).
+
+## Dependencies in `trusted/`
+
+When implementing or modifying components in `trusted/`:
+
+- **Do not hand-roll standard utilities:** Do not write bespoke argument
+  parsers, serializers, cryptographic hashers, or logging machinery to avoid
+  adding a dependency. Rely on battle-tested, standard ecosystem crates.
+- **Audit economy:** A concise, idiomatic interface built on a standard crate
+  is much easier for human reviewers to audit than hundreds of lines of
+  hand-rolled plumbing.
+- **Dependency discipline:** Keep dependencies in `trusted/` focused and
+  conservative. Prefer crates with minimal transitive dependencies and generic,
+  well-understood failure modes that do not pose soundness risks specific to
+  Anneal.

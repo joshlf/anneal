@@ -253,6 +253,124 @@ end
 instance instDecidableEqValue : DecidableEq Value :=
   decidableEqOfBoolEq valueEq (fun _ _ => valueEq_sound) valueEq_refl
 
+/--
+Single-step structural equality on `Value` parameterized by the list comparator
+`ih`, defined with non-overlapping single-variable `match` expressions.
+-/
+@[reducible]
+def valueHeadEq
+    (ih : List Value → List Value → Bool) (v₁ v₂ : Value) : Bool :=
+  match v₁ with
+  | .unit =>
+    match v₂ with
+    | .unit => true
+    | .scalar _ => false
+    | .ptr _ _ => false
+    | .aggregate _ _ => false
+  | .scalar s₁ =>
+    match v₂ with
+    | .unit => false
+    | .scalar s₂ => scalarIntEq s₁ s₂
+    | .ptr _ _ => false
+    | .aggregate _ _ => false
+  | .ptr p₁ sz₁ =>
+    match v₂ with
+    | .unit => false
+    | .scalar _ => false
+    | .ptr p₂ sz₂ => provenancePtrEq p₁ p₂ && Nat.beq sz₁ sz₂
+    | .aggregate _ _ => false
+  | .aggregate var₁ fs₁ =>
+    match v₂ with
+    | .unit => false
+    | .scalar _ => false
+    | .ptr _ _ => false
+    | .aggregate var₂ fs₂ => Nat.beq var₁ var₂ && ih fs₁ fs₂
+
+/--
+Fuel-bounded structural equality on `List Value`, defined via `Nat.rec` and
+exhaustive single-variable `match` expressions so it lowers to non-dependent
+`Nat.rec`, `List.casesOn`, and `Value.casesOn` without `.brecOn` or dependent
+splitter motives.
+-/
+@[reducible]
+def valueListEqFuel : Nat → List Value → List Value → Bool :=
+  Nat.rec
+    (motive := fun _ => List Value → List Value → Bool)
+    (fun _ _ => false)
+    (fun _ ih xs ys =>
+      match xs with
+      | [] =>
+        match ys with
+        | [] => true
+        | _ :: _ => false
+      | v₁ :: vs₁ =>
+        match ys with
+        | [] => false
+        | v₂ :: vs₂ =>
+          valueHeadEq ih v₁ v₂ && ih vs₁ vs₂)
+
+/--
+Fuel-bounded structural equality on runtime `Value`s without `Value.brecOn` or
+dependent multi-variable splitter motives.
+-/
+@[reducible]
+def valueEqFuel (fuel : Nat) (v₁ v₂ : Value) : Bool :=
+  valueHeadEq (valueListEqFuel fuel) v₁ v₂
+
+theorem valueHeadEq_sound
+    {ih : List Value → List Value → Bool}
+    (h_ih : ∀ {as bs}, ih as bs = true → as = bs)
+    {v₁ v₂ : Value}
+    (h : valueHeadEq ih v₁ v₂ = true) : v₁ = v₂ := by
+  cases v₁ with
+  | unit =>
+    cases v₂ with
+    | unit => rfl
+    | scalar _ => nomatch h
+    | ptr _ _ => nomatch h
+    | aggregate _ _ => nomatch h
+  | scalar s₁ =>
+    cases v₂ with
+    | unit => nomatch h
+    | scalar s₂ => exact congrArg Value.scalar (scalarIntEq_sound h)
+    | ptr _ _ => nomatch h
+    | aggregate _ _ => nomatch h
+  | ptr p₁ sz₁ =>
+    cases v₂ with
+    | unit => nomatch h
+    | scalar _ => nomatch h
+    | ptr p₂ sz₂ =>
+      rcases Bool.and_eq_true_iff.mp h with ⟨hp, hsz⟩
+      rw [provenancePtrEq_sound hp, Nat.beq_eq.mp hsz]
+    | aggregate _ _ => nomatch h
+  | aggregate var₁ fs₁ =>
+    cases v₂ with
+    | unit => nomatch h
+    | scalar _ => nomatch h
+    | ptr _ _ => nomatch h
+    | aggregate var₂ fs₂ =>
+      rcases Bool.and_eq_true_iff.mp h with ⟨hvar, hfs⟩
+      rw [Nat.beq_eq.mp hvar, h_ih hfs]
+
+theorem valueListEqFuel_sound :
+    ∀ (fuel : Nat) {xs ys : List Value},
+      valueListEqFuel fuel xs ys = true → xs = ys
+  | 0, _, _, h => nomatch h
+  | _ + 1, [], [], _ => rfl
+  | _ + 1, [], _ :: _, h => nomatch h
+  | _ + 1, _ :: _, [], h => nomatch h
+  | fuel + 1, v₁ :: vs₁, v₂ :: vs₂, h => by
+    change
+      (valueHeadEq (valueListEqFuel fuel) v₁ v₂ &&
+       valueListEqFuel fuel vs₁ vs₂) = true at h
+    rcases Bool.and_eq_true_iff.mp h with ⟨hHead, hTail⟩
+    rw [valueHeadEq_sound (fun hfs => valueListEqFuel_sound fuel hfs) hHead,
+        valueListEqFuel_sound fuel hTail]
+
+theorem valueEqFuel_sound {fuel : Nat} {v₁ v₂ : Value}
+    (h : valueEqFuel fuel v₁ v₂ = true) : v₁ = v₂ :=
+  valueHeadEq_sound (fun hfs => valueListEqFuel_sound fuel hfs) h
+
 mutual
   def reprValuePrec : Value → Nat → Std.Format
     | .unit, _ => "Value.unit"
@@ -529,6 +647,238 @@ instance instDecidableEqRigidTy : DecidableEq RigidTy :=
 instance instReprRigidTy : Repr RigidTy where
   reprPrec _ _ := "RigidTy"
 
+@[reducible]
+def intTyTag : IntTy → Nat
+  | .isize => 0 | .i8 => 1 | .i16 => 2 | .i32 => 3 | .i64 => 4 | .i128 => 5
+
+@[reducible]
+def intTyEq (a b : IntTy) : Bool := Nat.beq (intTyTag a) (intTyTag b)
+
+@[reducible]
+def uintTyTag : UintTy → Nat
+  | .usize => 0 | .u8 => 1 | .u16 => 2 | .u32 => 3 | .u64 => 4 | .u128 => 5
+
+@[reducible]
+def uintTyEq (a b : UintTy) : Bool := Nat.beq (uintTyTag a) (uintTyTag b)
+
+@[reducible]
+def floatTyTag : FloatTy → Nat
+  | .f16 => 0 | .f32 => 1 | .f64 => 2 | .f128 => 3
+
+@[reducible]
+def floatTyEq (a b : FloatTy) : Bool := Nat.beq (floatTyTag a) (floatTyTag b)
+
+@[reducible]
+def mutabilityTag : Mutability → Nat
+  | .not => 0 | .mut => 1
+
+@[reducible]
+def mutabilityEq (a b : Mutability) : Bool := Nat.beq (mutabilityTag a) (mutabilityTag b)
+
+@[reducible]
+def safetyTag : Safety → Nat
+  | .safe => 0 | .unsafe_ => 1
+
+@[reducible]
+def safetyEq (a b : Safety) : Bool := Nat.beq (safetyTag a) (safetyTag b)
+
+@[reducible]
+def callConvEq (a b : CallConv) : Bool :=
+  match a with
+  | .rust =>
+    match b with
+    | .rust => true | .c => false | .rustIntrinsic => false | .other _ => false
+  | .c =>
+    match b with
+    | .rust => false | .c => true | .rustIntrinsic => false | .other _ => false
+  | .rustIntrinsic =>
+    match b with
+    | .rust => false | .c => false | .rustIntrinsic => true | .other _ => false
+  | .other s₁ =>
+    match b with
+    | .rust => false | .c => false | .rustIntrinsic => false | .other s₂ => stringEq s₁ s₂
+
+@[reducible]
+def rigidTyTag : RigidTy → Nat
+  | .bool => 0
+  | .char => 1
+  | .int _ => 2
+  | .uint _ => 3
+  | .float _ => 4
+  | .never => 5
+  | .str => 6
+  | .tuple _ => 7
+  | .array _ _ => 8
+  | .slice _ => 9
+  | .ref _ _ => 10
+  | .rawPtr _ _ => 11
+  | .adt _ _ => 12
+  | .fnDef _ _ => 13
+  | .fnPtr _ _ _ _ => 14
+  | .closure _ _ => 15
+  | .dynamic _ => 16
+  | .foreign _ => 17
+  | .other _ => 18
+  | .param _ _ => 19
+  | .alias _ _ => 20
+    
+/--
+Fuel-bounded structural equality on `List RigidTy`, defined via `Nat.rec` and
+non-overlapping `match` expressions without `RigidTy.brecOn` or dependent
+splitter motives.
+-/
+@[reducible]
+def rigidTyListEqFuel : Nat → List RigidTy → List RigidTy → Bool :=
+  Nat.rec
+    (motive := fun _ => List RigidTy → List RigidTy → Bool)
+    (fun _ _ => false)
+    (fun _ ih xs ys =>
+      match xs with
+      | [] =>
+        match ys with
+        | [] => true
+        | _ :: _ => false
+      | t₁ :: ts₁ =>
+        match ys with
+        | [] => false
+        | t₂ :: ts₂ =>
+          let headEq : Bool :=
+            if Nat.beq (rigidTyTag t₁) (rigidTyTag t₂) then
+              match t₁ with
+              | .bool => true
+              | .char => true
+              | .int w₁ =>
+                match t₂ with
+                | .int w₂ => intTyEq w₁ w₂
+                | .bool | .char | .uint _ | .float _ | .never | .str
+                | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
+                | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
+              | .uint w₁ =>
+                match t₂ with
+                | .uint w₂ => uintTyEq w₁ w₂
+                | .bool | .char | .int _ | .float _ | .never | .str
+                | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
+                | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
+              | .float w₁ =>
+                match t₂ with
+                | .float w₂ => floatTyEq w₁ w₂
+                | .bool | .char | .int _ | .uint _ | .never | .str
+                | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
+                | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
+              | .never => true
+              | .str => true
+              | .tuple fs₁ =>
+                match t₂ with
+                | .tuple fs₂ => ih fs₁ fs₂
+                | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+                | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
+                | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
+              | .array e₁ n₁ =>
+                match t₂ with
+                | .array e₂ n₂ => ih [e₁] [e₂] && Nat.beq n₁ n₂
+                | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+                | .tuple _ | .slice _ | .ref _ _ | .rawPtr _ _
+                | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
+              | .slice e₁ =>
+                match t₂ with
+                | .slice e₂ => ih [e₁] [e₂]
+                | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+                | .tuple _ | .array _ _ | .ref _ _ | .rawPtr _ _
+                | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
+              | .ref m₁ p₁ =>
+                match t₂ with
+                | .ref m₂ p₂ => mutabilityEq m₁ m₂ && ih [p₁] [p₂]
+                | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+                | .tuple _ | .array _ _ | .slice _ | .rawPtr _ _
+                | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
+              | .rawPtr m₁ p₁ =>
+                match t₂ with
+                | .rawPtr m₂ p₂ => mutabilityEq m₁ m₂ && ih [p₁] [p₂]
+                | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+                | .tuple _ | .array _ _ | .slice _ | .ref _ _
+                | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
+              | .adt d₁ a₁ =>
+                match t₂ with
+                | .adt d₂ a₂ => stringEq d₁ d₂ && ih a₁ a₂
+                | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+                | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
+                | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
+              | .fnDef d₁ a₁ =>
+                match t₂ with
+                | .fnDef d₂ a₂ => stringEq d₁ d₂ && ih a₁ a₂
+                | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+                | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
+                | .adt _ _ | .fnPtr _ _ _ _ | .closure _ _
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
+              | .fnPtr i₁ o₁ s₁ c₁ =>
+                match t₂ with
+                | .fnPtr i₂ o₂ s₂ c₂ =>
+                  ih (o₁ :: i₁) (o₂ :: i₂) && safetyEq s₁ s₂ && callConvEq c₁ c₂
+                | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+                | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
+                | .adt _ _ | .fnDef _ _ | .closure _ _
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
+              | .closure d₁ u₁ =>
+                match t₂ with
+                | .closure d₂ u₂ => stringEq d₁ d₂ && ih u₁ u₂
+                | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+                | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
+                | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
+              | .dynamic d₁ =>
+                match t₂ with
+                | .dynamic d₂ => stringEq d₁ d₂
+                | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+                | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
+                | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
+                | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
+              | .foreign d₁ =>
+                match t₂ with
+                | .foreign d₂ => stringEq d₁ d₂
+                | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+                | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
+                | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
+                | .dynamic _ | .other _ | .param _ _ | .alias _ _ => false
+              | .other s₁ =>
+                match t₂ with
+                | .other s₂ => stringEq s₁ s₂
+                | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+                | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
+                | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
+                | .dynamic _ | .foreign _ | .param _ _ | .alias _ _ => false
+              | .param idx1 name1 =>
+                match t₂ with
+                | .param idx2 name2 => Nat.beq idx1 idx2 && stringEq name1 name2
+                | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+                | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
+                | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
+                | .dynamic _ | .foreign _ | .other _ | .alias _ _ => false
+              | .alias d1 a1 =>
+                match t₂ with
+                | .alias d2 a2 => stringEq d1 d2 && ih a1 a2
+                | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+                | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
+                | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ => false
+
+            else
+              false
+          headEq && ih ts₁ ts₂)
+
+/-- Fuel-bounded structural equality on `RigidTy` without `RigidTy.brecOn`. -/
+@[reducible]
+def rigidTyEqFuel (fuel : Nat) (t₁ t₂ : RigidTy) : Bool :=
+  rigidTyListEqFuel fuel [t₁] [t₂]
+
 deriving instance DecidableEq, Repr for Ty
 deriving instance DecidableEq, Repr for GenericParamDef
 deriving instance DecidableEq, Repr for TraitRef
@@ -693,11 +1043,22 @@ def MatchesObservedOutcome (obsOut : ObservedOutcome) (out : MirOutcome) : Prop 
 /-- Computable boolean check for `MatchesObservedOutcome`. -/
 @[reducible]
 def checkOutcomeMatches (obsOut : ObservedOutcome) (out : MirOutcome) : Bool :=
-  match obsOut, out with
-  | .normal expectedRet, .normal (actualRet, _) => valueEq actualRet expectedRet
-  | .panic, .panic => true
-  | .abort, .abort => true
-  | _, _ => false
+  match obsOut with
+  | .normal expectedRet =>
+    match out with
+    | .normal (actualRet, _) => valueEqFuel 16 actualRet expectedRet
+    | .panic => false
+    | .abort => false
+  | .panic =>
+    match out with
+    | .normal _ => false
+    | .panic => true
+    | .abort => false
+  | .abort =>
+    match out with
+    | .normal _ => false
+    | .panic => false
+    | .abort => true
 
 theorem checkOutcomeMatches_sound {obsOut : ObservedOutcome} {out : MirOutcome}
     (h : checkOutcomeMatches obsOut out = true) :
@@ -705,7 +1066,7 @@ theorem checkOutcomeMatches_sound {obsOut : ObservedOutcome} {out : MirOutcome}
   cases obsOut with
   | normal expectedRet =>
     cases out with
-    | normal p => exact valueEq_sound h
+    | normal p => exact valueEqFuel_sound h
     | panic => nomatch h
     | abort => nomatch h
   | panic =>
@@ -752,17 +1113,17 @@ synthesized `MirCallAns` when the callee `defPath` and `args` match.
 @[reducible]
 def matchCallObservedEvent (req : MirCallReq) : ObservedEvent → Option MirCallAns
   | .extCall defPath args retVal =>
-    if (req.defPath == defPath) && valueListEq req.args args then
+    if (req.defPath == defPath) && valueListEqFuel 16 req.args args then
       some (.returned retVal req.memory)
     else
       none
   | .extCallPanic defPath args =>
-    if (req.defPath == defPath) && valueListEq req.args args then
+    if (req.defPath == defPath) && valueListEqFuel 16 req.args args then
       some (.panicked req.memory)
     else
       none
   | .extCallAbort defPath args =>
-    if (req.defPath == defPath) && valueListEq req.args args then
+    if (req.defPath == defPath) && valueListEqFuel 16 req.args args then
       some .aborted
     else
       none
@@ -776,52 +1137,377 @@ theorem matchCallObservedEvent_sound
   | branch _ => nomatch h
   | extCall defPath args retVal =>
     change
-      (if (req.defPath == defPath) && valueListEq req.args args then
+      (if (req.defPath == defPath) && valueListEqFuel 16 req.args args then
         some (MirCallAns.returned retVal req.memory)
       else
         none) = some ans at h
     revert h
     cases hd : (req.defPath == defPath) <;>
-      cases ha : valueListEq req.args args <;> intro h
+      cases ha : valueListEqFuel 16 req.args args <;> intro h
     · nomatch h
     · nomatch h
     · nomatch h
     · cases h
-      exact ⟨beq_iff_eq.mp hd, valueListEq_sound ha, rfl⟩
+      exact ⟨beq_iff_eq.mp hd, valueListEqFuel_sound 16 ha, rfl⟩
   | extCallPanic defPath args =>
     change
-      (if (req.defPath == defPath) && valueListEq req.args args then
+      (if (req.defPath == defPath) && valueListEqFuel 16 req.args args then
         some (MirCallAns.panicked req.memory)
       else
         none) = some ans at h
     revert h
     cases hd : (req.defPath == defPath) <;>
-      cases ha : valueListEq req.args args <;> intro h
+      cases ha : valueListEqFuel 16 req.args args <;> intro h
     · nomatch h
     · nomatch h
     · nomatch h
     · cases h
-      exact ⟨beq_iff_eq.mp hd, valueListEq_sound ha, rfl⟩
+      exact ⟨beq_iff_eq.mp hd, valueListEqFuel_sound 16 ha, rfl⟩
   | extCallAbort defPath args =>
     change
-      (if (req.defPath == defPath) && valueListEq req.args args then
+      (if (req.defPath == defPath) && valueListEqFuel 16 req.args args then
         some MirCallAns.aborted
       else
         none) = some ans at h
     revert h
     cases hd : (req.defPath == defPath) <;>
-      cases ha : valueListEq req.args args <;> intro h
+      cases ha : valueListEqFuel 16 req.args args <;> intro h
     · nomatch h
     · nomatch h
     · nomatch h
     · cases h
-      exact ⟨beq_iff_eq.mp hd, valueListEq_sound ha, rfl⟩
+      exact ⟨beq_iff_eq.mp hd, valueListEqFuel_sound 16 ha, rfl⟩
 
 /-! ## 3. Full Trace Replay (`checkBranches = true`) and Soundness -/
+
+/-- Extract the active `(blockIdx, stmtIdx)` program counter from `MirExecState`. -/
+@[reducible]
+def execStateCursor : MirExecState → Nat × Nat
+  | .running s => (s.frame.blockIdx, s.frame.stmtIdx)
+  | _ => (0, 0)
+
+/-- Extract the active `CapturedMir` body from `MirExecState` (defaulting to `rootBody`). -/
+@[reducible]
+def execStateActiveBody (rootBody : CapturedMir) : MirExecState → CapturedMir
+  | .running s =>
+    match s.memory.activeCallee with
+    | some calleeBody => calleeBody
+    | none => rootBody
+  | _ => rootBody
+
+/-- Return `true` if `s : ScalarLayout` is a pointer primitive. -/
+@[reducible]
+def scalarLayoutIsPointer : ScalarLayout → Bool
+  | .initialized p _ =>
+    match p with
+    | .pointer _ => true
+    | .int _ _ | .float _ => false
+  | .union p =>
+    match p with
+    | .pointer _ => true
+    | .int _ _ | .float _ => false
+
+/-- Return `true` if `pred` holds for any index in `idxs` (bounded by fuel `32`). -/
+@[reducible]
+def anyLayoutIdxSatisfies (pred : Nat → Bool) (idxs : List Nat) : Bool :=
+  (Nat.rec
+    (motive := fun _ => List Nat → Bool)
+    (fun _ => false)
+    (fun _ ih xs =>
+      match xs with
+      | [] => false
+      | fIdx :: rest => if pred fIdx then true else ih rest)
+    32) idxs
+
+/--
+Test whether the `TypeLayout` at `layoutIdx` in `layouts` (or any transitive
+field layout in `l.fieldLayouts`) has a pointer scalar representation.
+-/
+@[reducible]
+def layoutHasPointerScalar : Nat → LayoutTable → Nat → Bool :=
+  Nat.rec
+    (motive := fun _ => LayoutTable → Nat → Bool)
+    (fun _ _ => false)
+    (fun _ ih layouts layoutIdx =>
+      match LayoutTable.lookup layouts layoutIdx with
+      | none => false
+      | some l =>
+        let reprHasPtr : Bool :=
+          match l.backendRepr with
+          | .scalar s0 => scalarLayoutIsPointer s0
+          | .scalarPair s0 s1 =>
+            Bool.or (scalarLayoutIsPointer s0) (scalarLayoutIsPointer s1)
+          | .memory => false
+        if reprHasPtr then
+          true
+        else
+          anyLayoutIdxSatisfies (ih layouts) l.fieldLayouts)
+
+/--
+Fuel-bounded check testing whether all `RigidTy`s in a list are `Freeze`
+(contain no `UnsafeCell` interior mutability or raw pointer), defined via
+`Nat.rec` and non-overlapping `match` expressions.
+-/
+@[reducible]
+def rigidTyListIsFreezeFuel : Nat → List RigidTy → Bool :=
+  Nat.rec
+    (motive := fun _ => List RigidTy → Bool)
+    (fun _ => true)
+    (fun _ ih xs =>
+      match xs with
+      | [] => true
+      | t :: rest =>
+        let headFreeze : Bool :=
+          match t with
+          | .rawPtr _ _ => false
+          | .adt defPath args =>
+            if stringEq defPath "core::cell::UnsafeCell" ||
+                stringEq defPath "std::cell::UnsafeCell" then
+              false
+            else
+              ih args
+          | .tuple fields => ih fields
+          | .array elem _ => ih [elem]
+          | .slice elem => ih [elem]
+          | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+          | .ref _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
+          | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => true
+        headFreeze && ih rest)
+
+/--
+Fuel-bounded check testing whether a `RigidTy` is `Freeze` without `.brecOn`.
+-/
+@[reducible]
+def rigidTyIsFreezeFuel (fuel : Nat) (ty : RigidTy) : Bool :=
+  rigidTyListIsFreezeFuel fuel [ty]
+
+/--
+Structurally recursive fuel-bounded helper testing whether any `RigidTy` in a
+worklist contains `&mut T`, `*const T` / `*mut T`, or an interior-mutable
+shared reference (`&UnsafeCell<T>`).
+-/
+@[reducible]
+def rigidTyListHasImpureExtCallPtr : Nat → List RigidTy → Bool :=
+  Nat.rec
+    (motive := fun _ => List RigidTy → Bool)
+    (fun _ => false)
+    (fun _ ih xs =>
+      match xs with
+      | [] => false
+      | t :: rest =>
+        let headImpure : Bool :=
+          match t with
+          | .ref m pointee =>
+            match m with
+            | .mut => true
+            | .not =>
+              Bool.or
+                (Bool.not (rigidTyIsFreezeFuel 16 pointee))
+                (ih [pointee])
+          | .rawPtr _ _ => true
+          | .tuple fields => ih fields
+          | .array elem _ => ih [elem]
+          | .slice elem => ih [elem]
+          | .adt defPath args =>
+            if Bool.not (rigidTyIsFreezeFuel 16 (.adt defPath args)) ||
+                stringEq defPath "core::ptr::non_null::NonNull" ||
+                stringEq defPath "core::ptr::unique::Unique" then
+              true
+            else
+              ih args
+          | .closure _ upvars => ih upvars
+          | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+          | .fnDef _ _ | .fnPtr _ _ _ _ | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
+        if headImpure then
+          true
+        else
+          ih rest)
+
+/--
+Test whether a `RigidTy` contains a mutable reference (`&mut T`), raw pointer
+(`*const T` / `*mut T`), or interior-mutable shared reference (`&UnsafeCell<T>`)
+through which an external callee could read or mutate memory outside the pure
+`MirCallE` value boundary.
+-/
+@[reducible]
+def rigidTyHasImpureExtCallPtr (fuel : Nat) (ty : RigidTy) : Bool :=
+  rigidTyListHasImpureExtCallPtr fuel [ty]
+
+/--
+Test whether a parameter `Ty` carries `&mut` or raw-pointer capabilities that
+violate `TraceCheck`'s memory-pure external-callee assumption, inspecting both
+`ty.kind` and (when `layouts` is supplied) `ty.layoutIdx` in `layouts`.
+-/
+@[reducible]
+def tyHasImpureExtCallPtr
+    (ty : Ty) (layouts : LayoutTable := emptyLayoutTable) : Bool :=
+  if rigidTyHasImpureExtCallPtr 16 ty.kind then
+    true
+  else
+    match ty.kind with
+    | .ref m pointee =>
+      match m with
+      | .mut => true
+      | .not => Bool.not (rigidTyIsFreezeFuel 16 pointee)
+    | .adt _ _ | .tuple _ | .array _ _ | .slice _ | .closure _ _ =>
+      layoutHasPointerScalar 16 layouts ty.layoutIdx
+    | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+    | .rawPtr _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ =>
+      false
+
+/--
+Return the 0-based argument index of the first parameter in `sigBody` whose type
+carries `&mut` or a raw pointer (`tyHasImpureExtCallPtr`), or `none` if all
+parameters are memory-pure.
+-/
+@[reducible]
+def findCalleeImpurePtrArgIdxAux
+    (layouts : LayoutTable) : Nat → Nat → List LocalDecl → Option Nat :=
+  Nat.rec
+    (motive := fun _ => Nat → List LocalDecl → Option Nat)
+    (fun _ _ => none)
+    (fun _ ih argIdx decls =>
+      match decls with
+      | [] => none
+      | decl :: rest =>
+        if tyHasImpureExtCallPtr decl.ty layouts then
+          some argIdx
+        else
+          ih (argIdx + 1) rest)
+
+/--
+Check a callee's `CapturedMir` signature for any `&mut` or raw-pointer parameter,
+returning `some argIdx` for the first impure parameter.
+-/
+@[reducible]
+def findCalleeImpurePtrArgIdx? (sigBody : CapturedMir) : Option Nat :=
+  findCalleeImpurePtrArgIdxAux sigBody.layouts sigBody.argCount 0 (sigBody.localDecls.drop 1)
+
+/--
+Inspect a caller basic block's `TerminatorKind.call` / `TerminatorKind.tailCall`
+argument operands for any `&mut` or raw-pointer argument type using `operandTy`,
+returning `some argIdx` on the first impure argument.
+-/
+@[reducible]
+def findCallOperandsImpurePtrArgIdxAux
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (argIdx : Nat) (ops : List Operand) : Option Nat :=
+  (Nat.rec
+    (motive := fun _ => Nat → List Operand → Option Nat)
+    (fun _ _ => none)
+    (fun _ ih idx xs =>
+      match xs with
+      | [] => none
+      | op :: rest =>
+        match operandTy localDecls layouts op with
+        | some ty =>
+          if tyHasImpureExtCallPtr ty layouts then
+            some idx
+          else
+            ih (idx + 1) rest
+        | none =>
+          ih (idx + 1) rest)
+    32) argIdx ops
+
+/--
+Check whether the call terminator at `blockIdx` in `body` passes any `&mut` or
+raw-pointer argument operand.
+-/
+@[reducible]
+def findBlockCallImpurePtrArgIdx?
+    (body : CapturedMir) (blockIdx : Nat) : Option Nat :=
+  match get? body.basicBlocks blockIdx with
+  | some bb =>
+    match bb.terminator.kind with
+    | .call _ argOps _ _ _ | .tailCall _ argOps =>
+      findCallOperandsImpurePtrArgIdxAux body.localDecls body.layouts 0 argOps
+    | _ => none
+  | none => none
+
+/--
+Structurally recursive fuel-bounded helper testing whether any runtime `Value`
+in a worklist contains a pointer whose borrow in `borrows` is mutable/non-frozen
+(`.active` or `.reserved`) or untracked (`none`, such as a raw pointer).
+-/
+@[reducible]
+def valueListHasImpureExtCallPtr (borrows : List BorrowEntry) : Nat → List Value → Bool :=
+  Nat.rec
+    (motive := fun _ => List Value → Bool)
+    (fun _ => false)
+    (fun _ ih xs =>
+      match xs with
+      | [] => false
+      | v :: rest =>
+        let headImpure : Bool :=
+          match v with
+          | .ptr ptrVal _ =>
+            match lookupBorrow borrows ptrVal.tag with
+            | some b =>
+              match b.perm with
+              | .frozen => false
+              | .reserved | .active | .disabled => true
+            | none => true
+          | .aggregate _ fields =>
+            ih fields
+          | .unit | .scalar _ => false
+        if headImpure then
+          true
+        else
+          ih rest)
+
+/--
+Test whether an evaluated runtime `Value` passed in a `MirCallReq` contains a
+pointer whose borrow in `borrows` is mutable/non-frozen (`.active` or
+`.reserved`) or untracked (`none`, such as a raw pointer).
+-/
+@[reducible]
+def valueHasImpureExtCallPtr (borrows : List BorrowEntry) (fuel : Nat) (v : Value) : Bool :=
+  valueListHasImpureExtCallPtr borrows fuel [v]
+
+/--
+Return the 0-based argument index of the first runtime argument in `args` that
+contains a mutable or untracked raw pointer under `borrows`.
+-/
+@[reducible]
+def findCallReqImpurePtrArgIdxAux
+    (borrows : List BorrowEntry) (argIdx : Nat) (args : List Value) : Option Nat :=
+  (Nat.rec
+    (motive := fun _ => Nat → List Value → Option Nat)
+    (fun _ _ => none)
+    (fun _ ih idx xs =>
+      match xs with
+      | [] => none
+      | v :: rest =>
+        if valueHasImpureExtCallPtr borrows 16 v then
+          some idx
+        else
+          ih (idx + 1) rest)
+    32) argIdx args
+
+/--
+Inspect a runtime `MirCallReq` for any argument containing a mutable (`&mut`)
+or untracked raw pointer capability.
+-/
+@[reducible]
+def findCallReqImpurePtrArgIdx? (req : MirCallReq) : Option Nat :=
+  findCallReqImpurePtrArgIdxAux req.memory.borrows 0 req.args
+
+/--
+Combined call-site operand-type and runtime `MirCallReq` argument check for
+`&mut` or raw-pointer external call arguments.
+-/
+@[reducible]
+def findActiveCallImpurePtrArgIdx?
+    (activeBody : CapturedMir) (blockIdx : Nat) (req : MirCallReq) : Option Nat :=
+  match findBlockCallImpurePtrArgIdx? activeBody blockIdx with
+  | some argIdx => some argIdx
+  | none => findCallReqImpurePtrArgIdx? req
 
 /--
 Fuel-bounded replay of `events` and `outcome` against `stepMirState body` with
 full `MirObsE` (`switchInt`) and `MirCallE` checking (`checkBranches = true`).
+Rejects external calls whose call-site argument operands or runtime values take
+`&mut` or raw-pointer capabilities (`findActiveCallImpurePtrArgIdx? = some _`).
 -/
 @[reducible]
 def reconstructFullMirTrace
@@ -856,16 +1542,22 @@ def reconstructFullMirTrace
           none
       | _ => none
     | .vis (.inr (.inr (.call req))) k =>
-      match events with
-      | obsEv :: rest =>
-        match matchCallObservedEvent req obsEv with
-        | some ans =>
-          match reconstructFullMirTrace fuel' body (k ans) rest outcome with
-          | some (trRest, out) =>
-            some (⟨.inr (.inr (.call req)), ans⟩ :: trRest, out)
+      match
+        findActiveCallImpurePtrArgIdx?
+          (execStateActiveBody body st) (execStateCursor st).1 req
+      with
+      | some _ => none
+      | none =>
+        match events with
+        | obsEv :: rest =>
+          match matchCallObservedEvent req obsEv with
+          | some ans =>
+            match reconstructFullMirTrace fuel' body (k ans) rest outcome with
+            | some (trRest, out) =>
+              some (⟨.inr (.inr (.call req)), ans⟩ :: trRest, out)
+            | none => none
           | none => none
-        | none => none
-      | [] => none
+        | [] => none
 
 /--
 Computable boolean checker for full (`MirObsE` + `MirCallE`) trace consistency
@@ -960,37 +1652,43 @@ theorem reconstructFullMirTrace_sound
       · cases callReq with
         | call req =>
           simp only [h_step] at h_ok
-          cases events with
-          | nil => nomatch h_ok
-          | cons obsEv rest =>
-            change
-              (match matchCallObservedEvent req obsEv with
-               | some ans =>
-                 match reconstructFullMirTrace fuel' body (k ans) rest outcome with
-                 | some (trRest, out) =>
-                   some (⟨.inr (.inr (.call req)), ans⟩ :: trRest, out)
-                 | none => none
-               | none => none) = some (tr, out) at h_ok
-            cases h_match : matchCallObservedEvent req obsEv with
-            | none => rw [h_match] at h_ok; nomatch h_ok
-            | some ans =>
-              rw [h_match] at h_ok
+          cases h_imp :
+              findActiveCallImpurePtrArgIdx?
+                (execStateActiveBody body st) (execStateCursor st).1 req with
+          | some _ => simp only [h_imp] at h_ok; nomatch h_ok
+          | none =>
+            simp only [h_imp] at h_ok
+            cases events with
+            | nil => nomatch h_ok
+            | cons obsEv rest =>
               change
-                (match reconstructFullMirTrace fuel' body (k ans) rest outcome with
-                 | some (trRest, out) =>
-                   some (⟨.inr (.inr (.call req)), ans⟩ :: trRest, out)
+                (match matchCallObservedEvent req obsEv with
+                 | some ans =>
+                   match reconstructFullMirTrace fuel' body (k ans) rest outcome with
+                   | some (trRest, out) =>
+                     some (⟨.inr (.inr (.call req)), ans⟩ :: trRest, out)
+                   | none => none
                  | none => none) = some (tr, out) at h_ok
-              cases h_rec : reconstructFullMirTrace fuel' body (k ans) rest outcome with
-              | none => rw [h_rec] at h_ok; nomatch h_ok
-              | some pair =>
-                rw [h_rec] at h_ok
-                cases h_ok
-                rcases ih (k ans) rest pair.1 h_rec with
-                  ⟨h_evs, h_out, ⟨u, h_reach, h_u⟩⟩
-                rw [h_step] at h_obs
-                dsimp only [ITreeF.map] at h_obs
-                exact ⟨⟨matchCallObservedEvent_sound h_match, h_evs⟩, h_out,
-                  ⟨u, .vis h_obs False.elim ans h_reach, h_u⟩⟩
+              cases h_match : matchCallObservedEvent req obsEv with
+              | none => rw [h_match] at h_ok; nomatch h_ok
+              | some ans =>
+                rw [h_match] at h_ok
+                change
+                  (match reconstructFullMirTrace fuel' body (k ans) rest outcome with
+                   | some (trRest, out) =>
+                     some (⟨.inr (.inr (.call req)), ans⟩ :: trRest, out)
+                   | none => none) = some (tr, out) at h_ok
+                cases h_rec : reconstructFullMirTrace fuel' body (k ans) rest outcome with
+                | none => rw [h_rec] at h_ok; nomatch h_ok
+                | some pair =>
+                  rw [h_rec] at h_ok
+                  cases h_ok
+                  rcases ih (k ans) rest pair.1 h_rec with
+                    ⟨h_evs, h_out, ⟨u, h_reach, h_u⟩⟩
+                  rw [h_step] at h_obs
+                  dsimp only [ITreeF.map] at h_obs
+                  exact ⟨⟨matchCallObservedEvent_sound h_match, h_evs⟩, h_out,
+                    ⟨u, .vis h_obs False.elim ans h_reach, h_u⟩⟩
 
 /--
 Soundness of `checkFullObservedTraceBounded`: if `checkFullObservedTraceBounded`
@@ -1043,16 +1741,22 @@ def reconstructObsErasedMirTrace
     | .vis (.inr (.inl _)) k =>
       reconstructObsErasedMirTrace fuel' body (k PUnit.unit) events outcome
     | .vis (.inr (.inr (.call req))) k =>
-      match events with
-      | obsEv :: rest =>
-        match matchCallObservedEvent req obsEv with
-        | some ans =>
-          match reconstructObsErasedMirTrace fuel' body (k ans) rest outcome with
-          | some (trRest, out) =>
-            some (⟨.inr (.inr (.call req)), ans⟩ :: trRest, out)
+      match
+        findActiveCallImpurePtrArgIdx?
+          (execStateActiveBody body st) (execStateCursor st).1 req
+      with
+      | some _ => none
+      | none =>
+        match events with
+        | obsEv :: rest =>
+          match matchCallObservedEvent req obsEv with
+          | some ans =>
+            match reconstructObsErasedMirTrace fuel' body (k ans) rest outcome with
+            | some (trRest, out) =>
+              some (⟨.inr (.inr (.call req)), ans⟩ :: trRest, out)
+            | none => none
           | none => none
-        | none => none
-      | [] => none
+        | [] => none
 
 /--
 Computable boolean checker for branch-erased (`MirCallE`-only) trace consistency
@@ -1188,37 +1892,43 @@ theorem reconstructObsErasedMirTrace_sound
       · cases callReq with
         | call req =>
           simp only [h_step] at h_ok
-          cases events with
-          | nil => nomatch h_ok
-          | cons obsEv rest =>
-            change
-              (match matchCallObservedEvent req obsEv with
-               | some ans =>
-                 match reconstructObsErasedMirTrace fuel' body (k ans) rest outcome with
-                 | some (trRest, out) =>
-                   some (⟨.inr (.inr (.call req)), ans⟩ :: trRest, out)
-                 | none => none
-               | none => none) = some (tr, out) at h_ok
-            cases h_match : matchCallObservedEvent req obsEv with
-            | none => rw [h_match] at h_ok; nomatch h_ok
-            | some ans =>
-              rw [h_match] at h_ok
+          cases h_imp :
+              findActiveCallImpurePtrArgIdx?
+                (execStateActiveBody body st) (execStateCursor st).1 req with
+          | some _ => simp only [h_imp] at h_ok; nomatch h_ok
+          | none =>
+            simp only [h_imp] at h_ok
+            cases events with
+            | nil => nomatch h_ok
+            | cons obsEv rest =>
               change
-                (match reconstructObsErasedMirTrace fuel' body (k ans) rest outcome with
-                 | some (trRest, out) =>
-                   some (⟨.inr (.inr (.call req)), ans⟩ :: trRest, out)
+                (match matchCallObservedEvent req obsEv with
+                 | some ans =>
+                   match reconstructObsErasedMirTrace fuel' body (k ans) rest outcome with
+                   | some (trRest, out) =>
+                     some (⟨.inr (.inr (.call req)), ans⟩ :: trRest, out)
+                   | none => none
                  | none => none) = some (tr, out) at h_ok
-              cases h_rec : reconstructObsErasedMirTrace fuel' body (k ans) rest outcome with
-              | none => rw [h_rec] at h_ok; nomatch h_ok
-              | some pair =>
-                rcases pair with ⟨trRest, out'⟩
-                rw [h_rec] at h_ok
-                cases h_ok
-                rcases ih (k ans) rest trRest h_rec with ⟨h_evs, h_out, h_reach⟩
-                rw [h_step] at h_obs
-                dsimp only [ITreeF.map] at h_obs
-                exact ⟨⟨matchCallObservedEvent_sound h_match, h_evs⟩, h_out,
-                  reachesRet_interp_silenceMirObs_call h_obs h_reach⟩
+              cases h_match : matchCallObservedEvent req obsEv with
+              | none => rw [h_match] at h_ok; nomatch h_ok
+              | some ans =>
+                rw [h_match] at h_ok
+                change
+                  (match reconstructObsErasedMirTrace fuel' body (k ans) rest outcome with
+                   | some (trRest, out) =>
+                     some (⟨.inr (.inr (.call req)), ans⟩ :: trRest, out)
+                   | none => none) = some (tr, out) at h_ok
+                cases h_rec : reconstructObsErasedMirTrace fuel' body (k ans) rest outcome with
+                | none => rw [h_rec] at h_ok; nomatch h_ok
+                | some pair =>
+                  rcases pair with ⟨trRest, out'⟩
+                  rw [h_rec] at h_ok
+                  cases h_ok
+                  rcases ih (k ans) rest trRest h_rec with ⟨h_evs, h_out, h_reach⟩
+                  rw [h_step] at h_obs
+                  dsimp only [ITreeF.map] at h_obs
+                  exact ⟨⟨matchCallObservedEvent_sound h_match, h_evs⟩, h_out,
+                    reachesRet_interp_silenceMirObs_call h_obs h_reach⟩
 
 /--
 Soundness of `checkObsErasedObservedTraceBounded`: if
@@ -1470,13 +2180,14 @@ theorem refutePolyStatefulClaimByObservedTrace
 /--
 Entry in the runtime observer's shadow provenance table mapping a watched native
 virtual address range `[baseAddr, baseAddr + byteLen)` to its abstract MIR
-`(allocId, tag)` provenance.
+`(allocId, tag)` provenance and optional initial referent bytes `rawBytes`.
 -/
 structure ShadowAllocEntry : Type where
   baseAddr : Nat
   byteLen : Nat
   allocId : AllocId
   tag : Nat := allocId
+  rawBytes : List UInt8 := []
   deriving DecidableEq, Repr
 
 /-- Table of watched runtime allocations used to reconstruct pointer provenance. -/
@@ -1496,19 +2207,32 @@ def decodeRawLittleEndianNat : List UInt8 → Nat
 
 /--
 Look up a native runtime virtual address `addr` in `ShadowProvenanceTable`,
+returning `(entry, addr - entry.baseAddr)` for the first entry whose range
+`[baseAddr, baseAddr + byteLen]` contains `addr`.
+-/
+@[reducible]
+def lookupShadowAllocEntry? :
+    ShadowProvenanceTable → Nat → Option (ShadowAllocEntry × Nat)
+  | [], _ => none
+  | entry :: rest, addr =>
+    if Nat.ble entry.baseAddr addr &&
+        Nat.ble addr (Nat.add entry.baseAddr entry.byteLen) then
+      some (entry, Nat.sub addr entry.baseAddr)
+    else
+      lookupShadowAllocEntry? rest addr
+
+/--
+Look up a native runtime virtual address `addr` in `ShadowProvenanceTable`,
 returning `(allocId, tag, addr - baseAddr)` for the first entry whose range
 `[baseAddr, baseAddr + byteLen]` contains `addr`.
 -/
 @[reducible]
 def lookupShadowProvenance :
     ShadowProvenanceTable → Nat → Option (AllocId × Nat × Nat)
-  | [], _ => none
-  | entry :: rest, addr =>
-    if Nat.ble entry.baseAddr addr &&
-        Nat.ble addr (Nat.add entry.baseAddr entry.byteLen) then
-      some (entry.allocId, entry.tag, Nat.sub addr entry.baseAddr)
-    else
-      lookupShadowProvenance rest addr
+  | table, addr =>
+    match lookupShadowAllocEntry? table addr with
+    | some (entry, relOffset) => some (entry.allocId, entry.tag, relOffset)
+    | none => none
 
 /--
 Translate an 8-byte little-endian native pointer byte slice using `table`:
@@ -1536,50 +2260,695 @@ def isWidePointee : RigidTy → Bool
   | .dynamic _ => true
   | _ => false
 
+/-- Extract a contiguous subslice `[offset .. offset + len)` from `raw : List UInt8`. -/
+@[reducible]
+def sliceRawBytes (raw : List UInt8) (offset len : Nat) : Option (List UInt8) :=
+  if Nat.ble (Nat.add offset len) (length raw) then
+    some ((raw.drop offset).take len)
+  else
+    none
+
 /--
-Convert a raw runtime byte slice `raw : List UInt8` captured for a value of type
-`ty` into `List AbstractByte`, applying `table` to reconstruct `(allocId, tag)`
-provenance and relative offsets for thin (8-byte) and wide (16-byte) pointers
-and references.
+Convert a raw runtime byte slice corresponding to a `ScalarLayout` into
+`List AbstractByte`, translating 8-byte pointer scalars through `table`.
 -/
 @[reducible]
-def rawBytesWithProvenance
-    (table : ShadowProvenanceTable) (ty : Ty) (raw : List UInt8) :
+def rawScalarLayoutBytes
+    (table : ShadowProvenanceTable) (s : ScalarLayout) (rawSlice : List UInt8) :
     List AbstractByte :=
-  match ty.kind with
-  | .ref _ pointee | .rawPtr _ pointee =>
-    match isWidePointee pointee with
-    | false =>
+  match s with
+  | .initialized (.pointer _) _ | .union (.pointer _) =>
+    if Nat.beq (length rawSlice) 8 then
+      translatePointerBytes table rawSlice
+    else
+      rawBytesToAbstractBytes rawSlice
+  | _ => rawBytesToAbstractBytes rawSlice
+
+/--
+Convert `count` array chunks of `elemSz` bytes from `raw` using `convChunk`.
+-/
+@[reducible]
+def rawArrayChunksWith
+    (convChunk : List UInt8 → List AbstractByte)
+    (elemSz : Nat) :
+    Nat → List UInt8 → Option (List AbstractByte)
+  | 0 => fun raw =>
+    match raw with
+    | [] => some []
+    | _ :: _ => none
+  | n + 1 => fun raw =>
+    if Nat.ble elemSz (length raw) then
+      let chunk := raw.take elemSz
+      let rest := raw.drop elemSz
+      match rawArrayChunksWith convChunk elemSz n rest with
+      | some restBytes => some (appendAbstractBytes (convChunk chunk) restBytes)
+      | none => none
+    else
+      none
+
+/--
+Overlay converted field slices at `offsets` onto `buf` (initially all `.uninit`)
+using `fieldKinds` and `sizeOfKind`, leaving inter-field and trailing padding
+bytes as `AbstractByte.uninit`.
+-/
+@[reducible]
+def rawFieldsAtOffsetsByKinds
+    (convKind : RigidTy → List UInt8 → List AbstractByte)
+    (sizeOfKind : RigidTy → Option Nat)
+    (raw : List UInt8) :
+    List Size → List RigidTy → List AbstractByte → Option (List AbstractByte)
+  | [] => fun ks buf =>
+    match ks with
+    | [] => some buf
+    | _ :: _ => none
+  | off :: offRest => fun ks buf =>
+    match ks with
+    | [] => none
+    | k :: kRest =>
+      match sizeOfKind k with
+      | none => none
+      | some fSz =>
+        match sliceRawBytes raw off.bytes fSz with
+        | none => none
+        | some rawSlice =>
+          match writeAbstractBytesAt buf off.bytes (convKind k rawSlice) with
+          | none => none
+          | some buf' =>
+            rawFieldsAtOffsetsByKinds convKind sizeOfKind raw offRest kRest buf'
+
+/--
+Overlay converted field slices at `offsets` onto `buf` (initially all `.uninit`)
+using `fieldLayouts` (`TypeLayout.fieldLayouts`), leaving inter-field and
+trailing padding bytes as `AbstractByte.uninit`.
+-/
+@[reducible]
+def rawFieldsAtOffsetsByLayoutIdxs
+    (convLayoutIdx : Nat → List UInt8 → List AbstractByte)
+    (layouts : LayoutTable)
+    (raw : List UInt8) :
+    List Size → List Nat → List AbstractByte → Option (List AbstractByte)
+  | [] => fun fs buf =>
+    match fs with
+    | [] => some buf
+    | _ :: _ => none
+  | off :: offRest => fun fs buf =>
+    match fs with
+    | [] => none
+    | fIdx :: fRest =>
+      match LayoutTable.lookup layouts fIdx with
+      | none => none
+      | some fl =>
+        match sliceRawBytes raw off.bytes fl.size.bytes with
+        | none => none
+        | some rawSlice =>
+          match writeAbstractBytesAt buf off.bytes (convLayoutIdx fIdx rawSlice) with
+          | none => none
+          | some buf' =>
+            rawFieldsAtOffsetsByLayoutIdxs
+              convLayoutIdx layouts raw offRest fRest buf'
+
+/--
+Find a layout index in `entries` whose byte size equals `targetBytes` and whose
+shape is a single-variant `.arbitrary` aggregate with at least one field or a
+multi-variant `.multiple` enum.
+-/
+@[reducible]
+def findMatchingAggregateLayoutIdx?
+    (targetBytes : Nat) : Nat → List TypeLayout → Option Nat
+  | _, [] => none
+  | idx, l :: rest =>
+    match l.variants, l.fields with
+    | .single _, .arbitrary (_ :: _) _ =>
+      if Nat.beq l.size.bytes targetBytes then
+        some idx
+      else
+        findMatchingAggregateLayoutIdx? targetBytes (idx + 1) rest
+    | .multiple _ _ _, _ =>
+      if Nat.beq l.size.bytes targetBytes then
+        some idx
+      else
+        findMatchingAggregateLayoutIdx? targetBytes (idx + 1) rest
+    | _, _ => findMatchingAggregateLayoutIdx? targetBytes (idx + 1) rest
+
+/-- Find any layout index in `entries` whose `size.bytes == targetBytes`. -/
+@[reducible]
+def findAnyLayoutIdxBySize?
+    (targetBytes : Nat) : Nat → List TypeLayout → Option Nat
+  | _, [] => none
+  | idx, l :: rest =>
+    if Nat.beq l.size.bytes targetBytes then
+      some idx
+    else
+      findAnyLayoutIdxBySize? targetBytes (idx + 1) rest
+
+/--
+Resolve the element `LayoutIdx` for an array with layout `arrayLayoutIdx` and
+element byte stride `elemSz`.
+-/
+@[reducible]
+def resolveArrayElemLayoutIdx
+    (layouts : LayoutTable) (arrayLayoutIdx elemSz : Nat) : Nat :=
+  match LayoutTable.lookup layouts arrayLayoutIdx with
+  | some l =>
+    match l.fieldLayouts with
+    | elemIdx :: _ => elemIdx
+    | [] =>
+      match findMatchingAggregateLayoutIdx? elemSz 0 layouts.entries with
+      | some idx => idx
+      | none =>
+        match findAnyLayoutIdxBySize? elemSz 0 layouts.entries with
+        | some idx => idx
+        | none => 0
+  | none =>
+    match findMatchingAggregateLayoutIdx? elemSz 0 layouts.entries with
+    | some idx => idx
+    | none => 0
+
+/-- Number of fields in a `FieldsShape`. -/
+@[reducible]
+def fieldsShapeCount : FieldsShape → Nat
+  | .arbitrary offsets _ => length offsets
+  | .union n => n
+  | .array _ n => n
+  | .primitive => 0
+
+/-- Total number of fields across all variants in `variantShapes`. -/
+@[reducible]
+def totalVariantFieldCount : List FieldsShape → Nat
+  | [] => 0
+  | vs :: rest => Nat.add (fieldsShapeCount vs) (totalVariantFieldCount rest)
+
+/-- Starting index in a flattened `fieldLayouts` list for variant `varIdx`. -/
+@[reducible]
+def variantFieldStartIdx : List FieldsShape → Nat → Nat
+  | [] => fun _ => 0
+  | vs :: rest => fun varIdx =>
+    match varIdx with
+    | 0 => 0
+    | varIdx' + 1 =>
+      Nat.add (fieldsShapeCount vs) (variantFieldStartIdx rest varIdx')
+
+/--
+Infer the largest power-of-two scalar byte width in `[16, 8, 4, 2, 1]` that fits
+within `maxSpan` and divides `offset` (or `offset == 0`).
+-/
+@[reducible]
+def inferAlignedScalarWidth (offset maxSpan : Nat) : Nat :=
+  let fitsAndAligned := fun (w : Nat) =>
+    Nat.ble w maxSpan && (Nat.beq offset 0 || Nat.beq (Nat.mod offset w) 0)
+  if fitsAndAligned 16 then 16
+  else if fitsAndAligned 8 then 8
+  else if fitsAndAligned 4 then 4
+  else if fitsAndAligned 2 then 2
+  else if Nat.ble 1 maxSpan then 1
+  else 0
+
+/--
+Populate variant field bytes at `varOffsets` into `buf` when per-variant
+`fieldLayouts` are not present on the `TypeLayout`, leaving inter-field and
+trailing padding bytes as `AbstractByte.uninit`.
+-/
+@[reducible]
+def rawVariantFieldsByAlignedSpan
+    (table : ShadowProvenanceTable) (l : TypeLayout) (tagOffBytes : Nat)
+    (raw : List UInt8) :
+    List Size → List AbstractByte → Option (List AbstractByte)
+  | [], buf => some buf
+  | off :: offRest, buf =>
+    let nextOff :=
+      match offRest with
+      | next :: _ => next.bytes
+      | [] => l.size.bytes
+    if Nat.ble off.bytes nextOff then
+      let maxSpan := Nat.sub nextOff off.bytes
+      let (fieldSz, scalarOpt) : Nat × Option ScalarLayout :=
+        match l.backendRepr with
+        | .scalarPair _ s1 =>
+          if Nat.ble (Nat.add tagOffBytes 1) off.bytes then
+            match scalarLayoutByteWidth s1 with
+            | some sz1 =>
+              if Nat.ble sz1 maxSpan && Nat.beq (Nat.mod off.bytes sz1) 0 then
+                (sz1, some s1)
+              else
+                (inferAlignedScalarWidth off.bytes maxSpan, none)
+            | none => (inferAlignedScalarWidth off.bytes maxSpan, none)
+          else
+            (inferAlignedScalarWidth off.bytes maxSpan, none)
+        | _ => (inferAlignedScalarWidth off.bytes maxSpan, none)
+      match sliceRawBytes raw off.bytes fieldSz with
+      | none => none
+      | some fRawSlice =>
+        let fAbs :=
+          match scalarOpt with
+          | some s1 => rawScalarLayoutBytes table s1 fRawSlice
+          | none => rawBytesToAbstractBytes fRawSlice
+        match writeAbstractBytesAt buf off.bytes fAbs with
+        | none => none
+        | some buf' =>
+          rawVariantFieldsByAlignedSpan table l tagOffBytes raw offRest buf'
+    else
+      none
+
+/--
+Fuel-bounded conversion of a raw runtime byte slice `raw : List UInt8` captured
+for a value of type `ty` under `layouts` and `table` into `List AbstractByte`:
+- Thin (8-byte) and wide (16-byte) pointers and references have their address
+  bytes translated via `translatePointerBytes table`.
+- Aggregate types (`.tuple`, `.adt`, `.array`) initialize an `AbstractByte.uninit`
+  buffer of `l.size.bytes` and populate only active field/tag byte spans from
+  `layouts`, preserving all inter-field and trailing padding offsets as
+  `AbstractByte.uninit`.
+-/
+@[reducible]
+def rawBytesWithLayoutAndProvenance :
+    Nat → LayoutTable → ShadowProvenanceTable → Ty → List UInt8 → List AbstractByte
+  | 0, _, _, _, raw => rawBytesToAbstractBytes raw
+  | fuel' + 1, layouts, table, ty, raw =>
+    match ty.kind with
+    | .ref _ pointee | .rawPtr _ pointee =>
+      match isWidePointee pointee with
+      | false =>
+        if Nat.beq (length raw) 8 then
+          translatePointerBytes table raw
+        else
+          rawBytesToAbstractBytes raw
+      | true =>
+        if Nat.beq (length raw) 16 then
+          let ptrBytes := raw.take 8
+          let metaBytes := raw.drop 8
+          appendAbstractBytes
+            (translatePointerBytes table ptrBytes)
+            (rawBytesToAbstractBytes metaBytes)
+        else
+          rawBytesToAbstractBytes raw
+    | .fnPtr _ _ _ _ =>
       if Nat.beq (length raw) 8 then
         translatePointerBytes table raw
       else
         rawBytesToAbstractBytes raw
-    | true =>
-      if Nat.beq (length raw) 16 then
-        let ptrBytes := raw.take 8
-        let metaBytes := raw.drop 8
-        appendAbstractBytes
-          (translatePointerBytes table ptrBytes)
-          (rawBytesToAbstractBytes metaBytes)
+    | .array elemKind n =>
+      match Nat.beq n 0 with
+      | true => []
+      | false =>
+        let elemSzOpt : Option Nat :=
+          match rigidTyKindByteSize elemKind with
+          | some sz => some sz
+          | none =>
+            match LayoutTable.lookup layouts ty.layoutIdx with
+            | some l =>
+              match l.fields with
+              | .array stride _ => some stride.bytes
+              | _ => none
+            | none => none
+        match elemSzOpt with
+        | none => rawBytesToAbstractBytes raw
+        | some elemSz =>
+          if Nat.beq (length raw) (Nat.mul elemSz n) then
+            let elemLayoutIdx := resolveArrayElemLayoutIdx layouts ty.layoutIdx elemSz
+            match
+              rawArrayChunksWith
+                (fun chunk =>
+                  rawBytesWithLayoutAndProvenance fuel' layouts table
+                    { kind := elemKind, layoutIdx := elemLayoutIdx } chunk)
+                elemSz n raw
+            with
+            | some bs => bs
+            | none => rawBytesToAbstractBytes raw
+          else
+            rawBytesToAbstractBytes raw
+    | .tuple (kHead :: kTail) =>
+      let fieldKinds := kHead :: kTail
+      let convKind := fun (k : RigidTy) (bs : List UInt8) =>
+        rawBytesWithLayoutAndProvenance fuel' layouts table
+          { kind := k, layoutIdx := 0 } bs
+      let sizeOfKind := fun (k : RigidTy) =>
+        rigidTyByteSize layouts { kind := k, layoutIdx := 0 }
+      match LayoutTable.lookup layouts ty.layoutIdx with
+      | some l =>
+        if Nat.beq (length raw) l.size.bytes then
+          match l.fields with
+          | .arbitrary offsets _ =>
+            let initBuf := replicateUninitBytes l.size.bytes
+            match
+              if Nat.beq (length l.fieldLayouts) (length offsets) &&
+                  Nat.beq (length fieldKinds) (length offsets) then
+                rawFieldsAtOffsetsByLayoutIdxs
+                  (fun fIdx bs =>
+                    rawBytesWithLayoutAndProvenance fuel' layouts table
+                      { kind := .adt "" [], layoutIdx := fIdx } bs)
+                  layouts raw offsets l.fieldLayouts initBuf
+              else
+                none
+            with
+            | some bs => bs
+            | none =>
+              match
+                rawFieldsAtOffsetsByKinds
+                  convKind sizeOfKind raw offsets fieldKinds initBuf
+              with
+              | some bs => bs
+              | none => rawBytesToAbstractBytes raw
+          | _ => rawBytesToAbstractBytes raw
+        else
+          rawBytesToAbstractBytes raw
+      | none => rawBytesToAbstractBytes raw
+    | .adt _ args =>
+      match LayoutTable.lookup layouts ty.layoutIdx with
+      | none => rawBytesToAbstractBytes raw
+      | some l =>
+        if l.isUninhabited || Bool.not (Nat.beq (length raw) l.size.bytes) then
+          rawBytesToAbstractBytes raw
+        else
+          let convKind := fun (k : RigidTy) (bs : List UInt8) =>
+            rawBytesWithLayoutAndProvenance fuel' layouts table
+              { kind := k, layoutIdx := 0 } bs
+          let sizeOfKind := fun (k : RigidTy) =>
+            rigidTyByteSize layouts { kind := k, layoutIdx := 0 }
+          let convLayoutIdx := fun (fIdx : Nat) (bs : List UInt8) =>
+            rawBytesWithLayoutAndProvenance fuel' layouts table
+              { kind := .adt "" [], layoutIdx := fIdx } bs
+          let initBuf := replicateUninitBytes l.size.bytes
+          match l.variants with
+          | .empty => initBuf
+          | .single _ =>
+            match l.fields with
+            | .arbitrary [] _ => initBuf
+            | .arbitrary offsets _ =>
+              let byFieldLayouts : Option (List AbstractByte) :=
+                if Nat.beq (length l.fieldLayouts) (length offsets) then
+                  rawFieldsAtOffsetsByLayoutIdxs
+                    convLayoutIdx layouts raw offsets l.fieldLayouts initBuf
+                else
+                  none
+              match byFieldLayouts with
+              | some bs => bs
+              | none =>
+                let byArgs : Option (List AbstractByte) :=
+                  if Nat.beq (length args) (length offsets) then
+                    rawFieldsAtOffsetsByKinds
+                      convKind sizeOfKind raw offsets args initBuf
+                  else
+                    none
+                match byArgs with
+                | some bs => bs
+                | none =>
+                  match offsets, l.backendRepr with
+                  | off0 :: [], .scalar s0 =>
+                    match scalarLayoutByteWidth s0 with
+                    | some sz0 =>
+                      match sliceRawBytes raw off0.bytes sz0 with
+                      | some slice0 =>
+                        match
+                          writeAbstractBytesAt
+                            initBuf off0.bytes (rawScalarLayoutBytes table s0 slice0)
+                        with
+                        | some bs => bs
+                        | none => rawBytesToAbstractBytes raw
+                      | none => rawBytesToAbstractBytes raw
+                    | none => rawBytesToAbstractBytes raw
+                  | off0 :: off1 :: [], .scalarPair s0 s1 =>
+                    match scalarLayoutByteWidth s0, scalarLayoutByteWidth s1 with
+                    | some sz0, some sz1 =>
+                      match
+                        sliceRawBytes raw off0.bytes sz0,
+                        sliceRawBytes raw off1.bytes sz1
+                      with
+                      | some slice0, some slice1 =>
+                        match
+                          writeAbstractBytesAt
+                            initBuf off0.bytes (rawScalarLayoutBytes table s0 slice0)
+                        with
+                        | some buf0 =>
+                          match
+                            writeAbstractBytesAt
+                              buf0 off1.bytes (rawScalarLayoutBytes table s1 slice1)
+                          with
+                          | some bs => bs
+                          | none => rawBytesToAbstractBytes raw
+                        | none => rawBytesToAbstractBytes raw
+                      | _, _ => rawBytesToAbstractBytes raw
+                    | _, _ => rawBytesToAbstractBytes raw
+                  | _, _ => rawBytesToAbstractBytes raw
+            | .primitive =>
+              if Nat.beq l.size.bytes 0 then
+                []
+              else
+                match l.backendRepr with
+                | .scalar s0 => rawScalarLayoutBytes table s0 raw
+                | _ => rawBytesToAbstractBytes raw
+            | .array stride count =>
+              let elemLayoutIdx :=
+                resolveArrayElemLayoutIdx layouts ty.layoutIdx stride.bytes
+              match
+                rawArrayChunksWith
+                  (fun chunk =>
+                    rawBytesWithLayoutAndProvenance fuel' layouts table
+                      { kind := .adt "" [], layoutIdx := elemLayoutIdx } chunk)
+                  stride.bytes count raw
+              with
+              | some bs => bs
+              | none => rawBytesToAbstractBytes raw
+            | .union _ => rawBytesToAbstractBytes raw
+          | .multiple tagLayout tagField variantShapes =>
+            match l.fields, scalarLayoutByteWidth tagLayout with
+            | .arbitrary outerOffsets _, some tagSz =>
+              match get? outerOffsets tagField with
+              | none => rawBytesToAbstractBytes raw
+              | some tagOff =>
+                match sliceRawBytes raw tagOff.bytes tagSz with
+                | none => rawBytesToAbstractBytes raw
+                | some rawTagSlice =>
+                  let tagAbs := rawScalarLayoutBytes table tagLayout rawTagSlice
+                  match writeAbstractBytesAt initBuf tagOff.bytes tagAbs with
+                  | none => rawBytesToAbstractBytes raw
+                  | some bufWithTag =>
+                    match decodeScalarLayoutBytes tagLayout tagAbs with
+                    | some (.scalar tagSc) =>
+                      let varIdx := tagSc.bits
+                      match get? variantShapes varIdx with
+                      | some (.arbitrary [] _) => bufWithTag
+                      | some (.arbitrary varOffsets _) =>
+                        let totalVarFields := totalVariantFieldCount variantShapes
+                        let byVarFieldLayouts : Option (List AbstractByte) :=
+                          if Nat.beq (length l.fieldLayouts) totalVarFields &&
+                              Nat.ble 1 totalVarFields then
+                            let startIdx := variantFieldStartIdx variantShapes varIdx
+                            let varFieldLayouts :=
+                              (l.fieldLayouts.drop startIdx).take (length varOffsets)
+                            rawFieldsAtOffsetsByLayoutIdxs
+                              convLayoutIdx layouts raw varOffsets varFieldLayouts bufWithTag
+                          else
+                            none
+                        match byVarFieldLayouts with
+                        | some bs => bs
+                        | none =>
+                          if Nat.beq (length args) (length varOffsets) then
+                            match
+                              rawFieldsAtOffsetsByKinds
+                                convKind sizeOfKind raw varOffsets args bufWithTag
+                            with
+                            | some bs => bs
+                            | none => rawBytesToAbstractBytes raw
+                          else
+                            match
+                              rawVariantFieldsByAlignedSpan
+                                table l tagOff.bytes raw varOffsets bufWithTag
+                            with
+                            | some bs => bs
+                            | none => rawBytesToAbstractBytes raw
+                      | _ => rawBytesToAbstractBytes raw
+                    | _ => rawBytesToAbstractBytes raw
+            | _, _ => rawBytesToAbstractBytes raw
+    | _ => rawBytesToAbstractBytes raw
+
+/--
+Convert a raw runtime byte slice `raw : List UInt8` captured for a value of type
+`ty` into `List AbstractByte`, applying `table` to reconstruct `(allocId, tag)`
+provenance and relative offsets for thin (8-byte) and wide (16-byte) pointers
+and references, and using `layouts` (when supplied) to decode padding offsets as
+`AbstractByte.uninit`.
+-/
+@[reducible]
+def rawBytesWithProvenance
+    (table : ShadowProvenanceTable) (ty : Ty) (raw : List UInt8)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    List AbstractByte :=
+  rawBytesWithLayoutAndProvenance defaultCodecFuel layouts table ty raw
+
+/--
+Decode variant fields at `varOffsets` from `absBytes` using aligned scalar widths
+when `decodeFieldsBySpan` encounters `.uninit` inter-field or trailing padding.
+-/
+@[reducible]
+def decodeVariantFieldsByAlignedSpan
+    (absBytes : List AbstractByte) (l : TypeLayout) (tagOffBytes : Nat) :
+    List Size → Option (List Value)
+  | [] => some []
+  | off :: offRest =>
+    let nextOff :=
+      match offRest with
+      | next :: _ => next.bytes
+      | [] => l.size.bytes
+    if Nat.ble off.bytes nextOff then
+      let maxSpan := Nat.sub nextOff off.bytes
+      if Nat.beq maxSpan 0 then
+        match decodeVariantFieldsByAlignedSpan absBytes l tagOffBytes offRest with
+        | some vs => some (.unit :: vs)
+        | none => none
       else
-        rawBytesToAbstractBytes raw
-  | .fnPtr _ _ _ _ =>
-    if Nat.beq (length raw) 8 then
-      translatePointerBytes table raw
+        let fieldSz : Nat :=
+          match l.backendRepr with
+          | .scalarPair _ s1 =>
+            if Nat.ble (Nat.add tagOffBytes 1) off.bytes then
+              match scalarLayoutByteWidth s1 with
+              | some sz1 =>
+                if Nat.ble sz1 maxSpan && Nat.beq (Nat.mod off.bytes sz1) 0 then
+                  sz1
+                else
+                  inferAlignedScalarWidth off.bytes maxSpan
+              | none => inferAlignedScalarWidth off.bytes maxSpan
+            else
+              inferAlignedScalarWidth off.bytes maxSpan
+          | _ => inferAlignedScalarWidth off.bytes maxSpan
+        match sliceAbstractBytes absBytes off.bytes fieldSz with
+        | none => none
+        | some fSlice =>
+          match decodeScalarBytes fSlice false with
+          | none => none
+          | some (sv, _) =>
+            match decodeVariantFieldsByAlignedSpan absBytes l tagOffBytes offRest with
+            | some vs => some (.scalar sv :: vs)
+            | none => none
     else
-      rawBytesToAbstractBytes raw
-  | _ => rawBytesToAbstractBytes raw
+      none
+
+/--
+Decode `count` array chunks of `elemSz` bytes from `raw : List UInt8` using
+`decodeChunk`.
+-/
+@[reducible]
+def decodeRawArrayChunksWith
+    (decodeChunk : List UInt8 → Option Value)
+    (elemSz : Nat) :
+    Nat → List UInt8 → Option (List Value)
+  | 0 => fun raw =>
+    match raw with
+    | [] => some []
+    | _ :: _ => none
+  | n + 1 => fun raw =>
+    if Nat.ble elemSz (length raw) then
+      let chunk := raw.take elemSz
+      let rest := raw.drop elemSz
+      match
+        decodeChunk chunk,
+        decodeRawArrayChunksWith decodeChunk elemSz n rest
+      with
+      | some v, some vs => some (v :: vs)
+      | _, _ => none
+    else
+      none
 
 /--
 Decode a raw runtime byte slice `raw : List UInt8` into a `Value` of type `ty`
-under `layouts` and shadow provenance table `table` using `decodeValueFromBytes`.
+under `layouts` and shadow provenance table `table` using `decodeValueFromBytes`,
+marking padding offsets as `AbstractByte.uninit` via `layouts`.
 -/
 @[reducible]
 def decodeRawValue
     (layouts : LayoutTable) (table : ShadowProvenanceTable)
     (ty : Ty) (raw : List UInt8) : Option Value :=
-  decodeValueFromBytes defaultCodecFuel layouts ty
-    (rawBytesWithProvenance table ty raw)
+  match ty.kind with
+  | .array elemKind n =>
+    if Nat.beq n 0 then
+      if Nat.beq (length raw) 0 then some (.aggregate 0 []) else none
+    else
+      let elemSzOpt : Option Nat :=
+        match rigidTyKindByteSize elemKind with
+        | some sz => some sz
+        | none =>
+          match LayoutTable.lookup layouts ty.layoutIdx with
+          | some l =>
+            match l.fields with
+            | .array stride _ => some stride.bytes
+            | _ => none
+          | none => none
+      match elemSzOpt with
+      | none => none
+      | some elemSz =>
+        if Nat.beq (length raw) (Nat.mul elemSz n) then
+          let elemLayoutIdx := resolveArrayElemLayoutIdx layouts ty.layoutIdx elemSz
+          let elemTy : Ty := { kind := elemKind, layoutIdx := elemLayoutIdx }
+          match
+            decodeRawArrayChunksWith
+              (fun chunk =>
+                decodeValueFromBytes defaultCodecFuel layouts elemTy
+                  (rawBytesWithProvenance table elemTy chunk layouts))
+              elemSz n raw
+          with
+          | some elems => some (.aggregate 0 elems)
+          | none => none
+        else
+          none
+  | .adt _ _ =>
+    match LayoutTable.lookup layouts ty.layoutIdx with
+    | some l =>
+      match l.variants with
+      | .multiple tagLayout tagField variantShapes =>
+        if l.isUninhabited || Bool.not (Nat.beq (length raw) l.size.bytes) then
+          none
+        else
+          let absBytes := rawBytesWithProvenance table ty raw layouts
+          match l.fields, scalarLayoutByteWidth tagLayout with
+          | .arbitrary outerOffsets _, some tagSz =>
+            match get? outerOffsets tagField with
+            | none => none
+            | some tagOff =>
+              match sliceAbstractBytes absBytes tagOff.bytes tagSz with
+              | none => none
+              | some tagSlice =>
+                match decodeScalarLayoutBytes tagLayout tagSlice with
+                | some (.scalar tagSc) =>
+                  let varIdx := tagSc.bits
+                  match get? variantShapes varIdx with
+                  | some (.arbitrary varOffsets _) =>
+                    let totalVarFields := totalVariantFieldCount variantShapes
+                    let byVarFieldLayouts : Option (List Value) :=
+                      if Nat.beq (length l.fieldLayouts) totalVarFields &&
+                          Nat.ble 1 totalVarFields then
+                        let startIdx := variantFieldStartIdx variantShapes varIdx
+                        let varFieldLayouts :=
+                          (l.fieldLayouts.drop startIdx).take (length varOffsets)
+                        decodeFieldsByLayoutIdxs
+                          (fun fIdx bs =>
+                            decodeValueFromBytes defaultCodecFuel layouts
+                              { kind := .adt "" [], layoutIdx := fIdx } bs)
+                          layouts absBytes varOffsets varFieldLayouts
+                      else
+                        none
+                    match byVarFieldLayouts with
+                    | some vals => some (.aggregate varIdx vals)
+                    | none =>
+                      match
+                        decodeVariantFieldsByAlignedSpan
+                          absBytes l tagOff.bytes varOffsets
+                      with
+                      | some vals => some (.aggregate varIdx vals)
+                      | none =>
+                        match decodeFieldsBySpan absBytes l.size.bytes varOffsets with
+                        | some vals => some (.aggregate varIdx vals)
+                        | none => none
+                  | _ => none
+                | _ => none
+          | _, _ => none
+      | _ =>
+        let absBytes := rawBytesWithProvenance table ty raw layouts
+        decodeValueFromBytes defaultCodecFuel layouts ty absBytes
+    | none =>
+      let absBytes := rawBytesWithProvenance table ty raw layouts
+      decodeValueFromBytes defaultCodecFuel layouts ty absBytes
+  | _ =>
+    let absBytes := rawBytesWithProvenance table ty raw layouts
+    decodeValueFromBytes defaultCodecFuel layouts ty absBytes
 
 /-- Alias for `decodeRawValue`. -/
 abbrev decodeRawValueWithTable := decodeRawValue
@@ -1587,17 +2956,19 @@ abbrev decodeRawValueWithTable := decodeRawValue
 /-- Decode a list of raw runtime byte slices against a list of parameter `LocalDecl`s. -/
 @[reducible]
 def decodeRawArgsByDecls
-    (layouts : LayoutTable) (table : ShadowProvenanceTable) :
-    List LocalDecl → List (List UInt8) → Option (List Value)
-  | _, [] => some []
-  | [], _ :: _ => none
-  | decl :: declRest, raw :: rawRest =>
-    match
-      decodeRawValue layouts table decl.ty raw,
-      decodeRawArgsByDecls layouts table declRest rawRest
-    with
-    | some v, some vs => some (v :: vs)
-    | _, _ => none
+    (layouts : LayoutTable) (table : ShadowProvenanceTable)
+    (decls : List LocalDecl) : List (List UInt8) → Option (List Value)
+  | [] => some []
+  | raw :: rawRest =>
+    match decls with
+    | [] => none
+    | decl :: declRest =>
+      match
+        decodeRawValue layouts table decl.ty raw,
+        decodeRawArgsByDecls layouts table declRest rawRest
+      with
+      | some v, some vs => some (v :: vs)
+      | _, _ => none
 
 /--
 Decode the incoming root or callee argument byte slices `rawArgs` using the
@@ -1624,6 +2995,707 @@ def decodeFnRetFromRawBytes
   match body.localDecls with
   | retDecl :: _ => decodeRawValue body.layouts table retDecl.ty rawRet
   | [] => none
+
+/-- Round `offset` up to the next multiple of `align` (when `align > 1`). -/
+@[reducible]
+def alignUpOffset (offset align : Nat) : Nat :=
+  if Nat.ble align 1 then
+    offset
+  else
+    let rem := Nat.mod offset align
+    if Nat.beq rem 0 then
+      offset
+    else
+      Nat.add offset (Nat.sub align rem)
+
+/-- Look up a `Ty` with `t.kind == targetKind` in `decls`. -/
+@[reducible]
+def findTyInLocalDecls? (targetKind : RigidTy) : List LocalDecl → Option Ty
+  | [] => none
+  | decl :: rest =>
+    if rigidTyEqFuel 8 decl.ty.kind targetKind then
+      some decl.ty
+    else
+      findTyInLocalDecls? targetKind rest
+
+/--
+Search `bodies` for a `LocalDecl` whose `ty.kind == targetKind`, returning both
+the body's `LayoutTable` and the matching `Ty`.
+-/
+@[reducible]
+def findTyWithLayoutsInBodies?
+    (targetKind : RigidTy) : List CapturedMir → Option (LayoutTable × Ty)
+  | [] => none
+  | b :: rest =>
+    match findTyInLocalDecls? targetKind b.localDecls with
+    | some ty => some (b.layouts, ty)
+    | none => findTyWithLayoutsInBodies? targetKind rest
+
+/--
+Extract the projected `Ty` of `.deref :: .field targetFieldIdx fieldTy :: _` on
+`paramLocal` from a `Place`, if present.
+-/
+@[reducible]
+def matchDerefFieldPlaceTy?
+    (paramLocal targetFieldIdx : Nat) (p : Place) : Option Ty :=
+  if Nat.beq p.local_ paramLocal then
+    match p.projection with
+    | .deref :: .field fIdx fTy :: _ =>
+      if Nat.beq fIdx targetFieldIdx then some fTy else none
+    | _ => none
+  else
+    none
+
+/--
+Extract the field index `fIdx` of any `.deref :: .field fIdx _ :: _` projection
+on `paramLocal` from a `Place`, if present.
+-/
+@[reducible]
+def matchDerefAnyFieldIdx? (paramLocal : Nat) (p : Place) : Option Nat :=
+  if Nat.beq p.local_ paramLocal then
+    match p.projection with
+    | .deref :: .field fIdx _ :: _ => some fIdx
+    | _ => none
+  else
+    none
+
+/-- Combine two `Option Nat` values by taking the maximum when both are `some`. -/
+@[reducible]
+def maxOptionNat : Option Nat → Option Nat → Option Nat
+  | none, b => b
+  | a, none => a
+  | some x, some y => if Nat.ble x y then some y else some x
+
+/-- Search an `Operand` for a dereferenced field projection on `paramLocal`. -/
+@[reducible]
+def findDerefFieldTyInOperand?
+    (paramLocal targetFieldIdx : Nat) : Operand → Option Ty
+  | .copy p | .move p => matchDerefFieldPlaceTy? paramLocal targetFieldIdx p
+  | .constant _ => none
+
+/-- Search an `Operand` for the maximum dereferenced field index on `paramLocal`. -/
+@[reducible]
+def findMaxDerefFieldIdxInOperand? (paramLocal : Nat) : Operand → Option Nat
+  | .copy p | .move p => matchDerefAnyFieldIdx? paramLocal p
+  | .constant _ => none
+
+/-- Search an `Rvalue` for a dereferenced field projection on `paramLocal`. -/
+@[reducible]
+def findDerefFieldTyInRvalue?
+    (paramLocal targetFieldIdx : Nat) : Rvalue → Option Ty
+  | .use op | .repeat op _ | .cast _ op _ | .unaryOp _ op | .shallowInitBox op _
+  | .wrapUnsafeBinder op _ =>
+    findDerefFieldTyInOperand? paramLocal targetFieldIdx op
+  | .ref _ p | .rawPtr _ p | .len p | .discriminant p | .copyForDeref p =>
+    matchDerefFieldPlaceTy? paramLocal targetFieldIdx p
+  | .binaryOp _ lhs rhs =>
+    match findDerefFieldTyInOperand? paramLocal targetFieldIdx lhs with
+    | some ty => some ty
+    | none => findDerefFieldTyInOperand? paramLocal targetFieldIdx rhs
+  | _ => none
+
+/-- Search an `Rvalue` for the maximum dereferenced field index on `paramLocal`. -/
+@[reducible]
+def findMaxDerefFieldIdxInRvalue? (paramLocal : Nat) : Rvalue → Option Nat
+  | .use op | .repeat op _ | .cast _ op _ | .unaryOp _ op | .shallowInitBox op _
+  | .wrapUnsafeBinder op _ =>
+    findMaxDerefFieldIdxInOperand? paramLocal op
+  | .ref _ p | .rawPtr _ p | .len p | .discriminant p | .copyForDeref p =>
+    matchDerefAnyFieldIdx? paramLocal p
+  | .binaryOp _ lhs rhs =>
+    maxOptionNat
+      (findMaxDerefFieldIdxInOperand? paramLocal lhs)
+      (findMaxDerefFieldIdxInOperand? paramLocal rhs)
+  | _ => none
+
+/-- Search a list of `Statement`s for a dereferenced field projection on `paramLocal`. -/
+@[reducible]
+def findDerefFieldTyInStmts?
+    (paramLocal targetFieldIdx : Nat) : List Statement → Option Ty
+  | [] => none
+  | stmt :: rest =>
+    let found : Option Ty :=
+      match stmt.kind with
+      | .assign dst rv =>
+        match matchDerefFieldPlaceTy? paramLocal targetFieldIdx dst with
+        | some ty => some ty
+        | none => findDerefFieldTyInRvalue? paramLocal targetFieldIdx rv
+      | .setDiscriminant p _ | .deinit p | .placeMention p | .retag _ p =>
+        matchDerefFieldPlaceTy? paramLocal targetFieldIdx p
+      | _ => none
+    match found with
+    | some ty => some ty
+    | none => findDerefFieldTyInStmts? paramLocal targetFieldIdx rest
+
+/-- Search a list of `Statement`s for the maximum dereferenced field index on `paramLocal`. -/
+@[reducible]
+def findMaxDerefFieldIdxInStmts?
+    (paramLocal : Nat) : List Statement → Option Nat
+  | [] => none
+  | stmt :: rest =>
+    let cur : Option Nat :=
+      match stmt.kind with
+      | .assign dst rv =>
+        maxOptionNat
+          (matchDerefAnyFieldIdx? paramLocal dst)
+          (findMaxDerefFieldIdxInRvalue? paramLocal rv)
+      | .setDiscriminant p _ | .deinit p | .placeMention p | .retag _ p =>
+        matchDerefAnyFieldIdx? paramLocal p
+      | _ => none
+    maxOptionNat cur (findMaxDerefFieldIdxInStmts? paramLocal rest)
+
+/-- Search `BasicBlockData`s for a dereferenced field projection on `paramLocal`. -/
+@[reducible]
+def findDerefFieldTyInBlocks?
+    (paramLocal targetFieldIdx : Nat) : List BasicBlockData → Option Ty
+  | [] => none
+  | bb :: rest =>
+    match findDerefFieldTyInStmts? paramLocal targetFieldIdx bb.statements with
+    | some ty => some ty
+    | none => findDerefFieldTyInBlocks? paramLocal targetFieldIdx rest
+
+/-- Search `BasicBlockData`s for the maximum dereferenced field index on `paramLocal`. -/
+@[reducible]
+def findMaxDerefFieldIdxInBlocks?
+    (paramLocal : Nat) : List BasicBlockData → Option Nat
+  | [] => none
+  | bb :: rest =>
+    maxOptionNat
+      (findMaxDerefFieldIdxInStmts? paramLocal bb.statements)
+      (findMaxDerefFieldIdxInBlocks? paramLocal rest)
+
+/-- Resolve `(sizeBytes, alignBytes)` for a field `Ty` under `layouts`. -/
+@[reducible]
+def fieldTySizeAndAlign (layouts : LayoutTable) (fieldTy : Ty) : Option Nat × Nat :=
+  match LayoutTable.lookup layouts fieldTy.layoutIdx with
+  | some fl => (some fl.size.bytes, fl.align.bytes)
+  | none => (rigidTyByteSize layouts fieldTy, 1)
+
+/--
+Decode dereferenced struct fields `0 ..= maxFieldIdx` of `paramLocal` from
+`refRawBytes` when `pointee`'s `TypeLayout` is absent from `rootBody.layouts`
+(e.g., in hand-written MIR fixtures). Supports both unprojected leading fields
+and 2-field `repr(Rust)` alignment-reordered structs.
+-/
+@[reducible]
+def decodeProjectedStructFieldsSequential
+    (rootBody : CapturedMir) (table : ShadowProvenanceTable)
+    (paramLocal : Nat) (refRawBytes : List UInt8) :
+    Nat → Nat → Nat → List Value
+  | 0, _, _ => []
+  | rem + 1, fieldIdx, curOffset =>
+    match findDerefFieldTyInBlocks? paramLocal fieldIdx rootBody.basicBlocks with
+    | none =>
+      let b0 : Nat :=
+        match sliceRawBytes refRawBytes curOffset 1 with
+        | some (b :: _) => b.toBitVec.toNat
+        | _ => 0
+      .scalar ⟨b0, 1⟩ ::
+        decodeProjectedStructFieldsSequential
+          rootBody table paramLocal refRawBytes
+          rem (fieldIdx + 1) (curOffset + 1)
+    | some fieldTy =>
+      let (fSizeOpt, fAlign) := fieldTySizeAndAlign rootBody.layouts fieldTy
+      match fSizeOpt with
+      | none => []
+      | some fSize =>
+        let alignedOff := alignUpOffset curOffset fAlign
+        match sliceRawBytes refRawBytes alignedOff fSize with
+        | none => []
+        | some fRawSlice =>
+          match decodeRawValue rootBody.layouts table fieldTy fRawSlice with
+          | none => []
+          | some fVal =>
+            fVal ::
+              decodeProjectedStructFieldsSequential
+                rootBody table paramLocal refRawBytes
+                rem (fieldIdx + 1) (Nat.add alignedOff fSize)
+
+/--
+Decode dereferenced struct fields of `paramLocal` using the field projections in
+`rootBody.basicBlocks` when no `TypeLayout` for the struct is present in
+`rootBody.layouts`.
+-/
+@[reducible]
+def decodeProjectedStructFieldsFromBody
+    (rootBody : CapturedMir) (table : ShadowProvenanceTable)
+    (paramLocal : Nat) (refRawBytes : List UInt8) : List Value :=
+  match findMaxDerefFieldIdxInBlocks? paramLocal rootBody.basicBlocks with
+  | none => []
+  | some maxFieldIdx =>
+    if Nat.beq maxFieldIdx 1 then
+      match
+        findDerefFieldTyInBlocks? paramLocal 0 rootBody.basicBlocks,
+        findDerefFieldTyInBlocks? paramLocal 1 rootBody.basicBlocks
+      with
+      | some fTy0, some fTy1 =>
+        let (szOpt0, al0) := fieldTySizeAndAlign rootBody.layouts fTy0
+        let (szOpt1, al1) := fieldTySizeAndAlign rootBody.layouts fTy1
+        match szOpt0, szOpt1 with
+        | some sz0, some sz1 =>
+          if Nat.ble (Nat.add al0 1) al1 then
+            let off0 := alignUpOffset sz1 al0
+            match
+              sliceRawBytes refRawBytes off0 sz0,
+              sliceRawBytes refRawBytes 0 sz1
+            with
+            | some slice0, some slice1 =>
+              match
+                decodeRawValue rootBody.layouts table fTy0 slice0,
+                decodeRawValue rootBody.layouts table fTy1 slice1
+              with
+              | some v0, some v1 => [v0, v1]
+              | _, _ =>
+                decodeProjectedStructFieldsSequential
+                  rootBody table paramLocal refRawBytes 2 0 0
+            | _, _ =>
+              decodeProjectedStructFieldsSequential
+                rootBody table paramLocal refRawBytes 2 0 0
+          else
+            decodeProjectedStructFieldsSequential
+              rootBody table paramLocal refRawBytes 2 0 0
+        | _, _ =>
+          decodeProjectedStructFieldsSequential
+            rootBody table paramLocal refRawBytes 2 0 0
+      | _, _ =>
+        decodeProjectedStructFieldsSequential
+          rootBody table paramLocal refRawBytes 2 0 0
+    else
+      decodeProjectedStructFieldsSequential
+        rootBody table paramLocal refRawBytes (maxFieldIdx + 1) 0 0
+
+/--
+Resolve the pointee `(LayoutTable, Ty)` and optional byte size for a pointer or
+reference parameter of type `ptrTy` pointing to `pointee : RigidTy`.
+-/
+@[reducible]
+def resolvePointeeTyAndSize
+    (rootBody : CapturedMir) (auxBodies : List CapturedMir)
+    (ptrTy : Ty) (pointee : RigidTy) (availByteLen : Nat) :
+    LayoutTable × Ty × Option Nat :=
+  let fromPtrFieldLayouts : Option (LayoutTable × Ty × Option Nat) :=
+    match LayoutTable.lookup rootBody.layouts ptrTy.layoutIdx with
+    | some ptrLayout =>
+      match ptrLayout.fieldLayouts with
+      | pointeeIdx :: _ =>
+        match LayoutTable.lookup rootBody.layouts pointeeIdx with
+        | some pl =>
+          some (rootBody.layouts, { kind := pointee, layoutIdx := pointeeIdx }, some pl.size.bytes)
+        | none => none
+      | [] => none
+    | none => none
+  match fromPtrFieldLayouts with
+  | some res => res
+  | none =>
+    match findTyWithLayoutsInBodies? pointee (rootBody :: auxBodies) with
+    | some (layouts, ty) =>
+      let szOpt :=
+        match rigidTyKindByteSize pointee with
+        | some sz => some sz
+        | none =>
+          match LayoutTable.lookup layouts ty.layoutIdx with
+          | some pl => some pl.size.bytes
+          | none => none
+      (layouts, ty, szOpt)
+    | none =>
+      match rigidTyKindByteSize pointee with
+      | some sz => (rootBody.layouts, { kind := pointee, layoutIdx := 0 }, some sz)
+      | none =>
+        match findMatchingAggregateLayoutIdx? availByteLen 0 rootBody.layouts.entries with
+        | some lIdx =>
+          (rootBody.layouts, { kind := pointee, layoutIdx := lIdx }, some availByteLen)
+        | none =>
+          (rootBody.layouts, { kind := pointee, layoutIdx := 0 }, none)
+
+/--
+Decode the referent bytes `refRawBytes` of a registered pointer parameter
+`paramLocal` pointing to `pointee : RigidTy`.
+-/
+@[reducible]
+def decodePointeeReferentValue
+    (rootBody : CapturedMir) (auxBodies : List CapturedMir)
+    (table : ShadowProvenanceTable) (paramLocal : Nat)
+    (ptrTy : Ty) (pointee : RigidTy) (refRawBytes : List UInt8) : Option Value :=
+  let (pointeeLayouts, pointeeTy, _) :=
+    resolvePointeeTyAndSize rootBody auxBodies ptrTy pointee (length refRawBytes)
+  let hasExplicitLayout : Bool :=
+    match LayoutTable.lookup rootBody.layouts ptrTy.layoutIdx with
+    | some ptrLayout =>
+      match ptrLayout.fieldLayouts with
+      | _ :: _ => true
+      | [] => (findTyWithLayoutsInBodies? pointee (rootBody :: auxBodies)).isSome
+    | none => (findTyWithLayoutsInBodies? pointee (rootBody :: auxBodies)).isSome
+  if hasExplicitLayout then
+    decodeRawValue pointeeLayouts table pointeeTy refRawBytes
+  else
+    let projFields :=
+      decodeProjectedStructFieldsFromBody rootBody table paramLocal refRawBytes
+    match projFields with
+    | _ :: _ => some (.aggregate 0 projFields)
+    | [] =>
+      decodeRawValue pointeeLayouts table pointeeTy refRawBytes
+
+/--
+Sequential helper for populating `List AbstractByte` from dereferenced struct
+field projections when no explicit `TypeLayout` for the struct is present in
+`rootBody.layouts`, leaving inter-field and trailing padding as `.uninit`.
+-/
+@[reducible]
+def rawProjectedStructBytesSequential
+    (rootBody : CapturedMir) (table : ShadowProvenanceTable)
+    (paramLocal : Nat) (refRawBytes : List UInt8) :
+    Nat → Nat → Nat → List AbstractByte → Option (List AbstractByte)
+  | 0, _, _, buf => some buf
+  | rem + 1, fieldIdx, curOffset, buf =>
+    match findDerefFieldTyInBlocks? paramLocal fieldIdx rootBody.basicBlocks with
+    | none =>
+      let bAbs : List AbstractByte :=
+        match sliceRawBytes refRawBytes curOffset 1 with
+        | some s => rawBytesToAbstractBytes s
+        | none => [.init 0 none]
+      match writeAbstractBytesAt buf curOffset bAbs with
+      | none => none
+      | some buf' =>
+        rawProjectedStructBytesSequential
+          rootBody table paramLocal refRawBytes
+          rem (fieldIdx + 1) (curOffset + 1) buf'
+    | some fieldTy =>
+      let (fSizeOpt, fAlign) := fieldTySizeAndAlign rootBody.layouts fieldTy
+      match fSizeOpt with
+      | none => none
+      | some fSize =>
+        let alignedOff := alignUpOffset curOffset fAlign
+        match sliceRawBytes refRawBytes alignedOff fSize with
+        | none => none
+        | some fRawSlice =>
+          let fAbs := rawBytesWithProvenance table fieldTy fRawSlice rootBody.layouts
+          match writeAbstractBytesAt buf alignedOff fAbs with
+          | none => none
+          | some buf' =>
+            rawProjectedStructBytesSequential
+              rootBody table paramLocal refRawBytes
+              rem (fieldIdx + 1) (Nat.add alignedOff fSize) buf'
+
+/--
+Populate `List AbstractByte` for a dereferenced struct parameter `paramLocal`
+from the field projections in `rootBody.basicBlocks` when no `TypeLayout` for
+the struct is present in `rootBody.layouts`.
+-/
+@[reducible]
+def rawProjectedStructBytesFromBody
+    (rootBody : CapturedMir) (table : ShadowProvenanceTable)
+    (paramLocal : Nat) (refRawBytes : List UInt8) : Option (List AbstractByte) :=
+  let initBuf := replicateUninitBytes (length refRawBytes)
+  match findMaxDerefFieldIdxInBlocks? paramLocal rootBody.basicBlocks with
+  | none => none
+  | some maxFieldIdx =>
+    if Nat.beq maxFieldIdx 1 then
+      match
+        findDerefFieldTyInBlocks? paramLocal 0 rootBody.basicBlocks,
+        findDerefFieldTyInBlocks? paramLocal 1 rootBody.basicBlocks
+      with
+      | some fTy0, some fTy1 =>
+        let (szOpt0, al0) := fieldTySizeAndAlign rootBody.layouts fTy0
+        let (szOpt1, al1) := fieldTySizeAndAlign rootBody.layouts fTy1
+        match szOpt0, szOpt1 with
+        | some sz0, some sz1 =>
+          if Nat.ble (Nat.add al0 1) al1 then
+            let off0 := alignUpOffset sz1 al0
+            match
+              sliceRawBytes refRawBytes off0 sz0,
+              sliceRawBytes refRawBytes 0 sz1
+            with
+            | some slice0, some slice1 =>
+              let abs0 := rawBytesWithProvenance table fTy0 slice0 rootBody.layouts
+              let abs1 := rawBytesWithProvenance table fTy1 slice1 rootBody.layouts
+              match writeAbstractBytesAt initBuf 0 abs1 with
+              | some buf1 => writeAbstractBytesAt buf1 off0 abs0
+              | none => none
+            | _, _ =>
+              rawProjectedStructBytesSequential
+                rootBody table paramLocal refRawBytes 2 0 0 initBuf
+          else
+            rawProjectedStructBytesSequential
+              rootBody table paramLocal refRawBytes 2 0 0 initBuf
+        | _, _ =>
+          rawProjectedStructBytesSequential
+            rootBody table paramLocal refRawBytes 2 0 0 initBuf
+      | _, _ =>
+        rawProjectedStructBytesSequential
+          rootBody table paramLocal refRawBytes 2 0 0 initBuf
+    else
+      rawProjectedStructBytesSequential
+        rootBody table paramLocal refRawBytes (maxFieldIdx + 1) 0 0 initBuf
+
+/--
+Convert the referent bytes `refRawBytes` of a registered pointer parameter
+`paramLocal` pointing to `pointee : RigidTy` into `List AbstractByte`, marking
+padding offsets as `.uninit`.
+-/
+@[reducible]
+def decodePointeeReferentAbsBytes
+    (rootBody : CapturedMir) (auxBodies : List CapturedMir)
+    (table : ShadowProvenanceTable) (paramLocal : Nat)
+    (ptrTy : Ty) (pointee : RigidTy) (refRawBytes : List UInt8) : List AbstractByte :=
+  let (pointeeLayouts, pointeeTy, _) :=
+    resolvePointeeTyAndSize rootBody auxBodies ptrTy pointee (length refRawBytes)
+  let hasExplicitLayout : Bool :=
+    match LayoutTable.lookup rootBody.layouts ptrTy.layoutIdx with
+    | some ptrLayout =>
+      match ptrLayout.fieldLayouts with
+      | _ :: _ => true
+      | [] => (findTyWithLayoutsInBodies? pointee (rootBody :: auxBodies)).isSome
+    | none => (findTyWithLayoutsInBodies? pointee (rootBody :: auxBodies)).isSome
+  if hasExplicitLayout then
+    rawBytesWithProvenance table pointeeTy refRawBytes pointeeLayouts
+  else
+    match rawProjectedStructBytesFromBody rootBody table paramLocal refRawBytes with
+    | some bs => bs
+    | none => rawBytesWithProvenance table pointeeTy refRawBytes pointeeLayouts
+
+/-- Convert `AbstractByte` into `Option UInt8` (`none` for `.uninit`). -/
+@[reducible]
+def abstractByteToOptionUInt8 : AbstractByte → Option UInt8
+  | .init b _ => some b
+  | .uninit => none
+
+/-- Map `abstractByteToOptionUInt8` across a list of `AbstractByte`s. -/
+@[reducible]
+def abstractBytesToGlobalBytes : List AbstractByte → List (Option UInt8)
+  | [] => []
+  | b :: rest => abstractByteToOptionUInt8 b :: abstractBytesToGlobalBytes rest
+
+/-- Construct a list of `n` `LocalSlot.dead` entries. -/
+@[reducible]
+def replicateDeadLocals : Nat → List LocalSlot
+  | 0 => []
+  | n + 1 => .dead :: replicateDeadLocals n
+
+/-- Compute the maximum `localDecls.length` across a list of `CapturedMir` bodies. -/
+@[reducible]
+def maxLocalCountInBodies : List CapturedMir → Nat
+  | [] => 0
+  | b :: rest =>
+    let restMax := maxLocalCountInBodies rest
+    let curLen := length b.localDecls
+    if Nat.ble restMax curLen then curLen else restMax
+
+/--
+Pad `callerLocals` with `.dead` slots so its length is at least `minLen`,
+ensuring that any appended caller local slot has an index `>= length locals` in
+both `rootBody` and all `inlinedCallees`.
+-/
+@[reducible]
+def ensureCallerLocalsPad (callerLocals : List LocalSlot) (minLen : Nat) : List LocalSlot :=
+  if Nat.ble minLen (length callerLocals) then
+    callerLocals
+  else
+    callerLocals ++ replicateDeadLocals (Nat.sub minLen (length callerLocals))
+
+/--
+Determine the initial `TreeBorrowPerm` for an incoming pointer/reference
+parameter of mutability `mutbl` and pointee `pointee`.
+-/
+@[reducible]
+def ptrParamBorrowPerm (mutbl : Mutability) (pointee : RigidTy) : TreeBorrowPerm :=
+  match mutbl with
+  | .mut => .active
+  | .not =>
+    if rigidTyIsFreezeFuel 16 pointee then .frozen else .reserved
+
+/--
+Populate `mem.borrows`, `mem.callerLocals`, and `mem.globals` for a single
+registered pointer/reference parameter when its runtime address resolves to a
+`ShadowAllocEntry` carrying non-empty initial `rawBytes`.
+-/
+@[reducible]
+def populateSinglePtrParamMemory
+    (rootBody : CapturedMir) (auxBodies : List CapturedMir)
+    (table : ShadowProvenanceTable) (minCallerIdx : Nat)
+    (paramLocal : Nat) (decl : LocalDecl) (rawArg : List UInt8) (argVal : Value)
+    (mem : Memory) : Memory :=
+  match decl.ty.kind with
+  | .ref mutbl pointee | .rawPtr mutbl pointee =>
+    match mem with
+    | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+       activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩ =>
+      match isWidePointee pointee with
+      | false =>
+        match argVal with
+        | .ptr ptrVal 8 =>
+          if Nat.beq (length rawArg) 8 then
+            let addr := decodeRawLittleEndianNat rawArg
+            match lookupShadowAllocEntry? table addr with
+            | none => mem
+            | some (entry, relOffset) =>
+              if Nat.beq (length entry.rawBytes) 0 ||
+                  Bool.not (Nat.ble relOffset (length entry.rawBytes)) then
+                mem
+              else
+                let availBytes := entry.rawBytes.drop relOffset
+                let (_, _, pointeeSzOpt) :=
+                  resolvePointeeTyAndSize
+                    rootBody auxBodies decl.ty pointee (length availBytes)
+                let refRawBytes :=
+                  match pointeeSzOpt with
+                  | some sz =>
+                    if Nat.ble sz (length availBytes) then
+                      availBytes.take sz
+                    else
+                      availBytes
+                  | none => availBytes
+                match
+                  decodePointeeReferentValue
+                    rootBody auxBodies table paramLocal decl.ty pointee refRawBytes
+                with
+                | none => mem
+                | some referentVal =>
+                  let paddedCallerLocals :=
+                    ensureCallerLocalsPad callerLocals minCallerIdx
+                  let targetLocal := length paddedCallerLocals
+                  let nextCallerLocals := paddedCallerLocals ++ [LocalSlot.init referentVal]
+                  let perm := ptrParamBorrowPerm mutbl pointee
+                  let nextBorrows :=
+                    match lookupBorrow borrows ptrVal.tag with
+                    | some _ => borrows
+                    | none =>
+                      { tag := ptrVal.tag
+                        targetLocal := targetLocal
+                        targetProjection := []
+                        perm := perm } :: borrows
+                  let nextTagVal :=
+                    if Nat.ble nextTag ptrVal.tag then
+                      Nat.add ptrVal.tag 1
+                    else
+                      nextTag
+                  let nextGlobals :=
+                    match lookupGlobalAlloc globals entry.allocId with
+                    | some _ => globals
+                    | none =>
+                      let absBytes :=
+                        decodePointeeReferentAbsBytes
+                          rootBody auxBodies table paramLocal decl.ty pointee refRawBytes
+                      { allocId := entry.allocId
+                        bytes := abstractBytesToGlobalBytes absBytes
+                        relocations := []
+                        align := { bytes := 8 }
+                        mutability := mutbl } :: globals
+                  ⟨nextAllocId, nextGlobals, nextBorrows, nextTagVal, callees, traitImpls, callStack, activeCallee, activeProtectors, nextProtector, nextCallerLocals, fnPtrs⟩
+          else
+            mem
+        | _ => mem
+      | true =>
+        match pointee, argVal with
+        | .slice elemKind, .aggregate 0 [.ptr ptrVal 8, .scalar metaSv] =>
+          if Nat.beq (length rawArg) 16 then
+            let addr := decodeRawLittleEndianNat (rawArg.take 8)
+            match lookupShadowAllocEntry? table addr with
+            | none => mem
+            | some (entry, relOffset) =>
+              if Nat.beq (length entry.rawBytes) 0 ||
+                  Bool.not (Nat.ble relOffset (length entry.rawBytes)) then
+                mem
+              else
+                let availBytes := entry.rawBytes.drop relOffset
+                let arrayKind : RigidTy := .array elemKind metaSv.bits
+                let elemSz :=
+                  match rigidTyKindByteSize elemKind with
+                  | some sz => sz
+                  | none =>
+                    let (_, _, elemSzOpt) :=
+                      resolvePointeeTyAndSize
+                        rootBody auxBodies decl.ty elemKind (length availBytes)
+                    match elemSzOpt with
+                    | some sz => sz
+                    | none => 0
+                let sliceByteLen := Nat.mul elemSz metaSv.bits
+                let refRawBytes :=
+                  if Nat.ble 1 sliceByteLen && Nat.ble sliceByteLen (length availBytes) then
+                    availBytes.take sliceByteLen
+                  else
+                    availBytes
+                match
+                  decodePointeeReferentValue
+                    rootBody auxBodies table paramLocal decl.ty arrayKind refRawBytes
+                with
+                | none => mem
+                | some referentVal =>
+                  let paddedCallerLocals :=
+                    ensureCallerLocalsPad callerLocals minCallerIdx
+                  let targetLocal := length paddedCallerLocals
+                  let nextCallerLocals := paddedCallerLocals ++ [LocalSlot.init referentVal]
+                  let perm := ptrParamBorrowPerm mutbl pointee
+                  let nextBorrows :=
+                    match lookupBorrow borrows ptrVal.tag with
+                    | some _ => borrows
+                    | none =>
+                      { tag := ptrVal.tag
+                        targetLocal := targetLocal
+                        targetProjection := []
+                        perm := perm } :: borrows
+                  let nextTagVal :=
+                    if Nat.ble nextTag ptrVal.tag then
+                      Nat.add ptrVal.tag 1
+                    else
+                      nextTag
+                  let nextGlobals :=
+                    match lookupGlobalAlloc globals entry.allocId with
+                    | some _ => globals
+                    | none =>
+                      let absBytes :=
+                        decodePointeeReferentAbsBytes
+                          rootBody auxBodies table paramLocal decl.ty arrayKind refRawBytes
+                      { allocId := entry.allocId
+                        bytes := abstractBytesToGlobalBytes absBytes
+                        relocations := []
+                        align := { bytes := 8 }
+                        mutability := mutbl } :: globals
+                  ⟨nextAllocId, nextGlobals, nextBorrows, nextTagVal, callees, traitImpls, callStack, activeCallee, activeProtectors, nextProtector, nextCallerLocals, fnPtrs⟩
+          else
+            mem
+        | _, _ => mem
+  | _ => mem
+
+/--
+Walk all parameters of `rootBody` (`localDecls.drop 1`) and populate initial
+memory in `mem` for registered pointer allocations.
+-/
+@[reducible]
+def populateShadowPointerMemoryAux
+    (rootBody : CapturedMir) (auxBodies : List CapturedMir)
+    (table : ShadowProvenanceTable) (minCallerIdx : Nat)
+    (paramLocal : Nat) (decls : List LocalDecl) (rawArgs : List (List UInt8)) :
+    List Value → Memory → Memory
+  | [], mem => mem
+  | argVal :: argRest, mem =>
+    match decls, rawArgs with
+    | decl :: declRest, rawArg :: rawRest =>
+      let mem' :=
+        populateSinglePtrParamMemory
+          rootBody auxBodies table minCallerIdx paramLocal decl rawArg argVal mem
+      populateShadowPointerMemoryAux
+        rootBody auxBodies table minCallerIdx (paramLocal + 1)
+        declRest rawRest argRest mem'
+    | _, _ => mem
+
+/--
+Supply initial `borrows`, `callerLocals`, and `globals` in `baseMem` for any
+pointer or reference argument of `rootBody` whose runtime address is registered
+in `table` (`ShadowProvenanceTable`) with initial `rawBytes`. Unregistered
+pointer arguments are left unmapped so dereferencing them faults with `.ub`.
+-/
+@[reducible]
+def populateShadowPointerMemory
+    (rootBody : CapturedMir) (auxBodies : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawArgs : List (List UInt8))
+    (args : List Value) (baseMem : Memory) : Memory :=
+  match table with
+  | [] => baseMem
+  | _ :: _ =>
+    let minCallerIdx := maxLocalCountInBodies (rootBody :: auxBodies)
+    populateShadowPointerMemoryAux
+      rootBody auxBodies table minCallerIdx 1
+      (rootBody.localDecls.drop 1) rawArgs args baseMem
 
 /--
 Raw byte-level interaction event recorded at runtime before `LayoutTable`
@@ -1678,7 +3750,12 @@ structure RawByteTrace : Type where
   outcome : RawObservedOutcome
   deriving Repr, DecidableEq
 
-/-- Decode a single `RawObservedEvent` using `calleeSigs` and `table`. -/
+/--
+Decode a single `RawObservedEvent` using `calleeSigs` and `table`.
+Rejects (`none`) any external call whose callee signature takes a `&mut` or
+raw-pointer parameter (`findCalleeImpurePtrArgIdx? sigBody = some _`), since
+`TraceCheck` assumes memory-pure external callees.
+-/
 @[reducible]
 def decodeRawObservedEvent
     (calleeSigs : List CapturedMir) (table : ShadowProvenanceTable) :
@@ -1687,26 +3764,35 @@ def decodeRawObservedEvent
   | .extCall defPath rawArgs rawRet =>
     match findCallee? calleeSigs defPath with
     | some sigBody =>
-      match
-        decodeFnArgsFromRawBytes sigBody table rawArgs,
-        decodeFnRetFromRawBytes sigBody table rawRet
-      with
-      | some args, some retVal => some (.extCall defPath args retVal)
-      | _, _ => none
+      match findCalleeImpurePtrArgIdx? sigBody with
+      | some _ => none
+      | none =>
+        match
+          decodeFnArgsFromRawBytes sigBody table rawArgs,
+          decodeFnRetFromRawBytes sigBody table rawRet
+        with
+        | some args, some retVal => some (.extCall defPath args retVal)
+        | _, _ => none
     | none => none
   | .extCallPanic defPath rawArgs =>
     match findCallee? calleeSigs defPath with
     | some sigBody =>
-      match decodeFnArgsFromRawBytes sigBody table rawArgs with
-      | some args => some (.extCallPanic defPath args)
-      | none => none
+      match findCalleeImpurePtrArgIdx? sigBody with
+      | some _ => none
+      | none =>
+        match decodeFnArgsFromRawBytes sigBody table rawArgs with
+        | some args => some (.extCallPanic defPath args)
+        | none => none
     | none => none
   | .extCallAbort defPath rawArgs =>
     match findCallee? calleeSigs defPath with
     | some sigBody =>
-      match decodeFnArgsFromRawBytes sigBody table rawArgs with
-      | some args => some (.extCallAbort defPath args)
-      | none => none
+      match findCalleeImpurePtrArgIdx? sigBody with
+      | some _ => none
+      | none =>
+        match decodeFnArgsFromRawBytes sigBody table rawArgs with
+        | some args => some (.extCallAbort defPath args)
+        | none => none
     | none => none
 
 /-- Decode a list of `RawObservedEvent`s using `calleeSigs` and `table`. -/
@@ -1738,7 +3824,8 @@ def decodeRawObservedOutcome
 /--
 Decode a complete `RawByteTrace` into a typed `ObservedTrace` using the
 compiler-extracted `LayoutTable` and `LocalDecl` metadata in `rootBody` and
-`calleeSigs`.
+`calleeSigs`, populating initial memory for registered pointer allocations via
+`populateShadowPointerMemory`.
 -/
 @[reducible]
 def decodeRawByteTrace
@@ -1751,13 +3838,25 @@ def decodeRawByteTrace
     decodeRawObservedOutcome rootBody table rawTrace.outcome
   with
   | some args, some events, some outcome =>
-    some {
-      args := args
-      initMem := rawTrace.initMem
-      inlinedCallees := rawTrace.inlinedCallees
-      events := events
-      outcome := outcome
-    }
+    match
+      populateShadowPointerMemory
+        rootBody
+        (calleeSigs ++ rawTrace.inlinedCallees)
+        table
+        rawTrace.rawArgs
+        args
+        rawTrace.initMem
+    with
+    | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+       activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩ =>
+      some {
+        args := args
+        initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+                    activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩
+        inlinedCallees := rawTrace.inlinedCallees
+        events := events
+        outcome := outcome
+      }
   | _, _, _ => none
 
 /--
@@ -1953,6 +4052,7 @@ inductive TraceReplayDiag where
   | decodeArgFailed (argIdx : Nat)
   | decodeEventFailed (evIdx : Nat)
   | decodeOutcomeFailed
+  | impureExtCallPtrArg (defPath : DefPath) (evIdx : Nat) (argIdx : Nat)
   | stepFaulted (kind : FailureKind) (blockIdx stmtIdx : Nat)
   | unexpectedExtCall (defPath : DefPath) (blockIdx : Nat)
   | callArgMismatch (defPath : DefPath) (blockIdx : Nat)
@@ -1978,6 +4078,7 @@ def TraceReplayDiag.tagName : TraceReplayDiag → String
   | .decodeArgFailed _ => "decode_arg_failed"
   | .decodeEventFailed _ => "decode_event_failed"
   | .decodeOutcomeFailed => "decode_outcome_failed"
+  | .impureExtCallPtrArg _ _ _ => "impure_ext_call_ptr_arg"
   | .stepFaulted _ _ _ => "step_faulted"
   | .unexpectedExtCall _ _ => "unexpected_ext_call"
   | .callArgMismatch _ _ => "call_arg_mismatch"
@@ -1985,12 +4086,6 @@ def TraceReplayDiag.tagName : TraceReplayDiag → String
   | .unconsumedEventsRemaining _ => "unconsumed_events"
   | .outcomeMismatch _ _ => "outcome_mismatch"
   | .outOfFuel _ _ => "out_of_fuel"
-
-/-- Extract the active `(blockIdx, stmtIdx)` program counter from `MirExecState`. -/
-@[reducible]
-def execStateCursor : MirExecState → Nat × Nat
-  | .running s => (s.frame.blockIdx, s.frame.stmtIdx)
-  | _ => (0, 0)
 
 /--
 Classify an external `MirCallReq` against the next `ObservedEvent`, distinguishing
@@ -2005,24 +4100,24 @@ def diagnoseCallObservedEvent
   | .branch _ =>
     .error (.unexpectedExtCall req.defPath blockIdx)
   | .extCall defPath args retVal =>
-    if req.defPath == defPath then
-      if valueListEq req.args args then
+    if stringEq req.defPath defPath then
+      if valueListEqFuel 16 req.args args then
         .ok (.returned retVal req.memory)
       else
         .error (.callArgMismatch req.defPath blockIdx)
     else
       .error (.unexpectedExtCall req.defPath blockIdx)
   | .extCallPanic defPath args =>
-    if req.defPath == defPath then
-      if valueListEq req.args args then
+    if stringEq req.defPath defPath then
+      if valueListEqFuel 16 req.args args then
         .ok (.panicked req.memory)
       else
         .error (.callArgMismatch req.defPath blockIdx)
     else
       .error (.unexpectedExtCall req.defPath blockIdx)
   | .extCallAbort defPath args =>
-    if req.defPath == defPath then
-      if valueListEq req.args args then
+    if stringEq req.defPath defPath then
+      if valueListEqFuel 16 req.args args then
         .ok .aborted
       else
         .error (.callArgMismatch req.defPath blockIdx)
@@ -2041,10 +4136,9 @@ def diagnoseMirExecBounded
     TraceReplayDiag :=
   match fuel with
   | 0 =>
-    let (lastBlockIdx, lastStmtIdx) := execStateCursor st
-    .outOfFuel lastBlockIdx lastStmtIdx
+    let cur := execStateCursor st
+    .outOfFuel cur.1 cur.2
   | fuel' + 1 =>
-    let (blockIdx, stmtIdx) := execStateCursor st
     match stepMirState body st with
     | .ret actualOut =>
       match events with
@@ -2058,15 +4152,17 @@ def diagnoseMirExecBounded
     | .tau st' =>
       diagnoseMirExecBounded fuel' checkBranches body st' events outcome
     | .vis (.inl (.fail kind)) _ =>
-      .stepFaulted kind blockIdx stmtIdx
+      let cur := execStateCursor st
+      .stepFaulted kind cur.1 cur.2
     | .vis (.inr (.inl (.emit obs))) k =>
       match checkBranches with
       | false =>
         diagnoseMirExecBounded fuel' false body (k PUnit.unit) events outcome
       | true =>
+        let cur := execStateCursor st
         match obs with
         | .silent =>
-          .stepFaulted .unsupported blockIdx stmtIdx
+          .stepFaulted .unsupported cur.1 cur.2
         | .event actualTag =>
           match events with
           | .branch expectedTag :: rest =>
@@ -2076,21 +4172,27 @@ def diagnoseMirExecBounded
                 .ok (⟨.inr (.inl (.emit (.event actualTag))), PUnit.unit⟩ :: trRest) out
               | diag => diag
             else
-              .branchTagMismatch actualTag expectedTag blockIdx
+              .branchTagMismatch actualTag expectedTag cur.1
           | _ =>
-            .branchTagMismatch actualTag 0 blockIdx
+            .branchTagMismatch actualTag 0 cur.1
     | .vis (.inr (.inr (.call req))) k =>
-      match events with
-      | [] =>
-        .unexpectedExtCall req.defPath blockIdx
-      | obsEv :: rest =>
-        match diagnoseCallObservedEvent req blockIdx obsEv with
-        | .error diag => diag
-        | .ok ans =>
-          match diagnoseMirExecBounded fuel' checkBranches body (k ans) rest outcome with
-          | .ok trRest out =>
-            .ok (⟨.inr (.inr (.call req)), ans⟩ :: trRest) out
-          | diag => diag
+      let blockIdx := (execStateCursor st).1
+      let activeBody := execStateActiveBody body st
+      match findActiveCallImpurePtrArgIdx? activeBody blockIdx req with
+      | some argIdx =>
+        .impureExtCallPtrArg req.defPath 0 argIdx
+      | none =>
+        match events with
+        | [] =>
+          .unexpectedExtCall req.defPath blockIdx
+        | obsEv :: rest =>
+          match diagnoseCallObservedEvent req blockIdx obsEv with
+          | .error diag => diag
+          | .ok ans =>
+            match diagnoseMirExecBounded fuel' checkBranches body (k ans) rest outcome with
+            | .ok trRest out =>
+              .ok (⟨.inr (.inr (.call req)), ans⟩ :: trRest) out
+            | diag => diag
 
 /--
 Diagnose a decoded `ObservedTrace` against `body` with fuel bound `fuel` and
@@ -2123,17 +4225,20 @@ to report `.decodeArgFailed argIdx` on the first failing argument.
 -/
 @[reducible]
 def diagnoseDecodeRawArgsAux
-    (layouts : LayoutTable) (table : ShadowProvenanceTable) :
-    Nat → List LocalDecl → List (List UInt8) → Except Nat (List Value)
-  | _, _, [] => .ok []
-  | argIdx, [], _ :: _ => .error argIdx
-  | argIdx, decl :: declRest, raw :: rawRest =>
-    match decodeRawValue layouts table decl.ty raw with
-    | none => .error argIdx
-    | some v =>
-      match diagnoseDecodeRawArgsAux layouts table (argIdx + 1) declRest rawRest with
-      | .ok vs => .ok (v :: vs)
-      | .error failedIdx => .error failedIdx
+    (layouts : LayoutTable) (table : ShadowProvenanceTable)
+    (argIdx : Nat) (decls : List LocalDecl) :
+    List (List UInt8) → Except Nat (List Value)
+  | [] => .ok []
+  | raw :: rawRest =>
+    match decls with
+    | [] => .error argIdx
+    | decl :: declRest =>
+      match decodeRawValue layouts table decl.ty raw with
+      | none => .error argIdx
+      | some v =>
+        match diagnoseDecodeRawArgsAux layouts table (argIdx + 1) declRest rawRest with
+        | .ok vs => .ok (v :: vs)
+        | .error failedIdx => .error failedIdx
 
 /--
 Decode root argument byte slices `rawArgs` against `body`, reporting the exact
@@ -2149,26 +4254,74 @@ def diagnoseDecodeFnArgs
     .error (length rawArgs)
 
 /--
+Diagnose and decode a single `RawObservedEvent` at index `evIdx`, flagging
+external calls that take `&mut` or raw-pointer arguments with
+`.impureExtCallPtrArg defPath evIdx argIdx` and reporting `.decodeEventFailed evIdx`
+on malformed argument/return bytes or missing callee signatures.
+-/
+@[reducible]
+def diagnoseDecodeRawEvent
+    (calleeSigs : List CapturedMir) (table : ShadowProvenanceTable)
+    (evIdx : Nat) : RawObservedEvent → Except TraceReplayDiag ObservedEvent
+  | .branch tag => .ok (.branch tag)
+  | .extCall defPath rawArgs rawRet =>
+    match findCallee? calleeSigs defPath with
+    | some sigBody =>
+      match findCalleeImpurePtrArgIdx? sigBody with
+      | some argIdx => .error (.impureExtCallPtrArg defPath evIdx argIdx)
+      | none =>
+        match
+          decodeFnArgsFromRawBytes sigBody table rawArgs,
+          decodeFnRetFromRawBytes sigBody table rawRet
+        with
+        | some args, some retVal => .ok (.extCall defPath args retVal)
+        | _, _ => .error (.decodeEventFailed evIdx)
+    | none => .error (.decodeEventFailed evIdx)
+  | .extCallPanic defPath rawArgs =>
+    match findCallee? calleeSigs defPath with
+    | some sigBody =>
+      match findCalleeImpurePtrArgIdx? sigBody with
+      | some argIdx => .error (.impureExtCallPtrArg defPath evIdx argIdx)
+      | none =>
+        match decodeFnArgsFromRawBytes sigBody table rawArgs with
+        | some args => .ok (.extCallPanic defPath args)
+        | none => .error (.decodeEventFailed evIdx)
+    | none => .error (.decodeEventFailed evIdx)
+  | .extCallAbort defPath rawArgs =>
+    match findCallee? calleeSigs defPath with
+    | some sigBody =>
+      match findCalleeImpurePtrArgIdx? sigBody with
+      | some argIdx => .error (.impureExtCallPtrArg defPath evIdx argIdx)
+      | none =>
+        match decodeFnArgsFromRawBytes sigBody table rawArgs with
+        | some args => .ok (.extCallAbort defPath args)
+        | none => .error (.decodeEventFailed evIdx)
+    | none => .error (.decodeEventFailed evIdx)
+
+/--
 Decode `rawEvents` item-by-item while tracking the 0-based event index `evIdx`
-to report `.decodeEventFailed evIdx` on the first failing event.
+to report `.impureExtCallPtrArg` or `.decodeEventFailed evIdx` on the first
+failing event.
 -/
 @[reducible]
 def diagnoseDecodeRawEventsAux
     (calleeSigs : List CapturedMir) (table : ShadowProvenanceTable) :
-    Nat → List RawObservedEvent → Except Nat (List ObservedEvent)
+    Nat → List RawObservedEvent → Except TraceReplayDiag (List ObservedEvent)
   | _, [] => .ok []
   | evIdx, ev :: rest =>
-    match decodeRawObservedEvent calleeSigs table ev with
-    | none => .error evIdx
-    | some dEv =>
+    match diagnoseDecodeRawEvent calleeSigs table evIdx ev with
+    | .error diag => .error diag
+    | .ok dEv =>
       match diagnoseDecodeRawEventsAux calleeSigs table (evIdx + 1) rest with
       | .ok dRest => .ok (dEv :: dRest)
-      | .error failedIdx => .error failedIdx
+      | .error diag => .error diag
 
 /--
 End-to-end diagnostic replay of a `RawByteTrace`: first pinpoints any
-`decodeArgFailed`, `decodeEventFailed`, or `decodeOutcomeFailed` error with its
-exact 0-based index, then executes `diagnoseObservedTraceBounded`.
+`decodeArgFailed`, `impureExtCallPtrArg`, `decodeEventFailed`, or
+`decodeOutcomeFailed` error with its exact 0-based index, populates initial
+memory for registered pointer allocations via `populateShadowPointerMemory`, and
+executes `diagnoseObservedTraceBounded`.
 -/
 @[reducible]
 def diagnoseRawByteTraceBounded
@@ -2179,18 +4332,30 @@ def diagnoseRawByteTraceBounded
   | .error argIdx => .decodeArgFailed argIdx
   | .ok args =>
     match diagnoseDecodeRawEventsAux calleeSigs table 0 rawTrace.events with
-    | .error evIdx => .decodeEventFailed evIdx
+    | .error diag => diag
     | .ok events =>
       match decodeRawObservedOutcome rootBody table rawTrace.outcome with
       | none => .decodeOutcomeFailed
       | some outcome =>
-        diagnoseObservedTraceBounded fuel checkBranches rootBody {
-          args := args
-          initMem := rawTrace.initMem
-          inlinedCallees := rawTrace.inlinedCallees
-          events := events
-          outcome := outcome
-        }
+        match
+          populateShadowPointerMemory
+            rootBody
+            (calleeSigs ++ rawTrace.inlinedCallees)
+            table
+            rawTrace.rawArgs
+            args
+            rawTrace.initMem
+        with
+        | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩ =>
+          diagnoseObservedTraceBounded fuel checkBranches rootBody {
+            args := args
+            initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩
+            inlinedCallees := rawTrace.inlinedCallees
+            events := events
+            outcome := outcome
+          }
 
 /--
 Convenience wrapper for `diagnoseRawByteTraceBounded` with full branch and call

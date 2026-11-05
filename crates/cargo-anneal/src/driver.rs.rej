@@ -1,0 +1,18 @@
+--- crates/cargo-anneal/src/driver.rs
++++ crates/cargo-anneal/src/driver.rs
+@@ -2755,9 +2758,12 @@
+       MirCallContract.evalSymExternalCall,
+       callFramePreserved,
+       callFramePreserved.match_1
+     ]
+-    intro retVal mem' hEq
+-    cases hEq
+-    exact ⟨n, hn, rfl⟩
++    refine ⟨⟨rfl, rfl, ⟨⟨n, hn, rfl⟩, trivial⟩, trivial⟩, ?_⟩
++    intro ans h_post
++    cases ans with
++    | returned retVal memAfter =>
++      exact ⟨n, hn, rfl⟩
++    | panicked => trivial
+ "#;
+         let caller_ffi_proof_path = crate_a_dir

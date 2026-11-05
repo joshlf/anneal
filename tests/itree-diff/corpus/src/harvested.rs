@@ -11,25 +11,25 @@ use super::{ext_combine_u32, ext_transform_u32};
 #[inline(never)]
 pub fn miropt_copy_prop_chain(a: u32, b: u32) -> u32 {
     let x = a;
-    let y = x.wrapping_add(b);
+    let y = x + b;
     let z = y;
     z ^ x
 }
 
 #[inline(never)]
 pub fn miropt_diamond_phi_merge(cond: bool, x: u32, y: u32) -> u32 {
-    let merged = if cond { x.wrapping_add(1) } else { y.wrapping_add(2) };
-    merged.wrapping_mul(3)
+    let merged = if cond { x + 1 } else { y + 2 };
+    merged * 3
 }
 
 #[inline(never)]
 pub fn miropt_switch_dense_u8(tag: u8, v: u32) -> u32 {
     match tag {
         0 => v,
-        1 => v.wrapping_add(10),
-        2 => v.wrapping_add(20),
-        3 => v.wrapping_add(30),
-        4 => v.wrapping_add(40),
+        1 => v + 10,
+        2 => v + 20,
+        3 => v + 30,
+        4 => v + 40,
         _ => 0,
     }
 }
@@ -37,9 +37,9 @@ pub fn miropt_switch_dense_u8(tag: u8, v: u32) -> u32 {
 #[inline(never)]
 pub fn miropt_switch_sparse_u32(code: u32, payload: u32) -> u32 {
     match code {
-        0x0000_0001 => payload.wrapping_add(1),
-        0x0000_0100 => payload.wrapping_add(16),
-        0x0001_0000 => payload.wrapping_add(256),
+        0x0000_0001 => payload + 1,
+        0x0000_0100 => payload + 16,
+        0x0001_0000 => payload + 256,
         0x414E_4E4C => payload ^ 0xFFFF_0000,
         _ => payload,
     }
@@ -48,29 +48,35 @@ pub fn miropt_switch_sparse_u32(code: u32, payload: u32) -> u32 {
 #[inline(never)]
 pub fn miropt_nested_tuple_swap(a: u32, b: u32, swap: bool) -> u32 {
     let pair = if swap { (b, a) } else { (a, b) };
-    pair.0.wrapping_sub(pair.1)
+    if pair.0 >= pair.1 {
+        pair.0 - pair.1
+    } else {
+        pair.1 - pair.0
+    }
 }
 
 #[inline(never)]
 pub fn miropt_checked_add_fallback(a: u32, b: u32, fallback: u32) -> u32 {
-    match a.checked_add(b) {
-        Some(sum) => sum,
-        None => fallback,
+    if a > u32::MAX - b {
+        fallback
+    } else {
+        a + b
     }
 }
 
 #[inline(never)]
 pub fn miropt_checked_sub_clamp_zero(a: u32, b: u32) -> u32 {
-    match a.checked_sub(b) {
-        Some(diff) => diff,
-        None => 0,
+    if a < b {
+        0
+    } else {
+        a - b
     }
 }
 
 #[inline(never)]
 pub fn miropt_bool_to_int_weighted(b0: bool, b1: bool, b2: bool, scale: u32) -> u32 {
     let bits = (b0 as u32) | ((b1 as u32) << 1) | ((b2 as u32) << 2);
-    bits.wrapping_mul(scale)
+    bits * scale
 }
 
 #[inline(never)]
@@ -87,8 +93,8 @@ pub fn miropt_loop_break_threshold(start: u32, step: u32, limit: u32) -> u32 {
         if cur >= limit {
             break;
         }
-        cur = cur.wrapping_add(step);
-        i = i.wrapping_add(1);
+        cur = cur + step;
+        i = i + 1;
     }
     cur
 }
@@ -98,19 +104,19 @@ pub fn miropt_loop_continue_filter(seed: u32, mask: u32) -> u32 {
     let mut acc = 0u32;
     let mut i = 0u32;
     while i < 6 {
-        let item = seed.wrapping_add(i);
-        i = i.wrapping_add(1);
+        let item = seed + i;
+        i = i + 1;
         if item & 1 == 0 {
             continue;
         }
-        acc = acc.wrapping_add(item & mask);
+        acc = acc + (item & mask);
     }
     acc
 }
 
 #[inline(never)]
 pub fn miropt_sign_extend_i8_to_i32(x: i8, bias: i32) -> i32 {
-    (x as i32).wrapping_add(bias)
+    (x as i32) + bias
 }
 
 #[inline(never)]
@@ -122,18 +128,18 @@ pub fn miropt_zero_extend_u16_to_u64(x: u16, shift: u32) -> u64 {
 pub fn miropt_truncate_u64_hi_lo(x: u64) -> u32 {
     let lo = x as u32;
     let hi = (x >> 32) as u32;
-    lo.wrapping_add(hi)
+    lo + hi
 }
 
 #[inline(never)]
 pub fn miropt_double_match_state(s0: u8, s1: u8, x: u32) -> u32 {
     let step1 = match s0 & 1 {
-        0 => x.wrapping_add(3),
-        _ => x.wrapping_mul(2),
+        0 => x + 3,
+        _ => x * 2,
     };
     match s1 & 1 {
         0 => step1 ^ 0xA5,
-        _ => step1.wrapping_add(7),
+        _ => step1 + 7,
     }
 }
 
@@ -161,23 +167,23 @@ pub fn zc_bswap_u32_manual(x: u32) -> u32 {
 
 #[inline(never)]
 pub fn zc_bswap_u16_pair(hi: u16, lo: u16) -> u32 {
-    let s_hi = hi.swap_bytes() as u32;
-    let s_lo = lo.swap_bytes() as u32;
-    (s_hi << 16) | s_lo
+    let s_hi = ((hi & 0x00FF) << 8) | ((hi >> 8) & 0x00FF);
+    let s_lo = ((lo & 0x00FF) << 8) | ((lo >> 8) & 0x00FF);
+    ((s_hi as u32) << 16) | (s_lo as u32)
 }
 
 #[inline(never)]
 pub fn zc_align_up_pow2(addr: u32, align_shift: u32) -> u32 {
     let shift = align_shift & 15;
     let align = 1u32 << shift;
-    let mask = align.wrapping_sub(1);
-    addr.wrapping_add(mask) & !mask
+    let mask = align - 1;
+    (addr + mask) & !mask
 }
 
 #[inline(never)]
 pub fn zc_is_aligned_check(addr: u32, align_shift: u32) -> bool {
     let shift = align_shift & 15;
-    let mask = (1u32 << shift).wrapping_sub(1);
+    let mask = (1u32 << shift) - 1;
     (addr & mask) == 0
 }
 
@@ -186,8 +192,8 @@ pub fn zc_split_at_bounds_check(total_len: u32, mid: u32, elem_size: u32) -> u32
     if elem_size == 0 || mid > total_len {
         return u32::MAX;
     }
-    let left_bytes = mid.wrapping_mul(elem_size);
-    let right_bytes = total_len.wrapping_sub(mid).wrapping_mul(elem_size);
+    let left_bytes = mid * elem_size;
+    let right_bytes = (total_len - mid) * elem_size;
     left_bytes ^ right_bytes
 }
 
@@ -235,7 +241,7 @@ pub fn zc_ipv4_header_ihl_bytes(ver_ihl: u8, total_len: u16) -> u32 {
     if version != 4 || ihl_words < 5 || (total_len as u32) < hdr_bytes {
         0
     } else {
-        (total_len as u32).wrapping_sub(hdr_bytes)
+        (total_len as u32) - hdr_bytes
     }
 }
 
@@ -244,8 +250,8 @@ pub fn zc_tlv_record_advance(cursor: u32, cap: u32, tag: u8, val_len: u16) -> u3
     if tag == 0 {
         return cursor;
     }
-    let step = 3u32.wrapping_add(val_len as u32);
-    let next = cursor.wrapping_add(step);
+    let step = 3u32 + (val_len as u32);
+    let next = cursor + step;
     if next > cap {
         cap
     } else {
@@ -255,8 +261,8 @@ pub fn zc_tlv_record_advance(cursor: u32, cap: u32, tag: u8, val_len: u16) -> u3
 
 #[inline(never)]
 pub fn zc_checksum_ones_complement_fold(sum: u32) -> u16 {
-    let folded = (sum & 0xFFFF).wrapping_add(sum >> 16);
-    let folded2 = (folded & 0xFFFF).wrapping_add(folded >> 16);
+    let folded = (sum & 0xFFFF) + (sum >> 16);
+    let folded2 = (folded & 0xFFFF) + (folded >> 16);
     !(folded2 as u16)
 }
 
@@ -278,7 +284,7 @@ pub fn fxfs_extent_overlap_len(a_start: u32, a_end: u32, b_start: u32, b_end: u3
     let lo = if a_start > b_start { a_start } else { b_start };
     let hi = if a_end < b_end { a_end } else { b_end };
     if lo < hi {
-        hi.wrapping_sub(lo)
+        hi - lo
     } else {
         0
     }
@@ -288,22 +294,22 @@ pub fn fxfs_extent_overlap_len(a_start: u32, a_end: u32, b_start: u32, b_end: u3
 pub fn fxfs_round_up_block(offset: u32, block_shift: u32) -> u32 {
     let shift = block_shift & 15;
     let bs = 1u32 << shift;
-    let mask = bs.wrapping_sub(1);
-    offset.wrapping_add(mask) & !mask
+    let mask = bs - 1;
+    (offset + mask) & !mask
 }
 
 #[inline(never)]
 pub fn fxfs_round_down_block(offset: u32, block_shift: u32) -> u32 {
     let shift = block_shift & 15;
     let bs = 1u32 << shift;
-    offset & !(bs.wrapping_sub(1))
+    offset & !(bs - 1)
 }
 
 #[inline(never)]
 pub fn fxfs_block_count_for_bytes(byte_len: u32, block_shift: u32) -> u32 {
     let shift = block_shift & 15;
     let bs = 1u32 << shift;
-    byte_len.wrapping_add(bs.wrapping_sub(1)) >> shift
+    (byte_len + (bs - 1)) >> shift
 }
 
 #[inline(never)]
@@ -336,7 +342,7 @@ pub fn fxfs_alloc_bitmap_find_free_bit(word: u32) -> i32 {
         if (word & (1u32 << bit)) == 0 {
             return bit as i32;
         }
-        bit = bit.wrapping_add(1);
+        bit = bit + 1;
     }
     -1
 }
@@ -359,9 +365,19 @@ pub fn fxfs_object_attr_version_cmp(v_a: u32, minor_a: u16, v_b: u32, minor_b: u
 #[inline(never)]
 pub fn fxfs_refcount_saturating_adjust(cur: u32, delta: i32) -> u32 {
     if delta >= 0 {
-        cur.saturating_add(delta as u32)
+        let d = delta as u32;
+        if cur > u32::MAX - d {
+            u32::MAX
+        } else {
+            cur + d
+        }
     } else {
-        cur.saturating_sub(delta.unsigned_abs())
+        let d = (-delta) as u32;
+        if cur < d {
+            0
+        } else {
+            cur - d
+        }
     }
 }
 
@@ -381,17 +397,21 @@ pub fn fxfs_extent_split_offset(extent_len: u32, split_at: u32) -> (u32, u32) {
     if split_at >= extent_len {
         (extent_len, 0)
     } else {
-        (split_at, extent_len.wrapping_sub(split_at))
+        (split_at, extent_len - split_at)
     }
 }
 
 #[inline(never)]
 pub fn fxfs_txn_reservation_check(avail_blocks: u32, data_blocks: u32, meta_blocks: u32) -> i32 {
-    let needed = data_blocks.saturating_add(meta_blocks);
+    let needed = if data_blocks > u32::MAX - meta_blocks {
+        u32::MAX
+    } else {
+        data_blocks + meta_blocks
+    };
     if needed > avail_blocks {
         -1
     } else {
-        avail_blocks.wrapping_sub(needed) as i32
+        (avail_blocks - needed) as i32
     }
 }
 

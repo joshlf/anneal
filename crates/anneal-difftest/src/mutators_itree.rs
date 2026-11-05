@@ -1,13 +1,30 @@
+// Copyright 2026 The Fuchsia Authors
+//
+// Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+// license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+// This file may not be copied, modified, or distributed except according to
+// those terms.
+
 //! Milestone 5: ITree-strength strictly safe-Rust `syn` AST mutators
 //! (`CallBoundaryOutliner`, `LayoutPaddingPerturber`, `BranchLoopWeaver`,
-//! `ExtOracleInjector`) plus [`generate_itree_batch`].
+//! `ExtOracleInjector`) plus [`generate_itree_batch`] and
+//! [`annotate_itree_external_callees`].
 //!
-//! Enforces a hard zero-`unsafe` invariant: [`contains_unsafe_token`] verifies that
-//! **zero** `unsafe` tokens appear anywhere in any emitted candidate program.
+//! Enforces a hard zero-`unsafe` invariant: [`contains_unsafe_token`] verifies
+//! that **zero** `unsafe` tokens appear anywhere in any emitted candidate
+//! program. All arithmetic in generated bodies uses widening integer casts and
+//! primitive operators (`((a as u64) + (b as u64)) as u32`) so `-Zmir-opt-level=0`
+//! lowers them to pure MIR `CastKind::IntToInt` + `Rvalue::BinaryOp` +
+//! `SwitchInt` + `TerminatorKind::Call` without unmodeled `core::num` or
+//! `core::hint::black_box` intrinsic calls.
 
-use proc_macro2::{TokenStream, TokenTree};
+use std::collections::BTreeSet;
+
+use proc_macro2::{Ident, TokenStream, TokenTree};
 use quote::{format_ident, quote};
-use syn::{Block, File, Item, Stmt};
+use syn::visit_mut::{self, VisitMut};
+use syn::{Attribute, Block, Expr, File, FnArg, Item, Pat, ReturnType, Stmt, Type};
 
 use crate::mutators_miri::DetRng;
 
@@ -60,6 +77,67 @@ fn sanitize_seed_to_safe_rust(file: &mut File) {
     }
 }
 
+fn returns_u32(output: &ReturnType) -> bool {
+    match output {
+        ReturnType::Default => false,
+        ReturnType::Type(_, ty) => matches!(
+            ty.as_ref(),
+            Type::Path(tp) if tp.qself.is_none() && tp.path.is_ident("u32")
+        ),
+    }
+}
+
+fn first_u32_param_expr(func: &syn::ItemFn, fallback: u32) -> Expr {
+    for input in &func.sig.inputs {
+        if let FnArg::Typed(pat_ty) = input
+            && matches!(
+                pat_ty.ty.as_ref(),
+                Type::Path(tp) if tp.qself.is_none() && tp.path.is_ident("u32")
+            )
+            && let Pat::Ident(pat_id) = pat_ty.pat.as_ref()
+        {
+            let id = &pat_id.ident;
+            return syn::parse_quote!(#id);
+        }
+    }
+    syn::parse_quote!(#fallback)
+}
+
+fn target_fn_index(file: &File) -> Option<usize> {
+    file.items
+        .iter()
+        .rposition(|it| {
+            matches!(
+                it,
+                Item::Fn(f) if !f.sig.ident.to_string().starts_with("__anneal_")
+            )
+        })
+        .or_else(|| file.items.iter().rposition(|it| matches!(it, Item::Fn(_))))
+}
+
+/// Wraps a `u32`-returning function body so `new_stmts` run first and fold
+/// `fold_ident` into the returned `u32` (preserving live data-flow into `_0`),
+/// or prepends `new_stmts` when the function does not return `u32`.
+fn weave_into_fn_body(func: &mut syn::ItemFn, mut new_stmts: Vec<Stmt>, fold_ident: &Ident) {
+    if returns_u32(&func.sig.output) && !func.block.stmts.is_empty() {
+        let orig_block = (*func.block).clone();
+        let combined: Block = syn::parse_quote!({
+            #(#new_stmts)*
+            if #fold_ident == 0 {
+                0u32
+            } else {
+                #orig_block
+            }
+        });
+        *func.block = combined;
+    } else {
+        let suppress: Stmt = syn::parse_quote!(let _ = #fold_ident;);
+        new_stmts.push(suppress);
+        new_stmts.append(&mut func.block.stmts);
+        func.block.stmts = new_stmts;
+    }
+}
+
 /// Trait implemented by all strictly safe ITree AST mutators.
 pub trait ItreeAstMutator {
     /// Canonical human-readable name of this mutator pass.
@@ -70,7 +148,7 @@ pub trait ItreeAstMutator {
 }
 
 /// 1. Outlines computation across a real function call boundary by synthesizing a pure
-/// top-level safe helper function and invoking it from each target function body.
+/// top-level safe helper function and invoking it from the target function body.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CallBoundaryOutliner;
 
@@ -87,20 +165,21 @@ impl ItreeAstMutator for CallBoundaryOutliner {
         let helper_item: Item = syn::parse_quote! {
             #[inline(never)]
             pub fn #helper_ident(seed: u32, delta: u32) -> u32 {
-                let mixed = seed.wrapping_add(delta).rotate_left(3);
-                mixed ^ #k_const
+                let sum = (seed >> 1) + (delta >> 1);
+                (sum >> 2) + #k_const
             }
         };
 
-        for item in &mut file.items {
-            if let Item::Fn(func) = item {
-                let local_ident = format_ident!("__itree_call_res_{}", tag);
-                let injected: Vec<Stmt> = syn::parse_quote! {
-                    let #local_ident: u32 = #helper_ident(#k_const, 7u32);
-                    let _ = core::hint::black_box(#local_ident);
-                };
-                prepend_safe_stmts(&mut func.block, injected);
-            }
+        let target_idx = target_fn_index(file);
+        if let Some(idx) = target_idx
+            && let Item::Fn(func) = &mut file.items[idx]
+        {
+            let arg_expr = first_u32_param_expr(func, k_const);
+            let local_ident = format_ident!("__itree_call_res_{}", tag);
+            let injected: Vec<Stmt> = syn::parse_quote! {
+                let #local_ident: u32 = #helper_ident(#arg_expr, #k_const);
+            };
+            weave_into_fn_body(func, injected, &local_ident);
         }
 
         file.items.push(helper_item);
@@ -109,7 +188,7 @@ impl ItreeAstMutator for CallBoundaryOutliner {
 
 /// 2. Introduces safe `#[repr(C)]` multi-field wrapper structs with natural inter-field
 /// alignment padding (`u8`, 3 bytes padding, `u32`, `u8`, 3 bytes padding) and moves values
-/// through field construction and pattern matching without a single `unsafe` token.
+/// through field construction and projection without a single `unsafe` token.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LayoutPaddingPerturber;
 
@@ -121,7 +200,7 @@ impl ItreeAstMutator for LayoutPaddingPerturber {
     fn mutate(&self, file: &mut File, rng: &mut DetRng) {
         let tag = rng.next_u64() & 0xFFFF;
         let struct_ident = format_ident!("__AnnealSafePadded_{}", tag);
-        let init_word = (rng.next_u64() & 0xFFFF_FFFF) as u32;
+        let init_word = ((rng.next_u64() & 0xFFFF) as u32).wrapping_add(1);
 
         let struct_item: Item = syn::parse_quote! {
             #[repr(C)]
@@ -133,24 +212,27 @@ impl ItreeAstMutator for LayoutPaddingPerturber {
             }
         };
 
-        for item in &mut file.items {
-            if let Item::Fn(func) = item {
-                let var_ident = format_ident!("__itree_padded_{}", tag);
-                let injected: Vec<Stmt> = syn::parse_quote! {
-                    let #var_ident = #struct_ident {
-                        lead_byte: 0x5Au8,
-                        aligned_word: #init_word,
-                        trail_byte: 0xA5u8,
-                    };
-                    let #struct_ident {
-                        lead_byte: __lb,
-                        aligned_word: __aw,
-                        trail_byte: __tb,
-                    } = #var_ident;
-                    let _ = core::hint::black_box((__lb, __aw, __tb));
+        let target_idx = target_fn_index(file);
+        if let Some(idx) = target_idx
+            && let Item::Fn(func) = &mut file.items[idx]
+        {
+            let var_ident = format_ident!("__itree_padded_{}", tag);
+            let fold_ident = format_ident!("__itree_pad_fold_{}", tag);
+            let injected: Vec<Stmt> = syn::parse_quote! {
+                let #var_ident = #struct_ident {
+                    lead_byte: 0x5Au8,
+                    aligned_word: #init_word,
+                    trail_byte: 0xA5u8,
                 };
-                prepend_safe_stmts(&mut func.block, injected);
-            }
+                let #fold_ident: u32 = if #var_ident.lead_byte == 0x5Au8
+                    && #var_ident.trail_byte == 0xA5u8
+                {
+                    #var_ident.aligned_word
+                } else {
+                    0u32
+                };
+            };
+            weave_into_fn_body(func, injected, &fold_ident);
         }
 
         file.items.push(struct_item);
@@ -169,34 +251,32 @@ impl ItreeAstMutator for BranchLoopWeaver {
 
     fn mutate(&self, file: &mut File, rng: &mut DetRng) {
         let tag = rng.next_u64() & 0xFFFF;
-        let bound: u32 = ((rng.next_u64() % 5) as u32) + 2;
+        let bound: u32 = 2;
 
-        for item in &mut file.items {
-            if let Item::Fn(func) = item {
-                let step_ident = format_ident!("__itree_step_{}", tag);
-                let acc_ident = format_ident!("__itree_acc_{}", tag);
-                let injected: Vec<Stmt> = syn::parse_quote! {
-                    let mut #step_ident: u32 = 0;
-                    let mut #acc_ident: u32 = 1;
-                    while #step_ident < #bound {
-                        #acc_ident = match #step_ident & 3 {
-                            0 => #acc_ident.wrapping_add(3),
-                            1 => #acc_ident.wrapping_mul(5),
-                            2 => #acc_ident ^ 0x0F0F_0F0Fu32,
-                            _ => #acc_ident.rotate_right(1),
-                        };
-                        #step_ident += 1;
-                    }
-                    let _ = core::hint::black_box(#acc_ident);
-                };
-                prepend_safe_stmts(&mut func.block, injected);
-            }
+        let target_idx = target_fn_index(file);
+        if let Some(idx) = target_idx
+            && let Item::Fn(func) = &mut file.items[idx]
+        {
+            let step_ident = format_ident!("__itree_step_{}", tag);
+            let acc_ident = format_ident!("__itree_acc_{}", tag);
+            let injected: Vec<Stmt> = syn::parse_quote! {
+                let mut #step_ident: u32 = 0;
+                let mut #acc_ident: u32 = 1;
+                while #step_ident < #bound {
+                    #acc_ident = match #step_ident % 2 {
+                        0 => if #acc_ident < 100 { #acc_ident + 3 } else { 7 },
+                        _ => if #acc_ident < 100 { #acc_ident + 5 } else { 11 },
+                    };
+                    #step_ident = #step_ident + 1;
+                }
+            };
+            weave_into_fn_body(func, injected, &acc_ident);
         }
     }
 }
 
 /// 4. Injects a deterministic safe external oracle function `__anneal_ext_oracle_<tag>` and
-/// threads its observable call/return interaction through target functions.
+/// threads its observable call/return interaction through the target function.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ExtOracleInjector;
 
@@ -212,36 +292,220 @@ impl ItreeAstMutator for ExtOracleInjector {
 
         let oracle_item: Item = syn::parse_quote! {
             #[inline(never)]
-            pub fn #oracle_ident(query: u32) -> Result<u32, u32> {
-                if query & 1 == 0 {
-                    Ok(query.wrapping_add(#mask))
+            pub fn #oracle_ident(query: u32) -> u32 {
+                if query % 2 == 0 {
+                    (query >> 1) + #mask
                 } else {
-                    Err(query ^ #mask)
+                    (query >> 2) + (#mask * 3)
                 }
             }
         };
 
-        for item in &mut file.items {
-            if let Item::Fn(func) = item {
-                let ans_ident = format_ident!("__itree_oracle_ans_{}", tag);
-                let injected: Vec<Stmt> = syn::parse_quote! {
-                    let #ans_ident: u32 = match #oracle_ident(#mask) {
-                        Ok(v) => v,
-                        Err(e) => e,
-                    };
-                    let _ = core::hint::black_box(#ans_ident);
-                };
-                prepend_safe_stmts(&mut func.block, injected);
-            }
+        let target_idx = target_fn_index(file);
+        if let Some(idx) = target_idx
+            && let Item::Fn(func) = &mut file.items[idx]
+        {
+            let arg_expr = first_u32_param_expr(func, mask);
+            let ans_ident = format_ident!("__itree_oracle_ans_{}", tag);
+            let injected: Vec<Stmt> = syn::parse_quote! {
+                let #ans_ident: u32 = #oracle_ident(#arg_expr);
+            };
+            weave_into_fn_body(func, injected, &ans_ident);
         }
 
         file.items.push(oracle_item);
     }
 }
 
-fn prepend_safe_stmts(block: &mut Block, mut new_stmts: Vec<Stmt>) {
-    new_stmts.append(&mut block.stmts);
-    block.stmts = new_stmts;
+/// Attaches `#[anneal_trace::external]` (and `#[inline(never)]`) to every
+/// top-level function in `source` whose name is not `root_fn_name`, returning
+/// the formatted Rust source and the ordered list of external callee names.
+pub fn annotate_itree_external_callees(
+    source: &str,
+    root_fn_name: &str,
+) -> Result<(String, Vec<String>), String> {
+    let mut file = syn::parse_str::<File>(source).map_err(|e| e.to_string())?;
+    let ext_attr: Attribute = syn::parse_quote!(#[anneal_trace::external]);
+    let inline_never_attr: Attribute = syn::parse_quote!(#[inline(never)]);
+    let mut ext_callees = Vec::new();
+
+    for item in &mut file.items {
+        if let Item::Fn(func) = item {
+            let name = func.sig.ident.to_string();
+            if name != root_fn_name {
+                let has_ext = func.attrs.iter().any(|a| {
+                    let s = quote!(#a).to_string();
+                    s.contains("anneal_trace") && s.contains("external")
+                });
+                if !has_ext {
+                    func.attrs.insert(0, ext_attr.clone());
+                }
+                let has_inline = func.attrs.iter().any(|a| a.path().is_ident("inline"));
+                if !has_inline {
+                    func.attrs.push(inline_never_attr.clone());
+                }
+                if !ext_callees.contains(&name) {
+                    ext_callees.push(name);
+                }
+            }
+        }
+    }
+
+    Ok((prettyplease::unparse(&file), ext_callees))
+}
+
+/// Staged representation of a single [`GeneratedItreeCandidate`] with all
+/// top-level items prefixed by `cand_prefix` (for example, `"b0_c0__"`) and
+/// external callees annotated with `#[anneal_trace::external]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedItreeCandidate {
+    /// Unique candidate prefix (e.g., `"b0_c0__"`).
+    pub cand_prefix: String,
+    /// Staged root function identifier (e.g., `"b0_c0__kernel_step"`).
+    pub root_fn_name: String,
+    /// Staged external callee identifiers annotated with `#[anneal_trace::external]`.
+    pub ext_callee_names: Vec<String>,
+    /// Formatted Rust source ready to be included in a combined crate.
+    pub staged_source: String,
+}
+
+struct TopLevelPrefixRewriter<'a> {
+    prefix: &'a str,
+    top_names: &'a BTreeSet<String>,
+}
+
+impl VisitMut for TopLevelPrefixRewriter<'_> {
+    fn visit_path_mut(&mut self, node: &mut syn::Path) {
+        if node.leading_colon.is_none() && node.segments.len() == 1 {
+            let ident_str = node.segments[0].ident.to_string();
+            if self.top_names.contains(&ident_str) {
+                node.segments[0].ident = format_ident!("{}{}", self.prefix, ident_str);
+            }
+        }
+        visit_mut::visit_path_mut(self, node);
+    }
+}
+
+/// Prefixes every top-level declaration and reference in `source` with
+/// `cand_prefix`, leaves `root_fn_name`'s body untouched (adding only
+/// `#[inline(never)]`), and attaches `#[anneal_trace::external]` +
+/// `#[inline(never)]` to all other top-level functions.
+pub fn stage_itree_candidate_items(
+    source: &str,
+    cand_prefix: &str,
+    root_fn_name: &str,
+) -> Result<StagedItreeCandidate, String> {
+    let mut file = syn::parse_str::<File>(source).map_err(|e| e.to_string())?;
+    let mut top_names = BTreeSet::new();
+    for item in &file.items {
+        match item {
+            Item::Fn(f) => {
+                top_names.insert(f.sig.ident.to_string());
+            }
+            Item::Struct(s) => {
+                top_names.insert(s.ident.to_string());
+            }
+            Item::Enum(e) => {
+                top_names.insert(e.ident.to_string());
+            }
+            Item::Type(t) => {
+                top_names.insert(t.ident.to_string());
+            }
+            Item::Const(c) => {
+                top_names.insert(c.ident.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    let mut rewriter = TopLevelPrefixRewriter {
+        prefix: cand_prefix,
+        top_names: &top_names,
+    };
+    rewriter.visit_file_mut(&mut file);
+
+    let ext_attr: Attribute = syn::parse_quote!(#[anneal_trace::external]);
+    let inline_never_attr: Attribute = syn::parse_quote!(#[inline(never)]);
+    let staged_root_fn = format!("{cand_prefix}{root_fn_name}");
+    let mut ext_callee_names = Vec::new();
+    let mut found_root = false;
+
+    for item in &mut file.items {
+        match item {
+            Item::Fn(func) => {
+                let orig_name = func.sig.ident.to_string();
+                let new_name = format!("{cand_prefix}{orig_name}");
+                func.sig.ident = format_ident!("{new_name}");
+                let has_inline = func.attrs.iter().any(|a| a.path().is_ident("inline"));
+                if !has_inline {
+                    func.attrs.push(inline_never_attr.clone());
+                }
+                if orig_name == root_fn_name {
+                    found_root = true;
+                } else {
+                    let has_ext = func.attrs.iter().any(|a| {
+                        let s = quote!(#a).to_string();
+                        s.contains("anneal_trace") && s.contains("external")
+                    });
+                    if !has_ext {
+                        func.attrs.insert(0, ext_attr.clone());
+                    }
+                    ext_callee_names.push(new_name);
+                }
+            }
+            Item::Struct(s) => {
+                s.ident = format_ident!("{cand_prefix}{}", s.ident);
+            }
+            Item::Enum(e) => {
+                e.ident = format_ident!("{cand_prefix}{}", e.ident);
+            }
+            Item::Type(t) => {
+                t.ident = format_ident!("{cand_prefix}{}", t.ident);
+            }
+            Item::Const(c) => {
+                c.ident = format_ident!("{cand_prefix}{}", c.ident);
+            }
+            _ => {}
+        }
+    }
+
+    if !found_root {
+        return Err(format!(
+            "target root function `{root_fn_name}` not found in candidate source"
+        ));
+    }
+
+    Ok(StagedItreeCandidate {
+        cand_prefix: cand_prefix.to_string(),
+        root_fn_name: staged_root_fn,
+        ext_callee_names,
+        staged_source: prettyplease::unparse(&file),
+    })
+}
+
+/// Generates an identity (unmutated) batch containing one
+/// [`GeneratedItreeCandidate`] per seed in `seeds`.
+pub fn generate_itree_identity_batch(seeds: &[&str]) -> Vec<GeneratedItreeCandidate> {
+    let mut out = Vec::with_capacity(seeds.len());
+    for (id, seed_src) in seeds.iter().enumerate() {
+        let Ok(mut parsed) = syn::parse_str::<File>(seed_src) else {
+            continue;
+        };
+        sanitize_seed_to_safe_rust(&mut parsed);
+        let formatted = prettyplease::unparse(&parsed);
+        assert!(
+            !contains_unsafe_token(&formatted),
+            "ITree identity seed {id} emitted forbidden `unsafe` token:\n{formatted}"
+        );
+        out.push(GeneratedItreeCandidate {
+            id,
+            seed_index: id,
+            seed_u64: id as u64,
+            applied_mutators: Vec::new(),
+            source: formatted,
+        });
+    }
+    out
 }
 
 /// Generates `count` deterministic, syntactically valid, strictly safe (`0` `unsafe` tokens)
@@ -275,14 +539,15 @@ pub fn generate_itree_batch(
         };
         sanitize_seed_to_safe_rust(&mut parsed);
 
-        let num_passes = 1 + cand_rng.gen_range(3);
+        let num_passes = 1 + cand_rng.gen_range(2);
         let mut applied_mutators = Vec::with_capacity(num_passes);
+        let first_idx = id % all_mutators.len();
 
         for pass in 0..num_passes {
             let m_idx = if pass == 0 {
-                id % all_mutators.len()
+                first_idx
             } else {
-                cand_rng.gen_range(all_mutators.len())
+                (first_idx + 1 + cand_rng.gen_range(all_mutators.len() - 1)) % all_mutators.len()
             };
             let mutator = all_mutators[m_idx];
             mutator.mutate(&mut parsed, &mut cand_rng);
@@ -314,9 +579,9 @@ mod tests {
     const SAFE_SEED: &str = r#"
         pub fn evaluate_state(a: u32, b: u32) -> u32 {
             if a > b {
-                a.wrapping_sub(b)
+                (((a as u64) + 0x1_0000_0000u64) - (b as u64)) as u32
             } else {
-                b.wrapping_add(a)
+                ((b as u64) + (a as u64)) as u32
             }
         }
     "#;
