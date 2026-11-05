@@ -71,7 +71,7 @@ cargo run -q -p anneal-minirust-gen -- generate --check
 
 # Build the generated model, the interpretation, the proofs, the witnesses,
 # and the axiom audit (which fails on any non-standard axiom).
-(cd examples && lake build MiniRustSpec)
+(cd examples && anneal-lean-run --mode build --concurrency 3 -- lake build MiniRustSpec)
 
 # Translator tests: determinism, freshness of the checked-in output,
 # independent block/item/opaque-node recounts, tamper detection, and a check
@@ -121,14 +121,45 @@ executable meaning of the fragment is `Interp.lean`.
 
 `Interp.lean` transcribes, against the *generated* types, the specr-lang
 functions needed to run the fragment below on `Machine<BasicMemory<x86_64>>`:
-`Machine::step` (single enabled thread), `Statement::{Assign, PlaceMention}`,
-`PlaceExpr::Local`, `ValueExpr::{Constant, Load, UnOp, BinOp}` with
-`IntUnOp::{Neg, BitNot, CountOnes}` (all 3 `IntUnOp` variants), `CastOp::IntToInt`, and
+`Machine::step` (single enabled thread),
+`Statement::{Assign, PlaceMention, StorageLive, StorageDead, Deinit}` (with
+`StackFrame::{storage_live, storage_dead}` and `ConcurrentMemory::deinit`),
+`PlaceExpr::{Local, Field}` (`PlaceExpr::Field` indexing `(offset, field_ty)`
+and offsetting the pointer via `Machine::ptr_offset_inbounds` and
+`ConcurrentMemory::signed_dereferenceable` / `BasicMemory::signed_dereferenceable`),
+`ValueExpr::{Constant, Load, Tuple, UnOp, BinOp}` (`ValueExpr::Tuple` evaluating
+each field expression in order and returning `(Value::Tuple(fields), ty)`, while
+`check_value` and `Type::encode` validate field count and field values against
+`Type::Tuple` at `typed_store` / `typed_load`) with
+`IntUnOp::{Neg, BitNot, CountOnes}` (all 3 `IntUnOp` variants),
+`CastOp::{IntToInt, Transmute}` (both `CastOp` variants; `Transmute` runs
+`Machine::transmute`, which encodes the value at the old type and decodes
+and checks it at the new one),
 `IntBinOp::{Add, AddUnchecked, Sub, SubUnchecked, Mul, MulUnchecked, Div, DivExact, Rem, Shl, Shr, ShlUnchecked, ShrUnchecked, BitAnd, BitOr, BitXor}` (all 16 `IntBinOp` variants),
+`BinOp::IntWithOverflow` with `IntBinOpWithOverflow::{Add, Sub, Mul}` (all 3
+`IntBinOpWithOverflow` variants, through `Machine::eval_int_bin_op_with_overflow`
+and `IntType::with_overflow`, returning `(Value::Int(res_wrapped), Value::Bool(res != res_wrapped))` at `ty.with_overflow()`),
+`BinOp::Rel` with `RelOp::{Lt, Gt, Le, Ge, Eq, Ne, Cmp}` (all 7 `RelOp`
+variants, through `Machine::eval_rel_op`) on integers and Booleans (pointer
+comparison is `unsupported`),
 `Terminator::{Goto, Switch, Return, Unreachable}` including
-frame teardown and both stack-pop actions, the representation relation for
-`Int` and `Bool`, `Type::layout`, `BasicMemory`'s `check_ptr`, `load`, `store`,
-and `deallocate`, and `ConcurrentMemory`'s access log and data-race check.
+frame teardown and both stack-pop actions, the representation relation
+(`Type::{decode, encode}`) for `Int`, `Bool`, sized `Tuple`, `Union`, `Enum`
+(through `decode_discriminant` and `encode_discriminant`), `Slice`, and
+`TraitObject`, `check_value` for those types, `Type::layout` (also for unsized
+tuples, slices, and trait objects) and `LayoutStrategy::compute_size_and_align`
+/ `TupleHeadLayout::full_size_and_align`, `BasicMemory`'s `check_ptr`,
+`dereferenceable`, `signed_dereferenceable`, `load`, `store`, `allocate`, and
+`deallocate`, and `ConcurrentMemory`'s access log and data-race check.
+`BasicMemory::allocate` picks the address with the daemonic choice `pick`,
+which never has a unique solution; the interpretation commits to one valid
+resolution (`BM.pickAddr`): the first multiple of `2^32` in `[2^32, 2^64)`
+that satisfies every test of the upstream predicate (`BM.allocAddrOk`), and
+reports `Stop.unsupported` when there is none. The recursion over
+nested types, tuple fields, union chunks, enum variants, and discriminator trees
+is structural (Lean `mutual` blocks), so the kernel evaluates it.
+MiniRust has no Boolean `!`: `UnOp::Int` on a `Value::Bool` is a spec panic,
+as upstream, and `minimize` expresses `!b` with transmutes instead (see below).
 Every definition quotes the upstream code it transcribes and cites its exact
 vendored source file, and `crates/anneal-minirust-gen/tests/quotes.rs` parses
 every Lean doc comment (`/-! ... -/` and `/-- ... -/`) and checks each quoted
@@ -138,7 +169,7 @@ comments; `..` marks elided code). Effects are
 (a panic in the spec, which upstream calls a spec bug), and
 `Stop.unsupported` (outside the interpreted fragment; never silently wrong).
 
-`Anchors.lean` lists the 39 upstream items that `Interp.lean` transcribes,
+`Anchors.lean` lists the 58 upstream items that `Interp.lean` transcribes,
 each with its file path, item name, line, and token hash, and proves by `decide`
 that the generated model contains them unchanged (`anchors_ok`) with no
 duplicate entries (`anchors_nodup`). Re-pinning MiniRust therefore breaks
@@ -153,17 +184,63 @@ MiniRust's `minimize` (vendored under `vendor/<commit>/tooling/minimize/src/`,
 quoted in the doc comments, quotations checked by `tests/quotes.rs`)
 restricted to the fragment checked by `inFragment`:
 
-* the body is `Runtime(PostCleanup)` MIR and declares only the return place
-  and the arguments, all of integer type (`u8`..`u128`, `i8`..`i128`,
-  `usize`, `isize`);
+* the body is `Runtime(PostCleanup)` MIR and declares the return place, the
+  arguments, and any number of temporaries (fewer than `2^31` locals in all),
+  all of integer type (`u8`..`u128`, `i8`..`i128`, `usize`, `isize`), `bool`,
+  `core::cmp::Ordering`, or a 2-tuple `(Int, bool)` for any integer type `Int`;
+* `StorageLive(_i)` and `StorageDead(_i)` of any local (`StorageDead` only of
+  temporaries, as MiniRust's well-formedness check requires), and `Deinit(_i)`
+  of a root local, which `minimize` does not translate and we translate to
+  `Statement::Deinit(PlaceExpr::Local(_i))`;
+* operands may also be `move _j` (and `move (_j.0)`, `move (_j.1)`), which
+  `minimize` translates like `copy`. Anneal's `move` of a root local leaves it
+  uninitialized while MiniRust's is a plain load, so `movesOk` rejects any body
+  that reads a possibly moved-out local before re-initializing it, propagating
+  moved-out sets forward from `[]` at `bb0` across `Goto` and `SwitchInt` edges
+  (`movedAtEntry`) and treating `Return` as reading `_0`;
+* temporaries without storage markers (`alwaysStorageLiveLocals`, which
+  `minimize`'s init block allocates) are never mentioned (`mentionsOk`);
 * statements are `_i = Use(op)`, `_i = UnaryOp(Neg | Not, op)`,
   `_i = BinaryOp(Add | Sub | Mul | Div | Rem | BitXor | BitAnd | BitOr | Shl | Shr | AddUnchecked | SubUnchecked | MulUnchecked | ShlUnchecked | ShrUnchecked, opL, opR)`,
-  `_i = Cast(CastKind::IntToInt, op, targetTy)`, or `PlaceMention(_i)`,
-  with `op`, `opL`, `opR` projection-free `copy _j` or integer constants (of `_i`'s
-  type for `Use`, `UnaryOp`, `opL`, and non-shift `opR`, or of any integer type
-  for shift `opR` and `Cast(IntToInt)`);
-* terminators are `Goto`, `SwitchInt` on any integer fragment operand (`copy _j`
-  or constant) with distinct in-range values, `Return`, and `Unreachable`; all
+  `_i = Cast(CastKind::IntToInt, op, targetTy)`, or `PlaceMention(_i | _i.0 | _i.1)`,
+  with `op`, `opL`, `opR` projection-free `copy _j` or `move _j`, tuple field
+  projection `copy (_j.0)` or `move (_j.0)` (for an integer operand from a
+  `(Int, bool)` local) or `copy (_j.1)` or `move (_j.1)` (for a `bool` operand
+  from a `(Int, bool)` local), or integer
+  constants (of `_i`'s type for `Use`, `UnaryOp`, `opL`, and non-shift `opR`,
+  of any integer type for shift `opR`, or of any integer or `bool` type for
+  `Cast(IntToInt)`, where `minimize` casts a `bool` by transmuting to `u8` and
+  applying `CastOp::IntToInt`), for an integer `_i`;
+* for a `bool` `_i`: `_i = Use(op)`, `_i = UnaryOp(Not, op)`, and
+  `_i = BinaryOp(BitAnd | BitOr | BitXor, opL, opR)` with `bool` operands, and
+  `_i = BinaryOp(Eq | Ne | Lt | Le | Gt | Ge, opL, opR)` with two integer
+  operands of one type or two `bool` operands (`copy _j`, `move _j`,
+  `copy (_j.0)`, `move (_j.0)`, `copy (_j.1)`, `move (_j.1)`, or a `bool`
+  constant `0`/`1`). `minimize` translates the
+  comparisons to `BinOp::Rel`, `!b` to `build::not(b)` (a transmute of
+  `1u8 - transmute::<u8>(b)` back to `bool`), `BitAnd | BitOr | BitXor` on
+  `bool` to `build::bool_and`, `build::bool_or`, and `build::bool_xor`
+  (`boolBitOp`: integer `BitAnd | BitOr | BitXor` on the `transmute::<u8>`
+  views, transmuted back to `bool`), and a `bool` constant to `Constant::Bool`;
+* for a `core::cmp::Ordering` `_i`: `_i = Use(copy _j | move _j)` of an
+  `Ordering` local, and the three-way comparison `_i = BinaryOp(Cmp, opL, opR)`
+  of two integer operands of one type or two `bool` operands. MiniRust's
+  `RelOp::Cmp` returns the `i8` `-1`, `0`, or `1`, and `minimize` transmutes it
+  to its translation of `Ordering` (`orderingTy`: a one-byte `Type::Enum` with a
+  directly encoded `i8` tag, built as `translate_enum` does for
+  `#[repr(i8)] enum Ordering { Less = -1, Equal = 0, Greater = 1 }`), so the
+  tag is re-validated by `decode_discriminant`;
+* for a 2-tuple `(Int, bool)` `_i`: `_i = Use(copy _j | move _j)` of a
+  `(Int, bool)` local of the same type,
+  `_i = BinaryOp(AddWithOverflow | SubWithOverflow | MulWithOverflow, opL, opR)`
+  with two integer operands `opL`, `opR` of type `Int` (`BinOp::IntWithOverflow`),
+  and `_i = Aggregate(AggregateKind::Tuple, [opInt, opBool])` (`ValueExpr::Tuple`
+  at `IntType::with_overflow`); field projections `_j.0` and `_j.1` translate to
+  `PlaceExpr::Field(PlaceExpr::Local(_j), 0)` and `PlaceExpr::Field(PlaceExpr::Local(_j), 1)`;
+* terminators are `Goto`, `SwitchInt` on any integer or `bool` fragment operand
+  (`copy _j`, `move _j`, `copy (_j.0)`, `move (_j.0)`, `copy (_j.1)`,
+  `move (_j.1)`, or constant) with distinct in-range values (`minimize` switches
+  on `transmute::<u8>(b)` for a `bool`), `Return`, and `Unreachable`; all
   targets are blocks of the body; no cleanup blocks.
 
 ### States
@@ -172,16 +249,22 @@ restricted to the fragment checked by `inFragment`:
 within MIR blocks) and `StartRel body f ctx s mInit` (for entry at `minimize`'s
 synthesized `f.start` block without requiring a phantom `bb0` machine): the
 MiniRust machine has one enabled thread whose stack is `[caller, callee]`; the
-callee runs `f` at the corresponding program point; every MIR local `_i` is a
-live MiniRust local pointing to its own `Stack` allocation whose bytes are the
-encoding of Anneal's slot (`Uninit` bytes for an uninitialized slot,
-little-endian bytes for an initialized scalar); the caller's return place is a
-live, large-enough, aligned allocation (`CtxOk`); and Anneal's memory has no
-borrows, protectors, call stack, or caller-owned referents. `ctx` fixes
-everything the callee does not determine: caller frame, unwind payloads, the
-allocations below the callee's locals, the locals' addresses (arbitrary,
-subject only to alignment, so every MiniRust address choice is covered), and
-the caller's continuation.
+callee runs `f` at the corresponding program point; a MIR local `_i` is in the
+callee's locals map exactly when Anneal's slot is live (or `_i` is a
+temporary that the init block allocated), pointing to its own `Stack`
+allocation whose bytes are the encoding of a slot (`Uninit` bytes for an
+uninitialized slot, little-endian bytes for an initialized scalar, only `0` or
+`1` for an initialized `bool`, and only the tags `255`, `0`, or `1` for an
+initialized `Ordering`, so that the byte decodes at the local's MiniRust type;
+`LocalsOk`); MiniRust's bytes encode Anneal's slots except for locals that
+Anneal's `move` de-initialized and that `movesOk` keeps unread (`StaleOk`); the
+caller's return place is a live, large-enough, aligned allocation and the
+caller's allocations lie below `2^32`, clear of `BM.pickAddr`'s candidates
+(`CtxOk`); and Anneal's memory has no borrows, protectors, call stack, or
+caller-owned referents. `ctx` fixes everything the callee does not determine:
+caller frame, unwind payloads, the allocations below the callee's locals, the
+addresses of the return place and the arguments (arbitrary below `2^32`,
+subject to alignment), and the caller's continuation.
 
 ### Theorems
 
@@ -198,11 +281,19 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
   the caller (`ReturnRel`); Anneal UB matches MiniRust UB (`throw_ub!`, never a
   spec panic, deadlock, or unsupported construct); every other Anneal outcome,
   including `unsupported`, is impossible.
-* `step_initBlock`, `step_start`, `initMachineState_startRel`
-  (`Simulation.lean`): proves for every translated function `f` that
-  `initMachineState body args` (with `argsOk body args = true` and `CtxOk body ctx`)
-  satisfies `StartRel` at `f.start`, and that `minimize`'s synthesized entry
-  block (`f.start = bbName body.basicBlocks.length`) steps in 1 step (`Goto bb0`)
+* `iterMovedEntries_stabilizes`, `movesOk_iff_blockMovesOk`,
+  `movedAtEntry_least`, `blockMovesOk_antitone`, `movesOk_of_preFixedPoint`,
+  `movesOk_iff_exists_preFixedPoint` (`Simulation.lean`): unconditional
+  finite-fuel stabilization of forward CFG move propagation (`movedAtEntry`),
+  Knaster–Tarski least fixed-point optimality, antitonicity of `blockMovesOk`,
+  and Park-induction soundness and completeness for inductive pre-fixed-point
+  certificates on well-typed CFGs.
+* `step_start`, `initMachineState_startRel` (`Simulation.lean`): proves for
+  every translated function `f` that `initMachineState body args` (with
+  `argsOk body args = true` and `CtxOk body ctx`) satisfies `StartRel` at
+  `f.start`, and that `minimize`'s synthesized entry block
+  (`f.start = bbName body.basicBlocks.length`: `StorageLive` of each temporary
+  of `alwaysStorageLiveLocals`, then `Goto(bb0)`) runs in `initLen body` steps
   to `StateRel`.
 * `run_ret`, `run_ub`, `run_ret_from_start`, `run_ub_from_start`,
   `mirCall_ret`, `mirCall_ub` (`Run.lean`): lifted to Anneal's interaction
@@ -237,6 +328,65 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
 `Correspondence/Witness.lean` discharges every hypothesis for concrete
 programs, computing both semantics in the kernel (`decide`/`rfl`, no
 `native_decide`):
+
+* `tempMove`, `crossBlockMove`, `loopTempMove`, `storageLiveArgRet`,
+  `diamondMoveJoin`, `tupleAggCastMove`, and `ordBoolCastTempMove` (MR-1.3):
+  `tempMove` is
+  `fn(x: u32) -> u32 { let y = (x + 1) * 2; if y == 8 { 100 } else { y } }`
+  with `u32` and `bool` temporaries, `StorageLive`/`StorageDead`, root `move`
+  in a `BinaryOp`, a `Use`, and a `switchInt` discriminant, `Deinit` of a
+  moved-from temporary, and an unused temporary `_4` that the init block
+  allocates (`tempMove3_*`, `tempMove2_*`, including `StorageLive` reusing the
+  first-fit address that `StorageDead` released); `crossBlockMove` is a 4-block
+  CFG exercising forward dataflow `movesOk` (`movedAtEntry`) across `Goto` and
+  `SwitchInt` edges, moving the incoming argument `_1`, projected tuple moves
+  `move (_2.0)` and `move (_2.1)` on a `(u32, bool)` temporary, `StorageLive`
+  re-allocating already-live locals, `Deinit` of a `(u32, bool)` tuple, and
+  idempotent `StorageDead` (`crossBlockMove20_*`, `crossBlockMoveOv_*`);
+  `loopTempMove` is a cyclic 4-block loop CFG with two heterogeneous unmarked
+  temporaries (`alwaysStorageLiveLocals = [4, 5]`, `initLen = 3`), multi-pass
+  back-edge fixpoint convergence of `iterMovedEntries`, per-iteration
+  `StorageLive`/`StorageDead`/`Deinit`/`SwitchInt(move _3)`, live re-allocation
+  of `_2`, and idempotent `StorageDead(_2)` on `n = 0` (`loopTempMove3_*`,
+  `loopTempMove0_*`); `storageLiveArgRet` re-allocates an argument local `_1`
+  and the return place `_0` via `StorageLive` from their initial `< 2^32`
+  addresses onto first-fit `allocCandidate` addresses before returning;
+  `diamondMoveJoin` merges asymmetric moved-out sets across a 4-block diamond
+  CFG (`movedAtEntry` joining outgoing `[1]` and `[2, 1]` to `[1, 2]` at `bb3`)
+  while returning a join-initialized temporary (`diamondMoveJoinTrue_*`,
+  `diamondMoveJoinFalse_*`); `tupleAggCastMove` exercises `Operand::Move`
+  inside `Rvalue::UnaryOp(Neg, move _1)`,
+  `Rvalue::Cast(IntToInt, move _2, u32)`, `Rvalue::UnaryOp(Not, move _4)`
+  (self-assign move), `Rvalue::Aggregate(Tuple, [move _3, move _4])`, and
+  projected field move `Use(move (_5.0))` (`tupleAggCastMoveNeg5_*`, plus
+  `ctx0_ok_trailing_temp_addrs` witnessing that `CtxOk.addrs` constrains only
+  `i ≤ argCount`); `ordBoolCastTempMove` exercises `Cast(IntToInt, move _3,
+  u32)` from a moved `bool`, `SwitchInt(move _4)`, and `StorageLive`,
+  `BinaryOp(Cmp, move _, move _)`, `Use(move _5)`, `Deinit`, and `StorageDead`
+  on a `core::cmp::Ordering` temporary local reusing `_4`'s freed `2^32` slot,
+  together with a concrete Park-induction certificate witness
+  (`ordBoolCastTempMove_movesOk_by_preFixedPoint`, `ordBoolCastTempMoveTrue_*`,
+  `ordBoolCastTempMoveFalse_*`); `deadRead`, `deadAssign`, `deadDeinit`, and
+  `deadPlaceMention` access a local (including projected `PlaceMention(_1.0)`)
+  after `StorageDead` (UB in both models via `mirCall_ub`,
+  `mirCall_steps_error`, `mirCall_outcome`, and direct runs); `moveReuse`,
+  `crossBlockMoveReuse`, `loopBackEdgeReuse`, `projAssignMoveReuse`,
+  `projFieldMoveReuse`, `sameRvalueMoveReuse`, `moveRetPlace`, and
+  `diamondHalfMoveReuse` read a local after moving out of it — across
+  statements, blocks, cyclic back-edges, projected assignments, projected
+  field reads after a root tuple move, operands of a single rvalue (`readsOk`),
+  `Return` (`termReadsOk`), and one-armed diamond merges — rejected by `movesOk`
+  with concrete semantic disagreements (`moveReuse7_*`, `loopBackEdgeReuse1_*`,
+  `projFieldMoveReuse_*`, `sameRvalueMoveReuse5_*`, `moveRetPlace_*`,
+  `diamondHalfMoveReuseFalse_*`); `unmarkedTempAssign`, `storageDeadRet`,
+  `storageDeadArg`, `storageDeadArgReadAfter`, and `projectedDeinit` exercise
+  the soundness and well-formedness boundaries of `mentionsOk`, `storageDeadOk`
+  (for both `_0` and arguments), and projection-free `Deinit` with concrete
+  execution and UB witnesses; and `bm_allocate_and_deallocate_ub_cases` /
+  `evalStatement_deinit_ok_dead_and_misaligned` directly verify the UB and
+  normal paths of `BM.allocate`, `BM.deallocate` (including exact
+  `AllocationKind` diagnostic formatting across all five `AllocationKind`
+  variants), and `Statement::Deinit`.
 
 * `sumTo`, the MIR of a `u32` loop with `switchInt`, wrapping `Add`/`Sub`,
   constants, and `Goto`: Anneal returns `6` for `n = 3`
@@ -324,16 +474,122 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   data in memory violates the language invariant"` UB), alongside ground-truth
   checks of all four `IntBinOp::DivExact` outcomes.
 
+* `cmpNotSwitch`, an `(i8, i8, bool) -> i8` body that compares integers with
+  signed `<` and `==`, negates a `bool` (`!b`, through `build::not`'s
+  transmutes), compares `bool`s (`b > false`), and branches with `SwitchInt` on
+  `bool` (through the transmute to `u8`) across four blocks: for
+  `(-1, 1, false)` both semantics return `-1i8` (`cmpNotNeg1_anneal_ret`,
+  `cmpNotNeg1_minirust_ret_from_start`, and the direct 9-step run
+  `cmpNotNeg1_minirust_direct`), which an unsigned comparison of the bit
+  patterns would get wrong; for `(3, 2, true)` both return `2i8`
+  (`cmpNot3_*`).
+* `leNeGe`, a `(u8, u8) -> bool` body whose `bool` return place is also the
+  `SwitchInt` scrutinee, exercising `<=`, `!=`, `>=`, and `bool` returns
+  (`leNeGe250_*` returns `true`, `leNeGe5_*` returns `false`).
+* `boolCastI8`, a `bool -> i8` body exercising `Cast(CastKind::IntToInt)` on
+  `bool` across both `true` and `false` branches, plus `argsOk` rejection of
+  the invalid `bool` byte `2` (`boolCastTrue_*`, `boolCastFalse_*`,
+  `boolCastInvalidArg_rejected`).
+* `uninitBool`, `uninitBoolNot`, `uninitBoolRel`, `uninitBoolBitAnd`, and
+  `uninitBoolBitOrRhs`, whose `SwitchInt`, `UnaryOp(Not)`, `BinaryOp(Eq)`,
+  `BinaryOp(BitAnd)` (uninitialized LHS), and `BinaryOp(BitOr)` (`const true`
+  LHS, uninitialized RHS — confirming MIR `BitOr` on `bool` does not
+  short-circuit) on an uninitialized `bool` are UB in both semantics
+  (`uninitBool*_minirust_ub_from_start`, `uninitBool*_minirust_direct`).
+* `cmpSel` and `boolBitOrdUse`, `(i8, i8, bool) -> Ordering` and
+  `(bool, u8, Ordering) -> Ordering` bodies that switch on `bool` (including
+  `PlaceMention(_0)` on the uninitialized `Ordering` return place and
+  `build::bool_and`, `build::bool_or`, and `build::bool_xor` in
+  `boolBitOrdUse`) and return signed `i8` `Cmp`, unsigned `u8` `Cmp`
+  (`255u8.cmp(&1u8) = Greater`), `bool` `Cmp`, or `Use(copy _3)` of an
+  `Ordering` argument (`cmpSelLess_*`, `cmpSelEqual_*`, `cmpSelGreater_*`,
+  `boolBitOrdUseCmp_*`, `boolBitOrdUseCopy_*`, and `argsOk` rejection of
+  invalid `Ordering` tag bytes `2` and `128` in `boolBitOrdInvalidTag_rejected`);
+  and `uninitOrdering`, whose return of an uninitialized `Ordering` is UB in
+  both semantics (`uninitOrdering_*`).
+* `checkedArithI8`, a signed `i8` body with a `(i8, bool)` local `_3` and a
+  `bool` local `_4`, exercising `AddWithOverflow`, `SubWithOverflow`, and
+  `MulWithOverflow`, field projections `_3.0` and `_3.1` in `Use`, `BinaryOp`,
+  `UnaryOp`, and `SwitchInt`, across no-overflow inputs (`checkedArithOk_*`),
+  `INT_MAX + 1` (`127i8 + 1i8 = (-128i8, true)`, `checkedArithAddOv_*`),
+  `INT_MIN - 1` (`-128i8 - 1i8 = (127i8, true)`, `checkedArithSubOv_*`), and
+  signed multiplication overflow (`64i8 * 2i8 = (-128i8, true)`,
+  `checkedArithMulOv_*`), plus `argsOk` rejection of an invalid `bool` byte in
+  a tuple argument (`checkedArithInvalidTupleArg_rejected`).
+* `checkedTupleU32`, a `(u32, u32) -> (u32, bool)` body returning a padded
+  8-byte `(u32, bool)` 2-tuple in `_0`, exercising `PlaceMention(_0)`,
+  `PlaceMention(_0.0)`, and `PlaceMention(_0.1)` on the uninitialized tuple
+  return place, unsigned `0u32 - 1u32 = (u32::MAX, true)`
+  underflow followed by `u32::MAX + 1u32 = (0u32, true)` overflow
+  (`checkedTupleUnderAddOv_*`), unsigned multiplication overflow
+  `65536u32 * 65536u32 = (0u32, true)` and `Aggregate(Tuple, [copy (_0.0), copy (_0.1)])`
+  (`checkedTupleMulOv_*`), and no-overflow execution (`checkedTupleOk_*`),
+  writing 4-byte `u32` at offset `0`, 1-byte `bool` at offset `4`, and 3
+  trailing `AbstractByte::Uninit` padding bytes at offsets `5..8`; plus
+  `uninitTupleField0` and `uninitTupleField1`, whose reads of `_0.0` and `_0.1`
+  from an uninitialized `(u32, bool)` local raise UB in both semantics (with
+  converse error soundness `uninitTupleField0_converse_error` via
+  `mirCall_steps_error` and total outcome trichotomy `uninitTupleField1_outcome`
+  via `mirCall_outcome`).
+* Ground-truth checks of the interpreted operators: signed and unsigned
+  `BinOp::Rel`, `RelOp::Cmp` returning `i8`, `bool` ordering, a value-type
+  mismatch being a spec panic, `CastOp::Transmute` between `bool` and `u8`
+  (including the invalid byte `2` and a size mismatch, both UB),
+  `Type::Bool` decoding, `UnOp::Int` on a `bool` being a spec panic
+  (`relLt_signed`, ..., `bitNot_bool_panics`), `IntType::with_overflow` layouts
+  and encodings on `i8` and `u32`, `TupleHeadLayout::full_size_and_align` and
+  `LayoutStrategy::compute_size_and_align` on sized and unsized layouts,
+  `BinOp::IntWithOverflow` on `INT_MAX + 1`, `INT_MIN - 1`, `UINT_MAX + 1`,
+  `0 - 1`, multiplication overflow, and a non-integer operand (`specPanic`),
+  `Machine::ptr_offset_inbounds` in-bounds and out-of-bounds UB,
+  `ValueExpr::Tuple`, and `PlaceExpr::Field` (including `Type::Union` field
+  projections, `specPanic`s on invalid field indices, missing unsized tail,
+  out-of-bounds field offset, and non-projectable types, and
+  `IntType::with_overflow` / `BinOp::IntWithOverflow` across `u8`, `i8`, `i16`,
+  `u16`, `i32`, `u32`, `i64`, `u64`, `i128`, and `u128`;
+  `withOverflow_i8_layout`, ..., `evalPlace_field_union_and_offset_panic`); and of
+  the representation of
+  enums, tuples, unions, slices, and trait objects: exactly the bytes `0`, `1`,
+  `255` are valid at `orderingTy` (`ordering_validTags`), decoding, encoding,
+  `check_value`, and transmutes at `orderingTy` (including invalid tags, an
+  `Uninit` byte, and `decode_discriminant` short-circuiting before its
+  `fallback` continuation in `decodeDiscriminant_short_circuits`), a padded
+  `(i8, bool)` tuple whose size rounds up to its alignment and whose padding
+  encodes as `Uninit` and is ignored by decoding (`decode_ordering_less`, ...,
+  `checkValue_tuple_arity`), `Type::Union` chunk decoding, encoding,
+  `check_value`, and `CastOp::Transmute` round-tripping with `paddedPairTy`
+  (including UB when an `Uninit` union chunk overlaps a non-padding tuple
+  field; `layout_union`, `decode_union`, `encode_union`,
+  `checkValue_union_chunk_size`, `checkValue_union_chunk_data`,
+  `transmute_union_paddedPair`, `transmute_paddedPair_union`,
+  `transmute_union_paddedPair_uninit_ub`), and unsized `Slice`, `TraitObject`,
+  and unsized `Tuple` layouts and `specPanic`s (`layout_slice`, ...,
+  `checkValue_unsized_panics`).
+
+`Audit.lean` logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, and
+`[WITNESS-AUDIT]` lines ending in `sorry_free=true` (via
+`#check_theorem_deps`, which also rejects duplicate declaration names and
+non-`theorem` constants) and fails the build if any listed declaration depends
+on `sorryAx` or a non-standard axiom.
+
 ### Gaps
 
 These are deliberate and are the first things to lift:
 
-* **`Operand::Move` is excluded.** `minimize` translates `Move` exactly like
-  `Copy`, whereas Anneal de-initializes the moved-from place, so the models
-  disagree on later reads of a moved-from local.
-* **Only the return place and arguments.** Bodies with other locals need
-  `StorageLive`/`StorageDead` (and `minimize`'s init block would allocate
-  some of them), which the fragment and the interpretation do not cover.
+* **Moves are checked path-insensitively over the CFG.** `movesOk` propagates
+  possibly moved-out locals forward from `[]` at `bb0` across `Goto` and
+  `SwitchInt` edges (`movedAtEntry`), taking the union at control-flow merges; a
+  body that moves out of a local on only one incoming branch and reads it after
+  the merge without re-initializing it on that branch is rejected unless branch
+  correlation is tracked. Only root moves de-initialize in Anneal; projected
+  moves read like copies.
+* **Temporaries of the init block are never mentioned.** Anneal keeps a
+  temporary without storage markers dead, whereas `minimize`'s init block
+  allocates it, so the fragment requires that the body never mentions one.
+* **One resolution of the address choice.** `BasicMemory::allocate`'s `pick`
+  is resolved by first fit over the multiples of `2^32`; results hold for that
+  resolution, which the fragment cannot observe (it has no pointer-to-integer
+  casts or pointer comparisons).
 * **One thread, called from a caller frame.** MiniRust makes it UB for the
   bottom frame of the main thread to return, while Anneal's root body returns
   normally, so the relation places the callee above an arbitrary caller. What
@@ -343,9 +599,16 @@ These are deliberate and are the first things to lift:
 * **Branch observations.** Anneal's `switchInt` emits the scrutinee as a
   visible leakage event; MiniRust has no counterpart, so `StepRel` matches it
   with an ordinary MiniRust step.
-* **Integers only.** No `bool` discriminants (`minimize` inserts a transmute),
-  no pointers, references, aggregates, non-integer casts, comparisons,
-  checked arithmetic, calls, drops, or assertions.
+* **Integers, `bool`, `Ordering`, and `(Int, bool)` 2-tuples only.** An
+  `Ordering` local is written by `Cmp` or `Use(copy _j)` and read by `Use` or
+  `Return` (no `Ordering` constants, `Discriminant`, or `SwitchInt` on it);
+  `Type::Enum` and `Type::Union` are interpreted only as representations
+  (layout, `decode`, `encode`, `check_value`), without `ValueExpr::{Union,
+  Variant, GetDiscriminant}`, `Statement::SetDiscriminant`, or downcast
+  projections, and `Type::Tuple` / `ValueExpr::Tuple` / `PlaceExpr::Field` are
+  connected to the correspondence for `(Int, bool)` 2-tuples (not general nested
+  tuples or field-wise writes `_i.0 = ...`). There are no pointers, references,
+  other aggregates, other casts, calls, drops, or assertions.
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.

@@ -54,16 +54,172 @@ theorem localName_inj (a b : Nat) : localName a = localName b ↔ a = b := by
 theorem bbName_inj (a b : Nat) : bbName a = bbName b ↔ a = b := by
   simp [bbName]
 
+/-! ## Fragment types -/
+
+theorem intTypeOf_isBoolTy {t : MirAst.Ty} {it : Gen.IntType} (h : intTypeOf t = some it) :
+    isBoolTy t = false := by
+  unfold intTypeOf intTyBytes at h
+  unfold isBoolTy
+  split at h <;> simp_all
+
+theorem isBoolTy_intTypeOf {t : MirAst.Ty} (h : isBoolTy t = true) : intTypeOf t = none := by
+  unfold isBoolTy at h
+  unfold intTypeOf intTyBytes
+  split at h <;> simp_all
+
+theorem intTypeOf_isOrderingTy {t : MirAst.Ty} {it : Gen.IntType} (h : intTypeOf t = some it) :
+    isOrderingTy t = false := by
+  unfold intTypeOf intTyBytes at h
+  unfold isOrderingTy
+  split at h <;> simp_all
+
+theorem isOrderingTy_intTypeOf {t : MirAst.Ty} (h : isOrderingTy t = true) : intTypeOf t = none := by
+  unfold isOrderingTy at h
+  unfold intTypeOf intTyBytes
+  split at h <;> simp_all
+
+theorem isOrderingTy_isBoolTy {t : MirAst.Ty} (h : isOrderingTy t = true) : isBoolTy t = false := by
+  unfold isOrderingTy at h
+  unfold isBoolTy
+  split at h <;> simp_all
+
+theorem intTypeOf_intBoolTupleOf {t : MirAst.Ty} {it : Gen.IntType} (h : intTypeOf t = some it) :
+    intBoolTupleOf t = none := by
+  unfold intTypeOf intTyBytes at h
+  unfold intBoolTupleOf
+  split at h <;> simp_all
+
+theorem intBoolTupleOf_intTypeOf {t : MirAst.Ty} {it : Gen.IntType}
+    (h : intBoolTupleOf t = some it) : intTypeOf t = none := by
+  unfold intBoolTupleOf at h
+  unfold intTypeOf intTyBytes
+  split at h <;> simp_all
+
+theorem intBoolTupleOf_isBoolTy {t : MirAst.Ty} {it : Gen.IntType}
+    (h : intBoolTupleOf t = some it) : isBoolTy t = false := by
+  unfold intBoolTupleOf at h
+  unfold isBoolTy
+  split at h <;> simp_all
+
+theorem isBoolTy_intBoolTupleOf {t : MirAst.Ty} (h : isBoolTy t = true) :
+    intBoolTupleOf t = none := by
+  unfold isBoolTy at h
+  unfold intBoolTupleOf
+  split at h <;> simp_all
+
+theorem intBoolTupleOf_isOrderingTy {t : MirAst.Ty} {it : Gen.IntType}
+    (h : intBoolTupleOf t = some it) : isOrderingTy t = false := by
+  unfold intBoolTupleOf at h
+  unfold isOrderingTy
+  split at h <;> simp_all
+
+theorem isOrderingTy_intBoolTupleOf {t : MirAst.Ty} (h : isOrderingTy t = true) :
+    intBoolTupleOf t = none := by
+  unfold isOrderingTy at h
+  unfold intBoolTupleOf
+  split at h <;> simp_all
+
+theorem scalarTypeOf_int {t : MirAst.Ty} {it : Gen.IntType} (h : intTypeOf t = some it) :
+    scalarTypeOf t = some (.Int it) := by
+  simp [scalarTypeOf, intTypeOf_isBoolTy h, intTypeOf_isOrderingTy h, intTypeOf_intBoolTupleOf h, h]
+
+theorem scalarTypeOf_bool {t : MirAst.Ty} (h : isBoolTy t = true) : scalarTypeOf t = some .Bool := by
+  simp [scalarTypeOf, h]
+
+theorem scalarTypeOf_ordering {t : MirAst.Ty} (h : isOrderingTy t = true) :
+    scalarTypeOf t = some orderingTy := by
+  simp [scalarTypeOf, h, isOrderingTy_isBoolTy h]
+
+theorem scalarTypeOf_tuple {t : MirAst.Ty} {it : Gen.IntType} (h : intBoolTupleOf t = some it) :
+    scalarTypeOf t = some (intBoolTupleTy it) := by
+  simp [scalarTypeOf, intBoolTupleOf_isBoolTy h, intBoolTupleOf_isOrderingTy h, h]
+
+/-- A fragment type is `bool`, an integer type, `core::cmp::Ordering`, or a
+2-tuple `(Int, bool)`. -/
+theorem scalarTypeOf_cases {t : MirAst.Ty} {T : Gen.Type} (h : scalarTypeOf t = some T) :
+    (isBoolTy t = true ∧ T = .Bool) ∨ (∃ it, intTypeOf t = some it ∧ T = .Int it) ∨
+      (isOrderingTy t = true ∧ T = orderingTy) ∨
+      (∃ it, intBoolTupleOf t = some it ∧ T = intBoolTupleTy it) := by
+  unfold scalarTypeOf at h
+  cases hb : isBoolTy t with
+  | true => simp [hb] at h; exact .inl ⟨rfl, h.symm⟩
+  | false =>
+    simp only [hb, Bool.false_eq_true, ↓reduceIte] at h
+    cases ho : isOrderingTy t with
+    | true => simp [ho] at h; exact .inr (.inr (.inl ⟨rfl, h.symm⟩))
+    | false =>
+      simp only [ho, Bool.false_eq_true, ↓reduceIte] at h
+      cases htup : intBoolTupleOf t with
+      | some it => simp [htup] at h; exact .inr (.inr (.inr ⟨it, rfl, h.symm⟩))
+      | none =>
+        simp only [htup] at h
+        cases hit : intTypeOf t with
+        | none => simp [hit] at h
+        | some it => simp [hit] at h; exact .inr (.inl ⟨it, rfl, h.symm⟩)
+
+theorem tyOf_int {d : LocalDecl} {it : Gen.IntType} (h : intTypeOf d.ty = some it) :
+    tyOf d = .Int it ∧ itOf d = it := by
+  simp [tyOf, itOf, scalarTypeOf_int h, h]
+
+theorem tyOf_bool {d : LocalDecl} (h : isBoolTy d.ty = true) : tyOf d = .Bool ∧ itOf d = u8Ty := by
+  simp [tyOf, itOf, scalarTypeOf_bool h, isBoolTy_intTypeOf h, isBoolTy_intBoolTupleOf h, u8Ty]
+
+theorem tyOf_ordering {d : LocalDecl} (h : isOrderingTy d.ty = true) :
+    tyOf d = orderingTy ∧ itOf d = u8Ty := by
+  simp [tyOf, itOf, scalarTypeOf_ordering h, isOrderingTy_intTypeOf h, isOrderingTy_intBoolTupleOf h, u8Ty]
+
+theorem tyOf_tuple {d : LocalDecl} {it : Gen.IntType} (h : intBoolTupleOf d.ty = some it) :
+    tyOf d = intBoolTupleTy it ∧ itOf d = it := by
+  simp [tyOf, itOf, scalarTypeOf_tuple h, intBoolTupleOf_intTypeOf h, h]
+
+@[simp] theorem tupleIntOfTy_intBoolTupleTy (it : Gen.IntType) :
+    tupleIntOfTy (intBoolTupleTy it) = some it := by
+  simp [intBoolTupleTy, tupleIntOfTy]
+
+@[simp] theorem tupleIntOfTy_int (it : Gen.IntType) : tupleIntOfTy (.Int it) = none := rfl
+@[simp] theorem tupleIntOfTy_bool : tupleIntOfTy .Bool = none := rfl
+@[simp] theorem tupleIntOfTy_orderingTy : tupleIntOfTy orderingTy = none := rfl
+
+theorem declSlotData_of_none {d : LocalDecl} (h : intBoolTupleOf d.ty = none) (slot : LocalSlot) :
+    declSlotData d slot = slotData (itOf d) slot := by
+  simp [declSlotData, h]
+
+theorem declSlotData_of_some {d : LocalDecl} {it : Gen.IntType} (h : intBoolTupleOf d.ty = some it)
+    (slot : LocalSlot) : declSlotData d slot = tupleSlotData it slot := by
+  simp [declSlotData, h]
+
+/-- `2-tuple` constants are outside the fragment: `translateOperand` reads
+only integer and `bool` scalars. -/
+theorem translateOperand_tuple_const {c : ConstOperand} {it : Gen.IntType}
+    (ht : intBoolTupleOf c.ty = some it) : translateOperand (.constant c) = none := by
+  simp only [translateOperand, intBoolTupleOf_isBoolTy ht, Bool.false_eq_true, ↓reduceIte,
+    intBoolTupleOf_intTypeOf ht]
+  split <;> simp_all
+
+/-- `Ordering` constants are outside the fragment: `translateOperand` reads
+only integer and `bool` scalars. -/
+theorem translateOperand_ordering_const {c : ConstOperand} (ho : isOrderingTy c.ty = true) :
+    translateOperand (.constant c) = none := by
+  simp only [translateOperand, isOrderingTy_isBoolTy ho, Bool.false_eq_true, ↓reduceIte,
+    isOrderingTy_intTypeOf ho]
+  split <;> simp_all
+
+/-- `tyOf` is the translated type of a fragment local. -/
+theorem tyOf_of_scalarTypeOf {d : LocalDecl} {T : Gen.Type} (h : scalarTypeOf d.ty = some T) :
+    tyOf d = T := by
+  simp [tyOf, h]
+
+
 /-! ## `translateFn` -/
 
 theorem translateLocals_get (k : Nat) (ds : List LocalDecl) (L : List (Gen.LocalName × Gen.Type))
     (h : translateLocals k ds = some L) (j : Nat) (d : LocalDecl) (hd : ds[j]? = some d) :
-    ∃ it, intTypeOf d.ty = some it ∧ mapGet ⟨L⟩ (localName (k + j)) = some (.Int it) := by
+    ∃ T, scalarTypeOf d.ty = some T ∧ mapGet ⟨L⟩ (localName (k + j)) = some T := by
   induction ds generalizing k L j with
   | nil => simp at hd
   | cons d' ds ih =>
     simp only [translateLocals, Option.bind_eq_bind] at h
-    cases hit : intTypeOf d'.ty with
+    cases hit : scalarTypeOf d'.ty with
     | none => simp [hit] at h
     | some it' =>
       cases hrest : translateLocals (k + 1) ds with
@@ -117,7 +273,7 @@ theorem translateBlocks_get (decls : List LocalDecl) (k : Nat) (bbs : List Basic
 theorem translateFn_spec (body : CapturedMir) (f : Gen.Function) (h : translateFn body = some f) :
     f.ret = localName 0 ∧
     (∀ (i : Nat) d, body.localDecls[i]? = some d →
-      intTypeOf d.ty = some (itOf d) ∧ mapGet f.locals (localName i) = some (.Int (itOf d))) ∧
+      scalarTypeOf d.ty = some (tyOf d) ∧ mapGet f.locals (localName i) = some (tyOf d)) ∧
     (∀ (i : Nat) bb, body.basicBlocks[i]? = some bb →
       ∃ tb, translateBlock body.localDecls bb = some tb ∧ mapGet f.blocks (bbName i) = some tb) := by
   simp only [translateFn, Option.bind_eq_bind] at h
@@ -131,9 +287,8 @@ theorem translateFn_spec (body : CapturedMir) (f : Gen.Function) (h : translateF
       subst h
       refine ⟨rfl, ?_, ?_⟩
       · intro i d hd
-        obtain ⟨it, hit, hget⟩ := translateLocals_get 0 body.localDecls L hL i d hd
-        have : itOf d = it := by simp [itOf, hit]
-        rw [this]; refine ⟨hit, ?_⟩
+        obtain ⟨T, hT, hget⟩ := translateLocals_get 0 body.localDecls L hL i d hd
+        rw [tyOf_of_scalarTypeOf hT]; refine ⟨hT, ?_⟩
         simpa using hget
       · intro i bb hbb
         obtain ⟨tb, htb, hget⟩ := translateBlocks_get body.localDecls 0 body.basicBlocks B hB i bb hbb
@@ -143,8 +298,8 @@ theorem translateFn_spec (body : CapturedMir) (f : Gen.Function) (h : translateF
 
 theorem translateBlocks_append_get (decls : List LocalDecl) (k : Nat) (bbs : List BasicBlockData)
     (B : List (Gen.BbName × Gen.BasicBlock)) (h : translateBlocks decls k bbs = some B)
-    (m : Nat) (hm : k + bbs.length ≤ m) :
-    mapGet ⟨B ++ [(bbName m, initBlock)]⟩ (bbName m) = some initBlock := by
+    (m : Nat) (hm : k + bbs.length ≤ m) (ib : Gen.BasicBlock) :
+    mapGet ⟨B ++ [(bbName m, ib)]⟩ (bbName m) = some ib := by
   induction bbs generalizing k B with
   | nil => simp [translateBlocks] at h; subst h; simp [mapGet_cons]
   | cons bb bbs ih =>
@@ -166,7 +321,7 @@ theorem translateBlocks_append_get (decls : List LocalDecl) (k : Nat) (bbs : Lis
 that name to `initBlock` (`Goto(bb0)`). -/
 theorem translateFn_start (body : CapturedMir) (f : Gen.Function) (h : translateFn body = some f) :
     f.start = bbName body.basicBlocks.length ∧
-    mapGet f.blocks (bbName body.basicBlocks.length) = some initBlock := by
+    mapGet f.blocks (bbName body.basicBlocks.length) = some (initBlock body) := by
   simp only [translateFn, Option.bind_eq_bind] at h
   cases hL : translateLocals 0 body.localDecls with
   | none => simp [hL] at h
@@ -177,6 +332,6 @@ theorem translateFn_start (body : CapturedMir) (f : Gen.Function) (h : translate
       simp [hL, hB] at h
       subst h
       exact ⟨rfl, translateBlocks_append_get body.localDecls 0 body.basicBlocks B hB
-        body.basicBlocks.length (by omega)⟩
+        body.basicBlocks.length (by omega) (initBlock body)⟩
 
 end MiniRustSpec.Correspondence
