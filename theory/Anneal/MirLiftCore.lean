@@ -287,7 +287,7 @@ theorem LiftStmtsTerminator.nil_call {body : CapturedMir} {bbIdx : BasicBlockIdx
     dsimp [evalNodeWP]
     exact h_next
 
-theorem LiftStmtsTerminator.cons {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv} {stmt : Statement} {stmts : List Statement} {term : Terminator} {post : Value → Prop} {fuel : Nat}
+theorem LiftStmtsTerminator.cons_eval {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv} {stmt : Statement} {stmts : List Statement} {term : Terminator} {post : Value → Prop} {fuel : Nat}
   (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some { statements := stmts, terminator := term, isCleanup := false })
   (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
   (h_get : Trusted.Sequence.get? stmts stmtIdx = some stmt)
@@ -312,5 +312,19 @@ theorem LiftStmtsTerminator.cons {body : CapturedMir} {bbIdx : BasicBlockIdx} {s
     rw [h_eq]
     dsimp [evalNodeWP]
     exact h_next
+
+theorem LiftStmtsTerminator.cons {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv} {stmt : Statement} {stmts : List Statement} {term : Terminator} {post : Value → Prop} {fuel : Nat}
+  (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some { statements := stmts, terminator := term, isCleanup := false })
+  (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+  (h_get : Trusted.Sequence.get? stmts stmtIdx = some stmt)
+  (h_stmt : LiftStmt body bbIdx stmtIdx env stmt (fun e => e = env'))
+  (h_next : LiftStmtsTerminator body bbIdx (stmtIdx + 1) env' stmts term post fuel) :
+  LiftStmtsTerminator body bbIdx stmtIdx env stmts term post (fuel + 1) := by
+  cases h_stmt <;> rename_i h_eval h_p <;> cases h_p
+  · exact LiftStmtsTerminator.cons_eval h_bb h_phase h_get h_eval h_next
+  · exact LiftStmtsTerminator.cons_eval h_bb h_phase h_get h_eval h_next
+  · exact LiftStmtsTerminator.cons_eval h_bb h_phase h_get h_eval h_next
+  · exact LiftStmtsTerminator.cons_eval h_bb h_phase h_get h_eval h_next
+  · exact LiftStmtsTerminator.cons_eval h_bb h_phase h_get h_eval h_next
 
 
