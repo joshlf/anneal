@@ -52,6 +52,9 @@ This guide contains the step-by-step instructions for an independent adversary (
    *Expected Output*: `lake` finishes building `Anneal` and its dependencies without errors. You should see no `sorryAx` warnings for `theory/Anneal/PureMirExec.lean`.
 
 ## Proof Highlights
-- The core structural simulation lemma is `stepMirExecSymTree_eq_withMem`, proven by mutually recursive induction alongside `evalSymNodeTree_eq_withMem`.
+- The core structural simulation lemma is `wpMirExecSym_withMem_of_emptyMemory`, proven by induction over fuel, lifting evaluation from `emptyMemory` to arbitrary root-active `mem₀`.
 - All memory interactions in `PureState` are bypassed by matching directly against the syntactically restricted set of `checkPureMir`.
 - The multi-block `pureAdtMultiBlockBody` witness discharges a `StatefulVerificationResult` strictly via structural equality on `mem₀` across blocks, without constructing memory maps or provenance.
+
+## Audit Notes
+- `[diversity-reduced]`: This unit was evaluated under reduced model diversity (pinned to `gemini-pro-coordinator` / `gemini-3.1-pro-high`) due to quota constraints.
