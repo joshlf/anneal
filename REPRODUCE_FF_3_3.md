@@ -46,8 +46,8 @@ cd examples
 anneal-lean-run --mode build --concurrency 2 -- lake build Anneal
 ```
 
-This builds the frame-lifting rules (`LiftFrame`, `LiftResidualFrame`,
-`LiftStmtMem` / `LiftStmt.*`, and `LiftTerminator`) and the benchmarks in
+This builds the frame-lifting rules (`LiftFrame`, `LiftStmtMem` /
+`LiftStmt.*`, and `LiftTerminator`) and the benchmarks in
 `Anneal.MirLiftBench`:
 
 - `liftIndirectCaller_wpConverges`: the caller reifies the generic
@@ -87,13 +87,28 @@ The build runs:
 - `#mir_lift (callees := [liftPolyIdMir]) liftIndirectCallerMir`
 - `#mir_lift (callees := [liftPolyIdMir]) liftDirectCallerMir`
 - `#mir_lift (callees := liftPolyLayoutCallees) liftPolyLayoutCallerMir`
-- `#mir_lift (residual := true) multiCalleeBody` (residual frame lifting over
-  unlinked call blocks)
 
-Three `#guard_msgs` checks pin the axioms of the generated theorems to
+Each linked-callee `#mir_lift` defines `<item>_model` (the synthesized return
+value) and proves `<item>_lift_sound` (`MirWpConverges` from
+`initMachineStateWithCallees`) and `<item>_verified` (the trusted
+`VerificationResult` of the closed claim with the callees linked). Four
+`#guard_msgs` checks pin the axioms of generated theorems to
 `[propext, Classical.choice, Quot.sound]`, so the build fails if `sorryAx` or a
 custom axiom appears. The call-free `#mir_lift` tests from FF-3.2 run in the
 same module.
+
+The module also checks rejections. `lift_frame` fails without the linked
+callee, with a wrong expected value, and on the two signature-mismatch bodies
+in `Anneal.MirLiftBench` (`liftBadReifySigMir` reifies `lift_poly_id::<u32>`
+at `fn(u8) -> u8`; `liftBadCallSigMir` calls a `fn(u32) -> u32` through a local
+declared `fn(u8) -> u8`), which `liftBadReifySig_not_converges` and
+`liftBadCallSig_not_converges` prove are undefined behavior.
+`multiCalleeBody` calls a `u32` constant, which is also undefined behavior:
+`multiCalleeBody_not_converges` proves that it does not converge,
+`multiCalleeBody_residual_false` refutes the universally quantified residual
+hypothesis that a residual abstraction of its call block would assume, and a
+`#guard_msgs` check confirms that `#mir_lift (residual := true)` refuses bodies
+that need the memory-carrying mode.
 
 ## 5. Inspect the generated declarations (optional)
 

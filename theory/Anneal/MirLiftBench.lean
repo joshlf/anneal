@@ -278,7 +278,10 @@ theorem liftIndirectCaller_verified :
 def liftWrapperTTy : Ty :=
   { kind := .adt "ff33::Wrapper" [.param 0 "T"], layoutIdx := 1 }
 
-/-- `u32` at layout index `2` (distinct from `T` at `0` and `Wrapper<T>` at `1`). -/
+/--
+`u32` at layout index `2` (distinct from `T` at `0` and `Wrapper<T>` at
+`1`).
+-/
 def liftU32At2Ty : Ty := { kind := .uint .u32, layoutIdx := 2 }
 
 /-- Concrete 4-byte scalar layout for `u32`. -/
@@ -518,16 +521,19 @@ theorem liftPolyLayoutCaller_lift :
   -- `lift_poly_tail_apply::<u32>` bb0[1]: `StorageLive(_3)`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
-  -- `lift_poly_tail_apply::<u32>` bb0[2]: reify `lift_poly_id::<u32>` into `_2`.
+  -- `lift_poly_tail_apply::<u32>` bb0[2]: reify `lift_poly_id::<u32>` into
+  -- `_2`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
   apply LiftStmtMem.reifyFnPointer (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl)
-  -- `lift_poly_tail_apply::<u32>` bb0[3]: coerce `_2` to `unsafe fn(u32) -> u32`.
+  -- `lift_poly_tail_apply::<u32>` bb0[3]: coerce `_2` to
+  -- `unsafe fn(u32) -> u32`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
   apply LiftStmtMem.unsafeFnPointer (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl) (by rfl)
-  -- `lift_poly_tail_apply::<u32>` bb0 terminator: indirect `tailCall` to `lift_poly_id::<u32>`.
+  -- `lift_poly_tail_apply::<u32>` bb0 terminator: indirect `tailCall` to
+  -- `lift_poly_id::<u32>`.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
   apply LiftTerminator.tailCallIndirect (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
@@ -535,7 +541,8 @@ theorem liftPolyLayoutCaller_lift :
   -- `lift_poly_id::<u32>` bb0[0]: `_0 = move _1`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
-  -- `lift_poly_id::<u32>` bb0 terminator: return `7_u32` to `poly_layout_caller` at bb1.
+  -- `lift_poly_id::<u32>` bb0 terminator: return `7_u32` to
+  -- `poly_layout_caller` at bb1.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
   apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues]
@@ -557,13 +564,16 @@ theorem liftPolyLayoutCaller_lift :
   -- `lift_poly_wrapper_transmute::<u32>` bb0[0]: `StorageLive(_2)`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
-  -- `lift_poly_wrapper_transmute::<u32>` bb0[1]: `_2 = Wrapper::<u32>(move _1)`.
+  -- `lift_poly_wrapper_transmute::<u32>` bb0[1]:
+  -- `_2 = Wrapper::<u32>(move _1)`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
-  -- `lift_poly_wrapper_transmute::<u32>` bb0[2]: `_0 = move _2 as u32 (Transmute)`.
+  -- `lift_poly_wrapper_transmute::<u32>` bb0[2]:
+  -- `_0 = move _2 as u32 (Transmute)`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
-  -- `lift_poly_wrapper_transmute::<u32>` bb0 terminator: return `7_u32` into `_0` at bb3.
+  -- `lift_poly_wrapper_transmute::<u32>` bb0 terminator: return `7_u32` into
+  -- `_0` at bb3.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
   apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues]
@@ -572,7 +582,9 @@ theorem liftPolyLayoutCaller_lift :
   apply LiftTerminator.return_ (by rfl) (by rfl)
   rfl
 
-/-- Convergence of `liftPolyLayoutCallerMir` from the callee-aware initial state. -/
+/--
+Convergence of `liftPolyLayoutCallerMir` from the callee-aware initial state.
+-/
 theorem liftPolyLayoutCaller_wpConverges :
     MirWpConverges liftPolyLayoutCallerMir
       (initMachineStateWithCallees liftPolyLayoutCallerMir [] liftPolyLayoutCallees)
@@ -596,5 +608,82 @@ theorem liftPolyLayoutCaller_verified :
     VerificationResult liftPolyLayoutCallerClaim :=
   LiftFrame.verificationResult liftPolyLayoutCallerClaim [] (fun _ h => h)
     liftPolyLayoutCaller_lift
+
+/-! ### Signature mismatches are undefined behavior and do not lift -/
+
+/-- `u8` at layout index `0`. -/
+def liftU8Ty : Ty := { kind := .uint .u8, layoutIdx := 0 }
+
+/-- `fn(u8) -> u8` at layout index `0`. -/
+def liftU8FnPtrTy : Ty :=
+  { kind := .fnPtr [.uint .u8] (.uint .u8) .safe .rust, layoutIdx := 0 }
+
+/--
+`lift_poly_id::<u32>` reified at the wrong pointer type `fn(u8) -> u8`:
+`checkCalleeSig` compares the instantiated callee's `u32` locals with the
+`u8` signature, so `evalReifyFnPointer` faults.
+-/
+def liftBadReifySigMir : CapturedMir :=
+  mkMirBody "ff33::bad_reify_sig" 0
+    [ { mutability := .mut, ty := liftU8Ty, debugName := some "_0" }
+    , { mutability := .mut, ty := liftU8FnPtrTy, debugName := some "f" } ]
+    [ { statements :=
+          [ { kind := .storageLive 1, span := "live f" }
+          , { kind := .assign { local_ := 1, projection := [] }
+                (.cast (.pointerCoercion "ReifyFnPointer")
+                  (.constant
+                    { ty := { kind := .fnDef "ff33::lift_poly_id" [.uint .u32], layoutIdx := 0 }
+                      val := .zeroSized })
+                  liftU8FnPtrTy), span := "reify at fn(u8) -> u8" } ]
+        terminator :=
+          { kind := .call (.move { local_ := 1, projection := [] })
+              [.constant { ty := liftU8Ty, val := .scalar (.int ⟨7, 1⟩) }]
+              { local_ := 0, projection := [] } (some 1) .continue_
+            span := "call f" }
+        isCleanup := false }
+    , { statements := []
+        terminator := { kind := .return_, span := "ret" }
+        isCleanup := false } ]
+
+/-- The mis-typed reification faults at its second step. -/
+theorem liftBadReifySig_not_converges (post : MirOutcome → Prop) :
+    ¬ MirWpConverges liftBadReifySigMir
+      (initMachineStateWithCallees liftBadReifySigMir [] [liftPolyIdMir]) post := by
+  rintro ⟨fuel, h⟩
+  rcases fuel with _ | _ | fuel <;> exact h
+
+/--
+A correctly reified `fn(u32) -> u32` stored in a local declared as
+`fn(u8) -> u8`: the call site's operand type disagrees with the interned
+signature, so `fnEntryCompatibleWithCallSite` rejects the indirect call.
+-/
+def liftBadCallSigMir : CapturedMir :=
+  mkMirBody "ff33::bad_call_sig" 0
+    [ { mutability := .mut, ty := liftU32Ty, debugName := some "_0" }
+    , { mutability := .mut, ty := liftU8FnPtrTy, debugName := some "f" } ]
+    [ { statements :=
+          [ { kind := .storageLive 1, span := "live f" }
+          , { kind := .assign { local_ := 1, projection := [] }
+                (.cast (.pointerCoercion "ReifyFnPointer")
+                  (.constant
+                    { ty := { kind := .fnDef "ff33::lift_poly_id" [.uint .u32], layoutIdx := 0 }
+                      val := .zeroSized })
+                  liftU32FnPtrTy), span := "reify at fn(u32) -> u32" } ]
+        terminator :=
+          { kind := .call (.move { local_ := 1, projection := [] })
+              [.constant { ty := liftU32Ty, val := .scalar (.int ⟨7, 4⟩) }]
+              { local_ := 0, projection := [] } (some 1) .continue_
+            span := "call f as fn(u8) -> u8" }
+        isCleanup := false }
+    , { statements := []
+        terminator := { kind := .return_, span := "ret" }
+        isCleanup := false } ]
+
+/-- The mis-typed indirect call faults at its third step. -/
+theorem liftBadCallSig_not_converges (post : MirOutcome → Prop) :
+    ¬ MirWpConverges liftBadCallSigMir
+      (initMachineStateWithCallees liftBadCallSigMir [] [liftPolyIdMir]) post := by
+  rintro ⟨fuel, h⟩
+  rcases fuel with _ | _ | _ | fuel <;> exact h
 
 end IndirectCallBenchmark

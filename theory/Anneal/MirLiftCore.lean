@@ -440,15 +440,6 @@ theorem LiftFrame.iff_liftStmtsTerminator {body : CapturedMir}
       LiftStmtsTerminator body bbIdx stmtIdx env stmts term post fuel :=
   Iff.rfl
 
-/--
-Residual lifting judgment for block `bbIdx` of `body` at locals `env` and
-memory `mem`, used by `#mir_lift (residual := true)` in linked-callee or
-non-pure mode to abstract back-edge or unlinked-call blocks.
--/
-def LiftResidualFrame (body : CapturedMir) (bbIdx : BasicBlockIdx)
-    (env : PureEnv) (mem : Memory) (post : Value → Prop) (fuel : Nat) : Prop :=
-  LiftFrame body bbIdx 0 env mem post fuel
-
 /-- Liveness of a local slot: only `.dead` slots reject writes and drops. -/
 def slotLive : LocalSlot → Bool
   | .dead => false
@@ -515,7 +506,8 @@ def callFrameMem (callerBody : CapturedMir) (bbIdx : BasicBlockIdx)
 
 /--
 Memory after `TerminatorKind.tailCall` enters `calleeBody` without pushing a
-new caller frame onto `mem.callStack`. This is `(enterTailCalleeFrame ..).memory`.
+new caller frame onto `mem.callStack`. This is
+`(enterTailCalleeFrame ..).memory`.
 -/
 def tailCallFrameMem (mem : Memory) (calleeBody : CapturedMir) : Memory :=
   { mem with activeCallee := some calleeBody }
@@ -626,7 +618,8 @@ inductive LiftStmtMem (cur : CapturedMir) (bbIdx : BasicBlockIdx)
   /--
   Safe-to-unsafe function-pointer coercion
   `dst = op as unsafe fn(..) (PointerCoercion("UnsafeFnPointer"))`, preserving
-  the pointer's `ProvenancePtr` after validating its signature in `Memory.fnPtrs`.
+  the pointer's `ProvenancePtr` after validating its signature in
+  `Memory.fnPtrs`.
   -/
   | unsafeFnPointer {dst : Place} {coercionKind : String} {op : Operand}
       {targetTy : Ty} {span : String} {ptrVal : ProvenancePtr}
@@ -1494,20 +1487,6 @@ theorem LiftFrame.mono {body : CapturedMir} {bbIdx : BasicBlockIdx}
   wpMirExecSym_mono h_le h
 
 /--
-Instantiate a universally quantified `LiftResidualFrame` hypothesis at root
-block entry `(bbIdx, 0, env, mem)` (`mem.activeCallee = none`).
--/
-theorem LiftResidualFrame.to_LiftFrame {body : CapturedMir}
-    {bbIdx : BasicBlockIdx} {env : PureEnv} {mem : Memory}
-    {post : Value → Prop} {f₁ f₂ : Nat}
-    (h_root : mem.activeCallee = none)
-    (h : ∀ env mem, LiftResidualFrame body bbIdx env mem post f₁)
-    (h_le : f₁ ≤ f₂) :
-    LiftFrame body bbIdx 0 env mem post f₂ := by
-  let _ := h_root
-  exact LiftFrame.mono h_le (h env mem)
-
-/--
 Entry bridge for bodies with linked callees: a lifted entry frame at the
 callee-aware initial memory proves `MirWpConverges` from
 `initMachineStateWithCallees`, the initial state of `Claim.holds`.
@@ -1548,4 +1527,4 @@ The lifting judgments are opaque outside this module: callers, including the
 judgments into `wpMirExecSym`, which keeps `body` opaque in goal states and
 prevents `isDefEq` from falling back to whole-body symbolic evaluation.
 -/
-attribute [irreducible] LiftBlock LiftResidualBlock LiftStmtsTerminator LiftFrame LiftResidualFrame
+attribute [irreducible] LiftBlock LiftResidualBlock LiftStmtsTerminator LiftFrame

@@ -32,7 +32,12 @@ or abort. It has two modes:
   pointers, and instantiate generic callees. Lifting synthesizes the return
   value: the command defines `<item>_model : Value` and proves
   `<item>_lift_sound : MirWpConverges <item> (initMachineStateWithCallees <item>
-  [] [c₁, …]) (mirNormalPost (fun retVal _ => retVal = <item>_model))`.
+  [] [c₁, …]) (mirNormalPost (fun retVal _ => retVal = <item>_model))` and
+  `<item>_verified`, the trusted `VerificationResult` of the claim
+  `{ body := <item>, callees := [c₁, …], pre := (· = []),
+  post := fun _ ret => ret = <item>_model }`. A call-free body that still fails
+  `checkPureMir` (for example, one that reifies a function pointer) uses this
+  mode with no callees.
 
 Both modes run `<item>` on the empty argument list, so they apply to closed
 bodies (`argCount = 0`).
@@ -130,34 +135,12 @@ modules; audited proofs apply the same rules explicitly (see
 `Anneal.MirLiftBench`).
 -/
 
-elab "apply_residual_frame" : tactic => do
-  let g ← getMainGoal
-  let tgt ← g.getType
-  let tgt ← instantiateMVars tgt
-  if tgt.isAppOf ``Anneal.MirLiftCore.LiftFrame then
-    let applied ← withMainContext do
-      let lctx ← getLCtx
-      for decl in lctx do
-        if decl.isImplementationDetail then continue
-        if decl.userName.toString.startsWith "h_res_" then
-          try
-            let id := mkIdent decl.userName
-            evalTactic (← `(tactic| exact Anneal.MirLiftCore.LiftResidualFrame.to_LiftFrame (f₂ := 100) (by rfl) $id (by decide)))
-            return true
-          catch _ => pure ()
-      return false
-    if !applied then
-      throwError "ASSUMPTION FAILED!"
-  else
-    throwError "Not a LiftFrame goal"
-
 /-- Apply one memory-carrying statement or terminator lifting rule. -/
 syntax (name := liftFrameStep) "lift_frame_step" : tactic
 
 macro_rules
   | `(tactic| lift_frame_step) => `(tactic|
       first
-      | apply_residual_frame
       | (apply Anneal.MirLiftCore.LiftFrame.stmt (by rfl)
             (by first | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl)
          first
@@ -216,13 +199,16 @@ syntax (name := mirLiftCmd) "#mir_lift "
 Linked-callee mode of `#mir_lift`: lift `declName` from
 `initMachineStateWithCallees declName [] callees` with `lift_frame`, reading
 the root return value off the final `LiftTerminator.return_` step, then add
-`<item>_model` (that value) and `<item>_lift_sound` (the convergence theorem).
+`<item>_model` (that value), `<item>_lift_sound` (the convergence theorem), and
+`<item>_verified` (the trusted `VerificationResult` of the closed claim with
+`callees` linked).
 -/
 def elabMirLiftFrame (id : Ident) (calleesStx : Term) : CommandElabM Unit := do
   let declName ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo id
   let ns ← getCurrNamespace
   let modelName := ns ++ id.getId.appendAfter "_model"
   let soundName := ns ++ id.getId.appendAfter "_lift_sound"
+  let verifiedName := ns ++ id.getId.appendAfter "_verified"
   liftTermElabM do
     let bodyE := mkConst declName
     let valueTy := mkConst ``Value
@@ -273,6 +259,25 @@ def elabMirLiftFrame (id : Ident) (calleesStx : Term) : CommandElabM Unit := do
     let thmVal ← mkExpectedTypeHint thmVal thmTy
     addDecl <| .thmDecl
       { name := soundName, levelParams := [], type := thmTy, value := thmVal }
+    -- Package the same lifted execution as the trusted certificate for the
+    -- closed claim `{ body, callees, pre := (· = []), post := (· = model) }`.
+    let argsTy := mkApp (mkConst ``List [Level.zero]) valueTy
+    let preE ← withLocalDeclD `args argsTy fun a => do
+      mkLambdaFVars #[a] (← mkEq a argsE)
+    let claimPostE ←
+      withLocalDeclD `args argsTy fun a =>
+        withLocalDeclD `ret valueTy fun r => do
+          mkLambdaFVars #[a, r] (← mkEq r modelE)
+    let claimE := mkAppN (mkConst ``Trusted.VerificationResult.Claim.mk)
+      #[bodyE, preE, claimPostE, calleesE]
+    let hPreE ← withLocalDeclD `args argsTy fun a => do
+      withLocalDeclD `h (← mkEq a argsE) fun h => mkLambdaFVars #[a, h] h
+    let verTy := mkApp (mkConst ``Trusted.VerificationResult.VerificationResult) claimE
+    let verVal ← mkAppOptM ``LiftFrame.verificationResult
+      #[claimE, argsE, fuel, hPreE, proof]
+    let verVal ← mkExpectedTypeHint verVal verTy
+    addDecl <| .thmDecl
+      { name := verifiedName, levelParams := [], type := verTy, value := verVal }
 
 @[command_elab mirLiftCmd]
 def elabMirLift : CommandElab := fun stx => do
@@ -290,8 +295,19 @@ def elabMirLift : CommandElab := fun stx => do
       let some info := env.find? declName | throwError "unknown constant {declName}"
       unsafe evalExpr CapturedMir (mkConst ``CapturedMir) info.value!
 
+    -- Bodies with linked callees, or that fail `checkPureMir` (function-pointer
+    -- casts, calls), need the memory-carrying mode; call-free bodies keep the
+    -- alias-erased mode and its `mem' = mem₀` postcondition.
     let isPure := checkPureMir val
-    if res?.isNone && (callees?.isSome || !isPure) then
+    if callees?.isSome || !isPure then
+      if res?.isSome then
+        -- A residual block hypothesis would have to hold for every locals and
+        -- memory configuration, including foreign active callees, so it is
+        -- almost never satisfiable and would make the generated theorem
+        -- vacuous; refuse instead.
+        throwError "#mir_lift: `(residual := true)` applies only to call-free \
+          bodies without linked callees; the memory-carrying mode has no sound \
+          residual abstraction"
       let calleesStx ← match callees? with
         | some cs => pure cs
         | none => `([])
@@ -304,7 +320,6 @@ def elabMirLift : CommandElab := fun stx => do
 
     let mut residualHyps : Array (TSyntax [`ident, `Lean.Parser.Term.hole, `Lean.Parser.Term.bracketedBinder]) := #[]
     let isResidual := res?.isSome
-    let useFrameResidual := isResidual && (callees?.isSome || !isPure)
     if isResidual then
       for i in [0:blocksArr.size] do
         if h : i < blocksArr.size then
@@ -326,34 +341,22 @@ def elabMirLift : CommandElab := fun stx => do
 
           let mut needsResidual := isBackEdge
           match bb.terminator.kind with
-          | .call .. => if callees?.isNone then needsResidual := true
-          | .tailCall .. => if callees?.isNone then needsResidual := true
+          | .call .. => needsResidual := true
+          | .tailCall .. => needsResidual := true
           | _ => pure ()
 
           if needsResidual then
             let hypName := mkIdent (Name.mkSimple s!"h_res_{i}")
             let bbIdxStx := Syntax.mkNumLit (toString i)
             let hypType ←
-              if useFrameResidual then
-                `(∀ env mem, Anneal.MirLiftCore.LiftResidualFrame $targetName $bbIdxStx env mem (fun _ => True) 100)
-              else
-                `(∀ env, Anneal.MirLiftCore.LiftResidualBlock $targetName $bbIdxStx env (fun _ => True) 100)
+              `(∀ env, Anneal.MirLiftCore.LiftResidualBlock $targetName $bbIdxStx env (fun _ => True) 100)
             let b ← `(bracketedBinder| ($hypName : $hypType))
             residualHyps := residualHyps.push b
 
-    if useFrameResidual then
-      let calleesStx ← match callees? with
-        | some cs => pure cs
-        | none => `([])
-      let cmd2 ← `(command| theorem $soundName $residualHyps* : MirWpConverges $targetName (initMachineStateWithCallees $targetName [] $calleesStx) (mirNormalPost (fun retVal _ => (fun _ => True) retVal)) := by
-        exact LiftFrame.mirWpConverges_withCallees (fuel := 100) (by lift_frame))
-      elabCommand cmd1
-      elabCommand cmd2
-    else
-      let cmd2 ← `(command| theorem $soundName $residualHyps* : MirWpConverges $targetName (initMachineState $targetName []) (mirNormalPost (fun retVal mem' => mem' = (initMachineState $targetName []).memory ∧ (fun _ => True) retVal)) := by
-        exact mirWpConverges_of_pureExec_init (by rfl) (lift_PureMirConverges (by rfl) (by apply LiftBlock.of_lookup (by rfl); repeat (first | lift_mir_step | trivial))))
-      elabCommand cmd1
-      elabCommand cmd2
+    let cmd2 ← `(command| theorem $soundName $residualHyps* : MirWpConverges $targetName (initMachineState $targetName []) (mirNormalPost (fun retVal mem' => mem' = (initMachineState $targetName []).memory ∧ (fun _ => True) retVal)) := by
+      exact mirWpConverges_of_pureExec_init (by rfl) (lift_PureMirConverges (by rfl) (by apply LiftBlock.of_lookup (by rfl); repeat (first | lift_mir_step | trivial))))
+    elabCommand cmd1
+    elabCommand cmd2
   | _ => throwUnsupportedSyntax
 
 -- E2E Test Suite Definitions
@@ -407,6 +410,39 @@ def loopBody : CapturedMir := makeLoopBody "loop"
 #mir_lift (residual := true) loopBody
 
 def multiCalleeBody : CapturedMir := makeMultiCalleeBody "multi"
+
+/-!
+`multiCalleeBody` calls a `u32` constant. `resolveCallTarget` rejects a callee
+operand that is neither a function item nor a function pointer as undefined
+behavior, so no lifting may succeed: the body does not converge from its
+callee-aware initial state, and the universally quantified residual hypothesis
+`∀ env mem, LiftFrame multiCalleeBody 0 0 env mem _ 100` that a residual
+abstraction of its call block would assume is refutable.
+-/
+
+theorem multiCalleeBody_not_converges (post : MirOutcome → Prop) :
+    ¬ MirWpConverges multiCalleeBody
+      (initMachineStateWithCallees multiCalleeBody [] []) post := by
+  -- `wpMirExecSym` is sealed in this module; unfold one step explicitly. The
+  -- first terminator then evaluates to `MirStepNode.fail .ub`.
+  rintro ⟨_ | fuel, h⟩ <;> unfold wpMirSym wpMirExecSym at h <;> exact h
+
+theorem multiCalleeBody_residual_false :
+    ¬ ∀ env mem, LiftFrame multiCalleeBody 0 0 env mem (fun _ => True) 100 :=
+  fun h => multiCalleeBody_not_converges _
+    (LiftFrame.mirWpConverges_withCallees (h _ _))
+
+example : True := by
+  fail_if_success
+    (have : LiftFrame multiCalleeBody 0 0 (initPureEnv multiCalleeBody [])
+        (initMachineStateWithCallees multiCalleeBody [] []).memory
+        (fun _ => True) 1 := by lift_frame)
+  trivial
+
+/--
+error: #mir_lift: `(residual := true)` applies only to call-free bodies without linked callees; the memory-carrying mode has no sound residual abstraction
+-/
+#guard_msgs in
 #mir_lift (residual := true) multiCalleeBody
 
 def makeGotoBody (name : String) : CapturedMir := {
@@ -485,6 +521,20 @@ info: 'liftPolyLayoutCallerMir_lift_sound' depends on axioms: [propext, Classica
 #guard_msgs in
 #print axioms liftPolyLayoutCallerMir_lift_sound
 
+-- `#mir_lift` also emits the trusted certificate of the closed claim.
+example :
+    Trusted.VerificationResult.VerificationResult
+      { body := liftIndirectCallerMir, callees := [liftPolyIdMir],
+        pre := fun args => args = [],
+        post := fun _ ret => ret = Value.scalar ⟨7, 4⟩ } :=
+  liftIndirectCallerMir_verified
+
+/--
+info: 'liftIndirectCallerMir_verified' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs in
+#print axioms liftIndirectCallerMir_verified
+
 -- Without the linked callee, the indirect call does not lift.
 example : True := by
   fail_if_success
@@ -499,6 +549,23 @@ example : True := by
     (have : LiftFrame liftIndirectCallerMir 0 0 (initPureEnv liftIndirectCallerMir [])
         (initMachineStateWithCallees liftIndirectCallerMir [] [liftPolyIdMir]).memory
         (fun v => v = Value.scalar ⟨8, 4⟩) 7 := by lift_frame)
+  trivial
+
+-- Signature mismatches are undefined behavior (`liftBadReifySig_not_converges`,
+-- `liftBadCallSig_not_converges`), so neither reification nor the indirect
+-- call may lift.
+example : True := by
+  fail_if_success
+    (have : LiftFrame liftBadReifySigMir 0 0 (initPureEnv liftBadReifySigMir [])
+        (initMachineStateWithCallees liftBadReifySigMir [] [liftPolyIdMir]).memory
+        (fun _ => True) 7 := by lift_frame)
+  trivial
+
+example : True := by
+  fail_if_success
+    (have : LiftFrame liftBadCallSigMir 0 0 (initPureEnv liftBadCallSigMir [])
+        (initMachineStateWithCallees liftBadCallSigMir [] [liftPolyIdMir]).memory
+        (fun _ => True) 7 := by lift_frame)
   trivial
 
 -- The tactic reproduces the explicit audited proof in `Anneal.MirLiftBench`.
