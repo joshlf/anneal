@@ -1,6 +1,7 @@
 
 import Lean
 import Trusted
+import Anneal.MirFuelFree
 import Anneal.MirLiftCore
 import Anneal.PureMirExec
 import Anneal.MirLiftBench
@@ -8,8 +9,12 @@ import Anneal.MirLiftBench
 open Lean Meta Elab Command Tactic
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
+open Anneal.MirFuelFree
 open Anneal.MirLiftCore
+open Anneal.Rustc.V2026_06_01.SymbolicEval
 open Anneal.PureMirExec
+
+attribute [local irreducible] LiftBlock LiftResidualBlock wpMirExecSym
 
 set_option maxHeartbeats 100000
 
@@ -25,7 +30,7 @@ elab "apply_lift_block_of_lookup" : tactic => do
       let tgt2 ← instantiateMVars tgt2
       let g3 ← g2.change tgt2
       replaceMainGoal [g3]
-    evalTactic (← `(tactic| try dsimp only [Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData.statements, Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData.terminator]))
+    evalTactic (← `(tactic| try dsimp))
   else
     throwError "Not a LiftBlock goal"
 
@@ -34,18 +39,19 @@ elab "apply_residual_block" : tactic => do
   let tgt ← g.getType
   let tgt ← instantiateMVars tgt
   if tgt.isAppOf ``Anneal.MirLiftCore.LiftBlock then
-    try evalTactic (← `(tactic| apply Anneal.MirLiftCore.LiftResidualBlock.to_LiftBlock))
-    catch _ =>
-      logInfo "APPLY FAILED!"
-      throwError "APPLY FAILED!"
-    try evalTactic (← `(tactic| assumption))
-    catch _ =>
-      logInfo "ASSUMPTION FAILED!"
+    let applied ← withMainContext do
+      let lctx ← getLCtx
+      for decl in lctx do
+        if decl.isImplementationDetail then continue
+        if decl.userName.toString.startsWith "h_res_" then
+          try
+            let id := mkIdent decl.userName
+            evalTactic (← `(tactic| exact Anneal.MirLiftCore.LiftResidualBlock.to_LiftBlock (f2 := 100) $id (by decide)))
+            return true
+          catch _ => pure ()
+      return false
+    if !applied then
       throwError "ASSUMPTION FAILED!"
-    try evalTactic (← `(tactic| decide))
-    catch _ =>
-      logInfo "DECIDE FAILED!"
-      throwError "DECIDE FAILED!"
   else
     throwError "Not a LiftBlock goal"
 
@@ -61,7 +67,7 @@ macro_rules
     | apply LiftStmtsTerminator.cons_eval (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl)
     | apply LiftStmtsTerminator.term_switchInt (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl)
     | apply LiftStmtsTerminator.term_assert (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl) (by rfl)
-    | apply LiftStmtsTerminator.term_drop (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl) (by decide) (by rfl) (by rfl)
+    | apply LiftStmtsTerminator.term_drop (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl) (by intro h; contradiction) (by rfl) (by rfl)
     | apply LiftStmtsTerminator.term_call (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl)
     | apply LiftStmtsTerminator.cons (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by assumption)
     | dsimp [evalPureStmt, isPureStatement, evalStmt, evalRvalue, evalOperand, advanceStmt, PureState.toMachineState, MachineState.frame, emptyMemory, invalidateConflictingBorrows, LocalSlot.init, Value.scalar, Rvalue.use, Operand.constant, Option.map, Option.bind, List.set, initPureEnv, initLocals, initLocalsAux, Trusted.Sequence.get?, List.length, Nat.add, writePurePlaceValue]; rfl
@@ -122,9 +128,8 @@ def elabMirLift : CommandElab := fun stx => do
             let b ← `(bracketedBinder| ($hypName : $hypType))
             residualHyps := residualHyps.push b
         
-    let topFuel := 100 + blocksArr.size
-    let topFuelStx := Syntax.mkNumLit (toString topFuel)
-    let cmd2 ← `(command| theorem $soundName $residualHyps* : ∃ fuel, LiftBlock $targetName 0 (initPureEnv $targetName []) (fun _ => True) fuel := by exact ⟨$topFuelStx, by apply LiftBlock.of_lookup (by rfl); repeat (first | lift_mir_step | trivial)⟩)
+    let cmd2 ← `(command| theorem $soundName $residualHyps* : MirWpConverges $targetName (initMachineState $targetName []) (mirNormalPost (fun retVal mem' => mem' = (initMachineState $targetName []).memory ∧ (fun _ => True) retVal)) := by
+      exact mirWpConverges_of_pureExec_init (by rfl) (lift_PureMirConverges (by rfl) (by apply LiftBlock.of_lookup (by rfl); repeat (first | lift_mir_step | trivial))))
     elabCommand cmd1
     elabCommand cmd2
   | _ => throwUnsupportedSyntax
