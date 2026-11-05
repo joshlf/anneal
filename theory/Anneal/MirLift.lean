@@ -1,3 +1,10 @@
+-- Copyright 2026 The Fuchsia Authors
+--
+-- Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+-- <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+-- license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+-- This file may not be copied, modified, or distributed except according to
+-- those terms.
 
 import Lean
 import Trusted
@@ -5,6 +12,36 @@ import Anneal.MirFuelFree
 import Anneal.MirLiftCore
 import Anneal.PureMirExec
 import Anneal.MirLiftBench
+
+/-!
+# `#mir_lift`: proof-producing lifting of captured MIR bodies
+
+`#mir_lift <item>` inspects the `CapturedMir` constant `<item>` and proves that
+running it on no arguments returns normally, with no undefined behavior, panic,
+or abort. It has two modes:
+
+- **Call-free mode** (`#mir_lift [(residual := true)] <item>`): lifts the body
+  along the alias-erased `LiftBlock` rules and transports the result to
+  `initMachineState` through `mirWpConverges_of_pureExec_init`, which requires
+  `checkPureMir <item>`. With `(residual := true)`, blocks on back edges are
+  abstracted by `LiftResidualBlock` hypotheses of the generated theorem.
+- **Linked-callee mode** (`#mir_lift (callees := [c₁, …]) <item>`): lifts the
+  body along the memory-carrying `LiftFrame` rules from
+  `initMachineStateWithCallees <item> [] [c₁, …]`, so the body may reify
+  function pointers, call linked callees directly or through function
+  pointers, and instantiate generic callees. Lifting synthesizes the return
+  value: the command defines `<item>_model : Value` and proves
+  `<item>_lift_sound : MirWpConverges <item> (initMachineStateWithCallees <item>
+  [] [c₁, …]) (mirNormalPost (fun retVal _ => retVal = <item>_model))`.
+
+Both modes run `<item>` on the empty argument list, so they apply to closed
+bodies (`argCount = 0`).
+
+This module imports `Lean` for its command elaborator, so it is a tool rather
+than part of the audited `Anneal` umbrella (the trusted-boundary audit admits
+only `Init` and `Std` imports in downstream modules). Every theorem it emits is
+an ordinary declaration checked by the Lean kernel when this module is built.
+-/
 
 open Lean Meta Elab Command Tactic
 open Trusted.Rustc.V2026_06_01.MirAst
@@ -14,7 +51,10 @@ open Anneal.MirLiftCore
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 open Anneal.PureMirExec
 
-attribute [local irreducible] LiftBlock LiftResidualBlock wpMirExecSym
+-- `LiftBlock`, `LiftResidualBlock`, and `LiftFrame` are globally irreducible
+-- (see `Anneal.MirLiftCore`); also seal `wpMirExecSym` here so `isDefEq` never
+-- falls back to symbolic evaluation while matching lifting rules.
+attribute [local irreducible] wpMirExecSym
 
 set_option maxHeartbeats 100000
 
@@ -74,21 +114,146 @@ macro_rules
     | dsimp [initPureEnv, initLocals, initLocalsAux, List.set, Trusted.Sequence.get?]; rfl
   )
 
-syntax (name := mirLiftCmd) "#mir_lift " ("(" &"residual" " := " ident ")")? ident : command
+/-!
+### Frame-lifting tactics
+
+`lift_frame_step` applies one `LiftFrame.stmt` or `LiftFrame.term` rule,
+choosing the first `LiftStmtMem` or `LiftTerminator` constructor whose premises
+hold on the concrete frame. Every premise is an evaluation fact closed by
+`rfl`, so the kernel replays the trusted evaluator on exactly the visited
+statements and terminators while `body` stays a constant in every goal.
+`lift_frame` repeats steps until the root return, then closes the
+postcondition (`rfl` or `trivial`) and any fuel left unconstrained by the final
+step (`0`). They live here rather than in `Anneal.MirLiftCore` because the
+trusted-boundary audit admits no `syntax` or `macro_rules` commands in audited
+modules; audited proofs apply the same rules explicitly (see
+`Anneal.MirLiftBench`).
+-/
+
+/-- Apply one memory-carrying statement or terminator lifting rule. -/
+syntax (name := liftFrameStep) "lift_frame_step" : tactic
+
+macro_rules
+  | `(tactic| lift_frame_step) => `(tactic|
+      first
+      | (apply Anneal.MirLiftCore.LiftFrame.stmt (by rfl)
+            (by first | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl)
+         first
+         | apply Anneal.MirLiftCore.LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
+         | apply Anneal.MirLiftCore.LiftStmtMem.reifyFnPointer (by rfl) (by rfl)
+             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl))
+      | (apply Anneal.MirLiftCore.LiftFrame.term (by rfl)
+            (by first | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl)
+         first
+         | apply Anneal.MirLiftCore.LiftTerminator.goto
+         | apply Anneal.MirLiftCore.LiftTerminator.switchInt (by rfl)
+         | apply Anneal.MirLiftCore.LiftTerminator.assert (by rfl) (by rfl)
+         | apply Anneal.MirLiftCore.LiftTerminator.drop (by rfl) (by rfl) (by rfl)
+             (by rfl)
+         | apply Anneal.MirLiftCore.LiftTerminator.return_ (by rfl) (by rfl)
+         | apply Anneal.MirLiftCore.LiftTerminator.returnToCaller (by rfl) (by rfl)
+             (by rfl) (by rfl)
+         | apply Anneal.MirLiftCore.LiftTerminator.callDirect (by rfl) (by rfl)
+             (by rfl)
+         | apply Anneal.MirLiftCore.LiftTerminator.callIndirect (by rfl) (by rfl)
+             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+         dsimp only [Anneal.MirLiftCore.FrameStep.Continues]))
+
+/-- Lift a whole execution from an entry `LiftFrame` goal to the root return. -/
+syntax (name := liftFrame) "lift_frame" : tactic
+
+macro_rules
+  | `(tactic| lift_frame) => `(tactic|
+      (repeat lift_frame_step
+       all_goals first | rfl | trivial | exact 0))
+
+syntax (name := mirLiftCmd) "#mir_lift "
+  (atomic("(" &"residual") " := " ident ")")?
+  (atomic("(" &"callees") " := " term ")")? ident : command
+
+/--
+Linked-callee mode of `#mir_lift`: lift `declName` from
+`initMachineStateWithCallees declName [] callees` with `lift_frame`, reading
+the root return value off the final `LiftTerminator.return_` step, then add
+`<item>_model` (that value) and `<item>_lift_sound` (the convergence theorem).
+-/
+def elabMirLiftFrame (id : Ident) (calleesStx : Term) : CommandElabM Unit := do
+  let declName ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo id
+  let ns ← getCurrNamespace
+  let modelName := ns ++ id.getId.appendAfter "_model"
+  let soundName := ns ++ id.getId.appendAfter "_lift_sound"
+  liftTermElabM do
+    let bodyE := mkConst declName
+    let valueTy := mkConst ``Value
+    let calleesE ← Term.elabTermEnsuringType calleesStx
+      (mkApp (mkConst ``List [Level.zero]) (mkConst ``CapturedMir))
+    Term.synthesizeSyntheticMVarsNoPostponing
+    let calleesE ← instantiateMVars calleesE
+    let argsE := mkApp (mkConst ``List.nil [Level.zero]) valueTy
+    let retMVar ← mkFreshExprMVar valueTy
+    let fuelMVar ← mkFreshExprMVar (mkConst ``Nat)
+    let postOf (target : Expr) : MetaM Expr :=
+      withLocalDeclD `retVal valueTy fun v => do
+        mkLambdaFVars #[v] (← mkEq v target)
+    let postE ← postOf retMVar
+    let envE ← mkAppM ``initPureEnv #[bodyE, argsE]
+    let initE ← mkAppM ``initMachineStateWithCallees #[bodyE, argsE, calleesE]
+    let memE ← mkAppM ``MachineState.memory #[initE]
+    let goalTy ← mkAppM ``LiftFrame
+      #[bodyE, mkNatLit 0, mkNatLit 0, envE, memE, postE, fuelMVar]
+    let goal ← mkFreshExprSyntheticOpaqueMVar goalTy
+    let remaining ← Tactic.run goal.mvarId! do
+      Tactic.evalTactic (← `(tactic| lift_frame))
+    unless remaining.isEmpty do
+      throwError "#mir_lift: could not lift {declName} with the linked callees; \
+        unsolved lifting goals:{indentD (MessageData.joinSep
+          (remaining.map MessageData.ofGoal) Format.line)}"
+    let proof ← instantiateMVars goal
+    let fuel ← instantiateMVars fuelMVar
+    let retVal ← instantiateMVars retMVar
+    if proof.hasExprMVar || fuel.hasExprMVar || retVal.hasExprMVar then
+      throwError "#mir_lift: lifting {declName} left unassigned metavariables"
+    -- The return value is a closed `Value` term; normalize it so the model is
+    -- a readable literal rather than the evaluator's unreduced projections.
+    let retVal ← withTransparency .all <| Meta.reduce retVal
+    addAndCompile <| .defnDecl
+      { name := modelName, levelParams := [], type := valueTy, value := retVal,
+        hints := .abbrev, safety := .safe }
+    let modelE := mkConst modelName
+    let postModel ← postOf modelE
+    let normalPost ←
+      withLocalDeclD `retVal valueTy fun v =>
+        withLocalDeclD `mem (mkConst ``Memory) fun m => do
+          mkLambdaFVars #[v, m] (← mkEq v modelE)
+    let thmTy ← mkAppM ``MirWpConverges
+      #[bodyE, initE, ← mkAppM ``mirNormalPost #[normalPost]]
+    let thmVal ← mkAppOptM ``LiftFrame.mirWpConverges_withCallees
+      #[bodyE, argsE, calleesE, postModel, fuel, proof]
+    let thmVal ← mkExpectedTypeHint thmVal thmTy
+    addDecl <| .thmDecl
+      { name := soundName, levelParams := [], type := thmTy, value := thmVal }
 
 @[command_elab mirLiftCmd]
 def elabMirLift : CommandElab := fun stx => do
   match stx with
-  | `(command| #mir_lift $[(residual := $res?:ident)]? $id:ident) =>
+  | `(command| #mir_lift $[(residual := $res?:ident)]? $[(callees := $callees?:term)]? $id:ident) =>
+    if let some calleesStx := callees? then
+      if res?.isSome then
+        throwError "#mir_lift: `(residual := true)` is only supported in \
+          call-free mode; linked-callee mode lifts every block"
+      elabMirLiftFrame id calleesStx
+      return
     let name := id.getId
-    
-    let modelName := mkIdent (name.appendBefore "_model")
-    let soundName := mkIdent (name.appendBefore "_lift_sound")
-    let targetName := mkIdent name
+    let declName ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo id
+
+    let modelName := mkIdent (name.appendAfter "_model")
+    let soundName := mkIdent (name.appendAfter "_lift_sound")
+    let targetName := mkCIdent declName
 
     let val ← liftTermElabM do
       let env ← getEnv
-      let some info := env.find? name | throwError "unknown constant {name}"
+      let some info := env.find? declName | throwError "unknown constant {declName}"
       unsafe evalExpr CapturedMir (mkConst ``CapturedMir) info.value!
       
     let blocksArr := val.basicBlocks.toArray
@@ -214,3 +379,56 @@ def makeDropLoopBody (name : String) : CapturedMir := {
 
 def dropLoopBody : CapturedMir := makeDropLoopBody "dropLoop"
 #mir_lift (residual := true) dropLoopBody
+
+/-! ## Linked-callee mode: polymorphic indirect-call benchmark (`FF-3.3`) -/
+
+-- `liftIndirectCallerMir` reifies `lift_poly_id::<u32>` into a function
+-- pointer and calls it indirectly; `liftDirectCallerMir` calls the same generic
+-- callee through its function-item constant (see `Anneal.MirLiftBench`).
+#mir_lift (callees := [liftPolyIdMir]) liftIndirectCallerMir
+#mir_lift (callees := [liftPolyIdMir]) liftDirectCallerMir
+
+-- The synthesized models are the values returned through each call.
+example : liftIndirectCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
+example : liftDirectCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
+
+example :
+    MirWpConverges liftIndirectCallerMir
+      (initMachineStateWithCallees liftIndirectCallerMir [] [liftPolyIdMir])
+      (mirNormalPost (fun retVal _ => retVal = .scalar ⟨7, 4⟩)) :=
+  liftIndirectCallerMir_lift_sound
+
+/--
+info: 'liftIndirectCallerMir_lift_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs in
+#print axioms liftIndirectCallerMir_lift_sound
+
+/--
+info: 'liftDirectCallerMir_lift_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs in
+#print axioms liftDirectCallerMir_lift_sound
+
+-- Without the linked callee, the indirect call does not lift.
+example : True := by
+  fail_if_success
+    (have : LiftFrame liftIndirectCallerMir 0 0 (initPureEnv liftIndirectCallerMir [])
+        (initMachineStateWithCallees liftIndirectCallerMir [] []).memory
+        (fun v => v = Value.scalar ⟨7, 4⟩) 7 := by lift_frame)
+  trivial
+
+-- A wrong expected result does not lift.
+example : True := by
+  fail_if_success
+    (have : LiftFrame liftIndirectCallerMir 0 0 (initPureEnv liftIndirectCallerMir [])
+        (initMachineStateWithCallees liftIndirectCallerMir [] [liftPolyIdMir]).memory
+        (fun v => v = Value.scalar ⟨8, 4⟩) 7 := by lift_frame)
+  trivial
+
+-- The tactic reproduces the explicit audited proof in `Anneal.MirLiftBench`.
+example :
+    LiftFrame liftIndirectCallerMir 0 0 (initPureEnv liftIndirectCallerMir [])
+      (initMachineStateWithCallees liftIndirectCallerMir [] [liftPolyIdMir]).memory
+      (fun v => v = Value.scalar ⟨7, 4⟩) 7 := by
+  lift_frame

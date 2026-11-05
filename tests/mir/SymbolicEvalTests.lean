@@ -1360,7 +1360,8 @@ theorem reifyAndCallFnPtr_verified :
   intro x' h_args
   simp only [List.cons.injEq, Value.scalar.injEq, ScalarInt.mk.injEq, and_true] at h_args
   subst h_args
-  simp
+  -- `simp` leaves the `u8` range side condition `x % 2 < 256`.
+  simp <;> omega
 
 /--
 Caller `indirectFnPtrTailCallMir` taking an incoming function pointer parameter
