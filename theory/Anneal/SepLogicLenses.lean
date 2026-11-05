@@ -34,12 +34,13 @@ open Anneal.Rustc.V2026_06_01.SymbolicEval (mirNormalPost)
 
 This module connects Anneal's separation logic (`SepProp`, `sepConj`,
 `DisjointFootprints`, `ActiveTypedMutBorrow`, `FieldPointsTo`,
-`ActiveTypedFieldMutBorrow`) and functional lens layer (`MutLens`,
-`LawfulMutLens`, `memoryPtrMutLens`, `treeMemoryPtrMutLens`,
-`treeFieldMemoryPtrMutLens`) to fuel-free `ITree` weakest preconditions
-(`MirWpConverges`, `StatefulVerificationResult`, `TotalVerificationResult`) over
-the `I-10` Tree Borrows and 12-field `Memory` model. No proof here destructures
-the `Memory` record.
+`ActiveTypedFieldMutBorrow`, `AgreeOnSubplaceFootprint`, `SubplaceLocalSepProp`,
+`FieldMutBorrowBinding`, `sepConjFieldBindings`) and functional lens layer
+(`MutLens`, `LawfulMutLens`, `memoryPtrMutLens`, `treeMemoryPtrMutLens`,
+`treeFieldMemoryPtrMutLens`, `subplaceTreeMutLens`) to fuel-free `ITree` weakest
+preconditions (`MirWpConverges`, `StatefulVerificationResult`,
+`TotalVerificationResult`) over the `I-10` Tree Borrows and 12-field `Memory`
+model. No proof here destructures the `Memory` record.
 
 1. **Section 1 (lens algebra).** `IndependentLenses`, `prodMutLens`,
    `PairwiseIndependentLenses`, and the generic restriction lemmas
@@ -50,42 +51,56 @@ the `Memory` record.
    `treeFieldMemoryPtrMutLens` (under `TreeFieldExclusiveBorrow`) from
    `rawPtrMutLens` and `rawFieldMutLens`, together with the separation-logic
    bridges `sepConj_entails_independentLenses`,
-   `sepConj_entails_independentTreeLenses`, and
-   `sepConj_entails_independentTreeFieldLenses` (over `FieldPointsTo` and
-   `ActiveTypedFieldMutBorrow`).
+   `sepConj_entails_independentTreeLenses`,
+   `sepConj_entails_independentTreeFieldLenses`, and `k`-ary
+   `sepConjFieldBindings_entails_independentTreeFieldLensFamily` /
+   `sepConjFieldBindings_entails_pairwiseIndependentTreeFieldLenses` (over
+   `FieldPointsTo` and `ActiveTypedFieldMutBorrow`).
 2. **Section 2 (lifting).** Both whole-allocation (`SepLensStateInv`,
    `LensFramePreserved`, `mirWpConverges_of_sepLenses`) and sub-place /
    field-granular (`BorrowSubplace`, `SepSubplaceLensStateInv`,
    `SubplaceLensFramePreserved`, `mirWpConverges_of_sepSubplaceLenses`,
    `verifyStatefulMir_of_sepSubplaceLenses`,
-   `verifyTotalMir_of_sepSubplaceLenses`) lifting soundness for `LiftDerefRead`,
-   `LiftDerefFieldRead`, `LiftDerefWrite` (root `*p = rv` and projected field
-   `((*p).f) = rv`), `LiftRetag`, `LiftLensOperands`, `LiftLensRvalue` (`use`,
-   `use_deref_field`, `copyForDeref`, scalar `BinOp`, `unaryOp_not`,
-   `unaryOp_neg`, `cast_intToInt`, and tuple/ADT `aggregate` constructors),
-   `LiftLensStmts`, and `LiftLensBlock` (`return_`, `goto`, `assert`,
-   `switchInt`, and `drop_local`). Single-statement and whole-CFG lens-view
-   state-passing theorems (`LiftDerefWrite.evalStmt_treeLens_putGet_and_frame`,
+   `verifyTotalMir_of_sepSubplaceLenses`,
+   `verifyStatefulMir_of_sepSubplaceLenses_supportedFrame`,
+   `verifyTotalMir_of_sepSubplaceLenses_supportedFrame`) lifting soundness for
+   `LiftDerefRead`, `LiftDerefFieldRead`, `LiftDerefWrite` (root `*p = rv` and
+   projected field `((*p).f) = rv`), `LiftRetag`, `LiftLensOperands`,
+   `LiftLensRvalue` (`use`, `use_deref_field`, `copyForDeref`, scalar `BinOp`,
+   `unaryOp_not`, `unaryOp_neg`, `cast_intToInt`, and tuple/ADT `aggregate`
+   constructors), `LiftLensStmts`, and `LiftLensBlock` (`return_`, `goto`,
+   `assert`, `switchInt`, and `drop_local`). Single-statement and whole-CFG
+   lens-view state-passing theorems
+   (`LiftDerefWrite.evalStmt_treeLens_putGet_and_frame`,
    `LiftDerefWrite.evalStmt_treeFieldLens_putGet_and_frame`,
+   `LiftDerefRead.evalOperand_eq_treeFieldLens_readView_and_step`,
    `LiftLensStmt.evalStmt_treeLens_views_and_frame`,
-   `mirWpConverges_of_sepLenses_treeLens_views`), `k`-ary `sepConjBindings`
-   entry/exit/family bridges, 1- and 2-field `ActiveTypedFieldMutBorrow`
-   entry/exit bridges, and `SupportedBy` frame preservation
+   `LiftLensStmt.evalStmt_subplaceTreeLens_views_and_frame`,
+   `mirWpConverges_of_sepLenses_treeLens_views`,
+   `mirWpConverges_of_sepSubplaceLenses_treeLens_views`), `k`-ary
+   `sepConjBindings` and `sepConjFieldBindings` entry/exit/family bridges,
+   unrestricted sub-place frame locality (`AgreeOnSubplaceFootprint`,
+   `SubplaceLocalSepProp`,
+   `sepConj_activeTypedFieldMutBorrow_preserved_one_subplace`,
+   `sepConj_activeTypedFieldMutBorrow_preserved_two_subplace`), and
+   `SupportedBy` frame preservation
    (`treeMemoryPtrMutLens_writeBack_supportedBy_family`,
    `treeFieldMemoryPtrMutLens_writeBack_supportedBy`,
+   `supportedBy_of_subplaceLensFramePreserved`,
    `verifyStatefulMir_of_sepLenses_supportedFrame`,
    `verifyTotalMir_of_sepLenses_supportedFrame`).
 3. **Section 3 (witnesses).** `MirWpConverges`, `StatefulVerificationResult`,
    and `TotalVerificationResult` for `add_assign` (wrapping, overflow-checked,
-   retagged, and field-reborrow retagged), `swap_u32` (both distinct allocations
-   and sibling field reborrows `&mut s.0` / `&mut s.1` on a shared struct
-   allocation), `max_assign_u32`, `not_assign`, `widen_assign`,
-   `neg_assign_i32`, `drop_temp_assign`, `swap_pair_u32`,
-   `swap_pair_tuple_rvalue` (`aggregate_tuple`), and `step_fib_pair_adt`
-   (`aggregate_adt`), plus concrete `I-10` non-vacuity witnesses including a
-   4-tag struct hierarchy where `swap_u32(&mut s.0, &mut s.1)` executes while
-   both the active parent `&mut s` and a third active sibling borrow `&mut s.2`
-   remain active in `R_frame`.
+   retagged, field-reborrow retagged at field `0`, and field-reborrow retagged
+   at arbitrary `fieldIdx`), `swap_u32` (both distinct allocations and sibling
+   field reborrows `&mut s.0` / `&mut s.1` on a shared struct allocation),
+   `max_assign_u32`, `not_assign`, `widen_assign`, `neg_assign_i32`,
+   `drop_temp_assign`, `swap_pair_u32`, `swap_pair_tuple_rvalue`
+   (`aggregate_tuple`), and `step_fib_pair_adt` (`aggregate_adt`), plus concrete
+   `I-10` non-vacuity witnesses including a 4-tag struct hierarchy where both
+   `swap_u32(&mut s.0, &mut s.1)` and `add_assign_retag(&mut s.1, d)` execute
+   while preserving the active parent `&mut s` and active sibling field borrows
+   (`&mut s.0` at field `0` and `&mut s.2` at field `2`) in `R_frame`.
 -/
 
 /-! ## 0. Elementary List & Borrow-Table Helpers -/
@@ -9631,6 +9646,1175 @@ theorem sepConj_activeTypedFieldMutBorrow_preserved_two {α β : Type}
   · intro addr; simp [fpTotal, fieldMutBorrowFootprint]
   · intro tag; simp [fpTotal, fieldMutBorrowFootprint]
 
+/-! ### Unrestricted Sub-Place Frame Locality (`AgreeOnSubplaceFootprint`) -/
+
+/--
+Sub-place footprint agreement (`AgreeOnSubplaceFootprint fp m₁ m₂`): `m₁` and
+`m₂` agree on `readFieldAt?` at every `(allocId, fieldIdx) ∈ fp.addrs`, on
+whole-slot `get?` at `(allocId, 0) ∈ fp.addrs` whenever `allocId` is not a
+variant-`0` aggregate in `m₁`, and on `lookupBorrow` at every `tag ∈ fp.tags`.
+
+Unlike `AgreeOnFootprint` (whose `readAllocAt?` at `offset = 0` inspects the
+entire aggregate value `.aggregate 0 elems` and therefore changes whenever any
+sibling field `fieldIdx > 0` is mutated), `AgreeOnSubplaceFootprint` inspects
+field `0` via `readFieldAt?`, so mutating `&mut s.1` preserves
+`ActiveTypedFieldMutBorrow` on `&mut s.0` in `R_frame` with no `hRootFree`
+side condition.
+-/
+def AgreeOnSubplaceFootprint (fp : Footprint) (m₁ m₂ : Memory) : Prop :=
+  (∀ allocId fieldIdx, (allocId, fieldIdx) ∈ fp.addrs →
+    readFieldAt? (memoryLocals m₁) allocId fieldIdx =
+      readFieldAt? (memoryLocals m₂) allocId fieldIdx ∧
+    (fieldIdx = 0 →
+      (∀ elems,
+        get? (memoryLocals m₁) allocId ≠ .some (.init (.aggregate 0 elems))) →
+      get? (memoryLocals m₁) allocId = get? (memoryLocals m₂) allocId)) ∧
+  (∀ tag, tag ∈ fp.tags →
+    lookupBorrow m₁.borrows tag = lookupBorrow m₂.borrows tag)
+
+/--
+A `SepProp` is sub-place local (`SubplaceLocalSepProp P`) when its truth on
+`⟨m, fp⟩` is invariant under `AgreeOnSubplaceFootprint fp m₁ m₂`.
+-/
+def SubplaceLocalSepProp (P : SepProp) : Prop :=
+  ∀ (fp : Footprint) (m₁ m₂ : Memory),
+    AgreeOnSubplaceFootprint fp m₁ m₂ → P ⟨m₁, fp⟩ → P ⟨m₂, fp⟩
+
+theorem subplaceLocalSepProp_emp : SubplaceLocalSepProp emp := by
+  intro _ _ _ _ hEmp
+  exact hEmp
+
+theorem subplaceLocalSepProp_borrowToken
+    (rp : RawPtrVal) (perm : TreeBorrowPerm) :
+    SubplaceLocalSepProp (BorrowToken rp perm) := by
+  intro fp m₁ m₂ hAgree ⟨⟨entry, hLook, hT, hP⟩, hFp⟩
+  dsimp only at hFp
+  have hTagIn : rp.tag ∈ fp.tags := by
+    rw [hFp]
+    exact List.Mem.head []
+  refine ⟨⟨entry, ?_, hT, hP⟩, hFp⟩
+  rw [← hAgree.2 rp.tag hTagIn]
+  exact hLook
+
+theorem subplaceLocalSepProp_fieldPointsTo
+    (rp : RawPtrVal) (fieldIdx : FieldIdx) (v : Value) :
+    SubplaceLocalSepProp (FieldPointsTo rp fieldIdx v) := by
+  intro fp m₁ m₂ hAgree ⟨hFld, hFp⟩
+  dsimp only at hFp
+  have hIn : (rp.allocId, fieldIdx) ∈ fp.addrs := by
+    rw [hFp]
+    exact List.Mem.head []
+  refine ⟨?_, hFp⟩
+  rw [← (hAgree.1 rp.allocId fieldIdx hIn).1]
+  exact hFld
+
+theorem subplaceLocalSepProp_activeTypedFieldMutBorrow {α : Type}
+    (rp : RawPtrVal) (fieldIdx : FieldIdx) (codec : ValueCodec α) (a : α) :
+    SubplaceLocalSepProp (ActiveTypedFieldMutBorrow rp fieldIdx codec a) := by
+  intro fp m₁ m₂ hAgree ⟨h₁, h₂, ⟨hs₁, hs₂, hDisj, hAddrs, hTags⟩, hP, hQ⟩
+  dsimp only at hs₁ hs₂
+  refine ⟨⟨m₂, h₁.footprint⟩, ⟨m₂, h₂.footprint⟩,
+    ⟨rfl, rfl, hDisj, hAddrs, hTags⟩, ?_, ?_⟩
+  · apply subplaceLocalSepProp_fieldPointsTo rp fieldIdx (codec.encode a)
+      h₁.footprint m₁ m₂
+    · refine ⟨fun allocId f hIn =>
+        hAgree.1 allocId f ((hAddrs _).mpr (Or.inl hIn)),
+        fun tag hIn => hAgree.2 tag ((hTags _).mpr (Or.inl hIn))⟩
+    · have hEq : h₁ = ⟨m₁, h₁.footprint⟩ := by
+        cases h₁; dsimp only at hs₁ ⊢; subst hs₁; rfl
+      exact hEq ▸ hP
+  · apply subplaceLocalSepProp_borrowToken rp .active h₂.footprint m₁ m₂
+    · refine ⟨fun allocId f hIn =>
+        hAgree.1 allocId f ((hAddrs _).mpr (Or.inr hIn)),
+        fun tag hIn => hAgree.2 tag ((hTags _).mpr (Or.inr hIn))⟩
+    · have hEq : h₂ = ⟨m₁, h₂.footprint⟩ := by
+        cases h₂; dsimp only at hs₂ ⊢; subst hs₂; rfl
+      exact hEq ▸ hQ
+
+theorem subplaceLocalSepProp_pointsTo_of_not_agg
+    (rp : RawPtrVal) (v : Value) (hOff : rp.offset = 0)
+    (hNotAgg : ∀ elems, v ≠ .aggregate 0 elems) :
+    SubplaceLocalSepProp (PointsTo rp v) := by
+  intro fp m₁ m₂ hAgree ⟨hPts, hFp⟩
+  dsimp only at hFp
+  have hIn : (rp.allocId, 0) ∈ fp.addrs := by
+    rw [hFp, ← hOff]
+    exact List.Mem.head []
+  refine ⟨?_, hFp⟩
+  unfold readAllocAt? at hPts ⊢
+  rw [hOff] at hPts ⊢
+  cases hGet₁ : get? (memoryLocals m₁) rp.allocId with
+  | none => rw [hGet₁] at hPts; nomatch hPts
+  | some slot₁ =>
+    rw [hGet₁] at hPts
+    cases slot₁ with
+    | dead => nomatch hPts
+    | uninit => nomatch hPts
+    | init val₁ =>
+      dsimp only at hPts
+      injection hPts with hValEq
+      subst hValEq
+      have hNoAgg :
+          ∀ elems,
+            get? (memoryLocals m₁) rp.allocId ≠
+              .some (.init (.aggregate 0 elems)) := by
+        intro elems hEq
+        rw [hGet₁] at hEq
+        injection hEq with hSlotEq
+        injection hSlotEq with hVEq
+        exact hNotAgg elems hVEq
+      have hGetEq := (hAgree.1 rp.allocId 0 hIn).2 rfl hNoAgg
+      rw [← hGetEq, hGet₁]
+
+theorem subplaceLocalSepProp_sepConj {P Q : SepProp}
+    (hP : SubplaceLocalSepProp P) (hQ : SubplaceLocalSepProp Q) :
+    SubplaceLocalSepProp (sepConj P Q) := by
+  intro fp m₁ m₂ hAgree ⟨h₁, h₂, ⟨hs₁, hs₂, hDisj, hAddrs, hTags⟩, hp, hq⟩
+  dsimp only at hs₁ hs₂
+  refine ⟨⟨m₂, h₁.footprint⟩, ⟨m₂, h₂.footprint⟩,
+    ⟨rfl, rfl, hDisj, hAddrs, hTags⟩, ?_, ?_⟩
+  · apply hP h₁.footprint m₁ m₂
+    · refine ⟨fun allocId f hIn =>
+        hAgree.1 allocId f ((hAddrs _).mpr (Or.inl hIn)),
+        fun tag hIn => hAgree.2 tag ((hTags _).mpr (Or.inl hIn))⟩
+    · have hEq : h₁ = ⟨m₁, h₁.footprint⟩ := by
+        cases h₁; dsimp only at hs₁ ⊢; subst hs₁; rfl
+      exact hEq ▸ hp
+  · apply hQ h₂.footprint m₁ m₂
+    · refine ⟨fun allocId f hIn =>
+        hAgree.1 allocId f ((hAddrs _).mpr (Or.inr hIn)),
+        fun tag hIn => hAgree.2 tag ((hTags _).mpr (Or.inr hIn))⟩
+    · have hEq : h₂ = ⟨m₁, h₂.footprint⟩ := by
+        cases h₂; dsimp only at hs₂ ⊢; subst hs₂; rfl
+      exact hEq ▸ hq
+
+theorem subplaceLocalSepProp_activeTypedMutBorrow_of_not_agg {α : Type}
+    (rp : RawPtrVal) (codec : ValueCodec α) (a : α) (hOff : rp.offset = 0)
+    (hNotAgg : ∀ elems, codec.encode a ≠ .aggregate 0 elems) :
+    SubplaceLocalSepProp (ActiveTypedMutBorrow rp codec a) :=
+  subplaceLocalSepProp_sepConj
+    (subplaceLocalSepProp_pointsTo_of_not_agg rp (codec.encode a) hOff hNotAgg)
+    (subplaceLocalSepProp_borrowToken rp .active)
+
+/--
+Sub-place footprint agreement for `treeFieldMemoryPtrMutLens.writeBack`: writing
+field `fieldIdx` of `rp.allocId` agrees with `m` on `AgreeOnSubplaceFootprint`
+for any `fp_frame` whose cells avoid `(rp.allocId, fieldIdx)` (including when
+`fp_frame` owns `(rp.allocId, 0)` and `fieldIdx > 0`).
+-/
+theorem treeFieldMemoryPtrMutLens_writeBack_agreeOnSubplaceFootprint
+    {α : Type} {rp : RawPtrVal} {fieldIdx : FieldIdx} {fieldTy : Ty}
+    {codec : ValueCodec α} {m : Memory} (a : α)
+    (hm : ValidTreeFieldMutBorrowLens rp fieldIdx fieldTy codec m)
+    {fp_frame : Footprint}
+    (hAddrs :
+      ∀ allocId offset, (allocId, offset) ∈ fp_frame.addrs →
+        allocId ≠ rp.allocId ∨ offset ≠ fieldIdx) :
+    AgreeOnSubplaceFootprint fp_frame m
+      ((treeFieldMemoryPtrMutLens rp fieldIdx codec).writeBack a m) := by
+  rw [treeFieldMemoryPtrMutLens_writeBack_eq_of_treeField
+    rp fieldIdx fieldTy codec a hm.exclusive]
+  rcases hm.valid_raw with ⟨⟨a₀, hFld₀⟩⟩
+  rcases eq_aggregate_of_readFieldAt_some hFld₀ with ⟨elems, hGet₀, _⟩
+  dsimp only [rawFieldMutLens]
+  refine ⟨fun allocId offset hIn => ?_, fun _ _ => ?_⟩
+  · rw [memoryLocals_updateMemoryLocals]
+    by_cases hEqAlloc : allocId = rp.allocId
+    · subst hEqAlloc
+      rcases hAddrs rp.allocId offset hIn with hNeAlloc | hNeFld
+      · exact absurd rfl hNeAlloc
+      · refine ⟨(readFieldAt_writeFieldAt_ne_eq _ _ _ hNeFld.symm).symm,
+          fun _ hNoAgg => absurd hGet₀ (hNoAgg elems)⟩
+    · refine ⟨?_, fun _ _ =>
+        (get?_writeFieldAt_ne_alloc _ _ _ hEqAlloc).symm⟩
+      unfold readFieldAt?
+      rw [get?_writeFieldAt_ne_alloc _ _ _ hEqAlloc]
+  · rw [updateMemoryLocals_borrows]
+
+/--
+Unrestricted 1-Field Exit Bridge
+(`sepConj_activeTypedFieldMutBorrow_preserved_one_subplace`):
+preserves `sepConj (ActiveTypedFieldMutBorrow rp fieldIdx codec a_new) R_frame`
+for **any** `fieldIdx : FieldIdx` (including `fieldIdx > 0` when sibling field
+`0` is held in `R_frame`) whenever `SubplaceLocalSepProp R_frame` holds, with
+no `hRootFree` side condition.
+-/
+theorem sepConj_activeTypedFieldMutBorrow_preserved_one_subplace {α : Type}
+    {frameLen : Nat} {rp : RawPtrVal} {fieldIdx : FieldIdx} {fieldTy : Ty}
+    {codec : ValueCodec α} {a_old a_new : α}
+    {R_frame : SepProp} {m₀ m_final : Memory}
+    (hSep :
+      SepProp.holdsIn
+        (sepConj (ActiveTypedFieldMutBorrow rp fieldIdx codec a_old) R_frame)
+        m₀)
+    (hInv_final :
+      SepSubplaceLensStateInv (singleFieldSubplace rp fieldIdx fieldTy)
+        frameLen [(rp, codec.encode a_new)] m_final)
+    (hWf : WfSingleFieldMutBorrow frameLen rp fieldIdx fieldTy m₀)
+    (hPres :
+      SubplaceLensFramePreserved (singleFieldSubplace rp fieldIdx fieldTy)
+        [(rp, codec.encode a_old)] m₀ m_final)
+    (h_R : SubplaceLocalSepProp R_frame) :
+    SepProp.holdsIn
+      (sepConj (ActiveTypedFieldMutBorrow rp fieldIdx codec a_new) R_frame)
+      m_final := by
+  rcases hSep with ⟨fp, h₁, hR₀, ⟨hs₁, hsR, hDisj, _, _⟩, hA₁, hR_holds₀⟩
+  dsimp only at hs₁ hsR
+  rcases activeTypedFieldMutBorrow_facts hA₁ with ⟨hFld₀, _, hCell₁, hTag₁⟩
+  have hFld₀_m₀ :
+      readFieldAt? (memoryLocals m₀) rp.allocId fieldIdx =
+        some (codec.encode a_old) := hs₁ ▸ hFld₀
+  rcases eq_aggregate_of_readFieldAt_some hFld₀_m₀ with ⟨elems₀, hGet₀, _⟩
+  have hValF := hInv_final.entries_valid rp (codec.encode a_new)
+    (List.Mem.head [])
+  unfold BorrowSubplace.entryValid singleFieldSubplace at hValF
+  simp only [ite_true] at hValF
+  rcases hValF with ⟨_, _, hFldF, hExclF⟩
+  have hAgree : AgreeOnSubplaceFootprint hR₀.footprint m₀ m_final := by
+    refine ⟨fun allocId offset hIn => ?_, fun tag hIn => ?_⟩
+    · rw [memoryLocals_of_callStack_nil hWf.callStack_nil,
+        memoryLocals_of_callStack_nil hInv_final.callStack_nil]
+      by_cases hEqAlloc : allocId = rp.allocId
+      · subst hEqAlloc
+        have hOffNeFld : offset ≠ fieldIdx := by
+          intro hEqF
+          subst hEqF
+          exact hDisj.1 (rp.allocId, offset) hCell₁ hIn
+        refine ⟨(hPres.fields_unchanged_outside rp.allocId offset ?_).symm,
+          fun _ hNoAgg => ?_⟩
+        · intro e he _
+          rw [List.mem_singleton.mp he]
+          exact ⟨fieldIdx, fieldTy, by simp [singleFieldSubplace],
+            hOffNeFld.symm⟩
+        · rw [memoryLocals_of_callStack_nil hWf.callStack_nil] at hGet₀
+          exact absurd hGet₀ (hNoAgg elems₀)
+      · have hLocEq :
+            get? m_final.callerLocals allocId =
+              get? m₀.callerLocals allocId := by
+          refine hPres.locals_unchanged_outside allocId ?_
+          intro e he
+          rw [List.mem_singleton.mp he]
+          exact hEqAlloc
+        refine ⟨?_, fun _ _ => hLocEq.symm⟩
+        unfold readFieldAt?
+        rw [hLocEq]
+    · refine (hPres.borrows_unchanged_outside tag ?_).symm
+      intro e he hEqT
+      rw [List.mem_singleton.mp he] at hEqT
+      subst hEqT
+      exact hDisj.2 rp.tag hTag₁ hIn
+  have hR_m₀ : R_frame ⟨m₀, hR₀.footprint⟩ := by
+    have hEqH : hR₀ = ⟨m₀, hR₀.footprint⟩ := by
+      cases hR₀; dsimp only at hsR ⊢; subst hsR; rfl
+    exact hEqH ▸ hR_holds₀
+  have hR_final : R_frame ⟨m_final, hR₀.footprint⟩ :=
+    h_R hR₀.footprint m₀ m_final hAgree hR_m₀
+  have hFldML :
+      readFieldAt? (memoryLocals m_final) rp.allocId fieldIdx =
+        some (codec.encode a_new) := by
+    rw [memoryLocals_of_callStack_nil hInv_final.callStack_nil]
+    exact hFldF
+  rcases hExclF.lookup_active with ⟨entryF, hLookF, hTF, _, hPermF, _, _⟩
+  have hA₁_final :
+      ActiveTypedFieldMutBorrow rp fieldIdx codec a_new
+        ⟨m_final, fieldMutBorrowFootprint rp fieldIdx⟩ :=
+    activeTypedFieldMutBorrow_intro hFldML ⟨entryF, hLookF, hTF, hPermF⟩
+  let fpTotal : Footprint := {
+    addrs := (rp.allocId, fieldIdx) :: hR₀.footprint.addrs
+    tags := rp.tag :: hR₀.footprint.tags
+  }
+  refine ⟨fpTotal,
+    ⟨m_final, fieldMutBorrowFootprint rp fieldIdx⟩,
+    ⟨m_final, hR₀.footprint⟩,
+    ⟨rfl, rfl, ⟨?_, ?_⟩, ?_, ?_⟩,
+    hA₁_final, hR_final⟩
+  · intro cell hIn₁ hInR
+    rw [List.mem_singleton.mp hIn₁] at hInR
+    exact hDisj.1 (rp.allocId, fieldIdx) hCell₁ hInR
+  · intro t hIn₁ hInR
+    rw [List.mem_singleton.mp hIn₁] at hInR
+    exact hDisj.2 rp.tag hTag₁ hInR
+  · intro addr; simp [fpTotal, fieldMutBorrowFootprint]
+  · intro tag; simp [fpTotal, fieldMutBorrowFootprint]
+
+/--
+Unrestricted 2-Field Exit Bridge
+(`sepConj_activeTypedFieldMutBorrow_preserved_two_subplace`):
+preserves two separated `ActiveTypedFieldMutBorrow` assertions with an arbitrary
+`SubplaceLocalSepProp R_frame` across `SubplaceLensFramePreserved` for any
+`fieldIdx₁, fieldIdx₂ : FieldIdx` (even when neither is `0`), with no
+`hRootFree` side condition.
+-/
+theorem sepConj_activeTypedFieldMutBorrow_preserved_two_subplace {α β : Type}
+    {frameLen : Nat} (rp₁ rp₂ : RawPtrVal)
+    (fieldIdx₁ fieldIdx₂ : FieldIdx) (fieldTy₁ fieldTy₂ : Ty)
+    (codec₁ : ValueCodec α) (codec₂ : ValueCodec β)
+    (a_old a_new : α) (b_old b_new : β)
+    {R_frame : SepProp} {m₀ m_final : Memory}
+    (hSep :
+      SepProp.holdsIn
+        (sepConj (ActiveTypedFieldMutBorrow rp₁ fieldIdx₁ codec₁ a_old)
+          (sepConj (ActiveTypedFieldMutBorrow rp₂ fieldIdx₂ codec₂ b_old)
+            R_frame))
+        m₀)
+    (hInv_final :
+      SepSubplaceLensStateInv
+        (pairFieldSubplace rp₁ rp₂ fieldIdx₁ fieldIdx₂ fieldTy₁ fieldTy₂)
+        frameLen [(rp₁, codec₁.encode a_new), (rp₂, codec₂.encode b_new)]
+        m_final)
+    (hWf₁ : WfSingleFieldMutBorrow frameLen rp₁ fieldIdx₁ fieldTy₁ m₀)
+    (hPres :
+      SubplaceLensFramePreserved
+        (pairFieldSubplace rp₁ rp₂ fieldIdx₁ fieldIdx₂ fieldTy₁ fieldTy₂)
+        [(rp₁, codec₁.encode a_old), (rp₂, codec₂.encode b_old)] m₀ m_final)
+    (h_R : SubplaceLocalSepProp R_frame) :
+    SepProp.holdsIn
+      (sepConj (ActiveTypedFieldMutBorrow rp₁ fieldIdx₁ codec₁ a_new)
+        (sepConj (ActiveTypedFieldMutBorrow rp₂ fieldIdx₂ codec₂ b_new)
+          R_frame))
+      m_final := by
+  rcases hSep with ⟨fp, h₁, h₂₃, ⟨hs₁, hs₂₃, hDisj₁, _, _⟩, hA₁,
+    h₂, hR₀, ⟨hs₂, hsR, hDisj₂, hAddrs₂₃, hTags₂₃⟩, hA₂, hR_holds₀⟩
+  dsimp only at hs₁ hs₂ hs₂₃ hsR
+  rcases activeTypedFieldMutBorrow_facts hA₁ with ⟨hFld₀₁, _, hCell₁, hTag₁⟩
+  rcases activeTypedFieldMutBorrow_facts hA₂ with ⟨hFld₀₂, _, hCell₂, hTag₂⟩
+  have hFld₁_m₀ :
+      readFieldAt? (memoryLocals m₀) rp₁.allocId fieldIdx₁ =
+        some (codec₁.encode a_old) := hs₁ ▸ hFld₀₁
+  have hFld₂_m₀ :
+      readFieldAt? (memoryLocals m₀) rp₂.allocId fieldIdx₂ =
+        some (codec₂.encode b_old) := (hs₂.trans hs₂₃) ▸ hFld₀₂
+  rcases eq_aggregate_of_readFieldAt_some hFld₁_m₀ with ⟨elems₁, hGet₀₁, _⟩
+  rcases eq_aggregate_of_readFieldAt_some hFld₂_m₀ with ⟨elems₂, hGet₀₂, _⟩
+  have hNeTag : rp₁.tag ≠ rp₂.tag := by
+    intro hEq
+    apply hDisj₁.2 rp₁.tag hTag₁
+    apply (hTags₂₃ _).mpr; left; rw [hEq]; exact hTag₂
+  have hNePtr : rp₁ ≠ rp₂ := fun hEq => hNeTag (congrArg RawPtrVal.tag hEq)
+  have hNeCell₁₂ : (rp₁.allocId, fieldIdx₁) ≠ (rp₂.allocId, fieldIdx₂) := by
+    intro hEq
+    apply hDisj₁.1 (rp₁.allocId, fieldIdx₁) hCell₁
+    apply (hAddrs₂₃ _).mpr; left; rw [hEq]; exact hCell₂
+  have hDisj₁R_addrs :
+      ∀ cell, cell ∈ h₁.footprint.addrs → cell ∉ hR₀.footprint.addrs := by
+    intro cell hc₁ hcR
+    exact hDisj₁.1 cell hc₁ ((hAddrs₂₃ cell).mpr (Or.inr hcR))
+  have hDisj₁R_tags :
+      ∀ t, t ∈ h₁.footprint.tags → t ∉ hR₀.footprint.tags := by
+    intro t ht₁ htR
+    exact hDisj₁.2 t ht₁ ((hTags₂₃ t).mpr (Or.inr htR))
+  have hSub₁ :
+      pairFieldSubplace rp₁ rp₂ fieldIdx₁ fieldIdx₂ fieldTy₁ fieldTy₂ rp₁ =
+        .field fieldIdx₁ fieldTy₁ := by
+    simp [pairFieldSubplace]
+  have hSub₂ :
+      pairFieldSubplace rp₁ rp₂ fieldIdx₁ fieldIdx₂ fieldTy₁ fieldTy₂ rp₂ =
+        .field fieldIdx₂ fieldTy₂ := by
+    simp [pairFieldSubplace, hNePtr.symm]
+  have hR_m₀ : R_frame ⟨m₀, hR₀.footprint⟩ := by
+    have hEqH : hR₀ = ⟨m₀, hR₀.footprint⟩ := by
+      cases hR₀; dsimp only at hsR hs₂₃ ⊢
+      have hS := hsR.trans hs₂₃; subst hS; rfl
+    exact hEqH ▸ hR_holds₀
+  have hAgree : AgreeOnSubplaceFootprint hR₀.footprint m₀ m_final := by
+    refine ⟨fun allocId offset hIn => ?_, fun tag hIn => ?_⟩
+    · rw [memoryLocals_of_callStack_nil hWf₁.callStack_nil,
+        memoryLocals_of_callStack_nil hInv_final.callStack_nil]
+      by_cases hTracked : allocId = rp₁.allocId ∨ allocId = rp₂.allocId
+      · refine ⟨(hPres.fields_unchanged_outside allocId offset ?_).symm,
+          fun _ hNoAgg => ?_⟩
+        · intro e he hEA
+          rcases List.mem_cons.mp he with rfl | hTl
+          · refine ⟨fieldIdx₁, fieldTy₁, hSub₁, ?_⟩
+            intro hEqF
+            dsimp only at hEA
+            rw [← hEA, ← hEqF] at hIn
+            exact hDisj₁R_addrs _ hCell₁ hIn
+          · rw [List.mem_singleton.mp hTl] at hEA ⊢
+            refine ⟨fieldIdx₂, fieldTy₂, hSub₂, ?_⟩
+            intro hEqF
+            dsimp only at hEA
+            rw [← hEA, ← hEqF] at hIn
+            exact hDisj₂.1 _ hCell₂ hIn
+        · rw [memoryLocals_of_callStack_nil hWf₁.callStack_nil] at hGet₀₁ hGet₀₂
+          rcases hTracked with rfl | rfl
+          · exact absurd hGet₀₁ (hNoAgg elems₁)
+          · exact absurd hGet₀₂ (hNoAgg elems₂)
+      · have hLocEq :
+            get? m_final.callerLocals allocId =
+              get? m₀.callerLocals allocId := by
+          refine hPres.locals_unchanged_outside allocId ?_
+          intro e he hEqA
+          rcases List.mem_cons.mp he with rfl | hTl
+          · exact hTracked (Or.inl hEqA)
+          · rw [List.mem_singleton.mp hTl] at hEqA
+            exact hTracked (Or.inr hEqA)
+        refine ⟨?_, fun _ _ => hLocEq.symm⟩
+        unfold readFieldAt?
+        rw [hLocEq]
+    · refine (hPres.borrows_unchanged_outside tag ?_).symm
+      intro e he hEqT
+      rcases List.mem_cons.mp he with rfl | hTl
+      · dsimp only at hEqT; subst hEqT
+        exact hDisj₁R_tags _ hTag₁ hIn
+      · rw [List.mem_singleton.mp hTl] at hEqT
+        dsimp only at hEqT; subst hEqT
+        exact hDisj₂.2 _ hTag₂ hIn
+  have hR_final : R_frame ⟨m_final, hR₀.footprint⟩ :=
+    h_R hR₀.footprint m₀ m_final hAgree hR_m₀
+  have hVal₁ := hInv_final.entries_valid rp₁ (codec₁.encode a_new)
+    (List.Mem.head _)
+  have hVal₂ := hInv_final.entries_valid rp₂ (codec₂.encode b_new)
+    (List.Mem.tail _ (List.Mem.head []))
+  unfold BorrowSubplace.entryValid at hVal₁ hVal₂
+  rw [hSub₁] at hVal₁
+  rw [hSub₂] at hVal₂
+  rcases hVal₁ with ⟨_, _, hFldF₁, hExclF₁⟩
+  rcases hVal₂ with ⟨_, _, hFldF₂, hExclF₂⟩
+  rcases hExclF₁.lookup_active with ⟨e₁, hL₁, hT₁, _, hP₁, _, _⟩
+  rcases hExclF₂.lookup_active with ⟨e₂, hL₂, hT₂, _, hP₂, _, _⟩
+  have hAF₁ :
+      ActiveTypedFieldMutBorrow rp₁ fieldIdx₁ codec₁ a_new
+        ⟨m_final, fieldMutBorrowFootprint rp₁ fieldIdx₁⟩ :=
+    activeTypedFieldMutBorrow_intro
+      (by rw [memoryLocals_of_callStack_nil hInv_final.callStack_nil]
+          exact hFldF₁)
+      ⟨e₁, hL₁, hT₁, hP₁⟩
+  have hAF₂ :
+      ActiveTypedFieldMutBorrow rp₂ fieldIdx₂ codec₂ b_new
+        ⟨m_final, fieldMutBorrowFootprint rp₂ fieldIdx₂⟩ :=
+    activeTypedFieldMutBorrow_intro
+      (by rw [memoryLocals_of_callStack_nil hInv_final.callStack_nil]
+          exact hFldF₂)
+      ⟨e₂, hL₂, hT₂, hP₂⟩
+  let fp₂R : Footprint := {
+    addrs := (rp₂.allocId, fieldIdx₂) :: hR₀.footprint.addrs
+    tags := rp₂.tag :: hR₀.footprint.tags
+  }
+  have hSep₂R :
+      sepConj (ActiveTypedFieldMutBorrow rp₂ fieldIdx₂ codec₂ b_new) R_frame
+        ⟨m_final, fp₂R⟩ := by
+    refine ⟨⟨m_final, fieldMutBorrowFootprint rp₂ fieldIdx₂⟩,
+      ⟨m_final, hR₀.footprint⟩, ⟨rfl, rfl, ⟨?_, ?_⟩, ?_, ?_⟩, hAF₂, hR_final⟩
+    · intro cell hc₂ hcR
+      rw [List.mem_singleton.mp hc₂] at hcR
+      exact hDisj₂.1 _ hCell₂ hcR
+    · intro t ht₂ htR
+      rw [List.mem_singleton.mp ht₂] at htR
+      exact hDisj₂.2 _ hTag₂ htR
+    · intro addr; simp [fp₂R, fieldMutBorrowFootprint]
+    · intro tag; simp [fp₂R, fieldMutBorrowFootprint]
+  let fpTotal : Footprint := {
+    addrs := (rp₁.allocId, fieldIdx₁) :: fp₂R.addrs
+    tags := rp₁.tag :: fp₂R.tags
+  }
+  refine ⟨fpTotal,
+    ⟨m_final, fieldMutBorrowFootprint rp₁ fieldIdx₁⟩,
+    ⟨m_final, fp₂R⟩,
+    ⟨rfl, rfl, ⟨?_, ?_⟩, ?_, ?_⟩,
+    hAF₁, hSep₂R⟩
+  · intro cell hc₁ hc₂R
+    rw [List.mem_singleton.mp hc₁] at hc₂R
+    rcases List.mem_cons.mp hc₂R with hEq₁₂ | hcR
+    · exact hNeCell₁₂ hEq₁₂
+    · exact hDisj₁R_addrs _ hCell₁ hcR
+  · intro t ht₁ ht₂R
+    rw [List.mem_singleton.mp ht₁] at ht₂R
+    rcases List.mem_cons.mp ht₂R with hEqT | htR
+    · exact hNeTag hEqT
+    · exact hDisj₁R_tags _ hTag₁ htR
+  · intro addr; simp [fpTotal, fieldMutBorrowFootprint]
+  · intro tag; simp [fpTotal, fieldMutBorrowFootprint]
+
+/-! ### `k`-Ary Field-Granular Lens Families & `SupportedBy` Bridges -/
+
+/--
+A typed field-granular mutable-borrow binding (`&mut s.fieldIdx`): pointer `rp`,
+field index `fieldIdx`, field type `fieldTy`, value codec `codec`, and current
+logical field value `val`.
+-/
+structure FieldMutBorrowBinding : Type 1 where
+  α : Type
+  rp : RawPtrVal
+  fieldIdx : FieldIdx
+  fieldTy : Ty
+  codec : ValueCodec α
+  val : α
+
+/--
+Build a `FieldMutBorrowBinding`, inferring the field type `α` from `codec`.
+-/
+def FieldMutBorrowBinding.bind {α : Type}
+    (rp : RawPtrVal) (fieldIdx : FieldIdx) (fieldTy : Ty)
+    (codec : ValueCodec α) (val : α) : FieldMutBorrowBinding :=
+  ⟨α, rp, fieldIdx, fieldTy, codec, val⟩
+
+/-- `ActiveTypedFieldMutBorrow b.rp b.fieldIdx b.codec b.val`. -/
+def FieldMutBorrowBinding.toSepProp (b : FieldMutBorrowBinding) : SepProp :=
+  ActiveTypedFieldMutBorrow b.rp b.fieldIdx b.codec b.val
+
+/-- Pure lens-state entry `(b.rp, b.codec.encode b.val)`. -/
+def FieldMutBorrowBinding.entry
+    (b : FieldMutBorrowBinding) : RawPtrVal × Value :=
+  (b.rp, b.codec.encode b.val)
+
+/-- Address cell `(allocId, fieldIdx)` owned by `b`'s `FieldPointsTo`. -/
+def FieldMutBorrowBinding.cell (b : FieldMutBorrowBinding) : Nat × Nat :=
+  (b.rp.allocId, b.fieldIdx)
+
+/--
+`k`-ary separating conjunction of field-granular mutable borrows
+`ATFMB b₁ ∗ ⋯ ∗ ATFMB bₖ ∗ R`, right-nested like the binary form.
+-/
+def sepConjFieldBindings
+    (bs : List FieldMutBorrowBinding) (R : SepProp) : SepProp :=
+  sepConjList (bs.map FieldMutBorrowBinding.toSepProp) R
+
+/-- Combined footprint of a field-binding list. -/
+def fieldBindingsFootprint (bs : List FieldMutBorrowBinding) : Footprint :=
+  { addrs := bs.map FieldMutBorrowBinding.cell, tags := bs.map (·.rp.tag) }
+
+/--
+Decomposition of `sepConjFieldBindings bs R` at `h`: every binding's field value
+and active borrow token are present in `h.state`, binding `(allocId, fieldIdx)`
+cells and tags are pairwise distinct and owned by `h`, and the frame `R` holds
+at a footprint `fpR ⊆ h.footprint` disjoint from every binding.
+-/
+theorem sepConjFieldBindings_split
+    {bs : List FieldMutBorrowBinding} {R : SepProp} {h : PartialHeap}
+    (hSep : sepConjFieldBindings bs R h) :
+    (∀ b ∈ bs,
+      readFieldAt? (memoryLocals h.state) b.rp.allocId b.fieldIdx =
+        some (b.codec.encode b.val) ∧
+      ∃ entry,
+        lookupBorrow h.state.borrows b.rp.tag = some entry ∧
+        entry.targetLocal = b.rp.allocId ∧
+        entry.perm = .active) ∧
+    bs.Pairwise (fun b₁ b₂ => b₁.cell ≠ b₂.cell ∧ b₁.rp.tag ≠ b₂.rp.tag) ∧
+    (∀ b ∈ bs, b.cell ∈ h.footprint.addrs ∧ b.rp.tag ∈ h.footprint.tags) ∧
+    ∃ fpR : Footprint,
+      R ⟨h.state, fpR⟩ ∧
+      (∀ b ∈ bs, b.cell ∉ fpR.addrs ∧ b.rp.tag ∉ fpR.tags) ∧
+      (∀ a ∈ fpR.addrs, a ∈ h.footprint.addrs) ∧
+      (∀ t ∈ fpR.tags, t ∈ h.footprint.tags) := by
+  induction bs generalizing h with
+  | nil =>
+    refine ⟨?_, List.Pairwise.nil, ?_, h.footprint, hSep, ?_,
+      fun _ ha => ha, fun _ ht => ht⟩
+    · intro _ hb; nomatch hb
+    · intro _ hb; nomatch hb
+    · intro _ hb; nomatch hb
+  | cons b rest ih =>
+    rcases hSep with ⟨h₁, h₂, ⟨hs₁, hs₂, hDisj, hAddrs, hTags⟩, hB, hRest⟩
+    rcases activeTypedFieldMutBorrow_facts hB with
+      ⟨hFld, hTok, hCell, hTag⟩
+    rcases ih hRest with ⟨hBind, hPair, hOwn, fpR, hR, hDisjR, hSubA, hSubT⟩
+    refine ⟨?_, ?_, ?_, fpR, ?_, ?_, ?_, ?_⟩
+    · intro b' hb'
+      rcases List.mem_cons.mp hb' with rfl | hb'
+      · rw [← hs₁]; exact ⟨hFld, hTok⟩
+      · rw [← hs₂]; exact hBind b' hb'
+    · refine List.pairwise_cons.mpr ⟨fun b' hb' => ⟨?_, ?_⟩, hPair⟩
+      · intro hEq
+        apply hDisj.1 _ hCell
+        have hIn := (hOwn b' hb').1
+        rw [← hEq] at hIn
+        exact hIn
+      · intro hEq
+        apply hDisj.2 _ hTag
+        have hIn := (hOwn b' hb').2
+        rw [← hEq] at hIn
+        exact hIn
+    · intro b' hb'
+      rcases List.mem_cons.mp hb' with rfl | hb'
+      · exact ⟨(hAddrs _).mpr (Or.inl hCell), (hTags _).mpr (Or.inl hTag)⟩
+      · exact ⟨(hAddrs _).mpr (Or.inr (hOwn b' hb').1),
+          (hTags _).mpr (Or.inr (hOwn b' hb').2)⟩
+    · rw [← hs₂]; exact hR
+    · intro b' hb'
+      rcases List.mem_cons.mp hb' with rfl | hb'
+      · exact ⟨fun hIn => hDisj.1 _ hCell (hSubA _ hIn),
+          fun hIn => hDisj.2 _ hTag (hSubT _ hIn)⟩
+      · exact hDisjR b' hb'
+    · intro a ha; exact (hAddrs a).mpr (Or.inr (hSubA a ha))
+    · intro t ht; exact (hTags t).mpr (Or.inr (hSubT t ht))
+
+/--
+Validity domain shared by a `k`-ary family of sibling field-granular `I-10`
+reborrow lenses on aggregate allocation `allocId`.
+-/
+structure ValidTreeFieldMutBorrowFamily
+    (bs : List FieldMutBorrowBinding) (allocId : Local) (m : Memory) :
+    Prop where
+  valid :
+    ∀ b ∈ bs,
+      b.rp.allocId = allocId ∧
+      ValidTreeFieldMutBorrowLens b.rp b.fieldIdx b.fieldTy b.codec m
+  pairwise_field : bs.Pairwise (fun b₁ b₂ => b₁.fieldIdx ≠ b₂.fieldIdx)
+
+theorem ValidTreeFieldMutBorrowFamily.writeBack
+    {bs : List FieldMutBorrowBinding} {allocId : Local} {m : Memory}
+    {b : FieldMutBorrowBinding} (hb : b ∈ bs)
+    (hValid : ValidTreeFieldMutBorrowFamily bs allocId m) (a : b.α) :
+    ValidTreeFieldMutBorrowFamily bs allocId
+      ((treeFieldMemoryPtrMutLens b.rp b.fieldIdx b.codec).writeBack a m) := by
+  refine ⟨fun b' hb' => ?_, hValid.pairwise_field⟩
+  rcases hValid.valid b hb with ⟨hAllocB, hValB⟩
+  rcases hValid.valid b' hb' with ⟨hAllocB', hValB'⟩
+  refine ⟨hAllocB', ?_⟩
+  by_cases hEq : b'.fieldIdx = b.fieldIdx
+  · have hSame : b' = b :=
+      eq_of_pairwise_ne_of_mem hValid.pairwise_field hb' hb hEq
+    subst hSame
+    exact
+      (treeFieldMemoryPtrMutLens_lawful b'.rp b'.fieldIdx b'.fieldTy
+        b'.codec).valid_writeBack a m hValB'
+  · have hPair :
+        ValidTreeFieldMutBorrowLensPair
+          b.rp b'.rp b.fieldIdx b'.fieldIdx b.fieldTy b'.fieldTy
+          b.codec b'.codec m :=
+      ⟨hValB, hValB', hAllocB.trans hAllocB'.symm, Ne.symm hEq⟩
+    exact
+      ((treeFieldMemoryPtrMutLens_independent_of_ne_field
+        b.rp b'.rp b.fieldIdx b'.fieldIdx b.fieldTy b'.fieldTy
+        b.codec b'.codec).valid_writeBack_left a m hPair).valid_right
+
+theorem treeFieldMemoryPtrMutLens_lawful_family
+    {bs : List FieldMutBorrowBinding} {allocId : Local}
+    {b : FieldMutBorrowBinding} (hb : b ∈ bs) :
+    LawfulMutLens (treeFieldMemoryPtrMutLens b.rp b.fieldIdx b.codec)
+      (ValidTreeFieldMutBorrowFamily bs allocId) where
+  valid_writeBack a _ hm := hm.writeBack hb a
+  readView_writeBack a m hm :=
+    (treeFieldMemoryPtrMutLens_lawful b.rp b.fieldIdx b.fieldTy
+      b.codec).readView_writeBack a m (hm.valid b hb).2
+  writeBack_readView m hm :=
+    (treeFieldMemoryPtrMutLens_lawful b.rp b.fieldIdx b.fieldTy
+      b.codec).writeBack_readView m (hm.valid b hb).2
+  writeBack_writeBack a₁ a₂ m hm :=
+    (treeFieldMemoryPtrMutLens_lawful b.rp b.fieldIdx b.fieldTy
+      b.codec).writeBack_writeBack a₁ a₂ m (hm.valid b hb).2
+
+theorem treeFieldMemoryPtrMutLens_independent_family
+    {bs : List FieldMutBorrowBinding} {allocId : Local}
+    {b₁ b₂ : FieldMutBorrowBinding}
+    (hb₁ : b₁ ∈ bs) (hb₂ : b₂ ∈ bs) (hNe : b₁.fieldIdx ≠ b₂.fieldIdx) :
+    IndependentLenses
+      (treeFieldMemoryPtrMutLens b₁.rp b₁.fieldIdx b₁.codec)
+      (treeFieldMemoryPtrMutLens b₂.rp b₂.fieldIdx b₂.codec)
+      (ValidTreeFieldMutBorrowFamily bs allocId) := by
+  have hPair :=
+    treeFieldMemoryPtrMutLens_independent_of_ne_field
+      b₁.rp b₂.rp b₁.fieldIdx b₂.fieldIdx b₁.fieldTy b₂.fieldTy
+      b₁.codec b₂.codec
+  have toPair :
+      ∀ m, ValidTreeFieldMutBorrowFamily bs allocId m →
+        ValidTreeFieldMutBorrowLensPair
+          b₁.rp b₂.rp b₁.fieldIdx b₂.fieldIdx b₁.fieldTy b₂.fieldTy
+          b₁.codec b₂.codec m :=
+    fun m hm =>
+      ⟨(hm.valid b₁ hb₁).2, (hm.valid b₂ hb₂).2,
+        (hm.valid b₁ hb₁).1.trans (hm.valid b₂ hb₂).1.symm, hNe⟩
+  exact {
+    valid_writeBack_left := fun a m hm => hm.writeBack hb₁ a
+    valid_writeBack_right := fun a m hm => hm.writeBack hb₂ a
+    readView_right_of_writeBack_left := fun a m hm =>
+      hPair.readView_right_of_writeBack_left a m (toPair m hm)
+    readView_left_of_writeBack_right := fun a m hm =>
+      hPair.readView_left_of_writeBack_right a m (toPair m hm)
+    writeBack_comm := fun a a' m hm => hPair.writeBack_comm a a' m (toPair m hm)
+  }
+
+/--
+`k`-ary field-granular `I-10` separation-to-lens bridge: a `k`-ary separating
+conjunction of `ActiveTypedFieldMutBorrow` bindings on the same aggregate
+allocation `allocId` automatically has pairwise distinct field indices and
+yields a `ValidTreeFieldMutBorrowFamily` in which every
+`treeFieldMemoryPtrMutLens` is lawful and every pair of distinct indices is
+independent.
+-/
+theorem sepConjFieldBindings_entails_independentTreeFieldLensFamily
+    {bs : List FieldMutBorrowBinding} {allocId : Local}
+    {R : SepProp} {m : Memory}
+    (hSep : SepProp.holdsIn (sepConjFieldBindings bs R) m)
+    (hAlloc : ∀ b ∈ bs, b.rp.allocId = allocId)
+    (hExcl :
+      ∀ b ∈ bs, TreeFieldExclusiveBorrow b.rp b.fieldIdx b.fieldTy m) :
+    ValidTreeFieldMutBorrowFamily bs allocId m ∧
+    (∀ (i : Nat) (hi : i < bs.length),
+      LawfulMutLens
+        (treeFieldMemoryPtrMutLens bs[i].rp bs[i].fieldIdx bs[i].codec)
+        (ValidTreeFieldMutBorrowFamily bs allocId)) ∧
+    (∀ (i j : Nat) (hi : i < bs.length) (hj : j < bs.length), i ≠ j →
+      IndependentLenses
+        (treeFieldMemoryPtrMutLens bs[i].rp bs[i].fieldIdx bs[i].codec)
+        (treeFieldMemoryPtrMutLens bs[j].rp bs[j].fieldIdx bs[j].codec)
+        (ValidTreeFieldMutBorrowFamily bs allocId)) := by
+  rcases hSep with ⟨fp, hSep⟩
+  rcases sepConjFieldBindings_split hSep with ⟨hBind, hPair, _, _⟩
+  have hPairField :
+      bs.Pairwise (fun b₁ b₂ => b₁.fieldIdx ≠ b₂.fieldIdx) := by
+    refine List.Pairwise.imp_of_mem ?_ hPair
+    intro b₁ b₂ hb₁ hb₂ hNe hEqF
+    apply hNe.1
+    show (b₁.rp.allocId, b₁.fieldIdx) = (b₂.rp.allocId, b₂.fieldIdx)
+    rw [hAlloc b₁ hb₁, hAlloc b₂ hb₂, hEqF]
+  have hValid : ValidTreeFieldMutBorrowFamily bs allocId m :=
+    ⟨fun b hb => ⟨hAlloc b hb, ⟨⟨⟨b.val, (hBind b hb).1⟩⟩, hExcl b hb⟩⟩,
+      hPairField⟩
+  refine ⟨hValid, fun i hi => treeFieldMemoryPtrMutLens_lawful_family
+    (List.getElem_mem hi), fun i j hi hj hNe => ?_⟩
+  refine treeFieldMemoryPtrMutLens_independent_family
+    (List.getElem_mem hi) (List.getElem_mem hj) ?_
+  rcases Nat.lt_or_gt_of_ne hNe with hLt | hGt
+  · exact List.pairwise_iff_getElem.mp hPairField i j hi hj hLt
+  · exact Ne.symm (List.pairwise_iff_getElem.mp hPairField j i hj hi hGt)
+
+/--
+Homogeneous `List` form of the `k`-ary field-granular `I-10` lens family bridge
+yielding `PairwiseIndependentLenses`.
+-/
+theorem sepConjFieldBindings_entails_pairwiseIndependentTreeFieldLenses
+    {α : Type} {codec : ValueCodec α} {fieldTy : Ty} {allocId : Local}
+    {ptrs : List (RawPtrVal × FieldIdx × α)} {R : SepProp} {m : Memory}
+    (hSep :
+      SepProp.holdsIn
+        (sepConjFieldBindings
+          (ptrs.map fun p =>
+            FieldMutBorrowBinding.bind p.1 p.2.1 fieldTy codec p.2.2) R)
+        m)
+    (hAlloc : ∀ p ∈ ptrs, p.1.allocId = allocId)
+    (hExcl :
+      ∀ p ∈ ptrs, TreeFieldExclusiveBorrow p.1 p.2.1 fieldTy m) :
+    ValidTreeFieldMutBorrowFamily
+      (ptrs.map fun p =>
+        FieldMutBorrowBinding.bind p.1 p.2.1 fieldTy codec p.2.2)
+      allocId m ∧
+    PairwiseIndependentLenses
+      (ValidTreeFieldMutBorrowFamily
+        (ptrs.map fun p =>
+          FieldMutBorrowBinding.bind p.1 p.2.1 fieldTy codec p.2.2)
+        allocId)
+      (ptrs.map fun p => treeFieldMemoryPtrMutLens p.1 p.2.1 codec) := by
+  let bs :=
+    ptrs.map fun p => FieldMutBorrowBinding.bind p.1 p.2.1 fieldTy codec p.2.2
+  have hAlloc' : ∀ b ∈ bs, b.rp.allocId = allocId := by
+    intro b hb
+    rcases List.mem_map.mp hb with ⟨p, hp, rfl⟩
+    exact hAlloc p hp
+  have hExcl' :
+      ∀ b ∈ bs, TreeFieldExclusiveBorrow b.rp b.fieldIdx b.fieldTy m := by
+    intro b hb
+    rcases List.mem_map.mp hb with ⟨p, hp, rfl⟩
+    exact hExcl p hp
+  rcases sepConjFieldBindings_entails_independentTreeFieldLensFamily
+      hSep hAlloc' hExcl' with
+    ⟨hValid, _, _⟩
+  refine ⟨hValid, ?_⟩
+  have hPairPtr :
+      ptrs.Pairwise (fun p₁ p₂ => p₁.2.1 ≠ p₂.2.1) := by
+    have h := hValid.pairwise_field
+    rw [List.pairwise_map] at h
+    exact h
+  have hSuffix :
+      ∀ sfx : List (RawPtrVal × FieldIdx × α),
+        (∀ p ∈ sfx, p ∈ ptrs) →
+        sfx.Pairwise (fun p₁ p₂ => p₁.2.1 ≠ p₂.2.1) →
+        PairwiseIndependentLenses (ValidTreeFieldMutBorrowFamily bs allocId)
+          (sfx.map fun p => treeFieldMemoryPtrMutLens p.1 p.2.1 codec) := by
+    intro sfx
+    induction sfx with
+    | nil => intro _ _; exact .nil
+    | cons p rest ih =>
+      intro hSub hPairSfx
+      rcases List.pairwise_cons.mp hPairSfx with ⟨hHead, hTail⟩
+      have hp :
+          FieldMutBorrowBinding.bind p.1 p.2.1 fieldTy codec p.2.2 ∈ bs :=
+        List.mem_map.mpr ⟨p, hSub p (List.Mem.head rest), rfl⟩
+      refine .cons (treeFieldMemoryPtrMutLens_lawful_family hp) ?_
+        (ih (fun q hq => hSub q (List.Mem.tail p hq)) hTail)
+      intro L hL
+      rcases List.mem_map.mp hL with ⟨q, hq, rfl⟩
+      have hq' :
+          FieldMutBorrowBinding.bind q.1 q.2.1 fieldTy codec q.2.2 ∈ bs :=
+        List.mem_map.mpr ⟨q, hSub q (List.Mem.tail p hq), rfl⟩
+      exact treeFieldMemoryPtrMutLens_independent_family hp hq' (hHead q hq)
+  exact hSuffix ptrs (fun _ h => h) hPairPtr
+
+/--
+MIR-level sub-place `AgreeOnFootprint` bridge: when
+`SubplaceLensFramePreserved subplaceOf entries₀ m₀ m` holds, `m₀` and `m`
+satisfy `AgreeOnFootprint fp m₀ m` for any footprint `fp` whose cells either
+avoid the tracked allocations or sit at non-root field offsets (`offset ≠ 0`)
+outside the tracked field indices.
+-/
+theorem agreeOnFootprint_of_subplaceLensFramePreserved
+    {subplaceOf : RawPtrVal → BorrowSubplace}
+    {entries₀ : List (RawPtrVal × Value)} {m₀ m : Memory}
+    (hPres : SubplaceLensFramePreserved subplaceOf entries₀ m₀ m)
+    (hStack₀ : m₀.callStack = []) (hStack : m.callStack = [])
+    {fp : Footprint}
+    (hAddrs :
+      ∀ allocId offset, (allocId, offset) ∈ fp.addrs →
+        (∀ e ∈ entries₀, allocId ≠ e.1.allocId) ∨
+        (offset ≠ 0 ∧
+          ∀ e ∈ entries₀, e.1.allocId = allocId →
+            ∃ f ty, subplaceOf e.1 = .field f ty ∧ f ≠ offset))
+    (hTags : ∀ tag ∈ fp.tags, ∀ e ∈ entries₀, tag ≠ e.1.tag) :
+    AgreeOnFootprint fp m₀ m := by
+  refine ⟨fun allocId offset hIn => ?_, fun tag hIn => ?_⟩
+  · rw [memoryLocals_of_callStack_nil hStack₀,
+      memoryLocals_of_callStack_nil hStack]
+    rcases hAddrs allocId offset hIn with hOutAlloc | ⟨hNeZero, hOutFld⟩
+    · unfold readAllocAt?
+      rw [hPres.locals_unchanged_outside allocId hOutAlloc]
+    · obtain ⟨k, rfl⟩ := Nat.exists_eq_succ_of_ne_zero hNeZero
+      rw [readAllocAt_succ_eq_readFieldAt, readAllocAt_succ_eq_readFieldAt]
+      exact (hPres.fields_unchanged_outside allocId (k + 1) hOutFld).symm
+  · exact (hPres.borrows_unchanged_outside tag (hTags tag hIn)).symm
+
+/--
+`SupportedBy R_frame fp_frame` heap predicates disjoint from the tracked
+sub-place footprint survive `SubplaceLensFramePreserved`.
+-/
+theorem supportedBy_of_subplaceLensFramePreserved
+    {subplaceOf : RawPtrVal → BorrowSubplace}
+    {entries₀ : List (RawPtrVal × Value)} {m₀ m : Memory}
+    (hPres : SubplaceLensFramePreserved subplaceOf entries₀ m₀ m)
+    (hStack₀ : m₀.callStack = []) (hStack : m.callStack = [])
+    {R_frame : HeapPred} {fp_frame : Footprint}
+    (hSupp : SupportedBy R_frame fp_frame)
+    (hAddrs :
+      ∀ allocId offset, (allocId, offset) ∈ fp_frame.addrs →
+        (∀ e ∈ entries₀, allocId ≠ e.1.allocId) ∨
+        (offset ≠ 0 ∧
+          ∀ e ∈ entries₀, e.1.allocId = allocId →
+            ∃ f ty, subplaceOf e.1 = .field f ty ∧ f ≠ offset))
+    (hTags : ∀ tag ∈ fp_frame.tags, ∀ e ∈ entries₀, tag ≠ e.1.tag)
+    (hR : R_frame m₀) :
+    R_frame m :=
+  hSupp m₀ m
+    (agreeOnFootprint_of_subplaceLensFramePreserved hPres hStack₀ hStack
+      hAddrs hTags)
+    hR
+
+/--
+Framed bridge from `mirWpConverges_of_sepSubplaceLenses` to
+`StatefulVerificationResult`: conjoins any `SupportedBy R_frame fp_frame` heap
+predicate avoiding the sub-place lens footprint onto the claim via
+`frameStatefulClaim`.
+-/
+theorem verifyStatefulMir_of_sepSubplaceLenses_supportedFrame
+    (body : CapturedMir)
+    (Pre : List Value → Memory → Prop)
+    (Post : List Value → Memory → Value → Memory → Prop)
+    (R_frame : HeapPred) (fp_frame : Footprint)
+    (hSupp : SupportedBy R_frame fp_frame)
+    (hStep :
+      ∀ args m₀,
+        Pre args m₀ →
+        ∃ (subplaceOf : RawPtrVal → BorrowSubplace)
+          (entries₀ entries' : List (RawPtrVal × Value)) (retVal : Value),
+          let env₀ := (initMachineState body args).frame.locals
+          LiftLensBlock body 0 env₀ entries₀ retVal entries' ∧
+          SepSubplaceLensStateInv subplaceOf env₀.length entries₀ m₀ ∧
+          (∀ allocId offset, (allocId, offset) ∈ fp_frame.addrs →
+            (∀ e ∈ entries₀, allocId ≠ e.1.allocId) ∨
+            (offset ≠ 0 ∧
+              ∀ e ∈ entries₀, e.1.allocId = allocId →
+                ∃ f ty, subplaceOf e.1 = .field f ty ∧ f ≠ offset)) ∧
+          (∀ tag ∈ fp_frame.tags, ∀ e ∈ entries₀, tag ≠ e.1.tag) ∧
+          ∀ m_final : Memory,
+            SepSubplaceLensStateInv subplaceOf env₀.length entries' m_final →
+            SubplaceLensFramePreserved subplaceOf entries₀ m₀ m_final →
+            Post args m₀ retVal m_final) :
+    StatefulVerificationResult
+      (frameStatefulClaim { body := body, pre := Pre, post := Post } R_frame) := by
+  refine verifyStatefulMirNoPanic_of_wpConverges _ ?_
+  intro args m₀ ⟨hPre, hR₀⟩
+  rcases hStep args m₀ hPre with
+    ⟨subplaceOf, entries₀, entries', retVal, hBlock, hInv₀, hAddrs, hTags,
+      hPost⟩
+  exact mirWpConverges_of_sepSubplaceLenses hBlock hInv₀
+    (fun m_final hInvF hPresF =>
+      ⟨hPost m_final hInvF hPresF,
+        supportedBy_of_subplaceLensFramePreserved hPresF hInv₀.callStack_nil
+          hInvF.callStack_nil hSupp hAddrs hTags hR₀⟩)
+
+/--
+Framed bridge from `mirWpConverges_of_sepSubplaceLenses` to
+`TotalVerificationResult` via `frameTotalClaim`.
+-/
+theorem verifyTotalMir_of_sepSubplaceLenses_supportedFrame
+    (body : CapturedMir)
+    (Pre : List Value → Memory → Prop)
+    (Post : List Value → Memory → Value → Memory → Prop)
+    (R_frame : HeapPred) (fp_frame : Footprint)
+    (hSupp : SupportedBy R_frame fp_frame)
+    (hStep :
+      ∀ args m₀,
+        Pre args m₀ →
+        ∃ (subplaceOf : RawPtrVal → BorrowSubplace)
+          (entries₀ entries' : List (RawPtrVal × Value)) (retVal : Value),
+          let env₀ := (initMachineState body args).frame.locals
+          LiftLensBlock body 0 env₀ entries₀ retVal entries' ∧
+          SepSubplaceLensStateInv subplaceOf env₀.length entries₀ m₀ ∧
+          (∀ allocId offset, (allocId, offset) ∈ fp_frame.addrs →
+            (∀ e ∈ entries₀, allocId ≠ e.1.allocId) ∨
+            (offset ≠ 0 ∧
+              ∀ e ∈ entries₀, e.1.allocId = allocId →
+                ∃ f ty, subplaceOf e.1 = .field f ty ∧ f ≠ offset)) ∧
+          (∀ tag ∈ fp_frame.tags, ∀ e ∈ entries₀, tag ≠ e.1.tag) ∧
+          ∀ m_final : Memory,
+            SepSubplaceLensStateInv subplaceOf env₀.length entries' m_final →
+            SubplaceLensFramePreserved subplaceOf entries₀ m₀ m_final →
+            Post args m₀ retVal m_final) :
+    TotalVerificationResult
+      (frameTotalClaim { body := body, pre := Pre, post := Post } R_frame) := by
+  refine verifyTotalMir_of_wpConverges _ ?_
+  intro args m₀ ⟨hPre, hR₀⟩
+  rcases hStep args m₀ hPre with
+    ⟨subplaceOf, entries₀, entries', retVal, hBlock, hInv₀, hAddrs, hTags,
+      hPost⟩
+  exact mirWpConverges_of_sepSubplaceLenses hBlock hInv₀
+    (fun m_final hInvF hPresF =>
+      ⟨hPost m_final hInvF hPresF,
+        supportedBy_of_subplaceLensFramePreserved hPresF hInv₀.callStack_nil
+          hInvF.callStack_nil hSupp hAddrs hTags hR₀⟩)
+
+/-! ### Unified Sub-Place `MutLens` View-Passing (`subplaceTreeMutLens`) -/
+
+/--
+Unified `I-10`-aware mutable lens for a tracked pointer `rp` under `subplaceOf`:
+dispatches to `treeMemoryPtrMutLens rp codec` when `subplaceOf rp = .root` and
+to `treeFieldMemoryPtrMutLens rp fieldIdx codec` when
+`subplaceOf rp = .field fieldIdx fieldTy`.
+-/
+def subplaceTreeMutLens {α : Type}
+    (subplaceOf : RawPtrVal → BorrowSubplace)
+    (rp : RawPtrVal) (codec : ValueCodec α) : MutLens Memory α :=
+  match subplaceOf rp with
+  | .root => treeMemoryPtrMutLens rp codec
+  | .field fieldIdx _ => treeFieldMemoryPtrMutLens rp fieldIdx codec
+
+/--
+Every lens-state binding `(rp, codec.encode a) ∈ entries` under
+`SepSubplaceLensStateInv` equals the `subplaceTreeMutLens` view of memory `m`.
+-/
+theorem SepSubplaceLensStateInv.subplaceTreeLens_readView {α : Type}
+    {subplaceOf : RawPtrVal → BorrowSubplace}
+    {frameLen : Nat} {entries : List (RawPtrVal × Value)} {m : Memory}
+    {rp : RawPtrVal} {codec : ValueCodec α} {a : α}
+    (hInv : SepSubplaceLensStateInv subplaceOf frameLen entries m)
+    (hMem : (rp, codec.encode a) ∈ entries) :
+    (subplaceTreeMutLens subplaceOf rp codec).readView m = a := by
+  have hVal := hInv.entries_valid rp (codec.encode a) hMem
+  unfold BorrowSubplace.entryValid at hVal
+  rcases hVal with ⟨hOff, _, hRest⟩
+  unfold subplaceTreeMutLens
+  cases hSub : subplaceOf rp with
+  | root =>
+    rw [hSub] at hRest
+    dsimp only [treeMemoryPtrMutLens]
+    apply memoryPtrMutLens_readView_of_readAllocAt
+    rw [memoryLocals_of_callStack_nil hInv.callStack_nil]
+    unfold readAllocAt?
+    rw [hRest.1, hOff]
+  | field fieldIdx fieldTy =>
+    rw [hSub] at hRest
+    dsimp only [treeFieldMemoryPtrMutLens]
+    apply rawFieldMutLens_readView_of_readFieldAt
+    rw [memoryLocals_of_callStack_nil hInv.callStack_nil]
+    exact hRest.1
+
+/--
+Every field-reborrow binding `(rp, codec.encode a) ∈ entries` with
+`subplaceOf rp = .field fieldIdx fieldTy` under `SepSubplaceLensStateInv`
+satisfies `ValidTreeFieldMutBorrowLens` and reads back `a` via
+`treeFieldMemoryPtrMutLens`.
+-/
+theorem SepSubplaceLensStateInv.treeFieldLens_readView {α : Type}
+    {subplaceOf : RawPtrVal → BorrowSubplace}
+    {frameLen : Nat} {entries : List (RawPtrVal × Value)} {m : Memory}
+    {rp : RawPtrVal} {fieldIdx : FieldIdx} {fieldTy : Ty}
+    {codec : ValueCodec α} {a : α}
+    (hInv : SepSubplaceLensStateInv subplaceOf frameLen entries m)
+    (hMem : (rp, codec.encode a) ∈ entries)
+    (hSub : subplaceOf rp = .field fieldIdx fieldTy) :
+    ValidTreeFieldMutBorrowLens rp fieldIdx fieldTy codec m ∧
+    (treeFieldMemoryPtrMutLens rp fieldIdx codec).readView m = a := by
+  have hVal := hInv.entries_valid rp (codec.encode a) hMem
+  unfold BorrowSubplace.entryValid at hVal
+  rcases hVal with ⟨_, _, hRest⟩
+  rw [hSub] at hRest
+  have hFld :
+      readFieldAt? (memoryLocals m) rp.allocId fieldIdx =
+        some (codec.encode a) := by
+    rw [memoryLocals_of_callStack_nil hInv.callStack_nil]
+    exact hRest.1
+  exact ⟨⟨⟨⟨a, hFld⟩⟩, hRest.2⟩,
+    rawFieldMutLens_readView_of_readFieldAt hFld⟩
+
+/--
+Read-side alias erasure for field-granular reborrows (`&mut s.fieldIdx`): under
+`SepSubplaceLensStateInv`, a lifted deref read `copy/move (*p)` on a pointer
+`rp` with `subplaceOf rp = .field fieldIdx fieldTy` leaves the `I-10` borrow
+table unchanged (`stepTreeBorrowHierarchyAccess? m rp false = .some m`),
+satisfies `ValidTreeFieldMutBorrowLens`, and returns
+`codec.encode ((treeFieldMemoryPtrMutLens rp fieldIdx codec).readView m)`.
+-/
+theorem LiftDerefRead.evalOperand_eq_treeFieldLens_readView_and_step
+    {α : Type} {subplaceOf : RawPtrVal → BorrowSubplace}
+    {env env' : PureEnv} {entries : List (RawPtrVal × Value)}
+    {op : Operand} {m : Memory} {codec : ValueCodec α} {a : α}
+    (h : LiftDerefRead env entries op (codec.encode a) env')
+    (hInv : SepSubplaceLensStateInv subplaceOf env.length entries m)
+    (layouts : LayoutTable) :
+    ∃ rp : RawPtrVal,
+      (rp, codec.encode a) ∈ entries ∧
+      (subplaceTreeMutLens subplaceOf rp codec).readView m = a ∧
+      evalOperand env op m.borrows m.globals layouts m.callerLocals =
+        .ok
+          (codec.encode
+            ((subplaceTreeMutLens subplaceOf rp codec).readView m))
+          env' ∧
+      ∀ fieldIdx fieldTy,
+        subplaceOf rp = .field fieldIdx fieldTy →
+        stepTreeBorrowHierarchyAccess? m rp false = .some m ∧
+        ValidTreeFieldMutBorrowLens rp fieldIdx fieldTy codec m ∧
+        (treeFieldMemoryPtrMutLens rp fieldIdx codec).readView m = a := by
+  have hEval := (h.evalOperand_and_freeze_eq_subplace hInv layouts).1
+  cases h with
+  | @copy_deref _ rp _ hGetPtr hLook =>
+    have hMem := lookupLensVal?_mem hLook
+    have hView := hInv.subplaceTreeLens_readView hMem
+    refine ⟨rp, hMem, hView, by rw [hView]; exact hEval,
+      fun fieldIdx fieldTy hSub => ?_⟩
+    rcases hInv.treeFieldLens_readView hMem hSub with ⟨hValid, hFView⟩
+    exact ⟨stepTreeBorrowHierarchyAccess_read_eq_some_self_of_treeField
+      hValid.exclusive, hValid, hFView⟩
+  | @move_deref _ rp _ hGetPtr hLook =>
+    have hMem := lookupLensVal?_mem hLook
+    have hView := hInv.subplaceTreeLens_readView hMem
+    refine ⟨rp, hMem, hView, by rw [hView]; exact hEval,
+      fun fieldIdx fieldTy hSub => ?_⟩
+    rcases hInv.treeFieldLens_readView hMem hSub with ⟨hValid, hFView⟩
+    exact ⟨stepTreeBorrowHierarchyAccess_read_eq_some_self_of_treeField
+      hValid.exclusive, hValid, hFView⟩
+
+/--
+Statement-level sub-place `MutLens` state-passing theorem with frame
+preservation (`LiftLensStmt.evalStmt_subplaceTreeLens_views_and_frame`): every
+lifted statement steps `evalStmt` to a post-state `m'` satisfying
+`SepSubplaceLensStateInv`, `SubplaceLensFramePreserved`, and
+`(subplaceTreeMutLens subplaceOf rp codec).readView m' = a` for every
+`(rp, codec.encode a) ∈ entries'`.
+-/
+theorem LiftLensStmt.evalStmt_subplaceTreeLens_views_and_frame
+    {subplaceOf : RawPtrVal → BorrowSubplace}
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {env env' : PureEnv} {entries₀ entries entries' : List (RawPtrVal × Value)}
+    {stmt : Statement} {s : MachineState} {m₀ : Memory}
+    (hStmt : LiftLensStmt localDecls layouts env entries stmt env' entries')
+    (hEnv : s.frame.locals = env)
+    (hInv : SepSubplaceLensStateInv subplaceOf env.length entries s.memory)
+    (hFrame : SubplaceLensFramePreserved subplaceOf entries₀ m₀ s.memory)
+    (hKeys : entries.map Prod.fst = entries₀.map Prod.fst) :
+    ∃ m' : Memory,
+      evalStmt s stmt localDecls layouts =
+        MirStepNode.step (advanceStmt s env' m') ∧
+      env'.length = env.length ∧
+      SepSubplaceLensStateInv subplaceOf env'.length entries' m' ∧
+      SubplaceLensFramePreserved subplaceOf entries₀ m₀ m' ∧
+      entries'.map Prod.fst = entries₀.map Prod.fst ∧
+      ∀ {α : Type} (rp : RawPtrVal) (codec : ValueCodec α) (a : α),
+        (rp, codec.encode a) ∈ entries' →
+        (subplaceTreeMutLens subplaceOf rp codec).readView m' = a := by
+  rcases hStmt.evalStmt_step_subplace hEnv hInv hFrame hKeys with
+    ⟨m', hEval, hLen, hInv', hFrame', hKeys'⟩
+  exact ⟨m', hEval, hLen, hInv', hFrame', hKeys',
+    fun _ _ _ hMem => hInv'.subplaceTreeLens_readView hMem⟩
+
+/--
+Multi-statement sub-place `MutLens` state-passing theorem
+(`LiftLensStmts.mirWpConverges_subplaceTreeLens_views`).
+-/
+theorem LiftLensStmts.mirWpConverges_subplaceTreeLens_views
+    {subplaceOf : RawPtrVal → BorrowSubplace}
+    {body : CapturedMir} {bbIdx : BasicBlockIdx} {bb : BasicBlockData}
+    {prefixStmts stmts : List Statement}
+    {env env' : PureEnv}
+    {entries₀ entries entries' : List (RawPtrVal × Value)}
+    {m₀ m : Memory} {Φ : MirOutcome → Prop}
+    (hPhase : body.phase = .runtimePostCleanup)
+    (hBb : get? body.basicBlocks bbIdx = .some bb)
+    (hStmts :
+      LiftLensStmts body.localDecls body.layouts
+        env entries stmts env' entries')
+    (hBbStmts : bb.statements = prefixStmts ++ stmts)
+    (hInv : SepSubplaceLensStateInv subplaceOf env.length entries m)
+    (hFrame : SubplaceLensFramePreserved subplaceOf entries₀ m₀ m)
+    (hKeys : entries.map Prod.fst = entries₀.map Prod.fst)
+    (hCont :
+      ∀ m' : Memory,
+        SepSubplaceLensStateInv subplaceOf env'.length entries' m' →
+        SubplaceLensFramePreserved subplaceOf entries₀ m₀ m' →
+        entries'.map Prod.fst = entries₀.map Prod.fst →
+        (∀ {α : Type} (rp : RawPtrVal) (codec : ValueCodec α) (a : α),
+          (rp, codec.encode a) ∈ entries' →
+          (subplaceTreeMutLens subplaceOf rp codec).readView m' = a) →
+        MirWpConverges body
+          { frame := {
+              blockIdx := bbIdx
+              stmtIdx := bb.statements.length
+              locals := env'
+            }
+            memory := m' }
+          Φ) :
+    MirWpConverges body
+      { frame := {
+          blockIdx := bbIdx
+          stmtIdx := prefixStmts.length
+          locals := env
+        }
+        memory := m }
+      Φ :=
+  mirWpConverges_of_liftLensStmts_subplace hPhase hBb hStmts prefixStmts m₀ m Φ
+    hBbStmts hInv hFrame hKeys (fun m' hInv' hFrame' hKeys' =>
+      hCont m' hInv' hFrame' hKeys'
+        (fun _ _ _ hMem => hInv'.subplaceTreeLens_readView hMem))
+
+/--
+Whole-CFG sub-place `MutLens` state-passing theorem
+(`mirWpConverges_of_sepSubplaceLenses_treeLens_views`): composes `LiftLensBlock`
+over `SepSubplaceLensStateInv` so that the final memory `m_final` satisfies
+`(subplaceTreeMutLens subplaceOf rp codec).readView m_final = a` for every final
+binding `(rp, codec.encode a) ∈ entries'` alongside `SepSubplaceLensStateInv`
+and `SubplaceLensFramePreserved`.
+-/
+theorem mirWpConverges_of_sepSubplaceLenses_treeLens_views
+    {subplaceOf : RawPtrVal → BorrowSubplace}
+    {body : CapturedMir} {bbIdx : BasicBlockIdx}
+    {env : PureEnv} {entries₀ entries' : List (RawPtrVal × Value)}
+    {retVal : Value} {m₀ : Memory} {Φ : MirOutcome → Prop}
+    (hBlock : LiftLensBlock body bbIdx env entries₀ retVal entries')
+    (hInv₀ : SepSubplaceLensStateInv subplaceOf env.length entries₀ m₀)
+    (hPost :
+      ∀ m_final : Memory,
+        SepSubplaceLensStateInv subplaceOf env.length entries' m_final →
+        SubplaceLensFramePreserved subplaceOf entries₀ m₀ m_final →
+        (∀ {α : Type} (rp : RawPtrVal) (codec : ValueCodec α) (a : α),
+          (rp, codec.encode a) ∈ entries' →
+          (subplaceTreeMutLens subplaceOf rp codec).readView m_final = a) →
+        Φ (.normal (retVal, m_final))) :
+    MirWpConverges body
+      { frame := { blockIdx := bbIdx, stmtIdx := 0, locals := env }
+        memory := m₀ }
+      Φ :=
+  mirWpConverges_of_sepSubplaceLenses hBlock hInv₀ (fun m_final hInvF hPresF =>
+    hPost m_final hInvF hPresF
+      (fun _ _ _ hMem => hInvF.subplaceTreeLens_readView hMem))
+
 /-! ## 3. Concrete Witnesses: `add_assign` and `swap_u32` -/
 
 def unitLayout : TypeLayout :=
@@ -11996,6 +13180,200 @@ theorem add_assign_retag_field_total
   verifyTotalMir_of_wpConverges _ (fun args m₀ hPre =>
     add_assign_retag_field_mirWpConverges x_ptr fieldTy x_old d_val R_frame h_R
       args m₀ hPre)
+
+/--
+Precondition for `add_assign_retag` invoked on a field-granular reborrow
+`&mut s.f` (`x_ptr`) at an arbitrary field index `fieldIdx : FieldIdx`,
+exercising `LiftRetag` protector attachment and protected dereference writes
+over `SepSubplaceLensStateInv` with unrestricted `SubplaceLocalSepProp` frame
+preservation (preserving sibling field borrows at `fieldIdx' = 0` even when
+`fieldIdx > 0`).
+-/
+def addAssignRetagFieldAnyPre
+    (x_ptr : RawPtrVal) (fieldIdx : FieldIdx) (fieldTy : Ty)
+    (x_old d_val : Nat) (R_frame : SepProp) :
+    List Value → Memory → Prop :=
+  fun args m₀ =>
+    args = [.ptr x_ptr.toMirPtr 8, .scalar ⟨d_val, 4⟩] ∧
+    WfSingleFieldMutBorrow 3 x_ptr fieldIdx fieldTy m₀ ∧
+    SepProp.holdsIn
+      (sepConj
+        (ActiveTypedFieldMutBorrow x_ptr fieldIdx (ValueCodec.scalarNat 4) x_old)
+        R_frame)
+      m₀
+
+def addAssignRetagFieldAnyPost
+    (x_ptr : RawPtrVal) (fieldIdx : FieldIdx) (x_old d_val : Nat)
+    (R_frame : SepProp) :
+    List Value → Memory → Value → Memory → Prop :=
+  fun _ _ retVal m_final =>
+    retVal = .unit ∧
+    SepProp.holdsIn
+      (sepConj
+        (ActiveTypedFieldMutBorrow x_ptr fieldIdx (ValueCodec.scalarNat 4)
+          (wrapScalarBits (x_old + d_val) (scalarModulus 4)))
+        R_frame)
+      m_final
+
+theorem add_assign_retag_field_any_mirWpConverges
+    (x_ptr : RawPtrVal) (fieldIdx : FieldIdx) (fieldTy : Ty)
+    (x_old d_val : Nat)
+    (R_frame : SepProp) (h_R : SubplaceLocalSepProp R_frame)
+    (args : List Value) (m₀ : Memory)
+    (hPre : addAssignRetagFieldAnyPre x_ptr fieldIdx fieldTy x_old d_val
+      R_frame args m₀) :
+    MirWpConverges add_assign_retag
+      (initMachineStateWithMemory add_assign_retag args m₀)
+      (mirNormalPost
+        (addAssignRetagFieldAnyPost x_ptr fieldIdx x_old d_val R_frame
+          args m₀)) := by
+  rcases hPre with ⟨rfl, hWf, hSep⟩
+  refine mirWpConverges_of_sepSubplaceLenses
+    (add_assign_retag_lift x_ptr x_old d_val)
+    (sepSubplaceLensStateInv_of_sepConj_one_field hSep hWf)
+    (fun m_final hInv hPres => ?_)
+  rw [updateLensVal_singleton_self] at hInv
+  exact ⟨rfl, sepConj_activeTypedFieldMutBorrow_preserved_one_subplace
+    hSep hInv hWf hPres h_R⟩
+
+theorem add_assign_retag_field_any_verified
+    (x_ptr : RawPtrVal) (fieldIdx : FieldIdx) (fieldTy : Ty)
+    (x_old d_val : Nat)
+    (R_frame : SepProp) (h_R : SubplaceLocalSepProp R_frame) :
+    StatefulVerificationResult {
+      body := add_assign_retag,
+      pre := addAssignRetagFieldAnyPre x_ptr fieldIdx fieldTy x_old d_val
+        R_frame,
+      post := addAssignRetagFieldAnyPost x_ptr fieldIdx x_old d_val R_frame
+    } :=
+  verifyStatefulMirNoPanic_of_wpConverges _ (fun args m₀ hPre =>
+    add_assign_retag_field_any_mirWpConverges x_ptr fieldIdx fieldTy x_old d_val
+      R_frame h_R args m₀ hPre)
+
+theorem add_assign_retag_field_any_total
+    (x_ptr : RawPtrVal) (fieldIdx : FieldIdx) (fieldTy : Ty)
+    (x_old d_val : Nat)
+    (R_frame : SepProp) (h_R : SubplaceLocalSepProp R_frame) :
+    TotalVerificationResult {
+      body := add_assign_retag,
+      pre := addAssignRetagFieldAnyPre x_ptr fieldIdx fieldTy x_old d_val
+        R_frame,
+      post := addAssignRetagFieldAnyPost x_ptr fieldIdx x_old d_val R_frame
+    } :=
+  verifyTotalMir_of_wpConverges _ (fun args m₀ hPre =>
+    add_assign_retag_field_any_mirWpConverges x_ptr fieldIdx fieldTy x_old d_val
+      R_frame h_R args m₀ hPre)
+
+theorem add_assign_retag_field1_demo_pre (a_old b_old c_old d_val : Nat) :
+    addAssignRetagFieldAnyPre demoField1Ptr 1
+      { kind := .uint .u32, layoutIdx := 1 }
+      b_old d_val
+      (sepConj
+        (ActiveTypedFieldMutBorrow demoField0Ptr 0
+          (ValueCodec.scalarNat 4) a_old)
+        (sepConj
+          (BorrowToken swapPairParentPtr .active)
+          (ActiveTypedFieldMutBorrow demoField2Ptr 2
+            (ValueCodec.scalarNat 4) c_old)))
+      [.ptr demoField1Ptr.toMirPtr 8, .scalar ⟨d_val, 4⟩]
+      (swapSiblingFieldsDemoMem a_old b_old c_old) := by
+  let m := swapSiblingFieldsDemoMem a_old b_old c_old
+  have hAbove : ∀ b ∈ m.borrows, 3 ≤ b.targetLocal := by
+    intro b hb
+    simp only [m, swapSiblingFieldsDemoMem, List.mem_cons, List.not_mem_nil,
+      or_false] at hb
+    rcases hb with rfl | rfl | rfl | rfl <;> decide
+  refine ⟨rfl, ⟨rfl, rfl, hAbove, by decide, ⟨rfl, ?_, ?_⟩⟩, ?_⟩
+  · exact ⟨_, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  · intro b hb _
+    simp only [swapSiblingFieldsDemoMem, List.mem_cons, List.not_mem_nil,
+      or_false] at hb
+    rcases hb with rfl | rfl | rfl | rfl
+    · exact Or.inr (Or.inl ⟨rfl, rfl⟩)
+    · exact Or.inl ⟨rfl, rfl⟩
+    · exact Or.inr (Or.inl ⟨rfl, rfl⟩)
+    · exact Or.inl ⟨rfl, rfl⟩
+  · let fpR : Footprint := { addrs := [(4, 2)], tags := [1, 4] }
+    let fp0R : Footprint := { addrs := [(4, 0), (4, 2)], tags := [2, 1, 4] }
+    let fp10R : Footprint :=
+      { addrs := [(4, 1), (4, 0), (4, 2)], tags := [3, 2, 1, 4] }
+    have hR :
+        sepConj (BorrowToken swapPairParentPtr .active)
+          (ActiveTypedFieldMutBorrow demoField2Ptr 2
+            (ValueCodec.scalarNat 4) c_old)
+          ⟨m, fpR⟩ := by
+      refine ⟨⟨m, { addrs := [], tags := [1] }⟩,
+        ⟨m, fieldMutBorrowFootprint demoField2Ptr 2⟩,
+        ⟨rfl, rfl,
+          by unfold DisjointFootprints fieldMutBorrowFootprint demoField2Ptr
+             dsimp only; decide,
+          ?_, ?_⟩,
+        ⟨⟨_, rfl, rfl, rfl⟩, rfl⟩,
+        activeTypedFieldMutBorrow_intro rfl ⟨_, rfl, rfl, rfl⟩⟩
+      · intro a; simp [fpR, fieldMutBorrowFootprint, demoField2Ptr]
+      · intro t; simp [fpR, fieldMutBorrowFootprint, demoField2Ptr]
+    have h0R :
+        sepConj
+          (ActiveTypedFieldMutBorrow demoField0Ptr 0
+            (ValueCodec.scalarNat 4) a_old)
+          (sepConj (BorrowToken swapPairParentPtr .active)
+            (ActiveTypedFieldMutBorrow demoField2Ptr 2
+              (ValueCodec.scalarNat 4) c_old))
+          ⟨m, fp0R⟩ := by
+      refine ⟨⟨m, fieldMutBorrowFootprint demoField0Ptr 0⟩,
+        ⟨m, fpR⟩,
+        ⟨rfl, rfl,
+          by unfold DisjointFootprints fieldMutBorrowFootprint demoField0Ptr
+             dsimp only [fpR]; decide,
+          ?_, ?_⟩,
+        activeTypedFieldMutBorrow_intro rfl ⟨_, rfl, rfl, rfl⟩, hR⟩
+      · intro a; simp [fp0R, fpR, fieldMutBorrowFootprint, demoField0Ptr]
+      · intro t; simp [fp0R, fpR, fieldMutBorrowFootprint, demoField0Ptr]
+    refine ⟨fp10R, ⟨m, fieldMutBorrowFootprint demoField1Ptr 1⟩,
+      ⟨m, fp0R⟩,
+      ⟨rfl, rfl,
+        by unfold DisjointFootprints fieldMutBorrowFootprint demoField1Ptr
+           dsimp only [fp0R]; decide,
+        ?_, ?_⟩,
+      activeTypedFieldMutBorrow_intro rfl ⟨_, rfl, rfl, rfl⟩, h0R⟩
+    · intro a; simp [fp10R, fp0R, fieldMutBorrowFootprint, demoField1Ptr]
+    · intro t; simp [fp10R, fp0R, fieldMutBorrowFootprint, demoField1Ptr]
+
+/--
+`add_assign_retag(&mut s.1, d_val)` runs to completion on the concrete 4-tag
+struct memory `swapSiblingFieldsDemoMem a_old b_old c_old`, mutating field `1`
+(`&mut s.1`, tag `3`) under a function-entry protector retag while preserving
+the sibling borrow on field `0` (`&mut s.0`, tag `2`, whose footprint contains
+`(4, 0)`), the active parent borrow `&mut s` (tag `1`), and the sibling borrow
+on field `2` (`&mut s.2`, tag `4`) in `R_frame`.
+-/
+theorem add_assign_retag_field1_demo_runs (a_old b_old c_old d_val : Nat) :
+    MirWpConverges add_assign_retag
+      (initMachineStateWithMemory add_assign_retag
+        [.ptr demoField1Ptr.toMirPtr 8, .scalar ⟨d_val, 4⟩]
+        (swapSiblingFieldsDemoMem a_old b_old c_old))
+      (mirNormalPost
+        (addAssignRetagFieldAnyPost demoField1Ptr 1 b_old d_val
+          (sepConj
+            (ActiveTypedFieldMutBorrow demoField0Ptr 0
+              (ValueCodec.scalarNat 4) a_old)
+            (sepConj
+              (BorrowToken swapPairParentPtr .active)
+              (ActiveTypedFieldMutBorrow demoField2Ptr 2
+                (ValueCodec.scalarNat 4) c_old)))
+          [.ptr demoField1Ptr.toMirPtr 8, .scalar ⟨d_val, 4⟩]
+          (swapSiblingFieldsDemoMem a_old b_old c_old))) :=
+  add_assign_retag_field_any_mirWpConverges demoField1Ptr 1
+    { kind := .uint .u32, layoutIdx := 1 }
+    b_old d_val _
+    (subplaceLocalSepProp_sepConj
+      (subplaceLocalSepProp_activeTypedFieldMutBorrow demoField0Ptr 0
+        (ValueCodec.scalarNat 4) a_old)
+      (subplaceLocalSepProp_sepConj
+        (subplaceLocalSepProp_borrowToken swapPairParentPtr .active)
+        (subplaceLocalSepProp_activeTypedFieldMutBorrow demoField2Ptr 2
+          (ValueCodec.scalarNat 4) c_old)))
+    _ _ (add_assign_retag_field1_demo_pre a_old b_old c_old d_val)
 
 /--
 `Runtime(PostCleanup)` MIR of

@@ -79,14 +79,23 @@ The module is imported by `theory/Anneal.lean` and registered in
   `treeFieldMemoryPtrMutLens_lawful`, `ValidTreeFieldMutBorrowLensPair`, and
   `treeFieldMemoryPtrMutLens_independent_of_ne_field` lift them to
   field-granular `I-10` reborrows (`&mut s.f` / `&mut s.g`, `f ≠ g`).
-  `FieldPointsTo` (`localSepProp_fieldPointsTo`), `ActiveTypedFieldMutBorrow`
-  (`localSepProp_activeTypedFieldMutBorrow`),
+  `FieldPointsTo` (`localSepProp_fieldPointsTo`,
+  `subplaceLocalSepProp_fieldPointsTo`), `ActiveTypedFieldMutBorrow`
+  (`localSepProp_activeTypedFieldMutBorrow`,
+  `subplaceLocalSepProp_activeTypedFieldMutBorrow`),
   `sepConj_entails_independentTreeFieldLenses`,
-  `treeFieldMemoryPtrMutLens_writeBack_agreeOnFootprint`, and
+  `FieldMutBorrowBinding`, `sepConjFieldBindings`,
+  `sepConjFieldBindings_split`, `ValidTreeFieldMutBorrowFamily`,
+  `treeFieldMemoryPtrMutLens_lawful_family`,
+  `treeFieldMemoryPtrMutLens_independent_family`,
+  `sepConjFieldBindings_entails_independentTreeFieldLensFamily`,
+  `sepConjFieldBindings_entails_pairwiseIndependentTreeFieldLenses`,
+  `treeFieldMemoryPtrMutLens_writeBack_agreeOnFootprint`,
+  `treeFieldMemoryPtrMutLens_writeBack_agreeOnSubplaceFootprint`, and
   `treeFieldMemoryPtrMutLens_writeBack_supportedBy` derive field-disjointness
-  (`f₁ ≠ f₂`), `ValidTreeFieldMutBorrowLensPair`, `IndependentLenses`,
-  `LawfulMutLens (prodMutLens ...)`, and `SupportedBy` frame preservation
-  directly from `sepConj`.
+  (`f₁ ≠ f₂`), binary and `k`-ary `LawfulMutLens` / `IndependentLenses` /
+  `PairwiseIndependentLenses`, and `SupportedBy` / `SubplaceLocalSepProp` frame
+  preservation directly from `sepConj` and `sepConjFieldBindings`.
 
 ### Section 2: lifting rules and soundness
 
@@ -149,19 +158,33 @@ The module is imported by `theory/Anneal.lean` and registered in
     `mirWpConverges_of_liftLensStmts_subplace`,
     `mirWpConverges_of_liftLensBlock_subplace`,
     `mirWpConverges_of_sepSubplaceLenses`,
-    `verifyStatefulMir_of_sepSubplaceLenses`, and
-    `verifyTotalMir_of_sepSubplaceLenses`, plus the 1- and 2-field bridges
-    `WfSingleFieldMutBorrow`, `sepSubplaceLensStateInv_of_sepConj_one_field`,
+    `verifyStatefulMir_of_sepSubplaceLenses`,
+    `verifyTotalMir_of_sepSubplaceLenses`,
+    `agreeOnFootprint_of_subplaceLensFramePreserved`,
+    `supportedBy_of_subplaceLensFramePreserved`,
+    `verifyStatefulMir_of_sepSubplaceLenses_supportedFrame`, and
+    `verifyTotalMir_of_sepSubplaceLenses_supportedFrame`, plus the 1- and
+    2-field bridges `WfSingleFieldMutBorrow`,
+    `sepSubplaceLensStateInv_of_sepConj_one_field`,
     `sepConj_activeTypedFieldMutBorrow_preserved_one`,
-    `sepSubplaceLensStateInv_of_sepConj_two_fields`, and
-    `sepConj_activeTypedFieldMutBorrow_preserved_two`.
+    `sepConj_activeTypedFieldMutBorrow_preserved_one_subplace`,
+    `sepSubplaceLensStateInv_of_sepConj_two_fields`,
+    `sepConj_activeTypedFieldMutBorrow_preserved_two`, and
+    `sepConj_activeTypedFieldMutBorrow_preserved_two_subplace` (over
+    `AgreeOnSubplaceFootprint` and `SubplaceLocalSepProp`, requiring zero
+    `hRootFree` side condition even when mutating `fieldIdx > 0` while sibling
+    field `0` is in `R_frame`).
 - Alias erasure at the semantic level: `LiftDerefWrite.evalStmt_eq` and
   `LiftDerefWrite.evalStmt_field_eq` give the exact memory after a lifted root
   or projected-field deref write. `SepLensStateInv.treeLens_readView`,
-  `LiftDerefRead.evalOperand_eq_treeLens_readView`, and
-  `LiftDerefRead.evalOperand_eq_treeLens_readView_and_step` equate MIR deref
-  reads to `treeMemoryPtrMutLens` views while leaving the `I-10` borrow table
-  unchanged under `stepTreeBorrowHierarchyAccess? m rp false = some m`.
+  `SepSubplaceLensStateInv.subplaceTreeLens_readView` (over unified
+  `subplaceTreeMutLens`), `SepSubplaceLensStateInv.treeFieldLens_readView`,
+  `LiftDerefRead.evalOperand_eq_treeLens_readView`,
+  `LiftDerefRead.evalOperand_eq_treeLens_readView_and_step`, and
+  `LiftDerefRead.evalOperand_eq_treeFieldLens_readView_and_step` equate MIR
+  deref reads to `treeMemoryPtrMutLens` and `treeFieldMemoryPtrMutLens` views
+  while leaving the `I-10` borrow table unchanged under
+  `stepTreeBorrowHierarchyAccess?`.
   `LiftDerefFieldRead.evalOperand_eq_rawFieldLens_readView` shows a projected
   deref field read returns
   `(rawFieldMutLens rp.allocId fieldIdx codec).readView m`, while
@@ -177,15 +200,20 @@ The module is imported by `theory/Anneal.lean` and registered in
   MIR deref writes directly to Section 1 `PutGet` and `IndependentLenses` for
   both `treeMemoryPtrMutLens` and `treeFieldMemoryPtrMutLens`.
 - Every lifted statement, statement list, and whole-CFG execution is lens-state
-  passing: `LiftLensStmt.evalStmt_treeLens_views` and
-  `LiftLensStmt.evalStmt_treeLens_views_and_frame` show that `evalStmt` steps
-  to a memory whose `treeMemoryPtrMutLens` views are the post lens state while
-  establishing `LensFramePreserved entries s.memory s'.memory`;
-  `LiftRetag.evalStmt_treeLens_views` specializes this to Tree Borrows retags;
-  and `LiftLensStmts.mirWpConverges_treeLens_views` and
-  `mirWpConverges_of_sepLenses_treeLens_views` compose this state-passing
-  invariant across multi-statement lists and whole-CFG `MirWpConverges`
-  executions.
+  passing under both whole-allocation and sub-place invariants:
+  `LiftLensStmt.evalStmt_treeLens_views`,
+  `LiftLensStmt.evalStmt_treeLens_views_and_frame`, and
+  `LiftLensStmt.evalStmt_subplaceTreeLens_views_and_frame` show that `evalStmt`
+  steps to a memory whose `treeMemoryPtrMutLens` / `subplaceTreeMutLens` views
+  are the post lens state while establishing `LensFramePreserved` /
+  `SubplaceLensFramePreserved`; `LiftRetag.evalStmt_treeLens_views` specializes
+  this to Tree Borrows retags; and
+  `LiftLensStmts.mirWpConverges_treeLens_views`,
+  `LiftLensStmts.mirWpConverges_subplaceTreeLens_views`,
+  `mirWpConverges_of_sepLenses_treeLens_views`, and
+  `mirWpConverges_of_sepSubplaceLenses_treeLens_views` compose this
+  state-passing invariant across multi-statement lists and whole-CFG
+  `MirWpConverges` executions.
 - General `List` / indexed composition:
   - `MutBorrowBinding`, `sepConjList`, and `sepConjBindings` (the `k`-ary,
     heterogeneous separating conjunction, right-nested like the binary form).
@@ -241,7 +269,7 @@ theorem is proved through `mirWpConverges_of_sepLenses` or
 | :--- | :--- | :--- |
 | `add_assign` | `(*_1) = Add(copy (*_1), copy _2); _0 = const (); return` | `add_assign_mirWpConverges`, `add_assign_verified`, `add_assign_total` |
 | `add_assign_checked` | bb0: `StorageLive(_3); _3 = AddWithOverflow(copy (*_1), copy _2); assert(!move (_3.1: bool)) -> bb1`; bb1: `(*_1) = move (_3.0: u32); StorageDead(_3); _0 = const (); return` | `add_assign_checked_mirWpConverges`, `add_assign_checked_verified`, `add_assign_checked_total` |
-| `add_assign_retag` | `Retag([fn entry] _1)` followed by the `add_assign` body (both root `&mut u32` and field reborrow `&mut s.0`) | `add_assign_retag_mirWpConverges`, `add_assign_retag_verified`, `add_assign_retag_total`, `add_assign_retag_field_mirWpConverges`, `add_assign_retag_field_verified`, `add_assign_retag_field_total` |
+| `add_assign_retag` | `Retag([fn entry] _1)` followed by the `add_assign` body (root `&mut u32`, field `0` reborrow `&mut s.0`, and arbitrary-field reborrow `&mut s.f`) | `add_assign_retag_mirWpConverges`, `add_assign_retag_verified`, `add_assign_retag_total`, `add_assign_retag_field_mirWpConverges`, `add_assign_retag_field_verified`, `add_assign_retag_field_total`, `add_assign_retag_field_any_mirWpConverges`, `add_assign_retag_field_any_verified`, `add_assign_retag_field_any_total` |
 | `swap_u32` | `StorageLive(_3); _3 = copy (*_1); (*_1) = copy (*_2); (*_2) = copy _3; _0 = const (); StorageDead(_3); return` (both distinct allocations and sibling field reborrows `&mut s.0`, `&mut s.1`) | `swap_u32_mirWpConverges`, `swap_u32_verified`, `swap_u32_total`, `swap_u32_sibling_fields_mirWpConverges`, `swap_u32_sibling_fields_verified`, `swap_u32_sibling_fields_total` |
 | `max_assign_u32` | bb0: `StorageLive(_3); _3 = Lt(copy (*_1), copy _2); switchInt(move _3) -> [0: bb2, otherwise: bb1]`; bb1: `(*_1) = copy _2; goto -> bb2`; bb2: `StorageDead(_3); _0 = const (); return` | `max_assign_u32_mirWpConverges`, `max_assign_u32_verified`, `max_assign_u32_total` |
 | `not_assign` | `(*_1) = Not(copy (*_1)); _0 = const (); return` | `not_assign_mirWpConverges`, `not_assign_verified`, `not_assign_total` |
@@ -265,12 +293,17 @@ the parent stays active after the child's write. `swap_u32_demo_pre` and
 and `swap_pair_u32_demo_pre` and `swap_pair_u32_demo_runs` do so for
 `swap_pair_u32` on a 2-field tuple pointee under an `I-10` parent/child borrow
 chain. Finally, `validTreeFieldMutBorrowLensPair_siblingFieldDemoMem`
-instantiates a 3-tag `I-10` sibling field-reborrow hierarchy, and
+instantiates a 3-tag `I-10` sibling field-reborrow hierarchy,
 `swap_u32_sibling_fields_demo_pre` / `swap_u32_sibling_fields_demo_runs` execute
 `swap_u32(&mut s.0, &mut s.1)` end to end on `swapSiblingFieldsDemoMem` (a
 4-tag hierarchy on caller slot `4` with active parent `&mut s` tag `1`, swapped
 children `&mut s.0` tag `2` and `&mut s.1` tag `3`, and an untouched active
-third sibling borrow `&mut s.2` tag `4` preserved inside `R_frame`).
+third sibling borrow `&mut s.2` tag `4` preserved inside `R_frame`), and
+`add_assign_retag_field1_demo_pre` / `add_assign_retag_field1_demo_runs` execute
+`add_assign_retag(&mut s.1, d_val)` on `swapSiblingFieldsDemoMem` while
+preserving the sibling borrow on field `0` (`&mut s.0`, whose footprint contains
+`(4, 0)`), the parent `BorrowToken` (`&mut s`), and the sibling borrow on field
+`2` (`&mut s.2`) in `R_frame`.
 
 ## 2. Scope and known limitations
 
@@ -303,13 +336,15 @@ third sibling borrow `&mut s.2` tag `4` preserved inside `R_frame`).
   sub-field cells `(allocId, k + 1)`), `sepConjBindings_preserved_of_rootAlloc`
   and `sepConj_activeTypedMutBorrow_preserved_one_of_rootAlloc` preserve any
   root-addressed frame (`RootAllocSepProp R_frame`). For field-granular borrows
-  (`ActiveTypedFieldMutBorrow`), whenever field `0` is among the borrowed
-  fields (such as `&mut s.0` or `(&mut s.0, &mut s.1)`), `(allocId, 0)` is
-  already excluded from `R_frame`'s footprint by `sepConj`, so
-  `sepConj_activeTypedFieldMutBorrow_preserved_one` and
-  `sepConj_activeTypedFieldMutBorrow_preserved_two` preserve **any**
-  `LocalSepProp R_frame` (including active parent `BorrowToken` and active
-  sibling `ActiveTypedFieldMutBorrow` assertions on the same allocation).
+  (`ActiveTypedFieldMutBorrow`), `AgreeOnSubplaceFootprint` and
+  `SubplaceLocalSepProp` (`subplaceLocalSepProp_fieldPointsTo`,
+  `subplaceLocalSepProp_activeTypedFieldMutBorrow`,
+  `subplaceLocalSepProp_sepConj`) resolve `(allocId, 0)` on `.aggregate 0 elems`
+  slots to field `0` (`readFieldAt? _ allocId 0`), so
+  `sepConj_activeTypedFieldMutBorrow_preserved_one_subplace` and
+  `sepConj_activeTypedFieldMutBorrow_preserved_two_subplace` preserve any
+  `SubplaceLocalSepProp R_frame` across arbitrary `fieldIdx : FieldIdx` (even
+  when mutating `fieldIdx > 0` while sibling field `0` is in `R_frame`).
 - Anneal's `rustc` capture does not request retag statements;
   `add_assign_retag` models `-Zmir-emit-retag` output to exercise `LiftRetag`.
 - `drop_temp_assign` is hand-written: rustc elaborates away `drop` of locals
@@ -351,8 +386,11 @@ open Anneal.SepLogicLenses
 #print axioms mirWpConverges_of_sepLenses_treeLens_views
 #print axioms mirWpConverges_of_liftLensBlock
 #print axioms mirWpConverges_of_sepSubplaceLenses
+#print axioms mirWpConverges_of_sepSubplaceLenses_treeLens_views
 #print axioms verifyStatefulMir_of_sepSubplaceLenses
 #print axioms verifyTotalMir_of_sepSubplaceLenses
+#print axioms verifyStatefulMir_of_sepSubplaceLenses_supportedFrame
+#print axioms verifyTotalMir_of_sepSubplaceLenses_supportedFrame
 #print axioms verifyStatefulMir_of_sepLenses_supportedFrame
 #print axioms verifyTotalMir_of_sepLenses_supportedFrame
 #print axioms sepLensStateInv_of_sepConjBindings
@@ -362,6 +400,8 @@ open Anneal.SepLogicLenses
 #print axioms sepConjBindings_entails_pairwiseIndependentLenses
 #print axioms sepConjBindings_entails_independentTreeLensFamily
 #print axioms sepConjBindings_entails_pairwiseIndependentTreeLenses
+#print axioms sepConjFieldBindings_entails_independentTreeFieldLensFamily
+#print axioms sepConjFieldBindings_entails_pairwiseIndependentTreeFieldLenses
 #print axioms treeMemoryPtrMutLens_writeBack_supportedBy_family
 #print axioms rawFieldMutLens_lawful
 #print axioms rawFieldMutLens_independent_of_ne_field
@@ -371,8 +411,10 @@ open Anneal.SepLogicLenses
 #print axioms treeFieldMemoryPtrMutLens_writeBack_supportedBy
 #print axioms sepSubplaceLensStateInv_of_sepConj_one_field
 #print axioms sepConj_activeTypedFieldMutBorrow_preserved_one
+#print axioms sepConj_activeTypedFieldMutBorrow_preserved_one_subplace
 #print axioms sepSubplaceLensStateInv_of_sepConj_two_fields
 #print axioms sepConj_activeTypedFieldMutBorrow_preserved_two
+#print axioms sepConj_activeTypedFieldMutBorrow_preserved_two_subplace
 #print axioms add_assign_verified
 #print axioms add_assign_total
 #print axioms add_assign_checked_verified
@@ -381,6 +423,8 @@ open Anneal.SepLogicLenses
 #print axioms add_assign_retag_total
 #print axioms add_assign_retag_field_verified
 #print axioms add_assign_retag_field_total
+#print axioms add_assign_retag_field_any_verified
+#print axioms add_assign_retag_field_any_total
 #print axioms swap_u32_verified
 #print axioms swap_u32_total
 #print axioms swap_u32_sibling_fields_verified
@@ -403,7 +447,9 @@ open Anneal.SepLogicLenses
 #print axioms step_fib_pair_adt_total
 #print axioms LiftLensStmt.evalStmt_treeLens_views
 #print axioms LiftLensStmt.evalStmt_treeLens_views_and_frame
+#print axioms LiftLensStmt.evalStmt_subplaceTreeLens_views_and_frame
 #print axioms LiftLensStmts.mirWpConverges_treeLens_views
+#print axioms LiftLensStmts.mirWpConverges_subplaceTreeLens_views
 #print axioms LiftRetag.evalStmt_treeLens_views
 #print axioms i32NegBits_spec
 #print axioms LiftDerefWrite.evalStmt_eq_treeLens_writeBack
@@ -412,6 +458,7 @@ open Anneal.SepLogicLenses
 #print axioms LiftDerefWrite.evalStmt_treeFieldLens_putGet_and_frame
 #print axioms LiftDerefRead.evalOperand_eq_treeLens_readView
 #print axioms LiftDerefRead.evalOperand_eq_treeLens_readView_and_step
+#print axioms LiftDerefRead.evalOperand_eq_treeFieldLens_readView_and_step
 #print axioms LiftDerefFieldRead.evalOperand_eq_rawFieldLens_readView
 #print axioms sepConjBindings_pairwise_disjointFootprints
 #print axioms sepConjBindings_targetLocal_pairwise_ne
@@ -421,6 +468,7 @@ open Anneal.SepLogicLenses
 #print axioms swap_pair_u32_demo_runs
 #print axioms validTreeFieldMutBorrowLensPair_siblingFieldDemoMem
 #print axioms swap_u32_sibling_fields_demo_runs
+#print axioms add_assign_retag_field1_demo_runs
 EOF
 (cd examples && anneal-lean-run --mode file --concurrency 2 -- \
   lake env lean /tmp/ff_4_1_axioms.lean)
@@ -452,8 +500,9 @@ Expected: no output.
 | B3 | `ff41b` | `opus-5.5-max` | Every lifted statement proved to be lens-state passing on `treeMemoryPtrMutLens` views (`LiftLensStmt.evalStmt_treeLens_views`), retags proved to be the identity on lens views (`LiftRetag.evalStmt_treeLens_views`), `i32NegBits_spec`, corrected `drop_temp_assign` MIR shape and marked it hand-written, comment rewraps. |
 | A3 | `ff41a` | `gemini-launch-candidate-high` | Added projected deref field reads/writes (`LiftDerefFieldRead`, `LiftDerefWrite.field`) and non-empty aggregate construction (`LiftLensOperands`, `LiftLensRvalue.aggregate_tuple`/`aggregate_adt`); added `RootAllocSepProp` and `sepConjBindings_preserved_of_rootAlloc` for aggregate pointees; added sub-allocation field lenses `rawFieldMutLens` and `treeFieldMemoryPtrMutLens` (`LawfulMutLens` and `IndependentLenses` for sibling field reborrows `&mut s.f` / `&mut s.g`); composed `evalStmt_treeLens_views` with `LensFramePreserved`, `LiftLensStmts`, and `mirWpConverges_of_sepLenses_treeLens_views`; added `swap_pair_u32` and 3-tag sibling field-reborrow non-vacuity witness `validTreeFieldMutBorrowLensPair_siblingFieldDemoMem`. |
 | B4 | `ff41b` | `gemini-pro-coordinator` | Closed Section 1 / Section 2 field-granular `SepLogic` and MIR execution gaps via `FieldPointsTo`, `ActiveTypedFieldMutBorrow`, `sepConj_entails_independentTreeFieldLenses`, `treeFieldMemoryPtrMutLens_writeBack_supportedBy`, `SepSubplaceLensStateInv`, `LiftDerefWrite.evalStmt_treeFieldLens_putGet_and_frame`, `mirWpConverges_of_sepSubplaceLenses`, and `LiftDerefWrite.field_evalStmt_eq_rawFieldLens_writeBack`; executed `swap_u32(&mut s.0, &mut s.1)` and `add_assign_retag(&mut s.0, d)` on shared struct allocations (plus 4-tag non-vacuity witness `swap_u32_sibling_fields_demo_runs` preserving active parent `&mut s` and active third sibling `&mut s.2`); added `swap_pair_tuple_rvalue` (`aggregate_tuple`) and `step_fib_pair_adt` (`aggregate_adt`); fixed `aggregate_adt` scope note and 80-col wraps. |
+| A4 | `ff41a` | `gemini-launch-candidate-high` | Removed `hRootFree` restriction from field-granular frame preservation via `AgreeOnSubplaceFootprint`, `SubplaceLocalSepProp`, `sepConj_activeTypedFieldMutBorrow_preserved_one_subplace`, and `sepConj_activeTypedFieldMutBorrow_preserved_two_subplace`; added `k`-ary `FieldMutBorrowBinding`, `sepConjFieldBindings`, `sepConjFieldBindings_entails_independentTreeFieldLensFamily`, `sepConjFieldBindings_entails_pairwiseIndependentTreeFieldLenses`, and `SupportedBy` sub-place bridges (`verifyStatefulMir_of_sepSubplaceLenses_supportedFrame`, `verifyTotalMir_of_sepSubplaceLenses_supportedFrame`); added unified `subplaceTreeMutLens`, `LiftDerefRead.evalOperand_eq_treeFieldLens_readView_and_step`, `LiftLensStmt.evalStmt_subplaceTreeLens_views_and_frame`, `LiftLensStmts.mirWpConverges_subplaceTreeLens_views`, and `mirWpConverges_of_sepSubplaceLenses_treeLens_views`; added arbitrary-field `add_assign_retag_field_any_verified`/`total` and 4-tag non-zero field witness `add_assign_retag_field1_demo_runs`. |
 
-Passes A0–A3 and B1–B3 ran on primary frontier pools
+Passes A0–A4 and B1–B3 ran on primary frontier pools
 (`gemini-launch-candidate-high` and `opus-5.5-max`); before Pass B4,
 `coordinator` switched `ff41b` to the Reserve Frontier Pool
 `gemini-pro-coordinator` (`[diversity-reduced]`) after `opus-5.5-max` reached
