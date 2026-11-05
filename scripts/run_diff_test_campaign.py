@@ -79,6 +79,20 @@ VALID_NOT_COMPARED_REASONS = (
     "external_call",
 )
 
+VALID_ITREE_DIAG_TAGS = (
+    "ok",
+    "outcome_mismatch",
+    "unexpected_ext_call",
+    "call_arg_mismatch",
+    "branch_tag_mismatch",
+    "unconsumed_events",
+    "step_faulted",
+    "decode_arg_failed",
+    "decode_event_failed",
+    "decode_outcome_failed",
+    "out_of_fuel",
+)
+
 # Integer count keys that a harness JSON summary may carry.
 HARNESS_INT_KEYS = (
     "batches",
@@ -96,6 +110,16 @@ HARNESS_INT_KEYS = (
     "opt_level_2_compiled",
     "opt_level_0_and_2_compiled",
     "instrumented_compiled",
+    "trials_per_candidate",
+    "agree_candidates",
+    "diverge_candidates",
+    "not_compared_candidates",
+    "total_traces_executed",
+    "distinct_traces_checked",
+    "agree_traces",
+    "diverge_traces",
+    "kernel_confirmed_traces",
+    "distinct_obs_paths",
 )
 
 # Ledger keys that earlier compile-only versions of this runner dropped when
@@ -430,6 +454,218 @@ def validate_performed_miri_summary(summary: dict[str, Any]) -> tuple[bool, str]
             return False, f"finding[{idx}] has non-boolean 'kernel_confirmed'"
 
     return True, "ok"
+
+
+def validate_performed_itree_summary(summary: dict[str, Any]) -> tuple[bool, str]:
+    """Checks that an `itree-difftest` summary claiming `performed` is complete."""
+    if summary.get("harness") != "itree-difftest":
+        return False, f"expected harness='itree-difftest', got {summary.get('harness')!r}"
+    if summary.get("oracle_comparison") != "performed":
+        return (
+            False,
+            f"expected oracle_comparison='performed', got {summary.get('oracle_comparison')!r}",
+        )
+
+    req_ints = (
+        "batches",
+        "batch_size",
+        "trials_per_candidate",
+        "total_candidates",
+        "unsafe_token_violations",
+        "opt_level_0_compiled",
+        "opt_level_2_compiled",
+        "opt_level_0_and_2_compiled",
+        "instrumented_compiled",
+        "compared_candidates",
+        "agree_candidates",
+        "diverge_candidates",
+        "not_compared_candidates",
+        "total_traces_executed",
+        "distinct_traces_checked",
+        "agree_traces",
+        "diverge_traces",
+        "kernel_confirmed_traces",
+        "kernel_confirmed_divergences",
+        "distinct_obs_paths",
+    )
+    for k in req_ints:
+        if not is_nonneg_int(summary.get(k)):
+            return False, f"missing or invalid integer field {k!r}"
+
+    elapsed = summary.get("elapsed_ms")
+    if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
+        return False, "missing or invalid numeric field 'elapsed_ms'"
+
+    if not is_int_map(summary.get("diag_tag_counts"), VALID_ITREE_DIAG_TAGS):
+        return False, "missing or invalid 'diag_tag_counts' map"
+    if not is_int_map(summary.get("per_candidate_distinct_traces")):
+        return False, "missing or invalid 'per_candidate_distinct_traces' map"
+    if not is_int_map(summary.get("mutator_applications")):
+        return False, "missing or invalid 'mutator_applications' map"
+
+    findings = summary.get("findings")
+    if not isinstance(findings, list):
+        return False, "missing or invalid 'findings' list"
+    for idx, f in enumerate(findings):
+        if not isinstance(f, dict):
+            return False, f"itree finding[{idx}] is not a JSON object"
+        for str_key in (
+            "finding_id",
+            "fn_name",
+            "case_ident",
+            "diag_tag",
+            "diag_repr",
+            "trace_hex",
+            "checked_mir_module",
+            "repro_path",
+        ):
+            val = f.get(str_key)
+            if not isinstance(val, str) or not val.strip():
+                return False, f"itree finding[{idx}] has missing or empty {str_key!r}"
+        if f["diag_tag"] == "ok" or f["diag_tag"] not in VALID_ITREE_DIAG_TAGS:
+            return (
+                False,
+                f"itree finding[{idx}] has invalid divergence diag_tag {f['diag_tag']!r}",
+            )
+        if not isinstance(f.get("kernel_confirmed"), bool):
+            return False, f"itree finding[{idx}] has non-boolean 'kernel_confirmed'"
+
+    return True, "ok"
+
+
+def itree_signature_for_seed_check(summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "diag_tag_counts": dict(summary.get("diag_tag_counts", {})),
+        "distinct_obs_paths": int(summary.get("distinct_obs_paths", 0)),
+        "mutator_applications": dict(summary.get("mutator_applications", {})),
+    }
+
+
+def evaluate_itree_red_flags(
+    summary: dict[str, Any],
+    itree_seed: int,
+    ledger: dict[str, Any],
+    min_oracle_elapsed_ms: float,
+) -> RedFlagResult:
+    """Runs red-flag vacuity checks on an `itree-difftest` oracle summary."""
+    reasons: list[str] = []
+
+    total = int(summary["total_candidates"])
+    unsafe_violations = int(summary["unsafe_token_violations"])
+    opt_both = int(summary["opt_level_0_and_2_compiled"])
+    compared = int(summary["compared_candidates"])
+    agree_cands = int(summary["agree_candidates"])
+    diverge_cands = int(summary["diverge_candidates"])
+    not_compared_cands = int(summary["not_compared_candidates"])
+    total_traces = int(summary["total_traces_executed"])
+    distinct_traces = int(summary["distinct_traces_checked"])
+    agree_traces = int(summary["agree_traces"])
+    diverge_traces = int(summary["diverge_traces"])
+    kc_traces = int(summary["kernel_confirmed_traces"])
+    kc_divergences = int(summary["kernel_confirmed_divergences"])
+    distinct_obs = int(summary["distinct_obs_paths"])
+    elapsed_ms = float(summary["elapsed_ms"])
+    diag_counts: dict[str, int] = summary["diag_tag_counts"]
+    findings: list[dict[str, Any]] = summary["findings"]
+
+    oracle_invoked = True
+    if unsafe_violations != 0:
+        oracle_invoked = False
+        reasons.append(
+            f"itree_oracle_not_invoked: unsafe_token_violations={unsafe_violations} != 0"
+        )
+    if compared <= 0 or compared != opt_both or compared + not_compared_cands != total:
+        oracle_invoked = False
+        reasons.append(
+            f"itree_oracle_not_invoked: compared ({compared}), opt_both ({opt_both}), "
+            f"not_compared ({not_compared_cands}), total ({total}) inconsistent"
+        )
+    if agree_cands + diverge_cands != compared:
+        oracle_invoked = False
+        reasons.append(
+            f"itree_oracle_not_invoked: agree_candidates ({agree_cands}) + "
+            f"diverge_candidates ({diverge_cands}) != compared_candidates ({compared})"
+        )
+    if (
+        total_traces < compared
+        or distinct_traces <= 0
+        or distinct_traces > total_traces
+        or distinct_obs <= 0
+    ):
+        oracle_invoked = False
+        reasons.append(
+            f"itree_oracle_not_invoked: traces (total={total_traces}, "
+            f"distinct={distinct_traces}, obs_paths={distinct_obs}) invalid"
+        )
+    if (
+        agree_traces + diverge_traces != distinct_traces
+        or sum(diag_counts.values()) != distinct_traces
+        or int(diag_counts.get("ok", 0)) != agree_traces
+    ):
+        oracle_invoked = False
+        reasons.append(
+            f"itree_oracle_not_invoked: agree_traces ({agree_traces}) + "
+            f"diverge_traces ({diverge_traces}) != distinct_traces ({distinct_traces})"
+        )
+    if (
+        kc_traces != distinct_traces
+        or kc_divergences != diverge_traces
+        or len(findings) != diverge_traces
+    ):
+        oracle_invoked = False
+        reasons.append(
+            f"itree_oracle_not_invoked: kernel_confirmed_traces ({kc_traces}), "
+            f"kernel_confirmed_divergences ({kc_divergences}), findings ({len(findings)}) "
+            f"do not match distinct_traces ({distinct_traces}) / diverge_traces ({diverge_traces})"
+        )
+    for f in findings:
+        repro_p = Path(f["repro_path"])
+        if not f.get("kernel_confirmed") or not repro_p.is_file():
+            oracle_invoked = False
+            reasons.append(
+                f"itree_oracle_not_invoked: finding {f.get('finding_id')!r} missing "
+                f"kernel confirmation or repro.rs ({repro_p})"
+            )
+
+    non_zero_compared = compared > 0 and distinct_traces > 0
+    if not non_zero_compared:
+        reasons.append(
+            f"itree_zero_compared_items: compared_candidates={compared}, distinct_traces_checked={distinct_traces}"
+        )
+
+    plausible_wall_clock = elapsed_ms >= min_oracle_elapsed_ms
+    if not plausible_wall_clock:
+        reasons.append(
+            f"itree_impossible_wall_clock: elapsed_ms ({elapsed_ms:.2f} ms) < min_oracle_elapsed_ms ({min_oracle_elapsed_ms:.2f} ms)"
+        )
+
+    seed_sensitive = True
+    seed_hex = f"0x{itree_seed:08x}"
+    prev_seed = ledger.get("last_itree_seed")
+    prev_sig = ledger.get("last_itree_signature")
+    cur_sig = itree_signature_for_seed_check(summary)
+    if (
+        isinstance(prev_seed, str)
+        and prev_seed.lower() != seed_hex.lower()
+        and isinstance(prev_sig, dict)
+        and prev_sig == cur_sig
+    ):
+        seed_sensitive = False
+        reasons.append(
+            f"itree_identical_metrics_across_seeds: seed {seed_hex} produced identical trace metrics/mutators to prior seed {prev_seed}"
+        )
+
+    checks = {
+        "itree_oracle_invoked": oracle_invoked,
+        "itree_non_zero_compared": non_zero_compared,
+        "itree_plausible_wall_clock": plausible_wall_clock,
+        "itree_seed_sensitivity": seed_sensitive,
+    }
+    return RedFlagResult(
+        passed=all(checks.values()),
+        checks=checks,
+        failure_reasons=reasons,
+    )
 
 
 def miri_signature_for_seed_check(summary: dict[str, Any]) -> dict[str, Any]:
@@ -816,14 +1052,99 @@ def deduplicate_and_quarantine_findings(
     return all_dedup, unquarantined, quarantined
 
 
+def deduplicate_and_quarantine_itree_findings(
+    findings: list[dict[str, Any]],
+    quarantine_rules: set[str],
+) -> tuple[
+    list[DeduplicatedFinding], list[DeduplicatedFinding], list[DeduplicatedFinding]
+]:
+    """Deduplicates raw ITree findings and splits into unquarantined and quarantined."""
+    by_fp: dict[str, DeduplicatedFinding] = {}
+    for f in findings:
+        fn_name = str(f["fn_name"])
+        seed_idx = f.get("seed_index", 0)
+        seed_name = f"itree_seed_{seed_idx}"
+        mutators = f.get("applied_mutators")
+        cause = (
+            str(mutators[0])
+            if isinstance(mutators, list)
+            and len(mutators) > 0
+            and isinstance(mutators[0], str)
+            else seed_name
+        )
+        diag_tag = str(f["diag_tag"])
+        div_class = f"itree_{diag_tag}"
+        norm_tag = f"TraceReplayDiag.{diag_tag}"
+        fp = f"{cause}:{div_class}:{norm_tag}"
+        is_quarantined = bool(
+            quarantine_rules
+            and (
+                fp in quarantine_rules
+                or cause in quarantine_rules
+                or seed_name in quarantine_rules
+                or fn_name in quarantine_rules
+                or diag_tag in quarantine_rules
+                or div_class in quarantine_rules
+                or f"{cause}:{div_class}" in quarantine_rules
+                or f"{cause}:{diag_tag}" in quarantine_rules
+            )
+        )
+        repro_path = str(f["repro_path"])
+        native_outcome = f"trace:{f.get('case_ident', fn_name)}"
+        anneal_outcome = str(f.get("diag_repr", diag_tag))
+
+        if fp in by_fp:
+            existing = by_fp[fp]
+            existing.occurrences += 1
+            if repro_path not in existing.all_repro_paths:
+                existing.all_repro_paths.append(repro_path)
+            existing.kernel_confirmed = existing.kernel_confirmed and bool(
+                f.get("kernel_confirmed", False)
+            )
+            if not is_quarantined and existing.quarantined:
+                existing.quarantined = False
+                existing.seed_name = seed_name
+                existing.primary_fn_name = fn_name
+                existing.primary_repro_path = repro_path
+                existing.miri_outcome = native_outcome
+                existing.anneal_outcome = anneal_outcome
+        else:
+            by_fp[fp] = DeduplicatedFinding(
+                fingerprint=fp,
+                cause=cause,
+                seed_name=seed_name,
+                divergence_class=div_class,
+                normalized_anneal_tag=norm_tag,
+                quarantined=is_quarantined,
+                occurrences=1,
+                primary_fn_name=fn_name,
+                primary_repro_path=repro_path,
+                all_repro_paths=[repro_path],
+                miri_outcome=native_outcome,
+                anneal_outcome=anneal_outcome,
+                kernel_confirmed=bool(f.get("kernel_confirmed", False)),
+            )
+
+    all_dedup = list(by_fp.values())
+    unquarantined = [d for d in all_dedup if not d.quarantined]
+    quarantined = [d for d in all_dedup if d.quarantined]
+    return all_dedup, unquarantined, quarantined
+
+
 def collect_finding_bundle_files(findings: list[dict[str, Any]], state_dir: Path) -> list[Path]:
-    """Collects all `repro.rs`, `finding.json`, and `SUMMARY.md` files under `state_dir`."""
+    """Collects all finding bundle files under `state_dir`."""
     files: list[Path] = []
     seen: set[Path] = set()
     for f in findings:
         repro = Path(f["repro_path"]).resolve()
         bundle_dir = repro.parent
-        for name in ("repro.rs", "finding.json", "SUMMARY.md"):
+        for name in (
+            "repro.rs",
+            "repro_trace.txt",
+            "repro_mir.lean",
+            "finding.json",
+            "SUMMARY.md",
+        ):
             candidate = bundle_dir / name
             if candidate.is_file() and candidate not in seen:
                 try:
@@ -956,10 +1277,11 @@ def write_oracle_junit_xml(
     profile_name: str,
     miri: dict[str, Any] | None,
     miri_red_flags: RedFlagResult | None,
-    unquarantined: list[DeduplicatedFinding],
-    quarantined: list[DeduplicatedFinding],
+    miri_unquarantined: list[DeduplicatedFinding],
     include_itree: bool,
     itree: dict[str, Any] | None,
+    itree_red_flags: RedFlagResult | None,
+    itree_unquarantined: list[DeduplicatedFinding],
     itree_ran_without_oracle: bool,
     elapsed_sec: float,
 ) -> None:
@@ -990,16 +1312,16 @@ def write_oracle_junit_xml(
                 None,
             )
         )
-    elif len(unquarantined) > 0:
+    elif len(miri_unquarantined) > 0:
         summary_lines = [
             f"{d.fingerprint} (occurrences={d.occurrences}, repro={d.primary_repro_path})"
-            for d in unquarantined
+            for d in miri_unquarantined
         ]
         cases.append(
             (
                 "miri-difftest",
                 (
-                    f"unquarantined divergences detected ({len(unquarantined)} distinct, {miri['diverge_count']} total)",
+                    f"unquarantined divergences detected ({len(miri_unquarantined)} distinct, {miri['diverge_count']} total)",
                     "\n".join(summary_lines),
                 ),
                 None,
@@ -1009,7 +1331,7 @@ def write_oracle_junit_xml(
         cases.append(("miri-difftest", None, None))
 
     if include_itree:
-        if itree is None or not itree_ran_without_oracle:
+        if itree is None:
             cases.append(
                 (
                     "itree-difftest",
@@ -1020,15 +1342,45 @@ def write_oracle_junit_xml(
                     None,
                 )
             )
-        else:
+        elif itree_ran_without_oracle:
             cases.append(
                 (
                     "itree-difftest",
                     None,
                     f"itree-difftest generated {compile_summary('itree-difftest', itree)}, "
-                    "but its runtime trace oracle is not yet active.",
+                    "but its runtime trace oracle was not performed.",
                 )
             )
+        elif itree_red_flags is None or not itree_red_flags.passed:
+            reasons = (
+                "; ".join(itree_red_flags.failure_reasons)
+                if itree_red_flags is not None
+                else "itree-difftest produced invalid oracle JSON."
+            )
+            cases.append(
+                (
+                    "itree-difftest",
+                    ("red-flag vacuity check failed", reasons),
+                    None,
+                )
+            )
+        elif len(itree_unquarantined) > 0:
+            summary_lines = [
+                f"{d.fingerprint} (occurrences={d.occurrences}, repro={d.primary_repro_path})"
+                for d in itree_unquarantined
+            ]
+            cases.append(
+                (
+                    "itree-difftest",
+                    (
+                        f"unquarantined ITree divergences detected ({len(itree_unquarantined)} distinct, {itree['diverge_traces']} total)",
+                        "\n".join(summary_lines),
+                    ),
+                    None,
+                )
+            )
+        else:
+            cases.append(("itree-difftest", None, None))
 
     failures_count = sum(1 for _, fail, _ in cases if fail is not None)
     skipped_count = sum(1 for _, _, skip in cases if skip is not None)
@@ -1071,74 +1423,137 @@ def render_oracle_campaign_report(
     quarantined: list[DeduplicatedFinding],
     include_itree: bool,
     itree: dict[str, Any] | None,
+    itree_red_flags: RedFlagResult | None,
+    itree_all_dedup: list[DeduplicatedFinding],
+    itree_unquarantined: list[DeduplicatedFinding],
+    itree_quarantined: list[DeduplicatedFinding],
     itree_ran_without_oracle: bool,
     miri_seed: int,
     itree_seed: int,
     elapsed_sec: float,
 ) -> str:
-    """Renders the full Markdown report for a live `miri-difftest` oracle campaign."""
-    if not miri_red_flags.passed or (include_itree and not itree_ran_without_oracle):
+    """Renders the full Markdown report for a live oracle campaign."""
+    itree_performed = (
+        include_itree
+        and itree is not None
+        and itree.get("oracle_comparison") == "performed"
+        and itree_red_flags is not None
+    )
+    itree_failed = include_itree and not (
+        itree_ran_without_oracle or (itree_performed and itree_red_flags.passed)
+    )
+    raw_divergences = int(miri["diverge_count"]) + (
+        int(itree["diverge_traces"]) if itree_performed and itree is not None else 0
+    )
+
+    if not miri_red_flags.passed or itree_failed:
         status = "RED FLAG / HARNESS FAILED"
     elif len(unquarantined) > 0:
         status = (
             f"DIVERGENCE DETECTED ({len(unquarantined)} unquarantined distinct, "
-            f"{miri['diverge_count']} raw)"
+            f"{raw_divergences} raw)"
         )
-    elif include_itree and len(quarantined) > 0:
+    elif include_itree and itree_ran_without_oracle and len(quarantined) > 0:
         status = (
             f"MIRI PASS ({len(quarantined)} quarantined known bug fingerprints) "
             "/ ITREE NOT EVALUATED"
         )
-    elif include_itree:
+    elif include_itree and itree_ran_without_oracle:
         status = "MIRI PASS (0 divergences) / ITREE NOT EVALUATED"
     elif len(quarantined) > 0:
         status = f"PASS ({len(quarantined)} quarantined known bug fingerprints)"
     else:
         status = "PASS (0 divergences)"
 
+    itree_mode_cell = (
+        f"`{itree.get('mode', 'seeded')}`"
+        if itree_performed and itree is not None
+        else ("`compile-only`" if include_itree else "skipped")
+    )
     itree_seed_cell = f"`0x{itree_seed:08x}`" if include_itree else "skipped (`--miri-only`)"
     itree_total_cell = (
         str(itree.get("total_candidates", "n/a")) if (include_itree and itree) else "n/a"
     )
-    itree_compiled_cell = (
-        f"{itree['opt_level_0_and_2_compiled']} (`-O0` & `-O2`, compile only)"
-        if (include_itree and itree and "opt_level_0_and_2_compiled" in itree)
-        else "n/a"
-    )
-    itree_oracle_cell = (
-        "**not performed**"
-        if (include_itree and itree_ran_without_oracle)
-        else ("harness failed" if include_itree else "skipped")
-    )
+    if itree_performed and itree is not None:
+        itree_compiled_cell = (
+            f"{itree['opt_level_0_and_2_compiled']} (`-O0` & `-O2`, "
+            f"{itree['instrumented_compiled']} instrumented)"
+        )
+        itree_oracle_cell = "**performed**"
+        itree_compared_cell = (
+            f"{itree['compared_candidates']} ({itree['distinct_traces_checked']} distinct traces, "
+            f"{itree['total_traces_executed']} total)"
+        )
+        itree_agreed_cell = (
+            f"{itree['agree_candidates']} ({itree['agree_traces']} traces)"
+        )
+        itree_diverged_cell = (
+            f"{itree['diverge_traces']} ({len(itree_all_dedup)} distinct: "
+            f"{len(itree_unquarantined)} unquarantined, {len(itree_quarantined)} quarantined)"
+        )
+        itree_kc_cell = (
+            f"{itree['kernel_confirmed_divergences']} "
+            f"({itree['kernel_confirmed_traces']} traces confirmed)"
+        )
+        itree_not_compared_cell = str(itree["not_compared_candidates"])
+    else:
+        itree_compiled_cell = (
+            f"{itree['opt_level_0_and_2_compiled']} (`-O0` & `-O2`, compile only)"
+            if (include_itree and itree and "opt_level_0_and_2_compiled" in itree)
+            else "n/a"
+        )
+        itree_oracle_cell = (
+            "**not performed**"
+            if (include_itree and itree_ran_without_oracle)
+            else ("harness failed" if include_itree else "skipped")
+        )
+        itree_compared_cell = "0"
+        itree_agreed_cell = "n/a"
+        itree_diverged_cell = "n/a"
+        itree_kc_cell = "n/a"
+        itree_not_compared_cell = itree_total_cell
+
     itree_elapsed_cell = (
         f"{float(itree['elapsed_ms']):.1f} ms"
         if (include_itree and itree and "elapsed_ms" in itree)
         else "n/a"
     )
 
-    lines: list[str] = [
-        f"# Anneal Differential Testing Campaign Report (`{profile.name}` — `{date_prefix}`)",
-        "",
+    banner_lines = [
         f"> **Status: {status}.**",
         f"> `miri-difftest` evaluated `{miri['compared_candidates']}/{miri['total_candidates']}` "
         f"candidates against live Miri (`-Zmiri-tree-borrows`) and Anneal's `MirSemantics` "
         f"oracle (`{miri['agree_count']}` agreed, `{miri['diverge_count']}` diverged, "
         f"`{miri['not_compared_count']}` not compared).",
+    ]
+    if itree_performed and itree is not None:
+        banner_lines.append(
+            f"> `itree-difftest` evaluated `{itree['compared_candidates']}/{itree['total_candidates']}` "
+            f"candidates (`{itree['distinct_traces_checked']}` distinct traces across "
+            f"`{itree['total_traces_executed']}` native `-O0`/`-O2` executions, "
+            f"`{itree['agree_traces']}` agreed, `{itree['diverge_traces']}` diverged, "
+            f"`{itree['distinct_obs_paths']}` distinct observable paths)."
+        )
+
+    lines: list[str] = [
+        f"# Anneal Differential Testing Campaign Report (`{profile.name}` — `{date_prefix}`)",
+        "",
+        *banner_lines,
         "",
         "## Campaign Summary",
         "",
         "| Metric | `miri-difftest` | `itree-difftest` |",
         "| :--- | :--- | :--- |",
-        f"| Mode | `{miri.get('mode', 'seeded')}` | `compile-only` |",
+        f"| Mode | `{miri.get('mode', 'seeded')}` | {itree_mode_cell} |",
         f"| Seed | `0x{miri_seed:08x}` | {itree_seed_cell} |",
         f"| Candidates generated | {miri['total_candidates']} | {itree_total_cell} |",
         f"| Compiled with `rustc` | {miri['compiled_candidates']} ({miri['compile_failed_candidates']} failed) | {itree_compiled_cell} |",
         f"| Oracle comparison | **performed** | {itree_oracle_cell} |",
-        f"| Compared | {miri['compared_candidates']} | 0 |",
-        f"| Agreed | {miri['agree_count']} | n/a |",
-        f"| Diverged (raw / distinct) | {miri['diverge_count']} ({len(all_dedup)} distinct: {len(unquarantined)} unquarantined, {len(quarantined)} quarantined) | n/a |",
-        f"| Kernel-confirmed divergences (`by rfl`) | {miri['kernel_confirmed_divergences']} | n/a |",
-        f"| Not compared | {miri['not_compared_count']} | {itree_total_cell} |",
+        f"| Compared | {miri['compared_candidates']} | {itree_compared_cell} |",
+        f"| Agreed | {miri['agree_count']} | {itree_agreed_cell} |",
+        f"| Diverged (raw / distinct) | {miri['diverge_count']} ({len(all_dedup) - len(itree_all_dedup)} distinct: {len(unquarantined) - len(itree_unquarantined)} unquarantined, {len(quarantined) - len(itree_quarantined)} quarantined) | {itree_diverged_cell} |",
+        f"| Kernel-confirmed divergences (`by rfl`) | {miri['kernel_confirmed_divergences']} | {itree_kc_cell} |",
+        f"| Not compared | {miri['not_compared_count']} | {itree_not_compared_cell} |",
         f"| Harness wall-clock | {float(miri['elapsed_ms']):.1f} ms | {itree_elapsed_cell} |",
         "",
         f"Total campaign wall-clock: {elapsed_sec:.2f} s.",
@@ -1190,6 +1605,19 @@ def render_oracle_campaign_report(
         for callee, count in sorted(ext_calls.items(), key=lambda kv: (-kv[1], kv[0])):
             lines.append(f"| `{callee}` | {count} |")
 
+    if itree_performed and itree is not None:
+        lines.extend(
+            [
+                "",
+                "## ITree Native vs. Lean `TraceCheck` Breakdown (`itree-difftest`)",
+                "",
+                "| `TraceReplayDiag` Tag | Count |",
+                "| :--- | ---: |",
+            ]
+        )
+        for tag, count in sorted(itree["diag_tag_counts"].items()):
+            lines.append(f"| `{tag}` | {count} |")
+
     lines.extend(
         [
             "",
@@ -1201,9 +1629,15 @@ def render_oracle_campaign_report(
     )
     for check_name, ok in miri_red_flags.checks.items():
         lines.append(f"| `{check_name}` | {'PASS' if ok else '**FAIL**'} |")
-    if miri_red_flags.failure_reasons:
+    if itree_red_flags is not None:
+        for check_name, ok in itree_red_flags.checks.items():
+            lines.append(f"| `{check_name}` | {'PASS' if ok else '**FAIL**'} |")
+    all_red_flag_reasons = list(miri_red_flags.failure_reasons)
+    if itree_red_flags is not None:
+        all_red_flag_reasons.extend(itree_red_flags.failure_reasons)
+    if all_red_flag_reasons:
         lines.append("")
-        for reason in miri_red_flags.failure_reasons:
+        for reason in all_red_flag_reasons:
             lines.append(f"- **Red-flag failure**: {reason}")
 
     lines.extend(
@@ -1369,14 +1803,18 @@ def main() -> int:
             prev_miri_gen = ledger_counter(ledger, "total_miri_candidates_generated")
             prev_itree_gen = ledger_counter(ledger, "total_itree_candidates_generated")
             prev_miri_eval = ledger_counter(ledger, "total_miri_candidates_evaluated")
+            prev_itree_eval = ledger_counter(ledger, "total_itree_candidates_evaluated")
+            prev_itree_traces = ledger_counter(ledger, "total_itree_traces_checked")
         except ValueError as e:
             sys.stderr.write(f"error: {e}\n")
             return EXIT_INTERNAL_ERROR
 
         date_prefix = utc_date_prefix()
         findings_dir = state_dir / "findings" / f"{date_prefix}_{profile.name}_miri"
+        itree_findings_dir = state_dir / "findings" / f"{date_prefix}_{profile.name}_itree"
         if not args.compile_only:
             shutil.rmtree(findings_dir, ignore_errors=True)
+            shutil.rmtree(itree_findings_dir, ignore_errors=True)
 
         with tempfile.TemporaryDirectory(prefix="anneal-diff-test-run-") as run_tmp:
             run_tmp_path = Path(run_tmp)
@@ -1410,6 +1848,28 @@ def main() -> int:
                     str(findings_dir),
                 ]
 
+            if args.compile_only:
+                itree_args = [
+                    "--compile-only",
+                    "--batches",
+                    str(profile.itree_batches),
+                    "--batch-size",
+                    str(profile.itree_batch_size),
+                    "--seed",
+                    f"0x{itree_seed:08x}",
+                ]
+            else:
+                itree_args = [
+                    "--batches",
+                    str(profile.itree_batches),
+                    "--batch-size",
+                    str(profile.itree_batch_size),
+                    "--seed",
+                    f"0x{itree_seed:08x}",
+                    "--findings-dir",
+                    str(itree_findings_dir),
+                ]
+
             miri = run_harness(
                 repo_root,
                 "miri-difftest",
@@ -1422,15 +1882,7 @@ def main() -> int:
                 else run_harness(
                     repo_root,
                     "itree-difftest",
-                    [
-                        "--compile-only",
-                        "--batches",
-                        str(profile.itree_batches),
-                        "--batch-size",
-                        str(profile.itree_batch_size),
-                        "--seed",
-                        f"0x{itree_seed:08x}",
-                    ],
+                    itree_args,
                     run_tmp_path / "itree_difftest_out.json",
                 )
             )
@@ -1443,7 +1895,9 @@ def main() -> int:
         # `miri-difftest` returning `"not_performed"` is treated as a harness
         # failure (`EXIT_HARNESS_FAILED`).
         if miri_status != "performed":
-            summaries = {"miri-difftest": miri, "itree-difftest": itree}
+            summaries = {"miri-difftest": miri}
+            if not args.miri_only:
+                summaries["itree-difftest"] = itree
             ran_without_oracle = {
                 name: (
                     isinstance(s, dict)
@@ -1460,17 +1914,18 @@ def main() -> int:
             harness_failed = not all(ran_without_oracle.values())
 
             written: list[Path] = []
-            if not harness_failed and miri is not None and itree is not None:
+            if not harness_failed and miri is not None and (args.miri_only or itree is not None):
                 for key in OBSOLETE_LEDGER_KEYS:
                     ledger.pop(key, None)
                 ledger["next_miri_seed"] = f"0x{advance_seed(miri_seed):08x}"
-                ledger["next_itree_seed"] = f"0x{advance_seed(itree_seed):08x}"
+                if itree is not None:
+                    ledger["next_itree_seed"] = f"0x{advance_seed(itree_seed):08x}"
+                    ledger["total_itree_candidates_generated"] = prev_itree_gen + int(
+                        itree.get("total_candidates", 0)
+                    )
                 ledger["total_campaigns_run"] = prev_campaigns + 1
                 ledger["total_miri_candidates_generated"] = prev_miri_gen + int(
                     miri.get("total_candidates", 0)
-                )
-                ledger["total_itree_candidates_generated"] = prev_itree_gen + int(
-                    itree.get("total_candidates", 0)
                 )
                 ledger["last_run_utc"] = utc_now_iso()
                 ledger["last_profile"] = profile.name
@@ -1518,6 +1973,7 @@ def main() -> int:
         itree_ran_without_oracle = (
             isinstance(itree, dict) and itree_status == "not_performed"
         )
+        itree_performed = isinstance(itree, dict) and itree_status == "performed"
         if not valid_miri:
             sys.stderr.write(f"miri-difftest produced invalid oracle summary: {err_reason}\n")
             elapsed_sec = time.monotonic() - start_time
@@ -1565,18 +2021,60 @@ def main() -> int:
             for reason in miri_red_flags.failure_reasons:
                 sys.stderr.write(f"red-flag check failed: {reason}\n")
 
-        known_corpus_bug_seeds = load_known_corpus_bug_seeds(repo_root)
-        all_dedup, unquarantined, quarantined = deduplicate_and_quarantine_findings(
-            miri["findings"],
-            known_corpus_bug_seeds,
-            quarantine_rules,
-        )
+        itree_red_flags: RedFlagResult | None = None
+        itree_all_dedup: list[DeduplicatedFinding] = []
+        itree_unquarantined: list[DeduplicatedFinding] = []
+        itree_quarantined: list[DeduplicatedFinding] = []
+        if include_itree and itree_performed and itree is not None:
+            valid_itree, itree_err = validate_performed_itree_summary(itree)
+            if not valid_itree:
+                sys.stderr.write(
+                    f"itree-difftest produced invalid oracle summary: {itree_err}\n"
+                )
+                itree_red_flags = RedFlagResult(
+                    passed=False,
+                    checks={"itree_oracle_invoked": False},
+                    failure_reasons=[f"itree_invalid_summary: {itree_err}"],
+                )
+            else:
+                itree_red_flags = evaluate_itree_red_flags(
+                    itree,
+                    itree_seed,
+                    ledger,
+                    args.min_oracle_elapsed_ms,
+                )
+                if not itree_red_flags.passed:
+                    for reason in itree_red_flags.failure_reasons:
+                        sys.stderr.write(f"red-flag check failed: {reason}\n")
+                (
+                    itree_all_dedup,
+                    itree_unquarantined,
+                    itree_quarantined,
+                ) = deduplicate_and_quarantine_itree_findings(
+                    itree["findings"],
+                    quarantine_rules,
+                )
 
-        harness_or_red_flag_failed = (not miri_red_flags.passed) or (
-            include_itree and not itree_ran_without_oracle
+        known_corpus_bug_seeds = load_known_corpus_bug_seeds(repo_root)
+        miri_all_dedup, miri_unquarantined, miri_quarantined = (
+            deduplicate_and_quarantine_findings(
+                miri["findings"],
+                known_corpus_bug_seeds,
+                quarantine_rules,
+            )
         )
+        all_dedup = [*miri_all_dedup, *itree_all_dedup]
+        unquarantined = [*miri_unquarantined, *itree_unquarantined]
+        quarantined = [*miri_quarantined, *itree_quarantined]
+
+        itree_ok = (not include_itree) or itree_ran_without_oracle or (
+            itree_performed and itree_red_flags is not None and itree_red_flags.passed
+        )
+        harness_or_red_flag_failed = (not miri_red_flags.passed) or (not itree_ok)
 
         written = collect_finding_bundle_files(miri["findings"], state_dir)
+        if include_itree and itree_performed and itree is not None and isinstance(itree.get("findings"), list):
+            written.extend(collect_finding_bundle_files(itree["findings"], state_dir))
         if not harness_or_red_flag_failed:
             ledger["next_miri_seed"] = f"0x{advance_seed(miri_seed):08x}"
             if include_itree and itree is not None:
@@ -1584,6 +2082,15 @@ def main() -> int:
                 ledger["total_itree_candidates_generated"] = prev_itree_gen + int(
                     itree.get("total_candidates", 0)
                 )
+                if itree_performed:
+                    ledger["total_itree_candidates_evaluated"] = prev_itree_eval + int(
+                        itree.get("compared_candidates", 0)
+                    )
+                    ledger["total_itree_traces_checked"] = prev_itree_traces + int(
+                        itree.get("distinct_traces_checked", 0)
+                    )
+                    ledger["last_itree_seed"] = f"0x{itree_seed:08x}"
+                    ledger["last_itree_signature"] = itree_signature_for_seed_check(itree)
             ledger["total_campaigns_run"] = prev_campaigns + 1
             ledger["total_miri_candidates_generated"] = prev_miri_gen + int(
                 miri.get("total_candidates", 0)
@@ -1598,7 +2105,9 @@ def main() -> int:
             ledger["last_run_utc"] = utc_now_iso()
             ledger["last_profile"] = profile.name
             ledger["last_oracle_comparison"] = (
-                "performed" if not include_itree else "miri_performed_itree_not_performed"
+                "performed"
+                if (not include_itree or itree_performed)
+                else "miri_performed_itree_not_performed"
             )
             ledger_path.write_text(
                 json.dumps(ledger, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -1616,6 +2125,10 @@ def main() -> int:
             quarantined,
             include_itree,
             itree,
+            itree_red_flags,
+            itree_all_dedup,
+            itree_unquarantined,
+            itree_quarantined,
             itree_ran_without_oracle,
             miri_seed,
             itree_seed,
@@ -1628,6 +2141,12 @@ def main() -> int:
             report_path.write_text(report_md, encoding="utf-8")
             written.append(report_path)
 
+        combined_checks = dict(miri_red_flags.checks)
+        combined_reasons = list(miri_red_flags.failure_reasons)
+        if itree_red_flags is not None:
+            combined_checks.update(itree_red_flags.checks)
+            combined_reasons.extend(itree_red_flags.failure_reasons)
+
         campaign_summary = {
             "profile": profile.name,
             "date_utc": date_prefix,
@@ -1635,16 +2154,21 @@ def main() -> int:
             "itree_seed": f"0x{itree_seed:08x}" if include_itree else None,
             "miri_oracle_comparison": "performed",
             "itree_oracle_comparison": (
-                "not_performed"
-                if (include_itree and itree_ran_without_oracle)
-                else ("failed" if include_itree else "skipped")
+                "performed"
+                if (include_itree and itree_performed and itree_red_flags is not None and itree_red_flags.passed)
+                else (
+                    "not_performed"
+                    if (include_itree and itree_ran_without_oracle)
+                    else ("failed" if include_itree else "skipped")
+                )
             ),
             "red_flags": {
-                "passed": miri_red_flags.passed,
-                "checks": miri_red_flags.checks,
-                "failure_reasons": miri_red_flags.failure_reasons,
+                "passed": miri_red_flags.passed and (itree_red_flags is None or itree_red_flags.passed),
+                "checks": combined_checks,
+                "failure_reasons": combined_reasons,
             },
             "miri_summary": miri,
+            "itree_summary": itree if include_itree else None,
             "deduplicated_findings": [d.to_dict() for d in all_dedup],
             "unquarantined_findings": [d.to_dict() for d in unquarantined],
             "quarantined_findings": [d.to_dict() for d in quarantined],
@@ -1664,10 +2188,11 @@ def main() -> int:
                 profile.name,
                 miri,
                 miri_red_flags,
-                unquarantined,
-                quarantined,
+                miri_unquarantined,
                 include_itree,
                 itree,
+                itree_red_flags,
+                itree_unquarantined,
                 itree_ran_without_oracle,
                 elapsed_sec,
             )

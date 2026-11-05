@@ -161,38 +161,42 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         fs::read_to_string(state_dir.join("reports/LATEST_REPORT.md")).expect("read LATEST_REPORT");
     assert_eq!(report1.trim(), stdout1.trim());
     assert!(
-        report1.contains("Status: DIVERGENCE DETECTED (1 unquarantined distinct, 2 raw)."),
-        "report must announce 1 unquarantined distinct / 2 raw divergences:\n{report1}"
+        report1.contains("Status: DIVERGENCE DETECTED (1 unquarantined distinct, 1 raw)."),
+        "report must announce 1 unquarantined distinct / 1 raw divergence:\n{report1}"
     );
     assert!(
-        report1.contains("| Oracle comparison | **performed** | **not performed** |"),
-        "report must show performed for miri-difftest and not performed for itree-difftest:\n{report1}"
+        report1.contains("| Oracle comparison | **performed** | **performed** |"),
+        "report must show performed for both miri-difftest and itree-difftest:\n{report1}"
     );
     assert!(
-        report1.contains("| Compared | 16 | 0 |"),
-        "report must show 16 compared candidates:\n{report1}"
+        report1.contains("| Compared | 16 | 16 ("),
+        "report must show 16 compared candidates for both miri-difftest and itree-difftest:\n{report1}"
     );
     assert!(
-        report1.contains("| Agreed | 14 | n/a |"),
-        "report must show 14 agreed candidates:\n{report1}"
+        report1.contains("| Agreed | 15 | 16 ("),
+        "report must show 15 agreed Miri candidates and 16 agreed ITree candidates:\n{report1}"
     );
     assert!(
         report1.contains(
-            "| Diverged (raw / distinct) | 2 (1 distinct: 1 unquarantined, 0 quarantined) | n/a |"
+            "| Diverged (raw / distinct) | 1 (1 distinct: 1 unquarantined, 0 quarantined) | 0 (0 distinct: 0 unquarantined, 0 quarantined) |"
         ),
         "report must show raw and deduplicated divergence counts:\n{report1}"
     );
     assert!(
-        report1.contains("| Kernel-confirmed divergences (`by rfl`) | 2 | n/a |"),
-        "report must show 2 kernel-confirmed divergences:\n{report1}"
+        report1.contains("| Kernel-confirmed divergences (`by rfl`) | 1 | 0 ("),
+        "report must show 1 kernel-confirmed Miri divergence and 0 ITree divergences:\n{report1}"
     );
     assert!(
-        report1.contains("| Not compared | 0 | 16 |"),
+        report1.contains("| Not compared | 0 | 0 |"),
         "report must show not-compared counts:\n{report1}"
     );
     assert!(
         report1.contains("## Not-Compared Breakdown by Reason (`miri-difftest`)"),
         "report must include not-compared breakdown table:\n{report1}"
+    );
+    assert!(
+        report1.contains("## ITree Native vs. Lean `TraceCheck` Breakdown (`itree-difftest`)"),
+        "report must include ITree TraceCheck breakdown table:\n{report1}"
     );
     for check in [
         "oracle_invoked",
@@ -200,6 +204,10 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         "plausible_wall_clock",
         "seed_sensitivity",
         "oracle_error_threshold",
+        "itree_oracle_invoked",
+        "itree_non_zero_compared",
+        "itree_plausible_wall_clock",
+        "itree_seed_sensitivity",
     ] {
         assert!(
             report1.contains(&format!("| `{check}` | PASS |")),
@@ -207,8 +215,8 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         );
     }
     assert!(
-        report1.contains("| `RawPtrOffsetMutator:missed_ub:MirDiffTag.normalScalar` | `missed_ub` | 2 |"),
-        "report must list deduplicated RawPtrOffsetMutator missed_ub fingerprint with 2 occurrences:\n{report1}"
+        report1.contains("| `RawPtrOffsetMutator:ub_location_mismatch:MirDiffTag.ub` | `ub_location_mismatch` | 1 |"),
+        "report must list deduplicated RawPtrOffsetMutator ub_location_mismatch fingerprint:\n{report1}"
     );
     assert!(
         !report1.contains("pass_tb_unsafe_cell_shared_mutation"),
@@ -221,7 +229,7 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         "JUnit XML must record 1 failure for unquarantined divergences:\n{junit1}"
     );
     assert!(
-        junit1.contains("unquarantined divergences detected (1 distinct, 2 total)"),
+        junit1.contains("unquarantined divergences detected (1 distinct, 1 total)"),
         "JUnit XML must describe the unquarantined divergences:\n{junit1}"
     );
 
@@ -229,7 +237,7 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
     // `primary_repro_path` via `miri-difftest --reproduce`.
     let summary_json = fs::read_to_string(state_dir.join("reports/LATEST_CAMPAIGN_SUMMARY.json"))
         .expect("read LATEST_CAMPAIGN_SUMMARY.json");
-    assert!(summary_json.contains("\"fingerprint\": \"RawPtrOffsetMutator:missed_ub:MirDiffTag.normalScalar\""));
+    assert!(summary_json.contains("\"fingerprint\": \"RawPtrOffsetMutator:ub_location_mismatch:MirDiffTag.ub\""));
     assert!(!summary_json.contains("pass_tb_unsafe_cell_shared_mutation:false_positive_ub"));
 
     // Extract primary_repro_path values from the summary JSON and run `--reproduce` on each.
@@ -310,7 +318,7 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
     let report_partial = fs::read_to_string(state_dir_partial.join("reports/LATEST_REPORT.md"))
         .expect("read partial report");
     assert!(
-        report_partial.contains("Status: DIVERGENCE DETECTED (1 unquarantined distinct, 2 raw)."),
+        report_partial.contains("Status: DIVERGENCE DETECTED (1 unquarantined distinct, 1 raw)."),
         "partial quarantine must leave 1 unquarantined distinct divergence:\n{report_partial}"
     );
 
@@ -322,7 +330,7 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         &full_quarantine,
         r#"{
             "quarantined": [
-                "RawPtrOffsetMutator:missed_ub:MirDiffTag.normalScalar"
+                "RawPtrOffsetMutator:ub_location_mismatch:MirDiffTag.ub"
             ]
         }"#,
     )
@@ -359,7 +367,7 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
     );
     assert!(
         stdout_clean.contains(
-            "Status: MIRI PASS (1 quarantined known bug fingerprints) / ITREE NOT EVALUATED."
+            "Status: PASS (1 quarantined known bug fingerprints)."
         ),
         "report must show quarantined fingerprint count in status banner:\n{stdout_clean}"
     );
@@ -828,5 +836,198 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
     assert!(
         stdout_coll.contains(&format!("`{}`", repro1.display())),
         "RawPtrOffsetMutator row must point to the unquarantined repro1.rs:\n{stdout_coll}"
+    );
+
+    // 7. ITree red-flag failure (`itree_oracle_invoked` fail) and ITree divergence
+    // deduplication + quarantine:
+    let clean_miri_payload = r#"{
+        "harness": "miri-difftest",
+        "oracle_comparison": "performed",
+        "mode": "seeded",
+        "seed": "0x00000044",
+        "batches": 1,
+        "batch_size": 8,
+        "total_candidates": 8,
+        "compiled_candidates": 8,
+        "compile_failed_candidates": 0,
+        "compared_candidates": 8,
+        "agree_count": 8,
+        "diverge_count": 0,
+        "not_compared_count": 0,
+        "kernel_confirmed_divergences": 0,
+        "miri_verdicts": {"pass": 6, "panic": 1, "ub": 1, "error": 0},
+        "anneal_outcomes": {"pass": 6, "panic": 1, "ub": 1, "unsupported": 0, "out_of_fuel": 0, "external_call": 0, "error": 0},
+        "divergence_classes": {"wrong_value": 0, "false_positive_ub": 0, "missed_ub": 0, "ub_location_mismatch": 0, "panic_vs_return": 0, "return_vs_panic": 0, "panic_site_mismatch": 0},
+        "not_compared_reasons": {"compile_failed": 0, "capture_failed": 0, "miri_oracle_error": 0, "unsupported": 0, "out_of_fuel": 0, "external_call": 0},
+        "unmodeled_external_calls": {},
+        "mutator_applications": {"ArithmeticCastMutator": 8},
+        "findings": [],
+        "elapsed_ms": 500.0
+    }"#;
+
+    // 7a. `itree_oracle_not_invoked`: `kernel_confirmed_traces` (0) != `distinct_traces_checked` (8).
+    let bad_itree_payload = r#"{
+        "harness": "itree-difftest",
+        "oracle_comparison": "performed",
+        "mode": "seeded",
+        "seed": "0x00000055",
+        "batches": 1,
+        "batch_size": 8,
+        "trials_per_candidate": 12,
+        "total_candidates": 8,
+        "unsafe_token_violations": 0,
+        "opt_level_0_compiled": 8,
+        "opt_level_2_compiled": 8,
+        "opt_level_0_and_2_compiled": 8,
+        "instrumented_compiled": 8,
+        "compared_candidates": 8,
+        "agree_candidates": 8,
+        "diverge_candidates": 0,
+        "not_compared_candidates": 0,
+        "total_traces_executed": 96,
+        "distinct_traces_checked": 8,
+        "agree_traces": 8,
+        "diverge_traces": 0,
+        "kernel_confirmed_traces": 0,
+        "kernel_confirmed_divergences": 0,
+        "distinct_obs_paths": 8,
+        "diag_tag_counts": {"ok": 8, "outcome_mismatch": 0, "unexpected_ext_call": 0, "call_arg_mismatch": 0, "branch_tag_mismatch": 0, "unconsumed_events": 0, "step_faulted": 0, "decode_arg_failed": 0, "decode_event_failed": 0, "decode_outcome_failed": 0, "out_of_fuel": 0},
+        "per_candidate_distinct_traces": {"b0_c0__kernel_step": 1},
+        "mutator_applications": {"BranchLoopWeaver": 8},
+        "findings": [],
+        "elapsed_ms": 500.0
+    }"#;
+    let itree_rf_dir = dir.join("itree_red_flag");
+    let out_itree_rf = run_campaign_driver(
+        &fileutil,
+        &[],
+        &[],
+        &[
+            format!("miri_summary={clean_miri_payload}"),
+            format!("itree_summary={bad_itree_payload}"),
+        ],
+        &["--profile", "smoke", "--x20-uri", ""],
+        &itree_rf_dir,
+    );
+    let stdout_itree_rf = String::from_utf8_lossy(&out_itree_rf.stdout);
+    assert_eq!(
+        out_itree_rf.status.code(),
+        Some(2),
+        "bad itree summary must fail red-flag check with exit 2:\n{stdout_itree_rf}"
+    );
+    assert!(
+        stdout_itree_rf.contains("| `itree_oracle_invoked` | **FAIL** |")
+            && stdout_itree_rf.contains("itree_oracle_not_invoked"),
+        "report must flag `itree_oracle_invoked` as FAIL:\n{stdout_itree_rf}"
+    );
+
+    // 7b. ITree divergence deduplication and quarantine (`BranchLoopWeaver:itree_branch_tag_mismatch:TraceReplayDiag.branch_tag_mismatch`).
+    let itree_repro_dir = dir.join("itree_repros");
+    fs::create_dir_all(&itree_repro_dir).expect("create itree_repros");
+    let itree_repro0 = itree_repro_dir.join("repro.rs");
+    fs::write(&itree_repro0, "pub fn kernel_step() {}\n").expect("write itree stub repro");
+    let div_itree_payload = format!(
+        r#"{{
+        "harness": "itree-difftest",
+        "oracle_comparison": "performed",
+        "mode": "seeded",
+        "seed": "0x00000055",
+        "batches": 1,
+        "batch_size": 8,
+        "trials_per_candidate": 12,
+        "total_candidates": 8,
+        "unsafe_token_violations": 0,
+        "opt_level_0_compiled": 8,
+        "opt_level_2_compiled": 8,
+        "opt_level_0_and_2_compiled": 8,
+        "instrumented_compiled": 8,
+        "compared_candidates": 8,
+        "agree_candidates": 7,
+        "diverge_candidates": 1,
+        "not_compared_candidates": 0,
+        "total_traces_executed": 96,
+        "distinct_traces_checked": 8,
+        "agree_traces": 7,
+        "diverge_traces": 1,
+        "kernel_confirmed_traces": 8,
+        "kernel_confirmed_divergences": 1,
+        "distinct_obs_paths": 8,
+        "diag_tag_counts": {{"ok": 7, "outcome_mismatch": 0, "unexpected_ext_call": 0, "call_arg_mismatch": 0, "branch_tag_mismatch": 1, "unconsumed_events": 0, "step_faulted": 0, "decode_arg_failed": 0, "decode_event_failed": 0, "decode_outcome_failed": 0, "out_of_fuel": 0}},
+        "per_candidate_distinct_traces": {{"b0_c0__kernel_step": 1}},
+        "mutator_applications": {{"BranchLoopWeaver": 8}},
+        "findings": [
+            {{
+                "finding_id": "finding_0000_case_b0_c0__kernel_step_t0",
+                "fn_name": "b0_c0__kernel_step",
+                "case_ident": "case_b0_c0__kernel_step_t0",
+                "seed_index": 0,
+                "applied_mutators": ["BranchLoopWeaver"],
+                "diag_tag": "branch_tag_mismatch",
+                "diag_repr": "TraceReplayDiag.branch_tag_mismatch 0 1 2",
+                "trace_hex": "deadbeef",
+                "checked_mir_module": "Mir.ItreeDiffStaged.b0_c0__kernel_step",
+                "kernel_confirmed": true,
+                "repro_path": "{}"
+            }}
+        ],
+        "elapsed_ms": 500.0
+    }}"#,
+        itree_repro0.display()
+    );
+
+    let itree_div_dir = dir.join("itree_div_unquarantined");
+    let out_itree_div = run_campaign_driver(
+        &fileutil,
+        &[],
+        &[],
+        &[
+            format!("miri_summary={clean_miri_payload}"),
+            format!("itree_summary={div_itree_payload}"),
+        ],
+        &["--profile", "smoke", "--x20-uri", ""],
+        &itree_div_dir,
+    );
+    let stdout_itree_div = String::from_utf8_lossy(&out_itree_div.stdout);
+    assert_eq!(
+        out_itree_div.status.code(),
+        Some(4),
+        "unquarantined ITree divergence must exit 4:\n{stdout_itree_div}"
+    );
+    assert!(
+        stdout_itree_div.contains(
+            "| `BranchLoopWeaver:itree_branch_tag_mismatch:TraceReplayDiag.branch_tag_mismatch` | `itree_branch_tag_mismatch` | 1 |"
+        ),
+        "report must list ITree divergence fingerprint:\n{stdout_itree_div}"
+    );
+
+    let itree_quarantine = dir.join("itree_quarantine.json");
+    fs::write(
+        &itree_quarantine,
+        r#"{"quarantined": ["BranchLoopWeaver:itree_branch_tag_mismatch:TraceReplayDiag.branch_tag_mismatch"]}"#,
+    )
+    .expect("write itree quarantine");
+    let itree_quar_dir = dir.join("itree_div_quarantined");
+    let out_itree_quar = run_campaign_driver(
+        &fileutil,
+        &[],
+        &[],
+        &[
+            format!("miri_summary={clean_miri_payload}"),
+            format!("itree_summary={div_itree_payload}"),
+        ],
+        &[
+            "--profile",
+            "smoke",
+            "--quarantine-file",
+            &itree_quarantine.to_string_lossy(),
+            "--x20-uri",
+            "",
+        ],
+        &itree_quar_dir,
+    );
+    assert_eq!(
+        out_itree_quar.status.code(),
+        Some(0),
+        "quarantined ITree divergence must exit 0"
     );
 }

@@ -31,9 +31,10 @@ use cargo_anneal::{
 };
 
 use crate::input_gen::{
-    LayoutAwareByteBuilder, LayoutSpec, MirInputDictionary, MirObsPathSet, PaddingFillPattern,
-    ScalarLayout,
+    EnvScheduleGenerator, FieldLayout, LayoutAwareByteBuilder, LayoutSpec, MirInputDictionary,
+    MirObsPathSet, PaddingFillPattern, ScalarLayout,
 };
+use crate::instrument::EnvSchedule;
 use crate::miri_eval::{json_escape, resolve_rustc_bin};
 use crate::mutators_itree::{
     GeneratedItreeCandidate, StagedItreeCandidate, annotate_itree_external_callees,
@@ -613,17 +614,114 @@ fn build_anneal_trace_proc_macro_dylib(
     Ok(tmp_out)
 }
 
-fn create_itree_staging_dir(label: &str, repo_root: &Path) -> Result<PathBuf, String> {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = env::temp_dir().join(format!(
-        "anneal_itree_eval_{label}_{}_{stamp}",
-        std::process::id()
-    ));
-    fs::create_dir_all(dir.join("src"))
-        .map_err(|e| format!("failed to create staging dir {}: {e}", dir.display()))?;
+struct ItreeStagingSlot {
+    path: PathBuf,
+}
+
+impl std::ops::Deref for ItreeStagingSlot {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for ItreeStagingSlot {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.path.as_os_str()
+    }
+}
+
+impl Drop for ItreeStagingSlot {
+    fn drop(&mut self) {
+        release_itree_staging_dir(&self.path);
+    }
+}
+
+fn create_itree_staging_dir(label: &str, repo_root: &Path) -> Result<ItreeStagingSlot, String> {
+    let pool_root = repo_root.join("target/anneal_itree_staging");
+    let _ = fs::create_dir_all(&pool_root);
+
+    let mut chosen_dir: Option<PathBuf> = None;
+    for slot_idx in 0..8 {
+        let slot_dir = pool_root.join(format!("slot_{slot_idx}"));
+        let _ = fs::create_dir_all(&slot_dir);
+        let lock_dir = slot_dir.join(".active_lock");
+        if lock_dir.is_dir() {
+            let pid_file = lock_dir.join("pid");
+            let lock_older_than_5s = lock_dir
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|d| d > std::time::Duration::from_secs(5));
+            let is_stale = match fs::read_to_string(&pid_file) {
+                Ok(pid_s) => {
+                    let pid = pid_s.trim();
+                    if pid.is_empty() {
+                        lock_older_than_5s
+                    } else {
+                        !Path::new(&format!("/proc/{pid}")).exists()
+                    }
+                }
+                Err(_) => lock_older_than_5s,
+            };
+            if is_stale {
+                let _ = fs::remove_dir_all(&lock_dir);
+            }
+        }
+        if fs::create_dir(&lock_dir).is_ok() {
+            let _ = fs::write(lock_dir.join("pid"), std::process::id().to_string());
+            chosen_dir = Some(slot_dir);
+            break;
+        }
+    }
+
+    let slot = match chosen_dir {
+        Some(slot_dir) => {
+            for rel in [
+                "src",
+                "target",
+                "anneal",
+                ".anneal/generated",
+                ".anneal/.lake/build/lib/lean/Mir",
+                ".anneal/.lake/build/lib/lean/Obligations",
+                ".anneal/.lake/build/lib/lean/Verify",
+                ".anneal/.lake/build/lib/lean/Assumptions",
+                ".anneal/.lake/build/lib/lean/CrateVerify",
+                ".anneal/.lake/build/ir/Mir",
+                ".anneal/.lake/build/ir/Obligations",
+                ".anneal/.lake/build/ir/Verify",
+                ".anneal/.lake/build/ir/Assumptions",
+                ".anneal/.lake/build/ir/CrateVerify",
+            ] {
+                let _ = fs::remove_dir_all(slot_dir.join(rel));
+            }
+            for file_rel in [
+                "collect_traces.rs",
+                "collect_traces_bin_o0",
+                "collect_traces_bin_o2",
+            ] {
+                let _ = fs::remove_file(slot_dir.join(file_rel));
+            }
+            ItreeStagingSlot { path: slot_dir }
+        }
+        None => {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            ItreeStagingSlot {
+                path: env::temp_dir().join(format!(
+                    "anneal_itree_eval_{label}_{}_{stamp}",
+                    std::process::id()
+                )),
+            }
+        }
+    };
+
+    fs::create_dir_all(slot.join("src"))
+        .map_err(|e| format!("failed to create staging dir {}: {e}", slot.display()))?;
     let anneal_trace_dir = repo_root.join("crates/anneal-trace");
     let cargo_toml = format!(
         "[package]\n\
@@ -638,35 +736,82 @@ fn create_itree_staging_dir(label: &str, repo_root: &Path) -> Result<PathBuf, St
          [workspace]\n",
         anneal_trace_dir.display()
     );
-    fs::write(dir.join("Cargo.toml"), cargo_toml)
+    fs::write(slot.join("Cargo.toml"), cargo_toml)
         .map_err(|e| format!("failed to write staged Cargo.toml: {e}"))?;
-    Ok(dir)
+    Ok(slot)
 }
 
-/// Generate `trials` deterministic input pairs `(magic, payload_len, inject_panic)`
+fn release_itree_staging_dir(staging_dir: &Path) {
+    let lock_dir = staging_dir.join(".active_lock");
+    if lock_dir.is_dir() {
+        for file_rel in [
+            "collect_traces.rs",
+            "collect_traces_bin_o0",
+            "collect_traces_bin_o2",
+        ] {
+            let _ = fs::remove_file(staging_dir.join(file_rel));
+        }
+        let _ = fs::remove_dir_all(&lock_dir);
+    } else if staging_dir
+        .file_name()
+        .is_some_and(|n| !n.to_string_lossy().starts_with("slot_"))
+    {
+        let _ = fs::remove_dir_all(staging_dir);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CandidateTrialInput {
+    magic: u32,
+    payload_len: u32,
+    schedule: EnvSchedule,
+}
+
+/// Generate `trials` deterministic `(magic, payload_len, EnvSchedule)` trials
 /// for `cand`, combining `MirInputDictionary::from_rust_source(&cand.source)`
-/// + `LayoutAwareByteBuilder` with boundary probes that exercise all `magic & 3`,
-/// `payload_len & 3`, and threshold branches, plus one scheduled external-call
-/// panic trial.
+/// and `MirInputDictionary::from_lean_mir(lean_mir_source)` with
+/// `LayoutAwareByteBuilder` (using a named `LayoutSpec::Struct` so `"magic"`
+/// and `"payload_len"` field hints are consulted), `EnvScheduleGenerator`, and
+/// boundary probes that exercise all `magic & 3`, `payload_len & 3`, and
+/// threshold branches.
 fn build_candidate_trial_inputs(
     cand: &GeneratedItreeCandidate,
+    staged: &StagedItreeCandidate,
+    lean_mir_source: Option<&str>,
     trials: usize,
     batch_seed: u64,
-) -> Vec<(u32, u32, bool)> {
+) -> Vec<CandidateTrialInput> {
     let count = trials.max(1);
-    let dict = MirInputDictionary::from_rust_source(&cand.source)
+    let mut dict = MirInputDictionary::from_rust_source(&cand.source)
         .unwrap_or_else(|_| MirInputDictionary::new());
+    if let Some(mir_src) = lean_mir_source {
+        let mir_dict = MirInputDictionary::from_lean_mir(mir_src);
+        dict.merge(&mir_dict);
+    }
     let builder = LayoutAwareByteBuilder::new(&dict)
         .with_dictionary_bias_pct(75)
         .with_validity_fault_rate_pct(0)
         .with_padding_pattern(PaddingFillPattern::AlternatingA55A);
-    let pair_layout = LayoutSpec::Tuple {
+    let pair_layout = LayoutSpec::Struct {
+        name: "KernelStepArgs".to_string(),
         total_size: 8,
-        elements: vec![
-            (0, LayoutSpec::Scalar(ScalarLayout::u32())),
-            (4, LayoutSpec::Scalar(ScalarLayout::u32())),
+        fields: vec![
+            FieldLayout {
+                name: "magic".to_string(),
+                offset: 0,
+                layout: LayoutSpec::Scalar(ScalarLayout::u32()),
+            },
+            FieldLayout {
+                name: "payload_len".to_string(),
+                offset: 4,
+                layout: LayoutSpec::Scalar(ScalarLayout::u32()),
+            },
         ],
     };
+    let sched_gen = EnvScheduleGenerator::new(&dict)
+        .with_horizon_steps(4)
+        .with_panic_injection_pct(20);
+    let callee_refs: Vec<&str> = staged.ext_callee_names.iter().map(String::as_str).collect();
 
     let fixed_probes: &[(u32, u32, bool)] = &[
         (0x414E_4E4C, 2048, false),
@@ -682,12 +827,23 @@ fn build_candidate_trial_inputs(
 
     let mut out = Vec::with_capacity(count);
     let mut rng = DetRng::new(cand.seed_u64 ^ batch_seed);
+    let mut dynamic_idx = 0usize;
     for idx in 0..count {
         if idx < fixed_probes.len() && idx + 2 <= count {
-            out.push(fixed_probes[idx]);
+            let (magic, payload_len, inject_panic) = fixed_probes[idx];
+            let schedule = if inject_panic {
+                EnvSchedule::new().with_panic_on_call(0)
+            } else {
+                EnvSchedule::new()
+            };
+            out.push(CandidateTrialInput {
+                magic,
+                payload_len,
+                schedule,
+            });
             continue;
         }
-        let mut entropy = [0u8; 32];
+        let mut entropy = [0u8; 64];
         for chunk in entropy.chunks_exact_mut(8) {
             chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
         }
@@ -695,14 +851,67 @@ fn build_candidate_trial_inputs(
         let raw = builder.build_bytes(&pair_layout, &mut u);
         let magic = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
         let payload_len = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
-        out.push((magic, payload_len, false));
+        let schedule = if dynamic_idx % 2 == 1 && !callee_refs.is_empty() {
+            sched_gen.generate_schedule(&callee_refs, &mut u)
+        } else {
+            EnvSchedule::new()
+        };
+        dynamic_idx += 1;
+        out.push(CandidateTrialInput {
+            magic,
+            payload_len,
+            schedule,
+        });
     }
     out
 }
 
+fn render_trace_recorder_expr(sched: &EnvSchedule) -> String {
+    if sched.global_panic_on_call.is_none()
+        && sched.callee_panic_on_call.is_empty()
+        && sched.callee_queues.is_empty()
+        && sched.callee_defaults.is_empty()
+    {
+        return "TraceRecorder::new()".to_string();
+    }
+    let mut expr = "{ let mut s = EnvSchedule::new();".to_string();
+    if let Some(idx) = sched.global_panic_on_call {
+        let _ = write!(expr, " s.set_panic_on_call({idx});");
+    }
+    for (callee, idx) in &sched.callee_panic_on_call {
+        let _ = write!(expr, " s.set_callee_panic_on_call({callee:?}, {idx});");
+    }
+    for (callee, queue) in &sched.callee_queues {
+        for bytes in queue {
+            let byte_list = bytes
+                .iter()
+                .map(|b| format!("{b}u8"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(
+                expr,
+                " s.push_callee_response({callee:?}, vec![{byte_list}]);"
+            );
+        }
+    }
+    for (callee, bytes) in &sched.callee_defaults {
+        let byte_list = bytes
+            .iter()
+            .map(|b| format!("{b}u8"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(
+            expr,
+            " s.set_callee_default({callee:?}, vec![{byte_list}]);"
+        );
+    }
+    expr.push_str(" TraceRecorder::with_schedule(s) }");
+    expr
+}
+
 fn render_trace_collector_source(
     repo_root: &Path,
-    staged_candidates: &[(StagedItreeCandidate, Vec<(u32, u32, bool)>)],
+    staged_candidates: &[(StagedItreeCandidate, Vec<CandidateTrialInput>)],
 ) -> String {
     let trace_observer_path = repo_root.join("crates/cargo-anneal/src/trace_observer.rs");
     let mut out = String::new();
@@ -729,12 +938,10 @@ fn render_trace_collector_source(
     for (staged, trials) in staged_candidates {
         let fn_ident = &staged.root_fn_name;
         let def_path = format!("itree_diff_staged::{fn_ident}");
-        for &(magic, payload_len, inject_panic) in trials {
-            let rec_expr = if inject_panic {
-                "TraceRecorder::with_schedule(EnvSchedule::new().with_panic_on_call(0))"
-            } else {
-                "TraceRecorder::new()"
-            };
+        for trial in trials {
+            let magic = trial.magic;
+            let payload_len = trial.payload_len;
+            let rec_expr = render_trace_recorder_expr(&trial.schedule);
             let _ = writeln!(
                 out,
                 "    {{\n\
@@ -759,7 +966,7 @@ fn render_trace_collector_source(
 fn collect_traces_natively(
     repo_root: &Path,
     staging_dir: &Path,
-    staged_candidates: &[(StagedItreeCandidate, Vec<(u32, u32, bool)>)],
+    staged_candidates: &[(StagedItreeCandidate, Vec<CandidateTrialInput>)],
 ) -> Result<BTreeMap<String, Vec<RecordedRawTrace>>, String> {
     let proc_macro_dylib = build_anneal_trace_proc_macro_dylib(repo_root, staging_dir)?;
     let mir_instrument_bin = ensure_mir_instrument_bin(repo_root)?;
@@ -1034,7 +1241,7 @@ pub fn evaluate_itree_batches_with_options(
     let staging_dir = create_itree_staging_dir(mode, &repo_root)?;
     let eval_res = (|| -> Result<ItreeCampaignEvalReport, String> {
         let mut combined_candidates_rs = String::new();
-        let mut staged_with_trials: Vec<(StagedItreeCandidate, Vec<(u32, u32, bool)>)> =
+        let mut staged_candidates: Vec<(&GeneratedItreeCandidate, StagedItreeCandidate)> =
             Vec::with_capacity(opt_level_0_and_2_compiled);
         let mut cand_meta: BTreeMap<String, (&GeneratedItreeCandidate, StagedItreeCandidate)> =
             BTreeMap::new();
@@ -1049,10 +1256,8 @@ pub fn evaluate_itree_batches_with_options(
                 let staged = stage_itree_candidate_items(&cand.source, &prefix, "kernel_step")?;
                 combined_candidates_rs.push_str(&staged.staged_source);
                 combined_candidates_rs.push('\n');
-                let trials =
-                    build_candidate_trial_inputs(cand, options.trials_per_candidate, seed);
                 cand_meta.insert(staged.root_fn_name.clone(), (cand, staged.clone()));
-                staged_with_trials.push((staged, trials));
+                staged_candidates.push((cand, staged));
             }
         }
 
@@ -1097,6 +1302,26 @@ pub fn evaluate_itree_batches_with_options(
             }
             fs::write(&mir_file, mutated)
                 .map_err(|e| format!("failed to write mutated {}: {e}", mir_file.display()))?;
+        }
+
+        // Now that Lean MIR is scaffolded, build MIR-guided initial inputs and
+        // `EnvScheduleGenerator` schedules per candidate using both the Rust
+        // source and the extracted Lean MIR (`MirInputDictionary::from_lean_mir`).
+        let mut staged_with_trials: Vec<(
+            StagedItreeCandidate,
+            Vec<CandidateTrialInput>,
+        )> = Vec::with_capacity(staged_candidates.len());
+        for (cand, staged) in staged_candidates {
+            let mir_file = mir_dir.join(format!("{}.lean", staged.root_fn_name));
+            let lean_mir_src = fs::read_to_string(&mir_file).ok();
+            let trials = build_candidate_trial_inputs(
+                cand,
+                &staged,
+                lean_mir_src.as_deref(),
+                options.trials_per_candidate,
+                seed,
+            );
+            staged_with_trials.push((staged, trials));
         }
 
         let swap_map: BTreeMap<String, String> =
@@ -1244,12 +1469,38 @@ pub fn evaluate_itree_batches_with_options(
             case.expected_diag_tag = Some(tag.clone());
         }
 
-        // Stage 2: Kernel-confirm every trace's `TraceReplayDiag.tagName` (`by rfl`)
-        // and `checkRawByteTraceFullBounded_sound` + `checkRawByteTraceObsErasedBounded_sound`
-        // for `"ok"` traces.
+        // Stage 2: Kernel-confirm `TraceReplayDiag.tagName` (`by rfl`) and
+        // `checkRawByteTraceFullBounded_sound` + `checkRawByteTraceObsErasedBounded_sound`.
+        // For small batches (<= 32 distinct traces), confirm every trace in the Lean
+        // kernel. For larger campaign batches, confirm every divergence plus the first
+        // trace of each candidate (at least 16 traces) so `lake env lean` finishes well
+        // within campaign time budgets while every candidate and every divergence gets
+        // kernel-confirmed `by rfl` proofs.
+        let confirm_cases: Vec<BatchTraceEvalCase> = if batch_cases.len() <= 32 {
+            batch_cases.clone()
+        } else {
+            let mut selected = Vec::new();
+            let mut confirmed_fns: BTreeSet<String> = BTreeSet::new();
+            for case in &batch_cases {
+                let is_div = case.expected_diag_tag.as_deref() != Some("ok");
+                let fn_name = case_to_fn
+                    .get(&case.case_ident)
+                    .cloned()
+                    .unwrap_or_default();
+                if is_div || (selected.len() < 16 && confirmed_fns.insert(fn_name)) {
+                    selected.push(case.clone());
+                }
+            }
+            if selected.is_empty()
+                && let Some(first) = batch_cases.first()
+            {
+                selected.push(first.clone());
+            }
+            selected
+        };
         let confirm_src = render_batch_trace_eval_lean_module(
             "Proof.ItreeDiffBatchConfirm",
-            &batch_cases,
+            &confirm_cases,
             false,
         );
         let confirm_file = verify_dir.join("ItreeDiffBatchConfirm.lean");
@@ -1371,7 +1622,7 @@ pub fn evaluate_itree_batches_with_options(
         })
     })();
 
-    let _ = fs::remove_dir_all(&staging_dir);
+    release_itree_staging_dir(&staging_dir);
     eval_res
 }
 
@@ -1541,7 +1792,7 @@ pub fn reproduce_itree_finding(
         })
     })();
 
-    let _ = fs::remove_dir_all(&staging_dir);
+    release_itree_staging_dir(&staging_dir);
     res
 }
 
