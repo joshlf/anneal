@@ -1562,6 +1562,43 @@ inductive LiftLensRvalue
           .ok v env₂ mem) →
       LiftLensRvalue localDecls layouts env entries
         (.binaryOp op lhsOp rhsOp) v env₂
+  | unaryOp_not
+      {env env' : PureEnv} {entries : List (RawPtrVal × Value)}
+      {op : Operand} {sc : ScalarInt} {v : Value} :
+      LiftLensOperandAny env entries op (.scalar sc) env' →
+      (∀ mem : Memory,
+        evalUnaryNot sc (operandTy localDecls layouts op) env' mem =
+          .ok v env' mem) →
+      LiftLensRvalue localDecls layouts env entries
+        (.unaryOp .not op) v env'
+  | unaryOp_neg
+      {env env' : PureEnv} {entries : List (RawPtrVal × Value)}
+      {op : Operand} {sc : ScalarInt} :
+      LiftLensOperandAny env entries op (.scalar sc) env' →
+      Nat.beq sc.sizeBytes 0 = false →
+      LiftLensRvalue localDecls layouts env entries
+        (.unaryOp .neg op)
+        (.scalar ⟨wrapScalarBits
+          (Nat.sub (scalarModulus sc.sizeBytes)
+            (wrapScalarBits sc.bits (scalarModulus sc.sizeBytes)))
+          (scalarModulus sc.sizeBytes), sc.sizeBytes⟩)
+        env'
+  | cast_intToInt
+      {env env' : PureEnv} {entries : List (RawPtrVal × Value)}
+      {op : Operand} {targetTy : Ty} {sc : ScalarInt} {targetBytes : Nat} :
+      LiftLensOperandAny env entries op (.scalar sc) env' →
+      Nat.beq sc.sizeBytes 0 = false →
+      intCastTargetBytes targetTy.kind = .some targetBytes →
+      LiftLensRvalue localDecls layouts env entries
+        (.cast .intToInt op targetTy)
+        (.scalar ⟨match operandIsSigned localDecls op layouts with
+          | false => wrapScalarBits sc.bits (scalarModulus targetBytes)
+          | true =>
+            match Nat.ble targetBytes sc.sizeBytes with
+            | true => wrapScalarBits sc.bits (scalarModulus targetBytes)
+            | false => signExtendBits sc.bits sc.sizeBytes targetBytes,
+          targetBytes⟩)
+        env'
   | tuple_nil
       {env : PureEnv} {entries : List (RawPtrVal × Value)} :
       LiftLensRvalue localDecls layouts env entries
@@ -1734,9 +1771,12 @@ from basic block `bbIdx` with locals `env` and pure lens bindings `entries`
 returns `retVal` (read from `_0`) with final lens bindings `entries'`.
 
 Each constructor lifts the block's statements and then one terminator:
-`return_` ends the derivation, `goto` continues at its target, and `assert`
+`return_` ends the derivation, `goto` continues at its target, `assert`
 continues at its success target after its condition operand lifts to the
-expected bit. Derivations are finite, so every lifted path is acyclic.
+expected bit, `switchInt` continues at the target selected by
+`lookupSwitchTarget` on the discriminant's bits, and `drop_local` marks a root
+local slot `.uninit` and continues at its normal target. Derivations are finite,
+so every lifted path is acyclic.
 -/
 inductive LiftLensBlock (body : CapturedMir) :
     BasicBlockIdx → PureEnv → List (RawPtrVal × Value) →
@@ -1773,6 +1813,36 @@ inductive LiftLensBlock (body : CapturedMir) :
         env entries bb.statements env₁ entries₁ →
       LiftLensOperandAny env₁ entries₁ cond (.scalar sc) env₂ →
       sc.bits = assertBit expected →
+      LiftLensBlock body target env₂ entries₁ retVal entries' →
+      LiftLensBlock body bbIdx env entries retVal entries'
+  | switchInt
+      {bbIdx target : BasicBlockIdx} {bb : BasicBlockData}
+      {discr : Operand} {targets : SwitchTargets}
+      {env env₁ env₂ : PureEnv} {sc : ScalarInt}
+      {entries entries₁ entries' : List (RawPtrVal × Value)} {retVal : Value} :
+      body.phase = .runtimePostCleanup →
+      get? body.basicBlocks bbIdx = .some bb →
+      bb.terminator.kind = .switchInt discr targets →
+      LiftLensStmts body.localDecls body.layouts
+        env entries bb.statements env₁ entries₁ →
+      LiftLensOperandAny env₁ entries₁ discr (.scalar sc) env₂ →
+      lookupSwitchTarget sc.bits targets.branches targets.otherwise = target →
+      LiftLensBlock body target env₂ entries₁ retVal entries' →
+      LiftLensBlock body bbIdx env entries retVal entries'
+  | drop_local
+      {bbIdx target : BasicBlockIdx} {bb : BasicBlockData}
+      {loc : Local} {unwind : UnwindAction} {oldSlot : LocalSlot}
+      {env env₁ env₂ : PureEnv}
+      {entries entries₁ entries' : List (RawPtrVal × Value)} {retVal : Value} :
+      body.phase = .runtimePostCleanup →
+      get? body.basicBlocks bbIdx = .some bb →
+      bb.terminator.kind =
+        .drop { local_ := loc, projection := [] } target unwind →
+      LiftLensStmts body.localDecls body.layouts
+        env entries bb.statements env₁ entries₁ →
+      get? env₁ loc = .some oldSlot →
+      oldSlot ≠ .dead →
+      set? env₁ loc .uninit = .some env₂ →
       LiftLensBlock body target env₂ entries₁ retVal entries' →
       LiftLensBlock body bbIdx env entries retVal entries'
 
@@ -2017,6 +2087,30 @@ theorem LiftLensRvalue.evalRvalue_eq
     dsimp only
     rw [hEval₂]
     exact hEvalOp m
+  | unaryOp_not hOp hNot =>
+    rcases hOp.evalOperand_eq hInv layouts with ⟨hEval, hLen⟩
+    refine ⟨?_, hLen⟩
+    unfold evalRvalue
+    dsimp only
+    rw [hEval]
+    exact hNot m
+  | unaryOp_neg hOp hSz =>
+    rcases hOp.evalOperand_eq hInv layouts with ⟨hEval, hLen⟩
+    refine ⟨?_, hLen⟩
+    unfold evalRvalue
+    dsimp only
+    rw [hEval]
+    dsimp only
+    rw [hSz]
+  | cast_intToInt hOp hSz hTarget =>
+    rcases hOp.evalOperand_eq hInv layouts with ⟨hEval, hLen⟩
+    refine ⟨?_, hLen⟩
+    unfold evalRvalue
+    dsimp only
+    rw [hEval]
+    dsimp only
+    rw [hSz, hTarget]
+    rfl
   | tuple_nil =>
     exact ⟨rfl, rfl⟩
 
@@ -2577,6 +2671,108 @@ theorem mirWpConverges_assert_of_lens
   rw [hBit]
   cases expected <;> rfl
 
+/--
+A `switchInt` terminator whose discriminant evaluates to scalar `sc` emits the
+branch observation `.event sc.bits` and continues at the target selected by
+`lookupSwitchTarget sc.bits targets.branches targets.otherwise`.
+-/
+theorem mirWpConverges_switchInt_of_lens
+    {body : CapturedMir} {bbIdx target : BasicBlockIdx} {bb : BasicBlockData}
+    {discr : Operand} {targets : SwitchTargets}
+    {env env' : PureEnv} {sc : ScalarInt} {m : Memory} {Φ : MirOutcome → Prop}
+    (hPhase : body.phase = .runtimePostCleanup)
+    (hBb : get? body.basicBlocks bbIdx = .some bb)
+    (hTerm : bb.terminator.kind = .switchInt discr targets)
+    (hCallee : m.activeCallee = .none)
+    (hEval :
+      evalOperand env discr m.borrows m.globals body.layouts m.callerLocals =
+        .ok (.scalar sc) env')
+    (hTarget : lookupSwitchTarget sc.bits targets.branches targets.otherwise = target)
+    (hNext :
+      MirWpConverges body
+        { frame := { blockIdx := target, stmtIdx := 0, locals := env' }
+          memory := m }
+        Φ) :
+    MirWpConverges body
+      { frame := {
+          blockIdx := bbIdx
+          stmtIdx := bb.statements.length
+          locals := env
+        }
+        memory := m }
+      Φ := by
+  refine MirWpConverges.step_emit (obs := .event sc.bits) ?_ hNext
+  unfold stepMirFn
+  rw [hCallee]
+  dsimp only [Option.getD]
+  simp only [hPhase, hBb]
+  have hGetNone : get? bb.statements bb.statements.length = .none :=
+    get?_eq_none_of_le (Nat.le_refl _)
+  simp only [hGetNone]
+  unfold length
+  simp only [beq_self_eq_true, ↓reduceIte]
+  unfold evalTerminator
+  rw [hTerm]
+  dsimp only
+  rw [hEval]
+  dsimp only
+  rw [hTarget]
+
+/--
+A `drop` terminator on a non-dead root local slot `loc` marks the slot
+`.uninit` and continues at its normal target.
+-/
+theorem mirWpConverges_drop_of_lens
+    {body : CapturedMir} {bbIdx target : BasicBlockIdx} {bb : BasicBlockData}
+    {loc : Local} {unwind : UnwindAction} {oldSlot : LocalSlot}
+    {env env' : PureEnv} {m : Memory} {Φ : MirOutcome → Prop}
+    (hPhase : body.phase = .runtimePostCleanup)
+    (hBb : get? body.basicBlocks bbIdx = .some bb)
+    (hTerm :
+      bb.terminator.kind =
+        .drop { local_ := loc, projection := [] } target unwind)
+    (hCallee : m.activeCallee = .none)
+    (hGet : get? env loc = .some oldSlot)
+    (hNotDead : oldSlot ≠ .dead)
+    (hSet : set? env loc .uninit = .some env')
+    (hNext :
+      MirWpConverges body
+        { frame := { blockIdx := target, stmtIdx := 0, locals := env' }
+          memory := m }
+        Φ) :
+    MirWpConverges body
+      { frame := {
+          blockIdx := bbIdx
+          stmtIdx := bb.statements.length
+          locals := env
+        }
+        memory := m }
+      Φ := by
+  refine MirWpConverges.step_tau ?_ hNext
+  unfold stepMirFn
+  rw [hCallee]
+  dsimp only [Option.getD]
+  simp only [hPhase, hBb]
+  have hGetNone : get? bb.statements bb.statements.length = .none :=
+    get?_eq_none_of_le (Nat.le_refl _)
+  simp only [hGetNone]
+  unfold length
+  simp only [beq_self_eq_true, ↓reduceIte]
+  unfold evalTerminator
+  rw [hTerm]
+  dsimp only
+  rw [hGet]
+  cases oldSlot with
+  | dead => exact absurd rfl hNotDead
+  | uninit =>
+    dsimp only
+    rw [hSet]
+    rfl
+  | init _ =>
+    dsimp only
+    rw [hSet]
+    rfl
+
 
 /-- Pure operand lifting preserves the length of the local slot environment. -/
 theorem LiftLensOperand.length_eq
@@ -2612,6 +2808,9 @@ theorem LiftLensRvalue.length_eq
   | use_deref hDeref => cases hDeref <;> rfl
   | copyForDeref_deref _ _ => rfl
   | binaryOp hLhs hRhs _ => exact hRhs.length_eq.trans hLhs.length_eq
+  | unaryOp_not hOp _ => exact hOp.length_eq
+  | unaryOp_neg hOp _ => exact hOp.length_eq
+  | cast_intToInt hOp _ _ => exact hOp.length_eq
   | tuple_nil => rfl
 
 theorem LiftLensStmt.length_eq
@@ -2643,9 +2842,9 @@ theorem LiftLensStmts.length_eq
 /--
 Control-flow soundness of `LiftLensBlock` by induction on the derivation: each
 block's statements step through `mirWpConverges_of_liftLensStmts`, and its
-terminator (`return_`, `goto`, or `assert`) steps through the matching
-terminator lemma, threading `SepLensStateInv`, `LensFramePreserved`, and the
-lens keys across blocks.
+terminator (`return_`, `goto`, `assert`, `switchInt`, or `drop_local`) steps
+through the matching terminator lemma, threading `SepLensStateInv`,
+`LensFramePreserved`, and the lens keys across blocks.
 -/
 theorem mirWpConverges_of_liftLensBlock
     {body : CapturedMir} {bbIdx : BasicBlockIdx} {env : PureEnv}
@@ -2693,6 +2892,30 @@ theorem mirWpConverges_of_liftLensBlock
     rcases hCond.evalOperand_eq hInv' body.layouts with ⟨hEval, hLen₂⟩
     exact mirWpConverges_assert_of_lens hPhase hBb hTerm
       hInv'.activeCallee_none hEval hBit
+      (ih entries₀ m₀ m' Φ (by rw [hLen₂]; exact hInv') hFrame' hKeys'
+        (fun m_final hInvF hFrameF =>
+          hPost m_final (by rw [← hLen, ← hLen₂]; exact hInvF) hFrameF))
+  | switchInt hPhase hBb hTerm hStmts hDiscr hTarget _ ih =>
+    intro entries₀ m₀ m Φ hInv hFrame hKeys hPost
+    have hLen := hStmts.length_eq
+    refine mirWpConverges_of_liftLensStmts hPhase hBb hStmts [] m₀ m Φ
+      (List.nil_append _).symm hInv hFrame hKeys
+      (fun m' hInv' hFrame' hKeys' => ?_)
+    rcases hDiscr.evalOperand_eq hInv' body.layouts with ⟨hEval, hLen₂⟩
+    exact mirWpConverges_switchInt_of_lens hPhase hBb hTerm
+      hInv'.activeCallee_none hEval hTarget
+      (ih entries₀ m₀ m' Φ (by rw [hLen₂]; exact hInv') hFrame' hKeys'
+        (fun m_final hInvF hFrameF =>
+          hPost m_final (by rw [← hLen, ← hLen₂]; exact hInvF) hFrameF))
+  | drop_local hPhase hBb hTerm hStmts hGet hNotDead hSet _ ih =>
+    intro entries₀ m₀ m Φ hInv hFrame hKeys hPost
+    have hLen := hStmts.length_eq
+    have hLen₂ := set?_length_eq hSet
+    refine mirWpConverges_of_liftLensStmts hPhase hBb hStmts [] m₀ m Φ
+      (List.nil_append _).symm hInv hFrame hKeys
+      (fun m' hInv' hFrame' hKeys' => ?_)
+    exact mirWpConverges_drop_of_lens hPhase hBb hTerm
+      hInv'.activeCallee_none hGet hNotDead hSet
       (ih entries₀ m₀ m' Φ (by rw [hLen₂]; exact hInv') hFrame' hKeys'
         (fun m_final hInvF hFrameF =>
           hPost m_final (by rw [← hLen, ← hLen₂]; exact hInvF) hFrameF))
@@ -3423,6 +3646,548 @@ theorem sepConjBindings_entails_pairwiseIndependentLenses
       exact memoryPtrMutLens_independent_family hp hq' (hHead q hq)
   exact hSuffix ptrs (fun _ h => h) hPairPtr
 
+/-! ### `I-10`-Aware Mutable Borrow Lenses (`treeMemoryPtrMutLens`) -/
+
+/--
+`I-10`-aware Tree Borrows access step for `rp` on `m`: unlike
+`stepTreeBorrowAccess?` (which uses the flat `invalidateConflictingBorrows`
+helper), a write access updates permissions with the `I-10` parent/child
+invalidation `invalidateTreeBorrowsAtProj`, so active ancestor tags of `rp.tag`
+remain `.active` under child writes.
+-/
+def stepTreeBorrowHierarchyAccess?
+    (m : Memory) (rp : RawPtrVal) (isWrite : Bool) : Option Memory :=
+  match lookupBorrow m.borrows rp.tag with
+  | .some entry =>
+    match entry.perm, isWrite with
+    | .disabled, _ => .none
+    | .frozen, true => .none
+    | _, false => .some m
+    | .active, true | .reserved, true =>
+      .some { m with
+        borrows :=
+          invalidateTreeBorrowsAtProj m.borrows m.borrows entry.targetLocal
+            (.some rp.tag) entry.targetProjection entry.rangeOffset
+            entry.rangeLen }
+  | .none => .none
+
+/--
+`I-10`-aware `MutLens Memory α` backed by an active Tree Borrows pointer `rp`:
+identical to `memoryPtrMutLens rp codec` on reads and pointee updates, except
+that `writeBack` steps the borrow table via `stepTreeBorrowHierarchyAccess?` so
+that `I-10` parent/child reborrow chains (`TreeExclusiveBorrow`) satisfy all
+algebraic lens laws without requiring the ancestor-free `ExclusiveActiveBorrow`.
+-/
+def treeMemoryPtrMutLens (rp : RawPtrVal) (codec : ValueCodec α) :
+    MutLens Memory α where
+  readView m := (memoryPtrMutLens rp codec).readView m
+  writeBack a m :=
+    let m₁ := (stepTreeBorrowHierarchyAccess? m rp true).getD m
+    match writeAllocAt? (memoryLocals m₁) rp (codec.encode a) with
+    | some locals' => updateMemoryLocals m₁ locals'
+    | none => m₁
+
+theorem stepTreeBorrowHierarchyAccess_write_eq_some_self_of_tree
+    {rp : RawPtrVal} {m : Memory}
+    (hExcl : TreeExclusiveBorrow rp m) :
+    stepTreeBorrowHierarchyAccess? m rp true = .some m := by
+  rcases hExcl.lookup_active with
+    ⟨entry, hLook, hTarget, hProj, hPerm, hRO, hRL⟩
+  unfold stepTreeBorrowHierarchyAccess?
+  rw [hLook]
+  dsimp only
+  rw [hPerm, hTarget, hProj, hRO, hRL]
+  simp only [
+    invalidateTreeBorrowsAtProj_eq_self_of_tree m.borrows m.borrows [] 0 0
+      hExcl.ancestors_active_or_disabled]
+
+theorem treeMemoryPtrMutLens_readView_of_readAllocAt
+    {rp : RawPtrVal} {codec : ValueCodec α} {a : α} {m : Memory}
+    (h_read : readAllocAt? (memoryLocals m) rp = some (codec.encode a)) :
+    (treeMemoryPtrMutLens rp codec).readView m = a :=
+  memoryPtrMutLens_readView_of_readAllocAt h_read
+
+/--
+Under `TreeExclusiveBorrow rp m` and an initialized pointee slot,
+`(treeMemoryPtrMutLens rp codec).writeBack a m` leaves `m.borrows` (including
+all active `I-10` ancestor tags) unchanged and updates `memoryLocals m` at
+`rp.allocId` to `.init (codec.encode a)`.
+-/
+theorem treeMemoryPtrMutLens_writeBack_eq_of_tree
+    {α : Type} (rp : RawPtrVal) (codec : ValueCodec α) (a : α)
+    {m : Memory} {v₀ : Value}
+    (hPts : readAllocAt? (memoryLocals m) rp = some v₀)
+    (hExcl : TreeExclusiveBorrow rp m) :
+    (treeMemoryPtrMutLens rp codec).writeBack a m =
+      updateMemoryLocals
+        m
+        ((memoryLocals m).set rp.allocId (.init (codec.encode a))) := by
+  unfold treeMemoryPtrMutLens
+  dsimp only
+  rw [stepTreeBorrowHierarchyAccess_write_eq_some_self_of_tree hExcl]
+  dsimp only [Option.getD]
+  unfold readAllocAt? at hPts
+  rw [hExcl.offset_zero] at hPts
+  unfold writeAllocAt?
+  rw [hExcl.offset_zero]
+  cases hGet : get? (memoryLocals m) rp.allocId with
+  | none => rw [hGet] at hPts; nomatch hPts
+  | some slot =>
+    rw [hGet] at hPts
+    cases slot with
+    | dead => nomatch hPts
+    | uninit => nomatch hPts
+    | init _ =>
+      have hLt : rp.allocId < (memoryLocals m).length :=
+        (List.getElem?_eq_some_iff.mp hGet).1
+      unfold set?
+      simp [hLt]
+
+/--
+On any memory satisfying the ancestor-free `ExclusiveActiveBorrow rp m`,
+`treeMemoryPtrMutLens` and `memoryPtrMutLens` coincide on both `readView` and
+`writeBack`.
+-/
+theorem treeMemoryPtrMutLens_writeBack_eq_memoryPtrMutLens_of_exclusive
+    {α : Type} (rp : RawPtrVal) (codec : ValueCodec α) (a : α)
+    {m : Memory} {v₀ : Value}
+    (hPts : readAllocAt? (memoryLocals m) rp = some v₀)
+    (hExcl : ExclusiveActiveBorrow rp m) :
+    (treeMemoryPtrMutLens rp codec).writeBack a m =
+      (memoryPtrMutLens rp codec).writeBack a m := by
+  rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp codec a hPts hExcl.toTree,
+    memoryPtrMutLens_writeBack_eq_of_exclusive rp codec a hPts hExcl]
+
+/--
+Domain validity predicate for an `I-10`-aware mutable borrow lens
+`treeMemoryPtrMutLens rp codec`.
+-/
+structure ValidTreeMutBorrowLens {α : Type}
+    (rp : RawPtrVal) (codec : ValueCodec α) (m : Memory) : Prop where
+  has_typed_pointee : ∃ a : α, readAllocAt? (memoryLocals m) rp = some (codec.encode a)
+  exclusive : TreeExclusiveBorrow rp m
+
+theorem ValidMutBorrowLens.toTree {α : Type}
+    {rp : RawPtrVal} {codec : ValueCodec α} {m : Memory}
+    (h : ValidMutBorrowLens rp codec m) :
+    ValidTreeMutBorrowLens rp codec m :=
+  ⟨h.has_typed_pointee, h.exclusive.toTree⟩
+
+/--
+`treeMemoryPtrMutLens rp codec` is a `LawfulMutLens` on
+`ValidTreeMutBorrowLens rp codec` (admitting active `I-10` parent/child
+reborrow chains).
+-/
+theorem treeMemoryPtrMutLens_lawful {α : Type}
+    (rp : RawPtrVal) (codec : ValueCodec α) :
+    LawfulMutLens (treeMemoryPtrMutLens rp codec)
+      (ValidTreeMutBorrowLens rp codec) where
+  valid_writeBack a m hm := by
+    rcases hm with ⟨⟨a₀, hPts⟩, hExcl⟩
+    rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp codec a hPts hExcl]
+    refine ⟨⟨a, ?_⟩,
+      TreeExclusiveBorrow.of_borrows_eq hExcl (updateMemoryLocals_borrows _ _)⟩
+    unfold readAllocAt?
+    rw [memoryLocals_updateMemoryLocals, hExcl.offset_zero]
+    unfold readAllocAt? at hPts
+    rw [hExcl.offset_zero] at hPts
+    cases hGet : get? (memoryLocals m) rp.allocId with
+    | none => rw [hGet] at hPts; nomatch hPts
+    | some slot =>
+      have hLt : rp.allocId < (memoryLocals m).length :=
+        (List.getElem?_eq_some_iff.mp hGet).1
+      unfold get?
+      rw [List.getElem?_set_self hLt]
+  readView_writeBack a m hm := by
+    rcases hm with ⟨⟨a₀, hPts⟩, hExcl⟩
+    rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp codec a hPts hExcl]
+    unfold treeMemoryPtrMutLens memoryPtrMutLens
+    dsimp only
+    unfold readAllocAt?
+    rw [memoryLocals_updateMemoryLocals, hExcl.offset_zero]
+    unfold readAllocAt? at hPts
+    rw [hExcl.offset_zero] at hPts
+    cases hGet : get? (memoryLocals m) rp.allocId with
+    | none => rw [hGet] at hPts; nomatch hPts
+    | some slot =>
+      have hLt : rp.allocId < (memoryLocals m).length :=
+        (List.getElem?_eq_some_iff.mp hGet).1
+      unfold get?
+      rw [List.getElem?_set_self hLt]
+      simp
+  writeBack_readView m hm := by
+    rcases hm with ⟨⟨a₀, hPts⟩, hExcl⟩
+    have hRead : (treeMemoryPtrMutLens rp codec).readView m = a₀ :=
+      treeMemoryPtrMutLens_readView_of_readAllocAt hPts
+    rw [hRead]
+    rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp codec a₀ hPts hExcl]
+    unfold readAllocAt? at hPts
+    rw [hExcl.offset_zero] at hPts
+    cases hGet : get? (memoryLocals m) rp.allocId with
+    | none => rw [hGet] at hPts; nomatch hPts
+    | some slot =>
+      rw [hGet] at hPts
+      cases slot with
+      | dead => nomatch hPts
+      | uninit => nomatch hPts
+      | init v =>
+        injection hPts with hV
+        subst hV
+        rw [list_set_getElem?_self hGet, updateMemoryLocals_self]
+  writeBack_writeBack a₁ a₂ m hm := by
+    have hm₁ : ValidTreeMutBorrowLens rp codec
+        ((treeMemoryPtrMutLens rp codec).writeBack a₁ m) := by
+      rcases hm with ⟨⟨a₀, hPts⟩, hExcl⟩
+      rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp codec a₁ hPts hExcl]
+      refine ⟨⟨a₁, ?_⟩,
+        TreeExclusiveBorrow.of_borrows_eq hExcl
+          (updateMemoryLocals_borrows _ _)⟩
+      unfold readAllocAt?
+      rw [memoryLocals_updateMemoryLocals, hExcl.offset_zero]
+      unfold readAllocAt? at hPts
+      rw [hExcl.offset_zero] at hPts
+      cases hGet : get? (memoryLocals m) rp.allocId with
+      | none => rw [hGet] at hPts; nomatch hPts
+      | some slot =>
+        have hLt : rp.allocId < (memoryLocals m).length :=
+          (List.getElem?_eq_some_iff.mp hGet).1
+        unfold get?
+        rw [List.getElem?_set_self hLt]
+    rcases hm with ⟨⟨a₀, hPts⟩, hExcl⟩
+    rcases hm₁ with ⟨⟨a₁', hPts₁⟩, hExcl₁⟩
+    rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp codec a₂ hPts₁ hExcl₁]
+    rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp codec a₁ hPts hExcl]
+    rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp codec a₂ hPts hExcl]
+    rw [memoryLocals_updateMemoryLocals, list_set_set_self,
+      updateMemoryLocals_updateMemoryLocals]
+
+/--
+Domain validity predicate for a pair of `I-10`-aware mutable borrow lenses
+`treeMemoryPtrMutLens rp₁ codec₁` and `treeMemoryPtrMutLens rp₂ codec₂`.
+-/
+structure ValidTreeMutBorrowLensPair {α β : Type}
+    (rp₁ rp₂ : RawPtrVal) (codec₁ : ValueCodec α) (codec₂ : ValueCodec β)
+    (m : Memory) : Prop where
+  valid_left : ValidTreeMutBorrowLens rp₁ codec₁ m
+  valid_right : ValidTreeMutBorrowLens rp₂ codec₂ m
+  ne_alloc : rp₁.allocId ≠ rp₂.allocId
+
+/--
+Two `treeMemoryPtrMutLens` instances on distinct allocations satisfy
+`IndependentLenses` on `ValidTreeMutBorrowLensPair rp₁ rp₂ codec₁ codec₂`.
+-/
+theorem treeMemoryPtrMutLens_independent_of_ne_alloc {α β : Type}
+    (rp₁ rp₂ : RawPtrVal) (codec₁ : ValueCodec α) (codec₂ : ValueCodec β) :
+    IndependentLenses
+      (treeMemoryPtrMutLens rp₁ codec₁)
+      (treeMemoryPtrMutLens rp₂ codec₂)
+      (ValidTreeMutBorrowLensPair rp₁ rp₂ codec₁ codec₂) where
+  valid_writeBack_left a m hm := by
+    refine ⟨
+      (treeMemoryPtrMutLens_lawful rp₁ codec₁).valid_writeBack a m hm.valid_left,
+      ?_, hm.ne_alloc⟩
+    rcases hm.valid_left with ⟨⟨a₀, hPts₁⟩, hExcl₁⟩
+    rcases hm.valid_right with ⟨⟨b₀, hPts₂⟩, hExcl₂⟩
+    rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp₁ codec₁ a hPts₁ hExcl₁]
+    exact ⟨
+      ⟨b₀, pointsTo_updateMemoryLocals_set_ne hm.ne_alloc hExcl₂.offset_zero hPts₂⟩,
+      TreeExclusiveBorrow.of_borrows_eq hExcl₂
+        (updateMemoryLocals_borrows _ _)⟩
+  valid_writeBack_right b m hm := by
+    refine ⟨?_,
+      (treeMemoryPtrMutLens_lawful rp₂ codec₂).valid_writeBack b m hm.valid_right,
+      hm.ne_alloc⟩
+    rcases hm.valid_left with ⟨⟨a₀, hPts₁⟩, hExcl₁⟩
+    rcases hm.valid_right with ⟨⟨b₀, hPts₂⟩, hExcl₂⟩
+    rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp₂ codec₂ b hPts₂ hExcl₂]
+    exact ⟨
+      ⟨a₀, pointsTo_updateMemoryLocals_set_ne hm.ne_alloc.symm
+        hExcl₁.offset_zero hPts₁⟩,
+      TreeExclusiveBorrow.of_borrows_eq hExcl₁
+        (updateMemoryLocals_borrows _ _)⟩
+  readView_right_of_writeBack_left a m hm := by
+    rcases hm.valid_left with ⟨⟨a₀, hPts₁⟩, hExcl₁⟩
+    rcases hm.valid_right with ⟨⟨b₀, hPts₂⟩, hExcl₂⟩
+    rw [treeMemoryPtrMutLens_readView_of_readAllocAt hPts₂]
+    rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp₁ codec₁ a hPts₁ hExcl₁]
+    exact treeMemoryPtrMutLens_readView_of_readAllocAt
+      (pointsTo_updateMemoryLocals_set_ne hm.ne_alloc hExcl₂.offset_zero hPts₂)
+  readView_left_of_writeBack_right b m hm := by
+    rcases hm.valid_left with ⟨⟨a₀, hPts₁⟩, hExcl₁⟩
+    rcases hm.valid_right with ⟨⟨b₀, hPts₂⟩, hExcl₂⟩
+    rw [treeMemoryPtrMutLens_readView_of_readAllocAt hPts₁]
+    rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp₂ codec₂ b hPts₂ hExcl₂]
+    exact treeMemoryPtrMutLens_readView_of_readAllocAt
+      (pointsTo_updateMemoryLocals_set_ne hm.ne_alloc.symm
+        hExcl₁.offset_zero hPts₁)
+  writeBack_comm a b m hm := by
+    rcases hm.valid_left with ⟨⟨a₀, hPts₁⟩, hExcl₁⟩
+    rcases hm.valid_right with ⟨⟨b₀, hPts₂⟩, hExcl₂⟩
+    have hPts₂' :
+        readAllocAt?
+          (memoryLocals ((treeMemoryPtrMutLens rp₁ codec₁).writeBack a m)) rp₂ =
+          some (codec₂.encode b₀) := by
+      rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp₁ codec₁ a hPts₁ hExcl₁]
+      exact pointsTo_updateMemoryLocals_set_ne hm.ne_alloc
+        hExcl₂.offset_zero hPts₂
+    have hExcl₂' :
+        TreeExclusiveBorrow rp₂
+          ((treeMemoryPtrMutLens rp₁ codec₁).writeBack a m) := by
+      rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp₁ codec₁ a hPts₁ hExcl₁]
+      exact TreeExclusiveBorrow.of_borrows_eq hExcl₂
+        (updateMemoryLocals_borrows _ _)
+    have hPts₁' :
+        readAllocAt?
+          (memoryLocals ((treeMemoryPtrMutLens rp₂ codec₂).writeBack b m)) rp₁ =
+          some (codec₁.encode a₀) := by
+      rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp₂ codec₂ b hPts₂ hExcl₂]
+      exact pointsTo_updateMemoryLocals_set_ne hm.ne_alloc.symm
+        hExcl₁.offset_zero hPts₁
+    have hExcl₁' :
+        TreeExclusiveBorrow rp₁
+          ((treeMemoryPtrMutLens rp₂ codec₂).writeBack b m) := by
+      rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp₂ codec₂ b hPts₂ hExcl₂]
+      exact TreeExclusiveBorrow.of_borrows_eq hExcl₁
+        (updateMemoryLocals_borrows _ _)
+    rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp₂ codec₂ b hPts₂' hExcl₂']
+    rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp₁ codec₁ a hPts₁' hExcl₁']
+    rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp₁ codec₁ a hPts₁ hExcl₁]
+    rw [treeMemoryPtrMutLens_writeBack_eq_of_tree rp₂ codec₂ b hPts₂ hExcl₂]
+    rw [memoryLocals_updateMemoryLocals, memoryLocals_updateMemoryLocals]
+    rw [updateMemoryLocals_updateMemoryLocals,
+      updateMemoryLocals_updateMemoryLocals]
+    rw [list_set_comm (memoryLocals m) hm.ne_alloc]
+
+/--
+`I-10`-aware binary separation-to-lens bridge under `TreeExclusiveBorrow`.
+-/
+theorem sepConj_entails_independentTreeLenses {α β : Type}
+    {rp₁ rp₂ : RawPtrVal} {codec₁ : ValueCodec α} {codec₂ : ValueCodec β}
+    {a₁ : α} {a₂ : β} {R_frame : SepProp} {m : Memory}
+    (hSep :
+      SepProp.holdsIn (sepConj (ActiveTypedMutBorrow rp₁ codec₁ a₁)
+          (sepConj (ActiveTypedMutBorrow rp₂ codec₂ a₂) R_frame)) m)
+    (hExcl₁ : TreeExclusiveBorrow rp₁ m)
+    (hExcl₂ : TreeExclusiveBorrow rp₂ m) :
+    rp₁.allocId ≠ rp₂.allocId ∧
+    rp₁.tag ≠ rp₂.tag ∧
+    ValidTreeMutBorrowLensPair rp₁ rp₂ codec₁ codec₂ m ∧
+    IndependentLenses
+      (treeMemoryPtrMutLens rp₁ codec₁)
+      (treeMemoryPtrMutLens rp₂ codec₂)
+      (ValidTreeMutBorrowLensPair rp₁ rp₂ codec₁ codec₂) ∧
+    LawfulMutLens
+      (prodMutLens
+        (treeMemoryPtrMutLens rp₁ codec₁)
+        (treeMemoryPtrMutLens rp₂ codec₂))
+      (ValidTreeMutBorrowLensPair rp₁ rp₂ codec₁ codec₂) := by
+  have hDisj := sepConj_activeTypedMutBorrow_disjoint hSep
+  have hOffEq : rp₁.offset = rp₂.offset :=
+    hExcl₁.offset_zero.trans hExcl₂.offset_zero.symm
+  have hAllocNe : rp₁.allocId ≠ rp₂.allocId := (hDisj.2.2 hOffEq).1
+  have hTagNe : rp₁.tag ≠ rp₂.tag := hDisj.2.1
+  have hPts₁ : readAllocAt? (memoryLocals m) rp₁ = some (codec₁.encode a₁) :=
+    readAllocAt_of_activeTypedMutBorrow_holdsIn (holdsIn_of_sepConj_left hSep)
+  have hPts₂ : readAllocAt? (memoryLocals m) rp₂ = some (codec₂.encode a₂) :=
+    readAllocAt_of_activeTypedMutBorrow_holdsIn
+      (holdsIn_of_sepConj_left (holdsIn_of_sepConj_right hSep))
+  have hValidPair : ValidTreeMutBorrowLensPair rp₁ rp₂ codec₁ codec₂ m :=
+    ⟨⟨⟨a₁, hPts₁⟩, hExcl₁⟩, ⟨⟨a₂, hPts₂⟩, hExcl₂⟩, hAllocNe⟩
+  have hInd := treeMemoryPtrMutLens_independent_of_ne_alloc rp₁ rp₂ codec₁ codec₂
+  have hLaw₁ :
+      LawfulMutLens
+        (treeMemoryPtrMutLens rp₁ codec₁)
+        (ValidTreeMutBorrowLensPair rp₁ rp₂ codec₁ codec₂) := {
+    valid_writeBack := hInd.valid_writeBack_left
+    readView_writeBack := fun a c hc =>
+      (treeMemoryPtrMutLens_lawful rp₁ codec₁).readView_writeBack a c
+        hc.valid_left
+    writeBack_readView := fun c hc =>
+      (treeMemoryPtrMutLens_lawful rp₁ codec₁).writeBack_readView c
+        hc.valid_left
+    writeBack_writeBack := fun a₁' a₂' c hc =>
+      (treeMemoryPtrMutLens_lawful rp₁ codec₁).writeBack_writeBack a₁' a₂' c
+        hc.valid_left
+  }
+  have hLaw₂ :
+      LawfulMutLens
+        (treeMemoryPtrMutLens rp₂ codec₂)
+        (ValidTreeMutBorrowLensPair rp₁ rp₂ codec₁ codec₂) := {
+    valid_writeBack := hInd.valid_writeBack_right
+    readView_writeBack := fun b c hc =>
+      (treeMemoryPtrMutLens_lawful rp₂ codec₂).readView_writeBack b c
+        hc.valid_right
+    writeBack_readView := fun c hc =>
+      (treeMemoryPtrMutLens_lawful rp₂ codec₂).writeBack_readView c
+        hc.valid_right
+    writeBack_writeBack := fun b₁' b₂' c hc =>
+      (treeMemoryPtrMutLens_lawful rp₂ codec₂).writeBack_writeBack b₁' b₂' c
+        hc.valid_right
+  }
+  refine ⟨hAllocNe, hTagNe, hValidPair, hInd,
+    prodMutLens_lawful hLaw₁ hLaw₂ hInd⟩
+
+/--
+Validity domain shared by an `I-10`-aware family of binding lenses under
+`TreeExclusiveBorrow`.
+-/
+structure ValidTreeMutBorrowFamily
+    (bs : List MutBorrowBinding) (m : Memory) : Prop where
+  valid : ∀ b ∈ bs, ValidTreeMutBorrowLens b.rp b.codec m
+  pairwise_alloc : bs.Pairwise (fun b₁ b₂ => b₁.rp.allocId ≠ b₂.rp.allocId)
+
+theorem ValidTreeMutBorrowFamily.writeBack
+    {bs : List MutBorrowBinding} {m : Memory} {b : MutBorrowBinding}
+    (hb : b ∈ bs) (hValid : ValidTreeMutBorrowFamily bs m) (a : b.α) :
+    ValidTreeMutBorrowFamily bs
+      ((treeMemoryPtrMutLens b.rp b.codec).writeBack a m) := by
+  refine ⟨fun b' hb' => ?_, hValid.pairwise_alloc⟩
+  by_cases hEq : b'.rp.allocId = b.rp.allocId
+  · have hSame : b' = b :=
+      eq_of_pairwise_ne_of_mem hValid.pairwise_alloc hb' hb hEq
+    subst hSame
+    exact (treeMemoryPtrMutLens_lawful b'.rp b'.codec).valid_writeBack a m
+      (hValid.valid b' hb')
+  · rcases hValid.valid b hb with ⟨⟨a₀, hPts⟩, hExcl⟩
+    rcases hValid.valid b' hb' with ⟨⟨a₀', hPts'⟩, hExcl'⟩
+    rw [treeMemoryPtrMutLens_writeBack_eq_of_tree b.rp b.codec a hPts hExcl]
+    exact ⟨⟨a₀', pointsTo_updateMemoryLocals_set_ne (Ne.symm hEq)
+        hExcl'.offset_zero hPts'⟩,
+      TreeExclusiveBorrow.of_borrows_eq hExcl'
+        (updateMemoryLocals_borrows _ _)⟩
+
+theorem treeMemoryPtrMutLens_lawful_family
+    {bs : List MutBorrowBinding} {b : MutBorrowBinding} (hb : b ∈ bs) :
+    LawfulMutLens (treeMemoryPtrMutLens b.rp b.codec)
+      (ValidTreeMutBorrowFamily bs) where
+  valid_writeBack a _ hm := hm.writeBack hb a
+  readView_writeBack a m hm :=
+    (treeMemoryPtrMutLens_lawful b.rp b.codec).readView_writeBack a m
+      (hm.valid b hb)
+  writeBack_readView m hm :=
+    (treeMemoryPtrMutLens_lawful b.rp b.codec).writeBack_readView m
+      (hm.valid b hb)
+  writeBack_writeBack a₁ a₂ m hm :=
+    (treeMemoryPtrMutLens_lawful b.rp b.codec).writeBack_writeBack a₁ a₂ m
+      (hm.valid b hb)
+
+theorem treeMemoryPtrMutLens_independent_family
+    {bs : List MutBorrowBinding} {b₁ b₂ : MutBorrowBinding}
+    (hb₁ : b₁ ∈ bs) (hb₂ : b₂ ∈ bs) (hNe : b₁.rp.allocId ≠ b₂.rp.allocId) :
+    IndependentLenses
+      (treeMemoryPtrMutLens b₁.rp b₁.codec)
+      (treeMemoryPtrMutLens b₂.rp b₂.codec)
+      (ValidTreeMutBorrowFamily bs) := by
+  have hPair :=
+    treeMemoryPtrMutLens_independent_of_ne_alloc b₁.rp b₂.rp b₁.codec b₂.codec
+  have toPair :
+      ∀ m, ValidTreeMutBorrowFamily bs m →
+        ValidTreeMutBorrowLensPair b₁.rp b₂.rp b₁.codec b₂.codec m :=
+    fun m hm => ⟨hm.valid b₁ hb₁, hm.valid b₂ hb₂, hNe⟩
+  exact {
+    valid_writeBack_left := fun a m hm => hm.writeBack hb₁ a
+    valid_writeBack_right := fun a m hm => hm.writeBack hb₂ a
+    readView_right_of_writeBack_left := fun a m hm =>
+      hPair.readView_right_of_writeBack_left a m (toPair m hm)
+    readView_left_of_writeBack_right := fun a m hm =>
+      hPair.readView_left_of_writeBack_right a m (toPair m hm)
+    writeBack_comm := fun a a' m hm => hPair.writeBack_comm a a' m (toPair m hm)
+  }
+
+/--
+`k`-ary `I-10`-aware separation-to-lens bridge: a `k`-ary separating conjunction
+of typed mutable borrows satisfying `TreeExclusiveBorrow` (not requiring the
+strict ancestor-free `ExclusiveActiveBorrow`) yields a valid lens family in
+which every member `treeMemoryPtrMutLens` is lawful and every pair of distinct
+indices is independent.
+-/
+theorem sepConjBindings_entails_independentTreeLensFamily
+    {bs : List MutBorrowBinding} {R : SepProp} {m : Memory}
+    (hSep : SepProp.holdsIn (sepConjBindings bs R) m)
+    (hExcl : ∀ b ∈ bs, TreeExclusiveBorrow b.rp m) :
+    ValidTreeMutBorrowFamily bs m ∧
+    (∀ (i : Nat) (hi : i < bs.length),
+      LawfulMutLens
+        (treeMemoryPtrMutLens bs[i].rp bs[i].codec)
+        (ValidTreeMutBorrowFamily bs)) ∧
+    (∀ (i j : Nat) (hi : i < bs.length) (hj : j < bs.length), i ≠ j →
+      IndependentLenses
+        (treeMemoryPtrMutLens bs[i].rp bs[i].codec)
+        (treeMemoryPtrMutLens bs[j].rp bs[j].codec)
+        (ValidTreeMutBorrowFamily bs)) := by
+  rcases hSep with ⟨fp, hSep⟩
+  rcases sepConjBindings_split hSep with ⟨hBind, hPair, _, _⟩
+  have hPairAlloc :
+      bs.Pairwise (fun b₁ b₂ => b₁.rp.allocId ≠ b₂.rp.allocId) := by
+    refine List.Pairwise.imp_of_mem ?_ hPair
+    intro b₁ b₂ hb₁ hb₂ hNe hAlloc
+    apply hNe.1
+    show (b₁.rp.allocId, b₁.rp.offset) = (b₂.rp.allocId, b₂.rp.offset)
+    rw [hAlloc, (hExcl b₁ hb₁).offset_zero, (hExcl b₂ hb₂).offset_zero]
+  have hValid : ValidTreeMutBorrowFamily bs m :=
+    ⟨fun b hb => ⟨⟨b.val, (hBind b hb).1⟩, hExcl b hb⟩, hPairAlloc⟩
+  refine ⟨hValid, fun i hi => treeMemoryPtrMutLens_lawful_family
+    (List.getElem_mem hi), fun i j hi hj hNe => ?_⟩
+  refine treeMemoryPtrMutLens_independent_family
+    (List.getElem_mem hi) (List.getElem_mem hj) ?_
+  rcases Nat.lt_or_gt_of_ne hNe with hLt | hGt
+  · exact List.pairwise_iff_getElem.mp hPairAlloc i j hi hj hLt
+  · exact Ne.symm (List.pairwise_iff_getElem.mp hPairAlloc j i hj hi hGt)
+
+/--
+Homogeneous `List` form of the `I-10`-aware family bridge under
+`TreeExclusiveBorrow`.
+-/
+theorem sepConjBindings_entails_pairwiseIndependentTreeLenses
+    {α : Type} {codec : ValueCodec α} {ptrs : List (RawPtrVal × α)}
+    {R : SepProp} {m : Memory}
+    (hSep :
+      SepProp.holdsIn
+        (sepConjBindings (ptrs.map fun p => MutBorrowBinding.bind p.1 codec p.2) R)
+        m)
+    (hExcl : ∀ p ∈ ptrs, TreeExclusiveBorrow p.1 m) :
+    ValidTreeMutBorrowFamily
+        (ptrs.map fun p => MutBorrowBinding.bind p.1 codec p.2) m ∧
+    PairwiseIndependentLenses
+      (ValidTreeMutBorrowFamily
+        (ptrs.map fun p => MutBorrowBinding.bind p.1 codec p.2))
+      (ptrs.map fun p => treeMemoryPtrMutLens p.1 codec) := by
+  let bs := ptrs.map fun p => MutBorrowBinding.bind p.1 codec p.2
+  have hExcl' : ∀ b ∈ bs, TreeExclusiveBorrow b.rp m := by
+    intro b hb
+    rcases List.mem_map.mp hb with ⟨p, hp, rfl⟩
+    exact hExcl p hp
+  rcases sepConjBindings_entails_independentTreeLensFamily hSep hExcl' with
+    ⟨hValid, _, _⟩
+  refine ⟨hValid, ?_⟩
+  have hPairPtr :
+      ptrs.Pairwise (fun p₁ p₂ => p₁.1.allocId ≠ p₂.1.allocId) := by
+    have h := hValid.pairwise_alloc
+    rw [List.pairwise_map] at h
+    exact h
+  have hSuffix :
+      ∀ sfx : List (RawPtrVal × α),
+        (∀ p ∈ sfx, p ∈ ptrs) →
+        sfx.Pairwise (fun p₁ p₂ => p₁.1.allocId ≠ p₂.1.allocId) →
+        PairwiseIndependentLenses (ValidTreeMutBorrowFamily bs)
+          (sfx.map fun p => treeMemoryPtrMutLens p.1 codec) := by
+    intro sfx
+    induction sfx with
+    | nil => intro _ _; exact .nil
+    | cons p rest ih =>
+      intro hSub hPairSfx
+      rcases List.pairwise_cons.mp hPairSfx with ⟨hHead, hTail⟩
+      have hp : MutBorrowBinding.bind p.1 codec p.2 ∈ bs :=
+        List.mem_map.mpr ⟨p, hSub p (List.Mem.head rest), rfl⟩
+      refine .cons (treeMemoryPtrMutLens_lawful_family hp) ?_
+        (ih (fun q hq => hSub q (List.Mem.tail p hq)) hTail)
+      intro L hL
+      rcases List.mem_map.mp hL with ⟨q, hq, rfl⟩
+      have hq' : MutBorrowBinding.bind q.1 codec q.2 ∈ bs :=
+        List.mem_map.mpr ⟨q, hSub q (List.Mem.tail p hq), rfl⟩
+      exact treeMemoryPtrMutLens_independent_family hp hq' (hHead q hq)
+  exact hSuffix ptrs (fun _ h => h) hPairPtr
+
 /-! ### `SupportedBy` Heap-Predicate Frames via `AgreeOnFootprint` -/
 
 /--
@@ -3937,6 +4702,28 @@ theorem add_assign_retag_mirWpConverges
   exact ⟨rfl, sepConj_activeTypedMutBorrow_preserved_one hSep hInv hWf hPres h_R
     (scalarNat_not_aggregate 4)⟩
 
+theorem add_assign_retag_verified
+    (x_ptr : RawPtrVal) (x_old d_val : Nat) (R_frame : SepProp)
+    (h_R : LocalSepProp R_frame) :
+    StatefulVerificationResult {
+      body := add_assign_retag,
+      pre := addAssignPre x_ptr x_old d_val R_frame,
+      post := addAssignPost x_ptr x_old d_val R_frame
+    } :=
+  verifyStatefulMirNoPanic_of_wpConverges _ (fun args m₀ hPre =>
+    add_assign_retag_mirWpConverges x_ptr x_old d_val R_frame h_R args m₀ hPre)
+
+theorem add_assign_retag_total
+    (x_ptr : RawPtrVal) (x_old d_val : Nat) (R_frame : SepProp)
+    (h_R : LocalSepProp R_frame) :
+    TotalVerificationResult {
+      body := add_assign_retag,
+      pre := addAssignPre x_ptr x_old d_val R_frame,
+      post := addAssignPost x_ptr x_old d_val R_frame
+    } :=
+  verifyTotalMir_of_wpConverges _ (fun args m₀ hPre =>
+    add_assign_retag_mirWpConverges x_ptr x_old d_val R_frame h_R args m₀ hPre)
+
 
 /-! ### `swap_u32(a: &mut u32, b: &mut u32)` -/
 
@@ -4355,6 +5142,240 @@ theorem add_assign_checked_total
     add_assign_checked_mirWpConverges x_ptr x_old d_val R_frame h_R args m₀ hPre)
 
 
+/-! ### Multi-Block Conditional Branching: `max_assign_u32(x: &mut u32, y: u32)` -/
+
+/--
+`Runtime(PostCleanup)` MIR of `max_assign_u32(x: &mut u32, y: u32) { if *x < y { *x = y; } }`:
+three basic blocks joined by `TerminatorKind.switchInt` and `TerminatorKind.goto`.
+- `bb0` (index `0`): `StorageLive(_3); _3 = Lt(copy (*_1), copy _2); switchInt(move _3) -> [0: bb2, otherwise: bb1]`
+- `bb1` (index `1`): `(*_1) = copy _2; goto -> bb2`
+- `bb2` (index `2`): `StorageDead(_3); _0 = const (); return`
+-/
+def max_assign_u32 : CapturedMir where
+  defPath := "demo::max_assign_u32"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [
+    { mutability := .mut, ty := { kind := .tuple [], layoutIdx := 0 },
+      debugName := some "_0" },
+    { mutability := .not, ty := { kind := .ref .mut (.uint .u32), layoutIdx := 2 },
+      debugName := some "x" },
+    { mutability := .not, ty := { kind := .uint .u32, layoutIdx := 1 },
+      debugName := some "y" },
+    { mutability := .mut, ty := { kind := .bool, layoutIdx := 3 },
+      debugName := some "_3" }
+  ]
+  basicBlocks := [
+    { statements := [
+        { kind := .storageLive 3, span := "max_assign_u32" },
+        { kind := .assign { local_ := 3, projection := [] }
+            (.binaryOp .lt
+              (.copy { local_ := 1, projection := [.deref] })
+              (.copy { local_ := 2, projection := [] })),
+          span := "max_assign_u32" }
+      ],
+      terminator := {
+        kind := .switchInt
+          (.move { local_ := 3, projection := [] })
+          { branches := [(0, 2)], otherwise := 1 }
+        span := "max_assign_u32"
+      },
+      isCleanup := false
+    },
+    { statements := [
+        { kind := .assign { local_ := 1, projection := [.deref] }
+            (.use (.copy { local_ := 2, projection := [] })),
+          span := "max_assign_u32" }
+      ],
+      terminator := { kind := .goto 2, span := "max_assign_u32" },
+      isCleanup := false
+    },
+    { statements := [
+        { kind := .storageDead 3, span := "max_assign_u32" },
+        { kind := .assign { local_ := 0, projection := [] }
+            (.use (.constant
+              { ty := { kind := .tuple [], layoutIdx := 0 }, val := .zeroSized })),
+          span := "max_assign_u32" }
+      ],
+      terminator := { kind := .return_, span := "max_assign_u32" },
+      isCleanup := false
+    }
+  ]
+  fnAbi := {
+    args := [
+      { layout := u32MutPtrLayout, mode := .direct },
+      { layout := u32Layout, mode := .direct }
+    ]
+    ret := { layout := unitLayout, mode := .direct }
+    conv := .rust
+    canUnwind := false
+  }
+  layouts := {
+    pointerBits := 64
+    isLittleEndian := true
+    entries := [unitLayout, u32Layout, u32MutPtrLayout, boolLayout]
+  }
+  allocations := []
+
+/-- Precondition of `max_assign_u32`: `x` owns an active `&mut u32` holding `x_old`. -/
+def maxAssignU32Pre (x_ptr : RawPtrVal) (x_old y_val : Nat) (R_frame : SepProp) :
+    List Value → Memory → Prop :=
+  fun args m₀ =>
+    args = [.ptr x_ptr.toMirPtr 8, .scalar ⟨y_val, 4⟩] ∧
+    WfSingleMutBorrow 4 x_ptr m₀ ∧
+    SepProp.holdsIn
+      (sepConj (ActiveTypedMutBorrow x_ptr (ValueCodec.scalarNat 4) x_old) R_frame)
+      m₀
+
+/--
+Postcondition of `max_assign_u32`: unit result, and `x_ptr` holds
+`if x_old < y_val then y_val else x_old`, with `R_frame` preserved.
+-/
+def maxAssignU32Post (x_ptr : RawPtrVal) (x_old y_val : Nat) (R_frame : SepProp) :
+    List Value → Memory → Value → Memory → Prop :=
+  fun _ _ retVal m_final =>
+    retVal = .unit ∧
+    SepProp.holdsIn
+      (sepConj
+        (ActiveTypedMutBorrow x_ptr (ValueCodec.scalarNat 4)
+          (if x_old < y_val then y_val else x_old))
+        R_frame)
+      m_final
+
+/--
+Pure lens-state derivation of the three-block `max_assign_u32` body across both
+`switchInt` outcomes (`*x < y` takes `bb0 -> bb1 -> bb2`; `y ≤ *x` takes
+`bb0 -> bb2`).
+-/
+theorem max_assign_u32_lift (x_ptr : RawPtrVal) (x_old y_val : Nat) :
+    LiftLensBlock max_assign_u32 0
+      (initMachineState max_assign_u32
+        [.ptr x_ptr.toMirPtr 8, .scalar ⟨y_val, 4⟩]).frame.locals
+      [(x_ptr, (ValueCodec.scalarNat 4).encode x_old)]
+      .unit
+      [(x_ptr, (ValueCodec.scalarNat 4).encode
+        (if x_old < y_val then y_val else x_old))] := by
+  unfold initMachineState
+  dsimp [max_assign_u32, initLocalsAux]
+  by_cases hLt : x_old < y_val
+  · have hBle : Nat.ble y_val x_old = false := by
+      cases hB : Nat.ble y_val x_old with
+      | false => rfl
+      | true => exact absurd (Nat.le_of_ble_eq_true hB) (Nat.not_le.mpr hLt)
+    simp only [hLt, ↓reduceIte]
+    apply LiftLensBlock.switchInt (target := 1)
+      (entries₁ := [(x_ptr, (ValueCodec.scalarNat 4).encode x_old)])
+      (env₁ := [.uninit, .init (.ptr x_ptr.toMirPtr 8), .init (.scalar ⟨y_val, 4⟩),
+        .init (.scalar (boolToScalar (Bool.not (Nat.ble y_val x_old))))])
+      (env₂ := [.uninit, .init (.ptr x_ptr.toMirPtr 8), .init (.scalar ⟨y_val, 4⟩),
+        .uninit])
+      (sc := boolToScalar (Bool.not (Nat.ble y_val x_old)))
+    · rfl
+    · rfl
+    · rfl
+    · refine .cons (.storageLive (.mk (oldSlot := .dead)
+        (env' := [.uninit, .init (.ptr x_ptr.toMirPtr 8),
+          .init (.scalar ⟨y_val, 4⟩), .uninit]) rfl rfl)) ?_
+      refine .cons (.pureAssign (.mk (oldSlot := .uninit)
+        (.binaryOp (.deref (.copy_deref rfl (lookupLensVal?_singleton_self _ _)))
+          (.pure (.copy_local rfl)) (fun _ => rfl))
+        rfl (fun h => nomatch h) rfl)) ?_
+      exact .nil
+    · exact .pure (.move_local rfl rfl)
+    · rw [hBle]
+      rfl
+    · apply LiftLensBlock.goto (target := 2)
+        (entries₁ := [(x_ptr, (ValueCodec.scalarNat 4).encode y_val)])
+        (env₁ := [.uninit, .init (.ptr x_ptr.toMirPtr 8),
+          .init (.scalar ⟨y_val, 4⟩), .uninit])
+      · rfl
+      · rfl
+      · rfl
+      · refine .cons (.derefWrite (.mk (.use_pure (.copy_local rfl)) rfl
+          (lookupLensVal?_singleton_self _ _))) ?_
+        rw [updateLensVal_singleton_self]
+        exact .nil
+      · refine LiftLensBlock.return_
+          (env' := [.init .unit, .init (.ptr x_ptr.toMirPtr 8),
+            .init (.scalar ⟨y_val, 4⟩), .dead]) rfl rfl rfl ?_ rfl
+        refine .cons (.storageDead (.mk rfl rfl)) ?_
+        refine .cons (.pureAssign (.mk (oldSlot := .uninit)
+          (.use_pure .const_zeroSized) rfl (fun h => nomatch h) rfl)) ?_
+        exact .nil
+  · have hLe : y_val ≤ x_old := Nat.le_of_not_lt hLt
+    have hBle : Nat.ble y_val x_old = true := Nat.ble_eq_true_of_le hLe
+    simp only [hLt, ↓reduceIte]
+    apply LiftLensBlock.switchInt (target := 2)
+      (entries₁ := [(x_ptr, (ValueCodec.scalarNat 4).encode x_old)])
+      (env₁ := [.uninit, .init (.ptr x_ptr.toMirPtr 8), .init (.scalar ⟨y_val, 4⟩),
+        .init (.scalar (boolToScalar (Bool.not (Nat.ble y_val x_old))))])
+      (env₂ := [.uninit, .init (.ptr x_ptr.toMirPtr 8), .init (.scalar ⟨y_val, 4⟩),
+        .uninit])
+      (sc := boolToScalar (Bool.not (Nat.ble y_val x_old)))
+    · rfl
+    · rfl
+    · rfl
+    · refine .cons (.storageLive (.mk (oldSlot := .dead)
+        (env' := [.uninit, .init (.ptr x_ptr.toMirPtr 8),
+          .init (.scalar ⟨y_val, 4⟩), .uninit]) rfl rfl)) ?_
+      refine .cons (.pureAssign (.mk (oldSlot := .uninit)
+        (.binaryOp (.deref (.copy_deref rfl (lookupLensVal?_singleton_self _ _)))
+          (.pure (.copy_local rfl)) (fun _ => rfl))
+        rfl (fun h => nomatch h) rfl)) ?_
+      exact .nil
+    · exact .pure (.move_local rfl rfl)
+    · rw [hBle]
+      rfl
+    · refine LiftLensBlock.return_
+        (env' := [.init .unit, .init (.ptr x_ptr.toMirPtr 8),
+          .init (.scalar ⟨y_val, 4⟩), .dead]) rfl rfl rfl ?_ rfl
+      refine .cons (.storageDead (.mk rfl rfl)) ?_
+      refine .cons (.pureAssign (.mk (oldSlot := .uninit)
+        (.use_pure .const_zeroSized) rfl (fun h => nomatch h) rfl)) ?_
+      exact .nil
+
+/--
+Fuel-free convergence of `max_assign_u32` across all three basic blocks and both
+`switchInt` outcomes, proved through `mirWpConverges_of_sepLenses` with zero
+`Memory` destructuring.
+-/
+theorem max_assign_u32_mirWpConverges
+    (x_ptr : RawPtrVal) (x_old y_val : Nat) (R_frame : SepProp)
+    (h_R : LocalSepProp R_frame) (args : List Value) (m₀ : Memory)
+    (hPre : maxAssignU32Pre x_ptr x_old y_val R_frame args m₀) :
+    MirWpConverges max_assign_u32
+      (initMachineStateWithMemory max_assign_u32 args m₀)
+      (mirNormalPost (maxAssignU32Post x_ptr x_old y_val R_frame args m₀)) := by
+  rcases hPre with ⟨rfl, hWf, hSep⟩
+  refine mirWpConverges_of_sepLenses (max_assign_u32_lift x_ptr x_old y_val)
+    (sepLensStateInv_of_sepConj_one hSep hWf) (fun m_final hInv hPres => ?_)
+  exact ⟨rfl, sepConj_activeTypedMutBorrow_preserved_one hSep hInv hWf hPres h_R
+    (scalarNat_not_aggregate 4)⟩
+
+theorem max_assign_u32_verified
+    (x_ptr : RawPtrVal) (x_old y_val : Nat) (R_frame : SepProp)
+    (h_R : LocalSepProp R_frame) :
+    StatefulVerificationResult {
+      body := max_assign_u32,
+      pre := maxAssignU32Pre x_ptr x_old y_val R_frame,
+      post := maxAssignU32Post x_ptr x_old y_val R_frame
+    } :=
+  verifyStatefulMirNoPanic_of_wpConverges _ (fun args m₀ hPre =>
+    max_assign_u32_mirWpConverges x_ptr x_old y_val R_frame h_R args m₀ hPre)
+
+theorem max_assign_u32_total
+    (x_ptr : RawPtrVal) (x_old y_val : Nat) (R_frame : SepProp)
+    (h_R : LocalSepProp R_frame) :
+    TotalVerificationResult {
+      body := max_assign_u32,
+      pre := maxAssignU32Pre x_ptr x_old y_val R_frame,
+      post := maxAssignU32Post x_ptr x_old y_val R_frame
+    } :=
+  verifyTotalMir_of_wpConverges _ (fun args m₀ hPre =>
+    max_assign_u32_mirWpConverges x_ptr x_old y_val R_frame h_R args m₀ hPre)
+
+
 /-! ### Non-Vacuity: Concrete `I-10` Reborrow Chains -/
 
 /-- Child tag `2` of `x` (the callee's reborrow `&mut *r`). -/
@@ -4392,6 +5413,35 @@ theorem addAssignDemoMem_not_strictExclusive (x_old : Nat) :
   rcases h.exclusive_on_alloc _ hParent rfl with ⟨hTag, _⟩ | hDis
   · exact absurd hTag (by decide)
   · exact nomatch hDis
+
+/--
+Even though `addAssignDemoMem x_old` fails the strict `ExclusiveActiveBorrow`
+invariant (`addAssignDemoMem_not_strictExclusive`), it satisfies
+`ValidTreeMutBorrowLens` for the `I-10`-aware lens `treeMemoryPtrMutLens`,
+making `treeMemoryPtrMutLens demoChildPtr (ValueCodec.scalarNat 4)` a lawful
+PutGet / GetPut / PutPut lens on the concrete parent/child reborrow chain.
+-/
+theorem validTreeMutBorrowLens_addAssignDemoMem (x_old : Nat) :
+    ValidTreeMutBorrowLens demoChildPtr (ValueCodec.scalarNat 4)
+      (addAssignDemoMem x_old) where
+  has_typed_pointee := ⟨x_old, rfl⟩
+  exclusive := by
+    refine ⟨rfl, ⟨_, rfl, rfl, rfl, rfl, rfl, rfl⟩, ?_⟩
+    intro b hb _
+    simp only [addAssignDemoMem, List.mem_cons, List.not_mem_nil, or_false] at hb
+    rcases hb with rfl | rfl <;> exact Or.inl ⟨rfl, rfl⟩
+
+/--
+Concrete PutGet on `addAssignDemoMem x_old`: writing `x_new` through
+`treeMemoryPtrMutLens` on the child reborrow and reading back recovers `x_new`,
+even though the active parent tag remains in the borrow table.
+-/
+theorem treeMemoryPtrMutLens_putGet_addAssignDemoMem (x_old x_new : Nat) :
+    (treeMemoryPtrMutLens demoChildPtr (ValueCodec.scalarNat 4)).readView
+      ((treeMemoryPtrMutLens demoChildPtr (ValueCodec.scalarNat 4)).writeBack
+        x_new (addAssignDemoMem x_old)) = x_new :=
+  (treeMemoryPtrMutLens_lawful demoChildPtr (ValueCodec.scalarNat 4)).readView_writeBack
+    x_new (addAssignDemoMem x_old) (validTreeMutBorrowLens_addAssignDemoMem x_old)
 
 theorem add_assign_demo_pre (x_old d_val : Nat) :
     addAssignPre demoChildPtr x_old d_val (BorrowToken demoParentPtr .active)
