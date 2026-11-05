@@ -29,3 +29,6 @@ anneal-lean-run --mode file --concurrency 2 -- lake env lean ../theory/Anneal/Mi
 ```
 
 If it succeeds with no output (and specifically no warnings about `sorry` or `sorryAx`), the proof is kernel-checked and complete!
+
+## 4. Audit Compliance
+- `[diversity-reduced]`: This unit was evaluated under reduced model diversity (pinned to `gemini-pro-coordinator` / `gemini-3.1-pro-high`) due to quota constraints.
