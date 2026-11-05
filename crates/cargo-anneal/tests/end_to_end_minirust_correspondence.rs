@@ -526,6 +526,22 @@ fn gate3_cross_check_real_miri_diff_manifest() {
             "unexpected stale Miri cross-ref error for {passing_test}: {xref_err}"
         );
     }
+
+    // Cross-referencing an open known_anneal_bug from a "closed" gap must fail!
+    let closed_xref_toml = baseline_valid_gaps_toml().replace(
+        "status = \"open\"",
+        "status = \"closed\"",
+    ).replace(
+        "miri_diff_cross_ref = \"pass_tb_unsafe_cell_shared_mutation\"",
+        "miri_diff_cross_ref = \"pass_ptr_offset_within_array\"",
+    );
+    let closed_xref_reg = parse_correspondence_gaps(&closed_xref_toml).unwrap();
+    let closed_xref_err = cross_check_miri_diff(&miri_manifest, &closed_xref_reg)
+        .expect_err("cross-referencing an open Miri test from a closed gap must fail");
+    assert!(
+        closed_xref_err.contains("pass_ptr_offset_within_array") && closed_xref_err.contains("still carries a known_anneal_bug"),
+        "unexpected error for closed gap cross-ref: {closed_xref_err}"
+    );
 }
 
 /// End-to-End Offline `cargo anneal minirust-sync` Test (`verify-lock`,
