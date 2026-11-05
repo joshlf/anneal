@@ -1324,7 +1324,7 @@ def BM.signed_dereferenceable (mem : BM) (ptr : Ptr) (len : Int) : Interp Unit :
     BM.dereferenceable mem beginPtr ⟨(-len).toNat⟩
 
 /-- `BasicMemory::deallocate` (`spec/mem/basic.md`, with the trivial
-`handle_extra` and a fixed message string for the `AllocationKind` check):
+`handle_extra`):
 > "let Some((id, prov_extra)) = ptr.provenance else { throw_ub!(\"deallocating invalid pointer\") };
 >  let mut allocation = self.allocations[id.0];
 >  if !allocation.live { throw_ub!(\"double-free\"); }
@@ -1352,9 +1352,15 @@ def BM.deallocate (mem : BM) (ptr : Ptr) (kind : AllocationKind) (size : Size) (
     if !allocation.live then ub "double-free"
     else if ptr.addr ≠ allocation.addr then
       ub "deallocating with pointer not to the beginning of its allocation"
-    else if kind ≠ allocation.kind then ub "deallocating with the wrong deallocation operation"
-    else if size ≠ Allocation.size allocation then ub "deallocating with incorrect size information"
-    else if align ≠ allocation.align then ub "deallocating with incorrect alignment information"
+    else if kind ≠ allocation.kind then
+      let kindName : AllocationKind → String := fun
+        | .Stack => "Stack" | .Heap => "Heap" | .Global => "Global"
+        | .Function => "Function" | .VTable => "VTable"
+      ub s!"deallocating {kindName allocation.kind} memory with {kindName kind} deallocation operation"
+    else if size ≠ Allocation.size allocation then
+      ub "deallocating with incorrect size information"
+    else if align ≠ allocation.align then
+      ub "deallocating with incorrect alignment information"
     else do
       let allocations ← listSet mem.allocations id._0 { allocation with live := false } "set"
       pure { mem with allocations := allocations }

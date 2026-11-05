@@ -229,10 +229,12 @@ theorem iterMovedEntries_fixed {bbs : List BasicBlockData} {entries : List (List
   rw [← hfix]
   exact (stepMovedEntries_spec bbs entries dst hdst).2 src bb hbb htgt j hj
 
-/-- `iterMovedEntries` is monotone at every in-range block index `dst < bbs.length`. -/
+/-- `iterMovedEntries` is monotone at every in-range block index
+`dst < bbs.length`. -/
 theorem iterMovedEntries_mono (fuel : Nat) (bbs : List BasicBlockData)
     (entries : List (List Nat)) (dst : Nat) (hdst : dst < bbs.length) :
-    ∀ j ∈ entries.getD dst [], j ∈ (iterMovedEntries fuel bbs entries).getD dst [] := by
+    ∀ j ∈ entries.getD dst [],
+      j ∈ (iterMovedEntries fuel bbs entries).getD dst [] := by
   induction fuel generalizing entries with
   | zero => intro j hj; exact hj
   | succ n ih =>
@@ -240,12 +242,14 @@ theorem iterMovedEntries_mono (fuel : Nat) (bbs : List BasicBlockData)
     simp only [iterMovedEntries]
     split
     · exact hj
-    · exact ih (stepMovedEntries bbs entries) j ((stepMovedEntries_spec bbs entries dst hdst).1 j hj)
+    · exact ih (stepMovedEntries bbs entries) j
+        ((stepMovedEntries_spec bbs entries dst hdst).1 j hj)
 
-/-- Once `stepMovedEntries bbs entries = entries`, any further `iterMovedEntries`
-fuel leaves `entries` unchanged. -/
+/-- Once `stepMovedEntries bbs entries = entries`, any further
+`iterMovedEntries` fuel leaves `entries` unchanged. -/
 theorem iterMovedEntries_eq_of_fixed (fuel : Nat) {bbs : List BasicBlockData}
-    {entries : List (List Nat)} (hfix : stepMovedEntries bbs entries = entries) :
+    {entries : List (List Nat)}
+    (hfix : stepMovedEntries bbs entries = entries) :
     iterMovedEntries fuel bbs entries = entries := by
   cases fuel with
   | zero => rfl
@@ -286,11 +290,14 @@ theorem terminatorOk_targets_lt {decls : List LocalDecl} {nblocks : Nat}
 /-- When `iterMovedEntries` reaches a fixed point of `stepMovedEntries` at the
 canonical fuel bound `N * (L + 1)` on a CFG whose terminators satisfy
 `terminatorOk` and whose blocks satisfy `blockMovesOk`, `movesOk body = true`
-follows automatically because outgoing-edge closure holds at every fixed point. -/
+follows automatically because outgoing-edge closure holds at every fixed
+point. -/
 theorem movesOk_of_fixed {body : CapturedMir}
     (hfix : stepMovedEntries body.basicBlocks
-        (iterMovedEntries (body.basicBlocks.length * (body.localDecls.length + 1)) body.basicBlocks []) =
-      iterMovedEntries (body.basicBlocks.length * (body.localDecls.length + 1)) body.basicBlocks [])
+        (iterMovedEntries (body.basicBlocks.length * (body.localDecls.length + 1))
+          body.basicBlocks []) =
+      iterMovedEntries (body.basicBlocks.length * (body.localDecls.length + 1))
+        body.basicBlocks [])
     (hterm : ∀ bb ∈ body.basicBlocks,
       terminatorOk body.localDecls body.basicBlocks.length bb.terminator = true)
     (hblk : ∀ blk (bb : BasicBlockData), body.basicBlocks[blk]? = some bb →
@@ -306,6 +313,593 @@ theorem movesOk_of_fixed {body : CapturedMir}
   have hdst_lt : dst < body.basicBlocks.length :=
     terminatorOk_targets_lt (hterm bb hmem) dst hdst
   exact iterMovedEntries_fixed hfix hbb hdst_lt hdst j hj
+
+/-- Either `unionLocals acc xs = acc`, or some `j ∈ xs` was absent from `acc`
+and is present in `unionLocals acc xs`. -/
+theorem unionLocals_eq_or_mem_new (acc xs : List Nat) :
+    unionLocals acc xs = acc ∨ ∃ j ∈ xs, j ∉ acc ∧ j ∈ unionLocals acc xs := by
+  induction xs generalizing acc with
+  | nil => exact .inl rfl
+  | cons x xs ih =>
+    simp only [unionLocals, List.foldl_cons] at ih ⊢
+    by_cases hc : acc.contains x = true
+    · simp only [hc, ↓reduceIte]
+      rcases ih acc with heq | ⟨j, hjx, hnot, hin⟩
+      · exact .inl heq
+      · exact .inr ⟨j, List.mem_cons_of_mem x hjx, hnot, hin⟩
+    · simp only [Bool.not_eq_true] at hc
+      simp only [hc, Bool.false_eq_true, ↓reduceIte]
+      have hnot : x ∉ acc := fun hx => by
+        rw [List.contains_iff_mem.mpr hx] at hc; cases hc
+      have hin : x ∈ unionLocals (x :: acc) xs :=
+        (unionLocals_mem (x :: acc) xs x).mpr (.inl (List.mem_cons.mpr (.inl rfl)))
+      exact .inr ⟨x, List.mem_cons.mpr (.inl rfl), hnot, hin⟩
+
+/-- When `entries.length = bbs.length`, one pass of `stepMovedEntries` either
+reaches a fixed point or adds at least one new element `j` at some in-range
+block `dst < bbs.length`. -/
+theorem stepMovedEntries_eq_or_strict (bbs : List BasicBlockData)
+    (entries : List (List Nat)) (hlen : entries.length = bbs.length) :
+    stepMovedEntries bbs entries = entries ∨
+      ∃ dst < bbs.length, ∃ j,
+        j ∉ entries.getD dst [] ∧ j ∈ (stepMovedEntries bbs entries).getD dst [] := by
+  by_cases heq : stepMovedEntries bbs entries = entries
+  · exact .inl heq
+  · right
+    have hex : ∃ dst < bbs.length,
+        (stepMovedEntries bbs entries).getD dst [] ≠ entries.getD dst [] := by
+      by_cases hall : (List.range bbs.length).all
+          (fun dst => decide ((stepMovedEntries bbs entries).getD dst [] =
+            entries.getD dst [])) = true
+      · exfalso; apply heq
+        simp only [List.all_eq_true, List.mem_range, decide_eq_true_eq] at hall
+        apply List.ext_getElem (by simp [stepMovedEntries, hlen])
+        intro i h1 h2
+        have hi : i < bbs.length := by simpa [stepMovedEntries] using h1
+        have h := hall i hi
+        simpa [List.getD, List.getElem?_eq_getElem h1, List.getElem?_eq_getElem h2] using h
+      · simp only [Bool.not_eq_true, List.all_eq_false, List.mem_range,
+          Bool.not_eq_true, decide_eq_false_iff_not] at hall
+        obtain ⟨dst, hdst, hne⟩ := hall
+        exact ⟨dst, hdst, hne⟩
+    obtain ⟨dst, hdst, hne_dst⟩ := hex
+    let stepFn (acc : List Nat) (src : Nat) : List Nat :=
+      match bbs[src]? with
+      | some bb =>
+        if (termTargets bb.terminator).contains dst then
+          unionLocals acc
+            (termMoved (bb.statements.foldl stmtMoved (entries.getD src [])) bb.terminator)
+        else acc
+      | none => acc
+    have hmono : ∀ (srcs : List Nat) (acc : List Nat) (j : Nat),
+        j ∈ acc → j ∈ srcs.foldl stepFn acc := by
+      intro srcs
+      induction srcs with
+      | nil => intro acc j hj; exact hj
+      | cons s srcs ih =>
+        intro acc j hj
+        apply ih
+        simp only [stepFn]
+        cases bbs[s]? with
+        | none => exact hj
+        | some bb =>
+          simp only
+          split
+          · exact (unionLocals_mem _ _ _).mpr (.inl hj)
+          · exact hj
+    have hfold : ∀ (srcs : List Nat) (acc : List Nat),
+        srcs.foldl stepFn acc = acc ∨
+          ∃ j, j ∉ acc ∧ j ∈ srcs.foldl stepFn acc := by
+      intro srcs
+      induction srcs with
+      | nil => intro acc; exact .inl rfl
+      | cons s srcs ih =>
+        intro acc
+        simp only [List.foldl_cons]
+        have hone : stepFn acc s = acc ∨ ∃ j, j ∉ acc ∧ j ∈ stepFn acc s := by
+          simp only [stepFn]
+          cases bbs[s]? with
+          | none => exact .inl rfl
+          | some bb =>
+            simp only
+            split
+            · rcases unionLocals_eq_or_mem_new acc _ with h1 | ⟨j, _, hnot, hin⟩
+              · exact .inl h1
+              · exact .inr ⟨j, hnot, hin⟩
+            · exact .inl rfl
+        rcases hone with hsame | ⟨j, hnot, hin⟩
+        · rw [hsame]; exact ih acc
+        · exact .inr ⟨j, hnot, hmono srcs (stepFn acc s) j hin⟩
+    have hget : (stepMovedEntries bbs entries).getD dst [] =
+        (List.range bbs.length).foldl stepFn (entries.getD dst []) := by
+      simp only [stepMovedEntries, stepFn, List.getD, List.getElem?_map,
+        List.getElem?_range hdst, Option.map_some, Option.getD_some]
+      rfl
+    rcases hfold (List.range bbs.length) (entries.getD dst []) with hsame | ⟨j, hnot, hin⟩
+    · exact False.elim (hne_dst (hget.trans hsame))
+    · exact ⟨dst, hdst, j, hnot, hget ▸ hin⟩
+
+private def countMissing (m : List Nat) : List Nat → Nat
+  | [] => 0
+  | x :: xs => (if m.contains x then 0 else 1) + countMissing m xs
+
+private theorem countMissing_le (m u : List Nat) : countMissing m u ≤ u.length := by
+  induction u with
+  | nil => simp [countMissing]
+  | cons x xs ih =>
+    simp only [countMissing, List.length_cons]
+    cases m.contains x <;> simp <;> omega
+
+private theorem countMissing_mono {m m' : List Nat} (hsub : ∀ k ∈ m, k ∈ m')
+    (u : List Nat) : countMissing m' u ≤ countMissing m u := by
+  induction u with
+  | nil => simp [countMissing]
+  | cons x xs ih =>
+    simp only [countMissing]
+    by_cases hx : m.contains x = true
+    · have hx' : m'.contains x = true :=
+        List.contains_iff_mem.mpr (hsub x (List.contains_iff_mem.mp hx))
+      rw [hx, hx']; simp; omega
+    · simp only [Bool.not_eq_true] at hx
+      rw [hx]; cases m'.contains x <;> simp <;> omega
+
+private theorem countMissing_lt_of_new {m m' : List Nat} (hsub : ∀ k ∈ m, k ∈ m')
+    {j : Nat} (hnot : j ∉ m) (hin : j ∈ m') {u : List Nat} (hju : j ∈ u) :
+    countMissing m' u < countMissing m u := by
+  induction u with
+  | nil => simp at hju
+  | cons x xs ih =>
+    simp only [countMissing]
+    rcases List.mem_cons.mp hju with rfl | hrest
+    · have hc1 : m.contains j = false := by
+        cases hc : m.contains j with
+        | false => rfl
+        | true => exact False.elim (hnot (List.contains_iff_mem.mp hc))
+      have hc2 : m'.contains j = true := List.contains_iff_mem.mpr hin
+      have hle := countMissing_mono hsub xs
+      rw [hc1, hc2]; simp; omega
+    · have hlt := ih hrest
+      by_cases hx : m.contains x = true
+      · have hx' : m'.contains x = true :=
+          List.contains_iff_mem.mpr (hsub x (List.contains_iff_mem.mp hx))
+        rw [hx, hx']; simp; omega
+      · simp only [Bool.not_eq_true] at hx
+        rw [hx]; cases m'.contains x <;> simp <;> omega
+
+private def remCapAux (L : Nat) (entries : List (List Nat)) : List Nat → Nat
+  | [] => 0
+  | d :: ds => countMissing (entries.getD d []) (List.range L) + remCapAux L entries ds
+
+private theorem remCapAux_le (L : Nat) (entries : List (List Nat)) (ds : List Nat) :
+    remCapAux L entries ds ≤ ds.length * L := by
+  induction ds with
+  | nil => simp [remCapAux]
+  | cons d ds ih =>
+    simp only [remCapAux, List.length_cons, Nat.succ_mul]
+    have hc : countMissing (entries.getD d []) (List.range L) ≤ L := by
+      simpa using countMissing_le (entries.getD d []) (List.range L)
+    omega
+
+private theorem remCapAux_mono {L : Nat} {entries entries' : List (List Nat)}
+    {ds : List Nat}
+    (hmono : ∀ d ∈ ds, ∀ k ∈ entries.getD d [], k ∈ entries'.getD d []) :
+    remCapAux L entries' ds ≤ remCapAux L entries ds := by
+  induction ds with
+  | nil => simp [remCapAux]
+  | cons d ds ih =>
+    simp only [remCapAux]
+    have hd := countMissing_mono (hmono d (List.mem_cons.mpr (.inl rfl))) (List.range L)
+    have hds := ih (fun d' hd' => hmono d' (List.mem_cons_of_mem d hd'))
+    omega
+
+private theorem remCapAux_lt {L : Nat} {entries entries' : List (List Nat)}
+    {ds : List Nat}
+    (hmono : ∀ d ∈ ds, ∀ k ∈ entries.getD d [], k ∈ entries'.getD d [])
+    {dst : Nat} (hdst : dst ∈ ds) {j : Nat} (hjL : j < L)
+    (hnot : j ∉ entries.getD dst []) (hin : j ∈ entries'.getD dst []) :
+    remCapAux L entries' ds < remCapAux L entries ds := by
+  induction ds with
+  | nil => simp at hdst
+  | cons d ds ih =>
+    simp only [remCapAux]
+    rcases List.mem_cons.mp hdst with rfl | hrest
+    · have hd := countMissing_lt_of_new
+        (hmono dst (List.mem_cons.mpr (.inl rfl))) hnot hin (List.mem_range.mpr hjL)
+      have hds := remCapAux_mono (L := L)
+        (fun d' hd' => hmono d' (List.mem_cons_of_mem dst hd'))
+      omega
+    · have hd := countMissing_mono (hmono d (List.mem_cons.mpr (.inl rfl))) (List.range L)
+      have hds := ih (fun d' hd' => hmono d' (List.mem_cons_of_mem d hd')) hrest
+      omega
+
+private theorem stepMovedEntries_lt {L : Nat} {bbs : List BasicBlockData}
+    (hbbs : ∀ bb ∈ bbs,
+      (∀ s ∈ bb.statements, ∀ mo j, j ∈ stmtMoved mo s → j ∈ mo ∨ j < L) ∧
+      (∀ mo j, j ∈ termMoved mo bb.terminator → j ∈ mo ∨ j < L))
+    (entries : List (List Nat))
+    (hent : ∀ src < bbs.length, ∀ j ∈ entries.getD src [], j < L) :
+    ∀ dst < bbs.length, ∀ j ∈ (stepMovedEntries bbs entries).getD dst [], j < L := by
+  have hfold_ss : ∀ (ss : List MirAst.Statement)
+      (_ : ∀ s ∈ ss, ∀ mo j, j ∈ stmtMoved mo s → j ∈ mo ∨ j < L)
+      (mo : List Nat) (_ : ∀ j ∈ mo, j < L) (j : Nat),
+      j ∈ ss.foldl stmtMoved mo → j < L := by
+    intro ss
+    induction ss with
+    | nil => intro _ mo hmo j hj; exact hmo j hj
+    | cons s ss ih =>
+      intro hss mo hmo j hj
+      apply ih (fun s' hs' => hss s' (List.mem_cons_of_mem s hs')) (stmtMoved mo s) _ j hj
+      intro k hk
+      rcases hss s (List.mem_cons.mpr (.inl rfl)) mo k hk with h1 | h2
+      · exact hmo k h1
+      · exact h2
+  intro dst hdst
+  let stepFn (acc : List Nat) (src : Nat) : List Nat :=
+    match bbs[src]? with
+    | some bb =>
+      if (termTargets bb.terminator).contains dst then
+        unionLocals acc
+          (termMoved (bb.statements.foldl stmtMoved (entries.getD src [])) bb.terminator)
+      else acc
+    | none => acc
+  have hsrcs : ∀ (srcs : List Nat) (_ : ∀ s ∈ srcs, s < bbs.length)
+      (acc : List Nat) (_ : ∀ j ∈ acc, j < L) (j : Nat),
+      j ∈ srcs.foldl stepFn acc → j < L := by
+    intro srcs
+    induction srcs with
+    | nil => intro _ acc hacc j hj; exact hacc j hj
+    | cons s srcs ih =>
+      intro hlt acc hacc j hj
+      apply ih (fun s' hs' => hlt s' (List.mem_cons_of_mem s hs')) (stepFn acc s) _ j hj
+      intro k hk
+      simp only [stepFn] at hk
+      cases hbb : bbs[s]? with
+      | none => simp [hbb] at hk; exact hacc k hk
+      | some bb =>
+        simp only [hbb] at hk
+        split at hk
+        · rcases (unionLocals_mem _ _ _).mp hk with h1 | h2
+          · exact hacc k h1
+          · obtain ⟨hbb_ss, hbb_tm⟩ := hbbs bb (List.mem_of_getElem? hbb)
+            have hs_lt : s < bbs.length := hlt s (List.mem_cons.mpr (.inl rfl))
+            rcases hbb_tm _ k h2 with h3 | h4
+            · exact hfold_ss bb.statements hbb_ss (entries.getD s []) (hent s hs_lt) k h3
+            · exact h4
+        · exact hacc k hk
+  have hget : (stepMovedEntries bbs entries).getD dst [] =
+      (List.range bbs.length).foldl stepFn (entries.getD dst []) := by
+    simp only [stepMovedEntries, stepFn, List.getD, List.getElem?_map,
+      List.getElem?_range hdst, Option.map_some, Option.getD_some]
+    rfl
+  rw [hget]
+  exact hsrcs (List.range bbs.length) (fun _ hs => List.mem_range.mp hs)
+    (entries.getD dst []) (hent dst hdst)
+
+private theorem iterMovedEntries_stabilizes_from {L : Nat} {bbs : List BasicBlockData}
+    (hbbs : ∀ bb ∈ bbs,
+      (∀ s ∈ bb.statements, ∀ mo j, j ∈ stmtMoved mo s → j ∈ mo ∨ j < L) ∧
+      (∀ mo j, j ∈ termMoved mo bb.terminator → j ∈ mo ∨ j < L)) :
+    ∀ (fuel : Nat) (entries : List (List Nat)),
+      entries.length = bbs.length →
+      (∀ src < bbs.length, ∀ j ∈ entries.getD src [], j < L) →
+      remCapAux L entries (List.range bbs.length) ≤ fuel →
+      stepMovedEntries bbs (iterMovedEntries fuel bbs entries) =
+        iterMovedEntries fuel bbs entries := by
+  intro fuel
+  induction fuel with
+  | zero =>
+    intro entries hlen hent hcap
+    rcases stepMovedEntries_eq_or_strict bbs entries hlen with hfix | ⟨dst, hdst, j, hnot, hin⟩
+    · simpa [iterMovedEntries] using hfix
+    · have hent' := stepMovedEntries_lt hbbs entries hent
+      have hjL : j < L := hent' dst hdst j hin
+      have hlt := remCapAux_lt (L := L)
+        (fun d hd => (stepMovedEntries_spec bbs entries d (List.mem_range.mp hd)).1)
+        (List.mem_range.mpr hdst) hjL hnot hin
+      omega
+  | succ n ih =>
+    intro entries hlen hent hcap
+    simp only [iterMovedEntries]
+    by_cases hbeq : (stepMovedEntries bbs entries == entries) = true
+    · simp only [hbeq, ↓reduceIte]
+      exact beq_iff_eq.mp hbeq
+    · simp only [Bool.not_eq_true] at hbeq
+      simp only [hbeq, Bool.false_eq_true, ↓reduceIte]
+      have hne : stepMovedEntries bbs entries ≠ entries := fun h => by
+        rw [beq_iff_eq.mpr h] at hbeq; cases hbeq
+      rcases stepMovedEntries_eq_or_strict bbs entries hlen with hfix | ⟨dst, hdst, j, hnot, hin⟩
+      · exact False.elim (hne hfix)
+      · have hent' := stepMovedEntries_lt hbbs entries hent
+        have hjL : j < L := hent' dst hdst j hin
+        have hlt := remCapAux_lt (L := L)
+          (fun d hd => (stepMovedEntries_spec bbs entries d (List.mem_range.mp hd)).1)
+          (List.mem_range.mpr hdst) hjL hnot hin
+        exact ih (stepMovedEntries bbs entries) (by simp [stepMovedEntries]) hent' (by omega)
+
+/-- Unconditional finite-fuel convergence: when every moved-out local index of
+`bbs` lies below `L`, `iterMovedEntries (bbs.length * (L + 1)) bbs []` always
+reaches a fixed point of `stepMovedEntries bbs`. -/
+theorem iterMovedEntries_stabilizes {L : Nat} {bbs : List BasicBlockData}
+    (hbbs : ∀ bb ∈ bbs,
+      (∀ s ∈ bb.statements, ∀ mo j, j ∈ stmtMoved mo s → j ∈ mo ∨ j < L) ∧
+      (∀ mo j, j ∈ termMoved mo bb.terminator → j ∈ mo ∨ j < L)) :
+    stepMovedEntries bbs (iterMovedEntries (bbs.length * (L + 1)) bbs []) =
+      iterMovedEntries (bbs.length * (L + 1)) bbs [] := by
+  cases hN : bbs.length with
+  | zero =>
+    have hnil : bbs = [] := List.eq_nil_of_length_eq_zero hN
+    subst hnil
+    simp [Nat.zero_mul, iterMovedEntries, stepMovedEntries]
+  | succ k =>
+    have hfuel : (k + 1) * (L + 1) = ((k + 1) * L + k) + 1 := by
+      rw [Nat.mul_succ]
+      omega
+    rw [hfuel]
+    simp only [iterMovedEntries]
+    by_cases hbeq : (stepMovedEntries bbs [] == []) = true
+    · simp only [hbeq, ↓reduceIte]
+      exact beq_iff_eq.mp hbeq
+    · simp only [Bool.not_eq_true] at hbeq
+      simp only [hbeq, Bool.false_eq_true, ↓reduceIte]
+      have hent0 : ∀ src < bbs.length, ∀ j ∈ ([] : List (List Nat)).getD src [], j < L := by
+        intro src _ j hj; simp [List.getD] at hj
+      have hent1 := stepMovedEntries_lt hbbs [] hent0
+      have hcap : remCapAux L (stepMovedEntries bbs []) (List.range bbs.length) ≤
+          (k + 1) * L + k := by
+        have hle := remCapAux_le L (stepMovedEntries bbs []) (List.range (k + 1))
+        simp only [List.length_range] at hle
+        rw [hN]
+        omega
+      exact iterMovedEntries_stabilizes_from hbbs ((k + 1) * L + k)
+        (stepMovedEntries bbs []) (by simp [stepMovedEntries]) hent1 hcap
+
+private theorem opMoved_eq_move {op : Operand} {j : Nat} (h : opMoved op = some j) :
+    op = .move ⟨j, []⟩ := by
+  cases op with
+  | copy _ => simp [opMoved] at h
+  | constant _ => simp [opMoved] at h
+  | move p =>
+    rcases p with ⟨k, proj⟩
+    cases proj with
+    | nil => simp [opMoved] at h; subst h; rfl
+    | cons _ _ => simp [opMoved] at h
+
+private theorem opMoved_lt_of_operandOk {decls : List LocalDecl} {it : Gen.IntType}
+    {op : Operand} {j : Nat} (hop : opMoved op = some j)
+    (hok : operandOk decls it (copyOp op) = true) : j < decls.length := by
+  rw [opMoved_eq_move hop] at hok
+  simp only [copyOp, operandOk, Bool.and_eq_true, decide_eq_true_eq] at hok
+  exact hok.1
+
+private theorem opMoved_lt_of_operandOkB {decls : List LocalDecl}
+    {op : Operand} {j : Nat} (hop : opMoved op = some j)
+    (hok : operandOkB decls (copyOp op) = true) : j < decls.length := by
+  rw [opMoved_eq_move hop] at hok
+  simp only [copyOp, operandOkB, Bool.and_eq_true, decide_eq_true_eq] at hok
+  exact hok.1
+
+private theorem opMoved_lt_of_operandOkO {decls : List LocalDecl}
+    {op : Operand} {j : Nat} (hop : opMoved op = some j)
+    (hok : operandOkO decls (copyOp op) = true) : j < decls.length := by
+  rw [opMoved_eq_move hop] at hok
+  simp only [copyOp, operandOkO, Bool.and_eq_true, decide_eq_true_eq] at hok
+  exact hok.1
+
+private theorem opMoved_lt_of_operandOkTuple {decls : List LocalDecl} {it : Gen.IntType}
+    {op : Operand} {j : Nat} (hop : opMoved op = some j)
+    (hok : operandOkTuple decls it (copyOp op) = true) : j < decls.length := by
+  rw [opMoved_eq_move hop] at hok
+  simp only [copyOp, operandOkTuple, Bool.and_eq_true, decide_eq_true_eq] at hok
+  exact hok.1
+
+private theorem opMoved_lt_of_relOperandsOk {decls : List LocalDecl} {a b : Operand}
+    (hok : relOperandsOk decls (copyOp a) (copyOp b) = true) :
+    (∀ j, opMoved a = some j → j < decls.length) ∧
+    (∀ j, opMoved b = some j → j < decls.length) := by
+  unfold relOperandsOk at hok
+  split at hok
+  · simp only [Bool.and_eq_true] at hok
+    exact ⟨fun _ ha => opMoved_lt_of_operandOk ha hok.1,
+      fun _ hb => opMoved_lt_of_operandOk hb hok.2⟩
+  · simp only [Bool.and_eq_true] at hok
+    exact ⟨fun _ ha => opMoved_lt_of_operandOkB ha hok.1,
+      fun _ hb => opMoved_lt_of_operandOkB hb hok.2⟩
+  · simp at hok
+
+private theorem rvalue_filterMap_opMoved_lt {decls : List LocalDecl} {rv : Rvalue} {j : Nat}
+    (hj : j ∈ (rvOperands rv).filterMap opMoved)
+    (hok : (∃ it, rvalueOk decls it (copyRv rv) = true) ∨
+      rvalueOkB decls (copyRv rv) = true ∨
+      rvalueOkO decls (copyRv rv) = true ∨
+      (∃ it, rvalueOkTuple decls it (copyRv rv) = true)) :
+    j < decls.length := by
+  obtain ⟨op, hop_mem, hop_mv⟩ := List.mem_filterMap.mp hj
+  match rv, hop_mem, hok with
+  | .use o, hop_mem, hok =>
+    simp [rvOperands] at hop_mem; subst hop_mem
+    rcases hok with ⟨it, h⟩ | h | h | ⟨it, h⟩
+    · exact opMoved_lt_of_operandOk hop_mv (by simpa [copyRv, rvalueOk] using h)
+    · exact opMoved_lt_of_operandOkB hop_mv (by simpa [copyRv, rvalueOkB] using h)
+    · exact opMoved_lt_of_operandOkO hop_mv (by simpa [copyRv, rvalueOkO] using h)
+    · exact opMoved_lt_of_operandOkTuple hop_mv (by simpa [copyRv, rvalueOkTuple] using h)
+  | .unaryOp uop o, hop_mem, hok =>
+    simp [rvOperands] at hop_mem; subst hop_mem
+    rcases hok with ⟨it, h⟩ | h | h | ⟨it, h⟩
+    · simp only [copyRv, rvalueOk, Bool.and_eq_true] at h
+      exact opMoved_lt_of_operandOk hop_mv h.2
+    · cases uop <;> simp only [copyRv, rvalueOkB] at h <;> try cases h
+      exact opMoved_lt_of_operandOkB hop_mv h
+    · simp [copyRv, rvalueOkO] at h
+    · simp [copyRv, rvalueOkTuple] at h
+  | .cast ck o ty, hop_mem, hok =>
+    simp [rvOperands] at hop_mem; subst hop_mem
+    rcases hok with ⟨it, h⟩ | h | h | ⟨it, h⟩
+    · cases ck <;> simp only [copyRv, rvalueOk, Bool.and_eq_true] at h <;> try contradiction
+      split at h
+      · exact opMoved_lt_of_operandOk hop_mv h.2
+      · exact opMoved_lt_of_operandOkB hop_mv h.2
+    · simp [copyRv, rvalueOkB] at h
+    · simp [copyRv, rvalueOkO] at h
+    · simp [copyRv, rvalueOkTuple] at h
+  | .binaryOp bop a b, hop_mem, hok =>
+    simp only [rvOperands, List.mem_cons, List.not_mem_nil, or_false] at hop_mem
+    rcases hok with ⟨it, h⟩ | h | h | ⟨it, h⟩
+    · simp only [copyRv, rvalueOk] at h
+      cases htb : translateBinOp bop with
+      | none => simp [htb] at h
+      | some iop =>
+        simp only [htb, Bool.and_eq_true] at h
+        rcases hop_mem with rfl | rfl
+        · exact opMoved_lt_of_operandOk hop_mv h.1
+        · split at h
+          · split at h
+            · exact opMoved_lt_of_operandOk hop_mv h.2
+            · simp at h
+          · exact opMoved_lt_of_operandOk hop_mv h.2
+    · simp only [copyRv, rvalueOkB] at h
+      split at h
+      · obtain ⟨ha, hb⟩ := opMoved_lt_of_relOperandsOk h
+        rcases hop_mem with rfl | rfl
+        · exact ha j hop_mv
+        · exact hb j hop_mv
+      · simp only [Bool.and_eq_true] at h
+        rcases hop_mem with rfl | rfl
+        · exact opMoved_lt_of_operandOkB hop_mv h.1.2
+        · exact opMoved_lt_of_operandOkB hop_mv h.2
+    · cases bop <;> simp only [copyRv, rvalueOkO] at h <;> try cases h
+      obtain ⟨ha, hb⟩ := opMoved_lt_of_relOperandsOk h
+      rcases hop_mem with rfl | rfl
+      · exact ha j hop_mv
+      · exact hb j hop_mv
+    · simp only [copyRv, rvalueOkTuple, Bool.and_eq_true] at h
+      rcases hop_mem with rfl | rfl
+      · exact opMoved_lt_of_operandOk hop_mv h.1.2
+      · exact opMoved_lt_of_operandOk hop_mv h.2
+  | .aggregate ak ops, hop_mem, hok =>
+    rcases hok with ⟨it, h⟩ | h | h | ⟨it, h⟩
+    · simp [copyRv, rvalueOk] at h
+    · simp [copyRv, rvalueOkB] at h
+    · simp [copyRv, rvalueOkO] at h
+    · cases ak <;> try (simp [copyRv, rvalueOkTuple] at h)
+      match ops, hop_mem, h with
+      | [a, b], hop_mem, h =>
+        simp only [List.map, Bool.and_eq_true] at h
+        simp only [rvOperands, List.mem_cons, List.not_mem_nil, or_false] at hop_mem
+        rcases hop_mem with rfl | rfl
+        · exact opMoved_lt_of_operandOk hop_mv h.1
+        · exact opMoved_lt_of_operandOkB hop_mv h.2
+      | [], hop_mem, _ => simp [rvOperands] at hop_mem
+      | [_], _, h => simp [List.map] at h
+      | _ :: _ :: _ :: _, _, h => simp [List.map] at h
+  | .copyForDeref _, hop_mem, _ | .repeat _ _, hop_mem, _ | .ref _ _, hop_mem, _
+  | .rawPtr _ _, hop_mem, _ | .len _, hop_mem, _ | .discriminant _, hop_mem, _
+  | .threadLocalRef _, hop_mem, _ | .nullaryOp _ _, hop_mem, _
+  | .shallowInitBox _ _, hop_mem, _ | .wrapUnsafeBinder _ _, hop_mem, _ =>
+    simp [rvOperands] at hop_mem
+
+/-- Every local newly added to `mo` by `stmtMoved` on a `statementOk` statement
+lies below `decls.length`. -/
+theorem statementOk_stmtMoved_lt {decls : List LocalDecl} {s : MirAst.Statement}
+    (hs : statementOk decls s = true) (mo : List Nat) (j : Nat)
+    (hj : j ∈ stmtMoved mo s) : j ∈ mo ∨ j < decls.length := by
+  obtain ⟨kind, span⟩ := s
+  match kind, hs, hj with
+  | .assign ⟨i, _ :: _⟩ _, hs, _ => simp [statementOk] at hs
+  | .assign ⟨i, []⟩ rv, hs, hj =>
+    simp only [stmtMoved] at hj
+    have hj' : j ∈ (rvOperands rv).foldl moveOut mo := (List.mem_filter.mp hj).1
+    rcases (foldl_moveOut_mem (rvOperands rv) mo j).mp hj' with hmo | hmv
+    · exact .inl hmo
+    · right
+      simp only [statementOk] at hs
+      cases hd : decls[i]? with
+      | none => simp [hd] at hs
+      | some d =>
+        simp only [hd] at hs
+        split at hs
+        · exact rvalue_filterMap_opMoved_lt hmv (.inr (.inl hs))
+        · split at hs
+          · exact rvalue_filterMap_opMoved_lt hmv (.inr (.inr (.inl hs)))
+          · cases htup : intBoolTupleOf d.ty with
+            | some it =>
+              simp only [htup] at hs
+              exact rvalue_filterMap_opMoved_lt hmv (.inr (.inr (.inr ⟨it, hs⟩)))
+            | none =>
+              simp only [htup] at hs
+              cases hint : intTypeOf d.ty with
+              | none => simp [hint] at hs
+              | some it =>
+                simp only [hint] at hs
+                exact rvalue_filterMap_opMoved_lt hmv (.inl ⟨it, hs⟩)
+  | .storageLive i, _, hj | .storageDead i, _, hj =>
+    simp only [stmtMoved] at hj
+    exact .inl (List.mem_filter.mp hj).1
+  | .deinit ⟨i, []⟩, _, hj =>
+    simp only [stmtMoved] at hj
+    exact .inl (List.mem_filter.mp hj).1
+  | .deinit ⟨_, _ :: _⟩, hs, _ => simp [statementOk] at hs
+  | .placeMention _, _, hj | .setDiscriminant _ _, _, hj | .retag _ _, _, hj
+  | .intrinsic _, _, hj | .coverage, _, hj | .constEvalCounter, _, hj
+  | .backwardIncompatibleDropHint _, _, hj | .nop, _, hj =>
+    simpa [stmtMoved] using .inl hj
+
+/-- Every local newly added to `mo` by `termMoved` on a `terminatorOk`
+terminator lies below `decls.length`. -/
+theorem terminatorOk_termMoved_lt {decls : List LocalDecl} {nblocks : Nat}
+    {t : MirAst.Terminator} (ht : terminatorOk decls nblocks t = true)
+    (mo : List Nat) (j : Nat) (hj : j ∈ termMoved mo t) :
+    j ∈ mo ∨ j < decls.length := by
+  obtain ⟨kind, span⟩ := t
+  cases kind with
+  | switchInt discr targets =>
+    simp only [termMoved, moveOut] at hj
+    cases hmv : opMoved discr with
+    | none => rw [hmv] at hj; exact .inl hj
+    | some k =>
+      simp only [hmv, List.mem_cons] at hj
+      rcases hj with rfl | hmo
+      · right
+        simp only [terminatorOk] at ht
+        cases hit : switchIntType decls (copyOp discr) with
+        | none => simp [hit] at ht
+        | some it =>
+          simp only [hit, Bool.and_eq_true] at ht
+          have hdok : discrOk decls (copyOp discr) = true := ht.1.1.1
+          unfold discrOk at hdok
+          split at hdok
+          · exact opMoved_lt_of_operandOk hmv hdok
+          · exact opMoved_lt_of_operandOkB hmv hdok
+          · simp at hdok
+      · exact .inl hmo
+  | goto _ | unreachable | return_ | unwindResume | unwindTerminate | drop _ _ _
+  | call _ _ _ _ _ | tailCall _ _ | assert _ _ _ _ | inlineAsm _ _ _ =>
+    simpa [termMoved] using .inl hj
+
+/-- On any CFG whose statements satisfy `statementOk` and whose terminators
+satisfy `terminatorOk`, `iterMovedEntries` always stabilizes within
+`N * (L + 1)` passes (`iterMovedEntries_stabilizes`), so `movesOk body = true`
+holds if and only if every block satisfies `blockMovesOk` at
+`movedAtEntry body blk` (outgoing-edge closure is automatic). -/
+theorem movesOk_iff_blockMovesOk {body : CapturedMir}
+    (hst : ∀ bb ∈ body.basicBlocks, ∀ s ∈ bb.statements,
+      statementOk body.localDecls s = true)
+    (hterm : ∀ bb ∈ body.basicBlocks,
+      terminatorOk body.localDecls body.basicBlocks.length bb.terminator = true) :
+    movesOk body = true ↔
+      ∀ blk (bb : BasicBlockData), body.basicBlocks[blk]? = some bb →
+        blockMovesOk (movedAtEntry body blk) bb.statements bb.terminator = true := by
+  constructor
+  · intro hmv blk bb hbb
+    have hlt : blk < body.basicBlocks.length := (List.getElem?_eq_some_iff.mp hbb).1
+    simp only [movesOk, List.all_eq_true, List.mem_range] at hmv
+    have h := hmv blk hlt
+    simp only [hbb, Bool.and_eq_true] at h
+    exact h.1
+  · intro hblk
+    apply movesOk_of_fixed ?_ hterm hblk
+    exact iterMovedEntries_stabilizes fun bb hbb =>
+      ⟨fun s hs => statementOk_stmtMoved_lt (hst bb hbb s hs),
+       terminatorOk_termMoved_lt (hterm bb hbb)⟩
 
 theorem movedBefore_zero (body : CapturedMir) (blk : Nat) :
     movedBefore body blk 0 = movedAtEntry body blk := by

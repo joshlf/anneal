@@ -32,17 +32,18 @@ as a pass.
   `allocate` helpers and `BM.deallocate` listed in the
   `impl_BasicMemory__allocate` anchor.
 - **Quotation checks** (`crates/anneal-minirust-gen/tests/quotes.rs`):
-  `storage_live_dead_deinit_move_and_init_block_quotations_are_pinned` pins 19
+  `storage_live_dead_deinit_move_and_init_block_quotations_are_pinned` pins 21
   upstream quotations (`valid_size`, `overlaps`, `allocate` and its `pick`
-  predicate, `BM.deallocate` and all six of its UB checks, `CM.deallocate`,
-  `try_mutate_cur_frame`, `deinit`, `Deinit`, `storage_live`, `storage_dead`,
-  the `StorageLive`/`StorageDead` statements, `deallocAll`'s `Return` teardown
-  loop, `minimize`'s `Move` operand and storage-statement translations, its
-  init block, and `spec/lang/well-formed.md`'s `Statement::StorageLive` and
-  `Statement::StorageDead` well-formedness rules), verifies every quotation on
-  both the vendored upstream side and the Lean side via `extract_quotes`,
-  rejects tampered variants, and rejects file misattribution across all 10
-  `MR-1.3` upstream files.
+  predicate, `BM.deallocate` and all six of its UB checks, `CM.allocate`,
+  `CM.deallocate`, `try_mutate_cur_frame`, `deinit`, `Deinit`, `storage_live`,
+  `storage_dead`, the `StorageLive`/`StorageDead` statements, `deallocAll`'s
+  `Return` teardown loop, `minimize`'s `Move` operand, local-type map, and
+  storage-statement translations, its `free_argc` / init-block / `ret` setup,
+  and `spec/lang/well-formed.md`'s `Statement::Deinit`,
+  `Statement::StorageLive`, and `Statement::StorageDead` well-formedness
+  rules), verifies every quotation on both the vendored upstream side and the
+  Lean side via `extract_quotes`, rejects tampered variants, and rejects file
+  misattribution across all 10 `MR-1.3` upstream files.
 - **Translation and fragment** (`Correspondence/Translate.lean`):
   - Bodies may declare any number of temporaries (fewer than `2^31` locals).
   - `StorageLive`/`StorageDead` translate to MiniRust's statements;
@@ -92,9 +93,13 @@ as a pass.
     terminator of the extended fragment, including the dead-local UB cases,
     backed by `stepMovedEntries_spec`, `iterMovedEntries_fixed`,
     `iterMovedEntries_mono`, `iterMovedEntries_eq_of_fixed`,
-    `terminatorOk_targets_lt`, and `movesOk_of_fixed` for the monotone forward
-    CFG dataflow `movedAtEntry`; `step_start` runs the init
-    block in `initLen body` MiniRust steps; all `Run.lean` theorems
+    `terminatorOk_targets_lt`, `movesOk_of_fixed`, `unionLocals_eq_or_mem_new`,
+    `stepMovedEntries_eq_or_strict`, `iterMovedEntries_stabilizes`,
+    `statementOk_stmtMoved_lt`, `terminatorOk_termMoved_lt`, and
+    `movesOk_iff_blockMovesOk` (unconditional finite-fuel fixed-point
+    convergence and exact `blockMovesOk` characterization on well-typed CFGs)
+    for the monotone forward CFG dataflow `movedAtEntry`; `step_start` runs the
+    init block in `initLen body` MiniRust steps; all `Run.lean` theorems
     (`mirSimRun`) are re-proved, with the `*_from_start` step counts
     `initLen body + n`.
 - **Witnesses** (`Correspondence/Witness.lean`):
@@ -121,24 +126,34 @@ as a pass.
     `SwitchInt(move _3)`, `Deinit(_3)`, and `StorageDead(_3)`, live
     re-allocation of `_2`, and idempotent `StorageDead(_2)` on `n = 0`
     (`loopTempMove3_*`, `loopTempMove0_*`, including `mirCall_progress`).
+  - `storageLiveArgRet` and `diamondMoveJoin`: `StorageLive(_1)` and
+    `StorageLive(_0)` re-allocating an argument local and the return place from
+    their initial `< 2^32` allocations onto `allocCandidate` addresses before
+    `Return` (`storageLiveArgRet5_*`), and a 4-block diamond CFG merging
+    asymmetric moved-out sets (outgoing `[1]` and `[2, 1]` joining to `[1, 2]`
+    at `bb3`) across both `SwitchInt` branches (`diamondMoveJoinTrue_*`,
+    `diamondMoveJoinFalse_*`).
   - `deadRead`, `deadAssign`, `deadDeinit`, and `deadPlaceMention`: reading,
     assigning, de-initializing, or mentioning (including projected `_1.0`) a
     temporary after `StorageDead` is UB in both models (`mirCall_ub`,
     `mirCall_steps_error`, `mirCall_outcome`, and direct runs).
   - `moveReuse`, `crossBlockMoveReuse`, `loopBackEdgeReuse`,
-    `projAssignMoveReuse`, `sameRvalueMoveReuse`, and `moveRetPlace`:
-    intra-block, cross-block, cyclic back-edge, projected-assignment,
-    intra-rvalue (`readsOk`), and `Return`-terminator (`termReadsOk`) bodies
-    that read a local after moving out of it; `movesOk` rejects all six, and
-    the models disagree on `moveReuse(7)`, `loopBackEdgeReuse(1)`,
-    `sameRvalueMoveReuse(5)`, and `moveRetPlace`.
-  - `unmarkedTempAssign`, `storageDeadRet`, and `projectedDeinit`: bodies
-    exercising the soundness boundaries of `mentionsOk`, `storageDeadOk`, and
-    projection-free `Deinit`, each accompanied by concrete semantic
-    disagreements between Anneal and MiniRust.
+    `projAssignMoveReuse`, `sameRvalueMoveReuse`, `moveRetPlace`, and
+    `diamondHalfMoveReuse`: intra-block, cross-block, cyclic back-edge,
+    projected-assignment, intra-rvalue (`readsOk`), `Return`-terminator
+    (`termReadsOk`), and one-armed diamond-merge bodies that read a local after
+    moving out of it; `movesOk` rejects all seven, and the models disagree on
+    `moveReuse(7)`, `loopBackEdgeReuse(1)`, `sameRvalueMoveReuse(5)`,
+    `moveRetPlace`, and `diamondHalfMoveReuse(false, 7)`.
+  - `unmarkedTempAssign`, `storageDeadRet`, `storageDeadArg`, and
+    `projectedDeinit`: bodies exercising the soundness and well-formedness
+    boundaries of `mentionsOk`, `storageDeadOk` (for both `_0` and arguments at
+    `i = argCount`), and projection-free `Deinit`, accompanied by concrete
+    semantic disagreements between Anneal and MiniRust.
   - Direct ground-truth checks for `BM.allocate` (`!x86_64.valid_size` UB), all
-    six `BM.deallocate` UB diagnostics (`bm_allocate_and_deallocate_ub_cases`),
-    and `evalStatement (.Deinit ..)` / `CM.deinit` on live, dead, out-of-bounds,
+    six `BM.deallocate` UB diagnostics including exact `AllocationKind`
+    formatting (`bm_allocate_and_deallocate_ub_cases`), and
+    `evalStatement (.Deinit ..)` / `CM.deinit` on live, dead, out-of-bounds,
     and misaligned targets (`evalStatement_deinit_ok_dead_and_misaligned`).
   - Every pre-existing witness is re-proved against the new relation (the
     `bb0` relations now follow from `step_start`).
@@ -167,8 +182,9 @@ trusted-base audit prints `PASS`).
 cargo test -p anneal-minirust-gen --offline
 ```
 
-Pass: every test passes, in particular `anchors_match_generated_items_and_cover_interp`
-(58 anchors) in `tests/pipeline.rs` and
+Pass: every test passes, in particular
+`anchors_match_generated_items_and_cover_interp` (58 anchors) in
+`tests/pipeline.rs` and
 `storage_live_dead_deinit_move_and_init_block_quotations_are_pinned` and
 `quotations_occur_upstream` in `tests/quotes.rs`.
 
@@ -185,14 +201,14 @@ Pass: `Build completed successfully`, with:
 
 ```text
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
-[SIMULATION-AUDIT] decls=159 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
-[WITNESS-AUDIT] decls=315 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-MiniRustSpec.Audit: exhaustively verified standard axioms for 10164 declarations across all MiniRustSpec.* modules
+[SIMULATION-AUDIT] decls=165 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
+[WITNESS-AUDIT] decls=342 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+MiniRustSpec.Audit: exhaustively verified standard axioms for 10299 declarations across all MiniRustSpec.* modules
 ```
 
 (`lake` prints already-built modules without re-running them; to see the audit
-lines again after a successful build, touch `minirust/lean/MiniRustSpec/Audit.lean`
-first.)
+lines again after a successful build, touch
+`minirust/lean/MiniRustSpec/Audit.lean` first.)
 
 ## Step 4: spot checks
 
@@ -202,20 +218,24 @@ first.)
   return: `live = [true, false, false, false, false, false, false]` and
   addresses `[64, 128, 256, 2^32, 2 * 2^32, 3 * 2^32, 2 * 2^32]`.
 - `inFragment crossBlockMove = true`, `crossBlockMove_movedAtEntry`,
-  `inFragment loopTempMove = true`, and `loopTempMove_movedAtEntry_multiPass`
-  are proved by `decide`, showing that `movesOk` accepts moving `_1` in `bb0`,
-  propagating live temporaries across `Goto` and `SwitchInt` edges, and
-  converging across cyclic loop back-edges in multiple passes.
+  `inFragment loopTempMove = true`, `loopTempMove_movedAtEntry_multiPass`,
+  `inFragment storageLiveArgRet = true`, `inFragment diamondMoveJoin = true`,
+  and `diamondMoveJoin_movedAtEntry` are proved by `decide`, showing that
+  `movesOk` accepts moving `_1` in `bb0`, propagating live temporaries across
+  `Goto` and `SwitchInt` edges, converging across cyclic loop back-edges and
+  diamond merges, and re-allocating argument/return locals via `StorageLive`.
 - `moveReuse_not_inFragment`, `crossBlockMoveReuse_movesOk`,
   `loopBackEdgeReuse_movesOk`, `projAssignMoveReuse_movesOk`,
   `sameRvalueMoveReuse_movesOk`, `moveRetPlace_movesOk`,
-  `unmarkedTempAssign_rejected`, `storageDeadRet_rejected`, and
+  `diamondHalfMoveReuse_movesOk`, `unmarkedTempAssign_rejected`,
+  `storageDeadRet_rejected`, `storageDeadArg_rejected`, and
   `projectedDeinit_rejected` are proved by `decide`, so none of the fragment's
   side-conditions is vacuous.
 
 ## Known limitations
 
-- `movesOk` is path-insensitive across control-flow merges (`movedAtEntry` takes
-  the union of moved-out locals over incoming CFG edges; see `minirust/README.md`, Gaps).
+- `movesOk` is path-insensitive across control-flow merges (`movedAtEntry`
+  takes the union of moved-out locals over incoming CFG edges; see
+  `minirust/README.md`, Gaps).
 - Temporaries without storage markers must be unmentioned.
 - Results hold for the first-fit resolution of `pick`.

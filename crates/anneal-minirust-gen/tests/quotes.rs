@@ -1655,11 +1655,33 @@ fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
         ),
         (
             func,
-            "init_statements.extend(rs::always_storage_live_locals(&self.body).iter() \
+            "for (id, local_name) in &self.local_name_map { \
+                 let local_decl = &self.body.local_decls[*id]; \
+                 let span = local_decl.source_info.span; \
+                 let ty = self.cx.translate_ty(local_decl.ty, span); \
+                 self.locals.insert(*local_name, ty); \
+             }",
+            "self.locals.remove(*local_name);",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            func,
+            "let free_argc = self.body.arg_count + 1; .. \
+             init_statements.extend(rs::always_storage_live_locals(&self.body).iter() \
              .map(|loc| self.local_name_map[&loc]) \
              .filter(|LocalName(i)| i.get_internal() as usize >= free_argc) \
-             .map(Statement::StorageLive),);",
+             .map(Statement::StorageLive),); .. \
+             let ret = LocalName(Name::from_internal(0));",
             ".filter(|LocalName(i)| i.get_internal() as usize < free_argc)",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            wf,
+            "Deinit { place } => { \
+                 let ty = place.check_wf::<T>(func.locals, prog)?; \
+                 ensure_wf(ty.layout::<T>().is_sized(), \"Statement::Deinit: unsized place\")?; \
+             }",
+            "ensure_wf(!ty.layout::<T>().is_sized(), \"Statement::Deinit: unsized place\")?;",
             "MiniRustSpec/Correspondence/Translate.lean",
         ),
         (
@@ -1674,14 +1696,17 @@ fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
         ),
         (
             wf,
-            "if local == func.ret || func.args.any(|arg_name| local == arg_name) { \
-                 throw_ill_formed!(\"Statement::StorageDead: trying to mark argument or return local as dead\"); \
+            "StorageDead(local) => { \
+                 ensure_wf(func.locals.contains_key(local), \"Statement::StorageDead: invalid local variable\")?; \
+                 if local == func.ret || func.args.any(|arg_name| local == arg_name) { \
+                     throw_ill_formed!(\"Statement::StorageDead: trying to mark argument or return local as dead\"); \
+                 } \
              }",
             "if local == func.ret && func.args.any(|arg_name| local == arg_name)",
             "MiniRustSpec/Correspondence/Translate.lean",
         ),
     ];
-    assert_eq!(cases.len(), 19, "expected 19 pinned MR-1.3 quotations");
+    assert_eq!(cases.len(), 21, "expected 21 pinned MR-1.3 quotations");
 
     let mr13_files = [target, basic, conc, mach, stmts, terms, wf, rvalue, bb, func];
     let lean_root = minirust_dir().join("lean");

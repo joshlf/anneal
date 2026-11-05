@@ -245,6 +245,12 @@ open MiniRustSpec.Correspondence in
   iterMovedEntries_eq_of_fixed
   terminatorOk_targets_lt
   movesOk_of_fixed
+  unionLocals_eq_or_mem_new
+  stepMovedEntries_eq_or_strict
+  iterMovedEntries_stabilizes
+  statementOk_stmtMoved_lt
+  terminatorOk_termMoved_lt
+  movesOk_iff_blockMovesOk
   blockMovesOk_spec
   movesOk_spec
   readsOk_mono
@@ -783,6 +789,33 @@ open MiniRustSpec.Correspondence.Witness in
   moveRetPlace_translate
   moveRetPlace_anneal_ub
   moveRetPlace_minirust_direct
+  storageLiveArgRet_inFragment
+  storageLiveArgRet_translate
+  ctx0_ok_u32_3
+  storageLiveArgRet5_anneal_ret
+  storageLiveArgRet5_noUB
+  storageLiveArgRet5_progress
+  storageLiveArgRet5_minirust_ret_from_start
+  storageLiveArgRet5_minirust_direct
+  storageDeadArg_rejected
+  ctx0_2_ok_bool_u32
+  diamondMoveJoin_inFragment
+  diamondMoveJoin_movedAtEntry
+  diamondMoveJoin_translate
+  diamondMoveJoinTrue_anneal_ret
+  diamondMoveJoinTrue_noUB
+  diamondMoveJoinTrue_progress
+  diamondMoveJoinTrue_minirust_ret_from_start
+  diamondMoveJoinTrue_minirust_direct
+  diamondMoveJoinFalse_anneal_ret
+  diamondMoveJoinFalse_noUB
+  diamondMoveJoinFalse_progress
+  diamondMoveJoinFalse_minirust_ret_from_start
+  diamondMoveJoinFalse_minirust_direct
+  diamondHalfMoveReuse_movesOk
+  diamondHalfMoveReuse_translate
+  diamondHalfMoveReuseFalse_anneal_ub
+  diamondHalfMoveReuseFalse_minirust_direct
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -892,6 +925,12 @@ open MiniRustSpec.Correspondence in
   iterMovedEntries_eq_of_fixed
   terminatorOk_targets_lt
   movesOk_of_fixed
+  unionLocals_eq_or_mem_new
+  stepMovedEntries_eq_or_strict
+  iterMovedEntries_stabilizes
+  statementOk_stmtMoved_lt
+  terminatorOk_termMoved_lt
+  movesOk_iff_blockMovesOk
   blockMovesOk_spec
   movesOk_spec
   readsOk_mono
@@ -1271,6 +1310,33 @@ open MiniRustSpec.Correspondence.Witness in
   moveRetPlace_translate
   moveRetPlace_anneal_ub
   moveRetPlace_minirust_direct
+  storageLiveArgRet_inFragment
+  storageLiveArgRet_translate
+  ctx0_ok_u32_3
+  storageLiveArgRet5_anneal_ret
+  storageLiveArgRet5_noUB
+  storageLiveArgRet5_progress
+  storageLiveArgRet5_minirust_ret_from_start
+  storageLiveArgRet5_minirust_direct
+  storageDeadArg_rejected
+  ctx0_2_ok_bool_u32
+  diamondMoveJoin_inFragment
+  diamondMoveJoin_movedAtEntry
+  diamondMoveJoin_translate
+  diamondMoveJoinTrue_anneal_ret
+  diamondMoveJoinTrue_noUB
+  diamondMoveJoinTrue_progress
+  diamondMoveJoinTrue_minirust_ret_from_start
+  diamondMoveJoinTrue_minirust_direct
+  diamondMoveJoinFalse_anneal_ret
+  diamondMoveJoinFalse_noUB
+  diamondMoveJoinFalse_progress
+  diamondMoveJoinFalse_minirust_ret_from_start
+  diamondMoveJoinFalse_minirust_direct
+  diamondHalfMoveReuse_movesOk
+  diamondHalfMoveReuse_translate
+  diamondHalfMoveReuseFalse_anneal_ub
+  diamondHalfMoveReuseFalse_minirust_direct
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

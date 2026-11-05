@@ -86,19 +86,23 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
   `mirCall_steps_error`, and direct checks of MiniRust's `"load at type but the
   data in memory violates the language invariant"` UB), alongside ground-truth
   checks of all four `IntBinOp::DivExact` outcomes.
-* `tempMove`, `crossBlockMove`, `loopTempMove`, `deadRead`, `deadAssign`,
-  `deadDeinit`, `deadPlaceMention`, `moveReuse`, `crossBlockMoveReuse`,
-  `loopBackEdgeReuse`, `projAssignMoveReuse`, `unmarkedTempAssign`,
-  `storageDeadRet`, and `projectedDeinit` (MR-1.3): temporaries with
-  `StorageLive`/`StorageDead`, root and projected `move` across straight-line,
-  branching, and cyclic loop CFGs (with multi-pass back-edge `movedAtEntry`
-  fixpoint convergence), `Deinit`, multi-local `initBlock` allocation of
-  heterogeneous temporaries, first-fit address reuse, dead-local UB across
-  reads, `Assign`, `Deinit`, and projected `PlaceMention`, and concrete
-  semantic counterexamples showing why `movesOk` (including multi-pass fixpoint
-  iteration), `mentionsOk`, `storageDeadOk`, and projection-free `Deinit` are
-  each necessary for soundness. Their direct MiniRust runs allocate, so they
-  are checked by `decide +kernel` (kernel evaluation; still no `native_decide`).
+* `tempMove`, `crossBlockMove`, `loopTempMove`, `storageLiveArgRet`,
+  `diamondMoveJoin`, `deadRead`, `deadAssign`, `deadDeinit`,
+  `deadPlaceMention`, `moveReuse`, `crossBlockMoveReuse`, `loopBackEdgeReuse`,
+  `projAssignMoveReuse`, `sameRvalueMoveReuse`, `moveRetPlace`,
+  `diamondHalfMoveReuse`, `unmarkedTempAssign`, `storageDeadRet`,
+  `storageDeadArg`, and `projectedDeinit` (MR-1.3): temporaries with
+  `StorageLive`/`StorageDead` (including `StorageLive` on `_0` and argument
+  locals), root and projected `move` across straight-line, branching, diamond
+  join, and cyclic loop CFGs (with multi-pass back-edge `movedAtEntry` fixpoint
+  convergence), `Deinit`, multi-local `initBlock` allocation of heterogeneous
+  temporaries, first-fit address reuse, dead-local UB across reads, `Assign`,
+  `Deinit`, and projected `PlaceMention`, and concrete semantic counterexamples
+  showing why `movesOk` (including intra-rvalue, `Return`, diamond merge, and
+  back-edge checks), `mentionsOk`, `storageDeadOk` (for both `_0` and
+  arguments), and projection-free `Deinit` are each necessary for soundness.
+  Their direct MiniRust runs allocate, so they are checked by `decide +kernel`
+  (kernel evaluation; still no `native_decide`).
 * `checkedArithI8`, `checkedTupleU32`, `uninitTupleField0`, and
   `uninitTupleField1`: checked integer arithmetic (`AddWithOverflow`,
   `SubWithOverflow`, `MulWithOverflow`), `(Int, bool)` 2-tuple locals and
@@ -4767,18 +4771,21 @@ theorem moveReuse7_minirust_direct :
 
 `crossBlockMove` exercises the CFG-aware `movesOk` dataflow analysis across
 `Goto` and `SwitchInt` edges:
-* moving the incoming function argument `_1` in `bb0` (`_2 = AddWithOverflow(move _1, const 10_u32)`),
-  which a block-insensitive `movedLocals` check would reject;
+* moving the incoming function argument `_1` in `bb0`
+  (`_2 = AddWithOverflow(move _1, const 10_u32)`), which a block-insensitive
+  `movedLocals` check would reject;
 * projected tuple moves `move (_2.0)` (in `Use`) and `move (_2.1)` (as a `bool`
   `SwitchInt` discriminant), which leave `_2: (u32, bool)` initialized in both
   models (`opMoved (.move ⟨2, [.field ..]⟩) = none`);
-* carrying live temporaries `_2` and `_3` initialized in `bb0` across `Goto(bb1)`
-  and `SwitchInt -> [0: bb2, otherwise: bb3]` before moving `_3` in `bb1` and `bb2`;
+* carrying live temporaries `_2` and `_3` initialized in `bb0` across
+  `Goto(bb1)` and `SwitchInt -> [0: bb2, otherwise: bb3]` before moving `_3` in
+  `bb1` and `bb2`;
 * calling `StorageLive(_1)` and `StorageLive(_3)` on already-live locals without
   an intervening `StorageDead`, exercising `StackFrame::storage_live`'s initial
-  `self.storage_dead(mem, local)?` deallocation and clearing their moved-out marks;
+  `self.storage_dead(mem, local)?` deallocation and clearing their moved marks;
 * `Deinit(_2)` on a `(u32, bool)` 2-tuple local;
-* idempotent `StorageDead(_2)` on an already-dead local (`if let Some(ptr) = self.locals.remove(local)`). -/
+* idempotent `StorageDead(_2)` on an already-dead local
+  (`if let Some(ptr) = self.locals.remove(local)`). -/
 def crossBlockMove : CapturedMir where
   defPath := "witness::cross_block_move"
   phase := .runtimePostCleanup
@@ -5005,7 +5012,7 @@ theorem crossBlockMoveReuse_movesOk :
     movedAtEntry crossBlockMoveReuse 1 = [1] ∧ movesOk crossBlockMoveReuse = false ∧
     inFragment crossBlockMoveReuse = false := by decide
 
-/-! ### A body that `mentionsOk` rejects (`alwaysStorageLiveLocals` semantic discrepancy) -/
+/-! ### A body that `mentionsOk` rejects (`alwaysStorageLiveLocals` gap) -/
 
 /-- MIR of `_1 = const 9_u32; _0 = copy _1; return` for `fn() -> u32` where the
 temporary `_1: u32` has no `StorageLive` or `StorageDead` marker in the body
@@ -5063,14 +5070,16 @@ theorem unmarkedTempAssign_minirust_direct :
       some (some { retAlloc with data := scalarBytes u32 9 }, [1]) := by
   decide +kernel
 
-/-! ### Direct ground-truth checks for `BM.allocate`, `BM.deallocate`, and `Statement::Deinit` UB paths -/
+/-! ### Direct ground-truth checks for `BM.allocate`, `BM.deallocate`, and
+`Statement::Deinit` UB paths -/
 
 /-- `BM.allocate` raises `"asking for a too large allocation"` when
 `!x86_64.valid_size(size)` (`size.bytes >= 2^63` or `size.bytes < 0`), and
 `BM.deallocate` raises each of the six upstream UB diagnostics from
 `spec/mem/basic.md` (provenance `None`, double-free of a dead allocation,
-non-zero offset from `alloc.addr`, wrong `AllocationKind`, wrong `Size`, and
-wrong `Align`). -/
+non-zero offset from `alloc.addr`, wrong `AllocationKind` formatting both the
+allocation's kind and the requested operation kind, wrong `Size`, and wrong
+`Align`). -/
 theorem bm_allocate_and_deallocate_ub_cases :
     BM.allocate { tempMove3MInit.mem.memory with allocations := [] } .Stack ⟨2 ^ 63⟩ ⟨1⟩ =
       .error (.ub "asking for a too large allocation") ∧
@@ -5085,7 +5094,7 @@ theorem bm_allocate_and_deallocate_ub_cases :
       .error (.ub "deallocating with pointer not to the beginning of its allocation") ∧
     BM.deallocate tempMove3MInit.mem.memory
       { addr := 64, provenance := some (⟨0⟩, ()) } .Heap ⟨4⟩ ⟨4⟩ =
-      .error (.ub "deallocating with the wrong deallocation operation") ∧
+      .error (.ub "deallocating Stack memory with Heap deallocation operation") ∧
     BM.deallocate tempMove3MInit.mem.memory
       { addr := 64, provenance := some (⟨0⟩, ()) } .Stack ⟨8⟩ ⟨4⟩ =
       .error (.ub "deallocating with incorrect size information") ∧
@@ -5685,11 +5694,13 @@ theorem deadPlaceMention_outcome (n : Nat) :
   mirCall_outcome deadPlaceMention_inFragment deadPlaceMention_translate ctx0
     (ctx0_ok_u32_tuple rfl) [] (by decide) deadPlaceMentionMInit rfl rfl rfl n
 
-/-! ### Boundary counterexamples (`storageDeadOk`, `Deinit`, `stmtMoved`, `readsOk`, `termReadsOk`) -/
+/-! ### Boundary counterexamples (`storageDeadOk`, `Deinit`, `stmtMoved`,
+`readsOk`, `termReadsOk`) -/
 
 /-- `StorageDead(_0); return` is ill-formed in MiniRust (`storageDeadOk` fails):
 Anneal faults with `.ub` on returning a dead `_0`, whereas MiniRust's
-`evalReturn` indexes `frame.locals[frame.func.ret]` and hits `Stop.specPanic`. -/
+`evalReturn` indexes `frame.locals[frame.func.ret]` and hits `Stop.specPanic`.
+-/
 def storageDeadRet : CapturedMir where
   defPath := "witness::storage_dead_ret"
   phase := .runtimePostCleanup
@@ -5866,12 +5877,12 @@ theorem sameRvalueMoveReuse5_minirust_direct :
       some (some { retAlloc with data := scalarBytes u32 10 }, [1]) := by
   decide +kernel
 
-/-- `_0 = const 10_u32; StorageLive(_1); _1 = Use(move _0); StorageDead(_1); return`
-for `fn() -> u32`: every statement satisfies `stmtReadsOk`, but `termReadsOk`
-on `.return_` requires `!mo.contains 0` because `Return` reads the return place
-`_0`. Anneal de-initializes `_0` at `move _0` and faults with `.ub` at
-`return`, whereas MiniRust's `evalReturn` loads the still-present bytes of `_0`
-and returns `10`. -/
+/-- `_0 = const 10_u32; StorageLive(_1); _1 = Use(move _0); StorageDead(_1);`
+`return` for `fn() -> u32`: every statement satisfies `stmtReadsOk`, but
+`termReadsOk` on `.return_` requires `!mo.contains 0` because `Return` reads the
+return place `_0`. Anneal de-initializes `_0` at `move _0` and faults with `.ub`
+at `return`, whereas MiniRust's `evalReturn` loads the still-present bytes of
+`_0` and returns `10`. -/
 def moveRetPlace : CapturedMir where
   defPath := "witness::move_ret_place"
   phase := .runtimePostCleanup
@@ -5923,6 +5934,432 @@ theorem moveRetPlace_minirust_direct :
         moveRetPlaceS0.frame.locals moveRetPlaceFn.start)).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAlloc with data := scalarBytes u32 10 }, [1]) := by
+  decide +kernel
+
+/-! ### `StorageLive` on argument and return locals, `StorageDead` on an
+argument, and CFG diamond merges -/
+
+/-- `fn(x: u32) -> u32` exercising `StorageLive(_1)` on an argument local and
+`StorageLive(_0)` on the return place (both permitted by MiniRust's
+well-formedness check in `spec/lang/well-formed.md` and by `statementOk`).
+`StorageLive(_1)` and `StorageLive(_0)` deallocate the caller-range (`< 2^32`)
+initial allocations at `256` and `128`, re-allocate fresh `Uninit` stack
+allocations at `2 * 2^32` and `3 * 2^32`, clear `1` from `mo` (`stmtMoved`),
+and allow `Return` to copy `_0` from its re-allocated `3 * 2^32` slot and tear
+down the shuffled `locals` map. -/
+def storageLiveArgRet : CapturedMir where
+  defPath := "witness::storage_live_arg_ret"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.assign (local_ 2) (.use (.move (local_ 1)))),
+        mkStmt (.storageLive 1),
+        mkStmt (.assign (local_ 1) (.binaryOp .add (.copy (local_ 2)) (constU32 10))),
+        mkStmt (.storageLive 0),
+        mkStmt (.assign (local_ 0) (.binaryOp .mul (.move (local_ 1)) (constU32 2))),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem storageLiveArgRet_inFragment : inFragment storageLiveArgRet = true := by decide
+
+def storageLiveArgRetFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2),
+      .Assign (.Local (localName 2)) (.Load (.Local (localName 1))),
+      .StorageLive (localName 1),
+      .Assign (.Local (localName 1))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 2))) (.Constant (.Int 10) (.Int u32))),
+      .StorageLive (localName 0),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Mul) (.Load (.Local (localName 1))) (.Constant (.Int 2) (.Int u32))),
+      .StorageDead (localName 2)],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem storageLiveArgRet_translate :
+    translateFn storageLiveArgRet = some storageLiveArgRetFn := rfl
+
+theorem ctx0_ok_u32_3 {body : CapturedMir}
+    (h : body.localDecls = [u32Decl, u32Decl, u32Decl]) : CtxOk body ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | 2, hd => simp at hd; subst hd; decide
+    | _ + 3, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def storageLiveArgRet5S0 : MachineState :=
+  initMachineState storageLiveArgRet [.scalar ⟨5, 4⟩]
+def storageLiveArgRet5MInit : Mach :=
+  machine storageLiveArgRet storageLiveArgRetFn
+    storageLiveArgRet5S0.frame.locals storageLiveArgRetFn.start
+
+theorem storageLiveArgRet5_anneal_ret :
+    ReachesRet (mirTree storageLiveArgRet storageLiveArgRet5S0) []
+      (.normal (.scalar ⟨30, 4⟩, storageLiveArgRet5S0.memory)) :=
+  runA_sound storageLiveArgRet 20 _ _ _ rfl
+
+theorem storageLiveArgRet5_noUB :
+    MirNoUBTree (mirCallTree storageLiveArgRet [.scalar ⟨5, 4⟩]) :=
+  runA_noUB storageLiveArgRet 20 _ _ _ rfl
+
+theorem storageLiveArgRet5_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (initLen storageLiveArgRet + n) storageLiveArgRet5MInit = .ok m' ∧
+      StateRel storageLiveArgRet storageLiveArgRetFn ctx0 s' m' ∧
+      Reaches (mirCallTree storageLiveArgRet [.scalar ⟨5, 4⟩]) tr
+        (mirTree storageLiveArgRet s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen storageLiveArgRet + n ∧
+      Interp.steps k storageLiveArgRet5MInit = .ok mRet ∧
+      ReturnRel storageLiveArgRet ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree storageLiveArgRet [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) :=
+  mirCall_progress storageLiveArgRet_inFragment storageLiveArgRet_translate ctx0
+    (ctx0_ok_u32_3 rfl) [.scalar ⟨5, 4⟩] (by decide) storageLiveArgRet5MInit
+    rfl rfl rfl storageLiveArgRet5_noUB n
+
+theorem storageLiveArgRet5_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n storageLiveArgRet5MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 30 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret storageLiveArgRet_inFragment storageLiveArgRet_translate ctx0
+      (ctx0_ok_u32_3 rfl) [.scalar ⟨5, 4⟩] (by decide) storageLiveArgRet5MInit
+      rfl rfl rfl storageLiveArgRet5_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [storageLiveArgRet] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem storageLiveArgRet5_minirust_direct :
+    (Interp.steps 9 storageLiveArgRet5MInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length),
+          m.mem.memory.allocations.map (·.live), m.mem.memory.allocations.map (·.addr))) =
+      some (some { retAlloc with data := scalarBytes u32 30 }, [1],
+        [true, false, false, false, false, false],
+        [64, 128, 256, 2 ^ 32, 2 * 2 ^ 32, 3 * 2 ^ 32]) := by
+  decide +kernel
+
+/-- `_0 = Use(copy _1); StorageDead(_1); return` for `fn(u32) -> u32`:
+`statementOk` accepts `StorageDead(_1)` because `_1` is an in-range local, while
+`storageDeadOk` rejects it at the exact upper boundary `i = argCount` (`1 ≤ 1`),
+matching MiniRust's well-formedness rejection of `StorageDead` on `func.args`.
+-/
+def storageDeadArg : CapturedMir where
+  defPath := "witness::storage_dead_arg"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 1)))),
+        mkStmt (.storageDead 1)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem storageDeadArg_rejected :
+    statementOk storageDeadArg.localDecls (mkStmt (.storageDead 1)) = true ∧
+    storageDeadOk storageDeadArg = false ∧
+    inFragment storageDeadArg = false := by decide
+
+/-- Caller context placing `_0`, `_1`, and `_2` at distinct non-zero addresses
+`128`, `256`, and `384` below `2^32` for two-argument `(bool, u32) -> u32`
+diamond witnesses. -/
+def ctx0_2 : Ctx := { ctx0 with addrs := [128, 256, 384] }
+
+theorem ctx0_2_ok_bool_u32 {body : CapturedMir}
+    (h : body.localDecls = [u32Decl, boolDecl, u32Decl, u32Decl]) : CtxOk body ctx0_2 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | 2, hd => simp at hd; subst hd; decide
+    | 3, hd => simp at hd; subst hd; decide
+    | _ + 4, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- A 4-block diamond CFG `fn(flag: bool, x: u32) -> u32` accepted by
+`inFragment = true`: `bb0` branches via `SwitchInt(move _1)` to `bb1` (which
+moves `_2` into `_3 = move _2 + 1` and re-initializes `_2 = 10`, leaving
+outgoing set `[1]`) and `bb2` (which moves `_2` into `_3 = move _2 * 2` without
+re-initializing `_2`, leaving outgoing set `[2, 1]`). At the merge block `bb3`,
+`movedAtEntry` converges to `[1, 2]`, and `bb3` safely returns `move _3`
+without reading `_2`. -/
+def diamondMoveJoin : CapturedMir where
+  defPath := "witness::diamond_move_join"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, boolDecl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 3)],
+      terminator := mkTerm (.switchInt (.move (local_ 1))
+        { branches := [(0, 2)], otherwise := 1 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 3) (.binaryOp .add (.move (local_ 2)) (constU32 1))),
+        mkStmt (.assign (local_ 2) (.use (constU32 10)))],
+      terminator := mkTerm (.goto 3),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 3) (.binaryOp .mul (.move (local_ 2)) (constU32 2)))],
+      terminator := mkTerm (.goto 3),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.move (local_ 3)))),
+        mkStmt (.storageDead 3)],
+      terminator := mkTerm .return_,
+      isCleanup := false }]
+  fnAbi := fnAbi 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem diamondMoveJoin_inFragment : inFragment diamondMoveJoin = true := by decide
+
+theorem diamondMoveJoin_movedAtEntry :
+    [0, 1, 2, 3].map (movedAtEntry diamondMoveJoin) = [[], [1], [1], [1, 2]] := by decide
+
+def diamondMoveJoinFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Bool),
+    (localName 2, .Int u32), (localName 3, .Int u32)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[.StorageLive (localName 3)],
+      .Switch (.UnOp (.Cast (.Transmute (.Int u8))) (.Load (.Local (localName 1))))
+        ⟨[(0, bbName 2)]⟩ (bbName 1), .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 3))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 2))) (.Constant (.Int 1) (.Int u32))),
+      .Assign (.Local (localName 2)) (.Constant (.Int 10) (.Int u32))],
+      .Goto (bbName 3), .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Local (localName 3))
+        (.BinOp (.Int .Mul) (.Load (.Local (localName 2))) (.Constant (.Int 2) (.Int u32)))],
+      .Goto (bbName 3), .Regular⟩),
+    (bbName 3, ⟨[
+      .Assign (.Local (localName 0)) (.Load (.Local (localName 3))),
+      .StorageDead (localName 3)],
+      .Return, .Regular⟩),
+    (bbName 4, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 4
+  implicit_writes := true
+
+theorem diamondMoveJoin_translate :
+    translateFn diamondMoveJoin = some diamondMoveJoinFn := rfl
+
+def diamondMoveJoinTrueArgs : List Value := [.scalar ⟨1, 1⟩, .scalar ⟨7, 4⟩]
+def diamondMoveJoinTrueS0 : MachineState :=
+  initMachineState diamondMoveJoin diamondMoveJoinTrueArgs
+def diamondMoveJoinTrueMInit : Mach :=
+  machineWithCtx ctx0_2 diamondMoveJoin diamondMoveJoinFn
+    diamondMoveJoinTrueS0.frame.locals diamondMoveJoinFn.start
+
+theorem diamondMoveJoinTrue_anneal_ret :
+    ReachesRet (mirTree diamondMoveJoin diamondMoveJoinTrueS0)
+      [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
+      (.normal (.scalar ⟨8, 4⟩, diamondMoveJoinTrueS0.memory)) :=
+  runA_sound diamondMoveJoin 20 _ _ _ rfl
+
+theorem diamondMoveJoinTrue_noUB :
+    MirNoUBTree (mirCallTree diamondMoveJoin diamondMoveJoinTrueArgs) :=
+  runA_noUB diamondMoveJoin 20 _ _ _ rfl
+
+theorem diamondMoveJoinTrue_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (initLen diamondMoveJoin + n) diamondMoveJoinTrueMInit = .ok m' ∧
+      StateRel diamondMoveJoin diamondMoveJoinFn ctx0_2 s' m' ∧
+      Reaches (mirCallTree diamondMoveJoin diamondMoveJoinTrueArgs) tr
+        (mirTree diamondMoveJoin s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen diamondMoveJoin + n ∧
+      Interp.steps k diamondMoveJoinTrueMInit = .ok mRet ∧
+      ReturnRel diamondMoveJoin ctx0_2 s' v mRet ∧
+      ReachesRet (mirCallTree diamondMoveJoin diamondMoveJoinTrueArgs) tr
+        (.normal (v, mem))) :=
+  mirCall_progress diamondMoveJoin_inFragment diamondMoveJoin_translate ctx0_2
+    (ctx0_2_ok_bool_u32 rfl) diamondMoveJoinTrueArgs (by decide)
+    diamondMoveJoinTrueMInit rfl rfl rfl diamondMoveJoinTrue_noUB n
+
+theorem diamondMoveJoinTrue_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n diamondMoveJoinTrueMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 8 } ∧
+      m'.threads = [thread1 ctx0_2 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret diamondMoveJoin_inFragment diamondMoveJoin_translate ctx0_2
+      (ctx0_2_ok_bool_u32 rfl) diamondMoveJoinTrueArgs (by decide)
+      diamondMoveJoinTrueMInit rfl rfl rfl diamondMoveJoinTrue_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [diamondMoveJoin] at hd; subst hd
+  simp [retPtr, ctx0_2, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0_2, ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem diamondMoveJoinTrue_minirust_direct :
+    (Interp.steps 9 diamondMoveJoinTrueMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 8 }, [1]) := by
+  decide +kernel
+
+def diamondMoveJoinFalseArgs : List Value := [.scalar ⟨0, 1⟩, .scalar ⟨7, 4⟩]
+def diamondMoveJoinFalseS0 : MachineState :=
+  initMachineState diamondMoveJoin diamondMoveJoinFalseArgs
+def diamondMoveJoinFalseMInit : Mach :=
+  machineWithCtx ctx0_2 diamondMoveJoin diamondMoveJoinFn
+    diamondMoveJoinFalseS0.frame.locals diamondMoveJoinFn.start
+
+theorem diamondMoveJoinFalse_anneal_ret :
+    ReachesRet (mirTree diamondMoveJoin diamondMoveJoinFalseS0)
+      [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
+      (.normal (.scalar ⟨14, 4⟩, diamondMoveJoinFalseS0.memory)) :=
+  runA_sound diamondMoveJoin 20 _ _ _ rfl
+
+theorem diamondMoveJoinFalse_noUB :
+    MirNoUBTree (mirCallTree diamondMoveJoin diamondMoveJoinFalseArgs) :=
+  runA_noUB diamondMoveJoin 20 _ _ _ rfl
+
+theorem diamondMoveJoinFalse_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (initLen diamondMoveJoin + n) diamondMoveJoinFalseMInit = .ok m' ∧
+      StateRel diamondMoveJoin diamondMoveJoinFn ctx0_2 s' m' ∧
+      Reaches (mirCallTree diamondMoveJoin diamondMoveJoinFalseArgs) tr
+        (mirTree diamondMoveJoin s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen diamondMoveJoin + n ∧
+      Interp.steps k diamondMoveJoinFalseMInit = .ok mRet ∧
+      ReturnRel diamondMoveJoin ctx0_2 s' v mRet ∧
+      ReachesRet (mirCallTree diamondMoveJoin diamondMoveJoinFalseArgs) tr
+        (.normal (v, mem))) :=
+  mirCall_progress diamondMoveJoin_inFragment diamondMoveJoin_translate ctx0_2
+    (ctx0_2_ok_bool_u32 rfl) diamondMoveJoinFalseArgs (by decide)
+    diamondMoveJoinFalseMInit rfl rfl rfl diamondMoveJoinFalse_noUB n
+
+theorem diamondMoveJoinFalse_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n diamondMoveJoinFalseMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 14 } ∧
+      m'.threads = [thread1 ctx0_2 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret diamondMoveJoin_inFragment diamondMoveJoin_translate ctx0_2
+      (ctx0_2_ok_bool_u32 rfl) diamondMoveJoinFalseArgs (by decide)
+      diamondMoveJoinFalseMInit rfl rfl rfl diamondMoveJoinFalse_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [diamondMoveJoin] at hd; subst hd
+  simp [retPtr, ctx0_2, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0_2, ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem diamondMoveJoinFalse_minirust_direct :
+    (Interp.steps 8 diamondMoveJoinFalseMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 14 }, [1]) := by
+  decide +kernel
+
+/-- A 4-block diamond CFG where only `bb2` moves out of `_2` while `bb1` leaves
+`_2` intact, and the merge block `bb3` reads `copy _2`: `movedAtEntry` unions
+`[]` and `[2]` to `[2]` at `bb3`, so `movesOk` rejects the body. On
+`(false, 7)`, Anneal faults with `.ub` at `copy _2` in `bb3`, whereas MiniRust
+loads the stale `7` and returns `14`. -/
+def diamondHalfMoveReuse : CapturedMir where
+  defPath := "witness::diamond_half_move_reuse"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, boolDecl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 3)],
+      terminator := mkTerm (.switchInt (.copy (local_ 1))
+        { branches := [(0, 2)], otherwise := 1 }),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 3) (.use (constU32 1)))],
+      terminator := mkTerm (.goto 3),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 3) (.use (.move (local_ 2))))],
+      terminator := mkTerm (.goto 3),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .add (.move (local_ 3)) (.copy (local_ 2)))),
+        mkStmt (.storageDead 3)],
+      terminator := mkTerm .return_,
+      isCleanup := false }]
+  fnAbi := fnAbi 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem diamondHalfMoveReuse_movesOk :
+    [0, 1, 2, 3].map (movedAtEntry diamondHalfMoveReuse) = [[], [], [], [2]] ∧
+    movesOk diamondHalfMoveReuse = false ∧
+    inFragment diamondHalfMoveReuse = false := by decide
+
+def diamondHalfMoveReuseFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Bool),
+    (localName 2, .Int u32), (localName 3, .Int u32)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[.StorageLive (localName 3)],
+      .Switch (.UnOp (.Cast (.Transmute (.Int u8))) (.Load (.Local (localName 1))))
+        ⟨[(0, bbName 2)]⟩ (bbName 1), .Regular⟩),
+    (bbName 1, ⟨[.Assign (.Local (localName 3)) (.Constant (.Int 1) (.Int u32))],
+      .Goto (bbName 3), .Regular⟩),
+    (bbName 2, ⟨[.Assign (.Local (localName 3)) (.Load (.Local (localName 2)))],
+      .Goto (bbName 3), .Regular⟩),
+    (bbName 3, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 3))) (.Load (.Local (localName 2)))),
+      .StorageDead (localName 3)],
+      .Return, .Regular⟩),
+    (bbName 4, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 4
+  implicit_writes := true
+
+theorem diamondHalfMoveReuse_translate :
+    translateFn diamondHalfMoveReuse = some diamondHalfMoveReuseFn := rfl
+
+def diamondHalfMoveReuseFalseS0 : MachineState :=
+  initMachineState diamondHalfMoveReuse [.scalar ⟨0, 1⟩, .scalar ⟨7, 4⟩]
+
+theorem diamondHalfMoveReuseFalse_anneal_ub :
+    ∃ tr u, Reaches (mirTree diamondHalfMoveReuse diamondHalfMoveReuseFalseS0) tr u ∧
+      FaultNow u :=
+  faultsA_sound diamondHalfMoveReuse 15 _ (by decide)
+
+theorem diamondHalfMoveReuseFalse_minirust_direct :
+    (Interp.steps 8 (machineWithCtx ctx0_2 diamondHalfMoveReuse diamondHalfMoveReuseFn
+        diamondHalfMoveReuseFalseS0.frame.locals diamondHalfMoveReuseFn.start)).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 14 }, [1]) := by
   decide +kernel
 
 end MiniRustSpec.Correspondence.Witness

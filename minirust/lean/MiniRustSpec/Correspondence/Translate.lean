@@ -890,7 +890,8 @@ def initBlock (body : MirAst.CapturedMir) : Gen.BasicBlock :=
 specialized to bodies without a spread argument (`spread_arg`, used only by
 closures and the `rust-call` ABI):
 
-> "// add init basic block
+> "let free_argc = self.body.arg_count + 1;
+>  // add init basic block
 >  let init_bb = self.fresh_bb_name();
 >  // this block allocates all \"always_storage_live_locals\",
 >  // except for those which are implicitly storage live in Minirust;
@@ -1081,9 +1082,14 @@ destination takes a `bool` rvalue (`rvalueOkB`), an `Ordering` destination
 takes a three-way comparison (`rvalueOkO`), and an `(it, bool)` 2-tuple
 destination takes a 2-tuple rvalue (`rvalueOkTuple`), each checked through
 `copyRv`; `PlaceMention` takes any fragment place (`placeOk`);
-`StorageLive`, `StorageDead`, and `Deinit` take a declared local (`StorageLive`
-is well-formed on any local in `spec/lang/well-formed.md`:
-> "StorageLive(local) => {
+`StorageLive`, `StorageDead`, and `Deinit` take a declared local (fragment
+locals have sized layout, and `Deinit` and `StorageLive` are well-formed in
+`spec/lang/well-formed.md`:
+> "Deinit { place } => {
+>      let ty = place.check_wf::<T>(func.locals, prog)?;
+>      ensure_wf(ty.layout::<T>().is_sized(), \"Statement::Deinit: unsized place\")?;
+>  }
+>  StorageLive(local) => {
 >      ensure_wf(func.locals.contains_key(local), \"Statement::StorageLive: invalid local variable\")?;
 >  }"
 `Deinit` only without projections: Anneal's `Deinit` of a projected place reads
@@ -1140,8 +1146,11 @@ def terminatorOk (decls : List MirAst.LocalDecl) (nblocks : Nat) (t : MirAst.Ter
 /-- `StorageDead` only of temporaries: MiniRust's well-formedness check
 (`spec/lang/well-formed.md`) rejects it for the return place and the
 arguments:
-> "if local == func.ret || func.args.any(|arg_name| local == arg_name) {
->      throw_ill_formed!(\"Statement::StorageDead: trying to mark argument or return local as dead\");
+> "StorageDead(local) => {
+>      ensure_wf(func.locals.contains_key(local), \"Statement::StorageDead: invalid local variable\")?;
+>      if local == func.ret || func.args.any(|arg_name| local == arg_name) {
+>          throw_ill_formed!(\"Statement::StorageDead: trying to mark argument or return local as dead\");
+>      }
 >  }" -/
 def storageDeadOk (body : MirAst.CapturedMir) : Bool :=
   body.basicBlocks.all fun bb =>
@@ -1272,9 +1281,10 @@ def iterMovedEntries : Nat → List MirAst.BasicBlockData → List (List Nat) �
     else iterMovedEntries n bbs entries'
 
 /-- The locals that may be moved out on entry to block `blk`. For `N ≥ 1`
-blocks and `L` locals, one pass expands `[]` to `N` entry lists and at most
-`N * L` further passes add distinct moved-out locals `< L`, so
-`1 + N * L ≤ N * (L + 1)` passes always reach the least fixed point. -/
+blocks whose moved-out local indices lie below `L = body.localDecls.length`,
+one pass expands `[]` to `N` entry lists and at most `N * L` further passes add
+distinct moved-out locals `< L`, so `1 + N * L ≤ N * (L + 1)` passes always
+reach a fixed point (`iterMovedEntries_stabilizes`). -/
 def movedAtEntry (body : MirAst.CapturedMir) (blk : Nat) : List Nat :=
   let fuel := body.basicBlocks.length * (body.localDecls.length + 1)
   (iterMovedEntries fuel body.basicBlocks []).getD blk []
