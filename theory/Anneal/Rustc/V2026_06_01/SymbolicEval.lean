@@ -4322,6 +4322,61 @@ theorem evalTerminatorSymTree_unreachable_eq_ub
       .leaf (MirStepNode.fail .ub) :=
   rfl
 
+theorem evalTerminatorSymTree_call_extCall
+    (s : MachineState)
+    (func : Operand)
+    (argOps : List Operand)
+    (destination : Place)
+    (targetBb : BasicBlockIdx)
+    (unwind : UnwindAction)
+    (span : String)
+    (currentBody : CapturedMir)
+    (resolvedTarget : ResolvedCallTarget)
+    (localsAfterFunc : List LocalSlot)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (h_res :
+      resolveCallTarget
+        s func (length argOps) currentBody.localDecls currentBody.layouts =
+      .ok resolvedTarget localsAfterFunc)
+    (h_args :
+      evalOperands
+        localsAfterFunc
+        argOps
+        s.memory.borrows
+        s.memory.globals
+        currentBody.layouts
+        s.memory.callerLocals =
+      .ok argVals locals')
+    (_h_indirect : resolvedTarget.isIndirect = false)
+    (h_callee :
+      lookupCallee
+        s.memory.callees
+        currentBody.layouts
+        resolvedTarget.defPath
+        resolvedTarget.typeArgs
+        s.memory.traitImpls = .none)
+    (_h_unreachable : isUnreachableCallTarget resolvedTarget.defPath = false)
+    (_h_abort : isAbortingPanicDefPath resolvedTarget.defPath = false)
+    (_h_unwind : isUnwindingPanicDefPath resolvedTarget.defPath = false)
+    (h_exactDiv : isDirectExactDivTarget resolvedTarget = false) :
+    evalTerminatorSymTree
+      s
+      { kind := .call func argOps destination (.some targetBb) unwind, span := span }
+      currentBody =
+    .leaf
+      (MirStepNode.extCall
+        { defPath := resolvedTarget.defPath, typeArgs := resolvedTarget.typeArgs, args := argVals, memory := s.memory }
+        (resumeExternalCall s locals' destination targetBb unwind)) := by
+  dsimp only [evalTerminatorSymTree, evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
+  rw [h_res]
+  dsimp only []
+  rw [h_args]
+  dsimp only []
+  rw [h_callee]
+  dsimp only []
+  rw [h_exactDiv]
+
 /--
 `evalTerminatorSymTree` for a normal inlined call (`target = .some targetBb`)
 resolved via `CalleeCtx`.

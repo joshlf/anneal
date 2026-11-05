@@ -376,7 +376,6 @@ end Proof.FrameTutor.pin_magic
         allow_impl_edit: None,
         filter: None,
         extra_cargo_args: Vec::new(),
-        out_dir: None,
     };
 
     let strict_err = verify_workspace_with_options(&base_verify_options)
