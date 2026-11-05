@@ -130,19 +130,48 @@ modules; audited proofs apply the same rules explicitly (see
 `Anneal.MirLiftBench`).
 -/
 
+elab "apply_residual_frame" : tactic => do
+  let g ← getMainGoal
+  let tgt ← g.getType
+  let tgt ← instantiateMVars tgt
+  if tgt.isAppOf ``Anneal.MirLiftCore.LiftFrame then
+    let applied ← withMainContext do
+      let lctx ← getLCtx
+      for decl in lctx do
+        if decl.isImplementationDetail then continue
+        if decl.userName.toString.startsWith "h_res_" then
+          try
+            let id := mkIdent decl.userName
+            evalTactic (← `(tactic| exact Anneal.MirLiftCore.LiftResidualFrame.to_LiftFrame (f₂ := 100) (by rfl) $id (by decide)))
+            return true
+          catch _ => pure ()
+      return false
+    if !applied then
+      throwError "ASSUMPTION FAILED!"
+  else
+    throwError "Not a LiftFrame goal"
+
 /-- Apply one memory-carrying statement or terminator lifting rule. -/
 syntax (name := liftFrameStep) "lift_frame_step" : tactic
 
 macro_rules
   | `(tactic| lift_frame_step) => `(tactic|
       first
+      | apply_residual_frame
       | (apply Anneal.MirLiftCore.LiftFrame.stmt (by rfl)
             (by first | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl)
          first
          | apply Anneal.MirLiftCore.LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftStmtMem.reifyFnPointer (by rfl) (by rfl)
              (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
-             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl))
+             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+         | apply Anneal.MirLiftCore.LiftStmtMem.reifyFnPointerPlace (by rfl)
+             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+             (by rfl) (by rfl) (by rfl) (by rfl)
+         | apply Anneal.MirLiftCore.LiftStmtMem.unsafeFnPointer (by rfl)
+             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+         | apply Anneal.MirLiftCore.LiftStmtMem.fnPtrToPtr (by rfl) (by rfl)
+             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl))
       | (apply Anneal.MirLiftCore.LiftFrame.term (by rfl)
             (by first | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl)
          first
@@ -151,13 +180,24 @@ macro_rules
          | apply Anneal.MirLiftCore.LiftTerminator.assert (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.drop (by rfl) (by rfl) (by rfl)
              (by rfl)
+         | apply Anneal.MirLiftCore.LiftTerminator.dropProjected (by rfl)
+             (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.return_ (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.returnToCaller (by rfl) (by rfl)
              (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.callDirect (by rfl) (by rfl)
              (by rfl)
+         | apply Anneal.MirLiftCore.LiftTerminator.callFnItem (by rfl) (by rfl)
+             (by rfl) (by rfl) (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.callIndirect (by rfl) (by rfl)
              (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+         | apply Anneal.MirLiftCore.LiftTerminator.tailCallDirect (by rfl)
+             (by rfl) (by rfl)
+         | apply Anneal.MirLiftCore.LiftTerminator.tailCallFnItem (by rfl)
+             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+         | apply Anneal.MirLiftCore.LiftTerminator.tailCallIndirect (by rfl)
+             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+             (by rfl)
          dsimp only [Anneal.MirLiftCore.FrameStep.Continues]))
 
 /-- Lift a whole execution from an entry `LiftFrame` goal to the root return. -/
@@ -238,12 +278,6 @@ def elabMirLiftFrame (id : Ident) (calleesStx : Term) : CommandElabM Unit := do
 def elabMirLift : CommandElab := fun stx => do
   match stx with
   | `(command| #mir_lift $[(residual := $res?:ident)]? $[(callees := $callees?:term)]? $id:ident) =>
-    if let some calleesStx := callees? then
-      if res?.isSome then
-        throwError "#mir_lift: `(residual := true)` is only supported in \
-          call-free mode; linked-callee mode lifts every block"
-      elabMirLiftFrame id calleesStx
-      return
     let name := id.getId
     let declName ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo id
 
@@ -255,13 +289,22 @@ def elabMirLift : CommandElab := fun stx => do
       let env ← getEnv
       let some info := env.find? declName | throwError "unknown constant {declName}"
       unsafe evalExpr CapturedMir (mkConst ``CapturedMir) info.value!
-      
+
+    let isPure := checkPureMir val
+    if res?.isNone && (callees?.isSome || !isPure) then
+      let calleesStx ← match callees? with
+        | some cs => pure cs
+        | none => `([])
+      elabMirLiftFrame id calleesStx
+      return
+
     let blocksArr := val.basicBlocks.toArray
 
     let cmd1 ← `(command| def $modelName := ())
-    
+
     let mut residualHyps : Array (TSyntax [`ident, `Lean.Parser.Term.hole, `Lean.Parser.Term.bracketedBinder]) := #[]
     let isResidual := res?.isSome
+    let useFrameResidual := isResidual && (callees?.isSome || !isPure)
     if isResidual then
       for i in [0:blocksArr.size] do
         if h : i < blocksArr.size then
@@ -280,23 +323,37 @@ def elabMirLift : CommandElab := fun stx => do
             for b in targets.branches do
               if b.snd ≤ i then isBackEdge := true
           | _ => pure ()
-          
+
           let mut needsResidual := isBackEdge
           match bb.terminator.kind with
-          | .call .. => needsResidual := true
+          | .call .. => if callees?.isNone then needsResidual := true
+          | .tailCall .. => if callees?.isNone then needsResidual := true
           | _ => pure ()
-          
+
           if needsResidual then
             let hypName := mkIdent (Name.mkSimple s!"h_res_{i}")
             let bbIdxStx := Syntax.mkNumLit (toString i)
-            let hypType ← `(∀ env, Anneal.MirLiftCore.LiftResidualBlock $targetName $bbIdxStx env (fun _ => True) 100)
+            let hypType ←
+              if useFrameResidual then
+                `(∀ env mem, Anneal.MirLiftCore.LiftResidualFrame $targetName $bbIdxStx env mem (fun _ => True) 100)
+              else
+                `(∀ env, Anneal.MirLiftCore.LiftResidualBlock $targetName $bbIdxStx env (fun _ => True) 100)
             let b ← `(bracketedBinder| ($hypName : $hypType))
             residualHyps := residualHyps.push b
-        
-    let cmd2 ← `(command| theorem $soundName $residualHyps* : MirWpConverges $targetName (initMachineState $targetName []) (mirNormalPost (fun retVal mem' => mem' = (initMachineState $targetName []).memory ∧ (fun _ => True) retVal)) := by
-      exact mirWpConverges_of_pureExec_init (by rfl) (lift_PureMirConverges (by rfl) (by apply LiftBlock.of_lookup (by rfl); repeat (first | lift_mir_step | trivial))))
-    elabCommand cmd1
-    elabCommand cmd2
+
+    if useFrameResidual then
+      let calleesStx ← match callees? with
+        | some cs => pure cs
+        | none => `([])
+      let cmd2 ← `(command| theorem $soundName $residualHyps* : MirWpConverges $targetName (initMachineStateWithCallees $targetName [] $calleesStx) (mirNormalPost (fun retVal _ => (fun _ => True) retVal)) := by
+        exact LiftFrame.mirWpConverges_withCallees (fuel := 100) (by lift_frame))
+      elabCommand cmd1
+      elabCommand cmd2
+    else
+      let cmd2 ← `(command| theorem $soundName $residualHyps* : MirWpConverges $targetName (initMachineState $targetName []) (mirNormalPost (fun retVal mem' => mem' = (initMachineState $targetName []).memory ∧ (fun _ => True) retVal)) := by
+        exact mirWpConverges_of_pureExec_init (by rfl) (lift_PureMirConverges (by rfl) (by apply LiftBlock.of_lookup (by rfl); repeat (first | lift_mir_step | trivial))))
+      elabCommand cmd1
+      elabCommand cmd2
   | _ => throwUnsupportedSyntax
 
 -- E2E Test Suite Definitions
@@ -350,7 +407,7 @@ def loopBody : CapturedMir := makeLoopBody "loop"
 #mir_lift (residual := true) loopBody
 
 def multiCalleeBody : CapturedMir := makeMultiCalleeBody "multi"
--- -- #mir_lift (residual := true) multiCalleeBody
+#mir_lift (residual := true) multiCalleeBody
 
 def makeGotoBody (name : String) : CapturedMir := {
   benchBody with
@@ -384,19 +441,31 @@ def dropLoopBody : CapturedMir := makeDropLoopBody "dropLoop"
 
 -- `liftIndirectCallerMir` reifies `lift_poly_id::<u32>` into a function
 -- pointer and calls it indirectly; `liftDirectCallerMir` calls the same generic
--- callee through its function-item constant (see `Anneal.MirLiftBench`).
+-- callee through its function-item constant; `liftPolyLayoutCallerMir`
+-- exercises projected `ReifyFnPointer`, `UnsafeFnPointer`, `FnPtrToPtr`,
+-- indirect `tailCall`, local fn-item calls, projected `drop`, and polymorphic
+-- compound layout recomputation (`LayoutTable.instantiateForBody`) on
+-- `Wrapper<T>` (see `Anneal.MirLiftBench`).
 #mir_lift (callees := [liftPolyIdMir]) liftIndirectCallerMir
 #mir_lift (callees := [liftPolyIdMir]) liftDirectCallerMir
+#mir_lift (callees := liftPolyLayoutCallees) liftPolyLayoutCallerMir
 
 -- The synthesized models are the values returned through each call.
 example : liftIndirectCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
 example : liftDirectCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
+example : liftPolyLayoutCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
 
 example :
     MirWpConverges liftIndirectCallerMir
       (initMachineStateWithCallees liftIndirectCallerMir [] [liftPolyIdMir])
       (mirNormalPost (fun retVal _ => retVal = .scalar ⟨7, 4⟩)) :=
   liftIndirectCallerMir_lift_sound
+
+example :
+    MirWpConverges liftPolyLayoutCallerMir
+      (initMachineStateWithCallees liftPolyLayoutCallerMir [] liftPolyLayoutCallees)
+      (mirNormalPost (fun retVal _ => retVal = .scalar ⟨7, 4⟩)) :=
+  liftPolyLayoutCallerMir_lift_sound
 
 /--
 info: 'liftIndirectCallerMir_lift_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
@@ -409,6 +478,12 @@ info: 'liftDirectCallerMir_lift_sound' depends on axioms: [propext, Classical.ch
 -/
 #guard_msgs in
 #print axioms liftDirectCallerMir_lift_sound
+
+/--
+info: 'liftPolyLayoutCallerMir_lift_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs in
+#print axioms liftPolyLayoutCallerMir_lift_sound
 
 -- Without the linked callee, the indirect call does not lift.
 example : True := by

@@ -46,18 +46,31 @@ cd examples
 anneal-lean-run --mode build --concurrency 2 -- lake build Anneal
 ```
 
-This builds the frame-lifting rules (`LiftFrame`, `LiftStmtMem`,
-`LiftTerminator`, and the `lift_frame` tactic) and the benchmark in
+This builds the frame-lifting rules (`LiftFrame`, `LiftResidualFrame`,
+`LiftStmtMem` / `LiftStmt.*`, and `LiftTerminator`) and the benchmarks in
 `Anneal.MirLiftBench`:
 
 - `liftIndirectCaller_wpConverges`: the caller reifies the generic
   `lift_poly_id::<u32>` into `_1 : fn(u32) -> u32`, calls it indirectly with
   `7`, and returns `7_u32` from `initMachineStateWithCallees`.
 - `liftDirectCaller_wpConverges`: the same generic callee called directly.
-- `liftIndirectCaller_verified`: the trusted `VerificationResult` for the claim
-  with `lift_poly_id` linked in `Claim.callees`.
-- Two `fail_if_success` checks: without the linked callee, or with a wrong
-  expected value, `lift_frame` fails.
+- `liftPolyWrapperTransmute_uninstantiated_fails`: proves that `evalPureStmt`
+  on the uninstantiated generic `liftPolyWrapperTransmuteMir` returns `none`
+  because `Wrapper<T>` has a 0-byte placeholder layout prior to
+  `LayoutTable.instantiateForBody`.
+- `liftPolyLayoutCaller_wpConverges`: comprehensive 22-step lifted derivation
+  exercising projected function-pointer reification
+  (`LiftStmtMem.reifyFnPointerPlace`), `CastKind.fnPtrToPtr`
+  (`LiftStmtMem.fnPtrToPtr`), indirect calls through projected operands
+  (`LiftTerminator.callIndirect`), safe-to-unsafe function-pointer coercion
+  (`LiftStmtMem.unsafeFnPointer`), indirect tail calls
+  (`LiftTerminator.tailCallIndirect`), projected drops
+  (`LiftTerminator.dropProjected`), local function-item calls
+  (`LiftTerminator.callFnItem`), and polymorphic compound layout recomputation
+  (`LayoutTable.instantiateForBody`) on `Wrapper<T>` during
+  `CastKind.transmute`.
+- `liftIndirectCaller_verified` and `liftPolyLayoutCaller_verified`: the
+  trusted `VerificationResult` certificates for both claims.
 
 ## 4. Build the `#mir_lift` elaborator and its benchmarks
 
@@ -70,10 +83,14 @@ cd examples
 anneal-lean-run --mode build --concurrency 2 -- lake build Anneal.MirLift
 ```
 
-The build runs `#mir_lift (callees := [liftPolyIdMir]) liftIndirectCallerMir`,
-which defines `liftIndirectCallerMir_model := Value.scalar { bits := 7,
-sizeBytes := 4 }` and proves `liftIndirectCallerMir_lift_sound`. Two
-`#guard_msgs` checks pin the axioms of the generated theorems to
+The build runs:
+- `#mir_lift (callees := [liftPolyIdMir]) liftIndirectCallerMir`
+- `#mir_lift (callees := [liftPolyIdMir]) liftDirectCallerMir`
+- `#mir_lift (callees := liftPolyLayoutCallees) liftPolyLayoutCallerMir`
+- `#mir_lift (residual := true) multiCalleeBody` (residual frame lifting over
+  unlinked call blocks)
+
+Three `#guard_msgs` checks pin the axioms of the generated theorems to
 `[propext, Classical.choice, Quot.sound]`, so the build fails if `sorryAx` or a
 custom axiom appears. The call-free `#mir_lift` tests from FF-3.2 run in the
 same module.
