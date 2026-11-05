@@ -5,6 +5,7 @@ import Anneal.ITree
 import Anneal.Pass
 import Anneal.EffectWP
 import Anneal.ITreeWP
+import Anneal.MirLoops
 import Anneal.Scalars
 import Anneal.Memory
 import Anneal.BitValidity
