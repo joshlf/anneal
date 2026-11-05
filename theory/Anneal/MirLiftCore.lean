@@ -16,6 +16,7 @@ open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
 open Anneal.MirFuelFree
 open Anneal.PureMirExec
+set_option linter.unusedSimpArgs false
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 open Anneal.MirLoops
 
@@ -179,35 +180,45 @@ theorem LiftBlock.of_lookup {body : CapturedMir} {bbIdx : BasicBlockIdx} {env : 
   LiftBlock body bbIdx env post fuel :=
   h_lift
 
-theorem LiftStmtsTerminator.nil_goto {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env : PureEnv} {target : BasicBlockIdx} {span : String} {post : Value → Prop} {fuel : Nat}
-  (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some { statements := [], terminator := { kind := .goto target, span := span }, isCleanup := false })
+theorem get_length_none_seq {α} (l : List α) : Trusted.Sequence.get? l (List.length l) = none := by
+  simp [Trusted.Sequence.get?]
+
+theorem get_length_none_list {α} (l : List α) : l[List.length l]? = none := by
+  simp
+
+theorem ite_length_eq {α β} (l : List α) (a b : β) : (if l.length = length l then a else b) = a := by
+  have : l.length = length l := rfl
+  simp [this]
+
+theorem LiftStmtsTerminator.term_goto {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env : PureEnv} {target : BasicBlockIdx} {span : String} {post : Value → Prop} {fuel : Nat}
+  (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some { statements := stmts, terminator := { kind := .goto target, span := span }, isCleanup := false })
   (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
-  (h_stmtIdx : stmtIdx = 0)
+  (h_end : stmtIdx = List.length stmts)
   (h_lift : LiftBlock body target env post fuel) :
-  LiftStmtsTerminator body bbIdx stmtIdx env [] { kind := .goto target, span := span } post (fuel + 1) := by
-  subst h_stmtIdx
+  LiftStmtsTerminator body bbIdx stmtIdx env stmts { kind := .goto target, span := span } post (fuel + 1) := by
+  subst h_end
   rcases h_phase with hp | hp
   · dsimp [LiftStmtsTerminator, wpMirExecSym, evalSymNodeTree, stepMirExecSymTree, stepMirSymTree, PureState.toMachineState, emptyMemory]
-    simp [hp, h_bb, evalTerminatorSymTree, evalTerminator]
+    simp [hp, h_bb, get_length_none_seq, get_length_none_list, ite_length_eq, evalTerminatorSymTree, evalTerminator]
     exact h_lift
   · dsimp [LiftStmtsTerminator, wpMirExecSym, evalSymNodeTree, stepMirExecSymTree, stepMirSymTree, PureState.toMachineState, emptyMemory]
-    simp [hp, h_bb, evalTerminatorSymTree, evalTerminator]
+    simp [hp, h_bb, get_length_none_seq, get_length_none_list, ite_length_eq, evalTerminatorSymTree, evalTerminator]
     exact h_lift
 
-theorem LiftStmtsTerminator.nil_return {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env : PureEnv} {span : String} {post : Value → Prop} {val : Value}
-  (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some { statements := [], terminator := { kind := .return_, span := span }, isCleanup := false })
+theorem LiftStmtsTerminator.term_return {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env : PureEnv} {span : String} {post : Value → Prop} {val : Value}
+  (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some { statements := stmts, terminator := { kind := .return_, span := span }, isCleanup := false })
   (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
-  (h_stmtIdx : stmtIdx = 0)
+  (h_end : stmtIdx = List.length stmts)
   (h_ret : Trusted.Sequence.get? env 0 = some (.init val))
   (h_post : post val) :
-  LiftStmtsTerminator body bbIdx stmtIdx env [] { kind := .return_, span := span } post 1 := by
-  subst h_stmtIdx
+  LiftStmtsTerminator body bbIdx stmtIdx env stmts { kind := .return_, span := span } post 1 := by
+  subst h_end
   rcases h_phase with hp | hp
   · dsimp [LiftStmtsTerminator, wpMirExecSym, evalSymNodeTree, stepMirExecSymTree, stepMirSymTree, PureState.toMachineState, emptyMemory]
-    simp [hp, h_bb, evalTerminatorSymTree, evalTerminator, h_ret]
+    simp [hp, h_bb, get_length_none_seq, get_length_none_list, ite_length_eq, evalTerminatorSymTree, evalTerminator, h_ret]
     exact h_post
   · dsimp [LiftStmtsTerminator, wpMirExecSym, evalSymNodeTree, stepMirExecSymTree, stepMirSymTree, PureState.toMachineState, emptyMemory]
-    simp [hp, h_bb, evalTerminatorSymTree, evalTerminator, h_ret]
+    simp [hp, h_bb, get_length_none_seq, get_length_none_list, ite_length_eq, evalTerminatorSymTree, evalTerminator, h_ret]
     exact h_post
 
 def LiftLoop (body : CapturedMir) (bbIdx : BasicBlockIdx) (lo hi : Nat) (init : α) (step : (i : Nat) → lo ≤ i → i < hi → α → α)
@@ -223,71 +234,69 @@ theorem lift_PureMirConverges
   PureMirConverges body (initPureState body args) post :=
   ⟨fuel, h_lift⟩
 
-theorem LiftStmtsTerminator.nil_switchInt {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv} {discr : Operand} {targets : SwitchTargets} {span : String} {post : Value → Prop} {fuel : Nat} {sc : ScalarInt} {target : BasicBlockIdx}
-  (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some { statements := [], terminator := { kind := .switchInt discr targets, span := span }, isCleanup := false })
+theorem LiftStmtsTerminator.term_switchInt {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv} {discr : Operand} {targets : SwitchTargets} {span : String} {post : Value → Prop} {fuel : Nat} {sc : ScalarInt} {target : BasicBlockIdx}
+  (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some { statements := stmts, terminator := { kind := .switchInt discr targets, span := span }, isCleanup := false })
   (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
-  (h_stmtIdx : stmtIdx = 0)
+  (h_end : stmtIdx = List.length stmts)
   (h_eval : evalPureOperand body env discr = .ok (.scalar sc) env')
   (h_target : target = lookupSwitchTarget sc.bits targets.branches targets.otherwise)
   (h_next : wpMirExecSym fuel body (.running (PureState.toMachineState { bb := target, stmtIdx := 0, env := env' } emptyMemory)) (mirNormalPost (fun retVal _ => post retVal))) :
-  LiftStmtsTerminator body bbIdx stmtIdx env [] { kind := .switchInt discr targets, span := span } post (fuel + 1) := by
-  subst h_stmtIdx h_target
+  LiftStmtsTerminator body bbIdx stmtIdx env stmts { kind := .switchInt discr targets, span := span } post (fuel + 1) := by
   dsimp [evalPureOperand] at h_eval
   dsimp [LiftStmtsTerminator, wpMirExecSym, stepMirExecSymTree, stepMirSymTree, PureState.toMachineState, emptyMemory]
+  subst h_end
   rcases h_phase with hp | hp <;> rw [hp, h_bb] <;> dsimp [Trusted.Sequence.get?, List.length, beq_iff_eq]
-  · simp [evalTerminatorSymTree, h_eval, MirObsE, ObsE]
-    split
-    · simp only [evalSymNodeTree_eq, SymTree.bind_eval, lookupSwitchTargetTree_eval]
-      dsimp [evalNodeWP]
-      exact h_next
-    · contradiction
-  · simp [evalTerminatorSymTree, h_eval, MirObsE, ObsE]
-    split
-    · simp only [evalSymNodeTree_eq, SymTree.bind_eval, lookupSwitchTargetTree_eval]
-      dsimp [evalNodeWP]
-      exact h_next
-    · contradiction
+  · simp [evalTerminatorSymTree, get_length_none_seq, get_length_none_list, ite_length_eq, h_eval, MirObsE, ObsE]
+    rw [h_target] at h_next
+    simp only [evalSymNodeTree_eq, SymTree.bind_eval, lookupSwitchTargetTree_eval]
+    dsimp [evalNodeWP]
+    exact h_next
+  · simp [evalTerminatorSymTree, get_length_none_seq, get_length_none_list, ite_length_eq, h_eval, MirObsE, ObsE]
+    rw [h_target] at h_next
+    simp only [evalSymNodeTree_eq, SymTree.bind_eval, lookupSwitchTargetTree_eval]
+    dsimp [evalNodeWP]
+    exact h_next
 
-theorem LiftStmtsTerminator.nil_assert {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv} {cond : Operand} {expected : Bool} {target : BasicBlockIdx} {unwind : UnwindAction} {span : String} {post : Value → Prop} {fuel : Nat} {sc : ScalarInt}
-  (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some { statements := [], terminator := { kind := .assert cond expected target unwind, span := span }, isCleanup := false })
+theorem LiftStmtsTerminator.term_assert {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv} {cond : Operand} {expected : Bool} {target : BasicBlockIdx} {unwind : UnwindAction} {span : String} {post : Value → Prop} {fuel : Nat} {sc : ScalarInt}
+  (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some { statements := stmts, terminator := { kind := .assert cond expected target unwind, span := span }, isCleanup := false })
   (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
-  (h_stmtIdx : stmtIdx = 0)
+  (h_end : stmtIdx = List.length stmts)
   (h_eval : evalPureOperand body env cond = .ok (.scalar sc) env')
   (h_cond : sc.bits = (match expected with | true => 1 | false => 0))
   (h_next : wpMirExecSym fuel body (.running (PureState.toMachineState { bb := target, stmtIdx := 0, env := env' } emptyMemory)) (mirNormalPost (fun retVal _ => post retVal))) :
-  LiftStmtsTerminator body bbIdx stmtIdx env [] { kind := .assert cond expected target unwind, span := span } post (fuel + 1) := by
-  subst h_stmtIdx
+  LiftStmtsTerminator body bbIdx stmtIdx env stmts { kind := .assert cond expected target unwind, span := span } post (fuel + 1) := by
   dsimp [evalPureOperand] at h_eval
   dsimp [LiftStmtsTerminator, wpMirExecSym, stepMirExecSymTree, stepMirSymTree, PureState.toMachineState, emptyMemory]
+  subst h_end
   rcases h_phase with hp | hp <;> rw [hp, h_bb] <;> dsimp [Trusted.Sequence.get?, List.length, beq_iff_eq]
-  · simp [evalTerminatorSymTree, h_eval]
+  · simp [evalTerminatorSymTree, get_length_none_seq, get_length_none_list, ite_length_eq, h_eval]
     cases expected <;> dsimp at h_cond ⊢ <;> rw [h_cond] <;> simp only [Nat.beq_refl, evalSymNodeTree_eq] <;> dsimp [evalNodeWP] <;> exact h_next
-  · simp [evalTerminatorSymTree, h_eval]
+  · simp [evalTerminatorSymTree, get_length_none_seq, get_length_none_list, ite_length_eq, h_eval]
     cases expected <;> dsimp at h_cond ⊢ <;> rw [h_cond] <;> simp only [Nat.beq_refl, evalSymNodeTree_eq] <;> dsimp [evalNodeWP] <;> exact h_next
 
-theorem LiftStmtsTerminator.nil_call {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env : PureEnv} {func : Operand} {args : List Operand} {destination : Place} {target : Option BasicBlockIdx} {unwind : UnwindAction} {span : String} {post : Value → Prop} {fuel : Nat} {ms' : MachineState}
-  (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some { statements := [], terminator := { kind := .call func args destination target unwind, span := span }, isCleanup := false })
+theorem LiftStmtsTerminator.term_call {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env : PureEnv} {func : Operand} {args : List Operand} {destination : Place} {target : Option BasicBlockIdx} {unwind : UnwindAction} {span : String} {post : Value → Prop} {fuel : Nat} {ms' : MachineState}
+  (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some { statements := stmts, terminator := { kind := .call func args destination target unwind, span := span }, isCleanup := false })
   (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
-  (h_stmtIdx : stmtIdx = 0)
-  (h_eval : evalPureTerminator body bbIdx 0 env { kind := .call func args destination target unwind, span := span } = .step ms')
+  (h_end : stmtIdx = List.length stmts)
+  (h_eval : evalPureTerminator body bbIdx (List.length stmts) env { kind := .call func args destination target unwind, span := span } = .step ms')
   (h_next : wpMirExecSym fuel body (.running ms') (mirNormalPost (fun retVal _ => post retVal))) :
-  LiftStmtsTerminator body bbIdx stmtIdx env [] { kind := .call func args destination target unwind, span := span } post (fuel + 1) := by
-  subst h_stmtIdx
+  LiftStmtsTerminator body bbIdx stmtIdx env stmts { kind := .call func args destination target unwind, span := span } post (fuel + 1) := by
   dsimp [evalPureTerminator] at h_eval
   dsimp [LiftStmtsTerminator, wpMirExecSym, stepMirExecSymTree, stepMirSymTree, PureState.toMachineState, emptyMemory] at h_eval ⊢
+  subst h_end
   rcases h_phase with hp | hp <;> rw [hp, h_bb] <;> dsimp [Trusted.Sequence.get?, List.length, beq_iff_eq]
-  · simp [evalTerminatorSymTree]
+  · simp [evalTerminatorSymTree, get_length_none_seq, get_length_none_list, ite_length_eq]
     rw [h_eval]
     rw [evalSymNodeTree_eq]
     dsimp [evalNodeWP]
     exact h_next
-  · simp [evalTerminatorSymTree]
+  · simp [evalTerminatorSymTree, get_length_none_seq, get_length_none_list, ite_length_eq]
     rw [h_eval]
     rw [evalSymNodeTree_eq]
     dsimp [evalNodeWP]
     exact h_next
 
-theorem LiftStmtsTerminator.cons_eval {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv} {stmt : Statement} {stmts : List Statement} {term : Terminator} {post : Value → Prop} {fuel : Nat}
+theorem LiftStmtsTerminator.cons_eval {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv} {stmt : Statement} {term : Terminator} {post : Value → Prop} {fuel : Nat}
   (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some { statements := stmts, terminator := term, isCleanup := false })
   (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
   (h_get : Trusted.Sequence.get? stmts stmtIdx = some stmt)
@@ -313,7 +322,7 @@ theorem LiftStmtsTerminator.cons_eval {body : CapturedMir} {bbIdx : BasicBlockId
     dsimp [evalNodeWP]
     exact h_next
 
-theorem LiftStmtsTerminator.cons {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv} {stmt : Statement} {stmts : List Statement} {term : Terminator} {post : Value → Prop} {fuel : Nat}
+theorem LiftStmtsTerminator.cons {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv} {stmt : Statement} {term : Terminator} {post : Value → Prop} {fuel : Nat}
   (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some { statements := stmts, terminator := term, isCleanup := false })
   (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
   (h_get : Trusted.Sequence.get? stmts stmtIdx = some stmt)
