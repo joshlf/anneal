@@ -51,6 +51,7 @@ applies, follow all of them.
 
 | Activity | Required skills |
 | :--- | :--- |
+| Reviewing code, commits, or pull requests, or auditing changes for trust-boundary compliance | [`trust-review`](skills/trust-review/SKILL.md) |
 | Writing, revising, or reviewing any technical prose (documentation, code comments, commit messages, PR descriptions, or issue bodies) | [`reader-oriented-explanation`](skills/reader-oriented-explanation/SKILL.md), [`williams-style`](skills/williams-style/SKILL.md) |
 | Adding, revising, or reviewing explanatory inline (`//`, `--`) or documentation (`///`, `//!`, `/--`, `/-!`) code comments | [`comment-guidelines`](skills/comment-guidelines/SKILL.md), [`reader-oriented-explanation`](skills/reader-oriented-explanation/SKILL.md), [`williams-style`](skills/williams-style/SKILL.md) |
 | Structuring commits, drafting or revising commit messages, rebasing or amending commits, or managing GHerrit branches and stacks | [`source-control`](skills/source-control/SKILL.md), [`commit-message`](skills/commit-message/SKILL.md), [`authorship-disclosure`](skills/authorship-disclosure/SKILL.md), [`reader-oriented-explanation`](skills/reader-oriented-explanation/SKILL.md), [`williams-style`](skills/williams-style/SKILL.md) |
@@ -68,9 +69,12 @@ Anneal verifies Rust programs (including unsafe code) by extracting typed
 `Runtime(PostCleanup)` MIR and compiler facts via a thin `rustc_driver` wrapper
 and checking per-item `VerificationResult` theorems inside the Lean 4 kernel.
 
-Start with [`PRINCIPLES.md`](PRINCIPLES.md), [`DESIGN.md`](DESIGN.md), and
-[README.md](README.md) for the normative project principles, design contract,
-repository map, and links to the
+Start with [`PRINCIPLES.md`](PRINCIPLES.md), [`DESIGN.md`](DESIGN.md),
+[README.md](README.md), [`docs/design.md`](docs/design.md),
+[`docs/architecture.md`](docs/architecture.md), and
+[`docs/trust-model.md`](docs/trust-model.md) for the normative project
+principles, design contract, three-stage MIR pipeline, trust model, repository
+map, and links to the
 architecture issues ([#1](https://github.com/joshlf/anneal/issues/1),
 [#100](https://github.com/joshlf/anneal/issues/100),
 [#99](https://github.com/joshlf/anneal/issues/99),
@@ -90,6 +94,12 @@ Before placing or modifying code, check whether it belongs inside
 - All derived definitions, program transformations (`VerifierPass`, `ExactPass`),
   certificate checkers (`VerifiedChecker`), program logics (`WP`), tactics, and
   CLI orchestration belong outside `trusted/`.
+
+When reviewing code or auditing changes before committing, run a dedicated
+[`trust-review`](skills/trust-review/SKILL.md) pass both to verify that code
+outside `trusted/`, `ci/`, and `.github/` cannot bypass trust auditing and to
+audit any changes inside `trusted/`, `ci/`, `.github/`, or pinned root
+manifests.
 
 ## Required writing skills
 

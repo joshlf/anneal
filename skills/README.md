@@ -32,10 +32,11 @@ for configuring Claude Code, Gemini CLI, Jetski, and Codex to load these skills.
 | [`tech-lead`](tech-lead/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | [`tech-lead/` at `3bf3f345b2916f8417306ba197f779b0b4429c1d`](https://github.com/joshlf/skills/tree/3bf3f345b2916f8417306ba197f779b0b4429c1d/tech-lead) |
 | [`williams-style`](williams-style/SKILL.md) | [`joshlf/skills`](https://github.com/joshlf/skills) | [`williams-style/` at `b563468a8148df117283494915cee5b6561cc47f`](https://github.com/joshlf/skills/tree/b563468a8148df117283494915cee5b6561cc47f/williams-style) |
 | [`source-control`](source-control/SKILL.md) | Repository-owned | Adapted from [`google/zerocopy`'s Contributing Guide](https://github.com/google/zerocopy/discussions/1318) and [`joshlf/gherrit`](https://github.com/joshlf/gherrit) |
+| [`trust-review`](trust-review/SKILL.md) | Repository-owned | Derived from [`PRINCIPLES.md`](../PRINCIPLES.md) and [`docs/trust-model.md`](../docs/trust-model.md) |
 
 Keep the vendored `joshlf/skills` packages unmodified so they can be updated
 cleanly from upstream; place Anneal-specific conventions in repository-owned
 files (`AGENTS.md`, `skills/adversarial-rounds/`,
 `skills/hierarchical-supervision/`, `skills/anneal-prove/`,
-`skills/anneal-lsp/`, `skills/anneal-doc-audit/`, and
-`skills/source-control/`).
+`skills/anneal-lsp/`, `skills/anneal-doc-audit/`,
+`skills/source-control/`, and `skills/trust-review/`).
