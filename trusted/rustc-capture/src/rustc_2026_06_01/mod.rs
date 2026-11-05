@@ -1471,6 +1471,7 @@ pub mod inner {
         }
 
         let lean_bin = resolve_bin("lean");
+        std::fs::copy(examples_dir.join("lean-toolchain"), crate_capture_dir.join("lean-toolchain")).ok();
         let lean_path_env = format!(
             "{}:{}",
             lean_lib_dir.display(),
@@ -1591,6 +1592,7 @@ example :
 "#;
         fs::write(&verify_lean_path, verify_lean_src.as_bytes()).expect("write VerifyPolymorphicCapture.lean");
         let verify_out = Command::new(&lean_bin)
+            .current_dir(&crate_capture_dir)
             .env("LEAN_PATH", &lean_path_env)
             .arg(&verify_lean_path)
             .output()
@@ -1772,6 +1774,7 @@ pub fn check_range_contains(r: &Range<usize>, idx: &usize) -> bool {
         }
 
         let lean_bin = resolve_bin("lean");
+        std::fs::copy(examples_dir.join("lean-toolchain"), unit_dir.join("lean-toolchain")).ok();
         let lean_path_env = format!("{}:{}", lean_lib_dir.display(), unit_dir.display());
         for target_rec in &manifest.unit_targets {
             let src_lean = unit_dir.join(&target_rec.target.mir_module_path);

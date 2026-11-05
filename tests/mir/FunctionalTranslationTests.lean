@@ -1096,5 +1096,178 @@ theorem advanceCursorMutSpec_total_and_stateful_verified :
       (advanceCursorMut_wpTransPlan c h_add_lt)
   exact ⟨h_tot, statefulOfTotalMutRefLocal h_tot⟩
 
+/-! ## Suite 4: Multi-Frame `callees`, Indirect `FnPtr`, and Polymorphic Linking (`Lower`) -/
+
+section Suite4MultiFrameAndPolyCalls
+
+private def usizeFtMirTy : Ty := { kind := .uint .usize, layoutIdx := 0 }
+private def paramTFtMirTy : Ty := { kind := .param 0 "T", layoutIdx := 0 }
+private def sliceRefParamTFtMirTy : Ty :=
+  { kind := .ref .not (.slice (.param 0 "T")), layoutIdx := 0 }
+private def sliceRefU32FtMirTy : Ty :=
+  { kind := .ref .not (.slice (.uint .u32)), layoutIdx := 0 }
+private def u32FnPtrFtKind : RigidTy :=
+  .fnPtr [.uint .u32] (.uint .u32) .safe .rust
+private def u32FnPtrFtMirTy : Ty := { kind := u32FnPtrFtKind, layoutIdx := 0 }
+
+private def fnConstFtOp (defPath : DefPath) (typeArgs : List RigidTy := []) : Operand :=
+  .constant
+    { ty := { kind := .fnDef defPath typeArgs, layoutIdx := 0 }
+      val := .zeroSized }
+
+private def ftCallerLayouts : LayoutTable := {
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [defaultU32Layout]
+}
+
+/-- Polymorphic `core::slice::<impl [T]>::len` in `s.memory.callees`. -/
+def ftCoreSliceLenMir : CapturedMir := {
+  mkMirBody "core::slice::<impl [T]>::len" 1
+    [mkDecl .mut usizeFtMirTy, mkDecl .not sliceRefParamTFtMirTy]
+    [ { statements :=
+          [ mkStmt (.assign (locPlace 0)
+              (.unaryOp .ptrMetadata (.move (locPlace 1)))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ] with
+  typeParamCount := 1
+  genericParams := [{ idx := 0, name := "T" }]
+  layouts := ftCallerLayouts
+}
+
+/-- Callback `fn id_u32_cb(x: u32) -> u32 { x }` invoked via `FnPtr`. -/
+def ftIdU32CallbackMir : CapturedMir := {
+  mkMirBody "test::id_u32_cb" 1
+    [mkDecl .mut u32MirTy, mkDecl .not u32MirTy]
+    [ { statements :=
+          [ mkStmt (.assign (locPlace 0) (.use (.move (locPlace 1)))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ] with
+  layouts := ftCallerLayouts
+}
+
+/--
+Caller `ftSliceLenAndFnPtrMir` combining:
+1. Polymorphic call to `core::slice::<impl [T]>::len::<u32>` in `callees`,
+2. `ReifyFnPointer` coercion of `test::id_u32_cb`, and
+3. Indirect `FnPtr` call `move _3(move _2)` in `callees`.
+-/
+def ftSliceLenAndFnPtrMir : CapturedMir := {
+  mkMirBody "test::slice_len_and_fn_ptr" 2
+    [ mkDecl .mut usizeFtMirTy
+    , mkDecl .not sliceRefU32FtMirTy
+    , mkDecl .not u32MirTy
+    , mkDecl .mut u32FnPtrFtMirTy
+    , mkDecl .mut u32MirTy ]
+    [ { statements :=
+          [ mkStmt (.storageLive 3)
+          , mkStmt (.storageLive 4)
+          , mkStmt (.assign (locPlace 3)
+              (.cast (.pointerCoercion "ReifyFnPointer")
+                (fnConstFtOp "test::id_u32_cb")
+                u32FnPtrFtMirTy)) ]
+        terminator :=
+          mkTerm (.call
+            (.move (locPlace 3))
+            [.move (locPlace 2)]
+            (locPlace 4)
+            (.some 1)
+            .continue_)
+        isCleanup := false }
+    , { statements := []
+        terminator :=
+          mkTerm (.call
+            (fnConstFtOp "core::slice::<impl [T]>::len" [.uint .u32])
+            [.move (locPlace 1)]
+            (locPlace 0)
+            (.some 2)
+            .continue_)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.storageDead 4)
+          , mkStmt (.storageDead 3) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ] with
+  layouts := ftCallerLayouts
+}
+
+def ftSliceLenAndFnPtrClaim : Claim where
+  body := ftSliceLenAndFnPtrMir
+  callees := [ftCoreSliceLenMir, ftIdU32CallbackMir]
+  pre args :=
+    ∃ (p : ProvenancePtr) (len x : Nat),
+      args =
+        [ .aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]
+        , .scalar ⟨x, 4⟩ ]
+  post args ret :=
+    ∀ (p : ProvenancePtr) (len x : Nat),
+      args =
+        [ .aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]
+        , .scalar ⟨x, 4⟩ ] →
+      ret = .scalar ⟨len, 8⟩
+
+theorem ftSliceLenAndFnPtr_verified :
+    VerificationResult ftSliceLenAndFnPtrClaim := by
+  refine verifyMirBounded ftSliceLenAndFnPtrClaim 20 ?_
+  rintro _ ⟨p, len, x, rfl⟩
+  rintro retVal mem' h_out p' len' x' h_args
+  injection h_out with h_pair
+  injection h_pair with h_rv _
+  subst h_rv
+  simp only [List.cons.injEq, Value.aggregate.injEq, Value.ptr.injEq,
+    Value.scalar.injEq, ScalarInt.mk.injEq, and_true, true_and] at h_args
+  rcases h_args with ⟨⟨rfl, rfl⟩, rfl⟩
+  rfl
+
+/-- Trait implementation of `Default::default` for `u32`. -/
+def ftDefaultU32Mir : CapturedMir := {
+  mkMirBody "test::impl_Default_for_u32" 0
+    [mkDecl .mut u32MirTy]
+    [ { statements :=
+          [ mkStmt (.assign (locPlace 0) (.use (u32ConstOp 0))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ] with
+  traitImpls :=
+    [ { traitRef := { defPath := "core::default::Default::default", args := [.uint .u32] }
+      , implPath := "test::impl_Default_for_u32" } ]
+  layouts := ftCallerLayouts
+}
+
+/-- Caller `ftTraitCallMir` demonstrating trait-method compositional linking. -/
+def ftTraitCallMir : CapturedMir := {
+  mkMirBody "test::trait_call" 0
+    [mkDecl .mut u32MirTy]
+    [ { statements := []
+        terminator :=
+          mkTerm (.call
+            (fnConstFtOp "core::default::Default::default" [.uint .u32])
+            []
+            (locPlace 0)
+            (.some 1)
+            .continue_)
+        isCleanup := false }
+    , { statements := []
+        terminator := mkTerm .return_
+        isCleanup := false } ] with
+  layouts := ftCallerLayouts
+}
+
+def ftTraitCallClaim : Claim where
+  body := ftTraitCallMir
+  callees := [ftDefaultU32Mir]
+  pre args := args = []
+  post args ret := args = [] → ret = .scalar ⟨0, 4⟩
+
+theorem ftTraitCall_verified :
+    VerificationResult ftTraitCallClaim := by
+  refine verifyMirBounded ftTraitCallClaim 20 ?_
+  rintro _ rfl
+  rintro retVal mem' h_out h_args
+  injection h_out with h_pair
+  injection h_pair with h_rv _
+  subst h_rv
+  rfl
+
+end Suite4MultiFrameAndPolyCalls
 
 end Anneal.FunctionalTranslationTests

@@ -182,7 +182,6 @@ fn end_to_end_four_demo_user_journeys() {
         allow_impl_edit: None,
         filter: None,
         extra_cargo_args: Vec::new(),
-        out_dir: None,
     };
 
     let bootstrap_report = verify_workspace_with_options(&base_opts)

@@ -455,6 +455,27 @@ fn render_companion_predicate(
     }
 }
 
+/// Render the Lean proposition asserting that the polymorphic boolean companion
+/// predicate `(Mir.<companion_suffix>.body.instantiate typeArgs)` holds on `args_expr`.
+fn render_companion_predicate_for(
+    bundle: &SubjectObligationBundle,
+    companion_suffix: &str,
+    type_args_expr: &str,
+    args_expr: &str,
+) -> String {
+    if !bundle.spec_callees.is_empty()
+        && bundle.spec_companions_with_calls.contains(companion_suffix)
+    {
+        format!(
+            "MirBoolPredicateHoldsWithCallees (Mir.{companion_suffix}.body.instantiate {type_args_expr}) defaultSpecCallees {args_expr}"
+        )
+    } else {
+        format!(
+            "MirBoolPredicateHolds (Mir.{companion_suffix}.body.instantiate {type_args_expr}) {args_expr}"
+        )
+    }
+}
+
 /// Lean identifier of the `externalSpecCallContract` definition emitted for
 /// `ext` in an `Obligations.<Item>` module.
 pub(crate) fn external_call_contract_ident(ext: &ExternalSpecContractRef) -> String {
@@ -694,8 +715,11 @@ pub fn render_obligations_module_with_options(
         ));
         for req in &bundle.inline_requires {
             let req_suffix = derive_item_module_suffix(req);
-            clauses.push(format!(
-                "MirBoolPredicateHolds (Mir.{req_suffix}.body.instantiate typeArgs) args"
+            clauses.push(render_companion_predicate_for(
+                bundle,
+                &req_suffix,
+                "typeArgs",
+                "args",
             ));
         }
         conjoin_prop_clauses(&clauses)
@@ -709,9 +733,11 @@ pub fn render_obligations_module_with_options(
             .iter()
             .map(|ens| {
                 let ens_suffix = derive_item_module_suffix(ens);
-                format!(
-                    "MirBoolPredicateHolds (Mir.{ens_suffix}.body.instantiate typeArgs) \
-                     (List.append args (List.cons ret List.nil))"
+                render_companion_predicate_for(
+                    bundle,
+                    &ens_suffix,
+                    "typeArgs",
+                    "(List.append args (List.cons ret List.nil))",
                 )
             })
             .collect();
@@ -1123,7 +1149,8 @@ pub fn render_obligations_module_with_options(
                    (Trusted.VerificationResult.retMatchesSignature\n            \
                      (Mir.{item}.body.instantiate typeArgs)\n            \
                      ret\n            \
-                     (initMachineState (Mir.{item}.body.instantiate typeArgs) args).memory) }}\n\n\
+                     (initMachineState (Mir.{item}.body.instantiate typeArgs) args).memory)\n    \
+             callees := defaultCallees }}\n\n\
          /-- Universally quantified polymorphic verification proposition for `{def_id}`\n    \
              over all `typeArgs : Trusted.MirAst.TypeSubst` of length\n    \
              `Mir.{item}.body.typeParamCount`. -/\n\
@@ -1135,7 +1162,8 @@ pub fn render_obligations_module_with_options(
          def statefulClaimFor (typeArgs : Trusted.MirAst.TypeSubst) : StatefulClaim :=\n  \
            {{ body := Mir.{item}.body.instantiate typeArgs\n    \
              pre := fun args mem => sigPre typeArgs args mem\n    \
-             post := fun args _ ret mem => sigPost typeArgs args ret mem }}\n\n\
+             post := fun args _ ret mem => sigPost typeArgs args ret mem\n    \
+             callees := defaultCallees }}\n\n\
          /-- Universally quantified polymorphic stateful verification proposition for\n    \
              `{def_id}` over all `typeArgs : Trusted.MirAst.TypeSubst` of length\n    \
              `Mir.{item}.body.typeParamCount`. -/\n\
@@ -1152,7 +1180,8 @@ pub fn render_obligations_module_with_options(
                         (mem = (initMachineState (Mir.{item}.body.instantiate typeArgs) args).memory))\n          \
                    (Trusted.VerificationResult.argsMatchSignature\n            \
                      (Mir.{item}.body.instantiate typeArgs) args mem)\n    \
-             post := fun args _ ret mem => sigPost typeArgs args ret mem }}\n\n\
+             post := fun args _ ret mem => sigPost typeArgs args ret mem\n    \
+             callees := defaultCallees }}\n\n\
          /-- Universally quantified polymorphic total-correctness verification\n    \
              proposition for `{def_id}` over all `typeArgs : Trusted.MirAst.TypeSubst`\n    \
              of length `Mir.{item}.body.typeParamCount`. -/\n\
@@ -1167,7 +1196,8 @@ pub fn render_obligations_module_with_options(
            {{ body := Mir.{item}.body.instantiate typeArgs\n    \
              envAssumed := spec.envAssumed\n    \
              pre := fun args mem => sigPre typeArgs args mem\n    \
-             post := fun args _ ret m1 => sigPost typeArgs args ret m1 }}\n\n\
+             post := fun args _ ret m1 => sigPost typeArgs args ret m1\n    \
+             callees := defaultCallees }}\n\n\
          /-- Universally quantified polymorphic modular verification proposition for\n    \
              `{def_id}` over all `typeArgs : Trusted.MirAst.TypeSubst` of length\n    \
              `Mir.{item}.body.typeParamCount`. -/\n\
@@ -1183,7 +1213,8 @@ pub fn render_obligations_module_with_options(
            {{ body := Mir.{item}.body.instantiate typeArgs\n    \
              pre := fun args mem => sigPre typeArgs args mem\n    \
              strictSafetyPre := spec.strictSafetyPre\n    \
-             post := fun args _ ret m1 => sigPost typeArgs args ret m1 }}\n\n\
+             post := fun args _ ret m1 => sigPost typeArgs args ret m1\n    \
+             callees := defaultCallees }}\n\n\
          /-- Universally quantified polymorphic UB-exception verification proposition\n    \
              for `{def_id}` over all `typeArgs : Trusted.MirAst.TypeSubst` of length\n    \
              `Mir.{item}.body.typeParamCount`. -/\n\
@@ -2613,7 +2644,11 @@ mod tests {
                    VerificationResult (claimFor typeArgs)"
         ));
         assert!(obligations.contains(
-            "def statefulClaimFor (typeArgs : Trusted.MirAst.TypeSubst) : StatefulClaim :="
+            "def statefulClaimFor (typeArgs : Trusted.MirAst.TypeSubst) : StatefulClaim :=\n  \
+               { body := Mir.MyCrate.math.inc.body.instantiate typeArgs\n    \
+                 pre := fun args mem => sigPre typeArgs args mem\n    \
+                 post := fun args _ ret mem => sigPost typeArgs args ret mem\n    \
+                 callees := defaultCallees }"
         ));
         assert!(obligations.contains(
             "def polyStatefulClaim : Prop :=\n  \
@@ -2947,6 +2982,10 @@ mod tests {
         assert!(obligations.contains(
             "def defaultPost (args : List Value) (ret : Value) : Prop :=\n  \
              MirBoolPredicateHoldsWithCallees Mir.MyCrate.math.__anodized_fn_ensures_inc.body \
+             defaultSpecCallees (List.append args (List.cons ret List.nil))"
+        ));
+        assert!(obligations.contains(
+            "MirBoolPredicateHoldsWithCallees (Mir.MyCrate.math.__anodized_fn_ensures_inc.body.instantiate typeArgs) \
              defaultSpecCallees (List.append args (List.cons ret List.nil))"
         ));
 

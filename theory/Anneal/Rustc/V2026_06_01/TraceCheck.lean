@@ -1249,6 +1249,38 @@ theorem checkObsErasedObservedTraceBounded_sound
         pair.1 pair.2 h_rec⟩
 
 /--
+Soundness of `checkObsErasedObservedTraceBounded` with `callees`: if
+`checkObsErasedObservedTraceBounded` returns `true` from
+`initMachineStateWithMemoryAndCallees body args mem callees`, then
+`mirObsErasedStatefulTreeWithCallees body args mem callees` reaches a terminal
+outcome `out` matching `outcome` along a `MirCallE` trace `tr` matching `events`.
+-/
+theorem checkObsErasedObservedTraceWithCalleesBounded_sound
+    (fuel : Nat) (body : CapturedMir) (args : List Value) (mem : Memory)
+    (callees : List CapturedMir)
+    (events : List ObservedEvent) (outcome : ObservedOutcome)
+    (h_ok :
+      checkObsErasedObservedTraceBounded fuel body
+        (initMachineStateWithMemoryAndCallees body args mem callees)
+        events outcome = true) :
+    ∃ tr out,
+      MatchesObservedEvents events tr ∧
+      MatchesObservedOutcome outcome out ∧
+      ReachesRet
+        (mirObsErasedStatefulTreeWithCallees body args mem callees) tr out := by
+  unfold checkObsErasedObservedTraceBounded at h_ok
+  cases h_rec :
+      reconstructObsErasedMirTrace fuel body
+        (.running (initMachineStateWithMemoryAndCallees body args mem callees))
+        events outcome with
+  | none => rw [h_rec] at h_ok; nomatch h_ok
+  | some pair =>
+    exact ⟨pair.1, pair.2,
+      reconstructObsErasedMirTrace_sound fuel body
+        (.running (initMachineStateWithMemoryAndCallees body args mem callees))
+        events outcome pair.1 pair.2 h_rec⟩
+
+/--
 Unified trace-consistency dispatcher supporting both `checkBranches = true`
 (`mirStatefulTree`) and `checkBranches = false` (`mirObsErasedStatefulTree`),
 with `trace.inlinedCallees` installed in `Memory.callees`.
@@ -1263,7 +1295,73 @@ def checkObservedTraceConsistencyBounded
   | true => checkFullObservedTraceBounded fuel body s trace.events trace.outcome
   | false => checkObsErasedObservedTraceBounded fuel body s trace.events trace.outcome
 
+/--
+Unified trace-consistency dispatcher initializing `MachineState` via
+`initMachineStateWithMemoryAndCallees body trace.args trace.initMem trace.inlinedCallees`
+so that both `trace.inlinedCallees` and `body.traitImpls` are populated when
+`trace.inlinedCallees` is non-empty.
+-/
+@[reducible]
+def checkObservedTraceWithCalleesBounded
+    (fuel : Nat) (checkBranches : Bool) (body : CapturedMir)
+    (trace : ObservedTrace) : Bool :=
+  let s := initMachineStateWithMemoryAndCallees body trace.args trace.initMem trace.inlinedCallees
+  match checkBranches with
+  | true => checkFullObservedTraceBounded fuel body s trace.events trace.outcome
+  | false => checkObsErasedObservedTraceBounded fuel body s trace.events trace.outcome
+
 /-! ## 5. Connection to Verification Certificates & Postcondition Refutation -/
+
+/--
+If a `VerificationResult c` certificate holds and an observed full trace is
+consistent with `c.body` (and `c.callees`) on inputs `args` satisfying
+`c.pre args` with normal return `retVal`, then `retVal` provably satisfies
+`c.post args retVal`.
+-/
+theorem verifiedClaim_satisfies_observedTrace
+    {c : Claim}
+    (h_ver : VerificationResult c)
+    (fuel : Nat) (args : List Value)
+    (events : List ObservedEvent) (retVal : Value)
+    (h_pre : c.pre args)
+    (h_trace :
+      checkFullObservedTraceBounded fuel c.body
+        (initMachineStateWithCallees c.body args c.callees)
+        events (.normal retVal) = true) :
+    c.post args retVal := by
+  rcases checkFullObservedTraceBounded_sound fuel c.body
+      (initMachineStateWithCallees c.body args c.callees)
+      events (.normal retVal) h_trace with
+    ⟨tr, out, _, h_out, h_reach⟩
+  cases out with
+  | normal p =>
+    rcases p with ⟨actualRet, mem'⟩
+    dsimp [MatchesObservedOutcome] at h_out
+    subst h_out
+    exact (h_ver.proof args h_pre).2 (tr, .normal (actualRet, mem'))
+      h_reach h_pre actualRet mem' rfl
+  | panic => nomatch h_out
+  | abort => nomatch h_out
+
+/--
+Refute a stateless `Claim` (`¬ c.holds`) by exhibiting a runtime trace
+consistent with `c.body` and `c.callees` on inputs `args` satisfying `c.pre args`
+whose normal return value `retVal` violates `c.post args retVal`.
+-/
+theorem refuteClaimByObservedTrace
+    (c : Claim)
+    (fuel : Nat) (args : List Value)
+    (events : List ObservedEvent) (retVal : Value)
+    (h_pre : c.pre args)
+    (h_trace :
+      checkFullObservedTraceBounded fuel c.body
+        (initMachineStateWithCallees c.body args c.callees)
+        events (.normal retVal) = true)
+    (h_bad : ¬ c.post args retVal) :
+    ¬ c.holds := by
+  intro h_holds
+  exact h_bad (verifiedClaim_satisfies_observedTrace ⟨h_holds⟩ fuel args
+    events retVal h_pre h_trace)
 
 /--
 If a `StatefulVerificationResult c` certificate holds and an observed full trace
@@ -1316,6 +1414,56 @@ theorem refuteStatefulClaimByObservedTrace
   rcases verifiedStatefulClaim_satisfies_observedTrace ⟨h_holds⟩ fuel args mem
       events retVal h_pre h_trace with ⟨mem', h_post⟩
   exact h_bad mem' h_post
+
+/--
+If a universally quantified polymorphic stateful claim holds across all
+`typeArgs` of length `paramCount`, and an observed full trace at a specific
+instantiation `typeArgs` returns `retVal`, then `retVal` provably satisfies the
+instantiated claim's postcondition for some post-state `mem'`.
+-/
+theorem verifiedPolyStatefulClaim_satisfies_observedTrace
+    {claimFor : TypeSubst → StatefulClaim} {paramCount : Nat}
+    (h_poly : ∀ typeArgs : TypeSubst,
+      typeArgs.length = paramCount →
+      StatefulVerificationResult (claimFor typeArgs))
+    (typeArgs : TypeSubst)
+    (h_len : typeArgs.length = paramCount)
+    (fuel : Nat) (args : List Value) (mem : Memory)
+    (events : List ObservedEvent) (retVal : Value)
+    (h_pre : (claimFor typeArgs).pre args mem)
+    (h_trace :
+      checkFullObservedTraceBounded fuel (claimFor typeArgs).body
+        (initMachineStateWithMemoryAndCallees (claimFor typeArgs).body args mem
+          (claimFor typeArgs).callees)
+        events (.normal retVal) = true) :
+    ∃ mem', (claimFor typeArgs).post args mem retVal mem' :=
+  verifiedStatefulClaim_satisfies_observedTrace (h_poly typeArgs h_len) fuel args
+    mem events retVal h_pre h_trace
+
+/--
+Refute a universally quantified polymorphic stateful claim by exhibiting a
+single monomorphized instantiation `typeArgs` (with `typeArgs.length = paramCount`)
+and a consistent runtime trace whose normal return `retVal` violates the
+postcondition across all post-states `mem'`.
+-/
+theorem refutePolyStatefulClaimByObservedTrace
+    (claimFor : TypeSubst → StatefulClaim) (paramCount : Nat)
+    (typeArgs : TypeSubst)
+    (h_len : typeArgs.length = paramCount)
+    (fuel : Nat) (args : List Value) (mem : Memory)
+    (events : List ObservedEvent) (retVal : Value)
+    (h_pre : (claimFor typeArgs).pre args mem)
+    (h_trace :
+      checkFullObservedTraceBounded fuel (claimFor typeArgs).body
+        (initMachineStateWithMemoryAndCallees (claimFor typeArgs).body args mem
+          (claimFor typeArgs).callees)
+        events (.normal retVal) = true)
+    (h_bad : ∀ mem', ¬ (claimFor typeArgs).post args mem retVal mem') :
+    ¬ (∀ ta : TypeSubst, ta.length = paramCount →
+        StatefulVerificationResult (claimFor ta)) := by
+  intro h_poly
+  exact refuteStatefulClaimByObservedTrace (claimFor typeArgs) fuel args mem
+    events retVal h_pre h_trace h_bad (h_poly typeArgs h_len).proof
 
 /-! ## 6. Raw Byte-Slice & Shadow-Provenance Decoding (`RawByteTrace`) -/
 
@@ -1700,6 +1848,99 @@ theorem checkRawByteTraceObsErasedBounded_sound
       ⟨tr, out, h_evs, h_out, h_reach⟩
     exact ⟨obsTrace, tr, out, rfl, h_evs, h_out, h_reach⟩
 
+/--
+Computable end-to-end check that a `RawByteTrace` decodes cleanly under
+`rootBody`, `calleeSigs`, and `table` and is consistent with
+`mirStatefulTreeWithCallees` (`checkBranches = true`), populating
+`rootBody.traitImpls` when `obsTrace.inlinedCallees` is non-empty.
+-/
+@[reducible]
+def checkRawByteTraceWithCalleesFullBounded
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) : Bool :=
+  match decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | some obsTrace =>
+    checkObservedTraceWithCalleesBounded fuel true rootBody obsTrace
+  | none => false
+
+/--
+Computable end-to-end check that a `RawByteTrace` decodes cleanly under
+`rootBody`, `calleeSigs`, and `table` and is consistent with
+`mirObsErasedStatefulTreeWithCallees` (`checkBranches = false`), populating
+`rootBody.traitImpls` when `obsTrace.inlinedCallees` is non-empty.
+-/
+@[reducible]
+def checkRawByteTraceWithCalleesObsErasedBounded
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) : Bool :=
+  match decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | some obsTrace =>
+    checkObservedTraceWithCalleesBounded fuel false rootBody obsTrace
+  | none => false
+
+/--
+End-to-end soundness of `checkRawByteTraceWithCalleesFullBounded`: when it
+returns `true`, the raw byte slices decode to a typed `obsTrace : ObservedTrace`
+whose execution reaches a matching `out` along `tr` in
+`mirStatefulTreeWithCallees`.
+-/
+theorem checkRawByteTraceWithCalleesFullBounded_sound
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace)
+    (h_ok :
+      checkRawByteTraceWithCalleesFullBounded
+        fuel rootBody calleeSigs table rawTrace = true) :
+    ∃ obsTrace tr out,
+      decodeRawByteTrace rootBody calleeSigs table rawTrace = some obsTrace ∧
+      MatchesObservedEvents obsTrace.events tr ∧
+      MatchesObservedOutcome obsTrace.outcome out ∧
+      ReachesRet
+        (mirStatefulTreeWithCallees
+          rootBody obsTrace.args obsTrace.initMem obsTrace.inlinedCallees)
+        tr out := by
+  unfold checkRawByteTraceWithCalleesFullBounded at h_ok
+  cases h_dec : decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rw [h_dec] at h_ok; nomatch h_ok
+  | some obsTrace =>
+    rw [h_dec] at h_ok
+    rcases checkFullObservedTraceBounded_sound fuel rootBody
+        (initMachineStateWithMemoryAndCallees
+          rootBody obsTrace.args obsTrace.initMem obsTrace.inlinedCallees)
+        obsTrace.events obsTrace.outcome h_ok with
+      ⟨tr, out, h_evs, h_out, h_reach⟩
+    exact ⟨obsTrace, tr, out, rfl, h_evs, h_out, h_reach⟩
+
+/--
+End-to-end soundness of `checkRawByteTraceWithCalleesObsErasedBounded`: when it
+returns `true`, the raw byte slices decode to a typed `obsTrace : ObservedTrace`
+whose execution reaches a matching `out` along a `MirCallE` trace `tr` in
+`mirObsErasedStatefulTreeWithCallees`.
+-/
+theorem checkRawByteTraceWithCalleesObsErasedBounded_sound
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace)
+    (h_ok :
+      checkRawByteTraceWithCalleesObsErasedBounded
+        fuel rootBody calleeSigs table rawTrace = true) :
+    ∃ obsTrace tr out,
+      decodeRawByteTrace rootBody calleeSigs table rawTrace = some obsTrace ∧
+      MatchesObservedEvents obsTrace.events tr ∧
+      MatchesObservedOutcome obsTrace.outcome out ∧
+      ReachesRet
+        (mirObsErasedStatefulTreeWithCallees
+          rootBody obsTrace.args obsTrace.initMem obsTrace.inlinedCallees)
+        tr out := by
+  unfold checkRawByteTraceWithCalleesObsErasedBounded at h_ok
+  cases h_dec : decodeRawByteTrace rootBody calleeSigs table rawTrace with
+  | none => rw [h_dec] at h_ok; nomatch h_ok
+  | some obsTrace =>
+    rw [h_dec] at h_ok
+    rcases checkObsErasedObservedTraceWithCalleesBounded_sound
+        fuel rootBody obsTrace.args obsTrace.initMem obsTrace.inlinedCallees
+        obsTrace.events obsTrace.outcome h_ok with
+      ⟨tr, out, h_evs, h_out, h_reach⟩
+    exact ⟨obsTrace, tr, out, rfl, h_evs, h_out, h_reach⟩
+
 /-! ## 7. Differential-Testing Triage Diagnostic Replay (`TraceReplayDiag`) -/
 
 /--
@@ -1864,6 +2105,19 @@ def diagnoseObservedTraceBounded
   diagnoseMirExecBounded fuel checkBranches body (.running s) trace.events trace.outcome
 
 /--
+Diagnose a decoded `ObservedTrace` against `body` using
+`initMachineStateWithMemoryAndCallees body trace.args trace.initMem trace.inlinedCallees`
+so that both `trace.inlinedCallees` and `body.traitImpls` are populated when
+`trace.inlinedCallees` is non-empty.
+-/
+@[reducible]
+def diagnoseObservedTraceWithCalleesBounded
+    (fuel : Nat) (checkBranches : Bool) (body : CapturedMir)
+    (trace : ObservedTrace) : TraceReplayDiag :=
+  let s := initMachineStateWithMemoryAndCallees body trace.args trace.initMem trace.inlinedCallees
+  diagnoseMirExecBounded fuel checkBranches body (.running s) trace.events trace.outcome
+
+/--
 Decode `rawArgs` slot-by-slot while tracking the 0-based argument index `argIdx`
 to report `.decodeArgFailed argIdx` on the first failing argument.
 -/
@@ -1957,5 +2211,52 @@ def diagnoseRawByteTraceObsErasedBounded
     (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
     (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) : TraceReplayDiag :=
   diagnoseRawByteTraceBounded fuel false rootBody calleeSigs table rawTrace
+
+/--
+End-to-end diagnostic replay of a `RawByteTrace` using
+`diagnoseObservedTraceWithCalleesBounded` so that both `rawTrace.inlinedCallees`
+and `rootBody.traitImpls` are populated.
+-/
+@[reducible]
+def diagnoseRawByteTraceWithCalleesBounded
+    (fuel : Nat) (checkBranches : Bool) (rootBody : CapturedMir)
+    (calleeSigs : List CapturedMir) (table : ShadowProvenanceTable)
+    (rawTrace : RawByteTrace) : TraceReplayDiag :=
+  match diagnoseDecodeFnArgs rootBody table rawTrace.rawArgs with
+  | .error argIdx => .decodeArgFailed argIdx
+  | .ok args =>
+    match diagnoseDecodeRawEventsAux calleeSigs table 0 rawTrace.events with
+    | .error evIdx => .decodeEventFailed evIdx
+    | .ok events =>
+      match decodeRawObservedOutcome rootBody table rawTrace.outcome with
+      | none => .decodeOutcomeFailed
+      | some outcome =>
+        diagnoseObservedTraceWithCalleesBounded fuel checkBranches rootBody {
+          args := args
+          initMem := rawTrace.initMem
+          inlinedCallees := rawTrace.inlinedCallees
+          events := events
+          outcome := outcome
+        }
+
+/--
+Convenience wrapper for `diagnoseRawByteTraceWithCalleesBounded` with full
+branch and call checking (`checkBranches = true`).
+-/
+@[reducible]
+def diagnoseRawByteTraceWithCalleesFullBounded
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) : TraceReplayDiag :=
+  diagnoseRawByteTraceWithCalleesBounded fuel true rootBody calleeSigs table rawTrace
+
+/--
+Convenience wrapper for `diagnoseRawByteTraceWithCalleesBounded` with
+branch-erased call-boundary checking (`checkBranches = false`).
+-/
+@[reducible]
+def diagnoseRawByteTraceWithCalleesObsErasedBounded
+    (fuel : Nat) (rootBody : CapturedMir) (calleeSigs : List CapturedMir)
+    (table : ShadowProvenanceTable) (rawTrace : RawByteTrace) : TraceReplayDiag :=
+  diagnoseRawByteTraceWithCalleesBounded fuel false rootBody calleeSigs table rawTrace
 
 end Anneal.Rustc.V2026_06_01.TraceCheck
