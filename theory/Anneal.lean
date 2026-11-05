@@ -20,6 +20,7 @@ import Anneal.MirFuelFree
 import Anneal.PureMirExec
 import Anneal.MirLiftCore
 import Anneal.MirLiftBench
+import Anneal.SepLogicLenses
 
 namespace Anneal
 
