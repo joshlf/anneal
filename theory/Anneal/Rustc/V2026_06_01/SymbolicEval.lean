@@ -3002,7 +3002,7 @@ def evalNodeUbWaivedWP
   | .tau st' => cont st'
   | .vis (.inl f) _ => isWaivedUbFailReq f
   | .vis (.inr (.inl _)) k => cont (k PUnit.unit)
-  | .vis (.inr (.inr (.call req))) k => ∀ ans : MirCallAns, Lower.callAnsPreserved req ans → cont (k ans)
+  | .vis (.inr (.inr (.call _))) k => ∀ ans : MirCallAns, cont (k ans)
 
 theorem evalNodeUbWaivedWP_eq
     (cont : MirExecState → Prop) (post : MirOutcome → Prop)
@@ -3029,7 +3029,7 @@ def evalSymNodeTreeUbWaived
   | .leaf (.tau st') => cont st'
   | .leaf (.vis (.inl f) _) => isWaivedUbFailReq f
   | .leaf (.vis (.inr (.inl _)) k) => cont (k PUnit.unit)
-  | .leaf (.vis (.inr (.inr (.call req))) k) => ∀ ans : MirCallAns, Lower.callAnsPreserved req ans → cont (k ans)
+  | .leaf (.vis (.inr (.inr (.call _))) k) => ∀ ans : MirCallAns, cont (k ans)
   | .branch c t1 t2 =>
     match c with
     | true => evalSymNodeTreeUbWaived cont post t1
@@ -4400,7 +4400,8 @@ theorem evalTerminatorSymTree_call_extCall
     (_h_unreachable : isUnreachableCallTarget resolvedTarget.defPath = false)
     (_h_abort : isAbortingPanicDefPath resolvedTarget.defPath = false)
     (_h_unwind : isUnwindingPanicDefPath resolvedTarget.defPath = false)
-    (h_exactDiv : isDirectExactDivTarget resolvedTarget = false) :
+    (h_exactDiv : isDirectExactDivTarget resolvedTarget = false)
+    (_h_not_intrinsic : evalDirectRustIntrinsic? s (some currentBody) resolvedTarget currentBody.localDecls currentBody.layouts argOps argVals locals' destination targetBb unwind = none) :
     evalTerminatorSymTree
       s
       { kind := .call func argOps destination (.some targetBb) unwind, span := span }
@@ -4409,7 +4410,18 @@ theorem evalTerminatorSymTree_call_extCall
       (MirStepNode.extCall
         { defPath := resolvedTarget.defPath, typeArgs := resolvedTarget.typeArgs, args := argVals, memory := s.memory }
         (resumeExternalCall s locals' destination targetBb unwind)) := by
-  sorry
+  dsimp only [evalTerminatorSymTree, evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
+  rw [h_res]
+  dsimp only []
+  rw [h_args]
+  dsimp only []
+  rw [h_callee]
+  dsimp only []
+  rw [h_exactDiv]
+  dsimp only []
+  rw [_h_indirect]
+  dsimp only []
+  rw [_h_not_intrinsic]
 
 /--
 `evalTerminatorSymTree` for a normal inlined call (`target = .some targetBb`)
@@ -4632,7 +4644,17 @@ theorem evalTerminatorSymTree_diverging_extCall
           args := argVals
           memory := s.memory }
         (resumeExternalDivergingCall s locals' unwind)) := by
-  sorry
+  dsimp only [evalTerminatorSymTree, evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
+  rw [h_res]
+  dsimp only []
+  rw [h_args]
+  dsimp only []
+  rw [h_none]
+  dsimp only []
+  cases resolvedTarget.isIndirect
+  · dsimp only []
+    rw [h_not_unreach, h_not_abort, h_not_unwind]
+  · rfl
 
 /--
 Verify a universally quantified polymorphic stateless claim

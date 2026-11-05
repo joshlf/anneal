@@ -112,34 +112,6 @@ abbrev mirNoCallWP : EffectWP MirEffect :=
     ((obsIgnoreWP PUnit MirObs).sum
       (forbidCallWP PUnit MirCallReq (fun _ => MirCallAns)))
 
-@[reducible, simp]
-def callFrameAndTraitsPreserved (before after : Memory) : Prop :=
-  And (callFramePreserved before after) (after.traitImpls = before.traitImpls)
-
-@[reducible]
-def callAnsPreserved (req : MirCallReq) (ans : MirCallAns) : Prop :=
-  match ans with
-  | .returned _ memAfter => callFrameAndTraitsPreserved req.memory memAfter
-  | .panicked memAfter => callFrameAndTraitsPreserved req.memory memAfter
-  | .aborted => True
-
-@[reducible]
-def waiveCallWP : StateEffectWP PUnit (CallE MirCallReq (fun _ => MirCallAns)) where
-  wp
-    | .call req, Q, s => ∀ ans : MirCallAns, callAnsPreserved req ans → Q ans s
-  mono {i P Q s} h_imp h_wp :=
-    match i with
-    | .call req => fun ans h_pres => h_imp ans s (h_wp ans h_pres)
-
-instance : StateEffectWP.Conjunctive waiveCallWP where
-  conj {i P Q s} hp hq :=
-    match i with
-    | .call req => fun ans h_pres => ⟨hp ans h_pres, hq ans h_pres⟩
-
-instance : StateEffectWP.ExcludedMiracle waiveCallWP where
-  no_miracle {i} _ _ :=
-    sorry
-
 /--
 Default impure-call predicate transformer for `MirEffect`: faults evaluate to
 `False`, `MirObs` emissions step cleanly, and unresolved `MirCallE` requests
@@ -190,7 +162,7 @@ cleanly, and unresolved `MirCallE` requests quantify demonically over all
 abbrev mirUbWaivedWP : EffectWP MirEffect :=
   (waiveUbFailWP PUnit).sum
     ((obsIgnoreWP PUnit MirObs).sum
-      waiveCallWP)
+      (unconstrainedCallWP PUnit MirCallReq (fun _ => MirCallAns)))
 
 /-- Convert a `MirCallContract` (`Trusted.VerificationResult`) into an `EffectWP.CallContract`. -/
 def _root_.Trusted.VerificationResult.MirCallContract.toCallContract
@@ -539,8 +511,19 @@ private theorem dwlp_ubWaived_reaches
     {Q : MirOutcome → PUnit → Prop}
     (h_reach : Reaches t tr u)
     (h_dwlp : DWLP mirUbWaivedWP t Q PUnit.unit) :
-    DWLP mirUbWaivedWP u Q PUnit.unit :=
-  sorry
+    DWLP mirUbWaivedWP u Q PUnit.unit := by
+  induction h_reach with
+  | refl => exact h_dwlp
+  | tau ht _ ih =>
+    rw [DWLP.unfold_eq, ht] at h_dwlp; exact ih h_dwlp
+  | @vis _ _ i k _ hv _ o _ ih =>
+    rw [DWLP.unfold_eq, hv] at h_dwlp
+    cases i with
+    | inl f => cases f; nomatch o
+    | inr rest =>
+      cases rest with
+      | inl obs => cases obs; cases o; exact ih h_dwlp
+      | inr call => cases call; exact ih (h_dwlp o)
 
 /--
 Adequacy of `DWLP mirUbWaivedWP` on normal/returning paths: even when `.fail .ub`
@@ -551,8 +534,11 @@ holds on every return `out`.
 theorem dwlp_ubWaived_reachesRet
     {t : ITree MirEffect MirOutcome} {post : MirOutcome → Prop}
     (h_dwlp : DWLP mirUbWaivedWP t (fun out _ => post out) PUnit.unit) :
-    ∀ tr out, ReachesRet t tr out → post out :=
-  sorry
+    ∀ tr out, ReachesRet t tr out → post out := by
+  intro tr out ⟨u, h_reach, h_ret⟩
+  have hu := dwlp_ubWaived_reaches h_reach h_dwlp
+  rw [DWLP.unfold_eq, h_ret] at hu
+  exact hu
 
 /--
 Prove a scoped `UbExceptionVerificationResult c` constructively (with zero
@@ -981,6 +967,9 @@ Stronger call-frame preservation predicate that preserves both
 `callFramePreserved` (`callees`, `callStack`, `activeCallee`,
 `activeProtectors`, and `fnPtrs` suffix) and `traitImpls`.
 -/
+@[reducible, simp]
+def callFrameAndTraitsPreserved (before after : Memory) : Prop :=
+  And (callFramePreserved before after) (after.traitImpls = before.traitImpls)
 
 theorem callFramePreserved_restoreCallerMemoryFrame
     (before after : Memory)
