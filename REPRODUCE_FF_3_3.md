@@ -59,32 +59,34 @@ This builds the frame-lifting rules (`LiftFrame`, `LiftStmtMem` /
   on the uninstantiated generic `liftPolyWrapperTransmuteMir` returns `none`
   because `Wrapper<T>` has a 0-byte placeholder layout prior to
   `LayoutTable.instantiateForBody`.
-- `liftPolyLayoutCaller_wpConverges`: comprehensive 22-step lifted derivation
+- `liftPolyLayoutCaller_wpConverges`: comprehensive 23-step lifted derivation
   exercising projected function-pointer reification
   (`LiftStmtMem.reifyFnPointerPlace`), `CastKind.fnPtrToPtr`
-  (`LiftStmtMem.fnPtrToPtr`), indirect calls through projected operands
-  (`LiftTerminator.callIndirect`), safe-to-unsafe function-pointer coercion
-  (`LiftStmtMem.unsafeFnPointer`), indirect tail calls
-  (`LiftTerminator.tailCallIndirect`), projected drops
+  (`LiftStmtMem.fnPtrToPtr`), byte-level `CastKind.transmute` provenance
+  round-tripping of `*const ()` back to `fn(u32) -> u32`, indirect calls
+  through projected operands (`LiftTerminator.callIndirect`), safe-to-unsafe
+  function-pointer coercion (`LiftStmtMem.unsafeFnPointer`), indirect tail
+  calls (`LiftTerminator.tailCallIndirect`), projected drops
   (`LiftTerminator.dropProjected`), local function-item calls
   (`LiftTerminator.callFnItem`), and polymorphic compound layout recomputation
   (`LayoutTable.instantiateForBody`) on `Wrapper<T>` during
   `CastKind.transmute`.
 - `liftClosureAndTraitCaller_wpConverges`: exercises non-capturing closure
   coercion (`PointerCoercion("ClosureFnPointer")` on
-  `RigidTy.closure "ff33::closure_id" []`) and generic trait-method function
+  `RigidTy.closure "ff33::closure_id" []`), generic trait-method function
   pointer reification and indirect dispatch (`TraitImplEntry` mapping
   `"ff33::ApplyTrait::apply"` to `"ff33::lift_poly_id"` in `checkCalleeSig`
-  and `lookupCallee`).
+  and `lookupCallee`), and inline `core::intrinsics::exact_div::<u32>` calls
+  (`LiftTerminator.callExactDiv`).
 - `liftIndirectCaller_verified`, `liftPolyLayoutCaller_verified`, and
   `liftClosureAndTraitCaller_verified`: the trusted `VerificationResult`
   certificates for those claims.
-- `liftBadDivergingReturn_not_converges` and
-  `liftDivergingPanic_not_converges`: why `LiftTerminator` has no rule for
-  diverging calls (`target = none`). A diverging callee that returns is
-  undefined behavior, and one that unwinds into a cleanup block ends in a root
-  panic, because rustc's MIR validator forbids cleanup blocks from returning
-  (`liftDivergingPanicCallerMir`'s cleanup block ends in `UnwindResume`).
+- `liftBadDivergingReturn_not_converges`, `liftDivergingPanic_not_converges`,
+  `liftBadNullFnPtrTransmute_not_converges`, `liftBadExactDiv_not_converges`,
+  and `liftBadCleanupReturnMir`: negative UB and well-formedness benchmarks
+  covering diverging calls that return or unwind into cleanup blocks,
+  transmuting `0_usize` to a function pointer, non-exact `exact_div`, and
+  attempting to lift a cleanup block (`blk.isCleanup = true`).
 
 ## 4. Build the `#mir_lift` elaborator and its benchmarks
 

@@ -143,21 +143,20 @@ macro_rules
       first
       | (apply Anneal.MirLiftCore.LiftFrame.stmt (by rfl)
             (by first | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl)
+            (by rfl)
          first
          | apply Anneal.MirLiftCore.LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
-         | apply Anneal.MirLiftCore.LiftStmtMem.reifyFnPointer (by rfl) (by rfl)
-             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
-             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftStmtMem.reifyFnPointerPlace (by rfl)
              (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
              (by rfl) (by rfl) (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftStmtMem.unsafeFnPointer (by rfl)
-             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+             (by rfl) (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftStmtMem.fnPtrToPtr (by rfl) (by rfl)
-             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+             (by rfl)
          dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add])
       | (apply Anneal.MirLiftCore.LiftFrame.term (by rfl)
             (by first | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl)
+            (by rfl)
          first
          | apply Anneal.MirLiftCore.LiftTerminator.goto
          | apply Anneal.MirLiftCore.LiftTerminator.switchInt (by rfl)
@@ -175,6 +174,8 @@ macro_rules
              (by rfl) (by rfl) (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.callIndirect (by rfl) (by rfl)
              (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+         | apply Anneal.MirLiftCore.LiftTerminator.callExactDiv (by rfl) (by rfl)
+             (by rfl) (by rfl) (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.tailCallDirect (by rfl)
              (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.tailCallFnItem (by rfl)
@@ -483,12 +484,13 @@ def dropLoopBody : CapturedMir := makeDropLoopBody "dropLoop"
 -- `liftIndirectCallerMir` reifies `lift_poly_id::<u32>` into a function
 -- pointer and calls it indirectly; `liftDirectCallerMir` calls the same generic
 -- callee through its function-item constant; `liftPolyLayoutCallerMir`
--- exercises projected `ReifyFnPointer`, `UnsafeFnPointer`, `FnPtrToPtr`,
--- indirect `tailCall`, local fn-item calls, projected `drop`, and polymorphic
--- compound layout recomputation (`LayoutTable.instantiateForBody`) on
--- `Wrapper<T>`; `liftClosureAndTraitCallerMir` calls a `ClosureFnPointer`
--- coercion and a reified trait method resolved through `TraitImplEntry` (see
--- `Anneal.MirLiftBench`).
+-- exercises projected `ReifyFnPointer`, `UnsafeFnPointer`, `FnPtrToPtr`
+-- followed by a byte-level `Transmute` provenance round-trip, indirect
+-- `tailCall`, local fn-item calls, projected `drop`, and polymorphic compound
+-- layout recomputation (`LayoutTable.instantiateForBody`) on `Wrapper<T>`;
+-- `liftClosureAndTraitCallerMir` calls a `ClosureFnPointer` coercion, a reified
+-- trait method resolved through `TraitImplEntry`, and the inline
+-- `core::intrinsics::exact_div` intrinsic (see `Anneal.MirLiftBench`).
 #mir_lift (callees := [liftPolyIdMir]) liftIndirectCallerMir
 #mir_lift (callees := [liftPolyIdMir]) liftDirectCallerMir
 #mir_lift (callees := liftPolyLayoutCallees) liftPolyLayoutCallerMir
@@ -610,6 +612,35 @@ example : True := by
         (initMachineStateWithCallees liftDivergingPanicCallerMir []
           [liftAssertPanicMir]).memory
         (fun _ => True) 7 := by lift_frame)
+  trivial
+
+-- Transmuting a null pointer (`0_usize`) to `fn(u32) -> u32`
+-- (`liftBadNullFnPtrTransmute_not_converges`), calling
+-- `core::intrinsics::exact_div` with a non-zero remainder
+-- (`liftBadExactDiv_not_converges`), and returning from a cleanup basic block
+-- (`isCleanup = true`) all fail to lift.
+example : True := by
+  fail_if_success
+    (have : LiftFrame liftBadNullFnPtrTransmuteMir 0 0
+        (initPureEnv liftBadNullFnPtrTransmuteMir [])
+        (initMachineStateWithCallees liftBadNullFnPtrTransmuteMir [] []).memory
+        (fun _ => True) 4 := by lift_frame)
+  trivial
+
+example : True := by
+  fail_if_success
+    (have : LiftFrame liftBadExactDivMir 0 0
+        (initPureEnv liftBadExactDivMir [])
+        (initMachineStateWithCallees liftBadExactDivMir [] []).memory
+        (fun _ => True) 4 := by lift_frame)
+  trivial
+
+example : True := by
+  fail_if_success
+    (have : LiftFrame liftBadCleanupReturnMir 0 0
+        (initPureEnv liftBadCleanupReturnMir [])
+        (initMachineStateWithCallees liftBadCleanupReturnMir [] []).memory
+        (fun _ => True) 4 := by lift_frame)
   trivial
 
 -- The tactic reproduces the explicit audited proof in `Anneal.MirLiftBench`.

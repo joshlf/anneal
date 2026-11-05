@@ -546,50 +546,18 @@ inductive LiftStmtMem (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       post env' mem →
       LiftStmtMem cur bbIdx stmtIdx env mem post stmt
   /--
-  Function-pointer reification `dst = op as fn(..) (PointerCoercion(ck))`.
+  Function-pointer reification `dst = op as fn(..) (PointerCoercion(ck))` into
+  an unprojected or non-deref projected local place `dst` (e.g., `_1` or a
+  tuple/struct field `_1.0`).
 
   The premises are the success path of the trusted `evalReifyFnPointer`: `op`
-  is a zero-sized function item whose type names `(defPath, typeArgs)`, the
-  target type is a non-intrinsic `fn` pointer whose safety the coercion admits,
-  the linked callee (if any) has a matching signature (`checkCalleeSig`, which
-  instantiates a generic callee with `typeArgs`), and `internFnPtr` returns the
-  synthetic `allocId`. The remaining premises are the trusted assignment to an
-  unprojected live local with no active protectors.
-  -/
-  | reifyFnPointer {dst : Place} {coercionKind : String} {op : Operand}
-      {targetTy : Ty} {span : String} {fnItem : Value} {env₁ env₂ : PureEnv}
-      {fnInputs : List RigidTy} {fnOutput : RigidTy} {fnSafety : Safety}
-      {fnAbi : CallConv} {defPath : DefPath} {typeArgs : List RigidTy}
-      {allocId : AllocId} {mem₁ : Memory} {slot : LocalSlot} :
-      isReifyFnPointerCoercion coercionKind = true →
-      stringEq coercionKind "UnsafeFnPointer" = false →
-      evalOperand env op mem.borrows mem.globals cur.layouts mem.callerLocals =
-        .ok fnItem env₁ →
-      isZstFnItemValue fnItem = true →
-      targetTy.kind = .fnPtr fnInputs fnOutput fnSafety fnAbi →
-      callConvEq fnAbi .rustIntrinsic = false →
-      reifyCoercionSafetyCompatible coercionKind fnSafety = true →
-      extractReifyCoercionTarget? coercionKind
-          (operandTy cur.localDecls cur.layouts op) =
-        some (defPath, typeArgs) →
-      checkCalleeSig mem.callees defPath fnInputs fnOutput fnAbi typeArgs
-          mem.traitImpls = true →
-      internFnPtr mem defPath typeArgs (some targetTy.kind) = (allocId, mem₁) →
-      dst.projection = [] →
-      get? env₁ dst.local_ = some slot →
-      slotLive slot = true →
-      set? env₁ dst.local_ (.init (.ptr { allocId := allocId, offsetBytes := 0 } 8)) =
-        some env₂ →
-      mem₁.activeProtectors = [] →
-      post env₂
-        { mem₁ with borrows := invalidateConflictingBorrows mem₁.borrows dst.local_ .none } →
-      LiftStmtMem cur bbIdx stmtIdx env mem post
-        { kind := .assign dst (.cast (.pointerCoercion coercionKind) op targetTy),
-          span := span }
-  /--
-  Function-pointer reification `dst = op as fn(..) (PointerCoercion(ck))` into
-  an unprojected or non-deref projected local place `dst` (e.g., a tuple or
-  struct field `_1.0`).
+  is a zero-sized function item or non-capturing closure whose type names
+  `(defPath, typeArgs)`, the target type is a non-intrinsic `fn` pointer whose
+  safety the coercion admits, the linked callee (if any) has a matching
+  signature (`checkCalleeSig`, which resolves trait methods through
+  `mem.traitImpls` and instantiates generic callees with `typeArgs`), and
+  `internFnPtr` returns the synthetic `allocId`. The remaining premises are the
+  protector-free local assignment `assignLocalPlace`.
   -/
   | reifyFnPointerPlace {dst : Place} {coercionKind : String} {op : Operand}
       {targetTy : Ty} {span : String} {fnItem : Value} {env₁ env₂ : PureEnv}
@@ -621,19 +589,13 @@ inductive LiftStmtMem (cur : CapturedMir) (bbIdx : BasicBlockIdx)
   /--
   Safe-to-unsafe function-pointer coercion
   `dst = op as unsafe fn(..) (PointerCoercion("UnsafeFnPointer"))`, preserving
-  the pointer's `ProvenancePtr` after validating its signature in
-  `Memory.fnPtrs`.
+  the pointer's `ProvenancePtr` after `evalUnsafeFnPointer` validates its
+  signature in `Memory.fnPtrs`.
   -/
   | unsafeFnPointer {dst : Place} {coercionKind : String} {op : Operand}
       {targetTy : Ty} {span : String} {ptrVal : ProvenancePtr}
-      {env₁ env₂ : PureEnv} {fnEntry : FnPtrEntry}
-      {borrows' : List BorrowEntry} :
+      {env₁ env₂ : PureEnv} {borrows' : List BorrowEntry} :
       coercionKind = "UnsafeFnPointer" →
-      evalOperand env op mem.borrows mem.globals cur.layouts mem.callerLocals =
-        .ok (.ptr ptrVal 8) env₁ →
-      ptrVal.offsetBytes = 0 →
-      lookupBorrow mem.borrows ptrVal.tag = none →
-      lookupFnPtr mem.fnPtrs ptrVal.allocId = some fnEntry →
       evalUnsafeFnPointer env op targetTy mem cur.localDecls cur.layouts =
         .ok (.ptr ptrVal 8) env₁ mem →
       assignLocalPlace env₁ mem.borrows dst (.ptr ptrVal 8) =
@@ -645,17 +607,12 @@ inductive LiftStmtMem (cur : CapturedMir) (bbIdx : BasicBlockIdx)
           span := span }
   /--
   Function-pointer to thin raw-pointer cast `dst = op as *const T (FnPtrToPtr)`,
-  preserving `ptrVal : ProvenancePtr` after validating its entry in
-  `Memory.fnPtrs`.
+  preserving `ptrVal : ProvenancePtr` after `evalFnPtrToPtr` validates its
+  entry in `Memory.fnPtrs`.
   -/
   | fnPtrToPtr {dst : Place} {op : Operand} {targetTy : Ty} {span : String}
-      {ptrVal : ProvenancePtr} {env₁ env₂ : PureEnv} {fnEntry : FnPtrEntry}
+      {ptrVal : ProvenancePtr} {env₁ env₂ : PureEnv}
       {borrows' : List BorrowEntry} :
-      evalOperand env op mem.borrows mem.globals cur.layouts mem.callerLocals =
-        .ok (.ptr ptrVal 8) env₁ →
-      ptrVal.offsetBytes = 0 →
-      lookupBorrow mem.borrows ptrVal.tag = none →
-      lookupFnPtr mem.fnPtrs ptrVal.allocId = some fnEntry →
       evalFnPtrToPtr env op targetTy mem cur.localDecls cur.layouts =
         .ok (.ptr ptrVal 8) env₁ mem →
       assignLocalPlace env₁ mem.borrows dst (.ptr ptrVal 8) =
@@ -664,6 +621,81 @@ inductive LiftStmtMem (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       post env₂ { mem with borrows := borrows' } →
       LiftStmtMem cur bbIdx stmtIdx env mem post
         { kind := .assign dst (.cast .fnPtrToPtr op targetTy), span := span }
+
+/--
+Unprojected `assignLocalPlace` reduction when `dst.projection = []` and
+`dst.local_` holds a live slot in `env₁`.
+-/
+theorem assignLocalPlace_unprojected {env₁ env₂ : PureEnv}
+    {borrows : List BorrowEntry} {dst : Place} {slot : LocalSlot} {val : Value}
+    (h_proj : dst.projection = [])
+    (h_slot : get? env₁ dst.local_ = some slot)
+    (h_live : slotLive slot = true)
+    (h_set : set? env₁ dst.local_ (.init val) = some env₂) :
+    assignLocalPlace env₁ borrows dst val =
+      some (env₂, invalidateConflictingBorrows borrows dst.local_ .none) := by
+  rcases dst with ⟨dstLoc, dstProj⟩
+  dsimp only at h_proj h_slot h_set
+  subst h_proj
+  unfold assignLocalPlace
+  dsimp only []
+  rw [h_slot]
+  cases slot with
+  | dead => cases h_live
+  | uninit =>
+    dsimp only []
+    rw [h_set]
+  | init _ =>
+    dsimp only []
+    rw [h_set]
+
+/--
+Unprojected function-pointer reification `dst = op as fn(..)
+(PointerCoercion(ck))` (`dst.projection = []`), derived as a special case of
+`LiftStmtMem.reifyFnPointerPlace`.
+-/
+theorem LiftStmtMem.reifyFnPointer {cur : CapturedMir} {bbIdx : BasicBlockIdx}
+    {stmtIdx : Nat} {env : PureEnv} {mem : Memory}
+    {post : PureEnv → Memory → Prop} {dst : Place} {coercionKind : String}
+    {op : Operand} {targetTy : Ty} {span : String} {fnItem : Value}
+    {env₁ env₂ : PureEnv} {fnInputs : List RigidTy} {fnOutput : RigidTy}
+    {fnSafety : Safety} {fnAbi : CallConv} {defPath : DefPath}
+    {typeArgs : List RigidTy} {allocId : AllocId} {mem₁ : Memory}
+    {slot : LocalSlot}
+    (h_kind : isReifyFnPointerCoercion coercionKind = true)
+    (h_unsafe : stringEq coercionKind "UnsafeFnPointer" = false)
+    (h_op :
+      evalOperand env op mem.borrows mem.globals cur.layouts mem.callerLocals =
+        .ok fnItem env₁)
+    (h_zst : isZstFnItemValue fnItem = true)
+    (h_ty : targetTy.kind = .fnPtr fnInputs fnOutput fnSafety fnAbi)
+    (h_abi : callConvEq fnAbi .rustIntrinsic = false)
+    (h_safety : reifyCoercionSafetyCompatible coercionKind fnSafety = true)
+    (h_target :
+      extractReifyCoercionTarget? coercionKind
+          (operandTy cur.localDecls cur.layouts op) =
+        some (defPath, typeArgs))
+    (h_sig :
+      checkCalleeSig mem.callees defPath fnInputs fnOutput fnAbi typeArgs
+          mem.traitImpls = true)
+    (h_intern :
+      internFnPtr mem defPath typeArgs (some targetTy.kind) = (allocId, mem₁))
+    (h_proj : dst.projection = [])
+    (h_slot : get? env₁ dst.local_ = some slot)
+    (h_live : slotLive slot = true)
+    (h_set :
+      set? env₁ dst.local_ (.init (.ptr { allocId := allocId, offsetBytes := 0 } 8)) =
+        some env₂)
+    (h_prot : mem₁.activeProtectors = [])
+    (h_next :
+      post env₂
+        { mem₁ with borrows := invalidateConflictingBorrows mem₁.borrows dst.local_ .none }) :
+    LiftStmtMem cur bbIdx stmtIdx env mem post
+      { kind := .assign dst (.cast (.pointerCoercion coercionKind) op targetTy),
+        span := span } :=
+  .reifyFnPointerPlace h_kind h_unsafe h_op h_zst h_ty h_abi h_safety h_target
+    h_sig h_intern (assignLocalPlace_unprojected h_proj h_slot h_live h_set)
+    h_prot h_next
 
 /--
 Every pure `LiftStmt` derivation (`FF-3.1`) embeds into `LiftStmtMem` at any
@@ -717,13 +749,15 @@ Memory-carrying one-terminator judgment: executing `term` at the end of block
 `bbIdx` (statement index `stmtIdx`) of the active body `cur` from `(env, mem)`
 takes one step whose outcome satisfies `post`.
 
-The call and tail-call constructors cover inlined calls to linked callees:
-`callDirect`/`tailCallDirect` for function-item constants (including generic
-items and trait methods resolved through `lookupCallee`),
-`callFnItem`/`tailCallFnItem` for zero-sized function items (`RigidTy.fnDef`)
-stored in locals or projected places, and `callIndirect`/`tailCallIndirect` for
-calls through a reified function pointer or `ClosureFnPointer`-coerced
-non-capturing closure resolved via `Memory.fnPtrs`.
+The call and tail-call constructors cover inlined calls to linked callees and
+inline compiler intrinsics: `callDirect`/`tailCallDirect` for function-item
+constants (including generic items and trait methods resolved through
+`lookupCallee`), `callFnItem`/`tailCallFnItem` for zero-sized function items
+(`RigidTy.fnDef`) stored in locals or projected places,
+`callIndirect`/`tailCallIndirect` for calls through a reified function pointer
+or `ClosureFnPointer`-coerced non-capturing closure resolved via
+`Memory.fnPtrs`, and `callExactDiv` for direct calls to
+`core::intrinsics::exact_div` evaluated inline by `evalCallTerminator`.
 
 There are deliberately no rules for diverging calls (`target = none`), failed
 assertions, or `TerminatorKind.unwindResume`: in MIR that rustc emits, none of
@@ -731,8 +765,10 @@ them can reach the normal root return that `LiftFrame` certifies. A diverging
 callee faults if it returns (`SavedCallerFrame.isDiverging`). An unwind
 continues only through cleanup blocks, and rustc's MIR validator forbids
 cleanup blocks from returning or branching to non-cleanup blocks, so every
-unwind ends in `.panic` or `.abort`. `liftBadDivergingReturnMir` and
-`liftDivergingPanicCallerMir` in `Anneal.MirLiftBench` exercise both cases.
+unwind ends in `.panic` or `.abort`; `LiftFrame.stmt` and `LiftFrame.term`
+further enforce `blk.isCleanup = false` on every lifted step.
+`liftBadDivergingReturnMir` and `liftDivergingPanicCallerMir` in
+`Anneal.MirLiftBench` exercise both cases.
 -/
 inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
     (stmtIdx : Nat) (env : PureEnv) (mem : Memory) (post : FrameStep → Prop) :
@@ -872,6 +908,35 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
           calleeBody)) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .call func argOps destination (some targetBb) unwind, span := span }
+  /--
+  Inline `core::intrinsics::exact_div` call (`isDirectExactDivTarget`): when no
+  linked override exists in `mem.callees`, `evalCallTerminator` evaluates
+  `evalExactDiv` on the two scalar arguments and writes `.scalar retScalar` to
+  `destination` in the current frame.
+  -/
+  | callExactDiv {func lhsOp : Operand} {rhsOps : List Operand}
+      {destination : Place} {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+      {span : String} {resolvedTarget : ResolvedCallTarget}
+      {envAfterFunc env' updatedEnv : PureEnv} {lhs rhs retScalar : ScalarInt} :
+      resolveCallTarget
+          (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
+          func (length (lhsOp :: rhsOps)) cur.localDecls cur.layouts =
+        .ok resolvedTarget envAfterFunc →
+      evalOperands envAfterFunc (lhsOp :: rhsOps) mem.borrows mem.globals
+          cur.layouts mem.callerLocals =
+        .ok [.scalar lhs, .scalar rhs] env' →
+      lookupCallee mem.callees cur.layouts resolvedTarget.defPath
+          resolvedTarget.typeArgs mem.traitImpls = none →
+      isDirectExactDivTarget resolvedTarget = true →
+      evalExactDiv lhs rhs
+          (operandIsSigned cur.localDecls lhsOp cur.layouts) =
+        some retScalar →
+      writePlaceValue env' mem.borrows destination (.scalar retScalar) =
+        .ok updatedEnv →
+      post (.frame targetBb 0 updatedEnv mem) →
+      LiftTerminator cur bbIdx stmtIdx env mem post
+        { kind := .call func (lhsOp :: rhsOps) destination (some targetBb) unwind,
+          span := span }
   /--
   Inlined tail call (`TerminatorKind.tailCall`) of a function-item constant
   `func` naming `(defPath, typeArgs)`.
@@ -1166,39 +1231,6 @@ theorem LiftStmtMem.evalNodeWP_of {body cur : CapturedMir}
       (isPureStatement_of_evalPureStmt h_eval) h_borrows h_prot]
     rw [evalPureStmt_eq_step h_eval]
     exact h_next
-  | reifyFnPointer h_kind h_unsafe h_op h_zst h_ty h_abi h_safety h_target
-      h_sig h_intern h_proj h_slot h_live h_set h_prot h_next =>
-    rename_i dst coercionKind op targetTy span fnItem env₁ env₂ fnInputs fnOutput
-      fnSafety fnAbi defPath typeArgs allocId mem₁ slot
-    have h_rv :
-        evalRvalue env (.cast (.pointerCoercion coercionKind) op targetTy) mem
-            cur.localDecls cur.layouts =
-          .ok (.ptr { allocId := allocId, offsetBytes := 0 } 8) env₁ mem₁ :=
-      evalRvalue_reifyFnPointer h_kind h_unsafe h_op h_zst h_ty h_abi h_safety
-        h_target h_sig h_intern
-    rcases dst with ⟨dstLoc, dstProj⟩
-    dsimp only at h_proj h_slot h_set h_next
-    subst h_proj
-    show evalNodeWP _ _ (evalStmt _ _ _ _)
-    unfold evalStmt
-    dsimp only [PureState.toMachineState]
-    rw [h_rv]
-    dsimp only []
-    rw [h_slot]
-    cases slot with
-    | dead => cases h_live
-    | uninit =>
-      dsimp only []
-      rw [h_set]
-      dsimp only []
-      rw [h_prot] at h_next ⊢
-      exact h_next
-    | init _ =>
-      dsimp only []
-      rw [h_set]
-      dsimp only []
-      rw [h_prot] at h_next ⊢
-      exact h_next
   | reifyFnPointerPlace h_kind h_unsafe h_op h_zst h_ty h_abi h_safety h_target
       h_sig h_intern h_write h_prot h_next =>
     have h_rv :=
@@ -1206,8 +1238,8 @@ theorem LiftStmtMem.evalNodeWP_of {body cur : CapturedMir}
         h_target h_sig h_intern
     rw [evalStmt_assign_of_evalRvalue h_rv h_prot h_write]
     exact h_next
-  | unsafeFnPointer h_ck h_op h_off h_noBorrow h_fnPtr h_eval h_write h_prot h_next =>
-    rename_i dst coercionKind op targetTy span ptrVal env₁ env₂ fnEntry borrows'
+  | unsafeFnPointer h_ck h_eval h_write h_prot h_next =>
+    rename_i dst coercionKind op targetTy span ptrVal env₁ env₂ borrows'
     subst h_ck
     have h_rv :
         evalRvalue env (.cast (.pointerCoercion "UnsafeFnPointer") op targetTy) mem
@@ -1218,8 +1250,8 @@ theorem LiftStmtMem.evalNodeWP_of {body cur : CapturedMir}
       exact h_eval
     rw [evalStmt_assign_of_evalRvalue h_rv h_prot h_write]
     exact h_next
-  | fnPtrToPtr h_op h_off h_noBorrow h_fnPtr h_eval h_write h_prot h_next =>
-    rename_i dst op targetTy span ptrVal env₁ env₂ fnEntry borrows'
+  | fnPtrToPtr h_eval h_write h_prot h_next =>
+    rename_i dst op targetTy span ptrVal env₁ env₂ borrows'
     have h_rv :
         evalRvalue env (.cast .fnPtrToPtr op targetTy) mem cur.localDecls cur.layouts =
           .ok (.ptr ptrVal 8) env₁ mem :=
@@ -1228,8 +1260,9 @@ theorem LiftStmtMem.evalNodeWP_of {body cur : CapturedMir}
     exact h_next
 
 /--
-Statement step on an activation frame: a `LiftStmtMem` step of the active body
-`cur` refines `wpMirExecSym` by one unit of fuel.
+Statement step on an activation frame: a `LiftStmtMem` step in a non-cleanup
+basic block (`blk.isCleanup = false`) of the active body `cur` refines
+`wpMirExecSym` by one unit of fuel.
 -/
 theorem LiftFrame.stmt {body cur : CapturedMir} {bbIdx : BasicBlockIdx}
     {stmtIdx : Nat} {env : PureEnv} {mem : Memory} {blk : BasicBlockData}
@@ -1237,6 +1270,7 @@ theorem LiftFrame.stmt {body cur : CapturedMir} {bbIdx : BasicBlockIdx}
     (h_cur : mem.activeCallee.getD body = cur)
     (h_phase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
     (h_bb : get? cur.basicBlocks bbIdx = some blk)
+    (h_cleanup : blk.isCleanup = false)
     (h_get : get? blk.statements stmtIdx = some stmt)
     (h_lift : LiftStmtMem cur bbIdx stmtIdx env mem
       (fun env' mem' => LiftFrame body bbIdx (stmtIdx + 1) env' mem' post fuel) stmt) :
@@ -1430,6 +1464,21 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
         calleeBody h_res h_args h_ctx h_target
     rw [← evalTerminatorSymTree_eval, h_tree]
     exact h_next
+  | callExactDiv h_res h_args h_lookup h_exact h_div h_write h_next =>
+    unfold evalTerminator evalCallTerminator
+    dsimp only [bodyLocalDeclsOf]
+    rw [h_res]
+    dsimp only [PureState.toMachineState]
+    rw [h_args]
+    dsimp only []
+    rw [h_lookup]
+    dsimp only []
+    rw [h_exact]
+    dsimp only []
+    rw [h_div]
+    dsimp only []
+    rw [h_write]
+    exact h_next
   | tailCallDirect h_callee h_args h_ctx h_next =>
     rename_i func argOps span defPath typeArgs argVals env' calleeBody
     have h_res :=
@@ -1475,8 +1524,9 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
     exact h_next
 
 /--
-Terminator step on an activation frame: a `LiftTerminator` step of the active
-body `cur` refines `wpMirExecSym` by one unit of fuel.
+Terminator step on an activation frame: a `LiftTerminator` step in a
+non-cleanup basic block (`blk.isCleanup = false`) of the active body `cur`
+refines `wpMirExecSym` by one unit of fuel.
 -/
 theorem LiftFrame.term {body cur : CapturedMir} {bbIdx : BasicBlockIdx}
     {stmtIdx : Nat} {env : PureEnv} {mem : Memory} {blk : BasicBlockData}
@@ -1484,6 +1534,7 @@ theorem LiftFrame.term {body cur : CapturedMir} {bbIdx : BasicBlockIdx}
     (h_cur : mem.activeCallee.getD body = cur)
     (h_phase : cur.phase = .runtimePostCleanup ∨ cur.phase = .runtimeOptimized)
     (h_bb : get? cur.basicBlocks bbIdx = some blk)
+    (h_cleanup : blk.isCleanup = false)
     (h_end : stmtIdx = length blk.statements)
     (h_lift : LiftTerminator cur bbIdx stmtIdx env mem
       (FrameStep.Continues body post fuel) blk.terminator) :

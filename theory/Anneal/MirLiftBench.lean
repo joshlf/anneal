@@ -188,30 +188,30 @@ theorem liftIndirectCaller_lift :
       (initMachineStateWithCallees liftIndirectCallerMir [] [liftPolyIdMir]).memory
       (fun v => v = .scalar ⟨7, 4⟩) 7 := by
   -- bb0[0]: `StorageLive(_1)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   -- bb0[1]: `_1 = lift_poly_id::<u32> as fn(u32) -> u32 (ReifyFnPointer)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.reifyFnPointer (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl)
   -- bb0 terminator: `_0 = move _1(const 7_u32) -> bb1`, through `fnPtrs`.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.callIndirect (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues]
   -- Callee (`lift_poly_id` instantiated at `T = u32`) bb0[0]: `_0 = move _1`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   -- Callee bb0 terminator: `return` into the caller's `_0`, resuming at bb1.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues]
   -- bb1[0]: `StorageDead(_1)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   -- bb1 terminator: root `return` of `_0 = 7_u32`.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.return_ (by rfl) (by rfl)
   rfl
 
@@ -231,18 +231,18 @@ theorem liftDirectCaller_lift :
       (initMachineStateWithCallees liftDirectCallerMir [] [liftPolyIdMir]).memory
       (fun v => v = .scalar ⟨7, 4⟩) 5 := by
   -- bb0 terminator: `_0 = lift_poly_id::<u32>(const 7_u32) -> bb1`.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.callDirect (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues]
   -- Callee bb0[0]: `_0 = move _1`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   -- Callee bb0 terminator: `return` into the caller's `_0`.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues]
   -- bb1 terminator: root `return`.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.return_ (by rfl) (by rfl)
   rfl
 
@@ -412,12 +412,15 @@ def liftWrapperTransmuteFnDefTy : Ty :=
 1. Projected function-pointer reification (`LiftStmtMem.reifyFnPointerPlace`)
    into `_1.0 : fn(u32) -> u32` for `lift_poly_tail_apply::<u32>`.
 2. Function-pointer to raw-pointer cast (`LiftStmtMem.fnPtrToPtr`) into
-   `_1.1 : *const ()`.
-3. Indirect call through projected operand `copy _1.0(const 7_u32)`
-   (`LiftTerminator.callIndirect`) into `lift_poly_tail_apply::<u32>`, which in
-   turn exercises polymorphic `ReifyFnPointer`, `UnsafeFnPointer`
-   (`LiftStmtMem.unsafeFnPointer`), and indirect `TerminatorKind.tailCall`
-   (`LiftTerminator.tailCallIndirect`) to `lift_poly_id::<u32>`.
+   `_1.1 : *const ()`, followed by a byte-level `CastKind.transmute`
+   round-trip of `_1.1 : *const ()` back into `_1.0 : fn(u32) -> u32`
+   (preserving `ProvenancePtr` across `AbstractByte` encoding/decoding).
+3. Indirect call through the round-tripped projected operand
+   `copy _1.0(const 7_u32)` (`LiftTerminator.callIndirect`) into
+   `lift_poly_tail_apply::<u32>`, which in turn exercises polymorphic
+   `ReifyFnPointer`, `UnsafeFnPointer` (`LiftStmtMem.unsafeFnPointer`), and
+   indirect `TerminatorKind.tailCall` (`LiftTerminator.tailCallIndirect`) to
+   `lift_poly_id::<u32>`.
 4. Projected drop (`LiftTerminator.dropProjected`) of `_1.0`.
 5. Local function-item call (`LiftTerminator.callFnItem`) through
    `_3 : FnDef("ff33::lift_poly_wrapper_transmute", [u32])`, which exercises
@@ -451,7 +454,13 @@ def liftPolyLayoutCallerMir : CapturedMir :=
                 (.cast .fnPtrToPtr
                   (.copy { local_ := 1, projection := [.field 0 liftU32FnPtrTy] })
                   liftRawUnitPtrTy)
-              span := "cast _1.0 as *const ()" } ]
+              span := "cast _1.0 as *const ()" }
+          , { kind := .assign
+                { local_ := 1, projection := [.field 0 liftU32FnPtrTy] }
+                (.cast .transmute
+                  (.copy { local_ := 1, projection := [.field 1 liftRawUnitPtrTy] })
+                  liftU32FnPtrTy)
+              span := "transmute _1.1 back to fn(u32) -> u32" } ]
         terminator :=
           { kind := .call
               (.copy { local_ := 1, projection := [.field 0 liftU32FnPtrTy] })
@@ -488,109 +497,111 @@ def liftPolyLayoutCallees : List CapturedMir :=
 
 /--
 Explicit audited frame-lifting derivation for `liftPolyLayoutCallerMir` across
-all 22 steps.
+all 23 steps.
 -/
 theorem liftPolyLayoutCaller_lift :
     LiftFrame liftPolyLayoutCallerMir 0 0 (initPureEnv liftPolyLayoutCallerMir [])
       (initMachineStateWithCallees liftPolyLayoutCallerMir [] liftPolyLayoutCallees).memory
-      (fun v => v = .scalar ⟨7, 4⟩) 22 := by
+      (fun v => v = .scalar ⟨7, 4⟩) 23 := by
   -- bb0[0]: `StorageLive(_1)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- bb0[1]: `StorageLive(_2)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- bb0[2]: initialize tuple `_1`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- bb0[3]: reify `lift_poly_tail_apply::<u32>` into projected field `_1.0`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.reifyFnPointerPlace (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
   -- bb0[4]: cast `_1.0` to `*const ()` in `_1.1` via `CastKind.fnPtrToPtr`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
-  apply LiftStmtMem.fnPtrToPtr (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
-    (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftStmtMem.fnPtrToPtr (by rfl) (by rfl) (by rfl)
+  -- bb0[5]: transmute `_1.1 : *const ()` back into `_1.0 : fn(u32) -> u32`.
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
+  dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- bb0 terminator: indirect call `_2 = copy _1.0(const 7_u32) -> bb1`.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.callIndirect (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, callFrameMem, Option.getD]
   -- `lift_poly_tail_apply::<u32>` bb0[0]: `StorageLive(_2)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- `lift_poly_tail_apply::<u32>` bb0[1]: `StorageLive(_3)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- `lift_poly_tail_apply::<u32>` bb0[2]: reify `lift_poly_id::<u32>` into
   -- `_2`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.reifyFnPointer (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl)
   -- `lift_poly_tail_apply::<u32>` bb0[3]: coerce `_2` to
   -- `unsafe fn(u32) -> u32`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
-  apply LiftStmtMem.unsafeFnPointer (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
-    (by rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftStmtMem.unsafeFnPointer (by rfl) (by rfl) (by rfl) (by rfl)
   -- `lift_poly_tail_apply::<u32>` bb0 terminator: indirect `tailCall` to
   -- `lift_poly_id::<u32>`.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.tailCallIndirect (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, tailCallFrameMem, Option.getD]
   -- `lift_poly_id::<u32>` bb0[0]: `_0 = move _1`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- `lift_poly_id::<u32>` bb0 terminator: return `7_u32` to
   -- `poly_layout_caller` at bb1.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
   -- bb1 terminator: projected drop of `_1.0 -> bb2`.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.dropProjected (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues]
   -- bb2[0]: `StorageLive(_3)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- bb2[1]: `_3 = const FnDef("ff33::lift_poly_wrapper_transmute", [u32])`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- bb2 terminator: local function-item call `_0 = move _3(move _2) -> bb3`.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.callFnItem (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl)
   dsimp only [FrameStep.Continues, callFrameMem, Option.getD]
   -- `lift_poly_wrapper_transmute::<u32>` bb0[0]: `StorageLive(_2)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- `lift_poly_wrapper_transmute::<u32>` bb0[1]:
   -- `_2 = Wrapper::<u32>(move _1)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- `lift_poly_wrapper_transmute::<u32>` bb0[2]:
   -- `_0 = move _2 as u32 (Transmute)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- `lift_poly_wrapper_transmute::<u32>` bb0 terminator: return `7_u32` into
   -- `_0` at bb3.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
   -- bb3 terminator: root return of `7_u32`.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.return_ (by rfl) (by rfl)
   rfl
 
@@ -803,7 +814,85 @@ theorem liftDivergingPanic_not_converges (Q : Value → Memory → Prop) :
   rintro ⟨fuel, h⟩
   rcases fuel with _ | _ | _ | _ | _ | fuel <;> exact h
 
-/-! ### Non-capturing `ClosureFnPointer` and `TraitImplEntry` dispatch -/
+/-- `usize` at layout index `0`. -/
+def liftUsizeTy : Ty := { kind := .uint .usize, layoutIdx := 0 }
+
+/--
+Transmuting a null integer (`0_usize`) to `fn(u32) -> u32`: in Rust a function
+pointer is non-null, so `decodeValueFromBytes` rejects `sv.bits = 0` without
+provenance as immediate undefined behavior.
+-/
+def liftBadNullFnPtrTransmuteMir : CapturedMir :=
+  mkMirBody "ff33::bad_null_fn_ptr_transmute" 0
+    [ { mutability := .mut, ty := liftU32FnPtrTy, debugName := some "_0" } ]
+    [ { statements :=
+          [ { kind := .assign { local_ := 0, projection := [] }
+                (.cast .transmute
+                  (.constant { ty := liftUsizeTy, val := .scalar (.int ⟨0, 8⟩) })
+                  liftU32FnPtrTy)
+              span := "transmute 0_usize as fn(u32) -> u32" } ]
+        terminator := { kind := .return_, span := "ret" }
+        isCleanup := false } ]
+
+/-- Transmuting `0_usize` to `fn(u32) -> u32` faults at its first step. -/
+theorem liftBadNullFnPtrTransmute_not_converges (post : MirOutcome → Prop) :
+    ¬ MirWpConverges liftBadNullFnPtrTransmuteMir
+      (initMachineStateWithCallees liftBadNullFnPtrTransmuteMir [] []) post := by
+  rintro ⟨fuel, h⟩
+  rcases fuel with _ | fuel <;> exact h
+
+/--
+Function-item type `FnDef("core::intrinsics::exact_div", [u32])` for the inline
+`exact_div` intrinsic.
+-/
+def liftExactDivU32FnDefTy : Ty :=
+  { kind := .fnDef "core::intrinsics::exact_div" [.uint .u32], layoutIdx := 0 }
+
+/--
+Calling `core::intrinsics::exact_div::<u32>(7_u32, 2_u32)` with a non-zero
+remainder (`7 % 2 != 0`): `evalExactDiv` returns `none`, so `evalCallTerminator`
+faults with `.ub`.
+-/
+def liftBadExactDivMir : CapturedMir :=
+  mkMirBody "ff33::bad_exact_div" 0
+    [ { mutability := .mut, ty := liftU32Ty, debugName := some "_0" } ]
+    [ { statements := []
+        terminator :=
+          { kind := .call
+              (.constant { ty := liftExactDivU32FnDefTy, val := .zeroSized })
+              [ .constant { ty := liftU32Ty, val := .scalar (.int ⟨7, 4⟩) }
+              , .constant { ty := liftU32Ty, val := .scalar (.int ⟨2, 4⟩) } ]
+              { local_ := 0, projection := [] } (some 1) .continue_
+            span := "exact_div(7, 2)" }
+        isCleanup := false }
+    , { statements := []
+        terminator := { kind := .return_, span := "ret" }
+        isCleanup := false } ]
+
+/-- Non-exact `core::intrinsics::exact_div` faults at its first step. -/
+theorem liftBadExactDiv_not_converges (post : MirOutcome → Prop) :
+    ¬ MirWpConverges liftBadExactDivMir
+      (initMachineStateWithCallees liftBadExactDivMir [] []) post := by
+  rintro ⟨fuel, h⟩
+  rcases fuel with _ | fuel <;> exact h
+
+/--
+Ill-formed MIR body whose entry block is marked `isCleanup := true` and
+executes `Return`. Even though `stepMirFn` does not inspect `blk.isCleanup`,
+`LiftFrame.stmt` and `LiftFrame.term` require `blk.isCleanup = false`, so this
+body cannot be lifted.
+-/
+def liftBadCleanupReturnMir : CapturedMir :=
+  mkMirBody "ff33::bad_cleanup_return" 0
+    [ { mutability := .mut, ty := liftU32Ty, debugName := some "_0" } ]
+    [ { statements :=
+          [ { kind := .assign { local_ := 0, projection := [] }
+                (.use (.constant { ty := liftU32Ty, val := .scalar (.int ⟨7, 4⟩) }))
+              span := "assign in cleanup" } ]
+        terminator := { kind := .return_, span := "return from cleanup" }
+        isCleanup := true } ]
+
+/-! ### Non-capturing `ClosureFnPointer`, `TraitImplEntry`, and `exact_div` -/
 
 /-- Non-capturing closure type `RigidTy.closure "ff33::closure_id" []`. -/
 def liftClosureIdTy : Ty :=
@@ -843,19 +932,23 @@ def liftClosureIdMir : CapturedMir :=
    to `_2 : fn(u32) -> u32`, resolving `"ff33::ApplyTrait::apply"` through
    `mem.traitImpls` (`liftApplyTraitImpl`) to `lift_poly_id::<u32>` during both
    `checkCalleeSig` and `lookupCallee`.
-3. Calls both function pointers indirectly: `_3 = move _1(7)` and
-   `_0 = move _2(_3)`.
+3. Calls both function pointers indirectly (`_3 = move _1(14)` and
+   `_4 = move _2(_3)`), then divides `_4` by `2` via the inline compiler
+   intrinsic `core::intrinsics::exact_div::<u32>`
+   (`LiftTerminator.callExactDiv`) to return `7_u32`.
 -/
 def liftClosureAndTraitCallerMir : CapturedMir := {
   mkMirBody "ff33::closure_and_trait_caller" 0
     [ { mutability := .mut, ty := liftU32Ty, debugName := some "_0" }
     , { mutability := .mut, ty := liftU32FnPtrTy, debugName := some "f_clos" }
     , { mutability := .mut, ty := liftU32FnPtrTy, debugName := some "f_trait" }
-    , { mutability := .mut, ty := liftU32Ty, debugName := some "tmp" } ]
+    , { mutability := .mut, ty := liftU32Ty, debugName := some "tmp1" }
+    , { mutability := .mut, ty := liftU32Ty, debugName := some "tmp2" } ]
     [ { statements :=
           [ { kind := .storageLive 1, span := "live f_clos" }
           , { kind := .storageLive 2, span := "live f_trait" }
-          , { kind := .storageLive 3, span := "live tmp" }
+          , { kind := .storageLive 3, span := "live tmp1" }
+          , { kind := .storageLive 4, span := "live tmp2" }
           , { kind := .assign { local_ := 1, projection := [] }
                 (.cast (.pointerCoercion "ClosureFnPointer")
                   (.constant { ty := liftClosureIdTy, val := .zeroSized })
@@ -868,7 +961,7 @@ def liftClosureAndTraitCallerMir : CapturedMir := {
               span := "reify trait method" } ]
         terminator :=
           { kind := .call (.move { local_ := 1, projection := [] })
-              [.constant { ty := liftU32Ty, val := .scalar (.int ⟨7, 4⟩) }]
+              [.constant { ty := liftU32Ty, val := .scalar (.int ⟨14, 4⟩) }]
               { local_ := 3, projection := [] } (some 1) .continue_
             span := "call closure fn ptr" }
         isCleanup := false }
@@ -876,8 +969,17 @@ def liftClosureAndTraitCallerMir : CapturedMir := {
         terminator :=
           { kind := .call (.move { local_ := 2, projection := [] })
               [.move { local_ := 3, projection := [] }]
-              { local_ := 0, projection := [] } (some 2) .continue_
+              { local_ := 4, projection := [] } (some 2) .continue_
             span := "call trait fn ptr" }
+        isCleanup := false }
+    , { statements := []
+        terminator :=
+          { kind := .call
+              (.constant { ty := liftExactDivU32FnDefTy, val := .zeroSized })
+              [ .move { local_ := 4, projection := [] }
+              , .constant { ty := liftU32Ty, val := .scalar (.int ⟨2, 4⟩) } ]
+              { local_ := 0, projection := [] } (some 3) .continue_
+            span := "call exact_div(_4, 2)" }
         isCleanup := false }
     , { statements := []
         terminator := { kind := .return_, span := "ret" }
@@ -891,65 +993,74 @@ def liftClosureAndTraitCallees : List CapturedMir :=
 
 /--
 Frame-lifted execution of `closure_and_trait_caller` across
-`ClosureFnPointer` reification and `TraitImplEntry` polymorphic trait-method
-dispatch.
+`ClosureFnPointer` reification, `TraitImplEntry` polymorphic trait-method
+dispatch, and inline `core::intrinsics::exact_div`.
 -/
 theorem liftClosureAndTraitCaller_lift :
     LiftFrame liftClosureAndTraitCallerMir 0 0
       (initPureEnv liftClosureAndTraitCallerMir [])
       (initMachineStateWithCallees liftClosureAndTraitCallerMir []
         liftClosureAndTraitCallees).memory
-      (fun v => v = .scalar ⟨7, 4⟩) 12 := by
+      (fun v => v = .scalar ⟨7, 4⟩) 14 := by
   -- bb0[0]: `StorageLive(_1)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- bb0[1]: `StorageLive(_2)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
   -- bb0[2]: `StorageLive(_3)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
-  -- bb0[3]: `_1 = closure_id as fn(u32) -> u32 (ClosureFnPointer)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  -- bb0[3]: `StorageLive(_4)`.
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
+  dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
+  -- bb0[4]: `_1 = closure_id as fn(u32) -> u32 (ClosureFnPointer)`.
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.reifyFnPointer (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl)
-  -- bb0[4]: `_2 = ApplyTrait::apply::<u32> as fn(u32) -> u32 (ReifyFnPointer)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  -- bb0[5]: `_2 = ApplyTrait::apply::<u32> as fn(u32) -> u32 (ReifyFnPointer)`.
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.reifyFnPointer (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl)
-  -- bb0 terminator: `_3 = move _1(const 7_u32) -> bb1`.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  -- bb0 terminator: `_3 = move _1(const 14_u32) -> bb1`.
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.callIndirect (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, callFrameMem, Option.getD]
   -- `closure_id` bb0[0]: `_0 = move _1`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
-  -- `closure_id` bb0 terminator: return `7_u32` into `_3` at bb1.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  -- `closure_id` bb0 terminator: return `14_u32` into `_3` at bb1.
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
-  -- bb1 terminator: `_0 = move _2(move _3) -> bb2` (trait method via `fnPtrs`).
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  -- bb1 terminator: `_4 = move _2(move _3) -> bb2` (trait method via `fnPtrs`).
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.callIndirect (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, callFrameMem, Option.getD]
   -- `lift_poly_id::<u32>` bb0[0]: `_0 = move _1`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
   dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
-  -- `lift_poly_id::<u32>` bb0 terminator: return `7_u32` into `_0` at bb2.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  -- `lift_poly_id::<u32>` bb0 terminator: return `14_u32` into `_4` at bb2.
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
-  -- bb2 terminator: root return of `7_u32`.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+  -- bb2 terminator: `_0 = exact_div::<u32>(move _4, const 2_u32) -> bb3`.
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.callExactDiv (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+    (by rfl)
+  dsimp only [FrameStep.Continues, List.set]
+  -- bb3 terminator: root return of `7_u32`.
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.return_ (by rfl) (by rfl)
   rfl
 
