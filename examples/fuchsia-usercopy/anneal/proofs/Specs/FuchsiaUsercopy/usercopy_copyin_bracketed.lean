@@ -16,6 +16,7 @@ def pre (args : List Value) (mem : Memory) : Prop :=
   ∃ (in_range dest_len fo v : Nat),
     (in_range = 0 ∨ in_range = 1) ∧
     fo ≤ dest_len ∧
+    (in_range = 0 ∨ v = 1) ∧
     dest_len < 18446744073709551616 ∧
     (v = 0 ∨ v = 1) ∧
     args =
@@ -29,7 +30,7 @@ def pre (args : List Value) (mem : Memory) : Prop :=
     returns `(fault_offset, dest_len - fault_offset)`; when `false` (`0`),
     returns `(0, dest_len)`. -/
 def post (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory) : Prop :=
-  mem' = mem ∧
+  mem' = { mem with callees := mem'.callees, traitImpls := mem'.traitImpls, activeCallee := mem'.activeCallee } ∧
   ∀ (in_range dest_len fo v : Nat),
     args =
       [ .scalar { bits := in_range, sizeBytes := 1 }

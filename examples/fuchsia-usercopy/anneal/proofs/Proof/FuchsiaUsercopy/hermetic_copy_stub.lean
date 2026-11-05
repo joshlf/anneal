@@ -34,15 +34,15 @@ theorem body_localDecls_eq : Mir.FuchsiaUsercopy.hermetic_copy_stub.body.localDe
      ty := { kind := Trusted.Rustc.V2026_06_01.MirAst.RigidTy.never, layoutIdx := 2 }, debugName := none }] := rfl
 
 @[simp]
-theorem initLocals_hermetic_copy_stub (count fo : Nat) :
+theorem initLocals_hermetic_copy_stub (count fo v : Nat) :
   initLocals Mir.FuchsiaUsercopy.hermetic_copy_stub.body
     [Value.scalar { bits := count, sizeBytes := 8 },
      Value.scalar { bits := fo, sizeBytes := 8 },
-     Value.scalar { bits := 0, sizeBytes := 1 }] =
+     Value.scalar { bits := v, sizeBytes := 1 }] =
   [LocalSlot.uninit,
    LocalSlot.init (Value.scalar { bits := count, sizeBytes := 8 }),
    LocalSlot.init (Value.scalar { bits := fo, sizeBytes := 8 }),
-   LocalSlot.init (Value.scalar { bits := 0, sizeBytes := 1 }),
+   LocalSlot.init (Value.scalar { bits := v, sizeBytes := 1 }),
    LocalSlot.dead] := rfl
 
 @[simp]
@@ -91,65 +91,10 @@ theorem verified : UbExceptionVerificationResult Obligations.FuchsiaUsercopy.her
     (repeat' ((conv => whnf); split))
     all_goals (conv => whnf)
     all_goals (try dsimp [Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaimFor, Obligations.FuchsiaUsercopy.hermetic_copy_stub.sigPost, ItemSpec.post, Trusted.VerificationResult.invalidateConflictingBorrows, Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaim, emptyMemory] at *)
-    all_goals (dsimp at *; try simp_all; try omega)
+    all_goals (try dsimp at *; try simp_all; try omega)
     all_goals (
       try exact True.intro
-      try {
-        refine ⟨rfl, ?_⟩
-      intro c' fo' v' h_args
-      injection h_args with h1 ht1
-      injection ht1 with h2 _
-      injection h1 with hs1
-      injection h2 with hs2
-      cases hs1; cases hs2
-      exact ⟨rfl, h_fo⟩
-      }
-    )
-  · intro args mem h_pre
-    rcases h_pre with ⟨count, fo, v, h_fo, h_c, h_v, rfl, rfl⟩
-    rcases h_v with rfl | rfl
-    · -- v = 0 (UB path, calls unreachable_unchecked)
-      dsimp [claim_callees_eq, claim_body_eq, initMachineStateWithMemoryAndCallees_eq] at *
-      (repeat' ((conv => whnf); split))
-      all_goals (conv => whnf)
-      all_goals (dsimp at *; try simp_all; try omega)
-      intro ans
-      cases ans
-      · rename_i val memAfter
-        intro h_call
-        (repeat' ((conv => whnf); split))
-        all_goals (conv => whnf)
-        all_goals (dsimp [callAnsPreserved, callFrameAndTraitsPreserved, callFramePreserved] at *)
-        all_goals (try obtain ⟨⟨h_callees, h_callStack, h_activeCallee, h_activeProtectors, ⟨fresh, h_fnPtrs⟩⟩, h_traitImpls⟩ := h_call)
-        all_goals (try simp_all [stepMirSymTree, evalStmtSymTree, evalTerminatorSymTree])
-        all_goals (try dsimp [Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaimFor, Obligations.FuchsiaUsercopy.hermetic_copy_stub.sigPost, ItemSpec.post, Trusted.VerificationResult.invalidateConflictingBorrows, Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaim, emptyMemory] at *)
-      all_goals (dsimp [claim_body_eq, claim_callees_eq, advanceStmt_eq, initMachineStateWithMemoryAndCallees_eq, initMachineStateWithMemory_eq, initLocals_hermetic_copy_stub, pushDivergingCalleeFrame_eq, stepMirExecSymTree, resumeExternalCall, writePlaceValue, wpMirExecUbWaivedSym, evalSymNodeTreeUbWaived, isWaivedUbFailReq, evalNodeUbWaivedWP, initMachineStateWithMemoryAndCallees, resumeExternalDivergingCall, ActiveCalleeCtx.init, ActiveCalleeCtx.initMem, Option.getD, Trusted.Sequence.get?, Trusted.Sequence.set?, List.set, List.append, Nat.add, Nat.succ, Nat.zero] at *)
-        all_goals (try simp_all; try omega)
-      · rename_i memAfter
-        intro h_call
-        (repeat' ((conv => whnf); split))
-        all_goals (conv => whnf)
-        all_goals (dsimp [callAnsPreserved, callFrameAndTraitsPreserved, callFramePreserved] at *)
-        all_goals (try obtain ⟨⟨h_callees, h_callStack, h_activeCallee, h_activeProtectors, ⟨fresh, h_fnPtrs⟩⟩, h_traitImpls⟩ := h_call)
-        all_goals (try simp_all [stepMirSymTree, evalStmtSymTree, evalTerminatorSymTree])
-        all_goals (try dsimp [Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaimFor, Obligations.FuchsiaUsercopy.hermetic_copy_stub.sigPost, ItemSpec.post, Trusted.VerificationResult.invalidateConflictingBorrows, Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaim, emptyMemory] at *)
-      all_goals (dsimp [claim_body_eq, claim_callees_eq, advanceStmt_eq, initMachineStateWithMemoryAndCallees_eq, initMachineStateWithMemory_eq, initLocals_hermetic_copy_stub, pushDivergingCalleeFrame_eq, stepMirExecSymTree, resumeExternalCall, writePlaceValue, wpMirExecUbWaivedSym, evalSymNodeTreeUbWaived, isWaivedUbFailReq, evalNodeUbWaivedWP, initMachineStateWithMemoryAndCallees, resumeExternalDivergingCall, ActiveCalleeCtx.init, ActiveCalleeCtx.initMem, Option.getD, Trusted.Sequence.get?, Trusted.Sequence.set?, List.set, List.append, Nat.add, Nat.succ, Nat.zero] at *)
-        all_goals (try simp_all; try omega)
-      · intro h_call
-        (repeat' ((conv => whnf); split))
-        all_goals (conv => whnf)
-        all_goals (dsimp [callAnsPreserved, callFrameAndTraitsPreserved, callFramePreserved] at *)
-        all_goals (try simp_all [stepMirSymTree, evalStmtSymTree, evalTerminatorSymTree])
-        all_goals (try dsimp [Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaimFor, Obligations.FuchsiaUsercopy.hermetic_copy_stub.sigPost, ItemSpec.post, Trusted.VerificationResult.invalidateConflictingBorrows, Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaim, emptyMemory] at *)
-      all_goals (dsimp [claim_body_eq, claim_callees_eq, advanceStmt_eq, initMachineStateWithMemoryAndCallees_eq, initMachineStateWithMemory_eq, initLocals_hermetic_copy_stub, pushDivergingCalleeFrame_eq, stepMirExecSymTree, resumeExternalCall, writePlaceValue, wpMirExecUbWaivedSym, evalSymNodeTreeUbWaived, isWaivedUbFailReq, evalNodeUbWaivedWP, initMachineStateWithMemoryAndCallees, resumeExternalDivergingCall, ActiveCalleeCtx.init, ActiveCalleeCtx.initMem, Option.getD, Trusted.Sequence.get?, Trusted.Sequence.set?, List.set, List.append, Nat.add, Nat.succ, Nat.zero] at *)
-        all_goals (try simp_all; try omega)
-    · -- v = 1 (normal path, no external calls)
-      dsimp [claim_callees_eq, claim_body_eq, initMachineStateWithMemoryAndCallees_eq] at *
-      (repeat' ((conv => whnf); split))
-      all_goals (conv => whnf)
-      all_goals (try dsimp [Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaimFor, Obligations.FuchsiaUsercopy.hermetic_copy_stub.sigPost, ItemSpec.post, Trusted.VerificationResult.invalidateConflictingBorrows, Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaim, emptyMemory] at *)
-      all_goals (dsimp [claim_body_eq, claim_callees_eq, advanceStmt_eq, initMachineStateWithMemoryAndCallees_eq, initMachineStateWithMemory_eq, initLocals_hermetic_copy_stub, pushDivergingCalleeFrame_eq, stepMirExecSymTree, resumeExternalCall, writePlaceValue, wpMirExecUbWaivedSym, evalSymNodeTreeUbWaived, isWaivedUbFailReq, evalNodeUbWaivedWP, initMachineStateWithMemoryAndCallees, resumeExternalDivergingCall, ActiveCalleeCtx.init, ActiveCalleeCtx.initMem, Option.getD, Trusted.Sequence.get?, Trusted.Sequence.set?, List.set, List.append, Nat.add, Nat.succ, Nat.zero] at *; try simp_all; try omega)
-      all_goals (
+      try (
         refine ⟨rfl, ?_⟩
         intro c' fo' v' h_args
         injection h_args with h1 ht1
@@ -158,6 +103,103 @@ theorem verified : UbExceptionVerificationResult Obligations.FuchsiaUsercopy.her
         injection h2 with hs2
         cases hs1; cases hs2
         exact ⟨rfl, h_fo⟩
+      )
+    )
+  · intro args mem h_pre
+    rcases h_pre with ⟨count, fo, v, h_fo, h_c, h_v, rfl, rfl⟩
+    rcases h_v with rfl | rfl
+    · -- v = 0 (UB path, calls unreachable_unchecked)
+      dsimp [claim_callees_eq, claim_body_eq, initMachineStateWithMemoryAndCallees_eq] at *
+      (repeat' ((conv => whnf); split))
+      all_goals (conv => whnf)
+      all_goals (try dsimp at *; try simp_all; try omega)
+      intro ans
+      cases ans
+      · rename_i val memAfter
+        intro h_call
+        (repeat' ((conv => whnf); split))
+        all_goals (conv => whnf)
+        all_goals (try dsimp [callAnsPreserved, callFrameAndTraitsPreserved, callFramePreserved] at *)
+        all_goals (
+            rcases h_call with ⟨⟨h_callees, h_callStack, h_activeCallee, h_activeProtectors, fresh, h_fnPtrs⟩, h_traitImpls⟩
+            cases memAfter
+            dsimp at h_activeCallee
+            subst h_activeCallee
+        )
+        all_goals (try dsimp [Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaimFor, Obligations.FuchsiaUsercopy.hermetic_copy_stub.sigPost, ItemSpec.post, Trusted.VerificationResult.invalidateConflictingBorrows, Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaim, emptyMemory] at *)
+        all_goals (try (rename_i h_eqs; rcases h_eqs with ⟨h_callees, h_activeCallee, h_borrows, h_traits⟩; try rw [h_activeCallee, h_borrows, h_callees, h_traits] at *))
+        all_goals (try simp_all [checkCallFrameAndTraitsPreserved, resumeExternalCall])
+        all_goals (try unfold wpMirUbWaivedSym)
+        all_goals (try unfold wpMirExecUbWaivedSym)
+        all_goals (try dsimp [claim_body_eq, claim_callees_eq, advanceStmt_eq, initMachineStateWithMemoryAndCallees_eq, initMachineStateWithMemory_eq, initLocals_hermetic_copy_stub, pushDivergingCalleeFrame_eq, stepMirExecSymTree, resumeExternalCall, writePlaceValue, evalSymNodeTreeUbWaived, isWaivedUbFailReq, evalNodeUbWaivedWP, initMachineStateWithMemoryAndCallees, resumeExternalDivergingCall, ActiveCalleeCtx.init, ActiveCalleeCtx.initMem, Option.getD, Trusted.Sequence.get?, Trusted.Sequence.set?, List.set, List.append, Nat.add, Nat.succ, Nat.zero, stepMirSymTree, evalStmtSymTree, evalTerminatorSymTree] at *)
+        (repeat' ((conv => whnf); split))
+        all_goals (try (rename_i h_eqs; rcases h_eqs with ⟨h_callees, h_activeCallee, h_borrows, h_traits⟩; try rw [h_activeCallee, h_borrows, h_callees, h_traits] at *))
+        all_goals (try simp_all)
+        all_goals (
+          try exact True.intro
+          try (intro _ _ h_absurd; contradiction)
+        )
+      · rename_i memAfter
+        intro h_call
+        (repeat' ((conv => whnf); split))
+        all_goals (conv => whnf)
+        all_goals (try dsimp [callAnsPreserved, callFrameAndTraitsPreserved, callFramePreserved] at *)
+        all_goals (
+            rcases h_call with ⟨⟨h_callees, h_callStack, h_activeCallee, h_activeProtectors, fresh, h_fnPtrs⟩, h_traitImpls⟩
+            cases memAfter
+            dsimp at h_activeCallee
+            subst h_activeCallee
+        )
+        all_goals (try dsimp [Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaimFor, Obligations.FuchsiaUsercopy.hermetic_copy_stub.sigPost, ItemSpec.post, Trusted.VerificationResult.invalidateConflictingBorrows, Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaim, emptyMemory] at *)
+        all_goals (try (rename_i h_eqs; rcases h_eqs with ⟨h_callees, h_activeCallee, h_borrows, h_traits⟩; try rw [h_activeCallee, h_borrows, h_callees, h_traits] at *))
+        all_goals (try simp_all [checkCallFrameAndTraitsPreserved, resumeExternalCall])
+        all_goals (try unfold wpMirUbWaivedSym)
+        all_goals (try unfold wpMirExecUbWaivedSym)
+        all_goals (try dsimp [claim_body_eq, claim_callees_eq, advanceStmt_eq, initMachineStateWithMemoryAndCallees_eq, initMachineStateWithMemory_eq, initLocals_hermetic_copy_stub, pushDivergingCalleeFrame_eq, stepMirExecSymTree, resumeExternalCall, writePlaceValue, evalSymNodeTreeUbWaived, isWaivedUbFailReq, evalNodeUbWaivedWP, initMachineStateWithMemoryAndCallees, resumeExternalDivergingCall, ActiveCalleeCtx.init, ActiveCalleeCtx.initMem, Option.getD, Trusted.Sequence.get?, Trusted.Sequence.set?, List.set, List.append, Nat.add, Nat.succ, Nat.zero, stepMirSymTree, evalStmtSymTree, evalTerminatorSymTree] at *)
+        (repeat' ((conv => whnf); split))
+        all_goals (try (rename_i h_eqs; rcases h_eqs with ⟨h_callees, h_activeCallee, h_borrows, h_traits⟩; try rw [h_activeCallee, h_borrows, h_callees, h_traits] at *))
+        all_goals (try simp_all)
+        all_goals (
+          try exact True.intro
+          try (intro _ _ h_absurd; contradiction)
+        )
+      · intro h_call
+        (repeat' ((conv => whnf); split))
+        all_goals (conv => whnf)
+        all_goals (try dsimp [callAnsPreserved, callFrameAndTraitsPreserved, callFramePreserved] at *)
+        all_goals (try dsimp [Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaimFor, Obligations.FuchsiaUsercopy.hermetic_copy_stub.sigPost, ItemSpec.post, Trusted.VerificationResult.invalidateConflictingBorrows, Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaim, emptyMemory] at *)
+        all_goals (try (rename_i h_eqs; rcases h_eqs with ⟨h_callees, h_activeCallee, h_borrows, h_traits⟩; try rw [h_activeCallee, h_borrows, h_callees, h_traits] at *))
+        all_goals (try simp_all [checkCallFrameAndTraitsPreserved, resumeExternalCall])
+        all_goals (try unfold wpMirUbWaivedSym)
+        all_goals (try unfold wpMirExecUbWaivedSym)
+        all_goals (try dsimp [claim_body_eq, claim_callees_eq, advanceStmt_eq, initMachineStateWithMemoryAndCallees_eq, initMachineStateWithMemory_eq, initLocals_hermetic_copy_stub, pushDivergingCalleeFrame_eq, stepMirExecSymTree, resumeExternalCall, writePlaceValue, evalSymNodeTreeUbWaived, isWaivedUbFailReq, evalNodeUbWaivedWP, initMachineStateWithMemoryAndCallees, resumeExternalDivergingCall, ActiveCalleeCtx.init, ActiveCalleeCtx.initMem, Option.getD, Trusted.Sequence.get?, Trusted.Sequence.set?, List.set, List.append, Nat.add, Nat.succ, Nat.zero, stepMirSymTree, evalStmtSymTree, evalTerminatorSymTree] at *)
+        (repeat' ((conv => whnf); split))
+        all_goals (try (rename_i h_eqs; rcases h_eqs with ⟨h_callees, h_activeCallee, h_borrows, h_traits⟩; try rw [h_activeCallee, h_borrows, h_callees, h_traits] at *))
+        all_goals (try simp_all)
+        all_goals (
+          try exact True.intro
+          try (intro _ _ h_absurd; contradiction)
+        )
+    · -- v = 1 (normal path, no external calls)
+      dsimp [claim_callees_eq, claim_body_eq, initMachineStateWithMemoryAndCallees_eq] at *
+      (repeat' ((conv => whnf); split))
+      all_goals (conv => whnf)
+      all_goals (try dsimp [Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaimFor, Obligations.FuchsiaUsercopy.hermetic_copy_stub.sigPost, ItemSpec.post, Trusted.VerificationResult.invalidateConflictingBorrows, Obligations.FuchsiaUsercopy.hermetic_copy_stub.ubExceptionClaim, emptyMemory] at *)
+      all_goals (try unfold wpMirUbWaivedSym wpMirExecUbWaivedSym)
+      
+      all_goals (try dsimp [claim_body_eq, claim_callees_eq, advanceStmt_eq, initMachineStateWithMemoryAndCallees_eq, initMachineStateWithMemory_eq, initLocals_hermetic_copy_stub, pushDivergingCalleeFrame_eq, stepMirExecSymTree, stepMirSymTree, evalStmtSymTree, evalTerminatorSymTree, resumeExternalCall, writePlaceValue, evalSymNodeTreeUbWaived, isWaivedUbFailReq, evalNodeUbWaivedWP, initMachineStateWithMemoryAndCallees, resumeExternalDivergingCall, ActiveCalleeCtx.init, ActiveCalleeCtx.initMem, Option.getD, Trusted.Sequence.get?, Trusted.Sequence.set?, List.set, List.append, Nat.add, Nat.succ, Nat.zero] at *; try simp_all; try omega)
+      all_goals (
+        try exact True.intro
+        try (
+          refine ⟨rfl, ?_⟩
+          intro c' fo' v' h_args
+          injection h_args with h1 ht1
+          injection ht1 with h2 _
+          injection h1 with hs1
+          injection h2 with hs2
+          cases hs1; cases hs2
+          exact ⟨rfl, h_fo⟩
+        )
       )
 
 end Proof.FuchsiaUsercopy.hermetic_copy_stub

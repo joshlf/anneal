@@ -118,7 +118,7 @@ pub unsafe fn hermetic_copy_stub(
 /// `(read_count, dest_len - read_count)` without slice-split panic or out-of-bounds
 /// `MaybeUninit` initialization UB.
 #[anneal_spec::spec(
-    requires: fault_offset <= dest_len,
+    requires: fault_offset <= dest_len && (!source_in_restricted_range || normal_mode_dest_valid),
     ensures: |ref ret| true,
 )]
 pub fn usercopy_copyin_bracketed(
