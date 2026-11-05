@@ -1518,6 +1518,7 @@ structure SymState : Type where
 def concretizeSymMemory (body : CapturedMir) (st : SymState) : Memory :=
   { nextAllocId := length body.allocations
     globals := body.allocations
+    traitImpls := body.traitImpls
     borrows := st.borrows
     nextTag := st.nextTag
     callees := .nil
@@ -2526,8 +2527,12 @@ theorem symFinishPinEq_branch_ok_sound
                  .step (advanceStmt (concretizeSymState body args st) locals₂ {
                    nextAllocId := length body.allocations
                    globals := body.allocations
+                   traitImpls := body.traitImpls
                    borrows := borrows₂
                    nextTag := st.nextTag
+                   callees := .nil
+                   callStack := .nil
+                   activeCallee := .none
                  })
                | .none => .fail .ub) := by
             rcases concretizeSymSlot_eq_of_not_dead args dstSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
@@ -3678,8 +3683,12 @@ theorem symExtractUpperBound1_sound
                                                         (concretizeSymSlots args slots2)
                                                         { nextAllocId := length body.allocations
                                                           globals := body.allocations
+                                                          traitImpls := body.traitImpls
                                                           borrows := st.borrows
-                                                          nextTag := st.nextTag }
+                                                          nextTag := st.nextTag
+                                                          callees := .nil
+                                                          callStack := .nil
+                                                          activeCallee := .none }
                                                         hOp hActSz0 hSzEq] at hHold
                                                       have ⟨_, hScEq, hBranch⟩ :=
                                                         symFinishPinEq_branch_ok_sound
@@ -4783,8 +4792,12 @@ theorem symFinishEnsTrue_ok_sound
                .step (advanceStmt (concretizeSymState body args st) locals₂ {
                  nextAllocId := length body.allocations
                  globals := body.allocations
+                 traitImpls := body.traitImpls
                  borrows := borrows₂
                  nextTag := st.nextTag
+                 callees := .nil
+                 callStack := .nil
+                 activeCallee := .none
                })
              | .none => .fail .ub) := by
           rw [set?_concretizeSymSlots_concrete args (.init (.scalar ⟨1, 1⟩)) slots₂ dstLoc, hSetT]
@@ -4982,8 +4995,12 @@ theorem symExtractEnsuresUpperBound1_sound
                                             (concretizeSymSlots args slots2)
                                             { nextAllocId := length body.allocations
                                               globals := body.allocations
+                                              traitImpls := body.traitImpls
                                               borrows := st.borrows
-                                              nextTag := st.nextTag }
+                                              nextTag := st.nextTag
+                                              callees := .nil
+                                              callStack := .nil
+                                              activeCallee := .none }
                                             hUbOp hSz0 hSzEq]
                                           rw [evalUnsignedUpperBoundCmp_eq_true_of_ble op r sc0.bits hOp hBle]
                                           exact hStepTrue

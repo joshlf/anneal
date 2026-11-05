@@ -171,6 +171,12 @@ inductive LiftStmt : CapturedMir → BasicBlockIdx → Nat → PureEnv → State
 def LiftBlock (body : CapturedMir) (bbIdx : BasicBlockIdx) (env : PureEnv) (post : Value → Prop) (fuel : Nat) : Prop :=
   wpPureMirExec fuel body { bb := bbIdx, stmtIdx := 0, env := env } post
 
+def LiftResidualBlock (body : CapturedMir) (bbIdx : BasicBlockIdx) (env : PureEnv) (post : Value → Prop) (fuel : Nat) : Prop :=
+  LiftBlock body bbIdx env post fuel
+
+theorem LiftResidualBlock.to_LiftBlock {body : CapturedMir} {bbIdx : BasicBlockIdx} {env : PureEnv} {post : Value → Prop} {fuel : Nat}
+  (h : ∀ env, LiftResidualBlock body bbIdx env post fuel) : LiftBlock body bbIdx env post fuel := h env
+
 def LiftStmtsTerminator (body : CapturedMir) (bbIdx : BasicBlockIdx) (stmtIdx : Nat) (env : PureEnv) (stmts : List Statement) (term : Terminator) (post : Value → Prop) (fuel : Nat) : Prop :=
   wpMirExecSym fuel body (.running (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } emptyMemory)) (mirNormalPost (fun retVal _ => post retVal))
 

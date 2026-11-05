@@ -17,6 +17,7 @@ macro_rules
 | `(tactic| lift_mir_step) => `(tactic|
     first
     | exact (by assumption)
+    | apply Anneal.MirLiftCore.LiftResidualBlock.to_LiftBlock; exact (by assumption)
     | apply LiftStmtsTerminator.term_goto (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl)
     | apply LiftStmtsTerminator.term_return (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl)
     | apply LiftStmtsTerminator.cons_eval (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl)
@@ -59,14 +60,14 @@ def elabMirLift : CommandElab := fun stx => do
           | TerminatorKind.call .. =>
             let hypName := mkIdent (Name.mkSimple s!"h_res_{i}")
             let bbIdxStx := Syntax.mkNumLit (toString i)
-            let hypType ← `(LiftBlock $targetName $bbIdxStx (initPureEnv $targetName []) (fun _ => True) 100)
+            let hypType ← `(∀ env, Anneal.MirLiftCore.LiftResidualBlock $targetName $bbIdxStx env (fun _ => True) 100)
             let b ← `(bracketedBinder| ($hypName : $hypType))
             residualHyps := residualHyps.push b
           | TerminatorKind.goto target =>
             if target ≤ i then
               let hypName := mkIdent (Name.mkSimple s!"h_res_{i}")
               let bbIdxStx := Syntax.mkNumLit (toString i)
-              let hypType ← `(LiftBlock $targetName $bbIdxStx (initPureEnv $targetName []) (fun _ => True) 100)
+              let hypType ← `(∀ env, Anneal.MirLiftCore.LiftResidualBlock $targetName $bbIdxStx env (fun _ => True) 100)
               let b ← `(bracketedBinder| ($hypName : $hypType))
               residualHyps := residualHyps.push b
           | _ => pure ()
