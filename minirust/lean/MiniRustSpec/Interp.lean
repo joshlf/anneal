@@ -38,7 +38,8 @@ here.
   `Stop.unsupported` instead of resolving the choice.
 * `Statement::Assign` and `Statement::PlaceMention`
   (`spec/lang/step/statements.md`).
-* `PlaceExpr::Local` and `PlaceExpr::Index` (`spec/lang/step/expressions.md`),
+* `PlaceExpr::Local`, `PlaceExpr::Field`, and `PlaceExpr::Index`
+  (`spec/lang/step/expressions.md`),
   together with `Machine::ptr_offset_inbounds` (`spec/lang/step/operators.md`)
   and `Memory::dereferenceable` / `Memory::signed_dereferenceable`
   (`spec/mem/basic.md`, `spec/mem/interface.md`, `spec/mem/concurrent.md`).
@@ -53,10 +54,11 @@ here.
 * `Terminator::Goto`, `Terminator::Switch`, `Terminator::Unreachable`, and
   `Terminator::Return` (`spec/lang/step/terminators.md`), including frame
   teardown, `storage_dead` of every local, and both stack-pop actions.
-* The representation relation for `Type::Int`, `Type::Bool`, and `Type::Array`
-  (`spec/lang/representation.md`), `Type::layout` for those types and
-  `LayoutStrategy::compute_size_and_align` for `Sized` layouts
-  (`spec/lang/types.md`, with `Machine::compute_size` from
+* The representation relation for `Type::Int`, `Type::Bool`, `Type::Tuple`, and
+  `Type::Array` (`spec/lang/representation.md`), `Type::layout` and
+  `TupleHeadLayout` for those types, `LayoutStrategy::is_sized`, and
+  `LayoutStrategy::compute_size_and_align` (`spec/lang/types.md`, with
+  `Machine::compute_size` and `Machine::compute_align` from
   `spec/lang/machine.md`), and `BasicMemory`'s `load`, `store`, `deallocate`,
   `dereferenceable`, `signed_dereferenceable`, and `check_ptr`
   (`spec/mem/basic.md`, `spec/mem/interface.md`), wrapped by
@@ -160,12 +162,30 @@ def Size.mulInt (s : Size) (n : Int) : Interp Size :=
   | some sz => pure sz
   | none => specPanic "Size * Int: negative byte count"
 
+/-- `Size + Size` (`Add<Size> for Size` in `libspecr`). -/
+def Size.add (a b : Size) : Size := ⟨a.bytes + b.bytes⟩
+
+/-- `Size::align_to(align)` in `libspecr`: round `s` up to the smallest multiple
+of `align` that is `≥ s`. -/
+def Size.align_to (s : Size) (align : Align) : Size :=
+  if align.bytes = 0 then s
+  else
+    let rem := s.bytes % align.bytes
+    if rem = 0 then s
+    else ⟨s.bytes + (align.bytes - rem)⟩
+
 /-- `Align::from_bytes(n)`: `Some` iff `n` is a power of two. -/
 def alignFromBytes (n : Nat) : Option Align :=
   if n ≠ 0 ∧ n &&& (n - 1) = 0 then some ⟨n⟩ else none
 
 /-- `Align::is_aligned(addr)`: `addr` is a multiple of the alignment. -/
 def Align.is_aligned (a : Align) (addr : Int) : Bool := addr % (a.bytes : Int) == 0
+
+/-- `Align::min(other)` in `libspecr`. -/
+def Align.min (a b : Align) : Align := ⟨Nat.min a.bytes b.bytes⟩
+
+/-- `Align::max(other)` in `libspecr`. -/
+def Align.max (a b : Align) : Align := ⟨Nat.max a.bytes b.bytes⟩
 
 /-- `Int::in_bounds(signed, size)`: whether `i` is representable as an integer
 of the given signedness and size (unsigned: `[0, 2^bits)`; signed:
@@ -347,6 +367,63 @@ def IntType.align (t : IntType) : Interp Align :=
   | some a => pure ⟨min a.bytes x86_64.INT_MAX_ALIGN.bytes⟩
   | none => specPanic "Align::from_bytes(size).unwrap()"
 
+/-- `TupleHeadLayout::capped_tail_align` (`spec/lang/types.md`):
+> "fn capped_tail_align(self, tail_align: Align) -> Align {
+>     match self.packed_align {
+>         Some(packed_align) => tail_align.min(packed_align),
+>         None => tail_align,
+>     }
+> }" -/
+def TupleHeadLayout.capped_tail_align (self : TupleHeadLayout) (tailAlign : Align) : Align :=
+  match self.packed_align with
+  | some packedAlign => Align.min tailAlign packedAlign
+  | none => tailAlign
+
+/-- `TupleHeadLayout::tail_offset` (`spec/lang/types.md`):
+> "pub fn tail_offset(self, tail_align: Align) -> Offset {
+>     let capped_tail_align = self.capped_tail_align(tail_align);
+>     let tail_offset = self.end.align_to(capped_tail_align);
+>     tail_offset
+> }" -/
+def TupleHeadLayout.tail_offset (self : TupleHeadLayout) (tailAlign : Align) : Offset :=
+  let cappedTailAlign := TupleHeadLayout.capped_tail_align self tailAlign
+  let tailOffset := Size.align_to self.«end» cappedTailAlign
+  tailOffset
+
+/-- `TupleHeadLayout::full_size_and_align` (`spec/lang/types.md`):
+> "pub fn full_size_and_align(self, tail_size: Size, tail_align: Align) -> (Size, Align) {
+>     let capped_tail_align = self.capped_tail_align(tail_align);
+>     let align = capped_tail_align.max(self.align);
+>     let tail_offset = self.tail_offset(tail_align);
+>     let end = tail_offset + tail_size;
+>     let size = end.align_to(align);
+>     (size, align)
+> }" -/
+def TupleHeadLayout.full_size_and_align (self : TupleHeadLayout) (tailSize : Size)
+    (tailAlign : Align) : Size × Align :=
+  let cappedTailAlign := TupleHeadLayout.capped_tail_align self tailAlign
+  let align := Align.max cappedTailAlign self.align
+  let tailOffset := TupleHeadLayout.tail_offset self tailAlign
+  let end_ := Size.add tailOffset tailSize
+  let size := Size.align_to end_ align
+  (size, align)
+
+/-- `TupleHeadLayout::head_size_and_align` (`spec/lang/types.md`):
+> "pub fn head_size_and_align(self) -> (Size, Align) {
+>     (self.end.align_to(self.align), self.align)
+> }" -/
+def TupleHeadLayout.head_size_and_align (self : TupleHeadLayout) : Size × Align :=
+  (Size.align_to self.«end» self.align, self.align)
+
+/-- `LayoutStrategy::is_sized` (`spec/lang/types.md`):
+> "pub fn is_sized(self) -> bool {
+>     matches!(self, LayoutStrategy::Sized(..))
+> }" -/
+def LayoutStrategy.is_sized (l : LayoutStrategy) : Bool :=
+  match l with
+  | .Sized _ _ => true
+  | _ => false
+
 /-- `LayoutStrategy::expect_size` (`spec/lang/types.md`):
 > "pub fn expect_size(self, msg: &str) -> Size {
 >     match self {
@@ -371,10 +448,9 @@ def LayoutStrategy.expect_align (l : LayoutStrategy) (msg : String) : Interp Ali
   | .Sized _ align => pure align
   | _ => specPanic s!"expect_align called on unsized type: {msg}"
 
-/-- `LayoutStrategy::compute_size_and_align` (`spec/lang/types.md`) for the
-interpreted `Sized` layouts. The unsized strategies (`Slice`, `TraitObject`,
-`Tuple`) are outside the fragment, and with only `Sized` layouts the `vtables`
-lookup is never consulted, so it is not modelled:
+/-- `LayoutStrategy::compute_size_and_align` (`spec/lang/types.md`) for
+`Sized`, `Slice`, and `Tuple` layouts (without `TraitObject`, so the `vtables`
+lookup is not consulted):
 > "pub fn compute_size_and_align<Provenance>(
 >     self,
 >     meta: Option<PointerMeta<Provenance>>,
@@ -382,16 +458,27 @@ lookup is never consulted, so it is not modelled:
 > ) -> (Size, Align) {
 >     match (self, meta) {
 >         (LayoutStrategy::Sized(size, align), None) => (size, align),
+>         (LayoutStrategy::Slice(elem_size, align), Some(PointerMeta::ElementCount(count))) => (count * elem_size, align),
 >         ..
+>         (LayoutStrategy::Tuple { head, tail }, Some(meta)) => {
+>             let (tail_size, tail_align) = tail.compute_size_and_align(Some(meta), vtables);
+>             head.full_size_and_align(tail_size, tail_align)
+>         }
 >         _ => panic!(\"pointer meta data does not match type\"),
 >     }
 > }" -/
-def LayoutStrategy.compute_size_and_align (l : LayoutStrategy)
-    (metadata : Option (PointerMeta Prov)) : Interp (Size × Align) :=
-  match l, metadata with
+def LayoutStrategy.compute_size_and_align :
+    LayoutStrategy → Option (PointerMeta Prov) → Interp (Size × Align)
   | .Sized size align, none => pure (size, align)
-  | .Sized _ _, some _ => specPanic "pointer meta data does not match type"
-  | _, _ => unsupported "LayoutStrategy::compute_size_and_align for an unsized layout"
+  | .Slice elemSize align, some (.ElementCount count) => do
+    let size ← Size.mulInt elemSize count
+    pure (size, align)
+  | .Tuple head tail, some m => do
+    let (tailSize, tailAlign) ← LayoutStrategy.compute_size_and_align tail (some m)
+    pure (TupleHeadLayout.full_size_and_align head tailSize tailAlign)
+  | .TraitObject _, some (.VTablePointer _) =>
+    unsupported "LayoutStrategy::compute_size_and_align for TraitObject"
+  | _, _ => specPanic "pointer meta data does not match type"
 
 /-- `Machine::compute_size` (`spec/lang/machine.md`), with the vtable lookup
 omitted as in `LayoutStrategy.compute_size_and_align`:
@@ -404,24 +491,61 @@ def computeSize (layout : LayoutStrategy) (metadata : Option (PointerMeta Prov))
   let (size, _) ← LayoutStrategy.compute_size_and_align layout metadata
   pure size
 
-/-- `Type::layout::<x86_64>` for the interpreted types:
+/-- `Machine::compute_align` (`spec/lang/machine.md`), with the vtable lookup
+omitted as in `LayoutStrategy.compute_size_and_align`:
+> "fn compute_align(&self, layout: LayoutStrategy, meta: Option<PointerMeta<M::Provenance>>) -> Align {
+>     let (_, align) = layout.compute_size_and_align(meta, self.vtable_lookup());
+>     align
+> }" -/
+def computeAlign (layout : LayoutStrategy) (metadata : Option (PointerMeta Prov)) :
+    Interp Align := do
+  let (_, align) ← LayoutStrategy.compute_size_and_align layout metadata
+  pure align
+
+/-- `Type::layout::<x86_64>` (`spec/lang/types.md`) for the interpreted types:
 > "Int(int_type) => Sized(int_type.size, int_type.align::<T>()),
 >  Bool => Sized(Size::from_bytes_const(1), Align::ONE),
 >  ..
+>  Tuple { sized_head_layout, unsized_field, .. } => match unsized_field {
+>      None => {
+>          let (size, align) = sized_head_layout.head_size_and_align();
+>          Sized(size, align)
+>      }
+>      Some(tail_ty) => LayoutStrategy::Tuple {
+>          head: sized_head_layout,
+>          tail: tail_ty.layout::<T>(),
+>      },
+>  },
 >  Array { elem, count } => Sized(
 >      elem.layout::<T>().expect_size(\"WF ensures array element is sized\") * count,
+>      elem.layout::<T>().expect_align(\"WF ensures array element is sized\"),
+>  ),
+>  Slice { elem } => LayoutStrategy::Slice(
+>      elem.layout::<T>().expect_size(\"WF ensures slice element is sized\"),
 >      elem.layout::<T>().expect_align(\"WF ensures array element is sized\"),
 >  )," -/
 def Type.layout : «Type» → Interp LayoutStrategy
   | .Int t => do pure (.Sized t.size (← IntType.align t))
   | .Bool => pure (.Sized ⟨1⟩ ⟨1⟩)
+  | .Tuple _ sizedHeadLayout unsizedField =>
+    match unsizedField with
+    | none =>
+      let (size, align) := TupleHeadLayout.head_size_and_align sizedHeadLayout
+      pure (.Sized size align)
+    | some tailTy => do
+      pure (.Tuple sizedHeadLayout (← Type.layout tailTy))
   | .Array elem count => do
     let elemLayout ← Type.layout elem
     let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures array element is sized"
     let elemAlign ← LayoutStrategy.expect_align elemLayout "WF ensures array element is sized"
     let size ← Size.mulInt elemSize count
     pure (.Sized size elemAlign)
-  | _ => unsupported "Type::layout for a non-Int, non-Bool, non-Array type"
+  | .Slice elem => do
+    let elemLayout ← Type.layout elem
+    let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures slice element is sized"
+    let elemAlign ← LayoutStrategy.expect_align elemLayout "WF ensures array element is sized"
+    pure (.Slice elemSize elemAlign)
+  | _ => unsupported "Type::layout for a non-Int, non-Bool, non-Tuple, non-Array, non-Slice type"
 
 /-! ## Representation relation (`spec/lang/representation.md`) -/
 
@@ -436,7 +560,9 @@ def AbstractByte.data : Byte → Option UInt8
   | .Uninit => none
   | .Init b _ => some b
 
-/-- `Type::decode` for `Bool`, `Int`, and `Array`:
+mutual
+
+/-- `Type::decode` for `Bool`, `Int`, `Tuple`, and `Array` (`spec/lang/representation.md`):
 > "fn decode<M: Memory>(Type::Bool: Self, bytes: ..) -> Option<Value<M>> {
 >     if bytes.len() != 1 { panic!(..); }
 >     ret(match bytes[0] {
@@ -451,6 +577,23 @@ def AbstractByte.data : Byte → Option UInt8
 >     // Fails if any byte is `Uninit`.
 >     let bytes_data: List<u8> = bytes.try_map(|b| b.data())?;
 >     ret(Value::Int(M::T::ENDIANNESS.decode(signed, bytes_data)))
+> }
+> ..
+> fn decode<M: Memory>(Type::Tuple { sized_fields, sized_head_layout, unsized_field }: Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> {
+>     assert!(unsized_field.is_none(), \"decode of Type::Tuple with unsized field\");
+>     let (size, _) = sized_head_layout.head_size_and_align();
+>     if bytes.len() != size.bytes() {
+>         panic!(\"decode of Type::Tuple with invalid length\");
+>     }
+>     ret(Value::Tuple(
+>         sized_fields.try_map(|(offset, ty)| {
+>             let subslice = bytes.subslice_with_length(
+>                 offset.bytes(),
+>                 ty.layout::<M::T>().expect_size(\"WF ensures all sized tuple fields are sized\").bytes()
+>             );
+>             ty.decode::<M>(subslice)
+>         })?
+>     ))
 > }
 > ..
 > fn decode<M: Memory>(Type::Array { elem, count }: Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> {
@@ -481,6 +624,16 @@ def Type.decode : «Type» → List Byte → Interp (Option Val)
       match bytes.mapM AbstractByte.data with
       | some data => pure (some (.Int (Endianness.decode x86_64.ENDIANNESS signed data)))
       | none => pure none
+  | .Tuple sizedFields sizedHeadLayout unsizedField, bytes =>
+    if unsizedField.isSome then
+      specPanic "decode of Type::Tuple with unsized field"
+    else
+      let (size, _) := TupleHeadLayout.head_size_and_align sizedHeadLayout
+      if bytes.length ≠ size.bytes then
+        specPanic "decode of Type::Tuple with invalid length"
+      else do
+        let decoded ← decodeTupleFields sizedFields bytes
+        pure (decoded.map Value.Tuple)
   | .Array elem count, bytes => do
     let elemLayout ← Type.layout elem
     let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures array element is sized"
@@ -492,9 +645,35 @@ def Type.decode : «Type» → List Byte → Interp (Option Val)
         subsliceWithLength bytes ((i : Int) * (elemSize.bytes : Int)) elemSize.bytes)
       let decoded ← tryMapM (fun elemBytes => Type.decode elem elemBytes) chunks
       pure (decoded.map Value.Tuple)
-  | _, _ => unsupported "Type::decode for a non-Int, non-Bool, non-Array type"
+  | _, _ => unsupported "Type::decode for a non-Int, non-Bool, non-Tuple, non-Array type"
 
-/-- `Type::encode` for `Bool`, `Int`, and `Array`:
+/-- Field-by-field `sized_fields.try_map` loop of `Type::decode` for `Type::Tuple`
+(`spec/lang/representation.md`):
+> "sized_fields.try_map(|(offset, ty)| {
+>     let subslice = bytes.subslice_with_length(
+>         offset.bytes(),
+>         ty.layout::<M::T>().expect_size(\"WF ensures all sized tuple fields are sized\").bytes()
+>     );
+>     ty.decode::<M>(subslice)
+> })" -/
+def decodeTupleFields : List (Offset × «Type») → List Byte → Interp (Option (List Val))
+  | [], _ => pure (some [])
+  | (offset, ty) :: rest, bytes => do
+    let layout ← Type.layout ty
+    let fieldSize ← LayoutStrategy.expect_size layout "WF ensures all sized tuple fields are sized"
+    let subslice ← subsliceWithLength bytes offset.bytes fieldSize.bytes
+    match ← Type.decode ty subslice with
+    | none => pure none
+    | some v =>
+      match ← decodeTupleFields rest bytes with
+      | none => pure none
+      | some vs => pure (some (v :: vs))
+
+end
+
+mutual
+
+/-- `Type::encode` for `Bool`, `Int`, `Tuple`, and `Array` (`spec/lang/representation.md`):
 > "fn encode<M: Memory>(Type::Bool: Self, val: Value<M>) -> .. {
 >     let Value::Bool(b) = val else { panic!() };
 >     list![AbstractByte::Init(if b { 1 } else { 0 }, None)]
@@ -505,6 +684,18 @@ def Type.decode : «Type» → List Byte → Interp (Option Val)
 >     // `Endianness::encode` will do the integer's bound check.
 >     let bytes_data = M::T::ENDIANNESS.encode(signed, size, i).unwrap();
 >     bytes_data.map(|b| AbstractByte::Init(b, None))
+> }
+> ..
+> fn encode<M: Memory>(Type::Tuple { sized_fields, sized_head_layout, unsized_field }: Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> {
+>     assert!(unsized_field.is_none(), \"encode of Type::Tuple with unsized field\");
+>     let (size, _) = sized_head_layout.head_size_and_align();
+>     let Value::Tuple(values) = val else { panic!() };
+>     assert_eq!(values.len(), sized_fields.len());
+>     let mut bytes = list![AbstractByte::Uninit; size.bytes()];
+>     for ((offset, ty), value) in sized_fields.zip(values) {
+>         bytes.write_subslice_at_index(offset.bytes(), ty.encode::<M>(value));
+>     }
+>     bytes
 > }
 > ..
 > fn encode<M: Memory>(Type::Array { elem, count }: Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> {
@@ -524,6 +715,17 @@ def Type.encode : «Type» → Val → Interp (List Byte)
     | some data => pure (data.map (fun b => .Init b none))
     | none => specPanic "Endianness::encode(..).unwrap()"
   | .Int _, _ => specPanic "encode: Type::Int with a non-Int value"
+  | .Tuple sizedFields sizedHeadLayout unsizedField, .Tuple values =>
+    if unsizedField.isSome then
+      specPanic "encode of Type::Tuple with unsized field"
+    else
+      let (size, _) := TupleHeadLayout.head_size_and_align sizedHeadLayout
+      if values.length ≠ sizedFields.length then
+        specPanic "encode: Type::Tuple length mismatch"
+      else
+        let bytes := List.replicate size.bytes .Uninit
+        encodeTupleFields sizedFields values bytes
+  | .Tuple _ _ _, _ => specPanic "encode: Type::Tuple with a non-Tuple value"
   | .Array elem count, .Tuple values =>
     if (values.length : Int) ≠ count then
       specPanic "encode: Type::Array length mismatch"
@@ -538,7 +740,22 @@ def Type.encode : «Type» → Val → Interp (List Byte)
           pure bytes)
       pure encoded.flatten
   | .Array _ _, _ => specPanic "encode: Type::Array with a non-Tuple value"
-  | _, _ => unsupported "Type::encode for a non-Int, non-Bool, non-Array type"
+  | _, _ => unsupported "Type::encode for a non-Int, non-Bool, non-Tuple, non-Array type"
+
+/-- Field-by-field `write_subslice_at_index` loop of `Type::encode` for `Type::Tuple`
+(`spec/lang/representation.md`):
+> "for ((offset, ty), value) in sized_fields.zip(values) {
+>     bytes.write_subslice_at_index(offset.bytes(), ty.encode::<M>(value));
+> }" -/
+def encodeTupleFields : List (Offset × «Type») → List Val → List Byte → Interp (List Byte)
+  | [], _, bytes => pure bytes
+  | _, [], bytes => pure bytes
+  | (offset, ty) :: restFields, value :: restVals, bytes => do
+    let encoded ← Type.encode ty value
+    let bytes' ← writeSubsliceAtIndex bytes offset.bytes encoded
+    encodeTupleFields restFields restVals bytes'
+
+end
 
 /-- `ensure_else_ub` (`spec/lang/representation.md`):
 > "fn ensure_else_ub(b: bool, msg: &str) -> Result<()> {
@@ -548,12 +765,22 @@ def Type.encode : «Type» → Val → Interp (List Byte)
 def ensureElseUb (b : Bool) (msg : String) : Interp Unit :=
   if b then pure () else ub msg
 
-/-- `Machine::check_value` for `Int`, `Bool`, and `Array`:
+mutual
+
+/-- `Machine::check_value` for `Int`, `Bool`, `Tuple`, and `Array`
+(`spec/lang/representation.md`):
 > "(Value::Int(i), Type::Int(int_ty)) => {
 >     ensure_else_ub(int_ty.can_represent(i), \"Value::Int: invalid integer value\")?;
 > }
 > (Value::Bool(_), Type::Bool) => {},
 > ..
+> (Value::Tuple(vals), Type::Tuple { sized_fields, unsized_field, .. }) => {
+>     assert!(unsized_field.is_none(), \"Value: unsized structs cannot be represented as values\");
+>     ensure_else_ub(vals.len() == sized_fields.len(), \"Value::Tuple: invalid number of fields\")?;
+>     for (val, (_, ty)) in vals.zip(sized_fields) {
+>         self.check_value(val, ty)?;
+>     }
+> }
 > (Value::Tuple(vals), Type::Array { elem, count }) => {
 >     ensure_else_ub(vals.len() == count, \"Value::Tuple: invalid number of elements\")?;
 >     for val in vals {
@@ -566,13 +793,34 @@ def checkValue : Val → «Type» → Interp Unit
   | .Int i, .Int t =>
     ensureElseUb (IntType.can_represent t i) "Value::Int: invalid integer value"
   | .Bool _, .Bool => pure ()
+  | .Tuple vals, .Tuple sizedFields _ unsizedField =>
+    if unsizedField.isSome then
+      specPanic "Value: unsized structs cannot be represented as values"
+    else do
+      ensureElseUb (decide (vals.length = sizedFields.length)) "Value::Tuple: invalid number of fields"
+      checkTupleFields vals sizedFields
   | .Tuple vals, .Array elem count => do
     ensureElseUb (decide ((vals.length : Int) = count)) "Value::Tuple: invalid number of elements"
     vals.forM (fun val => checkValue val elem)
   | _, .Int _ => specPanic "Value: value does not match type"
   | _, .Bool => specPanic "Value: value does not match type"
+  | _, .Tuple _ _ _ => specPanic "Value: value does not match type"
   | _, .Array _ _ => specPanic "Value: value does not match type"
-  | _, _ => unsupported "check_value for a non-Int, non-Bool, non-Array type"
+  | _, _ => unsupported "check_value for a non-Int, non-Bool, non-Tuple, non-Array type"
+
+/-- Field-by-field loop of `Machine::check_value` for `Type::Tuple`
+(`spec/lang/representation.md`):
+> "for (val, (_, ty)) in vals.zip(sized_fields) {
+>     self.check_value(val, ty)?;
+> }" -/
+def checkTupleFields : List Val → List (Offset × «Type») → Interp Unit
+  | [], _ => pure ()
+  | _, [] => pure ()
+  | val :: restVals, (_, ty) :: restFields => do
+    checkValue val ty
+    checkTupleFields restVals restFields
+
+end
 
 /-! ## `BasicMemory` (`spec/mem/basic.md`) -/
 
@@ -1188,13 +1436,41 @@ def ptrOffsetInbounds (m : Mach) (ptr : Ptr) (offset : Int) : Interp Ptr := do
 
 mutual
 
-/-- `Machine::eval_place` for `PlaceExpr::Local` and `PlaceExpr::Index`:
+/-- `Machine::eval_place` for `PlaceExpr::Local`, `PlaceExpr::Field`, and
+`PlaceExpr::Index` (`spec/lang/step/expressions.md`):
 > "let ty = self.cur_frame().func.locals[name];
 >  let Some(ptr) = self.cur_frame().locals.get(name) else {
 >      throw_ub!(\"access to a dead local\");
 >  };
 >  ret((Place { ptr: ptr.widen(None), aligned: true }, ty))
 >  ..
+>  fn eval_place(&mut self, PlaceExpr::Field { root, field }: PlaceExpr) -> Result<(Place<M>, Type)> {
+>      let (root, ty) = self.eval_place(root)?;
+>      let (offset, field_ty) = match ty {
+>          Type::Tuple { sized_fields, unsized_field, sized_head_layout } => {
+>              if field >= 0 && field < sized_fields.len() {
+>                  sized_fields[field]
+>              } else if field == sized_fields.len() {
+>                  let tail_ty = unsized_field.expect(\"field projection to non-existing unsized tail\");
+>                  let tail_align = self.compute_align(tail_ty.layout::<M::T>(), root.ptr.metadata);
+>                  let offset = sized_head_layout.tail_offset(tail_align);
+>                  (offset, tail_ty)
+>              } else {
+>                  panic!(\"field projection to invalid field\");
+>              }
+>          }
+>          Type::Union { fields, .. } => fields[field],
+>          _ => panic!(\"field projection on non-projectable type\"),
+>      };
+>      assert!(offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata));
+>      let ptr = self.ptr_offset_inbounds(root.ptr.thin_pointer, offset.bytes())?;
+>      let ptr = if !field_ty.layout::<M::T>().is_sized() {
+>          ptr.widen(root.ptr.metadata)
+>      } else {
+>          ptr.widen(None)
+>      };
+>      ret((Place { ptr, ..root }, field_ty))
+>  }
 >  fn eval_place(&mut self, PlaceExpr::Index { root, index }: PlaceExpr) -> Result<(Place<M>, Type)> {
 >      let (root, ty) = self.eval_place(root)?;
 >      let (Value::Int(index), _) = self.eval_value(index)? else {
@@ -1226,6 +1502,35 @@ def evalPlace (m : Mach) : PlaceExpr → Interp ((Place BM × «Type») × Mach)
     match mapGet fr.locals name with
     | none => ub "access to a dead local"
     | some ptr => pure (({ ptr := { thin_pointer := ptr, metadata := none }, aligned := true }, ty), m)
+  | .Field root field => do
+    let ((rootPlace, ty), m) ← evalPlace m root
+    let (offset, fieldTy) ← match ty with
+      | .Tuple sizedFields sizedHeadLayout unsizedField =>
+        if 0 ≤ field ∧ field < (sizedFields.length : Int) then
+          listIndex sizedFields field "sized_fields[field]"
+        else if field = (sizedFields.length : Int) then
+          match unsizedField with
+          | none => specPanic "field projection to non-existing unsized tail"
+          | some tailTy => do
+            let tailAlign ← computeAlign (← Type.layout tailTy) rootPlace.ptr.metadata
+            let offset := TupleHeadLayout.tail_offset sizedHeadLayout tailAlign
+            pure (offset, tailTy)
+        else
+          specPanic "field projection to invalid field"
+      | .Union fields _ _ _ => listIndex fields field "fields[field]"
+      | _ => specPanic "field projection on non-projectable type"
+    let size ← computeSize (← Type.layout ty) rootPlace.ptr.metadata
+    if offset.bytes ≤ size.bytes then
+      let ptr ← ptrOffsetInbounds m rootPlace.ptr.thin_pointer offset.bytes
+      let fieldLayout ← Type.layout fieldTy
+      let widePtr : Pointer Prov :=
+        if !LayoutStrategy.is_sized fieldLayout then
+          { thin_pointer := ptr, metadata := rootPlace.ptr.metadata }
+        else
+          { thin_pointer := ptr, metadata := none }
+      pure (({ rootPlace with ptr := widePtr }, fieldTy), m)
+    else
+      specPanic "assertion failed: offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata)"
   | .Index root index => do
     let ((rootPlace, ty), m) ← evalPlace m root
     let ((idxVal, _), m) ← evalValue m index
@@ -1248,7 +1553,7 @@ def evalPlace (m : Mach) : PlaceExpr → Interp ((Place BM × «Type») × Mach)
         pure (({ rootPlace with ptr := { thin_pointer := ptr, metadata := none } }, elemTy), m)
       else
         specPanic "sanity check: the indexed offset should not be outside what the type allows."
-  | _ => unsupported "eval_place for a non-Local, non-Index place expression"
+  | _ => unsupported "eval_place for a non-Local, non-Field, non-Index place expression"
 
 /-- Left-to-right element evaluation `exprs.try_map(|e| self.eval_value(e))?.map(|e| e.0)`
 in `Machine::eval_value` for `ValueExpr::Tuple` (`spec/lang/step/expressions.md`):
