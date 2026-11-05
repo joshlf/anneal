@@ -1313,7 +1313,7 @@ all 20 steps.
 theorem liftPolyApplyCaller_lift :
     LiftFrame liftPolyApplyCallerMir 0 0 (initPureEnv liftPolyApplyCallerMir [])
       (initMachineStateWithCallees liftPolyApplyCallerMir []
-         liftPolyApplyCallees).memory
+        liftPolyApplyCallees).memory
       (fun v => v = .scalar ⟨7, 4⟩) 20 := by
   -- bb0[0]: `StorageLive(_1)`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)

@@ -39,8 +39,13 @@ or abort. It has two modes:
   `checkPureMir` (for example, one that reifies a function pointer) uses this
   mode with no callees.
 
-Both modes run `<item>` on the empty argument list, so they apply to closed
-bodies (`argCount = 0`).
+Both modes run `<item>` on the empty argument list, so they apply only to
+closed bodies (`argCount = 0`) and reject any other body. In linked-callee mode
+every call must resolve to a linked callee or to the inline
+`core::intrinsics::exact_div`. Calls to external functions, diverging calls
+(`target = none`), unwinding, and cleanup blocks have no lifting rule, so
+lifting fails on them (see the `LiftTerminator` docstring in
+`Anneal.MirLiftCore`).
 
 This module imports `Lean` for its command elaborator, so it is a tool rather
 than part of the audited `Anneal` umbrella (the trusted-boundary audit admits
@@ -515,6 +520,13 @@ example : liftDirectCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
 example : liftPolyLayoutCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
 example : liftClosureAndTraitCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
 example : liftPolyApplyCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
+
+-- The linked-callee mode also applies to call-free bodies: with
+-- `(callees := [])` it synthesizes the returned value, which the call-free
+-- mode does not record.
+def branchFrameBody : CapturedMir := makeBranchBody "branchFrame"
+#mir_lift (callees := []) branchFrameBody
+example : branchFrameBody_model = Value.scalar ⟨0, 4⟩ := rfl
 
 example :
     MirWpConverges liftIndirectCallerMir

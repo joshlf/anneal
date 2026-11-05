@@ -121,6 +121,8 @@ The build runs:
 - `#mir_lift (callees := liftPolyLayoutCallees) liftPolyLayoutCallerMir`
 - `#mir_lift (callees := liftClosureAndTraitCallees) liftClosureAndTraitCallerMir`
 - `#mir_lift (callees := liftPolyApplyCallees) liftPolyApplyCallerMir`
+- `#mir_lift (callees := []) branchFrameBody`, a call-free body lifted in
+  linked-callee mode so that its return value is synthesized
 
 Each linked-callee `#mir_lift` defines `<item>_model` (the synthesized return
 value) and proves `<item>_lift_sound` (`MirWpConverges` from
@@ -169,3 +171,21 @@ theorem states `MirWpConverges liftIndirectCallerMir
 (initMachineStateWithCallees liftIndirectCallerMir [] [liftPolyIdMir])
 (mirNormalPost fun retVal mem => retVal = liftIndirectCallerMir_model)`, and
 both theorems depend only on `[propext, Classical.choice, Quot.sound]`.
+
+## 6. Scope and known limitations
+
+- `#mir_lift` lifts only closed bodies (`argCount = 0`) and rejects others
+  with an error.
+- In linked-callee mode every call must resolve to a body in `callees`, or to
+  the inline `core::intrinsics::exact_div`. External calls cannot be lifted,
+  because their answers may panic or abort, which no normal-return
+  postcondition allows.
+- Diverging calls (`target = none`), failed assertions, `UnwindResume`, and
+  cleanup blocks have no lifting rules. In MIR that rustc emits, none of them
+  can reach a normal root return (see the `LiftTerminator` docstring and
+  `liftDivergingPanic_not_converges`).
+- The call-free mode inherited from FF-3.2 does not record the return value:
+  its `<item>_model` is `()` and its postcondition constrains only the final
+  memory. The linked-callee mode also applies to call-free bodies given
+  `(callees := [])` and synthesizes the returned value (see
+  `branchFrameBody`).
