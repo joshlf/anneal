@@ -1291,7 +1291,7 @@ theorem verified :
       evalRvalueFast,
       evalOperandFast, evalConstValue,
       evalScalarBinOp, evalUnaryNot,
-      Trusted.Effect.SumE, Trusted.Effect.Effect.I, Trusted.Effect.Effect.O, Trusted.Rustc.V2026_06_01.MirSemantics.MirEffect,
+      Trusted.Effect.SumE, Trusted.Effect.Effect.I, Trusted.Effect.Effect.O, Trusted.Rustc.V2026_06_01.MirSemantics.MirEffect, Trusted.Rustc.V2026_06_01.MirSemantics.MirStepNode, Trusted.ITree.ITreeF,
       operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
       intCastTargetBytes, shiftLeftBits, shiftRightUnsignedBits, scalarPow2_eight,
       scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
