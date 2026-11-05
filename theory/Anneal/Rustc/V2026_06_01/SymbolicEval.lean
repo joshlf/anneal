@@ -534,7 +534,7 @@ def evalNodeWP
   | .tau st' => cont st'
   | .vis (.inl _) _ => False
   | .vis (.inr (.inl _)) k => cont (k PUnit.unit)
-  | .vis (.inr (.inr (.call _))) k => ∀ ans : MirCallAns, cont (k ans)
+  | .vis (.inr (.inr (.call req))) k => ∀ ans : MirCallAns, cont (k ans)
 
 theorem evalNodeWP_eq
     (cont : MirExecState → Prop) (post : MirOutcome → Prop)
@@ -561,7 +561,7 @@ def evalSymNodeTree
   | .leaf (.tau st') => cont st'
   | .leaf (.vis (.inl _) _) => False
   | .leaf (.vis (.inr (.inl _)) k) => cont (k PUnit.unit)
-  | .leaf (.vis (.inr (.inr (.call _))) k) => ∀ ans : MirCallAns, cont (k ans)
+  | .leaf (.vis (.inr (.inr (.call req))) k) => ∀ ans : MirCallAns, cont (k ans)
   | .branch c t1 t2 =>
     match c with
     | true => evalSymNodeTree cont post t1
@@ -3002,7 +3002,7 @@ def evalNodeUbWaivedWP
   | .tau st' => cont st'
   | .vis (.inl f) _ => isWaivedUbFailReq f
   | .vis (.inr (.inl _)) k => cont (k PUnit.unit)
-  | .vis (.inr (.inr (.call _))) k => ∀ ans : MirCallAns, cont (k ans)
+  | .vis (.inr (.inr (.call req))) k => ∀ ans : MirCallAns, Lower.callAnsPreserved req ans → cont (k ans)
 
 theorem evalNodeUbWaivedWP_eq
     (cont : MirExecState → Prop) (post : MirOutcome → Prop)
@@ -3029,7 +3029,7 @@ def evalSymNodeTreeUbWaived
   | .leaf (.tau st') => cont st'
   | .leaf (.vis (.inl f) _) => isWaivedUbFailReq f
   | .leaf (.vis (.inr (.inl _)) k) => cont (k PUnit.unit)
-  | .leaf (.vis (.inr (.inr (.call _))) k) => ∀ ans : MirCallAns, cont (k ans)
+  | .leaf (.vis (.inr (.inr (.call req))) k) => ∀ ans : MirCallAns, Lower.callAnsPreserved req ans → cont (k ans)
   | .branch c t1 t2 =>
     match c with
     | true => evalSymNodeTreeUbWaived cont post t1

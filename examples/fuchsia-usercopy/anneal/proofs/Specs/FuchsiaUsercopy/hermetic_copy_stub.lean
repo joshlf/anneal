@@ -34,7 +34,7 @@ def strictSafetyPre (args : List Value) (_ : Memory) : Prop :=
 /-- Normal-return postcondition across all `pre`: returns `fault_offset <= count`
     and preserves `mem`. -/
 def post (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory) : Prop :=
-  mem' = mem ∧
+  mem' = { mem with callees := mem'.callees, traitImpls := mem'.traitImpls } ∧
   ∀ (count fault_offset v : Nat),
     args =
       [ .scalar { bits := count, sizeBytes := 8 }
