@@ -1106,8 +1106,8 @@ through polymorphic `core::slice::<impl [T]>::len::<u8>`,
 theorem sliceLenAsPtrFromRawParts_verified :
     VerificationResult sliceLenAsPtrFromRawPartsClaim := by
   refine verifyMirNoPanicSym sliceLenAsPtrFromRawPartsClaim 24 ?_
-  rintro _ ⟨p, len, rfl⟩
-  rfl
+  rintro _ ⟨p, len, decide⟩
+  decide
 
 /--
 Caller `sliceSplitAtMutCallerMir` that invokes `core::slice::<impl [T]>::split_at_mut`

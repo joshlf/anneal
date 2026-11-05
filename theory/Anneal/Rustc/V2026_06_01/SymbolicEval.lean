@@ -4389,7 +4389,7 @@ theorem evalTerminatorSymTree_call_extCall
         currentBody.layouts
         s.memory.callerLocals =
       .ok argVals locals')
-    (_h_indirect : resolvedTarget.isIndirect = false)
+    (h_indirect : resolvedTarget.isIndirect = false)
     (h_callee :
       lookupCallee
         s.memory.callees
@@ -4400,7 +4400,11 @@ theorem evalTerminatorSymTree_call_extCall
     (_h_unreachable : isUnreachableCallTarget resolvedTarget.defPath = false)
     (_h_abort : isAbortingPanicDefPath resolvedTarget.defPath = false)
     (_h_unwind : isUnwindingPanicDefPath resolvedTarget.defPath = false)
-    (h_exactDiv : isDirectExactDivTarget resolvedTarget = false) :
+    (h_exactDiv : isDirectExactDivTarget resolvedTarget = false)
+    (h_intrinsic :
+      evalDirectRustIntrinsic?
+        s (some currentBody) resolvedTarget currentBody.localDecls
+        currentBody.layouts argOps argVals locals' destination targetBb unwind = .none) :
     evalTerminatorSymTree
       s
       { kind := .call func argOps destination (.some targetBb) unwind, span := span }
@@ -4416,8 +4420,7 @@ theorem evalTerminatorSymTree_call_extCall
   dsimp only []
   rw [h_callee]
   dsimp only []
-  rw [h_exactDiv]
-
+  rw [h_exactDiv, h_indirect, h_intrinsic]
 /--
 `evalTerminatorSymTree` for a normal inlined call (`target = .some targetBb`)
 resolved via `CalleeCtx`.
