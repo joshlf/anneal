@@ -37,7 +37,8 @@ exclusions!).
 
 /-! ## 1. Initial Machine Configuration Correspondence -/
 
-/-- Universal characterization of `initMachineState` and `initMachineStateWithCallees`. -/
+/-- Universal characterization of `initMachineState` and `initMachineStateWithCallees`;
+`initMachineStateWithCallees` also seeds `Memory.traitImpls` with `body.traitImpls`. -/
 theorem mir_initMachineState_pc_zero
     (body : CapturedMir) (args : List Value) (callees : List CapturedMir) :
     (initMachineState body args).frame.blockIdx = 0 ∧
@@ -50,8 +51,9 @@ theorem mir_initMachineState_pc_zero
     (initMachineStateWithCallees body args callees).memory.callStack = [] ∧
     (initMachineStateWithCallees body args callees).memory.activeCallee = none ∧
     (initMachineStateWithCallees body args callees).memory.nextTag = 1 ∧
-    (initMachineStateWithCallees body args callees).memory.callees = callees := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+    (initMachineStateWithCallees body args callees).memory.callees = callees ∧
+    (initMachineStateWithCallees body args callees).memory.traitImpls = body.traitImpls := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ## 2. Program-Counter Statement-vs-Terminator Dispatch Correspondence -/
 

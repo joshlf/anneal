@@ -132,6 +132,8 @@ private def evalOperandFast (locals : List LocalSlot) (op : Operand)
                 | _ => .ub
             | true => evalOperandFallback locals (.copy p) borrows globals layouts callerLocals
         | .none => evalDerefGlobalFallback globals ptrVal sz locals restProj
+      | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
+        evalOperandFallback locals (.copy p) borrows globals layouts callerLocals
       | _ => .ub
     | _ =>
       match get? locals p.local_ with
@@ -256,7 +258,13 @@ private def evalRvalueSymTreeFast
   match rv with
   | .use op =>
     match evalOperandFast locals op mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok v locals' => .leaf (.ok v locals' mem)
+    | .ok v locals' =>
+      match op, mem.borrows with
+      | .copy { local_ := ptrLoc, projection := .deref :: restProj }, b1 :: b2 :: restBorrows =>
+        .leaf (.ok v locals' { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b1 :: b2 :: restBorrows) })
+      | .move { local_ := ptrLoc, projection := .deref :: restProj }, b1 :: b2 :: restBorrows =>
+        .leaf (.ok v locals' { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b1 :: b2 :: restBorrows) })
+      | _, _ => .leaf (.ok v locals' mem)
     | .ub => .leaf .ub
     | .unsupported => .leaf .unsupported
   | .ref bk p =>

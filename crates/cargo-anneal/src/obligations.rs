@@ -1348,7 +1348,7 @@ mod tests {
 
     fn sample_records() -> Vec<UnitTargetRecord> {
         vec![
-            UnitTargetRecord {
+            UnitTargetRecord { trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: "my_crate::math::inc".to_string(),
                     mir_module_path: "Mir/MyCrate/math/inc.lean".to_string(),
@@ -1358,7 +1358,7 @@ mod tests {
                 item_kind: CapturedItemKind::Subject,
                 associated_subject_def_id: None,
             },
-            UnitTargetRecord {
+            UnitTargetRecord { trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: "my_crate::math::__anodized_fn_requires_inc".to_string(),
                     mir_module_path: "Mir/MyCrate/math/__anodized_fn_requires_inc.lean"
@@ -1369,7 +1369,7 @@ mod tests {
                 item_kind: CapturedItemKind::InlineSpecRequires,
                 associated_subject_def_id: Some("my_crate::math::inc".to_string()),
             },
-            UnitTargetRecord {
+            UnitTargetRecord { trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: "my_crate::math::__anodized_fn_ensures_inc".to_string(),
                     mir_module_path: "Mir/MyCrate/math/__anodized_fn_ensures_inc.lean"
@@ -1457,7 +1457,7 @@ mod tests {
 
     #[test]
     fn renders_empty_and_multi_clause_rust_contracts() {
-        let subject = UnitTargetRecord {
+        let subject = UnitTargetRecord { trait_impls: vec![],
             target: CapturedTarget {
                 def_id: "my_crate::math::id".to_string(),
                 mir_module_path: "Mir/MyCrate/math/id.lean".to_string(),
@@ -1474,7 +1474,7 @@ mod tests {
             inline_requires: Vec::new(),
             inline_ensures: Vec::new(),
             inline_qualifiers: Vec::new(),
-            external_specs: vec![UnitTargetRecord {
+            external_specs: vec![UnitTargetRecord { trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: "my_crate::math::__ANNEAL_EXT_SPEC_TARGET_id".to_string(),
                     mir_module_path: "Mir/MyCrate/math/__ANNEAL_EXT_SPEC_TARGET_id.lean"
@@ -1505,7 +1505,7 @@ mod tests {
             item_module_suffix: "MyCrate.math.id".to_string(),
             item_rel_path: PathBuf::from("MyCrate/math/id.lean"),
             inline_requires: vec![
-                UnitTargetRecord {
+                UnitTargetRecord { trait_impls: vec![],
                     target: CapturedTarget {
                         def_id: "my_crate::math::__anodized_fn_requires_id_0".to_string(),
                         mir_module_path: "Mir/MyCrate/math/__anodized_fn_requires_id_0.lean"
@@ -1516,7 +1516,7 @@ mod tests {
                     item_kind: CapturedItemKind::InlineSpecRequires,
                     associated_subject_def_id: Some("my_crate::math::id".to_string()),
                 },
-                UnitTargetRecord {
+                UnitTargetRecord { trait_impls: vec![],
                     target: CapturedTarget {
                         def_id: "my_crate::math::__anodized_fn_requires_id_1".to_string(),
                         mir_module_path: "Mir/MyCrate/math/__anodized_fn_requires_id_1.lean"
@@ -1737,7 +1737,7 @@ mod tests {
     #[test]
     fn renders_rust_safe_total_and_equiv_attribute_specs() {
         let mut records = sample_records();
-        records.push(UnitTargetRecord {
+        records.push(UnitTargetRecord { trait_impls: vec![],
             target: CapturedTarget {
                 def_id: "my_crate::math::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_safe_total_inc"
                     .to_string(),
@@ -1748,7 +1748,7 @@ mod tests {
             item_kind: CapturedItemKind::ExternalSpec,
             associated_subject_def_id: Some("my_crate::math::inc".to_string()),
         });
-        records.push(UnitTargetRecord {
+        records.push(UnitTargetRecord { trait_impls: vec![],
             target: CapturedTarget {
                 def_id: "my_crate::math::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_equiv_inc_ref__for__inc"
                     .to_string(),
@@ -1786,7 +1786,7 @@ mod tests {
     #[test]
     fn renders_rust_trusted_assumptions_and_modular_default_proofs() {
         let mut records = sample_records();
-        records.push(UnitTargetRecord {
+        records.push(UnitTargetRecord { trait_impls: vec![],
             target: CapturedTarget {
                 def_id: "my_crate::math::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_trusted_inc"
                     .to_string(),
@@ -1861,7 +1861,7 @@ mod tests {
                (inferInstance : ModularItemProof \"my_crate::math::inc\" Obligations.MyCrate.math.inc.modularClaim).verified"
         ));
 
-        caller_bundle.push(UnitTargetRecord {
+        caller_bundle.push(UnitTargetRecord { trait_impls: vec![],
             target: CapturedTarget {
                 def_id: "my_crate::math::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_safe_total_inc"
                     .to_string(),

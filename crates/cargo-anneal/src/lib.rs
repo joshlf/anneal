@@ -2429,19 +2429,19 @@ mod tests {
             ],
         };
         let records = vec![
-            UnitTargetRecord {
+            UnitTargetRecord { trait_impls: vec![],
                 target: manifest.targets[0].clone(),
                 lean_module_name: "Mir.Demo.id".to_string(),
                 item_kind: CapturedItemKind::Subject,
                 associated_subject_def_id: None,
             },
-            UnitTargetRecord {
+            UnitTargetRecord { trait_impls: vec![],
                 target: manifest.targets[1].clone(),
                 lean_module_name: "Mir.Demo.__anodized_fn_requires_id".to_string(),
                 item_kind: CapturedItemKind::InlineSpecRequires,
                 associated_subject_def_id: Some("demo::id".to_string()),
             },
-            UnitTargetRecord {
+            UnitTargetRecord { trait_impls: vec![],
                 target: manifest.targets[2].clone(),
                 lean_module_name: "Mir.Demo.__anodized_fn_ensures_id".to_string(),
                 item_kind: CapturedItemKind::InlineSpecEnsures,
@@ -2565,7 +2565,7 @@ mod tests {
             mir_dialect: MIR_DIALECT_V2026_06_01.to_string(),
             compilation_succeeded: true,
             rust_sources: vec![("src/lib.rs".to_string(), sha256_hex(rs_bytes))],
-            unit_targets: vec![UnitTargetRecord {
+            unit_targets: vec![UnitTargetRecord { trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: "demo::id".to_string(),
                     mir_module_path: "Mir/Demo/id.lean".to_string(),

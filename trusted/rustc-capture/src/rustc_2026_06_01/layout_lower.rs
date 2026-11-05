@@ -14,12 +14,14 @@
 //!
 //! Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1-L2
 
+use std::collections::BTreeMap;
+
 use rustc_abi::{
     Align, BackendRepr, CanonAbi, Endian, ExternAbi, FieldIdx, FieldsShape, Float, HasDataLayout,
     Integer, LayoutData, Primitive, Scalar, Size, VariantIdx, Variants, WrappingRange,
 };
 use rustc_hir::def_id::DefId;
-use rustc_middle::ty::{self, Instance, Ty, TyCtxt, TypingEnv};
+use rustc_middle::ty::{self, Instance, Ty, TyCtxt, TypeVisitableExt, TypingEnv};
 use rustc_target::callconv::{ArgAbi, FnAbi, PassMode};
 
 use crate::lean_emit::{
@@ -28,27 +30,59 @@ use crate::lean_emit::{
     IrWrappingRange,
 };
 
-/// Deduplicating table of monomorphized type layouts collected while lowering a
-/// single MIR body.
+/// Deduplicating table of monomorphized and parametric type layouts collected
+/// while lowering a single MIR body.
 pub struct LayoutTableBuilder<'tcx> {
     tcx: TyCtxt<'tcx>,
     typing_env: TypingEnv<'tcx>,
+    /// Mapping from `rustc` `GenericParamDef::index` to dense 0-based type
+    /// parameter index (`0 .. type_param_count`).
+    param_index_map: BTreeMap<u32, u32>,
+    /// Number of reserved type-parameter placeholder slots at the start of
+    /// `entries` (`0 .. type_param_count`).
+    type_param_count: usize,
+    /// Dedicated `(Ty, layout_idx)` slots for compound parametric types so
+    /// distinct generic types never alias each other or concrete layout slots.
+    parametric_ty_indices: Vec<(Ty<'tcx>, usize)>,
     entries: Vec<IrTypeLayout>,
 }
 
 impl<'tcx> LayoutTableBuilder<'tcx> {
-    /// Creates a new layout table builder for `def_id`.
+    /// Creates a new layout table builder for `def_id` with no pre-allocated
+    /// generic type parameter slots.
     pub fn new(tcx: TyCtxt<'tcx>, def_id: DefId) -> Self {
+        Self::new_with_type_params(tcx, def_id, BTreeMap::new())
+    }
+
+    /// Creates a new layout table builder for `def_id`, pre-allocating slots
+    /// `0 .. param_index_map.len()` with `placeholder_param_layout()` in dense
+    /// type-parameter index order so `substitutePlaceholderEntries` in Lean
+    /// maps parameter `i` directly to slot `i`.
+    pub fn new_with_type_params(
+        tcx: TyCtxt<'tcx>,
+        def_id: DefId,
+        param_index_map: BTreeMap<u32, u32>,
+    ) -> Self {
+        let type_param_count = param_index_map.len();
+        let entries = vec![placeholder_param_layout(); type_param_count];
         Self {
             tcx,
             typing_env: TypingEnv::post_analysis(tcx, def_id),
-            entries: Vec::new(),
+            param_index_map,
+            type_param_count,
+            parametric_ty_indices: Vec::new(),
+            entries,
         }
     }
 
     /// Returns the `TypingEnv` used for layout and constant evaluation queries.
     pub fn typing_env(&self) -> TypingEnv<'tcx> {
         self.typing_env
+    }
+
+    /// Looks up the `IrTypeLayout` at `layout_idx`.
+    pub fn entry(&self, layout_idx: usize) -> Option<&IrTypeLayout> {
+        self.entries.get(layout_idx)
     }
 
     /// Interns the layout of `ty` into `self.entries` and returns its
@@ -96,11 +130,33 @@ impl<'tcx> LayoutTableBuilder<'tcx> {
         self.intern_ty_layout_depth(ty, 0)
     }
 
-    fn intern_ty_layout_depth(&mut self, ty: Ty<'tcx>, depth: usize) -> usize {
+    fn intern_ty_layout_depth(&mut self, raw_ty: Ty<'tcx>, depth: usize) -> usize {
+        let ty = self
+            .tcx
+            .try_normalize_erasing_regions(self.typing_env, ty::Unnormalized::new_wip(raw_ty))
+            .unwrap_or(raw_ty);
+
+        if let ty::Param(param_ty) = *ty.kind() {
+            if let Some(&dense_idx) = self.param_index_map.get(&param_ty.index) {
+                return dense_idx as usize;
+            }
+            return self.intern_parametric_ty_slot(ty, placeholder_param_layout());
+        }
+
+        let is_parametric = ty.has_param();
+        if is_parametric
+            && let Some(&(_, existing_idx)) = self
+                .parametric_ty_indices
+                .iter()
+                .find(|&&(cached_ty, _)| cached_ty == ty)
+        {
+            return existing_idx;
+        }
+
         let ir_layout = match self.tcx.layout_of(self.typing_env.as_query_input(ty)) {
             Ok(ty_and_layout) => {
                 let mut lowered = lower_layout_data(&ty_and_layout.layout.0);
-                if depth < 8 {
+                if depth < 16 {
                     if let FieldsShape::Arbitrary { ref offsets, .. } = ty_and_layout.fields
                         && !offsets.is_empty()
                         && let Variants::Single { index } = ty_and_layout.variants
@@ -178,16 +234,216 @@ impl<'tcx> LayoutTableBuilder<'tcx> {
                 }
                 lowered
             }
+            Err(_) if is_parametric => self.lower_parametric_compound_layout(ty, depth),
             Err(_) => fallback_zst_layout(),
         };
-        self.intern_ir_layout(ir_layout)
+
+        if is_parametric {
+            self.intern_parametric_ty_slot(ty, ir_layout)
+        } else {
+            self.intern_ir_layout(ir_layout)
+        }
     }
 
-    /// Interns an already-lowered `IrTypeLayout` and returns its deduplicated
-    /// index.
+    fn intern_parametric_ty_slot(&mut self, ty: Ty<'tcx>, layout: IrTypeLayout) -> usize {
+        if let Some(&(_, existing_idx)) = self
+            .parametric_ty_indices
+            .iter()
+            .find(|&&(cached_ty, _)| cached_ty == ty)
+        {
+            return existing_idx;
+        }
+        let idx = self.entries.len();
+        self.entries.push(layout);
+        self.parametric_ty_indices.push((ty, idx));
+        idx
+    }
+
+    fn intern_field_tys(&mut self, tys: Vec<Ty<'tcx>>, depth: usize) -> Vec<usize> {
+        if depth < 16 {
+            tys.into_iter()
+                .map(|fty| self.intern_ty_layout_depth(fty, depth + 1))
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Synthesizes a structural `IrTypeLayout` for a compound type containing
+    /// uninstantiated type parameters (`ty.has_param()`), preserving its
+    /// `IrFieldsShape`, `IrVariantsShape`, and `field_layouts` so
+    /// `TypeLayout.recomputeFromFieldLayouts` and `RigidTy.computeLayout` in
+    /// Lean can recompute exact monomorphized layouts while keeping
+    /// `TypeLayout.isParamPlaceholder == false`.
+    fn lower_parametric_compound_layout(&mut self, ty: Ty<'tcx>, depth: usize) -> IrTypeLayout {
+        let tcx = self.tcx;
+        match *ty.kind() {
+            ty::Tuple(tys) => {
+                let n = tys.len();
+                let field_layouts = self.intern_field_tys(tys.iter().collect(), depth);
+                IrTypeLayout {
+                    size: IrSize { bytes: 0 },
+                    align: IrAlign { bytes: 1 },
+                    backend_repr: IrBackendRepr::Memory,
+                    fields: IrFieldsShape::Arbitrary {
+                        offsets: vec![IrSize { bytes: 0 }; n],
+                        memory_index: (0..n).collect(),
+                    },
+                    variants: IrVariantsShape::Single { index: 0 },
+                    is_uninhabited: false,
+                    field_layouts,
+                }
+            }
+            ty::Closure(_, args) => {
+                let upvars = args.as_closure().upvar_tys();
+                let n = upvars.len();
+                let field_layouts = self.intern_field_tys(upvars.iter().collect(), depth);
+                IrTypeLayout {
+                    size: IrSize { bytes: 0 },
+                    align: IrAlign { bytes: 1 },
+                    backend_repr: IrBackendRepr::Memory,
+                    fields: IrFieldsShape::Arbitrary {
+                        offsets: vec![IrSize { bytes: 0 }; n],
+                        memory_index: (0..n).collect(),
+                    },
+                    variants: IrVariantsShape::Single { index: 0 },
+                    is_uninhabited: false,
+                    field_layouts,
+                }
+            }
+            ty::Array(elem_ty, len_const) => {
+                let count = len_const.try_to_target_usize(tcx).unwrap_or(0);
+                let field_layouts = self.intern_field_tys(vec![elem_ty], depth);
+                IrTypeLayout {
+                    size: IrSize { bytes: 0 },
+                    align: IrAlign { bytes: 1 },
+                    backend_repr: IrBackendRepr::Memory,
+                    fields: IrFieldsShape::Array {
+                        stride: IrSize { bytes: 0 },
+                        count,
+                    },
+                    variants: IrVariantsShape::Single { index: 0 },
+                    is_uninhabited: false,
+                    field_layouts,
+                }
+            }
+            ty::Adt(def, args) => {
+                if def.is_union() {
+                    let field_tys: Vec<Ty<'tcx>> = def
+                        .variants()
+                        .iter()
+                        .next()
+                        .map(|v| {
+                            v.fields
+                                .iter()
+                                .map(|f| f.ty(tcx, args).skip_norm_wip())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let count = field_tys.len();
+                    let field_layouts = self.intern_field_tys(field_tys, depth);
+                    IrTypeLayout {
+                        size: IrSize { bytes: 0 },
+                        align: IrAlign { bytes: 1 },
+                        backend_repr: IrBackendRepr::Memory,
+                        fields: IrFieldsShape::Union { count },
+                        variants: IrVariantsShape::Single { index: 0 },
+                        is_uninhabited: false,
+                        field_layouts,
+                    }
+                } else if def.variants().is_empty() {
+                    IrTypeLayout {
+                        size: IrSize { bytes: 0 },
+                        align: IrAlign { bytes: 1 },
+                        backend_repr: IrBackendRepr::Memory,
+                        fields: IrFieldsShape::Arbitrary {
+                            offsets: Vec::new(),
+                            memory_index: Vec::new(),
+                        },
+                        variants: IrVariantsShape::Empty,
+                        is_uninhabited: true,
+                        field_layouts: Vec::new(),
+                    }
+                } else if def.variants().len() == 1 {
+                    let variant = def.variants().iter().next().expect("single variant");
+                    let field_tys: Vec<Ty<'tcx>> = variant
+                        .fields
+                        .iter()
+                        .map(|f| f.ty(tcx, args).skip_norm_wip())
+                        .collect();
+                    let n = field_tys.len();
+                    let field_layouts = self.intern_field_tys(field_tys, depth);
+                    IrTypeLayout {
+                        size: IrSize { bytes: 0 },
+                        align: IrAlign { bytes: 1 },
+                        backend_repr: IrBackendRepr::Memory,
+                        fields: IrFieldsShape::Arbitrary {
+                            offsets: vec![IrSize { bytes: 0 }; n],
+                            memory_index: (0..n).collect(),
+                        },
+                        variants: IrVariantsShape::Single { index: 0 },
+                        is_uninhabited: false,
+                        field_layouts,
+                    }
+                } else {
+                    let mut variant_shapes = Vec::with_capacity(def.variants().len());
+                    let mut payload_tys = Vec::new();
+                    for v in def.variants().iter() {
+                        let n = v.fields.len();
+                        variant_shapes.push(IrFieldsShape::Arbitrary {
+                            offsets: vec![IrSize { bytes: 0 }; n],
+                            memory_index: (0..n).collect(),
+                        });
+                        for f in &v.fields {
+                            payload_tys.push(f.ty(tcx, args).skip_norm_wip());
+                        }
+                    }
+                    let field_layouts = self.intern_field_tys(payload_tys, depth);
+                    let max_discr = def.variants().len().saturating_sub(1) as u128;
+                    let tag = IrScalarLayout::Initialized {
+                        value: IrPrimitiveKind::Int {
+                            bits: 8,
+                            signed: false,
+                        },
+                        valid_range: IrWrappingRange {
+                            start: 0,
+                            end_: max_discr,
+                        },
+                    };
+                    IrTypeLayout {
+                        size: IrSize { bytes: 1 },
+                        align: IrAlign { bytes: 1 },
+                        backend_repr: IrBackendRepr::Memory,
+                        fields: IrFieldsShape::Arbitrary {
+                            offsets: vec![IrSize { bytes: 0 }],
+                            memory_index: vec![0],
+                        },
+                        variants: IrVariantsShape::Multiple {
+                            tag,
+                            tag_field: 0,
+                            variants: variant_shapes,
+                        },
+                        is_uninhabited: false,
+                        field_layouts,
+                    }
+                }
+            }
+            _ => fallback_zst_layout(),
+        }
+    }
+
+    /// Interns an already-lowered concrete `IrTypeLayout` and returns its
+    /// deduplicated index (skipping reserved type-parameter and compound
+    /// parametric slots so concrete and parametric slots remain disjoint).
     pub fn intern_ir_layout(&mut self, layout: IrTypeLayout) -> usize {
-        if let Some(idx) = self.entries.iter().position(|existing| *existing == layout) {
-            return idx;
+        for idx in self.type_param_count..self.entries.len() {
+            let is_parametric_slot = self
+                .parametric_ty_indices
+                .iter()
+                .any(|&(_, p_idx)| p_idx == idx);
+            if !is_parametric_slot && self.entries[idx] == layout {
+                return idx;
+            }
         }
         let idx = self.entries.len();
         self.entries.push(layout);
@@ -476,11 +732,19 @@ pub fn lower_backend_repr(repr: BackendRepr) -> IrBackendRepr {
 ///
 /// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L2102-L2157
 pub fn lower_layout_data(layout: &LayoutData<FieldIdx, VariantIdx>) -> IrTypeLayout {
+    let mut fields = lower_fields_shape(&layout.fields);
+    if layout.size.bytes() == 0 && !layout.uninhabited && matches!(fields, IrFieldsShape::Primitive)
+    {
+        fields = IrFieldsShape::Arbitrary {
+            offsets: Vec::new(),
+            memory_index: Vec::new(),
+        };
+    }
     IrTypeLayout {
         size: lower_size(layout.size),
         align: lower_align(layout.align.abi),
         backend_repr: lower_backend_repr(layout.backend_repr),
-        fields: lower_fields_shape(&layout.fields),
+        fields,
         variants: lower_variants_shape(&layout.variants),
         is_uninhabited: layout.uninhabited,
         field_layouts: Vec::new(),
@@ -682,6 +946,22 @@ pub fn fallback_zst_layout() -> IrTypeLayout {
             offsets: Vec::new(),
             memory_index: Vec::new(),
         },
+        variants: IrVariantsShape::Single { index: 0 },
+        is_uninhabited: false,
+        field_layouts: Vec::new(),
+    }
+}
+
+/// Returns a placeholder `IrTypeLayout` for an uninstantiated generic type
+/// parameter (`TyKind::Param`), matching `TypeLayout.isParamPlaceholder` in
+/// `Trusted.Rustc.V2026_06_01.Layout` (`fields = .primitive`, `size = 0`,
+/// `isUninhabited = false`).
+pub fn placeholder_param_layout() -> IrTypeLayout {
+    IrTypeLayout {
+        size: IrSize { bytes: 0 },
+        align: IrAlign { bytes: 1 },
+        backend_repr: IrBackendRepr::Memory,
+        fields: IrFieldsShape::Primitive,
         variants: IrVariantsShape::Single { index: 0 },
         is_uninhabited: false,
         field_layouts: Vec::new(),
