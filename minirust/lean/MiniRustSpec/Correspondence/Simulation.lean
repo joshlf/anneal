@@ -901,6 +901,173 @@ theorem movesOk_iff_blockMovesOk {body : CapturedMir}
       ⟨fun s hs => statementOk_stmtMoved_lt (hst bb hbb s hs),
        terminatorOk_termMoved_lt (hterm bb hbb)⟩
 
+/-- `stmtMoved` is monotone with respect to membership in `mo`. -/
+theorem stmtMoved_mono {mo mo' : List Nat} (hsub : ∀ k ∈ mo, k ∈ mo')
+    (s : MirAst.Statement) {j : Nat} (hj : j ∈ stmtMoved mo s) :
+    j ∈ stmtMoved mo' s := by
+  obtain ⟨kind, span⟩ := s
+  cases kind with
+  | assign p rv =>
+    obtain ⟨i, proj⟩ := p
+    cases proj with
+    | nil =>
+      simp only [stmtMoved, List.mem_filter] at hj ⊢
+      refine ⟨(foldl_moveOut_mem (rvOperands rv) mo' j).mpr ?_, hj.2⟩
+      rcases (foldl_moveOut_mem (rvOperands rv) mo j).mp hj.1 with hmo | hmv
+      · exact .inl (hsub j hmo)
+      · exact .inr hmv
+    | cons _ _ =>
+      simp only [stmtMoved] at hj ⊢
+      apply (foldl_moveOut_mem (rvOperands rv) mo' j).mpr
+      rcases (foldl_moveOut_mem (rvOperands rv) mo j).mp hj with hmo | hmv
+      · exact .inl (hsub j hmo)
+      · exact .inr hmv
+  | storageLive i | storageDead i =>
+    simp only [stmtMoved, List.mem_filter] at hj ⊢
+    exact ⟨hsub j hj.1, hj.2⟩
+  | deinit p =>
+    obtain ⟨i, proj⟩ := p
+    cases proj with
+    | nil =>
+      simp only [stmtMoved, List.mem_filter] at hj ⊢
+      exact ⟨hsub j hj.1, hj.2⟩
+    | cons _ _ =>
+      simp only [stmtMoved] at hj ⊢
+      exact hsub j hj
+  | placeMention _ | setDiscriminant _ _ | retag _ _ | intrinsic _
+  | coverage | constEvalCounter | backwardIncompatibleDropHint _ | nop =>
+    simp only [stmtMoved] at hj ⊢
+    exact hsub j hj
+
+/-- `termMoved` is monotone with respect to membership in `mo`. -/
+theorem termMoved_mono {mo mo' : List Nat} (hsub : ∀ k ∈ mo, k ∈ mo')
+    (t : MirAst.Terminator) {j : Nat} (hj : j ∈ termMoved mo t) :
+    j ∈ termMoved mo' t := by
+  obtain ⟨kind, span⟩ := t
+  cases kind with
+  | switchInt discr _ =>
+    simp only [termMoved, moveOut] at hj ⊢
+    cases hmv : opMoved discr with
+    | none =>
+      simp only [hmv] at hj ⊢
+      exact hsub j hj
+    | some k =>
+      simp only [hmv, List.mem_cons] at hj ⊢
+      rcases hj with rfl | hmo
+      · exact .inl rfl
+      · exact .inr (hsub j hmo)
+  | goto _ | unreachable | return_ | unwindResume | unwindTerminate | drop _ _ _
+  | call _ _ _ _ _ | tailCall _ _ | assert _ _ _ _ | inlineAsm _ _ _ =>
+    simp only [termMoved] at hj ⊢
+    exact hsub j hj
+
+/-- One pass of `stepMovedEntries` preserves containment inside any pre-fixed
+point `entries'` of the CFG outgoing-edge constraints. -/
+theorem stepMovedEntries_least {bbs : List BasicBlockData}
+    {entries entries' : List (List Nat)}
+    (hsub : ∀ blk < bbs.length, ∀ j ∈ entries.getD blk [], j ∈ entries'.getD blk [])
+    (hpre : ∀ src dst (bb : BasicBlockData),
+      bbs[src]? = some bb → dst < bbs.length → dst ∈ termTargets bb.terminator →
+      ∀ j ∈ termMoved (bb.statements.foldl stmtMoved (entries'.getD src [])) bb.terminator,
+        j ∈ entries'.getD dst []) :
+    ∀ dst < bbs.length,
+      ∀ j ∈ (stepMovedEntries bbs entries).getD dst [], j ∈ entries'.getD dst [] := by
+  have hfold_ss : ∀ (ss : List MirAst.Statement) {mo mo' : List Nat},
+      (∀ k ∈ mo, k ∈ mo') →
+      ∀ k ∈ ss.foldl stmtMoved mo, k ∈ ss.foldl stmtMoved mo' := by
+    intro ss
+    induction ss with
+    | nil => intro _ _ h k hk; exact h k hk
+    | cons s ss ih =>
+      intro _ _ h k hk
+      exact ih (fun _ hm => stmtMoved_mono h s hm) k hk
+  intro dst hdst
+  let stepFn (acc : List Nat) (src : Nat) : List Nat :=
+    match bbs[src]? with
+    | some bb =>
+      if (termTargets bb.terminator).contains dst then
+        unionLocals acc
+          (termMoved (bb.statements.foldl stmtMoved (entries.getD src [])) bb.terminator)
+      else acc
+    | none => acc
+  have hsrcs : ∀ (srcs : List Nat) (acc : List Nat),
+      (∀ j ∈ acc, j ∈ entries'.getD dst []) →
+      ∀ j ∈ srcs.foldl stepFn acc, j ∈ entries'.getD dst [] := by
+    intro srcs
+    induction srcs with
+    | nil => intro acc hacc j hj; exact hacc j hj
+    | cons s srcs ih =>
+      intro acc hacc j hj
+      apply ih (stepFn acc s) _ j hj
+      intro k hk
+      simp only [stepFn] at hk
+      cases hbb : bbs[s]? with
+      | none => simp [hbb] at hk; exact hacc k hk
+      | some bb =>
+        simp only [hbb] at hk
+        by_cases hcont : (termTargets bb.terminator).contains dst = true
+        · simp only [hcont, ↓reduceIte] at hk
+          rcases (unionLocals_mem _ _ _).mp hk with h1 | h2
+          · exact hacc k h1
+          · have hs_lt : s < bbs.length := (List.getElem?_eq_some_iff.mp hbb).1
+            have htgt : dst ∈ termTargets bb.terminator := List.contains_iff_mem.mp hcont
+            have htm : k ∈ termMoved
+                (bb.statements.foldl stmtMoved (entries'.getD s [])) bb.terminator :=
+              termMoved_mono (hfold_ss bb.statements (hsub s hs_lt)) bb.terminator h2
+            exact hpre s dst bb hbb hdst htgt k htm
+        · simp only [Bool.not_eq_true] at hcont
+          simp only [hcont, Bool.false_eq_true, ↓reduceIte] at hk
+          exact hacc k hk
+  have hget : (stepMovedEntries bbs entries).getD dst [] =
+      (List.range bbs.length).foldl stepFn (entries.getD dst []) := by
+    simp only [stepMovedEntries, stepFn, List.getD, List.getElem?_map,
+      List.getElem?_range hdst, Option.map_some, Option.getD_some]
+    rfl
+  rw [hget]
+  exact hsrcs (List.range bbs.length) (entries.getD dst []) (hsub dst hdst)
+
+/-- For any `fuel`, `iterMovedEntries fuel bbs []` is contained in every
+pre-fixed point `entries'` of the CFG outgoing-edge constraints. -/
+theorem iterMovedEntries_least (fuel : Nat) (bbs : List BasicBlockData)
+    (entries' : List (List Nat))
+    (hpre : ∀ src dst (bb : BasicBlockData),
+      bbs[src]? = some bb → dst < bbs.length → dst ∈ termTargets bb.terminator →
+      ∀ j ∈ termMoved (bb.statements.foldl stmtMoved (entries'.getD src [])) bb.terminator,
+        j ∈ entries'.getD dst []) :
+    ∀ dst < bbs.length,
+      ∀ j ∈ (iterMovedEntries fuel bbs []).getD dst [], j ∈ entries'.getD dst [] := by
+  have haux : ∀ (n : Nat) (entries : List (List Nat)),
+      (∀ blk < bbs.length, ∀ j ∈ entries.getD blk [], j ∈ entries'.getD blk []) →
+      ∀ dst < bbs.length,
+        ∀ j ∈ (iterMovedEntries n bbs entries).getD dst [], j ∈ entries'.getD dst [] := by
+    intro n
+    induction n with
+    | zero => intro entries hsub dst hdst; exact hsub dst hdst
+    | succ m ih =>
+      intro entries hsub dst hdst j hj
+      simp only [iterMovedEntries] at hj
+      split at hj
+      · exact hsub dst hdst j hj
+      · exact ih (stepMovedEntries bbs entries)
+          (stepMovedEntries_least hsub hpre) dst hdst j hj
+  exact haux fuel [] (fun blk _ j hj => by simp [List.getD] at hj)
+
+/-- Least fixed-point optimality of `movedAtEntry`: for any pre-fixed point
+`entries'` of `body`'s forward move-tracking equations, `movedAtEntry body dst`
+is a subset of `entries'.getD dst []` at every block
+`dst < body.basicBlocks.length`. -/
+theorem movedAtEntry_least {body : CapturedMir} {entries' : List (List Nat)}
+    (hpre : ∀ src dst (bb : BasicBlockData),
+      body.basicBlocks[src]? = some bb → dst < body.basicBlocks.length →
+      dst ∈ termTargets bb.terminator →
+      ∀ j ∈ termMoved (bb.statements.foldl stmtMoved (entries'.getD src [])) bb.terminator,
+        j ∈ entries'.getD dst [])
+    {dst : Nat} (hdst : dst < body.basicBlocks.length) :
+    ∀ j ∈ movedAtEntry body dst, j ∈ entries'.getD dst [] :=
+  iterMovedEntries_least
+    (body.basicBlocks.length * (body.localDecls.length + 1))
+    body.basicBlocks entries' hpre dst hdst
+
 theorem movedBefore_zero (body : CapturedMir) (blk : Nat) :
     movedBefore body blk 0 = movedAtEntry body blk := by
   unfold movedBefore

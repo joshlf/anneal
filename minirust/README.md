@@ -322,8 +322,8 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
 programs, computing both semantics in the kernel (`decide`/`rfl`, no
 `native_decide`):
 
-* `tempMove`, `crossBlockMove`, `loopTempMove`, `storageLiveArgRet`, and
-  `diamondMoveJoin` (MR-1.3): `tempMove` is
+* `tempMove`, `crossBlockMove`, `loopTempMove`, `storageLiveArgRet`,
+  `diamondMoveJoin`, and `tupleAggCastMove` (MR-1.3): `tempMove` is
   `fn(x: u32) -> u32 { let y = (x + 1) * 2; if y == 8 { 100 } else { y } }`
   with `u32` and `bool` temporaries, `StorageLive`/`StorageDead`, root `move`
   in a `BinaryOp`, a `Use`, and a `switchInt` discriminant, `Deinit` of a
@@ -346,25 +346,31 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `diamondMoveJoin` merges asymmetric moved-out sets across a 4-block diamond
   CFG (`movedAtEntry` joining outgoing `[1]` and `[2, 1]` to `[1, 2]` at `bb3`)
   while returning a join-initialized temporary (`diamondMoveJoinTrue_*`,
-  `diamondMoveJoinFalse_*`); `deadRead`, `deadAssign`, `deadDeinit`, and
-  `deadPlaceMention` access a local (including projected `PlaceMention(_1.0)`)
-  after `StorageDead` (UB in both models via `mirCall_ub`,
+  `diamondMoveJoinFalse_*`); `tupleAggCastMove` exercises `Operand::Move`
+  inside `Rvalue::UnaryOp(Neg, move _1)`, `Rvalue::Cast(IntToInt, move _2, u32)`,
+  `Rvalue::UnaryOp(Not, move _4)` (self-assign move),
+  `Rvalue::Aggregate(Tuple, [move _3, move _4])`, and projected field move
+  `Use(move (_5.0))` (`tupleAggCastMoveNeg5_*`); `deadRead`, `deadAssign`,
+  `deadDeinit`, and `deadPlaceMention` access a local (including projected
+  `PlaceMention(_1.0)`) after `StorageDead` (UB in both models via `mirCall_ub`,
   `mirCall_steps_error`, `mirCall_outcome`, and direct runs); `moveReuse`,
   `crossBlockMoveReuse`, `loopBackEdgeReuse`, `projAssignMoveReuse`,
-  `sameRvalueMoveReuse`, `moveRetPlace`, and `diamondHalfMoveReuse` read a
-  local after moving out of it — across statements, blocks, cyclic back-edges,
-  projected assignments, operands of a single rvalue (`readsOk`), `Return`
-  (`termReadsOk`), and one-armed diamond merges — rejected by `movesOk` with
-  concrete semantic disagreements (`moveReuse7_*`, `loopBackEdgeReuse1_*`,
-  `sameRvalueMoveReuse5_*`, `moveRetPlace_*`, `diamondHalfMoveReuseFalse_*`);
-  `unmarkedTempAssign`, `storageDeadRet`, `storageDeadArg`, and
-  `projectedDeinit` exercise the soundness and well-formedness boundaries of
-  `mentionsOk`, `storageDeadOk` (for both `_0` and arguments), and
-  projection-free `Deinit` with concrete semantic disagreements; and
-  `bm_allocate_and_deallocate_ub_cases` /
+  `projFieldMoveReuse`, `sameRvalueMoveReuse`, `moveRetPlace`, and
+  `diamondHalfMoveReuse` read a local after moving out of it — across
+  statements, blocks, cyclic back-edges, projected assignments, projected
+  field reads after a root tuple move, operands of a single rvalue (`readsOk`),
+  `Return` (`termReadsOk`), and one-armed diamond merges — rejected by `movesOk`
+  with concrete semantic disagreements (`moveReuse7_*`, `loopBackEdgeReuse1_*`,
+  `projFieldMoveReuse_*`, `sameRvalueMoveReuse5_*`, `moveRetPlace_*`,
+  `diamondHalfMoveReuseFalse_*`); `unmarkedTempAssign`, `storageDeadRet`,
+  `storageDeadArg`, `storageDeadArgReadAfter`, and `projectedDeinit` exercise
+  the soundness and well-formedness boundaries of `mentionsOk`, `storageDeadOk`
+  (for both `_0` and arguments), and projection-free `Deinit` with concrete
+  execution and UB witnesses; and `bm_allocate_and_deallocate_ub_cases` /
   `evalStatement_deinit_ok_dead_and_misaligned` directly verify the UB and
   normal paths of `BM.allocate`, `BM.deallocate` (including exact
-  `AllocationKind` diagnostic formatting), and `Statement::Deinit`.
+  `AllocationKind` diagnostic formatting across all five `AllocationKind`
+  variants), and `Statement::Deinit`.
 
 * `sumTo`, the MIR of a `u32` loop with `switchInt`, wrapping `Add`/`Sub`,
   constants, and `Goto`: Anneal returns `6` for `n = 3`

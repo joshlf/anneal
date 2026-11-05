@@ -95,10 +95,13 @@ as a pass.
     `iterMovedEntries_mono`, `iterMovedEntries_eq_of_fixed`,
     `terminatorOk_targets_lt`, `movesOk_of_fixed`, `unionLocals_eq_or_mem_new`,
     `stepMovedEntries_eq_or_strict`, `iterMovedEntries_stabilizes`,
-    `statementOk_stmtMoved_lt`, `terminatorOk_termMoved_lt`, and
-    `movesOk_iff_blockMovesOk` (unconditional finite-fuel fixed-point
-    convergence and exact `blockMovesOk` characterization on well-typed CFGs)
-    for the monotone forward CFG dataflow `movedAtEntry`; `step_start` runs the
+    `statementOk_stmtMoved_lt`, `terminatorOk_termMoved_lt`,
+    `movesOk_iff_blockMovesOk`, `stmtMoved_mono`, `termMoved_mono`,
+    `stepMovedEntries_least`, `iterMovedEntries_least`, and
+    `movedAtEntry_least` (unconditional finite-fuel fixed-point convergence,
+    Knaster–Tarski least fixed-point optimality, and exact `blockMovesOk`
+    characterization on well-typed CFGs) for the monotone forward CFG dataflow
+    `movedAtEntry`; `step_start` runs the
     init block in `initLen body` MiniRust steps; all `Run.lean` theorems
     (`mirSimRun`) are re-proved, with the `*_from_start` step counts
     `initLen body + n`.
@@ -126,33 +129,40 @@ as a pass.
     `SwitchInt(move _3)`, `Deinit(_3)`, and `StorageDead(_3)`, live
     re-allocation of `_2`, and idempotent `StorageDead(_2)` on `n = 0`
     (`loopTempMove3_*`, `loopTempMove0_*`, including `mirCall_progress`).
-  - `storageLiveArgRet` and `diamondMoveJoin`: `StorageLive(_1)` and
-    `StorageLive(_0)` re-allocating an argument local and the return place from
-    their initial `< 2^32` allocations onto `allocCandidate` addresses before
-    `Return` (`storageLiveArgRet5_*`), and a 4-block diamond CFG merging
-    asymmetric moved-out sets (outgoing `[1]` and `[2, 1]` joining to `[1, 2]`
-    at `bb3`) across both `SwitchInt` branches (`diamondMoveJoinTrue_*`,
-    `diamondMoveJoinFalse_*`).
+  - `storageLiveArgRet`, `diamondMoveJoin`, and `tupleAggCastMove`:
+    `StorageLive(_1)` and `StorageLive(_0)` re-allocating an argument local and
+    the return place from their initial `< 2^32` allocations onto
+    `allocCandidate` addresses before `Return` (`storageLiveArgRet5_*`), a
+    4-block diamond CFG merging asymmetric moved-out sets (outgoing `[1]` and
+    `[2, 1]` joining to `[1, 2]` at `bb3`) across both `SwitchInt` branches
+    (`diamondMoveJoinTrue_*`, `diamondMoveJoinFalse_*`), and `Operand::Move`
+    across `UnaryOp(Neg, move _1)`, `Cast(IntToInt, move _2, u32)`,
+    `UnaryOp(Not, move _4)` (self-assign move),
+    `Aggregate(Tuple, [move _3, move _4])`, and projected `Use(move (_5.0))`
+    (`tupleAggCastMoveNeg5_*`).
   - `deadRead`, `deadAssign`, `deadDeinit`, and `deadPlaceMention`: reading,
     assigning, de-initializing, or mentioning (including projected `_1.0`) a
     temporary after `StorageDead` is UB in both models (`mirCall_ub`,
     `mirCall_steps_error`, `mirCall_outcome`, and direct runs).
   - `moveReuse`, `crossBlockMoveReuse`, `loopBackEdgeReuse`,
-    `projAssignMoveReuse`, `sameRvalueMoveReuse`, `moveRetPlace`, and
-    `diamondHalfMoveReuse`: intra-block, cross-block, cyclic back-edge,
-    projected-assignment, intra-rvalue (`readsOk`), `Return`-terminator
-    (`termReadsOk`), and one-armed diamond-merge bodies that read a local after
-    moving out of it; `movesOk` rejects all seven, and the models disagree on
-    `moveReuse(7)`, `loopBackEdgeReuse(1)`, `sameRvalueMoveReuse(5)`,
-    `moveRetPlace`, and `diamondHalfMoveReuse(false, 7)`.
-  - `unmarkedTempAssign`, `storageDeadRet`, `storageDeadArg`, and
-    `projectedDeinit`: bodies exercising the soundness and well-formedness
-    boundaries of `mentionsOk`, `storageDeadOk` (for both `_0` and arguments at
-    `i = argCount`), and projection-free `Deinit`, accompanied by concrete
-    semantic disagreements between Anneal and MiniRust.
+    `projAssignMoveReuse`, `projFieldMoveReuse`, `sameRvalueMoveReuse`,
+    `moveRetPlace`, and `diamondHalfMoveReuse`: intra-block, cross-block,
+    cyclic back-edge, projected-assignment, projected-field-after-root-move,
+    intra-rvalue (`readsOk`), `Return`-terminator (`termReadsOk`), and
+    one-armed diamond-merge bodies that read a local after moving out of it;
+    `movesOk` rejects all eight, and the models disagree on `moveReuse(7)`,
+    `loopBackEdgeReuse(1)`, `projFieldMoveReuse(11, true)`,
+    `sameRvalueMoveReuse(5)`, `moveRetPlace`, and
+    `diamondHalfMoveReuse(false, 7)`.
+  - `unmarkedTempAssign`, `storageDeadRet`, `storageDeadArg`,
+    `storageDeadArgReadAfter`, and `projectedDeinit`: bodies exercising the
+    soundness and well-formedness boundaries of `mentionsOk`, `storageDeadOk`
+    (for both `_0` and arguments at `i = argCount`), and projection-free
+    `Deinit`, accompanied by concrete execution and UB witnesses.
   - Direct ground-truth checks for `BM.allocate` (`!x86_64.valid_size` UB), all
     six `BM.deallocate` UB diagnostics including exact `AllocationKind`
-    formatting (`bm_allocate_and_deallocate_ub_cases`), and
+    formatting across all five `AllocationKind` variants
+    (`bm_allocate_and_deallocate_ub_cases`), and
     `evalStatement (.Deinit ..)` / `CM.deinit` on live, dead, out-of-bounds,
     and misaligned targets (`evalStatement_deinit_ok_dead_and_misaligned`).
   - Every pre-existing witness is re-proved against the new relation (the
@@ -201,9 +211,9 @@ Pass: `Build completed successfully`, with:
 
 ```text
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
-[SIMULATION-AUDIT] decls=165 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
-[WITNESS-AUDIT] decls=342 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-MiniRustSpec.Audit: exhaustively verified standard axioms for 10299 declarations across all MiniRustSpec.* modules
+[SIMULATION-AUDIT] decls=170 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
+[WITNESS-AUDIT] decls=361 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+MiniRustSpec.Audit: exhaustively verified standard axioms for 10351 declarations across all MiniRustSpec.* modules
 ```
 
 (`lake` prints already-built modules without re-running them; to see the audit
@@ -220,15 +230,18 @@ lines again after a successful build, touch
 - `inFragment crossBlockMove = true`, `crossBlockMove_movedAtEntry`,
   `inFragment loopTempMove = true`, `loopTempMove_movedAtEntry_multiPass`,
   `inFragment storageLiveArgRet = true`, `inFragment diamondMoveJoin = true`,
-  and `diamondMoveJoin_movedAtEntry` are proved by `decide`, showing that
-  `movesOk` accepts moving `_1` in `bb0`, propagating live temporaries across
-  `Goto` and `SwitchInt` edges, converging across cyclic loop back-edges and
-  diamond merges, and re-allocating argument/return locals via `StorageLive`.
+  `diamondMoveJoin_movedAtEntry`, and `inFragment tupleAggCastMove = true` are
+  proved by `decide`, showing that `movesOk` accepts moving `_1` in `bb0`,
+  propagating live temporaries across `Goto` and `SwitchInt` edges, converging
+  across cyclic loop back-edges and diamond merges, moving across `UnaryOp`,
+  `Cast(IntToInt)`, and `Aggregate(Tuple, ..)`, and re-allocating
+  argument/return locals via `StorageLive`.
 - `moveReuse_not_inFragment`, `crossBlockMoveReuse_movesOk`,
   `loopBackEdgeReuse_movesOk`, `projAssignMoveReuse_movesOk`,
-  `sameRvalueMoveReuse_movesOk`, `moveRetPlace_movesOk`,
-  `diamondHalfMoveReuse_movesOk`, `unmarkedTempAssign_rejected`,
-  `storageDeadRet_rejected`, `storageDeadArg_rejected`, and
+  `projFieldMoveReuse_movesOk`, `sameRvalueMoveReuse_movesOk`,
+  `moveRetPlace_movesOk`, `diamondHalfMoveReuse_movesOk`,
+  `unmarkedTempAssign_rejected`, `storageDeadRet_rejected`,
+  `storageDeadArg_rejected`, `storageDeadArgReadAfter_rejected`, and
   `projectedDeinit_rejected` are proved by `decide`, so none of the fragment's
   side-conditions is vacuous.
 

@@ -87,18 +87,21 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
   data in memory violates the language invariant"` UB), alongside ground-truth
   checks of all four `IntBinOp::DivExact` outcomes.
 * `tempMove`, `crossBlockMove`, `loopTempMove`, `storageLiveArgRet`,
-  `diamondMoveJoin`, `deadRead`, `deadAssign`, `deadDeinit`,
-  `deadPlaceMention`, `moveReuse`, `crossBlockMoveReuse`, `loopBackEdgeReuse`,
-  `projAssignMoveReuse`, `sameRvalueMoveReuse`, `moveRetPlace`,
-  `diamondHalfMoveReuse`, `unmarkedTempAssign`, `storageDeadRet`,
-  `storageDeadArg`, and `projectedDeinit` (MR-1.3): temporaries with
+  `diamondMoveJoin`, `tupleAggCastMove`, `deadRead`, `deadAssign`,
+  `deadDeinit`, `deadPlaceMention`, `moveReuse`, `crossBlockMoveReuse`,
+  `loopBackEdgeReuse`, `projAssignMoveReuse`, `projFieldMoveReuse`,
+  `sameRvalueMoveReuse`, `moveRetPlace`, `diamondHalfMoveReuse`,
+  `unmarkedTempAssign`, `storageDeadRet`, `storageDeadArg`,
+  `storageDeadArgReadAfter`, and `projectedDeinit` (MR-1.3): temporaries with
   `StorageLive`/`StorageDead` (including `StorageLive` on `_0` and argument
-  locals), root and projected `move` across straight-line, branching, diamond
-  join, and cyclic loop CFGs (with multi-pass back-edge `movedAtEntry` fixpoint
-  convergence), `Deinit`, multi-local `initBlock` allocation of heterogeneous
-  temporaries, first-fit address reuse, dead-local UB across reads, `Assign`,
-  `Deinit`, and projected `PlaceMention`, and concrete semantic counterexamples
-  showing why `movesOk` (including intra-rvalue, `Return`, diamond merge, and
+  locals), root and projected `move` across `Use`, `UnaryOp`, `BinaryOp`,
+  `Cast(IntToInt)`, `Aggregate(Tuple, ..)`, and `SwitchInt` in straight-line,
+  branching, diamond join, and cyclic loop CFGs (with multi-pass back-edge
+  `movedAtEntry` fixpoint convergence), `Deinit`, multi-local `initBlock`
+  allocation of heterogeneous temporaries, first-fit address reuse, dead-local
+  UB across reads, `Assign`, `Deinit`, and projected `PlaceMention`, and
+  concrete semantic counterexamples showing why `movesOk` (including
+  intra-rvalue, projected sibling-field, `Return`, diamond merge, and
   back-edge checks), `mentionsOk`, `storageDeadOk` (for both `_0` and
   arguments), and projection-free `Deinit` are each necessary for soundness.
   Their direct MiniRust runs allocate, so they are checked by `decide +kernel`
@@ -5078,8 +5081,9 @@ theorem unmarkedTempAssign_minirust_direct :
 `BM.deallocate` raises each of the six upstream UB diagnostics from
 `spec/mem/basic.md` (provenance `None`, double-free of a dead allocation,
 non-zero offset from `alloc.addr`, wrong `AllocationKind` formatting both the
-allocation's kind and the requested operation kind, wrong `Size`, and wrong
-`Align`). -/
+allocation's kind and the requested operation kind across all five
+`AllocationKind` variants `Stack`, `Heap`, `Global`, `Function`, and `VTable`,
+wrong `Size`, and wrong `Align`). -/
 theorem bm_allocate_and_deallocate_ub_cases :
     BM.allocate { tempMove3MInit.mem.memory with allocations := [] } .Stack ⟨2 ^ 63⟩ ⟨1⟩ =
       .error (.ub "asking for a too large allocation") ∧
@@ -5095,13 +5099,21 @@ theorem bm_allocate_and_deallocate_ub_cases :
     BM.deallocate tempMove3MInit.mem.memory
       { addr := 64, provenance := some (⟨0⟩, ()) } .Heap ⟨4⟩ ⟨4⟩ =
       .error (.ub "deallocating Stack memory with Heap deallocation operation") ∧
+    BM.deallocate
+      { tempMove3MInit.mem.memory with allocations := [{ retAlloc with kind := .Global }] }
+      { addr := 64, provenance := some (⟨0⟩, ()) } .Function ⟨4⟩ ⟨4⟩ =
+      .error (.ub "deallocating Global memory with Function deallocation operation") ∧
+    BM.deallocate
+      { tempMove3MInit.mem.memory with allocations := [{ retAlloc with kind := .VTable }] }
+      { addr := 64, provenance := some (⟨0⟩, ()) } .Stack ⟨4⟩ ⟨4⟩ =
+      .error (.ub "deallocating VTable memory with Stack deallocation operation") ∧
     BM.deallocate tempMove3MInit.mem.memory
       { addr := 64, provenance := some (⟨0⟩, ()) } .Stack ⟨8⟩ ⟨4⟩ =
       .error (.ub "deallocating with incorrect size information") ∧
     BM.deallocate tempMove3MInit.mem.memory
       { addr := 64, provenance := some (⟨0⟩, ()) } .Stack ⟨4⟩ ⟨8⟩ =
       .error (.ub "deallocating with incorrect alignment information") :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- `evalStatement` for `Statement::Deinit` replaces the bytes of a live local
 with `AbstractByte.Uninit`, raises `"access to a dead local"` on a dead local,
@@ -6086,6 +6098,96 @@ theorem storageDeadArg_rejected :
     storageDeadOk storageDeadArg = false ∧
     inFragment storageDeadArg = false := by decide
 
+def storageDeadArgFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 0)) (.Load (.Local (localName 1))),
+      .StorageDead (localName 1)],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem storageDeadArg_translate :
+    translateFn storageDeadArg = some storageDeadArgFn := rfl
+
+def storageDeadArg5S0 : MachineState :=
+  initMachineState storageDeadArg [.scalar ⟨5, 4⟩]
+
+theorem storageDeadArg5_anneal_ret :
+    ReachesRet (mirTree storageDeadArg storageDeadArg5S0) []
+      (.normal (.scalar ⟨5, 4⟩, storageDeadArg5S0.memory)) :=
+  runA_sound storageDeadArg 10 _ _ _ rfl
+
+theorem storageDeadArg5_minirust_direct :
+    (Interp.steps 4 (machine storageDeadArg storageDeadArgFn
+        storageDeadArg5S0.frame.locals storageDeadArgFn.start)).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length),
+          m.mem.memory.allocations.map (·.live))) =
+      some (some { retAlloc with data := scalarBytes u32 5 }, [1],
+        [true, false, false]) := by
+  decide +kernel
+
+/-- `StorageDead(_1); _0 = Use(copy _1); return` for `fn(u32) -> u32`:
+rejected by `storageDeadOk = false` (`1 ≤ argCount`), and reading `_1` after
+`StorageDead(_1)` faults with UB in both Anneal (`storageDeadArgReadAfter5_anneal_ub`)
+and MiniRust (`storageDeadArgReadAfter5_minirust_ub`, raising
+`"access to a dead local"`). -/
+def storageDeadArgReadAfter : CapturedMir where
+  defPath := "witness::storage_dead_arg_read_after"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageDead 1),
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem storageDeadArgReadAfter_rejected :
+    storageDeadOk storageDeadArgReadAfter = false ∧
+    inFragment storageDeadArgReadAfter = false := by decide
+
+def storageDeadArgReadAfterFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageDead (localName 1),
+      .Assign (.Local (localName 0)) (.Load (.Local (localName 1)))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem storageDeadArgReadAfter_translate :
+    translateFn storageDeadArgReadAfter = some storageDeadArgReadAfterFn := rfl
+
+def storageDeadArgReadAfter5S0 : MachineState :=
+  initMachineState storageDeadArgReadAfter [.scalar ⟨5, 4⟩]
+
+theorem storageDeadArgReadAfter5_anneal_ub :
+    ∃ tr u, Reaches (mirTree storageDeadArgReadAfter storageDeadArgReadAfter5S0) tr u ∧
+      FaultNow u :=
+  faultsA_sound storageDeadArgReadAfter 10 _ (by decide)
+
+theorem storageDeadArgReadAfter5_minirust_ub :
+    (match Interp.steps 3 (machine storageDeadArgReadAfter storageDeadArgReadAfterFn
+        storageDeadArgReadAfter5S0.frame.locals storageDeadArgReadAfterFn.start) with
+      | .error (.ub msg) => some msg
+      | _ => none) = some "access to a dead local" := by
+  decide +kernel
+
 /-- Caller context placing `_0`, `_1`, and `_2` at distinct non-zero addresses
 `128`, `256`, and `384` below `2^32` for two-argument `(bool, u32) -> u32`
 diamond witnesses. -/
@@ -6360,6 +6462,226 @@ theorem diamondHalfMoveReuseFalse_minirust_direct :
         diamondHalfMoveReuseFalseS0.frame.locals diamondHalfMoveReuseFn.start)).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAlloc with data := scalarBytes u32 14 }, [1]) := by
+  decide +kernel
+
+/-- Caller context for `[u32Decl, i8Decl, i8Decl, u32Decl, boolDecl, u32BoolTupleDecl]`. -/
+def ctx0_tupleAggCastMove : Ctx :=
+  { ctx0 with addrs := [128, 256, 384, 512, 640, 768] }
+
+theorem ctx0_ok_tupleAggCastMove {body : CapturedMir}
+    (h : body.localDecls = [u32Decl, i8Decl, i8Decl, u32Decl, boolDecl, u32BoolTupleDecl]) :
+    CtxOk body ctx0_tupleAggCastMove where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | 2, hd => simp at hd; subst hd; decide
+    | 3, hd => simp at hd; subst hd; decide
+    | 4, hd => simp at hd; subst hd; decide
+    | 5, hd => simp at hd; subst hd; decide
+    | _ + 6, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- `tupleAggCastMove`: `fn(x: i8) -> u32` exercising `Operand::Move` across
+`Rvalue::UnaryOp(Neg, move _1)` on `i8`, `Rvalue::Cast(IntToInt, move _2, u32)`
+from `i8` to `u32`, `Rvalue::UnaryOp(Not, move _4)` on `bool` (self-assign
+move), `Rvalue::Aggregate(Tuple, [move _3, move _4])` constructing a `(u32, bool)`
+tuple from two moved operands, and `Rvalue::Use(move (_5.0))` projected field
+move followed by `StorageDead(_5)`. -/
+def tupleAggCastMove : CapturedMir where
+  defPath := "witness::tuple_agg_cast_move"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, i8Decl, i8Decl, u32Decl, boolDecl, u32BoolTupleDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.assign (local_ 2) (.unaryOp .neg (.move (local_ 1)))),
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 3) (.cast .intToInt (.move (local_ 2)) u32Ty)),
+        mkStmt (.storageDead 2),
+        mkStmt (.storageLive 4),
+        mkStmt (.assign (local_ 4) (.binaryOp .gt (.copy (local_ 3)) (constU32 0))),
+        mkStmt (.assign (local_ 4) (.unaryOp .not (.move (local_ 4)))),
+        mkStmt (.storageLive 5),
+        mkStmt (.assign (local_ 5) (.aggregate .tuple [.move (local_ 3), .move (local_ 4)])),
+        mkStmt (.storageDead 3),
+        mkStmt (.storageDead 4),
+        mkStmt (.assign (local_ 0) (.use (.move (field0U32 5)))),
+        mkStmt (.storageDead 5)],
+      terminator := mkTerm .return_,
+      isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem tupleAggCastMove_inFragment : inFragment tupleAggCastMove = true := by decide
+
+def tupleAggCastMoveFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int i8), (localName 2, .Int i8),
+    (localName 3, .Int u32), (localName 4, .Bool), (localName 5, intBoolTupleTy u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2),
+      .Assign (.Local (localName 2)) (.UnOp (.Int .Neg) (.Load (.Local (localName 1)))),
+      .StorageLive (localName 3),
+      .Assign (.Local (localName 3))
+        (.UnOp (.Cast (.IntToInt u32)) (.Load (.Local (localName 2)))),
+      .StorageDead (localName 2),
+      .StorageLive (localName 4),
+      .Assign (.Local (localName 4))
+        (.BinOp (.Rel .Gt) (.Load (.Local (localName 3))) (.Constant (.Int 0) (.Int u32))),
+      .Assign (.Local (localName 4)) (boolNot (.Load (.Local (localName 4)))),
+      .StorageLive (localName 5),
+      .Assign (.Local (localName 5))
+        (.Tuple [.Load (.Local (localName 3)), .Load (.Local (localName 4))]
+          (intBoolTupleTy u32)),
+      .StorageDead (localName 3),
+      .StorageDead (localName 4),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 5)) 0)),
+      .StorageDead (localName 5)],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem tupleAggCastMove_translate :
+    translateFn tupleAggCastMove = some tupleAggCastMoveFn := rfl
+
+def tupleAggCastMoveNeg5Args : List Value := [.scalar ⟨251, 1⟩]
+def tupleAggCastMoveNeg5S0 : MachineState :=
+  initMachineState tupleAggCastMove tupleAggCastMoveNeg5Args
+def tupleAggCastMoveNeg5MInit : Mach :=
+  machineWithCtx ctx0_tupleAggCastMove tupleAggCastMove tupleAggCastMoveFn
+    tupleAggCastMoveNeg5S0.frame.locals tupleAggCastMoveFn.start
+
+theorem tupleAggCastMoveNeg5_anneal_ret :
+    ReachesRet (mirTree tupleAggCastMove tupleAggCastMoveNeg5S0) []
+      (.normal (.scalar ⟨5, 4⟩, tupleAggCastMoveNeg5S0.memory)) :=
+  runA_sound tupleAggCastMove 25 _ _ _ rfl
+
+theorem tupleAggCastMoveNeg5_noUB :
+    MirNoUBTree (mirCallTree tupleAggCastMove tupleAggCastMoveNeg5Args) :=
+  runA_noUB tupleAggCastMove 25 _ _ _ rfl
+
+theorem tupleAggCastMoveNeg5_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (initLen tupleAggCastMove + n) tupleAggCastMoveNeg5MInit = .ok m' ∧
+      StateRel tupleAggCastMove tupleAggCastMoveFn ctx0_tupleAggCastMove s' m' ∧
+      Reaches (mirCallTree tupleAggCastMove tupleAggCastMoveNeg5Args) tr
+        (mirTree tupleAggCastMove s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen tupleAggCastMove + n ∧
+      Interp.steps k tupleAggCastMoveNeg5MInit = .ok mRet ∧
+      ReturnRel tupleAggCastMove ctx0_tupleAggCastMove s' v mRet ∧
+      ReachesRet (mirCallTree tupleAggCastMove tupleAggCastMoveNeg5Args) tr
+        (.normal (v, mem))) :=
+  mirCall_progress tupleAggCastMove_inFragment tupleAggCastMove_translate ctx0_tupleAggCastMove
+    (ctx0_ok_tupleAggCastMove rfl) tupleAggCastMoveNeg5Args (by decide)
+    tupleAggCastMoveNeg5MInit rfl rfl rfl tupleAggCastMoveNeg5_noUB n
+
+theorem tupleAggCastMoveNeg5_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n tupleAggCastMoveNeg5MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 5 } ∧
+      m'.threads = [thread1 ctx0_tupleAggCastMove
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret tupleAggCastMove_inFragment tupleAggCastMove_translate ctx0_tupleAggCastMove
+      (ctx0_ok_tupleAggCastMove rfl) tupleAggCastMoveNeg5Args (by decide)
+      tupleAggCastMoveNeg5MInit rfl rfl rfl tupleAggCastMoveNeg5_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [tupleAggCastMove] at hd; subst hd
+  simp [retPtr, ctx0_tupleAggCastMove, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0_tupleAggCastMove, ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem tupleAggCastMoveNeg5_minirust_direct :
+    (Interp.steps 16 tupleAggCastMoveNeg5MInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 5 }, [1]) := by
+  decide +kernel
+
+/-- Projected field read after root tuple move (`projFieldMoveReuse`):
+moving out of the root tuple `_3` (`_4 = Use(move _3)`) deinitializes `_3` in
+Anneal's `evalOperand` (`s.frame.locals[3] := .uninit`), so subsequently
+reading the projected field `_3.0` (`_0 = Use(copy (_3.0))`) faults with `.ub`
+in Anneal while succeeding in MiniRust (which translates `move _3` to
+`Load(Local(_3))` without deinitializing `_3`). `movesOk` rejects
+`projFieldMoveReuse` because `opMoved (.move (local_ 3)) = some 3` marks local
+`3` moved out and `opRead (.copy (field0U32 3)) = some 3` detects the projected
+read of `3`. -/
+def projFieldMoveReuse : CapturedMir where
+  defPath := "witness::proj_field_move_reuse"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, u32Decl, boolDecl, u32BoolTupleDecl, u32BoolTupleDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 3) (.aggregate .tuple [.move (local_ 1), .move (local_ 2)])),
+        mkStmt (.storageLive 4),
+        mkStmt (.assign (local_ 4) (.use (.move (local_ 3)))),
+        mkStmt (.assign (local_ 0) (.use (.copy (field0U32 3)))),
+        mkStmt (.storageDead 4),
+        mkStmt (.storageDead 3)],
+      terminator := mkTerm .return_,
+      isCleanup := false }]
+  fnAbi := fnAbi 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem projFieldMoveReuse_movesOk :
+    movesOk projFieldMoveReuse = false ∧
+    inFragment projFieldMoveReuse = false := by decide
+
+def projFieldMoveReuseFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, .Bool),
+    (localName 3, intBoolTupleTy u32), (localName 4, intBoolTupleTy u32)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 3),
+      .Assign (.Local (localName 3))
+        (.Tuple [.Load (.Local (localName 1)), .Load (.Local (localName 2))]
+          (intBoolTupleTy u32)),
+      .StorageLive (localName 4),
+      .Assign (.Local (localName 4)) (.Load (.Local (localName 3))),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 3)) 0)),
+      .StorageDead (localName 4),
+      .StorageDead (localName 3)],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem projFieldMoveReuse_translate :
+    translateFn projFieldMoveReuse = some projFieldMoveReuseFn := rfl
+
+def projFieldMoveReuseS0 : MachineState :=
+  initMachineState projFieldMoveReuse [.scalar ⟨11, 4⟩, .scalar ⟨1, 1⟩]
+
+theorem projFieldMoveReuse_anneal_ub :
+    ∃ tr u, Reaches (mirTree projFieldMoveReuse projFieldMoveReuseS0) tr u ∧
+      FaultNow u :=
+  faultsA_sound projFieldMoveReuse 15 _ (by decide)
+
+theorem projFieldMoveReuse_minirust_direct :
+    (Interp.steps 9 (machineWithCtx ctx0_tupleAggCastMove projFieldMoveReuse projFieldMoveReuseFn
+        projFieldMoveReuseS0.frame.locals projFieldMoveReuseFn.start)).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 11 }, [1]) := by
   decide +kernel
 
 end MiniRustSpec.Correspondence.Witness

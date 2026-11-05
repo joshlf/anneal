@@ -251,6 +251,11 @@ open MiniRustSpec.Correspondence in
   statementOk_stmtMoved_lt
   terminatorOk_termMoved_lt
   movesOk_iff_blockMovesOk
+  stmtMoved_mono
+  termMoved_mono
+  stepMovedEntries_least
+  iterMovedEntries_least
+  movedAtEntry_least
   blockMovesOk_spec
   movesOk_spec
   readsOk_mono
@@ -798,6 +803,13 @@ open MiniRustSpec.Correspondence.Witness in
   storageLiveArgRet5_minirust_ret_from_start
   storageLiveArgRet5_minirust_direct
   storageDeadArg_rejected
+  storageDeadArg_translate
+  storageDeadArg5_anneal_ret
+  storageDeadArg5_minirust_direct
+  storageDeadArgReadAfter_rejected
+  storageDeadArgReadAfter_translate
+  storageDeadArgReadAfter5_anneal_ub
+  storageDeadArgReadAfter5_minirust_ub
   ctx0_2_ok_bool_u32
   diamondMoveJoin_inFragment
   diamondMoveJoin_movedAtEntry
@@ -816,6 +828,18 @@ open MiniRustSpec.Correspondence.Witness in
   diamondHalfMoveReuse_translate
   diamondHalfMoveReuseFalse_anneal_ub
   diamondHalfMoveReuseFalse_minirust_direct
+  ctx0_ok_tupleAggCastMove
+  tupleAggCastMove_inFragment
+  tupleAggCastMove_translate
+  tupleAggCastMoveNeg5_anneal_ret
+  tupleAggCastMoveNeg5_noUB
+  tupleAggCastMoveNeg5_progress
+  tupleAggCastMoveNeg5_minirust_ret_from_start
+  tupleAggCastMoveNeg5_minirust_direct
+  projFieldMoveReuse_movesOk
+  projFieldMoveReuse_translate
+  projFieldMoveReuse_anneal_ub
+  projFieldMoveReuse_minirust_direct
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -931,6 +955,11 @@ open MiniRustSpec.Correspondence in
   statementOk_stmtMoved_lt
   terminatorOk_termMoved_lt
   movesOk_iff_blockMovesOk
+  stmtMoved_mono
+  termMoved_mono
+  stepMovedEntries_least
+  iterMovedEntries_least
+  movedAtEntry_least
   blockMovesOk_spec
   movesOk_spec
   readsOk_mono
@@ -1319,6 +1348,13 @@ open MiniRustSpec.Correspondence.Witness in
   storageLiveArgRet5_minirust_ret_from_start
   storageLiveArgRet5_minirust_direct
   storageDeadArg_rejected
+  storageDeadArg_translate
+  storageDeadArg5_anneal_ret
+  storageDeadArg5_minirust_direct
+  storageDeadArgReadAfter_rejected
+  storageDeadArgReadAfter_translate
+  storageDeadArgReadAfter5_anneal_ub
+  storageDeadArgReadAfter5_minirust_ub
   ctx0_2_ok_bool_u32
   diamondMoveJoin_inFragment
   diamondMoveJoin_movedAtEntry
@@ -1337,6 +1373,18 @@ open MiniRustSpec.Correspondence.Witness in
   diamondHalfMoveReuse_translate
   diamondHalfMoveReuseFalse_anneal_ub
   diamondHalfMoveReuseFalse_minirust_direct
+  ctx0_ok_tupleAggCastMove
+  tupleAggCastMove_inFragment
+  tupleAggCastMove_translate
+  tupleAggCastMoveNeg5_anneal_ret
+  tupleAggCastMoveNeg5_noUB
+  tupleAggCastMoveNeg5_progress
+  tupleAggCastMoveNeg5_minirust_ret_from_start
+  tupleAggCastMoveNeg5_minirust_direct
+  projFieldMoveReuse_movesOk
+  projFieldMoveReuse_translate
+  projFieldMoveReuse_anneal_ub
+  projFieldMoveReuse_minirust_direct
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard
