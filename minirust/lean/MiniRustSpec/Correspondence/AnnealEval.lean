@@ -2382,7 +2382,7 @@ theorem evalRvalue_fragTuple (decls : List LocalDecl) (locals : List LocalSlot)
 /-- Anneal's assignment to a live local `_i` from an rvalue that evaluates to
 a scalar (or to UB). -/
 theorem evalStmt_assign_of (s : MachineState) (decls : List LocalDecl) (layouts : Layout.LayoutTable)
-    (i : Nat) (rv : Rvalue) (span : String) (hslots : SlotsOk decls s.frame.locals)
+    (i : Nat) (rv : Rvalue) (span : String) (_hslots : SlotsOk decls s.frame.locals)
     (hn : s.frame.locals.length = decls.length) (d : LocalDecl) (hd : decls[i]? = some d)
     (hlive0 : s.frame.locals[i]? ≠ some .dead)
     (hbor : s.memory.borrows = []) (hprot : s.memory.activeProtectors = []) :

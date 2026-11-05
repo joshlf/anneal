@@ -1620,6 +1620,16 @@ fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
         ),
         (
             wf,
+            "StorageLive(local) => { \
+                 ensure_wf(func.locals.contains_key(local), \"Statement::StorageLive: invalid local variable\")?; \
+             }",
+            "StorageLive(local) => { \
+                 ensure_wf(!func.locals.contains_key(local), \"Statement::StorageLive: invalid local variable\")?; \
+             }",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            wf,
             "if local == func.ret || func.args.any(|arg_name| local == arg_name) { \
                  throw_ill_formed!(\"Statement::StorageDead: trying to mark argument or return local as dead\"); \
              }",
@@ -1627,7 +1637,7 @@ fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
             "MiniRustSpec/Correspondence/Translate.lean",
         ),
     ];
-    assert_eq!(cases.len(), 15, "expected 15 pinned MR-1.3 quotations");
+    assert_eq!(cases.len(), 16, "expected 16 pinned MR-1.3 quotations");
 
     let lean_root = minirust_dir().join("lean");
     for (file, genuine, tampered, lean_file) in cases {

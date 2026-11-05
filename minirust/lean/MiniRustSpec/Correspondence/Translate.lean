@@ -30,7 +30,7 @@ The translation is defined only on the fragment checked by `inFragment`:
 * the body declares the return place, the arguments, and any number of
   temporaries (`argCount + 1 ≤ localDecls.length < 2^31`), all of integer,
   `bool`, `core::cmp::Ordering`, or `(Int, bool)` 2-tuple type;
-* statements are `_i = Use(copy _j)`, `_i = Use(copy (_j.0))`, `_i = Use(const c)`,
+* statements are `_i = Use(a)`,
   `_i = UnaryOp(uop, a)` with `uop ∈ {Neg, Not}`,
   `_i = BinaryOp(op, a, b)` with
   `op ∈ {Add, Sub, Mul, Div, Rem, BitXor, BitAnd, BitOr, Shl, Shr, AddUnchecked, SubUnchecked, MulUnchecked, ShlUnchecked, ShrUnchecked}`
@@ -43,21 +43,22 @@ The translation is defined only on the fragment checked by `inFragment`:
   UnaryOp(Not, a)` (`boolNot`), and `_i = BinaryOp(BitAnd | BitOr | BitXor, a,
   b)` (`boolBitOp`) with `bool` operands, and the comparisons
   `_i = BinaryOp(Eq | Ne | Lt | Le | Gt | Ge, a, b)` of two integer operands
-  of one type or of two `bool` operands; for an `Ordering` `_i`, `_i =
-  Use(copy _j)` of an `Ordering` local and the three-way comparison
-  `_i = BinaryOp(Cmp, a, b)` of such operands; for an `(it, bool)` 2-tuple `_i`,
-  `_i = Use(copy _j)` of an `(it, bool)` local, the checked integer operations
+  of one type or of two `bool` operands; for an `Ordering` `_i`, `_i = Use(a)`
+  of an `Ordering` local (`copy _j` or `move _j`) and the three-way comparison
+  `_i = BinaryOp(Cmp, a, b)` of integer or `bool` operands; for an `(it, bool)`
+  2-tuple `_i`, `_i = Use(a)` of an `(it, bool)` local (`copy _j` or `move _j`),
+  the checked integer operations
   `_i = BinaryOp(AddWithOverflow | SubWithOverflow | MulWithOverflow, a, b)` of
   two integer operands of type `it`, and `_i = Aggregate(Tuple, [a, b])` of an
   integer operand `a` of type `it` and a `bool` operand `b`; every operand is
   `copy _j` or `move _j`, a 2-tuple field projection `copy (_j.0)`,
   `copy (_j.1)`, `move (_j.0)`, or `move (_j.1)`, or a scalar constant;
-  `PlaceMention(p)` of a fragment place; `StorageLive(_i)` and
-  `StorageDead(_i)` of a temporary (`_i` with `argCount < i`); and
-  `Deinit(_i)` of a local;
-* terminators are `Goto`, `SwitchInt` on an integer or `bool` operand
-  (`copy _j`, `move _j`, or constant), `Unreachable`, or `Return`, and every
-  jump target is a block of the body;
+  `PlaceMention(p)` of a fragment place; `StorageLive(_i)` of any local,
+  `StorageDead(_i)` of a temporary (`_i` with `argCount < i`), and
+  `Deinit(_i)` of a root local;
+* terminators are `Goto`, `SwitchInt` on an integer or `bool` fragment operand
+  (`copy _j`, `move _j`, 2-tuple field projection, or constant), `Unreachable`,
+  or `Return`, and every jump target is a block of the body;
 * no block is a cleanup block;
 * no moved-from local is read before it is re-initialized (`movesOk`), and
   every temporary the body mentions has explicit storage markers
@@ -1080,9 +1081,13 @@ destination takes a `bool` rvalue (`rvalueOkB`), an `Ordering` destination
 takes a three-way comparison (`rvalueOkO`), and an `(it, bool)` 2-tuple
 destination takes a 2-tuple rvalue (`rvalueOkTuple`), each checked through
 `copyRv`; `PlaceMention` takes any fragment place (`placeOk`);
-`StorageLive`, `StorageDead`, and `Deinit` take a local (`Deinit` only
-without projections: Anneal's `Deinit` of a projected place reads the
-projected value and leaves the slot initialized, whereas MiniRust's writes
+`StorageLive`, `StorageDead`, and `Deinit` take a declared local (`StorageLive`
+is well-formed on any local in `spec/lang/well-formed.md`:
+> "StorageLive(local) => {
+>      ensure_wf(func.locals.contains_key(local), \"Statement::StorageLive: invalid local variable\")?;
+>  }"
+`Deinit` only without projections: Anneal's `Deinit` of a projected place reads
+the projected value and leaves the slot initialized, whereas MiniRust's writes
 `Uninit` to the projected bytes). `storageDeadOk` restricts `StorageDead`
 further. -/
 def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement) : Bool :=
@@ -1201,12 +1206,14 @@ def readsOk : List Nat → List MirAst.Operand → Bool
      | none => true) && readsOk (moveOut mo op) ops
 
 /-- The moved-out locals after statement `s`: those its operands move out of,
-minus the local it writes (an assignment's destination, or the local of
-`StorageLive`, `StorageDead`, or `Deinit`, after which both models agree that
-the local is unallocated or holds the same bytes). -/
+minus the root local it writes (a root assignment's destination, or the local of
+`StorageLive`, `StorageDead`, or root `Deinit`, after which both models agree
+that the local is unallocated or holds the same bytes; a projected assignment
+records its operand moves without clearing the destination root local). -/
 def stmtMoved (mo : List Nat) (s : MirAst.Statement) : List Nat :=
   match s.kind with
   | .assign ⟨i, []⟩ rv => ((rvOperands rv).foldl moveOut mo).filter (· != i)
+  | .assign ⟨_, _ :: _⟩ rv => (rvOperands rv).foldl moveOut mo
   | .storageLive i | .storageDead i | .deinit ⟨i, []⟩ => mo.filter (· != i)
   | _ => mo
 
@@ -1264,7 +1271,10 @@ def iterMovedEntries : Nat → List MirAst.BasicBlockData → List (List Nat) �
     if entries' == entries then entries
     else iterMovedEntries n bbs entries'
 
-/-- The locals that may be moved out on entry to block `blk`. -/
+/-- The locals that may be moved out on entry to block `blk`. For `N ≥ 1`
+blocks and `L` locals, one pass expands `[]` to `N` entry lists and at most
+`N * L` further passes add distinct moved-out locals `< L`, so
+`1 + N * L ≤ N * (L + 1)` passes always reach the least fixed point. -/
 def movedAtEntry (body : MirAst.CapturedMir) (blk : Nat) : List Nat :=
   let fuel := body.basicBlocks.length * (body.localDecls.length + 1)
   (iterMovedEntries fuel body.basicBlocks []).getD blk []

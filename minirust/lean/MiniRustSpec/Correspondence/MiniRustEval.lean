@@ -3559,7 +3559,7 @@ theorem CM_store_whole {cm : Gen.ConcurrentMemory BM} {p : Ptr} {k : Nat}
   have hne' : a.data ≠ [] := by
     intro h; rw [h] at hlen; exact hne (List.eq_nil_of_length_eq_zero hlen)
   simp [CM.store, BM.store, isAligned_one, BM.check_ptr, hp, listIndex, hk, hAk, hlive, haddr,
-    Allocation.size, hlen, writeSubsliceAtIndex, listSet, hne', hA]
+    Allocation.size, hlen, writeSubsliceAtIndex, listSet, hne']
 
 theorem LocalTy.tyBytes_pos {T : Gen.Type} {it : Gen.IntType} (h : LocalTy T it) : 0 < tyBytes T := by
   cases h with

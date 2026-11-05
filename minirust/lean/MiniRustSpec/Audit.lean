@@ -238,6 +238,9 @@ open MiniRustSpec.Correspondence in
   movedBefore_zero
   movedBefore_succ
   lookupSwitchTarget_mem
+  unionLocals_mem
+  stepMovedEntries_spec
+  iterMovedEntries_fixed
   blockMovesOk_spec
   movesOk_spec
   readsOk_mono
@@ -712,6 +715,50 @@ open MiniRustSpec.Correspondence.Witness in
   unmarkedTempAssign_minirust_direct
   bm_allocate_and_deallocate_ub_cases
   evalStatement_deinit_ok_dead_and_misaligned
+  loopTempMove_inFragment
+  loopTempMove_alwaysLive
+  loopTempMove_initLen
+  loopTempMove_movedAtEntry_multiPass
+  loopTempMove_translate
+  ctx0_ok_loopTempMove
+  loopTempMove3_anneal_ret
+  loopTempMove3_noUB
+  loopTempMove3_progress
+  loopTempMove3_minirust_ret_from_start
+  loopTempMove3_minirust_direct
+  loopTempMove0_anneal_ret
+  loopTempMove0_noUB
+  loopTempMove0_minirust_ret_from_start
+  loopTempMove0_minirust_direct
+  loopBackEdgeReuse_movesOk
+  loopBackEdgeReuse_translate
+  loopBackEdgeReuse1_anneal_ub
+  loopBackEdgeReuse1_minirust_direct
+  deadAssign_inFragment
+  deadAssign_translate
+  deadAssign_anneal_ub
+  deadAssign_minirust_ub_from_start
+  deadAssign_minirust_direct
+  deadDeinit_inFragment
+  deadDeinit_translate
+  deadDeinit_anneal_ub
+  deadDeinit_minirust_ub_from_start
+  deadDeinit_minirust_direct
+  ctx0_ok_u32_tuple
+  deadPlaceMention_inFragment
+  deadPlaceMention_translate
+  deadPlaceMention_anneal_ub
+  deadPlaceMention_minirust_ub_from_start
+  deadPlaceMention_minirust_direct
+  storageDeadRet_rejected
+  storageDeadRet_translate
+  storageDeadRet_anneal_ub
+  storageDeadRet_minirust_panics
+  projectedDeinit_rejected
+  projectedDeinit_translate
+  projectedDeinit_anneal_ret
+  projectedDeinit_minirust_ub
+  projAssignMoveReuse_movesOk
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -814,6 +861,9 @@ open MiniRustSpec.Correspondence in
   movedBefore_zero
   movedBefore_succ
   lookupSwitchTarget_mem
+  unionLocals_mem
+  stepMovedEntries_spec
+  iterMovedEntries_fixed
   blockMovesOk_spec
   movesOk_spec
   readsOk_mono
@@ -1129,6 +1179,50 @@ open MiniRustSpec.Correspondence.Witness in
   unmarkedTempAssign_minirust_direct
   bm_allocate_and_deallocate_ub_cases
   evalStatement_deinit_ok_dead_and_misaligned
+  loopTempMove_inFragment
+  loopTempMove_alwaysLive
+  loopTempMove_initLen
+  loopTempMove_movedAtEntry_multiPass
+  loopTempMove_translate
+  ctx0_ok_loopTempMove
+  loopTempMove3_anneal_ret
+  loopTempMove3_noUB
+  loopTempMove3_progress
+  loopTempMove3_minirust_ret_from_start
+  loopTempMove3_minirust_direct
+  loopTempMove0_anneal_ret
+  loopTempMove0_noUB
+  loopTempMove0_minirust_ret_from_start
+  loopTempMove0_minirust_direct
+  loopBackEdgeReuse_movesOk
+  loopBackEdgeReuse_translate
+  loopBackEdgeReuse1_anneal_ub
+  loopBackEdgeReuse1_minirust_direct
+  deadAssign_inFragment
+  deadAssign_translate
+  deadAssign_anneal_ub
+  deadAssign_minirust_ub_from_start
+  deadAssign_minirust_direct
+  deadDeinit_inFragment
+  deadDeinit_translate
+  deadDeinit_anneal_ub
+  deadDeinit_minirust_ub_from_start
+  deadDeinit_minirust_direct
+  ctx0_ok_u32_tuple
+  deadPlaceMention_inFragment
+  deadPlaceMention_translate
+  deadPlaceMention_anneal_ub
+  deadPlaceMention_minirust_ub_from_start
+  deadPlaceMention_minirust_direct
+  storageDeadRet_rejected
+  storageDeadRet_translate
+  storageDeadRet_anneal_ub
+  storageDeadRet_minirust_panics
+  projectedDeinit_rejected
+  projectedDeinit_translate
+  projectedDeinit_anneal_ret
+  projectedDeinit_minirust_ub
+  projAssignMoveReuse_movesOk
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

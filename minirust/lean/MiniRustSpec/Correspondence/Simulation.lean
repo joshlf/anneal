@@ -139,6 +139,96 @@ theorem foldl_moveOut_mem (ops : List Operand) (acc : List Nat) (j : Nat) :
         · exact .inl (.inl h1)
         · exact .inr h1
 
+theorem unionLocals_mem (acc xs : List Nat) (j : Nat) :
+    j ∈ unionLocals acc xs ↔ j ∈ acc ∨ j ∈ xs := by
+  induction xs generalizing acc with
+  | nil => simp [unionLocals]
+  | cons x xs ih =>
+    simp only [unionLocals, List.foldl_cons] at ih ⊢
+    rw [ih]
+    by_cases hc : acc.contains x = true
+    · simp only [hc, ↓reduceIte, List.mem_cons]
+      have hx : x ∈ acc := List.contains_iff_mem.mp hc
+      exact ⟨fun h => h.elim .inl (.inr ∘ .inr),
+        fun h => h.elim .inl (fun h2 => h2.elim (fun hjx => .inl (hjx ▸ hx)) .inr)⟩
+    · simp only [Bool.not_eq_true] at hc
+      simp only [hc, Bool.false_eq_true, ↓reduceIte, List.mem_cons]
+      exact ⟨fun h => h.elim (fun h1 => h1.elim (.inr ∘ .inl) .inl) (.inr ∘ .inr),
+        fun h => h.elim (.inl ∘ .inr) (fun h2 => h2.elim (.inl ∘ .inl) .inr)⟩
+
+/-- Each pass of `stepMovedEntries` preserves existing moved-out entries and
+propagates every outgoing control-flow edge `(src → dst)` into block `dst`'s
+entry set. -/
+theorem stepMovedEntries_spec (bbs : List BasicBlockData) (entries : List (List Nat))
+    (dst : Nat) (hdst : dst < bbs.length) :
+    (∀ j ∈ entries.getD dst [], j ∈ (stepMovedEntries bbs entries).getD dst []) ∧
+    (∀ (src : Nat) (bb : BasicBlockData), bbs[src]? = some bb → dst ∈ termTargets bb.terminator →
+      ∀ j ∈ termMoved (bb.statements.foldl stmtMoved (entries.getD src [])) bb.terminator,
+        j ∈ (stepMovedEntries bbs entries).getD dst []) := by
+  let stepFn (acc : List Nat) (src : Nat) : List Nat :=
+    match bbs[src]? with
+    | some bb =>
+      if (termTargets bb.terminator).contains dst then
+        unionLocals acc (termMoved (bb.statements.foldl stmtMoved (entries.getD src [])) bb.terminator)
+      else acc
+    | none => acc
+  have hmono : ∀ (srcs : List Nat) (acc : List Nat) (j : Nat),
+      j ∈ acc → j ∈ srcs.foldl stepFn acc := by
+    intro srcs
+    induction srcs with
+    | nil => intro acc j hj; exact hj
+    | cons s srcs ih =>
+      intro acc j hj
+      simp only [List.foldl_cons]
+      apply ih
+      simp only [stepFn]
+      cases h : bbs[s]? with
+      | none => exact hj
+      | some bb =>
+        simp only
+        split
+        · exact (unionLocals_mem _ _ _).mpr (.inl hj)
+        · exact hj
+  have hprop : ∀ (srcs : List Nat) (acc : List Nat) (src : Nat) (bb : BasicBlockData),
+      src ∈ srcs → bbs[src]? = some bb → dst ∈ termTargets bb.terminator →
+      ∀ j ∈ termMoved (bb.statements.foldl stmtMoved (entries.getD src [])) bb.terminator,
+        j ∈ srcs.foldl stepFn acc := by
+    intro srcs
+    induction srcs with
+    | nil => intro _ _ _ hmem; simp at hmem
+    | cons s srcs ih =>
+      intro acc src bb hmem hbb htgt j hj
+      simp only [List.foldl_cons]
+      rcases List.mem_cons.mp hmem with rfl | hrest
+      · apply hmono
+        have hcont : (termTargets bb.terminator).contains dst = true :=
+          List.contains_iff_mem.mpr htgt
+        simp only [stepFn, hbb, hcont, ↓reduceIte]
+        exact (unionLocals_mem _ _ _).mpr (.inr hj)
+      · exact ih _ src bb hrest hbb htgt j hj
+  have hget : (stepMovedEntries bbs entries).getD dst [] =
+      (List.range bbs.length).foldl stepFn (entries.getD dst []) := by
+    simp only [stepMovedEntries, stepFn, List.getD, List.getElem?_map,
+      List.getElem?_range hdst, Option.map_some, Option.getD_some]
+    rfl
+  rw [hget]
+  refine ⟨fun j hj => hmono _ _ j hj, fun src bb hbb htgt j hj => ?_⟩
+  have hsrc : src ∈ List.range bbs.length :=
+    List.mem_range.mpr (List.getElem?_eq_some_iff.mp hbb).1
+  exact hprop _ _ src bb hsrc hbb htgt j hj
+
+/-- Any fixed point of `stepMovedEntries` satisfies outgoing-edge closure for
+every in-range successor block `dst < bbs.length`. -/
+theorem iterMovedEntries_fixed {bbs : List BasicBlockData} {entries : List (List Nat)}
+    (hfix : stepMovedEntries bbs entries = entries) {src dst : Nat} {bb : BasicBlockData}
+    (hbb : bbs[src]? = some bb) (hdst : dst < bbs.length)
+    (htgt : dst ∈ termTargets bb.terminator) :
+    ∀ j ∈ termMoved (bb.statements.foldl stmtMoved (entries.getD src [])) bb.terminator,
+      j ∈ entries.getD dst [] := by
+  intro j hj
+  rw [← hfix]
+  exact (stepMovedEntries_spec bbs entries dst hdst).2 src bb hbb htgt j hj
+
 theorem movedBefore_zero (body : CapturedMir) (blk : Nat) :
     movedBefore body blk 0 = movedAtEntry body blk := by
   unfold movedBefore

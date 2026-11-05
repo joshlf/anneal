@@ -194,18 +194,19 @@ restricted to the fragment checked by `inFragment`:
   `Statement::Deinit(PlaceExpr::Local(_i))`;
 * operands may also be `move _j` (and `move (_j.0)`, `move (_j.1)`), which
   `minimize` translates like `copy`. Anneal's `move` of a root local leaves it
-  uninitialized while MiniRust's is a plain load, so `movesOk` requires that no
-  operand reads a local that may have been moved out of (tracked per block,
-  conservatively assuming at each block entry every local that the body moves
-  anywhere) before it is written again;
+  uninitialized while MiniRust's is a plain load, so `movesOk` rejects any body
+  that reads a possibly moved-out local before re-initializing it, propagating
+  moved-out sets forward from `[]` at `bb0` across `Goto` and `SwitchInt` edges
+  (`movedAtEntry`) and treating `Return` as reading `_0`;
 * temporaries without storage markers (`alwaysStorageLiveLocals`, which
   `minimize`'s init block allocates) are never mentioned (`mentionsOk`);
 * statements are `_i = Use(op)`, `_i = UnaryOp(Neg | Not, op)`,
   `_i = BinaryOp(Add | Sub | Mul | Div | Rem | BitXor | BitAnd | BitOr | Shl | Shr | AddUnchecked | SubUnchecked | MulUnchecked | ShlUnchecked | ShrUnchecked, opL, opR)`,
   `_i = Cast(CastKind::IntToInt, op, targetTy)`, or `PlaceMention(_i | _i.0 | _i.1)`,
-  with `op`, `opL`, `opR` projection-free `copy _j`, tuple field projection
-  `copy (_j.0)` (for an integer operand from a `(Int, bool)` local) or
-  `copy (_j.1)` (for a `bool` operand from a `(Int, bool)` local), or integer
+  with `op`, `opL`, `opR` projection-free `copy _j` or `move _j`, tuple field
+  projection `copy (_j.0)` or `move (_j.0)` (for an integer operand from a
+  `(Int, bool)` local) or `copy (_j.1)` or `move (_j.1)` (for a `bool` operand
+  from a `(Int, bool)` local), or integer
   constants (of `_i`'s type for `Use`, `UnaryOp`, `opL`, and non-shift `opR`,
   of any integer type for shift `opR`, or of any integer or `bool` type for
   `Cast(IntToInt)`, where `minimize` casts a `bool` by transmuting to `u8` and
@@ -213,31 +214,34 @@ restricted to the fragment checked by `inFragment`:
 * for a `bool` `_i`: `_i = Use(op)`, `_i = UnaryOp(Not, op)`, and
   `_i = BinaryOp(BitAnd | BitOr | BitXor, opL, opR)` with `bool` operands, and
   `_i = BinaryOp(Eq | Ne | Lt | Le | Gt | Ge, opL, opR)` with two integer
-  operands of one type or two `bool` operands (`copy _j`, `copy (_j.0)`,
-  `copy (_j.1)`, or a `bool` constant `0`/`1`). `minimize` translates the
+  operands of one type or two `bool` operands (`copy _j`, `move _j`,
+  `copy (_j.0)`, `move (_j.0)`, `copy (_j.1)`, `move (_j.1)`, or a `bool`
+  constant `0`/`1`). `minimize` translates the
   comparisons to `BinOp::Rel`, `!b` to `build::not(b)` (a transmute of
   `1u8 - transmute::<u8>(b)` back to `bool`), `BitAnd | BitOr | BitXor` on
   `bool` to `build::bool_and`, `build::bool_or`, and `build::bool_xor`
   (`boolBitOp`: integer `BitAnd | BitOr | BitXor` on the `transmute::<u8>`
   views, transmuted back to `bool`), and a `bool` constant to `Constant::Bool`;
-* for a `core::cmp::Ordering` `_i`: `_i = Use(copy _j)` of an `Ordering`
-  local, and the three-way comparison `_i = BinaryOp(Cmp, opL, opR)` of two
-  integer operands of one type or two `bool` operands. MiniRust's `RelOp::Cmp`
-  returns the `i8` `-1`, `0`, or `1`, and `minimize` transmutes it to its
-  translation of `Ordering` (`orderingTy`: a one-byte `Type::Enum` with a
+* for a `core::cmp::Ordering` `_i`: `_i = Use(copy _j | move _j)` of an
+  `Ordering` local, and the three-way comparison `_i = BinaryOp(Cmp, opL, opR)`
+  of two integer operands of one type or two `bool` operands. MiniRust's
+  `RelOp::Cmp` returns the `i8` `-1`, `0`, or `1`, and `minimize` transmutes it
+  to its translation of `Ordering` (`orderingTy`: a one-byte `Type::Enum` with a
   directly encoded `i8` tag, built as `translate_enum` does for
   `#[repr(i8)] enum Ordering { Less = -1, Equal = 0, Greater = 1 }`), so the
   tag is re-validated by `decode_discriminant`;
-* for a 2-tuple `(Int, bool)` `_i`: `_i = Use(copy _j)` of a `(Int, bool)`
-  local of the same type, `_i = BinaryOp(AddWithOverflow | SubWithOverflow | MulWithOverflow, opL, opR)`
+* for a 2-tuple `(Int, bool)` `_i`: `_i = Use(copy _j | move _j)` of a
+  `(Int, bool)` local of the same type,
+  `_i = BinaryOp(AddWithOverflow | SubWithOverflow | MulWithOverflow, opL, opR)`
   with two integer operands `opL`, `opR` of type `Int` (`BinOp::IntWithOverflow`),
   and `_i = Aggregate(AggregateKind::Tuple, [opInt, opBool])` (`ValueExpr::Tuple`
   at `IntType::with_overflow`); field projections `_j.0` and `_j.1` translate to
   `PlaceExpr::Field(PlaceExpr::Local(_j), 0)` and `PlaceExpr::Field(PlaceExpr::Local(_j), 1)`;
 * terminators are `Goto`, `SwitchInt` on any integer or `bool` fragment operand
-  (`copy _j`, `copy (_j.0)`, `copy (_j.1)`, or constant) with distinct in-range
-  values (`minimize` switches on `transmute::<u8>(b)` for a `bool`), `Return`,
-  and `Unreachable`; all targets are blocks of the body; no cleanup blocks.
+  (`copy _j`, `move _j`, `copy (_j.0)`, `move (_j.0)`, `copy (_j.1)`,
+  `move (_j.1)`, or constant) with distinct in-range values (`minimize` switches
+  on `transmute::<u8>(b)` for a `bool`), `Return`, and `Unreachable`; all
+  targets are blocks of the body; no cleanup blocks.
 
 ### States
 
@@ -318,7 +322,7 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
 programs, computing both semantics in the kernel (`decide`/`rfl`, no
 `native_decide`):
 
-* `tempMove` and `crossBlockMove` (MR-1.3): `tempMove` is the MIR of
+* `tempMove`, `crossBlockMove`, and `loopTempMove` (MR-1.3): `tempMove` is
   `fn(x: u32) -> u32 { let y = (x + 1) * 2; if y == 8 { 100 } else { y } }`
   with `u32` and `bool` temporaries, `StorageLive`/`StorageDead`, root `move`
   in a `BinaryOp`, a `Use`, and a `switchInt` discriminant, `Deinit` of a
@@ -330,13 +334,20 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `move (_2.0)` and `move (_2.1)` on a `(u32, bool)` temporary, `StorageLive`
   re-allocating already-live locals, `Deinit` of a `(u32, bool)` tuple, and
   idempotent `StorageDead` (`crossBlockMove20_*`, `crossBlockMoveOv_*`);
-  `deadRead` reads a temporary after `StorageDead` (UB in both models,
-  `deadRead_*`); `moveReuse` and `crossBlockMoveReuse` read a local after
-  moving out of it (rejected by `movesOk`, with `moveReuse7_*` showing the
-  semantic disagreement); `unmarkedTempAssign` assigns to a temporary without
-  storage markers (rejected by `mentionsOk`, with `unmarkedTempAssign_*`
-  showing the `initBlock` vs `initMachineState` disagreement); and
-  `bm_allocate_and_deallocate_ub_cases` /
+  `loopTempMove` is a cyclic 4-block loop CFG with two heterogeneous unmarked
+  temporaries (`alwaysStorageLiveLocals = [4, 5]`, `initLen = 3`), multi-pass
+  back-edge fixpoint convergence of `iterMovedEntries`, per-iteration
+  `StorageLive`/`StorageDead`/`Deinit`/`SwitchInt(move _3)`, live re-allocation
+  of `_2`, and idempotent `StorageDead(_2)` on `n = 0` (`loopTempMove3_*`,
+  `loopTempMove0_*`); `deadRead`, `deadAssign`, `deadDeinit`, and
+  `deadPlaceMention` access a local (including projected `PlaceMention(_1.0)`)
+  after `StorageDead` (UB in both models); `moveReuse`, `crossBlockMoveReuse`,
+  `loopBackEdgeReuse`, and `projAssignMoveReuse` read a local after moving out
+  of it (rejected by `movesOk`, with `moveReuse7_*` and `loopBackEdgeReuse1_*`
+  showing the semantic disagreement); `unmarkedTempAssign`, `storageDeadRet`,
+  and `projectedDeinit` exercise the soundness boundaries of `mentionsOk`,
+  `storageDeadOk`, and projection-free `Deinit` with concrete semantic
+  disagreements; and `bm_allocate_and_deallocate_ub_cases` /
   `evalStatement_deinit_ok_dead_and_misaligned` directly verify the UB and
   normal paths of `BM.allocate`, `BM.deallocate`, and `Statement::Deinit`.
 
@@ -528,12 +539,13 @@ on `sorryAx` or a non-standard axiom.
 
 These are deliberate and are the first things to lift:
 
-* **Moves are checked per block.** `movesOk` assumes at every block entry
-  that each local the body moves anywhere may be moved out, so a moved-from
-  local must be written in the same block before it is read again; a body that
-  reads, in another block, a local that it moves elsewhere is outside the
-  fragment (a dataflow analysis over the CFG would admit more bodies). Only
-  root moves de-initialize in Anneal; projected moves read like copies.
+* **Moves are checked path-insensitively over the CFG.** `movesOk` propagates
+  possibly moved-out locals forward from `[]` at `bb0` across `Goto` and
+  `SwitchInt` edges (`movedAtEntry`), taking the union at control-flow merges; a
+  body that moves out of a local on only one incoming branch and reads it after
+  the merge without re-initializing it on that branch is rejected unless branch
+  correlation is tracked. Only root moves de-initialize in Anneal; projected
+  moves read like copies.
 * **Temporaries of the init block are never mentioned.** Anneal keeps a
   temporary without storage markers dead, whereas `minimize`'s init block
   allocates it, so the fragment requires that the body never mentions one.
