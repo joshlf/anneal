@@ -1,7 +1,10 @@
 -- Copyright 2026 The Fuchsia Authors
 --
--- Use of this source code is governed by a BSD-style license that can be
--- found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
+-- Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+-- <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+-- license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+-- This file may not be copied, modified, or distributed except according to
+-- those terms.
 
 import Anneal.SepLogic
 import Anneal.FunctionalTranslation
@@ -24,45 +27,41 @@ open Anneal.SepLogic
 open Anneal.FunctionalTranslation
 open Anneal.MirLiftCore
 open Anneal.MirFuelFree
+open Anneal.Rustc.V2026_06_01.SymbolicEval (mirNormalPost)
 
 /-!
 # Separation-Logic-Backed Mutable Lenses & Pure Deref Lifting (`FF-4.1`)
 
 This module connects Anneal's separation logic (`SepProp`, `sepConj`,
 `DisjointFootprints`, `ActiveTypedMutBorrow`) and functional lens layer
-(`MutLens`, `LawfulMutLens`, `memoryPtrMutLens`) to the variable-headed pure
-lifting judgment layer (`MirLiftCore`) and fuel-free `ITree` weakest
+(`MutLens`, `LawfulMutLens`, `memoryPtrMutLens`) to fuel-free `ITree` weakest
 preconditions (`MirWpConverges`, `StatefulVerificationResult`,
-`TotalVerificationResult`) under the `I-10` Tree Borrows and 12-field `Memory`
-model:
+`TotalVerificationResult`) over the `I-10` Tree Borrows and 12-field `Memory`
+model. No proof here destructures the `Memory` record.
 
-1. **Section 1 — Connecting `sepConj` (`*`) & `DisjointFootprints` to
-   `IndependentLenses` (`MutLens`)**:
-   Defines `IndependentLenses`, `IndependentLenses.symm`, `prodMutLens`,
-   `prodMutLens_lawful`, and `PairwiseIndependentLenses`, and proves that a
-   separating conjunction of active typed mutable borrows
-   `sepConj (ActiveTypedMutBorrow rp₁ codec₁ a₁) (sepConj (ActiveTypedMutBorrow rp₂ codec₂ a₂) R_frame)`
-   automatically derives pointer/allocation/tag non-aliasing
-   (`rp₁.allocId ≠ rp₂.allocId`, `rp₁.tag ≠ rp₂.tag`, `rp₁ ≠ rp₂`), lens
-   lawfulness (`LawfulMutLens`), lens independence (`IndependentLenses`), and
-   preservation of arbitrary `LocalSepProp` frame assertions `R_frame`.
-2. **Section 2 — Pure Lens-State Lifting Rules (`LiftDerefRead`,
-   `LiftDerefWrite`, `LiftRetag`, `mirWpConverges_of_sepLenses`)**:
-   Defines the separation-logic lens-state invariant `SepLensStateInv` and
-   frame preservation relation `LensFramePreserved`, together with variable-headed
-   pure lifting judgments (`LiftLensOperand`, `LiftLensRvalue`, `LiftDerefRead`,
-   `LiftDerefWrite`, `LiftRetag`, `LiftPureAssign`, `LiftStorageLive`,
-   `LiftStorageDead`, `LiftNop`, `LiftLensStmt`, `LiftLensStmts`,
-   `LiftLensBlock`) over `(PureEnv × List (RawPtrVal × Value))`. Proves that
-   every lifted block converges fuel-freely (`mirWpConverges_of_sepLenses`,
-   `verifyStatefulMir_of_sepLenses`, `verifyTotalMir_of_sepLenses`) without
-   manual `Memory` record destructuring.
-3. **Section 3 — Concrete Stateful Reference Witnesses (`add_assign` &
-   `swap_u32`)**:
-   Discharges fuel-free `MirWpConverges`, `StatefulVerificationResult`,
-   `TotalVerificationResult`, and non-vacuity theorems for realistic
-   `Runtime(PostCleanup)` MIR bodies of `add_assign(x: &mut u32, d: u32)` and
-   `swap_u32(a: &mut u32, b: &mut u32)` via `mirWpConverges_of_sepLenses`.
+1. **Section 1 (lens algebra).** `IndependentLenses`, `prodMutLens`, and
+   `PairwiseIndependentLenses`, with the binary bridge
+   `sepConj_entails_independentLenses`: two separated active typed mutable
+   borrows have distinct allocations and tags and lawful, independent lenses.
+2. **Section 2 (lifting).** The lens-state invariant `SepLensStateInv` (whose
+   per-pointer exclusivity `TreeExclusiveBorrow` admits active `I-10`
+   ancestors), the frame relation `LensFramePreserved`, and the lifting
+   judgments `LiftDerefRead`, `LiftDerefWrite`, `LiftRetag`, `LiftLensRvalue`
+   (any scalar `BinOp` over pure or deref operands), `LiftLensStmts`, and the
+   control-flow judgment `LiftLensBlock` (`return_`, `goto`, `assert`). The
+   theorem `mirWpConverges_of_sepLenses` turns a lifting derivation into
+   fuel-free convergence on real memory. The `k`-ary bridges over
+   `sepConjBindings` (`sepLensStateInv_of_sepConjBindings`,
+   `sepConjBindings_preserved`, `sepConjBindings_entails_independentLensFamily`)
+   generalize the unary and binary ones, and
+   `verifyStatefulMir_of_sepLenses_supportedFrame` frames any
+   `SupportedBy R_frame fp_frame` heap predicate.
+3. **Section 3 (witnesses).** `MirWpConverges`, `StatefulVerificationResult`,
+   and `TotalVerificationResult` for `Runtime(PostCleanup)` MIR of
+   `add_assign(x: &mut u32, d: u32)` (wrapping, overflow-checked with an
+   `assert` edge, and retagged variants) and
+   `swap_u32(a: &mut u32, b: &mut u32)`, plus non-vacuity witnesses on concrete
+   memories, including an `I-10` reborrow chain whose parent tag stays active.
 -/
 
 /-! ## 0. Elementary List & Borrow-Table Helpers -/
@@ -149,12 +148,9 @@ theorem resolveTreeBorrowWriterTag_self
 theorem borrowEntry_disabled_eta {entry : BorrowEntry}
     (h : entry.perm = .disabled) :
     { entry with perm := .disabled } = entry := by
-  cases entry
-  dsimp only at h
-  subst h
-  rfl
+  rw [← h]
 
-/-! ## 1. Connecting `sepConj` (`*`) & `DisjointFootprints` to `IndependentLenses` -/
+/-! ## 1. From `sepConj` and `DisjointFootprints` to `IndependentLenses` -/
 
 /--
 Two mutable lenses `L₁ : MutLens Carrier α` and `L₂ : MutLens Carrier β` are
@@ -190,7 +186,8 @@ theorem IndependentLenses.symm {Carrier α β : Type}
 
 /--
 Product of two mutable lenses on a shared carrier `Carrier`, reading `(L₁, L₂)`
-in parallel and writing back sequentially via `L₁.writeBack` then `L₂.writeBack`.
+in parallel and writing back sequentially via `L₁.writeBack` then
+`L₂.writeBack`.
 -/
 def prodMutLens {Carrier α β : Type}
     (L₁ : MutLens Carrier α) (L₂ : MutLens Carrier β) :
@@ -373,44 +370,52 @@ theorem stepTreeBorrowAccess_write_eq_some_self_of_exclusive
   simp only [
     invalidateConflictingBorrows_eq_self_of_exclusive hExcl.exclusive_on_alloc]
 
+/-
+The `updateMemoryLocals` helper lemmas below case-split only on the
+`m.callStack` field (the one field `updateMemoryLocals` inspects) and rely on
+structure eta for everything else, so they never destructure the 12-field
+`Memory` record and keep holding if `Memory` gains fields.
+-/
+
 theorem memoryLocals_updateMemoryLocals (m : Memory) (locals' : List LocalValue) :
-    memoryLocals (updateMemoryLocals m locals') = locals' := by
-  cases m
-  unfold memoryLocals updateMemoryLocals
-  rename_i f1 f2 f3 f4 f5 f6 callStack f8 f9 f10 f11 f12
-  cases callStack <;> rfl
+    memoryLocals (updateMemoryLocals m locals') = locals' :=
+  Anneal.FunctionalTranslation.memoryLocals_updateMemoryLocals m locals'
 
 theorem updateMemoryLocals_borrows (m : Memory) (locals' : List LocalValue) :
     (updateMemoryLocals m locals').borrows = m.borrows := by
-  cases m
   unfold updateMemoryLocals
-  rename_i f1 f2 f3 f4 f5 f6 callStack f8 f9 f10 f11 f12
-  cases callStack <;> rfl
+  cases m.callStack <;> rfl
 
 theorem updateMemoryLocals_self (m : Memory) :
     updateMemoryLocals m (memoryLocals m) = m := by
-  cases m
-  unfold updateMemoryLocals memoryLocals
-  rename_i f1 f2 f3 f4 f5 f6 callStack f8 f9 f10 f11 f12
-  cases callStack <;> rfl
+  unfold updateMemoryLocals
+  split
+  · rename_i head tail hStack
+    have hLoc : memoryLocals m = head.frame.locals := by
+      unfold memoryLocals
+      rw [hStack]
+    rw [hLoc]
+    show { m with callStack := head :: tail } = m
+    rw [← hStack]
+  · rename_i hStack
+    have hLoc : memoryLocals m = m.callerLocals := by
+      unfold memoryLocals
+      rw [hStack]
+    rw [hLoc]
 
 theorem updateMemoryLocals_updateMemoryLocals
     (m : Memory) (l₁ l₂ : List LocalValue) :
     updateMemoryLocals (updateMemoryLocals m l₁) l₂ =
       updateMemoryLocals m l₂ := by
-  cases m
   unfold updateMemoryLocals
-  rename_i f1 f2 f3 f4 f5 f6 callStack f8 f9 f10 f11 f12
-  cases callStack <;> rfl
+  cases m.callStack <;> rfl
 
 /--
-Under `ExclusiveActiveBorrow rp m` and an initialized pointee slot
-`PointsTo rp v₀ m`, `(memoryPtrMutLens rp codec).writeBack a m` leaves
-`m.borrows` unchanged and directly updates `memoryLocals m` at `rp.allocId` to
-`.init (codec.encode a)`.
+`memoryPtrMutLens rp codec` reads back `a` from any memory whose pointee slot
+holds `codec.encode a`.
 -/
-
-theorem memoryPtrMutLens_readView_of_readAllocAt {rp : RawPtrVal} {codec : ValueCodec α} {a : α} {m : Memory}
+theorem memoryPtrMutLens_readView_of_readAllocAt
+    {rp : RawPtrVal} {codec : ValueCodec α} {a : α} {m : Memory}
     (h_read : readAllocAt? (memoryLocals m) rp = some (codec.encode a)) :
     (memoryPtrMutLens rp codec).readView m = a := by
   unfold memoryPtrMutLens
@@ -420,6 +425,11 @@ theorem memoryPtrMutLens_readView_of_readAllocAt {rp : RawPtrVal} {codec : Value
   rw [codec.decode_encode]
   rfl
 
+/--
+Under `ExclusiveActiveBorrow rp m` and an initialized pointee slot,
+`(memoryPtrMutLens rp codec).writeBack a m` leaves `m.borrows` unchanged and
+directly updates `memoryLocals m` at `rp.allocId` to `.init (codec.encode a)`.
+-/
 theorem memoryPtrMutLens_writeBack_eq_of_exclusive
     {α : Type} (rp : RawPtrVal) (codec : ValueCodec α) (a : α)
     {m : Memory} {v₀ : Value}
@@ -460,7 +470,8 @@ structure ValidMutBorrowLens {α : Type}
   exclusive : ExclusiveActiveBorrow rp m
 
 /--
-`memoryPtrMutLens rp codec` is a `LawfulMutLens` on `ValidMutBorrowLens rp codec`.
+`memoryPtrMutLens rp codec` is a `LawfulMutLens` on
+`ValidMutBorrowLens rp codec`.
 -/
 theorem memoryPtrMutLens_lawful {α : Type}
     (rp : RawPtrVal) (codec : ValueCodec α) :
@@ -569,8 +580,9 @@ private theorem pointsTo_updateMemoryLocals_set_ne
   exact hPts₂
 
 /--
-Two `memoryPtrMutLens` instances on distinct allocations (`rp₁.allocId ≠ rp₂.allocId`)
-satisfy `IndependentLenses` on `ValidMutBorrowLensPair rp₁ rp₂ codec₁ codec₂`.
+Two `memoryPtrMutLens` instances on distinct allocations
+(`rp₁.allocId ≠ rp₂.allocId`) satisfy `IndependentLenses` on
+`ValidMutBorrowLensPair rp₁ rp₂ codec₁ codec₂`.
 -/
 theorem memoryPtrMutLens_independent_of_ne_alloc {α β : Type}
     (rp₁ rp₂ : RawPtrVal) (codec₁ : ValueCodec α) (codec₂ : ValueCodec β) :
@@ -804,9 +816,12 @@ theorem sepConj_entails_independentLenses {α β : Type}
   refine ⟨hAllocNe, hTagNe, hValidPair, hInd,
     prodMutLens_lawful hLaw₁ hLaw₂ hInd⟩
 
-/-! ## 2. Pure Lens-State Lifting Rules (`LiftDerefRead`, `LiftDerefWrite`, `LiftRetag`) -/
+/-! ## 2. Pure Lens-State Lifting Rules -/
 
-/-- Project a `RawPtrVal` to a `MirAst.ProvenancePtr` carrying `rp.tag` as its provenance ID. -/
+/--
+Project a `RawPtrVal` to a `MirAst.ProvenancePtr` whose `allocId` field
+carries the provenance tag `rp.tag`, as `MirSemantics` pointers do.
+-/
 @[reducible]
 def _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr (rp : RawPtrVal) : ProvenancePtr :=
   { allocId := rp.tag, offsetBytes := rp.offset }
@@ -816,7 +831,7 @@ def _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr (rp : RawPtrVal) : Proven
 def _root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue (rp : RawPtrVal) : Value :=
   .ptr rp.toMirPtr 8
 
-/-- Look up the current pointee `Value` of `rp` in the pure lens environment `entries`. -/
+/-- Look up the current pointee `Value` of `rp` in the lens bindings. -/
 @[reducible]
 def lookupLensVal?
     (entries : List (RawPtrVal × Value)) (rp : RawPtrVal) : Option Value :=
@@ -929,10 +944,77 @@ theorem pairwise_disjoint_of_mem_ne
       exact hHd rp hIn
     · exact ih hTl h₁ h₂
 
+/-! ### Tree Borrows Parent/Child Exclusivity (`I-10`) -/
+
+/--
+`resolveTreeBorrowWriterTag` normalizes a writer tag to `entry.tag` whenever
+the writer descends from (or is) `entry` in the `I-10` parent/child hierarchy.
+-/
+theorem resolveTreeBorrowWriterTag_of_descendant
+    {borrows : List BorrowEntry} {entry : BorrowEntry} {tag : Nat}
+    (h : isBorrowDescendantOrSelf borrows tag entry.tag = true) :
+    resolveTreeBorrowWriterTag borrows entry (.some tag) = .some entry.tag := by
+  unfold resolveTreeBorrowWriterTag
+  dsimp only
+  rw [h]
+
+/--
+Tree-Borrows-aware exclusivity of a root mutable borrow `rp` in `m` under the
+`I-10` parent/child hierarchy (`BorrowEntry.parentTag`).
+
+It relaxes `ExclusiveActiveBorrow` in one way. Besides `rp.tag`'s own entry,
+an entry targeting `rp.allocId` may remain `.active` when it is an ancestor of
+`rp.tag` (`isBorrowDescendantOrSelf m.borrows rp.tag b.tag = true`), as when a
+callee receives the reborrow `&mut *r` of a caller reference `r`. Reads and
+writes through `rp.tag` are local (child) accesses for such ancestors, so
+`freezeTreeBorrowsOnReadAtProj`, `invalidateTreeBorrowsAtProj`, and
+`hasProtectedTreeWriteConflict` leave them untouched. Every other entry on the
+allocation must already be `.disabled`.
+-/
+structure TreeExclusiveBorrow (rp : RawPtrVal) (m : Memory) : Prop where
+  offset_zero : rp.offset = 0
+  lookup_active :
+    ∃ entry,
+      lookupBorrow m.borrows rp.tag = .some entry ∧
+      entry.targetLocal = rp.allocId ∧
+      entry.targetProjection = [] ∧
+      entry.perm = .active ∧
+      entry.rangeOffset = 0 ∧
+      entry.rangeLen = 0
+  ancestors_active_or_disabled :
+    ∀ b ∈ m.borrows,
+      b.targetLocal = rp.allocId →
+        (isBorrowDescendantOrSelf m.borrows rp.tag b.tag = true ∧
+          b.perm = .active) ∨
+        b.perm = .disabled
+
+/-- The strict exclusivity invariant is the ancestor-free special case. -/
+theorem ExclusiveActiveBorrow.toTree {rp : RawPtrVal} {m : Memory}
+    (h : ExclusiveActiveBorrow rp m) : TreeExclusiveBorrow rp m where
+  offset_zero := h.offset_zero
+  lookup_active := h.lookup_active
+  ancestors_active_or_disabled b hb hTarget := by
+    rcases h.exclusive_on_alloc b hb hTarget with ⟨hTag, hPerm, _⟩ | hDis
+    · left
+      rw [hTag]
+      exact ⟨isBorrowDescendantOrSelf_self _ _, hPerm⟩
+    · exact Or.inr hDis
+
+theorem TreeExclusiveBorrow.of_borrows_eq
+    {rp : RawPtrVal} {m₁ m₂ : Memory}
+    (h : TreeExclusiveBorrow rp m₁)
+    (hBorrows : m₂.borrows = m₁.borrows) :
+    TreeExclusiveBorrow rp m₂ where
+  offset_zero := h.offset_zero
+  lookup_active := by rw [hBorrows]; exact h.lookup_active
+  ancestors_active_or_disabled := by
+    rw [hBorrows]; exact h.ancestors_active_or_disabled
+
 /--
 Separation-logic lens-state invariant connecting a pure local slot environment
 of length `frameLen` and pure lens bindings `entries : List (RawPtrVal × Value)`
-to the concrete 12-field `Memory` state `m`.
+to the concrete 12-field `Memory` state `m`. Each tracked pointer must satisfy
+the `I-10` parent/child exclusivity invariant `TreeExclusiveBorrow`.
 -/
 structure SepLensStateInv
     (frameLen : Nat)
@@ -946,7 +1028,7 @@ structure SepLensStateInv
       rp.offset = 0 ∧
       frameLen ≤ rp.allocId ∧
       get? m.callerLocals rp.allocId = .some (.init v) ∧
-      ExclusiveActiveBorrow rp m
+      TreeExclusiveBorrow rp m
   pairwise_disjoint :
     List.Pairwise
       (fun k₁ k₂ => k₁.allocId ≠ k₂.allocId ∧ k₁.tag ≠ k₂.tag)
@@ -958,9 +1040,9 @@ def hasBorrowPerm (borrows : List BorrowEntry) (rp : RawPtrVal) : Option TreeBor
 
 /--
 Relational invariant between initial memory `m₀` (with initial lens bindings
-`entries₀`) and current memory `m`, ensuring that all caller allocations
-outside `entries₀` and all Tree Borrows permission states `hasBorrowPerm` are
-preserved across `.retag` and `.deref` writes.
+`entries₀`) and current memory `m`: every caller allocation outside the tracked
+allocations of `entries₀`, and every borrow-table entry whose tag is not a
+tracked tag, is unchanged.
 -/
 structure LensFramePreserved
     (entries₀ : List (RawPtrVal × Value)) (m₀ m : Memory) : Prop where
@@ -979,7 +1061,7 @@ theorem LensFramePreserved.refl
   locals_unchanged_outside _ _ := rfl
   borrows_unchanged_outside _ _ := rfl
 
-/-! ### Borrow-Table Preservation Lemmas for `Retag`, `DerefRead`, `DerefWrite`, and Local Writes -/
+/-! ### Borrow-Table Identities for Retags, Deref Accesses, and Local Writes -/
 
 theorem mem_attachBorrowProtector
     {borrows : List BorrowEntry} {tag pid : Nat} {b : BorrowEntry}
@@ -1081,6 +1163,66 @@ theorem lookupBorrow_attachBorrowProtector_some
         simp only [lookupBorrow, hEqQ] <;>
         exact ⟨_, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/--
+Exact characterization of lookups after `attachBorrowProtector`: the entry
+found for `q` is unchanged except for its `protector` field.
+-/
+theorem lookupBorrow_attachBorrowProtector
+    (borrows : List BorrowEntry) (tag pid q : Nat) :
+    lookupBorrow (attachBorrowProtector borrows tag pid) q =
+      (lookupBorrow borrows q).map (fun e =>
+        match Nat.beq e.tag tag with
+        | true => { e with protector := .some pid }
+        | false => e) := by
+  induction borrows with
+  | nil => rfl
+  | cons hd tl ih =>
+    unfold attachBorrowProtector
+    cases hTag : Nat.beq hd.tag tag <;>
+      cases hQ : Nat.beq hd.tag q <;>
+      simp [lookupBorrow, hTag, hQ, ih]
+
+theorem length_attachBorrowProtector
+    (borrows : List BorrowEntry) (tag pid : Nat) :
+    length (attachBorrowProtector borrows tag pid) = length borrows := by
+  unfold length
+  induction borrows with
+  | nil => rfl
+  | cons hd tl ih =>
+    unfold attachBorrowProtector
+    cases Nat.beq hd.tag tag <;> simp [ih]
+
+theorem isBorrowDescendantOrSelfAux_attachBorrowProtector
+    (fuel : Nat) (borrows : List BorrowEntry) (tag pid c a : Nat) :
+    isBorrowDescendantOrSelfAux fuel (attachBorrowProtector borrows tag pid) c a =
+      isBorrowDescendantOrSelfAux fuel borrows c a := by
+  induction fuel generalizing c with
+  | zero => rfl
+  | succ fuel ih =>
+    simp only [isBorrowDescendantOrSelfAux, lookupBorrow_attachBorrowProtector]
+    cases Nat.beq c a with
+    | true => rfl
+    | false =>
+      dsimp only
+      cases lookupBorrow borrows c with
+      | none => rfl
+      | some e =>
+        dsimp only [Option.map]
+        cases Nat.beq e.tag tag <;> dsimp only <;> cases e.parentTag <;>
+          first | rfl | exact ih _
+
+/--
+Attaching a function-entry protector never changes the `I-10` parent/child
+hierarchy: `isBorrowDescendantOrSelf` only follows `tag` and `parentTag`.
+-/
+theorem isBorrowDescendantOrSelf_attachBorrowProtector
+    (borrows : List BorrowEntry) (tag pid c a : Nat) :
+    isBorrowDescendantOrSelf (attachBorrowProtector borrows tag pid) c a =
+      isBorrowDescendantOrSelf borrows c a := by
+  unfold isBorrowDescendantOrSelf
+  rw [length_attachBorrowProtector]
+  exact isBorrowDescendantOrSelfAux_attachBorrowProtector _ _ _ _ _ _
+
 theorem SepLensStateInv.attachProtector
     {frameLen : Nat} {entries : List (RawPtrVal × Value)} {m : Memory}
     (hInv : SepLensStateInv frameLen entries m)
@@ -1099,7 +1241,7 @@ theorem SepLensStateInv.attachProtector
     exact hInv.borrows_above_frame b₀ hb₀
   entries_valid rp v hMem := by
     rcases hInv.entries_valid rp v hMem with
-      ⟨hOff, hAbove, hCaller, ⟨_, hLook, hExcl⟩⟩
+      ⟨hOff, hAbove, hCaller, ⟨_, hLook, hTree⟩⟩
     rcases hLook with ⟨entry, hLookEq, hT, hP, hPerm, hRO, hRL⟩
     rcases lookupBorrow_attachBorrowProtector_some
         (tag := tag) (pid := protId) hLookEq with
@@ -1109,27 +1251,27 @@ theorem SepLensStateInv.attachProtector
         hRO'.trans hRO, hRL'.trans hRL⟩, ?_⟩⟩
     intro b hb hTargetB
     rcases mem_attachBorrowProtector hb with
-      ⟨b₀, hb₀, hTagB, hTargetB₀, hProjB, hPermB, hROB, hRLB⟩
-    rcases hExcl b₀ hb₀ (hTargetB₀.symm.trans hTargetB) with
-      ⟨hTag₀, hPerm₀, hProj₀, hRO₀, hRL₀⟩ | hDis₀
-    · exact Or.inl ⟨hTagB.trans hTag₀, hPermB.trans hPerm₀,
-        hProjB.trans hProj₀, hROB.trans hRO₀, hRLB.trans hRL₀⟩
-    · exact Or.inr (hPermB.trans hDis₀)
+      ⟨b₀, hb₀, hTagB, hTargetB₀, _, hPermB, _, _⟩
+    dsimp only
+    rw [isBorrowDescendantOrSelf_attachBorrowProtector, hTagB, hPermB]
+    exact hTree b₀ hb₀ (hTargetB₀.symm.trans hTargetB)
   pairwise_disjoint := hInv.pairwise_disjoint
 
-theorem freezeTreeBorrowsOnReadAtProj_eq_self_of_exclusive
+/--
+`I-10` deref-read freezing is the identity on a borrow table whose entries on
+the read allocation are active ancestors-or-self of the reader tag or are
+already disabled: every such read is a local (child) read.
+-/
+theorem freezeTreeBorrowsOnReadAtProj_eq_self_of_tree
     (allBorrows borrows : List BorrowEntry)
     {allocId tag : Nat}
     (readProj : List ProjectionElem)
     (readRangeOff readRangeLen : Nat)
-    (hExcl :
+    (hTree :
       ∀ b ∈ borrows,
         b.targetLocal = allocId →
-          (b.tag = tag ∧
-            b.perm = .active ∧
-            b.targetProjection = [] ∧
-            b.rangeOffset = 0 ∧
-            b.rangeLen = 0) ∨
+          (isBorrowDescendantOrSelf allBorrows tag b.tag = true ∧
+            b.perm = .active) ∨
           b.perm = .disabled) :
     freezeTreeBorrowsOnReadAtProj
       allBorrows borrows allocId (.some tag)
@@ -1137,8 +1279,7 @@ theorem freezeTreeBorrowsOnReadAtProj_eq_self_of_exclusive
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
-    have hTail :=
-      ih (fun b hb => hExcl b (List.Mem.tail hd hb))
+    have hTail := ih (fun b hb => hTree b (List.Mem.tail hd hb))
     unfold freezeTreeBorrowsOnReadAtProj
     rw [hTail]
     unfold updateBorrowPermOnReadAtProj
@@ -1147,33 +1288,33 @@ theorem freezeTreeBorrowsOnReadAtProj_eq_self_of_exclusive
     | true =>
       have hTargetEq : hd.targetLocal = allocId :=
         Nat.eq_of_beq_eq_true hTarget
-      rcases hExcl hd (List.Mem.head tl) hTargetEq with
-        ⟨hTag, _, _, _, _⟩ | hDis
-      · subst hTag
-        cases borrowEntryOverlapsWrite hd readProj readRangeOff readRangeLen with
-        | false => rfl
-        | true =>
-          simp_all [isBorrowDescendantOrSelf_self]
-      · cases borrowEntryOverlapsWrite hd readProj readRangeOff readRangeLen with
-        | false => rfl
-        | true =>
-          cases hDesc : isBorrowDescendantOrSelf allBorrows tag hd.tag <;>
-            simp_all
+      cases borrowEntryOverlapsWrite hd readProj readRangeOff readRangeLen with
+      | false => rfl
+      | true =>
+        dsimp only
+        rcases hTree hd (List.Mem.head tl) hTargetEq with ⟨hDesc, _⟩ | hDis
+        · rw [hDesc]
+        · cases isBorrowDescendantOrSelf allBorrows tag hd.tag with
+          | true => rfl
+          | false =>
+            dsimp only
+            rw [hDis]
 
-theorem hasProtectedTreeWriteConflict_eq_false_of_exclusive
+/--
+No protected entry conflicts with an `I-10` write whose allocation entries are
+active ancestors-or-self of the writer tag or are already disabled.
+-/
+theorem hasProtectedTreeWriteConflict_eq_false_of_tree
     (allBorrows borrows : List BorrowEntry)
     (activeProtectors : List Nat)
     {allocId tag : Nat}
     (writeProj : List ProjectionElem)
     (writeRangeOff writeRangeLen : Nat)
-    (hExcl :
+    (hTree :
       ∀ b ∈ borrows,
         b.targetLocal = allocId →
-          (b.tag = tag ∧
-            b.perm = .active ∧
-            b.targetProjection = [] ∧
-            b.rangeOffset = 0 ∧
-            b.rangeLen = 0) ∨
+          (isBorrowDescendantOrSelf allBorrows tag b.tag = true ∧
+            b.perm = .active) ∨
           b.perm = .disabled) :
     hasProtectedTreeWriteConflict
       allBorrows borrows activeProtectors allocId (.some tag)
@@ -1181,7 +1322,7 @@ theorem hasProtectedTreeWriteConflict_eq_false_of_exclusive
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
-    have hTail := ih (fun b hb => hExcl b (List.Mem.tail hd hb))
+    have hTail := ih (fun b hb => hTree b (List.Mem.tail hd hb))
     unfold hasProtectedTreeWriteConflict
     cases hTarget : Nat.beq hd.targetLocal allocId with
     | false =>
@@ -1193,10 +1334,8 @@ theorem hasProtectedTreeWriteConflict_eq_false_of_exclusive
           borrowEntryWriteConflicts
             hd
             (resolveTreeBorrowWriterTag allBorrows hd (.some tag)) = false := by
-        rcases hExcl hd (List.Mem.head tl) hTargetEq with
-          ⟨hTag, hPerm, _, _, _⟩ | hDis
-        · subst hTag
-          rw [resolveTreeBorrowWriterTag_self]
+        rcases hTree hd (List.Mem.head tl) hTargetEq with ⟨hDesc, _⟩ | hDis
+        · rw [resolveTreeBorrowWriterTag_of_descendant hDesc]
           unfold borrowEntryWriteConflicts
           simp
         · unfold borrowEntryWriteConflicts
@@ -1206,52 +1345,21 @@ theorem hasProtectedTreeWriteConflict_eq_false_of_exclusive
             cases hEq : Nat.beq hd.tag wTag <;> simp [hEq, hDis]
       simp [hNoConflict, hTail]
 
-theorem updateBorrowPermAtProj_eq_self_of_exclusive
-    (entry : BorrowEntry)
-    {allocId tag : Nat}
-    (writeProj : List ProjectionElem)
-    (writeRangeOff writeRangeLen : Nat)
-    (hExcl :
-      entry.targetLocal = allocId →
-        (entry.tag = tag ∧
-          entry.perm = .active ∧
-          entry.targetProjection = [] ∧
-          entry.rangeOffset = 0 ∧
-          entry.rangeLen = 0) ∨
-        entry.perm = .disabled) :
-    updateBorrowPermAtProj
-      entry allocId (.some tag) writeProj writeRangeOff writeRangeLen = entry := by
-  unfold updateBorrowPermAtProj
-  cases hTarget : Nat.beq entry.targetLocal allocId with
-  | false => rfl
-  | true =>
-    dsimp only
-    have hTargetEq : entry.targetLocal = allocId :=
-      Nat.eq_of_beq_eq_true hTarget
-    rcases hExcl hTargetEq with ⟨hTag, hPerm, _, _, _⟩ | hDis
-    · subst hTag
-      simp [hPerm]
-    · cases hEq : Nat.beq entry.tag tag with
-      | true => simp [hDis]
-      | false =>
-        dsimp only
-        cases hOverlap : borrowEntryOverlapsWrite entry writeProj writeRangeOff writeRangeLen with
-        | false => rfl
-        | true => exact borrowEntry_disabled_eta hDis
-
-theorem invalidateTreeBorrowsAtProj_eq_self_of_exclusive
+/--
+`I-10` deref-write invalidation is the identity on a borrow table whose entries
+on the written allocation are active ancestors-or-self of the writer tag (local
+writes keep them `.active`) or are already disabled.
+-/
+theorem invalidateTreeBorrowsAtProj_eq_self_of_tree
     (allBorrows borrows : List BorrowEntry)
     {allocId tag : Nat}
     (writeProj : List ProjectionElem)
     (writeRangeOff writeRangeLen : Nat)
-    (hExcl :
+    (hTree :
       ∀ b ∈ borrows,
         b.targetLocal = allocId →
-          (b.tag = tag ∧
-            b.perm = .active ∧
-            b.targetProjection = [] ∧
-            b.rangeOffset = 0 ∧
-            b.rangeLen = 0) ∨
+          (isBorrowDescendantOrSelf allBorrows tag b.tag = true ∧
+            b.perm = .active) ∨
           b.perm = .disabled) :
     invalidateTreeBorrowsAtProj
       allBorrows borrows allocId (.some tag)
@@ -1259,7 +1367,7 @@ theorem invalidateTreeBorrowsAtProj_eq_self_of_exclusive
   induction borrows with
   | nil => rfl
   | cons hd tl ih =>
-    have hTail := ih (fun b hb => hExcl b (List.Mem.tail hd hb))
+    have hTail := ih (fun b hb => hTree b (List.Mem.tail hd hb))
     unfold invalidateTreeBorrowsAtProj
     rw [hTail]
     unfold updateBorrowPermTreeAtProj
@@ -1270,10 +1378,8 @@ theorem invalidateTreeBorrowsAtProj_eq_self_of_exclusive
       dsimp only
       have hTargetEq : hd.targetLocal = allocId :=
         Nat.eq_of_beq_eq_true hTarget
-      rcases hExcl hd (List.Mem.head tl) hTargetEq with
-        ⟨hTag, hPerm, _, _, _⟩ | hDis
-      · subst hTag
-        rw [resolveTreeBorrowWriterTag_self]
+      rcases hTree hd (List.Mem.head tl) hTargetEq with ⟨hDesc, hPerm⟩ | hDis
+      · rw [resolveTreeBorrowWriterTag_of_descendant hDesc]
         dsimp only
         have hEq : Nat.beq hd.tag hd.tag = true := by simp
         rw [hEq]
@@ -1281,7 +1387,8 @@ theorem invalidateTreeBorrowsAtProj_eq_self_of_exclusive
       · cases hWriter : resolveTreeBorrowWriterTag allBorrows hd (.some tag) with
         | none =>
           dsimp only
-          cases hOverlap : borrowEntryOverlapsWrite hd writeProj writeRangeOff writeRangeLen <;>
+          cases hOverlap :
+              borrowEntryOverlapsWrite hd writeProj writeRangeOff writeRangeLen <;>
             simp [hDis]
         | some wTag =>
           dsimp only
@@ -1289,11 +1396,13 @@ theorem invalidateTreeBorrowsAtProj_eq_self_of_exclusive
           | true => simp [hDis]
           | false =>
             dsimp only
-            cases hOverlap : borrowEntryOverlapsWrite hd writeProj writeRangeOff writeRangeLen with
+            cases hOverlap :
+                borrowEntryOverlapsWrite hd writeProj writeRangeOff writeRangeLen with
             | false => rfl
             | true =>
               dsimp only
               rw [borrowEntry_disabled_eta hDis]
+
 
 theorem hasProtectedWriteConflict_eq_false_of_lt_frame
     {borrows : List BorrowEntry} {frameLen dstLoc : Nat}
@@ -1336,7 +1445,9 @@ theorem invalidateConflictingBorrows_eq_self_of_lt_frame
 /-! ### Variable-Headed Pure Lens-State Lifting Judgments -/
 
 /--
-Variable-headed pure operand evaluation on a local slot environment `env : PureEnv`.
+Variable-headed pure operand evaluation on a local slot environment
+`env : PureEnv`, including single-field projections such as `move (_3.0: u32)`
+that read one component of a checked-arithmetic pair.
 -/
 inductive LiftLensOperand :
     PureEnv → Operand → Value → PureEnv → Prop where
@@ -1347,6 +1458,18 @@ inductive LiftLensOperand :
       get? env loc = .some (.init v) →
       set? env loc .uninit = .some env' →
       LiftLensOperand env (.move { local_ := loc, projection := [] }) v env'
+  | copy_field {env : PureEnv} {loc : Local} {fieldIdx : FieldIdx} {fieldTy : Ty}
+      {rootVal v : Value} :
+      get? env loc = .some (.init rootVal) →
+      readProjectedValue env rootVal [.field fieldIdx fieldTy] = .ok v →
+      LiftLensOperand env
+        (.copy { local_ := loc, projection := [.field fieldIdx fieldTy] }) v env
+  | move_field {env : PureEnv} {loc : Local} {fieldIdx : FieldIdx} {fieldTy : Ty}
+      {rootVal v : Value} :
+      get? env loc = .some (.init rootVal) →
+      readProjectedValue env rootVal [.field fieldIdx fieldTy] = .ok v →
+      LiftLensOperand env
+        (.move { local_ := loc, projection := [.field fieldIdx fieldTy] }) v env
   | const_scalar {env : PureEnv} {ty : Ty} {sc : ScalarInt} :
       LiftLensOperand
         env
@@ -1383,8 +1506,30 @@ inductive LiftDerefRead :
         env entries (.move { local_ := ptrLoc, projection := [.deref] }) v env
 
 /--
+Unified operand lifting: a pure local or constant operand (`LiftLensOperand`)
+or a separation-logic lens dereference read (`LiftDerefRead`). It lets compound
+rvalues such as `Add(copy (*_1), copy _2)` read pointees directly, as rustc
+emits them for `*x += d`.
+-/
+inductive LiftLensOperandAny :
+    PureEnv → List (RawPtrVal × Value) → Operand → Value → PureEnv → Prop where
+  | pure {env env' : PureEnv} {entries : List (RawPtrVal × Value)}
+      {op : Operand} {v : Value} :
+      LiftLensOperand env op v env' →
+      LiftLensOperandAny env entries op v env'
+  | deref {env env' : PureEnv} {entries : List (RawPtrVal × Value)}
+      {op : Operand} {v : Value} :
+      LiftDerefRead env entries op v env' →
+      LiftLensOperandAny env entries op v env'
+
+/--
 Variable-headed pure rvalue evaluation (`LiftLensRvalue`) combining pure local
 operands and separation-logic lens dereference reads.
+
+`binaryOp` covers every scalar `BinOp` whose operands lift through
+`LiftLensOperandAny`: the side condition asks `evalScalarBinOp` to succeed with
+the signedness `evalRvalue` derives from `localDecls`, independently of the
+memory it threads through unchanged.
 -/
 inductive LiftLensRvalue
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
@@ -1406,19 +1551,44 @@ inductive LiftLensRvalue
       lookupLensVal? entries rp = .some v →
       LiftLensRvalue localDecls layouts env entries
         (.copyForDeref { local_ := ptrLoc, projection := [.deref] }) v env
-  | binaryOp_add_u32
+  | binaryOp
       {env env₁ env₂ : PureEnv} {entries : List (RawPtrVal × Value)}
-      {lhsOp rhsOp : Operand} {a b : Nat} :
-      LiftLensOperand env lhsOp (.scalar ⟨a, 4⟩) env₁ →
-      LiftLensOperand env₁ rhsOp (.scalar ⟨b, 4⟩) env₂ →
+      {op : BinOp} {lhsOp rhsOp : Operand} {lhs rhs : ScalarInt} {v : Value} :
+      LiftLensOperandAny env entries lhsOp (.scalar lhs) env₁ →
+      LiftLensOperandAny env₁ entries rhsOp (.scalar rhs) env₂ →
+      (∀ mem : Memory,
+        evalScalarBinOp op lhs rhs env₂ mem
+            (operandIsSigned localDecls lhsOp layouts) =
+          .ok v env₂ mem) →
       LiftLensRvalue localDecls layouts env entries
-        (.binaryOp .add lhsOp rhsOp)
-        (.scalar ⟨wrapScalarBits (Nat.add a b) (scalarModulus 4), 4⟩)
-        env₂
+        (.binaryOp op lhsOp rhsOp) v env₂
   | tuple_nil
       {env : PureEnv} {entries : List (RawPtrVal × Value)} :
       LiftLensRvalue localDecls layouts env entries
         (.aggregate .tuple []) (.aggregate 0 []) env
+
+/--
+Wrapping `Add` instance of `LiftLensRvalue.binaryOp` at any non-zero scalar
+width, with either operand possibly a lens dereference read.
+-/
+theorem LiftLensRvalue.binaryOp_add
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {env env₁ env₂ : PureEnv} {entries : List (RawPtrVal × Value)}
+    {lhsOp rhsOp : Operand} {a b sz : Nat}
+    (hSz : sz ≠ 0)
+    (hLhs : LiftLensOperandAny env entries lhsOp (.scalar ⟨a, sz⟩) env₁)
+    (hRhs : LiftLensOperandAny env₁ entries rhsOp (.scalar ⟨b, sz⟩) env₂) :
+    LiftLensRvalue localDecls layouts env entries
+      (.binaryOp .add lhsOp rhsOp)
+      (.scalar ⟨wrapScalarBits (Nat.add a b) (scalarModulus sz), sz⟩)
+      env₂ := by
+  refine .binaryOp hLhs hRhs (fun mem => ?_)
+  have hZero : Nat.beq sz 0 = false := by
+    cases sz with
+    | zero => exact absurd rfl hSz
+    | succ _ => rfl
+  unfold evalScalarBinOp
+  simp only [hZero, Nat.beq_refl]
 
 /--
 Variable-headed pure `StatementKind.retag` rule (`LiftRetag`) validating a
@@ -1438,8 +1608,8 @@ inductive LiftRetag
         env entries
 
 /--
-Variable-headed pure dereference write rule (`LiftDerefWrite`) updating `*ptrLoc`
-in the pure lens environment `entries` via `updateLensVal`.
+Variable-headed pure dereference write rule (`LiftDerefWrite`) updating
+`*ptrLoc` in the pure lens environment `entries` via `updateLensVal`.
 -/
 inductive LiftDerefWrite
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
@@ -1531,8 +1701,8 @@ inductive LiftLensStmt
       LiftLensStmt localDecls layouts env entries stmt env' entries'
 
 /--
-Statement-list pure lens-lifting judgment (`LiftLensStmts`) threading `(env, entries)`
-across a basic block's statement sequence.
+Statement-list pure lens-lifting judgment (`LiftLensStmts`) threading
+`(env, entries)` across a basic block's statement sequence.
 -/
 inductive LiftLensStmts
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
@@ -1549,15 +1719,30 @@ inductive LiftLensStmts
       LiftLensStmts localDecls layouts env entries (stmt :: rest) env₂ entries₂
 
 /--
-Whole-block pure lens-lifting judgment (`LiftLensBlock`) for a basic block
-terminating with `TerminatorKind.return_`, extracting return value `retVal`
-from local `_0` and final pure lens bindings `entries'`.
+Scalar bit that an `assert` condition must produce for execution to continue
+at the success target (`expected` encoded as `0` or `1`, matching
+`evalTerminator`).
 -/
-inductive LiftLensBlock (body : CapturedMir) (bbIdx : BasicBlockIdx) :
-    PureEnv → List (RawPtrVal × Value) →
+def assertBit (expected : Bool) : Nat :=
+  match expected with
+  | true => 1
+  | false => 0
+
+/--
+Control-flow-graph lens-lifting judgment (`LiftLensBlock`): executing `body`
+from basic block `bbIdx` with locals `env` and pure lens bindings `entries`
+returns `retVal` (read from `_0`) with final lens bindings `entries'`.
+
+Each constructor lifts the block's statements and then one terminator:
+`return_` ends the derivation, `goto` continues at its target, and `assert`
+continues at its success target after its condition operand lifts to the
+expected bit. Derivations are finite, so every lifted path is acyclic.
+-/
+inductive LiftLensBlock (body : CapturedMir) :
+    BasicBlockIdx → PureEnv → List (RawPtrVal × Value) →
     Value → List (RawPtrVal × Value) → Prop where
   | return_
-      {bb : BasicBlockData} {env env' : PureEnv}
+      {bbIdx : BasicBlockIdx} {bb : BasicBlockData} {env env' : PureEnv}
       {entries entries' : List (RawPtrVal × Value)} {retVal : Value} :
       body.phase = .runtimePostCleanup →
       get? body.basicBlocks bbIdx = .some bb →
@@ -1566,8 +1751,32 @@ inductive LiftLensBlock (body : CapturedMir) (bbIdx : BasicBlockIdx) :
         env entries bb.statements env' entries' →
       get? env' 0 = .some (.init retVal) →
       LiftLensBlock body bbIdx env entries retVal entries'
+  | goto
+      {bbIdx target : BasicBlockIdx} {bb : BasicBlockData} {env env₁ : PureEnv}
+      {entries entries₁ entries' : List (RawPtrVal × Value)} {retVal : Value} :
+      body.phase = .runtimePostCleanup →
+      get? body.basicBlocks bbIdx = .some bb →
+      bb.terminator.kind = .goto target →
+      LiftLensStmts body.localDecls body.layouts
+        env entries bb.statements env₁ entries₁ →
+      LiftLensBlock body target env₁ entries₁ retVal entries' →
+      LiftLensBlock body bbIdx env entries retVal entries'
+  | assert
+      {bbIdx target : BasicBlockIdx} {bb : BasicBlockData}
+      {cond : Operand} {expected : Bool} {unwind : UnwindAction}
+      {env env₁ env₂ : PureEnv} {sc : ScalarInt}
+      {entries entries₁ entries' : List (RawPtrVal × Value)} {retVal : Value} :
+      body.phase = .runtimePostCleanup →
+      get? body.basicBlocks bbIdx = .some bb →
+      bb.terminator.kind = .assert cond expected target unwind →
+      LiftLensStmts body.localDecls body.layouts
+        env entries bb.statements env₁ entries₁ →
+      LiftLensOperandAny env₁ entries₁ cond (.scalar sc) env₂ →
+      sc.bits = assertBit expected →
+      LiftLensBlock body target env₂ entries₁ retVal entries' →
+      LiftLensBlock body bbIdx env entries retVal entries'
 
-/-! ### Soundness of Operand, Rvalue, and Statement Lifting under `SepLensStateInv` -/
+/-! ### Soundness of Operand, Rvalue, and Statement Lifting -/
 
 theorem set?_length_eq {α : Type u} {xs ys : List α} {i : Nat} {v : α}
     (h : set? xs i v = .some ys) : ys.length = xs.length := by
@@ -1594,6 +1803,20 @@ theorem LiftLensOperand.evalOperand_eq
   | move_local hGet hSet =>
     refine ⟨?_, set?_length_eq hSet⟩
     simp [evalOperand, hGet, hSet]
+  | copy_field hGet hRead =>
+    refine ⟨?_, rfl⟩
+    unfold evalOperand
+    dsimp only
+    rw [hGet]
+    dsimp only
+    rw [hRead]
+  | move_field hGet hRead =>
+    refine ⟨?_, rfl⟩
+    unfold evalOperand
+    dsimp only
+    rw [hGet]
+    dsimp only
+    rw [hRead]
   | const_scalar =>
     exact ⟨rfl, rfl⟩
   | const_zeroSized =>
@@ -1662,7 +1885,7 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq
         rw [hLookB]
         dsimp only
         rw [hT]
-        exact freezeTreeBorrowsOnReadAtProj_eq_self_of_exclusive
+        exact freezeTreeBorrowsOnReadAtProj_eq_self_of_tree
           m.borrows m.borrows _ _ _ hExcl
       · nomatch hMove
   | move_deref hGetPtr hLookVal =>
@@ -1694,8 +1917,28 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq
         rw [hLookB]
         dsimp only
         rw [hT]
-        exact freezeTreeBorrowsOnReadAtProj_eq_self_of_exclusive
+        exact freezeTreeBorrowsOnReadAtProj_eq_self_of_tree
           m.borrows m.borrows _ _ _ hExcl
+
+/--
+Soundness of unified operand lifting: under `SepLensStateInv`, the lifted
+operand evaluates to its lifted value against the real borrow table, globals,
+and caller locals, without changing the local environment's length.
+-/
+theorem LiftLensOperandAny.evalOperand_eq
+    {env env' : PureEnv} {entries : List (RawPtrVal × Value)}
+    {op : Operand} {v : Value} {m : Memory}
+    (h : LiftLensOperandAny env entries op v env')
+    (hInv : SepLensStateInv env.length entries m)
+    (layouts : LayoutTable) :
+    evalOperand env op m.borrows m.globals layouts m.callerLocals = .ok v env' ∧
+    env'.length = env.length := by
+  cases h with
+  | pure hOp => exact hOp.evalOperand_eq m.borrows m.globals layouts m.callerLocals
+  | deref hDeref =>
+    rcases hDeref.evalOperand_and_freeze_eq hInv layouts with ⟨hEval, hEnvEq, _⟩
+    subst hEnvEq
+    exact ⟨hEval, rfl⟩
 
 theorem LiftLensRvalue.evalRvalue_eq
     {localDecls : List LocalDecl} {layouts : LayoutTable}
@@ -1712,7 +1955,7 @@ theorem LiftLensRvalue.evalRvalue_eq
     refine ⟨?_, hLen⟩
     unfold evalRvalue
     simp [hEval]
-    try { exact hOp.not_deref m.borrows m }
+    exact hOp.not_deref m.borrows m
   | use_deref hDeref =>
     rcases hDeref.evalOperand_and_freeze_eq hInv layouts with
       ⟨hEval, hEnvEq, hFreeze⟩
@@ -1763,14 +2006,17 @@ theorem LiftLensRvalue.evalRvalue_eq
         rw [hB] at hFr
         dsimp only
         rw [hFr, ← hB]
-  | binaryOp_add_u32 hLhs hRhs =>
-    rcases hLhs.evalOperand_eq m.borrows m.globals layouts m.callerLocals with
-      ⟨hEval₁, hLen₁⟩
-    rcases hRhs.evalOperand_eq m.borrows m.globals layouts m.callerLocals with
+  | binaryOp hLhs hRhs hEvalOp =>
+    rcases hLhs.evalOperand_eq hInv layouts with ⟨hEval₁, hLen₁⟩
+    rcases hRhs.evalOperand_eq (by rw [hLen₁]; exact hInv) layouts with
       ⟨hEval₂, hLen₂⟩
     refine ⟨?_, hLen₂.trans hLen₁⟩
     unfold evalRvalue
-    simp [hEval₁, hEval₂]
+    dsimp only
+    rw [hEval₁]
+    dsimp only
+    rw [hEval₂]
+    exact hEvalOp m
   | tuple_nil =>
     exact ⟨rfl, rfl⟩
 
@@ -1793,7 +2039,7 @@ theorem SepLensStateInv.updateDeref
     rcases mem_updateLensVal_raw hInv.pairwise_disjoint hMemNew with
       ⟨rfl, rfl⟩ | ⟨hNe, hMemOld⟩
     · refine ⟨hOffRp, hAboveRp, ?_,
-        ExclusiveActiveBorrow.of_borrows_eq hExclRp rfl⟩
+        TreeExclusiveBorrow.of_borrows_eq hExclRp rfl⟩
       unfold get?
       exact List.getElem?_set_self hLtRp
     · rcases hInv.entries_valid k v hMemOld with
@@ -1801,7 +2047,7 @@ theorem SepLensStateInv.updateDeref
       have hDisj :=
         pairwise_disjoint_of_mem_ne hInv.pairwise_disjoint hMemRp hMemOld hNe
       refine ⟨hOffK, hAboveK, ?_,
-        ExclusiveActiveBorrow.of_borrows_eq hExclK rfl⟩
+        TreeExclusiveBorrow.of_borrows_eq hExclK rfl⟩
       unfold get? at hCallerK ⊢
       rw [List.getElem?_set_ne hDisj.1.symm]
       exact hCallerK
@@ -1961,9 +2207,9 @@ theorem LiftLensStmt.evalStmt_step
                     entry.rangeOffset
                     entry.rangeLen = false := by
                 rw [hT, ← hB]
-                exact hasProtectedTreeWriteConflict_eq_false_of_exclusive
+                exact hasProtectedTreeWriteConflict_eq_false_of_tree
                   s.memory.borrows s.memory.borrows (pHead :: pTail) _ _ _
-                  hExcl.exclusive_on_alloc
+                  hExcl.ancestors_active_or_disabled
               dsimp only
               rw [hNoConflict]
               dsimp only
@@ -1996,8 +2242,25 @@ theorem LiftLensStmt.evalStmt_step
               needsThinPtrElemResolution,
               stripTransparentProjections,
               normalizeSubsliceProjections]
-            have hExclSingle := hExcl.exclusive_on_alloc
-            rw [hB] at hExclSingle
+            -- With a single borrow-table entry, `lookupBorrow` forces that
+            -- entry to be `rp.tag`'s own active whole-allocation entry, so the
+            -- non-tree `invalidateConflictingBorrows` path is the identity.
+            have hExclSingle :
+                ∀ b ∈ [b₁],
+                  b.targetLocal = rp.allocId →
+                    (b.tag = rp.tag ∧
+                      b.perm = .active ∧
+                      b.targetProjection = [] ∧
+                      b.rangeOffset = 0 ∧
+                      b.rangeLen = 0) ∨
+                    b.perm = .disabled := by
+              intro b hb _
+              rcases lookupBorrow_mem_and_tag hLookSingle with ⟨hMemE, hTagE⟩
+              have hbEq : b = b₁ := List.mem_singleton.mp hb
+              have heEq : entry = b₁ := List.mem_singleton.mp hMemE
+              subst hbEq
+              rw [← heEq]
+              exact Or.inl ⟨hTagE, hPerm, hP, hRO, hRL⟩
             rw [hT]
             exact invalidateConflictingBorrows_eq_self_of_exclusive hExclSingle
           | cons b₂ rest =>
@@ -2008,8 +2271,9 @@ theorem LiftLensStmt.evalStmt_step
             rw [hLookMany]
             dsimp only
             rw [hT, ← hB]
-            exact invalidateTreeBorrowsAtProj_eq_self_of_exclusive
-              s.memory.borrows s.memory.borrows _ _ _ hExcl.exclusive_on_alloc
+            exact invalidateTreeBorrowsAtProj_eq_self_of_tree
+              s.memory.borrows s.memory.borrows _ _ _
+              hExcl.ancestors_active_or_disabled
       refine ⟨
         { s.memory with
           callerLocals := s.memory.callerLocals.set rp.allocId (.init newVal) },
@@ -2107,30 +2371,42 @@ theorem LiftLensStmt.evalStmt_step
 
 /-! ### Fuel-Free `MirWpConverges` Soundness (`mirWpConverges_of_sepLenses`) -/
 
+/--
+Statement-sequence soundness in continuation form: if the remaining statements
+`stmts` of block `bbIdx` lift from `(env, entries)` to `(env', entries')`, then
+execution reaches the block's terminator (`stmtIdx = bb.statements.length`)
+with locals `env'` and a memory satisfying the invariant, the frame relation,
+and the key invariant; any continuation established there extends to the
+current statement.
+-/
 theorem mirWpConverges_of_liftLensStmts
     {body : CapturedMir} {bbIdx : BasicBlockIdx} {bb : BasicBlockData}
     {stmts : List Statement}
     {env env' : PureEnv}
     {entries₀ entries entries' : List (RawPtrVal × Value)}
-    {retVal : Value}
     (hPhase : body.phase = .runtimePostCleanup)
     (hBb : get? body.basicBlocks bbIdx = .some bb)
-    (hTerm : bb.terminator.kind = .return_)
     (hStmts :
       LiftLensStmts body.localDecls body.layouts
-        env entries stmts env' entries')
-    (hRet : get? env' 0 = .some (.init retVal)) :
+        env entries stmts env' entries') :
     ∀ (prefixStmts : List Statement) (m₀ m : Memory)
       (Φ : MirOutcome → Prop),
       bb.statements = prefixStmts ++ stmts →
       SepLensStateInv env.length entries m →
       LensFramePreserved entries₀ m₀ m →
       entries.map Prod.fst = entries₀.map Prod.fst →
-      (∀ m_final : Memory,
-        SepLensStateInv env'.length entries' m_final →
-        LensFramePreserved entries₀ m₀ m_final →
+      (∀ m' : Memory,
+        SepLensStateInv env'.length entries' m' →
+        LensFramePreserved entries₀ m₀ m' →
         entries'.map Prod.fst = entries₀.map Prod.fst →
-        Φ (.normal (retVal, m_final))) →
+        MirWpConverges body
+          { frame := {
+              blockIdx := bbIdx
+              stmtIdx := bb.statements.length
+              locals := env'
+            }
+            memory := m' }
+          Φ) →
       MirWpConverges body
         { frame := {
             blockIdx := bbIdx
@@ -2141,26 +2417,14 @@ theorem mirWpConverges_of_liftLensStmts
         Φ := by
   induction hStmts with
   | @nil env entries =>
-    intro prefixStmts m₀ m Φ hBbStmts hInv hFrame hKeys hPost
-    apply MirWpConverges.ret_of_step
-    · unfold stepMirFn
-      rw [hInv.activeCallee_none]
-      dsimp only [Option.getD]
-      simp only [hPhase, hBb]
-      have hStmtLen : bb.statements.length = prefixStmts.length := by
-        rw [hBbStmts, List.append_nil]
-      have hGetNone : get? bb.statements prefixStmts.length = .none :=
-        get?_eq_none_of_le (Nat.le_of_eq hStmtLen)
-      simp only [hGetNone]
-      unfold length
-      simp only [← hStmtLen, beq_self_eq_true, ↓reduceIte]
-      unfold evalTerminator
-      rw [hTerm, hRet, hInv.callStack_nil]
-      rfl
-    · exact hPost m hInv hFrame hKeys
+    intro prefixStmts m₀ m Φ hBbStmts hInv hFrame hKeys hCont
+    have hStmtLen : bb.statements.length = prefixStmts.length := by
+      rw [hBbStmts, List.append_nil]
+    rw [← hStmtLen]
+    exact hCont m hInv hFrame hKeys
   | cons hFirst hRest ih =>
     rename_i env_ env1_ env2_ entries_ entries1_ entries2_ stmt rest
-    intro prefixStmts m₀ m Φ hBbStmts hInv hFrame hKeys hPost
+    intro prefixStmts m₀ m Φ hBbStmts hInv hFrame hKeys hCont
     let s : MachineState := {
       frame := {
         blockIdx := bbIdx
@@ -2196,17 +2460,125 @@ theorem mirWpConverges_of_liftLensStmts
       unfold advanceStmt
       dsimp only [s]
       rw [← hPrefixLen]
-      exact ih hRet (prefixStmts ++ [stmt]) m₀ m₁ Φ
-        hAppend hInv₁ hFrame₁ hKeys₁ hPost
+      exact ih (prefixStmts ++ [stmt]) m₀ m₁ Φ hAppend hInv₁ hFrame₁ hKeys₁ hCont
+
+/-- A root-frame `return_` terminator halts with `_0`'s value and the memory. -/
+theorem mirWpConverges_return_of_lens
+    {body : CapturedMir} {bbIdx : BasicBlockIdx} {bb : BasicBlockData}
+    {env : PureEnv} {m : Memory} {retVal : Value} {Φ : MirOutcome → Prop}
+    (hPhase : body.phase = .runtimePostCleanup)
+    (hBb : get? body.basicBlocks bbIdx = .some bb)
+    (hTerm : bb.terminator.kind = .return_)
+    (hRet : get? env 0 = .some (.init retVal))
+    (hStack : m.callStack = [])
+    (hCallee : m.activeCallee = .none)
+    (hPost : Φ (.normal (retVal, m))) :
+    MirWpConverges body
+      { frame := {
+          blockIdx := bbIdx
+          stmtIdx := bb.statements.length
+          locals := env
+        }
+        memory := m }
+      Φ := by
+  refine MirWpConverges.ret_of_step ?_ hPost
+  unfold stepMirFn
+  rw [hCallee]
+  dsimp only [Option.getD]
+  simp only [hPhase, hBb]
+  have hGetNone : get? bb.statements bb.statements.length = .none :=
+    get?_eq_none_of_le (Nat.le_refl _)
+  simp only [hGetNone]
+  unfold length
+  simp only [beq_self_eq_true, ↓reduceIte]
+  unfold evalTerminator
+  rw [hTerm, hRet, hStack]
+  rfl
+
+/-- A `goto` terminator continues at the first statement of its target. -/
+theorem mirWpConverges_goto_of_lens
+    {body : CapturedMir} {bbIdx target : BasicBlockIdx} {bb : BasicBlockData}
+    {env : PureEnv} {m : Memory} {Φ : MirOutcome → Prop}
+    (hPhase : body.phase = .runtimePostCleanup)
+    (hBb : get? body.basicBlocks bbIdx = .some bb)
+    (hTerm : bb.terminator.kind = .goto target)
+    (hCallee : m.activeCallee = .none)
+    (hNext :
+      MirWpConverges body
+        { frame := { blockIdx := target, stmtIdx := 0, locals := env }
+          memory := m }
+        Φ) :
+    MirWpConverges body
+      { frame := {
+          blockIdx := bbIdx
+          stmtIdx := bb.statements.length
+          locals := env
+        }
+        memory := m }
+      Φ := by
+  refine MirWpConverges.step_tau ?_ hNext
+  unfold stepMirFn
+  rw [hCallee]
+  dsimp only [Option.getD]
+  simp only [hPhase, hBb]
+  have hGetNone : get? bb.statements bb.statements.length = .none :=
+    get?_eq_none_of_le (Nat.le_refl _)
+  simp only [hGetNone]
+  unfold length
+  simp only [beq_self_eq_true, ↓reduceIte]
+  unfold evalTerminator
+  rw [hTerm]
+  rfl
 
 /--
-Fuel-Free Separation-Logic Lens Lifting Theorem (`mirWpConverges_of_sepLenses`):
-Given a `LiftLensBlock body bbIdx env entries₀ retVal entries'` derivation and
-an initial memory `m₀` satisfying `SepLensStateInv env.length entries₀ m₀`,
-`MirWpConverges` holds fuel-freely from `{ blockIdx := bbIdx, stmtIdx := 0, locals := env }`
-to a final memory `m_final` satisfying `SepLensStateInv env.length entries' m_final`
-and `LensFramePreserved entries₀ m₀ m_final`.
+An `assert` terminator whose condition evaluates to the expected bit continues
+at its success target with the locals left by the condition operand.
 -/
+theorem mirWpConverges_assert_of_lens
+    {body : CapturedMir} {bbIdx target : BasicBlockIdx} {bb : BasicBlockData}
+    {cond : Operand} {expected : Bool} {unwind : UnwindAction}
+    {env env' : PureEnv} {sc : ScalarInt} {m : Memory} {Φ : MirOutcome → Prop}
+    (hPhase : body.phase = .runtimePostCleanup)
+    (hBb : get? body.basicBlocks bbIdx = .some bb)
+    (hTerm : bb.terminator.kind = .assert cond expected target unwind)
+    (hCallee : m.activeCallee = .none)
+    (hEval :
+      evalOperand env cond m.borrows m.globals body.layouts m.callerLocals =
+        .ok (.scalar sc) env')
+    (hBit : sc.bits = assertBit expected)
+    (hNext :
+      MirWpConverges body
+        { frame := { blockIdx := target, stmtIdx := 0, locals := env' }
+          memory := m }
+        Φ) :
+    MirWpConverges body
+      { frame := {
+          blockIdx := bbIdx
+          stmtIdx := bb.statements.length
+          locals := env
+        }
+        memory := m }
+      Φ := by
+  refine MirWpConverges.step_tau ?_ hNext
+  unfold stepMirFn
+  rw [hCallee]
+  dsimp only [Option.getD]
+  simp only [hPhase, hBb]
+  have hGetNone : get? bb.statements bb.statements.length = .none :=
+    get?_eq_none_of_le (Nat.le_refl _)
+  simp only [hGetNone]
+  unfold length
+  simp only [beq_self_eq_true, ↓reduceIte]
+  unfold evalTerminator
+  rw [hTerm]
+  dsimp only
+  rw [hEval]
+  dsimp only
+  rw [hBit]
+  cases expected <;> rfl
+
+
+/-- Pure operand lifting preserves the length of the local slot environment. -/
 theorem LiftLensOperand.length_eq
     {env env' : PureEnv} {op : Operand} {v : Value}
     (h : LiftLensOperand env op v env') :
@@ -2214,8 +2586,20 @@ theorem LiftLensOperand.length_eq
   cases h with
   | copy_local _ => rfl
   | move_local _ hSet => exact set?_length_eq hSet
+  | copy_field _ _ => rfl
+  | move_field _ _ => rfl
   | const_scalar => rfl
   | const_zeroSized => rfl
+
+/-- Unified operand lifting preserves the local slot environment's length. -/
+theorem LiftLensOperandAny.length_eq
+    {env env' : PureEnv} {entries : List (RawPtrVal × Value)}
+    {op : Operand} {v : Value}
+    (h : LiftLensOperandAny env entries op v env') :
+    env'.length = env.length := by
+  cases h with
+  | pure hOp => exact hOp.length_eq
+  | deref hDeref => cases hDeref <;> rfl
 
 theorem LiftLensRvalue.length_eq
     {localDecls : List LocalDecl} {layouts : LayoutTable}
@@ -2227,7 +2611,7 @@ theorem LiftLensRvalue.length_eq
   | use_pure hOp => exact hOp.length_eq
   | use_deref hDeref => cases hDeref <;> rfl
   | copyForDeref_deref _ _ => rfl
-  | binaryOp_add_u32 hLhs hRhs => exact hRhs.length_eq.trans hLhs.length_eq
+  | binaryOp hLhs hRhs _ => exact hRhs.length_eq.trans hLhs.length_eq
   | tuple_nil => rfl
 
 theorem LiftLensStmt.length_eq
@@ -2257,12 +2641,70 @@ theorem LiftLensStmts.length_eq
   | cons hFirst _ ih => exact ih.trans hFirst.length_eq
 
 /--
+Control-flow soundness of `LiftLensBlock` by induction on the derivation: each
+block's statements step through `mirWpConverges_of_liftLensStmts`, and its
+terminator (`return_`, `goto`, or `assert`) steps through the matching
+terminator lemma, threading `SepLensStateInv`, `LensFramePreserved`, and the
+lens keys across blocks.
+-/
+theorem mirWpConverges_of_liftLensBlock
+    {body : CapturedMir} {bbIdx : BasicBlockIdx} {env : PureEnv}
+    {entries entries' : List (RawPtrVal × Value)} {retVal : Value}
+    (hBlock : LiftLensBlock body bbIdx env entries retVal entries') :
+    ∀ (entries₀ : List (RawPtrVal × Value)) (m₀ m : Memory)
+      (Φ : MirOutcome → Prop),
+      SepLensStateInv env.length entries m →
+      LensFramePreserved entries₀ m₀ m →
+      entries.map Prod.fst = entries₀.map Prod.fst →
+      (∀ m_final : Memory,
+        SepLensStateInv env.length entries' m_final →
+        LensFramePreserved entries₀ m₀ m_final →
+        Φ (.normal (retVal, m_final))) →
+      MirWpConverges body
+        { frame := { blockIdx := bbIdx, stmtIdx := 0, locals := env }
+          memory := m }
+        Φ := by
+  induction hBlock with
+  | return_ hPhase hBb hTerm hStmts hRet =>
+    intro entries₀ m₀ m Φ hInv hFrame hKeys hPost
+    have hLen := hStmts.length_eq
+    exact mirWpConverges_of_liftLensStmts hPhase hBb hStmts [] m₀ m Φ
+      (List.nil_append _).symm hInv hFrame hKeys
+      (fun m' hInv' hFrame' _ =>
+        mirWpConverges_return_of_lens hPhase hBb hTerm hRet
+          hInv'.callStack_nil hInv'.activeCallee_none
+          (hPost m' (by rw [← hLen]; exact hInv') hFrame'))
+  | goto hPhase hBb hTerm hStmts _ ih =>
+    intro entries₀ m₀ m Φ hInv hFrame hKeys hPost
+    have hLen := hStmts.length_eq
+    exact mirWpConverges_of_liftLensStmts hPhase hBb hStmts [] m₀ m Φ
+      (List.nil_append _).symm hInv hFrame hKeys
+      (fun m' hInv' hFrame' hKeys' =>
+        mirWpConverges_goto_of_lens hPhase hBb hTerm hInv'.activeCallee_none
+          (ih entries₀ m₀ m' Φ hInv' hFrame' hKeys'
+            (fun m_final hInvF hFrameF =>
+              hPost m_final (by rw [← hLen]; exact hInvF) hFrameF)))
+  | assert hPhase hBb hTerm hStmts hCond hBit _ ih =>
+    intro entries₀ m₀ m Φ hInv hFrame hKeys hPost
+    have hLen := hStmts.length_eq
+    refine mirWpConverges_of_liftLensStmts hPhase hBb hStmts [] m₀ m Φ
+      (List.nil_append _).symm hInv hFrame hKeys
+      (fun m' hInv' hFrame' hKeys' => ?_)
+    rcases hCond.evalOperand_eq hInv' body.layouts with ⟨hEval, hLen₂⟩
+    exact mirWpConverges_assert_of_lens hPhase hBb hTerm
+      hInv'.activeCallee_none hEval hBit
+      (ih entries₀ m₀ m' Φ (by rw [hLen₂]; exact hInv') hFrame' hKeys'
+        (fun m_final hInvF hFrameF =>
+          hPost m_final (by rw [← hLen, ← hLen₂]; exact hInvF) hFrameF))
+
+/--
 Fuel-Free Separation-Logic Lens Lifting Theorem (`mirWpConverges_of_sepLenses`):
-Given a `LiftLensBlock body bbIdx env entries₀ retVal entries'` derivation and
-an initial memory `m₀` satisfying `SepLensStateInv env.length entries₀ m₀`,
-`MirWpConverges` holds fuel-freely from `{ blockIdx := bbIdx, stmtIdx := 0, locals := env }`
-to a final memory `m_final` satisfying `SepLensStateInv env.length entries' m_final`
-and `LensFramePreserved entries₀ m₀ m_final`.
+given a `LiftLensBlock body bbIdx env entries₀ retVal entries'` derivation over
+the body's control-flow graph and an initial memory `m₀` satisfying
+`SepLensStateInv env.length entries₀ m₀`, `MirWpConverges` holds fuel-freely
+from `{ blockIdx := bbIdx, stmtIdx := 0, locals := env }` to a normal return of
+`retVal` in a final memory satisfying `SepLensStateInv env.length entries'` and
+`LensFramePreserved entries₀ m₀`.
 -/
 theorem mirWpConverges_of_sepLenses
     {body : CapturedMir} {bbIdx : BasicBlockIdx}
@@ -2278,14 +2720,10 @@ theorem mirWpConverges_of_sepLenses
     MirWpConverges body
       { frame := { blockIdx := bbIdx, stmtIdx := 0, locals := env }
         memory := m₀ }
-      Φ := by
-  cases hBlock with
-  | @return_ bb _ env' _ _ _ hPhase hBb hTerm hStmts hRet =>
-    have hLenEq : env'.length = env.length := hStmts.length_eq
-    exact mirWpConverges_of_liftLensStmts hPhase hBb hTerm hStmts hRet
-      [] m₀ m₀ Φ (List.nil_append _).symm hInv₀
-      (LensFramePreserved.refl entries₀ m₀) rfl
-      (fun m_final hInvF hFrameF _ => hPost m_final (hLenEq ▸ hInvF) hFrameF)
+      Φ :=
+  mirWpConverges_of_liftLensBlock hBlock entries₀ m₀ m₀ Φ hInv₀
+    (LensFramePreserved.refl entries₀ m₀) rfl hPost
+
 
 /--
 Bridge from `mirWpConverges_of_sepLenses` to `StatefulVerificationResult`.
@@ -2351,7 +2789,7 @@ structure WfSingleMutBorrow
   activeCallee_none : m.activeCallee = .none
   borrows_above_frame : ∀ b ∈ m.borrows, frameLen ≤ b.targetLocal
   alloc_above_frame : frameLen ≤ rp.allocId
-  exclusive : ExclusiveActiveBorrow rp m
+  exclusive : TreeExclusiveBorrow rp m
 
 theorem callerLocals_get?_of_pointsTo
     {rp : RawPtrVal} {v : Value} {m : Memory}
@@ -2391,6 +2829,721 @@ theorem activeTypedMutBorrow_of_sepLensEntry {α : Type}
   exact ⟨⟨mutBorrowFootprint rp, activeTypedMutBorrow_intro hPts hTok⟩,
     memoryPtrMutLens_readView_of_readAllocAt hPts⟩
 
+/-! ### General `List` / Indexed Composition of Typed Mutable Borrows -/
+
+/--
+A typed mutable-borrow binding: pointer `rp`, value codec `codec`, and current
+logical pointee value `val`. Heterogeneous binding lists model the `k`-ary
+separating conjunction `ATMB rp₁ codec₁ a₁ ∗ ⋯ ∗ ATMB rpₖ codecₖ aₖ ∗ R_frame`,
+where `ATMB` abbreviates `ActiveTypedMutBorrow`.
+-/
+structure MutBorrowBinding : Type 1 where
+  α : Type
+  rp : RawPtrVal
+  codec : ValueCodec α
+  val : α
+
+/-- Build a `MutBorrowBinding`, inferring the pointee type from `codec`. -/
+def MutBorrowBinding.bind {α : Type}
+    (rp : RawPtrVal) (codec : ValueCodec α) (val : α) : MutBorrowBinding :=
+  ⟨α, rp, codec, val⟩
+
+/-- `ActiveTypedMutBorrow b.rp b.codec b.val`. -/
+def MutBorrowBinding.toSepProp (b : MutBorrowBinding) : SepProp :=
+  ActiveTypedMutBorrow b.rp b.codec b.val
+
+/-- Pure lens-state entry `(b.rp, b.codec.encode b.val)`. -/
+def MutBorrowBinding.entry (b : MutBorrowBinding) : RawPtrVal × Value :=
+  (b.rp, b.codec.encode b.val)
+
+/-- Address cell `(allocId, offset)` owned by the binding's `PointsTo`. -/
+def MutBorrowBinding.cell (b : MutBorrowBinding) : Nat × Nat :=
+  (b.rp.allocId, b.rp.offset)
+
+/-- Iterated separating conjunction `P₁ ∗ (P₂ ∗ (⋯ ∗ (Pₖ ∗ R)))`. -/
+def sepConjList : List SepProp → SepProp → SepProp
+  | [], R => R
+  | P :: Ps, R => sepConj P (sepConjList Ps R)
+
+/--
+`ATMB b₁ ∗ ⋯ ∗ ATMB bₖ ∗ R`, right-nested exactly like the binary forms, so
+`sepConjBindings [b₁, b₂] R` unfolds definitionally to
+`sepConj (ATMB b₁) (sepConj (ATMB b₂) R)`.
+-/
+def sepConjBindings (bs : List MutBorrowBinding) (R : SepProp) : SepProp :=
+  sepConjList (bs.map MutBorrowBinding.toSepProp) R
+
+/-- Combined footprint of a binding list: its cells and its tags. -/
+def bindingsFootprint (bs : List MutBorrowBinding) : Footprint :=
+  { addrs := bs.map MutBorrowBinding.cell, tags := bs.map (·.rp.tag) }
+
+/-- Pointer-level facts carried by one `ActiveTypedMutBorrow` at `h`. -/
+theorem activeTypedMutBorrow_facts {α : Type}
+    {rp : RawPtrVal} {codec : ValueCodec α} {a : α} {h : PartialHeap}
+    (hA : ActiveTypedMutBorrow rp codec a h) :
+    readAllocAt? (memoryLocals h.state) rp = some (codec.encode a) ∧
+    (∃ entry,
+      lookupBorrow h.state.borrows rp.tag = some entry ∧
+      entry.targetLocal = rp.allocId ∧
+      entry.perm = .active) ∧
+    (rp.allocId, rp.offset) ∈ h.footprint.addrs ∧
+    rp.tag ∈ h.footprint.tags := by
+  rcases hA with
+    ⟨h₁, h₂, ⟨hs₁, hs₂, _, hAddrs, hTags⟩, ⟨hPts, hfp₁⟩, ⟨hTok, hfp₂⟩⟩
+  refine ⟨hs₁ ▸ hPts, hs₂ ▸ hTok, ?_, ?_⟩
+  · apply (hAddrs _).mpr
+    left
+    rw [hfp₁]
+    exact List.mem_singleton.mpr rfl
+  · apply (hTags _).mpr
+    right
+    rw [hfp₂]
+    exact List.mem_singleton.mpr rfl
+
+/--
+Decomposition of `sepConjBindings bs R` at `h`: every binding's pointee and
+active borrow token are present in `h.state`, binding cells and tags are
+pairwise distinct and owned by `h`, and the frame `R` holds at a footprint
+`fpR ⊆ h.footprint` that is disjoint from every binding.
+-/
+theorem sepConjBindings_split
+    {bs : List MutBorrowBinding} {R : SepProp} {h : PartialHeap}
+    (hSep : sepConjBindings bs R h) :
+    (∀ b ∈ bs,
+      readAllocAt? (memoryLocals h.state) b.rp = some (b.codec.encode b.val) ∧
+      ∃ entry,
+        lookupBorrow h.state.borrows b.rp.tag = some entry ∧
+        entry.targetLocal = b.rp.allocId ∧
+        entry.perm = .active) ∧
+    bs.Pairwise (fun b₁ b₂ => b₁.cell ≠ b₂.cell ∧ b₁.rp.tag ≠ b₂.rp.tag) ∧
+    (∀ b ∈ bs, b.cell ∈ h.footprint.addrs ∧ b.rp.tag ∈ h.footprint.tags) ∧
+    ∃ fpR : Footprint,
+      R ⟨h.state, fpR⟩ ∧
+      (∀ b ∈ bs, b.cell ∉ fpR.addrs ∧ b.rp.tag ∉ fpR.tags) ∧
+      (∀ a ∈ fpR.addrs, a ∈ h.footprint.addrs) ∧
+      (∀ t ∈ fpR.tags, t ∈ h.footprint.tags) := by
+  induction bs generalizing h with
+  | nil =>
+    refine ⟨?_, List.Pairwise.nil, ?_, h.footprint, hSep, ?_, ?_, ?_⟩
+    · intro _ hb
+      nomatch hb
+    · intro _ hb
+      nomatch hb
+    · intro _ hb
+      nomatch hb
+    · intro _ ha
+      exact ha
+    · intro _ ht
+      exact ht
+  | cons b rest ih =>
+    rcases hSep with ⟨h₁, h₂, ⟨hs₁, hs₂, hDisj, hAddrs, hTags⟩, hB, hRest⟩
+    rcases activeTypedMutBorrow_facts hB with ⟨hPts, hTok, hCell, hTag⟩
+    rcases ih hRest with ⟨hBind, hPair, hOwn, fpR, hR, hDisjR, hSubA, hSubT⟩
+    refine ⟨?_, ?_, ?_, fpR, ?_, ?_, ?_, ?_⟩
+    · intro b' hb'
+      rcases List.mem_cons.mp hb' with rfl | hb'
+      · rw [← hs₁]
+        exact ⟨hPts, hTok⟩
+      · rw [← hs₂]
+        exact hBind b' hb'
+    · refine List.pairwise_cons.mpr ⟨fun b' hb' => ⟨?_, ?_⟩, hPair⟩
+      · intro hEq
+        apply hDisj.1 _ hCell
+        have hIn := (hOwn b' hb').1
+        rw [← hEq] at hIn
+        exact hIn
+      · intro hEq
+        apply hDisj.2 _ hTag
+        have hIn := (hOwn b' hb').2
+        rw [← hEq] at hIn
+        exact hIn
+    · intro b' hb'
+      rcases List.mem_cons.mp hb' with rfl | hb'
+      · exact ⟨(hAddrs _).mpr (Or.inl hCell), (hTags _).mpr (Or.inl hTag)⟩
+      · exact ⟨(hAddrs _).mpr (Or.inr (hOwn b' hb').1),
+          (hTags _).mpr (Or.inr (hOwn b' hb').2)⟩
+    · rw [← hs₂]
+      exact hR
+    · intro b' hb'
+      rcases List.mem_cons.mp hb' with rfl | hb'
+      · exact ⟨fun hIn => hDisj.1 _ hCell (hSubA _ hIn),
+          fun hIn => hDisj.2 _ hTag (hSubT _ hIn)⟩
+      · exact hDisjR b' hb'
+    · intro a ha
+      exact (hAddrs a).mpr (Or.inr (hSubA a ha))
+    · intro t ht
+      exact (hTags t).mpr (Or.inr (hSubT t ht))
+
+/--
+Converse of `sepConjBindings_split`: pairwise-disjoint bindings that are each
+present in `m`, together with a frame `R` at a footprint disjoint from all of
+them, compose into `sepConjBindings bs R` at their union footprint.
+-/
+theorem sepConjBindings_intro
+    {bs : List MutBorrowBinding} {R : SepProp} {m : Memory} {fpR : Footprint}
+    (hBind :
+      ∀ b ∈ bs,
+        readAllocAt? (memoryLocals m) b.rp = some (b.codec.encode b.val) ∧
+        ∃ entry,
+          lookupBorrow m.borrows b.rp.tag = some entry ∧
+          entry.targetLocal = b.rp.allocId ∧
+          entry.perm = .active)
+    (hPair :
+      bs.Pairwise (fun b₁ b₂ => b₁.cell ≠ b₂.cell ∧ b₁.rp.tag ≠ b₂.rp.tag))
+    (hR : R ⟨m, fpR⟩)
+    (hDisjR : ∀ b ∈ bs, b.cell ∉ fpR.addrs ∧ b.rp.tag ∉ fpR.tags) :
+    sepConjBindings bs R ⟨m, (bindingsFootprint bs).union fpR⟩ := by
+  induction bs with
+  | nil => exact hR
+  | cons b rest ih =>
+    rcases List.pairwise_cons.mp hPair with ⟨hHead, hTail⟩
+    have hRest :=
+      ih (fun b' hb' => hBind b' (List.Mem.tail b hb')) hTail
+        (fun b' hb' => hDisjR b' (List.Mem.tail b hb'))
+    rcases hBind b (List.Mem.head rest) with ⟨hPts, hTok⟩
+    refine ⟨⟨m, mutBorrowFootprint b.rp⟩,
+      ⟨m, (bindingsFootprint rest).union fpR⟩,
+      ⟨rfl, rfl, ⟨?_, ?_⟩, ?_, ?_⟩,
+      activeTypedMutBorrow_intro hPts hTok, hRest⟩
+    · intro a ha hb
+      simp only [mutBorrowFootprint, List.mem_singleton] at ha
+      subst ha
+      simp only [bindingsFootprint, Footprint.union, List.mem_append,
+        List.mem_map] at hb
+      rcases hb with ⟨b', hb', hEq⟩ | hInR
+      · exact (hHead b' hb').1 hEq.symm
+      · exact (hDisjR b (List.Mem.head rest)).1 hInR
+    · intro t ht hb
+      simp only [mutBorrowFootprint, List.mem_singleton] at ht
+      subst ht
+      simp only [bindingsFootprint, Footprint.union, List.mem_append,
+        List.mem_map] at hb
+      rcases hb with ⟨b', hb', hEq⟩ | hInR
+      · exact (hHead b' hb').2 hEq.symm
+      · exact (hDisjR b (List.Mem.head rest)).2 hInR
+    · intro a
+      simp only [bindingsFootprint, Footprint.union, mutBorrowFootprint,
+        MutBorrowBinding.cell, List.map_cons, List.cons_append, List.mem_cons,
+        List.not_mem_nil, or_false, List.mem_append, List.mem_map]
+    · intro t
+      simp only [bindingsFootprint, Footprint.union, mutBorrowFootprint,
+        List.map_cons, List.cons_append, List.mem_cons, List.not_mem_nil,
+        or_false, List.mem_append, List.mem_map]
+
+/--
+Pointer-independent MIR frame well-formedness at function entry: the caller
+has no saved frames, no callee is active, and every borrow targets a caller
+allocation above the callee's `frameLen` local slots.
+-/
+structure WfLensFrame (frameLen : Nat) (m : Memory) : Prop where
+  callStack_nil : m.callStack = []
+  activeCallee_none : m.activeCallee = .none
+  borrows_above_frame : ∀ b ∈ m.borrows, frameLen ≤ b.targetLocal
+
+theorem WfSingleMutBorrow.toWfLensFrame
+    {frameLen : Nat} {rp : RawPtrVal} {m : Memory}
+    (h : WfSingleMutBorrow frameLen rp m) : WfLensFrame frameLen m :=
+  ⟨h.callStack_nil, h.activeCallee_none, h.borrows_above_frame⟩
+
+/--
+`k`-Lens Entry Bridge: a `k`-ary separating conjunction of typed mutable borrows
+with an arbitrary frame establishes `SepLensStateInv` for all `k` lens entries.
+The hypotheses `hPtr` are per pointer; pairwise disjointness of allocations and
+tags is derived from `sepConj`.
+-/
+theorem sepLensStateInv_of_sepConjBindings
+    {frameLen : Nat} {bs : List MutBorrowBinding} {R : SepProp} {m : Memory}
+    (hSep : SepProp.holdsIn (sepConjBindings bs R) m)
+    (hFrame : WfLensFrame frameLen m)
+    (hPtr : ∀ b ∈ bs, frameLen ≤ b.rp.allocId ∧ TreeExclusiveBorrow b.rp m) :
+    SepLensStateInv frameLen (bs.map MutBorrowBinding.entry) m := by
+  rcases hSep with ⟨fp, hSep⟩
+  rcases sepConjBindings_split hSep with ⟨hBind, hPair, _, _⟩
+  refine ⟨hFrame.callStack_nil, hFrame.activeCallee_none,
+    hFrame.borrows_above_frame, ?_, ?_⟩
+  · intro rp v hMem
+    rcases List.mem_map.mp hMem with ⟨b, hb, hEq⟩
+    simp only [MutBorrowBinding.entry, Prod.mk.injEq] at hEq
+    rcases hEq with ⟨rfl, rfl⟩
+    rcases hPtr b hb with ⟨hAbove, hExcl⟩
+    exact ⟨hExcl.offset_zero, hAbove,
+      callerLocals_get?_of_pointsTo hFrame.callStack_nil hExcl.offset_zero
+        (hBind b hb).1,
+      hExcl⟩
+  · rw [List.map_map]
+    apply List.pairwise_map.mpr
+    refine List.Pairwise.imp_of_mem ?_ hPair
+    intro b₁ b₂ hb₁ hb₂ hNe
+    refine ⟨fun hAlloc => hNe.1 ?_, hNe.2⟩
+    show (b₁.rp.allocId, b₁.rp.offset) = (b₂.rp.allocId, b₂.rp.offset)
+    have hAlloc' : b₁.rp.allocId = b₂.rp.allocId := hAlloc
+    rw [hAlloc', (hPtr b₁ hb₁).2.offset_zero, (hPtr b₂ hb₂).2.offset_zero]
+
+/--
+Reading past offset `0` of a slot whose value is not a variant-`0` aggregate
+yields `none`; such cells are therefore unaffected by whole-slot writes.
+-/
+theorem readAllocAt_succ_of_not_aggregate
+    {locals : List LocalValue} {allocId k tag : Nat} {v : Value}
+    (hGet : get? locals allocId = some (.init v))
+    (hNotAgg : ∀ elems, v ≠ .aggregate 0 elems) :
+    readAllocAt? locals { allocId := allocId, offset := k + 1, tag := tag } =
+      none := by
+  unfold readAllocAt?
+  rw [hGet]
+  dsimp only
+  cases v with
+  | aggregate variant elems =>
+    cases variant with
+    | zero => exact absurd rfl (hNotAgg elems)
+    | succ _ => rfl
+  | unit => rfl
+  | scalar _ => rfl
+  | ptr _ _ => rfl
+
+theorem memoryLocals_of_callStack_nil {m : Memory}
+    (h : m.callStack = []) : memoryLocals m = m.callerLocals := by
+  unfold memoryLocals
+  rw [h]
+
+/--
+`k`-Lens Exit Bridge: if `ATMB b₁ ∗ ⋯ ∗ ATMB bₖ ∗ R_frame` held initially, the
+final memory satisfies `SepLensStateInv` for the updated bindings `bs'` (same
+pointers, new values), and every caller allocation and borrow tag outside the
+lens footprint is unchanged (`LensFramePreserved`), then
+`ATMB b'₁ ∗ ⋯ ∗ ATMB b'ₖ ∗ R_frame` holds finally for every footprint-local
+frame `R_frame`.
+
+The non-aggregate hypotheses rule out frames that own a sub-field cell
+`(allocId, k + 1)` of a tracked aggregate pointee, which a whole-slot write
+would change.
+-/
+theorem sepConjBindings_preserved
+    {frameLen : Nat} {bs bs' : List MutBorrowBinding} {R : SepProp}
+    {m₀ m : Memory}
+    (hSep : SepProp.holdsIn (sepConjBindings bs R) m₀)
+    (hStack₀ : m₀.callStack = [])
+    (hOff₀ : ∀ b ∈ bs, b.rp.offset = 0)
+    (hKeys : bs'.map (·.rp) = bs.map (·.rp))
+    (hInv : SepLensStateInv frameLen (bs'.map MutBorrowBinding.entry) m)
+    (hPres : LensFramePreserved (bs.map MutBorrowBinding.entry) m₀ m)
+    (hR : LocalSepProp R)
+    (hNotAgg₀ : ∀ b ∈ bs, ∀ elems, b.codec.encode b.val ≠ .aggregate 0 elems)
+    (hNotAgg : ∀ b ∈ bs', ∀ elems, b.codec.encode b.val ≠ .aggregate 0 elems) :
+    SepProp.holdsIn (sepConjBindings bs' R) m := by
+  rcases hSep with ⟨fp, hSep⟩
+  rcases sepConjBindings_split hSep with
+    ⟨hBind₀, hPair, _, fpR, hR₀, hDisjR, _, _⟩
+  have hML₀ : memoryLocals m₀ = m₀.callerLocals :=
+    memoryLocals_of_callStack_nil hStack₀
+  have hML : memoryLocals m = m.callerLocals :=
+    memoryLocals_of_callStack_nil hInv.callStack_nil
+  -- Every updated binding shares its pointer with an initial binding.
+  have hSameRp :
+      ∀ b' ∈ bs', ∃ b ∈ bs, b.rp = b'.rp := by
+    intro b' hb'
+    have hIn : b'.rp ∈ bs.map (·.rp) := by
+      rw [← hKeys]
+      exact List.mem_map.mpr ⟨b', hb', rfl⟩
+    rcases List.mem_map.mp hIn with ⟨b, hb, hEq⟩
+    exact ⟨b, hb, hEq⟩
+  have hFinal :
+      ∀ b' ∈ bs',
+        get? m.callerLocals b'.rp.allocId =
+            some (.init (b'.codec.encode b'.val)) ∧
+          TreeExclusiveBorrow b'.rp m := by
+    intro b' hb'
+    have hMemE : b'.entry ∈ bs'.map MutBorrowBinding.entry :=
+      List.mem_map.mpr ⟨b', hb', rfl⟩
+    rcases hInv.entries_valid _ _ hMemE with ⟨_, _, hCaller, hExcl⟩
+    exact ⟨hCaller, hExcl⟩
+  -- (1) The frame footprint `fpR` agrees between `m₀` and `m`.
+  have hAgree : AgreeOnFootprint fpR m₀ m := by
+    refine ⟨fun allocId offset hIn => ?_, fun tag hIn => ?_⟩
+    · rw [hML₀, hML]
+      by_cases hTracked : ∃ b ∈ bs, b.rp.allocId = allocId
+      · rcases hTracked with ⟨b, hb, hAlloc⟩
+        have hOffNe : offset ≠ 0 := by
+          intro hZ
+          apply (hDisjR b hb).1
+          show (b.rp.allocId, b.rp.offset) ∈ fpR.addrs
+          rw [hAlloc, hOff₀ b hb, ← hZ]
+          exact hIn
+        obtain ⟨k, rfl⟩ : ∃ k, offset = k + 1 :=
+          Nat.exists_eq_succ_of_ne_zero hOffNe
+        have hRpIn : b.rp ∈ bs'.map (·.rp) := by
+          rw [hKeys]
+          exact List.mem_map.mpr ⟨b, hb, rfl⟩
+        rcases List.mem_map.mp hRpIn with ⟨b', hb', hRpEq⟩
+        have hOld :
+            get? m₀.callerLocals allocId =
+              some (.init (b.codec.encode b.val)) := by
+          rw [← hAlloc]
+          exact callerLocals_get?_of_pointsTo hStack₀ (hOff₀ b hb)
+            (hBind₀ b hb).1
+        have hNew :
+            get? m.callerLocals allocId =
+              some (.init (b'.codec.encode b'.val)) := by
+          rw [← hAlloc, ← hRpEq]
+          exact (hFinal b' hb').1
+        rw [readAllocAt_succ_of_not_aggregate hOld (hNotAgg₀ b hb),
+          readAllocAt_succ_of_not_aggregate hNew (hNotAgg b' hb')]
+      · have hOut :
+            ∀ e ∈ bs.map MutBorrowBinding.entry, allocId ≠ e.1.allocId := by
+          intro e he hEq
+          rcases List.mem_map.mp he with ⟨b, hb, rfl⟩
+          exact hTracked ⟨b, hb, hEq.symm⟩
+        unfold readAllocAt?
+        rw [hPres.locals_unchanged_outside allocId hOut]
+    · have hOut :
+          ∀ e ∈ bs.map MutBorrowBinding.entry, tag ≠ e.1.tag := by
+        intro e he hEq
+        rcases List.mem_map.mp he with ⟨b, hb, rfl⟩
+        have hEq' : tag = b.rp.tag := hEq
+        apply (hDisjR b hb).2
+        rw [← hEq']
+        exact hIn
+      exact (hPres.borrows_unchanged_outside tag hOut).symm
+  -- (2) The footprint-local frame therefore still holds in `m`.
+  have hRm : R ⟨m, fpR⟩ := hR fpR m₀ m hAgree hR₀
+  -- (3) Recompose the updated bindings with the preserved frame.
+  have hBind' :
+      ∀ b ∈ bs',
+        readAllocAt? (memoryLocals m) b.rp = some (b.codec.encode b.val) ∧
+        ∃ entry,
+          lookupBorrow m.borrows b.rp.tag = some entry ∧
+          entry.targetLocal = b.rp.allocId ∧
+          entry.perm = .active := by
+    intro b' hb'
+    rcases hFinal b' hb' with ⟨hCaller, hExcl⟩
+    rcases hExcl.lookup_active with ⟨entry, hLook, hT, _, hPerm, _⟩
+    refine ⟨?_, entry, hLook, hT, hPerm⟩
+    rw [hML]
+    unfold readAllocAt?
+    rw [hCaller, hExcl.offset_zero]
+  have hPairRp :
+      (bs.map (·.rp)).Pairwise
+        (fun r₁ r₂ => (r₁.allocId, r₁.offset) ≠ (r₂.allocId, r₂.offset) ∧
+          r₁.tag ≠ r₂.tag) :=
+    List.pairwise_map.mpr hPair
+  have hPair' :
+      bs'.Pairwise (fun b₁ b₂ => b₁.cell ≠ b₂.cell ∧ b₁.rp.tag ≠ b₂.rp.tag) := by
+    rw [← hKeys] at hPairRp
+    exact List.pairwise_map.mp hPairRp
+  have hDisjR' : ∀ b ∈ bs', b.cell ∉ fpR.addrs ∧ b.rp.tag ∉ fpR.tags := by
+    intro b' hb'
+    rcases hSameRp b' hb' with ⟨b, hb, hEq⟩
+    have hCellEq : b'.cell = b.cell := by
+      unfold MutBorrowBinding.cell
+      rw [hEq]
+    rw [hCellEq, ← hEq]
+    exact hDisjR b hb
+  exact ⟨_, sepConjBindings_intro hBind' hPair' hRm hDisjR'⟩
+
+/-! ### Indexed Families of Pairwise-Independent Lawful Lenses -/
+
+/--
+Validity domain shared by a whole family of binding lenses: every binding's
+lens is individually valid and the bindings occupy pairwise distinct
+allocations.
+-/
+structure ValidMutBorrowFamily (bs : List MutBorrowBinding) (m : Memory) :
+    Prop where
+  valid : ∀ b ∈ bs, ValidMutBorrowLens b.rp b.codec m
+  pairwise_alloc : bs.Pairwise (fun b₁ b₂ => b₁.rp.allocId ≠ b₂.rp.allocId)
+
+theorem eq_of_pairwise_ne_of_mem {β : Type u} {γ : Type v} {f : β → γ} :
+    ∀ {xs : List β} {x y : β},
+      xs.Pairwise (fun a b => f a ≠ f b) → x ∈ xs → y ∈ xs → f x = f y →
+        x = y
+  | [], _, _, _, hx, _, _ => nomatch hx
+  | z :: zs, x, y, hP, hx, hy, hEq => by
+    rcases List.pairwise_cons.mp hP with ⟨hHead, hTail⟩
+    rcases List.mem_cons.mp hx with hxz | hx'
+    · rcases List.mem_cons.mp hy with hyz | hy'
+      · rw [hxz, hyz]
+      · rw [hxz] at hEq
+        exact absurd hEq (hHead y hy')
+    · rcases List.mem_cons.mp hy with hyz | hy'
+      · rw [hyz] at hEq
+        exact absurd hEq.symm (hHead x hx')
+      · exact eq_of_pairwise_ne_of_mem hTail hx' hy' hEq
+
+/--
+Writing through one member lens preserves the validity of the whole family:
+the written pointee keeps a typed value, and every other member's pointee and
+the borrow table are unchanged.
+-/
+theorem ValidMutBorrowFamily.writeBack
+    {bs : List MutBorrowBinding} {m : Memory} {b : MutBorrowBinding}
+    (hb : b ∈ bs) (hValid : ValidMutBorrowFamily bs m) (a : b.α) :
+    ValidMutBorrowFamily bs ((memoryPtrMutLens b.rp b.codec).writeBack a m) := by
+  refine ⟨fun b' hb' => ?_, hValid.pairwise_alloc⟩
+  by_cases hEq : b'.rp.allocId = b.rp.allocId
+  · have hSame : b' = b :=
+      eq_of_pairwise_ne_of_mem hValid.pairwise_alloc hb' hb hEq
+    subst hSame
+    exact (memoryPtrMutLens_lawful b'.rp b'.codec).valid_writeBack a m
+      (hValid.valid b' hb')
+  · rcases hValid.valid b hb with ⟨⟨a₀, hPts⟩, hExcl⟩
+    rcases hValid.valid b' hb' with ⟨⟨a₀', hPts'⟩, hExcl'⟩
+    rw [memoryPtrMutLens_writeBack_eq_of_exclusive b.rp b.codec a hPts hExcl]
+    exact ⟨⟨a₀', pointsTo_updateMemoryLocals_set_ne (Ne.symm hEq)
+        hExcl'.offset_zero hPts'⟩,
+      ExclusiveActiveBorrow.of_borrows_eq hExcl'
+        (updateMemoryLocals_borrows _ _)⟩
+
+/-- Each member lens of a valid family is a `LawfulMutLens` on the family. -/
+theorem memoryPtrMutLens_lawful_family
+    {bs : List MutBorrowBinding} {b : MutBorrowBinding} (hb : b ∈ bs) :
+    LawfulMutLens (memoryPtrMutLens b.rp b.codec) (ValidMutBorrowFamily bs) where
+  valid_writeBack a _ hm := hm.writeBack hb a
+  readView_writeBack a m hm :=
+    (memoryPtrMutLens_lawful b.rp b.codec).readView_writeBack a m (hm.valid b hb)
+  writeBack_readView m hm :=
+    (memoryPtrMutLens_lawful b.rp b.codec).writeBack_readView m (hm.valid b hb)
+  writeBack_writeBack a₁ a₂ m hm :=
+    (memoryPtrMutLens_lawful b.rp b.codec).writeBack_writeBack a₁ a₂ m
+      (hm.valid b hb)
+
+/-- Two member lenses on distinct allocations are independent on the family. -/
+theorem memoryPtrMutLens_independent_family
+    {bs : List MutBorrowBinding} {b₁ b₂ : MutBorrowBinding}
+    (hb₁ : b₁ ∈ bs) (hb₂ : b₂ ∈ bs) (hNe : b₁.rp.allocId ≠ b₂.rp.allocId) :
+    IndependentLenses
+      (memoryPtrMutLens b₁.rp b₁.codec)
+      (memoryPtrMutLens b₂.rp b₂.codec)
+      (ValidMutBorrowFamily bs) := by
+  have hPair :=
+    memoryPtrMutLens_independent_of_ne_alloc b₁.rp b₂.rp b₁.codec b₂.codec
+  have toPair :
+      ∀ m, ValidMutBorrowFamily bs m →
+        ValidMutBorrowLensPair b₁.rp b₂.rp b₁.codec b₂.codec m :=
+    fun m hm => ⟨hm.valid b₁ hb₁, hm.valid b₂ hb₂, hNe⟩
+  exact {
+    valid_writeBack_left := fun a m hm => hm.writeBack hb₁ a
+    valid_writeBack_right := fun a m hm => hm.writeBack hb₂ a
+    readView_right_of_writeBack_left := fun a m hm =>
+      hPair.readView_right_of_writeBack_left a m (toPair m hm)
+    readView_left_of_writeBack_right := fun a m hm =>
+      hPair.readView_left_of_writeBack_right a m (toPair m hm)
+    writeBack_comm := fun a a' m hm => hPair.writeBack_comm a a' m (toPair m hm)
+  }
+
+/--
+`k`-ary (indexed-family) separation-to-lens bridge: a `k`-ary separating
+conjunction of typed mutable borrows whose pointers are exclusive yields a
+valid lens family in which every member lens is lawful and every pair of
+distinct indices is independent.
+-/
+theorem sepConjBindings_entails_independentLensFamily
+    {bs : List MutBorrowBinding} {R : SepProp} {m : Memory}
+    (hSep : SepProp.holdsIn (sepConjBindings bs R) m)
+    (hExcl : ∀ b ∈ bs, ExclusiveActiveBorrow b.rp m) :
+    ValidMutBorrowFamily bs m ∧
+    (∀ (i : Nat) (hi : i < bs.length),
+      LawfulMutLens
+        (memoryPtrMutLens bs[i].rp bs[i].codec) (ValidMutBorrowFamily bs)) ∧
+    (∀ (i j : Nat) (hi : i < bs.length) (hj : j < bs.length), i ≠ j →
+      IndependentLenses
+        (memoryPtrMutLens bs[i].rp bs[i].codec)
+        (memoryPtrMutLens bs[j].rp bs[j].codec)
+        (ValidMutBorrowFamily bs)) := by
+  rcases hSep with ⟨fp, hSep⟩
+  rcases sepConjBindings_split hSep with ⟨hBind, hPair, _, _⟩
+  have hPairAlloc :
+      bs.Pairwise (fun b₁ b₂ => b₁.rp.allocId ≠ b₂.rp.allocId) := by
+    refine List.Pairwise.imp_of_mem ?_ hPair
+    intro b₁ b₂ hb₁ hb₂ hNe hAlloc
+    apply hNe.1
+    show (b₁.rp.allocId, b₁.rp.offset) = (b₂.rp.allocId, b₂.rp.offset)
+    rw [hAlloc, (hExcl b₁ hb₁).offset_zero, (hExcl b₂ hb₂).offset_zero]
+  have hValid : ValidMutBorrowFamily bs m :=
+    ⟨fun b hb => ⟨⟨b.val, (hBind b hb).1⟩, hExcl b hb⟩, hPairAlloc⟩
+  refine ⟨hValid, fun i hi => memoryPtrMutLens_lawful_family
+    (List.getElem_mem hi), fun i j hi hj hNe => ?_⟩
+  refine memoryPtrMutLens_independent_family
+    (List.getElem_mem hi) (List.getElem_mem hj) ?_
+  rcases Nat.lt_or_gt_of_ne hNe with hLt | hGt
+  · exact List.pairwise_iff_getElem.mp hPairAlloc i j hi hj hLt
+  · exact Ne.symm (List.pairwise_iff_getElem.mp hPairAlloc j i hj hi hGt)
+
+/--
+Homogeneous `List` form of the family bridge: for a single pointee type `α` and
+codec, the lens list is `PairwiseIndependentLenses` on the family domain.
+-/
+theorem sepConjBindings_entails_pairwiseIndependentLenses
+    {α : Type} {codec : ValueCodec α} {ptrs : List (RawPtrVal × α)}
+    {R : SepProp} {m : Memory}
+    (hSep :
+      SepProp.holdsIn
+        (sepConjBindings (ptrs.map fun p => MutBorrowBinding.bind p.1 codec p.2) R)
+        m)
+    (hExcl : ∀ p ∈ ptrs, ExclusiveActiveBorrow p.1 m) :
+    ValidMutBorrowFamily
+        (ptrs.map fun p => MutBorrowBinding.bind p.1 codec p.2) m ∧
+    PairwiseIndependentLenses
+      (ValidMutBorrowFamily
+        (ptrs.map fun p => MutBorrowBinding.bind p.1 codec p.2))
+      (ptrs.map fun p => memoryPtrMutLens p.1 codec) := by
+  let bs := ptrs.map fun p => MutBorrowBinding.bind p.1 codec p.2
+  have hExcl' : ∀ b ∈ bs, ExclusiveActiveBorrow b.rp m := by
+    intro b hb
+    rcases List.mem_map.mp hb with ⟨p, hp, rfl⟩
+    exact hExcl p hp
+  rcases sepConjBindings_entails_independentLensFamily hSep hExcl' with
+    ⟨hValid, _, _⟩
+  refine ⟨hValid, ?_⟩
+  have hPairPtr :
+      ptrs.Pairwise (fun p₁ p₂ => p₁.1.allocId ≠ p₂.1.allocId) := by
+    have h := hValid.pairwise_alloc
+    rw [List.pairwise_map] at h
+    exact h
+  -- Induct over every suffix of `ptrs`, keeping the family domain fixed.
+  have hSuffix :
+      ∀ sfx : List (RawPtrVal × α),
+        (∀ p ∈ sfx, p ∈ ptrs) →
+        sfx.Pairwise (fun p₁ p₂ => p₁.1.allocId ≠ p₂.1.allocId) →
+        PairwiseIndependentLenses (ValidMutBorrowFamily bs)
+          (sfx.map fun p => memoryPtrMutLens p.1 codec) := by
+    intro sfx
+    induction sfx with
+    | nil => intro _ _; exact .nil
+    | cons p rest ih =>
+      intro hSub hPairSfx
+      rcases List.pairwise_cons.mp hPairSfx with ⟨hHead, hTail⟩
+      have hp : MutBorrowBinding.bind p.1 codec p.2 ∈ bs :=
+        List.mem_map.mpr ⟨p, hSub p (List.Mem.head rest), rfl⟩
+      refine .cons (memoryPtrMutLens_lawful_family hp) ?_
+        (ih (fun q hq => hSub q (List.Mem.tail p hq)) hTail)
+      intro L hL
+      rcases List.mem_map.mp hL with ⟨q, hq, rfl⟩
+      have hq' : MutBorrowBinding.bind q.1 codec q.2 ∈ bs :=
+        List.mem_map.mpr ⟨q, hSub q (List.Mem.tail p hq), rfl⟩
+      exact memoryPtrMutLens_independent_family hp hq' (hHead q hq)
+  exact hSuffix ptrs (fun _ h => h) hPairPtr
+
+/-! ### `SupportedBy` Heap-Predicate Frames via `AgreeOnFootprint` -/
+
+/--
+A family write-back through member `b` agrees with the original memory on
+every frame footprint whose cells avoid `b`'s allocation: it rewrites one
+caller slot and leaves the borrow table unchanged.
+-/
+theorem memoryPtrMutLens_writeBack_agreeOnFootprint_family
+    {bs : List MutBorrowBinding} {m : Memory} {b : MutBorrowBinding}
+    (hb : b ∈ bs) (hValid : ValidMutBorrowFamily bs m) (a : b.α)
+    {fp_frame : Footprint}
+    (hAddrs :
+      ∀ allocId offset, (allocId, offset) ∈ fp_frame.addrs →
+        allocId ≠ b.rp.allocId) :
+    AgreeOnFootprint fp_frame m
+      ((memoryPtrMutLens b.rp b.codec).writeBack a m) := by
+  rcases hValid.valid b hb with ⟨⟨a₀, hPts⟩, hExcl⟩
+  rw [memoryPtrMutLens_writeBack_eq_of_exclusive b.rp b.codec a hPts hExcl]
+  refine ⟨fun allocId offset hIn => ?_, fun tag _ => ?_⟩
+  · rw [memoryLocals_updateMemoryLocals]
+    unfold readAllocAt?
+    unfold get?
+    rw [List.getElem?_set_ne (Ne.symm (hAddrs allocId offset hIn))]
+  · rw [updateMemoryLocals_borrows]
+
+/--
+Arbitrary `SupportedBy R_frame fp_frame` heap-predicate frames survive any
+family write-back whose cells avoid `fp_frame`.
+-/
+theorem memoryPtrMutLens_writeBack_supportedBy_family
+    {bs : List MutBorrowBinding} {m : Memory} {b : MutBorrowBinding}
+    (hb : b ∈ bs) (hValid : ValidMutBorrowFamily bs m) (a : b.α)
+    {R_frame : HeapPred} {fp_frame : Footprint}
+    (hSupp : SupportedBy R_frame fp_frame)
+    (hAddrs :
+      ∀ allocId offset, (allocId, offset) ∈ fp_frame.addrs →
+        allocId ≠ b.rp.allocId)
+    (hR : R_frame m) :
+    R_frame ((memoryPtrMutLens b.rp b.codec).writeBack a m) :=
+  hSupp m _
+    (memoryPtrMutLens_writeBack_agreeOnFootprint_family hb hValid a hAddrs) hR
+
+/--
+MIR-level frame agreement: whenever `LensFramePreserved entries₀ m₀ m` holds
+(as `mirWpConverges_of_sepLenses` guarantees), `m₀` and `m` agree on every
+footprint whose cells avoid the tracked allocations and whose tags avoid the
+tracked tags.
+-/
+theorem agreeOnFootprint_of_lensFramePreserved
+    {entries₀ : List (RawPtrVal × Value)} {m₀ m : Memory}
+    (hPres : LensFramePreserved entries₀ m₀ m)
+    (hStack₀ : m₀.callStack = []) (hStack : m.callStack = [])
+    {fp : Footprint}
+    (hAddrs :
+      ∀ allocId offset, (allocId, offset) ∈ fp.addrs →
+        ∀ e ∈ entries₀, allocId ≠ e.1.allocId)
+    (hTags : ∀ tag ∈ fp.tags, ∀ e ∈ entries₀, tag ≠ e.1.tag) :
+    AgreeOnFootprint fp m₀ m := by
+  refine ⟨fun allocId offset hIn => ?_, fun tag hIn => ?_⟩
+  · rw [memoryLocals_of_callStack_nil hStack₀,
+      memoryLocals_of_callStack_nil hStack]
+    unfold readAllocAt?
+    rw [hPres.locals_unchanged_outside allocId (hAddrs allocId offset hIn)]
+  · exact (hPres.borrows_unchanged_outside tag (hTags tag hIn)).symm
+
+/-- `SupportedBy` frames disjoint from the lens footprint survive execution. -/
+theorem supportedBy_of_lensFramePreserved
+    {entries₀ : List (RawPtrVal × Value)} {m₀ m : Memory}
+    (hPres : LensFramePreserved entries₀ m₀ m)
+    (hStack₀ : m₀.callStack = []) (hStack : m.callStack = [])
+    {R_frame : HeapPred} {fp_frame : Footprint}
+    (hSupp : SupportedBy R_frame fp_frame)
+    (hAddrs :
+      ∀ allocId offset, (allocId, offset) ∈ fp_frame.addrs →
+        ∀ e ∈ entries₀, allocId ≠ e.1.allocId)
+    (hTags : ∀ tag ∈ fp_frame.tags, ∀ e ∈ entries₀, tag ≠ e.1.tag)
+    (hR : R_frame m₀) :
+    R_frame m :=
+  hSupp m₀ m
+    (agreeOnFootprint_of_lensFramePreserved hPres hStack₀ hStack hAddrs hTags)
+    hR
+
+/--
+Framed bridge from `mirWpConverges_of_sepLenses` to
+`StatefulVerificationResult`: any `SupportedBy R_frame fp_frame` heap predicate
+whose footprint avoids the lens footprint is conjoined onto both the pre- and
+postcondition (`frameStatefulClaim`) without re-verifying the body.
+-/
+theorem verifyStatefulMir_of_sepLenses_supportedFrame
+    (body : CapturedMir)
+    (Pre : List Value → Memory → Prop)
+    (Post : List Value → Memory → Value → Memory → Prop)
+    (R_frame : HeapPred) (fp_frame : Footprint)
+    (hSupp : SupportedBy R_frame fp_frame)
+    (hStep :
+      ∀ args m₀,
+        Pre args m₀ →
+        ∃ (entries₀ entries' : List (RawPtrVal × Value)) (retVal : Value),
+          let env₀ := (initMachineState body args).frame.locals
+          LiftLensBlock body 0 env₀ entries₀ retVal entries' ∧
+          SepLensStateInv env₀.length entries₀ m₀ ∧
+          (∀ allocId offset, (allocId, offset) ∈ fp_frame.addrs →
+            ∀ e ∈ entries₀, allocId ≠ e.1.allocId) ∧
+          (∀ tag ∈ fp_frame.tags, ∀ e ∈ entries₀, tag ≠ e.1.tag) ∧
+          ∀ m_final : Memory,
+            SepLensStateInv env₀.length entries' m_final →
+            LensFramePreserved entries₀ m₀ m_final →
+            Post args m₀ retVal m_final) :
+    StatefulVerificationResult
+      (frameStatefulClaim { body := body, pre := Pre, post := Post } R_frame) := by
+  refine verifyStatefulMirNoPanic_of_wpConverges _ ?_
+  intro args m₀ ⟨hPre, hR₀⟩
+  rcases hStep args m₀ hPre with
+    ⟨entries₀, entries', retVal, hBlock, hInv₀, hAddrs, hTags, hPost⟩
+  exact mirWpConverges_of_sepLenses hBlock hInv₀ (fun m_final hInvF hPresF =>
+    ⟨hPost m_final hInvF hPresF,
+      supportedBy_of_lensFramePreserved hPresF hInv₀.callStack_nil
+        hInvF.callStack_nil hSupp hAddrs hTags hR₀⟩)
+
+/-! ### Binary and Unary Instances of the General Bridges -/
+
 /--
 1-Lens Entry Bridge: `sepConj (ActiveTypedMutBorrow rp₁ codec₁ a₁) R_frame m₀`
 together with `WfSingleMutBorrow frameLen rp₁ m₀` establishes
@@ -2402,457 +3555,136 @@ theorem sepLensStateInv_of_sepConj_one {α : Type}
     (hSep :
       SepProp.holdsIn (sepConj (ActiveTypedMutBorrow rp₁ codec₁ a₁) R_frame) m₀)
     (hWf₁ : WfSingleMutBorrow frameLen rp₁ m₀) :
-    SepLensStateInv frameLen [(rp₁, codec₁.encode a₁)] m₀ where
-  callStack_nil := hWf₁.callStack_nil
-  activeCallee_none := hWf₁.activeCallee_none
-  borrows_above_frame := hWf₁.borrows_above_frame
-  entries_valid rp' v' hMem := by
-    simp only [List.mem_singleton, Prod.mk.injEq] at hMem
-    rcases hMem with ⟨rfl, rfl⟩
-    have hPts₁ : readAllocAt? (memoryLocals m₀) rp' = some (codec₁.encode a₁) :=
-      readAllocAt_of_activeTypedMutBorrow_holdsIn (holdsIn_of_sepConj_left hSep)
-    exact ⟨hWf₁.exclusive.offset_zero, hWf₁.alloc_above_frame,
-      callerLocals_get?_of_pointsTo
-        hWf₁.callStack_nil hWf₁.exclusive.offset_zero hPts₁,
-      hWf₁.exclusive⟩
-  pairwise_disjoint := by simp
+    SepLensStateInv frameLen [(rp₁, codec₁.encode a₁)] m₀ :=
+  sepLensStateInv_of_sepConjBindings
+    (bs := [MutBorrowBinding.bind rp₁ codec₁ a₁]) hSep hWf₁.toWfLensFrame
+    (fun b hb => by
+      rw [List.mem_singleton.mp hb]
+      exact ⟨hWf₁.alloc_above_frame, hWf₁.exclusive⟩)
 
 theorem sepConj_activeTypedMutBorrow_preserved_one {α : Type}
     {frameLen : Nat} {rp₁ : RawPtrVal} {codec₁ : ValueCodec α} {a_old a_new : α}
     {R_frame : SepProp} {m₀ m_final : Memory}
-    (hSep : SepProp.holdsIn (sepConj (ActiveTypedMutBorrow rp₁ codec₁ a_old) R_frame) m₀)
+    (hSep :
+      SepProp.holdsIn
+        (sepConj (ActiveTypedMutBorrow rp₁ codec₁ a_old) R_frame) m₀)
     (hInv_final : SepLensStateInv frameLen [(rp₁, codec₁.encode a_new)] m_final)
     (hWf : WfSingleMutBorrow frameLen rp₁ m₀)
     (hPres : LensFramePreserved [(rp₁, codec₁.encode a_old)] m₀ m_final)
     (h_R : LocalSepProp R_frame)
     (h_not_agg : ∀ a : α, ∀ elems, codec₁.encode a ≠ .aggregate 0 elems) :
-    SepProp.holdsIn (sepConj (ActiveTypedMutBorrow rp₁ codec₁ a_new) R_frame) m_final := by
-  rcases hSep with ⟨fp, h₁, h₂, hsplit, hActive, hR⟩
-  exists fp, { state := m_final, footprint := h₁.footprint }, { state := m_final, footprint := h₂.footprint }
-  refine ⟨⟨rfl, rfl, hsplit.2.2.1, hsplit.2.2.2.1, hsplit.2.2.2.2⟩, ?_, ?_⟩
-  · rcases hActive with ⟨h₁a, h₁b, hsplit_ab, hpts, htok⟩
-    have hOff : rp₁.offset = 0 := hWf.exclusive.offset_zero
-    have hPtsFinal : readAllocAt? (memoryLocals m_final) rp₁ = some (codec₁.encode a_new) := by
-      have hMem : (rp₁, codec₁.encode a_new) ∈ [(rp₁, codec₁.encode a_new)] := List.mem_singleton.mpr rfl
-      rcases hInv_final.entries_valid rp₁ (codec₁.encode a_new) hMem with ⟨_, _, hCaller, _⟩
-      unfold readAllocAt? memoryLocals
-      rw [hInv_final.callStack_nil, hOff, hCaller]
-    have hTokFinal : ∃ entry, lookupBorrow m_final.borrows rp₁.tag = some entry ∧ entry.targetLocal = rp₁.allocId ∧ entry.perm = .active := by
-      have hMem : (rp₁, codec₁.encode a_new) ∈ [(rp₁, codec₁.encode a_new)] := List.mem_singleton.mpr rfl
-      rcases hInv_final.entries_valid rp₁ (codec₁.encode a_new) hMem with ⟨_, _, _, hExcl⟩
-      rcases hExcl.lookup_active with ⟨entry, hLook, hT, hP, hPerm, _⟩
-      exact ⟨entry, hLook, hT, hPerm⟩
-    unfold ActiveTypedMutBorrow sepConj
-    exists { state := m_final, footprint := h₁a.footprint }
-    exists { state := m_final, footprint := h₁b.footprint }
-    refine ⟨⟨rfl, rfl, hsplit_ab.2.2.1, hsplit_ab.2.2.2.1, hsplit_ab.2.2.2.2⟩, ⟨hPtsFinal, hpts.2⟩, ⟨hTokFinal, htok.2⟩⟩
-  · have h₂_eq : h₂ = { state := m₀, footprint := h₂.footprint } := by cases h₂; dsimp; congr; exact hsplit.2.1
-    have hR' : R_frame.atFootprint h₂.footprint m₀ := by
-      unfold SepProp.atFootprint
-      have h_eq : ({ state := m₀, footprint := h₂.footprint } : PartialHeap) = h₂ := by cases h₂; dsimp; congr; exact Eq.symm hsplit.2.1
-      exact h_eq ▸ hR
-    apply h_R h₂.footprint m₀ m_final ?_ hR'
-    refine ⟨fun allocId offset hIn => ?_, fun tag hIn => ?_⟩
-    · rcases hActive with ⟨h₁a, h₁b, hsplit_ab, hpts, htok⟩
-      have h₁a_fp : h₁a.footprint = { addrs := [(rp₁.allocId, rp₁.offset)], tags := [] } := hpts.2
-      have hIn₁ : (rp₁.allocId, rp₁.offset) ∈ h₁.footprint.addrs := by
-        apply (hsplit_ab.2.2.2.1 _).mpr
-        rw [h₁a_fp]
-        exact Or.inl (List.mem_singleton.mpr rfl)
-      cases hEqAlloc : Nat.beq allocId rp₁.allocId
-      · have hAllocNe : allocId ≠ rp₁.allocId := Nat.ne_of_beq_eq_false hEqAlloc
-        have hOut : ∀ e ∈ [(rp₁, codec₁.encode a_old)], allocId ≠ e.1.allocId := by
-          intro e hE
-          cases List.mem_singleton.mp hE
-          exact hAllocNe
-        have hGetEq := hPres.locals_unchanged_outside allocId hOut
-        unfold readAllocAt? memoryLocals
-        rw [hInv_final.callStack_nil, hWf.callStack_nil, hGetEq]
-      · have hAllocEq : allocId = rp₁.allocId := Nat.eq_of_beq_eq_true hEqAlloc
-        subst hAllocEq
-        have hOffNe : rp₁.offset ≠ offset := by
-          intro hEq
-          subst hEq
-          exact hsplit.2.2.1.1 (rp₁.allocId, rp₁.offset) hIn₁ hIn
-        have hOffZero : rp₁.offset = 0 := hWf.exclusive.offset_zero
-        have hOffsetPos : offset ≠ 0 := fun hZ => hOffNe (hZ ▸ hOffZero)
-        have hNone₀ : readAllocAt? (memoryLocals m₀) { allocId := rp₁.allocId, offset := offset, tag := rp₁.allocId } = none := by
-          have hPts₀ : readAllocAt? (memoryLocals m₀) rp₁ = some (codec₁.encode a_old) := by
-            have h_eq : h₁a.state = m₀ := Eq.trans hsplit_ab.1 hsplit.1
-            exact h_eq ▸ hpts.1
-          unfold readAllocAt? memoryLocals at hPts₀ ⊢
-          rw [hWf.callStack_nil]
-          rw [hWf.callStack_nil, hOffZero] at hPts₀
-          dsimp only at hPts₀ ⊢
-          cases hGet : get? m₀.callerLocals rp₁.allocId with
-          | none => rfl
-          | some slot =>
-            cases slot with
-            | dead => rfl
-            | uninit => rfl
-            | init val =>
-              rw [hGet] at hPts₀
-              dsimp only at hPts₀
-              injection hPts₀ with hV
-              subst hV
-              cases offset with
-              | zero => contradiction
-              | succ k =>
-                cases hVal : codec₁.encode a_old with
-                | aggregate m elems =>
-                  cases m with
-                  | zero =>
-                    exfalso
-                    exact h_not_agg a_old elems hVal
-                  | succ m => rfl
-                | _ => rfl
-        have hNone_final : readAllocAt? (memoryLocals m_final) { allocId := rp₁.allocId, offset := offset, tag := rp₁.allocId } = none := by
-          have hMem : (rp₁, codec₁.encode a_new) ∈ [(rp₁, codec₁.encode a_new)] := List.mem_singleton.mpr rfl
-          rcases hInv_final.entries_valid rp₁ (codec₁.encode a_new) hMem with ⟨_, _, hCaller, _⟩
-          unfold readAllocAt? memoryLocals
-          rw [hInv_final.callStack_nil, hCaller]
-          cases offset with
-          | zero => contradiction
-          | succ k =>
-            cases hVal : codec₁.encode a_new with
-            | aggregate m elems =>
-              cases m with
-              | zero =>
-                exfalso
-                exact h_not_agg a_new elems hVal
-              | succ m => rfl
-            | _ => rfl
-        rw [hNone₀, hNone_final]
-    · rcases hActive with ⟨h₁a, h₁b, hsplit_ab, hpts, htok⟩
-      have h₁b_fp : h₁b.footprint = { addrs := [], tags := [rp₁.tag] } := htok.2
-      have hIn₁ : rp₁.tag ∈ h₁.footprint.tags := by
-        apply (hsplit_ab.2.2.2.2 _).mpr
-        rw [h₁b_fp]
-        exact Or.inr (List.mem_singleton.mpr rfl)
-      have hNe : tag ≠ rp₁.tag := by
-        intro hEq
-        subst hEq
-        exact hsplit.2.2.1.2 rp₁.tag hIn₁ hIn
-      have hEq := hPres.borrows_unchanged_outside tag (by
-        intro e hE
-        cases List.mem_singleton.mp hE
-        exact hNe)
-      exact Eq.symm hEq
+    SepProp.holdsIn
+      (sepConj (ActiveTypedMutBorrow rp₁ codec₁ a_new) R_frame) m_final :=
+  sepConjBindings_preserved
+    (bs := [MutBorrowBinding.bind rp₁ codec₁ a_old])
+    (bs' := [MutBorrowBinding.bind rp₁ codec₁ a_new])
+    hSep hWf.callStack_nil
+    (fun b hb => by
+      rw [List.mem_singleton.mp hb]
+      exact hWf.exclusive.offset_zero)
+    rfl hInv_final hPres h_R
+    (fun b hb => by
+      rw [List.mem_singleton.mp hb]
+      exact h_not_agg a_old)
+    (fun b hb => by
+      rw [List.mem_singleton.mp hb]
+      exact h_not_agg a_new)
 
-theorem sepLensStateInv_of_sepConj_two {α : Type}
-    {frameLen : Nat} {rp₁ rp₂ : RawPtrVal} {codec₁ codec₂ : ValueCodec α} {a₁ a₂ : α}
+/--
+2-Lens Entry Bridge, now heterogeneous in the two pointee types: the binary
+separating conjunction derives allocation and tag disjointness of the two
+pointers instead of assuming it.
+-/
+theorem sepLensStateInv_of_sepConj_two {α β : Type}
+    {frameLen : Nat} {rp₁ rp₂ : RawPtrVal}
+    {codec₁ : ValueCodec α} {codec₂ : ValueCodec β} {a₁ : α} {a₂ : β}
     {R_frame : SepProp} {m₀ : Memory}
-    (hSep : SepProp.holdsIn (sepConj (ActiveTypedMutBorrow rp₁ codec₁ a₁) (sepConj (ActiveTypedMutBorrow rp₂ codec₂ a₂) R_frame)) m₀)
+    (hSep :
+      SepProp.holdsIn
+        (sepConj (ActiveTypedMutBorrow rp₁ codec₁ a₁)
+          (sepConj (ActiveTypedMutBorrow rp₂ codec₂ a₂) R_frame)) m₀)
     (hWf₁ : WfSingleMutBorrow frameLen rp₁ m₀)
     (hWf₂ : WfSingleMutBorrow frameLen rp₂ m₀) :
-    SepLensStateInv frameLen [(rp₁, codec₁.encode a₁), (rp₂, codec₂.encode a₂)] m₀ where
-  callStack_nil := hWf₁.callStack_nil
-  activeCallee_none := hWf₁.activeCallee_none
-  borrows_above_frame := hWf₁.borrows_above_frame
-  entries_valid := by
-    intro rp' v' hMem
-    simp only [List.mem_cons, List.not_mem_nil, or_false, Prod.mk.injEq] at hMem
-    rcases hMem with hEq1 | hEq2
-    · have hPts1 : readAllocAt? (memoryLocals m₀) rp' = some v' := by
-        rw [hEq1.1, hEq1.2]
-        exact readAllocAt_of_activeTypedMutBorrow_holdsIn (holdsIn_of_sepConj_left hSep)
-      have hOff : rp'.offset = 0 := by rw [hEq1.1]; exact hWf₁.exclusive.offset_zero
-      exact ⟨hOff, by rw [hEq1.1]; exact hWf₁.alloc_above_frame,
-        callerLocals_get?_of_pointsTo hWf₁.callStack_nil hOff hPts1,
-        by rw [hEq1.1]; exact hWf₁.exclusive⟩
-    · have hPts2 : readAllocAt? (memoryLocals m₀) rp' = some v' := by
-        rw [hEq2.1, hEq2.2]
-        exact readAllocAt_of_activeTypedMutBorrow_holdsIn (holdsIn_of_sepConj_left (holdsIn_of_sepConj_right hSep))
-      have hOff : rp'.offset = 0 := by rw [hEq2.1]; exact hWf₂.exclusive.offset_zero
-      exact ⟨hOff, by rw [hEq2.1]; exact hWf₂.alloc_above_frame,
-        callerLocals_get?_of_pointsTo hWf₂.callStack_nil hOff hPts2,
-        by rw [hEq2.1]; exact hWf₂.exclusive⟩
-  pairwise_disjoint := by
-    apply List.Pairwise.cons
-    · intro k hIn
-      cases hIn with
-      | head _ =>
-        rcases hSep with ⟨fp, h₁, h₂_3, hsplit_a, hActive_a, hSep_b⟩
-        rcases hSep_b with ⟨h₂, h₃, hsplit_b, hActive_b, hR_b⟩
-        rcases hActive_a with ⟨w1a, w2a, hsplit_wa, hpts_a, htok_a⟩
-        rcases hActive_b with ⟨w1b, w2b, hsplit_wb, hpts_b, htok_b⟩
-        have hIn_tag1 : rp₁.tag ∈ h₁.footprint.tags := by
-          apply (hsplit_wa.2.2.2.2 _).mpr
-          rw [htok_a.2]
-          exact Or.inr (List.mem_singleton.mpr rfl)
-        have hIn_tag2 : rp₂.tag ∈ h₂.footprint.tags := by
-          apply (hsplit_wb.2.2.2.2 _).mpr
-          rw [htok_b.2]
-          exact Or.inr (List.mem_singleton.mpr rfl)
-        have hDisjTags : rp₁.tag ≠ rp₂.tag := by
-          intro hEq
-          have hIn_tag2_subst : rp₁.tag ∈ h₂.footprint.tags := hEq ▸ hIn_tag2
-          exact hsplit_a.2.2.1.2 _ hIn_tag1 (by apply (hsplit_b.2.2.2.2 _).mpr; exact Or.inl hIn_tag2_subst)
-        have hIn_addr1 : (rp₁.allocId, rp₁.offset) ∈ h₁.footprint.addrs := by
-          apply (hsplit_wa.2.2.2.1 _).mpr
-          rw [hpts_a.2]
-          exact Or.inl (List.mem_singleton.mpr rfl)
-        have hIn_addr2 : (rp₂.allocId, rp₂.offset) ∈ h₂.footprint.addrs := by
-          apply (hsplit_wb.2.2.2.1 _).mpr
-          rw [hpts_b.2]
-          exact Or.inl (List.mem_singleton.mpr rfl)
-        have hDisjAlloc : rp₁.allocId ≠ rp₂.allocId := by
-          intro hEq
-          have hIn_addr2_subst : (rp₁.allocId, rp₁.offset) ∈ h₂.footprint.addrs := by
-            have hEqOff : rp₂.offset = rp₁.offset := by rw [hWf₂.exclusive.offset_zero, hWf₁.exclusive.offset_zero]
-            rw [←hEq, hEqOff] at hIn_addr2
-            exact hIn_addr2
-          exact hsplit_a.2.2.1.1 _ hIn_addr1 (by apply (hsplit_b.2.2.2.1 _).mpr; exact Or.inl hIn_addr2_subst)
-        exact ⟨hDisjAlloc, hDisjTags⟩
-      | tail _ hTail => nomatch hTail
-    · apply List.Pairwise.cons
-      · intro k hIn
-        nomatch hIn
-      · exact List.Pairwise.nil
+    SepLensStateInv frameLen
+      [(rp₁, codec₁.encode a₁), (rp₂, codec₂.encode a₂)] m₀ :=
+  sepLensStateInv_of_sepConjBindings
+    (bs := [MutBorrowBinding.bind rp₁ codec₁ a₁,
+      MutBorrowBinding.bind rp₂ codec₂ a₂])
+    hSep hWf₁.toWfLensFrame
+    (fun b hb => by
+      rcases List.mem_cons.mp hb with rfl | hb
+      · exact ⟨hWf₁.alloc_above_frame, hWf₁.exclusive⟩
+      · rw [List.mem_singleton.mp hb]
+        exact ⟨hWf₂.alloc_above_frame, hWf₂.exclusive⟩)
 
-theorem sepConj_activeTypedMutBorrow_preserved_two {α : Type}
-    {frameLen : Nat} (rp₁ rp₂ : RawPtrVal) (codec₁ codec₂ : ValueCodec α) (a_old a_new b_old b_new : α)
+theorem sepConj_activeTypedMutBorrow_preserved_two {α β : Type}
+    {frameLen : Nat} (rp₁ rp₂ : RawPtrVal)
+    (codec₁ : ValueCodec α) (codec₂ : ValueCodec β)
+    (a_old a_new : α) (b_old b_new : β)
     {R_frame : SepProp} {m₀ m_final : Memory}
-    (hSep : SepProp.holdsIn (sepConj (ActiveTypedMutBorrow rp₁ codec₁ a_old) (sepConj (ActiveTypedMutBorrow rp₂ codec₂ b_old) R_frame)) m₀)
-    (hInv_final : SepLensStateInv frameLen [(rp₁, codec₁.encode a_new), (rp₂, codec₂.encode b_new)] m_final)
+    (hSep :
+      SepProp.holdsIn
+        (sepConj (ActiveTypedMutBorrow rp₁ codec₁ a_old)
+          (sepConj (ActiveTypedMutBorrow rp₂ codec₂ b_old) R_frame)) m₀)
+    (hInv_final :
+      SepLensStateInv frameLen
+        [(rp₁, codec₁.encode a_new), (rp₂, codec₂.encode b_new)] m_final)
     (hWf₁ : WfSingleMutBorrow frameLen rp₁ m₀)
     (hWf₂ : WfSingleMutBorrow frameLen rp₂ m₀)
-    (hPres : LensFramePreserved [(rp₁, codec₁.encode a_old), (rp₂, codec₂.encode b_old)] m₀ m_final)
+    (hPres :
+      LensFramePreserved
+        [(rp₁, codec₁.encode a_old), (rp₂, codec₂.encode b_old)] m₀ m_final)
     (h_R : LocalSepProp R_frame)
     (h_not_agg : ∀ a : α, ∀ elems, codec₁.encode a ≠ .aggregate 0 elems)
-    (h_not_agg2 : ∀ a : α, ∀ elems, codec₂.encode a ≠ .aggregate 0 elems) :
-    SepProp.holdsIn (sepConj (ActiveTypedMutBorrow rp₁ codec₁ a_new) (sepConj (ActiveTypedMutBorrow rp₂ codec₂ b_new) R_frame)) m_final := by
-  rcases hSep with ⟨fp, h₁, h₂_3, hsplit, hActive₁, hSep₂_3⟩
-  rcases hSep₂_3 with ⟨h₂, h₃, hsplit₂, hActive₂, hR⟩
-  exists fp, { state := m_final, footprint := h₁.footprint }, { state := m_final, footprint := h₂_3.footprint }
-  refine ⟨⟨rfl, rfl, hsplit.2.2.1, hsplit.2.2.2.1, hsplit.2.2.2.2⟩, ?_, ?_⟩
-  · rcases hActive₁ with ⟨h₁a, h₁b, hsplit_ab, hpts, htok⟩
-    have hOff : rp₁.offset = 0 := hWf₁.exclusive.offset_zero
-    have hPtsFinal : readAllocAt? (memoryLocals m_final) rp₁ = some (codec₁.encode a_new) := by
-      have hMem : (rp₁, codec₁.encode a_new) ∈ [(rp₁, codec₁.encode a_new), (rp₂, codec₂.encode b_new)] := by simp only [List.mem_cons]; exact Or.inl trivial
-      rcases hInv_final.entries_valid rp₁ (codec₁.encode a_new) hMem with ⟨_, _, hCaller, _⟩
-      unfold readAllocAt? memoryLocals
-      rw [hInv_final.callStack_nil, hOff, hCaller]
-    have hTokFinal : ∃ entry, lookupBorrow m_final.borrows rp₁.tag = some entry ∧ entry.targetLocal = rp₁.allocId ∧ entry.perm = .active := by
-      have hMem : (rp₁, codec₁.encode a_new) ∈ [(rp₁, codec₁.encode a_new), (rp₂, codec₂.encode b_new)] := by simp only [List.mem_cons]; exact Or.inl trivial
-      rcases hInv_final.entries_valid rp₁ (codec₁.encode a_new) hMem with ⟨_, _, _, hExcl⟩
-      rcases hExcl.lookup_active with ⟨entry, hLook, hT, hP, hPerm, _⟩
-      exact ⟨entry, hLook, hT, hPerm⟩
-    let h₁a_final : PartialHeap := { state := m_final, footprint := h₁a.footprint }
-    let h₁b_final : PartialHeap := { state := m_final, footprint := h₁b.footprint }
-    have hsplit_ab_final : PartialHeapSplit { state := m_final, footprint := h₁.footprint } h₁a_final h₁b_final :=
-      ⟨rfl, rfl, hsplit_ab.2.2.1, hsplit_ab.2.2.2.1, hsplit_ab.2.2.2.2⟩
-    unfold ActiveTypedMutBorrow sepConj
-    exact ⟨h₁a_final, h₁b_final, hsplit_ab_final, ⟨hPtsFinal, hpts.2⟩, ⟨hTokFinal, htok.2⟩⟩
-  · exists { state := m_final, footprint := h₂.footprint }, { state := m_final, footprint := h₃.footprint }
-    refine ⟨⟨rfl, rfl, hsplit₂.2.2.1, hsplit₂.2.2.2.1, hsplit₂.2.2.2.2⟩, ?_, ?_⟩
-    · rcases hActive₂ with ⟨h₂a, h₂b, hsplit₂_ab, hpts₂, htok₂⟩
-      have hOff : rp₂.offset = 0 := hWf₂.exclusive.offset_zero
-      have hPtsFinal : readAllocAt? (memoryLocals m_final) rp₂ = some (codec₂.encode b_new) := by
-        have hMem : (rp₂, codec₂.encode b_new) ∈ [(rp₁, codec₁.encode a_new), (rp₂, codec₂.encode b_new)] := by simp only [List.mem_cons]; exact Or.inr (Or.inl trivial)
-        rcases hInv_final.entries_valid rp₂ (codec₂.encode b_new) hMem with ⟨_, _, hCaller, _⟩
-        unfold readAllocAt? memoryLocals
-        rw [hInv_final.callStack_nil, hOff, hCaller]
-      have hTokFinal : ∃ entry, lookupBorrow m_final.borrows rp₂.tag = some entry ∧ entry.targetLocal = rp₂.allocId ∧ entry.perm = .active := by
-        have hMem : (rp₂, codec₂.encode b_new) ∈ [(rp₁, codec₁.encode a_new), (rp₂, codec₂.encode b_new)] := by simp only [List.mem_cons]; exact Or.inr (Or.inl trivial)
-        rcases hInv_final.entries_valid rp₂ (codec₂.encode b_new) hMem with ⟨_, _, _, hExcl⟩
-        rcases hExcl.lookup_active with ⟨entry, hLook, hT, hP, hPerm, _⟩
-        exact ⟨entry, hLook, hT, hPerm⟩
-      let h₂a_final : PartialHeap := { state := m_final, footprint := h₂a.footprint }
-      let h₂b_final : PartialHeap := { state := m_final, footprint := h₂b.footprint }
-      have hsplit₂_ab_final : PartialHeapSplit { state := m_final, footprint := h₂.footprint } h₂a_final h₂b_final :=
-        ⟨rfl, rfl, hsplit₂_ab.2.2.1, hsplit₂_ab.2.2.2.1, hsplit₂_ab.2.2.2.2⟩
-      unfold ActiveTypedMutBorrow sepConj
-      exact ⟨h₂a_final, h₂b_final, hsplit₂_ab_final, ⟨hPtsFinal, hpts₂.2⟩, ⟨hTokFinal, htok₂.2⟩⟩
-    · have h₃_eq : h₃ = { state := m₀, footprint := h₃.footprint } := by cases h₃; dsimp; congr; exact Eq.trans hsplit₂.2.1 hsplit.2.1
-      have hR' : R_frame.atFootprint h₃.footprint m₀ := by
-        unfold SepProp.atFootprint
-        have h_eq : ({ state := m₀, footprint := h₃.footprint } : PartialHeap) = h₃ := by cases h₃; dsimp; congr; exact Eq.symm (Eq.trans hsplit₂.2.1 hsplit.2.1)
-        exact h_eq ▸ hR
-      apply h_R h₃.footprint m₀ m_final ?_ hR'
-      refine ⟨fun allocId offset hIn => ?_, fun tag hIn => ?_⟩
-      · rcases hActive₁ with ⟨h₁a, h₁b, hsplit_ab, hpts, htok⟩
-        rcases hActive₂ with ⟨h₂a, h₂b, hsplit₂_ab, hpts₂, htok₂⟩
-        have h₁a_fp : h₁a.footprint = { addrs := [(rp₁.allocId, rp₁.offset)], tags := [] } := hpts.2
-        have hIn₁ : (rp₁.allocId, rp₁.offset) ∈ h₁.footprint.addrs := by
-          apply (hsplit_ab.2.2.2.1 _).mpr
-          rw [h₁a_fp]
-          exact Or.inl (List.mem_singleton.mpr rfl)
-        have h₂a_fp : h₂a.footprint = { addrs := [(rp₂.allocId, rp₂.offset)], tags := [] } := hpts₂.2
-        have hIn₂ : (rp₂.allocId, rp₂.offset) ∈ h₂.footprint.addrs := by
-          apply (hsplit₂_ab.2.2.2.1 _).mpr
-          rw [h₂a_fp]
-          exact Or.inl (List.mem_singleton.mpr rfl)
-        cases hEqAlloc : Nat.beq allocId rp₁.allocId
-        · have hAllocNe : allocId ≠ rp₁.allocId := Nat.ne_of_beq_eq_false hEqAlloc
-          cases hEqAlloc2 : Nat.beq allocId rp₂.allocId
-          · have hAllocNe2 : allocId ≠ rp₂.allocId := Nat.ne_of_beq_eq_false hEqAlloc2
-            have hOut : ∀ e ∈ [(rp₁, codec₁.encode a_old), (rp₂, codec₂.encode b_old)], allocId ≠ e.1.allocId := by
-              intro e hE
-              simp only [List.mem_cons, List.not_mem_nil, or_false] at hE
-              rcases hE with rfl | rfl
-              · exact hAllocNe
-              · exact hAllocNe2
-            have hGetEq := hPres.locals_unchanged_outside allocId hOut
-            unfold readAllocAt? memoryLocals
-            rw [hInv_final.callStack_nil, hWf₁.callStack_nil, hGetEq]
-          · have hAllocEq2 : allocId = rp₂.allocId := Nat.eq_of_beq_eq_true hEqAlloc2
-            subst hAllocEq2
-            have hOffNe : rp₂.offset ≠ offset := by
-              intro hEq
-              subst hEq
-              exact hsplit₂.2.2.1.1 (rp₂.allocId, rp₂.offset) hIn₂ hIn
-            have hOffZero : rp₂.offset = 0 := hWf₂.exclusive.offset_zero
-            have hOffsetPos : offset ≠ 0 := fun hZ => hOffNe (hZ ▸ hOffZero)
-            have hNone₀ : readAllocAt? (memoryLocals m₀) { allocId := rp₂.allocId, offset := offset, tag := rp₂.allocId } = none := by
-              have hPts₀ : readAllocAt? (memoryLocals m₀) rp₂ = some (codec₂.encode b_old) := by
-                have h_eq : h₂a.state = m₀ := Eq.trans hsplit₂_ab.1 (Eq.trans hsplit₂.1 hsplit.2.1)
-                exact h_eq ▸ hpts₂.1
-              unfold readAllocAt? memoryLocals at hPts₀ ⊢
-              rw [hWf₂.callStack_nil]
-              rw [hWf₂.callStack_nil, hOffZero] at hPts₀
-              dsimp only at hPts₀ ⊢
-              cases hGet : get? m₀.callerLocals rp₂.allocId with
-              | none => rfl
-              | some slot =>
-                cases slot with
-                | dead => rfl
-                | uninit => rfl
-                | init val =>
-                  rw [hGet] at hPts₀
-                  dsimp only at hPts₀
-                  injection hPts₀ with hV
-                  subst hV
-                  cases offset with
-                  | zero => contradiction
-                  | succ k =>
-                    cases hVal : codec₂.encode b_old with
-                    | aggregate m elems =>
-                      cases m with
-                      | zero => exfalso; exact h_not_agg2 b_old elems hVal
-                      | succ m => rfl
-                    | _ => rfl
-            have hNone_final : readAllocAt? (memoryLocals m_final) { allocId := rp₂.allocId, offset := offset, tag := rp₂.allocId } = none := by
-              have hMem : (rp₂, codec₂.encode b_new) ∈ [(rp₁, codec₁.encode a_new), (rp₂, codec₂.encode b_new)] := by simp only [List.mem_cons]; exact Or.inr (Or.inl trivial)
-              rcases hInv_final.entries_valid rp₂ (codec₂.encode b_new) hMem with ⟨_, _, hCaller, _⟩
-              unfold readAllocAt? memoryLocals
-              rw [hInv_final.callStack_nil, hCaller]
-              cases offset with
-              | zero => contradiction
-              | succ k =>
-                cases hVal : codec₂.encode b_new with
-                | aggregate m elems =>
-                  cases m with
-                  | zero => exfalso; exact h_not_agg2 b_new elems hVal
-                  | succ m => rfl
-                | _ => rfl
-            rw [hNone₀, hNone_final]
-        · have hAllocEq : allocId = rp₁.allocId := Nat.eq_of_beq_eq_true hEqAlloc
-          subst hAllocEq
-          have hOffNe : rp₁.offset ≠ offset := by
-            intro hEq
-            subst hEq
-            have hIn_h₂_3 : (rp₁.allocId, rp₁.offset) ∈ h₂_3.footprint.addrs := by apply (hsplit₂.2.2.2.1 _).mpr; exact Or.inr hIn
-            exact hsplit.2.2.1.1 (rp₁.allocId, rp₁.offset) hIn₁ hIn_h₂_3
-          have hOffZero : rp₁.offset = 0 := hWf₁.exclusive.offset_zero
-          have hOffsetPos : offset ≠ 0 := fun hZ => hOffNe (hZ ▸ hOffZero)
-          have hNone₀ : readAllocAt? (memoryLocals m₀) { allocId := rp₁.allocId, offset := offset, tag := rp₁.allocId } = none := by
-            have hPts₀ : readAllocAt? (memoryLocals m₀) rp₁ = some (codec₁.encode a_old) := by
-              have h_eq : h₁a.state = m₀ := Eq.trans hsplit_ab.1 hsplit.1
-              exact h_eq ▸ hpts.1
-            unfold readAllocAt? memoryLocals at hPts₀ ⊢
-            rw [hWf₁.callStack_nil]
-            rw [hWf₁.callStack_nil, hOffZero] at hPts₀
-            dsimp only at hPts₀ ⊢
-            cases hGet : get? m₀.callerLocals rp₁.allocId with
-            | none => rfl
-            | some slot =>
-              cases slot with
-              | dead => rfl
-              | uninit => rfl
-              | init val =>
-                rw [hGet] at hPts₀
-                dsimp only at hPts₀
-                injection hPts₀ with hV
-                subst hV
-                cases offset with
-                | zero => contradiction
-                | succ k =>
-                  cases hVal : codec₁.encode a_old with
-                  | aggregate m elems =>
-                    cases m with
-                    | zero => exfalso; exact h_not_agg a_old elems hVal
-                    | succ m => rfl
-                  | _ => rfl
-          have hNone_final : readAllocAt? (memoryLocals m_final) { allocId := rp₁.allocId, offset := offset, tag := rp₁.allocId } = none := by
-            have hMem : (rp₁, codec₁.encode a_new) ∈ [(rp₁, codec₁.encode a_new), (rp₂, codec₂.encode b_new)] := by simp only [List.mem_cons]; exact Or.inl trivial
-            rcases hInv_final.entries_valid rp₁ (codec₁.encode a_new) hMem with ⟨_, _, hCaller, _⟩
-            unfold readAllocAt? memoryLocals
-            rw [hInv_final.callStack_nil, hCaller]
-            cases offset with
-            | zero => contradiction
-            | succ k =>
-              cases hVal : codec₁.encode a_new with
-              | aggregate m elems =>
-                cases m with
-                | zero => exfalso; exact h_not_agg a_new elems hVal
-                | succ m => rfl
-              | _ => rfl
-          rw [hNone₀, hNone_final]
-      · rcases hActive₁ with ⟨h₁a, h₁b, hsplit_ab, hpts, htok⟩
-        rcases hActive₂ with ⟨h₂a, h₂b, hsplit₂_ab, hpts₂, htok₂⟩
-        have h₁b_fp : h₁b.footprint = { addrs := [], tags := [rp₁.tag] } := htok.2
-        have hIn₁ : rp₁.tag ∈ h₁.footprint.tags := by
-          apply (hsplit_ab.2.2.2.2 _).mpr
-          rw [h₁b_fp]
-          exact Or.inr (List.mem_singleton.mpr rfl)
-        have h₂b_fp : h₂b.footprint = { addrs := [], tags := [rp₂.tag] } := htok₂.2
-        have hIn₂ : rp₂.tag ∈ h₂.footprint.tags := by
-          apply (hsplit₂_ab.2.2.2.2 _).mpr
-          rw [h₂b_fp]
-          exact Or.inr (List.mem_singleton.mpr rfl)
-        cases hEqTag : Nat.beq tag rp₁.tag
-        · have hTagNe : tag ≠ rp₁.tag := Nat.ne_of_beq_eq_false hEqTag
-          cases hEqTag2 : Nat.beq tag rp₂.tag
-          · have hTagNe2 : tag ≠ rp₂.tag := Nat.ne_of_beq_eq_false hEqTag2
-            have hEq := hPres.borrows_unchanged_outside tag (by
-              intro e hE
-              simp only [List.mem_cons, List.not_mem_nil, or_false] at hE
-              rcases hE with rfl | rfl
-              · exact hTagNe
-              · exact hTagNe2)
-            exact Eq.symm hEq
-          · have hTagEq2 : tag = rp₂.tag := Nat.eq_of_beq_eq_true hEqTag2
-            subst hTagEq2
-            have hIn_h₂_3 : rp₂.tag ∈ h₂_3.footprint.tags := by apply (hsplit₂.2.2.2.2 _).mpr; exact Or.inl hIn₂
-            exact False.elim (hsplit₂.2.2.1.2 rp₂.tag hIn₂ hIn)
-        · have hTagEq : tag = rp₁.tag := Nat.eq_of_beq_eq_true hEqTag
-          subst hTagEq
-          have hIn_h₂_3 : rp₁.tag ∈ h₂_3.footprint.tags := by apply (hsplit₂.2.2.2.2 _).mpr; exact Or.inr hIn
-          exact False.elim (hsplit.2.2.1.2 rp₁.tag hIn₁ hIn_h₂_3)
+    (h_not_agg2 : ∀ b : β, ∀ elems, codec₂.encode b ≠ .aggregate 0 elems) :
+    SepProp.holdsIn
+      (sepConj (ActiveTypedMutBorrow rp₁ codec₁ a_new)
+        (sepConj (ActiveTypedMutBorrow rp₂ codec₂ b_new) R_frame)) m_final :=
+  sepConjBindings_preserved
+    (bs := [MutBorrowBinding.bind rp₁ codec₁ a_old,
+      MutBorrowBinding.bind rp₂ codec₂ b_old])
+    (bs' := [MutBorrowBinding.bind rp₁ codec₁ a_new,
+      MutBorrowBinding.bind rp₂ codec₂ b_new])
+    hSep hWf₁.callStack_nil
+    (fun b hb => by
+      rcases List.mem_cons.mp hb with rfl | hb
+      · exact hWf₁.exclusive.offset_zero
+      · rw [List.mem_singleton.mp hb]
+        exact hWf₂.exclusive.offset_zero)
+    rfl hInv_final hPres h_R
+    (fun b hb => by
+      rcases List.mem_cons.mp hb with rfl | hb
+      · exact h_not_agg a_old
+      · rw [List.mem_singleton.mp hb]
+        exact h_not_agg2 b_old)
+    (fun b hb => by
+      rcases List.mem_cons.mp hb with rfl | hb
+      · exact h_not_agg a_new
+      · rw [List.mem_singleton.mp hb]
+        exact h_not_agg2 b_new)
 
-theorem pairwise_disjoint_of_sepConj_two_ne {α : Type}
-    {rp₁ rp₂ : RawPtrVal} {codec₁ codec₂ : ValueCodec α} {a₁ a₂ : α}
-    {R_frame : SepProp} {m₀ : Memory}
-    (hSep : SepProp.holdsIn (sepConj (ActiveTypedMutBorrow rp₁ codec₁ a₁) (sepConj (ActiveTypedMutBorrow rp₂ codec₂ a₂) R_frame)) m₀) :
+/--
+Binary separating conjunctions of typed mutable borrows have distinct pointers
+(a consequence of the derived tag disjointness).
+-/
+theorem pairwise_disjoint_of_sepConj_two_ne {α β : Type}
+    {rp₁ rp₂ : RawPtrVal} {codec₁ : ValueCodec α} {codec₂ : ValueCodec β}
+    {a₁ : α} {a₂ : β} {R_frame : SepProp} {m₀ : Memory}
+    (hSep :
+      SepProp.holdsIn
+        (sepConj (ActiveTypedMutBorrow rp₁ codec₁ a₁)
+          (sepConj (ActiveTypedMutBorrow rp₂ codec₂ a₂) R_frame)) m₀) :
     rp₁ ≠ rp₂ := by
   intro hEq
-  rcases hSep with ⟨fp, h₁, h₂_3, hsplit_a, hActive_a, hSep_b⟩
-  rcases hSep_b with ⟨h₂, h₃, hsplit_b, hActive_b, hR_b⟩
-  rcases hActive_a with ⟨w1a, w2a, hsplit_wa, hpts_a, htok_a⟩
-  rcases hActive_b with ⟨w1b, w2b, hsplit_wb, hpts_b, htok_b⟩
-  have hIn_tag1 : rp₁.tag ∈ h₁.footprint.tags := by
-    apply (hsplit_wa.2.2.2.2 _).mpr
-    rw [htok_a.2]
-    exact Or.inr (List.mem_singleton.mpr rfl)
-  have hIn_tag2 : rp₂.tag ∈ h₂.footprint.tags := by
-    apply (hsplit_wb.2.2.2.2 _).mpr
-    rw [htok_b.2]
-    exact Or.inr (List.mem_singleton.mpr rfl)
-  have hIn_tag2_subst : rp₁.tag ∈ h₂.footprint.tags := hEq ▸ hIn_tag2
-  exact hsplit_a.2.2.1.2 _ hIn_tag1 (by apply (hsplit_b.2.2.2.2 _).mpr; exact Or.inl hIn_tag2_subst)
+  rcases hSep with ⟨fp, hSep⟩
+  rcases sepConjBindings_split
+      (bs := [MutBorrowBinding.bind rp₁ codec₁ a₁,
+        MutBorrowBinding.bind rp₂ codec₂ a₂]) hSep with ⟨_, hPair, _⟩
+  rcases List.pairwise_cons.mp hPair with ⟨hHead, _⟩
+  exact (hHead _ (List.Mem.head _)).2 (congrArg RawPtrVal.tag hEq)
 
-/-! ## 3. Concrete Separation-Logic Lens Witnesses (`add_assign` & `swap_u32`) -/
+
+/-! ## 3. Concrete Witnesses: `add_assign` and `swap_u32` -/
 
 def unitLayout : TypeLayout :=
   { size := { bytes := 0 }
@@ -2878,24 +3710,54 @@ def u32MutPtrLayout : TypeLayout :=
     variants := .single 0
     isUninhabited := false }
 
+theorem lookupLensVal?_singleton_self (rp : RawPtrVal) (v : Value) :
+    lookupLensVal? [(rp, v)] rp = .some v := by
+  simp [lookupLensVal?]
+
+theorem updateLensVal_singleton_self (rp : RawPtrVal) (v v' : Value) :
+    updateLensVal [(rp, v)] rp v' = [(rp, v')] := by
+  simp [updateLensVal]
+
+theorem scalarNat_not_aggregate (sz a : Nat) (elems : List Value) :
+    (ValueCodec.scalarNat sz).encode a ≠ .aggregate 0 elems := by
+  intro hEq
+  unfold ValueCodec.encode ValueCodec.scalarNat at hEq
+  dsimp only at hEq
+  injection hEq
+
+/-! ### `add_assign(x: &mut u32, d: u32)` -/
+
+/--
+`Runtime(PostCleanup)` MIR of
+`pub fn add_assign(x: &mut u32, d: u32) { *x += d; }` as rustc builds it without
+overflow checks: the compound assignment reads and
+writes the pointee in one statement, `(*_1) = Add(copy (*_1), copy _2)`, and the
+unit return value is stored by `_0 = const ()`.
+-/
 def add_assign : CapturedMir where
   defPath := "demo::add_assign"
   phase := .runtimePostCleanup
   role := .subject
   argCount := 2
   localDecls := [
-    { mutability := .mut, ty := { kind := .tuple [], layoutIdx := 0 }, debugName := some "_0" },
-    { mutability := .not, ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 2 }, debugName := some "x" },
-    { mutability := .not, ty := { kind := .uint .u32, layoutIdx := 1 }, debugName := some "d" },
-    { mutability := .mut, ty := { kind := .uint .u32, layoutIdx := 1 }, debugName := some "tmp" }
+    { mutability := .mut, ty := { kind := .tuple [], layoutIdx := 0 },
+      debugName := some "_0" },
+    { mutability := .not, ty := { kind := .ref .mut (.uint .u32), layoutIdx := 2 },
+      debugName := some "x" },
+    { mutability := .not, ty := { kind := .uint .u32, layoutIdx := 1 },
+      debugName := some "d" }
   ]
   basicBlocks := [
     { statements := [
-        { kind := .storageLive 3, span := "add_assign" },
-        { kind := .assign { local_ := 3, projection := [] } (.use (.copy { local_ := 1, projection := [.deref] })), span := "add_assign" },
-        { kind := .assign { local_ := 1, projection := [.deref] } (.binaryOp .add (.copy { local_ := 3, projection := [] }) (.copy { local_ := 2, projection := [] })), span := "add_assign" },
-        { kind := .assign { local_ := 0, projection := [] } (.use (.constant { ty := { kind := .tuple [], layoutIdx := 0 }, val := .zeroSized })), span := "add_assign" },
-        { kind := .storageDead 3, span := "add_assign" }
+        { kind := .assign { local_ := 1, projection := [.deref] }
+            (.binaryOp .add
+              (.copy { local_ := 1, projection := [.deref] })
+              (.copy { local_ := 2, projection := [] })),
+          span := "add_assign" },
+        { kind := .assign { local_ := 0, projection := [] }
+            (.use (.constant
+              { ty := { kind := .tuple [], layoutIdx := 0 }, val := .zeroSized })),
+          span := "add_assign" }
       ],
       terminator := { kind := .return_, span := "add_assign" },
       isCleanup := false
@@ -2917,99 +3779,202 @@ def add_assign : CapturedMir where
   }
   allocations := []
 
-theorem add_assign_verified (x_ptr : RawPtrVal) (x_old d_val : Nat) (R_frame : SepProp) (h_R : LocalSepProp R_frame) :
-  StatefulVerificationResult {
-    body := add_assign,
-    pre := fun args m₀ =>
-      args = [.ptr x_ptr.toMirPtr 8, .scalar ⟨d_val, 4⟩] ∧
-      WfSingleMutBorrow 4 x_ptr m₀ ∧
-      SepProp.holdsIn (sepConj (ActiveTypedMutBorrow x_ptr (ValueCodec.scalarNat 4) x_old) R_frame) m₀,
-    post := fun _args _m₀ retVal m_final =>
-      retVal = .unit ∧
-      SepProp.holdsIn (sepConj (ActiveTypedMutBorrow x_ptr (ValueCodec.scalarNat 4) (wrapScalarBits (x_old + d_val) (scalarModulus 4))) R_frame) m_final
-  } := by
-  apply verifyStatefulMir_of_sepLenses
-  intro args m₀ hPre
-  rcases hPre with ⟨rfl, hWf, hSep⟩
-  exists [(x_ptr, (ValueCodec.scalarNat 4).encode x_old)]
-  exists updateLensVal [(x_ptr, (ValueCodec.scalarNat 4).encode x_old)] x_ptr (.scalar ⟨wrapScalarBits (x_old + d_val : Nat) (scalarModulus 4), 4⟩)
-  exists Value.unit
-  refine And.intro ?_ (And.intro ?_ ?_)
-  · unfold initMachineState
-    dsimp [add_assign, initLocals, initLocalsAux, List.length, List.append, Value.ptr, Rvalue.binaryOp]
-    apply LiftLensBlock.return_ (env' := [.init .unit, .init (Value.ptr x_ptr.toMirPtr 8), .init (Value.scalar ⟨d_val, 4⟩), .dead])
-    · rfl
-    · rfl
-    · rfl
-    · apply LiftLensStmts.cons
-      · apply LiftLensStmt.storageLive
-        apply LiftStorageLive.mk (env' := [.uninit, .init (Value.ptr x_ptr.toMirPtr 8), .init (Value.scalar ⟨d_val, 4⟩), .uninit])
-        · exact rfl
-        · exact rfl
-      · apply LiftLensStmts.cons
-        · apply LiftLensStmt.pureAssign
-          apply LiftPureAssign.mk (env₂ := [.uninit, .init (Value.ptr x_ptr.toMirPtr 8), .init (Value.scalar ⟨d_val, 4⟩), .init (Value.scalar ⟨x_old, 4⟩)])
-          · apply LiftLensRvalue.use_deref
-            apply LiftDerefRead.copy_deref
-            · exact rfl
-            · simp [lookupLensVal?]; rfl
-          · exact rfl
-          · exact fun h => nomatch h
-          · exact rfl
-        · apply LiftLensStmts.cons
-          · apply LiftLensStmt.derefWrite
-            apply LiftDerefWrite.mk
-            · apply LiftLensRvalue.binaryOp_add_u32
-              · apply LiftLensOperand.copy_local
-                exact rfl
-              · apply LiftLensOperand.copy_local
-                exact rfl
-            · exact rfl
-            · simp [lookupLensVal?]; rfl
-          · apply LiftLensStmts.cons
-            · apply LiftLensStmt.pureAssign
-              apply LiftPureAssign.mk (env₂ := [.init .unit, .init (Value.ptr x_ptr.toMirPtr 8), .init (Value.scalar ⟨d_val, 4⟩), .init (Value.scalar ⟨x_old, 4⟩)])
-              · apply LiftLensRvalue.use_pure
-                apply LiftLensOperand.const_zeroSized
-              · exact rfl
-              · exact fun h => nomatch h
-              · exact rfl
-            · apply LiftLensStmts.cons
-              · apply LiftLensStmt.storageDead
-                apply LiftStorageDead.mk (env' := [.init .unit, .init (Value.ptr x_ptr.toMirPtr 8), .init (Value.scalar ⟨d_val, 4⟩), .dead])
-                · exact rfl
-                · exact rfl
-              · exact @LiftLensStmts.nil add_assign.localDecls add_assign.layouts [.init .unit, .init (Value.ptr x_ptr.toMirPtr 8), .init (Value.scalar ⟨d_val, 4⟩), .dead] _
-    · rfl
-  · exact sepLensStateInv_of_sepConj_one hSep hWf
-  · intro m_final hInv hPres
-    have hEq : updateLensVal [(x_ptr, (ValueCodec.scalarNat 4).encode x_old)] x_ptr (Value.scalar ⟨wrapScalarBits (x_old + d_val : Nat) (scalarModulus 4), 4⟩) = [(x_ptr, (ValueCodec.scalarNat 4).encode (wrapScalarBits (x_old + d_val : Nat) (scalarModulus 4)))] := by
-      simp [updateLensVal, ValueCodec.scalarNat]
-    have h_not_agg : ∀ a : Nat, ∀ elems, (ValueCodec.scalarNat 4).encode a ≠ .aggregate 0 elems := by
-      intro a elems hEqAgg
-      unfold ValueCodec.encode ValueCodec.scalarNat at hEqAgg
-      dsimp only at hEqAgg
-      injection hEqAgg
-    exact ⟨rfl, sepConj_activeTypedMutBorrow_preserved_one hSep (hEq ▸ hInv) hWf hPres h_R h_not_agg⟩
+/--
+Precondition of `add_assign`: `x` carries `x_ptr`, which owns an active,
+Tree-Borrows-exclusive `u32` cell holding `x_old`, separated from an arbitrary
+footprint-local frame `R_frame`.
+-/
+def addAssignPre (x_ptr : RawPtrVal) (x_old d_val : Nat) (R_frame : SepProp) :
+    List Value → Memory → Prop :=
+  fun args m₀ =>
+    args = [.ptr x_ptr.toMirPtr 8, .scalar ⟨d_val, 4⟩] ∧
+    WfSingleMutBorrow 3 x_ptr m₀ ∧
+    SepProp.holdsIn
+      (sepConj (ActiveTypedMutBorrow x_ptr (ValueCodec.scalarNat 4) x_old) R_frame)
+      m₀
 
+/-- Postcondition of `add_assign`: unit result, wrapped sum behind `x_ptr`. -/
+def addAssignPost (x_ptr : RawPtrVal) (x_old d_val : Nat) (R_frame : SepProp) :
+    List Value → Memory → Value → Memory → Prop :=
+  fun _ _ retVal m_final =>
+    retVal = .unit ∧
+    SepProp.holdsIn
+      (sepConj
+        (ActiveTypedMutBorrow x_ptr (ValueCodec.scalarNat 4)
+          (wrapScalarBits (x_old + d_val) (scalarModulus 4)))
+        R_frame)
+      m_final
+
+/-- The pure lens-state derivation of the whole `add_assign` body. -/
+theorem add_assign_lift (x_ptr : RawPtrVal) (x_old d_val : Nat) :
+    LiftLensBlock add_assign 0
+      (initMachineState add_assign
+        [.ptr x_ptr.toMirPtr 8, .scalar ⟨d_val, 4⟩]).frame.locals
+      [(x_ptr, (ValueCodec.scalarNat 4).encode x_old)]
+      .unit
+      (updateLensVal [(x_ptr, (ValueCodec.scalarNat 4).encode x_old)] x_ptr
+        (.scalar ⟨wrapScalarBits (Nat.add x_old d_val) (scalarModulus 4), 4⟩)) := by
+  unfold initMachineState
+  dsimp [add_assign, initLocalsAux]
+  refine LiftLensBlock.return_
+    (env' := [.init .unit, .init (.ptr x_ptr.toMirPtr 8), .init (.scalar ⟨d_val, 4⟩)])
+    rfl rfl rfl ?_ rfl
+  refine .cons (.derefWrite (.mk (.binaryOp_add (by decide)
+      (.deref (.copy_deref rfl (lookupLensVal?_singleton_self _ _)))
+      (.pure (.copy_local rfl))) rfl (lookupLensVal?_singleton_self _ _))) ?_
+  refine .cons (.pureAssign (.mk (.use_pure .const_zeroSized) rfl
+      (fun h => nomatch h) rfl)) ?_
+  exact .nil
+
+/--
+Fuel-free convergence of `add_assign` from every memory satisfying the
+separation-logic precondition, proved through `mirWpConverges_of_sepLenses`:
+no step of the proof inspects a `Memory` field.
+-/
+theorem add_assign_mirWpConverges
+    (x_ptr : RawPtrVal) (x_old d_val : Nat) (R_frame : SepProp)
+    (h_R : LocalSepProp R_frame) (args : List Value) (m₀ : Memory)
+    (hPre : addAssignPre x_ptr x_old d_val R_frame args m₀) :
+    MirWpConverges add_assign (initMachineStateWithMemory add_assign args m₀)
+      (mirNormalPost (addAssignPost x_ptr x_old d_val R_frame args m₀)) := by
+  rcases hPre with ⟨rfl, hWf, hSep⟩
+  refine mirWpConverges_of_sepLenses (add_assign_lift x_ptr x_old d_val)
+    (sepLensStateInv_of_sepConj_one hSep hWf) (fun m_final hInv hPres => ?_)
+  rw [updateLensVal_singleton_self] at hInv
+  exact ⟨rfl, sepConj_activeTypedMutBorrow_preserved_one hSep hInv hWf hPres h_R
+    (scalarNat_not_aggregate 4)⟩
+
+theorem add_assign_verified
+    (x_ptr : RawPtrVal) (x_old d_val : Nat) (R_frame : SepProp)
+    (h_R : LocalSepProp R_frame) :
+    StatefulVerificationResult {
+      body := add_assign,
+      pre := addAssignPre x_ptr x_old d_val R_frame,
+      post := addAssignPost x_ptr x_old d_val R_frame
+    } :=
+  verifyStatefulMirNoPanic_of_wpConverges _ (fun args m₀ hPre =>
+    add_assign_mirWpConverges x_ptr x_old d_val R_frame h_R args m₀ hPre)
+
+theorem add_assign_total
+    (x_ptr : RawPtrVal) (x_old d_val : Nat) (R_frame : SepProp)
+    (h_R : LocalSepProp R_frame) :
+    TotalVerificationResult {
+      body := add_assign,
+      pre := addAssignPre x_ptr x_old d_val R_frame,
+      post := addAssignPost x_ptr x_old d_val R_frame
+    } :=
+  verifyTotalMir_of_wpConverges _ (fun args m₀ hPre =>
+    add_assign_mirWpConverges x_ptr x_old d_val R_frame h_R args m₀ hPre)
+
+/-! ### `add_assign` with Function-Entry Retags (`LiftRetag`) -/
+
+/--
+`add_assign` as rustc emits it under `-Zmir-emit-retag` (the Miri
+configuration): `Retag([fn entry] _1)` attaches a function-entry protector to
+`x`'s borrow before the compound assignment. Anneal's capture does not request
+retag statements, so this body exists to exercise `LiftRetag` and the
+protected-write paths of `LiftDerefWrite` end to end.
+-/
+def add_assign_retag : CapturedMir :=
+  { add_assign with
+    defPath := "demo::add_assign_retag"
+    basicBlocks := [
+      { statements := [
+          { kind := .retag .fnEntry { local_ := 1, projection := [] },
+            span := "add_assign_retag" },
+          { kind := .assign { local_ := 1, projection := [.deref] }
+              (.binaryOp .add
+                (.copy { local_ := 1, projection := [.deref] })
+                (.copy { local_ := 2, projection := [] })),
+            span := "add_assign_retag" },
+          { kind := .assign { local_ := 0, projection := [] }
+              (.use (.constant
+                { ty := { kind := .tuple [], layoutIdx := 0 }, val := .zeroSized })),
+            span := "add_assign_retag" }
+        ],
+        terminator := { kind := .return_, span := "add_assign_retag" },
+        isCleanup := false
+      }
+    ] }
+
+theorem add_assign_retag_lift (x_ptr : RawPtrVal) (x_old d_val : Nat) :
+    LiftLensBlock add_assign_retag 0
+      (initMachineState add_assign_retag
+        [.ptr x_ptr.toMirPtr 8, .scalar ⟨d_val, 4⟩]).frame.locals
+      [(x_ptr, (ValueCodec.scalarNat 4).encode x_old)]
+      .unit
+      (updateLensVal [(x_ptr, (ValueCodec.scalarNat 4).encode x_old)] x_ptr
+        (.scalar ⟨wrapScalarBits (Nat.add x_old d_val) (scalarModulus 4), 4⟩)) := by
+  unfold initMachineState
+  dsimp [add_assign_retag, add_assign, initLocalsAux]
+  refine LiftLensBlock.return_
+    (env' := [.init .unit, .init (.ptr x_ptr.toMirPtr 8), .init (.scalar ⟨d_val, 4⟩)])
+    rfl rfl rfl ?_ rfl
+  refine .cons (.retag (.mk rfl (lookupLensVal?_singleton_self _ _))) ?_
+  refine .cons (.derefWrite (.mk (.binaryOp_add (by decide)
+      (.deref (.copy_deref rfl (lookupLensVal?_singleton_self _ _)))
+      (.pure (.copy_local rfl))) rfl (lookupLensVal?_singleton_self _ _))) ?_
+  refine .cons (.pureAssign (.mk (oldSlot := .uninit) (.use_pure .const_zeroSized)
+      rfl (fun h => nomatch h) rfl)) ?_
+  exact .nil
+
+/--
+The retagged body satisfies the same contract as `add_assign`: after the
+function-entry retag protects `x`'s borrow, the protected write through `x`
+raises no protector conflict and the frame is preserved.
+-/
+theorem add_assign_retag_mirWpConverges
+    (x_ptr : RawPtrVal) (x_old d_val : Nat) (R_frame : SepProp)
+    (h_R : LocalSepProp R_frame) (args : List Value) (m₀ : Memory)
+    (hPre : addAssignPre x_ptr x_old d_val R_frame args m₀) :
+    MirWpConverges add_assign_retag
+      (initMachineStateWithMemory add_assign_retag args m₀)
+      (mirNormalPost (addAssignPost x_ptr x_old d_val R_frame args m₀)) := by
+  rcases hPre with ⟨rfl, hWf, hSep⟩
+  refine mirWpConverges_of_sepLenses (add_assign_retag_lift x_ptr x_old d_val)
+    (sepLensStateInv_of_sepConj_one hSep hWf) (fun m_final hInv hPres => ?_)
+  rw [updateLensVal_singleton_self] at hInv
+  exact ⟨rfl, sepConj_activeTypedMutBorrow_preserved_one hSep hInv hWf hPres h_R
+    (scalarNat_not_aggregate 4)⟩
+
+
+/-! ### `swap_u32(a: &mut u32, b: &mut u32)` -/
+
+/--
+`Runtime(PostCleanup)` MIR of `swap_u32`, whose Rust source is
+`fn swap_u32(a: &mut u32, b: &mut u32) { let tmp = *a; *a = *b; *b = tmp; }`.
+-/
 def swap_u32 : CapturedMir where
   defPath := "demo::swap_u32"
   phase := .runtimePostCleanup
   role := .subject
   argCount := 2
   localDecls := [
-    { mutability := .mut, ty := { kind := .tuple [], layoutIdx := 0 }, debugName := some "_0" },
-    { mutability := .not, ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 2 }, debugName := some "a" },
-    { mutability := .not, ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 2 }, debugName := some "b" },
-    { mutability := .mut, ty := { kind := .uint .u32, layoutIdx := 1 }, debugName := some "tmp" }
+    { mutability := .mut, ty := { kind := .tuple [], layoutIdx := 0 },
+      debugName := some "_0" },
+    { mutability := .not, ty := { kind := .ref .mut (.uint .u32), layoutIdx := 2 },
+      debugName := some "a" },
+    { mutability := .not, ty := { kind := .ref .mut (.uint .u32), layoutIdx := 2 },
+      debugName := some "b" },
+    { mutability := .not, ty := { kind := .uint .u32, layoutIdx := 1 },
+      debugName := some "tmp" }
   ]
   basicBlocks := [
     { statements := [
         { kind := .storageLive 3, span := "swap_u32" },
-        { kind := .assign { local_ := 3, projection := [] } (.use (.copy { local_ := 1, projection := [.deref] })), span := "swap_u32" },
-        { kind := .assign { local_ := 1, projection := [.deref] } (.use (.copy { local_ := 2, projection := [.deref] })), span := "swap_u32" },
-        { kind := .assign { local_ := 2, projection := [.deref] } (.use (.copy { local_ := 3, projection := [] })), span := "swap_u32" },
-        { kind := .assign { local_ := 0, projection := [] } (.use (.constant { ty := { kind := .tuple [], layoutIdx := 0 }, val := .zeroSized })), span := "swap_u32" },
+        { kind := .assign { local_ := 3, projection := [] }
+            (.use (.copy { local_ := 1, projection := [.deref] })),
+          span := "swap_u32" },
+        { kind := .assign { local_ := 1, projection := [.deref] }
+            (.use (.copy { local_ := 2, projection := [.deref] })),
+          span := "swap_u32" },
+        { kind := .assign { local_ := 2, projection := [.deref] }
+            (.use (.copy { local_ := 3, projection := [] })),
+          span := "swap_u32" },
+        { kind := .assign { local_ := 0, projection := [] }
+            (.use (.constant
+              { ty := { kind := .tuple [], layoutIdx := 0 }, val := .zeroSized })),
+          span := "swap_u32" },
         { kind := .storageDead 3, span := "swap_u32" }
       ],
       terminator := { kind := .return_, span := "swap_u32" },
@@ -3032,89 +3997,525 @@ def swap_u32 : CapturedMir where
   }
   allocations := []
 
-theorem swap_u32_verified (a_ptr b_ptr : RawPtrVal) (a_old b_old : Nat) (R_frame : SepProp) (h_R : LocalSepProp R_frame) :
-  StatefulVerificationResult {
-    body := swap_u32,
-    pre := fun args m₀ =>
-      args = [.ptr a_ptr.toMirPtr 8, .ptr b_ptr.toMirPtr 8] ∧
-      WfSingleMutBorrow 4 a_ptr m₀ ∧
-      WfSingleMutBorrow 4 b_ptr m₀ ∧
-      SepProp.holdsIn (sepConj (ActiveTypedMutBorrow a_ptr (ValueCodec.scalarNat 4) a_old) (sepConj (ActiveTypedMutBorrow b_ptr (ValueCodec.scalarNat 4) b_old) R_frame)) m₀,
-    post := fun _args _m₀ retVal m_final =>
-      retVal = .unit ∧
-      SepProp.holdsIn (sepConj (ActiveTypedMutBorrow a_ptr (ValueCodec.scalarNat 4) b_old) (sepConj (ActiveTypedMutBorrow b_ptr (ValueCodec.scalarNat 4) a_old) R_frame)) m_final
-  } := by
-  apply verifyStatefulMir_of_sepLenses
-  intro args m₀ hPre
+/--
+Precondition of `swap_u32`: `a` and `b` carry pointers owning active,
+Tree-Borrows-exclusive `u32` cells, separated from each other (which forces
+distinct allocations and tags) and from an arbitrary frame `R_frame`.
+-/
+def swapU32Pre (a_ptr b_ptr : RawPtrVal) (a_old b_old : Nat) (R_frame : SepProp) :
+    List Value → Memory → Prop :=
+  fun args m₀ =>
+    args = [.ptr a_ptr.toMirPtr 8, .ptr b_ptr.toMirPtr 8] ∧
+    WfSingleMutBorrow 4 a_ptr m₀ ∧
+    WfSingleMutBorrow 4 b_ptr m₀ ∧
+    SepProp.holdsIn
+      (sepConj (ActiveTypedMutBorrow a_ptr (ValueCodec.scalarNat 4) a_old)
+        (sepConj (ActiveTypedMutBorrow b_ptr (ValueCodec.scalarNat 4) b_old)
+          R_frame))
+      m₀
+
+/-- Postcondition of `swap_u32`: unit result with the two pointees exchanged. -/
+def swapU32Post (a_ptr b_ptr : RawPtrVal) (a_old b_old : Nat) (R_frame : SepProp) :
+    List Value → Memory → Value → Memory → Prop :=
+  fun _ _ retVal m_final =>
+    retVal = .unit ∧
+    SepProp.holdsIn
+      (sepConj (ActiveTypedMutBorrow a_ptr (ValueCodec.scalarNat 4) b_old)
+        (sepConj (ActiveTypedMutBorrow b_ptr (ValueCodec.scalarNat 4) a_old)
+          R_frame))
+      m_final
+
+/--
+The pure lens-state derivation of the whole `swap_u32` body; pointer
+distinctness `a_ptr ≠ b_ptr` (derived from `sepConj` by the callers) is needed
+only to resolve the second lens lookup.
+-/
+theorem swap_u32_lift (a_ptr b_ptr : RawPtrVal) (a_old b_old : Nat)
+    (hNe : a_ptr ≠ b_ptr) :
+    LiftLensBlock swap_u32 0
+      (initMachineState swap_u32
+        [.ptr a_ptr.toMirPtr 8, .ptr b_ptr.toMirPtr 8]).frame.locals
+      [(a_ptr, (ValueCodec.scalarNat 4).encode a_old),
+        (b_ptr, (ValueCodec.scalarNat 4).encode b_old)]
+      .unit
+      (updateLensVal
+        (updateLensVal
+          [(a_ptr, (ValueCodec.scalarNat 4).encode a_old),
+            (b_ptr, (ValueCodec.scalarNat 4).encode b_old)]
+          a_ptr (.scalar ⟨b_old, 4⟩))
+        b_ptr (.scalar ⟨a_old, 4⟩)) := by
+  unfold initMachineState
+  dsimp [swap_u32, initLocalsAux]
+  refine LiftLensBlock.return_
+    (env' := [.init .unit, .init (.ptr a_ptr.toMirPtr 8),
+      .init (.ptr b_ptr.toMirPtr 8), .dead])
+    rfl rfl rfl ?_ rfl
+  refine .cons (.storageLive (.mk (oldSlot := .dead)
+      (env' := [.uninit, .init (.ptr a_ptr.toMirPtr 8),
+        .init (.ptr b_ptr.toMirPtr 8), .uninit]) rfl rfl)) ?_
+  refine .cons (.pureAssign (.mk (oldSlot := .uninit)
+      (env₂ := [.uninit, .init (.ptr a_ptr.toMirPtr 8),
+        .init (.ptr b_ptr.toMirPtr 8), .init (.scalar ⟨a_old, 4⟩)])
+      (.use_deref (.copy_deref rfl (by simp [lookupLensVal?]; rfl)))
+      rfl (fun h => nomatch h) rfl)) ?_
+  refine .cons (.derefWrite (.mk
+      (.use_deref (.copy_deref rfl (by simp [lookupLensVal?, hNe]; rfl)))
+      rfl (by simp [lookupLensVal?]; rfl))) ?_
+  refine .cons (.derefWrite (.mk (.use_pure (.copy_local rfl)) rfl
+      (by simp [lookupLensVal?, updateLensVal, hNe]; rfl))) ?_
+  refine .cons (.pureAssign (.mk (oldSlot := .uninit)
+      (env₂ := [.init .unit, .init (.ptr a_ptr.toMirPtr 8),
+        .init (.ptr b_ptr.toMirPtr 8), .init (.scalar ⟨a_old, 4⟩)])
+      (.use_pure .const_zeroSized) rfl (fun h => nomatch h) rfl)) ?_
+  refine .cons (.storageDead (.mk (oldSlot := .init (.scalar ⟨a_old, 4⟩))
+      (env' := [.init .unit, .init (.ptr a_ptr.toMirPtr 8),
+        .init (.ptr b_ptr.toMirPtr 8), .dead]) rfl rfl)) ?_
+  exact .nil
+
+/--
+Fuel-free convergence of `swap_u32` from every memory satisfying the
+separation-logic precondition, proved through `mirWpConverges_of_sepLenses`.
+-/
+theorem swap_u32_mirWpConverges
+    (a_ptr b_ptr : RawPtrVal) (a_old b_old : Nat) (R_frame : SepProp)
+    (h_R : LocalSepProp R_frame) (args : List Value) (m₀ : Memory)
+    (hPre : swapU32Pre a_ptr b_ptr a_old b_old R_frame args m₀) :
+    MirWpConverges swap_u32 (initMachineStateWithMemory swap_u32 args m₀)
+      (mirNormalPost (swapU32Post a_ptr b_ptr a_old b_old R_frame args m₀)) := by
   rcases hPre with ⟨rfl, hWf_a, hWf_b, hSep⟩
   have hNe : a_ptr ≠ b_ptr := pairwise_disjoint_of_sepConj_two_ne hSep
-  exists [(a_ptr, (ValueCodec.scalarNat 4).encode a_old), (b_ptr, (ValueCodec.scalarNat 4).encode b_old)]
-  exists updateLensVal (updateLensVal [(a_ptr, (ValueCodec.scalarNat 4).encode a_old), (b_ptr, (ValueCodec.scalarNat 4).encode b_old)] a_ptr (.scalar ⟨b_old, 4⟩)) b_ptr (.scalar ⟨a_old, 4⟩)
-  exists Value.unit
-  refine And.intro ?_ (And.intro ?_ ?_)
-  · unfold initMachineState
-    dsimp [swap_u32, initLocals, initLocalsAux, List.length, List.append, Value.ptr, Rvalue.binaryOp]
-    apply LiftLensBlock.return_ (env' := [.init .unit, .init (Value.ptr a_ptr.toMirPtr 8), .init (Value.ptr b_ptr.toMirPtr 8), .dead])
-    · rfl
-    · rfl
-    · rfl
-    · apply LiftLensStmts.cons
-      · apply LiftLensStmt.storageLive
-        apply LiftStorageLive.mk (env' := [.uninit, .init (Value.ptr a_ptr.toMirPtr 8), .init (Value.ptr b_ptr.toMirPtr 8), .uninit])
-        · exact rfl
-        · exact rfl
-      · apply LiftLensStmts.cons
-        · apply LiftLensStmt.pureAssign
-          apply LiftPureAssign.mk (env₂ := [.uninit, .init (Value.ptr a_ptr.toMirPtr 8), .init (Value.ptr b_ptr.toMirPtr 8), .init (Value.scalar ⟨a_old, 4⟩)])
-          · apply LiftLensRvalue.use_deref
-            apply LiftDerefRead.copy_deref
-            · exact rfl
-            · simp [lookupLensVal?]; rfl
-          · exact rfl
-          · exact fun h => nomatch h
-          · exact rfl
-        · apply LiftLensStmts.cons
-          · apply LiftLensStmt.derefWrite
-            apply LiftDerefWrite.mk
-            · apply LiftLensRvalue.use_deref
-              apply LiftDerefRead.copy_deref
-              · exact rfl
-              · simp [lookupLensVal?, hNe]; rfl
-            · exact rfl
-            · simp [lookupLensVal?]; rfl
-          · apply LiftLensStmts.cons
-            · apply LiftLensStmt.derefWrite
-              apply LiftDerefWrite.mk
-              · apply LiftLensRvalue.use_pure
-                apply LiftLensOperand.copy_local
-                · exact rfl
-              · exact rfl
-              · simp [lookupLensVal?, updateLensVal, hNe]; rfl
-            · apply LiftLensStmts.cons
-              · apply LiftLensStmt.pureAssign
-                apply LiftPureAssign.mk (env₂ := [.init .unit, .init (Value.ptr a_ptr.toMirPtr 8), .init (Value.ptr b_ptr.toMirPtr 8), .init (Value.scalar ⟨a_old, 4⟩)])
-                · apply LiftLensRvalue.use_pure
-                  apply LiftLensOperand.const_zeroSized
-                · exact rfl
-                · exact fun h => nomatch h
-                · exact rfl
-              · apply LiftLensStmts.cons
-                · apply LiftLensStmt.storageDead
-                  apply LiftStorageDead.mk (env' := [.init .unit, .init (Value.ptr a_ptr.toMirPtr 8), .init (Value.ptr b_ptr.toMirPtr 8), .dead])
-                  · exact rfl
-                  · exact rfl
-                · exact @LiftLensStmts.nil swap_u32.localDecls swap_u32.layouts [.init .unit, .init (Value.ptr a_ptr.toMirPtr 8), .init (Value.ptr b_ptr.toMirPtr 8), .dead] _
-    · rfl
-  · exact sepLensStateInv_of_sepConj_two hSep hWf_a hWf_b
-  · intro m_final hInv hPres
-    have hEq : updateLensVal (updateLensVal [(a_ptr, (ValueCodec.scalarNat 4).encode a_old), (b_ptr, (ValueCodec.scalarNat 4).encode b_old)] a_ptr (Value.scalar ⟨b_old, 4⟩)) b_ptr (Value.scalar ⟨a_old, 4⟩) = [(a_ptr, (ValueCodec.scalarNat 4).encode b_old), (b_ptr, (ValueCodec.scalarNat 4).encode a_old)] := by
-      simp [updateLensVal, ValueCodec.scalarNat, hNe]
-    have h_not_agg : ∀ a : Nat, ∀ elems, (ValueCodec.scalarNat 4).encode a ≠ .aggregate 0 elems := by
-      intro a elems hEqAgg
-      unfold ValueCodec.encode ValueCodec.scalarNat at hEqAgg
-      dsimp only at hEqAgg
-      injection hEqAgg
-    exact ⟨rfl, sepConj_activeTypedMutBorrow_preserved_two a_ptr b_ptr (ValueCodec.scalarNat 4) (ValueCodec.scalarNat 4) a_old b_old b_old a_old hSep (hEq ▸ hInv) hWf_a hWf_b hPres h_R h_not_agg h_not_agg⟩
+  refine mirWpConverges_of_sepLenses (swap_u32_lift a_ptr b_ptr a_old b_old hNe)
+    (sepLensStateInv_of_sepConj_two hSep hWf_a hWf_b)
+    (fun m_final hInv hPres => ?_)
+  have hEq :
+      updateLensVal
+          (updateLensVal
+            [(a_ptr, (ValueCodec.scalarNat 4).encode a_old),
+              (b_ptr, (ValueCodec.scalarNat 4).encode b_old)]
+            a_ptr (.scalar ⟨b_old, 4⟩))
+          b_ptr (.scalar ⟨a_old, 4⟩) =
+        [(a_ptr, (ValueCodec.scalarNat 4).encode b_old),
+          (b_ptr, (ValueCodec.scalarNat 4).encode a_old)] := by
+    simp [updateLensVal, ValueCodec.scalarNat, hNe]
+  rw [hEq] at hInv
+  exact ⟨rfl, sepConj_activeTypedMutBorrow_preserved_two a_ptr b_ptr
+    (ValueCodec.scalarNat 4) (ValueCodec.scalarNat 4) a_old b_old b_old a_old
+    hSep hInv hWf_a hWf_b hPres h_R
+    (scalarNat_not_aggregate 4) (scalarNat_not_aggregate 4)⟩
+
+theorem swap_u32_verified
+    (a_ptr b_ptr : RawPtrVal) (a_old b_old : Nat) (R_frame : SepProp)
+    (h_R : LocalSepProp R_frame) :
+    StatefulVerificationResult {
+      body := swap_u32,
+      pre := swapU32Pre a_ptr b_ptr a_old b_old R_frame,
+      post := swapU32Post a_ptr b_ptr a_old b_old R_frame
+    } :=
+  verifyStatefulMirNoPanic_of_wpConverges _ (fun args m₀ hPre =>
+    swap_u32_mirWpConverges a_ptr b_ptr a_old b_old R_frame h_R args m₀ hPre)
+
+theorem swap_u32_total
+    (a_ptr b_ptr : RawPtrVal) (a_old b_old : Nat) (R_frame : SepProp)
+    (h_R : LocalSepProp R_frame) :
+    TotalVerificationResult {
+      body := swap_u32,
+      pre := swapU32Pre a_ptr b_ptr a_old b_old R_frame,
+      post := swapU32Post a_ptr b_ptr a_old b_old R_frame
+    } :=
+  verifyTotalMir_of_wpConverges _ (fun args m₀ hPre =>
+    swap_u32_mirWpConverges a_ptr b_ptr a_old b_old R_frame h_R args m₀ hPre)
+
+/-! ### `add_assign` with Overflow Checks (Multi-Block `assert` CFG) -/
+
+def boolLayout : TypeLayout :=
+  { size := { bytes := 1 }
+    align := { bytes := 1 }
+    backendRepr := .memory
+    fields := .primitive
+    variants := .single 0
+    isUninhabited := false }
+
+def u32BoolPairLayout : TypeLayout :=
+  { size := { bytes := 8 }
+    align := { bytes := 4 }
+    backendRepr := .memory
+    fields := .primitive
+    variants := .single 0
+    isUninhabited := false }
+
+/--
+`Runtime(PostCleanup)` MIR of
+`pub fn add_assign(x: &mut u32, d: u32) { *x += d; }` as rustc builds it with
+overflow checks: `AddWithOverflow` reads the pointee
+into the pair temporary `_3`, the `assert` on `!_3.1` guards the overflow
+panic edge, and the success block writes `_3.0` back through `x`.
+-/
+def add_assign_checked : CapturedMir where
+  defPath := "demo::add_assign_checked"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [
+    { mutability := .mut, ty := { kind := .tuple [], layoutIdx := 0 },
+      debugName := some "_0" },
+    { mutability := .not, ty := { kind := .ref .mut (.uint .u32), layoutIdx := 2 },
+      debugName := some "x" },
+    { mutability := .not, ty := { kind := .uint .u32, layoutIdx := 1 },
+      debugName := some "d" },
+    { mutability := .mut, ty := { kind := .tuple [.uint .u32, .bool], layoutIdx := 3 },
+      debugName := none }
+  ]
+  basicBlocks := [
+    { statements := [
+        { kind := .storageLive 3, span := "add_assign_checked" },
+        { kind := .assign { local_ := 3, projection := [] }
+            (.binaryOp .addWithOverflow
+              (.copy { local_ := 1, projection := [.deref] })
+              (.copy { local_ := 2, projection := [] })),
+          span := "add_assign_checked" }
+      ],
+      terminator := {
+        kind := .assert
+          (.move
+            { local_ := 3
+              projection := [.field 1 { kind := .bool, layoutIdx := 4 }] })
+          false 1 .continue_,
+        span := "add_assign_checked" },
+      isCleanup := false
+    },
+    { statements := [
+        { kind := .assign { local_ := 1, projection := [.deref] }
+            (.use (.move
+              { local_ := 3
+                projection := [.field 0 { kind := .uint .u32, layoutIdx := 1 }] })),
+          span := "add_assign_checked" },
+        { kind := .storageDead 3, span := "add_assign_checked" },
+        { kind := .assign { local_ := 0, projection := [] }
+            (.use (.constant
+              { ty := { kind := .tuple [], layoutIdx := 0 }, val := .zeroSized })),
+          span := "add_assign_checked" }
+      ],
+      terminator := { kind := .return_, span := "add_assign_checked" },
+      isCleanup := false
+    }
+  ]
+  fnAbi := {
+    args := [
+      { layout := u32MutPtrLayout, mode := .direct },
+      { layout := u32Layout, mode := .direct }
+    ]
+    ret := { layout := unitLayout, mode := .direct }
+    conv := .rust
+    canUnwind := true
+  }
+  layouts := {
+    pointerBits := 64
+    isLittleEndian := true
+    entries := [unitLayout, u32Layout, u32MutPtrLayout, u32BoolPairLayout, boolLayout]
+  }
+  allocations := []
+
+/--
+Precondition of the overflow-checked `add_assign`: the `add_assign`
+separation-logic precondition plus the absence of `u32` overflow, without which
+the `assert` takes the panic edge.
+-/
+def addAssignCheckedPre
+    (x_ptr : RawPtrVal) (x_old d_val : Nat) (R_frame : SepProp) :
+    List Value → Memory → Prop :=
+  fun args m₀ =>
+    args = [.ptr x_ptr.toMirPtr 8, .scalar ⟨d_val, 4⟩] ∧
+    x_old + d_val < scalarModulus 4 ∧
+    WfSingleMutBorrow 4 x_ptr m₀ ∧
+    SepProp.holdsIn
+      (sepConj (ActiveTypedMutBorrow x_ptr (ValueCodec.scalarNat 4) x_old) R_frame)
+      m₀
+
+/-- Postcondition of the overflow-checked `add_assign`: the exact sum. -/
+def addAssignCheckedPost
+    (x_ptr : RawPtrVal) (x_old d_val : Nat) (R_frame : SepProp) :
+    List Value → Memory → Value → Memory → Prop :=
+  fun _ _ retVal m_final =>
+    retVal = .unit ∧
+    SepProp.holdsIn
+      (sepConj (ActiveTypedMutBorrow x_ptr (ValueCodec.scalarNat 4) (x_old + d_val))
+        R_frame)
+      m_final
+
+/--
+`AddWithOverflow` result pair `(wrapped, overflowed)` for unsigned `u32`
+operands, as `evalScalarBinOp` computes it.
+-/
+def u32AddWithOverflowPair (a b : Nat) : Value :=
+  .aggregate 0
+    [.scalar ⟨wrapScalarBits (Nat.add a b) (scalarModulus 4), 4⟩,
+      .scalar ⟨match Nat.ble (scalarModulus 4) (Nat.add a b) with
+        | true => 1
+        | false => 0, 1⟩]
+
+theorem ble_scalarModulus_eq_false {n sz : Nat} (h : n < scalarModulus sz) :
+    Nat.ble (scalarModulus sz) n = false := by
+  cases hBle : Nat.ble (scalarModulus sz) n with
+  | false => rfl
+  | true => exact absurd (Nat.le_of_ble_eq_true hBle) (Nat.not_le.mpr h)
+
+/--
+The pure lens-state derivation of the two-block overflow-checked body: the
+`assert` edge is discharged from the no-overflow hypothesis, and the success
+block writes the wrapped sum back through the lens.
+-/
+theorem add_assign_checked_lift (x_ptr : RawPtrVal) (x_old d_val : Nat)
+    (hNo : x_old + d_val < scalarModulus 4) :
+    LiftLensBlock add_assign_checked 0
+      (initMachineState add_assign_checked
+        [.ptr x_ptr.toMirPtr 8, .scalar ⟨d_val, 4⟩]).frame.locals
+      [(x_ptr, (ValueCodec.scalarNat 4).encode x_old)]
+      .unit
+      (updateLensVal [(x_ptr, (ValueCodec.scalarNat 4).encode x_old)] x_ptr
+        (.scalar ⟨wrapScalarBits (Nat.add x_old d_val) (scalarModulus 4), 4⟩)) := by
+  have hBle : Nat.ble (scalarModulus 4) (Nat.add x_old d_val) = false :=
+    ble_scalarModulus_eq_false hNo
+  unfold initMachineState
+  dsimp [add_assign_checked, initLocalsAux]
+  apply LiftLensBlock.assert (target := 1)
+    (entries₁ := [(x_ptr, (ValueCodec.scalarNat 4).encode x_old)])
+    (env₁ := [.uninit, .init (.ptr x_ptr.toMirPtr 8), .init (.scalar ⟨d_val, 4⟩),
+      .init (u32AddWithOverflowPair x_old d_val)])
+  · rfl
+  · rfl
+  · rfl
+  · refine .cons (.storageLive (.mk (oldSlot := .dead)
+      (env' := [.uninit, .init (.ptr x_ptr.toMirPtr 8),
+        .init (.scalar ⟨d_val, 4⟩), .uninit]) rfl rfl)) ?_
+    refine .cons (.pureAssign (.mk (oldSlot := .uninit)
+      (.binaryOp (.deref (.copy_deref rfl (lookupLensVal?_singleton_self _ _)))
+        (.pure (.copy_local rfl)) (fun _ => rfl))
+      rfl (fun h => nomatch h) rfl)) ?_
+    exact .nil
+  · exact .pure (.move_field rfl rfl)
+  · show (match Nat.ble (scalarModulus 4) (Nat.add x_old d_val) with
+      | true => 1
+      | false => 0) = 0
+    rw [hBle]
+  · refine LiftLensBlock.return_
+      (env' := [.init .unit, .init (.ptr x_ptr.toMirPtr 8),
+        .init (.scalar ⟨d_val, 4⟩), .dead]) rfl rfl rfl ?_ rfl
+    refine .cons (.derefWrite (.mk (.use_pure (.move_field rfl rfl)) rfl
+      (lookupLensVal?_singleton_self _ _))) ?_
+    refine .cons (.storageDead (.mk rfl rfl)) ?_
+    refine .cons (.pureAssign (.mk (oldSlot := .uninit)
+      (.use_pure .const_zeroSized) rfl (fun h => nomatch h) rfl)) ?_
+    exact .nil
+
+/--
+Fuel-free convergence of the overflow-checked `add_assign` (two blocks joined
+by an `assert`) from every memory satisfying its precondition, proved through
+`mirWpConverges_of_sepLenses`: the panic edge is unreachable and the pointee
+ends at the exact sum.
+-/
+theorem add_assign_checked_mirWpConverges
+    (x_ptr : RawPtrVal) (x_old d_val : Nat) (R_frame : SepProp)
+    (h_R : LocalSepProp R_frame) (args : List Value) (m₀ : Memory)
+    (hPre : addAssignCheckedPre x_ptr x_old d_val R_frame args m₀) :
+    MirWpConverges add_assign_checked
+      (initMachineStateWithMemory add_assign_checked args m₀)
+      (mirNormalPost (addAssignCheckedPost x_ptr x_old d_val R_frame args m₀)) := by
+  rcases hPre with ⟨rfl, hNo, hWf, hSep⟩
+  refine mirWpConverges_of_sepLenses (add_assign_checked_lift x_ptr x_old d_val hNo)
+    (sepLensStateInv_of_sepConj_one hSep hWf) (fun m_final hInv hPres => ?_)
+  have hWrap :
+      wrapScalarBits (Nat.add x_old d_val) (scalarModulus 4) = x_old + d_val := by
+    unfold wrapScalarBits
+    rw [ble_scalarModulus_eq_false (n := Nat.add x_old d_val) hNo]
+    rfl
+  rw [updateLensVal_singleton_self, hWrap] at hInv
+  exact ⟨rfl, sepConj_activeTypedMutBorrow_preserved_one hSep hInv hWf hPres h_R
+    (scalarNat_not_aggregate 4)⟩
+
+theorem add_assign_checked_verified
+    (x_ptr : RawPtrVal) (x_old d_val : Nat) (R_frame : SepProp)
+    (h_R : LocalSepProp R_frame) :
+    StatefulVerificationResult {
+      body := add_assign_checked,
+      pre := addAssignCheckedPre x_ptr x_old d_val R_frame,
+      post := addAssignCheckedPost x_ptr x_old d_val R_frame
+    } :=
+  verifyStatefulMirNoPanic_of_wpConverges _ (fun args m₀ hPre =>
+    add_assign_checked_mirWpConverges x_ptr x_old d_val R_frame h_R args m₀ hPre)
+
+theorem add_assign_checked_total
+    (x_ptr : RawPtrVal) (x_old d_val : Nat) (R_frame : SepProp)
+    (h_R : LocalSepProp R_frame) :
+    TotalVerificationResult {
+      body := add_assign_checked,
+      pre := addAssignCheckedPre x_ptr x_old d_val R_frame,
+      post := addAssignCheckedPost x_ptr x_old d_val R_frame
+    } :=
+  verifyTotalMir_of_wpConverges _ (fun args m₀ hPre =>
+    add_assign_checked_mirWpConverges x_ptr x_old d_val R_frame h_R args m₀ hPre)
+
+
+/-! ### Non-Vacuity: Concrete `I-10` Reborrow Chains -/
+
+/-- Child tag `2` of `x` (the callee's reborrow `&mut *r`). -/
+def demoChildPtr : RawPtrVal := { allocId := 3, offset := 0, tag := 2 }
+
+/-- Parent tag `1` of the caller reference `r` the child was reborrowed from. -/
+def demoParentPtr : RawPtrVal := { allocId := 3, offset := 0, tag := 1 }
+
+/--
+Caller memory for `add_assign`: caller slot `3` (above the 3-slot callee frame)
+holds `x_old`, borrowed by the active parent tag `1` and its active child tag
+`2` (`parentTag := some 1`). The strict `ExclusiveActiveBorrow` rejects this
+table (the parent is neither disabled nor `x`'s own tag), while
+`TreeExclusiveBorrow` accepts it.
+-/
+def addAssignDemoMem (x_old : Nat) : Memory :=
+  { borrows := [
+      { tag := 2, targetLocal := 3, targetProjection := [], perm := .active,
+        parentTag := some 1 },
+      { tag := 1, targetLocal := 3, targetProjection := [], perm := .active } ]
+    callerLocals := [.dead, .dead, .dead, .init (.scalar ⟨x_old, 4⟩)] }
+
+/--
+The reborrow-chain memory lies outside the strict exclusivity invariant: the
+active parent entry is neither `x`'s own tag nor disabled. Only the `I-10`
+parent/child relaxation `TreeExclusiveBorrow` admits it.
+-/
+theorem addAssignDemoMem_not_strictExclusive (x_old : Nat) :
+    ¬ ExclusiveActiveBorrow demoChildPtr (addAssignDemoMem x_old) := by
+  intro h
+  have hParent :
+      ({ tag := 1, targetLocal := 3, targetProjection := [], perm := .active } :
+        BorrowEntry) ∈ (addAssignDemoMem x_old).borrows :=
+    List.Mem.tail _ (List.Mem.head _)
+  rcases h.exclusive_on_alloc _ hParent rfl with ⟨hTag, _⟩ | hDis
+  · exact absurd hTag (by decide)
+  · exact nomatch hDis
+
+theorem add_assign_demo_pre (x_old d_val : Nat) :
+    addAssignPre demoChildPtr x_old d_val (BorrowToken demoParentPtr .active)
+      [.ptr demoChildPtr.toMirPtr 8, .scalar ⟨d_val, 4⟩]
+      (addAssignDemoMem x_old) := by
+  refine ⟨rfl, ⟨rfl, rfl, ?_, by decide, ⟨rfl, ?_, ?_⟩⟩, ?_⟩
+  · intro b hb
+    simp only [addAssignDemoMem, List.mem_cons, List.not_mem_nil,
+      or_false] at hb
+    rcases hb with rfl | rfl <;> decide
+  · exact ⟨_, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  · intro b hb _
+    simp only [addAssignDemoMem, List.mem_cons, List.not_mem_nil,
+      or_false] at hb
+    rcases hb with rfl | rfl
+    · exact Or.inl ⟨rfl, rfl⟩
+    · exact Or.inl ⟨rfl, rfl⟩
+  · refine ⟨_, sepConjBindings_intro
+      (bs := [MutBorrowBinding.bind demoChildPtr (ValueCodec.scalarNat 4) x_old])
+      (fpR := { addrs := [], tags := [1] }) ?_ (List.pairwise_singleton _ _)
+      ⟨⟨_, rfl, rfl, rfl⟩, rfl⟩ ?_⟩
+    · intro b hb
+      rw [List.mem_singleton.mp hb]
+      exact ⟨rfl, _, rfl, rfl, rfl⟩
+    · intro b hb
+      rw [List.mem_singleton.mp hb]
+      refine ⟨(fun h => nomatch h), ?_⟩
+      show ¬ ((2 : Nat) ∈ [1])
+      decide
+
+/--
+`add_assign` runs to completion from the concrete reborrow-chain memory, and
+the caller's parent tag stays active: the child write is a local write for the
+`I-10` ancestor, which `R_frame := BorrowToken demoParentPtr .active` records.
+-/
+theorem add_assign_demo_runs (x_old d_val : Nat) :
+    MirWpConverges add_assign
+      (initMachineStateWithMemory add_assign
+        [.ptr demoChildPtr.toMirPtr 8, .scalar ⟨d_val, 4⟩]
+        (addAssignDemoMem x_old))
+      (mirNormalPost
+        (addAssignPost demoChildPtr x_old d_val
+          (BorrowToken demoParentPtr .active)
+          [.ptr demoChildPtr.toMirPtr 8, .scalar ⟨d_val, 4⟩]
+          (addAssignDemoMem x_old))) :=
+  add_assign_mirWpConverges demoChildPtr x_old d_val _
+    (localSepProp_borrowToken demoParentPtr .active) _ _
+    (add_assign_demo_pre x_old d_val)
+
+/--
+Caller memory for `swap_u32`: caller slots `4` and `5` (above the 4-slot callee
+frame) hold `a_old` and `b_old` under root tags `1` and `2`.
+-/
+def swapU32DemoMem (a_old b_old : Nat) : Memory :=
+  { borrows := [
+      { tag := 1, targetLocal := 4, targetProjection := [], perm := .active },
+      { tag := 2, targetLocal := 5, targetProjection := [], perm := .active } ]
+    callerLocals :=
+      [.dead, .dead, .dead, .dead, .init (.scalar ⟨a_old, 4⟩),
+        .init (.scalar ⟨b_old, 4⟩)] }
+
+def swapDemoA : RawPtrVal := { allocId := 4, offset := 0, tag := 1 }
+
+def swapDemoB : RawPtrVal := { allocId := 5, offset := 0, tag := 2 }
+
+theorem swap_u32_demo_pre (a_old b_old : Nat) :
+    swapU32Pre swapDemoA swapDemoB a_old b_old emp
+      [.ptr swapDemoA.toMirPtr 8, .ptr swapDemoB.toMirPtr 8]
+      (swapU32DemoMem a_old b_old) := by
+  have hAbove :
+      ∀ b ∈ (swapU32DemoMem a_old b_old).borrows, 4 ≤ b.targetLocal := by
+    intro b hb
+    simp only [swapU32DemoMem, List.mem_cons, List.not_mem_nil,
+      or_false] at hb
+    rcases hb with rfl | rfl <;> decide
+  refine ⟨rfl, ⟨rfl, rfl, hAbove, by decide, ⟨rfl, ?_, ?_⟩⟩,
+    ⟨rfl, rfl, hAbove, by decide, ⟨rfl, ?_, ?_⟩⟩, ?_⟩
+  · exact ⟨_, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  · intro b hb hT
+    simp only [swapU32DemoMem, List.mem_cons, List.not_mem_nil,
+      or_false] at hb
+    rcases hb with rfl | rfl
+    · exact Or.inl ⟨rfl, rfl⟩
+    · exact absurd hT (by decide)
+  · exact ⟨_, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  · intro b hb hT
+    simp only [swapU32DemoMem, List.mem_cons, List.not_mem_nil,
+      or_false] at hb
+    rcases hb with rfl | rfl
+    · exact absurd hT (by decide)
+    · exact Or.inl ⟨rfl, rfl⟩
+  · refine ⟨_, sepConjBindings_intro
+      (bs := [MutBorrowBinding.bind swapDemoA (ValueCodec.scalarNat 4) a_old,
+        MutBorrowBinding.bind swapDemoB (ValueCodec.scalarNat 4) b_old])
+      (fpR := Footprint.empty) ?_ ?_ rfl ?_⟩
+    · intro b hb
+      simp only [List.mem_cons, List.not_mem_nil, or_false] at hb
+      rcases hb with rfl | rfl
+      · exact ⟨rfl, _, rfl, rfl, rfl⟩
+      · exact ⟨rfl, _, rfl, rfl, rfl⟩
+    · refine List.pairwise_cons.mpr ⟨?_, List.pairwise_singleton _ _⟩
+      intro b hb
+      rw [List.mem_singleton.mp hb]
+      refine ⟨?_, ?_⟩
+      · show ((4 : Nat), (0 : Nat)) ≠ (5, 0)
+        decide
+      · show (1 : Nat) ≠ 2
+        decide
+    · intro b _
+      exact ⟨(fun h => nomatch h), (fun h => nomatch h)⟩
+
+/-- `swap_u32` runs to completion and swaps on the concrete two-cell memory. -/
+theorem swap_u32_demo_runs (a_old b_old : Nat) :
+    MirWpConverges swap_u32
+      (initMachineStateWithMemory swap_u32
+        [.ptr swapDemoA.toMirPtr 8, .ptr swapDemoB.toMirPtr 8]
+        (swapU32DemoMem a_old b_old))
+      (mirNormalPost
+        (swapU32Post swapDemoA swapDemoB a_old b_old emp
+          [.ptr swapDemoA.toMirPtr 8, .ptr swapDemoB.toMirPtr 8]
+          (swapU32DemoMem a_old b_old))) :=
+  swap_u32_mirWpConverges swapDemoA swapDemoB a_old b_old emp localSepProp_emp
+    _ _ (swap_u32_demo_pre a_old b_old)
+
 
 end Anneal.SepLogicLenses
 
