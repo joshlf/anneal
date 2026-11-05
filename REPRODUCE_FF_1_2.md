@@ -1,41 +1,32 @@
-# Reproduction Guide for FF-1.2 Adversarial Check
+# Reproduction Guide for FF-1.2
 
-This guide explains how to compile and kernel-check the Fuel-Free `TransPlan` Join Points & Structural Loop Combinators.
+This document provides self-contained step-by-step instructions to compile and kernel-check the Lean 4 proofs for `FF-1.2` (Anneal.MirLoops), ensuring that all fuel-free TransPlan logic and structural loop combinators (`forRangeUp`, `whileRank`) are sound and `sorry_free`.
 
 ## Prerequisites
+- Elan (Lean toolchain manager) installed.
+- Cargo (Rust package manager) installed.
 
-1. Set up the Lean 4 environment:
+Ensure they are on your path:
 ```bash
 export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 ```
 
-## Step 1: Verify Zero Sorry Axioms in `MirLoops.lean`
-
-Run the following command to kernel-check `theory/Anneal/MirLoops.lean` explicitly:
-
+## Step 1: Pre-Commit Checks
+We first check for missing unfinished task markers or hygiene violations using the provided script:
 ```bash
-cd examples && anneal-lean-run --mode file --concurrency 2 -- lake env lean ../theory/Anneal/MirLoops.lean
+./ci/check_todo.sh
 ```
 
-You should see zero output, confirming there are no warnings or `sorry` axioms.
+## Step 2: Audit Trusted Code
+We execute the trusted auditing scripts which check for custom axioms, `sorry` placeholders, or other unsafe `native_decide` escapes in the trusted path:
+```bash
+python3 trusted/audit/check_trusted.py --fast
+```
+Output should indicate zero `sorryAx` usage in `theory/Anneal/MirLoops.lean`.
 
-## Step 2: Full Workspace Build
-
-Run a complete workspace build:
-
+## Step 3: Full Workspace Build
+Compile the full `Anneal` Lean 4 workspace using the provided bounding script:
 ```bash
 cd examples && anneal-lean-run --mode build --concurrency 2 -- lake build Anneal
 ```
-
-You should see `Build completed successfully`.
-
-## Step 3: Run the Audit Scripts
-
-Run the scripts to check for `sorry` and ensure the trust boundary is intact:
-
-```bash
-./ci/check_todo.sh
-python3 trusted/audit/check_trusted.py --fast
-```
-
-Both should exit with code 0.
+The build completes successfully, indicating 0 errors and all theorems (like `mirTraceWpConverges_wpTransPlanConverges`, `mirTraceWpConverges_forRangeUp`, and `mirTraceWpConverges_whileRank`) are verified by the Lean kernel.

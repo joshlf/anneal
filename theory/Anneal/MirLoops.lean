@@ -60,39 +60,41 @@ termination_by hi - lo
 theorem mirTraceWpConverges_forRangeUp {α : Type}
     (lo hi : Nat) (init : α) (step : (i : Nat) → lo ≤ i → i < hi → α → α)
     (body : CapturedMir)
-    (LoopInv : Nat → α → MachineState → Prop)
-    (s₀ : MachineState)
+    (LoopInv : Nat → α → MachineState → List (Event MirEffect) → Prop)
+    (s₀ : MachineState) (tr₀ : List (Event MirEffect))
     (post : List (Event MirEffect) → MirOutcome → Prop)
-    (h_init : LoopInv lo init s₀)
-    (h_body : ∀ i h_i_le h_i_lt a s, LoopInv i a s →
+    (h_init : LoopInv lo init s₀ tr₀)
+    (h_body : ∀ i h_i_le h_i_lt a s tr, LoopInv i a s tr →
       MirTraceStepsConverges body s
-        (fun s' tr_step => LoopInv (i + 1) (step i h_i_le h_i_lt a) s' ∧ tr_step = [])
-        (fun _ _ => False))
-    (h_exit : ∀ i a s, i ≥ hi → LoopInv i a s → MirTraceWpConverges body s post) :
-    MirTraceWpConverges body s₀ post := by
+        (fun s' tr_step => LoopInv (i + 1) (step i h_i_le h_i_lt a) s' (tr ++ tr_step))
+        (fun tr_out out => post (tr ++ tr_out) out))
+    (h_exit : ∀ i a s tr, i ≥ hi → LoopInv i a s tr → MirTraceWpConverges body s (fun tr_rest out => post (tr ++ tr_rest) out)) :
+    MirTraceWpConverges body s₀ (fun tr_rest out => post (tr₀ ++ tr_rest) out) := by
   generalize h_d : hi - lo = d
-  induction d generalizing lo init step s₀ with
+  induction d generalizing lo init step s₀ tr₀ with
   | zero =>
     have h_ge : lo ≥ hi := Nat.le_of_sub_eq_zero h_d
-    exact h_exit lo init s₀ h_ge h_init
+    exact h_exit lo init s₀ tr₀ h_ge h_init
   | succ d ih =>
     have h_lt : lo < hi := Nat.lt_of_sub_eq_succ h_d
     have h_le : lo ≤ hi := Nat.le_of_lt h_lt
-    have h_step_conv := h_body lo (Nat.le_refl _) h_lt init s₀ h_init
-    have h_step_conv_post : MirTraceStepsConverges body s₀ (fun s' tr_step => LoopInv (lo + 1) (step lo (Nat.le_refl _) h_lt init) s' ∧ tr_step = []) post := by
-      exact MirTraceStepsConverges.mono
-        (fun s' tr_step h_mid => h_mid)
-        (fun tr_step out h_false => nomatch h_false)
-        h_step_conv
-    apply MirTraceWpConverges.bind_silent h_step_conv_post
-    intro s' h_mid
+    have h_step_conv := h_body lo (Nat.le_refl _) h_lt init s₀ tr₀ h_init
+    apply MirTraceWpConverges.bind h_step_conv
+    intro s' tr_step h_mid
     have h_sub : hi - (lo + 1) = d := by omega
-    exact ih (lo + 1) (step lo (Nat.le_refl _) h_lt init)
+    have h_ih := ih (lo + 1) (step lo (Nat.le_refl _) h_lt init)
       (fun i h_le' h_lt' a => step i (Nat.le_trans (Nat.le_succ _) h_le') h_lt' a)
-      s'
+      s' (tr₀ ++ tr_step)
       h_mid
-      (fun i h_le' h_lt' a s h_inv => h_body i (Nat.le_trans (Nat.le_succ _) h_le') h_lt' a s h_inv)
+      (fun i h_le' h_lt' a s tr h_inv => by
+        have h_body' := h_body i (Nat.le_trans (Nat.le_succ _) h_le') h_lt' a s tr h_inv
+        exact h_body')
       h_sub
+    have h_post_eq : (fun tr_rest out => post (tr₀ ++ tr_step ++ tr_rest) out) = (fun tr_rest out => post (tr₀ ++ (tr_step ++ tr_rest)) out) := by
+      funext tr_rest out
+      rw [List.append_assoc]
+    rw [h_post_eq] at h_ih
+    exact h_ih
 
 theorem nat_strong_induction (P : Nat → Prop) (ind : ∀ n, (∀ m, m < n → P m) → P n) : ∀ n, P n := by
   intro n
@@ -116,26 +118,31 @@ theorem nat_strong_induction (P : Nat → Prop) (ind : ∀ n, (∀ m, m < n → 
 theorem mirTraceWpConverges_whileRank {α : Type}
     (rank : α → Nat)
     (body : CapturedMir)
-    (LoopInv : α → MachineState → Prop)
-    (s₀ : MachineState)
+    (LoopInv : α → MachineState → List (Event MirEffect) → Prop)
+    (s₀ : MachineState) (tr₀ : List (Event MirEffect))
     (a₀ : α)
     (post : List (Event MirEffect) → MirOutcome → Prop)
-    (h_init : LoopInv a₀ s₀)
-    (h_step : ∀ a s, LoopInv a s →
+    (h_init : LoopInv a₀ s₀ tr₀)
+    (h_step : ∀ a s tr, LoopInv a s tr →
       MirTraceStepsConverges body s
-        (fun s' tr_step => (∃ a', LoopInv a' s' ∧ rank a' < rank a) ∧ tr_step = [])
-        post) :
-    MirTraceWpConverges body s₀ post := by
-  have h_gen : ∀ r a s, rank a = r → LoopInv a s → MirTraceWpConverges body s post := by
-    apply nat_strong_induction (fun r => ∀ a s, rank a = r → LoopInv a s → MirTraceWpConverges body s post)
-    intro r ih a s h_eq h_inv
-    have h_step_conv := h_step a s h_inv
-    apply MirTraceWpConverges.bind_silent h_step_conv
-    intro s' h_mid
+        (fun s' tr_step => ∃ a', LoopInv a' s' (tr ++ tr_step) ∧ rank a' < rank a)
+        (fun tr_out out => post (tr ++ tr_out) out)) :
+    MirTraceWpConverges body s₀ (fun tr_rest out => post (tr₀ ++ tr_rest) out) := by
+  have h_gen : ∀ r a s tr, rank a = r → LoopInv a s tr → MirTraceWpConverges body s (fun tr_rest out => post (tr ++ tr_rest) out) := by
+    apply nat_strong_induction (fun r => ∀ a s tr, rank a = r → LoopInv a s tr → MirTraceWpConverges body s (fun tr_rest out => post (tr ++ tr_rest) out))
+    intro r ih a s tr h_eq h_inv
+    have h_step_conv := h_step a s tr h_inv
+    apply MirTraceWpConverges.bind h_step_conv
+    intro s' tr_step h_mid
     rcases h_mid with ⟨a', h_inv', h_lt⟩
     have h_sub : rank a' < r := by omega
-    exact ih (rank a') h_sub a' s' rfl h_inv'
-  exact h_gen (rank a₀) a₀ s₀ rfl h_init
+    have h_ih := ih (rank a') h_sub a' s' (tr ++ tr_step) rfl h_inv'
+    have h_post_eq : (fun tr_rest out => post (tr ++ tr_step ++ tr_rest) out) = (fun tr_rest out => post (tr ++ (tr_step ++ tr_rest)) out) := by
+      funext tr_rest out
+      rw [List.append_assoc]
+    rw [h_post_eq] at h_ih
+    exact h_ih
+  exact h_gen (rank a₀) a₀ s₀ tr₀ rfl h_init
 
 theorem runMirToBlock_eq_target
     {fuel : Nat} {body : CapturedMir} {targetBlock : BasicBlockIdx}
@@ -311,6 +318,164 @@ theorem wpTransPlanConverges
     have h_mem_eq : sThenJoin.memory = sElseJoin.memory := h_mem
     rw [h_mem_eq] at h_join
     rw [h_eq]
+    exact h_join
+
+
+theorem runMirTauToBlock_eq_target
+    {fuel : Nat} {body : CapturedMir} {targetBlock : BasicBlockIdx}
+    {s sOut : MachineState}
+    (h : runMirTauToBlock fuel body targetBlock s = some sOut) :
+    sOut.frame.blockIdx = targetBlock ∧ sOut.frame.stmtIdx = 0 := by
+  induction fuel generalizing s with
+  | zero => nomatch h
+  | succ fuel' ih =>
+    unfold runMirTauToBlock at h
+    split at h
+    · injection h with h_eq
+      subst h_eq
+      next h_cond =>
+        have h_cond_b := Bool.and_eq_true _ _ |>.mp h_cond
+        have hb2 : s.frame.blockIdx = targetBlock := Nat.eq_of_beq_eq_true h_cond_b.1
+        have hs2 : s.frame.stmtIdx = 0 := Nat.eq_of_beq_eq_true h_cond_b.2
+        exact ⟨hb2, hs2⟩
+    · cases h_step : stepMirFn body s with
+      | ret _ => simp only [h_step] at h; nomatch h
+      | vis _ _ => simp only [h_step] at h; nomatch h
+      | tau execNext =>
+        simp only [h_step] at h
+        cases execNext with
+        | running s₁ => exact ih h
+        | halted _ => nomatch h
+        | faulted _ => nomatch h
+
+theorem MirTraceStepsConverges_of_runMirToBinarySwitch
+    {fuel : Nat} {body : CapturedMir} {s : MachineState}
+    {cond : Bool} {bits : Nat} {sThen sElse : MachineState}
+    {post : List (Event MirEffect) → MirOutcome → Prop}
+    (h : runMirToBinarySwitch fuel body s = some (cond, bits, sThen, sElse)) :
+    MirTraceStepsConverges body s (fun s₁ tr => s₁ = (if cond = true then sThen else sElse) ∧ tr = [⟨.inr (.inl (.emit (.event bits))), PUnit.unit⟩]) post := by
+  induction fuel generalizing s with
+  | zero => nomatch h
+  | succ fuel' ih =>
+    unfold runMirToBinarySwitch at h
+    cases h_sw : inspectBinarySwitch body s with
+    | some res =>
+      rw [h_sw] at h
+      injection h with h_eq
+      subst h_eq
+      have h_step := stepMirFn_of_inspectBinarySwitch h_sw
+      have h_next : MirTraceStepsConverges body (if cond = true then sThen else sElse)
+        (fun s'' tr₂ =>
+          (s'' = (if cond = true then sThen else sElse)) ∧
+          [⟨.inr (.inl (.emit (.event bits))), PUnit.unit⟩] ++ tr₂ = [⟨.inr (.inl (.emit (.event bits))), PUnit.unit⟩])
+        (fun tr₂ out => post ([⟨.inr (.inl (.emit (.event bits))), PUnit.unit⟩] ++ tr₂) out) := by
+        apply MirTraceStepsConverges.refl
+        exact ⟨rfl, rfl⟩
+      exact MirTraceStepsConverges.step_emit h_step h_next
+    | none =>
+      rw [h_sw] at h
+      cases h_step : stepMirFn body s with
+      | ret _ => simp only [h_step] at h; nomatch h
+      | vis _ _ => simp only [h_step] at h; nomatch h
+      | tau execNext =>
+        simp only [h_step] at h
+        cases execNext with
+        | running s₁ =>
+          have h_ih := ih h
+          exact MirTraceStepsConverges.step_tau h_step h_ih
+        | halted _ => nomatch h
+        | faulted _ => nomatch h
+
+theorem mirTraceWpConverges_wpTransPlanConverges
+    {body : CapturedMir}
+    {s₀ sThen₀ sElse₀ sThenJoin sElseJoin : MachineState}
+    {cond : Bool}
+    {fuelThen fuelElse bits : Nat}
+    {joinBb : BasicBlockIdx}
+    {post : List (Event MirEffect) → MirOutcome → Prop}
+    (h_sw : runMirToBinarySwitch 1 body s₀ = some (cond, bits, sThen₀, sElse₀))
+    (h_then : runMirTauToBlock fuelThen body joinBb sThen₀ = some sThenJoin)
+    (h_else : runMirTauToBlock fuelElse body joinBb sElse₀ = some sElseJoin)
+    (h_len : sThenJoin.frame.locals.length = sElseJoin.frame.locals.length)
+    (h_mem : sThenJoin.memory = sElseJoin.memory)
+    (h_join : MirTraceWpConverges body
+      { frame := {
+          blockIdx := joinBb
+          stmtIdx := 0
+          locals := zipLocalSlots cond sThenJoin.frame.locals sElseJoin.frame.locals
+        }
+        memory := sThenJoin.memory }
+      (fun tr_rest out => post ([⟨.inr (.inl (.emit (.event bits))), PUnit.unit⟩] ++ tr_rest) out)) :
+    MirTraceWpConverges body s₀ post := by
+  have h_sw_conv := MirTraceStepsConverges_of_runMirToBinarySwitch (post := fun _ _ => False) h_sw
+  have h_sw_mono := MirTraceStepsConverges.mono
+    (mid₂ := fun x tr => x = (if cond = true then sThen₀ else sElse₀) ∧ tr = [⟨.inr (.inl (.emit (.event bits))), PUnit.unit⟩])
+    (post₂ := post)
+    (fun s_mid tr_mid h_mid => h_mid)
+    (fun tr_out out h_false => nomatch h_false)
+    h_sw_conv
+  apply MirTraceWpConverges.bind h_sw_mono
+  intro s' tr_sw h_mid
+  rcases h_mid with ⟨h_s', h_tr_sw⟩
+  subst h_s'
+  cases h_cond : cond with
+  | true =>
+    simp
+    have h_then_conv := MirTraceStepsConverges.of_runMirTauToBlock (post := fun tr_rest out => post (tr_sw ++ tr_rest) out) h_then
+    have h_then_mono := MirTraceStepsConverges.mono
+      (mid₂ := fun x tr => x = sThenJoin ∧ tr = [])
+      (post₂ := fun tr_rest out => post (tr_sw ++ tr_rest) out)
+      (fun s_mid tr_mid h_mid => h_mid)
+      (fun tr_out out h_post => h_post)
+      h_then_conv
+    apply MirTraceWpConverges.bind_silent h_then_mono
+    intro s_join h_join_mid
+    subst s_join
+    have h_eq : sThenJoin = ({ frame := { blockIdx := joinBb, stmtIdx := 0, locals := sThenJoin.frame.locals }, memory := sThenJoin.memory } : MachineState) := by
+      have ⟨h_blk, h_stmt⟩ := runMirTauToBlock_eq_target h_then
+      cases h_sThenJoin : sThenJoin
+      rename_i frame memory
+      cases h_frame : frame
+      rename_i blockIdx stmtIdx locals
+      subst h_sThenJoin h_frame
+      dsimp at h_blk h_stmt
+      subst h_blk h_stmt
+      rfl
+    rw [h_eq]
+    rw [h_cond] at h_join
+    rw [zipLocalSlots_eq_ite true h_len] at h_join
+    simp at h_join
+    rw [h_tr_sw]
+    exact h_join
+  | false =>
+    simp
+    have h_else_conv := MirTraceStepsConverges.of_runMirTauToBlock (post := fun tr_rest out => post (tr_sw ++ tr_rest) out) h_else
+    have h_else_mono := MirTraceStepsConverges.mono
+      (mid₂ := fun x tr => x = sElseJoin ∧ tr = [])
+      (post₂ := fun tr_rest out => post (tr_sw ++ tr_rest) out)
+      (fun s_mid tr_mid h_mid => h_mid)
+      (fun tr_out out h_post => h_post)
+      h_else_conv
+    apply MirTraceWpConverges.bind_silent h_else_mono
+    intro s_join h_join_mid
+    subst s_join
+    have h_eq : sElseJoin = ({ frame := { blockIdx := joinBb, stmtIdx := 0, locals := sElseJoin.frame.locals }, memory := sElseJoin.memory } : MachineState) := by
+      have ⟨h_blk, h_stmt⟩ := runMirTauToBlock_eq_target h_else
+      cases h_sElseJoin : sElseJoin
+      rename_i frame memory
+      cases h_frame : frame
+      rename_i blockIdx stmtIdx locals
+      subst h_sElseJoin h_frame
+      dsimp at h_blk h_stmt
+      subst h_blk h_stmt
+      rfl
+    have h_mem_eq : sThenJoin.memory = sElseJoin.memory := h_mem
+    rw [h_eq]
+    rw [h_cond] at h_join
+    rw [zipLocalSlots_eq_ite false h_len] at h_join
+    simp at h_join
+    rw [h_mem_eq] at h_join
+    rw [h_tr_sw]
     exact h_join
 
 private def defaultU32TypeLayout : TypeLayout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory, fields := .primitive, variants := .single 0, isUninhabited := false }
