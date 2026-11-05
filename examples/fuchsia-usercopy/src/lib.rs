@@ -96,7 +96,7 @@ pub fn assume_initialized_until_split_len(
 #[allow(unused_variables)]
 #[inline(never)]
 #[anneal_spec::spec(
-    requires: fault_offset <= count,
+    requires: fault_offset <= count && normal_mode_dest_valid,
     ensures: |ref ret| *ret == fault_offset && *ret <= count,
 )]
 pub unsafe fn hermetic_copy_stub(

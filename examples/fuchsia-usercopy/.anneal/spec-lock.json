@@ -174,7 +174,7 @@
       "lean_module_name": "Mir.FuchsiaUsercopy.__anodized_fn_requires_hermetic_copy_stub",
       "item_kind": "inline_spec_requires",
       "associated_subject_def_id": "fuchsia_usercopy::hermetic_copy_stub",
-      "mir_module_sha256": "6058101a3e3d36e973cb0d1e2d60624c7acaca7f92dbce71f7f4d12c1740ff23"
+      "mir_module_sha256": "27d7f5ab86470aab23bc16d550f7f1c5ce4a7435bc989f846ba58c03597e3232"
     },
     {
       "def_id": "fuchsia_usercopy::__anodized_fn_requires_parse_compare_exchange_result",
@@ -284,7 +284,7 @@
     },
     {
       "rel_path": "anneal/proofs/Specs/FuchsiaUsercopy/hermetic_copy_stub.lean",
-      "sha256": "c4e5955a1b4fa939842523d9dab92259d5320169651ed637a8b00dd7ee56731b"
+      "sha256": "44a2b979174244a9a2d571501d5107ec7c179ca79417cdd2086b2a48bb5918c4"
     },
     {
       "rel_path": "anneal/proofs/Specs/FuchsiaUsercopy/parse_compare_exchange_result.lean",

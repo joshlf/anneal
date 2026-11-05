@@ -1,0 +1,40 @@
+name = "AnnealVerification"
+defaultTargets = ["Verify", "CrateVerify"]
+
+[[lean_lib]]
+name = "Trusted"
+srcDir = "../../../trusted/lean"
+
+[[lean_lib]]
+name = "Anneal"
+srcDir = "../../../theory"
+
+[[lean_lib]]
+name = "Mir"
+srcDir = "generated"
+roots = ["Mir.Core.hint_unreachable_unchecked", "Mir.FuchsiaUsercopy.__anodized_fn_ensures_assume_initialized_until_split_len", "Mir.FuchsiaUsercopy.__anodized_fn_ensures_atomic_load_u32_unpack", "Mir.FuchsiaUsercopy.__anodized_fn_ensures_fidl_chunk_padding_len", "Mir.FuchsiaUsercopy.__anodized_fn_ensures_fidl_pointer_is_encoded_present", "Mir.FuchsiaUsercopy.__anodized_fn_ensures_hermetic_copy_bytes_copied", "Mir.FuchsiaUsercopy.__anodized_fn_ensures_hermetic_copy_stub", "Mir.FuchsiaUsercopy.__anodized_fn_ensures_parse_compare_exchange_result", "Mir.FuchsiaUsercopy.__anodized_fn_ensures_usercopy_address_in_restricted_range", "Mir.FuchsiaUsercopy.__anodized_fn_ensures_usercopy_copyin_bracketed", "Mir.FuchsiaUsercopy.__anodized_fn_qualifiers_assume_initialized_until_split_len", "Mir.FuchsiaUsercopy.__anodized_fn_qualifiers_atomic_load_u32_unpack", "Mir.FuchsiaUsercopy.__anodized_fn_qualifiers_fidl_chunk_padding_len", "Mir.FuchsiaUsercopy.__anodized_fn_qualifiers_fidl_pointer_is_encoded_present", "Mir.FuchsiaUsercopy.__anodized_fn_qualifiers_hermetic_copy_bytes_copied", "Mir.FuchsiaUsercopy.__anodized_fn_qualifiers_hermetic_copy_stub", "Mir.FuchsiaUsercopy.__anodized_fn_qualifiers_parse_compare_exchange_result", "Mir.FuchsiaUsercopy.__anodized_fn_qualifiers_usercopy_address_in_restricted_range", "Mir.FuchsiaUsercopy.__anodized_fn_qualifiers_usercopy_copyin_bracketed", "Mir.FuchsiaUsercopy.__anodized_fn_requires_assume_initialized_until_split_len", "Mir.FuchsiaUsercopy.__anodized_fn_requires_atomic_load_u32_unpack", "Mir.FuchsiaUsercopy.__anodized_fn_requires_fidl_chunk_padding_len", "Mir.FuchsiaUsercopy.__anodized_fn_requires_fidl_pointer_is_encoded_present", "Mir.FuchsiaUsercopy.__anodized_fn_requires_hermetic_copy_bytes_copied", "Mir.FuchsiaUsercopy.__anodized_fn_requires_hermetic_copy_stub", "Mir.FuchsiaUsercopy.__anodized_fn_requires_parse_compare_exchange_result", "Mir.FuchsiaUsercopy.__anodized_fn_requires_usercopy_address_in_restricted_range", "Mir.FuchsiaUsercopy.__anodized_fn_requires_usercopy_copyin_bracketed", "Mir.FuchsiaUsercopy.assume_initialized_until_split_len", "Mir.FuchsiaUsercopy.atomic_load_u32_unpack", "Mir.FuchsiaUsercopy.fidl_chunk_padding_len", "Mir.FuchsiaUsercopy.fidl_pointer_is_encoded_present", "Mir.FuchsiaUsercopy.hermetic_copy_bytes_copied", "Mir.FuchsiaUsercopy.hermetic_copy_stub", "Mir.FuchsiaUsercopy.parse_compare_exchange_result", "Mir.FuchsiaUsercopy.usercopy_address_in_restricted_range", "Mir.FuchsiaUsercopy.usercopy_copyin_bracketed"]
+
+[[lean_lib]]
+name = "Obligations"
+srcDir = "generated"
+roots = ["Obligations.FuchsiaUsercopy.assume_initialized_until_split_len", "Obligations.FuchsiaUsercopy.atomic_load_u32_unpack", "Obligations.FuchsiaUsercopy.fidl_chunk_padding_len", "Obligations.FuchsiaUsercopy.fidl_pointer_is_encoded_present", "Obligations.FuchsiaUsercopy.hermetic_copy_bytes_copied", "Obligations.FuchsiaUsercopy.hermetic_copy_stub", "Obligations.FuchsiaUsercopy.parse_compare_exchange_result", "Obligations.FuchsiaUsercopy.usercopy_address_in_restricted_range", "Obligations.FuchsiaUsercopy.usercopy_copyin_bracketed"]
+
+[[lean_lib]]
+name = "Specs"
+srcDir = "../anneal/proofs"
+roots = ["Specs.FuchsiaUsercopy.assume_initialized_until_split_len", "Specs.FuchsiaUsercopy.atomic_load_u32_unpack", "Specs.FuchsiaUsercopy.fidl_chunk_padding_len", "Specs.FuchsiaUsercopy.fidl_pointer_is_encoded_present", "Specs.FuchsiaUsercopy.hermetic_copy_bytes_copied", "Specs.FuchsiaUsercopy.hermetic_copy_stub", "Specs.FuchsiaUsercopy.parse_compare_exchange_result", "Specs.FuchsiaUsercopy.usercopy_address_in_restricted_range", "Specs.FuchsiaUsercopy.usercopy_copyin_bracketed"]
+
+[[lean_lib]]
+name = "Proof"
+srcDir = "../anneal/proofs"
+roots = ["Proof.FuchsiaUsercopy.assume_initialized_until_split_len", "Proof.FuchsiaUsercopy.atomic_load_u32_unpack", "Proof.FuchsiaUsercopy.fidl_chunk_padding_len", "Proof.FuchsiaUsercopy.fidl_pointer_is_encoded_present", "Proof.FuchsiaUsercopy.hermetic_copy_bytes_copied", "Proof.FuchsiaUsercopy.hermetic_copy_stub", "Proof.FuchsiaUsercopy.parse_compare_exchange_result", "Proof.FuchsiaUsercopy.usercopy_address_in_restricted_range", "Proof.FuchsiaUsercopy.usercopy_copyin_bracketed"]
+
+[[lean_lib]]
+name = "Verify"
+srcDir = "generated"
+roots = ["Verify.FuchsiaUsercopy.assume_initialized_until_split_len", "Verify.FuchsiaUsercopy.atomic_load_u32_unpack", "Verify.FuchsiaUsercopy.fidl_chunk_padding_len", "Verify.FuchsiaUsercopy.fidl_pointer_is_encoded_present", "Verify.FuchsiaUsercopy.hermetic_copy_bytes_copied", "Verify.FuchsiaUsercopy.hermetic_copy_stub", "Verify.FuchsiaUsercopy.parse_compare_exchange_result", "Verify.FuchsiaUsercopy.usercopy_address_in_restricted_range", "Verify.FuchsiaUsercopy.usercopy_copyin_bracketed"]
+
+[[lean_lib]]
+name = "CrateVerify"
+srcDir = "generated"
+roots = ["CrateVerify"]

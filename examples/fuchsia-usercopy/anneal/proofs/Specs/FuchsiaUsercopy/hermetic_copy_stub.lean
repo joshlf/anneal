@@ -14,7 +14,7 @@ def pre (args : List Value) (mem : Memory) : Prop :=
   ∃ (count fault_offset v : Nat),
     fault_offset ≤ count ∧
     count < 18446744073709551616 ∧
-    (v = 0 ∨ v = 1) ∧
+    v = 1 ∧
     args =
       [ .scalar { bits := count, sizeBytes := 8 }
       , .scalar { bits := fault_offset, sizeBytes := 8 }
