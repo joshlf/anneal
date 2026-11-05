@@ -2598,7 +2598,7 @@ def evalDirectRustIntrinsic?
            with
            | .none => MirStepNode.fail .ub
            | .some rtTarget =>
-             match findCallee? s.memory.callees rtTarget.defPath with
+             match lookupCallee s.memory.callees bodyLayouts rtTarget.defPath rtTarget.typeArgs s.memory.traitImpls with
              | .some calleeBody =>
                match
                  Bool.and
@@ -2626,7 +2626,7 @@ def evalDirectRustIntrinsic?
                match rtTarget.isIndirect with
                | true =>
                  MirStepNode.extCall
-                   { defPath := rtTarget.defPath, args := unpackedArgs, memory := s.memory }
+                   { defPath := rtTarget.defPath, typeArgs := rtTarget.typeArgs, args := unpackedArgs, memory := s.memory }
                    (resumeExternalCall s locals' destination targetBb unwind)
                | false =>
                  let selectArgOps := constEvalSelectTupleArgOps tupleTyOpt
@@ -2681,7 +2681,7 @@ def evalDirectRustIntrinsic?
                            | .faulted fk => MirStepNode.fail fk
                          | false =>
                            MirStepNode.extCall
-                             { defPath := rtTarget.defPath, args := unpackedArgs, memory := s.memory }
+                             { defPath := rtTarget.defPath, typeArgs := rtTarget.typeArgs, args := unpackedArgs, memory := s.memory }
                              (resumeExternalCall s locals' destination targetBb unwind)
        | _ => MirStepNode.fail .ub)
   | .some kind =>
@@ -3093,7 +3093,7 @@ def evalTerminator
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
       | .ok argVals locals' =>
-        match findCallee? s.memory.callees target.defPath with
+        match lookupCallee s.memory.callees bodyLayouts target.defPath target.typeArgs s.memory.traitImpls with
         | .some calleeBody =>
           match checkCalleeTargetCompatible target calleeBody (length argVals) with
           | false => MirStepNode.fail .ub
@@ -3146,7 +3146,7 @@ def evalTerminator
             match target.isIndirect with
             | true =>
               MirStepNode.extCall
-                { defPath := target.defPath, args := argVals, memory := s.memory }
+                { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
                 (resumeExternalCall s locals' destination targetBb unwind)
             | false =>
               match
@@ -3166,7 +3166,7 @@ def evalTerminator
               | .some stepNode => stepNode
               | .none =>
                 MirStepNode.extCall
-                  { defPath := target.defPath, args := argVals, memory := s.memory }
+                  { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
                   (resumeExternalCall s locals' destination targetBb unwind)
   -- Diverging call (`target == Option.none`, return type `!`):
   | .call func argOps destination .none unwind =>
@@ -3198,7 +3198,7 @@ def evalTerminator
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported
       | .ok argVals locals' =>
-        match findCallee? s.memory.callees target.defPath with
+        match lookupCallee s.memory.callees bodyLayouts target.defPath target.typeArgs s.memory.traitImpls with
         | .some calleeBody =>
           match checkCalleeTargetCompatible target calleeBody (length argVals) with
           | false => MirStepNode.fail .ub
@@ -3238,11 +3238,11 @@ def evalTerminator
                   | .faulted fk => MirStepNode.fail fk
                 | false =>
                   MirStepNode.extCall
-                    { defPath := target.defPath, args := argVals, memory := s.memory }
+                    { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
                     (resumeExternalDivergingCall s locals' unwind)
           | true =>
             MirStepNode.extCall
-              { defPath := target.defPath, args := argVals, memory := s.memory }
+              { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
               (resumeExternalDivergingCall s locals' unwind)
   | .tailCall func argOps =>
     evalTailCallTerminator s func argOps currentBody

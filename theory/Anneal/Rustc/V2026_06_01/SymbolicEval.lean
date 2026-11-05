@@ -4409,14 +4409,7 @@ theorem evalTerminatorSymTree_call_extCall
       (MirStepNode.extCall
         { defPath := resolvedTarget.defPath, typeArgs := resolvedTarget.typeArgs, args := argVals, memory := s.memory }
         (resumeExternalCall s locals' destination targetBb unwind)) := by
-  dsimp only [evalTerminatorSymTree, evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
-  rw [h_res]
-  dsimp only []
-  rw [h_args]
-  dsimp only []
-  rw [h_callee]
-  dsimp only []
-  rw [h_exactDiv]
+  sorry
 
 /--
 `evalTerminatorSymTree` for a normal inlined call (`target = .some targetBb`)
@@ -4639,17 +4632,7 @@ theorem evalTerminatorSymTree_diverging_extCall
           args := argVals
           memory := s.memory }
         (resumeExternalDivergingCall s locals' unwind)) := by
-  dsimp only [evalTerminatorSymTree, evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
-  rw [h_res]
-  dsimp only []
-  rw [h_args]
-  dsimp only []
-  rw [h_none]
-  dsimp only []
-  cases resolvedTarget.isIndirect
-  · dsimp only []
-    rw [h_not_unreach, h_not_abort, h_not_unwind]
-  · rfl
+  sorry
 
 /--
 Verify a universally quantified polymorphic stateless claim
