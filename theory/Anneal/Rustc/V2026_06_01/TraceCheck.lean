@@ -313,6 +313,8 @@ mutual
     | .closure d₁ u₁, .closure d₂ u₂ => (d₁ == d₂) && rigidTyListEq u₁ u₂
     | .dynamic d₁, .dynamic d₂ => d₁ == d₂
     | .foreign d₁, .foreign d₂ => d₁ == d₂
+    | .param i₁ n₁, .param i₂ n₂ => Nat.beq i₁ i₂ && (n₁ == n₂)
+    | .alias d₁ a₁, .alias d₂ a₂ => (d₁ == d₂) && rigidTyListEq a₁ a₂
     | .other s₁, .other s₂ => s₁ == s₂
     | _, _ => false
 
@@ -442,6 +444,28 @@ mutual
       cases t₂ with
       | foreign d₂ => exact congrArg RigidTy.foreign (beq_iff_eq.mp h)
       | _ => nomatch h
+    | param i₁ n₁ =>
+      cases t₂ with
+      | param i₂ n₂ =>
+        unfold rigidTyEq at h
+        revert h
+        cases hi : Nat.beq i₁ i₂ <;> cases hn : (n₁ == n₂) <;> intro h
+        · nomatch h
+        · nomatch h
+        · nomatch h
+        · rw [Nat.beq_eq.mp hi, beq_iff_eq.mp hn]
+      | _ => nomatch h
+    | alias d₁ a₁ =>
+      cases t₂ with
+      | alias d₂ a₂ =>
+        unfold rigidTyEq at h
+        revert h
+        cases hd : (d₁ == d₂) <;> cases ha : rigidTyListEq a₁ a₂ <;> intro h
+        · nomatch h
+        · nomatch h
+        · nomatch h
+        · rw [beq_iff_eq.mp hd, rigidTyListEq_sound ha]
+      | _ => nomatch h
     | other s₁ =>
       cases t₂ with
       | other s₂ => exact congrArg RigidTy.other (beq_iff_eq.mp h)
@@ -490,6 +514,8 @@ mutual
     | .closure d u => by unfold rigidTyEq; rw [beq_self_eq_true d, rigidTyListEq_refl u]; rfl
     | .dynamic d => beq_self_eq_true d
     | .foreign d => beq_self_eq_true d
+    | .param i n => by unfold rigidTyEq; rw [Nat.beq_refl i, beq_self_eq_true n]; rfl
+    | .alias d a => by unfold rigidTyEq; rw [beq_self_eq_true d, rigidTyListEq_refl a]; rfl
     | .other s => beq_self_eq_true s
 
   theorem rigidTyListEq_refl : (ts : List RigidTy) → rigidTyListEq ts ts = true
@@ -504,6 +530,9 @@ instance instReprRigidTy : Repr RigidTy where
   reprPrec _ _ := "RigidTy"
 
 deriving instance DecidableEq, Repr for Ty
+deriving instance DecidableEq, Repr for GenericParamDef
+deriving instance DecidableEq, Repr for TraitRef
+deriving instance DecidableEq, Repr for TraitImplEntry
 deriving instance DecidableEq, Repr for ConstScalar
 deriving instance DecidableEq, Repr for ConstValue
 deriving instance DecidableEq, Repr for ConstOperand
@@ -537,6 +566,7 @@ deriving instance DecidableEq, Repr for StackFrame
 deriving instance DecidableEq, Repr for TreeBorrowPerm
 deriving instance DecidableEq, Repr for BorrowEntry
 deriving instance DecidableEq, Repr for SavedCallerFrame
+deriving instance DecidableEq, Repr for FnPtrEntry
 deriving instance DecidableEq, Repr for Memory
 deriving instance DecidableEq, Repr for MachineState
 deriving instance DecidableEq, Repr for MirCallReq

@@ -672,7 +672,352 @@ structure LayoutTable : Type where
 Look up the `TypeLayout` at 0-based index `idx` in `tbl.entries`, returning
 `.none` if `idx` is out of bounds.
 -/
+@[reducible]
 def LayoutTable.lookup (tbl : LayoutTable) (idx : Nat) : Option TypeLayout :=
   Trusted.Sequence.get? tbl.entries idx
+
+/--
+Round byte offset `offset` up to the next multiple of `align` (`align_to` in
+`rustc_abi::Size`). When `align == 0`, returns `offset` unchanged.
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L901-L905>
+
+> "pub const fn align_to(self, align: Align) -> Size {
+>     let mask = align.bytes() - 1;
+>     Size::from_bytes((self.bytes() + mask) & !mask)
+> }"
+-/
+@[reducible]
+def alignUp (offset align : Nat) : Nat :=
+  match Nat.beq align 0 with
+  | true => offset
+  | false =>
+    let rem := Nat.mod offset align
+    match Nat.beq rem 0 with
+    | true => offset
+    | false => Nat.add offset (Nat.sub align rem)
+
+/--
+Maximum of two natural numbers in `Init.Core`.
+-/
+@[reducible]
+def maxNat (a b : Nat) : Nat :=
+  match Nat.ble a b with
+  | true => b
+  | false => a
+
+/--
+Structural concatenation of two `List TypeLayout` sequences in `Init.Core`.
+-/
+@[reducible]
+def appendTypeLayouts : List TypeLayout → List TypeLayout → List TypeLayout
+  | .nil, ys => ys
+  | x :: xs, ys => x :: appendTypeLayouts xs ys
+
+/--
+Identity lemma for `appendTypeLayouts` with `.nil` on the right.
+-/
+@[simp]
+theorem appendTypeLayouts_nil :
+    (xs : List TypeLayout) → appendTypeLayouts xs .nil = xs
+  | .nil => rfl
+  | x :: xs => congrArg (List.cons x) (appendTypeLayouts_nil xs)
+
+/--
+Functional point update at 0-based index `idx` in a `List TypeLayout`, leaving
+the list unchanged if `idx` is out of bounds.
+-/
+@[reducible]
+def setTypeLayoutAt : List TypeLayout → Nat → TypeLayout → List TypeLayout
+  | .nil, _, _ => .nil
+  | _ :: xs, .zero, val => val :: xs
+  | x :: xs, .succ idx, val => x :: setTypeLayoutAt xs idx val
+
+/--
+Resolve a list of `LayoutIdx` indices against `entries`, returning `.none` if
+any index is out of bounds.
+-/
+@[reducible]
+def lookupFieldLayouts (entries : List TypeLayout) :
+    List Nat → Option (List TypeLayout)
+  | .nil => .some .nil
+  | idx :: rest =>
+    match Trusted.Sequence.get? entries idx, lookupFieldLayouts entries rest with
+    | .some fl, .some fls => .some (fl :: fls)
+    | _, _ => .none
+
+/--
+Compute sequential aligned field offsets, identity memory-order indices, padded
+total byte size, maximum alignment, and uninhabitedness across a list of field
+`TypeLayout` descriptors.
+
+Reference (The Rust Reference, "Type Layout — Size and Alignment"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The size of a value is always a multiple of its alignment."
+-/
+@[reducible]
+def computeArbitraryFieldsAux :
+    Nat → Nat → Nat → List TypeLayout →
+      (List Size × List Nat × Nat × Nat × Bool)
+  | curOff, curAlign, _, .nil =>
+    (.nil, .nil, alignUp curOff curAlign, curAlign, false)
+  | curOff, curAlign, idx, fl :: rest =>
+    let fAlign := maxNat 1 fl.align.bytes
+    let alignedOff := alignUp curOff fAlign
+    let nextOff := Nat.add alignedOff fl.size.bytes
+    let nextAlign := maxNat curAlign fAlign
+    let (restOffsets, restMemIdx, finalSize, finalAlign, restUninhabited) :=
+      computeArbitraryFieldsAux nextOff nextAlign (Nat.add idx 1) rest
+    (⟨alignedOff⟩ :: restOffsets,
+     idx :: restMemIdx,
+     finalSize,
+     finalAlign,
+     Bool.or fl.isUninhabited restUninhabited)
+
+/--
+Compute the padded total byte size and maximum alignment of a `FieldsShape.union`
+across its member field layouts `fls` (where all fields overlap at byte offset
+`0`, so the union's size is `alignUp maxFieldSize maxFieldAlign`).
+
+Reference (The Rust Reference, "Unions"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html>
+
+> "The key property of unions is that all fields of a union share common
+> storage. As a result, writes to one field of a union can overwrite its other
+> fields, and size of a union is determined by the size of its largest field."
+-/
+@[reducible]
+def computeUnionSizeAndAlign :
+    Nat → Nat → List TypeLayout → (Nat × Nat)
+  | maxSz, maxAl, .nil => (alignUp maxSz maxAl, maxAl)
+  | maxSz, maxAl, fl :: rest =>
+    let fAlign := maxNat 1 fl.align.bytes
+    let nextMaxSz := maxNat maxSz fl.size.bytes
+    let nextMaxAl := maxNat maxAl fAlign
+    computeUnionSizeAndAlign nextMaxSz nextMaxAl rest
+
+/--
+Determine the `BackendRepr` of a single-variant aggregate from its total byte
+size and component field layouts.
+-/
+@[reducible]
+def computeAggregateBackendRepr
+    (totalSize : Nat) :
+    List TypeLayout → BackendRepr
+  | fl0 :: .nil =>
+    match Nat.beq totalSize 0 with
+    | true => .memory
+    | false => fl0.backendRepr
+  | fl0 :: fl1 :: .nil =>
+    match Nat.beq totalSize 0 with
+    | true => .memory
+    | false =>
+      match fl0.backendRepr, fl1.backendRepr with
+      | .scalar s0, .scalar s1 => .scalarPair s0 s1
+      | _, _ => .memory
+  | _ => .memory
+
+/--
+Compute the byte width of a `ScalarLayout` discriminant tag (`1, 2, 4, 8, 16`),
+defaulting to `1` when unspecified.
+-/
+@[reducible]
+def tagScalarByteWidth : ScalarLayout → Nat
+  | .initialized (.int bits _) _ =>
+    let b := Nat.div bits 8
+    match Nat.beq b 0 with | true => 1 | false => b
+  | .initialized (.float bits) _ =>
+    let b := Nat.div bits 8
+    match Nat.beq b 0 with | true => 1 | false => b
+  | .initialized (.pointer _) _ => 8
+  | .union (.int bits _) =>
+    let b := Nat.div bits 8
+    match Nat.beq b 0 with | true => 1 | false => b
+  | .union (.float bits) =>
+    let b := Nat.div bits 8
+    match Nat.beq b 0 with | true => 1 | false => b
+  | .union (.pointer _) => 8
+
+/--
+Recompute per-variant `FieldsShape` offsets, maximum size, and maximum alignment
+for a multi-variant enum (`VariantsShape.multiple`) given the discriminant tag's
+byte size `tagBytes` and the instantiated payload field layouts `payloadLayouts`.
+-/
+@[reducible]
+def recomputeVariantShapesAux (tagBytes : Nat) :
+    List FieldsShape → List TypeLayout → (List FieldsShape × Nat × Nat)
+  | .nil, _ => (.nil, tagBytes, tagBytes)
+  | .arbitrary .nil memIdx :: vRest, payloads =>
+    let (restShapes, maxSz, maxAl) :=
+      recomputeVariantShapesAux tagBytes vRest payloads
+    (.arbitrary .nil memIdx :: restShapes, maxSz, maxAl)
+  | .arbitrary (_ :: _) memIdx :: vRest, fl :: pRest =>
+    let fAlign := maxNat 1 fl.align.bytes
+    let payloadOff := alignUp tagBytes fAlign
+    let varEnd := Nat.add payloadOff fl.size.bytes
+    let varAlign := maxNat tagBytes fAlign
+    let nextPayloads :=
+      match pRest with
+      | .nil => fl :: .nil
+      | _ => pRest
+    let (restShapes, restMaxSz, restMaxAl) :=
+      recomputeVariantShapesAux tagBytes vRest nextPayloads
+    let newMaxAl := maxNat varAlign restMaxAl
+    let newMaxSz := alignUp (maxNat varEnd restMaxSz) newMaxAl
+    (.arbitrary (⟨payloadOff⟩ :: .nil) memIdx :: restShapes, newMaxSz, newMaxAl)
+  | vShape :: vRest, payloads =>
+    let (restShapes, maxSz, maxAl) :=
+      recomputeVariantShapesAux tagBytes vRest payloads
+    (vShape :: restShapes, maxSz, maxAl)
+
+/--
+Test whether `l` is an uninstantiated parametric placeholder slot
+(`size.bytes == 0`, `fields == .primitive`, and `isUninhabited == false`).
+Concrete zero-sized Rust types use `FieldsShape.arbitrary [] []` (unit/ZST
+structs) or `isUninhabited == true` (`!`).
+-/
+@[reducible]
+def TypeLayout.isParamPlaceholder (l : TypeLayout) : Bool :=
+  match l.fields with
+  | .primitive =>
+    Bool.and (Nat.beq l.size.bytes 0) (Bool.not l.isUninhabited)
+  | _ => false
+
+/--
+Recompute a `TypeLayout` entry whose `fieldLayouts` list references dependent
+entries in `extEntries` (such as parametric array elements, tuple/struct fields,
+or enum variant payloads). Entries with `fieldLayouts = .nil` are returned
+unchanged.
+-/
+@[reducible]
+def TypeLayout.recomputeFromFieldLayouts
+    (extEntries : List TypeLayout)
+    (l : TypeLayout) :
+    TypeLayout :=
+  match l.fieldLayouts with
+  | .nil => l
+  | fIdxs =>
+    match lookupFieldLayouts extEntries fIdxs with
+    | .none => l
+    | .some fls =>
+      match l.variants with
+      | .empty => l
+      | .single vIdx =>
+        match l.fields with
+        | .array _ count =>
+          match fls with
+          | elemFl :: _ =>
+            let eAlign := maxNat 1 elemFl.align.bytes
+            let strideBytes := alignUp elemFl.size.bytes eAlign
+            { l with
+              size := ⟨Nat.mul strideBytes count⟩
+              align := ⟨eAlign⟩
+              fields := .array ⟨strideBytes⟩ count
+              isUninhabited :=
+                Bool.and (Bool.not (Nat.beq count 0)) elemFl.isUninhabited }
+          | .nil => l
+        | .arbitrary _ _ =>
+          let (offsets', memIdx', totalSz, maxAl, uninh) :=
+            computeArbitraryFieldsAux 0 1 0 fls
+          { l with
+            size := ⟨totalSz⟩
+            align := ⟨maxAl⟩
+            backendRepr := computeAggregateBackendRepr totalSz fls
+            fields := .arbitrary offsets' memIdx'
+            variants := .single vIdx
+            isUninhabited := uninh }
+        | .union _ =>
+          let (totalSz, maxAl) := computeUnionSizeAndAlign 0 1 fls
+          { l with
+            size := ⟨totalSz⟩
+            align := ⟨maxAl⟩ }
+        | .primitive =>
+          match fls with
+          | fl0 :: .nil => { fl0 with fieldLayouts := l.fieldLayouts }
+          | _ => l
+      | .multiple tag tagField variantShapes =>
+        let tagBytes := tagScalarByteWidth tag
+        let (shapes', maxSz, maxAl) :=
+          recomputeVariantShapesAux tagBytes variantShapes fls
+        let outerFields :=
+          match l.fields with
+          | .arbitrary (_ :: _) _ => l.fields
+          | _ => .arbitrary (⟨0⟩ :: .nil) (0 :: .nil)
+        { l with
+          size := ⟨alignUp maxSz maxAl⟩
+          align := ⟨maxAl⟩
+          fields := outerFields
+          variants := .multiple tag tagField shapes' }
+
+/--
+Substitute placeholder parameter slots in `entries` with successive layouts from
+`paramLayouts` before recomputing compound layouts that depend on those slots.
+Only placeholder entries (`TypeLayout.isParamPlaceholder l = true`) advance the
+parameter index `paramIdx`, so concrete entries preceding or interleaved with
+placeholder slots are preserved without shifting parameter indices.
+-/
+@[reducible]
+def substitutePlaceholderEntries
+    (paramLayouts : List TypeLayout) :
+    Nat → List TypeLayout → List TypeLayout
+  | _, .nil => .nil
+  | paramIdx, l :: rest =>
+    match TypeLayout.isParamPlaceholder l with
+    | true =>
+      let l' :=
+        match Trusted.Sequence.get? paramLayouts paramIdx with
+        | .some pl => pl
+        | .none => l
+      l' :: substitutePlaceholderEntries paramLayouts (Nat.add paramIdx 1) rest
+    | false =>
+      l :: substitutePlaceholderEntries paramLayouts paramIdx rest
+
+/--
+Recompute all compound `TypeLayout` entries in `entries` using `extEntries`
+after parameter layouts have been substituted and appended.
+-/
+@[reducible]
+def recomputeEntriesWith
+    (extEntries : List TypeLayout) :
+    List TypeLayout → List TypeLayout
+  | .nil => .nil
+  | l :: rest =>
+    TypeLayout.recomputeFromFieldLayouts extEntries l ::
+      recomputeEntriesWith extEntries rest
+
+/--
+Instantiate a `LayoutTable` with concrete `paramLayouts` by:
+1. Substituting any parametric placeholder slots in `tbl.entries`,
+2. Appending `paramLayouts` at `tbl.entries.length + idx`, and
+3. Recomputing any compound `TypeLayout` entries whose `fieldLayouts` reference
+   parametric slots.
+-/
+@[reducible]
+def LayoutTable.appendParamLayouts
+    (tbl : LayoutTable)
+    (paramLayouts : List TypeLayout) :
+    LayoutTable :=
+  match paramLayouts with
+  | .nil => { tbl with entries := appendTypeLayouts tbl.entries .nil }
+  | _ :: _ =>
+    let substBase := substitutePlaceholderEntries paramLayouts 0 tbl.entries
+    let extEntries := appendTypeLayouts substBase paramLayouts
+    { tbl with
+      entries :=
+        appendTypeLayouts
+          (recomputeEntriesWith extEntries substBase)
+          paramLayouts }
+
+/--
+Identity theorem for `LayoutTable.appendParamLayouts` on `.nil`.
+-/
+@[simp]
+theorem LayoutTable.appendParamLayouts_nil (tbl : LayoutTable) :
+    tbl.appendParamLayouts .nil = tbl := by
+  cases tbl
+  simp [LayoutTable.appendParamLayouts, appendTypeLayouts_nil]
 
 end Trusted.Rustc.V2026_06_01.Layout

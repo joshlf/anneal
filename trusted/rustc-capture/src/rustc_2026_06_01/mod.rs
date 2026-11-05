@@ -960,4 +960,501 @@ pub fn unselected_helper(y: u32) -> u32 {
 
         let _ = fs::remove_dir_all(&temp_root);
     }
+
+    #[test]
+    fn driver_captures_generic_functions_and_trait_impls() {
+        use std::process::Command;
+
+        let temp_root = unique_temp_dir("generics-traits");
+        let capture_dir = temp_root.join("capture");
+        let out_dir = temp_root.join("out");
+        fs::create_dir_all(&capture_dir).expect("create capture dir");
+        fs::create_dir_all(&out_dir).expect("create out dir");
+
+        let src_path = temp_root.join("demo_generics.rs");
+        let sample_rust = r#"#![allow(dead_code, non_snake_case, non_upper_case_globals)]
+
+#[derive(Copy, Clone)]
+pub struct Wrapper<T>(pub T);
+
+#[derive(Copy, Clone)]
+pub struct Pair<A, B>(pub A, pub B);
+
+#[derive(Copy, Clone)]
+pub struct PairWithHeader<T> {
+    pub header: u64,
+    pub payload: T,
+}
+
+pub fn swap_pair<'a, T: Copy, U: Copy>(_tag: &'a u32, a: T, b: U) -> (U, T) {
+    (b, a)
+}
+
+pub fn wrap_array<T: Copy>(x: T) -> [T; 2] {
+    [x, x]
+}
+
+pub fn wrap_opt<T: Copy>(x: T) -> Option<T> {
+    Some(x)
+}
+
+pub fn make_header_pair<T: Copy>(header: u64, payload: T) -> PairWithHeader<T> {
+    PairWithHeader { header, payload }
+}
+
+impl<T: Copy> Pair<T, TypeA> {
+    pub fn first(self) -> T {
+        self.0
+    }
+}
+
+impl<T: Copy> Pair<T, TypeB> {
+    pub fn first(self) -> T {
+        self.0
+    }
+}
+
+impl<T: Copy> Pair<T, T> {
+    pub fn diag_first(self) -> T {
+        self.0
+    }
+}
+
+impl<T: Copy> Wrapper<T> {
+    pub fn get(self) -> T {
+        self.0
+    }
+
+    pub fn pair_with<U: Copy>(self, u: U) -> (T, U) {
+        (self.0, u)
+    }
+}
+
+impl Wrapper<u32> {
+    pub fn spec_tag(self) -> u32 {
+        self.0
+    }
+}
+
+impl Wrapper<u64> {
+    pub fn spec_tag(self) -> u32 {
+        self.0 as u32
+    }
+}
+
+pub trait MyTrait {
+    type Assoc;
+    fn method(&self) -> Self::Assoc;
+}
+
+pub struct TypeA;
+pub struct TypeB;
+
+impl MyTrait for TypeA {
+    type Assoc = u32;
+    fn method(&self) -> u32 {
+        1
+    }
+}
+
+impl MyTrait for TypeB {
+    type Assoc = u64;
+    fn method(&self) -> u64 {
+        2
+    }
+}
+
+impl<T: Copy> MyTrait for Wrapper<T> {
+    type Assoc = T;
+    fn method(&self) -> T {
+        self.0
+    }
+}
+
+pub fn normalized_assoc(a: &TypeA) -> <TypeA as MyTrait>::Assoc {
+    a.method()
+}
+
+pub fn unnormalized_assoc<T: MyTrait>(x: &T) -> <T as MyTrait>::Assoc {
+    x.method()
+}
+
+pub mod inner {
+    #[derive(Copy, Clone)]
+    pub struct GenericBox<T>(pub T);
+
+    impl<T: Copy> GenericBox<T> {
+        #[doc = "\u{200b}anneal::type_invariant=GenericBox"]
+        pub fn __anneal_type_invariant_generic_box(&self) -> bool {
+            true
+        }
+
+        pub fn unbox(self) -> T {
+            self.0
+        }
+
+        pub fn __anodized_fn_requires_unbox(self) -> bool {
+            true
+        }
+    }
+
+    impl GenericBox<u32> {
+        pub fn unbox_u32(self) -> u32 {
+            self.0
+        }
+    }
+}
+"#;
+        fs::write(&src_path, sample_rust.as_bytes()).expect("write sample rust source");
+
+        let args = vec![
+            "anneal-rustc-capture".to_owned(),
+            "rustc".to_owned(),
+            "--crate-name".to_owned(),
+            "demo_generics".to_owned(),
+            "--crate-type".to_owned(),
+            "lib".to_owned(),
+            "--edition=2024".to_owned(),
+            "--out-dir".to_owned(),
+            out_dir.to_string_lossy().into_owned(),
+            src_path.to_string_lossy().into_owned(),
+        ];
+
+        let code = run_with_args(&args, Some(capture_dir.clone()), None);
+        assert_eq!(code, 0, "expected run_with_args to succeed with exit code 0");
+
+        let crate_capture_dir = capture_dir.join("demo_generics");
+        let manifest_path = crate_capture_dir.join("UnitCaptureManifest.json");
+        let manifest_content = fs::read_to_string(&manifest_path).unwrap();
+        let manifest: crate::manifest::UnitCaptureManifest =
+            crate::manifest::UnitCaptureManifest::from_json_str(&manifest_content).unwrap();
+        assert!(manifest.compilation_succeeded);
+
+        let find_target = |def_id: &str| {
+            manifest
+                .unit_targets
+                .iter()
+                .find(|t| t.target.def_id == def_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing target {def_id}; available: {:?}",
+                        manifest
+                            .unit_targets
+                            .iter()
+                            .map(|t| &t.target.def_id)
+                            .collect::<Vec<_>>()
+                    )
+                })
+        };
+
+        // 1. Free generic function with lifetime `'a` + type params `T, U`:
+        // lifetime must be erased and type params must have dense 0-based indices 0 and 1.
+        let swap_pair = find_target("demo_generics::swap_pair");
+        assert!(swap_pair.trait_impls.is_empty());
+        let swap_lean =
+            fs::read_to_string(crate_capture_dir.join(&swap_pair.target.mir_module_path)).unwrap();
+        assert!(swap_lean.contains("typeParamCount := 2"));
+        assert!(swap_lean.contains(
+            "genericParams := (List.cons { idx := 0, name := \"T\" } (List.cons { idx := 1, name := \"U\" } List.nil))"
+        ));
+        assert!(swap_lean.contains("(RigidTy.param 0 \"T\")"));
+        assert!(swap_lean.contains("(RigidTy.param 1 \"U\")"));
+        assert!(swap_lean.contains("fieldLayouts := (List.cons 1 (List.cons 0 List.nil))"));
+
+        // 2. Generic inherent impl methods (`get` with 1 parent param, `pair_with` with 1 parent + 1 own param)
+        // and specialized inherent impl methods (`Wrapper<u32>::spec_tag` vs `Wrapper<u64>::spec_tag`).
+        let wrapper_get = find_target("demo_generics::Wrapper::<T>::get");
+        let wrapper_pair_with = find_target("demo_generics::Wrapper::<T>::pair_with");
+        let spec_u32 = find_target("demo_generics::<Wrapper<u32>>::spec_tag");
+        let spec_u64 = find_target("demo_generics::<Wrapper<u64>>::spec_tag");
+        let pair_type_a = find_target("demo_generics::<Pair<T, TypeA>>::first");
+        let pair_type_b = find_target("demo_generics::<Pair<T, TypeB>>::first");
+        let pair_diagonal = find_target("demo_generics::<Pair<T, T>>::diag_first");
+        assert_eq!(wrapper_get.lean_module_name, "Mir.DemoGenerics.Wrapper_T_get");
+        assert_eq!(
+            wrapper_pair_with.lean_module_name,
+            "Mir.DemoGenerics.Wrapper_T_pair_with"
+        );
+        assert_eq!(
+            spec_u32.lean_module_name,
+            "Mir.DemoGenerics.Wrapper_u32_spec_tag"
+        );
+        assert_eq!(
+            spec_u64.lean_module_name,
+            "Mir.DemoGenerics.Wrapper_u64_spec_tag"
+        );
+        assert_eq!(
+            pair_type_a.lean_module_name,
+            "Mir.DemoGenerics.Pair_T_TypeA_first"
+        );
+        assert_eq!(
+            pair_type_b.lean_module_name,
+            "Mir.DemoGenerics.Pair_T_TypeB_first"
+        );
+        assert_eq!(
+            pair_diagonal.lean_module_name,
+            "Mir.DemoGenerics.Pair_T_T_diag_first"
+        );
+
+        let pair_with_lean =
+            fs::read_to_string(crate_capture_dir.join(&wrapper_pair_with.target.mir_module_path))
+                .unwrap();
+        assert!(pair_with_lean.contains("typeParamCount := 2"));
+        assert!(pair_with_lean.contains(
+            "genericParams := (List.cons { idx := 0, name := \"T\" } (List.cons { idx := 1, name := \"U\" } List.nil))"
+        ));
+
+        // 3. Multiple trait impls (`TypeA`, `TypeB`, and generic `Wrapper<T>`) must have distinct
+        // canonical paths, distinct Lean module names, and populated `trait_impls`.
+        let a_method = find_target("demo_generics::<TypeA as MyTrait>::method");
+        let b_method = find_target("demo_generics::<TypeB as MyTrait>::method");
+        let w_method = find_target("demo_generics::<Wrapper<T> as MyTrait>::method");
+        assert_eq!(
+            a_method.lean_module_name,
+            "Mir.DemoGenerics.TypeA_as_MyTrait_method"
+        );
+        assert_eq!(
+            b_method.lean_module_name,
+            "Mir.DemoGenerics.TypeB_as_MyTrait_method"
+        );
+        assert_eq!(
+            w_method.lean_module_name,
+            "Mir.DemoGenerics.Wrapper_T_as_MyTrait_method"
+        );
+
+        assert_eq!(a_method.trait_impls.len(), 1);
+        assert_eq!(
+            a_method.trait_impls[0].trait_method_def_path,
+            "demo_generics::MyTrait::method"
+        );
+        assert_eq!(a_method.trait_impls[0].impl_path, a_method.target.def_id);
+        assert_eq!(
+            a_method.trait_impls[0].trait_args_lean,
+            vec!["(RigidTy.adt \"demo_generics::TypeA\" List.nil)"]
+        );
+
+        assert_eq!(b_method.trait_impls.len(), 1);
+        assert_eq!(
+            b_method.trait_impls[0].trait_method_def_path,
+            "demo_generics::MyTrait::method"
+        );
+        assert_eq!(b_method.trait_impls[0].impl_path, b_method.target.def_id);
+        assert_eq!(
+            b_method.trait_impls[0].trait_args_lean,
+            vec!["(RigidTy.adt \"demo_generics::TypeB\" List.nil)"]
+        );
+
+        assert_eq!(w_method.trait_impls.len(), 1);
+        assert_eq!(
+            w_method.trait_impls[0].trait_method_def_path,
+            "demo_generics::MyTrait::method"
+        );
+        assert_eq!(w_method.trait_impls[0].impl_path, w_method.target.def_id);
+        assert_eq!(
+            w_method.trait_impls[0].trait_args_lean,
+            vec!["(RigidTy.adt \"demo_generics::Wrapper\" (List.cons (RigidTy.param 0 \"T\") List.nil))"]
+        );
+
+        // 4. `TyKind::Alias` normalization (`<TypeA as MyTrait>::Assoc` -> `u32`) and unnormalized
+        // projection fallback (`<T as MyTrait>::Assoc` -> `RigidTy.alias "demo_generics::MyTrait::Assoc" [.param 0 "T"]`).
+        let norm_assoc = find_target("demo_generics::normalized_assoc");
+        let norm_lean =
+            fs::read_to_string(crate_capture_dir.join(&norm_assoc.target.mir_module_path)).unwrap();
+        assert!(
+            !norm_lean.contains("RigidTy.alias"),
+            "concrete associated type <TypeA as MyTrait>::Assoc must normalize to u32"
+        );
+        assert!(norm_lean.contains("(RigidTy.uint UintTy.u32)"));
+
+        let unnorm_assoc = find_target("demo_generics::unnormalized_assoc");
+        let unnorm_lean =
+            fs::read_to_string(crate_capture_dir.join(&unnorm_assoc.target.mir_module_path))
+                .unwrap();
+        assert!(unnorm_lean.contains(
+            "(RigidTy.alias \"demo_generics::MyTrait::Assoc\" (List.cons (RigidTy.param 0 \"T\") List.nil))"
+        ));
+
+        // 5. Generic type invariant and inline spec companion resolution inside `inner::GenericBox<T>`.
+        let generic_box_inv = find_target(
+            "demo_generics::inner::GenericBox::<T>::__anneal_type_invariant_generic_box",
+        );
+        assert_eq!(
+            generic_box_inv.item_kind,
+            crate::manifest::CapturedItemKind::TypeInvariant
+        );
+        assert_eq!(
+            generic_box_inv.associated_subject_def_id.as_deref(),
+            Some("demo_generics::inner::GenericBox")
+        );
+
+        let generic_box_req =
+            find_target("demo_generics::inner::GenericBox::<T>::__anodized_fn_requires_unbox");
+        assert_eq!(
+            generic_box_req.item_kind,
+            crate::manifest::CapturedItemKind::InlineSpecRequires
+        );
+        assert_eq!(
+            generic_box_req.associated_subject_def_id.as_deref(),
+            Some("demo_generics::inner::GenericBox::<T>::unbox")
+        );
+
+        // 5. End-to-end Lean 4 kernel typechecking of emitted polymorphic modules and
+        // `CapturedMir.instantiate` reduction theorems.
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root");
+        let examples_dir = repo_root.join("examples");
+        let lean_lib_dir = examples_dir.join(".lake/build/lib/lean");
+        let resolve_bin = |name: &str| -> PathBuf {
+            if let Ok(home) = std::env::var("HOME") {
+                let elan_bin = PathBuf::from(home).join(".elan/bin").join(name);
+                if elan_bin.exists() {
+                    return elan_bin;
+                }
+            }
+            PathBuf::from(name)
+        };
+        if !lean_lib_dir.join("Trusted.olean").exists() {
+            let status = Command::new(resolve_bin("lake"))
+                .args(["--dir", examples_dir.to_str().unwrap(), "build", "Trusted"])
+                .status()
+                .expect("invoke lake build Trusted");
+            assert!(status.success(), "lake build Trusted must succeed");
+        }
+
+        let lean_bin = resolve_bin("lean");
+        let lean_path_env = format!(
+            "{}:{}",
+            lean_lib_dir.display(),
+            crate_capture_dir.display()
+        );
+        let verified_modules = [
+            "Mir/DemoGenerics/swap_pair.lean",
+            "Mir/DemoGenerics/wrap_array.lean",
+            "Mir/DemoGenerics/wrap_opt.lean",
+            "Mir/DemoGenerics/make_header_pair.lean",
+            "Mir/DemoGenerics/Wrapper_T_pair_with.lean",
+            "Mir/DemoGenerics/Wrapper_T_as_MyTrait_method.lean",
+            "Mir/DemoGenerics/unnormalized_assoc.lean",
+        ];
+        for rel_path in verified_modules {
+            let src_lean = crate_capture_dir.join(rel_path);
+            let dst_olean = src_lean.with_extension("olean");
+            let out = Command::new(&lean_bin)
+                .current_dir(&crate_capture_dir)
+                .env("LEAN_PATH", &lean_path_env)
+                .arg("-R")
+                .arg(&crate_capture_dir)
+                .arg("-o")
+                .arg(&dst_olean)
+                .arg(&src_lean)
+                .output()
+                .expect("compile emitted Mir module with lean");
+            assert!(
+                out.status.success(),
+                "lean failed on {}:\nstdout: {}\nstderr: {}",
+                src_lean.display(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let verify_lean_path = crate_capture_dir.join("VerifyPolymorphicCapture.lean");
+        let verify_lean_src = r#"import Trusted
+import Mir.DemoGenerics.swap_pair
+import Mir.DemoGenerics.wrap_array
+import Mir.DemoGenerics.wrap_opt
+import Mir.DemoGenerics.make_header_pair
+import Mir.DemoGenerics.Wrapper_T_pair_with
+import Mir.DemoGenerics.Wrapper_T_as_MyTrait_method
+import Mir.DemoGenerics.unnormalized_assoc
+
+open Trusted.Sequence
+open Trusted.Rustc.V2026_06_01.Layout
+open Trusted.Rustc.V2026_06_01.MirAst
+
+def u32Layout : TypeLayout :=
+  { size := { bytes := 4 }
+    align := { bytes := 4 }
+    backendRepr := .scalar (.initialized (.int 32 false) { start := 0, end_ := 4294967295 })
+    fields := .primitive
+    variants := .single 0
+    isUninhabited := false }
+
+def u64Layout : TypeLayout :=
+  { size := { bytes := 8 }
+    align := { bytes := 8 }
+    backendRepr := .scalar (.initialized (.int 64 false) { start := 0, end_ := 18446744073709551615 })
+    fields := .primitive
+    variants := .single 0
+    isUninhabited := false }
+
+def substU32U64 : TypeSubst :=
+  [(.uint .u32, u32Layout), (.uint .u64, u64Layout)]
+
+def substU32 : TypeSubst :=
+  [(.uint .u32, u32Layout)]
+
+-- 1. Well-formedness preservation and parameter count reduction under instantiation
+example : (Mir.DemoGenerics.swap_pair.body.instantiate substU32U64).wellFormed =
+    Mir.DemoGenerics.swap_pair.body.wellFormed := rfl
+example : (Mir.DemoGenerics.swap_pair.body.instantiate substU32U64).typeParamCount = 0 := rfl
+example : (Mir.DemoGenerics.swap_pair.body.instantiate substU32U64).genericParams = [] := rfl
+
+-- 2. Return local `_0 : (U, T)` of `swap_pair` instantiates to `(u64, u32)` with size 16, align 8
+example :
+    ((get? (Mir.DemoGenerics.swap_pair.body.instantiate substU32U64).localDecls 0).map (fun d => d.ty.kind)) =
+      .some (.tuple [.uint .u64, .uint .u32]) := rfl
+example :
+    (Mir.DemoGenerics.swap_pair.body.instantiate substU32U64).fnAbi.ret.layout.size = { bytes := 16 } := rfl
+example :
+    (Mir.DemoGenerics.swap_pair.body.instantiate substU32U64).fnAbi.ret.layout.align = { bytes := 8 } := rfl
+
+-- 3. `Wrapper<T>::pair_with<U>` instantiates both parent param `T` (idx 0) and method param `U` (idx 1)
+example :
+    ((get? (Mir.DemoGenerics.Wrapper_T_pair_with.body.instantiate substU32U64).localDecls 0).map (fun d => d.ty.kind)) =
+      .some (.tuple [.uint .u32, .uint .u64]) := rfl
+example :
+    ((get? (Mir.DemoGenerics.Wrapper_T_pair_with.body.instantiate substU32U64).localDecls 1).map (fun d => d.ty.kind)) =
+      .some (.adt "demo_generics::Wrapper" [.uint .u32]) := rfl
+
+-- 4. `wrap_array<T>`, `wrap_opt<T>`, and `make_header_pair<T>` recompute `[u32; 2]` (8B, align 4),
+--    `Option<u32>` (8B, align 4), and `PairWithHeader<u32>` (16B, align 8)
+example :
+    (Mir.DemoGenerics.wrap_array.body.instantiate substU32).fnAbi.ret.layout.size = { bytes := 8 } := rfl
+example :
+    (Mir.DemoGenerics.wrap_array.body.instantiate substU32).fnAbi.ret.layout.align = { bytes := 4 } := rfl
+example :
+    (Mir.DemoGenerics.wrap_opt.body.instantiate substU32).fnAbi.ret.layout.size = { bytes := 8 } := rfl
+example :
+    (Mir.DemoGenerics.wrap_opt.body.instantiate substU32).fnAbi.ret.layout.align = { bytes := 4 } := rfl
+example :
+    (Mir.DemoGenerics.make_header_pair.body.instantiate substU32).fnAbi.ret.layout.size = { bytes := 16 } := rfl
+example :
+    (Mir.DemoGenerics.make_header_pair.body.instantiate substU32).fnAbi.ret.layout.align = { bytes := 8 } := rfl
+
+-- 5. Generic trait impl `<Wrapper<T> as MyTrait>::method` instantiates `traitImpls`
+example :
+    (Mir.DemoGenerics.Wrapper_T_as_MyTrait_method.body.instantiate substU32).traitImpls =
+      [{ traitRef :=
+           { defPath := "demo_generics::MyTrait::method"
+             args := [.adt "demo_generics::Wrapper" [.uint .u32]] }
+         implPath := "demo_generics::<Wrapper<T> as MyTrait>::method" }] := rfl
+"#;
+        fs::write(&verify_lean_path, verify_lean_src.as_bytes()).expect("write VerifyPolymorphicCapture.lean");
+        let verify_out = Command::new(&lean_bin)
+            .env("LEAN_PATH", &lean_path_env)
+            .arg(&verify_lean_path)
+            .output()
+            .expect("run lean kernel verification on instantiated polymorphic MIR");
+        assert!(
+            verify_out.status.success(),
+            "Lean kernel verification failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&verify_out.stdout),
+            String::from_utf8_lossy(&verify_out.stderr)
+        );
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
 }

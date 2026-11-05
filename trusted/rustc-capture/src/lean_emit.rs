@@ -266,6 +266,8 @@ pub enum IrRigidTy {
     Dynamic(String),
     Foreign(String),
     Other(String),
+    Param { index: u32, name: String },
+    Alias { def_path: String, args: Vec<IrRigidTy> },
 }
 
 /// Paired structural type and index into `IrLayoutTable::entries`,
@@ -707,6 +709,28 @@ pub struct IrCapturedAllocation {
     pub mutability: IrMutability,
 }
 
+/// Generic parameter definition corresponding to
+/// `Trusted.Rustc.V2026_06_01.MirAst.GenericParamDef`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrGenericParamDef {
+    pub index: u32,
+    pub name: String,
+}
+
+/// Trait ref corresponding to `Trusted.Rustc.V2026_06_01.MirAst.TraitRef`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrTraitRef {
+    pub def_path: String,
+    pub args: Vec<IrRigidTy>,
+}
+
+/// Trait impl entry corresponding to `Trusted.Rustc.V2026_06_01.MirAst.TraitImplEntry`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrTraitImplEntry {
+    pub trait_ref: IrTraitRef,
+    pub impl_path: String,
+}
+
 /// Complete captured MIR body, ABI, layout table, and constant allocations
 /// emitted as `def body : CapturedMir` in `Mir/<Item>.lean`, corresponding to
 /// `Trusted.Rustc.V2026_06_01.MirAst.CapturedMir`.
@@ -718,6 +742,12 @@ pub struct IrCapturedMir {
     pub phase: IrMirPhaseTag,
     /// Role of this item (subject vs. contract companion).
     pub role: IrContractRole,
+    /// Number of type parameters.
+    pub type_param_count: usize,
+    /// Generic parameters.
+    pub generic_params: Vec<IrGenericParamDef>,
+    /// Trait implementation entries.
+    pub trait_impls: Vec<IrTraitImplEntry>,
     /// Number of incoming function arguments (`_1 .. _arg_count`).
     pub arg_count: usize,
     /// Local variable declarations indexed by `LocalId` (`0` is return place).
@@ -1220,7 +1250,7 @@ fn render_safety(s: IrSafety) -> &'static str {
     }
 }
 
-fn render_rigid_ty(r: &IrRigidTy) -> String {
+pub fn render_rigid_ty_pub(r: &IrRigidTy) -> String {
     match r {
         IrRigidTy::Bool => String::from("RigidTy.bool"),
         IrRigidTy::Char => String::from("RigidTy.char"),
@@ -1229,45 +1259,55 @@ fn render_rigid_ty(r: &IrRigidTy) -> String {
         IrRigidTy::Float(f) => format!("(RigidTy.float {})", render_float_ty(*f)),
         IrRigidTy::Never => String::from("RigidTy.never"),
         IrRigidTy::Str => String::from("RigidTy.str"),
-        IrRigidTy::Tuple(elems) => format!("(RigidTy.tuple {})", render_list(elems, render_rigid_ty)),
+        IrRigidTy::Tuple(elems) => format!("(RigidTy.tuple {})", render_list(elems, render_rigid_ty_pub)),
         IrRigidTy::Array(elem, len) => {
-            format!("(RigidTy.array {} {len})", render_rigid_ty(elem))
+            format!("(RigidTy.array {} {len})", render_rigid_ty_pub(elem))
         }
-        IrRigidTy::Slice(elem) => format!("(RigidTy.slice {})", render_rigid_ty(elem)),
+        IrRigidTy::Slice(elem) => format!("(RigidTy.slice {})", render_rigid_ty_pub(elem)),
         IrRigidTy::Ref(m, pointee) => format!(
             "(RigidTy.ref {} {})",
             render_mutability(*m),
-            render_rigid_ty(pointee)
+            render_rigid_ty_pub(pointee)
         ),
         IrRigidTy::RawPtr(m, pointee) => format!(
             "(RigidTy.rawPtr {} {})",
             render_mutability(*m),
-            render_rigid_ty(pointee)
+            render_rigid_ty_pub(pointee)
         ),
         IrRigidTy::Adt(path, args) => format!(
             "(RigidTy.adt {} {})",
             render_lean_str(path),
-            render_list(args, render_rigid_ty)
+            render_list(args, render_rigid_ty_pub)
         ),
         IrRigidTy::FnDef(path, args) => format!(
             "(RigidTy.fnDef {} {})",
             render_lean_str(path),
-            render_list(args, render_rigid_ty)
+            render_list(args, render_rigid_ty_pub)
         ),
         IrRigidTy::FnPtr(inputs, output, safety, conv) => format!(
             "(RigidTy.fnPtr {} {} {} {})",
-            render_list(inputs, render_rigid_ty),
-            render_rigid_ty(output),
+            render_list(inputs, render_rigid_ty_pub),
+            render_rigid_ty_pub(output),
             render_safety(*safety),
             render_call_conv(conv)
         ),
         IrRigidTy::Closure(path, upvars) => format!(
             "(RigidTy.closure {} {})",
             render_lean_str(path),
-            render_list(upvars, render_rigid_ty)
+            render_list(upvars, render_rigid_ty_pub)
         ),
         IrRigidTy::Dynamic(path) => format!("(RigidTy.dynamic {})", render_lean_str(path)),
         IrRigidTy::Foreign(path) => format!("(RigidTy.foreign {})", render_lean_str(path)),
+        IrRigidTy::Param { index, name } => format!(
+            "(RigidTy.param {} {})",
+            index,
+            render_lean_str(name)
+        ),
+        IrRigidTy::Alias { def_path, args } => format!(
+            "(RigidTy.alias {} {})",
+            render_lean_str(def_path),
+            render_list(args, render_rigid_ty_pub)
+        ),
         IrRigidTy::Other(desc) => format!("(RigidTy.other {})", render_lean_str(desc)),
     }
 }
@@ -1275,7 +1315,7 @@ fn render_rigid_ty(r: &IrRigidTy) -> String {
 fn render_ty(ty: &IrTy) -> String {
     format!(
         "{{ kind := {}, layoutIdx := {} }}",
-        render_rigid_ty(&ty.kind),
+        render_rigid_ty_pub(&ty.kind),
         ty.layout_idx
     )
 }
@@ -1764,28 +1804,48 @@ fn render_captured_allocation(alloc: &IrCapturedAllocation) -> String {
     )
 }
 
-fn render_captured_mir(mir: &IrCapturedMir) -> String {
+fn render_generic_param_def(p: &IrGenericParamDef) -> String {
+    format!("{{ idx := {}, name := {} }}", p.index, render_lean_str(&p.name))
+}
+
+fn render_trait_ref(t: &IrTraitRef) -> String {
     format!(
-        "{{\n    \
-         defPath := {},\n    \
-         phase := {},\n    \
-         role := {},\n    \
-         argCount := {},\n    \
-         localDecls := {},\n    \
-         basicBlocks := {},\n    \
-         fnAbi := {},\n    \
-         layouts := layouts,\n    \
-         allocations := {}\n  \
-         }}",
-        render_lean_str(&mir.def_path),
-        render_mir_phase_tag(&mir.phase),
-        render_contract_role(&mir.role),
-        mir.arg_count,
-        render_list(&mir.local_decls, render_local_decl),
-        render_list(&mir.basic_blocks, render_basic_block_data),
-        render_fn_abi(&mir.fn_abi),
-        render_list(&mir.allocations, render_captured_allocation)
+        "{{ defPath := {}, args := {} }}",
+        render_lean_str(&t.def_path),
+        render_list(&t.args, render_rigid_ty_pub)
     )
+}
+
+fn render_trait_impl_entry(e: &IrTraitImplEntry) -> String {
+    format!(
+        "{{ traitRef := {}, implPath := {} }}",
+        render_trait_ref(&e.trait_ref),
+        render_lean_str(&e.impl_path)
+    )
+}
+
+fn render_captured_mir(mir: &IrCapturedMir) -> String {
+    let mut out = String::from("{\n");
+    out.push_str(&format!("    defPath := {},\n", render_lean_str(&mir.def_path)));
+    out.push_str(&format!("    phase := {},\n", render_mir_phase_tag(&mir.phase)));
+    out.push_str(&format!("    role := {},\n", render_contract_role(&mir.role)));
+    if mir.type_param_count > 0 {
+        out.push_str(&format!("    typeParamCount := {},\n", mir.type_param_count));
+    }
+    if !mir.generic_params.is_empty() {
+        out.push_str(&format!("    genericParams := {},\n", render_list(&mir.generic_params, render_generic_param_def)));
+    }
+    if !mir.trait_impls.is_empty() {
+        out.push_str(&format!("    traitImpls := {},\n", render_list(&mir.trait_impls, render_trait_impl_entry)));
+    }
+    out.push_str(&format!("    argCount := {},\n", mir.arg_count));
+    out.push_str(&format!("    localDecls := {},\n", render_list(&mir.local_decls, render_local_decl)));
+    out.push_str(&format!("    basicBlocks := {},\n", render_list(&mir.basic_blocks, render_basic_block_data)));
+    out.push_str(&format!("    fnAbi := {},\n", render_fn_abi(&mir.fn_abi)));
+    out.push_str("    layouts := layouts,\n");
+    out.push_str(&format!("    allocations := {}\n", render_list(&mir.allocations, render_captured_allocation)));
+    out.push_str("  }");
+    out
 }
 
 #[cfg(test)]
@@ -1819,7 +1879,7 @@ mod tests {
         let mir = IrCapturedMir {
             def_path: String::from("demo::answer"),
             phase: IrMirPhaseTag::RuntimeOptimized,
-            role: IrContractRole::Subject,
+            role: IrContractRole::Subject, type_param_count: 0, generic_params: vec![], trait_impls: vec![],
             arg_count: 0,
             local_decls: vec![IrLocalDecl {
                 mutability: IrMutability::Mut,
@@ -1878,5 +1938,111 @@ mod tests {
             "def defaultClaim : Claim :=\n  { body := body, pre := fun _ => True, post := fun _ _ => True }"
         ));
         assert!(code.ends_with("end Mir.Demo.answer\n"));
+    }
+
+    #[test]
+    fn emit_polymorphic_module_with_trait_impl_and_alias() {
+        let param_placeholder = IrTypeLayout {
+            size: IrSize { bytes: 0 },
+            align: IrAlign { bytes: 1 },
+            backend_repr: IrBackendRepr::Memory,
+            fields: IrFieldsShape::Primitive,
+            variants: IrVariantsShape::Single { index: 0 },
+            is_uninhabited: false,
+            field_layouts: vec![],
+        };
+        let tuple_layout = IrTypeLayout {
+            size: IrSize { bytes: 0 },
+            align: IrAlign { bytes: 1 },
+            backend_repr: IrBackendRepr::Memory,
+            fields: IrFieldsShape::Arbitrary {
+                offsets: vec![IrSize { bytes: 0 }, IrSize { bytes: 0 }],
+                memory_index: vec![0, 1],
+            },
+            variants: IrVariantsShape::Single { index: 0 },
+            is_uninhabited: false,
+            field_layouts: vec![0, 0],
+        };
+        let param_ty = IrTy {
+            kind: IrRigidTy::Param {
+                index: 0,
+                name: String::from("T"),
+            },
+            layout_idx: 0,
+        };
+        let alias_ty = IrTy {
+            kind: IrRigidTy::Alias {
+                def_path: String::from("demo::MyTrait::Assoc"),
+                args: vec![param_ty.kind.clone()],
+            },
+            layout_idx: 1,
+        };
+        let mir = IrCapturedMir {
+            def_path: String::from("demo::<Wrapper<T> as MyTrait>::method"),
+            phase: IrMirPhaseTag::RuntimeOptimized,
+            role: IrContractRole::Subject,
+            type_param_count: 1,
+            generic_params: vec![IrGenericParamDef {
+                index: 0,
+                name: String::from("T"),
+            }],
+            trait_impls: vec![IrTraitImplEntry {
+                trait_ref: IrTraitRef {
+                    def_path: String::from("demo::MyTrait::method"),
+                    args: vec![IrRigidTy::Adt(
+                        String::from("demo::Wrapper"),
+                        vec![param_ty.kind.clone()],
+                    )],
+                },
+                impl_path: String::from("demo::<Wrapper<T> as MyTrait>::method"),
+            }],
+            arg_count: 1,
+            local_decls: vec![
+                IrLocalDecl {
+                    mutability: IrMutability::Mut,
+                    ty: alias_ty,
+                    debug_name: None,
+                },
+                IrLocalDecl {
+                    mutability: IrMutability::Not,
+                    ty: param_ty,
+                    debug_name: Some(String::from("x")),
+                },
+            ],
+            basic_blocks: vec![IrBasicBlockData {
+                statements: vec![],
+                terminator: IrTerminator {
+                    kind: IrTerminatorKind::Return,
+                    span: String::from("<dummy>"),
+                    comment: None,
+                },
+                is_cleanup: false,
+            }],
+            fn_abi: IrFnAbi {
+                args: vec![IrArgAbi {
+                    layout: param_placeholder.clone(),
+                    mode: IrAbiPassMode::Direct,
+                }],
+                ret: IrArgAbi {
+                    layout: tuple_layout.clone(),
+                    mode: IrAbiPassMode::Direct,
+                },
+                conv: IrCallConv::Rust,
+                can_unwind: false,
+            },
+            layouts: IrLayoutTable {
+                pointer_bits: 64,
+                is_little_endian: true,
+                entries: vec![param_placeholder, tuple_layout],
+            },
+            allocations: vec![],
+        };
+
+        let code = emit_mir_lean_module("Mir.Demo.Wrapper_T_as_MyTrait_method", &mir);
+        assert!(code.contains("typeParamCount := 1"));
+        assert!(code.contains("genericParams := (List.cons { idx := 0, name := \"T\" } List.nil)"));
+        assert!(code.contains("traitImpls := (List.cons { traitRef := { defPath := \"demo::MyTrait::method\", args := (List.cons (RigidTy.adt \"demo::Wrapper\" (List.cons (RigidTy.param 0 \"T\") List.nil)) List.nil) }, implPath := \"demo::<Wrapper<T> as MyTrait>::method\" } List.nil)"));
+        assert!(code.contains("(RigidTy.alias \"demo::MyTrait::Assoc\" (List.cons (RigidTy.param 0 \"T\") List.nil))"));
+        assert!(code.contains("fieldLayouts := (List.cons 0 (List.cons 0 List.nil))"));
     }
 }
