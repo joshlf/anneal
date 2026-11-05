@@ -46,7 +46,12 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   encodeUnionFieldsWith
   decodeFieldsAtOffsetsWith decodeFieldsBySpan decodeSeqFieldsWith
   defaultCodecFuel encodeValueToBytes decodeValueFromBytes lookupBorrow
-  updateBorrowPerm invalidateConflictingBorrows lookupGlobalAlloc
+  updateBorrowPerm invalidateConflictingBorrows
+  isBorrowDescendantOrSelfAux isBorrowDescendantOrSelf
+  resolveTreeBorrowWriterTag updateBorrowPermTreeAtProj
+  invalidateTreeBorrowsAtProj updateBorrowPermOnReadAtProj
+  freezeTreeBorrowsOnReadAtProj freezeDerefReadBorrowsAt
+  hasProtectedTreeWriteConflict lookupGlobalAlloc
   readLittleEndianBytes readGlobalScalar tyScalarBytes evalConstValue
   dropValues takeValues extractSubslice readProjectedValue
   setOrExtendFields writeProjectedValue

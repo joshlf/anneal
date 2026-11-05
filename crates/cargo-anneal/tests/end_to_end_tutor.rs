@@ -374,6 +374,7 @@ end Proof.FrameTutor.pin_magic
         item_filter: None,
         allow_impl_edit: None,
         filter: None,
+        out_dir: None,
         extra_cargo_args: Vec::new(),
     };
 

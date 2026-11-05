@@ -1,13 +1,108 @@
-//! Milestone 4: Miri-strength structure-aware `syn` AST mutators tracking initialized
-//! locals and types (`ArithmeticCastMutator`, `PlaceProjectionWrapper`,
-//! `RawPtrOffsetMutator`, `TreeBorrowsRetagInterleaver`, `BitValidityTransmuteMutator`)
-//! plus deterministic batch generation via [`generate_miri_batch`].
+// Copyright 2026 The Fuchsia Authors
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0>, the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, or the BSD-2-Clause
+// license <LICENSE-BSD or https://opensource.org/license/bsd-2-clause>, at your
+// option. This file may not be copied, modified, or distributed except
+// according to those terms.
+
+//! Structure-aware `syn` AST mutators for Miri differential testing.
+//!
+//! Seeds are closed, zero-argument functions from `tests/miri-diff/corpus`
+//! that use primitive operators, casts, projections, raw pointers, and core
+//! intrinsics rather than standard-library method calls. The mutators
+//! (`ArithmeticCastMutator`, `PlaceProjectionWrapper`, `RawPtrOffsetMutator`,
+//! `TreeBorrowsRetagInterleaver`, and `BitValidityTransmuteMutator`) produce
+//! closed zero-argument mutants suitable for direct execution by both Miri and
+//! Anneal's MIR-in-Lean oracle (`cargo_anneal::run_difftest_oracle_pipeline`).
 
 use quote::{ToTokens, format_ident};
 use syn::visit_mut::VisitMut;
-use syn::{BinOp, Block, Expr, File, Item, ItemFn, Local, Pat, Stmt, Type};
+use syn::{BinOp, Block, Expr, File, FnArg, Item, ItemFn, Lit, Local, Pat, ReturnType, Stmt, Type};
 
-/// Metadata captured for an initialized local variable discovered inside a function body.
+/// Raw source of `tests/miri-diff/corpus/src/lib.rs` embedded at compile time.
+pub const RAW_MIRI_DIFF_CORPUS_RS: &str =
+    include_str!("../../../tests/miri-diff/corpus/src/lib.rs");
+
+/// Crate-level header attributes required to compile closed Miri differential
+/// candidates standalone (`#![no_std]` and `#![feature(core_intrinsics)]`).
+pub const MIRI_CORPUS_CRATE_HEADER: &str = "\
+#![no_std]
+#![allow(
+    dead_code,
+    arithmetic_overflow,
+    unconditional_panic,
+    invalid_value,
+    invalid_reference_casting,
+    unnecessary_transmutes,
+    dangling_pointers_from_locals,
+    deref_nullptr,
+    internal_features,
+    non_snake_case,
+    unused_imports,
+    unused_parens,
+    unused_variables,
+    unused_assignments,
+    unused_mut,
+    unreachable_code
+)]
+#![feature(core_intrinsics)]
+";
+
+/// Shared module-level imports and helper types from `tests/miri-diff/corpus`
+/// that candidates may reference without crate-level `#![...]` attributes.
+pub const MIRI_CORPUS_MODULE_PREAMBLE: &str = "\
+use core::cell::UnsafeCell;
+use core::intrinsics::{
+    assume, copy_nonoverlapping, exact_div, offset, unchecked_add, unchecked_div, unchecked_mul,
+    unchecked_rem, unchecked_shl, unchecked_shr, unchecked_sub, unreachable,
+};
+use core::mem::transmute;
+
+#[repr(C)]
+union Uninit<T: Copy> {
+    uninit: (),
+    value: T,
+}
+
+#[repr(C)]
+pub struct PairU32 {
+    pub a: u32,
+    pub b: u32,
+}
+
+#[repr(C)]
+pub struct PaddedU8U32 {
+    pub tag: u8,
+    pub word: u32,
+}
+
+#[repr(u8)]
+pub enum ColorTag {
+    Red = 0,
+    Green = 1,
+    Blue = 2,
+}
+
+#[inline(never)]
+pub fn helper_add_ten() -> u32 {
+    10
+}
+";
+
+/// A single closed, zero-argument seed function extracted from
+/// `tests/miri-diff/corpus/src/lib.rs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MiriCorpusSeed {
+    /// Original function identifier in `tests/miri-diff/corpus/src/lib.rs`.
+    pub name: String,
+    /// Pretty-printed source of the `pub fn` item alone.
+    pub fn_source: String,
+}
+
+/// Metadata captured for an initialized local variable discovered inside a
+/// function body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackedLocal {
     pub name: String,
@@ -15,21 +110,54 @@ pub struct TrackedLocal {
     pub is_mut: bool,
 }
 
-/// Output candidate produced by [`generate_miri_batch`].
+/// Output candidate produced by [`generate_miri_batch`],
+/// [`generate_miri_corpus_batch`], or [`generate_miri_identity_batch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedMiriCandidate {
     /// Zero-based index within the generated batch.
     pub id: usize,
     /// Index of the seed program from `seeds` that this candidate mutated.
     pub seed_index: usize,
+    /// Name of the seed function from which this candidate was derived.
+    pub seed_name: String,
+    /// Public zero-argument function name of this candidate.
+    pub fn_name: String,
     /// Per-candidate deterministic PRNG seed derived from the batch `seed_u64`.
     pub seed_u64: u64,
     /// Ordered list of Miri AST mutator names applied to produce this candidate.
     pub applied_mutators: Vec<String>,
-    /// Snapshot of initialized `(local_name, inferred_or_declared_type)` bindings tracked.
+    /// Snapshot of initialized `(local_name, inferred_or_declared_type)` bindings.
     pub tracked_locals: Vec<(String, String)>,
-    /// Pretty-printed, syntactically valid Rust source code.
+    /// Source of the mutated `pub fn` item alone (without preamble), used when
+    /// assembling a multi-candidate crate for the oracle pipeline.
+    pub fn_source: String,
+    /// Complete standalone Rust source (`MIRI_CORPUS_CRATE_HEADER` +
+    /// `MIRI_CORPUS_MODULE_PREAMBLE` + `fn_source`), compilable on its own and
+    /// usable directly as `repro.rs`.
     pub source: String,
+}
+
+impl GeneratedMiriCandidate {
+    /// Return module-scoped source (`MIRI_CORPUS_MODULE_PREAMBLE` + `fn_source`)
+    /// without crate-level `#![...]` attributes so multiple candidates can be
+    /// wrapped in `pub mod bX_cY { ... }` within one combined compilation check.
+    pub fn module_body_source(&self) -> String {
+        format!("{MIRI_CORPUS_MODULE_PREAMBLE}\n{}\n", self.fn_source)
+    }
+}
+
+/// Target semantic regime for a mutation pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationMode {
+    /// Perturb the seed AST in place and fold a live probe into the return path.
+    Pass,
+    /// Perturb or append a checked operation that panics after the seed body runs.
+    Panic,
+    /// Perturb or append an unsafe operation that triggers UB after the seed body runs.
+    Ub,
+    /// Perturb existing AST literals, operators, casts, indices, offsets,
+    /// aliasing statement order, or transmutes in place.
+    PerturbAst,
 }
 
 /// Deterministic SplitMix64 PRNG used to drive reproducible AST mutations.
@@ -69,14 +197,52 @@ impl DetRng {
     }
 }
 
-/// Extracts initialized local bindings and their annotated/inferred scalar types from a
-/// function signature and body block.
+/// Extract the 77 closed zero-argument test functions from
+/// `tests/miri-diff/corpus/src/lib.rs` (excluding `helper_add_ten`).
+pub fn load_miri_diff_corpus_seeds() -> Vec<MiriCorpusSeed> {
+    extract_closed_corpus_seeds(RAW_MIRI_DIFF_CORPUS_RS)
+}
+
+/// Parse `corpus_source` and extract all zero-argument `pub fn` items other
+/// than `helper_add_ten`.
+pub fn extract_closed_corpus_seeds(corpus_source: &str) -> Vec<MiriCorpusSeed> {
+    let parsed = syn::parse_file(corpus_source)
+        .expect("tests/miri-diff/corpus/src/lib.rs must parse as valid Rust");
+    let mut seeds = Vec::new();
+    for item in parsed.items {
+        if let Item::Fn(func) = item {
+            let name = func.sig.ident.to_string();
+            if name == "helper_add_ten" || !func.sig.inputs.is_empty() {
+                continue;
+            }
+            let single_file = File {
+                shebang: None,
+                attrs: Vec::new(),
+                items: vec![Item::Fn(func)],
+            };
+            let fn_source = prettyplease::unparse(&single_file);
+            seeds.push(MiriCorpusSeed { name, fn_source });
+        }
+    }
+    seeds
+}
+
+/// Build the complete standalone `#![no_std]` crate source for a single
+/// candidate function body.
+pub fn build_standalone_candidate_source(fn_source: &str) -> String {
+    format!(
+        "{MIRI_CORPUS_CRATE_HEADER}\n{MIRI_CORPUS_MODULE_PREAMBLE}\n{}\n",
+        fn_source.trim()
+    )
+}
+
+/// Extracts initialized local bindings and their annotated/inferred scalar
+/// types from a function signature and body block.
 pub fn collect_initialized_locals(func: &ItemFn) -> Vec<TrackedLocal> {
     let mut locals = Vec::new();
 
-    // Parameters are guaranteed initialized at function entry.
     for arg in &func.sig.inputs {
-        if let syn::FnArg::Typed(pat_ty) = arg {
+        if let FnArg::Typed(pat_ty) = arg {
             let (name_opt, is_mut) = extract_pat_ident(&pat_ty.pat);
             if let Some(name) = name_opt {
                 locals.push(TrackedLocal {
@@ -88,7 +254,6 @@ pub fn collect_initialized_locals(func: &ItemFn) -> Vec<TrackedLocal> {
         }
     }
 
-    // Walk top-level `let` statements with initializers.
     for stmt in &func.block.stmts {
         if let Stmt::Local(Local {
             pat,
@@ -135,21 +300,186 @@ fn extract_pat_ident(pat: &Pat) -> (Option<String>, bool) {
 fn infer_expr_type_name(expr: &Expr) -> String {
     match expr {
         Expr::Lit(el) => match &el.lit {
-            syn::Lit::Int(li) if !li.suffix().is_empty() => li.suffix().to_string(),
-            syn::Lit::Int(_) => "i32".to_string(),
-            syn::Lit::Bool(_) => "bool".to_string(),
-            _ => "i32".to_string(),
+            Lit::Int(li) if !li.suffix().is_empty() => li.suffix().to_string(),
+            Lit::Int(_) => "u32".to_string(),
+            Lit::Bool(_) => "bool".to_string(),
+            _ => "unknown".to_string(),
         },
         Expr::Cast(cast) => cast.ty.to_token_stream().to_string().replace(' ', ""),
-        _ => "i32".to_string(),
+        _ => "unknown".to_string(),
     }
 }
 
 fn is_integer_type_name(ty: &str) -> bool {
     matches!(
         ty,
-        "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+        "u8" | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
     )
+}
+
+/// Convert any function parameters into leading initialized local bindings and
+/// rewrite method calls (`.wrapping_add`, `.wrapping_sub`, `.wrapping_mul`,
+/// `.rotate_left`) into primitive operators so every candidate is closed,
+/// zero-argument, and free of unmodeled method calls.
+fn close_and_normalize_function(func: &mut ItemFn, rng: &mut DetRng) {
+    if !func.sig.inputs.is_empty() {
+        let mut init_stmts = Vec::new();
+        let inputs: Vec<FnArg> = func.sig.inputs.iter().cloned().collect();
+        func.sig.inputs.clear();
+        for arg in inputs {
+            if let FnArg::Typed(pat_ty) = arg {
+                let (name_opt, _) = extract_pat_ident(&pat_ty.pat);
+                if let Some(name) = name_opt {
+                    let ident = format_ident!("{}", name);
+                    let ty = &pat_ty.ty;
+                    let ty_str = ty.to_token_stream().to_string().replace(' ', "");
+                    let init_val = seeded_scalar_expr(&ty_str, rng);
+                    let stmt: Stmt = syn::parse_quote! {
+                        let mut #ident: #ty = #init_val;
+                    };
+                    init_stmts.push(stmt);
+                }
+            }
+        }
+        func.block.stmts.splice(0..0, init_stmts);
+    }
+
+    let mut normalizer = MethodCallNormalizer;
+    normalizer.visit_item_fn_mut(func);
+}
+
+fn seeded_scalar_expr(ty_str: &str, rng: &mut DetRng) -> Expr {
+    let pool_u32: [u32; 8] = [1, 2, 7, 15, 31, 42, 127, 255];
+    let pick = pool_u32[rng.gen_range(pool_u32.len())];
+    match ty_str {
+        "u8" => {
+            let v = (pick & 0x7F) as u8;
+            syn::parse_quote!(#v)
+        }
+        "u16" => {
+            let v = pick as u16;
+            syn::parse_quote!(#v)
+        }
+        "u64" => {
+            let v = pick as u64;
+            syn::parse_quote!(#v)
+        }
+        "usize" => {
+            let v = pick as usize;
+            syn::parse_quote!(#v)
+        }
+        "i8" => {
+            let v = (pick & 0x3F) as i8;
+            syn::parse_quote!(#v)
+        }
+        "i16" => {
+            let v = pick as i16;
+            syn::parse_quote!(#v)
+        }
+        "i32" => {
+            let v = pick as i32;
+            syn::parse_quote!(#v)
+        }
+        "i64" => {
+            let v = pick as i64;
+            syn::parse_quote!(#v)
+        }
+        "isize" => {
+            let v = pick as isize;
+            syn::parse_quote!(#v)
+        }
+        "bool" => {
+            let b = (pick & 1) == 1;
+            syn::parse_quote!(#b)
+        }
+        _ => syn::parse_quote!(#pick),
+    }
+}
+
+struct MethodCallNormalizer;
+
+impl VisitMut for MethodCallNormalizer {
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        syn::visit_mut::visit_expr_mut(self, expr);
+        if let Expr::MethodCall(mc) = expr {
+            let method = mc.method.to_string();
+            let recv = &mc.receiver;
+            if mc.args.len() == 1 {
+                let arg = &mc.args[0];
+                match method.as_str() {
+                    "wrapping_add" | "saturating_add" => {
+                        *expr = syn::parse_quote!(((#recv) ^ (#arg)));
+                    }
+                    "wrapping_sub" | "saturating_sub" => {
+                        *expr = syn::parse_quote!(((#recv) ^ (#arg)));
+                    }
+                    "wrapping_mul" => {
+                        *expr = syn::parse_quote!(((#recv) | (#arg)));
+                    }
+                    "rotate_left" => {
+                        *expr = syn::parse_quote!(((#recv) << ((#arg) & 7u32)));
+                    }
+                    "rotate_right" => {
+                        *expr = syn::parse_quote!(((#recv) >> ((#arg) & 7u32)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Evaluate the seed function's entire body and original return expression
+/// FIRST, then execute `setup_stmts` and fold `probe_ident` into the returned
+/// value (for integer return types) or a live sink binding (for non-integer
+/// return types).
+///
+/// Placing `let #tail_ident: #ret_ty = #tail_expr;` before `setup_stmts` ensures
+/// that the seed body is never dead-coded by an injected probe and that any
+/// divergence or fault inside the seed body executes before the tail probe.
+fn inject_live_probe(func: &mut ItemFn, mut setup_stmts: Vec<Stmt>, probe_ident: &syn::Ident) {
+    if let ReturnType::Type(_, ret_ty_box) = &func.sig.output {
+        let ret_ty: Type = (**ret_ty_box).clone();
+        let ret_ty_name = ret_ty.to_token_stream().to_string().replace(' ', "");
+        if let Some(Stmt::Expr(tail_expr, None)) = func.block.stmts.last().cloned() {
+            func.block.stmts.pop();
+            let tail_ident = format_ident!("__tail_{probe_ident}");
+            let tail_stmt: Stmt = syn::parse_quote! {
+                let #tail_ident: #ret_ty = #tail_expr;
+            };
+            func.block.stmts.push(tail_stmt);
+            func.block.stmts.append(&mut setup_stmts);
+            if is_integer_type_name(&ret_ty_name) {
+                let combined: Expr = syn::parse_quote! {
+                    #tail_ident ^ (#probe_ident as #ret_ty)
+                };
+                func.block.stmts.push(Stmt::Expr(combined, None));
+            } else {
+                let sink_stmt: Stmt = syn::parse_quote! {
+                    let mut __miri_sink: u32 = #probe_ident;
+                };
+                func.block.stmts.push(sink_stmt);
+                let tail_ret: Expr = syn::parse_quote!(#tail_ident);
+                func.block.stmts.push(Stmt::Expr(tail_ret, None));
+            }
+            return;
+        }
+    }
+    let sink_stmt: Stmt = syn::parse_quote! {
+        let mut __miri_sink: u32 = #probe_ident;
+    };
+    setup_stmts.push(sink_stmt);
+    func.block.stmts.append(&mut setup_stmts);
 }
 
 /// Trait implemented by all Miri-strength AST mutators.
@@ -157,28 +487,107 @@ pub trait MiriAstMutator {
     /// Canonical human-readable name of this mutator pass.
     fn name(&self) -> &'static str;
 
-    /// Mutates `file` in place using `rng`, appending any newly tracked locals to `locals_log`.
-    fn mutate(&self, file: &mut File, rng: &mut DetRng, locals_log: &mut Vec<(String, String)>);
+    /// Mutates `file` in place using `rng`, appending any tracked locals to
+    /// `locals_log`.
+    fn mutate(&self, file: &mut File, rng: &mut DetRng, locals_log: &mut Vec<(String, String)>) {
+        self.mutate_with_mode(file, rng, MutationMode::Pass, locals_log);
+    }
+
+    /// Mutates `file` in place under `mode` using `rng`.
+    fn mutate_with_mode(
+        &self,
+        file: &mut File,
+        rng: &mut DetRng,
+        mode: MutationMode,
+        locals_log: &mut Vec<(String, String)>,
+    );
 }
 
-/// 1. Mutates integer binary arithmetic/shift operations and injects explicit `as` casts
-/// over initialized integer locals to stress integer overflow, shift-width, and sign-extension rules.
+/// 1. Mutates integer binary operations, literals, and `as` casts (signedness
+/// and width swaps) or unchecked arithmetic intrinsics over initialized integer
+/// locals.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ArithmeticCastMutator;
 
-struct ArithVisitor<'a> {
+struct ArithAstPerturber<'a> {
     rng: &'a mut DetRng,
 }
 
-impl VisitMut for ArithVisitor<'_> {
+impl VisitMut for ArithAstPerturber<'_> {
+    fn visit_type_mut(&mut self, _ty: &mut Type) {
+        // Never mutate array lengths `[T; N]` inside type annotations.
+    }
+
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        // Preserve loop termination conditions, array index expressions, and
+        // intrinsic precondition arguments (`assume`, `exact_div`, shifts).
+        if matches!(expr, Expr::While(_) | Expr::Index(_)) {
+            return;
+        }
+        if let Expr::Call(call) = expr
+            && let Expr::Path(ep) = &*call.func
+            && let Some(seg) = ep.path.segments.last()
+            && matches!(
+                seg.ident.to_string().as_str(),
+                "assume" | "exact_div" | "unchecked_shl" | "unchecked_shr" | "transmute" | "offset"
+            )
+        {
+            return;
+        }
+
+        syn::visit_mut::visit_expr_mut(self, expr);
+
+        // Swap or insert an intermediate width/signedness cast inside `Expr::Cast`
+        // while keeping the outer cast type `#orig_ty` intact for type-checking.
+        if let Expr::Cast(cast) = expr {
+            let orig_ty: Type = (*cast.ty).clone();
+            let orig_ty_str = orig_ty.to_token_stream().to_string().replace(' ', "");
+            if is_integer_type_name(&orig_ty_str) && self.rng.coin(1, 2) {
+                let alt_types: [&str; 10] = [
+                    "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "usize", "isize",
+                ];
+                let pick_str = alt_types[self.rng.gen_range(alt_types.len())];
+                if let Ok(alt_ty) = syn::parse_str::<Type>(pick_str) {
+                    let inner = (*cast.expr).clone();
+                    *expr = syn::parse_quote!(((#inner as #alt_ty) as #orig_ty));
+                }
+            }
+        }
+    }
+
     fn visit_bin_op_mut(&mut self, op: &mut BinOp) {
         if self.rng.coin(1, 2) {
             match op {
                 BinOp::Add(_) => *op = syn::parse_quote!(^),
-                BinOp::Sub(_) => *op = syn::parse_quote!(+),
+                BinOp::Sub(_) => *op = syn::parse_quote!(^),
                 BinOp::BitXor(_) => *op = syn::parse_quote!(|),
-                BinOp::BitAnd(_) => *op = syn::parse_quote!(&),
+                BinOp::BitAnd(_) => *op = syn::parse_quote!(^),
+                BinOp::BitOr(_) => *op = syn::parse_quote!(&),
+                BinOp::Lt(_) => *op = syn::parse_quote!(<=),
+                BinOp::Le(_) => *op = syn::parse_quote!(<),
                 _ => {}
+            }
+        }
+    }
+
+    fn visit_lit_mut(&mut self, lit: &mut Lit) {
+        if let Lit::Int(li) = lit
+            && self.rng.coin(1, 3)
+        {
+            let suffix = li.suffix();
+            let val = li.base10_parse::<i128>().unwrap_or(0);
+            if matches!(suffix, "u32" | "i32") && (1..=31).contains(&val) {
+                let boundaries: &[u32] = &[1, 2, 3, 5, 7, 15, 31];
+                let pick = boundaries[self.rng.gen_range(boundaries.len())];
+                if let Ok(new_lit) = syn::parse_str::<Lit>(&format!("{pick}{suffix}")) {
+                    *lit = new_lit;
+                }
+            } else if matches!(suffix, "u16" | "i16") && (1..=15).contains(&val) {
+                let boundaries: &[u16] = &[1, 2, 3, 5, 7, 15];
+                let pick = boundaries[self.rng.gen_range(boundaries.len())];
+                if let Ok(new_lit) = syn::parse_str::<Lit>(&format!("{pick}{suffix}")) {
+                    *lit = new_lit;
+                }
             }
         }
     }
@@ -189,208 +598,805 @@ impl MiriAstMutator for ArithmeticCastMutator {
         "ArithmeticCastMutator"
     }
 
-    fn mutate(&self, file: &mut File, rng: &mut DetRng, locals_log: &mut Vec<(String, String)>) {
-        let mut visitor = ArithVisitor { rng };
-        visitor.visit_file_mut(file);
+    fn mutate_with_mode(
+        &self,
+        file: &mut File,
+        rng: &mut DetRng,
+        mode: MutationMode,
+        locals_log: &mut Vec<(String, String)>,
+    ) {
+        if matches!(mode, MutationMode::Pass | MutationMode::PerturbAst) {
+            let mut visitor = ArithAstPerturber { rng };
+            visitor.visit_file_mut(file);
+        }
 
         for item in &mut file.items {
-            if let Item::Fn(func) = item {
-                let locals = collect_initialized_locals(func);
-                for loc in &locals {
-                    locals_log.push((loc.name.clone(), loc.ty.clone()));
-                }
-                if let Some(int_loc) = locals.iter().find(|l| is_integer_type_name(&l.ty)) {
-                    let ident = format_ident!("{}", int_loc.name);
-                    let cast_local = format_ident!("__miri_arith_cast_{}", rng.next_u64() & 0xFFFF);
-                    let stmt: Stmt = syn::parse_quote! {
-                        let #cast_local: u64 = ((#ident as i64).wrapping_mul(3i64).wrapping_add(1i64)) as u64;
-                    };
-                    let use_stmt: Stmt = syn::parse_quote! {
-                        let _ = core::hint::black_box(#cast_local);
-                    };
-                    prepend_stmts(&mut func.block, vec![stmt, use_stmt]);
-                }
+            let Item::Fn(func) = item else { continue };
+            if func.sig.ident == "helper_add_ten" {
+                continue;
             }
+            let locals = collect_initialized_locals(func);
+            for loc in &locals {
+                locals_log.push((loc.name.clone(), loc.ty.clone()));
+            }
+            let tag = rng.next_u64() & 0xFFFF;
+            let probe_ident = format_ident!("__miri_arith_{tag}");
+            let mask_lit: u32 = [0x11u32, 0x2Au32, 0x55u32, 0x7Fu32][rng.gen_range(4)];
+            let shift_lit: u32 = [1u32, 2u32, 3u32, 5u32][rng.gen_range(4)];
+
+            let base_expr: Expr =
+                if let Some(int_loc) = locals.iter().find(|l| is_integer_type_name(&l.ty)) {
+                    let id = format_ident!("{}", int_loc.name);
+                    syn::parse_quote!(#id as u32)
+                } else {
+                    syn::parse_quote!(#mask_lit)
+                };
+
+            let stmts: Vec<Stmt> = match mode {
+                MutationMode::Pass | MutationMode::PerturbAst => {
+                    let cast_pairs: [(&str, &str); 6] = [
+                        ("i8", "i32"),
+                        ("u8", "u32"),
+                        ("i16", "i64"),
+                        ("u16", "i64"),
+                        ("i32", "i64"),
+                        ("isize", "usize"),
+                    ];
+                    let (inter_s, wide_s) = cast_pairs[rng.gen_range(cast_pairs.len())];
+                    let inter_ty: Type = syn::parse_str(inter_s).expect("valid inter_ty");
+                    let wide_ty: Type = syn::parse_str(wide_s).expect("valid wide_ty");
+                    syn::parse_quote! {
+                        let __miri_wide: #wide_ty = ((#base_expr as #inter_ty) as #wide_ty) ^ (#mask_lit as #wide_ty);
+                        let #probe_ident: u32 = ((__miri_wide as u32) << #shift_lit) ^ #mask_lit;
+                    }
+                }
+                MutationMode::Panic => {
+                    let variant = rng.gen_range(4);
+                    match variant {
+                        0 => syn::parse_quote! {
+                            let __ovf_a: u32 = u32::MAX;
+                            let __ovf_b: u32 = 1u32 + ((#base_expr) & 1u32);
+                            let #probe_ident: u32 = __ovf_a + __ovf_b;
+                        },
+                        1 => syn::parse_quote! {
+                            let __udf_a: u32 = (#base_expr) & 0u32;
+                            let __udf_b: u32 = #shift_lit;
+                            let #probe_ident: u32 = __udf_a - __udf_b;
+                        },
+                        2 => syn::parse_quote! {
+                            let __div_a: u32 = #mask_lit ^ ((#base_expr) & 3u32);
+                            let __div_z: u32 = (#base_expr) & 0u32;
+                            let #probe_ident: u32 = __div_a / __div_z;
+                        },
+                        _ => syn::parse_quote! {
+                            let __shl_v: u32 = #mask_lit ^ ((#base_expr) & 7u32);
+                            let __shl_w: u32 = 32u32;
+                            let #probe_ident: u32 = __shl_v << __shl_w;
+                        },
+                    }
+                }
+                MutationMode::Ub => {
+                    let variant = rng.gen_range(4);
+                    match variant {
+                        0 => syn::parse_quote! {
+                            let __ub_step: u32 = 1u32 + ((#base_expr) & 1u32);
+                            let #probe_ident: u32 = unsafe { unchecked_add(u32::MAX, __ub_step) };
+                        },
+                        1 => syn::parse_quote! {
+                            let __ub_step: u32 = 1u32 + ((#base_expr) & 1u32);
+                            let #probe_ident: u32 = unsafe { unchecked_sub(0u32, __ub_step) };
+                        },
+                        2 => syn::parse_quote! {
+                            let __ub_shl: u32 = 32u32 + ((#base_expr) & 1u32);
+                            let #probe_ident: u32 = unsafe { unchecked_shl(1u32, __ub_shl) };
+                        },
+                        _ => syn::parse_quote! {
+                            let __ub_zero: u32 = (#base_expr) & 0u32;
+                            let #probe_ident: u32 = unsafe { unchecked_div(#mask_lit, __ub_zero) };
+                        },
+                    }
+                }
+            };
+            inject_live_probe(func, stmts, &probe_ident);
         }
     }
 }
 
-/// 2. Wraps initialized locals in an explicit `#[repr(C)]` projection wrapper struct and
-/// exercises field place projections and `core::ptr::addr_of!` without moving out of parameters.
+/// 2. Perturbs AST array index expressions and struct field projections in
+/// place, and exercises `PairU32` field projections and array indexing.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PlaceProjectionWrapper;
+
+struct ProjectionAstPerturber<'a> {
+    rng: &'a mut DetRng,
+    in_addr_or_lhs: bool,
+}
+
+impl VisitMut for ProjectionAstPerturber<'_> {
+    fn visit_type_mut(&mut self, _ty: &mut Type) {
+        // Never mutate `[T; N]` array lengths in types.
+    }
+
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        match expr {
+            Expr::Assign(assign) => {
+                let prev = self.in_addr_or_lhs;
+                self.in_addr_or_lhs = true;
+                self.visit_expr_mut(&mut assign.left);
+                self.in_addr_or_lhs = prev;
+                self.visit_expr_mut(&mut assign.right);
+                return;
+            }
+            Expr::Reference(_) | Expr::RawAddr(_) => {
+                // Preserve `&raw const pair.a` / `&mut pair.b` targets so pointer
+                // offsets starting from `.a` retain their intended base field.
+                return;
+            }
+            _ => {}
+        }
+
+        syn::visit_mut::visit_expr_mut(self, expr);
+
+        match expr {
+            Expr::Index(idx_expr) if !self.in_addr_or_lhs => {
+                let base_str = idx_expr.expr.to_token_stream().to_string();
+                if let Expr::Lit(el) = &mut *idx_expr.index
+                    && let Lit::Int(li) = &el.lit
+                    && let Ok(cur_idx) = li.base10_parse::<usize>()
+                    && self.rng.coin(1, 2)
+                {
+                    // For `bytes[1]` in `ub_read_struct_padding_byte`, indices
+                    // 1..=3 are the uninitialized padding bytes of `PaddedU8U32`.
+                    let new_idx: usize = if base_str == "bytes" && (1..=3).contains(&cur_idx) {
+                        if cur_idx == 1 { 2 } else { 1 }
+                    } else if cur_idx == 0 {
+                        1
+                    } else {
+                        0
+                    };
+                    idx_expr.index = Box::new(syn::parse_quote!(#new_idx));
+                }
+            }
+            Expr::Field(field_expr) if !self.in_addr_or_lhs => {
+                if let syn::Member::Named(ident) = &mut field_expr.member {
+                    let name = ident.to_string();
+                    if (name == "a" || name == "b") && self.rng.coin(1, 2) {
+                        *ident = if name == "a" {
+                            format_ident!("b")
+                        } else {
+                            format_ident!("a")
+                        };
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
 
 impl MiriAstMutator for PlaceProjectionWrapper {
     fn name(&self) -> &'static str {
         "PlaceProjectionWrapper"
     }
 
-    fn mutate(&self, file: &mut File, rng: &mut DetRng, locals_log: &mut Vec<(String, String)>) {
+    fn mutate_with_mode(
+        &self,
+        file: &mut File,
+        rng: &mut DetRng,
+        mode: MutationMode,
+        locals_log: &mut Vec<(String, String)>,
+    ) {
+        if matches!(mode, MutationMode::Pass | MutationMode::PerturbAst) {
+            let mut visitor = ProjectionAstPerturber {
+                rng,
+                in_addr_or_lhs: false,
+            };
+            visitor.visit_file_mut(file);
+        }
+
         for item in &mut file.items {
-            if let Item::Fn(func) = item {
-                let locals = collect_initialized_locals(func);
-                for loc in &locals {
-                    locals_log.push((loc.name.clone(), loc.ty.clone()));
-                }
-                if let Some(int_loc) = locals.iter().find(|l| is_integer_type_name(&l.ty)) {
-                    let src_ident = format_ident!("{}", int_loc.name);
-                    let ty: Type = syn::parse_str(&int_loc.ty).unwrap_or_else(|_| syn::parse_quote!(u32));
-                    let wrap_ident = format_ident!("__MiriProjWrap_{}", rng.next_u64() & 0xFFFF);
-                    let inst_ident = format_ident!("__miri_proj_inst_{}", rng.next_u64() & 0xFFFF);
-                    let injected: Vec<Stmt> = syn::parse_quote! {
-                        #[repr(C)]
-                        struct #wrap_ident {
-                            head_tag: u8,
-                            payload: #ty,
-                            tail_tag: u8,
-                        }
-                        let #inst_ident = #wrap_ident {
-                            head_tag: 0x5Au8,
-                            payload: #src_ident,
-                            tail_tag: 0xA5u8,
-                        };
-                        let _ = core::hint::black_box((
-                            #inst_ident.head_tag,
-                            #inst_ident.payload,
-                            #inst_ident.tail_tag,
-                        ));
-                    };
-                    prepend_stmts(&mut func.block, injected);
-                }
+            let Item::Fn(func) = item else { continue };
+            if func.sig.ident == "helper_add_ten" {
+                continue;
             }
+            let locals = collect_initialized_locals(func);
+            for loc in &locals {
+                locals_log.push((loc.name.clone(), loc.ty.clone()));
+            }
+            let tag = rng.next_u64() & 0xFFFF;
+            let probe_ident = format_ident!("__miri_proj_{tag}");
+            let c0: u32 = [3u32, 9u32, 17u32, 33u32][rng.gen_range(4)];
+            let c1: u32 = [5u32, 12u32, 24u32, 48u32][rng.gen_range(4)];
+            let seed_val: Expr =
+                if let Some(int_loc) = locals.iter().find(|l| is_integer_type_name(&l.ty)) {
+                    let id = format_ident!("{}", int_loc.name);
+                    syn::parse_quote!((#id as u32) & 0xFFFFu32)
+                } else {
+                    syn::parse_quote!(#c0)
+                };
+
+            let stmts: Vec<Stmt> = match mode {
+                MutationMode::Pass | MutationMode::PerturbAst => {
+                    let idx_lit: usize = rng.gen_range(2);
+                    syn::parse_quote! {
+                        let mut __proj_pair: PairU32 = PairU32 { a: #seed_val, b: #c1 };
+                        let __proj_ref: &mut u32 = &mut __proj_pair.b;
+                        *__proj_ref = (*__proj_ref) ^ #c0;
+                        let __proj_arr: [u32; 2] = [__proj_pair.a, __proj_pair.b];
+                        let #probe_ident: u32 = __proj_arr[#idx_lit];
+                    }
+                }
+                MutationMode::Panic => {
+                    let oob_idx: usize = 3 + rng.gen_range(3);
+                    syn::parse_quote! {
+                        let __oob_arr: [u32; 3] = [#seed_val, #c1, #c0 ^ #c1];
+                        let __oob_idx: usize = #oob_idx;
+                        let #probe_ident: u32 = __oob_arr[__oob_idx];
+                    }
+                }
+                MutationMode::Ub => {
+                    syn::parse_quote! {
+                        let __dangling_ptr: *mut u32 = {
+                            let mut __dead_slot: u32 = #seed_val;
+                            &raw mut __dead_slot
+                        };
+                        let #probe_ident: u32 = unsafe { *__dangling_ptr };
+                    }
+                }
+            };
+            inject_live_probe(func, stmts, &probe_ident);
         }
     }
 }
 
-/// 3. Synthesizes raw pointer address-of and in-bounds pointer offset round-trips (`&raw const`,
-/// `.wrapping_add(1).wrapping_sub(1)`, `unsafe { ptr.read_unaligned() }`) over initialized locals.
+/// 3. Perturbs `core::intrinsics::offset` arguments in place and synthesizes
+/// raw pointer address-of and `offset` dereferences across in-bounds (`0isize`,
+/// `1isize`), out-of-bounds (`2isize`, `-1isize`), null, and unaligned
+/// addresses.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RawPtrOffsetMutator;
+
+struct OffsetArgPerturber<'a> {
+    rng: &'a mut DetRng,
+    allow_oob: bool,
+}
+
+impl VisitMut for OffsetArgPerturber<'_> {
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        syn::visit_mut::visit_expr_mut(self, expr);
+        if let Expr::Call(call) = expr
+            && let Expr::Path(ep) = &*call.func
+            && ep.path.segments.last().is_some_and(|s| s.ident == "offset")
+            && call.args.len() == 2
+            && self.rng.coin(1, 2)
+        {
+            let step: isize = if self.allow_oob {
+                let choices: [isize; 4] = [0, 1, 2, -1];
+                choices[self.rng.gen_range(choices.len())]
+            } else {
+                let choices: [isize; 2] = [0, 1];
+                choices[self.rng.gen_range(choices.len())]
+            };
+            call.args[1] = syn::parse_quote!(#step);
+        }
+    }
+}
 
 impl MiriAstMutator for RawPtrOffsetMutator {
     fn name(&self) -> &'static str {
         "RawPtrOffsetMutator"
     }
 
-    fn mutate(&self, file: &mut File, rng: &mut DetRng, locals_log: &mut Vec<(String, String)>) {
+    fn mutate_with_mode(
+        &self,
+        file: &mut File,
+        rng: &mut DetRng,
+        mode: MutationMode,
+        locals_log: &mut Vec<(String, String)>,
+    ) {
+        if matches!(
+            mode,
+            MutationMode::Pass | MutationMode::PerturbAst | MutationMode::Ub
+        ) {
+            let mut v = OffsetArgPerturber {
+                rng,
+                allow_oob: matches!(mode, MutationMode::PerturbAst | MutationMode::Ub),
+            };
+            v.visit_file_mut(file);
+        }
+
         for item in &mut file.items {
-            if let Item::Fn(func) = item {
-                let locals = collect_initialized_locals(func);
-                for loc in &locals {
-                    locals_log.push((loc.name.clone(), loc.ty.clone()));
-                }
-                if let Some(int_loc) = locals.iter().find(|l| is_integer_type_name(&l.ty)) {
-                    let src_ident = format_ident!("{}", int_loc.name);
-                    let ty: Type = syn::parse_str(&int_loc.ty).unwrap_or_else(|_| syn::parse_quote!(u32));
-                    let buf_ident = format_ident!("__miri_raw_arr_{}", rng.next_u64() & 0xFFFF);
-                    let step = rng.gen_range(2) + 1;
-                    let injected: Vec<Stmt> = syn::parse_quote! {
-                        let #buf_ident: [#ty; 4] = [#src_ident, #src_ident, #src_ident, #src_ident];
-                        let __base_ptr: *const #ty = &raw const #buf_ident[0];
-                        let __roundtrip_val: #ty = unsafe {
-                            __base_ptr.add(#step).wrapping_sub(#step).read()
-                        };
-                        let _ = core::hint::black_box(__roundtrip_val);
-                    };
-                    prepend_stmts(&mut func.block, injected);
-                }
+            let Item::Fn(func) = item else { continue };
+            if func.sig.ident == "helper_add_ten" {
+                continue;
             }
+            let locals = collect_initialized_locals(func);
+            for loc in &locals {
+                locals_log.push((loc.name.clone(), loc.ty.clone()));
+            }
+            let tag = rng.next_u64() & 0xFFFF;
+            let probe_ident = format_ident!("__miri_ptr_{tag}");
+            let c_a: u32 = [11u32, 22u32, 44u32, 88u32][rng.gen_range(4)];
+            let c_b: u32 = [33u32, 66u32, 99u32, 132u32][rng.gen_range(4)];
+
+            let stmts: Vec<Stmt> = match mode {
+                MutationMode::Pass => {
+                    syn::parse_quote! {
+                        let __ptr_pair: PairU32 = PairU32 { a: #c_a, b: #c_b };
+                        let __base_ptr: *const u32 = &raw const __ptr_pair.a;
+                        let #probe_ident: u32 = unsafe { *offset(__base_ptr, 0isize) };
+                    }
+                }
+                MutationMode::PerturbAst => {
+                    // Cross-field offset 1isize exercises `pass_ptr_offset_within_array`.
+                    let step: isize = if rng.coin(1, 2) { 1 } else { 0 };
+                    syn::parse_quote! {
+                        let __ptr_pair: PairU32 = PairU32 { a: #c_a, b: #c_b };
+                        let __base_ptr: *const u32 = &raw const __ptr_pair.a;
+                        let #probe_ident: u32 = unsafe { *offset(__base_ptr, #step) };
+                    }
+                }
+                MutationMode::Panic => {
+                    syn::parse_quote! {
+                        let __ptr_arr: [u32; 2] = [#c_a, #c_b];
+                        let __oob: usize = 2usize;
+                        let #probe_ident: u32 = __ptr_arr[__oob];
+                    }
+                }
+                MutationMode::Ub => {
+                    let variant = rng.gen_range(4);
+                    match variant {
+                        0 => syn::parse_quote! {
+                            let __null_p: *const u32 = 0usize as *const u32;
+                            let #probe_ident: u32 = unsafe { *__null_p };
+                        },
+                        1 => syn::parse_quote! {
+                            let __oob_pair: PairU32 = PairU32 { a: #c_a, b: #c_b };
+                            let __oob_base: *const u32 = &raw const __oob_pair.a;
+                            let #probe_ident: u32 = unsafe { *offset(__oob_base, 2isize) };
+                        },
+                        2 => syn::parse_quote! {
+                            let __neg_pair: PairU32 = PairU32 { a: #c_a, b: #c_b };
+                            let __neg_base: *const u32 = &raw const __neg_pair.a;
+                            let #probe_ident: u32 = unsafe { *offset(__neg_base, -1isize) };
+                        },
+                        _ => syn::parse_quote! {
+                            let __unaligned_pair: PairU32 = PairU32 { a: #c_a, b: #c_b };
+                            let __u8_base: *const u8 = (&raw const __unaligned_pair.a) as *const u8;
+                            let #probe_ident: u32 = unsafe { *(offset(__u8_base, 1isize) as *const u32) };
+                        },
+                    }
+                }
+            };
+            inject_live_probe(func, stmts, &probe_ident);
         }
     }
 }
 
-/// 4. Interleaves Tree Borrows / Stacked Borrows shared + mutable retag transitions on a
-/// shadow slot initialized from an existing local binding.
+/// 4. Reorders adjacent pointer/reference access statements in aliasing blocks
+/// and interleaves Tree Borrows shared/mutable reborrow transitions.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TreeBorrowsRetagInterleaver;
+
+/// Checks whether `stmt` is an access statement (semicolon-terminated expression
+/// statement such as `*r = 1;` / `unsafe { *p1 = 3; }` or an unused `_` local
+/// read `let _y = unsafe { *root };`) that does not introduce a named binding
+/// referenced by subsequent statements, making adjacent pairs safe to swap.
+fn is_reordering_safe_access_stmt(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Expr(_, Some(_)) => true,
+        Stmt::Local(loc) => {
+            let (name_opt, _) = extract_pat_ident(&loc.pat);
+            name_opt.is_some_and(|n| n.starts_with('_'))
+        }
+        _ => false,
+    }
+}
+
+struct AliasingAccessReorderer<'a> {
+    rng: &'a mut DetRng,
+}
+
+impl VisitMut for AliasingAccessReorderer<'_> {
+    fn visit_block_mut(&mut self, block: &mut Block) {
+        syn::visit_mut::visit_block_mut(self, block);
+        if block.stmts.len() < 2 {
+            return;
+        }
+        let mut idx = 0;
+        while idx + 1 < block.stmts.len() {
+            if is_reordering_safe_access_stmt(&block.stmts[idx])
+                && is_reordering_safe_access_stmt(&block.stmts[idx + 1])
+                && self.rng.coin(1, 2)
+            {
+                block.stmts.swap(idx, idx + 1);
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+        }
+    }
+}
 
 impl MiriAstMutator for TreeBorrowsRetagInterleaver {
     fn name(&self) -> &'static str {
         "TreeBorrowsRetagInterleaver"
     }
 
-    fn mutate(&self, file: &mut File, rng: &mut DetRng, locals_log: &mut Vec<(String, String)>) {
+    fn mutate_with_mode(
+        &self,
+        file: &mut File,
+        rng: &mut DetRng,
+        mode: MutationMode,
+        locals_log: &mut Vec<(String, String)>,
+    ) {
+        if matches!(
+            mode,
+            MutationMode::Pass | MutationMode::PerturbAst | MutationMode::Ub
+        ) {
+            let mut reorderer = AliasingAccessReorderer { rng };
+            reorderer.visit_file_mut(file);
+        }
+
         for item in &mut file.items {
-            if let Item::Fn(func) = item {
-                let locals = collect_initialized_locals(func);
-                for loc in &locals {
-                    locals_log.push((loc.name.clone(), loc.ty.clone()));
-                }
-                if let Some(int_loc) = locals.iter().find(|l| is_integer_type_name(&l.ty)) {
-                    let src_ident = format_ident!("{}", int_loc.name);
-                    let ty: Type = syn::parse_str(&int_loc.ty).unwrap_or_else(|_| syn::parse_quote!(u32));
-                    let slot_ident = format_ident!("__miri_tb_slot_{}", rng.next_u64() & 0xFFFF);
-                    let injected: Vec<Stmt> = syn::parse_quote! {
-                        let mut #slot_ident: #ty = #src_ident;
-                        {
-                            let __uniq_ref: &mut #ty = &mut #slot_ident;
-                            let __raw_mut: *mut #ty = &raw mut *__uniq_ref;
-                            let __shared_retag: &#ty = unsafe { &*(__raw_mut as *const #ty) };
-                            let __observed: #ty = *__shared_retag;
-                            unsafe {
-                                *__raw_mut = __observed;
-                            }
-                        }
-                        let _ = core::hint::black_box(#slot_ident);
-                    };
-                    prepend_stmts(&mut func.block, injected);
-                }
+            let Item::Fn(func) = item else { continue };
+            if func.sig.ident == "helper_add_ten" {
+                continue;
             }
+            let locals = collect_initialized_locals(func);
+            for loc in &locals {
+                locals_log.push((loc.name.clone(), loc.ty.clone()));
+            }
+            let tag = rng.next_u64() & 0xFFFF;
+            let probe_ident = format_ident!("__miri_tb_{tag}");
+            let init_val: u32 = [10u32, 20u32, 30u32, 40u32][rng.gen_range(4)];
+            let write_val: u32 = [1u32, 3u32, 7u32, 15u32][rng.gen_range(4)];
+
+            let stmts: Vec<Stmt> = match mode {
+                MutationMode::Pass => {
+                    // Reserved `&mut` coexisting with parent read before activation.
+                    syn::parse_quote! {
+                        let mut __tb_slot: u32 = #init_val;
+                        let __tb_root: *mut u32 = &raw mut __tb_slot;
+                        let __tb_res: &mut u32 = unsafe { &mut *__tb_root };
+                        let __tb_parent_read: u32 = unsafe { *__tb_root };
+                        let #probe_ident: u32 = __tb_parent_read ^ (*__tb_res);
+                    }
+                }
+                MutationMode::PerturbAst => {
+                    // Child write followed by parent read/write (legal in Tree Borrows,
+                    // exercises parent/child borrow-tree transitions).
+                    if rng.coin(1, 2) {
+                        syn::parse_quote! {
+                            let mut __tb_slot: u32 = #init_val;
+                            let __tb_root: *mut u32 = &raw mut __tb_slot;
+                            let __tb_child: &mut u32 = unsafe { &mut *__tb_root };
+                            *__tb_child = #write_val;
+                            let #probe_ident: u32 = unsafe { *__tb_root };
+                        }
+                    } else {
+                        syn::parse_quote! {
+                            let mut __tb_slot: u32 = #init_val;
+                            let __tb_parent: &mut u32 = &mut __tb_slot;
+                            {
+                                let __tb_reborrow: &mut u32 = &mut *__tb_parent;
+                                *__tb_reborrow = #write_val;
+                            }
+                            *__tb_parent = #init_val ^ #write_val;
+                            let #probe_ident: u32 = *__tb_parent;
+                        }
+                    }
+                }
+                MutationMode::Panic => {
+                    syn::parse_quote! {
+                        let __tb_ovf: u32 = u32::MAX;
+                        let #probe_ident: u32 = __tb_ovf + #write_val;
+                    }
+                }
+                MutationMode::Ub => {
+                    let variant = rng.gen_range(3);
+                    match variant {
+                        0 => syn::parse_quote! {
+                            let __tb_imm: u32 = #init_val;
+                            let __tb_shr: &u32 = &__tb_imm;
+                            let __tb_mut: *mut u32 = (__tb_shr as *const u32) as *mut u32;
+                            unsafe {
+                                *__tb_mut = #write_val;
+                            }
+                            let #probe_ident: u32 = __tb_imm;
+                        },
+                        1 => syn::parse_quote! {
+                            let mut __tb_x: u32 = #init_val;
+                            let __tb_root: *mut u32 = &raw mut __tb_x;
+                            let __tb_shr: &u32 = unsafe { &*__tb_root };
+                            unsafe {
+                                *__tb_root = #write_val;
+                            }
+                            let #probe_ident: u32 = *__tb_shr;
+                        },
+                        _ => syn::parse_quote! {
+                            let mut __tb_x: u32 = #init_val;
+                            let __tb_root: *mut u32 = &raw mut __tb_x;
+                            let __tb_act: &mut u32 = unsafe { &mut *__tb_root };
+                            *__tb_act = #write_val;
+                            let _ = unsafe { *__tb_root };
+                            *__tb_act = #init_val;
+                            let #probe_ident: u32 = unsafe { *__tb_root };
+                        },
+                    }
+                }
+            };
+            inject_live_probe(func, stmts, &probe_ident);
         }
     }
 }
 
-/// 5. Injects `core::mem::MaybeUninit` and fixed-size `core::mem::transmute_copy` bit-validity
-/// round-trips on initialized scalar locals.
+/// 5. Exercises scalar bit-validity (`bool`, `char`, `ColorTag` discriminant)
+/// and `Uninit<T>` initialization state via `core::mem::transmute` and union
+/// field reads.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BitValidityTransmuteMutator;
+
+struct TransmuteValidityPerturber<'a> {
+    rng: &'a mut DetRng,
+    inject_invalid: bool,
+}
+
+impl VisitMut for TransmuteValidityPerturber<'_> {
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        syn::visit_mut::visit_expr_mut(self, expr);
+        if let Expr::Call(call) = expr
+            && let Expr::Path(ep) = &*call.func
+            && ep.path.segments.last().is_some_and(|s| s.ident == "transmute")
+            && call.args.len() == 1
+            && let Expr::Lit(el) = &call.args[0]
+            && let Lit::Int(li) = &el.lit
+            && self.rng.coin(1, 2)
+        {
+            let suffix = li.suffix();
+            if suffix == "u8" {
+                let v: u8 = if self.inject_invalid {
+                    [3u8, 5u8, 7u8, 255u8][self.rng.gen_range(4)]
+                } else {
+                    (self.rng.gen_range(2)) as u8
+                };
+                call.args[0] = syn::parse_quote!(#v);
+            } else if suffix == "u32" {
+                let v: u32 = if self.inject_invalid {
+                    [0xD800u32, 0xDFFFu32, 0x11_0000u32, 0x1F_FFFFu32][self.rng.gen_range(4)]
+                } else {
+                    [0x41u32, 0x7Au32, 0x03BBu32, 0x2603u32][self.rng.gen_range(4)]
+                };
+                call.args[0] = syn::parse_quote!(#v);
+            }
+        }
+    }
+}
 
 impl MiriAstMutator for BitValidityTransmuteMutator {
     fn name(&self) -> &'static str {
         "BitValidityTransmuteMutator"
     }
 
-    fn mutate(&self, file: &mut File, rng: &mut DetRng, locals_log: &mut Vec<(String, String)>) {
+    fn mutate_with_mode(
+        &self,
+        file: &mut File,
+        rng: &mut DetRng,
+        mode: MutationMode,
+        locals_log: &mut Vec<(String, String)>,
+    ) {
+        if matches!(
+            mode,
+            MutationMode::Pass | MutationMode::PerturbAst | MutationMode::Ub
+        ) {
+            let mut visitor = TransmuteValidityPerturber {
+                rng,
+                inject_invalid: mode == MutationMode::Ub,
+            };
+            visitor.visit_file_mut(file);
+        }
+
         for item in &mut file.items {
-            if let Item::Fn(func) = item {
-                let locals = collect_initialized_locals(func);
-                for loc in &locals {
-                    locals_log.push((loc.name.clone(), loc.ty.clone()));
-                }
-                if let Some(int_loc) = locals.iter().find(|l| is_integer_type_name(&l.ty)) {
-                    let src_ident = format_ident!("{}", int_loc.name);
-                    let ty: Type = syn::parse_str(&int_loc.ty).unwrap_or_else(|_| syn::parse_quote!(u32));
-                    let mu_ident = format_ident!("__miri_mu_{}", rng.next_u64() & 0xFFFF);
-                    let injected: Vec<Stmt> = syn::parse_quote! {
-                        let #mu_ident: core::mem::MaybeUninit<#ty> = core::mem::MaybeUninit::new(#src_ident);
-                        let __rehydrated: #ty = unsafe { core::mem::transmute_copy(&#mu_ident) };
-                        let _ = core::hint::black_box(__rehydrated);
-                    };
-                    prepend_stmts(&mut func.block, injected);
-                }
+            let Item::Fn(func) = item else { continue };
+            if func.sig.ident == "helper_add_ten" {
+                continue;
             }
+            let locals = collect_initialized_locals(func);
+            for loc in &locals {
+                locals_log.push((loc.name.clone(), loc.ty.clone()));
+            }
+            let tag = rng.next_u64() & 0xFFFF;
+            let probe_ident = format_ident!("__miri_valid_{tag}");
+
+            let stmts: Vec<Stmt> = match mode {
+                MutationMode::Pass | MutationMode::PerturbAst => {
+                    let variant = rng.gen_range(3);
+                    match variant {
+                        0 => {
+                            let b_u8: u8 = (rng.gen_range(2)) as u8;
+                            let w_u32: u32 =
+                                [0x41u32, 0x3BBu32, 0x7Fu32, 0x2Au32][rng.gen_range(4)];
+                            syn::parse_quote! {
+                                let __valid_b: bool = unsafe { transmute(#b_u8) };
+                                let mut __valid_slot: Uninit<u32> = Uninit { uninit: () };
+                                let #probe_ident: u32 = unsafe {
+                                    __valid_slot.value = #w_u32;
+                                    __valid_slot.value ^ (__valid_b as u32)
+                                };
+                            }
+                        }
+                        1 => {
+                            let valid_char_u32: u32 =
+                                [0x41u32, 0x7Au32, 0x03BBu32, 0x2603u32][rng.gen_range(4)];
+                            syn::parse_quote! {
+                                let __valid_ch: char = unsafe { transmute(#valid_char_u32) };
+                                let #probe_ident: u32 = __valid_ch as u32;
+                            }
+                        }
+                        _ => {
+                            let valid_disc: u8 = (rng.gen_range(3)) as u8;
+                            syn::parse_quote! {
+                                let __valid_tag: ColorTag = unsafe { transmute(#valid_disc) };
+                                let #probe_ident: u32 = match __valid_tag {
+                                    ColorTag::Red => 10u32,
+                                    ColorTag::Green => 20u32,
+                                    ColorTag::Blue => 30u32,
+                                };
+                            }
+                        }
+                    }
+                }
+                MutationMode::Panic => {
+                    syn::parse_quote! {
+                        let __panic_arr: [u8; 2] = [0u8, 1u8];
+                        let __panic_idx: usize = 3usize;
+                        let #probe_ident: u32 = __panic_arr[__panic_idx] as u32;
+                    }
+                }
+                MutationMode::Ub => {
+                    let bad_u8: u8 = [2u8, 3u8, 7u8, 255u8][rng.gen_range(4)];
+                    let bad_char_u32: u32 =
+                        [0xD800u32, 0xDFFFu32, 0x11_0000u32, 0x1F_FFFFu32][rng.gen_range(4)];
+                    let bad_enum_u8: u8 = [3u8, 5u8, 7u8, 255u8][rng.gen_range(4)];
+                    let variant = rng.gen_range(6);
+                    match variant {
+                        0 => syn::parse_quote! {
+                            let __bad_b: bool = unsafe { transmute(#bad_u8) };
+                            let #probe_ident: u32 = __bad_b as u32;
+                        },
+                        1 => syn::parse_quote! {
+                            let __bad_ch: char = unsafe { transmute(#bad_char_u32) };
+                            let #probe_ident: u32 = __bad_ch as u32;
+                        },
+                        2 => syn::parse_quote! {
+                            let __bad_tag: ColorTag = unsafe { transmute(#bad_enum_u8) };
+                            let #probe_ident: u32 = match __bad_tag {
+                                ColorTag::Red => 1u32,
+                                ColorTag::Green => 2u32,
+                                ColorTag::Blue => 3u32,
+                            };
+                        },
+                        3 => syn::parse_quote! {
+                            let __uninit_slot: Uninit<u32> = Uninit { uninit: () };
+                            let #probe_ident: u32 = unsafe { __uninit_slot.value };
+                        },
+                        4 => syn::parse_quote! {
+                            let __padded: PaddedU8U32 = PaddedU8U32 { tag: 1u8, word: 0x1122_3344u32 };
+                            let __pad_bytes: [u8; 8] = unsafe { transmute(__padded) };
+                            let #probe_ident: u32 = __pad_bytes[1] as u32;
+                        },
+                        _ => syn::parse_quote! {
+                            let mut __ptr_b: bool = false;
+                            let __raw_u8: *mut u8 = (&mut __ptr_b as *mut bool) as *mut u8;
+                            unsafe {
+                                *__raw_u8 = #bad_u8;
+                            }
+                            let #probe_ident: u32 = __ptr_b as u32;
+                        },
+                    }
+                }
+            };
+            inject_live_probe(func, stmts, &probe_ident);
         }
     }
 }
 
-/// Inserts `new_stmts` immediately after any leading `let` local declarations in `block`
-/// so statements referencing a `let`-bound local never appear before its declaration,
-/// while preserving any trailing return expression at the end of `block`.
-fn prepend_stmts(block: &mut Block, new_stmts: Vec<Stmt>) {
-    let insert_idx = block
-        .stmts
-        .iter()
-        .take_while(|stmt| matches!(stmt, Stmt::Local(_) | Stmt::Item(_)))
-        .count();
-    block.stmts.splice(insert_idx..insert_idx, new_stmts);
+/// Generate the 77-candidate identity batch directly from
+/// `tests/miri-diff/corpus/src/lib.rs` with zero mutations applied.
+pub fn generate_miri_identity_batch() -> Vec<GeneratedMiriCandidate> {
+    let seeds = load_miri_diff_corpus_seeds();
+    seeds
+        .into_iter()
+        .enumerate()
+        .map(|(id, seed)| {
+            let parsed = syn::parse_file(&seed.fn_source).expect("parse corpus seed");
+            let mut tracked_locals = Vec::new();
+            for item in &parsed.items {
+                if let Item::Fn(func) = item {
+                    for loc in collect_initialized_locals(func) {
+                        let pair = (loc.name, loc.ty);
+                        if !tracked_locals.contains(&pair) {
+                            tracked_locals.push(pair);
+                        }
+                    }
+                }
+            }
+            let source = build_standalone_candidate_source(&seed.fn_source);
+            GeneratedMiriCandidate {
+                id,
+                seed_index: id,
+                seed_name: seed.name.clone(),
+                fn_name: seed.name,
+                seed_u64: id as u64,
+                applied_mutators: Vec::new(),
+                tracked_locals,
+                fn_source: seed.fn_source,
+                source,
+            }
+        })
+        .collect()
 }
 
-/// Generates `count` deterministic, syntactically valid Miri-strength mutated Rust programs
-/// from `seeds` using a PRNG keyed by `seed_u64`.
+/// Generate `count` deterministic, closed, zero-argument Miri candidates from
+/// the 77-function `tests/miri-diff/corpus/src/lib.rs` seed corpus.
+pub fn generate_miri_corpus_batch(
+    count: usize,
+    seed_u64: u64,
+    batch_idx: usize,
+) -> Vec<GeneratedMiriCandidate> {
+    let corpus_seeds = load_miri_diff_corpus_seeds();
+    let raw_refs: Vec<&str> = corpus_seeds.iter().map(|s| s.fn_source.as_str()).collect();
+    generate_miri_batch_with_prefix(&raw_refs, count, seed_u64, &format!("b{batch_idx}"))
+}
+
+/// Generates `count` deterministic, syntactically valid Miri-strength mutated
+/// Rust programs from `seeds` using a PRNG keyed by `seed_u64`.
 pub fn generate_miri_batch(
     seeds: &[&str],
     count: usize,
     seed_u64: u64,
+) -> Vec<GeneratedMiriCandidate> {
+    generate_miri_batch_with_prefix(seeds, count, seed_u64, "m")
+}
+
+/// Return the indices of non-faulting seeds (`pass_*`, `tb_*`, `safe_*` or
+/// user-provided seeds) that do not invoke unmodeled external calls.
+///
+/// Crucially, this list includes ALL Miri-passing seeds in
+/// `tests/miri-diff/corpus/src/lib.rs`—including both agreeing Tree Borrows
+/// parent/child seeds (`tb_child_write_then_parent_read`,
+/// `tb_child_write_then_parent_write`, `safe_reborrow_then_parent_write`) and
+/// seeds with `known_anneal_bug` divergences (`pass_ptr_offset_within_array`,
+/// `pass_copy_nonoverlapping_uninit_bytes_to_uninit`,
+/// `pass_tb_unsafe_cell_shared_mutation`).
+pub fn collect_non_fault_seed_indices(seeds: &[&str]) -> Vec<usize> {
+    seeds
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, src)| {
+            let parsed = syn::parse_str::<File>(src).ok()?;
+            let fn_name = parsed.items.iter().find_map(|it| match it {
+                Item::Fn(f) if f.sig.ident != "helper_add_ten" => Some(f.sig.ident.to_string()),
+                _ => None,
+            })?;
+            if !fn_name.starts_with("panic_")
+                && !fn_name.starts_with("ub_")
+                && fn_name != "pass_direct_fn_call"
+                && fn_name != "pass_exact_div_valid"
+            {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn generate_miri_batch_with_prefix(
+    seeds: &[&str],
+    count: usize,
+    seed_u64: u64,
+    batch_prefix: &str,
 ) -> Vec<GeneratedMiriCandidate> {
     if seeds.is_empty() || count == 0 {
         return Vec::new();
@@ -404,35 +1410,106 @@ pub fn generate_miri_batch(
         &BitValidityTransmuteMutator,
     ];
 
+    let non_fault_seed_indices = collect_non_fault_seed_indices(seeds);
+
     let mut master_rng = DetRng::new(seed_u64);
+    let seed_offset = master_rng.gen_range(seeds.len());
     let mut out = Vec::with_capacity(count);
 
     for id in 0..count {
-        let seed_index = id % seeds.len();
         let cand_seed = master_rng.next_u64() ^ ((id as u64).wrapping_mul(0x517C_C1B7_2722_0A95));
         let mut cand_rng = DetRng::new(cand_seed);
+
+        // Choose the candidate's target mutation regime so every batch produces
+        // a balanced, seed-dependent mix of `pass`, `panic`, and `ub` outcomes.
+        let bucket = (id + cand_rng.gen_range(4)) % 4;
+        let primary_mode = match bucket {
+            0 => MutationMode::Pass,
+            1 => MutationMode::Panic,
+            2 => MutationMode::Ub,
+            _ => match cand_rng.gen_range(4) {
+                0 => MutationMode::Pass,
+                1 => MutationMode::Panic,
+                2 => MutationMode::Ub,
+                _ => MutationMode::PerturbAst,
+            },
+        };
+
+        let seed_index = if (primary_mode == MutationMode::Pass
+            || primary_mode == MutationMode::Panic
+            || (primary_mode == MutationMode::Ub && cand_rng.coin(1, 2)))
+            && !non_fault_seed_indices.is_empty()
+        {
+            let pick = (seed_offset
+                + id.wrapping_mul(7)
+                + cand_rng.gen_range(non_fault_seed_indices.len()))
+                % non_fault_seed_indices.len();
+            non_fault_seed_indices[pick]
+        } else if seeds.len() <= 8 {
+            (id + seed_offset) % seeds.len()
+        } else {
+            (seed_offset + id.wrapping_mul(13) + cand_rng.gen_range(seeds.len())) % seeds.len()
+        };
 
         let Ok(mut parsed) = syn::parse_str::<File>(seeds[seed_index]) else {
             continue;
         };
 
-        // Always apply 1..=3 distinct mutators so every mutator family gets exercised.
+        // Close and rename the last function item in `parsed.items` (leaving
+        // any preceding helper functions in a multi-function seed intact).
+        let mut seed_name = format!("seed_{seed_index}");
+        let mut fn_name = format!("cand_{batch_prefix}_c{id}");
+        parsed.attrs.clear();
+        parsed.items.retain(|item| {
+            if let Item::Fn(f) = item {
+                f.sig.ident != "helper_add_ten"
+            } else {
+                false
+            }
+        });
+        if let Some(Item::Fn(func)) = parsed.items.last_mut() {
+            seed_name = func.sig.ident.to_string();
+            fn_name = format!("{seed_name}__{batch_prefix}_c{id}");
+            func.sig.ident = format_ident!("{}", fn_name);
+            close_and_normalize_function(func, &mut cand_rng);
+        }
+
+        // If the selected seed is already a faulting (`panic_*` or `ub_*`) seed,
+        // mutate it in-place (`PerturbAst` / `Pass`) rather than appending a
+        // second fault probe after the seed's own panic/UB.
+        let seed_already_faults =
+            seed_name.starts_with("panic_") || seed_name.starts_with("ub_");
+
         let num_passes = 1 + cand_rng.gen_range(3);
         let mut applied_mutators = Vec::with_capacity(num_passes);
         let mut raw_locals = Vec::new();
 
         for pass in 0..num_passes {
             let m_idx = if pass == 0 {
-                id % all_mutators.len()
+                (id + cand_rng.gen_range(all_mutators.len())) % all_mutators.len()
             } else {
                 cand_rng.gen_range(all_mutators.len())
             };
+            let pass_mode = if pass == 0 && !seed_already_faults {
+                primary_mode
+            } else if pass == 0 && seed_already_faults {
+                MutationMode::PerturbAst
+            } else {
+                MutationMode::Pass
+            };
             let mutator = all_mutators[m_idx];
-            mutator.mutate(&mut parsed, &mut cand_rng, &mut raw_locals);
+            mutator.mutate_with_mode(&mut parsed, &mut cand_rng, pass_mode, &mut raw_locals);
             applied_mutators.push(mutator.name().to_string());
         }
 
-        // Deduplicate tracked locals while preserving discovery order.
+        for item in &parsed.items {
+            if let Item::Fn(func) = item {
+                for loc in collect_initialized_locals(func) {
+                    raw_locals.push((loc.name, loc.ty));
+                }
+            }
+        }
+
         let mut tracked_locals = Vec::new();
         for pair in raw_locals {
             if !tracked_locals.contains(&pair) {
@@ -440,14 +1517,18 @@ pub fn generate_miri_batch(
             }
         }
 
-        let formatted = prettyplease::unparse(&parsed);
+        let fn_source = prettyplease::unparse(&parsed);
+        let source = build_standalone_candidate_source(&fn_source);
         out.push(GeneratedMiriCandidate {
             id,
             seed_index,
+            seed_name,
+            fn_name,
             seed_u64: cand_seed,
             applied_mutators,
             tracked_locals,
-            source: formatted,
+            fn_source,
+            source,
         });
     }
 
@@ -458,30 +1539,72 @@ pub fn generate_miri_batch(
 mod tests {
     use super::*;
 
-    const SEED_A: &str = r#"
-        pub fn compute_checksum(x: u32, y: u32) -> u32 {
-            let sum: u32 = x.wrapping_add(y);
-            sum ^ 0x55AA_55AA
-        }
-    "#;
+    #[test]
+    fn corpus_seeds_load_all_77_zero_arg_functions_and_do_not_blocklist_known_bugs() {
+        let seeds = load_miri_diff_corpus_seeds();
+        assert_eq!(
+            seeds.len(),
+            77,
+            "expected 77 zero-arg functions from tests/miri-diff/corpus/src/lib.rs"
+        );
+        assert!(seeds.iter().any(|s| s.name == "pass_integer_arith_basic"));
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.name == "ub_tb_use_frozen_mut_after_parent_read")
+        );
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.name == "tb_child_write_then_parent_read")
+        );
+        assert!(!seeds.iter().any(|s| s.name == "helper_add_ten"));
 
-    const SEED_B: &str = r#"
-        pub fn clamp_signed(v: i32, limit: i32) -> i32 {
-            let shifted: i32 = v.wrapping_sub(limit);
-            shifted
+        let raw_refs: Vec<&str> = seeds.iter().map(|s| s.fn_source.as_str()).collect();
+        let non_fault_indices = collect_non_fault_seed_indices(&raw_refs);
+        let non_fault_names: std::collections::BTreeSet<&str> = non_fault_indices
+            .iter()
+            .map(|&idx| seeds[idx].name.as_str())
+            .collect();
+        for known_bug_seed in [
+            "pass_ptr_offset_within_array",
+            "pass_copy_nonoverlapping_uninit_bytes_to_uninit",
+            "pass_tb_unsafe_cell_shared_mutation",
+            "tb_child_write_then_parent_read",
+            "tb_child_write_then_parent_write",
+            "safe_reborrow_then_parent_write",
+        ] {
+            assert!(
+                non_fault_names.contains(known_bug_seed),
+                "non_fault_seed_indices must include `{known_bug_seed}` without blocklisting"
+            );
         }
-    "#;
+    }
 
     #[test]
-    fn generate_miri_batch_is_deterministic_tracks_locals_and_parses_cleanly() {
-        let batch1 = generate_miri_batch(&[SEED_A, SEED_B], 15, 0xCAFE_BABE_1234_5678);
-        let batch2 = generate_miri_batch(&[SEED_A, SEED_B], 15, 0xCAFE_BABE_1234_5678);
-        assert_eq!(batch1, batch2, "same seed_u64 must produce bit-identical batch");
-        assert_eq!(batch1.len(), 15);
+    fn generate_miri_batch_is_deterministic_closed_and_free_of_black_box() {
+        let batch1 = generate_miri_corpus_batch(20, 0xCAFE_BABE_1234_5678, 0);
+        let batch2 = generate_miri_corpus_batch(20, 0xCAFE_BABE_1234_5678, 0);
+        assert_eq!(
+            batch1, batch2,
+            "same seed_u64 must produce bit-identical batch"
+        );
+        assert_eq!(batch1.len(), 20);
+
+        let other_seed = generate_miri_corpus_batch(20, 0xDEAD_BEEF_0000_0001, 0);
+        assert_ne!(
+            batch1, other_seed,
+            "different seeds must produce distinct candidate batches"
+        );
 
         let mut seen_mutators = std::collections::BTreeSet::new();
         for cand in &batch1 {
             assert!(!cand.tracked_locals.is_empty());
+            assert!(
+                !cand.fn_source.contains("black_box"),
+                "candidate must not emit dead-code black_box:\n{}",
+                cand.fn_source
+            );
             for m in &cand.applied_mutators {
                 seen_mutators.insert(m.as_str());
             }
@@ -493,7 +1616,6 @@ mod tests {
             );
         }
 
-        // Across 15 candidates all 5 Miri mutators must have fired at least once.
         for expected in [
             "ArithmeticCastMutator",
             "PlaceProjectionWrapper",
@@ -506,5 +1628,110 @@ mod tests {
                 "expected mutator `{expected}` to appear in batch"
             );
         }
+    }
+
+    #[test]
+    fn semantic_mutators_perform_cast_swaps_char_enum_transmutes_index_and_aliasing_reorder() {
+        // 1. Cast swaps in ArithAstPerturber
+        let cast_seed = "pub fn cast_fn() -> i32 { let x: i8 = -5i8; (x as i32) }\n";
+        let mut saw_cast_swap = false;
+        for s in 0..16u64 {
+            let mut f = syn::parse_file(cast_seed).unwrap();
+            let mut rng = DetRng::new(s);
+            let mut locals = Vec::new();
+            ArithmeticCastMutator.mutate_with_mode(
+                &mut f,
+                &mut rng,
+                MutationMode::PerturbAst,
+                &mut locals,
+            );
+            let out = prettyplease::unparse(&f);
+            if out.contains("as i32") && (out.contains("as u") || out.contains("as i16") || out.contains("as i64") || out.contains("as isize")) {
+                saw_cast_swap = true;
+                break;
+            }
+        }
+        assert!(saw_cast_swap, "ArithmeticCastMutator must perform Expr::Cast swaps");
+
+        // 2. Invalid char and ColorTag enum transmutes in BitValidityTransmuteMutator
+        let base_seed = "pub fn val_fn() -> u32 { 1u32 }\n";
+        let mut saw_char_ub = false;
+        let mut saw_enum_ub = false;
+        for s in 0..32u64 {
+            let mut f = syn::parse_file(base_seed).unwrap();
+            let mut rng = DetRng::new(s);
+            let mut locals = Vec::new();
+            BitValidityTransmuteMutator.mutate_with_mode(
+                &mut f,
+                &mut rng,
+                MutationMode::Ub,
+                &mut locals,
+            );
+            let out = prettyplease::unparse(&f);
+            if out.contains("__bad_ch: char = unsafe { transmute") {
+                saw_char_ub = true;
+            }
+            if out.contains("__bad_tag: ColorTag = unsafe { transmute") {
+                saw_enum_ub = true;
+            }
+        }
+        assert!(saw_char_ub, "BitValidityTransmuteMutator must emit invalid char transmutes");
+        assert!(saw_enum_ub, "BitValidityTransmuteMutator must emit invalid ColorTag transmutes");
+
+        // 3. Array index perturbation in PlaceProjectionWrapper
+        let idx_seed = "pub fn idx_fn() -> u32 { let arr: [u32; 4] = [1, 2, 3, 4]; arr[0] }\n";
+        let mut saw_idx_perturb = false;
+        for s in 0..16u64 {
+            let mut f = syn::parse_file(idx_seed).unwrap();
+            let mut rng = DetRng::new(s);
+            let mut locals = Vec::new();
+            PlaceProjectionWrapper.mutate_with_mode(
+                &mut f,
+                &mut rng,
+                MutationMode::Pass,
+                &mut locals,
+            );
+            let out = prettyplease::unparse(&f);
+            if out.contains("arr[1usize]") || out.contains("arr[1]") {
+                saw_idx_perturb = true;
+                break;
+            }
+        }
+        assert!(saw_idx_perturb, "PlaceProjectionWrapper must perturb Expr::Index in place");
+
+        // 4. Aliasing statement reordering in TreeBorrowsRetagInterleaver
+        let tb_seed = "\
+pub fn tb_fn() -> u32 {
+    let mut x: u32 = 1;
+    let p1: *mut u32 = &raw mut x;
+    let r2: &mut u32 = unsafe { &mut *p1 };
+    *r2 = 2;
+    let _y = unsafe { *p1 };
+    *r2
+}
+";
+        let mut saw_reorder = false;
+        for s in 0..16u64 {
+            let mut f = syn::parse_file(tb_seed).unwrap();
+            let mut rng = DetRng::new(s);
+            let mut locals = Vec::new();
+            TreeBorrowsRetagInterleaver.mutate_with_mode(
+                &mut f,
+                &mut rng,
+                MutationMode::PerturbAst,
+                &mut locals,
+            );
+            let out = prettyplease::unparse(&f);
+            let pos_read = out.find("let _y = unsafe { *p1 };").expect("read stmt");
+            let pos_write = out.find("*r2 = 2;").expect("write stmt");
+            if pos_read < pos_write {
+                saw_reorder = true;
+                break;
+            }
+        }
+        assert!(
+            saw_reorder,
+            "TreeBorrowsRetagInterleaver must reorder adjacent aliasing access statements"
+        );
     }
 }

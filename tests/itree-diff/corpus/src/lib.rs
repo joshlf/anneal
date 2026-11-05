@@ -1,4 +1,13 @@
-#![cfg_attr(not(test), no_std)]
+// Copyright 2026 The Fuchsia Authors
+//
+// Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+// license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+// This file may not be copied, modified, or distributed except according to
+// those terms.
+
+#![cfg_attr(not(any(test, anneal_trace_ext, anneal_mir_instrument)), no_std)]
+#![allow(unexpected_cfgs)]
 //! Curated 30-function seed corpus for Anneal ITree trace differential testing (`tests/itree-diff/`).
 //!
 //! Organized into 6 categories (5 functions per category = 30 functions):
@@ -13,6 +22,7 @@
 // Shared types & helper / external callees
 // ============================================================================
 
+#[anneal_trace::capture]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaddedHeader {
@@ -21,6 +31,7 @@ pub struct PaddedHeader {
     pub len: u32,
 }
 
+#[anneal_trace::capture]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NestedPair {
@@ -30,6 +41,7 @@ pub struct NestedPair {
     pub right: u32,
 }
 
+#[anneal_trace::capture]
 #[repr(u8)]
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +52,7 @@ pub enum DispatchMode {
     SelectLeft = 3,
 }
 
+#[anneal_trace::capture]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MaybeU32 {
@@ -48,6 +61,7 @@ pub struct MaybeU32 {
     pub val: u32,
 }
 
+#[anneal_trace::capture]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutcomeU16 {
@@ -57,16 +71,19 @@ pub struct OutcomeU16 {
     pub err_code: u16,
 }
 
+#[anneal_trace::external]
 #[inline(never)]
 pub fn ext_transform_u32(v: u32) -> u32 {
     v * 3 + 7
 }
 
+#[anneal_trace::external]
 #[inline(never)]
 pub fn ext_combine_u32(a: u32, b: u32) -> u32 {
     a + (b * 5)
 }
 
+#[anneal_trace::external]
 #[inline(never)]
 pub fn ext_may_panic_u32(trigger: u32, x: u32) -> u32 {
     if trigger == 0xDEAD {
@@ -75,21 +92,25 @@ pub fn ext_may_panic_u32(trigger: u32, x: u32) -> u32 {
     x + trigger
 }
 
+#[anneal_trace::external]
 #[inline(never)]
 pub fn helper_add_const(x: u32, c: u32) -> u32 {
     x + c
 }
 
+#[anneal_trace::external]
 #[inline(never)]
 pub fn helper_xor_fold(a: u32, b: u32) -> u32 {
     (a ^ b) + (a & 0xFF)
 }
 
+#[anneal_trace::external]
 #[inline(never)]
 pub fn helper_step_counter(cur: u32, delta: u32) -> u32 {
     (cur + delta) * 2
 }
 
+#[anneal_trace::external]
 #[inline(never)]
 pub fn helper_depth_step(n: u32, acc: u32) -> u32 {
     if n == 0 {
@@ -118,32 +139,36 @@ pub fn clamp_u32_range(x: u32, lo: u32, hi: u32) -> u32 {
 pub fn rotate_xor_mix(a: u32, b: u32, shift: u32) -> u32 {
     let s = shift & 7;
     let mixed = a ^ b;
-    mixed.wrapping_shl(s) | mixed.wrapping_shr(32u32.wrapping_sub(s) & 31)
+    if s == 0 {
+        mixed
+    } else {
+        (mixed << s) | (mixed >> (32 - s))
+    }
 }
 
 #[inline(never)]
 pub fn checked_affine_step(x: u32, scale: u32, bias: u32) -> u32 {
-    let prod = x.wrapping_mul(scale);
-    if prod > u32::MAX.wrapping_sub(bias) {
+    let prod = x * scale;
+    if prod > u32::MAX - bias {
         u32::MAX
     } else {
-        prod.wrapping_add(bias)
+        prod + bias
     }
 }
 
 #[inline(never)]
 pub fn signed_abs_diff(a: i32, b: i32) -> u32 {
     if a >= b {
-        (a as u32).wrapping_sub(b as u32)
+        (a - b) as u32
     } else {
-        (b as u32).wrapping_sub(a as u32)
+        (b - a) as u32
     }
 }
 
 #[inline(never)]
 pub fn bitfield_extract(word: u32, offset: u32, mask: u32) -> u32 {
     let safe_off = offset & 15;
-    (word.wrapping_shr(safe_off)) & mask
+    (word >> safe_off) & mask
 }
 
 // ============================================================================
@@ -161,9 +186,9 @@ pub fn repr_c_padded_header(hdr: PaddedHeader, bonus: u32) -> u32 {
 
 #[inline(never)]
 pub fn nested_tuple_struct_sum(pair: NestedPair, scale: u32) -> u32 {
-    let base = pair.left.wrapping_add(pair.right);
+    let base = pair.left + pair.right;
     if pair.flag != 0 {
-        base.wrapping_mul(scale)
+        base * scale
     } else {
         base
     }
@@ -172,8 +197,14 @@ pub fn nested_tuple_struct_sum(pair: NestedPair, scale: u32) -> u32 {
 #[inline(never)]
 pub fn c_like_enum_dispatch(mode: DispatchMode, x: u32, y: u32) -> u32 {
     match mode {
-        DispatchMode::Add => x.wrapping_add(y),
-        DispatchMode::Sub => x.wrapping_sub(y),
+        DispatchMode::Add => x + y,
+        DispatchMode::Sub => {
+            if x >= y {
+                x - y
+            } else {
+                y - x
+            }
+        }
         DispatchMode::Xor => x ^ y,
         DispatchMode::SelectLeft => x,
     }
@@ -182,7 +213,7 @@ pub fn c_like_enum_dispatch(mode: DispatchMode, x: u32, y: u32) -> u32 {
 #[inline(never)]
 pub fn option_u32_map_or(opt: MaybeU32, fallback: u32, addend: u32) -> u32 {
     if opt.is_some {
-        opt.val.wrapping_add(addend)
+        opt.val + addend
     } else {
         fallback
     }
@@ -193,7 +224,7 @@ pub fn result_u16_unwrap_or(res: OutcomeU16, default_val: u16) -> u16 {
     if res.is_ok {
         res.ok_val
     } else {
-        res.err_code.wrapping_add(default_val)
+        res.err_code + default_val
     }
 }
 
@@ -204,9 +235,15 @@ pub fn result_u16_unwrap_or(res: OutcomeU16, default_val: u16) -> u16 {
 #[inline(never)]
 pub fn match_four_way_tag(tag: u32, a: u32, b: u32) -> u32 {
     match tag {
-        0 => a.wrapping_add(b),
-        1 => a.wrapping_mul(2).wrapping_add(b),
-        2 => b.wrapping_sub(a),
+        0 => a + b,
+        1 => (a * 2) + b,
+        2 => {
+            if b >= a {
+                b - a
+            } else {
+                a - b
+            }
+        }
         _ => a ^ b ^ 0x55,
     }
 }
@@ -214,11 +251,13 @@ pub fn match_four_way_tag(tag: u32, a: u32, b: u32) -> u32 {
 #[inline(never)]
 pub fn short_circuit_guard_chain(a: u32, b: u32, c: u32) -> u32 {
     if a > 0 && b > a && c > b {
-        a.wrapping_add(b).wrapping_add(c)
+        a + b + c
     } else if a == 0 || b == 0 {
         c
+    } else if b >= a {
+        b - a
     } else {
-        b.wrapping_sub(a)
+        a - b
     }
 }
 
@@ -228,8 +267,8 @@ pub fn while_loop_accumulate(limit: u32, step: u32) -> u32 {
     let mut i = 0u32;
     let mut acc = 0u32;
     while i < bounded {
-        acc = acc.wrapping_add(i.wrapping_mul(step));
-        i = i.wrapping_add(1);
+        acc = acc + (i * step);
+        i = i + 1;
     }
     acc
 }
@@ -255,14 +294,14 @@ pub fn early_return_search_4(k0: u32, k1: u32, k2: u32, k3: u32, needle: u32) ->
 pub fn nested_if_else_matrix(row: u32, col: u32, val: u32) -> u32 {
     if row < 2 {
         if col < 2 {
-            val.wrapping_add(10)
+            val + 10
         } else {
-            val.wrapping_add(20)
+            val + 20
         }
     } else if col < 2 {
-        val.wrapping_add(30)
+        val + 30
     } else {
-        val.wrapping_add(40)
+        val + 40
     }
 }
 
@@ -279,7 +318,7 @@ pub fn call_once_and_postprocess(x: u32, bias: u32) -> u32 {
 #[inline(never)]
 pub fn call_twice_sequential(x: u32, y: u32) -> u32 {
     let first = ext_transform_u32(x);
-    let second = ext_transform_u32(first.wrapping_add(y));
+    let second = ext_transform_u32(first + y);
     second
 }
 
@@ -303,7 +342,7 @@ pub fn call_in_bounded_loop_3x(seed: u32) -> u32 {
 #[inline(never)]
 pub fn callee_panic_unwind_recovery(trigger: u32, x: u32) -> u32 {
     let out = ext_may_panic_u32(trigger, x);
-    out.wrapping_add(1)
+    out + 1
 }
 
 // ============================================================================
@@ -335,7 +374,7 @@ pub fn conditional_helper_dispatch(flag: u32, x: u32, y: u32) -> u32 {
 #[inline(never)]
 pub fn stateful_counter_pair(start: u32, delta: u32) -> u32 {
     let mid = helper_step_counter(start, delta);
-    helper_step_counter(mid, delta.wrapping_add(1))
+    helper_step_counter(mid, delta + 1)
 }
 
 #[inline(never)]
@@ -351,7 +390,7 @@ pub fn recursive_depth_2_unroll(n: u32, acc: u32) -> u32 {
 
 #[inline(never)]
 pub fn ref_u32_passthrough(r: &u32, addend: u32) -> u32 {
-    (*r).wrapping_add(addend)
+    (*r) + addend
 }
 
 #[inline(never)]
@@ -365,7 +404,7 @@ pub fn pair_of_refs_select(choose_first: bool, a: &u32, b: &u32) -> u32 {
 
 #[inline(never)]
 pub fn struct_field_ref_project(hdr: &PaddedHeader) -> u32 {
-    (hdr.tag as u32).wrapping_add(hdr.len)
+    (hdr.tag as u32) + hdr.len
 }
 
 #[inline(never)]
@@ -378,7 +417,7 @@ pub fn slice_len_and_ptr_meta(first_elem: &u32, len: usize) -> usize {
     if len == 0 {
         0
     } else {
-        (*first_elem as usize).wrapping_add(len)
+        (*first_elem as usize) + len
     }
 }
 

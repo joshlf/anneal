@@ -93,8 +93,7 @@ note = "The edit Section 6 invites: an unannotated function that can panic on ov
 append = [{ path = "src/lib.rs", text = "\npub fn advance_offset(offset: u8) -> u8 {\n    offset + 4\n}\n" }]
 run = "verify"
 expect = "failure"
-stdout_contains = ["Type mismatch", "True.intro"]
-stderr_contains = ["lake build failed"]
+stderr_contains = ["lake build failed", "Type mismatch", "True.intro"]
 
 # ---------------------------------------------------------------------------
 # Chapter 2: Adding Specifications in Rust — examples/tutor-ch2/

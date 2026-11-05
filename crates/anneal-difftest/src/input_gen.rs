@@ -8,8 +8,8 @@
 //! - [`LayoutAwareByteBuilder`]: materializes byte buffers for arbitrary [`LayoutSpec`]s
 //!   with an 80% dictionary-boundary / 20% uniform [`arbitrary::Unstructured`] bias,
 //!   deterministic non-zero padding noise (`0xA5`, `0x5A`, `0xFF`, or seeded non-zero PRNG),
-//!   and configurable `validity_fault_rate_pct` (e.g. 5% for negative `miri-difftest` testing
-//!   vs. 0% for safe `itree-difftest` testing).
+//!   and configurable `validity_fault_rate_pct` (a nonzero rate injects invalid
+//!   bit patterns; 0% keeps every value valid).
 //! - [`EnvScheduleGenerator`]: synthesizes reactive `inputs-over-time` [`EnvSchedule`]s
 //!   per external callee (constant, monotonic counter, alternating `Ok`/`Err`,
 //!   dictionary-drawn values, and `PanicOnCall(k)` unwinding injection).
@@ -23,7 +23,7 @@ use arbitrary::Unstructured;
 use syn::visit::{self, Visit};
 use syn::{BinOp, Expr, ExprBinary, ExprField, ExprLit, ExprMatch, ExprMethodCall, Lit, Member, Pat};
 
-use crate::instrument::{EnvSchedule, TraceRecorder};
+use crate::instrument::{EnvSchedule, FromScheduleBytes, ScheduleError, TraceRecorder};
 
 /// Bitmask covering the lowest `bit_width` bits (`1..=128`).
 #[inline]
@@ -167,6 +167,30 @@ impl ScalarLayout {
     pub fn bit_width(&self) -> u32 {
         (self.size_bytes * 8) as u32
     }
+
+    /// Maps an arbitrary `u128` bit pattern into a valid bit pattern for `self`
+    /// (`0..=1` for `bool`, a valid Unicode scalar value for `char`, and within
+    /// `valid_start..=valid_end` for ranged integers).
+    pub fn clamp_to_valid_bits(&self, raw: u128) -> u128 {
+        if self.is_bool {
+            return raw & 1;
+        }
+        if self.is_char {
+            const CHARS: [u32; 6] = [0, b'A' as u32, b'0' as u32, 0x00FF, 0xD7FF, 0x10_FFFF];
+            return CHARS[(raw as usize) % CHARS.len()] as u128;
+        }
+        let masked = raw & width_mask(self.bit_width());
+        if masked < self.valid_start || masked > self.valid_end {
+            let span = self.valid_end.saturating_sub(self.valid_start);
+            if span == 0 {
+                self.valid_start
+            } else {
+                self.valid_start + (masked % span.saturating_add(1))
+            }
+        } else {
+            masked
+        }
+    }
 }
 
 /// Struct field descriptor with explicit byte offset inside its enclosing struct.
@@ -238,6 +262,131 @@ impl LayoutSpec {
             .enumerate()
             .filter_map(|(idx, &is_data)| if !is_data { Some(idx) } else { None })
             .collect()
+    }
+
+    /// Masks all inter-field and trailing padding positions in `raw` as `None`
+    /// (unknown / uninitialized) while preserving occupied field bytes as
+    /// `Some(byte)`.
+    pub fn mask_padding_as_unknown(&self, raw: &[u8]) -> Result<Vec<Option<u8>>, ScheduleError> {
+        let total = self.total_size();
+        if raw.len() != total {
+            return Err(ScheduleError::PayloadSizeMismatch {
+                context: "LayoutSpec::mask_padding_as_unknown".to_string(),
+                expected: total,
+                actual: raw.len(),
+            });
+        }
+        let mut occupied = vec![false; total];
+        self.mark_occupied(0, &mut occupied);
+        Ok(raw
+            .iter()
+            .zip(occupied.iter())
+            .map(|(&b, &is_data)| if is_data { Some(b) } else { None })
+            .collect())
+    }
+
+    /// Validates that `raw` has length `self.total_size()` and that all scalar
+    /// fields and enum tags satisfy their bit-validity invariants.
+    pub fn validate_bytes(&self, raw: &[u8]) -> Result<(), ScheduleError> {
+        let total = self.total_size();
+        if raw.len() != total {
+            return Err(ScheduleError::PayloadSizeMismatch {
+                context: "LayoutSpec::validate_bytes".to_string(),
+                expected: total,
+                actual: raw.len(),
+            });
+        }
+        self.validate_at(0, raw)
+    }
+
+    fn validate_at(&self, base_offset: usize, raw: &[u8]) -> Result<(), ScheduleError> {
+        match self {
+            Self::Scalar(scalar) => {
+                let n = scalar.size_bytes.min(16);
+                let mut le = [0u8; 16];
+                le[..n].copy_from_slice(&raw[base_offset..base_offset + n]);
+                let val = u128::from_le_bytes(le) & width_mask(scalar.bit_width());
+                if scalar.is_bool && val > 1 {
+                    return Err(ScheduleError::InvalidBitPattern {
+                        context: "bool".to_string(),
+                        reason: format!("expected 0 or 1 at offset {base_offset}, got {val:#x}"),
+                    });
+                }
+                if scalar.is_char {
+                    let Ok(code) = u32::try_from(val) else {
+                        return Err(ScheduleError::InvalidBitPattern {
+                            context: "char".to_string(),
+                            reason: format!("out-of-range char bits {val:#x}"),
+                        });
+                    };
+                    if char::from_u32(code).is_none() {
+                        return Err(ScheduleError::InvalidBitPattern {
+                            context: "char".to_string(),
+                            reason: format!(
+                                "invalid Unicode scalar value {code:#x} at offset {base_offset}"
+                            ),
+                        });
+                    }
+                }
+                if val < scalar.valid_start || val > scalar.valid_end {
+                    return Err(ScheduleError::InvalidBitPattern {
+                        context: "ScalarLayout".to_string(),
+                        reason: format!(
+                            "scalar bits {val:#x} at offset {base_offset} outside valid range \
+                             [{:#x}, {:#x}]",
+                            scalar.valid_start, scalar.valid_end
+                        ),
+                    });
+                }
+                Ok(())
+            }
+            Self::Struct { fields, .. } => {
+                for field in fields {
+                    field.layout.validate_at(base_offset + field.offset, raw)?;
+                }
+                Ok(())
+            }
+            Self::Tuple { elements, .. } => {
+                for (off, elem) in elements {
+                    elem.validate_at(base_offset + *off, raw)?;
+                }
+                Ok(())
+            }
+            Self::Array {
+                elem,
+                elem_stride,
+                len,
+            } => {
+                for i in 0..*len {
+                    elem.validate_at(base_offset + i * (*elem_stride), raw)?;
+                }
+                Ok(())
+            }
+            Self::Enum {
+                tag_offset,
+                tag_size,
+                variants,
+                ..
+            } => {
+                let n = (*tag_size).min(16);
+                let mut le = [0u8; 16];
+                le[..n].copy_from_slice(&raw[base_offset + *tag_offset..base_offset + *tag_offset + n]);
+                let tag = u128::from_le_bytes(le) & width_mask((n * 8) as u32);
+                let Some(variant) = variants.iter().find(|v| v.discriminant == tag) else {
+                    return Err(ScheduleError::InvalidBitPattern {
+                        context: "EnumLayout".to_string(),
+                        reason: format!(
+                            "discriminant {tag:#x} at offset {} does not match any variant",
+                            base_offset + *tag_offset
+                        ),
+                    });
+                };
+                if let Some(payload) = &variant.payload {
+                    payload.validate_at(base_offset + variant.payload_offset, raw)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn mark_occupied(&self, base_offset: usize, occupied: &mut [bool]) {
@@ -843,7 +992,7 @@ pub struct LayoutAwareByteBuilder<'a> {
     pub dictionary_bias_pct: u8,
     /// Probability (`0..=100`) of injecting an invalid niche/discriminant bit pattern (`bool = 2`,
     /// surrogate `char = 0xD800`, out-of-range scalar validity, invalid enum tag).
-    /// Set to `5` for negative `miri-difftest` testing and `0` for safe `itree-difftest` testing.
+    /// `0` keeps every generated value valid.
     pub validity_fault_rate_pct: u8,
     /// Non-zero fill pattern written to all inter-field and trailing padding bytes.
     pub padding_pattern: PaddingFillPattern,
@@ -896,29 +1045,35 @@ impl<'a> LayoutAwareByteBuilder<'a> {
         buf
     }
 
-    /// Materializes both the raw byte buffer (including non-zero padding bytes) and an
-    /// owned `T: Copy` value by reading the layout-exact buffer with `core::ptr::read_unaligned`.
+    /// Materializes both the raw byte buffer (including non-zero padding bytes)
+    /// and a validated `T: FromScheduleBytes` value without `unsafe` or
+    /// `MaybeUninit::assume_init`.
+    pub fn materialize_checked<T: FromScheduleBytes>(
+        &self,
+        spec: &LayoutSpec,
+        u: &mut Unstructured<'_>,
+    ) -> Result<(Vec<u8>, T), ScheduleError> {
+        let bytes = self.build_bytes(spec, u);
+        spec.validate_bytes(&bytes)?;
+        let val = T::from_schedule_bytes(&bytes)?;
+        Ok((bytes, val))
+    }
+
+    /// Materializes both the raw byte buffer (including non-zero padding bytes)
+    /// and an owned `T: Copy + FromScheduleBytes` value using safe field-by-field
+    /// decoding.
     ///
-    /// # Safety
-    /// Caller must ensure `spec.total_size() == core::mem::size_of::<T>()` and that any
-    /// injected bit patterns are valid for `T` (keep `validity_fault_rate_pct == 0` when
-    /// materializing typed Rust values in safe harnesses).
-    pub unsafe fn materialize_copy<T: Copy>(
+    /// # Panics
+    ///
+    /// Panics if `spec.total_size() != size_of::<T>()` or if the generated
+    /// bytes fail `LayoutSpec` or `T::from_schedule_bytes` bit-validity checks.
+    pub fn materialize_copy<T: Copy + FromScheduleBytes>(
         &self,
         spec: &LayoutSpec,
         u: &mut Unstructured<'_>,
     ) -> (Vec<u8>, T) {
-        let bytes = self.build_bytes(spec, u);
-        assert_eq!(
-            bytes.len(),
-            core::mem::size_of::<T>(),
-            "LayoutSpec total_size ({}) must equal size_of::<T>() ({})",
-            bytes.len(),
-            core::mem::size_of::<T>()
-        );
-        // SAFETY: `bytes.len() == size_of::<T>()` and caller guarantees bit validity for `T`.
-        let val = unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const T) };
-        (bytes, val)
+        self.materialize_checked::<T>(spec, u)
+            .unwrap_or_else(|err| panic!("materialize_copy failed validation: {err}"))
     }
 
     /// Draws a single `u32` scalar using the configured dictionary bias and optional field hint.
@@ -1021,7 +1176,7 @@ impl<'a> LayoutAwareByteBuilder<'a> {
         let bits = scalar.bit_width();
         let mask = width_mask(bits);
 
-        // Optional negative bit-validity fault injection (`miri-difftest` mode).
+        // Optional bit-validity fault injection.
         if self.validity_fault_rate_pct > 0 && rng.roll_percent() < self.validity_fault_rate_pct {
             if scalar.is_bool {
                 // Invalid `bool` bit pattern (`2`..=`255`).
@@ -1127,6 +1282,10 @@ pub struct EnvScheduleGenerator<'a> {
     pub horizon_steps: usize,
     /// Percentage of generated schedules that inject `PanicOnCall(k)` (default `25%`).
     pub panic_injection_pct: u8,
+    /// Per-callee expected return [`LayoutSpec`]s used to validate schedule
+    /// payload sizes and bit-validity invariants at generation time. Callees
+    /// not explicitly registered default to a 4-byte `u32` scalar layout.
+    pub callee_return_layouts: BTreeMap<String, LayoutSpec>,
 }
 
 impl<'a> EnvScheduleGenerator<'a> {
@@ -1136,6 +1295,7 @@ impl<'a> EnvScheduleGenerator<'a> {
             dict,
             horizon_steps: 8,
             panic_injection_pct: 25,
+            callee_return_layouts: BTreeMap::new(),
         }
     }
 
@@ -1151,31 +1311,182 @@ impl<'a> EnvScheduleGenerator<'a> {
         self
     }
 
-    /// Applies an explicit [`EnvStrategy`] for `callee` onto `schedule`.
-    pub fn apply_strategy(
+    /// Registers the expected return [`LayoutSpec`] for `callee` and returns `self`.
+    pub fn with_callee_return_layout(mut self, callee: &str, layout: LayoutSpec) -> Self {
+        self.set_callee_return_layout(callee, layout);
+        self
+    }
+
+    /// Registers the expected return [`LayoutSpec`] for `callee`.
+    pub fn set_callee_return_layout(&mut self, callee: &str, layout: LayoutSpec) {
+        self.callee_return_layouts
+            .insert(callee.to_string(), layout);
+    }
+
+    /// Returns the expected return [`LayoutSpec`] for `callee`, defaulting to
+    /// `LayoutSpec::Scalar(ScalarLayout::u32())` (4 bytes) when not explicitly
+    /// registered.
+    pub fn expected_callee_layout(&self, callee: &str) -> LayoutSpec {
+        if let Some(spec) = self.callee_return_layouts.get(callee) {
+            return spec.clone();
+        }
+        if let Some((_, short)) = callee.rsplit_once("::")
+            && let Some(spec) = self.callee_return_layouts.get(short)
+        {
+            return spec.clone();
+        }
+        LayoutSpec::Scalar(ScalarLayout::u32())
+    }
+
+    /// Validates at schedule generation time that `strategy` produces payloads
+    /// whose byte size and bit-validity invariants match `callee`'s expected
+    /// return [`LayoutSpec`].
+    pub fn validate_strategy(
         &self,
-        schedule: &mut EnvSchedule,
         callee: &str,
         strategy: &EnvStrategy,
-        u: &mut Unstructured<'_>,
-    ) {
-        let mut rng = EntropyStream::new(u, 0xFACE_B00C_1234_5678);
+    ) -> Result<usize, ScheduleError> {
+        let layout = self.expected_callee_layout(callee);
+        let expected_size = layout.total_size();
         match strategy {
             EnvStrategy::Constant(bytes) => {
-                for _ in 0..self.horizon_steps {
-                    schedule.push_callee_response(callee, bytes.clone());
+                if bytes.len() != expected_size {
+                    return Err(ScheduleError::PayloadSizeMismatch {
+                        context: callee.to_string(),
+                        expected: expected_size,
+                        actual: bytes.len(),
+                    });
                 }
-                schedule.set_callee_default(callee, bytes.clone());
+                layout.validate_bytes(bytes)?;
             }
             EnvStrategy::MonotonicCounter {
                 start,
                 step,
                 width_bytes,
             } => {
-                let w = (*width_bytes).clamp(1, 8);
+                if *width_bytes != expected_size {
+                    return Err(ScheduleError::PayloadSizeMismatch {
+                        context: callee.to_string(),
+                        expected: expected_size,
+                        actual: *width_bytes,
+                    });
+                }
+                let steps = self.horizon_steps.max(1);
+                let w = *width_bytes;
+                for k in 0..steps {
+                    let raw = start.wrapping_add((k as u64).wrapping_mul(*step)) as u128;
+                    let val = if let LayoutSpec::Scalar(ref scalar) = layout {
+                        scalar.clamp_to_valid_bits(raw)
+                    } else {
+                        raw
+                    };
+                    let le = val.to_le_bytes();
+                    let mut payload = vec![0u8; w];
+                    let copy_len = w.min(le.len());
+                    payload[..copy_len].copy_from_slice(&le[..copy_len]);
+                    layout.validate_bytes(&payload)?;
+                }
+            }
+            EnvStrategy::AlternatingOkErr {
+                ok_bytes,
+                err_bytes,
+            } => {
+                if ok_bytes.len() != expected_size {
+                    return Err(ScheduleError::PayloadSizeMismatch {
+                        context: callee.to_string(),
+                        expected: expected_size,
+                        actual: ok_bytes.len(),
+                    });
+                }
+                if err_bytes.len() != expected_size {
+                    return Err(ScheduleError::PayloadSizeMismatch {
+                        context: callee.to_string(),
+                        expected: expected_size,
+                        actual: err_bytes.len(),
+                    });
+                }
+                layout.validate_bytes(ok_bytes)?;
+                layout.validate_bytes(err_bytes)?;
+            }
+            EnvStrategy::DictionaryDrawn { width_bytes } => {
+                if *width_bytes != expected_size {
+                    return Err(ScheduleError::PayloadSizeMismatch {
+                        context: callee.to_string(),
+                        expected: expected_size,
+                        actual: *width_bytes,
+                    });
+                }
+                let LayoutSpec::Scalar(ref scalar) = layout else {
+                    return Err(ScheduleError::InvalidBitPattern {
+                        context: callee.to_string(),
+                        reason: "DictionaryDrawn requires a scalar return layout".to_string(),
+                    });
+                };
+                let w = *width_bytes;
+                let slice = self.dict.boundary_slice_for_width((w * 8) as u32);
+                if slice.is_empty() {
+                    let chosen = scalar.clamp_to_valid_bits(0);
+                    let le = chosen.to_le_bytes();
+                    let mut payload = vec![0u8; w];
+                    let copy_len = w.min(le.len());
+                    payload[..copy_len].copy_from_slice(&le[..copy_len]);
+                    layout.validate_bytes(&payload)?;
+                } else {
+                    for &raw in slice {
+                        let chosen = scalar.clamp_to_valid_bits(raw);
+                        let le = chosen.to_le_bytes();
+                        let mut payload = vec![0u8; w];
+                        let copy_len = w.min(le.len());
+                        payload[..copy_len].copy_from_slice(&le[..copy_len]);
+                        layout.validate_bytes(&payload)?;
+                    }
+                }
+            }
+            EnvStrategy::PanicOnCall(_) => {}
+        }
+        Ok(expected_size)
+    }
+
+    /// Applies an explicit [`EnvStrategy`] for `callee` onto `schedule`,
+    /// rejecting any strategy whose payload size or bit pattern does not match
+    /// `callee`'s expected return layout.
+    pub fn apply_strategy_checked(
+        &self,
+        schedule: &mut EnvSchedule,
+        callee: &str,
+        strategy: &EnvStrategy,
+        u: &mut Unstructured<'_>,
+    ) -> Result<(), ScheduleError> {
+        let layout = self.expected_callee_layout(callee);
+        let expected_size = self.validate_strategy(callee, strategy)?;
+        schedule.register_callee_return_size(callee, expected_size);
+        let mut rng = EntropyStream::new(u, 0xFACE_B00C_1234_5678);
+        match strategy {
+            EnvStrategy::Constant(bytes) => {
+                for _ in 0..self.horizon_steps {
+                    schedule.push_callee_response_checked(callee, bytes.clone())?;
+                }
+                schedule.set_callee_default_checked(callee, bytes.clone())?;
+            }
+            EnvStrategy::MonotonicCounter {
+                start,
+                step,
+                width_bytes,
+            } => {
+                let w = *width_bytes;
                 for k in 0..self.horizon_steps {
-                    let val = start.wrapping_add((k as u64).wrapping_mul(*step));
-                    schedule.push_callee_response(callee, val.to_le_bytes()[..w].to_vec());
+                    let raw = start.wrapping_add((k as u64).wrapping_mul(*step)) as u128;
+                    let val = if let LayoutSpec::Scalar(ref scalar) = layout {
+                        scalar.clamp_to_valid_bits(raw)
+                    } else {
+                        raw
+                    };
+                    let le = val.to_le_bytes();
+                    let mut payload = vec![0u8; w];
+                    let copy_len = w.min(le.len());
+                    payload[..copy_len].copy_from_slice(&le[..copy_len]);
+                    layout.validate_bytes(&payload)?;
+                    schedule.push_callee_response_checked(callee, payload)?;
                 }
             }
             EnvStrategy::AlternatingOkErr {
@@ -1184,60 +1495,129 @@ impl<'a> EnvScheduleGenerator<'a> {
             } => {
                 for k in 0..self.horizon_steps {
                     if k.is_multiple_of(2) {
-                        schedule.push_callee_response(callee, ok_bytes.clone());
+                        schedule.push_callee_response_checked(callee, ok_bytes.clone())?;
                     } else {
-                        schedule.push_callee_response(callee, err_bytes.clone());
+                        schedule.push_callee_response_checked(callee, err_bytes.clone())?;
                     }
                 }
             }
             EnvStrategy::DictionaryDrawn { width_bytes } => {
-                let w = (*width_bytes).clamp(1, 16);
+                let w = *width_bytes;
                 let slice = self.dict.boundary_slice_for_width((w * 8) as u32);
                 for _ in 0..self.horizon_steps {
-                    let chosen = if !slice.is_empty() {
+                    let raw = if !slice.is_empty() {
                         slice[rng.choose_index(slice.len())]
                     } else {
                         0
                     };
-                    schedule.push_callee_response(callee, chosen.to_le_bytes()[..w].to_vec());
+                    let chosen = if let LayoutSpec::Scalar(ref scalar) = layout {
+                        scalar.clamp_to_valid_bits(raw)
+                    } else {
+                        raw
+                    };
+                    let le = chosen.to_le_bytes();
+                    let mut payload = vec![0u8; w];
+                    let copy_len = w.min(le.len());
+                    payload[..copy_len].copy_from_slice(&le[..copy_len]);
+                    layout.validate_bytes(&payload)?;
+                    schedule.push_callee_response_checked(callee, payload)?;
                 }
             }
             EnvStrategy::PanicOnCall(call_idx) => {
                 schedule.set_callee_panic_on_call(callee, *call_idx);
             }
         }
+        Ok(())
+    }
+
+    /// Applies an explicit [`EnvStrategy`] for `callee` onto `schedule`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `strategy` produces payloads whose byte length or bit pattern
+    /// does not match `callee`'s expected return layout.
+    pub fn apply_strategy(
+        &self,
+        schedule: &mut EnvSchedule,
+        callee: &str,
+        strategy: &EnvStrategy,
+        u: &mut Unstructured<'_>,
+    ) {
+        self.apply_strategy_checked(schedule, callee, strategy, u)
+            .unwrap_or_else(|err| panic!("invalid EnvStrategy for `{callee}`: {err}"));
     }
 
     /// Generates a complete multi-callee [`EnvSchedule`] by selecting one of the 5 reactive
-    /// environment strategies per callee from `u`.
+    /// environment strategies per callee from `u`, validating every payload against the
+    /// callee's expected return layout.
     pub fn generate_schedule(&self, callees: &[&str], u: &mut Unstructured<'_>) -> EnvSchedule {
         let mut schedule = EnvSchedule::new();
         let mut chosen_strategies = Vec::with_capacity(callees.len());
+        let builder = LayoutAwareByteBuilder::new(self.dict);
 
         {
             let mut rng = EntropyStream::new(u, 0xCAFE_F00D_0123_4567);
             for &callee in callees {
+                let layout = self.expected_callee_layout(callee);
+                let expected_size = layout.total_size();
+                schedule.register_callee_return_size(callee, expected_size);
                 let roll = rng.roll_percent();
                 let strategy = if roll < self.panic_injection_pct {
-                    // Inject a deterministic `PanicOnCall(0)` (or early call index) to test unwinding.
                     EnvStrategy::PanicOnCall(0)
+                } else if !matches!(layout, LayoutSpec::Scalar(_)) {
+                    match rng.next_u64() % 2 {
+                        0 => {
+                            let seed = rng.next_u64().to_le_bytes();
+                            let mut sub_u = Unstructured::new(&seed);
+                            let bytes = builder.build_bytes(&layout, &mut sub_u);
+                            EnvStrategy::Constant(bytes)
+                        }
+                        _ => {
+                            let seed_ok = rng.next_u64().to_le_bytes();
+                            let seed_err = rng.next_u64().to_le_bytes();
+                            let mut u_ok = Unstructured::new(&seed_ok);
+                            let mut u_err = Unstructured::new(&seed_err);
+                            EnvStrategy::AlternatingOkErr {
+                                ok_bytes: builder.build_bytes(&layout, &mut u_ok),
+                                err_bytes: builder.build_bytes(&layout, &mut u_err),
+                            }
+                        }
+                    }
                 } else {
                     match rng.next_u64() % 4 {
                         0 => {
-                            let pool = self.dict.candidates_for_width(32);
-                            let c = pool[rng.choose_index(pool.len())] as u32;
-                            EnvStrategy::Constant(c.to_le_bytes().to_vec())
+                            let seed = rng.next_u64().to_le_bytes();
+                            let mut sub_u = Unstructured::new(&seed);
+                            let bytes = builder.build_bytes(&layout, &mut sub_u);
+                            EnvStrategy::Constant(bytes)
                         }
                         1 => EnvStrategy::MonotonicCounter {
                             start: (rng.next_u64() % 16),
                             step: 1 + (rng.next_u64() % 8),
-                            width_bytes: 4,
+                            width_bytes: expected_size,
                         },
-                        2 => EnvStrategy::AlternatingOkErr {
-                            ok_bytes: vec![0, 0x42, 0, 0, 0],
-                            err_bytes: vec![1, 0, 0, 0, 0],
+                        2 => {
+                            let mut ok_bytes = vec![0u8; expected_size];
+                            let mut err_bytes = vec![0u8; expected_size];
+                            if !ok_bytes.is_empty() {
+                                ok_bytes[0] = 1;
+                            }
+                            if layout.validate_bytes(&ok_bytes).is_err() {
+                                let seed = rng.next_u64().to_le_bytes();
+                                let mut sub_u = Unstructured::new(&seed);
+                                ok_bytes = builder.build_bytes(&layout, &mut sub_u);
+                            }
+                            if layout.validate_bytes(&err_bytes).is_err() {
+                                err_bytes = ok_bytes.clone();
+                            }
+                            EnvStrategy::AlternatingOkErr {
+                                ok_bytes,
+                                err_bytes,
+                            }
+                        }
+                        _ => EnvStrategy::DictionaryDrawn {
+                            width_bytes: expected_size,
                         },
-                        _ => EnvStrategy::DictionaryDrawn { width_bytes: 4 },
                     }
                 };
                 chosen_strategies.push((callee, strategy));
@@ -1412,6 +1792,129 @@ mod tests {
         let mut u2 = Unstructured::new(&raw_entropy);
         let fault_bytes = fault_builder.build_bytes(&spec, &mut u2);
         assert!(fault_bytes[8] >= 2, "100% fault rate must inject invalid bool >= 2");
+        assert!(
+            spec.validate_bytes(&fault_bytes).is_err(),
+            "LayoutSpec::validate_bytes must reject injected invalid bool bit pattern"
+        );
+        let masked = spec
+            .mask_padding_as_unknown(&bytes)
+            .expect("mask_padding_as_unknown must succeed on matching size");
+        for &pad_idx in &pad_offsets {
+            assert_eq!(masked[pad_idx], None);
+        }
+        assert_eq!(masked[0], Some(bytes[0]));
+        assert_eq!(masked[8], Some(bytes[8]));
+    }
+
+    #[test]
+    fn env_schedule_generator_rejects_mismatched_payload_sizes_at_generation_time() {
+        let dict = MirInputDictionary::new();
+        let env_gen = EnvScheduleGenerator::new(&dict)
+            .with_horizon_steps(4)
+            .with_panic_injection_pct(0)
+            .with_callee_return_layout("ext_u32", LayoutSpec::Scalar(ScalarLayout::u32()))
+            .with_callee_return_layout("ext_bool", LayoutSpec::Scalar(ScalarLayout::bool_layout()));
+
+        let mut sched = EnvSchedule::new();
+        let mut u = Unstructured::new(&[0x11, 0x22, 0x33, 0x44]);
+
+        // 5-byte payload for 4-byte `ext_u32` must be rejected at generation time.
+        let bad_alt = EnvStrategy::AlternatingOkErr {
+            ok_bytes: vec![0, 0x42, 0, 0, 0],
+            err_bytes: vec![1, 0, 0, 0, 0],
+        };
+        assert_eq!(
+            env_gen.apply_strategy_checked(&mut sched, "ext_u32", &bad_alt, &mut u),
+            Err(ScheduleError::PayloadSizeMismatch {
+                context: "ext_u32".to_string(),
+                expected: 4,
+                actual: 5,
+            })
+        );
+
+        // 2-byte counter for 4-byte `ext_u32` must be rejected at generation time.
+        let bad_counter = EnvStrategy::MonotonicCounter {
+            start: 0,
+            step: 1,
+            width_bytes: 2,
+        };
+        assert_eq!(
+            env_gen.apply_strategy_checked(&mut sched, "ext_u32", &bad_counter, &mut u),
+            Err(ScheduleError::PayloadSizeMismatch {
+                context: "ext_u32".to_string(),
+                expected: 4,
+                actual: 2,
+            })
+        );
+
+        // Invalid `bool = 2` constant for `ext_bool` must be rejected at generation time.
+        let bad_bool = EnvStrategy::Constant(vec![2]);
+        assert!(
+            env_gen
+                .apply_strategy_checked(&mut sched, "ext_bool", &bad_bool, &mut u)
+                .is_err()
+        );
+
+        // `validate_strategy` must also reject `MonotonicCounter` and `DictionaryDrawn`
+        // when applied to an enum layout whose valid discriminant range is violated.
+        let env_gen_enum = env_gen.clone().with_callee_return_layout(
+            "ext_enum",
+            LayoutSpec::Enum {
+                name: "TwoWay".to_string(),
+                total_size: 1,
+                tag_offset: 0,
+                tag_size: 1,
+                variants: vec![
+                    EnumVariantLayout {
+                        name: "A".to_string(),
+                        discriminant: 0,
+                        payload_offset: 1,
+                        payload: None,
+                    },
+                    EnumVariantLayout {
+                        name: "B".to_string(),
+                        discriminant: 1,
+                        payload_offset: 1,
+                        payload: None,
+                    },
+                ],
+            },
+        );
+        assert!(
+            env_gen_enum
+                .validate_strategy(
+                    "ext_enum",
+                    &EnvStrategy::MonotonicCounter {
+                        start: 0,
+                        step: 1,
+                        width_bytes: 1,
+                    },
+                )
+                .is_err()
+        );
+        assert!(
+            env_gen_enum
+                .validate_strategy("ext_enum", &EnvStrategy::DictionaryDrawn { width_bytes: 1 })
+                .is_err()
+        );
+
+        // Generated schedules across arbitrary seeds must always emit exact-size valid payloads.
+        for seed in 0..32u64 {
+            let bytes = seed.to_le_bytes();
+            let mut u_seed = Unstructured::new(&bytes);
+            let generated = env_gen.generate_schedule(&["ext_u32", "ext_bool"], &mut u_seed);
+            if let Some(q) = generated.callee_queues.get("ext_u32") {
+                for item in q {
+                    assert_eq!(item.len(), 4);
+                }
+            }
+            if let Some(q) = generated.callee_queues.get("ext_bool") {
+                for item in q {
+                    assert_eq!(item.len(), 1);
+                    assert!(item[0] <= 1);
+                }
+            }
+        }
     }
 
     #[test]

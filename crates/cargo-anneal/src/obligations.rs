@@ -1035,8 +1035,8 @@ pub fn render_verify_module_with_options(
                      Obligations.{item}.totalClaim 64 (by\n            \
                        intro _ _ _\n            \
                        first\n            \
-                       | exact True.intro\n            \
-                       | simp; try omega)\n"
+                       | simp; try omega\n            \
+                       | exact True.intro)\n"
         ));
         out.push_str(&format!(
             "/-- Low-priority fallback `TotalItemProof` instance attempting\n    \
@@ -1092,8 +1092,8 @@ pub fn render_verify_module_with_options(
             "      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.verifyByWP Obligations.{item}.claim 64 (by\n          \
                      intro _ _\n          \
                      first\n          \
-                     | exact True.intro\n          \
-                     | simp; try omega)\n"
+                     | simp; try omega\n          \
+                     | exact True.intro)\n"
         ));
         out.push_str(&format!(
             "/-- Low-priority fallback `ItemProof` instance attempting bounded\n    \

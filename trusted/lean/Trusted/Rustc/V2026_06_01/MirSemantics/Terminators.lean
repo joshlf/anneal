@@ -186,9 +186,20 @@ Execute a basic-block `Terminator` from state `s`.
 
 Supports `.goto`, `.return_` (both root-frame termination and interprocedural
 return to `Memory.callStack`), `.unreachable`, `.switchInt`, `.assert`, `.drop`,
-`.call`, and `.tailCall`. When `.call` or `.tailCall` targets a `defPath`
-without a transparent body in `s.memory.callees`, execution emits a `MirCallE`
-effect interaction carrying `(defPath, argVals, s.memory)`.
+`.call` (including inline evaluation of `core::intrinsics::exact_div` via
+`evalScalarExactDiv`), and `.tailCall`. When `.call` or `.tailCall` targets a
+`defPath` without a transparent body in `s.memory.callees` (other than inline
+intrinsics), execution emits a `MirCallE` effect interaction carrying
+`(defPath, argVals, s.memory)`.
+
+Reference (`core::intrinsics::exact_div`, Rust 1.98.0, and
+`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.exact_div.html>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1932-L1939>
+
+> "/// Performs an exact division, resulting in undefined behavior where
+> /// `x % y != 0` or `y == 0` or `x == T::MIN && y == -1`"
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -336,9 +347,48 @@ def evalTerminator
               }
             }
         | .none =>
-          MirStepNode.extCall
-            { defPath := defPath, args := argVals, memory := s.memory }
-            (resumeExternalCall s locals' destination targetBb unwind)
+          match stringEq defPath "core::intrinsics::exact_div" with
+          | true =>
+            match argVals with
+            | .scalar lhs :: .scalar rhs :: .nil =>
+              let isSigned :=
+                match argOps with
+                | lhsOp :: _ =>
+                  operandIsSigned
+                    (match currentBody with
+                    | .some b => b.localDecls
+                    | .none => .nil)
+                    lhsOp
+                    bodyLayouts
+                | .nil => false
+              match evalScalarExactDiv lhs rhs locals' s.memory isSigned with
+              | .ok retVal localsAfter memAfter =>
+                match
+                  writePlaceValue
+                    localsAfter
+                    memAfter.borrows
+                    destination
+                    retVal
+                with
+                | .ok updatedLocals =>
+                  MirStepNode.step {
+                    frame := {
+                      s.frame with
+                      blockIdx := targetBb
+                      stmtIdx := 0
+                      locals := updatedLocals
+                    }
+                    memory := memAfter
+                  }
+                | .ub => MirStepNode.fail .ub
+                | .unsupported => MirStepNode.unsupported
+              | .ub => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
+            | _ => MirStepNode.unsupported
+          | false =>
+            MirStepNode.extCall
+              { defPath := defPath, args := argVals, memory := s.memory }
+              (resumeExternalCall s locals' destination targetBb unwind)
   -- Diverging call (`target == Option.none`, return type `!`):
   -- `core::hint::unreachable_unchecked` (`library/core/src/hint.rs` at commit
   -- `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65` and The Rust Reference 1.98.0,

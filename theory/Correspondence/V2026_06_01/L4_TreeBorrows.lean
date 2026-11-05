@@ -244,7 +244,7 @@ theorem mir_updateBorrowPerm_corresponds_to_minirust_write
       mrExpectedWritePerm entry targetLocal writerTag ∧
     (updateBorrowPerm entry targetLocal writerTag).tag = entry.tag ∧
     (updateBorrowPerm entry targetLocal writerTag).targetLocal = entry.targetLocal := by
-  cases entry with | mk tag tLoc tProj perm rOff rLen prot =>
+  cases entry with | mk tag tLoc tProj perm rOff rLen prot parentTag =>
   unfold updateBorrowPerm mrExpectedWritePerm
     MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.mrExpectedWritePerm
     toPermissionUnprot ofPermissionUnprot
@@ -269,7 +269,7 @@ theorem mir_updateBorrowPerm_unprot_eq_generated_ops
         writerTag
         entry.tag
         (toPermissionUnprot false entry.perm) := by
-  cases entry with | mk tag tLoc tProj perm rOff rLen prot =>
+  cases entry with | mk tag tLoc tProj perm rOff rLen prot parentTag =>
   unfold updateBorrowPerm
     MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.mrExpectedWritePerm
     toPermissionUnprot
@@ -747,5 +747,83 @@ theorem epoch_divergence_GAP_EPOCH_0001_characterized :
       .ub
       .normalUnit :=
   ⟨rfl, rfl, witness_GAP_EPOCH_0001.2⟩
+
+/--
+**Theorem L4.14 (`mir_updateBorrowPermTreeAtProj_characterization`)**:
+Universal characterization of Tree Borrows parent/child write transitions in
+`Trusted.Rustc.V2026_06_01.MirSemantics.updateBorrowPermTreeAtProj`:
+1. A write through a descendant or self tag (`isBorrowDescendantOrSelf allBorrows wTag entry.tag = true`)
+   activates a `.reserved` ancestor (`perm = .active`) and preserves an `.active` ancestor (`perm = .active`);
+2. An overlapping write through a foreign tag (`isBorrowDescendantOrSelf allBorrows wTag entry.tag = false`)
+   disables `entry` (`perm = .disabled`).
+-/
+theorem mir_updateBorrowPermTreeAtProj_characterization
+    (allBorrows : List BorrowEntry) (entry : BorrowEntry) (wTag : Nat)
+    (writeProj : List ProjectionElem) (writeRangeOff writeRangeLen : Nat) :
+    (isBorrowDescendantOrSelf allBorrows wTag entry.tag = true →
+      entry.perm = .reserved →
+      (updateBorrowPermTreeAtProj
+        allBorrows entry entry.targetLocal (.some wTag)
+        writeProj writeRangeOff writeRangeLen).perm = .active) ∧
+    (isBorrowDescendantOrSelf allBorrows wTag entry.tag = true →
+      entry.perm = .active →
+      (updateBorrowPermTreeAtProj
+        allBorrows entry entry.targetLocal (.some wTag)
+        writeProj writeRangeOff writeRangeLen).perm = .active) ∧
+    (isBorrowDescendantOrSelf allBorrows wTag entry.tag = false →
+      Nat.beq entry.tag wTag = false →
+      borrowEntryOverlapsWrite entry writeProj writeRangeOff writeRangeLen = true →
+      (updateBorrowPermTreeAtProj
+        allBorrows entry entry.targetLocal (.some wTag)
+        writeProj writeRangeOff writeRangeLen).perm = .disabled) := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro h_desc h_perm
+    simp [updateBorrowPermTreeAtProj, resolveTreeBorrowWriterTag,
+      updateBorrowPermAtProj, Nat.beq_refl, h_desc, h_perm]
+  · intro h_desc h_perm
+    simp [updateBorrowPermTreeAtProj, resolveTreeBorrowWriterTag,
+      updateBorrowPermAtProj, Nat.beq_refl, h_desc, h_perm]
+  · intro h_for h_neq h_ov
+    simp [updateBorrowPermTreeAtProj, resolveTreeBorrowWriterTag,
+      updateBorrowPermAtProj, Nat.beq_refl, h_for, h_neq, h_ov]
+
+/--
+**Theorem L4.15 (`mir_updateBorrowPermOnReadAtProj_characterization`)**:
+Universal characterization of Tree Borrows read transitions in
+`Trusted.Rustc.V2026_06_01.MirSemantics.updateBorrowPermOnReadAtProj`:
+1. A child/self (`Local`) read (`isBorrowDescendantOrSelf allBorrows rTag entry.tag = true`)
+   preserves `entry` unchanged;
+2. An overlapping `Foreign` read (`isBorrowDescendantOrSelf allBorrows rTag entry.tag = false`)
+   freezes an `.active` borrow (`perm = .frozen`) while preserving `.reserved`, `.frozen`, and
+   `.disabled` borrows.
+-/
+theorem mir_updateBorrowPermOnReadAtProj_characterization
+    (allBorrows : List BorrowEntry) (entry : BorrowEntry) (rTag : Nat)
+    (readProj : List ProjectionElem) (readRangeOff readRangeLen : Nat) :
+    (isBorrowDescendantOrSelf allBorrows rTag entry.tag = true →
+      updateBorrowPermOnReadAtProj
+        allBorrows entry entry.targetLocal (.some rTag)
+        readProj readRangeOff readRangeLen = entry) ∧
+    (isBorrowDescendantOrSelf allBorrows rTag entry.tag = false →
+      borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen = true →
+      entry.perm = .active →
+      (updateBorrowPermOnReadAtProj
+        allBorrows entry entry.targetLocal (.some rTag)
+        readProj readRangeOff readRangeLen).perm = .frozen) ∧
+    (isBorrowDescendantOrSelf allBorrows rTag entry.tag = false →
+      borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen = true →
+      entry.perm = .reserved →
+      (updateBorrowPermOnReadAtProj
+        allBorrows entry entry.targetLocal (.some rTag)
+        readProj readRangeOff readRangeLen).perm = .reserved) := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro h_desc
+    unfold updateBorrowPermOnReadAtProj
+    cases borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen <;>
+      simp [Nat.beq_refl, h_desc]
+  · intro h_for h_ov h_perm
+    simp [updateBorrowPermOnReadAtProj, Nat.beq_refl, h_for, h_ov, h_perm]
+  · intro h_for h_ov h_perm
+    simp [updateBorrowPermOnReadAtProj, Nat.beq_refl, h_for, h_ov, h_perm]
 
 end Correspondence.V2026_06_01.L4_TreeBorrows

@@ -15,26 +15,25 @@ use anneal_difftest::input_gen::{
     FieldLayout, LayoutAwareByteBuilder, LayoutSpec, MirInputDictionary, MirObsPathSet,
     ScalarLayout,
 };
-use anneal_difftest::instrument::{EnvAction, TraceRecorder};
+use anneal_difftest::instrument::{
+    EnvAction, FromScheduleBytes, TraceRecorder, capture_value_bytes,
+};
 
-/// ABI-explicit frame header with inter-field alignment padding between scalar fields:
+/// ABI-explicit frame header with genuine C ABI alignment padding between scalar fields:
 /// - `magic: u32` at offset 0..4
 /// - `version: u8` at offset 4..5
-/// - `_pad_after_version: [u8; 3]` (3 bytes inter-field padding at offsets 5..8!)
-/// - `flags: u8` at offset 8..9
-/// - `_pad_after_flags: [u8; 3]` (inter-field padding at offsets 9..12!)
-/// - `offset: u32` at offset 12..16
+/// - 3 bytes of implicit C ABI padding at offsets 5..8 before 4-byte-aligned `offset`!
+/// - `offset: u32` at offset 8..12
+/// - `flags: u8` at offset 12..13
+/// - 3 bytes of implicit C ABI trailing padding at offsets 13..16!
+#[anneal_trace::capture]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameHeader {
     pub magic: u32,
     pub version: u8,
-    // 3 bytes padding before next 4-byte aligned region!
-    _pad1: [u8; 3],
-    pub flags: u8,
-    // padding before `offset: u32`!
-    _pad2: [u8; 3],
     pub offset: u32,
+    pub flags: u8,
 }
 
 /// Canonical narrow-branch benchmark function with 6 distinct feasible basic-block paths:
@@ -157,7 +156,7 @@ fn run_traced_parse_frame(hdr: FrameHeader, payload_len: u32, rec: &mut TraceRec
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         parse_frame(hdr, payload_len, |len_arg| {
             let mut r = rec_cell.borrow_mut();
-            let (call_idx, action) = r.step_ext_call("ext_crc32");
+            let (_call_idx, action) = r.step_ext_call("ext_crc32");
             match action {
                 EnvAction::PanicOnCall(k) => {
                     drop(r);
@@ -166,7 +165,6 @@ fn run_traced_parse_frame(hdr: FrameHeader, payload_len: u32, rec: &mut TraceRec
                 EnvAction::ReturnBytes(bytes) => {
                     r.record_ext_call(
                         "ext_crc32",
-                        call_idx,
                         vec![len_arg.to_le_bytes().to_vec()],
                         bytes.clone(),
                     );
@@ -180,7 +178,6 @@ fn run_traced_parse_frame(hdr: FrameHeader, payload_len: u32, rec: &mut TraceRec
                     let crc = len_arg.wrapping_mul(0x9E37_79B1);
                     r.record_ext_call(
                         "ext_crc32",
-                        call_idx,
                         vec![len_arg.to_le_bytes().to_vec()],
                         crc.to_le_bytes().to_vec(),
                     );
@@ -217,8 +214,8 @@ fn milestone_3_parse_frame_discovers_all_6_paths_in_le_250_inputs_under_5ms() {
     let pad_offsets = layout.padding_offsets();
     assert_eq!(
         pad_offsets,
-        vec![5, 6, 7, 9, 10, 11],
-        "FrameHeader must expose explicit inter-field padding bytes"
+        vec![5, 6, 7, 13, 14, 15],
+        "FrameHeader must expose explicit inter-field and trailing C ABI padding bytes"
     );
 
     // 1. Extract dictionary directly from `parse_frame` AST source.
@@ -245,13 +242,23 @@ fn milestone_3_parse_frame_discovers_all_6_paths_in_le_250_inputs_under_5ms() {
         let raw_seed = make_seed_slice(step as u64, 0xA11E_A100_0000_0001);
         let mut u = Unstructured::new(&raw_seed);
 
-        // SAFETY: `layout.total_size() == size_of::<FrameHeader>()` and `validity_fault_rate_pct == 0`.
-        let (hdr_bytes, hdr) =
-            unsafe { builder.materialize_copy::<FrameHeader>(&layout, &mut u) };
+        let (hdr_bytes, hdr) = builder.materialize_copy::<FrameHeader>(&layout, &mut u);
+        let masked_hdr = layout
+            .mask_padding_as_unknown(&hdr_bytes)
+            .expect("mask_padding_as_unknown must succeed");
+        assert_eq!(
+            capture_value_bytes(&hdr),
+            masked_hdr,
+            "#[anneal_trace::capture] must mark C ABI padding offsets as None"
+        );
         for &pad_idx in &pad_offsets {
             assert_ne!(
                 hdr_bytes[pad_idx], 0,
                 "every padding byte in FrameHeader must be non-zero"
+            );
+            assert_eq!(
+                masked_hdr[pad_idx], None,
+                "padding offset {pad_idx} must be masked as unknown (None)"
             );
         }
 
@@ -296,10 +303,10 @@ fn milestone_3_parse_frame_discovers_all_6_paths_in_le_250_inputs_under_5ms() {
     let mut uniform_paths = MirObsPathSet::new();
     for step in 0..250usize {
         let raw_seed = make_seed_slice(step as u64, 0xDEAD_BEEF_CAFE_0000);
-        // SAFETY: `raw_seed` has 32 bytes >= `size_of::<FrameHeader>()` (16 bytes), and all bit
-        // patterns of `FrameHeader` (`u32`, `u8`, `[u8; 3]`) are valid.
-        let hdr = unsafe { core::ptr::read_unaligned(raw_seed.as_ptr() as *const FrameHeader) };
-        let payload_len = u32::from_le_bytes([raw_seed[16], raw_seed[17], raw_seed[18], raw_seed[19]]);
+        let hdr = FrameHeader::from_schedule_bytes(&raw_seed[..16])
+            .expect("all 16-byte slices are valid for FrameHeader");
+        let payload_len =
+            u32::from_le_bytes([raw_seed[16], raw_seed[17], raw_seed[18], raw_seed[19]]);
         let mut rec = TraceRecorder::new();
         run_traced_parse_frame(hdr, payload_len, &mut rec);
         uniform_paths.record_trace("parse_frame", &rec, raw_seed[..20].to_vec());

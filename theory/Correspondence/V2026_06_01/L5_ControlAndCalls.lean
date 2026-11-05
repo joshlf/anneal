@@ -374,6 +374,63 @@ theorem mir_evalTerminator_call_transparent_and_unreachable_unchecked
     subst hCurr
     simp [evalTerminator, hFunc, hArgs, hFind]
 
+/--
+**Theorem L5.11 (`mir_evalTerminator_exact_div_intrinsic_corresponds`)**:
+Universal correspondence for inline `"core::intrinsics::exact_div"` intrinsic call
+dispatch in `Trusted.Rustc.V2026_06_01.MirSemantics.evalTerminator`:
+For EVERY machine state `s` with `s.memory.callees = .nil`, EVERY pair of scalar
+arguments `lhs rhs : ScalarInt` at locals `1` and `2`, and EVERY target basic block `targetBb`:
+1. When `evalScalarExactDiv lhs rhs s.frame.locals s.memory false` succeeds with `.ok retVal s.frame.locals s.memory`
+   and `writePlaceValue s.frame.locals s.memory.borrows destination retVal = .ok updatedLocals`,
+   `evalTerminator` steps inline to `targetBb` with `stmtIdx := 0` and `locals := updatedLocals`
+   (`MrStackFrame.jump_to_block`);
+2. When `evalScalarExactDiv lhs rhs s.frame.locals s.memory false = .ub` (divisor zero or non-zero remainder),
+   `evalTerminator` faults with `MirStepNode.fail .ub`.
+-/
+theorem mir_evalTerminator_exact_div_intrinsic_corresponds
+    (lhs rhs : ScalarInt) (targetBb : BasicBlockIdx) (unwind : UnwindAction) (span : String) :
+    let fnTy : Ty := { kind := .fnDef "core::intrinsics::exact_div" .nil, layoutIdx := 0 }
+    let funcOp : Operand := .constant { ty := fnTy, val := .zeroSized }
+    let argOps : List Operand := [
+      .copy { local_ := 1, projection := .nil },
+      .copy { local_ := 2, projection := .nil }
+    ]
+    let dest : Place := { local_ := 0, projection := .nil }
+    let locals : List LocalSlot := [.uninit, .init (.scalar lhs), .init (.scalar rhs)]
+    let s : MachineState := {
+      frame := { blockIdx := 0, stmtIdx := 0, locals := locals }
+      memory := emptyMemory
+    }
+    (∀ retVal : Value,
+      evalScalarExactDiv lhs rhs locals emptyMemory false = .ok retVal locals emptyMemory →
+      evalTerminator s ⟨.call funcOp argOps dest (.some targetBb) unwind, span⟩ .none =
+        MirStepNode.step {
+          frame := {
+            blockIdx := targetBb
+            stmtIdx := 0
+            locals := [.init retVal, .init (.scalar lhs), .init (.scalar rhs)]
+          }
+          memory := emptyMemory
+        }) ∧
+    (evalScalarExactDiv lhs rhs locals emptyMemory false = .ub →
+      evalTerminator s ⟨.call funcOp argOps dest (.some targetBb) unwind, span⟩ .none =
+        MirStepNode.fail .ub) := by
+  dsimp only
+  have hStr : stringEq "core::intrinsics::exact_div" "core::intrinsics::exact_div" = true := by
+    decide
+  refine ⟨?_, ?_⟩
+  · intro retVal hExact
+    unfold emptyMemory at hExact
+    unfold evalTerminator
+    simp [extractCalleeDefPath?, evalOperands, evalOperand, readProjectedValue,
+      emptyMemory, get?, findCallee?, hStr, operandIsSigned, operandTy, placeTy,
+      hExact, writePlaceValue, set?]
+  · intro hUb
+    unfold emptyMemory at hUb
+    unfold evalTerminator
+    simp [extractCalleeDefPath?, evalOperands, evalOperand, readProjectedValue,
+      emptyMemory, get?, findCallee?, hStr, operandIsSigned, operandTy, placeTy, hUb]
+
 /-- Universal correspondence of `TerminatorKind.switchInt` (`Terminators.lean:387-406`
 vs. `Generated.Ops.mrLookupSwitchTarget` at `spec/lang/step/terminators.md:32-49`):
 when `evalOperand` evaluates `discr` to `.ok (.scalar sc) locals'`, `evalTerminator`

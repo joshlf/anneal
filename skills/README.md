@@ -34,7 +34,11 @@ for configuring Claude Code, Gemini CLI, Jetski, and Codex to load these skills.
 
 Keep the vendored `joshlf/skills` packages unmodified so they can be updated
 cleanly from upstream; place Anneal-specific conventions in repository-owned
+<<<<<<< HEAD
 files (`AGENTS.md`, `skills/adversarial-rounds/`,
 `skills/hierarchical-supervision/`, `skills/anneal-prove/`,
+=======
+files (`AGENTS.md`, `skills/adversarial-rounds/`, `skills/anneal-prove/`,
+>>>>>>> difftest-repair
 `skills/anneal-lsp/`, `skills/anneal-doc-audit/`, and
 `skills/source-control/`).
