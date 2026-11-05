@@ -41,7 +41,7 @@ Run the offline test suite for `anneal-minirust-gen`, which checks:
   `minirust/lean/MiniRustSpec/Correspondence/Translate.lean` (including
   `TupleHeadLayout`, `Type::Tuple`, `LayoutStrategy::is_sized`,
   `LayoutStrategy::compute_size_and_align` for `LayoutStrategy::Tuple`,
-  `Machine::compute_align`, `Type::layout` for `Type::Tuple`,
+  `Machine::compute_align`, `Type::layout` for `Type::Tuple` and `Type::Slice`,
   `Type::decode` and `Type::encode` for `Type::Tuple` preserving
   `AbstractByte::Uninit` in padding gaps, `check_value` for `Type::Tuple`,
   `PlaceExpr::Field` with its bounds check, offset computation, and
@@ -85,8 +85,8 @@ theorems it checked. The groups are:
   `typedLoad_tuple_slice`, `typedStore_tuple_slice`, `decode_tupleSpec`,
   `encode_tupleSpec`, `checkValue_tupleSpec`, `evalValue_specOperand`,
   `evalValue_tupleRvalue`, `evalStatement_assign_tuple`,
-  `evalStatement_assign_field_scalar`, `evalStmt_assign_tuple`,
-  `evalStmt_assign_field_scalar`, `evalRvalue_tuple_frag`,
+  `evalStatement_assign_field_scalar`, `evalStatement_placeMention_field`,
+  `evalStmt_assign_tuple`, `evalStmt_assign_field_scalar`, `evalRvalue_tuple_frag`,
   `resolveFieldPath_read`, `resolveFieldPath_write`).
 - `WITNESS-AUDIT`: every `MR-2.1` array witness theorem and every `MR-2.2`
   tuple/struct witness theorem in `MiniRustSpec/Correspondence/Witness.lean`
@@ -101,9 +101,9 @@ cd examples && anneal-lean-run --mode file --concurrency 3 -- lake env lean ../m
 Expected audit summary lines:
 
 ```text
-MiniRustSpec.Audit: exhaustively verified standard axioms for 9267 declarations across all MiniRustSpec.* modules
+MiniRustSpec.Audit: exhaustively verified standard axioms for 9274 declarations across all MiniRustSpec.* modules
 [ANCHOR-AUDIT] decls=2 theorems=2 sorry_free=true standard_axioms_only=true
-[SIMULATION-AUDIT] decls=37 theorems=37 sorry_free=true standard_axioms_only=true
+[SIMULATION-AUDIT] decls=38 theorems=38 sorry_free=true standard_axioms_only=true
 [WITNESS-AUDIT] decls=99 theorems=99 sorry_free=true standard_axioms_only=true
 ```
 
@@ -131,15 +131,19 @@ Each witness runs both semantics in the kernel (`decide`/`rfl`, no
   `Aggregate(Tuple)` construction, in-place whole sub-tuple writes
   (`_4.0 = Aggregate(Tuple, [9u8, copy _1])`), nested in-place scalar field
   writes (`_4.0.1 = Add(copy _4.0.1, 42u32)` at cumulative byte offset `0 + 4 = 4`),
+  `PlaceMention` on nested field places (`PlaceMention(_4.0)` and `PlaceMention(_4.0.1)`),
   and nested field reads (`copy _4.0.0`, `copy _4.0.1`).
   `nestedTupleOk_minirust_padding_bytes` proves byte-level preservation of both
   inner padding (`1..4 = .Uninit`) and outer trailing padding (`10..12 = .Uninit`)
   as well as `0`-byte representation of `_3 : ()`. Also proves end-to-end UB
   correspondence across three faulting paths (`nestedTupleAggUb_*`,
   `nestedTupleFieldRhsUb_*`, `nestedTupleCopyUninitUb_*`).
-- `tuple_encode_decode_place_edge_cases`: ground-truth checks of `Type.layout`,
-  `Type.encode`, `Type.decode`, and `checkValue` on zero-sized `()` and padded
+- `tuple_encode_decode_place_edge_cases`: ground-truth checks of `TupleHeadLayout`
+  (`capped_tail_align` with `packed_align = none` and `some ⟨2⟩`, `tail_offset`,
+  `full_size_and_align`), `Type.layout`, `computeSize`, and `computeAlign` on
+  zero-sized `()`, padded `(u8, u32)`, and unsized `Type::Tuple` with a
+  `Type::Slice` tail, `Type.encode`, `Type.decode`, and `checkValue` on `()` and
   `(u8, u32)` (including `.Uninit` padding preservation, ignoring arbitrary
-  padding bytes on decode, and returning `none` when a field byte is `.Uninit`),
-  plus `PlaceExpr::Field` out-of-bounds field indices (`-1` and `2`) and
-  non-tuple root panics.
+  padding bytes on decode, returning `none` when a field byte is `.Uninit`, and
+  unsized/length-mismatch/non-Tuple panics and UB), plus `PlaceExpr::Field`
+  out-of-bounds field indices (`-1`, `2`, `3`) and non-tuple root panics.

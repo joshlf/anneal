@@ -3186,6 +3186,54 @@ theorem evalStatement_placeMention {body : CapturedMir} {f : Gen.Function} {ctx 
   have hplace := evalPlace_local h.shape i hi _ hspec
   simp [evalStatement, hplace]
 
+/-- `Machine::eval_statement` on a translated fragment `PlaceMention` of a
+nested tuple/struct field projection `⟨i, .field idx fieldTy :: rest⟩` (whether
+local `_i` is initialized or uninitialized). -/
+theorem evalStatement_placeMention_field {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {locals : List LocalSlot} {m : Mach} {blk stmt : Nat} (h : FrameOk body f ctx locals m blk stmt)
+    (i idx : Nat) (fieldTy : MirAst.Ty) (rest : List ProjectionElem)
+    (pe : Gen.PlaceExpr)
+    (hpe : translateFieldPlace (.Local (localName i)) (.field idx fieldTy :: rest) = some pe)
+    (d : LocalDecl) (hd : body.localDecls[i]? = some d)
+    (fields : List (Nat × TupleSpec)) (size align : Nat)
+    (ht : tupleTypeOf body.layouts d.ty = some (fields, size, align))
+    (relOff : Nat) (leafSpec : TupleSpec)
+    (hres : resolveFieldPath body.layouts (.tuple fields size align) (.field idx fieldTy :: rest) =
+      some (relOff, leafSpec)) :
+    evalStatement m (.PlaceMention pe) = .ok m := by
+  have hi : i < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
+  obtain ⟨_, slot, _, hs⟩ := h.slot_exists i hi
+  have hslot := h.slots i d slot hd hs
+  have hnone1 := intTypeOf_none_of_tupleTypeOf ht
+  have hnone2 := arrayTypeOf_none_of_tupleTypeOf ht
+  have htr : translateTy body.layouts d.ty =
+      some ((TupleSpec.tuple fields size align).toMiniRustTy) := by
+    simp [translateTy, hnone1, hnone2, ht]
+  have hspec := translateFn_local_ty h.hf i d _ hd htr
+  have hplaceBase := evalPlace_local h.shape i hi _ hspec
+  have hL := h.localAllocs_get i d slot hd hs
+  have hdlen := declSlotData_length d slot hslot
+  simp only [hnone2, ht] at hdlen
+  have hrootWf := h.tuple_wf i d fields size align hd ht
+  have hbound : size < 2 ^ 63 := by
+    simp only [TupleSpec.wf, Bool.and_eq_true, decide_eq_true_eq] at hrootWf
+    exact hrootWf.1.2
+  have haddr := h.addrs i d hd
+  simp only [AddrOk, hnone2, ht] at haddr
+  obtain ⟨_, haddr0, haddrMax⟩ := haddr
+  have hrootEval : evalPlace m (.Local (localName i)) =
+      .ok (({ ptr := { thin_pointer := fieldPtr ctx i 0, metadata := none },
+               aligned := true },
+             (TupleSpec.tuple fields size align).toMiniRustTy), m) := by
+    simpa using hplaceBase
+  have hpeEval := evalPlace_fieldPath h.shape i (itOf body.layouts d)
+    (declSlotData body.layouts d slot) hL
+    (by rw [hdlen]; exact hbound) haddr0 (by rw [hdlen]; exact haddrMax)
+    (.Local (localName i)) 0 (.tuple fields size align) hrootEval hrootWf
+    (by simp [TupleSpec.size, hdlen]) (.field idx fieldTy :: rest) pe hpe
+    relOff leafSpec hres
+  simp [evalStatement, hpeEval]
+
 /-! ## `Switch` -/
 
 theorem intFromBits_inj (it : Gen.IntType) (a b : Nat) (ha : a < 2 ^ (8 * it.size.bytes))

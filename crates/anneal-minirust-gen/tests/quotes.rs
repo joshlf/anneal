@@ -824,6 +824,7 @@ fn mr_2_2_tuple_quotations_are_pinned_and_tamper_checked() {
         ("spec/lang/types.md", "(LayoutStrategy::Tuple { head, tail }, Some(meta)) =>"),
         ("spec/lang/machine.md", "fn compute_align(&self, layout: LayoutStrategy,"),
         ("spec/lang/types.md", "Tuple { sized_head_layout, unsized_field, .. } => match unsized_field {"),
+        ("spec/lang/types.md", "Slice { elem } => LayoutStrategy::Slice("),
         ("spec/lang/representation.md", "fn decode<M: Memory>(Type::Tuple { sized_fields,"),
         ("spec/lang/representation.md", "fn encode<M: Memory>(Type::Tuple { sized_fields,"),
         ("spec/lang/representation.md", "let mut bytes = list![AbstractByte::Uninit; size.bytes()];"),

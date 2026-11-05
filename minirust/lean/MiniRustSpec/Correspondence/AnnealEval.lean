@@ -2502,9 +2502,9 @@ theorem evalStmt_assign_field_scalar (s : MachineState) (decls : List LocalDecl)
   · simp [evalStmt, hrvNone hnone]
 
 theorem evalStmt_placeMention (s : MachineState) (decls : List LocalDecl) (layouts : Layout.LayoutTable)
-    (i : Nat) (span : String) (hslots : SlotsOk layouts decls s.frame.locals)
+    (i : Nat) (projs : List ProjectionElem) (span : String) (hslots : SlotsOk layouts decls s.frame.locals)
     (hn : s.frame.locals.length = decls.length) (hi : i < decls.length) :
-    evalStmt s ⟨.placeMention ⟨i, []⟩, span⟩ decls layouts =
+    evalStmt s ⟨.placeMention ⟨i, projs⟩, span⟩ decls layouts =
       .tau (.running (advanceStmt s s.frame.locals)) := by
   have hil : i < s.frame.locals.length := by rw [hn]; exact hi
   obtain ⟨d, hd⟩ : ∃ d, decls[i]? = some d := ⟨decls[i], by simp [hi]⟩

@@ -519,6 +519,10 @@ def computeAlign (layout : LayoutStrategy) (metadata : Option (PointerMeta Prov)
 >  Array { elem, count } => Sized(
 >      elem.layout::<T>().expect_size(\"WF ensures array element is sized\") * count,
 >      elem.layout::<T>().expect_align(\"WF ensures array element is sized\"),
+>  ),
+>  Slice { elem } => LayoutStrategy::Slice(
+>      elem.layout::<T>().expect_size(\"WF ensures slice element is sized\"),
+>      elem.layout::<T>().expect_align(\"WF ensures array element is sized\"),
 >  )," -/
 def Type.layout : «Type» → Interp LayoutStrategy
   | .Int t => do pure (.Sized t.size (← IntType.align t))
@@ -536,7 +540,12 @@ def Type.layout : «Type» → Interp LayoutStrategy
     let elemAlign ← LayoutStrategy.expect_align elemLayout "WF ensures array element is sized"
     let size ← Size.mulInt elemSize count
     pure (.Sized size elemAlign)
-  | _ => unsupported "Type::layout for a non-Int, non-Bool, non-Tuple, non-Array type"
+  | .Slice elem => do
+    let elemLayout ← Type.layout elem
+    let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures slice element is sized"
+    let elemAlign ← LayoutStrategy.expect_align elemLayout "WF ensures array element is sized"
+    pure (.Slice elemSize elemAlign)
+  | _ => unsupported "Type::layout for a non-Int, non-Bool, non-Tuple, non-Array, non-Slice type"
 
 /-! ## Representation relation (`spec/lang/representation.md`) -/
 

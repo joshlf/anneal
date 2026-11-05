@@ -664,9 +664,10 @@ def translateRvalue (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
 >      Statement::PlaceMention(place)
 >  }"
 where the elided part special-cases two pointer-provenance casts, which are
-outside the fragment, and `PlaceMention` is restricted to unprojected locals
-`⟨i, []⟩` because Anneal's `.placeMention` checks only `place.local_` and
-ignores `place.projection`. -/
+outside the fragment, and `PlaceMention` supports unprojected locals `⟨i, []⟩`
+and tuple/struct field projection chains `⟨i, .field idx fieldTy :: rest⟩`
+(array `Index`/`ConstantIndex` projections in `PlaceMention` are excluded
+because Anneal's `.placeMention` checks only `place.local_`). -/
 def translateStatement (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
     (decls : List MirAst.LocalDecl) (s : MirAst.Statement) :
     Option Gen.Statement :=
@@ -676,6 +677,9 @@ def translateStatement (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
     let source ← translateRvalue layouts decls (placeMirTy decls dst) rv
     pure (.Assign destination source)
   | .placeMention ⟨i, []⟩ => some (.PlaceMention (.Local (localName i)))
+  | .placeMention ⟨i, .field idx fieldTy :: rest⟩ => do
+    let pe ← translateFieldPlace (.Local (localName i)) (.field idx fieldTy :: rest)
+    pure (.PlaceMention pe)
   | _ => none
 
 /-- `minimize`'s switch cases for a discriminant of type `it`
@@ -999,6 +1003,12 @@ def statementOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
       projOk decls count proj && rvalueOk layouts decls elemIt rv
     | none => false
   | .placeMention ⟨i, []⟩ => decide (i < decls.length)
+  | .placeMention ⟨i, .field idx fieldTy :: rest⟩ =>
+    decide (i < decls.length) &&
+    match decls[i]? >>= (tupleTypeOf layouts ·.ty) with
+    | some (fields, size, align) =>
+      (resolveFieldPath layouts (.tuple fields size align) (.field idx fieldTy :: rest)).isSome
+    | none => false
   | _ => false
 
 /-- Fragment terminators; jump targets must be blocks of the body and

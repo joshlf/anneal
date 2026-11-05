@@ -307,7 +307,11 @@ theorem translateStatement_some {layouts : Layout.LayoutTable} {decls : List Loc
       translatePlace decls dst = some pe ∧
       translateRvalue layouts decls (placeMirTy decls dst) rv = some e ∧
       st' = .Assign pe e) ∨
-    (∃ i, st.kind = .placeMention ⟨i, []⟩ ∧ st' = .PlaceMention (.Local (localName i))) := by
+    (∃ i, st.kind = .placeMention ⟨i, []⟩ ∧ st' = .PlaceMention (.Local (localName i))) ∨
+    (∃ i idx fieldTy rest pe,
+      st.kind = .placeMention ⟨i, .field idx fieldTy :: rest⟩ ∧
+      translateFieldPlace (.Local (localName i)) (.field idx fieldTy :: rest) = some pe ∧
+      st' = .PlaceMention pe) := by
   obtain ⟨kind, span⟩ := st
   simp only [translateStatement] at h ⊢
   match kind, h with
@@ -326,8 +330,17 @@ theorem translateStatement_some {layouts : Layout.LayoutTable} {decls : List Loc
   | .storageLive _, h => simp at h
   | .storageDead _, h => simp at h
   | .retag _ _, h => simp at h
-  | .placeMention ⟨i, []⟩, h => simp at h; exact .inr ⟨i, rfl, h.symm⟩
-  | .placeMention ⟨_, _ :: _⟩, h => simp at h
+  | .placeMention ⟨i, []⟩, h => simp at h; exact .inr (.inl ⟨i, rfl, h.symm⟩)
+  | .placeMention ⟨i, p :: rest⟩, h =>
+    cases p with
+    | field idx fieldTy =>
+      simp only [Option.bind_eq_bind] at h
+      cases hpe : translateFieldPlace (.Local (localName i)) (.field idx fieldTy :: rest) with
+      | none => simp [hpe] at h
+      | some pe =>
+        simp [hpe] at h
+        exact .inr (.inr ⟨i, idx, fieldTy, rest, pe, rfl, hpe, h.symm⟩)
+    | _ => simp at h
   | .intrinsic _, h => simp at h
   | .coverage, h => simp at h
   | .constEvalCounter, h => simp at h
@@ -494,7 +507,9 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
       cases hbb'
       exact hlt
     rcases translateStatement_some hst' with
-      ⟨dst, rv, pe, e, hkind, hpe, he, rfl⟩ | ⟨i, hkind, rfl⟩
+      ⟨dst, rv, pe, e, hkind, hpe, he, rfl⟩ |
+      ⟨i, hkind, rfl⟩ |
+      ⟨i, idx, fieldTy, rest, pe, hkind, hpe, rfl⟩
     · ------------------------------------------------------------ assign
       obtain ⟨kind, span⟩ := st
       simp only at hkind
@@ -838,13 +853,13 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
                         activeCallee := hrel.activeCallee
                         protectors := hrel.protectors
                         callerLocals := hrel.callerLocals }
-    · ------------------------------------------------------------ placeMention
+    · ------------------------------------------------------------ placeMention (local)
       obtain ⟨kind, span⟩ := st
       simp only at hkind
       subst hkind
       have hi : i < body.localDecls.length := by simpa [statementOk] using hok
       have hM := evalStatement_placeMention hframe i hi
-      have hA := evalStmt_placeMention s body.localDecls body.layouts i span hslotsA hrel.nlocals hi
+      have hA := evalStmt_placeMention s body.localDecls body.layouts i [] span hslotsA hrel.nlocals hi
       rw [hA]
       obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee hframe.shape
       refine StepRel.tau' m4 (by simp [hne, listIndex_nat _ _ _ htst, hM, hm4, check_after h4]) ?_
@@ -863,6 +878,48 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
         activeCallee := hrel.activeCallee
         protectors := hrel.protectors
         callerLocals := hrel.callerLocals }
+    · ------------------------------------------------------------ placeMention (field path)
+      obtain ⟨kind, span⟩ := st
+      simp only at hkind
+      subst hkind
+      simp only [statementOk, Bool.and_eq_true, decide_eq_true_eq] at hok
+      obtain ⟨hi, hok⟩ := hok
+      cases hdi : body.localDecls[i]? with
+      | none => simp [hdi] at hok
+      | some d =>
+        simp only [hdi, Option.bind_eq_bind, Option.bind_some] at hok
+        cases ht : tupleTypeOf body.layouts d.ty with
+        | none => simp [ht] at hok
+        | some rpair =>
+          obtain ⟨fields, size, align⟩ := rpair
+          simp only [ht] at hok
+          cases hres : resolveFieldPath body.layouts (.tuple fields size align)
+              (.field idx fieldTy :: rest) with
+          | none => simp [hres] at hok
+          | some lpair =>
+            obtain ⟨relOff, leafSpec⟩ := lpair
+            have hM := evalStatement_placeMention_field hframe i idx fieldTy rest pe hpe d hdi
+              fields size align ht relOff leafSpec hres
+            have hA := evalStmt_placeMention s body.localDecls body.layouts i
+              (.field idx fieldTy :: rest) span hslotsA hrel.nlocals hi
+            rw [hA]
+            obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee hframe.shape
+            refine StepRel.tau' m4 (by simp [hne, listIndex_nat _ _ _ htst, hM, hm4, check_after h4]) ?_
+            exact {
+              threads := h4.threads
+              active := h4.active
+              allocs := h4.allocs
+              blk := hrel.blk
+              stmt := hstmt'
+              nlocals := hrel.nlocals
+              slots := hrel.slots
+              addrs := hrel.addrs
+              ret := hrel.ret
+              borrows := hrel.borrows
+              callStack := hrel.callStack
+              activeCallee := hrel.activeCallee
+              protectors := hrel.protectors
+              callerLocals := hrel.callerLocals }
   · ----------------------------------------------------------------- terminator
     have heq : s.frame.stmtIdx = bb.statements.length := by omega
     have hif : ((s.frame.stmtIdx : Nat) : Int) = (tb.statements.length : Int) := by rw [hlen, heq]

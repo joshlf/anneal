@@ -94,6 +94,7 @@ open MiniRustSpec.Correspondence in
   evalStatement_assign_tuple
   evalStatement_assign_field_scalar
   evalStatement_placeMention
+  evalStatement_placeMention_field
   evalValue_operand
   evalValue_specOperand
   evalValue_rvalue
@@ -513,6 +514,7 @@ open MiniRustSpec.Correspondence in
   evalValue_tupleRvalue
   evalStatement_assign_tuple
   evalStatement_assign_field_scalar
+  evalStatement_placeMention_field
   evalStmt_assign_tuple
   evalStmt_assign_field_scalar
   evalRvalue_tuple_frag

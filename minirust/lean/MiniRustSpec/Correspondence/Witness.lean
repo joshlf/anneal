@@ -3712,6 +3712,8 @@ def nestedTupleOps : CapturedMir where
             (.copy (placeField 4 [(0, innerTupleTy), (1, u32Ty)]))
             (constU32 42))),
         mkStmt (.assign (local_ 3) (.use (.copy (placeField 4 [(2, unitTupleTy)])))),
+        mkStmt (.placeMention (placeField 4 [(0, innerTupleTy)])),
+        mkStmt (.placeMention (placeField 4 [(0, innerTupleTy), (1, u32Ty)])),
         mkStmt (.assign (local_ 0)
           (.cast .intToInt (.copy (placeField 4 [(0, innerTupleTy), (0, u8Ty)])) u32Ty)),
         mkStmt (.assign (local_ 0)
@@ -3768,6 +3770,8 @@ def nestedTupleOpsFn : Gen.Function where
           (.Load (.Field (.Field (.Local (localName 4)) 0) 1))
           (.Constant (.Int 42) (.Int u32))),
       .Assign (.Local (localName 3)) (.Load (.Field (.Local (localName 4)) 2)),
+      .PlaceMention (.Field (.Local (localName 4)) 0),
+      .PlaceMention (.Field (.Field (.Local (localName 4)) 0) 1),
       .Assign (.Local (localName 0))
         (.UnOp (.Cast (.IntToInt u32))
           (.Load (.Field (.Field (.Local (localName 4)) 0) 0))),
@@ -3816,11 +3820,11 @@ def nestedTupleOkTrace : List (Event MirEffect) :=
 theorem nestedTupleOk_anneal_ret :
     ReachesRet (mirCallTree nestedTupleOps (nestedArgs 0)) nestedTupleOkTrace
       (.normal (.scalar ⟨51, 4⟩, nestedTupleOkS0.memory)) :=
-  runA_sound nestedTupleOps 16 _ _ _ rfl
+  runA_sound nestedTupleOps 20 _ _ _ rfl
 
 theorem nestedTupleOk_noUB :
     MirNoUBTree (mirCallTree nestedTupleOps (nestedArgs 0)) :=
-  runA_noUB nestedTupleOps 16 _ _ _ rfl
+  runA_noUB nestedTupleOps 20 _ _ _ rfl
 
 theorem nestedTupleOk_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n nestedTupleOkMInit = .ok m' ∧
@@ -3844,7 +3848,7 @@ theorem nestedTupleOk_minirust_ret_from_start :
   simp [ctxNested5, itOf, intTypeOf, intTyBytes, u32Decl, u32Ty, u32]
 
 theorem nestedTupleOk_minirust_direct :
-    (Interp.steps 11 nestedTupleOkMInit).toOption.map
+    (Interp.steps 13 nestedTupleOkMInit).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAlloc with data := scalarBytes u32 51 }, [1]) := rfl
 
@@ -3949,18 +3953,42 @@ theorem nestedTupleCopyUninitUb_minirust_direct :
     Interp.steps 3 nestedTupleCopyUninitUbMInit =
       .error (.ub "load at type but the data in memory violates the language invariant") := rfl
 
-/-- Ground-truth representation and place-evaluation edge cases for `Type::Tuple`
-and `PlaceExpr::Field`:
+def unsizedSliceTupleTy : Gen.Type :=
+  .Tuple [(⟨0⟩, .Int u8)]
+    { «end» := ⟨1⟩, align := ⟨4⟩, packed_align := none }
+    (some (.Slice (.Int u32)))
+
+/-- Ground-truth representation, layout, and place-evaluation edge cases for
+`Type::Tuple`, `TupleHeadLayout`, and `PlaceExpr::Field`:
 - zero-sized `()` layout, `encode`, `decode`, and `checkValue`;
+- `TupleHeadLayout` (`capped_tail_align` with `packed_align = none` and
+  `packed_align = some ⟨2⟩`, `tail_offset`, and `full_size_and_align`) and
+  unsized `Type::Tuple` with a `Type::Slice` tail (`Type.layout`, `computeSize`,
+  `computeAlign`);
 - `Type.encode` and `Type.decode` on padded `(u8, u32)` preserving `.Uninit`
-  padding bytes at `1..4` and returning `none` when a field byte is `.Uninit`;
-- `PlaceExpr::Field` out-of-bounds field index (`-1` and `2` on a 2-field tuple)
-  raising `.specPanic`, and non-tuple root raising `.specPanic`. -/
+  padding bytes at `1..4`, ignoring arbitrary padding bytes on decode,
+  returning `none` when a field byte is `.Uninit`, and panicking on unsized
+  fields, length mismatches, or non-Tuple values;
+- `checkValue` on `Type::Tuple` panicking on unsized fields and raising UB on
+  field-count mismatch or invalid field values;
+- `PlaceExpr::Field` out-of-bounds field indices (`-1`, `2`, and `3` on a
+  2-field tuple) and non-tuple root raising `.specPanic`. -/
 theorem tuple_encode_decode_place_edge_cases :
     Type.layout unitMiniRustTy = .ok (.Sized ⟨0⟩ ⟨1⟩) ∧
     Type.encode unitMiniRustTy (.Tuple []) = .ok [] ∧
     Type.decode unitMiniRustTy [] = .ok (some (.Tuple [])) ∧
     checkValue (.Tuple []) unitMiniRustTy = .ok () ∧
+    TupleHeadLayout.capped_tail_align { «end» := ⟨1⟩, align := ⟨4⟩, packed_align := none } ⟨4⟩ = ⟨4⟩ ∧
+    TupleHeadLayout.capped_tail_align { «end» := ⟨1⟩, align := ⟨2⟩, packed_align := some ⟨2⟩ } ⟨4⟩ = ⟨2⟩ ∧
+    TupleHeadLayout.tail_offset { «end» := ⟨1⟩, align := ⟨4⟩, packed_align := none } ⟨4⟩ = ⟨4⟩ ∧
+    TupleHeadLayout.full_size_and_align { «end» := ⟨1⟩, align := ⟨4⟩, packed_align := none } ⟨6⟩ ⟨2⟩ =
+      (⟨8⟩, ⟨4⟩) ∧
+    Type.layout unsizedSliceTupleTy =
+      .ok (.Tuple { «end» := ⟨1⟩, align := ⟨4⟩, packed_align := none } (.Slice ⟨4⟩ ⟨4⟩)) ∧
+    (Type.layout unsizedSliceTupleTy >>= fun l => computeSize l (some (.ElementCount 3))) =
+      .ok ⟨16⟩ ∧
+    (Type.layout unsizedSliceTupleTy >>= fun l => computeAlign l (some (.ElementCount 3))) =
+      .ok ⟨4⟩ ∧
     Type.encode innerMiniRustTy (.Tuple [.Int 7, .Int 0x04030201]) =
       .ok [.Init 7 none, .Uninit, .Uninit, .Uninit,
            .Init 1 none, .Init 2 none, .Init 3 none, .Init 4 none] ∧
@@ -3972,12 +4000,31 @@ theorem tuple_encode_decode_place_edge_cases :
       [.Init 7 none, .Uninit, .Uninit, .Uninit,
        .Init 1 none, .Uninit, .Init 3 none, .Init 4 none] =
       .ok none ∧
+    Type.encode unsizedSliceTupleTy (.Tuple [.Int 7]) =
+      .error (.specPanic "encode of Type::Tuple with unsized field") ∧
+    Type.encode innerMiniRustTy (.Tuple [.Int 7]) =
+      .error (.specPanic "encode: Type::Tuple length mismatch") ∧
+    Type.encode innerMiniRustTy (.Int 7) =
+      .error (.specPanic "encode: Type::Tuple with a non-Tuple value") ∧
+    Type.decode unsizedSliceTupleTy [.Init 7 none] =
+      .error (.specPanic "decode of Type::Tuple with unsized field") ∧
+    Type.decode innerMiniRustTy [.Init 7 none] =
+      .error (.specPanic "decode of Type::Tuple with invalid length") ∧
+    checkValue (.Tuple [.Int 7]) unsizedSliceTupleTy =
+      .error (.specPanic "Value: unsized structs cannot be represented as values") ∧
+    checkValue (.Tuple [.Int 7]) innerMiniRustTy =
+      .error (.ub "Value::Tuple: invalid number of fields") ∧
+    checkValue (.Tuple [.Int 300, .Int 0]) innerMiniRustTy =
+      .error (.ub "Value::Int: invalid integer value") ∧
     Interp.evalPlace nestedTupleOkMInit (.Field (.Local (localName 2)) (-1)) =
       .error (.specPanic "field projection to invalid field") ∧
     Interp.evalPlace nestedTupleOkMInit (.Field (.Local (localName 2)) 2) =
       .error (.specPanic "field projection to non-existing unsized tail") ∧
+    Interp.evalPlace nestedTupleOkMInit (.Field (.Local (localName 2)) 3) =
+      .error (.specPanic "field projection to invalid field") ∧
     Interp.evalPlace nestedTupleOkMInit (.Field (.Local (localName 0)) 0) =
       .error (.specPanic "field projection on non-projectable type") :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+   rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end MiniRustSpec.Correspondence.Witness
