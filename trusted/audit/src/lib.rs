@@ -1143,25 +1143,33 @@ const LOCKED_LEAN_SHA256: [&str; 4] = [
 pub fn default_lean_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/root"));
     let mut candidate_paths = Vec::new();
+    // Search the user cache (and home fallback) across candidate toolchain
+    // directory layouts. `anneal/toolchain` is the primary path installed by
+    // `cargo anneal setup` (via exocrate's `rel_dir_path: ["anneal",
+    // "toolchain"]`), while `.anneal/toolchain` is retained as a legacy
+    // fallback so existing checkouts resolve previously cached toolchains
+    // without requiring an immediate re-run of `setup`.
     for base in dirs::cache_dir()
         .into_iter()
         .chain(std::iter::once(home.clone()))
     {
-        let tc_base = base.join(".anneal/toolchain");
-        if let Ok(entries) = fs::read_dir(&tc_base) {
-            let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = entries
-                .filter_map(Result::ok)
-                .map(|e| e.path().join("lean/bin/lean"))
-                .filter(|p| p.is_file())
-                .map(|p| {
-                    let mtime = fs::metadata(&p)
-                        .and_then(|m| m.modified())
-                        .unwrap_or(std::time::UNIX_EPOCH);
-                    (mtime, p)
-                })
-                .collect();
-            dirs.sort_by(|a, b| b.0.cmp(&a.0));
-            candidate_paths.extend(dirs.into_iter().map(|(_, p)| p));
+        for rel in ["anneal/toolchain", ".anneal/toolchain"] {
+            let tc_base = base.join(rel);
+            if let Ok(entries) = fs::read_dir(&tc_base) {
+                let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.path().join("lean/bin/lean"))
+                    .filter(|p| p.is_file())
+                    .map(|p| {
+                        let mtime = fs::metadata(&p)
+                            .and_then(|m| m.modified())
+                            .unwrap_or(std::time::UNIX_EPOCH);
+                        (mtime, p)
+                    })
+                    .collect();
+                dirs.sort_by(|a, b| b.0.cmp(&a.0));
+                candidate_paths.extend(dirs.into_iter().map(|(_, p)| p));
+            }
         }
     }
     let elan_lean =
