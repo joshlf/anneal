@@ -4232,18 +4232,18 @@ Step `stepMirSymTree` in `O(1)` at statement `stmt` using a `BlockCtx`
 hypothesis on the active body `s.memory.activeCallee.getD body`.
 -/
 theorem stepMirSymTree_stmt_of_blockCtx
-    (body : CapturedMir)
+    (body instBody : CapturedMir)
     (s : MachineState)
     (bb : BasicBlockData)
     (stmt : Statement)
-    (h_phase : (s.memory.activeCallee.getD body).phase = .runtimeOptimized)
-    (h_bb : BlockCtx (s.memory.activeCallee.getD body) s.frame.blockIdx bb)
+    (h_ctx : ActiveCalleeCtx s body instBody)
+    (h_phase : instBody.phase = .runtimeOptimized)
+    (h_bb : BlockCtx instBody s.frame.blockIdx bb)
     (h_stmt : get? bb.statements s.frame.stmtIdx = .some stmt) :
     stepMirSymTree body s =
-      evalStmtSymTree s stmt
-        (s.memory.activeCallee.getD body).localDecls
-        (s.memory.activeCallee.getD body).layouts := by
+      evalStmtSymTree s stmt instBody.localDecls instBody.layouts := by
   unfold stepMirSymTree
+  rw [h_ctx]
   dsimp only []
   rw [h_phase, h_bb]
   dsimp only []
@@ -4254,16 +4254,18 @@ Step `stepMirSymTree` in `O(1)` at terminator `bb.terminator` using a `BlockCtx`
 hypothesis when `s.frame.stmtIdx == length bb.statements`.
 -/
 theorem stepMirSymTree_term_of_blockCtx
-    (body : CapturedMir)
+    (body instBody : CapturedMir)
     (s : MachineState)
     (bb : BasicBlockData)
-    (h_phase : (s.memory.activeCallee.getD body).phase = .runtimeOptimized)
-    (h_bb : BlockCtx (s.memory.activeCallee.getD body) s.frame.blockIdx bb)
+    (h_ctx : ActiveCalleeCtx s body instBody)
+    (h_phase : instBody.phase = .runtimeOptimized)
+    (h_bb : BlockCtx instBody s.frame.blockIdx bb)
     (h_none : get? bb.statements s.frame.stmtIdx = .none)
     (h_end : (s.frame.stmtIdx == length bb.statements) = true) :
     stepMirSymTree body s =
-      evalTerminatorSymTree s bb.terminator (s.memory.activeCallee.getD body) := by
+      evalTerminatorSymTree s bb.terminator instBody := by
   unfold stepMirSymTree
+  rw [h_ctx]
   dsimp only []
   rw [h_phase, h_bb]
   dsimp only []
