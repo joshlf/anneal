@@ -443,6 +443,31 @@ def resolveProjTy (baseTy : MirAst.Ty) : List MirAst.ProjectionElem → Option M
   | .field _ fieldTy :: rest => resolveProjTy fieldTy rest
   | _ => none
 
+
+/-- Extract enum variants layout -/
+def enumTypeOf (layouts : Layout.LayoutTable := ⟨64, true, []⟩) (t : MirAst.Ty) :
+    Option (List (List (Nat × TupleSpec) × Nat × Nat) × Gen.IntType × Nat × Nat) := do
+  match t.kind with
+  | .adt _ fieldKinds =>
+    match layouts.lookup t.layoutIdx with
+    | some l =>
+      match l.variants with
+      | .multiple _ _ varShapes =>
+        let it : Gen.IntType := ⟨.Unsigned, ⟨1⟩⟩
+        let variants ← varShapes.mapM (fun varShape =>
+          match varShape with
+          | .arbitrary offsets _ =>
+            if offsets.length = fieldKinds.length then do
+               let fields ← specOfFieldList layouts offsets fieldKinds l.fieldLayouts
+               pure (fields, l.size.bytes, l.align.bytes)
+            else none
+          | _ => none
+        )
+        pure (variants, it, l.size.bytes, l.align.bytes)
+      | _ => none
+    | none => none
+  | _ => none
+
 /-- Resolve the `MirAst.Ty` of a local or field-projected place. -/
 def placeMirTy (decls : List MirAst.LocalDecl) (p : MirAst.Place) : Option MirAst.Ty := do
   let d ← decls[p.local_]?
@@ -455,6 +480,14 @@ def placeIntType (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
   | ⟨j, []⟩ => decls[j]? >>= fun d => intTypeOf d.ty
   | ⟨j, [.index _]⟩ => decls[j]? >>= fun d => (arrayTypeOf d.ty).map Prod.fst
   | ⟨j, [.constantIndex _ _ _]⟩ => decls[j]? >>= fun d => (arrayTypeOf d.ty).map Prod.fst
+  | ⟨j, .downcast _ variantIdx :: rest⟩ => do
+    let d ← decls[j]?
+    let (variants, _, _, _) ← enumTypeOf layouts d.ty
+    let (fields, size, align) ← variants[variantIdx]?
+    let (_, leafSpec) ← resolveFieldPath layouts (.tuple fields size align) rest
+    match leafSpec with
+    | .scalar leafIt => some leafIt
+    | _ => none
   | ⟨j, .field idx fieldTy :: rest⟩ => do
     let d ← decls[j]?
     let (fields, size, align) ← tupleTypeOf layouts d.ty
@@ -832,7 +865,20 @@ a (possibly nested) field projection `_j.f1...fk`, or an indexed element
 `_j[proj]` of a homogeneous array local. -/
 def placeOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
     (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Place → Bool
-  | ⟨j, .downcast _ _ :: _⟩ => false
+  | ⟨j, .downcast _ variantIdx :: rest⟩ =>
+    decide (j < decls.length) &&
+    match decls[j]? with
+    | some d =>
+       match enumTypeOf layouts d.ty with
+       | some (variants, _, _, _) =>
+         match variants[variantIdx]? with
+         | some (fields, size, align) =>
+           match resolveFieldPath layouts (.tuple fields size align) rest with
+           | some (_, .scalar leafIt) => decide (leafIt = it)
+           | _ => false
+         | _ => false
+       | _ => false
+    | _ => false
   | ⟨j, []⟩ =>
     decide (j < decls.length) && decide ((decls[j]? >>= (intTypeOf ·.ty)) = some it)
   | ⟨j, .field idx fieldTy :: rest⟩ =>
@@ -873,7 +919,13 @@ def isShiftIntBinOp : Gen.IntBinOp → Bool
 /-- Fragment rvalues of integer type `it`. -/
 def rvalueOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
     (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rvalue → Bool
-  | .discriminant _ => false
+  | .discriminant place =>
+    match placeIntType layouts decls place with
+    | some _ => false
+    | none =>
+      match placeMirTy decls place with
+      | some ty => decide ((enumTypeOf layouts ty).isSome ∧ (translatePlace decls place).isSome)
+      | none => false
   | .use op => operandOk layouts decls it op
   | .unaryOp uop op => (translateUnOp uop).isSome && operandOk layouts decls it op
   | .binaryOp op a b =>
@@ -923,6 +975,17 @@ def tuplePlaceSpec (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
     MirAst.Place → Option (List (Nat × TupleSpec) × Nat × Nat)
   | ⟨j, []⟩ =>
     if j < decls.length then decls[j]? >>= (tupleTypeOf layouts ·.ty) else none
+  | ⟨j, .downcast _ variantIdx :: rest⟩ =>
+    if j < decls.length then do
+      let d ← decls[j]?
+      let (variants, _, _, _) ← enumTypeOf layouts d.ty
+      let (fields, size, align) ← variants[variantIdx]?
+      let (_, leafSpec) ←
+        resolveFieldPath layouts (.tuple fields size align) rest
+      match leafSpec with
+      | .tuple subFields subSize subAlign => some (subFields, subSize, subAlign)
+      | .scalar _ => none
+    else none
   | ⟨j, .field idx fieldTy :: rest⟩ =>
     if j < decls.length then do
       let d ← decls[j]?
@@ -1019,6 +1082,10 @@ def statementOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
     match decls[i]? >>= (tupleTypeOf layouts ·.ty) with
     | some (fields, size, align) =>
       (resolveFieldPath layouts (.tuple fields size align) (.field idx fieldTy :: rest)).isSome
+    | none => false
+  | .setDiscriminant dst _variant =>
+    match placeMirTy decls dst with
+    | some ty => decide ((enumTypeOf layouts ty).isSome ∧ (translatePlace decls dst).isSome)
     | none => false
   | _ => false
 

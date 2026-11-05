@@ -4119,4 +4119,23 @@ theorem tuple_encode_decode_place_edge_cases :
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
    rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+
+def optionU8Ty : Gen.Type :=
+  .Enum
+    ⟨[(0, { ty := .Tuple [] { «end» := ⟨0⟩, align := ⟨1⟩, packed_align := none } none,
+            tagger := ⟨[(⟨0⟩, (u8, 0))]⟩ }),
+      (1, { ty := .Tuple [(⟨1⟩, .Int u8)] { «end» := ⟨2⟩, align := ⟨1⟩, packed_align := none } none,
+            tagger := ⟨[(⟨0⟩, (u8, 1))]⟩ })]⟩
+    u8
+    (.Branch ⟨0⟩ u8 .Invalid ⟨[((0, 0), .Known 0), ((1, 1), .Known 1)]⟩)
+    ⟨2⟩
+    ⟨1⟩
+
+theorem option_u8_encode_decode :
+    Type.layout optionU8Ty = .ok (.Sized ⟨2⟩ ⟨1⟩) ∧
+    checkValue (.Variant 1 (.Tuple [.Int 42])) optionU8Ty = .ok () ∧
+    Interp.evalPlace nestedTupleOkMInit (.Downcast (.Local (localName 2)) 1) =
+      .error (.specPanic "downcast on non-projectable type") :=
+  ⟨rfl, rfl, rfl⟩
+
 end MiniRustSpec.Correspondence.Witness
