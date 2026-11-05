@@ -58,6 +58,7 @@ applies, follow all of them.
 
 | Activity | Required skills |
 | :--- | :--- |
+| Reviewing code, commits, or pull requests, or auditing changes for trust-boundary compliance | [`trust-review`](skills/trust-review/SKILL.md) |
 | Writing, revising, or reviewing any technical prose (documentation, code comments, commit messages, PR descriptions, or issue bodies) | [`reader-oriented-explanation`](skills/reader-oriented-explanation/SKILL.md), [`williams-style`](skills/williams-style/SKILL.md) |
 | Adding, revising, or reviewing explanatory inline (`//`, `--`) or documentation (`///`, `//!`, `/--`, `/-!`) code comments | [`comment-guidelines`](skills/comment-guidelines/SKILL.md), [`reader-oriented-explanation`](skills/reader-oriented-explanation/SKILL.md), [`williams-style`](skills/williams-style/SKILL.md) |
 | Structuring commits, drafting or revising commit messages, rebasing or amending commits, or managing GHerrit branches and stacks | [`source-control`](skills/source-control/SKILL.md), [`commit-message`](skills/commit-message/SKILL.md), [`authorship-disclosure`](skills/authorship-disclosure/SKILL.md), [`reader-oriented-explanation`](skills/reader-oriented-explanation/SKILL.md), [`williams-style`](skills/williams-style/SKILL.md) |
@@ -89,6 +90,12 @@ check whether it belongs inside `trusted/` or outside it (`theory/`):
   proof-script generator (`trusted/rustc-capture/`)—belong in `trusted/`.
 - All code outside `trusted/` (`theory/`) must be pure, effect-free Lean
   definitions and proofs checked by the Lean kernel.
+
+When reviewing code or auditing changes before committing, run a dedicated
+[`trust-review`](skills/trust-review/SKILL.md) pass both to verify that code
+outside `trusted/`, `ci/`, and `.github/` cannot bypass trust auditing and to
+audit any changes inside `trusted/`, `ci/`, `.github/`, or pinned root
+manifests.
 
 ## Commenting in `trusted/`
 
