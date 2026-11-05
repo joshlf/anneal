@@ -38,18 +38,20 @@ The module is imported by `theory/Anneal.lean` and registered in
 - `memoryPtrMutLens_lawful`, `memoryPtrMutLens_independent_of_ne_alloc`, and
   `sepConj_entails_independentLenses`: two separated active typed mutable
   borrows have distinct allocations and tags and lawful, independent
-  `memoryPtrMutLens` lenses under the strict ancestor-free `ExclusiveActiveBorrow`.
-- `stepTreeBorrowHierarchyAccess?`, `treeMemoryPtrMutLens`,
-  `treeMemoryPtrMutLens_writeBack_eq_memoryPtrMutLens_of_exclusive`,
-  `ValidTreeMutBorrowLens`, `ValidMutBorrowLens.toTree`,
-  `treeMemoryPtrMutLens_lawful`, `treeMemoryPtrMutLens_independent_of_ne_alloc`,
-  and `sepConj_entails_independentTreeLenses`: `I-10`-aware mutable borrow lens
-  family whose `writeBack` uses `invalidateTreeBorrowsAtProj` (matching MIR
-  execution in `PureMirExec.lean`), so PutGet, GetPut, PutPut, and pairwise
-  independence hold under the `I-10` parent/child hierarchy invariant
-  `TreeExclusiveBorrow` (where active parent tags remain in the borrow table)
-  and agree identically with `memoryPtrMutLens` whenever `ExclusiveActiveBorrow`
-  holds.
+  `memoryPtrMutLens` lenses under the strict ancestor-free
+  `ExclusiveActiveBorrow`.
+- `I-10`-aware lenses: `stepTreeBorrowHierarchyAccess?` applies the trusted
+  `I-10` transitions of `MirSemantics` (`freezeTreeBorrowsOnReadAtProj` on
+  reads, `invalidateTreeBorrowsAtProj` on writes), and `treeMemoryPtrMutLens`
+  uses it for write-backs. `treeMemoryPtrMutLens_lawful`,
+  `treeMemoryPtrMutLens_independent_of_ne_alloc`, and
+  `sepConj_entails_independentTreeLenses` prove the lens laws and pairwise
+  independence under `TreeExclusiveBorrow`, where active parent tags stay in
+  the borrow table. `stepTreeBorrowHierarchyAccess_read_eq_some_self_of_tree`
+  and `stepTreeBorrowHierarchyAccess_write_eq_some_self_of_tree` show that both
+  accesses leave such a table unchanged, and
+  `treeMemoryPtrMutLens_writeBack_eq_memoryPtrMutLens_of_exclusive` shows that
+  the two lenses agree under `ExclusiveActiveBorrow`.
 
 ### Section 2: lifting rules and soundness
 
@@ -80,19 +82,30 @@ The module is imported by `theory/Anneal.lean` and registered in
   - `LiftRetag`, `LiftDerefWrite`, `LiftPureAssign`, `LiftStorageLive`,
     `LiftStorageDead`, `LiftNop`, `LiftLensStmt`, `LiftLensStmts`.
   - `LiftLensBlock`: control flow through `return_`, `goto`, `assert` success
-    edges, `switchInt` (`TerminatorKind.switchInt` via `MirWpConverges.step_emit`),
-    and `drop_local` (`TerminatorKind.drop` on root locals).
+    edges, `switchInt` (an observable `.event` step), and `drop_local`
+    (`TerminatorKind.drop` on root locals).
 - Soundness: `LiftLensStmt.evalStmt_step`, `mirWpConverges_of_liftLensStmts`,
   `mirWpConverges_return_of_lens`, `mirWpConverges_goto_of_lens`,
   `mirWpConverges_assert_of_lens`, `mirWpConverges_switchInt_of_lens`,
   `mirWpConverges_drop_of_lens`, `mirWpConverges_of_liftLensBlock`, and the
   top-level `mirWpConverges_of_sepLenses`, with the bridges
   `verifyStatefulMir_of_sepLenses` and `verifyTotalMir_of_sepLenses`.
+- Alias erasure at the semantic level: `LiftDerefWrite.evalStmt_eq` gives the
+  exact memory after a lifted deref write. `SepLensStateInv.treeLens_readView`
+  shows every lens-state entry is the `treeMemoryPtrMutLens` view of memory,
+  `LiftDerefRead.evalOperand_eq_treeLens_readView` shows a MIR deref read
+  returns that view, and `LiftDerefWrite.evalStmt_eq_treeLens_writeBack` shows
+  a MIR deref write steps to exactly
+  `(treeMemoryPtrMutLens rp codec).writeBack a m`.
 - General `List` / indexed composition:
   - `MutBorrowBinding`, `sepConjList`, and `sepConjBindings` (the `k`-ary,
     heterogeneous separating conjunction, right-nested like the binary form).
   - `sepConjBindings_split` and `sepConjBindings_intro`: decomposition into
     pairwise-disjoint bindings plus a disjoint frame, and the converse.
+  - `sepConjBindings_pairwise_disjointFootprints` (pairwise
+    `DisjointFootprints` of the binding footprints) and
+    `sepConjBindings_targetLocal_pairwise_ne` (the borrow entries behind
+    distinct bindings target distinct caller locals).
   - `sepLensStateInv_of_sepConjBindings` (`k`-lens entry) and
     `sepConjBindings_preserved` (`k`-lens exit, for any `LocalSepProp`
     frame).
@@ -121,9 +134,9 @@ The module is imported by `theory/Anneal.lean` and registered in
 
 ### Section 3: concrete witnesses
 
-All parameters are typed `&mut u32` (`RigidTy.ref .mut (.uint .u32)`), and each
-witness theorem is proved by `mirWpConverges_of_sepLenses` from a lifting
-derivation (`*_lift`).
+Every pointer parameter is a reference (`RigidTy.ref .mut _`), and each witness
+theorem is proved by `mirWpConverges_of_sepLenses` from a lifting derivation
+(`*_lift`).
 
 | Body | MIR shape | Theorems |
 | :--- | :--- | :--- |
@@ -132,6 +145,8 @@ derivation (`*_lift`).
 | `add_assign_retag` | `Retag([fn entry] _1)` followed by the `add_assign` body | `add_assign_retag_mirWpConverges`, `add_assign_retag_verified`, `add_assign_retag_total` |
 | `swap_u32` | `StorageLive(_3); _3 = copy (*_1); (*_1) = copy (*_2); (*_2) = copy _3; _0 = const (); StorageDead(_3); return` | `swap_u32_mirWpConverges`, `swap_u32_verified`, `swap_u32_total` |
 | `max_assign_u32` | bb0: `StorageLive(_3); _3 = Lt(copy (*_1), copy _2); switchInt(move _3) -> [0: bb2, otherwise: bb1]`; bb1: `(*_1) = copy _2; goto -> bb2`; bb2: `StorageDead(_3); _0 = const (); return` | `max_assign_u32_mirWpConverges`, `max_assign_u32_verified`, `max_assign_u32_total` |
+| `not_assign` | `(*_1) = Not(copy (*_1)); _0 = const (); return` | `not_assign_mirWpConverges`, `not_assign_verified` |
+| `widen_assign` (`x: &mut u64`) | `(*_1) = copy _2 as u64 (IntToInt); _0 = const (); return` | `widen_assign_mirWpConverges`, `widen_assign_verified` |
 
 Non-vacuity: `add_assign_demo_pre` and `add_assign_demo_runs` instantiate the
 `add_assign` precondition on a concrete memory whose borrow table is an `I-10`
@@ -155,13 +170,14 @@ that the parent stays active after the child's write. `swap_u32_demo_pre` and
 - `LiftLensRvalue` lifts `use`, `copyForDeref`, `binaryOp`, `unaryOp` (`.not`,
   `.neg`), `cast` (`.intToInt`), and empty `aggregate` tuples, but does not
   lift `&`/`&raw` borrow-creation rvalues or non-empty aggregate construction.
-- Section 1 provides both `memoryPtrMutLens` (using `SymbolicEval`'s
-  ancestor-oblivious `stepTreeBorrowAccess?`, lawful under
-  `ExclusiveActiveBorrow`) and `treeMemoryPtrMutLens` (using `PureMirExec`'s
-  `I-10`-aware `invalidateTreeBorrowsAtProj`, lawful under
-  `TreeExclusiveBorrow`), with `treeMemoryPtrMutLens_writeBack_eq_memoryPtrMutLens_of_exclusive`
-  proving that their write-backs coincide whenever `ExclusiveActiveBorrow`
-  holds.
+- Section 1 provides both `memoryPtrMutLens` (from `FunctionalTranslation`,
+  whose `stepTreeBorrowAccess?` in `Anneal.UnsafeObligations` ignores the
+  `I-10` hierarchy, so it is lawful only under `ExclusiveActiveBorrow`) and
+  `treeMemoryPtrMutLens` (lawful under `TreeExclusiveBorrow`); their
+  write-backs coincide whenever `ExclusiveActiveBorrow` holds.
+- `LiftLensBlock.drop_local` and `LiftLensRvalue.unaryOp_neg` are not
+  exercised by a concrete witness: rustc emits no `drop` for `u32` locals and
+  no `Neg` for unsigned integers.
 - Frames that own a sub-field cell `(allocId, k + 1)` of a tracked pointee are
   preserved only for non-aggregate codecs (`h_not_agg`).
 - Anneal's `rustc` capture does not request retag statements;
@@ -217,6 +233,12 @@ open Anneal.SepLogicLenses
 #print axioms swap_u32_total
 #print axioms max_assign_u32_verified
 #print axioms max_assign_u32_total
+#print axioms not_assign_verified
+#print axioms widen_assign_verified
+#print axioms LiftDerefWrite.evalStmt_eq_treeLens_writeBack
+#print axioms LiftDerefRead.evalOperand_eq_treeLens_readView
+#print axioms sepConjBindings_pairwise_disjointFootprints
+#print axioms sepConjBindings_targetLocal_pairwise_ne
 #print axioms add_assign_demo_runs
 #print axioms treeMemoryPtrMutLens_putGet_addAssignDemoMem
 #print axioms swap_u32_demo_runs
@@ -246,5 +268,6 @@ Expected: no output.
 | A0 | `ff41a` | `gemini-launch-candidate-high` | Initial implementation. |
 | B1 | `ff41b` | `opus-5.5-max` | `k`-ary composition, `I-10` parent/child exclusivity, multi-block lifting, deref operands in binary ops, checked and retagged witnesses, non-vacuity. |
 | A1 | `ff41a` | `gemini-launch-candidate-high` | Closed Section 1 / Section 2 `I-10` exclusivity gap via `treeMemoryPtrMutLens` and `sepConjBindings_entails_independentTreeLensFamily`; added `LiftLensBlock.switchInt` and `drop_local`; added `LiftLensRvalue.unaryOp_not`, `unaryOp_neg`, and `cast_intToInt`; added `add_assign_retag_verified`/`total`, 3-block `max_assign_u32` (`switchInt`), and `treeMemoryPtrMutLens_putGet_addAssignDemoMem`. |
+| B2 | `ff41b` | `opus-5.5-max` | MIR deref accesses proved equal to `treeMemoryPtrMutLens` reads and write-backs; `I-10` read freezing in `stepTreeBorrowHierarchyAccess?`; pairwise `DisjointFootprints` and distinct `targetLocal`s; `not_assign` and `widen_assign` witnesses exercising the unary and cast rules; documentation fixes. |
 
 No pass so far ran under `[diversity-reduced]` or a fallback model.
