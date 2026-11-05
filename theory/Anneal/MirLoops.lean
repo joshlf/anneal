@@ -516,6 +516,10 @@ def mkMirBody
 
 def constU32 (v : Nat) : Operand := .constant { ty := Anneal.MirFuelFree.u32Ty, val := .scalar (.int ⟨v, 4⟩) }
 
+/--
+  A concrete MIR loop `countToN` CFG witness with a symbolic iteration bound `n`.
+  This represents a `while (i != n) { i += 1 }` loop in MIR.
+-/
 def countToNBody (n : Nat) : CapturedMir :=
   mkMirBody "Anneal::MirLoops::countToN" 0
       [ { mutability := .mut, ty := Anneal.MirFuelFree.u32Ty, debugName := some "_0" }
@@ -603,6 +607,12 @@ theorem bb3_converges_mem (n : Nat) (mem : Memory) (h_callee : mem.activeCallee 
       rfl
   exact MirWpConverges.step_tau h_step h_wp_term
 
+/--
+  Proves that the concrete symbolic MIR loop `countToNBody n` converges to exactly `i = n`
+  and returns `Outcome.normal n` natively inside the Lean kernel, without exposing fuel.
+  This demonstrates that the structural loop combinator `mirWpConverges_forRangeUp` successfully
+  abstracts unbounded iteration for arbitrary caller limits.
+-/
 theorem countToN_terminates (n : Nat) (hn : n < 4294967296) (mem : Memory) (h_callee : mem.activeCallee = none) (h_prot : mem.activeProtectors = []) (h_stack : mem.callStack = []) :
     MirWpConverges (countToNBody n) (countStateMem 0 0 0 mem)
       (fun out => ∃ mem', out = Outcome.normal (Value.scalar ⟨n, 4⟩, mem')) := by
