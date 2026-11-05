@@ -742,6 +742,528 @@ theorem invalidateConflictingBorrowsAtProj_cons
           writeRangeLen := rfl
 
 /--
+Fuel-bounded traversal of `BorrowEntry.parentTag` links testing whether
+`candidateTag` is equal to `ancestorTag` or is a transitive reborrow child of
+`ancestorTag` in `borrows`.
+
+Modeling choice vs. stable Rust Reference: The stable Rust Reference requires
+that pointer accesses obey Rust's aliasing rules (`behavior-considered-undefined.md`).
+Anneal models the reborrow hierarchy operationally via Tree Borrows (Villani et
+al., PLDI 2025), matching Miri's `tree.rs` and MiniRust's
+`spec/mem/tree_borrows/tree.md` classification into `NodeRelation::Local`
+(`candidateTag` in `ancestorTag`'s subtree) vs. `NodeRelation::Foreign`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+
+Reference (The Rust Reference, "Mutable references (`&mut T`)"):
+<https://doc.rust-lang.org/1.98.0/reference/types/pointer.html#mutable-references-mut>
+
+> "Mutable references point to memory which is owned by some other value."
+
+Reference (Miri Tree Borrows implementation,
+`src/tools/miri/src/borrow_tracker/tree_borrows/tree.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, and MiniRust
+`spec/mem/tree_borrows/tree.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/src/tools/miri/src/borrow_tracker/tree_borrows/tree.rs>
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/tree.md#L47-L55>
+
+> "When a node is accessed, each node in the tree can be divided into two
+> disjoint sets: *local nodes* and *foreign nodes*, based on its relative
+> position to the accessed node. The *local* set includes the node itself and
+> all its descendants, while the *foreign* set contains all other nodes."
+
+Reference (Neven Villani, Johannes Hostert, Ralf Jung, and Derek Dreyer,
+"Tree Borrows", Proc. ACM Program. Lang. 9, PLDI, Article 182, June 2025):
+<https://doi.org/10.1145/3729338>
+-/
+@[reducible]
+def isBorrowDescendantOrSelfAux :
+    Nat → List BorrowEntry → Nat → Nat → Bool
+  | .zero, _, candidateTag, ancestorTag =>
+    Nat.beq candidateTag ancestorTag
+  | .succ fuel, borrows, candidateTag, ancestorTag =>
+    match Nat.beq candidateTag ancestorTag with
+    | true => true
+    | false =>
+      match lookupBorrow borrows candidateTag with
+      | .some entry =>
+        match entry.parentTag with
+        | .some pTag =>
+          isBorrowDescendantOrSelfAux fuel borrows pTag ancestorTag
+        | .none => false
+      | .none => false
+
+/--
+Test whether `candidateTag` is in the Tree Borrows subtree rooted at
+`ancestorTag` (`candidateTag == ancestorTag` or `ancestorTag` is reachable via
+`BorrowEntry.parentTag` links in `borrows`).
+
+In Tree Borrows terminology, an access through `candidateTag` is a child/self
+(`NodeRelation::Local`) access relative to `entry` iff
+`isBorrowDescendantOrSelf borrows candidateTag entry.tag == true`, and a foreign
+(`NodeRelation::Foreign`) access otherwise.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+
+Reference (Miri Tree Borrows implementation,
+`src/tools/miri/src/borrow_tracker/tree_borrows/tree.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, and MiniRust
+`spec/mem/tree_borrows/tree.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/src/tools/miri/src/borrow_tracker/tree_borrows/tree.rs>
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/tree.md#L101-L106>
+
+> "// If `self` is an ancestor of the accessed node, the accessed node is local to `self`.
+> // Otherwise, the accessed node is a `foreign` of `self`.
+> let node_relation = if path.is_some() { NodeRelation::Local } else { NodeRelation::Foreign };"
+
+Reference (Neven Villani, Johannes Hostert, Ralf Jung, and Derek Dreyer,
+"Tree Borrows", Proc. ACM Program. Lang. 9, PLDI, Article 182, June 2025):
+<https://doi.org/10.1145/3729338>
+-/
+@[reducible]
+def isBorrowDescendantOrSelf
+    (borrows : List BorrowEntry)
+    (candidateTag ancestorTag : Nat) :
+    Bool :=
+  isBorrowDescendantOrSelfAux (length borrows) borrows candidateTag ancestorTag
+
+/--
+Resolve the effective writer provenance tag relative to `entry` in `borrows`
+under the Tree Borrows parent/child hierarchy.
+
+When `writerTag = .some wTag` and `wTag` is in the subtree rooted at `entry.tag`
+(`isBorrowDescendantOrSelf borrows wTag entry.tag == true`), the write is a
+child/self (`NodeRelation::Local`) write relative to `entry`, so
+`resolveTreeBorrowWriterTag` normalizes the writer tag to `.some entry.tag`
+(activating `entry` from `.reserved` to `.active` or preserving `.active`).
+Otherwise (`NodeRelation::Foreign` write), `writerTag` is returned unchanged so
+conflicting non-ancestor entries are disabled.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+
+Reference (Miri Tree Borrows implementation,
+`src/tools/miri/src/borrow_tracker/tree_borrows/perms.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, and MiniRust
+`spec/mem/tree_borrows/state_machine_unprotected.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/src/tools/miri/src/borrow_tracker/tree_borrows/perms.rs>
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/state_machine_unprotected.md#L37-L62>
+
+> "fn local_write(self) -> Result<PermissionUnprot> {
+>     match self {
+>         PermissionUnprot::Frozen => throw_ub!(\"Tree Borrows: local write of Frozen reference\"),
+>         PermissionUnprot::Disabled => throw_ub!(\"Tree Borrows: local write of Disabled reference\"),
+>         PermissionUnprot::Cell => ret(PermissionUnprot::Cell),
+>         _ => ret(PermissionUnprot::Unique),
+>     }
+> }
+> ...
+> fn foreign_write(self) -> Result<PermissionUnprot> {
+>     match self {
+>         PermissionUnprot::Cell => ret(PermissionUnprot::Cell),
+>         PermissionUnprot::ReservedIm => ret(PermissionUnprot::ReservedIm),
+>         // All other states become Disabled.
+>         _ => ret(PermissionUnprot::Disabled),
+>     }
+> }"
+
+Reference (Neven Villani, Johannes Hostert, Ralf Jung, and Derek Dreyer,
+"Tree Borrows", Proc. ACM Program. Lang. 9, PLDI, Article 182, June 2025):
+<https://doi.org/10.1145/3729338>
+-/
+@[reducible]
+def resolveTreeBorrowWriterTag
+    (borrows : List BorrowEntry)
+    (entry : BorrowEntry)
+    (writerTag : Option Nat) :
+    Option Nat :=
+  match writerTag with
+  | .none => .none
+  | .some wTag =>
+    match isBorrowDescendantOrSelf borrows wTag entry.tag with
+    | true => .some entry.tag
+    | false => .some wTag
+
+/--
+Tree-Borrows-aware write permission transition for `entry` within borrow table
+`allBorrows` when `targetLocal` is mutated at `writeProj` and optional byte
+range `[writeRangeOff, writeRangeOff + writeRangeLen)`.
+
+Writes through a descendant tag (`isBorrowDescendantOrSelf allBorrows wTag
+entry.tag == true`) act as `NodeRelation::Local` writes on `entry` (activating
+`.reserved -> .active` and preserving `.active` on ancestors), whereas writes
+through a non-descendant tag (`NodeRelation::Foreign` writes, including writes
+through an ancestor tag relative to its children) disable overlapping
+active/reserved/frozen entries.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+
+Reference (Miri Tree Borrows implementation,
+`src/tools/miri/src/borrow_tracker/tree_borrows/perms.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, and MiniRust
+`spec/mem/tree_borrows/state_machine_unprotected.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/src/tools/miri/src/borrow_tracker/tree_borrows/perms.rs>
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/state_machine_unprotected.md#L64-L75>
+
+> "fn transition(
+>     self,
+>     access_kind: AccessKind,
+>     node_relation: NodeRelation,
+> ) -> Result<PermissionUnprot> {
+>     match (node_relation, access_kind) {
+>         (NodeRelation::Local, AccessKind::Read) => self.local_read(),
+>         (NodeRelation::Local, AccessKind::Write) => self.local_write(),
+>         (NodeRelation::Foreign, AccessKind::Read) => self.foreign_read(),
+>         (NodeRelation::Foreign, AccessKind::Write) => self.foreign_write(),
+>     }
+> }"
+
+Reference (Neven Villani, Johannes Hostert, Ralf Jung, and Derek Dreyer,
+"Tree Borrows", Proc. ACM Program. Lang. 9, PLDI, Article 182, June 2025):
+<https://doi.org/10.1145/3729338>
+-/
+@[reducible]
+def updateBorrowPermTreeAtProj
+    (allBorrows : List BorrowEntry)
+    (entry : BorrowEntry)
+    (targetLocal : Local)
+    (writerTag : Option Nat)
+    (writeProj : List ProjectionElem)
+    (writeRangeOff : Nat := 0)
+    (writeRangeLen : Nat := 0) :
+    BorrowEntry :=
+  updateBorrowPermAtProj
+    entry
+    targetLocal
+    (resolveTreeBorrowWriterTag allBorrows entry writerTag)
+    writeProj
+    writeRangeOff
+    writeRangeLen
+
+/--
+Transition all `BorrowEntry` records in `borrows` affected by a Tree Borrows
+write in full borrow hierarchy `allBorrows` at `targetLocal` and `writeProj`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+
+Reference (Miri Tree Borrows implementation,
+`src/tools/miri/src/borrow_tracker/tree_borrows/tree.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, and MiniRust
+`spec/mem/tree_borrows/tree.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/src/tools/miri/src/borrow_tracker/tree_borrows/tree.rs>
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/tree.md#L89-L125>
+
+> "/// Recusively do state transition on `self` node and all its descendants.
+> /// `path` is the path from `self` to the accessed node.
+> /// `path` is None when the accessed node is not a descendant of `self`."
+
+Reference (Neven Villani, Johannes Hostert, Ralf Jung, and Derek Dreyer,
+"Tree Borrows", Proc. ACM Program. Lang. 9, PLDI, Article 182, June 2025):
+<https://doi.org/10.1145/3729338>
+-/
+@[reducible]
+def invalidateTreeBorrowsAtProj
+    (allBorrows : List BorrowEntry)
+    (borrows : List BorrowEntry)
+    (targetLocal : Local)
+    (writerTag : Option Nat)
+    (writeProj : List ProjectionElem)
+    (writeRangeOff : Nat := 0)
+    (writeRangeLen : Nat := 0) :
+    List BorrowEntry :=
+  match borrows with
+  | .nil => .nil
+  | entry :: rest =>
+    updateBorrowPermTreeAtProj
+      allBorrows
+      entry
+      targetLocal
+      writerTag
+      writeProj
+      writeRangeOff
+      writeRangeLen ::
+      invalidateTreeBorrowsAtProj
+        allBorrows
+        rest
+        targetLocal
+        writerTag
+        writeProj
+        writeRangeOff
+        writeRangeLen
+
+/--
+Tree-Borrows-aware read permission transition for `entry` within borrow table
+`allBorrows` when `targetLocal` is read at `readProj` and optional byte range
+`[readRangeOff, readRangeOff + readRangeLen)` through `readerTag`.
+
+Under Tree Borrows, a child/self (`NodeRelation::Local`) read
+(`isBorrowDescendantOrSelf allBorrows rTag entry.tag == true`) preserves
+`entry.perm`, whereas a `NodeRelation::Foreign` read (such as reading through a
+parent pointer after a child mutable borrow has been activated) transitions an
+overlapping `.active` (`PermissionUnprot::Unique`) entry to `.frozen` while
+leaving `.reserved`, `.frozen`, and `.disabled` entries unchanged.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+
+Reference (Miri Tree Borrows implementation,
+`src/tools/miri/src/borrow_tracker/tree_borrows/perms.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, and MiniRust
+`spec/mem/tree_borrows/state_machine_unprotected.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/src/tools/miri/src/borrow_tracker/tree_borrows/perms.rs>
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/state_machine_unprotected.md#L27-L53>
+
+> "fn local_read(self) -> Result<PermissionUnprot> {
+>     ret(
+>         match self {
+>             PermissionUnprot::Disabled => throw_ub!(\"Tree Borrows: local read of Disabled reference\"),
+>             // All other states are kept unchanged.
+>             perm => perm,
+>         }
+>     )
+> }
+> ...
+> fn foreign_read(self) -> Result<PermissionUnprot> {
+>     match self {
+>         PermissionUnprot::Reserved => ret(PermissionUnprot::Reserved),
+>         PermissionUnprot::Unique => ret(PermissionUnprot::Frozen),
+>         // All other states are kept unchanged.
+>         perm => ret(perm),
+>     }
+> }"
+
+Reference (Neven Villani, Johannes Hostert, Ralf Jung, and Derek Dreyer,
+"Tree Borrows", Proc. ACM Program. Lang. 9, PLDI, Article 182, June 2025):
+<https://doi.org/10.1145/3729338>
+-/
+@[reducible]
+def updateBorrowPermOnReadAtProj
+    (allBorrows : List BorrowEntry)
+    (entry : BorrowEntry)
+    (targetLocal : Local)
+    (readerTag : Option Nat)
+    (readProj : List ProjectionElem)
+    (readRangeOff : Nat := 0)
+    (readRangeLen : Nat := 0) :
+    BorrowEntry :=
+  match Nat.beq entry.targetLocal targetLocal with
+  | false => entry
+  | true =>
+    match
+      borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen
+    with
+    | false => entry
+    | true =>
+      let isLocalRead :=
+        match readerTag with
+        | .none => false
+        | .some rTag => isBorrowDescendantOrSelf allBorrows rTag entry.tag
+      match isLocalRead with
+      | true => entry
+      | false =>
+        match entry.perm with
+        | .active => { entry with perm := .frozen }
+        | _ => entry
+
+/--
+Apply `updateBorrowPermOnReadAtProj` across `borrows` for a read at
+`targetLocal` and `readProj` in full borrow hierarchy `allBorrows`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+
+Reference (Miri Tree Borrows implementation,
+`src/tools/miri/src/borrow_tracker/tree_borrows/tree.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, and MiniRust
+`spec/mem/tree_borrows/tree.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/src/tools/miri/src/borrow_tracker/tree_borrows/tree.rs>
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/tree.md#L89-L125>
+
+> "/// Recusively do state transition on `self` node and all its descendants.
+> /// `path` is the path from `self` to the accessed node.
+> /// `path` is None when the accessed node is not a descendant of `self`."
+
+Reference (Neven Villani, Johannes Hostert, Ralf Jung, and Derek Dreyer,
+"Tree Borrows", Proc. ACM Program. Lang. 9, PLDI, Article 182, June 2025):
+<https://doi.org/10.1145/3729338>
+-/
+@[reducible]
+def freezeTreeBorrowsOnReadAtProj
+    (allBorrows : List BorrowEntry)
+    (borrows : List BorrowEntry)
+    (targetLocal : Local)
+    (readerTag : Option Nat)
+    (readProj : List ProjectionElem)
+    (readRangeOff : Nat := 0)
+    (readRangeLen : Nat := 0) :
+    List BorrowEntry :=
+  match borrows with
+  | .nil => .nil
+  | entry :: rest =>
+    updateBorrowPermOnReadAtProj
+      allBorrows
+      entry
+      targetLocal
+      readerTag
+      readProj
+      readRangeOff
+      readRangeLen ::
+      freezeTreeBorrowsOnReadAtProj
+        allBorrows
+        rest
+        targetLocal
+        readerTag
+        readProj
+        readRangeOff
+        readRangeLen
+
+/--
+Update Tree Borrows permissions in `borrows` after a dereference read from
+pointer local `ptrLoc` with post-deref projection suffix `restProj`, freezing
+any foreign `.active` borrows whose target region overlaps the read.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+
+Reference (Miri Tree Borrows implementation,
+`src/tools/miri/src/borrow_tracker/tree_borrows/perms.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, and MiniRust
+`spec/mem/tree_borrows/state_machine_unprotected.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/src/tools/miri/src/borrow_tracker/tree_borrows/perms.rs>
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/state_machine_unprotected.md#L46-L53>
+
+> "fn foreign_read(self) -> Result<PermissionUnprot> {
+>     match self {
+>         PermissionUnprot::Reserved => ret(PermissionUnprot::Reserved),
+>         PermissionUnprot::Unique => ret(PermissionUnprot::Frozen),
+>         // All other states are kept unchanged.
+>         perm => ret(perm),
+>     }
+> }"
+
+Reference (Neven Villani, Johannes Hostert, Ralf Jung, and Derek Dreyer,
+"Tree Borrows", Proc. ACM Program. Lang. 9, PLDI, Article 182, June 2025):
+<https://doi.org/10.1145/3729338>
+-/
+@[reducible]
+def freezeDerefReadBorrowsAt
+    (locals : List LocalSlot)
+    (ptrLoc : Local)
+    (restProj : List ProjectionElem)
+    (borrows : List BorrowEntry) :
+    List BorrowEntry :=
+  match get? locals ptrLoc with
+  | .some (.init (.ptr ptrVal _)) =>
+    match lookupBorrow borrows ptrVal.tag with
+    | .some readerEntry =>
+      freezeTreeBorrowsOnReadAtProj
+        borrows
+        borrows
+        readerEntry.targetLocal
+        (.some ptrVal.tag)
+        (appendProjections readerEntry.targetProjection restProj)
+        readerEntry.rangeOffset
+        readerEntry.rangeLen
+    | .none => borrows
+  | _ => borrows
+
+/--
+Test whether any `BorrowEntry` in `borrows` targeting `targetLocal` at an
+overlapping sub-place or byte range is currently protected by `activeProtectors`
+and would be disabled by a write with `writerTag` in full borrow hierarchy
+`allBorrows`.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+
+Reference (Miri Tree Borrows implementation,
+`src/tools/miri/src/borrow_tracker/tree_borrows/tree.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, and MiniRust
+`spec/mem/tree_borrows/tree.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/src/tools/miri/src/borrow_tracker/tree_borrows/tree.rs>
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/tree.md#L7-L8>
+
+> "When a reborrow occurs at function entry (i.e. the original reference is
+> passed as an argument), we add a *protector* to the reborrow. When a node is
+> protected, it is UB for this node to become `Disabled`."
+
+Reference (Neven Villani, Johannes Hostert, Ralf Jung, and Derek Dreyer,
+"Tree Borrows", Proc. ACM Program. Lang. 9, PLDI, Article 182, June 2025):
+<https://doi.org/10.1145/3729338>
+-/
+@[reducible]
+def hasProtectedTreeWriteConflict
+    (allBorrows : List BorrowEntry)
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (targetLocal : Local)
+    (writerTag : Option Nat)
+    (writeProj : List ProjectionElem := .nil)
+    (writeRangeOff : Nat := 0)
+    (writeRangeLen : Nat := 0) :
+    Bool :=
+  match borrows with
+  | .nil => false
+  | entry :: rest =>
+    let resolvedWriter :=
+      resolveTreeBorrowWriterTag allBorrows entry writerTag
+    let thisConflict :=
+      Bool.and
+        (Nat.beq entry.targetLocal targetLocal)
+        (Bool.and
+          (borrowEntryOverlapsWrite
+            entry
+            writeProj
+            writeRangeOff
+            writeRangeLen)
+          (Bool.and
+            (isBorrowProtected activeProtectors entry)
+            (borrowEntryWriteConflicts entry resolvedWriter)))
+    match thisConflict with
+    | true => true
+    | false =>
+      hasProtectedTreeWriteConflict
+        allBorrows
+        rest
+        activeProtectors
+        targetLocal
+        writerTag
+        writeProj
+        writeRangeOff
+        writeRangeLen
+
+/--
 Look up the `CapturedAllocation` with identifier `allocId` in `globals`.
 
 Reference (`compiler/rustc_middle/src/mir/interpret/allocation.rs` at commit
@@ -1484,14 +2006,27 @@ def evalPlaceWrite
               match entry.targetProjection with
               | .nil => restProj
               | ph :: pt => ph :: appendProjections pt restProj
-            hasProtectedWriteConflict
-              borrows
-              activeProtectors
-              entry.targetLocal
-              (.some ptrVal.tag)
-              fullProj
-              entry.rangeOffset
-              entry.rangeLen
+            match borrows with
+            | b₁ :: b₂ :: restBorrows =>
+              let allBorrows := b₁ :: b₂ :: restBorrows
+              hasProtectedTreeWriteConflict
+                allBorrows
+                allBorrows
+                activeProtectors
+                entry.targetLocal
+                (.some ptrVal.tag)
+                fullProj
+                entry.rangeOffset
+                entry.rangeLen
+            | _ =>
+              hasProtectedWriteConflict
+                borrows
+                activeProtectors
+                entry.targetLocal
+                (.some ptrVal.tag)
+                fullProj
+                entry.rangeOffset
+                entry.rangeLen
           | .none => false
         | _ => false
       | proj :: rest =>
@@ -1617,14 +2152,27 @@ def evalCallerPlaceWrite
               match entry.targetProjection with
               | .nil => restProj
               | ph :: pt => ph :: appendProjections pt restProj
-            hasProtectedWriteConflict
-              borrows
-              activeProtectors
-              entry.targetLocal
-              (.some ptrVal.tag)
-              fullProj
-              entry.rangeOffset
-              entry.rangeLen
+            match borrows with
+            | b₁ :: b₂ :: restBorrows =>
+              let allBorrows := b₁ :: b₂ :: restBorrows
+              hasProtectedTreeWriteConflict
+                allBorrows
+                allBorrows
+                activeProtectors
+                entry.targetLocal
+                (.some ptrVal.tag)
+                fullProj
+                entry.rangeOffset
+                entry.rangeLen
+            | _ =>
+              hasProtectedWriteConflict
+                borrows
+                activeProtectors
+                entry.targetLocal
+                (.some ptrVal.tag)
+                fullProj
+                entry.rangeOffset
+                entry.rangeLen
           | .none => false
         | _ => false
       | _ => false
@@ -1648,37 +2196,58 @@ def invalidateDerefWriteBorrows
     (dst : Place)
     (restProj : List ProjectionElem) :
     List BorrowEntry :=
-  match get? locals₁ dst.local_ with
-  | .some (.init (.ptr ptrVal _)) =>
-    match lookupBorrow borrows ptrVal.tag with
-    | .some entry =>
-      let fullProj := appendProjections entry.targetProjection restProj
-      match fullProj with
-      | .nil =>
-        match Nat.beq entry.rangeLen 0 with
-        | true =>
-          invalidateConflictingBorrows
-            borrows
-            entry.targetLocal
-            (.some ptrVal.tag)
-        | false =>
+  match borrows with
+  | .nil => .nil
+  | single :: .nil =>
+    let b := single :: .nil
+    match get? locals₁ dst.local_ with
+    | .some (.init (.ptr ptrVal _)) =>
+      match lookupBorrow b ptrVal.tag with
+      | .some entry =>
+        let fullProj := appendProjections entry.targetProjection restProj
+        match fullProj with
+        | .nil =>
+          match Nat.beq entry.rangeLen 0 with
+          | true =>
+            invalidateConflictingBorrows
+              b
+              entry.targetLocal
+              (.some ptrVal.tag)
+          | false =>
+            invalidateConflictingBorrowsAtProj
+              b
+              entry.targetLocal
+              (.some ptrVal.tag)
+              .nil
+              entry.rangeOffset
+              entry.rangeLen
+        | pHead :: pTail =>
           invalidateConflictingBorrowsAtProj
-            borrows
+            b
             entry.targetLocal
             (.some ptrVal.tag)
-            .nil
+            (pHead :: pTail)
             entry.rangeOffset
             entry.rangeLen
-      | pHead :: pTail =>
-        invalidateConflictingBorrowsAtProj
-          borrows
+      | .none => b
+    | _ => b
+  | b₁ :: b₂ :: restBorrows =>
+    let allBorrows := b₁ :: b₂ :: restBorrows
+    match get? locals₁ dst.local_ with
+    | .some (.init (.ptr ptrVal _)) =>
+      match lookupBorrow allBorrows ptrVal.tag with
+      | .some entry =>
+        let fullProj := appendProjections entry.targetProjection restProj
+        invalidateTreeBorrowsAtProj
+          allBorrows
+          allBorrows
           entry.targetLocal
           (.some ptrVal.tag)
-          (pHead :: pTail)
+          fullProj
           entry.rangeOffset
           entry.rangeLen
-    | .none => borrows
-  | _ => borrows
+      | .none => allBorrows
+    | _ => allBorrows
 
 /--
 Evaluate a byte-level representation cast (`CastKind.transmute` or
@@ -3316,6 +3885,22 @@ Evaluate an `Rvalue` in `locals` and `mem`, using `localDecls` and `layouts` to
 resolve operand types, signedness, and byte layouts for `Rvalue.binaryOp`,
 `Rvalue.unaryOp`, `Rvalue.cast`, and `Rvalue.aggregate`.
 
+Tree Borrows modeling in `Rvalue.use`, `Rvalue.copyForDeref`, `Rvalue.ref`, and
+`Rvalue.rawPtr`:
+- Dereference reads (`.use (.copy/.move (.deref :: _))` and `.copyForDeref
+  (.deref :: _)`) apply `freezeDerefReadBorrowsAt` when two or more borrow
+  entries exist, freezing any overlapping foreign `.active` borrow to `.frozen`.
+- Dereference reborrows (`.ref borrowKind (.deref :: restProj)`) link the new
+  tag to `parentTag := .some parentPtr.tag`, perform an initial read via
+  `freezeTreeBorrowsOnReadAtProj` (matching `PermissionUnprot::init_access`),
+  and initialize mutable reborrows (`BorrowKind.mut _`) in
+  `TreeBorrowPerm.reserved` (lazy activation upon first child write).
+- Root borrows of a stack local (`.ref (.mut false) local` with
+  `parentTag := .none`) start in `TreeBorrowPerm.active` because direct reads or
+  writes to the root local carry `writerTag = .none` (which is foreign to all
+  borrow tags rather than a parent tag in `mem.borrows`), whereas two-phase root
+  borrows (`.ref (.mut true) local`) start in `TreeBorrowPerm.reserved`.
+
 Reference (The Rust Reference, "Negation operators"):
 <https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#negation-operators>
 
@@ -3350,6 +3935,27 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 >     CopyForDeref(Place<'tcx>),
 >     WrapUnsafeBinder(Operand<'tcx>, Ty<'tcx>),
 > }"
+
+Reference (Miri Tree Borrows implementation,
+`src/tools/miri/src/borrow_tracker/tree_borrows/perms.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, and MiniRust
+`spec/mem/tree_borrows/state_machine_unprotected.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/src/tools/miri/src/borrow_tracker/tree_borrows/perms.rs>
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/state_machine_unprotected.md#L87-L94>
+
+> "fn init_access(self) -> Option<AccessKind> {
+>     // Everything except for `Cell` gets an initial read access.
+>     // We never perform implicit writes for unprotected references.
+>     match self {
+>         PermissionUnprot::Cell => None,
+>         _ => Some(AccessKind::Read)
+>     }
+> }"
+
+Reference (Neven Villani, Johannes Hostert, Ralf Jung, and Derek Dreyer,
+"Tree Borrows", Proc. ACM Program. Lang. 9, PLDI, Article 182, June 2025):
+<https://doi.org/10.1145/3729338>
 -/
 def evalRvalue
     (locals : List LocalSlot)
@@ -3361,7 +3967,33 @@ def evalRvalue
   match rv with
   | .use op =>
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok v locals' => .ok v locals' mem
+    | .ok v locals' =>
+      match op, mem.borrows with
+      | .copy { local_ := ptrLoc, projection := .deref :: restProj },
+        b₁ :: b₂ :: restBorrows =>
+        .ok
+          v
+          locals'
+          { mem with
+            borrows :=
+              freezeDerefReadBorrowsAt
+                locals
+                ptrLoc
+                restProj
+                (b₁ :: b₂ :: restBorrows) }
+      | .move { local_ := ptrLoc, projection := .deref :: restProj },
+        b₁ :: b₂ :: restBorrows =>
+        .ok
+          v
+          locals'
+          { mem with
+            borrows :=
+              freezeDerefReadBorrowsAt
+                locals
+                ptrLoc
+                restProj
+                (b₁ :: b₂ :: restBorrows) }
+      | _, _ => .ok v locals' mem
     | .ub => .ub
     | .unsupported => .unsupported
   | .binaryOp op lhsOp rhsOp =>
@@ -3396,7 +4028,20 @@ def evalRvalue
     | .unsupported => .unsupported
   | .copyForDeref place =>
     match evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok v locals' => .ok v locals' mem
+    | .ok v locals' =>
+      match place.projection, mem.borrows with
+      | .deref :: restProj, b₁ :: b₂ :: restBorrows =>
+        .ok
+          v
+          locals'
+          { mem with
+            borrows :=
+              freezeDerefReadBorrowsAt
+                locals
+                place.local_
+                restProj
+                (b₁ :: b₂ :: restBorrows) }
+      | _, _ => .ok v locals' mem
     | .ub => .ub
     | .unsupported => .unsupported
   | .repeat op count =>
@@ -3428,15 +4073,31 @@ def evalRvalue
                 match parentEntry.targetProjection with
                 | .nil => resolvedRest
                 | ph :: pt => ph :: appendProjections pt resolvedRest
+              let reborrowPerm :=
+                match borrowKind with
+                | .shared => perm
+                | .mut _ => TreeBorrowPerm.reserved
+              let borrowsAfterRead :=
+                freezeTreeBorrowsOnReadAtProj
+                  mem.borrows
+                  mem.borrows
+                  parentEntry.targetLocal
+                  (.some parentPtr.tag)
+                  fullProj
+                  parentEntry.rangeOffset
+                  parentEntry.rangeLen
               let entry : BorrowEntry := {
                 tag := tag
                 targetLocal := parentEntry.targetLocal
                 targetProjection := fullProj
-                perm := perm
+                perm := reborrowPerm
+                rangeOffset := parentEntry.rangeOffset
+                rangeLen := parentEntry.rangeLen
+                parentTag := .some parentPtr.tag
               }
               let mem' := {
                 mem with
-                borrows := entry :: mem.borrows
+                borrows := entry :: borrowsAfterRead
                 nextTag := Nat.add tag 1
               }
               .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
@@ -3531,6 +4192,9 @@ def evalRvalue
                 targetLocal := parentEntry.targetLocal
                 targetProjection := fullProj
                 perm := perm
+                rangeOffset := parentEntry.rangeOffset
+                rangeLen := parentEntry.rangeLen
+                parentTag := .some parentPtr.tag
               }
               let mem' := {
                 mem with

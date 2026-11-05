@@ -607,7 +607,19 @@ theorem evalRvalue_pure_eq_withMem
     dsimp only [evalRvalue]
     rw [evalOperand_pure_eq locals op mem.borrows mem.globals layouts mem.callerLocals h_pure]
     rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
-    cases evalOperand locals op [] [] layouts [] <;> rfl
+    cases evalOperand locals op [] [] layouts [] with
+    | ub => rfl
+    | unsupported => rfl
+    | ok v locals' =>
+      cases op with
+      | constant _ => rfl
+      | copy p | move p =>
+        rcases p with ⟨loc, proj⟩
+        cases proj with
+        | nil => rfl
+        | cons hd tl =>
+          simp only [isPureOperand, isPurePlace, List.all_cons, Bool.and_eq_true] at h_pure
+          cases hd <;> first | rfl | exact False.elim (Bool.false_ne_true h_pure.1)
   | «repeat» op count =>
     dsimp only [isPureRvalue] at h_pure
     dsimp only [evalRvalue]
@@ -716,7 +728,16 @@ theorem evalRvalue_pure_eq_withMem
     dsimp only [evalRvalue]
     rw [evalOperand_pure_eq locals (.copy p) mem.borrows mem.globals layouts mem.callerLocals h_pure]
     rw [evalOperand_pure_eq locals (.copy p) emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
-    cases evalOperand locals (.copy p) [] [] layouts [] <;> rfl
+    cases evalOperand locals (.copy p) [] [] layouts [] with
+    | ub => rfl
+    | unsupported => rfl
+    | ok v locals' =>
+      rcases p with ⟨loc, proj⟩
+      cases proj with
+      | nil => rfl
+      | cons hd tl =>
+        simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_pure
+        cases hd <;> first | rfl | exact False.elim (Bool.false_ne_true h_pure.1)
   | wrapUnsafeBinder _ _ => rfl
 
 /-- Replace the `Memory` in a normal `MirOutcome` with `mem`. -/
