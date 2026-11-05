@@ -89,7 +89,6 @@ def initMachineStateWithCallees
       callees := callees
       callStack := []
       activeCallee := none
-      traitImpls := body.traitImpls
     }
   }
 
