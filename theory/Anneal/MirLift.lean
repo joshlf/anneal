@@ -4,7 +4,7 @@ import Anneal.MirLiftCore
 import Anneal.PureMirExec
 import Anneal.MirLiftBench
 
-open Lean Meta Elab Command
+open Lean Meta Elab Command Tactic
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Anneal.MirLiftCore
@@ -12,12 +12,22 @@ open Anneal.PureMirExec
 
 set_option maxHeartbeats 100000
 
+elab "apply_lift_block_of_lookup" : tactic => do
+  let g ← getMainGoal
+  let tgt ← g.getType
+  let tgt ← instantiateMVars tgt
+  if tgt.isAppOf ``Anneal.MirLiftCore.LiftBlock then
+    evalTactic (← `(tactic| apply Anneal.MirLiftCore.LiftBlock.of_lookup (by rfl)))
+  else
+    throwError "Not a LiftBlock goal"
+
 syntax "lift_mir_step" : tactic
 macro_rules
 | `(tactic| lift_mir_step) => `(tactic|
     first
     | exact (by assumption)
     | apply Anneal.MirLiftCore.LiftResidualBlock.to_LiftBlock; exact (by assumption)
+    | apply_lift_block_of_lookup
     | apply LiftStmtsTerminator.term_goto (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl)
     | apply LiftStmtsTerminator.term_return (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl)
     | apply LiftStmtsTerminator.cons_eval (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl)
@@ -129,6 +139,20 @@ def loopBody : CapturedMir := makeLoopBody "loop"
 
 def multiCalleeBody : CapturedMir := makeMultiCalleeBody "multi"
 #mir_lift (residual := true) multiCalleeBody
+
+def makeGotoBody (name : String) : CapturedMir := {
+  benchBody with
+  defPath := name,
+  basicBlocks := [
+    { statements := [], terminator := { kind := .goto 1, span := "bench" }, isCleanup := false },
+    { statements := [
+        { kind := .assign { local_ := 0, projection := [] } (.use (.constant { ty := pureU32Ty, val := .scalar (.int { bits := 0, sizeBytes := 4 }) })), span := "bench" }
+      ], terminator := { kind := .return_, span := "bench" }, isCleanup := false }
+  ]
+}
+
+def gotoBody : CapturedMir := makeGotoBody "goto"
+#mir_lift gotoBody
 
 def partialBody : CapturedMir := makeBranchBody "partial"
 #mir_lift (residual := true) partialBody
