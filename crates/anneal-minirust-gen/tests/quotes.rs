@@ -880,3 +880,43 @@ fn mr_2_2_tuple_quotations_are_pinned_and_tamper_checked() {
         );
     }
 }
+
+#[test]
+fn mr_2_3_enum_quotations_are_pinned_and_tamper_checked() {
+    let corpus = corpus();
+    let valid_paths: BTreeSet<String> = corpus.iter().map(|(p, _)| p.clone()).collect();
+    let lean_root = minirust_dir().join("lean");
+
+    let interp_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Interp.lean")).unwrap();
+    let interp_quotes = extract_quotes(&interp_text, &valid_paths).unwrap();
+    let expected_interp: &[(&str, &str)] = &[
+        ("spec/lang/representation.md", "fn decode_discriminant<M: Memory>(mut accessor: impl FnMut(Offset, Size) -> Result<List<AbstractByte<M::Provenance>>>,"),
+        ("spec/lang/representation.md", "fn encode_discriminant<M: Memory>("),
+        ("spec/lang/representation.md", "fn decode<M: Memory>(Type::Enum { variants, discriminator, size, .. }: Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> {"),
+        ("spec/lang/representation.md", "fn encode<M: Memory>(Type::Enum { variants, .. }: Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> {"),
+        ("spec/lang/representation.md", "(Value::Variant { discriminant, data }, Type::Enum { variants, .. }) => {"),
+        ("spec/lang/step/expressions.md", "fn eval_place(&mut self, PlaceExpr::Downcast { root, discriminant }: PlaceExpr) -> Result<(Place<M>, Type)> {"),
+        ("spec/lang/step/expressions.md", "fn eval_value(&mut self, ValueExpr::Variant { enum_ty, discriminant, data } : ValueExpr) -> Result<(Value<M>, Type)> {"),
+        ("spec/lang/step/expressions.md", "fn eval_value(&mut self, ValueExpr::GetDiscriminant { place } : ValueExpr) -> Result<(Value<M>, Type)> {"),
+        ("spec/lang/step/statements.md", "fn eval_statement(&mut self, Statement::SetDiscriminant { destination, value }: Statement) -> NdResult {"),
+    ];
+    for (cited_file, needle) in expected_interp {
+        let matched = interp_quotes
+            .iter()
+            .find(|q| q.cited_file == *cited_file && squash(&q.text).contains(&squash(needle)))
+            .unwrap_or_else(|| {
+                panic!("Interp.lean missing MR-2.3 quotation `{needle}` cited to `{cited_file}`")
+            });
+        assert_eq!(
+            missing_piece_in(&corpus, Some(cited_file), &matched.text),
+            None,
+            "Interp.lean quotation `{needle}` failed upstream verification"
+        );
+        let mutated = format!("{}__TAMPERED__", matched.text);
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), &mutated).is_some(),
+            "tampered quotation for `{needle}` unexpectedly matched `{cited_file}`"
+        );
+    }
+}

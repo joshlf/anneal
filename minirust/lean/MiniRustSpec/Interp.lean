@@ -560,6 +560,30 @@ def AbstractByte.data : Byte → Option UInt8
   | .Uninit => none
   | .Init b _ => some b
 
+/-- `decode_discriminant` (`spec/lang/representation.md`) -/
+partial def decodeDiscriminant {m' : Type → Type} [Monad m'] [MonadLiftT Interp m']
+    (accessor : Offset → Size → m' (List Byte)) : Discriminator → m' (Option Int)
+  | .Known val => pure (some val)
+  | .Invalid => pure none
+  | .Branch offset value_type fallback children => do
+    let bytes ← accessor offset value_type.size
+    let decoded := if bytes.length ≠ value_type.size.bytes then none
+      else match bytes.mapM AbstractByte.data with
+      | some data => some (Endianness.decode x86_64.ENDIANNESS value_type.signed data)
+      | none => none
+    match decoded with
+    | some val =>
+      let rec loop (entries : List ((Int × Int) × Discriminator)) : m' (Option Int) := do
+        match entries with
+        | [] => decodeDiscriminant accessor fallback
+        | ((start, end_), child) :: rest =>
+          if start ≤ val ∧ val < end_ then
+            decodeDiscriminant accessor child
+          else
+            loop rest
+      loop children.entries
+    | _ => pure none
+
 mutual
 
 /-- `Type::decode` for `Bool`, `Int`, `Tuple`, and `Array` (`spec/lang/representation.md`):
@@ -645,6 +669,16 @@ def Type.decode : «Type» → List Byte → Interp (Option Val)
         subsliceWithLength bytes ((i : Int) * (elemSize.bytes : Int)) elemSize.bytes)
       let decoded ← tryMapM (fun elemBytes => Type.decode elem elemBytes) chunks
       pure (decoded.map Value.Tuple)
+  | .Enum variants _ discriminator size _, bytes => do
+    if bytes.length ≠ size.bytes then
+      specPanic "decode of Type::Enum with invalid length"
+    else do
+      let accessor (offset : Offset) (sz : Size) : Interp (List Byte) :=
+        subsliceWithLength bytes offset.bytes sz.bytes
+      let discriminant ← decodeDiscriminant accessor discriminator
+      match discriminant with
+      | none => pure none
+      | some discr => decodeEnumVariant variants.entries discr bytes
   | _, _ => unsupported "Type::decode for a non-Int, non-Bool, non-Tuple, non-Array type"
 
 /-- Field-by-field `sized_fields.try_map` loop of `Type::decode` for `Type::Tuple`
@@ -656,6 +690,16 @@ def Type.decode : «Type» → List Byte → Interp (Option Val)
 >     );
 >     ty.decode::<M>(subslice)
 > })" -/
+def decodeEnumVariant : List (Int × Variant) → Int → List Byte → Interp (Option Val)
+  | [], _, _ => pure none
+  | (d, { ty := ty, tagger := _ }) :: vs, discr, bytes =>
+    if d == discr then do
+      match ← Type.decode ty bytes with
+      | none => pure none
+      | some value => pure (some (.Variant discr value))
+    else
+      decodeEnumVariant vs discr bytes
+
 def decodeTupleFields : List (Offset × «Type») → List Byte → Interp (Option (List Val))
   | [], _ => pure (some [])
   | (offset, ty) :: rest, bytes => do
@@ -670,6 +714,15 @@ def decodeTupleFields : List (Offset × «Type») → List Byte → Interp (Opti
       | some vs => pure (some (v :: vs))
 
 end
+
+/-- `encode_discriminant` (`spec/lang/representation.md`) -/
+def encodeDiscriminant {m' : Type → Type} [Monad m'] [MonadLiftT Interp m']
+    (accessor : Offset → List Byte → m' Unit) (tagger : Map Offset (IntType × Int)) : m' Unit := do
+  tagger.entries.forM fun (offset, value_type, value) => do
+    let value_bytes ← match Endianness.encode x86_64.ENDIANNESS value_type.signed value_type.size value with
+      | some data => pure (data.map (fun b => .Init b none))
+      | none => specPanic "encode of Int out of bounds"
+    accessor offset value_bytes
 
 mutual
 
@@ -740,6 +793,18 @@ def Type.encode : «Type» → Val → Interp (List Byte)
           pure bytes)
       pure encoded.flatten
   | .Array _ _, _ => specPanic "encode: Type::Array with a non-Tuple value"
+  | .Enum variants _ _ size _, .Variant discriminant data => do
+    let variantBytes ← encodeEnumVariant variants.entries discriminant data
+    let bytes := List.replicate size.bytes .Uninit
+    let bytes' ← writeSubsliceAtIndex bytes 0 variantBytes
+    let variant ← mapIndex variants discriminant "get tagger"
+    let (_, bytes'') ← StateT.run (encodeDiscriminant (fun offset value_bytes => do
+      let b ← get
+      let b' ← liftM (writeSubsliceAtIndex b offset.bytes value_bytes)
+      set b'
+    ) variant.tagger) bytes'
+    pure bytes''
+  | .Enum _ _ _ _ _, _ => specPanic "encode: Type::Enum with a non-Variant value"
   | _, _ => unsupported "Type::encode for a non-Int, non-Bool, non-Tuple, non-Array type"
 
 /-- Field-by-field `write_subslice_at_index` loop of `Type::encode` for `Type::Tuple`
@@ -747,6 +812,14 @@ def Type.encode : «Type» → Val → Interp (List Byte)
 > "for ((offset, ty), value) in sized_fields.zip(values) {
 >     bytes.write_subslice_at_index(offset.bytes(), ty.encode::<M>(value));
 > }" -/
+def encodeEnumVariant : List (Int × Variant) → Int → Val → Interp (List Byte)
+  | [], _, _ => specPanic "encode of Type::Enum with invalid discriminant"
+  | (d, { ty := ty, tagger := _ }) :: vs, discr, value =>
+    if d == discr then
+      Type.encode ty value
+    else
+      encodeEnumVariant vs discr value
+
 def encodeTupleFields : List (Offset × «Type») → List Val → List Byte → Interp (List Byte)
   | [], _, bytes => pure bytes
   | _, [], bytes => pure bytes
@@ -806,7 +879,10 @@ def checkValue : Val → «Type» → Interp Unit
   | _, .Bool => specPanic "Value: value does not match type"
   | _, .Tuple _ _ _ => specPanic "Value: value does not match type"
   | _, .Array _ _ => specPanic "Value: value does not match type"
-  | _, _ => unsupported "check_value for a non-Int, non-Bool, non-Tuple, non-Array type"
+  | .Variant id data, .Enum variants _ _ _ _ =>
+    checkEnumVariant variants.entries id data
+  | _, .Enum _ _ _ _ _ => specPanic "Value: value does not match type"
+  | _, _ => unsupported "check_value for a non-Int, non-Bool, non-Tuple, non-Array, non-Enum type"
 
 /-- Field-by-field loop of `Machine::check_value` for `Type::Tuple`
 (`spec/lang/representation.md`):
@@ -819,6 +895,14 @@ def checkTupleFields : List Val → List (Offset × «Type») → Interp Unit
   | val :: restVals, (_, ty) :: restFields => do
     checkValue val ty
     checkTupleFields restVals restFields
+
+def checkEnumVariant : List (Int × Variant) → Int → Val → Interp Unit
+  | [], _, _ => specPanic "Value::Variant: invalid variant id"
+  | (d, { ty := ty, tagger := _ }) :: vs, discr, data =>
+    if d == discr then
+      checkValue data ty
+    else
+      checkEnumVariant vs discr data
 
 end
 
@@ -1553,6 +1637,14 @@ def evalPlace (m : Mach) : PlaceExpr → Interp ((Place BM × «Type») × Mach)
         pure (({ rootPlace with ptr := { thin_pointer := ptr, metadata := none } }, elemTy), m)
       else
         specPanic "sanity check: the indexed offset should not be outside what the type allows."
+  | .Downcast root discriminant => do
+    let ((root_place, ty), m') ← evalPlace m root
+    match ty with
+    | .Enum variants _ _ _ _ =>
+      match listIndex variants.entries discriminant "variants[variant]" with
+      | .error _ => ub "access to invalid variant"
+      | .ok (_, variant) => pure ((root_place, variant.ty), m')
+    | _ => specPanic "downcast on non-projectable type"
   | _ => unsupported "eval_place for a non-Local, non-Field, non-Index place expression"
 
 /-- Left-to-right element evaluation `exprs.try_map(|e| self.eval_value(e))?.map(|e| e.0)`
@@ -1609,6 +1701,27 @@ def evalValue (m : Mach) : ValueExpr → Interp ((Val × «Type») × Mach)
     let (l, m) ← evalValue m left
     let (r, m) ← evalValue m right
     pure (← evalBinOp operator l r, m)
+  | .Variant discriminant data enum_ty => do
+    let ((data_val, _), m') ← evalValue m data
+    pure ((.Variant discriminant data_val, enum_ty), m')
+  | .GetDiscriminant place => do
+    let ((place_val, ty), m') ← evalPlace m place
+    match ty with
+    | .Enum _ discriminant_ty discriminator _ _ =>
+      if !place_val.aligned then
+        ub "Getting the discriminant of a place based on a misaligned pointer."
+      else
+        let accessor (idx : Offset) (sz : Size) : Interp (List Byte) := do
+          let ptr ← ptrOffsetInbounds m' place_val.ptr.thin_pointer idx.bytes
+          let (bytes, _) ← CM.load m'.mem ptr sz ⟨1⟩ .None
+          -- We cannot mutate `m'` easily here without returning it, but decodeDiscriminant only reads.
+          -- Let's just return bytes.
+          pure bytes
+        let discriminant ← decodeDiscriminant accessor discriminator
+        match discriminant with
+        | some discr => pure ((.Int discr, .Int discriminant_ty), m')
+        | none => ub "ValueExpr::GetDiscriminant encountered invalid discriminant."
+    | _ => specPanic "ValueExpr::GetDiscriminant requires enum type"
   | _ => unsupported "eval_value for an expression outside the fragment"
 
 end
@@ -1635,7 +1748,23 @@ def evalStatement (m : Mach) : Statement → Interp Mach
   | .PlaceMention place => do
     let (_, m) ← evalPlace m place
     pure m
-  | _ => unsupported "eval_statement for a statement other than Assign/PlaceMention"
+  | .SetDiscriminant destination value => do
+    let ((place, ty), m') ← evalPlace m destination
+    match ty with
+    | .Enum variants _ _ _ _ =>
+      if !place.aligned then
+        ub "setting the discriminant of a place based on a misaligned pointer"
+      else
+        let variant ← mapIndex variants value s!"setting an invalid discriminant ({value})"
+        let accessor (offset : Offset) (bytes : List Byte) : StateT Mach Interp Unit := do
+          let mach ← get
+          let ptr ← liftM (ptrOffsetInbounds mach place.ptr.thin_pointer offset.bytes)
+          let cm ← liftM (CM.store mach.mem ptr bytes ⟨1⟩ .None)
+          set { mach with mem := cm }
+        let ((), m'') ← StateT.run (encodeDiscriminant accessor variant.tagger) m'
+        pure m''
+    | _ => specPanic "setting the discriminant type of a non-enum contradicts well-formedness"
+  | _ => unsupported "eval_statement for a statement other than Assign/PlaceMention/SetDiscriminant"
 
 /-! ## Terminators (`spec/lang/step/terminators.md`) -/
 
