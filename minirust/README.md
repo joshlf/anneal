@@ -121,7 +121,9 @@ executable meaning of the fragment is `Interp.lean`.
 
 `Interp.lean` transcribes, against the *generated* types, the specr-lang
 functions needed to run the fragment below on `Machine<BasicMemory<x86_64>>`:
-`Machine::step` (single enabled thread), `Statement::{Assign, PlaceMention}`,
+`Machine::step` (single enabled thread),
+`Statement::{Assign, PlaceMention, StorageLive, StorageDead, Deinit}` (with
+`StackFrame::{storage_live, storage_dead}` and `ConcurrentMemory::deinit`),
 `PlaceExpr::{Local, Field}` (`PlaceExpr::Field` indexing `(offset, field_ty)`
 and offsetting the pointer via `Machine::ptr_offset_inbounds` and
 `ConcurrentMemory::signed_dereferenceable` / `BasicMemory::signed_dereferenceable`),
@@ -147,8 +149,13 @@ frame teardown and both stack-pop actions, the representation relation
 `TraitObject`, `check_value` for those types, `Type::layout` (also for unsized
 tuples, slices, and trait objects) and `LayoutStrategy::compute_size_and_align`
 / `TupleHeadLayout::full_size_and_align`, `BasicMemory`'s `check_ptr`,
-`dereferenceable`, `signed_dereferenceable`, `load`, `store`, and `deallocate`,
-and `ConcurrentMemory`'s access log and data-race check. The recursion over
+`dereferenceable`, `signed_dereferenceable`, `load`, `store`, `allocate`, and
+`deallocate`, and `ConcurrentMemory`'s access log and data-race check.
+`BasicMemory::allocate` picks the address with the daemonic choice `pick`,
+which never has a unique solution; the interpretation commits to one valid
+resolution (`BM.pickAddr`): the first multiple of `2^32` in `[2^32, 2^64)`
+that satisfies every test of the upstream predicate (`BM.allocAddrOk`), and
+reports `Stop.unsupported` when there is none. The recursion over
 nested types, tuple fields, union chunks, enum variants, and discriminator trees
 is structural (Lean `mutual` blocks), so the kernel evaluates it.
 MiniRust has no Boolean `!`: `UnOp::Int` on a `Value::Bool` is a spec panic,
@@ -162,7 +169,7 @@ comments; `..` marks elided code). Effects are
 (a panic in the spec, which upstream calls a spec bug), and
 `Stop.unsupported` (outside the interpreted fragment; never silently wrong).
 
-`Anchors.lean` lists the 55 upstream items that `Interp.lean` transcribes,
+`Anchors.lean` lists the 58 upstream items that `Interp.lean` transcribes,
 each with its file path, item name, line, and token hash, and proves by `decide`
 that the generated model contains them unchanged (`anchors_ok`) with no
 duplicate entries (`anchors_nodup`). Re-pinning MiniRust therefore breaks
@@ -177,10 +184,22 @@ MiniRust's `minimize` (vendored under `vendor/<commit>/tooling/minimize/src/`,
 quoted in the doc comments, quotations checked by `tests/quotes.rs`)
 restricted to the fragment checked by `inFragment`:
 
-* the body is `Runtime(PostCleanup)` MIR and declares only the return place
-  and the arguments, all of integer type (`u8`..`u128`, `i8`..`i128`,
-  `usize`, `isize`), `bool`, `core::cmp::Ordering`, or a 2-tuple `(Int, bool)`
-  for any integer type `Int`;
+* the body is `Runtime(PostCleanup)` MIR and declares the return place, the
+  arguments, and any number of temporaries (fewer than `2^31` locals in all),
+  all of integer type (`u8`..`u128`, `i8`..`i128`, `usize`, `isize`), `bool`,
+  `core::cmp::Ordering`, or a 2-tuple `(Int, bool)` for any integer type `Int`;
+* `StorageLive(_i)` and `StorageDead(_i)` of any local (`StorageDead` only of
+  temporaries, as MiniRust's well-formedness check requires), and `Deinit(_i)`
+  of a root local, which `minimize` does not translate and we translate to
+  `Statement::Deinit(PlaceExpr::Local(_i))`;
+* operands may also be `move _j` (and `move (_j.0)`, `move (_j.1)`), which
+  `minimize` translates like `copy`. Anneal's `move` of a root local leaves it
+  uninitialized while MiniRust's is a plain load, so `movesOk` requires that no
+  operand reads a local that may have been moved out of (tracked per block,
+  conservatively assuming at each block entry every local that the body moves
+  anywhere) before it is written again;
+* temporaries without storage markers (`alwaysStorageLiveLocals`, which
+  `minimize`'s init block allocates) are never mentioned (`mentionsOk`);
 * statements are `_i = Use(op)`, `_i = UnaryOp(Neg | Not, op)`,
   `_i = BinaryOp(Add | Sub | Mul | Div | Rem | BitXor | BitAnd | BitOr | Shl | Shr | AddUnchecked | SubUnchecked | MulUnchecked | ShlUnchecked | ShrUnchecked, opL, opR)`,
   `_i = Cast(CastKind::IntToInt, op, targetTy)`, or `PlaceMention(_i | _i.0 | _i.1)`,
@@ -226,19 +245,22 @@ restricted to the fragment checked by `inFragment`:
 within MIR blocks) and `StartRel body f ctx s mInit` (for entry at `minimize`'s
 synthesized `f.start` block without requiring a phantom `bb0` machine): the
 MiniRust machine has one enabled thread whose stack is `[caller, callee]`; the
-callee runs `f` at the corresponding program point; every MIR local `_i` is a
-live MiniRust local pointing to its own `Stack` allocation whose bytes are the
-encoding of Anneal's slot (`Uninit` bytes for an uninitialized slot,
-little-endian bytes for an initialized scalar, only `0` or `1` for an
-initialized `bool`, and only the tags `255`, `0`, or `1` for an initialized
-`Ordering`, so that the byte decodes at the local's MiniRust type); the
-caller's return place is a live, large-enough, aligned allocation (`CtxOk`);
-and Anneal's memory has no borrows, protectors, call stack, or caller-owned
-referents. `ctx` fixes
-everything the callee does not determine: caller frame, unwind payloads, the
-allocations below the callee's locals, the locals' addresses (arbitrary,
-subject only to alignment, so every MiniRust address choice is covered), and
-the caller's continuation.
+callee runs `f` at the corresponding program point; a MIR local `_i` is in the
+callee's locals map exactly when Anneal's slot is live (or `_i` is a
+temporary that the init block allocated), pointing to its own `Stack`
+allocation whose bytes are the encoding of a slot (`Uninit` bytes for an
+uninitialized slot, little-endian bytes for an initialized scalar, only `0` or
+`1` for an initialized `bool`, and only the tags `255`, `0`, or `1` for an
+initialized `Ordering`, so that the byte decodes at the local's MiniRust type;
+`LocalsOk`); MiniRust's bytes encode Anneal's slots except for locals that
+Anneal's `move` de-initialized and that `movesOk` keeps unread (`StaleOk`); the
+caller's return place is a live, large-enough, aligned allocation and the
+caller's allocations lie below `2^32`, clear of `BM.pickAddr`'s candidates
+(`CtxOk`); and Anneal's memory has no borrows, protectors, call stack, or
+caller-owned referents. `ctx` fixes everything the callee does not determine:
+caller frame, unwind payloads, the allocations below the callee's locals, the
+addresses of the return place and the arguments (arbitrary below `2^32`,
+subject to alignment), and the caller's continuation.
 
 ### Theorems
 
@@ -255,11 +277,12 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
   the caller (`ReturnRel`); Anneal UB matches MiniRust UB (`throw_ub!`, never a
   spec panic, deadlock, or unsupported construct); every other Anneal outcome,
   including `unsupported`, is impossible.
-* `step_initBlock`, `step_start`, `initMachineState_startRel`
-  (`Simulation.lean`): proves for every translated function `f` that
-  `initMachineState body args` (with `argsOk body args = true` and `CtxOk body ctx`)
-  satisfies `StartRel` at `f.start`, and that `minimize`'s synthesized entry
-  block (`f.start = bbName body.basicBlocks.length`) steps in 1 step (`Goto bb0`)
+* `step_start`, `initMachineState_startRel` (`Simulation.lean`): proves for
+  every translated function `f` that `initMachineState body args` (with
+  `argsOk body args = true` and `CtxOk body ctx`) satisfies `StartRel` at
+  `f.start`, and that `minimize`'s synthesized entry block
+  (`f.start = bbName body.basicBlocks.length`: `StorageLive` of each temporary
+  of `alwaysStorageLiveLocals`, then `Goto(bb0)`) runs in `initLen body` steps
   to `StateRel`.
 * `run_ret`, `run_ub`, `run_ret_from_start`, `run_ub_from_start`,
   `mirCall_ret`, `mirCall_ub` (`Run.lean`): lifted to Anneal's interaction
@@ -294,6 +317,19 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
 `Correspondence/Witness.lean` discharges every hypothesis for concrete
 programs, computing both semantics in the kernel (`decide`/`rfl`, no
 `native_decide`):
+
+* `tempMove` (MR-1.3), the MIR of `fn(x: u32) -> u32 { let y = (x + 1) * 2;
+  if y == 8 { 100 } else { y } }` with `u32` and `bool` temporaries,
+  `StorageLive`/`StorageDead`, root `move` in a `BinaryOp`, a `Use`, and a
+  `switchInt` discriminant, `Deinit` of a moved-from temporary, and an unused
+  temporary `_4` that the init block allocates: for `x = 3` and `x = 2`,
+  `mirCall_ret` yields MiniRust returns of `100` and `6`, which direct runs
+  confirm, including that every callee allocation is dead afterwards and that
+  `StorageLive` reuses the first-fit address that `StorageDead` released
+  (`tempMove3_*`, `tempMove2_*`); `deadRead` reads a temporary after
+  `StorageDead` (UB in both models, `deadRead_*`); and `moveReuse`, which reads
+  a local after moving out of it, is rejected by `movesOk`, and the two models
+  indeed disagree on it (`moveReuse7_*`).
 
 * `sumTo`, the MIR of a `u32` loop with `switchInt`, wrapping `Add`/`Sub`,
   constants, and `Goto`: Anneal returns `6` for `n = 3`
@@ -483,12 +519,19 @@ on `sorryAx` or a non-standard axiom.
 
 These are deliberate and are the first things to lift:
 
-* **`Operand::Move` is excluded.** `minimize` translates `Move` exactly like
-  `Copy`, whereas Anneal de-initializes the moved-from place, so the models
-  disagree on later reads of a moved-from local.
-* **Only the return place and arguments.** Bodies with other locals need
-  `StorageLive`/`StorageDead` (and `minimize`'s init block would allocate
-  some of them), which the fragment and the interpretation do not cover.
+* **Moves are checked per block.** `movesOk` assumes at every block entry
+  that each local the body moves anywhere may be moved out, so a moved-from
+  local must be written in the same block before it is read again; a body that
+  reads, in another block, a local that it moves elsewhere is outside the
+  fragment (a dataflow analysis over the CFG would admit more bodies). Only
+  root moves de-initialize in Anneal; projected moves read like copies.
+* **Temporaries of the init block are never mentioned.** Anneal keeps a
+  temporary without storage markers dead, whereas `minimize`'s init block
+  allocates it, so the fragment requires that the body never mentions one.
+* **One resolution of the address choice.** `BasicMemory::allocate`'s `pick`
+  is resolved by first fit over the multiples of `2^32`; results hold for that
+  resolution, which the fragment cannot observe (it has no pointer-to-integer
+  casts or pointer comparisons).
 * **One thread, called from a caller frame.** MiniRust makes it UB for the
   bottom frame of the main thread to return, while Anneal's root body returns
   normally, so the relation places the callee above an arbitrary caller. What

@@ -27,9 +27,9 @@ we choose the program that MiniRust's tooling would produce.
 
 The translation is defined only on the fragment checked by `inFragment`:
 
-* the body declares exactly the return place and the arguments
-  (`localDecls.length = argCount + 1`), all of integer, `bool`,
-  `core::cmp::Ordering`, or `(Int, bool)` 2-tuple type;
+* the body declares the return place, the arguments, and any number of
+  temporaries (`argCount + 1 ≤ localDecls.length < 2^31`), all of integer,
+  `bool`, `core::cmp::Ordering`, or `(Int, bool)` 2-tuple type;
 * statements are `_i = Use(copy _j)`, `_i = Use(copy (_j.0))`, `_i = Use(const c)`,
   `_i = UnaryOp(uop, a)` with `uop ∈ {Neg, Not}`,
   `_i = BinaryOp(op, a, b)` with
@@ -50,12 +50,18 @@ The translation is defined only on the fragment checked by `inFragment`:
   `_i = BinaryOp(AddWithOverflow | SubWithOverflow | MulWithOverflow, a, b)` of
   two integer operands of type `it`, and `_i = Aggregate(Tuple, [a, b])` of an
   integer operand `a` of type `it` and a `bool` operand `b`; every operand is
-  `copy _j`, a 2-tuple field projection `copy (_j.0)` or `copy (_j.1)`, or a
-  scalar constant; or `PlaceMention(_i)`;
+  `copy _j` or `move _j`, a 2-tuple field projection `copy (_j.0)`,
+  `copy (_j.1)`, `move (_j.0)`, or `move (_j.1)`, or a scalar constant;
+  `PlaceMention(p)` of a fragment place; `StorageLive(_i)` and
+  `StorageDead(_i)` of a temporary (`_i` with `argCount < i`); and
+  `Deinit(_i)` of a local;
 * terminators are `Goto`, `SwitchInt` on an integer or `bool` operand
-  (`copy _j` or constant), `Unreachable`, or `Return`, and every jump target is
-  a block of the body;
-* no block is a cleanup block.
+  (`copy _j`, `move _j`, or constant), `Unreachable`, or `Return`, and every
+  jump target is a block of the body;
+* no block is a cleanup block;
+* no moved-from local is read before it is re-initialized (`movesOk`), and
+  every temporary the body mentions has explicit storage markers
+  (`mentionsOk`); see below.
 
 `minimize` has no MiniRust Boolean operator to use: it writes `!b` as a
 transmute of `1 - b` back to `bool` (`boolNot`), `a & b` / `a | b` / `a ^ b` as
@@ -69,11 +75,30 @@ returns an `i8`; `minimize` transmutes that `i8` to its translation of the
 `Ordering` enum (`orderingTy`, `translateCmp`), so an `Ordering` local is a
 one-byte `Type::Enum` whose byte must be a valid tag (`-1`, `0`, or `1`).
 
-`Operand::Move` is excluded on purpose: `minimize` translates it exactly like
-`Copy` ("smir::Operand::Move(place) => ValueExpr::Load { .. }"), while Anneal's
-MIR semantics de-initializes the moved-from place. The two models genuinely
-disagree on later reads of a moved-from local, so `Move` cannot be in a
-lock-step fragment; `minirust/README.md` lists this and the other gaps.
+`Operand::Move` needs care. `minimize` translates it exactly like `Copy`
+("smir::Operand::Move(place) => ValueExpr::Load { .. }"), so MiniRust leaves
+the moved-from bytes in place, while Anneal's MIR semantics de-initializes a
+local that a projection-free `move _j` reads. The two models disagree exactly
+on a later read of the moved-from local before it is written again, which
+`rustc` itself forbids ("You should not emit MIR that may attempt a
+subsequent second load of this place without first re-initializing it",
+`Operand::Move` in `compiler/rustc_middle/src/mir/syntax.rs`). The fragment
+therefore admits `move` only where a conservative per-block check, `movesOk`,
+proves that no such read happens: at the start of every block, each local that
+the body moves anywhere may already be moved out, a `move _j` marks `_j` as
+moved out, writing `_j` (assignment, `StorageLive`, `StorageDead`, or
+`Deinit`) clears the mark, and no operand and no `Return` may read a marked
+local.
+
+`minimize`'s init block allocates every temporary without storage markers
+(`rs::always_storage_live_locals`), whereas Anneal starts every temporary
+dead (`initLocals`); Anneal's capture
+(`trusted/rustc-capture/src/rustc_2026_06_01/mir_lower.rs`) materializes a
+`StorageLive` for every such temporary that the body references. The fragment
+check `mentionsOk` makes that guarantee explicit: the temporaries that
+`initBlock` allocates are never mentioned by a statement or terminator, so
+they are dead in Anneal and allocated but untouched in MiniRust until the
+frame is torn down.
 -/
 
 namespace MiniRustSpec.Correspondence
@@ -299,12 +324,12 @@ def translatePlace : MirAst.Place → Option Gen.PlaceExpr
   | ⟨j, [.field f _]⟩ => some (.Field (.Local (localName j)) (f : Int))
   | _ => none
 
-/-- Integer type of a fragment operand: `copy _j` / `move _j` has `_j`'s
-declared type, `copy (_j.0)` / `move (_j.0)` on an `(it, bool)` local has type
-`it`, and a constant carries its type. -/
+/-- Integer type of a fragment operand: `copy _j` has `_j`'s declared type,
+`copy (_j.0)` on an `(it, bool)` local has type `it`, and a constant carries
+its type. A `move` operand is checked through `copyOp`. -/
 def operandIntType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.IntType
-  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ => decls[j]? >>= fun d => intTypeOf d.ty
-  | .copy ⟨j, [.field 0 fTy]⟩ | .move ⟨j, [.field 0 fTy]⟩ => do
+  | .copy ⟨j, []⟩ => decls[j]? >>= fun d => intTypeOf d.ty
+  | .copy ⟨j, [.field 0 fTy]⟩ => do
     let d ← decls[j]?
     let it ← intBoolTupleOf d.ty
     let fIt ← intTypeOf fTy
@@ -312,16 +337,16 @@ def operandIntType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option G
   | .constant c => intTypeOf c.ty
   | _ => none
 
-/-- MiniRust type of a fragment operand (including `copy`/`move (_j.0)` and
-`copy`/`move (_j.1)` field projections on an `(it, bool)` tuple local). -/
+/-- MiniRust type of a fragment operand (including `copy (_j.0)` and
+`copy (_j.1)` field projections on an `(it, bool)` tuple local). -/
 def operandType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.Type
-  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ => decls[j]? >>= fun d => scalarTypeOf d.ty
-  | .copy ⟨j, [.field 0 fTy]⟩ | .move ⟨j, [.field 0 fTy]⟩ => do
+  | .copy ⟨j, []⟩ => decls[j]? >>= fun d => scalarTypeOf d.ty
+  | .copy ⟨j, [.field 0 fTy]⟩ => do
     let d ← decls[j]?
     let it ← intBoolTupleOf d.ty
     let fIt ← intTypeOf fTy
     if fIt == it then some (.Int it) else none
-  | .copy ⟨j, [.field 1 fTy]⟩ | .move ⟨j, [.field 1 fTy]⟩ => do
+  | .copy ⟨j, [.field 1 fTy]⟩ => do
     let d ← decls[j]?
     let _ ← intBoolTupleOf d.ty
     if isBoolTy fTy then some .Bool else none
@@ -359,6 +384,27 @@ def translateOperand : MirAst.Operand → Option Gen.ValueExpr
           some (.Constant (.Int (intFromBits bits it)) (.Int it))
         else none
       | _, _ => none
+
+/-- An operand with `move` replaced by `copy`. `minimize` translates the two
+alike (`translateOperand`), and the type of `move p` is the type of `p`, just
+as for `copy p` (`Operand::ty`), so every type-directed check and every
+translation below inspects `copyOp op`. -/
+def copyOp : MirAst.Operand → MirAst.Operand
+  | .move p => .copy p
+  | op => op
+
+/-- An rvalue with every `move` operand replaced by `copy` (see `copyOp`). -/
+def copyRv : MirAst.Rvalue → MirAst.Rvalue
+  | .use op => .use (copyOp op)
+  | .unaryOp uop op => .unaryOp uop (copyOp op)
+  | .binaryOp bop a b => .binaryOp bop (copyOp a) (copyOp b)
+  | .cast k op ty => .cast k (copyOp op) ty
+  | .aggregate k ops => .aggregate k (ops.map copyOp)
+  | rv => rv
+
+theorem translateOperand_copyOp (op : MirAst.Operand) :
+    translateOperand (copyOp op) = translateOperand op := by
+  cases op <;> rfl
 
 /-- `minimize`'s unary-operator translation for integer operands
 (`tooling/minimize/src/rvalue.rs`):
@@ -689,13 +735,19 @@ def translateRvalue (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Option G
 >      Statement::PlaceMention(place)
 >  }"
 where the elided part special-cases two pointer-provenance casts, which are
-outside the fragment, and `Deinit` maps `MirAst.StatementKind.deinit` directly
-to `Statement::Deinit` (`spec/lang/step/statements.md`). -/
+outside the fragment. The rvalue goes through `copyRv` because `minimize`
+translates `move` and `copy` operands alike. `minimize` at the pinned commit
+has no case for MIR's `StatementKind::Deinit`, which Anneal's MIR does
+contain; we translate `Deinit(place)` to MiniRust's `Statement::Deinit` of the
+translated place, the statement with the same meaning ("This writes `uninit`
+bytes to the entire place", `compiler/rustc_middle/src/mir/syntax.rs`;
+"This statement replaces the contents of a place with `Uninit`",
+`spec/lang/step/statements.md`). -/
 def translateStatement (decls : List MirAst.LocalDecl) (s : MirAst.Statement) :
     Option Gen.Statement :=
   match s.kind with
   | .assign ⟨i, []⟩ rv =>
-    (translateRvalue decls rv).map (fun src => .Assign (.Local (localName i)) src)
+    (translateRvalue decls (copyRv rv)).map (fun src => .Assign (.Local (localName i)) src)
   | .placeMention p => (translatePlace p).map .PlaceMention
   | .storageLive i => some (.StorageLive (localName i))
   | .storageDead i => some (.StorageDead (localName i))
@@ -756,14 +808,14 @@ def switchIntType (decls : List MirAst.LocalDecl) (discr : MirAst.Operand) : Opt
 restricted to integer and `bool` discriminants. For a `bool`, the
 discriminant is transmuted to `u8` (`boolToU8`), so MiniRust re-validates the
 byte at `bool` when it loads the local and then switches on the integer `0` or
-`1`. -/
+`1`. A `move` discriminant goes through `copyOp`, like an rvalue operand. -/
 def translateTerminator (decls : List MirAst.LocalDecl) (t : MirAst.Terminator) :
     Option Gen.Terminator :=
   match t.kind with
   | .goto target => some (.Goto (bbName target))
   | .switchInt discr targets => do
-    let discrOp ← translateOperand discr
-    match operandType decls discr with
+    let discrOp ← translateOperand (copyOp discr)
+    match operandType decls (copyOp discr) with
     | some (.Int it) =>
       pure (.Switch discrOp (switchCases it targets.branches) (bbName targets.otherwise))
     | some .Bool =>
@@ -806,8 +858,9 @@ def translateBlocks (decls : List MirAst.LocalDecl) :
     let rest ← translateBlocks decls (i + 1) bbs
     pure ((bbName i, b) :: rest)
 
-/-- The init block `minimize` prepends (see `translateFn`). -/
-def hasExplicitStorageLive (body : MirAst.CapturedMir) (loc : Nat) : Bool :=
+/-- Whether some statement of the body is `StorageLive(_loc)` or
+`StorageDead(_loc)`. -/
+def hasStorageMarker (body : MirAst.CapturedMir) (loc : Nat) : Bool :=
   body.basicBlocks.any fun bb =>
     bb.statements.any fun s =>
       match s.kind with
@@ -815,15 +868,25 @@ def hasExplicitStorageLive (body : MirAst.CapturedMir) (loc : Nat) : Bool :=
       | .storageDead l => l == loc
       | _ => false
 
+/-- The locals that `minimize`'s init block marks live: the locals of
+`rs::always_storage_live_locals(&self.body)`, which `rustc_mir_dataflow`
+computes as the locals without any `StorageLive` or `StorageDead` statement
+in the body, in increasing index order (the iteration order of its
+`DenseBitSet`), minus the return place and the arguments (`.filter(|LocalName(i)|
+i.get_internal() as usize >= free_argc)` with `free_argc = arg_count + 1`). -/
 def alwaysStorageLiveLocals (body : MirAst.CapturedMir) : List Nat :=
   (List.range body.localDecls.length).filter fun loc =>
-    loc ≥ body.argCount + 1 && !hasExplicitStorageLive body loc
+    decide (body.argCount + 1 ≤ loc) && !hasStorageMarker body loc
 
+/-- The init block `minimize` prepends (see `translateFn`): `StorageLive` of
+every local of `alwaysStorageLiveLocals`, then `Goto(bb0)`. -/
 def initBlock (body : MirAst.CapturedMir) : Gen.BasicBlock :=
-  ⟨(alwaysStorageLiveLocals body).map (fun loc => .StorageLive (localName loc)), .Goto (bbName 0), .Regular⟩
+  ⟨(alwaysStorageLiveLocals body).map (fun loc => .StorageLive (localName loc)), .Goto (bbName 0),
+    .Regular⟩
 
 /-- `minimize`'s function translation (`tooling/minimize/src/function.rs`),
-specialized to bodies whose only locals are the return place and the arguments:
+specialized to bodies without a spread argument (`spread_arg`, used only by
+closures and the `rust-call` ABI):
 
 > "// add init basic block
 >  let init_bb = self.fresh_bb_name();
@@ -843,11 +906,10 @@ specialized to bodies whose only locals are the return place and the arguments:
 >      calling_convention: translate_calling_convention(self.abi.conv),
 >      implicit_writes: self.implicit_writes, };"
 
-With no locals beyond the return place and arguments, the `filter` leaves no
-`StorageLive`, so the init block is a lone `Goto(bb0)`. We take the
-calling convention to be `Rust` and `implicit_writes` to be `true` (the
-`minimize` default absent `#[rustc_no_writable]`); neither is read by the
-interpreted fragment. -/
+Without a spread argument, `init_statements` holds exactly the `StorageLive`s
+of `alwaysStorageLiveLocals` (`initBlock`). We take the calling convention to
+be `Rust` and `implicit_writes` to be `true` (the `minimize` default absent
+`#[rustc_no_writable]`); neither is read by the interpreted fragment. -/
 def translateFn (body : MirAst.CapturedMir) : Option Gen.Function := do
   let locals ← translateLocals 0 body.localDecls
   let blocks ← translateBlocks body.localDecls 0 body.basicBlocks
@@ -865,10 +927,11 @@ def translateFn (body : MirAst.CapturedMir) : Option Gen.Function := do
 /-! ## The fragment -/
 
 /-- A fragment integer operand of type `it`: an integer local `copy _j`, field
-0 `copy (_j.0)` of an `(it, bool)` tuple local, or an integer constant. -/
+0 `copy (_j.0)` of an `(it, bool)` tuple local, or an integer constant. A
+`move` operand is checked through `copyOp`. -/
 def operandOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) (op : MirAst.Operand) : Bool :=
   match op with
-  | .copy ⟨j, []⟩ | .copy ⟨j, [.field 0 _]⟩ | .move ⟨j, []⟩ | .move ⟨j, [.field 0 _]⟩ =>
+  | .copy ⟨j, []⟩ | .copy ⟨j, [.field 0 _]⟩ =>
     decide (j < decls.length) && decide (operandIntType decls op = some it)
   | .constant _ =>
     decide (operandIntType decls op = some it) && (translateOperand op).isSome
@@ -896,7 +959,7 @@ of an `(Int, bool)` tuple local, or a `bool` constant that `minimize` can read
 (`0` or `1`). -/
 def operandOkB (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
   match op with
-  | .copy ⟨j, []⟩ | .copy ⟨j, [.field 1 _]⟩ | .move ⟨j, []⟩ | .move ⟨j, [.field 1 _]⟩ =>
+  | .copy ⟨j, []⟩ | .copy ⟨j, [.field 1 _]⟩ =>
     decide (j < decls.length) && operandIsBool decls op
   | .constant _ => operandIsBool decls op && (translateOperand op).isSome
   | _ => false
@@ -948,7 +1011,7 @@ def rvalueOkB (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Bool
 
 /-- Whether a fragment operand has MiniRust type `orderingTy`. -/
 def operandIsOrdering (decls : List MirAst.LocalDecl) : MirAst.Operand → Bool
-  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ => match decls[j]? with | some d => isOrderingTy d.ty | none => false
+  | .copy ⟨j, []⟩ => match decls[j]? with | some d => isOrderingTy d.ty | none => false
   | .constant c => isOrderingTy c.ty
   | _ => false
 
@@ -957,7 +1020,7 @@ constants are rejected by `translateOperand`; see
 `translateOperand_ordering_const`). -/
 def operandOkO (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
   match op with
-  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ => decide (j < decls.length) && operandIsOrdering decls op
+  | .copy ⟨j, []⟩ => decide (j < decls.length) && operandIsOrdering decls op
   | .constant _ => operandIsOrdering decls op && (translateOperand op).isSome
   | _ => false
 
@@ -970,13 +1033,13 @@ def rvalueOkO (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Bool
 
 /-- Field-0 integer type of a projection-free `(Int, bool)` 2-tuple operand. -/
 def operandTupleIntType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.IntType
-  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ => decls[j]? >>= fun d => intBoolTupleOf d.ty
+  | .copy ⟨j, []⟩ => decls[j]? >>= fun d => intBoolTupleOf d.ty
   | _ => none
 
 /-- A projection-free `(Int, bool)` 2-tuple operand of field-0 integer type `it`. -/
 def operandOkTuple (decls : List MirAst.LocalDecl) (it : Gen.IntType) (op : MirAst.Operand) : Bool :=
   match op with
-  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ =>
+  | .copy ⟨j, []⟩ =>
     decide (j < decls.length) && decide (operandTupleIntType decls op = some it)
   | _ => false
 
@@ -1013,27 +1076,32 @@ def placeOk (decls : List MirAst.LocalDecl) : MirAst.Place → Bool
 /-- Fragment statements, type-checked against the destination's type: an
 integer destination takes an integer rvalue (`rvalueOk`), a `bool`
 destination takes a `bool` rvalue (`rvalueOkB`), an `Ordering` destination
-takes a three-way comparison (`rvalueOkO`), an `(it, bool)` 2-tuple
-destination takes a 2-tuple rvalue (`rvalueOkTuple`), and `PlaceMention` takes
-any fragment place (`placeOk`). -/
+takes a three-way comparison (`rvalueOkO`), and an `(it, bool)` 2-tuple
+destination takes a 2-tuple rvalue (`rvalueOkTuple`), each checked through
+`copyRv`; `PlaceMention` takes any fragment place (`placeOk`);
+`StorageLive`, `StorageDead`, and `Deinit` take a local (`Deinit` only
+without projections: Anneal's `Deinit` of a projected place reads the
+projected value and leaves the slot initialized, whereas MiniRust's writes
+`Uninit` to the projected bytes). `storageDeadOk` restricts `StorageDead`
+further. -/
 def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement) : Bool :=
   match s.kind with
   | .assign ⟨i, []⟩ rv =>
     match decls[i]? with
     | none => false
     | some d =>
-      if isBoolTy d.ty then rvalueOkB decls rv
-      else if isOrderingTy d.ty then rvalueOkO decls rv
+      if isBoolTy d.ty then rvalueOkB decls (copyRv rv)
+      else if isOrderingTy d.ty then rvalueOkO decls (copyRv rv)
       else
         match intBoolTupleOf d.ty with
-        | some it => rvalueOkTuple decls it rv
+        | some it => rvalueOkTuple decls it (copyRv rv)
         | none =>
           match intTypeOf d.ty with
           | none => false
-          | some it => rvalueOk decls it rv
+          | some it => rvalueOk decls it (copyRv rv)
   | .placeMention p => placeOk decls p
   | .storageLive i | .storageDead i => decide (i < decls.length)
-  | .deinit p => placeOk decls p
+  | .deinit ⟨i, []⟩ => decide (i < decls.length)
   | _ => false
 
 /-- A fragment `switchInt` discriminant: an integer operand of its type, or a
@@ -1047,14 +1115,14 @@ def discrOk (decls : List MirAst.LocalDecl) (discr : MirAst.Operand) : Bool :=
 /-- Fragment terminators; jump targets must be blocks of the body and
 `switchInt` values must be distinct in-range bit patterns of the type
 `minimize` switches at (`switchIntType`: the discriminant's integer type, or
-`u8` for a `bool`). -/
+`u8` for a `bool`). The discriminant is checked through `copyOp`. -/
 def terminatorOk (decls : List MirAst.LocalDecl) (nblocks : Nat) (t : MirAst.Terminator) : Bool :=
   match t.kind with
   | .goto target => decide (target < nblocks)
   | .switchInt discr targets =>
-    match switchIntType decls discr with
+    match switchIntType decls (copyOp discr) with
     | some it =>
-      discrOk decls discr &&
+      discrOk decls (copyOp discr) &&
       targets.branches.all (fun p => decide (p.1 < 2 ^ (8 * it.size.bytes)) && decide (p.2 < nblocks)) &&
       (targets.branches.map Prod.fst).Nodup &&
       decide (targets.otherwise < nblocks)
@@ -1063,16 +1131,159 @@ def terminatorOk (decls : List MirAst.LocalDecl) (nblocks : Nat) (t : MirAst.Ter
   | .return_ => true
   | _ => false
 
-/-- The decidable fragment on which the correspondence theorem is stated. -/
+/-- `StorageDead` only of temporaries: MiniRust's well-formedness check
+(`spec/lang/well-formed.md`) rejects it for the return place and the
+arguments:
+> "if local == func.ret || func.args.any(|arg_name| local == arg_name) {
+>      throw_ill_formed!(\"Statement::StorageDead: trying to mark argument or return local as dead\");
+>  }" -/
+def storageDeadOk (body : MirAst.CapturedMir) : Bool :=
+  body.basicBlocks.all fun bb =>
+    bb.statements.all fun s =>
+      match s.kind with
+      | .storageDead i => decide (body.argCount < i)
+      | _ => true
+
+/-! ### Moved-out locals
+
+The check `movesOk` described in the module docs. It runs over each block
+separately, starting from the conservative assumption that every local that
+the body moves anywhere (`movedLocals`) may already be moved out. -/
+
+/-- The local that a fragment operand moves out of: Anneal's `evalOperand`
+sets the slot of `_j` to `.uninit` when it reads `move _j` ("reading a root
+local via `Operand.move` transitions its slot to `.uninit`"), whereas a
+projected `move (_j.f)` leaves `_j` initialized. -/
+def opMoved : MirAst.Operand → Option Nat
+  | .move ⟨j, []⟩ => some j
+  | _ => none
+
+/-- The local that a fragment operand reads. -/
+def opRead : MirAst.Operand → Option Nat
+  | .copy p | .move p => some p.local_
+  | .constant _ => none
+
+/-- Whether an operand is a constant, a local, or a field of a local: the
+operand shapes that `statementOk` and `terminatorOk` admit. Reading one reads
+at most the slot of its local. -/
+def simpleOp : MirAst.Operand → Bool
+  | .constant _ => true
+  | .copy ⟨_, []⟩ | .move ⟨_, []⟩ => true
+  | .copy ⟨_, [.field _ _]⟩ | .move ⟨_, [.field _ _]⟩ => true
+  | _ => false
+
+/-- The operands of an rvalue in the order in which Anneal's `evalRvalue`
+evaluates them (left to right). -/
+def rvOperands : MirAst.Rvalue → List MirAst.Operand
+  | .use op | .unaryOp _ op | .cast _ op _ => [op]
+  | .binaryOp _ a b => [a, b]
+  | .aggregate _ ops => ops
+  | _ => []
+
+/-- Mark the local that `op` moves out of. -/
+def moveOut (mo : List Nat) (op : MirAst.Operand) : List Nat :=
+  match opMoved op with
+  | some j => j :: mo
+  | none => mo
+
+/-- Whether the operands `ops`, read in order with the moved-out locals `mo`,
+are simple (`simpleOp`, which the other checks already imply) and avoid every
+moved-out local, including those that earlier operands move out of. -/
+def readsOk : List Nat → List MirAst.Operand → Bool
+  | _, [] => true
+  | mo, op :: ops =>
+    (simpleOp op &&
+     match opRead op with
+     | some j => !mo.contains j
+     | none => true) && readsOk (moveOut mo op) ops
+
+/-- The moved-out locals after statement `s`: those its operands move out of,
+minus the local it writes (an assignment's destination, or the local of
+`StorageLive`, `StorageDead`, or `Deinit`, after which both models agree that
+the local is unallocated or holds the same bytes). -/
+def stmtMoved (mo : List Nat) (s : MirAst.Statement) : List Nat :=
+  match s.kind with
+  | .assign ⟨i, []⟩ rv => ((rvOperands rv).foldl moveOut mo).filter (· != i)
+  | .storageLive i | .storageDead i | .deinit ⟨i, []⟩ => mo.filter (· != i)
+  | _ => mo
+
+/-- Whether statement `s` reads no moved-out local. -/
+def stmtReadsOk (mo : List Nat) (s : MirAst.Statement) : Bool :=
+  match s.kind with
+  | .assign _ rv => readsOk mo (rvOperands rv)
+  | _ => true
+
+/-- Whether terminator `t` reads no moved-out local (`Return` reads `_0`). -/
+def termReadsOk (mo : List Nat) (t : MirAst.Terminator) : Bool :=
+  match t.kind with
+  | .switchInt discr _ => readsOk mo [discr]
+  | .return_ => !mo.contains 0
+  | _ => true
+
+/-- The locals that some operand of the body moves out of. -/
+def movedLocals (body : MirAst.CapturedMir) : List Nat :=
+  body.basicBlocks.flatMap fun bb =>
+    bb.statements.flatMap (fun s =>
+      match s.kind with
+      | .assign _ rv => (rvOperands rv).filterMap opMoved
+      | _ => []) ++
+    match bb.terminator.kind with
+    | .switchInt discr _ => (opMoved discr).toList
+    | _ => []
+
+/-- The locals that may be moved out before statement `stmt` of block `blk`. -/
+def movedBefore (body : MirAst.CapturedMir) (blk stmt : Nat) : List Nat :=
+  match body.basicBlocks[blk]? with
+  | some bb => (bb.statements.take stmt).foldl stmtMoved (movedLocals body)
+  | none => movedLocals body
+
+/-- Whether a block whose statements are `ss` and whose terminator is `t`,
+entered with the moved-out locals `mo`, never reads a moved-out local. -/
+def blockMovesOk (mo : List Nat) : List MirAst.Statement → MirAst.Terminator → Bool
+  | [], t => termReadsOk mo t
+  | s :: ss, t => stmtReadsOk mo s && blockMovesOk (stmtMoved mo s) ss t
+
+/-- No moved-from local is read before it is re-initialized. -/
+def movesOk (body : MirAst.CapturedMir) : Bool :=
+  body.basicBlocks.all fun bb => blockMovesOk (movedLocals body) bb.statements bb.terminator
+
+/-! ### Locals mentioned by the body -/
+
+/-- The locals a statement mentions. -/
+def stmtLocals (s : MirAst.Statement) : List Nat :=
+  match s.kind with
+  | .assign p rv => p.local_ :: (rvOperands rv).filterMap opRead
+  | .placeMention p | .deinit p => [p.local_]
+  | .storageLive i | .storageDead i => [i]
+  | _ => []
+
+/-- The locals a terminator mentions (`Return` reads `_0`). -/
+def termLocals (t : MirAst.Terminator) : List Nat :=
+  match t.kind with
+  | .switchInt discr _ => (opRead discr).toList
+  | .return_ => [0]
+  | _ => []
+
+/-- No statement or terminator mentions a local that `initBlock` allocates. -/
+def mentionsOk (body : MirAst.CapturedMir) : Bool :=
+  body.basicBlocks.all fun bb =>
+    bb.statements.all (fun s => (stmtLocals s).all (fun j => !(alwaysStorageLiveLocals body).contains j)) &&
+    (termLocals bb.terminator).all (fun j => !(alwaysStorageLiveLocals body).contains j)
+
+/-- The decidable fragment on which the correspondence theorem is stated. The
+bound `localDecls.length < 2^31` keeps the first-fit candidate addresses of
+`BM.pickAddr` that the callee's locals can occupy below `2^63`. -/
 def inFragment (body : MirAst.CapturedMir) : Bool :=
   body.isRuntimePostCleanup &&
   decide (body.argCount + 1 ≤ body.localDecls.length) &&
+  decide (body.localDecls.length < 2 ^ 31) &&
   body.localDecls.all (fun d => (scalarTypeOf d.ty).isSome) &&
   decide (body.basicBlocks ≠ []) &&
   body.basicBlocks.all (fun bb =>
     !bb.isCleanup &&
     bb.statements.all (statementOk body.localDecls) &&
     terminatorOk body.localDecls body.basicBlocks.length bb.terminator) &&
+  storageDeadOk body && movesOk body && mentionsOk body &&
   (translateFn body).isSome
 
 end MiniRustSpec.Correspondence

@@ -36,8 +36,11 @@ here.
   (`spec/lang/machine.md`). The daemonic thread choice `pick(..)` then has a
   unique solution; with more than one enabled thread we report
   `Stop.unsupported` instead of resolving the choice.
-* `Statement::Assign` and `Statement::PlaceMention`
-  (`spec/lang/step/statements.md`).
+* `Statement::Assign`, `Statement::PlaceMention`, `Statement::Deinit`
+  (through `ConcurrentMemory::deinit`), `Statement::StorageLive`, and
+  `Statement::StorageDead` (through `Machine::try_mutate_cur_frame`,
+  `StackFrame::storage_live`, and `StackFrame::storage_dead`)
+  (`spec/lang/step/statements.md`, `spec/lang/machine.md`).
 * `PlaceExpr::Local` and `PlaceExpr::Field` (`spec/lang/step/expressions.md`),
   including `Machine::ptr_offset_inbounds` (`spec/lang/step/operators.md`),
   `ThinPointer::wrapping_offset` and `ThinPointer::widen`
@@ -72,12 +75,12 @@ here.
   and `encode_discriminant`), `Type::Slice`, and `Type::TraitObject`, and
   `Machine::check_value` (with `ensure_else_ub` and `checkUnionChunks`) for
   those types (`spec/lang/representation.md`); `Type::layout` for all of them
-  (`spec/lang/types.md`); and `BasicMemory`'s `load`, `store`, `deallocate`,
-  and `check_ptr` (`spec/mem/basic.md`), wrapped by `ConcurrentMemory`'s
-  access recording (`spec/mem/concurrent.md`). The recursion of these
-  definitions over nested types, tuple fields, union chunks, enum variants,
-  and discriminator trees is structural (Lean `mutual` blocks), so the kernel
-  evaluates them.
+  (`spec/lang/types.md`); and `BasicMemory`'s `allocate`, `load`, `store`,
+  `deallocate`, and `check_ptr` (`spec/mem/basic.md`), wrapped by
+  `ConcurrentMemory`'s access recording (`spec/mem/concurrent.md`). The
+  recursion of these definitions over nested types, tuple fields, union
+  chunks, enum variants, and discriminator trees is structural (Lean `mutual`
+  blocks), so the kernel evaluates them.
 * The `x86_64` target (`spec/prelude/target.md`) as the instance of `T` and
   `BasicMemory<x86_64>` as the instance of `M`.
 
@@ -96,16 +99,17 @@ specr-lang functions return `Result`/`NdResult`. We use `Except Stop`:
   rather than program behavior,
 * `Stop.unsupported` marks a construct outside the interpreted fragment.
 
-The only non-deterministic operation reachable from this fragment is the thread
-choice in `Machine::step` (allocation is not reachable: `StorageLive` is
-outside the fragment); see `pickActiveThread`.
+Two non-deterministic operations are reachable from this fragment. The thread
+choice in `Machine::step` has a unique solution here (see
+`pickActiveThread`). The address choice of `BasicMemory::allocate`, reached
+through `Statement::StorageLive`, never does; `BM.pickAddr` documents the one
+valid resolution the interpretation commits to.
 -/
 
 namespace MiniRustSpec.Interp
 
 open MiniRustSpec.Gen
 open MiniRustSpec.LibSpecr
-
 
 /-! ## Instantiation: `M = BasicMemory<x86_64>` -/
 
@@ -1078,13 +1082,9 @@ def Allocation.overlaps (a : Allocation) (otherAddr : Address) (otherSize : Size
   else
     true
 
-/-- Deterministic address choice for `BasicMemory::allocate` (`spec/mem/basic.md`):
-> "let distr = libspecr::IntDistribution {
->     start: Int::ONE,
->     end: Int::from(2).pow(T::PTR_SIZE.bits()),
->     divisor: align.bytes(),
-> };
-> let addr = pick(distr, |addr: Address| {
+/-- The predicate of the daemonic address choice in `BasicMemory::allocate`
+(`spec/mem/basic.md`), transcribed test by test:
+> "let addr = pick(distr, |addr: Address| {
 >     // Pick a strictly positive integer...
 >     if addr <= 0 { return false; }
 >     // ... that is suitably aligned...
@@ -1096,14 +1096,60 @@ def Allocation.overlaps (a : Allocation) (otherAddr : Address) (otherSize : Size
 >     // If all tests pass, we are good!
 >     true
 > })?;" -/
-def nextAddress (mem : BM) (size : Size) (align : Align) : Int :=
-  let slot := ((List.range 1024).find? (fun k =>
-    let addr : Int := ((k + 1 : Nat) : Int) * 4096 * (align.bytes : Int)
-    !mem.allocations.any (fun a => a.live && Allocation.overlaps a addr size))).getD 0 % 1024
-  ((slot + 1 : Nat) : Int) * 4096 * (align.bytes : Int)
+def BM.allocAddrOk (mem : BM) (size : Size) (align : Align) (addr : Int) : Bool :=
+  if addr ≤ 0 then false
+  else if !Align.is_aligned align addr then false
+  else if !inBounds (addr + size.bytes) .Unsigned x86_64.PTR_SIZE then false
+  else if mem.allocations.any (fun a => a.live && Allocation.overlaps a addr size) then false
+  else true
 
-/-- `BasicMemory::allocate` (`spec/mem/basic.md`, with deterministic address
-choice `nextAddress` and `()` for `prov_extra` and `alloc_extra` as in
+/-- Candidate address number `k` of `BM.pickAddr`: `(k + 1) * 2^32`, a
+value of the address distribution of `BasicMemory::allocate`
+(`spec/mem/basic.md`) for every alignment up to `2^32`:
+> "divisor: align.bytes(),"
+Consecutive candidates are `2^32` bytes apart, so an allocation smaller than
+`2^32` bytes overlaps at most one candidate. -/
+def allocCandidate (k : Nat) : Int := ((k + 1 : Nat) : Int) * 2 ^ 32
+
+/-- First fit among the candidates `allocCandidate k`, `allocCandidate (k+1)`,
+.. (at most `fuel` of them): the first one that satisfies the predicate of
+the address choice in `BasicMemory::allocate` (`spec/mem/basic.md`),
+`BM.allocAddrOk`:
+> "let addr = pick(distr, |addr: Address| {" -/
+def firstFitAddr (mem : BM) (size : Size) (align : Align) : Nat → Nat → Option Int
+  | 0, _ => none
+  | fuel + 1, k =>
+    if BM.allocAddrOk mem size align (allocCandidate k) then some (allocCandidate k)
+    else firstFitAddr mem size align fuel (k + 1)
+
+/-- How the interpretation resolves the daemonic address choice of
+`BasicMemory::allocate` (`spec/mem/basic.md`):
+> "// Pick a base address. We use daemonic non-deterministic choice,
+>  // meaning the program has to cope with every possible choice.
+>  // FIXME: This makes OOM (when there is no possible choice) into \"no behavior\",
+>  // which is not what we want.
+>  let distr = libspecr::IntDistribution {
+>      start: Int::ONE,
+>      end: Int::from(2).pow(T::PTR_SIZE.bits()),
+>      divisor: align.bytes(),
+>  };"
+Unlike the thread choice in `Machine::step` (`pickActiveThread`), this choice
+never has a unique solution, so the interpretation commits to one valid
+resolution instead of reporting `Stop.unsupported`: the first of the
+candidates `allocCandidate 0`, `allocCandidate 1`, .., that is, of the
+`2^32 - 1` multiples of `2^32` in `[2^32, 2^64)`, that satisfies the `pick`
+predicate (`BM.allocAddrOk`). An address returned here therefore satisfies
+every test of the upstream predicate; when no candidate does, `BM.allocate`
+reports `Stop.unsupported` rather than inventing an address. Results about
+this interpretation hold for this resolution of the choice; the fragment
+cannot observe addresses (it has no pointer-to-integer casts or pointer
+comparisons), so the resolution affects which addresses locals receive, not
+which values the program computes. -/
+def BM.pickAddr (mem : BM) (size : Size) (align : Align) : Option Int :=
+  firstFitAddr mem size align (2 ^ 32 - 1) 0
+
+/-- `BasicMemory::allocate` (`spec/mem/basic.md`, with the address choice
+resolved by `BM.pickAddr` and `()` for `prov_extra` and `alloc_extra` as in
 `impl Memory for BasicMemory<T>`):
 > "fn allocate(
 >     &mut self,
@@ -1139,18 +1185,20 @@ def BM.allocate (mem : BM) (kind : AllocationKind) (size : Size) (align : Align)
     Interp (Ptr × BM) :=
   if !x86_64.valid_size size then ub "asking for a too large allocation"
   else
-    let addr := nextAddress mem size align
-    let allocation : Allocation := {
-      addr := addr
-      align := align
-      kind := kind
-      live := true
-      data := List.replicate size.bytes .Uninit
-      extra := ()
-    }
-    let id : AllocId := ⟨mem.allocations.length⟩
-    let allocations := mem.allocations ++ [allocation]
-    pure ({ addr := addr, provenance := some (id, ()) }, { mem with allocations := allocations })
+    match BM.pickAddr mem size align with
+    | none => unsupported "allocate: no candidate address of the first-fit resolution is free"
+    | some addr =>
+      let allocation : Allocation := {
+        addr := addr
+        align := align
+        kind := kind
+        live := true
+        data := List.replicate size.bytes .Uninit
+        extra := ()
+      }
+      let id : AllocId := ⟨mem.allocations.length⟩
+      let allocations := mem.allocations ++ [allocation]
+      pure ({ addr := addr, provenance := some (id, ()) }, { mem with allocations := allocations })
 
 /-- `BasicMemory::check_ptr`:
 > "fn check_ptr(&self, ptr: ThinPointer<..>, len: Size) -> Result<Option<(AllocId, ProvExtra, Size)>> {

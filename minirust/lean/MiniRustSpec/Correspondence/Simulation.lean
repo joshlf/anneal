@@ -20,7 +20,9 @@ ground-truth MiniRust interpretation (`MiniRustSpec.Interp.step`, which
 executes the MiniRust program that MiniRust's own `minimize` tool produces
 for the body) agree in the sense of `StepRel`: both continue in related
 states, both perform a related function return, or both raise UB.
-`MiniRustSpec.Correspondence.Run` lifts this to whole executions.
+`step_start` runs `minimize`'s init block (`initLen body` MiniRust steps) from
+the entry relation `StartRel` into `StateRel`.
+`MiniRustSpec.Correspondence.Run` lifts these to whole executions.
 -/
 
 namespace MiniRustSpec.Correspondence
@@ -76,18 +78,305 @@ theorem translateBlock_spec (decls : List LocalDecl) (bb : BasicBlockData) (tb :
 
 /-- Facts about a body accepted by `inFragment`. -/
 theorem inFragment_spec (body : CapturedMir) (h : inFragment body = true) :
-    body.phase = .runtimePostCleanup ∧ body.localDecls.length = body.argCount + 1 ∧
+    body.phase = .runtimePostCleanup ∧ body.argCount + 1 ≤ body.localDecls.length ∧
+    body.localDecls.length < 2 ^ 31 ∧
     (∀ bb ∈ body.basicBlocks, bb.isCleanup = false ∧
       (∀ st ∈ bb.statements, statementOk body.localDecls st = true) ∧
-      terminatorOk body.localDecls body.basicBlocks.length bb.terminator = true) := by
+      terminatorOk body.localDecls body.basicBlocks.length bb.terminator = true) ∧
+    storageDeadOk body = true ∧ movesOk body = true ∧ mentionsOk body = true := by
   simp only [inFragment, Bool.and_eq_true, decide_eq_true_eq, List.all_eq_true, Bool.not_eq_true']
     at h
-  obtain ⟨⟨⟨⟨⟨hphase, hlen⟩, _⟩, _⟩, hbbs⟩, _⟩ := h
-  refine ⟨?_, hlen, fun bb hbb => ?_⟩
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨hphase, hargs⟩, hn⟩, _⟩, _⟩, hbbs⟩, hsd⟩, hmv⟩, hmt⟩, _⟩ := h
+  refine ⟨?_, hargs, hn, fun bb hbb => ?_, hsd, hmv, hmt⟩
   · unfold CapturedMir.isRuntimePostCleanup at hphase
     split at hphase <;> simp_all
   · obtain ⟨⟨hc, hst⟩, ht⟩ := hbbs bb hbb
     exact ⟨hc, hst, ht⟩
+
+theorem storageDeadOk_spec {body : CapturedMir} (h : storageDeadOk body = true)
+    {bb : BasicBlockData} (hbb : bb ∈ body.basicBlocks) {st : MirAst.Statement}
+    (hst : st ∈ bb.statements) {i : Nat} (hk : st.kind = .storageDead i) : body.argCount < i := by
+  simp only [storageDeadOk, List.all_eq_true] at h
+  have := h bb hbb st hst
+  rw [hk] at this
+  simpa using this
+
+theorem mentionsOk_stmt {body : CapturedMir} (h : mentionsOk body = true)
+    {bb : BasicBlockData} (hbb : bb ∈ body.basicBlocks) {st : MirAst.Statement}
+    (hst : st ∈ bb.statements) {j : Nat} (hj : j ∈ stmtLocals st) :
+    j ∉ alwaysStorageLiveLocals body := by
+  simp only [mentionsOk, List.all_eq_true, Bool.and_eq_true] at h
+  have := (h bb hbb).1 st hst j hj
+  simpa using this
+
+theorem mentionsOk_term {body : CapturedMir} (h : mentionsOk body = true)
+    {bb : BasicBlockData} (hbb : bb ∈ body.basicBlocks) {j : Nat} (hj : j ∈ termLocals bb.terminator) :
+    j ∉ alwaysStorageLiveLocals body := by
+  simp only [mentionsOk, List.all_eq_true, Bool.and_eq_true] at h
+  have := (h bb hbb).2 j hj
+  simpa using this
+
+/-! ## Moved-out locals -/
+
+theorem foldl_moveOut_mem (ops : List Operand) (acc : List Nat) (j : Nat) :
+    j ∈ ops.foldl moveOut acc ↔ j ∈ acc ∨ j ∈ ops.filterMap opMoved := by
+  induction ops generalizing acc with
+  | nil => simp
+  | cons op ops ih =>
+    rw [List.foldl_cons, ih]
+    unfold moveOut
+    cases h : opMoved op with
+    | none => simp [List.filterMap_cons_none h]
+    | some k =>
+      simp only [List.mem_cons, List.filterMap_cons_some h]
+      constructor
+      · rintro ((h1 | h1) | h1)
+        · exact .inr (.inl h1)
+        · exact .inl h1
+        · exact .inr (.inr h1)
+      · rintro (h1 | h1 | h1)
+        · exact .inl (.inr h1)
+        · exact .inl (.inl h1)
+        · exact .inr h1
+
+theorem mem_movedLocals_stmt {body : CapturedMir} {bb : BasicBlockData}
+    (hbb : bb ∈ body.basicBlocks) {st : MirAst.Statement} (hst : st ∈ bb.statements) {p : Place}
+    {rv : Rvalue} (hk : st.kind = .assign p rv) {j : Nat} (hj : j ∈ (rvOperands rv).filterMap opMoved) :
+    j ∈ movedLocals body := by
+  simp only [movedLocals, List.mem_flatMap, List.mem_append]
+  exact ⟨bb, hbb, .inl ⟨st, hst, by rw [hk]; exact hj⟩⟩
+
+theorem mem_movedLocals_term {body : CapturedMir} {bb : BasicBlockData}
+    (hbb : bb ∈ body.basicBlocks) {discr : Operand} {targets : SwitchTargets}
+    (hk : bb.terminator.kind = .switchInt discr targets) {j : Nat} (hj : opMoved discr = some j) :
+    j ∈ movedLocals body := by
+  simp only [movedLocals, List.mem_flatMap, List.mem_append]
+  exact ⟨bb, hbb, .inr (by rw [hk]; simp [hj])⟩
+
+theorem stmtMoved_sub {body : CapturedMir} {bb : BasicBlockData} (hbb : bb ∈ body.basicBlocks)
+    {st : MirAst.Statement} (hst : st ∈ bb.statements) (mo : List Nat)
+    (hmo : ∀ j ∈ mo, j ∈ movedLocals body) : ∀ j ∈ stmtMoved mo st, j ∈ movedLocals body := by
+  intro j hj
+  unfold stmtMoved at hj
+  split at hj
+  next i rv hk =>
+    rcases (foldl_moveOut_mem _ _ _).mp (List.mem_filter.mp hj).1 with h | h
+    · exact hmo j h
+    · exact mem_movedLocals_stmt hbb hst hk h
+  all_goals first
+    | exact hmo j (List.mem_filter.mp hj).1
+    | exact hmo j hj
+
+theorem movedBefore_zero (body : CapturedMir) (blk : Nat) :
+    movedBefore body blk 0 = movedLocals body := by
+  unfold movedBefore
+  split <;> simp
+
+theorem movedBefore_succ {body : CapturedMir} {blk k : Nat} {bb : BasicBlockData}
+    {st : MirAst.Statement} (hbb : body.basicBlocks[blk]? = some bb)
+    (hst : bb.statements[k]? = some st) :
+    movedBefore body blk (k + 1) = stmtMoved (movedBefore body blk k) st := by
+  simp only [movedBefore, hbb]
+  rw [List.take_add_one, List.foldl_append, hst]
+  rfl
+
+theorem movedBefore_sub {body : CapturedMir} {blk : Nat} {bb : BasicBlockData}
+    (hbb : body.basicBlocks[blk]? = some bb) (k : Nat) :
+    ∀ j ∈ movedBefore body blk k, j ∈ movedLocals body := by
+  have hmem : bb ∈ body.basicBlocks := List.mem_of_getElem? hbb
+  simp only [movedBefore, hbb]
+  have key : ∀ (ss : List MirAst.Statement), (∀ s ∈ ss, s ∈ bb.statements) →
+      ∀ mo, (∀ j ∈ mo, j ∈ movedLocals body) →
+        ∀ j ∈ ss.foldl stmtMoved mo, j ∈ movedLocals body := by
+    intro ss
+    induction ss with
+    | nil => intro _ mo hmo; simpa using hmo
+    | cons s ss ih =>
+      intro hss mo hmo
+      rw [List.foldl_cons]
+      exact ih (fun s' hs' => hss s' (by simp [hs'])) _
+        (stmtMoved_sub hmem (hss s (by simp)) mo hmo)
+  exact key _ (fun s hs => List.mem_of_mem_take hs) _ (fun j hj => hj)
+
+theorem blockMovesOk_spec (mo : List Nat) (ss : List MirAst.Statement) (t : MirAst.Terminator)
+    (h : blockMovesOk mo ss t = true) :
+    (∀ (k : Nat) st, ss[k]? = some st → stmtReadsOk ((ss.take k).foldl stmtMoved mo) st = true) ∧
+    termReadsOk (ss.foldl stmtMoved mo) t = true := by
+  induction ss generalizing mo with
+  | nil => exact ⟨fun k st h => by simp at h, by simpa [blockMovesOk] using h⟩
+  | cons s ss ih =>
+    simp only [blockMovesOk, Bool.and_eq_true] at h
+    obtain ⟨ih1, ih2⟩ := ih (stmtMoved mo s) h.2
+    refine ⟨fun k st hk => ?_, by simpa using ih2⟩
+    cases k with
+    | zero => simp at hk; subst hk; simpa using h.1
+    | succ k => simpa using ih1 k st (by simpa using hk)
+
+/-- What `movesOk` guarantees at a statement and at a terminator. -/
+theorem movesOk_spec {body : CapturedMir} (h : movesOk body = true) {blk : Nat}
+    {bb : BasicBlockData} (hbb : body.basicBlocks[blk]? = some bb) :
+    (∀ (k : Nat) st, bb.statements[k]? = some st →
+      stmtReadsOk (movedBefore body blk k) st = true) ∧
+    termReadsOk (movedBefore body blk bb.statements.length) bb.terminator = true := by
+  simp only [movesOk, List.all_eq_true] at h
+  obtain ⟨h1, h2⟩ := blockMovesOk_spec _ _ _ (h bb (List.mem_of_getElem? hbb))
+  refine ⟨fun k st hk => ?_, ?_⟩
+  · simpa [movedBefore, hbb] using h1 k st hk
+  · simpa [movedBefore, hbb] using h2
+
+theorem readsOk_mono {mo mo' : List Nat} (hsub : ∀ j ∈ mo', j ∈ mo) {ops : List Operand}
+    (h : readsOk mo ops = true) : readsOk mo' ops = true := by
+  induction ops generalizing mo mo' with
+  | nil => rfl
+  | cons op ops ih =>
+    simp only [readsOk, Bool.and_eq_true] at h ⊢
+    obtain ⟨⟨hs, hr⟩, hrest⟩ := h
+    refine ⟨⟨hs, ?_⟩, ih ?_ hrest⟩
+    · cases hop : opRead op with
+      | none => simp
+      | some j =>
+        simp [hop] at hr ⊢
+        exact fun hj => hr (hsub j hj)
+    · intro j hj
+      unfold moveOut at hj ⊢
+      cases hm : opMoved op with
+      | none => simp only [hm] at hj ⊢; exact hsub j hj
+      | some k =>
+        simp only [hm, List.mem_cons] at hj ⊢
+        rcases hj with hj | hj
+        · exact .inl hj
+        · exact .inr (hsub j hj)
+
+/-- `opsPost` changes only the locals that `ops` move out of, to `.uninit`,
+and never a dead slot. -/
+theorem opsPost_get (L : List LocalSlot) (ops : List Operand) (k : Nat) :
+    (opsPost L ops)[k]? = L[k]? ∨
+      (k ∈ ops.filterMap opMoved ∧ (opsPost L ops)[k]? = some .uninit ∧ L[k]? ≠ some .dead) := by
+  induction ops generalizing L with
+  | nil => exact .inl rfl
+  | cons op ops ih =>
+    simp only [opsPost, List.foldl_cons] at ih ⊢
+    rcases ih (opPost L op) with h | ⟨h1, h2, h3⟩
+    · rcases opPost_get L op k with h' | ⟨hm, h1', s, h2', h3'⟩
+      · exact .inl (h.trans h')
+      · refine .inr ⟨?_, h.trans h1', by rw [h2']; simpa using h3'⟩
+        rw [List.filterMap_cons_some hm]; simp
+    · refine .inr ⟨?_, h2, fun hd => h3 ((opPost_dead L op k).mpr hd)⟩
+      cases hm : opMoved op with
+      | none => rw [List.filterMap_cons_none hm]; exact h1
+      | some j => rw [List.filterMap_cons_some hm]; exact List.mem_cons_of_mem _ h1
+
+/-! ## Stale slots -/
+
+theorem StaleOk.agree {body : CapturedMir} {actual view : List LocalSlot} {blk stmt : Nat}
+    (h : StaleOk body actual view blk stmt) {j : Nat} (hj : j ∉ movedBefore body blk stmt) :
+    actual[j]? = view[j]? :=
+  Classical.byContradiction fun hne => hj (h.2 j hne).1
+
+theorem StaleOk.dead_iff {body : CapturedMir} {actual view : List LocalSlot} {blk stmt : Nat}
+    (h : StaleOk body actual view blk stmt) (j : Nat) :
+    actual[j]? = some .dead ↔ view[j]? = some .dead := by
+  by_cases heq : actual[j]? = view[j]?
+  · rw [heq]
+  · obtain ⟨_, ha, hv⟩ := h.2 j heq
+    rw [ha]
+    simp [hv]
+
+theorem StaleOk.slots {decls : List LocalDecl} {body : CapturedMir} {actual view : List LocalSlot}
+    {blk stmt : Nat} (h : StaleOk body actual view blk stmt)
+    (hv : ∀ (i : Nat) d slot, decls[i]? = some d → view[i]? = some slot → SlotOk (tyOf d) slot) :
+    SlotsOk decls actual := by
+  intro i d slot hd hs
+  by_cases heq : actual[i]? = view[i]?
+  · rw [heq] at hs; exact hv i d slot hd hs
+  · obtain ⟨_, ha, _⟩ := h.2 i heq; rw [ha] at hs; cases hs; trivial
+
+theorem StaleOk.readsAgree {body : CapturedMir} {actual view : List LocalSlot} {blk stmt : Nat}
+    (h : StaleOk body actual view blk stmt) {ops : List Operand}
+    (hr : readsOk (movedBefore body blk stmt) ops = true) : ReadsAgree actual view ops :=
+  fun op hop j hj => h.agree ((readsOk_spec hr op hop).2 j hj)
+
+/-- `StaleOk` at the entry of any block, from `StaleOk` anywhere in a block:
+every local that a block may have moved out of is in `movedLocals`. -/
+theorem StaleOk.toBlock {body : CapturedMir} {actual view : List LocalSlot} {blk stmt : Nat}
+    {bb : BasicBlockData} (hbb : body.basicBlocks[blk]? = some bb)
+    (h : StaleOk body actual view blk stmt) (t : Nat) : StaleOk body actual view t 0 := by
+  refine ⟨h.1, fun j hj => ?_⟩
+  obtain ⟨h1, h2, h3⟩ := h.2 j hj
+  exact ⟨by rw [movedBefore_zero]; exact movedBefore_sub hbb stmt j h1, h2, h3⟩
+
+/-- `StaleOk` at the entry of any block after Anneal read the `switchInt`
+discriminant `op`, which may move out of a local. -/
+theorem StaleOk.toBlockMove {body : CapturedMir} {actual view : List LocalSlot} {blk stmt : Nat}
+    {bb : BasicBlockData} (hbb : body.basicBlocks[blk]? = some bb)
+    (h : StaleOk body actual view blk stmt) (op : Operand)
+    (hop : ∀ j, opMoved op = some j → j ∈ movedLocals body) (t : Nat) :
+    StaleOk body (opPost actual op) view t 0 := by
+  refine ⟨by rw [opPost_length]; exact h.1, fun j hj => ?_⟩
+  rcases opPost_get actual op j with h' | ⟨hm, h1, s, h2, h3⟩
+  · rw [h'] at hj ⊢
+    exact (h.toBlock hbb t).2 j hj
+  · refine ⟨by rw [movedBefore_zero]; exact hop j hm, h1, fun hv => h3 ?_⟩
+    have := (h.dead_iff j).mpr hv
+    rw [h2] at this
+    exact Option.some.inj this
+
+/-- `StaleOk` after an assignment to `_i`, from which Anneal's `move`s
+de-initialize the locals the rvalue moves out of. -/
+theorem StaleOk.assign {body : CapturedMir} {actual view : List LocalSlot} {blk stmt : Nat}
+    {bb : BasicBlockData} {st : MirAst.Statement} (hbb : body.basicBlocks[blk]? = some bb)
+    (hst : bb.statements[stmt]? = some st) {i : Nat} {rv : Rvalue}
+    (hk : st.kind = .assign ⟨i, []⟩ rv) (h : StaleOk body actual view blk stmt) (x : LocalSlot) :
+    StaleOk body ((rvPost actual rv).set i x) (view.set i x) blk (stmt + 1) := by
+  unfold StaleOk
+  rw [movedBefore_succ hbb hst]
+  refine ⟨by simp [rvPost_length, h.1], fun j hj => ?_⟩
+  simp only [stmtMoved, hk]
+  have hji : j ≠ i := by
+    intro hji
+    subst hji
+    apply hj
+    rw [List.getElem?_set, List.getElem?_set, rvPost_length, h.1]
+    simp
+  rw [List.getElem?_set_ne (Ne.symm hji), List.getElem?_set_ne (Ne.symm hji)] at hj ⊢
+  rcases opsPost_get actual (rvOperands rv) j with h' | ⟨hm, h1, h2⟩
+  · simp only [rvPost] at hj ⊢
+    rw [h'] at hj ⊢
+    obtain ⟨hmo, ha, hv⟩ := h.2 j hj
+    exact ⟨List.mem_filter.mpr ⟨(foldl_moveOut_mem _ _ _).mpr (.inl hmo), by simp [hji]⟩, ha, hv⟩
+  · refine ⟨List.mem_filter.mpr ⟨(foldl_moveOut_mem _ _ _).mpr (.inr hm), by simp [hji]⟩, h1,
+      fun hv => h2 ((h.dead_iff j).mpr hv)⟩
+
+/-- `StaleOk` after `StorageLive(_i)`, `StorageDead(_i)`, or `Deinit(_i)`,
+which set `_i` alike in both models. -/
+theorem StaleOk.setBoth {body : CapturedMir} {actual view : List LocalSlot} {blk stmt : Nat}
+    {bb : BasicBlockData} {st : MirAst.Statement} (hbb : body.basicBlocks[blk]? = some bb)
+    (hst : bb.statements[stmt]? = some st) {i : Nat}
+    (hmo : stmtMoved (movedBefore body blk stmt) st = (movedBefore body blk stmt).filter (· != i))
+    (h : StaleOk body actual view blk stmt) (x : LocalSlot) :
+    StaleOk body (actual.set i x) (view.set i x) blk (stmt + 1) := by
+  unfold StaleOk
+  rw [movedBefore_succ hbb hst, hmo]
+  refine ⟨by simp [h.1], fun j hj => ?_⟩
+  have hji : j ≠ i := by
+    intro hji
+    subst hji
+    apply hj
+    rw [List.getElem?_set, List.getElem?_set, h.1]
+    simp
+  rw [List.getElem?_set_ne (Ne.symm hji), List.getElem?_set_ne (Ne.symm hji)] at hj ⊢
+  obtain ⟨hm, ha, hv⟩ := h.2 j hj
+  exact ⟨List.mem_filter.mpr ⟨hm, by simp [hji]⟩, ha, hv⟩
+
+/-- `StaleOk` after a `PlaceMention`, which changes nothing. -/
+theorem StaleOk.keep {body : CapturedMir} {actual view : List LocalSlot} {blk stmt : Nat}
+    {bb : BasicBlockData} {st : MirAst.Statement} (hbb : body.basicBlocks[blk]? = some bb)
+    (hst : bb.statements[stmt]? = some st)
+    (hmo : stmtMoved (movedBefore body blk stmt) st = movedBefore body blk stmt)
+    (h : StaleOk body actual view blk stmt) : StaleOk body actual view blk (stmt + 1) := by
+  unfold StaleOk at h ⊢
+  rw [movedBefore_succ hbb hst, hmo]
+  exact h
 
 /-! ## One MiniRust step on a related machine -/
 
@@ -98,9 +387,9 @@ theorem resetPick_shape {m : Mach} {ctx : Ctx} {frames : List Frame} {allocs : L
     (h : Shape m ctx frames allocs) : Shape (resetPick m) ctx frames allocs :=
   ⟨h.threads, rfl, h.allocs⟩
 
-theorem step_callee {m : Mach} {ctx : Ctx} {f : Gen.Function} {n blk stmt : Nat}
-    {allocs : List Gen.Allocation}
-    (h : Shape m ctx [ctx.caller, calleeFrame f ctx n blk stmt] allocs) (tb : Gen.BasicBlock)
+theorem step_callee {m : Mach} {ctx : Ctx} {f : Gen.Function} {lm : Map Gen.LocalName Ptr}
+    {blk stmt : Nat} {allocs : List Gen.Allocation}
+    (h : Shape m ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] allocs) (tb : Gen.BasicBlock)
     (htb : mapGet f.blocks (bbName blk) = some tb) :
     Interp.step m = (do
       let m' ← if (stmt : Int) = (tb.statements.length : Int) then
@@ -116,14 +405,14 @@ theorem step_callee {m : Mach} {ctx : Ctx} {f : Gen.Function} {n blk stmt : Nat}
   have hpick : ∀ mm : Mach, mm.threads = m.threads → pickActiveThread mm = .ok 0 :=
     fun mm hmm => pick_eq (hmm.trans h.threads)
   have hcur : ∀ mm : Mach, mm.threads = m.threads → mm.active_thread = 0 →
-      curFrame mm = .ok (calleeFrame f ctx n blk stmt) :=
+      curFrame mm = .ok (calleeFrameL f ctx lm blk stmt) :=
     fun mm hmm hact => curFrame_eq ⟨hmm.trans h.threads, hact, rfl⟩
   simp only [Interp.step, hany, Bool.not_true, Bool.false_eq_true, ↓reduceIte, resetDataRaceTracking,
     h.active]
   rw [hpick { m with mem := { memory := m.mem.memory, accesses := [] }, active_thread := 0 } rfl]
   simp only [ok_bind]
   rw [hcur { m with mem := { memory := m.mem.memory, accesses := [] }, active_thread := 0 } rfl rfl]
-  simp only [ok_bind, mapIndex, calleeFrame, htb]
+  simp only [ok_bind, mapIndex, calleeFrameL, htb]
   rfl
 
 /-- `ConcurrentMemory::check_data_races` passes after any step that leaves
@@ -143,43 +432,35 @@ theorem mutateCurFrame_single {m : Mach} {ctx : Ctx} {fr : Frame} {allocs : List
   refine ⟨{ m with threads := [thread1 ctx [g fr]] }, ?_, ⟨rfl, h.active, h.allocs⟩⟩
   simp [mutateCurFrame, activeThread, listIndex, h.threads, h.active, thread1, listSet]
 
-theorem evalReturn_callee {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
-    {locals : List LocalSlot} {m : Mach} {blk stmt : Nat} (h : FrameOk body f ctx locals m blk stmt)
-    (d : LocalDecl) (hd : body.localDecls[0]? = some d)
-    (haddr : ctx.addrs.getD 0 0 % ((itOf d).size.bytes : Int) = 0)
-    (r : Nat) (a : Gen.Allocation) (hp : ctx.retPtr.provenance = some (⟨(r : Int)⟩, ()))
-    (hr : ctx.base[r]? = some a) (hlive : a.live = true) (haddrr : a.addr = ctx.retPtr.addr)
+/-- `Terminator::Return` from the callee: load `_0` (UB if uninitialized),
+deallocate every local in the locals map, store the value into the caller's
+return place, and continue the caller at `nextBlock`. -/
+theorem evalReturn_frame {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {m : Mach} {blk stmt : Nat}
+    (h : FrameOk body f ctx locals lm m blk stmt) (d : LocalDecl)
+    (hd : body.localDecls[0]? = some d) (r : Nat) (a : Gen.Allocation)
+    (hp : ctx.retPtr.provenance = some (⟨(r : Int)⟩, ())) (hr : ctx.base[r]? = some a)
+    (hlive : a.live = true) (haddrr : a.addr = ctx.retPtr.addr)
     (hlenr : a.data.length = tyBytes (tyOf d))
     (halr : ctx.retPtr.addr % ((itOf d).size.bytes : Int) = 0) :
     (∀ v, locals[0]? = some (.init v) →
-      ∃ m', evalReturn m = .ok m' ∧
+      ∃ m' R, evalReturn m = .ok m' ∧
         Shape m' ctx [{ ctx.caller with next_block := ctx.nextBlock, next_stmt := 0 }]
-          (ctx.base.set r { a with data := declSlotData d (.init v) } ++
-            (localAllocs ctx body.localDecls locals).map kill)) ∧
+          (ctx.base.set r { a with data := declSlotData d (.init v) } ++ R) ∧
+        ∀ b ∈ R, b.live = false) ∧
     (locals[0]? = some .uninit → ∃ msg, evalReturn m = .error (.ub msg)) := by
-  have hn0 : 0 < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
   have hT := h.decl_localTy 0 d hd
   have hdScalar := h.decl_scalar 0 d hd
   have hspec := translateFn_spec body f h.hf
   have hloc0 := (hspec.2.1 0 d hd).2
-  have hact : activeThread m =
-      .ok (thread1 ctx [ctx.caller, calleeFrame f ctx body.localDecls.length blk stmt]) := by
+  have hact : activeThread m = .ok (thread1 ctx [ctx.caller, calleeFrameL f ctx lm blk stmt]) := by
     simp [activeThread, listIndex, h.shape.threads, h.shape.active]
   have hs3 : Shape { m with threads := [thread1 ctx [ctx.caller]] } ctx [ctx.caller]
-      (ctx.base ++ localAllocs ctx body.localDecls locals) := ⟨rfl, h.shape.active, h.shape.allocs⟩
-  have hal0 : Align.is_aligned ⟨(itOf d).size.bytes⟩ (ctx.addrs.getD 0 0) = true := by
-    simp only [Align.is_aligned, haddr]; rfl
-  have hlocPtr : mapGet (localsMap ctx body.localDecls.length) (localName 0) = some (localPtr ctx 0) :=
-    mapGet_localsMap ctx _ 0 hn0
-  obtain ⟨_, slot0, _, hs0⟩ := h.slot_exists 0 hn0
-  have hL0 := h.localAllocs_get 0 d slot0 hd hs0
-  have hslot0 := h.slots 0 d slot0 hd hs0
-  -- The prefix of `evalReturn` common to both cases.
-  have hprefix : evalReturn m = (do
-      let (retVal, m4) ← typedLoad { m with threads := [thread1 ctx [ctx.caller]] } (localPtr ctx 0)
+      m.mem.memory.allocations := ⟨rfl, h.shape.active, rfl⟩
+  have hprefix : ∀ p0 : Ptr, mapGet lm (localName 0) = some p0 → evalReturn m = (do
+      let (retVal, m4) ← typedLoad { m with threads := [thread1 ctx [ctx.caller]] } p0
         (tyOf d) ⟨(itOf d).size.bytes⟩ .None
-      let (frame, cm) ← deallocAll (localsMap ctx body.localDecls.length).entries.length
-        (calleeFrame f ctx body.localDecls.length blk stmt) m4.mem
+      let (frame, cm) ← deallocAll lm.entries.length (calleeFrameL f ctx lm blk stmt) m4.mem
       let m5 := { m4 with mem := cm }
       match frame.stack_pop_action with
       | .BottomOfStack => terminateActiveThread m5
@@ -191,79 +472,93 @@ theorem evalReturn_callee {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
           match nextBlock with
           | some nb => jumpToBlock m6 nb
           | none => ub "return from a function where caller did not specify next block") := by
+    intro p0 hp0
     simp only [evalReturn, hact, ok_bind, thread1, List.getLast?_cons_cons, List.getLast?_singleton,
       listSet, h.shape.active, h.shape.threads]
-    simp [calleeFrame, hspec.1, mapIndex, hloc0, hT.layout, LayoutStrategy.expect_align,
-      hlocPtr]
+    simp [calleeFrameL, hspec.1, mapIndex, hloc0, hT.layout, expect_align_sized, hp0]
     rfl
+  -- `_0`'s storage, for a live `_0`.
+  have hstore : ∀ slot0, locals[0]? = some slot0 → slot0 ≠ .dead →
+      ∃ (p0 : Ptr) (id0 : Nat), mapGet lm (localName 0) = some p0 ∧ p0.provenance = some (⟨(id0 : Int)⟩, ()) ∧
+        Align.is_aligned ⟨(itOf d).size.bytes⟩ p0.addr = true ∧
+        m.mem.memory.allocations[id0]? = some (stackAlloc p0.addr (itOf d) (declSlotData d slot0)) := by
+    intro slot0 hs0 hne
+    obtain ⟨p0, hp0⟩ := h.locs.some_of_live hs0 hne
+    obtain ⟨id0, hpid0, _, haddr0, _, hA0⟩ := h.locs.storage 0 d slot0 p0 hd hs0 hp0
+    exact ⟨p0, id0, hp0, hpid0, by simp only [Align.is_aligned, haddr0.1]; rfl, hA0⟩
   constructor
   · intro v hv
-    rw [hv] at hs0
-    cases hs0
-    obtain ⟨m4, hm4, hs4⟩ := typedLoad_local_localTy hs3 0 d hdScalar v hslot0 hL0 _ hal0
-    have hlenL : (localAllocs ctx body.localDecls locals).length = body.localDecls.length := by
-      simp [localAllocs, localAllocsFrom_length, h.nlocals]
-    obtain ⟨cm5, hcm5, hcm5mem⟩ := deallocAll_callee ctx
-      (localsMap ctx body.localDecls.length).entries.length
-      (calleeFrame f ctx body.localDecls.length blk stmt) m4.mem (List.range body.localDecls.length)
-      (localAllocs ctx body.localDecls locals) (by simp [localsMap]) (by simp [calleeFrame, localsMap])
-      List.nodup_range (by rw [hs4.allocs])
+    obtain ⟨p0, id0, hp0, hpid0, hal0, hA0⟩ := hstore _ hv (by simp)
+    have hslot0 := h.slots 0 d _ hd hv
+    obtain ⟨m4, hm4, hs4⟩ := typedLoad_ptr_localTy hs3 p0 id0 hpid0 d hdScalar v hslot0 hA0 _ hal0
+    obtain ⟨hidnd, hok, hlow, hown⟩ := h.locs.teardown h.hf
+    obtain ⟨cm5, hcm5, hcm5mem⟩ := deallocAll_gen lm.entries.length
+      (calleeFrameL f ctx lm blk stmt) m4.mem lm.entries (Nat.le_refl _) rfl h.locs.keysNodup hidnd
       (by
-        intro i hi
-        rw [List.mem_range] at hi
-        obtain ⟨di, sloti, hdi, hsi⟩ := h.slot_exists i hi
-        refine ⟨tyOf di, itOf di, _, (hspec.2.1 i di hdi).2, h.decl_localTy i di hdi,
-          h.localAllocs_get i di sloti hdi hsi, rfl, rfl, rfl,
-          declSlotData_length (h.decl_scalar i di hdi) sloti, rfl⟩)
-    rw [← hlenL, killAt_range] at hcm5mem
-    have hs5 : Shape { m4 with mem := cm5 } ctx [ctx.caller]
-        (ctx.base ++ (localAllocs ctx body.localDecls locals).map kill) :=
+        intro e he
+        obtain ⟨T, it, a', h1, h2, h3, h4, h5⟩ := hok e he
+        exact ⟨T, it, a', h1, h2, h3, by rw [hs4.allocs]; exact h4, h5⟩)
+    obtain ⟨R0, hR0⟩ := h.locs.base
+    have hall : ∀ (j : Nat) b, R0[j]? = some b → b.live = true →
+        ctx.base.length + j ∈ lm.entries.map (fun e => provId e.2) := by
+      intro j b hb hlb
+      refine hown (ctx.base.length + j) b ?_ hlb (by omega)
+      rw [hR0, List.getElem?_append_right (by omega)]
+      simpa using hb
+    obtain ⟨R, hRk, hRdead⟩ := killAt_append_dead ctx.base R0 _ hlow hall
+    rw [hs4.allocs, hR0, hRk] at hcm5mem
+    have hs5 : Shape { m4 with mem := cm5 } ctx [ctx.caller] (ctx.base ++ R) :=
       ⟨hs4.threads, hs4.active, hcm5mem⟩
     have hact5 : activeThread { m4 with mem := cm5 } = .ok (thread1 ctx [ctx.caller]) := by
       simp [activeThread, listIndex, hs4.threads, hs4.active]
     obtain ⟨acc, hst⟩ := typedStore_base_localTy hs5 ctx.retPtr r a hp hr hlive haddrr d hdScalar
       hlenr v hslot0 ⟨(itOf d).size.bytes⟩ (by simp only [Align.is_aligned, halr]; rfl)
     have hs6 := withMem_shape (allocs' := ctx.base.set r { a with data := declSlotData d (.init v) } ++
-        (localAllocs ctx body.localDecls locals).map kill) hs5 acc
+        R) hs5 acc
     obtain ⟨m7, hm7, hs7⟩ := mutateCurFrame_single hs6
       (fun fr => { fr with next_block := ctx.nextBlock, next_stmt := 0 })
-    refine ⟨m7, ?_, hs7⟩
-    rw [hprefix, hm4]
+    refine ⟨m7, R, ?_, hs7, hRdead⟩
+    rw [hprefix p0 hp0, hm4]
     simp only [ok_bind]
     rw [hcm5]
-    simp only [ok_bind, calleeFrame, hact5, thread1, hst]
+    simp only [ok_bind, calleeFrameL, hact5, thread1, hst]
     simp [jumpToBlock, hm7]
   · intro hu
-    rw [hu] at hs0
-    cases hs0
-    obtain ⟨msg, hmsg⟩ := typedLoad_local_localTy_uninit hs3 0 d hdScalar hL0 _ hal0
-    exact ⟨msg, by rw [hprefix, hmsg]; rfl⟩
+    obtain ⟨p0, id0, hp0, hpid0, hal0, hA0⟩ := hstore _ hu (by simp)
+    obtain ⟨msg, hmsg⟩ := typedLoad_ptr_localTy_uninit hs3 p0 id0 hpid0 d hdScalar hA0 _ hal0
+    exact ⟨msg, by rw [hprefix p0 hp0, hmsg]; rfl⟩
 
 /-! ## Shapes of fragment statements and terminators -/
 
 theorem translateStatement_some {decls : List LocalDecl} {st : MirAst.Statement}
     {st' : Gen.Statement} (h : translateStatement decls st = some st') :
-    (∃ i rv e, st.kind = .assign ⟨i, []⟩ rv ∧ translateRvalue decls rv = some e ∧
+    (∃ i rv e, st.kind = .assign ⟨i, []⟩ rv ∧ translateRvalue decls (copyRv rv) = some e ∧
       st' = .Assign (.Local (localName i)) e) ∨
     (∃ p pe, st.kind = .placeMention p ∧ translatePlace p = some pe ∧
-      st' = .PlaceMention pe) := by
+      st' = .PlaceMention pe) ∨
+    (∃ i, st.kind = .storageLive i ∧ st' = .StorageLive (localName i)) ∨
+    (∃ i, st.kind = .storageDead i ∧ st' = .StorageDead (localName i)) ∨
+    (∃ p pe, st.kind = .deinit p ∧ translatePlace p = some pe ∧ st' = .Deinit pe) := by
   obtain ⟨kind, span⟩ := st
   simp only [translateStatement] at h ⊢
   match kind, h with
   | .assign ⟨i, []⟩ rv, h =>
-    cases he : translateRvalue decls rv with
+    cases he : translateRvalue decls (copyRv rv) with
     | none => simp [he] at h
     | some e => simp [he] at h; exact .inl ⟨i, rv, e, rfl, he, h.symm⟩
   | .assign ⟨_, _ :: _⟩ _, h => simp at h
   | .setDiscriminant _ _, h => simp at h
-  | .deinit _, h => simp at h
-  | .storageLive _, h => simp at h
-  | .storageDead _, h => simp at h
+  | .deinit p, h =>
+    cases hpe : translatePlace p with
+    | none => simp [hpe] at h
+    | some pe => simp [hpe] at h; exact .inr (.inr (.inr (.inr ⟨p, pe, rfl, hpe, h.symm⟩)))
+  | .storageLive i, h => simp at h; exact .inr (.inr (.inl ⟨i, rfl, h.symm⟩))
+  | .storageDead i, h => simp at h; exact .inr (.inr (.inr (.inl ⟨i, rfl, h.symm⟩)))
   | .retag _ _, h => simp at h
   | .placeMention p, h =>
     cases hpe : translatePlace p with
     | none => simp [hpe] at h
-    | some pe => simp [hpe] at h; exact .inr ⟨p, pe, rfl, hpe, h.symm⟩
+    | some pe => simp [hpe] at h; exact .inr (.inl ⟨p, pe, rfl, hpe, h.symm⟩)
   | .intrinsic _, h => simp at h
   | .coverage, h => simp at h
   | .constEvalCounter, h => simp at h
@@ -294,11 +589,11 @@ theorem translateTerminator_some {decls : List LocalDecl} {t : MirAst.Terminator
 theorem terminatorOk_switch {decls : List LocalDecl} {nblocks : Nat} {t : MirAst.Terminator}
     {discr : Operand} {targets : SwitchTargets}
     (h : terminatorOk decls nblocks t = true) (hk : t.kind = .switchInt discr targets) :
-    ∃ it, switchIntType decls discr = some it ∧ discrOk decls discr = true ∧
+    ∃ it, switchIntType decls (copyOp discr) = some it ∧ discrOk decls (copyOp discr) = true ∧
     (∀ p ∈ targets.branches, p.1 < 2 ^ (8 * it.size.bytes) ∧ p.2 < nblocks) ∧
     targets.otherwise < nblocks := by
   simp only [terminatorOk, hk] at h
-  cases hit : switchIntType decls discr with
+  cases hit : switchIntType decls (copyOp discr) with
   | none => simp [hit] at h
   | some it =>
     simp only [hit, Bool.and_eq_true, decide_eq_true_eq, List.all_eq_true] at h
@@ -307,25 +602,26 @@ theorem terminatorOk_switch {decls : List LocalDecl} {nblocks : Nat} {t : MirAst
 
 /-- A translated fragment `switchInt`: the switch value evaluates to the
 integer `int_from_bits(bits)` at the switch type `it` (for a `bool`
-discriminant, through `minimize`'s transmute to `u8`), and the discriminant
-is a fragment operand of a fragment type stored like `it`. -/
+discriminant, through `minimize`'s transmute to `u8`), and the discriminant's
+`copy` form is a fragment operand of a fragment type stored like `it`. -/
 theorem switch_spec {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
-    {locals : List LocalSlot} {m : Mach} {blk stmt : Nat} (h : FrameOk body f ctx locals m blk stmt)
+    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {m : Mach} {blk stmt : Nat}
+    (h : FrameOk body f ctx locals lm m blk stmt)
     {t : MirAst.Terminator} {tt : Gen.Terminator} {discr : Operand} {targets : SwitchTargets}
     (hk : t.kind = .switchInt discr targets) (htt : translateTerminator body.localDecls t = some tt)
-    {it : Gen.IntType} (hit : switchIntType body.localDecls discr = some it)
-    (hdok : discrOk body.localDecls discr = true) :
-    (∃ T, FragTy T it ∧ OperandOkT body.localDecls T discr) ∧
+    {it : Gen.IntType} (hit : switchIntType body.localDecls (copyOp discr) = some it)
+    (hdok : discrOk body.localDecls (copyOp discr) = true) :
+    (∃ T, FragTy T it ∧ OperandOkT body.localDecls T (copyOp discr)) ∧
     ∃ value, tt = .Switch value (switchCases it targets.branches) (bbName targets.otherwise) ∧
-      (∀ bits, opBits locals discr = some bits →
+      (∀ bits, opBits locals (copyOp discr) = some bits →
         bits < 2 ^ (8 * it.size.bytes) ∧
         ∃ m', evalValue m value = .ok ((.Int (intFromBits bits it), .Int it), m') ∧
-          FrameOk body f ctx locals m' blk stmt) ∧
-      (opBits locals discr = none → ∃ msg, evalValue m value = .error (.ub msg)) := by
+          FrameOk body f ctx locals lm m' blk stmt) ∧
+      (opBits locals (copyOp discr) = none → ∃ msg, evalValue m value = .error (.ub msg)) := by
   simp only [translateTerminator, hk, Option.bind_eq_bind] at htt
   unfold switchIntType at hit
   unfold discrOk at hdok
-  cases hv : translateOperand discr with
+  cases hv : translateOperand (copyOp discr) with
   | none => simp [hv] at htt
   | some v =>
     simp only [hv, Option.bind_some] at htt
@@ -338,7 +634,7 @@ theorem switch_spec {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
         simpa [hty] using htt.symm
       have hgood := operandOk_good hdok
       refine ⟨⟨.Int it', .int it' hgood, operandOk_T hdok⟩, v, htt', ?_⟩
-      exact evalValue_operand h it' discr hdok v hv
+      exact evalValue_operand h it' (copyOp discr) hdok v hv
     · next hty =>
       simp only [Option.some.injEq] at hit
       subst hit
@@ -348,7 +644,7 @@ theorem switch_spec {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
         simpa [hty] using htt.symm
       have hokT := operandOkB_T hdok
       refine ⟨⟨.Bool, .bool, hokT⟩, boolToU8 v, htt', ?_⟩
-      obtain ⟨hsome, hnone⟩ := evalValue_operandT h .bool discr hokT v hv
+      obtain ⟨hsome, hnone⟩ := evalValue_operandT h .bool (copyOp discr) hokT v hv
       refine ⟨fun bits hb => ?_, fun hb => ?_⟩
       · obtain ⟨hbv, m', hm', h'⟩ := hsome bits hb
         have hb2 : bits < 2 := by simpa [ValidBits] using hbv
@@ -395,31 +691,106 @@ theorem StepRel.ub' {body : CapturedMir} {f : Gen.Function} {ctx : Ctx} {s : Mac
     {r : Interp Mach} (msg : String) (hr : r = .error (.ub msg)) :
     StepRel body f ctx s (MirStepNode.fail .ub) r := ⟨msg, hr⟩
 
-/-- Anneal's state after jumping to block `t` with unchanged locals. -/
-def gotoState (s : MachineState) (t : Nat) : MachineState :=
-  { s with frame := { blockIdx := t, stmtIdx := 0, locals := s.frame.locals } }
+/-! ## Constructing `StateRel` -/
 
-/-- Jumping to an in-range block keeps the relation (the program counters
-move together; nothing else changes). -/
-theorem StateRel.goto {body : CapturedMir} {f : Gen.Function} {ctx : Ctx} {s : MachineState}
-    {m m' : Mach} (hrel : StateRel body f ctx s m) (t : Nat) (ht : t < body.basicBlocks.length)
-    (h : Shape m' ctx [ctx.caller, calleeFrame f ctx body.localDecls.length t 0]
-      (ctx.base ++ localAllocs ctx body.localDecls s.frame.locals)) :
-    StateRel body f ctx (gotoState s t) m' where
-  threads := h.threads
-  active := h.active
-  allocs := h.allocs
-  blk := ht
-  stmt := fun _ _ => Nat.zero_le _
-  nlocals := hrel.nlocals
-  slots := hrel.slots
-  addrs := hrel.addrs
-  ret := hrel.ret
-  borrows := hrel.borrows
-  callStack := hrel.callStack
-  activeCallee := hrel.activeCallee
-  protectors := hrel.protectors
-  callerLocals := hrel.callerLocals
+/-- The relation after a statement: Anneal advanced to the next statement with
+slots `actual'` and memory `mem'`, MiniRust to the next statement with the
+view `view'` and the locals map `lm'`. -/
+theorem StateRelAt.advance {body : CapturedMir} {f : Gen.Function} {ctx : Ctx} {s : MachineState}
+    {view : List LocalSlot} {m : Mach} (hrel : StateRelAt body f ctx s view m)
+    {bb : BasicBlockData} (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
+    (hlt : s.frame.stmtIdx < bb.statements.length)
+    (actual' view' : List LocalSlot) (mem' : MirSemantics.Memory) (lm' : Map Gen.LocalName Ptr)
+    (m' : Mach)
+    (hthr : m'.threads =
+      [thread1 ctx [ctx.caller, calleeFrameL f ctx lm' s.frame.blockIdx (s.frame.stmtIdx + 1)]])
+    (hact : m'.active_thread = 0)
+    (hlo : LocalsOk body ctx view' lm' m'.mem.memory.allocations)
+    (hstale : StaleOk body actual' view' s.frame.blockIdx (s.frame.stmtIdx + 1))
+    (hret : view'[0]? ≠ some .dead)
+    (hbor : mem'.borrows = []) (hcs : mem'.callStack = s.memory.callStack)
+    (hac : mem'.activeCallee = s.memory.activeCallee)
+    (hpr : mem'.activeProtectors = s.memory.activeProtectors)
+    (hcl : mem'.callerLocals = s.memory.callerLocals) :
+    StateRel body f ctx (advanceStmt s actual' mem') m' :=
+  ⟨view', {
+    frame := ⟨lm', hthr, hlo⟩
+    active := hact
+    blk := hrel.blk
+    stmt := fun bb' hbb' => by
+      simp only [advanceStmt] at hbb' ⊢
+      rw [hbb] at hbb'
+      cases hbb'
+      show s.frame.stmtIdx + 1 ≤ bb.statements.length
+      omega
+    stale := hstale
+    retLive := hret
+    ret := hrel.ret
+    baseLow := hrel.baseLow
+    borrows := hbor
+    callStack := hcs.trans hrel.callStack
+    activeCallee := hac.trans hrel.activeCallee
+    protectors := hpr.trans hrel.protectors
+    callerLocals := hcl.trans hrel.callerLocals }⟩
+
+/-- Anneal's state after jumping to block `t` with slots `locals`. -/
+def jumpState (s : MachineState) (t : Nat) (locals : List LocalSlot) : MachineState :=
+  { s with frame := { blockIdx := t, stmtIdx := 0, locals := locals } }
+
+/-- The relation after a jump to the in-range block `t`. -/
+theorem StateRelAt.jump {body : CapturedMir} {f : Gen.Function} {ctx : Ctx} {s : MachineState}
+    {view : List LocalSlot} {m : Mach} (hrel : StateRelAt body f ctx s view m) {m' : Mach}
+    (lm : Map Gen.LocalName Ptr) (t : Nat) (ht : t < body.basicBlocks.length)
+    (actual' : List LocalSlot)
+    (hthr : m'.threads = [thread1 ctx [ctx.caller, calleeFrameL f ctx lm t 0]])
+    (hact : m'.active_thread = 0) (hlo : LocalsOk body ctx view lm m'.mem.memory.allocations)
+    (hstale : StaleOk body actual' view t 0) :
+    StateRel body f ctx (jumpState s t actual') m' :=
+  ⟨view, {
+    frame := ⟨lm, hthr, hlo⟩
+    active := hact
+    blk := ht
+    stmt := fun _ _ => Nat.zero_le _
+    stale := hstale
+    retLive := hrel.retLive
+    ret := hrel.ret
+    baseLow := hrel.baseLow
+    borrows := hrel.borrows
+    callStack := hrel.callStack
+    activeCallee := hrel.activeCallee
+    protectors := hrel.protectors
+    callerLocals := hrel.callerLocals }⟩
+
+/-- The `moveKind` of a fragment rvalue. -/
+theorem moveKind_of_rvalueOk {decls : List LocalDecl} {it : Gen.IntType} {rv : Rvalue}
+    (h : rvalueOk decls it (copyRv rv) = true) : moveKind rv = true := by
+  cases rv with
+  | unaryOp uop op => cases uop <;> simp_all [copyRv, rvalueOk, translateUnOp, moveKind]
+  | cast k op ty => cases k <;> simp_all [copyRv, rvalueOk, moveKind]
+  | _ => simp_all [copyRv, rvalueOk, moveKind]
+
+theorem moveKind_of_rvalueOkB {decls : List LocalDecl} {rv : Rvalue}
+    (h : rvalueOkB decls (copyRv rv) = true) : moveKind rv = true := by
+  cases rv with
+  | unaryOp uop op => cases uop <;> simp_all [copyRv, rvalueOkB, moveKind]
+  | _ => simp_all [copyRv, rvalueOkB, moveKind]
+
+theorem moveKind_of_rvalueOkO {decls : List LocalDecl} {rv : Rvalue}
+    (h : rvalueOkO decls (copyRv rv) = true) : moveKind rv = true := by
+  cases rv <;> simp_all [copyRv, rvalueOkO, moveKind]
+
+theorem moveKind_of_rvalueOkTuple {decls : List LocalDecl} {it : Gen.IntType} {rv : Rvalue}
+    (h : rvalueOkTuple decls it (copyRv rv) = true) : moveKind rv = true := by
+  cases rv with
+  | aggregate k ops => cases k <;> simp_all [copyRv, rvalueOkTuple, moveKind]
+  | _ => simp_all [copyRv, rvalueOkTuple, moveKind]
+
+theorem retLive_set {view : List LocalSlot} (h : view[0]? ≠ some .dead) (i : Nat) {x : LocalSlot}
+    (hx : x ≠ .dead) : (view.set i x)[0]? ≠ some .dead := by
+  rw [List.getElem?_set]
+  split
+  · split <;> simp_all
+  · exact h
 
 /-! ## The theorem -/
 
@@ -430,20 +801,23 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
     (hf : translateFn body = some f) (ctx : Ctx) (s : MachineState) (m : Mach)
     (hrel : StateRel body f ctx s m) :
     StepRel body f ctx s (stepMirFn body s) (Interp.step m) := by
-  obtain ⟨hphase, hnl, hbbs⟩ := inFragment_spec body hfrag
+  obtain ⟨view, hrel⟩ := hrel
+  obtain ⟨hphase, hargs, hn31, hbbs, hsdOk, hmvOk, hmtOk⟩ := inFragment_spec body hfrag
   have hspec := translateFn_spec body f hf
+  obtain ⟨lm, hthr, hlo⟩ := hrel.frame
   obtain ⟨bb, hbb⟩ : ∃ bb, body.basicBlocks[s.frame.blockIdx]? = some bb :=
     ⟨_, List.getElem?_eq_getElem hrel.blk⟩
-  obtain ⟨_, hstmts, hterm⟩ := hbbs bb (List.mem_of_getElem? hbb)
+  have hbbmem : bb ∈ body.basicBlocks := List.mem_of_getElem? hbb
+  obtain ⟨_, hstmts, hterm⟩ := hbbs bb hbbmem
   obtain ⟨tb, htb, hgetb⟩ := hspec.2.2 _ bb hbb
   obtain ⟨hlen, hstspec, htermspec⟩ := translateBlock_spec _ bb tb htb
-  have hshape : Shape m ctx
-      [ctx.caller, calleeFrame f ctx body.localDecls.length s.frame.blockIdx s.frame.stmtIdx]
-      (ctx.base ++ localAllocs ctx body.localDecls s.frame.locals) :=
-    ⟨hrel.threads, hrel.active, hrel.allocs⟩
-  have hframe : FrameOk body f ctx s.frame.locals (resetPick m) s.frame.blockIdx s.frame.stmtIdx :=
-    ⟨hf, resetPick_shape hshape, hrel.nlocals, hrel.slots, hrel.addrs⟩
-  have hslotsA : SlotsOk body.localDecls s.frame.locals := hrel.slots
+  obtain ⟨hmvS, hmvT⟩ := movesOk_spec hmvOk hbb
+  have hshape : Shape m ctx [ctx.caller, calleeFrameL f ctx lm s.frame.blockIdx s.frame.stmtIdx]
+      m.mem.memory.allocations := ⟨hthr, hrel.active, rfl⟩
+  have hframe : FrameOk body f ctx view lm (resetPick m) s.frame.blockIdx s.frame.stmtIdx :=
+    ⟨hf, resetPick_shape hshape, hlo⟩
+  have hslotsA : SlotsOk body.localDecls s.frame.locals := hrel.stale.slots hlo.slots
+  have hnA : s.frame.locals.length = body.localDecls.length := hrel.stale.1.trans hlo.nlocals
   rw [step_callee hshape tb hgetb]
   have hstmt_le := hrel.stmt bb hbb
   rcases Nat.lt_or_ge s.frame.stmtIdx bb.statements.length with hlt | hge
@@ -452,17 +826,22 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
       rw [hlen]; omega
     obtain ⟨st, hst⟩ : ∃ st, bb.statements[s.frame.stmtIdx]? = some st :=
       ⟨_, List.getElem?_eq_getElem hlt⟩
+    have hstmem : st ∈ bb.statements := List.mem_of_getElem? hst
     obtain ⟨st', hst', htst⟩ := hstspec _ st hst
     rw [stepMirFn_stmt body s bb st hrel.activeCallee hphase hbb hst]
-    have hok := hstmts st (List.mem_of_getElem? hst)
-    have hstmt' : ∀ bb', body.basicBlocks[s.frame.blockIdx]? = some bb' →
-        s.frame.stmtIdx + 1 ≤ bb'.statements.length := by
-      intro bb' hbb'
-      rw [hbb] at hbb'
-      cases hbb'
-      exact hlt
-    rcases translateStatement_some hst' with ⟨i, rv, e, hkind, he, rfl⟩ | ⟨p, pe, hkind, hpe, rfl⟩
+    have hok := hstmts st hstmem
+    have hreads := hmvS _ st hst
+    rcases translateStatement_some hst' with ⟨i, rv, e, hkind, he, rfl⟩ | ⟨p, pe, hkind, hpe, rfl⟩ |
+      ⟨i, hkind, rfl⟩ | ⟨i, hkind, rfl⟩ | ⟨p, pe, hkind, hpe, rfl⟩
     · ------------------------------------------------------------ assign
+      have hreadsMo : readsOk (movedBefore body s.frame.blockIdx s.frame.stmtIdx) (rvOperands rv) =
+          true := by
+        simpa [stmtReadsOk, hkind] using hreads
+      have hr0 : readsOk [] (rvOperands rv) = true :=
+        readsOk_mono (fun _ h => by simp at h) hreadsMo
+      have hagree := hrel.stale.readsAgree hreadsMo
+      have hal : i ∉ alwaysStorageLiveLocals body :=
+        mentionsOk_stmt hmtOk hbbmem hstmem (by simp [stmtLocals, hkind])
       obtain ⟨kind, span⟩ := st
       simp only at hkind
       subst hkind
@@ -470,172 +849,276 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
       cases hdi : body.localDecls[i]? with
       | none => simp [hdi] at hok
       | some d =>
-        cases htup : intBoolTupleOf d.ty with
-        | some it =>
-          have hb := intBoolTupleOf_isBoolTy htup
-          have ho := intBoolTupleOf_isOrderingTy htup
-          have hitd : itOf d = it := (tyOf_tuple htup).2
-          have htup' : intBoolTupleOf d.ty = some (itOf d) := by rw [hitd]; exact htup
-          have hokT : rvalueOkTuple body.localDecls (itOf d) rv = true := by
-            rw [hitd]; simpa [hdi, hb, ho, htup] using hok
-          have hgood := hframe.decl_good i d hdi
-          obtain ⟨hMok, hMnone⟩ := evalStatement_assignTuple hframe i d hdi htup' rv hokT e he
-          obtain ⟨hAok, hAnone⟩ := evalStmt_assignTuple s body.localDecls body.layouts i rv span
-            hslotsA hrel.nlocals d hdi hgood hokT hrel.borrows hrel.protectors
-          cases hr : rvTupleBits s.frame.locals (itOf d) rv with
+        have hi : i < s.frame.locals.length := by
+          rw [hnA]; exact (List.getElem?_eq_some_iff.mp hdi).1
+        -- Both models' results, by the destination's type.
+        obtain ⟨res, hk, hMok, hMnone, hAok, hAnone⟩ : ∃ res : Option Value, moveKind rv = true ∧
+            (∀ v, res = some v → view[i]? ≠ some .dead →
+              ∃ m3, evalStatement (resetPick m) (.Assign (.Local (localName i)) e) = .ok m3 ∧
+                FrameOk body f ctx (view.set i (.init v)) lm m3 s.frame.blockIdx s.frame.stmtIdx) ∧
+            (res = none → view[i]? ≠ some .dead →
+              ∃ msg, evalStatement (resetPick m) (.Assign (.Local (localName i)) e) =
+                .error (.ub msg)) ∧
+            (∀ v, res = some v →
+              evalRvalue s.frame.locals (copyRv rv) s.memory body.localDecls body.layouts =
+                .ok v s.frame.locals s.memory) ∧
+            (res = none →
+              evalRvalue s.frame.locals (copyRv rv) s.memory body.localDecls body.layouts = .ub) := by
+          cases htup : intBoolTupleOf d.ty with
+          | some it =>
+            have hb := intBoolTupleOf_isBoolTy htup
+            have ho := intBoolTupleOf_isOrderingTy htup
+            have hitd : itOf d = it := (tyOf_tuple htup).2
+            have htup' : intBoolTupleOf d.ty = some (itOf d) := by rw [hitd]; exact htup
+            have hokT : rvalueOkTuple body.localDecls (itOf d) (copyRv rv) = true := by
+              rw [hitd]; simpa [hdi, hb, ho, htup] using hok
+            have hgood := hframe.decl_good i d hdi
+            have hfr : rvTupleBits s.frame.locals (itOf d) (copyRv rv) =
+                rvTupleBits view (itOf d) (copyRv rv) := rvTupleBits_frame hagree
+            obtain ⟨hA1, hA2⟩ := evalRvalue_fragTuple body.localDecls s.frame.locals hslotsA hnA
+              (itOf d) hgood (copyRv rv) hokT s.memory body.layouts
+            refine ⟨(rvTupleBits view (itOf d) (copyRv rv)).map
+                (fun pr => .aggregate 0 [.scalar ⟨pr.1, (itOf d).size.bytes⟩, .scalar ⟨pr.2, 1⟩]),
+              moveKind_of_rvalueOkTuple hokT, ?_, ?_, ?_, ?_⟩
+            · intro v hv hlive
+              obtain ⟨⟨bits, b⟩, hpb, rfl⟩ := Option.map_eq_some_iff.mp hv
+              exact (evalStatement_assignTuple hframe i d hdi hlive htup' (copyRv rv) hokT e he).1
+                bits b hpb
+            · intro hv hlive
+              exact (evalStatement_assignTuple hframe i d hdi hlive htup' (copyRv rv) hokT e he).2
+                (Option.map_eq_none_iff.mp hv)
+            · intro v hv
+              obtain ⟨⟨bits, b⟩, hpb, rfl⟩ := Option.map_eq_some_iff.mp hv
+              exact hA1 bits b (hfr.trans hpb)
+            · intro hv
+              exact hA2 (hfr.trans (Option.map_eq_none_iff.mp hv))
           | none =>
-            rw [hAnone hr]
-            obtain ⟨msg, hmsg⟩ := hMnone hr
-            exact StepRel.ub' msg (by simp [hne, listIndex_nat _ _ _ htst, hmsg])
-          | some pair =>
-            obtain ⟨bits, b⟩ := pair
-            rw [hAok bits b hr]
-            obtain ⟨m3, hm3, h3⟩ := hMok bits b hr
-            obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3.shape
-            refine StepRel.tau' m4 (by simp [hne, listIndex_nat _ _ _ htst, hm3, hm4, check_after h4]) ?_
-            have hn' : (s.frame.locals.set i
-                (.init (.aggregate 0 [.scalar ⟨bits, (itOf d).size.bytes⟩, .scalar ⟨b, 1⟩]))).length =
-                body.localDecls.length := by
-              simp [hrel.nlocals]
-            exact {
-              threads := h4.threads
-              active := h4.active
-              allocs := h4.allocs
-              blk := hrel.blk
-              stmt := hstmt'
-              nlocals := hn'
-              slots := h3.slots
-              addrs := hrel.addrs
-              ret := hrel.ret
-              borrows := rfl
-              callStack := hrel.callStack
-              activeCallee := hrel.activeCallee
-              protectors := hrel.protectors
-              callerLocals := hrel.callerLocals }
-        | none =>
-          obtain ⟨rvB, hMok, hMnone, hAok, hAnone⟩ : ∃ rvB : Option Nat,
-              (∀ r, rvB = some r →
-                ∃ m', evalStatement (resetPick m) (.Assign (.Local (localName i)) e) = .ok m' ∧
-                  FrameOk body f ctx (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩)))
-                    m' s.frame.blockIdx s.frame.stmtIdx) ∧
-              (rvB = none →
-                ∃ msg, evalStatement (resetPick m) (.Assign (.Local (localName i)) e) = .error (.ub msg)) ∧
-              (∀ r, rvB = some r →
-                evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ body.localDecls body.layouts =
-                  .tau (.running (advanceStmt s
-                    (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩)))
-                    { s.memory with borrows := [] }))) ∧
-              (rvB = none →
-                evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ body.localDecls body.layouts =
-                  MirStepNode.fail .ub) := by
             cases hb : isBoolTy d.ty with
             | true =>
-              have hokB : rvalueOkB body.localDecls rv = true := by simpa [hdi, hb] using hok
-              obtain ⟨hMok, hMnone⟩ := evalStatement_assignB hframe i d hdi hb rv hokB e he
-              obtain ⟨hAok, hAnone⟩ := evalStmt_assignB s body.localDecls body.layouts i rv span
-                hslotsA hrel.nlocals d hdi hb hokB hrel.borrows hrel.protectors
-              exact ⟨_, hMok, hMnone, hAok, hAnone⟩
+              have hit : itOf d = u8Ty := (tyOf_bool hb).2
+              have hokB : rvalueOkB body.localDecls (copyRv rv) = true := by
+                simpa [hdi, hb] using hok
+              have hfr : rvBitsB body.localDecls s.frame.locals (copyRv rv) =
+                  rvBitsB body.localDecls view (copyRv rv) := rvBitsB_frame hagree
+              obtain ⟨hA1, hA2⟩ := evalRvalue_fragB body.localDecls s.frame.locals hslotsA hnA
+                (copyRv rv) hokB s.memory body.layouts
+              refine ⟨(rvBitsB body.localDecls view (copyRv rv)).map
+                  (fun r => .scalar ⟨r, (itOf d).size.bytes⟩),
+                moveKind_of_rvalueOkB hokB, ?_, ?_, ?_, ?_⟩
+              · intro v hv hlive
+                obtain ⟨r, hr, rfl⟩ := Option.map_eq_some_iff.mp hv
+                exact (evalStatement_assignB hframe i d hdi hlive hb (copyRv rv) hokB e he).1 r hr
+              · intro hv hlive
+                exact (evalStatement_assignB hframe i d hdi hlive hb (copyRv rv) hokB e he).2
+                  (Option.map_eq_none_iff.mp hv)
+              · intro v hv
+                obtain ⟨r, hr, rfl⟩ := Option.map_eq_some_iff.mp hv
+                rw [hit]
+                exact hA1 r (hfr.trans hr)
+              · intro hv
+                exact hA2 (hfr.trans (Option.map_eq_none_iff.mp hv))
             | false =>
               cases ho : isOrderingTy d.ty with
               | true =>
-                have hokO : rvalueOkO body.localDecls rv = true := by simpa [hdi, hb, ho] using hok
-                obtain ⟨hMok, hMnone⟩ := evalStatement_assignO hframe i d hdi ho rv hokO e he
-                obtain ⟨hAok, hAnone⟩ := evalStmt_assignO s body.localDecls body.layouts i rv span
-                  hslotsA hrel.nlocals d hdi ho hokO hrel.borrows hrel.protectors
-                exact ⟨_, hMok, hMnone, hAok, hAnone⟩
+                have hit : itOf d = u8Ty := (tyOf_ordering ho).2
+                have hokO : rvalueOkO body.localDecls (copyRv rv) = true := by
+                  simpa [hdi, hb, ho] using hok
+                have hfr : rvBitsO body.localDecls s.frame.locals (copyRv rv) =
+                    rvBitsO body.localDecls view (copyRv rv) := rvBitsO_frame hagree
+                obtain ⟨hA1, hA2⟩ := evalRvalue_fragO body.localDecls s.frame.locals hslotsA hnA
+                  (copyRv rv) hokO s.memory body.layouts
+                refine ⟨(rvBitsO body.localDecls view (copyRv rv)).map
+                    (fun r => .scalar ⟨r, (itOf d).size.bytes⟩),
+                  moveKind_of_rvalueOkO hokO, ?_, ?_, ?_, ?_⟩
+                · intro v hv hlive
+                  obtain ⟨r, hr, rfl⟩ := Option.map_eq_some_iff.mp hv
+                  exact (evalStatement_assignO hframe i d hdi hlive ho (copyRv rv) hokO e he).1 r hr
+                · intro hv hlive
+                  exact (evalStatement_assignO hframe i d hdi hlive ho (copyRv rv) hokO e he).2
+                    (Option.map_eq_none_iff.mp hv)
+                · intro v hv
+                  obtain ⟨r, hr, rfl⟩ := Option.map_eq_some_iff.mp hv
+                  rw [hit]
+                  exact hA1 r (hfr.trans hr)
+                · intro hv
+                  exact hA2 (hfr.trans (Option.map_eq_none_iff.mp hv))
               | false =>
                 cases hit : intTypeOf d.ty with
                 | none => simp [hdi, hb, ho, htup, hit] at hok
                 | some it =>
                   have hitd : itOf d = it := (tyOf_int hit).2
-                  have hok' : rvalueOk body.localDecls (itOf d) rv = true := by
+                  have hok' : rvalueOk body.localDecls (itOf d) (copyRv rv) = true := by
                     rw [hitd]; simpa [hdi, hb, ho, htup, hit] using hok
                   have hint : intTypeOf d.ty = some (itOf d) := by rw [hitd]; exact hit
                   have hgood := hframe.decl_good i d hdi
-                  obtain ⟨hMok, hMnone⟩ := evalStatement_assign hframe i d hdi hint rv hok' e he
-                  obtain ⟨hAok, hAnone⟩ := evalStmt_assign s body.localDecls body.layouts i rv span
-                    hslotsA hrel.nlocals d hdi hgood hok' hrel.borrows hrel.protectors
-                  exact ⟨_, hMok, hMnone, hAok, hAnone⟩
-          cases hr : rvB with
+                  have hfr : rvBits body.localDecls s.frame.locals (itOf d) (copyRv rv) =
+                      rvBits body.localDecls view (itOf d) (copyRv rv) := rvBits_frame hagree
+                  obtain ⟨hA1, hA2⟩ := evalRvalue_frag body.localDecls s.frame.locals hslotsA hnA
+                    (itOf d) hgood (copyRv rv) hok' s.memory body.layouts
+                  refine ⟨(rvBits body.localDecls view (itOf d) (copyRv rv)).map
+                      (fun r => .scalar ⟨r, (itOf d).size.bytes⟩),
+                    moveKind_of_rvalueOk hok', ?_, ?_, ?_, ?_⟩
+                  · intro v hv hlive
+                    obtain ⟨r, hr, rfl⟩ := Option.map_eq_some_iff.mp hv
+                    exact (evalStatement_assign hframe i d hdi hlive hint (copyRv rv) hok' e he).1 r hr
+                  · intro hv hlive
+                    exact (evalStatement_assign hframe i d hdi hlive hint (copyRv rv) hok' e he).2
+                      (Option.map_eq_none_iff.mp hv)
+                  · intro v hv
+                    obtain ⟨r, hr, rfl⟩ := Option.map_eq_some_iff.mp hv
+                    exact hA1 r (hfr.trans hr)
+                  · intro hv
+                    exact hA2 (hfr.trans (Option.map_eq_none_iff.mp hv))
+        obtain ⟨hA1, hA2⟩ := evalStmt_assign_move s body.localDecls body.layouts i rv span hk hr0 hi
+          hrel.borrows hrel.protectors
+        by_cases hdead : s.frame.locals[i]? = some .dead
+        · -- A dead destination is UB in both models.
+          have hvd : view[i]? = some .dead := (hrel.stale.dead_iff i).mp hdead
+          obtain ⟨msg, hmsg⟩ := evalStatement_assign_dead hframe i d hdi hvd hal e
+          have hA : evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ body.localDecls body.layouts =
+              MirStepNode.fail .ub := by
+            cases hres : res with
+            | none => exact hA2 (hAnone hres)
+            | some v => exact (hA1 v (hAok v hres)).2 hdead
+          rw [hA]
+          exact StepRel.ub' msg (by simp [hne, listIndex_nat _ _ _ htst, hmsg])
+        · have hlive : view[i]? ≠ some .dead := fun h => hdead ((hrel.stale.dead_iff i).mpr h)
+          cases hres : res with
           | none =>
-            rw [hAnone hr]
-            obtain ⟨msg, hmsg⟩ := hMnone hr
+            rw [hA2 (hAnone hres)]
+            obtain ⟨msg, hmsg⟩ := hMnone hres hlive
             exact StepRel.ub' msg (by simp [hne, listIndex_nat _ _ _ htst, hmsg])
-          | some r =>
-            rw [hAok r hr]
-            obtain ⟨m3, hm3, h3⟩ := hMok r hr
+          | some v =>
+            rw [(hA1 v (hAok v hres)).1 hdead]
+            obtain ⟨m3, hm3, h3⟩ := hMok v hres hlive
             obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3.shape
-            refine StepRel.tau' m4 (by simp [hne, listIndex_nat _ _ _ htst, hm3, hm4, check_after h4]) ?_
-            have hn' : (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩))).length =
-                body.localDecls.length := by
-              simp [hrel.nlocals]
-            exact {
-              threads := h4.threads
-              active := h4.active
-              allocs := h4.allocs
-              blk := hrel.blk
-              stmt := hstmt'
-              nlocals := hn'
-              slots := h3.slots
-              addrs := hrel.addrs
-              ret := hrel.ret
-              borrows := rfl
-              callStack := hrel.callStack
-              activeCallee := hrel.activeCallee
-              protectors := hrel.protectors
-              callerLocals := hrel.callerLocals }
+            refine StepRel.tau' m4
+              (by simp [hne, listIndex_nat _ _ _ htst, hm3, hm4, check_after h4]) ?_
+            exact hrel.advance hbb hlt _ (view.set i (.init v)) _ lm m4 h4.threads h4.active
+              (by rw [h4.allocs]; exact h3.locs) (hrel.stale.assign hbb hst rfl (.init v))
+              (retLive_set hrel.retLive i (by simp)) rfl rfl rfl rfl rfl
     · ------------------------------------------------------------ placeMention
       obtain ⟨kind, span⟩ := st
       simp only at hkind
       subst hkind
       have hpOk : placeOk body.localDecls p = true := by simpa [statementOk] using hok
-      obtain ⟨hM, hi⟩ := evalStatement_placeMention_place hframe p hpOk pe hpe
-      have hA := evalStmt_placeMention_place s body.localDecls body.layouts p span hslotsA
-        hrel.nlocals hi
-      rw [hA]
-      obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee hframe.shape
-      refine StepRel.tau' m4 (by simp [hne, listIndex_nat _ _ _ htst, hM, hm4, check_after h4]) ?_
-      exact {
-        threads := h4.threads
-        active := h4.active
-        allocs := h4.allocs
-        blk := hrel.blk
-        stmt := hstmt'
-        nlocals := hrel.nlocals
-        slots := hrel.slots
-        addrs := hrel.addrs
-        ret := hrel.ret
-        borrows := hrel.borrows
-        callStack := hrel.callStack
-        activeCallee := hrel.activeCallee
-        protectors := hrel.protectors
-        callerLocals := hrel.callerLocals }
+      have hal : p.local_ ∉ alwaysStorageLiveLocals body :=
+        mentionsOk_stmt hmtOk hbbmem hstmem (by simp [stmtLocals])
+      obtain ⟨hpl, hMlive, hMdead⟩ := evalStatement_placeMention_place hframe p hpOk pe hpe
+      by_cases hdead : s.frame.locals[p.local_]? = some .dead
+      · rw [evalStmt_placeMention_dead s body.localDecls body.layouts p span hdead]
+        obtain ⟨msg, hmsg⟩ := hMdead ((hrel.stale.dead_iff _).mp hdead) hal
+        exact StepRel.ub' msg (by simp [hne, listIndex_nat _ _ _ htst, hmsg])
+      · have hlive : view[p.local_]? ≠ some .dead :=
+          fun h => hdead ((hrel.stale.dead_iff _).mpr h)
+        rw [evalStmt_placeMention_place s body.localDecls body.layouts p span hslotsA hnA hpl hdead]
+        have hM := hMlive hlive
+        obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee hframe.shape
+        refine StepRel.tau' m4 (by simp [hne, listIndex_nat _ _ _ htst, hM, hm4, check_after h4]) ?_
+        exact hrel.advance hbb hlt _ view _ lm m4 h4.threads h4.active
+          (by rw [h4.allocs]; exact hlo) (hrel.stale.keep hbb hst rfl) hrel.retLive hrel.borrows
+          rfl rfl rfl rfl
+    · ------------------------------------------------------------ storageLive
+      obtain ⟨kind, span⟩ := st
+      simp only at hkind
+      subst hkind
+      have hin : i < body.localDecls.length := by simpa [statementOk] using hok
+      have hal : i ∉ alwaysStorageLiveLocals body :=
+        mentionsOk_stmt hmtOk hbbmem hstmem (by simp [stmtLocals])
+      obtain ⟨d, hd⟩ : ∃ d, body.localDecls[i]? = some d := ⟨_, List.getElem?_eq_getElem hin⟩
+      have hi : i < s.frame.locals.length := by rw [hnA]; exact hin
+      rw [evalStmt_storageLive s body.localDecls body.layouts i span hi]
+      obtain ⟨m3, lm3, hm3, h3⟩ := evalStatement_storageLive hframe i d hd hal hrel.baseLow hn31
+      obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3.shape
+      refine StepRel.tau' m4 (by simp [hne, listIndex_nat _ _ _ htst, hm3, hm4, check_after h4]) ?_
+      exact hrel.advance hbb hlt _ (view.set i .uninit) _ lm3 m4 h4.threads h4.active
+        (by rw [h4.allocs]; exact h3.locs) (hrel.stale.setBoth hbb hst rfl .uninit)
+        (retLive_set hrel.retLive i (by simp)) hrel.borrows rfl rfl rfl rfl
+    · ------------------------------------------------------------ storageDead
+      obtain ⟨kind, span⟩ := st
+      simp only at hkind
+      subst hkind
+      have hin : i < body.localDecls.length := by simpa [statementOk] using hok
+      have hal : i ∉ alwaysStorageLiveLocals body :=
+        mentionsOk_stmt hmtOk hbbmem hstmem (by simp [stmtLocals])
+      have hi0 : body.argCount < i := storageDeadOk_spec hsdOk hbbmem hstmem rfl
+      obtain ⟨d, hd⟩ : ∃ d, body.localDecls[i]? = some d := ⟨_, List.getElem?_eq_getElem hin⟩
+      have hi : i < s.frame.locals.length := by rw [hnA]; exact hin
+      rw [evalStmt_storageDead s body.localDecls body.layouts i span hi]
+      obtain ⟨m3, hm3, h3⟩ := evalStatement_storageDead hframe i d hd hal
+      obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3.shape
+      refine StepRel.tau' m4 (by simp [hne, listIndex_nat _ _ _ htst, hm3, hm4, check_after h4]) ?_
+      exact hrel.advance hbb hlt _ (view.set i .dead) _ _ m4 h4.threads h4.active
+        (by rw [h4.allocs]; exact h3.locs) (hrel.stale.setBoth hbb hst rfl .dead)
+        (by rw [List.getElem?_set_ne (by omega)]; exact hrel.retLive) hrel.borrows rfl rfl rfl rfl
+    · ------------------------------------------------------------ deinit
+      obtain ⟨kind, span⟩ := st
+      simp only at hkind
+      subst hkind
+      obtain ⟨i, proj⟩ := p
+      cases proj with
+      | cons _ _ => simp [statementOk] at hok
+      | nil =>
+        have hin : i < body.localDecls.length := by simpa [statementOk] using hok
+        simp only [translatePlace, Option.some.injEq] at hpe
+        subst hpe
+        have hal : i ∉ alwaysStorageLiveLocals body :=
+          mentionsOk_stmt hmtOk hbbmem hstmem (by simp [stmtLocals])
+        obtain ⟨d, hd⟩ : ∃ d, body.localDecls[i]? = some d := ⟨_, List.getElem?_eq_getElem hin⟩
+        have hi : i < s.frame.locals.length := by rw [hnA]; exact hin
+        obtain ⟨hMlive, hMdead⟩ := evalStatement_deinit hframe i d hd
+        obtain ⟨hAlive, hAdead⟩ := evalStmt_deinit s body.localDecls body.layouts i span hi
+        by_cases hdead : s.frame.locals[i]? = some .dead
+        · rw [hAdead hdead]
+          obtain ⟨msg, hmsg⟩ := hMdead ((hrel.stale.dead_iff i).mp hdead) hal
+          exact StepRel.ub' msg (by simp [hne, listIndex_nat _ _ _ htst, hmsg])
+        · rw [hAlive hdead]
+          obtain ⟨m3, hm3, h3⟩ := hMlive (fun h => hdead ((hrel.stale.dead_iff i).mpr h))
+          obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee h3.shape
+          refine StepRel.tau' m4
+            (by simp [hne, listIndex_nat _ _ _ htst, hm3, hm4, check_after h4]) ?_
+          exact hrel.advance hbb hlt _ (view.set i .uninit) _ lm m4 h4.threads h4.active
+            (by rw [h4.allocs]; exact h3.locs) (hrel.stale.setBoth hbb hst rfl .uninit)
+            (retLive_set hrel.retLive i (by simp)) hrel.borrows rfl rfl rfl rfl
   · ----------------------------------------------------------------- terminator
     have heq : s.frame.stmtIdx = bb.statements.length := by omega
     have hif : ((s.frame.stmtIdx : Nat) : Int) = (tb.statements.length : Int) := by rw [hlen, heq]
     rw [stepMirFn_term body s bb hrel.activeCallee hphase hbb heq]
     simp only [hif, ↓reduceIte]
+    have hstale_end : StaleOk body s.frame.locals view s.frame.blockIdx bb.statements.length := by
+      rw [← heq]; exact hrel.stale
     rcases translateTerminator_some htermspec with
       ⟨t, hk, htt⟩ | ⟨discr, targets, hk⟩ | ⟨hk, htt⟩ | ⟨hk, htt⟩
     · -------------------------------------------------------------- goto
       have ht : t < body.basicBlocks.length := by
         simpa [terminatorOk, hk] using hterm
       obtain ⟨m3, hm3, h3⟩ := jumpToBlock_callee hframe.shape t
-      have hA : evalTerminator s bb.terminator (some body) = MirStepNode.step (gotoState s t) := by
-        simp [MirSemantics.evalTerminator, hk, gotoState]
+      have hA : evalTerminator s bb.terminator (some body) =
+          MirStepNode.step (jumpState s t s.frame.locals) := by
+        simp [MirSemantics.evalTerminator, hk, jumpState]
       rw [hA]
       exact StepRel.tau' m3 (by simp [htt, Interp.evalTerminator, hm3, check_after h3])
-        (hrel.goto t ht h3)
+        (hrel.jump lm t ht _ h3.threads h3.active (by rw [h3.allocs]; exact hlo)
+          (hstale_end.toBlock hbb t))
     · -------------------------------------------------------------- switchInt
       obtain ⟨it, hit, hdok, hbr, hother⟩ := terminatorOk_switch hterm hk
       obtain ⟨⟨T, hT, hokT⟩, v, htt, hMok, hMnone⟩ := switch_spec hframe hk htermspec hit hdok
-      obtain ⟨hAok, hAnone⟩ := evalOperand_fragT body.localDecls s.frame.locals hslotsA
-        hrel.nlocals hT discr hokT s.memory.borrows s.memory.globals body.layouts
-        s.memory.callerLocals
-      cases hb : opBits s.frame.locals discr with
+      have hreadsD : readsOk (movedBefore body s.frame.blockIdx bb.statements.length) [discr] =
+          true := by
+        simpa [termReadsOk, hk] using hmvT
+      have hsimple : simpleOp discr = true := (readsOk_spec hreadsD discr (by simp)).1
+      have hbitsEq : opBits s.frame.locals (copyOp discr) = opBits view (copyOp discr) :=
+        opBits_frame _ (by
+          rw [opRead_copyOp]
+          exact fun j hj => hstale_end.agree ((readsOk_spec hreadsD discr (by simp)).2 j hj))
+      obtain ⟨hAok, hAnone⟩ := evalOperand_fragT body.localDecls s.frame.locals hslotsA hnA hT
+        (copyOp discr) hokT s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals
+      have hmove := evalOperand_move s.frame.locals discr hsimple s.memory.borrows s.memory.globals
+        body.layouts s.memory.callerLocals
+      cases hb : opBits view (copyOp discr) with
       | none =>
         have hA : evalTerminator s bb.terminator (some body) = MirStepNode.fail .ub := by
-          simp [MirSemantics.evalTerminator, hk, hAnone hb]
+          simp [MirSemantics.evalTerminator, hk, hmove, hAnone (hbitsEq.trans hb), opWithLocals]
         rw [hA]
         obtain ⟨msg, hmsg⟩ := hMnone hb
         exact StepRel.ub' msg (by simp [htt, Interp.evalTerminator, hmsg])
@@ -649,15 +1132,19 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
           (MirSemantics.lookupSwitchTarget bits targets.branches targets.otherwise)
         have hA : evalTerminator s bb.terminator (some body) =
             MirStepNode.emitStep (.event bits)
-              (gotoState s (MirSemantics.lookupSwitchTarget bits targets.branches targets.otherwise)) := by
-          simp [MirSemantics.evalTerminator, hk, hAok bits hb, gotoState]
+              (jumpState s (MirSemantics.lookupSwitchTarget bits targets.branches targets.otherwise)
+                (opPost s.frame.locals discr)) := by
+          simp [MirSemantics.evalTerminator, hk, hmove, hAok bits (hbitsEq.trans hb), opWithLocals,
+            jumpState]
         rw [hA]
         have hM : evalTerminator (resetPick m) tb.terminator = .ok m4 := by
           rw [htt]
           simp only [Interp.evalTerminator, hm3, ok_bind]
           rw [hlookup]
           exact hm4
-        exact StepRel.emit' _ m4 rfl (by simp [hM, check_after h4]) (hrel.goto _ htgt h4)
+        exact StepRel.emit' _ m4 rfl (by simp [hM, check_after h4])
+          (hrel.jump lm _ htgt _ h4.threads h4.active (by rw [h4.allocs]; exact h3.locs)
+            (hstale_end.toBlockMove hbb discr (fun j hj => mem_movedLocals_term hbbmem hk hj) _))
     · -------------------------------------------------------------- unreachable
       have hA : evalTerminator s bb.terminator (some body) = MirStepNode.fail .ub := by
         simp [MirSemantics.evalTerminator, hk]
@@ -667,92 +1154,273 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
       have hn0 : 0 < body.localDecls.length := by omega
       obtain ⟨d0, hd0⟩ : ∃ d, body.localDecls[0]? = some d := ⟨_, List.getElem?_eq_getElem hn0⟩
       obtain ⟨r0, a0, hp, hr0, hlive, haddrr, hlenr, halr⟩ := hrel.ret d0 hd0
-      have hRet := evalReturn_callee hframe d0 hd0 (hrel.addrs 0 d0 hd0).1 r0 a0 hp hr0 hlive haddrr
-        hlenr halr
-      obtain ⟨_, slot0, _, hs0⟩ := hframe.slot_exists 0 hn0
-      have hslot0 := hrel.slots 0 d0 slot0 hd0 hs0
-      match slot0, hslot0, hs0 with
-      | .uninit, _, hs0 =>
+      have hRet := evalReturn_frame hframe d0 hd0 r0 a0 hp hr0 hlive haddrr hlenr halr
+      have h0mo : 0 ∉ movedBefore body s.frame.blockIdx bb.statements.length := by
+        simpa [termReadsOk, hk] using hmvT
+      have h0eq : s.frame.locals[0]? = view[0]? := hstale_end.agree h0mo
+      obtain ⟨slot0, hs0⟩ : ∃ slot, view[0]? = some slot :=
+        ⟨_, List.getElem?_eq_getElem (by rw [hlo.nlocals]; exact hn0)⟩
+      have hslot0 := hlo.slots 0 d0 slot0 hd0 hs0
+      have hsA : s.frame.locals[0]? = some slot0 := h0eq.trans hs0
+      match slot0, hslot0, hs0, hsA with
+      | .dead, _, hs0, _ => exact absurd hs0 hrel.retLive
+      | .uninit, _, hs0, hsA =>
         have hA : evalTerminator s bb.terminator (some body) = MirStepNode.fail .ub := by
-          simp [MirSemantics.evalTerminator, hk, get?, hs0]
+          simp [MirSemantics.evalTerminator, hk, get?, hsA]
         rw [hA]
         obtain ⟨msg, hmsg⟩ := hRet.2 hs0
         exact StepRel.ub' msg (by simp [htt, Interp.evalTerminator, hmsg])
-      | .init v, hv0, hs0 =>
-        have hA : evalTerminator s bb.terminator (some body) =
-            MirStepNode.retNormal v s.memory := by
-          simp [MirSemantics.evalTerminator, hk, get?, hs0, hrel.callStack]
+      | .init v, hv0, hs0, hsA =>
+        have hA : evalTerminator s bb.terminator (some body) = MirStepNode.retNormal v s.memory := by
+          simp [MirSemantics.evalTerminator, hk, get?, hsA, hrel.callStack]
         rw [hA]
-        obtain ⟨m', hm', hs'⟩ := hRet.1 v hs0
+        obtain ⟨m', R, hm', hs', hR⟩ := hRet.1 v hs0
         exact StepRel.ret' m' (by simp [htt, Interp.evalTerminator, hm', check_after hs'])
-          ⟨r0, a0, d0, hd0, hv0, hp, hr0, hs'.threads, hs'.allocs⟩
+          ⟨r0, a0, d0, R, hd0, hv0, hp, hr0, hs'.threads, hs'.allocs, hR⟩
 
 /-! ## Entry block (`f.start`) -/
 
-/-- Stepping the `minimize` entry block (`f.start = bbName body.basicBlocks.length`,
-whose body is `initBlock = Goto(bb0)`) jumps to `bb0` in one step while
-preserving all allocations and locals. -/
-theorem step_initBlock {body : CapturedMir} {f : Gen.Function} (hf : translateFn body = some f)
-    {ctx : Ctx} {mInit : Mach} {allocs : List Gen.Allocation}
-    (hshape : Shape mInit ctx
-      [ctx.caller, calleeFrame f ctx body.localDecls.length body.basicBlocks.length 0] allocs) :
-    ∃ m0, Interp.step mInit = .ok m0 ∧
-      Shape m0 ctx [ctx.caller, calleeFrame f ctx body.localDecls.length 0 0] allocs := by
-  obtain ⟨_, hinit⟩ := translateFn_start body f hf
-  obtain ⟨m0, hm0, h0⟩ := jumpToBlock_callee (resetPick_shape hshape) 0
-  refine ⟨m0, ?_, h0⟩
-  rw [step_callee hshape initBlock hinit]
-  simp [initBlock, Interp.evalTerminator, hm0, check_after h0]
+theorem steps_add (a b : Nat) (m : Mach) :
+    Interp.steps (a + b) m = Interp.steps a m >>= Interp.steps b := by
+  induction a generalizing m with
+  | zero => simp [Interp.steps]
+  | succ a ih =>
+    rw [Nat.add_right_comm a 1 b]
+    simp only [Interp.steps]
+    cases h : Interp.step m with
+    | error e => simp
+    | ok m1 => simp [ih]
 
-/-- From `StartRel` (Anneal at `(0, 0)` and MiniRust at `f.start`), one
-`Machine::step` executes `minimize`'s `initBlock` (`Goto(bb0)`) and lands in
-`StateRel`. -/
-theorem step_start {body : CapturedMir} {f : Gen.Function} (hf : translateFn body = some f)
-    {ctx : Ctx} {s : MachineState} {mInit : Mach} (hstart : StartRel body f ctx s mInit) :
-    ∃ m0, Interp.step mInit = .ok m0 ∧ StateRel body f ctx s m0 := by
-  obtain ⟨hfstart, _⟩ := translateFn_start body f hf
-  have hframe : { calleeFrame f ctx body.localDecls.length 0 0 with next_block := f.start } =
-      calleeFrame f ctx body.localDecls.length body.basicBlocks.length 0 := by
-    simp [calleeFrame, hfstart]
-  have hshape : Shape mInit ctx
-      [ctx.caller, calleeFrame f ctx body.localDecls.length body.basicBlocks.length 0]
-      (ctx.base ++ localAllocs ctx body.localDecls s.frame.locals) :=
-    ⟨hframe ▸ hstart.threads, hstart.active, hstart.allocs⟩
-  obtain ⟨m0, hm0, h0⟩ := step_initBlock hf hshape
-  refine ⟨m0, hm0, {
-    threads := by simpa [hstart.blk0, hstart.stmt0] using h0.threads
+theorem steps_one {m m' : Mach} (h : Interp.step m = .ok m') : Interp.steps 1 m = .ok m' := by
+  simp [Interp.steps, h]
+
+/-- The number of MiniRust steps of `minimize`'s init block: one per
+`StorageLive` of `alwaysStorageLiveLocals`, then `Goto(bb0)`. -/
+def initLen (body : CapturedMir) : Nat := (alwaysStorageLiveLocals body).length + 1
+
+theorem alwaysStorageLiveLocals_spec {body : CapturedMir} {j : Nat}
+    (h : j ∈ alwaysStorageLiveLocals body) : body.argCount + 1 ≤ j ∧ j < body.localDecls.length := by
+  simp only [alwaysStorageLiveLocals, List.mem_filter, List.mem_range, Bool.and_eq_true,
+    decide_eq_true_eq] at h
+  exact ⟨h.2.1, h.1⟩
+
+theorem alwaysStorageLiveLocals_nodup (body : CapturedMir) : (alwaysStorageLiveLocals body).Nodup :=
+  List.Nodup.sublist List.filter_sublist List.nodup_range
+
+/-- At `f.start`, the locals map holds the return place and the arguments in
+their initial allocations, and no temporary of the init block is allocated
+yet. -/
+theorem StartRel.localsOk {body : CapturedMir} {f : Gen.Function} {ctx : Ctx} {s : MachineState}
+    {mInit : Mach} (hstart : StartRel body f ctx s mInit)
+    (hargs : body.argCount + 1 ≤ body.localDecls.length) :
+    LocalsOkA body ctx [] s.frame.locals (localsMap ctx (body.argCount + 1))
+      mInit.mem.memory.allocations := by
+  have hmap : ∀ j, mapGet (localsMap ctx (body.argCount + 1)) (localName j) =
+      if j < body.argCount + 1 then some (localPtr ctx j) else none := by
+    intro j
+    simp only [localsMap]
+    exact mapGet_range_map _ _ _
+  have hR := hstart.allocs
+  have hn := hstart.nlocals
+  have hLlen : (localAllocs ctx (body.localDecls.take (body.argCount + 1)) s.frame.locals).length =
+      body.argCount + 1 := by
+    simp [localAllocs, localAllocsFrom_length, hn]; omega
+  have hget : ∀ (i : Nat) d slot, i < body.argCount + 1 → body.localDecls[i]? = some d →
+      s.frame.locals[i]? = some slot →
+      mInit.mem.memory.allocations[ctx.base.length + i]? =
+        some (stackAlloc (ctx.addrs.getD i 0) (itOf d) (declSlotData d slot)) := by
+    intro i d slot hi hd hs
+    rw [hR, List.getElem?_append_right (by omega)]
+    simp only [Nat.add_sub_cancel_left, localAllocs]
+    rw [localAllocsFrom_getElem? ctx 0 _ _ i d slot (by rw [List.getElem?_take_of_lt hi]; exact hd) hs]
+    simp [localAlloc]
+  refine {
+    nlocals := hn
+    slots := hstart.slots
+    base := ⟨_, hR⟩
+    keysNodup := ?_
+    keysLocal := ?_
+    live := ?_
+    storage := ?_
+    inj := ?_
+    owned := ?_ }
+  · simp only [localsMap, List.map_map]
+    exact nodup_map_of_inj_on _ _ List.nodup_range
+      (fun x _ y _ h => by simpa [Function.comp, localName_inj] using h)
+  · intro e he
+    simp only [localsMap, List.mem_map, List.mem_range] at he
+    obtain ⟨i, hi, rfl⟩ := he
+    exact ⟨i, by omega, rfl⟩
+  · intro i slot hs
+    have hil : i < body.localDecls.length := by
+      rw [← hn]; exact (List.getElem?_eq_some_iff.mp hs).1
+    rw [hmap i]
+    split
+    · next hi =>
+      simp only [Option.isSome_some, true_iff]
+      exact .inl (hstart.argsLive i slot (by omega) hs)
+    · next hi =>
+      have := hstart.tempsDead i (by omega) hil
+      rw [hs] at this
+      cases this
+      simp
+  · intro i d slot p hd hs hp
+    rw [hmap i] at hp
+    split at hp
+    · next hi =>
+      cases hp
+      exact ⟨ctx.base.length + i, rfl, by omega, (hstart.addrs i d hd).1,
+        .inl (hstart.addrs i d hd).2, hget i d slot hi hd hs⟩
+    · cases hp
+  · intro i j p q hp hq hpq
+    rw [hmap] at hp hq
+    split at hp <;> split at hq <;> simp only [Option.some.injEq, reduceCtorEq] at hp hq
+    subst hp hq
+    simp only [localPtr, Option.some.injEq, Prod.mk.injEq, and_true] at hpq
+    have : ((ctx.base.length + i : Nat) : Int) = ((ctx.base.length + j : Nat) : Int) := by
+      simpa using congrArg (fun x => x._0) hpq
+    omega
+  · intro id a ha hlive hb
+    have hlt : id - ctx.base.length < body.argCount + 1 := by
+      have := (List.getElem?_eq_some_iff.mp ha).1
+      rw [hR, List.length_append, hLlen] at this
+      omega
+    refine ⟨id - ctx.base.length, localPtr ctx (id - ctx.base.length), by rw [hmap]; simp [hlt], ?_⟩
+    simp only [localPtr]
+    congr
+    omega
+
+/-- **Init block.** From `StartRel` (Anneal at `(0, 0)` and MiniRust at
+`f.start`), `initLen body` MiniRust steps execute `minimize`'s init block
+(`StorageLive` of each temporary of `alwaysStorageLiveLocals`, then
+`Goto(bb0)`) and land in `StateRel`. -/
+theorem step_start {body : CapturedMir} {f : Gen.Function} (hfrag : inFragment body = true)
+    (hf : translateFn body = some f) {ctx : Ctx} {s : MachineState} {mInit : Mach}
+    (hstart : StartRel body f ctx s mInit) :
+    ∃ m0, Interp.steps (initLen body) mInit = .ok m0 ∧ StateRel body f ctx s m0 := by
+  obtain ⟨_, hargs, hn31, _, _, _, _⟩ := inFragment_spec body hfrag
+  obtain ⟨hfstart, hinit⟩ := translateFn_start body f hf
+  have hAnd := alwaysStorageLiveLocals_nodup body
+  have hlenS : (initBlock body).statements.length = (alwaysStorageLiveLocals body).length := by
+    simp [initBlock]
+  -- The init-block invariant after `k` steps.
+  have key : ∀ k, k ≤ (alwaysStorageLiveLocals body).length → ∃ m lm,
+      Interp.steps k mInit = .ok m ∧
+      Shape m ctx [ctx.caller, calleeFrameL f ctx lm body.basicBlocks.length k]
+        m.mem.memory.allocations ∧
+      LocalsOkA body ctx ((alwaysStorageLiveLocals body).take k) s.frame.locals lm
+        m.mem.memory.allocations := by
+    intro k
+    induction k with
+    | zero =>
+      intro _
+      refine ⟨mInit, localsMap ctx (body.argCount + 1), rfl, ⟨?_, hstart.active, rfl⟩,
+        by simpa using hstart.localsOk hargs⟩
+      rw [hstart.threads]
+      simp [calleeFrame, calleeFrameL, hfstart]
+    | succ k ih =>
+      intro hk
+      obtain ⟨m, lm, hm, hsh, hlo⟩ := ih (by omega)
+      have hkA : k < (alwaysStorageLiveLocals body).length := by omega
+      obtain ⟨hlo1, hlo2⟩ := alwaysStorageLiveLocals_spec
+        (List.getElem_mem (l := alwaysStorageLiveLocals body) hkA)
+      have hnot : (alwaysStorageLiveLocals body)[k] ∉ (alwaysStorageLiveLocals body).take k := by
+        intro hmem
+        obtain ⟨j, hj, hjk⟩ := List.getElem_of_mem hmem
+        rw [List.getElem_take] at hjk
+        have := hAnd.getElem_inj.mp hjk
+        simp at hj
+        omega
+      have hst : (initBlock body).statements[k]? =
+          some (.StorageLive (localName (alwaysStorageLiveLocals body)[k])) := by
+        simp [initBlock, List.getElem?_map, List.getElem?_eq_getElem hkA]
+      have htake : (alwaysStorageLiveLocals body).take (k + 1) =
+          (alwaysStorageLiveLocals body).take k ++ [(alwaysStorageLiveLocals body)[k]] := by
+        rw [List.take_add_one, List.getElem?_eq_getElem hkA, Option.toList_some]
+      generalize (alwaysStorageLiveLocals body)[k] = a at hnot hlo1 hlo2 hst htake
+      obtain ⟨d, hd⟩ : ∃ d, body.localDecls[a]? = some d := ⟨_, List.getElem?_eq_getElem hlo2⟩
+      have hsa : s.frame.locals[a]? = some .dead := hstart.tempsDead a (by omega) hlo2
+      have hpa : mapGet lm (localName a) = none := by
+        cases hp : mapGet lm (localName a) with
+        | none => rfl
+        | some p =>
+          have := (hlo.live a .dead hsa).mp (by simp [hp])
+          simp [hnot] at this
+      obtain ⟨m3, lm3, hm3, hsh3, hlo3⟩ := evalStatement_storageLive_init hf (resetPick_shape hsh)
+        hlo a d hd hsa hpa hstart.baseLow hn31
+      obtain ⟨m4, hm4, h4⟩ := bumpStmt_callee hsh3
+      have hne : ((k : Nat) : Int) ≠ ((initBlock body).statements.length : Int) := by
+        rw [hlenS]; omega
+      have hstep : Interp.step m = .ok m4 := by
+        rw [step_callee hsh (initBlock body) hinit]
+        simp [hne, listIndex_nat _ _ _ hst, hm3, hm4, check_after h4]
+      refine ⟨m4, lm3, ?_, ⟨h4.threads, h4.active, rfl⟩, ?_⟩
+      · rw [steps_add, hm, ok_bind, steps_one hstep]
+      · rw [htake, h4.allocs]
+        exact hlo3
+  obtain ⟨m, lm, hm, hsh, hlo⟩ := key _ (Nat.le_refl _)
+  rw [List.take_length] at hlo
+  obtain ⟨m0, hm0, h0⟩ := jumpToBlock_callee (resetPick_shape hsh) 0
+  have hif : (((alwaysStorageLiveLocals body).length : Nat) : Int) =
+      ((initBlock body).statements.length : Int) := by rw [hlenS]
+  have hstep : Interp.step m = .ok m0 := by
+    rw [step_callee hsh (initBlock body) hinit]
+    simp [hif, initBlock, Interp.evalTerminator, hm0, check_after h0]
+  refine ⟨m0, by rw [initLen, steps_add, hm, ok_bind, steps_one hstep], s.frame.locals, ?_⟩
+  have hn0 : 0 < body.localDecls.length := by omega
+  exact {
+    frame := ⟨lm, by rw [hstart.blk0, hstart.stmt0]; exact h0.threads,
+      by rw [h0.allocs]; exact hlo⟩
     active := h0.active
-    allocs := h0.allocs
     blk := by rw [hstart.blk0]; exact hstart.hasBlocks
     stmt := fun _ _ => by rw [hstart.stmt0]; exact Nat.zero_le _
-    nlocals := hstart.nlocals
-    slots := hstart.slots
-    addrs := hstart.addrs
+    stale := ⟨rfl, fun j hj => absurd rfl hj⟩
+    retLive := by
+      obtain ⟨slot0, hs0⟩ : ∃ slot, s.frame.locals[0]? = some slot :=
+        ⟨_, List.getElem?_eq_getElem (by rw [hstart.nlocals]; exact hn0)⟩
+      rw [hs0]
+      simpa using hstart.argsLive 0 slot0 (Nat.zero_le _) hs0
     ret := hstart.ret
+    baseLow := hstart.baseLow
     borrows := hstart.borrows
     callStack := hstart.callStack
     activeCallee := hstart.activeCallee
     protectors := hstart.protectors
-    callerLocals := hstart.callerLocals
-  }⟩
+    callerLocals := hstart.callerLocals }
 
-theorem initLocalsAux_one_spec (ds : List LocalDecl) (vs : List Value)
-    (h : argsOkAux ds vs = true) :
-    (initLocalsAux 1 ds vs).length = ds.length ∧
-    ∀ (k : Nat) d slot, ds[k]? = some d → (initLocalsAux 1 ds vs)[k]? = some slot →
-      SlotOk (tyOf d) slot := by
-  induction ds generalizing vs with
+theorem initLocalsAux_spec (ds : List LocalDecl) (vs : List Value) (idx : Nat)
+    (h : argsOkAux (ds.take vs.length) vs = true) (hlen : vs.length ≤ ds.length) :
+    (initLocalsAux (idx + 1) ds vs).length = ds.length ∧
+    (∀ (j : Nat) d slot, ds[j]? = some d → (initLocalsAux (idx + 1) ds vs)[j]? = some slot →
+      SlotOk (tyOf d) slot) ∧
+    (∀ (j : Nat) slot, j < vs.length → (initLocalsAux (idx + 1) ds vs)[j]? = some slot →
+      slot ≠ .dead) ∧
+    (∀ (j : Nat), vs.length ≤ j → j < ds.length → (initLocalsAux (idx + 1) ds vs)[j]? = some .dead) := by
+  induction ds generalizing vs idx with
   | nil =>
     cases vs with
     | nil => simp [initLocalsAux]
-    | cons _ _ => simp [argsOkAux] at h
+    | cons _ _ => simp at hlen
   | cons d ds ih =>
     cases vs with
-    | nil => simp [argsOkAux] at h
+    | nil =>
+      have hcons : initLocalsAux (idx + 1) (d :: ds) [] = .dead :: initLocalsAux (idx + 1) ds [] :=
+        rfl
+      obtain ⟨hl, hs, _, hd⟩ := ih [] idx (by simp [argsOkAux]) (by simp)
+      rw [hcons]
+      refine ⟨by simp [hl], fun j d' slot hd' hs' => ?_, fun j _ hj => by simp at hj, fun j _ hj => ?_⟩
+      · cases j with
+        | zero => simp at hs'; subst hs'; trivial
+        | succ j => simp at hd' hs'; exact hs j d' slot hd' hs'
+      · cases j with
+        | zero => rfl
+        | succ j => simpa using hd j (Nat.zero_le _) (by simpa using hj)
     | cons v vs =>
-      simp only [argsOkAux, Bool.and_eq_true] at h
+      simp only [List.length_cons, List.take_succ_cons, argsOkAux, Bool.and_eq_true] at h
       obtain ⟨hv, hvs⟩ := h
-      obtain ⟨hlen, hslots⟩ := ih vs hvs
+      have hcons : initLocalsAux (idx + 1) (d :: ds) (v :: vs) =
+          .init v :: initLocalsAux (idx + 1) ds vs := rfl
+      obtain ⟨hl, hs, hlive, hd⟩ := ih vs idx hvs (by simpa using hlen)
       have hvslot : SlotOk (tyOf d) (.init v) := by
         match v, hv with
         | .scalar sc, hv =>
@@ -765,42 +1433,62 @@ theorem initLocalsAux_one_spec (ds : List LocalDecl) (vs : List Value)
           | some it =>
             simp only [ht, Bool.and_eq_true, decide_eq_true_eq] at hv
             exact ⟨it, ht, hv.1.1.1, hv.1.1.2, hv.1.2, hv.2⟩
-      have hcons : initLocalsAux 1 (d :: ds) (v :: vs) = .init v :: initLocalsAux 1 ds vs := rfl
       rw [hcons]
-      refine ⟨by simp [hlen], fun k d' slot' hd' hs' => ?_⟩
-      cases k with
-      | zero =>
-        simp at hd' hs'
-        subst hd'; subst hs'
-        exact hvslot
-      | succ k =>
-        simp at hd' hs'
-        exact hslots k d' slot' hd' hs'
+      refine ⟨by simp [hl], fun j d' slot hd' hs' => ?_, fun j slot hj hs' => ?_, fun j hj1 hj2 => ?_⟩
+      · cases j with
+        | zero => simp at hd' hs'; subst hd' hs'; exact hvslot
+        | succ j => simp at hd' hs'; exact hs j d' slot hd' hs'
+      · cases j with
+        | zero => simp at hs'; subst hs'; simp
+        | succ j => simp at hs' hj; exact hlive j slot (by omega) hs'
+      · cases j with
+        | zero => simp at hj1
+        | succ j => simpa using hd j (by simp at hj1; omega) (by simpa using hj2)
 
 /-- General entry-state bridge: for any fragment `body`, well-typed `args`, and
 well-formed caller context `ctx`, Anneal's `initMachineState body args`
 (the initial state of `mirCallTree body args`) satisfies `StartRel` against any
-MiniRust machine positioned at `f.start` with matching stack and local
-allocations. -/
+MiniRust machine positioned at `f.start` whose stack holds the callee frame
+with the return place and the arguments, allocated in local order. -/
 theorem initMachineState_startRel {body : CapturedMir} {f : Gen.Function}
     (hfrag : inFragment body = true) (ctx : Ctx) (hctx : CtxOk body ctx)
     (args : List Value) (hargs : argsOk body args = true) (mInit : Mach)
     (hthreads : mInit.threads =
       [thread1 ctx [ctx.caller,
-        { calleeFrame f ctx body.localDecls.length 0 0 with next_block := f.start }]])
+        { calleeFrame f ctx (body.argCount + 1) 0 0 with next_block := f.start }]])
     (hactive : mInit.active_thread = 0)
     (hallocs : mInit.mem.memory.allocations =
-      ctx.base ++ localAllocs ctx body.localDecls (initMachineState body args).frame.locals) :
+      ctx.base ++ localAllocs ctx (body.localDecls.take (body.argCount + 1))
+        (initMachineState body args).frame.locals) :
     StartRel body f ctx (initMachineState body args) mInit := by
   have hbne : body.basicBlocks ≠ [] := by
     simp only [inFragment, Bool.and_eq_true, decide_eq_true_eq] at hfrag
-    exact hfrag.1.1.2
+    exact hfrag.1.1.1.1.1.2
   obtain ⟨_, hdeclLen, _⟩ := inFragment_spec body hfrag
   cases hdecls : body.localDecls with
   | nil => simp [hdecls] at hdeclLen
   | cons d0 ds =>
-    have hargs' : argsOkAux ds args = true := by simpa [argsOk, hdecls] using hargs
-    obtain ⟨hlen, hslots⟩ := initLocalsAux_one_spec ds args hargs'
+    rw [hdecls] at hdeclLen
+    have hargs' : argsOkAux (ds.take body.argCount) args = true := by
+      simpa [argsOk, hdecls] using hargs
+    have hlenA : args.length = body.argCount := by
+      have key : ∀ (ds' : List LocalDecl) (vs : List Value), argsOkAux ds' vs = true →
+          vs.length = ds'.length := by
+        intro ds'
+        induction ds' with
+        | nil => intro vs h; cases vs <;> simp_all [argsOkAux]
+        | cons d' ds' ih =>
+          intro vs h
+          cases vs with
+          | nil => simp [argsOkAux] at h
+          | cons v vs =>
+            simp only [argsOkAux, Bool.and_eq_true] at h
+            simp [ih vs h.2]
+      have := key _ _ hargs'
+      simp at this hdeclLen
+      omega
+    obtain ⟨hlen, hslots, hlive, hdead⟩ :=
+      initLocalsAux_spec ds args 0 (by rw [hlenA]; exact hargs') (by simp at hdeclLen; omega)
     have hinit : (initMachineState body args).frame.locals = .uninit :: initLocalsAux 1 ds args := by
       simp [initMachineState, hdecls, initLocalsAux]
     refine {
@@ -809,27 +1497,37 @@ theorem initMachineState_startRel {body : CapturedMir} {f : Gen.Function}
       allocs := hallocs
       blk0 := rfl
       stmt0 := rfl
-      hasBlocks := by cases hbbs : body.basicBlocks with | nil => exact absurd hbbs hbne | cons _ _ => simp
+      hasBlocks := by
+        cases hbbs : body.basicBlocks with | nil => exact absurd hbbs hbne | cons _ _ => simp
       nlocals := by simp [hinit, hdecls, hlen]
-      slots := by
-        intro i d slot hd hs
-        rw [hdecls] at hd
-        rw [hinit] at hs
-        cases i with
-        | zero =>
-          simp at hd hs
-          subst hd; subst hs
-          trivial
-        | succ k =>
-          simp at hd hs
-          exact hslots k d slot hd hs
+      slots := ?_
+      argsLive := ?_
+      tempsDead := ?_
       addrs := hctx.addrs
       ret := hctx.ret
+      baseLow := hctx.baseLow
       borrows := rfl
       callStack := rfl
       activeCallee := rfl
       protectors := rfl
-      callerLocals := rfl
-    }
+      callerLocals := rfl }
+    · intro i d slot hd hs
+      rw [hdecls] at hd
+      rw [hinit] at hs
+      cases i with
+      | zero => simp at hd hs; subst hs; trivial
+      | succ k => simp at hd hs; exact hslots k d slot hd hs
+    · intro i slot hi hs
+      rw [hinit] at hs
+      cases i with
+      | zero => simp at hs; subst hs; simp
+      | succ k => simp at hs; exact hlive k slot (by omega) hs
+    · intro i hi1 hi2
+      rw [hinit]
+      cases i with
+      | zero => omega
+      | succ k =>
+        simp only [List.getElem?_cons_succ]
+        exact hdead k (by omega) (by rw [hdecls] at hi2; simpa using hi2)
 
 end MiniRustSpec.Correspondence

@@ -83,7 +83,6 @@ open MiniRustSpec.LibSpecr in
 open MiniRustSpec.Correspondence in
 #assert_standard_axioms
   step_correspondence
-  step_initBlock
   step_start
   initMachineState_startRel
   steps_ok_mono
@@ -118,9 +117,8 @@ open MiniRustSpec.Correspondence in
   noRet_of_step_inv
   treeSafe_of_tau_inv
   noRet_of_tau_inv
-  evalReturn_callee
+  evalReturn_frame
   evalStatement_assign
-  evalStatement_placeMention
   evalStatement_placeMention_place
   evalValue_operand
   evalValue_rvalue
@@ -214,8 +212,8 @@ open MiniRustSpec.Correspondence in
   typedStore_local_tuple
   typedLoad_local_localTy
   typedLoad_local_localTy_uninit
-  evalPlace_field0
-  evalPlace_field1
+  evalPlace_field0L
+  evalPlace_field1L
   typedLoad_local_tuple_field0
   typedLoad_local_tuple_field0_uninit
   typedLoad_local_tuple_field1
@@ -232,6 +230,74 @@ open MiniRustSpec.Correspondence in
   evalScalarBinOp_checked
   evalRvalue_fragTuple
   evalStmt_assignTuple
+  inFragment_spec
+  storageDeadOk_spec
+  mentionsOk_stmt
+  mentionsOk_term
+  foldl_moveOut_mem
+  movedBefore_succ
+  movedBefore_sub
+  blockMovesOk_spec
+  movesOk_spec
+  readsOk_mono
+  opsPost_get
+  StaleOk.agree
+  StaleOk.dead_iff
+  StaleOk.slots
+  StaleOk.readsAgree
+  StaleOk.toBlock
+  StaleOk.toBlockMove
+  StaleOk.assign
+  StaleOk.setBoth
+  StaleOk.keep
+  StateRelAt.advance
+  StateRelAt.jump
+  StartRel.localsOk
+  initLocalsAux_spec
+  steps_add
+  moveKind_of_rvalueOk
+  moveKind_of_rvalueOkB
+  moveKind_of_rvalueOkO
+  moveKind_of_rvalueOkTuple
+  evalOperand_move
+  evalOperand_copy_frame
+  evalOperands_move
+  evalRvalue_move
+  evalRvalue_copy_locals
+  evalStmt_assign_move
+  evalScalarBinOp_locals
+  evalUnaryNot_locals
+  readsOk_spec
+  opBits_frame
+  rvBits_frame
+  rvBitsB_frame
+  rvBitsO_frame
+  rvTupleBits_frame
+  evalStmt_storageLive
+  evalStmt_storageDead
+  evalStmt_deinit
+  evalStmt_placeMention_dead
+  evalStatement_storageLive
+  evalStatement_storageLive_init
+  evalStatement_storageDead
+  evalStatement_deinit
+  evalStatement_assign_dead
+  storageDead_some
+  storageDead_none
+  storageDead_none'
+  BM_allocate_local
+  firstFitAddr_spec
+  allocAddrOk_cand
+  overlaps_low
+  overlaps_cand
+  LocalsOkA.free_candidate
+  LocalsOkA.alloc'
+  LocalsOk.alloc
+  LocalsOk.killLocal
+  LocalsOk.forget
+  LocalsOkA.teardown
+  deallocAll_gen
+  killAt_append_dead
 
 open MiniRustSpec.Correspondence.Witness in
 #assert_standard_axioms
@@ -599,6 +665,28 @@ open MiniRustSpec.Correspondence.Witness in
   evalPlace_field_panics
   evalBinOp_withOverflow_all_widths
   evalPlace_field_union_and_offset_panic
+  tempMove_inFragment
+  tempMove_alwaysLive
+  tempMove_translate
+  ctx0_ok_tempMove
+  tempMove_initLen
+  tempMove3_anneal_ret
+  tempMove3_noUB
+  tempMove3_minirust_ret_from_start
+  tempMove3_minirust_direct
+  tempMove2_anneal_ret
+  tempMove2_minirust_ret_from_start
+  tempMove2_minirust_direct
+  deadRead_inFragment
+  deadRead_translate
+  deadRead_anneal_ub
+  deadRead_minirust_ub_from_start
+  deadRead_minirust_direct
+  moveReuse_movesOk
+  moveReuse_not_inFragment
+  moveReuse_translate
+  moveReuse7_anneal_ub
+  moveReuse7_minirust_direct
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -611,7 +699,7 @@ open MiniRustSpec.Correspondence.Witness in
 open MiniRustSpec.Correspondence in
 #check_theorem_deps "[SIMULATION-AUDIT]"
   step_correspondence
-  step_initBlock
+  evalReturn_frame
   step_start
   initMachineState_startRel
   run_ret
@@ -673,8 +761,8 @@ open MiniRustSpec.Correspondence in
   typedStore_local_tuple
   typedLoad_local_localTy
   typedLoad_local_localTy_uninit
-  evalPlace_field0
-  evalPlace_field1
+  evalPlace_field0L
+  evalPlace_field1L
   typedLoad_local_tuple_field0
   typedLoad_local_tuple_field0_uninit
   typedLoad_local_tuple_field1
@@ -693,6 +781,74 @@ open MiniRustSpec.Correspondence in
   evalStmt_assignTuple
   evalStatement_placeMention_place
   evalStmt_placeMention_place
+  inFragment_spec
+  storageDeadOk_spec
+  mentionsOk_stmt
+  mentionsOk_term
+  foldl_moveOut_mem
+  movedBefore_succ
+  movedBefore_sub
+  blockMovesOk_spec
+  movesOk_spec
+  readsOk_mono
+  opsPost_get
+  StaleOk.agree
+  StaleOk.dead_iff
+  StaleOk.slots
+  StaleOk.readsAgree
+  StaleOk.toBlock
+  StaleOk.toBlockMove
+  StaleOk.assign
+  StaleOk.setBoth
+  StaleOk.keep
+  StateRelAt.advance
+  StateRelAt.jump
+  StartRel.localsOk
+  initLocalsAux_spec
+  steps_add
+  moveKind_of_rvalueOk
+  moveKind_of_rvalueOkB
+  moveKind_of_rvalueOkO
+  moveKind_of_rvalueOkTuple
+  evalOperand_move
+  evalOperand_copy_frame
+  evalOperands_move
+  evalRvalue_move
+  evalRvalue_copy_locals
+  evalStmt_assign_move
+  evalScalarBinOp_locals
+  evalUnaryNot_locals
+  readsOk_spec
+  opBits_frame
+  rvBits_frame
+  rvBitsB_frame
+  rvBitsO_frame
+  rvTupleBits_frame
+  evalStmt_storageLive
+  evalStmt_storageDead
+  evalStmt_deinit
+  evalStmt_placeMention_dead
+  evalStatement_storageLive
+  evalStatement_storageLive_init
+  evalStatement_storageDead
+  evalStatement_deinit
+  evalStatement_assign_dead
+  storageDead_some
+  storageDead_none
+  storageDead_none'
+  BM_allocate_local
+  firstFitAddr_spec
+  allocAddrOk_cand
+  overlaps_low
+  overlaps_cand
+  LocalsOkA.free_candidate
+  LocalsOkA.alloc'
+  LocalsOk.alloc
+  LocalsOk.killLocal
+  LocalsOk.forget
+  LocalsOkA.teardown
+  deallocAll_gen
+  killAt_append_dead
 
 open MiniRustSpec.Correspondence.Witness in
 #check_theorem_deps "[WITNESS-AUDIT]"
@@ -901,6 +1057,28 @@ open MiniRustSpec.Correspondence.Witness in
   sumTo_minirust_ret_from_start
   castBitNot4_minirust_ret_from_start
   uninitSwitchUb_minirust_ub_from_start
+  tempMove_inFragment
+  tempMove_alwaysLive
+  tempMove_translate
+  ctx0_ok_tempMove
+  tempMove_initLen
+  tempMove3_anneal_ret
+  tempMove3_noUB
+  tempMove3_minirust_ret_from_start
+  tempMove3_minirust_direct
+  tempMove2_anneal_ret
+  tempMove2_minirust_ret_from_start
+  tempMove2_minirust_direct
+  deadRead_inFragment
+  deadRead_translate
+  deadRead_anneal_ub
+  deadRead_minirust_ub_from_start
+  deadRead_minirust_direct
+  moveReuse_movesOk
+  moveReuse_not_inFragment
+  moveReuse_translate
+  moveReuse7_anneal_ub
+  moveReuse7_minirust_direct
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

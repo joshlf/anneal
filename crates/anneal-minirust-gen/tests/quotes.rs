@@ -1460,8 +1460,9 @@ fn with_overflow_tuple_and_field_quotations_are_pinned() {
 /// The upstream items behind `MR-1.3`: arbitrary locals, `StorageLive`,
 /// `StorageDead`, `Statement::Deinit`, `ConcurrentMemory::deinit`,
 /// `ConcurrentMemory::allocate`, `BasicMemory::allocate`, `Allocation::overlaps`,
-/// `x86_64::valid_size`, `Machine::try_mutate_cur_frame`, `Operand::Move`, and
-/// `initBlock` (`always_storage_live_locals`).
+/// `x86_64::valid_size`, `Machine::try_mutate_cur_frame`, `Operand::Move`,
+/// `initBlock` (`always_storage_live_locals`), and the predicate of the daemonic
+/// address choice (`pick`) in `BasicMemory::allocate`.
 #[test]
 fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
     let corpus = corpus();
@@ -1508,6 +1509,17 @@ fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
              self.allocations.push(allocation); \
              ret(ThinPointer { addr, provenance: Some((id, prov_extra)) })",
             "live: false, data: list![AbstractByte::Uninit; size.bytes()],",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            basic,
+            "let addr = pick(distr, |addr: Address| { .. \
+             if addr <= 0 { return false; } .. \
+             if !align.is_aligned(addr) { return false; } .. \
+             if !(addr+size.bytes()).in_bounds(Unsigned, T::PTR_SIZE) { return false; } .. \
+             if self.allocations.any(|a| a.live && a.overlaps(addr, size)) { return false; } .. \
+             true })?;",
+            "if self.allocations.any(|a| a.overlaps(addr, size)) { return false; }",
             "MiniRustSpec/Interp.lean",
         ),
         (
@@ -1606,7 +1618,7 @@ fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
             "MiniRustSpec/Correspondence/Translate.lean",
         ),
     ];
-    assert_eq!(cases.len(), 13, "expected 13 pinned MR-1.3 quotations");
+    assert_eq!(cases.len(), 14, "expected 14 pinned MR-1.3 quotations");
 
     let lean_root = minirust_dir().join("lean");
     for (file, genuine, tampered, lean_file) in cases {
