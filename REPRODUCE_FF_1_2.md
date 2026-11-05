@@ -30,3 +30,6 @@ Compile the full `Anneal` Lean 4 workspace using the provided bounding script:
 cd examples && anneal-lean-run --mode build --concurrency 2 -- lake build Anneal
 ```
 The build completes successfully, indicating 0 errors and all theorems (like `mirTraceWpConverges_wpTransPlanConverges`, `mirTraceWpConverges_forRangeUp`, and `mirTraceWpConverges_whileRank`) are verified by the Lean kernel.
+
+## Audit Note
+`[diversity-reduced]`: This adversarial proof unit was evaluated under reduced model diversity (the agent pool was pinned to `gemini-pro-coordinator` due to a model policy assignment) rather than alternating Anthropic/Google models.
