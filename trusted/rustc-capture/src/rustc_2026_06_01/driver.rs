@@ -288,6 +288,9 @@ fn capture_crate_unit<'tcx>(
             candidate.classification.contract_role.clone(),
         );
         ir_captured.def_path = candidate.def_path.clone();
+        for ti in &mut ir_captured.trait_impls {
+            ti.impl_path = candidate.def_path.clone();
+        }
 
         let item_stem = candidate.item_stem;
         let lean_module_name = format!("Mir.{crate_pascal}.{item_stem}");
@@ -305,6 +308,19 @@ fn capture_crate_unit<'tcx>(
             format!("failed to write MIR Lean module `{}`: {e}", mir_full_path.display())
         })?;
 
+        let mut manifest_trait_impls = Vec::new();
+        for ti in ir_captured.trait_impls {
+            let mut trait_args_lean = Vec::new();
+            for arg in ti.trait_ref.args {
+                trait_args_lean.push(crate::lean_emit::render_rigid_ty_pub(&arg));
+            }
+            manifest_trait_impls.push(crate::manifest::ManifestTraitImplEntry {
+                trait_method_def_path: ti.trait_ref.def_path,
+                trait_args_lean,
+                impl_path: ti.impl_path,
+            });
+        }
+
         unit_targets.push(UnitTargetRecord {
             target: CapturedTarget {
                 def_id: candidate.def_path,
@@ -314,6 +330,7 @@ fn capture_crate_unit<'tcx>(
             lean_module_name,
             item_kind: candidate.classification.item_kind,
             associated_subject_def_id: candidate.classification.associated_subject_def_id,
+            trait_impls: manifest_trait_impls,
         });
     }
 
@@ -472,6 +489,16 @@ pub fn sanitize_item_module_stem(crate_name: &str, def_path: &str) -> String {
     } else {
         out
     }
+}
+
+/// Returns the hierarchical Lean module segments `["Mir", "<CratePascal>", "<ItemStem>"]`
+/// for a canonical `def_path` in `crate_name`.
+pub fn lean_module_segments_for_def_path(crate_name: &str, def_path: &str) -> Vec<String> {
+    vec![
+        String::from("Mir"),
+        to_pascal_case(crate_name),
+        sanitize_item_module_stem(crate_name, def_path),
+    ]
 }
 
 /// Normalizes command-line arguments when invoked either directly or via Cargo

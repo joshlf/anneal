@@ -3300,7 +3300,7 @@ def evalPlaceWrite
           .nil
       | .deref :: restProj =>
         match get? locals dst.local_ with
-| .some (.init ptrOrFatVal) =>
+        | .some (.init ptrOrFatVal) =>
           match extractDerefPtrVal? ptrOrFatVal with
           | .some ptrVal =>
             match lookupBorrow borrows ptrVal.tag with
@@ -3313,20 +3313,19 @@ def evalPlaceWrite
                   entry
                   restProj
               match borrows with
-                          | b₁ :: b₂ :: restBorrows =>
-                            let allBorrows := b₁ :: b₂ :: restBorrows
-                            hasProtectedTreeWriteConflict
-                              allBorrows
-                              allBorrows
-                              activeProtectors
-                              entry.targetLocal
-                              (.some ptrVal.tag)
-                              fullProj
-                              entry.rangeOffset
-                              entry.rangeLen
-                          | _ =>
-
-              hasProtectedWriteConflict
+              | b₁ :: b₂ :: restBorrows =>
+                let allBorrows := b₁ :: b₂ :: restBorrows
+                hasProtectedTreeWriteConflict
+                  allBorrows
+                  allBorrows
+                  activeProtectors
+                  entry.targetLocal
+                  (.some ptrVal.tag)
+                  fullProj
+                  entry.rangeOffset
+                  entry.rangeLen
+              | _ =>
+                hasProtectedWriteConflict
                 borrows
                 activeProtectors
                 entry.targetLocal
@@ -3523,33 +3522,32 @@ def evalCallerPlaceWrite
       match dst.projection with
       | .deref :: restProj =>
         match get? frameLocals dst.local_ with
-| .some (.init ptrOrFatVal) =>
+        | .some (.init ptrOrFatVal) =>
           match extractDerefPtrVal? ptrOrFatVal with
           | .some ptrVal =>
             match lookupBorrow borrows ptrVal.tag with
             | .some entry =>
               let fullProj :=
                 resolveDerefWriteFullProj
-                  locals
-                  locals
+                  frameLocals
+                  callerLocals
                   ptrOrFatVal
                   entry
                   restProj
               match borrows with
-                          | b₁ :: b₂ :: restBorrows =>
-                            let allBorrows := b₁ :: b₂ :: restBorrows
-                            hasProtectedTreeWriteConflict
-                              allBorrows
-                              allBorrows
-                              activeProtectors
-                              entry.targetLocal
-                              (.some ptrVal.tag)
-                              fullProj
-                              entry.rangeOffset
-                              entry.rangeLen
-                          | _ =>
-
-              hasProtectedWriteConflict
+              | b₁ :: b₂ :: restBorrows =>
+                let allBorrows := b₁ :: b₂ :: restBorrows
+                hasProtectedTreeWriteConflict
+                  allBorrows
+                  allBorrows
+                  activeProtectors
+                  entry.targetLocal
+                  (.some ptrVal.tag)
+                  fullProj
+                  entry.rangeOffset
+                  entry.rangeLen
+              | _ =>
+                hasProtectedWriteConflict
                 borrows
                 activeProtectors
                 entry.targetLocal
@@ -3931,13 +3929,563 @@ def reifyCoercionSafetyCompatible
     | false => true
 
 /--
-Validate that a linked callee `p` in `callees` (when present) is compatible with
-the target function-pointer signature `(fnInputs, fnOutput, fnAbi)` during
-`ReifyFnPointer`:
-1. Rejects `CallConv.rustIntrinsic` callees (compiler intrinsics cannot be
+Look up a callee `CapturedMir` body in `callees` by its canonical `DefPath`.
+-/
+def findCallee? : List CapturedMir → DefPath → Option CapturedMir
+  | .nil, _ => .none
+  | body :: rest, defPath =>
+    match stringEq body.defPath defPath with
+    | true => .some body
+    | false => findCallee? rest defPath
+
+mutual
+/--
+Match a potentially parametric pattern `pat : RigidTy` from a `TraitImplEntry`
+header (`TraitRef.args`) against a call-site type argument `arg : RigidTy`,
+accumulating `(paramIdx, boundTy)` bindings in `subst` and enforcing equality
+when the same `RigidTy.param` index occurs multiple times (rejecting mismatched
+diagonal instantiations such as `Pair<u32, u64>` against `Pair<T, T>`).
+
+Reference (The Rust Reference, "Trait implementations"):
+<https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
+
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
+-/
+def matchRigidTy (pat arg : RigidTy) (subst : List (Nat × RigidTy)) : Option (List (Nat × RigidTy)) :=
+  match pat with
+  | .param pIdx _ =>
+    let rec lookupSubst (idx : Nat) : List (Nat × RigidTy) → Option RigidTy
+      | .nil => Option.none
+      | (k, v) :: rest => if k == idx then Option.some v else lookupSubst idx rest
+    match lookupSubst pIdx subst with
+    | Option.some existing => if rigidTyEq existing arg then Option.some subst else Option.none
+    | Option.none => Option.some ((pIdx, arg) :: subst)
+  | .tuple pFields =>
+    match arg with
+    | .tuple aFields => matchRigidTyList pFields aFields subst
+    | _ => Option.none
+  | .array pElem pLen =>
+    match arg with
+    | .array aElem aLen =>
+      if pLen == aLen then matchRigidTy pElem aElem subst else Option.none
+    | _ => Option.none
+  | .slice pElem =>
+    match arg with
+    | .slice aElem => matchRigidTy pElem aElem subst
+    | _ => Option.none
+  | .ref pMut pPointee =>
+    match arg with
+    | .ref aMut aPointee =>
+      if mutabilityEq pMut aMut then matchRigidTy pPointee aPointee subst else Option.none
+    | _ => Option.none
+  | .rawPtr pMut pPointee =>
+    match arg with
+    | .rawPtr aMut aPointee =>
+      if mutabilityEq pMut aMut then matchRigidTy pPointee aPointee subst else Option.none
+    | _ => Option.none
+  | .adt pDefPath pArgs =>
+    match arg with
+    | .adt aDefPath aArgs =>
+      if stringEq pDefPath aDefPath then matchRigidTyList pArgs aArgs subst else Option.none
+    | _ => Option.none
+  | .fnDef pDefPath pArgs =>
+    match arg with
+    | .fnDef aDefPath aArgs =>
+      if stringEq pDefPath aDefPath then matchRigidTyList pArgs aArgs subst else Option.none
+    | _ => Option.none
+  | .fnPtr pIns pOut pSaf pAbi =>
+    match arg with
+    | .fnPtr aIns aOut aSaf aAbi =>
+      if Bool.and (safetyEq pSaf aSaf) (callConvEq pAbi aAbi) then
+        match matchRigidTyList pIns aIns subst with
+        | Option.some s => matchRigidTy pOut aOut s
+        | Option.none => Option.none
+      else
+        Option.none
+    | _ => Option.none
+  | .closure pDefPath pUpvars =>
+    match arg with
+    | .closure aDefPath aUpvars =>
+      if stringEq pDefPath aDefPath then matchRigidTyList pUpvars aUpvars subst else Option.none
+    | _ => Option.none
+  | .alias pDefPath pArgs =>
+    match arg with
+    | .alias aDefPath aArgs =>
+      if stringEq pDefPath aDefPath then matchRigidTyList pArgs aArgs subst else Option.none
+    | _ => Option.none
+  | _ =>
+    if rigidTyEq pat arg then Option.some subst else Option.none
+
+/--
+Pointwise pattern matching of `pats : List RigidTy` against `args : List RigidTy`,
+threading parameter bindings `subst`.
+
+Reference (The Rust Reference, "Trait implementations"):
+<https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
+
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
+-/
+def matchRigidTyList (pats args : List RigidTy) (subst : List (Nat × RigidTy)) : Option (List (Nat × RigidTy)) :=
+  match pats, args with
+  | .nil, .nil => Option.some subst
+  | p :: ps, a :: as =>
+    match matchRigidTy p a subst with
+    | Option.some s => matchRigidTyList ps as s
+    | Option.none => Option.none
+  | _, _ => Option.none
+end
+
+/--
+Match a non-empty trait-header pattern list `pats : List RigidTy` against a
+prefix of call-site type arguments `args : List RigidTy`, returning the
+accumulated `impl`-level substitution `subst` together with any trailing
+method-level generic type arguments `restArgs`.
+
+Reference (The Rust Reference, "Trait implementations"):
+<https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
+
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
+-/
+def matchRigidTyPrefix
+    (pats args : List RigidTy)
+    (subst : List (Nat × RigidTy)) :
+    Option (List (Nat × RigidTy) × List RigidTy) :=
+  match pats, args with
+  | .nil, restArgs => Option.some (subst, restArgs)
+  | p :: ps, a :: as =>
+    match matchRigidTy p a subst with
+    | Option.some s => matchRigidTyPrefix ps as s
+    | Option.none => Option.none
+  | _ :: _, .nil => Option.none
+
+/--
+Extract the `count` generic type arguments of an `impl` method body in canonical
+parameter-index order `0 .. count - 1` from pattern-matching substitution `subst`.
+
+Reference (The Rust Reference, "Generic parameters"):
+<https://doc.rust-lang.org/1.98.0/reference/items/generics.html>
+
+> "Functions, type aliases, structs, enumerations, unions, traits, and
+> implementations may be parameterized by types, constants, and lifetimes."
+-/
+def extractImplTypeArgs (subst : List (Nat × RigidTy)) (count : Nat) : Option (List RigidTy) :=
+  if subst.length != count then
+    Option.none
+  else
+    let rec loop : Nat → List RigidTy → Option (List RigidTy)
+      | 0, acc => Option.some acc
+      | i + 1, acc =>
+        let rec lookupSubst (idx : Nat) : List (Nat × RigidTy) → Option RigidTy
+          | .nil => Option.none
+          | (k, v) :: rest => if k == idx then Option.some v else lookupSubst idx rest
+        match lookupSubst i subst with
+        | Option.some t => loop i (t :: acc)
+        | Option.none => Option.none
+    loop count .nil
+
+mutual
+/--
+Check that every `RigidTy.param idx _` occurring in `argTy` satisfies
+`idx < numCallerEntries`, ensuring that generic type arguments containing
+unbound parameters (even inside `.ref`, `.rawPtr`, `.fnPtr`, or `.fnDef`) cannot
+bypass layout resolution when `callerLayouts` lacks an entry for `idx`.
+
+Reference (`compiler/rustc_middle/src/ty/sty.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/sty.rs#L282-L285>
+
+> "pub struct ParamTy {
+>     pub index: u32,
+>     pub name: Symbol,
+> }"
+-/
+def allParamsInCallerLayouts (numCallerEntries : Nat) : RigidTy → Bool
+  | .param idx _ => Nat.blt idx numCallerEntries
+  | .alias _ a => allParamsInCallerLayoutsList numCallerEntries a
+  | .tuple fields => allParamsInCallerLayoutsList numCallerEntries fields
+  | .array elem _ => allParamsInCallerLayouts numCallerEntries elem
+  | .slice elem => allParamsInCallerLayouts numCallerEntries elem
+  | .ref _ pointee => allParamsInCallerLayouts numCallerEntries pointee
+  | .rawPtr _ pointee => allParamsInCallerLayouts numCallerEntries pointee
+  | .adt _ a => allParamsInCallerLayoutsList numCallerEntries a
+  | .fnDef _ a => allParamsInCallerLayoutsList numCallerEntries a
+  | .fnPtr inputs output _ _ =>
+    Bool.and
+      (allParamsInCallerLayoutsList numCallerEntries inputs)
+      (allParamsInCallerLayouts numCallerEntries output)
+  | .closure _ upvars => allParamsInCallerLayoutsList numCallerEntries upvars
+  | .bool => true
+  | .char => true
+  | .int _ => true
+  | .uint _ => true
+  | .float _ => true
+  | .never => true
+  | .str => true
+  | .dynamic _ => true
+  | .foreign _ => true
+  | .other _ => true
+
+/--
+Check that every `RigidTy` in a list satisfies `allParamsInCallerLayouts`.
+
+Reference (`compiler/rustc_middle/src/ty/sty.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/sty.rs#L282-L285>
+
+> "pub struct ParamTy {
+>     pub index: u32,
+>     pub name: Symbol,
+> }"
+-/
+def allParamsInCallerLayoutsList (numCallerEntries : Nat) : List RigidTy → Bool
+  | .nil => true
+  | t :: ts =>
+    Bool.and
+      (allParamsInCallerLayouts numCallerEntries t)
+      (allParamsInCallerLayoutsList numCallerEntries ts)
+end
+
+/--
+Collect all `TraitImplEntry` records attached to `callees`.
+
+Reference (The Rust Reference, "Trait implementations"):
+<https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
+
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
+-/
+def flatMapTraitImpls : List CapturedMir → List TraitImplEntry
+  | .nil => .nil
+  | c :: cs => c.traitImpls ++ flatMapTraitImpls cs
+
+/--
+Check whether any `TraitImplEntry` in `traitImpls` targets trait method
+`defPath`.
+
+Reference (The Rust Reference, "Trait implementations"):
+<https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
+
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
+-/
+def hasTraitImplForDefPath
+    (traitImpls : List TraitImplEntry)
+    (defPath : DefPath) :
+    Bool :=
+  match traitImpls with
+  | .nil => false
+  | entry :: rest =>
+    match stringEq entry.traitRef.defPath defPath with
+    | true => true
+    | false => hasTraitImplForDefPath rest defPath
+
+/--
+Insert `(entry, implTypeArgsOpt)` into `acc` when no entry with the same
+`implPath` is present, or upgrade an existing `(existingEntry, Option.none)`
+with the same `implPath` when `implTypeArgsOpt` is `Option.some _`.
+
+This deduplicates `TraitImplEntry` records by `implPath` while ensuring that an
+already-instantiated copy of a generic `TraitImplEntry` (whose parameter-free
+`traitRef.args` produces `Option.none` against the uninstantiated generic
+callee's `typeParamCount`) cannot shadow the raw generic `TraitImplEntry` for
+the same `implPath`.
+
+Reference (The Rust Reference, "Trait implementations"):
+<https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
+
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
+-/
+def upsertMatchingTraitImpl
+    (entry : TraitImplEntry)
+    (implTypeArgsOpt : Option (List RigidTy)) :
+    List (TraitImplEntry × Option (List RigidTy)) →
+    List (TraitImplEntry × Option (List RigidTy))
+  | .nil => [(entry, implTypeArgsOpt)]
+  | (existingEntry, existingArgsOpt) :: rest =>
+    match stringEq existingEntry.implPath entry.implPath with
+    | true =>
+      match existingArgsOpt, implTypeArgsOpt with
+      | Option.none, Option.some _ =>
+        (entry, implTypeArgsOpt) :: rest
+      | _, _ =>
+        (existingEntry, existingArgsOpt) :: rest
+    | false =>
+      (existingEntry, existingArgsOpt) ::
+        upsertMatchingTraitImpl entry implTypeArgsOpt rest
+
+/--
+Collect all `TraitImplEntry` records in `traitImpls` whose `traitRef.defPath`
+equals `defPath` and whose non-empty `traitRef.args` pattern-matches a prefix of
+`typeArgs`, deduplicating by `entry.implPath` via `upsertMatchingTraitImpl` and
+pairing each matched entry with its validated effective type arguments (or
+`Option.none` if parameter indices are not contiguous, the target `implPath` is
+not in `callees`, or the extracted type-argument count does not match the
+target callee's `typeParamCount`).
+
+Reference (The Rust Reference, "Trait implementations"):
+<https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
+
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
+-/
+def collectMatchingTraitImpls
+    (callees : List CapturedMir)
+    (traitImpls : List TraitImplEntry)
+    (defPath : DefPath)
+    (typeArgs : List RigidTy)
+    (acc : List (TraitImplEntry × Option (List RigidTy)) := .nil) :
+    List (TraitImplEntry × Option (List RigidTy)) :=
+  match traitImpls with
+  | .nil => acc
+  | entry :: rest =>
+    if stringEq entry.traitRef.defPath defPath then
+      match entry.traitRef.args with
+      | .nil => collectMatchingTraitImpls callees rest defPath typeArgs acc
+      | _ :: _ =>
+        match matchRigidTyPrefix entry.traitRef.args typeArgs .nil with
+        | Option.none =>
+          collectMatchingTraitImpls callees rest defPath typeArgs acc
+        | Option.some (subst, methodTypeArgs) =>
+          let rawImplTypeArgsOpt :=
+            match extractImplTypeArgs subst subst.length with
+            | Option.some implHeaderArgs =>
+              Option.some (implHeaderArgs ++ methodTypeArgs)
+            | Option.none => Option.none
+          let implTypeArgsOpt :=
+            match rawImplTypeArgsOpt, findCallee? callees entry.implPath with
+            | Option.some rawArgs, Option.some c =>
+              let effectiveTypeArgs :=
+                match stringEq entry.implPath defPath with
+                | true => typeArgs
+                | false => rawArgs
+              if effectiveTypeArgs.length == c.typeParamCount then
+                Option.some effectiveTypeArgs
+              else
+                Option.none
+            | _, _ => Option.none
+          collectMatchingTraitImpls
+            callees
+            rest
+            defPath
+            typeArgs
+            (upsertMatchingTraitImpl entry implTypeArgsOpt acc)
+    else
+      collectMatchingTraitImpls callees rest defPath typeArgs acc
+
+/--
+Check whether `candidateArgs` is a substitution instance of every matched
+`TraitImplEntry`'s `traitRef.args` in `allMatches`
+(`matchRigidTyList other.traitRef.args candidateArgs .nil ≠ Option.none`).
+
+Reference (The Rust Reference, "Trait implementations"):
+<https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
+
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
+-/
+def isTraitImplInstanceOfAll
+    (candidateArgs : List RigidTy) :
+    List (TraitImplEntry × Option (List RigidTy)) → Bool
+  | .nil => true
+  | (otherEntry, _) :: rest =>
+    match matchRigidTyList otherEntry.traitRef.args candidateArgs .nil with
+    | Option.some _ => isTraitImplInstanceOfAll candidateArgs rest
+    | Option.none => false
+
+/--
+Filter `candidates` to those whose `traitRef.args` is an instance of every
+matched `TraitImplEntry` in `allMatches`.
+
+Reference (The Rust Reference, "Trait implementations"):
+<https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
+
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
+-/
+def filterMostSpecificTraitImpls
+    (allMatches : List (TraitImplEntry × Option (List RigidTy))) :
+    List (TraitImplEntry × Option (List RigidTy)) →
+    List (TraitImplEntry × Option (List RigidTy))
+  | .nil => .nil
+  | (entry, implTypeArgsOpt) :: rest =>
+    match isTraitImplInstanceOfAll entry.traitRef.args allMatches with
+    | true =>
+      (entry, implTypeArgsOpt) ::
+        filterMostSpecificTraitImpls allMatches rest
+    | false =>
+      filterMostSpecificTraitImpls allMatches rest
+
+/--
+Resolve `(defPath, typeArgs)` against `callees` and registered `TraitImplEntry`
+tables (`extraTraitImpls ++ flatMapTraitImpls callees`), returning the matched
+uninstantiated `CapturedMir` body together with its effective `typeArgs`:
+1. When `typeArgs` is `.nil`, looks up `defPath` directly in `callees`.
+2. When `typeArgs` starts with an uninstantiated `.param _ _`, rejects resolution
+   if `defPath` is a trait method in `allTraitImpls` (even if a default trait
+   method body for `defPath` is in `callees`, because an arbitrary concrete
+   `Self` may override the default method), and otherwise resolves direct free
+   generic functions in `callees`.
+3. When `typeArgs` starts with a non-`.param` `firstArg`, collects all
+   `TraitImplEntry` header matches in `allTraitImpls` (deduplicated by
+   `implPath`):
+   - If no `TraitImplEntry` header matches, falls back to `findCallee? callees
+     defPath` (unless `defPath` is a trait method in `allTraitImpls` and
+     `firstArg` still contains an uninstantiated `RigidTy.param`).
+   - If one or more `TraitImplEntry` headers match, selects the unique match
+     whose `traitRef.args` is an instance of every matched entry's
+     `traitRef.args` (never falling back to a default trait method body when a
+     matching override is unlinked, has mismatched arity, or is ambiguous).
+     A winning entry whose `implPath` is `defPath` itself records an `impl`
+     that inherits the trait's default method body; that body is generic over
+     `Self`, so it resolves with the full call-site `typeArgs`.
+
+Header matching ignores `impl` where-clauses. The `TraitImplEntry` table is
+therefore trusted to be complete: if a where-clause-bounded generic `impl`
+(such as `impl<T: Copy> Trait for T`) overrides `defPath`, every more specific
+`impl` that inherits the default method instead needs its own
+`implPath := defPath` entry, or calls on that `impl`'s `Self` resolve to the
+generic override.
+
+Reference (The Rust Reference, "Trait implementations"):
+<https://doc.rust-lang.org/1.98.0/reference/items/implementations.html#trait-implementations>
+
+> "A trait implementation is defined like an inherent implementation except
+> that the optional generic type declarations are followed by a trait, followed
+> by the keyword `for`, followed by a path to a nominal type."
+-/
+def resolveCalleeBodyAndArgs?
+    (callees : List CapturedMir)
+    (defPath : DefPath)
+    (typeArgs : List RigidTy)
+    (extraTraitImpls : List TraitImplEntry := .nil) :
+    Option (CapturedMir × List RigidTy) :=
+  match typeArgs with
+  | .nil =>
+    match findCallee? callees defPath with
+    | Option.some c => Option.some (c, .nil)
+    | Option.none => Option.none
+  | .param _ _ :: _ =>
+    match findCallee? callees defPath with
+    | Option.none => Option.none
+    | Option.some c =>
+      let allTraitImpls := extraTraitImpls ++ flatMapTraitImpls callees
+      match hasTraitImplForDefPath allTraitImpls defPath with
+      | true => Option.none
+      | false => Option.some (c, typeArgs)
+  | firstArg :: restArgs =>
+    let allTraitImpls := extraTraitImpls ++ flatMapTraitImpls callees
+    let matchedImpls :=
+      collectMatchingTraitImpls
+        callees
+        allTraitImpls
+        defPath
+        (firstArg :: restArgs)
+    match matchedImpls with
+    | .nil =>
+      match findCallee? callees defPath with
+      | Option.none => Option.none
+      | Option.some c =>
+        match
+          Bool.and
+            (hasTraitImplForDefPath allTraitImpls defPath)
+            (Bool.not (allParamsInCallerLayouts 0 firstArg))
+        with
+        | true => Option.none
+        | false => Option.some (c, firstArg :: restArgs)
+    | _ :: _ =>
+      match filterMostSpecificTraitImpls matchedImpls matchedImpls with
+      | (winnerEntry, Option.some implTypeArgs) :: .nil =>
+        match findCallee? callees winnerEntry.implPath with
+        | Option.some c =>
+          let effectiveTypeArgs :=
+            match stringEq winnerEntry.implPath defPath with
+            | true => firstArg :: restArgs
+            | false => implTypeArgs
+          if effectiveTypeArgs.length == c.typeParamCount then
+            Option.some (c, effectiveTypeArgs)
+          else
+            Option.none
+        | Option.none => Option.none
+      | _ => Option.none
+
+/--
+Construct a placeholder `TypeSubst` pairing each `RigidTy` in `typeArgs` with a
+zero-sized placeholder `TypeLayout` so `RigidTy.instantiate` can substitute
+generic type parameters when checking function-pointer signatures in
+`checkCalleeSig`.
+
+Reference (`compiler/rustc_middle/src/ty/generic_args.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/generic_args.rs#L27-L28>
+
+> "/// An entity in the Rust type system, which can be one of
+> /// several kinds (types, lifetimes, and consts)."
+-/
+def typeSubstOfRigidTys : List RigidTy → TypeSubst
+  | .nil => .nil
+  | ty :: rest =>
+    (ty,
+      { size := ⟨0⟩
+        align := ⟨1⟩
+        backendRepr := .memory
+        fields := .primitive
+        variants := .single 0
+        isUninhabited := false }) :: typeSubstOfRigidTys rest
+
+/--
+Substitute generic type parameters (`RigidTy.param`) in the `ty.kind` of each
+`LocalDecl` using `subst`.
+
+Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/mod.rs#L967-L1065>
+
+> "pub struct LocalDecl<'tcx> {
+> ...
+>     pub mutability: Mutability,
+> ...
+>     pub local_info: ClearCrossCrate<Box<LocalInfo<'tcx>>>,
+> ...
+>     pub ty: Ty<'tcx>,
+> ...
+>     pub user_ty: Option<Box<UserTypeProjections>>,
+> ...
+>     pub source_info: SourceInfo,
+> }"
+-/
+def instantiateLocalDeclKinds
+    (subst : TypeSubst) :
+    List LocalDecl → List LocalDecl
+  | .nil => .nil
+  | d :: rest =>
+    { d with ty := { d.ty with kind := d.ty.kind.instantiate subst } } ::
+      instantiateLocalDeclKinds subst rest
+
+/--
+Validate that a linked callee `p` in `callees` or `extraTraitImpls` (when
+present) is compatible with the target function-pointer signature
+`(fnInputs, fnOutput, fnAbi)` during `ReifyFnPointer`:
+1. Resolves `(p, typeArgs)` via `resolveCalleeBodyAndArgs?` across both direct
+   `callees` and `TraitImplEntry` tables (`extraTraitImpls` and `c.traitImpls`).
+2. Rejects `CallConv.rustIntrinsic` callees (compiler intrinsics cannot be
    coerced to function pointers).
-2. Requires `length fnInputs == c.argCount` and `callConvEq fnAbi c.fnAbi.conv`.
-3. Requires `calleeLocalDeclsCompatible c.localDecls c.argCount fnInputs fnOutput`.
+3. Requires `length fnInputs == c.argCount` and `callConvEq fnAbi c.fnAbi.conv`.
+4. Requires `length effectiveTypeArgs == c.typeParamCount` and checks
+   `calleeLocalDeclsCompatible` on `c.localDecls` (instantiated with
+   `effectiveTypeArgs` when `c.typeParamCount > 0`).
 
 Reference (The Rust Reference, "Function pointer types"):
 <https://doc.rust-lang.org/1.98.0/reference/types/function-pointer.html>
@@ -3950,25 +4498,42 @@ def checkCalleeSig
     (p : DefPath)
     (fnInputs : List RigidTy)
     (fnOutput : RigidTy)
-    (fnAbi : CallConv) :
+    (fnAbi : CallConv)
+    (typeArgs : List RigidTy := .nil)
+    (extraTraitImpls : List TraitImplEntry := .nil) :
     Bool :=
   match callees with
   | .nil => true
-  | c :: rest =>
-    match stringEq c.defPath p with
-    | true =>
+  | _ :: _ =>
+    match resolveCalleeBodyAndArgs? callees p typeArgs extraTraitImpls with
+    | .none => true
+    | .some (c, effectiveTypeArgs) =>
+      let declsCompatible :=
+        match c.typeParamCount, effectiveTypeArgs with
+        | 0, .nil =>
+          calleeLocalDeclsCompatible
+            c.localDecls
+            c.argCount
+            fnInputs
+            fnOutput
+        | 0, _ :: _ => false
+        | .succ _, _ =>
+          Bool.and
+            (Nat.beq (length effectiveTypeArgs) c.typeParamCount)
+            (calleeLocalDeclsCompatible
+              (instantiateLocalDeclKinds
+                (typeSubstOfRigidTys effectiveTypeArgs)
+                c.localDecls)
+              c.argCount
+              fnInputs
+              fnOutput)
       Bool.and
         (Bool.not (callConvEq c.fnAbi.conv .rustIntrinsic))
         (Bool.and
           (Nat.beq (length fnInputs) c.argCount)
           (Bool.and
             (callConvEq fnAbi c.fnAbi.conv)
-            (calleeLocalDeclsCompatible
-              c.localDecls
-              c.argCount
-              fnInputs
-              fnOutput)))
-    | false => checkCalleeSig rest p fnInputs fnOutput fnAbi
+            declsCompatible))
 
 /--
 Evaluate `CastKind.pointerCoercion "UnsafeFnPointer"`, coercing a safe
@@ -4537,6 +5102,8 @@ def evalReifyFnPointer
                     fnInputs
                     fnOutput
                     fnAbi
+                    typeArgs
+                    mem.traitImpls
                 with
                 | false => .ub
                 | true =>

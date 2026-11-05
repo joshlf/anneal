@@ -670,6 +670,7 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
             .unwrap_or_default();
         let synthetic_bundle = SubjectObligationBundle {
             subject: UnitTargetRecord {
+            trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: def_id.clone(),
                     mir_module_path: format!("Mir/{}", rel_path.to_string_lossy()),
@@ -1165,6 +1166,7 @@ mod tests {
         fs::write(unit_mir_dir.join("compute.lean"), mir_content).expect("write unit mir");
 
         let initial_records = vec![UnitTargetRecord {
+            trait_impls: vec![],
             target: CapturedTarget {
                 def_id: "my_crate::compute".to_string(),
                 mir_module_path: "Mir/MyCrate/compute.lean".to_string(),
@@ -1235,6 +1237,7 @@ mod tests {
         let updated_records = vec![
             initial_records[0].clone(),
             UnitTargetRecord {
+            trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: "my_crate::__anodized_fn_requires_compute".to_string(),
                     mir_module_path: "Mir/MyCrate/__anodized_fn_requires_compute.lean"
@@ -1280,6 +1283,7 @@ mod tests {
     fn rescaffolding_a_smaller_item_set_prunes_stale_generated_modules() {
         let workspace = unique_temp_dir("prune-stale");
         let record = |name: &str| UnitTargetRecord {
+            trait_impls: vec![],
             target: CapturedTarget {
                 def_id: format!("my_crate::{name}"),
                 mir_module_path: format!("Mir/MyCrate/{name}.lean"),
@@ -1381,6 +1385,7 @@ mod tests {
         // Scaffold the workspace and verify that `Verify/MyCrate/ptr_op.lean`
         // emits `StatefulVerificationResult Obligations.MyCrate.ptr_op.statefulClaim`.
         let records = vec![UnitTargetRecord {
+            trait_impls: vec![],
             target: CapturedTarget {
                 def_id: "my_crate::ptr_op".to_string(),
                 mir_module_path: "Mir/MyCrate/ptr_op.lean".to_string(),
@@ -1406,6 +1411,7 @@ mod tests {
     fn init_specs_and_init_proofs_together_imports_specs_in_created_proof() {
         let workspace = unique_temp_dir("init-specs-and-proofs");
         let records = vec![UnitTargetRecord {
+            trait_impls: vec![],
             target: CapturedTarget {
                 def_id: "my_crate::add".to_string(),
                 mir_module_path: "Mir/MyCrate/add.lean".to_string(),

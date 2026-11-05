@@ -217,13 +217,16 @@ inductive Safety : Type where
   | unsafe_ : Safety
 
 /--
-Structural representation of a monomorphized Rust type after region and
-type-parameter erasure, modeling `rustc_middle::ty::TyKind`.
+Structural representation of a Rust type in captured `Runtime(PostCleanup)` MIR
+after lifetime-region erasure, modeling `rustc_middle::ty::TyKind` (supporting
+both concrete monomorphized types and polymorphic generic type parameters and
+associated type aliases).
 
-In `Runtime(PostCleanup)` MIR for monomorphic items, type parameters are
-instantiated and lifetime regions are erased for codegen. The constructors of
-`RigidTy` correspond to the concrete `TyKind` variants that appear in
+The constructors of `RigidTy` correspond to the `TyKind` variants that appear in
 post-cleanup MIR:
+- `.param`: generic type parameter `T` at index `idx` (`TyKind::Param`).
+- `.alias`: unnormalized associated type projection `<T as Trait>::Assoc`
+  (`TyKind::Alias`).
 - `.bool`, `.char`, `.int`, `.uint`, `.float`, `.never`, `.str`: primitive and
   textual types (`TyKind::Bool`, `Char`, `Int`, `Uint`, `Float`, `Never`,
   `Str`).
@@ -232,13 +235,22 @@ post-cleanup MIR:
 - `.ref`, `.rawPtr`: reference (`&T`, `&mut T`) and raw pointer (`*const T`,
   `*mut T`) types (`TyKind::Ref`, `RawPtr`).
 - `.adt`: structs, enums, and unions (`TyKind::Adt`) identified by canonical
-  `DefPath` and monomorphized type arguments.
+  `DefPath` and type arguments.
 - `.fnDef`, `.fnPtr`, `.closure`: callable types (`TyKind::FnDef`, `FnPtr`,
   `Closure`).
 - `.dynamic`, `.foreign`: trait objects (`dyn Trait`, `TyKind::Dynamic`) and
   extern foreign types (`TyKind::Foreign`).
 - `.other`: fallback preserving the rendered type string for any remaining
   compiler-internal type so syntax capture is total.
+
+Reference (`compiler/rustc_middle/src/ty/sty.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/sty.rs#L36-L46>
+
+> "pub struct ParamTy {
+>     pub index: u32,
+>     pub name: Symbol,
+> }"
 
 Reference (The Rust Reference, "Types"):
 <https://doc.rust-lang.org/1.98.0/reference/types.html>
@@ -262,6 +274,10 @@ into `LayoutTable.entries` (`R-TY-01`), so operational semantics never guesses a
 type's size, alignment, or field offsets from `RigidTy` alone.
 -/
 inductive RigidTy : Type where
+  /-- Generic type parameter `T` at index `idx` (`ty::Param`). -/
+  | param (idx : Nat) (name : String) : RigidTy
+  /-- Associated type alias `<T as Trait>::Assoc` (`ty::Alias`). -/
+  | alias (defPath : DefPath) (args : List RigidTy) : RigidTy
   /-- Boolean (`bool`). -/
   | bool : RigidTy
   /-- Unicode scalar value (`char`). -/
@@ -590,5 +606,1073 @@ inductive ContractRole : Type where
   | externalSpec (subjectDefPath : DefPath) : ContractRole
   /-- Pure specification model function (`#[anneal::model]`). -/
   | model : ContractRole
+
+
+/--
+Generic type parameter declaration on a polymorphic MIR body, modeling
+`rustc_middle::ty::GenericParamDef` (`GenericParamDefKind::Type`).
+
+Reference (`compiler/rustc_middle/src/ty/generics.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/generics.rs#L17-L26>
+
+> "pub struct GenericParamDef {
+>     pub name: Symbol,
+>     pub def_id: DefId,
+>     pub index: u32,
+>     pub pure_wrt_drop: bool,
+>     pub kind: GenericParamDefKind,
+> }"
+-/
+structure GenericParamDef : Type where
+  /-- 0-based index of the generic type parameter (`GenericParamDef::index`). -/
+  idx : Nat
+  /-- Source identifier of the generic parameter (`GenericParamDef::name`). -/
+  name : String
+
+/--
+Trait reference `<T_0 as Trait<T_1, ...>>`, modeling
+`rustc_middle::ty::TraitRef`.
+
+Reference (`compiler/rustc_middle/src/ty/structural_impls.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/sty.rs#L96-L102>
+
+> "pub struct TraitRef<'tcx> {
+>     pub def_id: DefId,
+>     pub args: GenericArgsRef<'tcx>,
+> }"
+-/
+structure TraitRef : Type where
+  /-- Canonical path of the trait definition (`TraitRef::def_id`). -/
+  defPath : DefPath
+  /-- Type arguments to the trait (`TraitRef::args`, with `Self` at index `0`). -/
+  args : List RigidTy
+
+/--
+Captured trait implementation entry associating a `TraitRef` with its concrete
+`impl` block or resolved associated item path (`implPath`).
+-/
+structure TraitImplEntry : Type where
+  /-- Implemented trait reference (`tcx.impl_trait_ref(impl_def_id)`). -/
+  traitRef : TraitRef
+  /-- Canonical path of the `impl` block or resolved implementation item. -/
+  implPath : DefPath
+
+/--
+Concrete type-and-layout substitution list mapping generic parameter index `idx`
+to `(substRigidTy, substTypeLayout)`.
+-/
+abbrev TypeSubst : Type := List (RigidTy × TypeLayout)
+
+/--
+Look up the `(RigidTy × TypeLayout)` entry at 0-based generic parameter index
+`idx` in `args` by structural recursion on `args`.
+
+Matching on `args` first ensures `TypeSubst.lookup .nil idx = .none` reduces
+definitionally (`rfl`) even when `idx` is a symbolic `Nat` variable.
+-/
+@[reducible]
+def TypeSubst.lookup : TypeSubst → Nat → Option (RigidTy × TypeLayout)
+  | .nil, _ => .none
+  | entry :: _, .zero => .some entry
+  | _ :: rest, .succ idx => TypeSubst.lookup rest idx
+
+/--
+Extract the ordered list of concrete `TypeLayout` entries from `args`.
+-/
+@[reducible]
+def TypeSubst.layouts : TypeSubst → List TypeLayout
+  | .nil => .nil
+  | (_, l) :: rest => l :: TypeSubst.layouts rest
+
+/--
+Number of type-parameter entries in `args`.
+-/
+@[reducible]
+def TypeSubst.length : TypeSubst → Nat
+  | .nil => 0
+  | _ :: rest => Nat.succ (TypeSubst.length rest)
+
+/--
+Two-argument congruence lemma in `Init.Core`.
+-/
+theorem congrArg2
+    {α β γ : Type}
+    (f : α → β → γ)
+    {a₁ a₂ : α}
+    {b₁ b₂ : β}
+    (ha : a₁ = a₂)
+    (hb : b₁ = b₂) :
+    f a₁ b₁ = f a₂ b₂ := by
+  subst ha
+  subst hb
+  rfl
+
+mutual
+/--
+Instantiate a `RigidTy` by structurally substituting every `.param idx name`
+resolved in `args` across all nested type constructors (`.alias`, `.tuple`,
+`.array`, `.slice`, `.ref`, `.rawPtr`, `.adt`, `.fnDef`, `.fnPtr`, `.closure`).
+-/
+@[reducible]
+def RigidTy.instantiate (args : TypeSubst) : RigidTy → RigidTy
+  | .param idx name =>
+    match TypeSubst.lookup args idx with
+    | .some (t, _) => t
+    | .none => .param idx name
+  | .alias p a => .alias p (RigidTy.instantiateList args a)
+  | .bool => .bool
+  | .char => .char
+  | .int w => .int w
+  | .uint w => .uint w
+  | .float w => .float w
+  | .never => .never
+  | .str => .str
+  | .tuple fields => .tuple (RigidTy.instantiateList args fields)
+  | .array elem len => .array (RigidTy.instantiate args elem) len
+  | .slice elem => .slice (RigidTy.instantiate args elem)
+  | .ref mutability pointee => .ref mutability (RigidTy.instantiate args pointee)
+  | .rawPtr mutability pointee => .rawPtr mutability (RigidTy.instantiate args pointee)
+  | .adt p a => .adt p (RigidTy.instantiateList args a)
+  | .fnDef p a => .fnDef p (RigidTy.instantiateList args a)
+  | .fnPtr inputs output safety abi =>
+    .fnPtr (RigidTy.instantiateList args inputs) (RigidTy.instantiate args output) safety abi
+  | .closure p upvars => .closure p (RigidTy.instantiateList args upvars)
+  | .dynamic traitPath => .dynamic traitPath
+  | .foreign defPath => .foreign defPath
+  | .other rendered => .other rendered
+
+/--
+Structurally instantiate a list of `RigidTy` arguments.
+-/
+@[reducible]
+def RigidTy.instantiateList (args : TypeSubst) : List RigidTy → List RigidTy
+  | .nil => .nil
+  | t :: ts => RigidTy.instantiate args t :: RigidTy.instantiateList args ts
+end
+
+mutual
+/--
+Universal identity theorem for `RigidTy.instantiate` under the empty
+substitution `.nil`.
+-/
+@[simp]
+theorem RigidTy.instantiate_nil :
+    (k : RigidTy) → RigidTy.instantiate .nil k = k
+  | .param _ _ => rfl
+  | .alias p a => congrArg (RigidTy.alias p) (RigidTy.instantiateList_nil a)
+  | .bool => rfl
+  | .char => rfl
+  | .int _ => rfl
+  | .uint _ => rfl
+  | .float _ => rfl
+  | .never => rfl
+  | .str => rfl
+  | .tuple fields => congrArg RigidTy.tuple (RigidTy.instantiateList_nil fields)
+  | .array elem len => congrArg (RigidTy.array · len) (RigidTy.instantiate_nil elem)
+  | .slice elem => congrArg RigidTy.slice (RigidTy.instantiate_nil elem)
+  | .ref m pointee => congrArg (RigidTy.ref m) (RigidTy.instantiate_nil pointee)
+  | .rawPtr m pointee => congrArg (RigidTy.rawPtr m) (RigidTy.instantiate_nil pointee)
+  | .adt p a => congrArg (RigidTy.adt p) (RigidTy.instantiateList_nil a)
+  | .fnDef p a => congrArg (RigidTy.fnDef p) (RigidTy.instantiateList_nil a)
+  | .fnPtr inputs output safety abi =>
+    congrArg2 (RigidTy.fnPtr · · safety abi)
+      (RigidTy.instantiateList_nil inputs)
+      (RigidTy.instantiate_nil output)
+  | .closure p upvars => congrArg (RigidTy.closure p) (RigidTy.instantiateList_nil upvars)
+  | .dynamic _ => rfl
+  | .foreign _ => rfl
+  | .other _ => rfl
+
+/--
+Universal identity theorem for `RigidTy.instantiateList` on `.nil`.
+-/
+@[simp]
+theorem RigidTy.instantiateList_nil :
+    (ks : List RigidTy) → RigidTy.instantiateList .nil ks = ks
+  | .nil => rfl
+  | k :: ks =>
+    congrArg2 List.cons (RigidTy.instantiate_nil k) (RigidTy.instantiateList_nil ks)
+end
+
+/--
+Alias for `RigidTy.instantiateList_nil`.
+-/
+@[simp]
+theorem RigidTy.instantiateList_nil_eq (ks : List RigidTy) :
+    RigidTy.instantiateList .nil ks = ks :=
+  RigidTy.instantiateList_nil ks
+
+/--
+Alias for `RigidTy.instantiate_nil`.
+-/
+@[simp]
+theorem RigidTy.instantiate_empty_id (k : RigidTy) :
+    RigidTy.instantiate .nil k = k :=
+  RigidTy.instantiate_nil k
+
+/--
+Auxiliary composition of two `TypeSubst` substitutions `fullArgs₂` and `args₁`,
+stepping `rem₂` in lockstep with `args₁` so out-of-bounds parameter indices in
+`args₁` fall through to `fullArgs₂`.
+-/
+@[reducible]
+def TypeSubst.composeAux (fullArgs₂ : TypeSubst) :
+    TypeSubst → TypeSubst → TypeSubst
+  | rem₂, .nil => rem₂
+  | .nil, (ty₁, l₁) :: rest₁ =>
+    (RigidTy.instantiate fullArgs₂ ty₁, l₁) ::
+      TypeSubst.composeAux fullArgs₂ .nil rest₁
+  | _ :: rest₂, (ty₁, l₁) :: rest₁ =>
+    (RigidTy.instantiate fullArgs₂ ty₁, l₁) ::
+      TypeSubst.composeAux fullArgs₂ rest₂ rest₁
+
+/--
+Compose two `TypeSubst` substitutions `args₂` and `args₁` such that
+instantiating a `RigidTy` with `args₁` and then `args₂` is equal to
+instantiating once with `TypeSubst.compose args₂ args₁`.
+-/
+@[reducible]
+def TypeSubst.compose (args₂ args₁ : TypeSubst) : TypeSubst :=
+  TypeSubst.composeAux args₂ args₂ args₁
+
+/--
+Left identity for `TypeSubst.composeAux` when `fullArgs₂ = .nil` and `rem₂ = .nil`.
+-/
+@[simp]
+theorem TypeSubst.composeAux_nil_left :
+    (args₁ : TypeSubst) → TypeSubst.composeAux .nil .nil args₁ = args₁
+  | .nil => rfl
+  | (ty₁, _) :: rest₁ => by
+    dsimp [TypeSubst.composeAux]
+    rw [RigidTy.instantiate_nil ty₁, TypeSubst.composeAux_nil_left rest₁]
+
+/--
+Left identity for `TypeSubst.compose` with `.nil`.
+-/
+@[simp]
+theorem TypeSubst.compose_nil_left (args₁ : TypeSubst) :
+    TypeSubst.compose .nil args₁ = args₁ :=
+  TypeSubst.composeAux_nil_left args₁
+
+/--
+Right identity for `TypeSubst.compose` with `.nil`.
+-/
+@[simp]
+theorem TypeSubst.compose_nil_right (args₂ : TypeSubst) :
+    TypeSubst.compose args₂ .nil = args₂ :=
+  rfl
+
+/--
+Step lemma relating `TypeSubst.lookup` on `TypeSubst.composeAux` to sequential
+`RigidTy.instantiate` on `.param`.
+-/
+theorem RigidTy.instantiate_param_composeAux
+    (fullArgs₂ : TypeSubst)
+    (origIdx : Nat)
+    (name : String) :
+    (rem₂ args₁ : TypeSubst) →
+    (curIdx : Nat) →
+    (h :
+      (match TypeSubst.lookup rem₂ curIdx with
+       | .some (t, _) => t
+       | .none => .param origIdx name) =
+      RigidTy.instantiate fullArgs₂ (.param origIdx name)) →
+    RigidTy.instantiate fullArgs₂
+      (match TypeSubst.lookup args₁ curIdx with
+       | .some (t, _) => t
+       | .none => .param origIdx name) =
+    (match TypeSubst.lookup (TypeSubst.composeAux fullArgs₂ rem₂ args₁) curIdx with
+     | .some (t, _) => t
+     | .none => .param origIdx name)
+  | rem₂, .nil, curIdx, h => by
+    dsimp [TypeSubst.lookup, TypeSubst.composeAux]
+    exact h.symm
+  | .nil, (_, _) :: _, .zero, _ => rfl
+  | _ :: _, (_, _) :: _, .zero, _ => rfl
+  | .nil, (_, _) :: rest₁, .succ idx', h =>
+    RigidTy.instantiate_param_composeAux fullArgs₂ origIdx name .nil rest₁ idx' h
+  | _ :: rest₂, (_, _) :: rest₁, .succ idx', h =>
+    RigidTy.instantiate_param_composeAux fullArgs₂ origIdx name rest₂ rest₁ idx' h
+
+mutual
+/--
+Universal composition theorem for `RigidTy.instantiate`: instantiating with
+`args₁` followed by `args₂` equals instantiating with
+`TypeSubst.compose args₂ args₁`.
+-/
+@[simp]
+theorem RigidTy.instantiate_instantiate
+    (args₂ args₁ : TypeSubst) :
+    (k : RigidTy) →
+    RigidTy.instantiate args₂ (RigidTy.instantiate args₁ k) =
+      RigidTy.instantiate (TypeSubst.compose args₂ args₁) k
+  | .param idx name =>
+    RigidTy.instantiate_param_composeAux args₂ idx name args₂ args₁ idx rfl
+  | .alias p a =>
+    congrArg (RigidTy.alias p) (RigidTy.instantiateList_instantiateList args₂ args₁ a)
+  | .bool => rfl
+  | .char => rfl
+  | .int _ => rfl
+  | .uint _ => rfl
+  | .float _ => rfl
+  | .never => rfl
+  | .str => rfl
+  | .tuple fields =>
+    congrArg RigidTy.tuple (RigidTy.instantiateList_instantiateList args₂ args₁ fields)
+  | .array elem len =>
+    congrArg (RigidTy.array · len) (RigidTy.instantiate_instantiate args₂ args₁ elem)
+  | .slice elem =>
+    congrArg RigidTy.slice (RigidTy.instantiate_instantiate args₂ args₁ elem)
+  | .ref m pointee =>
+    congrArg (RigidTy.ref m) (RigidTy.instantiate_instantiate args₂ args₁ pointee)
+  | .rawPtr m pointee =>
+    congrArg (RigidTy.rawPtr m) (RigidTy.instantiate_instantiate args₂ args₁ pointee)
+  | .adt p a =>
+    congrArg (RigidTy.adt p) (RigidTy.instantiateList_instantiateList args₂ args₁ a)
+  | .fnDef p a =>
+    congrArg (RigidTy.fnDef p) (RigidTy.instantiateList_instantiateList args₂ args₁ a)
+  | .fnPtr inputs output safety abi =>
+    congrArg2 (RigidTy.fnPtr · · safety abi)
+      (RigidTy.instantiateList_instantiateList args₂ args₁ inputs)
+      (RigidTy.instantiate_instantiate args₂ args₁ output)
+  | .closure p upvars =>
+    congrArg (RigidTy.closure p) (RigidTy.instantiateList_instantiateList args₂ args₁ upvars)
+  | .dynamic _ => rfl
+  | .foreign _ => rfl
+  | .other _ => rfl
+
+/--
+Universal composition theorem for `RigidTy.instantiateList`.
+-/
+@[simp]
+theorem RigidTy.instantiateList_instantiateList
+    (args₂ args₁ : TypeSubst) :
+    (ks : List RigidTy) →
+    RigidTy.instantiateList args₂ (RigidTy.instantiateList args₁ ks) =
+      RigidTy.instantiateList (TypeSubst.compose args₂ args₁) ks
+  | .nil => rfl
+  | k :: ks =>
+    congrArg2 List.cons
+      (RigidTy.instantiate_instantiate args₂ args₁ k)
+      (RigidTy.instantiateList_instantiateList args₂ args₁ ks)
+end
+
+/--
+Test whether `k : RigidTy` is a trivial 0-byte zero-sized type (`.tuple .nil` or
+`.fnDef _ _`) whose operational semantics in `MirSemantics` never queries
+`LayoutTable.lookup`.
+-/
+@[reducible]
+def RigidTy.isTrivialZst : RigidTy → Bool
+  | .tuple .nil => true
+  | .fnDef _ _ => true
+  | _ => false
+
+mutual
+/--
+Test whether `k : RigidTy` contains any `.param idx _` resolved by `args`.
+-/
+@[reducible]
+def RigidTy.hasSubstParam (args : TypeSubst) : RigidTy → Bool
+  | .param idx _ =>
+    match TypeSubst.lookup args idx with
+    | .some _ => true
+    | .none => false
+  | .alias _ a => RigidTy.hasSubstParamList args a
+  | .tuple fields => RigidTy.hasSubstParamList args fields
+  | .array elem _ => RigidTy.hasSubstParam args elem
+  | .slice elem => RigidTy.hasSubstParam args elem
+  | .ref _ pointee => RigidTy.hasSubstParam args pointee
+  | .rawPtr _ pointee => RigidTy.hasSubstParam args pointee
+  | .adt _ a => RigidTy.hasSubstParamList args a
+  | .fnDef _ a => RigidTy.hasSubstParamList args a
+  | .fnPtr inputs output _ _ =>
+    Bool.or
+      (RigidTy.hasSubstParamList args inputs)
+      (RigidTy.hasSubstParam args output)
+  | .closure _ upvars => RigidTy.hasSubstParamList args upvars
+  | .bool => false
+  | .char => false
+  | .int _ => false
+  | .uint _ => false
+  | .float _ => false
+  | .never => false
+  | .str => false
+  | .dynamic _ => false
+  | .foreign _ => false
+  | .other _ => false
+
+/--
+Test whether any `RigidTy` in a list contains a resolved `.param`.
+-/
+@[reducible]
+def RigidTy.hasSubstParamList (args : TypeSubst) : List RigidTy → Bool
+  | .nil => false
+  | t :: ts =>
+    Bool.or (RigidTy.hasSubstParam args t) (RigidTy.hasSubstParamList args ts)
+end
+
+/--
+Test whether `k : RigidTy` is a non-`.param` compound type that contains at
+least one `.param idx _` resolved by `args`.
+-/
+@[reducible]
+def RigidTy.isCompoundSubstParam (args : TypeSubst) : RigidTy → Bool
+  | .param _ _ => false
+  | k => RigidTy.hasSubstParam args k
+
+/--
+Left projection for `Bool.or a b = false`.
+-/
+theorem bool_or_eq_false_left {a b : Bool} (h : Bool.or a b = false) :
+    a = false := by
+  cases a with
+  | false => rfl
+  | true => cases h
+
+/--
+Right projection for `Bool.or a b = false`.
+-/
+theorem bool_or_eq_false_right {a b : Bool} (h : Bool.or a b = false) :
+    b = false := by
+  cases a with
+  | false => exact h
+  | true => cases h
+
+mutual
+/--
+When `RigidTy.hasSubstParam args k = false`, `RigidTy.instantiate args k = k`.
+-/
+@[simp]
+theorem RigidTy.instantiate_of_hasSubstParam_false (args : TypeSubst) :
+    (k : RigidTy) → RigidTy.hasSubstParam args k = false →
+    RigidTy.instantiate args k = k
+  | .param idx _, h => by
+    dsimp [RigidTy.hasSubstParam, RigidTy.instantiate] at h ⊢
+    cases hLook : TypeSubst.lookup args idx with
+    | none => rfl
+    | some _ => rw [hLook] at h; cases h
+  | .alias defPath a, h =>
+    congrArg (RigidTy.alias defPath)
+      (RigidTy.instantiateList_of_hasSubstParamList_false args a h)
+  | .bool, _ => rfl
+  | .char, _ => rfl
+  | .int _, _ => rfl
+  | .uint _, _ => rfl
+  | .float _, _ => rfl
+  | .never, _ => rfl
+  | .str, _ => rfl
+  | .tuple fields, h =>
+    congrArg RigidTy.tuple
+      (RigidTy.instantiateList_of_hasSubstParamList_false args fields h)
+  | .array elem len, h =>
+    congrArg (RigidTy.array · len)
+      (RigidTy.instantiate_of_hasSubstParam_false args elem h)
+  | .slice elem, h =>
+    congrArg RigidTy.slice
+      (RigidTy.instantiate_of_hasSubstParam_false args elem h)
+  | .ref mutability pointee, h =>
+    congrArg (RigidTy.ref mutability)
+      (RigidTy.instantiate_of_hasSubstParam_false args pointee h)
+  | .rawPtr mutability pointee, h =>
+    congrArg (RigidTy.rawPtr mutability)
+      (RigidTy.instantiate_of_hasSubstParam_false args pointee h)
+  | .adt defPath a, h =>
+    congrArg (RigidTy.adt defPath)
+      (RigidTy.instantiateList_of_hasSubstParamList_false args a h)
+  | .fnDef defPath a, h =>
+    congrArg (RigidTy.fnDef defPath)
+      (RigidTy.instantiateList_of_hasSubstParamList_false args a h)
+  | .fnPtr inputs output _ _, h => by
+    dsimp [RigidTy.instantiate]
+    rw [RigidTy.instantiateList_of_hasSubstParamList_false args inputs
+          (bool_or_eq_false_left h),
+        RigidTy.instantiate_of_hasSubstParam_false args output
+          (bool_or_eq_false_right h)]
+  | .closure defPath upvars, h =>
+    congrArg (RigidTy.closure defPath)
+      (RigidTy.instantiateList_of_hasSubstParamList_false args upvars h)
+  | .dynamic _, _ => rfl
+  | .foreign _, _ => rfl
+  | .other _, _ => rfl
+
+/--
+When `RigidTy.hasSubstParamList args ks = false`,
+`RigidTy.instantiateList args ks = ks`.
+-/
+@[simp]
+theorem RigidTy.instantiateList_of_hasSubstParamList_false (args : TypeSubst) :
+    (ks : List RigidTy) → RigidTy.hasSubstParamList args ks = false →
+    RigidTy.instantiateList args ks = ks
+  | .nil, _ => rfl
+  | k :: ks, h =>
+    congrArg2 List.cons
+      (RigidTy.instantiate_of_hasSubstParam_false args k
+        (bool_or_eq_false_left h))
+      (RigidTy.instantiateList_of_hasSubstParamList_false args ks
+        (bool_or_eq_false_right h))
+end
+
+mutual
+/--
+Universal theorem that no `RigidTy` has a substituted parameter under `.nil`.
+-/
+@[simp]
+theorem RigidTy.hasSubstParam_nil :
+    (k : RigidTy) → RigidTy.hasSubstParam .nil k = false
+  | .param _ _ => rfl
+  | .alias _ a => RigidTy.hasSubstParamList_nil a
+  | .bool => rfl
+  | .char => rfl
+  | .int _ => rfl
+  | .uint _ => rfl
+  | .float _ => rfl
+  | .never => rfl
+  | .str => rfl
+  | .tuple fields => RigidTy.hasSubstParamList_nil fields
+  | .array elem _ => RigidTy.hasSubstParam_nil elem
+  | .slice elem => RigidTy.hasSubstParam_nil elem
+  | .ref _ pointee => RigidTy.hasSubstParam_nil pointee
+  | .rawPtr _ pointee => RigidTy.hasSubstParam_nil pointee
+  | .adt _ a => RigidTy.hasSubstParamList_nil a
+  | .fnDef _ a => RigidTy.hasSubstParamList_nil a
+  | .fnPtr inputs output _ _ => by
+    dsimp [RigidTy.hasSubstParam]
+    rw [RigidTy.hasSubstParamList_nil inputs, RigidTy.hasSubstParam_nil output]
+    rfl
+  | .closure _ upvars => RigidTy.hasSubstParamList_nil upvars
+  | .dynamic _ => rfl
+  | .foreign _ => rfl
+  | .other _ => rfl
+
+/--
+Universal theorem that no list of `RigidTy` has a substituted parameter under
+`.nil`.
+-/
+@[simp]
+theorem RigidTy.hasSubstParamList_nil :
+    (ks : List RigidTy) → RigidTy.hasSubstParamList .nil ks = false
+  | .nil => rfl
+  | k :: ks => by
+    dsimp [RigidTy.hasSubstParamList]
+    rw [RigidTy.hasSubstParam_nil k, RigidTy.hasSubstParamList_nil ks]
+    rfl
+end
+
+/--
+Compute `2^k` in `Init.Core` for scalar valid-range bounds.
+-/
+@[reducible]
+def pow2Nat : Nat → Nat
+  | .zero => 1
+  | .succ k => Nat.mul 2 (pow2Nat k)
+
+/--
+Byte width of a `FloatTy` (`2, 4, 8, 16`).
+-/
+@[reducible]
+def FloatTy.byteWidth : FloatTy → Nat
+  | .f16 => 2
+  | .f32 => 4
+  | .f64 => 8
+  | .f128 => 16
+
+mutual
+/--
+Synthesize or recompute the concrete `TypeLayout` of a `RigidTy` under `args` on
+a target with pointer bit-width `ptrBits`, using `origLayout` for variant/field
+metadata on ADTs when available.
+-/
+@[reducible]
+def RigidTy.computeLayout
+    (ptrBits : Nat)
+    (extEntries : List TypeLayout)
+    (args : TypeSubst)
+    (origLayout : Option TypeLayout) :
+    RigidTy → Option TypeLayout
+  | .param idx _ =>
+    match TypeSubst.lookup args idx with
+    | .some (_, l) => .some l
+    | .none => origLayout
+  | .bool =>
+    .some
+      { size := ⟨1⟩
+        align := ⟨1⟩
+        backendRepr := .scalar (.initialized (.int 8 false) ⟨0, 1⟩)
+        fields := .primitive
+        variants := .single 0
+        isUninhabited := false }
+  | .char =>
+    .some
+      { size := ⟨4⟩
+        align := ⟨4⟩
+        backendRepr := .scalar (.initialized (.int 32 false) ⟨0, 1114111⟩)
+        fields := .primitive
+        variants := .single 0
+        isUninhabited := false }
+  | .uint w =>
+    let effPtrBits := match Nat.beq ptrBits 0 with | true => 64 | false => ptrBits
+    let sz := maxNat 1 (UintTy.byteWidth effPtrBits w)
+    let bits := Nat.mul sz 8
+    .some
+      { size := ⟨sz⟩
+        align := ⟨sz⟩
+        backendRepr :=
+          .scalar (.initialized (.int bits false) ⟨0, Nat.sub (pow2Nat bits) 1⟩)
+        fields := .primitive
+        variants := .single 0
+        isUninhabited := false }
+  | .int w =>
+    let effPtrBits := match Nat.beq ptrBits 0 with | true => 64 | false => ptrBits
+    let sz := maxNat 1 (IntTy.byteWidth effPtrBits w)
+    let bits := Nat.mul sz 8
+    .some
+      { size := ⟨sz⟩
+        align := ⟨sz⟩
+        backendRepr :=
+          .scalar (.initialized (.int bits true) ⟨0, Nat.sub (pow2Nat bits) 1⟩)
+        fields := .primitive
+        variants := .single 0
+        isUninhabited := false }
+  | .float w =>
+    let sz := FloatTy.byteWidth w
+    let bits := Nat.mul sz 8
+    .some
+      { size := ⟨sz⟩
+        align := ⟨sz⟩
+        backendRepr :=
+          .scalar (.initialized (.float bits) ⟨0, Nat.sub (pow2Nat bits) 1⟩)
+        fields := .primitive
+        variants := .single 0
+        isUninhabited := false }
+  | .never =>
+    .some
+      { size := ⟨0⟩
+        align := ⟨1⟩
+        backendRepr := .memory
+        fields := .primitive
+        variants := .empty
+        isUninhabited := true }
+  | .fnDef _ _ =>
+    .some
+      { size := ⟨0⟩
+        align := ⟨1⟩
+        backendRepr := .memory
+        fields := .arbitrary .nil .nil
+        variants := .single 0
+        isUninhabited := false }
+  | .fnPtr _ _ _ _ =>
+    let effPtrBits := match Nat.beq ptrBits 0 with | true => 64 | false => ptrBits
+    let ptrBytes := maxNat 1 (Nat.div effPtrBits 8)
+    let maxVal := Nat.sub (pow2Nat (Nat.mul ptrBytes 8)) 1
+    .some
+      { size := ⟨ptrBytes⟩
+        align := ⟨ptrBytes⟩
+        backendRepr := .scalar (.initialized (.pointer 0) ⟨1, maxVal⟩)
+        fields := .primitive
+        variants := .single 0
+        isUninhabited := false }
+  | .ref _ pointee =>
+    let effPtrBits := match Nat.beq ptrBits 0 with | true => 64 | false => ptrBits
+    let ptrBytes := maxNat 1 (Nat.div effPtrBits 8)
+    let bits := Nat.mul ptrBytes 8
+    let maxVal := Nat.sub (pow2Nat bits) 1
+    let ptrScalar : ScalarLayout := .initialized (.pointer 0) ⟨1, maxVal⟩
+    match RigidTy.instantiate args pointee with
+    | .slice _ | .str | .dynamic _ =>
+      let metaScalar : ScalarLayout := .initialized (.int bits false) ⟨0, maxVal⟩
+      .some
+        { size := ⟨Nat.mul ptrBytes 2⟩
+          align := ⟨ptrBytes⟩
+          backendRepr := .scalarPair ptrScalar metaScalar
+          fields := .arbitrary (⟨0⟩ :: ⟨ptrBytes⟩ :: .nil) (0 :: 1 :: .nil)
+          variants := .single 0
+          isUninhabited := false }
+    | _ =>
+      .some
+        { size := ⟨ptrBytes⟩
+          align := ⟨ptrBytes⟩
+          backendRepr := .scalar ptrScalar
+          fields := .primitive
+          variants := .single 0
+          isUninhabited := false }
+  | .rawPtr _ pointee =>
+    let effPtrBits := match Nat.beq ptrBits 0 with | true => 64 | false => ptrBits
+    let ptrBytes := maxNat 1 (Nat.div effPtrBits 8)
+    let bits := Nat.mul ptrBytes 8
+    let maxVal := Nat.sub (pow2Nat bits) 1
+    let ptrScalar : ScalarLayout := .initialized (.pointer 0) ⟨0, maxVal⟩
+    match RigidTy.instantiate args pointee with
+    | .slice _ | .str | .dynamic _ =>
+      let metaScalar : ScalarLayout := .initialized (.int bits false) ⟨0, maxVal⟩
+      .some
+        { size := ⟨Nat.mul ptrBytes 2⟩
+          align := ⟨ptrBytes⟩
+          backendRepr := .scalarPair ptrScalar metaScalar
+          fields := .arbitrary (⟨0⟩ :: ⟨ptrBytes⟩ :: .nil) (0 :: 1 :: .nil)
+          variants := .single 0
+          isUninhabited := false }
+    | _ =>
+      .some
+        { size := ⟨ptrBytes⟩
+          align := ⟨ptrBytes⟩
+          backendRepr := .scalar ptrScalar
+          fields := .primitive
+          variants := .single 0
+          isUninhabited := false }
+  | .array elem len =>
+    match RigidTy.computeLayout ptrBits extEntries args .none elem with
+    | .none => origLayout
+    | .some elemFl =>
+      let eAlign := maxNat 1 elemFl.align.bytes
+      let strideBytes := alignUp elemFl.size.bytes eAlign
+      .some
+        { size := ⟨Nat.mul strideBytes len⟩
+          align := ⟨eAlign⟩
+          backendRepr := .memory
+          fields := .array ⟨strideBytes⟩ len
+          variants := .single 0
+          isUninhabited :=
+            Bool.and (Bool.not (Nat.beq len 0)) elemFl.isUninhabited }
+  | .tuple fields =>
+    match RigidTy.computeLayoutList ptrBits extEntries args fields with
+    | .none => origLayout
+    | .some fls =>
+      let (offsets, memIdx, totalSz, maxAl, uninh) :=
+        computeArbitraryFieldsAux 0 1 0 fls
+      .some
+        { size := ⟨totalSz⟩
+          align := ⟨maxAl⟩
+          backendRepr := computeAggregateBackendRepr totalSz fls
+          fields := .arbitrary offsets memIdx
+          variants := .single 0
+          isUninhabited := uninh }
+  | .adt _ adtArgs =>
+    match origLayout with
+    | .some origL =>
+      match origL.fieldLayouts with
+      | _ :: _ => .some (TypeLayout.recomputeFromFieldLayouts extEntries origL)
+      | .nil =>
+        match RigidTy.computeLayoutList ptrBits extEntries args adtArgs with
+        | .none => .some origL
+        | .some fls =>
+          match origL.variants with
+          | .empty => .some origL
+          | .single vIdx =>
+            match origL.fields with
+            | .union count =>
+              let (totalSz, maxAl) := computeUnionSizeAndAlign 0 1 fls
+              .some
+                { origL with
+                  size := ⟨totalSz⟩
+                  align := ⟨maxAl⟩
+                  fields := .union count
+                  variants := .single vIdx }
+            | _ =>
+              let (offsets, memIdx, totalSz, maxAl, uninh) :=
+                computeArbitraryFieldsAux 0 1 0 fls
+              .some
+                { origL with
+                  size := ⟨totalSz⟩
+                  align := ⟨maxAl⟩
+                  backendRepr := computeAggregateBackendRepr totalSz fls
+                  fields := .arbitrary offsets memIdx
+                  variants := .single vIdx
+                  isUninhabited := uninh }
+          | .multiple tag tagField variantShapes =>
+            let tagBytes := tagScalarByteWidth tag
+            let (shapes', maxSz, maxAl) :=
+              recomputeVariantShapesAux tagBytes variantShapes fls
+            let outerFields :=
+              match origL.fields with
+              | .arbitrary (_ :: _) _ => origL.fields
+              | _ => .arbitrary (⟨0⟩ :: .nil) (0 :: .nil)
+            .some
+              { origL with
+                size := ⟨alignUp maxSz maxAl⟩
+                align := ⟨maxAl⟩
+                fields := outerFields
+                variants := .multiple tag tagField shapes' }
+    | .none =>
+      match RigidTy.computeLayoutList ptrBits extEntries args adtArgs with
+      | .none => .none
+      | .some fls =>
+        let (offsets, memIdx, totalSz, maxAl, uninh) :=
+          computeArbitraryFieldsAux 0 1 0 fls
+        .some
+          { size := ⟨totalSz⟩
+            align := ⟨maxAl⟩
+            backendRepr := computeAggregateBackendRepr totalSz fls
+            fields := .arbitrary offsets memIdx
+            variants := .single 0
+            isUninhabited := uninh }
+  | .closure _ upvars =>
+    match RigidTy.computeLayoutList ptrBits extEntries args upvars with
+    | .none => origLayout
+    | .some fls =>
+      let (offsets, memIdx, totalSz, maxAl, uninh) :=
+        computeArbitraryFieldsAux 0 1 0 fls
+      .some
+        { size := ⟨totalSz⟩
+          align := ⟨maxAl⟩
+          backendRepr := computeAggregateBackendRepr totalSz fls
+          fields := .arbitrary offsets memIdx
+          variants := .single 0
+          isUninhabited := uninh }
+  | .slice _ => origLayout
+  | .str => origLayout
+  | .dynamic _ => origLayout
+  | .alias _ _ => origLayout
+  | .foreign _ => origLayout
+  | .other _ => origLayout
+
+/--
+Compute concrete `TypeLayout`s for a list of `RigidTy` elements.
+-/
+@[reducible]
+def RigidTy.computeLayoutList
+    (ptrBits : Nat)
+    (extEntries : List TypeLayout)
+    (args : TypeSubst) :
+    List RigidTy → Option (List TypeLayout)
+  | .nil => .some .nil
+  | k :: ks =>
+    match
+      RigidTy.computeLayout ptrBits extEntries args .none k,
+      RigidTy.computeLayoutList ptrBits extEntries args ks
+    with
+    | .some fl, .some fls => .some (fl :: fls)
+    | _, _ => .none
+end
+
+/--
+Instantiate a `LayoutTable` with `args : TypeSubst`, substituting parametric
+placeholder slots, appending the concrete parameter layouts from `args`, and
+recomputing dependent `TypeLayout` entries.
+-/
+@[reducible]
+def _root_.Trusted.Rustc.V2026_08_01.Layout.LayoutTable.instantiate
+    (tbl : LayoutTable)
+    (args : TypeSubst) :
+    LayoutTable :=
+  LayoutTable.appendParamLayouts tbl (TypeSubst.layouts args)
+
+/--
+Alias for `LayoutTable.instantiate` inside the `MirAst` namespace.
+-/
+@[reducible]
+def LayoutTable.instantiate
+    (tbl : LayoutTable)
+    (args : TypeSubst) :
+    LayoutTable :=
+  _root_.Trusted.Rustc.V2026_08_01.Layout.LayoutTable.instantiate tbl args
+
+/--
+Universal identity theorem for `LayoutTable.instantiate` on `.nil`.
+-/
+@[simp]
+theorem _root_.Trusted.Rustc.V2026_08_01.Layout.LayoutTable.instantiate_nil
+    (tbl : LayoutTable) :
+    tbl.instantiate .nil = tbl := by
+  exact LayoutTable.appendParamLayouts_nil tbl
+
+/--
+Universal identity theorem for `LayoutTable.instantiate` on `.nil` in `MirAst`.
+-/
+@[simp]
+theorem LayoutTable.instantiate_nil (tbl : LayoutTable) :
+    LayoutTable.instantiate tbl .nil = tbl := by
+  exact LayoutTable.appendParamLayouts_nil tbl
+
+/--
+Alias for `LayoutTable.instantiate_nil`.
+-/
+@[simp]
+theorem LayoutTable.instantiate_empty_id (tbl : LayoutTable) :
+    LayoutTable.instantiate tbl .nil = tbl :=
+  LayoutTable.instantiate_nil tbl
+
+/--
+Instantiate a `Ty` by structurally substituting `.param` occurrences in
+`ty.kind` and updating `ty.layoutIdx` to the appended layout slot
+`tbl.entries.length + idx` when `ty.kind` is `.param idx _` and resolved in
+`args`.
+-/
+@[reducible]
+def Ty.instantiate (tbl : LayoutTable) (args : TypeSubst) (ty : Ty) : Ty :=
+  let layoutIdx' :=
+    match ty.kind with
+    | .param idx _ =>
+      match TypeSubst.lookup args idx with
+      | .some _ => Nat.add (Trusted.Sequence.length tbl.entries) idx
+      | .none => ty.layoutIdx
+    | _ => ty.layoutIdx
+  { kind := RigidTy.instantiate args ty.kind, layoutIdx := layoutIdx' }
+
+/--
+Universal identity theorem for `Ty.instantiate` under the empty substitution
+`.nil`.
+-/
+@[simp]
+theorem Ty.instantiate_nil (tbl : LayoutTable) (ty : Ty) :
+    Ty.instantiate tbl .nil ty = ty := by
+  cases ty with
+  | mk kind layoutIdx =>
+    have hKind : RigidTy.instantiate .nil kind = kind := RigidTy.instantiate_nil kind
+    cases kind <;> dsimp [Ty.instantiate, TypeSubst.lookup] <;> rw [hKind]
+
+/--
+Alias for `Ty.instantiate_nil`.
+-/
+@[simp]
+theorem Ty.instantiate_empty_id (tbl : LayoutTable) (ty : Ty) :
+    Ty.instantiate tbl .nil ty = ty :=
+  Ty.instantiate_nil tbl ty
+
+/--
+When `RigidTy.hasSubstParam args ty.kind = false`, `Ty.instantiate tbl args ty = ty`.
+-/
+@[simp]
+theorem Ty.instantiate_of_hasSubstParam_false
+    (tbl : LayoutTable)
+    (args : TypeSubst)
+    (ty : Ty)
+    (h : RigidTy.hasSubstParam args ty.kind = false) :
+    Ty.instantiate tbl args ty = ty := by
+  cases ty with
+  | mk kind layoutIdx =>
+    dsimp at h
+    have hKind : RigidTy.instantiate args kind = kind :=
+      RigidTy.instantiate_of_hasSubstParam_false args kind h
+    dsimp [Ty.instantiate]
+    rw [hKind]
+    clear hKind
+    cases kind with
+    | param idx name =>
+      dsimp [RigidTy.hasSubstParam] at h ⊢
+      cases hLook : TypeSubst.lookup args idx with
+      | none => rfl
+      | some _ => rw [hLook] at h; cases h
+    | _ => rfl
+
+/--
+Instantiate a `ConstOperand` by instantiating its `ty` field.
+-/
+@[reducible]
+def ConstOperand.instantiate
+    (tbl : LayoutTable)
+    (args : TypeSubst)
+    (c : ConstOperand) :
+    ConstOperand :=
+  { c with ty := Ty.instantiate tbl args c.ty }
+
+/--
+Universal identity theorem for `ConstOperand.instantiate` on `.nil`.
+-/
+@[simp]
+theorem ConstOperand.instantiate_nil (tbl : LayoutTable) (c : ConstOperand) :
+    ConstOperand.instantiate tbl .nil c = c := by
+  cases c
+  simp [ConstOperand.instantiate]
+
+/--
+Instantiate a `TraitRef` by structurally instantiating its `args` type list.
+-/
+@[reducible]
+def TraitRef.instantiate (args : TypeSubst) (tr : TraitRef) : TraitRef :=
+  { tr with args := RigidTy.instantiateList args tr.args }
+
+/--
+Universal identity theorem for `TraitRef.instantiate` on `.nil`.
+-/
+@[simp]
+theorem TraitRef.instantiate_nil (tr : TraitRef) :
+    TraitRef.instantiate .nil tr = tr := by
+  cases tr
+  simp [TraitRef.instantiate]
+
+/--
+Instantiate a `TraitImplEntry` by instantiating its `traitRef`.
+-/
+@[reducible]
+def TraitImplEntry.instantiate
+    (args : TypeSubst)
+    (e : TraitImplEntry) :
+    TraitImplEntry :=
+  { e with traitRef := TraitRef.instantiate args e.traitRef }
+
+/--
+Structurally instantiate a list of `TraitImplEntry` records.
+-/
+@[reducible]
+def TraitImplEntry.instantiateList
+    (args : TypeSubst) :
+    List TraitImplEntry → List TraitImplEntry
+  | .nil => .nil
+  | e :: es =>
+    TraitImplEntry.instantiate args e :: TraitImplEntry.instantiateList args es
+
+/--
+Universal identity theorem for `TraitImplEntry.instantiate` on `.nil`.
+-/
+@[simp]
+theorem TraitImplEntry.instantiate_nil (e : TraitImplEntry) :
+    TraitImplEntry.instantiate .nil e = e := by
+  cases e
+  simp [TraitImplEntry.instantiate]
+
+/--
+Universal identity theorem for `TraitImplEntry.instantiateList` on `.nil`.
+-/
+@[simp]
+theorem TraitImplEntry.instantiateList_nil :
+    (es : List TraitImplEntry) →
+    TraitImplEntry.instantiateList .nil es = es
+  | .nil => rfl
+  | e :: es =>
+    congrArg2 List.cons
+      (TraitImplEntry.instantiate_nil e)
+      (TraitImplEntry.instantiateList_nil es)
+
+/--
+Universal composition theorem for `TraitRef.instantiate`.
+-/
+@[simp]
+theorem TraitRef.instantiate_instantiate
+    (args₂ args₁ : TypeSubst)
+    (tr : TraitRef) :
+    TraitRef.instantiate args₂ (TraitRef.instantiate args₁ tr) =
+      TraitRef.instantiate (TypeSubst.compose args₂ args₁) tr := by
+  cases tr
+  simp [TraitRef.instantiate]
+
+/--
+Universal composition theorem for `TraitImplEntry.instantiate`.
+-/
+@[simp]
+theorem TraitImplEntry.instantiate_instantiate
+    (args₂ args₁ : TypeSubst)
+    (e : TraitImplEntry) :
+    TraitImplEntry.instantiate args₂ (TraitImplEntry.instantiate args₁ e) =
+      TraitImplEntry.instantiate (TypeSubst.compose args₂ args₁) e := by
+  cases e
+  simp [TraitImplEntry.instantiate]
+
+/--
+Universal composition theorem for `TraitImplEntry.instantiateList`.
+-/
+@[simp]
+theorem TraitImplEntry.instantiateList_instantiateList
+    (args₂ args₁ : TypeSubst) :
+    (es : List TraitImplEntry) →
+    TraitImplEntry.instantiateList args₂ (TraitImplEntry.instantiateList args₁ es) =
+      TraitImplEntry.instantiateList (TypeSubst.compose args₂ args₁) es
+  | .nil => rfl
+  | e :: es =>
+    congrArg2 List.cons
+      (TraitImplEntry.instantiate_instantiate args₂ args₁ e)
+      (TraitImplEntry.instantiateList_instantiateList args₂ args₁ es)
 
 end Trusted.Rustc.V2026_08_01.MirAst

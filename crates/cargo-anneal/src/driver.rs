@@ -356,6 +356,7 @@ pub fn aggregate_unit_manifests(
             let def_id = target.def_id.clone();
             let lean_module_name = derive_lean_module_from_path(&target.mir_module_path);
             let record = UnitTargetRecord {
+            trait_impls: vec![],
                 target: target.clone(),
                 lean_module_name,
                 item_kind: CapturedItemKind::Subject,
@@ -700,6 +701,7 @@ pub fn parse_unit_capture_manifest(input: &str) -> Result<UnitCaptureManifest, S
         };
 
         unit_targets.push(UnitTargetRecord {
+            trait_impls: vec![],
             target,
             lean_module_name,
             item_kind,
@@ -1088,6 +1090,7 @@ mod tests {
             rust_sources: vec![("src/lib.rs".to_string(), sha256_hex(b"pub fn add() {}"))],
             unit_targets: vec![
                 UnitTargetRecord {
+            trait_impls: vec![],
                     target: CapturedTarget {
                         def_id: "demo_crate::add".to_string(),
                         mir_module_path: "Mir/DemoCrate/add.lean".to_string(),
@@ -1098,6 +1101,7 @@ mod tests {
                     associated_subject_def_id: None,
                 },
                 UnitTargetRecord {
+            trait_impls: vec![],
                     target: CapturedTarget {
                         def_id: "demo_crate::__anodized_fn_requires_add".to_string(),
                         mir_module_path: "Mir/DemoCrate/__anodized_fn_requires_add.lean"
@@ -1171,6 +1175,7 @@ mod tests {
                 ("crates/shared/src/lib.rs".to_string(), shared_src_hash.clone()),
             ],
             unit_targets: vec![UnitTargetRecord {
+            trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: "crate_b::zeta".to_string(),
                     mir_module_path: "Mir/CrateB/zeta.lean".to_string(),
@@ -1195,6 +1200,7 @@ mod tests {
             ],
             unit_targets: vec![
                 UnitTargetRecord {
+            trait_impls: vec![],
                     target: CapturedTarget {
                         def_id: "crate_a::alpha".to_string(),
                         mir_module_path: "Mir/CrateA/alpha.lean".to_string(),
@@ -1207,6 +1213,7 @@ mod tests {
                 // Duplicate target across units with identical digest should
                 // deduplicate cleanly.
                 UnitTargetRecord {
+            trait_impls: vec![],
                     target: CapturedTarget {
                         def_id: "crate_b::zeta".to_string(),
                         mir_module_path: "Mir/CrateB/zeta.lean".to_string(),
@@ -1307,6 +1314,7 @@ mod tests {
             compilation_succeeded: true,
             rust_sources: vec![("src/lib.rs".to_string(), sha256_hex(source))],
             unit_targets: vec![UnitTargetRecord {
+            trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: def_id.to_string(),
                     mir_module_path: format!("Mir/Demo/{}.lean", def_id.replace("demo::", "")),
@@ -1395,5 +1403,1107 @@ mod tests {
             filter_val,
             std::ffi::OsStr::new("checked_scale,Ptr::try_from")
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn multi_crate_transitive_callees_and_external_spec_override_end_to_end() {
+        let root = unique_temp_dir("multi-crate-transitive-callees-ext-spec");
+        let crate_a_dir = root.join("crate_a");
+        let crate_b_dir = root.join("crate_b");
+        fs::create_dir_all(crate_a_dir.join("src")).expect("create crate_a/src");
+        fs::create_dir_all(crate_b_dir.join("src")).expect("create crate_b/src");
+
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root");
+
+        fs::write(
+            crate_b_dir.join("Cargo.toml"),
+            "[package]\nname = \"crate_b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write crate_b/Cargo.toml");
+        fs::write(
+            crate_b_dir.join("src/lib.rs"),
+            r#"#![no_std]
+use core::ops::{Range, RangeBounds};
+
+pub fn inner_leaf(x: usize) -> usize {
+    x.wrapping_add(1)
+}
+
+pub fn helper_add(x: usize, y: usize) -> usize {
+    let r: Range<usize> = 0..1024;
+    if RangeBounds::contains(&r, &x) {
+        inner_leaf(x).wrapping_add(y)
+    } else {
+        y
+    }
+}
+
+pub fn overridden_dep(x: usize) -> usize {
+    x.wrapping_add(5)
+}
+
+pub fn slice_len<T>(s: &[T]) -> usize {
+    // A direct `s.len()` is lowered to `PtrMetadata` by rustc; calling through
+    // a function pointer keeps a real call to `core::slice::<impl [T]>::len` in
+    // the MIR.
+    let len_fn: fn(&[T]) -> usize = <[T]>::len;
+    len_fn(s)
+}
+"#,
+        )
+        .expect("write crate_b/src/lib.rs");
+
+        fs::write(
+            crate_a_dir.join("Cargo.toml"),
+            "[package]\nname = \"crate_a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ncrate_b = { path = \"../crate_b\" }\n",
+        )
+        .expect("write crate_a/Cargo.toml");
+        fs::write(
+            crate_a_dir.join("src/lib.rs"),
+            r#"#![allow(dead_code, non_snake_case, non_upper_case_globals)]
+
+pub const __ANNEAL_EXT_SPEC_TARGET_ext_overridden_dep: &str = "crate_b::overridden_dep";
+pub fn ext_overridden_dep(x: usize) -> usize {
+    let _: fn(usize) -> usize = *::core::hint::black_box(&crate_b::overridden_dep);
+    let _ = (x,);
+    unreachable!()
+}
+pub fn __anodized_fn_requires_ext_overridden_dep(x: usize) -> bool {
+    x < 100
+}
+pub fn __anodized_fn_ensures_ext_overridden_dep(x: usize, ret: usize) -> bool {
+    ret == x.wrapping_add(5)
+}
+
+pub const __ANNEAL_EXT_SPEC_TARGET_ext_slice_is_empty: &str = "<[u8]>::is_empty";
+pub fn ext_slice_is_empty(s: &[u8]) -> bool {
+    let _: fn(&[u8]) -> bool = *::core::hint::black_box(&<[u8]>::is_empty);
+    let _ = (s,);
+    unreachable!()
+}
+
+pub fn caller_default_callees(s: &[u8], extra: usize) -> usize {
+    crate_b::helper_add(crate_b::slice_len(s), extra)
+}
+
+pub fn caller_with_external_specs(s: &[u8], x: usize) -> usize {
+    let empty_bonus = <[u8]>::is_empty(s) as usize;
+    crate_b::overridden_dep(x).wrapping_add(crate_b::inner_leaf(empty_bonus))
+}
+
+unsafe extern "C" {
+    pub fn ffi_checksum(len: usize) -> u32;
+}
+
+pub const __ANNEAL_EXT_SPEC_TARGET_ext_ffi_checksum: &str = "ffi_checksum";
+pub unsafe fn ext_ffi_checksum(len: usize) -> u32 {
+    let _: unsafe extern "C" fn(usize) -> u32 = *::core::hint::black_box(&ffi_checksum);
+    let _ = (len,);
+    unreachable!()
+}
+
+pub fn caller_ffi_and_len(s: &[u8]) -> u32 {
+    unsafe { ffi_checksum(crate_b::slice_len(s)) }
+}
+"#,
+        )
+        .expect("write crate_a/src/lib.rs");
+
+        let mut cfg = CaptureDriverConfig::new(&crate_a_dir);
+        cfg.manifest_path = Some(crate_a_dir.join("Cargo.toml"));
+        // Always (incrementally) rebuild the capture wrapper so the test never
+        // runs a stale `anneal-rustc-capture` binary from an earlier checkout.
+        let cargo_bin = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let status = Command::new(cargo_bin)
+            .args(["build", "-p", "anneal-rustc-capture", "--bin", "anneal-rustc-capture"])
+            .current_dir(repo_root)
+            .status()
+            .expect("build anneal-rustc-capture");
+        assert!(
+            status.success(),
+            "cargo build -p anneal-rustc-capture must succeed"
+        );
+        let wrapper = resolve_rustc_wrapper(&cfg);
+        assert!(wrapper.is_file(), "expected capture wrapper at {}", wrapper.display());
+
+        let (manifest, records) =
+            run_cargo_capture(&cfg).expect("run_cargo_capture on multi-crate workspace");
+        assert!(manifest.compilation_succeeded);
+
+        let mut scaffold_cfg = crate::scaffold::ScaffoldConfig::new(&crate_a_dir);
+        scaffold_cfg.units_dir = Some(cfg.units_dir.clone());
+        scaffold_cfg.anneal_repo_root = Some(repo_root.to_path_buf());
+        let scaffold_report =
+            crate::scaffold::scaffold_workspace_with_config(&scaffold_cfg, &records)
+                .expect("scaffold multi-crate workspace");
+
+        let gen_dir = crate_a_dir.join(".anneal/generated");
+        let ob_default = fs::read_to_string(
+            gen_dir.join("Obligations/CrateA/caller_default_callees.lean"),
+        )
+        .expect("read caller_default_callees.lean");
+
+        // 1. Default transitive `defaultCallees` contains `Mir.CrateB.helper_add.body`,
+        // transitive `Mir.CrateB.inner_leaf.body`, `Mir.Core.*len*.body`, and
+        // `Mir.Core.*contains*.body` without any `#[external_spec]` needed!
+        assert!(
+            ob_default.contains("Mir.CrateB.helper_add.body"),
+            "defaultCallees must include direct dependency callee Mir.CrateB.helper_add.body:\n{ob_default}"
+        );
+        assert!(
+            ob_default.contains("Mir.CrateB.inner_leaf.body"),
+            "defaultCallees must include transitive dependency callee Mir.CrateB.inner_leaf.body:\n{ob_default}"
+        );
+        assert!(
+            ob_default.contains("len.body"),
+            "defaultCallees must include sysroot <[T]>::len body:\n{ob_default}"
+        );
+        assert!(
+            ob_default.contains("contains.body"),
+            "defaultCallees must include transitive sysroot RangeBounds::contains body:\n{ob_default}"
+        );
+
+        // 2. Explicit `#[external_spec]` override (both with clauses and clause-less)
+        // excludes overridden targets from `defaultCallees` and emits `externalSpecCallContract`!
+        let ob_override = fs::read_to_string(
+            gen_dir.join("Obligations/CrateA/caller_with_external_specs.lean"),
+        )
+        .expect("read caller_with_external_specs.lean");
+        assert!(
+            ob_override.contains("Mir.CrateB.inner_leaf.body"),
+            "non-overridden callee Mir.CrateB.inner_leaf.body must remain in defaultCallees:\n{ob_override}"
+        );
+        assert!(
+            !ob_override.contains("Mir.CrateB.overridden_dep.body"),
+            "overridden target crate_b::overridden_dep must be excluded from defaultCallees:\n{ob_override}"
+        );
+        assert!(
+            !ob_override.contains("Mir.Core.slice_impl_T_is_empty.body"),
+            "clause-less overridden target <[u8]>::is_empty must be excluded from defaultCallees:\n{ob_override}"
+        );
+        assert!(
+            ob_override.contains(
+                "def externalCallContract_CrateA_ext_overridden_dep : MirCallContract :=\n  externalSpecCallContract\n    \"crate_b::overridden_dep\"\n    Mir.CrateA.ext_overridden_dep.body"
+            ),
+            "expected externalCallContract_CrateA_ext_overridden_dep in caller_with_external_specs.lean:\n{ob_override}"
+        );
+        assert!(
+            ob_override.contains(
+                "def externalCallContract_CrateA_ext_slice_is_empty : MirCallContract :=\n  externalSpecCallContract\n    \"core::slice::<impl [T]>::is_empty\"\n    Mir.CrateA.ext_slice_is_empty.body\n    (fun _ => True)\n    (fun _ _ => True)"
+            ),
+            "expected clause-less externalCallContract_CrateA_ext_slice_is_empty in caller_with_external_specs.lean:\n{ob_override}"
+        );
+        // Every abstracted callee is assumed in the modular environment, not
+        // only the first one discovered.
+        for contract in [
+            "externalCallContract_CrateA_ext_overridden_dep",
+            "externalCallContract_CrateA_ext_slice_is_empty",
+        ] {
+            assert!(
+                ob_override.contains(&format!("{contract}.holdsOn h")),
+                "envAssumed must conjoin {contract}.holdsOn:\n{ob_override}"
+            );
+        }
+        assert!(
+            ob_override.contains("envAssumed := fun h => And ("),
+            "envAssumed must be the conjunction of every external call contract:\n{ob_override}"
+        );
+        // The claused `ensures: ret == x.wrapping_add(5)` companion calls
+        // `core::num::<impl usize>::wrapping_add`, so it is evaluated with its
+        // callees linked instead of treating the call as an arbitrary-valued
+        // external call (which would make the contract's postcondition
+        // unsatisfiable). The call-free `requires: x < 100` keeps the plain form.
+        let spec_callees_line = ob_override
+            .lines()
+            .skip_while(|l| !l.starts_with("def defaultSpecCallees : List CapturedMir :="))
+            .nth(1)
+            .unwrap_or_default();
+        assert!(
+            spec_callees_line.contains("wrapping_add"),
+            "defaultSpecCallees must link the wrapping_add body called by the ensures companion:\n{ob_override}"
+        );
+        assert!(
+            ob_override.contains(
+                "(fun args ret => MirBoolPredicateHoldsWithCallees Mir.CrateA.__anodized_fn_ensures_ext_overridden_dep.body defaultSpecCallees (List.append args (List.cons ret List.nil)))"
+            ),
+            "call-containing ensures companion must be evaluated with defaultSpecCallees:\n{ob_override}"
+        );
+        assert!(
+            ob_override.contains(
+                "(fun args => MirBoolPredicateHolds Mir.CrateA.__anodized_fn_requires_ext_overridden_dep.body args)"
+            ),
+            "call-free requires companion keeps the plain MirBoolPredicateHolds form:\n{ob_override}"
+        );
+
+        // 2b. A true `extern "C"` FFI function (no MIR body) abstracted by an
+        // `#[external_spec]` sidecar is bound by its contract, while the
+        // `<[u8]>::len` call in the same subject still steps through `core`.
+        let ob_ffi = fs::read_to_string(gen_dir.join("Obligations/CrateA/caller_ffi_and_len.lean"))
+            .expect("read caller_ffi_and_len.lean");
+        assert!(
+            ob_ffi.contains("def externalCallContract_CrateA_ext_ffi_checksum : MirCallContract :=")
+                && ob_ffi.contains("envAssumed := externalCallContract_CrateA_ext_ffi_checksum.holdsOn"),
+            "FFI target must be abstracted by its external call contract:\n{ob_ffi}"
+        );
+        let ffi_callees_line = ob_ffi
+            .lines()
+            .skip_while(|l| !l.starts_with("def defaultCallees : List CapturedMir :="))
+            .nth(1)
+            .unwrap_or_default();
+        assert!(
+            ffi_callees_line.contains("len.body") && !ffi_callees_line.contains("ffi_checksum"),
+            "defaultCallees must link <[T]>::len and contain no FFI body:\n{ob_ffi}"
+        );
+
+        // 3. Test `cargo anneal generate-external-spec` against the scaffolded workspace.
+        let snippet = crate::generate_external_spec_snippet(
+            &crate_a_dir,
+            Some(&cfg.units_dir),
+            "crate_b::helper_add",
+        )
+        .expect("generate external spec snippet for crate_b::helper_add");
+        assert!(
+            snippet.contains("#[anneal_spec::external_spec(for = crate_b::helper_add)]"),
+            "snippet must contain external_spec attribute:\n{snippet}"
+        );
+        assert!(
+            snippet.contains("unsafe fn external_spec_helper_add(x: usize, y: usize) -> usize;"),
+            "snippet must reconstruct parameter and return types from captured Mir:\n{snippet}"
+        );
+
+        let slice_len_u8_snippet = crate::generate_external_spec_snippet(
+            &crate_a_dir,
+            Some(&cfg.units_dir),
+            "<[u8]>::len",
+        )
+        .expect("generate external spec snippet for <[u8]>::len");
+        assert!(
+            slice_len_u8_snippet.contains("(&[u8]) -> usize;")
+                || slice_len_u8_snippet.contains(": &[u8]) -> usize;"),
+            "snippet for <[u8]>::len must substitute concrete u8 element type even when polymorphic Mir/Core/slice_impl_T_len.lean is on disk:\n{slice_len_u8_snippet}"
+        );
+
+        let ffi_checksum_snippet = crate::generate_external_spec_snippet(
+            &crate_a_dir,
+            Some(&cfg.units_dir),
+            "ffi_checksum",
+        )
+        .expect("generate external spec snippet for ffi_checksum");
+        assert!(
+            ffi_checksum_snippet
+                .contains("unsafe extern \"C\" fn external_spec_ffi_checksum(len: usize) -> u32;"),
+            "snippet for extern \"C\" ffi_checksum must preserve extern \"C\" ABI:\n{ffi_checksum_snippet}"
+        );
+
+        let un_authored_verify_override = fs::read_to_string(
+            gen_dir.join("Verify/CrateA/caller_with_external_specs.lean"),
+        )
+        .expect("read un-authored Verify/CrateA/caller_with_external_specs.lean");
+        assert!(
+            un_authored_verify_override.contains(
+                "theorem verified : ModularVerificationResult Obligations.CrateA.caller_with_external_specs.modularClaim"
+            ),
+            "un-authored Verify module for subject with #[external_spec] callees must target ModularVerificationResult:\n{un_authored_verify_override}"
+        );
+
+        let generic_slice_len_snippet = crate::generate_external_spec_snippet(
+            &crate_a_dir,
+            Some(&cfg.units_dir),
+            "crate_b::slice_len",
+        )
+        .expect("generate external spec snippet for generic crate_b::slice_len");
+        assert!(
+            generic_slice_len_snippet
+                .contains("unsafe fn external_spec_slice_len<T>(s: &[T]) -> usize;"),
+            "snippet for generic crate_b::slice_len must include <T> generic parameter:\n{generic_slice_len_snippet}"
+        );
+
+        // 3b. Verify `render_agent_context` classifies subjects with `#[external_spec]`
+        // callees as `modular` and emits a `ModularVerificationResult` starter template
+        // even before `Specs/` or `Proof/` files exist on disk.
+        let ctx_report = crate::agent::render_agent_context(
+            &crate_a_dir,
+            &records,
+            Some("caller_with_external_specs"),
+        )
+        .expect("render agent context for caller_with_external_specs");
+        assert!(
+            ctx_report.contains("- **`is_stateful`**: modular (`ModularItemSpec` / `ModularVerificationResult`)"),
+            "agent-context must classify subject with #[external_spec] callees as modular:\n{ctx_report}"
+        );
+        assert!(
+            ctx_report.contains(
+                "theorem verified : ModularVerificationResult Obligations.CrateA.caller_with_external_specs.modularClaim"
+            ),
+            "agent-context starter template must target ModularVerificationResult:\n{ctx_report}"
+        );
+
+        // 4. Compile all generated `Mir` and `Obligations` modules in the Lean 4 kernel (`lean`),
+        // and prove in the Lean 4 kernel that `defaultCallees` steps directly into linked callees while
+        // `externalSpecCallContract` enforces non-vacuous return-type and layout validity!
+        let examples_dir = repo_root.join("examples");
+        let lean_lib_dir = examples_dir.join(".lake/build/lib/lean");
+        let lean_bin = if let Ok(home) = std::env::var("HOME") {
+            let elan_lean = PathBuf::from(home).join(".elan/bin/lean");
+            if elan_lean.exists() {
+                elan_lean
+            } else {
+                PathBuf::from("lean")
+            }
+        } else {
+            PathBuf::from("lean")
+        };
+        let proofs_dir = crate_a_dir.join("anneal/proofs");
+        let lean_path_env = format!(
+            "{}:{}:{}",
+            lean_lib_dir.display(),
+            gen_dir.display(),
+            proofs_dir.display()
+        );
+
+        let compile_lean_file = |lean_file: &Path| {
+            let dst_olean = lean_file.with_extension("olean");
+            let root_dir = if lean_file.starts_with(&proofs_dir) {
+                &proofs_dir
+            } else {
+                &gen_dir
+            };
+            let out = Command::new(&lean_bin)
+                .current_dir(&gen_dir)
+                .env("LEAN_PATH", &lean_path_env)
+                .arg("-R")
+                .arg(root_dir)
+                .arg("-o")
+                .arg(&dst_olean)
+                .arg(lean_file)
+                .output()
+                .expect("compile Lean module");
+            assert!(
+                out.status.success(),
+                "lean failed on {}:\nstdout: {}\nstderr: {}",
+                lean_file.display(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        for mir_file in &scaffold_report.generated_mir_files {
+            compile_lean_file(mir_file);
+        }
+        for ob_file in &scaffold_report.generated_obligation_files {
+            compile_lean_file(ob_file);
+        }
+
+        let verify_brief_3_2_path = gen_dir.join("VerifyBrief32.lean");
+        let verify_brief_3_2_src = r#"import Trusted
+import Anneal
+import Obligations.CrateA.caller_default_callees
+import Obligations.CrateA.caller_with_external_specs
+import Obligations.CrateA.caller_ffi_and_len
+
+open Trusted.Sequence
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+open Trusted.VerificationResult
+
+-- 1. Subject claims carry `defaultCallees` by default and populate `s.memory.callees`.
+example :
+    Obligations.CrateA.caller_default_callees.claim.callees =
+      Obligations.CrateA.caller_default_callees.defaultCallees := rfl
+
+example (args : List Value) :
+    (initMachineStateWithCallees
+      Mir.CrateA.caller_default_callees.body
+      args
+      Obligations.CrateA.caller_default_callees.defaultCallees).memory.callees =
+      Obligations.CrateA.caller_default_callees.defaultCallees := rfl
+
+-- 2. Without `#[external_spec]`, `findCallee?` over `defaultCallees` resolves
+--    both direct (`crate_b::helper_add`) and transitive (`crate_b::inner_leaf`) callees!
+example :
+    findCallee?
+      Obligations.CrateA.caller_default_callees.defaultCallees
+      "crate_b::helper_add" = .some Mir.CrateB.helper_add.body := rfl
+
+example :
+    findCallee?
+      Obligations.CrateA.caller_default_callees.defaultCallees
+      "crate_b::inner_leaf" = .some Mir.CrateB.inner_leaf.body := rfl
+
+-- 3. With `#[external_spec(for = ...)]`, overridden targets (`crate_b::overridden_dep`
+--    and `core::slice::<impl [T]>::is_empty`) are excluded from `defaultCallees`
+--    (so `findCallee?` returns `.none` and `evalTerminator` emits `MirCallE`),
+--    while non-overridden `crate_b::inner_leaf` stays linked!
+example :
+    findCallee?
+      Obligations.CrateA.caller_with_external_specs.defaultCallees
+      "crate_b::overridden_dep" = .none := rfl
+
+example :
+    findCallee?
+      Obligations.CrateA.caller_with_external_specs.defaultCallees
+      "core::slice::<impl [T]>::is_empty" = .none := rfl
+
+example :
+    findCallee?
+      Obligations.CrateA.caller_with_external_specs.defaultCallees
+      "crate_b::inner_leaf" = .some Mir.CrateB.inner_leaf.body := rfl
+
+-- 4. Clause-less `#[external_spec(for = <[u8]>::is_empty)]` generates a non-vacuous
+--    well-typed `MirCallContract` whose postcondition accepts valid `bool` scalars
+--    (`0` or `1` of byte width `1`) and rejects out-of-range values.
+example (sVal : Value) :
+    Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
+      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      (.returned (.scalar ⟨1, 1⟩) emptyMemory) :=
+  ⟨⟨rfl, rfl, rfl, rfl, ⟨[], rfl⟩⟩, ⟨1, by decide, rfl⟩, trivial⟩
+
+example (sVal : Value) :
+    ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
+      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      (.returned (.scalar ⟨2, 1⟩) emptyMemory) := by
+  rintro ⟨_, ⟨b, hb_lt, h_ret⟩, _⟩
+  cases h_ret
+  omega
+
+-- 5. The default contract assumes nothing a real callee could violate: a normal
+--    return may mutate the heap (only the call frame is preserved), and the callee
+--    may unwind or abort.
+example (sVal : Value) :
+    Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
+      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      (.returned (.scalar ⟨0, 1⟩) { emptyMemory with nextAllocId := 7, nextTag := 9 }) :=
+  ⟨⟨rfl, rfl, rfl, rfl, ⟨[], rfl⟩⟩, ⟨0, by decide, rfl⟩, trivial⟩
+
+example (sVal : Value) :
+    Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
+      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      (.panicked { emptyMemory with nextTag := 3 }) :=
+  ⟨rfl, rfl, rfl, rfl, ⟨[], rfl⟩⟩
+
+example (sVal : Value) :
+    Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
+      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      .aborted :=
+  trivial
+
+-- 5b. `callFramePreserved` rejects external call responses that clobber the
+--     caller's `activeProtectors` or drop existing reified function pointers,
+--     but admits Tree Borrows tag-table changes (a write through an argument
+--     reference updates tag permissions) and freshly reified function pointers.
+example (sVal : Value) :
+    ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
+      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      (.returned (.scalar ⟨0, 1⟩) { emptyMemory with activeProtectors := [1] }) := by
+  rintro ⟨⟨_, _, _, h_prot, _⟩, _, _⟩
+  cases h_prot
+
+example (sVal : Value) (entry : BorrowEntry) (fnEntry : FnPtrEntry) :
+    Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
+      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      (.returned (.scalar ⟨1, 1⟩)
+        { emptyMemory with borrows := [entry], fnPtrs := [fnEntry], nextTag := 2 }) :=
+  ⟨⟨rfl, rfl, rfl, rfl, ⟨[fnEntry], rfl⟩⟩, ⟨1, by decide, rfl⟩, trivial⟩
+
+example (sVal : Value) (fnEntry : FnPtrEntry) :
+    ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
+      { defPath := "core::slice::<impl [T]>::is_empty"
+        args := [sVal]
+        memory := { emptyMemory with fnPtrs := [fnEntry] } }
+      (.returned (.scalar ⟨1, 1⟩) emptyMemory) := by
+  rintro ⟨⟨_, _, _, _, ⟨fresh, h_fn⟩⟩, _, _⟩
+  cases fresh <;> cases h_fn
+
+-- 5c. `valueValidForTy` recursively validates nested element types of `.tuple`
+--     and `.array` values, rejecting ill-typed elements and non-ZST `.unit`
+--     while still admitting `.unit` for zero-sized tuples and empty arrays.
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    valueValidForTy L { kind := .tuple [.uint .u8, .bool], layoutIdx := 0 }
+      (.aggregate 0 [.scalar ⟨255, 1⟩, .scalar ⟨1, 1⟩]) :=
+  Or.inr ⟨[.scalar ⟨255, 1⟩, .scalar ⟨1, 1⟩], rfl, rfl, ⟨255, by decide, rfl⟩, ⟨1, by decide, rfl⟩, trivial⟩
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    ¬ valueValidForTy L { kind := .tuple [.uint .u8, .bool], layoutIdx := 0 }
+      (.aggregate 0 [.scalar ⟨255, 1⟩, .scalar ⟨2, 1⟩]) := by
+  rintro (⟨h_unit, _⟩ | ⟨fields, h_agg, _, h_elems⟩)
+  · cases h_unit
+  · cases h_agg
+    rcases h_elems with ⟨_, ⟨b, hb_lt, h_eq⟩, _⟩
+    cases h_eq
+    omega
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    ¬ valueValidForTy L { kind := .tuple [.uint .u8, .bool], layoutIdx := 0 } .unit := by
+  rintro (⟨_, ⟨bits, _, h_sc⟩, _⟩ | ⟨fields, h_agg, _⟩)
+  · cases h_sc
+  · cases h_agg
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    valueValidForTy L { kind := .tuple [.tuple [], .tuple []], layoutIdx := 0 } .unit :=
+  Or.inl ⟨rfl, Or.inl rfl, Or.inl rfl, trivial⟩
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    valueValidForTy L { kind := .array .bool 2, layoutIdx := 0 }
+      (.aggregate 0 [.scalar ⟨0, 1⟩, .scalar ⟨1, 1⟩]) :=
+  Or.inr ⟨[.scalar ⟨0, 1⟩, .scalar ⟨1, 1⟩], rfl, rfl, ⟨0, by decide, rfl⟩, ⟨1, by decide, rfl⟩, trivial⟩
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    ¬ valueValidForTy L { kind := .array .bool 2, layoutIdx := 0 }
+      (.aggregate 0 [.scalar ⟨0, 1⟩, .scalar ⟨2, 1⟩]) := by
+  rintro (⟨h_unit, _⟩ | ⟨elems, h_agg, _, h_elems⟩)
+  · cases h_unit
+  · cases h_agg
+    rcases h_elems with ⟨_, ⟨b, hb_lt, h_eq⟩, _⟩
+    cases h_eq
+    omega
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    ¬ valueValidForTy L { kind := .array .bool 2, layoutIdx := 0 } .unit := by
+  rintro (⟨_, h_len | ⟨b, _, h_sc⟩⟩ | ⟨elems, h_agg, _⟩)
+  · cases h_len
+  · cases h_sc
+  · cases h_agg
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
+    valueValidForTy L { kind := .array (.uint .u8) 0, layoutIdx := 0 } .unit :=
+  Or.inl ⟨rfl, Or.inl rfl⟩
+
+-- 6. The default input contract requires well-typed arguments: the `&[u8]`
+--    parameter must be a wide (pointer, length) aggregate with a valid 64-bit
+--    `usize` length scalar (`sizeBytes = 8` and `bits < 2^64`), not a thin
+--    pointer or a wide pointer with wrong-width/out-of-range length metadata.
+example (p : ProvenancePtr) :
+    Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.pre
+      { defPath := "core::slice::<impl [T]>::is_empty"
+        args := [.aggregate 0 [.ptr p 8, .scalar ⟨3, 8⟩]]
+        memory := emptyMemory } :=
+  ⟨rfl, rfl, ⟨⟨p, 8, 3, by decide, rfl⟩, trivial⟩, trivial⟩
+
+example (p : ProvenancePtr) :
+    ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.pre
+      { defPath := "core::slice::<impl [T]>::is_empty"
+        args := [.ptr p 8]
+        memory := emptyMemory } := by
+  rintro ⟨_, _, ⟨⟨_, _, _, _, h⟩, _⟩, _⟩
+  cases h
+
+example (p : ProvenancePtr) :
+    ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.pre
+      { defPath := "core::slice::<impl [T]>::is_empty"
+        args := [.aggregate 0 [.ptr p 8, .scalar ⟨3, 4⟩]]
+        memory := emptyMemory } := by
+  rintro ⟨_, _, ⟨⟨_, _, _, _, h⟩, _⟩, _⟩
+  cases h
+
+example (p : ProvenancePtr) :
+    ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.pre
+      { defPath := "core::slice::<impl [T]>::is_empty"
+        args := [.aggregate 0 [.ptr p 8, .scalar ⟨18446744073709551616, 8⟩]]
+        memory := emptyMemory } := by
+  rintro ⟨_, _, ⟨⟨_, _, len, h_lt, h_eq⟩, _⟩, _⟩
+  cases h_eq
+  exact absurd h_lt (by decide)
+
+-- 7. Wide references, raw pointers, generic pointees, and wide reborrow safety:
+--    slice and `str` references must carry 64-bit `usize` length metadata,
+--    reborrowing `&*s` on a dangling wide pointer faults with `.ub` while
+--    global or borrow-backed wide slices succeed, and `rigidTyMatchesCalleeDecl`
+--    recurses through generic `.fnPtr` types.
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (p : ProvenancePtr) :
+    valueValidForTy L { kind := .ref .not .str, layoutIdx := 0 }
+      (.aggregate 0 [.ptr p 8, .scalar ⟨5, 8⟩]) :=
+  ⟨p, 8, 5, by decide, rfl⟩
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (p : ProvenancePtr) :
+    ¬ valueValidForTy L { kind := .rawPtr .mut (.slice (.uint .u8)), layoutIdx := 0 }
+      (.ptr p 8) := by
+  rintro ⟨_, _, _, _, h⟩
+  cases h
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (p : ProvenancePtr) :
+    valueValidForTy L { kind := .ref .not (.param 0 "T"), layoutIdx := 0 } (.ptr p 8) ∧
+    valueValidForTy L { kind := .ref .not (.param 0 "T"), layoutIdx := 0 }
+      (.aggregate 0 [.ptr p 8, .scalar ⟨5, 8⟩]) :=
+  ⟨Or.inl (Or.inl ⟨p, 8, rfl⟩), Or.inr ⟨p, 8, .scalar ⟨5, 8⟩, Or.inr ⟨⟨5, 8⟩, rfl⟩, rfl⟩⟩
+
+example (p : ProvenancePtr) :
+    evalRvalue
+      [.init (.aggregate 0 [.ptr p 8, .scalar ⟨4, 8⟩])]
+      (.ref .shared { local_ := 0, projection := [.deref] })
+      emptyMemory = .ub :=
+  rfl
+
+example :
+    evalRvalue
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])]
+      (.ref .shared { local_ := 0, projection := [.deref] })
+      { emptyMemory with
+        globals := [{ allocId := 7, bytes := [.none, .none, .none, .none], relocations := [], align := ⟨1⟩, mutability := .not }] } =
+    .ok
+      (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])]
+      { emptyMemory with
+        globals := [{ allocId := 7, bytes := [.none, .none, .none, .none], relocations := [], align := ⟨1⟩, mutability := .not }] } :=
+  rfl
+
+example :
+    evalRvalue
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])]
+      (.ref (.mut false) { local_ := 0, projection := [.deref] })
+      { emptyMemory with
+        globals := [{ allocId := 7, bytes := [.none, .none, .none, .none], relocations := [], align := ⟨1⟩, mutability := .not }] } = .ub :=
+  rfl
+
+example :
+    rigidTyMatchesCalleeDecl
+      [.uint .u32, .bool]
+      8
+      (.fnPtr [.uint .u32] .bool .safe .rust)
+      (.fnPtr [.param 0 "T"] (.param 1 "U") .safe .rust) = true ∧
+    rigidTyMatchesCalleeDecl
+      [.uint .u32, .bool]
+      8
+      (.fnPtr [.uint .u64] .bool .safe .rust)
+      (.fnPtr [.param 0 "T"] (.param 1 "U") .safe .rust) = false :=
+  ⟨rfl, rfl⟩
+
+-- 7b. Nested `core::convert::Infallible` inside a `.tuple` is rejected even when
+--     `optLayoutIdx = .none` or `layouts.entries` is empty, mutable global wide
+--     reborrows (`alloc.mutability = .mut`) and vtable `.ptr` metadata succeed,
+--     and `rigidTyMatchesCalleeDecl` recurses into `.fnDef`, `.closure`, and `.alias`.
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (v : Value) :
+    ¬ valueValidForTy L
+      { kind := .tuple [.uint .u32, .adt "core::convert::Infallible" []], layoutIdx := 0 }
+      (.aggregate 0 [.scalar ⟨1, 4⟩, v]) := by
+  rintro (⟨h_unit, _⟩ | ⟨fields, h_agg, _, h_elems⟩)
+  · cases h_unit
+  · cases h_agg
+    exact h_elems.2.1
+
+example :
+    evalRvalue
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])]
+      (.ref (.mut false) { local_ := 0, projection := [.deref] })
+      { emptyMemory with
+        globals := [{ allocId := 7, bytes := [.none, .none, .none, .none], relocations := [], align := ⟨1⟩, mutability := .mut }] } =
+    .ok
+      (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])]
+      { emptyMemory with
+        globals := [{ allocId := 7, bytes := [.none, .none, .none, .none], relocations := [], align := ⟨1⟩, mutability := .mut }] } :=
+  rfl
+
+example (vtablePtr : ProvenancePtr) :
+    evalRvalue
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .ptr vtablePtr 8])]
+      (.ref .shared { local_ := 0, projection := [.deref] })
+      { emptyMemory with
+        globals := [{ allocId := 7, bytes := [.none, .none, .none, .none], relocations := [], align := ⟨1⟩, mutability := .not }] } = .ub :=
+  rfl
+
+example :
+    rigidTyMatchesCalleeDecl
+      [.uint .u32]
+      8
+      (.fnDef "f" [.uint .u32])
+      (.fnDef "f" [.param 0 "T"]) = true ∧
+    rigidTyMatchesCalleeDecl
+      [.uint .u32]
+      8
+      (.closure "c" [.uint .u64])
+      (.closure "c" [.param 0 "T"]) = false ∧
+    rigidTyMatchesCalleeDecl
+      [.uint .u32]
+      8
+      (.alias "Assoc" [.uint .u32])
+      (.alias "Assoc" [.param 0 "T"]) = true :=
+  ⟨rfl, rfl, rfl⟩
+
+-- 7c. Wide-to-thin `CastKind.ptrToPtr` (as in `<[T]>::as_ptr`), wide-to-wide
+--     `CastKind.ptrToPtr`, array-to-slice `Unsize`, and rejection of non-word
+--     (`.unit`) wide-pointer metadata.
+example (p : ProvenancePtr) :
+    evalRvalue
+      [.init (.aggregate 0 [.ptr p 8, .scalar ⟨4, 8⟩])]
+      (.cast .ptrToPtr (.move { local_ := 0, projection := .nil })
+        { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 })
+      emptyMemory =
+    .ok (.ptr p 8) [.uninit] emptyMemory :=
+  rfl
+
+example (p : ProvenancePtr) :
+    evalRvalue
+      [.init (.aggregate 0 [.ptr p 8, .scalar ⟨4, 8⟩])]
+      (.cast .ptrToPtr (.move { local_ := 0, projection := .nil })
+        { kind := .rawPtr .not (.slice (.uint .u8)), layoutIdx := 0 })
+      emptyMemory =
+    .ok (.aggregate 0 [.ptr p 8, .scalar ⟨4, 8⟩]) [.uninit] emptyMemory :=
+  rfl
+
+example :
+    evalRvalue
+      [.init (.ptr { allocId := 7, offsetBytes := 0 } 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
+        { kind := .ref .not (.slice (.uint .u8)), layoutIdx := 0 })
+      emptyMemory
+      (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.array (.uint .u8) 4), layoutIdx := 0 }, debugName := .none }]) =
+    .ok (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩]) [.init (.ptr { allocId := 7, offsetBytes := 0 } 8)] emptyMemory :=
+  rfl
+
+example :
+    evalRvalue
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .unit])]
+      (.ref .shared { local_ := 0, projection := [.deref] })
+      { emptyMemory with
+        globals := [{ allocId := 7, bytes := [.none, .none, .none, .none], relocations := [], align := ⟨1⟩, mutability := .not }] } = .ub :=
+  rfl
+
+example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (p : ProvenancePtr) :
+    ¬ valueValidForTy L { kind := .ref .not (.dynamic "Trait"), layoutIdx := 0 }
+      (.aggregate 0 [.ptr p 8, .unit]) := by
+  rintro ⟨_, _, _, h_meta, h_eq⟩
+  cases h_eq
+  rcases h_meta with ⟨_, _, h⟩ | ⟨_, _, h⟩ <;> cases h
+
+-- 7d. `valueValidForTy` rejects `Value.unit` for non-zero-sized inhabited `.adt`
+--     types (both at top level and when nested inside `.tuple` via `fieldLayouts`)
+--     while admitting `.unit` for zero-sized `.adt` types; `Unsize` and other
+--     pointer coercions fault with `.ub` on shared-to-mutable (`&[u8; 4] -> &mut [u8]`,
+--     `&[u8] -> &mut [u8]`), element-mismatch (`&[u8; 4] -> &[u32]`), thin-to-`&str`,
+--     and `.disabled` borrow tags; and `CastKind.ptrToPtr` faults with `.ub` on
+--     thin-to-wide raw pointer casts.
+def sampleAdtLayoutTable : Trusted.Rustc.V2026_06_01.Layout.LayoutTable := {
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [
+    { size := ⟨4⟩, align := ⟨4⟩, backendRepr := .memory, fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [] },
+    { size := ⟨0⟩, align := ⟨1⟩, backendRepr := .memory, fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [] },
+    { size := ⟨8⟩, align := ⟨4⟩, backendRepr := .memory, fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0, isUninhabited := false, fieldLayouts := [0, 0] }
+  ]
+}
+
+example :
+    ¬ valueValidForTy sampleAdtLayoutTable
+      { kind := .adt "my_crate::WrapperU32" [], layoutIdx := 0 }
+      .unit :=
+  id
+
+example :
+    ¬ valueValidForTy sampleAdtLayoutTable
+      { kind := .tuple [.uint .u32, .adt "my_crate::WrapperU32" []], layoutIdx := 2 }
+      (.aggregate 0 [.scalar ⟨1, 4⟩, .unit]) := by
+  rintro (⟨h_unit, _⟩ | ⟨fields, h_agg, _, h_elems⟩)
+  · cases h_unit
+  · cases h_agg
+    exact h_elems.2.1
+
+example :
+    valueValidForTy sampleAdtLayoutTable
+      { kind := .adt "my_crate::WrapperU32" [], layoutIdx := 0 }
+      (.aggregate 0 [.scalar ⟨42, 4⟩]) ∧
+    valueValidForTy sampleAdtLayoutTable
+      { kind := .adt "my_crate::UnitMarker" [], layoutIdx := 1 }
+      .unit :=
+  ⟨trivial, trivial⟩
+
+example :
+    evalRvalue
+      [.init (.ptr { allocId := 7, offsetBytes := 0 } 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
+        { kind := .ref .mut (.slice (.uint .u8)), layoutIdx := 0 })
+      emptyMemory
+      (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.array (.uint .u8) 4), layoutIdx := 0 }, debugName := .none }]) = .ub ∧
+    evalRvalue
+      [.init (.ptr { allocId := 7, offsetBytes := 0 } 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
+        { kind := .ref .not (.slice (.uint .u32)), layoutIdx := 0 })
+      emptyMemory
+      (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.array (.uint .u8) 4), layoutIdx := 0 }, debugName := .none }]) = .ub ∧
+    evalRvalue
+      [.init (.ptr { allocId := 1, offsetBytes := 0 } 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
+        { kind := .ref .not (.slice (.uint .u8)), layoutIdx := 0 })
+      { emptyMemory with
+        borrows := [{ tag := 1, targetLocal := 5, targetProjection := .nil, perm := .disabled }] }
+      (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.array (.uint .u8) 4), layoutIdx := 0 }, debugName := .none }]) = .ub ∧
+    evalRvalue
+      [.init (.ptr { allocId := 7, offsetBytes := 0 } 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
+        { kind := .ref .not .str, layoutIdx := 0 })
+      emptyMemory
+      (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.array (.uint .u8) 4), layoutIdx := 0 }, debugName := .none }]) = .ub ∧
+    evalRvalue
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
+        { kind := .ref .mut (.slice (.uint .u8)), layoutIdx := 0 })
+      emptyMemory
+      (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.slice (.uint .u8)), layoutIdx := 0 }, debugName := .none }]) = .ub :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+example (p : ProvenancePtr) :
+    evalRvalue
+      [.init (.ptr p 8)]
+      (.cast .ptrToPtr (.move { local_ := 0, projection := .nil })
+        { kind := .rawPtr .not (.slice (.uint .u8)), layoutIdx := 0 })
+      emptyMemory = .ub :=
+  rfl
+
+-- 8. The FFI target has no captured body, so a call to it is a `MirCallE`
+--    interaction bound only by its external call contract, whose postcondition
+--    types the `u32` result and forbids `.panicked` for `extern "C"` (nounwind)
+--    targets.
+example (lenVal : Value) :
+    ¬ Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum.post
+      { defPath := "ffi_checksum", args := [lenVal], memory := emptyMemory }
+      (.returned (.scalar ⟨4294967296, 4⟩) emptyMemory) := by
+  rintro ⟨_, ⟨bits, h_lt, h_ret⟩, _⟩
+  cases h_ret
+  exact absurd h_lt (by decide)
+
+example (lenVal : Value) (memAfter : Memory) :
+    ¬ Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum.post
+      { defPath := "ffi_checksum", args := [lenVal], memory := emptyMemory }
+      (.panicked memAfter) :=
+  id
+
+-- 9. Every abstracted callee is assumed in the modular environment.
+example (h : ExternalCallHandler)
+    (h1 :
+      Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_overridden_dep.holdsOn h)
+    (h2 :
+      Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.holdsOn h) :
+    Obligations.CrateA.caller_with_external_specs.modularClaim.envAssumed h := by
+  first
+  | exact ⟨h1, h2⟩
+  | exact ⟨h2, h1⟩
+
+-- 10. End-to-end modular proof of `caller_ffi_and_len`: steps through
+--     `crate_b::slice_len` and `core::slice::<impl [T]>::len` via `defaultCallees`
+--     and discharges `ffi_checksum` via `externalCallContract_CrateA_ext_ffi_checksum`.
+instance callerFfiAndLenSpec : ModularItemSpec "crate_a::caller_ffi_and_len" :=
+  Obligations.CrateA.caller_ffi_and_len.refineModularSpec
+    Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum.holdsOn
+    (fun args mem =>
+      ∃ offset : Nat, ∃ n : Nat,
+        n < 18446744073709551616 ∧
+        args = [.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]] ∧
+        mem = {
+          nextAllocId := 0
+          globals := []
+          borrows := [{ tag := 1, targetLocal := 10, targetProjection := .nil, perm := .frozen }]
+          nextTag := 2
+          callees := []
+          traitImpls := []
+          callStack := []
+          activeCallee := .none
+          activeProtectors := []
+          nextProtector := 0
+          callerLocals := []
+          fnPtrs := []
+        })
+    (fun _ _ ret _ =>
+      ∃ bits : Nat, bits < 4294967296 ∧ ret = .scalar { bits := bits, sizeBytes := 4 })
+
+theorem callerFfiAndLen_verified :
+    ModularVerificationResult Obligations.CrateA.caller_ffi_and_len.modularClaim := by
+  refine Anneal.Rustc.V2026_06_01.SymbolicEval.verifyModularContractWithCalleesMirSym
+    Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
+    Mir.CrateA.caller_ffi_and_len.body
+    Obligations.CrateA.caller_ffi_and_len.defaultCallees
+    callerFfiAndLenSpec.pre
+    callerFfiAndLenSpec.post
+    10
+    ?_
+  rintro args mem ⟨_, offset, n, hn, rfl, rfl⟩
+  intro ans h_post
+  cases ans with
+  | returned retVal memAfter =>
+    rcases h_post with ⟨⟨_, h_stack, h_active, _, _⟩, h_ret, _⟩
+    have h_act : memAfter.activeCallee = .some Mir.CrateA.caller_ffi_and_len.body := h_active
+    have h_stk : memAfter.callStack = .nil := h_stack
+    unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+    unfold initMachineStateWithMemoryAndCallees
+    unfold initMachineStateWithMemory
+    unfold initLocals
+    unfold initLocalsAux
+    unfold Mir.CrateA.caller_ffi_and_len.body
+    unfold Trusted.VerificationResult.Memory.withDefaultCallees
+    unfold Obligations.CrateA.caller_ffi_and_len.defaultCallees
+    unfold Trusted.Rustc.V2026_06_01.MirSemantics.advanceStmt
+    unfold Trusted.Rustc.V2026_06_01.MirSemantics.pushCalleeFrame
+    unfold Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTreeModular
+    unfold initMachineStateWithMemoryAndCallees
+    unfold initMachineStateWithMemory
+    unfold Trusted.VerificationResult.Memory.withDefaultCallees
+    unfold Obligations.CrateA.caller_ffi_and_len.defaultCallees
+    dsimp (config := { zetaDelta := true, zeta := true }) [
+      Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym,
+      initMachineStateWithMemoryAndCallees,
+      initMachineStateWithMemory,
+      initLocals,
+      initLocalsAux,
+      Mir.CrateA.caller_ffi_and_len.body,
+      Trusted.VerificationResult.Memory.withDefaultCallees,
+      Obligations.CrateA.caller_ffi_and_len.defaultCallees,
+      Trusted.Rustc.V2026_06_01.MirSemantics.advanceStmt,
+      Trusted.Rustc.V2026_06_01.MirSemantics.pushCalleeFrame,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTreeModular,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirSymTree,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.evalTerminatorSymTree,
+      evalTerminator
+    ]
+    rw [h_act, h_stk]
+    intro r m h_out
+    cases h_out
+    exact ⟨trivial, h_ret⟩
+  | panicked memAfter =>
+    exact False.elim h_post
+  | aborted =>
+    intro r m h_out
+    nomatch h_out
+"#;
+        fs::write(&verify_brief_3_2_path, verify_brief_3_2_src.as_bytes())
+            .expect("write VerifyBrief32.lean");
+        compile_lean_file(&verify_brief_3_2_path);
+
+        // Also author `Specs/CrateA/caller_ffi_and_len.lean` and `Proof/CrateA/caller_ffi_and_len.lean`
+        // so `refresh_workspace_assembly` generates `Verify/CrateA/caller_ffi_and_len.lean` and the
+        // Lean 4 kernel checks the full generated verification chain end-to-end.
+        let caller_ffi_specs_path = crate_a_dir
+            .join("anneal/proofs/Specs/CrateA/caller_ffi_and_len.lean");
+        fs::create_dir_all(caller_ffi_specs_path.parent().expect("specs parent"))
+            .expect("create Specs/CrateA");
+        fs::write(
+            &caller_ffi_specs_path,
+            r#"import Trusted.VerificationResult
+import Mir.CrateA.caller_ffi_and_len
+import Obligations.CrateA.caller_ffi_and_len
+
+namespace Specs.CrateA.caller_ffi_and_len
+
+open Trusted
+open Trusted.Sequence
+open Trusted.VerificationResult
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+
+instance : ModularItemSpec "crate_a::caller_ffi_and_len" :=
+  Obligations.CrateA.caller_ffi_and_len.refineModularSpec
+    Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum.holdsOn
+    (fun args mem =>
+      ∃ offset : Nat, ∃ n : Nat,
+        n < 18446744073709551616 ∧
+        args = [.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]] ∧
+        mem = {
+          nextAllocId := 0
+          globals := []
+          borrows := [{ tag := 1, targetLocal := 10, targetProjection := .nil, perm := .frozen }]
+          nextTag := 2
+          callees := []
+          traitImpls := []
+          callStack := []
+          activeCallee := .none
+          activeProtectors := []
+          nextProtector := 0
+          callerLocals := []
+          fnPtrs := []
+        })
+    (fun _ _ ret _ =>
+      ∃ bits : Nat, bits < 4294967296 ∧ ret = .scalar { bits := bits, sizeBytes := 4 })
+
+end Specs.CrateA.caller_ffi_and_len
+"#,
+        )
+        .expect("write Specs/CrateA/caller_ffi_and_len.lean");
+
+        let caller_ffi_proof_path = crate_a_dir
+            .join("anneal/proofs/Proof/CrateA/caller_ffi_and_len.lean");
+        fs::create_dir_all(caller_ffi_proof_path.parent().expect("proof parent"))
+            .expect("create Proof/CrateA");
+        fs::write(
+            &caller_ffi_proof_path,
+            r#"import Trusted.VerificationResult
+import Anneal.Rustc.V2026_06_01.SymbolicEval
+import Mir.CrateA.caller_ffi_and_len
+import Obligations.CrateA.caller_ffi_and_len
+import Specs.CrateA.caller_ffi_and_len
+
+namespace Proof.CrateA.caller_ffi_and_len
+
+open Trusted
+open Trusted.Sequence
+open Trusted.VerificationResult
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+
+theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_len.modularClaim := by
+  refine Anneal.Rustc.V2026_06_01.SymbolicEval.verifyModularContractWithCalleesMirSym
+    Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
+    Mir.CrateA.caller_ffi_and_len.body
+    Obligations.CrateA.caller_ffi_and_len.defaultCallees
+    (inferInstance : ModularItemSpec "crate_a::caller_ffi_and_len").pre
+    (inferInstance : ModularItemSpec "crate_a::caller_ffi_and_len").post
+    10
+    ?_
+  rintro args mem ⟨_, offset, n, hn, rfl, rfl⟩
+  unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+  unfold initMachineStateWithMemoryAndCallees
+  unfold initMachineStateWithMemory
+  unfold initLocals
+  unfold initLocalsAux
+  unfold Mir.CrateA.caller_ffi_and_len.body
+  unfold Trusted.VerificationResult.Memory.withDefaultCallees
+  unfold Obligations.CrateA.caller_ffi_and_len.defaultCallees
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.advanceStmt
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.pushCalleeFrame
+  unfold Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTreeModular
+  dsimp (config := { zetaDelta := true, zeta := true }) [
+    Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym,
+    initMachineStateWithMemoryAndCallees,
+    initMachineStateWithMemory,
+    initLocals,
+    initLocalsAux,
+    Mir.CrateA.caller_ffi_and_len.body,
+    Trusted.VerificationResult.Memory.withDefaultCallees,
+    Obligations.CrateA.caller_ffi_and_len.defaultCallees,
+    Trusted.Rustc.V2026_06_01.MirSemantics.advanceStmt,
+    Trusted.Rustc.V2026_06_01.MirSemantics.pushCalleeFrame,
+    Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTreeModular,
+    Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree,
+    Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirSymTree,
+    Anneal.Rustc.V2026_06_01.SymbolicEval.evalTerminatorSymTree,
+    evalTerminator
+  ]
+  rintro ⟨_, h_stack, h_active, _, _⟩ h_ret
+  exact ⟨trivial, h_ret⟩
+
+end Proof.CrateA.caller_ffi_and_len
+"#,
+        )
+        .expect("write Proof/CrateA/caller_ffi_and_len.lean");
+
+        crate::scaffold::refresh_workspace_assembly(&crate_a_dir)
+            .expect("refresh workspace assembly after authoring caller_ffi_and_len");
+        let verify_ffi_text = fs::read_to_string(
+            gen_dir.join("Verify/CrateA/caller_ffi_and_len.lean"),
+        )
+        .expect("read refreshed Verify/CrateA/caller_ffi_and_len.lean");
+        assert!(
+            verify_ffi_text.contains(
+                "theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_len.modularClaim"
+            ),
+            "refresh_workspace_assembly must preserve modular verification target in Verify/CrateA/caller_ffi_and_len.lean:\n{verify_ffi_text}"
+        );
+        compile_lean_file(&caller_ffi_specs_path);
+        compile_lean_file(&gen_dir.join("Obligations/CrateA/caller_ffi_and_len.lean"));
+        compile_lean_file(&caller_ffi_proof_path);
+        compile_lean_file(&gen_dir.join("Verify/CrateA/caller_ffi_and_len.lean"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -1349,6 +1349,7 @@ mod tests {
     fn sample_records() -> Vec<UnitTargetRecord> {
         vec![
             UnitTargetRecord {
+            trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: "my_crate::math::inc".to_string(),
                     mir_module_path: "Mir/MyCrate/math/inc.lean".to_string(),
@@ -1359,6 +1360,7 @@ mod tests {
                 associated_subject_def_id: None,
             },
             UnitTargetRecord {
+            trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: "my_crate::math::__anodized_fn_requires_inc".to_string(),
                     mir_module_path: "Mir/MyCrate/math/__anodized_fn_requires_inc.lean"
@@ -1370,6 +1372,7 @@ mod tests {
                 associated_subject_def_id: Some("my_crate::math::inc".to_string()),
             },
             UnitTargetRecord {
+            trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: "my_crate::math::__anodized_fn_ensures_inc".to_string(),
                     mir_module_path: "Mir/MyCrate/math/__anodized_fn_ensures_inc.lean"
@@ -1458,6 +1461,7 @@ mod tests {
     #[test]
     fn renders_empty_and_multi_clause_rust_contracts() {
         let subject = UnitTargetRecord {
+            trait_impls: vec![],
             target: CapturedTarget {
                 def_id: "my_crate::math::id".to_string(),
                 mir_module_path: "Mir/MyCrate/math/id.lean".to_string(),
@@ -1475,6 +1479,7 @@ mod tests {
             inline_ensures: Vec::new(),
             inline_qualifiers: Vec::new(),
             external_specs: vec![UnitTargetRecord {
+            trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: "my_crate::math::__ANNEAL_EXT_SPEC_TARGET_id".to_string(),
                     mir_module_path: "Mir/MyCrate/math/__ANNEAL_EXT_SPEC_TARGET_id.lean"
@@ -1506,6 +1511,7 @@ mod tests {
             item_rel_path: PathBuf::from("MyCrate/math/id.lean"),
             inline_requires: vec![
                 UnitTargetRecord {
+            trait_impls: vec![],
                     target: CapturedTarget {
                         def_id: "my_crate::math::__anodized_fn_requires_id_0".to_string(),
                         mir_module_path: "Mir/MyCrate/math/__anodized_fn_requires_id_0.lean"
@@ -1517,6 +1523,7 @@ mod tests {
                     associated_subject_def_id: Some("my_crate::math::id".to_string()),
                 },
                 UnitTargetRecord {
+            trait_impls: vec![],
                     target: CapturedTarget {
                         def_id: "my_crate::math::__anodized_fn_requires_id_1".to_string(),
                         mir_module_path: "Mir/MyCrate/math/__anodized_fn_requires_id_1.lean"
@@ -1738,6 +1745,7 @@ mod tests {
     fn renders_rust_safe_total_and_equiv_attribute_specs() {
         let mut records = sample_records();
         records.push(UnitTargetRecord {
+            trait_impls: vec![],
             target: CapturedTarget {
                 def_id: "my_crate::math::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_safe_total_inc"
                     .to_string(),
@@ -1749,6 +1757,7 @@ mod tests {
             associated_subject_def_id: Some("my_crate::math::inc".to_string()),
         });
         records.push(UnitTargetRecord {
+            trait_impls: vec![],
             target: CapturedTarget {
                 def_id: "my_crate::math::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_equiv_inc_ref__for__inc"
                     .to_string(),
@@ -1787,6 +1796,7 @@ mod tests {
     fn renders_rust_trusted_assumptions_and_modular_default_proofs() {
         let mut records = sample_records();
         records.push(UnitTargetRecord {
+            trait_impls: vec![],
             target: CapturedTarget {
                 def_id: "my_crate::math::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_trusted_inc"
                     .to_string(),
@@ -1862,6 +1872,7 @@ mod tests {
         ));
 
         caller_bundle.push(UnitTargetRecord {
+            trait_impls: vec![],
             target: CapturedTarget {
                 def_id: "my_crate::math::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_safe_total_inc"
                     .to_string(),

@@ -369,6 +369,8 @@ structure Memory : Type where
       resolution; calls to targets absent from `callees` emit `MirCallE`
       interactions. -/
   callees : List CapturedMir := .nil
+  /-- Registered trait implementations for polymorphic method resolution. -/
+  traitImpls : List TraitImplEntry := .nil
   /-- Stack of suspended caller frames awaiting `TerminatorKind.return_`. -/
   callStack : List SavedCallerFrame := .nil
   /-- Active callee MIR body, or `.none` when executing the root body. -/
@@ -411,6 +413,7 @@ def emptyMemory : Memory where
   borrows := .nil
   nextTag := 1
   callees := .nil
+  traitImpls := .nil
   callStack := .nil
   activeCallee := .none
   activeProtectors := .nil
@@ -455,6 +458,8 @@ Reference (The Rust Reference, "External blocks - ABI"):
 structure MirCallReq : Type where
   /-- Canonical `DefId` path of the external or unlinked callee. -/
   defPath : DefPath
+  /-- Monomorphized generic type arguments of the target function. -/
+  typeArgs : List RigidTy := .nil
   /-- Evaluated argument values passed to the callee. -/
   args : List Value
   /-- Memory and borrow state at the call point. -/
@@ -916,6 +921,10 @@ def rigidTyEqAux : Nat → RigidTy → RigidTy → Bool
       Bool.and (stringEq d₁ d₂) (rigidTyListEqAux fuel up₁ up₂)
     | .dynamic d₁, .dynamic d₂ => stringEq d₁ d₂
     | .foreign d₁, .foreign d₂ => stringEq d₁ d₂
+    | .param idx₁ name₁, .param idx₂ name₂ =>
+      Bool.and (Nat.beq idx₁ idx₂) (stringEq name₁ name₂)
+    | .alias d₁ args₁, .alias d₂ args₂ =>
+      Bool.and (stringEq d₁ d₂) (rigidTyListEqAux fuel args₁ args₂)
     | .other r₁, .other r₂ => stringEq r₁ r₂
     | _, _ => false
 
