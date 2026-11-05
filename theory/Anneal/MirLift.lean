@@ -301,6 +301,12 @@ def elabMirLift : CommandElab := fun stx => do
       let some info := env.find? declName | throwError "unknown constant {declName}"
       unsafe evalExpr CapturedMir (mkConst ``CapturedMir) info.value!
 
+    -- Both modes run the body on the empty argument list; refuse bodies that
+    -- take arguments rather than certify a call with missing arguments.
+    unless val.argCount == 0 do
+      throwError "#mir_lift: {declName} takes {val.argCount} argument(s); only \
+        closed bodies (`argCount = 0`) can be lifted"
+
     -- Bodies with linked callees, or that fail `checkPureMir` (function-pointer
     -- casts, calls), need the memory-carrying mode; call-free bodies keep the
     -- alias-erased mode and its `mem' = mem₀` postcondition.
@@ -490,17 +496,21 @@ def dropLoopBody : CapturedMir := makeDropLoopBody "dropLoop"
 -- layout recomputation (`LayoutTable.instantiateForBody`) on `Wrapper<T>`;
 -- `liftClosureAndTraitCallerMir` calls a `ClosureFnPointer` coercion, a reified
 -- trait method resolved through `TraitImplEntry`, and the inline
--- `core::intrinsics::exact_div` intrinsic (see `Anneal.MirLiftBench`).
+-- `core::intrinsics::exact_div` intrinsic; `liftPolyApplyCallerMir` passes
+-- reified function pointers to the generic higher-order `lift_poly_apply` at
+-- two instantiations (see `Anneal.MirLiftBench`).
 #mir_lift (callees := [liftPolyIdMir]) liftIndirectCallerMir
 #mir_lift (callees := [liftPolyIdMir]) liftDirectCallerMir
 #mir_lift (callees := liftPolyLayoutCallees) liftPolyLayoutCallerMir
 #mir_lift (callees := liftClosureAndTraitCallees) liftClosureAndTraitCallerMir
+#mir_lift (callees := liftPolyApplyCallees) liftPolyApplyCallerMir
 
 -- The synthesized models are the values returned through each call.
 example : liftIndirectCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
 example : liftDirectCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
 example : liftPolyLayoutCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
 example : liftClosureAndTraitCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
+example : liftPolyApplyCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
 
 example :
     MirWpConverges liftIndirectCallerMir
@@ -544,6 +554,12 @@ info: 'liftClosureAndTraitCallerMir_lift_sound' depends on axioms: [propext, Cla
 -/
 #guard_msgs in
 #print axioms liftClosureAndTraitCallerMir_lift_sound
+
+/--
+info: 'liftPolyApplyCallerMir_lift_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs in
+#print axioms liftPolyApplyCallerMir_lift_sound
 
 -- `#mir_lift` also emits the trusted certificate of the closed claim.
 example :
@@ -642,6 +658,26 @@ example : True := by
         (initMachineStateWithCallees liftBadCleanupReturnMir [] []).memory
         (fun _ => True) 4 := by lift_frame)
   trivial
+
+-- A function pointer whose signature does not match the instantiated parameter
+-- type `fn(T) -> T` of `lift_poly_apply::<u32>` is undefined behavior
+-- (`liftBadPolyApplySig_not_converges`), so it does not lift.
+example : True := by
+  fail_if_success
+    (have : LiftFrame liftBadPolyApplySigMir 0 0
+        (initPureEnv liftBadPolyApplySigMir [])
+        (initMachineStateWithCallees liftBadPolyApplySigMir []
+          liftPolyApplyCallees).memory
+        (fun _ => True) 7 := by lift_frame)
+  trivial
+
+-- `#mir_lift` runs bodies on the empty argument list, so it refuses bodies
+-- that take arguments.
+/--
+error: #mir_lift: liftPolyIdMir takes 1 argument(s); only closed bodies (`argCount = 0`) can be lifted
+-/
+#guard_msgs in
+#mir_lift (callees := []) liftPolyIdMir
 
 -- The tactic reproduces the explicit audited proof in `Anneal.MirLiftBench`.
 example :

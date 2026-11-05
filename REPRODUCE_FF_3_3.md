@@ -78,15 +78,24 @@ This builds the frame-lifting rules (`LiftFrame`, `LiftStmtMem` /
   `"ff33::ApplyTrait::apply"` to `"ff33::lift_poly_id"` in `checkCalleeSig`
   and `lookupCallee`), and inline `core::intrinsics::exact_div::<u32>` calls
   (`LiftTerminator.callExactDiv`).
-- `liftIndirectCaller_verified`, `liftPolyLayoutCaller_verified`, and
-  `liftClosureAndTraitCaller_verified`: the trusted `VerificationResult`
-  certificates for those claims.
+- `liftPolyApplyCaller_wpConverges`: higher-order polymorphic indirect calls.
+  The caller passes reified `lift_poly_id::<u32>` and `lift_poly_id::<u8>` to
+  the generic `lift_poly_apply::<u32>` and `lift_poly_apply::<u8>`, which call
+  their `f : fn(T) -> T` parameter, and returns `3 + (4_u8 as u32)`. It covers
+  function pointers crossing frames as arguments, signature checks against the
+  instantiated parameter type, one generic callee instantiated at two layouts,
+  and returns two frames deep.
+- `liftIndirectCaller_verified`, `liftPolyLayoutCaller_verified`,
+  `liftClosureAndTraitCaller_verified`, and `liftPolyApplyCaller_verified`: the
+  trusted `VerificationResult` certificates for those claims.
 - `liftBadDivergingReturn_not_converges`, `liftDivergingPanic_not_converges`,
   `liftBadNullFnPtrTransmute_not_converges`, `liftBadExactDiv_not_converges`,
-  and `liftBadCleanupReturnMir`: negative UB and well-formedness benchmarks
-  covering diverging calls that return or unwind into cleanup blocks,
-  transmuting `0_usize` to a function pointer, non-exact `exact_div`, and
-  attempting to lift a cleanup block (`blk.isCleanup = true`).
+  `liftBadPolyApplySig_not_converges`, and `liftBadCleanupReturnMir`: negative
+  UB and well-formedness benchmarks covering diverging calls that return or
+  unwind into cleanup blocks, transmuting `0_usize` to a function pointer,
+  non-exact `exact_div`, passing a `fn(u8) -> u8` where
+  `lift_poly_apply::<u32>` expects `fn(u32) -> u32`, and attempting to lift a
+  cleanup block (`blk.isCleanup = true`).
 
 ## 4. Build the `#mir_lift` elaborator and its benchmarks
 
@@ -104,11 +113,12 @@ The build runs:
 - `#mir_lift (callees := [liftPolyIdMir]) liftDirectCallerMir`
 - `#mir_lift (callees := liftPolyLayoutCallees) liftPolyLayoutCallerMir`
 - `#mir_lift (callees := liftClosureAndTraitCallees) liftClosureAndTraitCallerMir`
+- `#mir_lift (callees := liftPolyApplyCallees) liftPolyApplyCallerMir`
 
 Each linked-callee `#mir_lift` defines `<item>_model` (the synthesized return
 value) and proves `<item>_lift_sound` (`MirWpConverges` from
 `initMachineStateWithCallees`) and `<item>_verified` (the trusted
-`VerificationResult` of the closed claim with the callees linked). Five
+`VerificationResult` of the closed claim with the callees linked). Six
 `#guard_msgs` checks pin the axioms of generated theorems to
 `[propext, Classical.choice, Quot.sound]`, so the build fails if `sorryAx` or a
 custom axiom appears. The call-free `#mir_lift` tests from FF-3.2 run in the
@@ -119,9 +129,11 @@ callee, with a wrong expected value, on the two signature-mismatch bodies in
 `Anneal.MirLiftBench` (`liftBadReifySigMir` reifies `lift_poly_id::<u32>` at
 `fn(u8) -> u8`; `liftBadCallSigMir` calls a `fn(u32) -> u32` through a local
 declared `fn(u8) -> u8`), which `liftBadReifySig_not_converges` and
-`liftBadCallSig_not_converges` prove are undefined behavior, and on the two
-diverging-call bodies `liftBadDivergingReturnMir` and
-`liftDivergingPanicCallerMir`.
+`liftBadCallSig_not_converges` prove are undefined behavior, on
+`liftBadPolyApplySigMir`, and on the two diverging-call bodies
+`liftBadDivergingReturnMir` and `liftDivergingPanicCallerMir`. A `#guard_msgs`
+check confirms that `#mir_lift` refuses a body that takes arguments
+(`liftPolyIdMir`), because both modes run the body on the empty argument list.
 `multiCalleeBody` calls a `u32` constant, which is also undefined behavior:
 `multiCalleeBody_not_converges` proves that it does not converge,
 `multiCalleeBody_residual_false` refutes the universally quantified residual

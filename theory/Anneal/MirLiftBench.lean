@@ -1090,4 +1090,278 @@ theorem liftClosureAndTraitCaller_verified :
   LiftFrame.verificationResult liftClosureAndTraitCallerClaim [] (fun _ h => h)
     liftClosureAndTraitCaller_lift
 
+/-! ### Higher-order polymorphic indirect calls
+
+The function pointer is created in one frame and called in another: the caller
+passes reified `lift_poly_id::<u32>` and `lift_poly_id::<u8>` to the generic
+`lift_poly_apply::<u32>` and `lift_poly_apply::<u8>`, which call their
+`f : fn(T) -> T` parameter. This exercises `Memory.fnPtrs` entries surviving
+across frames, call-site compatibility against the instantiated parameter type
+(`CapturedMir.instantiate` rewrites `fn(T) -> T` to `fn(u32) -> u32` or
+`fn(u8) -> u8`), one generic callee instantiated at two layouts in a single
+execution, and `LiftTerminator.returnToCaller` with a non-empty remaining call
+stack (two frames deep).
+-/
+
+/--
+`fn lift_poly_apply<T>(f: fn(T) -> T, x: T) -> T { f(x) }`: calls its
+function-pointer parameter indirectly.
+-/
+def liftPolyApplyMir : CapturedMir := {
+  mkMirBody "ff33::lift_poly_apply" 2
+    [ { mutability := .mut, ty := liftParamTTy, debugName := some "_0" }
+    , { mutability := .not, ty := liftParamTFnPtrTy, debugName := some "f" }
+    , { mutability := .not, ty := liftParamTTy, debugName := some "x" } ]
+    [ { statements := []
+        terminator :=
+          { kind := .call (.copy { local_ := 1, projection := [] })
+              [.move { local_ := 2, projection := [] }]
+              { local_ := 0, projection := [] } (some 1) .continue_
+            span := "call f" }
+        isCleanup := false }
+    , { statements := []
+        terminator := { kind := .return_, span := "ret" }
+        isCleanup := false } ] with
+  typeParamCount := 1
+  genericParams := [{ idx := 0, name := "T" }]
+  layouts :=
+    { pointerBits := 64
+      isLittleEndian := true
+      entries := [liftParamTLayout, liftParamTLayout] }
+}
+
+/--
+`poly_apply_caller`: computes
+`lift_poly_apply::<u32>(lift_poly_id::<u32>, 3) +
+(lift_poly_apply::<u8>(lift_poly_id::<u8>, 4) as u32)`, which is `7_u32`.
+-/
+def liftPolyApplyCallerMir : CapturedMir :=
+  mkMirBody "ff33::poly_apply_caller" 0
+    [ { mutability := .mut, ty := liftU32Ty, debugName := some "_0" }
+    , { mutability := .mut, ty := liftU32FnPtrTy, debugName := some "f32" }
+    , { mutability := .mut, ty := liftU32Ty, debugName := some "a" }
+    , { mutability := .mut, ty := liftU8FnPtrTy, debugName := some "f8" }
+    , { mutability := .mut, ty := liftU8Ty, debugName := some "b" }
+    , { mutability := .mut, ty := liftU32Ty, debugName := some "b32" } ]
+    [ { statements :=
+          [ { kind := .storageLive 1, span := "live f32" }
+          , { kind := .assign { local_ := 1, projection := [] }
+                (.cast (.pointerCoercion "ReifyFnPointer")
+                  (.constant
+                    { ty := { kind := .fnDef "ff33::lift_poly_id" [.uint .u32], layoutIdx := 0 }
+                      val := .zeroSized })
+                  liftU32FnPtrTy)
+              span := "reify id::<u32>" }
+          , { kind := .storageLive 2, span := "live a" } ]
+        terminator :=
+          { kind := .call
+              (.constant
+                { ty := { kind := .fnDef "ff33::lift_poly_apply" [.uint .u32], layoutIdx := 0 }
+                  val := .zeroSized })
+              [ .move { local_ := 1, projection := [] }
+              , .constant { ty := liftU32Ty, val := .scalar (.int ⟨3, 4⟩) } ]
+              { local_ := 2, projection := [] } (some 1) .continue_
+            span := "apply::<u32>(f32, 3)" }
+        isCleanup := false }
+    , { statements :=
+          [ { kind := .storageLive 3, span := "live f8" }
+          , { kind := .assign { local_ := 3, projection := [] }
+                (.cast (.pointerCoercion "ReifyFnPointer")
+                  (.constant
+                    { ty := { kind := .fnDef "ff33::lift_poly_id" [.uint .u8], layoutIdx := 0 }
+                      val := .zeroSized })
+                  liftU8FnPtrTy)
+              span := "reify id::<u8>" }
+          , { kind := .storageLive 4, span := "live b" } ]
+        terminator :=
+          { kind := .call
+              (.constant
+                { ty := { kind := .fnDef "ff33::lift_poly_apply" [.uint .u8], layoutIdx := 0 }
+                  val := .zeroSized })
+              [ .move { local_ := 3, projection := [] }
+              , .constant { ty := liftU8Ty, val := .scalar (.int ⟨4, 1⟩) } ]
+              { local_ := 4, projection := [] } (some 2) .continue_
+            span := "apply::<u8>(f8, 4)" }
+        isCleanup := false }
+    , { statements :=
+          [ { kind := .storageLive 5, span := "live b32" }
+          , { kind := .assign { local_ := 5, projection := [] }
+                (.cast .intToInt (.move { local_ := 4, projection := [] }) liftU32Ty)
+              span := "b as u32" }
+          , { kind := .assign { local_ := 0, projection := [] }
+                (.binaryOp .add (.move { local_ := 2, projection := [] })
+                  (.move { local_ := 5, projection := [] }))
+              span := "a + b32" } ]
+        terminator := { kind := .return_, span := "ret" }
+        isCleanup := false } ]
+
+/-- Linked callees for `liftPolyApplyCallerMir`. -/
+def liftPolyApplyCallees : List CapturedMir := [liftPolyApplyMir, liftPolyIdMir]
+
+/--
+Explicit audited frame-lifting derivation for `liftPolyApplyCallerMir` across
+all 20 steps.
+-/
+theorem liftPolyApplyCaller_lift :
+    LiftFrame liftPolyApplyCallerMir 0 0 (initPureEnv liftPolyApplyCallerMir [])
+      (initMachineStateWithCallees liftPolyApplyCallerMir []
+        liftPolyApplyCallees).memory
+      (fun v => v = .scalar ⟨7, 4⟩) 20 := by
+  -- bb0[0]: `StorageLive(_1)`.
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
+  dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
+  -- bb0[1]: `_1 = lift_poly_id::<u32> as fn(u32) -> u32 (ReifyFnPointer)`.
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftStmtMem.reifyFnPointer (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+    (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+    (by rfl) (by rfl)
+  -- bb0[2]: `StorageLive(_2)`.
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
+  dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
+  -- bb0 terminator: `_2 = lift_poly_apply::<u32>(move _1, const 3_u32) -> bb1`.
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.callDirect (by rfl) (by rfl) (by rfl)
+  dsimp only [FrameStep.Continues, callFrameMem, Option.getD]
+  -- `lift_poly_apply::<u32>` bb0 terminator: `_0 = copy _1(move _2) -> bb1`
+  -- through the function-pointer parameter `_1 : fn(u32) -> u32`.
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.callIndirect (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+    (by rfl) (by rfl) (by rfl) (by rfl)
+  dsimp only [FrameStep.Continues, callFrameMem, Option.getD]
+  -- `lift_poly_id::<u32>` bb0[0]: `_0 = move _1`.
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
+  dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
+  -- `lift_poly_id::<u32>` bb0 terminator: return `3_u32` into
+  -- `lift_poly_apply::<u32>`'s `_0` at bb1 (two frames deep).
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
+  dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
+  -- `lift_poly_apply::<u32>` bb1 terminator: return `3_u32` into `_2` at bb1.
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
+  dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
+  -- bb1[0]: `StorageLive(_3)`.
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
+  dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
+  -- bb1[1]: `_3 = lift_poly_id::<u8> as fn(u8) -> u8 (ReifyFnPointer)`.
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftStmtMem.reifyFnPointer (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+    (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+    (by rfl) (by rfl)
+  -- bb1[2]: `StorageLive(_4)`.
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
+  dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
+  -- bb1 terminator: `_4 = lift_poly_apply::<u8>(move _3, const 4_u8) -> bb2`.
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.callDirect (by rfl) (by rfl) (by rfl)
+  dsimp only [FrameStep.Continues, callFrameMem, Option.getD]
+  -- `lift_poly_apply::<u8>` bb0 terminator: `_0 = copy _1(move _2) -> bb1`.
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.callIndirect (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+    (by rfl) (by rfl) (by rfl) (by rfl)
+  dsimp only [FrameStep.Continues, callFrameMem, Option.getD]
+  -- `lift_poly_id::<u8>` bb0[0]: `_0 = move _1`.
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
+  dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
+  -- `lift_poly_id::<u8>` bb0 terminator: return `4_u8` into
+  -- `lift_poly_apply::<u8>`'s `_0` at bb1.
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
+  dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
+  -- `lift_poly_apply::<u8>` bb1 terminator: return `4_u8` into `_4` at bb2.
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.returnToCaller (by rfl) (by rfl) (by rfl) (by rfl)
+  dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
+  -- bb2[0]: `StorageLive(_5)`.
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
+  dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
+  -- bb2[1]: `_5 = move _4 as u32 (IntToInt)`.
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
+  dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
+  -- bb2[2]: `_0 = Add(move _2, move _5)`.
+  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
+  dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
+  -- bb2 terminator: root return of `3 + 4 = 7_u32`.
+  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.return_ (by rfl) (by rfl)
+  rfl
+
+/-- Convergence of `liftPolyApplyCallerMir`. -/
+theorem liftPolyApplyCaller_wpConverges :
+    MirWpConverges liftPolyApplyCallerMir
+      (initMachineStateWithCallees liftPolyApplyCallerMir [] liftPolyApplyCallees)
+      (mirNormalPost (fun retVal _ => retVal = .scalar ⟨7, 4⟩)) :=
+  LiftFrame.mirWpConverges_withCallees liftPolyApplyCaller_lift
+
+/-- Stateless claim for `liftPolyApplyCallerMir`. -/
+def liftPolyApplyCallerClaim : Claim where
+  body := liftPolyApplyCallerMir
+  callees := liftPolyApplyCallees
+  pre args := args = []
+  post _ ret := ret = .scalar ⟨7, 4⟩
+
+/-- Non-vacuity of `liftPolyApplyCallerClaim`. -/
+theorem liftPolyApplyCallerClaim_nonVacuous :
+    ∃ args, liftPolyApplyCallerClaim.pre args :=
+  ⟨[], rfl⟩
+
+/-- Trusted verification certificate for `liftPolyApplyCallerClaim`. -/
+theorem liftPolyApplyCaller_verified :
+    VerificationResult liftPolyApplyCallerClaim :=
+  LiftFrame.verificationResult liftPolyApplyCallerClaim [] (fun _ h => h)
+    liftPolyApplyCaller_lift
+
+/--
+Passing `lift_poly_id::<u8>` (`fn(u8) -> u8`) where `lift_poly_apply::<u32>`
+expects `fn(u32) -> u32`, as `transmute` could: the indirect call inside
+`lift_poly_apply::<u32>` checks the pointer's signature against the instantiated
+parameter type and faults.
+-/
+def liftBadPolyApplySigMir : CapturedMir :=
+  mkMirBody "ff33::bad_poly_apply_sig" 0
+    [ { mutability := .mut, ty := liftU32Ty, debugName := some "_0" }
+    , { mutability := .mut, ty := liftU8FnPtrTy, debugName := some "f8" } ]
+    [ { statements :=
+          [ { kind := .storageLive 1, span := "live f8" }
+          , { kind := .assign { local_ := 1, projection := [] }
+                (.cast (.pointerCoercion "ReifyFnPointer")
+                  (.constant
+                    { ty := { kind := .fnDef "ff33::lift_poly_id" [.uint .u8], layoutIdx := 0 }
+                      val := .zeroSized })
+                  liftU8FnPtrTy)
+              span := "reify id::<u8>" } ]
+        terminator :=
+          { kind := .call
+              (.constant
+                { ty := { kind := .fnDef "ff33::lift_poly_apply" [.uint .u32], layoutIdx := 0 }
+                  val := .zeroSized })
+              [ .move { local_ := 1, projection := [] }
+              , .constant { ty := liftU32Ty, val := .scalar (.int ⟨3, 4⟩) } ]
+              { local_ := 0, projection := [] } (some 1) .continue_
+            span := "apply::<u32>(f8, 3)" }
+        isCleanup := false }
+    , { statements := []
+        terminator := { kind := .return_, span := "ret" }
+        isCleanup := false } ]
+
+/--
+The mis-typed function-pointer argument faults at the fourth step, the indirect
+call inside `lift_poly_apply::<u32>`.
+-/
+theorem liftBadPolyApplySig_not_converges (post : MirOutcome → Prop) :
+    ¬ MirWpConverges liftBadPolyApplySigMir
+      (initMachineStateWithCallees liftBadPolyApplySigMir []
+        liftPolyApplyCallees) post := by
+  rintro ⟨fuel, h⟩
+  rcases fuel with _ | _ | _ | _ | fuel <;> exact h
+
 end IndirectCallBenchmark
