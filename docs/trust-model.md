@@ -163,7 +163,7 @@ artifacts relate to the compiled theorem in the Lean 4 kernel:
 | :--- | :--- | :--- | :--- | :--- |
 | **Layer 1: Execution & foundation TCB** | Executes extraction, elaboration, and kernel checking. | Pinned `lean` + `Init.*` (`foundation-lock.json`), `rustc`, `trusted/rustc-capture/`, `trusted/audit/`, `trusted/cargo-anneal/`, `root-manifest.sha256`. | Target triple, Cargo features/cfgs, `[profile]` settings, and any approved `build.rs` or proc-macro hooks (`build_hooks`). | **In the TCB audit log.** Pinned by version/digest; `build_hooks` gated before execution. |
 | **Layer 2: Statement & specification TCB** (`ConstantInfo.type`) | Defines *what* program is verified, *what* proposition is claimed, and *what* assumptions are waived. | `trusted/lean/` (`Trusted.*`, module-tiered as `vetted` or `candidate:<feature>`). | Captured `Mir.lean` (`src/**`, inline `requires`/`ensures`/`invariant` specs, Mode 4 `spec_fn` closures, waivers, unverified functions in private-invariant scopes, ambient items) and user mathematical models (`Spec/*.lean`). | **In the TCB audit log.** Tactic-free, `opaque`-free, `instance`-free; reviewed by humans. |
-| **Layer 3: Untrusted proof layer** (`ConstantInfo.value?`) | Constructs proof terms discharging Layer 2's theorem statement. | `theory/` (`Anneal.*`: IR lowering passes, simulation theorems, WP & separation-logic lemmas, and proof automation). | Crate-specific Lean proof modules (`Proof/*.lean`) and the generated root `Proof.lean` entrypoint. | **Outside the TCB audit log.** Mechanically audited and kernel-checked; **zero human review**. |
+| **Layer 3: Untrusted proof layer** (`ConstantInfo.value?`) | Constructs proof terms discharging Layer 2's theorem statement. | `theory/` (`Anneal.*`: `lowerBody`, `lowerBody_simulates`, `proveCrate`, WP & separation-logic lemmas). | Crate-specific Lean proof modules (`Proof/*.lean`) and the generated root `Proof.lean` entrypoint. | **Outside the TCB audit log.** Mechanically audited and kernel-checked; **zero human review**. |
 
 ### Statement-Origin Separation (`ConstantInfo.type` vs. `ConstantInfo.value?`)
 
@@ -254,12 +254,12 @@ environment (`baseSpec = Init.* ∪ Trusted.*`, `baseProof = Anneal.*`) and audi
    `Mir.lean` (`Mir.crate : Trusted.Crate`) and one of two static `Proof.lean`
    templates (with `prelude` so Lean cannot inject implicit imports):
    - **Template A (default automated path, when `Proof/Main.lean` is absent):**
-     Imports `Trusted`, `Anneal`, and `Mir`, and discharges
-     `theorem Proof.verify_crate : Trusted.CrateTheorem Mir.crate` using
-     Anneal's automated crate verifier in `theory/`. When a crate has no
-     `Spec/*.lean` or `Proof/*.lean` files, no user-written Lean code exists at
-     all; checking the crate reduces to compiling `Mir.lean` and `Proof.lean`
-     and running the incremental kernel check.
+     Imports `Trusted`, `Anneal`, and `Mir`, and proves
+     `theorem Proof.verify_crate : Trusted.CrateTheorem Mir.crate :=
+     Anneal.proveCrate Mir.crate rfl`. When a crate has no `Spec/*.lean` or
+     `Proof/*.lean` files, no user-written Lean code exists at all; checking the
+     crate reduces to compiling `Mir.lean` and `Proof.lean` and running the
+     incremental kernel check.
    - **Template B (custom proof path, when `Proof/Main.lean` is present):**
      Imports `Trusted`, `Mir`, and `Proof.Main`, and binds
      `theorem Proof.verify_crate : Trusted.CrateTheorem Mir.crate :=
@@ -326,6 +326,33 @@ staging certificates during a run) from the committed `anneal-tcb.lock`:
 (`anneal-audit` and
 [`TrustedBoundary.lean`](../trusted/audit/TrustedBoundary.lean)) used in both
 Stage A (`--mode audit`) and Stage B (`--mode audit-delta`).
+
+### Keeping `trusted/lean/` transparent at the `.olean` kernel level
+
+Auditing `trusted/lean/` requires confidence not only in the surface `.lean`
+source files, but also in the compiled `.olean` constants replayed by the Lean
+4 kernel. Four design choices in `trusted/lean/` keep its compiled kernel
+environment simple and directly inspectable:
+
+- **Tactic-free definitions (`SourceRole.trusted`):** `TrustedBoundary.lean`
+  forbids `by` tactic blocks across `trusted/lean/`. All trusted definitions and
+  any foundational helper lemmas use explicit functional definitions and term-
+  mode proofs rather than opaque tactic-generated terms.
+- **No `mutual` inductive types (`BodyId` table):** `Trusted/MirAst.lean`
+  stores function bodies in a flat `Crate.bodies` list indexed by `BodyId`
+  rather than nesting `MirBody` inside `Terminator` or `TCBItem`, avoiding the
+  nested mutual recursors that Lean synthesizes for mutual inductive blocks.
+- **Structural fuel-bounded recursion without `WellFounded.fix`:** Recursive
+  semantic functions in `Trusted/StepResult.lean` and
+  `Trusted/MirSemantics.lean` recurse structurally on an explicit `Nat` fuel
+  argument (or on inductive syntax/value trees), avoiding well-founded recursion
+  proof obligations in the kernel environment.
+- **Explicit assumption obligations (`Obligation.assumed`) instead of `opaque`
+  constants:** Trusted waivers (such as `TCBItem.rustcLowering`,
+  `TCBItem.assumedContract`, and `TCBItem.unverifiedFn`) are stated via
+  `Obligation.assumed (id : Id) : Obligation Id := ⟨id, False⟩` in
+  `Trusted/Refinement.lean` rather than declaring dummy `opaque` constants in
+  `Trusted/MirSemantics.lean`.
 
 ### Staging TCB changes (`vetted` vs. `candidate:<feature>` modules)
 
