@@ -69,8 +69,21 @@ This builds the frame-lifting rules (`LiftFrame`, `LiftStmtMem` /
   (`LiftTerminator.callFnItem`), and polymorphic compound layout recomputation
   (`LayoutTable.instantiateForBody`) on `Wrapper<T>` during
   `CastKind.transmute`.
-- `liftIndirectCaller_verified` and `liftPolyLayoutCaller_verified`: the
-  trusted `VerificationResult` certificates for both claims.
+- `liftDivergingCatchCaller_wpConverges`: reifies a diverging `fn() -> !`
+  callee (`liftDivergingUnwindMir`), invokes it with `target = none` and
+  `unwind = .cleanup 1` (`LiftTerminator.callDivergingIndirect`), unwinds back
+  into the caller's cleanup block via `TerminatorKind.unwindResume`
+  (`LiftTerminator.unwindResume`), and returns `7_u32`.
+- `liftClosureAndTraitCaller_wpConverges`: exercises non-capturing closure
+  coercion (`PointerCoercion("ClosureFnPointer")` on
+  `RigidTy.closure "ff33::closure_id" []`) and generic trait-method function
+  pointer reification and indirect dispatch (`TraitImplEntry` mapping
+  `"ff33::ApplyTrait::apply"` to `"ff33::lift_poly_id"` in `checkCalleeSig`
+  and `lookupCallee`).
+- `liftIndirectCaller_verified`, `liftPolyLayoutCaller_verified`,
+  `liftDivergingCatchCaller_verified`, and
+  `liftClosureAndTraitCaller_verified`: the trusted `VerificationResult`
+  certificates for those claims.
 
 ## 4. Build the `#mir_lift` elaborator and its benchmarks
 
@@ -87,22 +100,27 @@ The build runs:
 - `#mir_lift (callees := [liftPolyIdMir]) liftIndirectCallerMir`
 - `#mir_lift (callees := [liftPolyIdMir]) liftDirectCallerMir`
 - `#mir_lift (callees := liftPolyLayoutCallees) liftPolyLayoutCallerMir`
+- `#mir_lift (callees := [liftDivergingUnwindMir]) liftDivergingCatchCallerMir`
+- `#mir_lift (callees := liftClosureAndTraitCallees) liftClosureAndTraitCallerMir`
 
 Each linked-callee `#mir_lift` defines `<item>_model` (the synthesized return
 value) and proves `<item>_lift_sound` (`MirWpConverges` from
 `initMachineStateWithCallees`) and `<item>_verified` (the trusted
-`VerificationResult` of the closed claim with the callees linked). Four
+`VerificationResult` of the closed claim with the callees linked). Six
 `#guard_msgs` checks pin the axioms of generated theorems to
 `[propext, Classical.choice, Quot.sound]`, so the build fails if `sorryAx` or a
 custom axiom appears. The call-free `#mir_lift` tests from FF-3.2 run in the
 same module.
 
 The module also checks rejections. `lift_frame` fails without the linked
-callee, with a wrong expected value, and on the two signature-mismatch bodies
-in `Anneal.MirLiftBench` (`liftBadReifySigMir` reifies `lift_poly_id::<u32>`
-at `fn(u8) -> u8`; `liftBadCallSigMir` calls a `fn(u32) -> u32` through a local
+callee, with a wrong expected value, on the two signature-mismatch bodies in
+`Anneal.MirLiftBench` (`liftBadReifySigMir` reifies `lift_poly_id::<u32>` at
+`fn(u8) -> u8`; `liftBadCallSigMir` calls a `fn(u32) -> u32` through a local
 declared `fn(u8) -> u8`), which `liftBadReifySig_not_converges` and
-`liftBadCallSig_not_converges` prove are undefined behavior.
+`liftBadCallSig_not_converges` prove are undefined behavior, and on
+`liftBadDivergingReturnMir` (which invokes `lift_poly_id::<u32>` as a diverging
+call `target = none` and faults when the callee executes `return_`, proved UB
+by `liftBadDivergingReturn_not_converges`).
 `multiCalleeBody` calls a `u32` constant, which is also undefined behavior:
 `multiCalleeBody_not_converges` proves that it does not converge,
 `multiCalleeBody_residual_false` refutes the universally quantified residual

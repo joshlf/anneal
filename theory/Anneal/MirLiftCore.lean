@@ -489,6 +489,7 @@ Memory after `TerminatorKind.call` inlines `calleeBody` from the caller frame
 after argument evaluation, is pushed onto `mem.callStack` and `calleeBody`
 becomes the active body. This is `(pushCalleeFrame ..).memory` written out.
 -/
+@[reducible]
 def callFrameMem (callerBody : CapturedMir) (bbIdx : BasicBlockIdx)
     (stmtIdx : Nat) (callerEnv : PureEnv) (mem : Memory) (destination : Place)
     (targetBb : BasicBlockIdx) (unwind : UnwindAction) (calleeBody : CapturedMir) :
@@ -505,10 +506,34 @@ def callFrameMem (callerBody : CapturedMir) (bbIdx : BasicBlockIdx)
     activeCallee := some calleeBody }
 
 /--
+Memory after a diverging `TerminatorKind.call` (`target = none`) inlines
+`calleeBody` from the caller frame `(bbIdx, stmtIdx)` of `callerBody`: the
+saved caller frame is marked `isDiverging := true` with `returnUnwind := unwind`
+so any normal `TerminatorKind.return_` from `calleeBody` is rejected as UB while
+unwinding pops the caller frame according to `unwind`. This is
+`(pushDivergingCalleeFrame ..).memory` written out.
+-/
+@[reducible]
+def divergingCallFrameMem (callerBody : CapturedMir) (bbIdx : BasicBlockIdx)
+    (stmtIdx : Nat) (callerEnv : PureEnv) (mem : Memory) (destination : Place)
+    (unwind : UnwindAction) (calleeBody : CapturedMir) : Memory :=
+  { mem with
+    callStack :=
+      { callerBody := callerBody
+        frame := { blockIdx := bbIdx, stmtIdx := stmtIdx, locals := callerEnv }
+        destination := destination
+        returnTarget := 0
+        calleeProtectors := mem.activeProtectors
+        returnUnwind := unwind
+        isDiverging := true } :: mem.callStack
+    activeCallee := some calleeBody }
+
+/--
 Memory after `TerminatorKind.tailCall` enters `calleeBody` without pushing a
 new caller frame onto `mem.callStack`. This is
 `(enterTailCalleeFrame ..).memory`.
 -/
+@[reducible]
 def tailCallFrameMem (mem : Memory) (calleeBody : CapturedMir) : Memory :=
   { mem with activeCallee := some calleeBody }
 
@@ -516,6 +541,7 @@ def tailCallFrameMem (mem : Memory) (calleeBody : CapturedMir) : Memory :=
 Memory after `TerminatorKind.return_` pops `caller` (with remaining stack
 `rest`) and resumes `caller.callerBody`.
 -/
+@[reducible]
 def returnFrameMem (mem : Memory) (caller : SavedCallerFrame)
     (rest : List SavedCallerFrame) : Memory :=
   { mem with
@@ -714,12 +740,16 @@ Memory-carrying one-terminator judgment: executing `term` at the end of block
 `bbIdx` (statement index `stmtIdx`) of the active body `cur` from `(env, mem)`
 takes one step whose outcome satisfies `post`.
 
-The call and tail-call constructors cover inlined calls to linked callees:
-`callDirect`/`tailCallDirect` for function-item constants (including generic
-items such as `f::<u32>`, whose `typeArgs` drive `lookupCallee`'s
-instantiation), `callFnItem`/`tailCallFnItem` for zero-sized function items or
-non-capturing closures stored in locals, and `callIndirect`/`tailCallIndirect`
-for calls through a reified function pointer resolved via `Memory.fnPtrs`.
+The call, diverging-call (`target = none`), and tail-call constructors cover
+inlined calls to linked callees: `callDirect`/`callDivergingDirect`/
+`tailCallDirect` for function-item constants (including generic items and trait
+methods resolved through `lookupCallee`), `callFnItem`/`callDivergingFnItem`/
+`tailCallFnItem` for zero-sized function items (`RigidTy.fnDef`) stored in
+locals or projected places, and `callIndirect`/`callDivergingIndirect`/
+`tailCallIndirect` for calls through a reified function pointer or
+`ClosureFnPointer`-coerced non-capturing closure resolved via `Memory.fnPtrs`.
+`unwindResume` pops unwinding frames from `mem.callStack` via
+`unwindFromCallStack` when a caller catches the unwind at `.cleanup cleanupBb`.
 -/
 inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
     (stmtIdx : Nat) (env : PureEnv) (mem : Memory) (post : FrameStep → Prop) :
@@ -763,6 +793,21 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       post (.frame target 0 env mem) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .drop place target unwind, span := span }
+  /--
+  Unwind out of an inlined callee (`TerminatorKind.unwindResume`) when
+  `unwindFromCallStack` catches the unwind at a caller `.cleanup cleanupBb`
+  block.
+  -/
+  | unwindResume {span : String} {cleanupBb : BasicBlockIdx}
+      {callerEnv : PureEnv} {callerMem : Memory} :
+      unwindFromCallStack mem.callStack mem =
+        .running
+          (PureState.toMachineState
+            { bb := cleanupBb, stmtIdx := 0, env := callerEnv }
+            callerMem) →
+      post (.frame cleanupBb 0 callerEnv callerMem) →
+      LiftTerminator cur bbIdx stmtIdx env mem post
+        { kind := .unwindResume, span := span }
   /-- Return from the root frame (empty call stack). -/
   | return_ {span : String} {retVal : Value} :
       get? env 0 = some (.init retVal) →
@@ -803,8 +848,8 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .call func argOps destination (some targetBb) unwind, span := span }
   /--
-  Inlined call of a zero-sized function item or non-capturing closure held in a
-  local or projected operand `func`.
+  Inlined call of a zero-sized function item (`RigidTy.fnDef`) held in a local
+  or projected operand `func`.
   -/
   | callFnItem {func : Operand} {argOps : List Operand} {destination : Place}
       {targetBb : BasicBlockIdx} {unwind : UnwindAction} {span : String}
@@ -860,6 +905,77 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .call func argOps destination (some targetBb) unwind, span := span }
   /--
+  Inlined diverging call (`target = none`) of a function-item constant `func`
+  naming `(defPath, typeArgs)` to the linked body `calleeBody`.
+  -/
+  | callDivergingDirect {func : Operand} {argOps : List Operand}
+      {destination : Place} {unwind : UnwindAction} {span : String}
+      {defPath : DefPath} {typeArgs : List RigidTy} {argVals : List Value}
+      {env' : PureEnv} {calleeBody : CapturedMir} :
+      extractCallee? func = some (defPath, typeArgs) →
+      evalOperands env argOps mem.borrows mem.globals cur.layouts mem.callerLocals =
+        .ok argVals env' →
+      CalleeCtx mem.callees cur.layouts defPath typeArgs mem.traitImpls calleeBody →
+      post (.frame 0 0 (initLocals calleeBody argVals)
+        (divergingCallFrameMem cur bbIdx stmtIdx env' mem destination unwind
+          calleeBody)) →
+      LiftTerminator cur bbIdx stmtIdx env mem post
+        { kind := .call func argOps destination none unwind, span := span }
+  /--
+  Inlined diverging call (`target = none`) of a zero-sized function item
+  (`RigidTy.fnDef`) held in a local or projected operand `func`.
+  -/
+  | callDivergingFnItem {func : Operand} {argOps : List Operand}
+      {destination : Place} {unwind : UnwindAction} {span : String}
+      {fnVal : Value} {envAfterFunc : PureEnv} {defPath : DefPath}
+      {typeArgs : List RigidTy} {argVals : List Value} {env' : PureEnv}
+      {calleeBody : CapturedMir} :
+      extractCalleeDefPath? func = none →
+      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals =
+        .ok fnVal envAfterFunc →
+      isZstFnItemValue fnVal = true →
+      extractFnItemTarget? (operandTy cur.localDecls cur.layouts func) =
+        some (defPath, typeArgs) →
+      evalOperands envAfterFunc argOps mem.borrows mem.globals cur.layouts
+          mem.callerLocals =
+        .ok argVals env' →
+      CalleeCtx mem.callees cur.layouts defPath typeArgs mem.traitImpls calleeBody →
+      post (.frame 0 0 (initLocals calleeBody argVals)
+        (divergingCallFrameMem cur bbIdx stmtIdx env' mem destination unwind
+          calleeBody)) →
+      LiftTerminator cur bbIdx stmtIdx env mem post
+        { kind := .call func argOps destination none unwind, span := span }
+  /--
+  Inlined diverging call (`target = none`) through a reified function pointer
+  in `Memory.fnPtrs`.
+  -/
+  | callDivergingIndirect {func : Operand} {argOps : List Operand}
+      {destination : Place} {unwind : UnwindAction} {span : String}
+      {ptrVal : ProvenancePtr} {envAfterFunc : PureEnv} {fnEntry : FnPtrEntry}
+      {argVals : List Value} {env' : PureEnv} {calleeBody : CapturedMir} :
+      extractCalleeDefPath? func = none →
+      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals =
+        .ok (.ptr ptrVal 8) envAfterFunc →
+      ptrVal.offsetBytes = 0 →
+      lookupBorrow mem.borrows ptrVal.tag = none →
+      lookupFnPtr mem.fnPtrs ptrVal.allocId = some fnEntry →
+      fnEntryCompatibleWithCallSite fnEntry (length argOps)
+          (operandTy cur.localDecls cur.layouts func) = true →
+      evalOperands envAfterFunc argOps mem.borrows mem.globals cur.layouts
+          mem.callerLocals =
+        .ok argVals env' →
+      CalleeCtx mem.callees cur.layouts fnEntry.defPath fnEntry.typeArgs
+          mem.traitImpls calleeBody →
+      checkCalleeTargetCompatible
+          { defPath := fnEntry.defPath, typeArgs := fnEntry.typeArgs,
+            fnSig := fnEntry.fnSig, isIndirect := true }
+          calleeBody (length argVals) = true →
+      post (.frame 0 0 (initLocals calleeBody argVals)
+        (divergingCallFrameMem cur bbIdx stmtIdx env' mem destination unwind
+          calleeBody)) →
+      LiftTerminator cur bbIdx stmtIdx env mem post
+        { kind := .call func argOps destination none unwind, span := span }
+  /--
   Inlined tail call (`TerminatorKind.tailCall`) of a function-item constant
   `func` naming `(defPath, typeArgs)`.
   -/
@@ -876,7 +992,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
         { kind := .tailCall func argOps, span := span }
   /--
   Inlined tail call (`TerminatorKind.tailCall`) of a zero-sized function item
-  or non-capturing closure held in a local or projected operand `func`.
+  (`RigidTy.fnDef`) held in a local or projected operand `func`.
   -/
   | tailCallFnItem {func : Operand} {argOps : List Operand} {span : String}
       {fnVal : Value} {envAfterFunc : PureEnv} {defPath : DefPath}
@@ -1232,8 +1348,8 @@ theorem LiftFrame.stmt {body cur : CapturedMir} {bbIdx : BasicBlockIdx}
     (LiftStmtMem.evalNodeWP_of h_lift)
 
 /--
-`resolveCallTarget` reduction for a zero-sized function item or non-capturing
-closure held in a local or projected operand `func`.
+`resolveCallTarget` reduction for a zero-sized function item (`RigidTy.fnDef`)
+held in a local or projected operand `func`.
 -/
 theorem resolveCallTarget_fnItem (s : MachineState) (func : Operand)
     (argCount : Nat) (bodyLocalDecls : List LocalDecl)
@@ -1353,6 +1469,11 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
     dsimp only []
     rw [h_read]
     exact h_next
+  | unwindResume h_unwind h_next =>
+    unfold evalTerminator
+    dsimp only [PureState.toMachineState] at h_unwind ⊢
+    rw [h_unwind]
+    exact h_next
   | return_ h_ret h_stack h_post =>
     unfold evalTerminator
     dsimp only [PureState.toMachineState]
@@ -1414,6 +1535,52 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
       evalTerminatorSymTree_call_inlined_of_calleeCtx
         (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
         func argOps destination targetBb unwind span cur _ envAfterFunc argVals env'
+        calleeBody h_res h_args h_ctx h_target
+    rw [← evalTerminatorSymTree_eval, h_tree]
+    exact h_next
+  | callDivergingDirect h_callee h_args h_ctx h_next =>
+    rename_i func argOps destination unwind span defPath typeArgs argVals env'
+      calleeBody
+    have h_res :=
+      resolveCallTarget_of_extractCallee
+        (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
+        func (length argOps) cur.localDecls cur.layouts defPath typeArgs h_callee
+    have h_tree :=
+      evalTerminatorSymTree_diverging_call_inlined_of_calleeCtx
+        (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
+        func argOps destination unwind span cur _ env argVals env' calleeBody
+        h_res h_args h_ctx (checkCalleeTargetCompatible_direct _ _ _ _ _)
+    rw [← evalTerminatorSymTree_eval, h_tree]
+    exact h_next
+  | callDivergingFnItem h_const h_func h_zst h_target h_args h_ctx h_next =>
+    rename_i func argOps destination unwind span fnVal envAfterFunc defPath
+      typeArgs argVals env' calleeBody
+    have h_res :=
+      resolveCallTarget_fnItem
+        (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
+        func (length argOps) cur.localDecls cur.layouts fnVal envAfterFunc
+        defPath typeArgs h_const h_func h_zst h_target
+    have h_tree :=
+      evalTerminatorSymTree_diverging_call_inlined_of_calleeCtx
+        (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
+        func argOps destination unwind span cur _ envAfterFunc argVals env'
+        calleeBody h_res h_args h_ctx
+        (checkCalleeTargetCompatible_direct _ _ _ _ _)
+    rw [← evalTerminatorSymTree_eval, h_tree]
+    exact h_next
+  | callDivergingIndirect h_const h_func h_off h_noBorrow h_fnPtr h_compat
+      h_args h_ctx h_target h_next =>
+    rename_i func argOps destination unwind span ptrVal envAfterFunc fnEntry
+      argVals env' calleeBody
+    have h_res :=
+      resolveCallTarget_indirect_fnPtr
+        (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
+        func (length argOps) cur.localDecls cur.layouts ptrVal envAfterFunc fnEntry
+        h_const h_func h_off h_noBorrow h_fnPtr h_compat
+    have h_tree :=
+      evalTerminatorSymTree_diverging_call_inlined_of_calleeCtx
+        (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
+        func argOps destination unwind span cur _ envAfterFunc argVals env'
         calleeBody h_res h_args h_ctx h_target
     rw [← evalTerminatorSymTree_eval, h_tree]
     exact h_next
