@@ -719,7 +719,9 @@ def rigidTyTag : RigidTy → Nat
   | .dynamic _ => 16
   | .foreign _ => 17
   | .other _ => 18
-
+  | .param _ _ => 19
+  | .alias _ _ => 20
+    
 /--
 Fuel-bounded structural equality on `List RigidTy`, defined via `Nat.rec` and
 non-overlapping `match` expressions without `RigidTy.brecOn` or dependent
@@ -751,21 +753,21 @@ def rigidTyListEqFuel : Nat → List RigidTy → List RigidTy → Bool :=
                 | .bool | .char | .uint _ | .float _ | .never | .str
                 | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
                 | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
-                | .dynamic _ | .foreign _ | .other _ => false
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
               | .uint w₁ =>
                 match t₂ with
                 | .uint w₂ => uintTyEq w₁ w₂
                 | .bool | .char | .int _ | .float _ | .never | .str
                 | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
                 | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
-                | .dynamic _ | .foreign _ | .other _ => false
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
               | .float w₁ =>
                 match t₂ with
                 | .float w₂ => floatTyEq w₁ w₂
                 | .bool | .char | .int _ | .uint _ | .never | .str
                 | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
                 | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
-                | .dynamic _ | .foreign _ | .other _ => false
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
               | .never => true
               | .str => true
               | .tuple fs₁ =>
@@ -774,49 +776,49 @@ def rigidTyListEqFuel : Nat → List RigidTy → List RigidTy → Bool :=
                 | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
                 | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
                 | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
-                | .dynamic _ | .foreign _ | .other _ => false
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
               | .array e₁ n₁ =>
                 match t₂ with
                 | .array e₂ n₂ => ih [e₁] [e₂] && Nat.beq n₁ n₂
                 | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
                 | .tuple _ | .slice _ | .ref _ _ | .rawPtr _ _
                 | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
-                | .dynamic _ | .foreign _ | .other _ => false
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
               | .slice e₁ =>
                 match t₂ with
                 | .slice e₂ => ih [e₁] [e₂]
                 | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
                 | .tuple _ | .array _ _ | .ref _ _ | .rawPtr _ _
                 | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
-                | .dynamic _ | .foreign _ | .other _ => false
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
               | .ref m₁ p₁ =>
                 match t₂ with
                 | .ref m₂ p₂ => mutabilityEq m₁ m₂ && ih [p₁] [p₂]
                 | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
                 | .tuple _ | .array _ _ | .slice _ | .rawPtr _ _
                 | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
-                | .dynamic _ | .foreign _ | .other _ => false
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
               | .rawPtr m₁ p₁ =>
                 match t₂ with
                 | .rawPtr m₂ p₂ => mutabilityEq m₁ m₂ && ih [p₁] [p₂]
                 | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
                 | .tuple _ | .array _ _ | .slice _ | .ref _ _
                 | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
-                | .dynamic _ | .foreign _ | .other _ => false
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
               | .adt d₁ a₁ =>
                 match t₂ with
                 | .adt d₂ a₂ => stringEq d₁ d₂ && ih a₁ a₂
                 | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
                 | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
                 | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
-                | .dynamic _ | .foreign _ | .other _ => false
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
               | .fnDef d₁ a₁ =>
                 match t₂ with
                 | .fnDef d₂ a₂ => stringEq d₁ d₂ && ih a₁ a₂
                 | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
                 | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
                 | .adt _ _ | .fnPtr _ _ _ _ | .closure _ _
-                | .dynamic _ | .foreign _ | .other _ => false
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
               | .fnPtr i₁ o₁ s₁ c₁ =>
                 match t₂ with
                 | .fnPtr i₂ o₂ s₂ c₂ =>
@@ -824,35 +826,50 @@ def rigidTyListEqFuel : Nat → List RigidTy → List RigidTy → Bool :=
                 | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
                 | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
                 | .adt _ _ | .fnDef _ _ | .closure _ _
-                | .dynamic _ | .foreign _ | .other _ => false
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
               | .closure d₁ u₁ =>
                 match t₂ with
                 | .closure d₂ u₂ => stringEq d₁ d₂ && ih u₁ u₂
                 | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
                 | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
                 | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _
-                | .dynamic _ | .foreign _ | .other _ => false
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
               | .dynamic d₁ =>
                 match t₂ with
                 | .dynamic d₂ => stringEq d₁ d₂
                 | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
                 | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
                 | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
-                | .foreign _ | .other _ => false
+                | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
               | .foreign d₁ =>
                 match t₂ with
                 | .foreign d₂ => stringEq d₁ d₂
                 | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
                 | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
                 | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
-                | .dynamic _ | .other _ => false
+                | .dynamic _ | .other _ | .param _ _ | .alias _ _ => false
               | .other s₁ =>
                 match t₂ with
                 | .other s₂ => stringEq s₁ s₂
                 | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
                 | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
                 | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
-                | .dynamic _ | .foreign _ => false
+                | .dynamic _ | .foreign _ | .param _ _ | .alias _ _ => false
+              | .param idx1 name1 =>
+                match t₂ with
+                | .param idx2 name2 => Nat.beq idx1 idx2 && stringEq name1 name2
+                | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+                | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
+                | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
+                | .dynamic _ | .foreign _ | .other _ | .alias _ _ => false
+              | .alias d1 a1 =>
+                match t₂ with
+                | .alias d2 a2 => stringEq d1 d2 && ih a1 a2
+                | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
+                | .tuple _ | .array _ _ | .slice _ | .ref _ _ | .rawPtr _ _
+                | .adt _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
+                | .dynamic _ | .foreign _ | .other _ | .param _ _ => false
+
             else
               false
           headEq && ih ts₁ ts₂)
@@ -1254,7 +1271,7 @@ def rigidTyListIsFreezeFuel : Nat → List RigidTy → Bool :=
           | .slice elem => ih [elem]
           | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
           | .ref _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _
-          | .dynamic _ | .foreign _ | .other _ => true
+          | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => true
         headFreeze && ih rest)
 
 /--
@@ -1300,7 +1317,7 @@ def rigidTyListHasImpureExtCallPtr : Nat → List RigidTy → Bool :=
               ih args
           | .closure _ upvars => ih upvars
           | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
-          | .fnDef _ _ | .fnPtr _ _ _ _ | .dynamic _ | .foreign _ | .other _ => false
+          | .fnDef _ _ | .fnPtr _ _ _ _ | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ => false
         if headImpure then
           true
         else
@@ -1335,7 +1352,7 @@ def tyHasImpureExtCallPtr
     | .adt _ _ | .tuple _ | .array _ _ | .slice _ | .closure _ _ =>
       layoutHasPointerScalar 16 layouts ty.layoutIdx
     | .bool | .char | .int _ | .uint _ | .float _ | .never | .str
-    | .rawPtr _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .dynamic _ | .foreign _ | .other _ =>
+    | .rawPtr _ _ | .fnDef _ _ | .fnPtr _ _ _ _ | .dynamic _ | .foreign _ | .other _ | .param _ _ | .alias _ _ =>
       false
 
 /--
@@ -3351,8 +3368,8 @@ def populateSinglePtrParamMemory
   match decl.ty.kind with
   | .ref mutbl pointee | .rawPtr mutbl pointee =>
     match mem with
-    | ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
-       activeCallee, activeProtectors, nextProtector, callerLocals⟩ =>
+    | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+       activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩ =>
       match isWidePointee pointee with
       | false =>
         match argVal with
@@ -3387,7 +3404,7 @@ def populateSinglePtrParamMemory
                   let paddedCallerLocals :=
                     ensureCallerLocalsPad callerLocals minCallerIdx
                   let targetLocal := length paddedCallerLocals
-                  let nextCallerLocals := paddedCallerLocals ++ [.init referentVal]
+                  let nextCallerLocals := paddedCallerLocals ++ [LocalSlot.init referentVal]
                   let perm := ptrParamBorrowPerm mutbl pointee
                   let nextBorrows :=
                     match lookupBorrow borrows ptrVal.tag with
@@ -3414,9 +3431,7 @@ def populateSinglePtrParamMemory
                         relocations := []
                         align := { bytes := 8 }
                         mutability := mutbl } :: globals
-                  ⟨nextAllocId, nextGlobals, nextBorrows, nextTagVal, callees,
-                   callStack, activeCallee, activeProtectors, nextProtector,
-                   nextCallerLocals⟩
+                  ⟨nextAllocId, nextGlobals, nextBorrows, nextTagVal, callees, traitImpls, callStack, activeCallee, activeProtectors, nextProtector, nextCallerLocals, fnPtrs⟩
           else
             mem
         | _ => mem
@@ -3459,7 +3474,7 @@ def populateSinglePtrParamMemory
                   let paddedCallerLocals :=
                     ensureCallerLocalsPad callerLocals minCallerIdx
                   let targetLocal := length paddedCallerLocals
-                  let nextCallerLocals := paddedCallerLocals ++ [.init referentVal]
+                  let nextCallerLocals := paddedCallerLocals ++ [LocalSlot.init referentVal]
                   let perm := ptrParamBorrowPerm mutbl pointee
                   let nextBorrows :=
                     match lookupBorrow borrows ptrVal.tag with
@@ -3486,9 +3501,7 @@ def populateSinglePtrParamMemory
                         relocations := []
                         align := { bytes := 8 }
                         mutability := mutbl } :: globals
-                  ⟨nextAllocId, nextGlobals, nextBorrows, nextTagVal, callees,
-                   callStack, activeCallee, activeProtectors, nextProtector,
-                   nextCallerLocals⟩
+                  ⟨nextAllocId, nextGlobals, nextBorrows, nextTagVal, callees, traitImpls, callStack, activeCallee, activeProtectors, nextProtector, nextCallerLocals, fnPtrs⟩
           else
             mem
         | _, _ => mem
@@ -3685,12 +3698,12 @@ def decodeRawByteTrace
         args
         rawTrace.initMem
     with
-    | ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
-       activeCallee, activeProtectors, nextProtector, callerLocals⟩ =>
+    | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+       activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩ =>
       some {
         args := args
-        initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
-                    activeCallee, activeProtectors, nextProtector, callerLocals⟩
+        initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+                    activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩
         inlinedCallees := rawTrace.inlinedCallees
         events := events
         outcome := outcome
@@ -4078,12 +4091,12 @@ def diagnoseRawByteTraceBounded
             args
             rawTrace.initMem
         with
-        | ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
-           activeCallee, activeProtectors, nextProtector, callerLocals⟩ =>
+        | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩ =>
           diagnoseObservedTraceBounded fuel checkBranches rootBody {
             args := args
-            initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
-                        activeCallee, activeProtectors, nextProtector, callerLocals⟩
+            initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
+                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩
             inlinedCallees := rawTrace.inlinedCallees
             events := events
             outcome := outcome

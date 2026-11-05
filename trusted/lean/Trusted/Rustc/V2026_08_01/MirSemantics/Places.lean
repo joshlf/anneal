@@ -6700,9 +6700,9 @@ def evalRvalue
                       targetLocal := parentEntry.targetLocal
                       targetProjection := fullProj
                       perm := reborrowPerm
-                  rangeOffset := parentEntry.rangeOffset
-                  rangeLen := parentEntry.rangeLen
-                  parentTag := .some parentPtr.tag
+                      rangeOffset := parentEntry.rangeOffset
+                      rangeLen := parentEntry.rangeLen
+                      parentTag := .some parentPtr.tag
                     }
                     let mem' := {
                       mem with
@@ -6853,9 +6853,9 @@ def evalRvalue
                       targetLocal := parentEntry.targetLocal
                       targetProjection := fullProj
                       perm := rawPerm
-                  rangeOffset := parentEntry.rangeOffset
-                  rangeLen := parentEntry.rangeLen
-                  parentTag := .some parentPtr.tag
+                      rangeOffset := parentEntry.rangeOffset
+                      rangeLen := parentEntry.rangeLen
+                      parentTag := .some parentPtr.tag
                     }
                     let mem' := {
                       mem with

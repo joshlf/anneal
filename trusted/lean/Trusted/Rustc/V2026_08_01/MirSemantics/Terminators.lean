@@ -2790,17 +2790,18 @@ def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operan
                 match argOps with
                 | lhsOp :: _ => operandIsSigned bodyLocalDecls lhsOp bodyLayouts
                 | .nil => false
-              match evalExactDiv lhs rhs isSigned with
-              | .some retScalar =>
-                match writePlaceValue locals' s.memory.borrows destination (.scalar retScalar) with
+              match evalExactDiv lhs rhs locals' s.memory isSigned with
+              | .ok val locals'' mem' =>
+                match writePlaceValue locals'' mem'.borrows destination val with
                 | .ok updatedLocals =>
                   MirStepNode.step {
                     frame := { s.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
-                    memory := s.memory
+                    memory := mem'
                   }
                 | .ub => MirStepNode.fail .ub
                 | .unsupported => MirStepNode.unsupported
-              | .none => MirStepNode.fail .ub
+              | .ub => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
             | _ => MirStepNode.unsupported
           | false =>
             MirStepNode.extCall
