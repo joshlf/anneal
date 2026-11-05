@@ -1145,6 +1145,7 @@ theorem evalPlace_fieldPath {layouts : Layout.LayoutTable}
     simpa using hrootEval
   | cons p rest ih =>
     cases p with
+    | downcast _ _ => simp [resolveFieldPath] at hres
     | field idx fieldTy =>
       simp only [translateFieldPlace] at hpe
       cases rootSpec with
@@ -1545,7 +1546,7 @@ theorem operandIntType_of_operandOk {layouts : Layout.LayoutTable}
             obtain ⟨elemIt, count⟩ := p
             simp only [ha, Bool.and_eq_true, decide_eq_true_eq, Option.map_some, Option.some.injEq] at hok ⊢
             exact hok.1
-      | cons _ _ => simp [operandOk, translateOperand, translatePlace] at h
+      | cons _ _ => simp [operandOk, translateOperand, translatePlace, placeOk] at h
     | constantIndex offset minLen fromEnd =>
       cases rest with
       | nil =>
@@ -1562,8 +1563,8 @@ theorem operandIntType_of_operandOk {layouts : Layout.LayoutTable}
             obtain ⟨elemIt, count⟩ := p
             simp only [ha, Bool.and_eq_true, decide_eq_true_eq, Option.map_some, Option.some.injEq] at hok ⊢
             exact hok.1
-      | cons _ _ => simp [operandOk, translateOperand, translatePlace] at h
-    | _ => simp [operandOk, translateOperand, translatePlace] at h
+      | cons _ _ => simp [operandOk, translateOperand, translatePlace, placeOk] at h
+    | _ => simp [operandOk, translateOperand, translatePlace, placeOk] at h
   | .constant _, h =>
     simp only [operandOk, Bool.and_eq_true, decide_eq_true_eq] at h
     exact h.1
@@ -1830,6 +1831,7 @@ theorem placeOk_single_nonfield {layouts : Layout.LayoutTable} {decls : List Loc
         | none => false) := by
   cases proj with
   | field idx fieldTy => exact False.elim (hnf idx fieldTy rfl)
+  | downcast _ _ => simp [placeOk]; cases decls[j]?.bind fun d => arrayTypeOf d.ty <;> simp [projOk]
   | _ => rfl
 
 theorem evalValue_operand_array_proj {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}

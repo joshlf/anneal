@@ -560,7 +560,10 @@ def AbstractByte.data : Byte → Option UInt8
   | .Uninit => none
   | .Init b _ => some b
 
-/-- `decode_discriminant` (`spec/lang/representation.md`) -/
+/--
+(`spec/lang/representation.md`):
+> "fn decode_discriminant<M: Memory>(mut accessor: impl FnMut(Offset, Size) -> Result<List<AbstractByte<M::Provenance>>>, discriminator: Discriminator) -> Result<Option<Int>> {"
+-/
 partial def decodeDiscriminant {m' : Type → Type} [Monad m'] [MonadLiftT Interp m']
     (accessor : Offset → Size → m' (List Byte)) : Discriminator → m' (Option Int)
   | .Known val => pure (some val)
@@ -681,15 +684,10 @@ def Type.decode : «Type» → List Byte → Interp (Option Val)
       | some discr => decodeEnumVariant variants.entries discr bytes
   | _, _ => unsupported "Type::decode for a non-Int, non-Bool, non-Tuple, non-Array type"
 
-/-- Field-by-field `sized_fields.try_map` loop of `Type::decode` for `Type::Tuple`
+/--
 (`spec/lang/representation.md`):
-> "sized_fields.try_map(|(offset, ty)| {
->     let subslice = bytes.subslice_with_length(
->         offset.bytes(),
->         ty.layout::<M::T>().expect_size(\"WF ensures all sized tuple fields are sized\").bytes()
->     );
->     ty.decode::<M>(subslice)
-> })" -/
+> "fn decode<M: Memory>(Type::Enum { variants, discriminator, size, .. }: Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> {"
+-/
 def decodeEnumVariant : List (Int × Variant) → Int → List Byte → Interp (Option Val)
   | [], _, _ => pure none
   | (d, { ty := ty, tagger := _ }) :: vs, discr, bytes =>
@@ -699,6 +697,16 @@ def decodeEnumVariant : List (Int × Variant) → Int → List Byte → Interp (
       | some value => pure (some (.Variant discr value))
     else
       decodeEnumVariant vs discr bytes
+
+/-- Field-by-field `sized_fields.try_map` loop of `Type::decode` for `Type::Tuple`
+(`spec/lang/representation.md`):
+> "sized_fields.try_map(|(offset, ty)| {
+>     let subslice = bytes.subslice_with_length(
+>         offset.bytes(),
+>         ty.layout::<M::T>().expect_size(\"WF ensures all sized tuple fields are sized\").bytes()
+>     );
+>     ty.decode::<M>(subslice)
+> })" -/
 
 def decodeTupleFields : List (Offset × «Type») → List Byte → Interp (Option (List Val))
   | [], _ => pure (some [])
@@ -715,7 +723,10 @@ def decodeTupleFields : List (Offset × «Type») → List Byte → Interp (Opti
 
 end
 
-/-- `encode_discriminant` (`spec/lang/representation.md`) -/
+/--
+(`spec/lang/representation.md`):
+> "fn encode_discriminant<M: Memory>(mut accessor: impl FnMut(Offset, List<AbstractByte<M::Provenance>>) -> Result, tagger: Map<Offset, (IntType, Int)>) -> Result<()> {"
+-/
 def encodeDiscriminant {m' : Type → Type} [Monad m'] [MonadLiftT Interp m']
     (accessor : Offset → List Byte → m' Unit) (tagger : Map Offset (IntType × Int)) : m' Unit := do
   tagger.entries.forM fun (offset, value_type, value) => do
@@ -807,11 +818,10 @@ def Type.encode : «Type» → Val → Interp (List Byte)
   | .Enum _ _ _ _ _, _ => specPanic "encode: Type::Enum with a non-Variant value"
   | _, _ => unsupported "Type::encode for a non-Int, non-Bool, non-Tuple, non-Array type"
 
-/-- Field-by-field `write_subslice_at_index` loop of `Type::encode` for `Type::Tuple`
+/--
 (`spec/lang/representation.md`):
-> "for ((offset, ty), value) in sized_fields.zip(values) {
->     bytes.write_subslice_at_index(offset.bytes(), ty.encode::<M>(value));
-> }" -/
+> "fn encode<M: Memory>(Type::Enum { variants, .. }: Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> {"
+-/
 def encodeEnumVariant : List (Int × Variant) → Int → Val → Interp (List Byte)
   | [], _, _ => specPanic "encode of Type::Enum with invalid discriminant"
   | (d, { ty := ty, tagger := _ }) :: vs, discr, value =>
@@ -819,6 +829,12 @@ def encodeEnumVariant : List (Int × Variant) → Int → Val → Interp (List B
       Type.encode ty value
     else
       encodeEnumVariant vs discr value
+
+/-- Field-by-field `write_subslice_at_index` loop of `Type::encode` for `Type::Tuple`
+(`spec/lang/representation.md`):
+> "for ((offset, ty), value) in sized_fields.zip(values) {
+>     bytes.write_subslice_at_index(offset.bytes(), ty.encode::<M>(value));
+> }" -/
 
 def encodeTupleFields : List (Offset × «Type») → List Val → List Byte → Interp (List Byte)
   | [], _, bytes => pure bytes
@@ -896,6 +912,10 @@ def checkTupleFields : List Val → List (Offset × «Type») → Interp Unit
     checkValue val ty
     checkTupleFields restVals restFields
 
+/--
+(`spec/lang/representation.md`):
+> "(Value::Variant { discriminant, data }, Type::Enum { variants, .. }) => {"
+-/
 def checkEnumVariant : List (Int × Variant) → Int → Val → Interp Unit
   | [], _, _ => specPanic "Value::Variant: invalid variant id"
   | (d, { ty := ty, tagger := _ }) :: vs, discr, data =>
@@ -1578,7 +1598,9 @@ mutual
 >
 >      let ptr = self.ptr_offset_inbounds(root.ptr.thin_pointer, offset.bytes())?;
 >      ret((Place { ptr: ptr.widen(None), ..root }, elem_ty))
->  }" -/
+>  }"
+>
+> "fn eval_place(&mut self, PlaceExpr::Downcast { root, discriminant }: PlaceExpr) -> Result<(Place<M>, Type)> {" -/
 def evalPlace (m : Mach) : PlaceExpr → Interp ((Place BM × «Type») × Mach)
   | .Local name => do
     let fr ← curFrame m
@@ -1684,7 +1706,11 @@ def evalValueList (m : Mach) : List ValueExpr → Interp (List Val × Mach)
 >     let left = self.eval_value(left)?;
 >     let right = self.eval_value(right)?;
 >     ret(self.eval_bin_op(operator, left, right)?)
-> }" -/
+> }"
+>
+> "fn eval_value(&mut self, ValueExpr::Variant { enum_ty, discriminant, data } : ValueExpr) -> Result<(Value<M>, Type)> {"
+>
+> "fn eval_value(&mut self, ValueExpr::GetDiscriminant { place } : ValueExpr) -> Result<(Value<M>, Type)> {" -/
 def evalValue (m : Mach) : ValueExpr → Interp ((Val × «Type») × Mach)
   | .Constant c ty => do pure ((← evalConstant c, ty), m)
   | .Tuple exprs ty => do
@@ -1739,7 +1765,9 @@ end
 > fn eval_statement(&mut self, Statement::PlaceMention(place): Statement) -> NdResult {
 >     self.eval_place(place)?;
 >     ret(())
-> }" -/
+> }"
+>
+> "fn eval_statement(&mut self, Statement::SetDiscriminant { destination, value }: Statement) -> NdResult {" -/
 def evalStatement (m : Mach) : Statement → Interp Mach
   | .Assign destination source => do
     let ((place, ty), m) ← evalPlace m destination

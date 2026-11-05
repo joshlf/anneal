@@ -307,6 +307,9 @@ theorem translateStatement_some {layouts : Layout.LayoutTable} {decls : List Loc
       translatePlace decls dst = some pe ∧
       translateRvalue layouts decls (placeMirTy decls dst) rv = some e ∧
       st' = .Assign pe e) ∨
+    (∃ dst variant pe, st.kind = .setDiscriminant dst variant ∧
+      translatePlace decls dst = some pe ∧
+      st' = .SetDiscriminant pe (Int.ofNat variant)) ∨
     (∃ i, st.kind = .placeMention ⟨i, []⟩ ∧ st' = .PlaceMention (.Local (localName i))) ∨
     (∃ i idx fieldTy rest pe,
       st.kind = .placeMention ⟨i, .field idx fieldTy :: rest⟩ ∧
@@ -325,7 +328,13 @@ theorem translateStatement_some {layouts : Layout.LayoutTable} {decls : List Loc
       | some e =>
         simp [hpe, he] at h
         exact .inl ⟨dst, rv, pe, e, rfl, hpe, he, h.symm⟩
-  | .setDiscriminant _ _, h => simp at h
+  | .setDiscriminant dst variant, h =>
+    simp only [translateStatement, Option.bind_eq_bind] at h
+    cases hpe : translatePlace decls dst with
+    | none => simp [hpe] at h
+    | some pe =>
+      simp [hpe] at h
+      exact .inr (.inl ⟨dst, variant, pe, rfl, hpe, h.symm⟩)
   | .deinit _, h => simp at h
   | .storageLive _, h => simp at h
   | .storageDead _, h => simp at h
@@ -508,6 +517,7 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
       exact hlt
     rcases translateStatement_some hst' with
       ⟨dst, rv, pe, e, hkind, hpe, he, rfl⟩ |
+      ⟨dst, variant, pe, hkind, hpe, rfl⟩ |
       ⟨i, hkind, rfl⟩ |
       ⟨i, idx, fieldTy, rest, pe, hkind, hpe, rfl⟩
     · ------------------------------------------------------------ assign
