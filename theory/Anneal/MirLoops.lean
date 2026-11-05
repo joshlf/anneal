@@ -57,6 +57,11 @@ theorem forRangeUp_induction {α : Type}
     exact h_init
 termination_by hi - lo
 
+/--
+  Proves that a MIR loop representing `for i in lo..hi` converges.
+  The invariant `LoopInv` is parameterized by the loop counter `i` and accumulated trace.
+  If the loop terminates (when `i >= hi`), the exit condition determines the final postcondition.
+-/
 theorem mirTraceWpConverges_forRangeUp {α : Type}
     (lo hi : Nat) (init : α) (step : (i : Nat) → lo ≤ i → i < hi → α → α)
     (body : CapturedMir)
@@ -115,6 +120,10 @@ theorem nat_strong_induction (P : Nat → Prop) (ind : ∀ n, (∀ m, m < n → 
         exact ih m (Nat.le_of_lt_succ h_lt)
   exact aux n (Nat.le_refl _)
 
+/--
+  Proves convergence of a general `while` loop with trace accumulation using a well-founded ranking function.
+  The ranking function `rank : α → Nat` must strictly decrease on every iteration.
+-/
 theorem mirTraceWpConverges_whileRank {α : Type}
     (rank : α → Nat)
     (body : CapturedMir)
@@ -185,6 +194,10 @@ theorem runMirToBlock_eq_target
         | halted _ => nomatch h
         | faulted _ => nomatch h
 
+/--
+  Pure variant of `mirTraceWpConverges_forRangeUp` without trace accumulation.
+  Proves convergence of a bounded range loop in MIR by well-founded induction on `hi - i`.
+-/
 theorem mirWpConverges_forRangeUp {α : Type}
     (lo hi : Nat) (init : α) (step : (i : Nat) → lo ≤ i → i < hi → α → α)
     (body : CapturedMir)
@@ -217,6 +230,10 @@ theorem mirWpConverges_forRangeUp {α : Type}
       (fun i h_le' h_lt' a s h_inv => h_body i (Nat.le_trans (Nat.le_succ _) h_le') h_lt' a s h_inv)
       h_sub
 
+/--
+  Proves convergence of a general `while` loop using a well-founded ranking function.
+  The ranking function `rank : α → Nat` must strictly decrease on every iteration.
+-/
 theorem mirWpConverges_whileRank {α : Type}
     (rank : α → Nat)
     (body : CapturedMir)
@@ -242,6 +259,10 @@ theorem mirWpConverges_whileRank {α : Type}
   exact h_gen (rank a₀) a₀ s₀ rfl h_init
 
 
+/--
+  Merges two divergent control flow paths (e.g. from a SwitchInt) into a single join block.
+  Proves convergence of the merged path without exposing branch-specific fuel to the caller.
+-/
 theorem wpTransPlanConverges
     {body : CapturedMir}
     {s₀ sThen₀ sElse₀ sThenJoin sElseJoin : MachineState}
@@ -386,6 +407,11 @@ theorem MirTraceStepsConverges_of_runMirToBinarySwitch
         | halted _ => nomatch h
         | faulted _ => nomatch h
 
+/--
+  Trace-accumulating variant of `wpTransPlanConverges`.
+  Merges two divergent control flow paths from a BinarySwitch into a single join block,
+  while properly appending the `.emit` event of the switch evaluation to the execution trace.
+-/
 theorem mirTraceWpConverges_wpTransPlanConverges
     {body : CapturedMir}
     {s₀ sThen₀ sElse₀ sThenJoin sElseJoin : MachineState}
