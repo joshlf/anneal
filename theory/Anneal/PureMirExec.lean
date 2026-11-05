@@ -349,7 +349,10 @@ def isPureRvalue : Rvalue → Bool
   | .rawPtr .. => false
   | .threadLocalRef _ => false
   | .len p => isPurePlace p
-  | .cast _ op _ => isPureOperand op
+  | .cast ck op _ => match ck with
+    | .pointerCoercion _ => false
+    | .fnPtrToPtr => false
+    | _ => isPureOperand op
   | .binaryOp _ lhs rhs => isPureOperand lhs && isPureOperand rhs
   | .nullaryOp _ _ => true
   | .unaryOp _ op => isPureOperand op
@@ -623,11 +626,17 @@ theorem evalRvalue_pure_eq_withMem
   | cast ck op targetTy =>
     dsimp only [isPureRvalue] at h_pure
     cases ck with
+    | pointerCoercion _ => cases h_pure
+    | fnPtrToPtr => cases h_pure
     | transmute => exact evalByteCast_pure_eq_withMem locals op targetTy mem localDecls layouts h_pure
     | subtype => exact evalByteCast_pure_eq_withMem locals op targetTy mem localDecls layouts h_pure
     | _ =>
       dsimp only [evalRvalue]
+      try unfold evalReifyFnPointer
+      try unfold evalFnPtrToPtr
       try rw [evalOperand_pure_eq locals op mem.borrows mem.globals layouts mem.callerLocals h_pure]
+      try unfold evalReifyFnPointer
+      try unfold evalFnPtrToPtr
       try rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
       try cases evalOperand locals op [] [] layouts []
       repeat' (first | rfl | split)

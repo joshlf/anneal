@@ -53,6 +53,7 @@ def initMachineState (body : CapturedMir) (args : List Value) : MachineState :=
       callees := []
       callStack := []
       activeCallee := none
+      traitImpls := body.traitImpls
     }
   }
 
