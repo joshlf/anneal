@@ -8,12 +8,12 @@
 //! 2. Full 74-test differential execution (`run_miri_diff_suite`):
 //!    - Captures MIR from `tests/miri-diff/corpus` with Miri-matching flags
 //!      (`-Zmir-opt-level=0 -C debug-assertions=off -C overflow-checks=on`).
-//!    - Proves `TotalVerificationResult` for all 22 non-bug `pass` tests.
+//!    - Proves `TotalVerificationResult` for all 27 non-bug `pass` tests.
 //!    - Proves `StatefulVerificationResult` (`post := False`) and
 //!      `¬ TotalClaim.holds` for all 9 non-bug `panic` tests.
 //!    - Proves `¬ StatefulClaim.holds ∧ ¬ TotalClaim.holds` via
-//!      `refuteMirPointByStrictUB` for all 29 non-bug `ub` tests.
-//!    - Enforces `evalMirDiffTagBounded` equality ratchets for all 14 open
+//!      `refuteMirPointByStrictUB` for all 28 non-bug `ub` tests.
+//!    - Enforces `evalMirDiffTagBounded` equality ratchets for all 10 open
 //!      Anneal bugs (`[tests.known_anneal_bug]`).
 //!    - Runs `trusted/audit/TrustedBoundary.lean` in `verify-audit` mode
 //!      (statement-origin isolation, zero `sorryAx`, zero `axiom`, and full
@@ -107,7 +107,7 @@ fn miri_diff_manifest_validation_rejects_stale_bugs_and_bad_paths() {
         .iter()
         .filter(|t| t.known_anneal_bug.is_some())
         .count();
-    assert_eq!(bug_count, 12);
+    assert_eq!(bug_count, 10);
 
     // A stale `known_anneal_bug` whose `observed_anneal_tag` equals `miri_verdict`
     // must be rejected at parse time.
@@ -174,12 +174,12 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
 
     let report = run_miri_diff_suite(&config).expect("74-test Miri differential suite must pass");
     assert_eq!(report.total_tests, 74);
-    assert_eq!(report.verified_pass_count, 26);
+    assert_eq!(report.verified_pass_count, 27);
     assert_eq!(report.verified_panic_count, 9);
-    assert_eq!(report.verified_strict_ub_count, 27);
-    assert_eq!(report.ratcheted_known_bug_count, 12);
-    // 26 pass + 9 panic + 1 helper (`helper_add_ten`) = 36 certificate modules
-    assert_eq!(report.audited_certificate_modules.len(), 36);
+    assert_eq!(report.verified_strict_ub_count, 28);
+    assert_eq!(report.ratcheted_known_bug_count, 10);
+    // 27 pass + 9 panic + 1 helper (`helper_add_ten`) = 37 certificate modules
+    assert_eq!(report.audited_certificate_modules.len(), 37);
 
     let summary = render_miri_diff_report(&report);
     assert!(summary.contains("Total corpus tests:              74"));

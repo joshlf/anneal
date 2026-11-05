@@ -1176,13 +1176,7 @@ def evalRvalueSymTree
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
-            .leaf (.ok
-              (.ptr
-                { ptrVal with
-                  offsetBytes := Nat.add ptrVal.offsetBytes offsetSc.bits }
-                sz)
-              locals₂
-              mem)
+            .leaf (evalPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp ptrVal sz offsetSc)
           | _ => .leaf .unsupported
         | _, _ => .leaf .unsupported
       | .ub => .leaf .ub
@@ -1331,7 +1325,12 @@ def finishAssignStmtNode
           with
           | .ok callerLocals' =>
             let borrows' :=
-              invalidateDerefWriteBorrows locals₁ mem₁.borrows dst restProj
+              invalidateDerefWriteBorrows
+                locals₁
+                mem₁.borrows
+                dst
+                restProj
+                mem₁.callerLocals
             MirStepNode.step
               (advanceStmt
                 s
@@ -1349,6 +1348,10 @@ def finishAssignStmtNode
         | .ok rootVal' =>
           match set? locals₁ dst.local_ (.init rootVal') with
           | .some locals₂ =>
+            let resolvedLocalProj :=
+              match resolveBorrowProjectionElems locals₁ (proj :: rest) with
+              | .some rp => rp
+              | .none => proj :: rest
             match mem₁.activeProtectors with
             | .nil =>
               let borrows' :=
@@ -1356,7 +1359,7 @@ def finishAssignStmtNode
                   mem₁.borrows
                   dst.local_
                   .none
-                  (proj :: rest)
+                  resolvedLocalProj
               MirStepNode.step
                 (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
             | protHead :: protTail =>
@@ -1366,7 +1369,7 @@ def finishAssignStmtNode
                   (protHead :: protTail)
                   dst.local_
                   .none
-                  (proj :: rest)
+                  resolvedLocalProj
               with
               | true => MirStepNode.fail .ub
               | false =>
@@ -1375,7 +1378,7 @@ def finishAssignStmtNode
                     mem₁.borrows
                     dst.local_
                     .none
-                    (proj :: rest)
+                    resolvedLocalProj
                 MirStepNode.step
                   (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
           | .none => MirStepNode.fail .ub

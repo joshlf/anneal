@@ -449,7 +449,7 @@ functions** in `Trusted.Rustc.V2026_08_01.MirSemantics`:
 5. `.sharedUnsafeCellWrite`: passes `localDecls` with `core::cell::UnsafeCell<u32>` at local 0 to `V2026_08_01.MirSemantics.evalRvalue`, so `placeIsFreeze` is `false` (`TreeBorrowPerm.reserved`) and `writePlaceValue` returns `.ok` (`.normalUnit`).
 6. `.unionVariantWriteRead`: calls `V2026_08_01.MirSemantics.writeProjectedValue` and `readProjectedValue` on `.field 1 u32Ty` (returns `.normalUnit`).
 7. `.dynamicArrayIndexBorrow`: calls `V2026_08_01.MirSemantics.evalRvalue` on `.ref .shared { local_ := 0, projection := [.index 1] }`, then `readProjectedValue` after `.dead` on local 1 (returns `.normalUnit`).
-8. `.exactDivIntrinsicCall`: calls `V2026_08_01.MirSemantics.evalTerminator` on `"core::intrinsics::exact_div"` with `24, 2` and `target = .some 1` (`stepNodeToVerdictV08` maps `.tau _` to `.normalUnit`).
+8. `.exactDivIntrinsicCall`: calls `V2026_08_01.MirSemantics.evalTerminator` on `"core::intrinsics::exact_div"` instantiated at `u32` (as in captured MIR, where the callee constant carries its generic arguments) with `24, 2` and `target = .some 1` (`stepNodeToVerdictV08` maps `.tau _` to `.normalUnit`).
 9. `.reservedImEpochTransition`: calls `V2026_08_01.MirSemantics.protectedReborrowHasInitWrite (V2026_08_01.MirSemantics.initProtectedReborrowPerm true false true)` (`true => .normalUnit`).
 -/
 @[reducible]
@@ -525,7 +525,7 @@ def evalAnnealV2026_08_01 (prog : FixtureProg) (_st : FixtureState) : Verdict :=
     | .ub => .ub
     | .unsupported => .unsupported
   | .exactDivIntrinsicCall =>
-    let fnTy : Ty := { kind := .fnDef "core::intrinsics::exact_div" .nil, layoutIdx := 0 }
+    let fnTy : Ty := { kind := .fnDef "core::intrinsics::exact_div" [.uint .u32], layoutIdx := 0 }
     let funcOp : Operand := .constant { ty := fnTy, val := .zeroSized }
     let argOps : List Operand := [
       .copy { local_ := 1, projection := .nil },
