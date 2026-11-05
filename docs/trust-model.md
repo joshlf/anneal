@@ -57,7 +57,7 @@ user's machine**:
 ```mermaid
 flowchart TD
     subgraph RepoCI ["In Anneal's Repository CI (before shipping)"]
-        THEORY["Untrusted theory/ (.lean) & trusted/lean/"] --> AUDIT["anneal-audit (trusted/audit/)\nEnforces pure, effect-free, axiom-free theory/\nand @[vetted] vs. @[candidate] non-contamination"]
+        THEORY["Untrusted theory/ (.lean) & trusted/lean/"] --> AUDIT["anneal-audit (trusted/audit/)\nEnforces pure, effect-free, axiom-free theory/\nand vetted vs. candidate:<feature> module-tier separation"]
         AUDIT --> ARCHIVE["Packaged Anneal Toolchain Archive"]
     end
 
@@ -123,7 +123,7 @@ Anneal's architecture enforces **Statement-Origin Separation** between the two:
   arbitrarily rich lowering passes and tactics without being able to weaken the
   theorem statement.
 
-### Staging TCB changes (`@[vetted]` vs. `@[candidate <feat>]`)
+### Staging TCB changes (`vetted` vs. `candidate:<feature>` modules)
 
 Auditing a new semantic rule in `trusted/lean/` to full TCB standards—including
 line-by-line Rust Reference citations and human review—takes deliberate effort.
@@ -135,52 +135,42 @@ would face an unproductive tradeoff when adding support for a new Rust feature:
   building the corresponding lowering passes and WP lemmas in `theory/` or
   testing the feature on real crates; or
 - **Dilute the TCB guarantee:** Merge unreviewed definitions into
-  `trusted/lean/` immediately, making it impossible to tell whether a crate's
+  `trusted/lean/` immediately, making it impossible to tell whether a
   verification result depends only on audited rules or also on work-in-progress
   semantics.
 
-Anneal resolves this by partitioning declarations and inductive constructors in
-`trusted/lean/` into two explicit trust tiers:
+Anneal resolves this by assigning every module in `trusted/lean/` an explicit
+module-level trust tier via a leading header comment directive:
 
-- **`@[vetted]`:** Definitions and constructors that have completed full Rust
-  Reference auditing. Enabled by default on both `alpha` and `stable` release
-  channels.
-- **`@[candidate <feat>]`:** Work-in-progress TCB definitions and constructors
-  belonging to a named feature slice `<feat>`. Disabled by default, forbidden
-  on the `stable` release channel, and usable on the `alpha` release channel
-  only when a target crate explicitly opts into `<feat>` in its trust policy.
+- **`-- anneal-trust-tier: vetted`:** Modules whose definitions have completed
+  full Rust Reference auditing.
+- **`-- anneal-trust-tier: candidate:<feature>`:** Work-in-progress TCB modules
+  belonging to a named subsystem feature `<feature>` (such as `refinement`,
+  `step_result`, `memory`, `mir_ast`, `mir_semantics`, or `rustc_capture`) that
+  have not yet completed human auditing.
 
-Supporting both tiers inside a single interpreter requires solving a structural
-problem: Rust's MIR AST and step relation are defined as shared `@[vetted]`
-inductive types (such as `Rvalue` or `TerminatorKind`). Adding a new language
-feature means adding a `@[candidate <feat>]` constructor to a `@[vetted]`
-inductive type, which in turn forces `@[vetted]` functions that pattern-match
-on that inductive to include a match arm for the new constructor.
+Assigning trust tiers at the module boundary rather than via per-declaration
+attributes keeps `trusted/lean/` completely free of custom attribute macros or
+metaprogramming: every constant compiled into a `Trusted` module's `.olean`
+file—including constructors, recursors (`rec`, `casesOn`), pattern matchers
+(`match_1`), equational lemmas (`eq_1`), and `where`/`private` helpers—
+automatically inherits its defining module's trust tier via
+`Environment.getModuleIdxFor?`.
 
-To allow `@[vetted]` inductives to be extended with `@[candidate <feat>]`
-constructors without weakening `@[vetted]` guarantees, Anneal enforces two
-non-contamination properties:
-
-1. **Branch confinement inside `@[vetted]` definitions:** A `@[vetted]`
-   declaration may never reference a `@[candidate <feat>]` constant in its type
-   or in unbranched code. It may reference `@[candidate <feat>]` constants only
-   inside the specific pattern-match arm for a `@[candidate <feat>]`
-   constructor, and that arm must be explicitly marked with a
-   `Trusted.candidate "<feat>" (...)` guard so a bug in `<feat>` cannot affect
-   the evaluation of any `@[vetted]` constructor.
-2. **Pay-only-for-what-you-use reachability:** Merely importing a `@[vetted]`
-   interpreter function that has a guarded `Trusted.candidate "<feat>"` match
-   arm does not taint a crate. A crate's verification is considered to depend
-   on `<feat>` only if its captured `Mir.crate` or proof actually constructs or
-   references a `@[candidate <feat>]` declaration.
+To prevent unreviewed candidate modules from contaminating audited definitions,
+`TrustedBoundary.lean` enforces a strict one-way dependency rule across all
+compiled constants: constants in a `vetted` module may reference only the
+locked `Init.*` foundation and other `vetted` modules, never a
+`candidate:<feature>` module.
 
 ## 2. Repository CI boundary enforcement (`anneal-audit`)
 
 [`trusted/audit/`](../trusted/audit) implements the CI gatekeeper
 (`anneal-audit` and
 [`TrustedBoundary.lean`](../trusted/audit/TrustedBoundary.lean)) that audits
-the Anneal repository (and runs synthetic crate-verification integration tests
-in CI). It enforces five invariants across two phases over an isolated staging
+the Anneal repository. It classifies every module into a single `ModuleRole`
+(`.foundation`, `.trusted .vetted`, `.trusted (.candidate f)`, or `.theory`)
+and enforces five invariants across two phases over an isolated staging
 directory.
 
 ### Cargo workspace containment
@@ -197,58 +187,54 @@ kernel, no Rust crate is permitted outside `trusted/`.
 Before compiling any `.lean` file in `trusted/lean/` or `theory/`,
 `anneal-audit` stages the source files into a private temporary directory,
 verifies that no pre-existing `.olean` or `.ir` files exist in the source tree,
-and scans the concrete syntax trees using Lean's parser:
+and parses every file using `Parser.parseHeader` and `Parser.parseCommand`
+against the locked `Init.*` foundation parser environment (without invoking
+Lean's Turing-complete elaborator):
 
-- **Bans unsafe, effectful, and metaprogramming escapes:** Rejects `unsafe`,
-  `partial`, `noncomputable` (where prohibited), `meta`, `axiom`, `opaque`,
-  `sorry`, `native_decide`, `by_elab`, `#eval`, `run_cmd`, `include_str`,
-  `set_option`, `@[implemented_by]`, `@[extern]`, `@[csimp]`, and `initialize` /
-  `builtin_initialize` hooks, preventing `theory/` from performing I/O or OS
-  calls during compilation.
-- **Enforces namespace and import hygiene:** Verifies that `Trusted.*` modules
-  import only allowed foundation (`Init.*`) and `Trusted.*` modules, and
-  prevents `theory/` modules from opening or declaring constants inside the
-  `Trusted` namespace.
-- **Records trust-tier declarations:** Validates that every declaration and
-  inductive constructor in `Trusted.*` carries an explicit `@[vetted]` or
-  `@[candidate <feature>]` annotation and records the resulting declaration
-  table before `Trusted.expandTrustDeclaration`
-  ([`Trusted/Attributes.lean`](../trusted/lean/Trusted/Attributes.lean)) strips
-  those attributes for `prelude`-only compilation.
+- **Enforces a closed syntax and attribute allowlist:** Admits only pure
+  declarations and commands, rejecting `unsafe`, `partial`, `noncomputable`,
+  `meta`, `axiom`, `macro`, `syntax`, `elab`, `sorry`, `native_decide`,
+  `by_elab`, `run_tac`, `#eval`, `include_str`, `set_option`,
+  `@[implemented_by]`, `@[extern]`, `@[csimp]`, and `initialize` hooks so
+  `theory/` cannot execute arbitrary code or read host files during
+  compilation.
+- **Extracts module trust tiers:** Verifies that every `Trusted.*` module
+  contains exactly one valid `-- anneal-trust-tier: vetted` or
+  `-- anneal-trust-tier: candidate:<feature>` directive, and rejects trust-tier
+  directives in non-`Trusted` modules.
 
 ### Phase 2: Standalone kernel replay and DAG audit (`--mode audit`)
 
 After compiling the staged `.lean` modules synchronously with kernel checking
 enabled (`-t0 -DElab.async=false -Ddebug.skipKernelTC=false`), `anneal-audit`
-loads the resulting `.olean` environment and performs a full kernel-level audit:
+loads the resulting `.olean` files with `trustLevel := 0`, `plugins := #[]`,
+and `loadExts := false` (so no `[init]` initializers or persistent environment
+extensions from audited modules are deserialized or executed) and performs a
+full kernel-level audit:
 
-1. **Module, origin, and axiom verification (`verifyAndCollectLocals`):**
-   Verifies that only allowlisted modules are loaded; that no non-foundation
-   declaration in `Trusted.*` or `theory/` is `unsafe`, `partial`, an `axiom`,
-   or a quotient primitive (`.quotInfo`); and that the transitive dependency
-   closure reaches only the locked foundation axiom allowlist
+1. **Module, namespace, and axiom verification (`verifyAndCollectLocals`):**
+   Verifies that only allowlisted modules are loaded; that every constant's
+   recorded module origin (`env.getModuleIdxFor?`) matches its module's
+   `ModuleRole`; that non-`Trusted` modules declare no constants in the
+   `Trusted` root namespace (`(privateToUserName ci.name).getRoot == `Trusted`)
+   and no `opaque` definitions; that no non-foundation declaration in
+   `Trusted.*` or `theory/` is `unsafe`, `partial`, an `axiom`, or a quotient
+   primitive (`.quotInfo`); and that the transitive dependency closure reaches
+   only the locked foundation axiom allowlist
    (`{Classical.choice, Quot.sound, propext}`).
-2. **Candidate non-contamination (`@[vetted]` vs. `@[candidate <feat>]`):**
-   Enforces the two staging properties described in Section 1.
-   `TrustedBoundary.lean` derives per-parameter eliminator trust statuses
-   (`deriveEliminatorParamStatuses`) to verify that every
-   `Trusted.candidate "<feat>" (...)` guard in a `@[vetted]` body occurs inside
-   the minor premise for a `@[candidate <feat>]` constructor and references only
-   `@[vetted]` or `@[candidate <feat>]` constants. It also computes
-   demand-driven candidate reachability (`collectActiveCandidateFeatures`),
-   deferring guarded `<feat>` branches unless `<feat>` is actually reached by
-   the crate.
+2. **Origin and trust-tier separation (`checkTierReferences`):** Traverses
+   every kernel dependency edge `c → dep` (`declarationEdges`) across all
+   `Trusted.*` constants and enforces two rules:
+   - **Origin rule:** A `.trusted _` constant may reference only `.foundation`
+     or `.trusted _` constants (never `.theory`).
+   - **Vetted rule:** A `.trusted .vetted` constant may reference only
+     `.foundation` or `.trusted .vetted` constants (never
+     `.trusted (.candidate _)`).
 3. **Fresh kernel replay (`base.toKernelEnv.replay locals`):** Finally,
    `TrustedBoundary.lean` constructs a clean kernel environment containing only
    the pinned `Init.*` foundation (`base`) and replays every non-foundation
    constant (`Trusted.*` and `theory/`) through the standalone Lean 4 kernel
    typechecker from scratch.
-
-*(In CI integration tests, `anneal-audit` also exercises a `--verify-crate`
-mode over test fixtures containing `Mir.lean` and `Proof.lean` to verify
-end-to-end that `Proof.verify_crate : Trusted.CrateTheorem Mir.crate` and
-candidate-feature reachability behave as expected across the `trusted/lean/`
-and `theory/` boundary.)*
 
 ### Including external files in the `trusted/` boundary via hashes
 
