@@ -4153,6 +4153,35 @@ theorem linkVerifiedTraitOrPolyContractMirCalleeWithCalleesSym
 that basic block `idx` in `body.basicBlocks` is `bb`, avoiding repeated linear
 list traversal of `body.basicBlocks` during symbolic execution.
 -/
+/--
+`O(1)` active callee normalization hypothesis (`ActiveCalleeCtx s body instBody`):
+records that `s.memory.activeCallee.getD body = instBody`, avoiding repeated
+evaluation and WHNF unrolling of `.getD` and `CapturedMir.instantiate` across steps.
+-/
+def ActiveCalleeCtx (s : MachineState) (body instBody : CapturedMir) : Prop :=
+  s.memory.activeCallee.getD body = instBody
+
+theorem stepMirSymTree_of_activeCalleeCtx
+    {body instBody : CapturedMir}
+    {s : MachineState}
+    (h_ctx : ActiveCalleeCtx s body instBody) :
+    stepMirSymTree body s =
+      match instBody.phase with
+      | .other _ => .leaf MirStepNode.unsupported
+      | _ =>
+        match get? instBody.basicBlocks s.frame.blockIdx with
+        | none => .leaf (MirStepNode.fail .ub)
+        | some bb =>
+          match get? bb.statements s.frame.stmtIdx with
+          | some stmt =>
+            evalStmtSymTree s stmt instBody.localDecls instBody.layouts
+          | none =>
+            if s.frame.stmtIdx == length bb.statements then
+              evalTerminatorSymTree s bb.terminator instBody
+            else .leaf (MirStepNode.fail .ub) := by
+  unfold stepMirSymTree
+  rw [h_ctx]
+
 def BlockCtx (body : CapturedMir) (idx : BasicBlockIdx) (bb : BasicBlockData) : Prop :=
   get? body.basicBlocks idx = .some bb
 

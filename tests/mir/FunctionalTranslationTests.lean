@@ -1219,6 +1219,55 @@ theorem ftSliceLenAndFnPtr_verified :
   rcases h_args with ⟨⟨rfl, rfl⟩, rfl⟩
   rfl
 
+/-- Trait implementation of `Default::default` for `u32`. -/
+def ftDefaultU32Mir : CapturedMir := {
+  mkMirBody "test::impl_Default_for_u32" 0
+    [mkDecl .mut u32MirTy]
+    [ { statements :=
+          [ mkStmt (.assign (locPlace 0) (.use (u32ConstOp 0))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ] with
+  traitImpls :=
+    [ { traitRef := { defPath := "core::default::Default::default", args := [.uint .u32] }
+      , implPath := "test::impl_Default_for_u32" } ]
+  layouts := ftCallerLayouts
+}
+
+/-- Caller `ftTraitCallMir` demonstrating trait-method compositional linking. -/
+def ftTraitCallMir : CapturedMir := {
+  mkMirBody "test::trait_call" 0
+    [mkDecl .mut u32MirTy]
+    [ { statements := []
+        terminator :=
+          mkTerm (.call
+            (fnConstFtOp "core::default::Default::default" [.uint .u32])
+            []
+            (locPlace 0)
+            (.some 1)
+            .continue_)
+        isCleanup := false }
+    , { statements := []
+        terminator := mkTerm .return_
+        isCleanup := false } ] with
+  layouts := ftCallerLayouts
+}
+
+def ftTraitCallClaim : Claim where
+  body := ftTraitCallMir
+  callees := [ftDefaultU32Mir]
+  pre args := args = []
+  post args ret := args = [] → ret = .scalar ⟨0, 4⟩
+
+theorem ftTraitCall_verified :
+    VerificationResult ftTraitCallClaim := by
+  refine verifyMirBounded ftTraitCallClaim 20 ?_
+  rintro _ rfl
+  rintro retVal mem' h_out h_args
+  injection h_out with h_pair
+  injection h_pair with h_rv _
+  subst h_rv
+  rfl
+
 end Suite4MultiFrameAndPolyCalls
 
 end Anneal.FunctionalTranslationTests
