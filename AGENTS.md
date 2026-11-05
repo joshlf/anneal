@@ -67,6 +67,7 @@ applies, follow all of them.
 | Coordinating multi-agent conceptual model refinement across theories, software designs, schemas, protocols, or instructions | [`swarm-model-refinement`](skills/swarm-model-refinement/SKILL.md), [`model-refinement`](skills/model-refinement/SKILL.md) |
 | Creating, revising, evaluating, or retiring agent skills or maintainer guidance | [`skill-authorship`](skills/skill-authorship/SKILL.md), [`model-refinement`](skills/model-refinement/SKILL.md) |
 | Leading or directing ambiguous engineering efforts, recovering requirements, developing or evaluating architecture, or recovering technical understanding after context loss | [`tech-lead`](skills/tech-lead/SKILL.md), [`reader-oriented-explanation`](skills/reader-oriented-explanation/SKILL.md), [`williams-style`](skills/williams-style/SKILL.md) |
+| Conducting multi-round technical research and experimentation (for example, on Rust, `rustc`, Lean 4, or verification models), or harvesting expensive-to-recover findings into the reference corpus (with user approval) | [`reference-research`](https://github.com/google/zerocopy/blob/reference/skills/reference-research/SKILL.md) (on `google/zerocopy`'s `reference` branch; see [Technical reference corpus](#technical-reference-corpus)) |
 
 ## Architecture and trust boundary
 
@@ -127,3 +128,35 @@ When implementing or modifying components in `trusted/`:
   conservative. Prefer crates with minimal transitive dependencies and generic,
   well-understood failure modes that do not pose soundness risks specific to
   Anneal.
+
+## Technical reference corpus
+
+The orphan [`reference`](https://github.com/google/zerocopy/tree/reference)
+branch of `google/zerocopy` (`refs/heads/reference` in a local `zerocopy`
+checkout or worktree, or fetched from `https://github.com/google/zerocopy.git`)
+maintains a general-purpose technical reference corpus (`CATALOG.json` and
+`reports/<package>/`) covering topics such as Rust operational semantics,
+`rustc` MIR stages and internals, Lean 4 kernel and elaboration behavior,
+Charon, Aeneas, and Anneal's verification architecture.
+
+- **Consulting existing research:** When designing architecture, modeling
+  semantics, or investigating non-obvious system, compiler, or kernel behavior,
+  check the `reference` branch (when accessible in your environment) and follow
+  its [`AGENTS.md`](https://github.com/google/zerocopy/blob/reference/AGENTS.md)
+  before repeating broad source crawls or experiments from scratch:
+  - Filter `CATALOG.json` programmatically (rather than reading the full file
+    into context) to find relevant packages under `reports/<package>/`.
+  - Check each report's subject revisions (`REPORT.json`), `Applicability`, and
+    `Boundaries` against the versions Anneal pins. Primary upstream sources
+    retain authority and must still be quoted and cited directly in `trusted/`
+    comments.
+- **Running new `reference-research` (human approval required):** When a design
+  or soundness decision depends on non-obvious technical behavior that is not
+  in `CATALOG.json` and cannot be resolved by a quick local check—or after an
+  engineering task uncovers expensive-to-recover findings worth preserving—
+  consider [`skills/reference-research/SKILL.md`](https://github.com/google/zerocopy/blob/reference/skills/reference-research/SKILL.md)
+  on `google/zerocopy`'s `reference` branch. Do not launch `reference-research`
+  or push to `google/zerocopy` without explicit user approval: state the
+  concrete question(s) or findings to harvest and ask the user whether to run
+  `reference-research` (and whether to stop after **brainstorm / plan only** or
+  run **end-to-end execution and publication**).
