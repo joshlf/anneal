@@ -1,39 +1,46 @@
-# Reproduce MR-2.3
+# Reproduce MR-2.3 (Enums/ADTs)
 
-This document outlines the steps to verify the implementation of `MR-2.3` (Enums/ADTs, Discriminator, SetDiscriminant, GetDiscriminant & Downcast) in the MiniRust Lean specification.
+This guide walks through reproducing the `MR-2.3` milestone, which adds semantic translation and simulation for Minirust Enums/ADTs (Discriminator, SetDiscriminant, GetDiscriminant, Downcast).
 
 ## Prerequisites
 
-- Lean 4 toolchain (installed via `elan`)
-- Rust toolchain (installed via `rustup`)
+- You must be inside the `MR-2.3` worktree.
+- Run commands with `anneal-lean-run` to enforce concurrency limits and resource constraints.
 
-Ensure `elan` and `cargo` are in your `PATH`.
+## Steps
 
-## Verification Steps
+### 1. Verify Rust Quotations
 
-1. **Verify the Concrete Enum Witness**
-   Check the `Witness.lean` file, which includes tests for `Type.encode`, `Type.decode`, `checkValue`, and `Interp.evalPlace` using a custom `Option<u8>`-like enum:
-   ```bash
-   cd examples
-   anneal-lean-run --mode file --concurrency 3 -- lake env lean ../minirust/lean/MiniRustSpec/Correspondence/Witness.lean
-   ```
+Check that the Rust quotes test for Enum statements is passing and tamper-checked:
 
-2. **Full Project Build**
-   Build the entire `MiniRustSpec` project to ensure all definitions and correspondence theorems type-check properly:
-   ```bash
-   cd examples
-   anneal-lean-run --mode build --concurrency 3 -- lake build MiniRustSpec
-   ```
+```bash
+cargo test -p anneal-minirust-gen --test quotes -- mr_2_3
+```
 
-3. **Check Upstream Quotes Sync**
-   Verify that the docstrings accurately reflect the upstream MiniRust specification by running the quote checker:
-   ```bash
-   cargo test -p anneal-minirust-gen --offline
-   ```
+You should see:
+```
+test mr_2_3_enum_quotations_are_pinned_and_tamper_checked ... ok
+```
 
-4. **Audit Trusted Base and TODOs**
-   Ensure no regressions in the trusted components and check for unresolved TODOs:
-   ```bash
-   ./ci/check_todo.sh
-   python3 trusted/audit/check_trusted.py --fast
-   ```
+### 2. Verify Semantic Translation & Simulation (Lean)
+
+Run the Lean build to verify the proofs in `Witness.lean`, `Translate.lean`, and `Simulation.lean` are valid and the `Audit.lean` target evaluates to `sorry_free=true`:
+
+```bash
+cd examples
+anneal-lean-run --mode build --concurrency 3 -- lake build MiniRustSpec
+```
+
+This will run for a while and should complete without errors. Ensure the final `Audit.lean` evaluates without hitting `sorry`.
+
+### 3. Check for TODOs / Axioms
+
+Verify that there are no unapproved `todo!`, `sorry`, or unsupported axioms:
+
+```bash
+cd ..
+./ci/check_todo.sh
+python3 trusted/audit/check_trusted.py --fast
+```
+
+The output should indicate no violations.

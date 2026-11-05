@@ -2504,6 +2504,7 @@ theorem evalStmt_assign_field_scalar (s : MachineState) (decls : List LocalDecl)
     simp [evalStmt, hrvOk r hr, get?, hil, hsl', hw, set?, hprot, hbor, MirStepNode.step]
   · simp [evalStmt, hrvNone hnone]
 
+
 theorem evalStmt_placeMention (s : MachineState) (decls : List LocalDecl) (layouts : Layout.LayoutTable)
     (i : Nat) (projs : List ProjectionElem) (span : String) (hslots : SlotsOk layouts decls s.frame.locals)
     (hn : s.frame.locals.length = decls.length) (hi : i < decls.length) :

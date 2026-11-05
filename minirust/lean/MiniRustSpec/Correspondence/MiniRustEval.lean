@@ -1564,7 +1564,7 @@ theorem operandIntType_of_operandOk {layouts : Layout.LayoutTable}
             simp only [ha, Bool.and_eq_true, decide_eq_true_eq, Option.map_some, Option.some.injEq] at hok ⊢
             exact hok.1
       | cons _ _ => simp [operandOk, translateOperand, translatePlace, placeOk] at h
-    | _ => simp [operandOk, translateOperand, translatePlace, placeOk] at h
+    | _ => cases rest <;> simp [operandOk, translateOperand, translatePlace, placeOk, projOk] at h <;> try split at h <;> try cases h <;> try rename_i left right <;> try cases left <;> try simp_all
   | .constant _, h =>
     simp only [operandOk, Bool.and_eq_true, decide_eq_true_eq] at h
     exact h.1
@@ -2061,6 +2061,7 @@ theorem evalValue_operand {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
         subst hbits
         exact ⟨hb, m, by simp [evalValue, evalConstant], h⟩
       · simp at he
+  | .copy ⟨j, .downcast _ _ :: rest⟩, hok, he => cases rest <;> simp [operandOk, placeOk, projOk] at hok <;> try split at hok <;> try cases hok <;> try rename_i left right <;> try cases left <;> try simp_all
 
 /-- The bit pattern an Anneal fragment rvalue of type `it` evaluates to, or
 `none` when evaluating it is UB. -/

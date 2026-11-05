@@ -329,7 +329,7 @@ theorem translateStatement_some {layouts : Layout.LayoutTable} {decls : List Loc
         simp [hpe, he] at h
         exact .inl ⟨dst, rv, pe, e, rfl, hpe, he, h.symm⟩
   | .setDiscriminant dst variant, h =>
-    simp only [translateStatement, Option.bind_eq_bind] at h
+    simp only [Option.bind_eq_bind] at h
     cases hpe : translatePlace decls dst with
     | none => simp [hpe] at h
     | some pe =>
@@ -339,7 +339,7 @@ theorem translateStatement_some {layouts : Layout.LayoutTable} {decls : List Loc
   | .storageLive _, h => simp at h
   | .storageDead _, h => simp at h
   | .retag _ _, h => simp at h
-  | .placeMention ⟨i, []⟩, h => simp at h; exact .inr (.inl ⟨i, rfl, h.symm⟩)
+  | .placeMention ⟨i, []⟩, h => simp at h; exact .inr (.inr (.inl ⟨i, rfl, h.symm⟩))
   | .placeMention ⟨i, p :: rest⟩, h =>
     cases p with
     | field idx fieldTy =>
@@ -348,7 +348,7 @@ theorem translateStatement_some {layouts : Layout.LayoutTable} {decls : List Loc
       | none => simp [hpe] at h
       | some pe =>
         simp [hpe] at h
-        exact .inr (.inr ⟨i, idx, fieldTy, rest, pe, rfl, hpe, h.symm⟩)
+        exact .inr (.inr (.inr ⟨i, idx, fieldTy, rest, pe, rfl, hpe, h.symm⟩))
     | _ => simp at h
   | .intrinsic _, h => simp at h
   | .coverage, h => simp at h
@@ -799,9 +799,10 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
             fun idx fieldTy h => hfield ⟨idx, fieldTy, h⟩
           cases rest with
           | cons p2 rest2 =>
-            cases proj with
-            | field idx fieldTy => exact False.elim (hnf idx fieldTy rfl)
-            | _ => simp [translatePlace] at hpe
+            cases proj
+            case field idx fieldTy => exact False.elim (hnf idx fieldTy rfl)
+            case downcast => simp [statementOk] at hok
+            all_goals simp [translatePlace] at hpe
           | nil =>
             rw [statementOk_assign_single_nonfield hnf] at hok
             cases hdi : body.localDecls[i]? with
@@ -863,6 +864,12 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
                         activeCallee := hrel.activeCallee
                         protectors := hrel.protectors
                         callerLocals := hrel.callerLocals }
+    · ------------------------------------------------------------ setDiscriminant
+      obtain ⟨kind, span⟩ := st
+      simp only at hkind
+      subst hkind
+      simp only [statementOk] at hok
+      contradiction
     · ------------------------------------------------------------ placeMention (local)
       obtain ⟨kind, span⟩ := st
       simp only at hkind

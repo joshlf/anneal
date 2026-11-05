@@ -619,9 +619,6 @@ def translateRvalue (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
     (decls : List MirAst.LocalDecl) (targetTy : Option MirAst.Ty := none) :
     MirAst.Rvalue → Option Gen.ValueExpr
   | .use op => translateOperand decls op
-  | .discriminant place => do
-    let p ← translatePlace decls place
-    pure (.GetDiscriminant p)
   | .unaryOp uop op => do
     let iuop ← translateUnOp uop
     pure (.UnOp (.Int iuop) (← translateOperand decls op))
@@ -682,9 +679,6 @@ def translateStatement (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
     let destination ← translatePlace decls dst
     let source ← translateRvalue layouts decls (placeMirTy decls dst) rv
     pure (.Assign destination source)
-  | .setDiscriminant dst variant => do
-    let p ← translatePlace decls dst
-    pure (.SetDiscriminant p (Int.ofNat variant))
   | .placeMention ⟨i, []⟩ => some (.PlaceMention (.Local (localName i)))
   | .placeMention ⟨i, .field idx fieldTy :: rest⟩ => do
     let pe ← translateFieldPlace (.Local (localName i)) (.field idx fieldTy :: rest)
@@ -832,7 +826,6 @@ a (possibly nested) field projection `_j.f1...fk`, or an indexed element
 `_j[proj]` of a homogeneous array local. -/
 def placeOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
     (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Place → Bool
-  | ⟨j, .downcast _ _ :: _⟩ => false
   | ⟨j, []⟩ =>
     decide (j < decls.length) && decide ((decls[j]? >>= (intTypeOf ·.ty)) = some it)
   | ⟨j, .field idx fieldTy :: rest⟩ =>
@@ -873,7 +866,6 @@ def isShiftIntBinOp : Gen.IntBinOp → Bool
 /-- Fragment rvalues of integer type `it`. -/
 def rvalueOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
     (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rvalue → Bool
-  | .discriminant _ => false
   | .use op => operandOk layouts decls it op
   | .unaryOp uop op => (translateUnOp uop).isSome && operandOk layouts decls it op
   | .binaryOp op a b =>

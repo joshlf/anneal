@@ -545,7 +545,8 @@ def Type.layout : «Type» → Interp LayoutStrategy
     let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures slice element is sized"
     let elemAlign ← LayoutStrategy.expect_align elemLayout "WF ensures array element is sized"
     pure (.Slice elemSize elemAlign)
-  | _ => unsupported "Type::layout for a non-Int, non-Bool, non-Tuple, non-Array, non-Slice type"
+  | .Enum _ _ _ size align => pure (.Sized size align)
+  | _ => unsupported "Type::layout for a non-Int, non-Bool, non-Tuple, non-Array, non-Slice, non-Enum type"
 
 /-! ## Representation relation (`spec/lang/representation.md`) -/
 
@@ -804,16 +805,14 @@ def Type.encode : «Type» → Val → Interp (List Byte)
           pure bytes)
       pure encoded.flatten
   | .Array _ _, _ => specPanic "encode: Type::Array with a non-Tuple value"
-  | .Enum variants _ _ size _, .Variant discriminant data => do
+  | .Enum variants _ _ _ _, .Variant discriminant data => do
     let variantBytes ← encodeEnumVariant variants.entries discriminant data
-    let bytes := List.replicate size.bytes .Uninit
-    let bytes' ← writeSubsliceAtIndex bytes 0 variantBytes
     let variant ← mapIndex variants discriminant "get tagger"
     let (_, bytes'') ← StateT.run (encodeDiscriminant (fun offset value_bytes => do
       let b ← get
       let b' ← liftM (writeSubsliceAtIndex b offset.bytes value_bytes)
       set b'
-    ) variant.tagger) bytes'
+    ) variant.tagger) variantBytes
     pure bytes''
   | .Enum _ _ _ _ _, _ => specPanic "encode: Type::Enum with a non-Variant value"
   | _, _ => unsupported "Type::encode for a non-Int, non-Bool, non-Tuple, non-Array type"
