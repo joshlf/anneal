@@ -503,6 +503,10 @@ fn rejects_forbidden_syntax_and_attributes_without_executing_eval() {
             "empty French-quote identifier",
             format!("{HEADER}def «» : Nat := 0\n"),
         ),
+        (
+            "tactic block in Trusted module",
+            format!("{HEADER}theorem x : Eq 0 0 := by rfl\n"),
+        ),
     ];
 
     let mut checker = Checker::new(&base_fix.root, None).unwrap();
@@ -517,18 +521,88 @@ fn rejects_forbidden_syntax_and_attributes_without_executing_eval() {
             .expect_err(&format!("expected preflight rejection for {label}"));
         assert_eq!(err.code, 1, "unexpected code for {label}: {err}");
     }
+
+    // Verify that `SourceRole.theory` (`Anneal`) admits allowed tactics (`by
+    // rfl`) while still rejecting disallowed tactics and tactic configurations
+    // (`native_decide`, `decide +native`, `decide +kernel`, `decide!`,
+    // `bv_decide`, `rfl'`, `grind`, `sorry`).
+    let theory_header = "prelude\nimport Init.NotationExtra\n";
+    let theory_pos_path = checker.stage.join("theory-pos.lean");
+    fs::write(
+        &theory_pos_path,
+        format!("{theory_header}theorem ok : Eq 0 0 := by rfl\n").as_bytes(),
+    )
+    .unwrap();
+    checker
+        .inspect(InspectorRequest::Preflight {
+            sources: vec![("Anneal".to_string(), theory_pos_path)],
+        })
+        .expect("expected theory module with `by rfl` to pass preflight");
+
+    let theory_negatives: Vec<(&str, String)> = vec![
+        (
+            "theory native_decide",
+            format!("{theory_header}theorem x : True := by native_decide\n"),
+        ),
+        (
+            "theory decide +native",
+            format!("{theory_header}theorem x : True := by decide +native\n"),
+        ),
+        (
+            "theory decide +kernel",
+            format!("{theory_header}theorem x : True := by decide +kernel\n"),
+        ),
+        (
+            "theory decideBang",
+            format!("{theory_header}theorem x : True := by decide!\n"),
+        ),
+        (
+            "theory bv_decide",
+            format!("{theory_header}theorem x : True := by bv_decide\n"),
+        ),
+        (
+            "theory rfl'",
+            format!("{theory_header}theorem x : True := by rfl'\n"),
+        ),
+        (
+            "theory grind set_option",
+            format!(
+                "{theory_header}theorem x : True := by grind => set_option debug.skipKernelTC true\n"
+            ),
+        ),
+        (
+            "theory by sorry",
+            format!("{theory_header}theorem x : False := by sorry\n"),
+        ),
+        (
+            "theory term sorry",
+            format!("{theory_header}theorem x : False := sorry\n"),
+        ),
+    ];
+    for (idx, (label, src)) in theory_negatives.iter().enumerate() {
+        let neg_path = checker.stage.join(format!("theory-neg-{idx}.lean"));
+        fs::write(&neg_path, src.as_bytes()).unwrap();
+        let err = checker
+            .inspect(InspectorRequest::Preflight {
+                sources: vec![("Anneal".to_string(), neg_path)],
+            })
+            .expect_err(&format!("expected preflight rejection for {label}"));
+        assert_eq!(err.code, 1, "unexpected code for {label}: {err}");
+    }
 }
 
-/// Verifies that Phase 2 (`"audit"`) rejects `sorry` and `sorryAx` (which is
-/// excluded from `foundation-lock.json`'s axiom allowlist), both in
-/// `Trusted.lean` and in an unimported `Trusted/Unused.lean` module discovered
-/// by `scan_lean_tree`.
+/// Verifies that `"preflight"` rejects surface `sorry` syntax before
+/// compilation (`execution_began == false`), and that Phase 2 (`"audit"`)
+/// rejects direct `sorryAx` applications (which use only allowed function
+/// application syntax, so they reach Phase 2 where `sorryAx` is excluded from
+/// `foundation-lock.json`'s axiom allowlist), both in `Trusted.lean` and in an
+/// unimported `Trusted/Unused.lean` module discovered by `scan_lean_tree`.
 #[test]
 fn rejects_sorry_and_unreferenced_module_with_sorry() {
     let mut f_sorry = TempFixture::new(Some(&format!(
         "{HEADER}theorem bad : False := by sorry\n"
     )));
-    let _ = f_sorry.check_expected(Some(1), Some("audit"), Some(true));
+    let _ = f_sorry.check_expected(Some(1), Some("preflight"), Some(false));
 
     let mut f_sorry_ax = TempFixture::new(Some(&format!(
         "{HEADER}theorem bad : False := sorryAx False true\n"
@@ -539,7 +613,8 @@ fn rejects_sorry_and_unreferenced_module_with_sorry() {
     fs::create_dir_all(f_unused.root.join("trusted/lean/Trusted")).unwrap();
     fs::write(
         f_unused.root.join("trusted/lean/Trusted/Unused.lean"),
-        format!("{HEADER}theorem unreferenced : False := by sorry\n").as_bytes(),
+        format!("{HEADER}theorem unreferenced : False := sorryAx False true\n")
+            .as_bytes(),
     )
     .unwrap();
     let _ = f_unused.check_expected(Some(1), Some("audit"), Some(true));
