@@ -67,21 +67,32 @@ def elabMirLift : CommandElab := fun stx => do
       for i in [0:blocksArr.size] do
         if h : i < blocksArr.size then
           let bb : BasicBlockData := blocksArr[i]
+          let mut isBackEdge := false
+          let checkUnwind (u : UnwindAction) : Bool := match u with | .cleanup target => target ≤ i | _ => false
           match bb.terminator.kind with
-          | TerminatorKind.call .. =>
+          | .goto target => if target ≤ i then isBackEdge := true
+          | .drop _ target u => if target ≤ i || checkUnwind u then isBackEdge := true
+          | .assert _ _ target u => if target ≤ i || checkUnwind u then isBackEdge := true
+          | .call _ _ _ t u =>
+            if checkUnwind u then isBackEdge := true
+            if let some target := t then if target ≤ i then isBackEdge := true
+          | .switchInt _ targets =>
+            if targets.otherwise ≤ i then isBackEdge := true
+            for b in targets.branches do
+              if b.snd ≤ i then isBackEdge := true
+          | _ => pure ()
+          
+          let mut needsResidual := isBackEdge
+          match bb.terminator.kind with
+          | .call .. => needsResidual := true
+          | _ => pure ()
+          
+          if needsResidual then
             let hypName := mkIdent (Name.mkSimple s!"h_res_{i}")
             let bbIdxStx := Syntax.mkNumLit (toString i)
             let hypType ← `(∀ env, Anneal.MirLiftCore.LiftResidualBlock $targetName $bbIdxStx env (fun _ => True) 100)
             let b ← `(bracketedBinder| ($hypName : $hypType))
             residualHyps := residualHyps.push b
-          | TerminatorKind.goto target =>
-            if target ≤ i then
-              let hypName := mkIdent (Name.mkSimple s!"h_res_{i}")
-              let bbIdxStx := Syntax.mkNumLit (toString i)
-              let hypType ← `(∀ env, Anneal.MirLiftCore.LiftResidualBlock $targetName $bbIdxStx env (fun _ => True) 100)
-              let b ← `(bracketedBinder| ($hypName : $hypType))
-              residualHyps := residualHyps.push b
-          | _ => pure ()
         
     let cmd2 ← `(command| theorem $soundName $residualHyps* : ∃ fuel, LiftBlock $targetName 0 (initPureEnv $targetName []) (fun _ => True) fuel := by apply Exists.intro; apply LiftBlock.of_lookup (by rfl); repeat (first | lift_mir_step | trivial))
     elabCommand cmd1
@@ -157,3 +168,14 @@ def gotoBody : CapturedMir := makeGotoBody "goto"
 
 def partialBody : CapturedMir := makeBranchBody "partial"
 #mir_lift (residual := true) partialBody
+
+def makeDropLoopBody (name : String) : CapturedMir := {
+  benchBody with
+  defPath := name,
+  basicBlocks := [
+    { statements := [], terminator := { kind := .drop { local_ := 0, projection := [] } 0 .unreachable, span := "bench" }, isCleanup := false }
+  ]
+}
+
+def dropLoopBody : CapturedMir := makeDropLoopBody "dropLoop"
+#mir_lift (residual := true) dropLoopBody
