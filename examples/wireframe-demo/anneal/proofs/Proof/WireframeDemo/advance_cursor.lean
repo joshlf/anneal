@@ -113,7 +113,7 @@ theorem verified :
       operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy,
       tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, ProvenancePtr.tag,
       lookupBorrow, appendProjections, stripTransparentProjections,
-      freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, not, Bool.rec, Bool.casesOn, advCtx,
+      freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, not, Bool.rec, Bool.casesOn,
       projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
       byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
       isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
@@ -125,6 +125,8 @@ theorem verified :
       get?, set?, length, Nat.add, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble,
       ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
       Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
+
+    dsimp only [Trusted.Effect.Effect.I, Trusted.Effect.Effect.O, Trusted.Rustc.V2026_06_01.MirSemantics.MirEffect, Trusted.Rustc.V2026_06_01.MirSemantics.MirStepNode, Trusted.ITree.ITreeF]
     have h_ble_inv : Nat.ble offset limit = true := Nat.ble_eq_true_of_le h_inv
     have h_sub_wrap : wrapScalarBits (Nat.sub limit offset) (scalarModulus 2) = limit - offset :=
       wrapScalarBits_eq_of_lt (by change limit - offset < 65536; omega)
@@ -186,7 +188,7 @@ theorem verified :
         operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy,
         tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, ProvenancePtr.tag,
         lookupBorrow, appendProjections, stripTransparentProjections,
-        freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, not, Bool.rec, Bool.casesOn, advCtx,
+        freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, not, Bool.rec, Bool.casesOn,
       projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
         byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
         isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,

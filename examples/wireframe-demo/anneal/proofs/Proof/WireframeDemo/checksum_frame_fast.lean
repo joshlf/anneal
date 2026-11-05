@@ -1540,7 +1540,7 @@ private theorem impl_verified :
       rootFrame8Ptr, frame8Value, sharedFrame8Borrow, frame8SlotIdx,
       readProjectedValue_nil, readProjectedValue_field, readProjectedValue_index,
       ProvenancePtr.tag, lookupBorrow, appendProjections, stripTransparentProjections,
-      freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, not, Bool.rec, Bool.casesOn, fastCtx,
+      freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, not, Bool.rec, Bool.casesOn,
       projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
       byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
       isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
@@ -1552,6 +1552,8 @@ private theorem impl_verified :
       get?, set?, length, Nat.add, Nat.mod, Nat.ble, Nat.beq, Bool.and, Bool.or, Bool.not,
       ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
       Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
+
+    dsimp only [Trusted.Effect.Effect.I, Trusted.Effect.Effect.O, Trusted.Rustc.V2026_06_01.MirSemantics.MirEffect, Trusted.Rustc.V2026_06_01.MirSemantics.MirStepNode, Trusted.ITree.ITreeF]
     simp only [Nat.add_eq, Nat.mul_eq, Nat.div_eq,
       uint8_ofNat_toBitVec_toNat_of_lt hb0,
       uint8_ofNat_toBitVec_toNat_of_lt hb1,
@@ -1604,6 +1606,8 @@ private theorem impl_verified :
           4294967296 =
           (b0 * 256 + b1) + (b2 * 256 + b3) + (b4 * 256 + b5) + (b6 * 256 + b7) :=
       wrapScalarBits_eq_of_lt (by omega)
+
+    dsimp only [Trusted.Effect.Effect.I, Trusted.Effect.Effect.O, Trusted.Rustc.V2026_06_01.MirSemantics.MirEffect, Trusted.Rustc.V2026_06_01.MirSemantics.MirStepNode, Trusted.ITree.ITreeF]
     simp only [h_c0, h_c1, h_c2, h_c3, h_ovf1, h_s1, h_ovf2, h_s2, h_ovf3, h_s3]
     rfl
   · refine ⟨trivial, rfl, ?_⟩
@@ -1680,7 +1684,7 @@ private theorem spec_verified :
     rootFrame8Ptr, frame8Value, sharedFrame8Borrow, frame8SlotIdx,
     readProjectedValue_nil, readProjectedValue_field, readProjectedValue_index,
     ProvenancePtr.tag, lookupBorrow, appendProjections, stripTransparentProjections,
-    freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, not, Bool.rec, Bool.casesOn, fastCtx,
+    freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, not, Bool.rec, Bool.casesOn,
       projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
     isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,

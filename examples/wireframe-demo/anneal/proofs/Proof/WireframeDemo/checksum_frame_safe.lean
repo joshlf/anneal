@@ -1304,7 +1304,7 @@ theorem verified :
       rootFrame8Ptr, frame8Value, sharedFrame8Borrow, frame8SlotIdx,
       readProjectedValue_nil, readProjectedValue_field, readProjectedValue_index,
       ProvenancePtr.tag, lookupBorrow, appendProjections, stripTransparentProjections,
-      freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, not, Bool.rec, Bool.casesOn, safeCtx,
+      freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, not, Bool.rec, Bool.casesOn,
       projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
       byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
       isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
@@ -1336,6 +1336,8 @@ theorem verified :
     have h_or3 : bitwiseOrBits 32 (wrapScalarBits (b6 * 256) 4294967296) b7 = b6 * 256 + b7 := by
       rw [wrapScalarBits_eq_of_lt (by omega)]
       exact bitwiseOrBits_32_mul256_add (by omega) hb7
+
+    dsimp only [Trusted.Effect.Effect.I, Trusted.Effect.Effect.O, Trusted.Rustc.V2026_06_01.MirSemantics.MirEffect, Trusted.Rustc.V2026_06_01.MirSemantics.MirStepNode, Trusted.ITree.ITreeF]
     simp only [Nat.add_eq, Nat.mul_eq,
       h_wb0, h_wb1, h_wb2, h_wb3, h_wb4, h_wb5, h_wb6, h_wb7,
       h_or0, h_or1, h_or2, h_or3]
