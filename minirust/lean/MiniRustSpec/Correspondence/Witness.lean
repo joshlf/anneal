@@ -263,7 +263,7 @@ def machine : CapturedMir → Gen.Function → List LocalSlot → Gen.BbName →
 theorem ctx0_ok1 {body : CapturedMir} (h : body.localDecls = [u32Decl]) : CtxOk body ctx0 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | _ + 1, hd => simp at hd
@@ -274,7 +274,7 @@ theorem ctx0_ok1 {body : CapturedMir} (h : body.localDecls = [u32Decl]) : CtxOk 
 theorem ctx0_ok2 {body : CapturedMir} (h : body.localDecls = [u32Decl, u32Decl]) : CtxOk body ctx0 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | 1, hd => simp at hd; subst hd; decide
@@ -573,7 +573,7 @@ theorem ctxI8_ok2 {body : CapturedMir} (h : body.localDecls = [i8Decl, i8Decl]) 
     CtxOk body ctxI8 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | 1, hd => simp at hd; subst hd; decide
@@ -737,7 +737,7 @@ theorem ctx0_ok_u32_i8 {body : CapturedMir} (h : body.localDecls = [u32Decl, i8D
     CtxOk body ctx0 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | 1, hd => simp at hd; subst hd; decide
@@ -915,7 +915,7 @@ theorem ctxI8_ok3 {body : CapturedMir} (h : body.localDecls = [i8Decl, i8Decl, i
     CtxOk body ctxI8_3 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | 1, hd => simp at hd; subst hd; decide
@@ -1718,7 +1718,7 @@ theorem ctxI8_ok_hetero {body : CapturedMir}
     (h : body.localDecls = [i8Decl, i8Decl, i32Decl]) : CtxOk body ctxI8_3 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | 1, hd => simp at hd; subst hd; decide
@@ -2070,7 +2070,7 @@ theorem ctxI8_ok_cmpNot {body : CapturedMir}
     (h : body.localDecls = [i8Decl, i8Decl, i8Decl, boolDecl]) : CtxOk body ctxI8_4 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | 1, hd => simp at hd; subst hd; decide
@@ -2256,7 +2256,7 @@ theorem ctxBool_ok {body : CapturedMir} (h : body.localDecls = [boolDecl, u8Decl
     CtxOk body ctxBool where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | 1, hd => simp at hd; subst hd; decide
@@ -2406,7 +2406,7 @@ theorem ctxI8_ok_boolCast {body : CapturedMir} (h : body.localDecls = [i8Decl, b
     CtxOk body ctxI8 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | 1, hd => simp at hd; subst hd; decide
@@ -2606,7 +2606,7 @@ def uninitBoolMInit : Mach :=
 theorem ctxBool_ok1 {body : CapturedMir} (h : body.localDecls = [boolDecl]) : CtxOk body ctxBool where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | _ + 1, hd => simp at hd
@@ -2754,7 +2754,7 @@ theorem ctxI8_ok_cmpSel {body : CapturedMir}
     (h : body.localDecls = [orderingDecl, i8Decl, i8Decl, boolDecl]) : CtxOk body ctxI8_4 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | 1, hd => simp at hd; subst hd; decide
@@ -2972,7 +2972,7 @@ theorem ctxBool_ok_ordering {body : CapturedMir} (h : body.localDecls = [orderin
     CtxOk body ctxBool where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | _ + 1, hd => simp at hd
@@ -3006,7 +3006,7 @@ theorem ctxI8_ok_boolBitOrdUse {body : CapturedMir}
     (h : body.localDecls = [orderingDecl, boolDecl, u8Decl, orderingDecl]) : CtxOk body ctxI8_4 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | 1, hd => simp at hd; subst hd; decide
@@ -3517,7 +3517,7 @@ theorem ctxI8_ok_checkedArith {body : CapturedMir}
     CtxOk body ctxI8_5 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | 1, hd => simp at hd; subst hd; decide
@@ -3848,7 +3848,7 @@ theorem ctxTupleU32_ok {body : CapturedMir}
     CtxOk body ctxTupleU32 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | 1, hd => simp at hd; subst hd; decide
@@ -4077,7 +4077,7 @@ theorem ctxTupleU32_ok1 {body : CapturedMir}
     (h : body.localDecls = [u32BoolTupleDecl]) : CtxOk body ctxTupleU32 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | _ + 1, hd => simp at hd
@@ -4505,15 +4505,11 @@ theorem tempMove_translate : translateFn tempMove = some tempMoveFn := rfl
 theorem ctx0_ok_tempMove : CtxOk tempMove ctx0 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd
-    match i, hd with
-    | 0, hd => simp [tempMove] at hd; subst hd; decide
-    | 1, hd => simp [tempMove] at hd; subst hd; decide
-    | 2, hd => simp [tempMove] at hd; subst hd; decide
-    | 3, hd => simp [tempMove] at hd; subst hd; decide
-    | 4, hd => simp [tempMove] at hd; subst hd; decide
-    | 5, hd => simp [tempMove] at hd; subst hd; decide
-    | _ + 6, hd => simp [tempMove] at hd
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [tempMove] at hd; subst hd; decide
+    | 1, _, hd => simp [tempMove] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [tempMove] at hi
   ret := by
     intro d hd
     simp [tempMove] at hd; subst hd
@@ -4880,13 +4876,11 @@ theorem crossBlockMove_translate : translateFn crossBlockMove = some crossBlockM
 theorem ctx0_ok_crossBlockMove : CtxOk crossBlockMove ctx0 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd
-    match i, hd with
-    | 0, hd => simp [crossBlockMove] at hd; subst hd; decide
-    | 1, hd => simp [crossBlockMove] at hd; subst hd; decide
-    | 2, hd => simp [crossBlockMove] at hd; subst hd; decide
-    | 3, hd => simp [crossBlockMove] at hd; subst hd; decide
-    | _ + 4, hd => simp [crossBlockMove] at hd
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [crossBlockMove] at hd; subst hd; decide
+    | 1, _, hd => simp [crossBlockMove] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [crossBlockMove] at hi
   ret := by
     intro d hd
     simp [crossBlockMove] at hd; subst hd
@@ -5244,15 +5238,11 @@ theorem loopTempMove_translate : translateFn loopTempMove = some loopTempMoveFn 
 theorem ctx0_ok_loopTempMove : CtxOk loopTempMove ctx0 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd
-    match i, hd with
-    | 0, hd => simp [loopTempMove] at hd; subst hd; decide
-    | 1, hd => simp [loopTempMove] at hd; subst hd; decide
-    | 2, hd => simp [loopTempMove] at hd; subst hd; decide
-    | 3, hd => simp [loopTempMove] at hd; subst hd; decide
-    | 4, hd => simp [loopTempMove] at hd; subst hd; decide
-    | 5, hd => simp [loopTempMove] at hd; subst hd; decide
-    | _ + 6, hd => simp [loopTempMove] at hd
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [loopTempMove] at hd; subst hd; decide
+    | 1, _, hd => simp [loopTempMove] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [loopTempMove] at hi
   ret := by
     intro d hd
     simp [loopTempMove] at hd; subst hd
@@ -5610,7 +5600,7 @@ theorem ctx0_ok_u32_tuple {body : CapturedMir}
     (h : body.localDecls = [u32Decl, u32BoolTupleDecl]) : CtxOk body ctx0 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | 1, hd => simp at hd; subst hd; decide
@@ -6009,7 +5999,7 @@ theorem ctx0_ok_u32_3 {body : CapturedMir}
     (h : body.localDecls = [u32Decl, u32Decl, u32Decl]) : CtxOk body ctx0 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | 1, hd => simp at hd; subst hd; decide
@@ -6197,7 +6187,7 @@ theorem ctx0_2_ok_bool_u32 {body : CapturedMir}
     (h : body.localDecls = [u32Decl, boolDecl, u32Decl, u32Decl]) : CtxOk body ctx0_2 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | 1, hd => simp at hd; subst hd; decide
@@ -6464,7 +6454,7 @@ theorem diamondHalfMoveReuseFalse_minirust_direct :
       some (some { retAlloc with data := scalarBytes u32 14 }, [1]) := by
   decide +kernel
 
-/-- Caller context for `[u32Decl, i8Decl, i8Decl, u32Decl, boolDecl, u32BoolTupleDecl]`. -/
+/-- Caller context for `tupleAggCastMove` and `projFieldMoveReuse`. -/
 def ctx0_tupleAggCastMove : Ctx :=
   { ctx0 with addrs := [128, 256, 384, 512, 640, 768] }
 
@@ -6473,7 +6463,7 @@ theorem ctx0_ok_tupleAggCastMove {body : CapturedMir}
     CtxOk body ctx0_tupleAggCastMove where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d hd; rw [h] at hd
+    intro i d _ hd; rw [h] at hd
     match i, hd with
     | 0, hd => simp at hd; subst hd; decide
     | 1, hd => simp at hd; subst hd; decide
@@ -6521,6 +6511,22 @@ def tupleAggCastMove : CapturedMir where
   allocations := []
 
 theorem tupleAggCastMove_inFragment : inFragment tupleAggCastMove = true := by decide
+
+/-- `CtxOk.addrs` constrains only `_0` and the arguments (`i ≤ body.argCount`),
+so unaligned (`257`) or `≥ 2^32` (`2^40`) trailing entries in `ctx.addrs` at
+temporary indices `i > argCount` remain valid caller contexts. -/
+theorem ctx0_ok_trailing_temp_addrs :
+    CtxOk tupleAggCastMove { ctx0 with addrs := [128, 256, 257, 2 ^ 40] } where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [tupleAggCastMove] at hd; subst hd; decide
+    | 1, _, hd => simp [tupleAggCastMove] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [tupleAggCastMove] at hi
+  ret := by
+    intro d hd; simp [tupleAggCastMove] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
 
 def tupleAggCastMoveFn : Gen.Function where
   locals := ⟨[(localName 0, .Int u32), (localName 1, .Int i8), (localName 2, .Int i8),
@@ -6606,8 +6612,14 @@ theorem tupleAggCastMoveNeg5_minirust_ret_from_start :
 
 theorem tupleAggCastMoveNeg5_minirust_direct :
     (Interp.steps 16 tupleAggCastMoveNeg5MInit).toOption.map
-        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
-      some (some { retAlloc with data := scalarBytes u32 5 }, [1]) := by
+        (fun m => (m.mem.memory.allocations[0]?,
+          m.mem.memory.allocations.map (·.live),
+          m.mem.memory.allocations.map (·.addr),
+          m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 5 },
+        [true, false, false, false, false, false, false],
+        [64, 128, 256, 2 ^ 32, 2 * 2 ^ 32, 2 ^ 32, 3 * 2 ^ 32],
+        [1]) := by
   decide +kernel
 
 /-- Projected field read after root tuple move (`projFieldMoveReuse`):
@@ -6682,6 +6694,257 @@ theorem projFieldMoveReuse_minirust_direct :
         projFieldMoveReuseS0.frame.locals projFieldMoveReuseFn.start)).toOption.map
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAlloc with data := scalarBytes u32 11 }, [1]) := by
+  decide +kernel
+
+/-! ## `ord_bool_cast_temp_move`: `Ordering` temporaries & moved-`bool` cast -/
+
+/-- `ordBoolCastTempMove`: `fn(a: i8, b: i8, flag: bool) -> Ordering` exercising
+`Rvalue::Cast(IntToInt, move _3, u32)` from a moved `bool` parameter (`boolToU8`
+followed by `IntToInt`), `SwitchInt(move _4)` on the cast temporary, explicit
+`StorageLive(_5)` / `BinaryOp(Cmp, move _, move _)` / `Use(move _5)` /
+`Deinit(_5)` / `StorageDead(_5)` on a `core::cmp::Ordering` (`Type::Enum`)
+temporary local reusing `_4`'s freed `2^32` address, and `ctxI8_4` directly
+(`addrs` of length `4 = argCount + 1` with `6` total `localDecls`). -/
+def ordBoolCastTempMove : CapturedMir where
+  defPath := "witness::ord_bool_cast_temp_move"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 3
+  localDecls := [orderingDecl, i8Decl, i8Decl, boolDecl, u32Decl, orderingDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 4),
+        mkStmt (.assign (local_ 4) (.cast .intToInt (.move (local_ 3)) u32Ty))],
+      terminator := mkTerm (.switchInt (.move (local_ 4))
+        { branches := [(0, 2)], otherwise := 1 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.storageDead 4),
+        mkStmt (.storageLive 5),
+        mkStmt (.assign (local_ 5) (.binaryOp .cmp (.move (local_ 1)) (.move (local_ 2))))],
+      terminator := mkTerm (.goto 3),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.storageDead 4),
+        mkStmt (.storageLive 5),
+        mkStmt (.assign (local_ 5) (.binaryOp .cmp (.move (local_ 2)) (.move (local_ 1))))],
+      terminator := mkTerm (.goto 3),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.move (local_ 5)))),
+        mkStmt (.deinit (local_ 5)),
+        mkStmt (.storageDead 5)],
+      terminator := mkTerm .return_,
+      isCleanup := false }]
+  fnAbi := fnAbiCmpSel
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem ctxI8_ok_ordBoolCastTempMove : CtxOk ordBoolCastTempMove ctxI8_4 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [ordBoolCastTempMove] at hd; subst hd; decide
+    | 1, _, hd => simp [ordBoolCastTempMove] at hd; subst hd; decide
+    | 2, _, hd => simp [ordBoolCastTempMove] at hd; subst hd; decide
+    | 3, _, hd => simp [ordBoolCastTempMove] at hd; subst hd; decide
+    | _ + 4, hi, _ => simp [ordBoolCastTempMove] at hi
+  ret := by
+    intro d hd; simp [ordBoolCastTempMove] at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem ordBoolCastTempMove_inFragment : inFragment ordBoolCastTempMove = true := by decide
+
+theorem ordBoolCastTempMove_movedAtEntry :
+    [0, 1, 2, 3].map (movedAtEntry ordBoolCastTempMove) =
+      [[], [3, 4], [3, 4], [3, 1, 2]] := by decide
+
+/-- Concrete Park-induction witness for `movesOk_of_preFixedPoint` using a
+strictly over-approximating inductive pre-fixed point `[[5], [3, 4, 5],
+[3, 4, 5], [1, 2, 3]]` (which marks `_5` moved out on entry to `bb0`, unlike
+the least fixed point `movedAtEntry`). -/
+theorem ordBoolCastTempMove_movesOk_by_preFixedPoint :
+    movesOk ordBoolCastTempMove = true := by
+  let cert : List (List Nat) := [[5], [3, 4, 5], [3, 4, 5], [1, 2, 3]]
+  apply movesOk_of_preFixedPoint (by decide) (by decide) cert
+  · intro src dst bb hbb hdst htgt j hj
+    have hsrc : src < 4 := by
+      have := (List.getElem?_eq_some_iff.mp hbb).1
+      simpa [ordBoolCastTempMove] using this
+    have hdst' : dst < 4 := by simpa [ordBoolCastTempMove] using hdst
+    revert bb hbb htgt j hj
+    rcases (by omega : src = 0 ∨ src = 1 ∨ src = 2 ∨ src = 3) with rfl | rfl | rfl | rfl <;>
+    rcases (by omega : dst = 0 ∨ dst = 1 ∨ dst = 2 ∨ dst = 3) with rfl | rfl | rfl | rfl <;>
+    (intro bb hbb; simp [ordBoolCastTempMove] at hbb; subst hbb; decide)
+  · intro blk bb hbb
+    have hblk : blk < 4 := by
+      have := (List.getElem?_eq_some_iff.mp hbb).1
+      simpa [ordBoolCastTempMove] using this
+    revert bb hbb
+    rcases (by omega : blk = 0 ∨ blk = 1 ∨ blk = 2 ∨ blk = 3) with rfl | rfl | rfl | rfl <;>
+    (intro bb hbb; simp [ordBoolCastTempMove] at hbb; subst hbb; decide)
+
+def ordBoolCastTempMoveFn : Gen.Function where
+  locals := ⟨[(localName 0, orderingTy), (localName 1, .Int i8), (localName 2, .Int i8),
+    (localName 3, .Bool), (localName 4, .Int u32), (localName 5, orderingTy)]⟩
+  args := [localName 1, localName 2, localName 3]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 4),
+      .Assign (.Local (localName 4))
+        (.UnOp (.Cast (.IntToInt u32)) (boolToU8 (.Load (.Local (localName 3)))))],
+      .Switch (.Load (.Local (localName 4))) ⟨[(0, bbName 2)]⟩ (bbName 1), .Regular⟩),
+    (bbName 1, ⟨[
+      .StorageDead (localName 4),
+      .StorageLive (localName 5),
+      .Assign (.Local (localName 5))
+        (translateCmp (.Load (.Local (localName 1))) (.Load (.Local (localName 2))))],
+      .Goto (bbName 3), .Regular⟩),
+    (bbName 2, ⟨[
+      .StorageDead (localName 4),
+      .StorageLive (localName 5),
+      .Assign (.Local (localName 5))
+        (translateCmp (.Load (.Local (localName 2))) (.Load (.Local (localName 1))))],
+      .Goto (bbName 3), .Regular⟩),
+    (bbName 3, ⟨[
+      .Assign (.Local (localName 0)) (.Load (.Local (localName 5))),
+      .Deinit (.Local (localName 5)),
+      .StorageDead (localName 5)],
+      .Return, .Regular⟩),
+    (bbName 4, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 4
+  implicit_writes := true
+
+theorem ordBoolCastTempMove_translate :
+    translateFn ordBoolCastTempMove = some ordBoolCastTempMoveFn := rfl
+
+def ordBoolCastTempMoveTrueArgs : List Value :=
+  [.scalar ⟨251, 1⟩, .scalar ⟨3, 1⟩, .scalar ⟨1, 1⟩]
+def ordBoolCastTempMoveTrueS0 : MachineState :=
+  initMachineState ordBoolCastTempMove ordBoolCastTempMoveTrueArgs
+def ordBoolCastTempMoveTrueMInit : Mach :=
+  machineWithCtx ctxI8_4 ordBoolCastTempMove ordBoolCastTempMoveFn
+    ordBoolCastTempMoveTrueS0.frame.locals ordBoolCastTempMoveFn.start
+
+theorem ordBoolCastTempMoveTrue_anneal_ret :
+    ReachesRet (mirCallTree ordBoolCastTempMove ordBoolCastTempMoveTrueArgs)
+      [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
+      (.normal (.scalar ⟨255, 1⟩, ordBoolCastTempMoveTrueS0.memory)) :=
+  runA_sound ordBoolCastTempMove 20 _ _ _ rfl
+
+theorem ordBoolCastTempMoveTrue_noUB :
+    MirNoUBTree (mirCallTree ordBoolCastTempMove ordBoolCastTempMoveTrueArgs) :=
+  runA_noUB ordBoolCastTempMove 20 _ _ _ rfl
+
+theorem ordBoolCastTempMoveTrue_progress (n : Nat) :
+    (∃ s' m' tr,
+      Interp.steps (initLen ordBoolCastTempMove + n) ordBoolCastTempMoveTrueMInit = .ok m' ∧
+      StateRel ordBoolCastTempMove ordBoolCastTempMoveFn ctxI8_4 s' m' ∧
+      Reaches (mirCallTree ordBoolCastTempMove ordBoolCastTempMoveTrueArgs) tr
+        (mirTree ordBoolCastTempMove s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen ordBoolCastTempMove + n ∧
+      Interp.steps k ordBoolCastTempMoveTrueMInit = .ok mRet ∧
+      ReturnRel ordBoolCastTempMove ctxI8_4 s' v mRet ∧
+      ReachesRet (mirCallTree ordBoolCastTempMove ordBoolCastTempMoveTrueArgs) tr
+        (.normal (v, mem))) :=
+  mirCall_progress ordBoolCastTempMove_inFragment ordBoolCastTempMove_translate ctxI8_4
+    ctxI8_ok_ordBoolCastTempMove ordBoolCastTempMoveTrueArgs (by decide)
+    ordBoolCastTempMoveTrueMInit rfl rfl rfl ordBoolCastTempMoveTrue_noUB n
+
+theorem ordBoolCastTempMoveTrue_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n ordBoolCastTempMoveTrueMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes u8 255 } ∧
+      m'.threads = [thread1 ctxI8_4
+        [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret ordBoolCastTempMove_inFragment ordBoolCastTempMove_translate ctxI8_4
+      ctxI8_ok_ordBoolCastTempMove ordBoolCastTempMoveTrueArgs (by decide)
+      ordBoolCastTempMoveTrueMInit rfl rfl rfl ordBoolCastTempMoveTrue_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [ordBoolCastTempMove] at hd; subst hd
+  simp [retPtr, ctxI8_4] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_4] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem ordBoolCastTempMoveTrue_minirust_direct :
+    (Interp.steps 12 ordBoolCastTempMoveTrueMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?,
+          m.mem.memory.allocations.map (·.live),
+          m.mem.memory.allocations.map (·.addr),
+          m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes u8 255 },
+        [true, false, false, false, false, false, false],
+        [64, 128, 256, 384, 512, 2 ^ 32, 2 ^ 32],
+        [1]) := by
+  decide +kernel
+
+def ordBoolCastTempMoveFalseArgs : List Value :=
+  [.scalar ⟨251, 1⟩, .scalar ⟨3, 1⟩, .scalar ⟨0, 1⟩]
+def ordBoolCastTempMoveFalseS0 : MachineState :=
+  initMachineState ordBoolCastTempMove ordBoolCastTempMoveFalseArgs
+def ordBoolCastTempMoveFalseMInit : Mach :=
+  machineWithCtx ctxI8_4 ordBoolCastTempMove ordBoolCastTempMoveFn
+    ordBoolCastTempMoveFalseS0.frame.locals ordBoolCastTempMoveFn.start
+
+theorem ordBoolCastTempMoveFalse_anneal_ret :
+    ReachesRet (mirCallTree ordBoolCastTempMove ordBoolCastTempMoveFalseArgs)
+      [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
+      (.normal (.scalar ⟨1, 1⟩, ordBoolCastTempMoveFalseS0.memory)) :=
+  runA_sound ordBoolCastTempMove 20 _ _ _ rfl
+
+theorem ordBoolCastTempMoveFalse_noUB :
+    MirNoUBTree (mirCallTree ordBoolCastTempMove ordBoolCastTempMoveFalseArgs) :=
+  runA_noUB ordBoolCastTempMove 20 _ _ _ rfl
+
+theorem ordBoolCastTempMoveFalse_progress (n : Nat) :
+    (∃ s' m' tr,
+      Interp.steps (initLen ordBoolCastTempMove + n) ordBoolCastTempMoveFalseMInit = .ok m' ∧
+      StateRel ordBoolCastTempMove ordBoolCastTempMoveFn ctxI8_4 s' m' ∧
+      Reaches (mirCallTree ordBoolCastTempMove ordBoolCastTempMoveFalseArgs) tr
+        (mirTree ordBoolCastTempMove s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen ordBoolCastTempMove + n ∧
+      Interp.steps k ordBoolCastTempMoveFalseMInit = .ok mRet ∧
+      ReturnRel ordBoolCastTempMove ctxI8_4 s' v mRet ∧
+      ReachesRet (mirCallTree ordBoolCastTempMove ordBoolCastTempMoveFalseArgs) tr
+        (.normal (v, mem))) :=
+  mirCall_progress ordBoolCastTempMove_inFragment ordBoolCastTempMove_translate ctxI8_4
+    ctxI8_ok_ordBoolCastTempMove ordBoolCastTempMoveFalseArgs (by decide)
+    ordBoolCastTempMoveFalseMInit rfl rfl rfl ordBoolCastTempMoveFalse_noUB n
+
+theorem ordBoolCastTempMoveFalse_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n ordBoolCastTempMoveFalseMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes u8 1 } ∧
+      m'.threads = [thread1 ctxI8_4
+        [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret ordBoolCastTempMove_inFragment ordBoolCastTempMove_translate ctxI8_4
+      ctxI8_ok_ordBoolCastTempMove ordBoolCastTempMoveFalseArgs (by decide)
+      ordBoolCastTempMoveFalseMInit rfl rfl rfl ordBoolCastTempMoveFalse_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [ordBoolCastTempMove] at hd; subst hd
+  simp [retPtr, ctxI8_4] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_4] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem ordBoolCastTempMoveFalse_minirust_direct :
+    (Interp.steps 12 ordBoolCastTempMoveFalseMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?,
+          m.mem.memory.allocations.map (·.live),
+          m.mem.memory.allocations.map (·.addr),
+          m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes u8 1 },
+        [true, false, false, false, false, false, false],
+        [64, 128, 256, 384, 512, 2 ^ 32, 2 ^ 32],
+        [1]) := by
   decide +kernel
 
 end MiniRustSpec.Correspondence.Witness

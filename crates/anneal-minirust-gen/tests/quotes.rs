@@ -540,7 +540,7 @@ fn quotations_occur_upstream() {
     );
     // The interpretation and the translation quote dozens of upstream items;
     // a sudden drop means the extraction above broke.
-    assert!(total >= 90, "only {total} quotations found");
+    assert!(total >= 140, "only {total} quotations found");
 
     // Every spec-transcribing `def` in `Interp.lean` (after `/-! ## Target`,
     // except the Lean recursion/iteration helpers `countOnesLoop` and `steps`)
@@ -1666,13 +1666,35 @@ fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
         ),
         (
             func,
-            "let free_argc = self.body.arg_count + 1; .. \
+            "for i in 1..=(self.body.arg_count) { \
+                 if Some(i) == spread_local_idx { .. } else { \
+                     args.push(LocalName(Name::from_internal(i as _))); \
+                 } \
+             } \
+             let free_argc = self.body.arg_count + 1; .. \
              init_statements.extend(rs::always_storage_live_locals(&self.body).iter() \
              .map(|loc| self.local_name_map[&loc]) \
              .filter(|LocalName(i)| i.get_internal() as usize >= free_argc) \
              .map(Statement::StorageLive),); .. \
+             self.blocks.insert(init_bb, init_blk); .. \
              let ret = LocalName(Name::from_internal(0));",
             ".filter(|LocalName(i)| i.get_internal() as usize < free_argc)",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            wf,
+            "let mut start_live: Set<LocalName> = Set::new(); \
+             for arg in self.args { \
+                 ensure_wf(self.locals.contains_key(arg), \"Function: argument local does not exist\")?; \
+                 if start_live.try_insert(arg).is_err() { \
+                     throw_ill_formed!(\"Function: two arguments refer to the same local\"); \
+                 }; \
+             } \
+             ensure_wf(self.locals.contains_key(self.ret), \"Function: return local does not exist\")?; \
+             if start_live.try_insert(self.ret).is_err() { \
+                 throw_ill_formed!(\"Function: return local is also used for an argument\"); \
+             };",
+            "ensure_wf(!self.locals.contains_key(self.ret), \"Function: return local does not exist\")?;",
             "MiniRustSpec/Correspondence/Translate.lean",
         ),
         (
@@ -1706,7 +1728,7 @@ fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
             "MiniRustSpec/Correspondence/Translate.lean",
         ),
     ];
-    assert_eq!(cases.len(), 21, "expected 21 pinned MR-1.3 quotations");
+    assert_eq!(cases.len(), 22, "expected 22 pinned MR-1.3 quotations");
 
     let mr13_files = [target, basic, conc, mach, stmts, terms, wf, rvalue, bb, func];
     let lean_root = minirust_dir().join("lean");

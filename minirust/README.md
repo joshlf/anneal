@@ -281,6 +281,13 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
   the caller (`ReturnRel`); Anneal UB matches MiniRust UB (`throw_ub!`, never a
   spec panic, deadlock, or unsupported construct); every other Anneal outcome,
   including `unsupported`, is impossible.
+* `iterMovedEntries_stabilizes`, `movesOk_iff_blockMovesOk`,
+  `movedAtEntry_least`, `blockMovesOk_antitone`, `movesOk_of_preFixedPoint`,
+  `movesOk_iff_exists_preFixedPoint` (`Simulation.lean`): unconditional
+  finite-fuel stabilization of forward CFG move propagation (`movedAtEntry`),
+  Knaster–Tarski least fixed-point optimality, antitonicity of `blockMovesOk`,
+  and Park-induction soundness and completeness for inductive pre-fixed-point
+  certificates on well-typed CFGs.
 * `step_start`, `initMachineState_startRel` (`Simulation.lean`): proves for
   every translated function `f` that `initMachineState body args` (with
   `argsOk body args = true` and `CtxOk body ctx`) satisfies `StartRel` at
@@ -323,7 +330,8 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
 `native_decide`):
 
 * `tempMove`, `crossBlockMove`, `loopTempMove`, `storageLiveArgRet`,
-  `diamondMoveJoin`, and `tupleAggCastMove` (MR-1.3): `tempMove` is
+  `diamondMoveJoin`, `tupleAggCastMove`, and `ordBoolCastTempMove` (MR-1.3):
+  `tempMove` is
   `fn(x: u32) -> u32 { let y = (x + 1) * 2; if y == 8 { 100 } else { y } }`
   with `u32` and `bool` temporaries, `StorageLive`/`StorageDead`, root `move`
   in a `BinaryOp`, a `Use`, and a `switchInt` discriminant, `Deinit` of a
@@ -347,12 +355,20 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   CFG (`movedAtEntry` joining outgoing `[1]` and `[2, 1]` to `[1, 2]` at `bb3`)
   while returning a join-initialized temporary (`diamondMoveJoinTrue_*`,
   `diamondMoveJoinFalse_*`); `tupleAggCastMove` exercises `Operand::Move`
-  inside `Rvalue::UnaryOp(Neg, move _1)`, `Rvalue::Cast(IntToInt, move _2, u32)`,
-  `Rvalue::UnaryOp(Not, move _4)` (self-assign move),
-  `Rvalue::Aggregate(Tuple, [move _3, move _4])`, and projected field move
-  `Use(move (_5.0))` (`tupleAggCastMoveNeg5_*`); `deadRead`, `deadAssign`,
-  `deadDeinit`, and `deadPlaceMention` access a local (including projected
-  `PlaceMention(_1.0)`) after `StorageDead` (UB in both models via `mirCall_ub`,
+  inside `Rvalue::UnaryOp(Neg, move _1)`,
+  `Rvalue::Cast(IntToInt, move _2, u32)`, `Rvalue::UnaryOp(Not, move _4)`
+  (self-assign move), `Rvalue::Aggregate(Tuple, [move _3, move _4])`, and
+  projected field move `Use(move (_5.0))` (`tupleAggCastMoveNeg5_*`, plus
+  `ctx0_ok_trailing_temp_addrs` witnessing that `CtxOk.addrs` constrains only
+  `i ≤ argCount`); `ordBoolCastTempMove` exercises `Cast(IntToInt, move _3,
+  u32)` from a moved `bool`, `SwitchInt(move _4)`, and `StorageLive`,
+  `BinaryOp(Cmp, move _, move _)`, `Use(move _5)`, `Deinit`, and `StorageDead`
+  on a `core::cmp::Ordering` temporary local reusing `_4`'s freed `2^32` slot,
+  together with a concrete Park-induction certificate witness
+  (`ordBoolCastTempMove_movesOk_by_preFixedPoint`, `ordBoolCastTempMoveTrue_*`,
+  `ordBoolCastTempMoveFalse_*`); `deadRead`, `deadAssign`, `deadDeinit`, and
+  `deadPlaceMention` access a local (including projected `PlaceMention(_1.0)`)
+  after `StorageDead` (UB in both models via `mirCall_ub`,
   `mirCall_steps_error`, `mirCall_outcome`, and direct runs); `moveReuse`,
   `crossBlockMoveReuse`, `loopBackEdgeReuse`, `projAssignMoveReuse`,
   `projFieldMoveReuse`, `sameRvalueMoveReuse`, `moveRetPlace`, and

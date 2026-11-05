@@ -367,7 +367,7 @@ structure StartRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : Mach
   argsLive : ∀ (i : Nat) slot, i ≤ body.argCount → s.frame.locals[i]? = some slot → slot ≠ .dead
   tempsDead : ∀ (i : Nat), body.argCount < i → i < body.localDecls.length →
     s.frame.locals[i]? = some .dead
-  addrs : ∀ (i : Nat) d, body.localDecls[i]? = some d →
+  addrs : ∀ (i : Nat) d, i ≤ body.argCount → body.localDecls[i]? = some d →
     AddrOk (ctx.addrs.getD i 0) (itOf d) ∧ ctx.addrs.getD i 0 + (tyBytes (tyOf d) : Int) < 2 ^ 32
   ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (tyOf d) (itOf d)
   baseLow : BaseLow ctx
@@ -378,12 +378,13 @@ structure StartRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : Mach
   callerLocals : s.memory.callerLocals = []
 
 /-- Well-formed caller context for executing `body`: the caller allocated the
-return place and the arguments at addresses that are aligned for their
-storage types and lie below `2^32`, the caller's own live allocations lie
-below `2^32` (so `StorageLive` finds a free first-fit candidate), and the
-caller's return place is a live, aligned allocation of `_0`'s byte size. -/
+return place and the arguments (`i ≤ body.argCount`) at addresses that are
+aligned for their storage types and lie below `2^32`, the caller's own live
+allocations lie below `2^32` (so `StorageLive` finds a free first-fit
+candidate), and the caller's return place is a live, aligned allocation of
+`_0`'s byte size. -/
 structure CtxOk (body : CapturedMir) (ctx : Ctx) : Prop where
-  addrs : ∀ (i : Nat) d, body.localDecls[i]? = some d →
+  addrs : ∀ (i : Nat) d, i ≤ body.argCount → body.localDecls[i]? = some d →
     AddrOk (ctx.addrs.getD i 0) (itOf d) ∧ ctx.addrs.getD i 0 + (tyBytes (tyOf d) : Int) < 2 ^ 32
   ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (tyOf d) (itOf d)
   baseLow : BaseLow ctx

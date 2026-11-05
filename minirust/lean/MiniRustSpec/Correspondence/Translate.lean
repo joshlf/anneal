@@ -890,7 +890,12 @@ def initBlock (body : MirAst.CapturedMir) : Gen.BasicBlock :=
 specialized to bodies without a spread argument (`spread_arg`, used only by
 closures and the `rust-call` ABI):
 
-> "let free_argc = self.body.arg_count + 1;
+> "for i in 1..=(self.body.arg_count) {
+>      if Some(i) == spread_local_idx { .. } else {
+>          args.push(LocalName(Name::from_internal(i as _)));
+>      }
+>  }
+>  let free_argc = self.body.arg_count + 1;
 >  // add init basic block
 >  let init_bb = self.fresh_bb_name();
 >  // this block allocates all \"always_storage_live_locals\",
@@ -903,9 +908,11 @@ closures and the `rust-call` ABI):
 >  let init_blk = BasicBlock { statements: init_statements.into_iter().collect(),
 >      terminator: Terminator::Goto(self.bb_name_map[&rs::mir::START_BLOCK]),
 >      kind: BbKind::Regular, };
+>  self.blocks.insert(init_bb, init_blk);
 >  ..
 >  let ret = LocalName(Name::from_internal(0));
->  let f = Function { locals: self.locals, args, ret, blocks: self.blocks, start: init_bb,
+>  let f = Function { locals: self.locals, args, ret, blocks: self.blocks,
+>      start: init_bb,
 >      calling_convention: translate_calling_convention(self.abi.conv),
 >      implicit_writes: self.implicit_writes, };"
 
@@ -1337,7 +1344,25 @@ def mentionsOk (body : MirAst.CapturedMir) : Bool :=
     (termLocals bb.terminator).all (fun j => !(alwaysStorageLiveLocals body).contains j)
 
 /-- The decidable fragment on which the correspondence theorem is stated. The
-bound `localDecls.length < 2^31` keeps the first-fit candidate addresses of
+condition `argCount + 1 ≤ localDecls.length` ensures that `_0` (`f.ret`) and
+`_1 .. _argCount` (`f.args`) are distinct declared keys of `f.locals`, matching
+`Function::check_wf` (`spec/lang/well-formed.md`):
+> "let mut start_live: Set<LocalName> = Set::new();
+>  for arg in self.args {
+>      ensure_wf(self.locals.contains_key(arg),
+>          \"Function: argument local does not exist\")?;
+>      if start_live.try_insert(arg).is_err() {
+>          throw_ill_formed!(
+>              \"Function: two arguments refer to the same local\");
+>      };
+>  }
+>  ensure_wf(self.locals.contains_key(self.ret),
+>      \"Function: return local does not exist\")?;
+>  if start_live.try_insert(self.ret).is_err() {
+>      throw_ill_formed!(
+>          \"Function: return local is also used for an argument\");
+>  };"
+The bound `localDecls.length < 2^31` keeps the first-fit candidate addresses of
 `BM.pickAddr` that the callee's locals can occupy below `2^63`. -/
 def inFragment (body : MirAst.CapturedMir) : Bool :=
   body.isRuntimePostCleanup &&

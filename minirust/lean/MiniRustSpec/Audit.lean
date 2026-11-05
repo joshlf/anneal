@@ -259,6 +259,11 @@ open MiniRustSpec.Correspondence in
   blockMovesOk_spec
   movesOk_spec
   readsOk_mono
+  stmtReadsOk_antitone
+  termReadsOk_antitone
+  blockMovesOk_antitone
+  movesOk_of_preFixedPoint
+  movesOk_iff_exists_preFixedPoint
   opsPost_get
   StaleOk.agree
   StaleOk.dead_iff
@@ -840,6 +845,22 @@ open MiniRustSpec.Correspondence.Witness in
   projFieldMoveReuse_translate
   projFieldMoveReuse_anneal_ub
   projFieldMoveReuse_minirust_direct
+  ctx0_ok_trailing_temp_addrs
+  ctxI8_ok_ordBoolCastTempMove
+  ordBoolCastTempMove_inFragment
+  ordBoolCastTempMove_movedAtEntry
+  ordBoolCastTempMove_movesOk_by_preFixedPoint
+  ordBoolCastTempMove_translate
+  ordBoolCastTempMoveTrue_anneal_ret
+  ordBoolCastTempMoveTrue_noUB
+  ordBoolCastTempMoveTrue_progress
+  ordBoolCastTempMoveTrue_minirust_ret_from_start
+  ordBoolCastTempMoveTrue_minirust_direct
+  ordBoolCastTempMoveFalse_anneal_ret
+  ordBoolCastTempMoveFalse_noUB
+  ordBoolCastTempMoveFalse_progress
+  ordBoolCastTempMoveFalse_minirust_ret_from_start
+  ordBoolCastTempMoveFalse_minirust_direct
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -963,6 +984,11 @@ open MiniRustSpec.Correspondence in
   blockMovesOk_spec
   movesOk_spec
   readsOk_mono
+  stmtReadsOk_antitone
+  termReadsOk_antitone
+  blockMovesOk_antitone
+  movesOk_of_preFixedPoint
+  movesOk_iff_exists_preFixedPoint
   opsPost_get
   StaleOk.agree
   StaleOk.dead_iff
@@ -1385,6 +1411,22 @@ open MiniRustSpec.Correspondence.Witness in
   projFieldMoveReuse_translate
   projFieldMoveReuse_anneal_ub
   projFieldMoveReuse_minirust_direct
+  ctx0_ok_trailing_temp_addrs
+  ctxI8_ok_ordBoolCastTempMove
+  ordBoolCastTempMove_inFragment
+  ordBoolCastTempMove_movedAtEntry
+  ordBoolCastTempMove_movesOk_by_preFixedPoint
+  ordBoolCastTempMove_translate
+  ordBoolCastTempMoveTrue_anneal_ret
+  ordBoolCastTempMoveTrue_noUB
+  ordBoolCastTempMoveTrue_progress
+  ordBoolCastTempMoveTrue_minirust_ret_from_start
+  ordBoolCastTempMoveTrue_minirust_direct
+  ordBoolCastTempMoveFalse_anneal_ret
+  ordBoolCastTempMoveFalse_noUB
+  ordBoolCastTempMoveFalse_progress
+  ordBoolCastTempMoveFalse_minirust_ret_from_start
+  ordBoolCastTempMoveFalse_minirust_direct
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

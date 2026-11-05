@@ -1140,6 +1140,96 @@ theorem readsOk_mono {mo mo' : List Nat} (hsub : ∀ j ∈ mo', j ∈ mo) {ops :
         · exact .inl hj
         · exact .inr (hsub j hj)
 
+/-- `stmtReadsOk` is antitone in the moved-out set `mo`. -/
+theorem stmtReadsOk_antitone {mo mo' : List Nat} (hsub : ∀ j ∈ mo, j ∈ mo')
+    {s : MirAst.Statement} (h : stmtReadsOk mo' s = true) :
+    stmtReadsOk mo s = true := by
+  obtain ⟨kind, span⟩ := s
+  cases kind with
+  | assign _ rv => exact readsOk_mono hsub h
+  | placeMention _ | storageLive _ | storageDead _ | deinit _
+  | setDiscriminant _ _ | retag _ _ | intrinsic _ | coverage
+  | constEvalCounter | backwardIncompatibleDropHint _ | nop => rfl
+
+/-- `termReadsOk` is antitone in the moved-out set `mo`. -/
+theorem termReadsOk_antitone {mo mo' : List Nat} (hsub : ∀ j ∈ mo, j ∈ mo')
+    {t : MirAst.Terminator} (h : termReadsOk mo' t = true) :
+    termReadsOk mo t = true := by
+  obtain ⟨kind, span⟩ := t
+  cases kind with
+  | switchInt discr _ => exact readsOk_mono hsub h
+  | return_ =>
+    simp [termReadsOk] at h ⊢
+    exact fun h0 => h (hsub 0 h0)
+  | goto _ | unreachable | unwindResume | unwindTerminate | drop _ _ _
+  | call _ _ _ _ _ | tailCall _ _ | assert _ _ _ _ | inlineAsm _ _ _ => rfl
+
+/-- `blockMovesOk` is antitone in the moved-out set `mo`: shrinking the
+incoming moved-out set preserves intra-block move safety. -/
+theorem blockMovesOk_antitone {mo mo' : List Nat} (hsub : ∀ j ∈ mo, j ∈ mo')
+    {ss : List MirAst.Statement} {t : MirAst.Terminator}
+    (h : blockMovesOk mo' ss t = true) :
+    blockMovesOk mo ss t = true := by
+  induction ss generalizing mo mo' with
+  | nil => exact termReadsOk_antitone hsub h
+  | cons s ss ih =>
+    simp only [blockMovesOk, Bool.and_eq_true] at h ⊢
+    exact ⟨stmtReadsOk_antitone hsub h.1,
+      ih (fun _ hk => stmtMoved_mono hsub s hk) h.2⟩
+
+/-- **Park induction for `movesOk`.** Any inductive pre-fixed point `entries'`
+of `body`'s forward move-propagation equations whose per-block entry sets
+satisfy `blockMovesOk` witnesses `movesOk body = true` on a well-typed CFG,
+since `movedAtEntry` is bounded above by `entries'` (`movedAtEntry_least`) and
+`blockMovesOk` is antitone (`blockMovesOk_antitone`). -/
+theorem movesOk_of_preFixedPoint {body : CapturedMir}
+    (hst : ∀ bb ∈ body.basicBlocks, ∀ s ∈ bb.statements,
+      statementOk body.localDecls s = true)
+    (hterm : ∀ bb ∈ body.basicBlocks,
+      terminatorOk body.localDecls body.basicBlocks.length bb.terminator = true)
+    (entries' : List (List Nat))
+    (hpre : ∀ src dst (bb : BasicBlockData),
+      body.basicBlocks[src]? = some bb → dst < body.basicBlocks.length →
+      dst ∈ termTargets bb.terminator →
+      ∀ j ∈ termMoved (bb.statements.foldl stmtMoved (entries'.getD src [])) bb.terminator,
+        j ∈ entries'.getD dst [])
+    (hblk : ∀ blk (bb : BasicBlockData), body.basicBlocks[blk]? = some bb →
+      blockMovesOk (entries'.getD blk []) bb.statements bb.terminator = true) :
+    movesOk body = true := by
+  refine (movesOk_iff_blockMovesOk hst hterm).mpr fun blk bb hbb => ?_
+  have hlt : blk < body.basicBlocks.length := (List.getElem?_eq_some_iff.mp hbb).1
+  exact blockMovesOk_antitone (movedAtEntry_least hpre hlt) (hblk blk bb hbb)
+
+/-- **Knaster–Tarski characterization of `movesOk`.** On a well-typed CFG,
+`movesOk body = true` holds if and only if there exists an inductive pre-fixed
+point `entries'` of the CFG move-propagation equations at which every block
+satisfies `blockMovesOk`. -/
+theorem movesOk_iff_exists_preFixedPoint {body : CapturedMir}
+    (hst : ∀ bb ∈ body.basicBlocks, ∀ s ∈ bb.statements,
+      statementOk body.localDecls s = true)
+    (hterm : ∀ bb ∈ body.basicBlocks,
+      terminatorOk body.localDecls body.basicBlocks.length bb.terminator = true) :
+    movesOk body = true ↔
+      ∃ entries' : List (List Nat),
+        (∀ src dst (bb : BasicBlockData),
+          body.basicBlocks[src]? = some bb → dst < body.basicBlocks.length →
+          dst ∈ termTargets bb.terminator →
+          ∀ j ∈ termMoved (bb.statements.foldl stmtMoved (entries'.getD src [])) bb.terminator,
+            j ∈ entries'.getD dst []) ∧
+        (∀ blk (bb : BasicBlockData), body.basicBlocks[blk]? = some bb →
+          blockMovesOk (entries'.getD blk []) bb.statements bb.terminator = true) := by
+  constructor
+  · intro hmv
+    refine ⟨iterMovedEntries
+      (body.basicBlocks.length * (body.localDecls.length + 1)) body.basicBlocks [],
+      fun src dst bb hbb _ htgt j hj => ?_,
+      fun blk bb hbb => (movesOk_iff_blockMovesOk hst hterm).mp hmv blk bb hbb⟩
+    have h3 := (movesOk_spec hmv hbb).2.2 dst htgt j
+      (by simpa [movedBefore, hbb, List.take_length, movedAtEntry] using hj)
+    simpa [movedBefore_zero, movedAtEntry] using h3
+  · rintro ⟨entries', hpre, hblk⟩
+    exact movesOk_of_preFixedPoint hst hterm entries' hpre hblk
+
 /-- `opsPost` changes only the locals that `ops` move out of, to `.uninit`,
 and never a dead slot. -/
 theorem opsPost_get (L : List LocalSlot) (ops : List Operand) (k : Nat) :
@@ -2188,8 +2278,9 @@ theorem StartRel.localsOk {body : CapturedMir} {f : Gen.Function} {ctx : Ctx} {s
     split at hp
     · next hi =>
       cases hp
-      exact ⟨ctx.base.length + i, rfl, by omega, (hstart.addrs i d hd).1,
-        .inl (hstart.addrs i d hd).2, hget i d slot hi hd hs⟩
+      exact ⟨ctx.base.length + i, rfl, by omega,
+        (hstart.addrs i d (by omega) hd).1,
+        .inl (hstart.addrs i d (by omega) hd).2, hget i d slot hi hd hs⟩
     · cases hp
   · intro i j p q hp hq hpq
     rw [hmap] at hp hq
