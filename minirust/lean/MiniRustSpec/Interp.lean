@@ -268,6 +268,15 @@ def mapIndex {K V : Type} [DecidableEq K] (m : Map K V) (k : K) (what : String) 
 def mapRemove {K V : Type} [DecidableEq K] (m : Map K V) (k : K) : Option V × Map K V :=
   (mapGet m k, ⟨m.entries.filter (fun e => !decide (e.1 = k))⟩)
 
+/-- `Map::insert(k, v)` helper on association-list entries. -/
+def mapInsert {K V : Type} [DecidableEq K] : List (K × V) → K → V → List (K × V)
+  | [], k, v => [(k, v)]
+  | (k', v') :: tail, k, v => if k' = k then (k, v) :: tail else (k', v') :: mapInsert tail k v
+
+/-- `Map::insert(k, v)`. -/
+def mapInsertMap {K V : Type} [DecidableEq K] (m : Map K V) (k : K) (v : V) : Map K V :=
+  ⟨mapInsert m.entries k v⟩
+
 /-- `Set::insert(x)`. -/
 def setInsert {T : Type} [DecidableEq T] (s : Set T) (x : T) : Set T :=
   if s.elems.contains x then s else ⟨s.elems ++ [x]⟩
@@ -336,6 +345,13 @@ def x86_64.INT_MAX_ALIGN : Align := ⟨16⟩
 /-- `x86_64::ENDIANNESS`:
 > "const ENDIANNESS: Endianness = LittleEndian;" -/
 def x86_64.ENDIANNESS : Endianness := .LittleEndian
+
+/-- `x86_64::valid_size` (`spec/prelude/target.md`):
+> "fn valid_size(size: Size) -> bool {
+>     size.bytes().in_bounds(Signed, Self::PTR_SIZE)
+> }" -/
+def x86_64.valid_size (size : Size) : Bool :=
+  inBounds size.bytes .Signed x86_64.PTR_SIZE
 
 /-! ## Types and layout (`spec/lang/types.md`) -/
 
@@ -1039,6 +1055,103 @@ end
 > "fn size(self) -> Size { Size::from_bytes(self.data.len()).unwrap() }" -/
 def Allocation.size (a : Allocation) : Size := ⟨a.data.length⟩
 
+/-- `Allocation::overlaps` (`spec/mem/basic.md`):
+> "fn overlaps(self, other_addr: Address, other_size: Size) -> bool {
+>     let end_addr = self.addr + self.size().bytes();
+>     let other_end_addr = other_addr + other_size.bytes();
+>     if end_addr <= other_addr || other_end_addr <= self.addr {
+>         // Our end is before their beginning, or vice versa -- we do not overlap.
+>         // However, to make sure that each allocation has a unique address, we still
+>         // report overlap if both allocations have the same address.
+>         // FIXME: This is not necessarily realistic, e.g. for zero-sized stack variables.
+>         // OTOH the function pointer logic currently relies on this.
+>         self.addr == other_addr
+>     } else {
+>         true
+>     }
+> }" -/
+def Allocation.overlaps (a : Allocation) (otherAddr : Address) (otherSize : Size) : Bool :=
+  let endAddr : Int := a.addr + (Allocation.size a).bytes
+  let otherEndAddr : Int := otherAddr + otherSize.bytes
+  if endAddr ≤ otherAddr ∨ otherEndAddr ≤ a.addr then
+    decide (a.addr = otherAddr)
+  else
+    true
+
+/-- Deterministic address choice for `BasicMemory::allocate` (`spec/mem/basic.md`):
+> "let distr = libspecr::IntDistribution {
+>     start: Int::ONE,
+>     end: Int::from(2).pow(T::PTR_SIZE.bits()),
+>     divisor: align.bytes(),
+> };
+> let addr = pick(distr, |addr: Address| {
+>     // Pick a strictly positive integer...
+>     if addr <= 0 { return false; }
+>     // ... that is suitably aligned...
+>     if !align.is_aligned(addr) { return false; }
+>     // ... such that addr+size is in-bounds of a `usize`...
+>     if !(addr+size.bytes()).in_bounds(Unsigned, T::PTR_SIZE) { return false; }
+>     // ... and it does not overlap with any existing live allocation.
+>     if self.allocations.any(|a| a.live && a.overlaps(addr, size)) { return false; }
+>     // If all tests pass, we are good!
+>     true
+> })?;" -/
+def nextAddress (mem : BM) (size : Size) (align : Align) : Int :=
+  let slot := ((List.range 1024).find? (fun k =>
+    let addr : Int := ((k + 1 : Nat) : Int) * 4096 * (align.bytes : Int)
+    !mem.allocations.any (fun a => a.live && Allocation.overlaps a addr size))).getD 0 % 1024
+  ((slot + 1 : Nat) : Int) * 4096 * (align.bytes : Int)
+
+/-- `BasicMemory::allocate` (`spec/mem/basic.md`, with deterministic address
+choice `nextAddress` and `()` for `prov_extra` and `alloc_extra` as in
+`impl Memory for BasicMemory<T>`):
+> "fn allocate(
+>     &mut self,
+>     kind: AllocationKind,
+>     size: Size,
+>     align: Align,
+>     prov_extra: ProvExtra,
+>     alloc_extra: AllocExtra,
+> ) -> NdResult<ThinPointer<Provenance<ProvExtra>>> {
+>     // Reject too large allocations. Size must fit in `isize`.
+>     if !T::valid_size(size) {
+>         throw_ub!(\"asking for a too large allocation\");
+>     }
+>     ..
+>     // Compute allocation.
+>     let allocation = Allocation {
+>         addr,
+>         align,
+>         kind,
+>         live: true,
+>         data: list![AbstractByte::Uninit; size.bytes()],
+>         extra: alloc_extra,
+>     };
+>
+>     // Insert it into list, and remember where.
+>     let id = AllocId(self.allocations.len());
+>     self.allocations.push(allocation);
+>
+>     // And we are done!
+>     ret(ThinPointer { addr, provenance: Some((id, prov_extra)) })
+> }" -/
+def BM.allocate (mem : BM) (kind : AllocationKind) (size : Size) (align : Align) :
+    Interp (Ptr × BM) :=
+  if !x86_64.valid_size size then ub "asking for a too large allocation"
+  else
+    let addr := nextAddress mem size align
+    let allocation : Allocation := {
+      addr := addr
+      align := align
+      kind := kind
+      live := true
+      data := List.replicate size.bytes .Uninit
+      extra := ()
+    }
+    let id : AllocId := ⟨mem.allocations.length⟩
+    let allocations := mem.allocations ++ [allocation]
+    pure ({ addr := addr, provenance := some (id, ()) }, { mem with allocations := allocations })
+
 /-- `BasicMemory::check_ptr`:
 > "fn check_ptr(&self, ptr: ThinPointer<..>, len: Size) -> Result<Option<(AllocId, ProvExtra, Size)>> {
 >     // For zero-sized accesses, there is nothing to check.
@@ -1212,6 +1325,15 @@ def CM.load (cm : ConcurrentMemory BM) (ptr : Ptr) (len : Size) (align : Align)
   let (bytes, memory) ← BM.load cm.memory ptr len align
   pure (bytes, { memory := memory, accesses := cm.accesses ++ [access] })
 
+/-- `ConcurrentMemory::allocate` (`spec/mem/concurrent.md`):
+> "pub fn allocate(&mut self, kind: AllocationKind, size: Size, align: Align) -> NdResult<ThinPointer<M::Provenance>> {
+>     self.memory.allocate(kind, size, align)
+> }" -/
+def CM.allocate (cm : ConcurrentMemory BM) (kind : AllocationKind) (size : Size) (align : Align) :
+    Interp (Ptr × ConcurrentMemory BM) := do
+  let (ptr, mem) ← BM.allocate cm.memory kind size align
+  pure (ptr, { cm with memory := mem })
+
 /-- `ConcurrentMemory::deallocate`:
 > "pub fn deallocate(&mut self, ptr: ThinPointer<M::Provenance>, kind: AllocationKind, size: Size, align: Align) -> Result {
 >     self.memory.deallocate(ptr, kind, size, align)
@@ -1325,6 +1447,31 @@ def mutateCurFrame (m : Mach) (f : Frame → Frame) : Interp Mach := do
     let t' : Thread BM := { t with stack := t.stack.dropLast ++ [f fr] }
     let threads ← listSet m.threads m.active_thread t' "mutate_at"
     pure { m with threads := threads }
+
+/-- `Machine::try_mutate_cur_frame` and `Thread::try_mutate_cur_frame`
+(`spec/lang/machine.md`):
+> "fn try_mutate_cur_frame<O>(&mut self, f: impl FnOnce(&mut StackFrame<M>, &mut ConcurrentMemory<M>) -> NdResult<O>) -> NdResult<O> {
+>     self.threads.try_mutate_at(self.active_thread, |thread| thread.try_mutate_cur_frame(|frame| f(frame, &mut self.mem)))
+> }
+> ..
+> fn try_mutate_cur_frame<O>(&mut self, f: impl FnOnce(&mut StackFrame<M>) -> NdResult<O>) -> NdResult<O> {
+>     if self.stack.is_empty() {
+>         panic!(\"`try_mutate_cur_frame` called on empty stack!\");
+>     }
+>
+>     let last_idx = self.stack.len() - 1;
+>     self.stack.try_mutate_at(last_idx, f)
+> }" -/
+def tryMutateCurFrame (m : Mach)
+    (f : Frame → ConcurrentMemory BM → Interp (Frame × ConcurrentMemory BM)) : Interp Mach := do
+  let t ← activeThread m
+  match t.stack.getLast? with
+  | none => specPanic "`try_mutate_cur_frame` called on empty stack!"
+  | some fr => do
+    let (fr', cm') ← f fr m.mem
+    let t' : Thread BM := { t with stack := t.stack.dropLast ++ [fr'] }
+    let threads ← listSet m.threads m.active_thread t' "try_mutate_at"
+    pure { m with mem := cm', threads := threads }
 
 /-- `StackFrame::jump_to_block` (`spec/lang/machine.md`):
 > "self.next_block = b; self.next_stmt = Int::ZERO;"
@@ -1988,93 +2135,24 @@ end
 
 /-! ## Statements (`spec/lang/step/statements.md`) -/
 
-/-- `Machine::eval_statement` for `Statement::Assign` and `Statement::PlaceMention`:
-> "fn eval_statement(&mut self, Statement::Assign { destination, source }: Statement) -> NdResult {
->     let (place, ty) = self.eval_place(destination)?;
->     let (val, _) = self.eval_value(source)?;
->     self.place_store(place, val, ty)?;
->     ret(())
-> }
-> ..
-> fn eval_statement(&mut self, Statement::PlaceMention(place): Statement) -> NdResult {
->     self.eval_place(place)?;
->     ret(())
-> }" -/
-
-def mapInsert {K V : Type} [DecidableEq K] : List (K × V) → K → V → List (K × V)
-  | [], k, v => [(k, v)]
-  | (k', v') :: tail, k, v => if k' = k then (k, v) :: tail else (k', v') :: mapInsert tail k v
-
-/-- `Map::insert(k, v)`. -/
-def mapInsertMap {K V : Type} [DecidableEq K] (m : Map K V) (k : K) (v : V) : Map K V :=
-  ⟨mapInsert m.entries k v⟩
-
-def validSize (size : Size) : Bool := inBounds (Int.ofNat size.bytes) .Signed x86_64.PTR_SIZE
-
-/-- `BasicMemory::allocate` (with deterministic address choice):
-> "let alloc = Allocation {
->      data: list![AbstractByte::Uninit; size.bytes()],
->      align,
->      ..
->  };
->  self.allocations.insert(id, alloc);
->  let ptr = ThinPointer {
->      addr: Address::from_usize(0),
->      provenance: prov,
->  };
->  ret(ptr)" -/
-def nextAddress (mem : BM) (align : Align) : Int :=
-  let maxAddr : Int := mem.allocations.foldl (fun (acc : Int) (a : Allocation) =>
-    max acc (if a.live then a.addr + (Allocation.size a).bytes else 0)
-  ) 1024
-  let rem := maxAddr % align.bytes
-  if rem == 0 then maxAddr else maxAddr + (align.bytes - rem)
-
-def BM.allocate (mem : BM) (kind : AllocationKind) (size : Size) (align : Align) :
-    Interp (Ptr × BM) :=
-  if !validSize size then ub "asking for a too large allocation"
-  else
-    let addr := nextAddress mem align
-    let alloc : Allocation := {
-      data := List.replicate size.bytes .Uninit
-      addr := addr
-      align := align
-      kind := kind
-      live := true
-      extra := ()
-    }
-    let id := mem.allocations.length
-    let ptr : Ptr := { addr := addr, provenance := some (⟨id⟩, ()) }
-    pure (ptr, { mem with allocations := mem.allocations ++ [alloc] })
-
-/-- `ConcurrentMemory::allocate`:
-> "pub fn allocate(&mut self, kind: AllocationKind, size: Size, align: Align) -> Result<ThinPointer<M::Provenance>> {
->     self.memory.allocate(kind, size, align)
-> }" -/
-def CM.allocate (cm : ConcurrentMemory BM) (kind : AllocationKind) (size : Size) (align : Align) :
-    Interp (Ptr × ConcurrentMemory BM) := do
-  let (ptr, mem) ← BM.allocate cm.memory kind size align
-  pure (ptr, { cm with memory := mem })
-
 /-- `ConcurrentMemory::deinit` (`spec/lang/step/statements.md`):
 > "fn deinit(&mut self, ptr: ThinPointer<M::Provenance>, len: Size, align: Align) -> Result {
->      self.store(ptr, list![AbstractByte::Uninit; len.bytes()], align, Atomicity::None)?;
->      ret(())
->  }" -/
+>     self.store(ptr, list![AbstractByte::Uninit; len.bytes()], align, Atomicity::None)?;
+>     ret(())
+> }" -/
 def CM.deinit (cm : ConcurrentMemory BM) (ptr : Ptr) (len : Size) (align : Align) :
-    Interp (ConcurrentMemory BM) := do
-  let mem ← BM.store cm.memory ptr (List.replicate len.bytes .Uninit) align
-  pure { cm with memory := mem }
-
-/-! ## Terminators (`spec/lang/step/terminators.md`) -/
+    Interp (ConcurrentMemory BM) :=
+  CM.store cm ptr (List.replicate len.bytes .Uninit) align .None
 
 /-- `StackFrame::storage_dead` (`spec/lang/step/statements.md`):
-> "let pointee_size = self.func.locals[local].layout::<M::T>().expect_size(..);
->  let pointee_align = self.func.locals[local].layout::<M::T>().expect_align(..);
->  if let Some(ptr) = self.locals.remove(local) {
->      mem.deallocate(ptr, AllocationKind::Stack, pointee_size, pointee_align)?;
->  }
->  ret(())" -/
+> "fn storage_dead(&mut self, mem: &mut ConcurrentMemory<M>, local: LocalName) -> NdResult {
+>     let pointee_size = self.func.locals[local].layout::<M::T>().expect_size(\"WF ensures all locals are sized\");
+>     let pointee_align = self.func.locals[local].layout::<M::T>().expect_align(\"WF ensures all locals are sized\");
+>     if let Some(ptr) = self.locals.remove(local) {
+>         mem.deallocate(ptr, AllocationKind::Stack, pointee_size, pointee_align)?;
+>     }
+>     ret(())
+> }" -/
 def storageDead (fr : Frame) (cm : ConcurrentMemory BM) (local_ : LocalName) :
     Interp (Frame × ConcurrentMemory BM) := do
   let ty ← mapIndex fr.func.locals local_ "self.func.locals[local]"
@@ -2087,14 +2165,18 @@ def storageDead (fr : Frame) (cm : ConcurrentMemory BM) (local_ : LocalName) :
   | some ptr => do pure (fr, ← CM.deallocate cm ptr .Stack size align)
   | none => pure (fr, cm)
 
-
 /-- `StackFrame::storage_live` (`spec/lang/step/statements.md`):
-> "self.storage_dead(mem, local)?;
->  let pointee_size = self.func.locals[local].layout::<M::T>().expect_size(..);
->  let pointee_align = self.func.locals[local].layout::<M::T>().expect_align(..);
->  let ptr = mem.allocate(AllocationKind::Stack, pointee_size, pointee_align)?;
->  self.locals.insert(local, ptr);
->  ret(())" -/
+> "fn storage_live(&mut self, mem: &mut ConcurrentMemory<M>, local: LocalName) -> NdResult {
+>     // First remove the old storage, if any.
+>     // This means the same address may be re-used for the new stoage.
+>     self.storage_dead(mem, local)?;
+>     // Then allocate the new storage.
+>     let pointee_size = self.func.locals[local].layout::<M::T>().expect_size(\"WF ensures all locals are sized\");
+>     let pointee_align = self.func.locals[local].layout::<M::T>().expect_align(\"WF ensures all locals are sized\");
+>     let ptr = mem.allocate(AllocationKind::Stack, pointee_size, pointee_align)?;
+>     self.locals.insert(local, ptr);
+>     ret(())
+> }" -/
 def storageLive (fr : Frame) (cm : ConcurrentMemory BM) (local_ : LocalName) :
     Interp (Frame × ConcurrentMemory BM) := do
   let (fr2, cm2) ← storageDead fr cm local_
@@ -2106,6 +2188,43 @@ def storageLive (fr : Frame) (cm : ConcurrentMemory BM) (local_ : LocalName) :
   let locals := mapInsertMap fr2.locals local_ ptr
   pure ({ fr2 with locals := locals }, cm3)
 
+/-- `Machine::eval_statement` for `Statement::Assign`, `Statement::PlaceMention`,
+`Statement::Deinit`, `Statement::StorageLive`, and `Statement::StorageDead`
+(`spec/lang/step/statements.md`):
+> "fn eval_statement(&mut self, Statement::Assign { destination, source }: Statement) -> NdResult {
+>     let (place, ty) = self.eval_place(destination)?;
+>     let (val, _) = self.eval_value(source)?;
+>     self.place_store(place, val, ty)?;
+>     ret(())
+> }
+> ..
+> fn eval_statement(&mut self, Statement::PlaceMention(place): Statement) -> NdResult {
+>     self.eval_place(place)?;
+>     ret(())
+> }
+> ..
+> fn eval_statement(&mut self, Statement::Deinit { place }: Statement) -> NdResult {
+>     let (p, ty) = self.eval_place(place)?;
+>     if !p.aligned {
+>         throw_ub!(\"de-initializing a place based on a misaligned pointer\");
+>     }
+>     // Alignment was already checked.
+>     self.mem.deinit(p.ptr.thin_pointer, ty.layout::<M::T>().expect_size(\"WF ensures deinits are sized\"), Align::ONE)?;
+>
+>     ret(())
+> }
+> ..
+> fn eval_statement(&mut self, Statement::StorageLive(local): Statement) -> NdResult {
+>     self.try_mutate_cur_frame(|frame, mem| {
+>         frame.storage_live(mem, local)
+>     })
+> }
+>
+> fn eval_statement(&mut self, Statement::StorageDead(local): Statement) -> NdResult {
+>     self.try_mutate_cur_frame(|frame, mem| {
+>         frame.storage_dead(mem, local)
+>     })
+> }" -/
 def evalStatement (m : Mach) : Statement → Interp Mach
   | .Assign destination source => do
     let (place, ty) ← evalPlace m destination
@@ -2114,14 +2233,10 @@ def evalStatement (m : Mach) : Statement → Interp Mach
   | .PlaceMention place => do
     let _ ← evalPlace m place
     pure m
-  | .StorageLive local_ => do
-    let fr ← curFrame m
-    let (fr2, cm) ← storageLive fr m.mem local_
-    pure { m with mem := cm, threads := ← listSet m.threads m.active_thread { ← activeThread m with stack := (← activeThread m).stack.dropLast ++ [fr2] } "set" }
-  | .StorageDead local_ => do
-    let fr ← curFrame m
-    let (fr2, cm) ← storageDead fr m.mem local_
-    pure { m with mem := cm, threads := ← listSet m.threads m.active_thread { ← activeThread m with stack := (← activeThread m).stack.dropLast ++ [fr2] } "set" }
+  | .StorageLive local_ =>
+    tryMutateCurFrame m (fun fr cm => storageLive fr cm local_)
+  | .StorageDead local_ =>
+    tryMutateCurFrame m (fun fr cm => storageDead fr cm local_)
   | .Deinit place => do
     let (p, ty) ← evalPlace m place
     if !p.aligned then ub "de-initializing a place based on a misaligned pointer"
@@ -2131,6 +2246,8 @@ def evalStatement (m : Mach) : Statement → Interp Mach
       let cm ← CM.deinit m.mem p.ptr.thin_pointer size ⟨1⟩
       pure { m with mem := cm }
   | _ => unsupported "eval_statement for a statement other than Assign/PlaceMention/StorageLive/StorageDead/Deinit"
+
+/-! ## Terminators (`spec/lang/step/terminators.md`) -/
 
 /-- The teardown loop of `Terminator::Return`:
 > "while let Some(local) = frame.locals.keys().next() {

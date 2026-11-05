@@ -299,12 +299,12 @@ def translatePlace : MirAst.Place → Option Gen.PlaceExpr
   | ⟨j, [.field f _]⟩ => some (.Field (.Local (localName j)) (f : Int))
   | _ => none
 
-/-- Integer type of a fragment operand: `copy _j` has `_j`'s declared type,
-`copy (_j.0)` on an `(it, bool)` local has type `it`, and a constant carries
-its type. -/
+/-- Integer type of a fragment operand: `copy _j` / `move _j` has `_j`'s
+declared type, `copy (_j.0)` / `move (_j.0)` on an `(it, bool)` local has type
+`it`, and a constant carries its type. -/
 def operandIntType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.IntType
   | .copy ⟨j, []⟩ | .move ⟨j, []⟩ => decls[j]? >>= fun d => intTypeOf d.ty
-  | .copy ⟨j, [.field 0 fTy]⟩ => do
+  | .copy ⟨j, [.field 0 fTy]⟩ | .move ⟨j, [.field 0 fTy]⟩ => do
     let d ← decls[j]?
     let it ← intBoolTupleOf d.ty
     let fIt ← intTypeOf fTy
@@ -312,16 +312,16 @@ def operandIntType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option G
   | .constant c => intTypeOf c.ty
   | _ => none
 
-/-- MiniRust type of a fragment operand (including `copy (_j.0)` and
-`copy (_j.1)` field projections on an `(it, bool)` tuple local). -/
+/-- MiniRust type of a fragment operand (including `copy`/`move (_j.0)` and
+`copy`/`move (_j.1)` field projections on an `(it, bool)` tuple local). -/
 def operandType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.Type
   | .copy ⟨j, []⟩ | .move ⟨j, []⟩ => decls[j]? >>= fun d => scalarTypeOf d.ty
-  | .copy ⟨j, [.field 0 fTy]⟩ => do
+  | .copy ⟨j, [.field 0 fTy]⟩ | .move ⟨j, [.field 0 fTy]⟩ => do
     let d ← decls[j]?
     let it ← intBoolTupleOf d.ty
     let fIt ← intTypeOf fTy
     if fIt == it then some (.Int it) else none
-  | .copy ⟨j, [.field 1 fTy]⟩ => do
+  | .copy ⟨j, [.field 1 fTy]⟩ | .move ⟨j, [.field 1 fTy]⟩ => do
     let d ← decls[j]?
     let _ ← intBoolTupleOf d.ty
     if isBoolTy fTy then some .Bool else none
@@ -331,6 +331,8 @@ def operandType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.
 /-- `minimize`'s operand translation (`tooling/minimize/src/rvalue.rs`):
 > "smir::Operand::Constant(c) => self.translate_const_smir(&c.const_, span),
 >  smir::Operand::Copy(place) =>
+>      ValueExpr::Load { source: GcCow::new(self.translate_place_smir(place, span)) },
+>  smir::Operand::Move(place) =>
 >      ValueExpr::Load { source: GcCow::new(self.translate_place_smir(place, span)) },"
 restricted to fragment places (`PlaceExpr::Local` and `PlaceExpr::Field`, see
 `translatePlace`) and scalar constants. For an integer constant,
@@ -667,9 +669,9 @@ def translateRvalue (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Option G
     | _ => none
   | _ => none
 
-/-- `minimize`'s statement translation for assignments to projection-free locals
-and `PlaceMention` on a fragment place (`_i`, `_i.0`, or `_i.1`,
-`tooling/minimize/src/bb.rs`):
+/-- `minimize`'s statement translation for assignments to projection-free locals,
+`StorageLive`, `StorageDead`, and `PlaceMention` on a fragment place (`_i`,
+`_i.0`, or `_i.1`, `tooling/minimize/src/bb.rs`):
 > "rs::StatementKind::Assign(operands) => {
 >      let (place, rval) = &**operands;
 >      let destination = self.translate_place(place, span);
@@ -677,13 +679,18 @@ and `PlaceMention` on a fragment place (`_i`, `_i.0`, or `_i.1`,
 >      let source = self.translate_rvalue(rval, span);
 >      Statement::Assign { destination, source }
 >  }
+>  rs::StatementKind::StorageLive(local) =>
+>      Statement::StorageLive(self.local_name_map[&local]),
+>  rs::StatementKind::StorageDead(local) =>
+>      Statement::StorageDead(self.local_name_map[&local]),
 >  ..
 >  rs::StatementKind::PlaceMention(place) => {
 >      let place = self.translate_place(place, span);
 >      Statement::PlaceMention(place)
 >  }"
 where the elided part special-cases two pointer-provenance casts, which are
-outside the fragment. -/
+outside the fragment, and `Deinit` maps `MirAst.StatementKind.deinit` directly
+to `Statement::Deinit` (`spec/lang/step/statements.md`). -/
 def translateStatement (decls : List MirAst.LocalDecl) (s : MirAst.Statement) :
     Option Gen.Statement :=
   match s.kind with

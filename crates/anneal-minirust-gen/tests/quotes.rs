@@ -1456,3 +1456,181 @@ fn with_overflow_tuple_and_field_quotations_are_pinned() {
         );
     }
 }
+
+/// The upstream items behind `MR-1.3`: arbitrary locals, `StorageLive`,
+/// `StorageDead`, `Statement::Deinit`, `ConcurrentMemory::deinit`,
+/// `ConcurrentMemory::allocate`, `BasicMemory::allocate`, `Allocation::overlaps`,
+/// `x86_64::valid_size`, `Machine::try_mutate_cur_frame`, `Operand::Move`, and
+/// `initBlock` (`always_storage_live_locals`).
+#[test]
+fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
+    let corpus = corpus();
+    let stmts = "spec/lang/step/statements.md";
+    let mach = "spec/lang/machine.md";
+    let basic = "spec/mem/basic.md";
+    let conc = "spec/mem/concurrent.md";
+    let target = "spec/prelude/target.md";
+    let rvalue = "tooling/minimize/src/rvalue.rs";
+    let bb = "tooling/minimize/src/bb.rs";
+    let func = "tooling/minimize/src/function.rs";
+
+    // (cited file, genuine quotation, tampered quotation, Lean file quoting it)
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            target,
+            "fn valid_size(size: Size) -> bool { \
+             size.bytes().in_bounds(Signed, Self::PTR_SIZE) }",
+            "size.bytes().in_bounds(Unsigned, Self::PTR_SIZE)",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            basic,
+            "fn overlaps(self, other_addr: Address, other_size: Size) -> bool { \
+             let end_addr = self.addr + self.size().bytes(); \
+             let other_end_addr = other_addr + other_size.bytes(); \
+             if end_addr <= other_addr || other_end_addr <= self.addr { \
+                 self.addr == other_addr \
+             } else { true } }",
+            "if end_addr < other_addr || other_end_addr < self.addr { false }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            basic,
+            "if !T::valid_size(size) { \
+                 throw_ub!(\"asking for a too large allocation\"); \
+             } .. \
+             let allocation = Allocation { \
+                 addr, align, kind, live: true, \
+                 data: list![AbstractByte::Uninit; size.bytes()], \
+                 extra: alloc_extra, \
+             }; \
+             let id = AllocId(self.allocations.len()); \
+             self.allocations.push(allocation); \
+             ret(ThinPointer { addr, provenance: Some((id, prov_extra)) })",
+            "live: false, data: list![AbstractByte::Uninit; size.bytes()],",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            conc,
+            "pub fn allocate(&mut self, kind: AllocationKind, size: Size, align: Align) -> NdResult<ThinPointer<M::Provenance>> { \
+             self.memory.allocate(kind, size, align) }",
+            "pub fn allocate(&mut self, kind: AllocationKind, size: Size, align: Align) -> Result<ThinPointer<M::Provenance>>",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            mach,
+            "fn try_mutate_cur_frame<O>(&mut self, f: impl FnOnce(&mut StackFrame<M>, &mut ConcurrentMemory<M>) -> NdResult<O>) -> NdResult<O> { \
+             self.threads.try_mutate_at(self.active_thread, |thread| thread.try_mutate_cur_frame(|frame| f(frame, &mut self.mem))) }",
+            "self.threads.mutate_at(self.active_thread, |thread| thread.cur_frame())",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            stmts,
+            "fn deinit(&mut self, ptr: ThinPointer<M::Provenance>, len: Size, align: Align) -> Result { \
+             self.store(ptr, list![AbstractByte::Uninit; len.bytes()], align, Atomicity::None)?; \
+             ret(()) }",
+            "self.store(ptr, list![AbstractByte::Uninit; len.bytes()], align, Atomicity::Atomic)?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            stmts,
+            "fn eval_statement(&mut self, Statement::Deinit { place }: Statement) -> NdResult { \
+             let (p, ty) = self.eval_place(place)?; \
+             if !p.aligned { \
+                 throw_ub!(\"de-initializing a place based on a misaligned pointer\"); \
+             } \
+             self.mem.deinit(p.ptr.thin_pointer, ty.layout::<M::T>().expect_size(\"WF ensures deinits are sized\"), Align::ONE)?; \
+             ret(()) }",
+            "self.mem.deinit(p.ptr.thin_pointer, Size::ZERO, Align::ONE)?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            stmts,
+            "fn storage_live(&mut self, mem: &mut ConcurrentMemory<M>, local: LocalName) -> NdResult { \
+             self.storage_dead(mem, local)?; \
+             let pointee_size = self.func.locals[local].layout::<M::T>().expect_size(\"WF ensures all locals are sized\"); \
+             let pointee_align = self.func.locals[local].layout::<M::T>().expect_align(\"WF ensures all locals are sized\"); \
+             let ptr = mem.allocate(AllocationKind::Stack, pointee_size, pointee_align)?; \
+             self.locals.insert(local, ptr); \
+             ret(()) }",
+            "let ptr = mem.allocate(AllocationKind::Heap, pointee_size, pointee_align)?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            stmts,
+            "fn storage_dead(&mut self, mem: &mut ConcurrentMemory<M>, local: LocalName) -> NdResult { \
+             let pointee_size = self.func.locals[local].layout::<M::T>().expect_size(\"WF ensures all locals are sized\"); \
+             let pointee_align = self.func.locals[local].layout::<M::T>().expect_align(\"WF ensures all locals are sized\"); \
+             if let Some(ptr) = self.locals.remove(local) { \
+                 mem.deallocate(ptr, AllocationKind::Stack, pointee_size, pointee_align)?; \
+             } \
+             ret(()) }",
+            "mem.deallocate(ptr, AllocationKind::Global, pointee_size, pointee_align)?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            stmts,
+            "fn eval_statement(&mut self, Statement::StorageLive(local): Statement) -> NdResult { \
+             self.try_mutate_cur_frame(|frame, mem| { frame.storage_live(mem, local) }) } \
+             fn eval_statement(&mut self, Statement::StorageDead(local): Statement) -> NdResult { \
+             self.try_mutate_cur_frame(|frame, mem| { frame.storage_dead(mem, local) }) }",
+            "fn eval_statement(&mut self, Statement::StorageLive(local): Statement) -> NdResult { \
+             self.try_mutate_cur_frame(|frame, mem| { frame.storage_dead(mem, local) }) }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            rvalue,
+            "smir::Operand::Copy(place) => \
+             ValueExpr::Load { source: GcCow::new(self.translate_place_smir(place, span)) }, \
+             smir::Operand::Move(place) => \
+             ValueExpr::Load { source: GcCow::new(self.translate_place_smir(place, span)) },",
+            "smir::Operand::Move(place) => ValueExpr::Tuple(list![], ty),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::StatementKind::StorageLive(local) => \
+             Statement::StorageLive(self.local_name_map[&local]), \
+             rs::StatementKind::StorageDead(local) => \
+             Statement::StorageDead(self.local_name_map[&local]),",
+            "rs::StatementKind::StorageLive(local) => Statement::StorageDead(self.local_name_map[&local]),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            func,
+            "init_statements.extend(rs::always_storage_live_locals(&self.body).iter() \
+             .map(|loc| self.local_name_map[&loc]) \
+             .filter(|LocalName(i)| i.get_internal() as usize >= free_argc) \
+             .map(Statement::StorageLive),);",
+            ".filter(|LocalName(i)| i.get_internal() as usize < free_argc)",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+    ];
+    assert_eq!(cases.len(), 13, "expected 13 pinned MR-1.3 quotations");
+
+    let lean_root = minirust_dir().join("lean");
+    for (file, genuine, tampered, lean_file) in cases {
+        assert_eq!(
+            missing_piece_in(&corpus, Some(file), genuine),
+            None,
+            "genuine quotation not found in `{file}`: {genuine}"
+        );
+        assert!(
+            missing_piece_in(&corpus, Some(file), tampered).is_some(),
+            "tampered quotation unexpectedly found in `{file}`: {tampered}"
+        );
+        let other = if *file == stmts { basic } else { stmts };
+        assert!(
+            missing_piece_in(&corpus, Some(other), genuine).is_some(),
+            "quotation from `{file}` also matches `{other}`: {genuine}"
+        );
+        let lean = std::fs::read_to_string(lean_root.join(lean_file)).unwrap();
+        let lean_squashed = squash(&lean.replace("\\\"", "\"").replace("\n>", "\n"));
+        let first_piece = squash(genuine.split("..").next().unwrap());
+        let probe: String = first_piece.chars().take(40).collect();
+        assert!(
+            lean_squashed.contains(&probe),
+            "`{lean_file}` no longer quotes `{probe}`"
+        );
+    }
+}
