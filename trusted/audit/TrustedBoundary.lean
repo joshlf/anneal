@@ -25,9 +25,13 @@ invokes this file in two phases over JSON IPC (`run` and `main`):
   alter code generation without appearing in kernel proof terms. `"preflight"`
   therefore parses every non-foundation `.lean` file using `Parser.parseHeader`
   and `Parser.parseCommand`—which never invoke the elaborator—against the locked
-  foundation parser environment only. It enforces a closed command, attribute,
-  and identifier grammar and extracts each `Trusted` module's
-  `-- anneal-trust-tier: <tier>` directive before `lean` compiles any file.
+  foundation parser environment only. Rather than maintaining an open-ended
+  block-list of dangerous Lean features, `"preflight"` enforces a closed,
+  role-aware `SyntaxNodeKind` allow-list (`allowedTrustedSyntaxKinds` for
+  tactic-free `trusted/lean/` specifications and `allowedTheorySyntaxKinds` for
+  `theory/` proofs) together with closed attribute and identifier grammars, and
+  extracts each `Trusted` module's `-- anneal-trust-tier: <tier>` directive
+  before `lean` compiles any file.
 - **`"audit"` (kernel `.olean` inspection and replay):**
   Loads the compiled `.olean` files with `trustLevel := 0`, `plugins := #[]`,
   and `loadExts := false` (so no `[init]` initializers or persistent environment
@@ -57,8 +61,8 @@ and `where`/`private` helpers, all of which are compiled into the same `.olean`
 and inherit their defining module's `ModuleRole` without surface-syntax name
 prediction or suffix heuristics.
 
-On every kernel dependency edge `c → dep` (`declarationEdges`), `checkTierReferences`
-enforces two rules:
+On every kernel dependency edge `c → dep` (`declarationEdges`),
+`checkTierReferences` enforces two rules:
 
 - **Origin rule:** a `.trusted _` constant may only reference `.foundation` or
   `.trusted _` constants (never `.theory`).
@@ -108,6 +112,15 @@ def parse? (raw : String) : Option TrustTier :=
     none
 
 end TrustTier
+
+/-- Role of a repository `.lean` source module inspected during `"preflight"`.
+Every `Trusted` module carries its required `TrustTier`, while `theory/`
+modules carry none; illegal combinations (a `Trusted` module without a tier
+or a `theory/` module with one) are unrepresentable. -/
+inductive SourceRole where
+  | trusted (tier : TrustTier)
+  | theory
+  deriving BEq, DecidableEq
 
 /-- Partition of every admitted module in the kernel environment into its
 repository role. Representing these three roles as mutually exclusive
@@ -176,9 +189,15 @@ def validateGraph (j : Json) (env : Environment) : IO Unit := do
 
 /-! ## Phase 1: source preflight -/
 
+/-- Closed allowlist of module header syntax kinds permitted in source files.
+Module-system and import modifiers (`moduleTk`, `public`, `meta`, `all`) are
+excluded so any header modifier is rejected by `SyntaxNodeKind` alone. -/
+def allowedHeaderKinds : List Name := [
+  ``Parser.Module.header, ``Parser.Module.prelude, ``Parser.Module.import]
+
 /-- Closed allowlist of top-level command syntax kinds permitted in source
 files. Commands such as `#eval`, `#check`, `macro`, `syntax`, `elab`,
-`initialize`, and `axiom` are excluded. -/
+`notation`, `infix`, `initialize`, `set_option`, and `axiom` are excluded. -/
 def allowedCommandKinds : List Name := [
   ``Parser.Command.declaration, ``Parser.Command.namespace,
   ``Parser.Command.section, ``Parser.Command.end, ``Parser.Command.universe,
@@ -187,49 +206,144 @@ def allowedCommandKinds : List Name := [
   ``Parser.Command.moduleDoc]
 
 /-- Closed allowlist of declaration syntax kinds permitted inside
-`Parser.Command.declaration`. -/
+`Parser.Command.declaration`. `axiom`, `example`, and `coinductive` are
+excluded. -/
 def allowedDeclarationKinds : List Name := [
   ``Parser.Command.abbrev, ``Parser.Command.definition,
   ``Parser.Command.theorem, ``Parser.Command.opaque,
   ``Parser.Command.instance, ``Parser.Command.inductive,
   ``Parser.Command.classInductive, ``Parser.Command.structure]
 
+/-- Closed allowlist of command and declaration structural sub-node kinds.
+Excludes `unsafe`, `partial`, `meta`, `nonrec`, `openScoped`, `derivingClass`,
+`computedFields`, and termination/fixpoint clauses (`terminationBy`,
+`decreasingBy`, `partialFixpoint`, `coinductiveFixpoint`,
+`inductiveFixpoint`). -/
+def allowedCommandSyntaxKinds : List Name := [
+  ``Parser.Command.declModifiers, ``Parser.Command.declId,
+  ``Parser.Command.declSig, ``Parser.Command.optDeclSig,
+  ``Parser.Command.declValSimple, ``Parser.Command.declValEqns,
+  ``Parser.Command.whereStructInst, ``Parser.Command.docComment,
+  ``Parser.Command.private, ``Parser.Command.protected,
+  ``Parser.Command.noncomputable, ``Parser.Command.openSimple,
+  ``Parser.Command.sectionHeader, ``Parser.Command.eraseAttr,
+  ``Parser.Command.ctor, ``Parser.Command.optDeriving,
+  ``Parser.Command.optDefDeriving, ``Parser.Command.classTk,
+  ``Parser.Command.structureTk, ``Parser.Command.extends,
+  ``Parser.Command.structCtor, ``Parser.Command.structFields,
+  ``Parser.Command.structSimpleBinder, ``Parser.Command.structExplicitBinder,
+  ``Parser.Command.structImplicitBinder, ``Parser.Command.structInstBinder,
+  ``Parser.Command.structParent, ``Parser.Termination.suffix,
+  ``Lean.binderIdent, ``Lean.explicitBinders,
+  ``Lean.bracketedExplicitBinders, ``Lean.unbracketedExplicitBinders]
+
+/-- Closed allowlist of pure term, binder, pattern-matching, structure-instance,
+literal, and attribute-application syntax kinds permitted in both `Trusted` and
+`theory/` modules. Excludes `byTactic` (permitted only in `theory/`), `sorry`,
+`unsafe`, `byElab`, `includeStr`, `set_option`, `scoped`/`local` attribute
+kinds, `do` notation, string interpolation, quotations, and reflection macros
+(`decl_name%`, `with_decl_name%`, `private_decl%`). -/
+def allowedTermSyntaxKinds : List Name := [
+  ``Parser.Term.anonymousCtor, ``Parser.Term.app, ``Parser.Term.arrow,
+  ``Parser.Term.attrInstance, ``Parser.Term.attrKind,
+  ``Parser.Term.attributes, ``Parser.Term.basicFun,
+  ``Parser.Term.binderDefault, ``Parser.Term.cdot, ``Parser.Term.dotIdent,
+  ``Parser.Term.explicit, ``Parser.Term.explicitBinder,
+  ``Parser.Term.forall, ``Parser.Term.fromTerm, ``Parser.Term.fun,
+  ``Parser.Term.have, `Lean.Parser.Term.haveDecl, `Lean.Parser.Term.haveId,
+  `Lean.Parser.Term.haveIdDecl, `Lean.Parser.Term.haveIdLhs, ``Parser.Term.hole,
+  ``Parser.Term.hygienicLParen, ``Parser.Term.implicitBinder,
+  ``Parser.Term.instBinder, ``Parser.Term.let, ``Parser.Term.letConfig,
+  ``Parser.Term.letDecl, ``Parser.Term.letId, ``Parser.Term.letIdDecl,
+  ``Parser.Term.letPatDecl, ``Parser.Term.match, ``Parser.Term.matchAlt,
+  ``Parser.Term.matchAlts, ``Parser.Term.matchAltsWhereDecls,
+  ``Parser.Term.matchDiscr, ``Parser.Term.namedArgument,
+  ``Parser.Term.nomatch, ``Parser.Term.optEllipsis, ``Parser.Term.paren,
+  ``Parser.Term.proj, ``Parser.Term.prop, ``Parser.Term.show,
+  ``Parser.Term.sort, ``Parser.Term.strictImplicitBinder,
+  ``Parser.Term.structInst, ``Parser.Term.structInstField,
+  ``Parser.Term.structInstFieldDef, ``Parser.Term.structInstFieldEqns,
+  ``Parser.Term.structInstFields, ``Parser.Term.structInstLVal,
+  ``Parser.Term.subst, ``Parser.Term.syntheticHole, ``Parser.Term.tuple,
+  ``Parser.Term.type, ``Parser.Term.typeAscription, ``Parser.Term.typeSpec,
+  ``Parser.Attr.simple, ``Parser.Attr.instance, `Lean.Parser.Attr.simp,
+  `fieldIdx, `group, `hygieneInfo, `num, `str, `char, `scientific]
+
+/-- Closed allowlist of standard `Init.*` notation syntax kinds expanded by the
+locked foundation parser. -/
+def allowedNotationSyntaxKinds : List Name := [
+  `term!_, `termIfThenElse, `termDepIfThenElse, `«term[_]»,
+  `«term_&&_», `«term_||_», `«term_+_», `«term_-_», `«term_*_»,
+  `«term_::_», `«term_++_», `«term_<_», `«term_≤_», `«term_>_»,
+  `«term_≥_», `«term_==_», `«term_!=_», `«term_=_», `«term_≠_»,
+  `«term__[_]_?», `«term_×_», `«term_↔_», `«term_∈_», `«term_∧_»,
+  `«term_∨_», `«term¬_», `«term∃_,_», `«term‹_›», `Lean.cdot, `Lean.cdotTk]
+
+/-- Closed allowlist of tactic syntax kinds permitted in `SourceRole.theory`
+(`theory/`) modules only. `Trusted` modules are tactic-free (`byTactic` is
+excluded from `allowedTrustedSyntaxKinds`). Even in `theory/`, effectful or
+trust-bypassing tactics (`native_decide`, `decide!`, `bv_decide`, `rfl'`,
+`sorry`, `run_tac`, `sleep`, `dbg_trace`, `unhygienic`, `grind`) and tactic
+configuration items (`+native`, `+kernel`, etc., which parse as
+`Parser.Tactic.configItem`) are excluded. -/
+def allowedTheoryTacticKinds : List Name := [
+  ``Parser.Term.byTactic, ``Parser.Term.binderTactic,
+  `Lean.Parser.Tactic.apply, `Lean.Parser.Tactic.cases,
+  `Lean.Parser.Tactic.change, `Lean.Parser.Tactic.constructor,
+  `Lean.Parser.Tactic.decide, `Lean.Parser.Tactic.dsimp,
+  `Lean.Parser.Tactic.elimTarget, `Lean.Parser.Tactic.exact,
+  `Lean.Parser.Tactic.first, `Lean.Parser.Tactic.induction,
+  `Lean.Parser.Tactic.inductionAlt, `Lean.Parser.Tactic.inductionAltLHS,
+  `Lean.Parser.Tactic.inductionAlts, `Lean.Parser.Tactic.injection,
+  `Lean.Parser.Tactic.intro, `Lean.Parser.Tactic.left,
+  `Lean.Parser.Tactic.location, `Lean.Parser.Tactic.locationHyp,
+  `Lean.Parser.Tactic.optConfig, `Lean.Parser.Tactic.paren,
+  `Lean.Parser.Tactic.refine, `Lean.Parser.Tactic.revert,
+  `Lean.Parser.Tactic.right, `Lean.Parser.Tactic.rwRule,
+  `Lean.Parser.Tactic.rwRuleSeq, `Lean.Parser.Tactic.rwSeq,
+  `Lean.Parser.Tactic.simp, `Lean.Parser.Tactic.simpLemma,
+  `Lean.Parser.Tactic.subst, `Lean.Parser.Tactic.tacticHave__,
+  `Lean.Parser.Tactic.tacticLet__, `Lean.Parser.Tactic.«tacticNomatch_,,»,
+  `Lean.Parser.Tactic.tacticRepeat_, `Lean.Parser.Tactic.tacticRfl,
+  `Lean.Parser.Tactic.tacticSeq, `Lean.Parser.Tactic.tacticSeq1Indented,
+  `Lean.Parser.Tactic.«tactic_<;>_», `Lean.Parser.Tactic.unfold,
+  `tacticFunext___]
+
+/-- Syntax node kinds permitted in `SourceRole.trusted` (`trusted/lean/`)
+modules: pure declarations, types, and term-mode proofs only. -/
+def allowedTrustedSyntaxKinds : NameSet :=
+  .ofList <|
+    allowedHeaderKinds ++
+    allowedCommandKinds ++
+    allowedDeclarationKinds ++
+    allowedCommandSyntaxKinds ++
+    allowedTermSyntaxKinds ++
+    allowedNotationSyntaxKinds
+
+/-- Syntax node kinds permitted in `SourceRole.theory` (`theory/`) modules:
+`allowedTrustedSyntaxKinds` extended with `allowedTheoryTacticKinds`. -/
+def allowedTheorySyntaxKinds : NameSet :=
+  allowedTrustedSyntaxKinds ++ .ofList allowedTheoryTacticKinds
+
+namespace SourceRole
+
+/-- The closed `SyntaxNodeKind` allowlist for a source module's role. -/
+def allowedSyntaxKinds : SourceRole → NameSet
+  | .trusted _ => allowedTrustedSyntaxKinds
+  | .theory => allowedTheorySyntaxKinds
+
+/-- Render the optional `"trustTier"` JSON wire value for a source module. -/
+def renderTier? : SourceRole → Option String
+  | .trusted tier => some tier.render
+  | .theory => none
+
+end SourceRole
+
 /-- Closed allowlist of attributes permitted on declarations. Compiler-override
 and metaprogramming attributes (`extern`, `implemented_by`, `csimp`, `init`,
 `macro`, `elab_as_elim`, etc.) are excluded. -/
 def allowedAttributeNames : List Name :=
   [`simp, `instance, `reducible, `semireducible, `irreducible]
-
-/-- Keyword atoms rejected anywhere inside a command syntax tree. -/
-def forbiddenAtomKeywords : List String := [
-  "set_option", "rfl'", "unhygienic", "decide!", "bv_decide",
-  "native_decide", "include_str", "by_elab", "run_tac",
-  "with_decl_name%", "private_decl%", "decl_name%",
-  "partial_fixpoint", "coinductive_fixpoint", "inductive_fixpoint"]
-
-/-- Syntax node kinds rejected anywhere inside a command syntax tree. -/
-def forbiddenSyntaxKinds : List Name := [
-  ``Parser.Command.unsafe, ``Parser.Command.partial, ``Parser.Command.meta,
-  ``Parser.Command.axiom, ``Parser.Command.example,
-  ``Parser.Command.coinductive, ``Parser.Command.computedFields,
-  ``Parser.Command.computedField, ``Parser.Command.openScoped,
-  ``Parser.Command.set_option, ``Parser.Term.set_option,
-  ``Parser.Term.unsafe, ``Parser.Tactic.set_option,
-  `Lean.Parser.Tactic.Grind.setOption, `Lean.byElab, `Lean.includeStr,
-  `Lean.Parser.Tactic.runTac, `Lean.Parser.Tactic.nativeDecide,
-  `Lean.Parser.Tactic.decideBang, `Lean.Parser.Tactic.bvDecide,
-  `Lean.Parser.Tactic.rfl', `Lean.Parser.Tactic.unhygienic,
-  `Lean.Parser.Tactic.sleep, `Lean.Parser.Tactic.dbgTrace,
-  `Lean.Parser.Term.idbg, `Lean.Parser.Term.doIdbg,
-  `Lean.Parser.Term.dbgTrace, `Lean.Parser.Term.doDbgTrace,
-  `Lean.Parser.Term.withDeclName, `Lean.Parser.Term.privateDecl,
-  `Lean.Parser.Term.declName, `Lean.Parser.Termination.partialFixpoint,
-  `Lean.Parser.Termination.coinductiveFixpoint,
-  `Lean.Parser.Termination.inductiveFixpoint]
-
-/-- Return `true` if `s` or any syntax descendant is an atom equal to `val`. -/
-def atomWithin (s : Syntax) (val : String) : Bool :=
-  (s.find? fun x => x.isAtom && x.getAtomVal == val).isSome
 
 /-- Return `true` if `id` is a valid user-written identifier with non-empty
 string components, no macro scopes, and no `_root_` namespace escape. -/
@@ -241,109 +355,112 @@ def isValidSourceIdent (id : Name) : Bool :=
        | .str .anonymous seg => !seg.isEmpty && seg != "_root_"
        | _ => false)
 
-/-- Extract the module-level `-- anneal-trust-tier: <tier>` directive from
-`text`. Every `Trusted` module must declare a single valid `TrustTier`, and
-non-`Trusted` modules may not declare one. -/
-def extractModuleTier (isTrustedModule : Bool) (moduleName : Name)
-    (text : String) : IO (Option TrustTier) := do
+/-- Determine the `SourceRole` of `moduleName` from its name and `--
+anneal-trust-tier: <tier>` directive in `text`. Every `Trusted` module must
+declare a single valid `TrustTier`, and non-`Trusted` (`theory/`) modules may
+not declare one. -/
+def extractSourceRole (moduleName : Name) (text : String) : IO SourceRole := do
+  let isTrustedModule :=
+    moduleName == `Trusted || moduleName.getRoot == `Trusted
   let directives := (text.splitOn "\n").filterMap fun rawLine =>
     (rawLine.trimAscii.toString.dropPrefix? "-- anneal-trust-tier:").map
       (·.trimAscii.toString)
   match isTrustedModule, directives with
-  | false, [] => pure none
+  | false, [] => pure .theory
   | false, _ :: _ =>
     fail s!"trust tier directive is only allowed in Trusted modules ({moduleName})"
   | true, [] =>
     fail s!"missing `-- anneal-trust-tier: vetted` or `-- anneal-trust-tier: candidate:<feature>` in {moduleName}"
   | true, [rawTier] =>
     match TrustTier.parse? rawTier with
-    | some tier => pure (some tier)
+    | some tier => pure (.trusted tier)
     | none => fail s!"invalid trust tier {rawTier} in {moduleName}"
   | true, _ :: _ :: _ =>
     fail s!"multiple trust tier directives in {moduleName}"
 
-/-- Validate a single `Parser.Term.attrInstance` syntax node `elem`. -/
-def inspectAttrInstance (elem : Syntax) : IO Unit := do
-  unless elem.getArgs.size == 2 do fail "unsupported attribute-operation shape"
-  if atomWithin elem[0] "scoped" || atomWithin elem[0] "local" then
-    fail "scoped/local attribute modifiers are unsupported"
-  let attr := elem[1]
-  let k := attr.getKind
-  if k == ``Parser.Attr.simple then
-    let attrName := attr[0].getId
+/-- Return `true` if `k` is a command permitted inside a `mutual` block or on
+the RHS of an `in` command (any command in `allowedCommandKinds` except scope
+and `mutual` commands). -/
+def isAllowedNestedCommand (k : SyntaxNodeKind) : Bool :=
+  allowedCommandKinds.contains k &&
+    ![``Parser.Command.namespace, ``Parser.Command.section,
+      ``Parser.Command.end, ``Parser.Command.mutual].contains k
+
+/-- Enforce per-node structural invariants on a `Syntax.node` whose kind `k` has
+already been admitted by `allowedKinds`:
+- `Parser.Module.header`: an explicit `prelude` child (`args[1]`) is mandatory
+  (omitting `prelude` produces an empty `null` node rather than a distinct
+  `SyntaxNodeKind`).
+- `Parser.Command.sectionHeader`: `section` and `namespace` headers may not
+  carry modifiers (`noncomputable section`, `@[attr] section`, etc.).
+- `Parser.Command.declaration`: the inner declaration body (`args[1]`) must be
+  one of `allowedDeclarationKinds`.
+- `Parser.Command.mutual`: every element inside `mutual ... end` (`args[1]`)
+  must satisfy `isAllowedNestedCommand`.
+- `Parser.Command.in`: only `open` and `variable` may appear on the LHS
+  (`args[0]`), and the RHS (`args[2]`) must satisfy `isAllowedNestedCommand`.
+- `Parser.Attr.simple`, `Parser.Attr.instance`, `Parser.Attr.simp`, and
+  `Parser.Command.eraseAttr`: attribute names must belong to
+  `allowedAttributeNames` and carry no arguments or priority overrides. -/
+def inspectNodeKind (k : SyntaxNodeKind) (args : Array Syntax) : IO Unit := do
+  if k == ``Parser.Module.header then
+    unless !(args[1]?.map Syntax.getArgs |>.getD #[]).isEmpty do
+      fail "explicit prelude is required"
+  else if k == ``Parser.Command.sectionHeader then
+    unless args.all (·.getArgs.isEmpty) do
+      fail "section/namespace modifiers are unsupported"
+  else if k == ``Parser.Command.declaration then
+    let declKind := args[1]?.map Syntax.getKind |>.getD .anonymous
+    unless allowedDeclarationKinds.contains declKind do
+      fail s!"unsupported declaration kind {declKind}"
+  else if k == ``Parser.Command.mutual then
+    unless args.size == 3 &&
+        args[1]!.getArgs.all (isAllowedNestedCommand ·.getKind) do
+      fail "unsupported mutual-block shape"
+  else if k == ``Parser.Command.in then
+    unless args.size == 3 do fail "unsupported command-wrapper shape"
+    unless [``Parser.Command.open, ``Parser.Command.variable].contains
+        args[0]!.getKind do
+      fail "only `open` and `variable` commands are permitted on the LHS of `in`"
+    unless isAllowedNestedCommand args[2]!.getKind do
+      fail s!"unsupported command inside `in`: {args[2]!.getKind}"
+  else if k == ``Parser.Attr.simple then
+    let attrName := args[0]?.map Syntax.getId |>.getD .anonymous
     unless allowedAttributeNames.contains attrName do
       fail s!"unsupported attribute {attrName}"
-    unless attr[1].getArgs.isEmpty do
+    unless (args[1]?.map Syntax.getArgs |>.getD #[]).isEmpty do
       fail s!"unsupported arguments on attribute {attrName}"
   else if k == ``Parser.Attr.instance || k == `Lean.Parser.Attr.simp then
-    pure ()
-  else
-    fail s!"unsupported attribute form {k}"
-
-/-- Recursively validate syntax node `s` during `"preflight"`. -/
-partial def inspectSyntax (s : Syntax) : IO Unit := do
-  if s.isIdent && !isValidSourceIdent s.getId then
-    fail s!"invalid identifier {s.getId}"
-  if s.isAtom && forbiddenAtomKeywords.contains s.getAtomVal then
-    fail s!"unsupported syntax keyword {s.getAtomVal}"
-  let k := s.getKind
-  if forbiddenSyntaxKinds.contains k then
-    fail s!"unsupported source form {k}"
-  if k == ``Parser.Term.attrKind then
-    if atomWithin s "scoped" || atomWithin s "local" then
-      fail "scoped/local attribute modifiers are unsupported"
-  else if k == ``Parser.Command.optDeriving ||
-      k == ``Parser.Command.optDefDeriving then
-    if atomWithin s "deriving" then fail "deriving clauses are unsupported"
-  else if k == ``Parser.Term.attrInstance then
-    inspectAttrInstance s
+    unless (args.extract 1 args.size).all (·.getArgs.isEmpty) do
+      fail s!"unsupported arguments on attribute {k}"
   else if k == ``Parser.Command.eraseAttr then
-    unless allowedAttributeNames.contains s[1].getId do
-      fail s!"unsupported attribute removal {s[1].getId}"
-  else if k == `Lean.Parser.Tactic.decide then
-    unless s[1].getArgs.all (·.getArgs.isEmpty) do
-      fail "decide configuration is unsupported"
-  for child in s.getArgs do inspectSyntax child
+    let attrName := args[1]?.map Syntax.getId |>.getD .anonymous
+    unless allowedAttributeNames.contains attrName do
+      fail s!"unsupported attribute removal {attrName}"
 
-/-- Validate a top-level command `s` during `"preflight"`. -/
-partial def inspectCommand (s : Syntax) : IO Unit := do
-  let k := s.getKind
-  unless allowedCommandKinds.contains k do
-    fail s!"unsupported command {k}"
-  inspectSyntax s
-  if k == ``Parser.Command.open then
-    if atomWithin s "scoped" then
-      fail "open scoped is unsupported"
-  else if k == ``Parser.Command.namespace || k == ``Parser.Command.section then
-    if !s[0].getArgs.all (·.getArgs.isEmpty) || atomWithin s "noncomputable" ||
-        atomWithin s "meta" || atomWithin s "public" ||
-        atomWithin s "expose" then
-      fail "section/namespace modifiers are unsupported"
-  else if k == ``Parser.Command.in then
-    unless s.getArgs.size == 3 do fail "unsupported command-wrapper shape"
-    unless [``Parser.Command.open, ``Parser.Command.variable].contains
-        s[0].getKind do
-      fail "only `open` and `variable` commands are permitted on the LHS of `in`"
-    if (s.find? fun x =>
-        [``Parser.Command.namespace, ``Parser.Command.section,
-         ``Parser.Command.end, ``Parser.Command.mutual].contains
-          x.getKind).isSome then
-      fail "scope or mutual commands are unsupported inside `in`"
-    inspectCommand s[0]
-    inspectCommand s[2]
-  else if k == ``Parser.Command.mutual then
-    unless s.getArgs.size == 3 do fail "unsupported mutual-block shape"
-    for child in s[1].getArgs do
-      inspectCommand child
-  else if k == ``Parser.Command.declaration then
-    let decl := s[1]
-    unless allowedDeclarationKinds.contains decl.getKind do
-      fail s!"unsupported declaration kind {decl.getKind}"
+/-- Recursively validate syntax tree `s` in a single top-down pass against the
+closed `allowedKinds` allowlist during `"preflight"`. Pattern-matching
+exhaustively on `Syntax` rejects recovery placeholders (`.missing`), validates
+every identifier with `isValidSourceIdent`, and requires every non-`null`
+`Syntax.node` kind to belong to `allowedKinds` and satisfy `inspectNodeKind`. -/
+partial def inspectSyntax (allowedKinds : NameSet) (s : Syntax) : IO Unit := do
+  match s with
+  | .missing => fail "unexpected missing syntax node"
+  | .atom _ _ => pure ()
+  | .ident _ _ val _ =>
+    unless isValidSourceIdent val do
+      fail s!"invalid identifier {val}"
+  | .node _ k args =>
+    unless k == nullKind || allowedKinds.contains k do
+      fail s!"unsupported syntax kind {k}"
+    inspectNodeKind k args
+    for child in args do
+      inspectSyntax allowedKinds child
 
 /-- Parse and validate all commands in `ctx` starting from `initial` and `log`
-using the pure foundation `parserEnv`. -/
+using the pure foundation `parserEnv` and the role's `allowedKinds`. -/
 partial def parseAndInspectCommands (ctx : Parser.InputContext)
-    (parserEnv : Environment) (moduleName : Name)
+    (parserEnv : Environment) (moduleName : Name) (allowedKinds : NameSet)
     (state : Parser.ModuleParserState) (messages : MessageLog) : IO Unit := do
   let previous := state.pos
   let (stx, nextState, nextMessages) :=
@@ -354,36 +471,32 @@ partial def parseAndInspectCommands (ctx : Parser.InputContext)
     return ()
   if nextState.pos <= previous then
     throw <| IO.userError "parser made no progress"
-  inspectCommand stx
-  parseAndInspectCommands ctx parserEnv moduleName nextState nextMessages
+  unless allowedCommandKinds.contains stx.getKind do
+    fail s!"unsupported command {stx.getKind}"
+  inspectSyntax allowedKinds stx
+  parseAndInspectCommands ctx parserEnv moduleName allowedKinds nextState
+    nextMessages
 
 /-- Parse and validate a single `.lean` source file during `"preflight"`. -/
 def inspectSource (parserEnv : Environment) (moduleName : Name)
     (path : System.FilePath) : IO Json := do
   let text ← IO.FS.readFile path
-  let isTrustedModule :=
-    moduleName == `Trusted || moduleName.getRoot == `Trusted
-  let tier? ← extractModuleTier isTrustedModule moduleName text
+  let role ← extractSourceRole moduleName text
+  let allowedKinds := role.allowedSyntaxKinds
   let ctx := Parser.mkInputContext text path.toString
   let (header, initial, log) ← Parser.parseHeader ctx
   if log.hasErrors || initial.recovering then
     fail s!"header parser error in {moduleName}"
-  if Elab.HeaderSyntax.isModule header then
-    fail "module headers are unsupported"
-  unless atomWithin header.raw "prelude" do
-    fail "explicit prelude is required"
-  if atomWithin header.raw "public" || atomWithin header.raw "meta" ||
-      atomWithin header.raw "all" then
-    fail "explicit import modifiers are unsupported"
+  inspectSyntax allowedKinds header.raw
   let imports := Elab.HeaderSyntax.imports header
   for imp in imports do
     if imp.importAll || imp.isMeta || !imp.isExported then
       fail "import modifiers are unsupported"
-  parseAndInspectCommands ctx parserEnv moduleName initial log
+  parseAndInspectCommands ctx parserEnv moduleName allowedKinds initial log
   return Json.mkObj [
     ("module", toJson moduleName),
     ("imports", toJson imports),
-    ("trustTier", toJson (tier?.map TrustTier.render))]
+    ("trustTier", toJson role.renderTier?)]
 
 /-! ## Phase 2: kernel environment audit -/
 

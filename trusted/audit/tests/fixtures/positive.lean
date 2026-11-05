@@ -19,7 +19,7 @@ structure Box where
 
 opaque sealed : Box := Box.mk (helper 7)
 
-@[simp] theorem helper_eq (n : Nat) : Eq (helper n) n := by rfl
+@[simp] theorem helper_eq (n : Nat) : Eq (helper n) n := rfl
 
 noncomputable def chosen : Nat := Classical.choice ⟨0⟩
 
