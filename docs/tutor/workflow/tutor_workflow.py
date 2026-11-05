@@ -771,7 +771,8 @@ def extract_errors(stdout: str, stderr: str, where: str) -> list[str]:
     if start is not None:
         out.extend(line for line in err_lines[start:]
                    if line.strip() and not CARGO_NOISE.match(line)
-                   and not line.startswith("info:"))
+                   and not line.startswith("info:")
+                   and not line.startswith(LAKE_NOISE_PREFIXES))
     if not out:
         raise WorkflowError(f"{where}: the step printed no error diagnostics")
     return out

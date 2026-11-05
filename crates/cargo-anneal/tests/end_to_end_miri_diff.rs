@@ -19,14 +19,14 @@
 //! 2. Full 77-test differential execution (`run_miri_diff_suite`):
 //!    - Captures MIR from `tests/miri-diff/corpus` with Miri-matching flags
 //!      (`-Zmir-opt-level=0 -C debug-assertions=off -C overflow-checks=on`).
-//!    - Proves `TotalVerificationResult` for all 29 non-bug `pass` tests.
+//!    - Proves `TotalVerificationResult` for all 32 non-bug `pass` tests.
 //!    - Proves `StatefulVerificationResult` (`post := False`) and
 //!      `¬ TotalClaim.holds` for all 9 non-bug `panic` tests.
 //!    - Proves `¬ StatefulClaim.holds ∧ ¬ TotalClaim.holds` via
 //!      `refuteMirPointByStrictUB` and verifies Miri UB fault locations via
-//!      `MiriOracleProbe.lean` for all 27 non-bug `ub` tests.
+//!      `MiriOracleProbe.lean` for all 28 non-bug `ub` tests.
 //!    - Enforces `evalMirDiffTagBounded` / `probeMirDiffExecBounded` equality
-//!      ratchets for all 12 open Anneal bugs (`[tests.known_anneal_bug]`).
+//!      ratchets for all 8 open Anneal bugs (`[tests.known_anneal_bug]`).
 //!    - Runs `trusted/audit/TrustedBoundary.lean` in `verify-audit` mode
 //!      (statement-origin isolation, zero `sorryAx`, zero `axiom`, and full
 //!      Lean 4 kernel replay at `trustLevel := 0`).
@@ -36,7 +36,10 @@
 //!    - Verifies that reintroducing any fixed `known_anneal_bug` ratchet
 //!      (`pass_uninit_union_write_then_read`, `pass_ref_array_elem_temp_index`,
 //!      `tb_child_write_then_parent_read`, `tb_child_write_then_parent_write`,
-//!      or `safe_reborrow_then_parent_write`) fails to build in Lake.
+//!      `safe_reborrow_then_parent_write`, `pass_exact_div_valid`,
+//!      `ub_exact_div_non_multiple`,
+//!      `pass_copy_nonoverlapping_uninit_bytes_to_uninit`, or
+//!      `pass_tb_unsafe_cell_shared_mutation`) fails to build in Lake.
 //!    - Verifies that reintroducing a stale `ub_location_mismatch` ratchet on
 //!      `ub_tb_use_frozen_mut_after_parent_read` (`src/lib.rs:606:23: 606:28`)
 //!      fails to build in Lake.
@@ -125,7 +128,7 @@ fn miri_diff_manifest_validation_rejects_stale_bugs_and_bad_paths() {
         .iter()
         .filter(|t| t.known_anneal_bug.is_some())
         .count();
-    assert_eq!(bug_count, 12);
+    assert_eq!(bug_count, 8);
 
     // Every `ub` test must have `miri_ub_span` recorded, and no non-`ub` test
     // may have `miri_ub_span`.
@@ -412,12 +415,12 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
 
     let report = run_miri_diff_suite(&config).expect("77-test Miri differential suite must pass");
     assert_eq!(report.total_tests, 77);
-    assert_eq!(report.verified_pass_count, 29);
+    assert_eq!(report.verified_pass_count, 32);
     assert_eq!(report.verified_panic_count, 9);
-    assert_eq!(report.verified_strict_ub_count, 27);
-    assert_eq!(report.ratcheted_known_bug_count, 12);
-    // 29 pass + 9 panic + 1 helper (`helper_add_ten`) = 39 certificate modules
-    assert_eq!(report.audited_certificate_modules.len(), 39);
+    assert_eq!(report.verified_strict_ub_count, 28);
+    assert_eq!(report.ratcheted_known_bug_count, 8);
+    // 32 pass + 9 panic + 1 helper (`helper_add_ten`) = 42 certificate modules
+    assert_eq!(report.audited_certificate_modules.len(), 42);
 
     let summary = render_miri_diff_report(&report);
     assert!(summary.contains("Total corpus tests:              77"));
@@ -428,72 +431,147 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
 
     // Negative check 1: `refuteMirPointByStrictUB` must reject an item that
     // stops on `externalCall` (or normal return) rather than `FailureKind.ub`.
-    let fake_ub_entry = MiriDiffTestEntry {
-        name: "pass_exact_div_valid".to_string(),
-        category: "scalar_arithmetic".to_string(),
-        upstream_path: "tests/pass/intrinsics/integer.rs".to_string(),
-        miri_verdict: MiriDiffVerdictSpec::Ub,
-        miri_ub_span: Some(
-            SourcePos::parse_rustc_pos("src/lib.rs:58:14").expect("parse fake miri_ub_span"),
+    for (non_ub_name, non_ub_cat, non_ub_path) in [
+        (
+            "pass_direct_fn_call",
+            "control_flow_and_calls",
+            "tests/pass/calls.rs",
         ),
-        fuel: 128,
-        known_anneal_bug: None,
-    };
-    let (fake_ub_lean, _) = render_miri_diff_verify_module(
-        "MiriDiffCorpus",
-        "miri_diff_corpus::pass_exact_div_valid",
-        &fake_ub_entry,
-    )
-    .expect("render fake strict UB module");
-    fs::write(verify_dir.join("pass_exact_div_valid.lean"), fake_ub_lean)
-        .expect("write fake strict UB module");
-    let strict_ub_res = run_lake_verify_targets(
-        &dot_anneal,
-        &["Verify.MiriDiffCorpus.pass_exact_div_valid".to_string()],
-    );
-    assert!(
-        strict_ub_res.is_err(),
-        "refuteMirPointByStrictUB must reject non-UB externalCall outcome"
-    );
+        (
+            "pass_exact_div_valid",
+            "scalar_arithmetic",
+            "tests/pass/intrinsics/integer.rs",
+        ),
+    ] {
+        let orig_path = verify_dir.join(format!("{non_ub_name}.lean"));
+        let orig_content = fs::read_to_string(&orig_path).expect("read original verify module");
+        let fake_ub_entry = MiriDiffTestEntry {
+            name: non_ub_name.to_string(),
+            category: non_ub_cat.to_string(),
+            upstream_path: non_ub_path.to_string(),
+            miri_verdict: MiriDiffVerdictSpec::Ub,
+            miri_ub_span: Some(
+                SourcePos::parse_rustc_pos("src/lib.rs:58:14").expect("parse fake miri_ub_span"),
+            ),
+            fuel: 128,
+            known_anneal_bug: None,
+        };
+        let (fake_ub_lean, _) = render_miri_diff_verify_module(
+            "MiriDiffCorpus",
+            &format!("miri_diff_corpus::{non_ub_name}"),
+            &fake_ub_entry,
+        )
+        .expect("render fake strict UB module");
+        fs::write(&orig_path, fake_ub_lean).expect("write fake strict UB module");
+        let strict_ub_res = run_lake_verify_targets(
+            &dot_anneal,
+            &[format!("Verify.MiriDiffCorpus.{non_ub_name}")],
+        );
+        fs::write(&orig_path, orig_content).expect("restore original verify module");
+        assert!(
+            strict_ub_res.is_err(),
+            "refuteMirPointByStrictUB must reject non-UB outcome on `{non_ub_name}`"
+        );
+    }
 
-    // Negative check 2: Reintroducing either fixed `known_anneal_bug` ratchet
-    // (`pass_uninit_union_write_then_read` or `pass_ref_array_elem_temp_index`
-    // claiming `observed_anneal_tag = Ub`) must fail to compile in Lake.
-    for (fixed_name, category, upstream_path, bits, size_bytes) in [
+    // Negative check 2: Reintroducing any fixed `known_anneal_bug` ratchet
+    // must fail to compile in Lake.
+    for (fixed_name, category, upstream_path, miri_verdict, miri_ub_span, stale_tag) in [
         (
             "pass_uninit_union_write_then_read",
             "uninitialized_memory_and_padding",
             "tests/pass/uninit_byte_read.rs",
-            0xAABBCCDDu128,
-            4u32,
+            MiriDiffVerdictSpec::PassScalar {
+                bits: 0xAABBCCDDu128,
+                size_bytes: 4,
+            },
+            None,
+            MiriDiffVerdictSpec::Ub,
         ),
         (
             "pass_ref_array_elem_temp_index",
             "arrays_slices_and_indexing",
             "tests/pass/arrays.rs",
-            25u128,
-            4u32,
+            MiriDiffVerdictSpec::PassScalar {
+                bits: 25,
+                size_bytes: 4,
+            },
+            None,
+            MiriDiffVerdictSpec::Ub,
         ),
         (
             "tb_child_write_then_parent_read",
             "tree_borrows",
             "tests/pass/tree_borrows/reserved.rs",
-            1u128,
-            4u32,
+            MiriDiffVerdictSpec::PassScalar {
+                bits: 1,
+                size_bytes: 4,
+            },
+            None,
+            MiriDiffVerdictSpec::Ub,
         ),
         (
             "tb_child_write_then_parent_write",
             "tree_borrows",
             "tests/pass/tree_borrows/reserved.rs",
-            3u128,
-            4u32,
+            MiriDiffVerdictSpec::PassScalar {
+                bits: 3,
+                size_bytes: 4,
+            },
+            None,
+            MiriDiffVerdictSpec::Ub,
         ),
         (
             "safe_reborrow_then_parent_write",
             "tree_borrows",
             "tests/pass/tree_borrows/reborrow-is-read.rs",
-            7u128,
-            4u32,
+            MiriDiffVerdictSpec::PassScalar {
+                bits: 7,
+                size_bytes: 4,
+            },
+            None,
+            MiriDiffVerdictSpec::Ub,
+        ),
+        (
+            "pass_exact_div_valid",
+            "scalar_arithmetic",
+            "tests/pass/intrinsics/integer.rs",
+            MiriDiffVerdictSpec::PassScalar {
+                bits: 12,
+                size_bytes: 4,
+            },
+            None,
+            MiriDiffVerdictSpec::ExternalCall("core::intrinsics::exact_div".to_string()),
+        ),
+        (
+            "ub_exact_div_non_multiple",
+            "scalar_arithmetic",
+            "tests/fail/intrinsics/exact_div1.rs",
+            MiriDiffVerdictSpec::Ub,
+            Some(SourcePos::parse_rustc_pos("src/lib.rs:248:14").expect("parse miri_ub_span")),
+            MiriDiffVerdictSpec::ExternalCall("core::intrinsics::exact_div".to_string()),
+        ),
+        (
+            "pass_copy_nonoverlapping_uninit_bytes_to_uninit",
+            "uninit_and_padding",
+            "tests/pass/move-uninit-primval.rs",
+            MiriDiffVerdictSpec::PassScalar {
+                bits: 5,
+                size_bytes: 4,
+            },
+            None,
+            MiriDiffVerdictSpec::Ub,
+        ),
+        (
+            "pass_tb_unsafe_cell_shared_mutation",
+            "tree_borrows",
+            "tests/pass/both_borrows/interior_mutability.rs",
+            MiriDiffVerdictSpec::PassScalar {
+                bits: 42,
+                size_bytes: 4,
+            },
+            None,
+            MiriDiffVerdictSpec::Ub,
         ),
     ] {
         let orig_path = verify_dir.join(format!("{fixed_name}.lean"));
@@ -502,13 +580,13 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
             name: fixed_name.to_string(),
             category: category.to_string(),
             upstream_path: upstream_path.to_string(),
-            miri_verdict: MiriDiffVerdictSpec::PassScalar { bits, size_bytes },
-            miri_ub_span: None,
+            miri_verdict,
+            miri_ub_span,
             fuel: 128,
             known_anneal_bug: Some(KnownAnnealBugSpec {
                 status: "open_bug".to_string(),
                 bug_class: "completeness_false_positive_ub".to_string(),
-                observed_anneal_tag: MiriDiffVerdictSpec::Ub,
+                observed_anneal_tag: stale_tag,
                 observed_anneal_ub_span: None,
                 suspected_component: "Trusted.Rustc.V2026_06_01.MirSemantics".to_string(),
                 summary: "Reintroduced stale bug ratchet must fail.".to_string(),

@@ -551,11 +551,20 @@ pub fn pass_ptr_offset_within_array() -> u32 {
 pub fn canary_external_call_exact_div() -> u32 {
     unsafe { exact_div(20u32, 4u32) }
 }
+
+#[inline(never)]
+fn unlinked_helper_ten() -> u32 {
+    10
+}
+
+pub fn canary_external_call_unlinked_helper() -> u32 {
+    unlinked_helper_ten()
+}
 ";
     fs::write(corpus_root.join("src/lib.rs"), lib_rs).expect("write src/lib.rs");
 
     let discovered = discover_zero_arg_pub_fns(lib_rs);
-    assert_eq!(discovered.len(), 12);
+    assert_eq!(discovered.len(), 13);
     let items: Vec<OracleItemSpec> = discovered
         .into_iter()
         .map(OracleItemSpec::new)
@@ -576,9 +585,10 @@ pub fn canary_external_call_exact_div() -> u32 {
     let report = run_difftest_oracle_pipeline(&config, &items)
         .expect("run Miri + Anneal oracle pipeline on canary corpus");
 
-    // 10 Agree (5 base canaries + 5 Tree Borrows parent/child items)
+    // 11 Agree (5 base canaries + 5 Tree Borrows parent/child items
+    // + `canary_external_call_exact_div`, interpreted inline since I-11)
     // + 1 Diverge (`pass_ptr_offset_within_array`)
-    // + 1 NotCompared (`canary_external_call_exact_div`) = 12
+    // + 1 NotCompared (`canary_external_call_unlinked_helper`) = 13
     for item in &report.items {
         println!(
             "ORACLE_CANARY\t{}\tmiri={}\tanneal={}\tverdict={:?}\tkernel_confirmed={}",
@@ -589,8 +599,8 @@ pub fn canary_external_call_exact_div() -> u32 {
             item.kernel_confirmed
         );
     }
-    assert_eq!(report.items.len(), 12);
-    assert_eq!(report.agree_count, 10);
+    assert_eq!(report.items.len(), 13);
+    assert_eq!(report.agree_count, 11);
     assert_eq!(report.diverge_count, 1);
     assert_eq!(report.not_compared_count, 1);
     let confirm_path = report
@@ -710,13 +720,25 @@ pub fn canary_external_call_exact_div() -> u32 {
         })
     );
 
-    // Verify the external-call item is NotCompared (never Agree):
-    let ext_call = report.item("canary_external_call_exact_div").unwrap();
+    // Verify `exact_div` is now interpreted inline and agrees with Miri on the
+    // exact quotient (20 / 4 = 5):
+    let exact_div_item = report.item("canary_external_call_exact_div").unwrap();
+    assert_eq!(exact_div_item.verdict, ComparisonVerdict::Agree);
+    assert_eq!(
+        exact_div_item.anneal,
+        AnnealOutcome::PassScalar {
+            bits: 5,
+            size_bytes: 4
+        }
+    );
+
+    // Verify the unlinked external-call item is NotCompared (never Agree):
+    let ext_call = report.item("canary_external_call_unlinked_helper").unwrap();
     assert!(!ext_call.verdict.is_agree());
     assert_eq!(
         ext_call.verdict,
         ComparisonVerdict::NotCompared(NotComparedReason::ExternalCall(
-            "core::intrinsics::exact_div".to_string()
+            "canary_corpus::unlinked_helper_ten".to_string()
         ))
     );
 

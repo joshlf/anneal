@@ -74,9 +74,7 @@ Lean 4 kernel replay at `trustLevel := 0`).
 | Soundness (false negative on UB) | `MirSemantics.Places` / `Operands` | `ub_ptr_offset_oob_read`, `ub_ptr_offset_oob_write`, `ub_ptr_offset_negative_before_start`, `ub_unaligned_ptr_read_u32` | `BinOp.offset` updates `ProvenancePtr.offsetBytes` without checking allocation bounds or negative wrapping, and `readPlace`/`writePlaceValue` ignore `ptr.offsetBytes` and pointer alignment. |
 | Soundness (false negative on UB) | `MirSemantics.Places` | `ub_transmute_invalid_bool_through_ptr` | Writing `3u8` through `*mut u8` cast from `&mut bool` stores an out-of-range scalar into the `bool` local without re-checking `[0, 1]` validity on write or subsequent read. |
 | Completeness (wrong return value) | `MirSemantics.Places` | `pass_ptr_offset_within_array` | `readPlace` ignores `ProvenancePtr.offsetBytes` after `BinOp.offset`, reading field 0 instead of field 1. |
-| Completeness (false-positive UB) | `MirSemantics.Places` | `pass_copy_nonoverlapping_uninit_bytes_to_uninit` | Union storage for `Uninit<[u8; 4]>` is represented as a 1-field `.unit` aggregate rather than union byte storage, causing `copy_nonoverlapping` on union fields to fault with `.ub`. |
-| Completeness (false-positive UB) | `MirSemantics.Memory` | `pass_tb_unsafe_cell_shared_mutation` | `BorrowKind.shared` unconditionally assigns Tree Borrows `Permission.frozen` without checking for `UnsafeCell` (`!Freeze` interior mutability). |
-| Incompleteness (unmodeled intrinsic / call) | `MirSemantics.Terminators` / `Memory` | `pass_exact_div_valid`, `ub_exact_div_non_multiple`, `pass_direct_fn_call`, `panic_explicit_macro` | `core::intrinsics::exact_div` and `core::panicking::panic_fmt` are not yet interpreted in `evalCallTerminator`, and `initMachineState` leaves `Memory.callees` empty by default. |
+| Incompleteness (unmodeled intrinsic / call) | `MirSemantics.Terminators` / `Memory` | `pass_direct_fn_call`, `panic_explicit_macro` | `core::panicking::panic_fmt` is not yet interpreted in `evalCallTerminator`, and `initMachineState` leaves `Memory.callees` empty by default. |
 
 ## Running the Suite
 

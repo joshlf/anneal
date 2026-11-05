@@ -87,7 +87,7 @@ fn miri_identity_batch_reproduces_corpus_divergences_and_coverage() {
     assert!(stdout.contains("- **Oracle comparison**: PERFORMED"));
     assert!(stdout.contains("## `NotCompared` Coverage Table"));
     assert!(stdout.contains("### Unmodeled External Calls"));
-    assert!(stdout.contains("| `core::intrinsics::exact_div` | 2 |"));
+    assert!(!stdout.contains("`core::intrinsics::exact_div`"));
     assert!(stdout.contains("| `miri_diff_corpus::helper_add_ten` | 1 |"));
 
     let verify = Command::new("python3")
@@ -107,15 +107,15 @@ assert data["mode"] == "identity"
 assert data["total_candidates"] == 77
 assert data["compiled_candidates"] == 77
 assert data["compile_failed_candidates"] == 0
-assert data["compared_candidates"] == 73
-assert data["agree_count"] == 65
-assert data["diverge_count"] == 8
-assert data["kernel_confirmed_divergences"] == 8
-assert data["not_compared_count"] == 4
+assert data["compared_candidates"] == 75
+assert data["agree_count"] == 69
+assert data["diverge_count"] == 6
+assert data["kernel_confirmed_divergences"] == 6
+assert data["not_compared_count"] == 2
 
 div_classes = data["divergence_classes"]
 assert div_classes == {
-    "false_positive_ub": 2,
+    "false_positive_ub": 0,
     "missed_ub": 5,
     "panic_site_mismatch": 0,
     "panic_vs_return": 0,
@@ -128,26 +128,25 @@ nc = data["not_compared_reasons"]
 assert nc == {
     "capture_failed": 0,
     "compile_failed": 0,
-    "external_call": 4,
+    "external_call": 2,
     "miri_oracle_error": 0,
     "out_of_fuel": 0,
     "unsupported": 0,
 }, f"unexpected not_compared_reasons: {nc}"
 
 ext = data["unmodeled_external_calls"]
-assert ext.get("core::intrinsics::exact_div") == 2, f"unexpected ext: {ext}"
+assert "core::intrinsics::exact_div" not in ext, f"unexpected ext: {ext}"
+assert ext.get("core::fmt::Arguments::<'a>::from_str") == 1, f"unexpected ext: {ext}"
 assert ext.get("miri_diff_corpus::helper_add_ten") == 1, f"unexpected ext: {ext}"
-assert sum(ext.values()) == 4, f"unexpected ext sum: {ext}"
+assert sum(ext.values()) == 2, f"unexpected ext sum: {ext}"
 
 expected_findings = {
     "ub_transmute_invalid_bool_through_ptr": "missed_ub",
-    "pass_copy_nonoverlapping_uninit_bytes_to_uninit": "false_positive_ub",
     "pass_ptr_offset_within_array": "wrong_value",
     "ub_ptr_offset_oob_read": "missed_ub",
     "ub_ptr_offset_oob_write": "missed_ub",
     "ub_ptr_offset_negative_before_start": "missed_ub",
     "ub_unaligned_ptr_read_u32": "missed_ub",
-    "pass_tb_unsafe_cell_shared_mutation": "false_positive_ub",
 }
 
 manifest = tomllib.loads(manifest_path.read_text())
@@ -166,10 +165,10 @@ manifest_ext = {
     if "known_anneal_bug" in t
     and t["known_anneal_bug"].get("observed_anneal_tag", "").startswith("externalCall:")
 }
-assert len(manifest_ext) == 4, f"expected 4 externalCall entries in manifest, got {manifest_ext}"
+assert len(manifest_ext) == 2, f"expected 2 externalCall entries in manifest, got {manifest_ext}"
 
 findings = data["findings"]
-assert len(findings) == 8
+assert len(findings) == 6
 actual_map = {f["fn_name"]: f["divergence_class"] for f in findings}
 assert actual_map == expected_findings, f"mismatch: {actual_map} vs {expected_findings}"
 

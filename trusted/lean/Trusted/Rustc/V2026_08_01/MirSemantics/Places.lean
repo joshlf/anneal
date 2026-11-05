@@ -2461,6 +2461,12 @@ Tree Borrows modeling in `Rvalue.use`, `Rvalue.copyForDeref`, `Rvalue.ref`, and
   writes to the root local carry `writerTag = .none` (which is foreign to all
   borrow tags rather than a parent tag in `mem.borrows`), whereas two-phase root
   borrows (`.ref (.mut true) local`) start in `TreeBorrowPerm.reserved`.
+- Raw pointer creation (`.rawPtr mutability place`) checks `placeIsFreeze
+  localDecls layouts place` when `mutability = .not` (preserving
+  `TreeBorrowPerm.reserved` for `!Freeze` interior-mutable pointees such as
+  `core::cell::UnsafeCell<T>` and inheriting `.reserved` from a `.reserved`
+  parent on `.deref :: restProj`, matching `ReborrowSettings::new` returning
+  `None` for `PtrType::Raw` in MiniRust `spec/mem/tree_borrows/reborrow_settings.md`).
 
 Reference (The Rust Reference, "Negation operators"):
 <https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#negation-operators>
@@ -2661,7 +2667,10 @@ def evalRvalue
   | .rawPtr mutability place =>
     let perm :=
       match mutability with
-      | .not => TreeBorrowPerm.frozen
+      | .not =>
+        match placeIsFreeze localDecls layouts place with
+        | true => TreeBorrowPerm.frozen
+        | false => TreeBorrowPerm.reserved
       | .mut => TreeBorrowPerm.active
     match place.projection with
     | .deref :: restProj =>
@@ -2681,11 +2690,15 @@ def evalRvalue
                 match parentEntry.targetProjection with
                 | .nil => resolvedProj
                 | ph :: pt => ph :: appendProjections pt resolvedProj
+              let rawPerm :=
+                match mutability, parentEntry.perm with
+                | .not, .reserved => TreeBorrowPerm.reserved
+                | _, _ => perm
               let entry : BorrowEntry := {
                 tag := tag
                 targetLocal := parentEntry.targetLocal
                 targetProjection := fullProj
-                perm := perm
+                perm := rawPerm
                 rangeOffset := parentEntry.rangeOffset
                 rangeLen := parentEntry.rangeLen
                 parentTag := .some parentPtr.tag
