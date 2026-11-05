@@ -1,0 +1,26 @@
+# Copyright 2026 The Fuchsia Authors
+#
+# Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+# <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+# license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+# This file may not be copied, modified, or distributed except according to
+# those terms.
+
+37f780b6257d0bc99fd5d7d3d0a1f16d168ef066a2a01466f4076f080d3425d2  trusted/lean/foundation-lock.json
+c7f5a40791753d613032f3303aa575b880e7460c11da390803f81704e17940a8  trusted/lean/Trusted/Refinement.lean
+fe96e20d5c8b25ed78687d1638b4c85bd2ff53f2b0b44787a04a6bb95bd6c68c  trusted/lean/Trusted/StepResult.lean
+cff4e5e8963f5be42fed3bd24fcb26d83d126c8b70506d86012c730661a8e6ea  trusted/lean/Trusted/MirAst.lean
+3480f2e9e8fbfd0339f93ed8f07f399f1baa253dd249eee9857bb83ed97536e3  trusted/lean/Trusted/MirSemantics.lean
+5f5aa4633cf9c11cb27b263b98635174c5a580a51c46e48a33d3dbe4594ec1f0  trusted/lean/Trusted.lean
+a38007a748154117c7986fe64838c11fd50c39567f80d22a340a721844f2cf86  theory/Anneal/Refinement.lean
+523c3170ed937aefbc190d1885193479225c0e3a8f82fc4d707b57ef3fe07636  theory/Anneal/StepResult.lean
+459c243502f59d95b2de507db47448e836bab81a4c9fbacb0be00e1184f01803  theory/Anneal/Lowering.lean
+ba76d619f85a8bdea8f83c90de533542f50e698885fc49fd59bc345147e55876  theory/Anneal/MirLemmas.lean
+c9f7d7147dbe5a3e1dbc0003c44b6d0f99d182790c2b0b46ff41da09320f4777  theory/Anneal.lean
+738dd9161d44ec9c6e05d177d02b675e840a6373a7ea73e31298723c1381e8d7  trusted/rustc-capture/src/main.rs
+1d810dad2de522c22503c665112076f8b801efcfa7206fecd84fc542b50820f9  trusted/rustc-capture/src/hook.rs
+8c281dbcc050755f2df20283a59e51f6641b2e574c894b5aa0fa6423a3dea9c4  trusted/rustc-capture/src/extract.rs
+11613bdd035e6a477f292447a2d3c20e2885456858bda38fe421d9d1704d3f66  trusted/rustc-capture/src/items.rs
+267ae7f7407155384e2566d3b8b84b657a03bb8c715c48ee03b0a802d39e480d  trusted/rustc-capture/src/ir.rs
+981820430bdf4d4c1368f6c4910957df93fb11cf886bdd90017fa398c3b94e43  trusted/rustc-capture/src/lean.rs
+cf19c52df123b3e94dc79083f1301fbfd17aca95a5a5771c4bf93f7779c86d6e  trusted/rustc-capture/src/spec.rs
