@@ -1,50 +1,40 @@
 #!/usr/bin/env python3
 # Copyright 2026 The Fuchsia Authors
 #
-# Use of this source code is governed by a BSD-style license that can be
-# found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
+# Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+# https://www.apache.org/licenses/LICENSE-2.0>, the MIT license
+# <LICENSE-MIT or https://opensource.org/licenses/MIT>, or the BSD-2-Clause
+# license <LICENSE-BSD or https://opensource.org/license/bsd-2-clause>, at your
+# option. This file may not be copied, modified, or distributed except
+# according to those terms.
 
-"""Unified Anneal dual differential-testing campaign orchestrator.
+"""Anneal differential-testing campaign orchestrator.
 
-Shared entrypoint for Option A (dedicated Capsule + `/x20/` RPC sync) and
-Option B (Kokoro V2 / GCB).
+Runs `miri-difftest` (live Miri + Anneal MIR-in-Lean oracle with Lean 4 kernel
+confirmation) and `itree-difftest` under a campaign profile, validates red-flag
+vacuity checks, deduplicates and optionally quarantines divergence findings,
+updates the persistent campaign ledger, and writes Markdown, JSON, and JUnit
+XML reports.
 
-Responsibilities:
-1. Pull persistent differential-testing state (`campaign_ledger.json`,
-   `coverage_ratchet.json`, `quarantine.toml`, and existing `findings/`) from
-   shared `/x20/teams/anneal-agent/differential-testing/` using
-   `/usr/bin/fileutil --x20_force_client_creation_at_head` (never
-   `/google/data/rw/...` FUSE), or from a local `--state-dir` when running on
-   Kokoro V2 / local dev.
-2. Execute `miri-difftest` (`2.a` Anneal MIR Evaluator vs. `2.b` Miri Reference)
-   and `itree-difftest` (`2.a` Anneal `mirStatefulTree` vs. `2.c` Native
-   Instrumented Execution at `-O0` and `-O2`) under configurable campaign
-   profiles (`smoke`, `quick`, `nightly`, `weekend`), plus optional Lean 4
-   kernel `BatchVerify.lean` checks.
-3. For any divergence (or `--inject-synthetic-divergence` verification run),
-   produce a dual-audience reproducer bundle in
-   `findings/<date>_<fingerprint>/`:
-   - Human-oriented report (`(a)`): minimized compilable Rust snippet with line
-     numbers, concrete scalar/struct/schedule inputs, step-by-step execution
-     table showing the exact Rust statement where Anneal and the reference
-     oracle diverge, and a one-liner replay command.
-   - Agent-oriented report (`(b)`): `TraceReplayDiag` classification tag, exact
-     MIR fault coordinate `(BasicBlockIdx, StmtIdx)`, lowered Lean 4 `Mir.Body`
-     neighborhood, pre-state `Memory` & `LocalFrame` snapshot, expected vs.
-     actual `MirOutcome` / `AbstractByte` representation, and targeted symbolic
-     evaluator / lowering candidate file & function coordinates.
-4. Deduplicate findings by `SHA-256(harness, diag_tag, block_idx, stmt_idx,
-   mir_construct)` and filter known issues against `quarantine.toml`.
-5. Optionally emit Sponge/Test-Fusion-compatible JUnit XML (`--junit-xml`) for
-   zero-friction graduation from Option A to Option B (`ci/kokoro_diff_test.sh`).
+Exit status:
+  0  `miri-difftest` performed real oracle comparisons, passed all red-flag
+     vacuity checks, had oracle errors within threshold, and produced zero
+     unquarantined divergences (and `itree-difftest`, if enabled, did not fail);
+  1  internal error, such as a ledger that is not a valid JSON object;
+  2  invalid command line, harness crash, missing Miri/Lean toolchain,
+     malformed harness JSON, red-flag vacuity failure (`zero_compared_items`,
+     `impossible_wall_clock`, `identical_metrics_across_seeds`,
+     `oracle_not_invoked`), or oracle errors above `--max-oracle-errors`;
+  3  compile-only mode (`--compile-only`): neither harness crashed, and both
+     harnesses reported `"oracle_comparison": "not_performed"`;
+  4  one or more unquarantined divergences were detected by a live oracle run.
 """
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 import datetime
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -60,7 +50,63 @@ import xml.etree.ElementTree as ET
 
 FILEUTIL_BIN = "/usr/bin/fileutil"
 FILEUTIL_X20_FLAG = "--x20_force_client_creation_at_head"
-DEFAULT_X20_DIFF_TEST_URI = "/x20/teams/anneal-agent/differential-testing"
+
+EXIT_SUCCESS = 0
+EXIT_INTERNAL_ERROR = 1
+EXIT_HARNESS_FAILED = 2
+EXIT_NOT_EVALUATED = 3
+EXIT_DIVERGENCE_DETECTED = 4
+
+DEFAULT_MIN_ORACLE_ELAPSED_MS = 50.0
+DEFAULT_MAX_ORACLE_ERRORS = 0
+
+VALID_DIVERGENCE_CLASSES = (
+    "wrong_value",
+    "false_positive_ub",
+    "missed_ub",
+    "ub_location_mismatch",
+    "panic_vs_return",
+    "return_vs_panic",
+    "panic_site_mismatch",
+)
+
+VALID_NOT_COMPARED_REASONS = (
+    "compile_failed",
+    "capture_failed",
+    "miri_oracle_error",
+    "unsupported",
+    "out_of_fuel",
+    "external_call",
+)
+
+# Integer count keys that a harness JSON summary may carry.
+HARNESS_INT_KEYS = (
+    "batches",
+    "batch_size",
+    "total_candidates",
+    "compiled_candidates",
+    "compile_failed_candidates",
+    "compared_candidates",
+    "agree_count",
+    "diverge_count",
+    "not_compared_count",
+    "kernel_confirmed_divergences",
+    "unsafe_token_violations",
+    "opt_level_0_compiled",
+    "opt_level_2_compiled",
+    "opt_level_0_and_2_compiled",
+    "instrumented_compiled",
+)
+
+# Ledger keys that earlier compile-only versions of this runner dropped when
+# running without an oracle.
+OBSOLETE_LEDGER_KEYS = (
+    "total_miri_candidates_evaluated",
+    "total_itree_candidates_evaluated",
+    "total_itree_inputs_evaluated",
+    "cumulative_distinct_obs_paths",
+    "active_fingerprints",
+)
 
 
 @dataclass(frozen=True)
@@ -70,111 +116,55 @@ class CampaignProfile:
     miri_batch_size: int
     itree_batches: int
     itree_batch_size: int
-    itree_inputs_per_fn: int
-    run_lean_batch_verify: bool
 
 
 PROFILES: dict[str, CampaignProfile] = {
-    "smoke": CampaignProfile(
-        name="smoke",
-        miri_batches=2,
-        miri_batch_size=8,
-        itree_batches=2,
-        itree_batch_size=8,
-        itree_inputs_per_fn=50,
-        run_lean_batch_verify=False,
-    ),
-    "quick": CampaignProfile(
-        name="quick",
-        miri_batches=5,
-        miri_batch_size=32,
-        itree_batches=5,
-        itree_batch_size=32,
-        itree_inputs_per_fn=200,
-        run_lean_batch_verify=True,
-    ),
-    "nightly": CampaignProfile(
-        name="nightly",
-        miri_batches=25,
-        miri_batch_size=32,
-        itree_batches=25,
-        itree_batch_size=32,
-        itree_inputs_per_fn=400,
-        run_lean_batch_verify=True,
-    ),
-    "weekend": CampaignProfile(
-        name="weekend",
-        miri_batches=100,
-        miri_batch_size=32,
-        itree_batches=100,
-        itree_batch_size=32,
-        itree_inputs_per_fn=1000,
-        run_lean_batch_verify=True,
-    ),
+    "smoke": CampaignProfile("smoke", 2, 8, 2, 8),
+    "quick": CampaignProfile("quick", 5, 32, 5, 32),
+    "nightly": CampaignProfile("nightly", 25, 32, 25, 32),
+    "weekend": CampaignProfile("weekend", 100, 32, 100, 32),
 }
 
 
-@dataclass
-class ExecutionStepRow:
-    step_num: int
-    rust_line: int
-    rust_stmt: str
-    mir_coord: str
-    anneal_state: str
-    oracle_state: str
-    status: str  # "OK" or "DIVERGED"
+@dataclass(frozen=True)
+class RedFlagResult:
+    passed: bool
+    checks: dict[str, bool]
+    failure_reasons: list[str]
 
 
 @dataclass
-class DualAudienceFinding:
-    """Self-contained divergence record for both human readers and agents."""
-
+class DeduplicatedFinding:
     fingerprint: str
-    harness: str
-    seed_hex: str
-    mutator_chain: list[str]
-    created_utc: str
+    cause: str
+    seed_name: str
+    divergence_class: str
+    normalized_anneal_tag: str
     quarantined: bool
-    quarantine_reason: str | None
+    occurrences: int
+    primary_fn_name: str
+    primary_repro_path: str
+    all_repro_paths: list[str]
+    miri_outcome: str
+    anneal_outcome: str
+    kernel_confirmed: bool
 
-    # --- Section (a): Human-Readable Concrete Rust Reproducer & Step Table ---
-    title: str
-    function_name: str
-    minimized_rust_source: str
-    concrete_inputs_rust: str
-    raw_input_bytes_hex: str
-    env_schedule_summary: str
-    failing_rust_line: int
-    failing_rust_statement: str
-    human_summary: str
-    execution_steps: list[ExecutionStepRow]
-    one_liner_repro_cmd: str
-
-    # --- Section (b): Agent-Oriented MIR, State & Evaluator Fault Context ---
-    diag_tag: str
-    mir_fault_block_idx: int
-    mir_fault_stmt_idx: int
-    mir_construct_kind: str
-    lowered_lean_mir_snippet: str
-    pre_state_locals: dict[str, str]
-    pre_state_memory: list[dict[str, str]]
-    anneal_outcome_repr: str
-    reference_oracle_outcome_repr: str
-    suspect_subsystem_files: list[dict[str, str]]
-    agent_triage_brief: str = field(default="")
-
-
-def compute_fingerprint(
-    harness: str,
-    diag_tag: str,
-    block_idx: int,
-    stmt_idx: int,
-    mir_construct_kind: str,
-) -> str:
-    payload = (
-        f"{harness}|{diag_tag}|bb{block_idx}|stmt{stmt_idx}|{mir_construct_kind}"
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "fingerprint": self.fingerprint,
+            "cause": self.cause,
+            "seed_name": self.seed_name,
+            "divergence_class": self.divergence_class,
+            "normalized_anneal_tag": self.normalized_anneal_tag,
+            "quarantined": self.quarantined,
+            "occurrences": self.occurrences,
+            "primary_fn_name": self.primary_fn_name,
+            "primary_repro_path": self.primary_repro_path,
+            "all_repro_paths": list(self.all_repro_paths),
+            "miri_outcome": self.miri_outcome,
+            "anneal_outcome": self.anneal_outcome,
+            "kernel_confirmed": self.kernel_confirmed,
+        }
 
 
 def utc_now_iso() -> str:
@@ -194,742 +184,1142 @@ def has_x20_fileutil() -> bool:
     return os.path.isfile(FILEUTIL_BIN) and os.access(FILEUTIL_BIN, os.X_OK)
 
 
-def run_fileutil(
-    args: list[str], check: bool = False
-) -> subprocess.CompletedProcess[str]:
+def run_fileutil(args: list[str]) -> subprocess.CompletedProcess[str]:
     cmd = [FILEUTIL_BIN, FILEUTIL_X20_FLAG, *args]
-    return subprocess.run(cmd, text=True, capture_output=True, check=check)
+    return subprocess.run(cmd, text=True, capture_output=True, check=False)
 
 
-def sync_state_from_x20(x20_uri: str, local_state_dir: Path) -> None:
-    """Pulls mutable state files from `/x20/` via `fileutil` RPC."""
-    if not x20_uri or not has_x20_fileutil():
-        return
+def check_x20_uri(x20_uri: str) -> None:
     if x20_uri.startswith("/google/data/rw/"):
         raise ValueError(
             f"Refusing FUSE path `{x20_uri}`; always use `/x20/...` URIs with "
             f"`{FILEUTIL_BIN} {FILEUTIL_X20_FLAG}`."
         )
-    (local_state_dir / "state").mkdir(parents=True, exist_ok=True)
-    (local_state_dir / "reports").mkdir(parents=True, exist_ok=True)
-    (local_state_dir / "findings").mkdir(parents=True, exist_ok=True)
-
-    for rel in [
-        "state/campaign_ledger.json",
-        "state/coverage_ratchet.json",
-        "state/quarantine.toml",
-    ]:
-        src = f"{x20_uri.rstrip('/')}/{rel}"
-        dst = str(local_state_dir / rel)
-        run_fileutil(["cp", "-f", src, dst], check=False)
 
 
-def sync_state_to_x20(local_state_dir: Path, x20_uri: str) -> None:
-    """Uploads updated state, reports, and finding bundles to `/x20/`."""
+def sync_state_from_x20(x20_uri: str, state_dir: Path) -> None:
+    """Pulls the ledger from `/x20/` via `fileutil` RPC."""
     if not x20_uri or not has_x20_fileutil():
         return
-    if x20_uri.startswith("/google/data/rw/"):
-        raise ValueError(
-            f"Refusing FUSE path `{x20_uri}`; always use `/x20/...` URIs with "
-            f"`{FILEUTIL_BIN} {FILEUTIL_X20_FLAG}`."
-        )
+    check_x20_uri(x20_uri)
+    (state_dir / "state").mkdir(parents=True, exist_ok=True)
+    run_fileutil(
+        [
+            "cp",
+            "-f",
+            f"{x20_uri.rstrip('/')}/state/campaign_ledger.json",
+            str(state_dir / "state" / "campaign_ledger.json"),
+        ]
+    )
+
+
+def sync_state_to_x20(state_dir: Path, x20_uri: str, written: list[Path]) -> None:
+    """Uploads the files this run wrote under `state_dir` to `/x20/`.
+
+    Only `written` is uploaded, so stale files in a reused state directory are
+    never republished.
+    """
+    if not x20_uri or not has_x20_fileutil():
+        return
+    check_x20_uri(x20_uri)
     base = x20_uri.rstrip("/")
-    for subdir in ["state", "reports", "findings"]:
-        run_fileutil(["mkdir", "-p", f"{base}/{subdir}"], check=False)
-
-    for rel in [
-        "state/campaign_ledger.json",
-        "state/coverage_ratchet.json",
-        "state/quarantine.toml",
-    ]:
-        local_file = local_state_dir / rel
-        if local_file.is_file():
-            run_fileutil(
-                ["cp", "-f", str(local_file), f"{base}/{rel}"], check=False
-            )
-
-    reports_dir = local_state_dir / "reports"
-    if reports_dir.is_dir():
-        for rfile in sorted(reports_dir.glob("*")):
-            if rfile.is_file():
-                run_fileutil(
-                    [
-                        "cp",
-                        "-f",
-                        str(rfile),
-                        f"{base}/reports/{rfile.name}",
-                    ],
-                    check=False,
-                )
-
-    findings_dir = local_state_dir / "findings"
-    if findings_dir.is_dir():
-        for bundle_dir in sorted(findings_dir.iterdir()):
-            if bundle_dir.is_dir():
-                remote_bundle = f"{base}/findings/{bundle_dir.name}"
-                run_fileutil(["mkdir", "-p", remote_bundle], check=False)
-                for bfile in sorted(bundle_dir.iterdir()):
-                    if bfile.is_file():
-                        run_fileutil(
-                            [
-                                "cp",
-                                "-f",
-                                str(bfile),
-                                f"{remote_bundle}/{bfile.name}",
-                            ],
-                            check=False,
-                        )
+    created_dirs: set[str] = set()
+    for subdir in ["state", "reports"]:
+        remote_dir = f"{base}/{subdir}"
+        run_fileutil(["mkdir", "-p", remote_dir])
+        created_dirs.add(remote_dir)
+    for local_file in written:
+        rel = local_file.relative_to(state_dir)
+        remote_parent = f"{base}/{rel.parent}"
+        if remote_parent not in created_dirs:
+            run_fileutil(["mkdir", "-p", remote_parent])
+            created_dirs.add(remote_parent)
+        run_fileutil(["cp", "-f", str(local_file), f"{base}/{rel}"])
 
 
-DEFAULT_QUARANTINE_TOML = """# Known Anneal differential-testing divergences quarantined pending fix PRs.
-#
-# Each `[[quarantine]]` entry suppresses failure exit codes for a matching
-# `fingerprint` (or `(harness, diag_tag, mir_construct_kind)` tuple) while still
-# recording the finding in the campaign ledger.
-
-# Example:
-# [[quarantine]]
-# fingerprint = "0123456789abcdef"
-# reason = "Known saturating_mul i128 lowering gap tracked in PR #42"
-"""
-
-
-def ensure_default_state_files(local_state_dir: Path) -> None:
-    state_sub = local_state_dir / "state"
-    state_sub.mkdir(parents=True, exist_ok=True)
-    (local_state_dir / "reports").mkdir(parents=True, exist_ok=True)
-    (local_state_dir / "findings").mkdir(parents=True, exist_ok=True)
-
-    ledger_path = state_sub / "campaign_ledger.json"
+def load_ledger(ledger_path: Path) -> dict[str, Any]:
     if not ledger_path.is_file():
-        default_ledger = {
-            "next_miri_seed": "0x5eed0001",
-            "next_itree_seed": "0x5eed0002",
-            "total_campaigns_run": 0,
-            "total_miri_candidates_evaluated": 0,
-            "total_itree_candidates_evaluated": 0,
-            "total_itree_inputs_evaluated": 0,
-            "cumulative_distinct_obs_paths": 0,
-            "last_run_utc": None,
-            "active_fingerprints": [],
-        }
-        ledger_path.write_text(
-            json.dumps(default_ledger, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-
-    ratchet_path = state_sub / "coverage_ratchet.json"
-    if not ratchet_path.is_file():
-        default_ratchet = {
-            "updated_utc": None,
-            "distinct_mir_obs_paths_latest": 0,
-            "cumulative_distinct_obs_paths": 0,
-        }
-        ratchet_path.write_text(
-            json.dumps(default_ratchet, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-
-    quarantine_path = state_sub / "quarantine.toml"
-    if not quarantine_path.is_file():
-        quarantine_path.write_text(DEFAULT_QUARANTINE_TOML, encoding="utf-8")
-
-
-def load_quarantine_map(quarantine_toml_path: Path) -> dict[str, str]:
-    if not quarantine_toml_path.is_file():
         return {}
     try:
-        data = tomllib.loads(quarantine_toml_path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    entries = data.get("quarantine", [])
-    result: dict[str, str] = {}
-    if isinstance(entries, list):
-        for item in entries:
-            if isinstance(item, dict) and "fingerprint" in item:
-                fp = str(item["fingerprint"]).strip()
-                reason = str(
-                    item.get("reason", "Quarantined in quarantine.toml")
-                ).strip()
-                if fp:
-                    result[fp] = reason
-    return result
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ValueError(f"cannot read {ledger_path}: {e}") from e
+    if not isinstance(ledger, dict):
+        raise ValueError(f"{ledger_path} is not a JSON object")
+    return ledger
 
 
-def add_line_numbers(rust_code: str) -> str:
-    lines = rust_code.strip("\n").splitlines()
-    width = max(2, len(str(len(lines))))
-    return "\n".join(
-        f"{idx:>{width}} | {line}" for idx, line in enumerate(lines, start=1)
+def parse_seed_int(raw: str) -> int:
+    clean = raw.strip().replace("_", "")
+    if not clean:
+        raise ValueError("empty seed")
+    val = int(clean, 16) if clean.lower().startswith("0x") else int(clean, 10)
+    if val < 0 or val > 0xFFFF_FFFF_FFFF_FFFF:
+        raise ValueError(f"seed out of u64 range: {raw!r}")
+    return val
+
+
+def ledger_seed_int(ledger: dict[str, Any], key: str, default: str) -> int:
+    raw = ledger.get(key, default)
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        raise ValueError(f"ledger field {key!r} must be a seed string or integer")
+    if isinstance(raw, int):
+        if raw < 0 or raw > 0xFFFF_FFFF_FFFF_FFFF:
+            raise ValueError(f"ledger field {key!r} is out of u64 range")
+        return raw
+    return parse_seed_int(raw)
+
+
+def ledger_counter(ledger: dict[str, Any], key: str) -> int:
+    raw = ledger.get(key, 0)
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise ValueError(f"ledger field {key!r} must be a non-negative integer")
+    return raw
+
+
+def advance_seed(seed_val: int) -> int:
+    return (seed_val + 0x9E37_79B9) & 0xFFFF_FFFF
+
+
+def is_nonneg_int(val: Any) -> bool:
+    return not isinstance(val, bool) and isinstance(val, int) and val >= 0
+
+
+def is_int_map(val: Any, expected_keys: tuple[str, ...] | None = None) -> bool:
+    if not isinstance(val, dict):
+        return False
+    if expected_keys is not None and set(val.keys()) != set(expected_keys):
+        return False
+    return all(isinstance(k, str) and is_nonneg_int(v) for k, v in val.items())
+
+
+def run_harness(
+    repo_root: Path, bin_name: str, harness_args: list[str], json_path: Path
+) -> dict[str, Any] | None:
+    """Runs one harness binary; returns its JSON summary, or None on failure."""
+    cargo_bin = shutil.which("cargo") or os.path.expanduser("~/.cargo/bin/cargo")
+    cmd = [
+        cargo_bin,
+        "run",
+        "--quiet",
+        "--locked",
+        "--manifest-path",
+        str(repo_root / "crates" / "anneal-difftest" / "Cargo.toml"),
+        "--bin",
+        bin_name,
+        "--",
+        *harness_args,
+        "--output-json",
+        str(json_path),
+    ]
+    env = dict(os.environ)
+    env["ANNEAL_CALLER_PATH"] = env.get("PATH", "")
+    res = subprocess.run(
+        cmd, cwd=str(repo_root), env=env, text=True, capture_output=True
     )
+    if res.returncode != 0:
+        sys.stderr.write(f"{bin_name} failed (exit {res.returncode}):\n{res.stderr}\n")
+        return None
+    try:
+        summary = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        sys.stderr.write(f"{bin_name} produced unreadable JSON: {e}\n")
+        return None
+    if not isinstance(summary, dict):
+        sys.stderr.write(f"{bin_name} produced a non-object JSON summary\n")
+        return None
+    for key in HARNESS_INT_KEYS:
+        val = summary.get(key)
+        if val is not None and (isinstance(val, bool) or not isinstance(val, int)):
+            sys.stderr.write(f"{bin_name} produced non-integer {key}={val!r}\n")
+            return None
+    elapsed = summary.get("elapsed_ms")
+    if elapsed is not None and (
+        isinstance(elapsed, bool) or not isinstance(elapsed, (int, float))
+    ):
+        sys.stderr.write(f"{bin_name} produced non-numeric elapsed_ms={elapsed!r}\n")
+        return None
+    return summary
 
 
-def render_finding_markdown_section(
-    index: int, finding: DualAudienceFinding
-) -> str:
-    """Renders a dual-audience Human `(a)` + Agent `(b)` reproducer section."""
-    numbered_rust = add_line_numbers(finding.minimized_rust_source)
-
-    step_rows_md = []
-    for row in finding.execution_steps:
-        marker = "**DIVERGED**" if row.status == "DIVERGED" else row.status
-        step_rows_md.append(
-            f"| `{row.step_num}` | `L{row.rust_line}` | `{row.rust_stmt}` | "
-            f"`{row.mir_coord}` | `{row.anneal_state}` | "
-            f"`{row.oracle_state}` | {marker} |"
+def validate_performed_miri_summary(summary: dict[str, Any]) -> tuple[bool, str]:
+    """Checks that a `miri-difftest` summary claiming `performed` is complete."""
+    if summary.get("harness") != "miri-difftest":
+        return False, f"expected harness='miri-difftest', got {summary.get('harness')!r}"
+    if summary.get("oracle_comparison") != "performed":
+        return (
+            False,
+            f"expected oracle_comparison='performed', got {summary.get('oracle_comparison')!r}",
         )
-    steps_table = "\n".join(step_rows_md)
 
-    locals_rows = "\n".join(
-        f"| `{loc}` | `{val}` |"
-        for loc, val in finding.pre_state_locals.items()
+    req_ints = (
+        "batches",
+        "batch_size",
+        "total_candidates",
+        "compiled_candidates",
+        "compile_failed_candidates",
+        "compared_candidates",
+        "agree_count",
+        "diverge_count",
+        "not_compared_count",
+        "kernel_confirmed_divergences",
     )
-    mem_rows = "\n".join(
-        f"| `{m['alloc_id']}` | `{m['provenance_tag']}` | `{m['size_align']}` | "
-        f"`{m['abstract_bytes']}` |"
-        for m in finding.pre_state_memory
+    for k in req_ints:
+        if not is_nonneg_int(summary.get(k)):
+            return False, f"missing or invalid integer field {k!r}"
+
+    elapsed = summary.get("elapsed_ms")
+    if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
+        return False, "missing or invalid numeric field 'elapsed_ms'"
+
+    if not is_int_map(summary.get("miri_verdicts"), ("pass", "panic", "ub", "error")):
+        return False, "missing or invalid 'miri_verdicts' map"
+    if not is_int_map(
+        summary.get("anneal_outcomes"),
+        ("pass", "panic", "ub", "unsupported", "out_of_fuel", "external_call", "error"),
+    ):
+        return False, "missing or invalid 'anneal_outcomes' map"
+    if not is_int_map(summary.get("divergence_classes"), VALID_DIVERGENCE_CLASSES):
+        return False, "missing or invalid 'divergence_classes' map"
+    if not is_int_map(summary.get("not_compared_reasons"), VALID_NOT_COMPARED_REASONS):
+        return False, "missing or invalid 'not_compared_reasons' map"
+    if not is_int_map(summary.get("unmodeled_external_calls")):
+        return False, "missing or invalid 'unmodeled_external_calls' map"
+    if not is_int_map(summary.get("mutator_applications")):
+        return False, "missing or invalid 'mutator_applications' map"
+
+    findings = summary.get("findings")
+    if not isinstance(findings, list):
+        return False, "missing or invalid 'findings' list"
+    not_compared_prefixes = ("error:", "unsupported:", "out_of_fuel", "external_call:")
+    for idx, f in enumerate(findings):
+        if not isinstance(f, dict):
+            return False, f"finding[{idx}] is not a JSON object"
+        for str_key in (
+            "finding_id",
+            "fn_name",
+            "seed_name",
+            "divergence_class",
+            "miri_outcome",
+            "anneal_outcome",
+            "anneal_lean_tag",
+            "miri_excerpt",
+            "repro_path",
+        ):
+            val = f.get(str_key)
+            if not isinstance(val, str) or not val.strip():
+                return False, f"finding[{idx}] has missing or empty {str_key!r}"
+        if f["divergence_class"] not in VALID_DIVERGENCE_CLASSES:
+            return (
+                False,
+                f"finding[{idx}] has unknown divergence_class {f['divergence_class']!r}",
+            )
+        if f["miri_outcome"] == f["anneal_outcome"]:
+            return (
+                False,
+                f"finding[{idx}] is not a divergence: miri_outcome == anneal_outcome",
+            )
+        if f["miri_outcome"].startswith(not_compared_prefixes) or f[
+            "anneal_outcome"
+        ].startswith(not_compared_prefixes):
+            return (
+                False,
+                f"finding[{idx}] has a not-compared outcome instead of a divergence",
+            )
+        if not isinstance(f.get("kernel_confirmed"), bool):
+            return False, f"finding[{idx}] has non-boolean 'kernel_confirmed'"
+
+    return True, "ok"
+
+
+def miri_signature_for_seed_check(summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "miri_verdicts": dict(summary.get("miri_verdicts", {})),
+        "anneal_outcomes": dict(summary.get("anneal_outcomes", {})),
+        "mutator_applications": dict(summary.get("mutator_applications", {})),
+    }
+
+
+def evaluate_miri_red_flags(
+    summary: dict[str, Any],
+    miri_seed: int,
+    ledger: dict[str, Any],
+    min_oracle_elapsed_ms: float,
+    max_oracle_errors: int,
+) -> RedFlagResult:
+    """Runs red-flag vacuity checks on a `miri-difftest` oracle summary."""
+    reasons: list[str] = []
+
+    total = int(summary["total_candidates"])
+    compiled = int(summary["compiled_candidates"])
+    compile_failed = int(summary["compile_failed_candidates"])
+    compared = int(summary["compared_candidates"])
+    agreed = int(summary["agree_count"])
+    diverged = int(summary["diverge_count"])
+    not_compared = int(summary["not_compared_count"])
+    kernel_confirmed = int(summary["kernel_confirmed_divergences"])
+    elapsed_ms = float(summary["elapsed_ms"])
+
+    miri_verdicts: dict[str, int] = summary["miri_verdicts"]
+    anneal_outcomes: dict[str, int] = summary["anneal_outcomes"]
+    div_classes: dict[str, int] = summary["divergence_classes"]
+    nc_reasons: dict[str, int] = summary["not_compared_reasons"]
+    findings: list[dict[str, Any]] = summary["findings"]
+
+    # 1. Miri and Lean actually invoked and accounting consistent.
+    oracle_invoked = True
+    if compiled <= 0 or compiled + compile_failed != total:
+        oracle_invoked = False
+        reasons.append(
+            f"oracle_not_invoked: compiled ({compiled}) + compile_failed ({compile_failed}) != total ({total})"
+        )
+    if sum(miri_verdicts.values()) != compiled:
+        oracle_invoked = False
+        reasons.append(
+            f"oracle_not_invoked: sum(miri_verdicts)={sum(miri_verdicts.values())} != compiled ({compiled})"
+        )
+    if sum(anneal_outcomes.values()) != compiled:
+        oracle_invoked = False
+        reasons.append(
+            f"oracle_not_invoked: sum(anneal_outcomes)={sum(anneal_outcomes.values())} != compiled ({compiled})"
+        )
+    if compared + not_compared != total:
+        oracle_invoked = False
+        reasons.append(
+            f"oracle_not_invoked: compared ({compared}) + not_compared ({not_compared}) != total ({total})"
+        )
+    if agreed + diverged != compared:
+        oracle_invoked = False
+        reasons.append(
+            f"oracle_not_invoked: agree ({agreed}) + diverge ({diverged}) != compared ({compared})"
+        )
+    if sum(div_classes.values()) != diverged:
+        oracle_invoked = False
+        reasons.append(
+            f"oracle_not_invoked: sum(divergence_classes)={sum(div_classes.values())} != diverge_count ({diverged})"
+        )
+    if sum(nc_reasons.values()) != not_compared:
+        oracle_invoked = False
+        reasons.append(
+            f"oracle_not_invoked: sum(not_compared_reasons)={sum(nc_reasons.values())} != not_compared_count ({not_compared})"
+        )
+    if len(findings) != diverged or kernel_confirmed != diverged:
+        oracle_invoked = False
+        reasons.append(
+            f"oracle_not_invoked: findings ({len(findings)}) or kernel_confirmed ({kernel_confirmed}) != diverge_count ({diverged})"
+        )
+    miri_executed = (
+        int(miri_verdicts.get("pass", 0))
+        + int(miri_verdicts.get("panic", 0))
+        + int(miri_verdicts.get("ub", 0))
     )
-    suspect_rows = "\n".join(
-        f"- **`{s['layer']}`**: `{s['file']}` — `{s['symbol']}` ({s['reason']})"
-        for s in finding.suspect_subsystem_files
+    anneal_executed = (
+        int(anneal_outcomes.get("pass", 0))
+        + int(anneal_outcomes.get("panic", 0))
+        + int(anneal_outcomes.get("ub", 0))
     )
+    if (
+        miri_executed <= 0
+        or anneal_executed <= 0
+        or miri_executed < compared
+        or anneal_executed < compared
+    ):
+        oracle_invoked = False
+        reasons.append(
+            f"oracle_not_invoked: executed verdicts (miri={miri_executed}, "
+            f"anneal={anneal_executed}) must be > 0 and >= compared ({compared})"
+        )
+    if int(nc_reasons.get("compile_failed", 0)) != compile_failed:
+        oracle_invoked = False
+        reasons.append(
+            f"oracle_not_invoked: not_compared_reasons.compile_failed "
+            f"({nc_reasons.get('compile_failed')}) != compile_failed ({compile_failed})"
+        )
+    for f in findings:
+        repro_p = Path(f["repro_path"])
+        if not f.get("kernel_confirmed") or not repro_p.is_file():
+            oracle_invoked = False
+            reasons.append(
+                f"oracle_not_invoked: finding {f.get('finding_id')!r} missing "
+                f"kernel confirmation or repro.rs ({repro_p})"
+            )
 
-    quarantine_badge = (
-        f"QUARANTINED ({finding.quarantine_reason})"
-        if finding.quarantined
-        else "ACTIVE (Unquarantined)"
+    # 2. Non-zero compared items.
+    non_zero_compared = compared > 0
+    if not non_zero_compared:
+        reasons.append("zero_compared_items: compared_candidates is 0")
+
+    # 3. Plausible wall-clock time.
+    plausible_wall_clock = elapsed_ms >= min_oracle_elapsed_ms
+    if not plausible_wall_clock:
+        reasons.append(
+            f"impossible_wall_clock: elapsed_ms ({elapsed_ms:.2f} ms) < min_oracle_elapsed_ms ({min_oracle_elapsed_ms:.2f} ms)"
+        )
+
+    # 4. Seed sensitivity across consecutive distinct seeds.
+    seed_sensitive = True
+    seed_hex = f"0x{miri_seed:08x}"
+    prev_seed = ledger.get("last_miri_seed")
+    prev_sig = ledger.get("last_miri_signature")
+    cur_sig = miri_signature_for_seed_check(summary)
+    if (
+        summary.get("mode") != "identity"
+        and isinstance(prev_seed, str)
+        and prev_seed.lower() != seed_hex.lower()
+        and isinstance(prev_sig, dict)
+        and prev_sig == cur_sig
+    ):
+        seed_sensitive = False
+        reasons.append(
+            f"identical_metrics_across_seeds: seed {seed_hex} produced identical verdicts/outcomes/mutators to prior seed {prev_seed}"
+        )
+
+    # 5. Oracle error count within threshold.
+    oracle_errors = (
+        int(nc_reasons.get("miri_oracle_error", 0))
+        + int(nc_reasons.get("capture_failed", 0))
+        + int(miri_verdicts.get("error", 0))
+        + int(anneal_outcomes.get("error", 0))
     )
+    within_error_threshold = oracle_errors <= max_oracle_errors
+    if not within_error_threshold:
+        reasons.append(
+            f"oracle_errors_exceeded: {oracle_errors} oracle/capture errors > max_oracle_errors ({max_oracle_errors})"
+        )
 
-    return f"""### Finding {index}: `{finding.title}` (`{finding.fingerprint}`)
-
-- **Harness**: `{finding.harness}` | **Status**: **{quarantine_badge}**
-- **Seed**: `{finding.seed_hex}` | **Mutator Chain**: `{", ".join(finding.mutator_chain)}`
-- **Target Function**: `{finding.function_name}`
-
----
-
-#### (a) Human-Oriented Reproducer & Step-by-Step Execution Trace
-
-**Summary**: {finding.human_summary}
-
-**Minimized Compilable Rust Reproducer (`repro.rs`)**:
-```rust
-{numbered_rust}
-```
-
-**Concrete Failing Input & Environment Schedule**:
-- **Rust Input Binding**: `{finding.concrete_inputs_rust}`
-- **Raw Layout-Aware Input Bytes (`{len(bytes.fromhex(finding.raw_input_bytes_hex.replace(" ", "")))} B`)**: `{finding.raw_input_bytes_hex}`
-- **Reactive `EnvSchedule`**: `{finding.env_schedule_summary}`
-- **Failing Rust Source Line (`L{finding.failing_rust_line}`)**: `{finding.failing_rust_statement}`
-
-**Step-by-Step Concrete Execution Trace**:
-
-| Step | Rust Line | Concrete Rust Statement | MIR Coord | Anneal (`2.a`) State / Value | Reference Oracle (`2.b`/`2.c`) State / Value | Verdict |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-{steps_table}
-
-**One-Liner Local Reproduction Command**:
-```bash
-{finding.one_liner_repro_cmd}
-```
-
----
-
-#### (b) Agent-Oriented MIR Fault Coordinate, State Snapshot & Subsystem Localization
-
-- **`TraceReplayDiag` Classification**: `{finding.diag_tag}`
-- **Exact MIR Fault Coordinate**: `BasicBlockIdx = {finding.mir_fault_block_idx}`, `StmtIdx = {finding.mir_fault_stmt_idx}` (`bb{finding.mir_fault_block_idx}[{finding.mir_fault_stmt_idx}]`)
-- **Faulting MIR Construct**: `{finding.mir_construct_kind}`
-- **Anneal (`2.a`) Outcome**: `{finding.anneal_outcome_repr}`
-- **Reference Oracle (`2.b`/`2.c`) Outcome**: `{finding.reference_oracle_outcome_repr}`
-
-**Lowered Lean 4 `Mir.Body` Neighborhood (`bb{finding.mir_fault_block_idx}`)**:
-```lean
-{finding.lowered_lean_mir_snippet.strip()}
-```
-
-**Pre-Fault `LocalFrame` Snapshot (immediately before `bb{finding.mir_fault_block_idx}[{finding.mir_fault_stmt_idx}]`)**:
-
-| MIR Local (`Place`) | Decoded `Value` / `AbstractByte` Representation |
-| :--- | :--- |
-{locals_rows}
-
-**Pre-Fault `Memory` Allocation Snapshot**:
-
-| `AllocId` | `ProvenanceTag` (`TreeBorrows`) | `(size, align)` | `AbstractByte` Slice |
-| :--- | :--- | :--- | :--- |
-{mem_rows}
-
-**Suspect Anneal Subsystem Coordinates for Agent Triage**:
-{suspect_rows}
-
-**Agent Triage Brief**:
-> {finding.agent_triage_brief}
-"""
-
-
-def write_finding_bundle(
-    findings_root: Path,
-    date_prefix: str,
-    finding: DualAudienceFinding,
-) -> Path:
-    bundle_dir = findings_root / f"{date_prefix}_{finding.fingerprint}"
-    bundle_dir.mkdir(parents=True, exist_ok=True)
-
-    (bundle_dir / "repro.rs").write_text(
-        finding.minimized_rust_source.rstrip() + "\n", encoding="utf-8"
-    )
-    (bundle_dir / "mir_neighborhood.lean").write_text(
-        finding.lowered_lean_mir_snippet.rstrip() + "\n", encoding="utf-8"
-    )
-    (bundle_dir / "diag_agent_bundle.json").write_text(
-        json.dumps(asdict(finding), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    (bundle_dir / "README.md").write_text(
-        f"# Anneal Differential Testing Divergence Bundle `{finding.fingerprint}`\n\n"
-        + render_finding_markdown_section(1, finding),
-        encoding="utf-8",
-    )
-    return bundle_dir
-
-
-def build_synthetic_verification_findings(
-    quarantine_map: dict[str, str],
-) -> list[DualAudienceFinding]:
-    """Synthesizes two representative divergences (`miri-difftest` & `itree-difftest`)."""
-    now = utc_now_iso()
-
-    # 1. Synthetic `miri-difftest` divergence: Signed-to-Unsigned Cast Sign-Extension vs Zero-Extension
-    miri_tag = "step_faulted(FailureKind.unsoundness, bb0, stmt2)"
-    miri_bb = 0
-    miri_stmt = 2
-    miri_construct = (
-        "Rvalue.cast(CastKind.intToInt, Operand.copy(_1: i8), Ty.uint(U32))"
-    )
-    miri_fp = compute_fingerprint(
-        "miri-difftest", miri_tag, miri_bb, miri_stmt, miri_construct
-    )
-    miri_q_reason = quarantine_map.get(miri_fp)
-
-    miri_finding = DualAudienceFinding(
-        fingerprint=miri_fp,
-        harness="miri-difftest",
-        seed_hex="0xbad0c0de",
-        mutator_chain=["ArithmeticCastMutator", "PlaceProjectionWrapper"],
-        created_utc=now,
-        quarantined=miri_q_reason is not None,
-        quarantine_reason=miri_q_reason,
-        title="Signed `i8 as u32` Cast Sign-Extension Mismatch on Negative Input `-128_i8`",
-        function_name="difftest_signed_i8_to_u32_cast",
-        minimized_rust_source=(
-            "// Minimized by `anneal_difftest::shrink` (20 bytes -> 4 bytes, 3 statements -> 1 cast)\n"
-            "pub fn difftest_signed_i8_to_u32_cast(raw: i8) -> u32 {\n"
-            "    let widened: u32 = raw as u32;\n"
-            "    widened.wrapping_add(1)\n"
-            "}\n"
-        ),
-        concrete_inputs_rust="raw: i8 = -128 (0x80)",
-        raw_input_bytes_hex="80 a5 a5 a5",
-        env_schedule_summary="Pure closed-world execution (no external calls)",
-        failing_rust_line=3,
-        failing_rust_statement="let widened: u32 = raw as u32;",
-        human_summary=(
-            "Divergence in `difftest_signed_i8_to_u32_cast` at `(bb0, stmt[2])`: "
-            "In Rust, casting a negative signed integer (`raw: i8 = -128`, byte `0x80`) to a wider "
-            "unsigned integer (`u32`) performs two's-complement sign-extension first (`-128_i8 as i32 = 0xFFFF_FF80`) "
-            "before reinterpreting as `u32` (`4294967168`). In this synthetic fault, Anneal's MIR cast evaluator "
-            "zero-extended `0x80` directly to `0x0000_0080` (`128`), causing the returned `u32` to diverge (`129` vs `4294967169`)."
-        ),
-        execution_steps=[
-            ExecutionStepRow(
-                step_num=1,
-                rust_line=2,
-                rust_stmt="fn difftest_signed_i8_to_u32_cast(raw = -128_i8)",
-                mir_coord="bb0[0] (StorageLive(_2))",
-                anneal_state="_1 (raw) = Int(-128, i8) [0x80]",
-                oracle_state="_1 (raw) = -128_i8 [0x80]",
-                status="OK",
-            ),
-            ExecutionStepRow(
-                step_num=2,
-                rust_line=3,
-                rust_stmt="let widened: u32 = raw as u32;",
-                mir_coord="bb0[2] (Assign(_2, Cast(IntToInt, _1, u32)))",
-                anneal_state="_2 (widened) = Uint(0x0000_0080, u32)",
-                oracle_state="_2 (widened) = 0xFFFF_FF80_u32",
-                status="DIVERGED",
-            ),
-            ExecutionStepRow(
-                step_num=3,
-                rust_line=4,
-                rust_stmt="widened.wrapping_add(1)",
-                mir_coord="bb0[term] (Call(wrapping_add, [_2, 1]))",
-                anneal_state="_0 (ret) = Uint(0x0000_0081, u32)",
-                oracle_state="_0 (ret) = 0xFFFF_FF81_u32",
-                status="DIVERGED",
-            ),
-        ],
-        one_liner_repro_cmd=(
-            "cargo run --manifest-path crates/anneal-difftest/Cargo.toml --bin miri-difftest -- --seed 0xbad0c0de"
-        ),
-        diag_tag=miri_tag,
-        mir_fault_block_idx=miri_bb,
-        mir_fault_stmt_idx=miri_stmt,
-        mir_construct_kind=miri_construct,
-        lowered_lean_mir_snippet=(
-            "-- Lowered Lean 4 MIR Neighborhood for `difftest_signed_i8_to_u32_cast`\n"
-            "def bb0 : BasicBlock := {\n"
-            "  statements := [\n"
-            "    Stmt.storageLive (LocalIdx.mk 2),\n"
-            "    Stmt.assign (Place.local 2) (Rvalue.use (Operand.copy (Place.local 1))),\n"
-            "    -- FAULT AT bb0[2]: Signed i8 -> u32 CastKind.intToInt\n"
-            "    Stmt.assign (Place.local 2)\n"
-            "      (Rvalue.cast CastKind.intToInt (Operand.copy (Place.local 1)) (Ty.uint UintTy.u32))\n"
-            "  ],\n"
-            "  terminator := TerminatorKind.return\n"
-            "}\n"
-        ),
-        pre_state_locals={
-            "_0 (return: u32)": "[uninit, uninit, uninit, uninit]",
-            "_1 (raw: i8)": "Value.scalar (ScalarValue.int (-128) IntTy.i8) [init(0x80, alloc=arg0)]",
-            "_2 (widened: u32)": "[uninit, uninit, uninit, uninit]",
-        },
-        pre_state_memory=[
-            {
-                "alloc_id": "AllocId(1)",
-                "provenance_tag": "Tag(0, SharedReadOnly)",
-                "size_align": "(size=4B, align=4B)",
-                "abstract_bytes": "[init(0x80, Tag(0)), pad(0xa5), pad(0xa5), pad(0xa5)]",
-            }
-        ],
-        anneal_outcome_repr="MirOutcome.returned (Value.uint 129 UintTy.u32) [81 00 00 00]",
-        reference_oracle_outcome_repr="MiriOutcome.Returned (0xFFFF_FF81 : u32) [81 ff ff ff]",
-        suspect_subsystem_files=[
-            {
-                "layer": "Lean 4 Operational Semantics (`2.a`)",
-                "file": "trusted/lean/Trusted/Rustc/V2026_06_01/Semantics/Rvalue.lean",
-                "symbol": "evalCastIntToInt",
-                "reason": "Inspect sign-extension vs. zero-extension when casting `Ty.int srcWidth` to `Ty.uint dstWidth` with `dstWidth > srcWidth`.",
-            },
-            {
-                "layer": "Lean 4 Symbolic Evaluator (`1.b`)",
-                "file": "theory/Anneal/Rustc/V2026_06_01/SymbolicEval.lean",
-                "symbol": "evalRvalueSym",
-                "reason": "Verify symbolic bitvector sign-extension rule matches concrete `evalCastIntToInt`.",
-            },
-        ],
-        agent_triage_brief=(
-            "Inspect `evalCastIntToInt` in `Semantics/Rvalue.lean`: when converting a signed integer "
-            "`ScalarValue.int v srcTy` with `v < 0` to `Ty.uint dstTy`, Rust's `as` cast semantics first "
-            "sign-extend `v` to `dstTy.bitWidth` bits and then reduce modulo `2 ^ dstTy.bitWidth`."
-        ),
-    )
-
-    # 2. Synthetic `itree-difftest` divergence: External Call Schedule Argument Mismatch
-    itree_tag = "call_arg_mismatch(DefPath('ext_oracle'), bb2)"
-    itree_bb = 2
-    itree_stmt = 0
-    itree_construct = (
-        "TerminatorKind.call(func=ext_oracle, args=[_3: u32], dest=_0, target=bb3)"
-    )
-    itree_fp = compute_fingerprint(
-        "itree-difftest", itree_tag, itree_bb, itree_stmt, itree_construct
-    )
-    itree_q_reason = quarantine_map.get(itree_fp)
-
-    itree_finding = DualAudienceFinding(
-        fingerprint=itree_fp,
-        harness="itree-difftest",
-        seed_hex="0xdeadbeef",
-        mutator_chain=["CallBoundaryOutliner", "ExtOracleInjector"],
-        created_utc=now,
-        quarantined=itree_q_reason is not None,
-        quarantine_reason=itree_q_reason,
-        title="External Call `MirCallE(ext_oracle)` Argument Mismatch Under Non-Zero Struct Padding",
-        function_name="kernel_step",
-        minimized_rust_source=(
-            "// Minimized by `anneal_difftest::shrink` (12 bytes -> 12 bytes, schedule horizon 4 -> 1)\n"
-            "#![forbid(unsafe_code)]\n"
-            "pub fn ext_oracle(query: u32) -> u32 {\n"
-            "    query.wrapping_mul(1664525).wrapping_add(1013904223)\n"
-            "}\n\n"
-            "pub fn kernel_step(magic: u32, payload_len: u32) -> u32 {\n"
-            "    if magic == 0x414E_4E4C {\n"
-            "        ext_oracle(magic ^ payload_len)\n"
-            "    } else {\n"
-            "        magic.wrapping_add(payload_len)\n"
-            "    }\n"
-            "}\n"
-        ),
-        concrete_inputs_rust="magic: u32 = 0x414E_4E4C, payload_len: u32 = 0x0000_0080",
-        raw_input_bytes_hex="4c 4e 4e 41 01 a5 5a ff 80 00 00 00",
-        env_schedule_summary="ext_oracle[call #0] -> ReturnBytes([0x2a, 0x00, 0x00, 0x00])",
-        failing_rust_line=9,
-        failing_rust_statement="ext_oracle(magic ^ payload_len)",
-        human_summary=(
-            "Divergence in `kernel_step` at external call boundary `bb2[term]`: "
-            "When `ItreeFrameInput` contains non-zero alignment padding bytes (`a5 5a ff` at offsets `5..8`), "
-            "native execution (`2.c`) passed `query = 0x414E_4ECC` (`magic ^ payload_len` using `payload_len` at offset 8), "
-            "whereas the synthetic mis-offset decoder read `payload_len` from unaligned offset 5 (`0xFF5A_A580`), "
-            "triggering `TraceReplayDiag.callArgMismatch` on `MirCallE(ext_oracle)`."
-        ),
-        execution_steps=[
-            ExecutionStepRow(
-                step_num=1,
-                rust_line=7,
-                rust_stmt="fn kernel_step(magic = 0x414E_4E4C, payload_len = 0x80)",
-                mir_coord="bb0[0] (EntryDecode)",
-                anneal_state="_1=0x414E_4E4C, _2=0x005A_A501 (misaligned offset)",
-                oracle_state="_1=0x414E_4E4C, _2=0x0000_0080 (offset 8)",
-                status="DIVERGED",
-            ),
-            ExecutionStepRow(
-                step_num=2,
-                rust_line=8,
-                rust_stmt="if magic == 0x414E_4E4C",
-                mir_coord="bb0[term] (SwitchInt(_1 == 0x414E4E4C -> bb2))",
-                anneal_state="MirObsE(tag = 1) -> bb2",
-                oracle_state="MirObsE(tag = 1) -> bb2",
-                status="OK",
-            ),
-            ExecutionStepRow(
-                step_num=3,
-                rust_line=9,
-                rust_stmt="ext_oracle(magic ^ payload_len)",
-                mir_coord="bb2[term] (MirCallE(ext_oracle, args=[_3]))",
-                anneal_state="MirCallE(ext_oracle, [0x4114_EB4D])",
-                oracle_state="MirCallE(ext_oracle, [0x414E_4ECC])",
-                status="DIVERGED",
-            ),
-        ],
-        one_liner_repro_cmd=(
-            "cargo run --manifest-path crates/anneal-difftest/Cargo.toml --bin itree-difftest -- --seed 0xdeadbeef"
-        ),
-        diag_tag=itree_tag,
-        mir_fault_block_idx=itree_bb,
-        mir_fault_stmt_idx=itree_stmt,
-        mir_construct_kind=itree_construct,
-        lowered_lean_mir_snippet=(
-            "-- Lowered Lean 4 MIR Neighborhood for `kernel_step` (`bb2`)\n"
-            "def bb2 : BasicBlock := {\n"
-            "  statements := [\n"
-            "    Stmt.assign (Place.local 3)\n"
-            "      (Rvalue.binaryOp BinOp.bitXor (Operand.copy (Place.local 1)) (Operand.copy (Place.local 2)))\n"
-            "  ],\n"
-            "  -- FAULT AT bb2[term]: MirCallE argument mismatch on `ext_oracle`\n"
-            "  terminator := TerminatorKind.call\n"
-            "    (DefPath.mk \"ext_oracle\")\n"
-            "    [Operand.move (Place.local 3)]\n"
-            "    (Place.local 0)\n"
-            "    (some (BasicBlockIdx.mk 3))\n"
-            "}\n"
-        ),
-        pre_state_locals={
-            "_1 (magic: u32)": "Value.uint 0x414E4E4C UintTy.u32 [4c 4e 4e 41]",
-            "_2 (payload_len: u32)": "Value.uint 0x005AA501 UintTy.u32 (expected 0x00000080 at ABI offset 8)",
-            "_3 (query: u32)": "Value.uint 0x4114EB4D UintTy.u32 (expected 0x414E4ECC)",
-        },
-        pre_state_memory=[
-            {
-                "alloc_id": "AllocId(0)",
-                "provenance_tag": "Tag(0, Unique)",
-                "size_align": "(size=12B, align=4B)",
-                "abstract_bytes": "[4c, 4e, 4e, 41, 01, pad(a5), pad(5a), pad(ff), 80, 00, 00, 00]",
-            }
-        ],
-        anneal_outcome_repr="TraceReplayDiag.callArgMismatch (DefPath.mk 'ext_oracle') (blockIdx := 2)",
-        reference_oracle_outcome_repr="RecordedEvent::ExtCall { callee: 'ext_oracle', call_index: 0, args: [[cc, 4e, 4e, 41]], ret: [2a, 00, 00, 00] }",
-        suspect_subsystem_files=[
-            {
-                "layer": "Lean 4 Byte-Level Trace Observer (`TraceCheck.lean`)",
-                "file": "theory/Anneal/Rustc/V2026_06_01/TraceCheck.lean",
-                "symbol": "decodeValueFromBytes / diagnoseRawByteTraceBounded",
-                "reason": "Check struct field byte offset table in `LayoutTable` when skipping non-zero inter-field alignment padding bytes (`offsets 5..8`).",
-            },
-            {
-                "layer": "Rust Charon -> Lean Lowering (`charon_to_lean.rs`)",
-                "file": "anneal/src/charon_to_lean.rs",
-                "symbol": "lower_adt_layout_table",
-                "reason": "Verify `repr(Rust)`/`repr(C)` field byte offsets emitted into `.anneal/generated/Mir/*.lean` match `rustc` layout calculation.",
-            },
-        ],
-        agent_triage_brief=(
-            "Inspect `decodeValueFromBytes` in `theory/Anneal/Rustc/V2026_06_01/TraceCheck.lean` and "
-            "`lower_adt_layout_table` in `anneal/src/charon_to_lean.rs`: ensure struct field decoding "
-            "indexes `rawBytes` by explicit `FieldLayout.offset` (`8`) rather than sequential packed field size (`5`)."
-        ),
+    checks = {
+        "oracle_invoked": oracle_invoked,
+        "non_zero_compared": non_zero_compared,
+        "plausible_wall_clock": plausible_wall_clock,
+        "seed_sensitivity": seed_sensitive,
+        "oracle_error_threshold": within_error_threshold,
+    }
+    return RedFlagResult(
+        passed=all(checks.values()),
+        checks=checks,
+        failure_reasons=reasons,
     )
 
-    return [miri_finding, itree_finding]
+
+def load_known_corpus_bug_seeds(repo_root: Path) -> set[str]:
+    manifest_path = repo_root / "tests" / "miri-diff" / "manifest.toml"
+    if not manifest_path.is_file():
+        return set()
+    try:
+        data = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return set()
+    seeds: set[str] = set()
+    for entry in data.get("tests", []):
+        if isinstance(entry, dict) and "known_anneal_bug" in entry:
+            name = entry.get("name")
+            if isinstance(name, str):
+                seeds.add(name)
+    return seeds
 
 
-def write_junit_xml(
+def load_quarantine_rules(quarantine_file: Path | None) -> set[str]:
+    """Loads quarantine tokens from a JSON or TOML file."""
+    if quarantine_file is None:
+        return set()
+    if not quarantine_file.is_file():
+        raise ValueError(f"quarantine file does not exist: {quarantine_file}")
+    text = quarantine_file.read_text(encoding="utf-8")
+    rules: set[str] = set()
+    if quarantine_file.suffix.lower() == ".toml":
+        try:
+            data = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as e:
+            raise ValueError(f"invalid TOML in {quarantine_file}: {e}") from e
+        for item in data.get("quarantined", []):
+            if isinstance(item, str):
+                rules.add(item)
+        for entry in data.get("tests", []):
+            if isinstance(entry, dict) and "known_anneal_bug" in entry:
+                name = entry.get("name")
+                bug = entry.get("known_anneal_bug")
+                if isinstance(name, str):
+                    rules.add(name)
+                    if isinstance(bug, dict) and isinstance(bug.get("divergence_class"), str):
+                        rules.add(f"{name}:{bug['divergence_class']}")
+    else:
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"invalid JSON in {quarantine_file}: {e}") from e
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, str):
+                    rules.add(item)
+        elif isinstance(data, dict):
+            for k in ("quarantined", "fingerprints", "seeds", "mutators"):
+                vals = data.get(k, [])
+                if isinstance(vals, list):
+                    for item in vals:
+                        if isinstance(item, str):
+                            rules.add(item)
+        else:
+            raise ValueError(f"unsupported quarantine JSON root in {quarantine_file}")
+    return rules
+
+
+def normalize_anneal_tag(raw_tag: str) -> str:
+    clean = raw_tag.strip()
+    while clean.startswith("(") and clean.endswith(")"):
+        clean = clean[1:-1].strip()
+    if clean.startswith("MirDiffTag.normalScalar"):
+        return "MirDiffTag.normalScalar"
+    return clean
+
+
+def extract_fault_line_text(finding: dict[str, Any]) -> str:
+    """Returns the source line at the earliest fault (`miri_pos` or `anneal_span`).
+
+    When Anneal faults inside the unmutated seed body at an earlier line than a
+    subsequent Miri fault in an appended mutator tail (or vice versa), the
+    earliest line number is the point where the two executions first diverged.
+    """
+    src = finding.get("mutant_source")
+    if not isinstance(src, str) or not src:
+        return ""
+    src_lines = src.splitlines()
+    earliest_line_no: int | None = None
+    for loc_key in ("miri_pos", "anneal_span"):
+        loc = finding.get(loc_key)
+        if not isinstance(loc, str) or ":" not in loc:
+            continue
+        parts = loc.split(":")
+        if len(parts) >= 2 and parts[1].strip().isdigit():
+            line_no = int(parts[1].strip())
+            if 1 <= line_no <= len(src_lines):
+                if earliest_line_no is None or line_no < earliest_line_no:
+                    earliest_line_no = line_no
+    if earliest_line_no is None:
+        return ""
+    return src_lines[earliest_line_no - 1]
+
+
+def infer_finding_cause(
+    finding: dict[str, Any], known_corpus_bug_seeds: set[str]
+) -> str:
+    """Identifies the seed or mutator responsible for a divergence finding."""
+    seed_name = str(finding["seed_name"])
+    mutators = finding.get("applied_mutators")
+    first_mutator = (
+        str(mutators[0])
+        if isinstance(mutators, list)
+        and len(mutators) > 0
+        and isinstance(mutators[0], str)
+        else ""
+    )
+    fault_text = extract_fault_line_text(finding)
+    if fault_text:
+        if any(
+            tok in fault_text
+            for tok in ("__miri_ptr_", "__oob_", "__neg_", "__ptr_pair", "__base_ptr")
+        ):
+            return "RawPtrOffsetMutator"
+        if any(tok in fault_text for tok in ("__miri_tb_", "__tb_")):
+            return "TreeBorrowsRetagInterleaver"
+        if any(
+            tok in fault_text
+            for tok in (
+                "__miri_valid_",
+                "__valid_",
+                "__bad_",
+                "__uninit_",
+                "__padded",
+                "__pad_bytes",
+                "__ptr_b",
+                "__raw_u8",
+            )
+        ):
+            return "BitValidityTransmuteMutator"
+        if any(tok in fault_text for tok in ("__miri_arith_", "__miri_wide")):
+            return "ArithmeticCastMutator"
+        if any(tok in fault_text for tok in ("__miri_proj_", "__proj_")):
+            return "PlaceProjectionWrapper"
+
+    if seed_name in known_corpus_bug_seeds or not first_mutator:
+        return seed_name
+    return first_mutator
+
+
+def deduplicate_and_quarantine_findings(
+    findings: list[dict[str, Any]],
+    known_corpus_bug_seeds: set[str],
+    quarantine_rules: set[str],
+) -> tuple[
+    list[DeduplicatedFinding], list[DeduplicatedFinding], list[DeduplicatedFinding]
+]:
+    """Deduplicates raw findings and splits into unquarantined and quarantined."""
+    by_fp: dict[str, DeduplicatedFinding] = {}
+    for f in findings:
+        seed_name = str(f["seed_name"])
+        fn_name = str(f["fn_name"])
+        div_class = str(f["divergence_class"])
+        norm_tag = normalize_anneal_tag(str(f["anneal_lean_tag"]))
+        cause = infer_finding_cause(f, known_corpus_bug_seeds)
+
+        fp = f"{cause}:{div_class}:{norm_tag}"
+        is_quarantined = bool(
+            quarantine_rules
+            and (
+                fp in quarantine_rules
+                or cause in quarantine_rules
+                or seed_name in quarantine_rules
+                or fn_name in quarantine_rules
+                or f"{seed_name}:{div_class}" in quarantine_rules
+                or f"{cause}:{div_class}" in quarantine_rules
+            )
+        )
+        repro_path = str(f["repro_path"])
+
+        if fp in by_fp:
+            existing = by_fp[fp]
+            existing.occurrences += 1
+            if repro_path not in existing.all_repro_paths:
+                existing.all_repro_paths.append(repro_path)
+            existing.kernel_confirmed = existing.kernel_confirmed and bool(
+                f.get("kernel_confirmed", False)
+            )
+            # An unquarantined instance of a fingerprint must never be swallowed
+            # by an earlier instance that happened to be quarantined by
+            # `seed_name` or `fn_name`.
+            if not is_quarantined and existing.quarantined:
+                existing.quarantined = False
+                existing.seed_name = seed_name
+                existing.primary_fn_name = fn_name
+                existing.primary_repro_path = repro_path
+                existing.miri_outcome = str(f["miri_outcome"])
+                existing.anneal_outcome = str(f["anneal_outcome"])
+        else:
+            by_fp[fp] = DeduplicatedFinding(
+                fingerprint=fp,
+                cause=cause,
+                seed_name=seed_name,
+                divergence_class=div_class,
+                normalized_anneal_tag=norm_tag,
+                quarantined=is_quarantined,
+                occurrences=1,
+                primary_fn_name=fn_name,
+                primary_repro_path=repro_path,
+                all_repro_paths=[repro_path],
+                miri_outcome=str(f["miri_outcome"]),
+                anneal_outcome=str(f["anneal_outcome"]),
+                kernel_confirmed=bool(f.get("kernel_confirmed", False)),
+            )
+
+    all_dedup = list(by_fp.values())
+    unquarantined = [d for d in all_dedup if not d.quarantined]
+    quarantined = [d for d in all_dedup if d.quarantined]
+    return all_dedup, unquarantined, quarantined
+
+
+def collect_finding_bundle_files(findings: list[dict[str, Any]], state_dir: Path) -> list[Path]:
+    """Collects all `repro.rs`, `finding.json`, and `SUMMARY.md` files under `state_dir`."""
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for f in findings:
+        repro = Path(f["repro_path"]).resolve()
+        bundle_dir = repro.parent
+        for name in ("repro.rs", "finding.json", "SUMMARY.md"):
+            candidate = bundle_dir / name
+            if candidate.is_file() and candidate not in seen:
+                try:
+                    candidate.relative_to(state_dir)
+                except ValueError:
+                    continue
+                seen.add(candidate)
+                files.append(candidate)
+    return sorted(files)
+
+
+def compile_summary(name: str, summary: dict[str, Any] | None) -> str:
+    """Describes how many candidates a harness generated and compiled."""
+    if summary is None:
+        return "no candidates"
+    key = "compiled_candidates" if name == "miri-difftest" else "opt_level_0_and_2_compiled"
+    return (
+        f"{summary.get('total_candidates', 'an unknown number of')} candidates, "
+        f"{summary.get(key, 'an unknown number')} of which compiled"
+    )
+
+
+def write_not_evaluated_junit_xml(
     junit_path: Path,
     profile_name: str,
-    miri_summary: dict[str, Any],
-    itree_summary: dict[str, Any],
-    findings: list[DualAudienceFinding],
+    summaries: dict[str, dict[str, Any] | None],
+    ran_without_oracle: dict[str, bool],
     elapsed_sec: float,
 ) -> None:
-    """Writes a Sponge / Test-Fusion-compatible JUnit XML report (`sponge_log.xml`)."""
+    """Writes JUnit XML when neither harness performed an oracle comparison."""
     junit_path.parent.mkdir(parents=True, exist_ok=True)
-    unquarantined = [f for f in findings if not f.quarantined]
-
     suites = ET.Element("testsuites")
     suite = ET.SubElement(
         suites,
         "testsuite",
         attrib={
             "name": f"anneal_diff_test_{profile_name}",
-            "tests": str(2 + len(findings)),
-            "failures": str(len(unquarantined)),
+            "tests": str(len(ran_without_oracle)),
+            "failures": str(len(ran_without_oracle)),
             "time": f"{elapsed_sec:.3f}",
         },
     )
-
-    tc_miri = ET.SubElement(
-        suite,
-        "testcase",
-        attrib={
-            "classname": "anneal_difftest.miri_difftest",
-            "name": f"miri_difftest_seed_{miri_summary.get('seed', 'unknown')}",
-            "time": f"{float(miri_summary.get('elapsed_ms', 0.0)) / 1000.0:.3f}",
-        },
-    )
-    if float(miri_summary.get("agreement_rate_pct", 100.0)) < 100.0:
-        fail = ET.SubElement(
-            tc_miri,
-            "failure",
-            attrib={"message": "miri-difftest agreement rate below 100%"},
-        )
-        fail.text = json.dumps(miri_summary, indent=2)
-
-    tc_itree = ET.SubElement(
-        suite,
-        "testcase",
-        attrib={
-            "classname": "anneal_difftest.itree_difftest",
-            "name": f"itree_difftest_seed_{itree_summary.get('seed', 'unknown')}",
-            "time": f"{float(itree_summary.get('elapsed_ms', 0.0)) / 1000.0:.3f}",
-        },
-    )
-    if float(itree_summary.get("metamorphic_parity_rate_pct", 100.0)) < 100.0:
-        fail = ET.SubElement(
-            tc_itree,
-            "failure",
-            attrib={"message": "itree-difftest metamorphic parity below 100%"},
-        )
-        fail.text = json.dumps(itree_summary, indent=2)
-
-    for f in findings:
-        tc_f = ET.SubElement(
+    for name, ran in ran_without_oracle.items():
+        case = ET.SubElement(
             suite,
             "testcase",
-            attrib={
-                "classname": f"anneal_difftest.finding.{f.harness}",
-                "name": f"{f.fingerprint}_{f.function_name}",
-                "time": "0.001",
-            },
+            attrib={"classname": "anneal_difftest", "name": name},
         )
-        if f.quarantined:
-            sk = ET.SubElement(
-                tc_f,
-                "skipped",
-                attrib={"message": f.quarantine_reason or "Quarantined"},
+        if not ran:
+            failure = ET.SubElement(case, "failure", attrib={"message": "harness failed"})
+            failure.text = (
+                f"{name} exited with an error, wrote unreadable JSON, or reported "
+                "an oracle status this runner cannot present."
             )
-            sk.text = render_finding_markdown_section(1, f)
         else:
-            fl = ET.SubElement(
-                tc_f,
-                "failure",
-                attrib={"message": f"{f.title} ({f.diag_tag})"},
+            failure = ET.SubElement(
+                case, "failure", attrib={"message": "oracle comparison not performed"}
             )
-            fl.text = render_finding_markdown_section(1, f)
-
+            failure.text = (
+                f"{name} generated {compile_summary(name, summaries[name])}, but "
+                "it did not compare Anneal with Miri or with native execution, "
+                "so this run is not evidence about Anneal."
+            )
     tree = ET.ElementTree(suites)
     ET.indent(tree, space="  ")
     tree.write(junit_path, encoding="utf-8", xml_declaration=True)
 
 
-def run_lean_batch_verify_check(repo_root: Path) -> tuple[bool, str]:
-    """Runs `lake env lean BatchVerify.lean` in `theory/` as a kernel health gate."""
-    theory_dir = repo_root / "theory"
-    batch_file = theory_dir / "BatchVerify.lean"
-    if not batch_file.is_file():
-        return True, "Skipped (`theory/BatchVerify.lean` not present)"
-    lake_bin = shutil.which("lake") or os.path.expanduser("~/.elan/bin/lake")
-    if not os.path.exists(lake_bin):
-        return True, "Skipped (`lake` binary not found)"
-    res = subprocess.run(
-        [lake_bin, "env", "lean", "BatchVerify.lean"],
-        cwd=str(theory_dir),
-        text=True,
-        capture_output=True,
+def render_not_evaluated_report(
+    profile: CampaignProfile,
+    date_prefix: str,
+    miri: dict[str, Any] | None,
+    itree: dict[str, Any] | None,
+    ran_without_oracle: dict[str, bool],
+    miri_seed: int,
+    itree_seed: int,
+    elapsed_sec: float,
+) -> str:
+    """Renders the 25-line report when no oracle comparison was performed."""
+    def cell(summary: dict[str, Any] | None, key: str, fmt: str = "{}") -> str:
+        if summary is None or key not in summary:
+            return "n/a"
+        return fmt.format(summary[key])
+
+    def oracle(name: str) -> str:
+        return "**not performed**" if ran_without_oracle.get(name, False) else "harness failed"
+
+    itree_compiled = (
+        "n/a"
+        if itree is None or "opt_level_0_and_2_compiled" not in itree
+        else f"{itree['opt_level_0_and_2_compiled']} at both `-O0` and `-O2` (compile only)"
     )
-    if res.returncode == 0:
-        return True, "PASS (`lake env lean BatchVerify.lean` -> 0 errors)"
-    return False, f"FAIL (`BatchVerify.lean` exit {res.returncode})"
+
+    status = "NOT EVALUATED" if all(ran_without_oracle.values()) else "HARNESS FAILED"
+    lines = [
+        f"# Anneal Differential Testing Campaign Report (`{profile.name}` — `{date_prefix}`)",
+        "",
+        f"> **Status: {status}.** Neither harness compared Anneal with an oracle.",
+        "> `miri-difftest` and `itree-difftest` generate candidate programs and",
+        "> compile them with `rustc`; they do not run Miri, Anneal's Lean model, or",
+        "> the generated programs. This report therefore contains no agreement",
+        "> figures and no divergence findings.",
+        "",
+        "| Metric | `miri-difftest` | `itree-difftest` |",
+        "| :--- | :--- | :--- |",
+        f"| Seed | `0x{miri_seed:08x}` | `0x{itree_seed:08x}` |",
+        f"| Candidates generated | {cell(miri, 'total_candidates')} | "
+        f"{cell(itree, 'total_candidates')} |",
+        f"| Compiled with `rustc` | {cell(miri, 'compiled_candidates')} | {itree_compiled} |",
+        f"| Instrumented copies compiled (never executed) | n/a | "
+        f"{cell(itree, 'instrumented_compiled')} |",
+        f"| Candidates containing `unsafe` | n/a | {cell(itree, 'unsafe_token_violations')} |",
+        f"| Oracle comparison | {oracle('miri-difftest')} | {oracle('itree-difftest')} |",
+        f"| Harness wall-clock | {cell(miri, 'elapsed_ms', '{:.1f} ms')} | "
+        f"{cell(itree, 'elapsed_ms', '{:.1f} ms')} |",
+        "",
+        f"Total campaign wall-clock: {elapsed_sec:.2f} s.",
+        "",
+        "## Divergences",
+        "",
+        "No oracle comparison was performed, so this campaign cannot report",
+        "divergences. The absence of findings is not evidence that Anneal agrees",
+        "with Miri or with native execution.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def write_oracle_junit_xml(
+    junit_path: Path,
+    profile_name: str,
+    miri: dict[str, Any] | None,
+    miri_red_flags: RedFlagResult | None,
+    unquarantined: list[DeduplicatedFinding],
+    quarantined: list[DeduplicatedFinding],
+    include_itree: bool,
+    itree: dict[str, Any] | None,
+    itree_ran_without_oracle: bool,
+    elapsed_sec: float,
+) -> None:
+    """Writes JUnit XML for a live oracle campaign."""
+    junit_path.parent.mkdir(parents=True, exist_ok=True)
+    # Each entry is (name, failure_tuple_or_none, skipped_message_or_none).
+    cases: list[tuple[str, tuple[str, str] | None, str | None]] = []
+
+    if miri is None or miri_red_flags is None:
+        cases.append(
+            (
+                "miri-difftest",
+                (
+                    "harness failed",
+                    "miri-difftest exited with an error or produced invalid oracle JSON.",
+                ),
+                None,
+            )
+        )
+    elif not miri_red_flags.passed:
+        cases.append(
+            (
+                "miri-difftest",
+                (
+                    "red-flag vacuity check failed",
+                    "; ".join(miri_red_flags.failure_reasons),
+                ),
+                None,
+            )
+        )
+    elif len(unquarantined) > 0:
+        summary_lines = [
+            f"{d.fingerprint} (occurrences={d.occurrences}, repro={d.primary_repro_path})"
+            for d in unquarantined
+        ]
+        cases.append(
+            (
+                "miri-difftest",
+                (
+                    f"unquarantined divergences detected ({len(unquarantined)} distinct, {miri['diverge_count']} total)",
+                    "\n".join(summary_lines),
+                ),
+                None,
+            )
+        )
+    else:
+        cases.append(("miri-difftest", None, None))
+
+    if include_itree:
+        if itree is None or not itree_ran_without_oracle:
+            cases.append(
+                (
+                    "itree-difftest",
+                    (
+                        "harness failed",
+                        "itree-difftest exited with an error or wrote unreadable JSON.",
+                    ),
+                    None,
+                )
+            )
+        else:
+            cases.append(
+                (
+                    "itree-difftest",
+                    None,
+                    f"itree-difftest generated {compile_summary('itree-difftest', itree)}, "
+                    "but its runtime trace oracle is not yet active.",
+                )
+            )
+
+    failures_count = sum(1 for _, fail, _ in cases if fail is not None)
+    skipped_count = sum(1 for _, _, skip in cases if skip is not None)
+    suites = ET.Element("testsuites")
+    suite = ET.SubElement(
+        suites,
+        "testsuite",
+        attrib={
+            "name": f"anneal_diff_test_{profile_name}",
+            "tests": str(len(cases)),
+            "failures": str(failures_count),
+            "skipped": str(skipped_count),
+            "time": f"{elapsed_sec:.3f}",
+        },
+    )
+    for name, fail, skip in cases:
+        case = ET.SubElement(
+            suite,
+            "testcase",
+            attrib={"classname": "anneal_difftest", "name": name},
+        )
+        if fail is not None:
+            msg, text = fail
+            failure = ET.SubElement(case, "failure", attrib={"message": msg})
+            failure.text = text
+        elif skip is not None:
+            ET.SubElement(case, "skipped", attrib={"message": skip})
+    tree = ET.ElementTree(suites)
+    ET.indent(tree, space="  ")
+    tree.write(junit_path, encoding="utf-8", xml_declaration=True)
+
+
+def render_oracle_campaign_report(
+    profile: CampaignProfile,
+    date_prefix: str,
+    miri: dict[str, Any],
+    miri_red_flags: RedFlagResult,
+    all_dedup: list[DeduplicatedFinding],
+    unquarantined: list[DeduplicatedFinding],
+    quarantined: list[DeduplicatedFinding],
+    include_itree: bool,
+    itree: dict[str, Any] | None,
+    itree_ran_without_oracle: bool,
+    miri_seed: int,
+    itree_seed: int,
+    elapsed_sec: float,
+) -> str:
+    """Renders the full Markdown report for a live `miri-difftest` oracle campaign."""
+    if not miri_red_flags.passed or (include_itree and not itree_ran_without_oracle):
+        status = "RED FLAG / HARNESS FAILED"
+    elif len(unquarantined) > 0:
+        status = (
+            f"DIVERGENCE DETECTED ({len(unquarantined)} unquarantined distinct, "
+            f"{miri['diverge_count']} raw)"
+        )
+    elif include_itree and len(quarantined) > 0:
+        status = (
+            f"MIRI PASS ({len(quarantined)} quarantined known bug fingerprints) "
+            "/ ITREE NOT EVALUATED"
+        )
+    elif include_itree:
+        status = "MIRI PASS (0 divergences) / ITREE NOT EVALUATED"
+    elif len(quarantined) > 0:
+        status = f"PASS ({len(quarantined)} quarantined known bug fingerprints)"
+    else:
+        status = "PASS (0 divergences)"
+
+    itree_seed_cell = f"`0x{itree_seed:08x}`" if include_itree else "skipped (`--miri-only`)"
+    itree_total_cell = (
+        str(itree.get("total_candidates", "n/a")) if (include_itree and itree) else "n/a"
+    )
+    itree_compiled_cell = (
+        f"{itree['opt_level_0_and_2_compiled']} (`-O0` & `-O2`, compile only)"
+        if (include_itree and itree and "opt_level_0_and_2_compiled" in itree)
+        else "n/a"
+    )
+    itree_oracle_cell = (
+        "**not performed**"
+        if (include_itree and itree_ran_without_oracle)
+        else ("harness failed" if include_itree else "skipped")
+    )
+    itree_elapsed_cell = (
+        f"{float(itree['elapsed_ms']):.1f} ms"
+        if (include_itree and itree and "elapsed_ms" in itree)
+        else "n/a"
+    )
+
+    lines: list[str] = [
+        f"# Anneal Differential Testing Campaign Report (`{profile.name}` — `{date_prefix}`)",
+        "",
+        f"> **Status: {status}.**",
+        f"> `miri-difftest` evaluated `{miri['compared_candidates']}/{miri['total_candidates']}` "
+        f"candidates against live Miri (`-Zmiri-tree-borrows`) and Anneal's `MirSemantics` "
+        f"oracle (`{miri['agree_count']}` agreed, `{miri['diverge_count']}` diverged, "
+        f"`{miri['not_compared_count']}` not compared).",
+        "",
+        "## Campaign Summary",
+        "",
+        "| Metric | `miri-difftest` | `itree-difftest` |",
+        "| :--- | :--- | :--- |",
+        f"| Mode | `{miri.get('mode', 'seeded')}` | `compile-only` |",
+        f"| Seed | `0x{miri_seed:08x}` | {itree_seed_cell} |",
+        f"| Candidates generated | {miri['total_candidates']} | {itree_total_cell} |",
+        f"| Compiled with `rustc` | {miri['compiled_candidates']} ({miri['compile_failed_candidates']} failed) | {itree_compiled_cell} |",
+        f"| Oracle comparison | **performed** | {itree_oracle_cell} |",
+        f"| Compared | {miri['compared_candidates']} | 0 |",
+        f"| Agreed | {miri['agree_count']} | n/a |",
+        f"| Diverged (raw / distinct) | {miri['diverge_count']} ({len(all_dedup)} distinct: {len(unquarantined)} unquarantined, {len(quarantined)} quarantined) | n/a |",
+        f"| Kernel-confirmed divergences (`by rfl`) | {miri['kernel_confirmed_divergences']} | n/a |",
+        f"| Not compared | {miri['not_compared_count']} | {itree_total_cell} |",
+        f"| Harness wall-clock | {float(miri['elapsed_ms']):.1f} ms | {itree_elapsed_cell} |",
+        "",
+        f"Total campaign wall-clock: {elapsed_sec:.2f} s.",
+        "",
+        "## Miri & Anneal Outcome Breakdown (`miri-difftest`)",
+        "",
+        "| Miri Verdict | Count | Anneal Outcome | Count | Divergence Class | Count |",
+        "| :--- | ---: | :--- | ---: | :--- | ---: |",
+    ]
+
+    miri_v = sorted(miri["miri_verdicts"].items())
+    anneal_o = sorted(miri["anneal_outcomes"].items())
+    div_c = sorted(miri["divergence_classes"].items())
+    row_count = max(len(miri_v), len(anneal_o), len(div_c))
+    for i in range(row_count):
+        mv_k, mv_v = miri_v[i] if i < len(miri_v) else ("", "")
+        ao_k, ao_v = anneal_o[i] if i < len(anneal_o) else ("", "")
+        dc_k, dc_v = div_c[i] if i < len(div_c) else ("", "")
+        mv_label = f"`{mv_k}`" if mv_k else ""
+        ao_label = f"`{ao_k}`" if ao_k else ""
+        dc_label = f"`{dc_k}`" if dc_k else ""
+        lines.append(
+            f"| {mv_label} | {mv_v} | {ao_label} | {ao_v} | {dc_label} | {dc_v} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Not-Compared Breakdown by Reason (`miri-difftest`)",
+            "",
+            "| Reason | Count |",
+            "| :--- | ---: |",
+        ]
+    )
+    for reason, count in sorted(miri["not_compared_reasons"].items()):
+        lines.append(f"| `{reason}` | {count} |")
+
+    ext_calls: dict[str, int] = miri.get("unmodeled_external_calls", {})
+    if ext_calls:
+        lines.extend(
+            [
+                "",
+                "### Unmodeled External Calls",
+                "",
+                "| Callee `def_path` | Count |",
+                "| :--- | ---: |",
+            ]
+        )
+        for callee, count in sorted(ext_calls.items(), key=lambda kv: (-kv[1], kv[0])):
+            lines.append(f"| `{callee}` | {count} |")
+
+    lines.extend(
+        [
+            "",
+            "## Red-Flag Vacuity Checks",
+            "",
+            "| Check | Status |",
+            "| :--- | :--- |",
+        ]
+    )
+    for check_name, ok in miri_red_flags.checks.items():
+        lines.append(f"| `{check_name}` | {'PASS' if ok else '**FAIL**'} |")
+    if miri_red_flags.failure_reasons:
+        lines.append("")
+        for reason in miri_red_flags.failure_reasons:
+            lines.append(f"- **Red-flag failure**: {reason}")
+
+    lines.extend(
+        [
+            "",
+            "## Divergences",
+            "",
+            f"### Unquarantined Divergences ({len(unquarantined)} distinct)",
+            "",
+        ]
+    )
+    if not unquarantined:
+        lines.append("None.")
+    else:
+        lines.extend(
+            [
+                "| Fingerprint | Class | Occurrences | Miri | Anneal | Kernel Confirmed | Reproducer |",
+                "| :--- | :--- | ---: | :--- | :--- | :--- | :--- |",
+            ]
+        )
+        for d in unquarantined:
+            lines.append(
+                f"| `{d.fingerprint}` | `{d.divergence_class}` | {d.occurrences} | "
+                f"`{d.miri_outcome}` | `{d.anneal_outcome}` | `{str(d.kernel_confirmed).lower()}` | "
+                f"`{d.primary_repro_path}` |"
+            )
+
+    lines.extend(
+        [
+            "",
+            f"### Quarantined Divergences ({len(quarantined)} distinct)",
+            "",
+        ]
+    )
+    if not quarantined:
+        lines.append("None.")
+    else:
+        lines.extend(
+            [
+                "| Fingerprint | Class | Occurrences | Miri | Anneal | Kernel Confirmed | Reproducer |",
+                "| :--- | :--- | ---: | :--- | :--- | :--- | :--- |",
+            ]
+        )
+        for d in quarantined:
+            lines.append(
+                f"| `{d.fingerprint}` | `{d.divergence_class}` | {d.occurrences} | "
+                f"`{d.miri_outcome}` | `{d.anneal_outcome}` | `{str(d.kernel_confirmed).lower()}` | "
+                f"`{d.primary_repro_path}` |"
+            )
+
+    return "\n".join(lines) + "\n"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Unified Anneal dual differential-testing campaign runner (`miri-difftest` + `itree-difftest`)."
+        description=(
+            "Anneal differential-testing campaign orchestrator. Runs live Miri + "
+            "Anneal oracle comparisons for miri-difftest, validates red-flag "
+            "vacuity checks, and deduplicates divergence findings."
+        )
     )
-    parser.add_argument(
-        "--profile",
-        choices=sorted(PROFILES.keys()),
-        default="quick",
-        help="Campaign execution profile (`smoke`, `quick`, `nightly`, `weekend`).",
-    )
+    parser.add_argument("--profile", choices=sorted(PROFILES), default="quick")
     parser.add_argument(
         "--state-dir",
         type=Path,
         default=None,
-        help="Local staging directory for campaign state, reports, and finding bundles.",
+        help="Local directory for the ledger, findings, and reports (default: a temporary directory).",
     )
     parser.add_argument(
         "--x20-uri",
         type=str,
-        default=DEFAULT_X20_DIFF_TEST_URI,
-        help="Shared x20 URI for persistent campaign state (`/x20/teams/anneal-agent/differential-testing`); pass empty string to disable x20 sync.",
+        default="",
+        help="x20 directory to synchronize the ledger and reports with (default: no x20 sync).",
+    )
+    parser.add_argument("--miri-seed", type=str, default=None)
+    parser.add_argument("--itree-seed", type=str, default=None)
+    parser.add_argument(
+        "--miri-identity",
+        action="store_true",
+        help="Run miri-difftest in 77-function identity corpus mode (--identity).",
     )
     parser.add_argument(
-        "--miri-seed",
-        type=str,
-        default=None,
-        help="Explicit hex/int seed override for `miri-difftest` (defaults to advancing `campaign_ledger.json`).",
+        "--miri-only",
+        action="store_true",
+        help="Run only miri-difftest (skipping itree-difftest).",
     )
     parser.add_argument(
-        "--itree-seed",
-        type=str,
+        "--compile-only",
+        action="store_true",
+        help="Run miri-difftest with --compile-only (no oracle execution).",
+    )
+    parser.add_argument(
+        "--quarantine-file",
+        type=Path,
         default=None,
-        help="Explicit hex/int seed override for `itree-difftest` (defaults to advancing `campaign_ledger.json`).",
+        help="Optional TOML or JSON file listing quarantined divergence fingerprints or seed names.",
+    )
+    parser.add_argument(
+        "--max-oracle-errors",
+        type=int,
+        default=DEFAULT_MAX_ORACLE_ERRORS,
+        help="Maximum allowed Miri/capture oracle errors before failing (default: 0).",
+    )
+    parser.add_argument(
+        "--min-oracle-elapsed-ms",
+        type=float,
+        default=DEFAULT_MIN_ORACLE_ELAPSED_MS,
+        help="Minimum plausible elapsed_ms for a live oracle run (default: 50.0).",
     )
     parser.add_argument(
         "--junit-xml",
         type=Path,
         default=None,
-        help="Optional path to emit a Sponge / Test-Fusion JUnit XML report (`sponge_log.xml`).",
-    )
-    parser.add_argument(
-        "--inject-synthetic-divergence",
-        action="store_true",
-        help="Inject synthetic `miri-difftest` and `itree-difftest` divergences to verify shrinking, deduplication, quarantine, and dual-audience Human+Agent reporting.",
+        help="Optional path for JUnit XML (`sponge_log.xml`).",
     )
     return parser.parse_args()
-
-
-def parse_seed_int(raw: str) -> int:
-    clean = raw.strip().replace("_", "")
-    if clean.lower().startswith("0x"):
-        return int(clean, 16)
-    return int(clean, 10)
-
-
-def advance_seed(seed_val: int) -> int:
-    return (seed_val + 0x9E37_79B9) & 0xFFFF_FFFF
 
 
 def main() -> int:
@@ -938,253 +1328,358 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
     start_time = time.monotonic()
 
+    x20_uri = args.x20_uri.strip()
+    try:
+        check_x20_uri(x20_uri)
+        cli_miri_seed = parse_seed_int(args.miri_seed) if args.miri_seed is not None else None
+        cli_itree_seed = parse_seed_int(args.itree_seed) if args.itree_seed is not None else None
+        quarantine_rules = load_quarantine_rules(args.quarantine_file)
+        if args.max_oracle_errors < 0 or args.min_oracle_elapsed_ms < 0:
+            raise ValueError("thresholds must be non-negative")
+    except ValueError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return EXIT_HARNESS_FAILED
+
     temp_ctx = (
         tempfile.TemporaryDirectory(prefix="anneal-diff-test-campaign-")
         if args.state_dir is None
         else None
     )
-    state_dir = (
-        Path(temp_ctx.name) if temp_ctx is not None else args.state_dir.resolve()
-    )
+    state_dir = Path(temp_ctx.name) if temp_ctx is not None else args.state_dir.resolve()
 
     try:
-        x20_uri = args.x20_uri.strip()
-        if x20_uri:
-            sync_state_from_x20(x20_uri, state_dir)
-        ensure_default_state_files(state_dir)
+        sync_state_from_x20(x20_uri, state_dir)
+        (state_dir / "state").mkdir(parents=True, exist_ok=True)
+        (state_dir / "reports").mkdir(parents=True, exist_ok=True)
 
         ledger_path = state_dir / "state" / "campaign_ledger.json"
-        ratchet_path = state_dir / "state" / "coverage_ratchet.json"
-        quarantine_path = state_dir / "state" / "quarantine.toml"
-
-        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-        quarantine_map = load_quarantine_map(quarantine_path)
-
-        miri_seed_int = (
-            parse_seed_int(args.miri_seed)
-            if args.miri_seed
-            else parse_seed_int(str(ledger.get("next_miri_seed", "0x5eed0001")))
-        )
-        itree_seed_int = (
-            parse_seed_int(args.itree_seed)
-            if args.itree_seed
-            else parse_seed_int(
-                str(ledger.get("next_itree_seed", "0x5eed0002"))
+        try:
+            ledger = load_ledger(ledger_path)
+            miri_seed = (
+                cli_miri_seed
+                if cli_miri_seed is not None
+                else ledger_seed_int(ledger, "next_miri_seed", "0x5eed0001")
             )
-        )
-
-        with tempfile.TemporaryDirectory(
-            prefix="anneal-diff-test-run-"
-        ) as run_tmp:
-            run_tmp_path = Path(run_tmp)
-            miri_json_path = run_tmp_path / "miri_difftest_out.json"
-            itree_json_path = run_tmp_path / "itree_difftest_out.json"
-            shrink_check_dir = run_tmp_path / "shrink_self_check"
-
-            cargo_bin = shutil.which("cargo") or os.path.expanduser(
-                "~/.cargo/bin/cargo"
+            itree_seed = (
+                cli_itree_seed
+                if cli_itree_seed is not None
+                else ledger_seed_int(ledger, "next_itree_seed", "0x5eed0002")
             )
-            manifest_path = str(
-                repo_root / "crates" / "anneal-difftest" / "Cargo.toml"
-            )
+            prev_campaigns = ledger_counter(ledger, "total_campaigns_run")
+            prev_miri_gen = ledger_counter(ledger, "total_miri_candidates_generated")
+            prev_itree_gen = ledger_counter(ledger, "total_itree_candidates_generated")
+            prev_miri_eval = ledger_counter(ledger, "total_miri_candidates_evaluated")
+        except ValueError as e:
+            sys.stderr.write(f"error: {e}\n")
+            return EXIT_INTERNAL_ERROR
 
-            # 1. Run `miri-difftest`
-            miri_cmd = [
-                cargo_bin,
-                "run",
-                "--quiet",
-                "--locked",
-                "--manifest-path",
-                manifest_path,
-                "--bin",
-                "miri-difftest",
-                "--",
-                "--batches",
-                str(profile.miri_batches),
-                "--batch-size",
-                str(profile.miri_batch_size),
-                "--seed",
-                f"0x{miri_seed_int:08x}",
-                "--findings-dir",
-                str(shrink_check_dir),
-                "--output-json",
-                str(miri_json_path),
-            ]
-            miri_res = subprocess.run(
-                miri_cmd, cwd=str(repo_root), text=True, capture_output=True
-            )
-            if miri_res.returncode != 0:
-                sys.stderr.write(f"miri-difftest failed:\n{miri_res.stderr}\n")
-                return 2
-            miri_summary = json.loads(
-                miri_json_path.read_text(encoding="utf-8")
-            )
-
-            # 2. Run `itree-difftest`
-            itree_cmd = [
-                cargo_bin,
-                "run",
-                "--quiet",
-                "--locked",
-                "--manifest-path",
-                manifest_path,
-                "--bin",
-                "itree-difftest",
-                "--",
-                "--batches",
-                str(profile.itree_batches),
-                "--batch-size",
-                str(profile.itree_batch_size),
-                "--inputs-per-fn",
-                str(profile.itree_inputs_per_fn),
-                "--seed",
-                f"0x{itree_seed_int:08x}",
-                "--output-json",
-                str(itree_json_path),
-            ]
-            itree_res = subprocess.run(
-                itree_cmd, cwd=str(repo_root), text=True, capture_output=True
-            )
-            if itree_res.returncode != 0:
-                sys.stderr.write(
-                    f"itree-difftest failed:\n{itree_res.stderr}\n"
-                )
-                return 2
-            itree_summary = json.loads(
-                itree_json_path.read_text(encoding="utf-8")
-            )
-
-        # 3. Optional Lean 4 `BatchVerify.lean` check
-        if profile.run_lean_batch_verify:
-            _, kernel_suite_status = run_lean_batch_verify_check(repo_root)
-        else:
-            kernel_suite_status = "Skipped (`smoke` profile)"
-
-        # 4. Collect & Deduplicate Findings
         date_prefix = utc_date_prefix()
-        findings_root = state_dir / "findings"
-        recorded_findings: list[DualAudienceFinding] = []
-        if args.inject_synthetic_divergence:
-            for f in build_synthetic_verification_findings(quarantine_map):
-                write_finding_bundle(findings_root, date_prefix, f)
-                recorded_findings.append(f)
+        findings_dir = state_dir / "findings" / f"{date_prefix}_{profile.name}_miri"
+        if not args.compile_only:
+            shutil.rmtree(findings_dir, ignore_errors=True)
 
-        new_unquarantined_count = sum(
-            1 for f in recorded_findings if not f.quarantined
-        )
+        with tempfile.TemporaryDirectory(prefix="anneal-diff-test-run-") as run_tmp:
+            run_tmp_path = Path(run_tmp)
+            if args.compile_only:
+                miri_args = [
+                    "--batches",
+                    str(profile.miri_batches),
+                    "--batch-size",
+                    str(profile.miri_batch_size),
+                    "--seed",
+                    f"0x{miri_seed:08x}",
+                    "--compile-only",
+                ]
+            elif args.miri_identity:
+                miri_args = [
+                    "--identity",
+                    "--seed",
+                    f"0x{miri_seed:08x}",
+                    "--findings-dir",
+                    str(findings_dir),
+                ]
+            else:
+                miri_args = [
+                    "--batches",
+                    str(profile.miri_batches),
+                    "--batch-size",
+                    str(profile.miri_batch_size),
+                    "--seed",
+                    f"0x{miri_seed:08x}",
+                    "--findings-dir",
+                    str(findings_dir),
+                ]
 
-        # 5. Update Persistent Ledger & Coverage Ratchet
-        next_miri_seed = advance_seed(miri_seed_int)
-        next_itree_seed = advance_seed(itree_seed_int)
-        obs_paths = int(itree_summary.get("distinct_mir_obs_paths", 0))
+            miri = run_harness(
+                repo_root,
+                "miri-difftest",
+                miri_args,
+                run_tmp_path / "miri_difftest_out.json",
+            )
+            itree = (
+                None
+                if args.miri_only
+                else run_harness(
+                    repo_root,
+                    "itree-difftest",
+                    [
+                        "--compile-only",
+                        "--batches",
+                        str(profile.itree_batches),
+                        "--batch-size",
+                        str(profile.itree_batch_size),
+                        "--seed",
+                        f"0x{itree_seed:08x}",
+                    ],
+                    run_tmp_path / "itree_difftest_out.json",
+                )
+            )
 
-        ledger["next_miri_seed"] = f"0x{next_miri_seed:08x}"
-        ledger["next_itree_seed"] = f"0x{next_itree_seed:08x}"
-        ledger["total_campaigns_run"] = (
-            int(ledger.get("total_campaigns_run", 0)) + 1
-        )
-        ledger["total_miri_candidates_evaluated"] = int(
-            ledger.get("total_miri_candidates_evaluated", 0)
-        ) + int(miri_summary.get("total_candidates", 0))
-        ledger["total_itree_candidates_evaluated"] = int(
-            ledger.get("total_itree_candidates_evaluated", 0)
-        ) + int(itree_summary.get("total_candidates", 0))
-        ledger["total_itree_inputs_evaluated"] = int(
-            ledger.get("total_itree_inputs_evaluated", 0)
-        ) + int(itree_summary.get("total_inputs_evaluated", 0))
-        ledger["cumulative_distinct_obs_paths"] = max(
-            int(ledger.get("cumulative_distinct_obs_paths", 0)), obs_paths
-        )
-        ledger["last_run_utc"] = utc_now_iso()
-        ledger["last_profile"] = profile.name
-        ledger["active_fingerprints"] = sorted(
-            {
-                *ledger.get("active_fingerprints", []),
-                *(f.fingerprint for f in recorded_findings),
+        miri_status = miri.get("oracle_comparison") if isinstance(miri, dict) else None
+        itree_status = itree.get("oracle_comparison") if isinstance(itree, dict) else None
+
+        # Case 1: Neither harness performed an oracle comparison (compile-only mode
+        # or stubbed non-oracle harnesses). When `--compile-only` was not passed,
+        # `miri-difftest` returning `"not_performed"` is treated as a harness
+        # failure (`EXIT_HARNESS_FAILED`).
+        if miri_status != "performed":
+            summaries = {"miri-difftest": miri, "itree-difftest": itree}
+            ran_without_oracle = {
+                name: (
+                    isinstance(s, dict)
+                    and s.get("oracle_comparison") == "not_performed"
+                    and (args.compile_only or name != "miri-difftest")
+                )
+                for name, s in summaries.items()
             }
+            for name, s in summaries.items():
+                if isinstance(s, dict) and not ran_without_oracle[name]:
+                    sys.stderr.write(
+                        f"{name} reported unsupported oracle_comparison={s.get('oracle_comparison')!r}\n"
+                    )
+            harness_failed = not all(ran_without_oracle.values())
+
+            written: list[Path] = []
+            if not harness_failed and miri is not None and itree is not None:
+                for key in OBSOLETE_LEDGER_KEYS:
+                    ledger.pop(key, None)
+                ledger["next_miri_seed"] = f"0x{advance_seed(miri_seed):08x}"
+                ledger["next_itree_seed"] = f"0x{advance_seed(itree_seed):08x}"
+                ledger["total_campaigns_run"] = prev_campaigns + 1
+                ledger["total_miri_candidates_generated"] = prev_miri_gen + int(
+                    miri.get("total_candidates", 0)
+                )
+                ledger["total_itree_candidates_generated"] = prev_itree_gen + int(
+                    itree.get("total_candidates", 0)
+                )
+                ledger["last_run_utc"] = utc_now_iso()
+                ledger["last_profile"] = profile.name
+                ledger["last_oracle_comparison"] = "not_performed"
+                ledger_path.write_text(
+                    json.dumps(ledger, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                )
+                written.append(ledger_path)
+
+            elapsed_sec = time.monotonic() - start_time
+            report_md = render_not_evaluated_report(
+                profile,
+                date_prefix,
+                miri,
+                itree,
+                ran_without_oracle,
+                miri_seed,
+                itree_seed,
+                elapsed_sec,
+            )
+            for report_path in [
+                state_dir / "reports" / f"{date_prefix}_{profile.name}_campaign_report.md",
+                state_dir / "reports" / "LATEST_REPORT.md",
+            ]:
+                report_path.write_text(report_md, encoding="utf-8")
+                written.append(report_path)
+
+            if args.junit_xml:
+                write_not_evaluated_junit_xml(
+                    args.junit_xml.resolve(),
+                    profile.name,
+                    summaries,
+                    ran_without_oracle,
+                    elapsed_sec,
+                )
+
+            sync_state_to_x20(state_dir, x20_uri, written)
+            print(report_md)
+            return EXIT_HARNESS_FAILED if harness_failed else EXIT_NOT_EVALUATED
+
+        # Case 2: `miri-difftest` reported `"oracle_comparison": "performed"`.
+        assert miri is not None
+        valid_miri, err_reason = validate_performed_miri_summary(miri)
+        include_itree = not args.miri_only
+        itree_ran_without_oracle = (
+            isinstance(itree, dict) and itree_status == "not_performed"
         )
-        ledger_path.write_text(
-            json.dumps(ledger, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        if not valid_miri:
+            sys.stderr.write(f"miri-difftest produced invalid oracle summary: {err_reason}\n")
+            elapsed_sec = time.monotonic() - start_time
+            ran_without_oracle = {
+                "miri-difftest": False,
+                "itree-difftest": itree_ran_without_oracle if include_itree else False,
+            }
+            report_md = render_not_evaluated_report(
+                profile,
+                date_prefix,
+                miri,
+                itree,
+                ran_without_oracle,
+                miri_seed,
+                itree_seed,
+                elapsed_sec,
+            )
+            written = []
+            for report_path in [
+                state_dir / "reports" / f"{date_prefix}_{profile.name}_campaign_report.md",
+                state_dir / "reports" / "LATEST_REPORT.md",
+            ]:
+                report_path.write_text(report_md, encoding="utf-8")
+                written.append(report_path)
+            if args.junit_xml:
+                write_not_evaluated_junit_xml(
+                    args.junit_xml.resolve(),
+                    profile.name,
+                    {"miri-difftest": miri, "itree-difftest": itree},
+                    ran_without_oracle,
+                    elapsed_sec,
+                )
+            sync_state_to_x20(state_dir, x20_uri, written)
+            print(report_md)
+            return EXIT_HARNESS_FAILED
+
+        miri_red_flags = evaluate_miri_red_flags(
+            miri,
+            miri_seed,
+            ledger,
+            args.min_oracle_elapsed_ms,
+            args.max_oracle_errors,
+        )
+        if not miri_red_flags.passed:
+            for reason in miri_red_flags.failure_reasons:
+                sys.stderr.write(f"red-flag check failed: {reason}\n")
+
+        known_corpus_bug_seeds = load_known_corpus_bug_seeds(repo_root)
+        all_dedup, unquarantined, quarantined = deduplicate_and_quarantine_findings(
+            miri["findings"],
+            known_corpus_bug_seeds,
+            quarantine_rules,
         )
 
-        ratchet_data = {
-            "updated_utc": utc_now_iso(),
-            "latest_itree_seed": f"0x{itree_seed_int:08x}",
-            "distinct_mir_obs_paths_latest": obs_paths,
-            "cumulative_distinct_obs_paths": ledger[
-                "cumulative_distinct_obs_paths"
-            ],
-        }
-        ratchet_path.write_text(
-            json.dumps(ratchet_data, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        harness_or_red_flag_failed = (not miri_red_flags.passed) or (
+            include_itree and not itree_ran_without_oracle
         )
+
+        written = collect_finding_bundle_files(miri["findings"], state_dir)
+        if not harness_or_red_flag_failed:
+            ledger["next_miri_seed"] = f"0x{advance_seed(miri_seed):08x}"
+            if include_itree and itree is not None:
+                ledger["next_itree_seed"] = f"0x{advance_seed(itree_seed):08x}"
+                ledger["total_itree_candidates_generated"] = prev_itree_gen + int(
+                    itree.get("total_candidates", 0)
+                )
+            ledger["total_campaigns_run"] = prev_campaigns + 1
+            ledger["total_miri_candidates_generated"] = prev_miri_gen + int(
+                miri.get("total_candidates", 0)
+            )
+            ledger["total_miri_candidates_evaluated"] = prev_miri_eval + int(
+                miri.get("compared_candidates", 0)
+            )
+            ledger["last_miri_seed"] = f"0x{miri_seed:08x}"
+            ledger["last_miri_signature"] = miri_signature_for_seed_check(miri)
+            ledger["active_fingerprints"] = [d.fingerprint for d in unquarantined]
+            ledger["quarantined_fingerprints"] = [d.fingerprint for d in quarantined]
+            ledger["last_run_utc"] = utc_now_iso()
+            ledger["last_profile"] = profile.name
+            ledger["last_oracle_comparison"] = (
+                "performed" if not include_itree else "miri_performed_itree_not_performed"
+            )
+            ledger_path.write_text(
+                json.dumps(ledger, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            written.append(ledger_path)
 
         elapsed_sec = time.monotonic() - start_time
+        report_md = render_oracle_campaign_report(
+            profile,
+            date_prefix,
+            miri,
+            miri_red_flags,
+            all_dedup,
+            unquarantined,
+            quarantined,
+            include_itree,
+            itree,
+            itree_ran_without_oracle,
+            miri_seed,
+            itree_seed,
+            elapsed_sec,
+        )
+        for report_path in [
+            state_dir / "reports" / f"{date_prefix}_{profile.name}_campaign_report.md",
+            state_dir / "reports" / "LATEST_REPORT.md",
+        ]:
+            report_path.write_text(report_md, encoding="utf-8")
+            written.append(report_path)
 
-        # 6. Render Dual-Audience Markdown Campaign Report
-        report_lines = [
-            f"# Anneal Dual Differential Testing Report (`{profile.name}` — `{date_prefix}`)",
-            "",
-            "## 1. Campaign Executive Summary",
-            "",
-            "| Metric | `miri-difftest` (`2.a` Anneal vs. `2.b` Miri) | `itree-difftest` (`2.a` Anneal vs. `2.c` Native Instrumented) |",
-            "| :--- | :--- | :--- |",
-            f"| **PRNG Seed** | `0x{miri_seed_int:08x}` (next: `0x{next_miri_seed:08x}`) | `0x{itree_seed_int:08x}` (next: `0x{next_itree_seed:08x}`) |",
-            f"| **Mutated AST Candidates** | `{miri_summary['total_candidates']}` (`{miri_summary['batches']}` × `{miri_summary['batch_size']}`) | `{itree_summary['total_candidates']}` (`{itree_summary['batches']}` × `{itree_summary['batch_size']}`) |",
-            f"| **`rustc` Compile Pass Rate** | `{miri_summary['compiled_candidates']}/{miri_summary['total_candidates']}` (**{miri_summary['compile_pass_rate_pct']:.2f}%**) | `{itree_summary['opt_o0_o2_parity_count']}/{itree_summary['total_candidates']}` (**{itree_summary['compile_pass_rate_pct']:.2f}%** at `-O0` & `-O2`) |",
-            f"| **Input / Schedule Executions** | `{miri_summary['padding_checks_passed']}` non-zero padding probes | `{itree_summary['total_inputs_evaluated']}` (`{itree_summary['inputs_per_fn']}` inputs/fn) |",
-            f"| **Oracle Agreement / Parity Rate** | **{miri_summary['agreement_rate_pct']:.2f}%** (`Pass`: `{miri_summary['verdict_buckets']['Pass']}`, `StrictUB`: `{miri_summary['verdict_buckets']['StrictUB']}`) | **{itree_summary['metamorphic_parity_rate_pct']:.2f}%** (`0` `unsafe` tokens, `{obs_paths}` `MirObsPathSet` paths) |",
-            f"| **Shrinker Self-Check (`ddmin`)** | `{miri_summary['shrinker_verification']['original_len']}B -> {miri_summary['shrinker_verification']['minimized_len']}B` (`{miri_summary['shrinker_verification']['predicate_evaluations']}` evals) | Enabled via `anneal_difftest::shrink` |",
-            f"| **Lean 4 Kernel Batch Suite** | `SymbolicEval` verified | {kernel_suite_status} |",
-            f"| **Campaign Wall-Clock Time** | `{miri_summary['elapsed_ms']:.1f} ms` | `{itree_summary['elapsed_ms']:.1f} ms` (Total: `{elapsed_sec:.2f} s`) |",
-            "",
-            "## 2. Divergences & Dual-Audience Reproducer Reports (Human `(a)` + Agent `(b)`)",
-            "",
-        ]
-
-        if not recorded_findings:
-            report_lines.extend(
-                [
-                    "> **0 Divergences Detected**: All mutated AST candidates, layout-aware byte inputs, and `EnvSchedule` fault injections agreed between Anneal (`2.a`), Miri (`2.b`), and Native `-O0`/`-O2` Instrumented Execution (`2.c`).",
-                    "",
-                ]
-            )
-        else:
-            report_lines.extend(
-                [
-                    f"Recorded **{len(recorded_findings)}** deduplicated finding(s) (**{new_unquarantined_count}** new unquarantined):",
-                    "",
-                ]
-            )
-            for idx, finding in enumerate(recorded_findings, start=1):
-                report_lines.append(
-                    render_finding_markdown_section(idx, finding)
-                )
-
-        report_md = "\n".join(report_lines).rstrip() + "\n"
-        report_filename = f"{date_prefix}_{profile.name}_campaign_report.md"
-        report_path = state_dir / "reports" / report_filename
-        latest_report_path = state_dir / "reports" / "LATEST_REPORT.md"
-        report_path.write_text(report_md, encoding="utf-8")
-        latest_report_path.write_text(report_md, encoding="utf-8")
+        campaign_summary = {
+            "profile": profile.name,
+            "date_utc": date_prefix,
+            "miri_seed": f"0x{miri_seed:08x}",
+            "itree_seed": f"0x{itree_seed:08x}" if include_itree else None,
+            "miri_oracle_comparison": "performed",
+            "itree_oracle_comparison": (
+                "not_performed"
+                if (include_itree and itree_ran_without_oracle)
+                else ("failed" if include_itree else "skipped")
+            ),
+            "red_flags": {
+                "passed": miri_red_flags.passed,
+                "checks": miri_red_flags.checks,
+                "failure_reasons": miri_red_flags.failure_reasons,
+            },
+            "miri_summary": miri,
+            "deduplicated_findings": [d.to_dict() for d in all_dedup],
+            "unquarantined_findings": [d.to_dict() for d in unquarantined],
+            "quarantined_findings": [d.to_dict() for d in quarantined],
+            "elapsed_sec": round(elapsed_sec, 3),
+        }
+        summary_json_text = json.dumps(campaign_summary, indent=2) + "\n"
+        for summary_path in [
+            state_dir / "reports" / f"{date_prefix}_{profile.name}_campaign_summary.json",
+            state_dir / "reports" / "LATEST_CAMPAIGN_SUMMARY.json",
+        ]:
+            summary_path.write_text(summary_json_text, encoding="utf-8")
+            written.append(summary_path)
 
         if args.junit_xml:
-            write_junit_xml(
+            write_oracle_junit_xml(
                 args.junit_xml.resolve(),
                 profile.name,
-                miri_summary,
-                itree_summary,
-                recorded_findings,
+                miri,
+                miri_red_flags,
+                unquarantined,
+                quarantined,
+                include_itree,
+                itree,
+                itree_ran_without_oracle,
                 elapsed_sec,
             )
 
-        if x20_uri:
-            sync_state_to_x20(state_dir, x20_uri)
-
+        sync_state_to_x20(state_dir, x20_uri, written)
         print(report_md)
-        return 0
+
+        if harness_or_red_flag_failed:
+            return EXIT_HARNESS_FAILED
+        if len(unquarantined) > 0:
+            return EXIT_DIVERGENCE_DETECTED
+        return EXIT_SUCCESS
     finally:
         if temp_ctx is not None:
             temp_ctx.cleanup()

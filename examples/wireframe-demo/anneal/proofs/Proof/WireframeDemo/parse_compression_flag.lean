@@ -92,7 +92,7 @@ private def evalOperandFast (locals : List LocalSlot) (op : Operand)
     | .indirect _ _ => evalOperandFallback locals (.constant c) borrows globals layouts callerLocals
     | .slice _ _ => evalOperandFallback locals (.constant c) borrows globals layouts callerLocals
     | cv =>
-      match evalConstValue cv with
+      match evalConstValue cv c.ty globals layouts with
       | .some v => .ok v locals
       | .none => .unsupported
   | .copy p =>
@@ -105,19 +105,9 @@ private def evalOperandFast (locals : List LocalSlot) (op : Operand)
           match entry.perm with
           | .disabled => .ub
           | _ =>
-            match get? locals entry.targetLocal with
-            | .some (.init targetRootVal) =>
-              let fullProj :=
-                match entry.targetProjection with
-                | .nil => restProj
-                | ph :: pt => ph :: appendProjections pt restProj
-              match readProjectedValue locals targetRootVal fullProj with
-              | .ok fieldVal => .ok fieldVal locals
-              | .ub => .ub
-              | .unsupported => .unsupported
-            | .some _ => .ub
-            | .none =>
-              match get? callerLocals entry.targetLocal with
+            match needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes with
+            | false =>
+              match get? locals entry.targetLocal with
               | .some (.init targetRootVal) =>
                 let fullProj :=
                   match entry.targetProjection with
@@ -127,8 +117,23 @@ private def evalOperandFast (locals : List LocalSlot) (op : Operand)
                 | .ok fieldVal => .ok fieldVal locals
                 | .ub => .ub
                 | .unsupported => .unsupported
-              | _ => .ub
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  let fullProj :=
+                    match entry.targetProjection with
+                    | .nil => restProj
+                    | ph :: pt => ph :: appendProjections pt restProj
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | _ => .ub
+            | true => evalOperandFallback locals (.copy p) borrows globals layouts callerLocals
         | .none => evalDerefGlobalFallback globals ptrVal sz locals restProj
+      | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
+        evalOperandFallback locals (.copy p) borrows globals layouts callerLocals
       | _ => .ub
     | _ =>
       match get? locals p.local_ with
@@ -253,7 +258,13 @@ private def evalRvalueSymTreeFast
   match rv with
   | .use op =>
     match evalOperandFast locals op mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok v locals' => .leaf (.ok v locals' mem)
+    | .ok v locals' =>
+      match op, mem.borrows with
+      | .copy { local_ := ptrLoc, projection := .deref :: restProj }, b1 :: b2 :: restBorrows =>
+        .leaf (.ok v locals' { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b1 :: b2 :: restBorrows) })
+      | .move { local_ := ptrLoc, projection := .deref :: restProj }, b1 :: b2 :: restBorrows =>
+        .leaf (.ok v locals' { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b1 :: b2 :: restBorrows) })
+      | _, _ => .leaf (.ok v locals' mem)
     | .ub => .leaf .ub
     | .unsupported => .leaf .unsupported
   | .ref bk p =>

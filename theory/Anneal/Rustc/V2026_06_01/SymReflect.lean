@@ -315,20 +315,25 @@ def evalSymPlaceCopy
         match entry.perm with
         | .disabled => .none
         | _ =>
-          match get? slots entry.targetLocal with
-          | .some (.concrete (.init targetRootVal)) =>
-            let fullProj :=
-              match entry.targetProjection with
-              | .nil => restProj
-              | ph :: pt => ph :: appendProjections pt restProj
-            match readProjectedPure targetRootVal fullProj with
-            | .some fieldVal => .some (.concrete fieldVal)
-            | .none => .none
-          | .some (.symArg idx) =>
-            match entry.targetProjection, restProj with
-            | .nil, .nil => .some (.symArg idx)
-            | _, _ => .none
-          | _ => .none
+          match
+            needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+          with
+          | false =>
+            match get? slots entry.targetLocal with
+            | .some (.concrete (.init targetRootVal)) =>
+              let fullProj :=
+                match entry.targetProjection with
+                | .nil => restProj
+                | ph :: pt => ph :: appendProjections pt restProj
+              match readProjectedPure targetRootVal fullProj with
+              | .some fieldVal => .some (.concrete fieldVal)
+              | .none => .none
+            | .some (.symArg idx) =>
+              match entry.targetProjection, restProj with
+              | .nil, .nil => .some (.symArg idx)
+              | _, _ => .none
+            | _ => .none
+          | true => .none
       | .none => .none
     | _ => .none
   | .nil =>
@@ -461,91 +466,99 @@ theorem evalSymPlaceCopy_sound_copy
                     rw [hPerm] at h
                     dsimp only [evalSymPlaceCopy] at h
                     dsimp only [evalOperand]
-                    rw [get?_concretizeSymSlots args slots entry.targetLocal]
-                    cases hTProj : entry.targetProjection with
-                    | nil =>
-                      rw [hTProj] at h
-                      dsimp only [evalSymPlaceCopy] at h
-                      dsimp only [evalOperand]
-                      cases hTarget : get? slots entry.targetLocal with
-                      | none =>
-                        rw [hTarget] at h
-                        nomatch h
-                      | some tSlot =>
-                        rw [hTarget] at h
-                        cases tSlot with
-                        | symPair0 _ _ => nomatch h
-                        | symArg idx =>
-                          dsimp only at h
-                          cases pTail with
-                          | cons _ _ => nomatch h
-                          | nil =>
-                            injection h with hEq
-                            subst hEq
-                            dsimp only [concretizeSymSlot, concretizeSymReadResult]
-                            cases get? args idx with
-                            | none => rfl
-                            | some v => rfl
-                        | concrete tcSlot =>
-                          cases tcSlot with
-                          | dead => nomatch h
-                          | uninit => nomatch h
-                          | init targetRootVal =>
-                            dsimp only at h
-                            dsimp only [concretizeSymSlot]
-                            cases hRead : readProjectedPure targetRootVal pTail with
-                            | none =>
-                              rw [hRead] at h
-                              nomatch h
-                            | some fieldVal =>
-                              rw [hRead] at h
-                              injection h with hEq
-                              subst hEq
-                              dsimp only [concretizeSymReadResult]
-                              rw [readProjectedPure_sound
-                                (concretizeSymSlots args slots)
-                                targetRootVal
-                                pTail
-                                fieldVal
-                                hRead]
-                    | cons ph pt =>
-                      rw [hTProj] at h
-                      dsimp only [evalSymPlaceCopy] at h
-                      dsimp only [evalOperand]
-                      cases hTarget : get? slots entry.targetLocal with
-                      | none =>
-                        rw [hTarget] at h
-                        nomatch h
-                      | some tSlot =>
-                        rw [hTarget] at h
-                        cases tSlot with
-                        | symArg idx | symPair0 _ idx =>
+                    cases hRes :
+                        needsThinPtrElemResolution
+                          entry.targetProjection
+                          ptrVal.offsetBytes with
+                    | true =>
+                      rw [hRes] at h
+                      nomatch h
+                    | false =>
+                      rw [hRes] at h
+                      dsimp only at h ⊢
+                      rw [get?_concretizeSymSlots args slots entry.targetLocal]
+                      cases hTProj : entry.targetProjection with
+                      | nil =>
+                        rw [hTProj] at h
+                        dsimp only at h ⊢
+                        cases hTarget : get? slots entry.targetLocal with
+                        | none =>
+                          rw [hTarget] at h
                           nomatch h
-                        | concrete tcSlot =>
-                          cases tcSlot with
-                          | dead => nomatch h
-                          | uninit => nomatch h
-                          | init targetRootVal =>
+                        | some tSlot =>
+                          rw [hTarget] at h
+                          cases tSlot with
+                          | symPair0 _ _ => nomatch h
+                          | symArg idx =>
                             dsimp only at h
-                            dsimp only [concretizeSymSlot]
-                            cases hRead :
-                                readProjectedPure
-                                  targetRootVal
-                                  (ph :: appendProjections pt pTail) with
-                            | none =>
-                              rw [hRead] at h
-                              nomatch h
-                            | some fieldVal =>
-                              rw [hRead] at h
+                            cases pTail with
+                            | cons _ _ => nomatch h
+                            | nil =>
                               injection h with hEq
                               subst hEq
-                              dsimp only [concretizeSymReadResult]
-                              rw [readProjectedPure_sound
-                                (concretizeSymSlots args slots)
-                                targetRootVal
-                                (ph :: appendProjections pt pTail)
-                                fieldVal
-                                hRead]
+                              dsimp only [concretizeSymSlot, concretizeSymReadResult]
+                              cases get? args idx with
+                              | none => rfl
+                              | some v => rfl
+                          | concrete tcSlot =>
+                            cases tcSlot with
+                            | dead => nomatch h
+                            | uninit => nomatch h
+                            | init targetRootVal =>
+                              dsimp only at h
+                              dsimp only [concretizeSymSlot]
+                              cases hRead : readProjectedPure targetRootVal pTail with
+                              | none =>
+                                rw [hRead] at h
+                                nomatch h
+                              | some fieldVal =>
+                                rw [hRead] at h
+                                injection h with hEq
+                                subst hEq
+                                dsimp only [concretizeSymReadResult]
+                                rw [readProjectedPure_sound
+                                  (concretizeSymSlots args slots)
+                                  targetRootVal
+                                  pTail
+                                  fieldVal
+                                  hRead]
+                      | cons ph pt =>
+                        rw [hTProj] at h
+                        dsimp only at h ⊢
+                        cases hTarget : get? slots entry.targetLocal with
+                        | none =>
+                          rw [hTarget] at h
+                          nomatch h
+                        | some tSlot =>
+                          rw [hTarget] at h
+                          cases tSlot with
+                          | symArg idx | symPair0 _ idx =>
+                            nomatch h
+                          | concrete tcSlot =>
+                            cases tcSlot with
+                            | dead => nomatch h
+                            | uninit => nomatch h
+                            | init targetRootVal =>
+                              dsimp only at h
+                              dsimp only [concretizeSymSlot]
+                              cases hRead :
+                                  readProjectedPure
+                                    targetRootVal
+                                    (ph :: appendProjections pt pTail) with
+                              | none =>
+                                rw [hRead] at h
+                                nomatch h
+                              | some fieldVal =>
+                                rw [hRead] at h
+                                injection h with hEq
+                                subst hEq
+                                dsimp only [concretizeSymReadResult]
+                                rw [readProjectedPure_sound
+                                  (concretizeSymSlots args slots)
+                                  targetRootVal
+                                  (ph :: appendProjections pt pTail)
+                                  fieldVal
+                                  hRead]
       | field fIdx fTy =>
         dsimp only [evalSymPlaceCopy] at h
         dsimp only [evalOperand]
@@ -1130,6 +1143,85 @@ theorem resolveSymBorrowProjectionElems_sound
         subst hEq
         rw [ih rest' hRest]
 
+/-- Symbolic counterpart of `freezeDerefReadBorrowsAt` over `slots : List SymSlot`. -/
+def freezeSymDerefReadBorrowsAt
+    (slots : List SymSlot)
+    (ptrLoc : Local)
+    (restProj : List ProjectionElem)
+    (borrows : List BorrowEntry) :
+    List BorrowEntry :=
+  match get? slots ptrLoc with
+  | .some (.concrete (.init (.ptr ptrVal _))) =>
+    match lookupBorrow borrows ptrVal.tag with
+    | .some readerEntry =>
+      freezeTreeBorrowsOnReadAtProj
+        borrows
+        borrows
+        readerEntry.targetLocal
+        (.some ptrVal.tag)
+        (appendProjections readerEntry.targetProjection restProj)
+        readerEntry.rangeOffset
+        readerEntry.rangeLen
+    | .none => borrows
+  | _ => borrows
+
+theorem freezeSymDerefReadBorrowsAt_sound
+    (args : List Value)
+    (slots : List SymSlot)
+    (ptrLoc : Local)
+    (restProj : List ProjectionElem)
+    (borrows : List BorrowEntry)
+    (sv : SymVal)
+    (h :
+      evalSymPlaceCopy
+        slots
+        { local_ := ptrLoc, projection := .deref :: restProj }
+        borrows = .some sv) :
+    freezeDerefReadBorrowsAt (concretizeSymSlots args slots) ptrLoc restProj borrows =
+      freezeSymDerefReadBorrowsAt slots ptrLoc restProj borrows := by
+  dsimp only [evalSymPlaceCopy] at h
+  dsimp only [freezeDerefReadBorrowsAt, freezeSymDerefReadBorrowsAt]
+  rw [get?_concretizeSymSlots args slots ptrLoc]
+  cases hGet : get? slots ptrLoc with
+  | none => rfl
+  | some sSlot =>
+    rw [hGet] at h
+    cases sSlot with
+    | symArg _ | symPair0 _ _ => nomatch h
+    | concrete cSlot =>
+      cases cSlot with
+      | dead | uninit => nomatch h
+      | init v =>
+        cases v with
+        | unit | scalar _ | aggregate _ _ => nomatch h
+        | ptr ptrVal sz => rfl
+
+/-- Update `borrows` after an `Operand` read in `Rvalue.use`. -/
+def freezeSymOperandReadBorrows
+    (slots : List SymSlot)
+    (op : Operand)
+    (borrows : List BorrowEntry) :
+    List BorrowEntry :=
+  match op, borrows with
+  | .copy { local_ := ptrLoc, projection := .deref :: restProj },
+    b₁ :: b₂ :: restBorrows =>
+    freezeSymDerefReadBorrowsAt slots ptrLoc restProj (b₁ :: b₂ :: restBorrows)
+  | .move { local_ := ptrLoc, projection := .deref :: restProj },
+    b₁ :: b₂ :: restBorrows =>
+    freezeSymDerefReadBorrowsAt slots ptrLoc restProj (b₁ :: b₂ :: restBorrows)
+  | _, _ => borrows
+
+/-- Update `borrows` after a `Place` read in `Rvalue.copyForDeref`. -/
+def freezeSymPlaceReadBorrows
+    (slots : List SymSlot)
+    (place : Place)
+    (borrows : List BorrowEntry) :
+    List BorrowEntry :=
+  match place.projection, borrows with
+  | .deref :: restProj, b₁ :: b₂ :: restBorrows =>
+    freezeSymDerefReadBorrowsAt slots place.local_ restProj (b₁ :: b₂ :: restBorrows)
+  | _, _ => borrows
+
 /-- Evaluate an `Rvalue` that produces a `SymVal`. -/
 def evalSymRvalueConcrete
     (slots : List SymSlot)
@@ -1142,11 +1234,13 @@ def evalSymRvalueConcrete
   match rv with
   | .use op =>
     match evalSymOperand slots op borrows with
-    | .some (sv, slots') => .some (sv, slots', borrows, nextTag)
+    | .some (sv, slots') =>
+      .some (sv, slots', freezeSymOperandReadBorrows slots op borrows, nextTag)
     | .none => .none
   | .copyForDeref place =>
     match evalSymPlaceCopy slots place borrows with
-    | .some sv => .some (sv, slots, borrows, nextTag)
+    | .some sv =>
+      .some (sv, slots, freezeSymPlaceReadBorrows slots place borrows, nextTag)
     | .none => .none
   | .ref borrowKind place =>
     let perm :=
@@ -1210,6 +1304,11 @@ theorem memory_eta (m : Memory) :
   cases m
   rfl
 
+theorem memory_borrows_eta (m : Memory) (b : List BorrowEntry) :
+    ({ m with borrows := b, nextTag := m.nextTag } : Memory) = { m with borrows := b } := by
+  cases m
+  rfl
+
 /-- Concretize a symbolic `Rvalue` evaluation result against `args`. -/
 def concretizeSymRvalueResult
     (args : List Value)
@@ -1231,6 +1330,22 @@ def concretizeSymRvalueResult
     match get? args idx with
     | .some _ => .ok v0 (concretizeSymSlots args slots') mem'
     | .none => .ub
+
+theorem concretizeSymReadResult_to_rvalue
+    (args : List Value)
+    (sv0 : SymVal)
+    (s1 : List SymSlot)
+    (mem' : Memory) :
+    (match concretizeSymReadResult args sv0 s1 with
+     | .ok v locals' => RvalueEvalResult.ok v locals' mem'
+     | .ub => RvalueEvalResult.ub
+     | .unsupported => RvalueEvalResult.unsupported) =
+      concretizeSymRvalueResult args sv0 s1 mem' := by
+  cases sv0 with
+  | concrete _ => rfl
+  | symArg idx | symPair0 _ idx | symGuarded _ idx =>
+    dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
+    cases get? args idx <;> rfl
 
 theorem evalSymRvalueConcrete_sound
     (args : List Value)
@@ -1269,18 +1384,91 @@ theorem evalSymRvalueConcrete_sound
         injection hRest2 with hB hT
         subst hV; subst hS; subst hB; subst hT
         rw [evalSymOperand_sound args slots op mem.borrows mem.globals layouts sv0 s1 hOp]
-        rw [memory_eta mem]
-        cases sv0 with
-        | concrete _ => rfl
-        | symArg idx =>
-          dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
-          cases get? args idx <;> rfl
-        | symPair0 v0 idx =>
-          dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
-          cases get? args idx <;> rfl
-        | symGuarded v0 idx =>
-          dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
-          cases get? args idx <;> rfl
+        rw [memory_borrows_eta mem]
+        cases op with
+        | constant _ =>
+          dsimp only [freezeSymOperandReadBorrows]
+          exact concretizeSymReadResult_to_rvalue args sv0 s1 mem
+        | copy p =>
+          cases p with
+          | mk loc proj =>
+            cases proj with
+            | nil =>
+              dsimp only [freezeSymOperandReadBorrows]
+              exact concretizeSymReadResult_to_rvalue args sv0 s1 mem
+            | cons pHead pTail =>
+              cases pHead with
+              | deref =>
+                dsimp only [evalSymOperand] at hOp
+                cases hCopy : evalSymPlaceCopy slots { local_ := loc, projection := .deref :: pTail } mem.borrows with
+                | none =>
+                  rw [hCopy] at hOp
+                  nomatch hOp
+                | some sv1 =>
+                  rw [hCopy] at hOp
+                  injection hOp with hPair
+                  injection hPair with hSv hSlots
+                  subst hSv
+                  cases hBs : mem.borrows with
+                  | nil =>
+                    dsimp only [freezeSymOperandReadBorrows]
+                    rw [← hBs]
+                    exact concretizeSymReadResult_to_rvalue args sv1 s1 mem
+                  | cons b1 rest1 =>
+                    cases rest1 with
+                    | nil =>
+                      dsimp only [freezeSymOperandReadBorrows]
+                      rw [← hBs]
+                      exact concretizeSymReadResult_to_rvalue args sv1 s1 mem
+                    | cons b2 restBorrows =>
+                      rw [hBs] at hCopy
+                      dsimp only [freezeSymOperandReadBorrows]
+                      rw [← freezeSymDerefReadBorrowsAt_sound args slots loc pTail (b1 :: b2 :: restBorrows) sv1 hCopy]
+                      exact concretizeSymReadResult_to_rvalue args sv1 s1
+                        { mem with borrows := freezeDerefReadBorrowsAt (concretizeSymSlots args slots) loc pTail (b1 :: b2 :: restBorrows) }
+              | field _ _ | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+                dsimp only [freezeSymOperandReadBorrows]
+                exact concretizeSymReadResult_to_rvalue args sv0 s1 mem
+        | move p =>
+          cases p with
+          | mk loc proj =>
+            cases proj with
+            | nil =>
+              dsimp only [freezeSymOperandReadBorrows]
+              exact concretizeSymReadResult_to_rvalue args sv0 s1 mem
+            | cons pHead pTail =>
+              cases pHead with
+              | deref =>
+                dsimp only [evalSymOperand] at hOp
+                cases hCopy : evalSymPlaceCopy slots { local_ := loc, projection := .deref :: pTail } mem.borrows with
+                | none =>
+                  rw [hCopy] at hOp
+                  nomatch hOp
+                | some sv1 =>
+                  rw [hCopy] at hOp
+                  injection hOp with hPair
+                  injection hPair with hSv hSlots
+                  subst hSv
+                  cases hBs : mem.borrows with
+                  | nil =>
+                    dsimp only [freezeSymOperandReadBorrows]
+                    rw [← hBs]
+                    exact concretizeSymReadResult_to_rvalue args sv1 s1 mem
+                  | cons b1 rest1 =>
+                    cases rest1 with
+                    | nil =>
+                      dsimp only [freezeSymOperandReadBorrows]
+                      rw [← hBs]
+                      exact concretizeSymReadResult_to_rvalue args sv1 s1 mem
+                    | cons b2 restBorrows =>
+                      rw [hBs] at hCopy
+                      dsimp only [freezeSymOperandReadBorrows]
+                      rw [← freezeSymDerefReadBorrowsAt_sound args slots loc pTail (b1 :: b2 :: restBorrows) sv1 hCopy]
+                      exact concretizeSymReadResult_to_rvalue args sv1 s1
+                        { mem with borrows := freezeDerefReadBorrowsAt (concretizeSymSlots args slots) loc pTail (b1 :: b2 :: restBorrows) }
+              | field _ _ | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+                dsimp only [freezeSymOperandReadBorrows]
+                exact concretizeSymReadResult_to_rvalue args sv0 s1 mem
   | copyForDeref place =>
     dsimp only [evalSymRvalueConcrete] at h
     dsimp only [evalRvalue]
@@ -1296,18 +1484,36 @@ theorem evalSymRvalueConcrete_sound
       injection hRest2 with hB hT
       subst hV; subst hS; subst hB; subst hT
       rw [evalSymPlaceCopy_sound_copy args slots place mem.borrows mem.globals layouts sv0 hCopy]
-      rw [memory_eta mem]
-      cases sv0 with
-      | concrete _ => rfl
-      | symArg idx =>
-        dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
-        cases get? args idx <;> rfl
-      | symPair0 v0 idx =>
-        dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
-        cases get? args idx <;> rfl
-      | symGuarded v0 idx =>
-        dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
-        cases get? args idx <;> rfl
+      rw [memory_borrows_eta mem]
+      cases place with
+      | mk loc proj =>
+        cases proj with
+        | nil =>
+          dsimp only [freezeSymPlaceReadBorrows]
+          exact concretizeSymReadResult_to_rvalue args sv0 slots mem
+        | cons pHead pTail =>
+          cases pHead with
+          | deref =>
+            cases hBs : mem.borrows with
+            | nil =>
+              dsimp only [freezeSymPlaceReadBorrows]
+              rw [← hBs]
+              exact concretizeSymReadResult_to_rvalue args sv0 slots mem
+            | cons b1 rest1 =>
+              cases rest1 with
+              | nil =>
+                dsimp only [freezeSymPlaceReadBorrows]
+                rw [← hBs]
+                exact concretizeSymReadResult_to_rvalue args sv0 slots mem
+              | cons b2 restBorrows =>
+                rw [hBs] at hCopy
+                dsimp only [freezeSymPlaceReadBorrows]
+                rw [← freezeSymDerefReadBorrowsAt_sound args slots loc pTail (b1 :: b2 :: restBorrows) sv0 hCopy]
+                exact concretizeSymReadResult_to_rvalue args sv0 slots
+                  { mem with borrows := freezeDerefReadBorrowsAt (concretizeSymSlots args slots) loc pTail (b1 :: b2 :: restBorrows) }
+          | field _ _ | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+            dsimp only [freezeSymPlaceReadBorrows]
+            exact concretizeSymReadResult_to_rvalue args sv0 slots mem
   | ref borrowKind place =>
     cases place with
     | mk loc proj =>

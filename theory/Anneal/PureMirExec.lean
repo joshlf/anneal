@@ -337,10 +337,21 @@ def isPureOperand : Operand → Bool
   | .move p => isPurePlace p
   | .constant c => isPureConstValue c.val
 
+/-- Syntactic purity check on a `CastKind`: allows value/byte casts while rejecting pointer/provenance coercions. -/
+def isPureCastKind : CastKind → Bool
+  | .intToInt => true
+  | .floatToInt => true
+  | .floatToFloat => true
+  | .intToFloat => true
+  | .transmute => true
+  | .subtype => true
+  | _ => false
+
 /--
 Syntactic purity check on an `Rvalue`: allows value operations on pure places
-and operands while rejecting address/borrow creation (`.ref`, `.rawPtr`,
-`.threadLocalRef`, `.shallowInitBox`).
+and operands while rejecting address/borrow creation and pointer/memory queries
+(`.ref`, `.rawPtr`, `.threadLocalRef`, `.shallowInitBox`, `.len`,
+`.wrapUnsafeBinder`, `.binaryOp .offset`, and pointer coercions).
 -/
 def isPureRvalue : Rvalue → Bool
   | .use op => isPureOperand op
@@ -348,8 +359,9 @@ def isPureRvalue : Rvalue → Bool
   | .ref .. => false
   | .rawPtr .. => false
   | .threadLocalRef _ => false
-  | .len p => isPurePlace p
-  | .cast _ op _ => isPureOperand op
+  | .len _ => false
+  | .cast ck op _ => isPureCastKind ck && isPureOperand op
+  | .binaryOp .offset _ _ => false
   | .binaryOp _ lhs rhs => isPureOperand lhs && isPureOperand rhs
   | .nullaryOp _ _ => true
   | .unaryOp _ op => isPureOperand op
@@ -357,7 +369,7 @@ def isPureRvalue : Rvalue → Bool
   | .aggregate _ ops => ops.all isPureOperand
   | .shallowInitBox _ _ => false
   | .copyForDeref p => isPurePlace p
-  | .wrapUnsafeBinder op _ => isPureOperand op
+  | .wrapUnsafeBinder _ _ => false
 
 /--
 Syntactic purity check on a `StatementKind`: allows `.assign`,
@@ -604,7 +616,26 @@ theorem evalRvalue_pure_eq_withMem
     dsimp only [evalRvalue]
     rw [evalOperand_pure_eq locals op mem.borrows mem.globals layouts mem.callerLocals h_pure]
     rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
-    cases evalOperand locals op [] [] layouts [] <;> rfl
+    cases evalOperand locals op [] [] layouts [] with
+    | ub => rfl
+    | unsupported => rfl
+    | ok v locals' =>
+      cases op with
+      | constant _ => rfl
+      | copy p =>
+        rcases p with ⟨loc, proj⟩
+        cases proj with
+        | nil => rfl
+        | cons hd tl =>
+          simp only [isPureOperand, isPurePlace, List.all_cons, Bool.and_eq_true] at h_pure
+          cases hd <;> first | rfl | exact False.elim (Bool.false_ne_true h_pure.1)
+      | move p =>
+        rcases p with ⟨loc, proj⟩
+        cases proj with
+        | nil => rfl
+        | cons hd tl =>
+          simp only [isPureOperand, isPurePlace, List.all_cons, Bool.and_eq_true] at h_pure
+          cases hd <;> first | rfl | exact False.elim (Bool.false_ne_true h_pure.1)
   | «repeat» op count =>
     dsimp only [isPureRvalue] at h_pure
     dsimp only [evalRvalue]
@@ -614,54 +645,58 @@ theorem evalRvalue_pure_eq_withMem
   | ref _ _ => cases h_pure
   | threadLocalRef _ => cases h_pure
   | rawPtr _ _ => cases h_pure
-  | len p =>
-    dsimp only [isPureRvalue] at h_pure
-    dsimp only [evalRvalue]
-    rw [evalOperand_pure_eq locals (.copy p) mem.borrows mem.globals layouts mem.callerLocals h_pure]
-    rw [evalOperand_pure_eq locals (.copy p) emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
-    repeat' (first | rfl | split)
+  | len _ => cases h_pure
   | cast ck op targetTy =>
-    dsimp only [isPureRvalue] at h_pure
+    simp only [isPureRvalue, Bool.and_eq_true] at h_pure
+    rcases h_pure with ⟨h_ck, h_op⟩
     cases ck with
-    | transmute => exact evalByteCast_pure_eq_withMem locals op targetTy mem localDecls layouts h_pure
-    | subtype => exact evalByteCast_pure_eq_withMem locals op targetTy mem localDecls layouts h_pure
+    | transmute => exact evalByteCast_pure_eq_withMem locals op targetTy mem localDecls layouts h_op
+    | subtype => exact evalByteCast_pure_eq_withMem locals op targetTy mem localDecls layouts h_op
+    | pointerExposeProvenance => cases h_ck
+    | pointerWithExposedProvenance => cases h_ck
+    | pointerCoercion _ => cases h_ck
+    | ptrToPtr => cases h_ck
+    | fnPtrToPtr => cases h_ck
     | _ =>
       dsimp only [evalRvalue]
-      try rw [evalOperand_pure_eq locals op mem.borrows mem.globals layouts mem.callerLocals h_pure]
-      try rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
+      try rw [evalOperand_pure_eq locals op mem.borrows mem.globals layouts mem.callerLocals h_op]
+      try rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_op]
       try cases evalOperand locals op [] [] layouts []
       repeat' (first | rfl | split)
       all_goals try dsimp (config := { zeta := true })
       repeat' (first | rfl | split)
       all_goals try rfl
   | binaryOp op lhs rhs =>
-    simp only [isPureRvalue, Bool.and_eq_true] at h_pure
-    dsimp only [evalRvalue]
-    rw [evalOperand_pure_eq locals lhs mem.borrows mem.globals layouts mem.callerLocals h_pure.1]
-    rw [evalOperand_pure_eq locals lhs emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure.1]
-    cases evalOperand locals lhs [] [] layouts [] with
-    | ub => rfl
-    | unsupported => rfl
-    | ok lhsVal locals₁ =>
-      dsimp only
-      rw [evalOperand_pure_eq locals₁ rhs mem.borrows mem.globals layouts mem.callerLocals h_pure.2]
-      rw [evalOperand_pure_eq locals₁ rhs emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure.2]
-      cases evalOperand locals₁ rhs [] [] layouts [] with
+    cases op with
+    | offset => cases h_pure
+    | _ =>
+      simp only [isPureRvalue, Bool.and_eq_true] at h_pure
+      dsimp only [evalRvalue]
+      rw [evalOperand_pure_eq locals lhs mem.borrows mem.globals layouts mem.callerLocals h_pure.1]
+      rw [evalOperand_pure_eq locals lhs emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure.1]
+      cases evalOperand locals lhs [] [] layouts [] with
       | ub => rfl
       | unsupported => rfl
-      | ok rhsVal locals₂ =>
+      | ok lhsVal locals₁ =>
         dsimp only
-        cases lhsVal with
-        | scalar lhsSc =>
-          cases rhsVal with
-          | scalar rhsSc =>
-            exact evalScalarBinOp_eq_withMem op lhsSc rhsSc locals₂ mem _
+        rw [evalOperand_pure_eq locals₁ rhs mem.borrows mem.globals layouts mem.callerLocals h_pure.2]
+        rw [evalOperand_pure_eq locals₁ rhs emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure.2]
+        cases evalOperand locals₁ rhs [] [] layouts [] with
+        | ub => rfl
+        | unsupported => rfl
+        | ok rhsVal locals₂ =>
+          dsimp only
+          cases lhsVal with
+          | scalar lhsSc =>
+            cases rhsVal with
+            | scalar rhsSc =>
+              exact evalScalarBinOp_eq_withMem _ lhsSc rhsSc locals₂ mem _
+            | _ => rfl
+          | ptr ptrVal sz =>
+            cases rhsVal with
+            | scalar _ => rfl
+            | _ => rfl
           | _ => rfl
-        | ptr ptrVal sz =>
-          cases rhsVal with
-          | scalar _ => cases op <;> rfl
-          | _ => rfl
-        | _ => rfl
   | nullaryOp _ _ => rfl
   | unaryOp uop op =>
     dsimp only [isPureRvalue] at h_pure
@@ -692,7 +727,14 @@ theorem evalRvalue_pure_eq_withMem
     dsimp only [evalRvalue]
     rw [evalOperand_pure_eq locals (.copy p) mem.borrows mem.globals layouts mem.callerLocals h_pure]
     rw [evalOperand_pure_eq locals (.copy p) emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
-    repeat' (first | rfl | split)
+    cases evalOperand locals (.copy p) [] [] layouts [] with
+    | ub => rfl
+    | unsupported => rfl
+    | ok v locals' =>
+      dsimp only
+      unfold evalPlaceDiscriminant
+      dsimp (config := { zeta := true })
+      repeat' (first | rfl | split)
   | aggregate kind ops =>
     dsimp only [isPureRvalue] at h_pure
     cases kind
@@ -707,8 +749,17 @@ theorem evalRvalue_pure_eq_withMem
     dsimp only [evalRvalue]
     rw [evalOperand_pure_eq locals (.copy p) mem.borrows mem.globals layouts mem.callerLocals h_pure]
     rw [evalOperand_pure_eq locals (.copy p) emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
-    cases evalOperand locals (.copy p) [] [] layouts [] <;> rfl
-  | wrapUnsafeBinder _ _ => rfl
+    cases evalOperand locals (.copy p) [] [] layouts [] with
+    | ub => rfl
+    | unsupported => rfl
+    | ok v locals' =>
+      rcases p with ⟨loc, proj⟩
+      cases proj with
+      | nil => rfl
+      | cons hd tl =>
+        simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_pure
+        cases hd <;> first | rfl | exact False.elim (Bool.false_ne_true h_pure.1)
+  | wrapUnsafeBinder _ _ => cases h_pure
 
 /-- Replace the `Memory` in a normal `MirOutcome` with `mem`. -/
 def MirOutcome.withMem (mem : Memory) : MirOutcome → MirOutcome
@@ -978,11 +1029,20 @@ theorem evalTerminator_toMachineState_eq_withMem
         | true => rfl
         | false =>
           dsimp only [applyUnwindAction]
-          cases unwind <;> rfl
+          cases unwind with
+          | continue_ =>
+            dsimp only
+            rw [h_stack]
+            rfl
+          | _ => rfl
       | _ => rfl
   | call _ _ _ _ _ => cases h_pure
   | tailCall _ _ => cases h_pure
-  | unwindResume => rfl
+  | unwindResume =>
+    unfold evalTerminator
+    dsimp only [PureState.toMachineState]
+    rw [h_stack]
+    rfl
   | unwindTerminate => rfl
   | inlineAsm => rfl
 
@@ -1970,7 +2030,7 @@ def purePairTy : Ty :=
 
 /-- Two-variant enum/ADT type `Mode` (`variant 0 = KeepFirst`, `variant 1 = KeepSecond`). -/
 def pureModeEnumTy : Ty :=
-  { kind := .adt "demo::Mode" [], layoutIdx := 0 }
+  { kind := .adt "demo::Mode" [], layoutIdx := 1 }
 
 /--
 Multi-block MIR function `pureAdtMultiBlockBody` operating on structs/tuples

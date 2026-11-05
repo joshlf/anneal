@@ -66,11 +66,14 @@ pub fn kernel_step(a: u32, b: u32) -> u32 {
 }
 "#;
 
-    // 1. Verify Milestone 1 instrumented module compiles cleanly with `rustc -D warnings`.
-    let instrumented =
-        anneal_difftest::instrument_source(seed_program, "kernel_step", &["ext_oracle"])
-            .expect("instrument_source should succeed");
-    assert_compiles_cleanly_with_rustc("milestone_1_instrumented", &instrumented);
+    // 1. Verify `#[anneal_trace::external]`-annotated module compiles cleanly with `rustc -D warnings`.
+    let (annotated, _) =
+        anneal_difftest::annotate_itree_external_callees(seed_program, "kernel_step")
+            .expect("annotate_itree_external_callees should succeed");
+    let annotated_crate = format!(
+        "#![feature(register_tool)]\n#![register_tool(anneal_trace)]\n{annotated}"
+    );
+    assert_compiles_cleanly_with_rustc("milestone_1_annotated", &annotated_crate);
 
     // 2. Verify Milestone 4 Miri batch candidates compile cleanly with `rustc -D warnings`.
     let miri_batch =

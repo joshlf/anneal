@@ -136,6 +136,15 @@ def projWriteResultToVerdict : ProjWriteResult → Verdict
   | .ub => .ub
   | .unsupported => .unsupported
 
+/-- Convert a real `MirStepNode` from `Trusted.Rustc.V2026_06_01.MirSemantics` into a `Verdict`. -/
+@[reducible]
+def stepNodeToVerdict : MirStepNode → Verdict
+  | .tau _ => .normalUnit
+  | .ret (.normal _) => .normalUnit
+  | .ret .panic => .panic
+  | .vis (.inl (.fail .ub)) _ => .ub
+  | _ => .unsupported
+
 /--
 Evaluate a `FixtureProg` by directly invoking the **actual operational semantics
 functions** in `Trusted.Rustc.V2026_06_01.MirSemantics`:
@@ -145,14 +154,17 @@ functions** in `Trusted.Rustc.V2026_06_01.MirSemantics`:
 3. `.canonicalSafeLocalWriteRead`: executes `writePlaceValue` followed by `readProjectedValue`
 4. `.canonicalSafeTreeBorrowMut`: executes `evalRvalue (.ref (.mut false) ...)` followed by deref `writePlaceValue`
 5. `.sharedUnsafeCellWrite` (`GAP-MR-0001`): executes `evalRvalue (.ref .shared ...)` on local 0
-   with `localDecls` typing local 0 as `core::cell::UnsafeCell<u32>` (`!Freeze` → `TreeBorrowPerm.reserved`)
-   and then executes `writePlaceValue` through the resulting pointer (`[.deref]`), returning `.normalUnit`.
+   with `localDecls` typing local 0 as `core::cell::UnsafeCell<u32>` (`!Freeze` → `TreeBorrowPerm.reserved`),
+   followed by `evalRvalue (.rawPtr .not { local_ := 1, projection := [.deref] })` (the real MIR shape
+   produced by `(shared_ref as *const UnsafeCell<u32>) as *mut u32` → `&raw const (*_1)`), and then
+   executes `writePlaceValue` through the resulting raw pointer (`[.deref]`), returning `.normalUnit`.
 6. `.unionVariantWriteRead` (`GAP-MR-0002`): executes `writeProjectedValue` to union variant field 1,
    extending the union field vector (`setOrExtendFields`) and returning `.normalUnit`.
 7. `.dynamicArrayIndexBorrow` (`GAP-MR-0003`): executes `evalRvalue (.ref .shared { local_ := 0, projection := [.index 1] })`,
    which resolves `.index 1` at borrow creation time (`resolveBorrowProjectionElems`), marks temporary index local 1 `.dead`
    (`StorageDead(1)`), and reads through the recorded `entry.targetProjection` via `readProjectedValue`, returning `.normalUnit`.
-8. `.exactDivIntrinsicCall` (`GAP-MR-0004`): executes `evalExactDiv ⟨84, 4⟩ ⟨2, 4⟩ false`, returning `.normalUnit`.
+8. `.exactDivIntrinsicCall` (`GAP-MR-0004`): executes `evalTerminator` on `"core::intrinsics::exact_div"`
+   with `24, 2` and `target = .some 1` (`stepNodeToVerdict` maps `.tau _` to `.normalUnit`).
 9. `.reservedImEpochTransition` (`GAP-EPOCH-0001`): executes `hasProtectedWriteConflict` on a protected `Reserved` borrow entry.
 -/
 @[reducible]
@@ -186,17 +198,26 @@ def evalAnnealV2026_06_01 (prog : FixtureProg) (_st : FixtureState) : Verdict :=
     | .ub => .ub
     | .unsupported => .unsupported
   | .sharedUnsafeCellWrite =>
-    let initLocals : List LocalSlot := [.init (.scalar ⟨10, 4⟩), .uninit]
-    let unsafeCellDecl : LocalDecl := {
-      mutability := .not
-      ty := { kind := .adt "core::cell::UnsafeCell" [.uint .u32], layoutIdx := 0 }
-      debugName := .none
-    }
-    match evalRvalue initLocals (.ref .shared { local_ := 0, projection := .nil }) emptyMemory [unsafeCellDecl] with
-    | .ok ptrVal _ memAfterRef =>
-      let localsWithPtr : List LocalSlot := [.init (.scalar ⟨10, 4⟩), .init ptrVal]
-      placeWriteResultToVerdict
-        (writePlaceValue localsWithPtr memAfterRef.borrows { local_ := 1, projection := [.deref] } (.scalar ⟨42, 4⟩))
+    let unsafeCellRigid : RigidTy := .adt "core::cell::UnsafeCell" [.uint .u32]
+    let unsafeCellTy : Ty := { kind := unsafeCellRigid, layoutIdx := 0 }
+    let refTy : Ty := { kind := .ref .not unsafeCellRigid, layoutIdx := 0 }
+    let rawPtrTy : Ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 }
+    let localDecls : List LocalDecl := [
+      { mutability := .not, ty := unsafeCellTy, debugName := .none },
+      { mutability := .not, ty := refTy, debugName := .none },
+      { mutability := .mut, ty := rawPtrTy, debugName := .none }
+    ]
+    let initLocals : List LocalSlot := [.init (.scalar ⟨10, 4⟩), .uninit, .uninit]
+    match evalRvalue initLocals (.ref .shared { local_ := 0, projection := .nil }) emptyMemory localDecls with
+    | .ok refVal _ memAfterRef =>
+      let localsWithRef : List LocalSlot := [.init (.scalar ⟨10, 4⟩), .init refVal, .uninit]
+      match evalRvalue localsWithRef (.rawPtr .not { local_ := 1, projection := [.deref] }) memAfterRef localDecls with
+      | .ok rawVal _ memAfterRaw =>
+        let localsWithRaw : List LocalSlot := [.init (.scalar ⟨10, 4⟩), .init refVal, .init rawVal]
+        placeWriteResultToVerdict
+          (writePlaceValue localsWithRaw memAfterRaw.borrows { local_ := 2, projection := [.deref] } (.scalar ⟨42, 4⟩))
+      | .ub => .ub
+      | .unsupported => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported
   | .unionVariantWriteRead =>
@@ -220,9 +241,23 @@ def evalAnnealV2026_06_01 (prog : FixtureProg) (_st : FixtureState) : Verdict :=
     | .ub => .ub
     | .unsupported => .unsupported
   | .exactDivIntrinsicCall =>
-    match evalExactDiv ⟨84, 4⟩ ⟨2, 4⟩ false with
-    | .some ⟨42, 4⟩ => .normalUnit
-    | _ => .ub
+    let fnTy : Ty := { kind := .fnDef "core::intrinsics::exact_div" .nil, layoutIdx := 0 }
+    let funcOp : Operand := .constant { ty := fnTy, val := .zeroSized }
+    let argOps : List Operand := [
+      .copy { local_ := 1, projection := .nil },
+      .copy { local_ := 2, projection := .nil }
+    ]
+    let dest : Place := { local_ := 0, projection := .nil }
+    let term : Terminator := { kind := .call funcOp argOps dest (.some 1) .unreachable, span := "" }
+    let initState : MachineState := {
+      frame := {
+        blockIdx := 0
+        stmtIdx := 0
+        locals := [.uninit, .init (.scalar ⟨24, 4⟩), .init (.scalar ⟨2, 4⟩)]
+      }
+      memory := emptyMemory
+    }
+    stepNodeToVerdict (evalTerminator initState term .none)
   | .reservedImEpochTransition =>
     let protectedReservedEntry : BorrowEntry := {
       tag := 1
@@ -449,7 +484,7 @@ functions** in `Trusted.Rustc.V2026_08_01.MirSemantics`:
 5. `.sharedUnsafeCellWrite`: passes `localDecls` with `core::cell::UnsafeCell<u32>` at local 0 to `V2026_08_01.MirSemantics.evalRvalue`, so `placeIsFreeze` is `false` (`TreeBorrowPerm.reserved`) and `writePlaceValue` returns `.ok` (`.normalUnit`).
 6. `.unionVariantWriteRead`: calls `V2026_08_01.MirSemantics.writeProjectedValue` and `readProjectedValue` on `.field 1 u32Ty` (returns `.normalUnit`).
 7. `.dynamicArrayIndexBorrow`: calls `V2026_08_01.MirSemantics.evalRvalue` on `.ref .shared { local_ := 0, projection := [.index 1] }`, then `readProjectedValue` after `.dead` on local 1 (returns `.normalUnit`).
-8. `.exactDivIntrinsicCall`: calls `V2026_08_01.MirSemantics.evalTerminator` on `"core::intrinsics::exact_div"` with `24, 2` and `target = .some 1` (`stepNodeToVerdictV08` maps `.tau _` to `.normalUnit`).
+8. `.exactDivIntrinsicCall`: calls `V2026_08_01.MirSemantics.evalTerminator` on `"core::intrinsics::exact_div"` instantiated at `u32` (as in captured MIR, where the callee constant carries its generic arguments) with `24, 2` and `target = .some 1` (`stepNodeToVerdictV08` maps `.tau _` to `.normalUnit`).
 9. `.reservedImEpochTransition`: calls `V2026_08_01.MirSemantics.protectedReborrowHasInitWrite (V2026_08_01.MirSemantics.initProtectedReborrowPerm true false true)` (`true => .normalUnit`).
 -/
 @[reducible]
@@ -485,17 +520,24 @@ def evalAnnealV2026_08_01 (prog : FixtureProg) (_st : FixtureState) : Verdict :=
   | .sharedUnsafeCellWrite =>
     let unsafeCellRigid : RigidTy := .adt "core::cell::UnsafeCell" [.uint .u32]
     let unsafeCellTy : Ty := { kind := unsafeCellRigid, layoutIdx := 0 }
-    let ptrTy : Ty := { kind := .ref .not unsafeCellRigid, layoutIdx := 0 }
+    let refTy : Ty := { kind := .ref .not unsafeCellRigid, layoutIdx := 0 }
+    let rawPtrTy : Ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 0 }
     let localDecls : List LocalDecl := [
       { mutability := .not, ty := unsafeCellTy, debugName := .none },
-      { mutability := .mut, ty := ptrTy, debugName := .none }
+      { mutability := .not, ty := refTy, debugName := .none },
+      { mutability := .mut, ty := rawPtrTy, debugName := .none }
     ]
-    let initLocals : List LocalSlot := [.init (.scalar ⟨10, 4⟩), .uninit]
+    let initLocals : List LocalSlot := [.init (.scalar ⟨10, 4⟩), .uninit, .uninit]
     match evalRvalue initLocals (.ref .shared { local_ := 0, projection := .nil }) emptyMemory localDecls with
-    | .ok ptrVal _ memAfterRef =>
-      let localsWithPtr : List LocalSlot := [.init (.scalar ⟨10, 4⟩), .init ptrVal]
-      placeWriteResultToVerdictV08
-        (writePlaceValue localsWithPtr memAfterRef.borrows { local_ := 1, projection := [.deref] } (.scalar ⟨42, 4⟩))
+    | .ok refVal _ memAfterRef =>
+      let localsWithRef : List LocalSlot := [.init (.scalar ⟨10, 4⟩), .init refVal, .uninit]
+      match evalRvalue localsWithRef (.rawPtr .not { local_ := 1, projection := [.deref] }) memAfterRef localDecls with
+      | .ok rawVal _ memAfterRaw =>
+        let localsWithRaw : List LocalSlot := [.init (.scalar ⟨10, 4⟩), .init refVal, .init rawVal]
+        placeWriteResultToVerdictV08
+          (writePlaceValue localsWithRaw memAfterRaw.borrows { local_ := 2, projection := [.deref] } (.scalar ⟨42, 4⟩))
+      | .ub => .ub
+      | .unsupported => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported
   | .unionVariantWriteRead =>
@@ -525,7 +567,7 @@ def evalAnnealV2026_08_01 (prog : FixtureProg) (_st : FixtureState) : Verdict :=
     | .ub => .ub
     | .unsupported => .unsupported
   | .exactDivIntrinsicCall =>
-    let fnTy : Ty := { kind := .fnDef "core::intrinsics::exact_div" .nil, layoutIdx := 0 }
+    let fnTy : Ty := { kind := .fnDef "core::intrinsics::exact_div" [.uint .u32], layoutIdx := 0 }
     let funcOp : Operand := .constant { ty := fnTy, val := .zeroSized }
     let argOps : List Operand := [
       .copy { local_ := 1, projection := .nil },

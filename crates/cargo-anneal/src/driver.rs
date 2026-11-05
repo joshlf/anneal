@@ -355,7 +355,7 @@ pub fn aggregate_unit_manifests(
         for target in manifest.targets {
             let def_id = target.def_id.clone();
             let lean_module_name = derive_lean_module_from_path(&target.mir_module_path);
-            let record = UnitTargetRecord {
+            let record = UnitTargetRecord { trait_impls: vec![],
                 target: target.clone(),
                 lean_module_name,
                 item_kind: CapturedItemKind::Subject,
@@ -699,7 +699,7 @@ pub fn parse_unit_capture_manifest(input: &str) -> Result<UnitCaptureManifest, S
             }
         };
 
-        unit_targets.push(UnitTargetRecord {
+        unit_targets.push(UnitTargetRecord { trait_impls: vec![],
             target,
             lean_module_name,
             item_kind,
@@ -1087,7 +1087,7 @@ mod tests {
             compilation_succeeded: true,
             rust_sources: vec![("src/lib.rs".to_string(), sha256_hex(b"pub fn add() {}"))],
             unit_targets: vec![
-                UnitTargetRecord {
+                UnitTargetRecord { trait_impls: vec![],
                     target: CapturedTarget {
                         def_id: "demo_crate::add".to_string(),
                         mir_module_path: "Mir/DemoCrate/add.lean".to_string(),
@@ -1097,7 +1097,7 @@ mod tests {
                     item_kind: CapturedItemKind::Subject,
                     associated_subject_def_id: None,
                 },
-                UnitTargetRecord {
+                UnitTargetRecord { trait_impls: vec![],
                     target: CapturedTarget {
                         def_id: "demo_crate::__anodized_fn_requires_add".to_string(),
                         mir_module_path: "Mir/DemoCrate/__anodized_fn_requires_add.lean"
@@ -1170,7 +1170,7 @@ mod tests {
                 ("crates/b/src/lib.rs".to_string(), src_b_hash.clone()),
                 ("crates/shared/src/lib.rs".to_string(), shared_src_hash.clone()),
             ],
-            unit_targets: vec![UnitTargetRecord {
+            unit_targets: vec![UnitTargetRecord { trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: "crate_b::zeta".to_string(),
                     mir_module_path: "Mir/CrateB/zeta.lean".to_string(),
@@ -1194,7 +1194,7 @@ mod tests {
                 ("crates/a/src/lib.rs".to_string(), src_a_hash.clone()),
             ],
             unit_targets: vec![
-                UnitTargetRecord {
+                UnitTargetRecord { trait_impls: vec![],
                     target: CapturedTarget {
                         def_id: "crate_a::alpha".to_string(),
                         mir_module_path: "Mir/CrateA/alpha.lean".to_string(),
@@ -1206,7 +1206,7 @@ mod tests {
                 },
                 // Duplicate target across units with identical digest should
                 // deduplicate cleanly.
-                UnitTargetRecord {
+                UnitTargetRecord { trait_impls: vec![],
                     target: CapturedTarget {
                         def_id: "crate_b::zeta".to_string(),
                         mir_module_path: "Mir/CrateB/zeta.lean".to_string(),
@@ -1306,7 +1306,7 @@ mod tests {
             mir_dialect: MIR_DIALECT_V2026_06_01.to_string(),
             compilation_succeeded: true,
             rust_sources: vec![("src/lib.rs".to_string(), sha256_hex(source))],
-            unit_targets: vec![UnitTargetRecord {
+            unit_targets: vec![UnitTargetRecord { trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: def_id.to_string(),
                     mir_module_path: format!("Mir/Demo/{}.lean", def_id.replace("demo::", "")),

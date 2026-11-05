@@ -19,11 +19,14 @@
 //!    `verify-audit` mode to enforce anti-cheat rules and classify conditional
 //!    `Assumptions.<Item>` axioms.
 
+extern crate self as cargo_anneal;
+
 pub mod agent;
 pub mod correspondence_bugs;
 pub mod driver;
 pub mod minirust_sync;
 pub mod miri_diff;
+pub mod miri_oracle;
 pub mod obligations;
 pub mod scaffold;
 pub mod setup;
@@ -72,7 +75,17 @@ pub use miri_diff::{
     KnownAnnealBugSpec, MiriDiffConfig, MiriDiffManifest, MiriDiffReport, MiriDiffTestEntry,
     MiriDiffVerdictSpec, load_miri_diff_manifest, parse_miri_diff_manifest,
     render_miri_diff_crate_verify_module, render_miri_diff_report, render_miri_diff_verify_module,
-    run_miri_diff_suite, stage_miri_diff_workspace,
+    run_miri_diff_suite, stage_miri_diff_workspace, verify_miri_diff_ub_locations,
+};
+pub use miri_oracle::{
+    ALLOW_MISSING_MIRI_ENV, AnnealOracleConfig, AnnealOutcome, ComparisonVerdict,
+    DEFAULT_CAPTURE_RUSTFLAGS, DEFAULT_MIRI_FLAGS, DEFAULT_ORACLE_FUEL, DifftestOracleConfig,
+    DifftestOracleReport, DivergenceKind, ItemOracleReport, MiriOracleConfig, MiriOutcome,
+    MiriToolchain, NotComparedReason, OracleItemSpec, SourcePos, SourceSpan,
+    compare_miri_and_anneal, confirm_anneal_outcomes_in_kernel, discover_zero_arg_pub_fns,
+    parse_anneal_probe_output, parse_miri_process_output, render_anneal_confirm_module,
+    render_anneal_probe_module, render_miri_driver_source, run_anneal_oracle,
+    run_difftest_oracle_pipeline, run_miri_oracle, source_files_match,
 };
 pub use obligations::{
     AuthoredItemModules, SubjectObligationBundle, derive_item_module_suffix,
@@ -87,13 +100,18 @@ pub use scaffold::{
     scaffold_init_spec_templates, scaffold_workspace, scaffold_workspace_with_config,
 };
 pub use trace_observer::{
-    BatchTraceEvalCase, RawByteTraceJson, RawCallEventJson, RawOutcomeJson, RawTraceEventJson,
-    RecordedEvent, RecordedOutcome, RecordedRawTrace, RecordedShadowAlloc, ShadowAllocEntryJson,
-    TraceCheckModuleConfig, TraceObserverSpec, TraceRecorder,
-    render_batch_trace_eval_lean_module, render_raw_byte_trace_lean,
-    render_raw_byte_trace_lean_def, render_raw_outcome_lean,
-    render_shadow_provenance_table_lean, render_tampered_outcome_diag_lean_snippet,
-    render_trace_check_lean_module, render_trace_diag_eval_lean_snippet, value_as_raw_bytes,
+    __anneal_mir_rt_branch, __anneal_mir_rt_call_begin, __anneal_mir_rt_call_end_normal,
+    __anneal_mir_rt_push_arg, __anneal_mir_rt_ret, BatchTraceEvalCase, EnvAction, EnvSchedule,
+    FromScheduleBytes, MIR_CALL_TOKEN_PASSTHROUGH_INLINED, MIR_CALL_TOKEN_SCHEDULED_RETURN,
+    RawByteTraceJson, RawCallEventJson, RawOutcomeJson, RawTraceEventJson, RecordedEvent,
+    RecordedOutcome, RecordedRawTrace, RecordedShadowAlloc, ScheduleError, ShadowAllocEntryJson,
+    TraceCapture, TraceCheckModuleConfig, TraceObserverSpec, TraceRecorder, capture_value_bytes,
+    decode_recorded_raw_trace_hex, encode_recorded_raw_trace_hex, observe_boundary_call,
+    parse_batch_trace_probe_output, render_batch_trace_eval_lean_module,
+    render_batch_trace_probe_lean_module, render_raw_byte_trace_lean,
+    render_raw_byte_trace_lean_def, render_raw_outcome_lean, render_shadow_provenance_table_lean,
+    render_tampered_outcome_diag_lean_snippet, render_trace_check_lean_module,
+    render_trace_diag_eval_lean_snippet, value_as_raw_bytes,
 };
 
 /// Top-level subcommand selected on the `cargo anneal` command line.
@@ -1491,7 +1509,7 @@ pub fn run_lake_verify_targets(dot_anneal_dir: &Path, targets: &[String]) -> Res
     for target in targets {
         cmd.arg(target);
     }
-    let status = cmd.status().map_err(|err| {
+    let output = cmd.output().map_err(|err| {
         format!(
             "failed to execute '{}' in {}: {}",
             lake_bin.display(),
@@ -1499,9 +1517,12 @@ pub fn run_lake_verify_targets(dot_anneal_dir: &Path, targets: &[String]) -> Res
             err
         )
     })?;
-    if !status.success() {
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "lake build failed with status {status} in {}",
+            "lake build failed with status {} in {}:\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status,
             dot_anneal_dir.display()
         ));
     }
@@ -2059,7 +2080,7 @@ fn resolve_trusted_boundary_lean(
     ))
 }
 
-fn resolve_lake_binary() -> PathBuf {
+pub(crate) fn resolve_lake_binary() -> PathBuf {
     if let Ok(lake_env) = env::var("LAKE")
         && !lake_env.trim().is_empty()
     {
@@ -2408,19 +2429,19 @@ mod tests {
             ],
         };
         let records = vec![
-            UnitTargetRecord {
+            UnitTargetRecord { trait_impls: vec![],
                 target: manifest.targets[0].clone(),
                 lean_module_name: "Mir.Demo.id".to_string(),
                 item_kind: CapturedItemKind::Subject,
                 associated_subject_def_id: None,
             },
-            UnitTargetRecord {
+            UnitTargetRecord { trait_impls: vec![],
                 target: manifest.targets[1].clone(),
                 lean_module_name: "Mir.Demo.__anodized_fn_requires_id".to_string(),
                 item_kind: CapturedItemKind::InlineSpecRequires,
                 associated_subject_def_id: Some("demo::id".to_string()),
             },
-            UnitTargetRecord {
+            UnitTargetRecord { trait_impls: vec![],
                 target: manifest.targets[2].clone(),
                 lean_module_name: "Mir.Demo.__anodized_fn_ensures_id".to_string(),
                 item_kind: CapturedItemKind::InlineSpecEnsures,
@@ -2544,7 +2565,7 @@ mod tests {
             mir_dialect: MIR_DIALECT_V2026_06_01.to_string(),
             compilation_succeeded: true,
             rust_sources: vec![("src/lib.rs".to_string(), sha256_hex(rs_bytes))],
-            unit_targets: vec![UnitTargetRecord {
+            unit_targets: vec![UnitTargetRecord { trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: "demo::id".to_string(),
                     mir_module_path: "Mir/Demo/id.lean".to_string(),

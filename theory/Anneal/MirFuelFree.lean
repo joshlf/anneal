@@ -2333,9 +2333,10 @@ def initMachineStateWithMemoryAndCallees
 
 @[simp]
 theorem initMachineStateWithCallees_nil
-    (body : CapturedMir) (args : List Value) :
-    initMachineStateWithCallees body args [] = initMachineState body args :=
-  rfl
+    (body : CapturedMir) (args : List Value)
+    (h_traits : body.traitImpls = [] := by rfl) :
+    initMachineStateWithCallees body args [] = initMachineState body args := by
+  simp [initMachineStateWithCallees, initMachineState, h_traits]
 
 @[simp]
 theorem initMachineStateWithMemoryAndCallees_nil
@@ -2369,9 +2370,10 @@ def mirStatefulTreeWithCallees
 
 @[simp]
 theorem mirCallTreeWithCallees_nil
-    (body : CapturedMir) (args : List Value) :
-    mirCallTreeWithCallees body args [] = mirCallTree body args :=
-  rfl
+    (body : CapturedMir) (args : List Value)
+    (h_traits : body.traitImpls = [] := by rfl) :
+    mirCallTreeWithCallees body args [] = mirCallTree body args := by
+  simp [mirCallTreeWithCallees, mirCallTree, initMachineStateWithCallees_nil body args h_traits]
 
 @[simp]
 theorem mirStatefulTreeWithCallees_nil
@@ -2462,10 +2464,17 @@ def MirBoolPredicateHoldsWithCallees
 
 @[simp]
 theorem mirBoolPredicateHoldsWithCallees_nil
-    (specBody : CapturedMir) (args : List Value) :
+    (specBody : CapturedMir) (args : List Value)
+    (h_traits : specBody.traitImpls = [] := by rfl) :
     MirBoolPredicateHoldsWithCallees specBody [] args =
-      MirBoolPredicateHolds specBody args :=
-  rfl
+      MirBoolPredicateHolds specBody args := by
+  have h_exec : MirExecPartialWithCallees specBody [] = MirExecPartial specBody := by
+    funext xs
+    simp [MirExecPartialWithCallees, MirExecPartial,
+      mirCallTreeWithCallees_nil specBody xs h_traits]
+  simp [MirBoolPredicateHoldsWithCallees, MirBoolPredicateHolds,
+    MirContractHoldsWithCallees, MirContractHolds,
+    MirContractHoldsWithSafetyAndCallees, MirContractHoldsWithSafety, h_exec]
 
 /-! ## 7. Fuel-Free Adequacy Bridges (`DWP`, `DWLP`, `VerificationResult`) -/
 

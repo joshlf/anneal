@@ -107,9 +107,20 @@ Tree Borrows permission state for a reference or raw-pointer provenance tag.
 Constructors `.active`, `.reserved`, `.frozen`, and `.disabled` model the four
 permission states of the Tree Borrows aliasing discipline for references (`&T`,
 `&mut T`) and raw borrows (`&raw const`, `&raw mut`):
-- `.active` and `.reserved` permit both reads and writes through the tag;
-- `.frozen` permits reads and rejects writes as undefined behavior; and
-- `.disabled` rejects both reads and writes as undefined behavior.
+- `.active` (`PermissionUnprot::Unique`) and `.reserved`
+  (`PermissionUnprot::Reserved` / `ReservedIm`) permit both reads and writes
+  through the tag;
+- `.frozen` (`PermissionUnprot::Frozen`) permits reads and rejects writes as
+  undefined behavior; and
+- `.disabled` (`PermissionUnprot::Disabled`) rejects both reads and writes as
+  undefined behavior.
+
+Modeling choice vs. stable Rust Reference: The stable Rust Reference specifies
+that breaking pointer aliasing rules or mutating immutable bytes is undefined
+behavior, but does not mandate a single operational aliasing automaton. Anneal
+models pointer aliasing operationally using Tree Borrows (Villani et al., PLDI
+2025), matching Miri's `-Zmiri-tree-borrows` implementation (`perms.rs`,
+`tree.rs`) and MiniRust's `spec/mem/tree_borrows/` state machine.
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -126,6 +137,33 @@ Reference (The Rust Reference, "Pointer types"):
 > value."
 >
 > "Mutable references point to memory which is owned by some other value."
+
+Reference (Miri Tree Borrows implementation,
+`src/tools/miri/src/borrow_tracker/tree_borrows/perms.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, and MiniRust
+`spec/mem/tree_borrows/state_machine_unprotected.md` at commit
+`d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/src/tools/miri/src/borrow_tracker/tree_borrows/perms.rs>
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/spec/mem/tree_borrows/state_machine_unprotected.md#L5-L19>
+
+> "enum PermissionUnprot {
+>     /// Represents a shared reference to interior mutable data.
+>     Cell,
+>     /// Represents a two-phase borrow during its reservation phase
+>     Reserved,
+>     /// Represents a interior mutable two-phase borrow during its reservation phase
+>     ReservedIm,
+>     /// Represents an activated (written to) mutable reference, i.e. it must actually be unique right now
+>     Unique,
+>     /// Represents a shared (immutable) reference
+>     Frozen,
+>     /// Represents a dead reference
+>     Disabled,
+> }"
+
+Reference (Neven Villani, Johannes Hostert, Ralf Jung, and Derek Dreyer,
+"Tree Borrows", Proc. ACM Program. Lang. 9, PLDI, Article 182, June 2025):
+<https://doi.org/10.1145/3729338>
 -/
 inductive TreeBorrowPerm : Type where
   /-- Mutable borrow with active read/write permission (`Active`). -/
@@ -210,12 +248,18 @@ abbrev LocalIdx : Type := Local
 /--
 Borrow-table entry associating a pointer provenance `tag` with its target stack
 local, sub-place projection path, optional explicit byte sub-range
-`[rangeOffset, rangeOffset + rangeLen)`, `TreeBorrowPerm` permission, and
-optional function-entry lifetime protector identifier (`RetagKind.fnEntry`).
+`[rangeOffset, rangeOffset + rangeLen)`, `TreeBorrowPerm` permission, optional
+function-entry lifetime protector identifier (`RetagKind.fnEntry`), and
+optional parent provenance tag (`parentTag`) in the Tree Borrows reborrow
+hierarchy.
 
 When `rangeLen == 0`, overlap with writes is governed structurally by
 `targetProjection`; when `rangeLen > 0`, overlap with byte-ranged writes is
 governed by the half-open interval `[rangeOffset, rangeOffset + rangeLen)`.
+When `parentTag == .some pTag`, `tag` was created by reborrowing through a
+dereference of `pTag`, so accesses through `tag` (or its descendants) are child
+(`NodeRelation::Local`) accesses relative to `pTag` and its ancestors, whereas
+accesses through any tag outside `pTag`'s subtree are `NodeRelation::Foreign`.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -237,6 +281,27 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 >     /// Normal retagging of references.
 >     Default,
 > }"
+
+Reference (Miri Tree Borrows implementation,
+`src/tools/miri/src/borrow_tracker/tree_borrows/tree.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, and MiniRust
+`spec/mem/tree_borrows/tree.md` at commit
+`d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/src/tools/miri/src/borrow_tracker/tree_borrows/tree.rs>
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/spec/mem/tree_borrows/tree.md#L3-L55>
+
+> "The core data structure of Tree Borrows is a *tree*, with a state machine in
+> each node. We use a tree to track reborrows in each allocation; each reborrow
+> adds a new node to the tree."
+>
+> "When a node is accessed, each node in the tree can be divided into two
+> disjoint sets: *local nodes* and *foreign nodes*, based on its relative
+> position to the accessed node. The *local* set includes the node itself and
+> all its descendants, while the *foreign* set contains all other nodes."
+
+Reference (Neven Villani, Johannes Hostert, Ralf Jung, and Derek Dreyer,
+"Tree Borrows", Proc. ACM Program. Lang. 9, PLDI, Article 182, June 2025):
+<https://doi.org/10.1145/3729338>
 -/
 structure BorrowEntry : Type where
   /-- Unique provenance tag allocated by `Rvalue.ref` or `Rvalue.rawPtr`. -/
@@ -254,18 +319,26 @@ structure BorrowEntry : Type where
   rangeLen : Nat := 0
   /-- Optional function-entry lifetime protector identifier (`RetagKind.fnEntry`). -/
   protector : Option Nat := .none
+  /-- Optional parent provenance tag in the Tree Borrows hierarchy (`some pTag`
+      when reborrowed from a dereferenced pointer with provenance `pTag`; `none`
+      for root borrows of a stack local). -/
+  parentTag : Option Nat := .none
 
 /--
 Saved caller activation record pushed onto `Memory.callStack` when executing a
-non-diverging `TerminatorKind.call` and popped by `TerminatorKind.return_`.
+`TerminatorKind.call` and popped by `TerminatorKind.return_` or stack unwinding
+(`applyUnwindAction` on `.continue_` / `TerminatorKind.unwindResume`).
 
 Snapshots the caller's active lifetime protectors so that protectors activated
 via `RetagKind.fnEntry` during the callee frame are deactivated upon
-`TerminatorKind.return_`.
+`TerminatorKind.return_` or unwind, records `returnUnwind : UnwindAction` to
+dispatch when the callee unwinds into this caller frame, and records
+`isDiverging : Bool` (`true` when `target = .none`) so returning normally from a
+diverging call faults with `MirStepNode.fail .ub`.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L812-L818>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L812-L853>
 
 > "/// Returns from the function.
 > ///
@@ -273,22 +346,38 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 > /// Returning very likely at least assigns the value currently in the return
 > /// place (`_0`) to the place specified in the associated `Call` terminator
 > /// in the calling function, as if assigned via `dest = move _0`.
-> Return,"
+> Return,
+> ...
+> Call {
+>     func: Operand<'tcx>,
+>     args: Box<[Spanned<Operand<'tcx>>]>,
+>     destination: Place<'tcx>,
+>     target: Option<BasicBlock>,
+>     unwind: UnwindAction,
+>     call_source: CallSource,
+>     fn_span: Span,
+> },"
 -/
 structure SavedCallerFrame : Type where
-  /-- Caller `CapturedMir` body to restore on `TerminatorKind.return_`. -/
+  /-- Caller `CapturedMir` body to restore on `TerminatorKind.return_` or unwind. -/
   callerBody : CapturedMir
   /-- Caller `StackFrame` after evaluating the call's argument operands. -/
   frame : StackFrame
   /-- Caller destination `Place` receiving the callee's `_0` return value. -/
   destination : Place
-  /-- Caller basic block index jumped to after writing `destination`. -/
-  returnTarget : BasicBlockIdx
+  /-- Caller basic block index jumped to after writing `destination` when
+      `isDiverging == false`. -/
+  returnTarget : BasicBlockIdx := 0
   /-- Optional caller lifetime protector identifier preserved across the call. -/
   callerProtector : Option Nat := .none
   /-- Snapshot of active lifetime protectors prior to entering the callee frame,
-      restored on `TerminatorKind.return_`. -/
+      restored on `TerminatorKind.return_` or unwind. -/
   calleeProtectors : List Nat := .nil
+  /-- Unwind action to apply in the caller frame when the callee unwinds. -/
+  returnUnwind : UnwindAction := .continue_
+  /-- True when pushed by a diverging call (`target = .none`), where returning
+      normally via `TerminatorKind.return_` is undefined behavior. -/
+  isDiverging : Bool := false
 
 /--
 Reified function-pointer table entry in `Memory.fnPtrs`, modeling
