@@ -3604,6 +3604,26 @@ theorem paddedStructOk_minirust_ret_dealloc :
         (fun m => m.mem.memory.allocations.map (fun a => (a.live, a.data.length))) =
       some [(true, 4), (false, 4), (false, 12), (false, 12)] := rfl
 
+theorem paddedStructOk_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n paddedStructOkMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k paddedStructOkMInit = .ok mRet ∧
+      ReturnRel paddedStructOps ctxPadded3 s' v mRet ∧
+      ReachesRet (mirCallTree paddedStructOps paddedArgs) tr (.normal (v, mem)) :=
+  mirCall_noUB paddedStructOps_inFragment paddedStructOps_translate ctxPadded3
+    (ctxPadded3_ok rfl rfl) paddedArgs (by decide) paddedStructOkMInit rfl rfl rfl
+    paddedStructOk_noUB herr
+
+theorem paddedStructOk_minirust_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (n + 1) paddedStructOkMInit = .ok m' ∧
+      StateRel paddedStructOps paddedStructOpsFn ctxPadded3 s' m' ∧
+      Reaches (mirCallTree paddedStructOps paddedArgs) tr (mirTree paddedStructOps s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ n + 1 ∧ Interp.steps k paddedStructOkMInit = .ok mRet ∧
+      ReturnRel paddedStructOps ctxPadded3 s' v mRet ∧
+      ReachesRet (mirCallTree paddedStructOps paddedArgs) tr (.normal (v, mem))) :=
+  mirCall_progress paddedStructOps_inFragment paddedStructOps_translate ctxPadded3
+    (ctxPadded3_ok rfl rfl) paddedArgs (by decide) paddedStructOkMInit rfl rfl rfl
+    paddedStructOk_noUB n
+
 /-! ## Nested padded tuples `((u8, u32), u16, ())`, zero-sized `()`, nested `Field` projections (`_4.0.1`), and tuple UB paths -/
 
 def innerTupleLayout : TypeLayout :=
@@ -3909,6 +3929,26 @@ theorem nestedTupleOk_minirust_ret_dealloc :
     (Interp.steps 13 nestedTupleOkMInit).toOption.map
         (fun m => m.mem.memory.allocations.map (fun a => (a.live, a.data.length))) =
       some [(true, 4), (false, 4), (false, 4), (false, 8), (false, 0), (false, 12)] := rfl
+
+theorem nestedTupleOk_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n nestedTupleOkMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k nestedTupleOkMInit = .ok mRet ∧
+      ReturnRel nestedTupleOps ctxNested5 s' v mRet ∧
+      ReachesRet (mirCallTree nestedTupleOps (nestedArgs 0)) tr (.normal (v, mem)) :=
+  mirCall_noUB nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
+    (ctxNested5_ok rfl rfl) (nestedArgs 0) (by decide) nestedTupleOkMInit rfl rfl rfl
+    nestedTupleOk_noUB herr
+
+theorem nestedTupleOk_minirust_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (n + 1) nestedTupleOkMInit = .ok m' ∧
+      StateRel nestedTupleOps nestedTupleOpsFn ctxNested5 s' m' ∧
+      Reaches (mirCallTree nestedTupleOps (nestedArgs 0)) tr (mirTree nestedTupleOps s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ n + 1 ∧ Interp.steps k nestedTupleOkMInit = .ok mRet ∧
+      ReturnRel nestedTupleOps ctxNested5 s' v mRet ∧
+      ReachesRet (mirCallTree nestedTupleOps (nestedArgs 0)) tr (.normal (v, mem))) :=
+  mirCall_progress nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
+    (ctxNested5_ok rfl rfl) (nestedArgs 0) (by decide) nestedTupleOkMInit rfl rfl rfl
+    nestedTupleOk_noUB n
 
 /-- `_1 = 1u32`: branches to `bb2` and faults when `Aggregate(Tuple)` evaluates
 its second operand `copy _0` while `_0` is `.uninit`. -/

@@ -101,10 +101,10 @@ cd examples && anneal-lean-run --mode file --concurrency 3 -- lake env lean ../m
 Expected audit summary lines:
 
 ```text
-MiniRustSpec.Audit: exhaustively verified standard axioms for 9279 declarations across all MiniRustSpec.* modules
+MiniRustSpec.Audit: exhaustively verified standard axioms for 9283 declarations across all MiniRustSpec.* modules
 [ANCHOR-AUDIT] decls=2 theorems=2 sorry_free=true standard_axioms_only=true
 [SIMULATION-AUDIT] decls=38 theorems=38 sorry_free=true standard_axioms_only=true
-[WITNESS-AUDIT] decls=104 theorems=104 sorry_free=true standard_axioms_only=true
+[WITNESS-AUDIT] decls=108 theorems=108 sorry_free=true standard_axioms_only=true
 ```
 
 ## 6. What the `MR-2.2` Witnesses Show

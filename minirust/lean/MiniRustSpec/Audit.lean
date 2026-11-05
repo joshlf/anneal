@@ -401,6 +401,8 @@ open MiniRustSpec.Correspondence.Witness in
   paddedStructOk_minirust_direct
   paddedStructOk_minirust_padding_bytes
   paddedStructOk_minirust_ret_dealloc
+  paddedStructOk_minirust_noUB
+  paddedStructOk_minirust_progress
   ctxNested5_ok
   nestedTupleOps_inFragment
   nestedTupleOps_translate
@@ -410,6 +412,8 @@ open MiniRustSpec.Correspondence.Witness in
   nestedTupleOk_minirust_direct
   nestedTupleOk_minirust_padding_bytes
   nestedTupleOk_minirust_ret_dealloc
+  nestedTupleOk_minirust_noUB
+  nestedTupleOk_minirust_progress
   nestedTupleAggUb_anneal_ub
   nestedTupleAggUb_minirust_ub_from_start
   nestedTupleAggUb_minirust_direct
@@ -611,6 +615,8 @@ open MiniRustSpec.Correspondence.Witness in
   paddedStructOk_minirust_direct
   paddedStructOk_minirust_padding_bytes
   paddedStructOk_minirust_ret_dealloc
+  paddedStructOk_minirust_noUB
+  paddedStructOk_minirust_progress
   nestedTupleOps_inFragment
   nestedTupleOps_translate
   nestedTupleOk_anneal_ret
@@ -619,6 +625,8 @@ open MiniRustSpec.Correspondence.Witness in
   nestedTupleOk_minirust_direct
   nestedTupleOk_minirust_padding_bytes
   nestedTupleOk_minirust_ret_dealloc
+  nestedTupleOk_minirust_noUB
+  nestedTupleOk_minirust_progress
   nestedTupleAggUb_anneal_ub
   nestedTupleAggUb_minirust_ub_from_start
   nestedTupleAggUb_minirust_direct
