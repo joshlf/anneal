@@ -64,7 +64,7 @@ private def evalOperandFast (locals : List LocalSlot) (op : Operand)
     | .indirect _ _ => evalOperandFallback locals (.constant c) borrows globals layouts callerLocals
     | .slice _ _ => evalOperandFallback locals (.constant c) borrows globals layouts callerLocals
     | cv =>
-      match evalConstValue cv with
+      match evalConstValue cv c.ty globals layouts with
       | .some v => .ok v locals
       | .none => .unsupported
   | .copy p =>

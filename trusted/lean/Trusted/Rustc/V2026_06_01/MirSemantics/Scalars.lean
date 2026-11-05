@@ -1222,4 +1222,901 @@ def intCastTargetBytes : RigidTy → Option Nat
   | .int .isize => .some 8
   | _ => .none
 
+/--
+Count the number of set (`1`) bits in the low `remBits` bits of `bits` by
+structural recursion (`core::intrinsics::ctpop`).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1656-L1669>
+
+> "/// Returns the number of bits set in an integer type `T`
+> ...
+> #[rustc_intrinsic]
+> pub const fn ctpop<T: Copy>(x: T) -> u32;"
+-/
+@[reducible]
+def ctpopLoop : Nat → Nat → Nat
+  | .zero, _ => 0
+  | .succ remBits, bits =>
+    Nat.add (Nat.mod bits 2) (ctpopLoop remBits (Nat.div bits 2))
+
+/--
+Count consecutive trailing zero (`0`) bits starting from the least significant
+bit across `remBits` bits of `bits` (`core::intrinsics::cttz`).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1734-L1773>
+
+> "/// Returns the number of trailing unset bits (zeroes) in an integer type `T`.
+> ...
+> #[rustc_intrinsic]
+> pub const fn cttz<T: Copy>(x: T) -> u32;"
+-/
+@[reducible]
+def cttzLoop : Nat → Nat → Nat
+  | .zero, _ => 0
+  | .succ remBits, bits =>
+    match Nat.beq (Nat.mod bits 2) 0 with
+    | true => Nat.add 1 (cttzLoop remBits (Nat.div bits 2))
+    | false => 0
+
+/--
+Reverse the low `remBits` bits of `bits` into accumulator `acc`
+(`core::intrinsics::bitreverse`).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1812-L1825>
+
+> "/// Reverses the bits in an integer type `T`.
+> ...
+> #[rustc_intrinsic]
+> pub const fn bitreverse<T: Copy>(x: T) -> T;"
+-/
+@[reducible]
+def bitreverseLoop : Nat → Nat → Nat → Nat
+  | .zero, _, acc => acc
+  | .succ remBits, bits, acc =>
+    bitreverseLoop
+      remBits
+      (Nat.div bits 2)
+      (Nat.add (Nat.mul acc 2) (Nat.mod bits 2))
+
+/--
+Count consecutive leading zero (`0`) bits starting from the most significant bit
+of a `numBits`-bit unsigned word `bits` (`core::intrinsics::ctlz`), computed as
+the trailing zero count of the `numBits`-bit reversal of `bits`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1671-L1710>
+
+> "/// Returns the number of leading unset bits (zeroes) in an integer type `T`.
+> ...
+> #[rustc_intrinsic]
+> pub const fn ctlz<T: Copy>(x: T) -> u32;"
+-/
+@[reducible]
+def ctlzBits (numBits bits : Nat) : Nat :=
+  cttzLoop numBits (bitreverseLoop numBits bits 0)
+
+/--
+Reverse the low `remBytes` bytes of `bits` into accumulator `acc`
+(`core::intrinsics::bswap`).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1797-L1810>
+
+> "/// Reverses the bytes in an integer type `T`.
+> ...
+> #[rustc_intrinsic]
+> pub const fn bswap<T: Copy>(x: T) -> T;"
+-/
+@[reducible]
+def bswapLoop : Nat → Nat → Nat → Nat
+  | .zero, _, acc => acc
+  | .succ remBytes, bits, acc =>
+    bswapLoop
+      remBytes
+      (Nat.div bits 256)
+      (Nat.add (Nat.mul acc 256) (Nat.mod bits 256))
+
+/--
+Evaluate `core::intrinsics::ctlz(sc)`, returning a `retBytes`-byte `ScalarInt`
+(default `4` bytes for `u32`) holding the count of leading zero bits in `sc`.
+Returns `.none` if `sc.sizeBytes == 0` or `retBytes == 0`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1671-L1710>
+
+> "/// Returns the number of leading unset bits (zeroes) in an integer type `T`.
+> ...
+> #[rustc_intrinsic]
+> pub const fn ctlz<T: Copy>(x: T) -> u32;"
+-/
+@[reducible]
+def evalCtlz (sc : ScalarInt) (retBytes : Nat := 4) : Option ScalarInt :=
+  match Bool.or (Nat.beq sc.sizeBytes 0) (Nat.beq retBytes 0) with
+  | true => .none
+  | false =>
+    let ca := wrapScalarBits sc.bits (scalarModulus sc.sizeBytes)
+    .some ⟨ctlzBits (Nat.mul sc.sizeBytes 8) ca, retBytes⟩
+
+/--
+Evaluate `core::intrinsics::ctlz_nonzero(sc)`, returning `.none` (undefined
+behavior) when `sc` is zero (`ca == 0`) or has zero byte width.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1712-L1732>
+
+> "/// Like `ctlz`, but extra-unsafe as it returns `undef` when
+> /// given an `x` with value `0`.
+> ...
+> #[rustc_intrinsic]
+> pub const unsafe fn ctlz_nonzero<T: Copy>(x: T) -> u32;"
+-/
+@[reducible]
+def evalCtlzNonzero (sc : ScalarInt) (retBytes : Nat := 4) : Option ScalarInt :=
+  match Bool.or (Nat.beq sc.sizeBytes 0) (Nat.beq retBytes 0) with
+  | true => .none
+  | false =>
+    let ca := wrapScalarBits sc.bits (scalarModulus sc.sizeBytes)
+    match Nat.beq ca 0 with
+    | true => .none
+    | false => .some ⟨ctlzBits (Nat.mul sc.sizeBytes 8) ca, retBytes⟩
+
+/--
+Evaluate `core::intrinsics::cttz(sc)`, returning a `retBytes`-byte `ScalarInt`
+(default `4` bytes for `u32`) holding the count of trailing zero bits in `sc`.
+Returns `.none` if `sc.sizeBytes == 0` or `retBytes == 0`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1734-L1773>
+
+> "/// Returns the number of trailing unset bits (zeroes) in an integer type `T`.
+> ...
+> #[rustc_intrinsic]
+> pub const fn cttz<T: Copy>(x: T) -> u32;"
+-/
+@[reducible]
+def evalCttz (sc : ScalarInt) (retBytes : Nat := 4) : Option ScalarInt :=
+  match Bool.or (Nat.beq sc.sizeBytes 0) (Nat.beq retBytes 0) with
+  | true => .none
+  | false =>
+    let ca := wrapScalarBits sc.bits (scalarModulus sc.sizeBytes)
+    .some ⟨cttzLoop (Nat.mul sc.sizeBytes 8) ca, retBytes⟩
+
+/--
+Evaluate `core::intrinsics::cttz_nonzero(sc)`, returning `.none` (undefined
+behavior) when `sc` is zero (`ca == 0`) or has zero byte width.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1775-L1795>
+
+> "/// Like `cttz`, but extra-unsafe as it returns `undef` when
+> /// given an `x` with value `0`.
+> ...
+> #[rustc_intrinsic]
+> pub const unsafe fn cttz_nonzero<T: Copy>(x: T) -> u32;"
+-/
+@[reducible]
+def evalCttzNonzero (sc : ScalarInt) (retBytes : Nat := 4) : Option ScalarInt :=
+  match Bool.or (Nat.beq sc.sizeBytes 0) (Nat.beq retBytes 0) with
+  | true => .none
+  | false =>
+    let ca := wrapScalarBits sc.bits (scalarModulus sc.sizeBytes)
+    match Nat.beq ca 0 with
+    | true => .none
+    | false => .some ⟨cttzLoop (Nat.mul sc.sizeBytes 8) ca, retBytes⟩
+
+/--
+Evaluate `core::intrinsics::ctpop(sc)`, returning a `retBytes`-byte `ScalarInt`
+(default `4` bytes for `u32`) holding the population count of `sc`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1656-L1669>
+
+> "/// Returns the number of bits set in an integer type `T`
+> ...
+> #[rustc_intrinsic]
+> pub const fn ctpop<T: Copy>(x: T) -> u32;"
+-/
+@[reducible]
+def evalCtpop (sc : ScalarInt) (retBytes : Nat := 4) : Option ScalarInt :=
+  match Bool.or (Nat.beq sc.sizeBytes 0) (Nat.beq retBytes 0) with
+  | true => .none
+  | false =>
+    let ca := wrapScalarBits sc.bits (scalarModulus sc.sizeBytes)
+    .some ⟨ctpopLoop (Nat.mul sc.sizeBytes 8) ca, retBytes⟩
+
+/--
+Evaluate `core::intrinsics::bswap(sc)`, reversing the byte order of `sc` while
+preserving `sc.sizeBytes`. Returns `.none` if `sc.sizeBytes == 0`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1797-L1810>
+
+> "/// Reverses the bytes in an integer type `T`.
+> ...
+> #[rustc_intrinsic]
+> pub const fn bswap<T: Copy>(x: T) -> T;"
+-/
+@[reducible]
+def evalBswap (sc : ScalarInt) : Option ScalarInt :=
+  match Nat.beq sc.sizeBytes 0 with
+  | true => .none
+  | false =>
+    let ca := wrapScalarBits sc.bits (scalarModulus sc.sizeBytes)
+    .some ⟨bswapLoop sc.sizeBytes ca 0, sc.sizeBytes⟩
+
+/--
+Evaluate `core::intrinsics::bitreverse(sc)`, reversing the bit order of `sc`
+across `8 * sc.sizeBytes` bits while preserving `sc.sizeBytes`. Returns `.none`
+if `sc.sizeBytes == 0`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1812-L1825>
+
+> "/// Reverses the bits in an integer type `T`.
+> ...
+> #[rustc_intrinsic]
+> pub const fn bitreverse<T: Copy>(x: T) -> T;"
+-/
+@[reducible]
+def evalBitreverse (sc : ScalarInt) : Option ScalarInt :=
+  match Nat.beq sc.sizeBytes 0 with
+  | true => .none
+  | false =>
+    let ca := wrapScalarBits sc.bits (scalarModulus sc.sizeBytes)
+    .some ⟨bitreverseLoop (Nat.mul sc.sizeBytes 8) ca 0, sc.sizeBytes⟩
+
+/--
+Evaluate `core::intrinsics::wrapping_add(lhs, rhs)` modulo
+`2^(8 * lhs.sizeBytes)`. Returns `.none` if `lhs.sizeBytes == 0` or
+`lhs.sizeBytes != rhs.sizeBytes`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2057-L2070>
+
+> "/// Returns (a + b) mod 2<sup>N</sup>, where N is the width of T in bits.
+> ...
+> #[rustc_intrinsic]
+> pub const fn wrapping_add<T: Copy>(a: T, b: T) -> T;"
+-/
+@[reducible]
+def evalWrappingAdd (lhs rhs : ScalarInt) : Option ScalarInt :=
+  match
+    Bool.or
+      (Nat.beq lhs.sizeBytes 0)
+      (Bool.not (Nat.beq lhs.sizeBytes rhs.sizeBytes))
+  with
+  | true => .none
+  | false =>
+    let sz := lhs.sizeBytes
+    let modulus := scalarModulus sz
+    let ca := wrapScalarBits lhs.bits modulus
+    let cb := wrapScalarBits rhs.bits modulus
+    .some ⟨wrapScalarBits (Nat.add ca cb) modulus, sz⟩
+
+/--
+Evaluate `core::intrinsics::wrapping_sub(lhs, rhs)` modulo
+`2^(8 * lhs.sizeBytes)`. Returns `.none` if `lhs.sizeBytes == 0` or
+`lhs.sizeBytes != rhs.sizeBytes`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2071-L2084>
+
+> "/// Returns (a - b) mod 2<sup>N</sup>, where N is the width of T in bits.
+> ...
+> #[rustc_intrinsic]
+> pub const fn wrapping_sub<T: Copy>(a: T, b: T) -> T;"
+-/
+@[reducible]
+def evalWrappingSub (lhs rhs : ScalarInt) : Option ScalarInt :=
+  match
+    Bool.or
+      (Nat.beq lhs.sizeBytes 0)
+      (Bool.not (Nat.beq lhs.sizeBytes rhs.sizeBytes))
+  with
+  | true => .none
+  | false =>
+    let sz := lhs.sizeBytes
+    let modulus := scalarModulus sz
+    let ca := wrapScalarBits lhs.bits modulus
+    let cb := wrapScalarBits rhs.bits modulus
+    let wrappedDiff :=
+      match Nat.ble cb ca with
+      | true => wrapScalarBits (Nat.sub ca cb) modulus
+      | false => wrapScalarBits (Nat.sub (Nat.add modulus ca) cb) modulus
+    .some ⟨wrappedDiff, sz⟩
+
+/--
+Evaluate `core::intrinsics::wrapping_mul(lhs, rhs)` modulo
+`2^(8 * lhs.sizeBytes)`. Returns `.none` if `lhs.sizeBytes == 0` or
+`lhs.sizeBytes != rhs.sizeBytes`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2085-L2098>
+
+> "/// Returns (a * b) mod 2<sup>N</sup>, where N is the width of T in bits.
+> ...
+> #[rustc_intrinsic]
+> pub const fn wrapping_mul<T: Copy>(a: T, b: T) -> T;"
+-/
+@[reducible]
+def evalWrappingMul (lhs rhs : ScalarInt) : Option ScalarInt :=
+  match
+    Bool.or
+      (Nat.beq lhs.sizeBytes 0)
+      (Bool.not (Nat.beq lhs.sizeBytes rhs.sizeBytes))
+  with
+  | true => .none
+  | false =>
+    let sz := lhs.sizeBytes
+    let modulus := scalarModulus sz
+    let ca := wrapScalarBits lhs.bits modulus
+    let cb := wrapScalarBits rhs.bits modulus
+    .some ⟨wrapScalarBits (Nat.mul ca cb) modulus, sz⟩
+
+/--
+Evaluate `core::intrinsics::saturating_add(lhs, rhs)`, clamping on unsigned
+overflow to `2^w - 1` (`isSigned = false`) and on signed two's-complement
+overflow to `T::MIN = -2^(w-1)` or `T::MAX = 2^(w-1) - 1` (`isSigned = true`).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2100-L2113>
+
+> "/// Computes `a + b`, saturating at numeric bounds.
+> ...
+> #[rustc_intrinsic]
+> pub const fn saturating_add<T: Copy>(a: T, b: T) -> T;"
+-/
+@[reducible]
+def evalSaturatingAdd
+    (lhs rhs : ScalarInt)
+    (isSigned : Bool := false) :
+    Option ScalarInt :=
+  match
+    Bool.or
+      (Nat.beq lhs.sizeBytes 0)
+      (Bool.not (Nat.beq lhs.sizeBytes rhs.sizeBytes))
+  with
+  | true => .none
+  | false =>
+    let sz := lhs.sizeBytes
+    let modulus := scalarModulus sz
+    let ca := wrapScalarBits lhs.bits modulus
+    let cb := wrapScalarBits rhs.bits modulus
+    let sum := Nat.add ca cb
+    match isSigned with
+    | false =>
+      match Nat.ble modulus sum with
+      | true => .some ⟨Nat.sub modulus 1, sz⟩
+      | false => .some ⟨sum, sz⟩
+    | true =>
+      match signedOverflowAdd ca cb sz with
+      | false => .some ⟨wrapScalarBits sum modulus, sz⟩
+      | true =>
+        let half := signedHalfModulus sz
+        match isSignedNegative ca sz with
+        | true => .some ⟨half, sz⟩
+        | false => .some ⟨Nat.sub half 1, sz⟩
+
+/--
+Evaluate `core::intrinsics::saturating_sub(lhs, rhs)`, clamping on unsigned
+underflow to `0` (`isSigned = false`) and on signed two's-complement overflow to
+`T::MIN = -2^(w-1)` or `T::MAX = 2^(w-1) - 1` (`isSigned = true`).
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2114-L2127>
+
+> "/// Computes `a - b`, saturating at numeric bounds.
+> ...
+> #[rustc_intrinsic]
+> pub const fn saturating_sub<T: Copy>(a: T, b: T) -> T;"
+-/
+@[reducible]
+def evalSaturatingSub
+    (lhs rhs : ScalarInt)
+    (isSigned : Bool := false) :
+    Option ScalarInt :=
+  match
+    Bool.or
+      (Nat.beq lhs.sizeBytes 0)
+      (Bool.not (Nat.beq lhs.sizeBytes rhs.sizeBytes))
+  with
+  | true => .none
+  | false =>
+    let sz := lhs.sizeBytes
+    let modulus := scalarModulus sz
+    let ca := wrapScalarBits lhs.bits modulus
+    let cb := wrapScalarBits rhs.bits modulus
+    match isSigned with
+    | false =>
+      match Nat.ble cb ca with
+      | true => .some ⟨Nat.sub ca cb, sz⟩
+      | false => .some ⟨0, sz⟩
+    | true =>
+      match signedOverflowSub ca cb sz with
+      | false =>
+        .some ⟨wrapScalarBits (Nat.add ca (Nat.sub modulus cb)) modulus, sz⟩
+      | true =>
+        let half := signedHalfModulus sz
+        match isSignedNegative ca sz with
+        | true => .some ⟨half, sz⟩
+        | false => .some ⟨Nat.sub half 1, sz⟩
+
+/--
+Evaluate `core::intrinsics::unchecked_add(lhs, rhs)`, returning `.none`
+(undefined behavior) on unsigned or signed two's-complement overflow.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1983-L1991>
+
+> "/// Returns the result of an unchecked addition, resulting in
+> /// undefined behavior when `x + y > T::MAX` or `x + y < T::MIN`.
+> ...
+> #[rustc_intrinsic]
+> pub const unsafe fn unchecked_add<T: Copy>(x: T, y: T) -> T;"
+-/
+@[reducible]
+def evalUncheckedAdd
+    (lhs rhs : ScalarInt)
+    (isSigned : Bool := false) :
+    Option ScalarInt :=
+  match
+    Bool.or
+      (Nat.beq lhs.sizeBytes 0)
+      (Bool.not (Nat.beq lhs.sizeBytes rhs.sizeBytes))
+  with
+  | true => .none
+  | false =>
+    let sz := lhs.sizeBytes
+    let modulus := scalarModulus sz
+    let ca := wrapScalarBits lhs.bits modulus
+    let cb := wrapScalarBits rhs.bits modulus
+    let sum := Nat.add ca cb
+    match isSigned with
+    | false =>
+      match Nat.ble modulus sum with
+      | true => .none
+      | false => .some ⟨sum, sz⟩
+    | true =>
+      match signedOverflowAdd ca cb sz with
+      | true => .none
+      | false => .some ⟨wrapScalarBits sum modulus, sz⟩
+
+/--
+Evaluate `core::intrinsics::unchecked_sub(lhs, rhs)`, returning `.none`
+(undefined behavior) on unsigned underflow or signed two's-complement overflow.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1993-L2001>
+
+> "/// Returns the result of an unchecked subtraction, resulting in
+> /// undefined behavior when `x - y > T::MAX` or `x - y < T::MIN`.
+> ...
+> #[rustc_intrinsic]
+> pub const unsafe fn unchecked_sub<T: Copy>(x: T, y: T) -> T;"
+-/
+@[reducible]
+def evalUncheckedSub
+    (lhs rhs : ScalarInt)
+    (isSigned : Bool := false) :
+    Option ScalarInt :=
+  match
+    Bool.or
+      (Nat.beq lhs.sizeBytes 0)
+      (Bool.not (Nat.beq lhs.sizeBytes rhs.sizeBytes))
+  with
+  | true => .none
+  | false =>
+    let sz := lhs.sizeBytes
+    let modulus := scalarModulus sz
+    let ca := wrapScalarBits lhs.bits modulus
+    let cb := wrapScalarBits rhs.bits modulus
+    match isSigned with
+    | false =>
+      match Nat.ble cb ca with
+      | true =>
+        let diff := Nat.sub ca cb
+        match Nat.ble modulus diff with
+        | true => .none
+        | false => .some ⟨diff, sz⟩
+      | false => .none
+    | true =>
+      match signedOverflowSub ca cb sz with
+      | true => .none
+      | false =>
+        let wrappedDiff :=
+          match Nat.ble cb ca with
+          | true => wrapScalarBits (Nat.sub ca cb) modulus
+          | false => wrapScalarBits (Nat.sub (Nat.add modulus ca) cb) modulus
+        .some ⟨wrappedDiff, sz⟩
+
+/--
+Evaluate `core::intrinsics::unchecked_mul(lhs, rhs)`, returning `.none`
+(undefined behavior) on unsigned or signed two's-complement multiplication
+overflow.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2003-L2011>
+
+> "/// Returns the result of an unchecked multiplication, resulting in
+> /// undefined behavior when `x * y > T::MAX` or `x * y < T::MIN`.
+> ...
+> #[rustc_intrinsic]
+> pub const unsafe fn unchecked_mul<T: Copy>(x: T, y: T) -> T;"
+-/
+@[reducible]
+def evalUncheckedMul
+    (lhs rhs : ScalarInt)
+    (isSigned : Bool := false) :
+    Option ScalarInt :=
+  match
+    Bool.or
+      (Nat.beq lhs.sizeBytes 0)
+      (Bool.not (Nat.beq lhs.sizeBytes rhs.sizeBytes))
+  with
+  | true => .none
+  | false =>
+    let sz := lhs.sizeBytes
+    let modulus := scalarModulus sz
+    let ca := wrapScalarBits lhs.bits modulus
+    let cb := wrapScalarBits rhs.bits modulus
+    let prod := Nat.mul ca cb
+    match isSigned with
+    | false =>
+      match Nat.ble modulus prod with
+      | true => .none
+      | false => .some ⟨prod, sz⟩
+    | true =>
+      match signedOverflowMul ca cb sz with
+      | true => .none
+      | false => .some ⟨wrapScalarBits prod modulus, sz⟩
+
+/--
+Evaluate `core::intrinsics::unchecked_div(lhs, rhs)`, returning `.none`
+(undefined behavior) when `rhs == 0` or signed `lhs == T::MIN && rhs == -1`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1941-L1950>
+
+> "/// Performs an unchecked division, resulting in undefined behavior
+> /// where `y == 0` or `x == T::MIN && y == -1`
+> ...
+> #[rustc_intrinsic]
+> pub const unsafe fn unchecked_div<T: Copy>(x: T, y: T) -> T;"
+-/
+@[reducible]
+def evalUncheckedDiv
+    (lhs rhs : ScalarInt)
+    (isSigned : Bool := false) :
+    Option ScalarInt :=
+  match
+    Bool.or
+      (Nat.beq lhs.sizeBytes 0)
+      (Bool.not (Nat.beq lhs.sizeBytes rhs.sizeBytes))
+  with
+  | true => .none
+  | false =>
+    let sz := lhs.sizeBytes
+    let modulus := scalarModulus sz
+    let ca := wrapScalarBits lhs.bits modulus
+    let cb := wrapScalarBits rhs.bits modulus
+    match Nat.beq cb 0 with
+    | true => .none
+    | false =>
+      match isSigned with
+      | false => .some ⟨wrapScalarBits (Nat.div ca cb) modulus, sz⟩
+      | true =>
+        let numBits := Nat.mul sz 8
+        let minSigned := scalarPow2 (Nat.sub numBits 1)
+        let minusOne := Nat.sub modulus 1
+        match Bool.and (Nat.beq ca minSigned) (Nat.beq cb minusOne) with
+        | true => .none
+        | false =>
+          let negA := isSignedNegative ca sz
+          let negB := isSignedNegative cb sz
+          let magA := match negA with | false => ca | true => Nat.sub modulus ca
+          let magB := match negB with | false => cb | true => Nat.sub modulus cb
+          let magQ := Nat.div magA magB
+          let quotBits :=
+            match Nat.beq magQ 0 with
+            | true => 0
+            | false =>
+              match negA, negB with
+              | false, false => wrapScalarBits magQ modulus
+              | true, true => wrapScalarBits magQ modulus
+              | _, _ => wrapScalarBits (Nat.sub modulus magQ) modulus
+          .some ⟨quotBits, sz⟩
+
+/--
+Evaluate `core::intrinsics::unchecked_rem(lhs, rhs)`, returning `.none`
+(undefined behavior) when `rhs == 0` or signed `lhs == T::MIN && rhs == -1`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1951-L1960>
+
+> "/// Returns the remainder of an unchecked division, resulting in
+> /// undefined behavior when `y == 0` or `x == T::MIN && y == -1`
+> ...
+> #[rustc_intrinsic]
+> pub const unsafe fn unchecked_rem<T: Copy>(x: T, y: T) -> T;"
+-/
+@[reducible]
+def evalUncheckedRem
+    (lhs rhs : ScalarInt)
+    (isSigned : Bool := false) :
+    Option ScalarInt :=
+  match
+    Bool.or
+      (Nat.beq lhs.sizeBytes 0)
+      (Bool.not (Nat.beq lhs.sizeBytes rhs.sizeBytes))
+  with
+  | true => .none
+  | false =>
+    let sz := lhs.sizeBytes
+    let modulus := scalarModulus sz
+    let ca := wrapScalarBits lhs.bits modulus
+    let cb := wrapScalarBits rhs.bits modulus
+    match Nat.beq cb 0 with
+    | true => .none
+    | false =>
+      match isSigned with
+      | false => .some ⟨wrapScalarBits (Nat.mod ca cb) modulus, sz⟩
+      | true =>
+        let numBits := Nat.mul sz 8
+        let minSigned := scalarPow2 (Nat.sub numBits 1)
+        let minusOne := Nat.sub modulus 1
+        match Bool.and (Nat.beq ca minSigned) (Nat.beq cb minusOne) with
+        | true => .none
+        | false =>
+          let negA := isSignedNegative ca sz
+          let negB := isSignedNegative cb sz
+          let magA := match negA with | false => ca | true => Nat.sub modulus ca
+          let magB := match negB with | false => cb | true => Nat.sub modulus cb
+          let magR := Nat.mod magA magB
+          let remBits :=
+            match Nat.beq magR 0 with
+            | true => 0
+            | false =>
+              match negA with
+              | false => wrapScalarBits magR modulus
+              | true => wrapScalarBits (Nat.sub modulus magR) modulus
+          .some ⟨remBits, sz⟩
+
+/--
+Evaluate `core::intrinsics::unchecked_shl(lhs, rhs)`, returning `.none`
+(undefined behavior) if `rhs` is signed and negative or if `rhs >= 8 *
+lhs.sizeBytes`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1962-L1971>
+
+> "/// Performs an unchecked left shift, resulting in undefined behavior when
+> /// `y < 0` or `y >= N`, where N is the width of T in bits.
+> ...
+> #[rustc_intrinsic]
+> pub const unsafe fn unchecked_shl<T: Copy, U: Copy>(x: T, y: U) -> T;"
+-/
+@[reducible]
+def evalUncheckedShl
+    (lhs rhs : ScalarInt)
+    (rhsIsSigned : Bool := false) :
+    Option ScalarInt :=
+  match Bool.or (Nat.beq lhs.sizeBytes 0) (Nat.beq rhs.sizeBytes 0) with
+  | true => .none
+  | false =>
+    let sz := lhs.sizeBytes
+    let numBits := Nat.mul sz 8
+    let modulus := scalarModulus sz
+    let ca := wrapScalarBits lhs.bits modulus
+    let cb := wrapScalarBits rhs.bits (scalarModulus rhs.sizeBytes)
+    let negShift := Bool.and rhsIsSigned (isSignedNegative cb rhs.sizeBytes)
+    match Bool.or negShift (Nat.ble numBits cb) with
+    | true => .none
+    | false => .some ⟨shiftLeftBits ca cb modulus, sz⟩
+
+/--
+Evaluate `core::intrinsics::unchecked_shr(lhs, rhs)`, returning `.none`
+(undefined behavior) if `rhs` is signed and negative or if `rhs >= 8 *
+lhs.sizeBytes`. Performs logical right shift when `lhsIsSigned = false` and
+arithmetic sign-extending right shift when `lhsIsSigned = true`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1972-L1981>
+
+> "/// Performs an unchecked right shift, resulting in undefined behavior when
+> /// `y < 0` or `y >= N`, where N is the width of T in bits.
+> ...
+> #[rustc_intrinsic]
+> pub const unsafe fn unchecked_shr<T: Copy, U: Copy>(x: T, y: U) -> T;"
+-/
+@[reducible]
+def evalUncheckedShr
+    (lhs rhs : ScalarInt)
+    (lhsIsSigned : Bool := false)
+    (rhsIsSigned : Bool := false) :
+    Option ScalarInt :=
+  match Bool.or (Nat.beq lhs.sizeBytes 0) (Nat.beq rhs.sizeBytes 0) with
+  | true => .none
+  | false =>
+    let sz := lhs.sizeBytes
+    let numBits := Nat.mul sz 8
+    let modulus := scalarModulus sz
+    let ca := wrapScalarBits lhs.bits modulus
+    let cb := wrapScalarBits rhs.bits (scalarModulus rhs.sizeBytes)
+    let negShift := Bool.and rhsIsSigned (isSignedNegative cb rhs.sizeBytes)
+    match Bool.or negShift (Nat.ble numBits cb) with
+    | true => .none
+    | false =>
+      let shifted :=
+        match lhsIsSigned with
+        | false => wrapScalarBits (shiftRightUnsignedBits ca cb) modulus
+        | true => arithmeticShrBits ca sz cb
+      .some ⟨shifted, sz⟩
+
+/--
+Evaluate `core::intrinsics::three_way_compare(lhs, rhs)`, returning a 1-byte
+`Ordering` scalar: `⟨255, 1⟩` (`-1i8`, `Ordering::Less`) when `lhs < rhs`,
+`⟨0, 1⟩` (`0i8`, `Ordering::Equal`) when `lhs == rhs`, and `⟨1, 1⟩` (`1i8`,
+`Ordering::Greater`) when `lhs > rhs`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1827-L1837>
+
+> "/// Does a three-way comparison between the two arguments,
+> /// which must be of character or integer (signed or unsigned) type.
+> ...
+> #[rustc_intrinsic]
+> pub const fn three_way_compare<T: Copy>(lhs: T, rhss: T) ->
+>     crate::cmp::Ordering;"
+-/
+@[reducible]
+def evalThreeWayCompare
+    (lhs rhs : ScalarInt)
+    (isSigned : Bool := false) :
+    Option ScalarInt :=
+  match
+    Bool.or
+      (Nat.beq lhs.sizeBytes 0)
+      (Bool.not (Nat.beq lhs.sizeBytes rhs.sizeBytes))
+  with
+  | true => .none
+  | false =>
+    let sz := lhs.sizeBytes
+    let modulus := scalarModulus sz
+    let ca := wrapScalarBits lhs.bits modulus
+    let cb := wrapScalarBits rhs.bits modulus
+    match Nat.beq ca cb with
+    | true => .some ⟨0, 1⟩
+    | false =>
+      let isLt :=
+        match isSigned with
+        | false => Nat.ble ca cb
+        | true => signedLt ca cb sz
+      match isLt with
+      | true => .some ⟨255, 1⟩
+      | false => .some ⟨1, 1⟩
+
+/--
+Evaluate `core::intrinsics::arith_offset(dst, offset)` on a 64-bit pointer
+`ptrVal` (`ptrSizeBytes == 8`) and signed 64-bit `isize` `offsetSc`
+(`offsetSc.sizeBytes == 8`) with pointee byte stride `elemStride`, preserving
+`ptrVal.allocId` provenance and wrapping `offsetBytes` modulo `2^64`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L899-L916>
+
+> "/// Calculates the offset from a pointer, potentially wrapping.
+> ///
+> /// This is implemented as an intrinsic to avoid converting to and from an
+> /// integer, since the conversion inhibits certain optimizations.
+> ...
+> #[rustc_intrinsic]
+> pub const unsafe fn arith_offset<T>(dst: *const T, offset: isize) -> *const T;"
+-/
+@[reducible]
+def evalArithOffset
+    (ptrVal : ProvenancePtr)
+    (ptrSizeBytes : Nat)
+    (offsetSc : ScalarInt)
+    (elemStride : Nat) :
+    Option ProvenancePtr :=
+  match
+    Bool.and
+      (Nat.beq ptrSizeBytes 8)
+      (Nat.beq offsetSc.sizeBytes 8)
+  with
+  | false => .none
+  | true =>
+    let modulus := scalarModulus 8
+    let offsetBits := wrapScalarBits offsetSc.bits modulus
+    let newOffset :=
+      match isSignedNegative offsetBits 8 with
+      | false =>
+        wrapScalarBits
+          (Nat.add ptrVal.offsetBytes (Nat.mul offsetBits elemStride))
+          modulus
+      | true =>
+        let mag := Nat.sub modulus offsetBits
+        let byteDelta := wrapScalarBits (Nat.mul mag elemStride) modulus
+        wrapScalarBits
+          (Nat.add ptrVal.offsetBytes (Nat.sub modulus byteDelta))
+          modulus
+    .some { ptrVal with offsetBytes := newOffset }
+
+/--
+Compute the dynamic byte size `elemSizeBytes * len` of a slice `[T]` or `str`
+for `core::intrinsics::size_of_val` from its 8-byte fat-pointer length metadata
+`lenSc`, returning `.none` (undefined behavior) if `lenSc.sizeBytes != 8` or if
+`elemSizeBytes * len` exceeds `isize::MAX` (`>= 2^63 = signedHalfModulus 8`).
+
+`core::intrinsics::align_of_val` performs the same check before returning the
+element alignment: `align_of_val_raw` has the same safety conditions as
+`size_of_val_raw`, and the CTFE interpreter computes both results with one
+function that rejects a slice larger than `isize::MAX` bytes.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2850-L2861>
+
+> "/// The size of the referenced value in bytes.
+> ...
+> #[rustc_intrinsic]
+> #[rustc_intrinsic_const_stable_indirect]
+> pub const unsafe fn size_of_val<T: ?Sized>(ptr: *const T) -> usize;"
+
+Reference (`library/core/src/mem/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/mem/mod.rs#L560-L579>
+
+> "/// This function is only safe to call if the following conditions hold:
+> ///
+> /// - If `T` is `Sized`, this function is always safe to call.
+> /// - If the unsized tail of `T` is:
+> ///     - a [slice], then the length of the slice tail must be an initialized
+> ///       integer, and the size of the *entire value*
+> ///       (dynamic tail length + statically sized prefix) must fit in `isize`."
+-/
+@[reducible]
+def evalSliceSizeOfVal
+    (elemSizeBytes : Nat)
+    (lenSc : ScalarInt) :
+    Option ScalarInt :=
+  match Nat.beq lenSc.sizeBytes 8 with
+  | false => .none
+  | true =>
+    let modulus := scalarModulus 8
+    let len := wrapScalarBits lenSc.bits modulus
+    let totalBytes := Nat.mul elemSizeBytes len
+    match Nat.ble (signedHalfModulus 8) totalBytes with
+    | true => .none
+    | false => .some ⟨totalBytes, 8⟩
+
 end Trusted.Rustc.V2026_06_01.MirSemantics

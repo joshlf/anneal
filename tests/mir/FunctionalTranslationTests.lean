@@ -194,29 +194,6 @@ private theorem runMirTauToBlock_succ
         | .tau (.running s') => runMirTauToBlock fuel body targetBlock s'
         | _ => none := rfl
 
-private theorem evalRvalue_len_eq
-    (locals : List LocalSlot) (place : Place) (mem : Memory)
-    (localDecls : List LocalDecl) (layouts : LayoutTable) :
-    evalRvalue locals (.len place) mem localDecls layouts =
-      match evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals with
-      | .ok (.aggregate tag elems) locals' =>
-        if Nat.beq tag 0 then
-          .ok (.scalar ⟨length elems, 8⟩) locals' mem
-        else
-          .unsupported
-      | .ok _ _ => .unsupported
-      | .ub => .ub
-      | .unsupported => .unsupported := by
-  unfold evalRvalue
-  dsimp only
-  cases evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals with
-  | ok v locals' =>
-    cases v with
-    | aggregate tag elems =>
-      cases tag <;> rfl
-    | _ => rfl
-  | _ => rfl
-
 private theorem evalScalarBinOp_add_u32
     {a b : Nat} {locals : List LocalSlot} {mem : Memory}
     (h_lt : a + b < 4294967296) :
@@ -443,6 +420,97 @@ private theorem boolToScalar_inj {b₁ b₂ : Bool}
     b₁ = b₂ := by
   cases b₁ <;> cases b₂ <;> simp [boolToScalar] at h <;> rfl
 
+private def twoDiamondPreSwitchState (c1 c2 : Bool) (x : Nat) (bb : BasicBlockIdx) : MachineState :=
+  { frame := {
+      blockIdx := bb
+      stmtIdx := 0
+      locals :=
+        [.uninit,
+         .init (.scalar ⟨c1.toNat, 1⟩),
+         .init (.scalar ⟨c2.toNat, 1⟩),
+         .init (.scalar ⟨x, 4⟩),
+         .uninit, .uninit, .uninit]
+    }
+    memory := emptyMemory }
+
+private def twoDiamondBb3BranchState (c1 c2 : Bool) (x a b : Nat) : MachineState :=
+  { frame := {
+      blockIdx := 3
+      stmtIdx := 0
+      locals :=
+        [.uninit,
+         .init (.scalar ⟨c1.toNat, 1⟩),
+         .init (.scalar ⟨c2.toNat, 1⟩),
+         .init (.scalar ⟨x, 4⟩),
+         .init (.aggregate 0 [.scalar ⟨a, 4⟩, .scalar ⟨b, 4⟩]),
+         .init (.scalar ⟨a, 4⟩),
+         .init (.scalar ⟨b, 4⟩)]
+    }
+    memory := emptyMemory }
+
+private theorem runMirToBlock_succ
+    (fuel : Nat) (body : CapturedMir) (targetBlock : BasicBlockIdx) (s : MachineState) :
+    runMirToBlock (fuel + 1) body targetBlock s =
+      if Nat.beq s.frame.blockIdx targetBlock && Nat.beq s.frame.stmtIdx 0 then
+        some s
+      else
+        match stepMirFn body s with
+        | .tau (.running s') => runMirToBlock fuel body targetBlock s'
+        | .vis (.inr (.inl (.emit _))) k =>
+          match k PUnit.unit with
+          | .running s' => runMirToBlock fuel body targetBlock s'
+          | _ => none
+        | _ => none := rfl
+
+private theorem runMirToBinarySwitch_succ
+    (fuel : Nat) (body : CapturedMir) (s : MachineState) :
+    runMirToBinarySwitch (fuel + 1) body s =
+      match inspectBinarySwitch body s with
+      | some res => some res
+      | none =>
+        match stepMirFn body s with
+        | .tau (.running s') => runMirToBinarySwitch fuel body s'
+        | _ => none := rfl
+
+private theorem twoDiamond_bb0_switch (c1 c2 : Bool) (x : Nat) :
+    runMirToBinarySwitch 4 twoDiamondTupleBody
+      (initMachineStateWithMemory twoDiamondTupleBody
+        [.scalar ⟨c1.toNat, 1⟩, .scalar ⟨c2.toNat, 1⟩, .scalar ⟨x, 4⟩]
+        emptyMemory) =
+      some (c1, c1.toNat,
+            twoDiamondPreSwitchState c1 c2 x 1,
+            twoDiamondPreSwitchState c1 c2 x 2) := by
+  dsimp only [twoDiamondTupleBody, twoDiamondPreSwitchState, runMirToBinarySwitch, inspectBinarySwitch, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalOperand, readProjectedValue, evalTerminator, lookupSwitchTarget, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory]
+  rw [not_beq_toNat_zero c1]
+
+private theorem twoDiamond_bb1_join (c1 c2 : Bool) {x : Nat}
+    (hx10 : x + 10 < 4294967296) (hx20 : x + 20 < 4294967296) :
+    evalPlanToJoin twoDiamondTupleBody (.jump 3 5)
+      (twoDiamondPreSwitchState c1 c2 x 1) =
+      some (twoDiamondBb3BranchState c1 c2 x (x + 10) (x + 20)) := by
+  rw [evalPlanToJoin, runMirToBlock_succ]
+  dsimp only [twoDiamondTupleBody, twoDiamondPreSwitchState, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory]
+  rw [evalScalarBinOp_add_u32 hx10]
+  dsimp only [MirStepNode.step, evalPlaceWrite, writePlaceValue, writeProjectedValue, advanceStmt, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows]
+  rw [runMirToBlock_succ]
+  dsimp only [twoDiamondTupleBody, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory]
+  rw [evalScalarBinOp_add_u32 hx20]
+  rfl
+
+private theorem twoDiamond_bb2_join (c1 c2 : Bool) {x : Nat}
+    (hx1 : x + 1 < 4294967296) (hx2 : x + 2 < 4294967296) :
+    evalPlanToJoin twoDiamondTupleBody (.jump 3 5)
+      (twoDiamondPreSwitchState c1 c2 x 2) =
+      some (twoDiamondBb3BranchState c1 c2 x (x + 1) (x + 2)) := by
+  rw [evalPlanToJoin, runMirToBlock_succ]
+  dsimp only [twoDiamondTupleBody, twoDiamondPreSwitchState, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory]
+  rw [evalScalarBinOp_add_u32 hx1]
+  dsimp only [MirStepNode.step, evalPlaceWrite, writePlaceValue, writeProjectedValue, advanceStmt, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows]
+  rw [runMirToBlock_succ]
+  dsimp only [twoDiamondTupleBody, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory]
+  rw [evalScalarBinOp_add_u32 hx2]
+  rfl
+
 /--
 Core `wpTransPlan` proof for `twoDiamondTupleBody` over symbolic `(c1, c2, x)`.
 Crucially, this proof NEVER invokes `cases c1` or `cases c2`: `zipLocalSlots`
@@ -461,17 +529,17 @@ theorem wpTransPlan_twoDiamondTuple
   have hx1 : x + 1 < 4294967296 := by omega
   have hx2 : x + 2 < 4294967296 := by omega
   rw [boolToScalar_eq c1, boolToScalar_eq c2]
-  dsimp only [twoDiamondPlan, twoDiamondTupleBody]
-  rw [wpTransPlan]; dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, optSlot, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList, evalScalarBinOp]
+  dsimp only [twoDiamondPlan]
+  rw [wpTransPlan, twoDiamond_bb0_switch c1 c2 x]
+  dsimp only []
+  rw [twoDiamond_bb1_join c1 c2 hx10 hx20,
+      twoDiamond_bb2_join c1 c2 hx1 hx2]
+  dsimp only [twoDiamondBb3BranchState, joinPlanMemConsistent]
   refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, trivial, trivial, ?_⟩
-  rw [wpTransPlan]; dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, optSlot, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList, evalScalarBinOp]
+  rw [wpTransPlan]; dsimp only [twoDiamondTupleBody, evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, optSlot, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
   refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, trivial, trivial, ?_⟩
-  rw [wpTransPlan]; dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, optSlot, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList, evalScalarBinOp]
-  rw [dec_rec_const c2.toNat, not_beq_toNat_zero c2, not_beq_toNat_zero c1,
-      nat_add_eq x 10, nat_add_eq x 20, nat_add_eq x 1, nat_add_eq x 2,
-      scalarModulus_four,
-      wrapScalarBits_of_lt hx10, wrapScalarBits_of_lt hx20,
-      wrapScalarBits_of_lt hx1, wrapScalarBits_of_lt hx2]
+  rw [wpTransPlan]; dsimp only [twoDiamondTupleBody, evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, optSlot, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
+  rw [dec_rec_const c2.toNat, not_beq_toNat_zero c2]
   dsimp only [twoDiamondPure, ite, instDecidableEqBool, Bool.decEq]
 
 theorem twoDiamondClaim_verified : VerificationResult twoDiamondClaim := by
@@ -617,9 +685,9 @@ private theorem sumToN_header_switch_ge
       some (false, 0, sumToNBranchState 2 i i 0, sumToNBranchState 3 i i 0) := by
   cases cmpOpt <;>
     (dsimp only [sumToNHeaderState, sumToNLoopBody, sumToNBranchState]
-     dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, runMirTauToRet, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue_len_eq, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, evalTerminator, lookupSwitchTarget, applyUnwindAction, ProvenancePtr.tag, optSlot, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
+     dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, runMirTauToRet, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, evalTerminator, lookupSwitchTarget, applyUnwindAction, ProvenancePtr.tag, optSlot, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
      rw [evalScalarBinOp_lt_u32_of_ge (Nat.le_refl i)]
-     dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, runMirTauToRet, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue_len_eq, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, evalTerminator, lookupSwitchTarget, applyUnwindAction, ProvenancePtr.tag, optSlot, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
+     dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, runMirTauToRet, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, evalTerminator, lookupSwitchTarget, applyUnwindAction, ProvenancePtr.tag, optSlot, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
      rfl)
 
 private theorem sumToN_header_switch_lt
@@ -628,9 +696,9 @@ private theorem sumToN_header_switch_lt
       some (true, 1, sumToNBranchState 2 n i 1, sumToNBranchState 3 n i 1) := by
   cases cmpOpt <;>
     (dsimp only [sumToNHeaderState, sumToNLoopBody, sumToNBranchState]
-     dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, runMirTauToRet, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue_len_eq, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, evalTerminator, lookupSwitchTarget, applyUnwindAction, ProvenancePtr.tag, optSlot, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
+     dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, runMirTauToRet, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, evalTerminator, lookupSwitchTarget, applyUnwindAction, ProvenancePtr.tag, optSlot, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
      rw [evalScalarBinOp_lt_u32_of_lt h_lt]
-     dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, runMirTauToRet, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue_len_eq, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, evalTerminator, lookupSwitchTarget, applyUnwindAction, ProvenancePtr.tag, optSlot, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
+     dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, runMirTauToRet, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, evalTerminator, lookupSwitchTarget, applyUnwindAction, ProvenancePtr.tag, optSlot, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
      rfl)
 
 private theorem sumToN_body_step
@@ -639,12 +707,13 @@ private theorem sumToN_body_step
     (h_inc_lt : i + 1 < 4294967296) :
     evalPlanToJoin sumToNLoopBody (.jump 1 4) (sumToNBranchState 2 n i 1) =
       some (sumToNHeaderState n (i + 1) (some (.scalar ⟨1, 1⟩))) := by
-  dsimp only [sumToNBranchState, sumToNLoopBody, sumToNHeaderState]
-  dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, runMirTauToRet, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue_len_eq, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, evalTerminator, lookupSwitchTarget, applyUnwindAction, ProvenancePtr.tag, optSlot, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
+  rw [evalPlanToJoin, runMirToBlock_succ]
+  dsimp only [sumToNBranchState, sumToNLoopBody, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, optSlot, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory]
   rw [evalScalarBinOp_add_u32 h_acc_lt]
-  dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, runMirTauToRet, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue_len_eq, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, evalTerminator, lookupSwitchTarget, applyUnwindAction, ProvenancePtr.tag, optSlot, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
+  dsimp only [MirStepNode.step, evalPlaceWrite, writePlaceValue, writeProjectedValue, advanceStmt, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows]
+  rw [runMirToBlock_succ]
+  dsimp only [sumToNLoopBody, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, optSlot, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory]
   rw [evalScalarBinOp_add_u32 h_inc_lt]
-  dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, runMirTauToRet, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue_len_eq, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, evalTerminator, lookupSwitchTarget, applyUnwindAction, ProvenancePtr.tag, optSlot, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
   rfl
 
 /--
@@ -943,6 +1012,37 @@ def advanceCursorMutSpec : MutRefLocalSpec FrameCursor Bool where
     lookupBorrow mem'.borrows 1 =
       some { tag := 1, targetLocal := 1, targetProjection := [], perm := .active }
 
+private theorem advanceCursorMut_wpTransPlan
+    (c : FrameCursor) {delta : Nat} (h_add_lt : c.pos + delta < 4294967296) :
+    wpTransPlan mirNoCallWP advanceCursorMutMirBody advanceCursorMutPlan
+      (fun out =>
+        out =
+          .normal
+            ((ValueCodec.pair frameCursorCodec ValueCodec.rustBool).encode
+               (FrameCursor.advancePure delta c),
+             { emptyMemory with
+               borrows :=
+                 [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .active }]
+               nextTag := 2 }))
+      (initMachineStateWithMemory advanceCursorMutMirBody
+        [frameCursorCodec.encode c, .scalar ⟨delta, 4⟩] emptyMemory) := by
+  dsimp only [advanceCursorMutPlan, frameCursorCodec]
+  rw [wpTransPlan]
+  iterate 6 (rw [runMirToBinarySwitch_succ]; dsimp only [advanceCursorMutMirBody, inspectBinarySwitch, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, ProvenancePtr.tag, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory])
+  rw [evalScalarBinOp_add_u32 h_add_lt]
+  dsimp only [MirStepNode.step, evalPlaceWrite, writePlaceValue, writeProjectedValue, advanceStmt, ProvenancePtr.tag, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length]
+  rw [runMirToBinarySwitch_succ]
+  dsimp only [advanceCursorMutMirBody, inspectBinarySwitch, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, ProvenancePtr.tag, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory]
+  rw [evalScalarBinOp_le_u32]
+  dsimp only [advanceCursorMutMirBody, evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, runMirTauToRet, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, evalTerminator, lookupSwitchTarget, applyUnwindAction, ProvenancePtr.tag, optSlot, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, trivial, trivial, ?_⟩
+  rw [wpTransPlan]; dsimp only [advanceCursorMutMirBody, evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, runMirTauToRet, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, evalTerminator, lookupSwitchTarget, applyUnwindAction, ProvenancePtr.tag, optSlot, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
+  rw [dec_rec_const (Nat.ble (c.pos + delta) c.len).toNat,
+      not_beq_toNat_zero (Nat.ble (c.pos + delta) c.len)]
+  dsimp only [ValueCodec.pair, frameCursorCodec, ValueCodec.rustBool,
+              FrameCursor.advancePure]
+  cases Nat.ble (c.pos + delta) c.len <;> rfl
+
 /--
 Symbolic total & stateful verification of `advanceCursorMutMirBody` against
 `FrameCursor.advancePure` for all `c : FrameCursor` (`c.pos, c.len < 10000`) and
@@ -957,35 +1057,11 @@ theorem advanceCursorMutSpec_total_and_stateful_verified :
       advanceCursorMutSpec (fun _ _ _ => advanceCursorMutPlan) ?_
     rintro c extraArgs mem ⟨h_pos, h_len, rfl, delta, h_delta, rfl⟩
     have h_add_lt : c.pos + delta < 4294967296 := by omega
-    have h_plan :
-        wpTransPlan mirNoCallWP advanceCursorMutMirBody advanceCursorMutPlan
-          (fun out =>
-            out =
-              .normal
-                ((ValueCodec.pair frameCursorCodec ValueCodec.rustBool).encode
-                   (FrameCursor.advancePure delta c),
-                 { emptyMemory with
-                   borrows :=
-                     [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .active }]
-                   nextTag := 2 }))
-          (initMachineStateWithMemory advanceCursorMutMirBody
-            [frameCursorCodec.encode c, .scalar ⟨delta, 4⟩] emptyMemory) := by
-      dsimp only [advanceCursorMutPlan, advanceCursorMutMirBody, frameCursorCodec]
-      rw [wpTransPlan]; dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, runMirTauToRet, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue_len_eq, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, evalTerminator, lookupSwitchTarget, applyUnwindAction, ProvenancePtr.tag, optSlot, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
-      rw [evalScalarBinOp_add_u32 h_add_lt]; dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, runMirTauToRet, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue_len_eq, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, evalTerminator, lookupSwitchTarget, applyUnwindAction, ProvenancePtr.tag, optSlot, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
-      rw [evalScalarBinOp_le_u32]; dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, runMirTauToRet, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue_len_eq, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, evalTerminator, lookupSwitchTarget, applyUnwindAction, ProvenancePtr.tag, optSlot, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
-      refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, trivial, trivial, ?_⟩
-      rw [wpTransPlan]; dsimp only [evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, runMirTauToRet, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue_len_eq, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, evalTerminator, lookupSwitchTarget, applyUnwindAction, ProvenancePtr.tag, optSlot, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected, natListContainsBool, invalidateConflictingBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
-      rw [dec_rec_const (Nat.ble (c.pos + delta) c.len).toNat,
-          not_beq_toNat_zero (Nat.ble (c.pos + delta) c.len)]
-      dsimp only [ValueCodec.pair, frameCursorCodec, ValueCodec.rustBool,
-                  FrameCursor.advancePure]
-      cases Nat.ble (c.pos + delta) c.len <;> rfl
     exact wpTransPlan_mono
       (fun out h_eq => by
         subst h_eq
         exact ⟨_, rfl, rfl⟩)
-      h_plan
+      (advanceCursorMut_wpTransPlan c h_add_lt)
   exact ⟨h_tot, statefulOfTotalMutRefLocal h_tot⟩
 
 
