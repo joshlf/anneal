@@ -139,36 +139,8 @@ theorem foldl_moveOut_mem (ops : List Operand) (acc : List Nat) (j : Nat) :
         · exact .inl (.inl h1)
         · exact .inr h1
 
-theorem mem_movedLocals_stmt {body : CapturedMir} {bb : BasicBlockData}
-    (hbb : bb ∈ body.basicBlocks) {st : MirAst.Statement} (hst : st ∈ bb.statements) {p : Place}
-    {rv : Rvalue} (hk : st.kind = .assign p rv) {j : Nat} (hj : j ∈ (rvOperands rv).filterMap opMoved) :
-    j ∈ movedLocals body := by
-  simp only [movedLocals, List.mem_flatMap, List.mem_append]
-  exact ⟨bb, hbb, .inl ⟨st, hst, by rw [hk]; exact hj⟩⟩
-
-theorem mem_movedLocals_term {body : CapturedMir} {bb : BasicBlockData}
-    (hbb : bb ∈ body.basicBlocks) {discr : Operand} {targets : SwitchTargets}
-    (hk : bb.terminator.kind = .switchInt discr targets) {j : Nat} (hj : opMoved discr = some j) :
-    j ∈ movedLocals body := by
-  simp only [movedLocals, List.mem_flatMap, List.mem_append]
-  exact ⟨bb, hbb, .inr (by rw [hk]; simp [hj])⟩
-
-theorem stmtMoved_sub {body : CapturedMir} {bb : BasicBlockData} (hbb : bb ∈ body.basicBlocks)
-    {st : MirAst.Statement} (hst : st ∈ bb.statements) (mo : List Nat)
-    (hmo : ∀ j ∈ mo, j ∈ movedLocals body) : ∀ j ∈ stmtMoved mo st, j ∈ movedLocals body := by
-  intro j hj
-  unfold stmtMoved at hj
-  split at hj
-  next i rv hk =>
-    rcases (foldl_moveOut_mem _ _ _).mp (List.mem_filter.mp hj).1 with h | h
-    · exact hmo j h
-    · exact mem_movedLocals_stmt hbb hst hk h
-  all_goals first
-    | exact hmo j (List.mem_filter.mp hj).1
-    | exact hmo j hj
-
 theorem movedBefore_zero (body : CapturedMir) (blk : Nat) :
-    movedBefore body blk 0 = movedLocals body := by
+    movedBefore body blk 0 = movedAtEntry body blk := by
   unfold movedBefore
   split <;> simp
 
@@ -179,24 +151,6 @@ theorem movedBefore_succ {body : CapturedMir} {blk k : Nat} {bb : BasicBlockData
   simp only [movedBefore, hbb]
   rw [List.take_add_one, List.foldl_append, hst]
   rfl
-
-theorem movedBefore_sub {body : CapturedMir} {blk : Nat} {bb : BasicBlockData}
-    (hbb : body.basicBlocks[blk]? = some bb) (k : Nat) :
-    ∀ j ∈ movedBefore body blk k, j ∈ movedLocals body := by
-  have hmem : bb ∈ body.basicBlocks := List.mem_of_getElem? hbb
-  simp only [movedBefore, hbb]
-  have key : ∀ (ss : List MirAst.Statement), (∀ s ∈ ss, s ∈ bb.statements) →
-      ∀ mo, (∀ j ∈ mo, j ∈ movedLocals body) →
-        ∀ j ∈ ss.foldl stmtMoved mo, j ∈ movedLocals body := by
-    intro ss
-    induction ss with
-    | nil => intro _ mo hmo; simpa using hmo
-    | cons s ss ih =>
-      intro hss mo hmo
-      rw [List.foldl_cons]
-      exact ih (fun s' hs' => hss s' (by simp [hs'])) _
-        (stmtMoved_sub hmem (hss s (by simp)) mo hmo)
-  exact key _ (fun s hs => List.mem_of_mem_take hs) _ (fun j hj => hj)
 
 theorem blockMovesOk_spec (mo : List Nat) (ss : List MirAst.Statement) (t : MirAst.Terminator)
     (h : blockMovesOk mo ss t = true) :
@@ -212,17 +166,27 @@ theorem blockMovesOk_spec (mo : List Nat) (ss : List MirAst.Statement) (t : MirA
     | zero => simp at hk; subst hk; simpa using h.1
     | succ k => simpa using ih1 k st (by simpa using hk)
 
-/-- What `movesOk` guarantees at a statement and at a terminator. -/
+/-- What `movesOk` guarantees at a statement, at a terminator, and across each
+outgoing control-flow edge `(blk → t)`. -/
 theorem movesOk_spec {body : CapturedMir} (h : movesOk body = true) {blk : Nat}
     {bb : BasicBlockData} (hbb : body.basicBlocks[blk]? = some bb) :
     (∀ (k : Nat) st, bb.statements[k]? = some st →
       stmtReadsOk (movedBefore body blk k) st = true) ∧
-    termReadsOk (movedBefore body blk bb.statements.length) bb.terminator = true := by
-  simp only [movesOk, List.all_eq_true] at h
-  obtain ⟨h1, h2⟩ := blockMovesOk_spec _ _ _ (h bb (List.mem_of_getElem? hbb))
-  refine ⟨fun k st hk => ?_, ?_⟩
+    termReadsOk (movedBefore body blk bb.statements.length) bb.terminator = true ∧
+    (∀ t ∈ termTargets bb.terminator,
+      ∀ j ∈ termMoved (movedBefore body blk bb.statements.length) bb.terminator,
+        j ∈ movedBefore body t 0) := by
+  have hlt : blk < body.basicBlocks.length := (List.getElem?_eq_some_iff.mp hbb).1
+  simp only [movesOk, List.all_eq_true, List.mem_range] at h
+  have hblk := h blk hlt
+  simp only [hbb, Bool.and_eq_true, List.all_eq_true, List.contains_iff_mem] at hblk
+  obtain ⟨h1, h2⟩ := blockMovesOk_spec _ _ _ hblk.1
+  have h3 := hblk.2
+  refine ⟨fun k st hk => ?_, ?_, fun t ht j hj => ?_⟩
   · simpa [movedBefore, hbb] using h1 k st hk
   · simpa [movedBefore, hbb] using h2
+  · rw [movedBefore_zero]
+    exact h3 t ht j (by simpa [movedBefore, hbb] using hj)
 
 theorem readsOk_mono {mo mo' : List Nat} (hsub : ∀ j ∈ mo', j ∈ mo) {ops : List Operand}
     (h : readsOk mo ops = true) : readsOk mo' ops = true := by
@@ -296,27 +260,27 @@ theorem StaleOk.readsAgree {body : CapturedMir} {actual view : List LocalSlot} {
     (hr : readsOk (movedBefore body blk stmt) ops = true) : ReadsAgree actual view ops :=
   fun op hop j hj => h.agree ((readsOk_spec hr op hop).2 j hj)
 
-/-- `StaleOk` at the entry of any block, from `StaleOk` anywhere in a block:
-every local that a block may have moved out of is in `movedLocals`. -/
-theorem StaleOk.toBlock {body : CapturedMir} {actual view : List LocalSlot} {blk stmt : Nat}
-    {bb : BasicBlockData} (hbb : body.basicBlocks[blk]? = some bb)
-    (h : StaleOk body actual view blk stmt) (t : Nat) : StaleOk body actual view t 0 := by
+/-- `StaleOk` at the entry of a successor block `t` when every local moved out
+before `(blk, stmt)` is in `movedBefore body t 0`. -/
+theorem StaleOk.toBlock {body : CapturedMir} {actual view : List LocalSlot} {blk stmt t : Nat}
+    (hsub : ∀ j ∈ movedBefore body blk stmt, j ∈ movedBefore body t 0)
+    (h : StaleOk body actual view blk stmt) : StaleOk body actual view t 0 := by
   refine ⟨h.1, fun j hj => ?_⟩
   obtain ⟨h1, h2, h3⟩ := h.2 j hj
-  exact ⟨by rw [movedBefore_zero]; exact movedBefore_sub hbb stmt j h1, h2, h3⟩
+  exact ⟨hsub j h1, h2, h3⟩
 
-/-- `StaleOk` at the entry of any block after Anneal read the `switchInt`
-discriminant `op`, which may move out of a local. -/
-theorem StaleOk.toBlockMove {body : CapturedMir} {actual view : List LocalSlot} {blk stmt : Nat}
-    {bb : BasicBlockData} (hbb : body.basicBlocks[blk]? = some bb)
-    (h : StaleOk body actual view blk stmt) (op : Operand)
-    (hop : ∀ j, opMoved op = some j → j ∈ movedLocals body) (t : Nat) :
+/-- `StaleOk` at the entry of a successor block `t` after Anneal read the
+`switchInt` discriminant `op`, which may move out of a local. -/
+theorem StaleOk.toBlockMove {body : CapturedMir} {actual view : List LocalSlot} {blk stmt t : Nat}
+    (op : Operand) (hsub : ∀ j ∈ moveOut (movedBefore body blk stmt) op, j ∈ movedBefore body t 0)
+    (h : StaleOk body actual view blk stmt) :
     StaleOk body (opPost actual op) view t 0 := by
   refine ⟨by rw [opPost_length]; exact h.1, fun j hj => ?_⟩
   rcases opPost_get actual op j with h' | ⟨hm, h1, s, h2, h3⟩
   · rw [h'] at hj ⊢
-    exact (h.toBlock hbb t).2 j hj
-  · refine ⟨by rw [movedBefore_zero]; exact hop j hm, h1, fun hv => h3 ?_⟩
+    obtain ⟨hmo, ha, hv⟩ := h.2 j hj
+    exact ⟨hsub j (by unfold moveOut; split <;> simp [hmo]), ha, hv⟩
+  · refine ⟨hsub j (by simp [moveOut, hm]), h1, fun hv => h3 ?_⟩
     have := (h.dead_iff j).mpr hv
     rw [h2] at this
     exact Option.some.inj this
@@ -667,6 +631,21 @@ theorem lookupSwitchTarget_lt (bits : Nat) (branches : List (Nat × Nat)) (other
     · exact ih (fun q hq => hbr q (by simp [hq]))
     · exact hbr (v, t) (by simp)
 
+theorem lookupSwitchTarget_mem (bits : Nat) (branches : List (Nat × Nat)) (otherwise : Nat) :
+    MirSemantics.lookupSwitchTarget bits branches otherwise ∈
+      otherwise :: branches.map Prod.snd := by
+  induction branches with
+  | nil => simp [MirSemantics.lookupSwitchTarget]
+  | cons p ps ih =>
+    obtain ⟨v, t⟩ := p
+    simp only [MirSemantics.lookupSwitchTarget, List.map_cons]
+    cases Nat.beq bits v
+    · simp only
+      rcases List.mem_cons.mp ih with h | hmem
+      · rw [h]; exact List.mem_cons_self
+      · exact List.mem_cons_of_mem _ (List.mem_cons_of_mem _ hmem)
+    · exact List.mem_cons_of_mem _ List.mem_cons_self
+
 theorem listIndex_nat {α : Type} (xs : List α) (k : Nat) (x : α) (h : xs[k]? = some x) (what : String) :
     listIndex xs (k : Int) what = .ok x := by
   simp [listIndex, h]
@@ -811,7 +790,7 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
   obtain ⟨_, hstmts, hterm⟩ := hbbs bb hbbmem
   obtain ⟨tb, htb, hgetb⟩ := hspec.2.2 _ bb hbb
   obtain ⟨hlen, hstspec, htermspec⟩ := translateBlock_spec _ bb tb htb
-  obtain ⟨hmvS, hmvT⟩ := movesOk_spec hmvOk hbb
+  obtain ⟨hmvS, hmvT, hmvEdge⟩ := movesOk_spec hmvOk hbb
   have hshape : Shape m ctx [ctx.caller, calleeFrameL f ctx lm s.frame.blockIdx s.frame.stmtIdx]
       m.mem.memory.allocations := ⟨hthr, hrel.active, rfl⟩
   have hframe : FrameOk body f ctx view lm (resetPick m) s.frame.blockIdx s.frame.stmtIdx :=
@@ -1096,10 +1075,13 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
       have hA : evalTerminator s bb.terminator (some body) =
           MirStepNode.step (jumpState s t s.frame.locals) := by
         simp [MirSemantics.evalTerminator, hk, jumpState]
+      have hsub : ∀ j ∈ movedBefore body s.frame.blockIdx bb.statements.length,
+          j ∈ movedBefore body t 0 := by
+        simpa [termTargets, termMoved, hk] using hmvEdge t (by simp [termTargets, hk])
       rw [hA]
       exact StepRel.tau' m3 (by simp [htt, Interp.evalTerminator, hm3, check_after h3])
         (hrel.jump lm t ht _ h3.threads h3.active (by rw [h3.allocs]; exact hlo)
-          (hstale_end.toBlock hbb t))
+          (hstale_end.toBlock hsub))
     · -------------------------------------------------------------- switchInt
       obtain ⟨it, hit, hdok, hbr, hother⟩ := terminatorOk_switch hterm hk
       obtain ⟨⟨T, hT, hokT⟩, v, htt, hMok, hMnone⟩ := switch_spec hframe hk htermspec hit hdok
@@ -1128,6 +1110,14 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
           targets.otherwise
         have htgt := lookupSwitchTarget_lt bits targets.branches targets.otherwise
           body.basicBlocks.length (fun p hp => (hbr p hp).2) hother
+        have htgtMem : MirSemantics.lookupSwitchTarget bits targets.branches targets.otherwise ∈
+            termTargets bb.terminator := by
+          rw [termTargets, hk]
+          exact lookupSwitchTarget_mem bits targets.branches targets.otherwise
+        have hsub : ∀ j ∈ moveOut (movedBefore body s.frame.blockIdx bb.statements.length) discr,
+            j ∈ movedBefore body
+              (MirSemantics.lookupSwitchTarget bits targets.branches targets.otherwise) 0 := by
+          simpa [termMoved, hk] using hmvEdge _ htgtMem
         obtain ⟨m4, hm4, h4⟩ := jumpToBlock_callee h3.shape
           (MirSemantics.lookupSwitchTarget bits targets.branches targets.otherwise)
         have hA : evalTerminator s bb.terminator (some body) =
@@ -1144,7 +1134,7 @@ theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inF
           exact hm4
         exact StepRel.emit' _ m4 rfl (by simp [hM, check_after h4])
           (hrel.jump lm _ htgt _ h4.threads h4.active (by rw [h4.allocs]; exact h3.locs)
-            (hstale_end.toBlockMove hbb discr (fun j hj => mem_movedLocals_term hbbmem hk hj) _))
+            (hstale_end.toBlockMove discr hsub))
     · -------------------------------------------------------------- unreachable
       have hA : evalTerminator s bb.terminator (some body) = MirStepNode.fail .ub := by
         simp [MirSemantics.evalTerminator, hk]

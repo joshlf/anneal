@@ -318,18 +318,27 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
 programs, computing both semantics in the kernel (`decide`/`rfl`, no
 `native_decide`):
 
-* `tempMove` (MR-1.3), the MIR of `fn(x: u32) -> u32 { let y = (x + 1) * 2;
-  if y == 8 { 100 } else { y } }` with `u32` and `bool` temporaries,
-  `StorageLive`/`StorageDead`, root `move` in a `BinaryOp`, a `Use`, and a
-  `switchInt` discriminant, `Deinit` of a moved-from temporary, and an unused
-  temporary `_4` that the init block allocates: for `x = 3` and `x = 2`,
-  `mirCall_ret` yields MiniRust returns of `100` and `6`, which direct runs
-  confirm, including that every callee allocation is dead afterwards and that
-  `StorageLive` reuses the first-fit address that `StorageDead` released
-  (`tempMove3_*`, `tempMove2_*`); `deadRead` reads a temporary after
-  `StorageDead` (UB in both models, `deadRead_*`); and `moveReuse`, which reads
-  a local after moving out of it, is rejected by `movesOk`, and the two models
-  indeed disagree on it (`moveReuse7_*`).
+* `tempMove` and `crossBlockMove` (MR-1.3): `tempMove` is the MIR of
+  `fn(x: u32) -> u32 { let y = (x + 1) * 2; if y == 8 { 100 } else { y } }`
+  with `u32` and `bool` temporaries, `StorageLive`/`StorageDead`, root `move`
+  in a `BinaryOp`, a `Use`, and a `switchInt` discriminant, `Deinit` of a
+  moved-from temporary, and an unused temporary `_4` that the init block
+  allocates (`tempMove3_*`, `tempMove2_*`, including `StorageLive` reusing the
+  first-fit address that `StorageDead` released); `crossBlockMove` is a 4-block
+  CFG exercising forward dataflow `movesOk` (`movedAtEntry`) across `Goto` and
+  `SwitchInt` edges, moving the incoming argument `_1`, projected tuple moves
+  `move (_2.0)` and `move (_2.1)` on a `(u32, bool)` temporary, `StorageLive`
+  re-allocating already-live locals, `Deinit` of a `(u32, bool)` tuple, and
+  idempotent `StorageDead` (`crossBlockMove20_*`, `crossBlockMoveOv_*`);
+  `deadRead` reads a temporary after `StorageDead` (UB in both models,
+  `deadRead_*`); `moveReuse` and `crossBlockMoveReuse` read a local after
+  moving out of it (rejected by `movesOk`, with `moveReuse7_*` showing the
+  semantic disagreement); `unmarkedTempAssign` assigns to a temporary without
+  storage markers (rejected by `mentionsOk`, with `unmarkedTempAssign_*`
+  showing the `initBlock` vs `initMachineState` disagreement); and
+  `bm_allocate_and_deallocate_ub_cases` /
+  `evalStatement_deinit_ok_dead_and_misaligned` directly verify the UB and
+  normal paths of `BM.allocate`, `BM.deallocate`, and `Statement::Deinit`.
 
 * `sumTo`, the MIR of a `u32` loop with `switchInt`, wrapping `Add`/`Sub`,
   constants, and `Goto`: Anneal returns `6` for `n = 3`

@@ -4567,6 +4567,20 @@ theorem tempMove2_anneal_ret :
       (.normal (.scalar ⟨6, 4⟩, tempMove2S0.memory)) :=
   runA_sound tempMove 30 _ _ _ rfl
 
+theorem tempMove2_noUB : MirNoUBTree (mirCallTree tempMove [.scalar ⟨2, 4⟩]) :=
+  runA_noUB tempMove 30 _ _ _ rfl
+
+theorem tempMove3_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (initLen tempMove + n) tempMove3MInit = .ok m' ∧
+      StateRel tempMove tempMoveFn ctx0 s' m' ∧
+      Reaches (mirCallTree tempMove [.scalar ⟨3, 4⟩]) tr (mirTree tempMove s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen tempMove + n ∧
+      Interp.steps k tempMove3MInit = .ok mRet ∧
+      ReturnRel tempMove ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree tempMove [.scalar ⟨3, 4⟩]) tr (.normal (v, mem))) :=
+  mirCall_progress tempMove_inFragment tempMove_translate ctx0 ctx0_ok_tempMove [.scalar ⟨3, 4⟩]
+    (by decide) tempMove3MInit rfl rfl rfl tempMove3_noUB n
+
 theorem tempMove2_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n tempMove2MInit = .ok m' ∧
       m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 6 } ∧
@@ -4651,6 +4665,36 @@ theorem deadRead_minirust_direct :
       | _ => none) = some "access to a dead local" := by
   decide +kernel
 
+theorem deadRead_steps5_ub :
+    Interp.steps 5 deadReadMInit = .error (.ub "access to a dead local") := by
+  have h := deadRead_minirust_direct
+  revert h
+  cases Interp.steps 5 deadReadMInit with
+  | ok _ => simp
+  | error e => cases e <;> simp
+
+theorem deadRead_converse_error :
+    (∃ msg, Stop.ub "access to a dead local" = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree deadRead []) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 5 ∧ Interp.steps k deadReadMInit = .ok mRet ∧
+      ReturnRel deadRead ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree deadRead []) tr (.normal (v, mem))) :=
+  mirCall_steps_error deadRead_inFragment deadRead_translate ctx0 (ctx0_ok2 rfl) []
+    (by decide) deadReadMInit rfl rfl rfl deadRead_steps5_ub
+
+theorem deadRead_outcome (n : Nat) :
+    (∃ s' m' tr, Interp.steps (initLen deadRead + n) deadReadMInit = .ok m' ∧
+      StateRel deadRead deadReadFn ctx0 s' m' ∧
+      Reaches (mirCallTree deadRead []) tr (mirTree deadRead s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen deadRead + n ∧
+      Interp.steps k deadReadMInit = .ok mRet ∧
+      ReturnRel deadRead ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree deadRead []) tr (.normal (v, mem))) ∨
+    (∃ msg, Interp.steps (initLen deadRead + n) deadReadMInit = .error (.ub msg) ∧
+      ∃ tr u, Reaches (mirCallTree deadRead []) tr u ∧ FaultNow u) :=
+  mirCall_outcome deadRead_inFragment deadRead_translate ctx0 (ctx0_ok2 rfl) []
+    (by decide) deadReadMInit rfl rfl rfl n
+
 /-! ### A body that `movesOk` rejects -/
 
 /-- MIR of `StorageLive(_2); _2 = copy _1; _0 = move _2; _0 = copy _2;
@@ -4712,5 +4756,340 @@ theorem moveReuse7_minirust_direct :
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAlloc with data := scalarBytes u32 7 }, [1]) := by
   decide +kernel
+
+/-! ### Cross-block moves, argument moves, projected tuple moves, live re-allocation, and idempotent `StorageDead`
+
+`crossBlockMove` exercises the CFG-aware `movesOk` dataflow analysis across
+`Goto` and `SwitchInt` edges:
+* moving the incoming function argument `_1` in `bb0` (`_2 = AddWithOverflow(move _1, const 10_u32)`),
+  which a block-insensitive `movedLocals` check would reject;
+* projected tuple moves `move (_2.0)` (in `Use`) and `move (_2.1)` (as a `bool`
+  `SwitchInt` discriminant), which leave `_2: (u32, bool)` initialized in both
+  models (`opMoved (.move ⟨2, [.field ..]⟩) = none`);
+* carrying live temporaries `_2` and `_3` initialized in `bb0` across `Goto(bb1)`
+  and `SwitchInt -> [0: bb2, otherwise: bb3]` before moving `_3` in `bb1` and `bb2`;
+* calling `StorageLive(_1)` and `StorageLive(_3)` on already-live locals without
+  an intervening `StorageDead`, exercising `StackFrame::storage_live`'s initial
+  `self.storage_dead(mem, local)?` deallocation and clearing their moved-out marks;
+* `Deinit(_2)` on a `(u32, bool)` 2-tuple local;
+* idempotent `StorageDead(_2)` on an already-dead local (`if let Some(ptr) = self.locals.remove(local)`). -/
+def crossBlockMove : CapturedMir where
+  defPath := "witness::cross_block_move"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32BoolTupleDecl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.assign (local_ 2) (.binaryOp .addWithOverflow (.move (local_ 1)) (constU32 10))),
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 3) (.use (.move (field0U32 2))))],
+      terminator := mkTerm (.goto 1),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.storageLive 1),
+        mkStmt (.assign (local_ 1) (.use (.move (local_ 3)))),
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 3) (.binaryOp .add (.move (local_ 1)) (constU32 5)))],
+      terminator := mkTerm (.switchInt (.move (field1 2)) { branches := [(0, 2)], otherwise := 3 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.deinit (local_ 2)),
+        mkStmt (.storageDead 2),
+        mkStmt (.storageDead 2),
+        mkStmt (.assign (local_ 0) (.use (.move (local_ 3)))),
+        mkStmt (.storageDead 3)],
+      terminator := mkTerm .return_,
+      isCleanup := false },
+    { statements := [
+        mkStmt (.storageDead 2),
+        mkStmt (.storageDead 3),
+        mkStmt (.assign (local_ 0) (.use (constU32 0)))],
+      terminator := mkTerm .return_,
+      isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem crossBlockMove_inFragment : inFragment crossBlockMove = true := by decide
+
+/-- Forward CFG dataflow `movedAtEntry` for `crossBlockMove`: `bb0` starts with
+`[]`, while `bb1`, `bb2`, and `bb3` have `[1]` moved out on entry (`_3` is
+initialized in `bb0`, moved in `bb1`, and re-allocated/initialized in `bb1`
+before reaching `bb2`). -/
+theorem crossBlockMove_movedAtEntry :
+    [0, 1, 2, 3].map (movedAtEntry crossBlockMove) = [[], [1], [1], [1]] := by decide
+
+def crossBlockMoveFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, intBoolTupleTy u32), (localName 3, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2),
+      .Assign (.Local (localName 2))
+        (.BinOp (.IntWithOverflow .Add) (.Load (.Local (localName 1))) (.Constant (.Int 10) (.Int u32))),
+      .StorageLive (localName 3),
+      .Assign (.Local (localName 3)) (.Load (.Field (.Local (localName 2)) 0))],
+      .Goto (bbName 1), .Regular⟩),
+    (bbName 1, ⟨[
+      .StorageLive (localName 1),
+      .Assign (.Local (localName 1)) (.Load (.Local (localName 3))),
+      .StorageLive (localName 3),
+      .Assign (.Local (localName 3))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 1))) (.Constant (.Int 5) (.Int u32)))],
+      .Switch (.UnOp (.Cast (.Transmute (.Int u8))) (.Load (.Field (.Local (localName 2)) 1)))
+        ⟨[(0, bbName 2)]⟩ (bbName 3), .Regular⟩),
+    (bbName 2, ⟨[
+      .Deinit (.Local (localName 2)),
+      .StorageDead (localName 2),
+      .StorageDead (localName 2),
+      .Assign (.Local (localName 0)) (.Load (.Local (localName 3))),
+      .StorageDead (localName 3)],
+      .Return, .Regular⟩),
+    (bbName 3, ⟨[
+      .StorageDead (localName 2),
+      .StorageDead (localName 3),
+      .Assign (.Local (localName 0)) (.Constant (.Int 0) (.Int u32))],
+      .Return, .Regular⟩),
+    (bbName 4, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 4
+  implicit_writes := true
+
+theorem crossBlockMove_translate : translateFn crossBlockMove = some crossBlockMoveFn := rfl
+
+theorem ctx0_ok_crossBlockMove : CtxOk crossBlockMove ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hd
+    match i, hd with
+    | 0, hd => simp [crossBlockMove] at hd; subst hd; decide
+    | 1, hd => simp [crossBlockMove] at hd; subst hd; decide
+    | 2, hd => simp [crossBlockMove] at hd; subst hd; decide
+    | 3, hd => simp [crossBlockMove] at hd; subst hd; decide
+    | _ + 4, hd => simp [crossBlockMove] at hd
+  ret := by
+    intro d hd
+    simp [crossBlockMove] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def crossBlockMove20S0 : MachineState := initMachineState crossBlockMove [.scalar ⟨20, 4⟩]
+def crossBlockMove20MInit : Mach :=
+  machine crossBlockMove crossBlockMoveFn crossBlockMove20S0.frame.locals crossBlockMoveFn.start
+
+theorem crossBlockMove20_anneal_ret :
+    ReachesRet (mirTree crossBlockMove crossBlockMove20S0)
+      [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
+      (.normal (.scalar ⟨35, 4⟩, crossBlockMove20S0.memory)) :=
+  runA_sound crossBlockMove 30 _ _ _ rfl
+
+theorem crossBlockMove20_noUB : MirNoUBTree (mirCallTree crossBlockMove [.scalar ⟨20, 4⟩]) :=
+  runA_noUB crossBlockMove 30 _ _ _ rfl
+
+theorem crossBlockMove20_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n crossBlockMove20MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 35 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret crossBlockMove_inFragment crossBlockMove_translate ctx0 ctx0_ok_crossBlockMove
+      [.scalar ⟨20, 4⟩] (by decide) crossBlockMove20MInit rfl rfl rfl crossBlockMove20_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [crossBlockMove] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem crossBlockMove20_minirust_direct :
+    (Interp.steps 17 crossBlockMove20MInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length),
+          m.mem.memory.allocations.map (·.live))) =
+      some (some { retAlloc with data := scalarBytes u32 35 }, [1],
+        [true, false, false, false, false, false, false]) := by
+  decide +kernel
+
+def crossBlockMoveOvS0 : MachineState :=
+  initMachineState crossBlockMove [.scalar ⟨4294967290, 4⟩]
+def crossBlockMoveOvMInit : Mach :=
+  machine crossBlockMove crossBlockMoveFn crossBlockMoveOvS0.frame.locals crossBlockMoveFn.start
+
+theorem crossBlockMoveOv_anneal_ret :
+    ReachesRet (mirTree crossBlockMove crossBlockMoveOvS0)
+      [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
+      (.normal (.scalar ⟨0, 4⟩, crossBlockMoveOvS0.memory)) :=
+  runA_sound crossBlockMove 30 _ _ _ rfl
+
+theorem crossBlockMoveOv_noUB :
+    MirNoUBTree (mirCallTree crossBlockMove [.scalar ⟨4294967290, 4⟩]) :=
+  runA_noUB crossBlockMove 30 _ _ _ rfl
+
+theorem crossBlockMoveOv_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n crossBlockMoveOvMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 0 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret crossBlockMove_inFragment crossBlockMove_translate ctx0 ctx0_ok_crossBlockMove
+      [.scalar ⟨4294967290, 4⟩] (by decide) crossBlockMoveOvMInit rfl rfl rfl
+      crossBlockMoveOv_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [crossBlockMove] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem crossBlockMoveOv_minirust_direct :
+    (Interp.steps 15 crossBlockMoveOvMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length),
+          m.mem.memory.allocations.map (·.live))) =
+      some (some { retAlloc with data := scalarBytes u32 0 }, [1],
+        [true, false, false, false, false, false, false]) := by
+  decide +kernel
+
+/-! ### Cross-block move-reuse rejected by `movesOk` -/
+
+/-- A 2-block body that moves `_1` in `bb0` (`_0 = move _1; goto bb1`) and reads
+`_1` in `bb1` (`_0 = copy _1; return`): `movedAtEntry` propagates `1` across the
+`bb0 → bb1` edge and `movesOk` rejects the body. -/
+def crossBlockMoveReuse : CapturedMir where
+  defPath := "witness::cross_block_move_reuse"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.assign (local_ 0) (.use (.move (local_ 1))))],
+      terminator := mkTerm (.goto 1), isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.use (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem crossBlockMoveReuse_movesOk :
+    movedAtEntry crossBlockMoveReuse 1 = [1] ∧ movesOk crossBlockMoveReuse = false ∧
+    inFragment crossBlockMoveReuse = false := by decide
+
+/-! ### A body that `mentionsOk` rejects (`alwaysStorageLiveLocals` semantic discrepancy) -/
+
+/-- MIR of `_1 = const 9_u32; _0 = copy _1; return` for `fn() -> u32` where the
+temporary `_1: u32` has no `StorageLive` or `StorageDead` marker in the body
+(`alwaysStorageLiveLocals = [1]`): `minimize`'s `initBlock` emits
+`StorageLive(_1)` so MiniRust returns `9`, whereas Anneal's `initMachineState`
+starts `_1` in `.dead` and faults with UB on `_1 = const 9_u32`. `mentionsOk`
+rejects this body. -/
+def unmarkedTempAssign : CapturedMir where
+  defPath := "witness::unmarked_temp_assign"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 1) (.use (constU32 9))),
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 0
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem unmarkedTempAssign_rejected :
+    alwaysStorageLiveLocals unmarkedTempAssign = [1] ∧
+    mentionsOk unmarkedTempAssign = false ∧
+    inFragment unmarkedTempAssign = false := by decide
+
+def unmarkedTempAssignFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 1)) (.Constant (.Int 9) (.Int u32)),
+      .Assign (.Local (localName 0)) (.Load (.Local (localName 1)))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[.StorageLive (localName 1)], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem unmarkedTempAssign_translate :
+    translateFn unmarkedTempAssign = some unmarkedTempAssignFn := rfl
+
+def unmarkedTempAssignS0 : MachineState := initMachineState unmarkedTempAssign []
+
+theorem unmarkedTempAssign_anneal_ub :
+    ∃ tr u, Reaches (mirTree unmarkedTempAssign unmarkedTempAssignS0) tr u ∧ FaultNow u :=
+  faultsA_sound unmarkedTempAssign 10 _ (by decide)
+
+theorem unmarkedTempAssign_minirust_direct :
+    (Interp.steps 5 (machine unmarkedTempAssign unmarkedTempAssignFn
+        unmarkedTempAssignS0.frame.locals unmarkedTempAssignFn.start)).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 9 }, [1]) := by
+  decide +kernel
+
+/-! ### Direct ground-truth checks for `BM.allocate`, `BM.deallocate`, and `Statement::Deinit` UB paths -/
+
+/-- `BM.allocate` raises `"asking for a too large allocation"` when
+`!x86_64.valid_size(size)` (`size.bytes >= 2^63` or `size.bytes < 0`), and
+`BM.deallocate` raises each of the six upstream UB diagnostics from
+`spec/mem/basic.md` (provenance `None`, double-free of a dead allocation,
+non-zero offset from `alloc.addr`, wrong `AllocationKind`, wrong `Size`, and
+wrong `Align`). -/
+theorem bm_allocate_and_deallocate_ub_cases :
+    BM.allocate { tempMove3MInit.mem.memory with allocations := [] } .Stack ⟨2 ^ 63⟩ ⟨1⟩ =
+      .error (.ub "asking for a too large allocation") ∧
+    BM.deallocate tempMove3MInit.mem.memory { addr := 64, provenance := none } .Stack ⟨4⟩ ⟨4⟩ =
+      .error (.ub "deallocating invalid pointer") ∧
+    BM.deallocate
+      { tempMove3MInit.mem.memory with allocations := [{ retAlloc with live := false }] }
+      { addr := 64, provenance := some (⟨0⟩, ()) } .Stack ⟨4⟩ ⟨4⟩ =
+      .error (.ub "double-free") ∧
+    BM.deallocate tempMove3MInit.mem.memory
+      { addr := 65, provenance := some (⟨0⟩, ()) } .Stack ⟨4⟩ ⟨4⟩ =
+      .error (.ub "deallocating with pointer not to the beginning of its allocation") ∧
+    BM.deallocate tempMove3MInit.mem.memory
+      { addr := 64, provenance := some (⟨0⟩, ()) } .Heap ⟨4⟩ ⟨4⟩ =
+      .error (.ub "deallocating with the wrong deallocation operation") ∧
+    BM.deallocate tempMove3MInit.mem.memory
+      { addr := 64, provenance := some (⟨0⟩, ()) } .Stack ⟨8⟩ ⟨4⟩ =
+      .error (.ub "deallocating with incorrect size information") ∧
+    BM.deallocate tempMove3MInit.mem.memory
+      { addr := 64, provenance := some (⟨0⟩, ()) } .Stack ⟨4⟩ ⟨8⟩ =
+      .error (.ub "deallocating with incorrect alignment information") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `evalStatement` for `Statement::Deinit` replaces the bytes of a live local
+with `AbstractByte.Uninit`, raises `"access to a dead local"` on a dead local,
+and raises `"dereferencing pointer outside the bounds of its allocation"` when
+`CM.deinit` stores `size` bytes at an out-of-bounds offset in the local's
+allocation (while `CM.deinit` with non-unit alignment raises `"store to a
+misaligned pointer"`). -/
+def misalignedLocalMach : Mach :=
+  { tempMove3MInit with
+    threads := [thread1 ctx0 [callerFrame,
+      { calleeFrameL tempMoveFn ctx0
+          ⟨[(localName 0, localPtr ctx0 0),
+            (localName 1, { addr := 257, provenance := some (⟨2⟩, ()) })]⟩ 0 0 with
+        next_block := tempMoveFn.start }]] }
+
+theorem evalStatement_deinit_ok_dead_and_misaligned :
+    (evalStatement tempMove3MInit (.Deinit (.Local (localName 1)))).toOption.bind
+        (fun m => m.mem.memory.allocations[2]?.map (·.data)) =
+      some [.Uninit, .Uninit, .Uninit, .Uninit] ∧
+    evalStatement tempMove3MInit (.Deinit (.Local (localName 2))) =
+      .error (.ub "access to a dead local") ∧
+    evalStatement misalignedLocalMach (.Deinit (.Local (localName 1))) =
+      .error (.ub "dereferencing pointer outside the bounds of its allocation") ∧
+    CM.deinit tempMove3MInit.mem { addr := 257, provenance := some (⟨2⟩, ()) } ⟨4⟩ ⟨4⟩ =
+      .error (.ub "store to a misaligned pointer") :=
+  ⟨rfl, rfl, rfl, rfl⟩
 
 end MiniRustSpec.Correspondence.Witness

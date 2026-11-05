@@ -83,12 +83,13 @@ on a later read of the moved-from local before it is written again, which
 `rustc` itself forbids ("You should not emit MIR that may attempt a
 subsequent second load of this place without first re-initializing it",
 `Operand::Move` in `compiler/rustc_middle/src/mir/syntax.rs`). The fragment
-therefore admits `move` only where a conservative per-block check, `movesOk`,
-proves that no such read happens: at the start of every block, each local that
-the body moves anywhere may already be moved out, a `move _j` marks `_j` as
-moved out, writing `_j` (assignment, `StorageLive`, `StorageDead`, or
-`Deinit`) clears the mark, and no operand and no `Return` may read a marked
-local.
+therefore admits `move` only where a CFG dataflow check, `movesOk`, proves
+that no such read happens: entry to `bb0` starts with no moved-out locals
+(apart from any propagated along back-edges to `bb0`), a root `move _j` marks
+`_j` as moved out, writing `_j` (assignment, `StorageLive`, `StorageDead`, or
+`Deinit`) clears the mark, control-flow edges (`Goto` and `SwitchInt`)
+propagate moved-out locals to successor blocks (`movedAtEntry`), and no
+operand and no `Return` may read a marked local.
 
 `minimize`'s init block allocates every temporary without storage markers
 (`rs::always_storage_live_locals`), whereas Anneal starts every temporary
@@ -1146,9 +1147,11 @@ def storageDeadOk (body : MirAst.CapturedMir) : Bool :=
 
 /-! ### Moved-out locals
 
-The check `movesOk` described in the module docs. It runs over each block
-separately, starting from the conservative assumption that every local that
-the body moves anywhere (`movedLocals`) may already be moved out. -/
+The CFG dataflow check `movesOk` described in the module docs. Forward
+propagation across `Goto` and `SwitchInt` edges computes the set of locals
+`movedAtEntry body blk` that may be moved out on entry to each block `blk`,
+and `movesOk` verifies both intra-block safety (`blockMovesOk`) and edge
+closure across every control-flow transition. -/
 
 /-- The local that a fragment operand moves out of: Anneal's `evalOperand`
 sets the slot of `_j` to `.uninit` when it reads `move _j` ("reading a root
@@ -1220,22 +1223,57 @@ def termReadsOk (mo : List Nat) (t : MirAst.Terminator) : Bool :=
   | .return_ => !mo.contains 0
   | _ => true
 
-/-- The locals that some operand of the body moves out of. -/
-def movedLocals (body : MirAst.CapturedMir) : List Nat :=
-  body.basicBlocks.flatMap fun bb =>
-    bb.statements.flatMap (fun s =>
-      match s.kind with
-      | .assign _ rv => (rvOperands rv).filterMap opMoved
-      | _ => []) ++
-    match bb.terminator.kind with
-    | .switchInt discr _ => (opMoved discr).toList
-    | _ => []
+/-- The moved-out locals after terminator `t` reads its operand. -/
+def termMoved (mo : List Nat) (t : MirAst.Terminator) : List Nat :=
+  match t.kind with
+  | .switchInt discr _ => moveOut mo discr
+  | _ => mo
+
+/-- The successor block indices of terminator `t`. -/
+def termTargets (t : MirAst.Terminator) : List Nat :=
+  match t.kind with
+  | .goto target => [target]
+  | .switchInt _ targets => targets.otherwise :: targets.branches.map Prod.snd
+  | _ => []
+
+/-- Add elements of `xs` not already present in `acc`. -/
+def unionLocals (acc xs : List Nat) : List Nat :=
+  xs.foldl (fun a j => if a.contains j then a else j :: a) acc
+
+/-- One forward CFG pass propagating moved-out locals from every block's exit
+to its successor blocks' entries. -/
+def stepMovedEntries (bbs : List MirAst.BasicBlockData) (entries : List (List Nat)) :
+    List (List Nat) :=
+  (List.range bbs.length).map fun dst =>
+    (List.range bbs.length).foldl (fun acc src =>
+      match bbs[src]? with
+      | some bb =>
+        if (termTargets bb.terminator).contains dst then
+          let mo := entries.getD src []
+          let exitMo := termMoved (bb.statements.foldl stmtMoved mo) bb.terminator
+          unionLocals acc exitMo
+        else acc
+      | none => acc) (entries.getD dst [])
+
+/-- Iterate forward moved-out propagation up to `fuel` passes, stopping early
+as soon as the per-block entry sets stabilize. -/
+def iterMovedEntries : Nat → List MirAst.BasicBlockData → List (List Nat) → List (List Nat)
+  | 0, _, entries => entries
+  | n + 1, bbs, entries =>
+    let entries' := stepMovedEntries bbs entries
+    if entries' == entries then entries
+    else iterMovedEntries n bbs entries'
+
+/-- The locals that may be moved out on entry to block `blk`. -/
+def movedAtEntry (body : MirAst.CapturedMir) (blk : Nat) : List Nat :=
+  let fuel := body.basicBlocks.length * (body.localDecls.length + 1)
+  (iterMovedEntries fuel body.basicBlocks []).getD blk []
 
 /-- The locals that may be moved out before statement `stmt` of block `blk`. -/
 def movedBefore (body : MirAst.CapturedMir) (blk stmt : Nat) : List Nat :=
   match body.basicBlocks[blk]? with
-  | some bb => (bb.statements.take stmt).foldl stmtMoved (movedLocals body)
-  | none => movedLocals body
+  | some bb => (bb.statements.take stmt).foldl stmtMoved (movedAtEntry body blk)
+  | none => movedAtEntry body blk
 
 /-- Whether a block whose statements are `ss` and whose terminator is `t`,
 entered with the moved-out locals `mo`, never reads a moved-out local. -/
@@ -1243,9 +1281,17 @@ def blockMovesOk (mo : List Nat) : List MirAst.Statement → MirAst.Terminator �
   | [], t => termReadsOk mo t
   | s :: ss, t => stmtReadsOk mo s && blockMovesOk (stmtMoved mo s) ss t
 
-/-- No moved-from local is read before it is re-initialized. -/
+/-- No moved-from local is read before it is re-initialized along any CFG path. -/
 def movesOk (body : MirAst.CapturedMir) : Bool :=
-  body.basicBlocks.all fun bb => blockMovesOk (movedLocals body) bb.statements bb.terminator
+  (List.range body.basicBlocks.length).all fun blk =>
+    match body.basicBlocks[blk]? with
+    | some bb =>
+      let mo := movedAtEntry body blk
+      let exitMo := termMoved (bb.statements.foldl stmtMoved mo) bb.terminator
+      blockMovesOk mo bb.statements bb.terminator &&
+      (termTargets bb.terminator).all (fun t =>
+        exitMo.all (fun j => (movedAtEntry body t).contains j))
+    | none => true
 
 /-! ### Locals mentioned by the body -/
 

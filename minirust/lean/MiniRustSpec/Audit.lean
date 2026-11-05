@@ -235,8 +235,9 @@ open MiniRustSpec.Correspondence in
   mentionsOk_stmt
   mentionsOk_term
   foldl_moveOut_mem
+  movedBefore_zero
   movedBefore_succ
-  movedBefore_sub
+  lookupSwitchTarget_mem
   blockMovesOk_spec
   movesOk_spec
   readsOk_mono
@@ -672,9 +673,11 @@ open MiniRustSpec.Correspondence.Witness in
   tempMove_initLen
   tempMove3_anneal_ret
   tempMove3_noUB
+  tempMove3_progress
   tempMove3_minirust_ret_from_start
   tempMove3_minirust_direct
   tempMove2_anneal_ret
+  tempMove2_noUB
   tempMove2_minirust_ret_from_start
   tempMove2_minirust_direct
   deadRead_inFragment
@@ -682,11 +685,33 @@ open MiniRustSpec.Correspondence.Witness in
   deadRead_anneal_ub
   deadRead_minirust_ub_from_start
   deadRead_minirust_direct
+  deadRead_steps5_ub
+  deadRead_converse_error
+  deadRead_outcome
   moveReuse_movesOk
   moveReuse_not_inFragment
   moveReuse_translate
   moveReuse7_anneal_ub
   moveReuse7_minirust_direct
+  crossBlockMove_inFragment
+  crossBlockMove_movedAtEntry
+  crossBlockMove_translate
+  ctx0_ok_crossBlockMove
+  crossBlockMove20_anneal_ret
+  crossBlockMove20_noUB
+  crossBlockMove20_minirust_ret_from_start
+  crossBlockMove20_minirust_direct
+  crossBlockMoveOv_anneal_ret
+  crossBlockMoveOv_noUB
+  crossBlockMoveOv_minirust_ret_from_start
+  crossBlockMoveOv_minirust_direct
+  crossBlockMoveReuse_movesOk
+  unmarkedTempAssign_rejected
+  unmarkedTempAssign_translate
+  unmarkedTempAssign_anneal_ub
+  unmarkedTempAssign_minirust_direct
+  bm_allocate_and_deallocate_ub_cases
+  evalStatement_deinit_ok_dead_and_misaligned
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -786,8 +811,9 @@ open MiniRustSpec.Correspondence in
   mentionsOk_stmt
   mentionsOk_term
   foldl_moveOut_mem
+  movedBefore_zero
   movedBefore_succ
-  movedBefore_sub
+  lookupSwitchTarget_mem
   blockMovesOk_spec
   movesOk_spec
   readsOk_mono
@@ -1064,9 +1090,11 @@ open MiniRustSpec.Correspondence.Witness in
   tempMove_initLen
   tempMove3_anneal_ret
   tempMove3_noUB
+  tempMove3_progress
   tempMove3_minirust_ret_from_start
   tempMove3_minirust_direct
   tempMove2_anneal_ret
+  tempMove2_noUB
   tempMove2_minirust_ret_from_start
   tempMove2_minirust_direct
   deadRead_inFragment
@@ -1074,11 +1102,33 @@ open MiniRustSpec.Correspondence.Witness in
   deadRead_anneal_ub
   deadRead_minirust_ub_from_start
   deadRead_minirust_direct
+  deadRead_steps5_ub
+  deadRead_converse_error
+  deadRead_outcome
   moveReuse_movesOk
   moveReuse_not_inFragment
   moveReuse_translate
   moveReuse7_anneal_ub
   moveReuse7_minirust_direct
+  crossBlockMove_inFragment
+  crossBlockMove_movedAtEntry
+  crossBlockMove_translate
+  ctx0_ok_crossBlockMove
+  crossBlockMove20_anneal_ret
+  crossBlockMove20_noUB
+  crossBlockMove20_minirust_ret_from_start
+  crossBlockMove20_minirust_direct
+  crossBlockMoveOv_anneal_ret
+  crossBlockMoveOv_noUB
+  crossBlockMoveOv_minirust_ret_from_start
+  crossBlockMoveOv_minirust_direct
+  crossBlockMoveReuse_movesOk
+  unmarkedTempAssign_rejected
+  unmarkedTempAssign_translate
+  unmarkedTempAssign_anneal_ub
+  unmarkedTempAssign_minirust_direct
+  bm_allocate_and_deallocate_ub_cases
+  evalStatement_deinit_ok_dead_and_misaligned
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

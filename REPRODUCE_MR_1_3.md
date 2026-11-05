@@ -31,11 +31,12 @@ as a pass.
 - **Anchors** (`Anchors.lean`): 58 anchors (up from 55), with the new
   `allocate` helpers listed in the `impl_BasicMemory__allocate` anchor.
 - **Quotation checks** (`crates/anneal-minirust-gen/tests/quotes.rs`):
-  `storage_live_dead_deinit_move_and_init_block_quotations_are_pinned` pins 14
+  `storage_live_dead_deinit_move_and_init_block_quotations_are_pinned` pins 15
   upstream quotations (`valid_size`, `overlaps`, `allocate` and its `pick`
   predicate, `try_mutate_cur_frame`, `deinit`, `Deinit`, `storage_live`,
   `storage_dead`, the `StorageLive`/`StorageDead` statements, `minimize`'s
-  `Move` operand and storage-statement translations, and its init block),
+  `Move` operand and storage-statement translations, its init block, and
+  `spec/lang/well-formed.md`'s `Statement::StorageDead` restriction),
   rejects tampered variants, and rejects file misattribution.
 - **Translation and fragment** (`Correspondence/Translate.lean`):
   - Bodies may declare any number of temporaries (fewer than `2^31` locals).
@@ -48,8 +49,9 @@ as a pass.
   - `move` operands translate like `copy` (`copyOp`, `copyRv`), as in
     `minimize`. Anneal's root `move` leaves the local uninitialized while
     MiniRust's is a plain load, so `movesOk` rejects any body that reads a
-    possibly moved-out local before writing it again (per block, starting
-    from every local the body moves anywhere).
+    possibly moved-out local before writing it again via forward CFG dataflow
+    propagation (`movedAtEntry`, propagating moved-out sets across `Goto` and
+    `SwitchInt` edges from `[]` at `bb0`).
   - `initBlock`: `StorageLive` of `alwaysStorageLiveLocals` (temporaries
     without storage markers), then `Goto(bb0)`, as `minimize`'s
     `always_storage_live_locals` filter computes. Anneal keeps such a
@@ -90,13 +92,34 @@ as a pass.
     `move` in a `BinaryOp`, a `Use`, and a `switchInt` discriminant, `Deinit`
     of a moved-from temporary, and an unused temporary that the init block
     allocates; `temp_move(3) = 100` and `temp_move(2) = 6` via `mirCall_ret`,
-    confirmed by direct runs that also show every callee allocation dead
-    after the return and `StorageLive` reusing a released first-fit address
-    (`tempMove3_minirust_direct`, `tempMove2_minirust_direct`).
-  - `deadRead`: reading a temporary after `StorageDead` is UB in both models.
-  - `moveReuse`: a body that reads a local after moving out of it; `movesOk`
-    rejects it (`moveReuse_not_inFragment`), and the models disagree on it
-    (`moveReuse7_anneal_ub`, `moveReuse7_minirust_direct`).
+    `mirCall_noUB`, and `mirCall_progress`, confirmed by direct runs that also
+    show every callee allocation dead after the return and `StorageLive`
+    reusing a released first-fit address (`tempMove3_minirust_direct`,
+    `tempMove2_minirust_direct`).
+  - `crossBlockMove`: a 4-block CFG exercising the forward dataflow `movesOk`
+    check across `Goto` and `SwitchInt` edges, moving the incoming argument
+    `_1` in `bb0`, projected tuple moves `move (_2.0)` and `move (_2.1)` on a
+    `(u32, bool)` temporary, carrying live temporaries across block boundaries
+    before moving them in later blocks, calling `StorageLive` on already-live
+    locals without an intervening `StorageDead`, `Deinit` of a `(u32, bool)`
+    tuple local, and idempotent `StorageDead` on an already-dead local
+    (`crossBlockMove20_*`, `crossBlockMoveOv_*`).
+  - `deadRead`: reading a temporary after `StorageDead` is UB in both models
+    (`mirCall_ub`, `mirCall_steps_error`, `mirCall_outcome`, and direct run).
+  - `moveReuse` and `crossBlockMoveReuse`: intra-block and cross-block bodies
+    that read a local after moving out of it; `movesOk` rejects both
+    (`moveReuse_not_inFragment`, `crossBlockMoveReuse_movesOk`), and the models
+    disagree on `moveReuse(7)` (`moveReuse7_anneal_ub`,
+    `moveReuse7_minirust_direct`).
+  - `unmarkedTempAssign`: a body that assigns to and reads a temporary without
+    `StorageLive`/`StorageDead` markers; `mentionsOk` rejects it
+    (`unmarkedTempAssign_rejected`), and the models disagree on it because
+    `initBlock` allocates `_1` in MiniRust while Anneal starts `_1` dead
+    (`unmarkedTempAssign_anneal_ub`, `unmarkedTempAssign_minirust_direct`).
+  - Direct ground-truth checks for `BM.allocate` (`!x86_64.valid_size` UB), all
+    six `BM.deallocate` UB diagnostics (`bm_allocate_and_deallocate_ub_cases`),
+    and `evalStatement (.Deinit ..)` / `CM.deinit` on live, dead, out-of-bounds,
+    and misaligned targets (`evalStatement_deinit_ok_dead_and_misaligned`).
   - Every pre-existing witness is re-proved against the new relation (the
     `bb0` relations now follow from `step_start`).
 
@@ -142,9 +165,9 @@ Pass: `Build completed successfully`, with:
 
 ```text
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
-[SIMULATION-AUDIT] decls=151 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
-[WITNESS-AUDIT] decls=227 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-MiniRustSpec.Audit: exhaustively verified standard axioms for 9988 declarations across all MiniRustSpec.* modules
+[SIMULATION-AUDIT] decls=152 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
+[WITNESS-AUDIT] decls=251 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+MiniRustSpec.Audit: exhaustively verified standard axioms for 10018 declarations across all MiniRustSpec.* modules
 ```
 
 (`lake` prints already-built modules without re-running them; to see the audit
@@ -158,11 +181,17 @@ first.)
 - `tempMove3_minirust_direct` states the full allocation list after the
   return: `live = [true, false, false, false, false, false, false]` and
   addresses `[64, 128, 256, 2^32, 2 * 2^32, 3 * 2^32, 2 * 2^32]`.
-- `moveReuse_not_inFragment` is proved by `decide`, so the fragment check
-  is not vacuous for the unsound case.
+- `inFragment crossBlockMove = true` and `crossBlockMove_movedAtEntry` are
+  proved by `decide`, showing that `movesOk` accepts moving `_1` in `bb0` and
+  propagating live temporaries across `Goto` and `SwitchInt` edges.
+- `moveReuse_not_inFragment`, `crossBlockMoveReuse_movesOk`, and
+  `unmarkedTempAssign_rejected` are proved by `decide`, so the fragment check
+  is not vacuous for intra-block move reuse, cross-block move reuse, or
+  unmarked temporaries.
 
 ## Known limitations
 
-- `movesOk` is conservative across blocks (see `minirust/README.md`, Gaps).
+- `movesOk` is path-insensitive across control-flow merges (`movedAtEntry` takes
+  the union of moved-out locals over incoming CFG edges; see `minirust/README.md`, Gaps).
 - Temporaries without storage markers must be unmentioned.
 - Results hold for the first-fit resolution of `pick`.

@@ -1471,6 +1471,7 @@ fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
     let basic = "spec/mem/basic.md";
     let conc = "spec/mem/concurrent.md";
     let target = "spec/prelude/target.md";
+    let wf = "spec/lang/well-formed.md";
     let rvalue = "tooling/minimize/src/rvalue.rs";
     let bb = "tooling/minimize/src/bb.rs";
     let func = "tooling/minimize/src/function.rs";
@@ -1617,8 +1618,16 @@ fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
             ".filter(|LocalName(i)| i.get_internal() as usize < free_argc)",
             "MiniRustSpec/Correspondence/Translate.lean",
         ),
+        (
+            wf,
+            "if local == func.ret || func.args.any(|arg_name| local == arg_name) { \
+                 throw_ill_formed!(\"Statement::StorageDead: trying to mark argument or return local as dead\"); \
+             }",
+            "if local == func.ret && func.args.any(|arg_name| local == arg_name)",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
     ];
-    assert_eq!(cases.len(), 14, "expected 14 pinned MR-1.3 quotations");
+    assert_eq!(cases.len(), 15, "expected 15 pinned MR-1.3 quotations");
 
     let lean_root = minirust_dir().join("lean");
     for (file, genuine, tampered, lean_file) in cases {

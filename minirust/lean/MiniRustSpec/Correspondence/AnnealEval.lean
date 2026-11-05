@@ -2485,13 +2485,12 @@ theorem evalStmt_assignTuple (s : MachineState) (decls : List LocalDecl) (layout
   · simp [evalStmt, hnone h]
 
 theorem evalStmt_placeMention (s : MachineState) (decls : List LocalDecl) (layouts : Layout.LayoutTable)
-    (i : Nat) (span : String) (hslots : SlotsOk decls s.frame.locals)
+    (i : Nat) (span : String) (_hslots : SlotsOk decls s.frame.locals)
     (hn : s.frame.locals.length = decls.length) (hi : i < decls.length)
     (hlive0 : s.frame.locals[i]? ≠ some .dead) :
     evalStmt s ⟨.placeMention ⟨i, []⟩, span⟩ decls layouts =
       .tau (.running (advanceStmt s s.frame.locals)) := by
   have hil : i < s.frame.locals.length := by rw [hn]; exact hi
-  obtain ⟨d, hd⟩ : ∃ d, decls[i]? = some d := ⟨decls[i], by simp [hi]⟩
   have hs : s.frame.locals[i]? = some s.frame.locals[i] := by simp [hil]
   have hlive : s.frame.locals[i] ≠ .dead := fun h => hlive0 (by rw [hs, h])
   simp only [evalStmt, get?, hs]
@@ -2502,13 +2501,12 @@ theorem evalStmt_placeMention (s : MachineState) (decls : List LocalDecl) (layou
 
 theorem evalStmt_placeMention_place (s : MachineState) (decls : List LocalDecl)
     (layouts : Layout.LayoutTable) (p : Place) (span : String)
-    (hslots : SlotsOk decls s.frame.locals) (hn : s.frame.locals.length = decls.length)
+    (_hslots : SlotsOk decls s.frame.locals) (hn : s.frame.locals.length = decls.length)
     (hi : p.local_ < decls.length)
     (hlive0 : s.frame.locals[p.local_]? ≠ some .dead) :
     evalStmt s ⟨.placeMention p, span⟩ decls layouts =
       .tau (.running (advanceStmt s s.frame.locals)) := by
   have hil : p.local_ < s.frame.locals.length := by rw [hn]; exact hi
-  obtain ⟨d, hd⟩ : ∃ d, decls[p.local_]? = some d := ⟨decls[p.local_], by simp [hi]⟩
   have hs : s.frame.locals[p.local_]? = some s.frame.locals[p.local_] := by simp [hil]
   have hlive : s.frame.locals[p.local_] ≠ .dead := fun h => hlive0 (by rw [hs, h])
   simp only [evalStmt, get?, hs]
@@ -2523,16 +2521,14 @@ theorem evalStmt_storageLive (s : MachineState) (decls : List LocalDecl)
     (layouts : Layout.LayoutTable) (i : Nat) (span : String) (hi : i < s.frame.locals.length) :
     evalStmt s ⟨.storageLive i, span⟩ decls layouts =
       .tau (.running (advanceStmt s (s.frame.locals.set i .uninit))) := by
-  have hs : s.frame.locals[i]? = some s.frame.locals[i] := by simp [hi]
-  simp [evalStmt, get?, hs, set?, hi, MirStepNode.step]
+  simp [evalStmt, get?, set?, hi, MirStepNode.step]
 
 /-- Anneal's `StorageDead(_i)`: the slot becomes `.dead`. -/
 theorem evalStmt_storageDead (s : MachineState) (decls : List LocalDecl)
     (layouts : Layout.LayoutTable) (i : Nat) (span : String) (hi : i < s.frame.locals.length) :
     evalStmt s ⟨.storageDead i, span⟩ decls layouts =
       .tau (.running (advanceStmt s (s.frame.locals.set i .dead))) := by
-  have hs : s.frame.locals[i]? = some s.frame.locals[i] := by simp [hi]
-  simp [evalStmt, get?, hs, set?, hi, MirStepNode.step]
+  simp [evalStmt, get?, set?, hi, MirStepNode.step]
 
 /-- Anneal's `Deinit(_i)` of a root local: the slot of a live local becomes
 `.uninit`; a dead local is UB. -/
