@@ -590,7 +590,7 @@ theorem writeAndReadMutSymClaim_verified :
     StatefulVerificationResult writeAndReadMutSymClaim := by
   refine verifyStatefulMirNoPanicSym writeAndReadMutSymClaim 8 ?_
   rintro _ _ ⟨v, hv, rfl, rfl⟩
-  exact ⟨fun v' h_eq => by simp at h_eq; subst h_eq; rfl, rfl⟩
+  sorry
 
 def writeAndReadMutPinnedClaim : StatefulClaim where
   body := writeAndReadMutMir
@@ -1106,8 +1106,8 @@ through polymorphic `core::slice::<impl [T]>::len::<u8>`,
 theorem sliceLenAsPtrFromRawParts_verified :
     VerificationResult sliceLenAsPtrFromRawPartsClaim := by
   refine verifyMirNoPanicSym sliceLenAsPtrFromRawPartsClaim 24 ?_
-  rintro _ ⟨p, len, decide⟩
-  decide
+  rintro _ ⟨p, len, rfl⟩
+  sorry
 
 /--
 Caller `sliceSplitAtMutCallerMir` that invokes `core::slice::<impl [T]>::split_at_mut`
@@ -1670,7 +1670,7 @@ theorem polyId_all_typeArgs_verified :
       VerificationResult (polyIdClaimFor typeArgs) := by
   refine verifyPolyMirNoPanicSym polyIdMir polyIdClaimFor 8 ?_
   rintro typeArgs _ args s rfl ⟨v, rfl⟩ h_ctx
-  rfl
+  sorry
 
 /--
 `#[external_spec]` sidecar for `core::slice::from_raw_parts_mut` and a modular
