@@ -4,6 +4,8 @@ import Anneal.PureMirExec
 import Anneal.MirLoops
 
 set_option maxRecDepth 2048
+set_option linter.unusedVariables false
+
 namespace Anneal.MirLiftCore
 
 open Trusted.Effect
@@ -86,47 +88,48 @@ inductive LiftStmt : PureEnv → Statement → (PureEnv → Prop) → Prop
       post env' →
       LiftStmt env { kind := .nop, span := span } post
 
-mutual
-inductive LiftStmtsTerminator (body : CapturedMir) : PureEnv → List Statement → Terminator → (Value → Prop) → Nat → Prop
-  | nil_goto (env target span post fuel) :
-      LiftBlock body target env post fuel →
-      LiftStmtsTerminator body env [] { kind := .goto target, span := span } post (fuel + 1)
-  | nil_return (env span post val) :
-      Trusted.Sequence.get? env 0 = some (.init val) →
-      post val →
-      LiftStmtsTerminator body env [] { kind := .return_, span := span } post 1
-  | nil_switchInt (env discr targets span post sc env' target fuel) :
-      evalPureOperand env discr = .ok (.scalar sc) env' →
-      target = lookupSwitchTarget sc.bits targets.branches targets.otherwise →
-      LiftBlock body target env' post fuel →
-      LiftStmtsTerminator body env [] { kind := .switchInt discr targets, span := span } post (fuel + 1)
-  | nil_assert (env cond expected target unwind span post sc env' expectedBit fuel) :
-      evalPureOperand env cond = .ok (.scalar sc) env' →
-      expectedBit = (if expected then 1 else 0) →
-      sc.bits = expectedBit →
-      LiftBlock body target env' post fuel →
-      LiftStmtsTerminator body env [] { kind := .assert cond expected target unwind, span := span } post (fuel + 1)
-  | nil_call (env func args dest target unwind span post ms' fuel) :
-      evalTerminator (PureState.toMachineState { bb := 0, stmtIdx := 0, env := env } emptyMemory) { kind := .call func args dest target unwind, span := span } none = .step ms' →
-      LiftBlock body ms'.frame.blockIdx ms'.frame.locals post fuel →
-      LiftStmtsTerminator body env [] { kind := .call func args dest target unwind, span := span } post (fuel + 1)
-  | cons (env stmt stmts term post env' fuel) :
-      LiftStmt env stmt (fun e => e = env') →
-      LiftStmtsTerminator body env' stmts term post fuel →
-      LiftStmtsTerminator body env (stmt :: stmts) term post (fuel + 1)
+def LiftBlock (body : CapturedMir) (bbIdx : BasicBlockIdx) (env : PureEnv) (post : Value → Prop) (fuel : Nat) : Prop :=
+  wpPureMirExec fuel body { bb := bbIdx, stmtIdx := 0, env := env } post
 
-inductive LiftBlock (body : CapturedMir) : BasicBlockIdx → PureEnv → (Value → Prop) → Nat → Prop
-  | step (bbIdx env post bb fuel) :
-      body.basicBlocks[bbIdx]? = some bb →
-      LiftStmtsTerminator body env bb.statements bb.terminator post fuel →
-      LiftBlock body bbIdx env post (fuel + 1)
-end
+def LiftStmtsTerminator (body : CapturedMir) (bbIdx : BasicBlockIdx) (stmtIdx : Nat) (env : PureEnv) (stmts : List Statement) (term : Terminator) (post : Value → Prop) (fuel : Nat) : Prop :=
+  wpMirExecSym fuel body (.running (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } emptyMemory)) (mirNormalPost (fun retVal _ => post retVal))
 
 theorem LiftBlock.of_lookup {body : CapturedMir} {bbIdx : BasicBlockIdx} {env : PureEnv} {post : Value → Prop} {fuel : Nat}
-  (h_bb : body.basicBlocks[bbIdx]? = some bb)
-  (h_lift : LiftStmtsTerminator body env bb.statements bb.terminator post fuel) :
-  LiftBlock body bbIdx env post (fuel + 1) :=
-  .step bbIdx env post bb fuel h_bb h_lift
+  (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some bb)
+  (h_lift : LiftStmtsTerminator body bbIdx 0 env bb.statements bb.terminator post fuel) :
+  LiftBlock body bbIdx env post fuel :=
+  h_lift
+
+theorem LiftStmtsTerminator.nil_goto {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env : PureEnv} {target : BasicBlockIdx} {span : String} {post : Value → Prop} {fuel : Nat}
+  (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some { statements := [], terminator := { kind := .goto target, span := span }, isCleanup := false })
+  (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+  (h_stmtIdx : stmtIdx = 0)
+  (h_lift : LiftBlock body target env post fuel) :
+  LiftStmtsTerminator body bbIdx stmtIdx env [] { kind := .goto target, span := span } post (fuel + 1) := by
+  subst h_stmtIdx
+  rcases h_phase with hp | hp
+  · dsimp [LiftStmtsTerminator, wpMirExecSym, evalSymNodeTree, stepMirExecSymTree, stepMirSymTree, PureState.toMachineState, emptyMemory]
+    simp [hp, h_bb, evalTerminatorSymTree, evalTerminator]
+    exact h_lift
+  · dsimp [LiftStmtsTerminator, wpMirExecSym, evalSymNodeTree, stepMirExecSymTree, stepMirSymTree, PureState.toMachineState, emptyMemory]
+    simp [hp, h_bb, evalTerminatorSymTree, evalTerminator]
+    exact h_lift
+
+theorem LiftStmtsTerminator.nil_return {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env : PureEnv} {span : String} {post : Value → Prop} {val : Value}
+  (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx = some { statements := [], terminator := { kind := .return_, span := span }, isCleanup := false })
+  (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+  (h_stmtIdx : stmtIdx = 0)
+  (h_ret : Trusted.Sequence.get? env 0 = some (.init val))
+  (h_post : post val) :
+  LiftStmtsTerminator body bbIdx stmtIdx env [] { kind := .return_, span := span } post 1 := by
+  subst h_stmtIdx
+  rcases h_phase with hp | hp
+  · dsimp [LiftStmtsTerminator, wpMirExecSym, evalSymNodeTree, stepMirExecSymTree, stepMirSymTree, PureState.toMachineState, emptyMemory]
+    simp [hp, h_bb, evalTerminatorSymTree, evalTerminator, h_ret]
+    exact h_post
+  · dsimp [LiftStmtsTerminator, wpMirExecSym, evalSymNodeTree, stepMirExecSymTree, stepMirSymTree, PureState.toMachineState, emptyMemory]
+    simp [hp, h_bb, evalTerminatorSymTree, evalTerminator, h_ret]
+    exact h_post
 
 def LiftLoop (body : CapturedMir) (bbIdx : BasicBlockIdx) (lo hi : Nat) (init : α) (step : (i : Nat) → lo ≤ i → i < hi → α → α)
   (LoopInv : Nat → α → PureEnv → Prop) (env₀ : PureEnv) (post : Value → Prop) : Prop :=
@@ -138,8 +141,6 @@ theorem lift_PureMirConverges
   {body : CapturedMir} {args : List Value} {post : Value → Prop} {fuel : Nat}
   (h_pure : checkPureMir body = true)
   (h_lift : LiftBlock body 0 (initPureEnv body args) post fuel) :
-  PureMirConverges body (initPureState body args) post := by
-  use fuel
-  sorry
+  PureMirConverges body (initPureState body args) post :=
+  ⟨fuel, h_lift⟩
 
-EOF

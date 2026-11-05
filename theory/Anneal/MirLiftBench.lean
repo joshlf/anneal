@@ -3,6 +3,8 @@ import Anneal.MirFuelFree
 import Anneal.PureMirExec
 import Anneal.MirLiftCore
 
+set_option linter.unusedVariables false
+
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirSemantics
@@ -30,28 +32,29 @@ def benchBody : CapturedMir :=
     argCount := 0
   }
 
-theorem bench_converges : LiftBlock benchBody 0 [ .init (.scalar { bits := 0, sizeBytes := 4 }) ] (fun v => v = (.scalar { bits := 0, sizeBytes := 4 })) := by
-  apply LiftBlock.of_lookup (by rfl)
-  apply LiftStmtsTerminator.nil_goto
-  apply LiftBlock.of_lookup (by rfl)
-  apply LiftStmtsTerminator.nil_goto
-  apply LiftBlock.of_lookup (by rfl)
-  apply LiftStmtsTerminator.nil_goto
-  apply LiftBlock.of_lookup (by rfl)
-  apply LiftStmtsTerminator.nil_goto
-  apply LiftBlock.of_lookup (by rfl)
-  apply LiftStmtsTerminator.nil_goto
-  apply LiftBlock.of_lookup (by rfl)
-  apply LiftStmtsTerminator.nil_goto
-  apply LiftBlock.of_lookup (by rfl)
-  apply LiftStmtsTerminator.nil_goto
-  apply LiftBlock.of_lookup (by rfl)
-  apply LiftStmtsTerminator.nil_goto
-  apply LiftBlock.of_lookup (by rfl)
-  apply LiftStmtsTerminator.nil_goto
-  apply LiftBlock.of_lookup (by rfl)
-  apply LiftStmtsTerminator.nil_goto
-  apply LiftBlock.of_lookup (by rfl)
-  apply LiftStmtsTerminator.nil_return
-  · rfl
-  · rfl
+theorem bench_converges : ∃ fuel, LiftBlock benchBody 0 [ .init (.scalar { bits := 0, sizeBytes := 4 }) ] (fun v => v = (.scalar { bits := 0, sizeBytes := 4 })) fuel :=
+  ⟨11, by
+    apply LiftBlock.of_lookup (by rfl)
+    apply LiftStmtsTerminator.nil_goto (by rfl) (by exact Or.inl rfl) (by rfl)
+    apply LiftBlock.of_lookup (by rfl)
+    apply LiftStmtsTerminator.nil_goto (by rfl) (by exact Or.inl rfl) (by rfl)
+    apply LiftBlock.of_lookup (by rfl)
+    apply LiftStmtsTerminator.nil_goto (by rfl) (by exact Or.inl rfl) (by rfl)
+    apply LiftBlock.of_lookup (by rfl)
+    apply LiftStmtsTerminator.nil_goto (by rfl) (by exact Or.inl rfl) (by rfl)
+    apply LiftBlock.of_lookup (by rfl)
+    apply LiftStmtsTerminator.nil_goto (by rfl) (by exact Or.inl rfl) (by rfl)
+    apply LiftBlock.of_lookup (by rfl)
+    apply LiftStmtsTerminator.nil_goto (by rfl) (by exact Or.inl rfl) (by rfl)
+    apply LiftBlock.of_lookup (by rfl)
+    apply LiftStmtsTerminator.nil_goto (by rfl) (by exact Or.inl rfl) (by rfl)
+    apply LiftBlock.of_lookup (by rfl)
+    apply LiftStmtsTerminator.nil_goto (by rfl) (by exact Or.inl rfl) (by rfl)
+    apply LiftBlock.of_lookup (by rfl)
+    apply LiftStmtsTerminator.nil_goto (by rfl) (by exact Or.inl rfl) (by rfl)
+    apply LiftBlock.of_lookup (by rfl)
+    apply LiftStmtsTerminator.nil_goto (by rfl) (by exact Or.inl rfl) (by rfl)
+    apply LiftBlock.of_lookup (by rfl)
+    apply LiftStmtsTerminator.nil_return (by rfl) (by exact Or.inl rfl) (by rfl)
+    · rfl
+    · rfl⟩
