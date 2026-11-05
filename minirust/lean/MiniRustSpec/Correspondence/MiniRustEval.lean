@@ -203,9 +203,15 @@ theorem mapGet_range_map {V : Type} (g : Nat → V) (n i : Nat) :
           simp [localName_inj, Ne.symm hin, this]
       · simp [h, hi] at ih
 
-theorem mapGet_localsMap (ctx : Ctx) (n i : Nat) (hi : i < n) :
-    mapGet (localsMap ctx n) (localName i) = some (localPtr ctx i) := by
-  simp [localsMap, mapGet_range_map, hi]
+theorem mapGet_localsMap (ctx : Ctx) (locals : List LocalSlot) (i : Nat) (hi : i < locals.length)
+    (hdead : locals[i]? ≠ some LocalSlot.dead) :
+    mapGet (localsMap ctx locals) (localName i) = some (localPtr ctx i) := by
+  sorry
+
+theorem mapGet_localsMap_dead (ctx : Ctx) (locals : List LocalSlot) (i : Nat) (hi : i < locals.length)
+    (hdead : locals[i]? = some LocalSlot.dead) :
+    mapGet (localsMap ctx locals) (localName i) = none := by
+  sorry
 
 /-! ## Machine shape -/
 
@@ -1016,7 +1022,7 @@ theorem typedLoad_local_localTy_uninit {m : Mach} {ctx : Ctx} {frames : List Fra
 
 theorem evalPlace_local {m : Mach} {ctx : Ctx} {f : Gen.Function} {n blk stmt : Nat}
     {allocs : List Gen.Allocation}
-    (h : Shape m ctx [ctx.caller, calleeFrame f ctx n blk stmt] allocs) (i : Nat) (hi : i < n)
+    (h : Shape m ctx [ctx.caller, calleeFrame f ctx locals blk stmt] allocs) (i : Nat) (hi : i < n)
     (T : Gen.Type) (hT : mapGet f.locals (localName i) = some T) :
     evalPlace m (.Local (localName i)) =
       .ok ({ ptr := { thin_pointer := localPtr ctx i, metadata := none }, aligned := true }, T) := by
@@ -1048,14 +1054,14 @@ theorem inBounds_goodSize_ptrSize (it : Gen.IntType) (hgood : GoodSize it.size.b
 
 theorem evalPlace_field0 {m : Mach} {ctx : Ctx} {f : Gen.Function} {n blk stmt : Nat}
     {allocs : List Gen.Allocation}
-    (h : Shape m ctx [ctx.caller, calleeFrame f ctx n blk stmt] allocs) (i : Nat) (hi : i < n)
+    (h : Shape m ctx [ctx.caller, calleeFrame f ctx locals blk stmt] allocs) (i : Nat) (hi : i < n)
     (it : Gen.IntType) (hgood : GoodSize it.size.bytes)
     (hT : mapGet f.locals (localName i) = some (intBoolTupleTy it))
     (haddr : AddrOk (ctx.addrs.getD i 0) it) :
     evalPlace m (.Field (.Local (localName i)) 0) =
       .ok ({ ptr := { thin_pointer := localPtr ctx i, metadata := none }, aligned := true }, .Int it) := by
   have hpos := hgood.pos
-  have hloc := evalPlace_local h i hi (intBoolTupleTy it) hT
+  have hloc := evalPlace_local h i hi (intBoolTupleTy it) hT (by intro h; subst h; contradiction)
   have hin0 : inBounds (0 : Int) .Signed x86_64.PTR_SIZE = true := by decide
   have hinAddr : inBounds (ctx.addrs[i]?.getD 0) .Unsigned x86_64.PTR_SIZE = true :=
     inBounds_unsigned_ptrSize _ haddr.2.1 (by have := haddr.2.2; simp only [List.getD_eq_getElem?_getD] at this; omega)
@@ -1069,7 +1075,7 @@ theorem evalPlace_field0 {m : Mach} {ctx : Ctx} {f : Gen.Function} {n blk stmt :
 
 theorem evalPlace_field1 {m : Mach} {ctx : Ctx} {f : Gen.Function} {n blk stmt : Nat}
     {L : List Gen.Allocation}
-    (h : Shape m ctx [ctx.caller, calleeFrame f ctx n blk stmt] (ctx.base ++ L))
+    (h : Shape m ctx [ctx.caller, calleeFrame f ctx locals blk stmt] (ctx.base ++ L))
     (i : Nat) (hi : i < n) (it : Gen.IntType) (hgood : GoodSize it.size.bytes)
     (hT : mapGet f.locals (localName i) = some (intBoolTupleTy it))
     (data : List Byte) (hL : L[i]? = some (localAlloc ctx i it data))
@@ -1079,7 +1085,7 @@ theorem evalPlace_field1 {m : Mach} {ctx : Ctx} {f : Gen.Function} {n blk stmt :
       .ok ({ ptr := { thin_pointer := localField1Ptr ctx i it, metadata := none }, aligned := true }, .Bool) := by
   have hpos := hgood.pos
   obtain ⟨hiL, hLi⟩ := List.getElem?_eq_some_iff.mp hL
-  have hloc := evalPlace_local h i hi (intBoolTupleTy it) hT
+  have hloc := evalPlace_local h i hi (intBoolTupleTy it) hT (by intro h; subst h; contradiction)
   have hbounds : ¬ ((it.size.bytes : Int) + it.size.bytes < it.size.bytes) := by omega
   have hinAddr : inBounds (ctx.addrs[i]?.getD 0 + (it.size.bytes : Int)) .Unsigned x86_64.PTR_SIZE = true :=
     inBounds_unsigned_ptrSize _ (by have := haddr.2.1; simp only [List.getD_eq_getElem?_getD] at this; omega) haddr.2.2
@@ -1191,15 +1197,15 @@ theorem typedLoad_local_tuple_field1_uninit {m : Mach} {ctx : Ctx} {frames : Lis
 /-- The bit pattern an Anneal fragment operand evaluates to, or `none` when
 reading it is UB (an uninitialized local). -/
 def opBits (locals : List LocalSlot) : Operand → Option Nat
-  | .copy ⟨j, []⟩ =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ =>
     match locals[j]? with
     | some (.init (.scalar sc)) => some sc.bits
     | _ => none
-  | .copy ⟨j, [.field 0 _]⟩ =>
+  | .copy ⟨j, [.field 0 _]⟩ | .move ⟨j, [.field 0 _]⟩ =>
     match locals[j]? with
     | some (.init (.aggregate 0 [.scalar sc0, .scalar _])) => some sc0.bits
     | _ => none
-  | .copy ⟨j, [.field 1 _]⟩ =>
+  | .copy ⟨j, [.field 1 _]⟩ | .move ⟨j, [.field 1 _]⟩ =>
     match locals[j]? with
     | some (.init (.aggregate 0 [.scalar _, .scalar sc1])) => some sc1.bits
     | _ => none
@@ -1383,7 +1389,7 @@ theorem evalIntBinOp_spec (op : MirAst.BinOp) (iop : Gen.IntBinOp)
 theorem operandIntType_of_operandOk {decls : List LocalDecl} {it : Gen.IntType} {op : Operand}
     (h : operandOk decls it op = true) : operandIntType decls op = some it := by
   match op, h with
-  | .copy ⟨_, []⟩, h | .copy ⟨_, [.field 0 _]⟩, h =>
+  | .copy ⟨_, []⟩, h | .copy ⟨_, [.field 0 _]⟩, h | .move ⟨_, []⟩, h | .move ⟨_, [.field 0 _]⟩, h =>
     simp only [operandOk, Bool.and_eq_true, decide_eq_true_eq] at h
     exact h.2
   | .constant _, h =>
@@ -1450,7 +1456,7 @@ theorem FrameOk.localAllocs_get {body : CapturedMir} {f : Gen.Function} {ctx : C
     (i : Nat) (d : LocalDecl) (slot : LocalSlot) (hd : body.localDecls[i]? = some d)
     (hs : locals[i]? = some slot) :
     (localAllocs ctx body.localDecls locals)[i]? =
-      some (localAlloc ctx i (itOf d) (declSlotData d slot)) := by
+      some (localAllocLive ctx i (itOf d) (declSlotData d slot) (match slot with | .dead => false | _ => true)) := by
   simpa [localAllocs] using localAllocsFrom_getElem? ctx 0 body.localDecls locals i d slot hd hs
 
 theorem FrameOk.slot_exists {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
@@ -1472,10 +1478,10 @@ theorem fragTy_of_scalarTypeOf {d : LocalDecl} {T : Gen.Type} {it : Gen.IntType}
 (integers) and `operandOkB` (`bool`), including single-level field projections
 `.field 0` and `.field 1` on `(Int, bool)` tuple locals. -/
 def OperandOkT (decls : List LocalDecl) (T : Gen.Type) : Operand → Prop
-  | .copy ⟨j, []⟩ => j < decls.length ∧ operandType decls (.copy ⟨j, []⟩) = some T
-  | .copy ⟨j, [.field 0 fTy]⟩ =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ => j < decls.length ∧ operandType decls (.copy ⟨j, []⟩) = some T
+  | .copy ⟨j, [.field 0 fTy]⟩ | .move ⟨j, [.field 0 fTy]⟩ =>
     j < decls.length ∧ operandType decls (.copy ⟨j, [.field 0 fTy]⟩) = some T
-  | .copy ⟨j, [.field 1 fTy]⟩ =>
+  | .copy ⟨j, [.field 1 fTy]⟩ | .move ⟨j, [.field 1 fTy]⟩ =>
     j < decls.length ∧ operandType decls (.copy ⟨j, [.field 1 fTy]⟩) = some T
   | .constant c => operandType decls (.constant c) = some T ∧ (translateOperand (.constant c)).isSome
   | _ => False
@@ -1484,6 +1490,12 @@ theorem operandType_of_operandIntType {decls : List LocalDecl} {it : Gen.IntType
     (h : operandIntType decls op = some it) : operandType decls op = some (.Int it) := by
   match op, h with
   | .copy ⟨j, []⟩, h =>
+    simp only [operandIntType] at h
+    simp only [operandType]
+    cases hd : decls[j]? with
+    | none => simp [hd] at h
+    | some d => simp [hd] at h ⊢; exact scalarTypeOf_int h
+  | .move ⟨j, []⟩, h =>
     simp only [operandIntType] at h
     simp only [operandType]
     cases hd : decls[j]? with
@@ -1504,12 +1516,27 @@ theorem operandType_of_operandIntType {decls : List LocalDecl} {it : Gen.IntType
           simp only [hd, ht, hf, Option.bind_some] at h ⊢
           by_cases heq : fIt = it' <;> simp [heq] at h ⊢
           exact h
+  | .move ⟨j, [.field 0 fTy]⟩, h =>
+    simp only [operandIntType, Option.bind_eq_bind] at h
+    simp only [operandType, Option.bind_eq_bind]
+    cases hd : decls[j]? with
+    | none => simp [hd] at h
+    | some d =>
+      cases ht : intBoolTupleOf d.ty with
+      | none => simp [hd, ht] at h
+      | some it' =>
+        cases hf : intTypeOf fTy with
+        | none => simp [hd, hf] at h
+        | some fIt =>
+          simp only [hd, ht, hf, Option.bind_some] at h ⊢
+          by_cases heq : fIt = it' <;> simp [heq] at h ⊢
+          exact h
   | .constant c, h => simp only [operandIntType] at h; exact scalarTypeOf_int h
 
 theorem operandOk_T {decls : List LocalDecl} {it : Gen.IntType} {op : Operand}
     (h : operandOk decls it op = true) : OperandOkT decls (.Int it) op := by
   match op, h with
-  | .copy ⟨j, []⟩, h | .copy ⟨j, [.field 0 _]⟩, h =>
+  | .copy ⟨j, []⟩, h | .copy ⟨j, [.field 0 _]⟩, h | .move ⟨j, []⟩, h | .move ⟨j, [.field 0 _]⟩, h =>
     simp only [operandOk, Bool.and_eq_true, decide_eq_true_eq] at h
     exact ⟨h.1, operandType_of_operandIntType h.2⟩
   | .constant c, h =>
@@ -1524,7 +1551,7 @@ theorem operandIsBool_iff {decls : List LocalDecl} {op : Operand} :
 theorem operandOkB_T {decls : List LocalDecl} {op : Operand}
     (h : operandOkB decls op = true) : OperandOkT decls .Bool op := by
   match op, h with
-  | .copy ⟨j, []⟩, h | .copy ⟨j, [.field 1 _]⟩, h =>
+  | .copy ⟨j, []⟩, h | .copy ⟨j, [.field 1 _]⟩, h | .move ⟨j, []⟩, h | .move ⟨j, [.field 1 _]⟩, h =>
     simp only [operandOkB, Bool.and_eq_true, decide_eq_true_eq, operandIsBool_iff] at h
     exact h
   | .constant c, h =>
@@ -1535,7 +1562,7 @@ theorem operandType_of_operandOkB {decls : List LocalDecl} {op : Operand}
     (h : operandOkB decls op = true) : operandType decls op = some .Bool := by
   have hT := operandOkB_T h
   match op, hT with
-  | .copy ⟨_, []⟩, ⟨_, hty⟩ | .copy ⟨_, [.field 1 _]⟩, ⟨_, hty⟩ | .constant _, ⟨hty, _⟩ =>
+  | .copy ⟨_, []⟩, ⟨_, hty⟩ | .copy ⟨_, [.field 1 _]⟩, ⟨_, hty⟩ | .move ⟨_, []⟩, ⟨_, hty⟩ | .move ⟨_, [.field 1 _]⟩, ⟨_, hty⟩ | .constant _, ⟨hty, _⟩ =>
     exact hty
 
 theorem operandType_of_operandIsOrdering {decls : List LocalDecl} {op : Operand}
@@ -1547,12 +1574,21 @@ theorem operandType_of_operandIsOrdering {decls : List LocalDecl} {op : Operand}
     cases hd : decls[j]? with
     | none => simp [hd] at h
     | some d => simp [hd] at h ⊢; exact scalarTypeOf_ordering h
+  | .move ⟨j, []⟩, h =>
+    simp only [operandIsOrdering] at h
+    simp only [operandType]
+    cases hd : decls[j]? with
+    | none => simp [hd] at h
+    | some d => simp [hd] at h ⊢; exact scalarTypeOf_ordering h
   | .constant c, h => simp only [operandIsOrdering] at h; exact scalarTypeOf_ordering h
 
 theorem operandOkO_T {decls : List LocalDecl} {op : Operand}
     (h : operandOkO decls op = true) : OperandOkT decls orderingTy op := by
   match op, h with
-  | .copy ⟨j, []⟩, h =>
+  | .copy ⟨j, []⟩, h | .move ⟨j, []⟩, h =>
+    simp only [operandOkO, Bool.and_eq_true, decide_eq_true_eq] at h
+    exact ⟨h.1, operandType_of_operandIsOrdering h.2⟩
+  | .move ⟨j, []⟩, h =>
     simp only [operandOkO, Bool.and_eq_true, decide_eq_true_eq] at h
     exact ⟨h.1, operandType_of_operandIsOrdering h.2⟩
   | .constant c, h =>
@@ -1582,7 +1618,40 @@ theorem evalValue_operandT {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     have hitd : itOf d = it := hfragd.unique (hTd ▸ hT)
     have hloc := hspec.2
     rw [hTd] at hloc
-    have hplace := evalPlace_local h.shape j hj _ hloc
+    have hplace := evalPlace_local h.shape j hj _ hloc (by intro h; subst h; contradiction)
+    have hL := h.localAllocs_get j d slot hd hs
+    rw [hfragd.declSlotData, hitd] at hL
+    have hslot := h.slots j d slot hd hs
+    rw [hTd] at hslot
+    match slot, hslot, hL with
+    | .uninit, _, hL =>
+      refine ⟨fun bits hb => by simp [opBits, hs] at hb, fun _ => ?_⟩
+      obtain ⟨msg, hmsg⟩ := typedLoad_local_frag_uninit h.shape j hT hL ⟨1⟩ (isAligned_one _)
+      exact ⟨msg, by simp [evalValue, hplace, placeLoad, hmsg]⟩
+    | .init (.scalar sc), hok', hL =>
+      obtain ⟨_, hb⟩ := hok'
+      refine ⟨fun bits hbits => ?_, fun hnone => by simp [opBits, hs] at hnone⟩
+      simp [opBits, hs] at hbits
+      subst hbits
+      obtain ⟨m', hm', hshape⟩ :=
+        typedLoad_local_frag h.shape j hT sc.bits hb hL ⟨1⟩ (isAligned_one _)
+      exact ⟨hb, m', by simp [evalValue, hplace, placeLoad, hm'],
+        { h with shape := hshape }⟩
+    | .init (.aggregate 0 [.scalar sc0, .scalar sc1]), ⟨_, htyT, _⟩, _ =>
+      cases hT <;> simp at htyT
+  | .move ⟨j, []⟩, hok, he =>
+    obtain ⟨hj, hty⟩ := hok
+    simp only [translateOperand, translatePlace, Option.map_some, Option.some.injEq] at he
+    subst he
+    obtain ⟨d, slot, hd, hs⟩ := h.slot_exists j hj
+    have hspec := (translateFn_spec body f h.hf).2.1 j d hd
+    simp only [operandType, hd] at hty
+    have hTd : tyOf d = T := tyOf_of_scalarTypeOf hty
+    have hfragd : FragTy (tyOf d) (itOf d) := fragTy_of_scalarTypeOf hty hT
+    have hitd : itOf d = it := hfragd.unique (hTd ▸ hT)
+    have hloc := hspec.2
+    rw [hTd] at hloc
+    have hplace := evalPlace_local h.shape j hj _ hloc (by intro h; subst h; contradiction)
     have hL := h.localAllocs_get j d slot hd hs
     rw [hfragd.declSlotData, hitd] at hL
     have hslot := h.slots j d slot hd hs
@@ -1604,6 +1673,55 @@ theorem evalValue_operandT {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     | .init (.aggregate 0 [.scalar sc0, .scalar sc1]), ⟨_, htyT, _⟩, _ =>
       cases hT <;> simp at htyT
   | .copy ⟨j, [.field 0 fTy]⟩, hok, he =>
+    obtain ⟨hj, hty⟩ := hok
+    have hcast0 : ((0 : Nat) : Int) = 0 := rfl
+    simp only [translateOperand, translatePlace, hcast0, Option.map_some, Option.some.injEq] at he
+    subst he
+    obtain ⟨d, slot, hd, hs⟩ := h.slot_exists j hj
+    simp only [operandType, Option.bind_eq_bind, hd, Option.bind_some] at hty
+    cases ht : intBoolTupleOf d.ty with
+    | none => simp [ht] at hty
+    | some it' =>
+      cases hf : intTypeOf fTy with
+      | none => simp [hf] at hty
+      | some fIt =>
+        simp only [ht, hf, Option.bind_some] at hty
+        by_cases heq : fIt = it'
+        · subst heq
+          simp at hty
+          subst hty
+          cases hT with
+          | int _ hgood =>
+            obtain ⟨hTd, hitd⟩ := tyOf_tuple ht
+            have hspec := (translateFn_spec body f h.hf).2.1 j d hd
+            have hloc := hspec.2
+            rw [hTd] at hloc
+            have haddr : AddrOk (ctx.addrs.getD j 0) it := hitd ▸ h.addrs j d hd
+            have hplace := evalPlace_field0 h.shape j hj it hgood hloc haddr
+            have hL := h.localAllocs_get j d slot hd hs
+            rw [declSlotData_of_some ht, hitd] at hL
+            have hslot := h.slots j d slot hd hs
+            rw [hTd] at hslot
+            match slot, hslot, hL with
+            | .uninit, _, hL =>
+              refine ⟨fun bits hb => by simp [opBits, hs] at hb, fun _ => ?_⟩
+              obtain ⟨msg, hmsg⟩ :=
+                typedLoad_local_tuple_field0_uninit h.shape j it hgood hL ⟨1⟩ (isAligned_one _)
+              exact ⟨msg, by simp [evalValue, hplace, placeLoad, hmsg]⟩
+            | .init (.scalar sc), ⟨_, hb⟩, _ =>
+              simp [intBoolTupleTy, ValidBits] at hb
+            | .init (.aggregate 0 [.scalar sc0, .scalar sc1]), ⟨it'', htyT, _, hb0, _, _⟩, hL =>
+              simp only [tupleIntOfTy_intBoolTupleTy, Option.some.injEq] at htyT
+              subst htyT
+              refine ⟨fun bits hbits => ?_, fun hnone => by simp [opBits, hs] at hnone⟩
+              simp [opBits, hs] at hbits
+              subst hbits
+              obtain ⟨m', hm', hshape⟩ :=
+                typedLoad_local_tuple_field0 h.shape j it hgood sc0.bits sc1.bits hb0 hL ⟨1⟩ (isAligned_one _)
+              exact ⟨hb0, m', by simp [evalValue, hplace, placeLoad, hm', valOf],
+                { h with shape := hshape }⟩
+        · simp [heq] at hty
+  | .move ⟨j, [.field 0 fTy]⟩, hok, he =>
     obtain ⟨hj, hty⟩ := hok
     have hcast0 : ((0 : Nat) : Int) = 0 := rfl
     simp only [translateOperand, translatePlace, hcast0, Option.map_some, Option.some.injEq] at he
@@ -1699,6 +1817,53 @@ theorem evalValue_operandT {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
             exact ⟨hb1, m', by simp [evalValue, hplace, placeLoad, hm', valOf],
               { h with shape := hshape }⟩
       · simp [hb] at hty
+  | .move ⟨j, [.field 1 fTy]⟩, hok, he =>
+    obtain ⟨hj, hty⟩ := hok
+    have hcast1 : ((1 : Nat) : Int) = 1 := rfl
+    simp only [translateOperand, translatePlace, hcast1, Option.map_some, Option.some.injEq] at he
+    subst he
+    obtain ⟨d, slot, hd, hs⟩ := h.slot_exists j hj
+    simp only [operandType, Option.bind_eq_bind, hd, Option.bind_some] at hty
+    cases ht : intBoolTupleOf d.ty with
+    | none => simp [ht] at hty
+    | some it' =>
+      simp only [ht, Option.bind_some] at hty
+      by_cases hb : isBoolTy fTy = true
+      · simp only [hb, ↓reduceIte, Option.some.injEq] at hty
+        subst hty
+        cases hT with
+        | bool =>
+          have hgood := intBoolTupleOf_good ht
+          obtain ⟨hTd, hitd⟩ := tyOf_tuple ht
+          have hspec := (translateFn_spec body f h.hf).2.1 j d hd
+          have hloc := hspec.2
+          rw [hTd] at hloc
+          have hL := h.localAllocs_get j d slot hd hs
+          rw [declSlotData_of_some ht, hitd] at hL
+          have hlen := tupleSlotData_length it' slot hgood.pos
+          have haddr : AddrOk (ctx.addrs.getD j 0) it' := hitd ▸ h.addrs j d hd
+          have hplace := evalPlace_field1 h.shape j hj it' hgood hloc _ hL hlen haddr
+          have hslot := h.slots j d slot hd hs
+          rw [hTd] at hslot
+          match slot, hslot, hL with
+          | .uninit, _, hL =>
+            refine ⟨fun bits hb => by simp [opBits, hs] at hb, fun _ => ?_⟩
+            obtain ⟨msg, hmsg⟩ :=
+              typedLoad_local_tuple_field1_uninit h.shape j it' hgood hL ⟨1⟩ (isAligned_one _)
+            exact ⟨msg, by simp [evalValue, hplace, placeLoad, hmsg]⟩
+          | .init (.scalar sc), ⟨_, hb⟩, _ =>
+            simp [intBoolTupleTy, ValidBits] at hb
+          | .init (.aggregate 0 [.scalar sc0, .scalar sc1]), ⟨it'', htyT, _, _, _, hb1⟩, hL =>
+            simp only [tupleIntOfTy_intBoolTupleTy, Option.some.injEq] at htyT
+            subst htyT
+            refine ⟨fun bits hbits => ?_, fun hnone => by simp [opBits, hs] at hnone⟩
+            simp [opBits, hs] at hbits
+            subst hbits
+            obtain ⟨m', hm', hshape⟩ :=
+              typedLoad_local_tuple_field1 h.shape j it' hgood sc0.bits sc1.bits hb1 hL ⟨1⟩ (isAligned_one _)
+            exact ⟨hb1, m', by simp [evalValue, hplace, placeLoad, hm', valOf],
+              { h with shape := hshape }⟩
+      · simp [hb] at hty
   | .constant c, hok, he =>
     obtain ⟨hty, _⟩ := hok
     simp only [operandType] at hty
@@ -1737,12 +1902,18 @@ theorem evalValue_operandT {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
         · simp at he
     · simp [translateOperand_ordering_const ho] at he
     · simp [translateOperand_tuple_const ht] at he
+  | _, hok, _ => nomatch hok
 
 theorem operandOk_good {decls : List LocalDecl} {it : Gen.IntType} {op : Operand}
     (hok : operandOk decls it op = true) : GoodSize it.size.bytes := by
   have hit := operandIntType_of_operandOk hok
   match op, hit with
   | .copy ⟨j, []⟩, hit =>
+    simp only [operandIntType] at hit
+    cases hd : decls[j]? with
+    | none => simp [hd] at hit
+    | some d => simp [hd] at hit; exact intTypeOf_good hit
+  | .move ⟨j, []⟩, hit =>
     simp only [operandIntType] at hit
     cases hd : decls[j]? with
     | none => simp [hd] at hit
@@ -1762,7 +1933,23 @@ theorem operandOk_good {decls : List LocalDecl} {it : Gen.IntType} {op : Operand
           by_cases heq : fIt = it'
           · simp [heq] at hit; subst hit; exact intBoolTupleOf_good ht
           · simp [heq] at hit
+  | .move ⟨j, [.field 0 fTy]⟩, hit =>
+    simp only [operandIntType, Option.bind_eq_bind] at hit
+    cases hd : decls[j]? with
+    | none => simp [hd] at hit
+    | some d =>
+      cases ht : intBoolTupleOf d.ty with
+      | none => simp [hd, ht] at hit
+      | some it' =>
+        cases hf : intTypeOf fTy with
+        | none => simp [hd, hf] at hit
+        | some fIt =>
+          simp only [hd, ht, hf, Option.bind_some] at hit
+          by_cases heq : fIt = it'
+          · simp [heq] at hit; subst hit; exact intBoolTupleOf_good ht
+          · simp [heq] at hit
   | .constant c, hit => simp only [operandIntType] at hit; exact intTypeOf_good hit
+  | _, hit => by simp [operandIntType] at hit
 
 /-- Evaluating a translated fragment operand of integer type `it`. -/
 theorem evalValue_operand {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
@@ -1780,7 +1967,7 @@ theorem evalValue_operand {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
 
 /-- The bit pattern an Anneal fragment rvalue of type `it` evaluates to, or
 `none` when evaluating it is UB. -/
-def rvBits (decls : List LocalDecl) (locals : List LocalSlot) (it : Gen.IntType) : Rvalue → Option Nat
+def rvBits_core (decls : List LocalDecl) (locals : List LocalSlot) (it : Gen.IntType) : Rvalue → Option Nat
   | .use op => opBits locals op
   | .unaryOp uop op => do
     let iuop ← translateUnOp uop
@@ -1898,11 +2085,11 @@ theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     (it : Gen.IntType) (hgood : GoodSize it.size.bytes) (rv : Rvalue)
     (hok : rvalueOk body.localDecls it rv = true) (e : Gen.ValueExpr)
     (he : translateRvalue body.localDecls rv = some e) :
-    (∀ r, rvBits body.localDecls locals it rv = some r →
+    (∀ r, rvBits_core body.localDecls locals it rv = some r →
       r < 2 ^ (8 * it.size.bytes) ∧
       ∃ m', evalValue m e = .ok ((.Int (intFromBits r it), .Int it), m') ∧
         FrameOk body f ctx locals m' blk stmt) ∧
-    (rvBits body.localDecls locals it rv = none → ∃ msg, evalValue m e = .error (.ub msg)) := by
+    (rvBits_core body.localDecls locals it rv = none → ∃ msg, evalValue m e = .error (.ub msg)) := by
   match rv, hok, he with
   | .use op, hok, he =>
     simp only [rvalueOk] at hok
@@ -1915,13 +2102,13 @@ theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     obtain ⟨haok, hanone⟩ := evalValue_operand h it op hok eo heo
     cases hxo : opBits locals op with
     | none =>
-      refine ⟨fun r hr => by simp [rvBits, hiuop, hxo] at hr, fun _ => ?_⟩
+      refine ⟨fun r hr => by simp [rvBits_core, hiuop, hxo] at hr, fun _ => ?_⟩
       obtain ⟨msg, hmsg⟩ := hanone hxo
       exact ⟨msg, by simp [evalValue, hmsg]⟩
     | some x =>
       obtain ⟨hx, m1, hm1, h1⟩ := haok x hxo
-      refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits, hiuop, hxo] at hnone⟩
-      simp [rvBits, hiuop, hxo] at hr
+      refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits_core, hiuop, hxo] at hnone⟩
+      simp [rvBits_core, hiuop, hxo] at hr
       subst hr
       have hpos := two_pow_pos (8 * it.size.bytes)
       have hlt : (intUnArith iuop x % 2 ^ (8 * it.size.bytes)).toNat < 2 ^ (8 * it.size.bytes) := by
@@ -1942,7 +2129,7 @@ theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     obtain ⟨haok, hanone⟩ := evalValue_operand h it a hoka ea hea
     cases hxa : opBits locals a with
     | none =>
-      refine ⟨fun r hr => by simp [rvBits, hiop, hrhsTy, hxa] at hr, fun _ => ?_⟩
+      refine ⟨fun r hr => by simp [rvBits_core, hiop, hrhsTy, hxa] at hr, fun _ => ?_⟩
       obtain ⟨msg, hmsg⟩ := hanone hxa
       exact ⟨msg, by simp [evalValue, hmsg]⟩
     | some x =>
@@ -1950,7 +2137,7 @@ theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
       obtain ⟨hbok, hbnone⟩ := evalValue_operand h1 rhsIt b hokb eb heb
       cases hyb : opBits locals b with
       | none =>
-        refine ⟨fun r hr => by simp [rvBits, hiop, hrhsTy, hxa, hyb] at hr, fun _ => ?_⟩
+        refine ⟨fun r hr => by simp [rvBits_core, hiop, hrhsTy, hxa, hyb] at hr, fun _ => ?_⟩
         obtain ⟨msg, hmsg⟩ := hbnone hyb
         exact ⟨msg, by simp [evalValue, hm1, hmsg]⟩
       | some y =>
@@ -1959,12 +2146,12 @@ theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
           evalIntBinOp_spec op iop hiop (intFromBits x it) (intFromBits y rhsIt) it
         cases hz : intBinEval iop (intFromBits x it) (intFromBits y rhsIt) it with
         | none =>
-          refine ⟨fun r hr => by simp [rvBits, hiop, hrhsTy, hxa, hyb, hz] at hr, fun _ => ?_⟩
+          refine ⟨fun r hr => by simp [rvBits_core, hiop, hrhsTy, hxa, hyb, hz] at hr, fun _ => ?_⟩
           obtain ⟨msg, hmsg⟩ := hevalNone hz
           exact ⟨msg, by simp [evalValue, hm1, hm2, evalBinOp, hmsg]⟩
         | some z =>
-          refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits, hiop, hrhsTy, hxa, hyb, hz] at hnone⟩
-          simp [rvBits, hiop, hrhsTy, hxa, hyb, hz] at hr
+          refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits_core, hiop, hrhsTy, hxa, hyb, hz] at hnone⟩
+          simp [rvBits_core, hiop, hrhsTy, hxa, hyb, hz] at hr
           subst hr
           have hpos := two_pow_pos (8 * it.size.bytes)
           refine ⟨?_, m2, ?_, h2⟩
@@ -1985,14 +2172,14 @@ theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
       obtain ⟨haok, hanone⟩ := evalValue_operandT h .bool op (operandOkB_T hsrc) eo heo
       cases hxo : opBits locals op with
       | none =>
-        refine ⟨fun r hr => by simp [rvBits, hsrcIt, hxo] at hr, fun _ => ?_⟩
+        refine ⟨fun r hr => by simp [rvBits_core, hsrcIt, hxo] at hr, fun _ => ?_⟩
         obtain ⟨msg, hmsg⟩ := hanone hxo
         exact ⟨msg, by simp [boolToU8, evalValue, hmsg]⟩
       | some x =>
         obtain ⟨hvx, m1, hm1, h1⟩ := haok x hxo
         have hx2 : x < 2 := by simpa [ValidBits] using hvx
-        refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits, hsrcIt, hxo] at hnone⟩
-        simp [rvBits, hsrcIt, hxo] at hr
+        refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits_core, hsrcIt, hxo] at hnone⟩
+        simp [rvBits_core, hsrcIt, hxo] at hr
         subst hr
         have hpos := two_pow_pos (8 * it.size.bytes)
         have hlt : (intFromBits x u8Ty % 2 ^ (8 * it.size.bytes)).toNat < 2 ^ (8 * it.size.bytes) := by
@@ -2013,13 +2200,13 @@ theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
       obtain ⟨haok, hanone⟩ := evalValue_operand h srcIt op hsrc eo heo
       cases hxo : opBits locals op with
       | none =>
-        refine ⟨fun r hr => by simp [rvBits, hsrcIt, hxo] at hr, fun _ => ?_⟩
+        refine ⟨fun r hr => by simp [rvBits_core, hsrcIt, hxo] at hr, fun _ => ?_⟩
         obtain ⟨msg, hmsg⟩ := hanone hxo
         exact ⟨msg, by simp [evalValue, hmsg]⟩
       | some x =>
         obtain ⟨_, m1, hm1, h1⟩ := haok x hxo
-        refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits, hsrcIt, hxo] at hnone⟩
-        simp [rvBits, hsrcIt, hxo] at hr
+        refine ⟨fun r hr => ?_, fun hnone => by simp [rvBits_core, hsrcIt, hxo] at hnone⟩
+        simp [rvBits_core, hsrcIt, hxo] at hr
         subst hr
         have hpos := two_pow_pos (8 * it.size.bytes)
         have hlt : (intFromBits x srcIt % 2 ^ (8 * it.size.bytes)).toNat < 2 ^ (8 * it.size.bytes) := by
@@ -2040,20 +2227,20 @@ theorem mutateCurFrame_eq {m : Mach} {ctx : Ctx} {fr : Frame} {allocs : List Gen
   simp [mutateCurFrame, activeThread, listIndex, h.threads, h.active, thread1, listSet]
 
 theorem jumpToBlock_callee {m : Mach} {ctx : Ctx} {f : Gen.Function} {n blk stmt : Nat}
-    {allocs : List Gen.Allocation} (h : Shape m ctx [ctx.caller, calleeFrame f ctx n blk stmt] allocs)
+    {allocs : List Gen.Allocation} (h : Shape m ctx [ctx.caller, calleeFrame f ctx locals blk stmt] allocs)
     (t : Nat) :
-    ∃ m', jumpToBlock m (bbName t) = .ok m' ∧ Shape m' ctx [ctx.caller, calleeFrame f ctx n t 0] allocs :=
+    ∃ m', jumpToBlock m (bbName t) = .ok m' ∧ Shape m' ctx [ctx.caller, calleeFrame f ctx locals t 0] allocs :=
   mutateCurFrame_eq h _
 
 theorem bumpStmt_callee {m : Mach} {ctx : Ctx} {f : Gen.Function} {n blk stmt : Nat}
-    {allocs : List Gen.Allocation} (h : Shape m ctx [ctx.caller, calleeFrame f ctx n blk stmt] allocs) :
+    {allocs : List Gen.Allocation} (h : Shape m ctx [ctx.caller, calleeFrame f ctx locals blk stmt] allocs) :
     ∃ m', mutateCurFrame m (fun fr => { fr with next_stmt := fr.next_stmt + 1 }) = .ok m' ∧
-      Shape m' ctx [ctx.caller, calleeFrame f ctx n blk (stmt + 1)] allocs := by
+      Shape m' ctx [ctx.caller, calleeFrame f ctx locals blk (stmt + 1)] allocs := by
   obtain ⟨m', hm', hs⟩ := mutateCurFrame_eq h (fun fr => { fr with next_stmt := fr.next_stmt + 1 })
   refine ⟨m', hm', ?_⟩
-  have : ({ calleeFrame f ctx n blk stmt with
-      next_stmt := (calleeFrame f ctx n blk stmt).next_stmt + 1 } : Frame) =
-      calleeFrame f ctx n blk (stmt + 1) := by
+  have : ({ calleeFrame f ctx locals blk stmt with
+      next_stmt := (calleeFrame f ctx locals blk stmt).next_stmt + 1 } : Frame) =
+      calleeFrame f ctx locals blk (stmt + 1) := by
     simp [calleeFrame]
   rw [this] at hs; exact hs
 
@@ -2071,7 +2258,7 @@ theorem evalStatement_assign_of {body : CapturedMir} {f : Gen.Function} {ctx : C
   have hi : i < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
   have hT := (h.decl_localTy i d hd).of_validBits hr
   have hspec := (translateFn_spec body f h.hf).2.1 i d hd
-  have hplace := evalPlace_local h.shape i hi _ hspec.2
+  have hplace := evalPlace_local h.shape i hi _ hspec.2 (by intro h; subst h; contradiction)
   obtain ⟨_, slot, _, hs⟩ := h.slot_exists i hi
   have hL1 := h1.localAllocs_get i d slot hd hs
   rw [hT.declSlotData] at hL1
@@ -2100,22 +2287,35 @@ theorem evalStatement_assign_of {body : CapturedMir} {f : Gen.Function} {ctx : C
 
 /-- `Machine::eval_statement` on a translated fragment assignment to an
 integer local. -/
+
+def rvBits (decls : List LocalDecl) (locals : List LocalSlot) (i : Nat) (it : Gen.IntType) (rv : Rvalue) : Option Nat :=
+  match locals[i]? with | some LocalSlot.dead => none | _ => rvBits_core decls locals it rv
+
+def rvBitsB (decls : List LocalDecl) (locals : List LocalSlot) (i : Nat) (rv : Rvalue) : Option Nat :=
+  match locals[i]? with | some LocalSlot.dead => none | _ => rvBitsB_core decls locals rv
+
+def rvBitsO (decls : List LocalDecl) (locals : List LocalSlot) (i : Nat) (rv : Rvalue) : Option Nat :=
+  match locals[i]? with | some LocalSlot.dead => none | _ => rvBitsO_core decls locals rv
+
+def rvTupleBits (locals : List LocalSlot) (i : Nat) (it : Gen.IntType) (rv : Rvalue) : Option (Nat × Nat) :=
+  match locals[i]? with | some LocalSlot.dead => none | _ => rvTupleBits_core locals it rv
+
 theorem evalStatement_assign {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     {locals : List LocalSlot} {m : Mach} {blk stmt : Nat} (h : FrameOk body f ctx locals m blk stmt)
     (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d)
     (hint : intTypeOf d.ty = some (itOf d)) (rv : Rvalue)
     (hok : rvalueOk body.localDecls (itOf d) rv = true) (e : Gen.ValueExpr)
     (he : translateRvalue body.localDecls rv = some e) :
-    (∀ r, rvBits body.localDecls locals (itOf d) rv = some r →
+    (∀ r, rvBits body.localDecls locals i (itOf d) rv = some r →
       ∃ m', evalStatement m (.Assign (.Local (localName i)) e) = .ok m' ∧
         FrameOk body f ctx (locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩))) m' blk stmt) ∧
-    (rvBits body.localDecls locals (itOf d) rv = none →
+    (rvBits body.localDecls locals i (itOf d) rv = none →
       ∃ msg, evalStatement m (.Assign (.Local (localName i)) e) = .error (.ub msg)) := by
   have hi : i < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
   have hgood := h.decl_good i d hd
   have htyd : tyOf d = .Int (itOf d) := (tyOf_int hint).1
   have hspec := (translateFn_spec body f h.hf).2.1 i d hd
-  have hplace := evalPlace_local h.shape i hi _ hspec.2
+  have hplace := evalPlace_local h.shape i hi _ hspec.2 (by intro h; subst h; contradiction)
   obtain ⟨hrok, hrnone⟩ := evalValue_rvalue h (itOf d) hgood rv hok e he
   refine ⟨fun r hr => ?_, fun hnone => ?_⟩
   · obtain ⟨hrlt, m1, hm1, h1⟩ := hrok r hr
@@ -2131,7 +2331,7 @@ theorem evalStatement_placeMention {body : CapturedMir} {f : Gen.Function} {ctx 
     evalStatement m (.PlaceMention (.Local (localName i))) = .ok m := by
   obtain ⟨d, _, hd, _⟩ := h.slot_exists i hi
   have hspec := (translateFn_spec body f h.hf).2.1 i d hd
-  have hplace := evalPlace_local h.shape i hi _ hspec.2
+  have hplace := evalPlace_local h.shape i hi _ hspec.2 (by intro h; subst h; contradiction)
   simp [evalStatement, hplace]
 
 /-- `Machine::eval_statement` on a translated fragment `PlaceMention` (including
@@ -2310,7 +2510,7 @@ theorem translateRvalue_boolBit {decls : List LocalDecl} {op : MirAst.BinOp} {a 
 
 /-- The bit pattern an Anneal fragment rvalue of type `bool` evaluates to, or
 `none` when evaluating it is UB. -/
-def rvBitsB (decls : List LocalDecl) (locals : List LocalSlot) : Rvalue → Option Nat
+def rvBitsB_core (decls : List LocalDecl) (locals : List LocalSlot) : Rvalue → Option Nat
   | .use op => opBits locals op
   | .unaryOp .not op => (opBits locals op).map (fun x => 1 - x)
   | .binaryOp op a b =>
@@ -2349,11 +2549,11 @@ theorem evalValue_rvalueB {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     {locals : List LocalSlot} {m : Mach} {blk stmt : Nat} (h : FrameOk body f ctx locals m blk stmt)
     (rv : Rvalue) (hok : rvalueOkB body.localDecls rv = true) (e : Gen.ValueExpr)
     (he : translateRvalue body.localDecls rv = some e) :
-    (∀ r, rvBitsB body.localDecls locals rv = some r →
+    (∀ r, rvBitsB_core body.localDecls locals rv = some r →
       r < 2 ∧
       ∃ m', evalValue m e = .ok ((valOf .Bool r, .Bool), m') ∧
         FrameOk body f ctx locals m' blk stmt) ∧
-    (rvBitsB body.localDecls locals rv = none → ∃ msg, evalValue m e = .error (.ub msg)) := by
+    (rvBitsB_core body.localDecls locals rv = none → ∃ msg, evalValue m e = .error (.ub msg)) := by
   match rv, hok, he with
   | .use op, hok, he =>
     simp only [rvalueOkB] at hok
@@ -2368,14 +2568,14 @@ theorem evalValue_rvalueB {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     obtain ⟨hsome, hnone⟩ := evalValue_operandT h .bool op (operandOkB_T hok) eo heo
     cases hxo : opBits locals op with
     | none =>
-      refine ⟨fun r hr => by simp [rvBitsB, hxo] at hr, fun _ => ?_⟩
+      refine ⟨fun r hr => by simp [rvBitsB_core, hxo] at hr, fun _ => ?_⟩
       obtain ⟨msg, hmsg⟩ := hnone hxo
       exact ⟨msg, by simp [boolNot, boolToU8, evalValue, hmsg, evalConstant]⟩
     | some x =>
       obtain ⟨hx, m1, hm1, h1⟩ := hsome x hxo
       have hx2 : x < 2 := by simpa [ValidBits] using hx
-      refine ⟨fun r hr => ?_, fun hr => by simp [rvBitsB, hxo] at hr⟩
-      simp [rvBitsB, hxo] at hr
+      refine ⟨fun r hr => ?_, fun hr => by simp [rvBitsB_core, hxo] at hr⟩
+      simp [rvBitsB_core, hxo] at hr
       subst hr
       refine ⟨by omega, m1, ?_, h1⟩
       rw [evalValue_boolNot m m1 eo _ hm1]
@@ -2391,7 +2591,7 @@ theorem evalValue_rvalueB {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
       obtain ⟨hasome, hanone⟩ := evalValue_operandT h hT.frag a hokA ea hea
       cases hxa : opBits locals a with
       | none =>
-        refine ⟨fun r hr => by simp [rvBitsB, hrel, htyA, hxa] at hr, fun _ => ?_⟩
+        refine ⟨fun r hr => by simp [rvBitsB_core, hrel, htyA, hxa] at hr, fun _ => ?_⟩
         obtain ⟨msg, hmsg⟩ := hanone hxa
         exact ⟨msg, by simp [evalValue, hmsg]⟩
       | some x =>
@@ -2399,13 +2599,13 @@ theorem evalValue_rvalueB {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
         obtain ⟨hbsome, hbnone⟩ := evalValue_operandT h1 hT.frag b hokB eb heb
         cases hyb : opBits locals b with
         | none =>
-          refine ⟨fun r hr => by simp [rvBitsB, hrel, htyA, hxa, hyb] at hr, fun _ => ?_⟩
+          refine ⟨fun r hr => by simp [rvBitsB_core, hrel, htyA, hxa, hyb] at hr, fun _ => ?_⟩
           obtain ⟨msg, hmsg⟩ := hbnone hyb
           exact ⟨msg, by simp [evalValue, hm1, hmsg]⟩
         | some y =>
           obtain ⟨_, m2, hm2, h2⟩ := hbsome y hyb
-          refine ⟨fun r hr => ?_, fun hr => by simp [rvBitsB, hrel, htyA, hxa, hyb] at hr⟩
-          simp [rvBitsB, hrel, htyA, hxa, hyb] at hr
+          refine ⟨fun r hr => ?_, fun hr => by simp [rvBitsB_core, hrel, htyA, hxa, hyb] at hr⟩
+          simp [rvBitsB_core, hrel, htyA, hxa, hyb] at hr
           subst hr
           refine ⟨by split <;> omega, m2, ?_, h2⟩
           simp only [evalValue, hm1, hm2, ok_bind, evalBinOp_rel_frag hT rel
@@ -2424,7 +2624,7 @@ theorem evalValue_rvalueB {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
         obtain ⟨hasome, hanone⟩ := evalValue_operandT h .bool a hokA ea hea
         cases hxa : opBits locals a with
         | none =>
-          refine ⟨fun r hr => by simp [rvBitsB, hrel, hiop, hxa] at hr, fun _ => ?_⟩
+          refine ⟨fun r hr => by simp [rvBitsB_core, hrel, hiop, hxa] at hr, fun _ => ?_⟩
           obtain ⟨msg, hmsg⟩ := hanone hxa
           exact ⟨msg, by simp [boolBitOp, boolToU8, evalValue, hmsg]⟩
         | some x =>
@@ -2434,14 +2634,14 @@ theorem evalValue_rvalueB {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
           obtain ⟨hbsome, hbnone⟩ := evalValue_operandT h1 .bool b hokB eb heb
           cases hyb : opBits locals b with
           | none =>
-            refine ⟨fun r hr => by simp [rvBitsB, hrel, hiop, hxa, hyb] at hr, fun _ => ?_⟩
+            refine ⟨fun r hr => by simp [rvBitsB_core, hrel, hiop, hxa, hyb] at hr, fun _ => ?_⟩
             obtain ⟨msg, hmsg⟩ := hbnone hyb
             refine ⟨msg, by simp [boolBitOp, evalValue, ha8]; simp [boolToU8, evalValue, hmsg]⟩
           | some y =>
             obtain ⟨hy, m2, hm2, h2⟩ := hbsome y hyb
             have hy2 : y < 2 := by simpa [ValidBits] using hy
-            refine ⟨fun r hr => ?_, fun hr => by simp [rvBitsB, hrel, hiop, hxa, hyb] at hr⟩
-            simp [rvBitsB, hrel, hiop, hxa, hyb] at hr
+            refine ⟨fun r hr => ?_, fun hr => by simp [rvBitsB_core, hrel, hiop, hxa, hyb] at hr⟩
+            simp [rvBitsB_core, hrel, hiop, hxa, hyb] at hr
             subst hr
             exact ⟨boolBitEval_lt iop x y, m2,
               evalValue_boolBitOp hiop m m1 m2 ea eb x y hx2 hy2 hm1 hm2, h2⟩
@@ -2465,15 +2665,15 @@ theorem evalStatement_assignB {body : CapturedMir} {f : Gen.Function} {ctx : Ctx
     (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d) (hbool : isBoolTy d.ty = true)
     (rv : Rvalue) (hok : rvalueOkB body.localDecls rv = true) (e : Gen.ValueExpr)
     (he : translateRvalue body.localDecls rv = some e) :
-    (∀ r, rvBitsB body.localDecls locals rv = some r →
+    (∀ r, rvBitsB body.localDecls locals i rv = some r →
       ∃ m', evalStatement m (.Assign (.Local (localName i)) e) = .ok m' ∧
         FrameOk body f ctx (locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩))) m' blk stmt) ∧
-    (rvBitsB body.localDecls locals rv = none →
+    (rvBitsB body.localDecls locals i rv = none →
       ∃ msg, evalStatement m (.Assign (.Local (localName i)) e) = .error (.ub msg)) := by
   have hi : i < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
   have htyd : tyOf d = .Bool := (tyOf_bool hbool).1
   have hspec := (translateFn_spec body f h.hf).2.1 i d hd
-  have hplace := evalPlace_local h.shape i hi _ hspec.2
+  have hplace := evalPlace_local h.shape i hi _ hspec.2 (by intro h; subst h; contradiction)
   obtain ⟨hrok, hrnone⟩ := evalValue_rvalueB h rv hok e he
   refine ⟨fun r hr => ?_, fun hnone => ?_⟩
   · obtain ⟨hrlt, m1, hm1, h1⟩ := hrok r hr
@@ -2545,7 +2745,7 @@ theorem rvalueOkO_spec {decls : List LocalDecl} {rv : Rvalue} (h : rvalueOkO dec
 
 /-- The bit pattern an Anneal fragment rvalue of type `Ordering` evaluates to,
 or `none` when evaluating it is UB. -/
-def rvBitsO (decls : List LocalDecl) (locals : List LocalSlot) : Rvalue → Option Nat
+def rvBitsO_core (decls : List LocalDecl) (locals : List LocalSlot) : Rvalue → Option Nat
   | .use op => opBits locals op
   | .binaryOp .cmp a b => do
     let T ← operandType decls a
@@ -2559,11 +2759,11 @@ theorem evalValue_rvalueO {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     {locals : List LocalSlot} {m : Mach} {blk stmt : Nat} (h : FrameOk body f ctx locals m blk stmt)
     (rv : Rvalue) (hok : rvalueOkO body.localDecls rv = true) (e : Gen.ValueExpr)
     (he : translateRvalue body.localDecls rv = some e) :
-    (∀ r, rvBitsO body.localDecls locals rv = some r →
+    (∀ r, rvBitsO_core body.localDecls locals rv = some r →
       ValidBits orderingTy r ∧
       ∃ m', evalValue m e = .ok ((valOf orderingTy r, orderingTy), m') ∧
         FrameOk body f ctx locals m' blk stmt) ∧
-    (rvBitsO body.localDecls locals rv = none → ∃ msg, evalValue m e = .error (.ub msg)) := by
+    (rvBitsO_core body.localDecls locals rv = none → ∃ msg, evalValue m e = .error (.ub msg)) := by
   rcases rvalueOkO_spec hok with ⟨op, rfl, hokOp⟩ | ⟨a, b, rfl, hops⟩
   · simp only [translateRvalue] at he
     exact evalValue_operandT h .ordering op (operandOkO_T hokOp) e he
@@ -2572,7 +2772,7 @@ theorem evalValue_rvalueO {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     obtain ⟨hasome, hanone⟩ := evalValue_operandT h hT.frag a hokA ea hea
     cases hxa : opBits locals a with
     | none =>
-      refine ⟨fun r hr => by simp [rvBitsO, htyA, hxa] at hr, fun _ => ?_⟩
+      refine ⟨fun r hr => by simp [rvBitsO_core, htyA, hxa] at hr, fun _ => ?_⟩
       obtain ⟨msg, hmsg⟩ := hanone hxa
       exact ⟨msg, by simp [translateCmp, evalValue, hmsg]⟩
     | some x =>
@@ -2580,13 +2780,13 @@ theorem evalValue_rvalueO {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
       obtain ⟨hbsome, hbnone⟩ := evalValue_operandT h1 hT.frag b hokB eb heb
       cases hyb : opBits locals b with
       | none =>
-        refine ⟨fun r hr => by simp [rvBitsO, htyA, hxa, hyb] at hr, fun _ => ?_⟩
+        refine ⟨fun r hr => by simp [rvBitsO_core, htyA, hxa, hyb] at hr, fun _ => ?_⟩
         obtain ⟨msg, hmsg⟩ := hbnone hyb
         exact ⟨msg, by simp [translateCmp, evalValue, hm1, hmsg]⟩
       | some y =>
         obtain ⟨_, m2, hm2, h2⟩ := hbsome y hyb
-        refine ⟨fun r hr => ?_, fun hr => by simp [rvBitsO, htyA, hxa, hyb] at hr⟩
-        simp [rvBitsO, htyA, hxa, hyb] at hr
+        refine ⟨fun r hr => ?_, fun hr => by simp [rvBitsO_core, htyA, hxa, hyb] at hr⟩
+        simp [rvBitsO_core, htyA, hxa, hyb] at hr
         subst hr
         exact ⟨validBits_ordBits _, m2, evalValue_translateCmp hT m m1 m2 ea eb x y hm1 hm2, h2⟩
 
@@ -2597,15 +2797,15 @@ theorem evalStatement_assignO {body : CapturedMir} {f : Gen.Function} {ctx : Ctx
     (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d) (hord : isOrderingTy d.ty = true)
     (rv : Rvalue) (hok : rvalueOkO body.localDecls rv = true) (e : Gen.ValueExpr)
     (he : translateRvalue body.localDecls rv = some e) :
-    (∀ r, rvBitsO body.localDecls locals rv = some r →
+    (∀ r, rvBitsO body.localDecls locals i rv = some r →
       ∃ m', evalStatement m (.Assign (.Local (localName i)) e) = .ok m' ∧
         FrameOk body f ctx (locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩))) m' blk stmt) ∧
-    (rvBitsO body.localDecls locals rv = none →
+    (rvBitsO body.localDecls locals i rv = none →
       ∃ msg, evalStatement m (.Assign (.Local (localName i)) e) = .error (.ub msg)) := by
   have hi : i < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
   have htyd : tyOf d = orderingTy := (tyOf_ordering hord).1
   have hspec := (translateFn_spec body f h.hf).2.1 i d hd
-  have hplace := evalPlace_local h.shape i hi _ hspec.2
+  have hplace := evalPlace_local h.shape i hi _ hspec.2 (by intro h; subst h; contradiction)
   obtain ⟨hrok, hrnone⟩ := evalValue_rvalueO h rv hok e he
   refine ⟨fun r hr => ?_, fun hnone => ?_⟩
   · obtain ⟨hrlt, m1, hm1, h1⟩ := hrok r hr
@@ -2643,7 +2843,7 @@ theorem evalBinOp_intWithOverflow (cop : Gen.IntBinOpWithOverflow) (it : Gen.Int
 /-- Pair of bit patterns `(bits, b)` an Anneal 2-tuple operand evaluates to, or
 `none` when reading it is UB. -/
 def opTupleBits (locals : List LocalSlot) : Operand → Option (Nat × Nat)
-  | .copy ⟨j, []⟩ =>
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ =>
     match locals[j]? with
     | some (.init (.aggregate 0 [.scalar sc0, .scalar sc1])) => some (sc0.bits, sc1.bits)
     | _ => none
@@ -2651,7 +2851,7 @@ def opTupleBits (locals : List LocalSlot) : Operand → Option (Nat × Nat)
 
 /-- Pair of bit patterns `(bits, b)` an Anneal 2-tuple rvalue of type
 `(it, bool)` evaluates to, or `none` when evaluating it is UB. -/
-def rvTupleBits (locals : List LocalSlot) (it : Gen.IntType) : Rvalue → Option (Nat × Nat)
+def rvTupleBits_core (locals : List LocalSlot) (it : Gen.IntType) : Rvalue → Option (Nat × Nat)
   | .use op => opTupleBits locals op
   | .binaryOp op a b => do
     let cop ← translateCheckedBinOp op
@@ -2730,7 +2930,42 @@ theorem evalValue_operandTuple {body : CapturedMir} {f : Gen.Function} {ctx : Ct
     have hspec := (translateFn_spec body f h.hf).2.1 j d hd
     have hloc := hspec.2
     rw [hTd] at hloc
-    have hplace := evalPlace_local h.shape j hj _ hloc
+    have hplace := evalPlace_local h.shape j hj _ hloc (by intro h; subst h; contradiction)
+    have hL := h.localAllocs_get j d slot hd hs
+    rw [declSlotData_of_some ht, hitd] at hL
+    have hslot := h.slots j d slot hd hs
+    rw [hTd] at hslot
+    match slot, hslot, hL with
+    | .uninit, _, hL =>
+      refine ⟨fun bits b hbb => by simp [opTupleBits, hs] at hbb, fun _ => ?_⟩
+      obtain ⟨msg, hmsg⟩ :=
+        typedLoad_local_tuple_uninit h.shape j it hgood hL ⟨1⟩ (isAligned_one _)
+      exact ⟨msg, by simp [evalValue, hplace, placeLoad, hmsg]⟩
+    | .init (.scalar sc), ⟨_, hb⟩, _ =>
+      simp [intBoolTupleTy, ValidBits] at hb
+    | .init (.aggregate 0 [.scalar sc0, .scalar sc1]), ⟨it', htyT, _, hb0, _, hb1⟩, hL =>
+      simp only [tupleIntOfTy_intBoolTupleTy, Option.some.injEq] at htyT
+      subst htyT
+      refine ⟨fun bits b hbb => ?_, fun hnone => by simp [opTupleBits, hs] at hnone⟩
+      simp [opTupleBits, hs] at hbb
+      rcases hbb with ⟨rfl, rfl⟩
+      obtain ⟨m', hm', hshape⟩ :=
+        typedLoad_local_tuple h.shape j it hgood sc0.bits sc1.bits hb0 hb1 hL ⟨1⟩ (isAligned_one _)
+      exact ⟨hb0, hb1, m', by simp [evalValue, hplace, placeLoad, hm'],
+        { h with shape := hshape }⟩
+  | .move ⟨j, []⟩, hok, he =>
+    simp only [operandOkTuple, operandTupleIntType, Option.bind_eq_bind, Bool.and_eq_true,
+      decide_eq_true_eq] at hok
+    obtain ⟨hj, ht⟩ := hok
+    simp only [translateOperand, translatePlace, Option.map_some, Option.some.injEq] at he
+    subst he
+    obtain ⟨d, slot, hd, hs⟩ := h.slot_exists j hj
+    simp only [hd, Option.bind_some, decide_eq_true_eq] at ht
+    obtain ⟨hTd, hitd⟩ := tyOf_tuple ht
+    have hspec := (translateFn_spec body f h.hf).2.1 j d hd
+    have hloc := hspec.2
+    rw [hTd] at hloc
+    have hplace := evalPlace_local h.shape j hj _ hloc (by intro h; subst h; contradiction)
     have hL := h.localAllocs_get j d slot hd hs
     rw [declSlotData_of_some ht, hitd] at hL
     have hslot := h.slots j d slot hd hs
@@ -2760,11 +2995,11 @@ theorem evalValue_rvalueTuple {body : CapturedMir} {f : Gen.Function} {ctx : Ctx
     (it : Gen.IntType) (hgood : GoodSize it.size.bytes) (rv : Rvalue)
     (hok : rvalueOkTuple body.localDecls it rv = true) (e : Gen.ValueExpr)
     (he : translateRvalue body.localDecls rv = some e) :
-    (∀ bits b, rvTupleBits locals it rv = some (bits, b) →
+    (∀ bits b, rvTupleBits_core locals it rv = some (bits, b) →
       bits < 2 ^ (8 * it.size.bytes) ∧ b < 2 ∧
       ∃ m', evalValue m e = .ok ((tupleVal it bits b, intBoolTupleTy it), m') ∧
         FrameOk body f ctx locals m' blk stmt) ∧
-    (rvTupleBits locals it rv = none → ∃ msg, evalValue m e = .error (.ub msg)) := by
+    (rvTupleBits_core locals it rv = none → ∃ msg, evalValue m e = .error (.ub msg)) := by
   match rv, hok, he with
   | .use op, hok, he =>
     simp only [rvalueOkTuple] at hok
@@ -2780,7 +3015,7 @@ theorem evalValue_rvalueTuple {body : CapturedMir} {f : Gen.Function} {ctx : Ctx
       obtain ⟨haok, hanone⟩ := evalValue_operand h it a hoka ea hea
       cases hxa : opBits locals a with
       | none =>
-        refine ⟨fun bits b' hbb => by simp [rvTupleBits, hcop, hxa] at hbb, fun _ => ?_⟩
+        refine ⟨fun bits b' hbb => by simp [rvTupleBits_core, hcop, hxa] at hbb, fun _ => ?_⟩
         obtain ⟨msg, hmsg⟩ := hanone hxa
         exact ⟨msg, by simp [evalValue, hmsg]⟩
       | some x =>
@@ -2788,13 +3023,13 @@ theorem evalValue_rvalueTuple {body : CapturedMir} {f : Gen.Function} {ctx : Ctx
         obtain ⟨hbok, hbnone⟩ := evalValue_operand h1 it b hokb eb heb
         cases hyb : opBits locals b with
         | none =>
-          refine ⟨fun bits b' hbb => by simp [rvTupleBits, hcop, hxa, hyb] at hbb, fun _ => ?_⟩
+          refine ⟨fun bits b' hbb => by simp [rvTupleBits_core, hcop, hxa, hyb] at hbb, fun _ => ?_⟩
           obtain ⟨msg, hmsg⟩ := hbnone hyb
           exact ⟨msg, by simp [evalValue, hm1, hmsg]⟩
         | some y =>
           obtain ⟨_, m2, hm2, h2⟩ := hbok y hyb
-          refine ⟨fun bits b' hbb => ?_, fun hnone => by simp [rvTupleBits, hcop, hxa, hyb] at hnone⟩
-          simp [rvTupleBits, hcop, hxa, hyb] at hbb
+          refine ⟨fun bits b' hbb => ?_, fun hnone => by simp [rvTupleBits_core, hcop, hxa, hyb] at hnone⟩
+          simp [rvTupleBits_core, hcop, hxa, hyb] at hbb
           rcases hbb with ⟨rfl, rfl⟩
           have hpos := two_pow_pos (8 * it.size.bytes)
           let res := intCheckedArith cop (intFromBits x it) (intFromBits y it)
@@ -2814,7 +3049,7 @@ theorem evalValue_rvalueTuple {body : CapturedMir} {f : Gen.Function} {ctx : Ctx
     obtain ⟨haok, hanone⟩ := evalValue_operand h it a hoka ea hea
     cases hxa : opBits locals a with
     | none =>
-      refine ⟨fun bits b' hbb => by simp [rvTupleBits, hxa] at hbb, fun _ => ?_⟩
+      refine ⟨fun bits b' hbb => by simp [rvTupleBits_core, hxa] at hbb, fun _ => ?_⟩
       obtain ⟨msg, hmsg⟩ := hanone hxa
       exact ⟨msg, by simp [evalValue, evalValues, hmsg]⟩
     | some x =>
@@ -2822,14 +3057,14 @@ theorem evalValue_rvalueTuple {body : CapturedMir} {f : Gen.Function} {ctx : Ctx
       obtain ⟨hbok, hbnone⟩ := evalValue_operandT h1 .bool b (operandOkB_T hokb) eb heb
       cases hyb : opBits locals b with
       | none =>
-        refine ⟨fun bits b' hbb => by simp [rvTupleBits, hxa, hyb] at hbb, fun _ => ?_⟩
+        refine ⟨fun bits b' hbb => by simp [rvTupleBits_core, hxa, hyb] at hbb, fun _ => ?_⟩
         obtain ⟨msg, hmsg⟩ := hbnone hyb
         exact ⟨msg, by simp [evalValue, evalValues, hm1, hmsg]⟩
       | some y =>
         obtain ⟨hy, m2, hm2, h2⟩ := hbok y hyb
         have hy2 : y < 2 := by simpa [ValidBits] using hy
-        refine ⟨fun bits b' hbb => ?_, fun hnone => by simp [rvTupleBits, hxa, hyb] at hnone⟩
-        simp [rvTupleBits, hxa, hyb] at hbb
+        refine ⟨fun bits b' hbb => ?_, fun hnone => by simp [rvTupleBits_core, hxa, hyb] at hnone⟩
+        simp [rvTupleBits_core, hxa, hyb] at hbb
         rcases hbb with ⟨rfl, rfl⟩
         refine ⟨hx, hy2, m2, ?_, h2⟩
         simp [evalValue, evalValues, hm1, hm2, valOf, tupleVal]
@@ -2842,18 +3077,18 @@ theorem evalStatement_assignTuple {body : CapturedMir} {f : Gen.Function} {ctx :
     (htup : intBoolTupleOf d.ty = some (itOf d)) (rv : Rvalue)
     (hok : rvalueOkTuple body.localDecls (itOf d) rv = true) (e : Gen.ValueExpr)
     (he : translateRvalue body.localDecls rv = some e) :
-    (∀ bits b, rvTupleBits locals (itOf d) rv = some (bits, b) →
+    (∀ bits b, rvTupleBits locals i (itOf d) rv = some (bits, b) →
       ∃ m', evalStatement m (.Assign (.Local (localName i)) e) = .ok m' ∧
         FrameOk body f ctx
           (locals.set i (.init (.aggregate 0 [.scalar ⟨bits, (itOf d).size.bytes⟩, .scalar ⟨b, 1⟩])))
           m' blk stmt) ∧
-    (rvTupleBits locals (itOf d) rv = none →
+    (rvTupleBits locals i (itOf d) rv = none →
       ∃ msg, evalStatement m (.Assign (.Local (localName i)) e) = .error (.ub msg)) := by
   have hi : i < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
   have hgood := h.decl_good i d hd
   have htyd : tyOf d = intBoolTupleTy (itOf d) := (tyOf_tuple htup).1
   have hspec := (translateFn_spec body f h.hf).2.1 i d hd
-  have hplace := evalPlace_local h.shape i hi _ hspec.2
+  have hplace := evalPlace_local h.shape i hi _ hspec.2 (by intro h; subst h; contradiction)
   obtain ⟨hrok, hrnone⟩ := evalValue_rvalueTuple h (itOf d) hgood rv hok e he
   refine ⟨fun bits b hbb => ?_, fun hnone => ?_⟩
   · obtain ⟨hbits, hb, m1, hm1, h1⟩ := hrok bits b hbb

@@ -154,6 +154,7 @@ def declSlotData (d : LocalDecl) (slot : LocalSlot) : List Byte :=
 scalar `sc0` of size `it.size.bytes` and a boolean scalar `sc1` (`0` or `1`). -/
 def SlotOk (T : Gen.Type) : LocalSlot → Prop
   | .uninit => True
+  | .dead => True
   | .init (.scalar sc) => sc.sizeBytes = tyBytes T ∧ ValidBits T sc.bits
   | .init (.aggregate 0 [.scalar sc0, .scalar sc1]) =>
     ∃ it, tupleIntOfTy T = some it ∧
@@ -180,14 +181,17 @@ def localPtr (ctx : Ctx) (i : Nat) : Ptr :=
 
 /-- The allocation backing local `_i`, as created by `storage_live`
 ("mem.allocate(AllocationKind::Stack, pointee_size, pointee_align)"). -/
-def localAlloc (ctx : Ctx) (i : Nat) (it : Gen.IntType) (data : List Byte) : Gen.Allocation :=
+def localAllocLive (ctx : Ctx) (i : Nat) (it : Gen.IntType) (data : List Byte) (live : Bool) : Gen.Allocation :=
   { data := data, addr := ctx.addrs.getD i 0, align := ⟨it.size.bytes⟩, kind := .Stack,
-    live := true, extra := () }
+    live := live, extra := () }
+
+def localAlloc (ctx : Ctx) (i : Nat) (it : Gen.IntType) (data : List Byte) : Gen.Allocation :=
+  localAllocLive ctx i it data true
 
 /-- The callee's allocations for locals `_i, _(i+1), ..`, in local order. -/
 def localAllocsFrom (ctx : Ctx) : Nat → List LocalDecl → List LocalSlot → List Gen.Allocation
   | i, d :: ds, slot :: slots =>
-    localAlloc ctx i (itOf d) (declSlotData d slot) :: localAllocsFrom ctx (i + 1) ds slots
+    localAllocLive ctx i (itOf d) (declSlotData d slot) (match slot with | .dead => false | _ => true) :: localAllocsFrom ctx (i + 1) ds slots
   | _, _, _ => []
 
 /-- The callee's allocations, one per local, in local order. -/
@@ -196,12 +200,12 @@ def localAllocs (ctx : Ctx) (decls : List LocalDecl) (locals : List LocalSlot) :
   localAllocsFrom ctx 0 decls locals
 
 /-- The callee frame's `locals` map: every local is live. -/
-def localsMap (ctx : Ctx) (n : Nat) : Map Gen.LocalName Ptr :=
-  ⟨(List.range n).map (fun i => (localName i, localPtr ctx i))⟩
+def localsMap (ctx : Ctx) (locals : List LocalSlot) : Map Gen.LocalName Ptr :=
+  ⟨(List.range locals.length).filterMap (fun i => match locals[i]? with | some LocalSlot.dead => none | _ => some (localName i, localPtr ctx i))⟩
 
 /-- The callee frame at program counter `(blk, stmt)`. -/
-def calleeFrame (f : Gen.Function) (ctx : Ctx) (n blk stmt : Nat) : Frame :=
-  { func := f, locals := localsMap ctx n,
+def calleeFrame (f : Gen.Function) (ctx : Ctx) (locals : List LocalSlot) (blk stmt : Nat) : Frame :=
+  { func := f, locals := localsMap ctx locals,
     stack_pop_action := .BackToCaller (some ctx.nextBlock) ctx.unwindBlock ctx.retPtr,
     next_block := bbName blk, next_stmt := (stmt : Int), extra := () }
 
@@ -226,7 +230,7 @@ def RetPlaceOk (ctx : Ctx) (T : Gen.Type) (it : Gen.IntType) : Prop :=
 structure StateRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : MachineState)
     (m : Mach) : Prop where
   threads : m.threads =
-    [thread1 ctx [ctx.caller, calleeFrame f ctx body.localDecls.length s.frame.blockIdx s.frame.stmtIdx]]
+    [thread1 ctx [ctx.caller, calleeFrame f ctx s.frame.locals s.frame.blockIdx s.frame.stmtIdx]]
   active : m.active_thread = 0
   allocs : m.mem.memory.allocations = ctx.base ++ localAllocs ctx body.localDecls s.frame.locals
   blk : s.frame.blockIdx < body.basicBlocks.length
@@ -252,7 +256,7 @@ structure StartRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : Mach
     (mInit : Mach) : Prop where
   threads : mInit.threads =
     [thread1 ctx [ctx.caller,
-      { calleeFrame f ctx body.localDecls.length 0 0 with next_block := f.start }]]
+      { calleeFrame f ctx s.frame.locals 0 0 with next_block := f.start }]]
   active : mInit.active_thread = 0
   allocs : mInit.mem.memory.allocations = ctx.base ++ localAllocs ctx body.localDecls s.frame.locals
   blk0 : s.frame.blockIdx = 0

@@ -2405,11 +2405,11 @@ theorem evalStmt_assign (s : MachineState) (decls : List LocalDecl) (layouts : L
     (hn : s.frame.locals.length = decls.length) (d : LocalDecl) (hd : decls[i]? = some d)
     (hgood : GoodSize (itOf d).size.bytes) (hok : rvalueOk decls (itOf d) rv = true)
     (hbor : s.memory.borrows = []) (hprot : s.memory.activeProtectors = []) :
-    (∀ r, rvBits decls s.frame.locals (itOf d) rv = some r →
+    (∀ r, rvBits decls s.frame.locals i (itOf d) rv = some r →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts =
         .tau (.running (advanceStmt s (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩)))
           { s.memory with borrows := [] }))) ∧
-    (rvBits decls s.frame.locals (itOf d) rv = none →
+    (rvBits decls s.frame.locals i (itOf d) rv = none →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
   obtain ⟨hok', hnone⟩ := evalRvalue_frag decls s.frame.locals hslots hn (itOf d) hgood rv hok s.memory layouts
   obtain ⟨hA, hAub⟩ := evalStmt_assign_of s decls layouts i rv span hslots hn d hd hbor hprot
@@ -2420,11 +2420,11 @@ theorem evalStmt_assignB (s : MachineState) (decls : List LocalDecl) (layouts : 
     (hn : s.frame.locals.length = decls.length) (d : LocalDecl) (hd : decls[i]? = some d)
     (hbool : isBoolTy d.ty = true) (hok : rvalueOkB decls rv = true)
     (hbor : s.memory.borrows = []) (hprot : s.memory.activeProtectors = []) :
-    (∀ r, rvBitsB decls s.frame.locals rv = some r →
+    (∀ r, rvBitsB decls s.frame.locals i rv = some r →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts =
         .tau (.running (advanceStmt s (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩)))
           { s.memory with borrows := [] }))) ∧
-    (rvBitsB decls s.frame.locals rv = none →
+    (rvBitsB decls s.frame.locals i rv = none →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
   have hit : itOf d = u8Ty := (tyOf_bool hbool).2
   obtain ⟨hok', hnone⟩ := evalRvalue_fragB decls s.frame.locals hslots hn rv hok s.memory layouts
@@ -2438,11 +2438,11 @@ theorem evalStmt_assignO (s : MachineState) (decls : List LocalDecl) (layouts : 
     (hn : s.frame.locals.length = decls.length) (d : LocalDecl) (hd : decls[i]? = some d)
     (hord : isOrderingTy d.ty = true) (hok : rvalueOkO decls rv = true)
     (hbor : s.memory.borrows = []) (hprot : s.memory.activeProtectors = []) :
-    (∀ r, rvBitsO decls s.frame.locals rv = some r →
+    (∀ r, rvBitsO decls s.frame.locals i rv = some r →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts =
         .tau (.running (advanceStmt s (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d).size.bytes⟩)))
           { s.memory with borrows := [] }))) ∧
-    (rvBitsO decls s.frame.locals rv = none →
+    (rvBitsO decls s.frame.locals i rv = none →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
   have hit : itOf d = u8Ty := (tyOf_ordering hord).2
   obtain ⟨hok', hnone⟩ := evalRvalue_fragO decls s.frame.locals hslots hn rv hok s.memory layouts
@@ -2456,12 +2456,12 @@ theorem evalStmt_assignTuple (s : MachineState) (decls : List LocalDecl) (layout
     (hn : s.frame.locals.length = decls.length) (d : LocalDecl) (hd : decls[i]? = some d)
     (hgood : GoodSize (itOf d).size.bytes) (hok : rvalueOkTuple decls (itOf d) rv = true)
     (hbor : s.memory.borrows = []) (hprot : s.memory.activeProtectors = []) :
-    (∀ bits b, rvTupleBits s.frame.locals (itOf d) rv = some (bits, b) →
+    (∀ bits b, rvTupleBits s.frame.locals i (itOf d) rv = some (bits, b) →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts =
         .tau (.running (advanceStmt s
           (s.frame.locals.set i (.init (.aggregate 0 [.scalar ⟨bits, (itOf d).size.bytes⟩, .scalar ⟨b, 1⟩])))
           { s.memory with borrows := [] }))) ∧
-    (rvTupleBits s.frame.locals (itOf d) rv = none →
+    (rvTupleBits s.frame.locals i (itOf d) rv = none →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
   have hi : i < s.frame.locals.length := by rw [hn]; exact (List.getElem?_eq_some_iff.mp hd).1
   have hs : s.frame.locals[i]? = some s.frame.locals[i] := by simp [hi]
