@@ -7,56 +7,36 @@
 // those terms.
 
 //! Standalone CLI entry point (`anneal-audit`) for auditing Anneal's
-//! repository trust boundary (`trusted/` vs. `theory/`) and verifying per-crate
-//! `.anneal/Mir.lean` and `.anneal/Proof.lean` artifacts in the Lean 4 kernel.
+//! repository trust boundary (`trusted/` vs. `theory/`) in CI.
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::error::ErrorKind;
 use clap::Parser;
+use clap::error::ErrorKind;
 
-use anneal_audit::{Checker, Json, ReleaseChannel};
+use anneal_audit::{Checker, Failure, Json};
 
 #[derive(Parser)]
 #[command(
     name = "anneal-audit",
     version,
-    about = "Trusted-boundary and kernel verification auditor for Anneal"
+    about = "Repository trusted-boundary and kernel environment auditor for Anneal"
 )]
 struct Cli {
-    /// Target crate directory containing `.anneal/Mir.lean` and
-    /// `.anneal/Proof.lean`. When omitted, audits the Anneal repository itself.
-    #[arg(long)]
-    verify_crate: Option<PathBuf>,
-
-    /// Pre-compile the repository `Trusted.*` and `Anneal.*` prefix into the
-    /// specified directory for reuse by subsequent `--verify-crate` calls.
-    #[arg(long)]
-    build_prefix_cache: Option<PathBuf>,
-
-    /// Reuse a pre-compiled repository prefix directory produced by
-    /// `--build-prefix-cache`.
-    #[arg(long)]
-    prefix_cache_dir: Option<PathBuf>,
-
-    /// Comma-separated candidate-trusted features to allow during
-    /// `--verify-crate` (or `*`).
-    #[arg(long, value_delimiter = ',')]
-    allow_candidate_features: Option<Vec<String>>,
-
-    /// Release channel override (`alpha` or `stable`) for `--verify-crate`.
-    #[arg(long)]
-    release_channel: Option<ReleaseChannel>,
-
-    /// Absolute path to the Lean 4 binary.
+    /// Path to the pinned `lean` binary (defaults to the installed Anneal
+    /// toolchain's `lean`).
     #[arg(long)]
     lean: Option<PathBuf>,
 
-    /// Path to the Anneal repository root.
+    /// Path to the Anneal repository root (defaults to the workspace root).
     #[arg(long)]
     anneal_root: Option<PathBuf>,
+
+    /// Emit the full JSON audit report instead of a human-readable summary.
+    #[arg(long)]
+    json: bool,
 }
 
 fn main() -> ExitCode {
@@ -69,30 +49,15 @@ fn main() -> ExitCode {
     }
 }
 
-fn resolve_checkout(explicit: Option<PathBuf>) -> Result<PathBuf, (u8, String)> {
-    if let Some(root) = explicit {
-        return Ok(root);
-    }
-    if Path::new("trusted/lean/foundation-lock.json").is_file() {
-        return Ok(PathBuf::from("."));
-    }
-    if let Ok(exe) = env::current_exe()
-        && let Some(tc_root) = exe.parent().and_then(Path::parent)
-    {
-        let share_root = tc_root.join("share/anneal");
-        if share_root.join("trusted/lean/foundation-lock.json").is_file() {
-            return Ok(share_root);
-        }
-    }
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    if let Some(workspace_root) = manifest_dir.parent().and_then(Path::parent)
-        && workspace_root
-            .join("trusted/lean/foundation-lock.json")
-            .is_file()
-    {
-        return Ok(workspace_root.to_path_buf());
-    }
-    Ok(PathBuf::from("."))
+fn failure_message(err: &Failure, checker: Option<&Checker>) -> (u8, String) {
+    let began = checker.is_some_and(|c| c.execution_began);
+    (
+        err.code as u8,
+        format!(
+            "Trusted check failed ({}): {}\nTarget execution began: {began}\nRetry only after resolving/reobserving the reported failure.",
+            err.phase, err.message
+        ),
+    )
 }
 
 fn run(raw_args: Vec<String>) -> Result<u8, (u8, String)> {
@@ -110,62 +75,28 @@ fn run(raw_args: Vec<String>) -> Result<u8, (u8, String)> {
         }
     };
 
-    if let Some(ref pb) = cli.lean
-        && !pb.is_absolute()
-    {
-        return Err((2, "error: --lean must be absolute".to_string()));
-    }
-
-    let checkout = resolve_checkout(cli.anneal_root)?;
+    let checkout = cli.anneal_root.unwrap_or_else(|| {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    });
     let mut checker = Checker::new(&checkout, cli.lean.as_deref()).map_err(|e| {
         (
             2,
             format!(
-                "Trusted check could not create its private temporary directory: {e}"
+                "Trusted check could not initialize staging directory: {e}"
             ),
         )
     })?;
 
-    if let Some(cache_dest) = cli.build_prefix_cache {
-        match checker.build_prefix_cache(&cache_dest) {
-            Ok(_) => return Ok(0),
-            Err(err) => {
-                let msg = format!(
-                    "Trusted check failed ({}): {}\nTarget execution began: {}\nRetry only after resolving/reobserving the reported failure.",
-                    err.phase, err.message, checker.execution_began
-                );
-                return Err((err.code as u8, msg));
-            }
-        }
-    }
-
-    if let Some(crate_dir) = cli.verify_crate {
-        checker.set_prefix_cache_dir(cli.prefix_cache_dir);
-        match checker.verify_crate_with_policy(
-            &crate_dir,
-            cli.release_channel,
-            cli.allow_candidate_features.as_deref(),
-        ) {
-            Ok(report) => {
+    match checker.run() {
+        Ok(report) => {
+            if cli.json {
                 println!(
                     "{}",
-                    serde_json::to_string(&report)
-                        .expect("serialize crate verification report")
+                    serde_json::to_string_pretty(&report)
+                        .expect("serialize audit report")
                 );
                 return Ok(0);
             }
-            Err(err) => {
-                let msg = format!(
-                    "Trusted check failed ({}): {}\nTarget execution began: {}\nRetry only after resolving/reobserving the reported failure.",
-                    err.phase, err.message, checker.execution_began
-                );
-                return Err((err.code as u8, msg));
-            }
-        }
-    }
-
-    match checker.run() {
-        Ok(report) => {
             let guarantee = report
                 .get("guarantee")
                 .and_then(Json::as_str)
@@ -186,6 +117,9 @@ fn run(raw_args: Vec<String>) -> Result<u8, (u8, String)> {
                 .get("toolchain")
                 .and_then(Json::as_str)
                 .unwrap_or("");
+            let adm = checker
+                .admitted()
+                .expect("toolchain must be admitted on Ok");
             println!(
                 "PASS: {guarantee}\n\
                  {} Trusted modules; {} Theory modules; \
@@ -193,17 +127,11 @@ fn run(raw_args: Vec<String>) -> Result<u8, (u8, String)> {
                  {replayed} total replayed declarations; \
                  axioms={axioms}\n\
                  {tc}",
-                checker.modules.len(),
-                checker.theory_modules.len()
+                adm.modules.len(),
+                adm.theory_modules.len()
             );
             Ok(0)
         }
-        Err(err) => {
-            let msg = format!(
-                "Trusted check failed ({}): {}\nTarget execution began: {}\nRetry only after resolving/reobserving the reported failure.",
-                err.phase, err.message, checker.execution_began
-            );
-            Err((err.code as u8, msg))
-        }
+        Err(err) => Err(failure_message(&err, Some(&checker))),
     }
 }
