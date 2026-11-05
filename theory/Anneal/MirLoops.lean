@@ -1,5 +1,6 @@
 import Anneal.MirFuelFree
 import Anneal.FunctionalTranslation
+
 open Trusted.Refinement
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
@@ -10,460 +11,432 @@ open Anneal.Rustc.V2026_06_01.SymbolicEval
 open Anneal.MirFuelFree
 open Anneal.FunctionalTranslation
 open Trusted.Rustc.V2026_06_01.Layout
+open Trusted.Effect
+open Trusted.ITree
+open Trusted.Sequence
 
 namespace Anneal.MirLoops
 
--- Copyright 2026 The Fuchsia Authors. All rights reserved.
--- Use of this source code is governed by a BSD-style license that can be
--- found in the LICENSE file.
-
-
-
-def zipMachineState (cond : Bool) (sThen sElse : MachineState) : MachineState :=
-  { frame :=
-      { blockIdx := if cond then sThen.frame.blockIdx else sElse.frame.blockIdx,
-        stmtIdx := if cond then sThen.frame.stmtIdx else sElse.frame.stmtIdx,
-        locals := zipLocalSlots cond sThen.frame.locals sElse.frame.locals },
-    memory := if cond then sThen.memory else sElse.memory }
-
-def wpTransPlanConverges
-    (body : CapturedMir)
-    (plan : TransPlan)
-    (s : MachineState)
-    (post : MirOutcome → Prop) : Prop :=
-  match plan with
-  | .ret _ => MirWpConverges body s post
-  | .jump _ _ => False
-  | .splitBranch _ _ _ => False
-  | .loop _ _ _ _ _ => False
-  | .seq targetBb cont stepFuel =>
-    match runMirToBlock stepFuel body targetBb s with
-    | .some s' => wpTransPlanConverges body cont s' post
-    | .none => False
-  | .branch joinBb thenPlan elsePlan cont preFuel =>
-    joinPlanMemConsistent body plan s ∧
-      match runMirToBinarySwitch preFuel body s with
-      | .none => False
-      | .some (cond, _, sThen₀, sElse₀) =>
-        match evalPlanToJoin body thenPlan sThen₀, evalPlanToJoin body elsePlan sElse₀ with
-        | .some sThen, .some sElse =>
-          sThen.frame.blockIdx = joinBb ∧ sElse.frame.blockIdx = joinBb ∧
-          sThen.frame.stmtIdx = 0 ∧ sElse.frame.stmtIdx = 0 ∧
-          sThen.frame.locals.length = sElse.frame.locals.length ∧
-          wpTransPlanConverges body cont (zipMachineState cond sThen sElse) post
-        | _, _ => False
-
-theorem MirWpConverges.join_of_branches
-    {body : CapturedMir} {Q : MirOutcome → Prop} :
-    (plan : TransPlan) → ∀ {s sJoin : MachineState},
-      evalPlanToJoin body plan s = some sJoin →
-      joinPlanMemConsistent body plan s →
-      MirWpConverges body sJoin Q →
-      MirWpConverges body s Q
-  | .ret _, _, _, h, _, _ => by nomatch h
-  | .splitBranch _ _ _, _, _, h, _, _ => by nomatch h
-  | .loop _ _ _ _ _, _, _, h, _, _ => by nomatch h
-  | .jump targetBlock fuel, _, _, h, _, h_next =>
-    MirWpConverges.of_runMirToBlock h h_next
-  | .seq nextBlock nextPlan fuel, s, sJoin, h, h_mem, h_next => by
-    unfold evalPlanToJoin at h
-    unfold joinPlanMemConsistent at h_mem
-    cases h_blk : runMirToBlock fuel body nextBlock s with
-    | none => rw [h_blk] at h; nomatch h
-    | some s' =>
-      rw [h_blk] at h h_mem
-      exact MirWpConverges.of_runMirToBlock h_blk
-        (MirWpConverges.join_of_branches nextPlan h h_mem h_next)
-  | .branch joinBlock thenPlan elsePlan joinPlan preFuel, s, sJoin, h, h_mem, h_next => by
-    unfold evalPlanToJoin at h
-    unfold joinPlanMemConsistent at h_mem
-    cases h_sw : runMirToBinarySwitch preFuel body s with
-    | none => rw [h_sw] at h; nomatch h
-    | some swRes =>
-      rcases swRes with ⟨cond, bits, sThen₀, sElse₀⟩
-      rw [h_sw] at h h_mem
-      dsimp only at h h_mem
-      cases h_t : evalPlanToJoin body thenPlan sThen₀ with
-      | none => rw [h_t] at h; nomatch h
-      | some sThen =>
-        cases h_e : evalPlanToJoin body elsePlan sElse₀ with
-        | none => rw [h_t, h_e] at h; nomatch h
-        | some sElse =>
-          rw [h_t, h_e] at h h_mem
-          rcases h_mem with ⟨h_meq, h_mt, h_me, h_mj⟩
-          dsimp only at h
-          cases h_chk : (Nat.beq sThen.frame.blockIdx joinBlock && Nat.beq sElse.frame.blockIdx joinBlock &&
-             sThen.frame.stmtIdx.beq 0 && sElse.frame.stmtIdx.beq 0 &&
-             sThen.frame.locals.length.beq sElse.frame.locals.length)
-          · rw [h_chk] at h; nomatch h
-          · rw [h_chk] at h
-            refine MirWpConverges.of_runMirToBinarySwitch h_sw ?_
-            have h_joined : MirWpConverges body {
-              frame := {
-                blockIdx := joinBlock,
-                stmtIdx := 0,
-                locals := zipLocalSlots cond sThen.frame.locals sElse.frame.locals
-              },
-              memory := sThen.memory
-            } Q := MirWpConverges.join_of_branches joinPlan h h_mj h_next
-            simp at h_chk
-            rcases h_chk with ⟨⟨⟨⟨h_tb, h_eb⟩, h_ts⟩, h_es⟩, h_len⟩
-            have h_zip := zipLocalSlots_eq_ite cond h_len
-            rw [h_zip] at h_joined
-            cases cond
-            · have h_mem_eq : sElse.memory = sThen.memory := h_meq.symm
-              have h_eq : { frame := { blockIdx := joinBlock, stmtIdx := 0, locals := (if false then sThen.frame.locals else sElse.frame.locals) }, memory := sThen.memory } = sElse := by
-                cases sElse with | mk f m =>
-                cases f with | mk b s l =>
-                simp [h_eb.symm, h_es.symm, h_mem_eq.symm]
-              rw [h_eq] at h_joined
-              exact MirWpConverges.join_of_branches elsePlan h_e h_me h_joined
-            · have h_eq : { frame := { blockIdx := joinBlock, stmtIdx := 0, locals := (if true then sThen.frame.locals else sElse.frame.locals) }, memory := sThen.memory } = sThen := by
-                cases sThen with | mk f m =>
-                cases f with | mk b s l =>
-                simp [h_tb.symm, h_ts.symm]
-              rw [h_eq] at h_joined
-              exact MirWpConverges.join_of_branches thenPlan h_t h_mt h_joined
-
-theorem mirWpConverges_of_wpTransPlanConverges
-    (body : CapturedMir) (plan : TransPlan) (s : MachineState) (post : MirOutcome → Prop)
-    (h : wpTransPlanConverges body plan s post) :
-    MirWpConverges body s post := by
-  induction plan generalizing s with
-  | ret _ => exact h
-  | jump _ _ => exact False.elim h
-  | splitBranch _ _ _ => exact False.elim h
-  | loop _ _ _ _ _ => exact False.elim h
-  | seq targetBb cont stepFuel ih =>
-    unfold wpTransPlanConverges at h
-    split at h
-    · next s' h_blk =>
-      exact MirWpConverges.of_runMirToBlock h_blk (ih s' h)
-    · exact False.elim h
-  | branch joinBb thenPlan elsePlan cont preFuel ihThen ihElse ihCont =>
-    unfold wpTransPlanConverges at h
-    rcases h with ⟨h_mem, h⟩
-    split at h
-    · exact False.elim h
-    · next cond bits sThen₀ sElse₀ h_sw =>
-      split at h
-      · next sThen sElse h_t h_e =>
-        rcases h with ⟨h_tb, h_eb, h_ts, h_es, h_len, h_cont⟩
-        refine MirWpConverges.of_runMirToBinarySwitch h_sw ?_
-        unfold joinPlanMemConsistent at h_mem
-        rw [h_sw] at h_mem
-        dsimp only at h_mem
-        rw [h_t, h_e] at h_mem
-        rcases h_mem with ⟨h_meq, h_mt, h_me, h_mj⟩
-        have h_next : MirWpConverges body (zipMachineState cond sThen sElse) post := ihCont _ h_cont
-        unfold zipMachineState at h_next
-        have h_zip := zipLocalSlots_eq_ite cond h_len
-        rw [h_zip] at h_next
-        cases cond
-        · have h_eq : { frame := { blockIdx := if false then sThen.frame.blockIdx else sElse.frame.blockIdx, stmtIdx := if false then sThen.frame.stmtIdx else sElse.frame.stmtIdx, locals := if false then sThen.frame.locals else sElse.frame.locals }, memory := if false then sThen.memory else sElse.memory } = sElse := by
-            cases sElse with | mk f m =>
-            cases f with | mk b s l =>
-            simp
-          rw [h_eq] at h_next
-          exact MirWpConverges.join_of_branches elsePlan h_e h_me h_next
-        · have h_eq : { frame := { blockIdx := if true then sThen.frame.blockIdx else sElse.frame.blockIdx, stmtIdx := if true then sThen.frame.stmtIdx else sElse.frame.stmtIdx, locals := if true then sThen.frame.locals else sElse.frame.locals }, memory := if true then sThen.memory else sElse.memory } = sThen := by
-            cases sThen with | mk f m =>
-            cases f with | mk b s l =>
-            simp
-          rw [h_eq] at h_next
-          exact MirWpConverges.join_of_branches thenPlan h_t h_mt h_next
-      · exact False.elim h
-
 def forRangeUp {α : Type} (lo hi : Nat) (init : α) (step : (i : Nat) → lo ≤ i → i < hi → α → α) : α :=
   if h : lo < hi then
-    forRangeUp (lo + 1) hi (step lo (Nat.le_refl lo) h init) (fun i hlo hhi a => step i (Nat.le_trans (Nat.le_succ lo) hlo) hhi a)
+    forRangeUp (lo + 1) hi (step lo (Nat.le_refl _) h init) (fun i h_le h_lt a => step i (Nat.le_trans (Nat.le_succ _) h_le) h_lt a)
   else
     init
 termination_by hi - lo
 
-theorem forRangeUp_unfold {α : Type} (lo hi : Nat) (init : α) (step : (i : Nat) → lo ≤ i → i < hi → α → α) :
-    forRangeUp lo hi init step =
-    if h : lo < hi then
-      forRangeUp (lo + 1) hi (step lo (Nat.le_refl lo) h init) (fun i hlo hhi a => step i (Nat.le_trans (Nat.le_succ lo) hlo) hhi a)
-    else
-      init := by
-  conv =>
-    lhs
-    unfold forRangeUp
+@[simp]
+theorem forRangeUp_eq_init_of_ge {α : Type} (lo hi : Nat) (init : α) (step : (i : Nat) → lo ≤ i → i < hi → α → α) (h : hi ≤ lo) :
+    forRangeUp lo hi init step = init := by
+  rw [forRangeUp]
+  split
+  · next h_lt => exact False.elim (Nat.not_lt_of_le h h_lt)
+  · rfl
 
-@[simp] theorem forRangeUp_eq_init_of_ge {α : Type} (lo hi : Nat) (init : α) (step : (i : Nat) → lo ≤ i → i < hi → α → α)
-    (hGe : lo ≥ hi) : forRangeUp lo hi init step = init := by
-  rw [forRangeUp_unfold]
-  have hNotLt : ¬(lo < hi) := by omega
-  simp [hNotLt]
-
-@[simp] theorem forRangeUp_step_of_lt {α : Type} (lo hi : Nat) (init : α) (step : (i : Nat) → lo ≤ i → i < hi → α → α)
-    (hLt : lo < hi) : forRangeUp lo hi init step =
-    forRangeUp (lo + 1) hi (step lo (Nat.le_refl lo) hLt init) (fun i hlo hhi a => step i (Nat.le_trans (Nat.le_succ lo) hlo) hhi a) := by
-  rw [forRangeUp_unfold]
-  simp [hLt]
+theorem forRangeUp_step_of_lt {α : Type} (lo hi : Nat) (init : α) (step : (i : Nat) → lo ≤ i → i < hi → α → α) (h : lo < hi) :
+    forRangeUp lo hi init step = forRangeUp (lo + 1) hi (step lo (Nat.le_refl _) h init) (fun i h_le h_lt a => step i (Nat.le_trans (Nat.le_succ _) h_le) h_lt a) := by
+  rw [forRangeUp]
+  split
+  · rfl
+  · next h_not_lt => exact False.elim (h_not_lt h)
 
 theorem forRangeUp_induction {α : Type}
-    {P : Nat → α → Prop}
     (lo hi : Nat) (init : α) (step : (i : Nat) → lo ≤ i → i < hi → α → α)
-    (hLo : lo ≤ hi)
-    (hInit : P lo init)
-    (hStep : ∀ i a hLe hLt, P i a → P (i + 1) (step i hLe hLt a)) :
-    P hi (forRangeUp lo hi init step) := by
-  generalize hd : hi - lo = d
-  induction d generalizing lo init step with
-  | zero =>
-    have h_eq : lo = hi := by omega
-    have h_rw : forRangeUp lo hi init step = init := forRangeUp_eq_init_of_ge _ _ _ _ (by omega)
-    rw [h_rw]
+    (Inv : Nat → α → Prop)
+    (h_le : lo ≤ hi)
+    (h_init : Inv lo init)
+    (h_step : ∀ i h_i_le h_i_lt a, Inv i a → Inv (i + 1) (step i h_i_le h_i_lt a)) :
+    Inv hi (forRangeUp lo hi init step) := by
+  if h : lo < hi then
+    rw [forRangeUp_step_of_lt lo hi init step h]
+    have h_next : Inv (lo + 1) (step lo (Nat.le_refl _) h init) := h_step lo (Nat.le_refl _) h init h_init
+    exact forRangeUp_induction (lo + 1) hi (step lo (Nat.le_refl _) h init) _ Inv (Nat.succ_le_of_lt h) h_next (fun i h_i_le h_i_lt a h_inv => h_step i (Nat.le_trans (Nat.le_succ _) h_i_le) h_i_lt a h_inv)
+  else
+    have h_eq : lo = hi := Nat.le_antisymm h_le (Nat.le_of_not_lt h)
     subst h_eq
-    exact hInit
+    rw [forRangeUp_eq_init_of_ge _ _ _ _ (Nat.le_refl _)]
+    exact h_init
+termination_by hi - lo
+
+theorem mirTraceWpConverges_forRangeUp {α : Type}
+    (lo hi : Nat) (init : α) (step : (i : Nat) → i ≤ hi → i < hi → α → α)
+    (body : CapturedMir)
+    (LoopInv : Nat → α → MachineState → Prop)
+    (s₀ : MachineState)
+    (post : List (Event MirEffect) → MirOutcome → Prop)
+    (h_le : lo ≤ hi)
+    (h_init : LoopInv lo init s₀)
+    (h_body : ∀ i h_i_le h_i_lt a s, LoopInv i a s →
+      MirTraceStepsConverges body s
+        (fun s' tr_step => LoopInv (i + 1) (step i h_i_le h_i_lt a) s' ∧ tr_step = [])
+        (fun _ _ => False))
+    (h_exit : ∀ a s, LoopInv hi a s → MirTraceWpConverges body s post) :
+    MirTraceWpConverges body s₀ post := by
+  generalize h_d : hi - lo = d
+  induction d generalizing lo init s₀ with
+  | zero =>
+    have h_eq : lo = hi := Nat.le_antisymm h_le (Nat.le_of_sub_eq_zero h_d)
+    subst h_eq
+    exact h_exit init s₀ h_init
   | succ d ih =>
-    have h_lt : lo < hi := by omega
-    have h_rw : forRangeUp lo hi init step = _ := forRangeUp_step_of_lt _ _ _ _ h_lt
-    rw [h_rw]
-    refine ih (lo + 1) (step lo (Nat.le_refl lo) h_lt init) (fun i hlo hhi a => step i (Nat.le_trans (Nat.le_succ lo) hlo) hhi a) ?_ ?_ ?_ ?_
-    · omega
-    · exact hStep lo init (Nat.le_refl lo) h_lt hInit
-    · intro i a hLe hLt' hP
-      exact hStep i a (Nat.le_trans (Nat.le_succ lo) hLe) hLt' hP
-    · omega
+    have h_lt : lo < hi := Nat.lt_of_sub_eq_succ h_d
+    have h_step_conv := h_body lo h_le h_lt init s₀ h_init
+    have h_step_conv_post : MirTraceStepsConverges body s₀ (fun s' tr_step => LoopInv (lo + 1) (step lo h_le h_lt init) s' ∧ tr_step = []) post := by
+      exact MirTraceStepsConverges.mono
+        (fun s' tr_step h_mid => h_mid)
+        (fun tr_step out h_false => nomatch h_false)
+        h_step_conv
+    apply MirTraceWpConverges.bind_silent h_step_conv_post
+    intro s' h_mid
+    have h_sub : hi - (lo + 1) = d := by omega
+    exact ih (lo + 1) (step lo h_le h_lt init) s' (Nat.succ_le_of_lt h_lt) h_mid h_sub
+
+theorem nat_strong_induction (P : Nat → Prop) (ind : ∀ n, (∀ m, m < n → P m) → P n) : ∀ n, P n := by
+  intro n
+  have aux : ∀ m, m ≤ n → P m := by
+    induction n with
+    | zero =>
+      intro m hm
+      have h_eq : m = 0 := Nat.le_zero.mp hm
+      subst h_eq
+      exact ind 0 (fun k hk => nomatch hk)
+    | succ n ih =>
+      intro m hm
+      if h_eq : m = n + 1 then
+        subst h_eq
+        exact ind (n + 1) (fun k hk => ih k (Nat.le_of_lt_succ hk))
+      else
+        have h_lt : m < n + 1 := Nat.lt_of_le_of_ne hm h_eq
+        exact ih m (Nat.le_of_lt_succ h_lt)
+  exact aux n (Nat.le_refl _)
+
+theorem mirTraceWpConverges_whileRank {α : Type}
+    (rank : α → Nat)
+    (body : CapturedMir)
+    (LoopInv : α → MachineState → Prop)
+    (s₀ : MachineState)
+    (a₀ : α)
+    (post : List (Event MirEffect) → MirOutcome → Prop)
+    (h_init : LoopInv a₀ s₀)
+    (h_step : ∀ a s, LoopInv a s →
+      MirTraceStepsConverges body s
+        (fun s' tr_step => (∃ a', LoopInv a' s' ∧ rank a' < rank a) ∧ tr_step = [])
+        post) :
+    MirTraceWpConverges body s₀ post := by
+  have h_gen : ∀ r a s, rank a = r → LoopInv a s → MirTraceWpConverges body s post := by
+    apply nat_strong_induction (fun r => ∀ a s, rank a = r → LoopInv a s → MirTraceWpConverges body s post)
+    intro r ih a s h_eq h_inv
+    have h_step_conv := h_step a s h_inv
+    apply MirTraceWpConverges.bind_silent h_step_conv
+    intro s' h_mid
+    rcases h_mid with ⟨a', h_inv', h_lt⟩
+    have h_sub : rank a' < r := by omega
+    exact ih (rank a') h_sub a' s' rfl h_inv'
+  exact h_gen (rank a₀) a₀ s₀ rfl h_init
+
+theorem runMirToBlock_eq_target
+    {fuel : Nat} {body : CapturedMir} {targetBlock : BasicBlockIdx}
+    {s sOut : MachineState}
+    (h : runMirToBlock fuel body targetBlock s = some sOut) :
+    sOut.frame.blockIdx = targetBlock ∧ sOut.frame.stmtIdx = 0 := by
+  induction fuel generalizing s with
+  | zero => nomatch h
+  | succ fuel' ih =>
+    unfold runMirToBlock at h
+    split at h
+    · injection h with h_eq
+      subst h_eq
+      rename_i h_and
+      have h1 : s.frame.blockIdx = targetBlock := by
+        exact Nat.eq_of_beq_eq_true (Bool.and_eq_true _ _ |>.mp h_and).1
+      have h2 : s.frame.stmtIdx = 0 := by
+        exact Nat.eq_of_beq_eq_true (Bool.and_eq_true _ _ |>.mp h_and).2
+      exact ⟨h1, h2⟩
+    · cases h_step : stepMirFn body s with
+      | ret _ => simp only [h_step] at h; nomatch h
+      | vis ef k =>
+        simp only [h_step] at h
+        cases ef with
+        | inl inl_ef => nomatch h
+        | inr inr_ef => cases inr_ef with
+          | inl inl_inr_ef => cases inl_inr_ef with
+            | emit ev =>
+              cases h_k : k PUnit.unit with
+              | running s_next =>
+                simp only [h_k] at h
+                exact ih h
+              | halted _ => simp only [h_k] at h; nomatch h
+              | faulted _ => simp only [h_k] at h; nomatch h
+          | inr _ => nomatch h
+      | tau execNext =>
+        simp only [h_step] at h
+        cases execNext with
+        | running s₁ => exact ih h
+        | halted _ => nomatch h
+        | faulted _ => nomatch h
 
 theorem mirWpConverges_forRangeUp {α : Type}
-    {body : CapturedMir} {LoopInv : Nat → α → MachineState → Prop}
-    {lo hi : Nat} (init : α) (step : (i : Nat) → lo ≤ i → i < hi → α → α)
-    {s : MachineState} {post : MirOutcome → Prop}
-    (hInit : LoopInv lo init s)
-    (hStep : ∀ i a s' hLe hLt, LoopInv i a s' → ∃ sNext, MirReachState body s' sNext ∧ LoopInv (i + 1) (step i hLe hLt a) sNext)
-    (hExit : ∀ i a s', i ≥ hi → LoopInv i a s' → MirWpConverges body s' post) :
-    MirWpConverges body s post := by
-  generalize hd : hi - lo = d
-  induction d generalizing lo init step s with
+    (lo hi : Nat) (init : α) (step : (i : Nat) → i ≤ hi → i < hi → α → α)
+    (body : CapturedMir)
+    (LoopInv : Nat → α → MachineState → Prop)
+    (s₀ : MachineState)
+    (post : MirOutcome → Prop)
+    (h_le : lo ≤ hi)
+    (h_init : LoopInv lo init s₀)
+    (h_body : ∀ i h_i_le h_i_lt a s, LoopInv i a s →
+      MirStepsConverges body s
+        (fun s' => LoopInv (i + 1) (step i h_i_le h_i_lt a) s')
+        (fun _ => False))
+    (h_exit : ∀ a s, LoopInv hi a s → MirWpConverges body s post) :
+    MirWpConverges body s₀ post := by
+  generalize h_d : hi - lo = d
+  induction d generalizing lo init s₀ with
   | zero =>
-    have h_ge : lo ≥ hi := Nat.le_of_sub_eq_zero hd
-    exact hExit lo init s h_ge hInit
-  | succ d ih =>
-    have h_lt : lo < hi := by omega
-    rcases hStep lo init s (Nat.le_refl lo) h_lt hInit with ⟨sNext, h_reach, h_inv_next⟩
-    have h_reach_mono : MirStepsConverges body s (· = sNext) post :=
-      MirStepsConverges.mono (fun _ h => h) (fun _ h => False.elim h) h_reach
-    refine MirWpConverges.bind h_reach_mono ?_
-    intro s' h_eq
+    have h_eq : lo = hi := Nat.le_antisymm h_le (Nat.le_of_sub_eq_zero h_d)
     subst h_eq
-    refine ih (step lo (Nat.le_refl lo) h_lt init)
-      (fun i hlo hhi a => step i (Nat.le_trans (Nat.le_succ lo) hlo) hhi a)
-      h_inv_next ?_ ?_
-    · intro i a s' hLe hLt hInv
-      exact hStep i a s' (Nat.le_trans (Nat.le_succ lo) hLe) hLt hInv
-    · omega
-
-def whileRank {α : Type} (init : α) (hRank : α → Nat)
-    (step : (a : α) → 0 < hRank a → α)
-    (hRankDec : ∀ a h, hRank (step a h) < hRank a) : α :=
-  if h : 0 < hRank init then
-    whileRank (step init h) hRank step hRankDec
-  else
-    init
-termination_by hRank init
-decreasing_by exact hRankDec init h
-
-theorem mirWpConverges_whileRank_aux {α : Type}
-    {body : CapturedMir} {LoopInv : α → MachineState → Prop}
-    (init : α) (hRank : α → Nat)
-    (step : (a : α) → 0 < hRank a → α)
-    (hRankDec : ∀ a h, hRank (step a h) < hRank a)
-    {s : MachineState} {post : MirOutcome → Prop}
-    (hInit : LoopInv init s)
-    (hStep : ∀ a s' hLt, LoopInv a s' → ∃ sNext, MirReachState body s' sNext ∧ LoopInv (step a hLt) sNext)
-    (hExit : ∀ a s', hRank a = 0 → LoopInv a s' → MirWpConverges body s' post)
-    (d : Nat) (hd : hRank init ≤ d) :
-    MirWpConverges body s post := by
-  induction d generalizing init s with
-  | zero =>
-    have h_eq : hRank init = 0 := by omega
-    exact hExit init s h_eq hInit
+    exact h_exit init s₀ h_init
   | succ d ih =>
-    by_cases h_z : hRank init = 0
-    · exact hExit init s h_z hInit
-    · have h_lt : 0 < hRank init := Nat.pos_of_ne_zero h_z
-      rcases hStep init s h_lt hInit with ⟨sNext, h_reach, h_inv_next⟩
-      have h_reach_mono : MirStepsConverges body s (· = sNext) post :=
-        MirStepsConverges.mono (fun _ h => h) (fun _ h => False.elim h) h_reach
-      refine MirWpConverges.bind h_reach_mono ?_
-      intro s' h_eq
-      subst h_eq
-      have h_dec := hRankDec init h_lt
-      refine ih (step init h_lt) h_inv_next ?_
-      omega
+    have h_lt : lo < hi := Nat.lt_of_sub_eq_succ h_d
+    have h_step_conv := h_body lo h_le h_lt init s₀ h_init
+    have h_step_mono := MirStepsConverges.mono (post₂ := post) (fun _ h => h) (fun _ h => False.elim h) h_step_conv
+    apply MirWpConverges.bind h_step_mono
+    intro s' h_mid
+    have h_sub : hi - (lo + 1) = d := by omega
+    exact ih (lo + 1) (step lo h_le h_lt init) s' (Nat.succ_le_of_lt h_lt) h_mid h_sub
 
 theorem mirWpConverges_whileRank {α : Type}
-    {body : CapturedMir} {LoopInv : α → MachineState → Prop}
-    (init : α) (hRank : α → Nat)
-    (step : (a : α) → 0 < hRank a → α)
-    (hRankDec : ∀ a h, hRank (step a h) < hRank a)
-    {s : MachineState} {post : MirOutcome → Prop}
-    (hInit : LoopInv init s)
-    (hStep : ∀ a s' hLt, LoopInv a s' → ∃ sNext, MirReachState body s' sNext ∧ LoopInv (step a hLt) sNext)
-    (hExit : ∀ a s', hRank a = 0 → LoopInv a s' → MirWpConverges body s' post) :
-    MirWpConverges body s post :=
-  mirWpConverges_whileRank_aux init hRank step hRankDec hInit hStep hExit (hRank init) (Nat.le_refl _)
+    (rank : α → Nat)
+    (body : CapturedMir)
+    (LoopInv : α → MachineState → Prop)
+    (s₀ : MachineState)
+    (a₀ : α)
+    (post : MirOutcome → Prop)
+    (h_init : LoopInv a₀ s₀)
+    (h_step : ∀ a s, LoopInv a s →
+      MirStepsConverges body s
+        (fun s' => ∃ a', LoopInv a' s' ∧ rank a' < rank a)
+        post) :
+    MirWpConverges body s₀ post := by
+  have h_gen : ∀ r a s, rank a = r → LoopInv a s → MirWpConverges body s post := by
+    apply nat_strong_induction (fun r => ∀ a s, rank a = r → LoopInv a s → MirWpConverges body s post)
+    intro r ih a s h_eq h_inv
+    have h_step_conv := h_step a s h_inv
+    apply MirWpConverges.bind h_step_conv
+    intro s' h_mid
+    rcases h_mid with ⟨a', h_inv', h_lt⟩
+    have h_sub : rank a' < r := by omega
+    exact ih (rank a') h_sub a' s' rfl h_inv'
+  exact h_gen (rank a₀) a₀ s₀ rfl h_init
 
 
-private def defaultU32TypeLayout : TypeLayout := {
-  size := { bytes := 4 }
-  align := { bytes := 4 }
-  backendRepr := .memory
-  fields := .primitive
-  variants := .single 0
-  isUninhabited := false
-}
+theorem wpTransPlanConverges
+    {body : CapturedMir}
+    {s₀ sThen₀ sElse₀ sThenJoin sElseJoin : MachineState}
+    {cond : Bool}
+    {fuelThen fuelElse bits : Nat}
+    {joinBb : BasicBlockIdx}
+    {post : MirOutcome → Prop}
+    (h_sw : runMirToBinarySwitch 1 body s₀ = some (cond, bits, sThen₀, sElse₀))
+    (h_then : runMirToBlock fuelThen body joinBb sThen₀ = some sThenJoin)
+    (h_else : runMirToBlock fuelElse body joinBb sElse₀ = some sElseJoin)
+    (h_len : sThenJoin.frame.locals.length = sElseJoin.frame.locals.length)
+    (h_mem : sThenJoin.memory = sElseJoin.memory)
+    (h_join : MirWpConverges body
+      { frame := {
+          blockIdx := joinBb
+          stmtIdx := 0
+          locals := zipLocalSlots cond sThenJoin.frame.locals sElseJoin.frame.locals
+        }
+        memory := sThenJoin.memory }
+      post) :
+    MirWpConverges body s₀ post := by
+  have h_sw_conv := MirStepsConverges.of_runMirToBinarySwitch (post := fun _ => False) h_sw
+  have h_sw_mono := MirStepsConverges.mono (mid₂ := fun x => x = if cond then sThen₀ else sElse₀) (post₂ := post)
+    (fun s_mid h_mid => h_mid)
+    (fun out h_false => nomatch h_false)
+    h_sw_conv
+  apply MirWpConverges.bind h_sw_mono
+  intro s' h_mid
+  if h_cond : cond = true then
+    have h_mid_then : s' = sThen₀ := by rw [h_cond] at h_mid; exact h_mid
+    cases h_mid_then
+    have h_then_conv := MirStepsConverges.of_runMirToBlock (post := fun _ => False) h_then
+    have h_then_mono := MirStepsConverges.mono (mid₂ := fun x => x = sThenJoin) (post₂ := post)
+      (fun s_mid h_mid => h_mid)
+      (fun out h_false => nomatch h_false)
+      h_then_conv
+    apply MirWpConverges.bind h_then_mono
+    intro s_join h_join_mid
+    cases h_join_mid
+    rw [h_cond] at h_join
+    rw [zipLocalSlots_eq_ite true h_len] at h_join
+    have ⟨h_blk, h_stmt⟩ := runMirToBlock_eq_target h_then
+    have h_eq : sThenJoin = ({ frame := { blockIdx := joinBb, stmtIdx := 0, locals := sThenJoin.frame.locals }, memory := sThenJoin.memory } : MachineState) := by
+      cases h_sThenJoin : sThenJoin with | mk frame memory =>
+      cases h_frame : frame with | mk blockIdx stmtIdx locals =>
+      subst h_sThenJoin h_frame
+      dsimp at h_blk h_stmt
+      subst h_blk h_stmt
+      rfl
+    rw [h_eq]
+    exact h_join
+  else
+    have h_cond_false : cond = false := by cases cond; rfl; cases h_cond rfl
+    have h_mid_else : s' = sElse₀ := by rw [h_cond_false] at h_mid; exact h_mid
+    cases h_mid_else
+    have h_else_conv := MirStepsConverges.of_runMirToBlock (post := fun _ => False) h_else
+    have h_else_mono := MirStepsConverges.mono (mid₂ := fun x => x = sElseJoin) (post₂ := post)
+      (fun s_mid h_mid => h_mid)
+      (fun out h_false => nomatch h_false)
+      h_else_conv
+    apply MirWpConverges.bind h_else_mono
+    intro s_join h_join_mid
+    cases h_join_mid
+    rw [h_cond_false] at h_join
+    rw [zipLocalSlots_eq_ite false h_len] at h_join
+    have ⟨h_blk, h_stmt⟩ := runMirToBlock_eq_target h_else
+    have h_eq : sElseJoin = ({ frame := { blockIdx := joinBb, stmtIdx := 0, locals := sElseJoin.frame.locals }, memory := sElseJoin.memory } : MachineState) := by
+      cases h_sElseJoin : sElseJoin with | mk frame memory =>
+      cases h_frame : frame with | mk blockIdx stmtIdx locals =>
+      subst h_sElseJoin h_frame
+      dsimp at h_blk h_stmt
+      subst h_blk h_stmt
+      rfl
+    have h_mem_eq : sThenJoin.memory = sElseJoin.memory := h_mem
+    rw [h_mem_eq] at h_join
+    rw [h_eq]
+    exact h_join
 
-private def defaultU32FnAbi : FnAbi := {
-  args := []
-  ret := { layout := defaultU32TypeLayout, mode := .direct }
-  conv := .rust
-  canUnwind := false
-}
+private def defaultU32TypeLayout : TypeLayout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory, fields := .primitive, variants := .single 0, isUninhabited := false }
+private def defaultU32FnAbi : FnAbi := { args := [], ret := { layout := defaultU32TypeLayout, mode := .direct }, conv := .rust, canUnwind := false }
 
-private def mkMirBody
+def mkMirBody
     (defPath : DefPath) (argCount : Nat)
     (localDecls : List LocalDecl) (basicBlocks : List BasicBlockData) :
     CapturedMir := {
-  defPath, argCount, localDecls, basicBlocks
-  phase := .runtimePostCleanup
-  role := .subject
-  fnAbi := defaultU32FnAbi
-  layouts := { pointerBits := 64, isLittleEndian := true, entries := [] }
-  allocations := []
+  defPath, argCount, localDecls, basicBlocks, phase := .runtimePostCleanup, role := .subject, fnAbi := defaultU32FnAbi, layouts := { pointerBits := 64, isLittleEndian := true, entries := [] }, allocations := []
 }
 
-private def constU32 (v : Nat) : Operand :=
-  .constant { ty := Anneal.MirFuelFree.u32Ty, val := .scalar (.int ⟨v, 4⟩) }
+def constU32 (v : Nat) : Operand := .constant { ty := Anneal.MirFuelFree.u32Ty, val := .scalar (.int ⟨v, 4⟩) }
 
 def countTo10Body : CapturedMir :=
   mkMirBody "Anneal::MirLoops::countTo10" 0
       [ { mutability := .mut, ty := Anneal.MirFuelFree.u32Ty, debugName := some "_0" }
       , { mutability := .mut, ty := Anneal.MirFuelFree.u32Ty, debugName := some "i" } ]
-      [ { statements :=
-            [ { kind := .assign { local_ := 1, projection := [] } (.use (constU32 0)), span := "init" } ]
-          terminator := { kind := .goto 1, span := "goto bb1" }
-          isCleanup := false }
-      , { statements := []
-          terminator := { kind := .switchInt (.copy { local_ := 1, projection := [] }) { branches := [(10, 3)], otherwise := 2 }, span := "switch" }
-          isCleanup := false }
-      , { statements :=
-            [ { kind := .assign { local_ := 1, projection := [] } (.binaryOp .add (.copy { local_ := 1, projection := [] }) (constU32 1)), span := "add" } ]
-          terminator := { kind := .goto 1, span := "goto bb1" }
-          isCleanup := false }
-      , { statements := [ { kind := .assign { local_ := 0, projection := [] } (.use (.copy { local_ := 1, projection := [] })), span := "ret_assign" } ]
-          terminator := { kind := .return_, span := "ret" }
-          isCleanup := false }
+      [ { statements := [ { kind := .assign { local_ := 1, projection := [] } (.use (constU32 0)), span := "init" } ], terminator := { kind := .goto 1, span := "goto bb1" }, isCleanup := false }
+      , { statements := [], terminator := { kind := .switchInt (.copy { local_ := 1, projection := [] }) { branches := [(10, 3)], otherwise := 2 }, span := "switch" }, isCleanup := false }
+      , { statements := [ { kind := .assign { local_ := 1, projection := [] } (.binaryOp .add (.copy { local_ := 1, projection := [] }) (constU32 1)), span := "add" } ], terminator := { kind := .goto 1, span := "goto bb1" }, isCleanup := false }
+      , { statements := [ { kind := .assign { local_ := 0, projection := [] } (.use (.copy { local_ := 1, projection := [] })), span := "ret_assign" } ], terminator := { kind := .return_, span := "ret" }, isCleanup := false }
       ]
 
-def countState (bb : Nat) (i : Nat) : MachineState :=
-  {
-    frame := {
-      blockIdx := bb,
-      stmtIdx := 0,
-      locals := [
-        .init (.scalar ⟨0, 4⟩),
-        .init (.scalar ⟨i, 4⟩)
-      ]
-    },
-    memory := {}
-  }
+def countStateMem (bb : Nat) (stmt : Nat) (i : Nat) (mem : Memory) : MachineState :=
+  { frame := { blockIdx := bb, stmtIdx := stmt, locals := [ .init (.scalar ⟨0, 4⟩), .init (.scalar ⟨i, 4⟩) ] }, memory := mem }
 
-theorem bb0_converges :
-    MirReachState countTo10Body (countState 0 0)
-      (countState 1 0) := by
-  apply MirStepsConverges.step
-  apply MirStepsConverges.step
+def countStateMemRet (bb : Nat) (stmt : Nat) (i : Nat) (mem : Memory) : MachineState :=
+  { frame := { blockIdx := bb, stmtIdx := stmt, locals := [ .init (.scalar ⟨i, 4⟩), .init (.scalar ⟨i, 4⟩) ] }, memory := mem }
+
+theorem bb0_converges_mem (mem : Memory) (h_callee : mem.activeCallee = none) (h_prot : mem.activeProtectors = []) :
+    MirReachState countTo10Body (countStateMem 0 0 0 mem)
+      (countStateMem 1 0 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }) := by
+  have h_step : stepMirFn countTo10Body (countStateMem 0 0 0 mem) = MirStepNode.step (countStateMem 0 1 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }) := by
+      unfold stepMirFn
+      dsimp [countStateMem]
+      simp [Option.getD, countTo10Body, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalStmt, h_callee, h_prot, evalOperand, evalRvalue, evalConstValue, advanceStmt, Trusted.Sequence.set?]
+  have h_term : stepMirFn countTo10Body (countStateMem 0 1 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }) = MirStepNode.step (countStateMem 1 0 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }) := by
+      unfold stepMirFn
+      dsimp [countStateMem]
+      simp [Option.getD, countTo10Body, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalTerminator, h_callee, h_prot, Trusted.Sequence.length]
+  apply MirReachState.step_tau h_step
+  apply MirReachState.step_tau h_term
   apply MirStepsConverges.refl
   rfl
 
-theorem bb1_converges_lt (i : Nat) (h : i < 10) :
-    MirReachState countTo10Body (countState 1 i)
-      (countState 2 i) := by
-  apply MirStepsConverges.step
-  have h_ne : i ≠ 10 := by omega
-  have h_beq : i.beq 10 = false := by
-    cases hc : i.beq 10
-    · rfl
-    · have h_eq : i = 10 := Nat.eq_of_beq_eq_true hc
-      omega
-  have h_tree : stepMirSymTree countTo10Body (countState 1 i) = 
-    SymTree.branch (i.beq 10) 
-      (SymTree.leaf (.vis (.inr (.inl (.emit (.event i)))) (fun _ => MirExecState.running (countState 3 i))))
-      (SymTree.leaf (.vis (.inr (.inl (.emit (.event i)))) (fun _ => MirExecState.running (countState 2 i)))) := by rfl
-  rw [h_tree]
-  dsimp [evalSymNodeTreeNoCall]
-  rw [h_beq]
-  dsimp [evalSymNodeTreeNoCall]
+theorem bb1_converges_lt (i : Nat) (mem : Memory) (h_callee : mem.activeCallee = none) (h_lt : i ≠ 10) :
+    MirReachState countTo10Body (countStateMem 1 0 i mem)
+      (countStateMem 2 0 i mem) := by
+  have h_beq : Nat.beq i 10 = false := by exact (Bool.not_eq_true _).mp (by exact h_lt ∘ Nat.eq_of_beq_eq_true)
+  have h_fn : stepMirFn countTo10Body (countStateMem 1 0 i mem) = MirStepNode.emitStep (.event i) (countStateMem 2 0 i mem) := by
+      unfold stepMirFn
+      dsimp [countStateMem]
+      simp [Option.getD, countTo10Body, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalTerminator, h_callee, Trusted.Sequence.length, evalOperand, readProjectedValue, lookupSwitchTarget, h_beq]
+  apply MirReachState.step_emit h_fn
   apply MirStepsConverges.refl
   rfl
 
-theorem bb1_converges_eq10 :
-    MirReachState countTo10Body (countState 1 10)
-      (countState 3 10) := by
-  apply MirStepsConverges.step
-  have h_tree : stepMirSymTree countTo10Body (countState 1 10) = 
-    SymTree.branch ((10 : Nat).beq 10) 
-      (SymTree.leaf (.vis (.inr (.inl (.emit (.event 10)))) (fun _ => MirExecState.running (countState 3 10))))
-      (SymTree.leaf (.vis (.inr (.inl (.emit (.event 10)))) (fun _ => MirExecState.running (countState 2 10)))) := by rfl
-  rw [h_tree]
-  dsimp [evalSymNodeTreeNoCall]
+theorem bb2_converges_mem (i : Nat) (mem : Memory) (h_callee : mem.activeCallee = none) (h_prot : mem.activeProtectors = []) :
+    MirReachState countTo10Body (countStateMem 2 0 i mem)
+      (countStateMem 1 0 ((i + 1) % 4294967296) { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }) := by
+  have h_step : stepMirFn countTo10Body (countStateMem 2 0 i mem) = MirStepNode.step (countStateMem 2 1 ((i + 1) % 4294967296) { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }) := by
+      unfold stepMirFn
+      dsimp [countStateMem]
+      simp [Option.getD, countTo10Body, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalStmt, h_callee, h_prot, evalOperand, readProjectedValue, evalRvalue, evalConstValue, advanceStmt, Trusted.Sequence.set?]
+  have h_term : stepMirFn countTo10Body (countStateMem 2 1 ((i + 1) % 4294967296) { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }) = MirStepNode.step (countStateMem 1 0 ((i + 1) % 4294967296) { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }) := by
+      unfold stepMirFn
+      dsimp [countStateMem]
+      simp [Option.getD, countTo10Body, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalTerminator, h_callee, h_prot, Trusted.Sequence.length]
+  apply MirReachState.step_tau h_step
+  apply MirReachState.step_tau h_term
   apply MirStepsConverges.refl
   rfl
 
-theorem bb2_converges (i : Nat) :
-    MirReachState countTo10Body (countState 2 i)
-      (countState 1 (wrapScalarBits (i + 1) 4294967296)) := by
-  apply MirStepsConverges.step
-  apply MirStepsConverges.step
+theorem bb1_converges_eq10 (mem : Memory) (h_callee : mem.activeCallee = none) :
+    MirReachState countTo10Body (countStateMem 1 0 10 mem)
+      (countStateMem 3 0 10 mem) := by
+  have h_fn : stepMirFn countTo10Body (countStateMem 1 0 10 mem) = MirStepNode.emitStep (.event 10) (countStateMem 3 0 10 mem) := by
+      unfold stepMirFn
+      dsimp [countStateMem]
+      simp [Option.getD, countTo10Body, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalTerminator, h_callee, Trusted.Sequence.length, evalOperand, readProjectedValue, lookupSwitchTarget]
+  apply MirReachState.step_emit h_fn
   apply MirStepsConverges.refl
   rfl
 
-theorem bb3_converges (i : Nat) :
-    MirWpConverges countTo10Body (countState 3 i)
-      (fun out => out = .normal (.scalar ⟨i, 4⟩, {})) := by
-  apply MirWpConverges.step
-  apply MirWpConverges.step
-  rfl
+theorem bb3_converges_mem (mem : Memory) (h_callee : mem.activeCallee = none) (h_prot : mem.activeProtectors = []) (h_stack : mem.callStack = []) :
+    MirWpConverges countTo10Body (countStateMem 3 0 10 mem)
+      (fun out => out = Outcome.normal (Value.scalar ⟨10, 4⟩, { mem with borrows := invalidateConflictingBorrows mem.borrows 0 none })) := by
+  have h_step : stepMirFn countTo10Body (countStateMem 3 0 10 mem) = MirStepNode.step (countStateMemRet 3 1 10 { mem with borrows := invalidateConflictingBorrows mem.borrows 0 none }) := by
+      unfold stepMirFn
+      dsimp [countStateMem, countStateMemRet]
+      simp [Option.getD, countTo10Body, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalStmt, h_callee, h_prot, evalOperand, readProjectedValue, evalRvalue, advanceStmt, Trusted.Sequence.set?]
+  have h_term : stepMirFn countTo10Body (countStateMemRet 3 1 10 { mem with borrows := invalidateConflictingBorrows mem.borrows 0 none }) = MirStepNode.retNormal (Value.scalar ⟨10, 4⟩) { mem with borrows := invalidateConflictingBorrows mem.borrows 0 none } := by
+      unfold stepMirFn
+      dsimp [countStateMemRet]
+      simp [Option.getD, countTo10Body, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalTerminator, h_callee, h_prot, Trusted.Sequence.length, h_stack]
+  have h_wp_term : MirWpConverges countTo10Body (countStateMemRet 3 1 10 { mem with borrows := invalidateConflictingBorrows mem.borrows 0 none }) (fun out => out = Outcome.normal (Value.scalar ⟨10, 4⟩, { mem with borrows := invalidateConflictingBorrows mem.borrows 0 none })) := by
+      apply MirWpConverges.ret_of_step h_term
+      rfl
+  exact MirWpConverges.step_tau h_step h_wp_term
 
-def loopInv (i : Nat) (_ : Unit) (s : MachineState) : Prop :=
-  i ≤ 10 ∧ s = countState 1 i
-
-theorem countTo10_terminates :
-    MirWpConverges countTo10Body (countState 0 0)
-      (fun out => out = .normal (.scalar ⟨10, 4⟩, {})) := by
-  apply MirWpConverges.bind_reachState bb0_converges
-  
-  apply mirWpConverges_forRangeUp (LoopInv := loopInv) (lo := 0) (hi := 10) (init := ()) (step := fun _ _ _ _ => ())
-  · exact ⟨by omega, rfl⟩
-  · intro i a s' hLe hLt hInv
-    rcases hInv with ⟨hi10, h_eq⟩
-    subst h_eq
-    have h1 := bb1_converges_lt i hLt
-    have h2 := bb2_converges i
-    have h_wrap : wrapScalarBits (i + 1) 4294967296 = i + 1 := by
-      dsimp [wrapScalarBits]
-      cases hc : Nat.ble 4294967296 (i + 1)
-      · rfl
-      · have : 4294967296 ≤ i + 1 := Nat.le_of_ble_eq_true hc
-        omega
-    rw [h_wrap] at h2
-    have h_reach : MirReachState countTo10Body (countState 1 i) (countState 1 (i + 1)) := by
-      exact MirReachState.trans h1 h2
-    exact ⟨countState 1 (i + 1), h_reach, ⟨by omega, rfl⟩⟩
-  · intro i a s' hGe hInv
-    rcases hInv with ⟨hLe, h_eq⟩
-    subst h_eq
-    have h_eq10 : i = 10 := by omega
-    subst h_eq10
-    have h1 := bb1_converges_eq10
-    have h3 := bb3_converges 10
-    apply MirWpConverges.bind_reachState h1
-    exact h3
-
+theorem countTo10_terminates (mem : Memory) (h_callee : mem.activeCallee = none) (h_prot : mem.activeProtectors = []) (h_stack : mem.callStack = []) :
+    MirWpConverges countTo10Body (countStateMem 0 0 0 mem)
+      (fun out => ∃ mem', out = Outcome.normal (Value.scalar ⟨10, 4⟩, mem')) := by
+  have h0 := bb0_converges_mem mem h_callee h_prot
+  apply MirWpConverges.bind_reachState h0
+  have h_loop : MirWpConverges countTo10Body (countStateMem 1 0 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none })
+    (fun out => ∃ mem', out = Outcome.normal (Value.scalar ⟨10, 4⟩, mem')) := by
+    refine mirWpConverges_forRangeUp 0 10 () (fun _ _ _ _ => ()) countTo10Body
+      (fun i _ s => ∃ m, s = countStateMem 1 0 i m ∧ m.activeCallee = none ∧ m.activeProtectors = [] ∧ m.callStack = [])
+      (countStateMem 1 0 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none })
+      (fun out => ∃ mem', out = Outcome.normal (Value.scalar ⟨10, 4⟩, mem'))
+      (by decide)
+      ?_
+      ?_
+      ?_
+    · exact ⟨{ mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }, rfl, h_callee, h_prot, h_stack⟩
+    · intro i h_le h_lt _ s h_inv
+      rcases h_inv with ⟨m, h_eq, hm_callee, hm_prot, hm_stack⟩
+      subst h_eq
+      have h1 := bb1_converges_lt i m hm_callee (Nat.ne_of_lt h_lt)
+      have h2 := bb2_converges_mem i m hm_callee hm_prot
+      have h12 := MirReachState.trans h1 h2
+      have hi_mod : (i + 1) % 4294967296 = i + 1 := Nat.mod_eq_of_lt (by omega)
+      rw [hi_mod] at h12
+      exact MirStepsConverges.mono (post₂ := fun _ => False) (fun s' hs' => ⟨{ m with borrows := invalidateConflictingBorrows m.borrows 1 none }, hs', hm_callee, hm_prot, hm_stack⟩) (fun _ h => False.elim h) h12
+    · intro _ s h_inv
+      rcases h_inv with ⟨m, h_eq, hm_callee, hm_prot, hm_stack⟩
+      subst h_eq
+      have h1 := bb1_converges_eq10 m hm_callee
+      have h3 := bb3_converges_mem m hm_callee hm_prot hm_stack
+      apply MirWpConverges.bind_reachState h1
+      exact MirWpConverges.mono (fun out h => ⟨{ m with borrows := invalidateConflictingBorrows m.borrows 0 none }, h⟩) h3
+  exact h_loop
 
 end Anneal.MirLoops

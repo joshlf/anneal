@@ -1,22 +1,41 @@
-# Reproducing FF-1.2 Verification
+# Reproduction Guide for FF-1.2 Adversarial Check
 
-To verify the fuel-free MIR loop combinators (`MirWpConverges.join_of_branches`, `mirWpConverges_forRangeUp`, `mirWpConverges_whileRank`) and the concrete non-vacuity witness (`countTo10_terminates`), run the following commands:
+This guide explains how to compile and kernel-check the Fuel-Free `TransPlan` Join Points & Structural Loop Combinators.
+
+## Prerequisites
+
+1. Set up the Lean 4 environment:
+```bash
+export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+```
+
+## Step 1: Verify Zero Sorry Axioms in `MirLoops.lean`
+
+Run the following command to kernel-check `theory/Anneal/MirLoops.lean` explicitly:
 
 ```bash
-# 1. Ensure the Lean/Cargo environment is active
-export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+cd examples && anneal-lean-run --mode file --concurrency 2 -- lake env lean ../theory/Anneal/MirLoops.lean
+```
 
-# 2. Check for missing tasks and repository hygiene
-./ci/check_todo.sh
+You should see zero output, confirming there are no warnings or `sorry` axioms.
 
-# 3. Audit trusted files and verify the dependency graph (fast mode)
-python3 trusted/audit/check_trusted.py --fast
+## Step 2: Full Workspace Build
 
-# 4. Kernel-check all Lean 4 theorems in Anneal (including MirLoops.lean) 
-# Note: Uses hardware-matched anneal-lean-run wrapper
+Run a complete workspace build:
+
+```bash
 cd examples && anneal-lean-run --mode build --concurrency 2 -- lake build Anneal
 ```
 
-Upon successful completion, the `lake build` step will verify all definitions and theorems in `theory/Anneal/MirLoops.lean` without any `sorry` or `sorryAx` warnings.
+You should see `Build completed successfully`.
 
-**Audit Note**: This verification is part of the `[diversity-reduced]` adversarial execution.
+## Step 3: Run the Audit Scripts
+
+Run the scripts to check for `sorry` and ensure the trust boundary is intact:
+
+```bash
+./ci/check_todo.sh
+python3 trusted/audit/check_trusted.py --fast
+```
+
+Both should exit with code 0.
