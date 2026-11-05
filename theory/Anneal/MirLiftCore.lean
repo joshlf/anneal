@@ -246,7 +246,7 @@ theorem LiftStmtsTerminator.term_switchInt {body : CapturedMir} {bbIdx : BasicBl
   (h_end : stmtIdx = List.length stmts)
   (h_eval : evalPureOperand body env discr = .ok (.scalar sc) env')
   (h_target : target = lookupSwitchTarget sc.bits targets.branches targets.otherwise)
-  (h_next : wpMirExecSym fuel body (.running (PureState.toMachineState { bb := target, stmtIdx := 0, env := env' } emptyMemory)) (mirNormalPost (fun retVal _ => post retVal))) :
+  (h_next : LiftBlock body target env' post fuel) :
   LiftStmtsTerminator body bbIdx stmtIdx env stmts { kind := .switchInt discr targets, span := span } post (fuel + 1) := by
   dsimp [evalPureOperand] at h_eval
   dsimp [LiftStmtsTerminator, wpMirExecSym, stepMirExecSymTree, stepMirSymTree, PureState.toMachineState, emptyMemory]
@@ -269,7 +269,7 @@ theorem LiftStmtsTerminator.term_assert {body : CapturedMir} {bbIdx : BasicBlock
   (h_end : stmtIdx = List.length stmts)
   (h_eval : evalPureOperand body env cond = .ok (.scalar sc) env')
   (h_cond : sc.bits = (match expected with | true => 1 | false => 0))
-  (h_next : wpMirExecSym fuel body (.running (PureState.toMachineState { bb := target, stmtIdx := 0, env := env' } emptyMemory)) (mirNormalPost (fun retVal _ => post retVal))) :
+  (h_next : LiftBlock body target env' post fuel) :
   LiftStmtsTerminator body bbIdx stmtIdx env stmts { kind := .assert cond expected target unwind, span := span } post (fuel + 1) := by
   dsimp [evalPureOperand] at h_eval
   dsimp [LiftStmtsTerminator, wpMirExecSym, stepMirExecSymTree, stepMirSymTree, PureState.toMachineState, emptyMemory]

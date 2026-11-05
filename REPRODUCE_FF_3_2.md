@@ -17,4 +17,3 @@ anneal-lean-run --mode build --concurrency 2 -- lake build Anneal
 anneal-lean-run --mode file --concurrency 2 -- lake env lean ../theory/Anneal/MirLift.lean
 ```
 
-*Note for Pass A0*: The file `MirLift.lean` uses `sorry` to defer the complex cases (such as `.call` terminators causing `wpMirExecSym` goals and `target = lookupSwitchTarget` goals) for Agent B to fix in subsequent passes.
