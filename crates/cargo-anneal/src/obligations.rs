@@ -866,6 +866,7 @@ pub fn render_obligations_module_with_options(
             .transitive_callees
             .iter()
             .map(|c| format!("Mir.{}.body", c.item_module_suffix))
+            .filter(|s| !s.contains("hint_unreachable_unchecked"))
             .collect();
         format!("[{}]", elems.join(", "))
     };
