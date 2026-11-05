@@ -229,6 +229,84 @@ theorem iterMovedEntries_fixed {bbs : List BasicBlockData} {entries : List (List
   rw [← hfix]
   exact (stepMovedEntries_spec bbs entries dst hdst).2 src bb hbb htgt j hj
 
+/-- `iterMovedEntries` is monotone at every in-range block index `dst < bbs.length`. -/
+theorem iterMovedEntries_mono (fuel : Nat) (bbs : List BasicBlockData)
+    (entries : List (List Nat)) (dst : Nat) (hdst : dst < bbs.length) :
+    ∀ j ∈ entries.getD dst [], j ∈ (iterMovedEntries fuel bbs entries).getD dst [] := by
+  induction fuel generalizing entries with
+  | zero => intro j hj; exact hj
+  | succ n ih =>
+    intro j hj
+    simp only [iterMovedEntries]
+    split
+    · exact hj
+    · exact ih (stepMovedEntries bbs entries) j ((stepMovedEntries_spec bbs entries dst hdst).1 j hj)
+
+/-- Once `stepMovedEntries bbs entries = entries`, any further `iterMovedEntries`
+fuel leaves `entries` unchanged. -/
+theorem iterMovedEntries_eq_of_fixed (fuel : Nat) {bbs : List BasicBlockData}
+    {entries : List (List Nat)} (hfix : stepMovedEntries bbs entries = entries) :
+    iterMovedEntries fuel bbs entries = entries := by
+  cases fuel with
+  | zero => rfl
+  | succ n => simp [iterMovedEntries, hfix]
+
+/-- Every successor block target of a `terminatorOk` terminator is in range
+(`< nblocks`). -/
+theorem terminatorOk_targets_lt {decls : List LocalDecl} {nblocks : Nat}
+    {t : MirAst.Terminator} (ht : terminatorOk decls nblocks t = true) :
+    ∀ dst ∈ termTargets t, dst < nblocks := by
+  intro dst hdst
+  obtain ⟨kind, span⟩ := t
+  match kind, ht, hdst with
+  | .goto target, ht, hdst =>
+    have ht' : target < nblocks := of_decide_eq_true ht
+    have hdst' : dst = target := List.mem_singleton.mp hdst
+    exact hdst' ▸ ht'
+  | .switchInt discr targets, ht, hdst =>
+    simp only [terminatorOk, termTargets, List.mem_cons, List.mem_map, Prod.exists] at ht hdst
+    cases hit : switchIntType decls (copyOp discr) with
+    | none => simp [hit] at ht
+    | some it =>
+      simp only [hit, Bool.and_eq_true, decide_eq_true_eq, List.all_eq_true, Prod.forall] at ht
+      obtain ⟨⟨⟨_, hbr⟩, _⟩, ho⟩ := ht
+      rcases hdst with rfl | ⟨val, b, hmem, rfl⟩
+      · exact ho
+      · exact (hbr val b hmem).2
+  | .unreachable, _, hdst => simp [termTargets] at hdst
+  | .return_, _, hdst => simp [termTargets] at hdst
+  | .unwindResume, ht, _ => simp [terminatorOk] at ht
+  | .unwindTerminate, ht, _ => simp [terminatorOk] at ht
+  | .drop _ _ _, ht, _ => simp [terminatorOk] at ht
+  | .call _ _ _ _ _, ht, _ => simp [terminatorOk] at ht
+  | .tailCall _ _, ht, _ => simp [terminatorOk] at ht
+  | .assert _ _ _ _, ht, _ => simp [terminatorOk] at ht
+  | .inlineAsm _ _ _, ht, _ => simp [terminatorOk] at ht
+
+/-- When `iterMovedEntries` reaches a fixed point of `stepMovedEntries` at the
+canonical fuel bound `N * (L + 1)` on a CFG whose terminators satisfy
+`terminatorOk` and whose blocks satisfy `blockMovesOk`, `movesOk body = true`
+follows automatically because outgoing-edge closure holds at every fixed point. -/
+theorem movesOk_of_fixed {body : CapturedMir}
+    (hfix : stepMovedEntries body.basicBlocks
+        (iterMovedEntries (body.basicBlocks.length * (body.localDecls.length + 1)) body.basicBlocks []) =
+      iterMovedEntries (body.basicBlocks.length * (body.localDecls.length + 1)) body.basicBlocks [])
+    (hterm : ∀ bb ∈ body.basicBlocks,
+      terminatorOk body.localDecls body.basicBlocks.length bb.terminator = true)
+    (hblk : ∀ blk (bb : BasicBlockData), body.basicBlocks[blk]? = some bb →
+      blockMovesOk (movedAtEntry body blk) bb.statements bb.terminator = true) :
+    movesOk body = true := by
+  simp only [movesOk, List.all_eq_true, List.mem_range]
+  intro blk hlt
+  obtain ⟨bb, hbb⟩ : ∃ bb, body.basicBlocks[blk]? = some bb :=
+    ⟨_, List.getElem?_eq_getElem hlt⟩
+  simp only [hbb, Bool.and_eq_true, List.all_eq_true, List.contains_iff_mem]
+  refine ⟨hblk blk bb hbb, fun dst hdst j hj => ?_⟩
+  have hmem : bb ∈ body.basicBlocks := List.mem_of_getElem? hbb
+  have hdst_lt : dst < body.basicBlocks.length :=
+    terminatorOk_targets_lt (hterm bb hmem) dst hdst
+  exact iterMovedEntries_fixed hfix hbb hdst_lt hdst j hj
+
 theorem movedBefore_zero (body : CapturedMir) (blk : Nat) :
     movedBefore body blk 0 = movedAtEntry body blk := by
   unfold movedBefore

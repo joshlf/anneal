@@ -341,13 +341,17 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   of `_2`, and idempotent `StorageDead(_2)` on `n = 0` (`loopTempMove3_*`,
   `loopTempMove0_*`); `deadRead`, `deadAssign`, `deadDeinit`, and
   `deadPlaceMention` access a local (including projected `PlaceMention(_1.0)`)
-  after `StorageDead` (UB in both models); `moveReuse`, `crossBlockMoveReuse`,
-  `loopBackEdgeReuse`, and `projAssignMoveReuse` read a local after moving out
-  of it (rejected by `movesOk`, with `moveReuse7_*` and `loopBackEdgeReuse1_*`
-  showing the semantic disagreement); `unmarkedTempAssign`, `storageDeadRet`,
-  and `projectedDeinit` exercise the soundness boundaries of `mentionsOk`,
-  `storageDeadOk`, and projection-free `Deinit` with concrete semantic
-  disagreements; and `bm_allocate_and_deallocate_ub_cases` /
+  after `StorageDead` (UB in both models via `mirCall_ub`, `mirCall_steps_error`,
+  `mirCall_outcome`, and direct runs); `moveReuse`, `crossBlockMoveReuse`,
+  `loopBackEdgeReuse`, `projAssignMoveReuse`, `sameRvalueMoveReuse`, and
+  `moveRetPlace` read a local after moving out of it — across statements,
+  blocks, cyclic back-edges, projected assignments, operands of a single
+  rvalue (`readsOk`), and `Return` (`termReadsOk`) — rejected by `movesOk` with
+  concrete semantic disagreements (`moveReuse7_*`, `loopBackEdgeReuse1_*`,
+  `sameRvalueMoveReuse5_*`, `moveRetPlace_*`); `unmarkedTempAssign`,
+  `storageDeadRet`, and `projectedDeinit` exercise the soundness boundaries of
+  `mentionsOk`, `storageDeadOk`, and projection-free `Deinit` with concrete
+  semantic disagreements; and `bm_allocate_and_deallocate_ub_cases` /
   `evalStatement_deinit_ok_dead_and_misaligned` directly verify the UB and
   normal paths of `BM.allocate`, `BM.deallocate`, and `Statement::Deinit`.
 

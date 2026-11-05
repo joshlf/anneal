@@ -273,7 +273,7 @@ def anchors : List Anchor := [
     tokenSha256 := "fe931d69e3e3f52a21a11a90aeec596314d94d5fddc0fdd775b8f000375b74d8" },
   { interp := [``MiniRustSpec.Interp.BM.allocate, ``MiniRustSpec.Interp.BM.allocAddrOk,
       ``MiniRustSpec.Interp.allocCandidate, ``MiniRustSpec.Interp.firstFitAddr,
-      ``MiniRustSpec.Interp.BM.pickAddr],
+      ``MiniRustSpec.Interp.BM.pickAddr, ``MiniRustSpec.Interp.BM.deallocate],
     file := "spec/mem/basic.md", items := MiniRustSpec.Gen.Items.Mem.Basic.items,
     name := "impl_BasicMemory__allocate", line := 91,
     tokenSha256 := "7032eb855841319cd9c9d20afb80bdea2eebd06403d9762ec845116cfc138bf3" },

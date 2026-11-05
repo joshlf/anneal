@@ -241,6 +241,10 @@ open MiniRustSpec.Correspondence in
   unionLocals_mem
   stepMovedEntries_spec
   iterMovedEntries_fixed
+  iterMovedEntries_mono
+  iterMovedEntries_eq_of_fixed
+  terminatorOk_targets_lt
+  movesOk_of_fixed
   blockMovesOk_spec
   movesOk_spec
   readsOk_mono
@@ -702,10 +706,12 @@ open MiniRustSpec.Correspondence.Witness in
   ctx0_ok_crossBlockMove
   crossBlockMove20_anneal_ret
   crossBlockMove20_noUB
+  crossBlockMove20_progress
   crossBlockMove20_minirust_ret_from_start
   crossBlockMove20_minirust_direct
   crossBlockMoveOv_anneal_ret
   crossBlockMoveOv_noUB
+  crossBlockMoveOv_progress
   crossBlockMoveOv_minirust_ret_from_start
   crossBlockMoveOv_minirust_direct
   crossBlockMoveReuse_movesOk
@@ -728,6 +734,7 @@ open MiniRustSpec.Correspondence.Witness in
   loopTempMove3_minirust_direct
   loopTempMove0_anneal_ret
   loopTempMove0_noUB
+  loopTempMove0_progress
   loopTempMove0_minirust_ret_from_start
   loopTempMove0_minirust_direct
   loopBackEdgeReuse_movesOk
@@ -739,17 +746,26 @@ open MiniRustSpec.Correspondence.Witness in
   deadAssign_anneal_ub
   deadAssign_minirust_ub_from_start
   deadAssign_minirust_direct
+  deadAssign_steps4_ub
+  deadAssign_converse_error
+  deadAssign_outcome
   deadDeinit_inFragment
   deadDeinit_translate
   deadDeinit_anneal_ub
   deadDeinit_minirust_ub_from_start
   deadDeinit_minirust_direct
+  deadDeinit_steps5_ub
+  deadDeinit_converse_error
+  deadDeinit_outcome
   ctx0_ok_u32_tuple
   deadPlaceMention_inFragment
   deadPlaceMention_translate
   deadPlaceMention_anneal_ub
   deadPlaceMention_minirust_ub_from_start
   deadPlaceMention_minirust_direct
+  deadPlaceMention_steps4_ub
+  deadPlaceMention_converse_error
+  deadPlaceMention_outcome
   storageDeadRet_rejected
   storageDeadRet_translate
   storageDeadRet_anneal_ub
@@ -759,6 +775,14 @@ open MiniRustSpec.Correspondence.Witness in
   projectedDeinit_anneal_ret
   projectedDeinit_minirust_ub
   projAssignMoveReuse_movesOk
+  sameRvalueMoveReuse_movesOk
+  sameRvalueMoveReuse_translate
+  sameRvalueMoveReuse5_anneal_ub
+  sameRvalueMoveReuse5_minirust_direct
+  moveRetPlace_movesOk
+  moveRetPlace_translate
+  moveRetPlace_anneal_ub
+  moveRetPlace_minirust_direct
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -864,6 +888,10 @@ open MiniRustSpec.Correspondence in
   unionLocals_mem
   stepMovedEntries_spec
   iterMovedEntries_fixed
+  iterMovedEntries_mono
+  iterMovedEntries_eq_of_fixed
+  terminatorOk_targets_lt
+  movesOk_of_fixed
   blockMovesOk_spec
   movesOk_spec
   readsOk_mono
@@ -1166,10 +1194,12 @@ open MiniRustSpec.Correspondence.Witness in
   ctx0_ok_crossBlockMove
   crossBlockMove20_anneal_ret
   crossBlockMove20_noUB
+  crossBlockMove20_progress
   crossBlockMove20_minirust_ret_from_start
   crossBlockMove20_minirust_direct
   crossBlockMoveOv_anneal_ret
   crossBlockMoveOv_noUB
+  crossBlockMoveOv_progress
   crossBlockMoveOv_minirust_ret_from_start
   crossBlockMoveOv_minirust_direct
   crossBlockMoveReuse_movesOk
@@ -1192,6 +1222,7 @@ open MiniRustSpec.Correspondence.Witness in
   loopTempMove3_minirust_direct
   loopTempMove0_anneal_ret
   loopTempMove0_noUB
+  loopTempMove0_progress
   loopTempMove0_minirust_ret_from_start
   loopTempMove0_minirust_direct
   loopBackEdgeReuse_movesOk
@@ -1203,17 +1234,26 @@ open MiniRustSpec.Correspondence.Witness in
   deadAssign_anneal_ub
   deadAssign_minirust_ub_from_start
   deadAssign_minirust_direct
+  deadAssign_steps4_ub
+  deadAssign_converse_error
+  deadAssign_outcome
   deadDeinit_inFragment
   deadDeinit_translate
   deadDeinit_anneal_ub
   deadDeinit_minirust_ub_from_start
   deadDeinit_minirust_direct
+  deadDeinit_steps5_ub
+  deadDeinit_converse_error
+  deadDeinit_outcome
   ctx0_ok_u32_tuple
   deadPlaceMention_inFragment
   deadPlaceMention_translate
   deadPlaceMention_anneal_ub
   deadPlaceMention_minirust_ub_from_start
   deadPlaceMention_minirust_direct
+  deadPlaceMention_steps4_ub
+  deadPlaceMention_converse_error
+  deadPlaceMention_outcome
   storageDeadRet_rejected
   storageDeadRet_translate
   storageDeadRet_anneal_ub
@@ -1223,6 +1263,14 @@ open MiniRustSpec.Correspondence.Witness in
   projectedDeinit_anneal_ret
   projectedDeinit_minirust_ub
   projAssignMoveReuse_movesOk
+  sameRvalueMoveReuse_movesOk
+  sameRvalueMoveReuse_translate
+  sameRvalueMoveReuse5_anneal_ub
+  sameRvalueMoveReuse5_minirust_direct
+  moveRetPlace_movesOk
+  moveRetPlace_translate
+  moveRetPlace_anneal_ub
+  moveRetPlace_minirust_direct
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

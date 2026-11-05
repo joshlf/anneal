@@ -1466,7 +1466,9 @@ fn with_overflow_tuple_and_field_quotations_are_pinned() {
 #[test]
 fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
     let corpus = corpus();
+    let valid_paths: BTreeSet<String> = corpus.iter().map(|(p, _)| p.clone()).collect();
     let stmts = "spec/lang/step/statements.md";
+    let terms = "spec/lang/step/terminators.md";
     let mach = "spec/lang/machine.md";
     let basic = "spec/mem/basic.md";
     let conc = "spec/mem/concurrent.md";
@@ -1524,10 +1526,42 @@ fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
             "MiniRustSpec/Interp.lean",
         ),
         (
+            basic,
+            "let Some((id, prov_extra)) = ptr.provenance else { \
+                 throw_ub!(\"deallocating invalid pointer\") \
+             }; \
+             let mut allocation = self.allocations[id.0]; \
+             if !allocation.live { throw_ub!(\"double-free\"); } \
+             if ptr.addr != allocation.addr { \
+                 throw_ub!(\"deallocating with pointer not to the beginning of its allocation\"); \
+             } \
+             if kind != allocation.kind { \
+                 throw_ub!(\"deallocating {:?} memory with {:?} deallocation operation\", allocation.kind, kind); \
+             } \
+             if size != allocation.size() { \
+                 throw_ub!(\"deallocating with incorrect size information\"); \
+             } \
+             if align != allocation.align { \
+                 throw_ub!(\"deallocating with incorrect alignment information\"); \
+             } \
+             handle_extra(&mut allocation.extra, prov_extra)?; \
+             allocation.live = false; \
+             self.allocations.set(id.0, allocation);",
+            "if !allocation.live { ret(()); }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
             conc,
             "pub fn allocate(&mut self, kind: AllocationKind, size: Size, align: Align) -> NdResult<ThinPointer<M::Provenance>> { \
              self.memory.allocate(kind, size, align) }",
             "pub fn allocate(&mut self, kind: AllocationKind, size: Size, align: Align) -> Result<ThinPointer<M::Provenance>>",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            conc,
+            "pub fn deallocate(&mut self, ptr: ThinPointer<M::Provenance>, kind: AllocationKind, size: Size, align: Align) -> Result { \
+             self.memory.deallocate(ptr, kind, size, align) }",
+            "self.memory.deallocate(ptr, AllocationKind::Stack, size, align)",
             "MiniRustSpec/Interp.lean",
         ),
         (
@@ -1592,6 +1626,16 @@ fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
             "MiniRustSpec/Interp.lean",
         ),
         (
+            terms,
+            "while let Some(local) = frame.locals.keys().next() { \
+                 frame.storage_dead(&mut self.mem, local)?; \
+             }",
+            "while let Some(local) = frame.locals.keys().next() { \
+                 frame.storage_live(&mut self.mem, local)?; \
+             }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
             rvalue,
             "smir::Operand::Copy(place) => \
              ValueExpr::Load { source: GcCow::new(self.translate_place_smir(place, span)) }, \
@@ -1637,8 +1681,9 @@ fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
             "MiniRustSpec/Correspondence/Translate.lean",
         ),
     ];
-    assert_eq!(cases.len(), 16, "expected 16 pinned MR-1.3 quotations");
+    assert_eq!(cases.len(), 19, "expected 19 pinned MR-1.3 quotations");
 
+    let mr13_files = [target, basic, conc, mach, stmts, terms, wf, rvalue, bb, func];
     let lean_root = minirust_dir().join("lean");
     for (file, genuine, tampered, lean_file) in cases {
         assert_eq!(
@@ -1650,18 +1695,39 @@ fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
             missing_piece_in(&corpus, Some(file), tampered).is_some(),
             "tampered quotation unexpectedly found in `{file}`: {tampered}"
         );
-        let other = if *file == stmts { basic } else { stmts };
-        assert!(
-            missing_piece_in(&corpus, Some(other), genuine).is_some(),
-            "quotation from `{file}` also matches `{other}`: {genuine}"
-        );
+        for other in mr13_files {
+            if other != *file {
+                assert!(
+                    missing_piece_in(&corpus, Some(other), genuine).is_some(),
+                    "quotation from `{file}` also matches `{other}`: {genuine}"
+                );
+            }
+        }
         let lean = std::fs::read_to_string(lean_root.join(lean_file)).unwrap();
-        let lean_squashed = squash(&lean.replace("\\\"", "\"").replace("\n>", "\n"));
-        let first_piece = squash(genuine.split("..").next().unwrap());
-        let probe: String = first_piece.chars().take(40).collect();
+        let extracted = extract_quotes(&lean, &valid_paths)
+            .unwrap_or_else(|e| panic!("extract_quotes failed on `{lean_file}`: {e:?}"));
+        let pieces: Vec<String> = strip_line_comments(genuine)
+            .split("..")
+            .map(squash)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let matched_in_lean = extracted.iter().any(|q| {
+            if q.cited_file != *file {
+                return false;
+            }
+            let q_squashed = squash(&strip_line_comments(&q.text));
+            let mut pos = 0usize;
+            for piece in &pieces {
+                let Some(j) = q_squashed[pos..].find(piece.as_str()) else {
+                    return false;
+                };
+                pos += j + piece.len();
+            }
+            true
+        });
         assert!(
-            lean_squashed.contains(&probe),
-            "`{lean_file}` no longer quotes `{probe}`"
+            matched_in_lean,
+            "`{lean_file}` has no extracted block quote citing `{file}` that contains all pieces of `{genuine}`"
         );
     }
 }

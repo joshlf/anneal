@@ -4895,6 +4895,17 @@ theorem crossBlockMove20_anneal_ret :
 theorem crossBlockMove20_noUB : MirNoUBTree (mirCallTree crossBlockMove [.scalar ⟨20, 4⟩]) :=
   runA_noUB crossBlockMove 30 _ _ _ rfl
 
+theorem crossBlockMove20_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (initLen crossBlockMove + n) crossBlockMove20MInit = .ok m' ∧
+      StateRel crossBlockMove crossBlockMoveFn ctx0 s' m' ∧
+      Reaches (mirCallTree crossBlockMove [.scalar ⟨20, 4⟩]) tr (mirTree crossBlockMove s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen crossBlockMove + n ∧
+      Interp.steps k crossBlockMove20MInit = .ok mRet ∧
+      ReturnRel crossBlockMove ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree crossBlockMove [.scalar ⟨20, 4⟩]) tr (.normal (v, mem))) :=
+  mirCall_progress crossBlockMove_inFragment crossBlockMove_translate ctx0 ctx0_ok_crossBlockMove
+    [.scalar ⟨20, 4⟩] (by decide) crossBlockMove20MInit rfl rfl rfl crossBlockMove20_noUB n
+
 theorem crossBlockMove20_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n crossBlockMove20MInit = .ok m' ∧
       m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 35 } ∧
@@ -4933,6 +4944,17 @@ theorem crossBlockMoveOv_anneal_ret :
 theorem crossBlockMoveOv_noUB :
     MirNoUBTree (mirCallTree crossBlockMove [.scalar ⟨4294967290, 4⟩]) :=
   runA_noUB crossBlockMove 30 _ _ _ rfl
+
+theorem crossBlockMoveOv_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (initLen crossBlockMove + n) crossBlockMoveOvMInit = .ok m' ∧
+      StateRel crossBlockMove crossBlockMoveFn ctx0 s' m' ∧
+      Reaches (mirCallTree crossBlockMove [.scalar ⟨4294967290, 4⟩]) tr (mirTree crossBlockMove s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen crossBlockMove + n ∧
+      Interp.steps k crossBlockMoveOvMInit = .ok mRet ∧
+      ReturnRel crossBlockMove ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree crossBlockMove [.scalar ⟨4294967290, 4⟩]) tr (.normal (v, mem))) :=
+  mirCall_progress crossBlockMove_inFragment crossBlockMove_translate ctx0 ctx0_ok_crossBlockMove
+    [.scalar ⟨4294967290, 4⟩] (by decide) crossBlockMoveOvMInit rfl rfl rfl crossBlockMoveOv_noUB n
 
 theorem crossBlockMoveOv_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n crossBlockMoveOvMInit = .ok m' ∧
@@ -5277,6 +5299,17 @@ theorem loopTempMove0_anneal_ret :
 theorem loopTempMove0_noUB : MirNoUBTree (mirCallTree loopTempMove [.scalar ⟨0, 4⟩]) :=
   runA_noUB loopTempMove 20 _ _ _ rfl
 
+theorem loopTempMove0_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (initLen loopTempMove + n) loopTempMove0MInit = .ok m' ∧
+      StateRel loopTempMove loopTempMoveFn ctx0 s' m' ∧
+      Reaches (mirCallTree loopTempMove [.scalar ⟨0, 4⟩]) tr (mirTree loopTempMove s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen loopTempMove + n ∧
+      Interp.steps k loopTempMove0MInit = .ok mRet ∧
+      ReturnRel loopTempMove ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree loopTempMove [.scalar ⟨0, 4⟩]) tr (.normal (v, mem))) :=
+  mirCall_progress loopTempMove_inFragment loopTempMove_translate ctx0 ctx0_ok_loopTempMove
+    [.scalar ⟨0, 4⟩] (by decide) loopTempMove0MInit rfl rfl rfl loopTempMove0_noUB n
+
 theorem loopTempMove0_minirust_ret_from_start :
     ∃ (n : Nat) (m' : Mach), Interp.steps n loopTempMove0MInit = .ok m' ∧
       m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 0 } ∧
@@ -5435,6 +5468,36 @@ theorem deadAssign_minirust_direct :
       | _ => none) = some "access to a dead local" := by
   decide +kernel
 
+theorem deadAssign_steps4_ub :
+    Interp.steps 4 deadAssignMInit = .error (.ub "access to a dead local") := by
+  have h := deadAssign_minirust_direct
+  revert h
+  cases Interp.steps 4 deadAssignMInit with
+  | ok _ => simp
+  | error e => cases e <;> simp
+
+theorem deadAssign_converse_error :
+    (∃ msg, Stop.ub "access to a dead local" = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree deadAssign []) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 4 ∧ Interp.steps k deadAssignMInit = .ok mRet ∧
+      ReturnRel deadAssign ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree deadAssign []) tr (.normal (v, mem))) :=
+  mirCall_steps_error deadAssign_inFragment deadAssign_translate ctx0 (ctx0_ok2 rfl) []
+    (by decide) deadAssignMInit rfl rfl rfl deadAssign_steps4_ub
+
+theorem deadAssign_outcome (n : Nat) :
+    (∃ s' m' tr, Interp.steps (initLen deadAssign + n) deadAssignMInit = .ok m' ∧
+      StateRel deadAssign deadAssignFn ctx0 s' m' ∧
+      Reaches (mirCallTree deadAssign []) tr (mirTree deadAssign s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen deadAssign + n ∧
+      Interp.steps k deadAssignMInit = .ok mRet ∧
+      ReturnRel deadAssign ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree deadAssign []) tr (.normal (v, mem))) ∨
+    (∃ msg, Interp.steps (initLen deadAssign + n) deadAssignMInit = .error (.ub msg) ∧
+      ∃ tr u, Reaches (mirCallTree deadAssign []) tr u ∧ FaultNow u) :=
+  mirCall_outcome deadAssign_inFragment deadAssign_translate ctx0 (ctx0_ok2 rfl) []
+    (by decide) deadAssignMInit rfl rfl rfl n
+
 /-- `Deinit(_1)` after `StorageDead(_1)` raises UB in both models. -/
 def deadDeinit : CapturedMir where
   defPath := "witness::dead_deinit"
@@ -5489,6 +5552,36 @@ theorem deadDeinit_minirust_direct :
       | .error (.ub msg) => some msg
       | _ => none) = some "access to a dead local" := by
   decide +kernel
+
+theorem deadDeinit_steps5_ub :
+    Interp.steps 5 deadDeinitMInit = .error (.ub "access to a dead local") := by
+  have h := deadDeinit_minirust_direct
+  revert h
+  cases Interp.steps 5 deadDeinitMInit with
+  | ok _ => simp
+  | error e => cases e <;> simp
+
+theorem deadDeinit_converse_error :
+    (∃ msg, Stop.ub "access to a dead local" = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree deadDeinit []) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 5 ∧ Interp.steps k deadDeinitMInit = .ok mRet ∧
+      ReturnRel deadDeinit ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree deadDeinit []) tr (.normal (v, mem))) :=
+  mirCall_steps_error deadDeinit_inFragment deadDeinit_translate ctx0 (ctx0_ok2 rfl) []
+    (by decide) deadDeinitMInit rfl rfl rfl deadDeinit_steps5_ub
+
+theorem deadDeinit_outcome (n : Nat) :
+    (∃ s' m' tr, Interp.steps (initLen deadDeinit + n) deadDeinitMInit = .ok m' ∧
+      StateRel deadDeinit deadDeinitFn ctx0 s' m' ∧
+      Reaches (mirCallTree deadDeinit []) tr (mirTree deadDeinit s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen deadDeinit + n ∧
+      Interp.steps k deadDeinitMInit = .ok mRet ∧
+      ReturnRel deadDeinit ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree deadDeinit []) tr (.normal (v, mem))) ∨
+    (∃ msg, Interp.steps (initLen deadDeinit + n) deadDeinitMInit = .error (.ub msg) ∧
+      ∃ tr u, Reaches (mirCallTree deadDeinit []) tr u ∧ FaultNow u) :=
+  mirCall_outcome deadDeinit_inFragment deadDeinit_translate ctx0 (ctx0_ok2 rfl) []
+    (by decide) deadDeinitMInit rfl rfl rfl n
 
 /-- Projected `PlaceMention(_1.0)` on `_1: (u32, bool)` after `StorageDead(_1)`
 raises UB in both models. -/
@@ -5561,7 +5654,38 @@ theorem deadPlaceMention_minirust_direct :
       | _ => none) = some "access to a dead local" := by
   decide +kernel
 
-/-! ### Boundary counterexamples (`storageDeadOk`, `Deinit`, `stmtMoved`) -/
+theorem deadPlaceMention_steps4_ub :
+    Interp.steps 4 deadPlaceMentionMInit = .error (.ub "access to a dead local") := by
+  have h := deadPlaceMention_minirust_direct
+  revert h
+  cases Interp.steps 4 deadPlaceMentionMInit with
+  | ok _ => simp
+  | error e => cases e <;> simp
+
+theorem deadPlaceMention_converse_error :
+    (∃ msg, Stop.ub "access to a dead local" = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree deadPlaceMention []) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 4 ∧ Interp.steps k deadPlaceMentionMInit = .ok mRet ∧
+      ReturnRel deadPlaceMention ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree deadPlaceMention []) tr (.normal (v, mem))) :=
+  mirCall_steps_error deadPlaceMention_inFragment deadPlaceMention_translate ctx0
+    (ctx0_ok_u32_tuple rfl) [] (by decide) deadPlaceMentionMInit rfl rfl rfl
+    deadPlaceMention_steps4_ub
+
+theorem deadPlaceMention_outcome (n : Nat) :
+    (∃ s' m' tr, Interp.steps (initLen deadPlaceMention + n) deadPlaceMentionMInit = .ok m' ∧
+      StateRel deadPlaceMention deadPlaceMentionFn ctx0 s' m' ∧
+      Reaches (mirCallTree deadPlaceMention []) tr (mirTree deadPlaceMention s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen deadPlaceMention + n ∧
+      Interp.steps k deadPlaceMentionMInit = .ok mRet ∧
+      ReturnRel deadPlaceMention ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree deadPlaceMention []) tr (.normal (v, mem))) ∨
+    (∃ msg, Interp.steps (initLen deadPlaceMention + n) deadPlaceMentionMInit = .error (.ub msg) ∧
+      ∃ tr u, Reaches (mirCallTree deadPlaceMention []) tr u ∧ FaultNow u) :=
+  mirCall_outcome deadPlaceMention_inFragment deadPlaceMention_translate ctx0
+    (ctx0_ok_u32_tuple rfl) [] (by decide) deadPlaceMentionMInit rfl rfl rfl n
+
+/-! ### Boundary counterexamples (`storageDeadOk`, `Deinit`, `stmtMoved`, `readsOk`, `termReadsOk`) -/
 
 /-- `StorageDead(_0); return` is ill-formed in MiniRust (`storageDeadOk` fails):
 Anneal faults with `.ub` on returning a dead `_0`, whereas MiniRust's
@@ -5686,5 +5810,119 @@ def projAssignMoveReuse : CapturedMir where
 
 theorem projAssignMoveReuse_movesOk :
     movesOk projAssignMoveReuse = false ∧ inFragment projAssignMoveReuse = false := by decide
+
+/-- `_0 = BinaryOp(Add, move _1, copy _1); return` for `fn(u32) -> u32`:
+`readsOk` threads `moveOut` left-to-right across the operands of a single
+rvalue (`readsOk (moveOut mo op) ops`), so moving `_1` in the first operand and
+reading `_1` in the second operand of the same statement is rejected by
+`movesOk`. On input `5`, Anneal faults with `.ub` on the second operand
+`copy _1`, whereas MiniRust loads `_1` twice and returns `10`. -/
+def sameRvalueMoveReuse : CapturedMir where
+  defPath := "witness::same_rvalue_move_reuse"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .add (.move (local_ 1)) (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem sameRvalueMoveReuse_movesOk :
+    readsOk [] (rvOperands (.binaryOp .add (.move (local_ 1)) (.copy (local_ 1)))) = false ∧
+    movesOk sameRvalueMoveReuse = false ∧
+    inFragment sameRvalueMoveReuse = false := by decide
+
+def sameRvalueMoveReuseFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 1))) (.Load (.Local (localName 1))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem sameRvalueMoveReuse_translate :
+    translateFn sameRvalueMoveReuse = some sameRvalueMoveReuseFn := rfl
+
+def sameRvalueMoveReuse5S0 : MachineState := initMachineState sameRvalueMoveReuse [.scalar ⟨5, 4⟩]
+
+theorem sameRvalueMoveReuse5_anneal_ub :
+    ∃ tr u, Reaches (mirTree sameRvalueMoveReuse sameRvalueMoveReuse5S0) tr u ∧ FaultNow u :=
+  faultsA_sound sameRvalueMoveReuse 5 _ (by decide)
+
+theorem sameRvalueMoveReuse5_minirust_direct :
+    (Interp.steps 3 (machine sameRvalueMoveReuse sameRvalueMoveReuseFn
+        sameRvalueMoveReuse5S0.frame.locals sameRvalueMoveReuseFn.start)).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 10 }, [1]) := by
+  decide +kernel
+
+/-- `_0 = const 10_u32; StorageLive(_1); _1 = Use(move _0); StorageDead(_1); return`
+for `fn() -> u32`: every statement satisfies `stmtReadsOk`, but `termReadsOk`
+on `.return_` requires `!mo.contains 0` because `Return` reads the return place
+`_0`. Anneal de-initializes `_0` at `move _0` and faults with `.ub` at
+`return`, whereas MiniRust's `evalReturn` loads the still-present bytes of `_0`
+and returns `10`. -/
+def moveRetPlace : CapturedMir where
+  defPath := "witness::move_ret_place"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (constU32 10))),
+        mkStmt (.storageLive 1),
+        mkStmt (.assign (local_ 1) (.use (.move (local_ 0)))),
+        mkStmt (.storageDead 1)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 0
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem moveRetPlace_movesOk :
+    termReadsOk [0] (mkTerm .return_) = false ∧
+    movesOk moveRetPlace = false ∧
+    inFragment moveRetPlace = false := by decide
+
+def moveRetPlaceFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 0)) (.Constant (.Int 10) (.Int u32)),
+      .StorageLive (localName 1),
+      .Assign (.Local (localName 1)) (.Load (.Local (localName 0))),
+      .StorageDead (localName 1)],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem moveRetPlace_translate : translateFn moveRetPlace = some moveRetPlaceFn := rfl
+
+def moveRetPlaceS0 : MachineState := initMachineState moveRetPlace []
+
+theorem moveRetPlace_anneal_ub :
+    ∃ tr u, Reaches (mirTree moveRetPlace moveRetPlaceS0) tr u ∧ FaultNow u :=
+  faultsA_sound moveRetPlace 10 _ (by decide)
+
+theorem moveRetPlace_minirust_direct :
+    (Interp.steps 6 (machine moveRetPlace moveRetPlaceFn
+        moveRetPlaceS0.frame.locals moveRetPlaceFn.start)).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 10 }, [1]) := by
+  decide +kernel
 
 end MiniRustSpec.Correspondence.Witness

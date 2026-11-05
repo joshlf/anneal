@@ -1323,14 +1323,23 @@ def BM.signed_dereferenceable (mem : BM) (ptr : Ptr) (len : Int) : Interp Unit :
     let beginPtr : Ptr := { ptr with addr := ptr.addr + len }
     BM.dereferenceable mem beginPtr ⟨(-len).toNat⟩
 
-/-- `BasicMemory::deallocate` (with the trivial `handle_extra`):
+/-- `BasicMemory::deallocate` (`spec/mem/basic.md`, with the trivial
+`handle_extra` and a fixed message string for the `AllocationKind` check):
 > "let Some((id, prov_extra)) = ptr.provenance else { throw_ub!(\"deallocating invalid pointer\") };
 >  let mut allocation = self.allocations[id.0];
 >  if !allocation.live { throw_ub!(\"double-free\"); }
->  if ptr.addr != allocation.addr { throw_ub!(..); }
->  if kind != allocation.kind { throw_ub!(..); }
->  if size != allocation.size() { throw_ub!(..); }
->  if align != allocation.align { throw_ub!(..); }
+>  if ptr.addr != allocation.addr {
+>      throw_ub!(\"deallocating with pointer not to the beginning of its allocation\");
+>  }
+>  if kind != allocation.kind {
+>      throw_ub!(\"deallocating {:?} memory with {:?} deallocation operation\", allocation.kind, kind);
+>  }
+>  if size != allocation.size() {
+>      throw_ub!(\"deallocating with incorrect size information\");
+>  }
+>  if align != allocation.align {
+>      throw_ub!(\"deallocating with incorrect alignment information\");
+>  }
 >  handle_extra(&mut allocation.extra, prov_extra)?;
 >  allocation.live = false;
 >  self.allocations.set(id.0, allocation);" -/

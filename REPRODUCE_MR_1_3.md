@@ -29,16 +29,20 @@ as a pass.
     (`BM.allocAddrOk`, transcribed test by test). When no candidate passes,
     `BM.allocate` reports `Stop.unsupported` instead of inventing an address.
 - **Anchors** (`Anchors.lean`): 58 anchors (up from 55), with the new
-  `allocate` helpers listed in the `impl_BasicMemory__allocate` anchor.
+  `allocate` helpers and `BM.deallocate` listed in the
+  `impl_BasicMemory__allocate` anchor.
 - **Quotation checks** (`crates/anneal-minirust-gen/tests/quotes.rs`):
-  `storage_live_dead_deinit_move_and_init_block_quotations_are_pinned` pins 16
+  `storage_live_dead_deinit_move_and_init_block_quotations_are_pinned` pins 19
   upstream quotations (`valid_size`, `overlaps`, `allocate` and its `pick`
-  predicate, `try_mutate_cur_frame`, `deinit`, `Deinit`, `storage_live`,
-  `storage_dead`, the `StorageLive`/`StorageDead` statements, `minimize`'s
-  `Move` operand and storage-statement translations, its init block, and
-  `spec/lang/well-formed.md`'s `Statement::StorageLive` and
-  `Statement::StorageDead` well-formedness rules), rejects tampered variants,
-  and rejects file misattribution.
+  predicate, `BM.deallocate` and all six of its UB checks, `CM.deallocate`,
+  `try_mutate_cur_frame`, `deinit`, `Deinit`, `storage_live`, `storage_dead`,
+  the `StorageLive`/`StorageDead` statements, `deallocAll`'s `Return` teardown
+  loop, `minimize`'s `Move` operand and storage-statement translations, its
+  init block, and `spec/lang/well-formed.md`'s `Statement::StorageLive` and
+  `Statement::StorageDead` well-formedness rules), verifies every quotation on
+  both the vendored upstream side and the Lean side via `extract_quotes`,
+  rejects tampered variants, and rejects file misattribution across all 10
+  `MR-1.3` upstream files.
 - **Translation and fragment** (`Correspondence/Translate.lean`):
   - Bodies may declare any number of temporaries (fewer than `2^31` locals).
   - `StorageLive`/`StorageDead` translate to MiniRust's statements;
@@ -86,8 +90,10 @@ as a pass.
     `StorageLive`, `StorageDead`, and `Deinit`.
   - `step_correspondence` (`mirSimStep`) now covers every statement and
     terminator of the extended fragment, including the dead-local UB cases,
-    backed by `stepMovedEntries_spec` and `iterMovedEntries_fixed` for the
-    monotone forward CFG dataflow `movedAtEntry`; `step_start` runs the init
+    backed by `stepMovedEntries_spec`, `iterMovedEntries_fixed`,
+    `iterMovedEntries_mono`, `iterMovedEntries_eq_of_fixed`,
+    `terminatorOk_targets_lt`, and `movesOk_of_fixed` for the monotone forward
+    CFG dataflow `movedAtEntry`; `step_start` runs the init
     block in `initLen body` MiniRust steps; all `Run.lean` theorems
     (`mirSimRun`) are re-proved, with the `*_from_start` step counts
     `initLen body + n`.
@@ -107,23 +113,25 @@ as a pass.
     before moving them in later blocks, calling `StorageLive` on already-live
     locals without an intervening `StorageDead`, `Deinit` of a `(u32, bool)`
     tuple local, and idempotent `StorageDead` on an already-dead local
-    (`crossBlockMove20_*`, `crossBlockMoveOv_*`).
+    (`crossBlockMove20_*`, `crossBlockMoveOv_*`, including `mirCall_progress`).
   - `loopTempMove`: a cyclic 4-block loop CFG with two heterogeneous unmarked
     temporaries (`alwaysStorageLiveLocals = [4, 5]`, `initLen = 3`), multi-pass
     back-edge fixpoint convergence of `iterMovedEntries`
     (`loopTempMove_movedAtEntry_multiPass`), per-iteration `StorageLive(_3)`,
     `SwitchInt(move _3)`, `Deinit(_3)`, and `StorageDead(_3)`, live
     re-allocation of `_2`, and idempotent `StorageDead(_2)` on `n = 0`
-    (`loopTempMove3_*`, `loopTempMove0_*`).
+    (`loopTempMove3_*`, `loopTempMove0_*`, including `mirCall_progress`).
   - `deadRead`, `deadAssign`, `deadDeinit`, and `deadPlaceMention`: reading,
     assigning, de-initializing, or mentioning (including projected `_1.0`) a
     temporary after `StorageDead` is UB in both models (`mirCall_ub`,
     `mirCall_steps_error`, `mirCall_outcome`, and direct runs).
-  - `moveReuse`, `crossBlockMoveReuse`, `loopBackEdgeReuse`, and
-    `projAssignMoveReuse`: intra-block, cross-block, cyclic back-edge, and
-    projected-assignment bodies that read a local after moving out of it;
-    `movesOk` rejects all four, and the models disagree on `moveReuse(7)` and
-    `loopBackEdgeReuse(1)`.
+  - `moveReuse`, `crossBlockMoveReuse`, `loopBackEdgeReuse`,
+    `projAssignMoveReuse`, `sameRvalueMoveReuse`, and `moveRetPlace`:
+    intra-block, cross-block, cyclic back-edge, projected-assignment,
+    intra-rvalue (`readsOk`), and `Return`-terminator (`termReadsOk`) bodies
+    that read a local after moving out of it; `movesOk` rejects all six, and
+    the models disagree on `moveReuse(7)`, `loopBackEdgeReuse(1)`,
+    `sameRvalueMoveReuse(5)`, and `moveRetPlace`.
   - `unmarkedTempAssign`, `storageDeadRet`, and `projectedDeinit`: bodies
     exercising the soundness boundaries of `mentionsOk`, `storageDeadOk`, and
     projection-free `Deinit`, each accompanied by concrete semantic
@@ -177,9 +185,9 @@ Pass: `Build completed successfully`, with:
 
 ```text
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
-[SIMULATION-AUDIT] decls=155 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
-[WITNESS-AUDIT] decls=295 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-MiniRustSpec.Audit: exhaustively verified standard axioms for 10117 declarations across all MiniRustSpec.* modules
+[SIMULATION-AUDIT] decls=159 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
+[WITNESS-AUDIT] decls=315 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+MiniRustSpec.Audit: exhaustively verified standard axioms for 10164 declarations across all MiniRustSpec.* modules
 ```
 
 (`lake` prints already-built modules without re-running them; to see the audit
@@ -200,6 +208,7 @@ first.)
   converging across cyclic loop back-edges in multiple passes.
 - `moveReuse_not_inFragment`, `crossBlockMoveReuse_movesOk`,
   `loopBackEdgeReuse_movesOk`, `projAssignMoveReuse_movesOk`,
+  `sameRvalueMoveReuse_movesOk`, `moveRetPlace_movesOk`,
   `unmarkedTempAssign_rejected`, `storageDeadRet_rejected`, and
   `projectedDeinit_rejected` are proved by `decide`, so none of the fragment's
   side-conditions is vacuous.
