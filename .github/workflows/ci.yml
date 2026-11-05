@@ -172,6 +172,8 @@ jobs:
           ANNEAL_ALLOW_MISSING_MIRI: "1"
         run: |
           cargo test -p cargo-anneal --test end_to_end_pipeline --locked
+          cargo test -p cargo-anneal --test end_to_end_itree_diff --locked
+          cargo test -p cargo-anneal --test end_to_end_difftest_oracles --locked
           cargo test -p cargo-anneal --test end_to_end_demo_journeys --locked
           cargo test -p cargo-anneal --test end_to_end_miri_diff --locked
           python3 tests/miri-diff/sync_miri_suite.py
