@@ -33,6 +33,7 @@ macro_rules
     | apply LiftStmtsTerminator.cons_eval (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl)
     | apply LiftStmtsTerminator.term_switchInt (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl)
     | apply LiftStmtsTerminator.term_assert (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl) (by rfl)
+    | apply LiftStmtsTerminator.term_drop (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl)
     | apply LiftStmtsTerminator.term_call (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by rfl)
     | apply LiftStmtsTerminator.cons (by rfl) (by first | decide | exact Or.inl rfl | exact Or.inr rfl) (by rfl) (by assumption)
     | dsimp [evalPureStmt, isPureStatement, evalStmt, evalRvalue, evalOperand, advanceStmt, PureState.toMachineState, MachineState.frame, emptyMemory, invalidateConflictingBorrows, LocalSlot.init, Value.scalar, Rvalue.use, Operand.constant, Option.map, Option.bind, List.set, initPureEnv, initLocals, initLocalsAux, Trusted.Sequence.get?, List.length, Nat.add, writePurePlaceValue]; rfl
