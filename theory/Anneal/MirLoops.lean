@@ -58,29 +58,28 @@ theorem forRangeUp_induction {α : Type}
 termination_by hi - lo
 
 theorem mirTraceWpConverges_forRangeUp {α : Type}
-    (lo hi : Nat) (init : α) (step : (i : Nat) → i ≤ hi → i < hi → α → α)
+    (lo hi : Nat) (init : α) (step : (i : Nat) → lo ≤ i → i < hi → α → α)
     (body : CapturedMir)
     (LoopInv : Nat → α → MachineState → Prop)
     (s₀ : MachineState)
     (post : List (Event MirEffect) → MirOutcome → Prop)
-    (h_le : lo ≤ hi)
     (h_init : LoopInv lo init s₀)
     (h_body : ∀ i h_i_le h_i_lt a s, LoopInv i a s →
       MirTraceStepsConverges body s
         (fun s' tr_step => LoopInv (i + 1) (step i h_i_le h_i_lt a) s' ∧ tr_step = [])
         (fun _ _ => False))
-    (h_exit : ∀ a s, LoopInv hi a s → MirTraceWpConverges body s post) :
+    (h_exit : ∀ i a s, i ≥ hi → LoopInv i a s → MirTraceWpConverges body s post) :
     MirTraceWpConverges body s₀ post := by
   generalize h_d : hi - lo = d
-  induction d generalizing lo init s₀ with
+  induction d generalizing lo init step s₀ with
   | zero =>
-    have h_eq : lo = hi := Nat.le_antisymm h_le (Nat.le_of_sub_eq_zero h_d)
-    subst h_eq
-    exact h_exit init s₀ h_init
+    have h_ge : lo ≥ hi := Nat.le_of_sub_eq_zero h_d
+    exact h_exit lo init s₀ h_ge h_init
   | succ d ih =>
     have h_lt : lo < hi := Nat.lt_of_sub_eq_succ h_d
-    have h_step_conv := h_body lo h_le h_lt init s₀ h_init
-    have h_step_conv_post : MirTraceStepsConverges body s₀ (fun s' tr_step => LoopInv (lo + 1) (step lo h_le h_lt init) s' ∧ tr_step = []) post := by
+    have h_le : lo ≤ hi := Nat.le_of_lt h_lt
+    have h_step_conv := h_body lo (Nat.le_refl _) h_lt init s₀ h_init
+    have h_step_conv_post : MirTraceStepsConverges body s₀ (fun s' tr_step => LoopInv (lo + 1) (step lo (Nat.le_refl _) h_lt init) s' ∧ tr_step = []) post := by
       exact MirTraceStepsConverges.mono
         (fun s' tr_step h_mid => h_mid)
         (fun tr_step out h_false => nomatch h_false)
@@ -88,7 +87,12 @@ theorem mirTraceWpConverges_forRangeUp {α : Type}
     apply MirTraceWpConverges.bind_silent h_step_conv_post
     intro s' h_mid
     have h_sub : hi - (lo + 1) = d := by omega
-    exact ih (lo + 1) (step lo h_le h_lt init) s' (Nat.succ_le_of_lt h_lt) h_mid h_sub
+    exact ih (lo + 1) (step lo (Nat.le_refl _) h_lt init)
+      (fun i h_le' h_lt' a => step i (Nat.le_trans (Nat.le_succ _) h_le') h_lt' a)
+      s'
+      h_mid
+      (fun i h_le' h_lt' a s h_inv => h_body i (Nat.le_trans (Nat.le_succ _) h_le') h_lt' a s h_inv)
+      h_sub
 
 theorem nat_strong_induction (P : Nat → Prop) (ind : ∀ n, (∀ m, m < n → P m) → P n) : ∀ n, P n := by
   intro n
@@ -175,33 +179,36 @@ theorem runMirToBlock_eq_target
         | faulted _ => nomatch h
 
 theorem mirWpConverges_forRangeUp {α : Type}
-    (lo hi : Nat) (init : α) (step : (i : Nat) → i ≤ hi → i < hi → α → α)
+    (lo hi : Nat) (init : α) (step : (i : Nat) → lo ≤ i → i < hi → α → α)
     (body : CapturedMir)
     (LoopInv : Nat → α → MachineState → Prop)
     (s₀ : MachineState)
     (post : MirOutcome → Prop)
-    (h_le : lo ≤ hi)
     (h_init : LoopInv lo init s₀)
     (h_body : ∀ i h_i_le h_i_lt a s, LoopInv i a s →
       MirStepsConverges body s
         (fun s' => LoopInv (i + 1) (step i h_i_le h_i_lt a) s')
         (fun _ => False))
-    (h_exit : ∀ a s, LoopInv hi a s → MirWpConverges body s post) :
+    (h_exit : ∀ i a s, i ≥ hi → LoopInv i a s → MirWpConverges body s post) :
     MirWpConverges body s₀ post := by
   generalize h_d : hi - lo = d
-  induction d generalizing lo init s₀ with
+  induction d generalizing lo init step s₀ with
   | zero =>
-    have h_eq : lo = hi := Nat.le_antisymm h_le (Nat.le_of_sub_eq_zero h_d)
-    subst h_eq
-    exact h_exit init s₀ h_init
+    have h_ge : lo ≥ hi := Nat.le_of_sub_eq_zero h_d
+    exact h_exit lo init s₀ h_ge h_init
   | succ d ih =>
     have h_lt : lo < hi := Nat.lt_of_sub_eq_succ h_d
-    have h_step_conv := h_body lo h_le h_lt init s₀ h_init
+    have h_step_conv := h_body lo (Nat.le_refl _) h_lt init s₀ h_init
     have h_step_mono := MirStepsConverges.mono (post₂ := post) (fun _ h => h) (fun _ h => False.elim h) h_step_conv
     apply MirWpConverges.bind h_step_mono
     intro s' h_mid
     have h_sub : hi - (lo + 1) = d := by omega
-    exact ih (lo + 1) (step lo h_le h_lt init) s' (Nat.succ_le_of_lt h_lt) h_mid h_sub
+    exact ih (lo + 1) (step lo (Nat.le_refl _) h_lt init)
+      (fun i h_le' h_lt' a => step i (Nat.le_trans (Nat.le_succ _) h_le') h_lt' a)
+      s'
+      h_mid
+      (fun i h_le' h_lt' a s h_inv => h_body i (Nat.le_trans (Nat.le_succ _) h_le') h_lt' a s h_inv)
+      h_sub
 
 theorem mirWpConverges_whileRank {α : Type}
     (rank : α → Nat)
@@ -413,26 +420,27 @@ theorem countTo10_terminates (mem : Memory) (h_callee : mem.activeCallee = none)
   have h_loop : MirWpConverges countTo10Body (countStateMem 1 0 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none })
     (fun out => ∃ mem', out = Outcome.normal (Value.scalar ⟨10, 4⟩, mem')) := by
     refine mirWpConverges_forRangeUp 0 10 () (fun _ _ _ _ => ()) countTo10Body
-      (fun i _ s => ∃ m, s = countStateMem 1 0 i m ∧ m.activeCallee = none ∧ m.activeProtectors = [] ∧ m.callStack = [])
+      (fun i _ s => i ≤ 10 ∧ ∃ m, s = countStateMem 1 0 i m ∧ m.activeCallee = none ∧ m.activeProtectors = [] ∧ m.callStack = [])
       (countStateMem 1 0 0 { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none })
       (fun out => ∃ mem', out = Outcome.normal (Value.scalar ⟨10, 4⟩, mem'))
-      (by decide)
       ?_
       ?_
       ?_
-    · exact ⟨{ mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }, rfl, h_callee, h_prot, h_stack⟩
+    · exact ⟨by decide, { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none }, rfl, h_callee, h_prot, h_stack⟩
     · intro i h_le h_lt _ s h_inv
-      rcases h_inv with ⟨m, h_eq, hm_callee, hm_prot, hm_stack⟩
+      rcases h_inv with ⟨h_i_le_10, m, h_eq, hm_callee, hm_prot, hm_stack⟩
       subst h_eq
       have h1 := bb1_converges_lt i m hm_callee (Nat.ne_of_lt h_lt)
       have h2 := bb2_converges_mem i m hm_callee hm_prot
       have h12 := MirReachState.trans h1 h2
       have hi_mod : (i + 1) % 4294967296 = i + 1 := Nat.mod_eq_of_lt (by omega)
       rw [hi_mod] at h12
-      exact MirStepsConverges.mono (post₂ := fun _ => False) (fun s' hs' => ⟨{ m with borrows := invalidateConflictingBorrows m.borrows 1 none }, hs', hm_callee, hm_prot, hm_stack⟩) (fun _ h => False.elim h) h12
-    · intro _ s h_inv
-      rcases h_inv with ⟨m, h_eq, hm_callee, hm_prot, hm_stack⟩
+      exact MirStepsConverges.mono (post₂ := fun _ => False) (fun s' hs' => ⟨Nat.succ_le_of_lt h_lt, { m with borrows := invalidateConflictingBorrows m.borrows 1 none }, hs', hm_callee, hm_prot, hm_stack⟩) (fun _ h => False.elim h) h12
+    · intro i a s h_ge h_inv
+      rcases h_inv with ⟨h_i_le_10, m, h_eq, hm_callee, hm_prot, hm_stack⟩
       subst h_eq
+      have h_i_eq : i = 10 := Nat.le_antisymm h_i_le_10 h_ge
+      subst h_i_eq
       have h1 := bb1_converges_eq10 m hm_callee
       have h3 := bb3_converges_mem m hm_callee hm_prot hm_stack
       apply MirWpConverges.bind_reachState h1
