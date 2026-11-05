@@ -213,13 +213,92 @@ def stripTransparentProjections : List ProjectionElem → List ProjectionElem
   | elem :: rest => elem :: stripTransparentProjections rest
 
 /--
-Test whether two transparent-stripped projection paths within the same root
-local overlap.
+Structural helper for `normalizeSubsliceProjections` that folds nested
+`.subslice` and `.constantIndex` projections into an active half-open subslice
+window `.some (fromA, toA)`.
+-/
+@[reducible]
+def normalizeSubsliceProjectionsAux :
+    Option (Nat × Nat) → List ProjectionElem → List ProjectionElem
+  | .none, .nil => .nil
+  | .some (fromA, toA), .nil => .subslice fromA toA false :: .nil
+  | .none, .subslice fromA toA false :: rest =>
+    match Nat.ble fromA toA with
+    | true => normalizeSubsliceProjectionsAux (.some (fromA, toA)) rest
+    | false =>
+      .subslice fromA toA false :: normalizeSubsliceProjectionsAux .none rest
+  | .none, elem :: rest =>
+    elem :: normalizeSubsliceProjectionsAux .none rest
+  | .some (fromA, toA), .subslice relFrom relTo false :: rest =>
+    let subLen := Nat.sub toA fromA
+    match Bool.and (Nat.ble relFrom relTo) (Nat.ble relTo subLen) with
+    | true =>
+      normalizeSubsliceProjectionsAux
+        (.some (Nat.add fromA relFrom, Nat.add fromA relTo))
+        rest
+    | false =>
+      .subslice fromA toA false ::
+        .subslice relFrom relTo false ::
+        normalizeSubsliceProjectionsAux .none rest
+  | .some (fromA, toA), .subslice relFrom relTo true :: rest =>
+    let subLen := Nat.sub toA fromA
+    let endIdx := Nat.sub subLen relTo
+    match Bool.and (Nat.ble relTo subLen) (Nat.ble relFrom endIdx) with
+    | true =>
+      normalizeSubsliceProjectionsAux
+        (.some (Nat.add fromA relFrom, Nat.add fromA endIdx))
+        rest
+    | false =>
+      .subslice fromA toA false ::
+        .subslice relFrom relTo true ::
+        normalizeSubsliceProjectionsAux .none rest
+  | .some (fromA, toA), .constantIndex relIdx minLen false :: rest =>
+    let subLen := Nat.sub toA fromA
+    match Bool.and (Nat.ble minLen subLen) (Nat.ble (.succ relIdx) subLen) with
+    | true =>
+      .constantIndex (Nat.add fromA relIdx) minLen false ::
+        normalizeSubsliceProjectionsAux .none rest
+    | false =>
+      .subslice fromA toA false ::
+        .constantIndex relIdx minLen false ::
+        normalizeSubsliceProjectionsAux .none rest
+  | .some (fromA, toA), .constantIndex relOff minLen true :: rest =>
+    let subLen := Nat.sub toA fromA
+    match
+      Bool.and
+        (Nat.ble minLen subLen)
+        (Bool.and (Nat.ble 1 relOff) (Nat.ble relOff subLen))
+    with
+    | true =>
+      .constantIndex (Nat.add fromA (Nat.sub subLen relOff)) minLen false ::
+        normalizeSubsliceProjectionsAux .none rest
+    | false =>
+      .subslice fromA toA false ::
+        .constantIndex relOff minLen true ::
+        normalizeSubsliceProjectionsAux .none rest
+  | .some (fromA, toA), elem :: rest =>
+    .subslice fromA toA false :: elem :: normalizeSubsliceProjectionsAux .none rest
+
+/--
+Normalize adjacent `.subslice` and `.constantIndex` projections in a
+transparent-stripped projection path so nested subslice/element accesses carry
+root-relative indices for overlap and projection evaluation.
+-/
+@[reducible]
+def normalizeSubsliceProjections (proj : List ProjectionElem) : List ProjectionElem :=
+  normalizeSubsliceProjectionsAux .none proj
+
+/--
+Test whether two transparent-stripped, subslice-normalized projection paths
+within the same root local overlap.
 
 - If either list is `.nil`, one projection is a prefix of the other, so they
   overlap (`true`).
 - Distinct `.field` indices (`idxA != idxB`), distinct `.constantIndex` offsets
-  with matching `fromEnd` polarity, and distinct `.downcast` enum variants are
+  with matching `fromEnd` polarity, disjoint `.subslice` intervals
+  (`[fromA, toA)` vs `[fromB, toB)` with `toA <= fromB` or `toB <= fromA`),
+  a `.subslice [fromA, toA)` and `.constantIndex idxB` outside `[fromA, toA)`
+  (`idxB < fromA` or `idxB >= toA`), and distinct `.downcast` enum variants are
   disjoint (`false`).
 - Otherwise returns `true` (conservative overlap).
 
@@ -258,6 +337,36 @@ def projectionsOverlapAux : List ProjectionElem → List ProjectionElem → Bool
       | true => projectionsOverlapAux restA restB
       | false => false
     | false => projectionsOverlapAux restA restB
+  | .subslice fromA toA false :: restA,
+    .subslice fromB toB false :: restB =>
+    match
+      Bool.or
+        (Nat.ble toA fromB)
+        (Nat.ble toB fromA)
+    with
+    | true => false
+    | false =>
+      match Bool.and (Nat.beq fromA fromB) (Nat.beq toA toB) with
+      | true => projectionsOverlapAux restA restB
+      | false => true
+  | .subslice fromA toA false :: _,
+    .constantIndex idxB _ false :: _ =>
+    match
+      Bool.or
+        (Bool.not (Nat.ble fromA idxB))
+        (Nat.ble toA idxB)
+    with
+    | true => false
+    | false => true
+  | .constantIndex idxA _ false :: _,
+    .subslice fromB toB false :: _ =>
+    match
+      Bool.or
+        (Bool.not (Nat.ble fromB idxA))
+        (Nat.ble toB idxA)
+    with
+    | true => false
+    | false => true
   | .downcast _ varA :: restA, .downcast _ varB :: restB =>
     match Nat.beq varA varB with
     | true => projectionsOverlapAux restA restB
@@ -266,7 +375,8 @@ def projectionsOverlapAux : List ProjectionElem → List ProjectionElem → Bool
 
 /--
 Test whether two projection paths within the same root local overlap after
-stripping transparent `.opaqueCast` and `.unwrapUnsafeBinder` projections.
+stripping transparent `.opaqueCast` and `.unwrapUnsafeBinder` projections and
+normalizing nested `.subslice` projections.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -278,8 +388,8 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 -/
 def projectionsOverlap (projA projB : List ProjectionElem) : Bool :=
   projectionsOverlapAux
-    (stripTransparentProjections projA)
-    (stripTransparentProjections projB)
+    (normalizeSubsliceProjections (stripTransparentProjections projA))
+    (normalizeSubsliceProjections (stripTransparentProjections projB))
 
 /--
 Test whether two half-open byte ranges `[offA, offA + lenA)` and
@@ -1337,15 +1447,74 @@ def tyScalarBytes (ty : Ty) : Option Nat :=
   | k => intCastTargetBytes k
 
 /--
-Evaluate a `ConstValue` to a runtime `Value` when supported without global
-allocation context.
+Byte width of a thin pointer or fat-pointer metadata word in `layouts`,
+defaulting to `8` bytes (64-bit target) when `layouts.pointerBits == 0`.
 -/
-def evalConstValue : ConstValue → Option Value
+@[reducible]
+def layoutPointerBytes (layouts : LayoutTable) : Nat :=
+  match Nat.beq layouts.pointerBits 0 with
+  | true => 8
+  | false => Nat.div layouts.pointerBits 8
+
+/--
+Evaluate a `ConstValue` to a runtime `Value`, decoding `ConstValue.slice` to the
+2-element fat-pointer aggregate `Value.aggregate 0 [dataVal, Value.scalar ⟨meta, ptrBytes⟩]`
+and `ConstValue.indirect allocId offset` by decoding `ty` from `globals` via
+`decodeValueFromBytes`.
+
+Reference (`compiler/rustc_middle/src/mir/interpret/value.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/value.rs#L31-L65>
+
+> "pub enum ConstValue {
+>     ZeroSized,
+>     Scalar(Scalar),
+>     Slice { alloc_id: AllocId, meta: u64 },
+>     Indirect { alloc_id: AllocId, offset: Size },
+> }"
+-/
+def evalConstValue
+    (cv : ConstValue)
+    (ty : Ty := { kind := .tuple .nil, layoutIdx := 0 })
+    (globals : List CapturedAllocation := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    Option Value :=
+  let ptrBytes := layoutPointerBytes layouts
+  match cv with
   | .zeroSized => .some .unit
   | .scalar (.int s) => .some (.scalar s)
   | .scalar (.ptr p sz) => .some (.ptr p sz)
-  | .slice _ _ => .none
-  | .indirect _ _ => .none
+  | .slice (.ptr p sz) lenMeta =>
+    .some (.aggregate 0 (.ptr p sz :: .scalar ⟨lenMeta, ptrBytes⟩ :: .nil))
+  | .slice (.int s) lenMeta =>
+    let p : ProvenancePtr := {
+      allocId := Nat.div s.bits 65536
+      offsetBytes := Nat.mod s.bits 65536
+    }
+    .some (.aggregate 0 (.ptr p ptrBytes :: .scalar ⟨lenMeta, ptrBytes⟩ :: .nil))
+  | .indirect allocId offset =>
+    match lookupGlobalAlloc globals allocId with
+    | .none => .none
+    | .some alloc =>
+      let sz :=
+        match rigidTyByteSize layouts ty with
+        | .some n => n
+        | .none =>
+          match tyScalarBytes ty with
+          | .some n => n
+          | .none => Nat.sub (length alloc.bytes) offset
+      match globalAllocSliceToAbstractBytes alloc offset sz with
+      | .some absBytes =>
+        match decodeValueFromBytes defaultCodecFuel layouts ty absBytes with
+        | .some v => .some v
+        | .none =>
+          match intCastTargetBytes ty.kind with
+          | .some n =>
+            match readGlobalScalar alloc offset n with
+            | .some sc => .some (.scalar sc)
+            | .none => .none
+          | .none => .none
+      | .none => .none
   | .unevaluated _ => .none
 
 /--
@@ -1492,7 +1661,47 @@ def readProjectedValue
   | _, .subslice _ _ _ :: _ => .ub
   | val, .opaqueCast _ :: rest =>
     readProjectedValue locals val rest
+  | val, .unwrapUnsafeBinder _ :: rest =>
+    readProjectedValue locals val rest
   | _, _ :: _ => .unsupported
+
+/--
+Concatenate two `List Value` sequences in order.
+-/
+@[reducible]
+def appendValueList : List Value → List Value → List Value
+  | .nil, ys => ys
+  | x :: xs, ys => x :: appendValueList xs ys
+
+/--
+Replace the subslice of `elems` specified by `ProjectionElem.subslice fromIdx
+toIdx fromEnd` with `newSubElems`, returning `.none` if the indices are out of
+bounds, inverted, or if `length newSubElems` does not equal the subslice length.
+-/
+def replaceSubslice
+    (elems : List Value)
+    (fromIdx toIdx : Nat)
+    (fromEnd : Bool)
+    (newSubElems : List Value) :
+    Option (List Value) :=
+  let len := length elems
+  match Nat.ble toIdx len with
+  | false => .none
+  | true =>
+    let endIdx :=
+      match fromEnd with
+      | true => Nat.sub len toIdx
+      | false => toIdx
+    match Nat.ble fromIdx endIdx with
+    | false => .none
+    | true =>
+      let count := Nat.sub endIdx fromIdx
+      match Nat.beq (length newSubElems) count with
+      | false => .none
+      | true =>
+        let prefixElems := takeValues fromIdx elems
+        let suffixElems := dropValues endIdx elems
+        .some (appendValueList prefixElems (appendValueList newSubElems suffixElems))
 
 /--
 Update the `Value` at index `idx` in `fields`, extending `fields` with
@@ -1612,7 +1821,24 @@ def writeProjectedValue
       | .none => .ub
     | false => .ub
   | _, .constantIndex _ _ _ :: _, _ => .ub
+  | .aggregate 0 fields,
+    .subslice fromIdx toIdx fromEnd :: rest,
+    newVal =>
+    match extractSubslice fields fromIdx toIdx fromEnd with
+    | .some subElems =>
+      match writeProjectedValue locals (.aggregate 0 subElems) rest newVal with
+      | .ok (.aggregate 0 updatedSubElems) =>
+        match replaceSubslice fields fromIdx toIdx fromEnd updatedSubElems with
+        | .some fields' => .ok (.aggregate 0 fields')
+        | .none => .ub
+      | .ok _ => .ub
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .none => .ub
+  | _, .subslice _ _ _ :: _, _ => .ub
   | val, .opaqueCast _ :: rest, newVal =>
+    writeProjectedValue locals val rest newVal
+  | val, .unwrapUnsafeBinder _ :: rest, newVal =>
     writeProjectedValue locals val rest newVal
   | _, _ :: _, _ => .unsupported
 
@@ -1630,12 +1856,729 @@ def sliceConstElemKind (ty : Ty) : RigidTy :=
   | _ => .uint .u8
 
 /--
+Determine whether a trailing projection path `restProj` after a dereference can
+be satisfied directly on a scalar value (`[]`, `.opaqueCast`, `.unwrapUnsafeBinder`,
+or zero-index newtype `.field 0`).
+-/
+@[reducible]
+def isScalarCompatibleProj : List ProjectionElem → Bool
+  | .nil => true
+  | .opaqueCast _ :: rest => isScalarCompatibleProj rest
+  | .unwrapUnsafeBinder _ :: rest => isScalarCompatibleProj rest
+  | .field .zero _ :: rest => isScalarCompatibleProj rest
+  | _ :: _ => false
+
+/--
+Infer an unsigned integer `RigidTy` from a primitive byte stride (`1`, `2`, `4`,
+`8`, or `16`).
+-/
+@[reducible]
+def uintRigidTyOfStride (strideBytes : Nat) : RigidTy :=
+  match strideBytes with
+  | 2 => .uint .u16
+  | 4 => .uint .u32
+  | 8 => .uint .u64
+  | 16 => .uint .u128
+  | _ => .uint .u8
+
+/--
+Decode and project a dereferenced global allocation `alloc` at `offset` with
+pointer/access width `sz` and trailing projections `restProj`.
+
+When `pointeeTyOpt` resolves to a scalar type (or when `pointeeTyOpt` is `.none`,
+`layouts` has no aggregate entry at index `0`, `restProj` is scalar-compatible,
+and `readGlobalScalar alloc offset sz` succeeds), reads the scalar directly via
+`readGlobalScalar`. When `readGlobalScalar` does not apply (non-scalar aggregate,
+tuple, or array `pointeeTy`, non-primitive layout in `layouts`, non-scalar width
+`sz`, or aggregate/array projection in `restProj`), decodes the global bytes via
+`decodeValueFromBytes` and projects `restProj`.
+-/
+def evalGlobalDerefRead
+    (locals : List LocalSlot)
+    (alloc : CapturedAllocation)
+    (offset sz : Nat)
+    (restProj : List ProjectionElem)
+    (layouts : LayoutTable := emptyLayoutTable)
+    (pointeeTyOpt : Option Ty := .none) :
+    PlaceReadResult :=
+  match pointeeTyOpt with
+  | .some pointeeTy =>
+    match intCastTargetBytes pointeeTy.kind with
+    | .some n =>
+      match readGlobalScalar alloc offset n with
+      | .some sc =>
+        match readProjectedValue locals (.scalar sc) restProj with
+        | .ok fieldVal => .ok fieldVal locals
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | .none => .ub
+    | .none =>
+      let byteSz :=
+        match rigidTyByteSize layouts pointeeTy with
+        | .some n => n
+        | .none => Nat.sub (length alloc.bytes) offset
+      match globalAllocSliceToAbstractBytes alloc offset byteSz with
+      | .some absBytes =>
+        match decodeValueFromBytes defaultCodecFuel layouts pointeeTy absBytes with
+        | .some decodedVal =>
+          match readProjectedValue locals decodedVal restProj with
+          | .ok fieldVal => .ok fieldVal locals
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | .none => .ub
+      | .none => .ub
+  | .none =>
+    let nonPrimLayoutOpt : Option (Ty × Nat) :=
+      match LayoutTable.lookup layouts 0 with
+      | .some l =>
+        match l.fields with
+        | .primitive => .none
+        | .array stride count =>
+          .some
+            ({ kind := .array (uintRigidTyOfStride stride.bytes) count, layoutIdx := 0 },
+             l.size.bytes)
+        | _ =>
+          .some ({ kind := .adt "" .nil, layoutIdx := 0 }, l.size.bytes)
+      | .none => .none
+    match nonPrimLayoutOpt with
+    | .some (inferredTy, byteSz) =>
+      match globalAllocSliceToAbstractBytes alloc offset byteSz with
+      | .some absBytes =>
+        match decodeValueFromBytes defaultCodecFuel layouts inferredTy absBytes with
+        | .some decodedVal =>
+          match readProjectedValue locals decodedVal restProj with
+          | .ok fieldVal => .ok fieldVal locals
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | .none => .ub
+      | .none => .ub
+    | .none =>
+      match isScalarCompatibleProj restProj with
+      | true =>
+        match readGlobalScalar alloc offset sz with
+        | .some sc =>
+          match readProjectedValue locals (.scalar sc) restProj with
+          | .ok fieldVal => .ok fieldVal locals
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | .none =>
+          match Nat.beq sz 0 with
+          | true =>
+            match Nat.ble offset (length alloc.bytes) with
+            | true =>
+              match readProjectedValue locals .unit restProj with
+              | .ok fieldVal => .ok fieldVal locals
+              | .ub => .ub
+              | .unsupported => .unsupported
+            | false => .ub
+          | false =>
+            match globalAllocSliceToAbstractBytes alloc offset sz with
+            | .some absBytes =>
+              let arrTy : Ty := { kind := .array (.uint .u8) sz, layoutIdx := 0 }
+              match decodeValueFromBytes defaultCodecFuel layouts arrTy absBytes with
+              | .some decodedVal =>
+                match readProjectedValue locals decodedVal restProj with
+                | .ok fieldVal => .ok fieldVal locals
+                | .ub => .ub
+                | .unsupported => .unsupported
+              | .none => .ub
+            | .none => .ub
+      | false =>
+        match Nat.ble offset (length alloc.bytes) with
+        | false => .ub
+        | true =>
+          let remBytes := Nat.sub (length alloc.bytes) offset
+          match globalAllocSliceToAbstractBytes alloc offset remBytes with
+          | .some absBytes =>
+            let arrTy : Ty := { kind := .array (.uint .u8) remBytes, layoutIdx := 0 }
+            match decodeValueFromBytes defaultCodecFuel layouts arrTy absBytes with
+            | .some decodedVal =>
+              match readProjectedValue locals decodedVal restProj with
+              | .ok fieldVal => .ok fieldVal locals
+              | .ub => .ub
+              | .unsupported => .unsupported
+            | .none => .ub
+          | .none => .ub
+
+/--
+Compute the total byte size of a runtime `Value` using structural recursion on
+`fuel` (supporting nested tuple, struct, and multi-dimensional array
+aggregates).
+-/
+@[reducible]
+def inferValueByteSizeAux : Nat → Value → Option Nat
+  | _, .unit => .some 0
+  | _, .scalar sc => .some sc.sizeBytes
+  | _, .ptr _ sz => .some sz
+  | _, .aggregate _ .nil => .some 0
+  | .zero, .aggregate _ (_ :: _) => .none
+  | .succ fuel, .aggregate 0 (f :: fs) =>
+    match inferValueByteSizeAux fuel f, inferValueByteSizeAux fuel (.aggregate 0 fs) with
+    | .some szF, .some szFs => .some (Nat.add szF szFs)
+    | _, _ => .none
+  | _, .aggregate (.succ _) (_ :: _) => .none
+
+/--
+Infer the element byte stride of a runtime array/slice element list `elems` when
+no static `pointeeTyOpt` is available, defaulting to `1` byte.
+-/
+@[reducible]
+def inferElemListByteStride : List Value → Nat
+  | .scalar sc :: _ => sc.sizeBytes
+  | .ptr _ sz :: _ => sz
+  | .unit :: _ => 0
+  | .aggregate 0 fields :: _ =>
+    match inferValueByteSizeAux 8 (.aggregate 0 fields) with
+    | .some sz => sz
+    | .none => 1
+  | _ => 1
+
+/--
+Divide `rem` by positive `stride` using structural recursion on `fuel`,
+returning `.some acc` when `stride` divides `rem` evenly and `.none` otherwise.
+-/
+@[reducible]
+def exactByteDivAux : Nat → Nat → Nat → Nat → Option Nat
+  | _, .zero, _, acc => .some acc
+  | .zero, .succ _, _, _ => .none
+  | .succ fuel, rem, stride, acc =>
+    match Nat.ble stride rem with
+    | false => .none
+    | true => exactByteDivAux fuel (Nat.sub rem stride) stride (.succ acc)
+
+/--
+Convert a byte offset `offsetBytes` into an element index given element byte
+stride `elemSz`, returning `.some 0` when `offsetBytes == 0`,
+`.some (offsetBytes / elemSz)` when `elemSz > 0` divides `offsetBytes`, and
+`.none` otherwise.
+-/
+@[reducible]
+def byteOffsetToElemIdx? (offsetBytes elemSz : Nat) : Option Nat :=
+  match Nat.beq offsetBytes 0 with
+  | true => .some 0
+  | false =>
+    match Nat.beq elemSz 0 with
+    | true => .none
+    | false => exactByteDivAux offsetBytes offsetBytes elemSz 0
+
+/--
+If `proj` ends with a forward `.constantIndex baseIdx minLen false`, split `proj`
+into `(initProj, baseIdx, minLen)`; otherwise return `.none`.
+-/
+@[reducible]
+def splitLastConstantIndex? : List ProjectionElem → Option (List ProjectionElem × Nat × Nat)
+  | .nil => .none
+  | .constantIndex baseIdx minLen false :: .nil => .some (.nil, baseIdx, minLen)
+  | elem :: rest =>
+    match splitLastConstantIndex? rest with
+    | .some (initProj, baseIdx, minLen) => .some (elem :: initProj, baseIdx, minLen)
+    | .none => .none
+
+/--
+Resolve the backing array/subslice element list `(containerProj, baseIdx, elems)`
+for a slice fat pointer or thin element pointer whose `BorrowEntry` has
+`targetProjection`:
+- When `targetProjection` (after stripping transparent projections and
+  normalizing subslices) ends with `.constantIndex baseIdx minLen false`
+  (e.g. `&raw const arr[baseIdx]` passed to `core::ptr::slice_from_raw_parts`,
+  including when each array element is itself a tuple or struct
+  `.aggregate 0 fields`), resolves the parent aggregate at `initProj`, validates
+  `minLen <= length elems` and `baseIdx <= length elems`, and returns
+  `.some (initProj, baseIdx, elems)`.
+- Otherwise, when `readProjectedValue indexLocals targetRootVal targetProjection`
+  yields `.ok (.aggregate 0 elems)`, returns `.some (targetProjection, 0, elems)`.
+-/
+@[reducible]
+def readSliceBackingAggregate?
+    (indexLocals : List LocalSlot)
+    (targetRootVal : Value)
+    (targetProjection : List ProjectionElem)
+    (minCount : Nat := 0)
+    (expectedElemSzOpt : Option Nat := .none) :
+    Option (List ProjectionElem × Nat × List Value) :=
+  let normProj :=
+    normalizeSubsliceProjections (stripTransparentProjections targetProjection)
+  match splitLastConstantIndex? normProj with
+  | .some (initProj, baseIdx, minLen) =>
+    match readProjectedValue indexLocals targetRootVal initProj with
+    | .ok (.aggregate 0 outerElems) =>
+      let outerValid :=
+        Bool.and
+          (Nat.ble minLen (length outerElems))
+          (Nat.ble (Nat.add baseIdx minCount) (length outerElems))
+      let preferInner :=
+        match readProjectedValue indexLocals targetRootVal targetProjection with
+        | .ok (.aggregate 0 innerElems) =>
+          match expectedElemSzOpt with
+          | .some expSz =>
+            let outerStride := inferElemListByteStride outerElems
+            let innerStride := inferElemListByteStride innerElems
+            Bool.and
+              (Bool.not (Nat.beq outerStride expSz))
+              (Bool.and
+                (Nat.beq innerStride expSz)
+                (Nat.ble minCount (length innerElems)))
+          | .none =>
+            Bool.and
+              (Bool.not outerValid)
+              (Bool.and
+                (Nat.ble 1 minCount)
+                (Nat.ble minCount (length innerElems)))
+        | _ => false
+      match preferInner with
+      | true =>
+        match readProjectedValue indexLocals targetRootVal targetProjection with
+        | .ok (.aggregate 0 innerElems) => .some (targetProjection, 0, innerElems)
+        | _ => .none
+      | false =>
+        match
+          Bool.and
+            (Nat.ble minLen (length outerElems))
+            (Nat.ble baseIdx (length outerElems))
+        with
+        | true => .some (initProj, baseIdx, outerElems)
+        | false => .none
+    | _ => .none
+  | .none =>
+    match readProjectedValue indexLocals targetRootVal targetProjection with
+    | .ok (.aggregate 0 elems) => .some (targetProjection, 0, elems)
+    | _ => .none
+
+/--
+If `proj` ends with `.subslice fromIdx toIdx fromEnd`, split `proj` into
+`(initProj, fromIdx, toIdx, fromEnd)`; otherwise return `.none`.
+-/
+@[reducible]
+def splitLastSubslice? : List ProjectionElem → Option (List ProjectionElem × Nat × Nat × Bool)
+  | .nil => .none
+  | .subslice fromIdx toIdx fromEnd :: .nil => .some (.nil, fromIdx, toIdx, fromEnd)
+  | elem :: rest =>
+    match splitLastSubslice? rest with
+    | .some (initProj, fromIdx, toIdx, fromEnd) =>
+      .some (elem :: initProj, fromIdx, toIdx, fromEnd)
+    | .none => .none
+
+/--
+Return `true` when `proj` ends with `.subslice`.
+-/
+@[reducible, simp]
+def endsWithSubslice : List ProjectionElem → Bool
+  | .nil => false
+  | .subslice _ _ _ :: .nil => true
+  | _ :: rest => endsWithSubslice rest
+
+/--
+Return `true` when dereferencing a stack-backed thin pointer with `BorrowEntry`
+`targetProjection` at `offsetBytes` requires array/subslice element offset
+resolution (`targetProjection` is non-empty and either ends with `.subslice` or
+has `offsetBytes > 0`). Reduces immediately to `false` when `targetProjection`
+is `.nil`.
+-/
+@[reducible, simp]
+def needsThinPtrElemResolution
+    (targetProjection : List ProjectionElem)
+    (offsetBytes : Nat) :
+    Bool :=
+  match targetProjection with
+  | .nil => false
+  | pHead :: pTail =>
+    let norm :=
+      normalizeSubsliceProjections (stripTransparentProjections (pHead :: pTail))
+    match endsWithSubslice norm with
+    | true => true
+    | false => Bool.not (Nat.beq offsetBytes 0)
+
+/--
+Return `true` when `proj` (after stripping transparent projections) begins with
+`.constantIndex`, `.index`, or `.subslice`.
+-/
+@[reducible]
+def startsWithArrayOrSliceProj (proj : List ProjectionElem) : Bool :=
+  match stripTransparentProjections proj with
+  | .constantIndex _ _ _ :: _ => true
+  | .index _ :: _ => true
+  | .subslice _ _ _ :: _ => true
+  | _ => false
+
+/--
+Resolve the effective target projection path on `entry.targetLocal` when
+dereferencing, writing through, or reborrowing a stack-backed thin pointer
+`Value.ptr ptrVal sz` (`BorrowEntry` `entry`) with post-deref projection suffix
+`restProj`.
+
+- When `ptrVal.offsetBytes == 0` and the pointer is not an element pointer into
+  a subslice or array (`isElemPtrAtZero == false`), returns the direct
+  concatenation `entry.targetProjection ++ restProj`.
+- When `ptrVal.offsetBytes > 0` (e.g. after `BinOp.offset` on `&raw const arr[i]`
+  or `slice.as_ptr().offset(k)`), or when `ptrVal.offsetBytes == 0` on an element
+  pointer into a `.subslice` (or into an `.array` when `pointeeTyOpt` is a
+  non-array element type), translates `ptrVal.offsetBytes` into an element index
+  via `byteOffsetToElemIdx?`, verifies in-bounds access against the backing
+  array/subslice aggregate (`elemIdx < length elems`), and returns the
+  normalized projection path (or `.none` on misaligned or out-of-bounds offset).
+-/
+@[reducible]
+def resolveStackThinPtrTargetProj?
+    (indexLocals : List LocalSlot)
+    (targetRootVal : Value)
+    (entry : BorrowEntry)
+    (ptrVal : ProvenancePtr)
+    (restProj : List ProjectionElem)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable)
+    (pointeeTyOpt : Option Ty := .none) :
+    Option (List ProjectionElem) :=
+  let rawFullProj :=
+    match entry.targetProjection with
+    | .nil => restProj
+    | ph :: pt => ph :: appendProjections pt restProj
+  let normTargetProj :=
+    normalizeSubsliceProjections (stripTransparentProjections entry.targetProjection)
+  let isElemPtrAtZero : Bool :=
+    match endsWithSubslice normTargetProj, pointeeTyOpt with
+    | false, .none => false
+    | _, _ =>
+      match startsWithArrayOrSliceProj restProj with
+      | true => false
+      | false =>
+        match endsWithSubslice normTargetProj with
+        | true => true
+        | false =>
+          match pointeeTyOpt with
+          | .none => false
+          | .some pointeeTy =>
+            let pointeeIsNotSeq :=
+              match pointeeTy.kind with
+              | .array _ _ => false
+              | .slice _ => false
+              | _ => true
+            match pointeeIsNotSeq with
+            | false => false
+            | true =>
+              match
+                placeTy
+                  localDecls
+                  layouts
+                  { local_ := entry.targetLocal, projection := normTargetProj }
+              with
+              | .some { kind := .array _ _, .. } => true
+              | .some { kind := .slice _, .. } => true
+              | _ => false
+  match Nat.beq ptrVal.offsetBytes 0, isElemPtrAtZero with
+  | true, false => .some rawFullProj
+  | _, _ =>
+    match splitLastConstantIndex? normTargetProj with
+    | .some (initProj, baseIdx, minLen) =>
+      match readProjectedValue indexLocals targetRootVal initProj with
+      | .ok (.aggregate 0 elems) =>
+        let elemSz := inferElemListByteStride elems
+        match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+        | .none => .none
+        | .some elemDelta =>
+          let idx := Nat.add baseIdx elemDelta
+          match
+            Bool.and
+              (Nat.ble minLen (length elems))
+              (Nat.ble (.succ idx) (length elems))
+          with
+          | false => .none
+          | true =>
+            let elemProj := ProjectionElem.constantIndex idx 0 false :: restProj
+            let combined :=
+              match initProj with
+              | .nil => elemProj
+              | ph :: pt => ph :: appendProjections pt elemProj
+            .some (normalizeSubsliceProjections combined)
+      | _ => .none
+    | .none =>
+      match readProjectedValue indexLocals targetRootVal normTargetProj with
+      | .ok (.aggregate 0 elems) =>
+        let elemSz := inferElemListByteStride elems
+        match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+        | .none => .none
+        | .some elemOffset =>
+          match endsWithSubslice normTargetProj, stripTransparentProjections restProj with
+          | false, .constantIndex relIdx minLen false :: tailProj =>
+            let idx := Nat.add elemOffset relIdx
+            let remLen := Nat.sub (length elems) elemOffset
+            match
+              Bool.and
+                (Nat.ble minLen remLen)
+                (Nat.ble (.succ idx) (length elems))
+            with
+            | false => .none
+            | true =>
+              let elemProj := ProjectionElem.constantIndex idx 0 false :: tailProj
+              let combined :=
+                match normTargetProj with
+                | .nil => elemProj
+                | ph :: pt => ph :: appendProjections pt elemProj
+              .some (normalizeSubsliceProjections combined)
+          | _, _ =>
+            match Nat.ble (.succ elemOffset) (length elems) with
+            | false => .none
+            | true =>
+              let elemProj := ProjectionElem.constantIndex elemOffset 0 false :: restProj
+              let combined :=
+                match normTargetProj with
+                | .nil => elemProj
+                | ph :: pt => ph :: appendProjections pt elemProj
+              .some (normalizeSubsliceProjections combined)
+      | _ => .none
+
+/--
+Dereference and project a slice fat pointer
+`Value.aggregate 0 [Value.ptr ptrVal ptrSz, Value.scalar lenSc]` through
+`borrows` or `globals`.
+-/
+def evalSliceFatPtrDerefRead
+    (locals : List LocalSlot)
+    (ptrVal : ProvenancePtr)
+    (ptrSz : Nat)
+    (lenSc : ScalarInt)
+    (restProj : List ProjectionElem)
+    (borrows : List BorrowEntry := .nil)
+    (globals : List CapturedAllocation := .nil)
+    (layouts : LayoutTable := emptyLayoutTable)
+    (callerLocals : List LocalSlot := .nil)
+    (pointeeTyOpt : Option Ty := .none) :
+    PlaceReadResult :=
+  let ptrBytes := layoutPointerBytes layouts
+  match
+    Bool.and
+      (Nat.beq ptrSz ptrBytes)
+      (Nat.beq lenSc.sizeBytes ptrBytes)
+  with
+  | false => .ub
+  | true =>
+    let elemKind : RigidTy :=
+      match pointeeTyOpt with
+      | .some { kind := .slice ek, .. } => ek
+      | .some { kind := .array ek _, .. } => ek
+      | .some { kind := .str, .. } => .uint .u8
+      | _ =>
+        match LayoutTable.lookup layouts 0 with
+        | .some l =>
+          match l.fields with
+          | .primitive => uintRigidTyOfStride l.size.bytes
+          | .array stride _ => uintRigidTyOfStride stride.bytes
+          | _ => .uint .u8
+        | .none => .uint .u8
+    match lookupBorrow borrows ptrVal.tag with
+    | .some entry =>
+      match entry.perm with
+      | .disabled => .ub
+      | _ =>
+        let targetRootOpt : Option Value :=
+          match get? locals entry.targetLocal with
+          | .some (.init v) => .some v
+          | .some _ => .none
+          | .none =>
+            match get? callerLocals entry.targetLocal with
+            | .some (.init v) => .some v
+            | _ => .none
+        match targetRootOpt with
+        | .some targetRootVal =>
+          let expSzOpt : Option Nat :=
+            match pointeeTyOpt with
+            | .some _ => rigidTyKindByteSize elemKind
+            | .none => .none
+          match
+            readSliceBackingAggregate?
+              locals
+              targetRootVal
+              entry.targetProjection
+              lenSc.bits
+              expSzOpt
+          with
+          | .some (_, baseIdx, elems) =>
+            let elemSz :=
+              match pointeeTyOpt with
+              | .some _ =>
+                match rigidTyKindByteSize elemKind with
+                | .some n => n
+                | .none => inferElemListByteStride elems
+              | .none => inferElemListByteStride elems
+            match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+            | .none => .ub
+            | .some rawElemOffset =>
+              let elemOffset := Nat.add rawElemOffset baseIdx
+              let remElems := dropValues elemOffset elems
+              match Nat.ble lenSc.bits (length remElems) with
+              | false => .ub
+              | true =>
+                let sliceVal := Value.aggregate 0 (takeValues lenSc.bits remElems)
+                match readProjectedValue locals sliceVal restProj with
+                | .ok fieldVal => .ok fieldVal locals
+                | .ub => .ub
+                | .unsupported => .unsupported
+          | .none =>
+            match readProjectedValue locals targetRootVal entry.targetProjection with
+            | .ok .unit =>
+              match
+                Bool.and
+                  (Nat.beq ptrVal.offsetBytes 0)
+                  (Nat.beq lenSc.bits 0)
+              with
+              | false => .ub
+              | true =>
+                match readProjectedValue locals (.aggregate 0 .nil) restProj with
+                | .ok fieldVal => .ok fieldVal locals
+                | .ub => .ub
+                | .unsupported => .unsupported
+            | _ => .ub
+        | .none => .ub
+    | .none =>
+      match lookupGlobalAlloc globals ptrVal.allocId with
+      | .some alloc =>
+        let elemSz :=
+          match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+          | .some n => n
+          | .none => 1
+        let totalBytes := Nat.mul lenSc.bits elemSz
+        match globalAllocSliceToAbstractBytes alloc ptrVal.offsetBytes totalBytes with
+        | .some absBytes =>
+          let sliceArrTy : Ty := { kind := .array elemKind lenSc.bits, layoutIdx := 0 }
+          match decodeValueFromBytes defaultCodecFuel layouts sliceArrTy absBytes with
+          | .some decodedVal =>
+            match readProjectedValue locals decodedVal restProj with
+            | .ok fieldVal => .ok fieldVal locals
+            | .ub => .ub
+            | .unsupported => .unsupported
+          | .none => .ub
+        | .none => .ub
+      | .none =>
+        let isNonNullEmptySlice :=
+          Bool.and
+            (Nat.beq lenSc.bits 0)
+            (Bool.not
+              (Bool.and
+                (Nat.beq ptrVal.allocId 0)
+                (Nat.beq ptrVal.offsetBytes 0)))
+        match isNonNullEmptySlice with
+        | false => .ub
+        | true =>
+          match readProjectedValue locals (.aggregate 0 .nil) restProj with
+          | .ok fieldVal => .ok fieldVal locals
+          | .ub => .ub
+          | .unsupported => .unsupported
+
+/--
+Evaluate a `Place` read in `locals` with active borrow table `borrows`, global
+allocations `globals`, layout table `layouts`, caller locals `callerLocals`, and
+local declarations `localDecls`.
+
+When `p.projection` begins with `.deref` and targets a global allocation in
+`globals` (not backed by a stack borrow in `borrows`), uses `pointeeTy` from
+`localDecls` (or `layouts` / projection structure) to decode non-scalar
+aggregates and arrays via `decodeValueFromBytes` when `readGlobalScalar` does
+not apply.
+-/
+def evalPlaceRead
+    (locals : List LocalSlot)
+    (p : Place)
+    (borrows : List BorrowEntry := .nil)
+    (globals : List CapturedAllocation := .nil)
+    (layouts : LayoutTable := emptyLayoutTable)
+    (callerLocals : List LocalSlot := .nil)
+    (localDecls : List LocalDecl := .nil) :
+    PlaceReadResult :=
+  match p.projection with
+  | .deref :: restProj =>
+    let pointeeTyOpt :=
+      placeTy localDecls layouts { local_ := p.local_, projection := .deref :: .nil }
+    match get? locals p.local_ with
+    | .some (.init (.ptr ptrVal sz)) =>
+      match lookupBorrow borrows ptrVal.tag with
+      | .some entry =>
+        match entry.perm with
+        | .disabled => .ub
+        | _ =>
+          match get? locals entry.targetLocal with
+          | .some (.init targetRootVal) =>
+            match
+              resolveStackThinPtrTargetProj?
+                locals
+                targetRootVal
+                entry
+                ptrVal
+                restProj
+                localDecls
+                layouts
+                pointeeTyOpt
+            with
+            | .none => .ub
+            | .some fullProj =>
+              match readProjectedValue locals targetRootVal fullProj with
+              | .ok fieldVal => .ok fieldVal locals
+              | .ub => .ub
+              | .unsupported => .unsupported
+          | .some _ => .ub
+          | .none =>
+            match get? callerLocals entry.targetLocal with
+            | .some (.init targetRootVal) =>
+              match
+                resolveStackThinPtrTargetProj?
+                  locals
+                  targetRootVal
+                  entry
+                  ptrVal
+                  restProj
+                  localDecls
+                  layouts
+                  pointeeTyOpt
+              with
+              | .none => .ub
+              | .some fullProj =>
+                match readProjectedValue locals targetRootVal fullProj with
+                | .ok fieldVal => .ok fieldVal locals
+                | .ub => .ub
+                | .unsupported => .unsupported
+            | _ => .ub
+      | .none =>
+        match lookupGlobalAlloc globals ptrVal.allocId with
+        | .some alloc =>
+          evalGlobalDerefRead
+            locals
+            alloc
+            ptrVal.offsetBytes
+            sz
+            restProj
+            layouts
+            pointeeTyOpt
+        | .none => .ub
+    | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
+      evalSliceFatPtrDerefRead
+        locals
+        ptrVal
+        ptrSz
+        lenSc
+        restProj
+        borrows
+        globals
+        layouts
+        callerLocals
+        pointeeTyOpt
+    | _ => .ub
+  | _ =>
+    match get? locals p.local_ with
+    | .some (.init rootVal) =>
+      match readProjectedValue locals rootVal p.projection with
+      | .ok fieldVal => .ok fieldVal locals
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .some .uninit => .ub
+    | .some .dead => .ub
+    | .none => .ub
+
+/--
 Evaluate an `Operand` in `locals` with active borrow table `borrows`, global
 allocations `globals`, and layout table `layouts`, supporting root locals
 (`projection = []`), dereferences (`ProjectionElem.deref` resolved through
 `borrows` or `globals`), indirect and slice global constants
 (`ConstValue.indirect` and `ConstValue.slice`), and nested `.field`, `.downcast`,
-`.index`, `.constantIndex`, `.subslice`, and `.opaqueCast` projections.
+`.index`, `.constantIndex`, `.subslice`, `.opaqueCast`, and `.unwrapUnsafeBinder`
+projections.
 
 In `Runtime(PostCleanup)` MIR, reading a root local via `Operand.move`
 transitions its slot to `.uninit`, whereas a projected or dereferenced read
@@ -1671,68 +2614,14 @@ def evalOperand
     match c.val with
     | .indirect allocId offset =>
       match lookupGlobalAlloc globals allocId with
-      | .some alloc =>
-        match tyScalarBytes c.ty with
-        | .some n =>
-          match readGlobalScalar alloc offset n with
-          | .some sc => .ok (.scalar sc) locals
-          | .none => .ub
-        | .none =>
-          let sz :=
-            match rigidTyByteSize layouts c.ty with
-            | .some n => n
-            | .none => Nat.sub (length alloc.bytes) offset
-          match globalAllocSliceToAbstractBytes alloc offset sz with
-          | .some absBytes =>
-            match
-              decodeValueFromBytes defaultCodecFuel layouts c.ty absBytes
-            with
-            | .some v => .ok v locals
-            | .none =>
-              match readGlobalScalar alloc offset sz with
-              | .some sc => .ok (.scalar sc) locals
-              | .none => .ub
-          | .none => .ub
-      | .none => .unsupported
-    | .slice (.ptr p sz) lenMeta =>
-      match lookupGlobalAlloc globals p.allocId with
-      | .some alloc =>
-        let elemKind := sliceConstElemKind c.ty
-        let elemSz :=
-          match rigidTyKindByteSize elemKind with
-          | .some n => n
-          | .none => 1
-        let totalBytes := Nat.mul lenMeta elemSz
-        match globalAllocSliceToAbstractBytes alloc p.offsetBytes totalBytes with
-        | .some absBytes =>
-          match
-            decodeArrayChunksWith
-              (fun chunk =>
-                decodeValueFromBytes defaultCodecFuel layouts
-                  { kind := elemKind, layoutIdx := 0 } chunk)
-              elemSz
-              lenMeta
-              absBytes
-          with
-          | .some elems => .ok (.aggregate 0 elems) locals
-          | .none => .ub
+      | .some _ =>
+        match evalConstValue (.indirect allocId offset) c.ty globals layouts with
+        | .some v => .ok v locals
         | .none => .ub
-      | .none =>
-        .ok
-          (.aggregate 0
-            (.ptr p sz ::
-              .scalar ⟨lenMeta, 8⟩ ::
-              .nil))
-          locals
-    | .slice (.int s) lenMeta =>
-      .ok
-        (.aggregate 0
-          (.scalar s ::
-            .scalar ⟨lenMeta, 8⟩ ::
-            .nil))
-        locals
+      | .none => .unsupported
+    | .unevaluated _ => .unsupported
     | cv =>
-      match evalConstValue cv with
+      match evalConstValue cv c.ty globals layouts with
       | .some v => .ok v locals
       | .none => .unsupported
   | .copy p =>
@@ -1745,19 +2634,11 @@ def evalOperand
           match entry.perm with
           | .disabled => .ub
           | _ =>
-            match get? locals entry.targetLocal with
-            | .some (.init targetRootVal) =>
-              let fullProj :=
-                match entry.targetProjection with
-                | .nil => restProj
-                | ph :: pt => ph :: appendProjections pt restProj
-              match readProjectedValue locals targetRootVal fullProj with
-              | .ok fieldVal => .ok fieldVal locals
-              | .ub => .ub
-              | .unsupported => .unsupported
-            | .some _ => .ub
-            | .none =>
-              match get? callerLocals entry.targetLocal with
+            match
+              needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+            with
+            | false =>
+              match get? locals entry.targetLocal with
               | .some (.init targetRootVal) =>
                 let fullProj :=
                   match entry.targetProjection with
@@ -1767,18 +2648,79 @@ def evalOperand
                 | .ok fieldVal => .ok fieldVal locals
                 | .ub => .ub
                 | .unsupported => .unsupported
-              | _ => .ub
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  let fullProj :=
+                    match entry.targetProjection with
+                    | .nil => restProj
+                    | ph :: pt => ph :: appendProjections pt restProj
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | _ => .ub
+            | true =>
+              match get? locals entry.targetLocal with
+              | .some (.init targetRootVal) =>
+                match
+                  resolveStackThinPtrTargetProj?
+                    locals
+                    targetRootVal
+                    entry
+                    ptrVal
+                    restProj
+                with
+                | .none => .ub
+                | .some fullProj =>
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  match
+                    resolveStackThinPtrTargetProj?
+                      locals
+                      targetRootVal
+                      entry
+                      ptrVal
+                      restProj
+                  with
+                  | .none => .ub
+                  | .some fullProj =>
+                    match readProjectedValue locals targetRootVal fullProj with
+                    | .ok fieldVal => .ok fieldVal locals
+                    | .ub => .ub
+                    | .unsupported => .unsupported
+                | _ => .ub
         | .none =>
           match lookupGlobalAlloc globals ptrVal.allocId with
           | .some alloc =>
-            match readGlobalScalar alloc ptrVal.offsetBytes sz with
-            | .some sc =>
-              match readProjectedValue locals (.scalar sc) restProj with
-              | .ok fieldVal => .ok fieldVal locals
-              | .ub => .ub
-              | .unsupported => .unsupported
-            | .none => .ub
+            evalGlobalDerefRead
+              locals
+              alloc
+              ptrVal.offsetBytes
+              sz
+              restProj
+              layouts
+              .none
           | .none => .ub
+      | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
+        evalSliceFatPtrDerefRead
+          locals
+          ptrVal
+          ptrSz
+          lenSc
+          restProj
+          borrows
+          globals
+          layouts
+          callerLocals
+          .none
       | _ => .ub
     | _ =>
       match get? locals p.local_ with
@@ -1809,19 +2751,11 @@ def evalOperand
           match entry.perm with
           | .disabled => .ub
           | _ =>
-            match get? locals entry.targetLocal with
-            | .some (.init targetRootVal) =>
-              let fullProj :=
-                match entry.targetProjection with
-                | .nil => restProj
-                | ph :: pt => ph :: appendProjections pt restProj
-              match readProjectedValue locals targetRootVal fullProj with
-              | .ok fieldVal => .ok fieldVal locals
-              | .ub => .ub
-              | .unsupported => .unsupported
-            | .some _ => .ub
-            | .none =>
-              match get? callerLocals entry.targetLocal with
+            match
+              needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+            with
+            | false =>
+              match get? locals entry.targetLocal with
               | .some (.init targetRootVal) =>
                 let fullProj :=
                   match entry.targetProjection with
@@ -1831,18 +2765,79 @@ def evalOperand
                 | .ok fieldVal => .ok fieldVal locals
                 | .ub => .ub
                 | .unsupported => .unsupported
-              | _ => .ub
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  let fullProj :=
+                    match entry.targetProjection with
+                    | .nil => restProj
+                    | ph :: pt => ph :: appendProjections pt restProj
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | _ => .ub
+            | true =>
+              match get? locals entry.targetLocal with
+              | .some (.init targetRootVal) =>
+                match
+                  resolveStackThinPtrTargetProj?
+                    locals
+                    targetRootVal
+                    entry
+                    ptrVal
+                    restProj
+                with
+                | .none => .ub
+                | .some fullProj =>
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  match
+                    resolveStackThinPtrTargetProj?
+                      locals
+                      targetRootVal
+                      entry
+                      ptrVal
+                      restProj
+                  with
+                  | .none => .ub
+                  | .some fullProj =>
+                    match readProjectedValue locals targetRootVal fullProj with
+                    | .ok fieldVal => .ok fieldVal locals
+                    | .ub => .ub
+                    | .unsupported => .unsupported
+                | _ => .ub
         | .none =>
           match lookupGlobalAlloc globals ptrVal.allocId with
           | .some alloc =>
-            match readGlobalScalar alloc ptrVal.offsetBytes sz with
-            | .some sc =>
-              match readProjectedValue locals (.scalar sc) restProj with
-              | .ok fieldVal => .ok fieldVal locals
-              | .ub => .ub
-              | .unsupported => .unsupported
-            | .none => .ub
+            evalGlobalDerefRead
+              locals
+              alloc
+              ptrVal.offsetBytes
+              sz
+              restProj
+              layouts
+              .none
           | .none => .ub
+      | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
+        evalSliceFatPtrDerefRead
+          locals
+          ptrVal
+          ptrSz
+          lenSc
+          restProj
+          borrows
+          globals
+          layouts
+          callerLocals
+          .none
       | _ => .ub
     | proj :: rest =>
       match get? locals p.local_ with
@@ -1886,10 +2881,261 @@ def evalOperands
     | .unsupported => .unsupported
 
 /--
+Extract the underlying `ProvenancePtr` from either a thin pointer (`Value.ptr`)
+or a 2-element slice fat pointer
+(`Value.aggregate 0 [Value.ptr ptrVal 8, Value.scalar ⟨_, 8⟩]`).
+-/
+@[reducible]
+def extractDerefPtrVal? : Value → Option ProvenancePtr
+  | .ptr ptrVal _ => .some ptrVal
+  | .aggregate 0 (.ptr ptrVal 8 :: .scalar ⟨_, 8⟩ :: .nil) => .some ptrVal
+  | _ => .none
+
+/--
+Resolve dynamic `.index idxLocal` projection elements against the current
+`locals` state, converting each `.index idxLocal` whose index local holds an
+initialized `.scalar sc` into `.constantIndex sc.bits 0 false` so subsequent
+dereferences and overlap checks do not depend on whether the temporary index
+local remains live.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1166-L1185>
+
+> "- [`Index`](ProjectionElem::Index): `Index` projections take their parent
+>   place and create a place referring to an element of an array or slice,
+>   indexed by the given `Local`. Note that the `Local` must be initialized
+>   before the projection is used."
+
+Reference (The Rust Reference, "Array and slice indexing expressions"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/array-expr.html#array-and-slice-indexing-expressions>
+
+> "Array and slice-typed values can be indexed by writing a
+> square-bracket-enclosed expression of type usize (the index) after them."
+-/
+@[reducible]
+def resolveBorrowProjectionElems
+    (locals : List LocalSlot) :
+    List ProjectionElem → Option (List ProjectionElem)
+  | .nil => .some .nil
+  | .index idxLocal :: rest =>
+    match get? locals idxLocal with
+    | .some (.init (.scalar sc)) =>
+      match resolveBorrowProjectionElems locals rest with
+      | .some rest' => .some (.constantIndex sc.bits 0 false :: rest')
+      | .none => .none
+    | _ => .none
+  | elem :: rest =>
+    match resolveBorrowProjectionElems locals rest with
+    | .some rest' => .some (elem :: rest')
+    | .none => .none
+
+/--
+Alias for `resolveBorrowProjectionElems`.
+-/
+abbrev resolveIndexProjections := resolveBorrowProjectionElems
+
+/--
+Compute the effective root projection path on `entry.targetLocal` accessed by a
+dereferenced write through `ptrOrFatVal` (`BorrowEntry` `entry`) with post-deref
+projection suffix `restProj`.
+
+Resolves dynamic `.index idxLocal` projections against `indexLocals` and, when
+`ptrOrFatVal` is a 2-element slice fat pointer with `ptrVal.offsetBytes > 0`,
+prepends `.subslice elemOffset (elemOffset + lenSc.bits) false` to the suffix.
+-/
+@[reducible]
+def resolveDerefWriteFullProj
+    (indexLocals : List LocalSlot)
+    (targetLocals : List LocalSlot)
+    (ptrOrFatVal : Value)
+    (entry : BorrowEntry)
+    (restProj : List ProjectionElem)
+    (callerLocals : List LocalSlot := .nil) :
+    List ProjectionElem :=
+  let resolvedRest :=
+    match resolveBorrowProjectionElems indexLocals restProj with
+    | .some rp => rp
+    | .none => restProj
+  let targetRootOpt : Option Value :=
+    match get? targetLocals entry.targetLocal with
+    | .some (.init v) => .some v
+    | .some _ => .none
+    | .none =>
+      match get? callerLocals entry.targetLocal with
+      | .some (.init v) => .some v
+      | _ => .none
+  match ptrOrFatVal with
+  | .ptr ptrVal _ =>
+    match
+      needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+    with
+    | false =>
+      let rawFull :=
+        match entry.targetProjection with
+        | .nil => resolvedRest
+        | ph :: pt => ph :: appendProjections pt resolvedRest
+      normalizeSubsliceProjections (stripTransparentProjections rawFull)
+    | true =>
+      match targetRootOpt with
+      | .some targetRootVal =>
+        match
+          resolveStackThinPtrTargetProj?
+            indexLocals
+            targetRootVal
+            entry
+            ptrVal
+            resolvedRest
+        with
+        | .some resolvedFull => resolvedFull
+        | .none =>
+          let rawFull :=
+            match entry.targetProjection with
+            | .nil => resolvedRest
+            | ph :: pt => ph :: appendProjections pt resolvedRest
+          normalizeSubsliceProjections (stripTransparentProjections rawFull)
+      | .none =>
+        let rawFull :=
+          match entry.targetProjection with
+          | .nil => resolvedRest
+          | ph :: pt => ph :: appendProjections pt resolvedRest
+        normalizeSubsliceProjections (stripTransparentProjections rawFull)
+  | _ =>
+    let (containerProj, effectiveSuffix) :=
+      match ptrOrFatVal with
+      | .aggregate 0 (.ptr ptrVal 8 :: .scalar lenSc :: .nil) =>
+        match targetRootOpt with
+        | .some targetRootVal =>
+          match
+            readSliceBackingAggregate?
+              indexLocals
+              targetRootVal
+              entry.targetProjection
+              lenSc.bits
+          with
+          | .some (cProj, baseIdx, elems) =>
+            let elemSz := inferElemListByteStride elems
+            match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+            | .some rawElemOffset =>
+              let elemOffset := Nat.add rawElemOffset baseIdx
+              (cProj,
+               ProjectionElem.subslice
+                 elemOffset
+                 (Nat.add elemOffset lenSc.bits)
+                 false ::
+                 resolvedRest)
+            | .none => (entry.targetProjection, resolvedRest)
+          | .none => (entry.targetProjection, resolvedRest)
+        | .none => (entry.targetProjection, resolvedRest)
+      | _ => (entry.targetProjection, resolvedRest)
+    let rawFull :=
+      match containerProj with
+      | .nil => effectiveSuffix
+      | ph :: pt => ph :: appendProjections pt effectiveSuffix
+    normalizeSubsliceProjections (stripTransparentProjections rawFull)
+
+/--
+Update the referent root aggregate `targetRootVal` at `targetProjection` when
+writing `val` through a dereferenced slice fat pointer
+`Value.aggregate 0 [Value.ptr ptrVal ptrSz, Value.scalar lenSc]` with trailing
+projection `restProj`.
+
+Enforces 8-byte pointer and metadata widths, converts `ptrVal.offsetBytes` into
+an element offset `elemOffset`, bounds-checks the `[elemOffset .. elemOffset +
+lenSc.bits)` slice window within the backing aggregate, applies
+`writeProjectedValue` on that `lenSc.bits`-element slice window, and splices the
+updated slice elements back into `targetRootVal`.
+-/
+def writeSliceFatPtrTargetValue
+    (indexLocals : List LocalSlot)
+    (targetRootVal : Value)
+    (targetProjection : List ProjectionElem)
+    (ptrVal : ProvenancePtr)
+    (ptrSz : Nat)
+    (lenSc : ScalarInt)
+    (restProj : List ProjectionElem)
+    (val : Value) :
+    ProjWriteResult :=
+  match
+    Bool.and
+      (Nat.beq ptrSz 8)
+      (Nat.beq lenSc.sizeBytes 8)
+  with
+  | false => .ub
+  | true =>
+    match
+      readSliceBackingAggregate?
+        indexLocals
+        targetRootVal
+        targetProjection
+        lenSc.bits
+    with
+    | .some (containerProj, baseIdx, elems) =>
+      let elemSz := inferElemListByteStride elems
+      match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+      | .none => .ub
+      | .some rawElemOffset =>
+        let elemOffset := Nat.add rawElemOffset baseIdx
+        let endOffset := Nat.add elemOffset lenSc.bits
+        match Nat.ble endOffset (length elems) with
+        | false => .ub
+        | true =>
+          let sliceElems := takeValues lenSc.bits (dropValues elemOffset elems)
+          match
+            writeProjectedValue
+              indexLocals
+              (.aggregate 0 sliceElems)
+              restProj
+              val
+          with
+          | .ok (.aggregate 0 updatedSliceElems) =>
+            match
+              replaceSubslice
+                elems
+                elemOffset
+                endOffset
+                false
+                updatedSliceElems
+            with
+            | .some elems' =>
+              writeProjectedValue
+                indexLocals
+                targetRootVal
+                containerProj
+                (.aggregate 0 elems')
+            | .none => .ub
+          | .ok _ => .ub
+          | .ub => .ub
+          | .unsupported => .unsupported
+    | .none =>
+      match readProjectedValue indexLocals targetRootVal targetProjection with
+      | .ok .unit =>
+        match
+          Bool.and
+            (Nat.beq ptrVal.offsetBytes 0)
+            (Nat.beq lenSc.bits 0)
+        with
+        | false => .ub
+        | true =>
+          match
+            writeProjectedValue
+              indexLocals
+              (.aggregate 0 .nil)
+              restProj
+              val
+          with
+          | .ok (.aggregate 0 .nil) => .ok targetRootVal
+          | .ok _ => .ub
+          | .ub => .ub
+          | .unsupported => .unsupported
+      | _ => .ub
+
+/--
 Write `val` to `dst` in `locals` using active borrow table `borrows`, supporting
 root locals (`projection = []`), dereference projections (`ProjectionElem.deref`
 checked against `TreeBorrowPerm`), and nested `.field`, `.downcast`, `.index`,
-`.constantIndex`, and `.opaqueCast` projections.
+`.constantIndex`, `.subslice`, `.opaqueCast`, and `.unwrapUnsafeBinder`
+projections.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -1924,32 +3170,87 @@ def writePlaceValue
         | .frozen => .ub
         | .disabled => .ub
         | _ =>
-          let fullProj :=
-            match entry.targetProjection with
-            | .nil => restProj
-            | ph :: pt => ph :: appendProjections pt restProj
-          match fullProj with
-          | .nil =>
-            match get? locals entry.targetLocal with
-            | .some .dead => .ub
-            | .some _ =>
-              match set? locals entry.targetLocal (.init val) with
-              | .some locals' => .ok locals'
+          match
+            needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+          with
+          | false =>
+            let fullProj :=
+              match entry.targetProjection with
+              | .nil => restProj
+              | ph :: pt => ph :: appendProjections pt restProj
+            match fullProj with
+            | .nil =>
+              match get? locals entry.targetLocal with
+              | .some .dead => .ub
+              | .some _ =>
+                match set? locals entry.targetLocal (.init val) with
+                | .some locals' => .ok locals'
+                | .none => .ub
               | .none => .ub
-            | .none => .ub
-          | pHead :: pTail =>
+            | pHead :: pTail =>
+              match get? locals entry.targetLocal with
+              | .some (.init targetRootVal) =>
+                match
+                  writeProjectedValue locals targetRootVal (pHead :: pTail) val
+                with
+                | .ok targetRootVal' =>
+                  match set? locals entry.targetLocal (.init targetRootVal') with
+                  | .some locals' => .ok locals'
+                  | .none => .ub
+                | .ub => .ub
+                | .unsupported => .unsupported
+              | _ => .ub
+          | true =>
             match get? locals entry.targetLocal with
             | .some (.init targetRootVal) =>
               match
-                writeProjectedValue locals targetRootVal (pHead :: pTail) val
+                resolveStackThinPtrTargetProj?
+                  locals
+                  targetRootVal
+                  entry
+                  ptrVal
+                  restProj
               with
-              | .ok targetRootVal' =>
-                match set? locals entry.targetLocal (.init targetRootVal') with
-                | .some locals' => .ok locals'
-                | .none => .ub
-              | .ub => .ub
-              | .unsupported => .unsupported
+              | .some (pHead :: pTail) =>
+                match
+                  writeProjectedValue locals targetRootVal (pHead :: pTail) val
+                with
+                | .ok targetRootVal' =>
+                  match set? locals entry.targetLocal (.init targetRootVal') with
+                  | .some locals' => .ok locals'
+                  | .none => .ub
+                | .ub => .ub
+                | .unsupported => .unsupported
+              | _ => .ub
             | _ => .ub
+      | .none => .ub
+    | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
+      match lookupBorrow borrows ptrVal.tag with
+      | .some entry =>
+        match entry.perm with
+        | .frozen => .ub
+        | .disabled => .ub
+        | _ =>
+          match get? locals entry.targetLocal with
+          | .some (.init targetRootVal) =>
+            match
+              writeSliceFatPtrTargetValue
+                locals
+                targetRootVal
+                entry.targetProjection
+                ptrVal
+                ptrSz
+                lenSc
+                restProj
+                val
+            with
+            | .ok targetRootVal' =>
+              match set? locals entry.targetLocal (.init targetRootVal') with
+              | .some locals' => .ok locals'
+              | .none => .ub
+            | .ub => .ub
+            | .unsupported => .unsupported
+          | _ => .ub
       | .none => .ub
     | _ => .ub
   | proj :: rest =>
@@ -1999,26 +3300,32 @@ def evalPlaceWrite
           .nil
       | .deref :: restProj =>
         match get? locals dst.local_ with
-        | .some (.init (.ptr ptrVal _)) =>
-          match lookupBorrow borrows ptrVal.tag with
-          | .some entry =>
-            let fullProj :=
-              match entry.targetProjection with
-              | .nil => restProj
-              | ph :: pt => ph :: appendProjections pt restProj
-            match borrows with
-            | b₁ :: b₂ :: restBorrows =>
-              let allBorrows := b₁ :: b₂ :: restBorrows
-              hasProtectedTreeWriteConflict
-                allBorrows
-                allBorrows
-                activeProtectors
-                entry.targetLocal
-                (.some ptrVal.tag)
-                fullProj
-                entry.rangeOffset
-                entry.rangeLen
-            | _ =>
+| .some (.init ptrOrFatVal) =>
+          match extractDerefPtrVal? ptrOrFatVal with
+          | .some ptrVal =>
+            match lookupBorrow borrows ptrVal.tag with
+            | .some entry =>
+              let fullProj :=
+                resolveDerefWriteFullProj
+                  locals
+                  locals
+                  ptrOrFatVal
+                  entry
+                  restProj
+              match borrows with
+                          | b₁ :: b₂ :: restBorrows =>
+                            let allBorrows := b₁ :: b₂ :: restBorrows
+                            hasProtectedTreeWriteConflict
+                              allBorrows
+                              allBorrows
+                              activeProtectors
+                              entry.targetLocal
+                              (.some ptrVal.tag)
+                              fullProj
+                              entry.rangeOffset
+                              entry.rangeLen
+                          | _ =>
+
               hasProtectedWriteConflict
                 borrows
                 activeProtectors
@@ -2027,15 +3334,20 @@ def evalPlaceWrite
                 fullProj
                 entry.rangeOffset
                 entry.rangeLen
+            | .none => false
           | .none => false
         | _ => false
       | proj :: rest =>
+        let resolvedLocalProj :=
+          match resolveBorrowProjectionElems locals (proj :: rest) with
+          | .some rp => rp
+          | .none => proj :: rest
         hasProtectedWriteConflict
           borrows
           activeProtectors
           dst.local_
           .none
-          (proj :: rest)
+          resolvedLocalProj
     match conflict with
     | true => .ub
     | false => writePlaceValue locals borrows dst val
@@ -2084,38 +3396,104 @@ def writeCallerPlaceValue
           match get? frameLocals entry.targetLocal with
           | .some _ => .ub
           | .none =>
-            let fullProj :=
-              match entry.targetProjection with
-              | .nil => restProj
-              | ph :: pt => ph :: appendProjections pt restProj
-            match fullProj with
-            | .nil =>
-              match get? callerLocals entry.targetLocal with
-              | .some .dead => .ub
-              | .some _ =>
-                match set? callerLocals entry.targetLocal (.init val) with
-                | .some callerLocals' => .ok callerLocals'
+            match
+              needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes
+            with
+            | false =>
+              let fullProj :=
+                match entry.targetProjection with
+                | .nil => restProj
+                | ph :: pt => ph :: appendProjections pt restProj
+              match fullProj with
+              | .nil =>
+                match get? callerLocals entry.targetLocal with
+                | .some .dead => .ub
+                | .some _ =>
+                  match set? callerLocals entry.targetLocal (.init val) with
+                  | .some callerLocals' => .ok callerLocals'
+                  | .none => .ub
                 | .none => .ub
-              | .none => .ub
-            | pHead :: pTail =>
+              | pHead :: pTail =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  match
+                    writeProjectedValue
+                      frameLocals
+                      targetRootVal
+                      (pHead :: pTail)
+                      val
+                  with
+                  | .ok targetRootVal' =>
+                    match
+                      set? callerLocals entry.targetLocal (.init targetRootVal')
+                    with
+                    | .some callerLocals' => .ok callerLocals'
+                    | .none => .ub
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | _ => .ub
+            | true =>
               match get? callerLocals entry.targetLocal with
               | .some (.init targetRootVal) =>
                 match
-                  writeProjectedValue
+                  resolveStackThinPtrTargetProj?
                     frameLocals
                     targetRootVal
-                    (pHead :: pTail)
-                    val
+                    entry
+                    ptrVal
+                    restProj
                 with
-                | .ok targetRootVal' =>
+                | .some (pHead :: pTail) =>
                   match
-                    set? callerLocals entry.targetLocal (.init targetRootVal')
+                    writeProjectedValue
+                      frameLocals
+                      targetRootVal
+                      (pHead :: pTail)
+                      val
                   with
-                  | .some callerLocals' => .ok callerLocals'
-                  | .none => .ub
-                | .ub => .ub
-                | .unsupported => .unsupported
+                  | .ok targetRootVal' =>
+                    match
+                      set? callerLocals entry.targetLocal (.init targetRootVal')
+                    with
+                    | .some callerLocals' => .ok callerLocals'
+                    | .none => .ub
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | _ => .ub
               | _ => .ub
+      | .none => .ub
+    | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
+      match lookupBorrow borrows ptrVal.tag with
+      | .some entry =>
+        match entry.perm with
+        | .frozen => .ub
+        | .disabled => .ub
+        | _ =>
+          match get? frameLocals entry.targetLocal with
+          | .some _ => .ub
+          | .none =>
+            match get? callerLocals entry.targetLocal with
+            | .some (.init targetRootVal) =>
+              match
+                writeSliceFatPtrTargetValue
+                  frameLocals
+                  targetRootVal
+                  entry.targetProjection
+                  ptrVal
+                  ptrSz
+                  lenSc
+                  restProj
+                  val
+              with
+              | .ok targetRootVal' =>
+                match
+                  set? callerLocals entry.targetLocal (.init targetRootVal')
+                with
+                | .some callerLocals' => .ok callerLocals'
+                | .none => .ub
+              | .ub => .ub
+              | .unsupported => .unsupported
+            | _ => .ub
       | .none => .ub
     | _ => .ub
   | _ => .ub
@@ -2145,26 +3523,32 @@ def evalCallerPlaceWrite
       match dst.projection with
       | .deref :: restProj =>
         match get? frameLocals dst.local_ with
-        | .some (.init (.ptr ptrVal _)) =>
-          match lookupBorrow borrows ptrVal.tag with
-          | .some entry =>
-            let fullProj :=
-              match entry.targetProjection with
-              | .nil => restProj
-              | ph :: pt => ph :: appendProjections pt restProj
-            match borrows with
-            | b₁ :: b₂ :: restBorrows =>
-              let allBorrows := b₁ :: b₂ :: restBorrows
-              hasProtectedTreeWriteConflict
-                allBorrows
-                allBorrows
-                activeProtectors
-                entry.targetLocal
-                (.some ptrVal.tag)
-                fullProj
-                entry.rangeOffset
-                entry.rangeLen
-            | _ =>
+| .some (.init ptrOrFatVal) =>
+          match extractDerefPtrVal? ptrOrFatVal with
+          | .some ptrVal =>
+            match lookupBorrow borrows ptrVal.tag with
+            | .some entry =>
+              let fullProj :=
+                resolveDerefWriteFullProj
+                  locals
+                  locals
+                  ptrOrFatVal
+                  entry
+                  restProj
+              match borrows with
+                          | b₁ :: b₂ :: restBorrows =>
+                            let allBorrows := b₁ :: b₂ :: restBorrows
+                            hasProtectedTreeWriteConflict
+                              allBorrows
+                              allBorrows
+                              activeProtectors
+                              entry.targetLocal
+                              (.some ptrVal.tag)
+                              fullProj
+                              entry.rangeOffset
+                              entry.rangeLen
+                          | _ =>
+
               hasProtectedWriteConflict
                 borrows
                 activeProtectors
@@ -2173,6 +3557,7 @@ def evalCallerPlaceWrite
                 fullProj
                 entry.rangeOffset
                 entry.rangeLen
+            | .none => false
           | .none => false
         | _ => false
       | _ => false
@@ -2194,7 +3579,8 @@ def invalidateDerefWriteBorrows
     (locals₁ : List LocalSlot)
     (borrows : List BorrowEntry)
     (dst : Place)
-    (restProj : List ProjectionElem) :
+    (restProj : List ProjectionElem)
+    (callerLocals : List LocalSlot := .nil) :
     List BorrowEntry :=
   match borrows with
   | .nil => .nil
@@ -2333,43 +3719,901 @@ def evalByteCast
             | .none => .ub
 
 /--
-Resolve dynamic `.index idxLocal` projection elements against the current
-`locals` state at borrow creation time, converting each `.index idxLocal`
-whose index local holds an initialized `.scalar sc` into
-`.constantIndex sc.bits 0 false` so subsequent dereferences do not depend on
-whether the temporary index local remains live.
+Test whether a `CastKind.pointerCoercion` tag string denotes function-item or
+non-capturing closure reification to a function pointer
+(`PointerCoercion::ReifyFnPointer` or `PointerCoercion::ClosureFnPointer`).
+
+Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L18-L41>
+
+> "pub enum PointerCoercion {
+>     /// Go from a fn-item type to a fn-pointer type.
+>     ReifyFnPointer(Safety),
+>
+>     /// Go from a safe fn pointer to an unsafe fn pointer.
+>     UnsafeFnPointer,
+>
+>     /// Go from a non-capturing closure to a fn pointer or an unsafe fn pointer.
+>     /// It cannot convert a closure that requires unsafe.
+>     ClosureFnPointer(Safety),"
+-/
+def isReifyFnPointerCoercion (coercionKind : String) : Bool :=
+  Bool.or
+    (stringEq coercionKind "ReifyFnPointer")
+    (Bool.or
+      (stringEq coercionKind "ReifyFnPointer(Safe)")
+      (Bool.or
+        (stringEq coercionKind "ReifyFnPointer(Unsafe)")
+        (Bool.or
+          (stringEq coercionKind "ClosureFnPointer")
+          (Bool.or
+            (stringEq coercionKind "ClosureFnPointer(Safe)")
+            (Bool.or
+              (stringEq coercionKind "ClosureFnPointer(Unsafe)")
+              (stringEq coercionKind "UnsafeFnPointer"))))))
+
+/--
+Extract the target `(defPath, typeArgs)` from the `Ty` of a function-item
+operand (`RigidTy.fnDef defPath typeArgs`).
+
+Reference (The Rust Reference, "Function item types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/function-item.html>
+
+> "When referred to, a function item, or the constructor of a tuple-like struct
+> or enum variant, yields a zero-sized value of its function item type. That
+> type uniquely identifies the function"
+-/
+def extractFnItemTarget? : Option Ty → Option (DefPath × List RigidTy)
+  | .some { kind := .fnDef defPath typeArgs, .. } => .some (defPath, typeArgs)
+  | _ => .none
+
+/--
+Test whether `coercionKind` is one of the `PointerCoercion::ClosureFnPointer`
+coercion tags (`"ClosureFnPointer"`, `"ClosureFnPointer(Safe)"`, or
+`"ClosureFnPointer(Unsafe)"`).
+-/
+@[reducible]
+def isClosureFnPointerCoercion (coercionKind : String) : Bool :=
+  Bool.or
+    (stringEq coercionKind "ClosureFnPointer")
+    (Bool.or
+      (stringEq coercionKind "ClosureFnPointer(Safe)")
+      (stringEq coercionKind "ClosureFnPointer(Unsafe)"))
+
+/--
+Extract the target `(defPath, typeArgs)` from the `Ty` of an operand being
+reified into a function pointer via `coercionKind`:
+- For `"ClosureFnPointer"` / `"ClosureFnPointer(Safe)"` /
+  `"ClosureFnPointer(Unsafe)"`, requires a non-capturing closure type
+  `RigidTy.closure defPath .nil`.
+- For `"ReifyFnPointer"` / `"ReifyFnPointer(Safe)"` /
+  `"ReifyFnPointer(Unsafe)"`, requires a function-item type
+  `RigidTy.fnDef defPath typeArgs`.
+
+Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L18-L41>
+
+> "pub enum PointerCoercion {
+>     /// Go from a fn-item type to a fn-pointer type.
+>     ReifyFnPointer(Safety),
+>
+>     /// Go from a safe fn pointer to an unsafe fn pointer.
+>     UnsafeFnPointer,
+>
+>     /// Go from a non-capturing closure to a fn pointer or an unsafe fn pointer.
+>     /// It cannot convert a closure that requires unsafe.
+>     ClosureFnPointer(Safety),"
+-/
+@[reducible]
+def extractReifyCoercionTarget?
+    (coercionKind : String)
+    (tyOpt : Option Ty) :
+    Option (DefPath × List RigidTy) :=
+  match isClosureFnPointerCoercion coercionKind with
+  | true =>
+    match tyOpt with
+    | .some { kind := .closure defPath .nil, .. } => .some (defPath, .nil)
+    | _ => .none
+  | false => extractFnItemTarget? tyOpt
+
+/--
+Test whether `ty` is a thin raw pointer type (`RigidTy.rawPtr _ pointee` where
+`pointee` is not a dynamically-sized `.slice _`, `.str`, or `.dynamic _`).
+
+Reference (The Rust Reference, "Type cast expressions"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#type-cast-expressions>
+
+> "* Function pointer types can be cast to any thin pointer type"
+-/
+def isThinRawPtrTy (ty : Ty) : Bool :=
+  match ty.kind with
+  | .rawPtr _ (.slice _) => false
+  | .rawPtr _ .str => false
+  | .rawPtr _ (.dynamic _) => false
+  | .rawPtr _ _ => true
+  | _ => false
+
+/--
+Check that `fnInputs` pointwise match the `RigidTy` kinds of the leading
+parameter declarations in `paramDecls`.
+
+Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/mod.rs#L225-L246>
+
+> "/// The first local is the return value pointer, followed by `arg_count`
+> /// locals for the function arguments, followed by any user-declared
+> /// variables and temporaries."
+-/
+def calleeParamTysMatch : List RigidTy → List LocalDecl → Bool
+  | .nil, _ => true
+  | _ :: _, .nil => false
+  | inputTy :: restInputs, decl :: restDecls =>
+    Bool.and
+      (rigidTyEq inputTy decl.ty.kind)
+      (calleeParamTysMatch restInputs restDecls)
+
+/--
+Validate that a callee's `localDecls` (when non-empty) has at least `argCount`
+parameter declarations after `_0` and matches the expected function-pointer
+parameter types `fnInputs` and return type `fnOutput`.
+
+When `localDecls` is `.nil` (as in synthetic stub bodies that omit
+`localDecls`), returns `true`.
+
+Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/mod.rs#L225-L246>
+
+> "/// The first local is the return value pointer, followed by `arg_count`
+> /// locals for the function arguments, followed by any user-declared
+> /// variables and temporaries."
+-/
+def calleeLocalDeclsCompatible
+    (localDecls : List LocalDecl)
+    (argCount : Nat)
+    (fnInputs : List RigidTy)
+    (fnOutput : RigidTy) :
+    Bool :=
+  match localDecls with
+  | .nil => true
+  | retDecl :: paramDecls =>
+    Bool.and
+      (Nat.ble argCount (length paramDecls))
+      (Bool.and
+        (rigidTyEq fnOutput retDecl.ty.kind)
+        (calleeParamTysMatch fnInputs paramDecls))
+
+/--
+Check whether an explicit `ReifyFnPointer(Safety)` or `ClosureFnPointer(Safety)`
+coercion tag is compatible with the target function-pointer `Safety` qualifier
+`fnSafety`.
+
+Unparameterized `"ReifyFnPointer"` and `"ClosureFnPointer"` tags accept both
+`.safe` and `.unsafe_`; `"ReifyFnPointer(Safe)"` / `"ClosureFnPointer(Safe)"`
+require `fnSafety = .safe`; `"ReifyFnPointer(Unsafe)"` /
+`"ClosureFnPointer(Unsafe)"` require `fnSafety = .unsafe_`.
+
+Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L18-L41>
+
+> "pub enum PointerCoercion {
+>     /// Go from a fn-item type to a fn-pointer type.
+>     ReifyFnPointer(Safety),
+>
+>     /// Go from a safe fn pointer to an unsafe fn pointer.
+>     UnsafeFnPointer,
+>
+>     /// Go from a non-capturing closure to a fn pointer or an unsafe fn pointer.
+>     /// It cannot convert a closure that requires unsafe.
+>     ClosureFnPointer(Safety),"
+-/
+def reifyCoercionSafetyCompatible
+    (coercionKind : String)
+    (fnSafety : Safety) :
+    Bool :=
+  match
+    Bool.or
+      (stringEq coercionKind "ReifyFnPointer(Safe)")
+      (stringEq coercionKind "ClosureFnPointer(Safe)")
+  with
+  | true => safetyEq fnSafety .safe
+  | false =>
+    match
+      Bool.or
+        (stringEq coercionKind "ReifyFnPointer(Unsafe)")
+        (stringEq coercionKind "ClosureFnPointer(Unsafe)")
+    with
+    | true => safetyEq fnSafety .unsafe_
+    | false => true
+
+/--
+Validate that a linked callee `p` in `callees` (when present) is compatible with
+the target function-pointer signature `(fnInputs, fnOutput, fnAbi)` during
+`ReifyFnPointer`:
+1. Rejects `CallConv.rustIntrinsic` callees (compiler intrinsics cannot be
+   coerced to function pointers).
+2. Requires `length fnInputs == c.argCount` and `callConvEq fnAbi c.fnAbi.conv`.
+3. Requires `calleeLocalDeclsCompatible c.localDecls c.argCount fnInputs fnOutput`.
+
+Reference (The Rust Reference, "Function pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/function-pointer.html>
+
+> "Two function pointer types are compatible if they have the same ABI, safety,
+> parameter types, and return type."
+-/
+def checkCalleeSig
+    (callees : List CapturedMir)
+    (p : DefPath)
+    (fnInputs : List RigidTy)
+    (fnOutput : RigidTy)
+    (fnAbi : CallConv) :
+    Bool :=
+  match callees with
+  | .nil => true
+  | c :: rest =>
+    match stringEq c.defPath p with
+    | true =>
+      Bool.and
+        (Bool.not (callConvEq c.fnAbi.conv .rustIntrinsic))
+        (Bool.and
+          (Nat.beq (length fnInputs) c.argCount)
+          (Bool.and
+            (callConvEq fnAbi c.fnAbi.conv)
+            (calleeLocalDeclsCompatible
+              c.localDecls
+              c.argCount
+              fnInputs
+              fnOutput)))
+    | false => checkCalleeSig rest p fnInputs fnOutput fnAbi
+
+/--
+Evaluate `CastKind.pointerCoercion "UnsafeFnPointer"`, coercing a safe
+function pointer (`RigidTy.fnPtr inputs output .safe abi`) into an `unsafe`
+function pointer (`RigidTy.fnPtr inputs output .unsafe_ abi`) while preserving
+its `ProvenancePtr`.
+
+Faults with `.ub` if `targetTy.kind` is not an `unsafe` function pointer with a
+non-intrinsic `CallConv`, if `op`'s known `operandTy` is not a compatible safe
+function pointer, or if `op` does not evaluate to a valid 8-byte function
+pointer at offset `0` (disjoint from stack borrows in `mem.borrows`).
+
+Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L21-L22>
+
+> "/// Go from a safe fn pointer to an unsafe fn pointer.
+> UnsafeFnPointer,"
+
+Reference (The Rust Reference, "Type coercions"):
+<https://doc.rust-lang.org/1.98.0/reference/type-coercions.html#coercion-types>
+
+> "* Safe function pointer types to `unsafe` function pointer types"
+-/
+def evalUnsafeFnPointer
+    (locals : List LocalSlot)
+    (op : Operand)
+    (targetTy : Ty)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    RvalueEvalResult :=
+  match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+  | .ub => .ub
+  | .unsupported => .unsupported
+  | .ok (.ptr ptrVal sz) locals' =>
+    match targetTy.kind with
+    | .fnPtr dstInputs dstOutput .unsafe_ dstAbi =>
+      match callConvEq dstAbi .rustIntrinsic with
+      | true => .ub
+      | false =>
+        let validSrcTy :=
+          match operandTy localDecls layouts op with
+          | .none => true
+          | .some { kind := .fnPtr srcInputs srcOutput .safe srcAbi, .. } =>
+            Bool.and
+              (callConvEq srcAbi dstAbi)
+              (Bool.and
+                (rigidTyListEq srcInputs dstInputs)
+                (rigidTyEq srcOutput dstOutput))
+          | .some _ => false
+        let validPtr :=
+          Bool.and
+            (Nat.beq sz 8)
+            (Bool.and
+              (Nat.beq ptrVal.offsetBytes 0)
+              (match lookupBorrow mem.borrows ptrVal.tag with
+               | .some _ => false
+               | .none =>
+                 match mem.fnPtrs with
+                 | .nil => isFnPtrAllocId ptrVal.allocId
+                 | _ :: _ =>
+                   match lookupFnPtr mem.fnPtrs ptrVal.allocId with
+                   | .none => false
+                   | .some entry =>
+                     match entry.fnSig with
+                     | .none => true
+                     | .some (.fnPtr sigInputs sigOutput .safe sigAbi) =>
+                       Bool.and
+                         (callConvEq sigAbi dstAbi)
+                         (Bool.and
+                           (rigidTyListEq sigInputs dstInputs)
+                           (rigidTyEq sigOutput dstOutput))
+                     | .some _ => false))
+        match Bool.and validSrcTy validPtr with
+        | true => .ok (.ptr ptrVal 8) locals' mem
+        | false => .ub
+    | _ => .ub
+  | .ok _ _ => .ub
+
+/--
+Check whether `srcKind` and `dstKind` form a valid array-to-slice pointer or
+reference unsizing coercion (`&[T; N]` / `&mut [T; N]` / `*const [T; N]` /
+`*mut [T; N]` to `&[T]` / `&mut [T]` / `*const [T]` / `*mut [T]`), returning
+`.some N` when element types and mutabilities are compatible and `.none`
+otherwise.
+
+Reference (The Rust Reference, "Unsized coercions"):
+<https://doc.rust-lang.org/1.98.0/reference/type-coercions.html#unsized-coercions>
+
+> "The following coercions are built-in:
+> * `[T; n]` to `[T]`."
+-/
+@[reducible]
+def unsizeArrayToSliceSpec? (srcKind dstKind : RigidTy) : Option Nat :=
+  match srcKind, dstKind with
+  | .ref .mut (.array srcElem n), .ref _ (.slice dstElem) =>
+    match rigidTyEq srcElem dstElem with
+    | true => .some n
+    | false => .none
+  | .ref .mut (.array srcElem n), .rawPtr _ (.slice dstElem) =>
+    match rigidTyEq srcElem dstElem with
+    | true => .some n
+    | false => .none
+  | .ref .not (.array srcElem n), .ref .not (.slice dstElem) =>
+    match rigidTyEq srcElem dstElem with
+    | true => .some n
+    | false => .none
+  | .ref .not (.array srcElem n), .rawPtr .not (.slice dstElem) =>
+    match rigidTyEq srcElem dstElem with
+    | true => .some n
+    | false => .none
+  | .rawPtr .mut (.array srcElem n), .rawPtr _ (.slice dstElem) =>
+    match rigidTyEq srcElem dstElem with
+    | true => .some n
+    | false => .none
+  | .rawPtr .not (.array srcElem n), .rawPtr .not (.slice dstElem) =>
+    match rigidTyEq srcElem dstElem with
+    | true => .some n
+    | false => .none
+  | _, _ => .none
+
+/--
+Evaluate `CastKind.pointerCoercion "Unsize"`, coercing an array reference or
+raw pointer (`Value.ptr p sz` of type `&[T; N]`, `&mut [T; N]`, `*const [T; N]`,
+or `*mut [T; N]`) to a slice fat pointer
+`Value.aggregate 0 [Value.ptr p sz, Value.scalar ⟨N, ptrBytes⟩]`.
+
+Faults with `.ub` if `op` does not evaluate to a pointer of width `ptrBytes`,
+if `targetTy` is a reference whose borrow tag is `.disabled`, or if source and
+target types are incompatible for slice unsizing.
+-/
+def evalUnsizeCoercion
+    (locals : List LocalSlot)
+    (op : Operand)
+    (targetTy : Ty)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    RvalueEvalResult :=
+  let ptrBytes := layoutPointerBytes layouts
+  match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+  | .ub => .ub
+  | .unsupported => .unsupported
+  | .ok (.ptr ptrVal sz) locals' =>
+    match Nat.beq sz ptrBytes with
+    | false => .ub
+    | true =>
+      let isTargetMutSlicePtr :=
+        match targetTy.kind with
+        | .ref .mut (.slice _) => true
+        | .rawPtr .mut (.slice _) => true
+        | _ => false
+      let isTargetSlicePtr :=
+        match targetTy.kind with
+        | .ref _ (.slice _) => true
+        | .rawPtr _ (.slice _) => true
+        | _ => false
+      let borrowValid :=
+        match isTargetSlicePtr with
+        | false => true
+        | true =>
+          match lookupBorrow mem.borrows ptrVal.tag with
+          | .some { perm := .disabled, .. } => false
+          | .some { perm := .frozen, .. } => Bool.not isTargetMutSlicePtr
+          | _ => true
+      match Bool.and isTargetSlicePtr borrowValid with
+      | false => .ub
+      | true =>
+        match operandTy localDecls layouts op with
+        | .some srcTy =>
+          match unsizeArrayToSliceSpec? srcTy.kind targetTy.kind with
+          | .some n =>
+            let stackTargetValid :=
+              match lookupBorrow mem.borrows ptrVal.tag with
+              | .none =>
+                match lookupGlobalAlloc mem.globals ptrVal.allocId with
+                | .some alloc =>
+                  let mutOk :=
+                    match isTargetMutSlicePtr, alloc.mutability with
+                    | true, .not => false
+                    | _, _ => true
+                  let elemSz :=
+                    match targetTy.kind with
+                    | .ref _ (.slice dstElem) =>
+                      match rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 } with
+                      | .some sz => sz
+                      | .none => 1
+                    | .rawPtr _ (.slice dstElem) =>
+                      match rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 } with
+                      | .some sz => sz
+                      | .none => 1
+                    | _ => 1
+                  let alignedOk :=
+                    match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+                    | .some _ => true
+                    | .none => false
+                  Bool.and
+                    mutOk
+                    (Bool.and
+                      alignedOk
+                      (Nat.ble
+                        (Nat.add ptrVal.offsetBytes (Nat.mul n elemSz))
+                        (length alloc.bytes)))
+                | .none =>
+                  match Nat.beq ptrVal.allocId 0 with
+                  | true =>
+                    Bool.and
+                      (Bool.not (Nat.beq ptrVal.offsetBytes 0))
+                      (Nat.beq n 0)
+                  | false => true
+              | .some entry =>
+                let rootValOpt : Option Value :=
+                  match get? locals' entry.targetLocal with
+                  | .some (.init v) => .some v
+                  | .some _ => .none
+                  | .none =>
+                    match get? mem.callerLocals entry.targetLocal with
+                    | .some (.init v) => .some v
+                    | _ => .none
+                match rootValOpt with
+                | .some rootVal =>
+                  let dstElemSzOpt : Option Nat :=
+                    match targetTy.kind with
+                    | .ref _ (.slice dstElem) =>
+                      rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 }
+                    | .rawPtr _ (.slice dstElem) =>
+                      rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 }
+                    | _ => .none
+                  match
+                    readSliceBackingAggregate?
+                      locals'
+                      rootVal
+                      entry.targetProjection
+                      n
+                      dstElemSzOpt
+                  with
+                  | .some (_, baseIdx, elems) =>
+                    let elemSz := inferElemListByteStride elems
+                    match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+                    | .some rawElemOffset =>
+                      let elemOffset := Nat.add rawElemOffset baseIdx
+                      Nat.ble (Nat.add elemOffset n) (length elems)
+                    | .none => false
+                  | .none =>
+                    match readProjectedValue locals' rootVal entry.targetProjection with
+                    | .ok .unit =>
+                      Bool.and
+                        (Nat.beq ptrVal.offsetBytes 0)
+                        (Nat.beq n 0)
+                    | .ok (.ptr _ _) => true
+                    | _ => false
+                | .none => false
+            match stackTargetValid with
+            | true =>
+              .ok
+                (.aggregate 0 (.ptr ptrVal sz :: .scalar ⟨n, ptrBytes⟩ :: .nil))
+                locals'
+                mem
+            | false => .ub
+          | .none => .ub
+        | .none =>
+          match lookupBorrow mem.borrows ptrVal.tag with
+          | .some entry =>
+            let permOk :=
+              match entry.perm, isTargetMutSlicePtr with
+              | .disabled, _ => false
+              | .frozen, true => false
+              | _, _ => true
+            match permOk with
+            | false => .ub
+            | true =>
+              let rootValOpt : Option Value :=
+                match get? locals' entry.targetLocal with
+                | .some (.init v) => .some v
+                | .some _ => .none
+                | .none =>
+                  match get? mem.callerLocals entry.targetLocal with
+                  | .some (.init v) => .some v
+                  | _ => .none
+              match rootValOpt with
+              | .some rootVal =>
+                let dstElemSzOpt : Option Nat :=
+                  match targetTy.kind with
+                  | .ref _ (.slice dstElem) =>
+                    rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 }
+                  | .rawPtr _ (.slice dstElem) =>
+                    rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 }
+                  | _ => .none
+                match
+                  readSliceBackingAggregate?
+                    locals'
+                    rootVal
+                    entry.targetProjection
+                    0
+                    dstElemSzOpt
+                with
+                | .some (_, baseIdx, elems) =>
+                  let elemSz := inferElemListByteStride elems
+                  match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+                  | .some rawElemOffset =>
+                    let elemOffset := Nat.add rawElemOffset baseIdx
+                    match Nat.ble elemOffset (length elems) with
+                    | true =>
+                      .ok
+                        (.aggregate 0
+                          (.ptr ptrVal sz ::
+                            .scalar ⟨Nat.sub (length elems) elemOffset, ptrBytes⟩ ::
+                            .nil))
+                        locals'
+                        mem
+                    | false => .ub
+                  | .none => .ub
+                | .none =>
+                  match readProjectedValue locals' rootVal entry.targetProjection with
+                  | .ok .unit =>
+                    match Nat.beq ptrVal.offsetBytes 0 with
+                    | true =>
+                      .ok
+                        (.aggregate 0
+                          (.ptr ptrVal sz ::
+                            .scalar ⟨0, ptrBytes⟩ ::
+                            .nil))
+                        locals'
+                        mem
+                    | false => .ub
+                  | _ => .ub
+              | .none => .ub
+          | .none =>
+            match lookupGlobalAlloc mem.globals ptrVal.allocId with
+            | .some alloc =>
+              let mutOk :=
+                match isTargetMutSlicePtr, alloc.mutability with
+                | true, .not => false
+                | _, _ => true
+              let dstElemOpt : Option RigidTy :=
+                match targetTy.kind with
+                | .ref _ (.slice dstElem) => .some dstElem
+                | .rawPtr _ (.slice dstElem) => .some dstElem
+                | _ => .none
+              match Bool.and mutOk (Nat.ble ptrVal.offsetBytes (length alloc.bytes)), dstElemOpt with
+              | true, .some dstElem =>
+                let elemSz :=
+                  match rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 } with
+                  | .some n => n
+                  | .none => 1
+                let remBytes := Nat.sub (length alloc.bytes) ptrVal.offsetBytes
+                match Nat.beq elemSz 0 with
+                | true => .ub
+                | false =>
+                  match
+                    byteOffsetToElemIdx? ptrVal.offsetBytes elemSz,
+                    byteOffsetToElemIdx? remBytes elemSz
+                  with
+                  | .some _, .some elemCount =>
+                    .ok
+                      (.aggregate 0
+                        (.ptr ptrVal sz ::
+                          .scalar ⟨elemCount, ptrBytes⟩ ::
+                          .nil))
+                      locals'
+                      mem
+                  | _, _ => .ub
+              | _, _ => .ub
+            | .none => .ub
+  | .ok _ _ => .ub
+
+/--
+Resolve a stack-backed array or slice borrow `parentEntry` at `ptrVal` into a
+thin element pointer (`*const T` / `*mut T`) whose `BorrowEntry.targetProjection`
+ends with `.subslice elemOffset endOffset false`, so dereferencing at
+`offsetBytes = 0` (e.g. `*slice.as_ptr()`) or after `BinOp.offset` accesses
+individual elements within `[elemOffset .. endOffset)` rather than the whole
+enclosing array aggregate.
+-/
+def deriveStackElemThinPtr
+    (locals : List LocalSlot)
+    (mem : Memory)
+    (ptrVal : ProvenancePtr)
+    (parentEntry : BorrowEntry)
+    (elemCountOpt : Option Nat) :
+    RvalueEvalResult :=
+  match parentEntry.perm with
+  | .disabled => .ub
+  | _ =>
+    let normProj :=
+      normalizeSubsliceProjections (stripTransparentProjections parentEntry.targetProjection)
+    let rootValOpt : Option Value :=
+      match get? locals parentEntry.targetLocal with
+      | .some (.init v) => .some v
+      | .some _ => .none
+      | .none =>
+        match get? mem.callerLocals parentEntry.targetLocal with
+        | .some (.init v) => .some v
+        | _ => .none
+    match rootValOpt with
+    | .none => .ub
+    | .some targetRootVal =>
+      let minCnt :=
+        match elemCountOpt with
+        | .some n => n
+        | .none => 0
+      match readSliceBackingAggregate? locals targetRootVal normProj minCnt with
+      | .some (containerProj, baseIdx, elems) =>
+        let elemSz := inferElemListByteStride elems
+        match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+        | .none => .ub
+        | .some rawElemOffset =>
+          let elemOffset := Nat.add rawElemOffset baseIdx
+          let sliceLen :=
+            match elemCountOpt with
+            | .some n => n
+            | .none => Nat.sub (length elems) elemOffset
+          let endOffset := Nat.add elemOffset sliceLen
+          match Nat.ble endOffset (length elems) with
+          | false => .ub
+          | true =>
+            let alreadySubslice :=
+              Bool.and
+                (endsWithSubslice containerProj)
+                (Bool.and
+                  (Nat.beq elemOffset 0)
+                  (Nat.beq sliceLen (length elems)))
+            match alreadySubslice with
+            | true => .ok (.ptr ptrVal 8) locals mem
+            | false =>
+              let subProj := ProjectionElem.subslice elemOffset endOffset false :: .nil
+              let fullProj :=
+                match containerProj with
+                | .nil => subProj
+                | ph :: pt => ph :: appendProjections pt subProj
+              let normFullProj := normalizeSubsliceProjections fullProj
+              let tag := mem.nextTag
+              let entry : BorrowEntry := {
+                tag := tag
+                targetLocal := parentEntry.targetLocal
+                targetProjection := normFullProj
+                perm := parentEntry.perm
+              }
+              let mem' := {
+                mem with
+                borrows := entry :: mem.borrows
+                nextTag := Nat.add tag 1
+              }
+              .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
+      | .none =>
+        match readProjectedValue locals targetRootVal normProj with
+        | .ok .unit =>
+          let isZeroSlice :=
+            match elemCountOpt with
+            | .some n => Nat.beq n 0
+            | .none => true
+          match Bool.and (Nat.beq ptrVal.offsetBytes 0) isZeroSlice with
+          | false => .ub
+          | true =>
+            match endsWithSubslice normProj with
+            | true => .ok (.ptr ptrVal 8) locals mem
+            | false =>
+              let subProj := ProjectionElem.subslice 0 0 false :: .nil
+              let fullProj :=
+                match normProj with
+                | .nil => subProj
+                | ph :: pt => ph :: appendProjections pt subProj
+              let normFullProj := normalizeSubsliceProjections fullProj
+              let tag := mem.nextTag
+              let entry : BorrowEntry := {
+                tag := tag
+                targetLocal := parentEntry.targetLocal
+                targetProjection := normFullProj
+                perm := parentEntry.perm
+              }
+              let mem' := {
+                mem with
+                borrows := entry :: mem.borrows
+                nextTag := Nat.add tag 1
+              }
+              .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
+        | _ => .ub
+
+/--
+Evaluate `CastKind.pointerCoercion` for function-pointer reification
+(`"ReifyFnPointer"`, `"ClosureFnPointer"`, `"UnsafeFnPointer"`), slice unsizing
+(`"Unsize"`), or pointer-preserving coercions (`"MutToConstPointer"`,
+`"ArrayToPointer"`).
+
+Reference (The Rust Reference, "Function pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/function-pointer.html>
+
+> "Function pointer types, written using the `fn` keyword, refer to a function
+> whose identity is not necessarily known at compile-time. They can be created
+> via a coercion from both function items and non-capturing closures."
+-/
+def evalReifyFnPointer
+    (locals : List LocalSlot)
+    (op : Operand)
+    (targetTy : Ty)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (coercionKind : String := "ReifyFnPointer") :
+    RvalueEvalResult :=
+  match isReifyFnPointerCoercion coercionKind with
+  | false =>
+    match stringEq coercionKind "Unsize" with
+    | true =>
+      evalUnsizeCoercion locals op targetTy mem localDecls layouts
+    | false =>
+      match stringEq coercionKind "ArrayToPointer" with
+      | true =>
+        match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+        | .ok (.ptr ptrVal sz) locals' =>
+          match Bool.and (Nat.beq sz 8) (isThinRawPtrTy targetTy) with
+          | false => .ub
+          | true =>
+            match lookupBorrow mem.borrows ptrVal.tag with
+            | .some parentEntry =>
+              deriveStackElemThinPtr locals' mem ptrVal parentEntry .none
+            | .none => .ok (.ptr ptrVal sz) locals' mem
+        | .ok _ _ => .ub
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | false =>
+        match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+        | .ok (.ptr ptrVal sz) locals' => .ok (.ptr ptrVal sz) locals' mem
+        | .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' =>
+          .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
+        | .ok _ _ => .unsupported
+        | .ub => .ub
+        | .unsupported => .unsupported
+  | true =>
+    match stringEq coercionKind "UnsafeFnPointer" with
+    | true =>
+      evalUnsafeFnPointer locals op targetTy mem localDecls layouts
+    | false =>
+      match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+      | .ub => .ub
+      | .unsupported => .unsupported
+      | .ok v locals' =>
+        let isZstVal :=
+          match v with
+          | .unit => true
+          | .aggregate 0 .nil => true
+          | _ => false
+        match isZstVal with
+        | false => .ub
+        | true =>
+          match targetTy.kind with
+          | .fnPtr fnInputs fnOutput fnSafety fnAbi =>
+            match
+              Bool.and
+                (Bool.not (callConvEq fnAbi .rustIntrinsic))
+                (reifyCoercionSafetyCompatible coercionKind fnSafety)
+            with
+            | false => .ub
+            | true =>
+              match
+                extractReifyCoercionTarget?
+                  coercionKind
+                  (operandTy localDecls layouts op)
+              with
+              | .some (defPath, typeArgs) =>
+                match
+                  checkCalleeSig
+                    mem.callees
+                    defPath
+                    fnInputs
+                    fnOutput
+                    fnAbi
+                with
+                | false => .ub
+                | true =>
+                  let (allocId, mem') :=
+                    internFnPtr mem defPath typeArgs (.some targetTy.kind)
+                  let p : ProvenancePtr := {
+                    allocId := allocId
+                    offsetBytes := 0
+                  }
+                  .ok (.ptr p 8) locals' mem'
+              | .none => .ub
+          | _ => .ub
+
+/--
+Evaluate `CastKind.fnPtrToPtr`, casting an 8-byte function pointer (`Value.ptr`)
+to a thin raw pointer (`*const T` or `*mut T`), preserving its `ProvenancePtr`
+(`allocId` and `offsetBytes = 0`) so subsequent `CastKind.ptrToPtr` or
+`CastKind.pointerExposeProvenance` casts succeed deterministically.
+
+Faults with `.ub` if `targetTy` is not a thin raw pointer, if `op`'s known
+`operandTy` is not `RigidTy.fnPtr` with a non-intrinsic `CallConv`, or if `op`
+does not evaluate to an 8-byte function pointer at offset `0` (disjoint from
+stack borrows in `mem.borrows`).
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1166-L1185>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1522-L1523>
 
-> "- [`Index`](ProjectionElem::Index): `Index` projections take their parent
->   place and create a place referring to an element of an array or slice,
->   indexed by the given `Local`. Note that the `Local` must be initialized
->   before the projection is used."
+> "FnPtrToPtr,"
 
-Reference (The Rust Reference, "Array and slice indexing expressions"):
-<https://doc.rust-lang.org/1.98.0/reference/expressions/array-expr.html#array-and-slice-indexing-expressions>
+Reference (The Rust Reference, "Type cast expressions"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#type-cast-expressions>
 
-> "Array and slice-typed values can be indexed by writing a
-> square-bracket-enclosed expression of type usize (the index) after them."
+> "* Function pointer types can be cast to any thin pointer type"
 -/
-@[reducible]
-def resolveBorrowProjectionElems
-    (locals : List LocalSlot) :
-    List ProjectionElem → Option (List ProjectionElem)
-  | .nil => .some .nil
-  | .index idxLocal :: rest =>
-    match get? locals idxLocal with
-    | .some (.init (.scalar sc)) =>
-      match resolveBorrowProjectionElems locals rest with
-      | .some rest' => .some (.constantIndex sc.bits 0 false :: rest')
-      | .none => .none
-    | _ => .none
-  | elem :: rest =>
-    match resolveBorrowProjectionElems locals rest with
-    | .some rest' => .some (elem :: rest')
-    | .none => .none
+def evalFnPtrToPtr
+    (locals : List LocalSlot)
+    (op : Operand)
+    (targetTy : Ty)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    RvalueEvalResult :=
+  match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+  | .ub => .ub
+  | .unsupported => .unsupported
+  | .ok (.ptr ptrVal sz) locals' =>
+    let validTargetTy := isThinRawPtrTy targetTy
+    let validSrcTy :=
+      match operandTy localDecls layouts op with
+      | .none => true
+      | .some { kind := .fnPtr _ _ _ srcAbi, .. } =>
+        Bool.not (callConvEq srcAbi .rustIntrinsic)
+      | .some _ => false
+    let validPtr :=
+      Bool.and
+        (Nat.beq sz 8)
+        (Bool.and
+          (Nat.beq ptrVal.offsetBytes 0)
+          (match lookupBorrow mem.borrows ptrVal.tag with
+           | .some _ => false
+           | .none =>
+             match mem.fnPtrs with
+             | .nil => isFnPtrAllocId ptrVal.allocId
+             | _ :: _ =>
+               match lookupFnPtr mem.fnPtrs ptrVal.allocId with
+               | .some entry =>
+                 match entry.fnSig with
+                 | .none => true
+                 | .some (.fnPtr _ _ _ sigAbi) =>
+                   Bool.not (callConvEq sigAbi .rustIntrinsic)
+                 | .some _ => false
+               | .none => false))
+    match Bool.and validTargetTy (Bool.and validSrcTy validPtr) with
+    | true => .ok (.ptr ptrVal 8) locals' mem
+    | false => .ub
+  | .ok _ _ => .ub
 
 /--
 Determine whether a monomorphized `RigidTy` is `Freeze` (contains no
@@ -2444,6 +4688,20 @@ def tyIsFreeze (ty : Ty) : Bool :=
   rigidTyIsFreeze 16 ty.kind
 
 /--
+Determine whether the resolved type of `p` in `localDecls` and `layouts` is
+`Freeze` (defaulting to `true` when `placeTy` returns `.none`).
+-/
+@[reducible]
+def placeIsFreeze
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (p : Place) :
+    Bool :=
+  match placeTy localDecls layouts p with
+  | .some ty => tyIsFreeze ty
+  | .none => true
+
+/--
 Determine the initial Tree Borrows permission for a shared borrow (`&place`)
 based on whether `place`'s resolved type in `localDecls` and `layouts` is
 `Freeze`.
@@ -2476,6 +4734,1141 @@ def sharedBorrowPerm
     | true => TreeBorrowPerm.frozen
     | false => TreeBorrowPerm.reserved
   | .none => TreeBorrowPerm.frozen
+
+/--
+If `proj` ends with `.deref`, return the prefix projection path before the final
+`.deref`; otherwise return `.none`.
+-/
+@[reducible]
+def splitLastDeref? : List ProjectionElem → Option (List ProjectionElem)
+  | .nil => .none
+  | .deref :: .nil => .some .nil
+  | .deref :: rest =>
+    match stripTransparentProjections rest with
+    | .nil => .some .nil
+    | _ =>
+      match splitLastDeref? rest with
+      | .some initProj => .some (.deref :: initProj)
+      | .none => .none
+  | .opaqueCast _ :: rest => splitLastDeref? rest
+  | .unwrapUnsafeBinder _ :: rest => splitLastDeref? rest
+  | elem :: rest =>
+    match splitLastDeref? rest with
+    | .some initProj => .some (elem :: initProj)
+    | .none => .none
+
+/--
+Evaluate `Rvalue.len place` on either a fixed-size array (`Value.aggregate 0 elems`)
+or a dereferenced slice (`*slice_ptr` where `slice_ptr` evaluates to the 2-element
+fat-pointer aggregate `Value.aggregate 0 [Value.ptr ptrVal ptrSz, Value.scalar lenSc]`).
+
+Faults with `.ub` if `place`'s resolved `placeTy` is neither `.array` nor
+`.slice`, if `slice_ptr` has a `.disabled` borrow tag or non-pointer-width
+fields, or if an un-dereferenced fat pointer is passed directly to `Rvalue.len`.
+-/
+def evalPlaceLen
+    (locals : List LocalSlot)
+    (place : Place)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    RvalueEvalResult :=
+  let ptrBytes := layoutPointerBytes layouts
+  let pTy := placeTy localDecls layouts place
+  let tyOk : Bool :=
+    match pTy with
+    | .none => true
+    | .some { kind := .array _ _, .. } => true
+    | .some { kind := .slice _, .. } => true
+    | .some _ => false
+  match tyOk with
+  | false => .ub
+  | true =>
+    match splitLastDeref? place.projection with
+    | .some initProj =>
+      let ptrPlace : Place := { local_ := place.local_, projection := initProj }
+      match
+        evalPlaceRead
+          locals
+          ptrPlace
+          mem.borrows
+          mem.globals
+          layouts
+          mem.callerLocals
+          localDecls
+      with
+      | .ok (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil)) locals' =>
+        let sizesOk :=
+          Bool.and
+            (Nat.beq ptrSz ptrBytes)
+            (Nat.beq lenSc.sizeBytes ptrBytes)
+        let borrowOk :=
+          match lookupBorrow mem.borrows ptrVal.tag with
+          | .some entry =>
+            match entry.perm with
+            | .disabled => false
+            | _ =>
+              let targetRootOpt : Option Value :=
+                match get? locals' entry.targetLocal with
+                | .some (.init v) => .some v
+                | .some _ => .none
+                | .none =>
+                  match get? mem.callerLocals entry.targetLocal with
+                  | .some (.init v) => .some v
+                  | _ => .none
+              match targetRootOpt with
+              | .some rootVal =>
+                let expSzOpt : Option Nat :=
+                  match pTy with
+                  | .some { kind := .slice elemKind, .. } =>
+                    rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 }
+                  | _ => .none
+                match
+                  readSliceBackingAggregate?
+                    locals'
+                    rootVal
+                    entry.targetProjection
+                    lenSc.bits
+                    expSzOpt
+                with
+                | .some (_, baseIdx, elems) =>
+                  let elemSz := inferElemListByteStride elems
+                  match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+                  | .some rawElemOffset =>
+                    let elemOffset := Nat.add rawElemOffset baseIdx
+                    Nat.ble (Nat.add elemOffset lenSc.bits) (length elems)
+                  | .none => false
+                | .none =>
+                  match readProjectedValue locals' rootVal entry.targetProjection with
+                  | .ok .unit =>
+                    Bool.and
+                      (Nat.beq ptrVal.offsetBytes 0)
+                      (Nat.beq lenSc.bits 0)
+                  | _ => false
+              | .none => false
+          | .none =>
+            match lookupGlobalAlloc mem.globals ptrVal.allocId with
+            | .some alloc =>
+              let elemSz :=
+                match pTy with
+                | .some { kind := .slice elemKind, .. } =>
+                  match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+                  | .some n => n
+                  | .none => 1
+                | _ => 1
+              Nat.ble
+                (Nat.add ptrVal.offsetBytes (Nat.mul lenSc.bits elemSz))
+                (length alloc.bytes)
+            | .none =>
+              match Nat.beq ptrVal.allocId 0 with
+              | true =>
+                Bool.and
+                  (Bool.not (Nat.beq ptrVal.offsetBytes 0))
+                  (Nat.beq lenSc.bits 0)
+              | false => true
+        let notFixedArrayPlace :=
+          match pTy with
+          | .some { kind := .array _ _, .. } => false
+          | _ => true
+        match Bool.and sizesOk (Bool.and borrowOk notFixedArrayPlace) with
+        | true => .ok (.scalar ⟨lenSc.bits, ptrBytes⟩) locals' mem
+        | false => .ub
+      | .ok (.ptr _ _) _ =>
+        match
+          evalPlaceRead
+            locals
+            place
+            mem.borrows
+            mem.globals
+            layouts
+            mem.callerLocals
+            localDecls
+        with
+        | .ok (.aggregate 0 (.ptr _ _ :: .scalar _ :: .nil)) _ => .ub
+        | .ok (.aggregate 0 elems) locals' =>
+          .ok (.scalar ⟨length elems, ptrBytes⟩) locals' mem
+        | .ok .unit locals' =>
+          match pTy with
+          | .some { kind := .array _ .zero, .. } =>
+            .ok (.scalar ⟨0, ptrBytes⟩) locals' mem
+          | _ => .ub
+        | .ok _ _ => .ub
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | .ok _ _ => .ub
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .none =>
+      match pTy with
+      | .some { kind := .array _ n, .. } =>
+        match
+          evalPlaceRead
+            locals
+            place
+            mem.borrows
+            mem.globals
+            layouts
+            mem.callerLocals
+            localDecls
+        with
+        | .ok (.aggregate 0 elems) locals' =>
+          .ok (.scalar ⟨length elems, ptrBytes⟩) locals' mem
+        | .ok .unit locals' =>
+          match n with
+          | .zero => .ok (.scalar ⟨0, ptrBytes⟩) locals' mem
+          | .succ _ => .ub
+        | .ok _ _ => .ub
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | _ =>
+        match
+          evalPlaceRead
+            locals
+            place
+            mem.borrows
+            mem.globals
+            layouts
+            mem.callerLocals
+            localDecls
+        with
+        | .ok (.aggregate 0 (.ptr _ _ :: .scalar _ :: .nil)) _ => .ub
+        | .ok (.aggregate 0 elems) locals' =>
+          .ok (.scalar ⟨length elems, ptrBytes⟩) locals' mem
+        | .ok _ _ => .ub
+        | .ub => .ub
+        | .unsupported => .unsupported
+
+/--
+Look up the first `LocalDecl` in `localDecls` whose `decl.ty.kind` structurally
+matches `kind`, returning its `Ty` (including its `LayoutIdx`).
+-/
+@[reducible]
+def findDeclTyWithKind? : List LocalDecl → RigidTy → Option Ty
+  | .nil, _ => .none
+  | decl :: rest, kind =>
+    match rigidTyEq decl.ty.kind kind with
+    | true => .some decl.ty
+    | false => findDeclTyWithKind? rest kind
+
+/--
+Resolve the pointee element byte stride `size_of::<T>()` for the pointer operand
+`lhsOp` of `BinOp.offset`, defaulting to `1` byte when `localDecls` does not
+declare a type for `lhsOp`.
+-/
+@[reducible]
+def pointeeElemByteStride
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (lhsOp : Operand) :
+    Option Nat :=
+  match operandTy localDecls layouts lhsOp with
+  | .none => .some 1
+  | .some ptrTy =>
+    match pointeeTyOf ptrTy with
+    | .some pointeeTy =>
+      match rigidTyKindByteSize pointeeTy.kind with
+      | .some sz => .some sz
+      | .none =>
+        let resolvedPointeeTy :=
+          match findDeclTyWithKind? localDecls pointeeTy.kind with
+          | .some declTy => declTy
+          | .none => pointeeTy
+        rigidTyByteSize layouts resolvedPointeeTy
+    | .none => .none
+
+/--
+Compute the default byte size of an untyped runtime `Value` when `localDecls`
+does not provide a `LocalDecl` for a stack allocation.
+-/
+@[reducible]
+def valueDefaultByteSize : Value → Option Nat
+  | .unit => .some 0
+  | .scalar sc => .some sc.sizeBytes
+  | .ptr _ sz => .some sz
+  | .aggregate 0 .nil => .some 0
+  | .aggregate 0 (.scalar sc :: rest) =>
+    .some (Nat.mul (Nat.add (length rest) 1) sc.sizeBytes)
+  | .aggregate 0 (.ptr _ sz :: rest) =>
+    .some (Nat.mul (Nat.add (length rest) 1) sz)
+  | .aggregate 0 (.unit :: _) => .some 0
+  | .aggregate 0 (.aggregate 0 fields :: rest) =>
+    inferValueByteSizeAux 8 (.aggregate 0 (.aggregate 0 fields :: rest))
+  | _ => .none
+
+/--
+Resolve the byte bound of a projected value `rootVal` at `proj` using
+`readProjectedValue` and `valueDefaultByteSize`.
+-/
+@[reducible]
+def projectedValueDefaultByteSize
+    (locals : List LocalSlot)
+    (rootVal : Value)
+    (proj : List ProjectionElem) :
+    Option Nat :=
+  match readProjectedValue locals rootVal proj with
+  | .ok projVal => valueDefaultByteSize projVal
+  | _ => .some 0
+
+/--
+Resolve the byte bound of the allocation backing `ptrVal` from `mem.borrows`
+(using `entry.rangeOffset + entry.rangeLen`, `localDecls`, or `locals`) or
+`mem.globals` (`length alloc.bytes`).
+-/
+def ptrAllocByteBound?
+    (locals : List LocalSlot)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ptrVal : ProvenancePtr) :
+    Option Nat :=
+  match lookupBorrow mem.borrows ptrVal.tag with
+  | .some entry =>
+    match entry.perm with
+    | .disabled => .some 0
+    | _ =>
+      match Nat.beq entry.rangeLen 0 with
+      | false => .some (Nat.add entry.rangeOffset entry.rangeLen)
+      | true =>
+        let rootValOpt : Option Value :=
+          match get? locals entry.targetLocal with
+          | .some (.init v) => .some v
+          | .some _ => .none
+          | .none =>
+            match get? mem.callerLocals entry.targetLocal with
+            | .some (.init v) => .some v
+            | _ => .none
+        let normTargetProj :=
+          normalizeSubsliceProjections (stripTransparentProjections entry.targetProjection)
+        match splitLastConstantIndex? normTargetProj with
+        | .some (initProj, baseIdx, minLen) =>
+          match rootValOpt with
+          | .some rootVal =>
+            match readProjectedValue locals rootVal initProj with
+            | .ok (.aggregate 0 elems) =>
+              match
+                Bool.and
+                  (Nat.ble minLen (length elems))
+                  (Nat.ble baseIdx (length elems))
+              with
+              | false => .some 0
+              | true =>
+                let remElems := Nat.sub (length elems) baseIdx
+                let elemPlace : Place := {
+                  local_ := entry.targetLocal
+                  projection := normTargetProj
+                }
+                let elemSz :=
+                  match placeTy localDecls layouts elemPlace with
+                  | .some elemTy =>
+                    match rigidTyByteSize layouts elemTy with
+                    | .some n => n
+                    | .none => inferElemListByteStride elems
+                  | .none => inferElemListByteStride elems
+                .some (Nat.mul remElems elemSz)
+            | _ => .some 0
+          | .none =>
+            let initPlace : Place := {
+              local_ := entry.targetLocal
+              projection := initProj
+            }
+            match placeTy localDecls layouts initPlace with
+            | .some { kind := .array elemKind arrLen, .. } =>
+              match
+                Bool.and
+                  (Nat.ble minLen arrLen)
+                  (Nat.ble baseIdx arrLen)
+              with
+              | false => .some 0
+              | true =>
+                let remElems := Nat.sub arrLen baseIdx
+                match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+                | .some elemSz => .some (Nat.mul remElems elemSz)
+                | .none => .some 0
+            | _ => .some 0
+        | .none =>
+          match splitLastSubslice? normTargetProj with
+          | .some (initProj, fromIdx, toIdx, fromEnd) =>
+            match rootValOpt with
+            | .some rootVal =>
+              match readProjectedValue locals rootVal normTargetProj with
+              | .ok (.aggregate 0 subElems) =>
+                let initPlace : Place := {
+                  local_ := entry.targetLocal
+                  projection := initProj
+                }
+                let elemSz :=
+                  match placeTy localDecls layouts initPlace with
+                  | .some parentTy =>
+                    match elemTyOf parentTy with
+                    | .some elemTy =>
+                      match rigidTyByteSize layouts elemTy with
+                      | .some n => n
+                      | .none => inferElemListByteStride subElems
+                    | .none => inferElemListByteStride subElems
+                  | .none => inferElemListByteStride subElems
+                .some (Nat.mul (length subElems) elemSz)
+              | _ => .some 0
+            | .none =>
+              let initPlace : Place := {
+                local_ := entry.targetLocal
+                projection := initProj
+              }
+              match placeTy localDecls layouts initPlace with
+              | .some { kind := .array elemKind arrLen, .. } =>
+                let subLenOpt : Option Nat :=
+                  match fromEnd with
+                  | false =>
+                    match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx arrLen) with
+                    | true => .some (Nat.sub toIdx fromIdx)
+                    | false => .none
+                  | true =>
+                    match Nat.ble (Nat.add fromIdx toIdx) arrLen with
+                    | true => .some (Nat.sub (Nat.sub arrLen toIdx) fromIdx)
+                    | false => .none
+                match subLenOpt, rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+                | .some subLen, .some elemSz => .some (Nat.mul subLen elemSz)
+                | _, _ => .some 0
+              | _ => .some 0
+          | .none =>
+            let targetPlace : Place := {
+              local_ := entry.targetLocal
+              projection := entry.targetProjection
+            }
+            match placeTy localDecls layouts targetPlace with
+            | .some projTy =>
+              match rigidTyByteSize layouts projTy with
+              | .some n => .some n
+              | .none =>
+                match rootValOpt with
+                | .some rootVal =>
+                  projectedValueDefaultByteSize locals rootVal entry.targetProjection
+                | .none => .some 0
+            | .none =>
+              match rootValOpt with
+              | .some rootVal =>
+                projectedValueDefaultByteSize locals rootVal entry.targetProjection
+              | .none => .some 0
+  | .none =>
+    match lookupGlobalAlloc mem.globals ptrVal.allocId with
+    | .some alloc => .some (length alloc.bytes)
+    | .none =>
+      match Nat.beq ptrVal.allocId 0 with
+      | true => .some 0
+      | false =>
+        match mem.borrows, mem.globals with
+        | .nil, .nil => .none
+        | _, _ => .some 0
+
+/--
+Evaluate in-bounds pointer arithmetic `BinOp.offset` (`ptr::offset` / inbounds
+GEP) on 64-bit pointer `ptrVal` (`ptrSizeBytes == 8`) and signed 64-bit `isize`
+offset `offsetSc` (`offsetSc.sizeBytes == 8`) scaled by pointee byte stride
+`elemStride` within optional allocation byte bound `allocBoundOpt`.
+
+Returns `.none` (undefined behavior) if:
+- `ptrSizeBytes != 8` or `offsetSc.sizeBytes != 8`,
+- the signed byte offset `count * elemStride` overflows 64-bit signed `isize`
+  (`|count| * elemStride >= 2^63`),
+- a negative offset underflows below allocation offset `0` (`byteDelta > ptrVal.offsetBytes`),
+- a positive offset overflows `isize::MAX` (`ptrVal.offsetBytes + byteDelta >= 2^63`), or
+- `allocBoundOpt = .some bound` and either `ptrVal.offsetBytes > bound` or
+  `newOffset > bound`.
+
+Reference (`library/core/src/ptr/const_ptr.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/const_ptr.rs#L380-L430>
+
+> "/// Adds a signed offset to a pointer.
+> ///
+> /// `count` is in units of T; e.g., a `count` of 3 represents a pointer
+> /// offset of `3 * size_of::<T>()` bytes.
+> ///
+> /// # Safety
+> ///
+> /// If any of the following conditions are violated, the result is Undefined
+> /// Behavior:
+> ///
+> /// * The computed offset, `count * size_of::<T>()` bytes, must not overflow `isize`.
+> ///
+> /// * If the computed offset is non-zero, then `self` must be derived from a
+> ///   pointer to some allocated object, and the entire memory range between
+> ///   `self` and the result must be in bounds of that allocated object."
+-/
+def evalBinOpOffset
+    (ptrVal : ProvenancePtr)
+    (ptrSizeBytes : Nat)
+    (offsetSc : ScalarInt)
+    (elemStride : Nat)
+    (allocBoundOpt : Option Nat := .none) :
+    Option ProvenancePtr :=
+  match
+    Bool.and
+      (Nat.beq ptrSizeBytes 8)
+      (Nat.beq offsetSc.sizeBytes 8)
+  with
+  | false => .none
+  | true =>
+    let modulus := scalarModulus 8
+    let halfMod := signedHalfModulus 8
+    let offsetBits := wrapScalarBits offsetSc.bits modulus
+    let newOffsetOpt : Option Nat :=
+      match isSignedNegative offsetBits 8 with
+      | false =>
+        let byteDelta := Nat.mul offsetBits elemStride
+        match Nat.ble halfMod byteDelta with
+        | true => .none
+        | false =>
+          let candidate := Nat.add ptrVal.offsetBytes byteDelta
+          match Nat.ble halfMod candidate with
+          | true => .none
+          | false => .some candidate
+      | true =>
+        let countMag := Nat.sub modulus offsetBits
+        let byteDelta := Nat.mul countMag elemStride
+        match
+          Bool.and
+            (Bool.not (Nat.ble halfMod byteDelta))
+            (Nat.ble byteDelta ptrVal.offsetBytes)
+        with
+        | false => .none
+        | true => .some (Nat.sub ptrVal.offsetBytes byteDelta)
+    match newOffsetOpt with
+    | .none => .none
+    | .some newOffset =>
+      let inBounds :=
+        match allocBoundOpt with
+        | .none =>
+          Bool.not (Nat.ble halfMod ptrVal.offsetBytes)
+        | .some bound =>
+          Bool.or
+            (Bool.and
+              (Nat.beq ptrVal.allocId 0)
+              (Bool.and
+                (Nat.beq bound 0)
+                (Bool.and
+                  (Nat.beq newOffset ptrVal.offsetBytes)
+                  (Bool.not (Nat.ble halfMod ptrVal.offsetBytes)))))
+            (Bool.and
+              (Bool.not (Nat.ble halfMod bound))
+              (Bool.and
+                (Nat.ble ptrVal.offsetBytes bound)
+                (Nat.ble newOffset bound)))
+      match inBounds with
+      | true => .some { ptrVal with offsetBytes := newOffset }
+      | false => .none
+
+/--
+Evaluate `BinOp.offset` in `evalRvalue` after operand evaluation, checking that
+`ptrVal.tag` is not `.disabled` in `mem.borrows`, resolving the pointee byte
+stride `pointeeElemByteStride localDecls layouts lhsOp`, resolving the
+allocation byte bound `ptrAllocByteBound? locals₂ mem localDecls layouts ptrVal`,
+and delegating to `evalBinOpOffset`.
+-/
+@[reducible]
+def evalPtrOffsetBinOp
+    (locals₂ : List LocalSlot)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (lhsOp : Operand)
+    (ptrVal : ProvenancePtr)
+    (sz : Nat)
+    (offsetSc : ScalarInt) :
+    RvalueEvalResult :=
+  let borrowDisabled :=
+    match lookupBorrow mem.borrows ptrVal.tag with
+    | .some { perm := .disabled, .. } => true
+    | _ => false
+  match borrowDisabled with
+  | true => .ub
+  | false =>
+    match pointeeElemByteStride localDecls layouts lhsOp with
+    | .none => .ub
+    | .some elemStride =>
+      match
+        evalBinOpOffset
+          ptrVal
+          sz
+          offsetSc
+          elemStride
+          (ptrAllocByteBound? locals₂ mem localDecls layouts ptrVal)
+      with
+      | .some newPtrVal => .ok (.ptr newPtrVal sz) locals₂ mem
+      | .none => .ub
+
+/--
+Evaluate a borrow (`Rvalue.ref`) or raw address-of (`Rvalue.rawPtr`) through a
+dereferenced slice fat pointer
+`Value.aggregate 0 [Value.ptr parentPtr ptrSz, Value.scalar lenSc]` with
+post-deref projection suffix `restProj`.
+
+Supports:
+1. Whole-slice reborrows (`&*s`, `&mut *s`, `&raw const *s`, `&raw mut *s` when
+   `stripTransparentProjections restProj = .nil`), returning a new 2-element
+   slice fat pointer with fresh borrow tag `mem.nextTag` (or preserving a
+   read-only global / empty-slice fat pointer),
+2. Subslice borrows (`&(*s)[from..to]` when `restProj` is a single `.subslice`),
+   returning a new 2-element slice fat pointer of length `subLen` within
+   `lenSc.bits`, and
+3. Element/field borrows (`&(*s)[i]` or `&(*s)[i].field` when `restProj` begins
+   with `.index` or `.constantIndex`), checking `idx < lenSc.bits` and returning
+   a thin pointer `.ptr { allocId := mem.nextTag, offsetBytes := 0 } 8`.
+-/
+def evalSliceFatPtrDerefBorrow
+    (locals : List LocalSlot)
+    (mem : Memory)
+    (parentPtr : ProvenancePtr)
+    (ptrSz : Nat)
+    (lenSc : ScalarInt)
+    (restProj : List ProjectionElem)
+    (perm : TreeBorrowPerm)
+    (isMut : Bool)
+    (pointeeTyOpt : Option Ty := .none)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    RvalueEvalResult :=
+  match
+    Bool.and
+      (Nat.beq ptrSz 8)
+      (Nat.beq lenSc.sizeBytes 8)
+  with
+  | false => .ub
+  | true =>
+    match
+      resolveBorrowProjectionElems
+        locals
+        (stripTransparentProjections restProj)
+    with
+    | .none => .ub
+    | .some rawResolvedRest =>
+      let resolvedRest := normalizeSubsliceProjections rawResolvedRest
+      match lookupBorrow mem.borrows parentPtr.tag with
+      | .some parentEntry =>
+        let permOk :=
+          match parentEntry.perm, isMut with
+          | .disabled, _ => false
+          | .frozen, true => false
+          | _, _ => true
+        match permOk with
+        | false => .ub
+        | true =>
+          let targetRootOpt : Option Value :=
+            match get? locals parentEntry.targetLocal with
+            | .some (.init v) => .some v
+            | .some _ => .none
+            | .none =>
+              match get? mem.callerLocals parentEntry.targetLocal with
+              | .some (.init v) => .some v
+              | _ => .none
+          match targetRootOpt with
+          | .none => .ub
+          | .some targetRootVal =>
+            let expSzOpt : Option Nat :=
+              match pointeeTyOpt with
+              | .some { kind := .slice elemKind, .. } =>
+                rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 }
+              | _ => .none
+            match
+              readSliceBackingAggregate?
+                locals
+                targetRootVal
+                parentEntry.targetProjection
+                lenSc.bits
+                expSzOpt
+            with
+            | .some (containerProj, baseIdx, elems) =>
+              let elemSz := inferElemListByteStride elems
+              match byteOffsetToElemIdx? parentPtr.offsetBytes elemSz with
+              | .none => .ub
+              | .some rawElemOffset =>
+                let elemOffset := Nat.add rawElemOffset baseIdx
+                match Nat.ble (Nat.add elemOffset lenSc.bits) (length elems) with
+                | false => .ub
+                | true =>
+                  match resolvedRest with
+                  | .nil =>
+                    let tag := mem.nextTag
+                    let (newTargetProj, newOffsetBytes, newRangeOff, newRangeLen) :=
+                      match Nat.beq baseIdx 0 with
+                      | true =>
+                        (parentEntry.targetProjection,
+                         parentPtr.offsetBytes,
+                         parentEntry.rangeOffset,
+                         parentEntry.rangeLen)
+                      | false =>
+                        let subProj :=
+                          ProjectionElem.subslice
+                            elemOffset
+                            (Nat.add elemOffset lenSc.bits)
+                            false :: .nil
+                        let rawFullProj :=
+                          match containerProj with
+                          | .nil => subProj
+                          | ph :: pt => ph :: appendProjections pt subProj
+                        (normalizeSubsliceProjections rawFullProj, 0, 0, 0)
+                    let entry : BorrowEntry := {
+                      tag := tag
+                      targetLocal := parentEntry.targetLocal
+                      targetProjection := newTargetProj
+                      perm := perm
+                      rangeOffset := newRangeOff
+                      rangeLen := newRangeLen
+                    }
+                    let mem' := {
+                      mem with
+                      borrows := entry :: mem.borrows
+                      nextTag := Nat.add tag 1
+                    }
+                    .ok
+                      (.aggregate 0
+                        (.ptr { allocId := tag, offsetBytes := newOffsetBytes } 8 ::
+                          .scalar ⟨lenSc.bits, 8⟩ ::
+                          .nil))
+                      locals
+                      mem'
+                  | .subslice fromIdx toIdx fromEnd :: .nil =>
+                    match Nat.ble toIdx lenSc.bits with
+                    | false => .ub
+                    | true =>
+                      let endIdx :=
+                        match fromEnd with
+                        | true => Nat.sub lenSc.bits toIdx
+                        | false => toIdx
+                      match Nat.ble fromIdx endIdx with
+                      | false => .ub
+                      | true =>
+                        let subLen := Nat.sub endIdx fromIdx
+                        let absFrom := Nat.add elemOffset fromIdx
+                        let absEnd := Nat.add elemOffset endIdx
+                        let subProj := ProjectionElem.subslice absFrom absEnd false :: .nil
+                        let rawFullProj :=
+                          match containerProj with
+                          | .nil => subProj
+                          | ph :: pt => ph :: appendProjections pt subProj
+                        let fullProj := normalizeSubsliceProjections rawFullProj
+                        let tag := mem.nextTag
+                        let entry : BorrowEntry := {
+                          tag := tag
+                          targetLocal := parentEntry.targetLocal
+                          targetProjection := fullProj
+                          perm := perm
+                        }
+                        let mem' := {
+                          mem with
+                          borrows := entry :: mem.borrows
+                          nextTag := Nat.add tag 1
+                        }
+                        .ok
+                          (.aggregate 0
+                            (.ptr { allocId := tag, offsetBytes := 0 } 8 ::
+                              .scalar ⟨subLen, 8⟩ ::
+                              .nil))
+                          locals
+                          mem'
+                  | .constantIndex offset minLen fromEnd :: tailProj =>
+                    let fromEndBoundsOk :=
+                      match fromEnd with
+                      | false => true
+                      | true =>
+                        Bool.and
+                          (Nat.ble 1 offset)
+                          (Nat.ble offset lenSc.bits)
+                    match Bool.and (Nat.ble minLen lenSc.bits) fromEndBoundsOk with
+                    | false => .ub
+                    | true =>
+                      let idx :=
+                        match fromEnd with
+                        | true => Nat.sub lenSc.bits offset
+                        | false => offset
+                      match Nat.ble (.succ idx) lenSc.bits with
+                      | false => .ub
+                      | true =>
+                        let absIdx := Nat.add elemOffset idx
+                        let normProj := ProjectionElem.constantIndex absIdx 0 false :: tailProj
+                        let rawFullProj :=
+                          match containerProj with
+                          | .nil => normProj
+                          | ph :: pt => ph :: appendProjections pt normProj
+                        let fullProj := normalizeSubsliceProjections rawFullProj
+                        let tag := mem.nextTag
+                        let entry : BorrowEntry := {
+                          tag := tag
+                          targetLocal := parentEntry.targetLocal
+                          targetProjection := fullProj
+                          perm := perm
+                        }
+                        let mem' := {
+                          mem with
+                          borrows := entry :: mem.borrows
+                          nextTag := Nat.add tag 1
+                        }
+                        .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
+                  | _ => .ub
+            | .none =>
+              match readProjectedValue locals targetRootVal parentEntry.targetProjection with
+              | .ok .unit =>
+                match
+                  Bool.and
+                    (Nat.beq parentPtr.offsetBytes 0)
+                    (Nat.beq lenSc.bits 0)
+                with
+                | false => .ub
+                | true =>
+                  let isZeroEmptySliceProj :=
+                    match resolvedRest with
+                    | .nil => true
+                    | .subslice 0 0 _ :: .nil => true
+                    | _ => false
+                  match isZeroEmptySliceProj with
+                  | false => .ub
+                  | true =>
+                    let tag := mem.nextTag
+                    let entry : BorrowEntry := {
+                      tag := tag
+                      targetLocal := parentEntry.targetLocal
+                      targetProjection := parentEntry.targetProjection
+                      perm := perm
+                      rangeOffset := parentEntry.rangeOffset
+                      rangeLen := parentEntry.rangeLen
+                    }
+                    let mem' := {
+                      mem with
+                      borrows := entry :: mem.borrows
+                      nextTag := Nat.add tag 1
+                    }
+                    .ok
+                      (.aggregate 0
+                        (.ptr { allocId := tag, offsetBytes := 0 } 8 ::
+                          .scalar ⟨0, 8⟩ ::
+                          .nil))
+                      locals
+                      mem'
+              | _ => .ub
+      | .none =>
+        match lookupGlobalAlloc mem.globals parentPtr.allocId with
+        | .some alloc =>
+          let elemKind : RigidTy :=
+            match pointeeTyOpt with
+            | .some { kind := .slice ek, .. } => ek
+            | .some { kind := .array ek _, .. } => ek
+            | .some { kind := .str, .. } => .uint .u8
+            | _ =>
+              match LayoutTable.lookup layouts 0 with
+              | .some l =>
+                match l.fields with
+                | .primitive => uintRigidTyOfStride l.size.bytes
+                | .array stride _ => uintRigidTyOfStride stride.bytes
+                | _ => .uint .u8
+              | .none => .uint .u8
+          let elemSz :=
+            match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+            | .some n => n
+            | .none => 1
+          let mutOk :=
+            match isMut, alloc.mutability with
+            | true, .not => false
+            | _, _ => true
+          let sliceInBounds :=
+            Nat.ble
+              (Nat.add parentPtr.offsetBytes (Nat.mul lenSc.bits elemSz))
+              (length alloc.bytes)
+          match Bool.and mutOk sliceInBounds with
+          | false => .ub
+          | true =>
+            match resolvedRest with
+            | .nil =>
+              .ok
+                (.aggregate 0
+                  (.ptr parentPtr 8 :: .scalar ⟨lenSc.bits, 8⟩ :: .nil))
+                locals
+                mem
+            | .subslice fromIdx toIdx fromEnd :: .nil =>
+              match Nat.ble toIdx lenSc.bits with
+              | false => .ub
+              | true =>
+                let endIdx :=
+                  match fromEnd with
+                  | true => Nat.sub lenSc.bits toIdx
+                  | false => toIdx
+                match Nat.ble fromIdx endIdx with
+                | false => .ub
+                | true =>
+                  let subLen := Nat.sub endIdx fromIdx
+                  let newOffset :=
+                    Nat.add parentPtr.offsetBytes (Nat.mul fromIdx elemSz)
+                  .ok
+                    (.aggregate 0
+                      (.ptr { parentPtr with offsetBytes := newOffset } 8 ::
+                        .scalar ⟨subLen, 8⟩ ::
+                        .nil))
+                    locals
+                    mem
+            | .constantIndex offset minLen fromEnd :: .nil =>
+              let fromEndBoundsOk :=
+                match fromEnd with
+                | false => true
+                | true =>
+                  Bool.and
+                    (Nat.ble 1 offset)
+                    (Nat.ble offset lenSc.bits)
+              match Bool.and (Nat.ble minLen lenSc.bits) fromEndBoundsOk with
+              | false => .ub
+              | true =>
+                let idx :=
+                  match fromEnd with
+                  | true => Nat.sub lenSc.bits offset
+                  | false => offset
+                match Nat.ble (.succ idx) lenSc.bits with
+                | false => .ub
+                | true =>
+                  let newOffset :=
+                    Nat.add parentPtr.offsetBytes (Nat.mul idx elemSz)
+                  .ok
+                    (.ptr { parentPtr with offsetBytes := newOffset } 8)
+                    locals
+                    mem
+            | _ => .ub
+        | .none =>
+          let emptySliceOk :=
+            Bool.and
+              (Bool.not isMut)
+              (Bool.and
+                (Nat.beq lenSc.bits 0)
+                (Bool.not
+                  (Bool.and
+                    (Nat.beq parentPtr.allocId 0)
+                    (Nat.beq parentPtr.offsetBytes 0))))
+          let isZeroEmptySliceProj :=
+            match resolvedRest with
+            | .nil => true
+            | .subslice 0 0 _ :: .nil => true
+            | _ => false
+          match Bool.and emptySliceOk isZeroEmptySliceProj with
+          | true =>
+            .ok
+              (.aggregate 0
+                (.ptr parentPtr 8 :: .scalar ⟨0, 8⟩ :: .nil))
+              locals
+              mem
+          | false => .ub
+
+/--
+Evaluate a dereferenced borrow or raw-address-of (`&(*p)...` or `&raw (*p)...`)
+when `p` holds a thin pointer `Value.ptr parentPtr ptrSz` backed by a global
+allocation `alloc` in `mem.globals`.
+-/
+def evalGlobalThinPtrDerefBorrow
+    (locals : List LocalSlot)
+    (mem : Memory)
+    (alloc : CapturedAllocation)
+    (parentPtr : ProvenancePtr)
+    (ptrSz : Nat)
+    (restProj : List ProjectionElem)
+    (isMut : Bool)
+    (pointeeTyOpt : Option Ty := .none)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    RvalueEvalResult :=
+  let mutOk :=
+    match isMut, alloc.mutability with
+    | true, .not => false
+    | _, _ => true
+  match
+    Bool.and
+      (Nat.beq ptrSz 8)
+      (Bool.and mutOk (Nat.ble parentPtr.offsetBytes (length alloc.bytes)))
+  with
+  | false => .ub
+  | true =>
+    match resolveBorrowProjectionElems locals restProj with
+    | .none => .ub
+    | .some rawResolvedRest =>
+      let resolvedRest :=
+        normalizeSubsliceProjections (stripTransparentProjections rawResolvedRest)
+      let remBytes := Nat.sub (length alloc.bytes) parentPtr.offsetBytes
+      let (elemSz, maxElems) :=
+        match pointeeTyOpt with
+        | .some { kind := .array elemKind arrLen, .. } =>
+          let sz :=
+            match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+            | .some n => n
+            | .none => 1
+          (sz, arrLen)
+        | _ =>
+          match LayoutTable.lookup layouts 0 with
+          | .some l =>
+            match l.fields with
+            | .array stride count => (stride.bytes, count)
+            | _ => (1, remBytes)
+          | .none => (1, remBytes)
+      match resolvedRest with
+      | .nil =>
+        let reqBytes :=
+          match pointeeTyOpt with
+          | .some pointeeTy =>
+            match rigidTyByteSize layouts pointeeTy with
+            | .some n => n
+            | .none => 0
+          | .none => 0
+        match Nat.ble reqBytes remBytes with
+        | true => .ok (.ptr parentPtr 8) locals mem
+        | false => .ub
+      | .constantIndex offset minLen fromEnd :: .nil =>
+        let fromEndBoundsOk :=
+          match fromEnd with
+          | false => true
+          | true =>
+            Bool.and
+              (Nat.ble 1 offset)
+              (Nat.ble offset maxElems)
+        let idx :=
+          match fromEnd with
+          | true => Nat.sub maxElems offset
+          | false => offset
+        let neededBytes := Nat.mul (.succ idx) elemSz
+        match
+          Bool.and
+            (Nat.ble minLen maxElems)
+            (Bool.and
+              fromEndBoundsOk
+              (Bool.and
+                (Nat.ble (.succ idx) maxElems)
+                (Nat.ble neededBytes remBytes)))
+        with
+        | true =>
+          let newOff := Nat.add parentPtr.offsetBytes (Nat.mul idx elemSz)
+          .ok (.ptr { parentPtr with offsetBytes := newOff } 8) locals mem
+        | false => .ub
+      | .subslice fromIdx toIdx fromEnd :: .nil =>
+        match Nat.ble toIdx maxElems with
+        | false => .ub
+        | true =>
+          let endIdx :=
+            match fromEnd with
+            | true => Nat.sub maxElems toIdx
+            | false => toIdx
+          let neededBytes := Nat.mul endIdx elemSz
+          match
+            Bool.and
+              (Nat.ble fromIdx endIdx)
+              (Bool.and
+                (Nat.ble endIdx maxElems)
+                (Nat.ble neededBytes remBytes))
+          with
+          | true =>
+            let newOff := Nat.add parentPtr.offsetBytes (Nat.mul fromIdx elemSz)
+            .ok (.ptr { parentPtr with offsetBytes := newOff } 8) locals mem
+          | false => .ub
+      | _ => .ub
+
+/--
+Compute the MIR `Rvalue.discriminant` scalar for `val` read from `place`.
+
+- For `core::cmp::Ordering` (`#[repr(i8)] enum Ordering { Less = -1, Equal = 0, Greater = 1 }`),
+  maps both `Value.scalar sc` (produced by `BinOp.cmp` and `three_way_compare`,
+  where `Less = ⟨255, 1⟩`, `Equal = ⟨0, 1⟩`, `Greater = ⟨1, 1⟩`) and zero-field
+  `Value.aggregate variantIdx []` (`0 ↦ ⟨255, 1⟩`, `1 ↦ ⟨0, 1⟩`, `2 ↦ ⟨1, 1⟩`)
+  to the signed 1-byte `Ordering` discriminant scalar, faulting with `.ub` on
+  out-of-range scalar bit patterns or widths.
+- For general multi-variant ADTs (`VariantsShape.multiple` or untyped `.adt` layout)
+  stored as `Value.scalar sc` (C-like scalar-encoded enums), checks `validRange`
+  when present and preserves `Value.scalar sc`.
+- For uninhabited types (`.never`, `isUninhabited = true`, or `VariantsShape.empty`),
+  returns `.ub`.
+- For `Value.aggregate variantIdx _`, validates `variantIdx` against
+  `VariantsShape.single` / `VariantsShape.multiple` when layout metadata is
+  available and returns `Value.scalar ⟨variantIdx, 8⟩`.
+- For single-variant ADTs (`VariantsShape.single`) and non-ADT types (`Value.unit`,
+  `Value.scalar`, `Value.ptr`), returns `Value.scalar ⟨0, 8⟩` per `rustc_middle`
+  (`Rvalue::Discriminant` "returns `0` if the type does not have a discriminant").
+-/
+def evalPlaceDiscriminant
+    (val : Value)
+    (locals' : List LocalSlot)
+    (mem : Memory)
+    (place : Place)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    RvalueEvalResult :=
+  match val with
+  | .aggregate variantIdx fields =>
+    match placeTy localDecls layouts place with
+    | .some pTy =>
+      match pTy.kind with
+      | .never => .ub
+      | .adt defPath _ =>
+        let evalOrderingOrVariant : RvalueEvalResult :=
+          match Bool.and (stringEq defPath "core::cmp::Ordering") (Nat.beq (length fields) 0) with
+          | true =>
+            match variantIdx with
+            | 0 => .ok (.scalar ⟨255, 1⟩) locals' mem
+            | 1 => .ok (.scalar ⟨0, 1⟩) locals' mem
+            | 2 => .ok (.scalar ⟨1, 1⟩) locals' mem
+            | _ => .ub
+          | false => .ok (.scalar ⟨variantIdx, 8⟩) locals' mem
+        match LayoutTable.lookup layouts pTy.layoutIdx with
+        | .some { isUninhabited := true, .. } => .ub
+        | .some { variants := .empty, .. } => .ub
+        | .some { variants := .single expectedIdx, .. } =>
+          match Nat.beq variantIdx expectedIdx with
+          | true => .ok (.scalar ⟨0, 8⟩) locals' mem
+          | false => .ub
+        | .some { variants := .multiple _ _ variants, .. } =>
+          let varBoundsOk :=
+            match variants with
+            | .nil => true
+            | _ :: _ => Nat.ble (.succ variantIdx) (length variants)
+          match varBoundsOk with
+          | true => evalOrderingOrVariant
+          | false => .ub
+        | .none => evalOrderingOrVariant
+      | .tuple _ =>
+        match Nat.beq variantIdx 0 with
+        | true => .ok (.scalar ⟨0, 8⟩) locals' mem
+        | false => .ub
+      | .array _ _ =>
+        match Nat.beq variantIdx 0 with
+        | true => .ok (.scalar ⟨0, 8⟩) locals' mem
+        | false => .ub
+      | .slice _ =>
+        match Nat.beq variantIdx 0 with
+        | true => .ok (.scalar ⟨0, 8⟩) locals' mem
+        | false => .ub
+      | .str =>
+        match Nat.beq variantIdx 0 with
+        | true => .ok (.scalar ⟨0, 8⟩) locals' mem
+        | false => .ub
+      | _ => .ok (.scalar ⟨variantIdx, 8⟩) locals' mem
+    | .none => .ok (.scalar ⟨variantIdx, 8⟩) locals' mem
+  | .scalar sc =>
+    match placeTy localDecls layouts place with
+    | .some pTy =>
+      match pTy.kind with
+      | .never => .ub
+      | .adt defPath _ =>
+        match LayoutTable.lookup layouts pTy.layoutIdx with
+        | .some { isUninhabited := true, .. } => .ub
+        | .some { variants := .empty, .. } => .ub
+        | .some { variants := .single _, .. } => .ok (.scalar ⟨0, 8⟩) locals' mem
+        | .some { variants := .multiple (.initialized _ validRange) _ _, .. } =>
+          match ScalarInt.inRange sc validRange with
+          | true => .ok (.scalar sc) locals' mem
+          | false => .ub
+        | _ =>
+          match stringEq defPath "core::cmp::Ordering" with
+          | true =>
+            let isOrderingSc :=
+              Bool.and
+                (Nat.beq sc.sizeBytes 1)
+                (Bool.or
+                  (Nat.beq sc.bits 0)
+                  (Bool.or (Nat.beq sc.bits 1) (Nat.beq sc.bits 255)))
+            match isOrderingSc with
+            | true => .ok (.scalar sc) locals' mem
+            | false => .ub
+          | false => .ok (.scalar sc) locals' mem
+      | _ => .ok (.scalar ⟨0, 8⟩) locals' mem
+    | .none => .ok (.scalar ⟨0, 8⟩) locals' mem
+  | .unit => .ok (.scalar ⟨0, 8⟩) locals' mem
+  | .ptr _ _ => .ok (.scalar ⟨0, 8⟩) locals' mem
 
 /--
 Evaluate an `Rvalue` in `locals` and `mem`, using `localDecls` and `layouts` to
@@ -2599,6 +5992,30 @@ def evalRvalue
       | _, _ => .ok v locals' mem
     | .ub => .ub
     | .unsupported => .unsupported
+  | .binaryOp op lhsOp rhsOp =>
+    match evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals with
+    | .ok lhsVal locals₁ =>
+      match evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals with
+      | .ok rhsVal locals₂ =>
+        match lhsVal, rhsVal with
+        | .scalar lhs, .scalar rhs =>
+          let isSigned := operandIsSigned localDecls lhsOp layouts
+          evalScalarBinOp op lhs rhs locals₂ mem isSigned
+        | .ptr ptrVal sz, .scalar offsetSc =>
+          match op with
+          | .offset =>
+            evalPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp ptrVal sz offsetSc
+          | _ => .unsupported
+        | _, _ => .unsupported
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .ub => .ub
+    | .unsupported => .unsupported
+  | .aggregate .tuple ops =>
+    match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals with
+    | .ok vals locals' => .ok (.aggregate 0 vals) locals' mem
+    | .ub => .ub
+    | .unsupported => .unsupported
   | .copyForDeref place =>
     match evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals with
     | .ok v locals' =>
@@ -2631,7 +6048,7 @@ def evalRvalue
     match place.projection with
     | .deref :: restProj =>
       match get? locals place.local_ with
-      | .some (.init (.ptr parentPtr _)) =>
+      | .some (.init (.ptr parentPtr ptrSz)) =>
         match lookupBorrow mem.borrows parentPtr.tag with
         | .some parentEntry =>
           match parentEntry.perm, borrowKind with
@@ -2641,40 +6058,134 @@ def evalRvalue
             match resolveBorrowProjectionElems locals restProj with
             | .none => .ub
             | .some resolvedRest =>
-              let tag := mem.nextTag
-              let fullProj :=
-                match parentEntry.targetProjection with
-                | .nil => resolvedRest
-                | ph :: pt => ph :: appendProjections pt resolvedRest
-              let reborrowPerm :=
-                match borrowKind with
-                | .shared => perm
-                | .mut _ => TreeBorrowPerm.reserved
-              let borrowsAfterRead :=
-                freezeTreeBorrowsOnReadAtProj
-                  mem.borrows
-                  mem.borrows
-                  parentEntry.targetLocal
-                  (.some parentPtr.tag)
-                  fullProj
-                  parentEntry.rangeOffset
-                  parentEntry.rangeLen
-              let entry : BorrowEntry := {
-                tag := tag
-                targetLocal := parentEntry.targetLocal
-                targetProjection := fullProj
-                perm := reborrowPerm
-                rangeOffset := parentEntry.rangeOffset
-                rangeLen := parentEntry.rangeLen
-                parentTag := .some parentPtr.tag
-              }
-              let mem' := {
-                mem with
-                borrows := entry :: borrowsAfterRead
-                nextTag := Nat.add tag 1
-              }
-              .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
-        | .none => .ub
+              match
+                needsThinPtrElemResolution
+                  parentEntry.targetProjection
+                  parentPtr.offsetBytes
+              with
+              | false =>
+                let tag := mem.nextTag
+                let fullProj :=
+                  match parentEntry.targetProjection with
+                  | .nil => resolvedRest
+                  | ph :: pt => ph :: appendProjections pt resolvedRest
+                let reborrowPerm :=
+                  match borrowKind with
+                  | .shared => perm
+                  | .mut _ => TreeBorrowPerm.reserved
+                let borrowsAfterRead :=
+                  freezeTreeBorrowsOnReadAtProj
+                    mem.borrows
+                    mem.borrows
+                    parentEntry.targetLocal
+                    (.some parentPtr.tag)
+                    fullProj
+                    parentEntry.rangeOffset
+                    parentEntry.rangeLen
+                let entry : BorrowEntry := {
+                  tag := tag
+                  targetLocal := parentEntry.targetLocal
+                  targetProjection := fullProj
+                  perm := reborrowPerm
+                  rangeOffset := parentEntry.rangeOffset
+                  rangeLen := parentEntry.rangeLen
+                  parentTag := .some parentPtr.tag
+                }
+                let mem' := {
+                  mem with
+                  borrows := entry :: borrowsAfterRead
+                  nextTag := Nat.add tag 1
+                }
+                .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
+              | true =>
+                let targetRootOpt : Option Value :=
+                  match get? locals parentEntry.targetLocal with
+                  | .some (.init v) => .some v
+                  | .some _ => .none
+                  | .none =>
+                    match get? mem.callerLocals parentEntry.targetLocal with
+                    | .some (.init v) => .some v
+                    | _ => .none
+                match targetRootOpt with
+                | .none => .ub
+                | .some targetRootVal =>
+                  match
+                    resolveStackThinPtrTargetProj?
+                      locals
+                      targetRootVal
+                      parentEntry
+                      parentPtr
+                      resolvedRest
+                  with
+                  | .none => .ub
+                  | .some fullProj =>
+                    let tag := mem.nextTag
+                    let reborrowPerm :=
+                  match borrowKind with
+                  | .shared => perm
+                  | .mut _ => TreeBorrowPerm.reserved
+                let borrowsAfterRead :=
+                  freezeTreeBorrowsOnReadAtProj
+                    mem.borrows
+                    mem.borrows
+                    parentEntry.targetLocal
+                    (.some parentPtr.tag)
+                    fullProj
+                    parentEntry.rangeOffset
+                    parentEntry.rangeLen
+                let entry : BorrowEntry := {
+                      tag := tag
+                      targetLocal := parentEntry.targetLocal
+                      targetProjection := fullProj
+                      perm := reborrowPerm
+                  rangeOffset := parentEntry.rangeOffset
+                  rangeLen := parentEntry.rangeLen
+                  parentTag := .some parentPtr.tag
+                    }
+                    let mem' := {
+                      mem with
+                      borrows := entry :: borrowsAfterRead
+                      nextTag := Nat.add tag 1
+                    }
+                    .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
+        | .none =>
+          match lookupGlobalAlloc mem.globals parentPtr.allocId with
+          | .some alloc =>
+            let isMut :=
+              match borrowKind with
+              | .shared => false
+              | .mut _ => true
+            let pointeeTyOpt :=
+              placeTy localDecls layouts { local_ := place.local_, projection := .deref :: .nil }
+            evalGlobalThinPtrDerefBorrow
+              locals
+              mem
+              alloc
+              parentPtr
+              ptrSz
+              restProj
+              isMut
+              pointeeTyOpt
+              layouts
+          | .none => .ub
+      | .some (.init (.aggregate 0 (.ptr parentPtr ptrSz :: .scalar lenSc :: .nil))) =>
+        let isMut :=
+          match borrowKind with
+          | .shared => false
+          | .mut _ => true
+        let pointeeTyOpt :=
+          placeTy localDecls layouts { local_ := place.local_, projection := .deref :: .nil }
+        evalSliceFatPtrDerefBorrow
+          locals
+          mem
+          parentPtr
+          ptrSz
+          lenSc
+          restProj
+          perm
+          isMut
+          pointeeTyOpt
+          layouts
       | _ => .ub
     | _ =>
       match get? locals place.local_ with
@@ -2705,7 +6216,7 @@ def evalRvalue
     match place.projection with
     | .deref :: restProj =>
       match get? locals place.local_ with
-      | .some (.init (.ptr parentPtr _)) =>
+      | .some (.init (.ptr parentPtr ptrSz)) =>
         match lookupBorrow mem.borrows parentPtr.tag with
         | .some parentEntry =>
           match parentEntry.perm, mutability with
@@ -2715,31 +6226,116 @@ def evalRvalue
             match resolveBorrowProjectionElems locals restProj with
             | .none => .ub
             | .some resolvedRest =>
-              let tag := mem.nextTag
-              let fullProj :=
-                match parentEntry.targetProjection with
-                | .nil => resolvedRest
-                | ph :: pt => ph :: appendProjections pt resolvedRest
-              let rawPerm :=
-                match mutability, parentEntry.perm with
-                | .not, .reserved => TreeBorrowPerm.reserved
-                | _, _ => perm
-              let entry : BorrowEntry := {
-                tag := tag
-                targetLocal := parentEntry.targetLocal
-                targetProjection := fullProj
-                perm := rawPerm
-                rangeOffset := parentEntry.rangeOffset
-                rangeLen := parentEntry.rangeLen
-                parentTag := .some parentPtr.tag
-              }
-              let mem' := {
-                mem with
-                borrows := entry :: mem.borrows
-                nextTag := Nat.add tag 1
-              }
-              .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
-        | .none => .ub
+              match
+                needsThinPtrElemResolution
+                  parentEntry.targetProjection
+                  parentPtr.offsetBytes
+              with
+              | false =>
+                let tag := mem.nextTag
+                let fullProj :=
+                  match parentEntry.targetProjection with
+                  | .nil => resolvedRest
+                  | ph :: pt => ph :: appendProjections pt resolvedRest
+                let rawPerm :=
+                  match mutability, parentEntry.perm with
+                  | .not, .reserved => TreeBorrowPerm.reserved
+                  | _, _ => perm
+                let entry : BorrowEntry := {
+                  tag := tag
+                  targetLocal := parentEntry.targetLocal
+                  targetProjection := fullProj
+                  perm := rawPerm
+                  rangeOffset := parentEntry.rangeOffset
+                  rangeLen := parentEntry.rangeLen
+                  parentTag := .some parentPtr.tag
+                }
+                let mem' := {
+                  mem with
+                  borrows := entry :: mem.borrows
+                  nextTag := Nat.add tag 1
+                }
+                .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
+              | true =>
+                let targetRootOpt : Option Value :=
+                  match get? locals parentEntry.targetLocal with
+                  | .some (.init v) => .some v
+                  | .some _ => .none
+                  | .none =>
+                    match get? mem.callerLocals parentEntry.targetLocal with
+                    | .some (.init v) => .some v
+                    | _ => .none
+                match targetRootOpt with
+                | .none => .ub
+                | .some targetRootVal =>
+                  match
+                    resolveStackThinPtrTargetProj?
+                      locals
+                      targetRootVal
+                      parentEntry
+                      parentPtr
+                      resolvedRest
+                  with
+                  | .none => .ub
+                  | .some fullProj =>
+                    let tag := mem.nextTag
+                    let rawPerm :=
+                  match mutability, parentEntry.perm with
+                  | .not, .reserved => TreeBorrowPerm.reserved
+                  | _, _ => perm
+                let entry : BorrowEntry := {
+                      tag := tag
+                      targetLocal := parentEntry.targetLocal
+                      targetProjection := fullProj
+                      perm := rawPerm
+                  rangeOffset := parentEntry.rangeOffset
+                  rangeLen := parentEntry.rangeLen
+                  parentTag := .some parentPtr.tag
+                    }
+                    let mem' := {
+                      mem with
+                      borrows := entry :: mem.borrows
+                      nextTag := Nat.add tag 1
+                    }
+                    .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
+        | .none =>
+          match lookupGlobalAlloc mem.globals parentPtr.allocId with
+          | .some alloc =>
+            let isMut :=
+              match mutability with
+              | .not => false
+              | .mut => true
+            let pointeeTyOpt :=
+              placeTy localDecls layouts { local_ := place.local_, projection := .deref :: .nil }
+            evalGlobalThinPtrDerefBorrow
+              locals
+              mem
+              alloc
+              parentPtr
+              ptrSz
+              restProj
+              isMut
+              pointeeTyOpt
+              layouts
+          | .none => .ub
+      | .some (.init (.aggregate 0 (.ptr parentPtr ptrSz :: .scalar lenSc :: .nil))) =>
+        let isMut :=
+          match mutability with
+          | .not => false
+          | .mut => true
+        let pointeeTyOpt :=
+          placeTy localDecls layouts { local_ := place.local_, projection := .deref :: .nil }
+        evalSliceFatPtrDerefBorrow
+          locals
+          mem
+          parentPtr
+          ptrSz
+          lenSc
+          restProj
+          perm
+          isMut
+          pointeeTyOpt
+          layouts
       | _ => .ub
     | _ =>
       match get? locals place.local_ with
@@ -2763,10 +6359,10 @@ def evalRvalue
           }
           .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
   | .len place =>
-    match evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok (.aggregate 0 elems) locals' =>
-      .ok (.scalar ⟨length elems, 8⟩) locals' mem
-    | .ok _ _ => .unsupported
+    evalPlaceLen locals place mem localDecls layouts
+  | .wrapUnsafeBinder op _ =>
+    match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+    | .ok v locals' => .ok v locals' mem
     | .ub => .ub
     | .unsupported => .unsupported
   | .cast .intToInt op targetTy =>
@@ -2790,22 +6386,59 @@ def evalRvalue
     | .ok _ _ => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported
-  | .cast .ptrToPtr op _ =>
+  | .cast .ptrToPtr op targetTy =>
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok (.ptr ptrVal sz) locals' => .ok (.ptr ptrVal sz) locals' mem
+    | .ok (.ptr ptrVal sz) locals' =>
+      match targetTy.kind with
+      | .rawPtr _ (.slice _) => .ub
+      | .rawPtr _ .str => .ub
+      | .rawPtr _ (.dynamic _) => .ub
+      | .rawPtr _ dstElem =>
+        let arrayCastLenOpt : Option Nat :=
+          match operandTy localDecls layouts op with
+          | .some { kind := .rawPtr _ (.array srcElem arrLen), .. } =>
+            match rigidTyEq srcElem dstElem with
+            | true => .some arrLen
+            | false => .none
+          | .some { kind := .ref _ (.array srcElem arrLen), .. } =>
+            match rigidTyEq srcElem dstElem with
+            | true => .some arrLen
+            | false => .none
+          | _ => .none
+        match arrayCastLenOpt, lookupBorrow mem.borrows ptrVal.tag with
+        | .some arrLen, .some parentEntry =>
+          match Nat.beq sz 8 with
+          | true =>
+            deriveStackElemThinPtr locals' mem ptrVal parentEntry (.some arrLen)
+          | false => .ub
+        | _, _ => .ok (.ptr ptrVal sz) locals' mem
+      | _ => .ok (.ptr ptrVal sz) locals' mem
     | .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' =>
-      .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
+      match
+        Bool.and
+          (Nat.beq sz 8)
+          (Nat.beq metaSc.sizeBytes 8)
+      with
+      | false => .ub
+      | true =>
+        match isThinRawPtrTy targetTy with
+        | true =>
+          match lookupBorrow mem.borrows ptrVal.tag with
+          | .some parentEntry =>
+            deriveStackElemThinPtr locals' mem ptrVal parentEntry (.some metaSc.bits)
+          | .none => .ok (.ptr ptrVal sz) locals' mem
+        | false =>
+          match targetTy.kind with
+          | .rawPtr _ _ =>
+            .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
+          | _ => .ub
     | .ok _ _ => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported
-  | .cast (.pointerCoercion _) op _ =>
-    match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok (.ptr ptrVal sz) locals' => .ok (.ptr ptrVal sz) locals' mem
-    | .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' =>
-      .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
-    | .ok _ _ => .unsupported
-    | .ub => .ub
-    | .unsupported => .unsupported
+  | .cast (.pointerCoercion coercionKind) op targetTy =>
+    evalReifyFnPointer locals op targetTy mem localDecls layouts coercionKind
+  | .cast .fnPtrToPtr op targetTy =>
+    evalFnPtrToPtr locals op targetTy mem localDecls layouts
   | .cast .pointerExposeProvenance op _ =>
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
     | .ok (.ptr ptrVal _) locals' =>
@@ -2831,31 +6464,6 @@ def evalRvalue
     evalByteCast locals op targetTy mem localDecls layouts
   | .cast .subtype op targetTy =>
     evalByteCast locals op targetTy mem localDecls layouts
-  | .binaryOp op lhsOp rhsOp =>
-    match evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok lhsVal locals₁ =>
-      match evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals with
-      | .ok rhsVal locals₂ =>
-        match lhsVal, rhsVal with
-        | .scalar lhs, .scalar rhs =>
-          let isSigned := operandIsSigned localDecls lhsOp layouts
-          evalScalarBinOp op lhs rhs locals₂ mem isSigned
-        | .ptr ptrVal sz, .scalar offsetSc =>
-          match op with
-          | .offset =>
-            .ok
-              (.ptr
-                { ptrVal with
-                  offsetBytes := Nat.add ptrVal.offsetBytes offsetSc.bits }
-                sz)
-              locals₂
-              mem
-          | _ => .unsupported
-        | _, _ => .unsupported
-      | .ub => .ub
-      | .unsupported => .unsupported
-    | .ub => .ub
-    | .unsupported => .unsupported
   | .unaryOp .not op =>
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
     | .ok (.scalar sc) locals' =>
@@ -2877,24 +6485,29 @@ def evalRvalue
     | .ub => .ub
     | .unsupported => .unsupported
   | .unaryOp .ptrMetadata op =>
+    let ptrBytes := layoutPointerBytes layouts
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok (.aggregate 0 (.ptr _ _ :: .scalar metaSc :: .nil)) locals' =>
-      .ok (.scalar ⟨metaSc.bits, 8⟩) locals' mem
+    | .ok (.aggregate 0 (.ptr _ ptrSz :: .scalar metaSc :: .nil)) locals' =>
+      match
+        Bool.and
+          (Nat.beq ptrSz ptrBytes)
+          (Nat.beq metaSc.sizeBytes ptrBytes)
+      with
+      | true => .ok (.scalar ⟨metaSc.bits, ptrBytes⟩) locals' mem
+      | false => .ub
     | .ok (.aggregate 0 elems) locals' =>
-      .ok (.scalar ⟨length elems, 8⟩) locals' mem
+      .ok (.scalar ⟨length elems, ptrBytes⟩) locals' mem
+    | .ok (.ptr _ ptrSz) locals' =>
+      match Nat.beq ptrSz ptrBytes with
+      | true => .ok .unit locals' mem
+      | false => .ub
     | .ok _ _ => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported
   | .discriminant place =>
     match evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok (.aggregate variantIdx _) locals' =>
-      .ok (.scalar ⟨variantIdx, 8⟩) locals' mem
-    | .ok _ _ => .unsupported
-    | .ub => .ub
-    | .unsupported => .unsupported
-  | .aggregate .tuple ops =>
-    match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok vals locals' => .ok (.aggregate 0 vals) locals' mem
+    | .ok val locals' =>
+      evalPlaceDiscriminant val locals' mem place localDecls layouts
     | .ub => .ub
     | .unsupported => .unsupported
   | .aggregate (.array _) ops =>
@@ -2905,6 +6518,11 @@ def evalRvalue
   | .aggregate (.adt _ variantIdx _) ops =>
     match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals with
     | .ok vals locals' => .ok (.aggregate variantIdx vals) locals' mem
+    | .ub => .ub
+    | .unsupported => .unsupported
+  | .aggregate (.closure _) ops =>
+    match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals with
+    | .ok vals locals' => .ok (.aggregate 0 vals) locals' mem
     | .ub => .ub
     | .unsupported => .unsupported
   | .aggregate (.rawPtr _ _) ops =>

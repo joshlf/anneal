@@ -34,7 +34,14 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   tyIsSigned placeIsSigned operandIsSigned evalUnaryNot signedOverflowAdd
   signedOverflowSub signedOverflowMul evalSignedDiv evalSignedRem
   signedHalfModulus evalExactDiv evalScalarExactDiv
-  evalScalarBinOp intCastTargetBytes ScalarVal AbstractByte mergeByteProvenance
+  evalScalarBinOp intCastTargetBytes
+  ctpopLoop cttzLoop bitreverseLoop ctlzBits bswapLoop
+  evalCtlz evalCtlzNonzero evalCttz evalCttzNonzero evalCtpop
+  evalBswap evalBitreverse evalWrappingAdd evalWrappingSub evalWrappingMul
+  evalSaturatingAdd evalSaturatingSub evalUncheckedAdd evalUncheckedSub
+  evalUncheckedMul evalUncheckedDiv evalUncheckedRem evalUncheckedShl
+  evalUncheckedShr evalThreeWayCompare evalArithOffset evalSliceSizeOfVal
+  ScalarVal AbstractByte mergeByteProvenance
   encodeLittleEndianBytes encodeScalarBytes decodeLittleEndianBytes
   decodeScalarBytes replicateUninitBytes takeAbstractBytes dropAbstractBytes
   appendAbstractBytes sliceAbstractBytes writeAbstractBytesAt
@@ -54,15 +61,50 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   hasProtectedTreeWriteConflict lookupGlobalAlloc
   readLittleEndianBytes readGlobalScalar tyScalarBytes evalConstValue
   dropValues takeValues extractSubslice readProjectedValue
+  appendValueList replaceSubslice
   setOrExtendFields writeProjectedValue
-  sliceConstElemKind evalOperand evalOperands writePlaceValue evalByteCast
+  sliceConstElemKind isScalarCompatibleProj uintRigidTyOfStride
+  inferValueByteSizeAux inferElemListByteStride exactByteDivAux byteOffsetToElemIdx?
+  splitLastConstantIndex? readSliceBackingAggregate? splitLastSubslice? endsWithSubslice needsThinPtrElemResolution
+  startsWithArrayOrSliceProj resolveStackThinPtrTargetProj?
+  evalGlobalDerefRead evalSliceFatPtrDerefRead evalPlaceRead
+  evalOperand evalOperands
+  extractDerefPtrVal? resolveDerefWriteFullProj writeSliceFatPtrTargetValue
+  writePlaceValue evalByteCast
+  unsizeArrayToSliceSpec? evalUnsizeCoercion deriveStackElemThinPtr
   resolveBorrowProjectionElems rigidTyIsFreeze tyIsFreeze sharedBorrowPerm
-  evalRvalue evalRvalueWithMemory advanceStmt projectionsOverlap appendValues
+  splitLastDeref? evalPlaceLen
+  findDeclTyWithKind? pointeeElemByteStride valueDefaultByteSize
+  projectedValueDefaultByteSize ptrAllocByteBound?
+  evalBinOpOffset evalPtrOffsetBinOp evalSliceFatPtrDerefBorrow
+  evalGlobalThinPtrDerefBorrow evalPlaceDiscriminant
+  evalRvalue evalRvalueWithMemory advanceStmt
+  normalizeSubsliceProjectionsAux normalizeSubsliceProjections
+  projectionsOverlap appendValues
   spliceValues sameRigidTyShape operandPointeeTy evalCopySingleDirect
   evalCopyNonOverlappingWithCount evalCopyNonOverlapping
   evalStmt lookupSwitchTarget findCallee?
-  extractCalleeDefPath? applyUnwindAction resumeExternalCall
-  resumeExternalTailCall evalTerminator
+  extractCalleeDefPath? restoreCallerProtectors pushCalleeFrame
+  pushDivergingCalleeFrame enterTailCalleeFrame unwindFromCallStack
+  applyUnwindAction resumeExternalCall resumeExternalDivergingCall
+  resumeExternalTailCall isDirectExactDivTarget RustIntrinsicKind
+  classifyRustIntrinsic? rigidTyIsSigned intrinsicIntSignedness?
+  resolveIntrinsicIsSigned resolveIntrinsicShiftSigned findDeclLayoutForRigidTy
+  intrinsicRigidTyByteSizeAux intrinsicRigidTyByteSize
+  intrinsicRigidTyKindAlign tupleFieldsAlign tupleFieldsByteSum roundUpToAlign
+  intrinsicRigidTyAlignAux intrinsicRigidTyAlign
+  anyUnsizedRigidTy isUnsizedRigidTy intrinsicUnresolvedLayoutStep
+  intrinsicLastRigidTy? intrinsicTailIsExtern intrinsicTailMayBeUnsized
+  isValidWidePtrMetaVal isValidIntrinsicPtrArgVal intrinsicWidePointeeStep
+  resolveIntrinsicPointeeTy? intrinsicMissingPointeeStep
+  allZeroSizedUnitElemTys isZeroSizedUnitElemTy
+  unpackConstEvalSelectArgs? resolveConstEvalSelectTarget?
+  writeIntrinsicReturn writeIntrinsicScalarResult
+  evalNonSelectIntrinsicCall isPtrPointeeIntrinsicKind
+  withConstEvalSelectIntrinsicTypeArgs rigidTysToZeroSizedOps
+  constEvalSelectTupleArgOps evalDirectRustIntrinsic?
+  isUnreachableCallTarget isAbortingPanicDefPath
+  isUnwindingPanicDefPath evalTerminator
   initMachineState initMachineStateWithCallees
   stepMirFn stepMirState mirTree mirCallTree MirCallInstance
   MirLang MirNoUBTree
