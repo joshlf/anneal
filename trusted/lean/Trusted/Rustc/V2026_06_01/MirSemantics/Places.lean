@@ -1556,14 +1556,15 @@ def splitLastConstantIndex? : List ProjectionElem → Option (List ProjectionEle
 Resolve the backing array/subslice element list `(containerProj, baseIdx, elems)`
 for a slice fat pointer or thin element pointer whose `BorrowEntry` has
 `targetProjection`:
-- When `readProjectedValue indexLocals targetRootVal targetProjection` yields
-  `.ok (.aggregate 0 elems)`, returns `.some (targetProjection, 0, elems)`
-  directly.
-- When `targetProjection` resolves to a non-aggregate element via a trailing
-  `.constantIndex baseIdx minLen false` (e.g. `&raw const arr[baseIdx]` passed
-  to `core::ptr::slice_from_raw_parts`), resolves the parent aggregate at
-  `initProj`, validates `minLen <= length elems` and `baseIdx <= length elems`,
-  and returns `.some (initProj, baseIdx, elems)`.
+- When `targetProjection` (after stripping transparent projections and
+  normalizing subslices) ends with `.constantIndex baseIdx minLen false`
+  (e.g. `&raw const arr[baseIdx]` passed to `core::ptr::slice_from_raw_parts`,
+  including when each array element is itself a tuple or struct
+  `.aggregate 0 fields`), resolves the parent aggregate at `initProj`, validates
+  `minLen <= length elems` and `baseIdx <= length elems`, and returns
+  `.some (initProj, baseIdx, elems)`.
+- Otherwise, when `readProjectedValue indexLocals targetRootVal targetProjection`
+  yields `.ok (.aggregate 0 elems)`, returns `.some (targetProjection, 0, elems)`.
 -/
 @[reducible]
 def readSliceBackingAggregate?
@@ -1571,26 +1572,24 @@ def readSliceBackingAggregate?
     (targetRootVal : Value)
     (targetProjection : List ProjectionElem) :
     Option (List ProjectionElem × Nat × List Value) :=
-  match readProjectedValue indexLocals targetRootVal targetProjection with
-  | .ok (.aggregate 0 elems) => .some (targetProjection, 0, elems)
-  | .ok .unit => .none
-  | .ok _ =>
-    let normProj :=
-      normalizeSubsliceProjections (stripTransparentProjections targetProjection)
-    match splitLastConstantIndex? normProj with
-    | .some (initProj, baseIdx, minLen) =>
-      match readProjectedValue indexLocals targetRootVal initProj with
-      | .ok (.aggregate 0 elems) =>
-        match
-          Bool.and
-            (Nat.ble minLen (length elems))
-            (Nat.ble baseIdx (length elems))
-        with
-        | true => .some (initProj, baseIdx, elems)
-        | false => .none
-      | _ => .none
-    | .none => .none
-  | _ => .none
+  let normProj :=
+    normalizeSubsliceProjections (stripTransparentProjections targetProjection)
+  match splitLastConstantIndex? normProj with
+  | .some (initProj, baseIdx, minLen) =>
+    match readProjectedValue indexLocals targetRootVal initProj with
+    | .ok (.aggregate 0 elems) =>
+      match
+        Bool.and
+          (Nat.ble minLen (length elems))
+          (Nat.ble baseIdx (length elems))
+      with
+      | true => .some (initProj, baseIdx, elems)
+      | false => .none
+    | _ => .none
+  | .none =>
+    match readProjectedValue indexLocals targetRootVal targetProjection with
+    | .ok (.aggregate 0 elems) => .some (targetProjection, 0, elems)
+    | _ => .none
 
 /--
 If `proj` ends with `.subslice fromIdx toIdx fromEnd`, split `proj` into
@@ -1849,7 +1848,21 @@ def evalSliceFatPtrDerefRead
                 | .ok fieldVal => .ok fieldVal locals
                 | .ub => .ub
                 | .unsupported => .unsupported
-          | .none => .ub
+          | .none =>
+            match readProjectedValue locals targetRootVal entry.targetProjection with
+            | .ok .unit =>
+              match
+                Bool.and
+                  (Nat.beq ptrVal.offsetBytes 0)
+                  (Nat.beq lenSc.bits 0)
+              with
+              | false => .ub
+              | true =>
+                match readProjectedValue locals (.aggregate 0 .nil) restProj with
+                | .ok fieldVal => .ok fieldVal locals
+                | .ub => .ub
+                | .unsupported => .unsupported
+            | _ => .ub
         | .none => .ub
     | .none =>
       match lookupGlobalAlloc globals ptrVal.allocId with
@@ -2523,7 +2536,28 @@ def writeSliceFatPtrTargetValue
           | .ok _ => .ub
           | .ub => .ub
           | .unsupported => .unsupported
-    | .none => .ub
+    | .none =>
+      match readProjectedValue indexLocals targetRootVal targetProjection with
+      | .ok .unit =>
+        match
+          Bool.and
+            (Nat.beq ptrVal.offsetBytes 0)
+            (Nat.beq lenSc.bits 0)
+        with
+        | false => .ub
+        | true =>
+          match
+            writeProjectedValue
+              indexLocals
+              (.aggregate 0 .nil)
+              restProj
+              val
+          with
+          | .ok (.aggregate 0 .nil) => .ok targetRootVal
+          | .ok _ => .ub
+          | .ub => .ub
+          | .unsupported => .unsupported
+      | _ => .ub
 
 /--
 Write `val` to `dst` in `locals` using active borrow table `borrows`, supporting
@@ -3500,7 +3534,42 @@ def evalUnsizeCoercion
           | .some n =>
             let stackTargetValid :=
               match lookupBorrow mem.borrows ptrVal.tag with
-              | .none => true
+              | .none =>
+                match lookupGlobalAlloc mem.globals ptrVal.allocId with
+                | .some alloc =>
+                  let mutOk :=
+                    match isTargetMutSlicePtr, alloc.mutability with
+                    | true, .not => false
+                    | _, _ => true
+                  let elemSz :=
+                    match targetTy.kind with
+                    | .ref _ (.slice dstElem) =>
+                      match rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 } with
+                      | .some sz => sz
+                      | .none => 1
+                    | .rawPtr _ (.slice dstElem) =>
+                      match rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 } with
+                      | .some sz => sz
+                      | .none => 1
+                    | _ => 1
+                  let alignedOk :=
+                    match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+                    | .some _ => true
+                    | .none => false
+                  Bool.and
+                    mutOk
+                    (Bool.and
+                      alignedOk
+                      (Nat.ble
+                        (Nat.add ptrVal.offsetBytes (Nat.mul n elemSz))
+                        (length alloc.bytes)))
+                | .none =>
+                  match Nat.beq ptrVal.allocId 0 with
+                  | true =>
+                    Bool.and
+                      (Bool.not (Nat.beq ptrVal.offsetBytes 0))
+                      (Nat.beq n 0)
+                  | false => true
               | .some entry =>
                 let rootValOpt : Option Value :=
                   match get? locals' entry.targetLocal with
@@ -3512,19 +3581,22 @@ def evalUnsizeCoercion
                     | _ => .none
                 match rootValOpt with
                 | .some rootVal =>
-                  match readProjectedValue locals' rootVal entry.targetProjection with
-                  | .ok (.aggregate 0 elems) =>
+                  match readSliceBackingAggregate? locals' rootVal entry.targetProjection with
+                  | .some (_, baseIdx, elems) =>
                     let elemSz := inferElemListByteStride elems
                     match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
-                    | .some elemOffset =>
+                    | .some rawElemOffset =>
+                      let elemOffset := Nat.add rawElemOffset baseIdx
                       Nat.ble (Nat.add elemOffset n) (length elems)
                     | .none => false
-                  | .ok .unit =>
-                    Bool.and
-                      (Nat.beq ptrVal.offsetBytes 0)
-                      (Nat.beq n 0)
-                  | .ok (.ptr _ _) => true
-                  | _ => false
+                  | .none =>
+                    match readProjectedValue locals' rootVal entry.targetProjection with
+                    | .ok .unit =>
+                      Bool.and
+                        (Nat.beq ptrVal.offsetBytes 0)
+                        (Nat.beq n 0)
+                    | .ok (.ptr _ _) => true
+                    | _ => false
                 | .none => false
             match stackTargetValid with
             | true =>
@@ -3555,11 +3627,12 @@ def evalUnsizeCoercion
                   | _ => .none
               match rootValOpt with
               | .some rootVal =>
-                match readProjectedValue locals' rootVal entry.targetProjection with
-                | .ok (.aggregate 0 elems) =>
+                match readSliceBackingAggregate? locals' rootVal entry.targetProjection with
+                | .some (_, baseIdx, elems) =>
                   let elemSz := inferElemListByteStride elems
                   match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
-                  | .some elemOffset =>
+                  | .some rawElemOffset =>
+                    let elemOffset := Nat.add rawElemOffset baseIdx
                     match Nat.ble elemOffset (length elems) with
                     | true =>
                       .ok
@@ -3571,18 +3644,20 @@ def evalUnsizeCoercion
                         mem
                     | false => .ub
                   | .none => .ub
-                | .ok .unit =>
-                  match Nat.beq ptrVal.offsetBytes 0 with
-                  | true =>
-                    .ok
-                      (.aggregate 0
-                        (.ptr ptrVal sz ::
-                          .scalar ⟨0, ptrBytes⟩ ::
-                          .nil))
-                      locals'
-                      mem
-                  | false => .ub
-                | _ => .ub
+                | .none =>
+                  match readProjectedValue locals' rootVal entry.targetProjection with
+                  | .ok .unit =>
+                    match Nat.beq ptrVal.offsetBytes 0 with
+                    | true =>
+                      .ok
+                        (.aggregate 0
+                          (.ptr ptrVal sz ::
+                            .scalar ⟨0, ptrBytes⟩ ::
+                            .nil))
+                        locals'
+                        mem
+                    | false => .ub
+                  | _ => .ub
               | .none => .ub
           | .none =>
             match lookupGlobalAlloc mem.globals ptrVal.allocId with
@@ -4117,7 +4192,26 @@ def evalPlaceLen
                       (Nat.beq lenSc.bits 0)
                   | _ => false
               | .none => false
-          | .none => true
+          | .none =>
+            match lookupGlobalAlloc mem.globals ptrVal.allocId with
+            | .some alloc =>
+              let elemSz :=
+                match pTy with
+                | .some { kind := .slice elemKind, .. } =>
+                  match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+                  | .some n => n
+                  | .none => 1
+                | _ => 1
+              Nat.ble
+                (Nat.add ptrVal.offsetBytes (Nat.mul lenSc.bits elemSz))
+                (length alloc.bytes)
+            | .none =>
+              match Nat.beq ptrVal.allocId 0 with
+              | true =>
+                Bool.and
+                  (Bool.not (Nat.beq ptrVal.offsetBytes 0))
+                  (Nat.beq lenSc.bits 0)
+              | false => true
         let notFixedArrayPlace :=
           match pTy with
           | .some { kind := .array _ _, .. } => false
@@ -5597,13 +5691,22 @@ def evalRvalue
     | .ub => .ub
     | .unsupported => .unsupported
   | .unaryOp .ptrMetadata op =>
+    let ptrBytes := layoutPointerBytes layouts
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok (.aggregate 0 (.ptr _ _ :: .scalar metaSc :: .nil)) locals' =>
-      .ok (.scalar ⟨metaSc.bits, 8⟩) locals' mem
+    | .ok (.aggregate 0 (.ptr _ ptrSz :: .scalar metaSc :: .nil)) locals' =>
+      match
+        Bool.and
+          (Nat.beq ptrSz ptrBytes)
+          (Nat.beq metaSc.sizeBytes ptrBytes)
+      with
+      | true => .ok (.scalar ⟨metaSc.bits, ptrBytes⟩) locals' mem
+      | false => .ub
     | .ok (.aggregate 0 elems) locals' =>
-      .ok (.scalar ⟨length elems, 8⟩) locals' mem
-    | .ok (.ptr _ _) locals' =>
-      .ok .unit locals' mem
+      .ok (.scalar ⟨length elems, ptrBytes⟩) locals' mem
+    | .ok (.ptr _ ptrSz) locals' =>
+      match Nat.beq ptrSz ptrBytes with
+      | true => .ok .unit locals' mem
+      | false => .ub
     | .ok _ _ => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported
