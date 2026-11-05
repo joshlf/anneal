@@ -6,9 +6,11 @@
 -- This file may not be copied, modified, or distributed except according to
 -- those terms.
 
--- anneal-trust-tier: candidate:step_result
+-- anneal-trust-tier: candidate:mir_semantics
 prelude
 import Init.NotationExtra
 import Init.Core
 import Trusted.Refinement
 import Trusted.StepResult
+import Trusted.MirAst
+import Trusted.MirSemantics
