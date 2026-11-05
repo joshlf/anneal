@@ -2402,8 +2402,25 @@ theorem rootActiveMemory_initMachineState
 @[simp]
 theorem rootActiveMemory_initMachineStateWithCallees
     (body : CapturedMir) (args : List Value) (callees : List CapturedMir) :
-    RootActiveMemory (initMachineStateWithCallees body args callees).memory :=
-  ⟨rfl, rfl, rfl, rfl⟩
+    RootActiveMemory (initMachineStateWithCallees body args callees).memory := by
+  cases callees <;> exact ⟨rfl, rfl, rfl, rfl⟩
+
+/--
+`initMachineStateWithCallees body args callees` is the frame of
+`initMachineStateWithMemory` over its own initial memory.
+
+The trusted definition matches on `callees` (`[]` reuses `initMachineState`,
+while a non-empty table also seeds `Memory.traitImpls`), so for an abstract
+`callees` the equation needs a case split rather than `rfl`. Proofs that
+discharge claims through `initMachineStateWithMemory`-shaped lemmas rewrite
+with this equation.
+-/
+theorem initMachineStateWithCallees_eq_withMemory
+    (body : CapturedMir) (args : List Value) (callees : List CapturedMir) :
+    initMachineStateWithCallees body args callees =
+      initMachineStateWithMemory body args
+        (initMachineStateWithCallees body args callees).memory := by
+  cases callees <;> rfl
 
 @[simp]
 theorem rootActiveMemory_withDefaultCallees
@@ -2640,6 +2657,10 @@ Discharge a stateless `VerificationResult c` from fuel-free `MirWpConverges`
 (`mirSafePost`: panics/unwinds are safe defined behavior; normal returns must
 satisfy `c.post args retVal`).
 
+The hypothesis starts from `initMachineStateWithCallees c.body args c.callees`,
+the initial state that `Claim.holds` quantifies over; for a claim without
+linked callees it reduces definitionally to `initMachineState c.body args`.
+
 Unlike `verifyMirSafeSym`, the existential step count inside `MirWpConverges`
 may vary arbitrarily with `args`.
 -/
@@ -2648,7 +2669,7 @@ theorem verifyMirSafe_of_wpConverges
     (h_wp :
       ∀ args : List Value,
         c.pre args →
-        MirWpConverges c.body (initMachineState c.body args)
+        MirWpConverges c.body (initMachineStateWithCallees c.body args c.callees)
           (mirSafePost (fun retVal _ => c.post args retVal))) :
     VerificationResult c := by
   refine verifyByDWLP c (fun args h_pre => ?_)
@@ -2671,7 +2692,7 @@ theorem verifyMirNoPanic_of_wpConverges
     (h_wp :
       ∀ args : List Value,
         c.pre args →
-        MirWpConverges c.body (initMachineState c.body args)
+        MirWpConverges c.body (initMachineStateWithCallees c.body args c.callees)
           (mirNormalPost (fun retVal _ => c.post args retVal))) :
     VerificationResult c :=
   verifyMirSafe_of_wpConverges c (fun args h_pre =>
@@ -2681,6 +2702,13 @@ theorem verifyMirNoPanic_of_wpConverges
 Discharge a stateful `StatefulVerificationResult c` from fuel-free
 `MirWpConverges` (`mirSafePost`).
 
+The hypothesis starts from the trusted
+`Trusted.VerificationResult.initMachineStateWithMemoryAndCallees`, the initial
+state that `StatefulClaim.holds` quantifies over; for a claim without linked
+callees it reduces definitionally to `initMachineStateWithMemory c.body args
+mem`. The stateful, total, UB-exception, trace, and equivalence combinators
+below start from the same trusted state.
+
 The existential step count inside `MirWpConverges` may vary arbitrarily with
 `(args, mem)`.
 -/
@@ -2689,7 +2717,9 @@ theorem verifyStatefulMirSafe_of_wpConverges
     (h_wp :
       ∀ (args : List Value) (mem : Memory),
         c.pre args mem →
-        MirWpConverges c.body (initMachineStateWithMemory c.body args mem)
+        MirWpConverges c.body
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees)
           (mirSafePost (c.post args mem))) :
     StatefulVerificationResult c := by
   refine verifyStatefulByDWLP c (fun args mem h_pre => ?_)
@@ -2711,7 +2741,9 @@ theorem verifyStatefulMirNoPanic_of_wpConverges
     (h_wp :
       ∀ (args : List Value) (mem : Memory),
         c.pre args mem →
-        MirWpConverges c.body (initMachineStateWithMemory c.body args mem)
+        MirWpConverges c.body
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees)
           (mirNormalPost (c.post args mem))) :
     StatefulVerificationResult c :=
   verifyStatefulMirSafe_of_wpConverges c (fun args mem h_pre =>
@@ -2729,7 +2761,9 @@ theorem verifyTotalMir_of_wpConverges
     (h_wp :
       ∀ (args : List Value) (mem : Memory),
         c.pre args mem →
-        MirWpConverges c.body (initMachineStateWithMemory c.body args mem)
+        MirWpConverges c.body
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees)
           (mirNormalPost (c.post args mem))) :
     TotalVerificationResult c := by
   refine verifyTotalByDWP c (fun args mem h_pre => ?_)
@@ -2751,7 +2785,8 @@ theorem verifyStatefulEquivMir_of_wpConverges
       ∀ (args : List Value) (mem : Memory),
         c.pre args mem →
         MirNoCallWpConverges c.implBody
-          (initMachineStateWithMemory c.implBody args mem)
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.implBody args mem c.implCallees)
           (fun out =>
             out = .normal (model args mem) ∧
             c.post args mem (model args mem).1 (model args mem).2))
@@ -2759,7 +2794,8 @@ theorem verifyStatefulEquivMir_of_wpConverges
       ∀ (args : List Value) (mem : Memory),
         c.pre args mem →
         MirNoCallWpConverges c.specBody
-          (initMachineStateWithMemory c.specBody args mem)
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.specBody args mem c.specCallees)
           (fun out => out = .normal (model args mem))) :
     StatefulEquivVerificationResult c :=
   verifyStatefulEquivViaPureModel c model
@@ -2940,13 +2976,15 @@ theorem verifyUbExceptionMir_of_wpConverges
         c.pre args mem →
         c.strictSafetyPre args mem →
         MirWpConverges c.body
-          (initMachineStateWithMemory c.body args mem)
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees)
           (mirSafePost (c.post args mem)))
     (h_waived :
       ∀ (args : List Value) (mem : Memory),
         c.pre args mem →
         MirUbWaivedWpConverges c.body
-          (initMachineStateWithMemory c.body args mem)
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees)
           (mirSafePost (c.post args mem))) :
     UbExceptionVerificationResult c := by
   refine verifyUbExceptionByDWLP c
@@ -4123,7 +4161,8 @@ theorem verifyTraceMir_of_wpConverges
       ∀ (args : List Value) (mem : Memory),
         c.pre args mem →
         MirTraceWpConverges c.body
-          (initMachineStateWithMemory c.body args mem)
+          (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees)
           (fun tr out => c.post args mem tr out)) :
     TraceVerificationResult c :=
   verifyTraceByDWLP c (fun args mem h_pre =>
@@ -4138,7 +4177,8 @@ theorem dischargeStatelessEq_of_wpConverges
     (expectedArgs : List Value)
     (h_pre : ∀ args : List Value, c.pre args → args = expectedArgs)
     (h_eval :
-      MirWpConverges c.body (initMachineState c.body expectedArgs)
+      MirWpConverges c.body
+        (initMachineStateWithCallees c.body expectedArgs c.callees)
         (mirNormalPost (fun retVal _ => c.post expectedArgs retVal))) :
     VerificationResult c :=
   verifyMirNoPanic_of_wpConverges c (fun args hp => by
@@ -4158,7 +4198,8 @@ theorem dischargeStatefulEq_of_wpConverges
         c.pre args mem → args = expectedArgs ∧ mem = expectedMem)
     (h_eval :
       MirWpConverges c.body
-        (initMachineStateWithMemory c.body expectedArgs expectedMem)
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          c.body expectedArgs expectedMem c.callees)
         (mirNormalPost (c.post expectedArgs expectedMem))) :
     StatefulVerificationResult c :=
   verifyStatefulMirNoPanic_of_wpConverges c (fun args mem hp => by
@@ -4177,7 +4218,8 @@ theorem verifyWellTypedScalarArg1_of_wpConverges
         b < scalarModulus width →
         c.pre [.scalar { bits := b, sizeBytes := width }] →
         MirWpConverges c.body
-          (initMachineState c.body [.scalar { bits := b, sizeBytes := width }])
+          (initMachineStateWithCallees c.body
+            [.scalar { bits := b, sizeBytes := width }] c.callees)
           (mirNormalPost
             (fun retVal _ =>
               c.post [.scalar { bits := b, sizeBytes := width }] retVal))) :
@@ -4195,7 +4237,8 @@ theorem verifyWellTypedSafeScalarArg1_of_wpConverges
         b < scalarModulus width →
         c.pre [.scalar { bits := b, sizeBytes := width }] →
         MirWpConverges c.body
-          (initMachineState c.body [.scalar { bits := b, sizeBytes := width }])
+          (initMachineStateWithCallees c.body
+            [.scalar { bits := b, sizeBytes := width }] c.callees)
           (mirSafePost
             (fun retVal _ =>
               c.post [.scalar { bits := b, sizeBytes := width }] retVal))) :
@@ -4219,9 +4262,9 @@ theorem verifyWellTypedScalarArg2_of_wpConverges
           [ .scalar { bits := b1, sizeBytes := w1 }
           , .scalar { bits := b2, sizeBytes := w2 } ] →
         MirWpConverges c.body
-          (initMachineState c.body
+          (initMachineStateWithCallees c.body
             [ .scalar { bits := b1, sizeBytes := w1 }
-            , .scalar { bits := b2, sizeBytes := w2 } ])
+            , .scalar { bits := b2, sizeBytes := w2 } ] c.callees)
           (mirNormalPost
             (fun retVal _ =>
               c.post
@@ -4245,9 +4288,9 @@ theorem verifyWellTypedSafeScalarArg2_of_wpConverges
           [ .scalar { bits := b1, sizeBytes := w1 }
           , .scalar { bits := b2, sizeBytes := w2 } ] →
         MirWpConverges c.body
-          (initMachineState c.body
+          (initMachineStateWithCallees c.body
             [ .scalar { bits := b1, sizeBytes := w1 }
-            , .scalar { bits := b2, sizeBytes := w2 } ])
+            , .scalar { bits := b2, sizeBytes := w2 } ] c.callees)
           (mirSafePost
             (fun retVal _ =>
               c.post
@@ -4465,11 +4508,12 @@ theorem multiBlockPipeline_withCallees_wpConverges
           retVal = .scalar { bits := b, sizeBytes := 4 } ∧
           mem' =
             (initMachineStateWithCallees multiBlockPipelineBody
-              [.scalar { bits := b, sizeBytes := 4 }] callees).memory)) :=
-  multiBlockPipeline_wpConverges b
+              [.scalar { bits := b, sizeBytes := 4 }] callees).memory)) := by
+  have h := multiBlockPipeline_wpConverges b
     (initMachineStateWithCallees multiBlockPipelineBody
       [.scalar { bits := b, sizeBytes := 4 }] callees).memory
-    ⟨rfl, rfl, rfl, rfl⟩
+    (rootActiveMemory_initMachineStateWithCallees _ _ callees)
+  rwa [← initMachineStateWithCallees_eq_withMemory] at h
 
 /-- Stateless `Claim` for `multiBlockPipelineBody`. -/
 def multiBlockPipelineClaim : Claim where

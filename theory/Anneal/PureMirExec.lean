@@ -167,16 +167,16 @@ theorem initPureState_toMachineState_withCallees
     (body : CapturedMir) (args : List Value) (callees : List CapturedMir) :
     (initPureState body args).toMachineState
         (initMachineStateWithCallees body args callees).memory =
-      initMachineStateWithCallees body args callees :=
-  rfl
+      initMachineStateWithCallees body args callees := by
+  cases callees <;> rfl
 
 @[simp]
 theorem initPureState_toMachineState_withMemoryAndCallees
     (body : CapturedMir) (args : List Value) (mem : Memory)
     (callees : List CapturedMir) :
     (initPureState body args).toMachineState
-        (Memory.withDefaultCallees mem callees) =
-      initMachineStateWithMemoryAndCallees body args mem callees :=
+        (MirFuelFree.Memory.withDefaultCallees mem callees) =
+      MirFuelFree.initMachineStateWithMemoryAndCallees body args mem callees :=
   rfl
 
 /--
@@ -249,8 +249,8 @@ theorem mirFrameSim_initMachineStateWithCallees
     (body : CapturedMir) (args : List Value) (callees : List CapturedMir) :
     MirFrameSim body (initMachineStateWithCallees body args callees).memory
       (initPureState body args)
-      (initMachineStateWithCallees body args callees) :=
-  ⟨rfl, rfl, rfl, rfl⟩
+      (initMachineStateWithCallees body args callees) := by
+  cases callees <;> exact ⟨rfl, rfl, rfl, rfl⟩
 
 /--
 Initial frame simulation between `initPureState body args` and
@@ -261,9 +261,9 @@ Initial frame simulation between `initPureState body args` and
 theorem mirFrameSim_initMachineStateWithMemoryAndCallees
     (body : CapturedMir) (args : List Value) (mem₀ : Memory)
     (callees : List CapturedMir) :
-    MirFrameSim body (Memory.withDefaultCallees mem₀ callees)
+    MirFrameSim body (MirFuelFree.Memory.withDefaultCallees mem₀ callees)
       (initPureState body args)
-      (initMachineStateWithMemoryAndCallees body args mem₀ callees) :=
+      (MirFuelFree.initMachineStateWithMemoryAndCallees body args mem₀ callees) :=
   ⟨rfl, rfl, rfl, rfl⟩
 
 /-- Extract `ms.memory = mem₀` from `MirFrameSim`. -/
@@ -349,7 +349,10 @@ def isPureRvalue : Rvalue → Bool
   | .rawPtr .. => false
   | .threadLocalRef _ => false
   | .len p => isPurePlace p
-  | .cast _ op _ => isPureOperand op
+  | .cast ck op _ => match ck with
+    | .pointerCoercion _ => false
+    | .fnPtrToPtr => false
+    | _ => isPureOperand op
   | .binaryOp _ lhs rhs => isPureOperand lhs && isPureOperand rhs
   | .nullaryOp _ _ => true
   | .unaryOp _ op => isPureOperand op
@@ -623,11 +626,17 @@ theorem evalRvalue_pure_eq_withMem
   | cast ck op targetTy =>
     dsimp only [isPureRvalue] at h_pure
     cases ck with
+    | pointerCoercion _ => cases h_pure
+    | fnPtrToPtr => cases h_pure
     | transmute => exact evalByteCast_pure_eq_withMem locals op targetTy mem localDecls layouts h_pure
     | subtype => exact evalByteCast_pure_eq_withMem locals op targetTy mem localDecls layouts h_pure
     | _ =>
       dsimp only [evalRvalue]
+      try unfold evalReifyFnPointer
+      try unfold evalFnPtrToPtr
       try rw [evalOperand_pure_eq locals op mem.borrows mem.globals layouts mem.callerLocals h_pure]
+      try unfold evalReifyFnPointer
+      try unfold evalFnPtrToPtr
       try rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
       try cases evalOperand locals op [] [] layouts []
       repeat' (first | rfl | split)
@@ -751,20 +760,27 @@ theorem memory_with_borrows_nil_eq {mem : Memory} (h : mem.borrows = []) :
   rfl
 
 /--
-Evaluating a pure `Statement` from `ps.toMachineState mem₀` under
-`RootActiveMemory mem₀` produces the exact same transition as evaluating from
-`ps.toMachineState emptyMemory` and restoring `mem₀`.
+Evaluating a pure `Statement` from `ps.toMachineState mem₀` produces the exact
+same transition as evaluating from `ps.toMachineState emptyMemory` and
+restoring `mem₀`, provided `mem₀` has no live borrows and no active
+function-entry protectors.
+
+Pure statements read and write only the frame's locals; the only memory fields
+they consult are the borrow table (invalidated on every local write) and the
+protector stack (checked for protected-write conflicts). In particular, the
+call stack and the active callee are irrelevant, so the lemma also applies to
+callee frames and to caller frames resumed after a return.
 -/
-theorem evalStmt_toMachineState_eq_withMem
+theorem evalStmt_toMachineState_eq_withMem_of_frameFree
     (ps : PureState) (mem₀ : Memory) (stmt : Statement)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (h_pure : isPureStatement stmt.kind = true)
-    (h_root : RootActiveMemory mem₀) :
+    (h_borrows : mem₀.borrows = [])
+    (h_prot : mem₀.activeProtectors = []) :
     evalStmt (ps.toMachineState mem₀) stmt localDecls layouts =
       MirStepNode.withMem mem₀
         (evalStmt (ps.toMachineState emptyMemory) stmt localDecls layouts) := by
   rcases stmt with ⟨kind, span⟩
-  rcases h_root with ⟨h_borrows, _, _, h_prot⟩
   cases kind with
   | nop => rfl
   | coverage => rfl
@@ -917,6 +933,22 @@ theorem evalStmt_toMachineState_eq_withMem
                   rfl
 
 /--
+Evaluating a pure `Statement` from `ps.toMachineState mem₀` under
+`RootActiveMemory mem₀` produces the exact same transition as evaluating from
+`ps.toMachineState emptyMemory` and restoring `mem₀`.
+-/
+theorem evalStmt_toMachineState_eq_withMem
+    (ps : PureState) (mem₀ : Memory) (stmt : Statement)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h_pure : isPureStatement stmt.kind = true)
+    (h_root : RootActiveMemory mem₀) :
+    evalStmt (ps.toMachineState mem₀) stmt localDecls layouts =
+      MirStepNode.withMem mem₀
+        (evalStmt (ps.toMachineState emptyMemory) stmt localDecls layouts) :=
+  evalStmt_toMachineState_eq_withMem_of_frameFree ps mem₀ stmt localDecls layouts
+    h_pure h_root.1 h_root.2.2.2
+
+/--
 Evaluating a pure `Terminator` from `ps.toMachineState mem₀` under
 `RootActiveMemory mem₀` produces the exact same transition as evaluating from
 `ps.toMachineState emptyMemory` and restoring `mem₀`.
@@ -978,11 +1010,15 @@ theorem evalTerminator_toMachineState_eq_withMem
         | true => rfl
         | false =>
           dsimp only [applyUnwindAction]
-          cases unwind <;> rfl
+          cases unwind <;> (try rw [h_stack]) <;> rfl
       | _ => rfl
   | call _ _ _ _ _ => cases h_pure
   | tailCall _ _ => cases h_pure
-  | unwindResume => rfl
+  | unwindResume =>
+    unfold evalTerminator
+    dsimp only [PureState.toMachineState]
+    rw [h_stack]
+    rfl
   | unwindTerminate => rfl
   | inlineAsm => rfl
 
@@ -1525,8 +1561,11 @@ theorem mirWpConverges_of_pureExec_withCallees
       (mirNormalPost
         (fun retVal mem' =>
           mem' = (initMachineStateWithCallees body args callees).memory ∧
-          post retVal)) :=
-  mirWpConverges_of_pureExec h_pure h_conv (h_root := ⟨rfl, rfl, rfl, rfl⟩)
+          post retVal)) := by
+  have h := mirWpConverges_of_pureExec
+    (mem₀ := (initMachineStateWithCallees body args callees).memory)
+    h_pure h_conv (rootActiveMemory_initMachineStateWithCallees body args callees)
+  rwa [← initMachineStateWithCallees_eq_withMemory] at h
 
 /--
 Specialization of `mirWpConverges_of_pureExec` to
@@ -1544,10 +1583,10 @@ theorem mirWpConverges_of_pureExec_withMemoryAndCallees
       | exact ⟨rfl, rfl, rfl, rfl⟩
       | (refine ⟨?_, ?_, ?_, ?_⟩ <;> simp_all [RootActiveMemory])) :
     MirWpConverges body
-      (initMachineStateWithMemoryAndCallees body args mem₀ callees)
+      (MirFuelFree.initMachineStateWithMemoryAndCallees body args mem₀ callees)
       (mirNormalPost
         (fun retVal mem' =>
-          mem' = Memory.withDefaultCallees mem₀ callees ∧ post retVal)) :=
+          mem' = MirFuelFree.Memory.withDefaultCallees mem₀ callees ∧ post retVal)) :=
   mirWpConverges_of_pureExec h_pure h_conv (h_root := ((rootActiveMemory_withDefaultCallees mem₀ callees).mpr h_root))
 
 /--
@@ -1790,6 +1829,36 @@ theorem mirStepsConverges_of_pureExec_sim
 /-! ## 5. Verification Gate Bridges (`VerificationResult`, `StatefulVerificationResult`, `TotalVerificationResult`) -/
 
 /--
+The trusted callee-aware stateful initial state is `initMachineStateWithMemory`
+over its own initial memory, which seeds `Memory.callees` and
+`Memory.traitImpls` only when the callee table is non-empty.
+-/
+theorem trustedInitWithMemoryAndCallees_eq_withMemory
+    (body : CapturedMir) (args : List Value) (mem : Memory)
+    (callees : List CapturedMir) :
+    Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+        body args mem callees =
+      initMachineStateWithMemory body args
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          body args mem callees).memory :=
+  rfl
+
+/--
+Seeding the callee and trait-implementation tables preserves
+`RootActiveMemory`: neither table is a root-activation field.
+-/
+theorem rootActiveMemory_trustedInitWithMemoryAndCallees
+    {body : CapturedMir} {args : List Value} {mem : Memory}
+    {callees : List CapturedMir}
+    (h_root : RootActiveMemory mem) :
+    RootActiveMemory
+      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+        body args mem callees).memory := by
+  cases callees with
+  | nil => exact h_root
+  | cons _ _ => exact h_root
+
+/--
 Discharge a stateless `VerificationResult c` from panic-forbidding pure
 execution (`PureMirConverges`).
 -/
@@ -1808,7 +1877,7 @@ theorem verifyMirNoPanic_of_pureExec
       | normal rv => exact h_out.2
       | panic => exact False.elim h_out
       | abort => exact False.elim h_out)
-    (mirWpConverges_of_pureExec_init h_pure (h_wp args h_pre))
+    (mirWpConverges_of_pureExec_withCallees h_pure (h_wp args h_pre))
 
 /--
 Discharge a stateless `VerificationResult c` from partial-correctness pure
@@ -1823,13 +1892,18 @@ theorem verifyMirSafe_of_pureExec
         PureMirSafeConverges c.body (initPureState c.body args) (c.post args)) :
     VerificationResult c := by
   refine verifyMirSafe_of_wpConverges c (fun args h_pre => ?_)
+  have h := mirSafeWpConverges_of_pureExec
+    (mem₀ := (initMachineStateWithCallees c.body args c.callees).memory)
+    h_pure (h_wp args h_pre)
+    (rootActiveMemory_initMachineStateWithCallees c.body args c.callees)
+  rw [← initMachineStateWithCallees_eq_withMemory] at h
   exact MirWpConverges.mono
     (fun out h_out => by
       cases out with
       | normal rv => exact h_out.2
       | panic => trivial
       | abort => trivial)
-    (mirSafeWpConverges_of_pureExec h_pure (h_wp args h_pre) ⟨rfl, rfl, rfl, rfl⟩)
+    h
 
 /-- Primary alias for stateless pure verification (`verifyMirNoPanic_of_pureExec`). -/
 abbrev verifyMir_of_pureExec := @verifyMirNoPanic_of_pureExec
@@ -1847,7 +1921,10 @@ theorem verifyStatefulMirNoPanic_of_pureExec
       ∀ (args : List Value) (mem : Memory),
         c.pre args mem →
         PureMirConverges c.body (initPureState c.body args)
-          (fun retVal => c.post args mem retVal mem)) :
+          (fun retVal =>
+            c.post args mem retVal
+              (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+                c.body args mem c.callees).memory)) :
     StatefulVerificationResult c := by
   refine verifyStatefulMirNoPanic_of_wpConverges c (fun args mem h_pre => ?_)
   exact MirWpConverges.mono
@@ -1859,7 +1936,11 @@ theorem verifyStatefulMirNoPanic_of_pureExec
         exact h_post
       | panic => exact False.elim h_out
       | abort => exact False.elim h_out)
-    (mirWpConverges_of_pureExec h_pure (h_wp args mem h_pre) (h_root args mem h_pre))
+    (mirWpConverges_of_pureExec
+      (mem₀ := (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          c.body args mem c.callees).memory)
+      h_pure (h_wp args mem h_pre)
+      (rootActiveMemory_trustedInitWithMemoryAndCallees (h_root args mem h_pre)))
 
 /--
 Discharge a stateful `StatefulVerificationResult c` from partial-correctness
@@ -1873,7 +1954,10 @@ theorem verifyStatefulMirSafe_of_pureExec
       ∀ (args : List Value) (mem : Memory),
         c.pre args mem →
         PureMirSafeConverges c.body (initPureState c.body args)
-          (fun retVal => c.post args mem retVal mem)) :
+          (fun retVal =>
+            c.post args mem retVal
+              (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+                c.body args mem c.callees).memory)) :
     StatefulVerificationResult c := by
   refine verifyStatefulMirSafe_of_wpConverges c (fun args mem h_pre => ?_)
   exact MirWpConverges.mono
@@ -1885,7 +1969,11 @@ theorem verifyStatefulMirSafe_of_pureExec
         exact h_post
       | panic => trivial
       | abort => trivial)
-    (mirSafeWpConverges_of_pureExec h_pure (h_wp args mem h_pre) (h_root args mem h_pre))
+    (mirSafeWpConverges_of_pureExec
+      (mem₀ := (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          c.body args mem c.callees).memory)
+      h_pure (h_wp args mem h_pre)
+      (rootActiveMemory_trustedInitWithMemoryAndCallees (h_root args mem h_pre)))
 
 /-- Primary alias for stateful pure verification (`verifyStatefulMirNoPanic_of_pureExec`). -/
 abbrev verifyStatefulMir_of_pureExec := @verifyStatefulMirNoPanic_of_pureExec
@@ -1902,7 +1990,10 @@ theorem verifyTotalMir_of_pureExec
       ∀ (args : List Value) (mem : Memory),
         c.pre args mem →
         PureMirConverges c.body (initPureState c.body args)
-          (fun retVal => c.post args mem retVal mem)) :
+          (fun retVal =>
+            c.post args mem retVal
+              (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+                c.body args mem c.callees).memory)) :
     TotalVerificationResult c := by
   refine verifyTotalMir_of_wpConverges c (fun args mem h_pre => ?_)
   exact MirWpConverges.mono
@@ -1914,7 +2005,11 @@ theorem verifyTotalMir_of_pureExec
         exact h_post
       | panic => exact False.elim h_out
       | abort => exact False.elim h_out)
-    (mirWpConverges_of_pureExec h_pure (h_wp args mem h_pre) (h_root args mem h_pre))
+    (mirWpConverges_of_pureExec
+      (mem₀ := (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          c.body args mem c.callees).memory)
+      h_pure (h_wp args mem h_pre)
+      (rootActiveMemory_trustedInitWithMemoryAndCallees (h_root args mem h_pre)))
 
 /--
 Discharge `MirBoolPredicateHolds specBody args` from `PureMirConverges`.
@@ -1945,7 +2040,7 @@ theorem mirBoolPredicateHoldsWithCallees_of_pureExec
     (h_conv :
       PureMirConverges specBody (initPureState specBody args)
         (· = .scalar { bits := 1, sizeBytes := 1 })) :
-    MirBoolPredicateHoldsWithCallees specBody callees args := by
+    MirFuelFree.MirBoolPredicateHoldsWithCallees specBody callees args := by
   refine mirBoolPredicateHoldsWithCallees_of_wpConverges specBody callees args ?_
   exact MirWpConverges.mono
     (fun out h_out => by
@@ -2145,7 +2240,7 @@ theorem pureAdtMultiBlock_wpConverges_withCallees
     (mem₀ : Memory) (callees : List CapturedMir)
     (h_root : RootActiveMemory mem₀) :
     MirWpConverges pureAdtMultiBlockBody
-      (initMachineStateWithMemoryAndCallees pureAdtMultiBlockBody [
+      (MirFuelFree.initMachineStateWithMemoryAndCallees pureAdtMultiBlockBody [
         .aggregate 0 [
           .scalar { bits := x, sizeBytes := 4 },
           .scalar { bits := y, sizeBytes := 4 }
@@ -2154,7 +2249,7 @@ theorem pureAdtMultiBlock_wpConverges_withCallees
       ] mem₀ callees)
       (mirNormalPost
         (fun retVal mem' =>
-          mem' = Memory.withDefaultCallees mem₀ callees ∧
+          mem' = MirFuelFree.Memory.withDefaultCallees mem₀ callees ∧
           retVal = pureAdtExpected x y variantIdx)) :=
   mirWpConverges_of_pureExec_withMemoryAndCallees
     checkPureMir_pureAdtMultiBlockBody
