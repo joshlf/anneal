@@ -13,7 +13,8 @@
 //! - `lean/`, the pinned Lean toolchain;
 //! - `rust/`, the pinned Rust toolchain (`rustc`, `rust-std`, and `rustc-dev`);
 //!   and
-//! - `share/anneal/`, the `trusted/lean/` foundation metadata.
+//! - `share/anneal/`, the `trusted/lean/` foundation metadata and `theory/`
+//!   proof automation.
 
 use std::path::PathBuf;
 
@@ -46,6 +47,52 @@ pub fn install(local_archive: Option<PathBuf>) -> Result<PathBuf, String> {
         .map_err(|e| format!("failed to install Anneal toolchain: {e}"))
 }
 
+/// Resolves an already-installed Anneal toolchain directory in the user-global
+/// cache without attempting a network download.
+pub fn resolve_installed() -> Option<PathBuf> {
+    if let Ok(dir) =
+        CONFIG.resolve_installation_dir(exocrate::Location::UserGlobal)
+    {
+        return Some(dir);
+    }
+    if let Ok(env_tc) = std::env::var("ANNEAL_TOOLCHAIN") {
+        let dir = PathBuf::from(env_tc);
+        if is_valid_toolchain_dir(&dir) {
+            return Some(dir);
+        }
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    for base in [
+        home.join(".cache/.anneal/toolchain"),
+        home.join(".anneal/toolchain"),
+    ] {
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            continue;
+        };
+        let mut candidates = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_valid_toolchain_dir(&path) {
+                let mtime = entry.metadata().and_then(|m| m.modified()).ok();
+                candidates.push((mtime, path));
+            }
+        }
+        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        if let Some((_, dir)) = candidates.into_iter().next() {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+fn is_valid_toolchain_dir(dir: &std::path::Path) -> bool {
+    dir.join("lean/bin/lean").is_file()
+        && dir.join("rust/bin/rustc").is_file()
+        && dir
+            .join("share/anneal/trusted/lean/foundation-lock.json")
+            .is_file()
+}
+
 #[cfg(test)]
 mod tests {
     use std::process::Command;
@@ -54,8 +101,7 @@ mod tests {
 
     #[test]
     fn resolves_and_executes_installed_exocrate_toolchain() {
-        let root = CONFIG
-            .resolve_installation_dir(exocrate::Location::UserGlobal)
+        let root = resolve_installed()
             .expect("Anneal toolchain must be installed before running tests");
 
         assert!(
