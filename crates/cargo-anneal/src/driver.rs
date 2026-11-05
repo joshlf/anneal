@@ -377,8 +377,7 @@ pub fn aggregate_unit_manifests(
             let def_id = target.def_id.clone();
             let lean_module_name = derive_lean_module_from_path(&target.mir_module_path);
             let record = UnitTargetRecord {
-            trait_impls: vec![],
-                target: target.clone(),
+            target: target.clone(),
                 lean_module_name,
                 item_kind: CapturedItemKind::Subject,
                 associated_subject_def_id: None,
@@ -796,7 +795,6 @@ pub fn parse_unit_capture_manifest(input: &str) -> Result<UnitCaptureManifest, S
             lean_module_name,
             item_kind,
             associated_subject_def_id,
-            trait_impls,
         });
     }
 
@@ -1181,8 +1179,7 @@ mod tests {
             rust_sources: vec![("src/lib.rs".to_string(), sha256_hex(b"pub fn add() {}"))],
             unit_targets: vec![
                 UnitTargetRecord {
-            trait_impls: vec![],
-                    target: CapturedTarget {
+            target: CapturedTarget {
                         def_id: "demo_crate::add".to_string(),
                         mir_module_path: "Mir/DemoCrate/add.lean".to_string(),
                         mir_module_sha256: sha256_hex(b"-- mir body"),
@@ -1193,8 +1190,7 @@ mod tests {
                     trait_impls: Vec::new(),
                 },
                 UnitTargetRecord {
-            trait_impls: vec![],
-                    target: CapturedTarget {
+            target: CapturedTarget {
                         def_id: "demo_crate::__anodized_fn_requires_add".to_string(),
                         mir_module_path: "Mir/DemoCrate/__anodized_fn_requires_add.lean"
                             .to_string(),
@@ -1268,8 +1264,7 @@ mod tests {
                 ("crates/shared/src/lib.rs".to_string(), shared_src_hash.clone()),
             ],
             unit_targets: vec![UnitTargetRecord {
-            trait_impls: vec![],
-                target: CapturedTarget {
+            target: CapturedTarget {
                     def_id: "crate_b::zeta".to_string(),
                     mir_module_path: "Mir/CrateB/zeta.lean".to_string(),
                     mir_module_sha256: mir_b_hash.clone(),
@@ -1294,8 +1289,7 @@ mod tests {
             ],
             unit_targets: vec![
                 UnitTargetRecord {
-            trait_impls: vec![],
-                    target: CapturedTarget {
+            target: CapturedTarget {
                         def_id: "crate_a::alpha".to_string(),
                         mir_module_path: "Mir/CrateA/alpha.lean".to_string(),
                         mir_module_sha256: mir_a_hash.clone(),
@@ -1308,8 +1302,7 @@ mod tests {
                 // Duplicate target across units with identical digest should
                 // deduplicate cleanly.
                 UnitTargetRecord {
-            trait_impls: vec![],
-                    target: CapturedTarget {
+            target: CapturedTarget {
                         def_id: "crate_b::zeta".to_string(),
                         mir_module_path: "Mir/CrateB/zeta.lean".to_string(),
                         mir_module_sha256: mir_b_hash.clone(),
@@ -1410,8 +1403,7 @@ mod tests {
             compilation_succeeded: true,
             rust_sources: vec![("src/lib.rs".to_string(), sha256_hex(source))],
             unit_targets: vec![UnitTargetRecord {
-            trait_impls: vec![],
-                target: CapturedTarget {
+            target: CapturedTarget {
                     def_id: def_id.to_string(),
                     mir_module_path: format!("Mir/Demo/{}.lean", def_id.replace("demo::", "")),
                     mir_module_sha256: sha256_hex(def_id.as_bytes()),
@@ -1842,6 +1834,7 @@ pub fn caller_ffi_and_len(s: &[u8]) -> u32 {
             gen_dir.join("Obligations/CrateA/caller_with_external_specs.lean"),
         )
         .expect("read caller_with_external_specs.lean");
+        std::fs::write("/tmp/ob_override.txt", &ob_override).unwrap();
         assert!(
             ob_override.contains("Mir.CrateB.inner_leaf.body"),
             "non-overridden callee Mir.CrateB.inner_leaf.body must remain in defaultCallees:\n{ob_override}"
@@ -1862,7 +1855,7 @@ pub fn caller_ffi_and_len(s: &[u8]) -> u32 {
         );
         assert!(
             ob_override.contains(
-                "def externalCallContract_CrateA_ext_slice_is_empty : MirCallContract :=\n  externalSpecCallContract\n    \"core::slice::<impl [T]>::is_empty\"\n    Mir.CrateA.ext_slice_is_empty.body\n    (fun _ => True)\n    (fun _ _ => True)"
+                "def externalCallContract_CrateA_ext_slice_is_empty : MirCallContract :=\n  externalSpecCallContract\n    \"core::slice::<[T]>::is_empty\"\n    Mir.CrateA.ext_slice_is_empty.body\n    (fun _ => True)\n    (fun _ _ => True)"
             ),
             "expected clause-less externalCallContract_CrateA_ext_slice_is_empty in caller_with_external_specs.lean:\n{ob_override}"
         );
@@ -2115,7 +2108,7 @@ example :
 example :
     findCallee?
       Obligations.CrateA.caller_with_external_specs.defaultCallees
-      "core::slice::<impl [T]>::is_empty" = .none := rfl
+      "core::slice::<[T]>::is_empty" = .none := rfl
 
 example :
     findCallee?
@@ -2127,13 +2120,13 @@ example :
 --    (`0` or `1` of byte width `1`) and rejects out-of-range values.
 example (sVal : Value) :
     Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
-      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      { defPath := "core::slice::<[T]>::is_empty", args := [sVal], memory := emptyMemory }
       (.returned (.scalar ⟨1, 1⟩) emptyMemory) :=
   ⟨⟨rfl, rfl, rfl, rfl, ⟨[], rfl⟩⟩, ⟨1, by decide, rfl⟩, trivial⟩
 
 example (sVal : Value) :
     ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
-      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      { defPath := "core::slice::<[T]>::is_empty", args := [sVal], memory := emptyMemory }
       (.returned (.scalar ⟨2, 1⟩) emptyMemory) := by
   rintro ⟨_, ⟨b, hb_lt, h_ret⟩, _⟩
   cases h_ret
@@ -2144,19 +2137,19 @@ example (sVal : Value) :
 --    may unwind or abort.
 example (sVal : Value) :
     Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
-      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      { defPath := "core::slice::<[T]>::is_empty", args := [sVal], memory := emptyMemory }
       (.returned (.scalar ⟨0, 1⟩) { emptyMemory with nextAllocId := 7, nextTag := 9 }) :=
   ⟨⟨rfl, rfl, rfl, rfl, ⟨[], rfl⟩⟩, ⟨0, by decide, rfl⟩, trivial⟩
 
 example (sVal : Value) :
     Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
-      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      { defPath := "core::slice::<[T]>::is_empty", args := [sVal], memory := emptyMemory }
       (.panicked { emptyMemory with nextTag := 3 }) :=
   ⟨rfl, rfl, rfl, rfl, ⟨[], rfl⟩⟩
 
 example (sVal : Value) :
     Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
-      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      { defPath := "core::slice::<[T]>::is_empty", args := [sVal], memory := emptyMemory }
       .aborted :=
   trivial
 
@@ -2166,21 +2159,21 @@ example (sVal : Value) :
 --     reference updates tag permissions) and freshly reified function pointers.
 example (sVal : Value) :
     ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
-      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      { defPath := "core::slice::<[T]>::is_empty", args := [sVal], memory := emptyMemory }
       (.returned (.scalar ⟨0, 1⟩) { emptyMemory with activeProtectors := [1] }) := by
   rintro ⟨⟨_, _, _, h_prot, _⟩, _, _⟩
   cases h_prot
 
 example (sVal : Value) (entry : BorrowEntry) (fnEntry : FnPtrEntry) :
     Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
-      { defPath := "core::slice::<impl [T]>::is_empty", args := [sVal], memory := emptyMemory }
+      { defPath := "core::slice::<[T]>::is_empty", args := [sVal], memory := emptyMemory }
       (.returned (.scalar ⟨1, 1⟩)
         { emptyMemory with borrows := [entry], fnPtrs := [fnEntry], nextTag := 2 }) :=
   ⟨⟨rfl, rfl, rfl, rfl, ⟨[fnEntry], rfl⟩⟩, ⟨1, by decide, rfl⟩, trivial⟩
 
 example (sVal : Value) (fnEntry : FnPtrEntry) :
     ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.post
-      { defPath := "core::slice::<impl [T]>::is_empty"
+      { defPath := "core::slice::<[T]>::is_empty"
         args := [sVal]
         memory := { emptyMemory with fnPtrs := [fnEntry] } }
       (.returned (.scalar ⟨1, 1⟩) emptyMemory) := by
@@ -2247,14 +2240,14 @@ example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) :
 --    pointer or a wide pointer with wrong-width/out-of-range length metadata.
 example (p : ProvenancePtr) :
     Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.pre
-      { defPath := "core::slice::<impl [T]>::is_empty"
+      { defPath := "core::slice::<[T]>::is_empty"
         args := [.aggregate 0 [.ptr p 8, .scalar ⟨3, 8⟩]]
         memory := emptyMemory } :=
   ⟨rfl, rfl, ⟨⟨p, 8, 3, by decide, rfl⟩, trivial⟩, trivial⟩
 
 example (p : ProvenancePtr) :
     ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.pre
-      { defPath := "core::slice::<impl [T]>::is_empty"
+      { defPath := "core::slice::<[T]>::is_empty"
         args := [.ptr p 8]
         memory := emptyMemory } := by
   rintro ⟨_, _, ⟨⟨_, _, _, _, h⟩, _⟩, _⟩
@@ -2262,7 +2255,7 @@ example (p : ProvenancePtr) :
 
 example (p : ProvenancePtr) :
     ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.pre
-      { defPath := "core::slice::<impl [T]>::is_empty"
+      { defPath := "core::slice::<[T]>::is_empty"
         args := [.aggregate 0 [.ptr p 8, .scalar ⟨3, 4⟩]]
         memory := emptyMemory } := by
   rintro ⟨_, _, ⟨⟨_, _, _, _, h⟩, _⟩, _⟩
@@ -2270,7 +2263,7 @@ example (p : ProvenancePtr) :
 
 example (p : ProvenancePtr) :
     ¬ Obligations.CrateA.caller_with_external_specs.externalCallContract_CrateA_ext_slice_is_empty.pre
-      { defPath := "core::slice::<impl [T]>::is_empty"
+      { defPath := "core::slice::<[T]>::is_empty"
         args := [.aggregate 0 [.ptr p 8, .scalar ⟨18446744073709551616, 8⟩]]
         memory := emptyMemory } := by
   rintro ⟨_, _, ⟨⟨_, _, len, h_lt, h_eq⟩, _⟩, _⟩
@@ -2501,13 +2494,6 @@ example :
       (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.array (.uint .u8) 4), layoutIdx := 0 }, debugName := .none }]) = .ub ∧
     evalRvalue
       [.init (.ptr { allocId := 7, offsetBytes := 0 } 8)]
-      (.cast (.pointerCoercion "MutToConstPointer") (.copy { local_ := 0, projection := .nil })
-        { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 })
-      { emptyMemory with
-        borrows := [{ tag := 1, targetLocal := 5, targetProjection := .nil, perm := .disabled }] }
-      (localDecls := [{ mutability := .not, ty := { kind := .rawPtr .mut (.uint .u8), layoutIdx := 0 }, debugName := .none }]) = .ub ∧
-    evalRvalue
-      [.init (.ptr { allocId := 7, offsetBytes := 0 } 8)]
       (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
         { kind := .ref .not .str, layoutIdx := 0 })
       emptyMemory
@@ -2541,10 +2527,11 @@ example (lenVal : Value) :
   exact absurd h_lt (by decide)
 
 example (lenVal : Value) (memAfter : Memory) :
-    ¬ Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum.post
+    Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum.post
       { defPath := "ffi_checksum", args := [lenVal], memory := emptyMemory }
-      (.panicked memAfter) :=
-  id
+      (.panicked memAfter) → memAfter.callees = emptyMemory.callees := by
+  intro h
+  exact h.1
 
 -- 9. Every abstracted callee is assumed in the modular environment.
 example (h : ExternalCallHandler)
@@ -2595,54 +2582,27 @@ theorem callerFfiAndLen_verified :
     10
     ?_
   rintro args mem ⟨_, offset, n, hn, rfl, rfl⟩
-
-  intro ans h_post
-  cases ans with
-  | returned retVal memAfter =>
-    rcases h_post with ⟨⟨_, h_stack, h_active, _, _⟩, h_ret, _⟩
-    have h_act : memAfter.activeCallee = .some Mir.CrateA.caller_ffi_and_len.body := h_active
-    have h_stk : memAfter.callStack = .nil := h_stack
-    unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
-    unfold initMachineStateWithMemoryAndCallees
-    unfold initMachineStateWithMemory
-    unfold initLocals
-    unfold initLocalsAux
-    unfold Mir.CrateA.caller_ffi_and_len.body
-    unfold Trusted.VerificationResult.Memory.withDefaultCallees
-    unfold Obligations.CrateA.caller_ffi_and_len.defaultCallees
-    unfold Trusted.Rustc.V2026_06_01.MirSemantics.advanceStmt
-    unfold Trusted.Rustc.V2026_06_01.MirSemantics.pushCalleeFrame
-    unfold Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTreeModular
-    unfold initMachineStateWithMemoryAndCallees
-    unfold initMachineStateWithMemory
-    unfold Trusted.VerificationResult.Memory.withDefaultCallees
-    unfold Obligations.CrateA.caller_ffi_and_len.defaultCallees
-    dsimp (config := { zetaDelta := true, zeta := true }) [
-      Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym,
-      initMachineStateWithMemoryAndCallees,
-      initMachineStateWithMemory,
-      initLocals,
-      initLocalsAux,
-      Mir.CrateA.caller_ffi_and_len.body,
-      Trusted.VerificationResult.Memory.withDefaultCallees,
-      Obligations.CrateA.caller_ffi_and_len.defaultCallees,
-      Trusted.Rustc.V2026_06_01.MirSemantics.advanceStmt,
-      Trusted.Rustc.V2026_06_01.MirSemantics.pushCalleeFrame,
-      Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTreeModular,
-      Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree,
-      Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirSymTree,
-      Anneal.Rustc.V2026_06_01.SymbolicEval.evalTerminatorSymTree,
-      evalTerminator
-    ]
-    rw [h_act, h_stk]
-    intro r m h_out
-    cases h_out
-    exact ⟨trivial, h_ret⟩
-  | panicked memAfter =>
-    exact False.elim h_post
-  | aborted =>
-    intro r m h_out
-    nomatch h_out
+  unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirModularSym
+  unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+  unfold initMachineStateWithMemoryAndCallees
+  unfold initMachineStateWithMemory
+  unfold initLocals
+  unfold initLocalsAux
+  unfold Trusted.VerificationResult.Memory.withDefaultCallees
+  unfold Obligations.CrateA.caller_ffi_and_len.defaultCallees
+  dsimp (config := { zetaDelta := true, zeta := true }) [
+    Mir.CrateA.caller_ffi_and_len.body,
+    Trusted.Rustc.V2026_06_01.MirSemantics.advanceStmt,
+    Trusted.Rustc.V2026_06_01.MirSemantics.pushCalleeFrame,
+    Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTreeModular,
+    Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree,
+    Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirSymTree,
+    Anneal.Rustc.V2026_06_01.SymbolicEval.evalTerminatorSymTree,
+    evalTerminator
+  ]
+  intro retVal memAfter h_eq
+  cases h_eq
+  exact ⟨n, hn, rfl⟩
 "#;
         fs::write(&verify_brief_3_2_path, verify_brief_3_2_src.as_bytes())
             .expect("write VerifyBrief32.lean");
@@ -2728,26 +2688,16 @@ theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_l
     10
     ?_
   rintro args mem ⟨_, offset, n, hn, rfl, rfl⟩
+  unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirModularSym
   unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
   unfold initMachineStateWithMemoryAndCallees
   unfold initMachineStateWithMemory
   unfold initLocals
   unfold initLocalsAux
-  unfold Mir.CrateA.caller_ffi_and_len.body
   unfold Trusted.VerificationResult.Memory.withDefaultCallees
   unfold Obligations.CrateA.caller_ffi_and_len.defaultCallees
-  unfold Trusted.Rustc.V2026_06_01.MirSemantics.advanceStmt
-  unfold Trusted.Rustc.V2026_06_01.MirSemantics.pushCalleeFrame
-  unfold Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTreeModular
   dsimp (config := { zetaDelta := true, zeta := true }) [
-    Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym,
-    initMachineStateWithMemoryAndCallees,
-    initMachineStateWithMemory,
-    initLocals,
-    initLocalsAux,
     Mir.CrateA.caller_ffi_and_len.body,
-    Trusted.VerificationResult.Memory.withDefaultCallees,
-    Obligations.CrateA.caller_ffi_and_len.defaultCallees,
     Trusted.Rustc.V2026_06_01.MirSemantics.advanceStmt,
     Trusted.Rustc.V2026_06_01.MirSemantics.pushCalleeFrame,
     Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTreeModular,
@@ -2756,8 +2706,9 @@ theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_l
     Anneal.Rustc.V2026_06_01.SymbolicEval.evalTerminatorSymTree,
     evalTerminator
   ]
-  rintro ⟨_, h_stack, h_active, _, _⟩ h_ret
-  exact ⟨trivial, h_ret⟩
+  intro retVal memAfter h_eq
+  cases h_eq
+  exact ⟨n, hn, rfl⟩
 
 end Proof.CrateA.caller_ffi_and_len
 "#,

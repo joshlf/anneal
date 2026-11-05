@@ -4391,7 +4391,7 @@ def diagnoseRawByteTraceWithCalleesBounded
   | .error argIdx => .decodeArgFailed argIdx
   | .ok args =>
     match diagnoseDecodeRawEventsAux calleeSigs table 0 rawTrace.events with
-    | .error evIdx => .decodeEventFailed evIdx
+    | .error diag => diag
     | .ok events =>
       match decodeRawObservedOutcome rootBody table rawTrace.outcome with
       | none => .decodeOutcomeFailed

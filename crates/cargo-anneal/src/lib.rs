@@ -88,9 +88,9 @@ pub use miri_oracle::{
     run_difftest_oracle_pipeline, run_miri_oracle, source_files_match,
 };
 pub use obligations::{
-    AuthoredItemModules, CalleeContractRef, ExternalSpecContractRef, SubjectObligationBundle,
-    TransitiveCalleeRef, collect_external_spec_contracts, derive_item_module_suffix,
-    group_subject_obligations, module_suffix_to_rel_path, render_crate_verify_module,
+    AuthoredItemModules, CalleeContractRef, SubjectObligationBundle,
+    derive_item_module_suffix, group_subject_obligations,
+    module_suffix_to_rel_path, render_crate_verify_module,
     render_obligations_module, render_obligations_module_with_options, render_proof_template,
     render_proof_template_with_options, render_specs_template, render_verify_module,
     render_verify_module_with_options,
@@ -3474,7 +3474,6 @@ mod tests {
         };
         let records = vec![
             UnitTargetRecord {
-            trait_impls: vec![],
                 target: manifest.targets[0].clone(),
                 lean_module_name: "Mir.Demo.id".to_string(),
                 item_kind: CapturedItemKind::Subject,
@@ -3482,7 +3481,6 @@ mod tests {
                 trait_impls: Vec::new(),
             },
             UnitTargetRecord {
-            trait_impls: vec![],
                 target: manifest.targets[1].clone(),
                 lean_module_name: "Mir.Demo.__anodized_fn_requires_id".to_string(),
                 item_kind: CapturedItemKind::InlineSpecRequires,
@@ -3490,7 +3488,6 @@ mod tests {
                 trait_impls: Vec::new(),
             },
             UnitTargetRecord {
-            trait_impls: vec![],
                 target: manifest.targets[2].clone(),
                 lean_module_name: "Mir.Demo.__anodized_fn_ensures_id".to_string(),
                 item_kind: CapturedItemKind::InlineSpecEnsures,
@@ -3616,7 +3613,6 @@ mod tests {
             compilation_succeeded: true,
             rust_sources: vec![("src/lib.rs".to_string(), sha256_hex(rs_bytes))],
             unit_targets: vec![UnitTargetRecord {
-            trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: "demo::id".to_string(),
                     mir_module_path: "Mir/Demo/id.lean".to_string(),
@@ -3858,18 +3854,3 @@ end Mir.Core.tuple_and_adt
     }
 }
 
-pub fn generate_external_spec_snippet(
-    _crate_dir: &std::path::Path,
-    _units_dir: Option<&std::path::Path>,
-    def_id_str: &str,
-) -> Result<String, String> {
-    if def_id_str == "crate_b::helper_add" {
-        Ok("#[anneal_spec::external_spec(for = crate_b::helper_add)]\nunsafe fn external_spec_helper_add(x: usize, y: usize) -> usize;".to_string())
-    } else if def_id_str == "<[u8]>::len" {
-        Ok("fn external_spec_len(s: &[u8]) -> usize;".to_string())
-    } else if def_id_str == "ffi_checksum" {
-        Ok("unsafe extern \"C\" fn external_spec_ffi_checksum(len: usize) -> u32;".to_string())
-    } else {
-        Ok("unsafe fn external_spec_slice_len<T>(s: &[T]) -> usize;".to_string())
-    }
-}

@@ -428,6 +428,7 @@ def checkCalleeTargetCompatible
              (Bool.and
                (callConvEq sigAbi calleeBody.fnAbi.conv)
                (calleeLocalDeclsCompatible
+                 target.typeArgs
                  calleeBody.localDecls
                  calleeBody.argCount
                  sigInputs
@@ -2597,7 +2598,7 @@ def evalDirectRustIntrinsic?
            with
            | .none => MirStepNode.fail .ub
            | .some rtTarget =>
-             match findCallee? s.memory.callees rtTarget.defPath with
+             match lookupCallee s.memory.callees bodyLayouts rtTarget.defPath rtTarget.typeArgs s.memory.traitImpls with
              | .some calleeBody =>
                match
                  Bool.and
@@ -2625,7 +2626,7 @@ def evalDirectRustIntrinsic?
                match rtTarget.isIndirect with
                | true =>
                  MirStepNode.extCall
-                   { defPath := rtTarget.defPath, args := unpackedArgs, memory := s.memory }
+                   { defPath := rtTarget.defPath, typeArgs := rtTarget.typeArgs, args := unpackedArgs, memory := s.memory }
                    (resumeExternalCall s locals' destination targetBb unwind)
                | false =>
                  let selectArgOps := constEvalSelectTupleArgOps tupleTyOpt
@@ -2680,7 +2681,7 @@ def evalDirectRustIntrinsic?
                            | .faulted fk => MirStepNode.fail fk
                          | false =>
                            MirStepNode.extCall
-                             { defPath := rtTarget.defPath, args := unpackedArgs, memory := s.memory }
+                             { defPath := rtTarget.defPath, typeArgs := rtTarget.typeArgs, args := unpackedArgs, memory := s.memory }
                              (resumeExternalCall s locals' destination targetBb unwind)
        | _ => MirStepNode.fail .ub)
   | .some kind =>
@@ -2702,20 +2703,27 @@ Execute a basic-block `Terminator` from state `s`.
 
 Supports `.goto`, `.return_` (both root-frame termination and interprocedural
 return to `Memory.callStack`), `.unreachable`, `.switchInt`, `.assert`, `.drop`,
-`.call` (including inline evaluation of `core::intrinsics::exact_div` via
-`evalScalarExactDiv`), and `.tailCall`. When `.call` or `.tailCall` targets a
-`defPath` without a transparent body in `s.memory.callees` (other than inline
-intrinsics), execution emits a `MirCallE` effect interaction carrying
+`.call`, and `.tailCall`. When `.call` targets the compiler intrinsic
+`core::intrinsics::exact_div`, execution evaluates `evalExactDiv` inline; when
+`.call` or `.tailCall` targets any other `defPath` without a transparent body in
+`s.memory.callees`, execution emits a `MirCallE` effect interaction carrying
 `(defPath, argVals, s.memory)`.
 
-Reference (`core::intrinsics::exact_div`, Rust 1.98.0, and
-`library/core/src/intrinsics/mod.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+Reference (`core::intrinsics::exact_div`, Rust 1.98.0 standard library):
 <https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.exact_div.html>
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L1932-L1939>
 
 > "/// Performs an exact division, resulting in undefined behavior where
-> /// `x % y != 0` or `y == 0` or `x == T::MIN && y == -1`"
+> /// `x % y != 0` or `y == 0` or `x == T::MIN && y == -1`
+> ///
+> /// This intrinsic does not have a stable counterpart.
+> #[rustc_intrinsic_const_stable_indirect]
+> #[rustc_nounwind]
+> #[rustc_intrinsic]
+> pub const unsafe fn exact_div<T: Copy>(x: T, y: T) -> T;"
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -2751,44 +2759,126 @@ def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operan
     match currentBody with
     | .some b => b.layouts
     | .none => emptyLayoutTable
-  match resolveCallTarget s func (length argOps) bodyLocalDecls bodyLayouts with
+  match
+    resolveCallTarget
+      s
+      func
+      (length argOps)
+      bodyLocalDecls
+      bodyLayouts
+  with
   | .ub => MirStepNode.fail .ub
   | .unsupported => MirStepNode.unsupported
   | .ok resolvedTarget localsAfterFunc =>
-    match evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals bodyLayouts s.memory.callerLocals with
-    | .ub => MirStepNode.fail .ub
-    | .unsupported => MirStepNode.unsupported
-    | .ok argVals locals' =>
-      match lookupCallee s.memory.callees bodyLayouts resolvedTarget.defPath resolvedTarget.typeArgs s.memory.traitImpls with
-      | .some calleeBody =>
-        match checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) with
-        | false => MirStepNode.fail .ub
-        | true =>
-          match currentBody with
-          | .none => MirStepNode.unsupported
-          | .some callerBody =>
-            match target with
-            | .some targetBb =>
-              MirStepNode.step (pushCalleeFrame s callerBody locals' destination targetBb calleeBody argVals unwind)
-            | .none =>
-              MirStepNode.step (pushDivergingCalleeFrame s callerBody locals' destination unwind calleeBody argVals)
-      | .none =>
-        match target with
-        | .some targetBb =>
+    match target with
+    | .none =>
+      match
+        evalOperands
+          localsAfterFunc
+          argOps
+          s.memory.borrows
+          s.memory.globals
+          bodyLayouts
+          s.memory.callerLocals
+      with
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+      | .ok argVals locals' =>
+        match lookupCallee s.memory.callees bodyLayouts resolvedTarget.defPath resolvedTarget.typeArgs s.memory.traitImpls with
+        | .some calleeBody =>
+          match checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) with
+          | false => MirStepNode.fail .ub
+          | true =>
+            match currentBody with
+            | .none => MirStepNode.unsupported
+            | .some callerBody =>
+              MirStepNode.step
+                (pushDivergingCalleeFrame
+                  s
+                  callerBody
+                  locals'
+                  destination
+                  unwind
+                  calleeBody
+                  argVals)
+        | .none =>
+          match resolvedTarget.isIndirect with
+          | false =>
+            match isUnreachableCallTarget resolvedTarget.defPath with
+            | true => MirStepNode.fail .ub
+            | false =>
+              match isAbortingPanicDefPath resolvedTarget.defPath with
+              | true => MirStepNode.retOutcome .abort
+              | false =>
+                match isUnwindingPanicDefPath resolvedTarget.defPath with
+                | true =>
+                  match applyUnwindAction s locals' s.memory unwind with
+                  | .running nextState => MirStepNode.step nextState
+                  | .halted out => MirStepNode.retOutcome out
+                  | .faulted fk => MirStepNode.fail fk
+                | false =>
+                  MirStepNode.extCall
+                    { defPath := resolvedTarget.defPath, typeArgs := resolvedTarget.typeArgs, args := argVals, memory := s.memory }
+                    (resumeExternalDivergingCall s locals' unwind)
+          | true =>
+            MirStepNode.extCall
+              { defPath := resolvedTarget.defPath, typeArgs := resolvedTarget.typeArgs, args := argVals, memory := s.memory }
+              (resumeExternalDivergingCall s locals' unwind)
+    | .some targetBb =>
+      match
+        evalOperands
+          localsAfterFunc
+          argOps
+          s.memory.borrows
+          s.memory.globals
+          bodyLayouts
+          s.memory.callerLocals
+      with
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+      | .ok argVals locals' =>
+        match lookupCallee s.memory.callees bodyLayouts resolvedTarget.defPath resolvedTarget.typeArgs s.memory.traitImpls with
+        | .some calleeBody =>
+          match checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) with
+          | false => MirStepNode.fail .ub
+          | true =>
+            match currentBody with
+            | .none => MirStepNode.unsupported
+            | .some callerBody =>
+              MirStepNode.step
+                (pushCalleeFrame
+                  s
+                  callerBody
+                  locals'
+                  destination
+                  targetBb
+                  calleeBody
+                  argVals
+                  unwind)
+        | .none =>
           match isDirectExactDivTarget resolvedTarget with
           | true =>
             match argVals with
             | .scalar lhs :: .scalar rhs :: .nil =>
               let isSigned :=
                 match argOps with
-                | lhsOp :: _ => operandIsSigned bodyLocalDecls lhsOp bodyLayouts
+                | lhsOp :: _ =>
+                  operandIsSigned
+                    bodyLocalDecls
+                    lhsOp
+                    bodyLayouts
                 | .nil => false
               match evalExactDiv lhs rhs isSigned with
               | .some retScalar =>
                 match writePlaceValue locals' s.memory.borrows destination (.scalar retScalar) with
                 | .ok updatedLocals =>
                   MirStepNode.step {
-                    frame := { s.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
+                    frame := {
+                      s.frame with
+                      blockIdx := targetBb
+                      stmtIdx := 0
+                      locals := updatedLocals
+                    }
                     memory := s.memory
                   }
                 | .ub => MirStepNode.fail .ub
@@ -2799,23 +2889,6 @@ def evalCallTerminator (s : MachineState) (func : Operand) (argOps : List Operan
             MirStepNode.extCall
               { defPath := resolvedTarget.defPath, typeArgs := resolvedTarget.typeArgs, args := argVals, memory := s.memory }
               (resumeExternalCall s locals' destination targetBb unwind)
-        | .none =>
-          match isUnreachableCallTarget resolvedTarget.defPath with
-          | true => MirStepNode.fail .ub
-          | false =>
-            match isAbortingPanicDefPath resolvedTarget.defPath with
-            | true => MirStepNode.retOutcome .abort
-            | false =>
-              match isUnwindingPanicDefPath resolvedTarget.defPath with
-              | true =>
-                match applyUnwindAction s locals' s.memory unwind with
-                | .running nextState => MirStepNode.step nextState
-                | .halted out => MirStepNode.retOutcome out
-                | .faulted fk => MirStepNode.fail fk
-              | false =>
-                MirStepNode.extCall
-                  { defPath := resolvedTarget.defPath, typeArgs := resolvedTarget.typeArgs, args := argVals, memory := s.memory }
-                  (resumeExternalDivergingCall s locals' unwind)
 
 /--
 Evaluate a `TerminatorKind.tailCall` terminator, resolving direct or indirect
@@ -2991,8 +3064,186 @@ def evalTerminator
           | .ub => MirStepNode.fail .ub
           | .unsupported => MirStepNode.unsupported
         | _ => MirStepNode.fail .ub
-  | .call func argOps destination target unwind =>
-    evalCallTerminator s func argOps destination target unwind currentBody
+  | .call func argOps destination (.some targetBb) unwind =>
+    let bodyLocalDecls := bodyLocalDeclsOf currentBody
+    let bodyLayouts : LayoutTable :=
+      match currentBody with
+      | .some b => b.layouts
+      | .none => emptyLayoutTable
+    match
+      resolveCallTarget
+        s
+        func
+        (length argOps)
+        bodyLocalDecls
+        bodyLayouts
+    with
+    | .ub => MirStepNode.fail .ub
+    | .unsupported => MirStepNode.unsupported
+    | .ok target localsAfterFunc =>
+      match
+        evalOperands
+          localsAfterFunc
+          argOps
+          s.memory.borrows
+          s.memory.globals
+          bodyLayouts
+          s.memory.callerLocals
+      with
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+      | .ok argVals locals' =>
+        match lookupCallee s.memory.callees bodyLayouts target.defPath target.typeArgs s.memory.traitImpls with
+        | .some calleeBody =>
+          match checkCalleeTargetCompatible target calleeBody (length argVals) with
+          | false => MirStepNode.fail .ub
+          | true =>
+            match currentBody with
+            | .none => MirStepNode.unsupported
+            | .some callerBody =>
+              MirStepNode.step
+                (pushCalleeFrame
+                  s
+                  callerBody
+                  locals'
+                  destination
+                  targetBb
+                  calleeBody
+                  argVals
+                  unwind)
+        | .none =>
+          match isDirectExactDivTarget target with
+          | true =>
+            match argVals with
+            | .scalar lhs :: .scalar rhs :: .nil =>
+              match
+                resolveIntrinsicIsSigned
+                  target
+                  bodyLocalDecls
+                  bodyLayouts
+                  argOps
+              with
+              | .none => MirStepNode.unsupported
+              | .some isSigned =>
+                match evalExactDiv lhs rhs isSigned with
+                | .some retScalar =>
+                  match writePlaceValue locals' s.memory.borrows destination (.scalar retScalar) with
+                  | .ok updatedLocals =>
+                    MirStepNode.step {
+                      frame := {
+                        s.frame with
+                        blockIdx := targetBb
+                        stmtIdx := 0
+                        locals := updatedLocals
+                      }
+                      memory := s.memory
+                    }
+                  | .ub => MirStepNode.fail .ub
+                  | .unsupported => MirStepNode.unsupported
+                | .none => MirStepNode.fail .ub
+            | _ => MirStepNode.fail .ub
+          | false =>
+            match target.isIndirect with
+            | true =>
+              MirStepNode.extCall
+                { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+                (resumeExternalCall s locals' destination targetBb unwind)
+            | false =>
+              match
+                evalDirectRustIntrinsic?
+                  s
+                  currentBody
+                  target
+                  bodyLocalDecls
+                  bodyLayouts
+                  argOps
+                  argVals
+                  locals'
+                  destination
+                  targetBb
+                  unwind
+              with
+              | .some stepNode => stepNode
+              | .none =>
+                MirStepNode.extCall
+                  { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+                  (resumeExternalCall s locals' destination targetBb unwind)
+  -- Diverging call (`target == Option.none`, return type `!`):
+  | .call func argOps destination .none unwind =>
+    let bodyLocalDecls := bodyLocalDeclsOf currentBody
+    let bodyLayouts : LayoutTable :=
+      match currentBody with
+      | .some b => b.layouts
+      | .none => emptyLayoutTable
+    match
+      resolveCallTarget
+        s
+        func
+        (length argOps)
+        bodyLocalDecls
+        bodyLayouts
+    with
+    | .ub => MirStepNode.fail .ub
+    | .unsupported => MirStepNode.unsupported
+    | .ok target localsAfterFunc =>
+      match
+        evalOperands
+          localsAfterFunc
+          argOps
+          s.memory.borrows
+          s.memory.globals
+          bodyLayouts
+          s.memory.callerLocals
+      with
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+      | .ok argVals locals' =>
+        match lookupCallee s.memory.callees bodyLayouts target.defPath target.typeArgs s.memory.traitImpls with
+        | .some calleeBody =>
+          match checkCalleeTargetCompatible target calleeBody (length argVals) with
+          | false => MirStepNode.fail .ub
+          | true =>
+            match currentBody with
+            | .none => MirStepNode.unsupported
+            | .some callerBody =>
+              MirStepNode.step
+                (pushDivergingCalleeFrame
+                  s
+                  callerBody
+                  locals'
+                  destination
+                  unwind
+                  calleeBody
+                  argVals)
+        | .none =>
+          -- A diverging call to `core::intrinsics::const_eval_select` (one whose
+          -- `called_at_rt` returns `!`) is not unpacked here; like any other
+          -- unlinked callee it becomes an external call, which constrains
+          -- nothing. Captured MIR never contains one, because `rustc` replaces
+          -- every `const_eval_select` call with a direct call to `called_at_rt`
+          -- before `optimized_mir` (`withConstEvalSelectIntrinsicTypeArgs`).
+          match target.isIndirect with
+          | false =>
+            match isUnreachableCallTarget target.defPath with
+            | true => MirStepNode.fail .ub
+            | false =>
+              match isAbortingPanicDefPath target.defPath with
+              | true => MirStepNode.retOutcome .abort
+              | false =>
+                match isUnwindingPanicDefPath target.defPath with
+                | true =>
+                  match applyUnwindAction s locals' s.memory unwind with
+                  | .running nextState => MirStepNode.step nextState
+                  | .halted out => MirStepNode.retOutcome out
+                  | .faulted fk => MirStepNode.fail fk
+                | false =>
+                  MirStepNode.extCall
+                    { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+                    (resumeExternalDivergingCall s locals' unwind)
+          | true =>
+            MirStepNode.extCall
+              { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+              (resumeExternalDivergingCall s locals' unwind)
   | .tailCall func argOps =>
     evalTailCallTerminator s func argOps currentBody
   | .assert cond expected target unwind =>

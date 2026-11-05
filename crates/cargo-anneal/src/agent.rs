@@ -1103,7 +1103,6 @@ fn discover_workspace_records(workspace_root: &Path) -> Vec<UnitTargetRecord> {
         for rec in manifest.locked_records {
             if let Some(item_kind) = CapturedItemKind::from_str_tag(&rec.item_kind) {
                 records.push(UnitTargetRecord {
-            trait_impls: vec![],
                     target: CapturedTarget {
                         def_id: rec.def_id,
                         mir_module_path: String::new(),
@@ -1766,7 +1765,6 @@ mod tests {
     fn sample_records() -> Vec<UnitTargetRecord> {
         vec![
             UnitTargetRecord {
-            trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: "demo::add".to_string(),
                     mir_module_path: "Mir/Demo/add.lean".to_string(),
@@ -1778,7 +1776,6 @@ mod tests {
                 trait_impls: Vec::new(),
             },
             UnitTargetRecord {
-            trait_impls: vec![],
                 target: CapturedTarget {
                     def_id: "demo::__anodized_fn_requires_add".to_string(),
                     mir_module_path: "Mir/Demo/__anodized_fn_requires_add.lean".to_string(),
@@ -1915,7 +1912,6 @@ mod tests {
 
         let mut records = sample_records();
         records.push(UnitTargetRecord {
-            trait_impls: vec![],
             target: CapturedTarget {
                 def_id: "demo::__anodized_fn_ensures_add".to_string(),
                 mir_module_path: "Mir/Demo/__anodized_fn_ensures_add.lean".to_string(),
@@ -2015,7 +2011,6 @@ mod tests {
 
         let mut records = sample_records();
         records.push(UnitTargetRecord {
-            trait_impls: vec![],
             target: CapturedTarget {
                 def_id: "demo::__anodized_fn_ensures_add".to_string(),
                 mir_module_path: "Mir/Demo/__anodized_fn_ensures_add.lean".to_string(),
@@ -2054,7 +2049,6 @@ mod tests {
         let ws = unique_temp_dir("mutable-subject");
         let mut records = sample_records();
         records.push(UnitTargetRecord {
-            trait_impls: vec![],
             target: CapturedTarget {
                 def_id: "demo::helper".to_string(),
                 mir_module_path: "Mir/Demo/helper.lean".to_string(),
@@ -2181,7 +2175,6 @@ mod tests {
 
         let mut records = sample_records();
         records.push(UnitTargetRecord {
-            trait_impls: vec![],
             target: CapturedTarget {
                 def_id: "demo::__anodized_fn_ensures_add".to_string(),
                 mir_module_path: "Mir/Demo/__anodized_fn_ensures_add.lean".to_string(),

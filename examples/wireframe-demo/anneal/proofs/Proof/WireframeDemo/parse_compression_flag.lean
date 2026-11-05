@@ -1023,7 +1023,7 @@ private theorem wpReq_imp_zero_or_one (b : Nat) :
           [.scalar { bits := b, sizeBytes := 1 }]).memory) →
     b = 0 ∨ b = 1 := by
   dsimp only [Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body,
-    reqCtx, BlockCtx.localDecls, BlockCtx.layouts, BlockCtx.body, reqBB0, wpBlockLinear, wpBlockStep, evalSymNodeTree,
+    reqCtx, reqBB0, wpBlockLinear, wpBlockStep, evalSymNodeTree,
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
     evalRvalueSymTreeFast,
     evalOperandFast, evalOperandsFast, evalConstValue,
@@ -1232,7 +1232,7 @@ theorem nonVacuousRequires :
   apply Hold.val
   refine hold_mirBool_req 28 _ ?_
   dsimp only [Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body,
-    reqCtx, BlockCtx.localDecls, BlockCtx.layouts, BlockCtx.body, reqBB0, wpBlockLinear, wpBlockStep, evalSymNodeTree,
+    reqCtx, reqBB0, wpBlockLinear, wpBlockStep, evalSymNodeTree,
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
     evalRvalueSymTreeFast,
     evalOperandFast, evalOperandsFast, evalConstValue,

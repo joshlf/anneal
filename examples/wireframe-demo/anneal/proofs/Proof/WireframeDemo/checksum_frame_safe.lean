@@ -1304,7 +1304,7 @@ theorem verified :
       rootFrame8Ptr, frame8Value, sharedFrame8Borrow, frame8SlotIdx,
       readProjectedValue_nil, readProjectedValue_field, readProjectedValue_index,
       ProvenancePtr.tag, lookupBorrow, appendProjections, stripTransparentProjections,
-      freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, BlockCtx.localDecls, BlockCtx.layouts, BlockCtx.body, not, Bool.rec, Bool.casesOn, safeCtx,
+      freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, not, Bool.rec, Bool.casesOn, safeCtx,
       projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
       byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
       isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
