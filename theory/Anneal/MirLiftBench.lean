@@ -291,7 +291,8 @@ def liftU32Layout : TypeLayout :=
     fields := .primitive, variants := .single 0, isUninhabited := false }
 
 /--
-`fn lift_poly_wrapper_transmute<T>(x: T) -> u32 { unsafe { transmute(Wrapper(x)) } }`.
+`fn lift_poly_wrapper_transmute<T>(x: T) -> u32`, whose body is
+`unsafe { transmute(Wrapper(x)) }`.
 
 In the uninstantiated generic MIR body, both `T` (`layoutIdx = 0`) and the
 compound ADT `Wrapper<T>` (`layoutIdx = 1`) carry placeholder 0-byte layouts
@@ -697,7 +698,13 @@ theorem liftBadCallSig_not_converges (post : MirOutcome → Prop) :
   rintro ⟨fuel, h⟩
   rcases fuel with _ | _ | _ | fuel <;> exact h
 
-/-! ### Diverging calls (`target = none`) and `unwindResume` -/
+/-! ### Diverging calls (`target = none`)
+
+`LiftTerminator` has no rule for diverging calls. In MIR that rustc emits, a
+diverging callee either faults by returning or unwinds through cleanup blocks,
+which cannot return, so execution never reaches a normal root return. The two
+bodies below exercise both outcomes.
+-/
 
 /-- `!` at layout index `0`. -/
 def liftNeverTy : Ty := { kind := .never, layoutIdx := 0 }
@@ -706,117 +713,8 @@ def liftNeverTy : Ty := { kind := .never, layoutIdx := 0 }
 def liftDivergingFnPtrTy : Ty :=
   { kind := .fnPtr [] .never .safe .rust, layoutIdx := 0 }
 
-/--
-`fn diverging_unwind() -> !`: diverges by unwinding out of the frame via
-`TerminatorKind.unwindResume`.
--/
-def liftDivergingUnwindMir : CapturedMir :=
-  mkMirBody "ff33::diverging_unwind" 0
-    [ { mutability := .mut, ty := liftNeverTy, debugName := some "_0" } ]
-    [ { statements := []
-        terminator := { kind := .unwindResume, span := "unwind" }
-        isCleanup := true } ]
-
-/--
-`diverging_catch_caller`: reifies `diverging_unwind` into `_1 : fn() -> !`,
-calls `move _1()` indirectly as a diverging call (`target = none`,
-`unwind = .cleanup 1`, `LiftTerminator.callDivergingIndirect`), catches the
-callee's `TerminatorKind.unwindResume` (`LiftTerminator.unwindResume`) at `bb1`,
-assigns `_0 = const 7_u32`, and returns normally.
--/
-def liftDivergingCatchCallerMir : CapturedMir :=
-  mkMirBody "ff33::diverging_catch_caller" 0
-    [ { mutability := .mut, ty := liftU32Ty, debugName := some "_0" }
-    , { mutability := .mut, ty := liftDivergingFnPtrTy, debugName := some "f" }
-    , { mutability := .mut, ty := liftNeverTy, debugName := some "never_dst" } ]
-    [ { statements :=
-          [ { kind := .storageLive 1, span := "live f" }
-          , { kind := .assign { local_ := 1, projection := [] }
-                (.cast (.pointerCoercion "ReifyFnPointer")
-                  (.constant
-                    { ty := { kind := .fnDef "ff33::diverging_unwind" [], layoutIdx := 0 }
-                      val := .zeroSized })
-                  liftDivergingFnPtrTy)
-              span := "reify diverging_unwind" } ]
-        terminator :=
-          { kind := .call (.move { local_ := 1, projection := [] })
-              [] { local_ := 2, projection := [] } none (.cleanup 1)
-            span := "diverging call f" }
-        isCleanup := false }
-    , { statements :=
-          [ { kind := .assign { local_ := 0, projection := [] }
-                (.use (.constant { ty := liftU32Ty, val := .scalar (.int ⟨7, 4⟩) }))
-              span := "recover 7" }
-          , { kind := .storageDead 1, span := "dead f" } ]
-        terminator := { kind := .return_, span := "ret" }
-        isCleanup := true } ]
-
-/--
-Frame-lifted execution of `diverging_catch_caller` across a diverging indirect
-call and `unwindResume` cleanup recovery.
--/
-theorem liftDivergingCatchCaller_lift :
-    LiftFrame liftDivergingCatchCallerMir 0 0
-      (initPureEnv liftDivergingCatchCallerMir [])
-      (initMachineStateWithCallees liftDivergingCatchCallerMir []
-        [liftDivergingUnwindMir]).memory
-      (fun v => v = .scalar ⟨7, 4⟩) 7 := by
-  -- bb0[0]: `StorageLive(_1)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
-  apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
-  dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
-  -- bb0[1]: `_1 = diverging_unwind as fn() -> ! (ReifyFnPointer)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
-  apply LiftStmtMem.reifyFnPointer (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
-    (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
-    (by rfl) (by rfl)
-  -- bb0 terminator: diverging indirect call `move _1()` with `.cleanup 1`.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
-  apply LiftTerminator.callDivergingIndirect (by rfl) (by rfl) (by rfl) (by rfl)
-    (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
-  dsimp only [FrameStep.Continues, divergingCallFrameMem, Option.getD]
-  -- `diverging_unwind` bb0 terminator: `unwindResume` into caller `bb1`.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
-  apply LiftTerminator.unwindResume (by rfl)
-  dsimp only [FrameStep.Continues]
-  -- bb1[0]: `_0 = const 7_u32`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
-  apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
-  dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
-  -- bb1[1]: `StorageDead(_1)`.
-  apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl)
-  apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
-  dsimp only [advanceStmt, PureState.toMachineState, List.set, Nat.add]
-  -- bb1 terminator: root `return_` of `7_u32`.
-  apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl)
-  apply LiftTerminator.return_ (by rfl) (by rfl)
-  rfl
-
-/-- Convergence of `liftDivergingCatchCallerMir`. -/
-theorem liftDivergingCatchCaller_wpConverges :
-    MirWpConverges liftDivergingCatchCallerMir
-      (initMachineStateWithCallees liftDivergingCatchCallerMir []
-        [liftDivergingUnwindMir])
-      (mirNormalPost (fun retVal _ => retVal = .scalar ⟨7, 4⟩)) :=
-  LiftFrame.mirWpConverges_withCallees liftDivergingCatchCaller_lift
-
-/-- Stateless claim for `liftDivergingCatchCallerMir`. -/
-def liftDivergingCatchCallerClaim : Claim where
-  body := liftDivergingCatchCallerMir
-  callees := [liftDivergingUnwindMir]
-  pre args := args = []
-  post _ ret := ret = .scalar ⟨7, 4⟩
-
-/-- Non-vacuity of `liftDivergingCatchCallerClaim`. -/
-theorem liftDivergingCatchCallerClaim_nonVacuous :
-    ∃ args, liftDivergingCatchCallerClaim.pre args :=
-  ⟨[], rfl⟩
-
-/-- Trusted verification certificate for `liftDivergingCatchCallerClaim`. -/
-theorem liftDivergingCatchCaller_verified :
-    VerificationResult liftDivergingCatchCallerClaim :=
-  LiftFrame.verificationResult liftDivergingCatchCallerClaim [] (fun _ h => h)
-    liftDivergingCatchCaller_lift
+/-- `bool` at layout index `0`. -/
+def liftBoolTy : Ty := { kind := .bool, layoutIdx := 0 }
 
 /--
 A diverging call (`target = none`) to a callee (`lift_poly_id::<u32>`) that
@@ -837,7 +735,7 @@ def liftBadDivergingReturnMir : CapturedMir :=
             span := "diverging call to returning callee" }
         isCleanup := false } ]
 
-/-- Returning normally from a diverging call (`target = none`) faults with UB. -/
+/-- Returning normally from a diverging call (`target = none`) is UB. -/
 theorem liftBadDivergingReturn_not_converges (post : MirOutcome → Prop) :
     ¬ MirWpConverges liftBadDivergingReturnMir
       (initMachineStateWithCallees liftBadDivergingReturnMir []
@@ -845,13 +743,75 @@ theorem liftBadDivergingReturn_not_converges (post : MirOutcome → Prop) :
   rintro ⟨fuel, h⟩
   rcases fuel with _ | _ | _ | fuel <;> exact h
 
+/--
+`fn assert_panic() -> !`: an assertion that always fails, whose unwind edge
+(`.continue_`) unwinds into the caller, as a failed overflow or bounds check
+does.
+-/
+def liftAssertPanicMir : CapturedMir :=
+  mkMirBody "ff33::assert_panic" 0
+    [ { mutability := .mut, ty := liftNeverTy, debugName := some "_0" } ]
+    [ { statements := []
+        terminator :=
+          { kind := .assert
+              (.constant { ty := liftBoolTy, val := .scalar (.int ⟨0, 1⟩) })
+              true 1 .continue_
+            span := "assert false" }
+        isCleanup := false }
+    , { statements := []
+        terminator := { kind := .unreachable, span := "unreachable" }
+        isCleanup := false } ]
+
+/--
+`diverging_panic_caller`: reifies `assert_panic` into `_1 : fn() -> !` and
+calls `move _1()` as a diverging call (`target = none`) whose unwind edge enters
+the cleanup block `bb1`. rustc's MIR validator forbids a cleanup block from
+returning, so `bb1` ends in `UnwindResume`; the unwind reaches the root frame
+and the program panics.
+-/
+def liftDivergingPanicCallerMir : CapturedMir :=
+  mkMirBody "ff33::diverging_panic_caller" 0
+    [ { mutability := .mut, ty := liftU32Ty, debugName := some "_0" }
+    , { mutability := .mut, ty := liftDivergingFnPtrTy, debugName := some "f" }
+    , { mutability := .mut, ty := liftNeverTy, debugName := some "never_dst" } ]
+    [ { statements :=
+          [ { kind := .storageLive 1, span := "live f" }
+          , { kind := .assign { local_ := 1, projection := [] }
+                (.cast (.pointerCoercion "ReifyFnPointer")
+                  (.constant
+                    { ty := { kind := .fnDef "ff33::assert_panic" [], layoutIdx := 0 }
+                      val := .zeroSized })
+                  liftDivergingFnPtrTy)
+              span := "reify assert_panic" } ]
+        terminator :=
+          { kind := .call (.move { local_ := 1, projection := [] })
+              [] { local_ := 2, projection := [] } none (.cleanup 1)
+            span := "diverging call f" }
+        isCleanup := false }
+    , { statements := []
+        terminator := { kind := .unwindResume, span := "resume" }
+        isCleanup := true } ]
+
+/--
+`liftDivergingPanicCallerMir` panics at its fifth step (the cleanup block's
+`UnwindResume` at the root), so no normal-return postcondition holds.
+-/
+theorem liftDivergingPanic_not_converges (Q : Value → Memory → Prop) :
+    ¬ MirWpConverges liftDivergingPanicCallerMir
+      (initMachineStateWithCallees liftDivergingPanicCallerMir []
+        [liftAssertPanicMir]) (mirNormalPost Q) := by
+  rintro ⟨fuel, h⟩
+  rcases fuel with _ | _ | _ | _ | _ | fuel <;> exact h
+
 /-! ### Non-capturing `ClosureFnPointer` and `TraitImplEntry` dispatch -/
 
 /-- Non-capturing closure type `RigidTy.closure "ff33::closure_id" []`. -/
 def liftClosureIdTy : Ty :=
   { kind := .closure "ff33::closure_id" [], layoutIdx := 0 }
 
-/-- Trait method function-item type `FnDef("ff33::ApplyTrait::apply", [u32])`. -/
+/--
+Trait method function-item type `FnDef("ff33::ApplyTrait::apply", [u32])`.
+-/
 def liftApplyTraitFnDefTy : Ty :=
   { kind := .fnDef "ff33::ApplyTrait::apply" [.uint .u32], layoutIdx := 0 }
 
@@ -883,7 +843,8 @@ def liftClosureIdMir : CapturedMir :=
    to `_2 : fn(u32) -> u32`, resolving `"ff33::ApplyTrait::apply"` through
    `mem.traitImpls` (`liftApplyTraitImpl`) to `lift_poly_id::<u32>` during both
    `checkCalleeSig` and `lookupCallee`.
-3. Calls both function pointers indirectly (`_3 = move _1(7)`, `_0 = move _2(_3)`).
+3. Calls both function pointers indirectly: `_3 = move _1(7)` and
+   `_0 = move _2(_3)`.
 -/
 def liftClosureAndTraitCallerMir : CapturedMir := {
   mkMirBody "ff33::closure_and_trait_caller" 0

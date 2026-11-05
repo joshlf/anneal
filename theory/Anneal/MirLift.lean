@@ -166,7 +166,6 @@ macro_rules
              (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.dropProjected (by rfl)
              (by rfl) (by rfl)
-         | apply Anneal.MirLiftCore.LiftTerminator.unwindResume (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.return_ (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.returnToCaller (by rfl) (by rfl)
              (by rfl) (by rfl)
@@ -176,13 +175,6 @@ macro_rules
              (by rfl) (by rfl) (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.callIndirect (by rfl) (by rfl)
              (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
-         | apply Anneal.MirLiftCore.LiftTerminator.callDivergingDirect (by rfl)
-             (by rfl) (by rfl)
-         | apply Anneal.MirLiftCore.LiftTerminator.callDivergingFnItem (by rfl)
-             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
-         | apply Anneal.MirLiftCore.LiftTerminator.callDivergingIndirect (by rfl)
-             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
-             (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.tailCallDirect (by rfl)
              (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.tailCallFnItem (by rfl)
@@ -192,7 +184,6 @@ macro_rules
              (by rfl)
          dsimp only [Anneal.MirLiftCore.FrameStep.Continues,
            Anneal.MirLiftCore.callFrameMem,
-           Anneal.MirLiftCore.divergingCallFrameMem,
            Anneal.MirLiftCore.tailCallFrameMem,
            Anneal.MirLiftCore.returnFrameMem,
            restoreCallerProtectors, Option.getD, List.set, Nat.add]))
@@ -495,18 +486,18 @@ def dropLoopBody : CapturedMir := makeDropLoopBody "dropLoop"
 -- exercises projected `ReifyFnPointer`, `UnsafeFnPointer`, `FnPtrToPtr`,
 -- indirect `tailCall`, local fn-item calls, projected `drop`, and polymorphic
 -- compound layout recomputation (`LayoutTable.instantiateForBody`) on
--- `Wrapper<T>` (see `Anneal.MirLiftBench`).
+-- `Wrapper<T>`; `liftClosureAndTraitCallerMir` calls a `ClosureFnPointer`
+-- coercion and a reified trait method resolved through `TraitImplEntry` (see
+-- `Anneal.MirLiftBench`).
 #mir_lift (callees := [liftPolyIdMir]) liftIndirectCallerMir
 #mir_lift (callees := [liftPolyIdMir]) liftDirectCallerMir
 #mir_lift (callees := liftPolyLayoutCallees) liftPolyLayoutCallerMir
-#mir_lift (callees := [liftDivergingUnwindMir]) liftDivergingCatchCallerMir
 #mir_lift (callees := liftClosureAndTraitCallees) liftClosureAndTraitCallerMir
 
 -- The synthesized models are the values returned through each call.
 example : liftIndirectCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
 example : liftDirectCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
 example : liftPolyLayoutCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
-example : liftDivergingCatchCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
 example : liftClosureAndTraitCallerMir_model = Value.scalar ⟨7, 4⟩ := rfl
 
 example :
@@ -520,13 +511,6 @@ example :
       (initMachineStateWithCallees liftPolyLayoutCallerMir [] liftPolyLayoutCallees)
       (mirNormalPost (fun retVal _ => retVal = .scalar ⟨7, 4⟩)) :=
   liftPolyLayoutCallerMir_lift_sound
-
-example :
-    MirWpConverges liftDivergingCatchCallerMir
-      (initMachineStateWithCallees liftDivergingCatchCallerMir []
-        [liftDivergingUnwindMir])
-      (mirNormalPost (fun retVal _ => retVal = .scalar ⟨7, 4⟩)) :=
-  liftDivergingCatchCallerMir_lift_sound
 
 example :
     MirWpConverges liftClosureAndTraitCallerMir
@@ -552,12 +536,6 @@ info: 'liftPolyLayoutCallerMir_lift_sound' depends on axioms: [propext, Classica
 -/
 #guard_msgs in
 #print axioms liftPolyLayoutCallerMir_lift_sound
-
-/--
-info: 'liftDivergingCatchCallerMir_lift_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
--/
-#guard_msgs in
-#print axioms liftDivergingCatchCallerMir_lift_sound
 
 /--
 info: 'liftClosureAndTraitCallerMir_lift_sound' depends on axioms: [propext, Classical.choice, Quot.sound]
@@ -612,8 +590,10 @@ example : True := by
         (fun _ => True) 7 := by lift_frame)
   trivial
 
--- Returning normally from a diverging call (`target = none`) is undefined
--- behavior (`liftBadDivergingReturn_not_converges`), so it does not lift.
+-- A diverging call (`target = none`) never returns normally: returning is
+-- undefined behavior (`liftBadDivergingReturn_not_converges`), and unwinding
+-- through a well-formed cleanup block panics at the root
+-- (`liftDivergingPanic_not_converges`). Neither lifts.
 example : True := by
   fail_if_success
     (have : LiftFrame liftBadDivergingReturnMir 0 0
@@ -623,9 +603,26 @@ example : True := by
         (fun _ => True) 7 := by lift_frame)
   trivial
 
+example : True := by
+  fail_if_success
+    (have : LiftFrame liftDivergingPanicCallerMir 0 0
+        (initPureEnv liftDivergingPanicCallerMir [])
+        (initMachineStateWithCallees liftDivergingPanicCallerMir []
+          [liftAssertPanicMir]).memory
+        (fun _ => True) 7 := by lift_frame)
+  trivial
+
 -- The tactic reproduces the explicit audited proof in `Anneal.MirLiftBench`.
 example :
     LiftFrame liftIndirectCallerMir 0 0 (initPureEnv liftIndirectCallerMir [])
       (initMachineStateWithCallees liftIndirectCallerMir [] [liftPolyIdMir]).memory
       (fun v => v = Value.scalar ⟨7, 4⟩) 7 := by
   lift_frame
+
+-- The lifting judgments are still irreducible after every `#mir_lift` above,
+-- so `isDefEq` cannot unfold them into whole-body symbolic evaluation.
+run_meta do
+  for n in [``LiftBlock, ``LiftResidualBlock, ``LiftStmtsTerminator,
+      ``LiftFrame] do
+    unless (← Lean.getReducibilityStatus n) matches .irreducible do
+      throwError "{n} is not irreducible"
