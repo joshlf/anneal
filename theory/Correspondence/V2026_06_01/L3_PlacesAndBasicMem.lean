@@ -1771,4 +1771,85 @@ theorem mir_b4_tuple_elem_slice_unit_slice_rw_global_len_and_typed_global_unsize
       emptyMemory = .ub := by
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/--
+**Theorem L3.29 (`mir_a4_multidim_row_slice_unsize_len_deref_and_borrow_corresponds`)**:
+Universal characterization of `A4` multi-dimensional array row-slice resolution in
+`readSliceBackingAggregate?`:
+When a 2D array `arr2d : [[u32; 4]; 2]` (`outerStride = 16`, `innerStride = 4`) has a
+row borrow `&arr2d[1]` (`targetProjection = [.constantIndex 1 0 false]`),
+`readSliceBackingAggregate?` distinguishes the inner 4-element `u32` row array from
+an outer-array element pointer (such as `&raw mut tuple_arr[1]` in `L3.28`) using
+`minCount` and `expectedElemSzOpt`, so:
+1. Unsizing `&arr2d[1] : &[u32; 4] -> &[u32]` produces a 4-element slice fat pointer
+   (`.aggregate 0 [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩]`),
+2. `Rvalue.len` on `*row_slice` evaluates to `4`,
+3. Dereference read `(*row_slice)[2]` evaluates to `arr2d[1][2]`,
+4. Dereference write `(*row_slice)[2] = w` updates `arr2d[1][2]` in `arr2d` without
+   corrupting `arr2d[0]`, and
+5. Dereferenced element borrow `&(*row_slice)[2]` creates a borrow with normalized
+   2D projection `[.constantIndex 1 0 false, .constantIndex 2 0 false]`.
+-/
+theorem mir_a4_multidim_row_slice_unsize_len_deref_and_borrow_corresponds
+    (r00 r01 r02 r03 r10 r11 r12 r13 w : Nat) :
+    let row0 : Value :=
+      .aggregate 0 [.scalar ⟨r00, 4⟩, .scalar ⟨r01, 4⟩, .scalar ⟨r02, 4⟩, .scalar ⟨r03, 4⟩]
+    let row1 : Value :=
+      .aggregate 0 [.scalar ⟨r10, 4⟩, .scalar ⟨r11, 4⟩, .scalar ⟨r12, 4⟩, .scalar ⟨r13, 4⟩]
+    let row1Updated : Value :=
+      .aggregate 0 [.scalar ⟨r10, 4⟩, .scalar ⟨r11, 4⟩, .scalar ⟨w, 4⟩, .scalar ⟨r13, 4⟩]
+    let arr2dVal : Value := .aggregate 0 [row0, row1]
+    let arr2dUpdatedVal : Value := .aggregate 0 [row0, row1Updated]
+    let row1Borrow : BorrowEntry := {
+      tag := 1
+      targetLocal := 0
+      targetProjection := [.constantIndex 1 0 false]
+      perm := .active
+    }
+    let row1SliceFat : Value :=
+      .aggregate 0 [.ptr { allocId := 1, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩]
+    let refSliceU32Ty : Ty := { kind := .ref .not (.slice (.uint .u32)), layoutIdx := 0 }
+    let memRow1 : Memory := { emptyMemory with borrows := [row1Borrow], nextTag := 2 }
+    -- 1. Unsize `&arr2d[1]` (`targetProjection = [.constantIndex 1 0 false]`) to `&[u32]` -> len 4
+    evalRvalue
+      [.init arr2dVal, .init (.ptr { allocId := 1, offsetBytes := 0 } 8)]
+      (.cast (.pointerCoercion "Unsize") (.copy { local_ := 1, projection := .nil }) refSliceU32Ty)
+      memRow1 =
+      .ok row1SliceFat
+        [.init arr2dVal, .init (.ptr { allocId := 1, offsetBytes := 0 } 8)]
+        memRow1 ∧
+    -- 2. `Rvalue.len` on `*row_slice` -> 4
+    evalRvalue
+      [.init arr2dVal, .init row1SliceFat]
+      (.len { local_ := 1, projection := [.deref] })
+      memRow1 =
+      .ok (.scalar ⟨4, 8⟩) [.init arr2dVal, .init row1SliceFat] memRow1 ∧
+    -- 3. `(*row_slice)[2]` -> `r12`
+    evalOperand
+      [.init arr2dVal, .init row1SliceFat]
+      (.copy { local_ := 1, projection := [.deref, .constantIndex 2 0 false] })
+      [row1Borrow] =
+      .ok (.scalar ⟨r12, 4⟩) [.init arr2dVal, .init row1SliceFat] ∧
+    -- 4. `(*row_slice)[2] = w` updates `arr2d[1][2]`
+    writePlaceValue
+      [.init arr2dVal, .init row1SliceFat]
+      [row1Borrow]
+      { local_ := 1, projection := [.deref, .constantIndex 2 0 false] }
+      (.scalar ⟨w, 4⟩) =
+      .ok [.init arr2dUpdatedVal, .init row1SliceFat] ∧
+    -- 5. `&(*row_slice)[2]` -> targetProjection `[.constantIndex 1 0 false, .constantIndex 2 0 false]`
+    evalRvalue
+      [.init arr2dVal, .init row1SliceFat]
+      (.ref .shared { local_ := 1, projection := [.deref, .constantIndex 2 0 false] })
+      memRow1 =
+      .ok (.ptr { allocId := 2, offsetBytes := 0 } 8)
+        [.init arr2dVal, .init row1SliceFat]
+        { memRow1 with
+          borrows :=
+            { tag := 2
+              targetLocal := 0
+              targetProjection := [.constantIndex 1 0 false, .constantIndex 2 0 false]
+              perm := .frozen } :: [row1Borrow]
+          nextTag := 3 } := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+
 end Correspondence.V2026_06_01.L3_PlacesAndBasicMem

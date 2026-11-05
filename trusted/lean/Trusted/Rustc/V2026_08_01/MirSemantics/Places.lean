@@ -1565,21 +1565,52 @@ for a slice fat pointer or thin element pointer whose `BorrowEntry` has
 def readSliceBackingAggregate?
     (indexLocals : List LocalSlot)
     (targetRootVal : Value)
-    (targetProjection : List ProjectionElem) :
+    (targetProjection : List ProjectionElem)
+    (minCount : Nat := 0)
+    (expectedElemSzOpt : Option Nat := .none) :
     Option (List ProjectionElem × Nat × List Value) :=
   let normProj :=
     normalizeSubsliceProjections (stripTransparentProjections targetProjection)
   match splitLastConstantIndex? normProj with
   | .some (initProj, baseIdx, minLen) =>
     match readProjectedValue indexLocals targetRootVal initProj with
-    | .ok (.aggregate 0 elems) =>
-      match
+    | .ok (.aggregate 0 outerElems) =>
+      let outerValid :=
         Bool.and
-          (Nat.ble minLen (length elems))
-          (Nat.ble baseIdx (length elems))
-      with
-      | true => .some (initProj, baseIdx, elems)
-      | false => .none
+          (Nat.ble minLen (length outerElems))
+          (Nat.ble (Nat.add baseIdx minCount) (length outerElems))
+      let preferInner :=
+        match readProjectedValue indexLocals targetRootVal targetProjection with
+        | .ok (.aggregate 0 innerElems) =>
+          match expectedElemSzOpt with
+          | .some expSz =>
+            let outerStride := inferElemListByteStride outerElems
+            let innerStride := inferElemListByteStride innerElems
+            Bool.and
+              (Bool.not (Nat.beq outerStride expSz))
+              (Bool.and
+                (Nat.beq innerStride expSz)
+                (Nat.ble minCount (length innerElems)))
+          | .none =>
+            Bool.and
+              (Bool.not outerValid)
+              (Bool.and
+                (Nat.ble 1 minCount)
+                (Nat.ble minCount (length innerElems)))
+        | _ => false
+      match preferInner with
+      | true =>
+        match readProjectedValue indexLocals targetRootVal targetProjection with
+        | .ok (.aggregate 0 innerElems) => .some (targetProjection, 0, innerElems)
+        | _ => .none
+      | false =>
+        match
+          Bool.and
+            (Nat.ble minLen (length outerElems))
+            (Nat.ble baseIdx (length outerElems))
+        with
+        | true => .some (initProj, baseIdx, outerElems)
+        | false => .none
     | _ => .none
   | .none =>
     match readProjectedValue indexLocals targetRootVal targetProjection with
@@ -1821,7 +1852,18 @@ def evalSliceFatPtrDerefRead
             | _ => .none
         match targetRootOpt with
         | .some targetRootVal =>
-          match readSliceBackingAggregate? locals targetRootVal entry.targetProjection with
+          let expSzOpt : Option Nat :=
+            match pointeeTyOpt with
+            | .some _ => rigidTyKindByteSize elemKind
+            | .none => .none
+          match
+            readSliceBackingAggregate?
+              locals
+              targetRootVal
+              entry.targetProjection
+              lenSc.bits
+              expSzOpt
+          with
           | .some (_, baseIdx, elems) =>
             let elemSz :=
               match pointeeTyOpt with
@@ -2442,6 +2484,7 @@ def resolveDerefWriteFullProj
               indexLocals
               targetRootVal
               entry.targetProjection
+              lenSc.bits
           with
           | .some (cProj, baseIdx, elems) =>
             let elemSz := inferElemListByteStride elems
@@ -2493,7 +2536,13 @@ def writeSliceFatPtrTargetValue
   with
   | false => .ub
   | true =>
-    match readSliceBackingAggregate? indexLocals targetRootVal targetProjection with
+    match
+      readSliceBackingAggregate?
+        indexLocals
+        targetRootVal
+        targetProjection
+        lenSc.bits
+    with
     | .some (containerProj, baseIdx, elems) =>
       let elemSz := inferElemListByteStride elems
       match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
@@ -3576,7 +3625,21 @@ def evalUnsizeCoercion
                     | _ => .none
                 match rootValOpt with
                 | .some rootVal =>
-                  match readSliceBackingAggregate? locals' rootVal entry.targetProjection with
+                  let dstElemSzOpt : Option Nat :=
+                    match targetTy.kind with
+                    | .ref _ (.slice dstElem) =>
+                      rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 }
+                    | .rawPtr _ (.slice dstElem) =>
+                      rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 }
+                    | _ => .none
+                  match
+                    readSliceBackingAggregate?
+                      locals'
+                      rootVal
+                      entry.targetProjection
+                      n
+                      dstElemSzOpt
+                  with
                   | .some (_, baseIdx, elems) =>
                     let elemSz := inferElemListByteStride elems
                     match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
@@ -3622,7 +3685,21 @@ def evalUnsizeCoercion
                   | _ => .none
               match rootValOpt with
               | .some rootVal =>
-                match readSliceBackingAggregate? locals' rootVal entry.targetProjection with
+                let dstElemSzOpt : Option Nat :=
+                  match targetTy.kind with
+                  | .ref _ (.slice dstElem) =>
+                    rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 }
+                  | .rawPtr _ (.slice dstElem) =>
+                    rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 }
+                  | _ => .none
+                match
+                  readSliceBackingAggregate?
+                    locals'
+                    rootVal
+                    entry.targetProjection
+                    0
+                    dstElemSzOpt
+                with
                 | .some (_, baseIdx, elems) =>
                   let elemSz := inferElemListByteStride elems
                   match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
@@ -3724,7 +3801,11 @@ def deriveStackElemThinPtr
     match rootValOpt with
     | .none => .ub
     | .some targetRootVal =>
-      match readSliceBackingAggregate? locals targetRootVal normProj with
+      let minCnt :=
+        match elemCountOpt with
+        | .some n => n
+        | .none => 0
+      match readSliceBackingAggregate? locals targetRootVal normProj minCnt with
       | .some (containerProj, baseIdx, elems) =>
         let elemSz := inferElemListByteStride elems
         match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
@@ -4171,7 +4252,19 @@ def evalPlaceLen
                   | _ => .none
               match targetRootOpt with
               | .some rootVal =>
-                match readSliceBackingAggregate? locals' rootVal entry.targetProjection with
+                let expSzOpt : Option Nat :=
+                  match pTy with
+                  | .some { kind := .slice elemKind, .. } =>
+                    rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 }
+                  | _ => .none
+                match
+                  readSliceBackingAggregate?
+                    locals'
+                    rootVal
+                    entry.targetProjection
+                    lenSc.bits
+                    expSzOpt
+                with
                 | .some (_, baseIdx, elems) =>
                   let elemSz := inferElemListByteStride elems
                   match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
@@ -4703,7 +4796,19 @@ def evalSliceFatPtrDerefBorrow
           match targetRootOpt with
           | .none => .ub
           | .some targetRootVal =>
-            match readSliceBackingAggregate? locals targetRootVal parentEntry.targetProjection with
+            let expSzOpt : Option Nat :=
+              match pointeeTyOpt with
+              | .some { kind := .slice elemKind, .. } =>
+                rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 }
+              | _ => .none
+            match
+              readSliceBackingAggregate?
+                locals
+                targetRootVal
+                parentEntry.targetProjection
+                lenSc.bits
+                expSzOpt
+            with
             | .some (containerProj, baseIdx, elems) =>
               let elemSz := inferElemListByteStride elems
               match byteOffsetToElemIdx? parentPtr.offsetBytes elemSz with
