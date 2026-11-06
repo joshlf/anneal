@@ -177,6 +177,7 @@ fn end_to_end_four_demo_user_journeys() {
         lock_file: None,
         lock_git_ref: None,
         local_archive: None,
+        out_dir: None,
         item_filter: None,
         allow_impl_edit: None,
         filter: None,

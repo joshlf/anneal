@@ -4976,7 +4976,7 @@ private theorem callTerminatorOk_unpack {fnMap : FnMap}
             obtain ⟨⟨⟨⟨⟨⟨⟨htgtLt, _⟩, _⟩, hArgLen⟩, hArgBound⟩, hArgsOk⟩, hDestOk⟩, hNotDst⟩ := hok
             simp only [translateTerminatorInProg, htk, hextr, Option.bind_eq_bind,
               Option.bind_some] at htr
-            simp only [hintr, Option.bind_none] at htr
+            simp only [hintr] at htr
             cases hlk : lookupFnTarget fnMap dp with
             | none => simp [hlk] at htr
             | some fnConv =>

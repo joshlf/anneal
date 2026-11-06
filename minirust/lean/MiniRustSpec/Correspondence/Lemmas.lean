@@ -478,7 +478,7 @@ theorem splitStmts_names (cur : Gen.BbName) (acc : List Gen.Statement) (nc : Nat
 /-- The cleanup blocks of `translateTerminatorInProg` take the fresh names
 `nc, nc + 1, ..` (at most one, for a call's unwind action). -/
 
-theorem translateRsIntrinsic_cfgWf (f : Gen.Function) (name : String) (argOps : List MirAst.Operand) (destination : MirAst.Place) (target : Option Nat) (res : TerminatorResult)
+theorem translateRsIntrinsic_cfgWf (f : Gen.Function) (name : RsIntrinsic) (argOps : List MirAst.Operand) (destination : MirAst.Place) (target : Option Nat) (res : TerminatorResult)
     (htgt : ∀ t, target = some t → checkNextBlock f Gen.BbKind.Regular (bbName t) = true)
     (h : translateRsIntrinsic name argOps destination target = some res) :
     res.stmts.all (stmtCfgWf f) = true ∧ termCfgWf f Gen.BbKind.Regular res.terminator = true := by

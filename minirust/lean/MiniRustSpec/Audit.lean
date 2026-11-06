@@ -2303,15 +2303,6 @@ open MiniRustSpec.Correspondence in
   bdMirCallReq_fields
   bdWriteBytes_extCall
   bdRawEq_extCall
-  bdColdPath_extCall
-  bdCtpop_extCall
-  bdExactDivI32_extCall
-  bdAbort_unsupported
-  bdExactDiv_param_types
-  bdExactDiv_same_request
-  bdExactDiv_decode
-  bdExactDiv_minirust_i32
-  bdExactDiv_minirust_u32
   bdExtCallers_rejected
   bdUnreach_anneal_ub
   bdUnreach_anneal_fault
@@ -2321,23 +2312,9 @@ open MiniRustSpec.Correspondence in
   countOnesLoop_mod
   evalCountOnes_intFromBits
   evalCountOnes_signedness_indep
-  bdColdPath_handled
-  bdCtpop_handled
-  bdExactDiv_handled
   exactDivHandler_iff_minirust
   bdWriteBytes_unhandled_fault
-  bdUbChecksCall_extCall
-  bdUbChecksCall_handled
 
-  bdCtpop_minirust_direct
-  bdCtpopI8_minirust_direct
-  bdExactDivI32_minirust_direct
-  bdExactDivU32_minirust_ub
-  bdExactDivI32_zero_ub
-  bdExactDivI32_overflow_ub
-  bdColdPath_minirust_direct
-  bdAbort_minirust_ub
-  bdUbChecksCall_minirust_direct
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

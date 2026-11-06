@@ -268,7 +268,7 @@ private def evalRvalueSymTreeFast
           tag := tag
           targetLocal := p.local_
           targetProjection := .nil
-          perm := .frozen
+          perm := sharedBorrowPerm localDecls layouts { local_ := p.local_, projection := [] }
         }
         let mem' := {
           mem with
@@ -329,7 +329,7 @@ private theorem evalRvalueSymTreeFast_eq
       evalRvalueSymTree locals rv mem localDecls layouts := by
   cases rv with
   | use op =>
-    dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree, evalRvalue]
+    dsimp only [evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze, evalRvalueSymTree, evalRvalue]
     rw [evalOperandFast_eq]
     cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals <;> rfl
   | ref bk p =>
@@ -338,7 +338,7 @@ private theorem evalRvalueSymTreeFast_eq
       rcases p with ⟨loc, proj⟩
       cases proj with
       | nil =>
-        dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree, evalRvalue]
+        dsimp only [evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze, evalRvalueSymTree, evalRvalue]
         cases get? locals loc with
         | none => rfl
         | some slot => cases slot <;> rfl
@@ -348,12 +348,12 @@ private theorem evalRvalueSymTreeFast_eq
   | aggregate ak ops =>
     cases ak with
     | tuple =>
-      dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree, evalRvalue]
+      dsimp only [evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze, evalRvalueSymTree, evalRvalue]
       rw [evalOperandsFast_eq]
       cases evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals <;> rfl
     | _ => rfl
   | binaryOp op lhsOp rhsOp =>
-    dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree]
+    dsimp only [evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze, evalRvalueSymTree]
     rw [evalOperandFast_eq]
     cases evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals with
     | ub => rfl
@@ -375,7 +375,7 @@ private theorem evalRvalueSymTreeFast_eq
   | unaryOp uop op =>
     cases uop with
     | not =>
-      dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree]
+      dsimp only [evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze, evalRvalueSymTree]
       rw [evalOperandFast_eq]
       cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
       | ok v _ => cases v <;> rfl
@@ -838,10 +838,10 @@ private theorem wpReq_imp_zero_or_one (b : Nat) :
           [.scalar { bits := b, sizeBytes := 1 }]).memory) →
     b = 0 ∨ b = 1 := by
   dsimp only [Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body,
-    reqBB0, wpBlockLinear, wpBlockStep, evalSymNodeTree,
+    reqCtx, reqBB0, wpBlockLinear, wpBlockStep, evalSymNodeTree,
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
-    evalRvalueSymTreeFast,
-    evalOperandFast, evalOperandsFast, evalConstValue,
+    evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze,
+    evalOperandFast, evalOperandsFast, evalConstValue, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
     evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree,
     evalTerminatorSymTreeFast,
     lookupSwitchTargetTree, applyUnwindAction,
@@ -890,8 +890,8 @@ private theorem ensures_holds_one :
   dsimp only [Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.body,
     ensBB0, wpBlockLinear, wpBlockStep, evalSymNodeTree,
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
-    evalRvalueSymTreeFast,
-    evalOperandFast, evalOperandsFast, evalConstValue,
+    evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze,
+    evalOperandFast, evalOperandsFast, evalConstValue, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
     evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree,
     evalTerminatorSymTreeFast,
     lookupSwitchTargetTree, applyUnwindAction,
@@ -922,8 +922,8 @@ private theorem ensures_holds_zero :
   dsimp only [Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.body,
     ensBB0, wpBlockLinear, wpBlockStep, evalSymNodeTree,
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
-    evalRvalueSymTreeFast,
-    evalOperandFast, evalOperandsFast, evalConstValue,
+    evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze,
+    evalOperandFast, evalOperandsFast, evalConstValue, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
     evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree,
     evalTerminatorSymTreeFast,
     lookupSwitchTargetTree, applyUnwindAction,
@@ -1003,8 +1003,8 @@ theorem verified : VerificationResult Obligations.WireframeDemo.parse_compressio
   dsimp only [Mir.WireframeDemo.parse_compression_flag.body,
     parseBB0, wpBlockLinear, wpBlockStep, evalSymNodeTree,
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
-    evalRvalueSymTreeFast,
-    evalOperandFast, evalOperandsFast, evalConstValue,
+    evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze,
+    evalOperandFast, evalOperandsFast, evalConstValue, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
     evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree,
     evalTerminatorSymTreeFast,
     lookupSwitchTargetTree, applyUnwindAction,
@@ -1047,10 +1047,10 @@ theorem nonVacuousRequires :
   apply Hold.val
   refine hold_mirBool_req 28 _ ?_
   dsimp only [Mir.WireframeDemo.__anodized_fn_requires_parse_compression_flag.body,
-    reqBB0, wpBlockLinear, wpBlockStep, evalSymNodeTree,
+    reqCtx, reqBB0, wpBlockLinear, wpBlockStep, evalSymNodeTree,
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
-    evalRvalueSymTreeFast,
-    evalOperandFast, evalOperandsFast, evalConstValue,
+    evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze,
+    evalOperandFast, evalOperandsFast, evalConstValue, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
     evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree,
     evalTerminatorSymTreeFast,
     lookupSwitchTargetTree, applyUnwindAction,

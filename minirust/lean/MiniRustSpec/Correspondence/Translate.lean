@@ -1254,21 +1254,30 @@ queries (`raw_eq`, `ctpop`, `exact_div`, `cold_path`, `abort`):
 Other `translate_rs_intrinsic` arms (`assert_*_valid`, `arith_offset`,
 `ptr_offset_from*`, `size_of_val`, `align_of_val`, `catch_unwind`) query `tcx`
 layouts or synthesize catch blocks, and unsupported names hit `span_bug!`. -/
-def translateRsIntrinsic (name : String) (args : List MirAst.Operand)
+inductive RsIntrinsic
+  | raw_eq
+  | ctpop
+  | exact_div
+  | cold_path
+  | abort
+  | ub_checks
+  deriving DecidableEq
+
+def translateRsIntrinsic (name : RsIntrinsic) (args : List MirAst.Operand)
     (destination : MirAst.Place) (target : Option Nat) : Option TerminatorResult :=
   match name with
-  | "raw_eq" => do
+  | .raw_eq => do
     let args' ← args.mapM translateOperand
     let ret' ← translatePlace destination
     pure ⟨[], .Intrinsic .RawEq args' ret' (target.map bbName)⟩
-  | "ctpop" =>
+  | .ctpop =>
     match args, target with
     | [vOp], some t => do
       let v ← translateOperand vOp
       let dest ← translatePlace destination
       pure ⟨[.Assign dest (buildCountOnes v)], .Goto (bbName t)⟩
     | _, _ => none
-  | "exact_div" =>
+  | .exact_div =>
     match args, target with
     | [lOp, rOp], some t => do
       let l ← translateOperand lOp
@@ -1276,11 +1285,11 @@ def translateRsIntrinsic (name : String) (args : List MirAst.Operand)
       let dest ← translatePlace destination
       pure ⟨[.Assign dest (buildDivExact l r)], .Goto (bbName t)⟩
     | _, _ => none
-  | "cold_path" =>
+  | .cold_path =>
     match target with
     | some t => pure ⟨[], .Goto (bbName t)⟩
     | none => none
-  | "abort" => pure ⟨[], abortTerminator⟩
+  | .abort => pure ⟨[], abortTerminator⟩
   | _ => none
 
 /-- `minimize`'s terminator translation extended with direct monomorphic calls
@@ -1316,19 +1325,22 @@ translated direct call). Non-call terminators delegate directly to
 `translateTerminator` and synthesize no extra cleanup blocks. -/
 
 
-def stripIntrinsicPrefix (str : String) : Option String :=
-  let rec go (p s : List Char) : Option (List Char) :=
-    match p, s with
-    | [], s => some s
-    | c::p', d::s' => if c = d then go p' s' else none
-    | _, _ => none
-  (go "core::intrinsics::".toList str.toList).map String.mk
-
 def translateIntrinsicOrNone (defPath : String) (argOps : List MirAst.Operand)
     (destination : MirAst.Place) (target : Option MirAst.BasicBlockIdx) : Option TerminatorResult :=
-  match stripIntrinsicPrefix defPath with
-  | some name => translateRsIntrinsic name argOps destination target
-  | none => none
+  match defPath.toList with
+  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','r','a','w','_','e','q'] =>
+      translateRsIntrinsic .raw_eq argOps destination target
+  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','c','t','p','o','p'] =>
+      translateRsIntrinsic .ctpop argOps destination target
+  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','e','x','a','c','t','_','d','i','v'] =>
+      translateRsIntrinsic .exact_div argOps destination target
+  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','c','o','l','d','_','p','a','t','h'] =>
+      translateRsIntrinsic .cold_path argOps destination target
+  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','a','b','o','r','t'] =>
+      translateRsIntrinsic .abort argOps destination target
+  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','u','b','_','c','h','e','c','k','s'] =>
+      translateRsIntrinsic .ub_checks argOps destination target
+  | _ => none
 
 def translateTerminatorInProg (fnMap : FnMap)
     (decls : List MirAst.LocalDecl) (nextCleanup : Nat) (t : MirAst.Terminator) :

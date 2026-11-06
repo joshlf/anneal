@@ -10248,25 +10248,24 @@ theorem evalTerminator_abortTerminator :
 no-op `Goto`, `"abort"` to `build::abort()`, and rejects unmodeled fallback
 intrinsics (`"ctlz"`). -/
 theorem translateRsIntrinsic_witness :
-    translateRsIntrinsic "raw_eq" [.copy (local_ 1), .copy (local_ 2)]
+    translateRsIntrinsic .raw_eq [.copy (local_ 1), .copy (local_ 2)]
         (local_ 0) (some 1) =
       some ⟨[], .Intrinsic .RawEq
         [.Load (.Local (localName 1)), .Load (.Local (localName 2))]
         (.Local (localName 0)) (some (bbName 1))⟩ ∧
-    translateRsIntrinsic "ctpop" [.copy (local_ 1)] (local_ 0) (some 1) =
+    translateRsIntrinsic .ctpop [.copy (local_ 1)] (local_ 0) (some 1) =
       some ⟨[.Assign (.Local (localName 0)) (buildCountOnes (.Load (.Local (localName 1))))],
         .Goto (bbName 1)⟩ ∧
-    translateRsIntrinsic "exact_div" [.copy (local_ 1), .copy (local_ 2)]
+    translateRsIntrinsic .exact_div [.copy (local_ 1), .copy (local_ 2)]
         (local_ 0) (some 1) =
       some ⟨[.Assign (.Local (localName 0))
         (buildDivExact (.Load (.Local (localName 1))) (.Load (.Local (localName 2))))],
         .Goto (bbName 1)⟩ ∧
-    translateRsIntrinsic "cold_path" [] (local_ 0) (some 1) =
+    translateRsIntrinsic .cold_path [] (local_ 0) (some 1) =
       some ⟨[], .Goto (bbName 1)⟩ ∧
-    translateRsIntrinsic "abort" [] (local_ 0) none =
-      some ⟨[], abortTerminator⟩ ∧
-    translateRsIntrinsic "ctlz" [.copy (local_ 1)] (local_ 0) (some 1) = none :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+    translateRsIntrinsic .abort [] (local_ 0) none =
+      some ⟨[], abortTerminator⟩ :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ### `Assume` statements and `minimize`'s block splitting -/
 
