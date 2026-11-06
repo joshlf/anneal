@@ -1363,28 +1363,9 @@ def annealStepHooks (localDecls : List LocalDecl := .nil)
       Unit
       (Miri.Interpreter.RuntimePlace AnnealProv) where
   assign := fun choice place rvalue state =>
-    let (state', result) := Miri.Interpreter.runRvalue
+    Miri.Interpreter.runRvalue
       (Miri.Interpreter.evalRvalueIntoPlace (annealRvalueHooks localDecls layouts) choice rvalue place)
       state
-    match result with
-    | .error _ => (state', result)
-    | .ok () =>
-      match rvalue with
-      | .Use (.Move srcPlace) _ =>
-        if srcPlace.projection.isEmpty then
-          match state'.stack.currentFrame? with
-          | none => (state', result)
-          | some frame =>
-            match frame.replaceLocalValue srcPlace.localId (.live (.immediate .uninit)) with
-            | .ok frame' =>
-              let idx := state'.stack.frames.size - 1
-              if h : idx < state'.stack.frames.size then
-                let state'' := { state' with stack := { frames := state'.stack.frames.set idx frame' h } }
-                (state'', result)
-              else (state', result)
-            | .error _ => (state', result)
-        else (state', result)
-      | _ => (state', result)
   evalPlace := fun _ place _ state =>
     Miri.Interpreter.runRvalue (annealEvalPlace localDecls layouts place) state
   writeDiscriminant := fun _ _ _ state =>
