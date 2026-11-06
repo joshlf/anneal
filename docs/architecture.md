@@ -14,353 +14,569 @@ those terms. -->
 > to the codebase.
 
 Anneal verifies Rust crates by extracting their Mid-level Intermediate
-Representation (MIR) from `rustc` and reasoning about that MIR inside the
-Lean 4 theorem prover. Designing this pipeline requires resolving a core
-tension between **auditability** and **proof stability**:
+Representation (MIR) from `rustc` and proving verification obligations over
+that MIR in the Lean 4 theorem prover. Designing this pipeline requires
+balancing **Trusted Computing Base (TCB) auditability** against **proof
+ergonomics and stability**:
 
-- **Auditability pulls toward raw `rustc` MIR:** Any transformation or
-  simplification performed inside the Rust extractor happens outside the Lean
-  kernel. If the extractor rewrites control flow or desugars operations in
-  Rust, a bug in that Rust code can silently alter what the program means and
-  compromise soundness. To keep the Trusted Computing Base (TCB) small and easy
-  to audit, extraction from `rustc` must be as thin and mechanical as possible.
-- **Proof stability and ergonomics pull toward a high-level stable IR:**
-  `rustc`'s internal `rustc_middle::mir` structures are designed for compiler
-  optimization and code generation, not theorem proving. Moreover, `rustc`'s
-  internal APIs and MIR representations evolve across compiler releases. If
-  weakest-precondition (WP) lemmas, tactics, and user specifications operated
-  directly on raw `rustc` MIR, every minor compiler upgrade would break
-  verification.
+- **Auditability pulls toward raw `rustc` MIR and simple, first-order code:**
+  Any transformation performed inside the Rust extractor happens outside the
+  Lean kernel. If the extractor rewrites control flow, desugars projections, or
+  synthesizes Lean `Prop` formulas in Rust, a bug in that Rust code can silently
+  alter what is being proved. Likewise, if the Lean semantics inside `trusted/`
+  rely on tactic blocks, well-founded recursion proofs, or mutual inductive
+  types, Lean's elaborator generates complex auxiliary definitions in the
+  compiled `.olean` environment. Keeping the TCB small and auditable requires a
+  thin, purely syntactic Rust extractor and a transparent, tactic-free Lean
+  semantic model.
+- **Verification ergonomics and stability pull toward normalized MIR:**
+  `rustc`'s `Runtime(PostCleanup)` MIR contains low-level control-flow chains,
+  storage markers, and `nop` statements that are tedious to step through
+  directly and can shift across compiler releases.
 
 Anneal resolves this tension with a **three-stage MIR pipeline** split across
 the repository's `trusted/` and `theory/` boundary:
 
-1. **Stage 1 — Mechanical Capture (`trusted/rustc-capture/`):** A thin,
-   version-specific `rustc_driver` wrapper transcribes `rustc`'s
-   `Runtime(PostCleanup)` MIR and inline Rust specification attributes 1-to-1
-   into Lean data definitions (`Mir.lean`) and a pure proof script
-   (`Proof.lean`), with zero semantic normalization in Rust.
-2. **Stage 2 — Shared Captured MIR & Reference Semantics (`trusted/lean/`):** A
-   single, auditable Lean AST and reference operational semantics represent the
-   captured MIR. Minor semantic variations across compiler versions or targets
-   are controlled by a declarative `CaptureProfile` parameter rather than
-   duplicating the interpreter.
-3. **Stage 3 — Verified Lowering to a Stable IR (`theory/`):** Untrusted passes
-   written in Lean translate the captured MIR into an ergonomic, version-
-   independent stable AST (`Theory/Rust/StableAst/`) and prove a kernel-checked
-   backward simulation (`Abstracts`) connecting the two representations.
+1. **Stage 1 — Mechanical, First-Order Capture (`trusted/rustc-capture/`):** A
+   thin `rustc_driver` wrapper transcribes each compiled crate's
+   `Runtime(PostCleanup)` MIR and inline specification attributes 1-to-1 into
+   purely first-order Lean data definitions (`Mir.crate : Trusted.Crate` in
+   `Mir.lean`), paired by `cargo-anneal` in a private staging directory with a
+   fixed, crate-independent proof entrypoint (`Proof.lean`), performing zero
+   semantic normalization in Rust. (In multi-crate workspaces, Stage 1 runs per
+   crate in the Cargo build graph, and downstream crates compose upstream
+   verified contracts and TCB ledgers as described in
+   [`docs/design.md`](design.md#library-centric-verification).)
+2. **Stage 2 — Flat Captured MIR & Reference Semantics
+   (`trusted/lean/Trusted/`):** A tactic-free, fuel-bounded Lean AST and
+   small-step operational semantics evaluate captured MIR over a flat,
+   `BodyId`-indexed table (`Crate.bodies`) and a value-tree memory model with
+   explicit uninitialized leaves (`MirVal.uninit`). `Trusted/MirAst.lean`
+   represents the full `Runtime(PostCleanup)` MIR statement, rvalue, terminator,
+   operand, and projection syntax without `.unsupported` AST placeholders;
+   unmodeled operations fail closed at the semantic layer in
+   `Trusted/MirSemantics.lean` only when a verified obligation reaches them.
+3. **Stage 3 — In-Place Verified Lowering & Compositional Proof Engine
+   (`theory/Anneal/`):** Untrusted, kernel-checked passes in `theory/` normalize
+   `MirBody` in place (`lowerBody : MirBody → MirBody`), prove a backward
+   simulation (`lowerBody_simulates`) back to the Stage 2 semantics, and
+   discharge `Trusted.CrateTheorem` compositionally per ADT and per function.
 
-Because Stage 3 runs inside Lean, is verified to be pure and axiom-free in
-Anneal's CI, and proves its own soundness in the Lean kernel, the stable IR,
-the lowering passes, and all downstream proof tactics remain entirely **outside
-the human-audited TCB**.
+Because Stage 3 lives in `theory/`, is verified by `anneal-audit` in CI to be
+pure and axiom-free, and proves its own soundness inside the Lean 4 kernel, all
+control-flow normalization, compositional checkers, and symbolic execution
+lemmas remain **outside the human-audited TCB**.
 
-For the broader context around this architecture, see:
+For related context, see:
 
 - [`docs/design.md`](design.md) for Anneal's end-to-end user workflow,
   library-centric verification model, and incremental adoption.
 - [`docs/trust-model.md`](trust-model.md) for how Anneal's CI enforces the
   boundary between `trusted/` and `theory/`.
 
+## Architectural goals
+
+Anneal's MIR pipeline is organized around six concrete goals:
+
+1. **No semantic desugaring or formula synthesis in Rust:** Stage 1 maps
+   `rustc` data structures directly to first-order Lean constructors. It never
+   rewrites places or control flow, never filters out unverified items via
+   duplicate semantic analyses in Rust, and never formats Lean propositions or
+   per-function tactic scripts.
+2. **Static, crate-independent `Proof.lean`:** Every crate is checked with the
+   exact same static `Proof.lean` file stating `theorem verify_crate :
+   Trusted.CrateTheorem Mir.crate := Anneal.proveCrate Mir.crate rfl`. No crate
+   name, function name, or user annotation is ever interpolated into
+   `Proof.lean`, and `cargo-anneal` never reads `.anneal/` from the target crate
+   directory.
+3. **Tactic-free, flat, and `opaque`-free `trusted/lean/`:** Stage 2 uses a
+   flat `BodyId` table instead of mutual inductive types, uses structural
+   recursion on explicit `Nat` fuel instead of `partial` or `WellFounded.fix`,
+   contains zero `by` tactic blocks (`SourceRole.trusted`), and contains zero
+   dummy `opaque` constants.
+4. **Unconditional MIR syntax capture with semantic-layer fail-closed
+   evaluation:** `Trusted/MirAst.lean` represents the complete
+   `Runtime(PostCleanup)` MIR statement, expression, projection, and control-flow
+   grammar (`PlaceElem`, `Operand`, `BinOp`, `UnOp`, `CastKind`, `BorrowKind`,
+   `RawPtrKind`, `Rvalue`, `Stmt`, `Terminator`) without `.unsupported` syntax
+   placeholders, keeping only a bounded `.unmodeled` leaf fallback on `MirTy`
+   for exotic compiler-internal types (`Dynamic`, `Alias`, `Coroutine`, `Pat`,
+   `UnsafeBinder`). Stage 1 translates MIR syntax unconditionally, while Stage 2
+   (`Trusted/MirSemantics.lean`) is the sole place that defines which operations
+   evaluate to a value versus stepping to `.failed` (undefined behavior).
+5. **In-place Stage 3 normalization without AST duplication:** Rather than
+   duplicating `MirBody`, `Stmt`, `Rvalue`, and `MirVal` into a parallel AST
+   hierarchy, Stage 3 normalizes `Trusted.MirBody` in place (`lowerBody`) and
+   verifies functions compositionally.
+6. **Source-span diagnostics:** Captured declarations, statements, and
+   terminators carry Rust source `Span` metadata (`file`, `line`, `col`) so
+   verification failures identify the exact Rust statement or assertion that
+   could not be discharged.
+
 ## The three-stage MIR pipeline
 
 ```mermaid
 flowchart TD
     subgraph Stage1 ["Stage 1: Mechanical Capture (trusted/rustc-capture/) — TCB"]
-        R1["rustc v1.X (rustc-capture-v1_X)"]
-        R2["rustc v1.Y (rustc-capture-v1_Y)"]
+        RC["anneal-rustc-capture\n1-to-1 transcription of Runtime(PostCleanup) MIR,\ninline spec ASTs, TargetLayout, & Span"]
+        FILES["Staged Mir.lean (first-order Mir.crate : Trusted.Crate)\n& static Proof.lean (verify_crate)"]
+        RC --> FILES
     end
 
-    subgraph Stage2 ["Stage 2: Captured MIR & Reference Semantics (trusted/lean/) — TCB"]
-        AST["Shared Captured MIR AST (Trusted/Rust/Ast/) + CaptureManifest"]
-        SEM["Reference Operational Semantics (Trusted/Rust/Semantics/)"]
-        THM["Crate Obligation (Trusted.CrateTheorem Mir.crate)"]
-        AST --> SEM --> THM
+    subgraph Stage2 ["Stage 2: Captured MIR & Reference Semantics (trusted/lean/Trusted/) — TCB"]
+        REF["Trusted/Refinement.lean & StepResult.lean\nLanguage, Verified, VerificationResult, Obligation.assumed"]
+        AST["Trusted/MirAst.lean\nFlat BodyId-indexed Crate.bodies, Place, MirBody, TCBItem"]
+        SEM["Trusted/MirSemantics.lean\nFuel-bounded semantics, MirVal.uninit, Place lenses,\nConstsTotal, & Trusted.CrateTheorem"]
+        REF --> AST --> SEM
     end
 
-    subgraph Stage3 ["Stage 3: Verified Lowering & Proof Engine (theory/) — Untrusted"]
-        PASS["Verified Lowering Passes (Theory/Rust/Passes/)"]
-        STABLE["Stable AST & Semantics (Theory/Rust/StableAst/, StableSemantics/)"]
-        WP["Program Logics & Tactics (Theory/Rust/Wp/, Tactics/)"]
-        PASS --> STABLE --> WP
+    subgraph Stage3 ["Stage 3: Lowering & Compositional Verifier (theory/Anneal/) — Untrusted"]
+        LOW["Anneal/Lowering.lean\nIn-place lowerBody : MirBody -> MirBody\n& lowerBody_simulates"]
+        LEM["Anneal/MirLemmas.lean\nCompositional per-ADT & per-function checker,\ninline/modular/assumed calls, & execNormal_join"]
+        LOW --> LEM
     end
 
-    R1 -->|"1-to-1 serialization (Mir.lean & Proof.lean)"| AST
-    R2 -->|"1-to-1 serialization (Mir.lean & Proof.lean)"| AST
-    AST -->|"Input to lowering"| PASS
-    WP -->|"Backward simulation (Abstracts) discharges"| THM
+    FILES -->|"Instantiates"| AST
+    SEM -->|"Defines obligation"| LEM
+    LEM -->|"Anneal.proveCrate Mir.crate rfl"| SEM
 ```
 
-### Stage 1: Thin, mechanical `rustc` capture (`trusted/rustc-capture/`)
+### Stage 1: Mechanical, first-order `rustc` capture (`trusted/rustc-capture/`)
 
 `trusted/rustc-capture/` links against `rustc_driver` and `rustc_middle` to
-extract the compiled crate's MIR and inline specifications into pure Lean
-source files (`Mir.lean` and `Proof.lean`).
+extract the compiled crate's `Runtime(PostCleanup)` MIR, layout facts, and
+inline specification attributes into `Mir.lean`, which `trusted/cargo-anneal/`
+pairs with the static `Proof.lean` module in a private staging directory.
 
-To minimize the unverified Rust surface in `trusted/`, Stage 1 obeys a strict
-**no-semantic-normalization rule**:
+#### 1-to-1 transcription without Rust-side desugaring
 
-- It does **not** rewrite control-flow graphs, eliminate temporary locals,
-  simplify casts, or desugar complex MIR statements into simpler primitives.
-- Instead, each `rustc_middle::mir` construct (`BasicBlockData`,
-  `StatementKind`, `TerminatorKind`, `Rvalue`, `Operand`, `Place`,
-  `ProjectionElem`) is mapped directly to its corresponding constructor in
-  Lean.
-- Alongside the MIR bodies, Stage 1 emits a `CaptureManifest` recording the
-  compiler version, target layout environment (pointer width, endianness, type
-  sizes, alignments, and field offsets), and active semantic profile, plus a
-  pure proof script (`Proof.lean`) that states `theorem Proof.verify_crate :
-  Trusted.CrateTheorem Mir.crate` and invokes `theory/` to discharge it.
+Stage 1 translates each `rustc_middle::mir` construct directly into its
+corresponding constructor in `Trusted/MirAst.lean`:
 
-Because Stage 1 is a straightforward structural serializer and proof-script
-generator, a human auditor can verify it by comparing each Rust serialization
-arm directly against the cited `rustc` data definition.
+- **Places and projections (`Place`, `PlaceElem`):** A MIR `Place` is emitted
+  directly as `(LocalId, List PlaceElem)` for the supported projection subset
+  (`.deref` and `.field idx`), while `extract_place` fails closed with an
+  explicit compiler diagnostic on not-yet-modeled `ProjectionElem` variants
+  (`Index`, `ConstantIndex`, `Subslice`, `Downcast`, `OpaqueCast`,
+  `UnwrapUnsafeBinder`, and `Subtype`). Stage 1 never pattern-matches projection
+  chains in Rust to synthesize special-case rvalues or silently drop
+  projections.
+- **Operands and rvalues (`Operand`, `Rvalue`):** `Operand::Copy(p)`,
+  `Operand::Move(p)`, and `Operand::Constant(...)` map 1-to-1 to
+  `Operand.copy`, `Operand.move`, and `Operand.constVal` / `Operand.constParam`.
+  `Rvalue::Use`, `Rvalue::Ref`, `Rvalue::RawPtr`, `Rvalue::BinaryOp`,
+  `Rvalue::Aggregate`, and `Rvalue::Cast(Transmute)` map directly to `Rvalue`
+  constructors.
+- **Statements and terminators (`Stmt`, `Terminator`):** `Assign`,
+  `StorageLive`, `StorageDead`, `PlaceMention`, and `Nop` map 1-to-1 to `Stmt`;
+  `Return`, `Goto`, `SwitchInt`, `Call`, and `Assert` map 1-to-1 to
+  `Terminator`.
 
-### Stage 2: Shared captured MIR and reference semantics (`trusted/lean/`)
+Because Stage 1 performs no control-flow restructuring or expression
+simplification, a human reviewer can audit each arm in
+`trusted/rustc-capture/src/extract.rs` directly against the cited `rustc`
+definition.
 
-The Lean files emitted by Stage 1 instantiate data structures defined in
-`trusted/lean/`:
+#### First-order `Mir.lean` and static `Proof.lean`
 
-- **Captured MIR AST (`Trusted/Rust/Ast/`):** Defines the Lean inductive types
-  for captured MIR programs (`Trusted.Crate`), types, places, rvalues,
-  statements, terminators, and layout environments.
-- **Reference operational semantics (`Trusted/Rust/Semantics/`):** Defines the
-  small-step operational semantics and memory model over the captured MIR AST,
-  explicitly distinguishing normal progress from undefined behavior (`UB`).
-- **Top-level theorem statement (`Trusted.CrateTheorem`):** States that for the
-  captured `Mir.crate : Trusted.Crate`, every verified function satisfies its
-  specification without reaching `UB`.
+Stage 1 separates the crate-specific data payload from the proof entrypoint:
 
-Stage 2 is optimized for **clarity and direct correspondence to the Rust
-Reference and `rustc`**, not for proof ergonomics. Where `rustc` MIR has
-verbose or low-level representations, Stage 2 models them faithfully so there
-is no semantic gap between what `rustc` hands to code generation and what
-`Trusted.CrateTheorem` constrains.
+- **`Mir.lean` is 100% first-order algebraic data:** `Mir.lean` defines
+  `def crate : Trusted.Crate := ...` using only constructors, natural numbers,
+  booleans, strings, and lists. Inline Rust specifications
+  (`#[anneal::requires]`, `#[anneal::ensures]`, `#[anneal::invariant]`,
+  `#[anneal::trusted]`) are parsed into first-order specification AST
+  constructors (`RequiresSpec`, `PostSpec`, `InvariantSpec`) inside `Mir.crate`
+  and denoted into `Prop` by pure functions in `Trusted/MirSemantics.lean`.
+  `rustc-capture` never emits raw Lean `Prop` syntax, quantifiers, or tactic
+  blocks. Because every captured body and declaration is pure first-order data
+  indexed by `BodyId`, large crates can partition `Mir.crate`'s declarations
+  across per-body submodules for parallel Lean elaboration without changing the
+  trust model or the proof entrypoint.
+- **`Proof.lean` is fixed and crate-independent:** Regardless of what the Rust
+  crate contains, `cargo-anneal` compiles the exact same static `Proof.lean`
+  file:
 
-### Stage 3: Verified lowering to a stable IR (`theory/`)
+  ```lean
+  prelude
+  import Trusted
+  import Anneal
+  import Mir
 
-Direct proof automation over Stage 2's raw captured MIR would be brittle and
-repetitive. Stage 3 (`theory/`) introduces an intermediate layer designed
-specifically for verification ergonomics and cross-version stability:
+  #eval Anneal.checkCrate Mir.crate
 
-- **Stable AST and semantics (`Theory/Rust/StableAst/` and
-  `Theory/Rust/StableSemantics/`):** A clean, normalized intermediate
-  representation that coalesces redundant MIR forms and remains stable across
-  `rustc` releases.
-- **Verified lowering passes (`Theory/Rust/Passes/`):** Pure Lean functions
-  that transform a Stage 2 captured MIR body into a Stage 3 `StableAst` body
-  (or a chain of progressively higher-level representations), accompanied by a
-  proof that the transformation is sound.
-- **Program logics and tactics (`Theory/Rust/Wp/` and `Theory/Rust/Tactics/`):**
-  Weakest-precondition calculi, separation-logic frame rules, and proof
-  automation built once against `StableAst` and `StableSemantics`.
+  namespace Proof
 
-#### Why lowering in `theory/` does not expand the TCB
+  theorem verify_crate : Trusted.CrateTheorem Mir.crate := Anneal.proveCrate Mir.crate rfl
 
-In a verified compiler (such as CompCert), a lowering pass translates a source
-program $S$ into a target program $T$ that will actually run on hardware; the
-compiler must prove that every behavior of $T$ is allowed by $S$.
+  end Proof
+  ```
 
-In a verification framework, the roles are reversed:
+  Because `Proof.lean` contains no crate-derived strings or identifiers, an
+  untrusted crate annotation cannot alter the theorem statement or inject Lean
+  commands into the proof script.
 
-- The captured MIR program $C$ (in `Trusted/Rust/Ast/`) is the ground-truth
-  program whose safety `Trusted.CrateTheorem` requires.
-- The lowered stable program $A$ (in `Theory/Rust/StableAst/`) is a pure proof
-  artifact used to simplify reasoning.
-- To discharge a claim about the concrete captured program $C$ by proving that
-  claim on the abstract stable program $A$, the lowering pass must establish a
-  **backward simulation** (denoted `Abstracts A C` in Anneal's framework): every
-  execution trace of the concrete captured program $C$ must be faithfully
-  matched by the abstract stable program $A$, and freedom from `UB` in $A$ must
-  imply freedom from `UB` in $C$.
+#### Unconditional MIR syntax capture and semantic-layer gating
 
-Because the Lean 4 kernel checks both (1) the proof that the specification
-holds for the lowered program $A$ and (2) the proof of `Abstracts A C` linking
-$A$ back to the captured `Mir.crate` $C$, the lowering pass is self-certifying.
-If a contributor introduces a bug in `Theory/Rust/Passes/` or `Theory/Rust/Wp/`,
-the simulation proof or weakest-precondition proof will fail to typecheck in
-Lean; it can never produce a valid kernel proof of `Trusted.CrateTheorem` for
-an unsafe program. See [`docs/trust-model.md`](trust-model.md) for how
-Anneal's CI auditor (`anneal-audit`) ensures that `theory/` is pure and
-axiom-free so it cannot bypass the Lean kernel.
+Anneal intentionally avoids `.unsupported` placeholder constructors on MIR
+syntax AST nodes and instead pushes unsupported-feature handling into the
+semantic layer (`Trusted/MirSemantics.lean`):
+
+- **Why unsupported constructs are handled in semantics, not syntax:**
+  `rustc`'s `Runtime(PostCleanup)` MIR operational grammar (`PlaceElem`,
+  `Operand`, `BinOp`, `UnOp`, `CastKind`, `BorrowKind`, `RawPtrKind`,
+  `NonDivergingIntrinsic`, `Rvalue`, `Stmt`, and `Terminator`) is small and
+  finite. Collapsing unmodeled MIR constructs into `.unsupported` inside
+  `trusted/rustc-capture/` would force the Rust extractor to encode semantic
+  feature-subsetting policy, discard structural detail from `.anneal/Mir.lean`,
+  and require coordinated edits across both `trusted/rustc-capture/` and
+  `trusted/lean/` whenever Stage 2 adds rules for another MIR construct. By
+  capturing the MIR operational syntax unconditionally in `Trusted/MirAst.lean`
+  and defining feature support solely in `Trusted/MirSemantics.lean`, Stage 1
+  remains a purely syntactic 1-to-1 transcriber and `Trusted/MirSemantics.lean`
+  is the single source of truth for what is semantically modeled.
+- **Which AST nodes may be `.unmodeled`:**
+  - **Operational MIR syntax (`PlaceElem`, `Operand`, `BinOp`, `UnOp`,
+    `CastKind`, `BorrowKind`, `RawPtrKind`, `NonDivergingIntrinsic`, `Rvalue`,
+    `Stmt`, `Terminator`):** Represented unconditionally in
+    `Trusted/MirAst.lean` with **no** `.unsupported` or `.unmodeled`
+    constructors.
+  - **Compiler type internals (`MirTy`):** Only `MirTy` retains a single
+    bounded `.unmodeled` leaf constructor for non-MIR compiler type-system
+    internals (`Dynamic` trait-object existential binders, unnormalized `Alias`
+    projections/opaques, `Coroutine`/`CoroutineWitness`, pattern types `Pat`,
+    and `UnsafeBinder`) whose representation would otherwise pull `rustc`'s
+    trait-solver and binder machinery into `Trusted/MirAst.lean`. Standard Rust
+    types (scalars, tuples, arrays, slices, references, raw pointers, ADTs,
+    function pointers/items, closures, `Never`, `Foreign`, and `Param`) are
+    represented explicitly in `MirTy`.
+
+All semantic gating happens fail-closed in `Trusted/MirSemantics.lean`:
+
+- If a verified function's specification, layout calculation (`evalTyByteSize`),
+  generic substitution (`MirTy.subst`, `Terminator.subst`), or reachable
+  execution path (`evalMirStmt`, `evalMirTerminator`) encounters an unmodeled
+  MIR construct or `MirTy.unmodeled`, evaluation in `Trusted/MirSemantics.lean`
+  returns `none` or steps to `.failed` (undefined behavior), making
+  `Trusted.CrateTheorem` unprovable.
+- If a verified function calls an unverified function body, the call is
+  permitted only when the callee is either given an explicit modular contract
+  (`TCBItem.assumedContract`) or explicitly waived in the crate's TCB ledger
+  (`TCBItem.unverifiedFn`).
+- Unverified functions in the same crate that are never called by verified code
+  do not block verification of the functions in scope.
+
+### Stage 2: Captured MIR and reference semantics (`trusted/lean/Trusted/`)
+
+Stage 2 defines the verification framework and the Rust MIR reference semantics
+in four tactic-free Lean modules under `trusted/lean/Trusted/`:
+
+1. **`Trusted/Refinement.lean`:** Defines the refinement preorder (`Preorder`,
+   `Partial`, `Behavior`), program-indexed languages (`Language`), complete
+   behavioral verification (`Language.Verified`), `Obligation`, `TrustPolicy`,
+   and `VerificationResult`. Unproved assumptions (such as `rustc`'s compilation
+   of MIR to machine code, assumed external contracts, or waived unverified
+   functions) are represented uniformly via
+   `abbrev Obligation.assumed (id : Id) : Obligation Id := ⟨id, False⟩`, which
+   can only be discharged in `VerificationResult` when `id` appears explicitly
+   in the crate's audited `c.tcb` waiver list. This eliminates the need for
+   dummy `opaque` target-language constants in the TCB.
+2. **`Trusted/StepResult.lean`:** Defines small-step operational machines
+   (`SmallStepMachine`), bounded prefix reachability (`ReachesPrefix`,
+   `PrefixOutcome`), and step-decoupled eventual behaviors (`EventualOut` and
+   `EventualBehaviorOf`) with explicit `.running`, `.terminated`, `.stuck`, and
+   `.failed` (undefined behavior) outcomes.
+3. **`Trusted/MirAst.lean`:** Defines the first-order captured MIR data
+   structures: `LocalId`, `BlockId`, `BodyId`, `MirTy`, `Place`
+   (`LocalId × List PlaceElem`), `Operand`, `Rvalue`, `Stmt`, `Terminator`,
+   `MirBody`, `BodyDecl`, `InvariantSpec`, `RequiresSpec`, `PostSpec`,
+   `TCBItem`, `CapturedFn`, and `Crate`.
+4. **`Trusted/MirSemantics.lean`:** Defines the small-step operational
+   semantics, value-tree memory model (`MirVal`), place projection lenses,
+   type-size predicates (`ValidTySizes`, `evalTyByteSize`),
+   post-monomorphization constant checks (`ConstsTotal`, `MonoAdmitted`), ADT
+   invariant admissibility (`AdmissibleAdtInv`), per-function verification
+   (`CapturedFn.obligations`), and the top-level crate obligation
+   (`Trusted.CrateTheorem`).
+
+#### Flat `BodyId`-indexed `Crate.bodies` table (no `mutual` inductive types)
+
+In `Trusted/MirAst.lean`, every captured function or constant body is stored
+once as a `BodyDecl` in the flat `Crate.bodies` table and referenced elsewhere
+by `BodyId`:
+
+- `Terminator.call1` and `MirBody.requiredConsts` reference callees and
+  required constants by `BodyId` rather than recursively embedding a `MirBody`
+  inside `Terminator` or `MirBody`.
+- `TCBItem` (`rustcLowering`, `fnVerified`) identifies functions by
+  `(fnName : String)` and `(bodyId : BodyId)` rather than embedding `MirBody`.
+
+Keeping `MirBody` out of `Terminator` and `TCBItem` eliminates `mutual`
+inductive types in `Trusted/MirAst.lean`, avoids duplicating shared callee ASTs
+across the call graph, and allows `theory/` to decide structural equality on
+`MirBody` without fuel bounds or manual mutual recursors.
+
+#### Value-tree memory model, `Place` lenses, and partial-move soundness
+
+`Trusted/MirSemantics.lean` represents values as functional trees (`MirVal`):
+
+- Scalar and aggregate nodes (`unit`, `bool`, `usize`, `adt`),
+- Opaque generic-parameter byte payloads (`bytes`),
+- Logical references (`ref`), and
+- Leaf-granular uninitialized field/local markers (`MirVal.uninit`).
+
+Composite places `(loc, projection)` are read and updated through lens helpers
+over `List PlaceElem` (`.deref` and `.field idx`):
+
+- **`evalProj` and `MirVal.isFullyInit`:** Reading (`Operand.copy` or
+  `Operand.move`) or borrowing (`Rvalue.ref`) a place traverses its projection
+  path, verifies that every intermediate dereference targets a live, valid
+  place, and requires `MirVal.isFullyInit` on the resulting `MirVal`—stepping to
+  `.failed` (UB) if any leaf of the read or borrowed value is `MirVal.uninit`.
+- **`updateProj` on moves and assignments:** Assigning to a projected place
+  writes the new subvalue back into the root local's `MirVal` tree. Crucially,
+  evaluating `Operand.move p` both returns the value at `p` and updates `p` to
+  `MirVal.uninit` via `updateProj` (`deinitPlace`). If a function moves a field
+  `_1.0` out of a non-`Copy` struct and subsequently reads or moves `_1` or
+  `_1.0` again before reinitializing it, `MirVal.isFullyInit` detects the
+  `MirVal.uninit` leaf and steps to `.failed`.
+- **Distinguishing uninitialized fields from padding bytes:** `MirVal.adt`
+  stores typed field values rather than raw padding bytes, so constructing an
+  initialized struct whose layout contains inter-field padding produces a fully
+  initialized `MirVal.adt` tree that can be borrowed or copied normally. By
+  contrast, opaque generic parameter values (`MirVal.bytes`, which may contain
+  padding or uninitialized bytes at runtime) are valid to copy or move at their
+  parameter type, whereas `extractTransmuteBits` rejects reinterpreting
+  `MirVal.bytes` or `MirVal.uninit` as a concrete integer via `transmute_copy`.
+
+#### UB faults vs. panics (`Terminator.unreachable` vs. `Terminator.assert` and `Terminator.panic`)
+
+Rust distinguishes undefined behavior (such as reaching
+`core::hint::unreachable_unchecked` or dereferencing a dangling reference) from
+clean runtime panics (`TerminatorKind::Assert` and `core::panicking::panic*`),
+and `Trusted/MirSemantics.lean` models the two distinctly:
+
+- **Undefined behavior (`.failed`):** Reaching `Terminator.unreachable`,
+  reading an uninitialized or moved-out place (`MirVal.uninit`), dereferencing
+  a dead local generation, or violating `transmute_copy` validity steps to
+  `.failed`.
+- **Clean panic unwinding (`.terminated .unwind`):** `rustc` lowers checked
+  arithmetic overflow (`+`, `-`, `*`), division or remainder by zero, and slice
+  bounds checks to `TerminatorKind::Assert` (`Terminator.assert`), and lowers
+  explicit `panic!` or `assert!` failures to `core::panicking::panic*`
+  (`Terminator.panic`). Both constructors record `hasCleanup : Bool` (`true`
+  when `rustc`'s `UnwindAction` is `UnwindAction::Cleanup(_)`). When
+  `Terminator.assert` evaluates a boolean operand that does not match `expected`
+  (or when `Terminator.panic` executes), `evalMirTerminator` steps to
+  `.terminated .unwind` only for a top-level frame without an unwind cleanup
+  edge (`hasCleanup = false` and `s.stack = []`); if an unwind cleanup block
+  (`hasCleanup = true`) or caller frame (`!s.stack.isEmpty`) is present (or if
+  `cond` is non-boolean/uninitialized or `target` is out of bounds),
+  `evalMirTerminator` steps fail-closed to `.failed` so destructor cleanup is
+  never skipped. Under Anneal's baseline safety semantics
+  (`PrefixOutcome.isSafe`), clean top-level unwinding is safe, while
+  total-correctness execution lemmas (`ExecNormal`) and compile-time constant
+  admission (`ConstSucceeds` in `MonoAdmitted`) require normal return
+  (`.terminated (.normal ...)`).
+
+### Stage 3: In-place lowering and compositional verification (`theory/Anneal/`)
+
+Stage 3 (`theory/Anneal/`) provides the normalization passes, compositional
+checkers, and symbolic execution lemmas that prove
+`Trusted.CrateTheorem Mir.crate`:
+
+- **In-place CFG lowering (`theory/Anneal/Lowering.lean`):** Rather than
+  translating `Trusted.MirBody` into a separate AST type, `lowerBody :
+  MirBody → MirBody` simplifies a captured body in place. It strips `Stmt.nop`
+  and collapses forwarding `goto` chains across terminator targets while
+  preserving `b.blocks.length`, `BlockId` numbering, and
+  `storageLive`/`storageDead` statements (so use-after-`StorageDead` checks on
+  dangling borrows remain sound). The theorem `lowerBody_simulates` proves a
+  backward simulation: proving `ExecNormal c (lowerBody b) s P` suffices to
+  establish `ExecNormal c b s P` on the unlowered body.
+- **Compositional per-ADT and per-function verification
+  (`theory/Anneal/MirLemmas.lean`):** `Anneal.proveCrate` (`checkCrateOpt` and
+  `checkCrate`) separates pure, non-dependent boolean/option decision checking
+  from its opaque `CrateTheorem` soundness proof across the crate's tables:
+  1. `NoDupIds` for `c.bodies`, `c.functions`, and `c.tcb` (with $O(N)$
+     strictly-increasing fast paths);
+  2. `ValidTargetLayout c.layout`;
+  3. Per-ADT invariant admissibility (`AdmissibleAdtInv` for each `AdtDecl` in
+     `c.adts`); and
+  4. Per-function verification (`checkFnsLoop` and `proveFnsLoop_of_check` for
+     each `CapturedFn` in `c.functions`).
+- **Inline, modular, and assumed call verification:** At `Terminator.call`
+  targeting `Callee.body calleeId args`, Stage 3 supports three verification
+  modes over the unified `BodyDecl` entry in `c.bodies`:
+  1. **Inline execution:** Step into the callee's `BodyPayload.mir` body by
+     pushing a `CallFrame` onto `MirState.stack`.
+  2. **Modular contract application:** When the callee carries a verified
+     `FnContract` (`requires` and `ensures`), check the callee's preconditions
+     at the call site and assume its postcondition for the destination place
+     without re-executing the callee's body.
+  3. **Explicitly waived calls:** When an external or unverified callee has no
+     verified MIR body, discharge the call only if the corresponding
+     `TCBItem.assumedContract` or `TCBItem.unverifiedFn` entry is present in
+     `c.tcb`.
+- **Diamond CFG joins and state canonicalization (`execNormal_join`):** When
+  two branches of a `Terminator.switchInt` reconverge at a join block, path
+  states may differ in dead branch-local temporaries. Because Stage 2 maps
+  `Stmt.storageDead l` to writing `MirVal.uninit` into local `l`, dead
+  temporaries on both branches canonicalize to `MirVal.uninit`, allowing
+  `execNormal_join` to merge the branches and verify the suffix from the join
+  block once.
 
 ## Repository layout
 
-Anneal's directory structure reflects both the **trust boundary** (`trusted/`
-vs. `theory/`) and the separation between **language-agnostic verification
-machinery** (`Framework/`) and **Rust-specific semantics** (`Rust/`).
-[`trusted/`](../trusted) houses the CI boundary auditor (`trusted/audit/`), CLI
-orchestrator (`trusted/cargo-anneal/`), capture entrypoint
-(`trusted/rustc-capture/`), and foundational Lean prelude (`trusted/lean/`);
-the `Framework/`, `Rust/`, per-version capture subcrates, and `theory/`
-subdirectories below show the target layout as the pipeline is populated:
+Anneal's directory structure mirrors the trust boundary (`trusted/` vs.
+`theory/`):
 
 ```text
 anneal/
 ├── trusted/                        # Human-audited Trusted Computing Base (TCB)
-│   ├── root-manifest.sha256        # SHA-256 pins for workspace & Nix manifests
+│   ├── root-manifest.sha256        # SHA-256 pins for Cargo & Nix root manifests
 │   ├── rustc-capture/              # Stage 1: rustc_driver MIR & spec extractor
 │   │   ├── Cargo.toml
-│   │   ├── src/                    # Version-independent CLI & dispatch logic
-│   │   └── crates/
-│   │       ├── rustc-capture-common/   # Shared Lean emission formatting
-│   │       ├── rustc-capture-v1_85/    # Thin backend for rustc 1.85
-│   │       └── rustc-capture-v1_86/    # Thin backend for rustc 1.86
-│   ├── lean/                       # Stage 2: Trusted Lean foundation
+│   │   └── src/
+│   │       ├── main.rs             # GuardedFileLoader & rustc_driver entrypoint
+│   │       ├── hook.rs             # Multi-config driver & MIR query hooks
+│   │       ├── items.rs            # Crate item, ADT, const, & layout extraction
+│   │       ├── extract.rs          # 1-to-1 MIR body & spec AST extraction
+│   │       ├── ir.rs               # First-order intermediate capture structs
+│   │       ├── lean.rs             # Deterministic Mir.lean emitter
+│   │       └── spec.rs             # Inline spec comment lexer & parser
+│   ├── lean/                       # Stage 2: Trusted Lean foundation (tactic-free)
 │   │   ├── foundation-lock.json    # SHA-256 pins for lean binary & Init.*
 │   │   ├── Trusted.lean            # Root TCB prelude import
 │   │   └── Trusted/
-│   │       ├── Framework/          # Language-agnostic transition systems,
-│   │       │                       # Abstracts/Compiles, & VerificationResult
-│   │       └── Rust/               # Captured MIR AST, CaptureProfile, memory
-│   │           ├── Ast/            # models, reference semantics, & CrateTheorem
-│   │           └── Semantics/
+│   │       ├── Refinement.lean     # Behavior, Language, Verified, VerificationResult
+│   │       ├── StepResult.lean     # StepResult, Outcome, & bounded ExecSteps
+│   │       ├── MirAst.lean         # Flat BodyId-indexed MIR AST & TCBItem
+│   │       └── MirSemantics.lean   # Small-step MIR semantics & CrateTheorem
 │   ├── audit/                      # CI-only .olean replay & boundary auditor
 │   │   ├── src/                    # anneal-audit Rust binary & manifest checks
-│   │   └── TrustedBoundary.lean    # Two-phase preflight & kernel DAG inspector
-│   └── cargo-anneal/               # CLI orchestrator (cargo anneal)
-└── theory/                         # Stage 3: Untrusted, kernel-checked proofs
-    ├── Framework/                  # Generic simulation & composition lemmas
-    └── Rust/
-        ├── StableAst/              # Version-independent normalized Rust IR
-        ├── StableSemantics/        # Operational semantics for StableAst
-        ├── Passes/                 # Verified lowering (Trusted.Rust -> StableAst)
-        ├── Wp/                     # Weakest-precondition & separation logic
-        └── Tactics/                # Proof automation & decision procedures
+│   │   └── TrustedBoundary.lean    # Syntax allowlist & kernel DAG inspector
+│   └── cargo-anneal/               # CLI orchestrator (cargo anneal) & integration runner
+├── theory/                         # Stage 3: Untrusted, kernel-checked proofs
+│   ├── Anneal.lean                 # Root theory module import
+│   └── Anneal/
+│       ├── Refinement.lean         # Simulation & Obligation composition lemmas
+│       ├── StepResult.lean         # Fuel monotonicity & step composition lemmas
+│       ├── Lowering.lean           # In-place lowerBody & lowerBody_simulates
+│       └── MirLemmas.lean          # Compositional checker & symbolic execution
+└── tests/                          # End-to-end declarative .rs verification fixtures
+    └── fixtures/
 ```
-
-### Separating `Framework/` from `Rust/`
-
-Both `trusted/lean/Trusted/` and `theory/` separate `Framework/` from `Rust/`:
-
-- **`Trusted/Framework/`** defines language-independent verification concepts:
-  labeled transition systems with explicit fault (`UB`) states, the refinement
-  relations (`Abstracts` for verification lowering and `Compiles` for
-  compilation lowering), and the top-level `VerificationResult` record that
-  tracks trusted definitions and assumptions.
-- **`Trusted/Rust/`** instantiates `Trusted/Framework/` for Rust MIR. Keeping
-  `Trusted/Framework/` free of Rust-specific syntax makes the core refinement
-  algebra small enough to audit on a single page and reusable across multiple
-  languages or lower-level intermediate representations (such as assembly or
-  LLVM IR).
 
 ## Compiler integration and extraction lifecycle
 
 Because Anneal's correctness promise applies to the Rust crate as compiled by
-`rustc`, `trusted/rustc-capture/` must extract MIR at the right point in the
-compiler pipeline and reject any crate that `rustc` itself would reject.
+`rustc`, `trusted/rustc-capture/` hooks directly into `rustc`'s query and
+codegen pipeline so that captured MIR reflects the exact semantics `rustc`
+compiles.
 
-### Why Anneal captures `Runtime(PostCleanup)` MIR
+### Why Anneal captures `Runtime(PostCleanup)` MIR with `-Z mir-preserve-ub`
 
-`rustc` lowers source code through several internal stages: Abstract Syntax
-Tree (AST) $\rightarrow$ High-level IR (HIR) $\rightarrow$ Thir $\rightarrow$
-built MIR $\rightarrow$ borrow-checked `Analysis` MIR $\rightarrow$
-`Runtime(PostCleanup)` MIR $\rightarrow$ monomorphization and LLVM/Cranelift
-code generation.
-
-Anneal extracts **`Runtime(PostCleanup)` MIR**, which is the final MIR dialect
-produced right before code generation:
+`rustc` lowers source code through HIR, THIR, built MIR, borrow-checked
+`Analysis` MIR, and finally **`Runtime(PostCleanup)` MIR** immediately before
+monomorphization and code generation:
 
 - **Explicit drops and control flow:** Implicit destructor calls (`Drop`),
-  unwind edges, and coroutine/async state machines have already been elaborated
-  into explicit basic blocks and terminators. Anneal does not need to re-
-  implement Rust's drop elaboration or borrow-checker rules in `trusted/`.
-- **Preserved Rust types and provenance:** Unlike LLVM IR or machine code,
-  `Runtime(PostCleanup)` MIR still retains full Rust type definitions, ADTs,
-  place projections, and pointer mutability/aliasing metadata required to check
-  Rust-level undefined behavior.
+  unwind edges, and state machines have already been elaborated into explicit
+  basic blocks and terminators, so `trusted/lean/` does not need to re-implement
+  drop elaboration or borrow checking.
+- **Preserved Rust types and projections:** Unlike LLVM IR,
+  `Runtime(PostCleanup)` MIR retains full Rust type definitions, ADTs, place
+  projections, and pointer mutability metadata needed to detect Rust-level
+  undefined behavior.
+- **Preserving UB checks via `-Z mir-preserve-ub`:** In default builds,
+  `rustc`'s `RemovePlaceMention` pass erases `StatementKind::PlaceMention`
+  statements (such as `let _ = *ptr;`) before `Runtime(PostCleanup)`.
+  `rustc-capture` injects `-Z mir-preserve-ub` into the compiler invocation so
+  `PlaceMention` and other UB-bearing checks survive into `Runtime(PostCleanup)`
+  and are checked by `Stmt.placeMention` in `Trusted/MirSemantics.lean`.
 
-### Build-graph and compiler-flag fidelity
+### Intercepting MIR before `Steal<Body>` consumption
 
-A Rust crate's semantics depend on the exact compiler flags passed by Cargo:
-`--cfg` predicates, enabled Cargo features, `--target` triple and data layout,
-edition settings, and resolved dependency crate hashes.
+During compilation, `rustc` stores intermediate MIR in `Steal<Body>` cells that
+are consumed ("stolen") when transitioning from analysis to runtime MIR passes.
+In `trusted/rustc-capture/src/hook.rs`, `rustc-capture` overrides the
+`mir_drops_elaborated_and_const_checked` query provider—whose final step
+(`run_analysis_to_runtime_passes`) produces `MirPhase::Runtime(RuntimePhase::PostCleanup)`
+before `DeadBlocks` runs—to clone each local body (preserving its full
+`Body::required_consts` list) into thread-local storage before downstream
+queries (`mir_for_ctfe`, `optimized_mir`) steal the `Steal<Body>` cell, and
+reads that `Runtime(PostCleanup)` snapshot inside `after_analysis`.
 
-Rather than parsing `.rs` files standalone, `cargo anneal` drives extraction
-through Cargo (setting `RUSTC_WORKSPACE_WRAPPER`) so that `rustc-capture`
-receives the exact command-line invocation and environment variables that a
-standard `cargo build` or `cargo check` passes to `rustc`.
+### Dual-configuration debug-assertion consistency (`CONFIGS`)
 
-### Guarding against post-monomorphization and late compiler errors
+Code that is only safe when `debug_assert!` is active is unsound in release
+builds. Conversely, ordinary Rust arithmetic (`+`, `-`, `*`) emits overflow
+`TerminatorKind::Assert` checks when overflow checks are enabled. To verify
+that functions do not rely on `debug_assert!` without rejecting ordinary checked
+integer arithmetic, `rustc-capture` holds `-C overflow-checks=on` constant
+across both compiler passes (`-C debug-assertions=on -C overflow-checks=on` vs.
+`-C debug-assertions=off -C overflow-checks=on`) and checks that every captured
+function's rendered `Mir.lean` is identical across both passes.
 
-Capturing `Runtime(PostCleanup)` MIR via `rustc_driver` introduces a subtle
-soundness hazard if compilation stops too early. In `rustc`, `Runtime` MIR is
-constructed per generic function *before* monomorphization and final code
-generation complete. However, several classes of fatal Rust compilation errors
-are only detected *after* `Runtime(PostCleanup)` MIR is constructed:
+### Guarding against post-monomorphization errors (PMEs)
 
-- **Post-monomorphization errors (PMEs):** Evaluation failures in `const`
-  blocks or associated constants (`panic!` inside `const { ... }`) that depend
-  on generic type parameters.
-- **Type-size and layout overflows:** Instantiating a generic struct or array
-  whose concrete monomorphized size exceeds `isize::MAX`.
-- **Inline assembly validation errors:** Register constraint mismatches or
-  target-feature errors inside `core::arch::asm!` that are validated during
-  codegen preparation.
+In `rustc`, `Runtime(PostCleanup)` MIR is constructed per generic function
+before monomorphization completes. However, a generic function that passes type
+checking can still fail during monomorphization if it evaluates a failing
+`const { ... }` block, triggers an associated-constant panic, or instantiates a
+type whose concrete size exceeds `isize::MAX`.
 
-If `rustc-capture` extracted the `Runtime(PostCleanup)` MIR and exited
-immediately inside `after_analysis`, it could emit a seemingly valid `Mir.lean`
-for a crate that `rustc` actually refuses to compile. To close this gap,
-`rustc-capture` requires the compiler session to complete late validation
-passes (including monomorphization/collector checks where applicable) and
-queries `tcx.dcx().has_errors()` before finalizing capture. If `rustc` reports
-any compilation error at any stage, capture fails closed and emits no
-verification artifact.
+Because Stage 1 fails closed on alignment- and offset-dependent generic
+operations (`NullOp::AlignOf`, `NullOp::OffsetOf`, and raw-pointer alignment
+checks) and admits only `size_of::<T>()` layout queries (`NullOp::SizeOf`) over
+generic type parameters, a monomorphization's layout environment in the current
+`candidate:mir_semantics` fragment is fully determined by its type-parameter
+size assignment `s.tySizes`. Anneal closes the post-monomorphization gap over
+this fragment with a two-part defense across Stage 1 and Stage 2:
 
-### Deterministic inline specification capture
+1. **Pre-pruning `required_consts` capture and `MonoAdmitted` (`ConstSucceeds`):**
+   Even a dead branch such as `if false { const { panic!() } }` can trigger a
+   post-monomorphization error in `rustc` before dead-block pruning runs.
+   Stage 1 captures `Body::required_consts` from the
+   `mir_drops_elaborated_and_const_checked` snapshot before `DeadBlocks`
+   executes, and `Trusted/MirSemantics.lean` requires `MonoAdmitted` in
+   `initMirState`: for the state's active `s.tySizes`, every transitive
+   required constant (`RequiresConst`) must evaluate to a normal return value
+   (`ConstSucceeds`, never `.terminated .unwind` or `.failed`). If a required
+   constant panics for a given `s.tySizes`, `MonoAdmitted` excludes that
+   monomorphization just as `rustc` rejects it at compile time; if a required
+   constant panics for *every* `s.tySizes`, `initMirState` is empty everywhere
+   and `NonVacuousOn` rejects the function fail-closed.
+2. **All-instantiation constant totality (`ConstsTotal`):** To ensure no
+   required constant ever exhibits undefined behavior, diverges, or hits a
+   model limit on any monomorphization (including monomorphizations where a
+   constant panics cleanly), `initMirState` also requires `ConstsTotal`: for
+   every valid monomorphized type-size assignment (`ValidTySizes`, where each
+   type parameter size is at most `isize::MAX`), every transitive required
+   constant must evaluate cleanly to either a normal return (`ConstSucceeds`)
+   or a clean compile-time panic (`ConstUnwinds`), never `.failed`.
 
-Users write specifications and proof guidance directly in Rust source code
-using Anneal attributes (for example, attaching preconditions, postconditions,
-or loop/type invariants to items). During compilation, `rustc-capture` resolves
-those attributes inside the compiler's own name-resolution and typechecking
-context—ensuring that identifiers and types in specifications refer to the
-exact same `DefId`s as the function body—and serializes them in a canonical,
-deterministic order into `Mir.lean` and `Proof.lean`.
+## Toolchain pinning and compiler upgrades
 
-## Multi-version toolchain and evolution policy
+`rustc`'s internal `rustc_private` APIs change across compiler releases. Anneal
+pins a single deterministic `rustc` and `lean` toolchain in `flake.nix` and
+`flake.lock` (authenticated via `trusted/root-manifest.sha256`,
+`trusted/lean/foundation-lock.json`, and
+`trusted/cargo-anneal/src/toolchain-lock.sha256`) and absorbs toolchain
+upgrades across the three stages according to what changed:
 
-`rustc`'s internal `rustc_private` APIs carry no stability guarantees: internal
-enum variants, query names, and MIR desugarings change regularly from one
-compiler release to the next. Anneal is designed to support multiple `rustc`
-versions concurrently while keeping both the TCB (`trusted/lean/`) and
-downstream verification (`theory/` and user specifications) stable.
-
-### Three independent version axes
-
-Every `CaptureManifest` emitted by `rustc-capture` records three distinct
-version identifiers rather than conflating them into a single version number:
-
-| Axis | Field in `CaptureManifest` | What it governs | When it changes |
-| :--- | :--- | :--- | :--- |
-| **1. Artifact schema** | `schema_version` | Syntactic wire/file layout of emitted `.lean` capture files and `CaptureManifest`. | Only when Anneal changes the serialization format between `rustc-capture` and `trusted/lean/`. |
-| **2. Compiler toolchain** | `rustc_version` (and commit hash) | Which `rustc-capture-v1_<minor>` backend produced the capture and which `rustc` release was run. | Every supported `rustc` release. |
-| **3. Semantic profile** | `SemProfile` (`CaptureProfile`) | Feature switches in `Trusted/Rust/Semantics/` (such as pointer aliasing model, target layout rules, or version-specific intrinsic semantics). | Only when Rust's runtime behavior or MIR execution semantics genuinely differ across versions or configurations. |
-
-### How compiler upgrades are absorbed across the three stages
-
-Separating these three axes allows Anneal to handle `rustc` upgrades at the
-cheapest possible layer:
-
-1. **Internal `rustc` API refactoring (absorbed in Stage 1):** Most changes
-   between `rustc 1.X` and `rustc 1.Y` are internal compiler refactorings (such
-   as renaming a `TyCtxt` query or restructuring an internal arena) that do not
-   change the meaning or shape of emitted MIR. These changes are isolated inside
-   a new `trusted/rustc-capture/crates/rustc-capture-v1_Y/` crate, which still
-   emits the exact same Stage 2 `Trusted/Rust/Ast/` structures. Neither
-   `trusted/lean/` nor `theory/` changes at all.
-2. **New MIR syntactic forms or desugarings (absorbed in Stage 2 $\rightarrow$
-   Stage 3 lowering):** Sometimes a new `rustc` version introduces a new
-   `Rvalue` or `StatementKind` variant, or changes how a surface Rust construct
-   desugars into MIR. When that happens:
-   - `Trusted/Rust/Ast/` and `Trusted/Rust/Semantics/` receive a minimal,
-     additive constructor and step rule for the new MIR construct (preserving
-     all existing constructors for older captures).
-   - `Theory/Rust/Passes/` updates its lowering pass to translate the new
-     `Trusted/Rust/Ast/` constructor into the existing normalized
-     `Theory/Rust/StableAst/` representation, updating the `Abstracts`
-     simulation proof.
-3. **Downstream proof stability:** Because `Theory/Rust/StableAst/`,
-   `Theory/Rust/Wp/`, `Theory/Rust/Tactics/`, and user Rust annotations sit
-   downstream of `Theory/Rust/Passes/`, absorbing MIR churn in the lowering
-   pass keeps existing crate specifications and automated proofs working across
-   compiler upgrades without manual rewrites.
+1. **Internal `rustc_private` API changes (absorbed in Stage 1):** Compiler
+   refactorings that rename internal queries or types without changing emitted
+   MIR are handled entirely inside `trusted/rustc-capture/`, leaving
+   `trusted/lean/` and `theory/` untouched.
+2. **Minor MIR shape variations (absorbed in Stage 3 `lowerBody`):** Changes in
+   how `rustc` emits `nop` statements or splits straight-line basic blocks are
+   normalized away in place by `theory/Anneal/Lowering.lean` (`lowerBody` and
+   `lowerBody_simulates`), keeping downstream verification lemmas stable without
+   expanding `trusted/lean/`.
+3. **New MIR constructs (staged in Stage 2 via `candidate:<feature>`):** When
+   Anneal adds support for a new MIR construct, `Trusted/MirAst.lean` and
+   `Trusted/MirSemantics.lean` receive an additive constructor and step rule
+   under a `-- anneal-trust-tier: candidate:<feature>` directive until human
+   auditing against the pinned Rust Reference and `rustc` source completes.
