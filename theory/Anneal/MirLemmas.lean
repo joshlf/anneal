@@ -4233,37 +4233,51 @@ structure ProofError where
   message : String
   scope : String
 
-/-- Discharge either `fn.specs = []` or `fn.specs = [.ensuresEqArg 1]` for an
-identity-like intra-procedural body `target`. -/
-def dispatchIdLikeSpecs {bodies : List BodyDecl} (fn : CapturedFn)
+/-- Check that `specs` is either `[]` or `[.ensuresEqArg 1]` for an
+identity-like intra-procedural function. -/
+def checkIdLikeSpecs (specs : List PostSpec) (fnName : String)
+    (errMsg : String) : Option ProofError :=
+  if listBeq beqPostSpec specs [] then
+    none
+  else if listBeq beqPostSpec specs [.ensuresEqArg 1] then
+    none
+  else
+    some ⟨errMsg, fnName⟩
+
+theorem proveIdLikeSpecs_of_check {bodies : List BodyDecl} (fn : CapturedFn)
     (target : MirBody)
     (hres : lowerBody (fn.resolveBody bodies) = target)
     (hcalls : target.blocks.all (fun bb => !isCall1 bb.terminator) = true)
     (hver : FnVerifiedAndRetInv [] bodies defaultAdtInv fn)
     (h_exec : ∀ s, initMirState [] bodies target s →
       ExecNormal [] bodies target s (fun r => s.locals 1 = some r.value))
-    (errMsg : String) :
-    Except ProofError
-      (PLift
-        (FnVerifiedAndRetInv [] bodies defaultAdtInv fn ∧
-         UserSpecsHold [] bodies defaultAdtInv fn)) :=
-  if hs0 : listBeq beqPostSpec fn.specs [] = true then
-    .ok (.up ⟨hver, userSpecsHold_nil (listEq_of_beq eq_of_beqPostSpec hs0)⟩)
-  else if hs1 : listBeq beqPostSpec fn.specs [.ensuresEqArg 1] = true then
-    .ok (.up ⟨hver,
-      userSpecs_ensuresEqArg1_of_lowerBody fn target hres hcalls hver
-        (listEq_of_beq eq_of_beqPostSpec hs1) h_exec⟩)
-  else
-    .error ⟨errMsg, fn.name⟩
+    {errMsg : String}
+    (h : checkIdLikeSpecs fn.specs fn.name errMsg = none) :
+    FnVerifiedAndRetInv [] bodies defaultAdtInv fn ∧
+    UserSpecsHold [] bodies defaultAdtInv fn := by
+  unfold checkIdLikeSpecs at h
+  cases hs0 : listBeq beqPostSpec fn.specs [] with
+  | true =>
+    exact ⟨hver, userSpecsHold_nil (listEq_of_beq eq_of_beqPostSpec hs0)⟩
+  | false =>
+    simp [hs0] at h
+    cases hs1 : listBeq beqPostSpec fn.specs [.ensuresEqArg 1] with
+    | true =>
+      exact ⟨hver,
+        userSpecs_ensuresEqArg1_of_lowerBody fn target hres hcalls hver
+          (listEq_of_beq eq_of_beqPostSpec hs1) h_exec⟩
+    | false =>
+      simp [hs1] at h
 
-theorem fnObligations_verified {c : Crate} {fn : CapturedFn}
-    (h_nodup_tcb : NoDupIds c.tcb)
-    (h_allowed_tcb : AllHold (c.tcb.map defaultTrustPolicy.isAllowed))
-    (h_mem_tcb : TCBItem.rustcLowering fn.name fn.bodyId ∈ c.tcb)
-    (h_ver : FnVerifiedAndRetInv c.adts c.bodies c.adtInv fn)
-    (h_specs : UserSpecsHold c.adts c.bodies c.adtInv fn) :
-    VerificationResult defaultTrustPolicy c.tcb
-      (fn.obligations c.adts c.bodies c.adtInv) :=
+theorem fnObligations_verified {adts : List AdtDecl} {bodies : List BodyDecl}
+    {adtInv : AdtInv} {tcb : List TCBItem} {fn : CapturedFn}
+    (h_nodup_tcb : NoDupIds tcb)
+    (h_allowed_tcb : AllHold (tcb.map defaultTrustPolicy.isAllowed))
+    (h_mem_tcb : TCBItem.rustcLowering fn.name fn.bodyId ∈ tcb)
+    (h_ver : FnVerifiedAndRetInv adts bodies adtInv fn)
+    (h_specs : UserSpecsHold adts bodies adtInv fn) :
+    VerificationResult defaultTrustPolicy tcb
+      (fn.obligations adts bodies adtInv) :=
   ⟨(by intro h; cases h),
    ⟨⟨tcbItem_rustcLowering_ne_fnVerified, True.intro⟩, True.intro, True.intro⟩,
    h_nodup_tcb,
@@ -4287,258 +4301,430 @@ def firstRequiredConstId (b : MirBody) : BodyId :=
   | (constId, _) :: _ => constId
   | _ => ⟨0⟩
 
-/-- Per-function proof dispatcher for crates without ADTs (`adts = []`).
+/-- Pure per-function checker for crates without ADTs (`adts = []`).
 Normalizes intra-procedural bodies with `lowerBody` before matching so that
 functions containing `Stmt.nop` or forwarding `goto` chains reduce to the
-same canonical verification theorems. -/
-def proveFnNoAdtOpt (bodies : List BodyDecl) (fn : CapturedFn) :
-    Except ProofError
-      (PLift
-        (FnVerifiedAndRetInv [] bodies defaultAdtInv fn ∧
-         UserSpecsHold [] bodies defaultAdtInv fn)) :=
+same canonical verification checks without embedding proof terms into kernel
+WHNF evaluation. -/
+def checkFnNoAdt (bodies : List BodyDecl) (fn : CapturedFn) :
+    Option ProofError :=
   let b := fn.resolveBody bodies
   let lb := lowerBody b
-  if hreq : optBeq beqRequiresSpec fn.requires none = true then
-    have hreqEq : fn.requires = none := optEq_of_beq eq_of_beqRequiresSpec hreq
-    if hb : beqMirBody lb idCopyBody = true then
-      have hres : lowerBody (fn.resolveBody bodies) = idCopyBody :=
-        eq_of_beqMirBody hb
-      dispatchIdLikeSpecs fn idCopyBody hres rfl
-        (idCopyBody_verified_of_resolve fn hres hreqEq)
-        (fun s hinit => (idCopyBody_execNormal s hinit).map (fun _ h => h.1))
-        "unsupported specs on id (copy)"
-    else if hb : beqMirBody lb idMoveBody = true then
-      have hres : lowerBody (fn.resolveBody bodies) = idMoveBody :=
-        eq_of_beqMirBody hb
-      dispatchIdLikeSpecs fn idMoveBody hres rfl
-        (idMoveBody_verified_of_resolve fn hres hreqEq)
-        (fun s hinit => (idMoveBody_execNormal s hinit).map (fun _ h => h.1))
-        "unsupported specs on id (move)"
-    else if hb : beqMirBody lb allocPassthroughBody = true then
-      have hres : lowerBody (fn.resolveBody bodies) = allocPassthroughBody :=
-        eq_of_beqMirBody hb
-      dispatchIdLikeSpecs fn allocPassthroughBody hres rfl
-        (allocPassthroughBody_verified_of_resolve fn hres hreqEq)
-        (fun s hinit =>
-          (allocPassthroughBody_execNormal s hinit).map (fun _ h => h.1))
-        "unsupported specs on alloc_passthrough"
+  if optBeq beqRequiresSpec fn.requires none then
+    if beqMirBody lb idCopyBody then
+      checkIdLikeSpecs fn.specs fn.name "unsupported specs on id (copy)"
+    else if beqMirBody lb idMoveBody then
+      checkIdLikeSpecs fn.specs fn.name "unsupported specs on id (move)"
+    else if beqMirBody lb allocPassthroughBody then
+      checkIdLikeSpecs fn.specs fn.name "unsupported specs on alloc_passthrough"
     else
       let constId := firstRequiredConstId lb
-      if hb : beqMirBody lb (inlineConstTransmuteBody constId) = true then
-        have hres :
-            lowerBody (fn.resolveBody bodies) =
-              inlineConstTransmuteBody constId :=
-          eq_of_beqMirBody hb
-        if hconst :
-            optBeq beqMirBody (findBody bodies constId)
-              (some (sizeEqConstBodyAt .usize .usize)) = true then
-          if hs0 : listBeq beqPostSpec fn.specs [] = true then
-            .ok (.up ⟨inlineConstTransmute_verified_of_resolve fn hres hreqEq
-                (optEq_of_beq eq_of_beqMirBody hconst),
-              userSpecsHold_nil (listEq_of_beq eq_of_beqPostSpec hs0)⟩)
+      if beqMirBody lb (inlineConstTransmuteBody constId) then
+        if optBeq beqMirBody (findBody bodies constId)
+            (some (sizeEqConstBodyAt .usize .usize)) then
+          if listBeq beqPostSpec fn.specs [] then
+            none
           else
-            .error ⟨"unsupported specs on inline_const_transmute", fn.name⟩
+            some ⟨"unsupported specs on inline_const_transmute", fn.name⟩
         else
-          .error ⟨"unproved required const", fn.name⟩
+          some ⟨"unproved required const", fn.name⟩
       else
         let calleeId := firstCalleeId b
-        if hb : beqMirBody b (concreteTransmuteCallerBody calleeId .usize) = true then
-          have hres :
-              fn.resolveBody bodies =
-                concreteTransmuteCallerBody calleeId .usize :=
-            eq_of_beqMirBody hb
-          match hcalleeOpt : findBody bodies calleeId with
-          | none => .error ⟨"missing callee body", fn.name⟩
+        if beqMirBody b (concreteTransmuteCallerBody calleeId .usize) then
+          match findBody bodies calleeId with
+          | none => some ⟨"missing callee body", fn.name⟩
           | some calleeBody =>
             let cId := firstRequiredConstId calleeBody
-            if hcallee :
-                beqMirBody calleeBody (transmuteCheckedBody cId) = true then
-              if hconst :
-                  optBeq beqMirBody (findBody bodies cId)
-                    (some sizeEqConstBody) = true then
-                if hs0 : listBeq beqPostSpec fn.specs [] = true then
-                  have hcalleeEq :
-                      findBody bodies calleeId =
-                        some (transmuteCheckedBody cId) := by
-                    rw [hcalleeOpt, eq_of_beqMirBody hcallee]
-                  .ok (.up ⟨concreteTransmuteCaller_verified_of_resolve fn
-                      hres hreqEq hcalleeEq
-                      (optEq_of_beq eq_of_beqMirBody hconst),
-                    userSpecsHold_nil (listEq_of_beq eq_of_beqPostSpec hs0)⟩)
+            if beqMirBody calleeBody (transmuteCheckedBody cId) then
+              if optBeq beqMirBody (findBody bodies cId)
+                  (some sizeEqConstBody) then
+                if listBeq beqPostSpec fn.specs [] then
+                  none
                 else
-                  .error ⟨"unsupported specs on concrete transmute caller", fn.name⟩
+                  some ⟨"unsupported specs on concrete transmute caller",
+                    fn.name⟩
               else
-                .error ⟨"unproved required const on callee", fn.name⟩
+                some ⟨"unproved required const on callee", fn.name⟩
             else
-              .error ⟨"unproved callee body", fn.name⟩
+              some ⟨"unproved callee body", fn.name⟩
+        else if !(b.argTys.all (MirTy.wfInAdts []) &&
+            b.retTy.wfInAdts []) then
+          some ⟨"unsupported type in function signature", fn.name⟩
         else
-          .error ⟨"unproved function body", fn.name⟩
+          some ⟨"unproved function body", fn.name⟩
   else
-    .error ⟨"unexpected requires clause", fn.name⟩
+    some ⟨"unexpected requires clause", fn.name⟩
 
-/-- Per-function proof dispatcher for crates with `[nonZeroAdtDecl 0]`. -/
-def proveFnNonZeroOpt (bodies : List BodyDecl) (fn : CapturedFn) :
-    Except ProofError
-      (PLift
-        (FnVerifiedAndRetInv [nonZeroAdtDecl 0] bodies nonZeroAdtInv fn ∧
-         UserSpecsHold [nonZeroAdtDecl 0] bodies nonZeroAdtInv fn)) :=
+theorem proveFnNoAdt_of_check {bodies : List BodyDecl} {fn : CapturedFn}
+    (h : checkFnNoAdt bodies fn = none) :
+    FnVerifiedAndRetInv [] bodies defaultAdtInv fn ∧
+    UserSpecsHold [] bodies defaultAdtInv fn := by
+  unfold checkFnNoAdt at h
+  dsimp at h
+  cases hreq : optBeq beqRequiresSpec fn.requires none with
+  | false => simp [hreq] at h
+  | true =>
+    have hreqEq : fn.requires = none := optEq_of_beq eq_of_beqRequiresSpec hreq
+    simp [hreq] at h
+    cases hb1 : beqMirBody (lowerBody (fn.resolveBody bodies)) idCopyBody with
+    | true =>
+      have hres : lowerBody (fn.resolveBody bodies) = idCopyBody :=
+        eq_of_beqMirBody hb1
+      simp [hb1] at h
+      exact proveIdLikeSpecs_of_check fn idCopyBody hres rfl
+        (idCopyBody_verified_of_resolve fn hres hreqEq)
+        (fun s hinit => (idCopyBody_execNormal s hinit).map (fun _ h => h.1)) h
+    | false =>
+      simp [hb1] at h
+      cases hb2 : beqMirBody (lowerBody (fn.resolveBody bodies)) idMoveBody with
+      | true =>
+        have hres : lowerBody (fn.resolveBody bodies) = idMoveBody :=
+          eq_of_beqMirBody hb2
+        simp [hb2] at h
+        exact proveIdLikeSpecs_of_check fn idMoveBody hres rfl
+          (idMoveBody_verified_of_resolve fn hres hreqEq)
+          (fun s hinit => (idMoveBody_execNormal s hinit).map (fun _ h => h.1)) h
+      | false =>
+        simp [hb2] at h
+        cases hb3 :
+            beqMirBody (lowerBody (fn.resolveBody bodies))
+              allocPassthroughBody with
+        | true =>
+          have hres :
+              lowerBody (fn.resolveBody bodies) = allocPassthroughBody :=
+            eq_of_beqMirBody hb3
+          simp [hb3] at h
+          exact proveIdLikeSpecs_of_check fn allocPassthroughBody hres rfl
+            (allocPassthroughBody_verified_of_resolve fn hres hreqEq)
+            (fun s hinit =>
+              (allocPassthroughBody_execNormal s hinit).map (fun _ h => h.1)) h
+        | false =>
+          simp [hb3] at h
+          cases hb4 :
+              beqMirBody (lowerBody (fn.resolveBody bodies))
+                (inlineConstTransmuteBody
+                  (firstRequiredConstId
+                    (lowerBody (fn.resolveBody bodies)))) with
+          | true =>
+            have hres :
+                lowerBody (fn.resolveBody bodies) =
+                  inlineConstTransmuteBody
+                    (firstRequiredConstId
+                      (lowerBody (fn.resolveBody bodies))) :=
+              eq_of_beqMirBody hb4
+            simp [hb4] at h
+            cases hconst :
+                optBeq beqMirBody
+                  (findBody bodies
+                    (firstRequiredConstId
+                      (lowerBody (fn.resolveBody bodies))))
+                  (some (sizeEqConstBodyAt .usize .usize)) with
+            | false => simp [hconst] at h
+            | true =>
+              simp [hconst] at h
+              cases hs0 : listBeq beqPostSpec fn.specs [] with
+              | false => simp [hs0] at h
+              | true =>
+                exact ⟨inlineConstTransmute_verified_of_resolve fn hres hreqEq
+                    (optEq_of_beq eq_of_beqMirBody hconst),
+                  userSpecsHold_nil (listEq_of_beq eq_of_beqPostSpec hs0)⟩
+          | false =>
+            simp [hb4] at h
+            cases hb5 :
+                beqMirBody (fn.resolveBody bodies)
+                  (concreteTransmuteCallerBody
+                    (firstCalleeId (fn.resolveBody bodies)) .usize) with
+            | true =>
+              have hres :
+                  fn.resolveBody bodies =
+                    concreteTransmuteCallerBody
+                      (firstCalleeId (fn.resolveBody bodies)) .usize :=
+                eq_of_beqMirBody hb5
+              simp [hb5] at h
+              cases hcalleeOpt :
+                  findBody bodies (firstCalleeId (fn.resolveBody bodies)) with
+              | none => simp [hcalleeOpt] at h
+              | some calleeBody =>
+                simp [hcalleeOpt] at h
+                cases hcallee :
+                    beqMirBody calleeBody
+                      (transmuteCheckedBody
+                        (firstRequiredConstId calleeBody)) with
+                | false => simp [hcallee] at h
+                | true =>
+                  simp [hcallee] at h
+                  cases hconst :
+                      optBeq beqMirBody
+                        (findBody bodies (firstRequiredConstId calleeBody))
+                        (some sizeEqConstBody) with
+                  | false => simp [hconst] at h
+                  | true =>
+                    simp [hconst] at h
+                    cases hs0 : listBeq beqPostSpec fn.specs [] with
+                    | false => simp [hs0] at h
+                    | true =>
+                      have hcalleeEq :
+                          findBody bodies
+                            (firstCalleeId (fn.resolveBody bodies)) =
+                            some (transmuteCheckedBody
+                              (firstRequiredConstId calleeBody)) :=
+                        hcalleeOpt.trans
+                          (congrArg some (eq_of_beqMirBody hcallee))
+                      exact ⟨concreteTransmuteCaller_verified_of_resolve fn
+                          hres hreqEq hcalleeEq
+                          (optEq_of_beq eq_of_beqMirBody hconst),
+                        userSpecsHold_nil (listEq_of_beq eq_of_beqPostSpec hs0)⟩
+            | false =>
+              simp [hb5] at h
+              cases hwf :
+                  ((fn.resolveBody bodies).argTys.all (MirTy.wfInAdts []) &&
+                   (fn.resolveBody bodies).retTy.wfInAdts []) <;>
+                simp [hwf] at h
+
+/-- Pure per-function checker for crates with `[nonZeroAdtDecl 0]`. -/
+def checkFnNonZero (bodies : List BodyDecl) (fn : CapturedFn) :
+    Option ProofError :=
   let lb := lowerBody (fn.resolveBody bodies)
-  if hs0 : listBeq beqPostSpec fn.specs [] = true then
+  if listBeq beqPostSpec fn.specs [] then
+    if optBeq beqRequiresSpec fn.requires none then
+      if beqMirBody lb makeNonZeroBody then
+        none
+      else if beqMirBody lb (getUncheckedNonZeroBodyAt 0 false) then
+        none
+      else if beqMirBody lb (getUncheckedNonZeroBodyAt 0 true) then
+        none
+      else
+        some ⟨"unproved safe NonZeroUsize function", fn.name⟩
+    else if optBeq beqRequiresSpec fn.requires newUncheckedRequires then
+      if beqMirBody lb newUncheckedBody then
+        none
+      else
+        some ⟨"unproved unsafe NonZeroUsize function", fn.name⟩
+    else
+      some ⟨"unsupported requires clause", fn.name⟩
+  else
+    some ⟨"unsupported specs on NonZeroUsize function", fn.name⟩
+
+theorem proveFnNonZero_of_check {bodies : List BodyDecl} {fn : CapturedFn}
+    (h : checkFnNonZero bodies fn = none) :
+    FnVerifiedAndRetInv [nonZeroAdtDecl 0] bodies nonZeroAdtInv fn ∧
+    UserSpecsHold [nonZeroAdtDecl 0] bodies nonZeroAdtInv fn := by
+  unfold checkFnNonZero at h
+  dsimp at h
+  cases hs0 : listBeq beqPostSpec fn.specs [] with
+  | false => simp [hs0] at h
+  | true =>
     have hspecs :
         UserSpecsHold [nonZeroAdtDecl 0] bodies nonZeroAdtInv fn :=
       userSpecsHold_nil (listEq_of_beq eq_of_beqPostSpec hs0)
-    if hreq : optBeq beqRequiresSpec fn.requires none = true then
+    simp [hs0] at h
+    cases hreq : optBeq beqRequiresSpec fn.requires none with
+    | true =>
       have hreqEq : fn.requires = none :=
         optEq_of_beq eq_of_beqRequiresSpec hreq
-      if hb : beqMirBody lb makeNonZeroBody = true then
-        .ok (.up ⟨makeNonZeroBody_verified_of_resolve fn
-            (eq_of_beqMirBody hb) hreqEq,
-          hspecs⟩)
-      else if hb : beqMirBody lb (getUncheckedNonZeroBodyAt 0 false) = true then
-        .ok (.up ⟨getUncheckedNonZeroBody_verified_of_resolve false fn
-            (eq_of_beqMirBody hb) hreqEq,
-          hspecs⟩)
-      else if hb : beqMirBody lb (getUncheckedNonZeroBodyAt 0 true) = true then
-        .ok (.up ⟨getUncheckedNonZeroBody_verified_of_resolve true fn
-            (eq_of_beqMirBody hb) hreqEq,
-          hspecs⟩)
-      else
-        .error ⟨"unproved safe NonZeroUsize function", fn.name⟩
-    else if hreq :
-        optBeq beqRequiresSpec fn.requires newUncheckedRequires = true then
-      have hreqEq : fn.requires = newUncheckedRequires :=
-        optEq_of_beq eq_of_beqRequiresSpec hreq
-      if hb : beqMirBody lb newUncheckedBody = true then
-        .ok (.up ⟨newUncheckedBody_verified_of_resolve fn
-            (eq_of_beqMirBody hb) hreqEq,
-          hspecs⟩)
-      else
-        .error ⟨"unproved unsafe NonZeroUsize function", fn.name⟩
-    else
-      .error ⟨"unsupported requires clause", fn.name⟩
-  else
-    .error ⟨"unsupported specs on NonZeroUsize function", fn.name⟩
+      simp [hreq] at h
+      cases hb1 :
+          beqMirBody (lowerBody (fn.resolveBody bodies)) makeNonZeroBody with
+      | true =>
+        exact ⟨makeNonZeroBody_verified_of_resolve fn
+            (eq_of_beqMirBody hb1) hreqEq,
+          hspecs⟩
+      | false =>
+        simp [hb1] at h
+        cases hb2 :
+            beqMirBody (lowerBody (fn.resolveBody bodies))
+              (getUncheckedNonZeroBodyAt 0 false) with
+        | true =>
+          exact ⟨getUncheckedNonZeroBody_verified_of_resolve false fn
+              (eq_of_beqMirBody hb2) hreqEq,
+            hspecs⟩
+        | false =>
+          simp [hb2] at h
+          cases hb3 :
+              beqMirBody (lowerBody (fn.resolveBody bodies))
+                (getUncheckedNonZeroBodyAt 0 true) with
+          | true =>
+            exact ⟨getUncheckedNonZeroBody_verified_of_resolve true fn
+                (eq_of_beqMirBody hb3) hreqEq,
+              hspecs⟩
+          | false => simp [hb3] at h
+    | false =>
+      simp [hreq] at h
+      cases hreq2 :
+          optBeq beqRequiresSpec fn.requires newUncheckedRequires with
+      | false => simp [hreq2] at h
+      | true =>
+        have hreqEq : fn.requires = newUncheckedRequires :=
+          optEq_of_beq eq_of_beqRequiresSpec hreq2
+        simp [hreq2] at h
+        cases hb1 :
+            beqMirBody (lowerBody (fn.resolveBody bodies)) newUncheckedBody with
+        | true =>
+          exact ⟨newUncheckedBody_verified_of_resolve fn
+              (eq_of_beqMirBody hb1) hreqEq,
+            hspecs⟩
+        | false => simp [hb1] at h
 
-/-- Compositionally discharge `AllHold` of `VerificationResult` across any list
-of `CapturedFn`s using a per-function prover `proveFn`. -/
-def proveFnsLoop (c : Crate)
-    (h_nodup_tcb : NoDupIds c.tcb)
-    (h_allowed_tcb : AllHold (c.tcb.map defaultTrustPolicy.isAllowed))
-    (proveFn :
-      ∀ (fn : CapturedFn),
-        Except ProofError
-          (PLift
-            (FnVerifiedAndRetInv c.adts c.bodies c.adtInv fn ∧
-             UserSpecsHold c.adts c.bodies c.adtInv fn))) :
-    ∀ (fns : List CapturedFn),
-      Except ProofError
-        (PLift
-          (AllHold (fns.map (fun fn =>
-            VerificationResult defaultTrustPolicy c.tcb
-              (fn.obligations c.adts c.bodies c.adtInv)))))
-  | [] => .ok (.up True.intro)
+/-- Pure function-list checker iterating `checkFn` across `fns`. -/
+def checkFnsLoop (tcb : List TCBItem)
+    (checkFn : CapturedFn → Option ProofError) :
+    List CapturedFn → Option ProofError
+  | [] => none
   | fn :: rest =>
-    if hmem : checkMemTCB (TCBItem.rustcLowering fn.name fn.bodyId) c.tcb = true then
-      match proveFn fn with
-      | .error err => .error err
-      | .ok pFn =>
-        match proveFnsLoop c h_nodup_tcb h_allowed_tcb proveFn rest with
-        | .error err => .error err
-        | .ok pRest =>
-          .ok (.up
-            ⟨fnObligations_verified h_nodup_tcb h_allowed_tcb
-              (mem_of_checkMemTCB hmem) pFn.down.1 pFn.down.2,
-             pRest.down⟩)
+    if checkMemTCB (TCBItem.rustcLowering fn.name fn.bodyId) tcb then
+      match checkFn fn with
+      | some err => some err
+      | none => checkFnsLoop tcb checkFn rest
     else
-      .error ⟨"missing TCBItem.rustcLowering waiver", fn.name⟩
+      some ⟨"missing TCBItem.rustcLowering waiver", fn.name⟩
 
-/-- Compositional Lean proof dispatcher: validates crate-level structural
-invariants (`c.functions ≠ []`, `NoDupIds` on bodies, functions, and TCB items,
-`AdmissibleAdtInv`, and `defaultTrustPolicy`) and then verifies each function
-in `c.functions` independently via `proveFnsLoop`. -/
-def proveCrateOpt (c : Crate) :
-    Except ProofError (PLift (CrateTheorem c)) :=
-  if hne : decide (c.functions = []) = false then
-    if hbnodup :
-        checkNoDupIds (fun a b => decide (a = b))
-          (c.bodies.map (fun d => d.id.index)) = true then
-      if hfnodup :
-          checkNoDupIds (fun a b => decide (a = b))
-            (c.functions.map CapturedFn.name) = true then
-        if htnodup : checkNoDupIds beqTCBItem c.tcb = true then
-          if htallow : checkAllowedTCB c.tcb = true then
-            have h_fns_ne : c.functions ≠ [] := of_decide_eq_false hne
-            have h_bodies_nodup :
-                NoDupIds (c.bodies.map (fun d => d.id.index)) :=
-              noDupIds_of_check (fun h => of_decide_eq_false h) hbnodup
-            have h_fns_nodup : NoDupIds (c.functions.map CapturedFn.name) :=
-              noDupIds_of_check (fun h => of_decide_eq_false h) hfnodup
-            have h_tcb_nodup : NoDupIds c.tcb :=
-              noDupIds_of_check ne_of_beqTCBItem_false htnodup
-            have h_tcb_allow :
-                AllHold (c.tcb.map defaultTrustPolicy.isAllowed) :=
-              allHold_allowed_of_checkAllowedTCB htallow
-            if hadts0 : listBeq beqAdtDecl c.adts [] = true then
-              have hadtsEq : c.adts = [] :=
-                listEq_of_beq eq_of_beqAdtDecl hadts0
-              have hadm : AdmissibleAdtInv c.adts c.adtInv := by
-                unfold Crate.adtInv
-                rw [hadtsEq]
-                exact defaultAdtInv_admissible
-              match proveFnsLoop c h_tcb_nodup h_tcb_allow
-                  (fun fn => by
-                    unfold Crate.adtInv
-                    rw [hadtsEq]
-                    exact proveFnNoAdtOpt c.bodies fn)
-                  c.functions with
-              | .ok pFns =>
-                .ok (.up ⟨h_fns_ne, h_bodies_nodup, h_fns_nodup, hadm, pFns.down⟩)
-              | .error err => .error err
-            else if hadt1 :
-                listBeq beqAdtDecl c.adts [nonZeroAdtDecl 0] = true then
-              have hadtsEq : c.adts = [nonZeroAdtDecl 0] :=
-                listEq_of_beq eq_of_beqAdtDecl hadt1
-              have hadm : AdmissibleAdtInv c.adts c.adtInv := by
-                unfold Crate.adtInv
-                rw [hadtsEq]
-                exact nonZeroAdtInv_admissible
-              match proveFnsLoop c h_tcb_nodup h_tcb_allow
-                  (fun fn => by
-                    unfold Crate.adtInv
-                    rw [hadtsEq]
-                    exact proveFnNonZeroOpt c.bodies fn)
-                  c.functions with
-              | .ok pFns =>
-                .ok (.up ⟨h_fns_ne, h_bodies_nodup, h_fns_nodup, hadm,
-                  pFns.down⟩)
-              | .error err => .error err
+theorem proveFnsLoop_of_check {adts : List AdtDecl} {bodies : List BodyDecl}
+    {adtInv : AdtInv} {tcb : List TCBItem}
+    (h_nodup_tcb : NoDupIds tcb)
+    (h_allowed_tcb : AllHold (tcb.map defaultTrustPolicy.isAllowed))
+    {checkFn : CapturedFn → Option ProofError}
+    (proveFn : ∀ {fn : CapturedFn}, checkFn fn = none →
+      FnVerifiedAndRetInv adts bodies adtInv fn ∧
+      UserSpecsHold adts bodies adtInv fn) :
+    ∀ {fns : List CapturedFn},
+      checkFnsLoop tcb checkFn fns = none →
+      AllHold (fns.map (fun fn =>
+        VerificationResult defaultTrustPolicy tcb
+          (fn.obligations adts bodies adtInv)))
+  | [], _ => True.intro
+  | fn :: rest, h => by
+    unfold checkFnsLoop at h
+    cases hmem : checkMemTCB (TCBItem.rustcLowering fn.name fn.bodyId) tcb with
+    | false => simp [hmem] at h
+    | true =>
+      simp [hmem] at h
+      cases hfn : checkFn fn with
+      | some err => simp [hfn] at h
+      | none =>
+        simp [hfn] at h
+        have pFn := proveFn hfn
+        exact ⟨fnObligations_verified h_nodup_tcb h_allowed_tcb
+          (mem_of_checkMemTCB hmem) pFn.1 pFn.2,
+          proveFnsLoop_of_check h_nodup_tcb h_allowed_tcb proveFn h⟩
+
+/-- Pure crate checker returning `none` iff all crate-level and function-level
+obligations succeed, or `some err` with the first `ProofError`. -/
+def checkCrateOpt (c : Crate) : Option ProofError :=
+  if decide (c.functions = []) = false then
+    if checkNoDupIds (fun a b => decide (a = b))
+        (c.bodies.map (fun d => d.id.index)) then
+      if checkNoDupIds (fun a b => decide (a = b))
+          (c.functions.map CapturedFn.name) then
+        if checkNoDupIds beqTCBItem c.tcb then
+          if checkAllowedTCB c.tcb then
+            if listBeq beqAdtDecl c.adts [] then
+              checkFnsLoop c.tcb (checkFnNoAdt c.bodies) c.functions
+            else if listBeq beqAdtDecl c.adts [nonZeroAdtDecl 0] then
+              checkFnsLoop c.tcb (checkFnNonZero c.bodies) c.functions
+            else if c.adts.any (fun decl =>
+                decl.invariant.isSome && decl.allFieldsPubSafe) then
+              some ⟨"ADT with invariant cannot have all public fields", "crate"⟩
             else
-              .error ⟨"unsupported ADT inventory", "crate"⟩
+              some ⟨"unsupported ADT inventory", "crate"⟩
           else
-            .error ⟨"disallowed fnVerified TCB waiver", "crate"⟩
+            some ⟨"disallowed fnVerified TCB waiver", "crate"⟩
         else
-          .error ⟨"duplicate TCB waiver IDs", "crate"⟩
+          some ⟨"duplicate TCB waiver IDs", "crate"⟩
       else
-        .error ⟨"duplicate function names", "crate"⟩
+        some ⟨"duplicate function names", "crate"⟩
     else
-      .error ⟨"duplicate body IDs", "crate"⟩
+      some ⟨"duplicate body IDs", "crate"⟩
   else
-    .error ⟨"crate defines no public functions", "crate"⟩
+    some ⟨"crate defines no public functions", "crate"⟩
 
-/-- Computable check returning `[]` iff `proveCrateOpt c` succeeds. -/
+/-- Computable check returning `[]` iff `checkCrateOpt c` succeeds. -/
 def checkCrate (c : Crate) : List String :=
-  match proveCrateOpt c with
-  | .ok _ => []
-  | .error err => [err.message, err.scope]
+  match checkCrateOpt c with
+  | none => []
+  | some err => [err.message, err.scope]
 
 /-- Universal crate verification entrypoint: when `checkCrate c = []` holds by
-`rfl`, extracts the kernel-checked `CrateTheorem c` proof from
-`proveCrateOpt c`. -/
+`rfl`, proves `CrateTheorem c` from `checkCrateOpt c = none`. -/
 theorem proveCrate (c : Crate) (h : checkCrate c = []) : CrateTheorem c := by
   unfold checkCrate at h
-  cases hp : proveCrateOpt c with
-  | ok p => exact p.down
-  | error err => simp [hp] at h
+  cases hopt : checkCrateOpt c with
+  | some err => simp [hopt] at h
+  | none =>
+    unfold checkCrateOpt at hopt
+    cases hne : decide (c.functions = []) with
+    | true => simp [hne] at hopt
+    | false =>
+      simp [hne] at hopt
+      cases hbnodup :
+          checkNoDupIds (fun a b => decide (a = b))
+            (c.bodies.map (fun d => d.id.index)) with
+      | false => simp [hbnodup] at hopt
+      | true =>
+        simp [hbnodup] at hopt
+        cases hfnodup :
+            checkNoDupIds (fun a b => decide (a = b))
+              (c.functions.map CapturedFn.name) with
+        | false => simp [hfnodup] at hopt
+        | true =>
+          simp [hfnodup] at hopt
+          cases htnodup : checkNoDupIds beqTCBItem c.tcb with
+          | false => simp [htnodup] at hopt
+          | true =>
+            simp [htnodup] at hopt
+            cases htallow : checkAllowedTCB c.tcb with
+            | false => simp [htallow] at hopt
+            | true =>
+              simp [htallow] at hopt
+              have h_fns_ne : c.functions ≠ [] := of_decide_eq_false hne
+              have h_bodies_nodup :
+                  NoDupIds (c.bodies.map (fun d => d.id.index)) :=
+                noDupIds_of_check (fun h => of_decide_eq_false h) hbnodup
+              have h_fns_nodup : NoDupIds (c.functions.map CapturedFn.name) :=
+                noDupIds_of_check (fun h => of_decide_eq_false h) hfnodup
+              have h_tcb_nodup : NoDupIds c.tcb :=
+                noDupIds_of_check ne_of_beqTCBItem_false htnodup
+              have h_tcb_allow :
+                  AllHold (c.tcb.map defaultTrustPolicy.isAllowed) :=
+                allHold_allowed_of_checkAllowedTCB htallow
+              cases hadts0 : listBeq beqAdtDecl c.adts [] with
+              | true =>
+                simp [hadts0] at hopt
+                have hadtsEq : c.adts = [] :=
+                  listEq_of_beq eq_of_beqAdtDecl hadts0
+                have hadm : AdmissibleAdtInv c.adts c.adtInv := by
+                  unfold Crate.adtInv
+                  rw [hadtsEq]
+                  exact defaultAdtInv_admissible
+                have hFns := proveFnsLoop_of_check h_tcb_nodup h_tcb_allow
+                  proveFnNoAdt_of_check hopt
+                refine ⟨h_fns_ne, h_bodies_nodup, h_fns_nodup, hadm, ?_⟩
+                unfold Crate.adtInv
+                rw [hadtsEq]
+                exact hFns
+              | false =>
+                simp [hadts0] at hopt
+                cases hadt1 :
+                    listBeq beqAdtDecl c.adts [nonZeroAdtDecl 0] with
+                | true =>
+                  simp [hadt1] at hopt
+                  have hadtsEq : c.adts = [nonZeroAdtDecl 0] :=
+                    listEq_of_beq eq_of_beqAdtDecl hadt1
+                  have hadm : AdmissibleAdtInv c.adts c.adtInv := by
+                    unfold Crate.adtInv
+                    rw [hadtsEq]
+                    exact nonZeroAdtInv_admissible
+                  have hFns := proveFnsLoop_of_check h_tcb_nodup h_tcb_allow
+                    proveFnNonZero_of_check hopt
+                  refine ⟨h_fns_ne, h_bodies_nodup, h_fns_nodup, hadm, ?_⟩
+                  unfold Crate.adtInv
+                  rw [hadtsEq]
+                  exact hFns
+                | false =>
+                  simp [hadt1] at hopt
+                  cases hadtPub :
+                      c.adts.any (fun decl =>
+                        decl.invariant.isSome && decl.allFieldsPubSafe) <;>
+                    simp [hadtPub] at hopt
 
 /-! ### Archetype crates and `proveCrate` canaries -/
 

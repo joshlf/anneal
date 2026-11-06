@@ -32,7 +32,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -48,12 +48,17 @@ use walkdir::WalkDir;
 /// Because `Mir.crate` is 100% first-order syntax data (`Trusted.Crate`) and
 /// `Anneal.proveCrate` is a total verified decision procedure proved sound in
 /// `theory/Anneal/MirLemmas.lean`, every crate's kernel-checked proof script is
-/// identical.
+/// identical. Evaluating `Anneal.checkCrate Mir.crate` before `verify_crate`
+/// prints `[]` on passing crates and `["<message>", "<scope>"]` on failing
+/// crates so `cargo-anneal` can report the exact failing item and cause from
+/// the single `lean Proof.lean` invocation.
 pub const PROOF_LEAN_SOURCE: &str = "\
 prelude
 import Trusted
 import Anneal
 import Mir
+
+#eval Anneal.checkCrate Mir.crate
 
 namespace Proof
 
@@ -369,7 +374,79 @@ fn tree_digest(dir: &Path, phase: &str) -> Result<String, String> {
     ))
 }
 
-fn authenticate_toolchain(root: &Path) -> Result<Toolchain, String> {
+/// Computes a fast `lstat` metadata digest over every directory, regular
+/// file, and symlink under `tc_root/lean` and `tc_root/rust` (`dev`, `ino`,
+/// `mode`, `len`, `mtime`, `mtime_nsec`, `ctime`, `ctime_nsec`, plus symlink
+/// target for symlinks).
+///
+/// Once the 1.45 GB toolchain has passed full byte-for-byte SHA-256
+/// verification against [`TOOLCHAIN_LOCK`] and `foundation-lock.json`, any
+/// subsequent process can confirm in ~2 ms that no file, directory, or symlink
+/// in the toolchain tree has been modified, replaced, linked, or added/removed
+/// since that full SHA-256 check completed.
+fn toolchain_stat_digest(tc_root: &Path, phase: &str) -> Result<Vec<u8>, String> {
+    let mut records = Vec::new();
+    for subdir in ["lean", "rust"] {
+        let dir = beneath(tc_root, subdir, phase, ExpectedKind::Directory)?;
+        for entry in WalkDir::new(&dir)
+            .follow_links(false)
+            .follow_root_links(false)
+        {
+            let entry = entry.map_err(|e| {
+                format!("{phase}: cannot walk {}: {e}", dir.display())
+            })?;
+            let meta = entry.metadata().map_err(|e| {
+                format!(
+                    "{phase}: cannot stat {}: {e}",
+                    entry.path().display()
+                )
+            })?;
+            let ft = meta.file_type();
+            let (kind, link_target) = if ft.is_dir() {
+                ("D", String::new())
+            } else if ft.is_file() {
+                ("F", String::new())
+            } else if ft.is_symlink() {
+                let target = fs::read_link(entry.path()).map_err(|e| {
+                    format!(
+                        "{phase}: cannot read symlink {}: {e}",
+                        entry.path().display()
+                    )
+                })?;
+                ("L", target.to_string_lossy().into_owned())
+            } else {
+                return Err(format!(
+                    "{phase}: special file in toolchain: {}",
+                    entry.path().display()
+                ));
+            };
+            let rel = entry.path().strip_prefix(tc_root).unwrap_or(entry.path());
+            let record = format!(
+                "{kind}:{}:{}:{}:{}:{}:{}:{}:{}:{link_target}\n",
+                meta.dev(),
+                meta.ino(),
+                meta.mode(),
+                meta.len(),
+                meta.mtime(),
+                meta.mtime_nsec(),
+                meta.ctime(),
+                meta.ctime_nsec(),
+            );
+            let mut key_and_line = rel.as_os_str().as_bytes().to_vec();
+            key_and_line.push(b'\t');
+            key_and_line.extend_from_slice(record.as_bytes());
+            records.push((rel.as_os_str().as_bytes().to_vec(), key_and_line));
+        }
+    }
+    records.sort();
+    let flat: Vec<u8> = records.into_iter().flat_map(|(_, r)| r).collect();
+    Ok(sha256_bytes(&flat).into_bytes())
+}
+
+fn authenticate_toolchain(
+    root: &Path,
+    anneal_root: &AuthenticatedRoot,
+) -> Result<Toolchain, String> {
     static AUTHENTICATED: Mutex<BTreeMap<PathBuf, Toolchain>> =
         Mutex::new(BTreeMap::new());
     let phase = "toolchain";
@@ -380,7 +457,49 @@ fn authenticate_toolchain(root: &Path) -> Result<Toolchain, String> {
     if let Some(tc) = cache.get(&canonical) {
         return Ok(tc.clone());
     }
+
+    let disk_cache = prefix_cache_dir(anneal_root);
+    let stat_digest = toolchain_stat_digest(&canonical, phase).ok();
+    if let Some(ref current_stat) = stat_digest
+        && let Some(loaded) = try_load_cached_artifacts(
+            &disk_cache,
+            "toolchain-stat.sha256",
+            &["stat-digest"],
+        )
+        && loaded.first().map(|(_, b)| b) == Some(current_stat)
+    {
+        let lean = beneath(
+            &canonical,
+            "lean/bin/lean",
+            phase,
+            ExpectedKind::RegularFile,
+        )?;
+        let rustc = beneath(
+            &canonical,
+            "rust/bin/rustc",
+            phase,
+            ExpectedKind::RegularFile,
+        )?;
+        let tc = Toolchain {
+            lean,
+            rustc,
+            rust_lib: canonical.join("rust/lib"),
+            sysroot: canonical.join("rust"),
+            root: canonical.clone(),
+        };
+        cache.insert(canonical, tc.clone());
+        return Ok(tc);
+    }
+
     let tc = authenticate_toolchain_uncached(&canonical)?;
+    verify_foundation_lock(&tc, &anneal_root.foundation_lock)?;
+    if let Some(current_stat) = stat_digest {
+        store_cached_artifacts(
+            &disk_cache,
+            "toolchain-stat.sha256",
+            &[("stat-digest".to_string(), current_stat)],
+        );
+    }
     cache.insert(canonical, tc.clone());
     Ok(tc)
 }
@@ -442,6 +561,7 @@ fn authenticate_toolchain_uncached(root: &Path) -> Result<Toolchain, String> {
 /// Authenticated source buffers read from `--anneal-root` after verifying
 /// every file against [`LOCKED_ANNEAL_SOURCES`].
 struct AuthenticatedRoot {
+    canonical: PathBuf,
     foundation_lock: Vec<u8>,
     trusted_lean: Vec<(&'static str, Vec<u8>)>,
     theory_lean: Vec<(&'static str, Vec<u8>)>,
@@ -453,7 +573,9 @@ struct AuthenticatedRoot {
 /// when present) against [`LOCKED_ANNEAL_SOURCES`].
 fn authenticate_anneal_root(
     anneal_root: &Path,
-) -> Result<AuthenticatedRoot, String> {
+) -> Result<Arc<AuthenticatedRoot>, String> {
+    static AUTHENTICATED_ROOTS: Mutex<BTreeMap<PathBuf, Arc<AuthenticatedRoot>>> =
+        Mutex::new(BTreeMap::new());
     let phase = "anneal-root";
     let canonical = fs::canonicalize(anneal_root).map_err(|e| {
         format!(
@@ -461,6 +583,20 @@ fn authenticate_anneal_root(
             anneal_root.display()
         )
     })?;
+    let mut cache =
+        AUTHENTICATED_ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(root) = cache.get(&canonical) {
+        return Ok(root.clone());
+    }
+    let root = Arc::new(authenticate_anneal_root_uncached(canonical.clone())?);
+    cache.insert(canonical, root.clone());
+    Ok(root)
+}
+
+fn authenticate_anneal_root_uncached(
+    canonical: PathBuf,
+) -> Result<AuthenticatedRoot, String> {
+    let phase = "anneal-root";
     let mut locked: BTreeMap<&str, &str> = BTreeMap::new();
     for (lineno, raw) in LOCKED_ANNEAL_SOURCES.lines().enumerate() {
         let line = raw.trim();
@@ -522,6 +658,7 @@ fn authenticate_anneal_root(
     };
 
     Ok(AuthenticatedRoot {
+        canonical,
         foundation_lock,
         trusted_lean,
         theory_lean,
@@ -823,14 +960,14 @@ fn check_candidate_policy(
 struct PreparedVerify {
     target: ValidatedTargetCrate,
     tc: Toolchain,
-    root: AuthenticatedRoot,
+    root: Arc<AuthenticatedRoot>,
     active_candidates: BTreeMap<String, Vec<String>>,
 }
 
 fn prepare_verify(config: &VerifyConfig) -> Result<PreparedVerify, String> {
     let target = validate_target_crate(&config.crate_dir)?;
-    let tc = authenticate_toolchain(&config.toolchain_dir)?;
     let root = authenticate_anneal_root(&config.anneal_root)?;
+    let tc = authenticate_toolchain(&config.toolchain_dir, &root)?;
     let active_candidates = check_candidate_policy(
         &root.trusted_lean,
         &target.allow_candidate_features,
@@ -846,13 +983,111 @@ fn prepare_verify(config: &VerifyConfig) -> Result<PreparedVerify, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Content-addressed on-disk build cache helpers
+// ---------------------------------------------------------------------------
+
+/// Computes the deterministic content-addressed cache key from the compiled-in
+/// [`TOOLCHAIN_LOCK`] and [`LOCKED_ANNEAL_SOURCES`] manifests.
+///
+/// Because [`authenticate_toolchain`] and [`authenticate_anneal_root`] verify
+/// that all toolchain binaries, foundation `.olean`s, `trusted/lean/*.lean`
+/// files, `theory/*.lean` files, and `trusted/rustc-capture/src/*.rs` files
+/// match those two manifests byte-for-byte before any cache lookup occurs, this
+/// key uniquely determines the compiled `anneal-rustc-capture` binary and the
+/// 10 precompiled `Trusted` and `Anneal` `.olean` files.
+fn prefix_cache_dir(root: &AuthenticatedRoot) -> PathBuf {
+    let base = env::var_os("ANNEAL_CACHE_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.canonical.join("target/anneal-cache"));
+    let mut hasher = Sha256::new();
+    hasher.update(b"anneal-prefix-cache-v1\n");
+    hasher.update(env::consts::ARCH.as_bytes());
+    hasher.update(b"-");
+    hasher.update(env::consts::OS.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(TOOLCHAIN_LOCK.as_bytes());
+    hasher.update(b"\n--\n");
+    hasher.update(LOCKED_ANNEAL_SOURCES.as_bytes());
+    base.join(format!("{:x}", hasher.finalize()))
+}
+
+/// Loads a cached artifact set `(rel_path, bytes)` from `cache_dir` after
+/// verifying every file via [`read_regular`] against `manifest_name`.
+///
+/// Staging the verified bytes into the caller's process-private `/tmp`
+/// directory eliminates any time-of-check to time-of-use race against
+/// concurrent processes modifying the on-disk cache.
+fn try_load_cached_artifacts(
+    cache_dir: &Path,
+    manifest_name: &str,
+    expected_rels: &[&str],
+) -> Option<Vec<(String, Vec<u8>)>> {
+    let manifest_bytes =
+        read_regular(&cache_dir.join(manifest_name), "cache").ok()?;
+    let manifest_text = std::str::from_utf8(&manifest_bytes).ok()?;
+    let entries = parse_digest_lines(manifest_text, "cache").ok()?;
+    let expected_map: BTreeMap<&str, &str> = entries
+        .iter()
+        .map(|(rel, sha)| (rel.as_str(), sha.as_str()))
+        .collect();
+    if expected_map.len() != expected_rels.len() {
+        return None;
+    }
+    let mut loaded = Vec::with_capacity(expected_rels.len());
+    for &rel in expected_rels {
+        let want_sha = *expected_map.get(rel)?;
+        let path =
+            beneath(cache_dir, rel, "cache", ExpectedKind::RegularFile).ok()?;
+        let bytes = read_regular(&path, "cache").ok()?;
+        if sha256_bytes(&bytes) != want_sha {
+            return None;
+        }
+        loaded.push((rel.to_string(), bytes));
+    }
+    Some(loaded)
+}
+
+/// Atomically writes `artifacts` and `manifest_name` into `cache_dir` via
+/// per-process temporary files (`<name>.tmp.<pid>`).
+fn store_cached_artifacts(
+    cache_dir: &Path,
+    manifest_name: &str,
+    artifacts: &[(String, Vec<u8>)],
+) {
+    let pid = std::process::id();
+    let mut manifest = String::new();
+    for (rel, bytes) in artifacts {
+        let dst = cache_dir.join(rel);
+        let Some(parent) = dst.parent() else {
+            return;
+        };
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let tmp = dst.with_extension(format!("tmp.{pid}"));
+        if fs::write(&tmp, bytes).is_err() || fs::rename(&tmp, &dst).is_err() {
+            let _ = fs::remove_file(&tmp);
+            return;
+        }
+        let sha = sha256_bytes(bytes);
+        manifest.push_str(&format!("{sha}  {rel}\n"));
+    }
+    let manifest_dst = cache_dir.join(manifest_name);
+    let manifest_tmp = cache_dir.join(format!("{manifest_name}.tmp.{pid}"));
+    if fs::write(&manifest_tmp, manifest.as_bytes()).is_ok() {
+        let _ = fs::rename(&manifest_tmp, &manifest_dst);
+    }
+    let _ = fs::remove_file(&manifest_tmp);
+}
+
+// ---------------------------------------------------------------------------
 // Building and running `anneal-rustc-capture`
 // ---------------------------------------------------------------------------
 
 /// Builds (or resolves) the `anneal-rustc-capture` binary for `tc` from the
 /// authenticated [`AuthenticatedRoot`] sources in a process-cached private
-/// `/tmp` directory (or uses `tc.root/bin/anneal-rustc-capture` when running
-/// from an installed archive without `trusted/rustc-capture` sources).
+/// `/tmp` directory, backed by the content-addressed on-disk cache.
 fn ensure_rustc_capture_bin(
     tc: &Toolchain,
     root: &AuthenticatedRoot,
@@ -876,7 +1111,24 @@ fn ensure_rustc_capture_bin(
         return Ok(bin.clone());
     }
 
+    let disk_cache = prefix_cache_dir(root);
     let stage = Arc::new(private_tempdir("anneal-capture-build-")?);
+    let bin = stage.path().join("anneal-rustc-capture");
+
+    if let Some(mut loaded) = try_load_cached_artifacts(
+        &disk_cache,
+        "capture.sha256",
+        &["anneal-rustc-capture"],
+    ) && let Some((_, bin_bytes)) = loaded.pop()
+    {
+        fs::write(&bin, &bin_bytes)
+            .map_err(|e| format!("cannot stage cached anneal-rustc-capture: {e}"))?;
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cannot chmod staged anneal-rustc-capture: {e}"))?;
+        cache.insert(tc.root.clone(), (stage, bin.clone()));
+        return Ok(bin);
+    }
+
     let src_stage = stage.path().join("rustc-capture");
     fs::create_dir_all(src_stage.join("src"))
         .map_err(|e| format!("cannot create capture staging dir: {e}"))?;
@@ -886,7 +1138,6 @@ fn ensure_rustc_capture_bin(
             .map_err(|e| format!("cannot write staged {rel}: {e}"))?;
     }
 
-    let bin = stage.path().join("anneal-rustc-capture");
     let out = child_command(&tc.rustc)
         .arg("--edition=2024")
         .arg("--crate-name")
@@ -907,12 +1158,13 @@ fn ensure_rustc_capture_bin(
         ));
     }
 
-    if !bin.is_file() {
-        return Err(format!(
-            "rustc build succeeded but {} is missing",
-            bin.display()
-        ));
-    }
+    let bin_bytes = read_regular(&bin, "rustc-capture-build")?;
+    store_cached_artifacts(
+        &disk_cache,
+        "capture.sha256",
+        &[("anneal-rustc-capture".to_string(), bin_bytes)],
+    );
+
     cache.insert(tc.root.clone(), (stage, bin.clone()));
     Ok(bin)
 }
@@ -1057,18 +1309,27 @@ fn compile_lean_file(
             format!("failed to invoke lean on {}: {e}", src_file.display())
         })?;
     if !out.status.success() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let prefix = stdout
+            .lines()
+            .next()
+            .and_then(|line| {
+                serde_json::from_str::<[String; 2]>(line.trim()).ok()
+            })
+            .map(|[message, scope]| format!("proof [{scope}]: {message}\n"))
+            .unwrap_or_default();
         return Err(format!(
-            "lean failed on {}:\nstdout:\n{}\nstderr:\n{}",
+            "{prefix}lean failed on {}:\nstdout:\n{stdout}\nstderr:\n{stderr}",
             src_file.display(),
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
         ));
     }
     Ok(())
 }
 
 /// Compiles `Trusted` and `Anneal` `.olean`s into a process-cached private
-/// `/tmp` directory from the authenticated [`AuthenticatedRoot`] sources.
+/// `/tmp` directory from the authenticated [`AuthenticatedRoot`] sources,
+/// backed by the content-addressed on-disk cache.
 fn ensure_compiled_prefix(
     tc: &Toolchain,
     root: &AuthenticatedRoot,
@@ -1081,9 +1342,41 @@ fn ensure_compiled_prefix(
         return Ok(dir.clone());
     }
 
-    verify_foundation_lock(tc, &root.foundation_lock)?;
-
     let prefix_dir = Arc::new(private_tempdir("anneal-lean-prefix-")?);
+    let expected_oleans: Vec<String> = TRUSTED_LEAN_PATHS
+        .iter()
+        .chain(THEORY_LEAN_PATHS.iter())
+        .map(|rel| {
+            format!("{}.olean", rel.strip_suffix(".lean").unwrap_or(rel))
+        })
+        .collect();
+    let expected_olean_refs: Vec<&str> =
+        expected_oleans.iter().map(String::as_str).collect();
+    let disk_cache = prefix_cache_dir(root);
+
+    if let Some(loaded) = try_load_cached_artifacts(
+        &disk_cache,
+        "oleans.sha256",
+        &expected_olean_refs,
+    ) {
+        for (rel, bytes) in loaded {
+            let dst = prefix_dir.path().join(&rel);
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "cannot create staged Lean olean dir {}: {e}",
+                        parent.display()
+                    )
+                })?;
+            }
+            fs::write(&dst, bytes).map_err(|e| {
+                format!("cannot write staged Lean olean {rel}: {e}")
+            })?;
+        }
+        cache.insert(tc.root.clone(), prefix_dir.clone());
+        return Ok(prefix_dir);
+    }
+
     let lean_sys_lib = tc.root.join("lean/lib/lean");
     let lean_path = format!(
         "{}:{}",
@@ -1091,6 +1384,7 @@ fn ensure_compiled_prefix(
         lean_sys_lib.display()
     );
 
+    let mut built_oleans = Vec::with_capacity(expected_oleans.len());
     for (rel, bytes) in root
         .trusted_lean
         .iter()
@@ -1108,13 +1402,15 @@ fn ensure_compiled_prefix(
         fs::write(&staged_src, bytes).map_err(|e| {
             format!("cannot write staged Lean source {rel}: {e}")
         })?;
-        let out_olean = prefix_dir
-            .path()
-            .join(rel.strip_suffix(".lean").unwrap_or(rel))
-            .with_extension("olean");
+        let rel_olean =
+            format!("{}.olean", rel.strip_suffix(".lean").unwrap_or(rel));
+        let out_olean = prefix_dir.path().join(&rel_olean);
         compile_lean_file(tc, &lean_path, &staged_src, &out_olean)?;
+        let olean_bytes = read_regular(&out_olean, "lean-prefix-build")?;
+        built_oleans.push((rel_olean, olean_bytes));
     }
 
+    store_cached_artifacts(&disk_cache, "oleans.sha256", &built_oleans);
     cache.insert(tc.root.clone(), prefix_dir.clone());
     Ok(prefix_dir)
 }

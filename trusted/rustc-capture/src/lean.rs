@@ -624,8 +624,9 @@ pub fn render(c: &ir::Crate) -> String {
         body_decls.collect::<Vec<_>>().join(",")
     );
     // Only public functions are roots; private ones appear as callees in
-    // `bodies`.
-    let roots: Vec<_> = c
+    // `bodies`. Sort by function name so `functions` and `tcb` have a canonical
+    // deterministic order independent of source declaration order.
+    let mut roots: Vec<_> = c
         .functions
         .iter()
         .filter_map(|f| match &f.kind {
@@ -635,6 +636,7 @@ pub fn render(c: &ir::Crate) -> String {
             }
         })
         .collect();
+    roots.sort_by(|a, b| a.0.name.cmp(&b.0.name));
     let fns = roots.iter().map(|(f, requires, specs)| {
         let req = Names::requires_field(requires);
         format!(
