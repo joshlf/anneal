@@ -718,7 +718,9 @@ def MultiStepRel (entry : CapturedMir) (callees : List CapturedMir)
   match a with
   | .tau (.running s') =>
     ∃ k m', 1 ≤ k ∧ Interp.steps k m = .ok m' ∧
-      MultiStateRel entry callees prog rootCtx s' m'
+      MultiStateRel entry callees prog rootCtx s' m' ∧
+      (∀ j, 1 ≤ j → j ≤ k → ∀ mj, Interp.steps j m = .ok mj →
+        ∀ b' c' s'' v, ¬ ReturnRel b' c' s'' v mj)
   | .vis (.inr (.inl (.emit _))) k =>
     ∃ s' m', k PUnit.unit = .running s' ∧ Interp.step m = .ok m' ∧
       MultiStateRel entry callees prog rootCtx s' m'

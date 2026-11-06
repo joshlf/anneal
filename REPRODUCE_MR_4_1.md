@@ -68,7 +68,12 @@ as a pass.
     must-initialized `(Int, bool)` 2-tuple tracking (`tupleInitAtEntry`,
     `tupleInitOk`), ensuring every `Call` return place (`_dst`, `_dst.0`, or
     `_dst.1`) is live and type/projection-compatible when MiniRust runs
-    `prepare_for_inplace_passing(ret_place)` prior to argument evaluation.
+    `prepare_for_inplace_passing(ret_place)` prior to argument evaluation, with
+    unconditional finite-fuel (`N * (L + 1)`) convergence and Knaster–Tarski
+    greatest post-fixed-point optimality proved in `Simulation.lean`
+    (`iterLiveEntries_stabilizes`, `livenessOk_eq_true`, `liveAtEntry_greatest`,
+    `liveAtEntry_zero_mem`, `iterTupleInitEntries_stabilizes`,
+    `tupleInitOk_eq_true`, `tupleInitAtEntry_greatest`).
   - `termReadsOk` checks `readsOk (dst :: mo) argOps` (forbidding `argOps` from
     reading either stale locals in `mo` or `dst`, allowing `_dst ∈ mo` when
     overwriting a root destination `⟨dst, []⟩`, and requiring `!mo.contains dst`
@@ -82,7 +87,8 @@ as a pass.
   `Simulation.lean`, `Run.lean`):
   - `ProgEnvOk`, `CallerDestRel`, `CallStackRel`, `MultiStateRel`,
     `MultiStartRel`, and `MultiStepRel` (`1 ≤ k` MiniRust steps with
-    `Interp.steps k m = .ok m'`, matching `1 + initLen callee` steps on
+    `Interp.steps k m = .ok m'` and prefix-wide `¬ ReturnRel` across every
+    intermediate step `1 ≤ j ≤ k`, matching `1 + initLen callee` steps on
     `TerminatorKind.call` and `1` step on nested `Return` / root `Return` /
     statements / branches, while `steps_ok_mono` prevents any intermediate error
     at `j < k` from hiding).
@@ -92,31 +98,39 @@ as a pass.
     `mkStartFn_spec`, `translateCallConv_eq_some_iff`,
     `lookupFnName_of_lookupFnTarget`, `lookupFnTarget_zipIdx_aux`),
     `multi_step_correspondence`, `multi_step_start`,
-    `initMachineStateWithCallees_startRel`, and the full `Run.lean` suite
+    `multi_step_start_no_returnRel`, `initMachineStateWithCallees_startRel`,
+    `steps_add_no_returnRel`, and the full `Run.lean` suite
     `mirCallWithCallees_{ret, ub, ub_rel, noUB, steps_error, progress,
-    progress_any, outcome, outcome_any, diverges_steps_ok, diverges_rel}`
+    progress_any, outcome, outcome_any, diverges_steps_ok, diverges_rel}` plus
+    single-body `run_ub_rel`, `run_ub_rel_from_start`, and `mirCall_ub_rel`
     (preserving all single-body `MR-1.1..1.3` theorems with zero regressions),
-    where `multi_run_ub_rel` / `mirCallWithCallees_ub_rel` localize forward UB
-    to a step taken from a `MultiStateRel`-related machine, which
-    `MultiStateRel.not_returnRel` shows is never a `ReturnRel` state (so the
-    fault belongs to `entry` or a callee, not to the external caller).
+    where `run_ub_rel` / `mirCall_ub_rel` and `multi_run_ub_rel` /
+    `mirCallWithCallees_ub_rel` localize forward UB to step `n + 1` from a
+    `StateRel`- or `MultiStateRel`-related machine `mLast` with `¬ ReturnRel` at
+    every prefix step `k ≤ n` (`StateRel.not_returnRel`,
+    `MultiStateRel.not_returnRel`, `step_start_no_returnRel`,
+    `multi_step_start_no_returnRel`).
 - **Witnesses & audit** (`Witness.lean`, `Audit.lean`):
   - `callerMain`/`calleePair` (`ByValue` + `InPlace` `(u32, bool)` tuple call,
     `initLen calleePair = 2`, overflow and non-overflow paths, mid-call stack
     depth `3` snapshot, and arbitrary-`n` `mirCallWithCallees_{progress_any,
     outcome_any}`), `projDestCaller` (`_0.0` and `_0.1` projected call
-    destinations), `chainEntry -> chainMid -> chainLeaf` (3-deep call stack,
+    destinations, plus fixed-point convergence and greatest-fixed-point
+    witnesses `projDestCaller_{liveness_stabilizes, tupleInit_stabilizes,
+    liveAtEntry_greatest, tupleInitAtEntry_greatest}`),
+    `chainEntry -> chainMid -> chainLeaf` (3-deep call stack,
     `Ordering` ABI), `cAbiCaller`/`cAbiCallee` (`CallConv.c` ABI),
     `diamondCallEntry -> {diamondMidA, diamondMidB} -> cAbiCallee` (diamond DAG
     call graph mixing `.Rust` and `.C` ABIs and sharing leaf `cAbiCallee`),
-    `callArgUbCaller`, `calleeDivZeroCaller`, `calleeRetUninitCaller` (UB on a
-    callee's `Return` of an uninitialized `_0`, localized by
-    `mirCallWithCallees_ub_rel`), `callMoveReuse`, `callSpinCaller` (diverging
-    call/return cycle), `liveCallDestSpinCaller` (divergence inside a callee
-    that never returns, stack depth `3` forever), `moveReinitByCall` (root call
-    destination re-initializing a moved-out local), `condCallMoveJoin`
-    (branch-correlated `InPlace` call move across a CFG join), and ground-truth
-    `Interp` unit checks.
+    `callArgUbCaller`, `calleeDivZeroCaller`, `calleeRetUninitCaller`, and
+    `callMoveReuse` (localized via `mirCallWithCallees_ub_rel` in
+    `{callArgUb, calleeDivZero, calleeRetUninit, callMoveReuse}_minirust_ub_rel`,
+    alongside single-body `{retUninit, negMention0}_minirust_ub_rel_from_start`),
+    `callSpinCaller` (diverging call/return cycle), `liveCallDestSpinCaller`
+    (divergence inside a callee that never returns, stack depth `3` forever),
+    `moveReinitByCall` (root call destination re-initializing a moved-out local),
+    `condCallMoveJoin` (branch-correlated `InPlace` call move across a CFG join),
+    and ground-truth `Interp` unit checks.
   - Necessity witnesses: `deadCallDestSpinCaller` (dead return place, diverging
     callee), `abiArgMismatchCaller` and `abiRetMismatchCaller` (parameter and
     return types), `argCountMismatchCaller` (argument count),
@@ -161,8 +175,8 @@ cargo test -p anneal-minirust-gen --offline
 ```
 
 Pass: all `22` tests (`8` unit + `7` pipeline + `7` quotes) pass, including
-`anchors_match_generated_items_and_cover_interp` (`61` anchors, `>= 226`
-`[SIMULATION-AUDIT]` theorems, `>= 560` `[WITNESS-AUDIT]` theorems) in
+`anchors_match_generated_items_and_cover_interp` (`61` anchors, `>= 247`
+`[SIMULATION-AUDIT]` theorems, `>= 569` `[WITNESS-AUDIT]` theorems) in
 `tests/pipeline.rs` and `call_return_and_multi_fn_quotations_are_pinned` (`20`
 pinned `MR-4.1` quotations) in `tests/quotes.rs`.
 
@@ -179,9 +193,9 @@ Pass: `Build completed successfully`, with:
 
 ```text
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
-[SIMULATION-AUDIT] decls=226 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
-[WITNESS-AUDIT] decls=560 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-MiniRustSpec.Audit: exhaustively verified standard axioms for 11969 declarations across all MiniRustSpec.* modules
+[SIMULATION-AUDIT] decls=247 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
+[WITNESS-AUDIT] decls=569 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+MiniRustSpec.Audit: exhaustively verified standard axioms for 12097 declarations across all MiniRustSpec.* modules
 ```
 
 (`lake` prints already-built modules without re-running them; to see the audit
@@ -224,9 +238,12 @@ lines again after a successful build, touch
 - Statement/switch `movesOk` remains path-insensitive at CFG joins (whereas
   `Call` `Operand::Move` lowers via `ArgumentExpr::InPlace` and writes `Uninit`
   in both semantics).
-- The single-body forward UB theorems (`run_ub`, `mirCall_ub`) and
-  `mirCallWithCallees_ub` do not by themselves locate the UB before the root
-  return; `mirCallWithCallees_ub_rel` does for multi-function programs.
+- Plain `run_ub`, `mirCall_ub`, and `mirCallWithCallees_ub` state only `∃ n msg,
+  Interp.steps n m = .error (.ub msg)`; their `_rel` counterparts (`run_ub_rel`,
+  `run_ub_rel_from_start`, `mirCall_ub_rel`, `multi_run_ub_rel`,
+  `multi_run_ub_rel_from_start`, and `mirCallWithCallees_ub_rel`) localize the UB
+  to step `n + 1` from a `StateRel`- or `MultiStateRel`-related machine with
+  prefix-wide `¬ ReturnRel` across every step `k ≤ n`.
 - `mkStartFn` calls the entry with `CallingConvention::Rust` (as `minimize`
   does), so an `extern "C"` entry would fault if run from `prog.start`; the
   theorems start at `fEntry.start` and are unaffected.

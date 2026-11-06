@@ -99,7 +99,10 @@ open MiniRustSpec.Correspondence in
   translateFnInProg_eq_translateFn_of_no_calls
   multi_step_correspondence
   multi_step_start
+  multi_step_start_with_no_returnRel
+  multi_step_start_no_returnRel
   initMachineStateWithCallees_startRel
+  steps_add_no_returnRel
   multi_reaches_rel
   multi_run_ret
   multi_run_ret_from_start
@@ -133,8 +136,12 @@ open MiniRustSpec.Correspondence in
   mirCallWithCallees_outcome_any
   mirCallWithCallees_diverges_steps_ok
   mirCallWithCallees_diverges_rel
+  Shape.not_returnRel_of_ne_nil
+  StateRel.not_returnRel
   step_correspondence
   step_start
+  step_start_with_no_returnRel
+  step_start_no_returnRel
   initMachineState_startRel
   steps_ok_mono
   reaches_rel
@@ -142,6 +149,8 @@ open MiniRustSpec.Correspondence in
   run_ret_from_start
   run_ub
   run_ub_from_start
+  run_ub_rel
+  run_ub_rel_from_start
   steps_error
   steps_error_from_start
   steps_outcome
@@ -155,12 +164,24 @@ open MiniRustSpec.Correspondence in
   mirNoUB_diverges_rel_from_start
   mirCall_ret
   mirCall_ub
+  mirCall_ub_rel
   mirCall_noUB
   mirCall_progress
   mirCall_diverges_steps_ok
   mirCall_diverges_rel
   mirCall_steps_error
   mirCall_outcome
+  stmtMustLive_mono
+  iterLiveEntries_stabilizes
+  livenessOk_eq_true
+  liveAtEntry_greatest
+  liveAtEntry_zero_mem
+  dropMovedFrom_mono
+  stmtTupleInit_mono
+  termTupleInit_mono
+  iterTupleInitEntries_stabilizes
+  tupleInitOk_eq_true
+  tupleInitAtEntry_greatest
   runA_sound
   runA_noUB
   faultsA_sound
@@ -559,6 +580,15 @@ open MiniRustSpec.Correspondence.Witness in
   calleeRetUninit_minirust_ub_rel
   calleeRetUninit_minirust_direct
   calleeRetUninit_converse_error
+  retUninit_minirust_ub_rel_from_start
+  negMention0_minirust_ub_rel_from_start
+  calleeDivZero_minirust_ub_rel
+  callArgUb_minirust_ub_rel
+  callMoveReuse_minirust_ub_rel
+  projDestCaller_liveness_stabilizes
+  projDestCaller_tupleInit_stabilizes
+  projDestCaller_liveAtEntry_greatest
+  projDestCaller_tupleInitAtEntry_greatest
   ctx0_ok1
   ctx0_ok2
   ctxI8_ok2
@@ -1123,7 +1153,10 @@ open MiniRustSpec.Correspondence in
   translateFnInProg_eq_translateFn_of_no_calls
   multi_step_correspondence
   multi_step_start
+  multi_step_start_with_no_returnRel
+  multi_step_start_no_returnRel
   initMachineStateWithCallees_startRel
+  steps_add_no_returnRel
   multi_reaches_rel
   multi_run_ret
   multi_run_ret_from_start
@@ -1157,14 +1190,20 @@ open MiniRustSpec.Correspondence in
   mirCallWithCallees_outcome_any
   mirCallWithCallees_diverges_steps_ok
   mirCallWithCallees_diverges_rel
+  Shape.not_returnRel_of_ne_nil
+  StateRel.not_returnRel
   step_correspondence
   evalReturn_frame
   step_start
+  step_start_with_no_returnRel
+  step_start_no_returnRel
   initMachineState_startRel
   run_ret
   run_ret_from_start
   run_ub
   run_ub_from_start
+  run_ub_rel
+  run_ub_rel_from_start
   steps_error
   steps_error_from_start
   steps_outcome
@@ -1173,12 +1212,24 @@ open MiniRustSpec.Correspondence in
   mirNoUB_safe_from_start
   mirCall_ret
   mirCall_ub
+  mirCall_ub_rel
   mirCall_noUB
   mirCall_progress
   mirCall_steps_error
   mirCall_outcome
   mirCall_diverges_steps_ok
   mirCall_diverges_rel
+  stmtMustLive_mono
+  iterLiveEntries_stabilizes
+  livenessOk_eq_true
+  liveAtEntry_greatest
+  liveAtEntry_zero_mem
+  dropMovedFrom_mono
+  stmtTupleInit_mono
+  termTupleInit_mono
+  iterTupleInitEntries_stabilizes
+  tupleInitOk_eq_true
+  tupleInitAtEntry_greatest
   evalValue_operandT
   evalValue_rvalueB
   evalStatement_assignB
@@ -1518,6 +1569,15 @@ open MiniRustSpec.Correspondence.Witness in
   calleeRetUninit_minirust_ub_rel
   calleeRetUninit_minirust_direct
   calleeRetUninit_converse_error
+  retUninit_minirust_ub_rel_from_start
+  negMention0_minirust_ub_rel_from_start
+  calleeDivZero_minirust_ub_rel
+  callArgUb_minirust_ub_rel
+  callMoveReuse_minirust_ub_rel
+  projDestCaller_liveness_stabilizes
+  projDestCaller_tupleInit_stabilizes
+  projDestCaller_liveAtEntry_greatest
+  projDestCaller_tupleInitAtEntry_greatest
   cmpNotSwitch_inFragment
   cmpNotSwitch_translate
   cmpNotNeg1_anneal_ret

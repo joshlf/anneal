@@ -9775,21 +9775,25 @@ theorem calleeRetUninit_minirust_ub :
     (by decide) calleeRetUninitMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
 
 /-- The callee-`Return` fault is localized (`mirCallWithCallees_ub_rel`):
-MiniRust reaches a machine still `MultiStateRel`-related to Anneal, hence not a
-`ReturnRel` state, whose next step raises UB. -/
+MiniRust reaches in `n` steps a machine still `MultiStateRel`-related to Anneal,
+no intermediate step `k ≤ n` satisfies `ReturnRel`, and the very next step
+(`n + 1`) raises UB. -/
 theorem calleeRetUninit_minirust_ub_rel :
     ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
       Interp.steps n calleeRetUninitMInit = .ok mLast ∧
       MultiStateRel calleeRetUninitCaller [retUninitCallee] calleeRetUninitProg ctxCallSpin
         sLast mLast ∧
       (∀ s' v, ¬ ReturnRel calleeRetUninitCaller ctxCallSpin s' v mLast) ∧
-      Interp.step mLast = .error (.ub msg) := by
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) calleeRetUninitMInit = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k calleeRetUninitMInit = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
   obtain ⟨tr, u, hr, hf⟩ := calleeRetUninit_anneal_ub
-  obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, _⟩ :=
+  obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
     mirCallWithCallees_ub_rel calleeRetUninit_inFragment calleeRetUninit_translate
       calleeRetUninit_translateInProg ctxCallSpin ctxCalleeRetUninit_ok calleeRetUninitArgs
       (by decide) calleeRetUninitMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
-  exact ⟨n, sLast, mLast, msg, hsteps, hrel, fun _ _ => hrel.not_returnRel, hstep⟩
+  exact ⟨n, sLast, mLast, msg, hsteps, hrel, fun _ _ => hrel.not_returnRel, hstep, hsteps1, hno⟩
 
 theorem calleeRetUninit_minirust_direct :
     Interp.steps 4 calleeRetUninitMInit =
@@ -9810,5 +9814,172 @@ theorem calleeRetUninit_converse_error :
     calleeRetUninit_translateInProg ctxCallSpin ctxCalleeRetUninit_ok calleeRetUninitArgs
     (by decide) calleeRetUninitMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
     calleeRetUninit_minirust_direct
+
+/-! ### Pass `B4`: Localized single-body & multi-function UB witnesses and fixed-point convergence witnesses -/
+
+/-- Single-body localized UB from `f.start` (`mirCall_ub_rel`) on `retUninit`:
+MiniRust steps to a `StateRel`-related state `mLast` with `¬ ReturnRel` at every
+prefix step `k ≤ n`, and the next step (`n + 1`) raises UB. -/
+theorem retUninit_minirust_ub_rel_from_start :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n retUninitMInit = .ok mLast ∧
+      StateRel retUninit retUninitFn ctx0 sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) retUninitMInit = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k retUninitMInit = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := retUninit_anneal_ub
+  exact mirCall_ub_rel retUninit_inFragment retUninit_translate ctx0 (ctx0_ok1 rfl) []
+    (by decide) retUninitMInit rfl rfl rfl hr hf
+
+/-- Single-body localized UB from `f.start` (`run_ub_rel_from_start`) on
+`negMention` with input `0` (branching into `Terminator::Unreachable`). -/
+theorem negMention0_minirust_ub_rel_from_start :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n negMention0MInit = .ok mLast ∧
+      StateRel negMention negMentionFn ctx0 sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) negMention0MInit = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k negMention0MInit = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := negMention0_anneal_ub
+  exact run_ub_rel_from_start negMention_inFragment negMention_translate ctx0 negMention0S0
+    negMention0MInit negMention0_startRel hr hf
+
+/-- Multi-function localized UB (`mirCallWithCallees_ub_rel`) on
+`calleeDivZeroCaller` faulting inside `divTenI8Callee`, with prefix-wide
+`¬ ReturnRel` across every intermediate step `k ≤ n`. -/
+theorem calleeDivZero_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n calleeDivZeroMInit = .ok mLast ∧
+      MultiStateRel calleeDivZeroCaller [divTenI8Callee] calleeDivZeroProg ctxCalleeDivZero
+        sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) calleeDivZeroMInit = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k calleeDivZeroMInit = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := calleeDivZero_anneal_ub
+  exact mirCallWithCallees_ub_rel calleeDivZero_inFragment calleeDivZero_translate
+    calleeDivZeroCaller_translateInProg ctxCalleeDivZero ctxCalleeDivZero_ok calleeDivZeroArgs
+    (by decide) calleeDivZeroMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+
+/-- Multi-function localized UB (`mirCallWithCallees_ub_rel`) on
+`callArgUbCaller` faulting during call-argument evaluation. -/
+theorem callArgUb_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n callArgUbMInit = .ok mLast ∧
+      MultiStateRel callArgUbCaller [idU32Callee] callArgUbProg ctxCallArgUb sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) callArgUbMInit = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k callArgUbMInit = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := callArgUb_anneal_ub
+  exact mirCallWithCallees_ub_rel callArgUb_inFragment callArgUb_translate
+    callArgUbCaller_translateInProg ctxCallArgUb ctxCallArgUb_ok [] (by decide)
+    callArgUbMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+
+/-- Multi-function localized UB (`mirCallWithCallees_ub_rel`) on
+`callMoveReuse` faulting in caller `bb1` after a completed callee return. -/
+theorem callMoveReuse_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n callMoveReuseMInit = .ok mLast ∧
+      MultiStateRel callMoveReuse [idU32Callee] callMoveReuseProg ctxCallSpin sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) callMoveReuseMInit = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k callMoveReuseMInit = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := callMoveReuse_anneal_ub
+  exact mirCallWithCallees_ub_rel callMoveReuse_inFragment callMoveReuse_translate
+    callMoveReuse_translateInProg ctxCallSpin ctxCallMoveReuse_ok
+    [.scalar ⟨7, 4⟩] (by decide) callMoveReuseMInit
+    (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+
+/-- Unconditional fixed-point stabilization of `iterLiveEntries` and
+`livenessOk_eq_true` on `projDestCaller` and `deadCallDestSpinCaller`. -/
+theorem projDestCaller_liveness_stabilizes :
+    (let fuel := projDestCaller.basicBlocks.length * (projDestCaller.localDecls.length + 1)
+     stepLiveEntries projDestCaller
+       (iterLiveEntries fuel projDestCaller (initLiveEntries projDestCaller)) =
+     iterLiveEntries fuel projDestCaller (initLiveEntries projDestCaller)) ∧
+    livenessOk projDestCaller = true ∧
+    (let fuel :=
+       deadCallDestSpinCaller.basicBlocks.length *
+         (deadCallDestSpinCaller.localDecls.length + 1)
+     stepLiveEntries deadCallDestSpinCaller
+       (iterLiveEntries fuel deadCallDestSpinCaller (initLiveEntries deadCallDestSpinCaller)) =
+     iterLiveEntries fuel deadCallDestSpinCaller (initLiveEntries deadCallDestSpinCaller)) ∧
+    livenessOk deadCallDestSpinCaller = true :=
+  ⟨iterLiveEntries_stabilizes (body := projDestCaller) (by decide),
+   livenessOk_eq_true (body := projDestCaller) (by decide),
+   iterLiveEntries_stabilizes (body := deadCallDestSpinCaller) (by decide),
+   livenessOk_eq_true (body := deadCallDestSpinCaller) (by decide)⟩
+
+/-- Unconditional fixed-point stabilization of `iterTupleInitEntries` and
+`tupleInitOk_eq_true` on `projDestCaller` and `uninitProjCallDestCaller`. -/
+theorem projDestCaller_tupleInit_stabilizes :
+    (let fuel := projDestCaller.basicBlocks.length * (projDestCaller.localDecls.length + 1)
+     stepTupleInitEntries projDestCaller
+       (iterTupleInitEntries fuel projDestCaller (initTupleEntries projDestCaller)) =
+     iterTupleInitEntries fuel projDestCaller (initTupleEntries projDestCaller)) ∧
+    tupleInitOk projDestCaller = true ∧
+    (let fuel :=
+       uninitProjCallDestCaller.basicBlocks.length *
+         (uninitProjCallDestCaller.localDecls.length + 1)
+     stepTupleInitEntries uninitProjCallDestCaller
+       (iterTupleInitEntries fuel uninitProjCallDestCaller
+         (initTupleEntries uninitProjCallDestCaller)) =
+     iterTupleInitEntries fuel uninitProjCallDestCaller
+       (initTupleEntries uninitProjCallDestCaller)) ∧
+    tupleInitOk uninitProjCallDestCaller = true :=
+  ⟨iterTupleInitEntries_stabilizes projDestCaller,
+   tupleInitOk_eq_true projDestCaller,
+   iterTupleInitEntries_stabilizes uninitProjCallDestCaller,
+   tupleInitOk_eq_true uninitProjCallDestCaller⟩
+
+/-- Greatest post-fixed-point optimality of `liveAtEntry` instantiated on
+`projDestCaller` (`[[0, 1], [0, 1], [0, 1, 2]]` is a post-fixed point). -/
+theorem projDestCaller_liveAtEntry_greatest {dst : Nat}
+    (hdst : dst < projDestCaller.basicBlocks.length) :
+    ∀ i ∈ ([[0, 1], [0, 1], [0, 1, 2]] : List (List Nat)).getD dst [],
+      i ∈ liveAtEntry projDestCaller dst :=
+  liveAtEntry_greatest
+    (by decide)
+    (fun d hd hne i hi => by
+      have hd' : d < 3 := by simpa [projDestCaller] using hd
+      revert i hi
+      rcases (by omega : d = 1 ∨ d = 2) with rfl | rfl <;> decide)
+    (fun s d bb hbb hd ht i hi => by
+      have hs : s < 3 := by
+        have := (List.getElem?_eq_some_iff.mp hbb).1
+        simpa [projDestCaller] using this
+      have hd' : d < 3 := by simpa [projDestCaller] using hd
+      revert bb hbb ht i hi
+      rcases (by omega : s = 0 ∨ s = 1 ∨ s = 2) with rfl | rfl | rfl <;>
+      rcases (by omega : d = 0 ∨ d = 1 ∨ d = 2) with rfl | rfl | rfl <;>
+      (intro bb hbb; simp [projDestCaller] at hbb; subst hbb; decide))
+    hdst
+
+/-- Greatest post-fixed-point optimality of `tupleInitAtEntry` instantiated on
+`projDestCaller` (`[[], [0], [0]]` is a post-fixed point). -/
+theorem projDestCaller_tupleInitAtEntry_greatest {dst : Nat}
+    (hdst : dst < projDestCaller.basicBlocks.length) :
+    ∀ i ∈ ([[], [0], [0]] : List (List Nat)).getD dst [],
+      i ∈ tupleInitAtEntry projDestCaller dst :=
+  tupleInitAtEntry_greatest
+    (by decide)
+    (fun d hd hne i hi => by
+      have hd' : d < 3 := by simpa [projDestCaller] using hd
+      revert i hi
+      rcases (by omega : d = 1 ∨ d = 2) with rfl | rfl <;> decide)
+    (fun s d bb hbb hd ht i hi => by
+      have hs : s < 3 := by
+        have := (List.getElem?_eq_some_iff.mp hbb).1
+        simpa [projDestCaller] using this
+      have hd' : d < 3 := by simpa [projDestCaller] using hd
+      revert bb hbb ht i hi
+      rcases (by omega : s = 0 ∨ s = 1 ∨ s = 2) with rfl | rfl | rfl <;>
+      rcases (by omega : d = 0 ∨ d = 1 ∨ d = 2) with rfl | rfl | rfl <;>
+      (intro bb hbb; simp [projDestCaller] at hbb; subst hbb; decide))
+    hdst
 
 end MiniRustSpec.Correspondence.Witness

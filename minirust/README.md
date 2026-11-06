@@ -338,14 +338,25 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
   `multi_mirNoUB_diverges_from_start`, `multi_mirNoUB_diverges_rel_from_start`,
   and `mirCallWithCallees_{ret, ub, ub_rel, noUB, steps_error, progress,
   progress_any, outcome, outcome_any, diverges_steps_ok, diverges_rel}`
-  (`Run.lean`): lift `MultiStepRel` (using `steps_ok_mono` so no intermediate
-  error at `j < k` during multi-step `Call + initBlock` can ever hide) to full
-  forward return, forward UB (localized by the `_rel` variants to a step taken
-  from a `MultiStateRel`-related machine, which `MultiStateRel.not_returnRel`
-  shows is never a `ReturnRel` state), converse `n`-step error soundness,
-  `MirNoUBTree` safety, arbitrary `n : Nat` outcome trichotomy and forward
-  progress (including startup steps `n ≤ initLen entry`), and diverging
-  call-loop liveness on `mirCallTreeWithCallees entry args callees`.
+  (`Run.lean`): lift `MultiStepRel` (using `steps_ok_mono` and prefix-wide
+  `¬ ReturnRel` across every intermediate step `1 ≤ j ≤ k` of `Call + initBlock`
+  so neither an intermediate error nor a transient root return can ever hide) to
+  full forward return, forward UB (localized by `multi_run_ub_rel`,
+  `multi_run_ub_rel_from_start`, and `mirCallWithCallees_ub_rel` to step `n + 1`
+  from a `MultiStateRel`-related machine `mLast` with `¬ ReturnRel` at every
+  prefix step `k ≤ n`, via `MultiStateRel.not_returnRel`,
+  `multi_step_start_no_returnRel`, and `steps_add_no_returnRel`), converse
+  `n`-step error soundness, `MirNoUBTree` safety, arbitrary `n : Nat` outcome
+  trichotomy and forward progress (including startup steps `n ≤ initLen entry`),
+  and diverging call-loop liveness on `mirCallTreeWithCallees entry args callees`.
+* `iterLiveEntries_stabilizes`, `livenessOk_eq_true`, `liveAtEntry_greatest`,
+  `liveAtEntry_zero_mem`, `iterTupleInitEntries_stabilizes`,
+  `tupleInitOk_eq_true`, `tupleInitAtEntry_greatest` (`Simulation.lean`):
+  unconditional finite-fuel (`N * (L + 1)`) fixed-point convergence of must-live
+  (`liveAtEntry`) and must-initialized `(Int, bool)` 2-tuple (`tupleInitAtEntry`)
+  CFG intersection, unconditional truth of `livenessOk` (whenever `argCount ≤
+  localDecls.length`) and `tupleInitOk`, and Knaster–Tarski greatest
+  post-fixed-point optimality.
 * `step_correspondence` (`Simulation.lean`): for a single-body fragment, its
   translation, and related states, one step of Anneal's coalgebra
   `stepMirFn body s` and one `Machine::step` satisfy `StepRel`: a silent
@@ -370,11 +381,15 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
   (`f.start = bbName body.basicBlocks.length`: `StorageLive` of each temporary
   of `alwaysStorageLiveLocals`, then `Goto(bb0)`) runs in `initLen body` steps
   to `StateRel`.
-* `run_ret`, `run_ub`, `run_ret_from_start`, `run_ub_from_start`,
-  `mirCall_ret`, `mirCall_ub` (`Run.lean`): lifted to Anneal's interaction
-  trees `mirTree body s` and `mirCallTree body args`: if Anneal returns `v` (or
-  can reach UB), then MiniRust started either at `bb0` or at `f.start` performs
-  the corresponding return (or raises UB) within finitely many steps.
+* `run_ret`, `run_ub`, `run_ub_rel`, `run_ret_from_start`, `run_ub_from_start`,
+  `run_ub_rel_from_start`, `mirCall_ret`, `mirCall_ub`, `mirCall_ub_rel`
+  (`Run.lean`): lifted to Anneal's interaction trees `mirTree body s` and
+  `mirCallTree body args`: if Anneal returns `v` (or can reach UB), then
+  MiniRust started either at `bb0` or at `f.start` performs the corresponding
+  return (or raises UB, localized by the `_rel` variants to step `n + 1` from a
+  `StateRel`-related machine `mLast` with `¬ ReturnRel` at every prefix step
+  `k ≤ n` via `StateRel.not_returnRel` and `step_start_no_returnRel`) within
+  finitely many steps.
 * `steps_error`, `steps_error_from_start`, `mirCall_steps_error` (`Run.lean`):
   conversely, if MiniRust stops with *any* error within `n` steps from
   `StateRel`, `StartRel`, or `mirCallTree body args`, either the error is UB and
@@ -426,8 +441,16 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `calleeDivZeroCaller`, `calleeRetUninitCaller`, and `callMoveReuse` exercise
   UB during argument evaluation, inside a pushed callee frame, on a callee's
   `Return` of an uninitialized `_0`, and on post-call reuse of an
-  `InPlace`-moved local via `mirCallWithCallees_ub` and
-  `mirCallWithCallees_steps_error`; `callSpinCaller` proves infinite lockstep
+  `InPlace`-moved local via `mirCallWithCallees_ub`,
+  `mirCallWithCallees_ub_rel` (`callArgUb_minirust_ub_rel`,
+  `calleeDivZero_minirust_ub_rel`, `calleeRetUninit_minirust_ub_rel`,
+  `callMoveReuse_minirust_ub_rel`, alongside single-body
+  `retUninit_minirust_ub_rel_from_start` and
+  `negMention0_minirust_ub_rel_from_start`), and
+  `mirCallWithCallees_steps_error`, while `projDestCaller_liveness_stabilizes`,
+  `projDestCaller_tupleInit_stabilizes`, `projDestCaller_liveAtEntry_greatest`,
+  and `projDestCaller_tupleInitAtEntry_greatest` instantiate the fixed-point
+  stabilization and greatest-fixed-point theorems; `callSpinCaller` proves infinite lockstep
   call/return divergence (`callSpin_minirust_diverges_rel`) and
   `liveCallDestSpinCaller` divergence inside a callee that never returns
   (`liveCallDestSpin_minirust_diverges_rel`); `moveReinitByCall`
@@ -718,19 +741,22 @@ These are deliberate and are the first things to lift:
 * **One thread, called from a caller frame.** MiniRust makes it UB for the
   bottom frame of the main thread to return, while Anneal's root body returns
   normally, so the relation places the root execution above an arbitrary
-  external caller. The forward UB theorems `run_ub`, `mirCall_ub`, and
-  `mirCallWithCallees_ub` conclude only that some MiniRust step raises UB; their
-  proofs produce that step before the root return, but the statements do not
-  say so, and for a `ctx` whose caller continuation itself raises UB the
-  conclusion would hold even if the callee returned normally. For
-  multi-function programs, `multi_run_ub_rel` and `mirCallWithCallees_ub_rel`
-  close this gap: the faulting step is taken from a `MultiStateRel`-related
-  machine, which still runs `entry`'s call tree and is never a `ReturnRel`
-  state (`MultiStateRel.not_returnRel`). The single-body theorems keep the
-  weaker statement. The converse theorems (`steps_error`, `mirCall_noUB`,
-  `mirCallWithCallees_steps_error`, `mirCallWithCallees_noUB`) separate the two
-  cases with `ReturnRel`, and the witnesses' external caller (`callerFn`, with
-  no blocks) stops with a `specPanic`, never UB, right after the return
+  external caller. While the plain `run_ub`, `mirCall_ub`, and
+  `mirCallWithCallees_ub` signatures conclude only `∃ n msg, Interp.steps n m =
+  .error (.ub msg)`, the localized forward UB theorems `run_ub_rel`,
+  `run_ub_rel_from_start`, `mirCall_ub_rel`, `multi_run_ub_rel`,
+  `multi_run_ub_rel_from_start`, and `mirCallWithCallees_ub_rel` close that gap
+  for both single-body and multi-function programs: the faulting step `n + 1` is
+  taken from a `StateRel`- or `MultiStateRel`-related machine `mLast` after an
+  `.ok` prefix in which `ReturnRel` holds at *no* step `k ≤ n`
+  (`StateRel.not_returnRel`, `MultiStateRel.not_returnRel`,
+  `step_start_no_returnRel`, `multi_step_start_no_returnRel`,
+  `steps_add_no_returnRel`), so the UB occurs strictly inside the subject call
+  tree prior to any root return. The converse theorems (`steps_error`,
+  `mirCall_noUB`, `mirCallWithCallees_steps_error`, `mirCallWithCallees_noUB`)
+  likewise separate pre-return faults from post-return caller steps via
+  `ReturnRel`, and the witnesses' external caller (`callerFn`, with no blocks)
+  stops with a `specPanic`, never UB, right after the return
   (`never_ub_of_nonUb_stop`).
 * **`extern "C"` entry functions.** `mkStartFn` calls the entry with
   `CallingConvention::Rust`, as `minimize`'s `mk_start_fn` does, so a
