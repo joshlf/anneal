@@ -6,7 +6,8 @@ license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
 This file may not be copied, modified, or distributed except according to
 those terms. -->
 
-# Reproduction Guide for FF-2.2: Compositional Callee, Polymorphic `(defPath, typeArgs)`, `#[external_spec]` & Pure `CallConv.rustIntrinsic` Call Resolution
+# Reproduction Guide for FF-2.2: Compositional Callee, Polymorphic,
+# `#[external_spec]` & Pure `CallConv.rustIntrinsic` Call Resolution
 
 This guide provides self-contained instructions for an independent reviewer or
 CI job to compile, kernel-check, and audit the `FF-2.2` extensions in
@@ -38,9 +39,11 @@ modification. `theory/Anneal/PureMirExec.lean` adds:
 2. **Inline Pure Callee Checker (`checkPureMirWithCallees`), Computable
    Evaluator (`evalPureMirWithCallees`), & Soundness**:
    - Recursively checks linked pure helper callees in `callees` (including
-     polymorphic `(defPath, typeArgs)` instantiations, `TraitImplEntry`
-     dispatch, `.call`, `.tailCall`, inline `core::intrinsics::exact_div`, and
-     diverging panic/abort calls) up to structural `maxCallDepth`.
+     local/projected zero-sized `RigidTy.fnDef` function-item operands via
+     `extractPureCalleeTarget?`, polymorphic `(defPath, typeArgs)`
+     instantiations, `TraitImplEntry` dispatch, `.call`, `.tailCall`, inline
+     `core::intrinsics::exact_div`, and diverging panic/abort calls) up to
+     structural `maxCallDepth`.
    - Provides executable evaluators `evalPureMirStateWithCallees`,
      `evalPureMirWithCallees`, and `checkPureMirBoolPredWithCallees` alongside
      soundness bridges `pureMirConvergesWithCallees_of_evalPureMirWithCallees`,
@@ -59,32 +62,40 @@ modification. `theory/Anneal/PureMirExec.lean` adds:
      `wrapping_add/sub/mul`, `saturating_add/sub`,
      `unchecked_add/sub/mul/div/rem/shl/shr`, `exact_div`, `three_way_compare`,
      `ub_checks`, and `const_eval_select`) in `PureRustIntrinsicKind`,
-     `evalPureRustIntrinsicWithRuntime`, and `pureRustIntrinsicContract`,
+     `evalPureRustIntrinsicWithRuntime`, `calleeRuntimeEval` (with operational
+     soundness `calleeRuntimeEval_sound`), and `pureRustIntrinsicContract`,
      normalizing `ScalarInt` bit widths, handling `.fnDef`/`.closure` and ZST
-     tuple arguments in `const_eval_select` (with automatic fallback to pure
-     scalar intrinsics), and failing closed (`none`) on UB inputs.
+     tuple arguments in `const_eval_select` (with bounded nested
+     `const_eval_select` and scalar-intrinsic fallback), and failing closed
+     (`none`) on UB inputs.
    - Provides compositional contract combination (`combineMirCallContracts` and
      `MirCallContract.Subsumes`) and `PureMirModularConverges` (`mono_contract`,
      `call_modular`, `call_modular_sub`, `call_poly_external_spec`,
      `call_poly_external_spec_sub`, `call_external_spec`,
      `call_external_spec_sub`, `call_intrinsic`, `call_intrinsic_sub`,
      `call_summary`, `call_summary_resolved`, `tailCall_summary`,
-     `call_exact_div`, `step_assert`, and `step_drop`), discharging
-     `ModularVerificationResult` via
-     `verifyModularMirWithCallees_of_pureModularExec` and
+     `tailCall_summary_resolved`, `tailCall_modular`, `tailCall_modular_sub`,
+     `tailCall_poly_external_spec_sub`, `tailCall_external_spec_sub`,
+     `tailCall_intrinsic`, `tailCall_intrinsic_sub`, `call_diverging_panic`,
+     `call_diverging_modular_sub`, `call_exact_div`, `step_assert`, and
+     `step_drop`), discharging `ModularVerificationResult` via
+     `verifyModularMir_of_pureModularExec_any`,
+     `verifyModularMirWithCallees_of_pureModularExec`, and
      `verifyModularMir_of_pureModularExec`.
-4. **Concrete Multi-Callee, Polymorphic, `TraitImplEntry`, Tail-Call, Intrinsic,
-   & `#[external_spec]` Witnesses**:
+4. **Concrete Multi-Callee, Polymorphic, Higher-Order Function-Item,
+   `TraitImplEntry`, Tail-Call, Intrinsic, & `#[external_spec]` Witnesses**:
    - Proves `nestedMultiCalleeCallerBody` invoking 2 nested helpers in
      `demoCallees := [polySwapPairBody, scaleSwapAndDivBody]` both via
      `PureMirConverges.call_summary` (`nestedMultiCalleeCaller_compositional`)
-     and via `checkPureMirWithCallees` (`nestedMultiCalleeCaller_inline`), plus
-     `combinedModularPipelineBody` (`verify_combinedModularPipeline` combining
-     `#[external_spec]`, `bswap`, `const_eval_select(ctpop)`, `assert`, inline
-     `exact_div`, and polymorphic `tailCall`) and
+     and via `checkPureMirWithCallees` (`nestedMultiCalleeCaller_inline`),
+     `combinedModularPipelineBody` (`verify_combinedModularPipeline`),
      `traitAndTailMultiMonoCallerBody` (`u32` + `u64` multi-monomorphization,
-     `TraitImplEntry` dispatch, `tailCall`, and computable
-     `evalPureMirWithCallees`).
+     `TraitImplEntry` dispatch, and `tailCall`), `higherOrderFnItemCallerBody`
+     (invoking local `Operand.move`/`Operand.copy` function-item slots in
+     `.call` and `.tailCall`), and `calleeBackedConstEvalAndIntrinsicTailBody`
+     (`verify_calleeBackedConstEvalAndIntrinsicTail` combining
+     `calleeRuntimeEval` inside `const_eval_select`, `switchInt`,
+     `call_diverging_panic`, and `tailCall_intrinsic_sub`).
 
 ## Step-by-Step Verification
 
@@ -143,9 +154,19 @@ modification. `theory/Anneal/PureMirExec.lean` adds:
    #print axioms PureMirModularConverges.call_summary
    #print axioms PureMirModularConverges.call_summary_resolved
    #print axioms PureMirModularConverges.tailCall_summary
+   #print axioms PureMirModularConverges.tailCall_summary_resolved
+   #print axioms PureMirModularConverges.tailCall_modular_sub
+   #print axioms PureMirModularConverges.tailCall_poly_external_spec_sub
+   #print axioms PureMirModularConverges.tailCall_external_spec_sub
+   #print axioms PureMirModularConverges.tailCall_intrinsic_sub
+   #print axioms PureMirModularConverges.call_diverging_panic
+   #print axioms PureMirModularConverges.call_diverging_modular_sub
    #print axioms PureMirModularConverges.step_assert
    #print axioms PureMirModularConverges.step_drop
    #print axioms PureMirModularConverges.call_exact_div
+   #print axioms resolveCallTarget_eq_of_extractPureCalleeTarget
+   #print axioms calleeRuntimeEval_sound
+   #print axioms verifyModularMir_of_pureModularExec_any
    #print axioms nestedMultiCalleeCaller_compositional
    #print axioms nestedMultiCalleeCaller_inline
    #print axioms verify_nestedMultiCalleeStatefulClaim
@@ -155,6 +176,10 @@ modification. `theory/Anneal/PureMirExec.lean` adds:
    #print axioms verify_combinedModularPipeline
    #print axioms traitAndTailMultiMonoCaller_compositional
    #print axioms traitAndTailMultiMonoCaller_evalConcrete
+   #print axioms higherOrderFnItemCaller_compositional
+   #print axioms higherOrderFnItemCaller_mirWpConverges
+   #print axioms higherOrderFnItemCaller_evalConcrete
+   #print axioms verify_calleeBackedConstEvalAndIntrinsicTail
    EOF
    cd /usr/local/google/Projects/anneal-workspace/anneal-wt-ff-2-2/examples
    anneal-lean-run --mode file --concurrency 2 -- lake env lean "$TMP_AXIOMS"
@@ -177,3 +202,14 @@ modification. `theory/Anneal/PureMirExec.lean` adds:
   `MirCallContract.Subsumes` + `_sub`/`step_assert`/`step_drop`/`call_exact_div`
   rules, and added `combinedModularPipelineBody` and
   `traitAndTailMultiMonoCallerBody` end-to-end witnesses.
+- Pass `A1` extended `checkPureTerminatorWith` and `checkPureMirWithCallees`
+  (`extractPureCalleeTarget?` and
+  `resolveCallTarget_eq_of_extractPureCalleeTarget`) to accept local and
+  projected zero-sized `RigidTy.fnDef` function-item slots
+  (`Operand.copy`/`Operand.move`), added `calleeRuntimeEval` +
+  `calleeRuntimeEval_sound` and bounded nested `const_eval_select` evaluation,
+  added modular external `tailCall_*` and diverging-call
+  (`call_diverging_panic`, `call_diverging_modular_sub`) rules plus unified
+  `verifyModularMir_of_pureModularExec_any`, and added
+  `higherOrderFnItemCallerBody` and `calleeBackedConstEvalAndIntrinsicTailBody`
+  witnesses.
