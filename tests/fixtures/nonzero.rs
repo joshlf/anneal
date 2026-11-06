@@ -7,7 +7,9 @@
 // those terms.
 
 // === case: valid_nonzero_library ===
-//@ known_bug(#108, capture): "MIR capture not yet implemented"
+//@ pass
+//@ mir-contains: "Trusted.FieldAccess.priv"
+//@ mir-not-contains: "Trusted.FieldAccess.pubSafe"
 
 /// anneal:invariant val != 0
 #[repr(transparent)]
@@ -41,7 +43,7 @@ pub fn get_unchecked(x: NonZeroUsize) -> usize {
 }
 
 // === case: buggy_safe_constructor_returns_zero ===
-//@ known_bug(#108, capture): "MIR capture not yet implemented"
+//@ fail(proof, make_nonzero): "unproved safe NonZeroUsize function"
 
 /// anneal:invariant val != 0
 #[repr(transparent)]
@@ -72,7 +74,8 @@ pub fn get_unchecked(x: NonZeroUsize) -> usize {
 }
 
 // === case: pub_field_violates_invariant ===
-//@ known_bug(#108, capture): "MIR capture not yet implemented"
+//@ fail(proof, crate): "ADT with invariant cannot have all public fields"
+//@ mir-contains: "Trusted.FieldAccess.pubSafe"
 
 /// anneal:invariant val != 0
 #[repr(transparent)]
@@ -106,7 +109,7 @@ pub fn get_unchecked(x: NonZeroUsize) -> usize {
 }
 
 // === case: buggy_unsafe_constructor ===
-//@ known_bug(#108, capture): "MIR capture not yet implemented"
+//@ fail(proof, new_unchecked): "unproved unsafe NonZeroUsize function"
 
 /// anneal:invariant val != 0
 #[repr(transparent)]
@@ -121,7 +124,7 @@ pub unsafe fn new_unchecked(x: usize) -> NonZeroUsize {
 }
 
 // === case: unsupported_requires_clause ===
-//@ known_bug(#108, capture): "MIR capture not yet implemented"
+//@ fail(proof, new_unchecked): "unsupported requires clause"
 
 /// anneal:invariant val != 0
 #[repr(transparent)]
@@ -135,7 +138,7 @@ pub unsafe fn new_unchecked(x: usize) -> NonZeroUsize {
 }
 
 // === case: unsupported_spec_on_nonzero_fn ===
-//@ known_bug(#108, capture): "MIR capture not yet implemented"
+//@ fail(proof, make_nonzero): "unsupported specs on NonZeroUsize function"
 
 /// anneal:invariant val != 0
 #[repr(transparent)]
@@ -153,7 +156,7 @@ pub fn make_nonzero(x: usize) -> NonZeroUsize {
 }
 
 // === case: struct_without_invariant ===
-//@ known_bug(#108, capture): "MIR capture not yet implemented"
+//@ fail(proof, crate): "unsupported ADT inventory"
 
 #[repr(transparent)]
 pub struct Wrapper {

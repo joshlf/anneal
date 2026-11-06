@@ -7,10 +7,10 @@
 // those terms.
 
 // === case: empty_crate_no_pub_fns ===
-//@ known_bug(#108, capture): "MIR capture not yet implemented"
+//@ fail(capture): "the crate defines no public functions"
 
 // === case: enum_item_rejected ===
-//@ known_bug(#108, capture): "MIR capture not yet implemented"
+//@ fail(capture): "unsupported item kind Enum"
 
 pub enum E {
     A,
@@ -21,7 +21,7 @@ pub fn id(x: usize) -> usize {
 }
 
 // === case: unsafe_trait_rejected ===
-//@ known_bug(#108, capture): "MIR capture not yet implemented"
+//@ fail(capture): "unsafe trait"
 
 pub unsafe trait Bad {}
 
@@ -30,7 +30,7 @@ pub fn id(x: usize) -> usize {
 }
 
 // === case: uncalled_private_fn_rejected ===
-//@ known_bug(#108, capture): "MIR capture not yet implemented"
+//@ fail(capture): "bad"
 
 fn bad(x: usize) -> usize {
     x
@@ -41,7 +41,7 @@ pub fn id(x: usize) -> usize {
 }
 
 // === case: include_str_external_file_rejected ===
-//@ known_bug(#108, capture): "MIR capture not yet implemented"
+//@ fail(capture): "Cargo.toml"
 
 pub fn id(x: usize) -> usize {
     let _ = include_str!("../Cargo.toml");
@@ -49,7 +49,7 @@ pub fn id(x: usize) -> usize {
 }
 
 // === case: env_macro_rejected ===
-//@ known_bug(#108, capture): "MIR capture not yet implemented"
+//@ fail(capture): "PATH"
 
 pub fn id(x: usize) -> usize {
     let _ = env!("PATH");

@@ -6,7 +6,7 @@
 // This file may not be copied, modified, or distributed except according to
 // those terms.
 
-//@ known_bug(#108, capture): "MIR capture not yet implemented"
+//@ pass
 
 /// anneal:spec ensures(ret == x)
 pub fn id_00(x: usize) -> usize {
