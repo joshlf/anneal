@@ -115,6 +115,43 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
   overflow boundary inputs (`INT_MAX + 1`, `INT_MIN - 1`, `UINT_MAX + 1`,
   `0 - 1`, and signed/unsigned multiplication overflow), plus UB on reading
   `.0` or `.1` from an uninitialized tuple local.
+* `arrayOpsI8`, `arraySignedIdxI8`, and `zeroArrayI8`: fixed-size homogeneous
+  arrays (`Type::Array` / `TyKind.array`), `AggregateKind.array`,
+  `Rvalue.repeat`, `Rvalue.len`, whole-array `Use(Copy)`, and
+  `ProjectionElem.index` / `ProjectionElem.constantIndex` (`fromEnd = false`
+  and `fromEnd = true`) for both reads and in-place element writes preserving
+  sibling elements, plus out-of-bounds (`idx >= count`), negative signed index
+  (`idx < 0`), and zero-length array (`[i8; 0]`) construction, `Len`, and
+  indexing UB, with a byte-level check that the in-place writes leave the
+  sibling bytes of MiniRust's array allocation intact
+  (`arrayOpsOk_minirust_inplace_bytes`).
+* `arrayUninitIdxI8`: an index local that is still uninitialized (`_1[_0]`
+  before `_0` is written) raises UB on both sides; MiniRust's `Load` of the
+  index operand fails the validity invariant before the bounds check.
+* `arrayU32Idx`: a multi-byte element type (`[u32; 3]`), so that the byte
+  offset `index * elem_size` of `PlaceExpr::Index` is exercised with
+  `elem_size = 4` (all other array witnesses use 1-byte `i8` elements, for
+  which the offset equals the index): an in-place write at index `2` lands at
+  byte offset `8` and leaves the first two elements intact, and index `3`
+  raises out-of-bounds UB on both sides.
+* `paddedStructOps`: a single-variant struct `Padded(u8, u32, u16)` with
+  non-zero inter-field and trailing padding (`offsets = [0, 4, 8]`, `size = 12`,
+  `align = 4`), exercising whole-struct `Use(Copy)`, `AggregateKind.adt`
+  construction, scalar `ProjectionElem.field` reads (`_1.0`, `_1.1`, `_2.0`,
+  `_2.2`), and in-place scalar field writes (`_1.1 = ...` at byte offset `4`),
+  with a byte-level theorem (`paddedStructOk_minirust_padding_bytes`) confirming
+  that `AbstractByte.Uninit` is preserved at padding offsets `1..4` and `10..12`
+  across both whole-struct stores and in-place field mutations.
+* `nestedTupleOps` (plus `tuple_encode_decode_place_edge_cases`): a nested
+  padded tuple `((u8, u32), u16, ())` (with inner tuple `(u8, u32)` of size `8`,
+  align `4` and zero-sized unit tuple `()` of size `0`, align `1` at offset `10`),
+  exercising `AggregateKind.tuple`, nested field reads (`copy _4.0.1`,
+  `copy _4.0.0`), nested in-place sub-tuple writes (`_4.0 = ...`), nested
+  in-place scalar field writes (`_4.0.1 = ...`), zero-sized field `Use(Copy)`
+  (`_3 = copy _4.2`), byte-level inner/outer padding preservation
+  (`nestedTupleOk_minirust_padding_bytes`), and UB paths for faulting tuple
+  aggregate operands, faulting nested field write RHS, and reading an
+  uninitialized tuple local.
 -/
 
 namespace MiniRustSpec.Correspondence.Witness
@@ -142,6 +179,122 @@ def constU32 (n : Nat) : Operand := .constant { ty := u32Ty, val := .scalar (.in
 def u32Layout : TypeLayout :=
   { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory, fields := .primitive,
     variants := .single 0, isUninhabited := false }
+
+
+@[simp] theorem arrayTypeOf_int (it : IntTy) (l : Nat) :
+    arrayTypeOf { kind := .int it, layoutIdx := l } = none := rfl
+
+@[simp] theorem arrayTypeOf_uint (ut : UintTy) (l : Nat) :
+    arrayTypeOf { kind := .uint ut, layoutIdx := l } = none := rfl
+
+@[simp] theorem tupleTypeOf_int (layouts : LayoutTable) (it : IntTy) (l : Nat) :
+    tupleTypeOf layouts { kind := .int it, layoutIdx := l } = none := rfl
+
+@[simp] theorem tupleTypeOf_uint (layouts : LayoutTable) (ut : UintTy) (l : Nat) :
+    tupleTypeOf layouts { kind := .uint ut, layoutIdx := l } = none := rfl
+
+@[simp] theorem tupleTypeOf_array (layouts : LayoutTable) (elem : RigidTy) (len l : Nat) :
+    tupleTypeOf layouts { kind := .array elem len, layoutIdx := l } = none := rfl
+
+private theorem itOf_uint (m : MirAst.Mutability) (ut : UintTy) (l : Nat) (n : Option String)
+    (layouts : LayoutTable) :
+    itOf { mutability := m, ty := { kind := .uint ut, layoutIdx := l }, debugName := n } layouts =
+      itOf { mutability := m, ty := { kind := .uint ut, layoutIdx := l }, debugName := n } := rfl
+
+private theorem tyOf_uint (m : MirAst.Mutability) (ut : UintTy) (l : Nat) (n : Option String)
+    (layouts : LayoutTable) :
+    tyOf { mutability := m, ty := { kind := .uint ut, layoutIdx := l }, debugName := n } layouts =
+      tyOf { mutability := m, ty := { kind := .uint ut, layoutIdx := l }, debugName := n } := rfl
+
+private theorem itOf_int (m : MirAst.Mutability) (it : IntTy) (l : Nat) (n : Option String)
+    (layouts : LayoutTable) :
+    itOf { mutability := m, ty := { kind := .int it, layoutIdx := l }, debugName := n } layouts =
+      itOf { mutability := m, ty := { kind := .int it, layoutIdx := l }, debugName := n } := rfl
+
+private theorem tyOf_int (m : MirAst.Mutability) (it : IntTy) (l : Nat) (n : Option String)
+    (layouts : LayoutTable) :
+    tyOf { mutability := m, ty := { kind := .int it, layoutIdx := l }, debugName := n } layouts =
+      tyOf { mutability := m, ty := { kind := .int it, layoutIdx := l }, debugName := n } := rfl
+
+private theorem itOf_bool (m : MirAst.Mutability) (l : Nat) (n : Option String)
+    (layouts : LayoutTable) :
+    itOf { mutability := m, ty := { kind := .bool, layoutIdx := l }, debugName := n } layouts =
+      itOf { mutability := m, ty := { kind := .bool, layoutIdx := l }, debugName := n } := rfl
+
+private theorem tyOf_bool (m : MirAst.Mutability) (l : Nat) (n : Option String)
+    (layouts : LayoutTable) :
+    tyOf { mutability := m, ty := { kind := .bool, layoutIdx := l }, debugName := n } layouts =
+      tyOf { mutability := m, ty := { kind := .bool, layoutIdx := l }, debugName := n } := rfl
+
+private theorem itOf_ordering (m : MirAst.Mutability) (l : Nat) (n : Option String)
+    (layouts : LayoutTable) :
+    itOf { mutability := m, ty := { kind := .adt "core::cmp::Ordering" [], layoutIdx := l },
+           debugName := n } layouts =
+      itOf { mutability := m, ty := { kind := .adt "core::cmp::Ordering" [], layoutIdx := l },
+             debugName := n } := rfl
+
+private theorem tyOf_ordering (m : MirAst.Mutability) (l : Nat) (n : Option String)
+    (layouts : LayoutTable) :
+    tyOf { mutability := m, ty := { kind := .adt "core::cmp::Ordering" [], layoutIdx := l },
+           debugName := n } layouts =
+      tyOf { mutability := m, ty := { kind := .adt "core::cmp::Ordering" [], layoutIdx := l },
+             debugName := n } := rfl
+
+private theorem itOf_u32BoolTuple (m : MirAst.Mutability) (l : Nat) (n : Option String)
+    (layouts : LayoutTable) :
+    itOf { mutability := m, ty := { kind := .tuple [.uint .u32, .bool], layoutIdx := l },
+           debugName := n } layouts =
+      itOf { mutability := m, ty := { kind := .tuple [.uint .u32, .bool], layoutIdx := l },
+             debugName := n } := rfl
+
+private theorem tyOf_u32BoolTuple (m : MirAst.Mutability) (l : Nat) (n : Option String)
+    (layouts : LayoutTable) :
+    tyOf { mutability := m, ty := { kind := .tuple [.uint .u32, .bool], layoutIdx := l },
+           debugName := n } layouts =
+      tyOf { mutability := m, ty := { kind := .tuple [.uint .u32, .bool], layoutIdx := l },
+             debugName := n } := rfl
+
+private theorem itOf_i8BoolTuple (m : MirAst.Mutability) (l : Nat) (n : Option String)
+    (layouts : LayoutTable) :
+    itOf { mutability := m, ty := { kind := .tuple [.int .i8, .bool], layoutIdx := l },
+           debugName := n } layouts =
+      itOf { mutability := m, ty := { kind := .tuple [.int .i8, .bool], layoutIdx := l },
+             debugName := n } := rfl
+
+private theorem tyOf_i8BoolTuple (m : MirAst.Mutability) (l : Nat) (n : Option String)
+    (layouts : LayoutTable) :
+    tyOf { mutability := m, ty := { kind := .tuple [.int .i8, .bool], layoutIdx := l },
+           debugName := n } layouts =
+      tyOf { mutability := m, ty := { kind := .tuple [.int .i8, .bool], layoutIdx := l },
+             debugName := n } := rfl
+
+private theorem itOf_array_int (m : MirAst.Mutability) (it : IntTy) (len l : Nat)
+    (n : Option String) (layouts : LayoutTable) :
+    itOf { mutability := m, ty := { kind := .array (.int it) len, layoutIdx := l },
+           debugName := n } layouts =
+      itOf { mutability := m, ty := { kind := .array (.int it) len, layoutIdx := l },
+             debugName := n } := rfl
+
+private theorem tyOf_array_int (m : MirAst.Mutability) (it : IntTy) (len l : Nat)
+    (n : Option String) (layouts : LayoutTable) :
+    tyOf { mutability := m, ty := { kind := .array (.int it) len, layoutIdx := l },
+           debugName := n } layouts =
+      tyOf { mutability := m, ty := { kind := .array (.int it) len, layoutIdx := l },
+             debugName := n } := rfl
+
+private theorem itOf_array_uint (m : MirAst.Mutability) (ut : UintTy) (len l : Nat)
+    (n : Option String) (layouts : LayoutTable) :
+    itOf { mutability := m, ty := { kind := .array (.uint ut) len, layoutIdx := l },
+           debugName := n } layouts =
+      itOf { mutability := m, ty := { kind := .array (.uint ut) len, layoutIdx := l },
+             debugName := n } := rfl
+
+private theorem tyOf_array_uint (m : MirAst.Mutability) (ut : UintTy) (len l : Nat)
+    (n : Option String) (layouts : LayoutTable) :
+    tyOf { mutability := m, ty := { kind := .array (.uint ut) len, layoutIdx := l },
+           debugName := n } layouts =
+      tyOf { mutability := m, ty := { kind := .array (.uint ut) len, layoutIdx := l },
+             debugName := n } := rfl
 
 def fnAbi (nargs : Nat) : FnAbi :=
   { args := List.replicate nargs { layout := u32Layout, mode := .direct },
@@ -248,7 +401,8 @@ def machineWithCtx (ctx : Ctx) (body : CapturedMir) (fn : Gen.Function) (locals 
     (blk : Gen.BbName) : Mach :=
   { prog := emptyProg,
     mem := { memory := { allocations := ctx.base ++
-                           localAllocs ctx (body.localDecls.take (body.argCount + 1)) locals,
+                           localAllocs ctx (body.localDecls.take (body.argCount + 1)) locals
+                             body.layouts,
                          _phantom := {} },
              accesses := [] },
     intptrcast := ⟨⟨[]⟩⟩,
@@ -265,23 +419,23 @@ theorem ctx0_ok1 {body : CapturedMir} (h : body.localDecls = [u32Decl]) : CtxOk 
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
     | _ + 1, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by rw [u32Decl, u32Ty, itOf_uint]; decide⟩
 
 theorem ctx0_ok2 {body : CapturedMir} (h : body.localDecls = [u32Decl, u32Decl]) : CtxOk body ctx0 where
   baseLow := by unfold BaseLow; decide
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
-    | 1, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | 1, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
     | _ + 2, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by rw [u32Decl, u32Ty, itOf_uint]; decide⟩
 
 /-! ## `sum_to(3)` -/
 
@@ -575,12 +729,12 @@ theorem ctxI8_ok2 {body : CapturedMir} (h : body.localDecls = [i8Decl, i8Decl]) 
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
-    | 1, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 1, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
     | _ + 2, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by rw [i8Decl, i8Ty, itOf_int]; decide⟩
 
 /-- MIR (`Runtime(PostCleanup)`) of
 ```rust
@@ -739,12 +893,12 @@ theorem ctx0_ok_u32_i8 {body : CapturedMir} (h : body.localDecls = [u32Decl, i8D
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
-    | 1, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | 1, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
     | _ + 2, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by rw [u32Decl, u32Ty, itOf_uint]; decide⟩
 
 /-- MIR (`Runtime(PostCleanup)`) of
 ```rust
@@ -917,13 +1071,13 @@ theorem ctxI8_ok3 {body : CapturedMir} (h : body.localDecls = [i8Decl, i8Decl, i
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
-    | 1, hd => simp at hd; subst hd; decide
-    | 2, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 1, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 2, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
     | _ + 3, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by rw [i8Decl, i8Ty, itOf_int]; decide⟩
 
 /-- MIR (`Runtime(PostCleanup)`) of
 ```rust
@@ -1720,13 +1874,13 @@ theorem ctxI8_ok_hetero {body : CapturedMir}
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
-    | 1, hd => simp at hd; subst hd; decide
-    | 2, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 1, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 2, hd => simp at hd; subst hd; rw [i32Decl, i32Ty, itOf_int, tyOf_int]; decide
     | _ + 3, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by rw [i8Decl, i8Ty, itOf_int]; decide⟩
 
 /-- MIR (`Runtime(PostCleanup)`) of
 ```rust
@@ -2072,14 +2226,14 @@ theorem ctxI8_ok_cmpNot {body : CapturedMir}
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
-    | 1, hd => simp at hd; subst hd; decide
-    | 2, hd => simp at hd; subst hd; decide
-    | 3, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 1, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 2, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 3, hd => simp at hd; subst hd; rw [boolDecl, boolTy, itOf_bool, tyOf_bool]; decide
     | _ + 4, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by rw [i8Decl, i8Ty, itOf_int]; decide⟩
 
 /-- MIR (`Runtime(PostCleanup)`) of
 ```rust
@@ -2258,13 +2412,13 @@ theorem ctxBool_ok {body : CapturedMir} (h : body.localDecls = [boolDecl, u8Decl
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
-    | 1, hd => simp at hd; subst hd; decide
-    | 2, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [boolDecl, boolTy, itOf_bool, tyOf_bool]; decide
+    | 1, hd => simp at hd; subst hd; rw [u8Decl, u8TyW, itOf_uint, tyOf_uint]; decide
+    | 2, hd => simp at hd; subst hd; rw [u8Decl, u8TyW, itOf_uint, tyOf_uint]; decide
     | _ + 3, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by rw [boolDecl, boolTy, itOf_bool]; decide⟩
 
 /-- MIR (`Runtime(PostCleanup)`) of
 ```rust
@@ -2408,12 +2562,12 @@ theorem ctxI8_ok_boolCast {body : CapturedMir} (h : body.localDecls = [i8Decl, b
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
-    | 1, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 1, hd => simp at hd; subst hd; rw [boolDecl, boolTy, itOf_bool, tyOf_bool]; decide
     | _ + 2, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by rw [i8Decl, i8Ty, itOf_int]; decide⟩
 
 /-- MIR (`Runtime(PostCleanup)`) of
 ```rust
@@ -2608,11 +2762,11 @@ theorem ctxBool_ok1 {body : CapturedMir} (h : body.localDecls = [boolDecl]) : Ct
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [boolDecl, boolTy, itOf_bool, tyOf_bool]; decide
     | _ + 1, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by rw [boolDecl, boolTy, itOf_bool]; decide⟩
 
 theorem uninitBool_anneal_ub :
     ∃ tr u, Reaches (mirCallTree uninitBool []) tr u ∧ FaultNow u :=
@@ -2756,14 +2910,14 @@ theorem ctxI8_ok_cmpSel {body : CapturedMir}
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
-    | 1, hd => simp at hd; subst hd; decide
-    | 2, hd => simp at hd; subst hd; decide
-    | 3, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [orderingDecl, orderingTyW, itOf_ordering, tyOf_ordering]; decide
+    | 1, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 2, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 3, hd => simp at hd; subst hd; rw [boolDecl, boolTy, itOf_bool, tyOf_bool]; decide
     | _ + 4, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by rw [orderingDecl, orderingTyW, itOf_ordering]; decide⟩
 
 /-- MIR (`Runtime(PostCleanup)`, with `Ord::cmp` inlined to `BinOp::Cmp`) of
 ```rust
@@ -2974,11 +3128,11 @@ theorem ctxBool_ok_ordering {body : CapturedMir} (h : body.localDecls = [orderin
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [orderingDecl, orderingTyW, itOf_ordering, tyOf_ordering]; decide
     | _ + 1, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by rw [orderingDecl, orderingTyW, itOf_ordering]; decide⟩
 
 def uninitOrderingS0 : MachineState := initMachineState uninitOrdering []
 def uninitOrderingMInit : Mach :=
@@ -3008,14 +3162,14 @@ theorem ctxI8_ok_boolBitOrdUse {body : CapturedMir}
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
-    | 1, hd => simp at hd; subst hd; decide
-    | 2, hd => simp at hd; subst hd; decide
-    | 3, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [orderingDecl, orderingTyW, itOf_ordering, tyOf_ordering]; decide
+    | 1, hd => simp at hd; subst hd; rw [boolDecl, boolTy, itOf_bool, tyOf_bool]; decide
+    | 2, hd => simp at hd; subst hd; rw [u8Decl, u8TyW, itOf_uint, tyOf_uint]; decide
+    | 3, hd => simp at hd; subst hd; rw [orderingDecl, orderingTyW, itOf_ordering, tyOf_ordering]; decide
     | _ + 4, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by rw [orderingDecl, orderingTyW, itOf_ordering]; decide⟩
 
 /-- MIR (`Runtime(PostCleanup)`) of
 ```rust
@@ -3519,15 +3673,15 @@ theorem ctxI8_ok_checkedArith {body : CapturedMir}
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
-    | 1, hd => simp at hd; subst hd; decide
-    | 2, hd => simp at hd; subst hd; decide
-    | 3, hd => simp at hd; subst hd; decide
-    | 4, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 1, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 2, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 3, hd => simp at hd; subst hd; rw [i8BoolTupleDecl, i8BoolTupleTyW, itOf_i8BoolTuple, tyOf_i8BoolTuple]; decide
+    | 4, hd => simp at hd; subst hd; rw [boolDecl, boolTy, itOf_bool, tyOf_bool]; decide
     | _ + 5, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by rw [i8Decl, i8Ty, itOf_int]; decide⟩
 
 def fnAbiCheckedArithI8 : FnAbi :=
   { args := [{ layout := i8Layout, mode := .direct }, { layout := i8Layout, mode := .direct },
@@ -3850,13 +4004,13 @@ theorem ctxTupleU32_ok {body : CapturedMir}
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
-    | 1, hd => simp at hd; subst hd; decide
-    | 2, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [u32BoolTupleDecl, u32BoolTupleTyW, itOf_u32BoolTuple, tyOf_u32BoolTuple]; decide
+    | 1, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | 2, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
     | _ + 3, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAllocTupleU32, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocTupleU32, rfl, rfl, rfl, rfl, rfl, by rw [u32BoolTupleDecl, u32BoolTupleTyW, itOf_u32BoolTuple]; decide⟩
 
 /-- MIR (`Runtime(PostCleanup)`) of
 ```rust
@@ -4079,11 +4233,11 @@ theorem ctxTupleU32_ok1 {body : CapturedMir}
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [u32BoolTupleDecl, u32BoolTupleTyW, itOf_u32BoolTuple, tyOf_u32BoolTuple]; decide
     | _ + 1, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAllocTupleU32, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAllocTupleU32, rfl, rfl, rfl, rfl, rfl, by rw [u32BoolTupleDecl, u32BoolTupleTyW, itOf_u32BoolTuple]; decide⟩
 
 /-- MIR of `fn uninit_tuple_field0() -> (u32, bool)` whose entry block reads
 `_0.0` from the uninitialized `(u32, bool)` return place `_0`
@@ -4321,11 +4475,11 @@ theorem evalValue_tuple_and_evalPlace_field :
         (intBoolTupleTy u32)) =
       .ok ((.Tuple [.Int 42, .Bool true], intBoolTupleTy u32), checkedTupleOkMInit) ∧
     evalPlace checkedTupleOkMInit (.Field (.Local (localName 0)) 0) =
-      .ok ({ ptr := { thin_pointer := { addr := 128, provenance := some (⟨1⟩, ()) }, metadata := none },
-             aligned := true }, .Int u32) ∧
+      .ok (({ ptr := { thin_pointer := { addr := 128, provenance := some (⟨1⟩, ()) }, metadata := none },
+              aligned := true }, .Int u32), checkedTupleOkMInit) ∧
     evalPlace checkedTupleOkMInit (.Field (.Local (localName 0)) 1) =
-      .ok ({ ptr := { thin_pointer := { addr := 132, provenance := some (⟨1⟩, ()) }, metadata := none },
-             aligned := true }, .Bool) := ⟨rfl, rfl, rfl⟩
+      .ok (({ ptr := { thin_pointer := { addr := 132, provenance := some (⟨1⟩, ()) }, metadata := none },
+              aligned := true }, .Bool), checkedTupleOkMInit) := ⟨rfl, rfl, rfl⟩
 
 /-- `evalBinOp (.IntWithOverflow ..)` on a non-integer operand and `evalPlace (.Field ..)`
 on an out-of-range field index, a missing unsized tail, or a non-projectable
@@ -4394,11 +4548,11 @@ def unionFieldTestMach : Mach :=
 
 theorem evalPlace_field_union_and_offset_panic :
     evalPlace unionFieldTestMach (.Field (.Local (localName 0)) 0) =
-      .ok ({ ptr := { thin_pointer := { addr := 128, provenance := some (⟨1⟩, ()) }, metadata := none },
-             aligned := true }, .Int i8) ∧
+      .ok (({ ptr := { thin_pointer := { addr := 128, provenance := some (⟨1⟩, ()) }, metadata := none },
+              aligned := true }, .Int i8), unionFieldTestMach) ∧
     evalPlace unionFieldTestMach (.Field (.Local (localName 0)) 1) =
-      .ok ({ ptr := { thin_pointer := { addr := 130, provenance := some (⟨1⟩, ()) }, metadata := none },
-             aligned := true }, .Bool) ∧
+      .ok (({ ptr := { thin_pointer := { addr := 130, provenance := some (⟨1⟩, ()) }, metadata := none },
+              aligned := true }, .Bool), unionFieldTestMach) ∧
     evalPlace unionFieldTestMach (.Field (.Local (localName 1)) 0) =
       .error (.specPanic "assertion failed: offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata)") :=
   ⟨rfl, rfl, rfl⟩
@@ -5602,12 +5756,12 @@ theorem ctx0_ok_u32_tuple {body : CapturedMir}
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
-    | 1, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | 1, hd => simp at hd; subst hd; rw [u32BoolTupleDecl, u32BoolTupleTyW, itOf_u32BoolTuple, tyOf_u32BoolTuple]; decide
     | _ + 2, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by rw [u32Decl, u32Ty, itOf_uint]; decide⟩
 
 def deadPlaceMention : CapturedMir where
   defPath := "witness::dead_place_mention"
@@ -6001,13 +6155,13 @@ theorem ctx0_ok_u32_3 {body : CapturedMir}
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
-    | 1, hd => simp at hd; subst hd; decide
-    | 2, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | 1, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | 2, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
     | _ + 3, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by rw [u32Decl, u32Ty, itOf_uint]; decide⟩
 
 def storageLiveArgRet5S0 : MachineState :=
   initMachineState storageLiveArgRet [.scalar ⟨5, 4⟩]
@@ -6189,14 +6343,14 @@ theorem ctx0_2_ok_bool_u32 {body : CapturedMir}
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
-    | 1, hd => simp at hd; subst hd; decide
-    | 2, hd => simp at hd; subst hd; decide
-    | 3, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | 1, hd => simp at hd; subst hd; rw [boolDecl, boolTy, itOf_bool, tyOf_bool]; decide
+    | 2, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | 3, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
     | _ + 4, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by rw [u32Decl, u32Ty, itOf_uint]; decide⟩
 
 /-- A 4-block diamond CFG `fn(flag: bool, x: u32) -> u32` accepted by
 `inFragment = true`: `bb0` branches via `SwitchInt(move _1)` to `bb1` (which
@@ -6465,16 +6619,16 @@ theorem ctx0_ok_tupleAggCastMove {body : CapturedMir}
   addrs := by
     intro i d _ hd; rw [h] at hd
     match i, hd with
-    | 0, hd => simp at hd; subst hd; decide
-    | 1, hd => simp at hd; subst hd; decide
-    | 2, hd => simp at hd; subst hd; decide
-    | 3, hd => simp at hd; subst hd; decide
-    | 4, hd => simp at hd; subst hd; decide
-    | 5, hd => simp at hd; subst hd; decide
+    | 0, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | 1, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 2, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 3, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | 4, hd => simp at hd; subst hd; rw [boolDecl, boolTy, itOf_bool, tyOf_bool]; decide
+    | 5, hd => simp at hd; subst hd; rw [u32BoolTupleDecl, u32BoolTupleTyW, itOf_u32BoolTuple, tyOf_u32BoolTuple]; decide
     | _ + 6, hd => simp at hd
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
-    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by rw [u32Decl, u32Ty, itOf_uint]; decide⟩
 
 /-- `tupleAggCastMove`: `fn(x: i8) -> u32` exercising `Operand::Move` across
 `Rvalue::UnaryOp(Neg, move _1)` on `i8`, `Rvalue::Cast(IntToInt, move _2, u32)`
@@ -6946,5 +7100,1957 @@ theorem ordBoolCastTempMoveFalse_minirust_direct :
         [64, 128, 256, 384, 512, 2 ^ 32, 2 ^ 32],
         [1]) := by
   decide +kernel
+
+/-! ## Homogeneous arrays (`Type::Array`), `Repeat`, `Len`, and `Index`/`ConstantIndex` projections -/
+
+def usizeTy : Ty := { kind := .uint .usize, layoutIdx := 0 }
+def usizeDecl : LocalDecl := { mutability := .mut, ty := usizeTy, debugName := none }
+def constUsize (n : Nat) : Operand := .constant { ty := usizeTy, val := .scalar (.int ⟨n, 8⟩) }
+
+def arrI8_3Ty : Ty := { kind := .array (.int .i8) 3, layoutIdx := 0 }
+def arrI8_3Decl : LocalDecl := { mutability := .mut, ty := arrI8_3Ty, debugName := none }
+
+def arrI8_2Ty : Ty := { kind := .array (.int .i8) 2, layoutIdx := 0 }
+def arrI8_2Decl : LocalDecl := { mutability := .mut, ty := arrI8_2Ty, debugName := none }
+
+def arrI8_0Ty : Ty := { kind := .array (.int .i8) 0, layoutIdx := 0 }
+def arrI8_0Decl : LocalDecl := { mutability := .mut, ty := arrI8_0Ty, debugName := none }
+
+def usizeLayout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false }
+
+def arrI8_3Layout : TypeLayout :=
+  { size := { bytes := 3 }, align := { bytes := 1 }, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false }
+
+def arrI8_2Layout : TypeLayout :=
+  { size := { bytes := 2 }, align := { bytes := 1 }, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false }
+
+def arrI8_0Layout : TypeLayout :=
+  { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false }
+
+def fnAbiArrayOps : FnAbi :=
+  { args := [{ layout := arrI8_3Layout, mode := .direct },
+             { layout := arrI8_3Layout, mode := .direct },
+             { layout := i8Layout, mode := .direct },
+             { layout := usizeLayout, mode := .direct },
+             { layout := usizeLayout, mode := .direct }],
+    ret := { layout := i8Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+def ctxI8_6 : Ctx :=
+  { caller := callerFrameI8, payloads := [], base := [retAllocI8],
+    addrs := [128, 256, 384, 512, 640, 768],
+    nextBlock := bbName 7, unwindBlock := none, retPtr := retPtr }
+
+theorem ctxI8_ok_arrayOps {body : CapturedMir}
+    (h : body.localDecls = [i8Decl, arrI8_3Decl, arrI8_3Decl, i8Decl, usizeDecl, usizeDecl]) :
+    CtxOk body ctxI8_6 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d _ hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 1, hd => simp at hd; subst hd; rw [arrI8_3Decl, arrI8_3Ty, itOf_array_int, tyOf_array_int]; decide
+    | 2, hd => simp at hd; subst hd; rw [arrI8_3Decl, arrI8_3Ty, itOf_array_int, tyOf_array_int]; decide
+    | 3, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 4, hd => simp at hd; subst hd; rw [usizeDecl, usizeTy, itOf_uint, tyOf_uint]; decide
+    | 5, hd => simp at hd; subst hd; rw [usizeDecl, usizeTy, itOf_uint, tyOf_uint]; decide
+    | _ + 6, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by rw [i8Decl, i8Ty, itOf_int]; decide⟩
+
+def placeIdx (i idxLocal : Nat) : Place :=
+  { local_ := i, projection := [.index idxLocal] }
+
+def placeConstIdx (i offset minLen : Nat) (fromEnd : Bool) : Place :=
+  { local_ := i, projection := [.constantIndex offset minLen fromEnd] }
+
+/-- MIR (`Runtime(PostCleanup)`) of a function exercising homogeneous `[i8; 3]`
+arrays across all six `MR-2.1` constructs:
+1. `_1 = [copy _3, 10i8, 20i8]` (`Rvalue.aggregate (.array i8Ty)`),
+2. `_2 = [5i8; 3]` (`Rvalue.repeat`),
+3. `_2 = copy _1` (whole-array `Rvalue.use (.copy _1)`),
+4. `_2[_4] = Add(copy _2[_4], 7i8)` (`ProjectionElem.index` read and in-place write),
+5. `_2[-1 of 3] = Sub(copy _2[-1 of 3], copy _2[0 of 3])`
+   (`ProjectionElem.constantIndex` with `fromEnd = true` and `fromEnd = false`,
+   both read and in-place write),
+6. `_5 = Len(_2)` (`Rvalue.len`), cast to `i8`, and summed with all three
+   elements `_2[_4]`, `_2[-1 of 3]`, and `_2[0 of 3]` to verify that in-place
+   indexed writes preserve sibling elements. -/
+def arrayOpsI8 : CapturedMir where
+  defPath := "witness::array_ops_i8"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 5
+  localDecls := [i8Decl, arrI8_3Decl, arrI8_3Decl, i8Decl, usizeDecl, usizeDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 1)
+          (.aggregate (.array i8Ty) [.copy (local_ 3), constI8 10, constI8 20])),
+        mkStmt (.assign (local_ 2) (.repeat (constI8 5) 3)),
+        mkStmt (.assign (local_ 2) (.use (.copy (local_ 1)))),
+        mkStmt (.assign (placeIdx 2 4)
+          (.binaryOp .add (.copy (placeIdx 2 4)) (constI8 7))),
+        mkStmt (.assign (placeConstIdx 2 1 3 true)
+          (.binaryOp .sub (.copy (placeConstIdx 2 1 3 true)) (.copy (placeConstIdx 2 0 3 false)))),
+        mkStmt (.assign (local_ 5) (.len (local_ 2))),
+        mkStmt (.assign (local_ 0) (.cast .intToInt (.copy (local_ 5)) i8Ty)),
+        mkStmt (.assign (local_ 0)
+          (.binaryOp .add (.copy (local_ 0)) (.copy (placeIdx 2 4)))),
+        mkStmt (.assign (local_ 0)
+          (.binaryOp .add (.copy (local_ 0)) (.copy (placeConstIdx 2 1 3 true)))),
+        mkStmt (.assign (local_ 0)
+          (.binaryOp .add (.copy (local_ 0)) (.copy (placeConstIdx 2 0 3 false))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiArrayOps
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem arrayOpsI8_inFragment : inFragment arrayOpsI8 = true := by decide
+
+def arrayOpsI8Fn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int i8),
+    (localName 1, .Array (.Int i8) 3),
+    (localName 2, .Array (.Int i8) 3),
+    (localName 3, .Int i8),
+    (localName 4, .Int usizeIt),
+    (localName 5, .Int usizeIt)]⟩
+  args := [localName 1, localName 2, localName 3, localName 4, localName 5]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 1))
+        (.Tuple [
+          .Load (.Local (localName 3)),
+          .Constant (.Int 10) (.Int i8),
+          .Constant (.Int 20) (.Int i8)] (.Array (.Int i8) 3)),
+      .Assign (.Local (localName 2))
+        (.Tuple [
+          .Constant (.Int 5) (.Int i8),
+          .Constant (.Int 5) (.Int i8),
+          .Constant (.Int 5) (.Int i8)] (.Array (.Int i8) 3)),
+      .Assign (.Local (localName 2)) (.Load (.Local (localName 1))),
+      .Assign (.Index (.Local (localName 2)) (.Load (.Local (localName 4))))
+        (.BinOp (.Int .Add)
+          (.Load (.Index (.Local (localName 2)) (.Load (.Local (localName 4)))))
+          (.Constant (.Int 7) (.Int i8))),
+      .Assign (.Index (.Local (localName 2)) (.Constant (.Int 2) (.Int usizeIt)))
+        (.BinOp (.Int .Sub)
+          (.Load (.Index (.Local (localName 2)) (.Constant (.Int 2) (.Int usizeIt))))
+          (.Load (.Index (.Local (localName 2)) (.Constant (.Int 0) (.Int usizeIt))))),
+      .Assign (.Local (localName 5)) (.Constant (.Int 3) (.Int usizeIt)),
+      .Assign (.Local (localName 0)) (.UnOp (.Cast (.IntToInt i8)) (.Load (.Local (localName 5)))),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add)
+          (.Load (.Local (localName 0)))
+          (.Load (.Index (.Local (localName 2)) (.Load (.Local (localName 4)))))),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add)
+          (.Load (.Local (localName 0)))
+          (.Load (.Index (.Local (localName 2)) (.Constant (.Int 2) (.Int usizeIt))))),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add)
+          (.Load (.Local (localName 0)))
+          (.Load (.Index (.Local (localName 2)) (.Constant (.Int 0) (.Int usizeIt)))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem arrayOpsI8_translate : translateFn arrayOpsI8 = some arrayOpsI8Fn := rfl
+
+def initArrI8_3 : Value := .aggregate 0 [.scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩, .scalar ⟨0, 1⟩]
+
+def arrayOpsOkArgs : List Value :=
+  [initArrI8_3, initArrI8_3, .scalar ⟨3, 1⟩, .scalar ⟨1, 8⟩, .scalar ⟨0, 8⟩]
+
+/-- Input `_3 = 3i8`, `_4 = 1usize`:
+* `_1 = [3, 10, 20]`, `_2 = [5, 5, 5]`, then `_2 = copy _1 = [3, 10, 20]`;
+* `_2[1] = _2[1] + 7 = 17`, so `_2 = [3, 17, 20]`;
+* `_2[2] = _2[2] - _2[0] = 20 - 3 = 17`, so `_2 = [3, 17, 17]`;
+* `_5 = Len(_2) = 3usize`, and `_0 = 3 + 17 + 17 + 3 = 40i8`. -/
+def arrayOpsOkS0 : MachineState := initMachineState arrayOpsI8 arrayOpsOkArgs
+def arrayOpsOkMInit : Mach :=
+  machineWithCtx ctxI8_6 arrayOpsI8 arrayOpsI8Fn arrayOpsOkS0.frame.locals arrayOpsI8Fn.start
+
+theorem arrayOpsOk_anneal_ret :
+    ReachesRet (mirCallTree arrayOpsI8 arrayOpsOkArgs) []
+      (.normal (.scalar ⟨40, 1⟩, arrayOpsOkS0.memory)) :=
+  runA_sound arrayOpsI8 16 _ _ _ rfl
+
+theorem arrayOpsOk_noUB :
+    MirNoUBTree (mirCallTree arrayOpsI8 arrayOpsOkArgs) :=
+  runA_noUB arrayOpsI8 16 _ _ _ rfl
+
+theorem arrayOpsOk_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n arrayOpsOkMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 40 } ∧
+      m'.threads = [thread1 ctxI8_6 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret arrayOpsI8_inFragment arrayOpsI8_translate ctxI8_6
+      (ctxI8_ok_arrayOps rfl) arrayOpsOkArgs (by decide)
+      arrayOpsOkMInit rfl rfl rfl arrayOpsOk_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [arrayOpsI8] at hd; subst hd
+  simp [retPtr, ctxI8_6] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_6] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem arrayOpsOk_minirust_direct :
+    (Interp.steps 12 arrayOpsOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 40 }, [1]) := rfl
+
+/-- Byte-level view of the in-place element writes of `arrayOpsI8` on the
+input of `arrayOpsOkArgs`. MiniRust's allocation `3` is `_2`'s (after the
+caller's return allocation and those of `_0` and `_1`). After step `4`
+(`_2 = copy _1`) it holds the bytes of `[3, 10, 20]`; step `5`
+(`_2[_4] = _2[_4] + 7`) rewrites only the byte at offset `1`, giving
+`[3, 17, 20]`; step `6` (`_2[-1 of 3] = _2[-1 of 3] - _2[0 of 3]`) rewrites
+only the byte at offset `2`, giving `[3, 17, 17]`. Each store leaves the
+sibling bytes before and after the written element unchanged. -/
+theorem arrayOpsOk_minirust_inplace_bytes :
+    [4, 5, 6].map (fun k => (Interp.steps k arrayOpsOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[3]?).map (·.data))) =
+      [some (some (scalarBytes i8 3 ++ scalarBytes i8 10 ++ scalarBytes i8 20)),
+       some (some (scalarBytes i8 3 ++ scalarBytes i8 17 ++ scalarBytes i8 20)),
+       some (some (scalarBytes i8 3 ++ scalarBytes i8 17 ++ scalarBytes i8 17))] := rfl
+
+/-- On `Terminator::Return` at step `12` of `arrayOpsI8`, `evalReturn` calls
+`storageDead` on every callee local (`_0`..`_5`, allocations `1..=6`), verifying
+`BM.deallocate` against each local's layout (`size = 3, align = 1` for the two
+`[i8; 3]` array locals `_1` and `_2` at allocations `2` and `3`) and marking all
+six callee stack allocations `live = false` while keeping the caller's return
+allocation `0` `live = true`. -/
+theorem arrayOpsOk_minirust_ret_dealloc :
+    (Interp.steps 12 arrayOpsOkMInit).toOption.map
+        (fun m => m.mem.memory.allocations.map (fun a => (a.live, a.data.length))) =
+      some [(true, 1), (false, 1), (false, 3), (false, 3), (false, 1), (false, 8), (false, 8)] := rfl
+
+/-- Out-of-bounds `Index` (`_4 = 3usize >= 3`) on `arrayOpsI8`: raises UB on
+`_2[_4]`. -/
+def arrayOpsOobArgs : List Value :=
+  [initArrI8_3, initArrI8_3, .scalar ⟨3, 1⟩, .scalar ⟨3, 8⟩, .scalar ⟨0, 8⟩]
+
+def arrayOpsOobS0 : MachineState := initMachineState arrayOpsI8 arrayOpsOobArgs
+def arrayOpsOobMInit : Mach :=
+  machineWithCtx ctxI8_6 arrayOpsI8 arrayOpsI8Fn arrayOpsOobS0.frame.locals arrayOpsI8Fn.start
+
+theorem arrayOpsOob_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree arrayOpsI8 arrayOpsOobArgs) tr u ∧ FaultNow u :=
+  faultsA_sound arrayOpsI8 8 _ (by decide)
+
+theorem arrayOpsOob_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arrayOpsOobMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arrayOpsOob_anneal_ub
+  exact mirCall_ub arrayOpsI8_inFragment arrayOpsI8_translate ctxI8_6
+    (ctxI8_ok_arrayOps rfl) arrayOpsOobArgs (by decide)
+    arrayOpsOobMInit rfl rfl rfl hr hf
+
+theorem arrayOpsOob_minirust_direct :
+    Interp.steps 5 arrayOpsOobMInit = .error (.ub "access to out-of-bounds index") := rfl
+
+theorem arrayOpsOob_converse_error :
+    (∃ msg, Stop.ub "access to out-of-bounds index" = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree arrayOpsI8 arrayOpsOobArgs) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 5 ∧ Interp.steps k arrayOpsOobMInit = .ok mRet ∧
+      ReturnRel arrayOpsI8 ctxI8_6 s' v mRet ∧
+      ReachesRet (mirCallTree arrayOpsI8 arrayOpsOobArgs) tr (.normal (v, mem))) :=
+  mirCall_steps_error arrayOpsI8_inFragment arrayOpsI8_translate ctxI8_6
+    (ctxI8_ok_arrayOps rfl) arrayOpsOobArgs (by decide)
+    arrayOpsOobMInit rfl rfl rfl arrayOpsOob_minirust_direct
+
+/-! ## Signed index local (`i8`), negative index UB (`idx < 0`), and in-place write UB -/
+
+def fnAbiArraySignedIdx : FnAbi :=
+  { args := [{ layout := arrI8_2Layout, mode := .direct },
+             { layout := i8Layout, mode := .direct }],
+    ret := { layout := i8Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+theorem ctxI8_ok_arraySignedIdx {body : CapturedMir}
+    (h : body.localDecls = [i8Decl, arrI8_2Decl, i8Decl]) : CtxOk body ctxI8_3 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d _ hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 1, hd => simp at hd; subst hd; rw [arrI8_2Decl, arrI8_2Ty, itOf_array_int, tyOf_array_int]; decide
+    | 2, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | _ + 3, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by rw [i8Decl, i8Ty, itOf_int]; decide⟩
+
+/-- MIR (`Runtime(PostCleanup)`) of a function that indexes `[i8; 2]` with a
+signed `i8` index local `_2` in both an in-place write `_1[_2] = const 99i8`
+and a read `_0 = copy _1[_2]`. -/
+def arraySignedIdxI8 : CapturedMir where
+  defPath := "witness::array_signed_idx_i8"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [i8Decl, arrI8_2Decl, i8Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (placeIdx 1 2) (.use (constI8 99))),
+        mkStmt (.assign (local_ 0) (.use (.copy (placeIdx 1 2))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiArraySignedIdx
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem arraySignedIdxI8_inFragment : inFragment arraySignedIdxI8 = true := by decide
+
+def arraySignedIdxI8Fn : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8), (localName 1, .Array (.Int i8) 2), (localName 2, .Int i8)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Index (.Local (localName 1)) (.Load (.Local (localName 2))))
+        (.Constant (.Int 99) (.Int i8)),
+      .Assign (.Local (localName 0))
+        (.Load (.Index (.Local (localName 1)) (.Load (.Local (localName 2)))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem arraySignedIdxI8_translate : translateFn arraySignedIdxI8 = some arraySignedIdxI8Fn := rfl
+
+def initArrI8_2 : Value := .aggregate 0 [.scalar ⟨11, 1⟩, .scalar ⟨22, 1⟩]
+
+/-- Signed index `_2 = 1i8`: writes `_1[1] = 99i8` and returns `99i8`. -/
+def arraySignedIdxOkS0 : MachineState :=
+  initMachineState arraySignedIdxI8 [initArrI8_2, .scalar ⟨1, 1⟩]
+def arraySignedIdxOkMInit : Mach :=
+  machineWithCtx ctxI8_3 arraySignedIdxI8 arraySignedIdxI8Fn
+    arraySignedIdxOkS0.frame.locals arraySignedIdxI8Fn.start
+
+theorem arraySignedIdxOk_anneal_ret :
+    ReachesRet (mirCallTree arraySignedIdxI8 [initArrI8_2, .scalar ⟨1, 1⟩]) []
+      (.normal (.scalar ⟨99, 1⟩, arraySignedIdxOkS0.memory)) :=
+  runA_sound arraySignedIdxI8 8 _ _ _ rfl
+
+theorem arraySignedIdxOk_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n arraySignedIdxOkMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 99 } ∧
+      m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret arraySignedIdxI8_inFragment arraySignedIdxI8_translate ctxI8_3
+      (ctxI8_ok_arraySignedIdx rfl) [initArrI8_2, .scalar ⟨1, 1⟩] (by decide)
+      arraySignedIdxOkMInit rfl rfl rfl arraySignedIdxOk_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [arraySignedIdxI8] at hd; subst hd
+  simp [retPtr, ctxI8_3] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_3] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem arraySignedIdxOk_minirust_direct :
+    (Interp.steps 4 arraySignedIdxOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 99 }, [1]) := rfl
+
+/-- Negative signed index `_2 = -1i8` (bits `255` in `i8`): raises UB on the
+in-place element write `_1[_2] = 99i8`. -/
+def arraySignedNegUbS0 : MachineState :=
+  initMachineState arraySignedIdxI8 [initArrI8_2, .scalar ⟨255, 1⟩]
+def arraySignedNegUbMInit : Mach :=
+  machineWithCtx ctxI8_3 arraySignedIdxI8 arraySignedIdxI8Fn
+    arraySignedNegUbS0.frame.locals arraySignedIdxI8Fn.start
+
+theorem arraySignedNegUb_anneal_ub :
+    ∃ tr u,
+      Reaches (mirCallTree arraySignedIdxI8 [initArrI8_2, .scalar ⟨255, 1⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound arraySignedIdxI8 6 _ (by decide)
+
+theorem arraySignedNegUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arraySignedNegUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arraySignedNegUb_anneal_ub
+  exact mirCall_ub arraySignedIdxI8_inFragment arraySignedIdxI8_translate ctxI8_3
+    (ctxI8_ok_arraySignedIdx rfl) [initArrI8_2, .scalar ⟨255, 1⟩] (by decide)
+    arraySignedNegUbMInit rfl rfl rfl hr hf
+
+theorem arraySignedNegUb_minirust_direct :
+    Interp.steps 2 arraySignedNegUbMInit = .error (.ub "access to out-of-bounds index") := rfl
+
+/-- Out-of-bounds positive signed index `_2 = 2i8` (`2 >= 2`): raises UB on the
+in-place element write `_1[_2] = 99i8`. -/
+def arraySignedOobUbS0 : MachineState :=
+  initMachineState arraySignedIdxI8 [initArrI8_2, .scalar ⟨2, 1⟩]
+def arraySignedOobUbMInit : Mach :=
+  machineWithCtx ctxI8_3 arraySignedIdxI8 arraySignedIdxI8Fn
+    arraySignedOobUbS0.frame.locals arraySignedIdxI8Fn.start
+
+theorem arraySignedOobUb_anneal_ub :
+    ∃ tr u,
+      Reaches (mirCallTree arraySignedIdxI8 [initArrI8_2, .scalar ⟨2, 1⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound arraySignedIdxI8 6 _ (by decide)
+
+theorem arraySignedOobUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arraySignedOobUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arraySignedOobUb_anneal_ub
+  exact mirCall_ub arraySignedIdxI8_inFragment arraySignedIdxI8_translate ctxI8_3
+    (ctxI8_ok_arraySignedIdx rfl) [initArrI8_2, .scalar ⟨2, 1⟩] (by decide)
+    arraySignedOobUbMInit rfl rfl rfl hr hf
+
+theorem arraySignedOobUb_minirust_direct :
+    Interp.steps 2 arraySignedOobUbMInit = .error (.ub "access to out-of-bounds index") := rfl
+
+/-! ## Zero-length array `[i8; 0]` construction, `Len`, and out-of-bounds indexing at `0` -/
+
+def fnAbiZeroArray : FnAbi :=
+  { args := [{ layout := arrI8_0Layout, mode := .direct },
+             { layout := usizeLayout, mode := .direct }],
+    ret := { layout := i8Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+theorem ctxI8_ok_zeroArray {body : CapturedMir}
+    (h : body.localDecls = [i8Decl, arrI8_0Decl, usizeDecl]) : CtxOk body ctxI8_3 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d _ hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 1, hd => simp at hd; subst hd; rw [arrI8_0Decl, arrI8_0Ty, itOf_array_int, tyOf_array_int]; decide
+    | 2, hd => simp at hd; subst hd; rw [usizeDecl, usizeTy, itOf_uint, tyOf_uint]; decide
+    | _ + 3, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by rw [i8Decl, i8Ty, itOf_int]; decide⟩
+
+/-- MIR (`Runtime(PostCleanup)`) of a function exercising a zero-length array
+`[i8; 0]` (`_1`):
+* in `bb0`, constructs `_1 = []` via `Rvalue.aggregate (.array i8Ty) []` and
+  copies `_1 = copy _1` via `Rvalue.use (.copy _1)`, then switches on `_2`;
+* when `_2 == 0` (`bb1`), constructs `_1 = [5i8; 0]` via
+  `Rvalue.repeat (constI8 5) 0`, computes `_2 = Len(_1)` (`= 0usize`), casts to
+  `0i8`, and returns;
+* when `_2 != 0` (`bb2`), sets `_2 = 0usize` and attempts to read `_1[_2]` at
+  index `0`, raising out-of-bounds UB (`0 >= 0`). -/
+def zeroArrayI8 : CapturedMir where
+  defPath := "witness::zero_array_i8"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [i8Decl, arrI8_0Decl, usizeDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 1) (.aggregate (.array i8Ty) [])),
+        mkStmt (.assign (local_ 1) (.use (.copy (local_ 1))))],
+      terminator := mkTerm (.switchInt (.copy (local_ 2))
+        { branches := [(0, 1)], otherwise := 2 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 1) (.repeat (constI8 5) 0)),
+        mkStmt (.assign (local_ 2) (.len (local_ 1))),
+        mkStmt (.assign (local_ 0) (.cast .intToInt (.copy (local_ 2)) i8Ty))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 2) (.use (constUsize 0))),
+        mkStmt (.assign (local_ 0) (.use (.copy (placeIdx 1 2))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiZeroArray
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem zeroArrayI8_inFragment : inFragment zeroArrayI8 = true := by decide
+
+def zeroArrayI8Fn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int i8),
+    (localName 1, .Array (.Int i8) 0),
+    (localName 2, .Int usizeIt)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 1)) (.Tuple [] (.Array (.Int i8) 0)),
+      .Assign (.Local (localName 1)) (.Load (.Local (localName 1)))],
+      .Switch (.Load (.Local (localName 2))) ⟨[(0, bbName 1)]⟩ (bbName 2), .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 1)) (.Tuple [] (.Array (.Int i8) 0)),
+      .Assign (.Local (localName 2)) (.Constant (.Int 0) (.Int usizeIt)),
+      .Assign (.Local (localName 0)) (.UnOp (.Cast (.IntToInt i8)) (.Load (.Local (localName 2))))],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Local (localName 2)) (.Constant (.Int 0) (.Int usizeIt)),
+      .Assign (.Local (localName 0))
+        (.Load (.Index (.Local (localName 1)) (.Load (.Local (localName 2)))))],
+      .Return, .Regular⟩),
+    (bbName 3, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 3
+  implicit_writes := true
+
+theorem zeroArrayI8_translate : translateFn zeroArrayI8 = some zeroArrayI8Fn := rfl
+
+def initArrI8_0 : Value := .aggregate 0 []
+
+/-- `_2 = 0usize`: constructs `[i8; 0]`, repeats `[5i8; 0]`, reads `Len(_1) = 0`,
+and returns `0i8`. -/
+def zeroArrayOkS0 : MachineState :=
+  initMachineState zeroArrayI8 [initArrI8_0, .scalar ⟨0, 8⟩]
+def zeroArrayOkMInit : Mach :=
+  machineWithCtx ctxI8_3 zeroArrayI8 zeroArrayI8Fn
+    zeroArrayOkS0.frame.locals zeroArrayI8Fn.start
+
+def zeroArrayOkTrace : List (Event MirEffect) :=
+  [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
+
+theorem zeroArrayOk_anneal_ret :
+    ReachesRet (mirCallTree zeroArrayI8 [initArrI8_0, .scalar ⟨0, 8⟩])
+      zeroArrayOkTrace (.normal (.scalar ⟨0, 1⟩, zeroArrayOkS0.memory)) :=
+  runA_sound zeroArrayI8 12 _ _ _ rfl
+
+theorem zeroArrayOk_noUB :
+    MirNoUBTree (mirCallTree zeroArrayI8 [initArrI8_0, .scalar ⟨0, 8⟩]) :=
+  runA_noUB zeroArrayI8 12 _ _ _ rfl
+
+theorem zeroArrayOk_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n zeroArrayOkMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 0 } ∧
+      m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret zeroArrayI8_inFragment zeroArrayI8_translate ctxI8_3
+      (ctxI8_ok_zeroArray rfl) [initArrI8_0, .scalar ⟨0, 8⟩] (by decide)
+      zeroArrayOkMInit rfl rfl rfl zeroArrayOk_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [zeroArrayI8] at hd; subst hd
+  simp [retPtr, ctxI8_3] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_3] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem zeroArrayOk_minirust_direct :
+    (Interp.steps 8 zeroArrayOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 0 }, [1]) := rfl
+
+/-- `_2 = 1usize`: takes `bb2` and indexes `[i8; 0]` at `0usize`, raising
+out-of-bounds UB (`0 >= 0`). -/
+def zeroArrayIdxUbS0 : MachineState :=
+  initMachineState zeroArrayI8 [initArrI8_0, .scalar ⟨1, 8⟩]
+def zeroArrayIdxUbMInit : Mach :=
+  machineWithCtx ctxI8_3 zeroArrayI8 zeroArrayI8Fn
+    zeroArrayIdxUbS0.frame.locals zeroArrayI8Fn.start
+
+theorem zeroArrayIdxUb_anneal_ub :
+    ∃ tr u,
+      Reaches (mirCallTree zeroArrayI8 [initArrI8_0, .scalar ⟨1, 8⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound zeroArrayI8 10 _ (by decide)
+
+theorem zeroArrayIdxUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n zeroArrayIdxUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := zeroArrayIdxUb_anneal_ub
+  exact mirCall_ub zeroArrayI8_inFragment zeroArrayI8_translate ctxI8_3
+    (ctxI8_ok_zeroArray rfl) [initArrI8_0, .scalar ⟨1, 8⟩] (by decide)
+    zeroArrayIdxUbMInit rfl rfl rfl hr hf
+
+theorem zeroArrayIdxUb_minirust_direct :
+    Interp.steps 6 zeroArrayIdxUbMInit = .error (.ub "access to out-of-bounds index") := rfl
+
+/-! ## Uninitialized index local (`_1[_0]` while `_0` is still `.uninit`) -/
+
+def fnAbiArrayUninitIdx : FnAbi :=
+  { args := [{ layout := arrI8_2Layout, mode := .direct }],
+    ret := { layout := i8Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+theorem ctxI8_ok_arrayUninitIdx {body : CapturedMir}
+    (h : body.localDecls = [i8Decl, arrI8_2Decl]) : CtxOk body ctxI8 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d _ hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 1, hd => simp at hd; subst hd; rw [arrI8_2Decl, arrI8_2Ty, itOf_array_int, tyOf_array_int]; decide
+    | _ + 2, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by rw [i8Decl, i8Ty, itOf_int]; decide⟩
+
+/-- MIR (`Runtime(PostCleanup)`) of a function that indexes `[i8; 2]` with the
+return place `_0` as the index local before `_0` is ever written: first in the
+in-place element write `_1[_0] = const 7_i8`, then in the read
+`_0 = copy _1[_0]`. MiniRust evaluates the destination place first, so the
+`Load` of the index operand `_0` fails the validity invariant before the
+bounds check or the store happen; Anneal's projection finds `_0` `.uninit`
+and faults. -/
+def arrayUninitIdxI8 : CapturedMir where
+  defPath := "witness::array_uninit_idx_i8"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [i8Decl, arrI8_2Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (placeIdx 1 0) (.use (constI8 7))),
+        mkStmt (.assign (local_ 0) (.use (.copy (placeIdx 1 0))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiArrayUninitIdx
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem arrayUninitIdxI8_inFragment : inFragment arrayUninitIdxI8 = true := by decide
+
+def arrayUninitIdxI8Fn : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8), (localName 1, .Array (.Int i8) 2)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Index (.Local (localName 1)) (.Load (.Local (localName 0))))
+        (.Constant (.Int 7) (.Int i8)),
+      .Assign (.Local (localName 0))
+        (.Load (.Index (.Local (localName 1)) (.Load (.Local (localName 0)))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem arrayUninitIdxI8_translate :
+    translateFn arrayUninitIdxI8 = some arrayUninitIdxI8Fn := rfl
+
+def arrayUninitIdxS0 : MachineState := initMachineState arrayUninitIdxI8 [initArrI8_2]
+def arrayUninitIdxMInit : Mach :=
+  machineWithCtx ctxI8 arrayUninitIdxI8 arrayUninitIdxI8Fn
+    arrayUninitIdxS0.frame.locals arrayUninitIdxI8Fn.start
+
+theorem arrayUninitIdx_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree arrayUninitIdxI8 [initArrI8_2]) tr u ∧ FaultNow u :=
+  faultsA_sound arrayUninitIdxI8 6 _ (by decide)
+
+theorem arrayUninitIdx_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arrayUninitIdxMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arrayUninitIdx_anneal_ub
+  exact mirCall_ub arrayUninitIdxI8_inFragment arrayUninitIdxI8_translate ctxI8
+    (ctxI8_ok_arrayUninitIdx rfl) [initArrI8_2] (by decide)
+    arrayUninitIdxMInit rfl rfl rfl hr hf
+
+/-- The UB is the failed `Load` of the uninitialized index operand, not the
+bounds check (`"access to out-of-bounds index"`). -/
+theorem arrayUninitIdx_minirust_direct :
+    Interp.steps 2 arrayUninitIdxMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") := rfl
+
+/-! ## Multi-byte elements (`[u32; 3]`): byte offset `index * elem_size` -/
+
+def arrU32_3Ty : Ty := { kind := .array (.uint .u32) 3, layoutIdx := 0 }
+def arrU32_3Decl : LocalDecl := { mutability := .mut, ty := arrU32_3Ty, debugName := none }
+
+def arrU32_3Layout : TypeLayout :=
+  { size := { bytes := 12 }, align := { bytes := 4 }, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false }
+
+def fnAbiArrayU32Idx : FnAbi :=
+  { args := [{ layout := arrU32_3Layout, mode := .direct },
+             { layout := usizeLayout, mode := .direct }],
+    ret := { layout := u32Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+/-- The callee's locals live at addresses `128` (`_0`), `256` (`_1`, twelve
+bytes), and `384` (`_2`). -/
+def ctxU32_3 : Ctx := { ctx0 with addrs := [128, 256, 384] }
+
+theorem ctxU32_ok_arrayU32Idx {body : CapturedMir}
+    (h : body.localDecls = [u32Decl, arrU32_3Decl, usizeDecl]) : CtxOk body ctxU32_3 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d _ hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | 1, hd => simp at hd; subst hd; rw [arrU32_3Decl, arrU32_3Ty, itOf_array_uint, tyOf_array_uint]; decide
+    | 2, hd => simp at hd; subst hd; rw [usizeDecl, usizeTy, itOf_uint, tyOf_uint]; decide
+    | _ + 3, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by rw [u32Decl, u32Ty, itOf_uint]; decide⟩
+
+/-- MIR (`Runtime(PostCleanup)`) of a function that writes
+`const 0x04030201_u32` into `_1[_2]` of a `[u32; 3]` argument and returns
+`_1[_2] + _1[0 of 3]`. -/
+def arrayU32Idx : CapturedMir where
+  defPath := "witness::array_u32_idx"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, arrU32_3Decl, usizeDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (placeIdx 1 2) (.use (constU32 0x04030201))),
+        mkStmt (.assign (local_ 0)
+          (.binaryOp .add (.copy (placeIdx 1 2)) (.copy (placeConstIdx 1 0 3 false))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiArrayU32Idx
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem arrayU32Idx_inFragment : inFragment arrayU32Idx = true := by decide
+
+def arrayU32IdxFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Array (.Int u32) 3),
+    (localName 2, .Int usizeIt)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Index (.Local (localName 1)) (.Load (.Local (localName 2))))
+        (.Constant (.Int 0x04030201) (.Int u32)),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add)
+          (.Load (.Index (.Local (localName 1)) (.Load (.Local (localName 2)))))
+          (.Load (.Index (.Local (localName 1)) (.Constant (.Int 0) (.Int usizeIt)))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem arrayU32Idx_translate : translateFn arrayU32Idx = some arrayU32IdxFn := rfl
+
+def initArrU32_3 : Value := .aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩]
+
+/-- Index `_2 = 2usize`: `_1 = [10, 20, 0x04030201]`, returning
+`0x04030201 + 10 = 0x0403020b`. -/
+def arrayU32IdxOkS0 : MachineState :=
+  initMachineState arrayU32Idx [initArrU32_3, .scalar ⟨2, 8⟩]
+def arrayU32IdxOkMInit : Mach :=
+  machineWithCtx ctxU32_3 arrayU32Idx arrayU32IdxFn arrayU32IdxOkS0.frame.locals
+    arrayU32IdxFn.start
+
+theorem arrayU32IdxOk_anneal_ret :
+    ReachesRet (mirCallTree arrayU32Idx [initArrU32_3, .scalar ⟨2, 8⟩]) []
+      (.normal (.scalar ⟨0x0403020b, 4⟩, arrayU32IdxOkS0.memory)) :=
+  runA_sound arrayU32Idx 8 _ _ _ rfl
+
+theorem arrayU32IdxOk_noUB :
+    MirNoUBTree (mirCallTree arrayU32Idx [initArrU32_3, .scalar ⟨2, 8⟩]) :=
+  runA_noUB arrayU32Idx 8 _ _ _ rfl
+
+theorem arrayU32IdxOk_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n arrayU32IdxOkMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 0x0403020b } ∧
+      m'.threads = [thread1 ctxU32_3 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret arrayU32Idx_inFragment arrayU32Idx_translate ctxU32_3
+      (ctxU32_ok_arrayU32Idx rfl) [initArrU32_3, .scalar ⟨2, 8⟩] (by decide)
+      arrayU32IdxOkMInit rfl rfl rfl arrayU32IdxOk_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [arrayU32Idx] at hd; subst hd
+  simp [retPtr, ctxU32_3, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxU32_3, ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem arrayU32IdxOk_minirust_direct :
+    (Interp.steps 4 arrayU32IdxOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 0x0403020b }, [1]) := rfl
+
+/-- Byte-level view of the in-place write: MiniRust's allocation `2` is `_1`'s
+(after the caller's return allocation and `_0`'s). Before step `2` it holds
+the little-endian bytes of `[10, 20, 30]`; step `2` (`_1[_2] = 0x04030201`
+with `_2 = 2`) rewrites exactly bytes `8..12` (`2 * size_of::<u32>()`) to
+`01 02 03 04`, leaving bytes `0..8` (elements `0` and `1`) unchanged. -/
+theorem arrayU32IdxOk_minirust_inplace_bytes :
+    [1, 2].map (fun k => (Interp.steps k arrayU32IdxOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[2]?).map (·.data))) =
+      [some (some (scalarBytes u32 10 ++ scalarBytes u32 20 ++ scalarBytes u32 30)),
+       some (some (scalarBytes u32 10 ++ scalarBytes u32 20 ++
+         [.Init 1 none, .Init 2 none, .Init 3 none, .Init 4 none]))] := rfl
+
+/-- Index `_2 = 3usize` (`3 >= 3`): out-of-bounds UB on the in-place write. -/
+def arrayU32IdxOobS0 : MachineState :=
+  initMachineState arrayU32Idx [initArrU32_3, .scalar ⟨3, 8⟩]
+def arrayU32IdxOobMInit : Mach :=
+  machineWithCtx ctxU32_3 arrayU32Idx arrayU32IdxFn arrayU32IdxOobS0.frame.locals
+    arrayU32IdxFn.start
+
+theorem arrayU32IdxOob_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree arrayU32Idx [initArrU32_3, .scalar ⟨3, 8⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound arrayU32Idx 6 _ (by decide)
+
+theorem arrayU32IdxOob_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arrayU32IdxOobMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arrayU32IdxOob_anneal_ub
+  exact mirCall_ub arrayU32Idx_inFragment arrayU32Idx_translate ctxU32_3
+    (ctxU32_ok_arrayU32Idx rfl) [initArrU32_3, .scalar ⟨3, 8⟩] (by decide)
+    arrayU32IdxOobMInit rfl rfl rfl hr hf
+
+theorem arrayU32IdxOob_minirust_direct :
+    Interp.steps 2 arrayU32IdxOobMInit = .error (.ub "access to out-of-bounds index") := rfl
+
+/-! ## Out-of-bounds `ConstantIndex` (`fromEnd = false, offset >= count`), `PlaceMention` on an array local, and `Interp` representation checks -/
+
+/-- MIR (`Runtime(PostCleanup)`) of a function that executes `PlaceMention(_1)`
+on a `[i8; 2]` array local and then attempts to read `_1[2 of 2]`
+(`ProjectionElem.constantIndex 2 2 false`, where `fromEnd = false` and
+`offset = 2 >= 2`), raising out-of-bounds UB in both Anneal and MiniRust. -/
+def arrayConstIdxOobI8 : CapturedMir where
+  defPath := "witness::array_const_idx_oob_i8"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [i8Decl, arrI8_2Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.placeMention (local_ 1)),
+        mkStmt (.assign (local_ 0) (.use (.copy (placeConstIdx 1 2 2 false))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiArrayUninitIdx
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem arrayConstIdxOobI8_inFragment : inFragment arrayConstIdxOobI8 = true := by decide
+
+def arrayConstIdxOobI8Fn : Gen.Function where
+  locals := ⟨[(localName 0, .Int i8), (localName 1, .Array (.Int i8) 2)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .PlaceMention (.Local (localName 1)),
+      .Assign (.Local (localName 0))
+        (.Load (.Index (.Local (localName 1)) (.Constant (.Int 2) (.Int usizeIt))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem arrayConstIdxOobI8_translate :
+    translateFn arrayConstIdxOobI8 = some arrayConstIdxOobI8Fn := rfl
+
+def arrayConstIdxOobS0 : MachineState := initMachineState arrayConstIdxOobI8 [initArrI8_2]
+def arrayConstIdxOobMInit : Mach :=
+  machineWithCtx ctxI8 arrayConstIdxOobI8 arrayConstIdxOobI8Fn
+    arrayConstIdxOobS0.frame.locals arrayConstIdxOobI8Fn.start
+
+theorem arrayConstIdxOob_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree arrayConstIdxOobI8 [initArrI8_2]) tr u ∧ FaultNow u :=
+  faultsA_sound arrayConstIdxOobI8 6 _ (by decide)
+
+theorem arrayConstIdxOob_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arrayConstIdxOobMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arrayConstIdxOob_anneal_ub
+  exact mirCall_ub arrayConstIdxOobI8_inFragment arrayConstIdxOobI8_translate ctxI8
+    (ctxI8_ok_arrayUninitIdx rfl) [initArrI8_2] (by decide)
+    arrayConstIdxOobMInit rfl rfl rfl hr hf
+
+theorem arrayConstIdxOob_minirust_direct :
+    Interp.steps 3 arrayConstIdxOobMInit = .error (.ub "access to out-of-bounds index") := rfl
+
+/-- `Size::ZERO * -1 = Size::ZERO` (`Size::from_bytes(0 * -1).unwrap()`), whereas
+multiplying a non-zero `Size` by `-1` panics with a negative byte count. -/
+theorem sizeMulInt_zero_neg :
+    Size.mulInt ⟨0⟩ (-1) = .ok ⟨0⟩ ∧
+    Size.mulInt ⟨1⟩ (-1) = .error (.specPanic "Size * Int: negative byte count") :=
+  ⟨rfl, rfl⟩
+
+/-- `Type.encode` on `Type::Array` checks `assert_eq!(values.len(), count)`
+before encoding elements or computing `elem.layout()` (so an empty 0-length
+array succeeds without querying `elem.layout()`), and `Type.decode` on
+`Type::Array` short-circuits left-to-right via `tryMapM` on the first `.Uninit`
+element chunk. -/
+theorem array_encode_decode_edge_cases :
+    checkValue (.Tuple []) (.Array (.Slice (.Int i8)) 0) = .ok () ∧
+    checkValue (.Tuple []) (.Array (.Int i8) 1) =
+      .error (.ub "Value::Tuple: invalid number of elements") ∧
+    checkValue (.Tuple [.Int 200]) (.Array (.Int i8) 1) =
+      .error (.ub "Value::Int: invalid integer value") ∧
+    Type.encode (.Array (.Slice (.Int i8)) 2) (.Tuple []) =
+      .error (.specPanic "encode: Type::Array length mismatch") ∧
+    Type.encode (.Array (.Slice (.Int i8)) 0) (.Tuple []) = .ok [] ∧
+    Type.decode (.Array (.Int i8) 2) [.Uninit, .Init 5 none] = .ok none ∧
+    Type.decode (.Array (.Int i8) 2) [.Init 1 none] =
+      .error (.specPanic "decode of Type::Array with invalid length") ∧
+    Type.decode (.Array (.Int i8) (-1)) [] =
+      .error (.specPanic "Size * Int: negative byte count") ∧
+    Type.decode (.Array (.Array (.Int i8) 0) (-1)) [] = .ok (some (.Tuple [])) ∧
+    (tryMapM (fun x : Nat =>
+      if x = 0 then (.ok none : Interp (Option Val))
+      else .error (.specPanic "unreachable")) [0, 1] : Interp (Option (List Val))) =
+      .ok none :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ## Projected array operands across `SwitchInt`/`Repeat`/`Aggregate`/`UnaryOp`/`Cast`, faulting array rvalues, and faulting in-place write RHS -/
+
+def fnAbiArrayCompose : FnAbi :=
+  { args := [{ layout := arrI8_2Layout, mode := .direct },
+             { layout := usizeLayout, mode := .direct }],
+    ret := { layout := i8Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+theorem ctxI8_ok_arrayCompose {body : CapturedMir}
+    (h : body.localDecls = [i8Decl, arrI8_2Decl, usizeDecl]) : CtxOk body ctxI8_3 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d _ hd; rw [h] at hd
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; rw [i8Decl, i8Ty, itOf_int, tyOf_int]; decide
+    | 1, hd => simp at hd; subst hd; rw [arrI8_2Decl, arrI8_2Ty, itOf_array_int, tyOf_array_int]; decide
+    | 2, hd => simp at hd; subst hd; rw [usizeDecl, usizeTy, itOf_uint, tyOf_uint]; decide
+    | _ + 3, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; simp at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by rw [i8Decl, i8Ty, itOf_int]; decide⟩
+
+/-- MIR (`Runtime(PostCleanup)`) of a function exercising projected array
+element operands (`copy _1[proj]`) across `SwitchInt`, `Repeat`,
+`Aggregate(Array)`, `UnaryOp(Neg)`, and `Cast(IntToInt)`, as well as the UB
+branches of `evalStatement_assign_array` (`Aggregate` and `Repeat` with a
+faulting operand) and `evalStatement_assign_index` (in-place indexed write with
+a faulting RHS, and when both destination projection and RHS fault):
+* `bb0`: `SwitchInt(copy _1[_2])` branches on `10 -> bb1`, `20 -> bb2`,
+  `30 -> bb3`, `40 -> bb4`, `otherwise -> bb5` (and faults in `bb0` if `_2 >= 2`);
+* `bb1`: `_1 = Repeat(copy _1[_2], 2)`,
+  `_1 = Aggregate(Array(i8), [copy _1[0 of 2], const 20i8])`,
+  `_1[_2] = UnaryOp(Neg, copy _1[-1 of 2])`,
+  `_0 = Cast(IntToInt, copy _1[0 of 2], i8Ty)`, then `Return`;
+* `bb2`: `_1 = Aggregate(Array(i8), [copy _1[0 of 2], copy _0])` (faults on
+  uninitialized `_0` in element `1`);
+* `bb3`: `_1 = Repeat(copy _1[2 of 2], 2)` (faults on out-of-bounds
+  `ConstantIndex` `2 >= 2`);
+* `bb4`: `_1[0 of 2] = BinaryOp(Div, copy _1[0 of 2], const 0i8)` (valid
+  destination index `0`, faulting RHS division by zero);
+* `bb5`: `_1[2 of 2] = BinaryOp(Div, copy _1[0 of 2], const 0i8)` (both
+  destination projection `2 >= 2` and RHS division by zero fault). -/
+def arrayComposeI8 : CapturedMir where
+  defPath := "witness::array_compose_i8"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [i8Decl, arrI8_2Decl, usizeDecl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.switchInt (.copy (placeIdx 1 2))
+        { branches := [(10, 1), (20, 2), (30, 3), (40, 4)], otherwise := 5 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 1) (.repeat (.copy (placeIdx 1 2)) 2)),
+        mkStmt (.assign (local_ 1)
+          (.aggregate (.array i8Ty) [.copy (placeConstIdx 1 0 2 false), constI8 20])),
+        mkStmt (.assign (placeIdx 1 2)
+          (.unaryOp .neg (.copy (placeConstIdx 1 1 2 true)))),
+        mkStmt (.assign (local_ 0)
+          (.cast .intToInt (.copy (placeConstIdx 1 0 2 false)) i8Ty))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 1)
+          (.aggregate (.array i8Ty) [.copy (placeConstIdx 1 0 2 false), .copy (local_ 0)]))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 1) (.repeat (.copy (placeConstIdx 1 2 2 false)) 2))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (placeConstIdx 1 0 2 false)
+          (.binaryOp .div (.copy (placeConstIdx 1 0 2 false)) (constI8 0)))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (placeConstIdx 1 2 2 false)
+          (.binaryOp .div (.copy (placeConstIdx 1 0 2 false)) (constI8 0)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiArrayCompose
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem arrayComposeI8_inFragment : inFragment arrayComposeI8 = true := by decide
+
+def arrayComposeI8Fn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int i8),
+    (localName 1, .Array (.Int i8) 2),
+    (localName 2, .Int usizeIt)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[],
+      .Switch (.Load (.Index (.Local (localName 1)) (.Load (.Local (localName 2)))))
+        ⟨[(10, bbName 1), (20, bbName 2), (30, bbName 3), (40, bbName 4)]⟩ (bbName 5),
+      .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 1))
+        (.Tuple [
+          .Load (.Index (.Local (localName 1)) (.Load (.Local (localName 2)))),
+          .Load (.Index (.Local (localName 1)) (.Load (.Local (localName 2))))]
+          (.Array (.Int i8) 2)),
+      .Assign (.Local (localName 1))
+        (.Tuple [
+          .Load (.Index (.Local (localName 1)) (.Constant (.Int 0) (.Int usizeIt))),
+          .Constant (.Int 20) (.Int i8)] (.Array (.Int i8) 2)),
+      .Assign (.Index (.Local (localName 1)) (.Load (.Local (localName 2))))
+        (.UnOp (.Int .Neg)
+          (.Load (.Index (.Local (localName 1)) (.Constant (.Int 1) (.Int usizeIt))))),
+      .Assign (.Local (localName 0))
+        (.UnOp (.Cast (.IntToInt i8))
+          (.Load (.Index (.Local (localName 1)) (.Constant (.Int 0) (.Int usizeIt)))))],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Local (localName 1))
+        (.Tuple [
+          .Load (.Index (.Local (localName 1)) (.Constant (.Int 0) (.Int usizeIt))),
+          .Load (.Local (localName 0))] (.Array (.Int i8) 2))],
+      .Return, .Regular⟩),
+    (bbName 3, ⟨[
+      .Assign (.Local (localName 1))
+        (.Tuple [
+          .Load (.Index (.Local (localName 1)) (.Constant (.Int 2) (.Int usizeIt))),
+          .Load (.Index (.Local (localName 1)) (.Constant (.Int 2) (.Int usizeIt)))]
+          (.Array (.Int i8) 2))],
+      .Return, .Regular⟩),
+    (bbName 4, ⟨[
+      .Assign (.Index (.Local (localName 1)) (.Constant (.Int 0) (.Int usizeIt)))
+        (.BinOp (.Int .Div)
+          (.Load (.Index (.Local (localName 1)) (.Constant (.Int 0) (.Int usizeIt))))
+          (.Constant (.Int 0) (.Int i8)))],
+      .Return, .Regular⟩),
+    (bbName 5, ⟨[
+      .Assign (.Index (.Local (localName 1)) (.Constant (.Int 2) (.Int usizeIt)))
+        (.BinOp (.Int .Div)
+          (.Load (.Index (.Local (localName 1)) (.Constant (.Int 0) (.Int usizeIt))))
+          (.Constant (.Int 0) (.Int i8)))],
+      .Return, .Regular⟩),
+    (bbName 6, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 6
+  implicit_writes := true
+
+theorem arrayComposeI8_translate : translateFn arrayComposeI8 = some arrayComposeI8Fn := rfl
+
+def initArrCompose10_20 : Value := .aggregate 0 [.scalar ⟨10, 1⟩, .scalar ⟨20, 1⟩]
+
+/-- `_1 = [10i8, 20i8]`, `_2 = 0usize`: switches on `_1[0] = 10` to `bb1`,
+repeats `_1[0]` into `[10, 10]`, rebuilds `[10, 20]`, negates `_1[-1 of 2] = 20`
+into `_1[0] = -20i8` (bits `236`), casts `_1[0]` to `i8`, and returns `-20i8`. -/
+def arrayComposeOkS0 : MachineState :=
+  initMachineState arrayComposeI8 [initArrCompose10_20, .scalar ⟨0, 8⟩]
+def arrayComposeOkMInit : Mach :=
+  machineWithCtx ctxI8_3 arrayComposeI8 arrayComposeI8Fn
+    arrayComposeOkS0.frame.locals arrayComposeI8Fn.start
+
+def arrayComposeOkTrace : List (Event MirEffect) :=
+  [⟨.inr (.inl (.emit (.event 10))), PUnit.unit⟩]
+
+theorem arrayComposeOk_anneal_ret :
+    ReachesRet (mirCallTree arrayComposeI8 [initArrCompose10_20, .scalar ⟨0, 8⟩])
+      arrayComposeOkTrace (.normal (.scalar ⟨236, 1⟩, arrayComposeOkS0.memory)) :=
+  runA_sound arrayComposeI8 12 _ _ _ rfl
+
+theorem arrayComposeOk_noUB :
+    MirNoUBTree (mirCallTree arrayComposeI8 [initArrCompose10_20, .scalar ⟨0, 8⟩]) :=
+  runA_noUB arrayComposeI8 12 _ _ _ rfl
+
+theorem arrayComposeOk_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n arrayComposeOkMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes i8 236 } ∧
+      m'.threads = [thread1 ctxI8_3 [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
+      (ctxI8_ok_arrayCompose rfl) [initArrCompose10_20, .scalar ⟨0, 8⟩] (by decide)
+      arrayComposeOkMInit rfl rfl rfl arrayComposeOk_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [arrayComposeI8] at hd; subst hd
+  simp [retPtr, ctxI8_3] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxI8_3] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem arrayComposeOk_minirust_direct :
+    (Interp.steps 7 arrayComposeOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 236 }, [1]) := rfl
+
+/-- `_1 = [10i8, 20i8]`, `_2 = 1usize`: switches on `_1[1] = 20` to `bb2` and
+faults when `Aggregate(Array)` evaluates its second operand `copy _0` while `_0`
+is `.uninit` (`evalStatement_assign_array` UB branch). -/
+def arrayComposeAggUbS0 : MachineState :=
+  initMachineState arrayComposeI8 [initArrCompose10_20, .scalar ⟨1, 8⟩]
+def arrayComposeAggUbMInit : Mach :=
+  machineWithCtx ctxI8_3 arrayComposeI8 arrayComposeI8Fn
+    arrayComposeAggUbS0.frame.locals arrayComposeI8Fn.start
+
+theorem arrayComposeAggUb_anneal_ub :
+    ∃ tr u,
+      Reaches (mirCallTree arrayComposeI8 [initArrCompose10_20, .scalar ⟨1, 8⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound arrayComposeI8 8 _ (by decide)
+
+theorem arrayComposeAggUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arrayComposeAggUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arrayComposeAggUb_anneal_ub
+  exact mirCall_ub arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
+    (ctxI8_ok_arrayCompose rfl) [initArrCompose10_20, .scalar ⟨1, 8⟩] (by decide)
+    arrayComposeAggUbMInit rfl rfl rfl hr hf
+
+theorem arrayComposeAggUb_minirust_direct :
+    Interp.steps 3 arrayComposeAggUbMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") := rfl
+
+/-- `_1 = [30i8, 20i8]`, `_2 = 0usize`: switches on `_1[0] = 30` to `bb3` and
+faults when `Repeat(copy _1[2 of 2], 2)` evaluates its out-of-bounds
+`ConstantIndex` operand (`evalStatement_assign_array` UB branch). -/
+def initArrCompose30_20 : Value := .aggregate 0 [.scalar ⟨30, 1⟩, .scalar ⟨20, 1⟩]
+
+def arrayComposeRepeatUbS0 : MachineState :=
+  initMachineState arrayComposeI8 [initArrCompose30_20, .scalar ⟨0, 8⟩]
+def arrayComposeRepeatUbMInit : Mach :=
+  machineWithCtx ctxI8_3 arrayComposeI8 arrayComposeI8Fn
+    arrayComposeRepeatUbS0.frame.locals arrayComposeI8Fn.start
+
+theorem arrayComposeRepeatUb_anneal_ub :
+    ∃ tr u,
+      Reaches (mirCallTree arrayComposeI8 [initArrCompose30_20, .scalar ⟨0, 8⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound arrayComposeI8 8 _ (by decide)
+
+theorem arrayComposeRepeatUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arrayComposeRepeatUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arrayComposeRepeatUb_anneal_ub
+  exact mirCall_ub arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
+    (ctxI8_ok_arrayCompose rfl) [initArrCompose30_20, .scalar ⟨0, 8⟩] (by decide)
+    arrayComposeRepeatUbMInit rfl rfl rfl hr hf
+
+theorem arrayComposeRepeatUb_minirust_direct :
+    Interp.steps 3 arrayComposeRepeatUbMInit =
+      .error (.ub "access to out-of-bounds index") := rfl
+
+/-- `_1 = [40i8, 20i8]`, `_2 = 0usize`: switches on `_1[0] = 40` to `bb4` and
+faults on the RHS division by zero in `_1[0 of 2] = Div(copy _1[0 of 2], 0i8)`
+while the destination projection `_1[0 of 2]` is in-bounds (`projIdx = some 0`,
+`rvBits = none` in `evalStatement_assign_index`). -/
+def initArrCompose40_20 : Value := .aggregate 0 [.scalar ⟨40, 1⟩, .scalar ⟨20, 1⟩]
+
+def arrayComposeRhsUbS0 : MachineState :=
+  initMachineState arrayComposeI8 [initArrCompose40_20, .scalar ⟨0, 8⟩]
+def arrayComposeRhsUbMInit : Mach :=
+  machineWithCtx ctxI8_3 arrayComposeI8 arrayComposeI8Fn
+    arrayComposeRhsUbS0.frame.locals arrayComposeI8Fn.start
+
+theorem arrayComposeRhsUb_anneal_ub :
+    ∃ tr u,
+      Reaches (mirCallTree arrayComposeI8 [initArrCompose40_20, .scalar ⟨0, 8⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound arrayComposeI8 8 _ (by decide)
+
+theorem arrayComposeRhsUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arrayComposeRhsUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arrayComposeRhsUb_anneal_ub
+  exact mirCall_ub arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
+    (ctxI8_ok_arrayCompose rfl) [initArrCompose40_20, .scalar ⟨0, 8⟩] (by decide)
+    arrayComposeRhsUbMInit rfl rfl rfl hr hf
+
+theorem arrayComposeRhsUb_minirust_direct :
+    Interp.steps 3 arrayComposeRhsUbMInit = .error (.ub "division by zero") := rfl
+
+/-- `_1 = [50i8, 20i8]`, `_2 = 0usize`: takes `otherwise` (`bb5`) where both the
+destination projection `_1[2 of 2]` (`2 >= 2`) and the RHS `Div(..., 0i8)` fault
+(`projIdx = none` and `rvBits = none`). Anneal faults on `evalRvalue` first and
+MiniRust faults on `eval_place(destination)` first, so both raise UB. -/
+def initArrCompose50_20 : Value := .aggregate 0 [.scalar ⟨50, 1⟩, .scalar ⟨20, 1⟩]
+
+def arrayComposeBothUbS0 : MachineState :=
+  initMachineState arrayComposeI8 [initArrCompose50_20, .scalar ⟨0, 8⟩]
+def arrayComposeBothUbMInit : Mach :=
+  machineWithCtx ctxI8_3 arrayComposeI8 arrayComposeI8Fn
+    arrayComposeBothUbS0.frame.locals arrayComposeI8Fn.start
+
+theorem arrayComposeBothUb_anneal_ub :
+    ∃ tr u,
+      Reaches (mirCallTree arrayComposeI8 [initArrCompose50_20, .scalar ⟨0, 8⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound arrayComposeI8 8 _ (by decide)
+
+theorem arrayComposeBothUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arrayComposeBothUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arrayComposeBothUb_anneal_ub
+  exact mirCall_ub arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
+    (ctxI8_ok_arrayCompose rfl) [initArrCompose50_20, .scalar ⟨0, 8⟩] (by decide)
+    arrayComposeBothUbMInit rfl rfl rfl hr hf
+
+theorem arrayComposeBothUb_minirust_direct :
+    Interp.steps 3 arrayComposeBothUbMInit =
+      .error (.ub "access to out-of-bounds index") := rfl
+
+/-- `_1 = [10i8, 20i8]`, `_2 = 2usize`: faults in `bb0` when `SwitchInt`
+evaluates its out-of-bounds projected discriminant `copy _1[_2]` (`2 >= 2`). -/
+def arrayComposeSwitchOobUbS0 : MachineState :=
+  initMachineState arrayComposeI8 [initArrCompose10_20, .scalar ⟨2, 8⟩]
+def arrayComposeSwitchOobUbMInit : Mach :=
+  machineWithCtx ctxI8_3 arrayComposeI8 arrayComposeI8Fn
+    arrayComposeSwitchOobUbS0.frame.locals arrayComposeI8Fn.start
+
+theorem arrayComposeSwitchOobUb_anneal_ub :
+    ∃ tr u,
+      Reaches (mirCallTree arrayComposeI8 [initArrCompose10_20, .scalar ⟨2, 8⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound arrayComposeI8 6 _ (by decide)
+
+theorem arrayComposeSwitchOobUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n arrayComposeSwitchOobUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := arrayComposeSwitchOobUb_anneal_ub
+  exact mirCall_ub arrayComposeI8_inFragment arrayComposeI8_translate ctxI8_3
+    (ctxI8_ok_arrayCompose rfl) [initArrCompose10_20, .scalar ⟨2, 8⟩] (by decide)
+    arrayComposeSwitchOobUbMInit rfl rfl rfl hr hf
+
+theorem arrayComposeSwitchOobUb_minirust_direct :
+    Interp.steps 2 arrayComposeSwitchOobUbMInit =
+      .error (.ub "access to out-of-bounds index") := rfl
+
+/-! ## Padded single-variant struct `Padded(u8, u32, u16)` (`TupleFields`, `.Uninit` padding preservation, and scalar `Field` reads/writes) -/
+
+
+def u16Ty : Ty := { kind := .uint .u16, layoutIdx := 0 }
+def u16Decl : LocalDecl := { mutability := .mut, ty := u16Ty, debugName := none }
+def u16 : Gen.IntType := ⟨.Unsigned, ⟨2⟩⟩
+def constU16 (n : Nat) : Operand := .constant { ty := u16Ty, val := .scalar (.int ⟨n, 2⟩) }
+
+def placeField (loc : Nat) (projs : List (Nat × Ty)) : Place :=
+  { local_ := loc, projection := projs.map (fun (f, t) => .field f t) }
+
+/-- Compiler layout for `struct Padded(u8, u32, u16)`:
+- field `0` (`u8`, 1 byte) at offset `0`
+- padding bytes `1..4` (`3` bytes of `AbstractByte.Uninit`)
+- field `1` (`u32`, 4 bytes) at offset `4`
+- field `2` (`u16`, 2 bytes) at offset `8`
+- trailing padding bytes `10..12` (`2` bytes of `AbstractByte.Uninit`)
+- total `size = 12`, `align = 4`. -/
+def paddedStructLayout : TypeLayout :=
+  { size := { bytes := 12 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }, { bytes := 8 }] [0, 1, 2],
+    variants := .single 0, isUninhabited := false, fieldLayouts := [0, 0, 0] }
+
+def paddedLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [paddedStructLayout] }
+
+def paddedStructTy : Ty :=
+  { kind := .adt "witness::Padded" [.uint .u8, .uint .u32, .uint .u16], layoutIdx := 0 }
+
+def paddedStructDecl : LocalDecl :=
+  { mutability := .mut, ty := paddedStructTy, debugName := none }
+
+def paddedMiniRustTy : Gen.Type :=
+  .Tuple [(⟨0⟩, .Int u8), (⟨4⟩, .Int u32), (⟨8⟩, .Int u16)]
+    { «end» := ⟨12⟩, align := ⟨4⟩, packed_align := none } none
+
+def fnAbiPaddedStruct : FnAbi :=
+  { args := [{ layout := paddedStructLayout, mode := .direct },
+             { layout := paddedStructLayout, mode := .direct }],
+    ret := { layout := u32Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+def ctxPadded3 : Ctx :=
+  { caller := callerFrame, payloads := [], base := [retAlloc], addrs := [128, 256, 512],
+    nextBlock := bbName 7, unwindBlock := none, retPtr := retPtr }
+
+theorem ctxPadded3_ok {body : CapturedMir}
+    (h : body.localDecls = [u32Decl, paddedStructDecl, paddedStructDecl])
+    (hlay : body.layouts = paddedLayouts) : CtxOk body ctxPadded3 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d _ hd; rw [h] at hd; rw [hlay]
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | 2, hd => simp at hd; subst hd; decide
+    | _ + 3, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; rw [hlay]; simp at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MIR (`Runtime(PostCleanup)`) of
+```rust
+struct Padded(u8, u32, u16);
+
+fn padded_struct_ops(mut s: Padded, mut copy_s: Padded) -> u32 {
+    copy_s = s;                                      // _2 = Use(copy _1)
+    s = Padded(copy_s.0, 0x04030201, copy_s.2);      // _1 = Aggregate(Adt, [copy _2.0, const 0x04030201_u32, copy _2.2])
+    s.1 = s.1.wrapping_add(0x10);                    // _1.1 = Add(copy _1.1, const 0x10_u32)
+    let a = s.0 as u32;                              // _0 = Cast(IntToInt, copy _1.0, u32)
+    a.wrapping_add(s.1)                              // _0 = Add(copy _0, copy _1.1)
+}
+```
+exercising whole-struct `Use(Copy)`, `AggregateKind.adt` construction,
+`ProjectionElem.field` reads (`_2.0`, `_2.2`, `_1.0`, `_1.1`), and in-place
+scalar field writes (`_1.1 = ...` at byte offset `4`) while preserving sibling
+fields (`_1.0` at offset `0` and `_1.2` at offset `8..10`) and `AbstractByte.Uninit`
+padding bytes at `1..4` and `10..12`. -/
+def paddedStructOps : CapturedMir where
+  defPath := "witness::padded_struct_ops"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, paddedStructDecl, paddedStructDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 2) (.use (.copy (local_ 1)))),
+        mkStmt (.assign (local_ 1)
+          (.aggregate (.adt "witness::Padded" 0 none)
+            [.copy (placeField 2 [(0, u8TyW)]),
+             constU32 0x04030201,
+             .copy (placeField 2 [(2, u16Ty)])])),
+        mkStmt (.assign (placeField 1 [(1, u32Ty)])
+          (.binaryOp .add (.copy (placeField 1 [(1, u32Ty)])) (constU32 0x10))),
+        mkStmt (.assign (local_ 0)
+          (.cast .intToInt (.copy (placeField 1 [(0, u8TyW)])) u32Ty)),
+        mkStmt (.assign (local_ 0)
+          (.binaryOp .add (.copy (placeField 1 [(1, u32Ty)])) (.copy (local_ 0))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiPaddedStruct
+  layouts := paddedLayouts
+  allocations := []
+
+theorem paddedStructOps_inFragment : inFragment paddedStructOps = true := by decide
+
+def paddedStructOpsFn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int u32),
+    (localName 1, paddedMiniRustTy),
+    (localName 2, paddedMiniRustTy)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Assign (.Local (localName 2)) (.Load (.Local (localName 1))),
+      .Assign (.Local (localName 1))
+        (.Tuple [
+          .Load (.Field (.Local (localName 2)) 0),
+          .Constant (.Int 0x04030201) (.Int u32),
+          .Load (.Field (.Local (localName 2)) 2)] paddedMiniRustTy),
+      .Assign (.Field (.Local (localName 1)) 1)
+        (.BinOp (.Int .Add)
+          (.Load (.Field (.Local (localName 1)) 1))
+          (.Constant (.Int 0x10) (.Int u32))),
+      .Assign (.Local (localName 0))
+        (.UnOp (.Cast (.IntToInt u32)) (.Load (.Field (.Local (localName 1)) 0))),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add)
+          (.Load (.Field (.Local (localName 1)) 1))
+          (.Load (.Local (localName 0))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem paddedStructOps_translate : translateFn paddedStructOps = some paddedStructOpsFn := rfl
+
+def initPaddedStruct : Value :=
+  .aggregate 0 [.scalar ⟨7, 1⟩, .scalar ⟨99, 4⟩, .scalar ⟨0x0605, 2⟩]
+
+def initPaddedStruct2 : Value :=
+  .aggregate 0 [.scalar ⟨0, 1⟩, .scalar ⟨0, 4⟩, .scalar ⟨0, 2⟩]
+
+def paddedArgs : List Value := [initPaddedStruct, initPaddedStruct2]
+
+def paddedStructOkS0 : MachineState := initMachineState paddedStructOps paddedArgs
+def paddedStructOkMInit : Mach :=
+  machineWithCtx ctxPadded3 paddedStructOps paddedStructOpsFn
+    paddedStructOkS0.frame.locals paddedStructOpsFn.start
+
+theorem paddedStructOk_anneal_ret :
+    ReachesRet (mirCallTree paddedStructOps paddedArgs) []
+      (.normal (.scalar ⟨0x04030218, 4⟩, paddedStructOkS0.memory)) :=
+  runA_sound paddedStructOps 10 _ _ _ rfl
+
+theorem paddedStructOk_noUB :
+    MirNoUBTree (mirCallTree paddedStructOps paddedArgs) :=
+  runA_noUB paddedStructOps 10 _ _ _ rfl
+
+theorem paddedStructOk_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n paddedStructOkMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 0x04030218 } ∧
+      m'.threads = [thread1 ctxPadded3 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret paddedStructOps_inFragment paddedStructOps_translate ctxPadded3
+      (ctxPadded3_ok rfl rfl) paddedArgs (by decide)
+      paddedStructOkMInit rfl rfl rfl paddedStructOk_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [paddedStructOps] at hd; subst hd
+  simp [retPtr, ctxPadded3] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxPadded3] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem paddedStructOk_minirust_direct :
+    (Interp.steps 7 paddedStructOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 0x04030218 }, [1]) := rfl
+
+/-- Byte-level proof that MiniRust preserves `AbstractByte.Uninit` at the
+inter-field padding offsets `1..4` and trailing padding offsets `10..12` across:
+- step `2` (`_2 = Use(copy _1)`: allocation `3` for `_2` receives `(7u8, 99u32, 0x0605u16)`
+  with `.Uninit` at `1..4` and `10..12`),
+- step `3` (`_1 = Aggregate(Adt, ...)`: allocation `2` for `_1` receives
+  `(7u8, 0x04030201u32, 0x0605u16)` with `.Uninit` at `1..4` and `10..12`), and
+- step `4` (`_1.1 = Add(copy _1.1, 0x10u32)`: in-place write at offset `4` updates
+  bytes `4..8` to `0x11 0x02 0x03 0x04` while leaving field `0` (`byte 0 = 7`),
+  inter-field padding (`bytes 1..4 = .Uninit`), field `2` (`bytes 8..10 = 0x05 0x06`),
+  and trailing padding (`bytes 10..12 = .Uninit`) untouched). -/
+theorem paddedStructOk_minirust_padding_bytes :
+    ((Interp.steps 2 paddedStructOkMInit).toOption.bind
+      (fun m => (m.mem.memory.allocations[3]?).map (·.data))) =
+      some [.Init 7 none, .Uninit, .Uninit, .Uninit,
+            .Init 99 none, .Init 0 none, .Init 0 none, .Init 0 none,
+            .Init 5 none, .Init 6 none, .Uninit, .Uninit] ∧
+    ((Interp.steps 3 paddedStructOkMInit).toOption.bind
+      (fun m => (m.mem.memory.allocations[2]?).map (·.data))) =
+      some [.Init 7 none, .Uninit, .Uninit, .Uninit,
+            .Init 1 none, .Init 2 none, .Init 3 none, .Init 4 none,
+            .Init 5 none, .Init 6 none, .Uninit, .Uninit] ∧
+    ((Interp.steps 4 paddedStructOkMInit).toOption.bind
+      (fun m => (m.mem.memory.allocations[2]?).map (·.data))) =
+      some [.Init 7 none, .Uninit, .Uninit, .Uninit,
+            .Init 0x11 none, .Init 2 none, .Init 3 none, .Init 4 none,
+            .Init 5 none, .Init 6 none, .Uninit, .Uninit] :=
+  ⟨rfl, rfl, rfl⟩
+
+/-- On `Terminator::Return` at step `7` of `paddedStructOps`, `evalReturn` calls
+`storageDead` on every callee local (`_0`..`_2`, allocations `1..=3`), verifying
+`BM.deallocate` against each local's layout (`size = 12, align = 4` for the two
+`Padded(u8, u32, u16)` struct locals `_1` and `_2` at allocations `2` and `3`)
+and marking all three callee stack allocations `live = false` while keeping the
+caller's return allocation `0` `live = true`. -/
+theorem paddedStructOk_minirust_ret_dealloc :
+    (Interp.steps 7 paddedStructOkMInit).toOption.map
+        (fun m => m.mem.memory.allocations.map (fun a => (a.live, a.data.length))) =
+      some [(true, 4), (false, 4), (false, 12), (false, 12)] := rfl
+
+theorem paddedStructOk_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n paddedStructOkMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k paddedStructOkMInit = .ok mRet ∧
+      ReturnRel paddedStructOps ctxPadded3 s' v mRet ∧
+      ReachesRet (mirCallTree paddedStructOps paddedArgs) tr (.normal (v, mem)) :=
+  mirCall_noUB paddedStructOps_inFragment paddedStructOps_translate ctxPadded3
+    (ctxPadded3_ok rfl rfl) paddedArgs (by decide) paddedStructOkMInit rfl rfl rfl
+    paddedStructOk_noUB herr
+
+theorem paddedStructOk_minirust_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (n + 1) paddedStructOkMInit = .ok m' ∧
+      StateRel paddedStructOps paddedStructOpsFn ctxPadded3 s' m' ∧
+      Reaches (mirCallTree paddedStructOps paddedArgs) tr (mirTree paddedStructOps s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ n + 1 ∧ Interp.steps k paddedStructOkMInit = .ok mRet ∧
+      ReturnRel paddedStructOps ctxPadded3 s' v mRet ∧
+      ReachesRet (mirCallTree paddedStructOps paddedArgs) tr (.normal (v, mem))) :=
+  by simpa only [show initLen paddedStructOps = 1 from rfl, Nat.add_comm 1 n] using
+    mirCall_progress paddedStructOps_inFragment paddedStructOps_translate ctxPadded3
+      (ctxPadded3_ok rfl rfl) paddedArgs (by decide) paddedStructOkMInit rfl rfl rfl
+      paddedStructOk_noUB n
+
+/-! ## Nested padded tuples `((u8, u32), u16, ())`, zero-sized `()`, nested `Field` projections (`_4.0.1`), and tuple UB paths -/
+
+def innerTupleLayout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }] [0, 1],
+    variants := .single 0, isUninhabited := false, fieldLayouts := [0, 0] }
+
+def unitTupleLayout : TypeLayout :=
+  { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+    fields := .arbitrary [] [],
+    variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+
+def outerTupleLayout : TypeLayout :=
+  { size := { bytes := 12 }, align := { bytes := 4 }, backendRepr := .memory,
+    fields := .arbitrary [{ bytes := 0 }, { bytes := 8 }, { bytes := 10 }] [0, 1, 2],
+    variants := .single 0, isUninhabited := false, fieldLayouts := [0, 0, 1] }
+
+def nestedLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [innerTupleLayout, unitTupleLayout, outerTupleLayout] }
+
+def innerTupleKind : RigidTy := .tuple [.uint .u8, .uint .u32]
+def innerTupleTy : Ty := { kind := innerTupleKind, layoutIdx := 0 }
+def innerTupleDecl : LocalDecl := { mutability := .mut, ty := innerTupleTy, debugName := none }
+
+def unitTupleKind : RigidTy := .tuple []
+def unitTupleTy : Ty := { kind := unitTupleKind, layoutIdx := 1 }
+def unitTupleDecl : LocalDecl := { mutability := .mut, ty := unitTupleTy, debugName := none }
+
+def outerTupleKind : RigidTy := .tuple [innerTupleKind, .uint .u16, unitTupleKind]
+def outerTupleTy : Ty := { kind := outerTupleKind, layoutIdx := 2 }
+def outerTupleDecl : LocalDecl := { mutability := .mut, ty := outerTupleTy, debugName := none }
+
+def innerMiniRustTy : Gen.Type :=
+  .Tuple [(⟨0⟩, .Int u8), (⟨4⟩, .Int u32)]
+    { «end» := ⟨8⟩, align := ⟨4⟩, packed_align := none } none
+
+def unitMiniRustTy : Gen.Type :=
+  .Tuple [] { «end» := ⟨0⟩, align := ⟨1⟩, packed_align := none } none
+
+def outerMiniRustTy : Gen.Type :=
+  .Tuple [(⟨0⟩, innerMiniRustTy), (⟨8⟩, .Int u16), (⟨10⟩, unitMiniRustTy)]
+    { «end» := ⟨12⟩, align := ⟨4⟩, packed_align := none } none
+
+def ctxNested5 : Ctx :=
+  { caller := callerFrame, payloads := [], base := [retAlloc],
+    addrs := [128, 256, 384, 512, 640],
+    nextBlock := bbName 7, unwindBlock := none, retPtr := retPtr }
+
+theorem ctxNested5_ok {body : CapturedMir}
+    (h : body.localDecls = [u32Decl, u32Decl, innerTupleDecl, unitTupleDecl, outerTupleDecl])
+    (hlay : body.layouts = nestedLayouts) : CtxOk body ctxNested5 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d _ hd; rw [h] at hd; rw [hlay]
+    match i, hd with
+    | 0, hd => simp at hd; subst hd; decide
+    | 1, hd => simp at hd; subst hd; decide
+    | 2, hd => simp at hd; subst hd; decide
+    | 3, hd => simp at hd; subst hd; decide
+    | 4, hd => simp at hd; subst hd; decide
+    | _ + 5, hd => simp at hd
+  ret := by
+    intro d hd; rw [h] at hd; rw [hlay]; simp at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def fnAbiNested : FnAbi :=
+  { args := [{ layout := u32Layout, mode := .direct },
+             { layout := innerTupleLayout, mode := .direct },
+             { layout := unitTupleLayout, mode := .ignore },
+             { layout := outerTupleLayout, mode := .direct }],
+    ret := { layout := u32Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+/-- MIR (`Runtime(PostCleanup)`) of a function exercising nested padded tuples
+`((u8, u32), u16, ())`, zero-sized `()`, nested `Field` projections (`_4.0.1`),
+in-place sub-tuple writes (`_4.0 = ...`), in-place nested scalar writes
+(`_4.0.1 = ...`), and three tuple/field UB paths:
+* `bb0`: `SwitchInt(copy _1)` branches on `0 -> bb1`, `1 -> bb2`, `2 -> bb3`,
+  `otherwise -> bb4`;
+* `bb1` (`_1 = 0`):
+  - `_3 = Aggregate(Tuple, [])` (constructs zero-sized `()`);
+  - `_2 = Aggregate(Tuple, [const 3_u8, const 100_u32])` (constructs `(u8, u32)`);
+  - `_4 = Aggregate(Tuple, [copy _2, const 500_u16, copy _3])` (constructs nested `((u8, u32), u16, ())`);
+  - `_4.0 = Aggregate(Tuple, [const 9_u8, copy _1])` (in-place whole sub-tuple write into field `0` of `_4`);
+  - `_4.0.1 = BinaryOp(Add, copy _4.0.1, const 42_u32)` (in-place nested scalar field write at byte offset `0 + 4 = 4`);
+  - `_3 = Use(copy _4.2)` (`Use(Copy)` of zero-sized `()` field at offset `10`);
+  - `_0 = Cast(IntToInt, copy _4.0.0, u32Ty)` (`_0 = 9u32`);
+  - `_0 = BinaryOp(Add, copy _0, copy _4.0.1)` (`_0 = 9 + 42 = 51u32`);
+  - `Return`;
+* `bb2` (`_1 = 1`): `_2 = Aggregate(Tuple, [const 1_u8, copy _0])` (faults when
+  evaluating uninitialized operand `copy _0` inside `Aggregate(Tuple)`);
+* `bb3` (`_1 = 2`): constructs `_2` and then executes
+  `_2.1 = BinaryOp(Div, copy _1, const 0_u32)` (faults on division by zero in
+  the RHS of an in-place field assignment);
+* `bb4` (`otherwise`): `_4.0 = Aggregate(Tuple, [copy _4.0.0, copy _0])` (faults
+  when evaluating uninitialized operand `copy _0` in an in-place sub-tuple
+  assignment `_4.0 = ...`). -/
+def nestedTupleOps : CapturedMir where
+  defPath := "witness::nested_tuple_ops"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 4
+  localDecls := [u32Decl, u32Decl, innerTupleDecl, unitTupleDecl, outerTupleDecl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.switchInt (.copy (local_ 1))
+        { branches := [(0, 1), (1, 2), (2, 3)], otherwise := 4 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 3) (.aggregate .tuple [])),
+        mkStmt (.assign (local_ 2) (.aggregate .tuple [constU8 3, constU32 100])),
+        mkStmt (.assign (local_ 4)
+          (.aggregate .tuple [.copy (local_ 2), constU16 500, .copy (local_ 3)])),
+        mkStmt (.assign (placeField 4 [(0, innerTupleTy)])
+          (.aggregate .tuple [constU8 9, .copy (local_ 1)])),
+        mkStmt (.assign (placeField 4 [(0, innerTupleTy), (1, u32Ty)])
+          (.binaryOp .add
+            (.copy (placeField 4 [(0, innerTupleTy), (1, u32Ty)]))
+            (constU32 42))),
+        mkStmt (.assign (local_ 3) (.use (.copy (placeField 4 [(2, unitTupleTy)])))),
+        mkStmt (.placeMention (placeField 4 [(0, innerTupleTy)])),
+        mkStmt (.placeMention (placeField 4 [(0, innerTupleTy), (1, u32Ty)])),
+        mkStmt (.assign (local_ 0)
+          (.cast .intToInt (.copy (placeField 4 [(0, innerTupleTy), (0, u8TyW)])) u32Ty)),
+        mkStmt (.assign (local_ 0)
+          (.binaryOp .add (.copy (local_ 0))
+            (.copy (placeField 4 [(0, innerTupleTy), (1, u32Ty)]))))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 2) (.aggregate .tuple [constU8 1, .copy (local_ 0)]))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 2) (.aggregate .tuple [constU8 1, constU32 10])),
+        mkStmt (.assign (placeField 2 [(1, u32Ty)])
+          (.binaryOp .div (.copy (local_ 1)) (constU32 0)))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (placeField 4 [(0, innerTupleTy)])
+          (.aggregate .tuple
+            [.copy (placeField 4 [(0, innerTupleTy), (0, u8TyW)]), .copy (local_ 0)]))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiNested
+  layouts := nestedLayouts
+  allocations := []
+
+theorem nestedTupleOps_inFragment : inFragment nestedTupleOps = true := by decide
+
+def nestedTupleOpsFn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int u32),
+    (localName 1, .Int u32),
+    (localName 2, innerMiniRustTy),
+    (localName 3, unitMiniRustTy),
+    (localName 4, outerMiniRustTy)]⟩
+  args := [localName 1, localName 2, localName 3, localName 4]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[],
+      .Switch (.Load (.Local (localName 1)))
+        ⟨[(0, bbName 1), (1, bbName 2), (2, bbName 3)]⟩ (bbName 4),
+      .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 3)) (.Tuple [] unitMiniRustTy),
+      .Assign (.Local (localName 2))
+        (.Tuple [.Constant (.Int 3) (.Int u8), .Constant (.Int 100) (.Int u32)] innerMiniRustTy),
+      .Assign (.Local (localName 4))
+        (.Tuple [
+          .Load (.Local (localName 2)),
+          .Constant (.Int 500) (.Int u16),
+          .Load (.Local (localName 3))] outerMiniRustTy),
+      .Assign (.Field (.Local (localName 4)) 0)
+        (.Tuple [.Constant (.Int 9) (.Int u8), .Load (.Local (localName 1))] innerMiniRustTy),
+      .Assign (.Field (.Field (.Local (localName 4)) 0) 1)
+        (.BinOp (.Int .Add)
+          (.Load (.Field (.Field (.Local (localName 4)) 0) 1))
+          (.Constant (.Int 42) (.Int u32))),
+      .Assign (.Local (localName 3)) (.Load (.Field (.Local (localName 4)) 2)),
+      .PlaceMention (.Field (.Local (localName 4)) 0),
+      .PlaceMention (.Field (.Field (.Local (localName 4)) 0) 1),
+      .Assign (.Local (localName 0))
+        (.UnOp (.Cast (.IntToInt u32))
+          (.Load (.Field (.Field (.Local (localName 4)) 0) 0))),
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add)
+          (.Load (.Local (localName 0)))
+          (.Load (.Field (.Field (.Local (localName 4)) 0) 1)))],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Local (localName 2))
+        (.Tuple [.Constant (.Int 1) (.Int u8), .Load (.Local (localName 0))] innerMiniRustTy)],
+      .Return, .Regular⟩),
+    (bbName 3, ⟨[
+      .Assign (.Local (localName 2))
+        (.Tuple [.Constant (.Int 1) (.Int u8), .Constant (.Int 10) (.Int u32)] innerMiniRustTy),
+      .Assign (.Field (.Local (localName 2)) 1)
+        (.BinOp (.Int .Div) (.Load (.Local (localName 1))) (.Constant (.Int 0) (.Int u32)))],
+      .Return, .Regular⟩),
+    (bbName 4, ⟨[
+      .Assign (.Field (.Local (localName 4)) 0)
+        (.Tuple [
+          .Load (.Field (.Field (.Local (localName 4)) 0) 0),
+          .Load (.Local (localName 0))] innerMiniRustTy)],
+      .Return, .Regular⟩),
+    (bbName 5, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 5
+  implicit_writes := true
+
+theorem nestedTupleOps_translate : translateFn nestedTupleOps = some nestedTupleOpsFn := rfl
+
+def initInnerTuple : Value := .aggregate 0 [.scalar ⟨1, 1⟩, .scalar ⟨2, 4⟩]
+def initUnitTuple : Value := .aggregate 0 []
+def initOuterTuple : Value := .aggregate 0 [initInnerTuple, .scalar ⟨10, 2⟩, initUnitTuple]
+def nestedArgs (sel : Nat) : List Value :=
+  [.scalar ⟨sel, 4⟩, initInnerTuple, initUnitTuple, initOuterTuple]
+
+/-- `_1 = 0u32`: executes `bb1` and returns `9 + 42 = 51u32`. -/
+def nestedTupleOkS0 : MachineState := initMachineState nestedTupleOps (nestedArgs 0)
+def nestedTupleOkMInit : Mach :=
+  machineWithCtx ctxNested5 nestedTupleOps nestedTupleOpsFn
+    nestedTupleOkS0.frame.locals nestedTupleOpsFn.start
+
+def nestedTupleOkTrace : List (Event MirEffect) :=
+  [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
+
+theorem nestedTupleOk_anneal_ret :
+    ReachesRet (mirCallTree nestedTupleOps (nestedArgs 0)) nestedTupleOkTrace
+      (.normal (.scalar ⟨51, 4⟩, nestedTupleOkS0.memory)) :=
+  runA_sound nestedTupleOps 20 _ _ _ rfl
+
+theorem nestedTupleOk_noUB :
+    MirNoUBTree (mirCallTree nestedTupleOps (nestedArgs 0)) :=
+  runA_noUB nestedTupleOps 20 _ _ _ rfl
+
+theorem nestedTupleOk_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n nestedTupleOkMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 51 } ∧
+      m'.threads = [thread1 ctxNested5 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
+      (ctxNested5_ok rfl rfl) (nestedArgs 0) (by decide)
+      nestedTupleOkMInit rfl rfl rfl nestedTupleOk_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [nestedTupleOps] at hd; subst hd
+  simp [retPtr, ctxNested5] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxNested5] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem nestedTupleOk_minirust_direct :
+    (Interp.steps 13 nestedTupleOkMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 51 }, [1]) := rfl
+
+/-- Byte-level proof on `nestedTupleOps` (`_1 = 0u32`): MiniRust allocation `5`
+is `_4 : ((u8, u32), u16, ())` (`12` bytes, `align = 4`) and allocation `4` is
+`_3 : ()` (`0` bytes, `align = 1`):
+- after step `5` (`_4 = Aggregate(Tuple, [copy _2, 500u16, copy _3])`), `_4` holds
+  `(3u8, 100u32)` at `0..8` (with inner padding `1..4 = .Uninit`), `500u16`
+  (`0xF4, 0x01`) at `8..10`, `()` at `10..10`, and outer trailing padding
+  `10..12 = .Uninit`;
+- after step `6` (`_4.0 = Aggregate(Tuple, [9u8, copy _1])`), bytes `0..8` are
+  updated to `(9u8, 0u32)` with inner padding `1..4 = .Uninit` while field `1`
+  (`500u16` at `8..10`) and outer trailing padding (`10..12 = .Uninit`) remain
+  untouched;
+- after step `7` (`_4.0.1 = Add(copy _4.0.1, 42u32)`), bytes `4..8` become
+  `42u32` while `_4.0.0` (`byte 0 = 9`), inner padding `1..4 = .Uninit`, field `1`
+  (`8..10 = 500u16`), and outer trailing padding `10..12 = .Uninit` are preserved;
+- allocation `4` (`_3 : ()`) has `data = []` (`0` bytes) throughout. -/
+theorem nestedTupleOk_minirust_padding_bytes :
+    ((Interp.steps 5 nestedTupleOkMInit).toOption.bind
+      (fun m => (m.mem.memory.allocations[5]?).map (·.data))) =
+      some [.Init 3 none, .Uninit, .Uninit, .Uninit,
+            .Init 100 none, .Init 0 none, .Init 0 none, .Init 0 none,
+            .Init 0xF4 none, .Init 0x01 none, .Uninit, .Uninit] ∧
+    ((Interp.steps 6 nestedTupleOkMInit).toOption.bind
+      (fun m => (m.mem.memory.allocations[5]?).map (·.data))) =
+      some [.Init 9 none, .Uninit, .Uninit, .Uninit,
+            .Init 0 none, .Init 0 none, .Init 0 none, .Init 0 none,
+            .Init 0xF4 none, .Init 0x01 none, .Uninit, .Uninit] ∧
+    ((Interp.steps 7 nestedTupleOkMInit).toOption.bind
+      (fun m => (m.mem.memory.allocations[5]?).map (·.data))) =
+      some [.Init 9 none, .Uninit, .Uninit, .Uninit,
+            .Init 42 none, .Init 0 none, .Init 0 none, .Init 0 none,
+            .Init 0xF4 none, .Init 0x01 none, .Uninit, .Uninit] ∧
+    ((Interp.steps 8 nestedTupleOkMInit).toOption.bind
+      (fun m => (m.mem.memory.allocations[4]?).map (·.data))) =
+      some [] :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- On `Terminator::Return` at step `13` of `nestedTupleOps`, `evalReturn` calls
+`storageDead` on every callee local (`_0`..`_4`, allocations `1..=5`), verifying
+`BM.deallocate` against each local's layout (`size = 8, align = 4` for
+`_2 : (u8, u32)`, `size = 0, align = 1` for `_3 : ()`, and `size = 12, align = 4`
+for `_4 : ((u8, u32), u16, ())`) and marking all five callee stack allocations
+`live = false` while keeping the caller's return allocation `0` `live = true`. -/
+theorem nestedTupleOk_minirust_ret_dealloc :
+    (Interp.steps 13 nestedTupleOkMInit).toOption.map
+        (fun m => m.mem.memory.allocations.map (fun a => (a.live, a.data.length))) =
+      some [(true, 4), (false, 4), (false, 4), (false, 8), (false, 0), (false, 12)] := rfl
+
+theorem nestedTupleOk_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n nestedTupleOkMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k nestedTupleOkMInit = .ok mRet ∧
+      ReturnRel nestedTupleOps ctxNested5 s' v mRet ∧
+      ReachesRet (mirCallTree nestedTupleOps (nestedArgs 0)) tr (.normal (v, mem)) :=
+  mirCall_noUB nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
+    (ctxNested5_ok rfl rfl) (nestedArgs 0) (by decide) nestedTupleOkMInit rfl rfl rfl
+    nestedTupleOk_noUB herr
+
+theorem nestedTupleOk_minirust_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (n + 1) nestedTupleOkMInit = .ok m' ∧
+      StateRel nestedTupleOps nestedTupleOpsFn ctxNested5 s' m' ∧
+      Reaches (mirCallTree nestedTupleOps (nestedArgs 0)) tr (mirTree nestedTupleOps s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ n + 1 ∧ Interp.steps k nestedTupleOkMInit = .ok mRet ∧
+      ReturnRel nestedTupleOps ctxNested5 s' v mRet ∧
+      ReachesRet (mirCallTree nestedTupleOps (nestedArgs 0)) tr (.normal (v, mem))) :=
+  by simpa only [show initLen nestedTupleOps = 1 from rfl, Nat.add_comm 1 n] using
+    mirCall_progress nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
+      (ctxNested5_ok rfl rfl) (nestedArgs 0) (by decide) nestedTupleOkMInit rfl rfl rfl
+      nestedTupleOk_noUB n
+
+/-- `_1 = 1u32`: branches to `bb2` and faults when `Aggregate(Tuple)` evaluates
+its second operand `copy _0` while `_0` is `.uninit`. -/
+def nestedTupleAggUbS0 : MachineState := initMachineState nestedTupleOps (nestedArgs 1)
+def nestedTupleAggUbMInit : Mach :=
+  machineWithCtx ctxNested5 nestedTupleOps nestedTupleOpsFn
+    nestedTupleAggUbS0.frame.locals nestedTupleOpsFn.start
+
+theorem nestedTupleAggUb_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree nestedTupleOps (nestedArgs 1)) tr u ∧ FaultNow u :=
+  faultsA_sound nestedTupleOps 8 _ (by decide)
+
+theorem nestedTupleAggUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n nestedTupleAggUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := nestedTupleAggUb_anneal_ub
+  exact mirCall_ub nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
+    (ctxNested5_ok rfl rfl) (nestedArgs 1) (by decide)
+    nestedTupleAggUbMInit rfl rfl rfl hr hf
+
+theorem nestedTupleAggUb_minirust_direct :
+    Interp.steps 3 nestedTupleAggUbMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") := rfl
+
+theorem nestedTupleAggUb_converse_error :
+    (∃ msg, Stop.ub "load at type but the data in memory violates the language invariant" = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree nestedTupleOps (nestedArgs 1)) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 3 ∧ Interp.steps k nestedTupleAggUbMInit = .ok mRet ∧
+      ReturnRel nestedTupleOps ctxNested5 s' v mRet ∧
+      ReachesRet (mirCallTree nestedTupleOps (nestedArgs 1)) tr (.normal (v, mem))) :=
+  mirCall_steps_error nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
+    (ctxNested5_ok rfl rfl) (nestedArgs 1) (by decide)
+    nestedTupleAggUbMInit rfl rfl rfl nestedTupleAggUb_minirust_direct
+
+/-- `_1 = 2u32`: branches to `bb3` and faults on division by zero in the RHS of
+`_2.1 = Div(copy _1, const 0_u32)`. -/
+def nestedTupleFieldRhsUbS0 : MachineState := initMachineState nestedTupleOps (nestedArgs 2)
+def nestedTupleFieldRhsUbMInit : Mach :=
+  machineWithCtx ctxNested5 nestedTupleOps nestedTupleOpsFn
+    nestedTupleFieldRhsUbS0.frame.locals nestedTupleOpsFn.start
+
+theorem nestedTupleFieldRhsUb_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree nestedTupleOps (nestedArgs 2)) tr u ∧ FaultNow u :=
+  faultsA_sound nestedTupleOps 8 _ (by decide)
+
+theorem nestedTupleFieldRhsUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n nestedTupleFieldRhsUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := nestedTupleFieldRhsUb_anneal_ub
+  exact mirCall_ub nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
+    (ctxNested5_ok rfl rfl) (nestedArgs 2) (by decide)
+    nestedTupleFieldRhsUbMInit rfl rfl rfl hr hf
+
+theorem nestedTupleFieldRhsUb_minirust_direct :
+    Interp.steps 4 nestedTupleFieldRhsUbMInit = .error (.ub "division by zero") := rfl
+
+theorem nestedTupleFieldRhsUb_converse_error :
+    (∃ msg, Stop.ub "division by zero" = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree nestedTupleOps (nestedArgs 2)) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 4 ∧ Interp.steps k nestedTupleFieldRhsUbMInit = .ok mRet ∧
+      ReturnRel nestedTupleOps ctxNested5 s' v mRet ∧
+      ReachesRet (mirCallTree nestedTupleOps (nestedArgs 2)) tr (.normal (v, mem))) :=
+  mirCall_steps_error nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
+    (ctxNested5_ok rfl rfl) (nestedArgs 2) (by decide)
+    nestedTupleFieldRhsUbMInit rfl rfl rfl nestedTupleFieldRhsUb_minirust_direct
+
+/-- `_1 = 3u32`: branches to `bb4` and faults when `_4.0 = Aggregate(Tuple, [copy _4.0.0, copy _0])`
+evaluates its uninitialized second operand `copy _0`. -/
+def nestedTupleCopyUninitUbS0 : MachineState := initMachineState nestedTupleOps (nestedArgs 3)
+def nestedTupleCopyUninitUbMInit : Mach :=
+  machineWithCtx ctxNested5 nestedTupleOps nestedTupleOpsFn
+    nestedTupleCopyUninitUbS0.frame.locals nestedTupleOpsFn.start
+
+theorem nestedTupleCopyUninitUb_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree nestedTupleOps (nestedArgs 3)) tr u ∧ FaultNow u :=
+  faultsA_sound nestedTupleOps 8 _ (by decide)
+
+theorem nestedTupleCopyUninitUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n nestedTupleCopyUninitUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := nestedTupleCopyUninitUb_anneal_ub
+  exact mirCall_ub nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
+    (ctxNested5_ok rfl rfl) (nestedArgs 3) (by decide)
+    nestedTupleCopyUninitUbMInit rfl rfl rfl hr hf
+
+theorem nestedTupleCopyUninitUb_minirust_direct :
+    Interp.steps 3 nestedTupleCopyUninitUbMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") := rfl
+
+theorem nestedTupleCopyUninitUb_converse_error :
+    (∃ msg, Stop.ub "load at type but the data in memory violates the language invariant" = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree nestedTupleOps (nestedArgs 3)) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 3 ∧ Interp.steps k nestedTupleCopyUninitUbMInit = .ok mRet ∧
+      ReturnRel nestedTupleOps ctxNested5 s' v mRet ∧
+      ReachesRet (mirCallTree nestedTupleOps (nestedArgs 3)) tr (.normal (v, mem))) :=
+  mirCall_steps_error nestedTupleOps_inFragment nestedTupleOps_translate ctxNested5
+    (ctxNested5_ok rfl rfl) (nestedArgs 3) (by decide)
+    nestedTupleCopyUninitUbMInit rfl rfl rfl nestedTupleCopyUninitUb_minirust_direct
+
+def unsizedSliceTupleTy : Gen.Type :=
+  .Tuple [(⟨0⟩, .Int u8)]
+    { «end» := ⟨1⟩, align := ⟨4⟩, packed_align := none }
+    (some (.Slice (.Int u32)))
+
+/-- Ground-truth representation, layout, and place-evaluation edge cases for
+`Type::Tuple`, `TupleHeadLayout`, and `PlaceExpr::Field`:
+- zero-sized `()` layout, `encode`, `decode`, and `checkValue`;
+- `TupleHeadLayout` (`capped_tail_align` with `packed_align = none` and
+  `packed_align = some ⟨2⟩`, `tail_offset`, and `full_size_and_align`) and
+  unsized `Type::Tuple` with a `Type::Slice` tail (`Type.layout`, `computeSize`,
+  `computeAlign`);
+- `Type.encode` and `Type.decode` on padded `(u8, u32)` preserving `.Uninit`
+  padding bytes at `1..4`, ignoring arbitrary padding bytes on decode,
+  returning `none` when a field byte is `.Uninit`, and panicking on unsized
+  fields, length mismatches, or non-Tuple values;
+- `checkValue` on `Type::Tuple` panicking on unsized fields and raising UB on
+  field-count mismatch or invalid field values;
+- `PlaceExpr::Field` out-of-bounds field indices (`-1`, `2`, and `3` on a
+  2-field tuple) and non-tuple root raising `.specPanic`. -/
+theorem tuple_encode_decode_place_edge_cases :
+    Type.layout unitMiniRustTy = .ok (.Sized ⟨0⟩ ⟨1⟩) ∧
+    Type.encode unitMiniRustTy (.Tuple []) = .ok [] ∧
+    Type.decode unitMiniRustTy [] = .ok (some (.Tuple [])) ∧
+    checkValue (.Tuple []) unitMiniRustTy = .ok () ∧
+    TupleHeadLayout.capped_tail_align { «end» := ⟨1⟩, align := ⟨4⟩, packed_align := none } ⟨4⟩ = ⟨4⟩ ∧
+    TupleHeadLayout.capped_tail_align { «end» := ⟨1⟩, align := ⟨2⟩, packed_align := some ⟨2⟩ } ⟨4⟩ = ⟨2⟩ ∧
+    TupleHeadLayout.tail_offset { «end» := ⟨1⟩, align := ⟨4⟩, packed_align := none } ⟨4⟩ = ⟨4⟩ ∧
+    TupleHeadLayout.full_size_and_align { «end» := ⟨1⟩, align := ⟨4⟩, packed_align := none } ⟨6⟩ ⟨2⟩ =
+      (⟨8⟩, ⟨4⟩) ∧
+    Type.layout unsizedSliceTupleTy =
+      .ok (.Tuple { «end» := ⟨1⟩, align := ⟨4⟩, packed_align := none } (.Slice ⟨4⟩ ⟨4⟩)) ∧
+    (Type.layout unsizedSliceTupleTy >>= fun l =>
+      computeSize nestedTupleOkMInit l (some (.ElementCount 3))) =
+      .ok ⟨16⟩ ∧
+    (Type.layout unsizedSliceTupleTy >>= fun l =>
+      computeAlign nestedTupleOkMInit l (some (.ElementCount 3))) =
+      .ok ⟨4⟩ ∧
+    Type.encode innerMiniRustTy (.Tuple [.Int 7, .Int 0x04030201]) =
+      .ok [.Init 7 none, .Uninit, .Uninit, .Uninit,
+           .Init 1 none, .Init 2 none, .Init 3 none, .Init 4 none] ∧
+    Type.decode innerMiniRustTy
+      [.Init 7 none, .Init 99 none, .Uninit, .Init 88 none,
+       .Init 1 none, .Init 2 none, .Init 3 none, .Init 4 none] =
+      .ok (some (.Tuple [.Int 7, .Int 0x04030201])) ∧
+    Type.decode innerMiniRustTy
+      [.Init 7 none, .Uninit, .Uninit, .Uninit,
+       .Init 1 none, .Uninit, .Init 3 none, .Init 4 none] =
+      .ok none ∧
+    Type.encode unsizedSliceTupleTy (.Tuple [.Int 7]) =
+      .error (.specPanic "encode of Type::Tuple with unsized field") ∧
+    Type.encode innerMiniRustTy (.Tuple [.Int 7]) =
+      .error (.specPanic "assertion failed: values.len() == sized_fields.len()") ∧
+    Type.encode innerMiniRustTy (.Int 7) =
+      .error (.specPanic "encode: Type::Tuple with a non-Tuple value") ∧
+    Type.decode unsizedSliceTupleTy [.Init 7 none] =
+      .error (.specPanic "decode of Type::Tuple with unsized field") ∧
+    Type.decode innerMiniRustTy [.Init 7 none] =
+      .error (.specPanic "decode of Type::Tuple with invalid length") ∧
+    checkValue (.Tuple [.Int 7]) unsizedSliceTupleTy =
+      .error (.specPanic "Value: unsized structs cannot be represented as values") ∧
+    checkValue (.Tuple [.Int 7]) innerMiniRustTy =
+      .error (.ub "Value::Tuple: invalid number of fields") ∧
+    checkValue (.Tuple [.Int 300, .Int 0]) innerMiniRustTy =
+      .error (.ub "Value::Int: invalid integer value") ∧
+    Interp.evalPlace nestedTupleOkMInit (.Field (.Local (localName 2)) (-1)) =
+      .error (.specPanic "field projection to invalid field") ∧
+    Interp.evalPlace nestedTupleOkMInit (.Field (.Local (localName 2)) 2) =
+      .error (.specPanic "field projection to non-existing unsized tail") ∧
+    Interp.evalPlace nestedTupleOkMInit (.Field (.Local (localName 2)) 3) =
+      .error (.specPanic "field projection to invalid field") ∧
+    Interp.evalPlace nestedTupleOkMInit (.Field (.Local (localName 0)) 0) =
+      .error (.specPanic "field projection on non-projectable type") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+   rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end MiniRustSpec.Correspondence.Witness

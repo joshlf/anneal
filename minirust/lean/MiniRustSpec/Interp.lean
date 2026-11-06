@@ -41,7 +41,8 @@ here.
   `Statement::StorageDead` (through `Machine::try_mutate_cur_frame`,
   `StackFrame::storage_live`, and `StackFrame::storage_dead`)
   (`spec/lang/step/statements.md`, `spec/lang/machine.md`).
-* `PlaceExpr::Local` and `PlaceExpr::Field` (`spec/lang/step/expressions.md`),
+* `PlaceExpr::Local`, `PlaceExpr::Field`, and `PlaceExpr::Index`
+  (`spec/lang/step/expressions.md`),
   including `Machine::ptr_offset_inbounds` (`spec/lang/step/operators.md`),
   `ThinPointer::wrapping_offset` and `ThinPointer::widen`
   (`spec/mem/pointer.md`), `Memory::dereferenceable` and
@@ -70,7 +71,7 @@ here.
   `Terminator::Return` (`spec/lang/step/terminators.md`), including frame
   teardown, `storage_dead` of every local, and both stack-pop actions.
 * The representation relation (`Type::{decode, encode}`) for `Type::Int`,
-  `Type::Bool`, sized and unsized `Type::Tuple`, `Type::Union`
+  `Type::Bool`, sized and unsized `Type::Tuple`, `Type::Array`, `Type::Union`
   (`Type.encodeUnionChunks`), `Type::Enum` (including `decode_discriminant`
   and `encode_discriminant`), `Type::Slice`, and `Type::TraitObject`, and
   `Machine::check_value` (with `ensure_else_ub` and `checkUnionChunks`) for
@@ -78,9 +79,9 @@ here.
   (`spec/lang/types.md`); and `BasicMemory`'s `allocate`, `load`, `store`,
   `deallocate`, and `check_ptr` (`spec/mem/basic.md`), wrapped by
   `ConcurrentMemory`'s access recording (`spec/mem/concurrent.md`). The
-  recursion of these definitions over nested types, tuple fields, union
-  chunks, enum variants, and discriminator trees is structural (Lean `mutual`
-  blocks), so the kernel evaluates them.
+  recursion of these definitions over nested types, tuple fields, array
+  elements, union chunks, enum variants, and discriminator trees is structural
+  (Lean `mutual` blocks), so the kernel evaluates them.
 * The `x86_64` target (`spec/prelude/target.md`) as the instance of `T` and
   `BasicMemory<x86_64>` as the instance of `M`.
 
@@ -168,6 +169,22 @@ these operations are hand-written from its documented behavior. -/
 
 /-- `Size::bits()`: the number of bits in `s` bytes. -/
 def Size.bits (s : Size) : Nat := 8 * s.bytes
+
+/-- `Size::from_bytes(n)`: `Some` iff `n ≥ 0`. -/
+def Size.from_bytes (n : Int) : Option Size :=
+  if 0 ≤ n then some ⟨n.toNat⟩ else none
+
+/-- `Size * Int` (`Mul<Int> for Size` in `libspecr`:
+`Size::from_bytes(self.bytes() * rhs).unwrap()`), which panics when the byte
+product `self.bytes() * rhs` is negative (`< 0`). Note that `Size::ZERO * n =
+Size::ZERO` even for negative `n`. -/
+def Size.mulInt (s : Size) (n : Int) : Interp Size :=
+  match Size.from_bytes ((s.bytes : Int) * n) with
+  | some sz => pure sz
+  | none => specPanic "Size * Int: negative byte count"
+
+/-- `Size + Size` (`Add<Size> for Size` in `libspecr`). -/
+def Size.add (a b : Size) : Size := ⟨a.bytes + b.bytes⟩
 
 /-- `Align::from_bytes(n)`: `Some` iff `n` is a power of two. -/
 def alignFromBytes (n : Nat) : Option Align :=
@@ -322,6 +339,18 @@ def writeSubsliceAtIndex {T : Type} (xs : List T) (start : Int) (src : List T) :
   if 0 ≤ start ∧ start + src.length ≤ xs.length then
     pure (xs.take start.toNat ++ src ++ xs.drop (start.toNat + src.length))
   else specPanic "write_subslice_at_index out of range"
+
+/-- `List::try_map(f)` in `libspecr` lifted into `Interp`: applies `f`
+left-to-right and short-circuits on the first element that returns `none`. -/
+def tryMapM {α β : Type} [Monad m] (f : α → m (Option β)) : List α → m (Option (List β))
+  | [] => pure (some [])
+  | x :: xs => do
+    match ← f x with
+    | none => pure none
+    | some y =>
+      match ← tryMapM f xs with
+      | none => pure none
+      | some ys => pure (some (y :: ys))
 
 /-- `Size::align_to(align)`: the least multiple of `align` that is at least
 `s`, `Size::from_bytes(self.bytes().next_multiple_of(align.bytes()))`, where
@@ -534,13 +563,16 @@ def LayoutStrategy.compute_size_and_align (vtables : Ptr → Interp VTable) :
 >          tail: tail_ty.layout::<T>(),
 >      },
 >  },
->  ..
+>  Array { elem, count } => Sized(
+>      elem.layout::<T>().expect_size(\"WF ensures array element is sized\") * count,
+>      elem.layout::<T>().expect_align(\"WF ensures array element is sized\"),
+>  ),
 >  Slice { elem } => LayoutStrategy::Slice(
 >      elem.layout::<T>().expect_size(\"WF ensures slice element is sized\"),
 >      elem.layout::<T>().expect_align(\"WF ensures array element is sized\"),
 >  ),
 >  TraitObject(trait_name) => LayoutStrategy::TraitObject(trait_name),"
-Pointers and arrays are outside the fragment. -/
+Pointers are outside the fragment. -/
 def Type.layout : «Type» → Interp LayoutStrategy
   | .Int t => do pure (.Sized t.size (← IntType.align t))
   | .Bool => pure (.Sized ⟨1⟩ ⟨1⟩)
@@ -551,6 +583,12 @@ def Type.layout : «Type» → Interp LayoutStrategy
     pure (.Sized size align)
   | .Tuple _ headLayout (some tailTy) => do
     pure (.Tuple headLayout (← Type.layout tailTy))
+  | .Array elem count => do
+    let elemLayout ← Type.layout elem
+    let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures array element is sized"
+    let elemAlign ← LayoutStrategy.expect_align elemLayout "WF ensures array element is sized"
+    let size ← Size.mulInt elemSize count
+    pure (.Sized size elemAlign)
   | .Slice elem => do
     let size ← LayoutStrategy.expect_size (← Type.layout elem)
       "WF ensures slice element is sized"
@@ -558,7 +596,7 @@ def Type.layout : «Type» → Interp LayoutStrategy
       "WF ensures array element is sized"
     pure (.Slice size align)
   | .TraitObject traitName => pure (.TraitObject traitName)
-  | _ => unsupported "Type::layout for a pointer or array type"
+  | _ => unsupported "Type::layout for a pointer type"
 
 /-! ## Representation relation (`spec/lang/representation.md`) -/
 
@@ -691,8 +729,8 @@ def encodeDiscriminant {σ : Type} (accessor : σ → Offset → List Byte → I
 
 mutual
 
-/-- `Type::decode` for `Bool`, `Int` (`Type.decodeInt`), `Tuple`, `Union`,
-`Enum`, `Slice`, and `TraitObject` (`spec/lang/representation.md`):
+/-- `Type::decode` for `Bool`, `Int` (`Type.decodeInt`), `Tuple`, `Array`,
+`Union`, `Enum`, `Slice`, and `TraitObject` (`spec/lang/representation.md`):
 > "fn decode<M: Memory>(Type::Bool: Self, bytes: ..) -> Option<Value<M>> {
 >     if bytes.len() != 1 { panic!(..); }
 >     ret(match bytes[0] {
@@ -710,6 +748,20 @@ mutual
 >     if bytes.len() != size.bytes() { panic!(\"decode of Type::Tuple with invalid length\"); }
 >     ret(Value::Tuple(
 >         sized_fields.try_map(|(offset, ty)| { .. })?
+>     ))
+> }"
+> "fn decode<M: Memory>(Type::Array { elem, count }: Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> {
+>     let elem_size = elem.layout::<M::T>().expect_size(\"WF ensures array element is sized\");
+>     let full_size = elem_size * count;
+>
+>     if bytes.len() != full_size.bytes() { panic!(\"decode of Type::Array with invalid length\"); }
+>
+>     let chunks: List<_> = (Int::ZERO..count).map(|i|
+>         bytes.subslice_with_length(i*elem_size.bytes(), elem_size.bytes())
+>     ).collect();
+>
+>     ret(Value::Tuple(
+>         chunks.try_map(|elem_bytes| elem.decode::<M>(elem_bytes))?
 >     ))
 > }"
 > "fn decode<M: Memory>(Type::Union { size, chunks, .. }: Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> {
@@ -745,8 +797,8 @@ mutual
 The fields of a tuple are decoded by `Type.decodeFields` and the data of an
 enum variant by `Type.decodeVariant`. `decode_discriminant` fails only if its
 accessor does; this accessor fails only by panicking (`subsliceWithLength` out
-of range), so `.unwrap()` is the propagation of that panic. Pointers and arrays
-are outside the fragment. -/
+of range), so `.unwrap()` is the propagation of that panic. Pointers are
+outside the fragment. -/
 def Type.decode : «Type» → List Byte → Interp (Option Val)
   | .Bool, bytes =>
     if bytes.length ≠ 1 then specPanic "decode of Type::Bool with invalid length"
@@ -766,6 +818,17 @@ def Type.decode : «Type» → List Byte → Interp (Option Val)
         match ← Type.decodeFields fields bytes with
         | some vals => pure (some (.Tuple vals))
         | none => pure none
+  | .Array elem count, bytes => do
+    let elemLayout ← Type.layout elem
+    let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures array element is sized"
+    let fullSize ← Size.mulInt elemSize count
+    if bytes.length ≠ fullSize.bytes then
+      specPanic "decode of Type::Array with invalid length"
+    else do
+      let chunks ← (List.range count.toNat).mapM (fun (i : Nat) =>
+        subsliceWithLength bytes ((i : Int) * (elemSize.bytes : Int)) elemSize.bytes)
+      let decoded ← tryMapM (fun elemBytes => Type.decode elem elemBytes) chunks
+      pure (decoded.map Value.Tuple)
   | .Union _ chunks size _, bytes =>
     if bytes.length ≠ size.bytes then specPanic "decode of Type::Union with invalid length"
     else do
@@ -786,7 +849,7 @@ def Type.decode : «Type» → List Byte → Interp (Option Val)
         | none => pure none
   | .Slice _, _ => specPanic "decode of Type::Slice"
   | .TraitObject _, _ => specPanic "decode of Type::TraitObject"
-  | _, _ => unsupported "Type::decode for a pointer or array type"
+  | _, _ => unsupported "Type::decode for a pointer type"
 
 /-- The fields of `Type::decode` for `Tuple` (`spec/lang/representation.md`),
 each decoded from its own subslice:
@@ -845,8 +908,8 @@ def Type.encodeUnionChunks :
 
 mutual
 
-/-- `Type::encode` for `Bool`, `Int` (`Type.encodeInt`), `Tuple`, `Union`,
-`Enum`, `Slice`, and `TraitObject` (`spec/lang/representation.md`):
+/-- `Type::encode` for `Bool`, `Int` (`Type.encodeInt`), `Tuple`, `Array`,
+`Union`, `Enum`, `Slice`, and `TraitObject` (`spec/lang/representation.md`):
 > "fn encode<M: Memory>(Type::Bool: Self, val: Value<M>) -> .. {
 >     let Value::Bool(b) = val else { panic!() };
 >     list![AbstractByte::Init(if b { 1 } else { 0 }, None)]
@@ -862,6 +925,15 @@ mutual
 >     let mut bytes = list![AbstractByte::Uninit; size.bytes()];
 >     ..
 >     bytes
+> }"
+> "fn encode<M: Memory>(Type::Array { elem, count }: Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> {
+>     let Value::Tuple(values) = val else { panic!() };
+>     assert_eq!(values.len(), count);
+>     values.flat_map(|value| {
+>         let bytes = elem.encode::<M>(value);
+>         assert_eq!(bytes.len(), elem.layout::<M::T>().expect_size(\"WF ensures array element is sized\").bytes());
+>         bytes
+>     })
 > }"
 > "fn encode<M: Memory>(Type::Union { size, chunks, .. }: Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> {
 >     let Value::Union(chunk_data) = val else { panic!() };
@@ -897,7 +969,7 @@ mutual
 > }"
 The fields of a tuple are encoded by `Type.encodeFields`, the chunks of a
 union by `Type.encodeUnionChunks`, and the variant of an enum by
-`Type.encodeVariant`. Pointers and arrays are outside the fragment. -/
+`Type.encodeVariant`. Pointers are outside the fragment. -/
 def Type.encode : «Type» → Val → Interp (List Byte)
   | .Bool, .Bool b => pure [.Init (if b then 1 else 0) none]
   | .Bool, _ => specPanic "encode: Type::Bool with a non-Bool value"
@@ -913,6 +985,20 @@ def Type.encode : «Type» → Val → Interp (List Byte)
           specPanic "assertion failed: values.len() == sized_fields.len()"
         else Type.encodeFields fields values (List.replicate size.bytes .Uninit)
       | _ => specPanic "encode: Type::Tuple with a non-Tuple value"
+  | .Array elem count, .Tuple values =>
+    if (values.length : Int) ≠ count then
+      specPanic "encode: Type::Array length mismatch"
+    else do
+      let encoded ← values.mapM (fun value => do
+        let bytes ← Type.encode elem value
+        let elemLayout ← Type.layout elem
+        let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures array element is sized"
+        if bytes.length ≠ elemSize.bytes then
+          specPanic "encode: Type::Array element byte length mismatch"
+        else
+          pure bytes)
+      pure encoded.flatten
+  | .Array _ _, _ => specPanic "encode: Type::Array with a non-Tuple value"
   | .Union _ chunks size _, val =>
     match val with
     | .Union chunkData =>
@@ -926,7 +1012,7 @@ def Type.encode : «Type» → Val → Interp (List Byte)
     | _ => specPanic "encode: Type::Enum with a non-Variant value"
   | .Slice _, _ => specPanic "encode of Type::Slice"
   | .TraitObject _, _ => specPanic "encode of Type::TraitObject"
-  | _, _ => unsupported "Type::encode for a pointer or array type"
+  | _, _ => unsupported "Type::encode for a pointer type"
 
 /-- The field loop of `Type::encode` for `Tuple`
 (`spec/lang/representation.md`), which writes each field's encoding at its
@@ -979,8 +1065,8 @@ def checkUnionChunks : List (List Byte) → List (Offset × Size) → Interp Uni
 
 mutual
 
-/-- `Machine::check_value` for `Int`, `Bool`, `Tuple`, `Union`, `Variant`,
-`Slice`, and `TraitObject` (`spec/lang/representation.md`):
+/-- `Machine::check_value` for `Int`, `Bool`, `Tuple`, `Array`, `Union`,
+`Variant`, `Slice`, and `TraitObject` (`spec/lang/representation.md`):
 > "(Value::Int(i), Type::Int(int_ty)) => {
 >     ensure_else_ub(int_ty.can_represent(i), \"Value::Int: invalid integer value\")?;
 > }
@@ -991,7 +1077,12 @@ mutual
 >     ensure_else_ub(vals.len() == sized_fields.len(), \"Value::Tuple: invalid number of fields\")?;
 >     ..
 > }
-> ..
+> (Value::Tuple(vals), Type::Array { elem, count }) => {
+>     ensure_else_ub(vals.len() == count, \"Value::Tuple: invalid number of elements\")?;
+>     for val in vals {
+>         self.check_value(val, elem)?;
+>     }
+> }
 > (Value::Union(chunk_data), Type::Union { chunks, .. }) => {
 >     ensure_else_ub(chunk_data.len() == chunks.len(), \"Value::Union: invalid chunk size\")?;
 >     ..
@@ -1003,8 +1094,8 @@ mutual
 > (_, Type::TraitObject { .. }) => panic!(\"Value: trait objects cannot be represented as values\"),
 > _ => panic!(\"Value: value does not match type\")"
 The fields of a tuple are checked by `checkFields`, the chunks of a union by
-`checkUnionChunks`, and the data of a variant by `checkVariant`. Pointers and
-arrays are outside the fragment. -/
+`checkUnionChunks`, and the data of a variant by `checkVariant`. Pointers are
+outside the fragment. -/
 def checkValue : Val → «Type» → Interp Unit
   | .Int i, .Int t =>
     ensureElseUb (IntType.can_represent t i) "Value::Int: invalid integer value"
@@ -1015,6 +1106,9 @@ def checkValue : Val → «Type» → Interp Unit
     | none => do
       ensureElseUb (vals.length == fields.length) "Value::Tuple: invalid number of fields"
       checkFields vals fields
+  | .Tuple vals, .Array elem count => do
+    ensureElseUb (decide ((vals.length : Int) = count)) "Value::Tuple: invalid number of elements"
+    vals.forM (fun val => checkValue val elem)
   | .Union chunkData, .Union _ chunks _ _ => do
     ensureElseUb (chunkData.length == chunks.length) "Value::Union: invalid chunk size"
     checkUnionChunks chunkData chunks
@@ -1024,9 +1118,10 @@ def checkValue : Val → «Type» → Interp Unit
   | _, .Int _ => specPanic "Value: value does not match type"
   | _, .Bool => specPanic "Value: value does not match type"
   | _, .Tuple _ _ _ => specPanic "Value: value does not match type"
+  | _, .Array _ _ => specPanic "Value: value does not match type"
   | _, .Union _ _ _ _ => specPanic "Value: value does not match type"
   | _, .Enum _ _ _ _ _ => specPanic "Value: value does not match type"
-  | _, _ => unsupported "check_value for a pointer or array type"
+  | _, _ => unsupported "check_value for a pointer type"
 
 /-- The field loop of `check_value` for tuples (`spec/lang/representation.md`):
 > "for (val, (_, ty)) in vals.zip(sized_fields) {
@@ -1657,78 +1752,6 @@ def ptrOffsetInbounds (m : Mach) (ptr : Ptr) (offset : Int) : Interp Ptr := do
   else
     pure { ptr with addr := ptr.addr + offset }
 
-/-- `Machine::eval_place` for `PlaceExpr::Local` and `PlaceExpr::Field`
-(`spec/lang/step/expressions.md`):
-> "let ty = self.cur_frame().func.locals[name];
->  let Some(ptr) = self.cur_frame().locals.get(name) else {
->      throw_ub!(\"access to a dead local\");
->  };
->  ret((Place { ptr: ptr.widen(None), aligned: true }, ty))"
-> "fn eval_place(&mut self, PlaceExpr::Field { root, field }: PlaceExpr) -> Result<(Place<M>, Type)> {
->     let (root, ty) = self.eval_place(root)?;
->     let (offset, field_ty) = match ty {
->         Type::Tuple { sized_fields, unsized_field, sized_head_layout } => {
->             if field >= 0 && field < sized_fields.len() {
->                 sized_fields[field]
->             } else if field == sized_fields.len() {
->                 let tail_ty = unsized_field.expect(\"field projection to non-existing unsized tail\");
->                 let tail_align = self.compute_align(tail_ty.layout::<M::T>(), root.ptr.metadata);
->                 let offset = sized_head_layout.tail_offset(tail_align);
->                 (offset, tail_ty)
->             } else {
->                 panic!(\"field projection to invalid field\");
->             }
->         }
->         Type::Union { fields, .. } => fields[field],
->         _ => panic!(\"field projection on non-projectable type\"),
->     };
->     assert!(offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata));
->
->     let ptr = self.ptr_offset_inbounds(root.ptr.thin_pointer, offset.bytes())?;
->     let ptr = if !field_ty.layout::<M::T>().is_sized() {
->         // Unsized fields should retain the metadata
->         ptr.widen(root.ptr.metadata)
->     } else {
->         ptr.widen(None)
->     };
->     ret((Place { ptr, ..root }, field_ty))
-> }" -/
-def evalPlace (m : Mach) : PlaceExpr → Interp (Place BM × «Type»)
-  | .Local name => do
-    let fr ← curFrame m
-    let ty ← mapIndex fr.func.locals name "self.cur_frame().func.locals[name]"
-    match mapGet fr.locals name with
-    | none => ub "access to a dead local"
-    | some ptr => pure ({ ptr := ThinPointer.widen ptr none, aligned := true }, ty)
-  | .Field root field => do
-    let (root, ty) ← evalPlace m root
-    let (offset, fieldTy) ← match ty with
-      | .Tuple sizedFields sizedHeadLayout unsizedField =>
-        if 0 ≤ field ∧ field < (sizedFields.length : Int) then
-          listIndex sizedFields field "sized_fields[field]"
-        else if field = (sizedFields.length : Int) then
-          match unsizedField with
-          | none => specPanic "field projection to non-existing unsized tail"
-          | some tailTy => do
-            let tailAlign ← computeAlign m (← Type.layout tailTy) root.ptr.metadata
-            let offset := TupleHeadLayout.tail_offset sizedHeadLayout tailAlign
-            pure (offset, tailTy)
-        else
-          specPanic "field projection to invalid field"
-      | .Union fields _ _ _ => listIndex fields field "fields[field]"
-      | _ => specPanic "field projection on non-projectable type"
-    let rootSize ← computeSize m (← Type.layout ty) root.ptr.metadata
-    if !(offset.bytes ≤ rootSize.bytes) then
-      specPanic "assertion failed: offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata)"
-    else do
-      let ptr ← ptrOffsetInbounds m root.ptr.thin_pointer (offset.bytes : Int)
-      let ptr := if !LayoutStrategy.is_sized (← Type.layout fieldTy) then
-          ThinPointer.widen ptr root.ptr.metadata
-        else
-          ThinPointer.widen ptr none
-      pure ({ root with ptr := ptr }, fieldTy)
-  | _ => unsupported "eval_place for a place expression other than Local or Field"
-
 /-- `Machine::place_load`:
 > "if !place.aligned { throw_ub!(\"loading from a place based on a misaligned pointer\"); }
 >  ret(self.typed_load(place.ptr.thin_pointer, ty, Align::ONE, Atomicity::None)?)" -/
@@ -2134,9 +2157,136 @@ def evalBinOp (op : BinOp) (l : Val × «Type») (r : Val × «Type») : Interp 
     | _, _, _ => specPanic "relational operator on incomparable type or value-type mismatch"
   | _, _, _ => unsupported "eval_bin_op for an operator outside BinOp::Int, BinOp::IntWithOverflow, and BinOp::Rel"
 
-/-! ## Value expressions (`spec/lang/step/expressions.md`) -/
+/-! ## Place and value expressions (`spec/lang/step/expressions.md`) -/
 
 mutual
+
+/-- `Machine::eval_place` for `PlaceExpr::Local`, `PlaceExpr::Field`, and
+`PlaceExpr::Index` (`spec/lang/step/expressions.md`):
+> "let ty = self.cur_frame().func.locals[name];
+>  let Some(ptr) = self.cur_frame().locals.get(name) else {
+>      throw_ub!(\"access to a dead local\");
+>  };
+>  ret((Place { ptr: ptr.widen(None), aligned: true }, ty))"
+> "fn eval_place(&mut self, PlaceExpr::Field { root, field }: PlaceExpr) -> Result<(Place<M>, Type)> {
+>     let (root, ty) = self.eval_place(root)?;
+>     let (offset, field_ty) = match ty {
+>         Type::Tuple { sized_fields, unsized_field, sized_head_layout } => {
+>             if field >= 0 && field < sized_fields.len() {
+>                 sized_fields[field]
+>             } else if field == sized_fields.len() {
+>                 let tail_ty = unsized_field.expect(\"field projection to non-existing unsized tail\");
+>                 let tail_align = self.compute_align(tail_ty.layout::<M::T>(), root.ptr.metadata);
+>                 let offset = sized_head_layout.tail_offset(tail_align);
+>                 (offset, tail_ty)
+>             } else {
+>                 panic!(\"field projection to invalid field\");
+>             }
+>         }
+>         Type::Union { fields, .. } => fields[field],
+>         _ => panic!(\"field projection on non-projectable type\"),
+>     };
+>     assert!(offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata));
+>
+>     let ptr = self.ptr_offset_inbounds(root.ptr.thin_pointer, offset.bytes())?;
+>     let ptr = if !field_ty.layout::<M::T>().is_sized() {
+>         // Unsized fields should retain the metadata
+>         ptr.widen(root.ptr.metadata)
+>     } else {
+>         ptr.widen(None)
+>     };
+>     ret((Place { ptr, ..root }, field_ty))
+> }
+>
+> fn eval_place(&mut self, PlaceExpr::Index { root, index }: PlaceExpr) -> Result<(Place<M>, Type)> {
+>     let (root, ty) = self.eval_place(root)?;
+>     let (Value::Int(index), _) = self.eval_value(index)? else {
+>         panic!(\"non-integer operand for array index\")
+>     };
+>     let (elem_ty, count) = match ty {
+>         Type::Array { elem, count } => (elem, count),
+>         Type::Slice { elem } => {
+>             let Some(PointerMeta::ElementCount(count)) = root.ptr.metadata else {
+>                 panic!(\"eval_place should always return a ptr which matches meta for the LayoutStrategy of ty\");
+>             };
+>             (elem, count)
+>         }
+>         _ => panic!(\"index projection on non-indexable type\"),
+>     };
+>     if index < 0 || index >= count {
+>         throw_ub!(\"access to out-of-bounds index\");
+>     }
+>
+>     let elem_size = elem_ty.layout::<M::T>().expect_size(\"WF ensures array & slice elements are sized\");
+>     let offset = index * elem_size;
+>     assert!(
+>         offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata),
+>         \"sanity check: the indexed offset should not be outside what the type allows.\"
+>     );
+>
+>     let ptr = self.ptr_offset_inbounds(root.ptr.thin_pointer, offset.bytes())?;
+>     ret((Place { ptr: ptr.widen(None), ..root }, elem_ty))
+> }" -/
+def evalPlace (m : Mach) : PlaceExpr → Interp ((Place BM × «Type») × Mach)
+  | .Local name => do
+    let fr ← curFrame m
+    let ty ← mapIndex fr.func.locals name "self.cur_frame().func.locals[name]"
+    match mapGet fr.locals name with
+    | none => ub "access to a dead local"
+    | some ptr => pure (({ ptr := ThinPointer.widen ptr none, aligned := true }, ty), m)
+  | .Field root field => do
+    let ((root, ty), m) ← evalPlace m root
+    let (offset, fieldTy) ← match ty with
+      | .Tuple sizedFields sizedHeadLayout unsizedField =>
+        if 0 ≤ field ∧ field < (sizedFields.length : Int) then
+          listIndex sizedFields field "sized_fields[field]"
+        else if field = (sizedFields.length : Int) then
+          match unsizedField with
+          | none => specPanic "field projection to non-existing unsized tail"
+          | some tailTy => do
+            let tailAlign ← computeAlign m (← Type.layout tailTy) root.ptr.metadata
+            let offset := TupleHeadLayout.tail_offset sizedHeadLayout tailAlign
+            pure (offset, tailTy)
+        else
+          specPanic "field projection to invalid field"
+      | .Union fields _ _ _ => listIndex fields field "fields[field]"
+      | _ => specPanic "field projection on non-projectable type"
+    let rootSize ← computeSize m (← Type.layout ty) root.ptr.metadata
+    if !(offset.bytes ≤ rootSize.bytes) then
+      specPanic "assertion failed: offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata)"
+    else do
+      let ptr ← ptrOffsetInbounds m root.ptr.thin_pointer (offset.bytes : Int)
+      let ptr := if !LayoutStrategy.is_sized (← Type.layout fieldTy) then
+          ThinPointer.widen ptr root.ptr.metadata
+        else
+          ThinPointer.widen ptr none
+      pure (({ root with ptr := ptr }, fieldTy), m)
+  | .Index root index => do
+    let ((root, ty), m) ← evalPlace m root
+    let ((idxVal, _), m) ← evalValue m index
+    let idx ← match idxVal with
+      | .Int i => pure i
+      | _ => specPanic "non-integer operand for array index"
+    let (elemTy, count) ← match ty with
+      | .Array elem count => pure (elem, count)
+      | .Slice elem =>
+        match root.ptr.metadata with
+        | some (.ElementCount count) => pure (elem, count)
+        | _ => specPanic "eval_place should always return a ptr which matches meta for the LayoutStrategy of ty"
+      | _ => specPanic "index projection on non-indexable type"
+    if idx < 0 ∨ idx ≥ count then
+      ub "access to out-of-bounds index"
+    else do
+      let elemLayout ← Type.layout elemTy
+      let elemSize ← LayoutStrategy.expect_size elemLayout "WF ensures array & slice elements are sized"
+      let offset ← Size.mulInt elemSize idx
+      let rootSize ← computeSize m (← Type.layout ty) root.ptr.metadata
+      if offset.bytes ≤ rootSize.bytes then
+        let ptr ← ptrOffsetInbounds m root.ptr.thin_pointer (offset.bytes : Int)
+        pure (({ root with ptr := ThinPointer.widen ptr none }, elemTy), m)
+      else
+        specPanic "sanity check: the indexed offset should not be outside what the type allows."
+  | _ => unsupported "eval_place for a place expression other than Local, Field, or Index"
 
 /-- `Machine::eval_value` for `Constant`, `Tuple`, `Load`, `UnOp`, and `BinOp`:
 > "fn eval_value(&mut self, ValueExpr::Constant(constant, ty): ValueExpr) -> .. {
@@ -2172,7 +2322,7 @@ def evalValue (m : Mach) : ValueExpr → Interp ((Val × «Type») × Mach)
     let (vals, m) ← evalValues m exprs
     pure ((.Tuple vals, ty), m)
   | .Load source => do
-    let (place, ty) ← evalPlace m source
+    let ((place, ty), m) ← evalPlace m source
     let (v, m) ← placeLoad m place ty
     pure ((v, ty), m)
   | .UnOp operator operand => do
@@ -2290,18 +2440,18 @@ def storageLive (fr : Frame) (cm : ConcurrentMemory BM) (local_ : LocalName) :
 > }" -/
 def evalStatement (m : Mach) : Statement → Interp Mach
   | .Assign destination source => do
-    let (place, ty) ← evalPlace m destination
+    let ((place, ty), m) ← evalPlace m destination
     let ((val, _), m) ← evalValue m source
     placeStore m place val ty
   | .PlaceMention place => do
-    let _ ← evalPlace m place
+    let (_, m) ← evalPlace m place
     pure m
   | .StorageLive local_ =>
     tryMutateCurFrame m (fun fr cm => storageLive fr cm local_)
   | .StorageDead local_ =>
     tryMutateCurFrame m (fun fr cm => storageDead fr cm local_)
   | .Deinit place => do
-    let (p, ty) ← evalPlace m place
+    let ((p, ty), m) ← evalPlace m place
     if !p.aligned then ub "de-initializing a place based on a misaligned pointer"
     else do
       let layout ← Type.layout ty

@@ -1778,3 +1778,157 @@ fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
         );
     }
 }
+
+#[test]
+fn mr_2_1_array_quotations_are_pinned_and_tamper_checked() {
+    let corpus = corpus();
+    let valid_paths: BTreeSet<String> = corpus.iter().map(|(p, _)| p.clone()).collect();
+    let lean_root = minirust_dir().join("lean");
+
+    let interp_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Interp.lean")).unwrap();
+    let interp_quotes = extract_quotes(&interp_text, &valid_paths).unwrap();
+    let expected_interp: &[(&str, &str)] = &[
+        ("spec/lang/types.md", "pub fn compute_size_and_align<Provenance>("),
+        ("spec/lang/machine.md", "fn compute_size(&self, layout: LayoutStrategy,"),
+        ("spec/lang/types.md", "Array { elem, count } => Sized("),
+        ("spec/lang/representation.md", "fn decode<M: Memory>(Type::Array { elem, count }: Self,"),
+        ("spec/lang/representation.md", "fn encode<M: Memory>(Type::Array { elem, count }: Self,"),
+        ("spec/lang/representation.md", "fn ensure_else_ub(b: bool, msg: &str) -> Result<()>"),
+        ("spec/lang/representation.md", "(Value::Tuple(vals), Type::Array { elem, count }) =>"),
+        ("spec/mem/basic.md", "fn dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Size)"),
+        ("spec/mem/interface.md", "fn signed_dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Int)"),
+        ("spec/mem/concurrent.md", "pub fn dereferenceable(&self, ptr: ThinPointer<M::Provenance>, len: Size) -> Result"),
+        ("spec/mem/concurrent.md", "pub fn signed_dereferenceable(&self, ptr: ThinPointer<M::Provenance>, len: Int) -> Result"),
+        ("spec/lang/step/operators.md", "fn ptr_offset_inbounds(&self, ptr: ThinPointer<M::Provenance>, offset: Int)"),
+        ("spec/lang/step/expressions.md", "PlaceExpr::Index { root, index }: PlaceExpr"),
+        ("spec/lang/step/expressions.md", "offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata),"),
+        ("spec/lang/step/expressions.md", "let vals = exprs.try_map(|e| self.eval_value(e))?.map(|e| e.0);"),
+        ("spec/lang/step/expressions.md", "ValueExpr::Tuple(exprs, ty): ValueExpr"),
+    ];
+    for (cited_file, needle) in expected_interp {
+        let matched = interp_quotes
+            .iter()
+            .find(|q| q.cited_file == *cited_file && squash(&q.text).contains(&squash(needle)))
+            .unwrap_or_else(|| {
+                panic!("Interp.lean missing MR-2.1 quotation `{needle}` cited to `{cited_file}`")
+            });
+        assert_eq!(
+            missing_piece_in(&corpus, Some(cited_file), &matched.text),
+            None,
+            "Interp.lean quotation `{needle}` failed upstream verification"
+        );
+        // Verify tamper sensitivity: mutating the quoted snippet must fail against `cited_file`.
+        let mutated = format!("{}__TAMPERED__", matched.text);
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), &mutated).is_some(),
+            "tampered quotation for `{needle}` unexpectedly matched `{cited_file}`"
+        );
+    }
+
+    let translate_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Correspondence/Translate.lean"))
+            .unwrap();
+    let translate_quotes = extract_quotes(&translate_text, &valid_paths).unwrap();
+    let expected_translate: &[(&str, &str)] = &[
+        ("tooling/minimize/src/ty.rs", "rs::TyKind::Array(ty, c) =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::ProjectionElem::Index(loc) =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::ProjectionElem::ConstantIndex { .. }"),
+        ("tooling/minimize/src/rvalue.rs", "Type::Tuple { .. } | Type::Array { .. } =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::Rvalue::Len(place) =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::Rvalue::Repeat(op, c) =>"),
+    ];
+    for (cited_file, needle) in expected_translate {
+        let matched = translate_quotes
+            .iter()
+            .find(|q| q.cited_file == *cited_file && squash(&q.text).contains(&squash(needle)))
+            .unwrap_or_else(|| {
+                panic!("Translate.lean missing MR-2.1 quotation `{needle}` cited to `{cited_file}`")
+            });
+        assert_eq!(
+            missing_piece_in(&corpus, Some(cited_file), &matched.text),
+            None,
+            "Translate.lean quotation `{needle}` failed upstream verification"
+        );
+        let mutated = format!("{}__TAMPERED__", matched.text);
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), &mutated).is_some(),
+            "tampered quotation for `{needle}` unexpectedly matched `{cited_file}`"
+        );
+    }
+}
+
+#[test]
+fn mr_2_2_tuple_quotations_are_pinned_and_tamper_checked() {
+    let corpus = corpus();
+    let valid_paths: BTreeSet<String> = corpus.iter().map(|(p, _)| p.clone()).collect();
+    let lean_root = minirust_dir().join("lean");
+
+    let interp_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Interp.lean")).unwrap();
+    let interp_quotes = extract_quotes(&interp_text, &valid_paths).unwrap();
+    let expected_interp: &[(&str, &str)] = &[
+        ("spec/lang/types.md", "fn capped_tail_align(self, tail_align: Align) -> Align"),
+        ("spec/lang/types.md", "pub fn tail_offset(self, tail_align: Align) -> Offset"),
+        ("spec/lang/types.md", "pub fn full_size_and_align(self, tail_size: Size, tail_align: Align)"),
+        ("spec/lang/types.md", "pub fn head_size_and_align(self) -> (Size, Align)"),
+        ("spec/lang/types.md", "pub fn is_sized(self) -> bool"),
+        ("spec/lang/types.md", "(LayoutStrategy::Tuple { head, tail }, Some(meta)) =>"),
+        ("spec/lang/machine.md", "fn compute_align(&self, layout: LayoutStrategy,"),
+        ("spec/lang/types.md", "Tuple { sized_head_layout, unsized_field, .. } => match unsized_field {"),
+        ("spec/lang/types.md", "Slice { elem } => LayoutStrategy::Slice("),
+        ("spec/lang/representation.md", "fn decode<M: Memory>(Type::Tuple { sized_fields,"),
+        ("spec/lang/representation.md", "fn encode<M: Memory>(Type::Tuple { sized_fields,"),
+        ("spec/lang/representation.md", "let mut bytes = list![AbstractByte::Uninit; size.bytes()];"),
+        ("spec/lang/representation.md", "(Value::Tuple(vals), Type::Tuple { sized_fields, unsized_field, .. }) =>"),
+        ("spec/lang/step/expressions.md", "PlaceExpr::Field { root, field }: PlaceExpr"),
+    ];
+    for (cited_file, needle) in expected_interp {
+        let matched = interp_quotes
+            .iter()
+            .find(|q| q.cited_file == *cited_file && squash(&q.text).contains(&squash(needle)))
+            .unwrap_or_else(|| {
+                panic!("Interp.lean missing MR-2.2 quotation `{needle}` cited to `{cited_file}`")
+            });
+        assert_eq!(
+            missing_piece_in(&corpus, Some(cited_file), &matched.text),
+            None,
+            "Interp.lean quotation `{needle}` failed upstream verification"
+        );
+        let mutated = format!("{}__TAMPERED__", matched.text);
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), &mutated).is_some(),
+            "tampered quotation for `{needle}` unexpectedly matched `{cited_file}`"
+        );
+    }
+
+    let translate_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Correspondence/Translate.lean"))
+            .unwrap();
+    let translate_quotes = extract_quotes(&translate_text, &valid_paths).unwrap();
+    let expected_translate: &[(&str, &str)] = &[
+        ("tooling/minimize/src/ty.rs", "fn tuple_from_layout(&mut self, layout: rs::TyAndLayout<'tcx>"),
+        ("tooling/minimize/src/ty.rs", "fn translate_non_enum_adt("),
+        ("tooling/minimize/src/ty.rs", "rs::TyKind::Tuple(..) =>"),
+        ("tooling/minimize/src/ty.rs", "rs::TyKind::Adt(adt_def, sref) if adt_def.is_struct() =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::ProjectionElem::Field(f, _ty) =>"),
+    ];
+    for (cited_file, needle) in expected_translate {
+        let matched = translate_quotes
+            .iter()
+            .find(|q| q.cited_file == *cited_file && squash(&q.text).contains(&squash(needle)))
+            .unwrap_or_else(|| {
+                panic!("Translate.lean missing MR-2.2 quotation `{needle}` cited to `{cited_file}`")
+            });
+        assert_eq!(
+            missing_piece_in(&corpus, Some(cited_file), &matched.text),
+            None,
+            "Translate.lean quotation `{needle}` failed upstream verification"
+        );
+        let mutated = format!("{}__TAMPERED__", matched.text);
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), &mutated).is_some(),
+            "tampered quotation for `{needle}` unexpectedly matched `{cited_file}`"
+        );
+    }
+}

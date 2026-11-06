@@ -37,12 +37,12 @@ open Lean Elab Command
 /-- Fail unless every listed declaration is distinct and depends only on the
 standard axioms. -/
 elab "#assert_standard_axioms " ids:ident* : command => do
-  let mut seen : Array Name := #[]
+  let mut seen : Lean.NameSet := {}
   for id in ids do
     let n ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo id
     if seen.contains n then
       throwError "duplicate declaration {n} in #assert_standard_axioms"
-    seen := seen.push n
+    seen := seen.insert n
     let axs ← liftCoreM <| Lean.collectAxioms n
     for a in axs do
       unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
@@ -54,13 +54,13 @@ elab "#assert_standard_axioms " ids:ident* : command => do
 then log one line `<tag> decls=<n> axioms=<union> sorry_free=true`. -/
 elab "#check_theorem_deps " tag:str ids:ident* : command => do
   let env ← getEnv
-  let mut seen : Array Name := #[]
+  let mut seen : Lean.NameSet := {}
   let mut union : Array Name := #[]
   for id in ids do
     let n ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo id
     if seen.contains n then
       throwError "{tag.getString} duplicate declaration {n}"
-    seen := seen.push n
+    seen := seen.insert n
     unless (env.find? n matches some (.thmInfo _)) do
       throwError "{tag.getString} {n} is not a theorem"
     let axs ← liftCoreM <| Lean.collectAxioms n
@@ -274,8 +274,8 @@ open MiniRustSpec.Correspondence in
   StaleOk.assign
   StaleOk.setBoth
   StaleOk.keep
-  StateRelAt.advance
-  StateRelAt.jump
+  StateRelAt.advanceN
+  StateRelAt.jumpN
   StartRel.localsOk
   initLocalsAux_spec
   steps_add
@@ -322,6 +322,47 @@ open MiniRustSpec.Correspondence in
   LocalsOkA.teardown
   deallocAll_gen
   killAt_append_dead
+  step_initBlock
+  evalReturn_callee
+  evalStatement_assign_array
+  evalStatement_assign_index
+  evalStatement_assign_tuple
+  evalStatement_assign_field_scalar
+  evalValue_specOperand
+  evalValue_arrayRvalue
+  evalValue_tupleRvalue
+  evalPlace_proj
+  evalPlace_fieldPath
+  evalPlace_tuplePlace
+  typedLoad_array_local
+  typedLoad_array_elem
+  typedLoad_tuple_slice
+  typedStore_array_local
+  typedStore_array_elem
+  typedStore_tuple_slice
+  decode_tupleSpec
+  encode_tupleSpec
+  checkValue_tupleSpec
+  evalStmt_assign_array
+  evalStmt_assign_index
+  evalStmt_assign_tuple
+  evalStmt_assign_field_scalar
+  evalRvalue_array_frag
+  evalRvalue_tuple_frag
+  readProjectedValue_proj
+  writeProjectedValue_proj
+  resolveFieldPath_read
+  resolveFieldPath_write
+  step_correspondence_N
+  step_start_N
+  initMachineState_nonScalar
+  reaches_rel_N
+  run_ret_N
+  run_ub_N
+  steps_error_N
+  steps_outcome_N
+  mirNoUB_safe_N
+  mirNoUB_progress_N
 
 open MiniRustSpec.Correspondence.Witness in
 #assert_standard_axioms
@@ -861,6 +902,122 @@ open MiniRustSpec.Correspondence.Witness in
   ordBoolCastTempMoveFalse_progress
   ordBoolCastTempMoveFalse_minirust_ret_from_start
   ordBoolCastTempMoveFalse_minirust_direct
+  ctxI8_ok_arrayOps
+  ctxI8_ok_arraySignedIdx
+  ctxI8_ok_zeroArray
+  arrayOpsI8_inFragment
+  arrayOpsI8_translate
+  arrayOpsOk_anneal_ret
+  arrayOpsOk_noUB
+  arrayOpsOk_minirust_ret_from_start
+  arrayOpsOk_minirust_direct
+  arrayOpsOob_anneal_ub
+  arrayOpsOob_minirust_ub_from_start
+  arrayOpsOob_minirust_direct
+  arrayOpsOob_converse_error
+  arraySignedIdxI8_inFragment
+  arraySignedIdxI8_translate
+  arraySignedIdxOk_anneal_ret
+  arraySignedIdxOk_minirust_ret_from_start
+  arraySignedIdxOk_minirust_direct
+  arraySignedNegUb_anneal_ub
+  arraySignedNegUb_minirust_ub_from_start
+  arraySignedNegUb_minirust_direct
+  arraySignedOobUb_anneal_ub
+  arraySignedOobUb_minirust_ub_from_start
+  arraySignedOobUb_minirust_direct
+  zeroArrayI8_inFragment
+  zeroArrayI8_translate
+  zeroArrayOk_anneal_ret
+  zeroArrayOk_noUB
+  zeroArrayOk_minirust_ret_from_start
+  zeroArrayOk_minirust_direct
+  zeroArrayIdxUb_anneal_ub
+  zeroArrayIdxUb_minirust_ub_from_start
+  zeroArrayIdxUb_minirust_direct
+  arrayOpsOk_minirust_inplace_bytes
+  arrayOpsOk_minirust_ret_dealloc
+  ctxI8_ok_arrayUninitIdx
+  arrayUninitIdxI8_inFragment
+  arrayUninitIdxI8_translate
+  arrayUninitIdx_anneal_ub
+  arrayUninitIdx_minirust_ub_from_start
+  arrayUninitIdx_minirust_direct
+  ctxU32_ok_arrayU32Idx
+  arrayU32Idx_inFragment
+  arrayU32Idx_translate
+  arrayU32IdxOk_anneal_ret
+  arrayU32IdxOk_noUB
+  arrayU32IdxOk_minirust_ret_from_start
+  arrayU32IdxOk_minirust_direct
+  arrayU32IdxOk_minirust_inplace_bytes
+  arrayU32IdxOob_anneal_ub
+  arrayU32IdxOob_minirust_ub_from_start
+  arrayU32IdxOob_minirust_direct
+  arrayConstIdxOobI8_inFragment
+  arrayConstIdxOobI8_translate
+  arrayConstIdxOob_anneal_ub
+  arrayConstIdxOob_minirust_ub_from_start
+  arrayConstIdxOob_minirust_direct
+  sizeMulInt_zero_neg
+  array_encode_decode_edge_cases
+  ctxI8_ok_arrayCompose
+  arrayComposeI8_inFragment
+  arrayComposeI8_translate
+  arrayComposeOk_anneal_ret
+  arrayComposeOk_noUB
+  arrayComposeOk_minirust_ret_from_start
+  arrayComposeOk_minirust_direct
+  arrayComposeAggUb_anneal_ub
+  arrayComposeAggUb_minirust_ub_from_start
+  arrayComposeAggUb_minirust_direct
+  arrayComposeRepeatUb_anneal_ub
+  arrayComposeRepeatUb_minirust_ub_from_start
+  arrayComposeRepeatUb_minirust_direct
+  arrayComposeRhsUb_anneal_ub
+  arrayComposeRhsUb_minirust_ub_from_start
+  arrayComposeRhsUb_minirust_direct
+  arrayComposeBothUb_anneal_ub
+  arrayComposeBothUb_minirust_ub_from_start
+  arrayComposeBothUb_minirust_direct
+  arrayComposeSwitchOobUb_anneal_ub
+  arrayComposeSwitchOobUb_minirust_ub_from_start
+  arrayComposeSwitchOobUb_minirust_direct
+  ctxPadded3_ok
+  paddedStructOps_inFragment
+  paddedStructOps_translate
+  paddedStructOk_anneal_ret
+  paddedStructOk_noUB
+  paddedStructOk_minirust_ret_from_start
+  paddedStructOk_minirust_direct
+  paddedStructOk_minirust_padding_bytes
+  paddedStructOk_minirust_ret_dealloc
+  paddedStructOk_minirust_noUB
+  paddedStructOk_minirust_progress
+  ctxNested5_ok
+  nestedTupleOps_inFragment
+  nestedTupleOps_translate
+  nestedTupleOk_anneal_ret
+  nestedTupleOk_noUB
+  nestedTupleOk_minirust_ret_from_start
+  nestedTupleOk_minirust_direct
+  nestedTupleOk_minirust_padding_bytes
+  nestedTupleOk_minirust_ret_dealloc
+  nestedTupleOk_minirust_noUB
+  nestedTupleOk_minirust_progress
+  nestedTupleAggUb_anneal_ub
+  nestedTupleAggUb_minirust_ub_from_start
+  nestedTupleAggUb_minirust_direct
+  nestedTupleAggUb_converse_error
+  nestedTupleFieldRhsUb_anneal_ub
+  nestedTupleFieldRhsUb_minirust_ub_from_start
+  nestedTupleFieldRhsUb_minirust_direct
+  nestedTupleFieldRhsUb_converse_error
+  nestedTupleCopyUninitUb_anneal_ub
+  nestedTupleCopyUninitUb_minirust_ub_from_start
+  nestedTupleCopyUninitUb_minirust_direct
+  nestedTupleCopyUninitUb_converse_error
+  tuple_encode_decode_place_edge_cases
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -999,8 +1156,8 @@ open MiniRustSpec.Correspondence in
   StaleOk.assign
   StaleOk.setBoth
   StaleOk.keep
-  StateRelAt.advance
-  StateRelAt.jump
+  StateRelAt.advanceN
+  StateRelAt.jumpN
   StartRel.localsOk
   initLocalsAux_spec
   steps_add
@@ -1047,6 +1204,45 @@ open MiniRustSpec.Correspondence in
   LocalsOkA.teardown
   deallocAll_gen
   killAt_append_dead
+  evalPlace_proj
+  evalStatement_assign_array
+  evalStatement_assign_index
+  evalValue_arrayRvalue
+  typedLoad_array_local
+  typedLoad_array_elem
+  typedStore_array_local
+  typedStore_array_elem
+  evalStmt_assign_array
+  evalStmt_assign_index
+  evalRvalue_array_frag
+  readProjectedValue_proj
+  writeProjectedValue_proj
+  evalPlace_fieldPath
+  evalPlace_tuplePlace
+  typedLoad_tuple_slice
+  typedStore_tuple_slice
+  decode_tupleSpec
+  encode_tupleSpec
+  checkValue_tupleSpec
+  evalValue_specOperand
+  evalValue_tupleRvalue
+  evalStatement_assign_tuple
+  evalStatement_assign_field_scalar
+  evalStmt_assign_tuple
+  evalStmt_assign_field_scalar
+  evalRvalue_tuple_frag
+  resolveFieldPath_read
+  resolveFieldPath_write
+  step_correspondence_N
+  step_start_N
+  initMachineState_nonScalar
+  reaches_rel_N
+  run_ret_N
+  run_ub_N
+  steps_error_N
+  steps_outcome_N
+  mirNoUB_safe_N
+  mirNoUB_progress_N
 
 open MiniRustSpec.Correspondence.Witness in
 #check_theorem_deps "[WITNESS-AUDIT]"
@@ -1427,6 +1623,114 @@ open MiniRustSpec.Correspondence.Witness in
   ordBoolCastTempMoveFalse_progress
   ordBoolCastTempMoveFalse_minirust_ret_from_start
   ordBoolCastTempMoveFalse_minirust_direct
+  arrayOpsI8_inFragment
+  arrayOpsI8_translate
+  arrayOpsOk_anneal_ret
+  arrayOpsOk_noUB
+  arrayOpsOk_minirust_ret_from_start
+  arrayOpsOk_minirust_direct
+  arrayOpsOk_minirust_inplace_bytes
+  arrayOpsOk_minirust_ret_dealloc
+  arrayOpsOob_anneal_ub
+  arrayOpsOob_minirust_ub_from_start
+  arrayOpsOob_minirust_direct
+  arrayOpsOob_converse_error
+  arraySignedIdxI8_inFragment
+  arraySignedIdxI8_translate
+  arraySignedIdxOk_anneal_ret
+  arraySignedIdxOk_minirust_ret_from_start
+  arraySignedIdxOk_minirust_direct
+  arraySignedNegUb_anneal_ub
+  arraySignedNegUb_minirust_ub_from_start
+  arraySignedNegUb_minirust_direct
+  arraySignedOobUb_anneal_ub
+  arraySignedOobUb_minirust_ub_from_start
+  arraySignedOobUb_minirust_direct
+  arrayUninitIdxI8_inFragment
+  arrayUninitIdxI8_translate
+  arrayUninitIdx_anneal_ub
+  arrayUninitIdx_minirust_ub_from_start
+  arrayUninitIdx_minirust_direct
+  arrayU32Idx_inFragment
+  arrayU32Idx_translate
+  arrayU32IdxOk_anneal_ret
+  arrayU32IdxOk_noUB
+  arrayU32IdxOk_minirust_ret_from_start
+  arrayU32IdxOk_minirust_direct
+  arrayU32IdxOk_minirust_inplace_bytes
+  arrayU32IdxOob_anneal_ub
+  arrayU32IdxOob_minirust_ub_from_start
+  arrayU32IdxOob_minirust_direct
+  arrayConstIdxOobI8_inFragment
+  arrayConstIdxOobI8_translate
+  arrayConstIdxOob_anneal_ub
+  arrayConstIdxOob_minirust_ub_from_start
+  arrayConstIdxOob_minirust_direct
+  sizeMulInt_zero_neg
+  array_encode_decode_edge_cases
+  zeroArrayI8_inFragment
+  zeroArrayI8_translate
+  zeroArrayOk_anneal_ret
+  zeroArrayOk_noUB
+  zeroArrayOk_minirust_ret_from_start
+  zeroArrayOk_minirust_direct
+  zeroArrayIdxUb_anneal_ub
+  zeroArrayIdxUb_minirust_ub_from_start
+  zeroArrayIdxUb_minirust_direct
+  arrayComposeI8_inFragment
+  arrayComposeI8_translate
+  arrayComposeOk_anneal_ret
+  arrayComposeOk_noUB
+  arrayComposeOk_minirust_ret_from_start
+  arrayComposeOk_minirust_direct
+  arrayComposeAggUb_anneal_ub
+  arrayComposeAggUb_minirust_ub_from_start
+  arrayComposeAggUb_minirust_direct
+  arrayComposeRepeatUb_anneal_ub
+  arrayComposeRepeatUb_minirust_ub_from_start
+  arrayComposeRepeatUb_minirust_direct
+  arrayComposeRhsUb_anneal_ub
+  arrayComposeRhsUb_minirust_ub_from_start
+  arrayComposeRhsUb_minirust_direct
+  arrayComposeBothUb_anneal_ub
+  arrayComposeBothUb_minirust_ub_from_start
+  arrayComposeBothUb_minirust_direct
+  arrayComposeSwitchOobUb_anneal_ub
+  arrayComposeSwitchOobUb_minirust_ub_from_start
+  arrayComposeSwitchOobUb_minirust_direct
+  paddedStructOps_inFragment
+  paddedStructOps_translate
+  paddedStructOk_anneal_ret
+  paddedStructOk_noUB
+  paddedStructOk_minirust_ret_from_start
+  paddedStructOk_minirust_direct
+  paddedStructOk_minirust_padding_bytes
+  paddedStructOk_minirust_ret_dealloc
+  paddedStructOk_minirust_noUB
+  paddedStructOk_minirust_progress
+  nestedTupleOps_inFragment
+  nestedTupleOps_translate
+  nestedTupleOk_anneal_ret
+  nestedTupleOk_noUB
+  nestedTupleOk_minirust_ret_from_start
+  nestedTupleOk_minirust_direct
+  nestedTupleOk_minirust_padding_bytes
+  nestedTupleOk_minirust_ret_dealloc
+  nestedTupleOk_minirust_noUB
+  nestedTupleOk_minirust_progress
+  nestedTupleAggUb_anneal_ub
+  nestedTupleAggUb_minirust_ub_from_start
+  nestedTupleAggUb_minirust_direct
+  nestedTupleAggUb_converse_error
+  nestedTupleFieldRhsUb_anneal_ub
+  nestedTupleFieldRhsUb_minirust_ub_from_start
+  nestedTupleFieldRhsUb_minirust_direct
+  nestedTupleFieldRhsUb_converse_error
+  nestedTupleCopyUninitUb_anneal_ub
+  nestedTupleCopyUninitUb_minirust_ub_from_start
+  nestedTupleCopyUninitUb_minirust_direct
+  nestedTupleCopyUninitUb_converse_error
+  tuple_encode_decode_place_edge_cases
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

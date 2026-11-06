@@ -27,38 +27,40 @@ we choose the program that MiniRust's tooling would produce.
 
 The translation is defined only on the fragment checked by `inFragment`:
 
-* the body declares the return place, the arguments, and any number of
-  temporaries (`argCount + 1 ≤ localDecls.length < 2^31`), all of integer,
-  `bool`, `core::cmp::Ordering`, or `(Int, bool)` 2-tuple type;
-* statements are `_i = Use(a)`,
-  `_i = UnaryOp(uop, a)` with `uop ∈ {Neg, Not}`,
-  `_i = BinaryOp(op, a, b)` with
-  `op ∈ {Add, Sub, Mul, Div, Rem, BitXor, BitAnd, BitOr, Shl, Shr, AddUnchecked, SubUnchecked, MulUnchecked, ShlUnchecked, ShrUnchecked}`
-  (`a` of `_i`'s integer type `it`, and `b` of `it` for homogeneous binary
-  operators or of any integer type `rhsIt` for the shift operators
-  `Shl, Shr, ShlUnchecked, ShrUnchecked`),
-  `_i = Cast(IntToInt, a, targetTy)` (casting an operand `a` of any integer
-  type `srcIt` or `bool` to the destination local's integer type `it`), all
-  for an integer `_i`; and, for a `bool` `_i`, `_i = Use(a)`, `_i =
-  UnaryOp(Not, a)` (`boolNot`), and `_i = BinaryOp(BitAnd | BitOr | BitXor, a,
-  b)` (`boolBitOp`) with `bool` operands, and the comparisons
-  `_i = BinaryOp(Eq | Ne | Lt | Le | Gt | Ge, a, b)` of two integer operands
-  of one type or of two `bool` operands; for an `Ordering` `_i`, `_i = Use(a)`
-  of an `Ordering` local (`copy _j` or `move _j`) and the three-way comparison
-  `_i = BinaryOp(Cmp, a, b)` of integer or `bool` operands; for an `(it, bool)`
-  2-tuple `_i`, `_i = Use(a)` of an `(it, bool)` local (`copy _j` or `move _j`),
-  the checked integer operations
-  `_i = BinaryOp(AddWithOverflow | SubWithOverflow | MulWithOverflow, a, b)` of
-  two integer operands of type `it`, and `_i = Aggregate(Tuple, [a, b])` of an
-  integer operand `a` of type `it` and a `bool` operand `b`; every operand is
-  `copy _j` or `move _j`, a 2-tuple field projection `copy (_j.0)`,
-  `copy (_j.1)`, `move (_j.0)`, or `move (_j.1)`, or a scalar constant;
-  `PlaceMention(p)` of a fragment place; `StorageLive(_i)` of any local,
-  `StorageDead(_i)` of a temporary (`_i` with `argCount < i`), and
-  `Deinit(_i)` of a root local;
-* terminators are `Goto`, `SwitchInt` on an integer or `bool` fragment operand
-  (`copy _j`, `move _j`, 2-tuple field projection, or constant), `Unreachable`,
-  or `Return`, and every jump target is a block of the body;
+* the body is `Runtime(PostCleanup)` MIR and declares the return place, the
+  arguments, and any number of temporaries (`argCount + 1 ≤ localDecls.length <
+  2^31`); the return place `_0` and every temporary (`argCount < i`) have scalar
+  fragment type (`Int`, `bool`, `core::cmp::Ordering`, or `(Int, bool)` 2-tuple),
+  and each argument local additionally may have homogeneous 1D integer array
+  type `[T; N]` whose byte size `N * size_of::<T>()` fits in signed 64-bit
+  `isize` (`< 2^63`) or well-formed tuple / single-variant struct type
+  (`RigidTy.tuple` or `RigidTy.adt`) with explicit layout offsets and padding
+  (`FieldsShape.arbitrary`, `VariantsShape.single 0`);
+* statements are:
+  - scalar assignments `dst = rv` to an integer place `dst` (`_i`, array
+    element `_i[proj]`, or tuple/struct scalar field chain `_i.f1...fk`), where
+    `rv` is `Use(a)`, `UnaryOp(uop, a)` (`uop ∈ {Neg, Not}`),
+    `BinaryOp(op, a, b)` (`op` among the 15 integer `BinOp` variants, with `b`
+    of `dst`'s integer type `it` or of any integer type `rhsIt` for the shift
+    operators `Shl, Shr, ShlUnchecked, ShrUnchecked`),
+    `Cast(IntToInt, a, targetTy)` (from any integer type `srcIt` or `bool`), or
+    `Len(_j)` of an array local `_j` (into a `usize` destination);
+  - `bool`, `Ordering`, and `(it, bool)` 2-tuple assignments `_i = rv` to a root
+    local `_i` (`boolNot`, `boolBitOp`, comparisons `Eq | Ne | Lt | Le | Gt | Ge`,
+    three-way `Cmp`, `AddWithOverflow | SubWithOverflow | MulWithOverflow`,
+    `Aggregate(Tuple, [a, b])`, and `Use(a)`);
+  - array assignments `_i = rv` to an unprojected array local `_i : [T; N]`,
+    where `rv` is `Use(copy _j)`, `Aggregate(Array(T), [op_0, .., op_{N-1}])`,
+    or `Repeat(op, N)` with `N > 0` (or `N = 0` when `op` is a constant);
+  - tuple and single-variant struct assignments `dst = rv` to `_i` or a nested
+    field chain `_i.f1...fk`, where `rv` is `Use(copy p)` or
+    `Aggregate(Tuple | Adt(_, 0, None), [op_0, .., op_{M-1}])`;
+  - `PlaceMention(p)` on `_i`, `(it, bool)` fields `_i.0` / `_i.1`, or
+    tuple/struct field chains `_i.f1...fk`;
+  - `StorageLive(_i)`, `StorageDead(_i)` of a temporary (`argCount < i`), and
+    `Deinit(_i)` on scalar-family root locals;
+* terminators are `Goto`, `SwitchInt` on an integer or `bool` fragment operand,
+  `Unreachable`, or `Return`, and every jump target is a block of the body;
 * no block is a cleanup block;
 * no moved-from local is read before it is re-initialized (`movesOk`), and
   every temporary the body mentions has explicit storage markers
@@ -299,6 +301,254 @@ def scalarTypeOf (t : MirAst.Ty) : Option Gen.Type :=
     | some it => some (intBoolTupleTy it)
     | none => (intTypeOf t).map .Int
 
+/-- MiniRust `usize` integer type on `x86_64` (`Unsigned`, 8 bytes). -/
+def usizeIt : Gen.IntType := ⟨.Unsigned, ⟨8⟩⟩
+
+/-- Element integer type and length of a homogeneous 1D array type `[T; N]`. -/
+def arrayTypeOf (t : MirAst.Ty) : Option (Gen.IntType × Nat) :=
+  match t.kind with
+  | .array elemKind count =>
+    (intTyBytes elemKind).map (fun (s, n) => (⟨s, ⟨n⟩⟩, count))
+  | _ => none
+
+/-- Whether `n` is a valid scalar/tuple alignment in bytes on `x86_64`
+(`1, 2, 4, 8, 16`). -/
+def goodAlignBytes (n : Nat) : Bool :=
+  decide (n = 1 ∨ n = 2 ∨ n = 4 ∨ n = 8 ∨ n = 16)
+
+/-- Structural descriptor of a scalar integer or a (possibly nested) padded
+tuple or single-variant struct type in the correspondence fragment. -/
+inductive TupleSpec : Type where
+  | scalar (it : Gen.IntType) : TupleSpec
+  | tuple (fields : List (Nat × TupleSpec)) (size : Nat) (align : Nat) : TupleSpec
+
+mutual
+
+/-- Boolean equality on `TupleSpec`. -/
+def TupleSpec.beq : TupleSpec → TupleSpec → Bool
+  | .scalar it1, .scalar it2 => decide (it1 = it2)
+  | .tuple fs1 sz1 al1, .tuple fs2 sz2 al2 =>
+    decide (sz1 = sz2) && decide (al1 = al2) && TupleSpec.fieldsBeq fs1 fs2
+  | _, _ => false
+
+/-- Pointwise Boolean equality on `List (Nat × TupleSpec)`. -/
+def TupleSpec.fieldsBeq : List (Nat × TupleSpec) → List (Nat × TupleSpec) → Bool
+  | [], [] => true
+  | (o1, s1) :: r1, (o2, s2) :: r2 =>
+    decide (o1 = o2) && s1.beq s2 && TupleSpec.fieldsBeq r1 r2
+  | _, _ => false
+
+end
+
+mutual
+
+theorem TupleSpec.beq_iff : ∀ (a b : TupleSpec), a.beq b = true ↔ a = b
+  | .scalar it1, .scalar it2 => by simp [TupleSpec.beq]
+  | .scalar _, .tuple _ _ _ => by simp [TupleSpec.beq]
+  | .tuple _ _ _, .scalar _ => by simp [TupleSpec.beq]
+  | .tuple fs1 sz1 al1, .tuple fs2 sz2 al2 => by
+    simp only [TupleSpec.beq, Bool.and_eq_true, decide_eq_true_eq,
+      TupleSpec.fieldsBeq_iff, TupleSpec.tuple.injEq]
+    exact ⟨fun ⟨⟨hsz, hal⟩, hfs⟩ => ⟨hfs, hsz, hal⟩, fun ⟨hfs, hsz, hal⟩ => ⟨⟨hsz, hal⟩, hfs⟩⟩
+
+theorem TupleSpec.fieldsBeq_iff :
+    ∀ (xs ys : List (Nat × TupleSpec)), TupleSpec.fieldsBeq xs ys = true ↔ xs = ys
+  | [], [] => by simp [TupleSpec.fieldsBeq]
+  | [], _ :: _ => by simp [TupleSpec.fieldsBeq]
+  | _ :: _, [] => by simp [TupleSpec.fieldsBeq]
+  | (o1, s1) :: r1, (o2, s2) :: r2 => by
+    simp [TupleSpec.fieldsBeq, TupleSpec.beq_iff, TupleSpec.fieldsBeq_iff, and_assoc]
+
+end
+
+instance : DecidableEq TupleSpec := fun a b =>
+  if h : a.beq b = true then isTrue ((TupleSpec.beq_iff a b).mp h)
+  else isFalse (fun heq => h ((TupleSpec.beq_iff a b).mpr heq))
+
+/-- Byte size of a `TupleSpec`. -/
+def TupleSpec.size : TupleSpec → Nat
+  | .scalar it => it.size.bytes
+  | .tuple _ size _ => size
+
+/-- Alignment in bytes of a `TupleSpec`. -/
+def TupleSpec.align : TupleSpec → Nat
+  | .scalar it => it.size.bytes
+  | .tuple _ _ align => align
+
+mutual
+
+/-- Lower a `TupleSpec` to a MiniRust `Gen.Type`:
+`build::tuple_ty(&fields, size, align)` (`tooling/minimize/src/ty.rs`) builds
+`Type::Tuple { sized_fields, sized_head_layout: TupleHeadLayout { end: size, align, packed_align: None }, unsized_field: None }`. -/
+def TupleSpec.toMiniRustTy : TupleSpec → Gen.Type
+  | .scalar it => .Int it
+  | .tuple fields size align =>
+    .Tuple (TupleSpec.fieldsToMiniRust fields)
+      { «end» := ⟨size⟩, align := ⟨align⟩, packed_align := none } none
+
+/-- Lower a list of `(offset, TupleSpec)` fields to MiniRust `Fields`. -/
+def TupleSpec.fieldsToMiniRust : List (Nat × TupleSpec) → List (Gen.Offset × Gen.Type)
+  | [] => []
+  | (off, s) :: rest => (⟨off⟩, s.toMiniRustTy) :: TupleSpec.fieldsToMiniRust rest
+
+end
+
+mutual
+
+/-- Well-formedness of a `TupleSpec`: valid alignment in `{1, 2, 4, 8, 16}`,
+`size` a multiple of `align` fitting in signed 64-bit `isize` (`< 2^63`), and
+pairwise non-overlapping aligned fields within `[0, size)`. -/
+def TupleSpec.wf : TupleSpec → Bool
+  | .scalar it => goodAlignBytes it.size.bytes
+  | .tuple fields size align =>
+    goodAlignBytes align &&
+    decide (size % align = 0) &&
+    decide (size < 2 ^ 63) &&
+    TupleSpec.fieldsWf size align fields
+
+/-- Well-formedness of the fields of a tuple/struct of given `size` and `align`. -/
+def TupleSpec.fieldsWf (size align : Nat) : List (Nat × TupleSpec) → Bool
+  | [] => true
+  | (off, s) :: rest =>
+    s.wf &&
+    decide (off + s.size ≤ size) &&
+    decide (off % s.align = 0) &&
+    decide (s.align ≤ align) &&
+    rest.all (fun p => decide (off + s.size ≤ p.1 ∨ p.1 + p.2.size ≤ off)) &&
+    TupleSpec.fieldsWf size align rest
+
+end
+
+mutual
+
+/-- `minimize`'s tuple and struct layout extraction (`tooling/minimize/src/ty.rs`):
+> "fn tuple_from_layout(&mut self, layout: rs::TyAndLayout<'tcx>, span: rs::Span) -> Type {
+>      let size = translate_size(layout.size);
+>      let align = translate_align(layout.align.abi);
+>
+>      let fields: Vec<(Size, Type)> = (0..layout.fields.count())
+>          .map(|i| {
+>              let ty = layout.field(self, i).ty;
+>              let ty = self.translate_ty(ty, span);
+>              let offset = layout.fields.offset(i);
+>              let offset = translate_size(offset);
+>              (offset, ty)
+>          })
+>          .collect();
+>
+>      build::tuple_ty(&fields, size, align)
+>  }
+>  ..
+>  fn translate_non_enum_adt(
+>      &mut self,
+>      ty: rs::Ty<'tcx>,
+>      adt_def: rs::AdtDef<'tcx>,
+>      sref: rs::GenericArgsRef<'tcx>,
+>      span: rs::Span,
+>  ) -> (Fields, Size, Align) {
+>      let layout = self.rs_layout_of(ty).layout;
+>      let fields = self.translate_adt_variant_fields(
+>          Some(layout.fields()),
+>          adt_def.non_enum_variant(),
+>          sref,
+>          span,
+>      );
+>      let size = translate_size(layout.size());
+>      let align = translate_align(layout.align().abi);
+>
+>      (fields, size, align)
+>  }" -/
+def specOfRigidTy (layouts : Layout.LayoutTable) : MirAst.RigidTy → Nat → Option TupleSpec
+  | .uint w, _ => (intTyBytes (.uint w)).map (fun (s, n) => .scalar ⟨s, ⟨n⟩⟩)
+  | .int w, _ => (intTyBytes (.int w)).map (fun (s, n) => .scalar ⟨s, ⟨n⟩⟩)
+  | .tuple fieldKinds, layoutIdx => do
+    let l ← Layout.LayoutTable.lookup layouts layoutIdx
+    match l.variants, l.isUninhabited, l.fields with
+    | .single 0, false, .arbitrary offsets _ =>
+      if offsets.length = fieldKinds.length then do
+        let fields ← specOfFieldList layouts offsets fieldKinds l.fieldLayouts
+        pure (.tuple fields l.size.bytes l.align.bytes)
+      else none
+    | _, _, _ => none
+  | .adt _ fieldKinds, layoutIdx => do
+    let l ← Layout.LayoutTable.lookup layouts layoutIdx
+    match l.variants, l.isUninhabited, l.fields with
+    | .single 0, false, .arbitrary offsets _ =>
+      if offsets.length = fieldKinds.length then do
+        let fields ← specOfFieldList layouts offsets fieldKinds l.fieldLayouts
+        pure (.tuple fields l.size.bytes l.align.bytes)
+      else none
+    | _, _, _ => none
+  | _, _ => none
+
+/-- Extract the `(offset, TupleSpec)` list for each field of a tuple or
+single-variant struct in source field order. -/
+def specOfFieldList (layouts : Layout.LayoutTable) :
+    List Layout.Size → List MirAst.RigidTy → List Nat → Option (List (Nat × TupleSpec))
+  | [], [], _ => some []
+  | off :: offs, fk :: fks, fls => do
+    let fIdx := fls.head?.getD 0
+    let fSpec ← specOfRigidTy layouts fk fIdx
+    let rest ← specOfFieldList layouts offs fks (fls.tailD [])
+    pure ((off.bytes, fSpec) :: rest)
+  | _, _, _ => none
+
+end
+
+/-- Extract the `(fields, size, align)` tuple/struct descriptor of `t` when `t`
+is a tuple (`RigidTy.tuple`) or single-variant struct (`RigidTy.adt`) outside
+`scalarTypeOf` (`core::cmp::Ordering` and `(Int, bool)` 2-tuples are handled by
+`scalarTypeOf`). -/
+def tupleTypeOf (layouts : Layout.LayoutTable := ⟨64, true, []⟩) (t : MirAst.Ty) :
+    Option (List (Nat × TupleSpec) × Nat × Nat) :=
+  if isOrderingTy t || (intBoolTupleOf t).isSome then none
+  else
+    match t.kind with
+    | .tuple _ | .adt _ _ =>
+      match specOfRigidTy layouts t.kind t.layoutIdx with
+      | some (.tuple fields size align) => some (fields, size, align)
+      | _ => none
+    | _ => none
+
+/-- `minimize`'s type translation across the fragment (`tooling/minimize/src/ty.rs`):
+> "rs::TyKind::Bool => Type::Bool,
+>  rs::TyKind::Int(t) => {
+>      let sz = rs::abi::Integer::from_int_ty(&self.tcx, *t).size();
+>      Type::Int(IntType { size: translate_size(sz), signed: Signedness::Signed })
+>  }
+>  rs::TyKind::Uint(t) => {
+>      let sz = rs::abi::Integer::from_uint_ty(&self.tcx, *t).size();
+>      Type::Int(IntType { size: translate_size(sz), signed: Signedness::Unsigned })
+>  }
+>  ..
+>  rs::TyKind::Tuple(..) => {
+>      let layout = self.rs_layout_of(ty);
+>      self.tuple_from_layout(layout, span)
+>  }
+>  ..
+>  rs::TyKind::Adt(adt_def, sref) if adt_def.is_struct() => {
+>      let (fields, size, align) = self.translate_non_enum_adt(ty, *adt_def, sref, span);
+>      build::tuple_ty(&fields.iter().collect::<Vec<_>>(), size, align)
+>  }
+>  ..
+>  rs::TyKind::Array(ty, c) => {
+>      let count = Int::from(c.try_to_target_usize(self.tcx).unwrap());
+>      let elem = GcCow::new(self.translate_ty(*ty, span));
+>      Type::Array { elem, count }
+>  }" -/
+def translateTy (layouts : Layout.LayoutTable := ⟨64, true, []⟩) (t : MirAst.Ty) :
+    Option Gen.Type :=
+  match scalarTypeOf t with
+  | some ty => some ty
+  | none =>
+    match arrayTypeOf t with
+    | some (elemIt, count) => some (.Array (.Int elemIt) (Int.ofNat count))
+    | none =>
+      match tupleTypeOf layouts t with
+      | some (fields, size, align) =>
+        some ((TupleSpec.tuple fields size align).toMiniRustTy)
+      | none => none
+
 /-- `minimize`'s `int_from_bits(bits, int_ty)`: interpret a `u128` bit pattern as
 the mathematical integer it encodes at type `int_ty` (two's complement for
 signed types). -/
@@ -308,8 +558,20 @@ def intFromBits (bits : Nat) (it : Gen.IntType) : Int :=
   | .Signed =>
     if bits < 2 ^ (8 * it.size.bytes - 1) then bits else (bits : Int) - 2 ^ (8 * it.size.bytes)
 
-/-- `minimize`'s place translation for locals and single-level field
-projections (`tooling/minimize/src/rvalue.rs`):
+/-- Left-to-right fold translating a chain of `ProjectionElem.field` projections
+into nested `PlaceExpr.Field` expressions (`tooling/minimize/src/rvalue.rs`):
+> "smir::ProjectionElem::Field(f, _ty) => {
+>      let indirected = GcCow::new(expr);
+>      PlaceExpr::Field { root: indirected, field: (*f).into() }
+>  }" -/
+def translateFieldPlace (root : Gen.PlaceExpr) :
+    List MirAst.ProjectionElem → Option Gen.PlaceExpr
+  | [] => some root
+  | .field idx _ :: rest => translateFieldPlace (.Field root (idx : Int)) rest
+  | _ => none
+
+/-- `minimize`'s place translation for locals, field projections, and array
+indexing (`tooling/minimize/src/rvalue.rs`):
 > "let expr = PlaceExpr::Local(self.local_name_map[&place.local.into()]);
 >  let place_ty = self.locals_smir[place.local].ty;
 >  // Fold over all projections
@@ -320,38 +582,115 @@ projections (`tooling/minimize/src/rvalue.rs`):
 >              smir::ProjectionElem::Field(f, _ty) => {
 >                  let indirected = GcCow::new(expr);
 >                  PlaceExpr::Field { root: indirected, field: (*f).into() }
->              }" -/
-def translatePlace : MirAst.Place → Option Gen.PlaceExpr
-  | ⟨j, []⟩ => some (.Local (localName j))
-  | ⟨j, [.field f _]⟩ => some (.Field (.Local (localName j)) (f : Int))
+>              }
+>              ..
+>              smir::ProjectionElem::Index(loc) => {
+>                  let i = PlaceExpr::Local(self.local_name_map[&(*loc).into()]);
+>                  let i = GcCow::new(i);
+>                  let i = ValueExpr::Load { source: i };
+>                  let i = GcCow::new(i);
+>                  let root = GcCow::new(expr);
+>                  PlaceExpr::Index { root, index: i }
+>              }
+>              ..
+>              smir::ProjectionElem::ConstantIndex { .. }
+>              | smir::ProjectionElem::Subslice { .. }
+>              | smir::ProjectionElem::OpaqueCast(_) => {
+>                  rs::span_bug!(span, \"Place Projection not supported: {:?}\", proj);
+>              }"
+Upstream `minimize` rejects `ProjectionElem::ConstantIndex`, so its lowering
+here is an extension rather than a transcription: for
+`ConstantIndex { offset, min_length, from_end }` on a fixed-size array
+`[T; count]`, the index that MIR defines for the projection (`count - offset`
+when `from_end` is true, or `offset` when `from_end` is false) becomes a
+`usize` constant index expression of `PlaceExpr::Index`. -/
+def translatePlace (decls : List MirAst.LocalDecl := []) : MirAst.Place → Option Gen.PlaceExpr
+  | ⟨i, []⟩ => some (.Local (localName i))
+  | ⟨i, [.index idxLocal]⟩ =>
+    some (.Index (.Local (localName i)) (.Load (.Local (localName idxLocal))))
+  | ⟨i, [.constantIndex offset minLen fromEnd]⟩ =>
+    match decls[i]? >>= (arrayTypeOf ·.ty) with
+    | some (_, count) =>
+      if minLen ≤ count ∧ (!fromEnd || (1 ≤ offset ∧ offset ≤ count)) then
+        let idx := if fromEnd then count - offset else offset
+        some (.Index (.Local (localName i)) (.Constant (.Int (Int.ofNat idx)) (.Int usizeIt)))
+      else none
+    | none => none
+  | ⟨i, .field idx fieldTy :: rest⟩ =>
+    translateFieldPlace (.Local (localName i)) (.field idx fieldTy :: rest)
   | _ => none
 
-/-- Integer type of a fragment operand: `copy _j` has `_j`'s declared type,
-`copy (_j.0)` on an `(it, bool)` local has type `it`, and a constant carries
-its type. A `move` operand is checked through `copyOp`. -/
-def operandIntType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.IntType
-  | .copy ⟨j, []⟩ => decls[j]? >>= fun d => intTypeOf d.ty
-  | .copy ⟨j, [.field 0 fTy]⟩ => do
+/-- Follow a chain of `ProjectionElem.field` projections from `spec`, verifying
+at each step that the projection's `fieldTy` translates to the selected field's
+`TupleSpec`, and returning the accumulated byte offset and leaf `TupleSpec`. -/
+def resolveFieldPath (layouts : Layout.LayoutTable) :
+    TupleSpec → List MirAst.ProjectionElem → Option (Nat × TupleSpec)
+  | spec, [] => some (0, spec)
+  | .tuple fields _ _, .field idx fieldTy :: rest => do
+    let (off, subSpec) ← fields[idx]?
+    let expectedSpec ← specOfRigidTy layouts fieldTy.kind fieldTy.layoutIdx
+    if subSpec = expectedSpec then do
+      let (restOff, leafSpec) ← resolveFieldPath layouts subSpec rest
+      pure (off + restOff, leafSpec)
+    else none
+  | _, _ => none
+
+/-- Resolve the `MirAst.Ty` of a chain of `.field` projections from `baseTy`. -/
+def resolveProjTy (baseTy : MirAst.Ty) : List MirAst.ProjectionElem → Option MirAst.Ty
+  | [] => some baseTy
+  | .field _ fieldTy :: rest => resolveProjTy fieldTy rest
+  | _ => none
+
+/-- Resolve the `MirAst.Ty` of a local or field-projected place. -/
+def placeMirTy (decls : List MirAst.LocalDecl) (p : MirAst.Place) : Option MirAst.Ty := do
+  let d ← decls[p.local_]?
+  resolveProjTy d.ty p.projection
+
+/-- Scalar integer type of a place (`_j`, `(it, bool)` field `_j.0`, `_j[idx]` /
+`_j[constIdx]`, or `TupleSpec` scalar field chain `_j.f1...fk`). -/
+def placeIntType (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) : MirAst.Place → Option Gen.IntType
+  | ⟨j, []⟩ => decls[j]? >>= fun d => intTypeOf d.ty
+  | ⟨j, [.index _]⟩ => decls[j]? >>= fun d => (arrayTypeOf d.ty).map Prod.fst
+  | ⟨j, [.constantIndex _ _ _]⟩ => decls[j]? >>= fun d => (arrayTypeOf d.ty).map Prod.fst
+  | ⟨j, .field idx fieldTy :: rest⟩ => do
     let d ← decls[j]?
-    let it ← intBoolTupleOf d.ty
-    let fIt ← intTypeOf fTy
-    if fIt == it then some it else none
+    match intBoolTupleOf d.ty with
+    | some it =>
+      match idx, rest with
+      | 0, [] =>
+        let fIt ← intTypeOf fieldTy
+        if fIt == it then some it else none
+      | _, _ => none
+    | none =>
+      let (fields, size, align) ← tupleTypeOf layouts d.ty
+      let (_, leafSpec) ←
+        resolveFieldPath layouts (.tuple fields size align) (.field idx fieldTy :: rest)
+      match leafSpec with
+      | .scalar it => some it
+      | .tuple _ _ _ => none
+  | _ => none
+
+/-- Integer type of a fragment operand: `copy p` has `p`'s resolved integer
+type (`placeIntType`), and a constant carries its type. A `move` operand is
+checked through `copyOp`. -/
+def operandIntType (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.IntType
+  | .copy p => placeIntType layouts decls p
   | .constant c => intTypeOf c.ty
   | _ => none
 
-/-- MiniRust type of a fragment operand (including `copy (_j.0)` and
-`copy (_j.1)` field projections on an `(it, bool)` tuple local). -/
-def operandType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.Type
+/-- MiniRust type of a fragment scalar-family operand (including `copy (_j.0)`
+and `copy (_j.1)` on an `(it, bool)` local, array element projections, and
+tuple/struct scalar field projections). -/
+def operandType (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.Type
   | .copy ⟨j, []⟩ => decls[j]? >>= fun d => scalarTypeOf d.ty
-  | .copy ⟨j, [.field 0 fTy]⟩ => do
-    let d ← decls[j]?
-    let it ← intBoolTupleOf d.ty
-    let fIt ← intTypeOf fTy
-    if fIt == it then some (.Int it) else none
-  | .copy ⟨j, [.field 1 fTy]⟩ => do
-    let d ← decls[j]?
-    let _ ← intBoolTupleOf d.ty
-    if isBoolTy fTy then some .Bool else none
+  | .copy ⟨j, [.field 1 fTy]⟩ =>
+    match decls[j]? >>= fun d => intBoolTupleOf d.ty with
+    | some _ => if isBoolTy fTy then some .Bool else none
+    | none => (placeIntType layouts decls ⟨j, [.field 1 fTy]⟩).map .Int
+  | .copy p => (placeIntType layouts decls p).map .Int
   | .constant c => scalarTypeOf c.ty
   | _ => none
 
@@ -361,18 +700,18 @@ def operandType (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.
 >      ValueExpr::Load { source: GcCow::new(self.translate_place_smir(place, span)) },
 >  smir::Operand::Move(place) =>
 >      ValueExpr::Load { source: GcCow::new(self.translate_place_smir(place, span)) },"
-restricted to fragment places (`PlaceExpr::Local` and `PlaceExpr::Field`, see
-`translatePlace`) and scalar constants. For an integer constant,
-`translate_const_val` (`tooling/minimize/src/constant.rs`) reads the scalar at
-the constant's type, which is `Constant::Int(int_from_bits(..))`; for a `bool`
-constant it reads a `bool`, which rustc's `Scalar::to_bool` accepts only for
-the one-byte patterns `0` and `1`:
+for places in the fragment (`PlaceExpr::Local`, `PlaceExpr::Field`, and
+`PlaceExpr::Index`, see `translatePlace`) and scalar constants. For an integer
+constant, `translate_const_val` (`tooling/minimize/src/constant.rs`) reads the
+scalar at the constant's type, which is `Constant::Int(int_from_bits(..))`; for
+a `bool` constant it reads a `bool`, which rustc's `Scalar::to_bool` accepts
+only for the one-byte patterns `0` and `1`:
 > "Type::Bool => {
 >      let val = ecx.read_scalar(&val).unwrap().to_bool().unwrap();
 >      ValueExpr::Constant(Constant::Bool(val), ty)
 >  }" (`tooling/minimize/src/constant.rs`) -/
-def translateOperand : MirAst.Operand → Option Gen.ValueExpr
-  | .copy p | .move p => (translatePlace p).map .Load
+def translateOperand (decls : List MirAst.LocalDecl := []) : MirAst.Operand → Option Gen.ValueExpr
+  | .copy p | .move p => (translatePlace decls p).map .Load
   | .constant c =>
     if isBoolTy c.ty then
       match c.val with
@@ -398,14 +737,15 @@ def copyOp : MirAst.Operand → MirAst.Operand
 /-- An rvalue with every `move` operand replaced by `copy` (see `copyOp`). -/
 def copyRv : MirAst.Rvalue → MirAst.Rvalue
   | .use op => .use (copyOp op)
+  | .repeat op c => .repeat (copyOp op) c
   | .unaryOp uop op => .unaryOp uop (copyOp op)
   | .binaryOp bop a b => .binaryOp bop (copyOp a) (copyOp b)
   | .cast k op ty => .cast k (copyOp op) ty
   | .aggregate k ops => .aggregate k (ops.map copyOp)
   | rv => rv
 
-theorem translateOperand_copyOp (op : MirAst.Operand) :
-    translateOperand (copyOp op) = translateOperand op := by
+theorem translateOperand_copyOp (decls : List MirAst.LocalDecl) (op : MirAst.Operand) :
+    translateOperand decls (copyOp op) = translateOperand decls op := by
   cases op <;> rfl
 
 /-- `minimize`'s unary-operator translation for integer operands
@@ -600,8 +940,9 @@ def translateCheckedBinOp : MirAst.BinOp → Option Gen.IntBinOpWithOverflow
 integers, `UnaryOp(Not)` on `bool`, integer `BinaryOp`s, checked integer
 `BinaryOp`s (`AddWithOverflow | SubWithOverflow | MulWithOverflow`), `bool`
 bitwise `BinaryOp`s (`BitAnd | BitOr | BitXor` via `boolBitOp`), the comparison
-`BinaryOp`s (including the three-way `Cmp`, `translateCmp`), `Aggregate` on
-2-tuples `(Int, bool)`, and `Cast(CastKind::IntToInt)` on integers and `bool`
+`BinaryOp`s (including the three-way `Cmp`, `translateCmp`),
+`Aggregate(Tuple | Adt | Array)`, `Len`, `Repeat`, and
+`Cast(CastKind::IntToInt)` on integers and `bool`
 (`tooling/minimize/src/rvalue.rs`):
 > "match rv {
 >      smir::Rvalue::Use(operand) => self.translate_operand_smir(operand, span),
@@ -644,6 +985,26 @@ bitwise `BinaryOp`s (`BitAnd | BitOr | BitXor` via `boolBitOp`), the comparison
 >          }
 >      }
 >      ..
+>      smir::Rvalue::Len(place) => {
+>          let ty = place.ty(&self.locals_smir).unwrap();
+>          match self.translate_ty_smir(ty, span) {
+>              Type::Array { elem: _, count } => {
+>                  ValueExpr::Constant(Constant::Int(count), <usize>::get_type())
+>              }
+>              ..
+>          }
+>      }
+>      ..
+>      smir::Rvalue::Repeat(op, c) => {
+>          let c = c.eval_target_usize().unwrap();
+>          let c = Int::from(c);
+>          let elem_ty = op.ty(&self.locals_smir).unwrap();
+>          let elem_ty = self.translate_ty_smir(elem_ty, span);
+>          let op = self.translate_operand_smir(op, span);
+>          let ty = Type::Array { elem: GcCow::new(elem_ty), count: c };
+>          let ls = list![op; c];
+>          ValueExpr::Tuple(ls, ty)
+>      }
 >      smir::Rvalue::Cast(cast_kind, operand, cast_ty) => {
 >          match cast_kind {
 >              smir::CastKind::IntToInt => {
@@ -671,11 +1032,13 @@ gives the types of locals): integer arithmetic needs an integer left operand,
 exactly when the operand is a `bool`, `IntToInt` casts a `bool` by first
 transmuting to `u8` (`boolToU8`) and then applying `CastOp::IntToInt(int_ty)`,
 and the comparisons apply to operands of any type. -/
-def translateRvalue (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Option Gen.ValueExpr
-  | .use op => translateOperand op
+def translateRvalue (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (targetTy : Option MirAst.Ty := none) :
+    MirAst.Rvalue → Option Gen.ValueExpr
+  | .use op => translateOperand decls op
   | .unaryOp uop op => do
-    let e ← translateOperand op
-    match operandType decls op with
+    let e ← translateOperand decls op
+    match operandType layouts decls op with
     | some (.Int _) => pure (.UnOp (.Int (← translateUnOp uop)) e)
     | some .Bool =>
       match uop with
@@ -683,14 +1046,14 @@ def translateRvalue (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Option G
       | _ => none
     | _ => none
   | .binaryOp op l r => do
-    let el ← translateOperand l
-    let er ← translateOperand r
+    let el ← translateOperand decls l
+    let er ← translateOperand decls r
     match translateRelOp op with
     | some rel => pure (.BinOp (.Rel rel) el er)
     | none =>
       match translateBinOp op with
       | some iop =>
-        match operandType decls l with
+        match operandType layouts decls l with
         | some (.Int _) => pure (.BinOp (.Int iop) el er)
         | some .Bool => do
           let biop ← translateBoolBitOp op
@@ -703,23 +1066,42 @@ def translateRvalue (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Option G
           match op with
           | .cmp => pure (translateCmp el er)
           | _ => none
-  | .aggregate .tuple [op0, op1] => do
-    let e0 ← translateOperand op0
-    let e1 ← translateOperand op1
-    let it ← operandIntType decls op0
-    pure (.Tuple [e0, e1] (intBoolTupleTy it))
-  | .cast .intToInt op targetTy => do
-    let intTy ← intTypeOf targetTy
-    let operand ← translateOperand op
-    match operandType decls op with
+  | .aggregate (.array elemTy) ops => do
+    let elemIt ← intTypeOf elemTy
+    let exprs ← ops.mapM (translateOperand decls)
+    pure (.Tuple exprs (.Array (.Int elemIt) (Int.ofNat ops.length)))
+  | .aggregate .tuple ops => do
+    let exprs ← ops.mapM (translateOperand decls)
+    match targetTy >>= intBoolTupleOf with
+    | some it => pure (.Tuple exprs (intBoolTupleTy it))
+    | none =>
+      let dstTy ← targetTy
+      let (fields, size, align) ← tupleTypeOf layouts dstTy
+      pure (.Tuple exprs ((TupleSpec.tuple fields size align).toMiniRustTy))
+  | .aggregate (.adt _ 0 none) ops => do
+    let dstTy ← targetTy
+    let (fields, size, align) ← tupleTypeOf layouts dstTy
+    let exprs ← ops.mapM (translateOperand decls)
+    pure (.Tuple exprs ((TupleSpec.tuple fields size align).toMiniRustTy))
+  | .repeat op count => do
+    let elemIt ← operandIntType layouts decls op
+    let expr ← translateOperand decls op
+    pure (.Tuple (List.replicate count expr) (.Array (.Int elemIt) (Int.ofNat count)))
+  | .len ⟨j, []⟩ => do
+    let (_, count) ← decls[j]? >>= (arrayTypeOf ·.ty)
+    pure (.Constant (.Int (Int.ofNat count)) (.Int usizeIt))
+  | .cast .intToInt op castTy => do
+    let intTy ← intTypeOf castTy
+    let operand ← translateOperand decls op
+    match operandType layouts decls op with
     | some (.Int _) => pure (.UnOp (.Cast (.IntToInt intTy)) operand)
     | some .Bool => pure (.UnOp (.Cast (.IntToInt intTy)) (boolToU8 operand))
     | _ => none
   | _ => none
 
-/-- `minimize`'s statement translation for assignments to projection-free locals,
-`StorageLive`, `StorageDead`, and `PlaceMention` on a fragment place (`_i`,
-`_i.0`, or `_i.1`, `tooling/minimize/src/bb.rs`):
+/-- `minimize`'s statement translation for assignments, `StorageLive`,
+`StorageDead`, and `PlaceMention` on a local or field-projected place
+(`tooling/minimize/src/bb.rs`):
 > "rs::StatementKind::Assign(operands) => {
 >      let (place, rval) = &**operands;
 >      let destination = self.translate_place(place, span);
@@ -737,23 +1119,31 @@ def translateRvalue (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Option G
 >      Statement::PlaceMention(place)
 >  }"
 where the elided part special-cases two pointer-provenance casts, which are
-outside the fragment. The rvalue goes through `copyRv` because `minimize`
-translates `move` and `copy` operands alike. `minimize` at the pinned commit
-has no case for MIR's `StatementKind::Deinit`, which Anneal's MIR does
-contain; we translate `Deinit(place)` to MiniRust's `Statement::Deinit` of the
-translated place, the statement with the same meaning ("This writes `uninit`
-bytes to the entire place", `compiler/rustc_middle/src/mir/syntax.rs`;
-"This statement replaces the contents of a place with `Uninit`",
-`spec/lang/step/statements.md`). -/
-def translateStatement (decls : List MirAst.LocalDecl) (s : MirAst.Statement) :
+outside the fragment, and `PlaceMention` supports unprojected locals `⟨i, []⟩`
+and field projection chains `⟨i, .field idx fieldTy :: rest⟩` (array
+`Index`/`ConstantIndex` projections in `PlaceMention` are excluded because
+Anneal's `.placeMention` checks only `place.local_`). The rvalue goes through
+`copyRv` because `minimize` translates `move` and `copy` operands alike.
+`minimize` at the pinned commit has no case for MIR's `StatementKind::Deinit`,
+which Anneal's MIR does contain; we translate `Deinit(place)` to MiniRust's
+`Statement::Deinit` of the translated place, the statement with the same
+meaning ("This writes `uninit` bytes to the entire place",
+`compiler/rustc_middle/src/mir/syntax.rs`; "This statement replaces the
+contents of a place with `Uninit`", `spec/lang/step/statements.md`). -/
+def translateStatement (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
+    (layouts : Layout.LayoutTable := ⟨64, true, []⟩) :
     Option Gen.Statement :=
   match s.kind with
-  | .assign ⟨i, []⟩ rv =>
-    (translateRvalue decls (copyRv rv)).map (fun src => .Assign (.Local (localName i)) src)
-  | .placeMention p => (translatePlace p).map .PlaceMention
+  | .assign dst rv => do
+    let destination ← translatePlace decls dst
+    let source ← translateRvalue layouts decls (placeMirTy decls dst) (copyRv rv)
+    pure (.Assign destination source)
+  | .placeMention ⟨i, []⟩ => some (.PlaceMention (.Local (localName i)))
+  | .placeMention ⟨i, .field idx fieldTy :: rest⟩ =>
+    (translateFieldPlace (.Local (localName i)) (.field idx fieldTy :: rest)).map .PlaceMention
   | .storageLive i => some (.StorageLive (localName i))
   | .storageDead i => some (.StorageDead (localName i))
-  | .deinit p => (translatePlace p).map .Deinit
+  | .deinit p => (translatePlace decls p).map .Deinit
   | _ => none
 
 /-- `minimize`'s switch cases for a discriminant of type `it`
@@ -772,8 +1162,9 @@ def switchCases (it : Gen.IntType) (branches : List (Nat × Nat)) : Map Int Gen.
 /-- The integer type `minimize` switches at for a fragment discriminant: the
 discriminant's own type for an integer, and `u8` for a `bool`, which
 `minimize` first transmutes to `u8` (see `translateTerminator`). -/
-def switchIntType (decls : List MirAst.LocalDecl) (discr : MirAst.Operand) : Option Gen.IntType :=
-  match operandType decls discr with
+def switchIntType (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (discr : MirAst.Operand) : Option Gen.IntType :=
+  match operandType layouts decls discr with
   | some (.Int it) => some it
   | some .Bool => some u8Ty
   | _ => none
@@ -811,13 +1202,14 @@ restricted to integer and `bool` discriminants. For a `bool`, the
 discriminant is transmuted to `u8` (`boolToU8`), so MiniRust re-validates the
 byte at `bool` when it loads the local and then switches on the integer `0` or
 `1`. A `move` discriminant goes through `copyOp`, like an rvalue operand. -/
-def translateTerminator (decls : List MirAst.LocalDecl) (t : MirAst.Terminator) :
+def translateTerminator (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (t : MirAst.Terminator) :
     Option Gen.Terminator :=
   match t.kind with
   | .goto target => some (.Goto (bbName target))
   | .switchInt discr targets => do
-    let discrOp ← translateOperand (copyOp discr)
-    match operandType decls (copyOp discr) with
+    let discrOp ← translateOperand decls (copyOp discr)
+    match operandType layouts decls (copyOp discr) with
     | some (.Int it) =>
       pure (.Switch discrOp (switchCases it targets.branches) (bbName targets.otherwise))
     | some .Bool =>
@@ -829,10 +1221,11 @@ def translateTerminator (decls : List MirAst.LocalDecl) (t : MirAst.Terminator) 
 
 /-- `minimize`'s basic-block translation; fragment blocks are not cleanup blocks,
 so their kind is `BbKind::Regular`. -/
-def translateBlock (decls : List MirAst.LocalDecl) (bb : MirAst.BasicBlockData) :
+def translateBlock (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (bb : MirAst.BasicBlockData) :
     Option Gen.BasicBlock := do
-  let stmts ← bb.statements.mapM (translateStatement decls)
-  let term ← translateTerminator decls bb.terminator
+  let stmts ← bb.statements.mapM (translateStatement decls · layouts)
+  let term ← translateTerminator layouts decls bb.terminator
   pure ⟨stmts, term, .Regular⟩
 
 /-- `minimize`'s local-type map, one entry per MIR local in index order
@@ -843,21 +1236,23 @@ def translateBlock (decls : List MirAst.LocalDecl) (bb : MirAst.BasicBlockData) 
 >      let ty = self.cx.translate_ty(local_decl.ty, span);
 >      self.locals.insert(*local_name, ty);
 >  }" -/
-def translateLocals : Nat → List MirAst.LocalDecl → Option (List (Gen.LocalName × Gen.Type))
+def translateLocals (layouts : Layout.LayoutTable := ⟨64, true, []⟩) :
+    Nat → List MirAst.LocalDecl → Option (List (Gen.LocalName × Gen.Type))
   | _, [] => some []
   | i, d :: ds => do
-    let ty ← scalarTypeOf d.ty
-    let rest ← translateLocals (i + 1) ds
+    let ty ← translateTy layouts d.ty
+    let rest ← translateLocals layouts (i + 1) ds
     pure ((localName i, ty) :: rest)
 
 /-- `minimize`'s block map, one entry per MIR block in index order
 ("for (id, bb_name) in self.bb_name_map.clone() { .. self.translate_bb(bb_name, bb_data); }"). -/
-def translateBlocks (decls : List MirAst.LocalDecl) :
+def translateBlocks (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) :
     Nat → List MirAst.BasicBlockData → Option (List (Gen.BbName × Gen.BasicBlock))
   | _, [] => some []
   | i, bb :: bbs => do
-    let b ← translateBlock decls bb
-    let rest ← translateBlocks decls (i + 1) bbs
+    let b ← translateBlock layouts decls bb
+    let rest ← translateBlocks layouts decls (i + 1) bbs
     pure ((bbName i, b) :: rest)
 
 /-- Whether some statement of the body is `StorageLive(_loc)` or
@@ -921,8 +1316,8 @@ of `alwaysStorageLiveLocals` (`initBlock`). We take the calling convention to
 be `Rust` and `implicit_writes` to be `true` (the `minimize` default absent
 `#[rustc_no_writable]`); neither is read by the interpreted fragment. -/
 def translateFn (body : MirAst.CapturedMir) : Option Gen.Function := do
-  let locals ← translateLocals 0 body.localDecls
-  let blocks ← translateBlocks body.localDecls 0 body.basicBlocks
+  let locals ← translateLocals body.layouts 0 body.localDecls
+  let blocks ← translateBlocks body.layouts body.localDecls 0 body.basicBlocks
   let n := body.basicBlocks.length
   pure {
     locals := ⟨locals⟩
@@ -936,15 +1331,62 @@ def translateFn (body : MirAst.CapturedMir) : Option Gen.Function := do
 
 /-! ## The fragment -/
 
-/-- A fragment integer operand of type `it`: an integer local `copy _j`, field
-0 `copy (_j.0)` of an `(it, bool)` tuple local, or an integer constant. A
-`move` operand is checked through `copyOp`. -/
-def operandOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) (op : MirAst.Operand) : Bool :=
+/-- Well-formedness of a single array indexing projection (`Index` or
+`ConstantIndex`) on an array of length `count`. -/
+def projOk (decls : List MirAst.LocalDecl) (count : Nat) : MirAst.ProjectionElem → Bool
+  | .index idxLocal =>
+    decide (idxLocal < decls.length) &&
+    match decls[idxLocal]? >>= (intTypeOf ·.ty) with
+    | some idxIt =>
+      decide (idxIt.signed = .Unsigned ∨ count ≤ 2 ^ (8 * idxIt.size.bytes - 1))
+    | none => false
+  | .constantIndex offset minLen fromEnd =>
+    decide (minLen ≤ count) &&
+    decide (offset < 2 ^ 63) &&
+    if fromEnd then decide (1 ≤ offset ∧ offset ≤ count) else true
+  | _ => false
+
+/-- A scalar place of integer type `it`: an unprojected integer local `_j`,
+field `0` (`_j.0`) of an `(it, bool)` local, a (possibly nested) field
+projection `_j.f1...fk` on a `TupleSpec` local, or an indexed element `_j[proj]`
+of a homogeneous array local. -/
+def placeOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Place → Bool
+  | ⟨j, []⟩ =>
+    decide (j < decls.length) && decide ((decls[j]? >>= (intTypeOf ·.ty)) = some it)
+  | ⟨j, .field idx fieldTy :: rest⟩ =>
+    decide (j < decls.length) &&
+    match decls[j]? with
+    | none => false
+    | some d =>
+      match intBoolTupleOf d.ty with
+      | some tupIt =>
+        match idx, rest, intTypeOf fieldTy with
+        | 0, [], some fIt => decide (fIt = tupIt) && decide (tupIt = it)
+        | _, _, _ => false
+      | none =>
+        match tupleTypeOf layouts d.ty with
+        | some (fields, size, align) =>
+          match resolveFieldPath layouts (.tuple fields size align)
+              (.field idx fieldTy :: rest) with
+          | some (_, .scalar leafIt) => decide (leafIt = it)
+          | _ => false
+        | none => false
+  | ⟨j, [proj]⟩ =>
+    decide (j < decls.length) &&
+    match decls[j]? >>= (arrayTypeOf ·.ty) with
+    | some (elemIt, count) => decide (elemIt = it) && projOk decls count proj
+    | none => false
+  | _ => false
+
+/-- A fragment integer operand of type `it`: `copy p` of an integer place `p`,
+or an integer constant. A `move` operand is checked through `copyOp`. -/
+def operandOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (it : Gen.IntType) (op : MirAst.Operand) : Bool :=
   match op with
-  | .copy ⟨j, []⟩ | .copy ⟨j, [.field 0 _]⟩ =>
-    decide (j < decls.length) && decide (operandIntType decls op = some it)
+  | .copy p => placeOk layouts decls it p && (translateOperand decls op).isSome
   | .constant _ =>
-    decide (operandIntType decls op = some it) && (translateOperand op).isSome
+    decide (operandIntType layouts decls op = some it) && (translateOperand decls op).isSome
   | _ => false
 
 /-- Whether an `IntBinOp` is a shift operator, which in MiniRust (as in MIR)
@@ -959,41 +1401,52 @@ def isShiftIntBinOp : Gen.IntBinOp → Bool
   | _ => false
 
 /-- Whether a fragment operand has MiniRust type `Type::Bool`. -/
-def operandIsBool (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
-  match operandType decls op with
+def operandIsBool (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
+  match operandType layouts decls op with
   | some .Bool => true
   | _ => false
 
 /-- A fragment `bool` operand: a `bool` local `copy _j`, field 1 `copy (_j.1)`
 of an `(Int, bool)` tuple local, or a `bool` constant that `minimize` can read
 (`0` or `1`). -/
-def operandOkB (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
+def operandOkB (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
   match op with
-  | .copy ⟨j, []⟩ | .copy ⟨j, [.field 1 _]⟩ =>
-    decide (j < decls.length) && operandIsBool decls op
-  | .constant _ => operandIsBool decls op && (translateOperand op).isSome
+  | .copy ⟨j, []⟩ => decide (j < decls.length) && operandIsBool layouts decls op
+  | .copy ⟨j, [.field 1 fTy]⟩ =>
+    decide (j < decls.length) &&
+    match decls[j]? >>= fun d => intBoolTupleOf d.ty with
+    | some _ => isBoolTy fTy
+    | none => false
+  | .constant _ => operandIsBool layouts decls op && (translateOperand decls op).isSome
   | _ => false
 
 /-- Fragment rvalues of integer type `it`. -/
-def rvalueOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rvalue → Bool
-  | .use op => operandOk decls it op
-  | .unaryOp uop op => (translateUnOp uop).isSome && operandOk decls it op
+def rvalueOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rvalue → Bool
+  | .use op => operandOk layouts decls it op
+  | .unaryOp uop op => (translateUnOp uop).isSome && operandOk layouts decls it op
   | .binaryOp op a b =>
     match translateBinOp op with
     | none => false
     | some iop =>
-      operandOk decls it a &&
+      operandOk layouts decls it a &&
       if isShiftIntBinOp iop then
-        match operandIntType decls b with
-        | some rhsIt => operandOk decls rhsIt b
+        match operandIntType layouts decls b with
+        | some rhsIt => operandOk layouts decls rhsIt b
         | none => false
       else
-        operandOk decls it b
+        operandOk layouts decls it b
   | .cast .intToInt op targetTy =>
     decide (intTypeOf targetTy = some it) &&
-    match operandIntType decls op with
-    | some srcIt => operandOk decls srcIt op
-    | none => operandOkB decls op
+    match operandIntType layouts decls op with
+    | some srcIt => operandOk layouts decls srcIt op
+    | none => operandOkB layouts decls op
+  | .len ⟨j, []⟩ =>
+    decide (it = usizeIt) &&
+    decide (j < decls.length) &&
+    (decls[j]? >>= (arrayTypeOf ·.ty)).isSome
   | _ => false
 
 /-- The operands of a fragment comparison: both integers of one type, or both
@@ -1001,22 +1454,24 @@ def rvalueOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rvalue 
 type, `spec/lang/well-formed.md`:
 > "ensure_wf(right == left, \"BinOp::Rel: invalid right type\")?;"
 and MIR's comparisons are homogeneous as well). -/
-def relOperandsOk (decls : List MirAst.LocalDecl) (a b : MirAst.Operand) : Bool :=
-  match operandType decls a with
-  | some (.Int it) => operandOk decls it a && operandOk decls it b
-  | some .Bool => operandOkB decls a && operandOkB decls b
+def relOperandsOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (a b : MirAst.Operand) : Bool :=
+  match operandType layouts decls a with
+  | some (.Int it) => operandOk layouts decls it a && operandOk layouts decls it b
+  | some .Bool => operandOkB layouts decls a && operandOkB layouts decls b
   | _ => false
 
 /-- Fragment rvalues of type `bool`: a `bool` operand, `!b` on a `bool`
 operand, `BitAnd | BitOr | BitXor` on two `bool` operands, or a comparison
 (`==`, `!=`, `<`, `<=`, `>`, `>=`) of two integers of one type or of two
 `bool`s. -/
-def rvalueOkB (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Bool
-  | .use op => operandOkB decls op
-  | .unaryOp .not op => operandOkB decls op
+def rvalueOkB (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Bool
+  | .use op => operandOkB layouts decls op
+  | .unaryOp .not op => operandOkB layouts decls op
   | .binaryOp op a b =>
-    if (translateRelOp op).isSome then relOperandsOk decls a b
-    else (translateBoolBitOp op).isSome && operandOkB decls a && operandOkB decls b
+    if (translateRelOp op).isSome then relOperandsOk layouts decls a b
+    else (translateBoolBitOp op).isSome && operandOkB layouts decls a && operandOkB layouts decls b
   | _ => false
 
 /-- Whether a fragment operand has MiniRust type `orderingTy`. -/
@@ -1031,14 +1486,15 @@ constants are rejected by `translateOperand`; see
 def operandOkO (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
   match op with
   | .copy ⟨j, []⟩ => decide (j < decls.length) && operandIsOrdering decls op
-  | .constant _ => operandIsOrdering decls op && (translateOperand op).isSome
+  | .constant _ => operandIsOrdering decls op && (translateOperand decls op).isSome
   | _ => false
 
 /-- Fragment rvalues of type `core::cmp::Ordering`: an `Ordering` operand or
 a three-way comparison `Cmp` of two integers of one type or of two `bool`s. -/
-def rvalueOkO (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Bool
+def rvalueOkO (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Bool
   | .use op => operandOkO decls op
-  | .binaryOp .cmp a b => relOperandsOk decls a b
+  | .binaryOp .cmp a b => relOperandsOk layouts decls a b
   | _ => false
 
 /-- Field-0 integer type of a projection-free `(Int, bool)` 2-tuple operand. -/
@@ -1057,41 +1513,127 @@ def operandOkTuple (decls : List MirAst.LocalDecl) (it : Gen.IntType) (op : MirA
 checked binary operation `AddWithOverflow | SubWithOverflow | MulWithOverflow`
 on two integer operands of type `it`, or a 2-tuple aggregate `(a, b)` of an
 integer operand of type `it` and a `bool` operand. -/
-def rvalueOkTuple (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rvalue → Bool
+def rvalueOkTuple (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rvalue → Bool
   | .use op => operandOkTuple decls it op
   | .binaryOp op a b =>
-    (translateCheckedBinOp op).isSome && operandOk decls it a && operandOk decls it b
-  | .aggregate .tuple [a, b] => operandOk decls it a && operandOkB decls b
+    (translateCheckedBinOp op).isSome && operandOk layouts decls it a && operandOk layouts decls it b
+  | .aggregate .tuple [a, b] => operandOk layouts decls it a && operandOkB layouts decls b
   | _ => false
 
-/-- A fragment place: a local `_i`, field `0` (`_i.0`) of an `(Int, bool)`
-tuple local, or field `1` (`_i.1`) of an `(Int, bool)` tuple local. -/
-def placeOk (decls : List MirAst.LocalDecl) : MirAst.Place → Bool
+/-- Fragment rvalues producing a homogeneous array `[elemIt; count]`. -/
+def arrayRvalueOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (elemIt : Gen.IntType) (count : Nat) :
+    MirAst.Rvalue → Bool
+  | .use (.copy ⟨j, []⟩) =>
+    decide (j < decls.length) &&
+    decide ((decls[j]? >>= (arrayTypeOf ·.ty)) = some (elemIt, count))
+  | .aggregate (.array elemTy) ops =>
+    decide (intTypeOf elemTy = some elemIt) &&
+    decide (ops.length = count) &&
+    ops.all (operandOk layouts decls elemIt)
+  | .repeat op n =>
+    decide (n = count) &&
+    (decide (0 < count) || match op with | .constant _ => true | _ => false) &&
+    operandOk layouts decls elemIt op
+  | _ => false
+
+/-- Resolved `(fields, size, align)` descriptor of a tuple/struct place (either
+an unprojected tuple/struct local `_j` or a field projection chain `_j.f1...fk`
+whose target is a nested tuple/struct). -/
+def tuplePlaceSpec (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) :
+    MirAst.Place → Option (List (Nat × TupleSpec) × Nat × Nat)
+  | ⟨j, []⟩ =>
+    if j < decls.length then decls[j]? >>= (tupleTypeOf layouts ·.ty) else none
+  | ⟨j, .field idx fieldTy :: rest⟩ =>
+    if j < decls.length then do
+      let d ← decls[j]?
+      let (fields, size, align) ← tupleTypeOf layouts d.ty
+      let (_, leafSpec) ←
+        resolveFieldPath layouts (.tuple fields size align) (.field idx fieldTy :: rest)
+      match leafSpec with
+      | .tuple subFields subSize subAlign => some (subFields, subSize, subAlign)
+      | .scalar _ => none
+    else none
+  | _ => none
+
+/-- Well-formedness of an operand producing a value of `TupleSpec` `spec`
+(either a scalar operand of type `it` when `spec = .scalar it`, or a `copy p`
+of a tuple/struct place when `spec = .tuple fields size align`). -/
+def specOperandOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (spec : TupleSpec) (op : MirAst.Operand) : Bool :=
+  match spec with
+  | .scalar it => operandOk layouts decls it op
+  | .tuple fields size align =>
+    match op with
+    | .copy p =>
+      decide (tuplePlaceSpec layouts decls p = some (fields, size, align)) &&
+      (translateOperand decls op).isSome
+    | _ => false
+
+/-- Pointwise well-formedness of aggregate field operands against `fields`. -/
+def tupleFieldsOperandOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) :
+    List (Nat × TupleSpec) → List MirAst.Operand → Bool
+  | [], [] => true
+  | (_, fSpec) :: restF, op :: restOps =>
+    specOperandOk layouts decls fSpec op && tupleFieldsOperandOk layouts decls restF restOps
+  | _, _ => false
+
+/-- Whether `AggregateKind` `agg` matches the destination's `RigidTy`
+(`.tuple` for `RigidTy.tuple`, `.adt defPath 0 none` for `RigidTy.adt defPath _`). -/
+def aggKindMatchesTy : MirAst.AggregateKind → MirAst.RigidTy → Bool
+  | .tuple, .tuple _ => true
+  | .adt defPath 0 none, .adt defPath' _ => decide (defPath = defPath')
+  | _, _ => false
+
+/-- Fragment rvalues producing a tuple or single-variant struct of spec
+`(fields, size, align)` and destination type `dstTy`. -/
+def tupleRvalueOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (dstTy : MirAst.Ty)
+    (fields : List (Nat × TupleSpec)) (size align : Nat) : MirAst.Rvalue → Bool
+  | .use (.copy p) =>
+    decide (tuplePlaceSpec layouts decls p = some (fields, size, align)) &&
+    (translatePlace decls p).isSome
+  | .aggregate agg ops =>
+    aggKindMatchesTy agg dstTy.kind &&
+    decide (tupleTypeOf layouts dstTy = some (fields, size, align)) &&
+    tupleFieldsOperandOk layouts decls fields ops
+  | _ => false
+
+/-- Places admissible in `PlaceMention`: an unprojected local `_i`, field `0`
+or `1` of an `(Int, bool)` local, or a valid field projection chain `_i.f1...fk`
+on a `TupleSpec` local. -/
+def mentionPlaceOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) : MirAst.Place → Bool
   | ⟨i, []⟩ => decide (i < decls.length)
-  | ⟨i, [.field 0 fieldTy]⟩ =>
+  | ⟨i, .field idx fieldTy :: rest⟩ =>
     decide (i < decls.length) &&
     match decls[i]? with
+    | none => false
     | some d =>
-      match intBoolTupleOf d.ty, intTypeOf fieldTy with
-      | some it, some fit => decide (fit = it)
-      | _, _ => false
-    | none => false
-  | ⟨i, [.field 1 fieldTy]⟩ =>
-    decide (i < decls.length) &&
-    match decls[i]? with
-    | some d => (intBoolTupleOf d.ty).isSome && isBoolTy fieldTy
-    | none => false
+      match intBoolTupleOf d.ty with
+      | some it =>
+        match idx, rest with
+        | 0, [] => decide (intTypeOf fieldTy = some it)
+        | 1, [] => isBoolTy fieldTy
+        | _, _ => false
+      | none =>
+        match tupleTypeOf layouts d.ty with
+        | some (fields, size, align) =>
+          (resolveFieldPath layouts (.tuple fields size align)
+            (.field idx fieldTy :: rest)).isSome
+        | none => false
   | _ => false
 
-/-- Fragment statements, type-checked against the destination's type: an
-integer destination takes an integer rvalue (`rvalueOk`), a `bool`
-destination takes a `bool` rvalue (`rvalueOkB`), an `Ordering` destination
-takes a three-way comparison (`rvalueOkO`), and an `(it, bool)` 2-tuple
-destination takes a 2-tuple rvalue (`rvalueOkTuple`), each checked through
-`copyRv`; `PlaceMention` takes any fragment place (`placeOk`);
-`StorageLive`, `StorageDead`, and `Deinit` take a declared local (fragment
-locals have sized layout, and `Deinit` and `StorageLive` are well-formed in
-`spec/lang/well-formed.md`:
+/-- Fragment statements, type-checked against the destination's type:
+scalar-family root assignments (`bool`, `Ordering`, `(it, bool)`, and `Int`)
+check `copyRv rv`; array root assignments check `arrayRvalueOk`; `TupleSpec`
+root and field assignments check `tupleRvalueOk` / `rvalueOk`; array element
+assignments check `projOk` and `rvalueOk`; `PlaceMention` checks
+`mentionPlaceOk`; and `StorageLive`, `StorageDead`, and root `Deinit` take a
+declared scalar-family local (`spec/lang/well-formed.md`:
 > "Deinit { place } => {
 >      let ty = place.check_wf::<T>(func.locals, prog)?;
 >      ensure_wf(ty.layout::<T>().is_sized(), \"Statement::Deinit: unsized place\")?;
@@ -1103,45 +1645,74 @@ locals have sized layout, and `Deinit` and `StorageLive` are well-formed in
 the projected value and leaves the slot initialized, whereas MiniRust's writes
 `Uninit` to the projected bytes). `storageDeadOk` restricts `StorageDead`
 further. -/
-def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement) : Bool :=
+def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
+    (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : Bool :=
   match s.kind with
   | .assign ⟨i, []⟩ rv =>
     match decls[i]? with
     | none => false
     | some d =>
-      if isBoolTy d.ty then rvalueOkB decls (copyRv rv)
-      else if isOrderingTy d.ty then rvalueOkO decls (copyRv rv)
+      if isBoolTy d.ty then rvalueOkB layouts decls (copyRv rv)
+      else if isOrderingTy d.ty then rvalueOkO layouts decls (copyRv rv)
       else
         match intBoolTupleOf d.ty with
-        | some it => rvalueOkTuple decls it (copyRv rv)
+        | some it => rvalueOkTuple layouts decls it (copyRv rv)
         | none =>
           match intTypeOf d.ty with
-          | none => false
-          | some it => rvalueOk decls it (copyRv rv)
-  | .placeMention p => placeOk decls p
-  | .storageLive i | .storageDead i => decide (i < decls.length)
-  | .deinit ⟨i, []⟩ => decide (i < decls.length)
+          | some it => rvalueOk layouts decls it (copyRv rv)
+          | none =>
+            match arrayTypeOf d.ty with
+            | some (elemIt, count) => arrayRvalueOk layouts decls elemIt count rv
+            | none =>
+              match tupleTypeOf layouts d.ty with
+              | some (fields, size, align) =>
+                tupleRvalueOk layouts decls d.ty fields size align rv
+              | none => false
+  | .assign ⟨i, .field idx fieldTy :: rest⟩ rv =>
+    (decls[i]? >>= (tupleTypeOf layouts ·.ty)).isSome &&
+    match placeIntType layouts decls ⟨i, .field idx fieldTy :: rest⟩ with
+    | some it =>
+      placeOk layouts decls it ⟨i, .field idx fieldTy :: rest⟩ &&
+      rvalueOk layouts decls it rv
+    | none =>
+      match tuplePlaceSpec layouts decls ⟨i, .field idx fieldTy :: rest⟩,
+            placeMirTy decls ⟨i, .field idx fieldTy :: rest⟩ with
+      | some (fields, size, align), some dstTy =>
+        tupleRvalueOk layouts decls dstTy fields size align rv
+      | _, _ => false
+  | .assign ⟨i, [proj]⟩ rv =>
+    match decls[i]? >>= (arrayTypeOf ·.ty) with
+    | some (elemIt, count) =>
+      projOk decls count proj && rvalueOk layouts decls elemIt rv
+    | none => false
+  | .placeMention p => mentionPlaceOk layouts decls p
+  | .storageLive i | .storageDead i =>
+    decide (i < decls.length) && (decls[i]? >>= (scalarTypeOf ·.ty)).isSome
+  | .deinit ⟨i, []⟩ =>
+    decide (i < decls.length) && (decls[i]? >>= (scalarTypeOf ·.ty)).isSome
   | _ => false
 
 /-- A fragment `switchInt` discriminant: an integer operand of its type, or a
 `bool` operand. -/
-def discrOk (decls : List MirAst.LocalDecl) (discr : MirAst.Operand) : Bool :=
-  match operandType decls discr with
-  | some (.Int it) => operandOk decls it discr
-  | some .Bool => operandOkB decls discr
+def discrOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (discr : MirAst.Operand) : Bool :=
+  match operandType layouts decls discr with
+  | some (.Int it) => operandOk layouts decls it discr
+  | some .Bool => operandOkB layouts decls discr
   | _ => false
 
 /-- Fragment terminators; jump targets must be blocks of the body and
 `switchInt` values must be distinct in-range bit patterns of the type
 `minimize` switches at (`switchIntType`: the discriminant's integer type, or
 `u8` for a `bool`). The discriminant is checked through `copyOp`. -/
-def terminatorOk (decls : List MirAst.LocalDecl) (nblocks : Nat) (t : MirAst.Terminator) : Bool :=
+def terminatorOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (nblocks : Nat) (t : MirAst.Terminator) : Bool :=
   match t.kind with
   | .goto target => decide (target < nblocks)
   | .switchInt discr targets =>
-    match switchIntType decls (copyOp discr) with
+    match switchIntType layouts decls (copyOp discr) with
     | some it =>
-      discrOk decls (copyOp discr) &&
+      discrOk layouts decls (copyOp discr) &&
       targets.branches.all (fun p => decide (p.1 < 2 ^ (8 * it.size.bytes)) && decide (p.2 < nblocks)) &&
       (targets.branches.map Prod.fst).Nodup &&
       decide (targets.otherwise < nblocks)
@@ -1182,24 +1753,47 @@ def opMoved : MirAst.Operand → Option Nat
   | .move ⟨j, []⟩ => some j
   | _ => none
 
-/-- The local that a fragment operand reads. -/
+/-- The root local of a fragment operand. -/
 def opRead : MirAst.Operand → Option Nat
   | .copy p | .move p => some p.local_
   | .constant _ => none
 
-/-- Whether an operand is a constant, a local, or a field of a local: the
-operand shapes that `statementOk` and `terminatorOk` admit. Reading one reads
-at most the slot of its local. -/
+/-- All locals referenced by a place (its root local, plus `idxLocal` for
+`ProjectionElem.index idxLocal`). -/
+def placeLocals : MirAst.Place → List Nat
+  | ⟨j, [.index k]⟩ => [j, k]
+  | ⟨j, _⟩ => [j]
+
+/-- All locals read when evaluating an operand (`placeLocals` for `copy`/`move`,
+none for constants). -/
+def opLocals : MirAst.Operand → List Nat
+  | .copy p | .move p => placeLocals p
+  | .constant _ => []
+
+/-- Whether every projection element in `projs` is `ProjectionElem.field`. -/
+def allFields : List MirAst.ProjectionElem → Bool
+  | [] => true
+  | .field _ _ :: rest => allFields rest
+  | _ => false
+
+/-- Projection lists admitted on fragment operands: field chains, `[.index _]`,
+or `[.constantIndex _ _ _]`. -/
+def simpleProj : List MirAst.ProjectionElem → Bool
+  | [.index _] | [.constantIndex _ _ _] => true
+  | projs => allFields projs
+
+/-- Whether an operand is a constant or a `copy`/`move` of a `simpleProj`
+place: the operand shapes that `statementOk` and `terminatorOk` admit. Reading
+one reads at most `opLocals op`. -/
 def simpleOp : MirAst.Operand → Bool
   | .constant _ => true
-  | .copy ⟨_, []⟩ | .move ⟨_, []⟩ => true
-  | .copy ⟨_, [.field _ _]⟩ | .move ⟨_, [.field _ _]⟩ => true
-  | _ => false
+  | .copy ⟨_, projs⟩ | .move ⟨_, projs⟩ => simpleProj projs
 
 /-- The operands of an rvalue in the order in which Anneal's `evalRvalue`
 evaluates them (left to right). -/
 def rvOperands : MirAst.Rvalue → List MirAst.Operand
-  | .use op | .unaryOp _ op | .cast _ op _ => [op]
+  | .use op | .repeat op _ | .unaryOp _ op | .cast _ op _ => [op]
+  | .len p => [.copy p]
   | .binaryOp _ a b => [a, b]
   | .aggregate _ ops => ops
   | _ => []
@@ -1216,10 +1810,8 @@ moved-out local, including those that earlier operands move out of. -/
 def readsOk : List Nat → List MirAst.Operand → Bool
   | _, [] => true
   | mo, op :: ops =>
-    (simpleOp op &&
-     match opRead op with
-     | some j => !mo.contains j
-     | none => true) && readsOk (moveOut mo op) ops
+    (simpleOp op && (opLocals op).all (fun j => !mo.contains j)) &&
+    readsOk (moveOut mo op) ops
 
 /-- The moved-out locals after statement `s`: those its operands move out of,
 minus the root local it writes (a root assignment's destination, or the local of
@@ -1233,10 +1825,16 @@ def stmtMoved (mo : List Nat) (s : MirAst.Statement) : List Nat :=
   | .storageLive i | .storageDead i | .deinit ⟨i, []⟩ => mo.filter (· != i)
   | _ => mo
 
-/-- Whether statement `s` reads no moved-out local. -/
+/-- Whether statement `s` reads no moved-out local (including `idxLocal` on an
+indexed destination `_i[_k] = rv` and the destination root `_i` on a projected
+assignment `_i.proj = rv`). -/
 def stmtReadsOk (mo : List Nat) (s : MirAst.Statement) : Bool :=
   match s.kind with
-  | .assign _ rv => readsOk mo (rvOperands rv)
+  | .assign ⟨_, []⟩ rv => readsOk mo (rvOperands rv)
+  | .assign p@⟨_, _ :: _⟩ rv =>
+    readsOk mo (rvOperands rv) &&
+    let mo' := (rvOperands rv).foldl moveOut mo
+    (placeLocals p).all (fun j => !mo'.contains j)
   | _ => true
 
 /-- Whether terminator `t` reads no moved-out local (`Return` reads `_0`). -/
@@ -1325,15 +1923,15 @@ def movesOk (body : MirAst.CapturedMir) : Bool :=
 /-- The locals a statement mentions. -/
 def stmtLocals (s : MirAst.Statement) : List Nat :=
   match s.kind with
-  | .assign p rv => p.local_ :: (rvOperands rv).filterMap opRead
-  | .placeMention p | .deinit p => [p.local_]
+  | .assign p rv => placeLocals p ++ (rvOperands rv).flatMap opLocals
+  | .placeMention p | .deinit p => placeLocals p
   | .storageLive i | .storageDead i => [i]
   | _ => []
 
 /-- The locals a terminator mentions (`Return` reads `_0`). -/
 def termLocals (t : MirAst.Terminator) : List Nat :=
   match t.kind with
-  | .switchInt discr _ => (opRead discr).toList
+  | .switchInt discr _ => opLocals discr
   | .return_ => [0]
   | _ => []
 
@@ -1342,6 +1940,19 @@ def mentionsOk (body : MirAst.CapturedMir) : Bool :=
   body.basicBlocks.all fun bb =>
     bb.statements.all (fun s => (stmtLocals s).all (fun j => !(alwaysStorageLiveLocals body).contains j)) &&
     (termLocals bb.terminator).all (fun j => !(alwaysStorageLiveLocals body).contains j)
+
+/-- Well-formedness of a local declaration in the fragment: a scalar-family
+type (`scalarTypeOf`), a homogeneous 1D integer array whose byte size fits in
+signed 64-bit `isize` (`< 2 ^ 63`), or a well-formed tuple / single-variant
+struct (`TupleSpec.wf`). -/
+def localDeclOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩) (d : MirAst.LocalDecl) : Bool :=
+  (scalarTypeOf d.ty).isSome ||
+  match arrayTypeOf d.ty with
+  | some (elemIt, count) => decide (count * elemIt.size.bytes < 2 ^ 63)
+  | none =>
+    match tupleTypeOf layouts d.ty with
+    | some (fields, size, align) => (TupleSpec.tuple fields size align).wf
+    | none => false
 
 /-- The decidable fragment on which the correspondence theorem is stated. The
 condition `argCount + 1 ≤ localDecls.length` ensures that `_0` (`f.ret`) and
@@ -1368,12 +1979,14 @@ def inFragment (body : MirAst.CapturedMir) : Bool :=
   body.isRuntimePostCleanup &&
   decide (body.argCount + 1 ≤ body.localDecls.length) &&
   decide (body.localDecls.length < 2 ^ 31) &&
-  body.localDecls.all (fun d => (scalarTypeOf d.ty).isSome) &&
+  (body.localDecls[0]? >>= (scalarTypeOf ·.ty)).isSome &&
+  body.localDecls.all (localDeclOk body.layouts) &&
+  (body.localDecls.drop (body.argCount + 1)).all (fun d => (scalarTypeOf d.ty).isSome) &&
   decide (body.basicBlocks ≠ []) &&
   body.basicBlocks.all (fun bb =>
     !bb.isCleanup &&
-    bb.statements.all (statementOk body.localDecls) &&
-    terminatorOk body.localDecls body.basicBlocks.length bb.terminator) &&
+    bb.statements.all (statementOk body.localDecls · body.layouts) &&
+    terminatorOk body.layouts body.localDecls body.basicBlocks.length bb.terminator) &&
   storageDeadOk body && movesOk body && mentionsOk body &&
   (translateFn body).isSome
 
