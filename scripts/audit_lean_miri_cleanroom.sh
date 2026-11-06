@@ -260,6 +260,25 @@ if not any(m == "Miri" or m.startswith("Miri.") for p in spec_files for m in imp
     print("ERROR: no LeanMiriSpec file imports Miri", file=sys.stderr)
     sys.exit(1)
 
+# LeanMiriSpec/Audit.lean walks only the modules it imports, and the build
+# elaborates only the modules the root imports. Every LeanMiriSpec module must
+# therefore be imported directly by both, or its declarations would escape the
+# exhaustive axiom walk.
+spec_root = pathlib.Path("lean-miri/lean")
+spec_modules = {
+    ".".join(p.relative_to(spec_root).with_suffix("").parts)
+    for p in spec_files
+    if p.relative_to(spec_root).parts[0] == "LeanMiriSpec" and len(p.relative_to(spec_root).parts) > 1
+}
+for importer, required in (
+    (spec_root / "LeanMiriSpec/Audit.lean", spec_modules - {"LeanMiriSpec.Audit"}),
+    (spec_root / "LeanMiriSpec.lean", spec_modules),
+):
+    missing = sorted(required - set(imports(importer)))
+    if missing:
+        print(f"ERROR: {importer} does not import LeanMiriSpec modules {missing}", file=sys.stderr)
+        sys.exit(1)
+
 print(
     f"Module isolation verified across {len(vendor_files)} Miri files, "
     f"{len(trusted_files)} Trusted files, and {len(spec_files)} LeanMiriSpec files."

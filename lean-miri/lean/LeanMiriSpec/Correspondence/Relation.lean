@@ -171,11 +171,15 @@ end ImmediateRel
 storage, `some v` for initialized storage) at type `ty` and a memory-backed
 `Miri.Interpreter.MemPlace AnnealProv` in `mem`.
 
-`relOffset` is the allocation-relative byte offset within `localAlloc.allocation`,
-decoupled from the virtual address `mp.ptr.offset` (`mp.ptr.offset = baseAddr + relOffset`
-under `Miri.Memory.AllocAddresses`) so Phase 2 address-taken locals with non-zero
-virtual base addresses require zero changes to `MemPlaceRel`, `LocalRel`, `FrameRel`,
-or `StateRel`. -/
+`relOffset` is the allocation-relative byte offset within `localAlloc.allocation`
+whose bytes the relation constrains. The relation does not yet tie it to the
+place's address: `offset_le_addr` (`relOffset ≤ mp.ptr.offset`) is the only link,
+so `relOffset` may name bytes other than those `mp` designates. The intended
+equation `mp.ptr.offset = baseAddr allocId + relOffset` needs an allocation
+address map, which `AnnealStepState` (whose machine is just `MemoryState`) does
+not carry. The first workstream that relates `.indirect` locals in a simulation
+proof must add that equation as a field; until then no `LM-1.1` theorem
+constructs or reads through `LocalRel.indirect`. -/
 inductive MemPlaceRel
     (mem : Miri.Memory.MemoryState AnnealProv Unit Unit)
     (ty : Ty)
