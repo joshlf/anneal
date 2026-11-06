@@ -41,3 +41,7 @@ roots = ["ToyCFG"]
 name = "MirVerification"
 srcDir = "mir"
 roots = ["MirVerification"]
+
+[[lean_lib]]
+name = "MiniRustSpec"
+srcDir = "../minirust/lean"
