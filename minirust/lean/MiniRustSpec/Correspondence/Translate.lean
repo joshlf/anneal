@@ -1528,8 +1528,7 @@ def termReadsOk (mo : List Nat) (t : MirAst.Terminator) : Bool :=
   match t.kind with
   | .switchInt discr _ => readsOk mo [discr]
   | .return_ => !mo.contains 0
-  | .call _ argOps ⟨_, []⟩ _ _ => readsOk mo argOps
-  | .call _ argOps ⟨dst, _ :: _⟩ _ _ => !mo.contains dst && readsOk mo argOps
+  | .call _ argOps ⟨dst, _⟩ _ _ => !mo.contains dst && readsOk (dst :: mo) argOps
   | _ => true
 
 /-- The moved-out locals after terminator `t`: `SwitchInt` marks a moved
@@ -1539,7 +1538,8 @@ bytes in MiniRust too, so they do not become stale). -/
 def termMoved (mo : List Nat) (t : MirAst.Terminator) : List Nat :=
   match t.kind with
   | .switchInt discr _ => moveOut mo discr
-  | .call _ _ ⟨dst, []⟩ (some _) _ => mo.filter (· != dst)
+  | .call _ argOps ⟨dst, []⟩ (some _) _ => (argOps.foldl moveOut mo).filter (· != dst)
+  | .call _ argOps _ _ _ => argOps.foldl moveOut mo
   | _ => mo
 
 /-- The successor block indices of terminator `t`. -/

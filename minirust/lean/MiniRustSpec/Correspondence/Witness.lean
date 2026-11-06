@@ -8052,8 +8052,7 @@ theorem callProjMoveReuse_minirust_ub :
 
 /-- Post-call root-`move` reuse (`StorageLive(_2); _2 = idU32Callee(move _1);
 _0 = copy _1`): because `ArgumentExpr::InPlace` writes `Uninit` to `_1` in
-MiniRust just as `evalOperand` sets `_1` to `.uninit` in Anneal, `callMoveReuse`
-is IN `progInFragment` and BOTH semantics fault with UB on `bb1`'s `copy _1`! -/
+MiniRust just as `evalOperand` sets `_1` to `.uninit` in Anneal, `callMoveReuse` is correctly NOT in `progInFragment` (rejected by `movesOk`), while BOTH semantics fault with UB on `bb1`'s `copy _1`! -/
 def callMoveReuse : CapturedMir where
   defPath := "witness::call_move_reuse"
   phase := .runtimePostCleanup
@@ -8071,8 +8070,8 @@ def callMoveReuse : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem callMoveReuse_inFragment :
-    progInFragment callMoveReuse [idU32Callee] = true := by decide
+theorem callMoveReuse_notInFragment :
+    progInFragment callMoveReuse [idU32Callee] = false := by decide
 
 theorem callMoveReuse_anneal_ub :
     ∃ tr u, Reaches
@@ -8093,28 +8092,15 @@ def callMoveReuseMInit : Mach :=
     (initMachineStateWithCallees callMoveReuse [.scalar ⟨7, 4⟩] [idU32Callee]).frame.locals
     callMoveReuseFn.start
 
-theorem callMoveReuse_minirust_ub :
-    ∃ (n : Nat) (msg : String), Interp.steps n callMoveReuseMInit = .error (.ub msg) := by
-  obtain ⟨tr, u, hr, hf⟩ := callMoveReuse_anneal_ub
-  exact mirCallWithCallees_ub callMoveReuse_inFragment callMoveReuse_translate
-    callMoveReuse_translateInProg ctxCallSpin
-    { baseLow := by unfold BaseLow; decide
-      addrs := by
-        intro i d hi hd
-        match i, hi, hd with
-        | 0, _, hd => simp [callMoveReuse] at hd; subst hd; decide
-        | 1, _, hd => simp [callMoveReuse] at hd; subst hd; decide
-        | _ + 2, hi, _ => simp [callMoveReuse] at hi
-      ret := by
-        intro d hd; simp [callMoveReuse] at hd; subst hd
-        exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩ }
-    [.scalar ⟨7, 4⟩] (by decide) callMoveReuseMInit
-    (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
-
 theorem callMoveReuse_minirust_direct :
     Interp.steps 7 callMoveReuseMInit =
       .error (.ub "load at type but the data in memory violates the language invariant") :=
   eq_error_ub_of_ubMsg? (by decide +kernel)
+
+theorem callMoveReuse_minirust_ub :
+    ∃ (n : Nat) (msg : String), Interp.steps n callMoveReuseMInit = .error (.ub msg) :=
+  ⟨7, _, callMoveReuse_minirust_direct⟩
+
 
 /-- Counterexample 3 (`StorageLive(_2); _2 = move _1; _0 = idU32Callee(copy _1)`):
 passing a local that was moved out in an earlier statement (leaving stale bytes

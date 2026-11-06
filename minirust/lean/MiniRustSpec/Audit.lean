@@ -425,7 +425,7 @@ open MiniRustSpec.Correspondence.Witness in
   callProjMoveReuse_translate
   callProjMoveReuse_anneal_ret
   callProjMoveReuse_minirust_ub
-  callMoveReuse_inFragment
+  callMoveReuse_notInFragment
   callMoveReuse_anneal_ub
   callMoveReuse_translate
   callMoveReuse_translateInProg
@@ -1265,7 +1265,7 @@ open MiniRustSpec.Correspondence.Witness in
   callProjMoveReuse_translate
   callProjMoveReuse_anneal_ret
   callProjMoveReuse_minirust_ub
-  callMoveReuse_inFragment
+  callMoveReuse_notInFragment
   callMoveReuse_anneal_ub
   callMoveReuse_translate
   callMoveReuse_translateInProg

@@ -957,20 +957,30 @@ theorem termMoved_mono {mo mo' : List Nat} (hsub : ∀ k ∈ mo, k ∈ mo')
       rcases hj with rfl | hmo
       · exact .inl rfl
       · exact .inr (hsub j hmo)
-  | call _ _ dst target _ =>
+  | call _ argOps dst target _ =>
     cases target with
     | none =>
       simp only [termMoved] at hj ⊢
-      exact hsub j hj
+      rw [foldl_moveOut_mem] at hj ⊢
+      rcases hj with hmo | hmv
+      · exact .inl (hsub j hmo)
+      · exact .inr hmv
     | some _ =>
       obtain ⟨i, proj⟩ := dst
       cases proj with
       | nil =>
         simp only [termMoved, List.mem_filter] at hj ⊢
-        exact ⟨hsub j hj.1, hj.2⟩
+        have ⟨hj', hneq⟩ := hj
+        rw [foldl_moveOut_mem] at hj' ⊢
+        rcases hj' with hmo | hmv
+        · exact ⟨.inl (hsub j hmo), hneq⟩
+        · exact ⟨.inr hmv, hneq⟩
       | cons _ _ =>
         simp only [termMoved] at hj ⊢
-        exact hsub j hj
+        rw [foldl_moveOut_mem] at hj ⊢
+        rcases hj with hmo | hmv
+        · exact .inl (hsub j hmo)
+        · exact .inr hmv
   | goto _ | unreachable | return_ | unwindResume | unwindTerminate | drop _ _ _
   | tailCall _ _ | assert _ _ _ _ | inlineAsm _ _ _ =>
     simp only [termMoved] at hj ⊢
@@ -1177,14 +1187,15 @@ theorem termReadsOk_antitone {mo mo' : List Nat} (hsub : ∀ j ∈ mo, j ∈ mo'
     simp [termReadsOk] at h ⊢
     exact fun h0 => h (hsub 0 h0)
   | call _ argOps dst _ _ =>
-    obtain ⟨i, proj⟩ := dst
-    cases proj with
-    | nil => exact readsOk_mono hsub h
-    | cons _ _ =>
-      simp only [termReadsOk, Bool.and_eq_true] at h ⊢
-      refine ⟨?_, readsOk_mono hsub h.2⟩
-      simp at h ⊢
-      exact fun hi => h.1 (hsub i hi)
+    obtain ⟨i, _⟩ := dst
+    simp only [termReadsOk, Bool.and_eq_true] at h ⊢
+    refine ⟨?_, readsOk_mono ?_ h.2⟩
+    · simp at h ⊢; exact fun hi => h.1 (hsub i hi)
+    · intro j hj
+      simp only [List.mem_cons] at hj ⊢
+      rcases hj with rfl | hmo
+      · exact .inl rfl
+      · exact .inr (hsub j hmo)
   | goto _ | unreachable | unwindResume | unwindTerminate | drop _ _ _
   | tailCall _ _ | assert _ _ _ _ | inlineAsm _ _ _ => rfl
 
@@ -4683,14 +4694,8 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
         evalValue_fnPtr_and_lookup henv1 hlk hgetCallee
       let mo0 := movedBefore curBody s.frame.blockIdx bb.statements.length
       have hreadsArgs : readsOk mo0 argOps = true := by
-        simp only [termReadsOk, hk] at hmvT
-        cases destination with
-        | mk dst proj =>
-          cases proj with
-          | nil => exact hmvT
-          | cons _ _ =>
-            simp only [Bool.and_eq_true] at hmvT
-            exact hmvT.2
+        simp only [termReadsOk, hk, Bool.and_eq_true] at hmvT
+        exact readsOk_mono (fun j hj => List.mem_cons_of_mem _ hj) hmvT.2
       have hstale1 : ∀ k : Nat, k ≠ destination.local_ → s.frame.locals[k]? ≠ view1[k]? →
           k ∈ mo0 ∧ s.frame.locals[k]? = some .uninit ∧ view1[k]? ≠ some .dead := by
         intro k hkDst hkne
@@ -4784,10 +4789,10 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
             cases proj with
             | nil =>
               simp only [termMoved, hk]
-              exact List.mem_filter.mpr ⟨hjMo0, by simpa using hjDst⟩
+              exact List.mem_filter.mpr ⟨(foldl_moveOut_mem argOps mo0 j).mpr (.inl hjMo0), by simpa using hjDst⟩
             | cons _ _ =>
               simp only [termMoved, hk]
-              exact hjMo0
+              exact (foldl_moveOut_mem argOps mo0 j).mpr (.inl hjMo0)
         have hPostLive' : ∀ i ∈ liveAtEntry curBody targetBb,
             i ≠ destination.local_ → locals'[i]? ≠ some .dead := by
           intro i hi _
