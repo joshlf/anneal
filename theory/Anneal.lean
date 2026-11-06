@@ -7,26 +7,7 @@
 -- those terms.
 
 prelude
-import Trusted
 import Anneal.Refinement
 import Anneal.StepResult
-
-/-!
-# Anneal Theory Umbrella (`Anneal.lean`)
-
-Root umbrella module for Anneal's verified meta-theory (`theory/`).
--/
-
-namespace Anneal
-
-/-- Placeholder crate checker pending `theory/Anneal/MirLemmas.lean`. -/
-def checkCrate (_ : Trusted.Crate) : List String :=
-  ["MIR lowering not yet implemented", "crate"]
-
-/-- Placeholder crate verification entrypoint pending
-`theory/Anneal/MirLemmas.lean`. -/
-theorem proveCrate (c : Trusted.Crate) (h : checkCrate c = []) :
-    Trusted.CrateTheorem c := by
-  nomatch h
-
-end Anneal
+import Anneal.Lowering
+import Anneal.MirLemmas
