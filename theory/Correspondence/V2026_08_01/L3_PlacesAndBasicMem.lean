@@ -113,35 +113,27 @@ theorem mir_readProjectedValue_field_aggregate
 **Theorem L3.5 (`mir_writeProjectedValue_field_aggregate`)**:
 Universal characterization of `.field idx ty` on `.aggregate vIdx fields` in
 `Trusted.Rustc.V2026_08_01.MirSemantics.writeProjectedValue`:
-1. In-bounds field (`get? fields idx = some oldFieldVal`) with valid nested write and
-   `set?` updates field `idx` in place;
-2. Out-of-bounds leaf field (`get? fields idx = none` and `rest = .nil`) extends
-   `fields` via `setOrExtendFields fields idx newVal` (supporting union cross-variant writes);
-3. Out-of-bounds non-leaf field (`get? fields idx = none` and `rest = nextProj :: moreProj`)
-   faults with `.ub`.
+1. In-bounds field with valid nested write and `set?` updates field `idx` in place;
+2. Out-of-bounds union variant field (`get? fields idx = none`) with valid nested write
+   extends `fields` via `setOrExtendFields fields idx updatedFieldVal`.
 -/
 theorem mir_writeProjectedValue_field_aggregate
     (locals : List LocalSlot) (vIdx idx : Nat) (fields fields' : List Value)
-    (oldFieldVal updatedFieldVal newVal : Value) (ty : Ty)
-    (rest : List ProjectionElem) (nextProj : ProjectionElem) (moreProj : List ProjectionElem) :
+    (oldFieldVal updatedFieldVal newVal : Value) (ty : Ty) (rest : List ProjectionElem) :
     (get? fields idx = some oldFieldVal →
       writeProjectedValue locals oldFieldVal rest newVal = .ok updatedFieldVal →
       set? fields idx updatedFieldVal = some fields' →
       writeProjectedValue locals (.aggregate vIdx fields) (.field idx ty :: rest) newVal =
         .ok (.aggregate vIdx fields')) ∧
     (get? fields idx = none →
-      writeProjectedValue locals (.aggregate vIdx fields) [.field idx ty] newVal =
-        .ok (.aggregate vIdx (setOrExtendFields fields idx newVal))) ∧
-    (get? fields idx = none →
-      writeProjectedValue locals (.aggregate vIdx fields)
-        (.field idx ty :: nextProj :: moreProj) newVal = .ub) := by
-  refine ⟨?_, ?_, ?_⟩
+      writeProjectedValue locals .unit rest newVal = .ok updatedFieldVal →
+      writeProjectedValue locals (.aggregate vIdx fields) (.field idx ty :: rest) newVal =
+        .ok (.aggregate vIdx (setOrExtendFields fields idx updatedFieldVal))) := by
+  constructor
   · intro h_get h_rec h_set
     simp [writeProjectedValue, h_get, h_rec, h_set]
-  · intro h_oob
-    simp [writeProjectedValue, h_oob]
-  · intro h_oob
-    simp [writeProjectedValue, h_oob]
+  · intro h_oob h_rec
+    simp [writeProjectedValue, h_oob, h_rec]
 
 /--
 **Theorem L3.6 (`mir_readPlace_deref_live_borrow`)**:

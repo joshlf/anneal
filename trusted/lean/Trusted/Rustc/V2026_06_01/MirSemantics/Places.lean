@@ -2151,12 +2151,14 @@ If `proj` ends with `.subslice fromIdx toIdx fromEnd`, split `proj` into
 @[reducible]
 def splitLastSubslice? : List ProjectionElem → Option (List ProjectionElem × Nat × Nat × Bool)
   | .nil => .none
-  | .subslice fromIdx toIdx fromEnd :: .nil => .some (.nil, fromIdx, toIdx, fromEnd)
   | elem :: rest =>
     match splitLastSubslice? rest with
     | .some (initProj, fromIdx, toIdx, fromEnd) =>
       .some (elem :: initProj, fromIdx, toIdx, fromEnd)
-    | .none => .none
+    | .none =>
+      match elem with
+      | .subslice fromIdx toIdx fromEnd => .some (.nil, fromIdx, toIdx, fromEnd)
+      | _ => .none
 
 /--
 Return `true` when `proj` ends with `.subslice`.
@@ -7158,18 +7160,30 @@ def ptrAllocByteBound?
               projection := initProj
             }
             match placeTy localDecls layouts initPlace with
-            | .some { kind := .array elemKind arrLen, .. } =>
-              match
-                Bool.and
-                  (Nat.ble minLen arrLen)
-                  (Nat.ble baseIdx arrLen)
-              with
-              | false => .some 0
-              | true =>
-                let remElems := Nat.sub arrLen baseIdx
-                match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
-                | .some elemSz => .some (Nat.mul remElems elemSz)
-                | .none => .some 0
+            | .some arrTy =>
+              match arrTy.kind with
+              | .array elemKind arrLen =>
+                match
+                  Bool.and
+                    (Nat.ble minLen arrLen)
+                    (Nat.ble baseIdx arrLen)
+                with
+                | false => .some 0
+                | true =>
+                  let remElems := Nat.sub arrLen baseIdx
+                  match LayoutTable.lookup layouts arrTy.layoutIdx with
+                  | .some layout =>
+                    match layout.fields with
+                    | .array stride _ => .some (Nat.mul remElems stride.bytes)
+                    | _ =>
+                      match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+                      | .some elemSz => .some (Nat.mul remElems elemSz)
+                      | .none => .some 0
+                  | .none =>
+                    match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+                    | .some elemSz => .some (Nat.mul remElems elemSz)
+                    | .none => .some 0
+              | _ => .some 0
             | _ => .some 0
         | .none =>
           match splitLastSubslice? normTargetProj with
@@ -7185,26 +7199,26 @@ def ptrAllocByteBound?
                 let elemSz :=
                   match placeTy localDecls layouts initPlace with
                   | .some parentTy =>
-                    match elemTyOf parentTy with
-                    | .some elemTy =>
-                      match rigidTyByteSize layouts elemTy with
-                      | .some n => n
+                    match LayoutTable.lookup layouts parentTy.layoutIdx with
+                    | .some layout =>
+                      match layout.fields with
+                      | .array stride _ => stride.bytes
+                      | _ =>
+                        match elemTyOf parentTy with
+                        | .some elemTy =>
+                          match rigidTyByteSize layouts elemTy with
+                          | .some n => n
+                          | .none => inferElemListByteStride subElems
+                        | .none => inferElemListByteStride subElems
+                    | .none =>
+                      match elemTyOf parentTy with
+                      | .some elemTy =>
+                        match rigidTyByteSize layouts elemTy with
+                        | .some n => n
+                        | .none => inferElemListByteStride subElems
                       | .none => inferElemListByteStride subElems
-                    | .none => inferElemListByteStride subElems
                   | .none => inferElemListByteStride subElems
-                  let subLenOpt : Option Nat :=
-                    match fromEnd with
-                    | false =>
-                      match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx (length subElems)) with
-                      | true => .some (Nat.sub toIdx fromIdx)
-                      | false => .none
-                    | true =>
-                      match Nat.ble (Nat.add fromIdx toIdx) (length subElems) with
-                      | true => .some (Nat.sub (Nat.sub (length subElems) toIdx) fromIdx)
-                      | false => .none
-                  match subLenOpt with
-                  | .some subLen => .some (Nat.mul subLen elemSz)
-                  | .none => .some 0
+                .some (Nat.mul (length subElems) elemSz)
               | _ => .some 0
             | .none =>
               let initPlace : Place := {
@@ -7212,20 +7226,35 @@ def ptrAllocByteBound?
                 projection := initProj
               }
               match placeTy localDecls layouts initPlace with
-              | .some { kind := .array elemKind arrLen, .. } =>
-                let subLenOpt : Option Nat :=
-                  match fromEnd with
-                  | false =>
-                    match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx arrLen) with
-                    | true => .some (Nat.sub toIdx fromIdx)
-                    | false => .none
-                  | true =>
-                    match Nat.ble (Nat.add fromIdx toIdx) arrLen with
-                    | true => .some (Nat.sub (Nat.sub arrLen toIdx) fromIdx)
-                    | false => .none
-                match subLenOpt, rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
-                | .some subLen, .some elemSz => .some (Nat.mul subLen elemSz)
-                | _, _ => .some 0
+              | .some arrTy =>
+                match arrTy.kind with
+                | .array elemKind arrLen =>
+                  let subLenOpt : Option Nat :=
+                    match fromEnd with
+                    | false =>
+                      match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx arrLen) with
+                      | true => .some (Nat.sub toIdx fromIdx)
+                      | false => .none
+                    | true =>
+                      match Nat.ble (Nat.add fromIdx toIdx) arrLen with
+                      | true => .some (Nat.sub (Nat.sub arrLen toIdx) fromIdx)
+                      | false => .none
+                  match subLenOpt with
+                  | .some subLen =>
+                    match LayoutTable.lookup layouts arrTy.layoutIdx with
+                    | .some layout =>
+                      match layout.fields with
+                      | .array stride _ => .some (Nat.mul subLen stride.bytes)
+                      | _ =>
+                        match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+                        | .some elemSz => .some (Nat.mul subLen elemSz)
+                        | .none => .some 0
+                    | .none =>
+                      match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+                      | .some elemSz => .some (Nat.mul subLen elemSz)
+                      | .none => .some 0
+                  | .none => .some 0
+                | _ => .some 0
               | _ => .some 0
           | .none =>
             let fallbackTargetPlaceBytes : Option Nat :=
@@ -7282,26 +7311,38 @@ def ptrAllocByteBound?
                     let elemSz :=
                       match placeTy localDecls layouts subInitPlace with
                       | .some parentTy =>
-                        match elemTyOf parentTy with
-                        | .some elemTy =>
-                          match rigidTyByteSize layouts elemTy with
-                          | .some n => n
+                        match LayoutTable.lookup layouts parentTy.layoutIdx with
+                        | .some layout =>
+                          match layout.fields with
+                          | .array stride _ => stride.bytes
+                          | _ =>
+                            match elemTyOf parentTy with
+                            | .some elemTy =>
+                              match rigidTyByteSize layouts elemTy with
+                              | .some n => n
+                              | .none => inferElemListByteStride subElems
+                            | .none => inferElemListByteStride subElems
+                        | .none =>
+                          match elemTyOf parentTy with
+                          | .some elemTy =>
+                            match rigidTyByteSize layouts elemTy with
+                            | .some n => n
+                            | .none => inferElemListByteStride subElems
                           | .none => inferElemListByteStride subElems
-                        | .none => inferElemListByteStride subElems
                       | .none => inferElemListByteStride subElems
-                      let subLenOpt : Option Nat :=
-                    match fromEnd with
-                    | false =>
-                      match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx (length subElems)) with
-                      | true => .some (Nat.sub toIdx fromIdx)
-                      | false => .none
-                    | true =>
-                      match Nat.ble (Nat.add fromIdx toIdx) (length subElems) with
-                      | true => .some (Nat.sub (Nat.sub (length subElems) toIdx) fromIdx)
-                      | false => .none
-                  match subLenOpt with
-                  | .some subLen => .some (Nat.mul subLen elemSz)
-                  | .none => .some 0
+                    let subLenOpt : Option Nat :=
+                      match fromEnd with
+                      | false =>
+                        match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx (length subElems)) with
+                        | true => .some (Nat.sub toIdx fromIdx)
+                        | false => .none
+                      | true =>
+                        match Nat.ble (Nat.add fromIdx toIdx) (length subElems) with
+                        | true => .some (Nat.sub (Nat.sub (length subElems) toIdx) fromIdx)
+                        | false => .none
+                    match subLenOpt with
+                    | .some subLen => .some (Nat.mul subLen elemSz)
+                    | .none => .some 0
                   | .some _ => .some 0
                   | .none =>
                     match placeTy localDecls layouts subInitPlace with
@@ -7333,18 +7374,34 @@ def ptrAllocByteBound?
                       | _ => .some 0
                     | .none => .none
                 | .none =>
-                  match encTyOpt with
-                  | .some encTy =>
-                    match rigidTyByteSize layouts encTy with
-                    | .some sz => .some sz
+                  let encSzOpt_fromArray : Option Nat :=
+                    match splitLastConstantIndex? encProj with
+                    | .some (arrProj, _, _) =>
+                      match placeTy localDecls layouts { local_ := entry.targetLocal, projection := arrProj } with
+                      | .some arrTy =>
+                        match LayoutTable.lookup layouts arrTy.layoutIdx with
+                        | .some layout =>
+                          match layout.fields with
+                          | .array stride _ => .some stride.bytes
+                          | _ => .none
+                        | .none => .none
+                      | .none => .none
+                    | .none => .none
+                  match encSzOpt_fromArray with
+                  | .some sz => .some sz
+                  | .none =>
+                    match encTyOpt with
+                    | .some encTy =>
+                      match rigidTyByteSize layouts encTy with
+                      | .some sz => .some sz
+                      | .none =>
+                        match encValOpt with
+                        | .some ev => inferValueCReprBytes ev
+                        | .none => .none
                     | .none =>
                       match encValOpt with
                       | .some ev => inferValueCReprBytes ev
                       | .none => .none
-                  | .none =>
-                    match encValOpt with
-                    | .some ev => inferValueCReprBytes ev
-                    | .none => .none
               match enclosingBytesOpt with
               | .none => fallbackTargetPlaceBytes
               | .some encBytes =>
