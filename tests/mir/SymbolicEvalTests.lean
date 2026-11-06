@@ -2815,6 +2815,340 @@ theorem scalar_enum_return_edge_cases_confirmed :
       (MirDiffTag.normalOther, "none") := by
   exact ⟨rfl, rfl, rfl, rfl, rfl⟩
 
+/--
+Kernel-checked `TotalVerificationResult` certification for
+`ub_transmute_invalid_enum_tag__b7_c29` via
+`verifyTotalMirDiffScalarPointBounded`.
+-/
+theorem confirm_total_claim_ub_transmute_invalid_enum_tag__b7_c29 :
+    TotalVerificationResult
+      { body := ubTransmuteInvalidEnumTagB7C29Body
+        pre := fun a m => a = [] ∧ m = emptyMemory
+        post := fun _ _ retVal _ =>
+          retVal = .scalar { bits := 1, sizeBytes := 1 } ∨
+            ∃ variantIdx,
+              retVal = .aggregate variantIdx .nil ∧
+              scalarEnumReturnTag?
+                ubTransmuteInvalidEnumTagB7C29Body variantIdx =
+                .some (1, 1) } :=
+  verifyTotalMirDiffScalarPointBounded
+    ubTransmuteInvalidEnumTagB7C29Body 64 [] emptyMemory 1 1
+
+/--
+`rustc`-captured layout for `#[repr(u8)] pub enum SingleFive { Only = 5 }`:
+`rustc` emits `VariantsShape.multiple` with one empty `FieldsShape` and
+`validRange = 5..=5` while MIR constructs `Value.aggregate 0 []`.
+-/
+def rustcCapturedSingleFiveBody : CapturedMir :=
+  let singleLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 false) { start := 5, end_ := 5 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 8 false) { start := 5, end_ := 5 })
+          0
+          [.arbitrary [] []]
+      isUninhabited := false }
+  let singleTy : Ty :=
+    { kind := .adt "sym_test::RustcSingleFive" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::rustc_single_five" 0 [mkDecl .mut singleTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "sym_test::RustcSingleFive" 0 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [singleLayout] } }
+
+/--
+User-defined `#[repr(i8)]` contiguous negative-start enum
+`enum SignedContig { NegTwo = -2, NegOne = -1, Zero = 0 }` (`254..=0`) returning
+variant `0` (`NegTwo = 254`).
+-/
+def userSignedContigI8Body : CapturedMir :=
+  let scLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 true) { start := 254, end_ := 0 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 8 true) { start := 254, end_ := 0 })
+          0
+          [.arbitrary [] [], .arbitrary [] [], .arbitrary [] []]
+      isUninhabited := false }
+  let scTy : Ty := { kind := .adt "sym_test::SignedContig" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::signed_contig_neg_two" 0 [mkDecl .mut scTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "sym_test::SignedContig" 0 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [scLayout] } }
+
+/--
+User-defined `#[repr(i16)]` contiguous signed enum
+`enum SignedI16 { Neg = -1, Zero = 0, Pos = 1 }` (`65535..=1`) returning variant
+`0` (`Neg = 65535`, `sizeBytes = 2`).
+-/
+def userSignedContigI16Body : CapturedMir :=
+  let i16EnumLayout : TypeLayout :=
+    { size := { bytes := 2 }
+      align := { bytes := 2 }
+      backendRepr :=
+        .scalar (.initialized (.int 16 true) { start := 65535, end_ := 1 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 16 true) { start := 65535, end_ := 1 })
+          0
+          [.arbitrary [] [], .arbitrary [] [], .arbitrary [] []]
+      isUninhabited := false }
+  let i16EnumTy : Ty := { kind := .adt "sym_test::SignedI16" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::signed_i16_neg" 0 [mkDecl .mut i16EnumTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "sym_test::SignedI16" 0 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [i16EnumLayout] } }
+
+/--
+Non-zero-based unsigned contiguous enum
+`#[repr(u8)] enum NonZeroContig { A = 10, B = 11, C = 12 }` returning variant
+`1` (`B = 11`).
+-/
+def nonZeroUnsignedContigBody : CapturedMir :=
+  let nzLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 false) { start := 10, end_ := 12 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 8 false) { start := 10, end_ := 12 })
+          0
+          [.arbitrary [] [], .arbitrary [] [], .arbitrary [] []]
+      isUninhabited := false }
+  let nzTy : Ty := { kind := .adt "sym_test::NonZeroContig" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::nonzero_contig_b" 0 [mkDecl .mut nzTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "sym_test::NonZeroContig" 1 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [nzLayout] } }
+
+/--
+Gapped explicit-discriminant enum `#[repr(u8)] enum Gapped { A = 1, B = 5 }`
+(`validRange = 1..=5`, `2` variants): per-variant discriminants are not stored
+in `TypeLayout`, so returning `B` (`variantIdx = 1`) must report `.normalOther`
+rather than fabricating `1` (`A`).
+-/
+def gappedExplicitDiscrEnumBody : CapturedMir :=
+  let gapLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 false) { start := 1, end_ := 5 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 8 false) { start := 1, end_ := 5 })
+          0
+          [.arbitrary [] [], .arbitrary [] []]
+      isUninhabited := false }
+  let gapTy : Ty := { kind := .adt "sym_test::Gapped" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::gapped_b" 0 [mkDecl .mut gapTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "sym_test::Gapped" 1 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [gapLayout] } }
+
+/--
+Niche-encoded `Option<OnlyZero>::None` (`validRange = 0..=1`, `2` variants where
+`Some(OnlyZero)` occupies byte `0` and `None` uses niche byte `1`): even though
+`wrappingRangeCount` equals `2`, `allVariantsFieldless` rejects the payload
+variant so `None` (`variantIdx = 0`) is not misclassified as byte `0`.
+-/
+def nicheOptionOnlyZeroNoneBody : CapturedMir :=
+  let optZeroLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 false) { start := 0, end_ := 1 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 8 false) { start := 0, end_ := 1 })
+          0
+          [ .arbitrary [] []
+          , .arbitrary [{ bytes := 0 }] [0] ]
+      isUninhabited := false }
+  let onlyZeroKind : RigidTy := .adt "sym_test::OnlyZero" []
+  let optZeroTy : Ty :=
+    { kind := .adt "core::option::Option" [onlyZeroKind], layoutIdx := 0 }
+  { mkMirBody "sym_test::option_only_zero_none" 0 [mkDecl .mut optZeroTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "core::option::Option" 0 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [optZeroLayout] } }
+
+/--
+Concrete zero-sized ADT return local (`UnitStruct` with `size.bytes = 0` in
+`body.layouts`) paired with a synthetic positive-sized scalar
+`fnAbi.ret.layout`: `resolveReturnLayout?` must keep the concrete zero-sized
+layout and report `.normalOther`.
+-/
+def zstLocalWithScalarFnAbiBody : CapturedMir :=
+  let zstLayout : TypeLayout :=
+    { size := { bytes := 0 }
+      align := { bytes := 1 }
+      backendRepr := .memory
+      fields := .arbitrary [] []
+      variants := .single 0
+      isUninhabited := false }
+  let bogusScalarRetLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 false) { start := 0, end_ := 0 })
+      fields := .arbitrary [] []
+      variants := .single 0
+      isUninhabited := false }
+  let zstTy : Ty := { kind := .adt "sym_test::UnitStruct" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::zst_with_scalar_fnabi" 0 [mkDecl .mut zstTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "sym_test::UnitStruct" 0 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    fnAbi :=
+      { args := []
+        ret := { layout := bogusScalarRetLayout, mode := .direct }
+        conv := .rust
+        canUnwind := true }
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [zstLayout] } }
+
+/--
+Scalar-represented enum return when `body.layouts` is empty, exercising fallback
+to `body.fnAbi.ret.layout` for `ColorTag::Green` (`variantIdx = 1`).
+-/
+def emptyLayoutsFnAbiFallbackBody : CapturedMir :=
+  let colorLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 false) { start := 0, end_ := 2 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 8 false) { start := 0, end_ := 2 })
+          0
+          [.arbitrary [] [], .arbitrary [] [], .arbitrary [] []]
+      isUninhabited := false }
+  let colorTy : Ty :=
+    { kind := .adt "miri_diff_corpus::ColorTag" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::empty_layouts_fnabi_fallback" 0 [mkDecl .mut colorTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "miri_diff_corpus::ColorTag" 1 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    fnAbi :=
+      { args := []
+        ret := { layout := colorLayout, mode := .direct }
+        conv := .rust
+        canUnwind := true }
+    layouts := { pointerBits := 64, isLittleEndian := true, entries := [] } }
+
+/--
+Malformed 1-byte scalar layout whose `validRange` endpoint `300` exceeds
+`scalarModulus 1 = 256`: rejected so out-of-width bit patterns never escape as
+`.normalScalar`.
+-/
+def outOfWidthRangeScalarEnumBody : CapturedMir :=
+  let badLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 false) { start := 300, end_ := 300 })
+      fields := .arbitrary [] []
+      variants := .single 0
+      isUninhabited := false }
+  let badTy : Ty := { kind := .adt "sym_test::BadRange" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::bad_range_enum" 0 [mkDecl .mut badTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "sym_test::BadRange" 0 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [badLayout] } }
+
+theorem scalar_enum_return_b1_hardening_confirmed :
+    probeMirDiffBounded 16 rustcCapturedSingleFiveBody
+      (initMachineStateWithMemory
+        rustcCapturedSingleFiveBody [] emptyMemory) =
+      (MirDiffTag.normalScalar 5 1, "none") ∧
+    probeMirDiffBounded 16 userSignedContigI8Body
+      (initMachineStateWithMemory
+        userSignedContigI8Body [] emptyMemory) =
+      (MirDiffTag.normalScalar 254 1, "none") ∧
+    probeMirDiffBounded 16 userSignedContigI16Body
+      (initMachineStateWithMemory
+        userSignedContigI16Body [] emptyMemory) =
+      (MirDiffTag.normalScalar 65535 2, "none") ∧
+    probeMirDiffBounded 16 nonZeroUnsignedContigBody
+      (initMachineStateWithMemory
+        nonZeroUnsignedContigBody [] emptyMemory) =
+      (MirDiffTag.normalScalar 11 1, "none") ∧
+    probeMirDiffBounded 16 gappedExplicitDiscrEnumBody
+      (initMachineStateWithMemory
+        gappedExplicitDiscrEnumBody [] emptyMemory) =
+      (MirDiffTag.normalOther, "none") ∧
+    probeMirDiffBounded 16 nicheOptionOnlyZeroNoneBody
+      (initMachineStateWithMemory
+        nicheOptionOnlyZeroNoneBody [] emptyMemory) =
+      (MirDiffTag.normalOther, "none") ∧
+    probeMirDiffBounded 16 zstLocalWithScalarFnAbiBody
+      (initMachineStateWithMemory
+        zstLocalWithScalarFnAbiBody [] emptyMemory) =
+      (MirDiffTag.normalOther, "none") ∧
+    probeMirDiffBounded 16 emptyLayoutsFnAbiFallbackBody
+      (initMachineStateWithMemory
+        emptyLayoutsFnAbiFallbackBody [] emptyMemory) =
+      (MirDiffTag.normalScalar 1 1, "none") ∧
+    probeMirDiffBounded 16 outOfWidthRangeScalarEnumBody
+      (initMachineStateWithMemory
+        outOfWidthRangeScalarEnumBody [] emptyMemory) =
+      (MirDiffTag.normalOther, "none") := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 end Anneal.Rustc.V2026_06_01.SymbolicEvalTests
 
 /-!
