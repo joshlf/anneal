@@ -7,7 +7,9 @@
 // those terms.
 
 // === case: concrete_pme_transmute ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ pass
+//@ mir-contains: "Trusted.TCBItem.rustcLowering \"transmute_checked\" ⟨1⟩"
+//@ mir-contains: "Trusted.TCBItem.rustcLowering \"f\" ⟨2⟩"
 
 trait SizeEq<Src, Dst> {
     const ASSERT: ();
@@ -28,7 +30,7 @@ pub fn f(x: usize) -> usize {
 }
 
 // === case: inline_const_pme_transmute ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ pass
 
 pub fn inline_const_transmute(x: usize) -> usize {
     let () = const {
@@ -38,7 +40,7 @@ pub fn inline_const_transmute(x: usize) -> usize {
 }
 
 // === case: public_generic_assoc_const_transmute ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ fail(proof, transmute_checked): "unproved function body"
 
 pub trait SizeEq<Src, Dst> {
     const ASSERT: ();
@@ -55,7 +57,7 @@ pub fn transmute_checked<Src: Copy, Dst: Copy>(x: Src) -> Dst {
 }
 
 // === case: public_generic_inline_const_transmute ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ fail(proof, inline_const_transmute): "unproved function body"
 
 pub fn inline_const_transmute<Src: Copy, Dst: Copy>(x: Src) -> Dst {
     let () = const {
@@ -65,14 +67,14 @@ pub fn inline_const_transmute<Src: Copy, Dst: Copy>(x: Src) -> Dst {
 }
 
 // === case: public_generic_unchecked_transmute ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ fail(proof, transmute_unchecked): "unproved function body"
 
 pub fn transmute_unchecked<Src: Copy, Dst: Copy>(x: Src) -> Dst {
     unsafe { core::mem::transmute_copy(&x) }
 }
 
 // === case: concrete_transmute_with_unsupported_spec ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ fail(proof, f): "unsupported specs on concrete transmute caller"
 
 trait SizeEq<Src, Dst> {
     const ASSERT: ();
@@ -94,7 +96,7 @@ pub fn f(x: usize) -> usize {
 }
 
 // === case: inline_const_transmute_with_unsupported_spec ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ fail(proof, inline_const_transmute): "unsupported specs on inline_const_transmute"
 
 /// anneal:spec ensures(ret == x)
 pub fn inline_const_transmute(x: usize) -> usize {
