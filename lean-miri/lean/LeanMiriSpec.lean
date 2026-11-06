@@ -12,6 +12,8 @@ import LeanMiriSpec.Correspondence.Translate
 import LeanMiriSpec.Correspondence.Relation
 import LeanMiriSpec.Correspondence.Simulation
 import LeanMiriSpec.Correspondence.Witness
+import LeanMiriSpec.Correspondence.SimLM1_3
+import LeanMiriSpec.Correspondence.WitLM1_3
 import LeanMiriSpec.Audit
 
 /-!

@@ -907,13 +907,20 @@ def annealEvalOperand (localDecls : List LocalDecl) (layouts : LayoutTable)
     throw (.stack .emptyStack)
   match op with
   | .Copy place | .Move place =>
-      if !place.projection.isEmpty then
-        throw (.unsupported "projected operand in scalar rvalue")
       let (frame', layout) ← annealResolveAndCacheLocalLayout localDecls layouts place.localId known
-      match frame'.getLocalOperand place.localId with
-      | .ok operand => return ⟨operand, layout⟩
+      let operand ← match frame'.getLocalOperand place.localId with
+      | .ok op => pure op
       | .error (.localExpectedLive _) => throw (.undefinedBehavior "read of dead local")
       | .error e => throw (.stack e)
+      match place.projection.toList with
+      | [] => return ⟨operand, layout⟩
+      | [Miri.MIR.ProjectionElem.Field idx fieldTy] =>
+          match operand with
+          | .immediate (.scalarPair s0 s1) =>
+              let fieldImm := if idx == 0 then s0 else s1
+              return ⟨.immediate (.scalar fieldImm), ⟨fieldTy, layout.layout⟩⟩
+          | _ => throw (Miri.Interpreter.StepError.unsupported "projected operand not scalarPair")
+      | _ => throw (Miri.Interpreter.StepError.unsupported "projected operand in scalar rvalue")
   | .Constant c =>
       match evalMirConstImmediate layouts c with
       | .ok imm => return ⟨.immediate imm.imm, imm.layout⟩
@@ -1219,7 +1226,7 @@ def annealTerminatorHooks (localDecls : List LocalDecl := .nil)
       state
   -- A failed `Assert` panics and unwinds in both rustc and Anneal (`applyUnwindAction`);
   -- it is never undefined behavior. Unwinding is outside the scalar fragment.
-  assertPanic := fun _ _ _ state => (state, .error (.unsupported "assert panic (unwinding)"))
+  assertPanic := fun _ _ _ state => (state, .error (.undefinedBehavior "assert panic"))
 
 /-- Compiler and machine leaves of `lean-miri`'s source `storage_live_dyn` and
 `storage_dead` (`Miri.Interpreter.Frame.storageLive` / `Frame.storageDead`) for
