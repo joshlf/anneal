@@ -67,6 +67,13 @@ The translation is defined only on the fragment checked by `inFragment`:
   `tupleInitOk`, `callTerminatorOk`), and every temporary the body mentions has
   explicit storage markers (`mentionsOk`); see below.
 
+Outside that fragment, `translateFnInProg` also transcribes how `minimize`
+lowers `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`: the
+statement ends the current MiniRust block in a `Terminator::Intrinsic` of
+`IntrinsicOp::Assume` on `op` whose next block is fresh (`translateStmtResult`,
+`splitStmts`, `SegChain`). The fragment does not yet admit `Assume`
+statements.
+
 `minimize` has no MiniRust Boolean operator to use: it writes `!b` as a
 transmute of `1 - b` back to `bool` (`boolNot`), `a & b` / `a | b` / `a ^ b` as
 integer `BitAnd` / `BitOr` / `BitXor` on the `u8` views transmuted back to
@@ -1063,6 +1070,46 @@ def buildUnitPlace : Gen.PlaceExpr :=
 def buildAbort : Gen.Terminator :=
   .Intrinsic .Abort [] buildUnitPlace none
 
+/-- `build::raw_void_ptr_ty()`, the thin raw pointer type with no metadata
+(`Type::Ptr(PtrType::Raw { meta_kind: PointerMetaKind::None })`). -/
+def rawVoidPtrTy : Gen.Type := .Ptr (.Raw .None)
+
+/-- `build::unit_ptr()`, `minimize`'s aligned dangling raw pointer constant
+used as the dummy unwind payload and `unit_place` base (MiniRust's
+`tooling/miniutil/src/build/expr.rs` at the pinned commit,
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/expr.rs>):
+`Constant::PointerWithoutProvenance(Address::from_bytes(1))` at
+`raw_void_ptr_ty()`. -/
+def unitPtr : Gen.ValueExpr :=
+  .Constant (.PointerWithoutProvenance 1) rawVoidPtrTy
+
+/-- `build::unit_place()`, `*unit_ptr()` at the zero-sized `()` tuple type
+`Interp.unitType` (MiniRust's `tooling/miniutil/src/build/expr.rs` at the
+pinned commit). `minimize` uses it as the destination of every intrinsic
+that returns `()`, such as `Assume` (`StatementResult::Intrinsic`). -/
+def unitPlace : Gen.PlaceExpr :=
+  .Deref unitPtr Interp.unitType
+
+/-- `build::abort()`, `minimize`'s abort terminator
+(`tooling/minimize/src/bb.rs`):
+> "Terminator::Intrinsic {
+>      intrinsic: IntrinsicOp::Abort,
+>      arguments: list![],
+>      ret: unit_place(),
+>      next_block: None,
+>  }" -/
+def abortTerminator : Gen.Terminator :=
+  .Intrinsic .Abort [] unitPlace none
+
+/-- The `MR-4.1` spelling `buildUnitPlace` is `unitPlace`. -/
+theorem unitPlace_eq_buildUnitPlace : unitPlace = buildUnitPlace := rfl
+
+/-- The `MR-4.1` spelling `buildAbort` is `abortTerminator`. -/
+theorem abortTerminator_eq_buildAbort : abortTerminator = buildAbort := rfl
+
+/-- The `MR-4.1` spelling `unitTy` is the transcribed `unit_type()`. -/
+theorem unitType_eq_unitTy : Interp.unitType = unitTy := rfl
+
 /-- `minimize`'s translation of a call's `UnwindAction` in a non-cleanup basic
 block (`tooling/minimize/src/bb.rs`):
 > "rs::UnwindAction::Continue => {
@@ -1168,27 +1215,173 @@ def translateTerminatorInProg (fnMap : FnMap)
     let term ← translateTerminator decls t
     pure (term, nextCleanup, [])
 
-/-- Translate basic blocks in index order while threading `nextCleanup`
-(starting at `body.basicBlocks.length + 1`, after `init_bb = bbName n` in
-`FnCtxt::translate`) for any synthesized call unwind blocks. -/
+/-- `minimize`'s per-statement translation result
+(`tooling/minimize/src/bb.rs`):
+> "/// A MIR statement becomes either a MiniRust statement or an intrinsic with some arguments, which
+>  /// then starts a new basic block.
+>  enum StatementResult {
+>      Statement(Statement),
+>      Intrinsic { intrinsic: IntrinsicOp, destination: PlaceExpr, arguments: List<ValueExpr> },
+>  }" -/
+inductive StatementResult : Type where
+  | statement (s : Gen.Statement)
+  | intrinsic (intrinsic : Gen.IntrinsicOp) (destination : Gen.PlaceExpr)
+      (arguments : List Gen.ValueExpr)
+
+/-- Whether a MIR statement is
+`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(_))`, the one
+statement that `minimize` turns into a block-ending
+`StatementResult::Intrinsic`. -/
+def isAssume (s : MirAst.Statement) : Bool :=
+  match s.kind with
+  | .intrinsic (.assume _) => true
+  | _ => false
+
+/-- `minimize`'s `translate_stmt` (`tooling/minimize/src/bb.rs`) on the
+fragment: `translateStatement` for the ordinary statements, and for
+`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`
+> "rs::StatementKind::Intrinsic(intrinsic) => {
+>      match &**intrinsic {
+>          rs::NonDivergingIntrinsic::Assume(op) => {
+>              let op = self.translate_operand(op, span);
+>              // Doesn't return anything, get us a dummy place.
+>              let destination = build::unit_place();
+>              return StatementResult::Intrinsic {
+>                  intrinsic: IntrinsicOp::Assume,
+>                  destination,
+>                  arguments: list![op],
+>              };
+>          }
+>          rs::NonDivergingIntrinsic::CopyNonOverlapping(_) =>
+>              rs::span_bug!(span, \"NonDivergingIntrinsic not supported: {intrinsic:?}\"),
+>      }
+>  }"
+`translate_operand` lowers `move p` like `copy p` (`translateOperand`).
+`CopyNonOverlapping` is a `span_bug!` in `minimize` and stays untranslated. -/
+def translateStmtResult (decls : List MirAst.LocalDecl) (s : MirAst.Statement) :
+    Option StatementResult :=
+  match s.kind with
+  | .intrinsic (.assume op) =>
+    (translateOperand op).map (fun op' => .intrinsic .Assume unitPlace [op'])
+  | _ => (translateStatement decls s).map .statement
+
+/-- The statement loop of `minimize`'s `translate_bb`
+(`tooling/minimize/src/bb.rs`):
+> "for stmt in bb.statements.iter() {
+>      match self.translate_stmt(stmt) {
+>          StatementResult::Statement(stmt) => {
+>              cur_block_statements.push(stmt);
+>          }
+>          StatementResult::Intrinsic { intrinsic, destination, arguments } => {
+>              // Generate a fresh bb name.
+>              let next_bb = self.fresh_bb_name();
+>              // End the current block by jumping to the next one.
+>              let terminator = Terminator::Intrinsic {
+>                  intrinsic,
+>                  arguments,
+>                  ret: destination,
+>                  next_block: Some(next_bb),
+>              };
+>              let cur_block = BasicBlock {
+>                  statements: cur_block_statements,
+>                  terminator,
+>                  kind: block_kind,
+>              };
+>              let old = self.blocks.insert(cur_block_name, cur_block);
+>              assert!(old.is_none()); // make sure we do not overwrite a bb
+>              // Go on building the next block.
+>              cur_block_name = next_bb;
+>              cur_block_statements = List::new();
+>          }
+>      }
+>  }"
+Given the open block's name `cur` and statements `acc` and the next fresh
+block index `nextBb`, returns the name and statements of the block that is
+still open after the loop, the blocks the loop finished (in insertion order),
+and the next fresh index. Fragment blocks are not cleanup blocks, so
+`block_kind` is `BbKind::Regular`. -/
+def splitStmts (cur : Gen.BbName) (acc : List Gen.Statement) (nextBb : Nat) :
+    List StatementResult →
+      Gen.BbName × List Gen.Statement × List (Gen.BbName × Gen.BasicBlock) × Nat
+  | [] => (cur, acc, [], nextBb)
+  | .statement s :: rest => splitStmts cur (acc ++ [s]) nextBb rest
+  | .intrinsic op dest args :: rest =>
+    let next := bbName nextBb
+    let r := splitStmts next [] (nextBb + 1) rest
+    (r.1, r.2.1, (cur, ⟨acc, .Intrinsic op args dest (some next), .Regular⟩) :: r.2.2.1, r.2.2.2)
+
+/-- Translate basic blocks in index order while threading the fresh block
+index `nextCleanup` (starting at `body.basicBlocks.length + 1`, after
+`init_bb = bbName n` in `FnCtxt::translate`). `minimize`'s `translate_bb`
+(`tooling/minimize/src/bb.rs`) first splits the block at every `Assume`
+statement (`splitStmts`, taking fresh names in statement order) and then
+translates the terminator into the block that is still open:
+> "let TerminatorResult { stmts, terminator } = self.translate_terminator(bb);
+>  for stmt in stmts.iter() {
+>      cur_block_statements.push(stmt);
+>  }
+>  let cur_block =
+>      BasicBlock { statements: cur_block_statements, terminator, kind: block_kind };
+>  let old = self.blocks.insert(cur_block_name, cur_block);
+>  assert!(old.is_none()); // make sure we do not overwrite a bb"
+so any unwind block of the terminator takes a fresh name after the split
+blocks. The first component lists every block that `translate_bb` inserts
+for MIR blocks (the segment named after the MIR block comes first), and the
+second component the synthesized cleanup blocks. -/
 def translateBlocksInProg (fnMap : FnMap)
     (decls : List MirAst.LocalDecl) :
     Nat → Nat → List MirAst.BasicBlockData →
       Option (List (Gen.BbName × Gen.BasicBlock) × List (Gen.BbName × Gen.BasicBlock))
   | _, _, [] => some ([], [])
   | i, nextCleanup, bb :: bbs => do
-    let stmts ← bb.statements.mapM (translateStatement decls)
+    let results ← bb.statements.mapM (translateStmtResult decls)
+    let sp := splitStmts (bbName i) [] nextCleanup results
     let (term, nextCleanup', extra1) ←
-      translateTerminatorInProg fnMap decls nextCleanup bb.terminator
+      translateTerminatorInProg fnMap decls sp.2.2.2 bb.terminator
     let (rest, extraRest) ← translateBlocksInProg fnMap decls (i + 1) nextCleanup' bbs
-    pure ((bbName i, ⟨stmts, term, .Regular⟩) :: rest, extra1 ++ extraRest)
+    pure (sp.2.2.1 ++ [(sp.1, ⟨sp.2.1, term, .Regular⟩)] ++ rest, extra1 ++ extraRest)
+
+/-- How `translate_bb` lays out MIR statements `ss`, followed by a terminator
+that `translateTerminatorInProg` translated to `term`, from MiniRust block
+`name` on, as seen through a block lookup `look` (`mapGet f.blocks`):
+* `last`: no statement of `ss` is an `Assume`, and `name` holds the
+  translations of `ss` followed by `term`;
+* `split`: `ss = pre ++ s :: post` with `s` the first `Assume(op)`, `name`
+  holds the translations of `pre` followed by `Terminator::Intrinsic` of
+  `IntrinsicOp::Assume` on `op` with destination `unit_place()` and next block
+  `next`, and `post` is laid out from `next` on (`splitStmts`).
+
+A MIR program point `(blk, stmt)` therefore corresponds to a MiniRust program
+point inside one of these segments (`PcAt` in `Correspondence.Relation`). -/
+inductive SegChain (look : Gen.BbName → Option Gen.BasicBlock)
+    (decls : List MirAst.LocalDecl) (term : Gen.Terminator) :
+    Gen.BbName → List MirAst.Statement → Prop where
+  | last {name : Gen.BbName} {ss : List MirAst.Statement} {stmts : List Gen.Statement}
+      (hlook : look name = some ⟨stmts, term, .Regular⟩)
+      (htr : ss.mapM (translateStatement decls) = some stmts)
+      (hna : ∀ s ∈ ss, isAssume s = false) :
+      SegChain look decls term name ss
+  | split {name next : Gen.BbName} {pre post : List MirAst.Statement}
+      {s : MirAst.Statement} {op : MirAst.Operand} {op' : Gen.ValueExpr}
+      {stmts : List Gen.Statement}
+      (hlook : look name =
+        some ⟨stmts, .Intrinsic .Assume [op'] unitPlace (some next), .Regular⟩)
+      (htr : pre.mapM (translateStatement decls) = some stmts)
+      (hna : ∀ s ∈ pre, isAssume s = false)
+      (hs : s.kind = .intrinsic (.assume op))
+      (hop : translateOperand op = some op')
+      (hrest : SegChain look decls term next post) :
+      SegChain look decls term name (pre ++ s :: post)
 
 /-- `FnCtxt::translate` for a function in a multi-function program: `init_bb`
-takes `bbName n` (`n = body.basicBlocks.length`), and any cleanup blocks
-synthesized by `translate_unwind_action` during block translation take
-`bbName (n + 1), bbName (n + 2), ..` (`tooling/minimize/src/function.rs`). When
-`body` contains no `Call` terminators, `extra` is empty and `translateFnInProg`
-produces the exact same `Gen.Function` as `translateFn`. -/
+takes `bbName n` (`n = body.basicBlocks.length`), and the blocks that
+`translate_bb` creates with `fresh_bb_name()` (the continuations after each
+`Assume` statement, `splitStmts`, and the cleanup blocks synthesized by
+`translate_unwind_action`) take `bbName (n + 1), bbName (n + 2), ..` in
+allocation order (`tooling/minimize/src/function.rs`). When `body` contains no
+`Call` terminators and no `Assume` statements, `extra` is empty, every MIR
+block yields exactly one MiniRust block, and `translateFnInProg` produces the
+exact same `Gen.Function` as `translateFn`. -/
 def translateFnInProg (fnMap : FnMap)
     (body : MirAst.CapturedMir) : Option Gen.Function := do
   let conv ← translateCallConv body.fnAbi.conv
@@ -2043,7 +2236,12 @@ def terminatorInProgOk (callees : List MirAst.CapturedMir) (body : MirAst.Captur
   terminatorOk body.localDecls body.basicBlocks.length t ||
   callTerminatorOk callees body blk t
 
-/-- Per-function fragment check within a multi-function program `(fnMap, callees)`. -/
+/-- Per-function fragment check within a multi-function program
+`(fnMap, callees)`. Statements must be single-body fragment statements
+(`statementOk`), so no statement of a fragment body is an `Assume` and every
+MIR block translates to exactly one MiniRust block (`SegChain.last`,
+`SegChain.eq_last`), even though `translateFnInProg` itself splits blocks at
+`Assume` statements exactly like `minimize`. -/
 def bodyInProgFragment (fnMap : FnMap)
     (callees : List MirAst.CapturedMir) (body : MirAst.CapturedMir) : Bool :=
   body.isRuntimePostCleanup &&

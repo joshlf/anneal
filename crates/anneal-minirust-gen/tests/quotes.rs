@@ -2051,3 +2051,240 @@ fn call_return_and_multi_fn_quotations_are_pinned() {
         );
     }
 }
+
+#[test]
+fn intrinsic_and_assume_quotations_are_pinned() {
+    let corpus = corpus();
+    let valid_paths: BTreeSet<String> = corpus.iter().map(|(p, _)| p.clone()).collect();
+    let intr = "spec/lang/step/intrinsics.md";
+    let terms = "spec/lang/step/terminators.md";
+    let exprs = "spec/lang/step/expressions.md";
+    let prelude = "spec/prelude/main.md";
+    let basic = "spec/mem/basic.md";
+    let intptr = "spec/mem/intptrcast.md";
+    let bb = "tooling/minimize/src/bb.rs";
+
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            intr,
+            "fn unit_value<M: Memory>() -> Value<M> { Value::Tuple(list![]) }",
+            "fn unit_value<M: Memory>() -> Value<M> { Value::Tuple(list![Value::Bool(true)]) }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "fn unit_type() -> Type { \
+                 Type::Tuple { sized_fields: list![], sized_head_layout: TupleHeadLayout { \
+                     end: Size::ZERO, align: Align::ONE, packed_align: None, \
+                 }, unsized_field: None } \
+             }",
+            "end: Size::ZERO, align: Align::ONE, packed_align: Some(Align::ONE),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "if !b { \
+                 throw_ub!(\"`Assume` intrinsic called on condition that is violated\"); \
+             } \
+             ret(unit_value())",
+            "if b { throw_ub!(\"`Assume` intrinsic called on condition that is violated\"); }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "IntrinsicOp::Abort: IntrinsicOp, \
+             arguments: List<(Value<M>, Type)>, \
+             ret_ty: Type, \
+             ) -> NdResult<Value<M>> { \
+                 throw_abort!(); \
+             }",
+            "IntrinsicOp::Abort: IntrinsicOp, \
+             arguments: List<(Value<M>, Type)>, \
+             ret_ty: Type, \
+             ) -> NdResult<Value<M>> { \
+                 throw_ub!(\"abort\"); \
+             }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "fn exit(&self) -> NdResult<!> { .. self.mem.leak_check()?; .. throw_machine_stop!(); }",
+            "fn exit(&self) -> NdResult<!> { throw_machine_stop!(); }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "Value::Int(i) => write!(stream, \"{}\\n\", i).unwrap(), \
+             Value::Bool(b) => write!(stream, \"{}\\n\", b).unwrap(), \
+             _ => throw_ub!(\"unsupported value for printing\"),",
+            "Value::Int(i) => write!(stream, \"{}\", i).unwrap(),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "self.intptrcast.expose(ptr); ret(Value::Int(ptr.addr))",
+            "self.intptrcast.expose(ptr); ret(Value::Int(ptr.addr + 1))",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "Terminator::Intrinsic { intrinsic, arguments, ret: ret_expr, next_block }: Terminator \
+             ) -> NdResult { \
+                 let (ret_place, ret_ty) = self.eval_place(ret_expr)?; \
+                 let arguments = arguments.try_map(|arg| self.eval_value(arg))?; \
+                 let value = self.eval_intrinsic(intrinsic, arguments, ret_ty)?; \
+                 self.place_store(ret_place, value, ret_ty)?;",
+            "let value = self.eval_intrinsic(intrinsic, arguments, ret_ty)?; \
+             self.place_store(ret_place, value, unit_type())?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "throw_ub!(\"return from an intrinsic where caller did not specify next block\");",
+            "throw_ub!(\"return from an intrinsic where callee did not specify next block\");",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            exprs,
+            "let aligned = self.compute_align(ty.layout::<M::T>(), ptr.metadata).is_aligned(ptr.thin_pointer.addr); \
+             ret((Place { ptr, aligned }, ty))",
+            "ret((Place { ptr, aligned: true }, ty))",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            prelude,
+            "macro_rules! throw_abort { () => { do yeet TerminationInfo::Abort } }",
+            "macro_rules! throw_abort { () => { do yeet TerminationInfo::MachineStop } }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            basic,
+            "match allocation.kind { .. Heap => throw_memory_leak!(), .. \
+                 Global | Function | Stack | VTable => {} \
+             }",
+            "Stack => throw_memory_leak!(),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intptr,
+            "pub fn expose(&mut self, ptr: ThinPointer<Provenance>) { \
+                 if let Some(provenance) = ptr.provenance { .. \
+                     self.exposed.insert(provenance); \
+                 } \
+             }",
+            "if let Some(provenance) = ptr.provenance { self.exposed.remove(provenance);",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            bb,
+            "enum StatementResult { \
+                 Statement(Statement), \
+                 Intrinsic { intrinsic: IntrinsicOp, destination: PlaceExpr, arguments: List<ValueExpr> }, \
+             }",
+            "Intrinsic { intrinsic: IntrinsicOp, arguments: List<ValueExpr> },",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::NonDivergingIntrinsic::Assume(op) => { \
+                 let op = self.translate_operand(op, span); .. \
+                 let destination = build::unit_place(); \
+                 return StatementResult::Intrinsic { \
+                     intrinsic: IntrinsicOp::Assume, \
+                     destination, \
+                     arguments: list![op], \
+                 }; \
+             }",
+            "return StatementResult::Intrinsic { \
+                 intrinsic: IntrinsicOp::Abort, \
+                 destination, \
+                 arguments: list![op], \
+             };",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "StatementResult::Intrinsic { intrinsic, destination, arguments } => { .. \
+                 let next_bb = self.fresh_bb_name(); .. \
+                 let terminator = Terminator::Intrinsic { \
+                     intrinsic, \
+                     arguments, \
+                     ret: destination, \
+                     next_block: Some(next_bb), \
+                 };",
+            "let terminator = Terminator::Intrinsic { \
+                 intrinsic, \
+                 arguments, \
+                 ret: destination, \
+                 next_block: None, \
+             };",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "let TerminatorResult { stmts, terminator } = self.translate_terminator(bb); \
+             for stmt in stmts.iter() { \
+                 cur_block_statements.push(stmt); \
+             }",
+            "let TerminatorResult { stmts, terminator } = self.translate_terminator(bb); \
+             let cur_block =",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::NonDivergingIntrinsic::CopyNonOverlapping(_) => \
+                 rs::span_bug!(span, \"NonDivergingIntrinsic not supported: {intrinsic:?}\"),",
+            "rs::NonDivergingIntrinsic::CopyNonOverlapping(_) => StatementResult::Statement(",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+    ];
+    assert_eq!(cases.len(), 18, "expected 18 pinned MR-4.2 quotations");
+
+    let mr42_files = [intr, terms, exprs, prelude, basic, intptr, bb];
+    let lean_root = minirust_dir().join("lean");
+    for (file, genuine, tampered, lean_file) in cases {
+        assert_eq!(
+            missing_piece_in(&corpus, Some(file), genuine),
+            None,
+            "genuine quotation not found in `{file}`: {genuine}"
+        );
+        assert!(
+            missing_piece_in(&corpus, Some(file), tampered).is_some(),
+            "tampered quotation unexpectedly found in `{file}`: {tampered}"
+        );
+        for other in mr42_files {
+            if other != *file {
+                assert!(
+                    missing_piece_in(&corpus, Some(other), genuine).is_some(),
+                    "quotation from `{file}` also matches `{other}`: {genuine}"
+                );
+            }
+        }
+        let lean = std::fs::read_to_string(lean_root.join(lean_file)).unwrap();
+        let extracted = extract_quotes(&lean, &valid_paths)
+            .unwrap_or_else(|e| panic!("extract_quotes failed on `{lean_file}`: {e:?}"));
+        let pieces: Vec<String> = strip_line_comments(genuine)
+            .split("..")
+            .map(squash)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let matched_in_lean = extracted.iter().any(|q| {
+            if q.cited_file != *file {
+                return false;
+            }
+            let q_squashed = squash(&strip_line_comments(&q.text));
+            let mut pos = 0usize;
+            for piece in &pieces {
+                let Some(j) = q_squashed[pos..].find(piece.as_str()) else {
+                    return false;
+                };
+                pos += j + piece.len();
+            }
+            true
+        });
+        assert!(
+            matched_in_lean,
+            "`{lean_file}` has no extracted block quote citing `{file}` that contains all pieces of `{genuine}`"
+        );
+    }
+}

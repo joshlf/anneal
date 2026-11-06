@@ -10,7 +10,7 @@ those terms.
 
 import Lean
 import MiniRustSpec.Anchors
-import MiniRustSpec.Correspondence.Witness
+import MiniRustSpec.Correspondence.IntrinsicBoundary
 
 /-!
 # Axiom audit
@@ -26,8 +26,10 @@ axioms of each declaration, so `lake build MiniRustSpec.Audit` doubles as the
 of declarations and logs one summary line per group, tagged `[ANCHOR-AUDIT]`
 (the anchors of the interpretation), `[SIMULATION-AUDIT]` (the
 correspondence theorems and the lemmas they rest on), or `[WITNESS-AUDIT]`
-(the concrete witnesses), ending in `sorry_free=true`. A group that depends on
-`sorryAx` or on any other non-standard axiom fails the build instead.
+(the concrete witnesses; a second and a third `[WITNESS-AUDIT]` line cover
+`Correspondence.IntrinsicFallback` and `Correspondence.IntrinsicBoundary`),
+ending in `sorry_free=true`. A group that depends on `sorryAx` or on any other
+non-standard axiom fails the build instead.
 -/
 
 namespace MiniRustSpec.Audit
@@ -82,8 +84,28 @@ open MiniRustSpec.LibSpecr in
 
 open MiniRustSpec.Correspondence in
 #assert_standard_axioms
-  translateBlocksInProg_get
-  translateBlocksInProg_append_get
+  unitPlace_eq_buildUnitPlace
+  abortTerminator_eq_buildAbort
+  unitType_eq_unitTy
+  mapGet_eq_of_mem_nodup
+  isAssume_iff
+  translateStmtResult_some
+  splitStmts_names
+  translateTerminatorInProg_names
+  nodup_map_bbName
+  bbName_range'_nodup
+  range'_append_of_le
+  mem_bbName_range'
+  translateBlocksInProg_names
+  splitStmts_segChain
+  translateBlocksInProg_segChain
+  SegChain.eq_last
+  statementOk_isAssume
+  splitStmts_statements
+  mapM_translateStmtResult_of_noAssume
+  evalPlace_derefFree_mach
+  evalPlace_rethread_derefFree
+  translatePlace_derefFree
   translateFnInProg_spec
   translateProgFns_get
   findCallee_idx
@@ -1127,6 +1149,21 @@ open MiniRustSpec.Correspondence.Witness in
   ordBoolCastTempMoveFalse_progress
   ordBoolCastTempMoveFalse_minirust_ret_from_start
   ordBoolCastTempMoveFalse_minirust_direct
+  evalIntrinsic_abort_exit
+  evalIntrinsic_assume
+  evalIntrinsic_print
+  evalIntrinsic_rawEq_withExposed
+  evalIntrinsic_exposeProvenance
+  evalIntrinsic_getUnwindPayload_empty
+  evalTerminator_abortTerminator
+  assumeSub_translate
+  assumeSub_translateInProg
+  assumeSub_not_inFragment
+  runsToScalar_sound
+  assumeSub20_anneal_ret
+  assumeSub20_minirust_direct
+  assumeSub20_split_point
+  assumeSubFalse_ub
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -1138,8 +1175,28 @@ open MiniRustSpec.Correspondence.Witness in
 
 open MiniRustSpec.Correspondence in
 #check_theorem_deps "[SIMULATION-AUDIT]"
-  translateBlocksInProg_get
-  translateBlocksInProg_append_get
+  unitPlace_eq_buildUnitPlace
+  abortTerminator_eq_buildAbort
+  unitType_eq_unitTy
+  mapGet_eq_of_mem_nodup
+  isAssume_iff
+  translateStmtResult_some
+  splitStmts_names
+  translateTerminatorInProg_names
+  nodup_map_bbName
+  bbName_range'_nodup
+  range'_append_of_le
+  mem_bbName_range'
+  translateBlocksInProg_names
+  splitStmts_segChain
+  translateBlocksInProg_segChain
+  SegChain.eq_last
+  statementOk_isAssume
+  splitStmts_statements
+  mapM_translateStmtResult_of_noAssume
+  evalPlace_derefFree_mach
+  evalPlace_rethread_derefFree
+  translatePlace_derefFree
   translateFnInProg_spec
   translateProgFns_get
   findCallee_idx
@@ -1959,6 +2016,180 @@ open MiniRustSpec.Correspondence.Witness in
   ordBoolCastTempMoveFalse_progress
   ordBoolCastTempMoveFalse_minirust_ret_from_start
   ordBoolCastTempMoveFalse_minirust_direct
+  evalIntrinsic_abort_exit
+  evalIntrinsic_assume
+  evalIntrinsic_print
+  evalIntrinsic_rawEq_withExposed
+  evalIntrinsic_exposeProvenance
+  evalIntrinsic_getUnwindPayload_empty
+  evalTerminator_abortTerminator
+  assumeSub_translate
+  assumeSub_translateInProg
+  assumeSub_not_inFragment
+  runsToScalar_sound
+  assumeSub20_anneal_ret
+  assumeSub20_minirust_direct
+  assumeSub20_split_point
+  assumeSubFalse_ub
+
+open MiniRustSpec.Correspondence in
+#check_theorem_deps "[WITNESS-AUDIT]"
+  fbCtxU32_ok_u8
+  fbCtxU32_ok_u32
+  fbCtxU32_ok_u32u32
+  fbCtxU8_ok_u8
+  fbCtxU8_ok_u8u8
+  fbCtxI8_ok_i8i8
+  fbRunsTo_sound
+  fb_forall_lt_of_all
+  fb_forall_mem_of_all
+  fb_returnRel_alloc
+  fb_minirust_ret
+  fb_minirust_of_runsTo
+  fbCtlz_inFragment
+  fbCtlz_translate
+  fbCtlzCaller_translateInProg
+  fbCtlz_check
+  fbCtlz_anneal_all
+  fbCtlz_minirust_all
+  fbCtlz128_anneal_ret
+  fbCtlz128_noUB
+  fbCtlz128_minirust_ret
+  fbCtlz128_minirust_direct
+  fbCttz_inFragment
+  fbCttz_translate
+  fbCttzCaller_translateInProg
+  fbCttz_check
+  fbCttz_anneal_all
+  fbCttz_minirust_all
+  fbCttz12_anneal_ret
+  fbCttz12_noUB
+  fbCttz12_minirust_ret
+  fbCttz12_minirust_direct
+  fbBswap_inFragment
+  fbBswap_translate
+  fbBswapCaller_translateInProg
+  fbBswap_check
+  fbBswap_anneal_samples
+  fbBswap_minirust_samples
+  fbBswapMid_anneal_ret
+  fbBswapMid_noUB
+  fbBswapMid_minirust_ret
+  fbBswapMid_minirust_direct
+  fbBitrev_inFragment
+  fbBitrev_translate
+  fbBitrevCaller_translateInProg
+  fbBitrev_check
+  fbBitrev_anneal_all
+  fbBitrev_minirust_all
+  fbBitrev35_anneal_ret
+  fbBitrev35_noUB
+  fbBitrev35_minirust_ret
+  fbBitrev35_minirust_direct
+  fbSatAdd_inFragment
+  fbSatAdd_translate
+  fbSatAddCaller_translateInProg
+  fbSatAdd_checkRow
+  fbSatAdd_checkGrid
+  fbSatAdd_anneal_row
+  fbSatAdd_anneal_grid
+  fbSatAdd_minirust_row
+  fbSatAdd_minirust_grid
+  fbSatAddOv_anneal_ret
+  fbSatAddOv_noUB
+  fbSatAddOv_minirust_ret
+  fbSatAddOv_minirust_direct
+  fbSatSub_inFragment
+  fbSatSub_translate
+  fbSatSubCaller_translateInProg
+  fbSatSub_checkRow
+  fbSatSub_checkCols
+  fbSatSub_checkGrid
+  fbSatSub_anneal_row
+  fbSatSub_anneal_cols
+  fbSatSub_anneal_grid
+  fbSatSub_minirust_row
+  fbSatSub_minirust_cols
+  fbSatSub_minirust_grid
+  fbSatSubMin_anneal_ret
+  fbSatSubMin_noUB
+  fbSatSubMin_minirust_ret
+  fbSatSubMin_minirust_direct
+  fbShl_inFragment
+  fbShr_inFragment
+  fbShl_translate
+  fbShr_translate
+  fbShlCaller_translateInProg
+  fbShrCaller_translateInProg
+  fbShl_checkRow
+  fbShl_checkSamples
+  fbShr_checkRow
+  fbShr_checkSamples
+  fbShl_anneal_row
+  fbShl_anneal_samples
+  fbShr_anneal_row
+  fbShr_anneal_samples
+  fbShl_minirust_row
+  fbShl_minirust_samples
+  fbShr_minirust_row
+  fbShr_minirust_samples
+  fbShl33_anneal_ret
+  fbShl33_noUB
+  fbShl33_minirust_ret
+  fbShl33_minirust_direct
+  fbShr63_anneal_ret
+  fbShr63_noUB
+  fbShr63_minirust_ret
+  fbShr63_minirust_direct
+  fbBlackBox_inFragment
+  fbBlackBox_translate
+  fbBlackBoxCaller_translateInProg
+  fbBlackBox_runA
+  fbBlackBox_argsOk
+  fbBlackBox_anneal_all
+  fbBlackBox_minirust_all
+  fbBlackBoxMid_anneal_ret
+  fbBlackBoxMid_noUB
+  fbBlackBoxMid_minirust_ret
+  fbBlackBoxMid_minirust_direct
+
+open MiniRustSpec.Correspondence in
+#check_theorem_deps "[WITNESS-AUDIT]"
+  bdNullaryOp_unsupported
+  bdUbChecks_step
+  bdUbChecks_not_noUB
+  bdNullaryOp_translateRvalue
+  bdUbChecks_rejected
+  bdCopy0_anneal_ret
+  bdCopy1_anneal_ret
+  bdCopy2_anneal_ret
+  bdCopy2_noUB
+  bdCopyZeroScalars_step
+  bdCopy_translateStatement
+  bdCopy_rejected
+  bdOffset1_anneal_ret
+  bdOffsetNeg1_anneal_ret
+  bdOffsetNeg1_noUB
+  bdOffset_rejected
+  bdArithOffset_extCall
+  bdMirCallReq_fields
+  bdWriteBytes_extCall
+  bdRawEq_extCall
+  bdColdPath_extCall
+  bdCtpop_extCall
+  bdExactDivI32_extCall
+  bdAbort_unsupported
+  bdExactDiv_param_types
+  bdExactDiv_same_request
+  bdExactDiv_decode
+  bdExactDiv_minirust_i32
+  bdExactDiv_minirust_u32
+  bdExtCallers_rejected
+  bdUnreach_anneal_ub
+  bdUnreach_anneal_fault
+  bd_minirust_unreachable_ub
+  bdUnreach_rejected
+  bdUnreachableTerminator_covered
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

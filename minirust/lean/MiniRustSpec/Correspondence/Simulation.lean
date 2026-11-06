@@ -4942,8 +4942,10 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
     ⟨_, List.getElem?_eq_getElem hrel.blk⟩
   have hbbmem : bb ∈ curBody.basicBlocks := List.mem_of_getElem? hbb
   obtain ⟨_, hstmts, htermOr⟩ := hbbs s.frame.blockIdx bb hbb
-  obtain ⟨tbStmts, tbTerm, nc1, nc2, ex1, hstMapM, htermTr, hgetb⟩ :=
+  obtain ⟨tbTerm, nc1, nc2, ex1, htermTr, hsegCur⟩ :=
     hBlocksCur s.frame.blockIdx bb hbb
+  obtain ⟨tbStmts, hgetb, hstMapM⟩ :=
+    hsegCur.eq_last (fun st hst => statementOk_isAssume (hstmts st hst))
   let tb : Gen.BasicBlock := ⟨tbStmts, tbTerm, .Regular⟩
   obtain ⟨hlen, hstspec⟩ := list_mapM_option_spec (translateStatement curBody.localDecls)
     bb.statements tbStmts hstMapM

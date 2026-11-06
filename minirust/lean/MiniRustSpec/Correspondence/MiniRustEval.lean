@@ -1032,7 +1032,7 @@ theorem evalPlace_localL {m : Mach} {ctx : Ctx} {f : Gen.Function} {lm : Map Gen
     evalPlace m (.Local (localName i)) =
       match mapGet lm (localName i) with
       | none => .error (.ub "access to a dead local")
-      | some p => .ok ({ ptr := { thin_pointer := p, metadata := none }, aligned := true }, T) := by
+      | some p => .ok (({ ptr := { thin_pointer := p, metadata := none }, aligned := true }, T), m) := by
   simp only [evalPlace, curFrame_eq h, mapIndex, calleeFrameL, hT, ok_bind]
   cases mapGet lm (localName i) <;> rfl
 
@@ -1042,7 +1042,7 @@ theorem evalPlace_local_some {m : Mach} {ctx : Ctx} {f : Gen.Function}
     (T : Gen.Type) (hT : mapGet f.locals (localName i) = some T) (p : Ptr)
     (hp : mapGet lm (localName i) = some p) :
     evalPlace m (.Local (localName i)) =
-      .ok ({ ptr := { thin_pointer := p, metadata := none }, aligned := true }, T) := by
+      .ok (({ ptr := { thin_pointer := p, metadata := none }, aligned := true }, T), m) := by
   rw [evalPlace_localL h i T hT, hp]
 
 theorem evalPlace_local_none {m : Mach} {ctx : Ctx} {f : Gen.Function}
@@ -1091,7 +1091,7 @@ theorem evalPlace_field0L {m : Mach} {ctx : Ctx} {f : Gen.Function}
     (hT : mapGet f.locals (localName i) = some (intBoolTupleTy it)) (p : Ptr)
     (hp : mapGet lm (localName i) = some p) (haddr : AddrOk p.addr it) :
     evalPlace m (.Field (.Local (localName i)) 0) =
-      .ok ({ ptr := { thin_pointer := p, metadata := none }, aligned := true }, .Int it) := by
+      .ok (({ ptr := { thin_pointer := p, metadata := none }, aligned := true }, .Int it), m) := by
   have hloc := evalPlace_local_some h i (intBoolTupleTy it) hT p hp
   have hin0 : inBounds (0 : Int) .Signed x86_64.PTR_SIZE = true := by decide
   have hinAddr : inBounds p.addr .Unsigned x86_64.PTR_SIZE = true :=
@@ -1100,7 +1100,7 @@ theorem evalPlace_field0L {m : Mach} {ctx : Ctx} {f : Gen.Function}
     simp [ptrOffsetInbounds, CM.signed_dereferenceable, BM.signed_dereferenceable,
       BM.dereferenceable, BM.check_ptr, hin0, hinAddr]
   rw [evalPlace]
-  simp [hloc, intBoolTupleTy, listIndex, Type.layout, head_size_and_align_tuple it hgood,
+  simp [hloc, fieldPlace, intBoolTupleTy, listIndex, Type.layout, head_size_and_align_tuple it hgood,
     computeSize, LayoutStrategy.compute_size_and_align, hptr, align_eq it hgood,
     LayoutStrategy.is_sized, ThinPointer.widen]
 
@@ -1113,7 +1113,7 @@ theorem evalPlace_field1L {m : Mach} {ctx : Ctx} {f : Gen.Function}
     (data : List Byte) (hA : m.mem.memory.allocations[k]? = some (stackAlloc p.addr it data))
     (hlen : data.length = it.size.bytes + it.size.bytes) (haddr : AddrOk p.addr it) :
     evalPlace m (.Field (.Local (localName i)) 1) =
-      .ok ({ ptr := { thin_pointer := field1Ptr p it, metadata := none }, aligned := true }, .Bool) := by
+      .ok (({ ptr := { thin_pointer := field1Ptr p it, metadata := none }, aligned := true }, .Bool), m) := by
   have hpos := hgood.pos
   obtain ⟨hkL, hAk⟩ := List.getElem?_eq_some_iff.mp hA
   have hloc := evalPlace_local_some h i (intBoolTupleTy it) hT p hp
@@ -1127,7 +1127,7 @@ theorem evalPlace_field1L {m : Mach} {ctx : Ctx} {f : Gen.Function}
       Allocation.size, hlen, hbounds, inBounds_goodSize_ptrSize it hgood, hinAddr]
   have hnotlt : ¬ (it.size.bytes + it.size.bytes < it.size.bytes) := by omega
   rw [evalPlace]
-  simp [hloc, intBoolTupleTy, listIndex, Type.layout, head_size_and_align_tuple it hgood,
+  simp [hloc, fieldPlace, intBoolTupleTy, listIndex, Type.layout, head_size_and_align_tuple it hgood,
     computeSize, LayoutStrategy.compute_size_and_align, hnotlt, hptr,
     LayoutStrategy.is_sized, ThinPointer.widen]
 
@@ -4852,34 +4852,6 @@ theorem mutateCurStack_append {m : Mach} {ctx : Ctx} {frames : List Frame}
       .ok ((), rethread m ctx (frames ++ [fr])) := by
   simp [mutateCurStack, activeThread, listIndex, h.threads, h.active, thread1, listSet, rethread]
 
-/-- `evalPlace` reads only `curFrame`, `prog.vtables`, `vtable_ptrs`, and `mem`,
-so replacing any stack prefix ending in `fr` with `[curCtx.caller, fr]` leaves
-`evalPlace` unchanged. -/
-theorem evalPlace_rethread (m : Mach) (rootCtx curCtx : Ctx) (pre : List Frame) (fr : Frame)
-    (hthr : m.threads = [thread1 rootCtx (pre ++ [fr])]) (hact : m.active_thread = 0) :
-    ∀ pe : Gen.PlaceExpr,
-      evalPlace (rethread m curCtx [curCtx.caller, fr]) pe = evalPlace m pe
-  | .Local name => by
-    have hc1 : curFrame (rethread m curCtx [curCtx.caller, fr]) = .ok fr :=
-      curFrame_eq ⟨rfl, hact, rfl⟩
-    have hc2 : curFrame m = .ok fr :=
-      curFrame_append ⟨hthr, hact, rfl⟩
-    simp [evalPlace, hc1, hc2]
-  | .Field root field => by
-    have ih := evalPlace_rethread m rootCtx curCtx pre fr hthr hact root
-    have hv : vtableLookup (rethread m curCtx [curCtx.caller, fr]) = vtableLookup m := rfl
-    have hca : computeAlign (rethread m curCtx [curCtx.caller, fr]) = computeAlign m := by
-      funext lay meta_
-      simp [computeAlign, hv]
-    have hcs : computeSize (rethread m curCtx [curCtx.caller, fr]) = computeSize m := by
-      funext lay meta_
-      simp [computeSize, hv]
-    have hpo : ptrOffsetInbounds (rethread m curCtx [curCtx.caller, fr]) = ptrOffsetInbounds m := rfl
-    simp [evalPlace, ih, hca, hcs, hpo]
-  | .Deref _ _ => rfl
-  | .Index _ _ => rfl
-  | .Downcast _ _ => rfl
-
 theorem placeLoad_rethread (m : Mach) (c : Ctx) (fs : List Frame) (pl : Gen.Place BM) (ty : Gen.Type) :
     (∀ v m2, placeLoad (rethread m c fs) pl ty = .ok (v, m2) →
       ∃ cm, m2 = { rethread m c fs with mem := cm } ∧
@@ -4944,6 +4916,79 @@ theorem placeStore_rethread (m : Mach) (c : Ctx) (fs : List Frame)
 
 mutual
 
+/-- `evalPlace` reads only `curFrame`, `prog.vtables`, `vtable_ptrs`, and `mem`
+(and, for `PlaceExpr::Deref`, whatever `evalValue` reads), so replacing any
+stack prefix ending in `fr` with `[curCtx.caller, fr]` changes neither its
+result nor its effect on memory. -/
+theorem evalPlace_rethread (pe : Gen.PlaceExpr) (m : Mach) (rootCtx curCtx : Ctx)
+    (pre : List Frame) (fr : Frame)
+    (hthr : m.threads = [thread1 rootCtx (pre ++ [fr])]) (hact : m.active_thread = 0) :
+    (∀ pt m2, evalPlace (rethread m curCtx [curCtx.caller, fr]) pe = .ok (pt, m2) →
+      ∃ cm, m2 = { rethread m curCtx [curCtx.caller, fr] with mem := cm } ∧
+        evalPlace m pe = .ok (pt, { m with mem := cm })) ∧
+    (∀ err, evalPlace (rethread m curCtx [curCtx.caller, fr]) pe = .error err →
+      evalPlace m pe = .error err) := by
+  match pe with
+  | .Local name =>
+    have hc1 : curFrame (rethread m curCtx [curCtx.caller, fr]) = .ok fr :=
+      curFrame_eq ⟨rfl, hact, rfl⟩
+    have hc2 : curFrame m = .ok fr :=
+      curFrame_append ⟨hthr, hact, rfl⟩
+    simp only [evalPlace, hc1, hc2, ok_bind]
+    cases hT : mapIndex fr.func.locals name "self.cur_frame().func.locals[name]" with
+    | error err => simp
+    | ok T =>
+      simp only [ok_bind]
+      cases mapGet fr.locals name with
+      | none => simp [ub]
+      | some p =>
+        refine ⟨fun pt m2 h => ?_, fun err h => by simp at h⟩
+        simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+        obtain ⟨rfl, rfl⟩ := h
+        exact ⟨m.mem, rfl, by cases m; rfl⟩
+  | .Deref operand ty =>
+    obtain ⟨hvok, hverr⟩ := evalValue_rethread operand m rootCtx curCtx pre fr hthr hact
+    simp only [evalPlace]
+    cases hev : evalValue (rethread m curCtx [curCtx.caller, fr]) operand with
+    | error err => simp [hverr err hev]
+    | ok vtm =>
+      obtain ⟨⟨val, opTy⟩, m1⟩ := vtm
+      obtain ⟨cm, rfl, hm1⟩ := hvok _ m1 hev
+      simp only [hm1, ok_bind]
+      have hd : ∀ ptr ptrType, derefPlace ({ rethread m curCtx [curCtx.caller, fr] with mem := cm } : Mach)
+          ptr ptrType ty = derefPlace { m with mem := cm } ptr ptrType ty := fun _ _ => rfl
+      cases val <;> cases opTy <;> try (simp [specPanic]; done)
+      rename_i ptr ptrType
+      simp only [hd]
+      cases hdp : derefPlace { m with mem := cm } ptr ptrType ty with
+      | error err => simp
+      | ok r =>
+        refine ⟨fun pt m2 h => ?_, fun err h => by simp at h⟩
+        simp only [ok_bind, pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+        obtain ⟨rfl, rfl⟩ := h
+        exact ⟨cm, rfl, rfl⟩
+  | .Field root field =>
+    obtain ⟨hrok, hrerr⟩ := evalPlace_rethread root m rootCtx curCtx pre fr hthr hact
+    simp only [evalPlace]
+    cases hep : evalPlace (rethread m curCtx [curCtx.caller, fr]) root with
+    | error err => simp [hrerr err hep]
+    | ok ptm =>
+      obtain ⟨⟨rp, ty⟩, m1⟩ := ptm
+      obtain ⟨cm, rfl, hm1⟩ := hrok _ m1 hep
+      simp only [hm1, ok_bind]
+      have hfp : fieldPlace ({ rethread m curCtx [curCtx.caller, fr] with mem := cm } : Mach)
+          rp ty field = fieldPlace { m with mem := cm } rp ty field := rfl
+      rw [hfp]
+      cases hf : fieldPlace { m with mem := cm } rp ty field with
+      | error err => simp
+      | ok r =>
+        refine ⟨fun pt m2 h => ?_, fun err h => by simp at h⟩
+        simp only [ok_bind, pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+        obtain ⟨rfl, rfl⟩ := h
+        exact ⟨cm, rfl, rfl⟩
+  | .Index _ _ | .Downcast _ _ =>
+    simp [evalPlace, unsupported]
+
 /-- Lifting `evalValue` from `[curCtx.caller, fr]` to an arbitrary stack prefix
 `pre ++ [fr]`. -/
 theorem evalValue_rethread (e : Gen.ValueExpr) (m : Mach) (rootCtx curCtx : Ctx)
@@ -4976,20 +5021,29 @@ theorem evalValue_rethread (e : Gen.ValueExpr) (m : Mach) (rootCtx curCtx : Ctx)
       obtain ⟨cm, rfl, hm1⟩ := hok vals m1 hev
       simp [hm1]
   | .Load source =>
-    have hpl := evalPlace_rethread m rootCtx curCtx pre fr hthr hact source
-    simp only [evalValue, hpl]
-    cases hep : evalPlace m source with
-    | error err => simp
-    | ok pt =>
-      obtain ⟨pl, ty⟩ := pt
-      obtain ⟨hlok, hlerr⟩ := placeLoad_rethread m curCtx [curCtx.caller, fr] pl ty
-      simp only [ok_bind]
-      cases hld : placeLoad (rethread m curCtx [curCtx.caller, fr]) pl ty with
+    obtain ⟨hpok, hperr⟩ := evalPlace_rethread source m rootCtx curCtx pre fr hthr hact
+    simp only [evalValue]
+    cases hep : evalPlace (rethread m curCtx [curCtx.caller, fr]) source with
+    | error err => simp [hperr err hep]
+    | ok ptm =>
+      obtain ⟨⟨pl, ty⟩, m1⟩ := ptm
+      obtain ⟨cm1, rfl, hpm⟩ := hpok _ m1 hep
+      simp only [hpm, ok_bind]
+      have hsub : ({ rethread m curCtx [curCtx.caller, fr] with mem := cm1 } : Mach) =
+          rethread { m with mem := cm1 } curCtx [curCtx.caller, fr] := rfl
+      rw [hsub]
+      obtain ⟨hlok, hlerr⟩ := placeLoad_rethread { m with mem := cm1 } curCtx [curCtx.caller, fr] pl ty
+      cases hld : placeLoad (rethread { m with mem := cm1 } curCtx [curCtx.caller, fr]) pl ty with
       | error err => simp [hlerr err hld]
       | ok vm =>
-        obtain ⟨v, m1⟩ := vm
-        obtain ⟨cm, rfl, hm1⟩ := hlok v m1 hld
-        simp [hm1]
+        obtain ⟨v, m2⟩ := vm
+        obtain ⟨cm, rfl, hm2⟩ := hlok v m2 hld
+        rw [mach_mem_mem] at hm2
+        simp only [hm2, ok_bind]
+        refine ⟨fun vt m3 h => ?_, fun err h => by simp at h⟩
+        simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+        obtain ⟨rfl, rfl⟩ := h
+        exact ⟨cm, rfl, rfl⟩
   | .UnOp op operand =>
     obtain ⟨hok, herr⟩ := evalValue_rethread operand m rootCtx curCtx pre fr hthr hact
     simp only [evalValue]
@@ -5073,6 +5127,77 @@ theorem evalValues_rethread (es : List Gen.ValueExpr) (m : Mach) (rootCtx curCtx
 
 end
 
+/-- Deref-free place expressions (`PlaceExpr::Local` and chains of
+`PlaceExpr::Field`): every place the fragment's statements, operands, call
+arguments, and call destinations translate to (`translatePlace`). Only
+`unit_place()` (an intrinsic's destination) dereferences. -/
+def derefFreePlace : Gen.PlaceExpr → Bool
+  | .Local _ => true
+  | .Field root _ => derefFreePlace root
+  | _ => false
+
+/-- A deref-free place evaluates without touching the machine. -/
+theorem evalPlace_derefFree_mach : ∀ (pe : Gen.PlaceExpr), derefFreePlace pe = true →
+    ∀ (m : Mach) r m', evalPlace m pe = .ok (r, m') → m' = m
+  | .Local name, _, m, r, m', h => by
+    simp only [evalPlace] at h
+    cases hcf : curFrame m with
+    | error e => simp [hcf] at h
+    | ok fr =>
+      simp only [hcf, ok_bind] at h
+      cases hT : mapIndex fr.func.locals name "self.cur_frame().func.locals[name]" with
+      | error e => simp [hT] at h
+      | ok T =>
+        simp only [hT, ok_bind] at h
+        split at h
+        · simp [ub] at h
+        · simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+          exact h.2.symm
+  | .Field root field, hdf, m, r, m', h => by
+    simp only [evalPlace] at h
+    cases hep : evalPlace m root with
+    | error e => simp [hep] at h
+    | ok ptm =>
+      obtain ⟨⟨rp, ty⟩, m1⟩ := ptm
+      have hm1 := evalPlace_derefFree_mach root (by simpa [derefFreePlace] using hdf) m _ _ hep
+      simp only [hep, ok_bind] at h
+      cases hf : fieldPlace m1 rp ty field with
+      | error e => simp [hf] at h
+      | ok r' =>
+        simp only [hf, ok_bind, pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+        rw [← h.2]
+        exact hm1
+  | .Deref _ _, hdf, _, _, _, _ => by simp [derefFreePlace] at hdf
+  | .Index _ _, hdf, _, _, _, _ => by simp [derefFreePlace] at hdf
+  | .Downcast _ _, hdf, _, _, _, _ => by simp [derefFreePlace] at hdf
+
+/-- For a deref-free place, `evalPlace` on any stack prefix ending in `fr`
+agrees with `evalPlace` on `[curCtx.caller, fr]`, up to the (unchanged)
+machine it returns. -/
+theorem evalPlace_rethread_derefFree (pe : Gen.PlaceExpr) (hdf : derefFreePlace pe = true)
+    (m : Mach) (rootCtx curCtx : Ctx) (pre : List Frame) (fr : Frame)
+    (hthr : m.threads = [thread1 rootCtx (pre ++ [fr])]) (hact : m.active_thread = 0) :
+    evalPlace m pe =
+      (evalPlace (rethread m curCtx [curCtx.caller, fr]) pe).map (fun r => (r.1, m)) := by
+  obtain ⟨hok, herr⟩ := evalPlace_rethread pe m rootCtx curCtx pre fr hthr hact
+  cases h : evalPlace (rethread m curCtx [curCtx.caller, fr]) pe with
+  | error e => simp [herr e h, Except.map]
+  | ok r =>
+    obtain ⟨pt, m2⟩ := r
+    obtain ⟨cm, _, hpm⟩ := hok pt m2 h
+    have hm := evalPlace_derefFree_mach pe hdf m _ _ hpm
+    rw [hm] at hpm
+    simp [hpm, Except.map]
+
+theorem translatePlace_derefFree {p : Place} {pe : Gen.PlaceExpr}
+    (h : translatePlace p = some pe) : derefFreePlace pe = true := by
+  match p, h with
+  | ⟨j, []⟩, h => simp [translatePlace] at h; subst h; rfl
+  | ⟨j, [.field f _]⟩, h => simp [translatePlace] at h; subst h; rfl
+  | ⟨_, [.deref]⟩, h | ⟨_, [.index _]⟩, h | ⟨_, [.constantIndex _ _ _]⟩, h
+  | ⟨_, [.subslice _ _ _]⟩, h | ⟨_, [.downcast _ _]⟩, h | ⟨_, [.opaqueCast _]⟩, h
+  | ⟨_, _ :: _ :: _⟩, h => simp [translatePlace] at h
+
 private theorem tryMutateCurFrame_rethread_aux (m : Mach) (rootCtx curCtx : Ctx)
     (pre : List Frame) (fr : Frame)
     (hthr : m.threads = [thread1 rootCtx (pre ++ [fr])]) (hact : m.active_thread = 0)
@@ -5133,21 +5258,27 @@ theorem evalStatement_rethread (st : Gen.Statement) (m : Mach) (rootCtx curCtx :
       evalStatement m st = .error err) := by
   match st with
   | .Assign dst src =>
-    have hpl := evalPlace_rethread m rootCtx curCtx pre fr hthr hact dst
-    simp only [evalStatement, hpl]
-    cases hep : evalPlace m dst with
-    | error err => simp
-    | ok pt =>
-      obtain ⟨pl, ty⟩ := pt
-      obtain ⟨hvok, hverr⟩ := evalValue_rethread src m rootCtx curCtx pre fr hthr hact
-      simp only [ok_bind]
-      cases hev : evalValue (rethread m curCtx [curCtx.caller, fr]) src with
+    obtain ⟨hpok, hperr⟩ := evalPlace_rethread dst m rootCtx curCtx pre fr hthr hact
+    simp only [evalStatement]
+    cases hep : evalPlace (rethread m curCtx [curCtx.caller, fr]) dst with
+    | error err => simp [hperr err hep]
+    | ok ptm =>
+      obtain ⟨⟨pl, ty⟩, m0⟩ := ptm
+      obtain ⟨cm0, rfl, hpm⟩ := hpok _ m0 hep
+      simp only [hpm, ok_bind]
+      have hsub0 : ({ rethread m curCtx [curCtx.caller, fr] with mem := cm0 } : Mach) =
+          rethread { m with mem := cm0 } curCtx [curCtx.caller, fr] := rfl
+      rw [hsub0]
+      obtain ⟨hvok, hverr⟩ :=
+        evalValue_rethread src { m with mem := cm0 } rootCtx curCtx pre fr hthr hact
+      cases hev : evalValue (rethread { m with mem := cm0 } curCtx [curCtx.caller, fr]) src with
       | error err => simp [hverr err hev]
       | ok vtm1 =>
         obtain ⟨⟨val, _⟩, m1⟩ := vtm1
         obtain ⟨cm1, rfl, hm1⟩ := hvok _ m1 hev
-        have hsub : ({ rethread m curCtx [curCtx.caller, fr] with mem := cm1 } : Mach) =
-            rethread { m with mem := cm1 } curCtx [curCtx.caller, fr] := rfl
+        rw [mach_mem_mem] at hm1
+        have hsub : ({ rethread { m with mem := cm0 } curCtx [curCtx.caller, fr] with
+            mem := cm1 } : Mach) = rethread { m with mem := cm1 } curCtx [curCtx.caller, fr] := rfl
         rw [hsub]
         obtain ⟨hsok, hserr⟩ :=
           placeStore_rethread { m with mem := cm1 } curCtx [curCtx.caller, fr] pl val ty
@@ -5169,18 +5300,22 @@ theorem evalStatement_rethread (st : Gen.Statement) (m : Mach) (rootCtx curCtx :
           rw [hre0]
           exact ⟨hms, ⟨hthr, hact, hsh2.allocs⟩, rfl, rfl⟩
   | .PlaceMention pl =>
-    have hpl := evalPlace_rethread m rootCtx curCtx pre fr hthr hact pl
-    simp only [evalStatement, hpl]
-    cases hep : evalPlace m pl with
-    | error err => simp
-    | ok _ =>
+    obtain ⟨hpok, hperr⟩ := evalPlace_rethread pl m rootCtx curCtx pre fr hthr hact
+    simp only [evalStatement]
+    cases hep : evalPlace (rethread m curCtx [curCtx.caller, fr]) pl with
+    | error err => simp [hperr err hep]
+    | ok ptm =>
+      obtain ⟨pt, m0⟩ := ptm
+      obtain ⟨cm0, rfl, hpm⟩ := hpok _ m0 hep
+      simp only [hpm, ok_bind]
       refine ⟨fun m2 fr' A' hm2 hsh2 => ?_, fun err herr => by simp at herr⟩
-      simp at hm2
+      simp only [pure, Except.pure, Except.ok.injEq] at hm2
       subst hm2
       have hfrEq := frame_eq_of_shape rfl hsh2
       cases hfrEq
-      have hre : rethread (rethread m curCtx [curCtx.caller, fr]) rootCtx (pre ++ [fr]) = m :=
-        rethread_with_mem_eq (curCtx := curCtx) hthr m.mem
+      have hre : rethread { rethread m curCtx [curCtx.caller, fr] with mem := cm0 } rootCtx
+          (pre ++ [fr]) = { m with mem := cm0 } :=
+        rethread_with_mem_eq (curCtx := curCtx) hthr cm0
       rw [hre]
       exact ⟨rfl, ⟨hthr, hact, hsh2.allocs⟩, rfl, rfl⟩
   | .StorageLive loc =>
@@ -5190,13 +5325,14 @@ theorem evalStatement_rethread (st : Gen.Statement) (m : Mach) (rootCtx curCtx :
     exact tryMutateCurFrame_rethread_aux m rootCtx curCtx pre fr hthr hact
       (fun f cm => storageDead f cm loc)
   | .Deinit pl =>
-    have hpl := evalPlace_rethread m rootCtx curCtx pre fr hthr hact pl
-    simp only [evalStatement, hpl]
-    cases hep : evalPlace m pl with
-    | error err => simp
-    | ok pt =>
-      obtain ⟨p, ty⟩ := pt
-      simp only [ok_bind]
+    obtain ⟨hpok, hperr⟩ := evalPlace_rethread pl m rootCtx curCtx pre fr hthr hact
+    simp only [evalStatement]
+    cases hep : evalPlace (rethread m curCtx [curCtx.caller, fr]) pl with
+    | error err => simp [hperr err hep]
+    | ok ptm =>
+      obtain ⟨⟨p, ty⟩, m0⟩ := ptm
+      obtain ⟨cm0, rfl, hpm⟩ := hpok _ m0 hep
+      simp only [hpm, ok_bind]
       by_cases hal : !p.aligned
       · simp [hal, ub]
       · simp only [hal, Bool.false_eq_true, ↓reduceIte]
@@ -5207,18 +5343,19 @@ theorem evalStatement_rethread (st : Gen.Statement) (m : Mach) (rootCtx curCtx :
           | error err => simp [hsz]
           | ok sz =>
             simp only [hsz, ok_bind]
-            have hmem : (rethread m curCtx [curCtx.caller, fr]).mem = m.mem := rfl
-            rw [hmem]
-            cases hdi : CM.deinit m.mem p.ptr.thin_pointer sz ⟨1⟩ with
+            cases hdi : CM.deinit cm0 p.ptr.thin_pointer sz ⟨1⟩ with
             | error err => simp
             | ok cm2 =>
               simp only [ok_bind]
               refine ⟨fun m2 fr' A' hm2 hsh2 => ?_, fun err herr => by simp at herr⟩
-              simp at hm2
+              simp only [pure, Except.pure, Except.ok.injEq] at hm2
               subst hm2
               have hfrEq := frame_eq_of_shape rfl hsh2
               cases hfrEq
-              rw [rethread_with_mem_eq (curCtx := curCtx) hthr cm2]
+              have hre : rethread { { rethread m curCtx [curCtx.caller, fr] with mem := cm0 } with
+                  mem := cm2 } rootCtx (pre ++ [fr]) = { m with mem := cm2 } :=
+                rethread_with_mem_eq (curCtx := curCtx) hthr cm2
+              rw [hre]
               exact ⟨rfl, ⟨hthr, hact, hsh2.allocs⟩, rfl, rfl⟩
   | .SetDiscriminant _ _ | .Validate _ _ =>
     simp [evalStatement, unsupported]
@@ -5549,7 +5686,7 @@ theorem evalCallRet_spec {callerBody : CapturedMir} {callerFn : Gen.Function}
           callerView[dst]? = some (.init (.aggregate 0 [.scalar sc0, .scalar sc1]))
       | _ => False) :
     ∃ retPlace m1 view1,
-      evalPlace m retExpr = .ok (retPlace, tyOf calleeRetDecl) ∧
+      evalPlace m retExpr = .ok ((retPlace, tyOf calleeRetDecl), m) ∧
       prepareForInplacePassing m retPlace (tyOf calleeRetDecl) = .ok m1 ∧
       Shape m1 rootCtx
         (callerFrames ++ [calleeFrameL callerFn callerCtx callerLm blk stmt])
@@ -5564,8 +5701,9 @@ theorem evalCallRet_spec {callerBody : CapturedMir} {callerFn : Gen.Function}
       [callerCtx.caller, fr] m.mem.memory.allocations :=
     ⟨rfl, hsh.active, hsh.allocs⟩
   have hplEq : evalPlace m retExpr =
-      evalPlace (rethread m callerCtx [callerCtx.caller, fr]) retExpr :=
-    (evalPlace_rethread m rootCtx callerCtx callerFrames fr hsh.threads hsh.active retExpr).symm
+      (evalPlace (rethread m callerCtx [callerCtx.caller, fr]) retExpr).map (fun r => (r.1, m)) :=
+    evalPlace_rethread_derefFree retExpr (translatePlace_derefFree hret) m rootCtx callerCtx
+      callerFrames fr hsh.threads hsh.active
   match destination, hret, hdstLive, hdestOk with
   | ⟨dst, []⟩, hret, hdstLive, ⟨d, hd, hsame⟩ =>
     simp only [translatePlace, Option.some.injEq] at hret
@@ -5583,7 +5721,7 @@ theorem evalCallRet_spec {callerBody : CapturedMir} {callerFn : Gen.Function}
     obtain ⟨k, hpk, _, haddr, _, hA⟩ := hlo.storage dst d vSlot p hd hvSlot hp
     have hplaceR := evalPlace_local_some hshR dst (tyOf d) (hf.2 dst d hd).2 p hp
     have hplace : evalPlace m (.Local (localName dst)) =
-        .ok ({ ptr := ThinPointer.widen p none, aligned := true }, tyOf calleeRetDecl) := by
+        .ok (({ ptr := ThinPointer.widen p none, aligned := true }, tyOf calleeRetDecl), m) := by
       rw [hplEq, hplaceR, ← hTyEq]
       rfl
     have hlen := declSlotData_length hdSc vSlot
@@ -5617,7 +5755,7 @@ theorem evalCallRet_spec {callerBody : CapturedMir} {callerFn : Gen.Function}
     rw [hitd] at haddr
     have hplaceR := evalPlace_field0L hshR dst it hgood hloc p hp haddr
     have hplace : evalPlace m (.Field (.Local (localName dst)) 0) =
-        .ok ({ ptr := ThinPointer.widen p none, aligned := true }, tyOf calleeRetDecl) := by
+        .ok (({ ptr := ThinPointer.widen p none, aligned := true }, tyOf calleeRetDecl), m) := by
       rw [hplEq, hplaceR, hRetTd]
       rfl
     have hprep := prepareForInplacePassing_ptr_field0 (m := m) hpk hgood sc0.bits sc1.bits hA haddr
@@ -5652,11 +5790,14 @@ theorem evalCallRet_spec {callerBody : CapturedMir} {callerFn : Gen.Function}
     have hlen := tupleBytes_length it sc0.bits sc1.bits hgood.pos
     have hplaceR : evalPlace (rethread m callerCtx [callerCtx.caller, fr])
         (.Field (.Local (localName dst)) 1) =
-        .ok ({ ptr := ThinPointer.widen (field1Ptr p it) none, aligned := true }, .Bool) :=
+        .ok (({ ptr := ThinPointer.widen (field1Ptr p it) none, aligned := true }, .Bool),
+          rethread m callerCtx [callerCtx.caller, fr]) :=
       evalPlace_field1L hshR dst it hgood hloc p hp k hpk _ hA hlen haddr
     have hplace : evalPlace m (.Field (.Local (localName dst)) 1) =
-        .ok ({ ptr := ThinPointer.widen (field1Ptr p it) none, aligned := true }, tyOf calleeRetDecl) := by
+        .ok (({ ptr := ThinPointer.widen (field1Ptr p it) none, aligned := true },
+          tyOf calleeRetDecl), m) := by
       rw [hplEq, hplaceR, hRetTd]
+      rfl
     have hprep := prepareForInplacePassing_ptr_field1 (m := m) hpk hgood sc0.bits sc1.bits hA
     rw [← hRetTd] at hprep
     let m1 := withMem m
@@ -6278,20 +6419,20 @@ theorem evalArgument_spec {callerBody : CapturedMir} {callerFn : Gen.Function}
     obtain ⟨hTyEq, _, _, _⟩ := sameFragmentTy_spec (hsame d hd)
     have hspec := hf.2 j d hd
     have hslotOk := hdest.slots j d slot hd hvs
-    have hplEq := (evalPlace_rethread m rootCtx callerCtx callerFrames fr hsh.threads hsh.active
-      (.Local (localName j))).symm
+    have hplEq := evalPlace_rethread_derefFree (.Local (localName j)) rfl m rootCtx callerCtx
+      callerFrames fr hsh.threads hsh.active
     cases hp : mapGet callerLm (localName j) with
     | none =>
       have hdead := hdest.dead_of_none hvs hp
       subst hdead
       refine ⟨fun v hv => by simp [callArgVal, has] at hv, fun _ => ?_⟩
       have hplR := evalPlace_local_none hshR j (tyOf d) hspec.2 hp
-      exact ⟨"access to a dead local", by simp [evalArgument, evalValue, hplEq, hplR]⟩
+      exact ⟨"access to a dead local", by simp [evalArgument, evalValue, hplEq, hplR, Except.map]⟩
     | some p =>
       obtain ⟨id, hpid, _, hA⟩ := hdest.storage_ne hjNeDst hd hvs hp
       have hplR := evalPlace_local_some hshR j (tyOf d) hspec.2 p hp
       have hpl : evalPlace m (.Local (localName j)) =
-          .ok ({ ptr := ThinPointer.widen p none, aligned := true }, tyOf pd) := by
+          .ok (({ ptr := ThinPointer.widen p none, aligned := true }, tyOf pd), m) := by
         rw [hplEq, hplR, ← hTyEq]; rfl
       cases slot with
       | dead =>
@@ -6332,20 +6473,20 @@ theorem evalArgument_spec {callerBody : CapturedMir} {callerFn : Gen.Function}
     obtain ⟨hTyEq, _, _, _⟩ := sameFragmentTy_spec (hsame d hd)
     have hspec := hf.2 j d hd
     have hslotOk := hdest.slots j d slot hd hvs
-    have hplEq := (evalPlace_rethread m rootCtx callerCtx callerFrames fr hsh.threads hsh.active
-      (.Local (localName j))).symm
+    have hplEq := evalPlace_rethread_derefFree (.Local (localName j)) rfl m rootCtx callerCtx
+      callerFrames fr hsh.threads hsh.active
     cases hp : mapGet callerLm (localName j) with
     | none =>
       have hdead := hdest.dead_of_none hvs hp
       subst hdead
       refine ⟨fun v hv => by simp [callArgVal, has] at hv, fun _ => ?_⟩
       have hplR := evalPlace_local_none hshR j (tyOf d) hspec.2 hp
-      exact ⟨"access to a dead local", by simp [evalArgument, hplEq, hplR]⟩
+      exact ⟨"access to a dead local", by simp [evalArgument, hplEq, hplR, Except.map]⟩
     | some p =>
       obtain ⟨id, hpid, haddr, hA⟩ := hdest.storage_ne hjNeDst hd hvs hp
       have hplR := evalPlace_local_some hshR j (tyOf d) hspec.2 p hp
       have hpl : evalPlace m (.Local (localName j)) =
-          .ok ({ ptr := ThinPointer.widen p none, aligned := true }, tyOf pd) := by
+          .ok (({ ptr := ThinPointer.widen p none, aligned := true }, tyOf pd), m) := by
         rw [hplEq, hplR, ← hTyEq]; rfl
       cases slot with
       | dead =>
@@ -6415,22 +6556,22 @@ theorem evalArgument_spec {callerBody : CapturedMir} {callerFn : Gen.Function}
     have hspec := hf.2 j d hd
     have hloc := hspec.2; rw [hTd] at hloc
     have hslotOk := hdest.slots j d slot hd hvs; rw [hTd] at hslotOk
-    have hplEq := (evalPlace_rethread m rootCtx callerCtx callerFrames fr hsh.threads hsh.active
-      (.Field (.Local (localName j)) 0)).symm
+    have hplEq := evalPlace_rethread_derefFree (.Field (.Local (localName j)) 0) rfl m rootCtx callerCtx
+      callerFrames fr hsh.threads hsh.active
     cases hp : mapGet callerLm (localName j) with
     | none =>
       have hdead := hdest.dead_of_none hvs hp
       subst hdead
       refine ⟨fun v hv => by simp [callArgVal, has] at hv, fun _ => ?_⟩
       exact ⟨"access to a dead local",
-        by simp [evalArgument, evalValue, hplEq, evalPlace_field_none hshR j _ hloc hp]⟩
+        by simp [evalArgument, evalValue, hplEq, evalPlace_field_none hshR j _ hloc hp, Except.map]⟩
     | some p =>
       obtain ⟨id, hpid, haddr, hA⟩ := hdest.storage_ne hjNeDst hd hvs hp
       rw [declSlotData_of_some hdTup, hitd] at hA
       rw [hitd] at haddr
       have hplR := evalPlace_field0L hshR j it hgood hloc p hp haddr
       have hpl : evalPlace m (.Field (.Local (localName j)) 0) =
-          .ok ({ ptr := ThinPointer.widen p none, aligned := true }, .Int it) := by
+          .ok (({ ptr := ThinPointer.widen p none, aligned := true }, .Int it), m) := by
         rw [hplEq, hplR]; rfl
       match slot, hslotOk, hA with
       | .dead, _, hA =>
@@ -6473,15 +6614,15 @@ theorem evalArgument_spec {callerBody : CapturedMir} {callerFn : Gen.Function}
     have hspec := hf.2 j d hd
     have hloc := hspec.2; rw [hTd] at hloc
     have hslotOk := hdest.slots j d slot hd hvs; rw [hTd] at hslotOk
-    have hplEq := (evalPlace_rethread m rootCtx callerCtx callerFrames fr hsh.threads hsh.active
-      (.Field (.Local (localName j)) 1)).symm
+    have hplEq := evalPlace_rethread_derefFree (.Field (.Local (localName j)) 1) rfl m rootCtx callerCtx
+      callerFrames fr hsh.threads hsh.active
     cases hp : mapGet callerLm (localName j) with
     | none =>
       have hdead := hdest.dead_of_none hvs hp
       subst hdead
       refine ⟨fun v hv => by simp [callArgVal, has] at hv, fun _ => ?_⟩
       exact ⟨"access to a dead local",
-        by simp [evalArgument, evalValue, hplEq, evalPlace_field_none hshR j _ hloc hp]⟩
+        by simp [evalArgument, evalValue, hplEq, evalPlace_field_none hshR j _ hloc hp, Except.map]⟩
     | some p =>
       obtain ⟨id, hpid, haddr, hA⟩ := hdest.storage_ne hjNeDst hd hvs hp
       rw [declSlotData_of_some hdTup, hitd] at hA
@@ -6489,7 +6630,7 @@ theorem evalArgument_spec {callerBody : CapturedMir} {callerFn : Gen.Function}
       have hlen := tupleSlotData_length it slot hgood.pos
       have hplR := evalPlace_field1L hshR j it hgood hloc p hp id hpid _ hA hlen haddr
       have hpl : evalPlace m (.Field (.Local (localName j)) 1) =
-          .ok ({ ptr := ThinPointer.widen (field1Ptr p it) none, aligned := true }, .Bool) := by
+          .ok (({ ptr := ThinPointer.widen (field1Ptr p it) none, aligned := true }, .Bool), m) := by
         rw [hplEq, hplR]; rfl
       match slot, hslotOk, hA with
       | .dead, _, hA =>

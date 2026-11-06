@@ -124,9 +124,11 @@ functions needed to run the fragment below on `Machine<BasicMemory<x86_64>>`:
 `Machine::step` (single enabled thread),
 `Statement::{Assign, PlaceMention, StorageLive, StorageDead, Deinit}` (with
 `StackFrame::{storage_live, storage_dead}` and `ConcurrentMemory::deinit`),
-`PlaceExpr::{Local, Field}` (`PlaceExpr::Field` indexing `(offset, field_ty)`
+`PlaceExpr::{Local, Field, Deref}` (`PlaceExpr::Field` indexing `(offset, field_ty)`
 and offsetting the pointer via `Machine::ptr_offset_inbounds` and
-`ConcurrentMemory::signed_dereferenceable` / `BasicMemory::signed_dereferenceable`),
+`ConcurrentMemory::signed_dereferenceable` / `BasicMemory::signed_dereferenceable`;
+`PlaceExpr::Deref` evaluating its operand, checking a safe pointee's alignment
+and dereferenceability, and recording whether the place is aligned),
 `ValueExpr::{Constant, Load, Tuple, UnOp, BinOp}` (`ValueExpr::Tuple` evaluating
 each field expression in order and returning `(Value::Tuple(fields), ty)`, while
 `check_value` and `Type::encode` validate field count and field values against
@@ -144,12 +146,18 @@ variants, through `Machine::eval_rel_op`) on integers and Booleans (pointer
 comparison is `unsupported`),
 `Constant::{Int, Bool, FnPointer, GlobalPointer, VTablePointer,
 PointerWithoutProvenance}` and `Machine::fn_from_ptr`,
-`Terminator::{Goto, Switch, Call, Return, Unreachable}` (including
+`Terminator::{Goto, Switch, Call, Return, Unreachable, Intrinsic}` (including
 `check_abi_compatibility` across all 7 `Type` variants,
 `Machine::prepare_for_inplace_passing`, `Machine::eval_argument` for `ByValue`
 and `InPlace`, `Machine::create_frame`, `Machine::eval_call`,
 `Machine::mutate_cur_stack`, frame teardown, and both `StackPopAction`s
-`BottomOfStack` and `BackToCaller`), the representation relation
+`BottomOfStack` and `BackToCaller`; for `Terminator::Intrinsic`,
+`Machine::eval_intrinsic` on `Exit` (with `ConcurrentMemory::leak_check`),
+`Abort`, `Assume`, `PrintStdout`, `PrintStderr`, `Allocate`, `Deallocate`,
+`PointerExposeProvenance` (with `IntPtrCast::expose`), and
+`GetUnwindPayload`, plus the argument and return-type checks of `RawEq` and
+`PointerWithExposedProvenance`, which then report `Stop.unsupported`, as do the
+thread, lock, and atomic intrinsics), the representation relation
 (`Type::{decode, encode}`) for `Int`, `Bool`, sized `Tuple`, `Union`, `Enum`
 (through `decode_discriminant` and `encode_discriminant`), `Slice`, and
 `TraitObject`, `check_value` for those types, `Type::layout` across all 9 `Type`
@@ -173,11 +181,13 @@ vendored source file, and `crates/anneal-minirust-gen/tests/quotes.rs` parses
 every Lean doc comment (`/-! ... -/` and `/-- ... -/`) and checks each quoted
 substring against its cited vendored file (ignoring only whitespace and `//`
 comments; `..` marks elided code). Effects are
-`Except Stop` with `Stop.ub` (`throw_ub!`), `Stop.deadlock`, `Stop.specPanic`
-(a panic in the spec, which upstream calls a spec bug), and
-`Stop.unsupported` (outside the interpreted fragment; never silently wrong).
+`Except Stop` with `Stop.ub` (`throw_ub!`), `Stop.abort` (`throw_abort!`),
+`Stop.machineStop` (`throw_machine_stop!`), `Stop.memoryLeak`
+(`throw_memory_leak!`), `Stop.deadlock`, `Stop.specPanic` (a panic in the
+spec, which upstream calls a spec bug), and `Stop.unsupported` (outside the
+interpreted fragment; never silently wrong).
 
-`Anchors.lean` lists the 61 upstream items that `Interp.lean` transcribes,
+`Anchors.lean` lists the 78 upstream items that `Interp.lean` transcribes,
 each with its file path, item name, line, and token hash, and proves by `decide`
 that the generated model contains them unchanged (`anchors_ok`) with no
 duplicate entries (`anchors_nodup`). Re-pinning MiniRust therefore breaks
@@ -487,6 +497,54 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `evalReturn_missingNextBlock_and_bottomOfStack_ub` directly verify every
   transcribed MR-4.1 spec item, while `progStart_outside_fragment` shows why
   the theorems start at `fEntry.start` rather than `prog.start`.
+* `evalIntrinsic_*`, `evalTerminator_abortTerminator`, and `assumeSub`
+  (MR-4.2): direct checks of every transcribed `eval_intrinsic` arm (`Abort`,
+  `Exit`, each UB check of `Assume`, `PrintStdout`/`PrintStderr` output and
+  UB, `PointerExposeProvenance`, and the checks that precede `unsupported` in
+  `RawEq` and `PointerWithExposedProvenance`) and of `build::abort()`; and
+  `assumeSub`, a body with two `Assume` statements in one MIR block, whose
+  translation (`assumeSub_translateInProg`) splits that block into three
+  MiniRust blocks joined by `Terminator::Intrinsic` of `IntrinsicOp::Assume`.
+  `assumeSub` is outside `progInFragment` (`assumeSub_not_inFragment`), so both
+  semantics are computed directly: for `(20, true)` Anneal returns `19u32`
+  without UB (`assumeSub20_anneal_ret`) and MiniRust writes the bytes of `19u32`
+  in 5 steps (`assumeSub20_minirust_direct`), with MIR point `(bb0, 1)` matching
+  the start of the fresh MiniRust block `bbName 2` (`assumeSub20_split_point`);
+  for `(20, false)` both raise UB at the first `Assume` (`assumeSubFalse_ub`).
+* `Correspondence/IntrinsicFallback.lean` (MR-4.2): calls to
+  `core::intrinsics::{ctlz, cttz, bswap, bitreverse, saturating_add,
+  saturating_sub, black_box}` and `u32::{wrapping_shl, wrapping_shr}` whose
+  callee is a hand-written fallback body in `callees` are ordinary direct calls
+  of the MR-4.1 fragment (`fb*_inFragment`). Each body is checked against a
+  pure Lean reference (`fb*Spec`) by kernel-evaluated Anneal runs
+  (exhaustively over all 256 inputs for `ctlz`, `cttz`, and `bitreverse`; for
+  every `u32` input of `black_box`; over full rows, columns, and boundary grids
+  for the saturating operations; over every shift amount below 64 for one
+  value of the shifts; and over sampled inputs for `bswap`), transferred to
+  MiniRust by `mirCallWithCallees_ret` (`fb*_minirust_*`) and cross-checked by
+  direct `Interp.steps` runs. Upstream `minimize` aborts with `span_bug!` on
+  calls to these seven intrinsics (`translate_rs_intrinsic` has no arm for
+  them); the witnesses relate Anneal to the MiniRust program that calls the
+  fallback body instead.
+* `Correspondence/IntrinsicBoundary.lean` (MR-4.2): kernel-checked boundary
+  witnesses for the intrinsic constructs outside the fragment, each proving
+  Anneal's behavior on a concrete state and the translation's or fragment
+  check's rejection. `Rvalue::NullaryOp(UbChecks)` is `unsupported` in Anneal
+  (`bdUbChecks_step`) but a session-fixed `bool` constant in `minimize`.
+  `CopyNonOverlapping` aborts `minimize` (`span_bug!`), while Anneal executes
+  it and returns normally even for a two-element `u32` copy between two
+  4-byte locals (`bdCopy2_noUB`). Anneal's `BinOp::Offset` adds the raw count
+  without scaling or bounds checks (`bdOffsetNeg1_noUB`). Calls to
+  `core::intrinsics::{write_bytes, raw_eq, cold_path, ctpop, exact_div,
+  arith_offset}` without a body are Anneal external calls whose `MirCallReq`
+  carries no types, so `exact_div::<i32>(-6, 3)` and
+  `exact_div::<u32>(4294967290, 3)` issue the same request although MiniRust's
+  `DivExact` returns `-2` for the first and raises UB for the second
+  (`bdExactDiv_same_request`, `bdExactDiv_minirust_i32`,
+  `bdExactDiv_minirust_u32`); the diverging `abort` call is `unsupported`
+  (`bdAbort_unsupported`); and a `core::hint::unreachable_unchecked()` call is
+  UB in Anneal, like MiniRust's `Terminator::Unreachable`
+  (`bdUnreach_anneal_ub`, `bd_minirust_unreachable_ub`).
 * `tempMove`, `crossBlockMove`, `loopTempMove`, `storageLiveArgRet`,
   `diamondMoveJoin`, `tupleAggCastMove`, and `ordBoolCastTempMove` (MR-1.3):
   `tempMove` is
@@ -724,8 +782,9 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   and unsized `Tuple` layouts and `specPanic`s (`layout_slice`, ...,
   `checkValue_unsized_panics`).
 
-`Audit.lean` logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, and
-`[WITNESS-AUDIT]` lines ending in `sorry_free=true` (via
+`Audit.lean` logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, and three
+`[WITNESS-AUDIT]` lines (`Witness`, `IntrinsicFallback`, and
+`IntrinsicBoundary`) ending in `sorry_free=true` (via
 `#check_theorem_deps`, which also rejects duplicate declaration names and
 non-`theorem` constants) and fails the build if any listed declaration depends
 on `sorryAx` or a non-standard axiom.
@@ -770,11 +829,11 @@ These are deliberate and are the first things to lift:
   (`never_ub_of_nonUb_stop`).
 * **`prog.start` is not modeled.** `mkStartFn` transcribes `minimize`'s
   `mk_start_fn`, which calls the entry with `CallingConvention::Rust`, no
-  arguments, and a `()` return place built by `build::unit_place()`. The
-  interpretation reports that `PlaceExpr::Deref` as `unsupported`, and the call
-  would fail `create_frame` anyway for any entry that takes arguments, returns
-  a non-`()` type, or has `CallConv.c` (`progStart_outside_fragment` checks
-  this for `callerMain` and `cAbiCallee`). The correspondence theorems
+  arguments, and a `()` return place built by `build::unit_place()`. That
+  `PlaceExpr::Deref` now evaluates (to the aligned, zero-sized place at address
+  `1`), but the call fails `create_frame` for any entry that takes arguments,
+  returns a non-`()` type, or has `CallConv.c` (`progStart_outside_fragment`
+  checks this for `callerMain` and `cAbiCallee`). The correspondence theorems
   therefore start at `fEntry.start` under an external `rootCtx` that supplies
   the arguments and a return place of the entry's own type.
 * **Branch observations.** Anneal's `switchInt` emits the scrutinee as a
@@ -797,6 +856,20 @@ These are deliberate and are the first things to lift:
   reads and writes, but not nested or general multi-field tuples). There are no
   user pointers, references, other aggregates, other casts, drops, or
   assertions.
+* **Intrinsics (MR-4.2, in progress).** `translateFnInProg` splits blocks at
+  `Assume` statements exactly like `minimize`'s `translate_bb` (`SegChain`,
+  `translateFnInProg_spec`), but `bodyInProgFragment` still requires
+  `statementOk`, so no fragment body contains an `Assume` and the simulation
+  theorems relate MIR block `b` to MiniRust block `bbName b` one to one
+  (`SegChain.eq_last`); `assumeSub` is checked by direct computation instead.
+  Compiler intrinsics called through `TerminatorKind.call` to a `DefPath`
+  outside `callees` (`ctpop`, `exact_div`, `abort`, `cold_path`, ...) are
+  Anneal external calls (`MirStepNode.extCall`), which `MultiStepRel` does not
+  relate, and `minimize`'s `translate_rs_intrinsic` lowerings of them are not
+  transcribed. `Rvalue::NullaryOp(UbChecks)`, `CopyNonOverlapping`,
+  `arith_offset`/`BinOp::Offset`, `write_bytes`, and `raw_eq` are outside the
+  fragment (pointers are); `IntrinsicBoundary` records how Anneal and
+  `minimize` treat each of them.
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.

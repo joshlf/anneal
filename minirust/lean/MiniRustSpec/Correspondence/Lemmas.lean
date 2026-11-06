@@ -401,81 +401,335 @@ theorem sameFragmentTy_spec {d1 d2 : LocalDecl} (h : sameFragmentTy d1.ty d2.ty 
           ⟨.Int it1, scalarTypeOf_int hi1, scalarTypeOf_int hi2⟩, fun slot => ?_⟩
         rw [declSlotData_of_none hnt1, declSlotData_of_none hnt2, hit1, hit2]
 
-theorem translateBlocksInProg_get (fnMap : FnMap)
-    (decls : List LocalDecl) (k nextC : Nat) (bbs : List BasicBlockData)
-    (B extra : List (Gen.BbName × Gen.BasicBlock))
-    (h : translateBlocksInProg fnMap decls k nextC bbs = some (B, extra))
-    (j : Nat) (bb : BasicBlockData) (hb : bbs[j]? = some bb) :
-    ∃ stmts term nc1 nc2 ex1,
-      bb.statements.mapM (translateStatement decls) = some stmts ∧
-      translateTerminatorInProg fnMap decls nc1 bb.terminator = some (term, nc2, ex1) ∧
-      mapGet ⟨B⟩ (bbName (k + j)) = some ⟨stmts, term, .Regular⟩ := by
-  induction bbs generalizing k nextC B extra j with
-  | nil => simp at hb
-  | cons bb' bbs ih =>
+/-! ### Block layout of `translateFnInProg` (`splitStmts`, `SegChain`) -/
+
+theorem mapGet_eq_of_mem_nodup {K V : Type} [DecidableEq K] {es : List (K × V)} {k : K} {v : V}
+    (hnd : (es.map Prod.fst).Nodup) (hmem : (k, v) ∈ es) : mapGet ⟨es⟩ k = some v := by
+  induction es with
+  | nil => simp at hmem
+  | cons e es ih =>
+    obtain ⟨k', v'⟩ := e
+    simp only [List.map_cons, List.nodup_cons] at hnd
+    rw [mapGet_cons]
+    rcases List.mem_cons.mp hmem with h | h
+    · simp only [Prod.mk.injEq] at h
+      obtain ⟨rfl, rfl⟩ := h
+      simp
+    · have hne : k' ≠ k := fun heq => hnd.1 (heq ▸ List.mem_map.mpr ⟨(k, v), h, rfl⟩)
+      simp only [hne, ↓reduceIte]
+      exact ih hnd.2 h
+
+theorem isAssume_iff (s : MirAst.Statement) :
+    isAssume s = true ↔ ∃ op, s.kind = .intrinsic (.assume op) := by
+  unfold isAssume
+  split
+  · next op heq => exact ⟨fun _ => ⟨op, heq⟩, fun _ => rfl⟩
+  · next hne => exact ⟨fun h => absurd h (by simp), fun ⟨op, hop⟩ => absurd hop (hne op)⟩
+
+/-- The two shapes of `translateStmtResult`: an ordinary statement translated
+by `translateStatement`, or an `Assume` that ends the current block. -/
+theorem translateStmtResult_some {decls : List LocalDecl} {s : MirAst.Statement}
+    {r : StatementResult} (h : translateStmtResult decls s = some r) :
+    (isAssume s = false ∧ ∃ s', translateStatement decls s = some s' ∧ r = .statement s') ∨
+    (∃ op op', s.kind = .intrinsic (.assume op) ∧ translateOperand op = some op' ∧
+      r = .intrinsic .Assume unitPlace [op']) := by
+  by_cases ha : ∃ op, s.kind = .intrinsic (.assume op)
+  · obtain ⟨op, hk⟩ := ha
+    simp only [translateStmtResult, hk] at h
+    obtain ⟨op', hop, rfl⟩ := Option.map_eq_some_iff.mp h
+    exact .inr ⟨op, op', hk, hop, rfl⟩
+  · have hna : isAssume s = false := by
+      cases hb : isAssume s with
+      | false => rfl
+      | true => exact absurd ((isAssume_iff s).mp hb) ha
+    have heq : translateStmtResult decls s = (translateStatement decls s).map .statement := by
+      unfold translateStmtResult
+      split
+      · next op heq => exact absurd ⟨op, heq⟩ ha
+      · rfl
+    rw [heq] at h
+    obtain ⟨s', hs', rfl⟩ := Option.map_eq_some_iff.mp h
+    exact .inl ⟨hna, s', hs', rfl⟩
+
+/-- `splitStmts` closes the open block `cur` and then takes the fresh names
+`nc, nc + 1, ..` in order: the names of the finished blocks followed by the
+name of the block left open are `cur` and those fresh names. -/
+theorem splitStmts_names (cur : Gen.BbName) (acc : List Gen.Statement) (nc : Nat)
+    (rs : List StatementResult) :
+    nc ≤ (splitStmts cur acc nc rs).2.2.2 ∧
+    (splitStmts cur acc nc rs).2.2.1.map Prod.fst ++ [(splitStmts cur acc nc rs).1] =
+      cur :: (List.range' nc ((splitStmts cur acc nc rs).2.2.2 - nc)).map bbName := by
+  induction rs generalizing cur acc nc with
+  | nil => simp [splitStmts]
+  | cons r rest ih =>
+    cases r with
+    | statement s => simpa [splitStmts] using ih cur (acc ++ [s]) nc
+    | intrinsic op dest args =>
+      obtain ⟨h1, h2⟩ := ih (bbName nc) [] (nc + 1)
+      simp only [splitStmts]
+      refine ⟨by omega, ?_⟩
+      simp only [List.map_cons, List.cons_append]
+      rw [h2]
+      have hlen : (splitStmts (bbName nc) [] (nc + 1) rest).2.2.2 - nc =
+          ((splitStmts (bbName nc) [] (nc + 1) rest).2.2.2 - (nc + 1)) + 1 := by omega
+      rw [hlen, List.range'_succ]
+      simp
+
+/-- The cleanup blocks of `translateTerminatorInProg` take the fresh names
+`nc, nc + 1, ..` (at most one, for a call's unwind action). -/
+theorem translateTerminatorInProg_names {fnMap : FnMap} {decls : List LocalDecl} {nc : Nat}
+    {t : MirAst.Terminator} {term : Gen.Terminator} {nc' : Nat}
+    {ex : List (Gen.BbName × Gen.BasicBlock)}
+    (h : translateTerminatorInProg fnMap decls nc t = some (term, nc', ex)) :
+    nc ≤ nc' ∧ ex.map Prod.fst = (List.range' nc (nc' - nc)).map bbName := by
+  unfold translateTerminatorInProg at h
+  cases hk : t.kind
+  case call func argOps destination target unwind =>
+    simp only [hk, Option.bind_eq_bind] at h
+    cases hdp : extractFnDefPath func <;> simp only [hdp, Option.bind_none, Option.bind_some] at h
+    · cases h
+    rename_i dp
+    cases hlk : lookupFnTarget fnMap dp <;> simp only [hlk, Option.bind_none, Option.bind_some] at h
+    · cases h
+    rename_i fc
+    cases ha : argOps.mapM translateCallArg <;> simp only [ha, Option.bind_none, Option.bind_some] at h
+    · cases h
+    cases hr : translatePlace destination <;> simp only [hr, Option.bind_none, Option.bind_some] at h
+    · cases h
+    cases unwind <;> simp [translateUnwindAction] at h <;> obtain ⟨_, rfl, rfl⟩ := h <;> simp
+  all_goals
+    simp only [hk, Option.bind_eq_bind] at h
+    cases ht : translateTerminator decls t <;> simp only [ht, Option.bind_none, Option.bind_some] at h
+    · cases h
+    simp only [pure, Option.some.injEq, Prod.mk.injEq] at h
+    obtain ⟨_, rfl, rfl⟩ := h
+    simp
+
+theorem nodup_map_bbName {l : List Nat} (h : l.Nodup) : (l.map bbName).Nodup := by
+  induction l with
+  | nil => simp
+  | cons x xs ih =>
+    rw [List.nodup_cons] at h
+    rw [List.map_cons, List.nodup_cons]
+    refine ⟨fun hm => h.1 ?_, ih h.2⟩
+    obtain ⟨y, hy, hxy⟩ := List.mem_map.mp hm
+    rw [bbName_inj] at hxy
+    exact hxy ▸ hy
+
+theorem bbName_range'_nodup (a n : Nat) : ((List.range' a n).map bbName).Nodup :=
+  nodup_map_bbName (by simpa using List.nodup_range' (s := a) (n := n))
+
+theorem range'_append_of_le {a b c : Nat} (h1 : a ≤ b) (h2 : b ≤ c) :
+    List.range' a (b - a) ++ List.range' b (c - b) = List.range' a (c - a) := by
+  have := List.range'_append (s := a) (m := b - a) (n := c - b) (step := 1)
+  simp only [Nat.one_mul] at this
+  rw [show a + (b - a) = b by omega, show b - a + (c - b) = c - a by omega] at this
+  exact this
+
+theorem mem_bbName_range' {x : Gen.BbName} {a n : Nat} :
+    x ∈ (List.range' a n).map bbName ↔ ∃ c, a ≤ c ∧ c < a + n ∧ x = bbName c := by
+  simp only [List.mem_map, List.mem_range']
+  constructor
+  · rintro ⟨c, ⟨i, hi, rfl⟩, rfl⟩
+    exact ⟨a + i, by omega, by omega, by simp⟩
+  · rintro ⟨c, h1, h2, rfl⟩
+    exact ⟨c, ⟨c - a, by omega, by omega⟩, rfl⟩
+
+/-- `translateBlocksInProg` names each MIR block's first segment after the MIR
+block and takes every other block name from the fresh range `nc, nc + 1, ..`,
+so the names are pairwise distinct and each is either a MIR block name
+`bbName (k + j)` or a fresh name `bbName c` with `nc ≤ c`. -/
+theorem translateBlocksInProg_names {fnMap : FnMap} {decls : List LocalDecl} :
+    ∀ (k nc : Nat) (bbs : List BasicBlockData) (B extra : List (Gen.BbName × Gen.BasicBlock)),
+      translateBlocksInProg fnMap decls k nc bbs = some (B, extra) →
+      k + bbs.length ≤ nc →
+      ((B ++ extra).map Prod.fst).Nodup ∧
+      ∀ e ∈ B ++ extra,
+        (∃ j, j < bbs.length ∧ e.1 = bbName (k + j)) ∨ (∃ c, nc ≤ c ∧ e.1 = bbName c)
+  | k, nc, [], B, extra, h, _ => by
+    simp [translateBlocksInProg] at h
+    obtain ⟨rfl, rfl⟩ := h
+    simp
+  | k, nc, bb :: bbs, B, extra, h, hk => by
     simp only [translateBlocksInProg, Option.bind_eq_bind] at h
-    cases hst : bb'.statements.mapM (translateStatement decls) with
-    | none => simp [hst] at h
-    | some stmts' =>
-      cases htm : translateTerminatorInProg fnMap decls nextC bb'.terminator with
-      | none => simp [hst, htm] at h
+    cases hres : bb.statements.mapM (translateStmtResult decls) with
+    | none => simp [hres] at h
+    | some results =>
+      simp only [hres, Option.bind_some] at h
+      obtain ⟨hsp1, hsp2⟩ := splitStmts_names (bbName k) [] nc results
+      generalize hsp : splitStmts (bbName k) [] nc results = sp at hsp1 hsp2 h
+      cases htm : translateTerminatorInProg fnMap decls sp.2.2.2 bb.terminator with
+      | none => simp [htm] at h
       | some trep =>
-        obtain ⟨term', nextC', extra1⟩ := trep
-        cases hrest : translateBlocksInProg fnMap decls (k + 1) nextC' bbs with
-        | none => simp [hst, htm, hrest] at h
+        obtain ⟨term, nc', ex1⟩ := trep
+        obtain ⟨htm1, htm2⟩ := translateTerminatorInProg_names htm
+        simp only [htm, Option.bind_some] at h
+        cases hrest : translateBlocksInProg fnMap decls (k + 1) nc' bbs with
+        | none => simp [hrest] at h
         | some rrep =>
           obtain ⟨rest, extraRest⟩ := rrep
-          simp [hst, htm, hrest] at h
+          simp only [hrest, Option.bind_some, pure, Option.some.injEq, Prod.mk.injEq] at h
+          obtain ⟨rfl, rfl⟩ := h
+          simp only [List.length_cons] at hk
+          obtain ⟨ihNd, ihMem⟩ :=
+            translateBlocksInProg_names (k + 1) nc' bbs rest extraRest hrest (by omega)
+          let segs : List (Gen.BbName × Gen.BasicBlock) :=
+            sp.2.2.1 ++ [(sp.1, ⟨sp.2.1, term, .Regular⟩)]
+          have hsegNames : (segs ++ ex1).map Prod.fst =
+              bbName k :: (List.range' nc (nc' - nc)).map bbName := by
+            have h1 : segs.map Prod.fst = bbName k :: (List.range' nc (sp.2.2.2 - nc)).map bbName := by
+              simpa [segs, List.map_append] using hsp2
+            rw [List.map_append, h1, htm2, List.cons_append, ← List.map_append,
+              range'_append_of_le hsp1 htm1]
+          have hperm : List.Perm (((segs ++ rest) ++ (ex1 ++ extraRest)).map Prod.fst)
+              ((bbName k :: (List.range' nc (nc' - nc)).map bbName) ++
+                (rest ++ extraRest).map Prod.fst) := by
+            rw [← hsegNames, ← List.map_append]
+            apply List.Perm.map
+            simp only [List.append_assoc]
+            exact List.Perm.append_left segs (List.perm_append_comm_assoc rest ex1 extraRest)
+          have hRestBound : ∀ x ∈ (rest ++ extraRest).map Prod.fst,
+              (∃ j, j < bbs.length ∧ x = bbName (k + 1 + j)) ∨ (∃ c, nc' ≤ c ∧ x = bbName c) := by
+            intro x hx
+            obtain ⟨e, he, rfl⟩ := List.mem_map.mp hx
+            exact ihMem e he
+          refine ⟨hperm.nodup_iff.mpr ?_, ?_⟩
+          · rw [List.nodup_append]
+            refine ⟨?_, ihNd, ?_⟩
+            · rw [List.nodup_cons]
+              refine ⟨fun hmem => ?_, bbName_range'_nodup nc (nc' - nc)⟩
+              obtain ⟨c, hc1, _, hc⟩ := mem_bbName_range'.mp hmem
+              rw [bbName_inj] at hc
+              omega
+            · intro x hx y hy hxy
+              subst hxy
+              rcases hRestBound x hy with ⟨j, hj, hx'⟩ | ⟨c, hc, hx'⟩
+              · rcases List.mem_cons.mp hx with hx0 | hx0
+                · rw [hx0, bbName_inj] at hx'; omega
+                · obtain ⟨c, hc1, hc2, hc⟩ := mem_bbName_range'.mp hx0
+                  rw [hc, bbName_inj] at hx'; omega
+              · rcases List.mem_cons.mp hx with hx0 | hx0
+                · rw [hx0, bbName_inj] at hx'; omega
+                · obtain ⟨c', hc1, hc2, hc'⟩ := mem_bbName_range'.mp hx0
+                  rw [hc', bbName_inj] at hx'; omega
+          · intro e he
+            have he' : e.1 ∈ ((segs ++ rest) ++ (ex1 ++ extraRest)).map Prod.fst :=
+              List.mem_map.mpr ⟨e, he, rfl⟩
+            rcases List.mem_append.mp (hperm.mem_iff.mp he') with hx | hx
+            · rcases List.mem_cons.mp hx with hx0 | hx0
+              · exact .inl ⟨0, by simp, by simpa using hx0⟩
+              · obtain ⟨c, hc1, _, hc⟩ := mem_bbName_range'.mp hx0
+                exact .inr ⟨c, hc1, hc⟩
+            · rcases hRestBound e.1 hx with ⟨j, hj, hx'⟩ | ⟨c, hc, hx'⟩
+              · exact .inl ⟨j + 1, by simp; omega, by rw [hx']; congr 1; omega⟩
+              · exact .inr ⟨c, by omega, hx'⟩
+
+/-- `splitStmts` lays out the statements still to be processed as a
+`SegChain` from the open block `cur` on, provided every block it finishes and
+the block it leaves open (completed with `term`) can be looked up; `pre` are
+the statements already pushed onto the open block (translated to `acc`). -/
+theorem splitStmts_segChain {look : Gen.BbName → Option Gen.BasicBlock}
+    {decls : List LocalDecl} {term : Gen.Terminator} :
+    ∀ (ss : List MirAst.Statement) (rs : List StatementResult) (cur : Gen.BbName)
+      (pre : List MirAst.Statement) (acc : List Gen.Statement) (nc : Nat),
+      ss.mapM (translateStmtResult decls) = some rs →
+      pre.mapM (translateStatement decls) = some acc →
+      (∀ s ∈ pre, isAssume s = false) →
+      (∀ e ∈ (splitStmts cur acc nc rs).2.2.1 ++
+          [((splitStmts cur acc nc rs).1, ⟨(splitStmts cur acc nc rs).2.1, term, .Regular⟩)],
+        look e.1 = some e.2) →
+      SegChain look decls term cur (pre ++ ss)
+  | [], rs, cur, pre, acc, nc, hrs, hpre, hna, hlook => by
+    simp only [List.mapM_nil, Option.pure_def, Option.some.injEq] at hrs
+    subst hrs
+    have hl := hlook (cur, ⟨acc, term, .Regular⟩) (by simp [splitStmts])
+    simpa using SegChain.last hl hpre hna
+  | s :: ss, rs, cur, pre, acc, nc, hrs, hpre, hna, hlook => by
+    simp only [List.mapM_cons, Option.bind_eq_bind] at hrs
+    cases hr : translateStmtResult decls s with
+    | none => simp [hr] at hrs
+    | some r =>
+      cases hrest : ss.mapM (translateStmtResult decls) with
+      | none => simp [hr, hrest] at hrs
+      | some rs' =>
+        simp only [hr, hrest, Option.bind_some, Option.pure_def, Option.some.injEq] at hrs
+        subst hrs
+        rcases translateStmtResult_some hr with ⟨hna1, s', hs', rfl⟩ | ⟨op, op', hk, hop, rfl⟩
+        · have hpre' : (pre ++ [s]).mapM (translateStatement decls) = some (acc ++ [s']) := by
+            rw [List.mapM_append, hpre]
+            simp [hs']
+          have hna' : ∀ x ∈ pre ++ [s], isAssume x = false := by
+            intro x hx
+            rcases List.mem_append.mp hx with h | h
+            · exact hna x h
+            · simp only [List.mem_singleton] at h
+              subst h
+              exact hna1
+          have := splitStmts_segChain ss rs' cur (pre ++ [s]) (acc ++ [s']) nc hrest hpre' hna'
+            (by simpa [splitStmts] using hlook)
+          simpa using this
+        · have hl0 := hlook (cur, ⟨acc, .Intrinsic .Assume [op'] unitPlace (some (bbName nc)),
+            .Regular⟩) (by simp [splitStmts])
+          have hrestChain := splitStmts_segChain ss rs' (bbName nc) [] [] (nc + 1) hrest rfl
+            (by simp) (fun e he => hlook e (by
+              simp only [splitStmts, List.cons_append, List.mem_cons]
+              exact .inr he))
+          exact SegChain.split hl0 hpre hna hk hop (by simpa using hrestChain)
+
+/-- Every MIR block's statements are laid out as a `SegChain` from the block's
+own name on, ending in the block's translated terminator. -/
+theorem translateBlocksInProg_segChain {fnMap : FnMap} {decls : List LocalDecl}
+    {look : Gen.BbName → Option Gen.BasicBlock} :
+    ∀ (k nc : Nat) (bbs : List BasicBlockData) (B extra : List (Gen.BbName × Gen.BasicBlock)),
+      translateBlocksInProg fnMap decls k nc bbs = some (B, extra) →
+      (∀ e ∈ B, look e.1 = some e.2) →
+      ∀ (j : Nat) (bb : BasicBlockData), bbs[j]? = some bb →
+        ∃ term nc1 nc2 ex1,
+          translateTerminatorInProg fnMap decls nc1 bb.terminator = some (term, nc2, ex1) ∧
+          SegChain look decls term (bbName (k + j)) bb.statements
+  | _, _, [], _, _, _, _, j, _, hb => by simp at hb
+  | k, nc, bb' :: bbs, B, extra, h, hlook, j, bb, hb => by
+    simp only [translateBlocksInProg, Option.bind_eq_bind] at h
+    cases hres : bb'.statements.mapM (translateStmtResult decls) with
+    | none => simp [hres] at h
+    | some results =>
+      simp only [hres, Option.bind_some] at h
+      generalize hsp : splitStmts (bbName k) [] nc results = sp at h
+      cases htm : translateTerminatorInProg fnMap decls sp.2.2.2 bb'.terminator with
+      | none => simp [htm] at h
+      | some trep =>
+        obtain ⟨term, nc', ex1⟩ := trep
+        simp only [htm, Option.bind_some] at h
+        cases hrest : translateBlocksInProg fnMap decls (k + 1) nc' bbs with
+        | none => simp [hrest] at h
+        | some rrep =>
+          obtain ⟨rest, extraRest⟩ := rrep
+          simp only [hrest, Option.bind_some, pure, Option.some.injEq, Prod.mk.injEq] at h
           obtain ⟨rfl, rfl⟩ := h
           cases j with
           | zero =>
-            simp at hb; subst hb
-            exact ⟨stmts', term', nextC, nextC', extra1, hst, htm, by simp [mapGet_cons]⟩
+            simp only [List.getElem?_cons_zero, Option.some.injEq] at hb
+            subst hb
+            refine ⟨term, sp.2.2.2, nc', ex1, htm, ?_⟩
+            have := splitStmts_segChain (look := look) (term := term) bb'.statements results
+              (bbName k) [] [] nc hres rfl (by simp) (by
+                rw [hsp]
+                intro e he
+                exact hlook e (List.mem_append.mpr (.inl he)))
+            simpa using this
           | succ j =>
-            simp at hb
-            obtain ⟨stmts, term, nc1, nc2, ex1, hs, ht, hget⟩ :=
-              ih (k + 1) nextC' rest extraRest hrest j hb
-            refine ⟨stmts, term, nc1, nc2, ex1, hs, ht, ?_⟩
-            rw [mapGet_cons]
-            split
-            · next heq => rw [bbName_inj] at heq; omega
-            · rw [show k + (j + 1) = k + 1 + j by omega]; exact hget
-
-theorem translateBlocksInProg_append_get (fnMap : FnMap)
-    (decls : List LocalDecl) (k nextC : Nat) (bbs : List BasicBlockData)
-    (B extra : List (Gen.BbName × Gen.BasicBlock))
-    (h : translateBlocksInProg fnMap decls k nextC bbs = some (B, extra))
-    (m : Nat) (hm : k + bbs.length ≤ m) (ib : Gen.BasicBlock)
-    (tail : List (Gen.BbName × Gen.BasicBlock)) :
-    mapGet ⟨B ++ [(bbName m, ib)] ++ tail⟩ (bbName m) = some ib := by
-  induction bbs generalizing k nextC B extra with
-  | nil =>
-    simp [translateBlocksInProg] at h
-    obtain ⟨rfl, rfl⟩ := h
-    simp [mapGet_cons]
-  | cons bb bbs ih =>
-    simp only [translateBlocksInProg, Option.bind_eq_bind] at h
-    cases hst : bb.statements.mapM (translateStatement decls) with
-    | none => simp [hst] at h
-    | some stmts =>
-      cases htm : translateTerminatorInProg fnMap decls nextC bb.terminator with
-      | none => simp [hst, htm] at h
-      | some trep =>
-        obtain ⟨term, nextC', extra1⟩ := trep
-        cases hrest : translateBlocksInProg fnMap decls (k + 1) nextC' bbs with
-        | none => simp [hst, htm, hrest] at h
-        | some rrep =>
-          obtain ⟨rest, extraRest⟩ := rrep
-          simp [hst, htm, hrest] at h
-          obtain ⟨rfl, rfl⟩ := h
-          simp only [List.cons_append, mapGet_cons]
-          split
-          · next heq => rw [bbName_inj] at heq; simp at hm; omega
-          · simpa [List.append_assoc] using ih (k + 1) nextC' rest extraRest hrest (by simp at hm; omega)
+            simp only [List.getElem?_cons_succ] at hb
+            obtain ⟨term2, nc1, nc2, ex2, htm2, hseg⟩ :=
+              translateBlocksInProg_segChain (k + 1) nc' bbs rest extraRest hrest
+                (fun e he => hlook e (List.mem_append.mpr (.inr he))) j bb hb
+            refine ⟨term2, nc1, nc2, ex2, htm2, ?_⟩
+            rw [show k + (j + 1) = k + 1 + j by omega]
+            exact hseg
 
 /-- What `translateFnInProg` produces: `FnLocalsSpec`, calling convention and
-argument list, `initBlock` at `f.start`, and block lookup for every MIR basic
-block. -/
+argument list, `initBlock` at `f.start`, and, for every MIR basic block, the
+`SegChain` layout of its statements (split at every `Assume`) ending in its
+translated terminator. -/
 theorem translateFnInProg_spec (fnMap : FnMap)
     (body : CapturedMir) (f : Gen.Function) (h : translateFnInProg fnMap body = some f) :
     FnLocalsSpec body f ∧
@@ -484,10 +738,10 @@ theorem translateFnInProg_spec (fnMap : FnMap)
     f.start = bbName body.basicBlocks.length ∧
     mapGet f.blocks (bbName body.basicBlocks.length) = some (initBlock body) ∧
     (∀ (i : Nat) bb, body.basicBlocks[i]? = some bb →
-      ∃ stmts term nc1 nc2 ex1,
-        bb.statements.mapM (translateStatement body.localDecls) = some stmts ∧
-        translateTerminatorInProg fnMap body.localDecls nc1 bb.terminator = some (term, nc2, ex1) ∧
-        mapGet f.blocks (bbName i) = some ⟨stmts, term, .Regular⟩) := by
+      ∃ term nc1 nc2 ex1,
+        translateTerminatorInProg fnMap body.localDecls nc1 bb.terminator =
+          some (term, nc2, ex1) ∧
+        SegChain (mapGet f.blocks) body.localDecls term (bbName i) bb.statements) := by
   simp only [translateFnInProg, Option.bind_eq_bind] at h
   cases hC : translateCallConv body.fnAbi.conv with
   | none => simp [hC] at h
@@ -502,21 +756,57 @@ theorem translateFnInProg_spec (fnMap : FnMap)
         obtain ⟨B, extra⟩ := brep
         simp [hC, hL, hB] at h
         subst h
+        obtain ⟨hnd, hmem⟩ := translateBlocksInProg_names 0 (body.basicBlocks.length + 1)
+          body.basicBlocks B extra hB (by omega)
+        have hinit : bbName body.basicBlocks.length ∉ (B ++ extra).map Prod.fst := by
+          intro hm
+          obtain ⟨e, he, heq⟩ := List.mem_map.mp hm
+          rcases hmem e he with ⟨j, hj, hj'⟩ | ⟨c, hc, hc'⟩
+          · rw [heq, bbName_inj] at hj'; omega
+          · rw [heq, bbName_inj] at hc'; omega
+        have hall : ((B ++ (bbName body.basicBlocks.length, initBlock body) :: extra).map
+            Prod.fst).Nodup := by
+          have hperm : List.Perm
+              ((B ++ (bbName body.basicBlocks.length, initBlock body) :: extra).map Prod.fst)
+              (bbName body.basicBlocks.length :: (B ++ extra).map Prod.fst) := by
+            simp only [List.map_append, List.map_cons]
+            exact List.perm_middle
+          rw [hperm.nodup_iff, List.nodup_cons]
+          exact ⟨hinit, hnd⟩
         refine ⟨⟨rfl, ?_⟩, rfl, rfl, rfl, ?_, ?_⟩
         · intro i d hd
           obtain ⟨T, hT, hget⟩ := translateLocals_get 0 body.localDecls L hL i d hd
           rw [tyOf_of_scalarTypeOf hT]
           exact ⟨hT, by simpa using hget⟩
-        · simpa using translateBlocksInProg_append_get fnMap body.localDecls 0
-            (body.basicBlocks.length + 1) body.basicBlocks B extra hB
-            body.basicBlocks.length (by omega) (initBlock body) extra
+        · exact mapGet_eq_of_mem_nodup hall (by simp)
         · intro i bb hbb
-          obtain ⟨stmts, term, nc1, nc2, ex1, hs, ht, hget⟩ :=
-            translateBlocksInProg_get fnMap body.localDecls 0 (body.basicBlocks.length + 1)
-              body.basicBlocks B extra hB i bb hbb
-          refine ⟨stmts, term, nc1, nc2, ex1, hs, ht, ?_⟩
-          apply mapGet_append_of_some
-          simpa using hget
+          have := translateBlocksInProg_segChain (look := mapGet
+              ⟨B ++ (bbName body.basicBlocks.length, initBlock body) :: extra⟩)
+            0 (body.basicBlocks.length + 1) body.basicBlocks B extra hB
+            (fun e he => mapGet_eq_of_mem_nodup hall (List.mem_append.mpr (.inl he))) i bb hbb
+          simpa using this
+
+/-- A `SegChain` over statements none of which is an `Assume` is a single
+segment: block `name` holds their translations followed by `term`. -/
+theorem SegChain.eq_last {look : Gen.BbName → Option Gen.BasicBlock}
+    {decls : List LocalDecl} {term : Gen.Terminator} {name : Gen.BbName}
+    {ss : List MirAst.Statement} (h : SegChain look decls term name ss)
+    (hna : ∀ s ∈ ss, isAssume s = false) :
+    ∃ stmts, look name = some ⟨stmts, term, .Regular⟩ ∧
+      ss.mapM (translateStatement decls) = some stmts := by
+  cases h with
+  | last hlook htr _ => exact ⟨_, hlook, htr⟩
+  | split _ _ _ hs _ _ =>
+    have h1 := hna _ (List.mem_append_right _ List.mem_cons_self)
+    simp [isAssume, hs] at h1
+
+/-- Single-body fragment statements (`statementOk`) are never `Assume`. -/
+theorem statementOk_isAssume {decls : List LocalDecl} {s : MirAst.Statement}
+    (h : statementOk decls s = true) : isAssume s = false := by
+  obtain ⟨kind, span⟩ := s
+  cases kind with
+  | intrinsic i => simp [statementOk] at h
+  | _ => rfl
 
 theorem translateProgFns_get (fnMap : FnMap)
     (k : Nat) (bs : List CapturedMir) (F : List (Gen.FnName × Gen.Function))
@@ -750,12 +1040,40 @@ theorem translateTerminatorInProg_eq_of_not_call (fnMap : FnMap)
   case call func args dst tgt unw =>
     exact absurd hk (hnc func args dst tgt unw)
 
-/-- When `bbs` contains no `.call` terminators, `translateBlocksInProg` agrees
-with `translateBlocks` and synthesizes no extra cleanup blocks (`extra = []`). -/
+theorem splitStmts_statements (cur : Gen.BbName) (acc : List Gen.Statement) (nc : Nat) :
+    ∀ ss : List Gen.Statement,
+      splitStmts cur acc nc (ss.map .statement) = (cur, acc ++ ss, [], nc)
+  | [] => by simp [splitStmts]
+  | s :: ss => by
+    simp only [List.map_cons, splitStmts]
+    rw [splitStmts_statements cur (acc ++ [s]) nc ss]
+    simp
+
+theorem mapM_translateStmtResult_of_noAssume {decls : List LocalDecl} :
+    ∀ ss : List MirAst.Statement, (∀ s ∈ ss, isAssume s = false) →
+      ss.mapM (translateStmtResult decls) =
+        (ss.mapM (translateStatement decls)).map (List.map .statement)
+  | [], _ => rfl
+  | s :: ss, hna => by
+    have hs : translateStmtResult decls s = (translateStatement decls s).map .statement := by
+      unfold translateStmtResult
+      split
+      · next op heq =>
+        have := hna s List.mem_cons_self
+        simp [isAssume, heq] at this
+      · rfl
+    simp only [List.mapM_cons, Option.bind_eq_bind, hs,
+      mapM_translateStmtResult_of_noAssume ss (fun x hx => hna x (List.mem_cons_of_mem _ hx))]
+    cases translateStatement decls s <;> cases ss.mapM (translateStatement decls) <;> simp
+
+/-- When `bbs` contains no `.call` terminators and no `Assume` statements,
+`translateBlocksInProg` agrees with `translateBlocks` and synthesizes no extra
+blocks (`extra = []`). -/
 theorem translateBlocksInProg_eq_of_no_calls (fnMap : FnMap)
     (decls : List LocalDecl) (k nextCleanup : Nat) (bbs : List BasicBlockData)
     (hnc : ∀ bb ∈ bbs, ∀ func args dst tgt unw,
-      bb.terminator.kind ≠ .call func args dst tgt unw) :
+      bb.terminator.kind ≠ .call func args dst tgt unw)
+    (hna : ∀ bb ∈ bbs, ∀ s ∈ bb.statements, isAssume s = false) :
     translateBlocksInProg fnMap decls k nextCleanup bbs =
       (translateBlocks decls k bbs).map (fun B => (B, [])) := by
   induction bbs generalizing k nextCleanup with
@@ -763,29 +1081,34 @@ theorem translateBlocksInProg_eq_of_no_calls (fnMap : FnMap)
   | cons bb bbs ih =>
     have hbb := hnc bb List.mem_cons_self
     have hrest := ih (k + 1) nextCleanup (fun b hb => hnc b (List.mem_cons_of_mem _ hb))
+      (fun b hb => hna b (List.mem_cons_of_mem _ hb))
     unfold translateBlocksInProg translateBlocks translateBlock
-    rw [translateTerminatorInProg_eq_of_not_call fnMap decls nextCleanup bb.terminator hbb]
+    rw [mapM_translateStmtResult_of_noAssume bb.statements (hna bb List.mem_cons_self)]
     cases bb.statements.mapM (translateStatement decls) with
     | none => rfl
     | some stmts =>
+      simp only [Option.map_some, Option.bind_eq_bind, Option.bind_some, splitStmts_statements,
+        List.nil_append]
+      rw [translateTerminatorInProg_eq_of_not_call fnMap decls nextCleanup bb.terminator hbb]
       cases translateTerminator decls bb.terminator with
       | none => rfl
       | some term =>
-        dsimp only [Option.bind_eq_bind, Option.map_some, Option.bind_some]
+        simp only [Option.map_some, Option.bind_some]
         rw [hrest]
         cases translateBlocks decls (k + 1) bbs <;> rfl
 
-/-- When `body` contains no `.call` terminators, `translateFnInProg fnMap body`
-produces the exact same `Option Gen.Function` as single-function `translateFn body`
- regardless of `fnMap`. -/
+/-- When `body` contains no `.call` terminators and no `Assume` statements,
+`translateFnInProg fnMap body` produces the exact same `Option Gen.Function` as
+single-function `translateFn body` regardless of `fnMap`. -/
 theorem translateFnInProg_eq_translateFn_of_no_calls (fnMap : FnMap)
     (body : CapturedMir)
     (hnc : ∀ bb ∈ body.basicBlocks, ∀ func args dst tgt unw,
-      bb.terminator.kind ≠ .call func args dst tgt unw) :
+      bb.terminator.kind ≠ .call func args dst tgt unw)
+    (hna : ∀ bb ∈ body.basicBlocks, ∀ s ∈ bb.statements, isAssume s = false) :
     translateFnInProg fnMap body = translateFn body := by
   simp only [translateFnInProg, translateFn,
     translateBlocksInProg_eq_of_no_calls fnMap body.localDecls 0
-      (body.basicBlocks.length + 1) body.basicBlocks hnc,
+      (body.basicBlocks.length + 1) body.basicBlocks hnc hna,
     Option.bind_eq_bind]
   cases translateCallConv body.fnAbi.conv with
   | none => rfl

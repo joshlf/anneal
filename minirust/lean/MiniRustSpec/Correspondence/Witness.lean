@@ -145,6 +145,15 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
   ground-truth unit checks of the `MR-4.1` `Interp` definitions and
   `progStart_outside_fragment`, which shows why the theorems start at
   `fEntry.start` under an external caller rather than at `prog.start`.
+* `evalIntrinsic_*`, `evalTerminator_abortTerminator`, and `assumeSub`
+  (`MR-4.2`): every transcribed `IntrinsicOp` arm of `eval_intrinsic`
+  (`Abort`, `Exit`, `Assume` with each of its UB checks, `PrintStdout` and
+  `PrintStderr`, `PointerExposeProvenance`, and the checks that precede
+  `unsupported` in `RawEq` and `PointerWithExposedProvenance`), the
+  `build::abort()` terminator, and a function with two `Assume` statements,
+  whose translation splits its only MIR block into three MiniRust blocks.
+  Anneal and MiniRust both return `19u32` for `assume_sub(20, true)` and both
+  raise UB at the first `Assume` for `assume_sub(20, false)`.
 -/
 
 namespace MiniRustSpec.Correspondence.Witness
@@ -4351,11 +4360,11 @@ theorem evalValue_tuple_and_evalPlace_field :
         (intBoolTupleTy u32)) =
       .ok ((.Tuple [.Int 42, .Bool true], intBoolTupleTy u32), checkedTupleOkMInit) ∧
     evalPlace checkedTupleOkMInit (.Field (.Local (localName 0)) 0) =
-      .ok ({ ptr := { thin_pointer := { addr := 128, provenance := some (⟨1⟩, ()) }, metadata := none },
-             aligned := true }, .Int u32) ∧
+      .ok (({ ptr := { thin_pointer := { addr := 128, provenance := some (⟨1⟩, ()) }, metadata := none },
+              aligned := true }, .Int u32), checkedTupleOkMInit) ∧
     evalPlace checkedTupleOkMInit (.Field (.Local (localName 0)) 1) =
-      .ok ({ ptr := { thin_pointer := { addr := 132, provenance := some (⟨1⟩, ()) }, metadata := none },
-             aligned := true }, .Bool) := ⟨rfl, rfl, rfl⟩
+      .ok (({ ptr := { thin_pointer := { addr := 132, provenance := some (⟨1⟩, ()) }, metadata := none },
+              aligned := true }, .Bool), checkedTupleOkMInit) := ⟨rfl, rfl, rfl⟩
 
 /-- `evalBinOp (.IntWithOverflow ..)` on a non-integer operand and `evalPlace (.Field ..)`
 on an out-of-range field index, a missing unsized tail, or a non-projectable
@@ -4424,11 +4433,11 @@ def unionFieldTestMach : Mach :=
 
 theorem evalPlace_field_union_and_offset_panic :
     evalPlace unionFieldTestMach (.Field (.Local (localName 0)) 0) =
-      .ok ({ ptr := { thin_pointer := { addr := 128, provenance := some (⟨1⟩, ()) }, metadata := none },
-             aligned := true }, .Int i8) ∧
+      .ok (({ ptr := { thin_pointer := { addr := 128, provenance := some (⟨1⟩, ()) }, metadata := none },
+              aligned := true }, .Int i8), unionFieldTestMach) ∧
     evalPlace unionFieldTestMach (.Field (.Local (localName 0)) 1) =
-      .ok ({ ptr := { thin_pointer := { addr := 130, provenance := some (⟨1⟩, ()) }, metadata := none },
-             aligned := true }, .Bool) ∧
+      .ok (({ ptr := { thin_pointer := { addr := 130, provenance := some (⟨1⟩, ()) }, metadata := none },
+              aligned := true }, .Bool), unionFieldTestMach) ∧
     evalPlace unionFieldTestMach (.Field (.Local (localName 1)) 0) =
       .error (.specPanic "assertion failed: offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata)") :=
   ⟨rfl, rfl, rfl⟩
@@ -10001,15 +10010,18 @@ def unitPlacePtr : Ptr := { addr := 1, provenance := none }
 
 /-- Why the correspondence starts at `fEntry.start` under an external `rootCtx`
 rather than at `prog.start`. `mkStartFn`'s first block evaluates
-`build::unit_place()`, a `PlaceExpr::Deref` that this interpretation reports as
-`unsupported`. Even past that, the `Terminator::Call` it performs (Rust calling
-convention, no arguments, a `()` return place, as in `minimize`'s
-`mk_start_fn`) fails `create_frame` for an entry such as `callerMain`, which
-returns `u32`, and for any `extern "C"` entry such as `cAbiCallee`. `rootCtx`
-instead supplies the entry's arguments and a return place of its own type
-(`CtxOk`). -/
+`build::unit_place()`, a `PlaceExpr::Deref` of the dangling raw pointer at
+address `1`; since `MR-4.2` transcribes `PlaceExpr::Deref`, this yields the
+aligned zero-sized place of type `unit_type()` without touching memory. But the
+`Terminator::Call` that block performs (Rust calling convention, no arguments, a
+`()` return place, as in `minimize`'s `mk_start_fn`) fails `create_frame` for
+an entry such as `callerMain`, which returns `u32`, and for any `extern "C"`
+entry such as `cAbiCallee`. `rootCtx` instead supplies the entry's arguments
+and a return place of its own type (`CtxOk`). -/
 theorem progStart_outside_fragment :
-    isUnsupportedStop (evalPlace callerCallee20MInit buildUnitPlace) = true ∧
+    evalPlace callerCallee20MInit buildUnitPlace =
+      .ok (({ ptr := { thin_pointer := unitPlacePtr, metadata := none }, aligned := true },
+        unitTy), callerCallee20MInit) ∧
     createFrame callerCallee20MInit callerMainFn
       (.BackToCaller (some (bbName 1)) (some (bbName 2)) unitPlacePtr) .Rust unitTy [] =
       .error (.ub "call ABI violation: return types are not compatible") ∧
@@ -10017,5 +10029,261 @@ theorem progStart_outside_fragment :
       (.BackToCaller (some (bbName 1)) (some (bbName 2)) unitPlacePtr) .Rust unitTy [] =
       .error (.ub "call ABI violation: calling conventions are not the same") :=
   ⟨rfl, eq_error_ub_of_ubMsg? (by decide +kernel), eq_error_ub_of_ubMsg? (by decide +kernel)⟩
+
+/-! ## `MR-4.2`: intrinsics
+
+Ground-truth checks of the transcribed `Machine::eval_intrinsic`
+(`evalIntrinsic`) and `Terminator::Intrinsic` (`evalIntrinsicTerminator`) on a
+concrete machine, and the `Assume` statement witness `assumeSub`: `minimize`
+ends the current MiniRust block at every
+`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))` in a
+`Terminator::Intrinsic` of `IntrinsicOp::Assume` whose next block is fresh
+(`translateStmtResult`, `splitStmts`). The multi-function fragment
+(`bodyInProgFragment`) does not yet admit `Assume` statements, so `assumeSub`
+is checked by computing both semantics directly. -/
+
+
+/-! ### `Machine::eval_intrinsic` on a concrete machine -/
+
+/-- The integer of a `Value::Int`. -/
+def intOfVal? : Val → Option Int
+  | .Int i => some i
+  | _ => none
+
+/-- Whether a MiniRust value is `unit_value()` (`Value::Tuple(list![])`). -/
+def isUnitValue : Val → Bool
+  | .Tuple [] => true
+  | _ => false
+
+/-- `IntrinsicOp::Abort` throws `TerminationInfo::Abort`; `IntrinsicOp::Exit`
+runs the leak check, which passes on a machine without live `Heap`
+allocations, and then throws `TerminationInfo::MachineStop`. -/
+theorem evalIntrinsic_abort_exit :
+    evalIntrinsic callerCallee20MInit .Abort [] Interp.unitType = .error .abort ∧
+    evalIntrinsic callerCallee20MInit .Exit [] Interp.unitType = .error .machineStop :=
+  ⟨rfl, rfl⟩
+
+/-- `IntrinsicOp::Assume` returns `unit_value()` on `true` and raises each of
+its four UB checks: a violated condition, a non-Boolean argument, a wrong
+argument count, and a return type other than `unit_type()`. -/
+theorem evalIntrinsic_assume :
+    evalIntrinsic callerCallee20MInit .Assume [(.Bool true, .Bool)] Interp.unitType =
+      .ok (Interp.unitValue, callerCallee20MInit) ∧
+    evalIntrinsic callerCallee20MInit .Assume [(.Bool false, .Bool)] Interp.unitType =
+      .error (.ub "`Assume` intrinsic called on condition that is violated") ∧
+    evalIntrinsic callerCallee20MInit .Assume [(.Int 1, .Int u8Ty)] Interp.unitType =
+      .error (.ub "invalid argument for `Assume` intrinsic: not a Boolean") ∧
+    evalIntrinsic callerCallee20MInit .Assume [] Interp.unitType =
+      .error (.ub "invalid number of arguments for `Assume` intrinsic") ∧
+    evalIntrinsic callerCallee20MInit .Assume [(.Bool true, .Bool), (.Bool true, .Bool)]
+        Interp.unitType =
+      .error (.ub "invalid number of arguments for `Assume` intrinsic") ∧
+    evalIntrinsic callerCallee20MInit .Assume [(.Bool true, .Bool)] .Bool =
+      .error (.ub "invalid return type for `Assume` intrinsic") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `IntrinsicOp::PrintStdout` and `IntrinsicOp::PrintStderr` append one line
+per integer or Boolean argument to their stream, reject any other value with
+UB, and check the `unit_type()` return type first. -/
+theorem evalIntrinsic_print :
+    (evalIntrinsic callerCallee20MInit .PrintStdout
+        [(.Int (-7), .Int i32W), (.Bool true, .Bool)] Interp.unitType).toOption.map
+        (fun r => (isUnitValue r.1, r.2.stdout.written, r.2.stderr.written)) =
+      some (true, ["-7\n", "true\n"], []) ∧
+    (evalIntrinsic callerCallee20MInit .PrintStderr [(.Int 42, .Int u32)]
+        Interp.unitType).toOption.map
+        (fun r => (r.2.stdout.written, r.2.stderr.written)) =
+      some ([], ["42\n"]) ∧
+    evalIntrinsic callerCallee20MInit .PrintStdout [(Interp.unitValue, Interp.unitType)]
+        Interp.unitType =
+      .error (.ub "unsupported value for printing") ∧
+    evalIntrinsic callerCallee20MInit .PrintStdout [] .Bool =
+      .error (.ub "invalid return type for `PrintStdout` intrinsic") := by
+  refine ⟨by decide +kernel, by decide +kernel, rfl, rfl⟩
+
+/-- `IntrinsicOp::RawEq` and `IntrinsicOp::PointerWithExposedProvenance` pass
+their transcribed argument and return-type checks and then report
+`unsupported`, while a failing check is still UB. -/
+theorem evalIntrinsic_rawEq_withExposed :
+    isUnsupportedStop (evalIntrinsic callerCallee20MInit .RawEq
+      [(.Int 1, .Int u8Ty), (.Int 1, .Int u8Ty)] .Bool) = true ∧
+    evalIntrinsic callerCallee20MInit .RawEq [(.Int 1, .Int u8Ty)] .Bool =
+      .error (.ub "invalid number of arguments for `RawEq` intrinsic") ∧
+    evalIntrinsic callerCallee20MInit .RawEq [(.Int 1, .Int u8Ty), (.Int 1, .Int u8Ty)]
+        (.Int u8Ty) =
+      .error (.ub "invalid return type for `RawEq` intrinsic") ∧
+    isUnsupportedStop (evalIntrinsic callerCallee20MInit .PointerWithExposedProvenance
+      [(.Int 64, .Int u64W)] (.Ptr (.Raw .None))) = true ∧
+    evalIntrinsic callerCallee20MInit .PointerWithExposedProvenance
+        [(.Bool true, .Bool)] (.Ptr (.Raw .None)) =
+      .error (.ub "invalid argument for `PointerWithExposedProvenance` intrinsic: not an integer") :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `IntrinsicOp::PointerExposeProvenance` returns the address of a thin
+pointer at `usize` and records its provenance as exposed. -/
+theorem evalIntrinsic_exposeProvenance :
+    (evalIntrinsic callerCallee20MInit .PointerExposeProvenance
+        [(.Ptr ⟨⟨128, some (⟨3⟩, ())⟩, none⟩, .Ptr (.Raw .None))] (.Int u64W)).toOption.map
+        (fun r => (intOfVal? r.1, r.2.intptrcast.exposed.elems.map (·.1._0))) =
+      some (some 128, [3]) ∧
+    evalIntrinsic callerCallee20MInit .PointerExposeProvenance
+        [(.Ptr ⟨⟨128, some (⟨3⟩, ())⟩, none⟩, .Ptr (.Raw .None))] (.Int u32) =
+      .error (.ub "invalid return type for `PointerExposeProvenance` intrinsic") :=
+  ⟨by decide +kernel, rfl⟩
+
+/-- `IntrinsicOp::GetUnwindPayload` on a thread with an empty payload stack is
+UB. -/
+theorem evalIntrinsic_getUnwindPayload_empty :
+    evalIntrinsic callerCallee20MInit .GetUnwindPayload [] (.Ptr (.Raw .None)) =
+      .error (.ub "GetUnwindPayload: the payload stack is empty") := rfl
+
+/-- The `Terminator::Intrinsic` that `build::abort()` produces stores nothing
+and throws `TerminationInfo::Abort`: `unit_place()` evaluates without touching
+memory, and `IntrinsicOp::Abort` never returns. -/
+theorem evalTerminator_abortTerminator :
+    evalTerminator callerCallee20MInit abortTerminator = .error .abort := rfl
+
+/-! ### `Assume` statements and `minimize`'s block splitting -/
+
+/-- MIR (`Runtime(PostCleanup)`) of
+```rust
+fn assume_sub(x: u32, b: bool) -> u32 {
+    unsafe { core::intrinsics::assume(b) }; // bb0: assume(copy _2)
+    let r = x.wrapping_sub(1);               //      _0 = Sub(copy _1, const 1_u32)
+    unsafe { core::intrinsics::assume(b) }; //      assume(copy _2)
+    r                                        //      return
+}
+```
+with `r` living in the return place. rustc's `LowerIntrinsics` MIR pass turns
+each `assume(b)` call into the statement
+`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(copy _2))`. -/
+def assumeSub : CapturedMir where
+  defPath := "witness::assume_sub"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, u32Decl, boolDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.intrinsic (.assume (.copy (local_ 2)))),
+        mkStmt (.assign (local_ 0) (.binaryOp .sub (.copy (local_ 1)) (constU32 1))),
+        mkStmt (.intrinsic (.assume (.copy (local_ 2))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- The MiniRust function `minimize` produces for `assumeSub`: `translate_bb`
+ends `bb0` at each `Assume` in a `Terminator::Intrinsic` whose next block is a
+fresh name (`bbName 2`, then `bbName 3`, after `init_bb = bbName 1`), and the
+`return` lands in the block that is still open. -/
+def assumeSubFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, .Bool)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[], .Intrinsic .Assume [.Load (.Local (localName 2))] unitPlace
+      (some (bbName 2)), .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Sub) (.Load (.Local (localName 1))) (.Constant (.Int 1) (.Int u32)))],
+      .Intrinsic .Assume [.Load (.Local (localName 2))] unitPlace (some (bbName 3)), .Regular⟩),
+    (bbName 3, ⟨[], .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+def assumeSubProg : Gen.Program where
+  functions := ⟨[(fnName 0, assumeSubFn), (fnName 1, mkStartFn 0)]⟩
+  start := fnName 1
+  globals := ⟨[]⟩
+  vtables := ⟨[]⟩
+  traits := ⟨[]⟩
+
+theorem assumeSub_translate : translateProg assumeSub [] = some assumeSubProg := rfl
+
+theorem assumeSub_translateInProg :
+    translateFnInProg (fnNameMap assumeSub []) assumeSub = some assumeSubFn := rfl
+
+/-- `Assume` statements are outside the multi-function fragment
+(`bodyInProgFragment` requires `statementOk`), so `assumeSub` is checked by
+direct computation on both sides below rather than through
+`mirCallWithCallees_ret`. -/
+theorem assumeSub_not_inFragment : progInFragment assumeSub [] = false := by decide
+
+def ctxAssumeSub : Ctx := ctxWithFns callerFrame retAlloc 1 [128, 256, 384]
+
+def assumeSubArgs (x : Nat) (b : Bool) : List Value :=
+  [.scalar ⟨x, 4⟩, .scalar ⟨if b then 1 else 0, 1⟩]
+
+def assumeSubS0 (x : Nat) (b : Bool) : MachineState :=
+  initMachineStateWithCallees assumeSub (assumeSubArgs x b) []
+
+def assumeSubMInit (x : Nat) (b : Bool) : Mach :=
+  multiMachineWithCtx ctxAssumeSub assumeSubProg 1 assumeSub assumeSubFn
+    (assumeSubS0 x b).frame.locals assumeSubFn.start
+
+/-- `runA` returns the scalar `⟨bits, size⟩`. -/
+def runsToScalar (body : CapturedMir) (fuel : Nat) (s : MachineState) (bits size : Nat) : Bool :=
+  match runA body fuel s with
+  | some (_, .normal (.scalar sc, _)) => sc.bits == bits && sc.sizeBytes == size
+  | _ => false
+
+/-- A passing `runsToScalar` check is a UB-free return of `⟨bits, size⟩`
+(`runA_sound`, `runA_noUB`). -/
+theorem runsToScalar_sound {body : CapturedMir} {fuel : Nat} {s : MachineState}
+    {bits size : Nat} (h : runsToScalar body fuel s bits size = true) :
+    (∃ tr mem, ReachesRet (mirTree body s) tr (.normal (.scalar ⟨bits, size⟩, mem))) ∧
+      MirNoUBTree (mirTree body s) := by
+  unfold runsToScalar at h
+  split at h
+  · rename_i tr sc mem hrun
+    rw [Bool.and_eq_true, beq_iff_eq, beq_iff_eq] at h
+    obtain ⟨hb, hs⟩ := h
+    have hsc : sc = ⟨bits, size⟩ := by cases sc; simp_all
+    subst hsc
+    exact ⟨⟨tr, mem, runA_sound body fuel _ _ _ hrun⟩, runA_noUB body fuel _ _ _ hrun⟩
+  · exact absurd h Bool.false_ne_true
+
+/-- With `b = true`, Anneal's `assume_sub(20, true)` steps over both `Assume`
+statements and returns `19u32` without UB. -/
+theorem assumeSub20_anneal_ret :
+    (∃ tr mem, ReachesRet (mirCallTreeWithCallees assumeSub (assumeSubArgs 20 true) []) tr
+      (.normal (.scalar ⟨19, 4⟩, mem))) ∧
+    MirNoUBTree (mirCallTreeWithCallees assumeSub (assumeSubArgs 20 true) []) :=
+  runsToScalar_sound (fuel := 10) (by decide)
+
+/-- MiniRust runs the translation of `assume_sub(20, true)` from `start` in
+`5` steps (the init block's `Goto`, the first `Terminator::Intrinsic`, the
+`Sub` assignment in `bbName 2`, the second `Terminator::Intrinsic`, and
+`Return`), writing the bytes of `19u32` into the caller's return place. -/
+theorem assumeSub20_minirust_direct :
+    (Interp.steps 5 (assumeSubMInit 20 true)).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 19 }, [1]) := by
+  decide +kernel
+
+/-- One Anneal step over the first `Assume` moves from MIR program point
+`(bb0, 1)`; the matching MiniRust step (after the init block) lands at the
+start of the fresh block `bbName 2`. -/
+theorem assumeSub20_split_point :
+    (match stepMirFn assumeSub (assumeSubS0 20 true) with
+      | .tau (.running s') => some (s'.frame.blockIdx, s'.frame.stmtIdx)
+      | _ => none) = some (0, 1) ∧
+    (Interp.steps 2 (assumeSubMInit 20 true)).toOption.map
+        (fun m => m.threads.map (fun t => t.stack.getLast?.map
+          (fun fr => (fr.next_block, fr.next_stmt)))) =
+      some [some (bbName 2, 0)] := by
+  refine ⟨by decide +kernel, by decide +kernel⟩
+
+/-- With `b = false`, both semantics raise UB at the first `Assume`: Anneal's
+first step is `MirStepNode.fail .ub`, and MiniRust's second step (the first
+`Terminator::Intrinsic`) throws the `Assume` UB of `eval_intrinsic`. -/
+theorem assumeSubFalse_ub :
+    stepMirFn assumeSub (assumeSubS0 20 false) = MirStepNode.fail .ub ∧
+    Interp.steps 2 (assumeSubMInit 20 false) =
+      .error (.ub "`Assume` intrinsic called on condition that is violated") :=
+  ⟨rfl, eq_error_ub_of_ubMsg? (by decide +kernel)⟩
 
 end MiniRustSpec.Correspondence.Witness
