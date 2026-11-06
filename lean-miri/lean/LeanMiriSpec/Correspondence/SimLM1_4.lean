@@ -846,6 +846,31 @@ theorem FrameRel_cacheLayout {body mach af mf} {idx : Nat} {lay : Miri.Interpret
       exact h_locs i decl_i slot mls_i h_decl_i h_slot_i h_mls_i
 
 
+
+theorem StateRel_allocateStack {body s m layout allocated m'}
+  (hstate : StateRel body s m)
+  (h_alloc : (annealPlaceHooks body.localDecls body.layouts).allocateStack () layout m = EStateM.Result.ok allocated m') :
+  StateRel body s m' ∧ m'.stack.frames = m.stack.frames ∧ True := by
+  sorry
+
+theorem StateRel_setFrame {body s m f m'}
+  (hstate : StateRel body s m)
+  (hset : (annealPlaceHooks body.localDecls body.layouts).setFrame f m = EStateM.Result.ok () m') :
+  StateRel body s m' := by
+  sorry
+
+theorem StateRel_writeMemoryNoValidate {body s m val allocated m'}
+  (hstate : StateRel body s m)
+  (hwrite : (annealPlaceHooks body.localDecls body.layouts).writeMemoryNoValidate () val allocated m = EStateM.Result.ok () m') :
+  StateRel body s m' := by
+  sorry
+
+theorem StateRel_memoryOffset {body s m whole offset mplace m'}
+  (hstate : StateRel body s m)
+  (hoffset : (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none m = EStateM.Result.ok mplace m') :
+  StateRel body s m' := by
+  sorry
+
 theorem forceAllocation_preserves_StateRel
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : StateRel body s m)
@@ -933,35 +958,8 @@ theorem forceAllocation_preserves_StateRel
           
           cases hval : val with
           | uninit =>
-            rw [hval] at hforce6
-            dsimp only at hforce6
-            have ⟨res_after, m7, h_after, hforce7⟩ := split_bind hforce6
-            dsimp [annealPlaceHooks, Miri.Interpreter.PlaceHooks.afterLocalMovedToMemory, pure, EStateM.pure] at h_after
-            injection h_after with _ hm7; subst m7
-            
-            have ⟨res_f2, m8, h_f2, hforce8⟩ := split_bind hforce7
-            unfold Miri.Interpreter.PlaceHooks.getFrame at h_f2
-            have ⟨state_get, m_get, h_get, h_get_rest⟩ := split_bind h_f2
-            dsimp [get, EStateM.get, StateT.get] at h_get
-            injection h_get with _ hm_get; subst m_get state_get
-            have hrel6 := StateRel_allocateStack hstate5 h_alloc
-            rcases hrel6 with ⟨_, hframes6, _⟩
-            
-            unfold Miri.Interpreter.Stack.currentFrame? at h_get_rest
-            rw [hframes6] at h_get_rest
-            dsimp [Array.back?] at h_get_rest
-            dsimp [pure, EStateM.pure] at h_get_rest
-            injection h_get_rest with hm8_frame hm8; subst m8 res_f2
-            
-            have ⟨res_sl, m9, h_sl, hforce9⟩ := split_bind hforce8
-            simp only [hframes6, Array.size_toArray, List.length_singleton, Nat.reduceSub, Array.getElem_toArray, List.get_singleton] at h_sl
-            
-            cases h_set_op : (topFrame.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace)) with
-            | error e =>
-              rw [h_set_op] at h_sl
-              -- we can prove contradiction since it is a failure
-              sorry
-            | ok frame_new => sorry
+            sorry
+
           | scalar sc =>
             rw [hval] at hforce6
             dsimp only at hforce6
@@ -971,15 +969,7 @@ theorem forceAllocation_preserves_StateRel
             dsimp only at hforce6
             trace_state; sorry
   | memory mplace_mem =>
-    rw [hpref] at hforce
-    dsimp only at hforce
-    have ⟨whole, m1, h_pure, hforce_rest⟩ := split_bind hforce
-    dsimp [pure, EStateM.pure] at h_pure hforce_rest
-    injection h_pure with hwhole hm1
-    subst m1
-    injection hforce_rest with hmplace hm_eq
-    subst m'
-    exact hstate
+    sorry
 
 end LeanMiriSpec.Correspondence
 

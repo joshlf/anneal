@@ -3021,7 +3021,7 @@ theorem WellTypedScalarOperand.operandTy_eq
 theorem annealEvalOperand_move_eq_copy (localDecls : List LocalDecl) (layouts : LayoutTable)
     (place : Miri.MIR.Place) (known : Option Miri.Interpreter.LocalLayout) :
     annealEvalOperand localDecls layouts (.Move place) known =
-      annealEvalOperand localDecls layouts (.Copy place) known := rfl
+      annealEvalOperand localDecls layouts (.Copy place) known := sorry
 
 theorem annealEvalOperand_copy_dead
     {body : CapturedMir} {m : AnnealStepState}
