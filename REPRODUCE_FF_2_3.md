@@ -25,7 +25,7 @@ This guide provides instructions to verify `MirSpecLift` and its tests against t
     Run the multi-threaded build to check all untrusted modules and examples (including `MirSpecLift.lean` and `WireframeDemo` companions):
     ```bash
     cd examples
-    anneal-lean-run --mode build --concurrency 2 -- lake build Anneal Anneal.MirSpecLift
+    anneal-lean-run --mode build --concurrency 2 -- lake build
     ```
 
 ## Verification
