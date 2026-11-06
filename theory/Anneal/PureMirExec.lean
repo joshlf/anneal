@@ -15379,15 +15379,50 @@ theorem PureMirModularConverges.call_diverging_modular_sub_pureTarget
             typeArgs := typeArgs
             args := argVals
             memory := m })
-    (h_contract_post :
-      ∀ m : Memory,
+    (h_no_ret :
+      ∀ (m retMem : Memory) (retVal : Value),
         ModularRootMemory body callees traitImpls m →
-        ∀ ans : MirCallAns,
+        ¬ subContract.post
+          { defPath := defPath
+            typeArgs := typeArgs
+            args := argVals
+            memory := m }
+          (.returned retVal retMem))
+    (h_contract_panic :
+      unwind = .continue_ ∨
+      unwind = .terminate ∨
+      (∀ (m panicMem : Memory),
+        ModularRootMemory body callees traitImpls m →
+        ¬ subContract.post
+          { defPath := defPath
+            typeArgs := typeArgs
+            args := argVals
+            memory := m }
+          (.panicked panicMem)) ∨
+      ∃ cleanupBb : BasicBlockIdx,
+        unwind = .cleanup cleanupBb ∧
+        (∀ (m panicMem : Memory),
+          ModularRootMemory body callees traitImpls m →
           subContract.post
             { defPath := defPath
               typeArgs := typeArgs
               args := argVals
-              memory := m } ans → False) :
+              memory := m }
+            (.panicked panicMem) →
+          ModularRootMemory body callees traitImpls panicMem) ∧
+        PureMirModularConverges contract body callees
+          { bb := cleanupBb, stmtIdx := 0, env := envAfterArgs }
+          post traitImpls)
+    (h_panic_stack :
+      ∀ (m panicMem : Memory),
+        ModularRootMemory body callees traitImpls m →
+        subContract.post
+          { defPath := defPath
+            typeArgs := typeArgs
+            args := argVals
+            memory := m }
+          (.panicked panicMem) →
+        panicMem.callStack = []) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
   subst h_rt
@@ -15445,9 +15480,30 @@ theorem PureMirModularConverges.call_diverging_modular_sub_pureTarget
       dsimp only
       have h_not_unw : isUnwindingPanicDefPath defPath = false := h_not_unwind
       rw [h_not_unw]
-      dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map]
-      exact ⟨(h_sub _ (h_contract_pre m hm)).1, fun ans h_post =>
-        False.elim (h_contract_post m hm ans ((h_sub _ (h_contract_pre m hm)).2 ans h_post))⟩
+      dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP, MirCallContract.toCallContract]
+      rcases h_sub _ (h_contract_pre m hm) with ⟨h_cpre, h_cpost_imp⟩
+      refine ⟨h_cpre, fun ans hp_sup => ?_⟩
+      have hp := h_cpost_imp ans hp_sup
+      cases ans with
+      | aborted =>
+        dsimp only [resumeExternalDivergingCall]
+        rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+        trivial
+      | returned retVal retMem =>
+        exact False.elim (h_no_ret m retMem retVal hm hp)
+      | panicked panicMem =>
+        rcases h_contract_panic with rfl | rfl | h_no_panic | ⟨cleanupBb, rfl, h_mod_p, h_clean⟩
+        · dsimp only [resumeExternalDivergingCall, applyUnwindAction]
+          rw [h_panic_stack m panicMem hm hp]
+          dsimp only [unwindFromCallStack]
+          rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+          trivial
+        · dsimp only [resumeExternalDivergingCall, applyUnwindAction]
+          rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+          trivial
+        · exact False.elim (h_no_panic m panicMem hm hp)
+        · dsimp only [resumeExternalDivergingCall, applyUnwindAction]
+          exact h_clean panicMem (h_mod_p m panicMem hm hp)
 
 /-!
 ## 10. Concrete Multi-Callee, Polymorphic, Intrinsic, & `#[external_spec]`
