@@ -97,6 +97,13 @@ open LeanMiriSpec.Correspondence in
   evalUnOp_neg_not_simulation
   step_assign_scalar_simulation
   step_terminator_goto_return_simulation
+  evalUnOp_bool_not_simulation
+  evalBinOp_rel_simulation
+  evalBinOp_cmp_simulation
+  evalCast_intToInt_simulation
+  step_terminator_switchInt_simulation
+  step_stmt_lm1_2_simulation
+  step_terminator_lm1_2_simulation
   WellTypedBody
   step_wellTypedBody_simulation
   step_wellTypedBody_bisim
