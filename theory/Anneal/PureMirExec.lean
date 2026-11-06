@@ -15337,6 +15337,118 @@ theorem PureMirModularConverges.call_diverging_panic_pureTarget
         · dsimp only [applyUnwindAction]
           exact h_clean m hm
 
+theorem PureMirModularConverges.call_diverging_modular_sub_pureTarget
+    {subContract contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {unwind : UnwindAction}
+    {defPath : DefPath}
+    {typeArgs : List RigidTy}
+    {resolvedTarget : ResolvedCallTarget}
+    {envAfterFunc envAfterArgs : List SlotState}
+    {argVals : List Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_sub : MirCallContract.Subsumes subContract contract)
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination .none unwind)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_ext :
+      extractPureCalleeTarget? body.localDecls body.layouts func =
+        some (defPath, typeArgs))
+    (h_res_pure :
+      resolvePureCalleeTarget ps.env func defPath typeArgs body.layouts =
+        .ok resolvedTarget envAfterFunc)
+    (h_args : evalPureOperands envAfterFunc argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup : lookupCallee callees body.layouts defPath typeArgs traitImpls = none)
+    (h_not_unreach : isUnreachableCallTarget defPath = false := by decide)
+    (h_not_abort : isAbortingPanicDefPath defPath = false := by decide)
+    (h_not_unwind : isUnwindingPanicDefPath defPath = false := by decide)
+    (h_contract_pre :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        subContract.pre
+          { defPath := defPath
+            typeArgs := typeArgs
+            args := argVals
+            memory := m })
+    (h_contract_post :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        ∀ ans : MirCallAns,
+          subContract.post
+            { defPath := defPath
+              typeArgs := typeArgs
+              args := argVals
+              memory := m } ans → False) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
+  subst h_rt
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  have h_res_m :
+      resolveCallTarget (ps.toMachineState m) func (length argOps)
+        body.localDecls body.layouts =
+        .ok { defPath := defPath, typeArgs := typeArgs, fnSig := .none, isIndirect := false }
+          envAfterFunc := by
+    rw [resolveCallTarget_eq_of_extractPureCalleeTarget
+      (ps.toMachineState m) func (length argOps) body.localDecls body.layouts
+      h_ext]
+    exact h_res_pure
+  dsimp only [PureState.toMachineState] at h_res_m
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  unfold stepMirFn
+  dsimp only [PureState.toMachineState]
+  rw [ModularRootMemory.activeCallee_getD hm]
+  cases h_ph : body.phase with
+  | other tag => exact False.elim (h_phase tag h_ph)
+  | _ =>
+    rw [h_bb]
+    dsimp only
+    rw [h_stmt_none]
+    dsimp only
+    have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+    simp only [h_beq, ite_true]
+    rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+    dsimp only at h_term
+    rw [h_term]
+    dsimp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
+    rw [h_res_m]
+    dsimp only
+    rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals body.layouts
+      m.callerLocals h_args_pure]
+    unfold evalPureOperands at h_args
+    cases h_ev : evalOperands envAfterFunc argOps [] [] body.layouts [] with
+    | ub => rw [h_ev] at h_args; nomatch h_args
+    | unsupported => rw [h_ev] at h_args; nomatch h_args
+    | ok vals env' =>
+      rw [h_ev] at h_args; injection h_args with h_v h_e
+      subst h_v h_e
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup]
+      dsimp only
+      have h_unr : isUnreachableCallTarget defPath = false := h_not_unreach
+      rw [h_unr]
+      dsimp only
+      have h_ab : isAbortingPanicDefPath defPath = false := h_not_abort
+      rw [h_ab]
+      dsimp only
+      have h_not_unw : isUnwindingPanicDefPath defPath = false := h_not_unwind
+      rw [h_not_unw]
+      dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map]
+      exact ⟨(h_sub _ (h_contract_pre m hm)).1, fun ans h_post =>
+        False.elim (h_contract_post m hm ans ((h_sub _ (h_contract_pre m hm)).2 ans h_post))⟩
+
 /-!
 ## 10. Concrete Multi-Callee, Polymorphic, Intrinsic, & `#[external_spec]`
 Witnesses

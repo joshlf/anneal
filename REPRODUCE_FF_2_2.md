@@ -192,6 +192,7 @@ modification. `theory/Anneal/PureMirExec.lean` adds:
    #print axioms PureMirModularConverges.tailCall_poly_external_spec_pureTarget
    #print axioms PureMirModularConverges.tailCall_intrinsic_pureTarget
    #print axioms PureMirModularConverges.call_diverging_panic_pureTarget
+   #print axioms PureMirModularConverges.call_diverging_modular_sub_pureTarget
    #print axioms verifyModularMir_of_pureModularExec_any
    #print axioms nestedMultiCalleeCaller_compositional
    #print axioms nestedMultiCalleeCaller_inline
