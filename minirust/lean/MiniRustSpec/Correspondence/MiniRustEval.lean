@@ -852,8 +852,8 @@ theorem typedStore_local_frag {m : Mach} {ctx : Ctx} {frames : List Frame} {L : 
       (encode_ordering hb) hL hlen align hal
 
 /-- All fragment local types (scalar `FragTy`, 2-tuples `intBoolTupleTy it`,
-homogeneous arrays, and layout-backed tuples/structs) and their alignment
-storage integer types. -/
+homogeneous arrays, layout-backed tuples/structs, and thin raw pointers) and
+their alignment storage integer types. -/
 inductive LocalTy : Gen.Type → Gen.IntType → Prop
   | frag {T : Gen.Type} {it : Gen.IntType} (h : FragTy T it) : LocalTy T it
   | tuple (it : Gen.IntType) (h : GoodSize it.size.bytes) : LocalTy (intBoolTupleTy it) it
@@ -862,6 +862,7 @@ inductive LocalTy : Gen.Type → Gen.IntType → Prop
   | tupleSpec (fields : List (Nat × TupleSpec)) (size align : Nat)
       (hwf : (TupleSpec.tuple fields size align).wf = true) :
       LocalTy ((TupleSpec.tuple fields size align).toMiniRustTy) ⟨.Unsigned, ⟨align⟩⟩
+  | rawPtr : LocalTy thinRawPtrTy usizeIt
 
 theorem LocalTy.good {T : Gen.Type} {it : Gen.IntType} (h : LocalTy T it) :
     GoodSize it.size.bytes := by
@@ -872,6 +873,7 @@ theorem LocalTy.good {T : Gen.Type} {it : Gen.IntType} (h : LocalTy T it) :
   | tupleSpec fields size align hwf =>
     simp only [TupleSpec.wf, Bool.and_eq_true] at hwf
     exact (goodAlignBytes_iff align).mp hwf.1.1.1
+  | rawPtr => simp [GoodSize, usizeIt]
 
 theorem LocalTy.layout {T : Gen.Type} {it : Gen.IntType} (h : LocalTy T it) :
     Type.layout T = .ok (.Sized ⟨tyBytes T⟩ ⟨it.size.bytes⟩) := by
@@ -883,6 +885,7 @@ theorem LocalTy.layout {T : Gen.Type} {it : Gen.IntType} (h : LocalTy T it) :
   | tupleSpec fields size align hwf =>
     simpa [TupleSpec.toMiniRustTy, TupleSpec.size, TupleSpec.align, tyBytes] using
       layout_tupleSpec (.tuple fields size align) hwf
+  | rawPtr => rfl
 
 /-- Storage integer type associated with a `LocalTy` type `T`. -/
 def storageIt : Gen.Type → Gen.IntType
@@ -895,6 +898,7 @@ def storageIt : Gen.Type → Gen.IntType
     else
       ⟨.Unsigned, ⟨head.align.bytes⟩⟩
   | .Array (.Int elemIt) _ => elemIt
+  | .Ptr (.Raw .None) => usizeIt
   | _ => u8Ty
 
 theorem TupleSpec.toMiniRustTy_ne_bool (s : TupleSpec) : s.toMiniRustTy ≠ .Bool := by
@@ -918,6 +922,7 @@ theorem LocalTy.storageIt_eq {T : Gen.Type} {it : Gen.IntType} (h : LocalTy T it
         | nil =>
           have hne := TupleSpec.toMiniRustTy_ne_bool f1.2
           cases hf1 : f1.2.toMiniRustTy <;> simp_all [TupleSpec.toMiniRustTy, TupleSpec.fieldsToMiniRust, storageIt]
+  | rawPtr => rfl
 
 theorem LocalTy.unique {T : Gen.Type} {it it' : Gen.IntType} (h : LocalTy T it)
     (h' : LocalTy T it') : it = it' := by
@@ -930,6 +935,7 @@ theorem LocalTy.of_validBits {T : Gen.Type} {it : Gen.IntType} (h : LocalTy T it
   | tuple _ _ => simp [intBoolTupleTy, ValidBits] at hb
   | array _ _ _ => simp [ValidBits] at hb
   | tupleSpec _ _ _ _ => simp [TupleSpec.toMiniRustTy, ValidBits] at hb
+  | rawPtr => simp [thinRawPtrTy, ValidBits] at hb
 
 /-- A scalar-family fragment local's declared MiniRust type is a `LocalTy`
 aligned like `itOf d layouts`. -/
@@ -963,13 +969,26 @@ theorem localTy_of_declOk {d : LocalDecl} {layouts : Layout.LayoutTable}
     | none =>
       simp only [ha] at hdok
       cases ht : tupleTypeOf layouts d.ty with
-      | none => simp [ht] at hdok
+      | none =>
+        simp only [ht, Bool.or_false] at hdok
+        obtain ⟨h1, h2⟩ := tyOf_isPtrTy (layouts := layouts) hdok
+        rw [h1, h2]
+        exact .rawPtr
       | some p =>
         obtain ⟨fields, size, align⟩ := p
         simp only [ht] at hdok
+        have hnp : isPtrTy d.ty = false := isPtrTy_false_of_tupleTypeOf ht
+        simp only [hnp, Bool.false_or] at hdok
         obtain ⟨h1, h2⟩ := tyOf_tupleSpec ht
         rw [h1, h2]
         exact .tupleSpec fields size align hdok
+
+theorem declSlotData_of_isPtrTy {d : LocalDecl} {layouts : Layout.LayoutTable}
+    (hp : isPtrTy d.ty = true) (slot : LocalSlot) :
+    declSlotData d slot layouts = slotData usizeIt slot := by
+  obtain ⟨hib, hb, ho, hi, harr, ha, _⟩ := not_other_of_isPtrTy (layouts := layouts) hp
+  obtain ⟨_, h2⟩ := tyOf_isPtrTy (layouts := layouts) hp
+  simp [declSlotData, hib, hb, ho, hi, harr, ha, h2]
 
 theorem declSlotData_length {d : LocalDecl} {layouts : Layout.LayoutTable}
     (hd : scalarTypeOf d.ty = some (tyOf d layouts))
@@ -1023,7 +1042,11 @@ theorem declSlotData_length_of_declOk {d : LocalDecl} {layouts : Layout.LayoutTa
     | none =>
       simp only [ha] at hdok hsl
       cases ht : tupleTypeOf layouts d.ty with
-      | none => simp [ht] at hdok
+      | none =>
+        simp only [ht, Bool.or_false] at hdok
+        obtain ⟨h1, _⟩ := tyOf_isPtrTy (layouts := layouts) hdok
+        rw [declSlotData_of_isPtrTy hdok, h1, slotData_length]
+        rfl
       | some p =>
         obtain ⟨fields, size, align⟩ := p
         simp only [ht] at hdok hsl
@@ -3058,15 +3081,16 @@ theorem rvalueOk_binaryOp {layouts : Layout.LayoutTable} {decls : List LocalDecl
       simp only [hsh, Bool.false_eq_true, ↓reduceIte] at hokb
       exact ⟨iop, it, rfl, hoka, operandIntType_of_operandOk hokb, hokb, fun _ => rfl⟩
 
-/-- Non-scalar locals (arrays and `TupleSpec` tuples/structs) in a fragment
-body are always initialized (`slot = .init v`) and, when in the locals map,
-occupy caller-region addresses below `2 ^ 32` (`StartRel` allocates parameters
-below `2 ^ 32`, and `inFragment` forbids `StorageLive` / `StorageDead` /
-`Deinit` / `Operand.move` on non-scalar locals). -/
+/-- Non-scalar aggregate locals (arrays and `TupleSpec` tuples/structs, i.e.
+non-scalar and non-pointer locals) in a fragment body are always initialized
+(`slot = .init v`) and, when in the locals map, occupy caller-region addresses
+below `2 ^ 32` (`StartRel` allocates parameters below `2 ^ 32`, and `inFragment`
+forbids `StorageLive` / `StorageDead` / `Deinit` / `Operand.move` on non-scalar
+non-pointer locals). -/
 def NonScalarLive (body : CapturedMir) (locals : List LocalSlot)
     (lm : Map Gen.LocalName Ptr) : Prop :=
   ∀ (i : Nat) d slot, body.localDecls[i]? = some d → locals[i]? = some slot →
-    scalarTypeOf d.ty = none →
+    scalarTypeOf d.ty = none → isPtrTy d.ty = false →
     (∃ v, slot = .init v) ∧
     (∀ p, mapGet lm (localName i) = some p →
       p.addr + (tyBytes (tyOf d body.layouts) : Int) < 2 ^ 32)
@@ -3075,7 +3099,7 @@ theorem NonScalarLive.set_init {body : CapturedMir} {locals : List LocalSlot}
     {lm : Map Gen.LocalName Ptr} (hns : NonScalarLive body locals lm)
     (i : Nat) (v : Value) :
     NonScalarLive body (locals.set i (.init v)) lm := by
-  intro j d slot hdj hsj hnone
+  intro j d slot hdj hsj hnone hnp
   by_cases hij : i = j
   · subst hij
     have hil : i < locals.length := by
@@ -3085,20 +3109,23 @@ theorem NonScalarLive.set_init {body : CapturedMir} {locals : List LocalSlot}
         exact False.elim (hlt (List.getElem?_eq_some_iff.mp hsj).1)
     rw [List.getElem?_set_self hil] at hsj
     cases hsj
-    exact ⟨⟨v, rfl⟩, (hns i d locals[i] hdj (List.getElem?_eq_getElem hil) hnone).2⟩
+    exact ⟨⟨v, rfl⟩, (hns i d locals[i] hdj (List.getElem?_eq_getElem hil) hnone hnp).2⟩
   · rw [List.getElem?_set_ne hij] at hsj
-    exact hns j d slot hdj hsj hnone
+    exact hns j d slot hdj hsj hnone hnp
 
 theorem NonScalarLive.set_scalar {body : CapturedMir} {locals : List LocalSlot}
     {lm : Map Gen.LocalName Ptr} (hns : NonScalarLive body locals lm)
     {i : Nat} {d : LocalDecl} (hd : body.localDecls[i]? = some d)
-    (hscalar : (scalarTypeOf d.ty).isSome = true) (ns : LocalSlot) :
+    (hscalar : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true) (ns : LocalSlot) :
     NonScalarLive body (locals.set i ns) lm := by
-  intro j dj slot hdj hsj hnone
+  intro j dj slot hdj hsj hnone hnp
   by_cases hij : i = j
-  · subst hij; rw [hd] at hdj; cases hdj; simp [hnone] at hscalar
+  · subst hij; rw [hd] at hdj; cases hdj
+    rcases hscalar with hsc | hp
+    · simp [hnone] at hsc
+    · simp [hnp] at hp
   · rw [List.getElem?_set_ne hij] at hsj
-    exact hns j dj slot hdj hsj hnone
+    exact hns j dj slot hdj hsj hnone hnp
 
 /-- Hypotheses describing a callee frame related to Anneal slots `locals`: `f`
 is the translation of `body`, and the machine runs the callee at `(blk, stmt)`
@@ -3155,7 +3182,8 @@ theorem FrameOk.array_bound {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     (elemIt : Gen.IntType) (count : Nat) (hd : body.localDecls[i]? = some d)
     (ha : arrayTypeOf d.ty = some (elemIt, count)) : count * elemIt.size.bytes < 2 ^ 63 := by
   have hdok := h.declsOk d (List.mem_of_getElem? hd)
-  simpa [localDeclOk, scalarTypeOf_none_of_arrayTypeOf ha, ha] using hdok
+  simpa [localDeclOk, scalarTypeOf_none_of_arrayTypeOf ha, ha, isPtrTy_false_of_arrayTypeOf ha]
+    using hdok
 
 theorem FrameOk.tuple_wf {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {m : Mach} {blk stmt : Nat}
@@ -3164,8 +3192,8 @@ theorem FrameOk.tuple_wf {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     (ht : tupleTypeOf body.layouts d.ty = some (fields, size, align)) :
     (TupleSpec.tuple fields size align).wf = true := by
   have hdok := h.declsOk d (List.mem_of_getElem? hd)
-  simpa [localDeclOk, scalarTypeOf_none_of_tupleTypeOf ht, arrayTypeOf_none_of_tupleTypeOf ht, ht]
-    using hdok
+  simpa [localDeclOk, scalarTypeOf_none_of_tupleTypeOf ht, arrayTypeOf_none_of_tupleTypeOf ht, ht,
+    isPtrTy_false_of_tupleTypeOf ht] using hdok
 
 theorem FrameOk.slot_exists {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {m : Mach} {blk stmt : Nat}
@@ -3173,6 +3201,55 @@ theorem FrameOk.slot_exists {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     (i : Nat) (hi : i < body.localDecls.length) :
     ∃ d slot, body.localDecls[i]? = some d ∧ locals[i]? = some slot := by
   refine ⟨body.localDecls[i], locals[i]'(by rw [h.nlocals]; exact hi), by simp [hi], by simp⟩
+
+theorem LocalsOkA.storage_nonptr {body : CapturedMir} {ctx : Ctx} {al : List Nat}
+    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {allocs : List Gen.Allocation}
+    (hlo : LocalsOkA body ctx al locals lm allocs)
+    (i : Nat) (d : LocalDecl) (slot : LocalSlot) (p : Ptr)
+    (hd : body.localDecls[i]? = some d) (hs : locals[i]? = some slot)
+    (hp : mapGet lm (localName i) = some p) (hnp : isPtrTy d.ty = false) :
+    ∃ id : Nat, p.provenance = some (⟨(id : Int)⟩, ()) ∧ ctx.base.length ≤ id ∧
+      AddrOk p.addr (itOf d body.layouts) ∧
+      p.addr + (tyBytes (tyOf d body.layouts) : Int) < 2 ^ 64 ∧
+      AddrClass p.addr (tyBytes (tyOf d body.layouts)) ∧
+      allocs[id]? = some (stackAlloc p.addr (itOf d body.layouts) (declSlotData d slot body.layouts)) := by
+  obtain ⟨id, hpid, hb, ha, hmax, hc, hA⟩ := hlo.storage i d slot p hd hs hp
+  simp only [hnp, Bool.false_eq_true, ↓reduceIte] at hA
+  exact ⟨id, hpid, hb, ha, hmax, hc, hA⟩
+
+theorem LocalsOkA.storage_any {body : CapturedMir} {ctx : Ctx} {al : List Nat}
+    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {allocs : List Gen.Allocation}
+    (hlo : LocalsOkA body ctx al locals lm allocs)
+    {i : Nat} {d : LocalDecl} {slot : LocalSlot} {p : Ptr}
+    (hd : body.localDecls[i]? = some d) (hs : locals[i]? = some slot)
+    (hp : mapGet lm (localName i) = some p)
+    (hdok : localDeclOk body.layouts d = true) :
+    ∃ (id : Nat) (data : List Byte),
+      p.provenance = some (⟨(id : Int)⟩, ()) ∧ ctx.base.length ≤ id ∧
+      AddrOk p.addr (itOf d body.layouts) ∧
+      p.addr + (tyBytes (tyOf d body.layouts) : Int) < 2 ^ 64 ∧
+      AddrClass p.addr (tyBytes (tyOf d body.layouts)) ∧
+      data.length = tyBytes (tyOf d body.layouts) ∧
+      allocs[id]? = some (stackAlloc p.addr (itOf d body.layouts) data) := by
+  obtain ⟨id, hpid, hb, ha, hmax, hc, hA⟩ := hlo.storage i d slot p hd hs hp
+  have hsl := hlo.slots i d slot hd hs
+  cases hp_ty : isPtrTy d.ty with
+  | false =>
+    simp only [hp_ty, Bool.false_eq_true, ↓reduceIte] at hA
+    exact ⟨id, _, hpid, hb, ha, hmax, hc, declSlotData_length_of_declOk hdok hsl, hA⟩
+  | true =>
+    simp only [hp_ty, ↓reduceIte] at hA
+    obtain ⟨hTd, _⟩ := tyOf_isPtrTy (layouts := body.layouts) hp_ty
+    match slot, hsl, hA with
+    | .dead, hsl, hA =>
+      exact ⟨id, _, hpid, hb, ha, hmax, hc, declSlotData_length_of_declOk hdok hsl, hA⟩
+    | .uninit, hsl, hA =>
+      exact ⟨id, _, hpid, hb, ha, hmax, hc, declSlotData_length_of_declOk hdok hsl, hA⟩
+    | .init v, hsl, hA =>
+      obtain ⟨pv, rfl⟩ := (DeclSlotOk_of_isPtrTy hp_ty (.init v)).mp hsl
+      obtain ⟨tAddr, tProv, _, _, hA'⟩ := hA
+      exact ⟨id, ptrBytes tAddr tProv, hpid, hb, ha, hmax, hc,
+        by rw [ptrBytes_length, hTd]; rfl, hA'⟩
 
 /-- A local that `LocalsOk` keeps out of the locals map is dead. -/
 theorem LocalsOk.dead_of_none {body : CapturedMir} {ctx : Ctx} {locals : List LocalSlot}
@@ -3385,7 +3462,8 @@ theorem evalValue_operandT {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
       refine ⟨fun bits hb => by simp [opBits, hs] at hb, fun _ => ?_⟩
       exact ⟨"access to a dead local", by simp [evalValue, evalPlace_local_none hshape j _ hloc hp]⟩
     | some p =>
-      obtain ⟨k, hpk, _, _, _, _, hA⟩ := hlo.storage j d slot p hd hs hp
+      obtain ⟨k, hpk, _, _, _, _, hA⟩ :=
+        hlo.storage_nonptr j d slot p hd hs hp (isPtrTy_false_of_scalarTypeOf hty)
       rw [hfragd.declSlotData, hitd] at hA
       have hplace := evalPlace_local_some hshape j _ hloc p hp
       match slot, hslot, hA with
@@ -3442,7 +3520,9 @@ theorem evalValue_operandT {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
               refine ⟨fun bits hb => by simp [opBits, hs] at hb, fun _ => ?_⟩
               exact ⟨"access to a dead local", by simp [evalValue, evalPlace_field_none hshape j _ hloc hp]⟩
             | some p =>
-              obtain ⟨k, hpk, _, haddr, _, _, hA⟩ := hlo.storage j d slot p hd hs hp
+              obtain ⟨k, hpk, _, haddr, _, _, hA⟩ :=
+                hlo.storage_nonptr j d slot p hd hs hp
+                  (isPtrTy_false_of_scalarTypeOf (scalarTypeOf_tuple ht))
               rw [declSlotData_of_some ht, hitd] at hA
               rw [hitd] at haddr
               have hplace := evalPlace_field0L hshape j it hgood hloc p hp haddr
@@ -3500,7 +3580,9 @@ theorem evalValue_operandT {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
             refine ⟨fun bits hb => by simp [opBits, hs] at hb, fun _ => ?_⟩
             exact ⟨"access to a dead local", by simp [evalValue, evalPlace_field_none hshape j _ hloc hp]⟩
           | some p =>
-            obtain ⟨k, hpk, _, haddr, _, _, hA⟩ := hlo.storage j d slot p hd hs hp
+            obtain ⟨k, hpk, _, haddr, _, _, hA⟩ :=
+              hlo.storage_nonptr j d slot p hd hs hp
+                (isPtrTy_false_of_scalarTypeOf (scalarTypeOf_tuple ht))
             rw [declSlotData_of_some ht, hitd] at hA
             rw [hitd] at haddr
             have hlen := tupleSlotData_length it' slot hgood.pos
@@ -3749,7 +3831,7 @@ theorem evalPlace_proj {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
                 Nat.mul_le_mul_right _ (by omega)
               omega
             obtain ⟨k, hpk, _, haddr, haddrMax, _, hA1⟩ :=
-              h1.locs.storage j d slot p hd hs hp
+              h1.locs.storage_nonptr j d slot p hd hs hp (isPtrTy_false_of_arrayTypeOf ha)
             rw [hitd] at hA1
             rw [hTd] at haddrMax
             simp only [tyBytes, Int.ofNat_eq_natCast, Int.toNat_natCast] at haddrMax
@@ -3805,7 +3887,8 @@ theorem evalPlace_proj {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
         have : idx * elemIt.size.bytes ≤ count * elemIt.size.bytes :=
           Nat.mul_le_mul_right _ (by omega)
         omega
-      obtain ⟨k, hpk, _, haddr, haddrMax, _, hA⟩ := h.locs.storage j d slot p hd hs hp
+      obtain ⟨k, hpk, _, haddr, haddrMax, _, hA⟩ :=
+        h.locs.storage_nonptr j d slot p hd hs hp (isPtrTy_false_of_arrayTypeOf ha)
       rw [hitd] at hA
       rw [hTd] at haddrMax
       simp only [tyBytes, Int.ofNat_eq_natCast, Int.toNat_natCast] at haddrMax
@@ -3870,7 +3953,8 @@ theorem evalValue_operand_array_proj {body : CapturedMir} {f : Gen.Function} {ct
         subst he
         obtain ⟨_, slot, hd', hs⟩ := h.slot_exists j hj
         rw [hd] at hd'; cases hd'
-        obtain ⟨⟨v, rfl⟩, _⟩ := h.nonScalar j d slot hd hs (scalarTypeOf_none_of_arrayTypeOf ha)
+        obtain ⟨⟨v, rfl⟩, _⟩ := h.nonScalar j d slot hd hs
+          (scalarTypeOf_none_of_arrayTypeOf ha) (isPtrTy_false_of_arrayTypeOf ha)
         have hslot := (DeclSlotOk_of_arrayTypeOf ha (.init v)).mp (h.slots j d (.init v) hd hs)
         have hitd : itOf d body.layouts = elemIt := itOf_eq_of_arrayTypeOf ha
         have hgood := arrayTypeOf_good ha
@@ -3886,7 +3970,8 @@ theorem evalValue_operand_array_proj {body : CapturedMir} {f : Gen.Function} {ct
           | some idx =>
             obtain ⟨hidx_lt, m1, hm1, h1⟩ := hpok idx hidx
             obtain ⟨k, hpk, _, _, _, _, hA1⟩ :=
-              h1.locs.storage j d (.init (.aggregate 0 elems)) p hd hs hp
+              h1.locs.storage_nonptr j d (.init (.aggregate 0 elems)) p hd hs hp
+                (isPtrTy_false_of_arrayTypeOf ha)
             rw [hitd, declSlotData_of_array ha] at hA1
             have hget : ∃ sc, elems[idx]? = some (.scalar sc) := by
               have hex : ∃ v, elems[idx]? = some v :=
@@ -3940,6 +4025,8 @@ theorem evalValue_operand {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     simp only [operandOk, placeOk, projOk, Bool.and_eq_true, decide_eq_true_eq] at hok
     obtain ⟨⟨_, hok⟩, _⟩ := hok
     split at hok <;> simp at hok
+  | .copy ⟨j, .deref :: _ :: _⟩, hok, _ =>
+    simp [operandOk, placeOk] at hok
   | .copy ⟨j, .field idx fieldTy :: rest⟩, hok, he =>
     have hit := operandIntType_of_operandOk hok
     simp only [operandOk, placeOk, Bool.and_eq_true, decide_eq_true_eq] at hok
@@ -3988,12 +4075,14 @@ theorem evalValue_operand {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
                 rw [hd] at hd'; cases hd'
                 obtain ⟨⟨rootVal, rfl⟩, _⟩ :=
                   h.nonScalar j d slot hd hs (scalarTypeOf_none_of_tupleTypeOf ht)
+                    (isPtrTy_false_of_tupleTypeOf ht)
                 obtain ⟨hrootWf, hrootVal⟩ :=
                   (DeclSlotOk_of_tupleTypeOf ht (.init rootVal)).mp
                     (h.slots j d (.init rootVal) hd hs)
                 obtain ⟨p, hp⟩ := h.locs.some_of_live hs (by simp)
                 obtain ⟨k, hpk, _, haddr, haddrMax, _, hA⟩ :=
-                  h.locs.storage j d (.init rootVal) p hd hs hp
+                  h.locs.storage_nonptr j d (.init rootVal) p hd hs hp
+                    (isPtrTy_false_of_tupleTypeOf ht)
                 obtain ⟨hTd, _⟩ := tyOf_tupleSpec ht
                 rw [declSlotData_of_tupleSpec ht] at hA
                 obtain ⟨hleafWf, hrelBound⟩ := resolveFieldPath_wf hrootWf hres
@@ -4468,12 +4557,14 @@ theorem evalValue_arrayRvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx
     have hloc := ((translateFn_spec body f h.hf).2.1 j d hd).2
     rw [hTd] at hloc
     obtain ⟨⟨v, rfl⟩, _⟩ := h.nonScalar j d slot hd hs (scalarTypeOf_none_of_arrayTypeOf hty)
+      (isPtrTy_false_of_arrayTypeOf hty)
     have hslot := (DeclSlotOk_of_arrayTypeOf hty (.init v)).mp (h.slots j d (.init v) hd hs)
     match v, hslot with
     | .aggregate 0 elems, ⟨hlen, he⟩ =>
       obtain ⟨p, hp⟩ := h.locs.some_of_live hs (by simp)
       obtain ⟨k, hpk, _, _, _, _, hA⟩ :=
-        h.locs.storage j d (.init (.aggregate 0 elems)) p hd hs hp
+        h.locs.storage_nonptr j d (.init (.aggregate 0 elems)) p hd hs hp
+          (isPtrTy_false_of_arrayTypeOf hty)
       rw [hitd, declSlotData_of_array hty] at hA
       have hplace := evalPlace_local_some h.shape j _ hloc p hp
       obtain ⟨m1, hm1, hshape1⟩ := typedLoad_ptr_array h.shape p k hpk elemIt count elems
@@ -4666,11 +4757,13 @@ theorem evalPlace_tuplePlace {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
   rw [hd] at hd'; cases hd'
   obtain ⟨⟨rootVal, rfl⟩, _⟩ :=
     h.nonScalar pl.local_ d slot hd hs (scalarTypeOf_none_of_tupleTypeOf ht)
+      (isPtrTy_false_of_tupleTypeOf ht)
   obtain ⟨hrootWf, hrootVal⟩ :=
     (DeclSlotOk_of_tupleTypeOf ht (.init rootVal)).mp (h.slots pl.local_ d (.init rootVal) hd hs)
   obtain ⟨ptr, hptr⟩ := h.locs.some_of_live hs (by simp)
   obtain ⟨k, hpk, _, haddr, haddrMax, _, hA⟩ :=
-    h.locs.storage pl.local_ d (.init rootVal) ptr hd hs hptr
+    h.locs.storage_nonptr pl.local_ d (.init rootVal) ptr hd hs hptr
+      (isPtrTy_false_of_tupleTypeOf ht)
   obtain ⟨hTd, _⟩ := tyOf_tupleSpec ht
   rw [declSlotData_of_tupleSpec ht] at hA
   obtain ⟨hleafWf, hrelBound⟩ := resolveFieldPath_wf hrootWf hres
@@ -4741,7 +4834,8 @@ theorem evalValue_specOperand {body : CapturedMir} {f : Gen.Function} {ctx : Ctx
         obtain ⟨leafVal, hread, hleafValOk, hslice, _⟩ :=
           resolveFieldPath_read hrootWf hrootVal hres
         obtain ⟨k, hpk, _, _, _, _, hA⟩ :=
-          h.locs.storage pl.local_ d (.init rootVal) ptr hd hs hptr
+          h.locs.storage_nonptr pl.local_ d (.init rootVal) ptr hd hs hptr
+            (isPtrTy_false_of_tupleTypeOf ht)
         rw [declSlotData_of_tupleSpec ht] at hA
         have hdlen : ((TupleSpec.tuple rootFields rootSize rootAlign).encodeVal rootVal).length = rootSize :=
           TupleSpec.encodeVal_length (.tuple rootFields rootSize rootAlign) rootVal hrootWf
@@ -4916,36 +5010,78 @@ theorem prov_inj (a b : Nat) :
   · intro h; simp at h; omega
   · intro h; subst h; rfl
 
-/-- The allocation behind a local is the one its pointer's provenance names. -/
+/-- The allocation behind a non-pointer local is the one its pointer's provenance names. -/
 theorem LocalsOkA.storage_id {body : CapturedMir} {ctx : Ctx} {al : List Nat}
     {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {A : List Gen.Allocation}
     (hlo : LocalsOkA body ctx al locals lm A)
     {i : Nat} {d : LocalDecl} {slot : LocalSlot} {p : Ptr} (hd : body.localDecls[i]? = some d)
     (hs : locals[i]? = some slot) (hp : mapGet lm (localName i) = some p) {k : Nat}
-    (hpk : p.provenance = some (⟨(k : Int)⟩, ())) :
+    (hpk : p.provenance = some (⟨(k : Int)⟩, ())) (hnp : isPtrTy d.ty = false) :
     ctx.base.length ≤ k ∧ AddrOk p.addr (itOf d body.layouts) ∧
       p.addr + (tyBytes (tyOf d body.layouts) : Int) < 2 ^ 64 ∧
       AddrClass p.addr (tyBytes (tyOf d body.layouts)) ∧
       A[k]? = some (stackAlloc p.addr (itOf d body.layouts) (declSlotData d slot body.layouts)) := by
-  obtain ⟨id, hpid, hb, ha, hmax, hc, hA⟩ := hlo.storage i d slot p hd hs hp
+  obtain ⟨id, hpid, hb, ha, hmax, hc, hA⟩ := hlo.storage_nonptr i d slot p hd hs hp hnp
   have : id = k := (prov_inj id k).mp (hpid.symm.trans hpk)
   subst this
   exact ⟨hb, ha, hmax, hc, hA⟩
 
-/-- Writing the live slot `slot'` into the live local `_i`, whose allocation is
-`k`, keeps `LocalsOk`. -/
+/-- The allocation behind any well-typed local (including raw-pointer locals)
+is the one its pointer's provenance names. -/
+theorem LocalsOkA.storage_any_id {body : CapturedMir} {ctx : Ctx} {al : List Nat}
+    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {A : List Gen.Allocation}
+    (hlo : LocalsOkA body ctx al locals lm A)
+    {i : Nat} {d : LocalDecl} {slot : LocalSlot} {p : Ptr} (hd : body.localDecls[i]? = some d)
+    (hs : locals[i]? = some slot) (hp : mapGet lm (localName i) = some p) {k : Nat}
+    (hpk : p.provenance = some (⟨(k : Int)⟩, ()))
+    (hdok : localDeclOk body.layouts d = true) :
+    ∃ data : List Byte,
+      ctx.base.length ≤ k ∧ AddrOk p.addr (itOf d body.layouts) ∧
+      p.addr + (tyBytes (tyOf d body.layouts) : Int) < 2 ^ 64 ∧
+      AddrClass p.addr (tyBytes (tyOf d body.layouts)) ∧
+      data.length = tyBytes (tyOf d body.layouts) ∧
+      A[k]? = some (stackAlloc p.addr (itOf d body.layouts) data) := by
+  obtain ⟨id, data, hpid, hb, ha, hmax, hc, hlen, hA⟩ := hlo.storage_any hd hs hp hdok
+  have : id = k := (prov_inj id k).mp (hpid.symm.trans hpk)
+  subst this
+  exact ⟨data, hb, ha, hmax, hc, hlen, hA⟩
+
+/-- Writing the live non-pointer slot `slot'` (or `.uninit` on any local) into
+the live local `_i`, whose allocation is `k`, keeps `LocalsOk`. -/
+theorem LocalStorage.congr_getElem? {ctx : Ctx} {A A' : List Gen.Allocation}
+    {d : LocalDecl} {slot : LocalSlot} {p : Ptr} {layouts : Layout.LayoutTable}
+    (h : LocalStorage ctx A d slot p layouts)
+    (heq : ∀ (id : Nat), p.provenance = some (⟨(id : Int)⟩, ()) → A'[id]? = A[id]?) :
+    LocalStorage ctx A' d slot p layouts := by
+  obtain ⟨id, hpid, hb, ha, hmax, hc, hA⟩ := h
+  refine ⟨id, hpid, hb, ha, hmax, hc, ?_⟩
+  simpa only [heq id hpid] using hA
+
 theorem LocalsOk.store {body : CapturedMir} {ctx : Ctx} {locals : List LocalSlot}
     {lm : Map Gen.LocalName Ptr} {A : List Gen.Allocation} (hlo : LocalsOk body ctx locals lm A)
     (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d) (slot slot' : LocalSlot)
     (hs : locals[i]? = some slot) (hlive' : slot' ≠ .dead)
     (hslot' : DeclSlotOk d slot' body.layouts)
     (p : Ptr) (hp : mapGet lm (localName i) = some p) (k : Nat)
-    (hpk : p.provenance = some (⟨(k : Int)⟩, ())) :
+    (hpk : p.provenance = some (⟨(k : Int)⟩, ()))
+    (hnp : isPtrTy d.ty = false ∨ (∀ pv, slot' ≠ .init (.ptr pv 8))) :
     LocalsOk body ctx (locals.set i slot') lm
       (A.set k (stackAlloc p.addr (itOf d body.layouts) (declSlotData d slot' body.layouts))) := by
   have hil : i < locals.length := (List.getElem?_eq_some_iff.mp hs).1
-  obtain ⟨hbase, haddr, haddrMax, hcls, hA⟩ := hlo.storage_id hd hs hp hpk
-  have hk : k < A.length := (List.getElem?_eq_some_iff.mp hA).1
+  obtain ⟨id0, hpid0, hbase, haddr, haddrMax, hcls, hA0⟩ := hlo.storage i d slot p hd hs hp
+  have hid0 : id0 = k := (prov_inj id0 k).mp (hpid0.symm.trans hpk)
+  subst id0
+  have hk : k < A.length := by
+    cases hp_ty : isPtrTy d.ty with
+    | false =>
+      simp only [hp_ty, Bool.false_eq_true, ↓reduceIte] at hA0
+      exact (List.getElem?_eq_some_iff.mp hA0).1
+    | true =>
+      simp only [hp_ty, ↓reduceIte] at hA0
+      split at hA0
+      · obtain ⟨_, _, _, _, hAk⟩ := hA0
+        exact (List.getElem?_eq_some_iff.mp hAk).1
+      · exact (List.getElem?_eq_some_iff.mp hA0).1
   refine {
     nlocals := by simp [hlo.nlocals]
     slots := ?_
@@ -4981,16 +5117,21 @@ theorem LocalsOk.store {body : CapturedMir} {ctx : Ctx} {locals : List LocalSlot
       rw [hd] at hdj; cases hdj
       rw [hp] at hq; cases hq
       rw [List.getElem?_set_self hil] at hsj; cases hsj
-      exact ⟨k, hpk, hbase, haddr, haddrMax, hcls, List.getElem?_set_self hk⟩
+      refine ⟨k, hpk, hbase, haddr, haddrMax, hcls, ?_⟩
+      cases hp_ty : isPtrTy d.ty with
+      | false =>
+        simp [List.getElem?_set_self hk]
+      | true =>
+        simp only [↓reduceIte]
+        rcases hnp with hfalse | hnotPtr
+        · rw [hp_ty] at hfalse; cases hfalse
+        · split
+          · next pv => exact False.elim (hnotPtr pv rfl)
+          · exact List.getElem?_set_self hk
     · rw [List.getElem?_set_ne hij] at hsj
-      obtain ⟨id, hqid, hb', ha', hmax', hc', hA'⟩ := hlo.storage j dj sj q hdj hsj hq
-      refine ⟨id, hqid, hb', ha', hmax', hc', ?_⟩
-      have hne : k ≠ id := by
-        intro hki
-        subst hki
-        exact hij (hlo.inj i j p q hp hq (by rw [hpk, hqid]))
-      rw [List.getElem?_set_ne hne]
-      exact hA'
+      refine (hlo.storage j dj sj q hdj hsj hq).congr_getElem? (fun id hqid => ?_)
+      have hne : k ≠ id := fun hki => hij (hlo.inj i j p q hp hq (by subst hki; rw [hpk, hqid]))
+      exact List.getElem?_set_ne hne
   · intro id a ha hlivea hb
     by_cases hki : k = id
     · subst hki
@@ -4998,13 +5139,96 @@ theorem LocalsOk.store {body : CapturedMir} {ctx : Ctx} {locals : List LocalSlot
     · rw [List.getElem?_set_ne hki] at ha
       exact hlo.owned id a ha hlivea hb
 
+/-- Writing an initialized thin raw pointer `.init (.ptr ptrVal 8)` backed by
+`ptrBytes tAddr tProv` (`tAddr < 2 ^ 64`) into raw-pointer local `_i`, whose
+allocation is `k`, keeps `LocalsOk`. -/
+theorem LocalsOk.store_ptr {body : CapturedMir} {ctx : Ctx} {locals : List LocalSlot}
+    {lm : Map Gen.LocalName Ptr} {A : List Gen.Allocation} (hlo : LocalsOk body ctx locals lm A)
+    (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d) (hp_ty : isPtrTy d.ty = true)
+    (slot : LocalSlot) (hs : locals[i]? = some slot)
+    (ptrVal : ProvenancePtr) (tAddr : Nat) (tProv : Option Prov) (htlt : tAddr < 2 ^ 64)
+    (htgt : ∀ a pr, ctx.ptrTargets ptrVal.allocId = some (a, pr) → tAddr = a ∧ tProv = pr)
+    (p : Ptr) (hp : mapGet lm (localName i) = some p) (k : Nat)
+    (hpk : p.provenance = some (⟨(k : Int)⟩, ())) :
+    LocalsOk body ctx (locals.set i (.init (.ptr ptrVal 8))) lm
+      (A.set k (stackAlloc p.addr (itOf d body.layouts) (ptrBytes tAddr tProv))) := by
+  have hil : i < locals.length := (List.getElem?_eq_some_iff.mp hs).1
+  obtain ⟨id0, hpid0, hbase, haddr, haddrMax, hcls, hA0⟩ := hlo.storage i d slot p hd hs hp
+  have hid0 : id0 = k := (prov_inj id0 k).mp (hpid0.symm.trans hpk)
+  subst id0
+  have hk : k < A.length := by
+    simp only [hp_ty, ↓reduceIte] at hA0
+    split at hA0
+    · obtain ⟨_, _, _, _, hAk⟩ := hA0
+      exact (List.getElem?_eq_some_iff.mp hAk).1
+    · exact (List.getElem?_eq_some_iff.mp hA0).1
+  have hslot' : DeclSlotOk d (.init (.ptr ptrVal 8)) body.layouts := by
+    rw [DeclSlotOk_of_isPtrTy hp_ty]
+    exact ⟨ptrVal, rfl⟩
+  refine {
+    nlocals := by simp [hlo.nlocals]
+    slots := ?_
+    base := ?_
+    keysNodup := hlo.keysNodup
+    keysLocal := hlo.keysLocal
+    live := ?_
+    storage := ?_
+    inj := hlo.inj
+    owned := ?_ }
+  · intro j dj sj hdj hsj
+    by_cases hij : i = j
+    · subst hij
+      rw [hd] at hdj; cases hdj
+      rw [List.getElem?_set_self hil] at hsj; cases hsj
+      exact hslot'
+    · rw [List.getElem?_set_ne hij] at hsj
+      exact hlo.slots j dj sj hdj hsj
+  · obtain ⟨R, hR⟩ := hlo.base
+    refine ⟨R.set (k - ctx.base.length)
+        (stackAlloc p.addr (itOf d body.layouts) (ptrBytes tAddr tProv)), ?_⟩
+    rw [hR, List.set_append_right _ _ hbase]
+  · intro j sj hsj
+    by_cases hij : i = j
+    · subst hij
+      rw [List.getElem?_set_self hil] at hsj; cases hsj
+      simp [hp]
+    · rw [List.getElem?_set_ne hij] at hsj
+      exact hlo.live j sj hsj
+  · intro j dj sj q hdj hsj hq
+    by_cases hij : i = j
+    · subst hij
+      rw [hd] at hdj; cases hdj
+      rw [hp] at hq; cases hq
+      rw [List.getElem?_set_self hil] at hsj; cases hsj
+      refine ⟨k, hpk, hbase, haddr, haddrMax, hcls, ?_⟩
+      simp only [hp_ty, ↓reduceIte]
+      exact ⟨tAddr, tProv, htlt, htgt, List.getElem?_set_self hk⟩
+    · rw [List.getElem?_set_ne hij] at hsj
+      refine (hlo.storage j dj sj q hdj hsj hq).congr_getElem? (fun id hqid => ?_)
+      have hne : k ≠ id := fun hki => hij (hlo.inj i j p q hp hq (by subst hki; rw [hpk, hqid]))
+      exact List.getElem?_set_ne hne
+  · intro id a ha hlivea hb
+    by_cases hki : k = id
+    · subst hki
+      exact ⟨i, p, hp, hpk⟩
+    · rw [List.getElem?_set_ne hki] at ha
+      exact hlo.owned id a ha hlivea hb
+
+theorem FragTy.not_isPtrTy {d : LocalDecl} {layouts : Layout.LayoutTable}
+    (h : FragTy (tyOf d layouts) (itOf d layouts)) : isPtrTy d.ty = false := by
+  cases hp : isPtrTy d.ty
+  · rfl
+  · have hT := (tyOf_isPtrTy (layouts := layouts) hp).1
+    rw [hT] at h
+    cases h
+
 theorem FragTy.declSlotOk {d : LocalDecl} {layouts : Layout.LayoutTable}
     (h : FragTy (tyOf d layouts) (itOf d layouts)) (slot : LocalSlot) :
     DeclSlotOk d slot layouts ↔ SlotOk (tyOf d layouts) slot := by
   unfold DeclSlotOk
   split
   · rfl
-  · cases slot <;> simp [h.not_array, h.not_tupleSpec, SlotOk]
+  · cases slot <;> simp [h.not_array, h.not_tupleSpec, h.not_isPtrTy, SlotOk]
 
 /-- `Machine::eval_statement` on an assignment to the live local `_i` whose
 source evaluates to the value of a valid bit pattern `r` of `_i`'s type
@@ -5028,7 +5252,7 @@ theorem evalStatement_assign_of {body : CapturedMir} {f : Gen.Function} {ctx : C
   have hslive : slot ≠ .dead := fun hc => hlive (hc ▸ hs)
   obtain ⟨p, hp⟩ := h.locs.some_of_live hs hslive
   obtain ⟨k, hpk, _⟩ := h1.locs.storage i d slot p hd hs hp
-  obtain ⟨_, _, _, _, hA⟩ := h1.locs.storage_id hd hs hp hpk
+  obtain ⟨_, _, _, _, hA⟩ := h1.locs.storage_id hd hs hp hpk hT.not_isPtrTy
   have hplace := evalPlace_local_some h.shape i _ hspec.2 p hp
   rw [hT.declSlotData] at hA
   have hst := typedStore_ptr_frag h1.shape p k hpk hT _ r hr hA (slotData_length _ _)
@@ -5041,6 +5265,7 @@ theorem evalStatement_assign_of {body : CapturedMir} {f : Gen.Function} {ctx : C
     (hT.declSlotOk _).mpr ⟨hT.tyBytes.symm, hr⟩
   have hlo' := h1.locs.store i d hd slot
     (.init (.scalar ⟨r, (itOf d body.layouts).size.bytes⟩)) hs (by simp) hslot' p hp k hpk
+    (.inl hT.not_isPtrTy)
   rw [hT.declSlotData] at hlo'
   exact hlo'
 
@@ -5113,6 +5338,7 @@ theorem evalStatement_assign_array {body : CapturedMir} {f : Gen.Function} {ctx 
   rw [hTd] at hloc
   obtain ⟨_, slot, _, hs⟩ := h.slot_exists i hi
   obtain ⟨⟨v0, rfl⟩, _⟩ := h.nonScalar i d slot hd hs (scalarTypeOf_none_of_arrayTypeOf ha)
+    (isPtrTy_false_of_arrayTypeOf ha)
   obtain ⟨p, hp⟩ := h.locs.some_of_live hs (by simp)
   have hplace := evalPlace_local_some h.shape i _ hloc p hp
   obtain ⟨hrok, hrnone⟩ := evalValue_arrayRvalue h elemIt count hgood rv hok e he
@@ -5123,7 +5349,8 @@ theorem evalStatement_assign_array {body : CapturedMir} {f : Gen.Function} {ctx 
     simpa [tyBytes] using hlen'
   refine ⟨fun elems hr => ?_, fun hnone => ?_⟩
   · obtain ⟨hlen, helemOk, m1, hm1, h1⟩ := hrok elems hr
-    obtain ⟨k, hpk, _, _, _, _, hA1⟩ := h1.locs.storage i d (.init v0) p hd hs hp
+    obtain ⟨k, hpk, _, _, _, _, hA1⟩ :=
+      h1.locs.storage_nonptr i d (.init v0) p hd hs hp (isPtrTy_false_of_arrayTypeOf ha)
     rw [hitd] at hA1
     have hst := typedStore_ptr_array h1.shape p k hpk elemIt count
       (declSlotData d (.init v0) body.layouts) elems hgood hA1 hdlen hlen helemOk
@@ -5135,7 +5362,7 @@ theorem evalStatement_assign_array {body : CapturedMir} {f : Gen.Function} {ctx 
     have hslot' : DeclSlotOk d (.init (.aggregate 0 elems)) body.layouts :=
       (DeclSlotOk_of_arrayTypeOf ha _).mpr ⟨hlen, helemOk⟩
     have hlo' := h1.locs.store i d hd (.init v0) (.init (.aggregate 0 elems)) hs (by simp)
-      hslot' p hp k hpk
+      hslot' p hp k hpk (.inl (isPtrTy_false_of_arrayTypeOf ha))
     rw [hitd, declSlotData_of_array ha] at hlo'
     exact hlo'
   · obtain ⟨msg, hmsg⟩ := hrnone hnone
@@ -5174,7 +5401,8 @@ theorem evalStatement_assign_index {body : CapturedMir} {f : Gen.Function} {ctx 
     obtain ⟨hrok, _⟩ := evalValue_rvalue h1 elemIt hgood rv hok e he
     obtain ⟨hrlt, m2, hm2, h2⟩ := hrok r hr
     obtain ⟨k, hpk, _, _, _, _, hA2⟩ :=
-      h2.locs.storage i d (.init (.aggregate 0 elems)) p hd hs hp
+      h2.locs.storage_nonptr i d (.init (.aggregate 0 elems)) p hd hs hp
+        (isPtrTy_false_of_arrayTypeOf ha)
     rw [hitd, declSlotData_of_array ha] at hA2
     have hst := typedStore_ptr_array_elem h2.shape p k hpk idx elemIt count elems r
       hgood hlen hidx_lt hrlt hA2
@@ -5194,7 +5422,7 @@ theorem evalStatement_assign_index {body : CapturedMir} {f : Gen.Function} {ctx 
       (DeclSlotOk_of_arrayTypeOf ha _).mpr ⟨by simp [hlen], helemOk'⟩
     have hlo' := h2.locs.store i d hd (.init (.aggregate 0 elems))
       (.init (.aggregate 0 (elems.set idx (.scalar ⟨r, elemIt.size.bytes⟩)))) hs (by simp)
-      hslot' p hp k hpk
+      hslot' p hp k hpk (.inl (isPtrTy_false_of_arrayTypeOf ha))
     rw [hitd, declSlotData_of_array ha] at hlo'
     exact hlo'
   · cases hidx : projIdx locals count proj with
@@ -5241,7 +5469,8 @@ theorem evalStatement_assign_tuple {body : CapturedMir} {f : Gen.Function} {ctx 
     obtain ⟨newRootVal, hwpath, hnewRootOk, hnewEnc, hwsem⟩ :=
       resolveFieldPath_write hrootWf hrootVal hres hnewValOk
     obtain ⟨k, hpk, _, _, _, _, hA1⟩ :=
-      h1.locs.storage dst.local_ d (.init rootVal) ptr hd hs hptr
+      h1.locs.storage_nonptr dst.local_ d (.init rootVal) ptr hd hs hptr
+        (isPtrTy_false_of_tupleTypeOf ht)
     rw [declSlotData_of_tupleSpec ht] at hA1
     have hst := typedStore_ptr_tuple_slice h1.shape ptr k hpk (itOf d body.layouts)
       ((TupleSpec.tuple rootFields rootSize rootAlign).encodeVal rootVal) hA1
@@ -5257,7 +5486,7 @@ theorem evalStatement_assign_tuple {body : CapturedMir} {f : Gen.Function} {ctx 
     have hslot' : DeclSlotOk d (.init newRootVal) body.layouts :=
       (DeclSlotOk_of_tupleTypeOf ht _).mpr ⟨hrootWf, hnewRootOk⟩
     have hlo' := h1.locs.store dst.local_ d hd (.init rootVal) (.init newRootVal) hs (by simp)
-      hslot' ptr hptr k hpk
+      hslot' ptr hptr k hpk (.inl (isPtrTy_false_of_tupleTypeOf ht))
     rw [declSlotData_of_tupleSpec ht] at hlo'
     exact hlo'
   · obtain ⟨msg, hmsg⟩ := hrnone hnone
@@ -5318,7 +5547,8 @@ theorem evalStatement_assign_field_scalar {body : CapturedMir} {f : Gen.Function
         rw [hTd] at hloc
         obtain ⟨ptr, hptr⟩ := h.locs.some_of_live hs (by simp)
         obtain ⟨k, hpk, _, haddr, haddrMax, _, hA⟩ :=
-          h.locs.storage i d (.init rootVal) ptr hd hs hptr
+          h.locs.storage_nonptr i d (.init rootVal) ptr hd hs hptr
+            (isPtrTy_false_of_tupleTypeOf ht)
         rw [declSlotData_of_tupleSpec ht] at hA
         have hplaceBase := evalPlace_local_some h.shape i _ hloc ptr hptr
         have hdlen : ((TupleSpec.tuple rootFields rootSize rootAlign).encodeVal rootVal).length = rootSize :=
@@ -5348,7 +5578,8 @@ theorem evalStatement_assign_field_scalar {body : CapturedMir} {f : Gen.Function
           obtain ⟨newRootVal, hwpath, hnewRootOk, hnewEnc, hwsem⟩ :=
             resolveFieldPath_write hrootWf hrootVal hres hnewValOk
           obtain ⟨k1, hpk1, _, _, _, _, hA1⟩ :=
-            h1.locs.storage i d (.init rootVal) ptr hd hs hptr
+            h1.locs.storage_nonptr i d (.init rootVal) ptr hd hs hptr
+              (isPtrTy_false_of_tupleTypeOf ht)
           have hkEq : k1 = k := (prov_inj k1 k).mp (hpk1.symm.trans hpk)
           subst hkEq
           rw [declSlotData_of_tupleSpec ht] at hA1
@@ -5367,7 +5598,7 @@ theorem evalStatement_assign_field_scalar {body : CapturedMir} {f : Gen.Function
           have hslot' : DeclSlotOk d (.init newRootVal) body.layouts :=
             (DeclSlotOk_of_tupleTypeOf ht _).mpr ⟨hrootWf, hnewRootOk⟩
           have hlo' := h1.locs.store i d hd (.init rootVal) (.init newRootVal) hs (by simp)
-            hslot' ptr hptr k1 hpk1
+            hslot' ptr hptr k1 hpk1 (.inl (isPtrTy_false_of_tupleTypeOf ht))
           rw [declSlotData_of_tupleSpec ht] at hlo'
           exact hlo'
         · obtain ⟨msg, hmsg⟩ := hrnone hnone
@@ -5419,7 +5650,8 @@ theorem evalStatement_placeMention_place {body : CapturedMir} {f : Gen.Function}
         refine ⟨hi, fun hlive => ?_, fun hdead hal => ?_⟩
         · obtain ⟨q, hq⟩ := h.locs.some_of_live hs (fun hc => hlive (hc ▸ hs))
           obtain ⟨k, hqk, _⟩ := h.locs.storage i d slot q hd hs hq
-          obtain ⟨_, haddr, _, _, _⟩ := h.locs.storage_id hd hs hq hqk
+          obtain ⟨_, haddr, _, _, _⟩ :=
+            h.locs.storage_id hd hs hq hqk (isPtrTy_false_of_scalarTypeOf (scalarTypeOf_tuple htup))
           rw [hitd] at haddr
           have hplace := evalPlace_field0L h.shape i it (intBoolTupleOf_good htup) hloc q hq haddr
           simp [evalStatement, hplace]
@@ -5436,7 +5668,8 @@ theorem evalStatement_placeMention_place {body : CapturedMir} {f : Gen.Function}
         refine ⟨hi, fun hlive => ?_, fun hdead hal => ?_⟩
         · obtain ⟨q, hq⟩ := h.locs.some_of_live hs (fun hc => hlive (hc ▸ hs))
           obtain ⟨k, hqk, _⟩ := h.locs.storage i d slot q hd hs hq
-          obtain ⟨_, haddr, _, _, hA⟩ := h.locs.storage_id hd hs hq hqk
+          obtain ⟨_, haddr, _, _, hA⟩ :=
+            h.locs.storage_id hd hs hq hqk (isPtrTy_false_of_scalarTypeOf (scalarTypeOf_tuple htup))
           rw [declSlotData_of_some htup, hitd] at hA
           rw [hitd] at haddr
           have hlen := tupleSlotData_length it slot hgood.pos
@@ -5456,13 +5689,15 @@ theorem evalStatement_placeMention_place {body : CapturedMir} {f : Gen.Function}
         simp only [translatePlace] at hpe
         obtain ⟨⟨rootVal, rfl⟩, _⟩ :=
           h.nonScalar i d slot hd hs (scalarTypeOf_none_of_tupleTypeOf htspec)
+            (isPtrTy_false_of_tupleTypeOf htspec)
         obtain ⟨hrootWf, _⟩ :=
           (DeclSlotOk_of_tupleTypeOf htspec (.init rootVal)).mp
             (h.slots i d (.init rootVal) hd hs)
         refine ⟨hi, fun _ => ?_, fun hdead _ => by rw [hs] at hdead; cases hdead⟩
         obtain ⟨q, hq⟩ := h.locs.some_of_live hs (by simp)
         obtain ⟨k, hqk, _, haddr, haddrMax, _, hA⟩ :=
-          h.locs.storage i d (.init rootVal) q hd hs hq
+          h.locs.storage_nonptr i d (.init rootVal) q hd hs hq
+            (isPtrTy_false_of_tupleTypeOf htspec)
         obtain ⟨hTd, _⟩ := tyOf_tupleSpec htspec
         rw [declSlotData_of_tupleSpec htspec] at hA
         have hloc := ((translateFn_spec body f h.hf).2.1 i d hd).2
@@ -6094,7 +6329,8 @@ theorem evalValue_operandTuple {body : CapturedMir} {f : Gen.Function} {ctx : Ct
       exact ⟨"access to a dead local", by simp [evalValue, evalPlace_local_none h.shape j _ hloc hp]⟩
     | some p =>
       obtain ⟨k, hpk, _⟩ := h.locs.storage j d slot p hd hs hp
-      obtain ⟨_, _, _, _, hA⟩ := h.locs.storage_id hd hs hp hpk
+      obtain ⟨_, _, _, _, hA⟩ :=
+        h.locs.storage_id hd hs hp hpk (isPtrTy_false_of_scalarTypeOf (scalarTypeOf_tuple ht))
       rw [declSlotData_of_some ht, hitd] at hA
       have hplace := evalPlace_local_some h.shape j _ hloc p hp
       match slot, hslot, hA with
@@ -6236,7 +6472,8 @@ theorem evalStatement_assignTuple {body : CapturedMir} {f : Gen.Function} {ctx :
   refine ⟨fun bits b hbb => ?_, fun hnone => ?_⟩
   · obtain ⟨hbits, hb, m1, hm1, h1⟩ := hrok bits b hbb
     obtain ⟨k, hpk, _⟩ := h1.locs.storage i d slot p hd hs hp
-    obtain ⟨_, _, _, _, hA⟩ := h1.locs.storage_id hd hs hp hpk
+    obtain ⟨_, _, _, _, hA⟩ :=
+      h1.locs.storage_id hd hs hp hpk (isPtrTy_false_of_scalarTypeOf (scalarTypeOf_tuple htup))
     rw [declSlotData_of_some htup] at hA
     have hlen := tupleSlotData_length (itOf d body.layouts) slot hgood.pos
     have hst := typedStore_ptr_tuple h1.shape p k hpk (itOf d body.layouts) hgood _
@@ -6254,6 +6491,7 @@ theorem evalStatement_assignTuple {body : CapturedMir} {f : Gen.Function} {ctx :
         (DeclSlotOk_of_scalarTypeOf (scalarTypeOf_tuple htup) newSlot).mpr
           ⟨itOf d body.layouts, by rw [htyd, tupleIntOfTy_intBoolTupleTy], rfl, hbits, rfl, hb⟩
       have hlo' := h1.locs.store i d hd slot newSlot hs (by simp [newSlot]) hslot' p hp k hpk
+        (.inl (isPtrTy_false_of_scalarTypeOf (scalarTypeOf_tuple htup)))
       simp only [declSlotData_of_some htup, newSlot, tupleSlotData] at hlo'
       exact hlo'
   · obtain ⟨msg, hmsg⟩ := hrnone hnone
@@ -6432,14 +6670,17 @@ theorem LocalsOkA.entries_length {body : CapturedMir} {ctx : Ctx} {al : List Nat
 theorem NonScalarLive.filter_scalar {body : CapturedMir} {locals : List LocalSlot}
     {lm : Map Gen.LocalName Ptr} (hns : NonScalarLive body locals lm)
     {i : Nat} {d : LocalDecl} (hd : body.localDecls[i]? = some d)
-    (hscalar : (scalarTypeOf d.ty).isSome = true) (ns : LocalSlot) :
+    (hscalar : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true) (ns : LocalSlot) :
     NonScalarLive body (locals.set i ns)
       ⟨lm.entries.filter (fun e => !decide (e.1 = localName i))⟩ := by
-  intro j dj slot hdj hsj hnone
+  intro j dj slot hdj hsj hnone hnp
   by_cases hij : i = j
-  · subst hij; rw [hd] at hdj; cases hdj; simp [hnone] at hscalar
+  · subst hij; rw [hd] at hdj; cases hdj
+    rcases hscalar with hsc | hp
+    · simp [hnone] at hsc
+    · simp [hnp] at hp
   · rw [List.getElem?_set_ne hij] at hsj
-    obtain ⟨hv, hp⟩ := hns j dj slot hdj hsj hnone
+    obtain ⟨hv, hp⟩ := hns j dj slot hdj hsj hnone hnp
     refine ⟨hv, fun p hget => hp p ?_⟩
     rw [mapGet_filter_key] at hget
     have hne : localName j ≠ localName i := by simp [localName_inj, Ne.symm hij]
@@ -6448,13 +6689,16 @@ theorem NonScalarLive.filter_scalar {body : CapturedMir} {locals : List LocalSlo
 theorem NonScalarLive.append_scalar {body : CapturedMir} {locals : List LocalSlot}
     {lm : Map Gen.LocalName Ptr} (hns : NonScalarLive body locals lm)
     {i : Nat} {d : LocalDecl} (hd : body.localDecls[i]? = some d)
-    (hscalar : (scalarTypeOf d.ty).isSome = true)
+    (hscalar : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true)
     (hnot : ∀ e ∈ lm.entries, e.1 ≠ localName i) (newPtr : Ptr) :
     NonScalarLive body locals ⟨lm.entries ++ [(localName i, newPtr)]⟩ := by
-  intro j dj slot hdj hsj hnone
+  intro j dj slot hdj hsj hnone hnp
   by_cases hij : i = j
-  · subst hij; rw [hd] at hdj; cases hdj; simp [hnone] at hscalar
-  · obtain ⟨hv, hp⟩ := hns j dj slot hdj hsj hnone
+  · subst hij; rw [hd] at hdj; cases hdj
+    rcases hscalar with hsc | hp
+    · simp [hnone] at hsc
+    · simp [hnp] at hp
+  · obtain ⟨hv, hp⟩ := hns j dj slot hdj hsj hnone hnp
     refine ⟨hv, fun p hget => hp p ?_⟩
     rw [mapGet_append_single _ _ _ _ hnot] at hget
     have hne : localName j ≠ localName i := by simp [localName_inj, Ne.symm hij]
@@ -6477,59 +6721,68 @@ theorem CM_store_whole {cm : Gen.ConcurrentMemory BM} {p : Ptr} {k : Nat}
     Allocation.size, hlen, writeSubsliceAtIndex, listSet, hne']
 
 theorem scalar_tyBytes_pos {d : LocalDecl} {layouts : Layout.LayoutTable}
-    (h : (scalarTypeOf d.ty).isSome = true) :
+    (h : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true) :
     0 < tyBytes (tyOf d layouts) := by
-  obtain ⟨T, hs⟩ := Option.isSome_iff_exists.mp h
-  rcases scalarTypeOf_cases hs with ⟨hb, _⟩ | ⟨it, hit, _⟩ | ⟨ho, _⟩ | ⟨it, ht, _⟩
-  · obtain ⟨h1, h2⟩ := tyOf_bool (layouts := layouts) hb
-    have hf : FragTy (tyOf d layouts) (itOf d layouts) := by rw [h1, h2]; exact .bool
-    rw [hf.tyBytes]; exact hf.good.pos
-  · obtain ⟨h1, h2⟩ := tyOf_int (layouts := layouts) hit
-    have hf : FragTy (tyOf d layouts) (itOf d layouts) :=
-      by rw [h1, h2]; exact .int it (intTypeOf_good hit)
-    rw [hf.tyBytes]; exact hf.good.pos
-  · obtain ⟨h1, h2⟩ := tyOf_ordering (layouts := layouts) ho
-    have hf : FragTy (tyOf d layouts) (itOf d layouts) := by rw [h1, h2]; exact .ordering
-    rw [hf.tyBytes]; exact hf.good.pos
-  · obtain ⟨h1, _⟩ := tyOf_tuple (layouts := layouts) ht
-    rw [h1]; simp only [intBoolTupleTy, tyBytes]; have := (intBoolTupleOf_good ht).pos; omega
+  rcases h with h | hp
+  · obtain ⟨T, hs⟩ := Option.isSome_iff_exists.mp h
+    rcases scalarTypeOf_cases hs with ⟨hb, _⟩ | ⟨it, hit, _⟩ | ⟨ho, _⟩ | ⟨it, ht, _⟩
+    · obtain ⟨h1, h2⟩ := tyOf_bool (layouts := layouts) hb
+      have hf : FragTy (tyOf d layouts) (itOf d layouts) := by rw [h1, h2]; exact .bool
+      rw [hf.tyBytes]; exact hf.good.pos
+    · obtain ⟨h1, h2⟩ := tyOf_int (layouts := layouts) hit
+      have hf : FragTy (tyOf d layouts) (itOf d layouts) :=
+        by rw [h1, h2]; exact .int it (intTypeOf_good hit)
+      rw [hf.tyBytes]; exact hf.good.pos
+    · obtain ⟨h1, h2⟩ := tyOf_ordering (layouts := layouts) ho
+      have hf : FragTy (tyOf d layouts) (itOf d layouts) := by rw [h1, h2]; exact .ordering
+      rw [hf.tyBytes]; exact hf.good.pos
+    · obtain ⟨h1, _⟩ := tyOf_tuple (layouts := layouts) ht
+      rw [h1]; simp only [intBoolTupleTy, tyBytes]; have := (intBoolTupleOf_good ht).pos; omega
+  · obtain ⟨h1, _⟩ := tyOf_isPtrTy (layouts := layouts) hp
+    rw [h1]; decide
 
 theorem scalar_size_le_tyBytes {d : LocalDecl} {layouts : Layout.LayoutTable}
-    (h : (scalarTypeOf d.ty).isSome = true) :
+    (h : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true) :
     (itOf d layouts).size.bytes ≤ tyBytes (tyOf d layouts) := by
-  obtain ⟨T, hs⟩ := Option.isSome_iff_exists.mp h
-  rcases scalarTypeOf_cases hs with ⟨hb, _⟩ | ⟨it, hit, _⟩ | ⟨ho, _⟩ | ⟨it, ht, _⟩
-  · obtain ⟨h1, h2⟩ := tyOf_bool (layouts := layouts) hb
-    have hf : FragTy (tyOf d layouts) (itOf d layouts) := by rw [h1, h2]; exact .bool
-    rw [hf.tyBytes]; exact Nat.le_refl _
-  · obtain ⟨h1, h2⟩ := tyOf_int (layouts := layouts) hit
-    have hf : FragTy (tyOf d layouts) (itOf d layouts) :=
-      by rw [h1, h2]; exact .int it (intTypeOf_good hit)
-    rw [hf.tyBytes]; exact Nat.le_refl _
-  · obtain ⟨h1, h2⟩ := tyOf_ordering (layouts := layouts) ho
-    have hf : FragTy (tyOf d layouts) (itOf d layouts) := by rw [h1, h2]; exact .ordering
-    rw [hf.tyBytes]; exact Nat.le_refl _
-  · obtain ⟨h1, h2⟩ := tyOf_tuple (layouts := layouts) ht
-    rw [h1, h2]; simp only [intBoolTupleTy, tyBytes]; omega
+  rcases h with h | hp
+  · obtain ⟨T, hs⟩ := Option.isSome_iff_exists.mp h
+    rcases scalarTypeOf_cases hs with ⟨hb, _⟩ | ⟨it, hit, _⟩ | ⟨ho, _⟩ | ⟨it, ht, _⟩
+    · obtain ⟨h1, h2⟩ := tyOf_bool (layouts := layouts) hb
+      have hf : FragTy (tyOf d layouts) (itOf d layouts) := by rw [h1, h2]; exact .bool
+      rw [hf.tyBytes]; exact Nat.le_refl _
+    · obtain ⟨h1, h2⟩ := tyOf_int (layouts := layouts) hit
+      have hf : FragTy (tyOf d layouts) (itOf d layouts) :=
+        by rw [h1, h2]; exact .int it (intTypeOf_good hit)
+      rw [hf.tyBytes]; exact Nat.le_refl _
+    · obtain ⟨h1, h2⟩ := tyOf_ordering (layouts := layouts) ho
+      have hf : FragTy (tyOf d layouts) (itOf d layouts) := by rw [h1, h2]; exact .ordering
+      rw [hf.tyBytes]; exact Nat.le_refl _
+    · obtain ⟨h1, h2⟩ := tyOf_tuple (layouts := layouts) ht
+      rw [h1, h2]; simp only [intBoolTupleTy, tyBytes]; omega
+  · obtain ⟨h1, h2⟩ := tyOf_isPtrTy (layouts := layouts) hp
+    rw [h1, h2]; decide
 
 theorem scalar_tyBytes_le {d : LocalDecl} {layouts : Layout.LayoutTable}
-    (h : (scalarTypeOf d.ty).isSome = true) :
+    (h : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true) :
     tyBytes (tyOf d layouts) ≤ 32 := by
-  obtain ⟨T, hs⟩ := Option.isSome_iff_exists.mp h
-  rcases scalarTypeOf_cases hs with ⟨hb, _⟩ | ⟨it, hit, _⟩ | ⟨ho, _⟩ | ⟨it, ht, _⟩
-  · obtain ⟨h1, h2⟩ := tyOf_bool (layouts := layouts) hb
-    have hf : FragTy (tyOf d layouts) (itOf d layouts) := by rw [h1, h2]; exact .bool
-    rw [hf.tyBytes]; rcases hf.good with hg | hg | hg | hg | hg <;> omega
-  · obtain ⟨h1, h2⟩ := tyOf_int (layouts := layouts) hit
-    have hf : FragTy (tyOf d layouts) (itOf d layouts) :=
-      by rw [h1, h2]; exact .int it (intTypeOf_good hit)
-    rw [hf.tyBytes]; rcases hf.good with hg | hg | hg | hg | hg <;> omega
-  · obtain ⟨h1, h2⟩ := tyOf_ordering (layouts := layouts) ho
-    have hf : FragTy (tyOf d layouts) (itOf d layouts) := by rw [h1, h2]; exact .ordering
-    rw [hf.tyBytes]; rcases hf.good with hg | hg | hg | hg | hg <;> omega
-  · obtain ⟨h1, _⟩ := tyOf_tuple (layouts := layouts) ht
-    rw [h1]; simp only [intBoolTupleTy, tyBytes]
-    rcases intBoolTupleOf_good ht with hg | hg | hg | hg | hg <;> omega
+  rcases h with h | hp
+  · obtain ⟨T, hs⟩ := Option.isSome_iff_exists.mp h
+    rcases scalarTypeOf_cases hs with ⟨hb, _⟩ | ⟨it, hit, _⟩ | ⟨ho, _⟩ | ⟨it, ht, _⟩
+    · obtain ⟨h1, h2⟩ := tyOf_bool (layouts := layouts) hb
+      have hf : FragTy (tyOf d layouts) (itOf d layouts) := by rw [h1, h2]; exact .bool
+      rw [hf.tyBytes]; rcases hf.good with hg | hg | hg | hg | hg <;> omega
+    · obtain ⟨h1, h2⟩ := tyOf_int (layouts := layouts) hit
+      have hf : FragTy (tyOf d layouts) (itOf d layouts) :=
+        by rw [h1, h2]; exact .int it (intTypeOf_good hit)
+      rw [hf.tyBytes]; rcases hf.good with hg | hg | hg | hg | hg <;> omega
+    · obtain ⟨h1, h2⟩ := tyOf_ordering (layouts := layouts) ho
+      have hf : FragTy (tyOf d layouts) (itOf d layouts) := by rw [h1, h2]; exact .ordering
+      rw [hf.tyBytes]; rcases hf.good with hg | hg | hg | hg | hg <;> omega
+    · obtain ⟨h1, _⟩ := tyOf_tuple (layouts := layouts) ht
+      rw [h1]; simp only [intBoolTupleTy, tyBytes]
+      rcases intBoolTupleOf_good ht with hg | hg | hg | hg | hg <;> omega
+  · obtain ⟨h1, _⟩ := tyOf_isPtrTy (layouts := layouts) hp
+    rw [h1]; decide
 
 theorem declSlotOk_dead (d : LocalDecl) (layouts : Layout.LayoutTable) :
     DeclSlotOk d .dead layouts := by
@@ -6586,7 +6839,11 @@ theorem declSlotData_uninit_of_declOk {d : LocalDecl} {layouts : Layout.LayoutTa
     | none =>
       simp only [ha] at hdok
       cases ht : tupleTypeOf layouts d.ty with
-      | none => simp [ht] at hdok
+      | none =>
+        simp only [ht, Bool.or_false] at hdok
+        obtain ⟨h1, _⟩ := tyOf_isPtrTy (layouts := layouts) hdok
+        rw [declSlotData_of_isPtrTy hdok, h1]
+        rfl
       | some p =>
         obtain ⟨fields, size, align⟩ := p
         obtain ⟨h1, _⟩ := tyOf_tupleSpec ht
@@ -6600,7 +6857,7 @@ theorem evalStatement_deinit {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {m : Mach} {blk stmt : Nat}
     (h : FrameOk body f ctx locals lm m blk stmt) (i : Nat) (d : LocalDecl)
     (hd : body.localDecls[i]? = some d)
-    (hscalar : (scalarTypeOf d.ty).isSome = true) :
+    (hscalar : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true) :
     (locals[i]? ≠ some .dead → ∃ m', evalStatement m (.Deinit (.Local (localName i))) = .ok m' ∧
       FrameOk body f ctx (locals.set i .uninit) lm m' blk stmt) ∧
     (locals[i]? = some .dead → i ∉ alwaysStorageLiveLocals body →
@@ -6612,11 +6869,9 @@ theorem evalStatement_deinit {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
   refine ⟨fun hlive => ?_, fun hdead hal => ?_⟩
   · have hslive : slot ≠ .dead := fun hc => hlive (hc ▸ hs)
     obtain ⟨p, hp⟩ := h.locs.some_of_live hs hslive
-    obtain ⟨k, hpk, _⟩ := h.locs.storage i d slot p hd hs hp
-    obtain ⟨_, _, _, _, hA⟩ := h.locs.storage_id hd hs hp hpk
+    obtain ⟨k, data, hpk, _, _, _, _, hlen, hA⟩ :=
+      h.locs.storage_any hd hs hp (h.declsOk d (List.mem_of_getElem? hd))
     have hplace := evalPlace_local_some h.shape i _ hspec.2 p hp
-    have hlen := declSlotData_length_of_declOk (h.declsOk d (List.mem_of_getElem? hd))
-      (h.locs.slots i d slot hd hs)
     have hne : List.replicate (tyBytes (tyOf d body.layouts)) (Gen.AbstractByte.Uninit : Byte) ≠ [] :=
       List.ne_nil_of_length_pos (by simp; exact scalar_tyBytes_pos hscalar)
     have hst := CM_store_whole hpk hA rfl rfl (List.replicate (tyBytes (tyOf d body.layouts)) .Uninit)
@@ -6630,6 +6885,7 @@ theorem evalStatement_deinit {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     · refine FrameOk.mk' h.hf (withMem_shape h.shape _) ?_ h.declsOk
         (h.nonScalar.set_scalar hd hscalar .uninit)
       exact h.locs.store i d hd slot .uninit hs (by simp) (declSlotOk_uninit d body.layouts) p hp k hpk
+        (.inr (by simp))
   · have hq := h.locs.none_of_dead hdead hal
     exact ⟨"access to a dead local", by simp [evalStatement, evalPlace_local_none h.shape i _ hspec.2 hq]⟩
 
@@ -6703,7 +6959,9 @@ theorem LocalsOk.killLocal {body : CapturedMir} {ctx : Ctx} {locals : List Local
     LocalsOk body ctx (locals.set i .dead)
       ⟨lm.entries.filter (fun e => !decide (e.1 = localName i))⟩ (A.set k (kill a)) := by
   have hil : i < locals.length := (List.getElem?_eq_some_iff.mp hs).1
-  obtain ⟨hbase, _, _, _, hA'⟩ := hlo.storage_id hd hs hp hpk
+  obtain ⟨id0, hpid0, hbase, _, _, _, _⟩ := hlo.storage i d slot p hd hs hp
+  have hid0 : id0 = k := (prov_inj id0 k).mp (hpid0.symm.trans hpk)
+  subst id0
   have hmap : ∀ j, mapGet ⟨lm.entries.filter (fun e => !decide (e.1 = localName i))⟩ (localName j) =
       if j = i then none else mapGet lm (localName j) := by
     intro j
@@ -6742,12 +7000,9 @@ theorem LocalsOk.killLocal {body : CapturedMir} {ctx : Ctx} {locals : List Local
     · subst hij; simp at hq
     · simp only [Ne.symm hij, ↓reduceIte] at hq
       rw [List.getElem?_set_ne hij] at hsj
-      obtain ⟨id, hqid, hb', ha', hmax', hc', hA''⟩ := hlo.storage j dj sj q hdj hsj hq
-      refine ⟨id, hqid, hb', ha', hmax', hc', ?_⟩
-      have hne : k ≠ id := by
-        intro hki; subst hki
-        exact hij (hlo.inj i j p q hp hq (by rw [hpk, hqid]))
-      rw [List.getElem?_set_ne hne]; exact hA''
+      refine (hlo.storage j dj sj q hdj hsj hq).congr_getElem? (fun id hqid => ?_)
+      have hne : k ≠ id := fun hki => hij (hlo.inj i j p q hp hq (by subst hki; rw [hpk, hqid]))
+      exact List.getElem?_set_ne hne
   · intro j j' q q' hq hq' hprov
     rw [hmap j] at hq; rw [hmap j'] at hq'
     by_cases hji : j = i
@@ -6810,6 +7065,7 @@ theorem LocalsOkA.alloc' {body : CapturedMir} {ctx : Ctx} {al al' : List Nat}
     (haddrMax : addr + (tyBytes (tyOf d body.layouts) : Int) < 2 ^ 64)
     (hcls : AddrClass addr (tyBytes (tyOf d body.layouts)))
     (ns : LocalSlot) (hns : DeclSlotOk d ns body.layouts)
+    (hns_np : isPtrTy d.ty = false ∨ (∀ pv, ns ≠ .init (.ptr pv 8)))
     (hlive : ns ≠ .dead ∨ i ∈ al') (hal : ∀ j, j ≠ i → (j ∈ al' ↔ j ∈ al)) :
     LocalsOkA body ctx al' (locals.set i ns)
       ⟨lm.entries ++ [(localName i, { addr := addr, provenance := some (⟨(A.length : Int)⟩, ()) })]⟩
@@ -6843,7 +7099,17 @@ theorem LocalsOkA.alloc' {body : CapturedMir} {ctx : Ctx} {al al' : List Nat}
     obtain ⟨sj, hsj⟩ : ∃ sj, locals[j]? = some sj :=
       ⟨_, List.getElem?_eq_getElem (by rw [hlo.nlocals]; exact hj')⟩
     obtain ⟨id, hqid, _, _, _, _, hA'⟩ := hlo.storage j dj sj q hdj hsj hq
-    exact ⟨id, hqid, (List.getElem?_eq_some_iff.mp hA').1⟩
+    refine ⟨id, hqid, ?_⟩
+    cases hpj : isPtrTy dj.ty with
+    | false =>
+      simp only [hpj, Bool.false_eq_true, ↓reduceIte] at hA'
+      exact (List.getElem?_eq_some_iff.mp hA').1
+    | true =>
+      simp only [hpj, ↓reduceIte] at hA'
+      split at hA'
+      · obtain ⟨_, _, _, _, hAid⟩ := hA'
+        exact (List.getElem?_eq_some_iff.mp hAid).1
+      · exact (List.getElem?_eq_some_iff.mp hA').1
   refine {
     nlocals := by simp [hlo.nlocals]
     slots := ?_
@@ -6892,13 +7158,22 @@ theorem LocalsOkA.alloc' {body : CapturedMir} {ctx : Ctx} {al al' : List Nat}
       refine ⟨A.length, rfl, ?_, haddr, haddrMax, hcls, ?_⟩
       · obtain ⟨R, hR⟩ := hlo.base
         rw [hR, List.length_append]; omega
-      · simp [newPtr]
+      · cases hp_ty : isPtrTy d.ty with
+        | false => simp [newPtr]
+        | true =>
+          simp only [↓reduceIte]
+          rcases hns_np with hfalse | hnotPtr
+          · rw [hp_ty] at hfalse; cases hfalse
+          · split
+            · next pv => exact False.elim (hnotPtr pv rfl)
+            · simp [newPtr]
     · simp only [Ne.symm hij, ↓reduceIte] at hq
       rw [List.getElem?_set_ne hij] at hsj
-      obtain ⟨id, hqid, hb', ha', hmax', hc', hA'⟩ := hlo.storage j dj sj q hdj hsj hq
-      refine ⟨id, hqid, hb', ha', hmax', hc', ?_⟩
-      rw [List.getElem?_append_left (List.getElem?_eq_some_iff.mp hA').1]
-      exact hA'
+      refine (hlo.storage j dj sj q hdj hsj hq).congr_getElem? (fun id hqid => ?_)
+      obtain ⟨id', hqid', hlt⟩ := hidlt j q hq
+      have heq : id' = id := (prov_inj id' id).mp (hqid'.symm.trans hqid)
+      subst id'
+      exact List.getElem?_append_left hlt
   · intro j j' q q' hq hq' hprov
     rw [hmap j] at hq; rw [hmap j'] at hq'
     by_cases hji : j = i
@@ -6946,7 +7221,7 @@ theorem LocalsOk.alloc {body : CapturedMir} {ctx : Ctx} {locals : List LocalSlot
       ⟨lm.entries ++ [(localName i, { addr := addr, provenance := some (⟨(A.length : Int)⟩, ()) })]⟩
       (A ++ [stackAlloc addr (itOf d body.layouts) (declSlotData d .uninit body.layouts)]) :=
   LocalsOkA.alloc' hlo i d hd hs hp addr haddr haddrMax hcls .uninit
-    (declSlotOk_uninit d body.layouts) (.inl (by simp)) (fun _ _ => Iff.rfl)
+    (declSlotOk_uninit d body.layouts) (.inr (by simp)) (.inl (by simp)) (fun _ _ => Iff.rfl)
 
 /-! ### The first-fit address of `StorageLive` -/
 
@@ -7076,18 +7351,30 @@ theorem LocalsOkA.free_candidate {body : CapturedMir} {ctx : Ctx} {al : List Nat
     obtain ⟨d, hd⟩ : ∃ d, body.localDecls[i]? = some d := ⟨_, List.getElem?_eq_getElem hi'⟩
     obtain ⟨sl, hsl⟩ : ∃ sl, locals[i]? = some sl :=
       ⟨_, List.getElem?_eq_getElem (by rw [hlo.nlocals]; exact hi')⟩
-    obtain ⟨_, _, _, hcls, hAq⟩ := hlo.storage_id hd hsl hq hqid
+    obtain ⟨data, _, _, _, hcls, hlen, hAq⟩ :=
+      hlo.storage_any_id hd hsl hq hqid (hdeclsOk d (List.mem_of_getElem? hd))
     rw [hAid] at hAq
     injection hAq with hAq'
     subst a
-    have hlen := declSlotData_length_of_declOk (hdeclsOk d (List.mem_of_getElem? hd))
-      (hlo.slots i d sl hd hsl)
     cases hsc : scalarTypeOf d.ty with
     | none =>
-      have hlow := (hns i d sl hd hsl hsc).2 q hq
-      exact overlaps_low _ k size (by simp only [stackAlloc]; rw [hlen]; exact hlow)
+      cases hp_ty : isPtrTy d.ty with
+      | false =>
+        have hlow := (hns i d sl hd hsl hsc hp_ty).2 q hq
+        exact overlaps_low _ k size (by simp only [stackAlloc]; rw [hlen]; exact hlow)
+      | true =>
+        have hle : tyBytes (tyOf d body.layouts) ≤ 32 := scalar_tyBytes_le (.inr hp_ty)
+        rcases hcls with hlow | ⟨_, j, hj⟩
+        · exact overlaps_low _ k size (by simp only [stackAlloc]; rw [hlen]; exact hlow)
+        · have hjk : j ≠ k := by
+            intro hjk; subst hjk
+            apply hknot
+            simp only [L, List.mem_map]
+            exact ⟨(localName i, q), hmemq, by simp [hj, candIdx_cand]⟩
+          exact overlaps_cand _ j k size (by simp [stackAlloc, hj]) hjk
+            (by simp only [stackAlloc]; rw [hlen]; omega) (by omega)
     | some T =>
-      have hle : tyBytes (tyOf d body.layouts) ≤ 32 := scalar_tyBytes_le (by simp [hsc])
+      have hle : tyBytes (tyOf d body.layouts) ≤ 32 := scalar_tyBytes_le (.inl (by simp [hsc]))
       rcases hcls with hlow | ⟨_, j, hj⟩
       · exact overlaps_low _ k size (by simp only [stackAlloc]; rw [hlen]; exact hlow)
       · have hjk : j ≠ k := by
@@ -7150,7 +7437,7 @@ theorem evalStatement_storageDead {body : CapturedMir} {f : Gen.Function} {ctx :
     {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {m : Mach} {blk stmt : Nat}
     (h : FrameOk body f ctx locals lm m blk stmt) (i : Nat) (d : LocalDecl)
     (hd : body.localDecls[i]? = some d) (hal : i ∉ alwaysStorageLiveLocals body)
-    (hscalar : (scalarTypeOf d.ty).isSome = true) :
+    (hscalar : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true) :
     ∃ m', evalStatement m (.StorageDead (localName i)) = .ok m' ∧
       FrameOk body f ctx (locals.set i .dead)
         ⟨lm.entries.filter (fun e => !decide (e.1 = localName i))⟩ m' blk stmt := by
@@ -7170,12 +7457,10 @@ theorem evalStatement_storageDead {body : CapturedMir} {f : Gen.Function} {ctx :
     exact FrameOk.mk' h.hf ⟨rfl, h.shape.active, rfl⟩ (h.locs.forget i hs hp) h.declsOk
       (h.nonScalar.filter_scalar hd hscalar .dead)
   | some p =>
-    obtain ⟨k, hpk, _⟩ := h.locs.storage i d slot p hd hs hp
-    obtain ⟨_, _, _, _, hA⟩ := h.locs.storage_id hd hs hp hpk
+    obtain ⟨k, data, hpk, _, _, _, _, hlen, hA⟩ :=
+      h.locs.storage_any hd hs hp (h.declsOk d (List.mem_of_getElem? hd))
     have hsd := storageDead_some (fr := calleeFrameL f ctx lm blk stmt) (cm := m.mem) hlt hspec.2
-      (by simpa [calleeFrameL] using hp) hpk hA rfl rfl rfl
-      (declSlotData_length_of_declOk (h.declsOk d (List.mem_of_getElem? hd))
-        (h.locs.slots i d slot hd hs)) rfl
+      (by simpa [calleeFrameL] using hp) hpk hA rfl rfl rfl hlen rfl
     have htm := tryMutateCurFrame_callee h.shape
       (fun fr cm => storageDead fr cm (localName i)) _ _ hsd
     refine ⟨_, by simp only [evalStatement]; exact htm, ?_⟩
@@ -7192,7 +7477,7 @@ theorem evalStatement_storageLive {body : CapturedMir} {f : Gen.Function} {ctx :
     {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {m : Mach} {blk stmt : Nat}
     (h : FrameOk body f ctx locals lm m blk stmt) (i : Nat) (d : LocalDecl)
     (hd : body.localDecls[i]? = some d) (hal : i ∉ alwaysStorageLiveLocals body)
-    (hscalar : (scalarTypeOf d.ty).isSome = true)
+    (hscalar : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true)
     (hbaseLow : BaseLow ctx) (hn : body.localDecls.length < 2 ^ 31) :
     ∃ m' lm', evalStatement m (.StorageLive (localName i)) = .ok m' ∧
       FrameOk body f ctx (locals.set i .uninit) lm' m' blk stmt := by
@@ -7213,11 +7498,10 @@ theorem evalStatement_storageLive {body : CapturedMir} {f : Gen.Function} {ctx :
       exact ⟨m.mem, storageDead_none hlt hspec.2 (by simpa [calleeFrameL] using hp),
         h.locs.forget i hs hp⟩
     | some p =>
-      obtain ⟨k, hpk, _⟩ := h.locs.storage i d slot p hd hs hp
-      obtain ⟨_, _, _, _, hA⟩ := h.locs.storage_id hd hs hp hpk
+      obtain ⟨k, data, hpk, _, _, _, _, hlen, hA⟩ :=
+        h.locs.storage_any hd hs hp (h.declsOk d (List.mem_of_getElem? hd))
       exact ⟨_, storageDead_some hlt hspec.2 (by simpa [calleeFrameL] using hp) hpk hA rfl rfl rfl
-        (declSlotData_length_of_declOk (h.declsOk d (List.mem_of_getElem? hd))
-          (h.locs.slots i d slot hd hs)) rfl,
+        hlen rfl,
         h.locs.killLocal i d hd slot hs hal p hp k hpk _ hA⟩
   have hp2 : mapGet lm2 (localName i) = none := by simp [lm2, mapGet_filter_key]
   have hs2 : (locals.set i .dead)[i]? = some .dead := List.getElem?_set_self hil
@@ -7272,7 +7556,7 @@ theorem evalStatement_storageLive_init {body : CapturedMir} {f : Gen.Function} {
     (hdeclsOk : ∀ d ∈ body.localDecls, localDeclOk body.layouts d = true)
     (hns : NonScalarLive body locals lm)
     (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d)
-    (hscalar : (scalarTypeOf d.ty).isSome = true)
+    (hscalar : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true)
     (hsi : locals[i]? = some .dead) (hp : mapGet lm (localName i) = none)
     (hbaseLow : BaseLow ctx) (hn : body.localDecls.length < 2 ^ 31) :
     ∃ m' lm', evalStatement m (.StorageLive (localName i)) = .ok m' ∧
@@ -7325,7 +7609,7 @@ theorem evalStatement_storageLive_init {body : CapturedMir} {f : Gen.Function} {
   refine ⟨_, ⟨lm.entries ++ [(localName i, newPtr)]⟩, by simp only [evalStatement]; exact htm, ?_⟩
   refine ⟨⟨rfl, hsh.active, rfl⟩, ?_, hns.append_scalar hd hscalar hnot newPtr⟩
   have hlo3 := hlo.alloc' (al' := al ++ [i]) i d hd hsi hp (allocCandidate k) haddr haddrMax
-    (Or.inr ⟨by omega, k, rfl⟩) .dead (declSlotOk_dead d body.layouts)
+    (Or.inr ⟨by omega, k, rfl⟩) .dead (declSlotOk_dead d body.layouts) (.inr (by simp))
     (.inr (by simp)) (fun j hj => by simp [hj])
   have hset : locals.set i .dead = locals := by
     have h1 := List.set_getElem_self (as := locals) hil
@@ -7499,21 +7783,22 @@ theorem LocalsOkA.teardown {body : CapturedMir} {f : Gen.Function} {ctx : Ctx} {
     refine ⟨i, _, _, List.getElem?_eq_getElem hi, List.getElem?_eq_getElem hil, hei, ?_⟩
     rw [← hei]
     exact mapGet_of_mem_nodup (by simpa using he) hlo.keysNodup
-  have hstore : ∀ e ∈ lm.entries, ∃ i d slot, body.localDecls[i]? = some d ∧
+  have hstore : ∀ e ∈ lm.entries, ∃ i d slot data, body.localDecls[i]? = some d ∧
       locals[i]? = some slot ∧ e.1 = localName i ∧
       e.2.provenance = some (⟨(provId e.2 : Int)⟩, ()) ∧ ctx.base.length ≤ provId e.2 ∧
-      A[provId e.2]? = some
-        (stackAlloc e.2.addr (itOf d body.layouts) (declSlotData d slot body.layouts)) := by
+      data.length = tyBytes (tyOf d body.layouts) ∧
+      A[provId e.2]? = some (stackAlloc e.2.addr (itOf d body.layouts) data) := by
     intro e he
     obtain ⟨i, d, slot, hd, hs, hei, hmg⟩ := hentry e he
-    obtain ⟨id, hpid, hb, _, _, _, hA⟩ := hlo.storage i d slot e.2 hd hs hmg
+    obtain ⟨id, data, hpid, hb, _, _, _, hlen, hA⟩ :=
+      hlo.storage_any hd hs hmg (hdeclsOk d (List.mem_of_getElem? hd))
     rw [provId_of hpid]
-    exact ⟨i, d, slot, hd, hs, hei, hpid, hb, hA⟩
+    exact ⟨i, d, slot, data, hd, hs, hei, hpid, hb, hlen, hA⟩
   refine ⟨?_, ?_, ?_, ?_⟩
   · apply nodup_map_of_inj_on _ _ (nodup_of_map Prod.fst hlo.keysNodup)
     intro x hx y hy hxy
-    obtain ⟨i, _, _, _, _, hxi, hpx, _, _⟩ := hstore x hx
-    obtain ⟨j, _, _, _, _, hyj, hpy, _, _⟩ := hstore y hy
+    obtain ⟨i, _, _, _, _, _, hxi, hpx, _, _, _⟩ := hstore x hx
+    obtain ⟨j, _, _, _, _, _, hyj, hpy, _, _, _⟩ := hstore y hy
     obtain ⟨i', _, _, _, _, hxi', hmx'⟩ := hentry x hx
     obtain ⟨j', _, _, _, _, hyj', hmy'⟩ := hentry y hy
     have hii : i' = i := by rw [hxi'] at hxi; simpa [localName_inj] using hxi
@@ -7527,15 +7812,14 @@ theorem LocalsOkA.teardown {body : CapturedMir} {f : Gen.Function} {ctx : Ctx} {
     simp only at hxi' hyj' hv
     rw [hxi', hyj', hv]
   · intro e he
-    obtain ⟨i, d, slot, hd, hs, hei, hpid, _, hA⟩ := hstore e he
+    obtain ⟨i, d, slot, data, hd, hs, hei, hpid, _, hlen, hA⟩ := hstore e he
     have hdok := hdeclsOk d (List.mem_of_getElem? hd)
     have hlt := localTy_of_declOk hdok
     exact ⟨tyOf d body.layouts, itOf d body.layouts, _, by rw [hei]; exact (hspec.2.1 i d hd).2,
-      hlt, hpid, hA, rfl, rfl, rfl,
-      declSlotData_length_of_declOk hdok (hlo.slots i d slot hd hs), rfl⟩
+      hlt, hpid, hA, rfl, rfl, rfl, hlen, rfl⟩
   · intro id hid
     obtain ⟨e, he, rfl⟩ := List.mem_map.mp hid
-    obtain ⟨_, _, _, _, _, _, _, hb, _⟩ := hstore e he
+    obtain ⟨_, _, _, _, _, _, _, _, hb, _, _⟩ := hstore e he
     exact hb
   · intro id a hA hlive hb
     obtain ⟨i, q, hq, hqid⟩ := hlo.owned id a hA hlive hb

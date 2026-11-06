@@ -2344,12 +2344,12 @@ theorem castBits_eq_toNat (srcIt it : Gen.IntType) (hsrcGood : GoodSize srcIt.si
         rw [this]
         omega
 
-/-- Every non-scalar local referenced by `ops` is initialized in `locals`. -/
+/-- Every non-scalar, non-pointer local referenced by `ops` is initialized in `locals`. -/
 def OpsNonScalarInit (decls : List LocalDecl) (locals : List LocalSlot)
     (ops : List Operand) : Prop :=
   ∀ op ∈ ops, ∀ j ∈ opLocals op, ∀ d slot,
     decls[j]? = some d → locals[j]? = some slot → scalarTypeOf d.ty = none →
-    ∃ v, slot = .init v
+    isPtrTy d.ty = false → ∃ v, slot = .init v
 
 theorem evalRvalue_frag {layouts : Layout.LayoutTable} (decls : List LocalDecl) (locals : List LocalSlot)
     (hslots : SlotsOk layouts decls locals) (hn : locals.length = decls.length)
@@ -2494,6 +2494,7 @@ theorem evalRvalue_frag {layouts : Layout.LayoutTable} (decls : List LocalDecl) 
         have hscNone := scalarTypeOf_none_of_arrayTypeOf ha
         obtain ⟨v, hv⟩ := hns (.copy ⟨j, []⟩) (by simp [rvOperands]) j
           (by simp [opLocals, placeLocals]) d locals[j] hd hs hscNone
+          (isPtrTy_false_of_arrayTypeOf ha)
         have hslot := hslots j d (.init v) hd (hv ▸ hs)
         simp only [DeclSlotOk, hscNone, Option.isSome_none, Bool.false_eq_true, ↓reduceIte,
           ha] at hslot
@@ -3357,28 +3358,57 @@ theorem evalRvalue_fragTuple {layouts : Layout.LayoutTable} (decls : List LocalD
 
 /-! ## Statements -/
 
+theorem memory_mk_nil_prot (mem : MirSemantics.Memory) (hprot : mem.activeProtectors = []) :
+    { mem with activeProtectors := [] } = mem := by
+  cases mem; subst hprot; rfl
+
+theorem invalidateConflictingBorrows_of_ne (borrows : List BorrowEntry) (loc : Local)
+    (writerTag : Option Nat) (h : ∀ e ∈ borrows, e.targetLocal ≠ loc) :
+    invalidateConflictingBorrows borrows loc writerTag = borrows := by
+  induction borrows with
+  | nil => rfl
+  | cons entry rest ih =>
+    have hne : Nat.beq entry.targetLocal loc = false := by
+      rw [nat_beq_eq_decide, decide_eq_false (h entry (.head _))]
+    simp [invalidateConflictingBorrows, updateBorrowPerm, hne,
+      ih (fun e he => h e (.tail _ he))]
+
+theorem invalidateConflictingBorrowsAtProj_of_ne (borrows : List BorrowEntry) (loc : Local)
+    (writerTag : Option Nat) (writeProj : List ProjectionElem)
+    (writeRangeOff : Nat := 0) (writeRangeLen : Nat := 0)
+    (h : ∀ e ∈ borrows, e.targetLocal ≠ loc) :
+    invalidateConflictingBorrowsAtProj borrows loc writerTag writeProj writeRangeOff writeRangeLen =
+      borrows := by
+  induction borrows with
+  | nil => rfl
+  | cons entry rest ih =>
+    have hne : Nat.beq entry.targetLocal loc = false := by
+      rw [nat_beq_eq_decide, decide_eq_false (h entry (.head _))]
+    simp [invalidateConflictingBorrowsAtProj, updateBorrowPermAtProj, hne,
+      ih (fun e he => h e (.tail _ he))]
+
 /-- Anneal's assignment to a live local `_i` from an rvalue that evaluates to
 a scalar (or to UB). -/
 theorem evalStmt_assign_of (s : MachineState) (decls : List LocalDecl) (layouts : Layout.LayoutTable)
     (i : Nat) (rv : Rvalue) (span : String) (_hslots : SlotsOk layouts decls s.frame.locals)
     (hn : s.frame.locals.length = decls.length) (d : LocalDecl) (hd : decls[i]? = some d)
     (hlive0 : s.frame.locals[i]? ≠ some .dead)
-    (hbor : s.memory.borrows = []) (hprot : s.memory.activeProtectors = []) :
+    (hbor : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i) (hprot : s.memory.activeProtectors = []) :
     (∀ sc, evalRvalue s.frame.locals rv s.memory decls layouts = .ok (.scalar sc) s.frame.locals s.memory →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts =
-        .tau (.running (advanceStmt s (s.frame.locals.set i (.init (.scalar sc)))
-          { s.memory with borrows := [] }))) ∧
+        .tau (.running (advanceStmt s (s.frame.locals.set i (.init (.scalar sc))) s.memory))) ∧
     (evalRvalue s.frame.locals rv s.memory decls layouts = .ub →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
   have hi : i < s.frame.locals.length := by rw [hn]; exact (List.getElem?_eq_some_iff.mp hd).1
   have hs : s.frame.locals[i]? = some s.frame.locals[i] := by simp [hi]
   have hlive : s.frame.locals[i] ≠ .dead := fun h => hlive0 (by rw [hs, h])
+  have hinv := invalidateConflictingBorrows_of_ne s.memory.borrows i .none hbor
   refine ⟨fun sc hsc => ?_, fun h => ?_⟩
-  · simp only [evalStmt, hsc, get?, hs, set?, hi, hprot, hbor, invalidateConflictingBorrows_nil]
+  · simp only [evalStmt, hsc, get?, hs, set?, hi, hprot, hinv]
     cases hsl : s.frame.locals[i] with
     | dead => exact absurd hsl hlive
-    | uninit => simp [MirStepNode.step]
-    | init v => simp [MirStepNode.step]
+    | uninit => simp [MirStepNode.step, memory_mk_nil_prot s.memory hprot]
+    | init v => simp [MirStepNode.step, memory_mk_nil_prot s.memory hprot]
   · simp [evalStmt, h]
 
 theorem evalStmt_assign (s : MachineState) (decls : List LocalDecl) (layouts : Layout.LayoutTable)
@@ -3388,11 +3418,11 @@ theorem evalStmt_assign (s : MachineState) (decls : List LocalDecl) (layouts : L
     (hgood : GoodSize (itOf d layouts).size.bytes)
     (hok : rvalueOk layouts decls (itOf d layouts) rv = true)
     (hns : OpsNonScalarInit decls s.frame.locals (rvOperands rv))
-    (hbor : s.memory.borrows = []) (hprot : s.memory.activeProtectors = []) :
+    (hbor : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i) (hprot : s.memory.activeProtectors = []) :
     (∀ r, rvBits decls s.frame.locals (itOf d layouts) layouts rv = some r →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts =
         .tau (.running (advanceStmt s (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d layouts).size.bytes⟩)))
-          { s.memory with borrows := [] }))) ∧
+          s.memory))) ∧
     (rvBits decls s.frame.locals (itOf d layouts) layouts rv = none →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
   obtain ⟨hok', hnone⟩ :=
@@ -3405,11 +3435,11 @@ theorem evalStmt_assignB (s : MachineState) (decls : List LocalDecl) (layouts : 
     (hn : s.frame.locals.length = decls.length) (d : LocalDecl) (hd : decls[i]? = some d)
     (hlive0 : s.frame.locals[i]? ≠ some .dead)
     (hbool : isBoolTy d.ty = true) (hok : rvalueOkB layouts decls rv = true)
-    (hbor : s.memory.borrows = []) (hprot : s.memory.activeProtectors = []) :
+    (hbor : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i) (hprot : s.memory.activeProtectors = []) :
     (∀ r, rvBitsB decls s.frame.locals rv layouts = some r →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts =
         .tau (.running (advanceStmt s (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d layouts).size.bytes⟩)))
-          { s.memory with borrows := [] }))) ∧
+          s.memory))) ∧
     (rvBitsB decls s.frame.locals rv layouts = none →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
   have hit : itOf d layouts = u8Ty := (tyOf_bool (layouts := layouts) hbool).2
@@ -3424,11 +3454,11 @@ theorem evalStmt_assignO (s : MachineState) (decls : List LocalDecl) (layouts : 
     (hn : s.frame.locals.length = decls.length) (d : LocalDecl) (hd : decls[i]? = some d)
     (hlive0 : s.frame.locals[i]? ≠ some .dead)
     (hord : isOrderingTy d.ty = true) (hok : rvalueOkO layouts decls rv = true)
-    (hbor : s.memory.borrows = []) (hprot : s.memory.activeProtectors = []) :
+    (hbor : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i) (hprot : s.memory.activeProtectors = []) :
     (∀ r, rvBitsO decls s.frame.locals rv layouts = some r →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts =
         .tau (.running (advanceStmt s (s.frame.locals.set i (.init (.scalar ⟨r, (itOf d layouts).size.bytes⟩)))
-          { s.memory with borrows := [] }))) ∧
+          s.memory))) ∧
     (rvBitsO decls s.frame.locals rv layouts = none →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
   have hit : itOf d layouts = u8Ty := (tyOf_ordering (layouts := layouts) hord).2
@@ -3444,26 +3474,26 @@ theorem evalStmt_assignTuple (s : MachineState) (decls : List LocalDecl) (layout
     (hlive0 : s.frame.locals[i]? ≠ some .dead)
     (hgood : GoodSize (itOf d layouts).size.bytes)
     (hok : rvalueOkTuple layouts decls (itOf d layouts) rv = true)
-    (hbor : s.memory.borrows = []) (hprot : s.memory.activeProtectors = []) :
+    (hbor : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i) (hprot : s.memory.activeProtectors = []) :
     (∀ bits b, rvTupleBits s.frame.locals (itOf d layouts) rv = some (bits, b) →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts =
         .tau (.running (advanceStmt s
           (s.frame.locals.set i (.init (.aggregate 0 [.scalar ⟨bits, (itOf d layouts).size.bytes⟩, .scalar ⟨b, 1⟩])))
-          { s.memory with borrows := [] }))) ∧
+          s.memory))) ∧
     (rvTupleBits s.frame.locals (itOf d layouts) rv = none →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
   have hi : i < s.frame.locals.length := by rw [hn]; exact (List.getElem?_eq_some_iff.mp hd).1
   have hs : s.frame.locals[i]? = some s.frame.locals[i] := by simp [hi]
   have hlive : s.frame.locals[i] ≠ .dead := fun h => hlive0 (by rw [hs, h])
+  have hinv := invalidateConflictingBorrows_of_ne s.memory.borrows i .none hbor
   obtain ⟨hok', hnone⟩ :=
     evalRvalue_fragTuple decls s.frame.locals hslots hn (itOf d layouts) hgood rv hok s.memory
   refine ⟨fun bits b hbb => ?_, fun h => ?_⟩
-  · simp only [evalStmt, hok' bits b hbb, get?, hs, set?, hi, hprot, hbor,
-      invalidateConflictingBorrows_nil]
+  · simp only [evalStmt, hok' bits b hbb, get?, hs, set?, hi, hprot, hinv]
     cases hsl : s.frame.locals[i] with
     | dead => exact absurd hsl hlive
-    | uninit => simp [MirStepNode.step]
-    | init v => simp [MirStepNode.step]
+    | uninit => simp [MirStepNode.step, memory_mk_nil_prot s.memory hprot]
+    | init v => simp [MirStepNode.step, memory_mk_nil_prot s.memory hprot]
   · simp [evalStmt, hnone h]
 
 theorem evalStmt_assign_array (s : MachineState) (decls : List LocalDecl) (layouts : Layout.LayoutTable)
@@ -3472,25 +3502,26 @@ theorem evalStmt_assign_array (s : MachineState) (decls : List LocalDecl) (layou
     (hlive0 : s.frame.locals[i]? ≠ some .dead)
     (elemIt : Gen.IntType) (count : Nat) (_ha : arrayTypeOf d.ty = some (elemIt, count))
     (hok : arrayRvalueOk layouts decls elemIt count rv = true)
-    (hbor : s.memory.borrows = []) (hprot : s.memory.activeProtectors = []) :
+    (hbor : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i) (hprot : s.memory.activeProtectors = []) :
     (∀ elems, arrayRvElems s.frame.locals elemIt rv = some elems →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts =
         .tau (.running (advanceStmt s
           (s.frame.locals.set i (.init (.aggregate 0 elems)))
-          { s.memory with borrows := [] }))) ∧
+          s.memory))) ∧
     (arrayRvElems s.frame.locals elemIt rv = none →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
   have hi : i < s.frame.locals.length := by rw [hn]; exact (List.getElem?_eq_some_iff.mp hd).1
   have hs : s.frame.locals[i]? = some s.frame.locals[i] := by simp [hi]
   have hlive : s.frame.locals[i] ≠ .dead := fun h => hlive0 (by rw [hs, h])
+  have hinv := invalidateConflictingBorrows_of_ne s.memory.borrows i .none hbor
   obtain ⟨hok', hnone⟩ :=
     evalRvalue_array_frag decls s.frame.locals hslots hn elemIt count rv hok s.memory
   refine ⟨fun elems hel => ?_, fun h => ?_⟩
-  · simp only [evalStmt, hok' elems hel, get?, hs, set?, hi, hprot, hbor, invalidateConflictingBorrows_nil]
+  · simp only [evalStmt, hok' elems hel, get?, hs, set?, hi, hprot, hinv]
     cases hsl : s.frame.locals[i] with
     | dead => exact absurd hsl hlive
-    | uninit => simp [MirStepNode.step]
-    | init v => simp [MirStepNode.step]
+    | uninit => simp [MirStepNode.step, memory_mk_nil_prot s.memory hprot]
+    | init v => simp [MirStepNode.step, memory_mk_nil_prot s.memory hprot]
   · simp [evalStmt, hnone h]
 
 theorem evalStmt_assign_index (s : MachineState) (decls : List LocalDecl) (layouts : Layout.LayoutTable)
@@ -3504,13 +3535,13 @@ theorem evalStmt_assign_index (s : MachineState) (decls : List LocalDecl) (layou
     (hns : OpsNonScalarInit decls s.frame.locals (rvOperands rv))
     (elems : List Value) (hsl : s.frame.locals[i]? = some (.init (.aggregate 0 elems)))
     (hlen : elems.length = count)
-    (hbor : s.memory.borrows = []) (hprot : s.memory.activeProtectors = []) :
+    (hbor : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i) (hprot : s.memory.activeProtectors = []) :
     (∀ idx r, projIdx s.frame.locals count proj = some idx →
       rvBits decls s.frame.locals elemIt layouts rv = some r →
       evalStmt s ⟨.assign ⟨i, [proj]⟩ rv, span⟩ decls layouts =
         .tau (.running (advanceStmt s
           (s.frame.locals.set i (.init (.aggregate 0 (elems.set idx (.scalar ⟨r, elemIt.size.bytes⟩)))))
-          { s.memory with borrows := [] }))) ∧
+          s.memory))) ∧
     ((projIdx s.frame.locals count proj = none ∨ rvBits decls s.frame.locals elemIt layouts rv = none) →
       evalStmt s ⟨.assign ⟨i, [proj]⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
   have hi : i < s.frame.locals.length := by rw [hn]; exact (List.getElem?_eq_some_iff.mp hd).1
@@ -3524,11 +3555,14 @@ theorem evalStmt_assign_index (s : MachineState) (decls : List LocalDecl) (layou
       writeProjectedValue_proj decls s.frame.locals count elems hlen proj hproj
         (.scalar ⟨r, elemIt.size.bytes⟩)
     have hw := hwOk idx hidx
-    match proj, hproj with
-    | .index _, _ =>
-      simp [evalStmt, hrvOk r hr, get?, hi, hsl', hw, set?, hprot, hbor, MirStepNode.step]
-    | .constantIndex _ _ _, _ =>
-      simp [evalStmt, hrvOk r hr, get?, hi, hsl', hw, set?, hprot, hbor, MirStepNode.step]
+    have hinv := invalidateConflictingBorrowsAtProj_of_ne s.memory.borrows i .none [proj] 0 0 hbor
+    match proj, hproj, hw, hinv with
+    | .index _, _, hw, hinv =>
+      simp [evalStmt, hrvOk r hr, get?, hi, hsl', hw, set?, hprot, hinv, MirStepNode.step,
+        memory_mk_nil_prot s.memory hprot]
+    | .constantIndex _ _ _, _, hw, hinv =>
+      simp [evalStmt, hrvOk r hr, get?, hi, hsl', hw, set?, hprot, hinv, MirStepNode.step,
+        memory_mk_nil_prot s.memory hprot]
   · cases hrv : rvBits decls s.frame.locals elemIt layouts rv with
     | none => simp [evalStmt, hrvNone hrv]
     | some r =>
@@ -3552,7 +3586,8 @@ theorem evalStmt_assign_tuple (s : MachineState) (decls : List LocalDecl) (layou
     (hslots : SlotsOk layouts decls s.frame.locals) (hn : s.frame.locals.length = decls.length)
     (hok : tupleRvalueOk layouts decls dstTy fields size align rv = true)
     (rootVal : Value) (hsl : s.frame.locals[dst.local_]? = some (.init rootVal))
-    (hbor : s.memory.borrows = []) (hprot : s.memory.activeProtectors = []) :
+    (hbor : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ dst.local_)
+    (hprot : s.memory.activeProtectors = []) :
     (∀ newVal newRootVal,
       tupleRvVal s.frame.locals fields rv = some newVal →
       writeFieldPath rootVal dst.projection newVal = some newRootVal →
@@ -3560,7 +3595,7 @@ theorem evalStmt_assign_tuple (s : MachineState) (decls : List LocalDecl) (layou
       evalStmt s ⟨.assign dst rv, span⟩ decls layouts =
         .tau (.running (advanceStmt s
           (s.frame.locals.set dst.local_ (.init newRootVal))
-          { s.memory with borrows := [] }))) ∧
+          s.memory))) ∧
     (tupleRvVal s.frame.locals fields rv = none →
       evalStmt s ⟨.assign dst rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
   obtain ⟨d, _, _, _, _, hj, _, _, _, _⟩ := tuplePlaceSpec_resolve htp
@@ -3572,17 +3607,22 @@ theorem evalStmt_assign_tuple (s : MachineState) (decls : List LocalDecl) (layou
     evalRvalue_tuple_frag decls s.frame.locals hslots hn dstTy fields size align rv hok s.memory
   refine ⟨fun newVal newRootVal hrv hwpath hwsem => ?_, fun hnone => ?_⟩
   · rcases dst with ⟨i, projs⟩
-    dsimp only at hi hsl' htp hwpath hwsem ⊢
+    dsimp only at hi hsl' htp hwpath hwsem hbor ⊢
     cases projs with
     | nil =>
       simp [writeFieldPath] at hwpath
       subst hwpath
-      simp [evalStmt, hrvOk newVal hrv, get?, hi, hsl', set?, hprot, hbor, MirStepNode.step]
+      have hinv := invalidateConflictingBorrows_of_ne s.memory.borrows i .none hbor
+      simp [evalStmt, hrvOk newVal hrv, get?, hi, hsl', set?, hprot, hinv, MirStepNode.step,
+        memory_mk_nil_prot s.memory hprot]
     | cons p rest =>
       cases p with
       | field idx fieldTy =>
         have hw := hwsem s.frame.locals
-        simp [evalStmt, hrvOk newVal hrv, get?, hi, hsl', hw, set?, hprot, hbor, MirStepNode.step]
+        have hinv := invalidateConflictingBorrowsAtProj_of_ne s.memory.borrows i .none
+          (.field idx fieldTy :: rest) 0 0 hbor
+        simp [evalStmt, hrvOk newVal hrv, get?, hi, hsl', hw, set?, hprot, hinv, MirStepNode.step,
+          memory_mk_nil_prot s.memory hprot]
       | _ => simp [tuplePlaceSpec] at htp
   · simp [evalStmt, hrvNone hnone]
 
@@ -3595,7 +3635,7 @@ theorem evalStmt_assign_field_scalar (s : MachineState) (decls : List LocalDecl)
     (hok : rvalueOk layouts decls it rv = true)
     (hns : OpsNonScalarInit decls s.frame.locals (rvOperands rv))
     (rootVal : Value) (hsl : s.frame.locals[i]? = some (.init rootVal))
-    (hbor : s.memory.borrows = []) (hprot : s.memory.activeProtectors = []) :
+    (hbor : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i) (hprot : s.memory.activeProtectors = []) :
     (∀ r newRootVal,
       rvBits decls s.frame.locals it layouts rv = some r →
       (∀ locals', MirSemantics.writeProjectedValue locals' rootVal (.field idx fieldTy :: rest)
@@ -3603,7 +3643,7 @@ theorem evalStmt_assign_field_scalar (s : MachineState) (decls : List LocalDecl)
       evalStmt s ⟨.assign ⟨i, .field idx fieldTy :: rest⟩ rv, span⟩ decls layouts =
         .tau (.running (advanceStmt s
           (s.frame.locals.set i (.init newRootVal))
-          { s.memory with borrows := [] }))) ∧
+          s.memory))) ∧
     (rvBits decls s.frame.locals it layouts rv = none →
       evalStmt s ⟨.assign ⟨i, .field idx fieldTy :: rest⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
   have hil : i < s.frame.locals.length := by rw [hn]; exact hi
@@ -3614,7 +3654,10 @@ theorem evalStmt_assign_field_scalar (s : MachineState) (decls : List LocalDecl)
     evalRvalue_frag decls s.frame.locals hslots hn it hgood rv hok hns s.memory
   refine ⟨fun r newRootVal hr hwsem => ?_, fun hnone => ?_⟩
   · have hw := hwsem s.frame.locals
-    simp [evalStmt, hrvOk r hr, get?, hil, hsl', hw, set?, hprot, hbor, MirStepNode.step]
+    have hinv := invalidateConflictingBorrowsAtProj_of_ne s.memory.borrows i .none
+      (.field idx fieldTy :: rest) 0 0 hbor
+    simp [evalStmt, hrvOk r hr, get?, hil, hsl', hw, set?, hprot, hinv, MirStepNode.step,
+      memory_mk_nil_prot s.memory hprot]
   · simp [evalStmt, hrvNone hnone]
 
 theorem evalStmt_placeMention (s : MachineState) (decls : List LocalDecl) (layouts : Layout.LayoutTable)
@@ -3799,7 +3842,7 @@ theorem opPost_slots {layouts : Layout.LayoutTable} {decls : List LocalDecl}
   intro i d slot hd hs
   rcases opPost_get locals op i with h1 | ⟨_, h1, _⟩
   · rw [h1] at hs; exact h i d slot hd hs
-  · rw [h1] at hs; cases hs; simp [DeclSlotOk, SlotOk]
+  · rw [h1] at hs; cases hs; exact declSlotOk_uninit d layouts
 
 theorem rvPost_slots {layouts : Layout.LayoutTable} {decls : List LocalDecl}
     {locals : List LocalSlot} (h : SlotsOk layouts decls locals) (rv : Rvalue) :
@@ -4319,19 +4362,20 @@ theorem evalStmt_assign_move (s : MachineState) (decls : List LocalDecl)
     (layouts : Layout.LayoutTable) (i : Nat) (rv : Rvalue) (span : String)
     (hk : moveKind rv = true) (hr : readsOk [] (rvOperands rv) = true)
     (hi : i < s.frame.locals.length)
-    (hbor : s.memory.borrows = []) (hprot : s.memory.activeProtectors = []) :
+    (hbor : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i) (hprot : s.memory.activeProtectors = []) :
     (∀ v, evalRvalue s.frame.locals (copyRv rv) s.memory decls layouts =
         .ok v s.frame.locals s.memory →
       (s.frame.locals[i]? ≠ some .dead →
         evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts =
           .tau (.running (advanceStmt s ((rvPost s.frame.locals rv).set i (.init v))
-            { s.memory with borrows := [] }))) ∧
+            s.memory))) ∧
       (s.frame.locals[i]? = some .dead →
         evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub)) ∧
     (evalRvalue s.frame.locals (copyRv rv) s.memory decls layouts = .ub →
       evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
   have hR := evalRvalue_move s.frame.locals rv hk hr s.memory decls layouts
   have hil : i < (rvPost s.frame.locals rv).length := by rw [rvPost_length]; exact hi
+  have hinv := invalidateConflictingBorrows_of_ne s.memory.borrows i .none hbor
   refine ⟨fun v hv => ⟨fun hlive => ?_, fun hdead => ?_⟩, fun hu => ?_⟩
   · simp only [evalStmt]
     rw [hR, hv]
@@ -4341,8 +4385,8 @@ theorem evalStmt_assign_move (s : MachineState) (decls : List LocalDecl)
     | some slot =>
       cases slot with
       | dead => exact absurd ((rvPost_dead _ _ _).mp hsl) hlive
-      | uninit => simp [set?, hil, hprot, hbor, invalidateConflictingBorrows_nil, MirStepNode.step]
-      | init w => simp [set?, hil, hprot, hbor, invalidateConflictingBorrows_nil, MirStepNode.step]
+      | uninit => simp [set?, hil, hprot, hinv, MirStepNode.step, memory_mk_nil_prot s.memory hprot]
+      | init w => simp [set?, hil, hprot, hinv, MirStepNode.step, memory_mk_nil_prot s.memory hprot]
   · simp only [evalStmt]
     rw [hR, hv]
     simp only [rvWithLocals, get?, (rvPost_dead _ _ _).mpr hdead]
@@ -4573,25 +4617,25 @@ theorem NonScalarLive.opsInit {body : CapturedMir} {locals : List LocalSlot}
     {lm : Map Gen.LocalName Ptr} (hns : NonScalarLive body locals lm)
     (ops : List Operand) :
     OpsNonScalarInit body.localDecls locals ops := by
-  intro op _ j _ d slot hd hs hnone
-  exact (hns j d slot hd hs hnone).1
+  intro op _ j _ d slot hd hs hnone hnp
+  exact (hns j d slot hd hs hnone hnp).1
 
 theorem NonScalarLive.opsInit_of_readsAgree {body : CapturedMir} {L V : List LocalSlot}
     {lm : Map Gen.LocalName Ptr} (hns : NonScalarLive body V lm)
     {ops : List Operand} (hr : ReadsAgree L V ops) :
     OpsNonScalarInit body.localDecls L ops := by
-  intro op hop j hj d slot hd hs hnone
+  intro op hop j hj d slot hd hs hnone hnp
   rw [hr op hop j hj] at hs
-  exact (hns j d slot hd hs hnone).1
+  exact (hns j d slot hd hs hnone hnp).1
 
 theorem OpsNonScalarInit.copy {decls : List LocalDecl} {locals : List LocalSlot}
     {rv : Rvalue} (h : OpsNonScalarInit decls locals (rvOperands rv)) :
     OpsNonScalarInit decls locals (rvOperands (copyRv rv)) := by
-  intro op hop j hj d slot hd hs hnone
+  intro op hop j hj d slot hd hs hnone hnp
   rw [rvOperands_copyRv] at hop
   obtain ⟨op0, hop0, rfl⟩ := List.mem_map.mp hop
   rw [opLocals_copyOp] at hj
-  exact h op0 hop0 j hj d slot hd hs hnone
+  exact h op0 hop0 j hj d slot hd hs hnone hnp
 
 theorem stepMirFn_stmt (body : CapturedMir) (s : MachineState) (bb : BasicBlockData)
     (stmt : MirAst.Statement) (hcallee : s.memory.activeCallee = none)

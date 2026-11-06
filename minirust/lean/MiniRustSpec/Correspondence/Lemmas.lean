@@ -259,6 +259,90 @@ theorem tupleTypeOf_none_of_scalarTypeOf {layouts : Layout.LayoutTable} {t : Mir
     rw [scalarTypeOf_none_of_tupleTypeOf ht] at h
     cases h
 
+theorem not_other_of_ptrPointeeOf {layouts : Layout.LayoutTable} {t : MirAst.Ty}
+    {mutbl : MirAst.Mutability} {it : Gen.IntType}
+    (h : ptrPointeeOf t = some (mutbl, it)) :
+    isBoolTy t = false ∧ isOrderingTy t = false ∧
+      intBoolTupleOf t = none ∧ intTypeOf t = none ∧
+      arrayTypeOf t = none ∧ tupleTypeOf layouts t = none ∧
+      scalarTypeOf t = none := by
+  unfold ptrPointeeOf at h
+  cases hk : t.kind with
+  | rawPtr m pointee =>
+    have hb : isBoolTy t = false := by simp [isBoolTy, hk]
+    have ho : isOrderingTy t = false := by simp [isOrderingTy, hk]
+    have htup : intBoolTupleOf t = none := by simp [intBoolTupleOf, hk]
+    have hit : intTypeOf t = none := by simp [intTypeOf, intTyBytes, hk]
+    have harr : arrayTypeOf t = none := by simp [arrayTypeOf, hk]
+    have htspec : tupleTypeOf layouts t = none := by
+      unfold tupleTypeOf
+      split
+      · rfl
+      · simp [hk]
+    have hsc : scalarTypeOf t = none := by
+      simp [scalarTypeOf, hb, ho, htup, hit]
+    exact ⟨hb, ho, htup, hit, harr, htspec, hsc⟩
+  | _ => simp [hk] at h
+
+theorem not_other_of_isPtrTy {layouts : Layout.LayoutTable} {t : MirAst.Ty}
+    (h : isPtrTy t = true) :
+    isBoolTy t = false ∧ isOrderingTy t = false ∧
+      intBoolTupleOf t = none ∧ intTypeOf t = none ∧
+      arrayTypeOf t = none ∧ tupleTypeOf layouts t = none ∧
+      scalarTypeOf t = none := by
+  unfold isPtrTy at h
+  obtain ⟨⟨mutbl, it⟩, hp⟩ := Option.isSome_iff_exists.mp h
+  exact not_other_of_ptrPointeeOf hp
+
+theorem isPtrTy_false_of_scalarTypeOf {t : MirAst.Ty} {T : Gen.Type}
+    (h : scalarTypeOf t = some T) : isPtrTy t = false := by
+  cases hp : isPtrTy t with
+  | false => rfl
+  | true =>
+    have hnone := (not_other_of_isPtrTy (layouts := ⟨64, true, []⟩) hp).2.2.2.2.2.2
+    rw [hnone] at h
+    cases h
+
+theorem isPtrTy_false_of_arrayTypeOf {t : MirAst.Ty} {elemIt : Gen.IntType} {count : Nat}
+    (h : arrayTypeOf t = some (elemIt, count)) : isPtrTy t = false := by
+  cases hp : isPtrTy t with
+  | false => rfl
+  | true =>
+    have hnone := (not_other_of_isPtrTy (layouts := ⟨64, true, []⟩) hp).2.2.2.2.1
+    rw [hnone] at h
+    cases h
+
+theorem isPtrTy_false_of_tupleTypeOf {layouts : Layout.LayoutTable} {t : MirAst.Ty}
+    {fields : List (Nat × TupleSpec)} {size align : Nat}
+    (h : tupleTypeOf layouts t = some (fields, size, align)) : isPtrTy t = false := by
+  cases hp : isPtrTy t with
+  | false => rfl
+  | true =>
+    have hnone := (not_other_of_isPtrTy (layouts := layouts) hp).2.2.2.2.2.1
+    rw [hnone] at h
+    cases h
+
+theorem rawPtrTypeOf_of_ptrPointeeOf {t : MirAst.Ty} {mutbl : MirAst.Mutability}
+    {it : Gen.IntType} (h : ptrPointeeOf t = some (mutbl, it)) :
+    rawPtrTypeOf t = some thinRawPtrTy := by
+  unfold ptrPointeeOf at h
+  cases hk : t.kind with
+  | rawPtr m pointee =>
+    simp only [hk, Option.map_eq_some_iff] at h
+    obtain ⟨⟨s, n⟩, hb, _⟩ := h
+    unfold intTyBytes at hb
+    unfold rawPtrTypeOf rawPtrMetaOf rawPtrMetaKind thinRawPtrTy
+    rw [hk]
+    cases pointee <;> simp_all
+  | _ => simp [hk] at h
+
+theorem translateTy_of_ptrPointeeOf {layouts : Layout.LayoutTable} {t : MirAst.Ty}
+    {mutbl : MirAst.Mutability} {it : Gen.IntType}
+    (h : ptrPointeeOf t = some (mutbl, it)) :
+    translateTy layouts t = some thinRawPtrTy := by
+  obtain ⟨_, _, _, _, harr, htspec, hsc⟩ := not_other_of_ptrPointeeOf (layouts := layouts) h
+  simp [translateTy, hsc, harr, htspec, rawPtrTypeOf_of_ptrPointeeOf h]
+
 theorem translateTy_of_scalarTypeOf {layouts : Layout.LayoutTable} {t : MirAst.Ty} {T : Gen.Type}
     (h : scalarTypeOf t = some T) : translateTy layouts t = some T := by
   simp [translateTy, h]
@@ -325,6 +409,22 @@ theorem tyOf_tupleSpec {d : LocalDecl} {layouts : Layout.LayoutTable}
   refine ⟨tyOf_of_translateTy (translateTy_of_tupleTypeOf h), ?_⟩
   simp [itOf, hb, ho, hit, htup, harr, h]
 
+theorem tyOf_ptr {d : LocalDecl} {layouts : Layout.LayoutTable}
+    {mutbl : MirAst.Mutability} {it : Gen.IntType}
+    (h : ptrPointeeOf d.ty = some (mutbl, it)) :
+    tyOf d layouts = thinRawPtrTy ∧ itOf d layouts = usizeIt := by
+  obtain ⟨hb, ho, htup, hit, harr, htspec, _⟩ := not_other_of_ptrPointeeOf (layouts := layouts) h
+  have hp : isPtrTy d.ty = true := by simp [isPtrTy, h]
+  refine ⟨tyOf_of_translateTy (translateTy_of_ptrPointeeOf h), ?_⟩
+  simp [itOf, hb, ho, hit, htup, harr, htspec, hp]
+
+theorem tyOf_isPtrTy {d : LocalDecl} {layouts : Layout.LayoutTable}
+    (h : isPtrTy d.ty = true) :
+    tyOf d layouts = thinRawPtrTy ∧ itOf d layouts = usizeIt := by
+  unfold isPtrTy at h
+  obtain ⟨⟨mutbl, it⟩, hp⟩ := Option.isSome_iff_exists.mp h
+  exact tyOf_ptr hp
+
 theorem itOf_eq_of_intTypeOf {layouts : Layout.LayoutTable} {d : LocalDecl} {it : Gen.IntType}
     (h : intTypeOf d.ty = some it) : itOf d layouts = it :=
   (tyOf_int h).2
@@ -348,6 +448,7 @@ theorem itOf_eq_of_tupleTypeOf {layouts : Layout.LayoutTable} {d : LocalDecl}
 @[simp] theorem tupleIntOfTy_bool : tupleIntOfTy .Bool = none := rfl
 @[simp] theorem tupleIntOfTy_orderingTy : tupleIntOfTy orderingTy = none := rfl
 @[simp] theorem tupleIntOfTy_array (T : Gen.Type) (n : Int) : tupleIntOfTy (.Array T n) = none := rfl
+@[simp] theorem tupleIntOfTy_ptr (pt : Gen.PtrType) : tupleIntOfTy (.Ptr pt) = none := rfl
 
 theorem declSlotData_of_none {d : LocalDecl} {layouts : Layout.LayoutTable}
     (h : intBoolTupleOf d.ty = none) (ha : arrayTypeOf d.ty = none)
@@ -420,6 +521,27 @@ theorem DeclSlotOk_of_tupleTypeOf {d : LocalDecl} {layouts : Layout.LayoutTable}
   simp only [DeclSlotOk, scalarTypeOf_none_of_tupleTypeOf h, arrayTypeOf_none_of_tupleTypeOf h, h,
     Option.isSome_none, Bool.false_eq_true, ↓reduceIte]
   exact Iff.rfl
+
+theorem DeclSlotOk_of_isPtrTy {d : LocalDecl} {layouts : Layout.LayoutTable}
+    (h : isPtrTy d.ty = true) (slot : LocalSlot) :
+    DeclSlotOk d slot layouts ↔
+      match slot with
+      | .dead => True
+      | .uninit => True
+      | .init v => ∃ ptrVal, v = .ptr ptrVal 8 := by
+  obtain ⟨_, _, _, _, harr, htspec, hsc⟩ := not_other_of_isPtrTy (layouts := layouts) h
+  simp only [DeclSlotOk, hsc, harr, htspec, h, Option.isSome_none, Bool.false_eq_true, ↓reduceIte]
+  cases slot <;> exact Iff.rfl
+
+theorem DeclSlotOk_of_ptrPointeeOf {d : LocalDecl} {layouts : Layout.LayoutTable}
+    {mutbl : MirAst.Mutability} {it : Gen.IntType}
+    (h : ptrPointeeOf d.ty = some (mutbl, it)) (slot : LocalSlot) :
+    DeclSlotOk d slot layouts ↔
+      match slot with
+      | .dead => True
+      | .uninit => True
+      | .init v => ∃ ptrVal, v = .ptr ptrVal 8 :=
+  DeclSlotOk_of_isPtrTy (by simp [isPtrTy, h]) slot
 
 /-- `2-tuple` constants are outside the fragment: `translateOperand` reads
 only integer and `bool` scalars. -/
@@ -1461,5 +1583,68 @@ theorem specOfRigidTy_of_tupleTypeOf {layouts : Layout.LayoutTable} {ty : MirAst
           rcases h with ⟨rfl, rfl, rfl⟩
           exact hs
     | _ => simp [hk] at h
+
+theorem goodAlignBytes_dvd {a b : Nat} (ha : goodAlignBytes a = true)
+    (hb : goodAlignBytes b = true) (hle : a ≤ b) : a ∣ b := by
+  simp only [goodAlignBytes, decide_eq_true_eq] at ha hb
+  rcases ha with rfl | rfl | rfl | rfl | rfl <;>
+    rcases hb with rfl | rfl | rfl | rfl | rfl <;> omega
+
+theorem TupleSpec.wf_align_good : ∀ (s : TupleSpec), s.wf = true → goodAlignBytes s.align = true
+  | .scalar it, hwf => hwf
+  | .tuple _ _ _, hwf => by
+    simp only [TupleSpec.wf, Bool.and_eq_true] at hwf
+    exact hwf.1.1.1
+
+theorem resolveFieldPath_align {layouts : Layout.LayoutTable} {rootSpec leafSpec : TupleSpec}
+    {projs : List ProjectionElem} {totalOff : Nat}
+    (hwf : rootSpec.wf = true)
+    (hres : resolveFieldPath layouts rootSpec projs = some (totalOff, leafSpec)) :
+    leafSpec.align ∣ rootSpec.align ∧ leafSpec.align ∣ totalOff := by
+  induction projs generalizing rootSpec totalOff with
+  | nil =>
+    simp [resolveFieldPath] at hres
+    rcases hres with ⟨rfl, rfl⟩
+    exact ⟨Nat.dvd_refl _, Nat.dvd_zero _⟩
+  | cons p rest ih =>
+    cases rootSpec with
+    | scalar _ =>
+      cases p <;> simp [resolveFieldPath] at hres
+    | tuple fields size align =>
+      cases p with
+      | field idx fieldTy =>
+        simp only [resolveFieldPath, Option.bind_eq_bind] at hres
+        cases hf : fields[idx]? with
+        | none => simp [hf] at hres
+        | some pair =>
+          obtain ⟨off, subSpec⟩ := pair
+          simp only [hf, Option.bind_some] at hres
+          cases hexp : specOfRigidTy layouts fieldTy.kind fieldTy.layoutIdx with
+          | none => simp [hexp] at hres
+          | some expectedSpec =>
+            simp only [hexp, Option.bind_some] at hres
+            by_cases heq : subSpec = expectedSpec
+            · simp only [heq, ↓reduceIte] at hres
+              cases hrest : resolveFieldPath layouts expectedSpec rest with
+              | none => simp [hrest] at hres
+              | some rpair =>
+                obtain ⟨restOff, leafSpec'⟩ := rpair
+                simp [hrest] at hres
+                rcases hres with ⟨rfl, rfl⟩
+                subst heq
+                have hrootGood : goodAlignBytes align = true :=
+                  TupleSpec.wf_align_good (.tuple fields size align) hwf
+                simp only [TupleSpec.wf, Bool.and_eq_true] at hwf
+                obtain ⟨hsubWf, _, hmod, hle⟩ := TupleSpec.fieldsWf_getElem? hwf.2 hf
+                have hsubGood : goodAlignBytes subSpec.align = true :=
+                  TupleSpec.wf_align_good subSpec hsubWf
+                have hsubDvdRoot : subSpec.align ∣ align :=
+                  goodAlignBytes_dvd hsubGood hrootGood hle
+                have hsubDvdOff : subSpec.align ∣ off := Nat.dvd_of_mod_eq_zero hmod
+                obtain ⟨hleafDvdSub, hleafDvdRest⟩ := ih hsubWf hrest
+                exact ⟨Nat.dvd_trans hleafDvdSub hsubDvdRoot,
+                  Nat.dvd_add (Nat.dvd_trans hleafDvdSub hsubDvdOff) hleafDvdRest⟩
+            · simp [heq] at hres
+      | _ => simp [resolveFieldPath] at hres
 
 end MiniRustSpec.Correspondence

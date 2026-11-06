@@ -62,8 +62,9 @@ open MiniRustSpec.Interp
 /-- MiniRust storage integer type of a MIR local declaration: `u8` for `bool` or
 `core::cmp::Ordering`, its own integer type for scalar integers, the field-0
 integer type `it` for `(it, bool)` 2-tuples, the element integer type for
-homogeneous arrays `[T; N]`, or an unsigned integer type carrying the alignment
-of a layout-backed tuple/struct (`TupleSpec`). -/
+homogeneous arrays `[T; N]`, an unsigned integer type carrying the alignment
+of a layout-backed tuple/struct (`TupleSpec`), or `usizeIt` (`8` bytes) for
+thin raw pointers. -/
 def itOf (d : LocalDecl) (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : Gen.IntType :=
   if isBoolTy d.ty || isOrderingTy d.ty then ⟨.Unsigned, ⟨1⟩⟩
   else
@@ -78,12 +79,14 @@ def itOf (d : LocalDecl) (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : 
         | none =>
           match tupleTypeOf layouts d.ty with
           | some (_, _, align) => ⟨.Unsigned, ⟨align⟩⟩
-          | none => ⟨.Unsigned, ⟨1⟩⟩
+          | none =>
+            if isPtrTy d.ty then usizeIt
+            else ⟨.Unsigned, ⟨1⟩⟩
 
 /-- MiniRust type of a fragment local declaration (`Type::Int(..)`,
-`Type::Bool`, `orderingTy`, `intBoolTupleTy`, `Type::Array`, or `TupleSpec`'s
-`Type::Tuple`, as `minimize` translates it); the default is never used for
-fragment bodies. -/
+`Type::Bool`, `orderingTy`, `intBoolTupleTy`, `Type::Array`, `TupleSpec`'s
+`Type::Tuple`, or `thinRawPtrTy`, as `minimize` translates it); the default is
+never used for fragment bodies. -/
 def tyOf (d : LocalDecl) (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : Gen.Type :=
   (translateTy layouts d.ty).getD (.Int (itOf d layouts))
 
@@ -93,6 +96,7 @@ def tyBytes : Gen.Type → Nat
   | .Enum _ _ _ size _ => size.bytes
   | .Tuple _ ⟨end_, _, _⟩ _ => end_.bytes
   | .Array (.Int elemIt) count => count.toNat * elemIt.size.bytes
+  | .Ptr (.Raw .None) => 8
   | _ => 1
 
 /-- Whether a MiniRust type is `intBoolTupleTy it`, returning `it`. -/
@@ -107,6 +111,20 @@ def tupleIntOfTy : Gen.Type → Option Gen.IntType
 little-endian bytes without provenance. -/
 def scalarBytes (it : Gen.IntType) (bits : Nat) : List Byte :=
   (leBytes bits it.size.bytes).map (fun b => .Init b none)
+
+/-- The bytes `encode_ptr` produces for the thin pointer `⟨addr, prov⟩` with
+`addr < 2^64` (`encodePtr_eq`). -/
+def ptrBytes (addr : Nat) (prov : Option Prov) : List Byte :=
+  encodePtrBytes prov 0 (leBytes addr 8)
+
+theorem encodePtrBytes_length (prov : Option Prov) (i : Nat) (data : List UInt8) :
+    (encodePtrBytes prov i data).length = data.length := by
+  induction data generalizing i with
+  | nil => rfl
+  | cons b rest ih => simp [encodePtrBytes, ih]
+
+theorem ptrBytes_length (addr : Nat) (prov : Option Prov) : (ptrBytes addr prov).length = 8 := by
+  simp [ptrBytes, encodePtrBytes_length, leBytes_length]
 
 /-- `Type::encode` of `Value::Tuple([Value::Int(intFromBits bits it), Value::Bool(b == 1)])`
 at `intBoolTupleTy it`: field 0's `it.size.bytes` little-endian bytes at offset
@@ -308,7 +326,11 @@ def DeclSlotOk (d : LocalDecl) (slot : LocalSlot)
         | some (fields, size, align) =>
           (TupleSpec.tuple fields size align).wf = true ∧
           (TupleSpec.tuple fields size align).valOk v = true
-        | none => SlotOk (tyOf d layouts) (.init v)
+        | none =>
+          if isPtrTy d.ty then
+            ∃ ptrVal, v = .ptr ptrVal 8
+          else
+            SlotOk (tyOf d layouts) (.init v)
 
 /-- The parts of the MiniRust machine that the callee's execution does not
 determine but must keep stable: the caller frame, the caller's continuation
@@ -323,6 +345,7 @@ structure Ctx : Type where
   nextBlock : Gen.BbName
   unwindBlock : Option Gen.BbName
   retPtr : Ptr
+  ptrTargets : Nat → Option (Nat × Option Prov) := fun _ => none
 
 /-- The pointer to local `_i` in the callee's initial frame: allocation number
 `base.length + i`. -/
@@ -394,14 +417,26 @@ def AddrClass (addr : Int) (size : Nat) : Prop :=
 /-- MiniRust's storage for local `_i` (declaration `d`, Anneal slot `slot`)
 behind pointer `p`: allocation number `id` (at or above the caller's
 allocations `base`), at an address that is well formed for `d`'s storage type,
-holding the representation of `slot`. -/
+holding the representation of `slot` (for an initialized thin raw pointer
+local, 8 encoded pointer bytes `ptrBytes tAddr tProv` for some `tAddr < 2^64`,
+whose exact target provenance and offset are tied to `s.memory.borrows` by
+`BorrowsOk`). -/
 def LocalStorage (ctx : Ctx) (allocs : List Gen.Allocation) (d : LocalDecl) (slot : LocalSlot)
     (p : Ptr) (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : Prop :=
   ∃ id : Nat, p.provenance = some (⟨(id : Int)⟩, ()) ∧ ctx.base.length ≤ id ∧
     AddrOk p.addr (itOf d layouts) ∧
     p.addr + (tyBytes (tyOf d layouts) : Int) < 2 ^ 64 ∧
     AddrClass p.addr (tyBytes (tyOf d layouts)) ∧
-    allocs[id]? = some (stackAlloc p.addr (itOf d layouts) (declSlotData d slot layouts))
+    if isPtrTy d.ty then
+      match slot with
+      | .init (.ptr pv 8) =>
+        ∃ (tAddr : Nat) (tProv : Option Prov), tAddr < 2 ^ 64 ∧
+          (∀ a pr, ctx.ptrTargets pv.allocId = some (a, pr) → tAddr = a ∧ tProv = pr) ∧
+          allocs[id]? = some (stackAlloc p.addr (itOf d layouts) (ptrBytes tAddr tProv))
+      | _ =>
+        allocs[id]? = some (stackAlloc p.addr (itOf d layouts) (declSlotData d slot layouts))
+    else
+      allocs[id]? = some (stackAlloc p.addr (itOf d layouts) (declSlotData d slot layouts))
 
 /-- Agreement of the callee's MiniRust locals map `lm` and the allocations
 `allocs` with Anneal slots `locals`, once `minimize`'s init block has
@@ -467,7 +502,7 @@ structure StateRelAt (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : Ma
     (view : List LocalSlot) (m : Mach) : Prop where
   frame : ∃ lm, m.threads =
       [thread1 ctx [ctx.caller, calleeFrameL f ctx lm s.frame.blockIdx s.frame.stmtIdx]] ∧
-    LocalsOk body ctx view lm m.mem.memory.allocations
+    LocalsOk body { ctx with ptrTargets := fun _ => none } view lm m.mem.memory.allocations
   active : m.active_thread = 0
   blk : s.frame.blockIdx < body.basicBlocks.length
   stmt : ∀ bb, body.basicBlocks[s.frame.blockIdx]? = some bb → s.frame.stmtIdx ≤ bb.statements.length
@@ -475,7 +510,8 @@ structure StateRelAt (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : Ma
   retLive : view[0]? ≠ some .dead
   ret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (tyOf d body.layouts) (itOf d body.layouts)
   baseLow : BaseLow ctx
-  borrows : s.memory.borrows = []
+  borrows : s.memory.borrows = [] ∨
+    ¬ body.localDecls.all (fun d => (scalarTypeOf d.ty).isSome) = true
   callStack : s.memory.callStack = []
   activeCallee : s.memory.activeCallee = none
   protectors : s.memory.activeProtectors = []

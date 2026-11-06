@@ -3175,31 +3175,40 @@ def int2ptrCandidates (allocs : List Gen.Allocation) (exposed : Set Prov) (addr 
 >     ret(ThinPointer { addr, provenance })
 > }"
 `predict` is an angelic choice: if some admissible provenance makes the rest
-of the execution well-defined, MiniRust picks it. No single choice is right
-for every continuation, so the interpretation commits to one admissible
-resolution, as `BM.pickAddr` does for the daemonic address choice:
+of the execution well-defined, MiniRust picks it. In `BasicMemory`, provenance
+is monotone (`spec/lang/representation.md`: every zero-sized operation and
+zero-offset `ptr_offset_inbounds` succeeds before inspecting provenance, and
+integer byte decoding ignores provenance fragments, so `Some(p)` succeeds in
+every continuation where `None` succeeds):
 
-* if exactly one exposed provenance belongs to a live allocation whose range
-  `[addr_a, addr_a + size_a]` contains `addr` (`int2ptrCandidates`), that
-  provenance, the only exposed one under which an access at `addr` can be
-  in bounds;
-* if none does, `None`, under which only zero-sized accesses are allowed and
-  which every exposed provenance would refuse as well;
-* if several do (two live allocations that meet at `addr`, one ending and one
-  starting there), `Stop.unsupported`: which one makes the execution
-  well-defined depends on accesses that have not happened yet.
+* if `exposed` is empty, `None` is the unique admissible provenance;
+* if `exposed` is a singleton `[p]`, `Some(p)` dominates `None` by provenance
+  monotonicity, so `Some(p)` is exact for every continuation — even when `addr`
+  lies temporarily outside allocation `p` before a wrapping offset brings it
+  back in bounds;
+* if `exposed` contains two or more provenances, `int2ptrCandidates` selects the
+  live exposed allocations whose range `[addr_a, addr_a + size_a]` contains
+  `addr`: a unique candidate `[p]` resolves to `Some(p)`, while zero or multiple
+  in-bounds candidates stop with `Stop.unsupported` rather than fabricating UB
+  by guessing `None` or choosing arbitrarily between adjacent allocations.
 
-The resolution is sound for successful executions: it always picks an
-admissible provenance, so a run that returns without UB under it is a run of
-the angelic semantics. A UB result reached through an integer-to-pointer
-cast, however, holds for this resolution only. The resolution fails to be
-the angelic one only when a later access through the pointer, after a
-wrapping offset, would be in bounds of a different exposed allocation. -/
+Every provenance returned is admissible (`None` or in `exposed`), so any run
+that completes under `int2ptrProvenance` is a valid angelic run. When two or
+more provenances are exposed and `int2ptrCandidates` picks the unique one
+containing `addr`, a UB result holds for that resolution (which differs from
+angelic choice only if a later wrapping offset moves the pointer into a
+different exposed allocation). -/
 def int2ptrProvenance (m : Mach) (addr : Int) : Interp (Option Prov) :=
-  match int2ptrCandidates m.mem.memory.allocations m.intptrcast.exposed addr with
+  match m.intptrcast.exposed.elems with
   | [] => pure none
   | [p] => pure (some p)
-  | _ => unsupported "int2ptr: several exposed allocations meet at the address (angelic choice)"
+  | _ =>
+    match int2ptrCandidates m.mem.memory.allocations m.intptrcast.exposed addr with
+    | [p] => pure (some p)
+    | [] =>
+      unsupported "int2ptr: multiple exposed allocations and none contains the address (angelic choice)"
+    | _ =>
+      unsupported "int2ptr: several exposed allocations meet at the address (angelic choice)"
 
 /-- `IntPtrCast::int2ptr` (`spec/mem/intptrcast.md`) with the provenance
 predicted by `int2ptrProvenance`:

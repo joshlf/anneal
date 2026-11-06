@@ -2003,6 +2003,46 @@ fn mr_3_1_pointer_quotations_are_pinned_and_tamper_checked() {
         );
     }
 
+    let translate_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Correspondence/Translate.lean"))
+            .unwrap();
+    let translate_quotes = extract_quotes(&translate_text, &valid_paths).unwrap();
+    let expected_translate: &[(&str, &str)] = &[
+        ("tooling/minimize/src/ty.rs", "rs::TyKind::RawPtr(ty, _mutbl) =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::ProjectionElem::Deref =>"),
+        ("tooling/minimize/src/rvalue.rs", "(Offset, Type::Ptr(_)) =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::Rvalue::AddressOf(_mutbl, place) =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::CastKind::PtrToPtr =>"),
+        (
+            "tooling/minimize/src/bb.rs",
+            "rs::Rvalue::Cast(rs::CastKind::PointerExposeProvenance, operand, _) =>",
+        ),
+        (
+            "tooling/minimize/src/bb.rs",
+            "StatementResult::Intrinsic { intrinsic, destination, arguments } =>",
+        ),
+    ];
+    for (cited_file, needle) in expected_translate {
+        let matched = translate_quotes
+            .iter()
+            .find(|q| q.cited_file == *cited_file && squash(&q.text).contains(&squash(needle)))
+            .unwrap_or_else(|| {
+                panic!(
+                    "Translate.lean missing MR-3.1 quotation `{needle}` cited to `{cited_file}`"
+                )
+            });
+        assert_eq!(
+            missing_piece_in(&corpus, Some(cited_file), &matched.text),
+            None,
+            "Translate.lean quotation `{needle}` failed upstream verification"
+        );
+        let mutated = format!("{}__TAMPERED__", matched.text);
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), &mutated).is_some(),
+            "tampered quotation for `{needle}` unexpectedly matched `{cited_file}`"
+        );
+    }
+
     // Semantic tampers: plausible misreadings of the pointer semantics must not
     // verify against the vendored specification.
     let tampers: &[(&str, &str)] = &[

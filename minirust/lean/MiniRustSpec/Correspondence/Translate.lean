@@ -29,22 +29,33 @@ The translation is defined only on the fragment checked by `inFragment`:
 
 * the body is `Runtime(PostCleanup)` MIR and declares the return place, the
   arguments, and any number of temporaries (`argCount + 1 ≤ localDecls.length <
-  2^31`); the return place `_0` and every temporary (`argCount < i`) have scalar
-  fragment type (`Int`, `bool`, `core::cmp::Ordering`, or `(Int, bool)` 2-tuple),
-  and each argument local additionally may have homogeneous 1D integer array
-  type `[T; N]` whose byte size `N * size_of::<T>()` fits in signed 64-bit
-  `isize` (`< 2^63`) or well-formed tuple / single-variant struct type
-  (`RigidTy.tuple` or `RigidTy.adt`) with explicit layout offsets and padding
+  2^31`); the return place `_0` has scalar fragment type (`Int`, `bool`,
+  `core::cmp::Ordering`, or `(Int, bool)` 2-tuple), each temporary
+  (`argCount < i`) has scalar fragment type or thin raw pointer type
+  (`*const T` / `*mut T` for integer `T`), and each argument local (`1 ≤ i ≤
+  argCount`) has scalar fragment type, homogeneous 1D integer array type
+  `[T; N]` whose byte size `N * size_of::<T>()` fits in signed 64-bit `isize`
+  (`< 2^63`), or well-formed tuple / single-variant struct type (`RigidTy.tuple`
+  or `RigidTy.adt`) with explicit layout offsets and padding
   (`FieldsShape.arbitrary`, `VariantsShape.single 0`);
 * statements are:
   - scalar assignments `dst = rv` to an integer place `dst` (`_i`, array
-    element `_i[proj]`, or tuple/struct scalar field chain `_i.f1...fk`), where
+    element `_i[proj]`, tuple/struct scalar field chain `_i.f1...fk`, or mutable
+    raw pointer dereference `*_p`), where
     `rv` is `Use(a)`, `UnaryOp(uop, a)` (`uop ∈ {Neg, Not}`),
     `BinaryOp(op, a, b)` (`op` among the 15 integer `BinOp` variants, with `b`
     of `dst`'s integer type `it` or of any integer type `rhsIt` for the shift
     operators `Shl, Shr, ShlUnchecked, ShrUnchecked`),
-    `Cast(IntToInt, a, targetTy)` (from any integer type `srcIt` or `bool`), or
-    `Len(_j)` of an array local `_j` (into a `usize` destination);
+    `Cast(IntToInt, a, targetTy)` (from any integer type `srcIt` or `bool`),
+    `Len(_j)` of an array local `_j` (into a `usize` destination), or on root
+    destinations `_i = copy/move (*_p)` reading through a thin raw pointer `_p`;
+  - thin raw pointer assignments `_i = rv` to a raw pointer local `_i`, where
+    `rv` is `Use(copy/move _p)`, `&raw const q` / `&raw mut q` of a parameter
+    scalar/array-element/struct-field place `q` (`ptrTargetOk`),
+    `Cast(PtrToPtr, copy/move _p, castTy)` preserving pointee integer type and
+    not upgrading `*const` to `*mut`, or zero-offset `BinaryOp(Offset,
+    copy/move _p, const 0)` (`ptrRvalueOk`), subject to the static non-aliasing
+    write discipline `ptrAliasingOk`;
   - `bool`, `Ordering`, and `(it, bool)` 2-tuple assignments `_i = rv` to a root
     local `_i` (`boolNot`, `boolBitOp`, comparisons `Eq | Ne | Lt | Le | Gt | Ge`,
     three-way `Cmp`, `AddWithOverflow | SubWithOverflow | MulWithOverflow`,
@@ -58,7 +69,7 @@ The translation is defined only on the fragment checked by `inFragment`:
   - `PlaceMention(p)` on `_i`, `(it, bool)` fields `_i.0` / `_i.1`, or
     tuple/struct field chains `_i.f1...fk`;
   - `StorageLive(_i)`, `StorageDead(_i)` of a temporary (`argCount < i`), and
-    `Deinit(_i)` on scalar-family root locals;
+    `Deinit(_i)` on scalar-family or thin raw pointer root locals;
 * terminators are `Goto`, `SwitchInt` on an integer or `bool` fragment operand,
   `Unreachable`, or `Return`, and every jump target is a block of the body;
 * no block is a cleanup block;
@@ -512,11 +523,20 @@ def tupleTypeOf (layouts : Layout.LayoutTable := ⟨64, true, []⟩) (t : MirAst
 
 /-- The metadata kind of a raw pointer to `pointee`, as `minimize` computes it
 from the pointee's layout (`pointee_info_of(..).layout.meta_kind()`): no
-metadata for the sized scalar pointees integers and `bool`, and an element
-count for slices and `str`. Other pointees are outside the translation. -/
+metadata (`PointerMetaKind::None`) for sized pointees, and an element count
+(`PointerMetaKind::ElementCount`) for slices and `str`. Unsized trait objects
+and extern foreign types are outside the translation. -/
 def rawPtrMetaKind : MirAst.RigidTy → Option Gen.PointerMetaKind
-  | .int _ | .uint _ | .bool => some .None
+  | .bool | .char | .int _ | .uint _ | .float _ | .never
+  | .tuple _ | .array _ _ | .ref _ _ | .rawPtr _ _ | .adt _ _
+  | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _ => some .None
   | .slice _ | .str => some .ElementCount
+  | .dynamic _ | .foreign _ | .other _ => none
+
+/-- Metadata kind of a raw pointer `MirAst.Ty` (`rawPtrMetaKind`). -/
+def rawPtrMetaOf (t : MirAst.Ty) : Option Gen.PointerMetaKind :=
+  match t.kind with
+  | .rawPtr _ pointee => rawPtrMetaKind pointee
   | _ => none
 
 /-- `minimize`'s translation of raw pointer types `*const T` and `*mut T`
@@ -527,9 +547,7 @@ kind (`rawPtrMetaKind`):
 >     Type::Ptr(PtrType::Raw { meta_kind: pointee.layout.meta_kind() })
 > }" -/
 def rawPtrTypeOf (t : MirAst.Ty) : Option Gen.Type :=
-  match t.kind with
-  | .rawPtr _ pointee => (rawPtrMetaKind pointee).map (fun k => .Ptr (.Raw k))
-  | _ => none
+  (rawPtrMetaOf t).map (fun k => .Ptr (.Raw k))
 
 /-- `minimize`'s type translation across the fragment (`tooling/minimize/src/ty.rs`):
 > "rs::TyKind::Bool => Type::Bool,
@@ -570,6 +588,12 @@ def translateTy (layouts : Layout.LayoutTable := ⟨64, true, []⟩) (t : MirAst
         some ((TupleSpec.tuple fields size align).toMiniRustTy)
       | none => rawPtrTypeOf t
 
+instance : DecidableEq MirAst.Mutability
+  | .not, .not => isTrue rfl
+  | .mut, .mut => isTrue rfl
+  | .not, .mut => isFalse (by intro h; cases h)
+  | .mut, .not => isFalse (by intro h; cases h)
+
 /-- The pointee integer type of a thin raw pointer type `*const T` or `*mut T`
 whose pointee `T` is an integer type, with the pointer's mutability. The
 correspondence fragment admits raw pointers only to integer pointees (see
@@ -595,13 +619,24 @@ def intFromBits (bits : Nat) (it : Gen.IntType) : Int :=
   | .Signed =>
     if bits < 2 ^ (8 * it.size.bytes - 1) then bits else (bits : Int) - 2 ^ (8 * it.size.bytes)
 
+/-- Translation of a `RigidTy` pointee without needing a layout-table entry:
+`bool`, integers, `core::cmp::Ordering`, `(Int, bool)` 2-tuples, homogeneous 1D
+integer arrays `[Int; N]`, and nested raw pointers `*const U` / `*mut U`. -/
+def translatePointeeRigidTy : MirAst.RigidTy → Option Gen.Type
+  | .bool => some .Bool
+  | .adt "core::cmp::Ordering" [] => some orderingTy
+  | .tuple [elem, .bool] => (intTyBytes elem).map (fun (s, n) => intBoolTupleTy ⟨s, ⟨n⟩⟩)
+  | .array elem count =>
+    (intTyBytes elem).map (fun (s, n) => .Array (.Int ⟨s, ⟨n⟩⟩) (Int.ofNat count))
+  | .rawPtr _ inner => (rawPtrMetaKind inner).map (fun k => .Ptr (.Raw k))
+  | pointee => (intTyBytes pointee).map (fun (s, n) => .Int ⟨s, ⟨n⟩⟩)
+
 /-- The translation of the pointee type of a raw pointer type, the type at
 which `minimize` dereferences it (`translate_ty_smir(this_ty, ..)` in
-`translatePlace`): integers and `bool`. -/
+`translatePlace`). -/
 def derefPointeeTy (t : MirAst.Ty) : Option Gen.Type :=
   match t.kind with
-  | .rawPtr _ .bool => some .Bool
-  | .rawPtr _ pointee => (intTyBytes pointee).map (fun (s, n) => .Int ⟨s, ⟨n⟩⟩)
+  | .rawPtr _ pointee => translatePointeeRigidTy pointee
   | _ => none
 
 /-- Left-to-right fold translating a chain of `ProjectionElem.field` projections
@@ -658,14 +693,15 @@ here is an extension rather than a transcription: for
 `[T; count]`, the index that MIR defines for the projection (`count - offset`
 when `from_end` is true, or `offset` when `from_end` is false) becomes a
 `usize` constant index expression of `PlaceExpr::Index`. A dereference
-`*_j` of a raw pointer local loads the pointer and dereferences it at the
-translation of the pointee type `this_ty` (`derefPointeeTy`). -/
+`*_j` (optionally followed by field projections `(*_j).f1...fk`) loads the
+pointer local and dereferences it at the translation of the pointee type
+`this_ty` (`derefPointeeTy`). -/
 def translatePlace (decls : List MirAst.LocalDecl := []) : MirAst.Place → Option Gen.PlaceExpr
   | ⟨i, []⟩ => some (.Local (localName i))
-  | ⟨i, [.deref]⟩ => do
+  | ⟨i, .deref :: rest⟩ => do
     let d ← decls[i]?
     let ty ← derefPointeeTy d.ty
-    some (.Deref (.Load (.Local (localName i))) ty)
+    translateFieldPlace (.Deref (.Load (.Local (localName i))) ty) rest
   | ⟨i, [.index idxLocal]⟩ =>
     some (.Index (.Local (localName i)) (.Load (.Local (localName idxLocal))))
   | ⟨i, [.constantIndex offset minLen fromEnd]⟩ =>
@@ -1003,6 +1039,12 @@ def operandPtrPointee (decls : List MirAst.LocalDecl) :
   | .copy ⟨j, []⟩ | .move ⟨j, []⟩ => decls[j]? >>= fun d => ptrPointeeOf d.ty
   | _ => none
 
+/-- Metadata kind of a raw pointer operand `copy _j` or `move _j` (`rawPtrMetaOf`). -/
+def operandRawPtrMeta (decls : List MirAst.LocalDecl) :
+    MirAst.Operand → Option Gen.PointerMetaKind
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ => decls[j]? >>= fun d => rawPtrMetaOf d.ty
+  | _ => none
+
 /-- `minimize`'s translation of MIR's pointer offset `Offset(l, r)`, which
 counts in units of the pointee (`tooling/minimize/src/rvalue.rs`):
 > "(Offset, Type::Ptr(_)) => {
@@ -1141,7 +1183,8 @@ at the raw pointer type of the place's pointee, which is sized for every place
 >
 >     ValueExpr::AddrOf { target, ptr_ty }
 > }"
-a `PtrToPtr` cast between thin raw pointers is the operand itself:
+a `PtrToPtr` cast preserves `operand` when `old_meta_kind == new_meta_kind` and
+strips metadata via `UnOp::GetThinPointer` when casting to a thin pointer:
 > "smir::CastKind::PtrToPtr => {
 >     let operand_ty = operand.ty(&self.locals_smir).unwrap();
 >     let Type::Ptr(PtrType::Raw { meta_kind: old_meta_kind }) =
@@ -1239,9 +1282,11 @@ def translateRvalue (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
     pure (.AddrOf target (.Raw .None))
   | .cast .ptrToPtr op castTy => do
     let operand ← translateOperand decls op
-    let (_, _) ← operandPtrPointee decls op
-    let (_, _) ← ptrPointeeOf castTy
-    pure operand
+    let oldMeta ← operandRawPtrMeta decls op
+    let newMeta ← rawPtrMetaOf castTy
+    if oldMeta == newMeta then pure operand
+    else if newMeta == .None then pure (.UnOp .GetThinPointer operand)
+    else none
   | _ => none
 
 /-- `minimize`'s statement translation for assignments, `StorageLive`,
@@ -1471,6 +1516,112 @@ def translateFn (body : MirAst.CapturedMir) : Option Gen.Function := do
     calling_convention := .Rust
     blocks := ⟨blocks ++ [(bbName n, initBlock body)]⟩
     start := bbName n
+    implicit_writes := true
+  }
+
+/-- `minimize`'s `StatementResult` (`tooling/minimize/src/bb.rs`): a MIR
+statement lowers either to a MiniRust `Statement` or to a block-splitting
+`Terminator::Intrinsic` call (`PointerExposeProvenance` /
+`PointerWithExposedProvenance`). -/
+inductive StmtTranslation : Type where
+  | stmt (s : Gen.Statement)
+  | intrinsic (op : Gen.IntrinsicOp) (dst : Gen.PlaceExpr) (args : List Gen.ValueExpr)
+
+/-- `minimize`'s statement translation including the integer-pointer provenance
+casts (`tooling/minimize/src/bb.rs`):
+> "match rval {
+>     rs::Rvalue::Cast(rs::CastKind::PointerExposeProvenance, operand, _) => {
+>         let operand = self.translate_operand(operand, span);
+>         return StatementResult::Intrinsic {
+>             intrinsic: IntrinsicOp::PointerExposeProvenance,
+>             destination,
+>             arguments: list![operand],
+>         };
+>     }
+>     rs::Rvalue::Cast(rs::CastKind::PointerWithExposedProvenance, operand, _) => {
+>         // TODO untested so far! (Can't test because of `predict`)
+>         let operand = self.translate_operand(operand, span);
+>         return StatementResult::Intrinsic {
+>             intrinsic: IntrinsicOp::PointerWithExposedProvenance,
+>             destination,
+>             arguments: list![operand],
+>         };
+>     }
+>     _ => {}
+> }" -/
+def translateStmtOrIntrinsic (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
+    (layouts : Layout.LayoutTable := ⟨64, true, []⟩) :
+    Option StmtTranslation :=
+  match s.kind with
+  | .assign dst (.cast .pointerExposeProvenance op _) => do
+    let destination ← translatePlace decls dst
+    let operand ← translateOperand decls op
+    pure (.intrinsic .PointerExposeProvenance destination [operand])
+  | .assign dst (.cast .pointerWithExposedProvenance op _) => do
+    let destination ← translatePlace decls dst
+    let operand ← translateOperand decls op
+    pure (.intrinsic .PointerWithExposedProvenance destination [operand])
+  | _ => (translateStatement decls s layouts).map .stmt
+
+/-- Split a sequence of `StmtTranslation`s at `StmtTranslation.intrinsic`
+boundaries (`FnCtxt::translate_bb`, `tooling/minimize/src/bb.rs`):
+> "StatementResult::Intrinsic { intrinsic, destination, arguments } => {
+>     // Generate a fresh bb name.
+>     let next_bb = self.fresh_bb_name();
+>     // End the current block by jumping to the next one.
+>     let terminator = Terminator::Intrinsic {
+>         intrinsic,
+>         arguments,
+>         ret: destination,
+>         next_block: Some(next_bb),
+>     };" -/
+def splitBlockAtIntrinsics (curName : Gen.BbName) (accStmts : List Gen.Statement)
+    (finalTerm : Gen.Terminator) (kind : Gen.BbKind) (nextFresh : Nat) :
+    List StmtTranslation → List (Gen.BbName × Gen.BasicBlock) × Nat
+  | [] => ([(curName, ⟨accStmts, finalTerm, kind⟩)], nextFresh)
+  | .stmt st :: rest =>
+    splitBlockAtIntrinsics curName (accStmts ++ [st]) finalTerm kind nextFresh rest
+  | .intrinsic op dst args :: rest =>
+    let nextBb := bbName nextFresh
+    let curBlk : Gen.BasicBlock :=
+      ⟨accStmts, .Intrinsic op args dst (some nextBb), kind⟩
+    let (tailBlks, nextFresh') :=
+      splitBlockAtIntrinsics nextBb [] finalTerm kind (nextFresh + 1) rest
+    ((curName, curBlk) :: tailBlks, nextFresh')
+
+/-- Translate basic blocks while splitting blocks at provenance-cast intrinsics,
+allocating fresh `BbName`s above `nextFresh`. -/
+def translateBlocksWithIntrinsics (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) :
+    Nat → Nat → List MirAst.BasicBlockData →
+      Option (List (Gen.BbName × Gen.BasicBlock) × Nat)
+  | _, nextFresh, [] => some ([], nextFresh)
+  | i, nextFresh, bb :: bbs => do
+    let trs ← bb.statements.mapM (translateStmtOrIntrinsic decls · layouts)
+    let term ← translateTerminator layouts decls bb.terminator
+    let kind := if bb.isCleanup then Gen.BbKind.Cleanup else .Regular
+    let (here, nextFresh') :=
+      splitBlockAtIntrinsics (bbName i) [] term kind nextFresh trs
+    let (rest, finalFresh) ←
+      translateBlocksWithIntrinsics layouts decls (i + 1) nextFresh' bbs
+    pure (here ++ rest, finalFresh)
+
+/-- `minimize`'s function translation extended with block-splitting lowering of
+`CastKind::PointerExposeProvenance` and `CastKind::PointerWithExposedProvenance`
+into `Terminator::Intrinsic` blocks (used by ground-truth and divergence
+witnesses outside `inFragment`). -/
+def translateFnWithIntrinsics (body : MirAst.CapturedMir) : Option Gen.Function := do
+  let locals ← translateLocals body.layouts 0 body.localDecls
+  let n := body.basicBlocks.length
+  let (blocks, initIdx) ←
+    translateBlocksWithIntrinsics body.layouts body.localDecls 0 n body.basicBlocks
+  pure {
+    locals := ⟨locals⟩
+    args := (List.range body.argCount).map (fun k => localName (k + 1))
+    ret := localName 0
+    calling_convention := .Rust
+    blocks := ⟨blocks ++ [(bbName initIdx, initBlock body)]⟩
+    start := bbName initIdx
     implicit_writes := true
   }
 
@@ -1747,6 +1898,85 @@ def tupleRvalueOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
     tupleFieldsOperandOk layouts decls fields ops
   | _ => false
 
+/-- Resolve the pointee integer type and relative byte offset of an admissible
+`&raw const` / `&raw mut` target place: an unprojected integer parameter local
+`⟨k, []⟩`, an in-bounds `ConstantIndex` element `⟨k, [.constantIndex ..]⟩` of an
+array parameter `[T; count]`, or a scalar field chain `⟨k, .field ..⟩` of a
+`TupleSpec` parameter (`1 ≤ k`). -/
+def ptrTargetSpec (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) : MirAst.Place → Option (Gen.IntType × Nat)
+  | ⟨k, []⟩ =>
+    if 1 ≤ k ∧ k < decls.length then
+      (decls[k]? >>= (intTypeOf ·.ty)).map (·, 0)
+    else none
+  | ⟨k, [.constantIndex offset minLen fromEnd]⟩ =>
+    if 1 ≤ k ∧ k < decls.length then
+      match decls[k]? >>= (arrayTypeOf ·.ty) with
+      | some (elemIt, count) =>
+        if minLen ≤ count ∧ (if fromEnd then 1 ≤ offset ∧ offset ≤ count else offset < count) then
+          let idx := if fromEnd then count - offset else offset
+          some (elemIt, idx * elemIt.size.bytes)
+        else none
+      | none => none
+    else none
+  | ⟨k, .field idx fieldTy :: rest⟩ =>
+    if 1 ≤ k ∧ k < decls.length then do
+      let d ← decls[k]?
+      let (fields, size, align) ← tupleTypeOf layouts d.ty
+      let (relOff, leafSpec) ←
+        resolveFieldPath layouts (.tuple fields size align) (.field idx fieldTy :: rest)
+      match leafSpec with
+      | .scalar leafIt => some (leafIt, relOff)
+      | .tuple _ _ _ => none
+    else none
+  | _ => none
+
+/-- Whether `place` is an admissible `&raw` target of pointee integer type `pointeeIt`. -/
+def ptrTargetOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (pointeeIt : Gen.IntType) (place : MirAst.Place) : Bool :=
+  match ptrTargetSpec layouts decls place with
+  | some (it, _) => decide (it = pointeeIt)
+  | none => false
+
+/-- Whether `c` is an integer constant encoding `0` (`Offset(p, 0)`). -/
+def zeroOffsetConstOk (c : MirAst.ConstOperand) : Bool :=
+  match c.val, intTypeOf c.ty with
+  | .scalar (.int ⟨0, sz⟩), some rIt => decide (sz = rIt.size.bytes)
+  | _, _ => false
+
+/-- Fragment rvalues producing a thin raw pointer of mutability `mutbl` and
+pointee integer type `pointeeIt` (inspected after `copyRv`). -/
+def ptrRvalueOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (mutbl : MirAst.Mutability) (pointeeIt : Gen.IntType) :
+    MirAst.Rvalue → Bool
+  | .use (.copy ⟨p, []⟩) =>
+    decide (p < decls.length) &&
+    decide ((decls[p]? >>= (ptrPointeeOf ·.ty)) = some (mutbl, pointeeIt))
+  | .rawPtr m place =>
+    decide (m = mutbl) && ptrTargetOk layouts decls pointeeIt place
+  | .cast .ptrToPtr (.copy ⟨p, []⟩) castTy =>
+    decide (p < decls.length) &&
+    decide (ptrPointeeOf castTy = some (mutbl, pointeeIt)) &&
+    match decls[p]? >>= (ptrPointeeOf ·.ty) with
+    | some (srcMutbl, srcIt) =>
+      decide (srcIt = pointeeIt) && (decide (srcMutbl = .mut) || decide (mutbl = .not))
+    | none => false
+  | .binaryOp .offset (.copy ⟨p, []⟩) (.constant c) =>
+    decide (p < decls.length) &&
+    decide ((decls[p]? >>= (ptrPointeeOf ·.ty)) = some (mutbl, pointeeIt)) &&
+    zeroOffsetConstOk c
+  | _ => false
+
+/-- Whether `rv` (after `copyRv`) is a dereference read `*_p` of a thin raw
+pointer to integer type `it`. -/
+def ptrDerefReadOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rvalue → Bool
+  | .use (.copy ⟨p, [.deref]⟩) =>
+    decide (p < decls.length) &&
+    match decls[p]? >>= (ptrPointeeOf ·.ty) with
+    | some (_, pointeeIt) => decide (pointeeIt = it)
+    | none => false
+  | _ => false
+
 /-- Places admissible in `PlaceMention`: an unprojected local `_i`, field `0`
 or `1` of an `(Int, bool)` local, or a valid field projection chain `_i.f1...fk`
 on a `TupleSpec` local. -/
@@ -1773,12 +2003,15 @@ def mentionPlaceOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
   | _ => false
 
 /-- Fragment statements, type-checked against the destination's type:
-scalar-family root assignments (`bool`, `Ordering`, `(it, bool)`, and `Int`)
-check `copyRv rv`; array root assignments check `arrayRvalueOk`; `TupleSpec`
-root and field assignments check `tupleRvalueOk` / `rvalueOk`; array element
-assignments check `projOk` and `rvalueOk`; `PlaceMention` checks
-`mentionPlaceOk`; and `StorageLive`, `StorageDead`, and root `Deinit` take a
-declared scalar-family local (`spec/lang/well-formed.md`:
+scalar-family root assignments (`bool`, `Ordering`, `(it, bool)`, and `Int`,
+including raw-pointer dereference reads `*_p`) check `copyRv rv`; thin raw
+pointer root assignments check `ptrRvalueOk` on `copyRv rv`; array root
+assignments check `arrayRvalueOk`; `TupleSpec` root and field assignments check
+`tupleRvalueOk` / `rvalueOk`; mutable raw pointer dereference writes `(*_p) = rv`
+check `rvalueOk`; array element assignments check `projOk` and `rvalueOk`;
+`PlaceMention` checks `mentionPlaceOk`; and `StorageLive`, `StorageDead`, and
+root `Deinit` take a declared scalar-family or thin raw pointer local
+(`spec/lang/well-formed.md`:
 > "Deinit { place } => {
 >      let ty = place.check_wf::<T>(func.locals, prog)?;
 >      ensure_wf(ty.layout::<T>().is_sized(), \"Statement::Deinit: unsized place\")?;
@@ -1804,7 +2037,7 @@ def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
         | some it => rvalueOkTuple layouts decls it (copyRv rv)
         | none =>
           match intTypeOf d.ty with
-          | some it => rvalueOk layouts decls it (copyRv rv)
+          | some it => rvalueOk layouts decls it (copyRv rv) || ptrDerefReadOk decls it (copyRv rv)
           | none =>
             match arrayTypeOf d.ty with
             | some (elemIt, count) => arrayRvalueOk layouts decls elemIt count rv
@@ -1812,7 +2045,11 @@ def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
               match tupleTypeOf layouts d.ty with
               | some (fields, size, align) =>
                 tupleRvalueOk layouts decls d.ty fields size align rv
-              | none => false
+              | none =>
+                match ptrPointeeOf d.ty with
+                | some (mutbl, pointeeIt) =>
+                  ptrRvalueOk layouts decls mutbl pointeeIt (copyRv rv)
+                | none => false
   | .assign ⟨i, .field idx fieldTy :: rest⟩ rv =>
     (decls[i]? >>= (tupleTypeOf layouts ·.ty)).isSome &&
     match placeIntType layouts decls ⟨i, .field idx fieldTy :: rest⟩ with
@@ -1825,6 +2062,11 @@ def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
       | some (fields, size, align), some dstTy =>
         tupleRvalueOk layouts decls dstTy fields size align rv
       | _, _ => false
+  | .assign ⟨i, [.deref]⟩ rv =>
+    decide (i < decls.length) &&
+    match decls[i]? >>= (ptrPointeeOf ·.ty) with
+    | some (.mut, pointeeIt) => rvalueOk layouts decls pointeeIt rv
+    | _ => false
   | .assign ⟨i, [proj]⟩ rv =>
     match decls[i]? >>= (arrayTypeOf ·.ty) with
     | some (elemIt, count) =>
@@ -1832,9 +2074,15 @@ def statementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
     | none => false
   | .placeMention p => mentionPlaceOk layouts decls p
   | .storageLive i | .storageDead i =>
-    decide (i < decls.length) && (decls[i]? >>= (scalarTypeOf ·.ty)).isSome
+    decide (i < decls.length) &&
+    match decls[i]? with
+    | some d => (scalarTypeOf d.ty).isSome || isPtrTy d.ty
+    | none => false
   | .deinit ⟨i, []⟩ =>
-    decide (i < decls.length) && (decls[i]? >>= (scalarTypeOf ·.ty)).isSome
+    decide (i < decls.length) &&
+    match decls[i]? with
+    | some d => (scalarTypeOf d.ty).isSome || isPtrTy d.ty
+    | none => false
   | _ => false
 
 /-- A fragment `switchInt` discriminant: an integer operand of its type, or a
@@ -1970,11 +2218,14 @@ def stmtMoved (mo : List Nat) (s : MirAst.Statement) : List Nat :=
   | .storageLive i | .storageDead i | .deinit ⟨i, []⟩ => mo.filter (· != i)
   | _ => mo
 
-/-- Whether statement `s` reads no moved-out local (including `idxLocal` on an
-indexed destination `_i[_k] = rv` and the destination root `_i` on a projected
-assignment `_i.proj = rv`). -/
+/-- Whether statement `s` reads no moved-out local (including `_p` on a raw
+pointer dereference read `*_p`, `idxLocal` on an indexed destination
+`_i[_k] = rv`, and the destination root `_i` on a projected assignment
+`_i.proj = rv` / `(*_p) = rv`). -/
 def stmtReadsOk (mo : List Nat) (s : MirAst.Statement) : Bool :=
   match s.kind with
+  | .assign ⟨_, []⟩ (.use (.copy ⟨p, .deref :: _⟩))
+  | .assign ⟨_, []⟩ (.use (.move ⟨p, .deref :: _⟩)) => !mo.contains p
   | .assign ⟨_, []⟩ rv => readsOk mo (rvOperands rv)
   | .assign p@⟨_, _ :: _⟩ rv =>
     readsOk mo (rvOperands rv) &&
@@ -2068,6 +2319,7 @@ def movesOk (body : MirAst.CapturedMir) : Bool :=
 /-- The locals a statement mentions. -/
 def stmtLocals (s : MirAst.Statement) : List Nat :=
   match s.kind with
+  | .assign p (.rawPtr _ q) => placeLocals p ++ placeLocals q
   | .assign p rv => placeLocals p ++ (rvOperands rv).flatMap opLocals
   | .placeMention p | .deinit p => placeLocals p
   | .storageLive i | .storageDead i => [i]
@@ -2086,12 +2338,104 @@ def mentionsOk (body : MirAst.CapturedMir) : Bool :=
     bb.statements.all (fun s => (stmtLocals s).all (fun j => !(alwaysStorageLiveLocals body).contains j)) &&
     (termLocals bb.terminator).all (fun j => !(alwaysStorageLiveLocals body).contains j)
 
+/-! ### Raw-pointer borrow discipline -/
+
+/-- All locals `k` whose address is taken via `.rawPtr _ ⟨k, _⟩` anywhere in `body`. -/
+def bodyAddrTakenLocals (body : MirAst.CapturedMir) : List Nat :=
+  body.basicBlocks.flatMap fun bb =>
+    bb.statements.filterMap fun s =>
+      match s.kind with
+      | .assign _ (.rawPtr _ q) => some q.local_
+      | _ => none
+
+/-- All locals `k` whose mutable address is taken via `.rawPtr .mut ⟨k, _⟩` in `body`. -/
+def bodyMutAddrTakenLocals (body : MirAst.CapturedMir) : List Nat :=
+  body.basicBlocks.flatMap fun bb =>
+    bb.statements.filterMap fun s =>
+      match s.kind with
+      | .assign _ (.rawPtr .mut q) => some q.local_
+      | _ => none
+
+/-- Whether `s` neither directly writes/deinits/changes storage of any local in
+`addrLocals` nor moves out any local in `addrLocals`. -/
+def stmtPreservesAddrTaken (addrLocals : List Nat) (s : MirAst.Statement) : Bool :=
+  let moveFree (ops : List MirAst.Operand) : Bool :=
+    ops.all fun op =>
+      match opMoved op with
+      | some j => !addrLocals.contains j
+      | none => true
+  match s.kind with
+  | .assign dst rv => !addrLocals.contains dst.local_ && moveFree (rvOperands rv)
+  | .deinit p => !addrLocals.contains p.local_
+  | .storageLive i | .storageDead i => !addrLocals.contains i
+  | _ => true
+
+/-- Whether `t` moves out no local in `addrLocals`. -/
+def termPreservesAddrTaken (addrLocals : List Nat) (t : MirAst.Terminator) : Bool :=
+  match t.kind with
+  | .switchInt discr _ =>
+    match opMoved discr with
+    | some j => !addrLocals.contains j
+    | none => true
+  | _ => true
+
+/-- Pairwise projection disjointness of `&raw` borrows of locals in `mutLocals`
+within an acyclic entry block. -/
+def rawPtrListDisjoint (mutLocals : List Nat) : List MirAst.Statement → Bool
+  | [] => true
+  | s :: rest =>
+    (match s.kind with
+      | .assign _ (.rawPtr _ ⟨k, projs1⟩) =>
+        if mutLocals.contains k then
+          rest.all fun s' =>
+            match s'.kind with
+            | .assign _ (.rawPtr _ ⟨k', projs2⟩) =>
+              decide (k ≠ k') ||
+              (!MirSemantics.projectionsOverlap projs1 projs2 &&
+               !MirSemantics.projectionsOverlap projs2 projs1)
+            | _ => true
+        else true
+      | _ => true) &&
+    rawPtrListDisjoint mutLocals rest
+
+/-- Whether no statement in `stmts` takes a `&raw` borrow of a local in `mutLocals`. -/
+def noMutAddrOfInStmts (mutLocals : List Nat) (stmts : List MirAst.Statement) : Bool :=
+  stmts.all fun s =>
+    match s.kind with
+    | .assign _ (.rawPtr _ ⟨k, _⟩) => !mutLocals.contains k
+    | _ => true
+
+/-- Static aliasing discipline aligning Anneal's per-borrow Tree Borrows tags
+with MiniRust's flat byte-level `BasicMemory` (where `retag_ptr` is the
+identity):
+1. Every address-taken local `k` is a parameter (`1 ≤ k ≤ body.argCount`) that
+   is never directly assigned, deinited, storage-cycled, or moved out.
+2. Whenever a local `k` has at least one mutable raw borrow (`&raw mut`), `bb0`
+   has no incoming CFG edges, all `&raw` borrows of `k` occur in `bb0`, and
+   distinct `&raw` borrows of `k` in `bb0` target pairwise non-overlapping
+   projections (`projectionsOverlap = false`), so writes through any `*mut`
+   pointer never disable another live borrow tag in Anneal. -/
+def ptrAliasingOk (body : MirAst.CapturedMir) : Bool :=
+  let addrLocals := bodyAddrTakenLocals body
+  let mutLocals := bodyMutAddrTakenLocals body
+  addrLocals.all (fun k => decide (1 ≤ k ∧ k ≤ body.argCount)) &&
+  body.basicBlocks.all (fun bb =>
+    bb.statements.all (stmtPreservesAddrTaken addrLocals) &&
+    termPreservesAddrTaken addrLocals bb.terminator) &&
+  (mutLocals.isEmpty ||
+    (body.basicBlocks.all (fun bb => !(termTargets bb.terminator).contains 0) &&
+     (match body.basicBlocks with
+      | [] => true
+      | bb0 :: restBbs =>
+        rawPtrListDisjoint mutLocals bb0.statements &&
+        restBbs.all (fun bb => noMutAddrOfInStmts mutLocals bb.statements))))
+
 /-- Well-formedness of a local declaration in the fragment: a scalar-family
-type (`scalarTypeOf`), a homogeneous 1D integer array whose byte size fits in
-signed 64-bit `isize` (`< 2 ^ 63`), or a well-formed tuple / single-variant
-struct (`TupleSpec.wf`). -/
+type (`scalarTypeOf`), a thin raw pointer to an integer (`isPtrTy`), a
+homogeneous 1D integer array whose byte size fits in signed 64-bit `isize`
+(`< 2 ^ 63`), or a well-formed tuple / single-variant struct (`TupleSpec.wf`). -/
 def localDeclOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩) (d : MirAst.LocalDecl) : Bool :=
-  (scalarTypeOf d.ty).isSome ||
+  (scalarTypeOf d.ty).isSome || isPtrTy d.ty ||
   match arrayTypeOf d.ty with
   | some (elemIt, count) => decide (count * elemIt.size.bytes < 2 ^ 63)
   | none =>
@@ -2126,13 +2470,15 @@ def inFragment (body : MirAst.CapturedMir) : Bool :=
   decide (body.localDecls.length < 2 ^ 31) &&
   (body.localDecls[0]? >>= (scalarTypeOf ·.ty)).isSome &&
   body.localDecls.all (localDeclOk body.layouts) &&
-  (body.localDecls.drop (body.argCount + 1)).all (fun d => (scalarTypeOf d.ty).isSome) &&
+  ((body.localDecls.drop 1).take body.argCount).all (fun d => !isPtrTy d.ty) &&
+  (body.localDecls.drop (body.argCount + 1)).all
+    (fun d => (scalarTypeOf d.ty).isSome || isPtrTy d.ty) &&
   decide (body.basicBlocks ≠ []) &&
   body.basicBlocks.all (fun bb =>
     !bb.isCleanup &&
     bb.statements.all (statementOk body.localDecls · body.layouts) &&
     terminatorOk body.layouts body.localDecls body.basicBlocks.length bb.terminator) &&
-  storageDeadOk body && movesOk body && mentionsOk body &&
+  storageDeadOk body && movesOk body && mentionsOk body && ptrAliasingOk body &&
   (translateFn body).isSome
 
 end MiniRustSpec.Correspondence
