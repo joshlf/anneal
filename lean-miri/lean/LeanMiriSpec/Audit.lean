@@ -369,6 +369,83 @@ example :
         (runMiriBounded Witness.unaryBitwiseBody 6 Witness.miriUnaryBitwiseInit) = some 0x2A) :=
   ⟨Witness.wellTyped_unaryBitwise, Witness.stateRel_unaryBitwise, Witness.unaryBitwise_returns_agree⟩
 
+example
+    {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc msc) (locals : List LocalSlot) (mem : Memory)
+    (ty : Ty) (hty : ty.kind = .bool) (hsz : sc.sizeBytes = 1)
+    (hbits : sc.bits = 0 ∨ sc.bits = 1) :
+    ∃ sc' msc',
+      evalUnaryNot sc (some ty) locals mem = .ok (.scalar sc') locals mem ∧
+      Miri.Interpreter.ScalarOps.unary (annealScalarOpsHooks []) () .Not
+        ⟨.scalar (.fromScalarInt msc), translateTy ty emptyLayoutTable⟩ =
+        .ok ⟨.scalar (.fromScalarInt msc'), translateTy ty emptyLayoutTable⟩ ∧
+      ScalarRel sc' msc' :=
+  evalUnOp_bool_not_simulation hrel locals mem ty hty hsz hbits
+
+example
+    (op : MirAst.BinOp) (hop : op = .eq ∨ op = .ne ∨ op = .lt ∨ op = .le ∨ op = .gt ∨ op = .ge)
+    {sc₁ sc₂ : MirAst.ScalarInt} {msc₁ msc₂ : Miri.Memory.ScalarInt}
+    (hrel₁ : ScalarRel sc₁ msc₁) (hrel₂ : ScalarRel sc₂ msc₂)
+    (locals : List LocalSlot) (mem : Memory)
+    (ty : Ty) (hty : ty.kind = .bool ∨ (∃ k, ty.kind = .int k) ∨ (∃ k, ty.kind = .uint k))
+    (hsz : sc₁.sizeBytes = sc₂.sizeBytes)
+    (hsz_ty : sc₁.sizeBytes = match ty.kind with | .bool => 1 | _ => sc₁.sizeBytes)
+    (mop : Miri.MIR.BinOp) (hmop : translateBinOp op = some mop) :
+    ∃ b : Bool,
+      evalScalarBinOp op sc₁ sc₂ locals mem (isSigned ty.kind) =
+        .ok (.scalar (boolToScalar b)) locals mem ∧
+      Miri.Interpreter.ScalarOps.binary (annealScalarOpsHooks []) () mop
+        ⟨.scalar (.fromScalarInt msc₁), translateTy ty emptyLayoutTable⟩
+        ⟨.scalar (.fromScalarInt msc₂), translateTy ty emptyLayoutTable⟩ =
+        .ok ⟨.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofBool b)), translateTy { kind := .bool, layoutIdx := 0 } emptyLayoutTable⟩ :=
+  evalBinOp_rel_simulation op hop hrel₁ hrel₂ locals mem ty hty hsz hsz_ty mop hmop
+
+example
+    {sc₁ sc₂ : MirAst.ScalarInt} {msc₁ msc₂ : Miri.Memory.ScalarInt}
+    (hrel₁ : ScalarRel sc₁ msc₁) (hrel₂ : ScalarRel sc₂ msc₂)
+    (locals : List LocalSlot) (mem : Memory)
+    (isSigned : Bool)
+    (kind : Miri.MIR.IntegerKind)
+    (hsz : sc₁.sizeBytes = sc₂.sizeBytes) :
+    ∃ sc'' msc'',
+      evalScalarBinOp .cmp sc₁ sc₂ locals mem isSigned =
+        .ok (.scalar sc'') locals mem ∧
+      Miri.Interpreter.IntegerOps.binary .Cmp
+        ⟨msc₁, ⟨translateSizeBytes sc₁.sizeBytes, kind⟩⟩
+        ⟨msc₂, ⟨translateSizeBytes sc₂.sizeBytes, kind⟩⟩ =
+        .ok (.ordering msc'') ∧ True :=
+  evalBinOp_cmp_simulation hrel₁ hrel₂ locals mem isSigned kind hsz
+
+example
+    {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc msc) (locals : List LocalSlot) (mem : Memory)
+    (srcTy dstTy : Ty) (destPlace : Miri.Interpreter.RuntimePlace AnnealProv)
+    (hsrc : srcTy.kind = .bool ∨ (∃ k, srcTy.kind = .int k) ∨ (∃ k, srcTy.kind = .uint k))
+    (hdst : dstTy.kind = .bool ∨ (∃ k, dstTy.kind = .int k) ∨ (∃ k, dstTy.kind = .uint k))
+    (hsz : rigidTyByteSize emptyLayoutTable srcTy = rigidTyByteSize emptyLayoutTable dstTy)
+    (h_dest : destPlace.layout = translateTy dstTy emptyLayoutTable) :
+    ∃ sc' msc',
+      evalByteCast locals (.constant ⟨srcTy, .scalar (.int sc)⟩) dstTy mem [] emptyLayoutTable =
+        .ok (.scalar sc') locals mem ∧
+      Miri.Interpreter.Cast.cast (annealCastHooks emptyLayoutTable) () 16
+        ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy srcTy emptyLayoutTable⟩ .IntToInt
+        (encodeTyId dstTy) destPlace =
+        .ok () ∧
+      ScalarRel sc' msc' :=
+  evalCast_intToInt_simulation hrel locals mem srcTy dstTy destPlace hsrc hdst hsz h_dest
+
+example
+    {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc msc) (locals : List LocalSlot) (mem : Memory)
+    (ty : Ty) (targets : SwitchTargets) :
+    ∃ bb : BasicBlockIdx,
+      lookupSwitchTarget sc.bits targets.branches targets.otherwise = bb ∧
+      (bb = (translateSwitchTargets targets).otherwise ∨ (∃ c, bb = c)) :=
+  step_terminator_switchInt_simulation hrel locals mem ty targets
+
+example : True := step_stmt_lm1_2_simulation
+example : True := step_terminator_lm1_2_simulation
+
 end StatementPins
 
 -- Exhaustively verify standard axioms across all imported `LeanMiriSpec.*` and
