@@ -1,0 +1,1 @@
+scratch_move.lean:1:0: error: object file '/usr/local/google/Projects/anneal-workspace/anneal-wt-lm-1-4/examples/.lake/build/lib/lean/LeanMiriSpec.olean' of module LeanMiriSpec does not exist

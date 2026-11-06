@@ -790,7 +790,42 @@ theorem evalOperand_move_simulation
     
     cases h_slot_src_eq : slot_src with
     | init v => exact sorryAx _ false
-    | uninit => exact sorryAx _ false
+    | uninit =>
+      apply StepRel.ub_iff.mpr
+      constructor
+      · unfold evalStmt
+        dsimp only
+        rw [hslot_src, h_slot_src_eq]
+        rfl
+      · have h_getElem? := Array.getElem?_eq_getElem hlt_mf_src
+        have heq_mls : topFrame.locals[srcPlace.local_]'hlt_mf_src = mls_src := by
+          have h_tmp := hmls_src
+          rw [h_getElem?] at h_tmp
+          exact Option.some.inj h_tmp
+        have hrel_src := hfr.locals_rel _ _ _ _ hsrc hslot_src hmls_src
+        cases hrel_src with
+        | immediate slot imm lay h_lay h_imm =>
+          cases h_imm with
+          | inl h =>
+            rcases h with ⟨h1, h2⟩
+            have h_val : mls_src.value = .live (.immediate .uninit) := by rw [h2]; rfl
+            simp only [Miri.Interpreter.Step.step, Miri.Interpreter.Step.evalStatement, translateStmt, translateStmtKind, translatePlace, translateRvalue]
+            unfold annealStepHooks annealRvalueHooks annealEvalPlace annealEvalOperand annealResolveAndCacheLocalLayout Miri.Interpreter.runRvalue
+            dsimp only [stack_currentFrame?_singleton m.stack topFrame hframes, Option.isNone, Bool.false_eq_true, ↓reduceIte, bind, Except.bind, EStateM.bind, pure, Except.pure, EStateM.pure, get, getThe, MonadStateOf.get, EStateM.get, StateT.get, Miri.Interpreter.Frame.getOrCacheLocalLayout]
+            have h_proj : ((List.map translateProjectionElem []).toArray.isEmpty) = true := rfl
+            simp only [h_proj, Bool.not_true, Bool.false_eq_true, ↓reduceIte, ↓reduceDIte]
+            unfold annealReadImmediate
+            simp only [h_val, heq_mls, bind, Except.bind, EStateM.bind, pure, Except.pure, EStateM.pure, ↓reduceIte, ↓reduceDIte]
+            rfl
+          | inr h =>
+            rcases h with ⟨v, h1, h2⟩
+            rw [h1] at h_slot_src_eq
+            contradiction
+        | dead =>
+          contradiction
+        | indirect =>
+          contradiction
+
     | dead => exact sorryAx _ false
 
 theorem LocalRel_cacheLayout {mach decl layouts slot value} {lay : Miri.Interpreter.LocalLayout} :
@@ -850,7 +885,8 @@ theorem FrameRel_cacheLayout {body mach af mf} {idx : Nat} {lay : Miri.Interpret
 theorem StateRel_allocateStack {body s m layout allocated m'}
   (hstate : StateRel body s m)
   (h_alloc : (annealPlaceHooks body.localDecls body.layouts).allocateStack () layout m = EStateM.Result.ok allocated m') :
-  StateRel body s m' ∧ m'.stack.frames = m.stack.frames ∧ True := by
+  StateRel body s m' ∧ m'.stack.frames = m.stack.frames ∧ 
+  MemoryAllocDisjoint body.localDecls body.layouts s.frame.locals m'.stack.frames.back? m'.machine := by
   exact sorryAx _ false
 
 theorem StateRel_setFrame {body s m f m'}
