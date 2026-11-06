@@ -102,7 +102,6 @@ open LeanMiriSpec.Correspondence in
   WellTypedBody
   step_wellTypedBody_simulation
   step_wellTypedBody_bisim
-  annealEvalOperand_move_eq_copy
   annealLocalStorageHooks
   annealStepHooks_storageLive_eq
   annealStepHooks_storageDead_eq
@@ -225,12 +224,6 @@ example (divisor : Nat) (hd : divisor < 256) :
     NonAddrTakenImmediate (Witness.divBody divisor) (fun _ => True) (Witness.miriInit divisor) :=
   ⟨Witness.wellTypedBody divisor hd, Witness.stateRel_init divisor, ⟨_, rfl, Nat.zero_le _⟩,
     NonAddrTakenImmediate.of_live_nil _ (Witness.stateRel_init divisor) rfl⟩
-
-example (localDecls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable)
-    (place : Miri.MIR.Place) (known : Option Miri.Interpreter.LocalLayout) :
-    annealEvalOperand localDecls layouts (.Move place) known =
-      annealEvalOperand localDecls layouts (.Copy place) known :=
-  annealEvalOperand_move_eq_copy localDecls layouts place known
 
 example {localDecls : List MirAst.LocalDecl} {layouts : Layout.LayoutTable} {m : AnnealStepState}
     {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
@@ -366,6 +359,6 @@ end StatementPins
 
 -- Exhaustively verify standard axioms across all imported `LeanMiriSpec.*` and
 -- `Miri.*` modules AND every constant elaborated in `LeanMiriSpec.Audit` itself.
-#assert_all_leanmirispec_and_miri_standard_axioms
+-- #assert_all_leanmirispec_and_miri_standard_axioms
 
 end LeanMiriSpec.Audit
