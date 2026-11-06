@@ -45,3 +45,12 @@ roots = ["MirVerification"]
 [[lean_lib]]
 name = "MiniRustSpec"
 srcDir = "../minirust/lean"
+
+[[lean_lib]]
+name = "Miri"
+srcDir = "../lean-miri/vendor"
+roots = ["Miri"]
+
+[[lean_lib]]
+name = "LeanMiriSpec"
+srcDir = "../lean-miri/lean"
