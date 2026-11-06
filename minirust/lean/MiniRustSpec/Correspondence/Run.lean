@@ -1631,6 +1631,31 @@ theorem multi_steps_outcome_from_start {entry : CapturedMir} {callees : List Cap
       by rw [steps_add, hmStart, ok_bind, hksteps], hretRel, hret⟩)
   · exact .inr (.inr ⟨msg, by rw [steps_add, hmStart, ok_bind, herr], hfault⟩)
 
+/-- **Multi-function total arbitrary-`n` outcome trichotomy from `fEntry.start`
+(including startup steps `n ≤ initLen entry` inside `fEntry.start`).** -/
+theorem multi_steps_outcome_any_from_start {entry : CapturedMir} {callees : List CapturedMir}
+    {prog : Gen.Program} {fEntry : Gen.Function}
+    (hfrag : progInFragment entry callees = true)
+    (hprog : translateProg entry callees = some prog)
+    (rootCtx : Ctx) (n : Nat) (s : MachineState) (mInit : Mach)
+    (hstart : MultiStartRel entry callees prog fEntry rootCtx s mInit) :
+    (∃ d s' m0 m' tr, Interp.steps n mInit = .ok m0 ∧
+      Interp.steps (n + d) mInit = .ok m' ∧
+      MultiStateRel entry callees prog rootCtx s' m' ∧
+      Reaches (mirTree entry s) tr (mirTree entry s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ n ∧ Interp.steps k mInit = .ok mRet ∧
+      ReturnRel entry rootCtx s' v mRet ∧
+      ReachesRet (mirTree entry s) tr (.normal (v, mem))) ∨
+    (∃ msg, Interp.steps n mInit = .error (.ub msg) ∧
+      ∃ tr u, Reaches (mirTree entry s) tr u ∧ FaultNow u) := by
+  obtain ⟨mStart, hmStart, hrel0⟩ := multi_step_start hfrag hstart
+  by_cases hn : n ≤ initLen entry
+  · obtain ⟨m0, hsteps0⟩ := steps_ok_mono hn hmStart
+    refine .inl ⟨initLen entry - n, s, m0, mStart, [], hsteps0, ?_, hrel0, .refl _⟩
+    rwa [show n + (initLen entry - n) = initLen entry by omega]
+  · obtain ⟨n', rfl⟩ : ∃ n', n = initLen entry + n' := ⟨n - initLen entry, by omega⟩
+    exact multi_steps_outcome_from_start hfrag hprog rootCtx n' s mInit hstart
+
 /-- **Multi-function forward progress under `MirNoUBTree`.** -/
 theorem multi_mirNoUB_progress {entry : CapturedMir} {callees : List CapturedMir}
     {prog : Gen.Program} (hfrag : progInFragment entry callees = true)
@@ -1667,6 +1692,28 @@ theorem multi_mirNoUB_progress_from_start {entry : CapturedMir} {callees : List 
       ReturnRel entry rootCtx s' v mRet ∧
       ReachesRet (mirTree entry s) tr (.normal (v, mem))) := by
   rcases multi_steps_outcome_from_start hfrag hprog rootCtx n s mInit hstart with
+    hrun | hret | ⟨_, _, tr, u, hr, hfault⟩
+  · exact .inl hrun
+  · exact .inr hret
+  · exact False.elim (hsafe tr u hr hfault)
+
+/-- **Multi-function arbitrary-`n` forward progress from `fEntry.start` under
+`MirNoUBTree` (including startup steps `n ≤ initLen entry`).** -/
+theorem multi_mirNoUB_progress_any_from_start {entry : CapturedMir} {callees : List CapturedMir}
+    {prog : Gen.Program} {fEntry : Gen.Function}
+    (hfrag : progInFragment entry callees = true)
+    (hprog : translateProg entry callees = some prog)
+    (rootCtx : Ctx) (s : MachineState) (mInit : Mach)
+    (hstart : MultiStartRel entry callees prog fEntry rootCtx s mInit)
+    (hsafe : MirNoUBTree (mirTree entry s)) (n : Nat) :
+    (∃ d s' m0 m' tr, Interp.steps n mInit = .ok m0 ∧
+      Interp.steps (n + d) mInit = .ok m' ∧
+      MultiStateRel entry callees prog rootCtx s' m' ∧
+      Reaches (mirTree entry s) tr (mirTree entry s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ n ∧ Interp.steps k mInit = .ok mRet ∧
+      ReturnRel entry rootCtx s' v mRet ∧
+      ReachesRet (mirTree entry s) tr (.normal (v, mem))) := by
+  rcases multi_steps_outcome_any_from_start hfrag hprog rootCtx n s mInit hstart with
     hrun | hret | ⟨_, _, tr, u, hr, hfault⟩
   · exact .inl hrun
   · exact .inr hret
@@ -1958,5 +2005,68 @@ theorem mirCallWithCallees_diverges_rel {entry : CapturedMir} {callees : List Ca
     (initMachineStateWithCallees_startRel hfrag hfEntry rootCtx hctx args hargs mInit henv
       hthreads hactive hallocs)
     hsafe hdiv n
+
+/-- **Multi-function call-tree arbitrary-`n` forward progress (covering all
+`n : Nat`, including startup steps `n ≤ initLen entry` in `fEntry.start`).** -/
+theorem mirCallWithCallees_progress_any {entry : CapturedMir} {callees : List CapturedMir}
+    {prog : Gen.Program} {fEntry : Gen.Function}
+    (hfrag : progInFragment entry callees = true)
+    (hprog : translateProg entry callees = some prog)
+    (hfEntry : translateFnInProg (fnNameMap entry callees) entry = some fEntry)
+    (rootCtx : Ctx) (hctx : CtxOk entry rootCtx)
+    (args : List Value) (hargs : argsOk entry args = true)
+    (mInit : Mach) (henv : ProgEnvOk prog (fnNameMap entry callees) mInit)
+    (hthreads : mInit.threads =
+      [thread1 rootCtx [rootCtx.caller,
+        { calleeFrame fEntry rootCtx (entry.argCount + 1) 0 0 with next_block := fEntry.start }]])
+    (hactive : mInit.active_thread = 0)
+    (hallocs : mInit.mem.memory.allocations =
+      rootCtx.base ++ localAllocs rootCtx (entry.localDecls.take (entry.argCount + 1))
+        (initMachineStateWithCallees entry args callees).frame.locals)
+    (hsafe : MirNoUBTree (mirCallTreeWithCallees entry args callees)) (n : Nat) :
+    (∃ d s' m0 m' tr, Interp.steps n mInit = .ok m0 ∧
+      Interp.steps (n + d) mInit = .ok m' ∧
+      MultiStateRel entry callees prog rootCtx s' m' ∧
+      Reaches (mirCallTreeWithCallees entry args callees) tr (mirTree entry s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ n ∧ Interp.steps k mInit = .ok mRet ∧
+      ReturnRel entry rootCtx s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees entry args callees) tr (.normal (v, mem))) :=
+  multi_mirNoUB_progress_any_from_start hfrag hprog rootCtx
+    (initMachineStateWithCallees entry args callees) mInit
+    (initMachineStateWithCallees_startRel hfrag hfEntry rootCtx hctx args hargs mInit henv
+      hthreads hactive hallocs)
+    hsafe n
+
+/-- **Multi-function call-tree total arbitrary-`n` outcome trichotomy (covering
+all `n : Nat`, including startup steps `n ≤ initLen entry`).** -/
+theorem mirCallWithCallees_outcome_any {entry : CapturedMir} {callees : List CapturedMir}
+    {prog : Gen.Program} {fEntry : Gen.Function}
+    (hfrag : progInFragment entry callees = true)
+    (hprog : translateProg entry callees = some prog)
+    (hfEntry : translateFnInProg (fnNameMap entry callees) entry = some fEntry)
+    (rootCtx : Ctx) (hctx : CtxOk entry rootCtx)
+    (args : List Value) (hargs : argsOk entry args = true)
+    (mInit : Mach) (henv : ProgEnvOk prog (fnNameMap entry callees) mInit)
+    (hthreads : mInit.threads =
+      [thread1 rootCtx [rootCtx.caller,
+        { calleeFrame fEntry rootCtx (entry.argCount + 1) 0 0 with next_block := fEntry.start }]])
+    (hactive : mInit.active_thread = 0)
+    (hallocs : mInit.mem.memory.allocations =
+      rootCtx.base ++ localAllocs rootCtx (entry.localDecls.take (entry.argCount + 1))
+        (initMachineStateWithCallees entry args callees).frame.locals)
+    (n : Nat) :
+    (∃ d s' m0 m' tr, Interp.steps n mInit = .ok m0 ∧
+      Interp.steps (n + d) mInit = .ok m' ∧
+      MultiStateRel entry callees prog rootCtx s' m' ∧
+      Reaches (mirCallTreeWithCallees entry args callees) tr (mirTree entry s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ n ∧ Interp.steps k mInit = .ok mRet ∧
+      ReturnRel entry rootCtx s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees entry args callees) tr (.normal (v, mem))) ∨
+    (∃ msg, Interp.steps n mInit = .error (.ub msg) ∧
+      ∃ tr u, Reaches (mirCallTreeWithCallees entry args callees) tr u ∧ FaultNow u) :=
+  multi_steps_outcome_any_from_start hfrag hprog rootCtx n
+    (initMachineStateWithCallees entry args callees) mInit
+    (initMachineStateWithCallees_startRel hfrag hfEntry rootCtx hctx args hargs mInit henv
+      hthreads hactive hallocs)
 
 end MiniRustSpec.Correspondence

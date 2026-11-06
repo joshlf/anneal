@@ -334,7 +334,7 @@ fn anchors_match_generated_items_and_cover_interp() {
             "Anchor `{file}`::{name}:{line} ({sha}) not found in generated items for `{file}`"
         );
     }
-    assert_eq!(anchor_count, 61, "expected 58 anchors, found {anchor_count}");
+    assert_eq!(anchor_count, 61, "expected 61 anchors, found {anchor_count}");
 
     let interp_path = minirust_dir().join("lean/MiniRustSpec/Interp.lean");
     let interp_text = std::fs::read_to_string(&interp_path).unwrap();
@@ -381,10 +381,10 @@ fn anchors_match_generated_items_and_cover_interp() {
     let sim_sec = &audit_text[audit_text.find("#check_theorem_deps \"[SIMULATION-AUDIT]\"").unwrap()..];
     let sim_sec = &sim_sec[..sim_sec.find("\n\n").unwrap()];
     let sim_count = sim_sec.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
-    assert!(sim_count >= 209, "expected at least 175 [SIMULATION-AUDIT] theorems, found {sim_count}");
+    assert!(sim_count >= 213, "expected at least 213 [SIMULATION-AUDIT] theorems, found {sim_count}");
 
     let wit_sec = &audit_text[audit_text.find("#check_theorem_deps \"[WITNESS-AUDIT]\"").unwrap()..];
     let wit_sec = &wit_sec[..wit_sec.find("\n\n").unwrap()];
     let wit_count = wit_sec.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
-    assert!(wit_count >= 458, "expected at least 377 [WITNESS-AUDIT] theorems, found {wit_count}");
+    assert!(wit_count >= 479, "expected at least 479 [WITNESS-AUDIT] theorems, found {wit_count}");
 }

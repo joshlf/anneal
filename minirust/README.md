@@ -142,12 +142,20 @@ and `IntType::with_overflow`, returning `(Value::Int(res_wrapped), Value::Bool(r
 `BinOp::Rel` with `RelOp::{Lt, Gt, Le, Ge, Eq, Ne, Cmp}` (all 7 `RelOp`
 variants, through `Machine::eval_rel_op`) on integers and Booleans (pointer
 comparison is `unsupported`),
-`Terminator::{Goto, Switch, Return, Unreachable}` including
-frame teardown and both stack-pop actions, the representation relation
+`Constant::{Int, Bool, FnPointer, GlobalPointer, VTablePointer, PointerWithoutProvenance}`
+and `Machine::fn_from_ptr`,
+`Terminator::{Goto, Switch, Call, Return, Unreachable}` (including
+`check_abi_compatibility` across all 7 `Type` variants,
+`Machine::prepare_for_inplace_passing`, `Machine::eval_argument` for `ByValue`
+and `InPlace`, `Machine::create_frame`, `Machine::eval_call`,
+`Machine::mutate_cur_stack`, frame teardown, and both `StackPopAction`s
+`BottomOfStack` and `BackToCaller`), the representation relation
 (`Type::{decode, encode}`) for `Int`, `Bool`, sized `Tuple`, `Union`, `Enum`
 (through `decode_discriminant` and `encode_discriminant`), `Slice`, and
-`TraitObject`, `check_value` for those types, `Type::layout` (also for unsized
-tuples, slices, and trait objects) and `LayoutStrategy::compute_size_and_align`
+`TraitObject`, `check_value` for those types, `Type::layout` across all 9 `Type`
+variants (`Int`, `Bool`, `Ptr`, `Tuple`, `Array`, `Union`, `Enum`, `Slice`, and
+`TraitObject`, with `PtrType::{safe_pointee, meta_kind}` and
+`LayoutStrategy::meta_kind`) and `LayoutStrategy::compute_size_and_align`
 / `TupleHeadLayout::full_size_and_align`, `BasicMemory`'s `check_ptr`,
 `dereferenceable`, `signed_dereferenceable`, `load`, `store`, `allocate`, and
 `deallocate`, and `ConcurrentMemory`'s access log and data-race check.
@@ -240,38 +248,88 @@ restricted to the fragment checked by `inFragment`:
 * terminators are `Goto`, `SwitchInt` on any integer or `bool` fragment operand
   (`copy _j`, `move _j`, `copy (_j.0)`, `move (_j.0)`, `copy (_j.1)`,
   `move (_j.1)`, or constant) with distinct in-range values (`minimize` switches
-  on `transmute::<u8>(b)` for a `bool`), `Return`, and `Unreachable`; all
-  targets are blocks of the body; no cleanup blocks.
+  on `transmute::<u8>(b)` for a `bool`), `Return`, `Unreachable`, and — in the
+  multi-function fragment `progInFragment entry callees` translated by
+  `translateProg` (`translateFnInProg` + `mkStartFn`) — direct monomorphic
+  `TerminatorKind.call` with `some targetBb` and non-cleanup `UnwindAction`
+  (`Continue`, `Unreachable`, or `Terminate`): `translateCallArg` lowers
+  `Operand::Move` to `ArgumentExpr::InPlace` (writing `Uninit` bytes in MiniRust
+  too, restricted by `callArgOk` to root locals `move _j`) and `Copy`/`Constant`
+  to `ArgumentExpr::ByValue`; `livenessOk` and `tupleInitOk` verify by greatest
+  fixed point that `destination` is live (and an initialized `(Int, bool)` tuple
+  when writing `_dst.0` or `_dst.1`) and disjoint from `argOps`; `termReadsOk`
+  checks `readsOk (dst :: mo) argOps` (allowing `_dst ∈ mo` on root overwrites
+  `⟨dst, []⟩` while requiring `!mo.contains dst` on projected writes
+  `⟨dst, _ :: _⟩`), and `termMoved` clears root `dst` from `mo`; and
+  `maxStackLocals entry callees < 2^31` bounds worst-case stack allocations
+  across acyclic call graphs; all targets are blocks of the body; no cleanup
+  blocks.
 
 ### States
 
-`Correspondence/Relation.lean` defines `StateRel body f ctx s m` (for execution
-within MIR blocks) and `StartRel body f ctx s mInit` (for entry at `minimize`'s
-synthesized `f.start` block without requiring a phantom `bb0` machine): the
-MiniRust machine has one enabled thread whose stack is `[caller, callee]`; the
-callee runs `f` at the corresponding program point; a MIR local `_i` is in the
-callee's locals map exactly when Anneal's slot is live (or `_i` is a
-temporary that the init block allocated), pointing to its own `Stack`
-allocation whose bytes are the encoding of a slot (`Uninit` bytes for an
-uninitialized slot, little-endian bytes for an initialized scalar, only `0` or
-`1` for an initialized `bool`, and only the tags `255`, `0`, or `1` for an
-initialized `Ordering`, so that the byte decodes at the local's MiniRust type;
-`LocalsOk`); MiniRust's bytes encode Anneal's slots except for locals that
-Anneal's `move` de-initialized and that `movesOk` keeps unread (`StaleOk`); the
-caller's return place is a live, large-enough, aligned allocation and the
-caller's allocations lie below `2^32`, clear of `BM.pickAddr`'s candidates
-(`CtxOk`); and Anneal's memory has no borrows, protectors, call stack, or
-caller-owned referents. `ctx` fixes everything the callee does not determine:
-caller frame, unwind payloads, the allocations below the callee's locals, the
-addresses of the return place and the arguments (arbitrary below `2^32`,
-subject to alignment), and the caller's continuation.
+`Correspondence/Relation.lean` defines single-frame `StateRel body f ctx s m`
+and `StartRel body f ctx s mInit`, together with multi-frame
+`CallStackRel callees prog fnMap rootCtx stack frames m`,
+`MultiStateRel entry callees prog rootCtx s m`, and
+`MultiStartRel entry callees prog fEntry rootCtx s mInit`: for a single body the
+MiniRust machine has one enabled thread whose stack is `[caller, callee]`, while
+for a multi-function call stack of depth `D` the MiniRust stack is
+`rootCtx.caller :: suspendedCaller_1 :: .. :: suspendedCaller_D :: activeCallee`
+aligned frame-for-frame with Anneal's `s.memory.callStack` (`SavedCallerFrame`s)
+and `s.memory.activeCallee`; the active frame runs `f` at the corresponding
+program point; a MIR local `_i` is in a frame's locals map exactly when Anneal's
+slot is live (or `_i` is a temporary that the init block allocated), pointing to
+its own `Stack` allocation whose bytes are the encoding of a slot (`Uninit`
+bytes for an uninitialized slot, little-endian bytes for an initialized scalar,
+only `0` or `1` for an initialized `bool`, and only the tags `255`, `0`, or `1`
+for an initialized `Ordering`, so that the byte decodes at the local's MiniRust
+type; `LocalsOkA` parameterized by `AddrClass`: `< 2^32` for `rootCtx` arguments
+and return place, or `allocCandidate k` at multiples of `2^32` for locals
+allocated by `BM.allocate` in `initBlock`, `StorageLive`, and `create_frame`);
+MiniRust's bytes encode Anneal's slots except for locals that Anneal's statement
+or switch `move` de-initialized and that `movesOk` keeps unread (`StaleOk`);
+each suspended caller's return destination (`CallerDestRel` for root `_dst`,
+`_dst.0`, or `_dst.1`) has already been `deinit`ed by MiniRust's
+`prepare_for_inplace_passing` and awaits `StackPopAction::BackToCaller` on
+`Terminator::Return`; `ProgEnvOk` maps each `(fnName idx)` in `m.fn_ptrs` and
+`m.prog.functions` to its translated `Gen.Function`; and Anneal's memory has no
+borrows, protectors, or caller-owned referents. `rootCtx` fixes everything above
+the root entry frame: external caller frame, unwind payloads, base allocations
+below `2^32` (`CtxOk`), and external continuation.
 
 ### Theorems
 
 All proofs are complete; `Audit.lean` fails the build unless each of the
 following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
 
-* `step_correspondence` (`Simulation.lean`): for a fragment body, its
+* `multi_step_correspondence`, `multi_step_start`,
+  `initMachineStateWithCallees_startRel` (`Simulation.lean`): for any
+  multi-function program in `progInFragment entry callees`, one step of Anneal's
+  `stepMirFn entry s` from `MultiStateRel` matches `1 ≤ k` MiniRust steps
+  (`MultiStepRel`: `k = 1 + initLen callee` steps on `TerminatorKind.call`,
+  executing `Terminator::Call` plus `callee`'s synthesized `initBlock` to reach
+  `callee` `bb0:0` with a pushed `CallStackRel` frame; `k = 1` step on nested
+  callee `Return` via `StackPopAction::BackToCaller`, tearing down callee
+  locals, writing `caller_ret_ptr`, and popping `CallStackRel` back to the
+  resumed caller at `targetBb:0`; `k = 1` step on root `Return` to `ReturnRel`,
+  ordinary statements/branches, and UB via `MultiStepRel.ub'`).
+* `multi_run_ret`, `multi_run_ret_from_start`, `multi_run_ub`,
+  `multi_run_ub_from_start`, `multi_steps_error`,
+  `multi_steps_error_from_start`, `multi_mirNoUB_safe`,
+  `multi_mirNoUB_safe_from_start`, `multi_steps_outcome`,
+  `multi_steps_outcome_from_start`, `multi_steps_outcome_any_from_start`,
+  `multi_mirNoUB_progress`, `multi_mirNoUB_progress_from_start`,
+  `multi_mirNoUB_progress_any_from_start`, `multi_mirNoUB_diverges_steps_ok`,
+  `multi_mirNoUB_diverges_from_start`, `multi_mirNoUB_diverges_rel_from_start`,
+  and `mirCallWithCallees_{ret, ub, noUB, steps_error, progress, progress_any,
+  outcome, outcome_any, diverges_steps_ok, diverges_rel}` (`Run.lean`): lift
+  `MultiStepRel` (using `steps_ok_mono` so no intermediate error at `j < k`
+  during multi-step `Call + initBlock` can ever hide) to full forward return,
+  forward UB, converse `n`-step error soundness, `MirNoUBTree` safety, arbitrary
+  `n : Nat` outcome trichotomy and forward progress (including startup steps
+  `n ≤ initLen entry`), and diverging call-loop liveness on
+  `mirCallTreeWithCallees entry args callees`.
+* `step_correspondence` (`Simulation.lean`): for a single-body fragment, its
   translation, and related states, one step of Anneal's coalgebra
   `stepMirFn body s` and one `Machine::step` satisfy `StepRel`: a silent
   Anneal step and an Anneal branch observation (the `switchInt` leakage tag)
@@ -329,6 +387,33 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
 programs, computing both semantics in the kernel (`decide`/`rfl`, no
 `native_decide`):
 
+* `callerMain`/`calleePair`, `projDestCaller`,
+  `chainEntry`/`chainMid`/`chainLeaf`, `callArgUbCaller`, `calleeDivZeroCaller`,
+  `callSpinCaller`, `callMoveReuse`, `moveReinitByCall`, and `condCallMoveJoin`
+  (MR-4.1): `callerMain` invokes `calleePair` (`initLen calleePair = 2`, 3-step
+  `Call + initBlock` entry) passing `_1` via `ArgumentExpr::ByValue` and
+  `(u32, bool)` tuple `_3` via `ArgumentExpr::InPlace`, exercising
+  `mirCallWithCallees_{ret, progress, progress_any, outcome_any}` on both
+  overflow and non-overflow paths (`callerCallee20_*`, `callerCalleeOv_*`,
+  `callerCallee20_midCall_step5`); `projDestCaller` writes sequential call
+  results into projected fields `_0.0` (`UnwindAction.unreachable`) and `_0.1`
+  (`UnwindAction.terminate`) of an `(i8, bool)` return place (`projDest127_*`);
+  `chainEntry -> chainMid -> chainLeaf` exercises a 3-deep nested call stack
+  (`depth 4` at `chainNeg5_depth4_step7`) returning `core::cmp::Ordering` across
+  frames (`chainNeg5_*`); `callArgUbCaller`, `calleeDivZeroCaller`, and `callMoveReuse` exercise UB during argument
+  evaluation, inside a pushed callee frame, and on post-call reuse of an
+  `InPlace`-moved local via `mirCallWithCallees_ub` and
+  `mirCallWithCallees_steps_error`; `callSpinCaller` proves infinite lockstep
+  call/return divergence (`callSpin_minirust_diverges_rel`); `moveReinitByCall`
+  re-initializes a moved-out local via a root call destination, and
+  `condCallMoveJoin` exercises a branch-correlated `InPlace` call move across a
+  CFG join (`condCallMoveJoin1_*`, `condCallMoveJoin0_*`); `callDestArgAlias`,
+  `callProjMoveReuse`, `stmtMoveThenCallArg`, and `recCycleA`/`recCycleB`
+  witness the soundness boundaries of `progInFragment`; and
+  `layout_ptr_and_array_mr41`, `evalConstant_and_fnFromPtr_mr41`,
+  `checkAbiCompatibility_all_variants_mr41`, `createFrame_ub_mr41`, and
+  `evalReturn_missingNextBlock_and_bottomOfStack_ub` directly verify every
+  transcribed MR-4.1 spec item.
 * `tempMove`, `crossBlockMove`, `loopTempMove`, `storageLiveArgRet`,
   `diamondMoveJoin`, `tupleAggCastMove`, and `ordBoolCastTempMove` (MR-1.3):
   `tempMove` is
@@ -596,16 +681,23 @@ These are deliberate and are the first things to lift:
 * **Branch observations.** Anneal's `switchInt` emits the scrutinee as a
   visible leakage event; MiniRust has no counterpart, so `StepRel` matches it
   with an ordinary MiniRust step.
+* **Direct monomorphic calls on acyclic call graphs only.** `progInFragment`
+  verifies multi-function programs whose static call graph is acyclic and whose
+  worst-case stack-local budget satisfies `maxStackLocals < 2^31`; recursive
+  call cycles, indirect function-pointer or virtual calls, and unwinding across
+  stack frames (`UnwindResume` / cleanup blocks) remain outside the fragment.
 * **Integers, `bool`, `Ordering`, and `(Int, bool)` 2-tuples only.** An
-  `Ordering` local is written by `Cmp` or `Use(copy _j)` and read by `Use` or
-  `Return` (no `Ordering` constants, `Discriminant`, or `SwitchInt` on it);
-  `Type::Enum` and `Type::Union` are interpreted only as representations
-  (layout, `decode`, `encode`, `check_value`), without `ValueExpr::{Union,
-  Variant, GetDiscriminant}`, `Statement::SetDiscriminant`, or downcast
-  projections, and `Type::Tuple` / `ValueExpr::Tuple` / `PlaceExpr::Field` are
-  connected to the correspondence for `(Int, bool)` 2-tuples (not general nested
-  tuples or field-wise writes `_i.0 = ...`). There are no pointers, references,
-  other aggregates, other casts, calls, drops, or assertions.
+  `Ordering` local is written by `Cmp`, `Use(copy _j | move _j)`, or a call
+  return and read by `Use`, call argument, or `Return` (no `Ordering` constants,
+  `Discriminant`, or `SwitchInt` on it); `Type::Enum` and `Type::Union` are
+  interpreted only as representations (layout, `decode`, `encode`,
+  `check_value`), without `ValueExpr::{Union, Variant, GetDiscriminant}`,
+  `Statement::SetDiscriminant`, or downcast projections, and `Type::Tuple` /
+  `ValueExpr::Tuple` / `PlaceExpr::Field` are connected to the correspondence
+  for `(Int, bool)` 2-tuples (supporting root and projected `_i.0` / `_i.1`
+  reads and writes, but not nested or general multi-field tuples). There are no
+  user pointers, references, other aggregates, other casts, drops, or
+  assertions.
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.

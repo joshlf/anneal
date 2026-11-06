@@ -103,8 +103,10 @@ open MiniRustSpec.Correspondence in
   multi_mirNoUB_safe_from_start
   multi_steps_outcome
   multi_steps_outcome_from_start
+  multi_steps_outcome_any_from_start
   multi_mirNoUB_progress
   multi_mirNoUB_progress_from_start
+  multi_mirNoUB_progress_any_from_start
   multi_mirNoUB_diverges_steps_ok
   multi_mirNoUB_diverges_from_start
   multi_mirNoUB_diverges_rel_from_start
@@ -113,7 +115,9 @@ open MiniRustSpec.Correspondence in
   mirCallWithCallees_noUB
   mirCallWithCallees_steps_error
   mirCallWithCallees_progress
+  mirCallWithCallees_progress_any
   mirCallWithCallees_outcome
+  mirCallWithCallees_outcome_any
   mirCallWithCallees_diverges_steps_ok
   mirCallWithCallees_diverges_rel
   step_correspondence
@@ -367,6 +371,8 @@ open MiniRustSpec.Correspondence.Witness in
   callerCallee20_anneal_ret
   callerCallee20_noUB
   callerCallee20_progress
+  callerCallee20_progress_any
+  callerCallee20_outcome_any
   callerCallee20_minirust_ret
   callerCallee20_midCall_step5
   callerCallee20_minirust_direct
@@ -417,6 +423,7 @@ open MiniRustSpec.Correspondence.Witness in
   callSpin_noRet
   callSpin_minirust_diverges
   callSpin_minirust_diverges_rel
+  callDestArgAlias_movesOk
   callDestArgAlias_rejected
   callDestArgAlias_translate
   callDestArgAlias_anneal_ret
@@ -425,12 +432,30 @@ open MiniRustSpec.Correspondence.Witness in
   callProjMoveReuse_translate
   callProjMoveReuse_anneal_ret
   callProjMoveReuse_minirust_ub
-  callMoveReuse_notInFragment
+  callMoveReuse_inFragment
   callMoveReuse_anneal_ub
   callMoveReuse_translate
   callMoveReuse_translateInProg
+  ctxCallMoveReuse_ok
   callMoveReuse_minirust_ub
   callMoveReuse_minirust_direct
+  callMoveReuse_converse_error
+  moveReinitByCall_inFragment
+  moveReinitByCall_translate
+  moveReinitByCall_translateInProg
+  ctxMoveReinitByCall_ok
+  moveReinitByCall_anneal_ret
+  moveReinitByCall_minirust_ret
+  moveReinitByCall_minirust_direct
+  condCallMoveJoin_inFragment
+  condCallMoveJoin_translate
+  condCallMoveJoin_translateInProg
+  ctxCondCallMoveJoin_ok
+  condCallMoveJoin1_anneal_ret
+  condCallMoveJoin1_minirust_ret
+  condCallMoveJoin0_anneal_ret
+  condCallMoveJoin0_minirust_ret
+  condCallMoveJoin_minirust_direct
   stmtMoveThenCallArg_movesOk
   stmtMoveThenCallArg_rejected
   recCycle_maxStackLocals
@@ -1008,8 +1033,10 @@ open MiniRustSpec.Correspondence in
   multi_mirNoUB_safe_from_start
   multi_steps_outcome
   multi_steps_outcome_from_start
+  multi_steps_outcome_any_from_start
   multi_mirNoUB_progress
   multi_mirNoUB_progress_from_start
+  multi_mirNoUB_progress_any_from_start
   multi_mirNoUB_diverges_steps_ok
   multi_mirNoUB_diverges_from_start
   multi_mirNoUB_diverges_rel_from_start
@@ -1018,7 +1045,9 @@ open MiniRustSpec.Correspondence in
   mirCallWithCallees_noUB
   mirCallWithCallees_steps_error
   mirCallWithCallees_progress
+  mirCallWithCallees_progress_any
   mirCallWithCallees_outcome
+  mirCallWithCallees_outcome_any
   mirCallWithCallees_diverges_steps_ok
   mirCallWithCallees_diverges_rel
   step_correspondence
@@ -1207,6 +1236,8 @@ open MiniRustSpec.Correspondence.Witness in
   callerCallee20_anneal_ret
   callerCallee20_noUB
   callerCallee20_progress
+  callerCallee20_progress_any
+  callerCallee20_outcome_any
   callerCallee20_minirust_ret
   callerCallee20_midCall_step5
   callerCallee20_minirust_direct
@@ -1257,6 +1288,7 @@ open MiniRustSpec.Correspondence.Witness in
   callSpin_noRet
   callSpin_minirust_diverges
   callSpin_minirust_diverges_rel
+  callDestArgAlias_movesOk
   callDestArgAlias_rejected
   callDestArgAlias_translate
   callDestArgAlias_anneal_ret
@@ -1265,12 +1297,30 @@ open MiniRustSpec.Correspondence.Witness in
   callProjMoveReuse_translate
   callProjMoveReuse_anneal_ret
   callProjMoveReuse_minirust_ub
-  callMoveReuse_notInFragment
+  callMoveReuse_inFragment
   callMoveReuse_anneal_ub
   callMoveReuse_translate
   callMoveReuse_translateInProg
+  ctxCallMoveReuse_ok
   callMoveReuse_minirust_ub
   callMoveReuse_minirust_direct
+  callMoveReuse_converse_error
+  moveReinitByCall_inFragment
+  moveReinitByCall_translate
+  moveReinitByCall_translateInProg
+  ctxMoveReinitByCall_ok
+  moveReinitByCall_anneal_ret
+  moveReinitByCall_minirust_ret
+  moveReinitByCall_minirust_direct
+  condCallMoveJoin_inFragment
+  condCallMoveJoin_translate
+  condCallMoveJoin_translateInProg
+  ctxCondCallMoveJoin_ok
+  condCallMoveJoin1_anneal_ret
+  condCallMoveJoin1_minirust_ret
+  condCallMoveJoin0_anneal_ret
+  condCallMoveJoin0_minirust_ret
+  condCallMoveJoin_minirust_direct
   stmtMoveThenCallArg_movesOk
   stmtMoveThenCallArg_rejected
   recCycle_maxStackLocals

@@ -7224,6 +7224,40 @@ theorem callerCallee20_progress (n : Nat) :
     callerCallee20MInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
     callerCallee20_noUB n
 
+theorem callerCallee20_progress_any (n : Nat) :
+    (∃ d s' m0 m' tr, Interp.steps n callerCallee20MInit = .ok m0 ∧
+      Interp.steps (n + d) callerCallee20MInit = .ok m' ∧
+      MultiStateRel callerMain [calleePair] callerCalleeProg ctxCallerMain s' m' ∧
+      Reaches (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair]) tr
+        (mirTree callerMain s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ n ∧
+      Interp.steps k callerCallee20MInit = .ok mRet ∧
+      ReturnRel callerMain ctxCallerMain s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair]) tr
+        (.normal (v, mem))) :=
+  mirCallWithCallees_progress_any callerCallee_inFragment callerCallee_translate
+    callerMain_translateInProg ctxCallerMain ctxCallerMain_ok callerCallee20Args (by decide)
+    callerCallee20MInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    callerCallee20_noUB n
+
+theorem callerCallee20_outcome_any (n : Nat) :
+    (∃ d s' m0 m' tr, Interp.steps n callerCallee20MInit = .ok m0 ∧
+      Interp.steps (n + d) callerCallee20MInit = .ok m' ∧
+      MultiStateRel callerMain [calleePair] callerCalleeProg ctxCallerMain s' m' ∧
+      Reaches (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair]) tr
+        (mirTree callerMain s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ n ∧
+      Interp.steps k callerCallee20MInit = .ok mRet ∧
+      ReturnRel callerMain ctxCallerMain s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair]) tr
+        (.normal (v, mem))) ∨
+    (∃ msg, Interp.steps n callerCallee20MInit = .error (.ub msg) ∧
+      ∃ tr u, Reaches (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair]) tr u ∧
+        FaultNow u) :=
+  mirCallWithCallees_outcome_any callerCallee_inFragment callerCallee_translate
+    callerMain_translateInProg ctxCallerMain ctxCallerMain_ok callerCallee20Args (by decide)
+    callerCallee20MInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl n
+
 theorem callerCallee20_minirust_ret :
     ∃ (n : Nat) (m' : Mach), Interp.steps n callerCallee20MInit = .ok m' ∧
       m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 52 } ∧
@@ -7967,6 +8001,8 @@ def callDestArgAlias : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
+theorem callDestArgAlias_movesOk : movesOk callDestArgAlias = false := by decide
+
 theorem callDestArgAlias_rejected :
     progInFragment callDestArgAlias [idU32Callee] = false := by decide
 
@@ -8052,7 +8088,10 @@ theorem callProjMoveReuse_minirust_ub :
 
 /-- Post-call root-`move` reuse (`StorageLive(_2); _2 = idU32Callee(move _1);
 _0 = copy _1`): because `ArgumentExpr::InPlace` writes `Uninit` to `_1` in
-MiniRust just as `evalOperand` sets `_1` to `.uninit` in Anneal, `callMoveReuse` is correctly NOT in `progInFragment` (rejected by `movesOk`), while BOTH semantics fault with UB on `bb1`'s `copy _1`! -/
+MiniRust just as `evalOperand` sets `_1` to `.uninit` in Anneal (`_1` is not
+stale!), `callMoveReuse` is IN `progInFragment`, and BOTH forward UB transfer
+(`mirCallWithCallees_ub`) and converse error soundness
+(`mirCallWithCallees_steps_error`) apply on `bb1`'s `copy _1`. -/
 def callMoveReuse : CapturedMir where
   defPath := "witness::call_move_reuse"
   phase := .runtimePostCleanup
@@ -8070,8 +8109,8 @@ def callMoveReuse : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-theorem callMoveReuse_notInFragment :
-    progInFragment callMoveReuse [idU32Callee] = false := by decide
+theorem callMoveReuse_inFragment :
+    progInFragment callMoveReuse [idU32Callee] = true := by decide
 
 theorem callMoveReuse_anneal_ub :
     ∃ tr u, Reaches
@@ -8092,14 +8131,280 @@ def callMoveReuseMInit : Mach :=
     (initMachineStateWithCallees callMoveReuse [.scalar ⟨7, 4⟩] [idU32Callee]).frame.locals
     callMoveReuseFn.start
 
+theorem ctxCallMoveReuse_ok : CtxOk callMoveReuse ctxCallSpin where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [callMoveReuse] at hd; subst hd; decide
+    | 1, _, hd => simp [callMoveReuse] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [callMoveReuse] at hi
+  ret := by
+    intro d hd; simp [callMoveReuse] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem callMoveReuse_minirust_ub :
+    ∃ (n : Nat) (msg : String), Interp.steps n callMoveReuseMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := callMoveReuse_anneal_ub
+  exact mirCallWithCallees_ub callMoveReuse_inFragment callMoveReuse_translate
+    callMoveReuse_translateInProg ctxCallSpin ctxCallMoveReuse_ok
+    [.scalar ⟨7, 4⟩] (by decide) callMoveReuseMInit
+    (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+
 theorem callMoveReuse_minirust_direct :
     Interp.steps 7 callMoveReuseMInit =
       .error (.ub "load at type but the data in memory violates the language invariant") :=
   eq_error_ub_of_ubMsg? (by decide +kernel)
 
-theorem callMoveReuse_minirust_ub :
-    ∃ (n : Nat) (msg : String), Interp.steps n callMoveReuseMInit = .error (.ub msg) :=
-  ⟨7, _, callMoveReuse_minirust_direct⟩
+theorem callMoveReuse_converse_error :
+    (∃ msg,
+      Stop.ub "load at type but the data in memory violates the language invariant" = .ub msg ∧
+      ∃ tr u,
+        Reaches (mirCallTreeWithCallees callMoveReuse [.scalar ⟨7, 4⟩] [idU32Callee]) tr u ∧
+          FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 7 ∧ Interp.steps k callMoveReuseMInit = .ok mRet ∧
+      ReturnRel callMoveReuse ctxCallSpin s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees callMoveReuse [.scalar ⟨7, 4⟩] [idU32Callee]) tr
+        (.normal (v, mem))) :=
+  mirCallWithCallees_steps_error callMoveReuse_inFragment callMoveReuse_translate
+    callMoveReuse_translateInProg ctxCallSpin ctxCallMoveReuse_ok
+    [.scalar ⟨7, 4⟩] (by decide) callMoveReuseMInit
+    (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    callMoveReuse_minirust_direct
+
+/-- Root-destination call re-initialization (`StorageLive(_2); _2 = move _1;
+_1 = idU32Callee(copy _2); _0 = copy _1; StorageDead(_2); Return`): `_1` is
+moved out by `_2 = move _1` (entering `mo`), then completely overwritten by the
+root destination of `_1 = idU32Callee(copy _2)` (`termMoved` clears `_1` from
+`mo`, and `termReadsOk` allows `_1 ∈ mo` on root destinations `⟨dst, []⟩`). -/
+def moveReinitByCall : CapturedMir where
+  defPath := "witness::move_reinit_by_call"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.assign (local_ 2) (.use (.move (local_ 1))))],
+      terminator := mkTerm (.call (fnDefOp "witness::id_u32_callee")
+        [.copy (local_ 2)] (local_ 1) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 1)))),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem moveReinitByCall_inFragment :
+    progInFragment moveReinitByCall [idU32Callee] = true := by decide
+
+def moveReinitByCallProg : Gen.Program :=
+  (translateProg moveReinitByCall [idU32Callee]).getD emptyProg
+def moveReinitByCallFn : Gen.Function :=
+  (translateFnInProg (fnNameMap moveReinitByCall [idU32Callee]) moveReinitByCall).getD callerFn
+theorem moveReinitByCall_translate :
+    translateProg moveReinitByCall [idU32Callee] = some moveReinitByCallProg := rfl
+theorem moveReinitByCall_translateInProg :
+    translateFnInProg (fnNameMap moveReinitByCall [idU32Callee]) moveReinitByCall =
+      some moveReinitByCallFn := rfl
+
+def moveReinitByCallS0 : MachineState :=
+  initMachineStateWithCallees moveReinitByCall [.scalar ⟨55, 4⟩] [idU32Callee]
+def moveReinitByCallMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin moveReinitByCallProg 2 moveReinitByCall moveReinitByCallFn
+    moveReinitByCallS0.frame.locals moveReinitByCallFn.start
+
+theorem ctxMoveReinitByCall_ok : CtxOk moveReinitByCall ctxCallSpin where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [moveReinitByCall] at hd; subst hd; decide
+    | 1, _, hd => simp [moveReinitByCall] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [moveReinitByCall] at hi
+  ret := by
+    intro d hd; simp [moveReinitByCall] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem moveReinitByCall_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees moveReinitByCall [.scalar ⟨55, 4⟩] [idU32Callee]) []
+      (.normal (.scalar ⟨55, 4⟩,
+        { moveReinitByCallS0.memory with activeCallee := some moveReinitByCall })) :=
+  runA_sound moveReinitByCall 20 _ _ _ rfl
+
+theorem moveReinitByCall_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n moveReinitByCallMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 55 } ∧
+      m'.threads = [thread1 ctxCallSpin
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret moveReinitByCall_inFragment moveReinitByCall_translate
+      moveReinitByCall_translateInProg ctxCallSpin ctxMoveReinitByCall_ok
+      [.scalar ⟨55, 4⟩] (by decide) moveReinitByCallMInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      moveReinitByCall_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [moveReinitByCall] at hd; subst hd
+  simp [retPtr, ctxCallSpin, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxCallSpin, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem moveReinitByCall_minirust_direct :
+    (Interp.steps 10 moveReinitByCallMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 55 }, [1]) := by
+  decide +kernel
+
+/-- Branch-correlated `Call` `move` across a CFG join:
+```rust
+fn cond_call_move_join(flag: u32, x: u32) -> u32 {
+    let y = if flag != 0 { id_u32_callee(move x) } else { 0 };
+    if flag != 0 { y } else { x }
+}
+```
+On `bb1` (`flag != 0`), `move _2` is lowered via `ArgumentExpr::InPlace` (writing
+`Uninit` in MiniRust too, so `_2` is not stale!), allowing `bb5` (`flag == 0`)
+after the join block `bb3` to read `copy _2` cleanly in `progInFragment`. -/
+def condCallMoveJoin : CapturedMir where
+  defPath := "witness::cond_call_move_join"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 3)],
+      terminator := mkTerm (.switchInt (.copy (local_ 1)) { branches := [(0, 2)], otherwise := 1 }),
+      isCleanup := false },
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::id_u32_callee")
+        [.move (local_ 2)] (local_ 3) (some 3) .continue_),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 3) (.use (constU32 0)))],
+      terminator := mkTerm (.goto 3), isCleanup := false },
+    { statements := [],
+      terminator := mkTerm (.switchInt (.copy (local_ 1)) { branches := [(0, 5)], otherwise := 4 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 3)))),
+        mkStmt (.storageDead 3)],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 2)))),
+        mkStmt (.storageDead 3)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem condCallMoveJoin_inFragment :
+    progInFragment condCallMoveJoin [idU32Callee] = true := by decide
+
+def condCallMoveJoinProg : Gen.Program :=
+  (translateProg condCallMoveJoin [idU32Callee]).getD emptyProg
+def condCallMoveJoinFn : Gen.Function :=
+  (translateFnInProg (fnNameMap condCallMoveJoin [idU32Callee]) condCallMoveJoin).getD callerFn
+theorem condCallMoveJoin_translate :
+    translateProg condCallMoveJoin [idU32Callee] = some condCallMoveJoinProg := rfl
+theorem condCallMoveJoin_translateInProg :
+    translateFnInProg (fnNameMap condCallMoveJoin [idU32Callee]) condCallMoveJoin =
+      some condCallMoveJoinFn := rfl
+
+theorem ctxCondCallMoveJoin_ok : CtxOk condCallMoveJoin ctxCallerMain where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [condCallMoveJoin] at hd; subst hd; decide
+    | 1, _, hd => simp [condCallMoveJoin] at hd; subst hd; decide
+    | 2, _, hd => simp [condCallMoveJoin] at hd; subst hd; decide
+    | _ + 3, hi, _ => simp [condCallMoveJoin] at hi
+  ret := by
+    intro d hd; simp [condCallMoveJoin] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def condCallMoveJoin1Args : List Value := [.scalar ⟨1, 4⟩, .scalar ⟨42, 4⟩]
+def condCallMoveJoin1S0 : MachineState :=
+  initMachineStateWithCallees condCallMoveJoin condCallMoveJoin1Args [idU32Callee]
+def condCallMoveJoin1MInit : Mach :=
+  multiMachineWithCtx ctxCallerMain condCallMoveJoinProg 2 condCallMoveJoin condCallMoveJoinFn
+    condCallMoveJoin1S0.frame.locals condCallMoveJoinFn.start
+
+theorem condCallMoveJoin1_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees condCallMoveJoin condCallMoveJoin1Args [idU32Callee])
+      [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩,
+        ⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
+      (.normal (.scalar ⟨42, 4⟩,
+        { condCallMoveJoin1S0.memory with activeCallee := some condCallMoveJoin })) :=
+  runA_sound condCallMoveJoin 25 _ _ _ rfl
+
+theorem condCallMoveJoin1_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n condCallMoveJoin1MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 42 } ∧
+      m'.threads = [thread1 ctxCallerMain
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret condCallMoveJoin_inFragment condCallMoveJoin_translate
+      condCallMoveJoin_translateInProg ctxCallerMain ctxCondCallMoveJoin_ok
+      condCallMoveJoin1Args (by decide) condCallMoveJoin1MInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      condCallMoveJoin1_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [condCallMoveJoin] at hd; subst hd
+  simp [retPtr, ctxCallerMain, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxCallerMain, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+def condCallMoveJoin0Args : List Value := [.scalar ⟨0, 4⟩, .scalar ⟨99, 4⟩]
+def condCallMoveJoin0S0 : MachineState :=
+  initMachineStateWithCallees condCallMoveJoin condCallMoveJoin0Args [idU32Callee]
+def condCallMoveJoin0MInit : Mach :=
+  multiMachineWithCtx ctxCallerMain condCallMoveJoinProg 2 condCallMoveJoin condCallMoveJoinFn
+    condCallMoveJoin0S0.frame.locals condCallMoveJoinFn.start
+
+theorem condCallMoveJoin0_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees condCallMoveJoin condCallMoveJoin0Args [idU32Callee])
+      [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩,
+        ⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
+      (.normal (.scalar ⟨99, 4⟩, condCallMoveJoin0S0.memory)) :=
+  runA_sound condCallMoveJoin 25 _ _ _ rfl
+
+theorem condCallMoveJoin0_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n condCallMoveJoin0MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 99 } ∧
+      m'.threads = [thread1 ctxCallerMain
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret condCallMoveJoin_inFragment condCallMoveJoin_translate
+      condCallMoveJoin_translateInProg ctxCallerMain ctxCondCallMoveJoin_ok
+      condCallMoveJoin0Args (by decide) condCallMoveJoin0MInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      condCallMoveJoin0_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [condCallMoveJoin] at hd; subst hd
+  simp [retPtr, ctxCallerMain, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxCallerMain, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem condCallMoveJoin_minirust_direct :
+    (Interp.steps 11 condCallMoveJoin1MInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 42 }, [1]) ∧
+    (Interp.steps 9 condCallMoveJoin0MInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 99 }, [1]) :=
+  ⟨by decide +kernel, by decide +kernel⟩
 
 
 /-- Counterexample 3 (`StorageLive(_2); _2 = move _1; _0 = idU32Callee(copy _1)`):

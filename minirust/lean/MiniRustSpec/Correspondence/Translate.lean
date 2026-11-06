@@ -1521,25 +1521,35 @@ def stmtReadsOk (mo : List Nat) (s : MirAst.Statement) : Bool :=
   | .assign _ rv => readsOk mo (rvOperands rv)
   | _ => true
 
-/-- Whether terminator `t` reads no moved-out local (`Return` reads `_0`;
-`Call` reads `argOps` and, when writing to a projected field `_dst.f`,
-preserves the other field of `_dst`). -/
+/-- Whether terminator `t` reads no local in `mo`. For `Call`:
+* MiniRust's `Terminator::Call` runs `prepare_for_inplace_passing(ret_place)`
+  (writing `Uninit` to `ret_place`) *before* evaluating `arguments`, so
+  `readsOk (dst :: mo) argOps` forbids `argOps` from reading either a stale
+  local in `mo` or `dst`;
+* a root destination `⟨dst, []⟩` overwrites `_dst` completely without reading
+  its prior value (so `_dst = callee(..)` may re-initialize a moved-out local),
+  whereas a projected destination `⟨dst, _ :: _⟩` (`_dst.f = callee(..)`)
+  preserves the sibling field of `_dst` and requires `!mo.contains dst`. -/
 def termReadsOk (mo : List Nat) (t : MirAst.Terminator) : Bool :=
   match t.kind with
   | .switchInt discr _ => readsOk mo [discr]
   | .return_ => !mo.contains 0
-  | .call _ argOps ⟨dst, _⟩ _ _ => !mo.contains dst && readsOk (dst :: mo) argOps
+  | .call _ argOps ⟨dst, []⟩ _ _ => readsOk (dst :: mo) argOps
+  | .call _ argOps ⟨dst, _ :: _⟩ _ _ => !mo.contains dst && readsOk (dst :: mo) argOps
   | _ => true
 
-/-- The moved-out locals after terminator `t`: `SwitchInt` marks a moved
-discriminant, while `Call` clears a root destination `_dst` (moved call
-arguments are translated via `ArgumentExpr::InPlace`, which writes `Uninit`
-bytes in MiniRust too, so they do not become stale). -/
+/-- The stale moved-out locals after terminator `t`: `SwitchInt` marks a moved
+discriminant (lowered via `ValueExpr::Load`, which leaves initialized bytes in
+MiniRust), whereas `Call` clears a root destination `_dst` on its `some target`
+edge and does NOT add `Move` call arguments to `mo` (`callArgOk` restricts
+`Call` `Move` arguments to root locals `⟨j, []⟩`, which `translateCallArg`
+lowers to `ArgumentExpr::InPlace`, writing `Uninit` bytes in MiniRust too so
+`_j` is uninitialized in both semantics rather than stale; `termTupleInit`
+separately drops moved tuple locals via `dropMovedFrom`). -/
 def termMoved (mo : List Nat) (t : MirAst.Terminator) : List Nat :=
   match t.kind with
   | .switchInt discr _ => moveOut mo discr
-  | .call _ argOps ⟨dst, []⟩ (some _) _ => (argOps.foldl moveOut mo).filter (· != dst)
-  | .call _ argOps _ _ _ => argOps.foldl moveOut mo
+  | .call _ _ ⟨dst, []⟩ (some _) _ => mo.filter (· != dst)
   | _ => mo
 
 /-- The successor block indices of terminator `t`. -/
