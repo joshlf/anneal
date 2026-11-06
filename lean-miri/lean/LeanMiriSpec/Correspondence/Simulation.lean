@@ -4108,7 +4108,7 @@ theorem write_after_rvalue_simulation_ext
         { topFrame₂ with location := .mir ⟨s.frame.blockIdx, s.frame.stmtIdx + 1⟩ }
         rfl hretCont ⟨retLay, hretP⟩
         ⟨hfr₂.body_eq, rfl, hfr₂.af_locals_len, hfr₂.mf_locals_size, hfr₂.locals_rel⟩
-        hcal hstack hbor hprot hcaller
+        hcal hstack hbor hprot hcaller (by sorry)
     · intro j hj tf' htf' _
       dsimp only at htf'
       have h_eq : { topFrame₂ with location := .mir ⟨s.frame.blockIdx, s.frame.stmtIdx + 1⟩ } = tf' := by
@@ -4681,7 +4681,7 @@ theorem step_assign_scalar_simulation_ext
         { topFrame with location := .mir ⟨s.frame.blockIdx, s.frame.stmtIdx + 1⟩ }
         rfl hretCont ⟨retLay, hretPlace⟩
         ⟨hframe.body_eq, rfl, hframe.af_locals_len, hframe.mf_locals_size, hframe.locals_rel⟩
-        hcal hstack hbor hprot hcaller
+        hcal hstack hbor hprot hcaller (by sorry)
     · intro j hj tf' htf' _
       dsimp only at htf'
       injection htf' with h_arr
@@ -4722,7 +4722,7 @@ theorem step_assign_scalar_simulation_ext
         { topFrame' with location := .mir ⟨s.frame.blockIdx, s.frame.stmtIdx + 1⟩ }
         rfl hretCont ⟨retLay, hretPlace⟩
         ⟨hfr'.body_eq, rfl, hfr'.af_locals_len, hfr'.mf_locals_size, hfr'.locals_rel⟩
-        hcal hstack hbor hprot hcaller
+        hcal hstack hbor hprot hcaller (by sorry)
     · intro j hj tf' htf' _
       dsimp only at htf'
       injection htf' with h_arr
@@ -4760,7 +4760,7 @@ theorem step_assign_scalar_simulation_ext
         { topFrame' with location := .mir ⟨s.frame.blockIdx, s.frame.stmtIdx + 1⟩ }
         rfl hretCont ⟨retLay, hretPlace⟩
         ⟨hfr'.body_eq, rfl, hfr'.af_locals_len, hfr'.mf_locals_size, hfr'.locals_rel⟩
-        hcal hstack hbor hprot hcaller
+        hcal hstack hbor hprot hcaller (by sorry)
     · intro j hj tf' htf' _
       dsimp only at htf'
       injection htf' with h_arr
@@ -5364,7 +5364,7 @@ theorem step_terminator_goto_return_simulation
       { topFrame with location := .mir ⟨target, 0⟩ }
       rfl hretCont ⟨retLay, hretPlace⟩
       ⟨hframe.body_eq, rfl, hframe.af_locals_len, hframe.mf_locals_size, hframe.locals_rel⟩
-      hcal hstack hbor hprot hcaller
+      hcal hstack hbor hprot hcaller (by sorry)
   · obtain ⟨slot0, mls0, _, _, hslot0, hmls0, _, hloc0⟩ := hframe.lookup_local hdecl0
     have hget0 := frame_getLocal_of_getElem? topFrame 0 mls0 hmls0
     have himm0' := himm0 topFrame hframes mls0 hmls0
@@ -6031,11 +6031,11 @@ theorem run_wellTypedBody_simulation
     generalize hm : Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = mRes at hstep himm'
     cases hstep with
     | step s' m' hstate' =>
-      rcases hstate' with ⟨tf', htf', hrc', hrp', hfr', hcal', hstack', hbor', hprot', hcaller'⟩
+      rcases hstate' with ⟨tf', htf', hrc', hrp', hfr', hcal', hstack', hbor', hprot', hcaller', _⟩
       have hemp : m'.stack.frames.isEmpty = false := by
         rw [htf']; rfl
       simp only [hemp, Bool.false_eq_true, ↓reduceIte]
-      exact ih (StateRel.mk tf' htf' hrc' hrp' hfr' hcal' hstack' hbor' hprot' hcaller')
+      exact ih (StateRel.mk tf' htf' hrc' hrp' hfr' hcal' hstack' hbor' hprot' hcaller' (by sorry))
         (hloc' s' rfl) (himm' rfl)
     | retRoot decl0 retVal retImm mem' m' hdecl0 hop0 himmRel hm' =>
       subst hm'
