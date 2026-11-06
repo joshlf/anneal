@@ -11,6 +11,7 @@ those terms.
 import LeanMiriSpec.Correspondence.Translate
 import LeanMiriSpec.Correspondence.Relation
 import LeanMiriSpec.Correspondence.Simulation
+import LeanMiriSpec.Correspondence.Witness
 import LeanMiriSpec.Audit
 
 /-!
@@ -26,6 +27,8 @@ import LeanMiriSpec.Audit
 * `LeanMiriSpec.Correspondence.Simulation`: lockstep simulation theorems for
   arithmetic, bitwise, shift, unary, statement (`assign` / `nop`), and
   terminator (`goto` / `return_`) execution.
+* `LeanMiriSpec.Correspondence.Witness`: a concrete body and initial states that
+  satisfy every premise of the correspondence theorems (non-vacuity).
 * `LeanMiriSpec.Audit`: axiom audit (`#assert_standard_axioms` and exhaustive
   module-wide axiom verification across `LeanMiriSpec.*` and `Miri.*`).
 -/

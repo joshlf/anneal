@@ -217,6 +217,27 @@ def scalarLayoutData (sizeBytes : Nat) (signed : Bool)
     reprC := false
     randomizationSeed := 0 }
 
+/-- Construct a `Miri.ABI.LayoutData` for an IEEE-754 float of `sizeBytes` bytes
+(`f16`, `f32`, `f64`, `f128`), whose backend scalar is a `Primitive.Float`
+rather than an integer of the same width. -/
+def floatLayoutData (sizeBytes : Nat) : Miri.ABI.LayoutData :=
+  let sz := translateSizeBytes sizeBytes
+  let al := translateAlignBytes sizeBytes
+  let prim : Miri.ABI.Primitive := .Float (translateAbiFloatBits (8 * sizeBytes))
+  let range : Miri.ABI.WrappingRange :=
+    { start := 0, «end» := BitVec.ofNat 128 ((2 ^ (8 * sizeBytes)) - 1) }
+  { fields := .Primitive
+    variants := .Single 0
+    backendRepr := .Scalar (.Initialized (value := prim) (validRange := range))
+    largestNiche := none
+    uninhabited := false
+    align := ⟨al⟩
+    size := sz
+    maxReprAlign := none
+    unadjustedAbiAlign := al
+    reprC := false
+    randomizationSeed := 0 }
+
 /-- Construct a `Miri.ABI.LayoutData` for a pointer of 8 bytes. -/
 def pointerLayoutData (nonNull : Bool := false) : Miri.ABI.LayoutData :=
   let sz := Miri.ABI.Size.ofBytes 8
@@ -317,10 +338,10 @@ def translateTy (ty : Ty) (layouts : LayoutTable := emptyLayoutTable) :
     | .char => scalarLayoutData 4 false 0 0x10FFFF
     | .int it => scalarLayoutData (it.byteWidth 64) true
     | .uint ut => scalarLayoutData (ut.byteWidth 64) false
-    | .float .f16 => scalarLayoutData 2 false
-    | .float .f32 => scalarLayoutData 4 false
-    | .float .f64 => scalarLayoutData 8 false
-    | .float .f128 => scalarLayoutData 16 false
+    | .float .f16 => floatLayoutData 2
+    | .float .f32 => floatLayoutData 4
+    | .float .f64 => floatLayoutData 8
+    | .float .f128 => floatLayoutData 16
     | .rawPtr _ _ => pointerLayoutData false
     | .ref _ _ => pointerLayoutData true
     | .fnPtr _ _ _ _ => pointerLayoutData true
@@ -500,7 +521,22 @@ def translateAggregateKind : AggregateKind → Miri.MIR.AggregateKind
   | .rawPtr pointeeTy mutability =>
       .RawPtr (encodeTyId pointeeTy) (match mutability with | .not => .Not | .mut => .Mut)
 
-/-- Translate an Anneal `Rvalue` to `Miri.MIR.Rvalue`. -/
+/-- An unevaluated constant of type `ty`. `evalMirConstImmediate` reports
+`StepError.unsupported` for it, never a value and never undefined behavior. -/
+def untranslatableConstOperand (ty : Ty) : Miri.MIR.ConstOperand :=
+  { span := defaultSpanRef
+    userType := none
+    value := .Unevaluated { definition := 0, arguments := #[], promoted := none } (encodeTyId ty) }
+
+/-- Translate an Anneal `Rvalue` to `Miri.MIR.Rvalue`.
+
+The pinned rustc MIR (`Miri.MIR.Rvalue`) has neither `Rvalue::Len` nor
+`NullOp::{SizeOf, AlignOf, OffsetOf}`. Rather than invent a meaning for them,
+the translation maps `len` to `CopyForDeref` (which `evalRvalueIntoPlace`
+rejects in runtime MIR with `invalidProgram`) and those nullary operators to an
+unevaluated constant (which `evalMirConstImmediate` rejects with
+`unsupported`). Neither outcome is a value or undefined behavior, so no
+simulation theorem can match them against Anneal results. -/
 def translateRvalue : Rvalue → Miri.MIR.Rvalue
   | .use op => .Use (translateOperand op) .No
   | .repeat op count =>
@@ -513,15 +549,14 @@ def translateRvalue : Rvalue → Miri.MIR.Rvalue
       .Ref .Erased (translateBorrowKind bk) (translatePlace place)
   | .threadLocalRef _ => .ThreadLocalRef 0
   | .rawPtr mutability place => .RawPtr (translateRawPtrKind mutability) (translatePlace place)
-  | .len place => .Discriminant (translatePlace place)
+  | .len place => .CopyForDeref (translatePlace place)
   | .cast kind op targetTy =>
       .Cast (translateCastKind kind) (translateOperand op) (encodeTyId targetTy)
   | .binaryOp op lhs rhs =>
       .BinaryOp (translateBinOp op) (translateOperand lhs) (translateOperand rhs)
   | .nullaryOp .ubChecks _ => .Use (.RuntimeChecks .UbChecks) .No
   | .nullaryOp .contractChecks _ => .Use (.RuntimeChecks .ContractChecks) .No
-  | .nullaryOp _ ty =>
-      .Use (.Constant { span := defaultSpanRef, userType := none, value := .Val .ZeroSized (encodeTyId ty) }) .No
+  | .nullaryOp _ ty => .Use (.Constant (untranslatableConstOperand ty)) .No
   | .unaryOp op operand =>
       .UnaryOp (translateUnOp op) (translateOperand operand)
   | .discriminant place => .Discriminant (translatePlace place)
@@ -721,8 +756,16 @@ def evalMirConstImmediate (layouts : LayoutTable) (c : Miri.MIR.ConstOperand) :
   | _ => .error (.unsupported "non-scalar constant in scalar rvalue evaluation")
 
 /-- Evaluate an unprojected local or constant `Miri.MIR.Operand` in the top frame of
-`AnnealStepState`, matching `MirSemantics.evalOperand` (including deinitializing
-the source local on `.Move`). -/
+`AnnealStepState`.
+
+`Copy` and `Move` share one branch, exactly as in `lean-miri`'s source operand
+evaluators (`Miri.Interpreter.OperandMachine.evalOperand` and
+`Miri.Interpreter.evalOperand`): the pinned rustc leaves move invalidation
+unimplemented, so reading `Move place` leaves the source local unchanged. This
+differs from Anneal's `MirSemantics.evalOperand`, which deinitializes a root
+local on `Operand.move`; that divergence is deliberately not papered over here.
+
+Reading a dead local is undefined behavior, matching rustc's `DeadLocal`. -/
 def annealEvalOperand (localDecls : List LocalDecl) (layouts : LayoutTable)
     (op : Miri.MIR.Operand) (known : Option Miri.Interpreter.LocalLayout) :
     Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.OpTy AnnealProv) := do
@@ -730,7 +773,7 @@ def annealEvalOperand (localDecls : List LocalDecl) (layouts : LayoutTable)
   let some frame := st.stack.currentFrame?
     | throw (.stack .emptyStack)
   match op with
-  | .Copy place =>
+  | .Copy place | .Move place =>
       if !place.projection.isEmpty then
         throw (.unsupported "projected operand in scalar rvalue")
       let localState ←
@@ -747,34 +790,6 @@ def annealEvalOperand (localDecls : List LocalDecl) (layouts : LayoutTable)
       match localState.value with
       | .dead => throw (.undefinedBehavior "read of dead local")
       | .live operand => return ⟨operand, layout⟩
-  | .Move place =>
-      if !place.projection.isEmpty then
-        throw (.unsupported "projected operand in scalar rvalue")
-      let localState ←
-        match frame.getLocal place.localId with
-        | .ok ls => pure ls
-        | .error _ => throw (.undefinedBehavior "out-of-bounds local read")
-      let layout ←
-        match localState.layout <|> lookupLocalDeclLayout localDecls layouts place.localId <|> known with
-        | some l => pure l
-        | none =>
-            match frame.body.locals[place.localId]? with
-            | some tyId => pure (layoutOfEncodedTyId tyId layouts)
-            | none => throw (.stack (.missingLocalType place.localId))
-      match localState.value with
-      | .dead => throw (.undefinedBehavior "read of dead local")
-      | .live (.immediate .uninit) => throw (.undefinedBehavior "move of uninitialized local")
-      | .live operand =>
-          let updatedFrame ←
-            match frame.replaceLocalValue place.localId (.live (.immediate .uninit)) with
-            | .ok f => pure f
-            | .error e => throw (.stack e)
-          let idx := st.stack.frames.size - 1
-          if h : idx < st.stack.frames.size then
-            set { st with stack := { frames := st.stack.frames.set idx updatedFrame h } }
-            return ⟨operand, layout⟩
-          else
-            throw (.stack .emptyStack)
   | .Constant c =>
       match evalMirConstImmediate layouts c with
       | .ok imm => return ⟨.immediate imm.imm, imm.layout⟩
@@ -974,7 +989,64 @@ def annealTerminatorHooks (localDecls : List LocalDecl := .nil)
             | .error _ => throw (.undefinedBehavior "invalid bool assert condition")
         | .error _ => throw (.invalidProgram "non-scalar assert condition"))
       state
-  assertPanic := fun _ _ _ state => (state, .error (.undefinedBehavior "assert failed"))
+  -- A failed `Assert` panics and unwinds in both rustc and Anneal (`applyUnwindAction`);
+  -- it is never undefined behavior. Unwinding is outside the scalar fragment.
+  assertPanic := fun _ _ _ state => (state, .error (.unsupported "assert panic (unwinding)"))
+
+/-- Compiler and machine leaves of `lean-miri`'s source `storage_live_dyn` and
+`storage_dead` (`Miri.Interpreter.Frame.storageLive` / `Frame.storageDead`) for
+Anneal's single-threaded machine.
+
+* `veryTriviallySized` answers `true`: `Runtime(PostCleanup)` MIR has no
+  unsized locals, so `storage_live_dyn` never needs a layout or metadata.
+* `afterLocalWrite` has nothing to do: data-race clocks exist only for
+  multi-threaded machines.
+* `allocateDyn` (unsized locals) and `deallocateStack` (memory-backed locals)
+  report `StackError` failures. Locals become memory-backed only through
+  `forceAllocation`, which `annealRvalueHooks` does not support, so neither
+  leaf is reachable from a state whose locals are all immediate. -/
+def annealLocalStorageHooks (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    Miri.Interpreter.LocalStorageHooks
+      AnnealProv
+      Miri.Interpreter.LocalLayout
+      Unit
+      (Miri.Memory.MemoryState AnnealProv Unit Unit) where
+  veryTriviallySized := fun _ => .ok true
+  layout := fun st _ localId =>
+    match lookupLocalDeclLayout localDecls layouts localId with
+    | some l => ⟨st, .ok l⟩
+    | none => ⟨st, .error (.missingLocalType localId)⟩
+  isSized := fun l => l.layout.isSized
+  afterLocalWrite := fun st _ _ => ⟨st, .ok ()⟩
+  allocateDyn := fun st _ _ =>
+    ⟨st, .error (.allocationFailure "unsized locals are outside the scalar fragment")⟩
+  deallocateStack := fun st _ =>
+    ⟨st, .error (.deallocationFailure "memory-backed locals are outside the scalar fragment")⟩
+
+/-- Run a current-frame storage operation (`Frame.storageLive` or
+`Frame.storageDead`), writing back the resulting frame and memory even when the
+operation fails, as `lean-miri`'s machine-level `MachineHooks.storageLiveDyn` and
+`MachineHooks.storageDead` do. -/
+def annealRunFrameStorage
+    (op : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit →
+      Miri.Memory.MemoryState AnnealProv Unit Unit →
+      Miri.Interpreter.LocalStorageResult AnnealProv Miri.Interpreter.LocalLayout Unit
+        (Miri.Memory.MemoryState AnnealProv Unit Unit))
+    (state : AnnealStepState) : Miri.Interpreter.StepResult AnnealStepState Unit :=
+  match state.stack.currentFrame? with
+  | none => (state, .error (.stack .emptyStack))
+  | some frame =>
+      let result := op frame state.machine
+      let idx := state.stack.frames.size - 1
+      if h : idx < state.stack.frames.size then
+        let state' : AnnealStepState :=
+          { stack := { frames := state.stack.frames.set idx result.frame h }
+            machine := result.state }
+        match result.outcome with
+        | .ok () => (state', .ok ())
+        | .error e => (state', .error (.stack e))
+      else
+        (state, .error (.stack .emptyStack))
 
 /-- `StepHooks` instantiated for Anneal's single-threaded machine. -/
 def annealStepHooks (localDecls : List LocalDecl := .nil)
@@ -995,29 +1067,13 @@ def annealStepHooks (localDecls : List LocalDecl := .nil)
   writeDiscriminant := fun _ _ _ state =>
     (state, .error (.unsupported "writeDiscriminant"))
   storageLive := fun _ localId state =>
-    match state.stack.currentFrame? with
-    | none => (state, .error (.stack .emptyStack))
-    | some frame =>
-        match frame.replaceLocalValue localId (.live (.immediate .uninit)) with
-        | .error _ => (state, .error (.undefinedBehavior "storageLive out-of-bounds local"))
-        | .ok updatedFrame =>
-            let idx := state.stack.frames.size - 1
-            if h : idx < state.stack.frames.size then
-              ({ state with stack := { frames := state.stack.frames.set idx updatedFrame h } }, .ok ())
-            else
-              (state, .error (.stack .emptyStack))
+    annealRunFrameStorage
+      (fun frame mem => frame.storageLive mem (annealLocalStorageHooks localDecls layouts) localId)
+      state
   storageDead := fun _ localId state =>
-    match state.stack.currentFrame? with
-    | none => (state, .error (.stack .emptyStack))
-    | some frame =>
-        match frame.replaceLocalValue localId .dead with
-        | .error _ => (state, .error (.undefinedBehavior "storageDead out-of-bounds local"))
-        | .ok updatedFrame =>
-            let idx := state.stack.frames.size - 1
-            if h : idx < state.stack.frames.size then
-              ({ state with stack := { frames := state.stack.frames.set idx updatedFrame h } }, .ok ())
-            else
-              (state, .error (.stack .emptyStack))
+    annealRunFrameStorage
+      (fun frame mem => frame.storageDead mem (annealLocalStorageHooks localDecls layouts) localId)
+      state
   intrinsic := fun _ _ state => (state, .error (.unsupported "intrinsic"))
   incrementConstEvalCounter := fun _ state => (state, .ok ())
   returnFromCurrentFrame := fun choice unwinding state =>

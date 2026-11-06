@@ -13,6 +13,7 @@ import Miri
 import LeanMiriSpec.Correspondence.Translate
 import LeanMiriSpec.Correspondence.Relation
 import LeanMiriSpec.Correspondence.Simulation
+import LeanMiriSpec.Correspondence.Witness
 
 /-!
 # Axiom Audit (`LeanMiriSpec.Audit`)
@@ -25,6 +26,20 @@ depends only on Lean's standard axioms (`propext`, `Quot.sound`,
 `#assert_all_leanmirispec_and_miri_standard_axioms` additionally walks every
 declaration across all `LeanMiriSpec.*` and `Miri.*` modules in `Lean.Environment`
 and verifies that none depends on any non-standard axiom.
+
+The `example`s at the end pin the exact statements of the headline results, so
+a later edit that weakens a hypothesis or conclusion fails this file even if the
+weakened theorem keeps its name:
+
+* `step_wellTypedBody_bisim`: the bidirectional step / normal-return /
+  undefined-behavior correspondence, stated on `stepMirFn` and
+  `Miri.Interpreter.Step.step` directly;
+* `Witness.bisim_applies`: a concrete body and initial states satisfy every
+  premise, so the correspondence is not vacuous (`Witness.divByZero_ub_agrees`
+  and `Witness.div_returns_agree` additionally run both machines on it);
+* `annealEvalOperand_move_eq_copy` and `annealStepHooks_storageDead_returnPlace`:
+  the hooks keep `lean-miri`'s source behavior for `Move` operands and for
+  `StorageDead(_0)` rather than imitating Anneal.
 -/
 
 namespace LeanMiriSpec.Audit
@@ -72,6 +87,17 @@ open LeanMiriSpec.Correspondence in
   step_terminator_goto_return_simulation
   WellTypedBody
   step_wellTypedBody_simulation
+  step_wellTypedBody_bisim
+  annealEvalOperand_move_eq_copy
+  annealLocalStorageHooks
+  annealStepHooks_storageLive_eq
+  annealStepHooks_storageDead_eq
+  annealStepHooks_storageDead_returnPlace
+  Witness.stateRel_init
+  Witness.wellTypedBody
+  Witness.bisim_applies
+  Witness.divByZero_ub_agrees
+  Witness.div_returns_agree
 
 /-- Exhaustively verify that every declaration across every imported
 `LeanMiriSpec.*` and `Miri.*` module in the environment depends only on Lean's
@@ -102,5 +128,59 @@ elab "#assert_all_leanmirispec_and_miri_standard_axioms" : command => do
   logInfo m!"LeanMiriSpec.Audit: exhaustively verified standard axioms for {specChecked} LeanMiriSpec.* declarations and {miriChecked} Miri.* declarations"
 
 #assert_all_leanmirispec_and_miri_standard_axioms
+
+/-! ## Statement pins -/
+
+section StatementPins
+
+open Trusted.Sequence
+open Trusted.Rustc.V2026_06_01
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+open LeanMiriSpec.Correspondence
+
+example {body : CapturedMir} {nonAddrTaken : Nat → Prop}
+    {s : MachineState} {m : AnnealStepState}
+    (hbody : WellTypedBody body nonAddrTaken)
+    (hstate : StateRel body s m)
+    (hloc : ValidFrameLocation body s.frame)
+    (himm : NonAddrTakenImmediate body nonAddrTaken m) :
+    ((∃ s', stepMirFn body s = .step s' ∧
+        StateRel body s' (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).1) ↔
+      ((Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).2 = .ok true ∧
+        (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).1.stack.frames ≠ #[])) ∧
+    ((∃ retVal mem', stepMirFn body s = .retNormal retVal mem') ↔
+      ((Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).2 = .ok true ∧
+        (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).1.stack.frames = #[])) ∧
+    (stepMirFn body s = .fail .ub ↔
+      ∃ msg, (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).2 =
+        .error (.undefinedBehavior msg)) ∧
+    ((∃ s', stepMirFn body s = .step s') ∨
+      (∃ retVal mem', stepMirFn body s = .retNormal retVal mem') ∨
+      stepMirFn body s = .fail .ub) :=
+  step_wellTypedBody_bisim hbody hstate hloc himm
+
+example (divisor : Nat) (hd : divisor < 256) :
+    WellTypedBody (Witness.divBody divisor) ∧
+    StateRel (Witness.divBody divisor) (Witness.annealInit divisor) (Witness.miriInit divisor) ∧
+    ValidFrameLocation (Witness.divBody divisor) (Witness.annealInit divisor).frame ∧
+    NonAddrTakenImmediate (Witness.divBody divisor) (fun _ => True) (Witness.miriInit divisor) :=
+  ⟨Witness.wellTypedBody divisor hd, Witness.stateRel_init divisor, ⟨_, rfl, Nat.zero_le _⟩,
+    NonAddrTakenImmediate.of_live_nil _ (Witness.stateRel_init divisor) rfl⟩
+
+example (localDecls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable)
+    (place : Miri.MIR.Place) (known : Option Miri.Interpreter.LocalLayout) :
+    annealEvalOperand localDecls layouts (.Move place) known =
+      annealEvalOperand localDecls layouts (.Copy place) known :=
+  annealEvalOperand_move_eq_copy localDecls layouts place known
+
+example {localDecls : List MirAst.LocalDecl} {layouts : Layout.LayoutTable} {m : AnnealStepState}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[topFrame]) :
+    (annealStepHooks localDecls layouts).storageDead () 0 m =
+      (m, .error (.stack .cannotMakeReturnPlaceDead)) :=
+  annealStepHooks_storageDead_returnPlace hframes
+
+end StatementPins
 
 end LeanMiriSpec.Audit

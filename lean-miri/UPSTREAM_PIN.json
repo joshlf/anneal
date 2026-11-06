@@ -1,15 +1,33 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "repository": "https://github.com/proofs-rs/lean-miri.git",
   "commit": "c92d1d9754c9dd585b6b9d6949ae67e5e4665d6a",
-  "lean_toolchain": "leanprover/lean4:v4.34.1",
+  "upstream_lean_toolchain": "leanprover/lean4:v4.35.0",
+  "build_lean_toolchain": "leanprover/lean4:v4.34.1",
   "upstream_pins": {
     "miri_commit": "7fa591d7d4dd9af8154becbc8332f8096f8323b1",
     "rustc_commit": "8144389c895da997dbdecaa635e41d6a50be6ffd",
-    "rustc_commit_brief_ref": "8144389c895da997dbdecaa635e44d6a50be6ffd",
     "rustc_apfloat_commit": "eeaacad81247af65d4043cb3e32d023a652d7951",
     "aes_commit": "c1534361e7549e29a16c3505f45a04c92d26b62a",
     "source_lock_sha256": "371f3b91e61ff027121b9706a15aac9b6f272ef1cb5ce0d150707a9cf8883873"
+  },
+  "notes": [
+    "upstream_lean_toolchain is the lean-toolchain file at the pinned commit; build_lean_toolchain is examples/lean-toolchain, the toolchain Anneal builds the vendored sources with.",
+    "The LM-1.1 brief cites rustc commit 8144389c895da997dbdecaa635e44d6a50be6ffd; upstream/.pins/rustc.commit at the pinned commit records 8144389c895da997dbdecaa635e41d6a50be6ffd, which is authoritative.",
+    "upstream_git_objects are git object ids at the pinned commit (`git rev-parse <commit>:<path>` in a clone of the repository); the audit recomputes them from the vendored bytes and file modes."
+  ],
+  "upstream_git_objects": {
+    "Miri": "ef473f04eed9bbfed474a7b5f6f91a2f6350c41b",
+    "LICENSE-APACHE": "1b5ec8b78e237b5c3b3d812a7c0a6589d0f7161d",
+    "LICENSE-MIT": "31aa79387f27e730e33d871925e152e35e428031",
+    "tools/check_implementation_ledger.py": "e1879ecc717b1ec24d8f4d51fa84835693b6d69b",
+    "tools/check_semantic_sources.py": "7a9d8f8628d536ac3eab665c578fa7901c3efb09",
+    "upstream/.pins/aes.commit": "2aadc7ac8eb1930b6dbdf28d4c6443f805038d6a",
+    "upstream/.pins/miri.commit": "3dff1349544fc7ef71be7266ee7437817efa0b18",
+    "upstream/.pins/rustc.commit": "60438fb681c3b95d7163a689a5e2cb0d54cc1ef3",
+    "upstream/.pins/rustc_apfloat.commit": "e3e2ad8b3762b9b9dffa17c6ec9f9ad3544d54f5",
+    "upstream/source-lock.json": "503d1c21ca5096c1cdbec40d235da58c1f12efd0",
+    "Miri.lean": "4c2b87b06a1786f369cc6ae26e94b3cc72652d85"
   },
   "vendor_tree": {
     "file_count": 608,
@@ -2448,5 +2466,43 @@
         "sha256": "e1aeb74ebecd73ac5dd4d48bf2796584343fb60ded7080edbe8cbb4d999391e6"
       }
     ]
-  }
+  },
+  "vendor_aux_files": [
+    {
+      "path": "LICENSE-APACHE",
+      "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+    },
+    {
+      "path": "LICENSE-MIT",
+      "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+    },
+    {
+      "path": "tools/check_implementation_ledger.py",
+      "sha256": "ea513e223ad6fe25cfba13bd3cf851044a6ffc6511de839c281732440cd7a857"
+    },
+    {
+      "path": "tools/check_semantic_sources.py",
+      "sha256": "95772b5a51b054cde4f6e20f3864671a2b1d992acd8a44ca71b4dcf0b5010778"
+    },
+    {
+      "path": "upstream/.pins/aes.commit",
+      "sha256": "59fdb9c131aeabd04bc58dfb229c0a2210997ea074cfdb064aada94f9c61ad01"
+    },
+    {
+      "path": "upstream/.pins/miri.commit",
+      "sha256": "3aa283e01b1a2ede57c97fed097bd2044dad4c2f051baf108c51e2574e6750d6"
+    },
+    {
+      "path": "upstream/.pins/rustc.commit",
+      "sha256": "264a4b122908bb735f405491139bdf8bff9c470f98e27457645dfc4a1813850d"
+    },
+    {
+      "path": "upstream/.pins/rustc_apfloat.commit",
+      "sha256": "a3e6284caf9b7b398b587d2371c1f3aa8804bc6e9d3e56a25048f38fc1438af6"
+    },
+    {
+      "path": "upstream/source-lock.json",
+      "sha256": "371f3b91e61ff027121b9706a15aac9b6f272ef1cb5ce0d150707a9cf8883873"
+    }
+  ]
 }

@@ -2436,6 +2436,106 @@ theorem frame_replaceLocalValue_of_lt
   unfold Miri.Interpreter.Frame.replaceLocalValue
   simp [hlt, pure, Except.pure]
 
+theorem translateBody_locals_getElem? (body : CapturedMir) (i : Nat) :
+    (translateBody body).locals[i]? = (get? body.localDecls i).map (fun d => encodeTyId d.ty) := by
+  simp [translateBody, get?]
+
+@[simp] theorem annealLocalStorageHooks_veryTriviallySized
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (ty : Miri.MIR.TyId) :
+    (annealLocalStorageHooks localDecls layouts).veryTriviallySized ty = .ok true := rfl
+
+@[simp] theorem annealLocalStorageHooks_afterLocalWrite
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (st : Miri.Memory.MemoryState AnnealProv Unit Unit) (l : Nat) (b : Bool) :
+    (annealLocalStorageHooks localDecls layouts).afterLocalWrite st l b = ⟨st, .ok ()⟩ := rfl
+
+/-- Only memory-backed locals own an allocation, so `deallocate_local` of any
+other local value is a no-op. -/
+theorem annealLocalStorageHooks_deallocateLocal_of_not_indirect
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (st : Miri.Memory.MemoryState AnnealProv Unit Unit)
+    (v : Miri.Interpreter.LocalValue AnnealProv)
+    (hv : ∀ mp, v ≠ .live (.indirect mp)) :
+    Miri.Interpreter.Frame.deallocateLocal (annealLocalStorageHooks localDecls layouts) st v =
+      ⟨st, .ok ()⟩ := by
+  unfold Miri.Interpreter.Frame.deallocateLocal
+  cases v with
+  | dead => rfl
+  | live op =>
+    cases op with
+    | immediate _ => rfl
+    | indirect mp => exact absurd rfl (hv mp)
+
+/-- `lean-miri`'s source `storage_live_dyn` (`Frame.storageLive`) on a
+non-memory-backed local makes it `.live (.immediate .uninit)`, keeping its cached
+layout and the memory unchanged. -/
+theorem annealStepHooks_storageLive_eq
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {m : AnnealStepState}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {loc : Nat} (hframes : m.stack.frames = #[topFrame])
+    (hlt : loc < topFrame.locals.size)
+    (hty : ∃ ty, topFrame.body.locals[loc]? = some ty)
+    (hnotIndirect : ∀ mp, (topFrame.locals[loc]'hlt).value ≠ .live (.indirect mp)) :
+    (annealStepHooks localDecls layouts).storageLive () loc m =
+      ({ m with
+          stack := ⟨#[{ topFrame with
+            locals := topFrame.locals.set loc
+              { topFrame.locals[loc]'hlt with value := .live (.immediate .uninit) } hlt }]⟩ },
+        .ok ()) := by
+  obtain ⟨ty, hty⟩ := hty
+  have hget : topFrame.getLocal loc = .ok (topFrame.locals[loc]'hlt) := by
+    unfold Miri.Interpreter.Frame.getLocal
+    simp [hlt, pure, Except.pure]
+  simp only [annealStepHooks, annealRunFrameStorage, stack_currentFrame?_singleton m.stack topFrame hframes]
+  simp only [Miri.Interpreter.Frame.storageLive, Miri.Interpreter.Frame.storageLiveDyn, hget, hty,
+    annealLocalStorageHooks_veryTriviallySized, annealLocalStorageHooks_afterLocalWrite,
+    Miri.Interpreter.MemPlaceMeta.hasMeta,
+    frame_replaceLocalValue_of_lt topFrame loc hlt,
+    annealLocalStorageHooks_deallocateLocal_of_not_indirect localDecls layouts m.machine _ hnotIndirect,
+    Id.run, hframes, pure_bind, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+  rfl
+
+/-- `lean-miri`'s source `storage_dead` (`Frame.storageDead`) on a
+non-memory-backed local other than the return place makes it `.dead`, keeping
+its cached layout and the memory unchanged. -/
+theorem annealStepHooks_storageDead_eq
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {m : AnnealStepState}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {loc : Nat} (hframes : m.stack.frames = #[topFrame])
+    (hlt : loc < topFrame.locals.size) (hne : loc ≠ 0)
+    (hnotIndirect : ∀ mp, (topFrame.locals[loc]'hlt).value ≠ .live (.indirect mp)) :
+    (annealStepHooks localDecls layouts).storageDead () loc m =
+      ({ m with
+          stack := ⟨#[{ topFrame with
+            locals := topFrame.locals.set loc
+              { topFrame.locals[loc]'hlt with value := .dead } hlt }]⟩ },
+        .ok ()) := by
+  have hget : topFrame.getLocal loc = .ok (topFrame.locals[loc]'hlt) := by
+    unfold Miri.Interpreter.Frame.getLocal
+    simp [hlt, pure, Except.pure]
+  have hbeq : (loc == 0) = false := by simpa using hne
+  simp only [annealStepHooks, annealRunFrameStorage, stack_currentFrame?_singleton m.stack topFrame hframes]
+  simp only [Miri.Interpreter.Frame.storageDead, hbeq, hget,
+    frame_replaceLocalValue_of_lt topFrame loc hlt,
+    annealLocalStorageHooks_deallocateLocal_of_not_indirect localDecls layouts m.machine _ hnotIndirect,
+    Id.run, hframes, Bool.false_eq_true, ↓reduceIte]
+  rfl
+
+/-- As in `lean-miri` (and rustc), `StorageDead` of the return place `_0` fails
+with `StackError.cannotMakeReturnPlaceDead`, which is not undefined behavior. -/
+theorem annealStepHooks_storageDead_returnPlace
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {m : AnnealStepState}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[topFrame]) :
+    (annealStepHooks localDecls layouts).storageDead () 0 m =
+      (m, .error (.stack .cannotMakeReturnPlaceDead)) := by
+  simp only [annealStepHooks, annealRunFrameStorage, stack_currentFrame?_singleton m.stack topFrame hframes]
+  simp only [Miri.Interpreter.Frame.storageDead, Id.run, hframes]
+  rcases m with ⟨⟨frames⟩, machine⟩
+  dsimp only at hframes
+  subst hframes
+  rfl
+
 theorem FrameRel.lookup_local
     {body : CapturedMir} {mem : Miri.Memory.MemoryState AnnealProv Unit Unit}
     {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
@@ -2812,7 +2912,14 @@ theorem annealWriteImmediate_live
     rfl
 
 /-- Syntactic well-typedness of a scalar or scalar-pair `MirAst.Operand` in `body`
-relative to `topFrame`. -/
+relative to `topFrame`.
+
+`Operand.move` is deliberately absent. Anneal's `evalOperand` deinitializes a
+moved-from root local, whereas `lean-miri` (like the pinned rustc) leaves it
+unchanged, so after a move the two states differ in exactly that local and a
+later read of it is undefined behavior only in Anneal. Relating moves needs a
+refinement argument (or a static no-use-after-move invariant) that lockstep
+`StepRel` cannot express. -/
 inductive WellTypedScalarOperand
     (body : CapturedMir)
     (topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit) :
@@ -2830,11 +2937,6 @@ inductive WellTypedScalarOperand
       (translateTy decl.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO →
       IsImmediateFrameLocal topFrame idx →
       WellTypedScalarOperand body topFrame (.copy ⟨idx, .nil⟩) decl.ty
-  | moveLocal (idx : Local) (decl : LocalDecl) :
-      get? body.localDecls idx = some decl →
-      (translateTy decl.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO →
-      IsImmediateFrameLocal topFrame idx →
-      WellTypedScalarOperand body topFrame (.move ⟨idx, .nil⟩) decl.ty
 
 theorem WellTypedScalarOperand.mono_immediate
     {body : CapturedMir}
@@ -2848,8 +2950,6 @@ theorem WellTypedScalarOperand.mono_immediate
     exact .constScalar c sc hval hprim hsz hcan hlaysz hbool
   | copyLocal idx decl hdecl hsz himm =>
     exact .copyLocal idx decl hdecl hsz (hmono idx himm)
-  | moveLocal idx decl hdecl hsz himm =>
-    exact .moveLocal idx decl hdecl hsz (hmono idx himm)
 
 /-- Joint outcome relation for `evalOperand` (Anneal) vs
 `annealEvalOperand >>= annealReadImmediate` (`lean-miri`). -/
@@ -2885,7 +2985,13 @@ theorem WellTypedScalarOperand.operandTy_eq
   cases h with
   | constScalar _ _ _ _ _ _ _ _ => rfl
   | copyLocal idx decl hdecl _ _ => simp [operandTy, resolveProjectedTy, hdecl]
-  | moveLocal idx decl hdecl _ _ => simp [operandTy, resolveProjectedTy, hdecl]
+
+/-- `annealEvalOperand` gives `Move` exactly the behavior of `Copy`, as
+`lean-miri`'s source operand evaluators do: no invented move invalidation. -/
+theorem annealEvalOperand_move_eq_copy (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (place : Miri.MIR.Place) (known : Option Miri.Interpreter.LocalLayout) :
+    annealEvalOperand localDecls layouts (.Move place) known =
+      annealEvalOperand localDecls layouts (.Copy place) known := rfl
 
 theorem annealEvalOperand_copy_dead
     {body : CapturedMir} {m : AnnealStepState}
@@ -2926,87 +3032,6 @@ theorem annealEvalOperand_copy_live
       get, getThe, MonadStateOf.get, EStateM.get, Bind.bind, EStateM.bind,
       Pure.pure, EStateM.pure, stack_currentFrame?_singleton m.stack topFrame hframes,
       hget, cachedLayout_orElse_lookupLocalDeclLayout_orElse hdecl hcache]
-
-theorem annealEvalOperand_move_dead
-    {body : CapturedMir} {m : AnnealStepState}
-    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
-    {idx : Nat} {decl : LocalDecl}
-    {lay : Option Miri.Interpreter.LocalLayout}
-    {known : Option Miri.Interpreter.LocalLayout}
-    (hframes : m.stack.frames = #[topFrame])
-    (hdecl : get? body.localDecls idx = some decl)
-    (hget : topFrame.getLocal idx = .ok ⟨.dead, lay⟩)
-    (hcache : ∀ l, lay = some l → l = translateTy decl.ty body.layouts) :
-    annealEvalOperand body.localDecls body.layouts (.Move ⟨idx, #[]⟩) known m =
-      .error (.undefinedBehavior "read of dead local") m := by
-  with_unfolding_all
-    unfold annealEvalOperand
-    simp only [Array.isEmpty_empty, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
-      get, getThe, MonadStateOf.get, EStateM.get, Bind.bind, EStateM.bind,
-      Pure.pure, EStateM.pure, stack_currentFrame?_singleton m.stack topFrame hframes,
-      hget, cachedLayout_orElse_lookupLocalDeclLayout_orElse hdecl hcache]
-    rfl
-
-theorem annealEvalOperand_move_uninit
-    {body : CapturedMir} {m : AnnealStepState}
-    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
-    {idx : Nat} {decl : LocalDecl}
-    {lay : Option Miri.Interpreter.LocalLayout}
-    {known : Option Miri.Interpreter.LocalLayout}
-    (hframes : m.stack.frames = #[topFrame])
-    (hdecl : get? body.localDecls idx = some decl)
-    (hget : topFrame.getLocal idx = .ok ⟨.live (.immediate .uninit), lay⟩)
-    (hcache : ∀ l, lay = some l → l = translateTy decl.ty body.layouts) :
-    annealEvalOperand body.localDecls body.layouts (.Move ⟨idx, #[]⟩) known m =
-      .error (.undefinedBehavior "move of uninitialized local") m := by
-  with_unfolding_all
-    unfold annealEvalOperand
-    simp only [Array.isEmpty_empty, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
-      get, getThe, MonadStateOf.get, EStateM.get, Bind.bind, EStateM.bind,
-      Pure.pure, EStateM.pure, stack_currentFrame?_singleton m.stack topFrame hframes,
-      hget, cachedLayout_orElse_lookupLocalDeclLayout_orElse hdecl hcache]
-    rfl
-
-theorem annealEvalOperand_move_live_imm
-    {body : CapturedMir} {m : AnnealStepState}
-    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
-    {idx : Nat} {decl : LocalDecl}
-    {imm : Miri.Interpreter.Immediate AnnealProv}
-    {lay : Option Miri.Interpreter.LocalLayout}
-    {known : Option Miri.Interpreter.LocalLayout}
-    (hframes : m.stack.frames = #[topFrame])
-    (hlt : idx < topFrame.locals.size)
-    (hdecl : get? body.localDecls idx = some decl)
-    (hget : topFrame.getLocal idx = .ok ⟨.live (.immediate imm), lay⟩)
-    (hne : imm ≠ .uninit)
-    (hcache : ∀ l, lay = some l → l = translateTy decl.ty body.layouts) :
-    annealEvalOperand body.localDecls body.layouts (.Move ⟨idx, #[]⟩) known m =
-      .ok ⟨.immediate imm, translateTy decl.ty body.layouts⟩
-        { m with
-          stack :=
-            ⟨#[{ topFrame with
-                  locals := topFrame.locals.set idx
-                    { topFrame.locals[idx]'hlt with value := .live (.immediate .uninit) } hlt }]⟩ } := by
-  cases imm with
-  | uninit => exact False.elim (hne rfl)
-  | scalar s =>
-    with_unfolding_all
-      unfold annealEvalOperand
-      simp only [Array.isEmpty_empty, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
-        get, getThe, MonadStateOf.get, EStateM.get, Bind.bind, EStateM.bind,
-        Pure.pure, EStateM.pure, stack_currentFrame?_singleton m.stack topFrame hframes,
-        hframes, hget, cachedLayout_orElse_lookupLocalDeclLayout_orElse hdecl hcache,
-        frame_replaceLocalValue_of_lt topFrame idx hlt (.live (.immediate .uninit))]
-      rfl
-  | scalarPair s1 s2 =>
-    with_unfolding_all
-      unfold annealEvalOperand
-      simp only [Array.isEmpty_empty, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
-        get, getThe, MonadStateOf.get, EStateM.get, Bind.bind, EStateM.bind,
-        Pure.pure, EStateM.pure, stack_currentFrame?_singleton m.stack topFrame hframes,
-        hframes, hget, cachedLayout_orElse_lookupLocalDeclLayout_orElse hdecl hcache,
-        frame_replaceLocalValue_of_lt topFrame idx hlt (.live (.immediate .uninit))]
-      rfl
 
 theorem evalOperand_scalar_simulation
     {body : CapturedMir} {af : StackFrame}
@@ -3077,52 +3102,6 @@ theorem evalOperand_scalar_simulation
         rw [ha, EStateM.bind_eq_ok (annealEvalOperand_copy_live hframes hdecl hget hcache),
           hread, ← hsame]
         exact .ok v af.locals topFrame imm hframe himmRel (fun _ h => h) rfl
-  | moveLocal idx decl hdecl hsz_nz himm =>
-    obtain ⟨slot, mls, hlt_af, hlt_mf, hslot, hmls, hmls_eq, hloc⟩ := hframe.lookup_local hdecl
-    have hget := frame_getLocal_of_getElem? topFrame idx mls hmls
-    have hcache := hloc.layout_eq
-    have himm' := himm mls hmls
-    have htr : translateOperand (.move ⟨idx, .nil⟩) = .Move ⟨idx, #[]⟩ := rfl
-    rw [htr]
-    cases hloc with
-    | dead cachedLayout _ =>
-      have ha : evalOperand af.locals (.move ⟨idx, .nil⟩) .nil globals body.layouts .nil = .ub := by
-        simp [evalOperand, hslot]
-      rw [ha, EStateM.bind_eq_error (annealEvalOperand_move_dead hframes hdecl hget hcache)]
-      exact .ub m _
-    | indirect _ mp _ _ _ _ =>
-      exact False.elim (himm' mp rfl)
-    | immediate _ imm cachedLayout hc hval =>
-      rcases hval with ⟨rfl, rfl⟩ | ⟨v, rfl, himmRel⟩
-      · have ha : evalOperand af.locals (.move ⟨idx, .nil⟩) .nil globals body.layouts .nil = .ub := by
-          simp [evalOperand, hslot]
-        rw [ha, EStateM.bind_eq_error (annealEvalOperand_move_uninit hframes hdecl hget hcache)]
-        exact .ub m _
-      · have ha : evalOperand af.locals (.move ⟨idx, .nil⟩) .nil globals body.layouts .nil =
-            .ok v (af.locals.set idx .uninit) := by
-          simp [evalOperand, hslot, set?_eq_some_set hlt_af]
-        obtain ⟨_, hne⟩ :=
-          annealReadImmediate_of_immediateRel himmRel hsz_nz (translateTy decl.ty body.layouts) m
-        let m' : AnnealStepState :=
-          { m with
-            stack :=
-              ⟨#[{ topFrame with
-                    locals := topFrame.locals.set idx
-                      { topFrame.locals[idx]'hlt_mf with value := .live (.immediate .uninit) } hlt_mf }]⟩ }
-        obtain ⟨hread', _⟩ :=
-          annealReadImmediate_of_immediateRel himmRel hsz_nz (translateTy decl.ty body.layouts) m'
-        rw [ha,
-          EStateM.bind_eq_ok (annealEvalOperand_move_live_imm hframes hlt_mf hdecl hget hne hcache),
-          hread']
-        have hloc_new : LocalRel m.machine decl body.layouts .uninit
-            { topFrame.locals[idx]'hlt_mf with value := .live (.immediate .uninit) } := by
-          rw [hmls_eq]
-          exact .immediate .uninit .uninit cachedLayout hc (Or.inl ⟨rfl, rfl⟩)
-        exact .ok v (af.locals.set idx .uninit) _ imm
-          (hframe.update_local hdecl .uninit (.live (.immediate .uninit)) hloc_new)
-          himmRel
-          (fun _ hj => hj.set_immediate hlt_mf .uninit)
-          rfl
 
 /-! ### 5.3 Public Mirrors & Operator-Result Shape Lemmas for `ScalarOps` / `Rvalue` -/
 
@@ -3688,7 +3667,7 @@ inductive WellTypedScalarRvalue
       WellTypedScalarRvalue body topFrame (.binaryOp bop lhsOp rhsOp) dstTy
 
 /-- Syntactic well-typedness of a scalar `MirAst.Statement` in `LM-1.1`, covering
-`nop`, `storageLive`, `storageDead`, and `assign` of constants, copies, moves,
+`nop`, `storageLive`, `storageDead`, and `assign` of constants, copies,
 unary `Neg`/`Not`, and arithmetic/checked/comparison/bitwise/shift binary operators. -/
 inductive WellTypedScalarStmt
     (body : CapturedMir)
@@ -3700,10 +3679,16 @@ inductive WellTypedScalarStmt
   | storageLive (stmt : Statement) (loc : Local) (decl : LocalDecl) :
       stmt.kind = .storageLive loc →
       get? body.localDecls loc = some decl →
+      IsImmediateFrameLocal topFrame loc →
       WellTypedScalarStmt body topFrame stmt
+  /-- `StorageDead` of the return place `_0` is excluded: rustc's MIR validator
+  forbids it, and `lean-miri` rejects it with `cannotMakeReturnPlaceDead`
+  while Anneal accepts it. -/
   | storageDead (stmt : Statement) (loc : Local) (decl : LocalDecl) :
       stmt.kind = .storageDead loc →
       get? body.localDecls loc = some decl →
+      loc ≠ 0 →
+      IsImmediateFrameLocal topFrame loc →
       WellTypedScalarStmt body topFrame stmt
   | assign (stmt : Statement) (dstIdx : Local) (dstDecl : LocalDecl) (rv : MirAst.Rvalue) :
       stmt.kind = .assign ⟨dstIdx, .nil⟩ rv →
@@ -4351,7 +4336,7 @@ theorem estate_bind_pure_assoc {ε σ α β γ : Type}
 /-- Theorem 5 (`LM-1.1`): Small-step statement simulation (`step_assign_scalar_simulation`)
 between Anneal's `stepMirFn` and `lean-miri`'s `Miri.Interpreter.Step.step` for
 `StatementKind.nop`, `StatementKind.storageLive`, `StatementKind.storageDead`, and
-`StatementKind.assign` of scalar constants, local copies/moves, unary `Neg`/`Not`,
+`StatementKind.assign` of scalar constants, local copies, unary `Neg`/`Not`,
 and arithmetic (`Add`, `Sub`, `Mul`, `Div`, `Rem`), unchecked (`AddUnchecked`,
 `SubUnchecked`, `MulUnchecked`), checked (`AddWithOverflow`, `SubWithOverflow`,
 `MulWithOverflow`), comparison (`Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`), bitwise
@@ -4392,7 +4377,7 @@ theorem step_assign_scalar_simulation
       rfl hretCont ⟨retLay, hretPlace⟩
       ⟨hframe.body_eq, rfl, hframe.af_locals_len, hframe.mf_locals_size, hframe.locals_rel⟩
       hcal hstack hbor hprot hcaller
-  | storageLive loc decl hkind hdecl =>
+  | storageLive loc decl hkind hdecl himm_loc =>
     obtain ⟨slot, mls, hlt_af, hlt_mf, hslot, hmls, hmls_eq, hloc⟩ := hframe.lookup_local hdecl
     have ha : evalStmt s stmt body.localDecls body.layouts =
         MirStepNode.step (advanceStmt s (s.frame.locals.set loc .uninit)) := by
@@ -4401,16 +4386,17 @@ theorem step_assign_scalar_simulation
       { topFrame with
         locals := topFrame.locals.set loc
           { topFrame.locals[loc]'hlt_mf with value := .live (.immediate .uninit) } hlt_mf }
+    have hty : ∃ ty, topFrame.body.locals[loc]? = some ty := by
+      rw [hframe.body_eq, translateBody_locals_getElem?, hdecl]
+      exact ⟨_, rfl⟩
+    have hnotInd : ∀ mp, (topFrame.locals[loc]'hlt_mf).value ≠ .live (.indirect mp) := by
+      rw [hmls_eq]; exact himm_loc mls hmls
     have hm : Miri.Interpreter.Step.evalStatement
         (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
         ({ m with stack := ⟨#[topFrame']⟩ }, .ok ()) := by
       unfold Miri.Interpreter.Step.evalStatement translateStmt
       rw [hkind]
-      dsimp only [translateStmtKind, annealStepHooks]
-      rw [stack_currentFrame?_singleton m.stack topFrame hframes]
-      dsimp only
-      rw [frame_replaceLocalValue_of_lt topFrame loc hlt_mf (.live (.immediate .uninit)), hframes]
-      rfl
+      exact annealStepHooks_storageLive_eq hframes hlt_mf hty hnotInd
     have hloc' : topFrame'.location = .mir ⟨s.frame.blockIdx, s.frame.stmtIdx⟩ := hframe.location_eq
     rw [ha, miri_step_at_statement_ok _ hframes hframe.body_eq hframe.location_eq hbb hstmt
       hm rfl hloc']
@@ -4425,7 +4411,7 @@ theorem step_assign_scalar_simulation
       rfl hretCont ⟨retLay, hretPlace⟩
       ⟨hfr'.body_eq, rfl, hfr'.af_locals_len, hfr'.mf_locals_size, hfr'.locals_rel⟩
       hcal hstack hbor hprot hcaller
-  | storageDead loc decl hkind hdecl =>
+  | storageDead loc decl hkind hdecl hne himm_loc =>
     obtain ⟨slot, mls, hlt_af, hlt_mf, hslot, hmls, hmls_eq, hloc⟩ := hframe.lookup_local hdecl
     have ha : evalStmt s stmt body.localDecls body.layouts =
         MirStepNode.step (advanceStmt s (s.frame.locals.set loc .dead)) := by
@@ -4434,16 +4420,14 @@ theorem step_assign_scalar_simulation
       { topFrame with
         locals := topFrame.locals.set loc
           { topFrame.locals[loc]'hlt_mf with value := .dead } hlt_mf }
+    have hnotInd : ∀ mp, (topFrame.locals[loc]'hlt_mf).value ≠ .live (.indirect mp) := by
+      rw [hmls_eq]; exact himm_loc mls hmls
     have hm : Miri.Interpreter.Step.evalStatement
         (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
         ({ m with stack := ⟨#[topFrame']⟩ }, .ok ()) := by
       unfold Miri.Interpreter.Step.evalStatement translateStmt
       rw [hkind]
-      dsimp only [translateStmtKind, annealStepHooks]
-      rw [stack_currentFrame?_singleton m.stack topFrame hframes]
-      dsimp only
-      rw [frame_replaceLocalValue_of_lt topFrame loc hlt_mf .dead, hframes]
-      rfl
+      exact annealStepHooks_storageDead_eq hframes hlt_mf hne hnotInd
     have hloc' : topFrame'.location = .mir ⟨s.frame.blockIdx, s.frame.stmtIdx⟩ := hframe.location_eq
     rw [ha, miri_step_at_statement_ok _ hframes hframe.body_eq hframe.location_eq hbb hstmt
       hm rfl hloc']
@@ -5094,11 +5078,6 @@ inductive WellTypedScalarOperandSyn
       (translateTy decl.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO →
       nonAddrTaken idx →
       WellTypedScalarOperandSyn body nonAddrTaken (.copy ⟨idx, .nil⟩) decl.ty
-  | moveLocal (idx : Local) (decl : LocalDecl) :
-      get? body.localDecls idx = some decl →
-      (translateTy decl.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO →
-      nonAddrTaken idx →
-      WellTypedScalarOperandSyn body nonAddrTaken (.move ⟨idx, .nil⟩) decl.ty
 
 /-- Purely syntactic rvalue well-typedness on `CapturedMir`. -/
 inductive WellTypedScalarRvalueSyn
@@ -5128,10 +5107,13 @@ inductive WellTypedScalarStmtSyn
   | storageLive (stmt : Statement) (loc : Local) (decl : LocalDecl) :
       stmt.kind = .storageLive loc →
       get? body.localDecls loc = some decl →
+      nonAddrTaken loc →
       WellTypedScalarStmtSyn body nonAddrTaken stmt
   | storageDead (stmt : Statement) (loc : Local) (decl : LocalDecl) :
       stmt.kind = .storageDead loc →
       get? body.localDecls loc = some decl →
+      loc ≠ 0 →
+      nonAddrTaken loc →
       WellTypedScalarStmtSyn body nonAddrTaken stmt
   | assign (stmt : Statement) (dstIdx : Local) (dstDecl : LocalDecl) (rv : MirAst.Rvalue) :
       stmt.kind = .assign ⟨dstIdx, .nil⟩ rv →
@@ -5203,8 +5185,6 @@ theorem WellTypedScalarOperandSyn.toFrame
     exact .constScalar c sc hval hprim hsz hcan hlaysz hbool
   | copyLocal idx decl hdecl hsz hna =>
     exact .copyLocal idx decl hdecl hsz (himm topFrame hframes idx decl hdecl hna)
-  | moveLocal idx decl hdecl hsz hna =>
-    exact .moveLocal idx decl hdecl hsz (himm topFrame hframes idx decl hdecl hna)
 
 theorem WellTypedScalarRvalueSyn.toFrame
     {body : CapturedMir} {nonAddrTaken : Nat → Prop}
@@ -5235,8 +5215,10 @@ theorem WellTypedScalarStmtSyn.toFrame
     WellTypedScalarStmt body topFrame stmt := by
   cases h with
   | nop hkind => exact .nop stmt hkind
-  | storageLive loc decl hkind hdecl => exact .storageLive stmt loc decl hkind hdecl
-  | storageDead loc decl hkind hdecl => exact .storageDead stmt loc decl hkind hdecl
+  | storageLive loc decl hkind hdecl hna =>
+    exact .storageLive stmt loc decl hkind hdecl (himm topFrame hframes loc decl hdecl hna)
+  | storageDead loc decl hkind hdecl hne hna =>
+    exact .storageDead stmt loc decl hkind hdecl hne (himm topFrame hframes loc decl hdecl hna)
   | assign dstIdx dstDecl rv hkind hdecl hna hrv =>
     exact .assign stmt dstIdx dstDecl rv hkind hdecl
       (himm topFrame hframes dstIdx dstDecl hdecl hna)
@@ -5279,6 +5261,47 @@ theorem step_wellTypedBody_simulation
     · exact Or.inl ⟨target, hgoto⟩
     · exact Or.inr ⟨hret, decl0, hdecl0, hsz0,
         fun tf hframes => himm tf hframes 0 decl0 hdecl0 hna0⟩
+
+/-- The `LM-1.1` correspondence stated directly on the two step functions,
+without `StepRel`. Under `StateRel` and the syntactic `WellTypedBody`
+fragment:
+
+1. Anneal steps within the frame, to a state related to `lean-miri`'s
+   post-state, iff `lean-miri` continues (`.ok true`) with a nonempty stack;
+2. Anneal returns normally from the root frame iff `lean-miri` continues
+   (`.ok true`) after popping the root frame;
+3. Anneal reports undefined behavior iff `lean-miri` reports
+   `StepError.undefinedBehavior`; and
+4. Anneal produces no other outcome (in particular no `unsupported` and no
+   failure other than undefined behavior). -/
+theorem step_wellTypedBody_bisim
+    {body : CapturedMir} {nonAddrTaken : Nat → Prop}
+    {s : MachineState} {m : AnnealStepState}
+    (hbody : WellTypedBody body nonAddrTaken)
+    (hstate : StateRel body s m)
+    (hloc : ValidFrameLocation body s.frame)
+    (himm : NonAddrTakenImmediate body nonAddrTaken m) :
+    ((∃ s', stepMirFn body s = .step s' ∧
+        StateRel body s' (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).1) ↔
+      ((Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).2 = .ok true ∧
+        (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).1.stack.frames ≠ #[])) ∧
+    ((∃ retVal mem', stepMirFn body s = .retNormal retVal mem') ↔
+      ((Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).2 = .ok true ∧
+        (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).1.stack.frames = #[])) ∧
+    (stepMirFn body s = .fail .ub ↔
+      ∃ msg, (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).2 =
+        .error (.undefinedBehavior msg)) ∧
+    ((∃ s', stepMirFn body s = .step s') ∨
+      (∃ retVal mem', stepMirFn body s = .retNormal retVal mem') ∨
+      stepMirFn body s = .fail .ub) := by
+  have h := step_wellTypedBody_simulation hbody hstate hloc himm
+  refine ⟨h.step_iff, h.retNormal_iff, h.ub_iff, ?_⟩
+  generalize stepMirFn body s = aRes at h
+  generalize Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = mRes at h
+  cases h with
+  | step s' _ _ => exact Or.inl ⟨s', rfl⟩
+  | retRoot _ retVal _ mem' _ _ _ _ _ => exact Or.inr (Or.inl ⟨retVal, mem', rfl⟩)
+  | ub _ _ => exact Or.inr (Or.inr rfl)
 
 end LeanMiriSpec.Correspondence
 
