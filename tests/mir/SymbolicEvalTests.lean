@@ -2260,4 +2260,953 @@ theorem pinnedWithSpecCalleesTotal_verified :
     (.some companionPinnedReqMir)
     (.some companionWithCallEnsMir)
 
+/-!
+## 7. Scalar-Represented Fieldless Enum Return Classification (`DIFF-E`)
+-/
+
+/--
+Exact captured `LayoutTable` from `finding_0009`
+(`miri_diff_corpus::ub_transmute_invalid_enum_tag__b7_c29`), where entry `0` is
+`#[repr(u8)] enum ColorTag { Red = 0, Green = 1, Blue = 2 }` with
+`BackendRepr.scalar` and `validRange` `0..=2`.
+-/
+def ubTransmuteInvalidEnumTagB7C29Layouts : LayoutTable :=
+  { pointerBits := 64
+    isLittleEndian := true
+    entries :=
+      [ { size := { bytes := 1 }
+          align := { bytes := 1 }
+          backendRepr :=
+            .scalar (.initialized (.int 8 false) { start := 0, end_ := 2 })
+          fields := .arbitrary [{ bytes := 0 }] [0]
+          variants :=
+            .multiple
+              (.initialized (.int 8 false) { start := 0, end_ := 2 })
+              0
+              [ .arbitrary [] []
+              , .arbitrary [] []
+              , .arbitrary [] [] ]
+          isUninhabited := false }
+      , { size := { bytes := 1 }
+          align := { bytes := 1 }
+          backendRepr :=
+            .scalar (.initialized (.int 8 false) { start := 0, end_ := 1 })
+          fields := .primitive
+          variants := .single 0
+          isUninhabited := false }
+      , { size := { bytes := 4 }
+          align := { bytes := 4 }
+          backendRepr := .memory
+          fields := .union 2
+          variants := .single 0
+          isUninhabited := false }
+      , { size := { bytes := 0 }
+          align := { bytes := 1 }
+          backendRepr := .memory
+          fields := .arbitrary [] []
+          variants := .single 0
+          isUninhabited := false }
+      , { size := { bytes := 4 }
+          align := { bytes := 4 }
+          backendRepr :=
+            .scalar
+              (.initialized (.int 32 false) { start := 0, end_ := 4294967295 })
+          fields := .primitive
+          variants := .single 0
+          isUninhabited := false }
+      , { size := { bytes := 1 }
+          align := { bytes := 1 }
+          backendRepr :=
+            .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 })
+          fields := .primitive
+          variants := .single 0
+          isUninhabited := false } ] }
+
+/--
+Exact captured `CapturedMir` body from `finding_0009`
+(`miri_diff_corpus::ub_transmute_invalid_enum_tag__b7_c29`), transmuting `1_u8`
+into `ColorTag::Green` and returning it in `_0`.
+-/
+def ubTransmuteInvalidEnumTagB7C29Body : CapturedMir :=
+  let colorTy : Ty :=
+    { kind := .adt "miri_diff_corpus::ColorTag" [], layoutIdx := 0 }
+  let boolTy : Ty := { kind := .bool, layoutIdx := 1 }
+  let uninitU32Ty : Ty :=
+    { kind := .adt "miri_diff_corpus::Uninit" [.uint .u32], layoutIdx := 2 }
+  let unitTy : Ty := { kind := .tuple [], layoutIdx := 3 }
+  let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 4 }
+  let u8Ty : Ty := { kind := .uint .u8, layoutIdx := 5 }
+  let colorRetLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 false) { start := 0, end_ := 2 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 8 false) { start := 0, end_ := 2 })
+          0
+          [ .arbitrary [] []
+          , .arbitrary [] []
+          , .arbitrary [] [] ]
+      isUninhabited := false }
+  { defPath := "miri_diff_corpus::ub_transmute_invalid_enum_tag__b7_c29"
+    phase := .runtimeOptimized
+    role := .subject
+    argCount := 0
+    localDecls :=
+      [ { mutability := .mut, ty := colorTy, debugName := .none }
+      , { mutability := .not, ty := colorTy, debugName := .some "c" }
+      , { mutability := .not
+          ty := colorTy
+          debugName := .some "__tail___miri_valid_5053" }
+      , { mutability := .not, ty := boolTy, debugName := .some "__valid_b" }
+      , { mutability := .mut
+          ty := uninitU32Ty
+          debugName := .some "__valid_slot" }
+      , { mutability := .mut, ty := unitTy, debugName := .none }
+      , { mutability := .not
+          ty := u32Ty
+          debugName := .some "__miri_valid_5053" }
+      , { mutability := .mut, ty := u32Ty, debugName := .none }
+      , { mutability := .mut, ty := u32Ty, debugName := .none }
+      , { mutability := .mut, ty := boolTy, debugName := .none }
+      , { mutability := .mut, ty := u32Ty, debugName := .some "__miri_sink" }
+      , { mutability := .not
+          ty := colorTy
+          debugName := .some "__tail___miri_valid_19483" }
+      , { mutability := .not, ty := boolTy, debugName := .some "__valid_b" }
+      , { mutability := .mut
+          ty := uninitU32Ty
+          debugName := .some "__valid_slot" }
+      , { mutability := .mut, ty := unitTy, debugName := .none }
+      , { mutability := .not
+          ty := u32Ty
+          debugName := .some "__miri_valid_19483" }
+      , { mutability := .mut, ty := u32Ty, debugName := .none }
+      , { mutability := .mut, ty := u32Ty, debugName := .none }
+      , { mutability := .mut, ty := boolTy, debugName := .none }
+      , { mutability := .mut, ty := u32Ty, debugName := .some "__miri_sink" } ]
+    basicBlocks :=
+      [ { statements :=
+            [ { kind := .storageLive 1, span := "src/lib.rs:5006:9: 5006:10" }
+            , { kind :=
+                  .assign { local_ := 1, projection := [] }
+                    (.cast .transmute
+                      (.constant
+                        { ty := u8Ty
+                          val := .scalar (.int { bits := 1, sizeBytes := 1 }) })
+                      colorTy)
+                span := "src/lib.rs:5006:32: 5006:46" }
+            , { kind := .storageLive 2, span := "src/lib.rs:5007:9: 5007:33" }
+            , { kind :=
+                  .assign { local_ := 2, projection := [] }
+                    (.use (.move { local_ := 1, projection := [] }))
+                span := "src/lib.rs:5007:46: 5007:47" }
+            , { kind := .storageLive 3, span := "src/lib.rs:5008:9: 5008:18" }
+            , { kind :=
+                  .assign { local_ := 3, projection := [] }
+                    (.cast .transmute
+                      (.constant
+                        { ty := u8Ty
+                          val := .scalar (.int { bits := 1, sizeBytes := 1 }) })
+                      boolTy)
+                span := "src/lib.rs:5008:36: 5008:50" }
+            , { kind := .storageLive 4, span := "src/lib.rs:5009:9: 5009:25" }
+            , { kind := .storageLive 5, span := "src/lib.rs:5009:58: 5009:60" }
+            , { kind :=
+                  .assign { local_ := 5, projection := [] }
+                    (.aggregate .tuple [])
+                span := "src/lib.rs:5009:58: 5009:60" }
+            , { kind :=
+                  .assign { local_ := 4, projection := [] }
+                    (.aggregate
+                      (.adt "miri_diff_corpus::Uninit" 0 (.some 0))
+                      [.move { local_ := 5, projection := [] }])
+                span := "src/lib.rs:5009:41: 5009:62" }
+            , { kind := .storageDead 5, span := "src/lib.rs:5009:61: 5009:62" }
+            , { kind := .storageLive 6, span := "src/lib.rs:5010:9: 5010:26" }
+            , { kind :=
+                  .assign
+                    { local_ := 4, projection := [.field 1 u32Ty] }
+                    (.use
+                      (.constant
+                        { ty := u32Ty
+                          val := .scalar (.int { bits := 42, sizeBytes := 4 }) }))
+                span := "src/lib.rs:5011:9: 5011:35" }
+            , { kind := .storageLive 7, span := "src/lib.rs:5012:9: 5012:27" }
+            , { kind :=
+                  .assign { local_ := 7, projection := [] }
+                    (.use
+                      (.copy { local_ := 4, projection := [.field 1 u32Ty] }))
+                span := "src/lib.rs:5012:9: 5012:27" }
+            , { kind := .storageLive 8, span := "src/lib.rs:5012:30: 5012:48" }
+            , { kind := .storageLive 9, span := "src/lib.rs:5012:31: 5012:40" }
+            , { kind :=
+                  .assign { local_ := 9, projection := [] }
+                    (.use (.copy { local_ := 3, projection := [] }))
+                span := "src/lib.rs:5012:31: 5012:40" }
+            , { kind :=
+                  .assign { local_ := 8, projection := [] }
+                    (.cast .intToInt
+                      (.move { local_ := 9, projection := [] })
+                      u32Ty)
+                span := "src/lib.rs:5012:30: 5012:48" }
+            , { kind := .storageDead 9, span := "src/lib.rs:5012:47: 5012:48" }
+            , { kind :=
+                  .assign { local_ := 6, projection := [] }
+                    (.binaryOp .bitXor
+                      (.move { local_ := 7, projection := [] })
+                      (.move { local_ := 8, projection := [] }))
+                span := "src/lib.rs:5012:9: 5012:48" }
+            , { kind := .storageDead 8, span := "src/lib.rs:5012:47: 5012:48" }
+            , { kind := .storageDead 7, span := "src/lib.rs:5012:47: 5012:48" }
+            , { kind := .storageLive 10, span := "src/lib.rs:5014:9: 5014:24" }
+            , { kind :=
+                  .assign { local_ := 10, projection := [] }
+                    (.use (.copy { local_ := 6, projection := [] }))
+                span := "src/lib.rs:5014:32: 5014:49" }
+            , { kind := .storageLive 11, span := "src/lib.rs:5015:9: 5015:34" }
+            , { kind :=
+                  .assign { local_ := 11, projection := [] }
+                    (.use (.move { local_ := 2, projection := [] }))
+                span := "src/lib.rs:5015:47: 5015:71" }
+            , { kind := .storageLive 12, span := "src/lib.rs:5016:9: 5016:18" }
+            , { kind :=
+                  .assign { local_ := 12, projection := [] }
+                    (.cast .transmute
+                      (.constant
+                        { ty := u8Ty
+                          val := .scalar (.int { bits := 1, sizeBytes := 1 }) })
+                      boolTy)
+                span := "src/lib.rs:5016:36: 5016:50" }
+            , { kind := .storageLive 13, span := "src/lib.rs:5017:9: 5017:25" }
+            , { kind := .storageLive 14, span := "src/lib.rs:5017:58: 5017:60" }
+            , { kind :=
+                  .assign { local_ := 14, projection := [] }
+                    (.aggregate .tuple [])
+                span := "src/lib.rs:5017:58: 5017:60" }
+            , { kind :=
+                  .assign { local_ := 13, projection := [] }
+                    (.aggregate
+                      (.adt "miri_diff_corpus::Uninit" 0 (.some 0))
+                      [.move { local_ := 14, projection := [] }])
+                span := "src/lib.rs:5017:41: 5017:62" }
+            , { kind := .storageDead 14, span := "src/lib.rs:5017:61: 5017:62" }
+            , { kind := .storageLive 15, span := "src/lib.rs:5018:9: 5018:27" }
+            , { kind :=
+                  .assign
+                    { local_ := 13, projection := [.field 1 u32Ty] }
+                    (.use
+                      (.constant
+                        { ty := u32Ty
+                          val := .scalar (.int { bits := 955, sizeBytes := 4 }) }))
+                span := "src/lib.rs:5019:9: 5019:36" }
+            , { kind := .storageLive 16, span := "src/lib.rs:5020:9: 5020:27" }
+            , { kind :=
+                  .assign { local_ := 16, projection := [] }
+                    (.use
+                      (.copy { local_ := 13, projection := [.field 1 u32Ty] }))
+                span := "src/lib.rs:5020:9: 5020:27" }
+            , { kind := .storageLive 17, span := "src/lib.rs:5020:30: 5020:48" }
+            , { kind := .storageLive 18, span := "src/lib.rs:5020:31: 5020:40" }
+            , { kind :=
+                  .assign { local_ := 18, projection := [] }
+                    (.use (.copy { local_ := 12, projection := [] }))
+                span := "src/lib.rs:5020:31: 5020:40" }
+            , { kind :=
+                  .assign { local_ := 17, projection := [] }
+                    (.cast .intToInt
+                      (.move { local_ := 18, projection := [] })
+                      u32Ty)
+                span := "src/lib.rs:5020:30: 5020:48" }
+            , { kind := .storageDead 18, span := "src/lib.rs:5020:47: 5020:48" }
+            , { kind :=
+                  .assign { local_ := 15, projection := [] }
+                    (.binaryOp .bitXor
+                      (.move { local_ := 16, projection := [] })
+                      (.move { local_ := 17, projection := [] }))
+                span := "src/lib.rs:5020:9: 5020:48" }
+            , { kind := .storageDead 17, span := "src/lib.rs:5020:47: 5020:48" }
+            , { kind := .storageDead 16, span := "src/lib.rs:5020:47: 5020:48" }
+            , { kind := .storageLive 19, span := "src/lib.rs:5022:9: 5022:24" }
+            , { kind :=
+                  .assign { local_ := 19, projection := [] }
+                    (.use (.copy { local_ := 15, projection := [] }))
+                span := "src/lib.rs:5022:32: 5022:50" }
+            , { kind :=
+                  .assign { local_ := 0, projection := [] }
+                    (.use (.move { local_ := 11, projection := [] }))
+                span := "src/lib.rs:5023:5: 5023:30" }
+            , { kind := .storageDead 19, span := "src/lib.rs:5024:1: 5024:2" }
+            , { kind := .storageDead 15, span := "src/lib.rs:5024:1: 5024:2" }
+            , { kind := .storageDead 13, span := "src/lib.rs:5024:1: 5024:2" }
+            , { kind := .storageDead 12, span := "src/lib.rs:5024:1: 5024:2" }
+            , { kind := .storageDead 11, span := "src/lib.rs:5024:1: 5024:2" }
+            , { kind := .storageDead 10, span := "src/lib.rs:5024:1: 5024:2" }
+            , { kind := .storageDead 6, span := "src/lib.rs:5024:1: 5024:2" }
+            , { kind := .storageDead 4, span := "src/lib.rs:5024:1: 5024:2" }
+            , { kind := .storageDead 3, span := "src/lib.rs:5024:1: 5024:2" }
+            , { kind := .storageDead 2, span := "src/lib.rs:5024:1: 5024:2" }
+            , { kind := .storageDead 1, span := "src/lib.rs:5024:1: 5024:2" } ]
+          terminator := { kind := .return_, span := "src/lib.rs:5024:2: 5024:2" }
+          isCleanup := false } ]
+    fnAbi :=
+      { args := []
+        ret := { layout := colorRetLayout, mode := .direct }
+        conv := .rust
+        canUnwind := true }
+    layouts := ubTransmuteInvalidEnumTagB7C29Layouts
+    allocations := [] }
+
+/--
+Kernel-checked `by rfl` confirmation that `evalMirDiffTagBounded` classifies
+`ub_transmute_invalid_enum_tag__b7_c29` (`ColorTag::Green`) as
+`MirDiffTag.normalScalar 1 1`, matching `MIRI_PASS:scalar:1:1`.
+-/
+theorem confirm_tag_ub_transmute_invalid_enum_tag__b7_c29 :
+    evalMirDiffTagBounded 64 ubTransmuteInvalidEnumTagB7C29Body
+      (initMachineStateWithMemory
+        ubTransmuteInvalidEnumTagB7C29Body [] emptyMemory) =
+      MirDiffTag.normalScalar 1 1 := by
+  rfl
+
+/--
+Kernel-checked `by rfl` confirmation that `probeMirDiffExecBounded` reports
+`(MirDiffTag.normalScalar 1 1, "none")` on
+`ub_transmute_invalid_enum_tag__b7_c29`.
+-/
+theorem confirm_probe_ub_transmute_invalid_enum_tag__b7_c29 :
+    probeMirDiffExecBounded 64 ubTransmuteInvalidEnumTagB7C29Body
+      (.running
+        (initMachineStateWithMemory
+          ubTransmuteInvalidEnumTagB7C29Body [] emptyMemory)) =
+      (MirDiffTag.normalScalar 1 1, "none") := by
+  rfl
+
+/--
+Variant of `ColorTag` transmute that feeds out-of-range byte `3_u8` (`validRange`
+is `0..=2`), verifying that invalid discriminant transmutation still faults with
+`MirDiffTag.ub` at the transmute statement span.
+-/
+def ubTransmuteInvalidEnumTagOutOfRangeBody : CapturedMir :=
+  let colorTy : Ty :=
+    { kind := .adt "miri_diff_corpus::ColorTag" [], layoutIdx := 0 }
+  let u8Ty : Ty := { kind := .uint .u8, layoutIdx := 5 }
+  { ubTransmuteInvalidEnumTagB7C29Body with
+    defPath := "miri_diff_corpus::ub_transmute_invalid_enum_tag_out_of_range"
+    localDecls :=
+      [ { mutability := .mut, ty := colorTy, debugName := .none } ]
+    basicBlocks :=
+      [ { statements :=
+            [ { kind :=
+                  .assign { local_ := 0, projection := [] }
+                    (.cast .transmute
+                      (.constant
+                        { ty := u8Ty
+                          val := .scalar (.int { bits := 3, sizeBytes := 1 }) })
+                      colorTy)
+                span := "src/lib.rs:5006:32: 5006:46" } ]
+          terminator := { kind := .return_, span := "src/lib.rs:5007:2: 5007:2" }
+          isCleanup := false } ] }
+
+theorem confirm_ub_transmute_invalid_enum_tag_out_of_range :
+    evalMirDiffTagBounded 64 ubTransmuteInvalidEnumTagOutOfRangeBody
+      (initMachineStateWithMemory
+        ubTransmuteInvalidEnumTagOutOfRangeBody [] emptyMemory) =
+      MirDiffTag.ub ∧
+    probeMirDiffExecBounded 64 ubTransmuteInvalidEnumTagOutOfRangeBody
+      (.running
+        (initMachineStateWithMemory
+          ubTransmuteInvalidEnumTagOutOfRangeBody [] emptyMemory)) =
+      (MirDiffTag.ub, "src/lib.rs:5006:32: 5006:46") := by
+  exact ⟨rfl, rfl⟩
+
+/--
+Adversarial edge-case bodies for scalar-represented enum return classification:
+
+1. Direct `Rvalue.aggregate` construction of `ColorTag::Blue` (`variantIdx = 2`)
+   combined with an in-body `Rvalue.discriminant` check and a zero-sized
+   `fnAbi.ret.layout` placeholder (exercising fallback to `_0` in `layouts`).
+2. `#[repr(u16)]` fieldless enum (`sizeBytes = 2`).
+3. `core::cmp::Ordering::Less` (`variantIdx = 0`, 1-byte two's complement `255`).
+4. Single-variant `#[repr(u8)]` enum with non-zero explicit discriminant (`5`).
+5. Niche-encoded payload enum `Option<bool>::None` (`variantIdx = 0` in MIR,
+   where variant `1` carries a field so `None` must NOT be misclassified as raw
+   scalar `0` instead of its Rust niche byte `2`).
+-/
+def directColorTagWithDiscrAndZeroFnAbiBody : CapturedMir :=
+  let colorTy : Ty :=
+    { kind := .adt "miri_diff_corpus::ColorTag" [], layoutIdx := 0 }
+  let u64Layout : TypeLayout :=
+    { size := { bytes := 8 }
+      align := { bytes := 8 }
+      backendRepr :=
+        .scalar
+          (.initialized
+            (.int 64 false)
+            { start := 0, end_ := 18446744073709551615 })
+      fields := .primitive
+      variants := .single 0
+      isUninhabited := false }
+  let u64Ty : Ty := { kind := .uint .u64, layoutIdx := 6 }
+  let zeroPlaceholderLayout : TypeLayout :=
+    { size := { bytes := 0 }
+      align := { bytes := 1 }
+      backendRepr := .memory
+      fields := .arbitrary [] []
+      variants := .empty
+      isUninhabited := false }
+  { defPath := "sym_test::direct_color_blue_with_discr"
+    phase := .runtimeOptimized
+    role := .subject
+    argCount := 0
+    localDecls :=
+      [ { mutability := .mut, ty := colorTy, debugName := .none }
+      , { mutability := .mut, ty := u64Ty, debugName := .none } ]
+    basicBlocks :=
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate
+                    (.adt "miri_diff_corpus::ColorTag" 2 .none)
+                    []))
+            , mkStmt (.storageLive 1)
+            , mkStmt
+                (.assign { local_ := 1, projection := [] }
+                  (.discriminant { local_ := 0, projection := [] })) ]
+          terminator :=
+            mkTerm
+              (.switchInt
+                (.move { local_ := 1, projection := [] })
+                { branches := [(2, 1)], otherwise := 2 })
+          isCleanup := false }
+      , { statements := [mkStmt (.storageDead 1)]
+          terminator := mkTerm .return_
+          isCleanup := false }
+      , { statements := []
+          terminator := mkTerm .unreachable
+          isCleanup := false } ]
+    fnAbi :=
+      { args := []
+        ret := { layout := zeroPlaceholderLayout, mode := .ignore }
+        conv := .rust
+        canUnwind := true }
+    layouts :=
+      { ubTransmuteInvalidEnumTagB7C29Layouts with
+        entries :=
+          ubTransmuteInvalidEnumTagB7C29Layouts.entries ++ [u64Layout] }
+    allocations := [] }
+
+def reprU16FieldlessEnumBody : CapturedMir :=
+  let wideLayout : TypeLayout :=
+    { size := { bytes := 2 }
+      align := { bytes := 2 }
+      backendRepr :=
+        .scalar (.initialized (.int 16 false) { start := 0, end_ := 2 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 16 false) { start := 0, end_ := 2 })
+          0
+          [.arbitrary [] [], .arbitrary [] [], .arbitrary [] []]
+      isUninhabited := false }
+  let wideTy : Ty := { kind := .adt "sym_test::WideTag" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::wide_tag_two" 0 [mkDecl .mut wideTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "sym_test::WideTag" 2 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [wideLayout] } }
+
+def orderingLessReturnBody : CapturedMir :=
+  let ordLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 true) { start := 255, end_ := 1 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 8 true) { start := 255, end_ := 1 })
+          0
+          [.arbitrary [] [], .arbitrary [] [], .arbitrary [] []]
+      isUninhabited := false }
+  let ordTy : Ty := { kind := .adt "core::cmp::Ordering" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::ordering_less" 0 [mkDecl .mut ordTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "core::cmp::Ordering" 0 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [ordLayout] } }
+
+def singleVariantReprU8FiveBody : CapturedMir :=
+  let singleLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 false) { start := 5, end_ := 5 })
+      fields := .arbitrary [] []
+      variants := .single 0
+      isUninhabited := false }
+  let singleTy : Ty := { kind := .adt "sym_test::SingleFive" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::single_five" 0 [mkDecl .mut singleTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "sym_test::SingleFive" 0 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [singleLayout] } }
+
+def nicheOptionBoolNoneBody : CapturedMir :=
+  let optBoolLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 false) { start := 0, end_ := 2 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 8 false) { start := 0, end_ := 2 })
+          0
+          [ .arbitrary [] []
+          , .arbitrary [{ bytes := 0 }] [0] ]
+      isUninhabited := false }
+  let optBoolTy : Ty :=
+    { kind := .adt "core::option::Option" [.bool], layoutIdx := 0 }
+  { mkMirBody "sym_test::option_bool_none" 0 [mkDecl .mut optBoolTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "core::option::Option" 0 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [optBoolLayout] } }
+
+theorem scalar_enum_return_edge_cases_confirmed :
+    probeMirDiffBounded 16 directColorTagWithDiscrAndZeroFnAbiBody
+      (initMachineStateWithMemory
+        directColorTagWithDiscrAndZeroFnAbiBody [] emptyMemory) =
+      (MirDiffTag.normalScalar 2 1, "none") ∧
+    probeMirDiffBounded 16 reprU16FieldlessEnumBody
+      (initMachineStateWithMemory
+        reprU16FieldlessEnumBody [] emptyMemory) =
+      (MirDiffTag.normalScalar 2 2, "none") ∧
+    probeMirDiffBounded 16 orderingLessReturnBody
+      (initMachineStateWithMemory
+        orderingLessReturnBody [] emptyMemory) =
+      (MirDiffTag.normalScalar 255 1, "none") ∧
+    probeMirDiffBounded 16 singleVariantReprU8FiveBody
+      (initMachineStateWithMemory
+        singleVariantReprU8FiveBody [] emptyMemory) =
+      (MirDiffTag.normalScalar 5 1, "none") ∧
+    probeMirDiffBounded 16 nicheOptionBoolNoneBody
+      (initMachineStateWithMemory
+        nicheOptionBoolNoneBody [] emptyMemory) =
+      (MirDiffTag.normalOther, "none") := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/--
+Kernel-checked `TotalVerificationResult` certification for
+`ub_transmute_invalid_enum_tag__b7_c29` via
+`verifyTotalMirDiffScalarPointBounded`.
+-/
+theorem confirm_total_claim_ub_transmute_invalid_enum_tag__b7_c29 :
+    TotalVerificationResult
+      { body := ubTransmuteInvalidEnumTagB7C29Body
+        pre := fun a m => a = [] ∧ m = emptyMemory
+        post := fun _ _ retVal _ =>
+          retVal = .scalar { bits := 1, sizeBytes := 1 } ∨
+            ∃ variantIdx,
+              retVal = .aggregate variantIdx .nil ∧
+              scalarEnumReturnTag?
+                ubTransmuteInvalidEnumTagB7C29Body variantIdx =
+                .some (1, 1) } :=
+  verifyTotalMirDiffScalarPointBounded
+    ubTransmuteInvalidEnumTagB7C29Body 64 [] emptyMemory 1 1
+
+/--
+`rustc`-captured layout for `#[repr(u8)] pub enum SingleFive { Only = 5 }`:
+`rustc` emits `VariantsShape.multiple` with one empty `FieldsShape` and
+`validRange = 5..=5` while MIR constructs `Value.aggregate 0 []`.
+-/
+def rustcCapturedSingleFiveBody : CapturedMir :=
+  let singleLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 false) { start := 5, end_ := 5 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 8 false) { start := 5, end_ := 5 })
+          0
+          [.arbitrary [] []]
+      isUninhabited := false }
+  let singleTy : Ty :=
+    { kind := .adt "sym_test::RustcSingleFive" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::rustc_single_five" 0 [mkDecl .mut singleTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "sym_test::RustcSingleFive" 0 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [singleLayout] } }
+
+/--
+User-defined `#[repr(i8)]` contiguous negative-start enum
+`enum SignedContig { NegTwo = -2, NegOne = -1, Zero = 0 }` (`254..=0`) returning
+variant `0` (`NegTwo = 254`).
+-/
+def userSignedContigI8Body : CapturedMir :=
+  let scLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 true) { start := 254, end_ := 0 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 8 true) { start := 254, end_ := 0 })
+          0
+          [.arbitrary [] [], .arbitrary [] [], .arbitrary [] []]
+      isUninhabited := false }
+  let scTy : Ty := { kind := .adt "sym_test::SignedContig" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::signed_contig_neg_two" 0 [mkDecl .mut scTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "sym_test::SignedContig" 0 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [scLayout] } }
+
+/--
+User-defined `#[repr(i16)]` contiguous signed enum
+`enum SignedI16 { Neg = -1, Zero = 0, Pos = 1 }` (`65535..=1`) returning variant
+`0` (`Neg = 65535`, `sizeBytes = 2`).
+-/
+def userSignedContigI16Body : CapturedMir :=
+  let i16EnumLayout : TypeLayout :=
+    { size := { bytes := 2 }
+      align := { bytes := 2 }
+      backendRepr :=
+        .scalar (.initialized (.int 16 true) { start := 65535, end_ := 1 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 16 true) { start := 65535, end_ := 1 })
+          0
+          [.arbitrary [] [], .arbitrary [] [], .arbitrary [] []]
+      isUninhabited := false }
+  let i16EnumTy : Ty := { kind := .adt "sym_test::SignedI16" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::signed_i16_neg" 0 [mkDecl .mut i16EnumTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "sym_test::SignedI16" 0 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [i16EnumLayout] } }
+
+/--
+Non-zero-based unsigned contiguous enum
+`#[repr(u8)] enum NonZeroContig { A = 10, B = 11, C = 12 }` returning variant
+`1` (`B = 11`).
+-/
+def nonZeroUnsignedContigBody : CapturedMir :=
+  let nzLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 false) { start := 10, end_ := 12 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 8 false) { start := 10, end_ := 12 })
+          0
+          [.arbitrary [] [], .arbitrary [] [], .arbitrary [] []]
+      isUninhabited := false }
+  let nzTy : Ty := { kind := .adt "sym_test::NonZeroContig" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::nonzero_contig_b" 0 [mkDecl .mut nzTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "sym_test::NonZeroContig" 1 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [nzLayout] } }
+
+/--
+Gapped explicit-discriminant enum `#[repr(u8)] enum Gapped { A = 1, B = 5 }`
+(`validRange = 1..=5`, `2` variants): per-variant discriminants are not stored
+in `TypeLayout`, so returning `B` (`variantIdx = 1`) must report `.normalOther`
+rather than fabricating `1` (`A`).
+-/
+def gappedExplicitDiscrEnumBody : CapturedMir :=
+  let gapLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 false) { start := 1, end_ := 5 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 8 false) { start := 1, end_ := 5 })
+          0
+          [.arbitrary [] [], .arbitrary [] []]
+      isUninhabited := false }
+  let gapTy : Ty := { kind := .adt "sym_test::Gapped" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::gapped_b" 0 [mkDecl .mut gapTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "sym_test::Gapped" 1 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [gapLayout] } }
+
+/--
+Niche-encoded `Option<OnlyZero>::None` (`validRange = 0..=1`, `2` variants where
+`Some(OnlyZero)` occupies byte `0` and `None` uses niche byte `1`): even though
+`wrappingRangeCount` equals `2`, `allVariantsFieldless` rejects the payload
+variant so `None` (`variantIdx = 0`) is not misclassified as byte `0`.
+-/
+def nicheOptionOnlyZeroNoneBody : CapturedMir :=
+  let optZeroLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 false) { start := 0, end_ := 1 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 8 false) { start := 0, end_ := 1 })
+          0
+          [ .arbitrary [] []
+          , .arbitrary [{ bytes := 0 }] [0] ]
+      isUninhabited := false }
+  let onlyZeroKind : RigidTy := .adt "sym_test::OnlyZero" []
+  let optZeroTy : Ty :=
+    { kind := .adt "core::option::Option" [onlyZeroKind], layoutIdx := 0 }
+  { mkMirBody "sym_test::option_only_zero_none" 0 [mkDecl .mut optZeroTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "core::option::Option" 0 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [optZeroLayout] } }
+
+/--
+Concrete zero-sized ADT return local (`UnitStruct` with `size.bytes = 0` in
+`body.layouts`) paired with a synthetic positive-sized scalar
+`fnAbi.ret.layout`: `resolveReturnLayout?` must keep the concrete zero-sized
+layout and report `.normalOther`.
+-/
+def zstLocalWithScalarFnAbiBody : CapturedMir :=
+  let zstLayout : TypeLayout :=
+    { size := { bytes := 0 }
+      align := { bytes := 1 }
+      backendRepr := .memory
+      fields := .arbitrary [] []
+      variants := .single 0
+      isUninhabited := false }
+  let bogusScalarRetLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 false) { start := 0, end_ := 0 })
+      fields := .arbitrary [] []
+      variants := .single 0
+      isUninhabited := false }
+  let zstTy : Ty := { kind := .adt "sym_test::UnitStruct" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::zst_with_scalar_fnabi" 0 [mkDecl .mut zstTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "sym_test::UnitStruct" 0 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    fnAbi :=
+      { args := []
+        ret := { layout := bogusScalarRetLayout, mode := .direct }
+        conv := .rust
+        canUnwind := true }
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [zstLayout] } }
+
+/--
+Scalar-represented enum return when `body.layouts` is empty, exercising fallback
+to `body.fnAbi.ret.layout` for `ColorTag::Green` (`variantIdx = 1`).
+-/
+def emptyLayoutsFnAbiFallbackBody : CapturedMir :=
+  let colorLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 false) { start := 0, end_ := 2 })
+      fields := .arbitrary [{ bytes := 0 }] [0]
+      variants :=
+        .multiple
+          (.initialized (.int 8 false) { start := 0, end_ := 2 })
+          0
+          [.arbitrary [] [], .arbitrary [] [], .arbitrary [] []]
+      isUninhabited := false }
+  let colorTy : Ty :=
+    { kind := .adt "miri_diff_corpus::ColorTag" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::empty_layouts_fnabi_fallback" 0 [mkDecl .mut colorTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "miri_diff_corpus::ColorTag" 1 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    fnAbi :=
+      { args := []
+        ret := { layout := colorLayout, mode := .direct }
+        conv := .rust
+        canUnwind := true }
+    layouts := { pointerBits := 64, isLittleEndian := true, entries := [] } }
+
+/--
+Malformed 1-byte scalar layout whose `validRange` endpoint `300` exceeds
+`scalarModulus 1 = 256`: rejected so out-of-width bit patterns never escape as
+`.normalScalar`.
+-/
+def outOfWidthRangeScalarEnumBody : CapturedMir :=
+  let badLayout : TypeLayout :=
+    { size := { bytes := 1 }
+      align := { bytes := 1 }
+      backendRepr :=
+        .scalar (.initialized (.int 8 false) { start := 300, end_ := 300 })
+      fields := .arbitrary [] []
+      variants := .single 0
+      isUninhabited := false }
+  let badTy : Ty := { kind := .adt "sym_test::BadRange" [], layoutIdx := 0 }
+  { mkMirBody "sym_test::bad_range_enum" 0 [mkDecl .mut badTy]
+      [ { statements :=
+            [ mkStmt
+                (.assign { local_ := 0, projection := [] }
+                  (.aggregate (.adt "sym_test::BadRange" 0 .none) [])) ]
+          terminator := mkTerm .return_
+          isCleanup := false } ] with
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [badLayout] } }
+
+theorem scalar_enum_return_b1_hardening_confirmed :
+    probeMirDiffBounded 16 rustcCapturedSingleFiveBody
+      (initMachineStateWithMemory
+        rustcCapturedSingleFiveBody [] emptyMemory) =
+      (MirDiffTag.normalScalar 5 1, "none") ∧
+    probeMirDiffBounded 16 userSignedContigI8Body
+      (initMachineStateWithMemory
+        userSignedContigI8Body [] emptyMemory) =
+      (MirDiffTag.normalScalar 254 1, "none") ∧
+    probeMirDiffBounded 16 userSignedContigI16Body
+      (initMachineStateWithMemory
+        userSignedContigI16Body [] emptyMemory) =
+      (MirDiffTag.normalScalar 65535 2, "none") ∧
+    probeMirDiffBounded 16 nonZeroUnsignedContigBody
+      (initMachineStateWithMemory
+        nonZeroUnsignedContigBody [] emptyMemory) =
+      (MirDiffTag.normalScalar 11 1, "none") ∧
+    probeMirDiffBounded 16 gappedExplicitDiscrEnumBody
+      (initMachineStateWithMemory
+        gappedExplicitDiscrEnumBody [] emptyMemory) =
+      (MirDiffTag.normalOther, "none") ∧
+    probeMirDiffBounded 16 nicheOptionOnlyZeroNoneBody
+      (initMachineStateWithMemory
+        nicheOptionOnlyZeroNoneBody [] emptyMemory) =
+      (MirDiffTag.normalOther, "none") ∧
+    probeMirDiffBounded 16 zstLocalWithScalarFnAbiBody
+      (initMachineStateWithMemory
+        zstLocalWithScalarFnAbiBody [] emptyMemory) =
+      (MirDiffTag.normalOther, "none") ∧
+    probeMirDiffBounded 16 emptyLayoutsFnAbiFallbackBody
+      (initMachineStateWithMemory
+        emptyLayoutsFnAbiFallbackBody [] emptyMemory) =
+      (MirDiffTag.normalScalar 1 1, "none") ∧
+    probeMirDiffBounded 16 outOfWidthRangeScalarEnumBody
+      (initMachineStateWithMemory
+        outOfWidthRangeScalarEnumBody [] emptyMemory) =
+      (MirDiffTag.normalOther, "none") := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 end Anneal.Rustc.V2026_06_01.SymbolicEvalTests
+
+/-!
+Namespace-shadowing regression check verifying that generated modules (such as
+`MiriOracleProbe` and `MiriOracleConfirm` in `crates/cargo-anneal/`) that run
+`open Anneal.Rustc.V2026_06_01.SymbolicEval` and also emit a local
+`def probeMirDiffExecBounded` resolve without ambiguity, and that
+`SymbolicEval.probeMirDiffExecBounded` resolves cleanly alongside it.
+-/
+namespace MiriOracleShadowCompatCheck
+
+open Trusted.Sequence
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+open Trusted.VerificationResult
+open Anneal.Rustc.V2026_06_01.SymbolicEval
+
+def probeMirDiffExecBounded
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState) :
+    MirDiffTag × String :=
+  match fuel with
+  | 0 => (.outOfFuel, "none")
+  | fuel' + 1 =>
+    match stepMirState body st with
+    | .ret (.normal (.unit, _)) => (.normalUnit, "none")
+    | .ret (.normal (.scalar sc, _)) =>
+      (.normalScalar sc.bits sc.sizeBytes, "none")
+    | .ret (.normal (_, _)) => (.normalOther, "none")
+    | .ret .panic => (.panic, "none")
+    | .ret .abort => (.abort, "none")
+    | .tau st' => probeMirDiffExecBounded fuel' body st'
+    | .vis (.inl (.fail .ub)) _ => (.ub, "none")
+    | .vis (.inl (.fail .unsupported)) _ => (.unsupported, "none")
+    | .vis (.inl (.fail .outOfFuel)) _ => (.outOfFuel, "none")
+    | .vis (.inr (.inl _)) k =>
+      probeMirDiffExecBounded fuel' body (k PUnit.unit)
+    | .vis (.inr (.inr (.call req))) _ => (.externalCall req.defPath, "none")
+
+theorem local_and_qualified_probe_resolve :
+    probeMirDiffExecBounded
+      8
+      Anneal.Rustc.V2026_06_01.SymbolicEvalTests.addBoundedMir
+      (.running
+        (initMachineStateWithMemory
+          Anneal.Rustc.V2026_06_01.SymbolicEvalTests.addBoundedMir
+          [ .scalar { bits := 10, sizeBytes := 1 }
+          , .scalar { bits := 20, sizeBytes := 1 } ]
+          emptyMemory)) =
+      (MirDiffTag.normalScalar 30 1, "none") ∧
+    Anneal.Rustc.V2026_06_01.SymbolicEval.probeMirDiffExecBounded
+      64
+      Anneal.Rustc.V2026_06_01.SymbolicEvalTests.ubTransmuteInvalidEnumTagB7C29Body
+      (.running
+        (initMachineStateWithMemory
+          Anneal.Rustc.V2026_06_01.SymbolicEvalTests.ubTransmuteInvalidEnumTagB7C29Body
+          []
+          emptyMemory)) =
+      (MirDiffTag.normalScalar 1 1, "none") := by
+  exact ⟨rfl, rfl⟩
+
+end MiriOracleShadowCompatCheck

@@ -5222,7 +5222,7 @@ inductive MirDiffTag : Type where
   | outOfFuel
   deriving DecidableEq, Repr
 
-/-- Project a `MirDiffVerdict` to its decidable `MirDiffTag`. -/
+/-- Project a `MirDiffVerdict` to its body-independent `MirDiffTag`. -/
 def MirDiffVerdict.toTag : MirDiffVerdict → MirDiffTag
   | .normal .unit _ => .normalUnit
   | .normal (.scalar sc) _ => .normalScalar sc.bits sc.sizeBytes
@@ -5233,6 +5233,236 @@ def MirDiffVerdict.toTag : MirDiffVerdict → MirDiffTag
   | .unsupported => .unsupported
   | .externalCall defPath => .externalCall defPath
   | .outOfFuel => .outOfFuel
+
+/--
+Return `true` when every variant in `variants` has an empty `FieldsShape`
+(`.arbitrary [] _`).
+-/
+def allVariantsFieldless : List FieldsShape → Bool
+  | .nil => true
+  | .arbitrary .nil _ :: rest => allVariantsFieldless rest
+  | _ :: _ => false
+
+/--
+Return `true` when return local `_0` in `body.localDecls` can represent a
+scalar-backed enum (`RigidTy.adt`, generic `RigidTy.param`, or an omitted
+`localDecls` table).
+
+Rejects zero-element arrays (`[T; 0]`), empty tuples (`()`), and other non-ADT
+types that construct `.aggregate 0 []` in MIR so they are never misclassified
+as scalar-represented enums if `body.fnAbi.ret.layout` differs.
+-/
+def returnLocalAllowsScalarEnum (body : CapturedMir) : Bool :=
+  match get? body.localDecls 0 with
+  | .none => true
+  | .some decl0 =>
+    match decl0.ty.kind with
+    | .adt _ _ => true
+    | .param _ _ => true
+    | _ => false
+
+/--
+Return the cardinality of inclusive wrap-around range `r` within `[0, modulus)`,
+or `.none` when either endpoint lies outside `[0, modulus)`.
+-/
+def wrappingRangeCount (r : WrappingRange) (modulus : Nat) : Option Nat :=
+  match
+    Bool.and
+      (Nat.ble (.succ r.start) modulus)
+      (Nat.ble (.succ r.end_) modulus)
+  with
+  | false => .none
+  | true =>
+    match Nat.ble r.start r.end_ with
+    | true => .some (Nat.add (Nat.sub r.end_ r.start) 1)
+    | false => .some (Nat.add (Nat.add (Nat.sub modulus r.start) r.end_) 1)
+
+/--
+Resolve the concrete positive-sized return `TypeLayout` of `body`.
+
+Consults return local `_0` in `body.layouts` first. When `_0` resolves to a
+concrete zero-sized layout (`l.size.bytes = 0` and
+`TypeLayout.isParamPlaceholder l = false`), returns `.none` without falling back
+to `body.fnAbi.ret.layout` so concrete zero-sized return types stay zero-sized.
+Falls back to `body.fnAbi.ret.layout` only when `_0` is absent from
+`body.localDecls`, missing from `body.layouts`, or still an uninstantiated
+parametric placeholder slot.
+-/
+def resolveReturnLayout? (body : CapturedMir) : Option TypeLayout :=
+  let fallbackFnAbi : Option TypeLayout :=
+    match body.fnAbi.ret.layout.size.bytes with
+    | _ + 1 => .some body.fnAbi.ret.layout
+    | 0 => .none
+  match get? body.localDecls 0 with
+  | .some decl0 =>
+    match LayoutTable.lookup body.layouts decl0.ty.layoutIdx with
+    | .some l =>
+      match l.size.bytes with
+      | _ + 1 => .some l
+      | 0 =>
+        match TypeLayout.isParamPlaceholder l with
+        | true => fallbackFnAbi
+        | false => .none
+    | .none => fallbackFnAbi
+  | .none => fallbackFnAbi
+
+/--
+Validate that candidate bit pattern `bits` fits in `[0, modulus)` and satisfies
+`ScalarInt.inRange` for `sz` bytes under `validRange`.
+-/
+def validateScalarEnumCandidate
+    (bits sz modulus : Nat) (validRange : WrappingRange) :
+    Option (Nat × Nat) :=
+  match
+    Bool.and
+      (Nat.ble (.succ bits) modulus)
+      (ScalarInt.inRange { bits := bits, sizeBytes := sz } validRange)
+  with
+  | true => .some (bits, sz)
+  | false => .none
+
+/--
+Compute the candidate unsigned discriminant bit pattern of `variantIdx` for a
+validated `sz`-byte integer scalar return layout (`modulus = scalarModulus sz`).
+
+Because `CapturedMir` records `TypeLayout` without `AdtDef` per-variant
+discriminants, `VariantsShape.multiple` determines each variant's bit pattern
+only when:
+
+1. Every variant has an empty `FieldsShape` (`allVariantsFieldless`), excluding
+   niche-encoded payload enums such as `Option<bool>` or `Option<OnlyZero>`
+   whose fieldless variant uses a displaced niche tag.
+2. `wrappingRangeCount validRange modulus` equals `variantShapes.length`,
+   excluding gapped explicit-discriminant enums (`A = 1, B = 5`) while unifying
+   zero-based enums (`0..=k-1`), `rustc`-captured single-variant `#[repr(int)]`
+   enums (`c..=c` with one `VariantsShape.multiple` entry), non-zero contiguous
+   enums (`a..=a+k-1`), and negative-start signed contiguous enums such as
+   `core::cmp::Ordering` (`255..=1` for `i8`) via
+   `wrapScalarBits (validRange.start + variantIdx) modulus`. Non-monotonic
+   permutations of a contiguous range (`High = 2, Mid = 1, Low = 0`) share the
+   same `TypeLayout` as ascending order until `CapturedMir` captures `AdtDef`
+   discriminants.
+3. Full-width signed `0..=modulus-1` ranges are excluded because wrapping
+   normalization erases whether variant `0` starts at `0` or `-2^(8*sz - 1)`.
+-/
+def scalarEnumCandidateBits?
+    (body : CapturedMir)
+    (retLayout : TypeLayout)
+    (sz modulus : Nat)
+    (isSigned : Bool)
+    (validRange : WrappingRange)
+    (variantIdx : VariantIdx) :
+    Option Nat :=
+  match retLayout.variants with
+  | .multiple _ _ (vHead :: vTail) =>
+    let variantShapes := vHead :: vTail
+    let numVariants := length variantShapes
+    let rangeMatchesCount :=
+      match wrappingRangeCount validRange modulus with
+      | .some cnt => Nat.beq cnt numVariants
+      | .none => false
+    let nonAmbiguousSignedFull :=
+      Bool.not
+        (Bool.and
+          isSigned
+          (Bool.and
+            (Nat.beq validRange.start 0)
+            (Nat.beq validRange.end_ (Nat.sub modulus 1))))
+    let ok :=
+      Bool.and
+        (Nat.ble (.succ variantIdx) numVariants)
+        (Bool.and
+          (allVariantsFieldless variantShapes)
+          (Bool.and rangeMatchesCount nonAmbiguousSignedFull))
+    match ok with
+    | true => .some (wrapScalarBits (Nat.add validRange.start variantIdx) modulus)
+    | false => .none
+  | .multiple _ _ .nil =>
+    match wrappingRangeCount validRange modulus with
+    | .none => .none
+    | .some _ =>
+      let isOrdering :=
+        match get? body.localDecls 0 with
+        | .some { ty := { kind := .adt defPath _, .. }, .. } =>
+          Bool.and
+            (stringEq defPath "core::cmp::Ordering")
+            (Bool.and
+              (Nat.beq sz 1)
+              (Bool.and
+                (Nat.beq validRange.start 255)
+                (Nat.beq validRange.end_ 1)))
+        | _ => false
+      match isOrdering with
+      | true =>
+        match variantIdx with
+        | 0 => .some 255
+        | 1 => .some 0
+        | 2 => .some 1
+        | _ => .none
+      | false =>
+        match Bool.and (Bool.not isSigned) (Nat.beq validRange.start 0) with
+        | true => .some variantIdx
+        | false => .none
+  | .single expectedIdx =>
+    match
+      retLayout.fields,
+      Nat.beq variantIdx expectedIdx,
+      Nat.beq validRange.start validRange.end_
+    with
+    | .arbitrary .nil _, true, true => .some validRange.start
+    | _, _, _ => .none
+  | .empty => .none
+
+/--
+Compute the unsigned `(bits, sizeBytes)` scalar representation of a fieldless
+enum return value `.aggregate variantIdx []` when `body`'s return layout uses
+`BackendRepr.scalar (ScalarLayout.initialized (.int (8 * sz) _) validRange)`
+with `1 ≤ sz ≤ 16`.
+
+MIR execution preserves fieldless enum values as `Value.aggregate variantIdx []`
+so `Rvalue.discriminant` can inspect their variant index, whereas Miri's
+differential runner observes the return place's `BackendRepr::Scalar` bit
+pattern. This helper bridges that representation at function return while
+keeping zero-sized types, payload-bearing aggregates, niche-encoded payload
+enums, and gapped explicit-discriminant enums classified as `.none`.
+-/
+def scalarEnumReturnTag?
+    (body : CapturedMir) (variantIdx : VariantIdx) : Option (Nat × Nat) :=
+  match returnLocalAllowsScalarEnum body, resolveReturnLayout? body with
+  | true, .some retLayout =>
+    match
+      retLayout.isUninhabited,
+      retLayout.size.bytes,
+      retLayout.backendRepr
+    with
+    | false, sz@(_ + 1), .scalar (.initialized (.int primBits isSigned) validRange) =>
+      match Bool.and (Nat.ble sz 16) (Nat.beq primBits (Nat.mul sz 8)) with
+      | false => .none
+      | true =>
+        let modulus := scalarModulus sz
+        match
+          scalarEnumCandidateBits?
+            body retLayout sz modulus isSigned validRange variantIdx
+        with
+        | .some candidateBits =>
+          validateScalarEnumCandidate candidateBits sz modulus validRange
+        | .none => .none
+    | _, _, _ => .none
+  | _, _ => .none
+
+/--
+Project a `MirDiffVerdict` to its decidable `MirDiffTag` using `body`'s return
+layout metadata so scalar-represented fieldless enums report `.normalScalar`
+matching Miri's `BackendRepr::Scalar` runner.
+-/
+def MirDiffVerdict.toTagWithBody
+    (body : CapturedMir) (v : MirDiffVerdict) : MirDiffTag :=
+  match v with
+  | .normal (.aggregate variantIdx .nil) _ =>
+    match scalarEnumReturnTag? body variantIdx with
+    | .some (bits, sz) => .normalScalar bits sz
+    | .none => .normalOther
+  | _ => v.toTag
 
 /--
 Evaluate `body` from `st : MirExecState` for up to `fuel` steps, classifying the
@@ -5268,7 +5498,104 @@ return its decidable `MirDiffTag`.
 -/
 def evalMirDiffTagBounded
     (fuel : Nat) (body : CapturedMir) (s : MachineState) : MirDiffTag :=
-  (evalMirDiffBounded fuel body s).toTag
+  (evalMirDiffBounded fuel body s).toTagWithBody body
+
+/--
+Return the active statement or terminator source span of `st` in `body` (or
+`"none"` when not running or when the span is empty or `"<dummy>"`).
+-/
+def activeMirSpan (body : CapturedMir) (st : MirExecState) : String :=
+  let raw :=
+    match st with
+    | .running s =>
+      let cur :=
+        match s.memory.activeCallee with
+        | .some callee => callee
+        | .none => body
+      match get? cur.basicBlocks s.frame.blockIdx with
+      | .some bb =>
+        match get? bb.statements s.frame.stmtIdx with
+        | .some stmt => stmt.span
+        | .none => bb.terminator.span
+      | .none => "none"
+    | _ => "none"
+  match Bool.or (stringEq raw "") (stringEq raw "<dummy>") with
+  | true => "none"
+  | false => raw
+
+/--
+Evaluate `body` from `st : MirExecState` for up to `fuel` steps and return both
+its `MirDiffTag` (via `MirDiffVerdict.toTagWithBody`) and the active fault or
+unwind source span (`"none"` on normal return).
+-/
+def probeMirDiffExecBounded
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState) :
+    MirDiffTag × String :=
+  match fuel with
+  | 0 => (.outOfFuel, activeMirSpan body st)
+  | fuel' + 1 =>
+    match stepMirState body st with
+    | .ret (.normal (retVal, mem)) =>
+      ((MirDiffVerdict.normal retVal mem).toTagWithBody body, "none")
+    | .ret .panic => (.panic, activeMirSpan body st)
+    | .ret .abort => (.abort, activeMirSpan body st)
+    | .tau st' => probeMirDiffExecBounded fuel' body st'
+    | .vis (.inl (.fail .ub)) _ => (.ub, activeMirSpan body st)
+    | .vis (.inl (.fail .unsupported)) _ => (.unsupported, activeMirSpan body st)
+    | .vis (.inl (.fail .outOfFuel)) _ => (.outOfFuel, activeMirSpan body st)
+    | .vis (.inr (.inl _)) k =>
+      probeMirDiffExecBounded fuel' body (k PUnit.unit)
+    | .vis (.inr (.inr (.call req))) _ =>
+      (.externalCall req.defPath, activeMirSpan body st)
+
+/--
+Evaluate `body` starting from `s : MachineState` for up to `fuel` steps and
+return its `(MirDiffTag, span)` pair.
+-/
+def probeMirDiffBounded
+    (fuel : Nat) (body : CapturedMir) (s : MachineState) :
+    MirDiffTag × String :=
+  probeMirDiffExecBounded fuel body (.running s)
+
+/--
+`probeMirDiffExecBounded` always agrees in its tag projection with
+`(evalMirDiffExecBounded fuel body st).toTagWithBody body`.
+-/
+theorem probeMirDiffExecBounded_fst_eq_toTagWithBody
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState) :
+    (probeMirDiffExecBounded fuel body st).1 =
+      (evalMirDiffExecBounded fuel body st).toTagWithBody body := by
+  induction fuel generalizing st with
+  | zero => rfl
+  | succ fuel' ih =>
+    unfold probeMirDiffExecBounded evalMirDiffExecBounded
+    cases h_step : stepMirState body st with
+    | ret out =>
+      cases out with
+      | normal p =>
+        rcases p with ⟨retVal, mem⟩
+        rfl
+      | panic => rfl
+      | abort => rfl
+    | tau st' => exact ih st'
+    | vis i k =>
+      rcases i with f | (e | c)
+      · rcases f with ⟨fk⟩
+        cases fk <;> rfl
+      · cases e
+        exact ih (k PUnit.unit)
+      · rcases c with ⟨req⟩
+        rfl
+
+/--
+`probeMirDiffBounded` always agrees in its tag projection with
+`evalMirDiffTagBounded`.
+-/
+theorem probeMirDiffBounded_fst_eq_evalMirDiffTagBounded
+    (fuel : Nat) (body : CapturedMir) (s : MachineState) :
+    (probeMirDiffBounded fuel body s).1 =
+      evalMirDiffTagBounded fuel body s :=
+  probeMirDiffExecBounded_fst_eq_toTagWithBody fuel body (.running s)
 
 /--
 Computable bounded strict-UB detector over `MirExecState`: returns `true` only
@@ -5695,6 +6022,41 @@ theorem wpCoalBounded_of_evalMirDiffExecBounded_normalScalar
         nomatch h_ok
 
 /--
+`MirDiffVerdict.toTagWithBody` produces `.normalUnit` only when `v.toTag` is
+already `.normalUnit`, because scalar-represented fieldless enum refinement maps
+`.normal (.aggregate _ []) _` solely to `.normalScalar` or `.normalOther`.
+-/
+theorem MirDiffVerdict.toTag_eq_normalUnit_of_toTagWithBody
+    (body : CapturedMir) (v : MirDiffVerdict)
+    (h : v.toTagWithBody body = .normalUnit) :
+    v.toTag = .normalUnit := by
+  cases v with
+  | normal rv mem =>
+    cases rv with
+    | unit => rfl
+    | scalar _ => nomatch h
+    | ptr _ _ => nomatch h
+    | aggregate varIdx fields =>
+      cases fields with
+      | nil =>
+        dsimp only [MirDiffVerdict.toTagWithBody] at h
+        cases h_tag : scalarEnumReturnTag? body varIdx with
+        | none =>
+          rw [h_tag] at h
+          nomatch h
+        | some pair =>
+          rcases pair with ⟨bits, sz⟩
+          rw [h_tag] at h
+          nomatch h
+      | cons _ _ => nomatch h
+  | panic => nomatch h
+  | abort => nomatch h
+  | ub => nomatch h
+  | unsupported => nomatch h
+  | externalCall _ => nomatch h
+  | outOfFuel => nomatch h
+
+/--
 Certify a Miri `pass` test returning `()` at `(args, mem)`: proves
 `TotalVerificationResult` via `evalMirDiffTagBounded ... = .normalUnit`.
 -/
@@ -5714,14 +6076,296 @@ theorem verifyTotalMirUnitPointBounded
   refine verifyTotalMirBounded _ fuel ?_
   rintro a m ⟨rfl, rfl⟩
   exact wpCoalBounded_of_evalMirDiffExecBounded_normalUnit
-    fuel body (.running (initMachineStateWithMemory body a m)) h_ok
+    fuel body (.running (initMachineStateWithMemory body a m))
+    (MirDiffVerdict.toTag_eq_normalUnit_of_toTagWithBody body _ h_ok)
 
 /--
-Certify a Miri `pass` test returning `.scalar ⟨bits, sizeBytes⟩` at `(args, mem)`:
-proves `TotalVerificationResult` via
-`evalMirDiffTagBounded ... = .normalScalar bits sizeBytes`.
+Certify a Miri `pass` test returning `.scalar ⟨bits, sizeBytes⟩` at
+`(args, mem)`: proves `TotalVerificationResult` via
+`(evalMirDiffBounded ...).toTag = .normalScalar bits sizeBytes`.
 -/
 theorem verifyTotalMirScalarPointBounded
+    (body : CapturedMir)
+    (fuel : Nat)
+    (args : List Value)
+    (mem : Memory)
+    (bits sizeBytes : Nat)
+    (h_ok :
+      (evalMirDiffBounded fuel body
+        (initMachineStateWithMemory body args mem)).toTag =
+          .normalScalar bits sizeBytes := by
+      rfl) :
+    TotalVerificationResult
+      { body := body
+        pre := fun a m => a = args ∧ m = mem
+        post := fun _ _ retVal _ =>
+          retVal = .scalar { bits := bits, sizeBytes := sizeBytes } } := by
+  refine verifyTotalMirBounded _ fuel ?_
+  rintro a m ⟨rfl, rfl⟩
+  exact wpCoalBounded_of_evalMirDiffExecBounded_normalScalar
+    fuel body (.running (initMachineStateWithMemory body a m))
+    bits sizeBytes h_ok
+
+/--
+Soundness of `validateScalarEnumCandidate`: any `.some (outBits, outSz)` result
+preserves `(bits, sz)` and establishes `bits < modulus` together with
+`ScalarInt.inRange`.
+-/
+theorem validateScalarEnumCandidate_spec
+    (bits sz modulus : Nat) (validRange : WrappingRange) (outBits outSz : Nat)
+    (h :
+      validateScalarEnumCandidate bits sz modulus validRange =
+        .some (outBits, outSz)) :
+    outBits = bits ∧
+    outSz = sz ∧
+    bits < modulus ∧
+    ScalarInt.inRange { bits := bits, sizeBytes := sz } validRange = true := by
+  unfold validateScalarEnumCandidate at h
+  cases h_ble : Nat.ble (.succ bits) modulus with
+  | false =>
+    simp only [h_ble, Bool.false_and] at h
+    nomatch h
+  | true =>
+    cases h_in :
+        ScalarInt.inRange { bits := bits, sizeBytes := sz } validRange with
+    | false =>
+      simp only [h_ble, h_in, Bool.and_false] at h
+      nomatch h
+    | true =>
+      simp only [h_ble, h_in, Bool.and_true] at h
+      injection h with h_pair
+      injection h_pair with h_b h_sz
+      exact ⟨h_b.symm, h_sz.symm, Eq.mp Nat.ble_eq h_ble, rfl⟩
+
+/--
+Soundness of `scalarEnumReturnTag?`: whenever `scalarEnumReturnTag? body
+variantIdx = .some (bits, sizeBytes)`, the return local permits a scalar-backed
+enum, `1 ≤ sizeBytes ≤ 16`, `bits < scalarModulus sizeBytes`, and `body`'s
+resolved return layout is an inhabited `sizeBytes`-byte integer
+`BackendRepr.scalar (ScalarLayout.initialized (.int (sizeBytes * 8) _)
+validRange)` containing `bits`.
+-/
+theorem scalarEnumReturnTag?_spec
+    (body : CapturedMir) (variantIdx bits sizeBytes : Nat)
+    (h : scalarEnumReturnTag? body variantIdx = .some (bits, sizeBytes)) :
+    returnLocalAllowsScalarEnum body = true ∧
+    0 < sizeBytes ∧
+    sizeBytes ≤ 16 ∧
+    bits < scalarModulus sizeBytes ∧
+    ∃ retLayout isSigned validRange,
+      resolveReturnLayout? body = .some retLayout ∧
+      retLayout.isUninhabited = false ∧
+      retLayout.size.bytes = sizeBytes ∧
+      retLayout.backendRepr =
+        .scalar
+          (.initialized (.int (Nat.mul sizeBytes 8) isSigned) validRange) ∧
+      ScalarInt.inRange
+        { bits := bits, sizeBytes := sizeBytes } validRange = true := by
+  unfold scalarEnumReturnTag? at h
+  cases h_local : returnLocalAllowsScalarEnum body with
+  | false =>
+    simp only [h_local] at h
+    nomatch h
+  | true =>
+    cases h_ret : resolveReturnLayout? body with
+    | none =>
+      simp only [h_local, h_ret] at h
+      nomatch h
+    | some retLayout =>
+      simp only [h_local, h_ret] at h
+      cases h_uninh : retLayout.isUninhabited with
+      | true =>
+        simp only [h_uninh] at h
+        nomatch h
+      | false =>
+        cases h_sz : retLayout.size.bytes with
+        | zero =>
+          simp only [h_uninh, h_sz] at h
+          nomatch h
+        | succ szPred =>
+          cases h_repr : retLayout.backendRepr with
+          | memory =>
+            simp only [h_uninh, h_sz, h_repr] at h
+            nomatch h
+          | scalarPair _ _ =>
+            simp only [h_uninh, h_sz, h_repr] at h
+            nomatch h
+          | scalar sl =>
+            cases sl with
+            | union _ =>
+              simp only [h_uninh, h_sz, h_repr] at h
+              nomatch h
+            | initialized pk validRange =>
+              cases pk with
+              | float _ =>
+                simp only [h_uninh, h_sz, h_repr] at h
+                nomatch h
+              | pointer _ =>
+                simp only [h_uninh, h_sz, h_repr] at h
+                nomatch h
+              | int primBits isSigned =>
+                simp only [h_uninh, h_sz, h_repr] at h
+                cases h_w : Nat.ble (.succ szPred) 16 with
+                | false =>
+                  simp only [h_w, Bool.false_and] at h
+                  nomatch h
+                | true =>
+                  cases h_p : Nat.beq primBits (Nat.mul (.succ szPred) 8) with
+                  | false =>
+                    simp only [h_w, h_p, Bool.and_false] at h
+                    nomatch h
+                  | true =>
+                    simp only [h_w, h_p, Bool.and_true] at h
+                    cases h_cand :
+                        scalarEnumCandidateBits?
+                          body
+                          retLayout
+                          (.succ szPred)
+                          (scalarModulus (.succ szPred))
+                          isSigned
+                          validRange
+                          variantIdx with
+                    | none =>
+                      simp only [h_cand] at h
+                      nomatch h
+                    | some candBits =>
+                      simp only [h_cand] at h
+                      rcases validateScalarEnumCandidate_spec
+                        candBits (.succ szPred) (scalarModulus (.succ szPred))
+                        validRange bits sizeBytes h with
+                        ⟨rfl, rfl, h_lt_mod, h_in⟩
+                      have h_prim : primBits = Nat.mul (.succ szPred) 8 :=
+                        Nat.eq_of_beq_eq_true h_p
+                      subst h_prim
+                      exact
+                        ⟨ rfl
+                        , Nat.zero_lt_succ szPred
+                        , Eq.mp Nat.ble_eq h_w
+                        , h_lt_mod
+                        , ⟨retLayout, isSigned, validRange,
+                            rfl, h_uninh, h_sz, h_repr, h_in⟩ ⟩
+
+/--
+Inversion lemma for `MirDiffVerdict.toTagWithBody`: a `.normalScalar bits
+sizeBytes` tag arises only from a `.normal` return carrying either `.scalar
+⟨bits, sizeBytes⟩` or a fieldless enum `.aggregate variantIdx []` whose
+`scalarEnumReturnTag?` resolves to `(bits, sizeBytes)`.
+-/
+theorem MirDiffVerdict.eq_normal_of_toTagWithBody_normalScalar
+    (body : CapturedMir) (v : MirDiffVerdict) (bits sizeBytes : Nat)
+    (h : v.toTagWithBody body = .normalScalar bits sizeBytes) :
+    ∃ retVal mem,
+      v = .normal retVal mem ∧
+      (retVal = .scalar { bits := bits, sizeBytes := sizeBytes } ∨
+        ∃ variantIdx,
+          retVal = .aggregate variantIdx .nil ∧
+          scalarEnumReturnTag? body variantIdx = .some (bits, sizeBytes)) := by
+  cases v with
+  | normal rv mem =>
+    cases rv with
+    | unit => nomatch h
+    | scalar sc =>
+      rcases sc with ⟨b, sz⟩
+      dsimp only [MirDiffVerdict.toTagWithBody, MirDiffVerdict.toTag] at h
+      injection h with h_b h_sz
+      subst h_b
+      subst h_sz
+      exact ⟨.scalar { bits := b, sizeBytes := sz }, mem, rfl, Or.inl rfl⟩
+    | ptr _ _ => nomatch h
+    | aggregate varIdx fields =>
+      cases fields with
+      | nil =>
+        dsimp only [MirDiffVerdict.toTagWithBody] at h
+        cases h_tag : scalarEnumReturnTag? body varIdx with
+        | none =>
+          rw [h_tag] at h
+          nomatch h
+        | some pair =>
+          rcases pair with ⟨b, sz⟩
+          rw [h_tag] at h
+          injection h with h_b h_sz
+          subst h_b
+          subst h_sz
+          exact
+            ⟨.aggregate varIdx .nil, mem, rfl, Or.inr ⟨varIdx, rfl, h_tag⟩⟩
+      | cons _ _ => nomatch h
+  | panic => nomatch h
+  | abort => nomatch h
+  | ub => nomatch h
+  | unsupported => nomatch h
+  | externalCall _ => nomatch h
+  | outOfFuel => nomatch h
+
+/--
+If `(evalMirDiffExecBounded fuel body st).toTagWithBody body = .normalScalar
+bits sizeBytes`, then `wpCoalBounded` holds under `mirDefaultWP` with a normal
+return carrying either `.scalar ⟨bits, sizeBytes⟩` or a scalar-represented
+fieldless enum `.aggregate variantIdx []` with `scalarEnumReturnTag? body
+variantIdx = .some (bits, sizeBytes)`.
+-/
+theorem wpCoalBounded_of_evalMirDiffExecBounded_toTagWithBody_normalScalar
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState)
+    (bits sizeBytes : Nat)
+    (h_ok :
+      (evalMirDiffExecBounded fuel body st).toTagWithBody body =
+        .normalScalar bits sizeBytes) :
+    wpCoalBounded fuel mirDefaultWP (stepMirState body)
+      (fun out _ =>
+        ∃ retVal mem',
+          out = .normal (retVal, mem') ∧
+          (retVal = .scalar { bits := bits, sizeBytes := sizeBytes } ∨
+            ∃ variantIdx,
+              retVal = .aggregate variantIdx .nil ∧
+              scalarEnumReturnTag? body variantIdx =
+                .some (bits, sizeBytes)))
+      st PUnit.unit := by
+  induction fuel generalizing st with
+  | zero => nomatch h_ok
+  | succ fuel' ih =>
+    unfold evalMirDiffExecBounded at h_ok
+    unfold wpCoalBounded
+    cases h_step : stepMirState body st with
+    | ret out =>
+      cases out with
+      | normal p =>
+        rcases p with ⟨rv, m⟩
+        simp only [h_step] at h_ok ⊢
+        rcases MirDiffVerdict.eq_normal_of_toTagWithBody_normalScalar
+          body (.normal rv m) bits sizeBytes h_ok with
+          ⟨rv', m', h_eq, h_post⟩
+        injection h_eq with h_rv h_m
+        subst h_rv
+        subst h_m
+        exact ⟨rv, m, rfl, h_post⟩
+      | panic =>
+        simp only [h_step] at h_ok
+        nomatch h_ok
+      | abort =>
+        simp only [h_step] at h_ok
+        nomatch h_ok
+    | tau st' =>
+      simp only [h_step] at h_ok ⊢
+      exact ih st' h_ok
+    | vis i k =>
+      rcases i with f | (e | c)
+      · rcases f with ⟨fk⟩
+        cases fk <;>
+          (simp only [h_step, MirDiffVerdict.toTagWithBody,
+            MirDiffVerdict.toTag] at h_ok; nomatch h_ok)
+      · simp only [h_step] at h_ok ⊢
+        cases e
+        exact ih (k PUnit.unit) h_ok
+      · rcases c with ⟨req⟩
+        simp only [h_step, MirDiffVerdict.toTagWithBody,
+          MirDiffVerdict.toTag] at h_ok
+        nomatch h_ok
+
+/--
+Certify a Miri `pass` test reporting `MIRI_PASS:scalar:<bits>:<sizeBytes>` via
+`evalMirDiffTagBounded`, covering both primitive `.scalar` returns and
+scalar-represented fieldless enum `.aggregate variantIdx []` returns.
+-/
+theorem verifyTotalMirDiffScalarPointBounded
     (body : CapturedMir)
     (fuel : Nat)
     (args : List Value)
@@ -5736,10 +6380,14 @@ theorem verifyTotalMirScalarPointBounded
       { body := body
         pre := fun a m => a = args ∧ m = mem
         post := fun _ _ retVal _ =>
-          retVal = .scalar { bits := bits, sizeBytes := sizeBytes } } := by
+          retVal = .scalar { bits := bits, sizeBytes := sizeBytes } ∨
+            ∃ variantIdx,
+              retVal = .aggregate variantIdx .nil ∧
+              scalarEnumReturnTag? body variantIdx =
+                .some (bits, sizeBytes) } := by
   refine verifyTotalMirBounded _ fuel ?_
   rintro a m ⟨rfl, rfl⟩
-  exact wpCoalBounded_of_evalMirDiffExecBounded_normalScalar
+  exact wpCoalBounded_of_evalMirDiffExecBounded_toTagWithBody_normalScalar
     fuel body (.running (initMachineStateWithMemory body a m))
     bits sizeBytes h_ok
 
