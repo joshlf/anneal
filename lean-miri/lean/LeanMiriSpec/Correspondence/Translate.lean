@@ -911,7 +911,19 @@ def annealEvalOperand (localDecls : List LocalDecl) (layouts : LayoutTable)
         throw (.unsupported "projected operand in scalar rvalue")
       let (frame', layout) ← annealResolveAndCacheLocalLayout localDecls layouts place.localId known
       match frame'.getLocalOperand place.localId with
-      | .ok operand => return ⟨operand, layout⟩
+      | .ok operand =>
+        match op with
+        | .Move _ =>
+          match frame'.replaceLocalValue place.localId (.live (.immediate .uninit)) with
+          | .ok frame'' =>
+            let st ← get
+            let idx := st.stack.frames.size - 1
+            if h : idx < st.stack.frames.size then
+              set { st with stack := { frames := st.stack.frames.set idx frame'' h } }
+              return ⟨operand, layout⟩
+            else throw (.stack .emptyStack)
+          | .error e => throw (.stack e)
+        | _ => return ⟨operand, layout⟩
       | .error (.localExpectedLive _) => throw (.undefinedBehavior "read of dead local")
       | .error e => throw (.stack e)
   | .Constant c =>
