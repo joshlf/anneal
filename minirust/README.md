@@ -142,8 +142,8 @@ and `IntType::with_overflow`, returning `(Value::Int(res_wrapped), Value::Bool(r
 `BinOp::Rel` with `RelOp::{Lt, Gt, Le, Ge, Eq, Ne, Cmp}` (all 7 `RelOp`
 variants, through `Machine::eval_rel_op`) on integers and Booleans (pointer
 comparison is `unsupported`),
-`Constant::{Int, Bool, FnPointer, GlobalPointer, VTablePointer, PointerWithoutProvenance}`
-and `Machine::fn_from_ptr`,
+`Constant::{Int, Bool, FnPointer, GlobalPointer, VTablePointer,
+PointerWithoutProvenance}` and `Machine::fn_from_ptr`,
 `Terminator::{Goto, Switch, Call, Return, Unreachable}` (including
 `check_abi_compatibility` across all 7 `Type` variants,
 `Machine::prepare_for_inplace_passing`, `Machine::eval_argument` for `ByValue`
@@ -348,15 +348,21 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
   `multi_step_start_no_returnRel`, and `steps_add_no_returnRel`), converse
   `n`-step error soundness, `MirNoUBTree` safety, arbitrary `n : Nat` outcome
   trichotomy and forward progress (including startup steps `n ≤ initLen entry`),
-  and diverging call-loop liveness on `mirCallTreeWithCallees entry args callees`.
+  and diverging call-loop liveness on
+  `mirCallTreeWithCallees entry args callees`.
 * `iterLiveEntries_stabilizes`, `livenessOk_eq_true`, `liveAtEntry_greatest`,
   `liveAtEntry_zero_mem`, `iterTupleInitEntries_stabilizes`,
   `tupleInitOk_eq_true`, `tupleInitAtEntry_greatest` (`Simulation.lean`):
   unconditional finite-fuel (`N * (L + 1)`) fixed-point convergence of must-live
-  (`liveAtEntry`) and must-initialized `(Int, bool)` 2-tuple (`tupleInitAtEntry`)
-  CFG intersection, unconditional truth of `livenessOk` (whenever `argCount ≤
-  localDecls.length`) and `tupleInitOk`, and Knaster–Tarski greatest
-  post-fixed-point optimality.
+  (`liveAtEntry`) and must-initialized `(Int, bool)` 2-tuple
+  (`tupleInitAtEntry`) CFG intersection, unconditional truth of `livenessOk`
+  (whenever `argCount ≤ localDecls.length`) and `tupleInitOk`, and
+  Knaster–Tarski greatest post-fixed-point optimality. `livenessOk` and
+  `tupleInitOk` therefore never reject a body; `bodyInProgFragment` keeps them
+  as executable certificates whose post-fixed-point property the simulation
+  consumes, and `callDestOk`'s membership tests on `mustLiveBefore` and
+  `tupleInitBefore` (computed from `liveAtEntry` and `tupleInitAtEntry`) are
+  the actual restrictions.
 * `step_correspondence` (`Simulation.lean`): for a single-body fragment, its
   translation, and related states, one step of Anneal's coalgebra
   `stepMirFn body s` and one `Machine::step` satisfy `StepRel`: a silent
@@ -388,8 +394,10 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
   MiniRust started either at `bb0` or at `f.start` performs the corresponding
   return (or raises UB, localized by the `_rel` variants to step `n + 1` from a
   `StateRel`-related machine `mLast` with `¬ ReturnRel` at every prefix step
-  `k ≤ n` via `StateRel.not_returnRel` and `step_start_no_returnRel`) within
-  finitely many steps.
+  `k ≤ n` via `reaches_rel_no_returnRel`, `StateRel.not_returnRel`, and
+  `step_start_no_returnRel`) within finitely many steps. The `MR-1.x`
+  statements of `reaches_rel`, `run_ub`, `run_ub_from_start`, `mirCall_ub`,
+  and `step_start` are unchanged.
 * `steps_error`, `steps_error_from_start`, `mirCall_steps_error` (`Run.lean`):
   conversely, if MiniRust stops with *any* error within `n` steps from
   `StateRel`, `StartRel`, or `mirCallTree body args`, either the error is UB and
@@ -450,8 +458,9 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `mirCallWithCallees_steps_error`, while `projDestCaller_liveness_stabilizes`,
   `projDestCaller_tupleInit_stabilizes`, `projDestCaller_liveAtEntry_greatest`,
   and `projDestCaller_tupleInitAtEntry_greatest` instantiate the fixed-point
-  stabilization and greatest-fixed-point theorems; `callSpinCaller` proves infinite lockstep
-  call/return divergence (`callSpin_minirust_diverges_rel`) and
+  stabilization and greatest-fixed-point theorems; `callSpinCaller` proves
+  infinite lockstep call/return divergence (`callSpin_minirust_diverges_rel`)
+  and
   `liveCallDestSpinCaller` divergence inside a callee that never returns
   (`liveCallDestSpin_minirust_diverges_rel`); `moveReinitByCall`
   re-initializes a moved-out local via a root call destination, and
@@ -476,7 +485,8 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `layout_ptr_and_array_mr41`, `evalConstant_and_fnFromPtr_mr41`,
   `checkAbiCompatibility_all_variants_mr41`, `createFrame_ub_mr41`, and
   `evalReturn_missingNextBlock_and_bottomOfStack_ub` directly verify every
-  transcribed MR-4.1 spec item.
+  transcribed MR-4.1 spec item, while `progStart_outside_fragment` shows why
+  the theorems start at `fEntry.start` rather than `prog.start`.
 * `tempMove`, `crossBlockMove`, `loopTempMove`, `storageLiveArgRet`,
   `diamondMoveJoin`, `tupleAggCastMove`, and `ordBoolCastTempMove` (MR-1.3):
   `tempMove` is
@@ -758,11 +768,15 @@ These are deliberate and are the first things to lift:
   `ReturnRel`, and the witnesses' external caller (`callerFn`, with no blocks)
   stops with a `specPanic`, never UB, right after the return
   (`never_ub_of_nonUb_stop`).
-* **`extern "C"` entry functions.** `mkStartFn` calls the entry with
-  `CallingConvention::Rust`, as `minimize`'s `mk_start_fn` does, so a
-  translated program whose entry has `CallConv.c` would fault in `create_frame`
-  if run from `prog.start`. The correspondence theorems start at
-  `fEntry.start` under an external `rootCtx` and are unaffected.
+* **`prog.start` is not modeled.** `mkStartFn` transcribes `minimize`'s
+  `mk_start_fn`, which calls the entry with `CallingConvention::Rust`, no
+  arguments, and a `()` return place built by `build::unit_place()`. The
+  interpretation reports that `PlaceExpr::Deref` as `unsupported`, and the call
+  would fail `create_frame` anyway for any entry that takes arguments, returns
+  a non-`()` type, or has `CallConv.c` (`progStart_outside_fragment` checks
+  this for `callerMain` and `cAbiCallee`). The correspondence theorems
+  therefore start at `fEntry.start` under an external `rootCtx` that supplies
+  the arguments and a return place of the entry's own type.
 * **Branch observations.** Anneal's `switchInt` emits the scrutinee as a
   visible leakage event; MiniRust has no counterpart, so `StepRel` matches it
   with an ordinary MiniRust step.

@@ -6,7 +6,7 @@ license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
 This file may not be copied, modified, or distributed except according to
 those terms. -->
 
-# Reproducing `MR-4.1`: multi-frame `Terminator::Call` & `Return` stack simulation
+# Reproducing `MR-4.1`: multi-frame `Terminator::Call` & `Return` simulation
 
 This guide lets an independent reviewer check every claim of work unit
 `MR-4.1` from a clean checkout of branch `adv/mr-4-1`. Run all commands from
@@ -92,7 +92,8 @@ as a pass.
     `TerminatorKind.call` and `1` step on nested `Return` / root `Return` /
     statements / branches, while `steps_ok_mono` prevents any intermediate error
     at `j < k` from hiding).
-  - Translation faithfulness lemmas (`translateFnInProg_eq_translateFn_of_no_calls`,
+  - Translation faithfulness lemmas
+    (`translateFnInProg_eq_translateFn_of_no_calls`,
     `translateBlocksInProg_eq_of_no_calls`,
     `translateTerminatorInProg_eq_of_not_call`, `translateUnwindAction_spec`,
     `mkStartFn_spec`, `translateCallConv_eq_some_iff`,
@@ -102,12 +103,13 @@ as a pass.
     `steps_add_no_returnRel`, and the full `Run.lean` suite
     `mirCallWithCallees_{ret, ub, ub_rel, noUB, steps_error, progress,
     progress_any, outcome, outcome_any, diverges_steps_ok, diverges_rel}` plus
-    single-body `run_ub_rel`, `run_ub_rel_from_start`, and `mirCall_ub_rel`
-    (preserving all single-body `MR-1.1..1.3` theorems with zero regressions),
-    where `run_ub_rel` / `mirCall_ub_rel` and `multi_run_ub_rel` /
-    `mirCallWithCallees_ub_rel` localize forward UB to step `n + 1` from a
-    `StateRel`- or `MultiStateRel`-related machine `mLast` with `¬ ReturnRel` at
-    every prefix step `k ≤ n` (`StateRel.not_returnRel`,
+    single-body `reaches_rel_no_returnRel`, `run_ub_rel`,
+    `run_ub_rel_from_start`, and `mirCall_ub_rel` (all `MR-1.1..1.3` theorem
+    statements, including `reaches_rel`, `step_start`, `run_ub`, and
+    `mirCall_ub`, are unchanged), where `run_ub_rel` / `mirCall_ub_rel` and
+    `multi_run_ub_rel` / `mirCallWithCallees_ub_rel` localize forward UB to
+    step `n + 1` from a `StateRel`- or `MultiStateRel`-related machine `mLast`
+    with `¬ ReturnRel` at every prefix step `k ≤ n` (`StateRel.not_returnRel`,
     `MultiStateRel.not_returnRel`, `step_start_no_returnRel`,
     `multi_step_start_no_returnRel`).
 - **Witnesses & audit** (`Witness.lean`, `Audit.lean`):
@@ -124,13 +126,16 @@ as a pass.
     call graph mixing `.Rust` and `.C` ABIs and sharing leaf `cAbiCallee`),
     `callArgUbCaller`, `calleeDivZeroCaller`, `calleeRetUninitCaller`, and
     `callMoveReuse` (localized via `mirCallWithCallees_ub_rel` in
-    `{callArgUb, calleeDivZero, calleeRetUninit, callMoveReuse}_minirust_ub_rel`,
-    alongside single-body `{retUninit, negMention0}_minirust_ub_rel_from_start`),
-    `callSpinCaller` (diverging call/return cycle), `liveCallDestSpinCaller`
-    (divergence inside a callee that never returns, stack depth `3` forever),
-    `moveReinitByCall` (root call destination re-initializing a moved-out local),
-    `condCallMoveJoin` (branch-correlated `InPlace` call move across a CFG join),
-    and ground-truth `Interp` unit checks.
+    `{callArgUb, calleeDivZero, calleeRetUninit,
+    callMoveReuse}_minirust_ub_rel`, alongside single-body
+    `{retUninit, negMention0}_minirust_ub_rel_from_start`), `callSpinCaller`
+    (diverging call/return cycle), `liveCallDestSpinCaller` (divergence inside
+    a callee that never returns, stack depth `3` forever), `moveReinitByCall`
+    (root call destination re-initializing a moved-out local),
+    `condCallMoveJoin` (branch-correlated `InPlace` call move across a CFG
+    join), `progStart_outside_fragment` (why the theorems start at
+    `fEntry.start` rather than `prog.start`), and ground-truth `Interp` unit
+    checks.
   - Necessity witnesses: `deadCallDestSpinCaller` (dead return place, diverging
     callee), `abiArgMismatchCaller` and `abiRetMismatchCaller` (parameter and
     return types), `argCountMismatchCaller` (argument count),
@@ -154,9 +159,12 @@ as a pass.
 
 ```bash
 export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
-git log --oneline 41bc68d1..HEAD   # the [adv A0] .. checkpoints of MR-4.1
+git log --oneline 41bc68d1..HEAD   # pass: the nine checkpoints of MR-4.1
 git status --porcelain             # pass: no output
 ```
+
+The checkpoints are, oldest first, `[adv A0]`, `[adv B1]`, `[adv A1]`,
+`[adv B2]`, `[adv A2]`, `[adv B3]`, `[adv A3]`, `[adv B4]`, and `[adv A4]`.
 
 ## Step 1: repository hygiene
 
@@ -175,8 +183,8 @@ cargo test -p anneal-minirust-gen --offline
 ```
 
 Pass: all `22` tests (`8` unit + `7` pipeline + `7` quotes) pass, including
-`anchors_match_generated_items_and_cover_interp` (`61` anchors, `>= 247`
-`[SIMULATION-AUDIT]` theorems, `>= 569` `[WITNESS-AUDIT]` theorems) in
+`anchors_match_generated_items_and_cover_interp` (`61` anchors, `>= 248`
+`[SIMULATION-AUDIT]` theorems, `>= 570` `[WITNESS-AUDIT]` theorems) in
 `tests/pipeline.rs` and `call_return_and_multi_fn_quotations_are_pinned` (`20`
 pinned `MR-4.1` quotations) in `tests/quotes.rs`.
 
@@ -193,9 +201,9 @@ Pass: `Build completed successfully`, with:
 
 ```text
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
-[SIMULATION-AUDIT] decls=247 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
-[WITNESS-AUDIT] decls=569 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-MiniRustSpec.Audit: exhaustively verified standard axioms for 12097 declarations across all MiniRustSpec.* modules
+[SIMULATION-AUDIT] decls=248 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
+[WITNESS-AUDIT] decls=570 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+MiniRustSpec.Audit: exhaustively verified standard axioms for 12106 declarations across all MiniRustSpec.* modules
 ```
 
 (`lake` prints already-built modules without re-running them; to see the audit
@@ -238,12 +246,17 @@ lines again after a successful build, touch
 - Statement/switch `movesOk` remains path-insensitive at CFG joins (whereas
   `Call` `Operand::Move` lowers via `ArgumentExpr::InPlace` and writes `Uninit`
   in both semantics).
-- Plain `run_ub`, `mirCall_ub`, and `mirCallWithCallees_ub` state only `∃ n msg,
-  Interp.steps n m = .error (.ub msg)`; their `_rel` counterparts (`run_ub_rel`,
-  `run_ub_rel_from_start`, `mirCall_ub_rel`, `multi_run_ub_rel`,
-  `multi_run_ub_rel_from_start`, and `mirCallWithCallees_ub_rel`) localize the UB
-  to step `n + 1` from a `StateRel`- or `MultiStateRel`-related machine with
-  prefix-wide `¬ ReturnRel` across every step `k ≤ n`.
-- `mkStartFn` calls the entry with `CallingConvention::Rust` (as `minimize`
-  does), so an `extern "C"` entry would fault if run from `prog.start`; the
-  theorems start at `fEntry.start` and are unaffected.
+- Plain `run_ub`, `mirCall_ub`, and `mirCallWithCallees_ub` state only
+  `∃ n msg, Interp.steps n m = .error (.ub msg)`; their `_rel` counterparts
+  (`run_ub_rel`, `run_ub_rel_from_start`, `mirCall_ub_rel`,
+  `multi_run_ub_rel`, `multi_run_ub_rel_from_start`, and
+  `mirCallWithCallees_ub_rel`) localize the UB to step `n + 1` from a
+  `StateRel`- or `MultiStateRel`-related machine with prefix-wide
+  `¬ ReturnRel` across every step `k ≤ n`.
+- `prog.start` is not modeled: `mkStartFn` (like `minimize`'s `mk_start_fn`)
+  calls the entry with `CallingConvention::Rust`, no arguments, and a `()`
+  return place through a `PlaceExpr::Deref` that the interpretation reports as
+  `unsupported`, and that call would fail `create_frame` for entries that take
+  arguments, return a non-`()` type, or use `CallConv.c`
+  (`progStart_outside_fragment`). The theorems start at `fEntry.start` under an
+  external `rootCtx` instead.

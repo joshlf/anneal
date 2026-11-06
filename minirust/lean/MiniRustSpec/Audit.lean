@@ -145,6 +145,7 @@ open MiniRustSpec.Correspondence in
   initMachineState_startRel
   steps_ok_mono
   reaches_rel
+  reaches_rel_no_returnRel
   run_ret
   run_ret_from_start
   run_ub
@@ -589,6 +590,7 @@ open MiniRustSpec.Correspondence.Witness in
   projDestCaller_tupleInit_stabilizes
   projDestCaller_liveAtEntry_greatest
   projDestCaller_tupleInitAtEntry_greatest
+  progStart_outside_fragment
   ctx0_ok1
   ctx0_ok2
   ctxI8_ok2
@@ -1198,6 +1200,7 @@ open MiniRustSpec.Correspondence in
   step_start_with_no_returnRel
   step_start_no_returnRel
   initMachineState_startRel
+  reaches_rel_no_returnRel
   run_ret
   run_ret_from_start
   run_ub
@@ -1578,6 +1581,7 @@ open MiniRustSpec.Correspondence.Witness in
   projDestCaller_tupleInit_stabilizes
   projDestCaller_liveAtEntry_greatest
   projDestCaller_tupleInitAtEntry_greatest
+  progStart_outside_fragment
   cmpNotSwitch_inFragment
   cmpNotSwitch_translate
   cmpNotNeg1_anneal_ret

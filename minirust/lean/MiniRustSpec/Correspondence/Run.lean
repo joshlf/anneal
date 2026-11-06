@@ -86,7 +86,8 @@ theorem tauStar_reaches {t u : ITree MirEffect MirOutcome} (h : TauStar t u) : R
 
 /-- Every Anneal execution prefix from related states is matched by MiniRust
 steps to a related state, and no intermediate step satisfies `ReturnRel`. -/
-theorem reaches_rel {body : CapturedMir} {f : Gen.Function} (hfrag : inFragment body = true)
+theorem reaches_rel_no_returnRel {body : CapturedMir} {f : Gen.Function}
+    (hfrag : inFragment body = true)
     (hf : translateFn body = some f) (ctx : Ctx) {t u : ITree MirEffect MirOutcome}
     {tr : List (Event MirEffect)} (h : Reaches t tr u) :
     ∀ (s : MachineState) (m : Mach), t = mirTree body s → StateRel body f ctx s m →
@@ -164,6 +165,21 @@ theorem reaches_rel {body : CapturedMir} {f : Gen.Function} (hfrag : inFragment 
             simp only [Interp.steps, hm1, ok_bind] at hmk
             exact hno k' (by omega) mk hmk
 
+/-- Every Anneal execution prefix from related states is matched by MiniRust
+steps to a related state (the `MR-1.x` statement, kept unchanged;
+`reaches_rel_no_returnRel` adds that no intermediate step satisfies
+`ReturnRel`). -/
+theorem reaches_rel {body : CapturedMir} {f : Gen.Function} (hfrag : inFragment body = true)
+    (hf : translateFn body = some f) (ctx : Ctx) {t u : ITree MirEffect MirOutcome}
+    {tr : List (Event MirEffect)} (h : Reaches t tr u) :
+    ∀ (s : MachineState) (m : Mach), t = mirTree body s → StateRel body f ctx s m →
+      ∃ (n : Nat) (s' : MachineState) (m' : Mach), Interp.steps n m = .ok m' ∧
+        StateRel body f ctx s' m' ∧ u = mirTree body s' := by
+  intro s m ht hrel
+  obtain ⟨n, s', m', hsteps, hrel', hu, _⟩ :=
+    reaches_rel_no_returnRel hfrag hf ctx h s m ht hrel
+  exact ⟨n, s', m', hsteps, hrel', hu⟩
+
 /-- **Returns.** If Anneal's semantics of `body` from `s` returns `v` (along
 any trace of branch observations), MiniRust, started from a related machine,
 performs the corresponding function return after finitely many steps. -/
@@ -174,7 +190,7 @@ theorem run_ret {body : CapturedMir} {f : Gen.Function} (hfrag : inFragment body
     ∃ (n : Nat) (s' : MachineState) (m' : Mach),
       Interp.steps n m = .ok m' ∧ ReturnRel body ctx s' v m' := by
   obtain ⟨u, hreach, hu⟩ := hret
-  obtain ⟨n, s', m', hsteps, hrel', rfl, _⟩ := reaches_rel hfrag hf ctx hreach s m rfl hrel
+  obtain ⟨n, s', m', hsteps, hrel', rfl⟩ := reaches_rel hfrag hf ctx hreach s m rfl hrel
   have hsr := step_correspondence body f hfrag hf ctx s' m' hrel'
   rw [mirTree_observe] at hu
   generalize stepMirFn body s' = node at hsr hu
@@ -217,9 +233,10 @@ theorem run_ub_rel {body : CapturedMir} {f : Gen.Function} (hfrag : inFragment b
       (∀ k ≤ n, ∀ mk, Interp.steps k m = .ok mk →
         ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
   obtain ⟨t', i, k, htau, hobs, hfi⟩ := hfault
-  obtain ⟨n1, s1, m1, h1, hrel1, rfl, hno1⟩ := reaches_rel hfrag hf ctx hreach s m rfl hrel
+  obtain ⟨n1, s1, m1, h1, hrel1, rfl, hno1⟩ :=
+    reaches_rel_no_returnRel hfrag hf ctx hreach s m rfl hrel
   obtain ⟨n2, s2, m2, h2, hrel2, rfl, hno2⟩ :=
-    reaches_rel hfrag hf ctx (tauStar_reaches htau) s1 m1 rfl hrel1
+    reaches_rel_no_returnRel hfrag hf ctx (tauStar_reaches htau) s1 m1 rfl hrel1
   have hsr := step_correspondence body f hfrag hf ctx s2 m2 hrel2
   rw [mirTree_observe] at hobs
   generalize stepMirFn body s2 = node at hsr hobs

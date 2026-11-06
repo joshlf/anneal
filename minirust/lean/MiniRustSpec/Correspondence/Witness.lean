@@ -142,7 +142,9 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
   pre-call `move` reuse, unsupported calling conventions, and cyclic call graphs
   (where the necessity witnesses also refute the conclusion of
   `mirCallWithCallees_noUB` or `mirCallWithCallees_ub` outright), plus
-  ground-truth unit checks of the `MR-4.1` `Interp` definitions.
+  ground-truth unit checks of the `MR-4.1` `Interp` definitions and
+  `progStart_outside_fragment`, which shows why the theorems start at
+  `fEntry.start` under an external caller rather than at `prog.start`.
 -/
 
 namespace MiniRustSpec.Correspondence.Witness
@@ -9815,7 +9817,8 @@ theorem calleeRetUninit_converse_error :
     (by decide) calleeRetUninitMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
     calleeRetUninit_minirust_direct
 
-/-! ### Pass `B4`: Localized single-body & multi-function UB witnesses and fixed-point convergence witnesses -/
+/-! ### Pass `B4`: localized single-body and multi-function UB witnesses, and
+fixed-point convergence witnesses -/
 
 /-- Single-body localized UB from `f.start` (`mirCall_ub_rel`) on `retUninit`:
 MiniRust steps to a `StateRel`-related state `mLast` with `¬ ReturnRel` at every
@@ -9981,5 +9984,38 @@ theorem projDestCaller_tupleInitAtEntry_greatest {dst : Nat}
       rcases (by omega : d = 0 ∨ d = 1 ∨ d = 2) with rfl | rfl | rfl <;>
       (intro bb hbb; simp [projDestCaller] at hbb; subst hbb; decide))
     hdst
+
+/-! ### `prog.start` versus the external caller -/
+
+/-- Whether an `Interp` result is a `Stop.unsupported`. -/
+def isUnsupportedStop {α : Type} : Interp α → Bool
+  | .error (.unsupported _) => true
+  | _ => false
+
+/-- The translation of the `extern "C"` callee `cAbiCallee`. -/
+def cAbiCalleeFn : Gen.Function :=
+  (translateFnInProg (fnNameMap cAbiCaller [cAbiCallee]) cAbiCallee).getD callerFn
+
+/-- The dangling, aligned pointer behind `build::unit_place()`. -/
+def unitPlacePtr : Ptr := { addr := 1, provenance := none }
+
+/-- Why the correspondence starts at `fEntry.start` under an external `rootCtx`
+rather than at `prog.start`. `mkStartFn`'s first block evaluates
+`build::unit_place()`, a `PlaceExpr::Deref` that this interpretation reports as
+`unsupported`. Even past that, the `Terminator::Call` it performs (Rust calling
+convention, no arguments, a `()` return place, as in `minimize`'s
+`mk_start_fn`) fails `create_frame` for an entry such as `callerMain`, which
+returns `u32`, and for any `extern "C"` entry such as `cAbiCallee`. `rootCtx`
+instead supplies the entry's arguments and a return place of its own type
+(`CtxOk`). -/
+theorem progStart_outside_fragment :
+    isUnsupportedStop (evalPlace callerCallee20MInit buildUnitPlace) = true ∧
+    createFrame callerCallee20MInit callerMainFn
+      (.BackToCaller (some (bbName 1)) (some (bbName 2)) unitPlacePtr) .Rust unitTy [] =
+      .error (.ub "call ABI violation: return types are not compatible") ∧
+    createFrame callerCallee20MInit cAbiCalleeFn
+      (.BackToCaller (some (bbName 1)) (some (bbName 2)) unitPlacePtr) .Rust unitTy [] =
+      .error (.ub "call ABI violation: calling conventions are not the same") :=
+  ⟨rfl, eq_error_ub_of_ubMsg? (by decide +kernel), eq_error_ub_of_ubMsg? (by decide +kernel)⟩
 
 end MiniRustSpec.Correspondence.Witness
