@@ -7,7 +7,8 @@
 // those terms.
 
 // === case: alloc_passthrough_with_spec ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ pass
+//@ mir-contains: "Trusted.PostSpec.ensuresEqArg 1"
 
 /// anneal:spec ensures(ret == x)
 pub fn alloc_passthrough(x: usize) -> usize {
@@ -16,7 +17,7 @@ pub fn alloc_passthrough(x: usize) -> usize {
 }
 
 // === case: alloc_passthrough_unannotated ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ pass
 
 pub fn alloc_passthrough(x: usize) -> usize {
     let r = &x;
@@ -24,7 +25,7 @@ pub fn alloc_passthrough(x: usize) -> usize {
 }
 
 // === case: wrong_alloc_passthrough ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ fail(proof, alloc_passthrough): "unproved function body"
 
 /// anneal:spec ensures(ret == x)
 pub fn alloc_passthrough(x: usize) -> usize {

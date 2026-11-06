@@ -7,7 +7,8 @@
 // those terms.
 
 // === case: annotated_id ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ pass
+//@ mir-contains: "Trusted.PostSpec.ensuresEqArg 1"
 
 /// anneal:spec ensures(ret == x)
 pub fn id(x: usize) -> usize {
@@ -15,14 +16,15 @@ pub fn id(x: usize) -> usize {
 }
 
 // === case: unannotated_id ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ pass
 
 pub fn id(x: usize) -> usize {
     x
 }
 
 // === case: id_move_via_local ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ known_bug(#87, proof, id): "unproved function body"
+//@ mir-contains: "Trusted.PostSpec.ensuresEqArg 1"
 
 /// anneal:spec ensures(ret == x)
 pub fn id(x: usize) -> usize {
@@ -31,7 +33,7 @@ pub fn id(x: usize) -> usize {
 }
 
 // === case: wrong_id_returns_zero ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ fail(proof, id): "unproved function body"
 
 /// anneal:spec ensures(ret == x)
 pub fn id(x: usize) -> usize {
@@ -40,14 +42,15 @@ pub fn id(x: usize) -> usize {
 }
 
 // === case: unsupported_u32_signature ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ fail(proof, add): "unsupported type in function signature"
+//@ mir-contains: "Trusted.MirTy.uint 32"
 
 pub fn add(x: u32, y: u32) -> u32 {
     x.wrapping_add(y)
 }
 
 // === case: requires_on_safe_fn_rejected ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ fail(capture): "`requires` is only accepted on `unsafe fn`"
 
 /// anneal:requires x != 0
 pub fn id(x: usize) -> usize {
@@ -55,7 +58,7 @@ pub fn id(x: usize) -> usize {
 }
 
 // === case: unsafe_fn_with_requires ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ fail(proof, id): "unexpected requires clause"
 
 /// anneal:requires x != 0
 pub unsafe fn id(x: usize) -> usize {
@@ -63,7 +66,7 @@ pub unsafe fn id(x: usize) -> usize {
 }
 
 // === case: unknown_spec_ident_rejected ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ fail(capture): "ensures"
 
 /// anneal:spec ensures(ret == y)
 pub fn id(x: usize) -> usize {
@@ -71,7 +74,7 @@ pub fn id(x: usize) -> usize {
 }
 
 // === case: known_bug_wrapping_add_one ===
-//@ known_bug(#87, capture): "MIR capture not yet implemented"
+//@ known_bug(#87, proof, add_one): "unproved function body"
 
 pub fn add_one(x: usize) -> usize {
     x.wrapping_add(1)

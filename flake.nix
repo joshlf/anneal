@@ -57,14 +57,6 @@
             url = "https://github.com/leanprover/lean4/releases/download/v${leanVersion}/lean-${leanVersion}-${platform.leanPlatform}.tar.zst";
             sha256 = platform.leanSha256;
           };
-
-          rustcCaptureSourceFiles = pkgs.lib.fileset.toSource {
-            root = ./.;
-            fileset = pkgs.lib.fileset.unions [
-              ./Cargo.lock
-              ./trusted/rustc-capture
-            ];
-          };
         in
         {
           # Download and unpack the multi-component Rust toolchain as a
@@ -168,16 +160,44 @@
             '';
           };
 
-          rustc-capture = pkgs.rustPlatform.buildRustPackage {
+          rustc-capture = pkgs.stdenv.mkDerivation {
             pname = "anneal-rustc-capture";
             version = "0.1.0";
-            src = rustcCaptureSourceFiles;
-            sourceRoot = "source/trusted/rustc-capture";
-            postUnpack = ''
-              cp "$sourceRoot/../../Cargo.lock" "$sourceRoot/Cargo.lock"
-              chmod +w "$sourceRoot/Cargo.lock"
+            src = ./trusted/rustc-capture;
+            rustToolchain = self.packages.${system}.rust-toolchain;
+            dontUnpack = true;
+            dontStrip = true;
+            buildPhase = ''
+              set -euo pipefail
+              mkdir -p "$out/bin"
+              ${if pkgs.stdenv.isLinux then ''
+                "$(cat "${pkgs.stdenv.cc}/nix-support/dynamic-linker")" \
+                  --library-path "$rustToolchain/lib:${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.zlib}/lib" \
+                  "$rustToolchain/bin/rustc" \
+                  --edition=2024 \
+                  --crate-name anneal_rustc_capture \
+                  --sysroot "$rustToolchain" \
+                  -C linker="${pkgs.stdenv.cc}/bin/cc" \
+                  -C link-self-contained=-linker \
+                  -C linker-features=-lld \
+                  -C link-arg="-Wl,-rpath-link,$rustToolchain/lib:${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.zlib}/lib" \
+                  -C opt-level=2 \
+                  "$src/src/main.rs" \
+                  -o "$out/bin/anneal-rustc-capture"
+              '' else ''
+                DYLD_LIBRARY_PATH="$rustToolchain/lib" \
+                  "$rustToolchain/bin/rustc" \
+                  --edition=2024 \
+                  --crate-name anneal_rustc_capture \
+                  --sysroot "$rustToolchain" \
+                  -C linker="${pkgs.stdenv.cc}/bin/cc" \
+                  -C link-self-contained=-linker \
+                  -C linker-features=-lld \
+                  -C opt-level=2 \
+                  "$src/src/main.rs" \
+                  -o "$out/bin/anneal-rustc-capture"
+              ''}
             '';
-            cargoLock.lockFile = ./Cargo.lock;
           };
 
           omnibus-archive = pkgs.stdenv.mkDerivation {
