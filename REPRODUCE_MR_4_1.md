@@ -74,7 +74,7 @@ Pass: `Build completed successfully`, with:
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
 [SIMULATION-AUDIT] decls=209 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
 [WITNESS-AUDIT] decls=458 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-MiniRustSpec.Audit: exhaustively verified standard axioms for 11648 declarations across all MiniRustSpec.* modules
+MiniRustSpec.Audit: exhaustively verified standard axioms for 11641 declarations across all MiniRustSpec.* modules
 ```
 
 ## Step 4: spot checks
