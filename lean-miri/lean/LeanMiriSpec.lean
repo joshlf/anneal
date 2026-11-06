@@ -10,7 +10,9 @@ those terms.
 
 import LeanMiriSpec.Correspondence.Translate
 import LeanMiriSpec.Correspondence.Relation
+import LeanMiriSpec.Correspondence.SimLM1_2
 import LeanMiriSpec.Correspondence.Simulation
+import LeanMiriSpec.Correspondence.WitLM1_2
 import LeanMiriSpec.Correspondence.Witness
 import LeanMiriSpec.Audit
 
