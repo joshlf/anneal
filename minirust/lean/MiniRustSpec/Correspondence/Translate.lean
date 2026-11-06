@@ -1314,11 +1314,21 @@ which is exactly the `calling_convention` that `translateFnInProg` gives the
 callee (and `create_frame`'s calling-convention check never fails on a
 translated direct call). Non-call terminators delegate directly to
 `translateTerminator` and synthesize no extra cleanup blocks. -/
+
+
+def stripIntrinsicPrefix (str : String) : Option String :=
+  let rec go (p s : List Char) : Option (List Char) :=
+    match p, s with
+    | [], s => some s
+    | c::p', d::s' => if c = d then go p' s' else none
+    | _, _ => none
+  (go "core::intrinsics::".toList str.toList).map String.mk
+
 def translateIntrinsicOrNone (defPath : String) (argOps : List MirAst.Operand)
     (destination : MirAst.Place) (target : Option MirAst.BasicBlockIdx) : Option TerminatorResult :=
-  if defPath.startsWith "core::intrinsics::" then
-    translateRsIntrinsic (defPath.drop 18).toString argOps destination target
-  else none
+  match stripIntrinsicPrefix defPath with
+  | some name => translateRsIntrinsic name argOps destination target
+  | none => none
 
 def translateTerminatorInProg (fnMap : FnMap)
     (decls : List MirAst.LocalDecl) (nextCleanup : Nat) (t : MirAst.Terminator) :
