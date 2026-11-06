@@ -145,6 +145,9 @@ open LeanMiriSpec.Correspondence in
   Witness.addUncheckedNop_witness_agrees
   Witness.annealCast_intToInt_fidelity
   Witness.annealSwitchInt_fidelity
+  Witness.stateRel_unaryBitwise
+  Witness.wellTyped_unaryBitwise
+  Witness.unaryBitwise_returns_agree
 
 /-- Exhaustively verify that every declaration across every imported
 `LeanMiriSpec.*` and `Miri.*` module in the environment — as well as every
@@ -347,6 +350,15 @@ example (rhs : Nat) (hrhs : rhs < 256) :
       (Witness.annealAddUncheckedNopInit rhs)
       (Witness.miriAddUncheckedNopInit rhs) :=
   ⟨Witness.wellTyped_addUncheckedNop rhs hrhs, Witness.stateRel_addUncheckedNop rhs⟩
+
+example :
+    WellTypedBody Witness.unaryBitwiseBody ∧
+    StateRel Witness.unaryBitwiseBody Witness.annealUnaryBitwiseInit Witness.miriUnaryBitwiseInit ∧
+    (Witness.annealOutcomeScalarBits 1
+        (runAnnealBounded Witness.unaryBitwiseBody 6 Witness.annealUnaryBitwiseInit) = some 0x2A ∧
+      Witness.miriOutcomeScalarBits 1
+        (runMiriBounded Witness.unaryBitwiseBody 6 Witness.miriUnaryBitwiseInit) = some 0x2A) :=
+  ⟨Witness.wellTyped_unaryBitwise, Witness.stateRel_unaryBitwise, Witness.unaryBitwise_returns_agree⟩
 
 end StatementPins
 

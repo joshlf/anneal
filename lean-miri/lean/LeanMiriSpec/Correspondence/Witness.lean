@@ -1439,4 +1439,136 @@ theorem annealSwitchInt_fidelity :
       (resPtrEmpty.1.stack.currentFrame?.map (·.location)) = some (.mir ⟨1, 0⟩)) := by
   exact ⟨by with_unfolding_all rfl, ⟨by with_unfolding_all rfl, by with_unfolding_all rfl⟩⟩
 
+/-! ## Unary (`Neg` on `i8::MIN`, `Not`) and Bitwise (`BitXor`) witness -/
+
+def constI8W (bits : Nat) : ConstOperand := { ty := i8TyW, val := .scalar (.int ⟨bits, 1⟩) }
+
+def i8LayoutW : TypeLayout :=
+  { size := { bytes := 1 }, align := { bytes := 1 }, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false }
+
+def fnAbiI8W : FnAbi :=
+  { args := [], ret := { layout := i8LayoutW, mode := .direct }, conv := .rust, canUnwind := false }
+
+/-- `Runtime(PostCleanup)` MIR body exercising wrapping `UnOp.neg` on `i8::MIN`
+(`-128_i8 = 0x80`, which wraps to `0x80` without UB in MIR `UnOp::Neg`),
+`UnOp.not`, and `BinOp.bitXor`:
+```text
+bb0: StorageLive(_1); _1 = Neg(const -128_i8); _1 = Not(copy _1);
+     _0 = BitXor(copy _1, const 0x55_i8); StorageDead(_1); return
+```
+`-(-128_i8) = 0x80`, `!0x80 = 0x7F`, `0x7F ^ 0x55 = 0x2A` (`42`). -/
+def unaryBitwiseBody : CapturedMir where
+  defPath := "lm_1_1_witness::unary_bitwise"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [i8DeclW, i8DeclW]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 1),
+        mkStmt (.assign (local_ 1) (.unaryOp .neg (.constant (constI8W 0x80)))),
+        mkStmt (.assign (local_ 1) (.unaryOp .not (.copy (local_ 1)))),
+        mkStmt (.assign (local_ 0) (.binaryOp .bitXor (.copy (local_ 1)) (.constant (constI8W 0x55)))),
+        mkStmt (.storageDead 1)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8W
+  layouts := emptyLayoutTable
+  allocations := []
+
+def annealUnaryBitwiseInit : MachineState := initMachineState unaryBitwiseBody []
+
+def miriUnaryBitwiseFrame :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody unaryBitwiseBody
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy i8TyW) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[{ value := .live (.immediate .uninit), layout := none },
+      { value := .dead, layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 0⟩ }
+
+def miriUnaryBitwiseInit : AnnealStepState :=
+  { stack := ⟨#[miriUnaryBitwiseFrame]⟩, machine := AnnealMachine.empty }
+
+theorem stateRel_unaryBitwise :
+    StateRel unaryBitwiseBody annealUnaryBitwiseInit miriUnaryBitwiseInit := by
+  refine StateRel.mk miriUnaryBitwiseFrame rfl rfl ⟨translateTy i8TyW, rfl⟩ ?_
+    rfl rfl rfl rfl rfl
+  refine
+    { body_eq := rfl
+      location_eq := rfl
+      af_locals_len := rfl
+      mf_locals_size := rfl
+      locals_rel := ?_ }
+  intro i decl slot mls hdecl hslot hmls
+  match i with
+  | 0 =>
+    have hd : decl = i8DeclW := by simpa [unaryBitwiseBody, get?] using hdecl.symm
+    have hs : slot = .uninit := by
+      simpa [annealUnaryBitwiseInit, initMachineState, unaryBitwiseBody, initLocalsAux, get?]
+        using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [miriUnaryBitwiseFrame] using hmls.symm
+    subst hd hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | 1 =>
+    have hd : decl = i8DeclW := by simpa [unaryBitwiseBody, get?] using hdecl.symm
+    have hs : slot = .dead := by
+      simpa [annealUnaryBitwiseInit, initMachineState, unaryBitwiseBody, initLocalsAux, get?]
+        using hslot.symm
+    have hm : mls = { value := .dead, layout := none } := by
+      simpa [miriUnaryBitwiseFrame] using hmls.symm
+    subst hd hs hm
+    exact .dead none (fun _ h => nomatch h)
+  | n + 2 =>
+    simp [unaryBitwiseBody, get?] at hdecl
+
+theorem wellTyped_unaryBitwise : WellTypedBody unaryBitwiseBody := by
+  have hi8 : IsPrimScalarTy i8TyW := Or.inr (Or.inr (Or.inl ⟨.i8, rfl⟩))
+  have hi8int : IsIntegralTy i8TyW (translateIntTy .i8) := .int .i8 rfl
+  have hconst80 : WellTypedScalarOperandSyn unaryBitwiseBody (fun _ => True)
+      (.constant (constI8W 0x80)) i8TyW :=
+    .constScalar (constI8W 0x80) ⟨0x80, 1⟩ rfl hi8 (Or.inl rfl) (by decide) rfl
+      (fun h => nomatch h) (fun h => nomatch h)
+  have hconst55 : WellTypedScalarOperandSyn unaryBitwiseBody (fun _ => True)
+      (.constant (constI8W 0x55)) i8TyW :=
+    .constScalar (constI8W 0x55) ⟨0x55, 1⟩ rfl hi8 (Or.inl rfl) (by decide) rfl
+      (fun h => nomatch h) (fun h => nomatch h)
+  refine ⟨(fun p h => by simp [unaryBitwiseBody] at h), ?_⟩
+  intro bb hbb
+  simp only [unaryBitwiseBody, List.mem_singleton] at hbb
+  subst hbb
+  refine ⟨rfl, ?_, Or.inr (Or.inl ⟨rfl, trivial, i8DeclW, rfl, IsPrimScalarTy.size_ne_zero hi8⟩)⟩
+  intro stmt hstmt
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hstmt
+  rcases hstmt with rfl | rfl | rfl | rfl | rfl
+  · exact .storageLive _ 1 i8DeclW rfl rfl trivial
+  · exact .assign _ 1 i8DeclW _ rfl rfl trivial
+      (.unaryOp .neg _ i8TyW i8TyW hconst80 (.intNeg i8TyW i8TyW _ hi8int hi8int rfl))
+  · exact .assign _ 1 i8DeclW _ rfl rfl trivial
+      (.unaryOp .not _ i8TyW i8TyW
+        (.copyLocal 1 i8DeclW rfl (IsPrimScalarTy.size_ne_zero hi8) trivial)
+        (.intNot i8TyW i8TyW _ hi8int hi8int))
+  · exact .assign _ 0 i8DeclW _ rfl rfl trivial
+      (.binaryOp .bitXor _ _ i8TyW i8TyW i8TyW
+        (.copyLocal 1 i8DeclW rfl (IsPrimScalarTy.size_ne_zero hi8) trivial)
+        hconst55
+        (.intArithOrBitwise .bitXor i8TyW i8TyW i8TyW _
+          (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr rfl))))))))))
+          hi8int hi8int hi8int))
+  · exact .storageDead _ 1 i8DeclW rfl rfl (by decide) trivial
+
+/-- Wrapping `Neg(-128_i8)`, `Not`, and `BitXor(_, 0x55_i8)` return `0x2A` (`42`)
+in 6 steps on both machines without triggering undefined behavior. -/
+theorem unaryBitwise_returns_agree :
+    annealOutcomeScalarBits 1 (runAnnealBounded unaryBitwiseBody 6 annealUnaryBitwiseInit) = some 0x2A ∧
+    miriOutcomeScalarBits 1 (runMiriBounded unaryBitwiseBody 6 miriUnaryBitwiseInit) = some 0x2A := by
+  decide
+
 end LeanMiriSpec.Correspondence.Witness

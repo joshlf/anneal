@@ -17,18 +17,26 @@ import LeanMiriSpec.Audit
 /-!
 # `lean-miri` Correspondence with Anneal's MIR Semantics (`LeanMiriSpec`)
 
-* `LeanMiriSpec.Correspondence.Translate`: bidirectional translation between
-  Anneal's `Trusted.Rustc.V2026_06_01.MirAst` and `Miri.MIR`, together with
-  single-threaded `AnnealStepHooks` (`RvalueHooks`, `ScalarOpsHooks`,
-  `ControlHooks`, `TerminatorHooks`, `StepHooks`).
+* `LeanMiriSpec.Correspondence.Translate`: syntax, type, and layout translation
+  from Anneal's `Trusted.Rustc.V2026_06_01.MirAst` to `Miri.MIR`, together with
+  single-threaded `AnnealMachine` and `annealStepHooks` (`RvalueHooks`,
+  `ScalarOpsHooks`, `CastHooks`, `ControlHooks`, `TerminatorHooks`,
+  `LocalStorageHooks`, `StepHooks`).
 * `LeanMiriSpec.Correspondence.Relation`: dual immediate/indirect simulation
   relations (`ScalarRel`, `ImmediateRel`, `MemPlaceRel`, `LocalRel`, `FrameRel`,
-  `StateRel`, `RvalueResultRel`, `StepRel`).
-* `LeanMiriSpec.Correspondence.Simulation`: lockstep simulation theorems for
-  arithmetic, bitwise, shift, unary, statement (`assign` / `nop`), and
-  terminator (`goto` / `return_`) execution.
-* `LeanMiriSpec.Correspondence.Witness`: a concrete body and initial states that
-  satisfy every premise of the correspondence theorems (non-vacuity).
-* `LeanMiriSpec.Audit`: axiom audit (`#assert_standard_axioms` and exhaustive
-  module-wide axiom verification across `LeanMiriSpec.*` and `Miri.*`).
+  `StateRel`, `RvalueResultRel`, `StepRel`, `StepObsRel`).
+* `LeanMiriSpec.Correspondence.Simulation`: single-step and fuel-bounded
+  multi-step lockstep simulation and bisimulation theorems for scalar constants,
+  copies, arithmetic (wrapping, checked `WithOverflow`, and `Unchecked`),
+  division/remainder, bitwise, shift (`Shl`/`Shr`/`ShlUnchecked`/`ShrUnchecked`),
+  unary (`Neg`/`Not`), statement (`assign`, `storageLive`, `storageDead`, `nop`),
+  and terminator (`goto`, `return_`, `unreachable`) execution.
+* `LeanMiriSpec.Correspondence.Witness`: kernel-checked non-vacuity and
+  behavioral fidelity witnesses across normal returns, UB traps (`Div` by zero,
+  signed `INT_MIN / -1`, OOB and negative signed shifts, `AddUnchecked`
+  overflow, `Unreachable`), `(u16, bool)` scalar pairs, Unicode `char`, indirect
+  `MemPlaceRel` allocations, `IntToInt` casts, and `SwitchInt` hooks.
+* `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
+  plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
+  `Miri.*`).
 -/

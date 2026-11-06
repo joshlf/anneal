@@ -412,7 +412,7 @@ found = []
 files = sorted(pathlib.Path("lean-miri/lean").rglob("*.lean"))
 audit_file = pathlib.Path("lean-miri/lean/LeanMiriSpec/Audit.lean")
 for path in files:
-    stripped = code_only_char_aware(path.read_text(encoding="utf-8"))
+    stripped = code_only_char_aware(path.read_text(encoding="utf-8")).replace("«", " ").replace("»", " ")
     for match in FORBIDDEN.finditer(stripped):
         line = stripped.count("\n", 0, match.start()) + 1
         found.append(f"{path}:{line}: forbidden construct {match.group()!r}")
