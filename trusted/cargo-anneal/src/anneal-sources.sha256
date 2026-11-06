@@ -1,0 +1,12 @@
+# Copyright 2026 The Fuchsia Authors
+#
+# Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+# <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+# license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+# This file may not be copied, modified, or distributed except according to
+# those terms.
+
+37f780b6257d0bc99fd5d7d3d0a1f16d168ef066a2a01466f4076f080d3425d2  trusted/lean/foundation-lock.json
+a092aacebf29d66ce8ace0ae41c4dc80263e242351869e62f97e8957c6594b59  trusted/lean/Trusted.lean
+0aabaac51bae7bea9b1c00eee34be4ed0a524517803bad6a075dddb01c90abfb  theory/Anneal.lean
+173ab3e6332d082267a297b0a41226f3450eb46dc601547f9186b4b698df6a46  trusted/rustc-capture/src/main.rs

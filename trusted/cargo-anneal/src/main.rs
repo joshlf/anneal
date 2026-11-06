@@ -6,90 +6,195 @@
 // This file may not be copied, modified, or distributed except according to
 // those terms.
 
-//! CLI entrypoint for `cargo-anneal`.
-
-mod setup;
+//! Trusted CLI entry point (`cargo-anneal`).
+//!
+//! Supports both direct invocation (`cargo-anneal <subcommand>`) and Cargo
+//! subcommand invocation (`cargo anneal <subcommand>`).
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-fn print_help() {
-    println!(
-        "\
-cargo-anneal {}
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser, Subcommand};
 
-USAGE:
-    cargo anneal <SUBCOMMAND>
-    cargo-anneal <SUBCOMMAND>
+use cargo_anneal::setup;
+use cargo_anneal::{ReleaseChannel, VerifyConfig, verify_crate};
 
-SUBCOMMANDS:
-    setup [--local-archive <path>]    Install the pinned Anneal toolchain archive
-
-OPTIONS:
-    -h, --help       Print help information
-    -V, --version    Print version information",
-        env!("CARGO_PKG_VERSION")
-    );
+#[derive(Parser)]
+#[command(
+    name = "cargo-anneal",
+    version,
+    about = "Deductive verification CLI for Anneal"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
 }
 
-fn run_setup_cli(args: &[String]) -> ExitCode {
-    let mut local_archive: Option<PathBuf> = None;
-    let mut iter = args.iter().map(String::as_str);
-    while let Some(arg) = iter.next() {
-        match arg {
-            "--local-archive" => {
-                let Some(val) = iter.next() else {
-                    eprintln!("error: --local-archive requires a path");
-                    return ExitCode::from(2);
-                };
-                local_archive = Some(PathBuf::from(val));
-            }
-            "--help" | "-h" => {
-                println!(
-                    "Usage: cargo anneal setup [--local-archive <path>]"
-                );
-                return ExitCode::SUCCESS;
-            }
-            other => {
-                eprintln!("error: unknown setup argument `{other}`");
-                return ExitCode::from(2);
-            }
+#[derive(Subcommand)]
+enum Commands {
+    /// Install the pinned Anneal Rust and Lean 4 toolchain bundle.
+    Setup {
+        /// Optional path to a local toolchain archive.
+        #[arg(long)]
+        local_archive: Option<PathBuf>,
+    },
+    /// Capture MIR and verify a Rust crate in the Lean 4 kernel.
+    Verify {
+        /// Target crate directory (defaults to the current working directory).
+        crate_dir: Option<PathBuf>,
+        /// Comma-separated candidate-trusted features to allow (or `*`).
+        #[arg(long, value_delimiter = ',')]
+        allow_candidate_features: Option<Vec<String>>,
+        /// Release channel override (`alpha` or `stable`).
+        #[arg(long)]
+        release_channel: Option<String>,
+        /// Anneal toolchain directory (defaults to the installed toolchain).
+        #[arg(long)]
+        toolchain: Option<PathBuf>,
+        /// Path to the Anneal root containing `trusted/lean` and `theory`.
+        #[arg(long)]
+        anneal_root: Option<PathBuf>,
+    },
+}
+
+fn resolve_default_anneal_root(toolchain_dir: &Path) -> PathBuf {
+    let manifest_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    if manifest_root.join("trusted/lean/Trusted.lean").is_file()
+        && manifest_root.join("theory/Anneal.lean").is_file()
+    {
+        return std::fs::canonicalize(&manifest_root).unwrap_or(manifest_root);
+    }
+    toolchain_dir.join("share/anneal")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CliError {
+    code: u8,
+    message: String,
+}
+
+impl CliError {
+    fn failed(message: impl Into<String>) -> Self {
+        Self {
+            code: 1,
+            message: message.into(),
         }
     }
 
-    match setup::install(local_archive) {
-        Ok(root) => {
-            println!("Installed Anneal toolchain at {}", root.display());
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            eprintln!("error: {err}");
-            ExitCode::from(1)
+    fn usage(message: impl Into<String>) -> Self {
+        Self {
+            code: 2,
+            message: message.into(),
         }
     }
 }
 
 fn main() -> ExitCode {
-    let mut args: Vec<String> = env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("anneal") {
-        args.remove(0);
+    match run(env::args().collect()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{}", err.message);
+            ExitCode::from(err.code)
+        }
+    }
+}
+
+fn run(mut raw_args: Vec<String>) -> Result<(), CliError> {
+    if raw_args.get(1).map(String::as_str) == Some("anneal") {
+        raw_args.remove(1);
     }
 
-    match args.first().map(String::as_str) {
-        None | Some("--help") | Some("-h") | Some("help") => {
-            print_help();
-            ExitCode::SUCCESS
+    let cli = match Cli::try_parse_from(raw_args) {
+        Ok(c) => c,
+        Err(e) => {
+            if matches!(
+                e.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                print!("{e}");
+                return Ok(());
+            }
+            return Err(CliError::usage(e.to_string().trim_end()));
         }
-        Some("--version") | Some("-V") => {
-            println!("cargo-anneal {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
+    };
+
+    match cli.command {
+        None => {
+            let _ = Cli::command().print_help();
+            println!();
+            Ok(())
         }
-        Some("setup") => run_setup_cli(&args[1..]),
-        Some(other) => {
-            eprintln!("error: unknown subcommand `{other}`");
-            print_help();
-            ExitCode::from(2)
+        Some(Commands::Setup { local_archive }) => {
+            match setup::install(local_archive) {
+                Ok(root) => {
+                    println!(
+                        "Installed Anneal toolchain at {}",
+                        root.display()
+                    );
+                    Ok(())
+                }
+                Err(err) => Err(CliError::failed(format!("error: {err}"))),
+            }
         }
+        Some(Commands::Verify {
+            crate_dir,
+            allow_candidate_features,
+            release_channel,
+            toolchain,
+            anneal_root,
+        }) => {
+            let release_channel =
+                ReleaseChannel::resolve(release_channel.as_deref())
+                    .map_err(|e| CliError::usage(format!("error: {e}")))?;
+            let allow_candidate_features = allow_candidate_features
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let toolchain_dir = match toolchain {
+                Some(tc) => tc,
+                None => setup::resolve_installed().ok_or_else(|| {
+                    CliError::failed(
+                        "error: Anneal toolchain is not installed (run `cargo anneal setup` or pass `--toolchain`)",
+                    )
+                })?,
+            };
+            let anneal_root = anneal_root
+                .unwrap_or_else(|| resolve_default_anneal_root(&toolchain_dir));
+            let target_dir = match crate_dir {
+                Some(dir) => dir,
+                None => env::current_dir().map_err(|e| {
+                    CliError::failed(format!("error: no current dir: {e}"))
+                })?,
+            };
+            let config = VerifyConfig {
+                crate_dir: target_dir,
+                toolchain_dir,
+                anneal_root,
+                allow_candidate_features,
+                release_channel,
+            };
+            let report = verify_crate(&config)
+                .map_err(|e| CliError::failed(format!("error: {e}")))?;
+            print!("{}", report.output_text);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run;
+
+    #[test]
+    fn no_subcommand_prints_help_and_exits_zero() {
+        assert_eq!(run(vec!["cargo-anneal".to_string()]), Ok(()));
+        assert_eq!(
+            run(vec!["cargo-anneal".to_string(), "anneal".to_string()]),
+            Ok(())
+        );
     }
 }
