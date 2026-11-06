@@ -19,7 +19,8 @@ memory layouts, interior mutability, and inline assembly—cannot trigger
 undefined behavior (UB) and satisfy their functional specifications.
 
 Anneal is designed around three commitments that implement
-[`PRINCIPLES.md`](../PRINCIPLES.md):
+[`PRINCIPLES.md`](../PRINCIPLES.md) and
+[`THREAT_MODEL.md`](../THREAT_MODEL.md):
 
 1. **Verify the code `rustc` actually compiles.** Anneal does not ask users to
    rewrite Rust in a custom verification language. Instead, it hooks into Cargo
@@ -51,11 +52,15 @@ For deeper coverage of specific subsystems, see:
 
 - [`PRINCIPLES.md`](../PRINCIPLES.md) for Anneal's mission, correctness
   promise, and decision-making priority order.
+- [`THREAT_MODEL.md`](../THREAT_MODEL.md) for the threat model,
+  execution-isolation boundary, three-layer trust partition, and TCB audit log
+  (`anneal-tcb.lock`).
 - [`docs/architecture.md`](architecture.md) for the three-stage MIR pipeline,
   `rustc` extraction lifecycle, repository layout, and multi-version toolchain
   strategy.
-- [`docs/trust-model.md`](trust-model.md) for the `trusted/` vs. `theory/`
-  boundary and repository CI auditing.
+- [`docs/trust-model.md`](trust-model.md) for how `trusted/` and
+  `trusted/audit/` implement and enforce [`PRINCIPLES.md`](../PRINCIPLES.md) and
+  [`THREAT_MODEL.md`](../THREAT_MODEL.md).
 
 ## End-to-end verification workflow
 
@@ -105,31 +110,31 @@ flowchart LR
    proof term produced for `Proof.verify_crate` against the proposition
    `Trusted.CrateTheorem Mir.crate`.
 
-### Why repository auditing runs in Anneal's CI, not on user machines
+### Two-stage boundary auditing: Anneal's CI and downstream CI
 
 Because Lean 4 is a general-purpose programming and metaprogramming language,
-an unrestricted `.lean` file in `theory/` could otherwise execute arbitrary OS
-commands during compilation (`#eval`, `run_cmd`, `initialize`), attach compiler
-overrides (`@[implemented_by]`, `@[extern]`), or declare custom `axiom`s to
-bypass the Lean kernel.
+an unrestricted `.lean` file in `theory/` or in a user crate's proof directory
+could otherwise execute arbitrary OS commands during compilation (`#eval`,
+`run_cmd`, `initialize`), attach compiler overrides (`@[implemented_by]`,
+`@[extern]`), or declare custom `axiom`s to bypass the Lean kernel.
 
-Anneal prevents this without running an auditor on the user's machine by
-combining two invariants:
+As specified in
+[`THREAT_MODEL.md`](../THREAT_MODEL.md#two-stage-boundary-auditing-anneal-ci-vs-user-ci),
+Anneal prevents this without re-auditing its own shipped code on every user run
+by splitting boundary auditing across two composable stages:
 
-- **In Anneal's repository CI (`trusted/audit/`):** Before any change to Anneal
-  can merge or ship in the toolchain archive, `anneal-audit` inspects all
-  repository `.lean` sources and replays their compiled `.olean` artifacts in
-  the standalone Lean kernel. This guarantees that the `theory/` library
-  shipped with Anneal is strictly pure, side-effect-free, and axiom-free.
-- **On the user's machine (`trusted/rustc-capture/`):** Users write
-  specifications and proof guidance as Rust annotations rather than arbitrary
-  Lean files. Because `trusted/rustc-capture/` (part of the human-audited TCB)
-  generates `Mir.lean` and `Proof.lean` directly, `Proof.lean` is guaranteed to
-  state the exact `Trusted.CrateTheorem Mir.crate` obligation and invoke only
-  pure definitions from `trusted/lean/` and the CI-audited `theory/` library.
+- **Stage A — In Anneal's repository CI (`trusted/audit/`):** `anneal-audit`
+  audits and compiles Anneal's `trusted/lean/` and `theory/` modules once per
+  release and seals their pre-compiled `.olean` artifacts into the toolchain
+  archive.
+- **Stage B — When verifying a target crate (`cargo anneal verify`):**
+  `cargo-anneal` loads Anneal's pre-audited `.olean` modules as an immutable
+  base environment and audits only the target crate's delta (`Mir.lean`,
+  `Proof.lean`, and any user-supplied `Spec/*.lean` or `Proof/*.lean` files).
 
-See [`docs/trust-model.md`](trust-model.md) for the full trust model and CI
-boundary audit mechanics.
+See [`THREAT_MODEL.md`](../THREAT_MODEL.md) for the controlling threat model and
+[`docs/trust-model.md`](trust-model.md) for the implementation of
+`trusted/audit/`.
 
 ## Library-centric verification
 

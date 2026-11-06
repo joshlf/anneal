@@ -10,7 +10,8 @@ those terms. -->
 
 Anneal is a deductive verification framework for Rust—including unsafe code—built
 as a Lean 4 library paired with a thin `rustc_driver` capture frontend. See
-[`PRINCIPLES.md`](PRINCIPLES.md) for the current project principles and
+[`PRINCIPLES.md`](PRINCIPLES.md) for the current project principles,
+[`THREAT_MODEL.md`](THREAT_MODEL.md) for the threat model, and
 [`DESIGN.md`](DESIGN.md) for the durable design constraints derived from them.
 
 - [Requirements, aspirations, and architectural decision ledger (#1)](https://github.com/joshlf/anneal/issues/1).
@@ -36,10 +37,10 @@ The [`trusted/`](trusted/README.md) directory isolates every first-party
 component of Anneal on which those two assertions depend without checked
 evidence. The invariant of `trusted/` is that **auditing `trusted/` and its
 explicit, pinned dependency manifest is sufficient to verify that Anneal upholds
-[`PRINCIPLES.md`](PRINCIPLES.md) and [`DESIGN.md`](DESIGN.md)**: an auditor
-never needs to inspect first-party code outside `trusted/` to trust a
-verification result. This must remain true in the face of adversarial
-implementations in any other part of the repository.
+[`PRINCIPLES.md`](PRINCIPLES.md), [`THREAT_MODEL.md`](THREAT_MODEL.md), and
+[`DESIGN.md`](DESIGN.md)**: an auditor never needs to inspect first-party code
+outside `trusted/` to trust a verification result. This must remain true in the
+face of adversarial implementations in any other part of the repository.
 
 To keep the human audit surface tractable and reliable, `trusted/` permits
 battle-tested, widely-used external libraries for routine utilities (such as
@@ -55,6 +56,9 @@ that as well.)
 
 - [`PRINCIPLES.md`](PRINCIPLES.md): Anneal's mission, correctness promise, and
   decision-making priority order.
+- [`THREAT_MODEL.md`](THREAT_MODEL.md): Threat model, execution-isolation
+  boundary, the three-layer trust partition, two-stage CI vs. crate boundary
+  auditing, and the TCB audit log (`anneal-tcb.lock`) review contract.
 - [`DESIGN.md`](DESIGN.md): Durable architectural design contract and invariants.
 - [`docs/design.md`](docs/design.md): Overall system design, end-to-end
   verification workflow, library-centric verification, multi-modal
@@ -62,8 +66,9 @@ that as well.)
 - [`docs/architecture.md`](docs/architecture.md): The three-stage MIR pipeline,
   repository layout, `rustc` extraction lifecycle, and multi-version toolchain
   strategy.
-- [`docs/trust-model.md`](docs/trust-model.md): The `trusted/` vs. `theory/`
-  boundary, Statement-Origin Separation, and repository CI boundary auditing.
+- [`docs/trust-model.md`](docs/trust-model.md): How Anneal's internal `trusted/`
+  vs. `theory/` boundary and `trusted/audit/` implement and enforce
+  [`PRINCIPLES.md`](PRINCIPLES.md) and [`THREAT_MODEL.md`](THREAT_MODEL.md).
 
 ## Repository layout and trust boundary
 

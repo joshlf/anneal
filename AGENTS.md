@@ -7,8 +7,9 @@ in the directory you change as well.
 ## Project principles
 
 Before designing, modifying, or reviewing repository artifacts, read and
-preserve [`PRINCIPLES.md`](PRINCIPLES.md), which defines Anneal's mission,
-correctness promise, and decision-making principles.
+preserve [`PRINCIPLES.md`](PRINCIPLES.md) and
+[`THREAT_MODEL.md`](THREAT_MODEL.md), which define Anneal's mission,
+correctness promise, threat model, and decision-making principles.
 
 ## Standing rules
 
@@ -72,13 +73,15 @@ Anneal verifies Rust programs (including unsafe code) by extracting typed
 `Runtime(PostCleanup)` MIR and compiler facts via a thin `rustc_driver` wrapper
 and checking per-item `VerificationResult` theorems inside the Lean 4 kernel.
 
-Start with [`PRINCIPLES.md`](PRINCIPLES.md), [`DESIGN.md`](DESIGN.md),
-[README.md](README.md), [`docs/design.md`](docs/design.md),
+Start with [`PRINCIPLES.md`](PRINCIPLES.md),
+[`THREAT_MODEL.md`](THREAT_MODEL.md), [`DESIGN.md`](DESIGN.md),
+[`README.md`](README.md), [`docs/design.md`](docs/design.md),
 [`docs/architecture.md`](docs/architecture.md), and
 [`docs/trust-model.md`](docs/trust-model.md) for the normative project
-principles, design contract, three-stage MIR pipeline, trust model, repository
-map, and links to the
-architecture issues ([#1](https://github.com/joshlf/anneal/issues/1),
+principles, threat model and execution-isolation boundary, design contract,
+three-stage MIR pipeline, how `trusted/` and `trusted/audit/` enforce the trust
+boundary, repository map, and links to the architecture issues
+([#1](https://github.com/joshlf/anneal/issues/1),
 [#100](https://github.com/joshlf/anneal/issues/100),
 [#99](https://github.com/joshlf/anneal/issues/99),
 [#103](https://github.com/joshlf/anneal/issues/103),
