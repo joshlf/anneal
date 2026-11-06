@@ -1068,6 +1068,40 @@ def annealCastHooks (layouts : LayoutTable := emptyLayoutTable) :
   normalizePrincipal := fun _ _ => throw (.unsupported "normalizePrincipal in cast")
 
 /-- `RvalueHooks` instantiated for Anneal's single-threaded machine. -/
+
+def annealPlaceHooks (_localDecls : List LocalDecl) (_layouts : LayoutTable) :
+    Miri.Interpreter.PlaceHooks AnnealProv AnnealStepState Unit Unit where
+  getFrame := throw (.unsupported "getFrame")
+  setFrame := fun _ => throw (.unsupported "setFrame")
+  debugAssertions := false
+  frameIndex := throw (.unsupported "frameIndex")
+  resolveLayout := fun _ _ => throw (.unsupported "resolveLayout")
+  localToOp := fun _ _ => throw (.unsupported "localToOp")
+  projection := fun _ => throw (.unsupported "projection")
+  deref := fun _ _ _ => throw (.unsupported "deref")
+  checkPlaceType := fun _ _ _ => throw (.unsupported "checkPlaceType")
+  allocateStack := fun _ layout => do
+    let size := layout.layout.size
+    let align := layout.layout.align.abi
+    let allocation ← match Miri.Memory.Allocation.tryNew size align .Uninit (fun _ _ => none) with
+      | .ok allocation => pure allocation
+      | .error _ => throw (.unsupported "stack allocation storage")
+    let state ← get
+    let (memory, reserved) := state.machine.memory.reserveAllocId
+    let id ← match reserved with
+      | .ok id => pure id
+      | .error _ => throw (.unsupported "stack allocation ID")
+    let memory := {memory with live := memory.live.push (id, ⟨.stack, allocation.withExtra none⟩)}
+    set {state with machine := {state.machine with memory := memory}}
+    let pointer : Miri.Memory.Pointer (Option AnnealProv) := ⟨⟨0⟩, none⟩
+    return ⟨⟨pointer, .none, none⟩, layout⟩
+  writeMemoryNoValidate := fun _ _ _ => throw (.unsupported "writeMemoryNoValidate")
+  afterLocalMovedToMemory := fun _ _ _ => pure ()
+  memoryOffset := fun _ _ _ _ _ => throw (.unsupported "memoryOffset")
+  writeLocalImmediate := fun _ _ _ _ => throw (.unsupported "writeLocalImmediate")
+  enforceValidity := fun _ _ => throw (.unsupported "enforceValidity")
+  validate := fun _ _ => throw (.unsupported "validate")
+
 def annealRvalueHooks (localDecls : List LocalDecl := .nil)
     (layouts : LayoutTable := emptyLayoutTable) :
     Miri.Interpreter.RvalueHooks
@@ -1248,8 +1282,7 @@ def annealLocalStorageHooks (localDecls : List LocalDecl) (layouts : LayoutTable
   afterLocalWrite := fun st _ _ => ⟨st, .ok ()⟩
   allocateDyn := fun st _ _ =>
     ⟨st, .error (.allocationFailure "unsized locals are outside the scalar fragment")⟩
-  deallocateStack := fun st _ =>
-    ⟨st, .error (.deallocationFailure "memory-backed locals are outside the scalar fragment")⟩
+  deallocateStack := fun st _ => ⟨st, .ok ()⟩
 
 /-- Run a current-frame storage operation (`Frame.storageLive` or
 `Frame.storageDead`), writing back the resulting frame and memory even when the

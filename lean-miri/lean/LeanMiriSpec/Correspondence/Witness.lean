@@ -1,3 +1,4 @@
+import LeanMiriSpec.Correspondence.WitLM1_4
 /-
 Copyright 2026 The Fuchsia Authors
 
@@ -95,7 +96,7 @@ def miriInit (divisor : Nat) : AnnealStepState :=
 
 theorem stateRel_init (divisor : Nat) :
     StateRel (divBody divisor) (annealInit divisor) (miriInit divisor) := by
-  refine StateRel.mk (miriFrame divisor) rfl rfl ⟨translateTy u8Ty, rfl⟩ ?_ rfl rfl rfl rfl rfl
+  refine StateRel.mk (miriFrame divisor) rfl rfl ⟨translateTy u8Ty, rfl⟩ ?_ rfl rfl rfl rfl rfl (MemoryAllocDisjoint.of_no_indirect _ (by intro i v lay h mpi hneq; rcases i with _ | _ | _ | _ | _ | _ | _ <;> (revert h; simp; intro h; rw [hneq] at h; cases h)))
   refine
     { body_eq := rfl
       location_eq := rfl
@@ -355,8 +356,7 @@ theorem stateRel_signedDiv (divisorBits : Nat) :
     StateRel (signedDivBody divisorBits)
       (annealSignedDivInit divisorBits)
       (miriSignedDivInit divisorBits) := by
-  refine StateRel.mk (miriSignedDivFrame divisorBits) rfl rfl ⟨translateTy i8Ty, rfl⟩ ?_
-    rfl rfl rfl rfl rfl
+  refine StateRel.mk (miriSignedDivFrame divisorBits) rfl rfl ⟨translateTy i8Ty, rfl⟩ ?_ rfl rfl rfl rfl rfl (MemoryAllocDisjoint.of_no_indirect _ (by intro i v lay h mpi hneq; rcases i with _ | _ | _ | _ | _ | _ | _ <;> (revert h; simp; intro h; rw [hneq] at h; cases h)))
   refine
     { body_eq := rfl
       location_eq := rfl
@@ -537,8 +537,8 @@ def miriAddOvfInit (rhs : Nat) : AnnealStepState :=
 
 theorem stateRel_addWithOverflow (rhs : Nat) :
     StateRel (addWithOverflowBody rhs) (annealAddOvfInit rhs) (miriAddOvfInit rhs) := by
-  refine StateRel.mk (miriAddOvfFrame rhs) rfl rfl
-    ⟨translateTy u16BoolTupleTy u16BoolLayoutTable, rfl⟩ ?_ rfl rfl rfl rfl rfl
+  refine StateRel.mk (miriAddOvfFrame rhs) rfl rfl ⟨translateTy u16BoolTupleTy u16BoolLayoutTable, rfl⟩ ?_ rfl rfl rfl rfl rfl (MemoryAllocDisjoint.of_no_indirect _ (by intro i v lay h mpi hneq; rcases i with _ | _ | _ | _ | _ | _ | _ <;> (revert h; simp; intro h; rw [hneq] at h; cases h)))
+
   refine
     { body_eq := rfl
       location_eq := rfl
@@ -877,7 +877,7 @@ def miriUnreachableInit : AnnealStepState :=
 
 theorem stateRel_unreachable :
     StateRel unreachableBody annealUnreachableInit miriUnreachableInit := by
-  refine StateRel.mk miriUnreachableFrame rfl rfl ⟨translateTy u8Ty, rfl⟩ ?_ rfl rfl rfl rfl rfl
+  refine StateRel.mk miriUnreachableFrame rfl rfl ⟨translateTy u8Ty, rfl⟩ ?_ rfl rfl rfl rfl rfl (MemoryAllocDisjoint.of_no_indirect _ (by intro i v lay h mpi hneq; rcases i with _ | _ | _ | _ | _ | _ | _ <;> (revert h; simp; intro h; rw [hneq] at h; cases h)))
   refine
     { body_eq := rfl
       location_eq := rfl
@@ -1019,7 +1019,7 @@ def miriCharInit : AnnealStepState :=
   { stack := ⟨#[miriCharFrame]⟩, machine := AnnealMachine.empty }
 
 theorem stateRel_charCopy : StateRel charCopyBody annealCharInit miriCharInit := by
-  refine StateRel.mk miriCharFrame rfl rfl ⟨translateTy charTy, rfl⟩ ?_ rfl rfl rfl rfl rfl
+  refine StateRel.mk miriCharFrame rfl rfl ⟨translateTy charTy, rfl⟩ ?_ rfl rfl rfl rfl rfl (MemoryAllocDisjoint.of_no_indirect _ (by intro i v lay h mpi hneq; rcases i with _ | _ | _ | _ | _ | _ | _ <;> (revert h; simp; intro h; rw [hneq] at h; cases h)))
   refine
     { body_eq := rfl
       location_eq := rfl
@@ -1130,8 +1130,7 @@ theorem stateRel_shiftUnchecked (shiftBits : Nat) :
     StateRel (shiftUncheckedBody shiftBits)
       (annealShiftUncheckedInit shiftBits)
       (miriShiftUncheckedInit shiftBits) := by
-  refine StateRel.mk (miriShiftUncheckedFrame shiftBits) rfl rfl ⟨translateTy u8Ty, rfl⟩ ?_
-    rfl rfl rfl rfl rfl
+  refine StateRel.mk (miriShiftUncheckedFrame shiftBits) rfl rfl ⟨translateTy u8Ty, rfl⟩ ?_ rfl rfl rfl rfl rfl (MemoryAllocDisjoint.of_no_indirect _ (by intro i v lay h mpi hneq; rcases i with _ | _ | _ | _ | _ | _ | _ <;> (revert h; simp; intro h; rw [hneq] at h; cases h)))
   refine
     { body_eq := rfl
       location_eq := rfl
@@ -1261,8 +1260,7 @@ theorem stateRel_addUncheckedNop (rhs : Nat) :
     StateRel (addUncheckedNopBody rhs)
       (annealAddUncheckedNopInit rhs)
       (miriAddUncheckedNopInit rhs) := by
-  refine StateRel.mk (miriAddUncheckedNopFrame rhs) rfl rfl ⟨translateTy u8Ty, rfl⟩ ?_
-    rfl rfl rfl rfl rfl
+  refine StateRel.mk (miriAddUncheckedNopFrame rhs) rfl rfl ⟨translateTy u8Ty, rfl⟩ ?_ rfl rfl rfl rfl rfl (MemoryAllocDisjoint.of_no_indirect _ (by intro i v lay h mpi hneq; rcases i with _ | _ | _ | _ | _ | _ | _ <;> (revert h; simp; intro h; rw [hneq] at h; cases h)))
   refine
     { body_eq := rfl
       location_eq := rfl
@@ -1498,8 +1496,7 @@ def miriUnaryBitwiseInit : AnnealStepState :=
 
 theorem stateRel_unaryBitwise :
     StateRel unaryBitwiseBody annealUnaryBitwiseInit miriUnaryBitwiseInit := by
-  refine StateRel.mk miriUnaryBitwiseFrame rfl rfl ⟨translateTy i8TyW, rfl⟩ ?_
-    rfl rfl rfl rfl rfl
+  refine StateRel.mk miriUnaryBitwiseFrame rfl rfl ⟨translateTy i8TyW, rfl⟩ ?_ rfl rfl rfl rfl rfl (MemoryAllocDisjoint.of_no_indirect _ (by intro i v lay h mpi hneq; rcases i with _ | _ | _ | _ | _ | _ | _ <;> (revert h; simp; intro h; rw [hneq] at h; cases h)))
   refine
     { body_eq := rfl
       location_eq := rfl

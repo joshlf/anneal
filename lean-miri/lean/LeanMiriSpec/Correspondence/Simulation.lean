@@ -1,3 +1,4 @@
+import LeanMiriSpec.Correspondence.SimLM1_4
 /-
 Copyright 2026 The Fuchsia Authors
 
@@ -2403,38 +2404,6 @@ theorem stepMirFn_eq_of_not_other (body : CapturedMir) (s : MachineState)
   | other p => exact False.elim (hphase p hp)
   | _ => rfl
 
-theorem stack_currentFrame?_singleton
-    {P L E : Type} (s : Miri.Interpreter.Stack P L E)
-    (f : Miri.Interpreter.Frame P L E) (h : s.frames = #[f]) :
-    s.currentFrame? = some f := by
-  unfold Miri.Interpreter.Stack.currentFrame?
-  rw [h]; rfl
-
-theorem stepState_with_same_singleton
-    (m : AnnealStepState)
-    (f : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
-    (h : m.stack.frames = #[f]) :
-    { m with stack := ⟨#[f]⟩ } = m := by
-  rcases m with ⟨⟨frames⟩, machine⟩
-  dsimp only at h
-  subst h
-  rfl
-
-theorem frame_getLocal_of_getElem?
-    {P L E : Type} (mf : Miri.Interpreter.Frame P L E) (i : Nat) (mls : Miri.Interpreter.LocalState P L)
-    (h : mf.locals[i]? = some mls) :
-    mf.getLocal i = .ok mls := by
-  obtain ⟨hlt, heq⟩ := Array.getElem?_eq_some_iff.mp h
-  unfold Miri.Interpreter.Frame.getLocal
-  simp [hlt, heq, pure, Except.pure]
-
-theorem frame_replaceLocalValue_of_lt
-    {P L E : Type} (mf : Miri.Interpreter.Frame P L E) (i : Nat)
-    (hlt : i < mf.locals.size) (val : Miri.Interpreter.LocalValue P) :
-    mf.replaceLocalValue i val =
-      .ok { mf with locals := mf.locals.set i { mf.locals[i] with value := val } hlt } := by
-  unfold Miri.Interpreter.Frame.replaceLocalValue
-  simp [hlt, pure, Except.pure]
 
 theorem translateBody_locals_getElem? (body : CapturedMir) (i : Nat) :
     (translateBody body).locals[i]? = (get? body.localDecls i).map (fun d => encodeTyId d.ty) := by

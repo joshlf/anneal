@@ -341,6 +341,76 @@ structure FrameRel
       mf.locals[i]? = some mls →
       LocalRel mach decl body.layouts slot mls
 
+/-- Disjointness & monotonicity invariant for locals. -/
+def MemoryAllocDisjoint (topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit) : Prop :=
+  ∀ (i j : Nat) (mplace_i mplace_j : Miri.Interpreter.MemPlace AnnealProv) (lay_i lay_j : Option Miri.Interpreter.LocalLayout),
+    i ≠ j →
+    topFrame.locals[i]? = some { value := .live (.indirect mplace_i), layout := lay_i } →
+    topFrame.locals[j]? = some { value := .live (.indirect mplace_j), layout := lay_j } →
+    mplace_i.ptr.provenance ≠ mplace_j.ptr.provenance
+
+theorem MemoryAllocDisjoint.of_no_indirect
+    (tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+    (h_no_indirect : ∀ (k : Nat) (x : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout), tf.locals[k]? = some x → ∀ mplace, x.value ≠ .live (.indirect mplace)) :
+    MemoryAllocDisjoint tf := by
+  intro i j mplace_i mplace_j lay_i lay_j hneq hi hj
+  have hi' := h_no_indirect i _ hi mplace_i
+  contradiction
+
+theorem MemoryAllocDisjoint.mono_immediate
+    {tf tf' : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (h : MemoryAllocDisjoint tf)
+    (h_locals : ∀ (k : Nat), tf'.locals[k]? = tf.locals[k]? ∨ ∃ imm lay, tf'.locals[k]? = some { value := .live (.immediate imm), layout := lay }) :
+    MemoryAllocDisjoint tf' := by
+  intro i j mplace_i mplace_j lay_i lay_j hneq hi hj
+  rcases h_locals i with eq_i | ⟨imm_i, lay_i', heq_i⟩
+  · rcases h_locals j with eq_j | ⟨imm_j, lay_j', heq_j⟩
+    · rw [eq_i] at hi; rw [eq_j] at hj
+      exact h i j mplace_i mplace_j lay_i lay_j hneq hi hj
+    · rw [heq_j] at hj; cases hj
+  · rw [heq_i] at hi; cases hi
+
+theorem MemoryAllocDisjoint.mono_dead
+    {tf tf' : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (h : MemoryAllocDisjoint tf)
+    (h_locals : ∀ (k : Nat), tf'.locals[k]? = tf.locals[k]? ∨ ∃ lay, tf'.locals[k]? = some { value := .dead, layout := lay }) :
+    MemoryAllocDisjoint tf' := by
+  intro i j mplace_i mplace_j lay_i lay_j hneq hi hj
+  rcases h_locals i with eq_i | heq_i
+  · rcases h_locals j with eq_j | heq_j
+    · rw [eq_i] at hi; rw [eq_j] at hj
+      exact h i j mplace_i mplace_j lay_i lay_j hneq hi hj
+    · rcases heq_j with ⟨lay, heq_j⟩; rw [heq_j] at hj; cases hj
+  · rcases heq_i with ⟨lay, heq_i⟩; rw [heq_i] at hi; cases hi
+
+theorem MemoryAllocDisjoint.mono_layout
+    {tf tf' : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (h : MemoryAllocDisjoint tf)
+    (h_locals : ∀ (k : Nat), ∃ lay_k, tf'.locals[k]? = (tf.locals[k]?).map (fun x => { value := x.value, layout := lay_k })) :
+    MemoryAllocDisjoint tf' := by
+  intro i j mplace_i mplace_j lay_i lay_j hneq hi hj
+  rcases h_locals i with ⟨lay_i', heq_i⟩
+  rcases h_locals j with ⟨lay_j', heq_j⟩
+  rw [heq_i] at hi
+  rw [heq_j] at hj
+  revert hi hj
+  cases h_i : tf.locals[i]? with
+  | none => intros; contradiction
+  | some x_i =>
+    cases h_j : tf.locals[j]? with
+    | none => intros; contradiction
+    | some x_j =>
+      intro hi hj
+      dsimp only [Option.map] at hi hj
+      injection hi with hval_i
+      injection hval_i with hv_i hl_i
+      injection hj with hval_j
+      injection hval_j with hv_j hl_j
+      have hi2 : tf.locals[i]? = some { value := .live (.indirect mplace_i), layout := x_i.layout } := by
+        rw [h_i]; cases x_i; simp_all
+      have hj2 : tf.locals[j]? = some { value := .live (.indirect mplace_j), layout := x_j.layout } := by
+        rw [h_j]; cases x_j; simp_all
+      exact h i j mplace_i mplace_j _ _ hneq hi2 hj2
 /-- Simulation relation between an Anneal `MachineState` (`s`) and a single-threaded
 `AnnealStepState` (`m`) executing `body`. -/
 inductive StateRel
@@ -360,7 +430,8 @@ inductive StateRel
       (callStack_nil : s.memory.callStack = .nil)
       (borrows_nil : s.memory.borrows = .nil)
       (activeProtectors_nil : s.memory.activeProtectors = .nil)
-      (callerLocals_nil : s.memory.callerLocals = .nil) :
+      (callerLocals_nil : s.memory.callerLocals = .nil)
+      (memoryAllocDisjoint : MemoryAllocDisjoint topFrame) :
       StateRel body s m
 
 /-- Predicate characterizing when a `Miri.Interpreter.StepError` is an undefined-behavior fault. -/
@@ -420,7 +491,7 @@ theorem step_iff {body : CapturedMir} {m : AnnealStepState}
       (mRes.2 = .ok true ∧ mRes.1.stack.frames ≠ #[]) := by
   cases h with
   | step s' m' hrel =>
-    rcases hrel with ⟨tf, hf, hrc, hrp, hfr, hcal, hst, hbor, hprot, hcaller⟩
+    rcases hrel with ⟨tf, hf, hrc, hrp, hfr, hcal, hst, hbor, hprot, hcaller, hdisjoint⟩
     constructor
     · intro _
       refine ⟨rfl, ?_⟩
@@ -429,7 +500,7 @@ theorem step_iff {body : CapturedMir} {m : AnnealStepState}
       have hsz := congrArg Array.size hemp
       contradiction
     · intro _
-      exact ⟨s', rfl, StateRel.mk tf hf hrc hrp hfr hcal hst hbor hprot hcaller⟩
+      exact ⟨s', rfl, StateRel.mk tf hf hrc hrp hfr hcal hst hbor hprot hcaller hdisjoint⟩
   | retRoot _ _ _ _ _ _ _ _ hm' =>
     subst hm'
     constructor
@@ -448,7 +519,7 @@ theorem retNormal_iff {body : CapturedMir} {m : AnnealStepState}
       (mRes.2 = .ok true ∧ mRes.1.stack.frames = #[]) := by
   cases h with
   | step s' m' hrel =>
-    rcases hrel with ⟨tf, hf, _, _, _, _, _, _, _, _⟩
+    rcases hrel with ⟨tf, hf, _, _, _, _, _, _, _, _, _⟩
     constructor
     · rintro ⟨_, _, h⟩; cases h
     · rintro ⟨_, hemp⟩
@@ -547,7 +618,7 @@ theorem emitStep_iff {body : CapturedMir} {m : AnnealStepState}
       (mRes.2 = .ok true ∧ mRes.1.stack.frames ≠ #[]) := by
   cases h with
   | emitStep obs s' m' hrel =>
-    rcases hrel with ⟨tf, hf, hrc, hrp, hfr, hcal, hst, hbor, hprot, hcaller⟩
+    rcases hrel with ⟨tf, hf, hrc, hrp, hfr, hcal, hst, hbor, hprot, hcaller, hdisjoint⟩
     constructor
     · intro _
       refine ⟨rfl, ?_⟩
@@ -556,7 +627,7 @@ theorem emitStep_iff {body : CapturedMir} {m : AnnealStepState}
       have hsz := congrArg Array.size hemp
       contradiction
     · intro _
-      exact ⟨obs, s', rfl, StateRel.mk tf hf hrc hrp hfr hcal hst hbor hprot hcaller⟩
+      exact ⟨obs, s', rfl, StateRel.mk tf hf hrc hrp hfr hcal hst hbor hprot hcaller hdisjoint⟩
   | retRoot _ _ _ _ _ _ _ _ hm' =>
     subst hm'
     constructor
@@ -577,7 +648,7 @@ theorem retNormal_iff {body : CapturedMir} {m : AnnealStepState}
       (mRes.2 = .ok true ∧ mRes.1.stack.frames = #[]) := by
   cases h with
   | emitStep obs s' m' hrel =>
-    rcases hrel with ⟨tf, hf, _, _, _, _, _, _, _, _⟩
+    rcases hrel with ⟨tf, hf, _, _, _, _, _, _, _, _, _⟩
     constructor
     · rintro ⟨_, _, h⟩
       cases obs <;> cases h
@@ -633,5 +704,16 @@ theorem ub_iff {body : CapturedMir} {m : AnnealStepState}
     exact ⟨fun _ => ⟨msg, rfl⟩, fun _ => rfl⟩
 
 end StepObsRel
+
+/-- Retrieve the memory allocation disjointness invariant. -/
+def StateRel.memoryAllocDisjoint {body : CapturedMir} {s : MachineState} {m : Miri.Interpreter.StepState AnnealProv Miri.Interpreter.LocalLayout Unit AnnealMachine} (h : StateRel body s m) :
+    ∀ top, m.stack.frames = #[top] → MemoryAllocDisjoint top := by
+  cases h with
+  | mk top hframes _ _ _ _ _ _ _ _ hd =>
+    intro top' hframes'
+    have heq : #[top] = #[top'] := by rw [← hframes, hframes']
+    have heq2 : top = top' := by injection heq with hlist; injection hlist
+    subst heq2
+    exact hd
 
 end LeanMiriSpec.Correspondence
