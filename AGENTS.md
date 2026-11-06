@@ -79,8 +79,9 @@ applies, follow all of them.
 
 Anneal verifies Rust programs (including unsafe code) by extracting typed
 `Runtime(PostCleanup)` MIR and compiler facts via `anneal-rustc-capture` and
-checking the crate's `Trusted.CrateTheorem` (`VerificationResult` over every
-captured function's `Compiler.Verified` obligations) inside the Lean 4 kernel.
+checking the crate's `Trusted.CrateTheorem` (`Language.Verified` and
+`ContractWellFormed` obligations across the crate's captured items) inside the
+Lean 4 kernel.
 
 See [`README.md`](README.md) for the correctness policy and `trusted/`
 invariant, [`THREAT_MODEL.md`](THREAT_MODEL.md) for the threat model, bounded

@@ -85,7 +85,7 @@ conflated:
      Anneal itself and is always on, even when a crate contains no user-written
      specifications at all.
    - For properties beyond baseline soundness (as well as any stated
-     preconditions or invariants under which code is verified, including caller
+     preconditions or invariants that qualify those properties or define caller
      safety preconditions on `unsafe` functions), the stated
      specifications—together with any helper functions, trait implementations,
      constants, types, or mathematical models that define their meaning—express
@@ -257,11 +257,11 @@ proved or assumed without appearing on the two surfaces a human reviewer audits:
     point—or calling any waived, unverified, or external (`extern`) function
     must be recorded in the TCB audit log (surfacing the waived code or
     assumption so edits to waived code cannot pass silently). Likewise, every
-    verified caller must prove a callee's stated preconditions—including
-    `unsafe` function preconditions (which are part of the human-reviewed
-    specification surface)—at the call site, and every trait implementation must
-    prove the trait's stated specifications (and, for `unsafe` traits, its
-    safety contract).
+    verified caller must prove an `unsafe` callee's stated preconditions (and a
+    safe callee's stated preconditions whenever relying on its postconditions,
+    all of which are part of the human-reviewed specification surface) at the
+    call site, and every trait implementation must prove the trait's stated
+    specifications (and, for `unsafe` traits, its safety contract).
   - *Type invariants and encapsulation boundaries:* If verified code assumes a
     type invariant that relies on encapsulation, the type's visibility boundary
     must prevent unverified code from breaking it: *every* function within the
