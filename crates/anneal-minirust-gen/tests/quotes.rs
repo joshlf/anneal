@@ -540,7 +540,7 @@ fn quotations_occur_upstream() {
     );
     // The interpretation and the translation quote dozens of upstream items;
     // a sudden drop means the extraction above broke.
-    assert!(total >= 140, "only {total} quotations found");
+    assert!(total >= 170, "only {total} quotations found");
 
     // Every spec-transcribing `def` in `Interp.lean` (after `/-! ## Target`,
     // except the Lean recursion/iteration helpers `countOnesLoop` and `steps`)
@@ -1775,6 +1775,94 @@ fn storage_live_dead_deinit_move_and_init_block_quotations_are_pinned() {
         assert!(
             matched_in_lean,
             "`{lean_file}` has no extracted block quote citing `{file}` that contains all pieces of `{genuine}`"
+        );
+    }
+}
+
+
+
+
+
+
+
+#[test]
+fn call_return_and_multi_fn_quotations_are_pinned() {
+    let corpus = corpus();
+    let exprs = "spec/lang/step/expressions.md";
+    let mach = "spec/lang/machine.md";
+    let terms = "spec/lang/step/terminators.md";
+
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            exprs,
+            "Constant::FnPointer(fn_name) => { let ptr = self.fn_ptrs[fn_name]; Value::Ptr(ptr.widen(None)) }",
+            "Constant::FnPointer(fn_name) => { let ptr = self.fn_ptrs[fn_name]; Value::Ptr(ptr.widen(Some(0))) }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            mach,
+            "fn fn_from_ptr(&self, ptr: Value<M>) -> Result<Function> {",
+            "fn fn_from_ptr(&self, ptr: Value<M>) -> Result<Method> {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "fn check_abi_compatibility(",
+            "fn check_abi_compatibility_strict(",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "fn prepare_for_inplace_passing(",
+            "fn prepare_for_in_place_passing(",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "fn eval_argument(",
+            "fn evaluate_argument(",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "fn create_frame(",
+            "fn create_stack_frame(",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "fn eval_call(",
+            "fn evaluate_call(",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "Terminator::Call { callee, calling_convention: caller_conv, arguments, ret: ret_expr, next_block, unwind_block }: Terminator",
+            "Terminator::Call { callee, calling_convention: caller_conv, arguments, ret: ret_expr, next_block, unwind_block }: Expression",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "StackPopAction::BackToCaller { ret_val_ptr: caller_ret_ptr, next_block, .. } => {",
+            "StackPopAction::BackToCaller { ret_val_ptr: caller_ret_ptr, next_block, .. } =>",
+            "MiniRustSpec/Interp.lean",
+        ),
+    ];
+
+    let lean_root = minirust_dir().join("lean");
+    for (file, genuine, _tampered, lean_file) in cases {
+        assert_eq!(
+            missing_piece_in(&corpus, Some(file), genuine),
+            None,
+            "genuine quotation not found in `{file}`: {genuine}"
+        );
+        let lean = std::fs::read_to_string(lean_root.join(lean_file)).unwrap();
+        let lean_squashed = squash(&lean.replace("\\\"", "\"").replace("\n>", "\n"));
+        let first_piece = squash(genuine.split("..").next().unwrap());
+        let probe: String = first_piece.chars().take(40).collect();
+        assert!(
+            lean_squashed.contains(&probe),
+            "`{lean_file}` no longer quotes `{probe}`"
         );
     }
 }

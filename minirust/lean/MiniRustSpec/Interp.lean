@@ -49,8 +49,9 @@ here.
   `spec/mem/concurrent.md`, `spec/mem/interface.md`), and
   `Machine::vtable_lookup`, `Machine::compute_size`, and
   `Machine::compute_align` (`spec/lang/machine.md`).
-* `ValueExpr::Constant` for `Constant::Int`/`Constant::Bool`,
-  `ValueExpr::Tuple`, `ValueExpr::Load`,
+* `ValueExpr::Constant` (all `Constant` variants: `Int`, `Bool`,
+  `GlobalPointer`, `FnPointer`, `VTablePointer`, and
+  `PointerWithoutProvenance`), `ValueExpr::Tuple`, `ValueExpr::Load`,
   `ValueExpr::UnOp` with `UnOp::Int` (all `IntUnOp` variants: `Neg`, `BitNot`,
   `CountOnes`) and `UnOp::Cast` (both `CastOp` variants: `IntToInt` and
   `Transmute`, the latter through `Machine::transmute`, i.e. `encode` at the
@@ -66,16 +67,24 @@ here.
   has no Boolean negation operator: `minimize` expresses `!b` with transmutes
   and integer subtraction (see `MiniRustSpec.Correspondence.Translate`), so
   `UnOp::Int` on a `Value::Bool` stays a spec panic, exactly as upstream.
-* `Terminator::Goto`, `Terminator::Switch`, `Terminator::Unreachable`, and
-  `Terminator::Return` (`spec/lang/step/terminators.md`), including frame
-  teardown, `storage_dead` of every local, and both stack-pop actions.
+* `Terminator::Goto`, `Terminator::Switch`, `Terminator::Unreachable`,
+  `Terminator::Call` (including `Machine::fn_from_ptr`,
+  `check_abi_compatibility`, `Machine::prepare_for_inplace_passing`,
+  `Machine::eval_argument` for both `ByValue` and `InPlace`,
+  `Machine::create_frame`, `Machine::eval_call`, and
+  `Machine::mutate_cur_stack`), and `Terminator::Return`
+  (`spec/lang/step/terminators.md`, `spec/lang/machine.md`), including frame
+  teardown, `storage_dead` of every local, and both stack-pop actions
+  (`BottomOfStack` and `BackToCaller`).
 * The representation relation (`Type::{decode, encode}`) for `Type::Int`,
   `Type::Bool`, sized and unsized `Type::Tuple`, `Type::Union`
   (`Type.encodeUnionChunks`), `Type::Enum` (including `decode_discriminant`
   and `encode_discriminant`), `Type::Slice`, and `Type::TraitObject`, and
   `Machine::check_value` (with `ensure_else_ub` and `checkUnionChunks`) for
-  those types (`spec/lang/representation.md`); `Type::layout` for all of them
-  (`spec/lang/types.md`); and `BasicMemory`'s `allocate`, `load`, `store`,
+  those types (`spec/lang/representation.md`); `Type::layout` across all nine
+  `Type` variants together with `LayoutStrategy::meta_kind` and
+  `PtrType::{safe_pointee, meta_kind}` (`spec/lang/types.md`,
+  `spec/mem/pointer.md`); and `BasicMemory`'s `allocate`, `load`, `store`,
   `deallocate`, and `check_ptr` (`spec/mem/basic.md`), wrapped by
   `ConcurrentMemory`'s access recording (`spec/mem/concurrent.md`). The
   recursion of these definitions over nested types, tuple fields, union
@@ -281,6 +290,19 @@ def mapInsert {K V : Type} [DecidableEq K] : List (K × V) → K → V → List 
 def mapInsertMap {K V : Type} [DecidableEq K] (m : Map K V) (k : K) (v : V) : Map K V :=
   ⟨mapInsert m.entries k v⟩
 
+/-- `PartialEq::eq` on `libspecr::Map`: extensional key-value equality
+(independent of association-list entry order or shadowed bindings). -/
+def mapEq {K V : Type} [DecidableEq K] (eqV : V → V → Bool) (m1 m2 : Map K V) : Bool :=
+  m1.entries.all (fun (k, _) =>
+    match mapGet m1 k, mapGet m2 k with
+    | some v1, some v2 => eqV v1 v2
+    | _, _ => false) &&
+  m2.entries.all (fun (k, _) => (mapGet m1 k).isSome)
+
+/-- Distinct key count `Map::len()` on `libspecr::Map`. -/
+def mapLen {K V : Type} [DecidableEq K] (m : Map K V) : Nat :=
+  (m.entries.map Prod.fst).eraseDups.length
+
 /-- `Set::insert(x)`. -/
 def setInsert {T : Type} [DecidableEq T] (s : Set T) (x : T) : Set T :=
   if s.elems.contains x then s else ⟨s.elems ++ [x]⟩
@@ -343,6 +365,9 @@ def Size.align_to (s : Size) (a : Align) : Size :=
 /-- `x86_64::PTR_SIZE` = 64 bits:
 > "const PTR_SIZE: Size = Size::from_bits_const(64).unwrap();" -/
 def x86_64.PTR_SIZE : Size := ⟨8⟩
+/-- `x86_64::PTR_ALIGN` = 64 bits:
+> "const PTR_ALIGN: Align = Align::from_bits_const(64).unwrap();" -/
+def x86_64.PTR_ALIGN : Align := ⟨8⟩
 /-- `x86_64::INT_MAX_ALIGN` = 128 bits:
 > "const INT_MAX_ALIGN: Align = Align::from_bits_const(128).unwrap();" -/
 def x86_64.INT_MAX_ALIGN : Align := ⟨16⟩
@@ -519,10 +544,50 @@ def LayoutStrategy.compute_size_and_align (vtables : Ptr → Interp VTable) :
     pure (TupleHeadLayout.full_size_and_align head tailSize tailAlign)
   | _, _ => specPanic "pointer meta data does not match type"
 
-/-- `Type::layout::<x86_64>` for the interpreted types (`spec/lang/types.md`):
+/-- `LayoutStrategy::meta_kind` (`spec/lang/types.md`):
+> "pub fn meta_kind(self) -> PointerMetaKind {
+>     match self {
+>         LayoutStrategy::Sized(..) => PointerMetaKind::None,
+>         LayoutStrategy::Slice(..) => PointerMetaKind::ElementCount,
+>         LayoutStrategy::TraitObject(trait_name) => PointerMetaKind::VTablePointer(trait_name),
+>         LayoutStrategy::Tuple { tail, .. } => tail.meta_kind(),
+>     }
+> }" -/
+def LayoutStrategy.meta_kind : LayoutStrategy → PointerMetaKind
+  | .Sized _ _ => .None
+  | .Slice _ _ => .ElementCount
+  | .TraitObject traitName => .VTablePointer traitName
+  | .Tuple _ tail => LayoutStrategy.meta_kind tail
+
+/-- `PtrType::safe_pointee` (`spec/mem/pointer.md`):
+> "pub fn safe_pointee(self) -> Option<PointeeInfo> {
+>     match self {
+>         PtrType::Ref { pointee, .. } | PtrType::Box { pointee, .. } => Some(pointee),
+>         PtrType::Raw { .. } | PtrType::FnPtr | PtrType::VTablePtr(_) => None,
+>     }
+> }" -/
+def PtrType.safe_pointee : PtrType → Option PointeeInfo
+  | .Ref _ pointee | .Box pointee => some pointee
+  | .Raw _ | .FnPtr | .VTablePtr _ => none
+
+/-- `PtrType::meta_kind` (`spec/mem/pointer.md`):
+> "pub fn meta_kind(self) -> PointerMetaKind {
+>     match self {
+>         PtrType::Ref { pointee, .. } | PtrType::Box { pointee, .. } => pointee.layout.meta_kind(),
+>         PtrType::Raw { meta_kind, .. } => meta_kind,
+>         PtrType::FnPtr | PtrType::VTablePtr(_) => PointerMetaKind::None,
+>     }
+> }" -/
+def PtrType.meta_kind : PtrType → PointerMetaKind
+  | .Ref _ pointee | .Box pointee => LayoutStrategy.meta_kind pointee.layout
+  | .Raw metaKind => metaKind
+  | .FnPtr | .VTablePtr _ => .None
+
+/-- `Type::layout::<x86_64>` (`spec/lang/types.md`):
 > "Int(int_type) => Sized(int_type.size, int_type.align::<T>()),
 >  Bool => Sized(Size::from_bytes_const(1), Align::ONE),
->  ..
+>  Ptr(p) if p.meta_kind() == PointerMetaKind::None => Sized(T::PTR_SIZE, T::PTR_ALIGN),
+>  Ptr(_) => Sized(libspecr::Int::from(2) * T::PTR_SIZE, T::PTR_ALIGN),
 >  Union { size, align, .. } | Enum { size, align, .. } => Sized(size, align),
 >  Tuple { sized_head_layout, unsized_field, .. } => match unsized_field {
 >      None => {
@@ -534,16 +599,23 @@ def LayoutStrategy.compute_size_and_align (vtables : Ptr → Interp VTable) :
 >          tail: tail_ty.layout::<T>(),
 >      },
 >  },
->  ..
+>  Array { elem, count } => Sized(
+>      elem.layout::<T>().expect_size(\"WF ensures array element is sized\") * count,
+>      elem.layout::<T>().expect_align(\"WF ensures array element is sized\"),
+>  ),
 >  Slice { elem } => LayoutStrategy::Slice(
 >      elem.layout::<T>().expect_size(\"WF ensures slice element is sized\"),
 >      elem.layout::<T>().expect_align(\"WF ensures array element is sized\"),
 >  ),
->  TraitObject(trait_name) => LayoutStrategy::TraitObject(trait_name),"
-Pointers and arrays are outside the fragment. -/
+>  TraitObject(trait_name) => LayoutStrategy::TraitObject(trait_name)," -/
 def Type.layout : «Type» → Interp LayoutStrategy
   | .Int t => do pure (.Sized t.size (← IntType.align t))
   | .Bool => pure (.Sized ⟨1⟩ ⟨1⟩)
+  | .Ptr p =>
+    if PtrType.meta_kind p == .None then
+      pure (.Sized x86_64.PTR_SIZE x86_64.PTR_ALIGN)
+    else
+      pure (.Sized ⟨2 * x86_64.PTR_SIZE.bytes⟩ x86_64.PTR_ALIGN)
   | .Union _ _ size align => pure (.Sized size align)
   | .Enum _ _ _ size align => pure (.Sized size align)
   | .Tuple _ headLayout none =>
@@ -551,6 +623,14 @@ def Type.layout : «Type» → Interp LayoutStrategy
     pure (.Sized size align)
   | .Tuple _ headLayout (some tailTy) => do
     pure (.Tuple headLayout (← Type.layout tailTy))
+  | .Array elem count => do
+    let elemSize ← LayoutStrategy.expect_size (← Type.layout elem)
+      "WF ensures array element is sized"
+    let align ← LayoutStrategy.expect_align (← Type.layout elem)
+      "WF ensures array element is sized"
+    let bytes : Int := (elemSize.bytes : Int) * count
+    if 0 ≤ bytes then pure (.Sized ⟨bytes.toNat⟩ align)
+    else specPanic "Size::from_bytes(elem_size.bytes() * count).unwrap()"
   | .Slice elem => do
     let size ← LayoutStrategy.expect_size (← Type.layout elem)
       "WF ensures slice element is sized"
@@ -558,7 +638,6 @@ def Type.layout : «Type» → Interp LayoutStrategy
       "WF ensures array element is sized"
     pure (.Slice size align)
   | .TraitObject traitName => pure (.TraitObject traitName)
-  | _ => unsupported "Type::layout for a pointer or array type"
 
 /-! ## Representation relation (`spec/lang/representation.md`) -/
 
@@ -1536,12 +1615,47 @@ def tryMutateCurFrame (m : Mach)
     let threads ← listSet m.threads m.active_thread t' "try_mutate_at"
     pure { m with mem := cm', threads := threads }
 
+/-- `Machine::mutate_cur_stack` (`spec/lang/machine.md`):
+> "fn mutate_cur_stack<O>(&mut self, f: impl FnOnce(&mut List<StackFrame<M>>) -> O) -> O {
+>     self.threads.mutate_at(self.active_thread, |thread| f(&mut thread.stack))
+> }" -/
+def mutateCurStack {α : Type} (m : Mach) (f : List Frame → Interp (α × List Frame)) :
+    Interp (α × Mach) := do
+  let t ← activeThread m
+  let (out, stack') ← f t.stack
+  let threads ← listSet m.threads m.active_thread { t with stack := stack' } "mutate_at"
+  pure (out, { m with threads := threads })
+
 /-- `StackFrame::jump_to_block` (`spec/lang/machine.md`):
 > "self.next_block = b; self.next_stmt = Int::ZERO;"
 and `Machine::jump_to_block` (`spec/lang/step/terminators.md`):
 > "self.try_mutate_cur_frame(|frame, _mem| { frame.jump_to_block(block); ret(()) })" -/
 def jumpToBlock (m : Mach) (b : BbName) : Interp Mach :=
   mutateCurFrame m (fun fr => { fr with next_block := b, next_stmt := 0 })
+
+/-- `Machine::fn_from_ptr` (`spec/lang/machine.md`):
+> "fn fn_from_ptr(&self, ptr: Value<M>) -> Result<Function> {
+>     if let Value::Ptr(Pointer { thin_pointer: thin_ptr, metadata }) = ptr {
+>         if metadata.is_some() {
+>             throw_ub!(\"invalid pointer for function lookup\");
+>         }
+>         let Some((func_name, _)) = self.fn_ptrs.iter().find(|(_, fn_ptr)| *fn_ptr == thin_ptr) else {
+>             throw_ub!(\"invalid pointer for function lookup\");
+>         };
+>         ret(self.prog.functions[func_name])
+>     } else {
+>         throw_ub!(\"trying to look up a function based on a non-pointer value\");
+>     }
+> }" -/
+def fnFromPtr (m : Mach) (ptr : Val) : Interp Function :=
+  match ptr with
+  | .Ptr ⟨thinPtr, metadata⟩ =>
+    if metadata.isSome then ub "invalid pointer for function lookup"
+    else
+      match m.fn_ptrs.entries.find? (fun (_, (fnPtr : Ptr)) => decide (fnPtr = thinPtr)) with
+      | some (funcName, _) => mapIndex m.prog.functions funcName "self.prog.functions[func_name]"
+      | none => ub "invalid pointer for function lookup"
+  | _ => ub "trying to look up a function based on a non-pointer value"
 
 /-- `Machine::vtable_lookup` (`spec/lang/machine.md`):
 > "fn vtable_lookup(&self) -> impl Fn(ThinPointer<M::Provenance>) -> VTable + 'static {
@@ -1743,13 +1857,46 @@ def placeStore (m : Mach) (place : Place BM) (val : Val) (ty : «Type») : Inter
   if !place.aligned then ub "storing to a place based on a misaligned pointer"
   else typedStore m place.ptr.thin_pointer val ty ⟨1⟩ .None
 
-/-- `Machine::eval_constant` for the constants without provenance:
-> "Constant::Int(i) => Value::Int(i),
->  Constant::Bool(b) => Value::Bool(b)," -/
-def evalConstant : Constant → Interp Val
+/-- `Machine::eval_constant` (`spec/lang/step/expressions.md`):
+> "fn eval_constant(&mut self, constant: Constant) -> Result<Value<M>> {
+>     ret(match constant {
+>         Constant::Int(i) => Value::Int(i),
+>         Constant::Bool(b) => Value::Bool(b),
+>         Constant::GlobalPointer(relocation) => {
+>             let ptr = self.global_ptrs[relocation.name].wrapping_offset::<M::T>(relocation.offset.bytes());
+>             Value::Ptr(ptr.widen(None))
+>         },
+>         Constant::FnPointer(fn_name) => {
+>             let ptr = self.fn_ptrs[fn_name];
+>             Value::Ptr(ptr.widen(None))
+>         },
+>         Constant::VTablePointer(vtable_name) => {
+>             let ptr = self.vtable_ptrs[vtable_name];
+>             Value::Ptr(ptr.widen(None))
+>         },
+>         Constant::PointerWithoutProvenance(addr) => {
+>             Value::Ptr(ThinPointer {
+>                 addr,
+>                 provenance: None,
+>             }.widen(None))
+>         }
+>     })
+> }" -/
+def evalConstant (m : Mach) : Constant → Interp Val
   | .Int i => pure (.Int i)
   | .Bool b => pure (.Bool b)
-  | _ => unsupported "eval_constant for a pointer constant"
+  | .GlobalPointer relocation => do
+    let base ← mapIndex m.global_ptrs relocation.name "self.global_ptrs[relocation.name]"
+    let ptr := ThinPointer.wrapping_offset base relocation.offset.bytes
+    pure (.Ptr (ThinPointer.widen ptr none))
+  | .FnPointer fnName => do
+    let ptr ← mapIndex m.fn_ptrs fnName "self.fn_ptrs[fn_name]"
+    pure (.Ptr (ThinPointer.widen ptr none))
+  | .VTablePointer vtableName => do
+    let ptr ← mapIndex m.vtable_ptrs vtableName "self.vtable_ptrs[vtable_name]"
+    pure (.Ptr (ThinPointer.widen ptr none))
+  | .PointerWithoutProvenance addr =>
+    pure (.Ptr (ThinPointer.widen { addr := addr, provenance := none } none))
 
 /-! ## Operators (`spec/lang/step/operators.md`) -/
 
@@ -2167,7 +2314,7 @@ mutual
 >     ret(self.eval_bin_op(operator, left, right)?)
 > }" -/
 def evalValue (m : Mach) : ValueExpr → Interp ((Val × «Type») × Mach)
-  | .Constant c ty => do pure ((← evalConstant c, ty), m)
+  | .Constant c ty => do pure ((← evalConstant m c, ty), m)
   | .Tuple exprs ty => do
     let (vals, m) ← evalValues m exprs
     pure ((.Tuple vals, ty), m)
@@ -2312,6 +2459,377 @@ def evalStatement (m : Mach) : Statement → Interp Mach
 
 /-! ## Terminators (`spec/lang/step/terminators.md`) -/
 
+mutual
+
+/-- Structural equality `caller_discriminator == callee_discriminator` on
+`Discriminator` decision trees in `check_abi_compatibility`
+(`spec/lang/step/terminators.md`), comparing `Branch` child maps extensionally:
+> "caller_discriminator == callee_discriminator &&" -/
+def discriminatorEq : Discriminator → Discriminator → Bool
+  | .Known v1, .Known v2 => v1 == v2
+  | .Invalid, .Invalid => true
+  | .Branch off1 ty1 fb1 ⟨ch1⟩, .Branch off2 ty2 fb2 ch2 =>
+    off1 == off2 && ty1 == ty2 && discriminatorEq fb1 fb2 &&
+    discriminatorChildrenEq [] ch1 ch2 &&
+    ch2.entries.all (fun (k, _) => (mapGet ⟨ch1⟩ k).isSome)
+  | _, _ => false
+
+/-- Child-map comparison of `discriminatorEq` (`spec/lang/step/terminators.md`),
+checking each active `(start, end)` binding of `ch1` against `ch2`:
+> "caller_discriminator == callee_discriminator &&" -/
+def discriminatorChildrenEq (seen : List (Int × Int)) :
+    List ((Int × Int) × Discriminator) → Map (Int × Int) Discriminator → Bool
+  | [], _ => true
+  | (k, d1) :: rest, ch2 =>
+    if seen.contains k then
+      discriminatorChildrenEq seen rest ch2
+    else
+      (match mapGet ch2 k with
+       | some d2 => discriminatorEq d1 d2
+       | none => false) &&
+      discriminatorChildrenEq (k :: seen) rest ch2
+
+end
+
+mutual
+
+/-- `check_abi_compatibility` (`spec/lang/step/terminators.md`):
+> "fn check_abi_compatibility(
+>     caller_ty: Type,
+>     callee_ty: Type,
+> ) -> bool {
+>     match (caller_ty, callee_ty) {
+>         (Type::Int(caller_ty), Type::Int(callee_ty)) =>
+>             caller_ty == callee_ty,
+>         (Type::Bool, Type::Bool) =>
+>             true,
+>         (Type::Ptr(caller_ty), Type::Ptr(callee_ty)) =>
+>             caller_ty.meta_kind() == callee_ty.meta_kind(),
+>         (Type::Tuple { sized_fields: caller_fields, sized_head_layout: caller_head_layout, unsized_field: caller_unsized_field },
+>          Type::Tuple { sized_fields: callee_fields, sized_head_layout: callee_head_layout, unsized_field: callee_unsized_field }) => {
+>             let (caller_size, caller_align) = caller_head_layout.head_size_and_align();
+>             let (callee_size, callee_align) = callee_head_layout.head_size_and_align();
+>             assert!(caller_unsized_field.is_none(), \"wf ensures all arugments are sized\");
+>             assert!(callee_unsized_field.is_none(), \"wf ensures all arugments are sized\");
+>             caller_fields.len() == callee_fields.len() &&
+>             caller_fields.zip(callee_fields).all(|(caller_field, callee_field)|
+>                 caller_field.0 == callee_field.0 && check_abi_compatibility(caller_field.1, callee_field.1)
+>             ) &&
+>             caller_size == callee_size &&
+>             caller_align == callee_align
+>         }
+>         (Type::Array { elem: caller_elem, count: caller_count },
+>          Type::Array { elem: callee_elem, count: callee_count }) =>
+>             check_abi_compatibility(caller_elem, callee_elem) && caller_count == callee_count,
+>         (Type::Union { fields: caller_fields, chunks: caller_chunks, size: caller_size, align: caller_align },
+>          Type::Union { fields: callee_fields, chunks: callee_chunks, size: callee_size, align: callee_align }) =>
+>             caller_fields.len() == callee_fields.len() &&
+>             caller_fields.zip(callee_fields).all(|(caller_field, callee_field)|
+>                 caller_field.0 == callee_field.0 && check_abi_compatibility(caller_field.1, callee_field.1)
+>             ) &&
+>             caller_chunks == callee_chunks &&
+>             caller_size == callee_size &&
+>             caller_align == callee_align,
+>         (Type::Enum { variants: caller_variants, discriminator: caller_discriminator, discriminant_ty: caller_discriminant_ty, size: caller_size, align: caller_align },
+>          Type::Enum { variants: callee_variants, discriminator: callee_discriminator, discriminant_ty: callee_discriminant_ty, size: callee_size, align: callee_align }) =>
+>             caller_variants.len() == callee_variants.len() &&
+>             caller_variants.iter().all(|(caller_discriminant, caller_variant)| {
+>                 let Some(callee_variant) = callee_variants.get(caller_discriminant) else {
+>                     return false;
+>                 };
+>                 check_abi_compatibility(caller_variant.ty, callee_variant.ty) &&
+>                 caller_variant.tagger == callee_variant.tagger
+>             }) &&
+>             caller_discriminator == callee_discriminator &&
+>             caller_discriminant_ty == callee_discriminant_ty &&
+>             caller_size == callee_size &&
+>             caller_align == callee_align,
+>         _ =>
+>             false
+>     }
+> }" -/
+def checkAbiCompatibility : «Type» → «Type» → Interp Bool
+  | .Int callerTy, .Int calleeTy => pure (callerTy == calleeTy)
+  | .Bool, .Bool => pure true
+  | .Ptr callerTy, .Ptr calleeTy =>
+    pure (PtrType.meta_kind callerTy == PtrType.meta_kind calleeTy)
+  | .Tuple callerFields callerHeadLayout callerUnsizedField,
+    .Tuple calleeFields calleeHeadLayout calleeUnsizedField =>
+    let (callerSize, callerAlign) := TupleHeadLayout.head_size_and_align callerHeadLayout
+    let (calleeSize, calleeAlign) := TupleHeadLayout.head_size_and_align calleeHeadLayout
+    if callerUnsizedField.isSome then
+      specPanic "wf ensures all arugments are sized"
+    else if calleeUnsizedField.isSome then
+      specPanic "wf ensures all arugments are sized"
+    else if callerFields.length ≠ calleeFields.length then
+      pure false
+    else do
+      if !(← checkAbiFields callerFields calleeFields) then
+        pure false
+      else
+        pure (callerSize == calleeSize && callerAlign == calleeAlign)
+  | .Array callerElem callerCount, .Array calleeElem calleeCount => do
+    if !(← checkAbiCompatibility callerElem calleeElem) then
+      pure false
+    else
+      pure (callerCount == calleeCount)
+  | .Union callerFields callerChunks callerSize callerAlign,
+    .Union calleeFields calleeChunks calleeSize calleeAlign =>
+    if callerFields.length ≠ calleeFields.length then
+      pure false
+    else do
+      if !(← checkAbiFields callerFields calleeFields) then
+        pure false
+      else
+        pure (callerChunks == calleeChunks && callerSize == calleeSize && callerAlign == calleeAlign)
+  | .Enum ⟨callerVariants⟩ callerDiscrTy callerDiscriminator callerSize callerAlign,
+    .Enum calleeVariants calleeDiscrTy calleeDiscriminator calleeSize calleeAlign =>
+    if mapLen ⟨callerVariants⟩ ≠ mapLen calleeVariants then
+      pure false
+    else do
+      if !(← checkAbiVariants [] callerVariants calleeVariants) then
+        pure false
+      else
+        pure (discriminatorEq callerDiscriminator calleeDiscriminator &&
+          callerDiscrTy == calleeDiscrTy &&
+          callerSize == calleeSize &&
+          callerAlign == calleeAlign)
+  | _, _ => pure false
+
+/-- The field-list comparison of `check_abi_compatibility` for `Tuple` and
+`Union` (`spec/lang/step/terminators.md`):
+> "caller_fields.zip(callee_fields).all(|(caller_field, callee_field)|
+>     caller_field.0 == callee_field.0 && check_abi_compatibility(caller_field.1, callee_field.1)
+> )" -/
+def checkAbiFields : List (Offset × «Type») → List (Offset × «Type») → Interp Bool
+  | (callerOff, callerTy) :: restCaller, (calleeOff, calleeTy) :: restCallee =>
+    if callerOff ≠ calleeOff then
+      pure false
+    else do
+      if !(← checkAbiCompatibility callerTy calleeTy) then
+        pure false
+      else
+        checkAbiFields restCaller restCallee
+  | _, _ => pure true
+
+/-- The variant-map comparison of `check_abi_compatibility` for `Enum`
+(`spec/lang/step/terminators.md`):
+> "caller_variants.iter().all(|(caller_discriminant, caller_variant)| {
+>     let Some(callee_variant) = callee_variants.get(caller_discriminant) else {
+>         return false;
+>     };
+>     check_abi_compatibility(caller_variant.ty, callee_variant.ty) &&
+>     caller_variant.tagger == callee_variant.tagger
+> })" -/
+def checkAbiVariants (seen : List Int) :
+    List (Int × Variant) → Map Int Variant → Interp Bool
+  | [], _ => pure true
+  | (callerDiscr, ⟨callerVarTy, callerTagger⟩) :: rest, calleeVariants =>
+    if seen.contains callerDiscr then
+      checkAbiVariants seen rest calleeVariants
+    else
+      match mapGet calleeVariants callerDiscr with
+      | none => pure false
+      | some calleeVariant => do
+        if !(← checkAbiCompatibility callerVarTy calleeVariant.ty) then
+          pure false
+        else if !mapEq (· == ·) callerTagger calleeVariant.tagger then
+          pure false
+        else
+          checkAbiVariants (callerDiscr :: seen) rest calleeVariants
+
+end
+
+/-- `Machine::prepare_for_inplace_passing` (`spec/lang/step/terminators.md`):
+> "fn prepare_for_inplace_passing(
+>     &mut self,
+>     place: Place<M>,
+>     ty: Type,
+> ) -> NdResult {
+>     self.mem.deinit(
+>         place.ptr.thin_pointer,
+>         ty.layout::<M::T>().expect_size(\"WF ensures arguments and return types are sized\"),
+>         ty.layout::<M::T>().expect_align(\"WF ensures arguments and return types are sized\")
+>     )?;
+>     ret(())
+> }" -/
+def prepareForInplacePassing (m : Mach) (place : Place BM) (ty : «Type») : Interp Mach := do
+  let size ← LayoutStrategy.expect_size (← Type.layout ty)
+    "WF ensures arguments and return types are sized"
+  let align ← LayoutStrategy.expect_align (← Type.layout ty)
+    "WF ensures arguments and return types are sized"
+  let cm ← CM.deinit m.mem place.ptr.thin_pointer size align
+  pure { m with mem := cm }
+
+/-- `Machine::eval_argument` (`spec/lang/step/terminators.md`):
+> "fn eval_argument(
+>     &mut self,
+>     val: ArgumentExpr,
+> ) -> NdResult<(Value<M>, Type)> {
+>     ret(match val {
+>         ArgumentExpr::ByValue(value) => {
+>             self.eval_value(value)?
+>         }
+>         ArgumentExpr::InPlace(place) => {
+>             let (place, ty) = self.eval_place(place)?;
+>             let value = self.place_load(place, ty)?;
+>             self.prepare_for_inplace_passing(place, ty)?;
+>             (value, ty)
+>         }
+>     })
+> }" -/
+def evalArgument (m : Mach) : ArgumentExpr → Interp ((Val × «Type») × Mach)
+  | .ByValue value => evalValue m value
+  | .InPlace place => do
+    let (place, ty) ← evalPlace m place
+    let (value, m) ← placeLoad m place ty
+    let m ← prepareForInplacePassing m place ty
+    pure ((value, ty), m)
+
+/-- The argument evaluation loop of `Terminator::Call`
+(`spec/lang/step/terminators.md`):
+> "let arguments = arguments.try_map(|arg| self.eval_argument(arg))?;" -/
+def evalArguments (m : Mach) : List ArgumentExpr → Interp (List (Val × «Type») × Mach)
+  | [] => pure ([], m)
+  | arg :: args => do
+    let (v, m) ← evalArgument m arg
+    let (vs, m) ← evalArguments m args
+    pure (v :: vs, m)
+
+/-- The argument-local allocation loop of `Machine::create_frame`
+(`spec/lang/step/terminators.md`):
+> "for arg_local in func.args {
+>     frame.storage_live(&mut self.mem, arg_local)?;
+> }" -/
+def allocFrameArgs (fr : Frame) (cm : ConcurrentMemory BM) :
+    List LocalName → Interp (Frame × ConcurrentMemory BM)
+  | [] => pure (fr, cm)
+  | argLocal :: rest => do
+    let (fr, cm) ← storageLive fr cm argLocal
+    allocFrameArgs fr cm rest
+
+/-- The argument-passing and ABI-checking loop of `Machine::create_frame`
+(`spec/lang/step/terminators.md`):
+> "for (callee_local, (caller_val, caller_ty)) in func.args.zip(caller_args) {
+>     if !check_abi_compatibility(caller_ty, func.locals[callee_local]) {
+>         throw_ub!(\"call ABI violation: argument types are not compatible\");
+>     }
+>     let align = caller_ty.layout::<M::T>().expect_align(\"WF ensures function arguments are sized\");
+>     self.typed_store(frame.locals[callee_local], caller_val, caller_ty, align, Atomicity::None).unwrap();
+> }" -/
+def initFrameArgs (m : Mach) (frame : Frame) :
+    List LocalName → List (Val × «Type») → Interp Mach
+  | calleeLocal :: restLocals, (callerVal, callerTy) :: restArgs => do
+    let calleeTy ← mapIndex frame.func.locals calleeLocal "func.locals[callee_local]"
+    if !(← checkAbiCompatibility callerTy calleeTy) then
+      ub "call ABI violation: argument types are not compatible"
+    else do
+      let align ← LayoutStrategy.expect_align (← Type.layout callerTy)
+        "WF ensures function arguments are sized"
+      let calleePtr ← mapIndex frame.locals calleeLocal "frame.locals[callee_local]"
+      let m ← match typedStore m calleePtr callerVal callerTy align .None with
+        | .ok m => pure m
+        | .error (.unsupported w) => unsupported w
+        | .error (.specPanic msg) => specPanic msg
+        | .error _ => specPanic "self.typed_store(..).unwrap()"
+      initFrameArgs m frame restLocals restArgs
+  | _, _ => pure m
+
+/-- `Machine::create_frame` (`spec/lang/step/terminators.md`):
+> "fn create_frame(
+>     &mut self,
+>     func: Function,
+>     stack_pop_action: StackPopAction<M>,
+>     caller_conv: CallingConvention,
+>     caller_ret_ty: Type,
+>     caller_args: List<(Value<M>, Type)>,
+> ) -> NdResult<StackFrame<M>> {
+>     let mut frame = StackFrame {
+>         func,
+>         locals: Map::new(),
+>         stack_pop_action,
+>         next_block: func.start,
+>         next_stmt: Int::ZERO,
+>         extra: M::new_call(),
+>     };
+>     frame.storage_live(&mut self.mem, func.ret)?;
+>     for arg_local in func.args {
+>         frame.storage_live(&mut self.mem, arg_local)?;
+>     }
+>     if caller_conv != func.calling_convention {
+>         throw_ub!(\"call ABI violation: calling conventions are not the same\");
+>     }
+>     if !check_abi_compatibility(caller_ret_ty, func.locals[func.ret]) {
+>         throw_ub!(\"call ABI violation: return types are not compatible\");
+>     }
+>     if func.args.len() != caller_args.len() {
+>         throw_ub!(\"call ABI violation: number of arguments does not agree\");
+>     }
+>     ..
+>     ret(frame)
+> }" -/
+def createFrame (m : Mach) (func : Function) (stackPopAction : StackPopAction BM)
+    (callerConv : CallingConvention) (callerRetTy : «Type»)
+    (callerArgs : List (Val × «Type»)) : Interp (Frame × Mach) := do
+  let frame : Frame := {
+    func := func
+    locals := ⟨[]⟩
+    stack_pop_action := stackPopAction
+    next_block := func.start
+    next_stmt := 0
+    extra := ()
+  }
+  let (frame, cm) ← storageLive frame m.mem func.ret
+  let (frame, cm) ← allocFrameArgs frame cm func.args
+  let m := { m with mem := cm }
+  if callerConv ≠ func.calling_convention then
+    ub "call ABI violation: calling conventions are not the same"
+  else do
+    let calleeRetTy ← mapIndex frame.func.locals frame.func.ret "func.locals[func.ret]"
+    if !(← checkAbiCompatibility callerRetTy calleeRetTy) then
+      ub "call ABI violation: return types are not compatible"
+    else if func.args.length ≠ callerArgs.length then
+      ub "call ABI violation: number of arguments does not agree"
+    else do
+      let m ← initFrameArgs m frame func.args callerArgs
+      pure (frame, m)
+
+/-- `Machine::eval_call` (`spec/lang/step/terminators.md`):
+> "fn eval_call(
+>     &mut self,
+>     callee: Function,
+>     caller_conv: CallingConvention,
+>     arguments: List<(Value<M>, Type)>,
+>     caller_ret: (Place<M>, Type),
+>     next_block: Option<BbName>,
+>     unwind_block: Option<BbName>,
+> ) -> NdResult {
+>     let (caller_ret_place, caller_ret_ty) = caller_ret;
+>     let stack_pop_action = StackPopAction::BackToCaller {
+>         next_block,
+>         unwind_block,
+>         ret_val_ptr: caller_ret_place.ptr.thin_pointer,
+>     };
+>     let frame = self.create_frame(
+>         callee,
+>         stack_pop_action,
+>         caller_conv,
+>         caller_ret_ty,
+>         arguments,
+>     )?;
+>     self.mutate_cur_stack(|stack| stack.push(frame));
+>     ret(())
+> }" -/
+def evalCall (m : Mach) (callee : Function) (callerConv : CallingConvention)
+    (arguments : List (Val × «Type»)) (callerRet : Place BM × «Type»)
+    (nextBlock : Option BbName) (unwindBlock : Option BbName) : Interp Mach := do
+  let (callerRetPlace, callerRetTy) := callerRet
+  let stackPopAction : StackPopAction BM :=
+    .BackToCaller nextBlock unwindBlock callerRetPlace.ptr.thin_pointer
+  let (frame, m) ← createFrame m callee stackPopAction callerConv callerRetTy arguments
+  let (_, m) ← mutateCurStack m (fun stack => pure ((), stack ++ [frame]))
+  pure m
+
 /-- The teardown loop of `Terminator::Return`:
 > "while let Some(local) = frame.locals.keys().next() {
 >      frame.storage_dead(&mut self.mem, local)?;
@@ -2407,7 +2925,8 @@ def evalReturn (m : Mach) : Interp Mach := do
       | some nb => jumpToBlock m nb
       | none => ub "return from a function where caller did not specify next block"
 
-/-- `Machine::eval_terminator` for `Goto`, `Switch`, `Unreachable`, and `Return`:
+/-- `Machine::eval_terminator` for `Goto`, `Switch`, `Unreachable`, `Call`, and
+`Return` (`spec/lang/step/terminators.md`):
 > "fn eval_terminator(&mut self, Terminator::Goto(block_name): Terminator) -> NdResult {
 >     self.jump_to_block(block_name)?;
 >     ret(())
@@ -2422,6 +2941,25 @@ def evalReturn (m : Mach) : Interp Mach := do
 > ..
 > fn eval_terminator(&mut self, Terminator::Unreachable: Terminator) -> NdResult {
 >     throw_ub!(\"reached unreachable code\");
+> }
+> ..
+> fn eval_terminator(
+>     &mut self,
+>     Terminator::Call { callee, calling_convention: caller_conv, arguments, ret: ret_expr, next_block, unwind_block }: Terminator
+> ) -> NdResult {
+>     let (ret_place, ret_ty) = self.eval_place(ret_expr)?;
+>     self.prepare_for_inplace_passing(ret_place, ret_ty)?;
+>     let (callee_val, _) = self.eval_value(callee)?;
+>     let callee = self.fn_from_ptr(callee_val)?;
+>     let arguments = arguments.try_map(|arg| self.eval_argument(arg))?;
+>     self.eval_call(
+>         callee,
+>         caller_conv,
+>         arguments,
+>         (ret_place, ret_ty),
+>         next_block,
+>         unwind_block,
+>     )
 > }" -/
 def evalTerminator (m : Mach) : Terminator → Interp Mach
   | .Goto blockName => jumpToBlock m blockName
@@ -2431,8 +2969,15 @@ def evalTerminator (m : Mach) : Terminator → Interp Mach
     | .Int i => jumpToBlock m ((mapGet cases i).getD fallback)
     | _ => specPanic "switch on a non-integer"
   | .Unreachable => ub "reached unreachable code"
+  | .Call callee callerConv arguments retExpr nextBlock unwindBlock => do
+    let (retPlace, retTy) ← evalPlace m retExpr
+    let m ← prepareForInplacePassing m retPlace retTy
+    let ((calleeVal, _), m) ← evalValue m callee
+    let callee ← fnFromPtr m calleeVal
+    let (arguments, m) ← evalArguments m arguments
+    evalCall m callee callerConv arguments (retPlace, retTy) nextBlock unwindBlock
   | .Return => evalReturn m
-  | _ => unsupported "eval_terminator for a terminator other than Goto/Switch/Unreachable/Return"
+  | _ => unsupported "eval_terminator for a terminator other than Goto/Switch/Unreachable/Call/Return"
 
 /-! ## The step function (`spec/lang/machine.md`) -/
 

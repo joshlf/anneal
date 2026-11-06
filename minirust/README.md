@@ -169,7 +169,7 @@ comments; `..` marks elided code). Effects are
 (a panic in the spec, which upstream calls a spec bug), and
 `Stop.unsupported` (outside the interpreted fragment; never silently wrong).
 
-`Anchors.lean` lists the 58 upstream items that `Interp.lean` transcribes,
+`Anchors.lean` lists the 61 upstream items that `Interp.lean` transcribes,
 each with its file path, item name, line, and token hash, and proves by `decide`
 that the generated model contains them unchanged (`anchors_ok`) with no
 duplicate entries (`anchors_nodup`). Re-pinning MiniRust therefore breaks
@@ -592,10 +592,7 @@ These are deliberate and are the first things to lift:
   casts or pointer comparisons).
 * **One thread, called from a caller frame.** MiniRust makes it UB for the
   bottom frame of the main thread to return, while Anneal's root body returns
-  normally, so the relation places the callee above an arbitrary caller. What
-  the caller does after the return is outside the relation. Call setup
-  (`Terminator::Call`, argument passing) is not interpreted; witnesses start
-  at the callee's entry.
+  normally, so the relation places the root execution above an arbitrary external caller.
 * **Branch observations.** Anneal's `switchInt` emits the scrutinee as a
   visible leakage event; MiniRust has no counterpart, so `StepRel` matches it
   with an ordinary MiniRust step.
