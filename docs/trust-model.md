@@ -42,8 +42,8 @@ Anneal divides its repository into two zones with strictly separated roles:
 
 | Zone | Directory | Role | Trust status |
 | :--- | :--- | :--- | :--- |
-| **Trusted foundation** | [`trusted/`](../trusted) | Extracts MIR and emits pure proof scripts (`trusted/rustc-capture/`), defines captured MIR syntax and reference semantics (`trusted/lean/`), orchestrates CLI invocation (`trusted/cargo-anneal/`), and audits the Anneal repository in CI (`trusted/audit/`). | **In the TCB.** Audited by humans (alongside external files pinned by hash manifests inside `trusted/`). |
-| **Proof theory** | `theory/` | Defines the normalized `StableAst`, proves lowering passes (`Abstracts`), and provides WP calculi, separation logic, and proof tactics invoked by generated proof scripts. | **Outside the TCB.** Treated as potentially adversarial; audited mechanically in Anneal's CI and checked by the Lean 4 kernel. |
+| **Trusted foundation** | [`trusted/`](../trusted) | Extracts first-order MIR and emits a static proof entrypoint (`trusted/rustc-capture/`), defines captured MIR syntax and reference semantics (`trusted/lean/`), orchestrates CLI invocation (`trusted/cargo-anneal/`), and audits the Anneal repository in CI (`trusted/audit/`). | **In the TCB.** Audited by humans (alongside external files pinned by hash manifests inside `trusted/`). |
+| **Proof theory** | `theory/` | Defines in-place MIR lowering (`lowerBody`), proves lowering simulations (`lowerBody_simulates`), and provides compositional verification checkers (`proveCrate`) and symbolic execution lemmas. | **Outside the TCB.** Treated as potentially adversarial; audited mechanically in Anneal's CI and checked by the Lean 4 kernel. |
 
 ### How CI auditing and user-machine verification fit together
 
@@ -62,7 +62,7 @@ flowchart TD
     end
 
     subgraph UserMachine ["On a User's Machine (cargo anneal)"]
-        CRATE["Target Rust Crate + inline annotations"] --> CAPTURE["trusted/rustc-capture/ (TCB)\nGenerates Mir.lean (Mir.crate : Trusted.Crate)\nand pure Proof.lean (Proof.verify_crate : Trusted.CrateTheorem Mir.crate)"]
+        CRATE["Target Rust Crate + inline annotations"] --> CAPTURE["trusted/rustc-capture/ (TCB)\nGenerates first-order Mir.lean (Mir.crate : Trusted.Crate)\nand static Proof.lean (Anneal.proveCrate Mir.crate rfl)"]
         CAPTURE --> KERNEL["Lean 4 Kernel\nChecks Proof.verify_crate against Trusted.CrateTheorem Mir.crate\nusing CI-audited theory/"]
         ARCHIVE --> CAPTURE & KERNEL
     end
@@ -72,14 +72,19 @@ flowchart TD
    - Users do not write raw Lean files that could spoof the theorem statement or
      introduce `sorry`. Instead, users annotate their Rust source code, and
      `trusted/rustc-capture/` (which is part of the human-audited TCB)
-     deterministically generates both `Mir.lean` (defining
-     `Mir.crate : Trusted.Crate`) and `Proof.lean` (a pure proof script that
-     states `theorem Proof.verify_crate : Trusted.CrateTheorem Mir.crate` and
-     calls into `theory/` to prove it).
-   - Because `trusted/rustc-capture/` generates `Mir.lean` and `Proof.lean`
-     directly, the theorem *statement* (`ConstantInfo.type`) is guaranteed to
-     be `Trusted.CrateTheorem Mir.crate` over the extracted crate, and
-     `Proof.lean` is guaranteed to contain no axioms or effectful code.
+     deterministically generates two files:
+     - `Mir.lean`, which defines `Mir.crate : Trusted.Crate` using purely
+       first-order constructor applications (including first-order AST values
+       for inline specifications `RequiresSpec`, `PostSpec`, and
+       `InvariantSpec`).
+     - `Proof.lean`, a fixed, crate-independent 8-line file that states
+       `theorem Proof.verify_crate : Trusted.CrateTheorem Mir.crate :=
+       Anneal.proveCrate Mir.crate rfl`.
+   - Because `Proof.lean` is static and `Mir.lean` contains only first-order
+     data constructors, crate names and user annotations cannot inject Lean
+     commands, tactics, or axioms, and the theorem *statement*
+     (`ConstantInfo.type`) is guaranteed to be `Trusted.CrateTheorem Mir.crate`
+     over the extracted crate.
    - The Lean 4 kernel on the user's machine then typechecks `Proof.lean`,
      verifying that the proof term (`ConstantInfo.value?`) constructed by
      `theory/` is a valid proof of `Trusted.CrateTheorem Mir.crate`.
@@ -99,6 +104,35 @@ flowchart TD
      toolchain archive. `anneal-audit` does **not** run on a user's machine; its
      job is to verify in CI that nothing outside `trusted/` in the Anneal
      repository is effectful or axiom-bearing.
+
+### Keeping `trusted/lean/` transparent at the `.olean` kernel level
+
+Auditing `trusted/lean/` requires confidence not only in the surface `.lean`
+source files, but also in the compiled `.olean` constants replayed by the Lean
+4 kernel. Four design choices in `trusted/lean/` keep its compiled kernel
+environment simple and directly inspectable:
+
+- **Tactic-free definitions (`SourceRole.trusted`):** `TrustedBoundary.lean`
+  forbids `by` tactic blocks across `trusted/lean/`. All trusted definitions and
+  any foundational helper lemmas use explicit functional definitions and term-
+  mode proofs rather than opaque tactic-generated terms.
+- **No `mutual` inductive types (`BodyId` table):** `Trusted/MirAst.lean`
+  stores function bodies in a flat `Crate.bodies` list indexed by `BodyId`
+  rather than nesting `MirBody` inside `Terminator` or `TCBItem`, avoiding the
+  nested mutual recursors that Lean synthesizes for mutual inductive blocks.
+- **Structural fuel-bounded recursion without `._unsafe_rec` or
+  `WellFounded.fix`:** Recursive semantic functions in `Trusted/StepResult.lean`
+  and `Trusted/MirSemantics.lean` recurse structurally on an explicit `Nat`
+  fuel argument (or on inductive syntax/value trees), ensuring Lean's compiler
+  never emits `._unsafe_rec` definitions or well-founded recursion proof
+  obligations in `trusted/lean/`.
+- **Explicit assumption obligations (`Obligation.assumed`) instead of `opaque`
+  constants:** Trusted waivers (such as `TCBItem.rustcLowering`,
+  `TCBItem.compileTimeGuard`, `TCBItem.transparentDepBody`,
+  `TCBItem.documentedIntent`, and `TCBItem.pinnedCompilerCoupled`) are stated
+  via `Obligation.assumed (id : Id) : Obligation Id := ⟨id, False⟩` in
+  `Trusted/Refinement.lean` (or checked against `c.tcb`) rather than declaring
+  dummy `opaque` constants in `Trusted/MirSemantics.lean`.
 
 ### Statement-Origin Separation (`ConstantInfo.type` vs. `ConstantInfo.value?`)
 
