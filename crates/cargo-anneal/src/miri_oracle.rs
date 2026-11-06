@@ -1366,7 +1366,9 @@ pub fn render_anneal_confirm_module(
         out.push_str(&format!("import Mir.{crate_camel}.{}\n", item.name));
     }
     out.push_str(
-        "\nnamespace MiriOracleConfirm\n\n\
+        "\nset_option maxRecDepth 100000\n\
+         set_option maxHeartbeats 2000000\n\n\
+         namespace MiriOracleConfirm\n\n\
          open Trusted.Sequence\n\
          open Trusted.Rustc.V2026_06_01.MirAst\n\
          open Trusted.Rustc.V2026_06_01.MirSemantics\n\

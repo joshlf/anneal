@@ -2032,7 +2032,11 @@ pub fn render_trace_check_lean_module(
         }
     }
 
-    let _ = writeln!(out, "\nnamespace {}\n", cfg.module_namespace);
+    let _ = writeln!(
+        out,
+        "\nset_option maxRecDepth 100000\n\nnamespace {}\n",
+        cfg.module_namespace
+    );
     out.push_str("open Trusted.Effect\n");
     out.push_str("open Trusted.ITree\n");
     out.push_str("open Trusted.Rustc.V2026_06_01.MirAst\n");
@@ -2143,7 +2147,10 @@ pub fn render_batch_trace_eval_lean_module(
         }
     }
 
-    let _ = writeln!(out, "\nnamespace {module_namespace}\n");
+    let _ = writeln!(
+        out,
+        "\nset_option maxRecDepth 100000\n\nnamespace {module_namespace}\n"
+    );
     out.push_str("open Trusted.Effect\n");
     out.push_str("open Trusted.ITree\n");
     out.push_str("open Trusted.Rustc.V2026_06_01.MirAst\n");
@@ -2296,7 +2303,10 @@ pub fn render_batch_trace_probe_lean_module(
         }
     }
 
-    let _ = writeln!(out, "\nnamespace {module_namespace}\n");
+    let _ = writeln!(
+        out,
+        "\nset_option maxRecDepth 100000\n\nnamespace {module_namespace}\n"
+    );
     out.push_str("open Trusted.Effect\n");
     out.push_str("open Trusted.ITree\n");
     out.push_str("open Trusted.Rustc.V2026_06_01.MirAst\n");
