@@ -57,6 +57,10 @@ the human-audited TCB**.
 
 For the broader context around this architecture, see:
 
+- [`META_PRINCIPLES.md`](../META_PRINCIPLES.md),
+  [`PRINCIPLES.md`](../PRINCIPLES.md), and
+  [`THREAT_MODEL.md`](../THREAT_MODEL.md) for Anneal's controlling
+  meta-principles, correctness promise, and threat model.
 - [`docs/design.md`](design.md) for Anneal's end-to-end user workflow,
   library-centric verification model, and incremental adoption.
 - [`docs/trust-model.md`](trust-model.md) for how Anneal's CI enforces the
@@ -128,8 +132,8 @@ The Lean files emitted by Stage 1 instantiate data structures defined in
   small-step operational semantics and memory model over the captured MIR AST,
   explicitly distinguishing normal progress from undefined behavior (`UB`).
 - **Top-level theorem statement (`Trusted.CrateTheorem`):** States that for the
-  captured `Mir.crate : Trusted.Crate`, every verified function satisfies its
-  specification without reaching `UB`.
+  captured `Mir.crate : Trusted.Crate`, every verified function is sound (free
+  of `UB`) and satisfies any stated specifications.
 
 Stage 2 is optimized for **clarity and direct correspondence to the Rust
 Reference and `rustc`**, not for proof ergonomics. Where `rustc` MIR has

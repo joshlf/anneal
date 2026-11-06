@@ -13,10 +13,13 @@ those terms. -->
 > implemented differently; this document may be aspirational or stale relative
 > to the codebase.
 
-[`PRINCIPLES.md`](../PRINCIPLES.md) states Anneal's central correctness promise:
-if the code in a verification result's Trusted Computing Base (TCB) audit log
-is correct, its assumptions are valid, and Anneal emits no errors, then the
-verified code is correct.
+[`META_PRINCIPLES.md`](../META_PRINCIPLES.md),
+[`PRINCIPLES.md`](../PRINCIPLES.md), and [`THREAT_MODEL.md`](../THREAT_MODEL.md)
+are the controlling documents for Anneal's correctness promise and threat
+model: if the code in a verification result's Trusted Computing Base (TCB)
+audit log is correct, its assumptions are valid, and Anneal emits no errors in
+an uncompromised execution environment, then the verified code is sound and
+satisfies any stated specifications.
 
 A modern verification tool needs tens of thousands of lines of intermediate
 representation (IR) lowering passes, weakest-precondition (WP) rules,
@@ -250,7 +253,9 @@ full kernel-level audit:
 
 The invariant of [`trusted/`](../trusted) is that an auditor only needs to
 inspect `trusted/` to verify that Anneal upholds
-[`PRINCIPLES.md`](../PRINCIPLES.md). However, some files that belong to the
+[`META_PRINCIPLES.md`](../META_PRINCIPLES.md),
+[`PRINCIPLES.md`](../PRINCIPLES.md), and
+[`THREAT_MODEL.md`](../THREAT_MODEL.md). However, some files that belong to the
 effective TCB cannot practically reside inside the `trusted/` subdirectory:
 
 - Standard tooling expects workspace and environment manifests (`Cargo.toml`,
