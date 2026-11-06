@@ -1070,9 +1070,8 @@ fn ignores_tampered_or_spoofed_files_in_dot_anneal() {
     .unwrap();
     let err = verify_crate(&cfg_for(&crate_dir.path)).unwrap_err();
     assert!(
-        err.starts_with("proof [id]: unproved function body")
-            || err.contains("MIR capture not yet implemented"),
-        "expected rejection despite spoofed .anneal/, got: {err}"
+        err.starts_with("proof [id]: unproved function body"),
+        "expected structured Lean rejection despite spoofed .anneal/, got: {err}"
     );
 }
 
@@ -1107,20 +1106,12 @@ fn verifies_via_cli_flag_and_emits_candidate_tcb_audit_section() {
         .arg(&crate_dir.path)
         .output()
         .unwrap();
-    if output.status.success() {
-        let stdout = assert_cli_success(&output);
-        assert!(
-            stdout.contains("Candidate-Trusted TCB (Unvetted / Alpha):"),
-            "{stdout}"
-        );
-        assert!(stdout.contains("[candidate-tcb-audit]"), "{stdout}");
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("MIR capture not yet implemented"),
-            "expected CLI to pass candidate policy check and reach capture, got: {stderr}"
-        );
-    }
+    let stdout = assert_cli_success(&output);
+    assert!(
+        stdout.contains("Candidate-Trusted TCB (Unvetted / Alpha):"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("[candidate-tcb-audit]"), "{stdout}");
 }
 
 #[test]
@@ -1188,15 +1179,7 @@ fn verifies_under_hostile_environment_and_cargo_configs() {
         .env("LEAN_PATH", e)
         .output()
         .expect("invoke cargo-anneal binary");
-    if output.status.success() {
-        assert_cli_success(&output);
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("MIR capture not yet implemented"),
-            "expected hostile environment to be scrubbed through prefix & capture build, got: {stderr}"
-        );
-    }
+    assert_cli_success(&output);
 }
 
 #[test]

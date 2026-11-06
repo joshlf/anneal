@@ -6,6 +6,7 @@
 # This file may not be copied, modified, or distributed except according to
 # those terms.
 
+
 37f780b6257d0bc99fd5d7d3d0a1f16d168ef066a2a01466f4076f080d3425d2  trusted/lean/foundation-lock.json
 d5057fd252b120d101eccadf8c2502940ee17d911d2ac3fbd7d488c2366cbcbd  trusted/lean/Trusted/Refinement.lean
 670b9a7594591664e26c8a762eb6f306171d208bb250cd0ac343721eccf82d39  trusted/lean/Trusted/StepResult.lean
@@ -17,4 +18,10 @@ a38007a748154117c7986fe64838c11fd50c39567f80d22a340a721844f2cf86  theory/Anneal/
 2ce197008a784d860b79235550daac2015d293edf30d2f2f57b82f1d5ae5b9b8  theory/Anneal/Lowering.lean
 bc651e901e239b9773176f18cca6733d3a22552c0063fc6fdb0a867d983d3848  theory/Anneal/MirLemmas.lean
 c9f7d7147dbe5a3e1dbc0003c44b6d0f99d182790c2b0b46ff41da09320f4777  theory/Anneal.lean
-173ab3e6332d082267a297b0a41226f3450eb46dc601547f9186b4b698df6a46  trusted/rustc-capture/src/main.rs
+64d72f9378471f30f7c631dae10fb3e224291856aa7091f889d567335bc3b8a7  trusted/rustc-capture/src/main.rs
+1d810dad2de522c22503c665112076f8b801efcfa7206fecd84fc542b50820f9  trusted/rustc-capture/src/hook.rs
+8c281dbcc050755f2df20283a59e51f6641b2e574c894b5aa0fa6423a3dea9c4  trusted/rustc-capture/src/extract.rs
+4a84f633d33761a50296b6b4f9a9bd940b028f25a69dd1d921ad1fe2dfdcf15f  trusted/rustc-capture/src/items.rs
+4b0c4bf52e2782f923d16e896ef2c9920ebc5251b66127981fffe730bed24dde  trusted/rustc-capture/src/ir.rs
+cff9c07f76ba4707fb3141da1d12c6def3183218e01dfbd0d8e0f6651b84cced  trusted/rustc-capture/src/lean.rs
+cf19c52df123b3e94dc79083f1301fbfd17aca95a5a5771c4bf93f7779c86d6e  trusted/rustc-capture/src/spec.rs
