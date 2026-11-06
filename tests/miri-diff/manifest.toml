@@ -310,13 +310,6 @@ category = "uninit_and_padding"
 upstream_path = "tests/pass/partially-uninit.rs"
 miri_verdict = "pass:scalar:99:4"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "completeness_false_positive_ub"
-observed_anneal_tag = "ub"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Statements"
-summary = "Union Rvalue.aggregate (.adt ...) initializes a single-field unit aggregate, and writing to another union variant field (slot.value: u32) via writeProjectedValue fails with FailureKind.ub."
-
 [[tests]]
 name = "pass_copy_nonoverlapping_uninit_bytes_to_uninit"
 category = "uninit_and_padding"
@@ -385,13 +378,6 @@ category = "places_projections_and_pointers"
 upstream_path = "tests/pass/arrays.rs"
 miri_verdict = "pass:scalar:30:4"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "completeness_false_positive_ub"
-observed_anneal_tag = "ub"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Statements"
-summary = "Rvalue.ref and Rvalue.rawPtr record the unevaluated ProjectionElem.index tmpLocal in BorrowEntry.targetProjection instead of resolving the concrete index value at borrow creation time; when StorageDead(tmpLocal) executes before the reference is dereferenced, readPlace faults with FailureKind.ub."
-
 [[tests]]
 name = "pass_ptr_offset_within_array"
 category = "places_projections_and_pointers"

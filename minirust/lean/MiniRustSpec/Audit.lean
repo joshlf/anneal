@@ -2303,17 +2303,31 @@ open MiniRustSpec.Correspondence in
   bdMirCallReq_fields
   bdWriteBytes_extCall
   bdRawEq_extCall
+  bdColdPath_extCall
+  bdCtpop_extCall
+  bdExactDivI32_extCall
+  bdAbort_unsupported
+  bdExactDiv_param_types
+  bdExactDiv_same_request
+  bdExactDiv_decode
+  bdExactDiv_minirust_i32
+  bdExactDiv_minirust_u32
   bdExtCallers_rejected
+  countOnesLoop_mod
+  evalCountOnes_intFromBits
+  evalCountOnes_signedness_indep
+  bdColdPath_handled
+  bdCtpop_handled
+  bdExactDiv_handled
+  exactDivHandler_iff_minirust
+  bdWriteBytes_unhandled_fault
+  bdUbChecksCall_extCall
+  bdUbChecksCall_handled
   bdUnreach_anneal_ub
   bdUnreach_anneal_fault
   bd_minirust_unreachable_ub
   bdUnreach_rejected
   bdUnreachableTerminator_covered
-  countOnesLoop_mod
-  evalCountOnes_intFromBits
-  evalCountOnes_signedness_indep
-  exactDivHandler_iff_minirust
-  bdWriteBytes_unhandled_fault
 
 
 /-- Exhaustively verify that every declaration across every imported
