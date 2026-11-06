@@ -2058,7 +2058,14 @@ condition `argCount + 1 ≤ localDecls.length` ensures that `_0` (`f.ret`) and
 >          \"Function: return local is also used for an argument\");
 >  };"
 The bound `localDecls.length < 2^31` keeps the first-fit candidate addresses of
-`BM.pickAddr` that the callee's locals can occupy below `2^63`. -/
+`BM.pickAddr` that the callee's locals can occupy below `2^63`.
+
+Note: `inFragment` checks `statementOk`, which rejects
+`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`. The single-body
+MR-1.x and MR-4.1 theorems (like `run_ub`) do not model block splitting.
+`Assume` is only supported in multi-function proofs (`bodyInProgFragment`),
+where `translateFnInProg` explicitly translates `Assume` into a block-splitting
+`Terminator::Intrinsic` corresponding to `SegChain` and `SegPc`. -/
 def inFragment (body : MirAst.CapturedMir) : Bool :=
   body.isRuntimePostCleanup &&
   decide (body.argCount + 1 ≤ body.localDecls.length) &&
@@ -2459,5 +2466,33 @@ def progInFragment (entry : MirAst.CapturedMir) (callees : List MirAst.CapturedM
    | some bound => decide (bound < 2 ^ 31)
    | none => false) &&
   (translateProg entry callees).isSome
+
+
+
+/-- Well-formedness check for the CFG of a generated MiniRust function,
+matching `impl_Function__check_wf` (`spec/lang/well-formed.md`). Specifically
+checks that all jump targets exist in `f.blocks`. -/
+def funcCfgWf (f : Gen.Function) : Bool :=
+  f.blocks.entries.all fun ⟨_, bb⟩ =>
+    match bb.terminator with
+    | .Goto target => f.blocks.entries.any (fun ⟨n, _⟩ => n == target)
+    | .Switch _ targets fallback =>
+      targets.entries.all (fun p => f.blocks.entries.any (fun ⟨n, _⟩ => n == p.2)) &&
+      f.blocks.entries.any (fun ⟨n, _⟩ => n == fallback)
+    | .Call _ _ _ _ (some target) (some unwind) =>
+      f.blocks.entries.any (fun ⟨n, _⟩ => n == target) &&
+      f.blocks.entries.any (fun ⟨n, _⟩ => n == unwind)
+    | .Call _ _ _ _ (some target) none =>
+      f.blocks.entries.any (fun ⟨n, _⟩ => n == target)
+    | .Call _ _ _ _ none (some unwind) =>
+      f.blocks.entries.any (fun ⟨n, _⟩ => n == unwind)
+    | .Intrinsic _ _ _ (some target) =>
+      f.blocks.entries.any (fun ⟨n, _⟩ => n == target)
+    | _ => true
+
+/-- Well-formedness check for a generated MiniRust program's functions,
+matching `impl_Program__check_wf`. -/
+def progWf (p : Gen.Program) : Bool :=
+  p.functions.entries.all fun ⟨_, f⟩ => funcCfgWf f
 
 end MiniRustSpec.Correspondence

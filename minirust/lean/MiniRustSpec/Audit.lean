@@ -1194,6 +1194,9 @@ open MiniRustSpec.Correspondence.Witness in
   ctxAssumeDeadLocal_ok
   assumeDeadLocal_anneal_ub
   assumeDeadLocal_minirust_ub_rel
+  assumeMultiFrame_prog_wf
+  assumeMultiFrame_func_wf_caller
+  assumeMultiFrame_func_wf_callee
   assumeMoveReuse_rejected
   assumeMoveReuse_diverges
   assumeAfterMove_rejected
@@ -2095,6 +2098,9 @@ open MiniRustSpec.Correspondence.Witness in
   ctxAssumeDeadLocal_ok
   assumeDeadLocal_anneal_ub
   assumeDeadLocal_minirust_ub_rel
+  assumeMultiFrame_prog_wf
+  assumeMultiFrame_func_wf_caller
+  assumeMultiFrame_func_wf_callee
   assumeMoveReuse_rejected
   assumeMoveReuse_diverges
   assumeAfterMove_rejected

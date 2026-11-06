@@ -817,6 +817,19 @@ theorem exactDivHandler_iff_minirust (it : Gen.IntType)
     · simp only [Bool.not_eq_true] at hrep
       simp [evalBinOp, evalIntBinOp, hr0, hrep, ub]
 
+
+/-! ## Completeness Audit: `write_bytes` and `ub_checks`
+
+* `core::intrinsics::write_bytes`: `minimize`'s `translate_rs_intrinsic` has no arm
+  for `write_bytes`; its catch-all arm stops with `span_bug!`. We explicitly map
+  this to `MirStepNode.unsupported` because it lacks an `ExternalCallHandler` and
+  fallback body (see `bdWriteBytes_extCall`).
+* `core::intrinsics::ub_checks`: `tooling/minimize/src/rvalue.rs` lowers
+  `Rvalue::NullaryOp(NullOp::UbChecks)` to a `bool` constant (`build::const_bool`).
+  We map this to `unsupported` in Anneal (see `bdUbChecks_extCall`) because the
+  evaluation requires session configuration not present in MIR semantics.
+-/
+
 /-! ## 5. `core::hint::unreachable_unchecked()` -/
 
 /-- MIR of `fn unreachable_caller() -> !`, which calls

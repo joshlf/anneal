@@ -10595,9 +10595,60 @@ theorem assumeTupleCallOv_minirust_ub_rel :
       (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
   exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
 
-/-- `Assume` reading a dead local (`StorageLive(_2); StorageDead(_2); Assume(copy _2)`):
-`progInFragment` admits the body, and both Anneal and MiniRust raise UB on the
-dead-local load (`mirCallWithCallees_ub_rel`). -/
+ 
+
+-- ## MR-4.2 A1 Witnesses for `funcCfgWf`/`progWf` and `Assume` edge cases
+
+/-- Callee with an `Assume` chain to test `funcCfgWf`/`progWf` and multi-frame split. -/
+def assumeChainCallee : CapturedMir where
+  defPath := "witness::assume_chain_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [boolDecl, boolDecl, boolDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.intrinsic (.assume (.copy (local_ 1)))),
+        mkStmt (.intrinsic (.assume (.copy (local_ 1)))),
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 1)))),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Caller that tests `Assume` before and after call, and calls a block-splitting callee. -/
+def assumeMultiFrameCaller : CapturedMir where
+  defPath := "witness::assume_multi_frame_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [boolDecl, boolDecl, boolDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.intrinsic (.assume (.copy (local_ 1))))],
+      terminator := mkTerm (.call (fnDefOp "witness::assume_chain_callee") [.copy (local_ 1)] (local_ 2) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.intrinsic (.assume (.copy (local_ 2)))),
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 2))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem assumeMultiFrame_prog_wf :
+    progWf ((translateProg assumeMultiFrameCaller [assumeChainCallee]).getD emptyProg) = true := by decide
+
+theorem assumeMultiFrame_func_wf_caller :
+    funcCfgWf ((translateFnInProg (fnNameMap assumeMultiFrameCaller [assumeChainCallee]) assumeMultiFrameCaller).getD callerFn) = true := by decide
+
+theorem assumeMultiFrame_func_wf_callee :
+    funcCfgWf ((translateFnInProg (fnNameMap assumeMultiFrameCaller [assumeChainCallee]) assumeChainCallee).getD callerFn) = true := by decide
+
+
+
 def assumeDeadLocal : CapturedMir where
   defPath := "witness::assume_dead_local"
   phase := .runtimePostCleanup

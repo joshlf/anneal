@@ -1669,6 +1669,21 @@ theorem fbShr63_minirust_direct :
       some (some { retAlloc with data := scalarBytes u32 1 }, [1]) := by
   decide +kernel
 
+
+/-! ## Completeness Audit: Statement Lowering vs Fallback
+
+The `core::intrinsics::unchecked_add`, `unchecked_sub`, `unchecked_mul`,
+`unchecked_shl`, and `unchecked_shr` intrinsics, along with `wrapping_add`,
+`wrapping_sub`, and `wrapping_mul`, are handled by `rustc`'s intrinsic lowering
+pass during MIR building (`rustc_mir_build`). They become `Rvalue::BinaryOp`
+statements (`BinOp.*Unchecked` or ordinary `BinOp.add`/`sub`/`mul`) in the MIR,
+so they do not appear as `TerminatorKind::Call` to `core::intrinsics::*` in
+`Runtime(PostCleanup)` MIR. Consequently, they do not require
+`ExternalCallHandler` implementations or `callees` fallback bodies.
+`Translate.lean` translates `BinOp.addUnchecked` directly to MiniRust's
+`IntBinOp::AddUnchecked` (`translateRvalue`).
+-/
+
 /-! ## `black_box::<u32>` -/
 
 /-- `black_box::<u32>` (`core::intrinsics::black_box`), an identity function
