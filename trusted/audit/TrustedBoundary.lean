@@ -663,6 +663,26 @@ def validateLocalConstant (m : Name) (role : ModuleRole)
   if ci.hasValue true && (ci.value? true).isNone then
     fail s!"missing stored body {ci.name}"
 
+/-- Whether `ci` is the compiler-only `_unsafe_rec` helper emitted by Lean's
+structural recursion elaborator (`addAndCompilePartialRec`) alongside a total,
+safe `.defnInfo` declaration `baseName` in the same module `m`.
+
+Excluding these helpers from `locals` is sound because `replay locals` replays
+every kernel declaration into `base.toKernelEnv` without `compilerHelpers`: if
+any kernel definition or theorem referenced an `_unsafe_rec` helper, kernel
+replay would reject it as an unknown constant. -/
+def isStructuralRecCompilerHelper (env : Environment) (m : Name)
+    (ci : ConstantInfo) : IO Bool := do
+  unless ci.isPartial && !ci.isUnsafe do
+    return false
+  let some baseName := Compiler.isUnsafeRecName? ci.name
+    | return false
+  let baseOrig ← origin env baseName
+  let some baseCi := env.checked.get.find? baseName
+    | return false
+  return baseOrig == m && (baseCi matches .defnInfo _) &&
+    !baseCi.isUnsafe && !baseCi.isPartial
+
 /-- Verify module allowlists, declaration provenance, `Trusted` namespace
 hygiene, and the absence of axioms and `unsafe`/`partial` declarations across
 all loaded modules. Return every non-foundation constant and the compiler-only
@@ -676,6 +696,7 @@ def verifyAndCollectLocals (env : Environment)
     unless loadedMods.contains reqMod do
       fail s!"missing required module {reqMod}"
   let mut locals : Std.HashMap Name ConstantInfo := {}
+  let mut compilerHelpers : NameSet := {}
   let mut extraNames : NameSet := {}
   for m in env.header.modules, data in env.header.moduleData do
     unless data.constNames == data.constants.map ConstantInfo.name do
@@ -689,7 +710,7 @@ def verifyAndCollectLocals (env : Environment)
         unless origRole == .foundation do
           fail s!"inventory origin mismatch {ci.name}"
       | .trusted _ | .theory =>
-        if locals.contains ci.name then
+        if locals.contains ci.name || compilerHelpers.contains ci.name then
           fail s!"duplicate declaration {ci.name}"
         unless orig == m.module do
           fail s!"inventory origin mismatch {ci.name}"
@@ -698,8 +719,13 @@ def verifyAndCollectLocals (env : Environment)
       unless stored.type == ci.type && stored.value? true == ci.value? true do
         fail s!"stored declaration differs from inventory {ci.name}"
       if role != .foundation then
-        validateLocalConstant m.module role ci
-        locals := locals.insert ci.name ci
+        if ← isStructuralRecCompilerHelper env m.module ci then
+          compilerHelpers := compilerHelpers.insert ci.name
+          if role matches .trusted _ then
+            extraNames := extraNames.insert ci.name
+        else
+          validateLocalConstant m.module role ci
+          locals := locals.insert ci.name ci
     for n in data.extraConstNames do
       let (orig, origRole) ← constProvenance env roles n
       match role with
@@ -710,13 +736,14 @@ def verifyAndCollectLocals (env : Environment)
         unless orig == m.module do
           fail s!"IR helper provenance mismatch {n}"
         if (env.checked.get.find? n).isSome then
-          unless locals.contains n do
+          unless locals.contains n || compilerHelpers.contains n do
             fail s!"uninventoried kernel compiler helper {n}"
         else if role matches .trusted _ then
           extraNames := extraNames.insert n
   for (n, _) in env.checked.get.constants do
     let (_, origRole) ← constProvenance env roles n
-    if origRole != .foundation && !locals.contains n then
+    if origRole != .foundation && !locals.contains n &&
+        !compilerHelpers.contains n then
       fail s!"uninventoried constant {n}"
   return (locals, extraNames)
 
