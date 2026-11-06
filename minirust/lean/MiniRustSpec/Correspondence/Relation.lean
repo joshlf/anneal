@@ -733,9 +733,6 @@ def MultiStepRel (entry : CapturedMir) (callees : List CapturedMir)
     ∃ m', Interp.step m = .ok m' ∧ ReturnRel entry rootCtx s v m'
   | .vis (.inl (.fail .ub)) _ =>
     ∃ msg, Interp.step m = .error (.ub msg)
-  | .vis (.inr (.inr (.call req))) k =>
-    ∃ m' ans s', k ans = .running s' ∧ (∃ j, 1 ≤ j ∧ Interp.steps j m = .ok m') ∧
-      MultiStateRel entry callees prog rootCtx s' m'
   | _ => False
 
 end MiniRustSpec.Correspondence

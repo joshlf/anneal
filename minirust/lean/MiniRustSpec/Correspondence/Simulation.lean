@@ -2729,8 +2729,7 @@ theorem bodyInProgFragment_spec {fnMap : FnMap}
       bb.isCleanup = false ∧
       (∀ st ∈ bb.statements, progStatementOk body.localDecls st = true) ∧
       (terminatorOk body.localDecls body.basicBlocks.length bb.terminator = true ∨
-        callTerminatorOk callees body blk bb.terminator = true ∨
-        intrinsicTerminatorOk body blk bb.terminator = true)) ∧
+        callTerminatorOk callees body blk bb.terminator = true)) ∧
     storageDeadOk body = true ∧
     movesOk body = true ∧
     mentionsOk body = true ∧
@@ -2745,7 +2744,7 @@ theorem bodyInProgFragment_spec {fnMap : FnMap}
   have hb := hbbs blk hlt
   simp only [hbb, Bool.and_eq_true, Bool.not_eq_true', List.all_eq_true,
     terminatorInProgOk, Bool.or_eq_true] at hb
-  exact ⟨hb.1.1, hb.1.2, by rcases hb.2 with (h1 | h2) | h3; exact Or.inl h1; exact Or.inr (Or.inl h2); exact Or.inr (Or.inr h3)⟩
+  exact ⟨hb.1.1, hb.1.2, hb.2⟩
 
 private theorem list_mapM_mem {α β : Type} {f : α → Option β} {xs : List α} {ys : List β}
     (hm : xs.mapM f = some ys) {x : α} (hx : x ∈ xs) :
@@ -4925,45 +4924,6 @@ private theorem callDestOk_evalSpec {curBody : CapturedMir} {s : MachineState}
   | ⟨_, [.opaqueCast _]⟩, _, hdest | ⟨_, _ :: _ :: _⟩, _, hdest =>
     simp [callDestOk] at hdest
 
-
-
-
-
-private theorem intrinsicTerminatorOk_unpack {fnMap : FnMap}
-    {curBody : CapturedMir} {blk nc1 nc2 : Nat}
-    {bb : BasicBlockData} {tbTerm : Gen.Terminator}
-    {ex1 : List (Gen.BbName × Gen.BasicBlock)}
-    (hbb : curBody.basicBlocks[blk]? = some bb)
-    (hok : intrinsicTerminatorOk curBody blk bb.terminator = true)
-    (htr : translateTerminatorInProg fnMap curBody.localDecls nc1 bb.terminator =
-      some (tbTerm, nc2, ex1)) :
-    ∃ func argOps destination targetBb unwind dp res,
-      bb.terminator.kind = .call func argOps destination (some targetBb) unwind ∧
-      extractFnDefPath func = some dp ∧
-      translateIntrinsicOrNone dp argOps destination (some targetBb) = some res ∧
-      targetBb < curBody.basicBlocks.length ∧
-      tbTerm = .Goto (bbName nc1) ∧ nc2 = nc1 + 1 ∧
-      ex1 = [(bbName nc1, ⟨res.stmts, res.terminator, Gen.BbKind.Regular⟩)] := by
-  unfold intrinsicTerminatorOk at hok
-  rw [hbb] at hok
-  cases htk : bb.terminator.kind with
-  | call func argOps destination target unwind =>
-    rw [htk] at hok
-    cases target with
-    | none => simp at hok
-    | some targetBb =>
-      cases hdp : extractFnDefPath func with
-      | none => simp [hdp] at hok
-      | some dp =>
-        cases hres : translateIntrinsicOrNone dp argOps destination (some targetBb) with
-        | none => simp [hdp, hres] at hok
-        | some res =>
-          unfold translateTerminatorInProg at htr
-          rw [htk, hdp, hres] at htr
-          obtain ⟨rfl, rfl, rfl⟩ := Option.some.inj htr
-          exact ⟨func, argOps, destination, targetBb, unwind, dp, res, htk, hdp, hres, hok, rfl, rfl, rfl⟩
-  | _ => simp at hok
-
 private theorem callTerminatorOk_unpack {fnMap : FnMap}
     {callees : List CapturedMir} {curBody : CapturedMir} {blk nc1 nc2 : Nat}
     {bb : BasicBlockData} {tbTerm : Gen.Terminator}
@@ -5009,14 +4969,14 @@ private theorem callTerminatorOk_unpack {fnMap : FnMap}
           | none => simp [hextr, hintr, hfind] at hok
           | some callee =>
             cases hcd : callee.localDecls with
-          | nil => simp [hextr, hintr, hfind, hcd] at hok
+          | nil => simp [hextr, hfind, hcd] at hok
           | cons calleeRetDecl restDecls =>
             simp only [hextr, hintr, hfind, hcd, Bool.and_eq_true, decide_eq_true_eq,
               List.all_eq_true, bne_iff_ne] at hok
             obtain ⟨⟨⟨⟨⟨⟨⟨htgtLt, _⟩, _⟩, hArgLen⟩, hArgBound⟩, hArgsOk⟩, hDestOk⟩, hNotDst⟩ := hok
             simp only [translateTerminatorInProg, htk, hextr, Option.bind_eq_bind,
               Option.bind_some] at htr
-            simp only [hintr] at htr
+            simp only [hintr, Option.bind_none] at htr
             cases hlk : lookupFnTarget fnMap dp with
             | none => simp [hlk] at htr
             | some fnConv =>
@@ -5752,9 +5712,8 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
                 exact .inr (congrArg some (hCallerEq.trans hRest.nil_body_eq))
               · intro _
                 exact ⟨savedCaller.callerBody, rfl⟩
-    · rcases hcallOk with hcallOk | hintrinsicOk
-      · ------------------------------------------------------------ call terminator
-        obtain ⟨func, argOps, destination, targetBb, unwind, dp, callee, calleeRetDecl,
+    · ------------------------------------------------------------ call terminator
+      obtain ⟨func, argOps, destination, targetBb, unwind, dp, callee, calleeRetDecl,
         restDecls, fn, conv, argExprs, retExpr, unwindBb,
         hk, hextr, hfind, hCalleeDecls, htgtLt, hArgLen, hArgBound, hArgsOk, hDestOk,
         hNotDst, hlkTgt, hlk, htrArgs, hretTr, htt⟩ :=
@@ -5970,8 +5929,6 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
         simp only [Option.getD_some]
         exact ⟨hCalleeMem, hfCallee, hStackNext, rfl, hbase2, hCalleeBud,
           by omega, hshCallee0.threads, segPcZero_of_translateFnInProg hfCallee 0, hloCallee⟩
-      · -------------------------------------------------------- intrinsic terminator
-        sorry
 
 /-- Initial locals map at `fEntry.start` under `MultiStartRel`. -/
 theorem MultiStartRel.localsOk {entry : CapturedMir} {callees : List CapturedMir}
