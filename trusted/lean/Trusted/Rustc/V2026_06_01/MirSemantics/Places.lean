@@ -2151,14 +2151,12 @@ If `proj` ends with `.subslice fromIdx toIdx fromEnd`, split `proj` into
 @[reducible]
 def splitLastSubslice? : List ProjectionElem → Option (List ProjectionElem × Nat × Nat × Bool)
   | .nil => .none
+  | .subslice fromIdx toIdx fromEnd :: .nil => .some (.nil, fromIdx, toIdx, fromEnd)
   | elem :: rest =>
     match splitLastSubslice? rest with
     | .some (initProj, fromIdx, toIdx, fromEnd) =>
       .some (elem :: initProj, fromIdx, toIdx, fromEnd)
-    | .none =>
-      match elem with
-      | .subslice fromIdx toIdx fromEnd => .some (.nil, fromIdx, toIdx, fromEnd)
-      | _ => .none
+    | .none => .none
 
 /--
 Return `true` when `proj` ends with `.subslice`.
