@@ -1069,13 +1069,28 @@ def annealCastHooks (layouts : LayoutTable := emptyLayoutTable) :
 
 /-- `RvalueHooks` instantiated for Anneal's single-threaded machine. -/
 
-def annealPlaceHooks (_localDecls : List LocalDecl) (_layouts : LayoutTable) :
+def annealPlaceHooks (localDecls : List LocalDecl) (layouts : LayoutTable) :
     Miri.Interpreter.PlaceHooks AnnealProv AnnealStepState Unit Unit where
-  getFrame := throw (.unsupported "getFrame")
-  setFrame := fun _ => throw (.unsupported "setFrame")
+  getFrame := do
+    let state ← get
+    match state.stack.currentFrame? with
+    | some frame => pure frame
+    | none => throw (.stack .emptyStack)
+  setFrame := fun frame => do
+    let state ← get
+    let idx := state.stack.frames.size - 1
+    if h : idx < state.stack.frames.size then
+      set { state with stack := { frames := state.stack.frames.set idx frame h } }
+    else
+      throw (.stack .emptyStack)
   debugAssertions := false
-  frameIndex := throw (.unsupported "frameIndex")
-  resolveLayout := fun _ _ => throw (.unsupported "resolveLayout")
+  frameIndex := do
+    let state ← get
+    return state.stack.frames.size - 1
+  resolveLayout := fun _ localId =>
+    match lookupLocalDeclLayout localDecls layouts localId with
+    | some l => pure l
+    | none => throw (.stack (.missingLocalType localId))
   localToOp := fun _ _ => throw (.unsupported "localToOp")
   projection := fun _ => throw (.unsupported "projection")
   deref := fun _ _ _ => throw (.unsupported "deref")
@@ -1095,12 +1110,38 @@ def annealPlaceHooks (_localDecls : List LocalDecl) (_layouts : LayoutTable) :
     set {state with machine := {state.machine with memory := memory}}
     let pointer : Miri.Memory.Pointer (Option AnnealProv) := ⟨⟨0⟩, none⟩
     return ⟨⟨pointer, .none, none⟩, layout⟩
-  writeMemoryNoValidate := fun _ _ _ => throw (.unsupported "writeMemoryNoValidate")
+  writeMemoryNoValidate := fun _ value mplace => do
+    let state ← get
+    let mut memory := state.machine.memory
+    let id? := mplace.mplace.ptr.provenance.bind Miri.Memory.Provenance.getAllocId
+    let some id := id? | throw (.unsupported "no alloc id")
+    let offset := mplace.mplace.ptr.offset
+    match memory.live.findIdx? (fun (k, _) => k == id) with
+    | some idx =>
+      match memory.live[idx]? with
+      | some (k, ⟨kind, alloc⟩) =>
+        let ptrSize := Miri.ABI.Size.ofBytes 8
+        let alloc' ← match value with
+        | .uninit =>
+            match Miri.Memory.Allocation.writeUninit (Miri.Memory.allocRange offset mplace.layout.layout.size) ptrSize alloc with
+            | EStateM.Result.ok _ a => pure a
+            | EStateM.Result.error _ _ => throw (.unsupported "size error in writeUninit")
+        | .scalar s =>
+            match Miri.Memory.Allocation.writeScalar annealTargetDataLayout (Miri.Memory.allocRange offset s.size) s alloc with
+            | EStateM.Result.ok _ a => pure a
+            | EStateM.Result.error _ _ => throw (.unsupported "size error in writeScalar")
+        | .scalarPair s1 s2 =>
+            throw (.unsupported "scalarPair in writeMemoryNoValidate")
+        let memory' := { memory with live := memory.live.set! idx (k, ⟨kind, alloc'⟩) }
+        set { state with machine := { state.machine with memory := memory' } }
+        pure ()
+      | none => pure ()
+    | none => throw (.unsupported "allocation not found")
   afterLocalMovedToMemory := fun _ _ _ => pure ()
   memoryOffset := fun _ _ _ _ _ => throw (.unsupported "memoryOffset")
   writeLocalImmediate := fun _ _ _ _ => throw (.unsupported "writeLocalImmediate")
-  enforceValidity := fun _ _ => throw (.unsupported "enforceValidity")
-  validate := fun _ _ => throw (.unsupported "validate")
+  enforceValidity := fun _ _ => pure true
+  validate := fun _ _ => pure ()
 
 def annealRvalueHooks (localDecls : List LocalDecl := .nil)
     (layouts : LayoutTable := emptyLayoutTable) :
@@ -1128,7 +1169,9 @@ def annealRvalueHooks (localDecls : List LocalDecl := .nil)
   unaryOp := fun c op v => Miri.Interpreter.ScalarOps.unary (annealScalarOpsHooks localDecls layouts) c op v
   writeAggregate := fun _ _ _ _ => throw (.unsupported "writeAggregate")
   writeRepeat := fun _ _ _ => throw (.unsupported "writeRepeat")
-  forceAllocation := fun _ _ => throw (.unsupported "forceAllocation")
+  forceAllocation := fun c v => do
+    let res ← Miri.Interpreter.forceAllocation (annealPlaceHooks localDecls layouts) c v
+    pure res.mplace
   toRef := fun _ _ => throw (.unsupported "toRef")
   enforceValidity := fun _ _ => pure true
   retagPtrValue := fun _ _ _ => pure none
@@ -1320,9 +1363,28 @@ def annealStepHooks (localDecls : List LocalDecl := .nil)
       Unit
       (Miri.Interpreter.RuntimePlace AnnealProv) where
   assign := fun choice place rvalue state =>
-    Miri.Interpreter.runRvalue
+    let (state', result) := Miri.Interpreter.runRvalue
       (Miri.Interpreter.evalRvalueIntoPlace (annealRvalueHooks localDecls layouts) choice rvalue place)
       state
+    match result with
+    | .error _ => (state', result)
+    | .ok () =>
+      match rvalue with
+      | .Use (.Move srcPlace) _ =>
+        if srcPlace.projection.isEmpty then
+          match state'.stack.currentFrame? with
+          | none => (state', result)
+          | some frame =>
+            match frame.replaceLocalValue srcPlace.localId (.live (.immediate .uninit)) with
+            | .ok frame' =>
+              let idx := state'.stack.frames.size - 1
+              if h : idx < state'.stack.frames.size then
+                let state'' := { state' with stack := { frames := state'.stack.frames.set idx frame' h } }
+                (state'', result)
+              else (state', result)
+            | .error _ => (state', result)
+        else (state', result)
+      | _ => (state', result)
   evalPlace := fun _ place _ state =>
     Miri.Interpreter.runRvalue (annealEvalPlace localDecls layouts place) state
   writeDiscriminant := fun _ _ _ state =>
