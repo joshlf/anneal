@@ -221,6 +221,7 @@ theorem evalPlaceProject_scalarPair_field0_field1_simulation
 
 
 
+/-- Simulation of `AddWithOverflow` via `evalBinOp_arithmetic_simulation`. -/
 theorem evalCheckedAdd_simulation
     {sc₁ sc₂ : MirAst.ScalarInt} {msc₁ msc₂ : Miri.Memory.ScalarInt}
     (hrel₁ : ScalarRel sc₁ msc₁) (hrel₂ : ScalarRel sc₂ msc₂)
@@ -238,6 +239,7 @@ theorem evalCheckedAdd_simulation
   have hop : (translateBinOp .addWithOverflow : Option Miri.MIR.BinOp) = some .AddWithOverflow := rfl
   exact evalBinOp_arithmetic_simulation harith hop hrel₁ hrel₂ hsz_eq kind locals mem
 
+/-- Simulation of `SubWithOverflow` via `evalBinOp_arithmetic_simulation`. -/
 theorem evalCheckedSub_simulation
     {sc₁ sc₂ : MirAst.ScalarInt} {msc₁ msc₂ : Miri.Memory.ScalarInt}
     (hrel₁ : ScalarRel sc₁ msc₁) (hrel₂ : ScalarRel sc₂ msc₂)
@@ -255,6 +257,7 @@ theorem evalCheckedSub_simulation
   have hop : (translateBinOp .subWithOverflow : Option Miri.MIR.BinOp) = some .SubWithOverflow := rfl
   exact evalBinOp_arithmetic_simulation harith hop hrel₁ hrel₂ hsz_eq kind locals mem
 
+/-- Simulation of `MulWithOverflow` via `evalBinOp_arithmetic_simulation`. -/
 theorem evalCheckedMul_simulation
     {sc₁ sc₂ : MirAst.ScalarInt} {msc₁ msc₂ : Miri.Memory.ScalarInt}
     (hrel₁ : ScalarRel sc₁ msc₁) (hrel₂ : ScalarRel sc₂ msc₂)
@@ -275,6 +278,11 @@ theorem evalCheckedMul_simulation
 
 
 
+/-- 
+Theorem 5 (`LM-1.3`): End-to-end multi-step simulation for checked arithmetic and assertion.
+
+Proves that for any well-typed basic block sequence evaluating a checked binary operation (`AddWithOverflow`, `SubWithOverflow`, `MulWithOverflow`) into a tuple, projecting the overflow bit `.1`, and branching via `TerminatorKind.assert`, the bounded execution (`runAnnealBounded` vs `runMiriBounded` for 3 steps) remains perfectly synchronized (either both hit UB on overflow, or both step forward safely).
+-/
 theorem checked_binop_then_assert_simulation
     {body : CapturedMir} {nonAddrTaken : Nat → Prop}
     {s0 : MachineState} {m0 : AnnealStepState}
