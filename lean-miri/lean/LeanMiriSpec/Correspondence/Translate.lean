@@ -496,6 +496,22 @@ def translateRawPtrKind : Mutability → Miri.MIR.RawPtrKind
   | .not => .Const
   | .mut => .Mut
 
+/-- Translate Anneal's `Debug`-formatted `PointerCoercion` tag string
+(`rustc_middle::ty::adjustment::PointerCoercion` emitted by `rustc-capture`) to
+`Miri.MIR.PointerCoercion`. Unrecognized strings map to `.MutToConstPointer`,
+which `Miri.Interpreter.Cast.cast` rejects in runtime MIR with
+`StepError.invalidProgram`. -/
+def translatePointerCoercion : String → Miri.MIR.PointerCoercion
+  | "ReifyFnPointer(Safe)" | "ReifyFnPointer" => .ReifyFnPointer .Safe
+  | "ReifyFnPointer(Unsafe)" => .ReifyFnPointer .Unsafe
+  | "UnsafeFnPointer" => .UnsafeFnPointer
+  | "ClosureFnPointer(Safe)" | "ClosureFnPointer(Normal)" => .ClosureFnPointer .Safe
+  | "ClosureFnPointer(Unsafe)" => .ClosureFnPointer .Unsafe
+  | "MutToConstPointer" => .MutToConstPointer
+  | "ArrayToPointer" => .ArrayToPointer
+  | "Unsize" => .Unsize
+  | _ => .MutToConstPointer
+
 /-- Translate an Anneal `CastKind` to `Miri.MIR.CastKind`. -/
 def translateCastKind : CastKind → Miri.MIR.CastKind
   | .intToInt => .IntToInt
@@ -506,7 +522,7 @@ def translateCastKind : CastKind → Miri.MIR.CastKind
   | .fnPtrToPtr => .FnPtrToPtr
   | .pointerExposeProvenance => .PointerExposeProvenance
   | .pointerWithExposedProvenance => .PointerWithExposedProvenance
-  | .pointerCoercion _ => .PointerCoercion .Unsize .Implicit
+  | .pointerCoercion ck => .PointerCoercion (translatePointerCoercion ck) .Implicit
   | .transmute => .Transmute
   | .subtype => .Subtype
 
@@ -971,6 +987,86 @@ def annealWriteImmediate (val : Miri.Interpreter.Immediate AnnealProv)
             throw (.stack .emptyStack)
   | _ => throw (.unsupported "non-local immediate write in scalar fragment")
 
+/-- Classify an encoded `Miri.MIR.TyId` into `Miri.Interpreter.CastTypeInfo` for
+integer-like (`bool`, `char`, `i8..isize`, `u8..usize`) casts in
+`Miri.Interpreter.Cast.cast`. Floating-point, pointer, and aggregate casts
+fail closed with `StepError.unsupported` until their downstream hooks
+(`ValidityVisitor`, provenance exposure, vtables) are wired. -/
+def castTypeInfoOfEncodedTyId (tyId : Miri.MIR.TyId) :
+    Except Miri.Interpreter.StepError Miri.Interpreter.CastTypeInfo :=
+  match tyId with
+  | 1 => .ok .boolean
+  | 2 => .ok .character
+  | 10 => .ok (.integer .i8)
+  | 11 => .ok (.integer .i16)
+  | 12 => .ok (.integer .i32)
+  | 13 => .ok (.integer .i64)
+  | 14 => .ok (.integer .i128)
+  | 15 => .ok (.integer .isize)
+  | 20 => .ok (.integer .u8)
+  | 21 => .ok (.integer .u16)
+  | 22 => .ok (.integer .u32)
+  | 23 => .ok (.integer .u64)
+  | 24 => .ok (.integer .u128)
+  | 25 => .ok (.integer .usize)
+  | _ => .error (.unsupported s!"cast typeInfo not wired in scalar fragment for TyId {tyId}")
+
+/-- `CastHooks` instantiated for Anneal's single-threaded machine, supporting
+integer-like `CastKind.IntToInt` via `Miri.Interpreter.Cast.cast` and failing
+closed (`StepError.unsupported`) on float, pointer-provenance, unsizing, and
+transmute leaves. -/
+def annealCastHooks (layouts : LayoutTable := emptyLayoutTable) :
+    Miri.Interpreter.CastHooks
+      AnnealProv
+      AnnealStepState
+      Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) where
+  target := annealTargetDataLayout
+  typeInfo := fun _ tyId =>
+    match castTypeInfoOfEncodedTyId tyId with
+    | .ok info => pure info
+    | .error err => throw err
+  layoutOf := fun _ tyId => pure (layoutOfEncodedTyId tyId layouts)
+  destLayout := fun p => p.layout
+  readImmediate := fun _ op => annealReadImmediate op
+  writeImmediate := fun _ val dest => annealWriteImmediate val dest
+  writePointer := fun _ _ _ => throw (.unsupported "writePointer in cast")
+  enforceValidity := fun _ _ => pure true
+  enforceValidityRecursively := fun _ _ => pure true
+  validatePlace := fun _ _ _ _ => throw (.unsupported "validatePlace in cast")
+  derefPointer := fun _ _ => throw (.unsupported "derefPointer in cast")
+  checkFunctionPointer := fun _ _ => throw (.unsupported "checkFunctionPointer in cast")
+  exposeProvenance := fun _ _ => throw (.unsupported "exposeProvenance in cast")
+  pointerFromExposedAddress := fun _ _ => throw (.unsupported "pointerFromExposedAddress in cast")
+  usizeLayout := fun _ => pure (translateTy { kind := .uint .usize, layoutIdx := 0 })
+  floatOps := {
+    integerKindOf := fun _ _ => throw (.unsupported "floatOps.integerKindOf")
+    formatOf := fun _ _ => throw (.unsupported "floatOps.formatOf")
+    boolLayout := fun _ => pure (translateTy { kind := .bool, layoutIdx := 0 })
+    floatNondeterministic := false
+    chooseNaN := fun _ _ => throw (.unsupported "floatOps.chooseNaN") }
+  ensureMonomorphic := fun _ _ => pure ()
+  requireNoBoundVars := fun _ _ => pure ()
+  resolveFunction := fun _ _ _ => throw (.unsupported "resolveFunction in cast")
+  resolveClosureFnOnce := fun _ _ _ => throw (.unsupported "resolveClosureFnOnce in cast")
+  functionPointer := fun _ _ => throw (.unsupported "functionPointer in cast")
+  builtinDeref := fun _ _ _ => throw (.unsupported "builtinDeref in cast")
+  boxLayout := fun _ _ => throw (.unsupported "boxLayout in cast")
+  validateImmediateABI := fun _ _ => .error (.unsupported "validateImmediateABI in cast")
+  copyAllowTransmute := fun _ _ _ => throw (.unsupported "copyAllowTransmute in cast")
+  copyNoValidate := fun _ _ _ _ => throw (.unsupported "copyNoValidate in cast")
+  projectRead := fun _ _ _ => throw (.unsupported "projectRead in cast")
+  projectWrite := fun _ _ _ => throw (.unsupported "projectWrite in cast")
+  fieldLayout := fun _ _ _ => throw (.unsupported "fieldLayout in cast")
+  lockstepTails := fun _ _ _ => throw (.unsupported "lockstepTails in cast")
+  vtableType := fun _ _ _ => throw (.unsupported "vtableType in cast")
+  vtablePointer := fun _ _ _ => throw (.unsupported "vtablePointer in cast")
+  principal := fun _ _ => throw (.unsupported "principal in cast")
+  vtableEntries := fun _ _ _ => throw (.unsupported "vtableEntries in cast")
+  supertraitSlot := fun _ _ _ => throw (.unsupported "supertraitSlot in cast")
+  eraseSelfTraitRef := fun _ _ => throw (.unsupported "eraseSelfTraitRef in cast")
+  normalizePrincipal := fun _ _ => throw (.unsupported "normalizePrincipal in cast")
+
 /-- `RvalueHooks` instantiated for Anneal's single-threaded machine. -/
 def annealRvalueHooks (localDecls : List LocalDecl := .nil)
     (layouts : LayoutTable := emptyLayoutTable) :
@@ -1004,7 +1100,8 @@ def annealRvalueHooks (localDecls : List LocalDecl := .nil)
   retagPtrValue := fun _ _ _ => pure none
   placeBaseRaw := fun _ _ => pure false
   normalize := fun _ tyId => pure tyId
-  cast := fun _ _ _ _ _ => throw (.unsupported "cast")
+  cast := fun c src kind ty dest =>
+    Miri.Interpreter.Cast.cast (annealCastHooks layouts) c 16 src kind ty dest
   readDiscriminant := fun _ _ => throw (.unsupported "readDiscriminant")
   discriminantForVariant := fun _ _ _ => throw (.unsupported "discriminantForVariant")
 
@@ -1079,15 +1176,30 @@ def annealTerminatorHooks (localDecls : List LocalDecl := .nil)
     Miri.Interpreter.runRvalue
       (do
         let opTy ← annealEvalOperand localDecls layouts op none
-        let imm ← annealReadImmediate opTy
-        match imm.imm.toScalarInt with
-        | .ok _ => return imm
-        | .error err => throw (Miri.Interpreter.ScalarOps.immediateError err))
+        annealReadImmediate opTy)
       state
-  compareSwitchCase := fun _ imm caseVal state =>
-    match imm.imm.toScalarInt with
-    | .ok sc => (state, .ok (sc.data.toNat == caseVal))
-    | .error err => (state, .error (Miri.Interpreter.ScalarOps.immediateError err))
+  compareSwitchCase := fun choice value caseVal state =>
+    Miri.Interpreter.runRvalue
+      (do
+        let caseScalar ←
+          match Miri.Memory.Scalar.fromUInt (BitVec.ofNat 128 caseVal) value.layout.layout.size with
+          | .ok sc => pure sc
+          | .error err => throw (Miri.Interpreter.ScalarOps.scalarError err)
+        let result ←
+          Miri.Interpreter.ScalarOps.binary
+            (annealScalarOpsHooks localDecls layouts)
+            choice
+            .Eq
+            value
+            ⟨.scalar caseScalar, value.layout⟩
+        let resScalar ←
+          match result.imm.toScalar with
+          | .ok sc => pure sc
+          | .error err => throw (Miri.Interpreter.ScalarOps.immediateError err)
+        match resScalar.toBool with
+        | .ok b => return b
+        | .error err => throw (Miri.Interpreter.ScalarOps.scalarError err))
+      state
   call := fun _ _ state => (state, .error (.unsupported "call terminator"))
   tailCall := fun _ _ state => (state, .error (.unsupported "tailCall terminator"))
   drop := fun _ _ _ _ state => (state, .error (.unsupported "drop terminator"))
@@ -1097,12 +1209,13 @@ def annealTerminatorHooks (localDecls : List LocalDecl := .nil)
       (do
         let opTy ← annealEvalOperand localDecls layouts op none
         let imm ← annealReadImmediate opTy
-        match imm.imm.toScalarInt with
-        | .ok sc =>
-            match sc.tryToBool with
-            | .ok b => return b
-            | .error err => throw (Miri.Interpreter.ScalarOps.scalarIntError err)
-        | .error err => throw (Miri.Interpreter.ScalarOps.immediateError err))
+        let sc ←
+          match imm.imm.toScalar with
+          | .ok sc => pure sc
+          | .error err => throw (Miri.Interpreter.ScalarOps.immediateError err)
+        match sc.toBool with
+        | .ok b => return b
+        | .error err => throw (Miri.Interpreter.ScalarOps.scalarError err))
       state
   -- A failed `Assert` panics and unwinds in both rustc and Anneal (`applyUnwindAction`);
   -- it is never undefined behavior. Unwinding is outside the scalar fragment.

@@ -5961,7 +5961,9 @@ inductive AnnealRunOutcome : Type where
   | haltedOther (out : MirOutcome)
   | blocked
 
-/-- Fuel-bounded execution of Anneal's `stepMirFn` on `body`. -/
+/-- Fuel-bounded execution of Anneal's `stepMirFn` on `body`. Handles both silent
+`.tau` steps and trace-emitting `MirObsE` steps (`MirStepNode.emitStep (.event tag) s'`,
+emitted by `TerminatorKind.switchInt`). -/
 def runAnnealBounded (body : CapturedMir) : Nat → MachineState → AnnealRunOutcome
   | 0, s => .running s
   | fuel + 1, s =>
@@ -5973,7 +5975,23 @@ def runAnnealBounded (body : CapturedMir) : Nat → MachineState → AnnealRunOu
     | .ret (.normal (retVal, mem)) => .returned retVal mem
     | .ret out => .haltedOther out
     | .vis (.inl (.fail kind)) _ => .faulted kind
-    | .vis (.inr _) _ => .blocked
+    | .vis (.inr (.inl (.emit _))) k =>
+        match k PUnit.unit with
+        | .running s' => runAnnealBounded body fuel s'
+        | .halted (.normal (retVal, mem)) => .returned retVal mem
+        | .halted out => .haltedOther out
+        | .faulted kind => .faulted kind
+    | .vis (.inr (.inr _)) _ => .blocked
+
+/-- Stepping across `MirStepNode.emitStep obs s'` (both `.silent` and `SwitchInt`'s
+`.event tag`) advances `runAnnealBounded` directly to `s'` with `fuel` remaining. -/
+theorem runAnnealBounded_emitStep (body : CapturedMir) (fuel : Nat)
+    (s s' : MachineState) (obs : MirObs)
+    (hstep : stepMirFn body s = .emitStep obs s') :
+    runAnnealBounded body (fuel + 1) s = runAnnealBounded body fuel s' := by
+  conv => lhs; unfold runAnnealBounded
+  rw [hstep]
+  cases obs <;> rfl
 
 /-- Outcome of running `lean-miri`'s `Step.step` for at most `fuel` steps from a
 live root frame, recording the root `_0` return operand upon root-frame pop. -/

@@ -1074,4 +1074,369 @@ theorem charCopy_returns_agree :
     miriOutcomeScalarBits 4 (runMiriBounded charCopyBody 5 miriCharInit) = some 0x03BB := by
   decide
 
+/-! ## Heterogeneous `ShlUnchecked` (`u8 << i16`) witness (normal shift & OOB / negative UB) -/
+
+def i16Ty : Ty := { kind := .int .i16, layoutIdx := 0 }
+def i16Decl : LocalDecl := { mutability := .mut, ty := i16Ty, debugName := none }
+def constI16 (bits : Nat) : ConstOperand := { ty := i16Ty, val := .scalar (.int ⟨bits, 2⟩) }
+
+/-- `Runtime(PostCleanup)` MIR body computing `ShlUnchecked(5_u8, shiftBits as i16)`
+with heterogeneous operand types (`lhs : u8`, `rhs : i16`):
+```text
+bb0: StorageLive(_1); _1 = const 5_u8;
+     _0 = ShlUnchecked(copy _1, const shiftBits_i16);
+     StorageDead(_1); return
+``` -/
+def shiftUncheckedBody (shiftBits : Nat) : CapturedMir where
+  defPath := "lm_1_1_witness::shl_unchecked"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u8Decl, u8Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 1),
+        mkStmt (.assign (local_ 1) (.use (.constant (constU8 5)))),
+        mkStmt (.assign (local_ 0)
+          (.binaryOp .shlUnchecked (.copy (local_ 1)) (.constant (constI16 shiftBits)))),
+        mkStmt (.storageDead 1)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi0
+  layouts := emptyLayoutTable
+  allocations := []
+
+def annealShiftUncheckedInit (shiftBits : Nat) : MachineState :=
+  initMachineState (shiftUncheckedBody shiftBits) []
+
+def miriShiftUncheckedFrame (shiftBits : Nat) :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody (shiftUncheckedBody shiftBits)
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy u8Ty) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[{ value := .live (.immediate .uninit), layout := none },
+      { value := .dead, layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 0⟩ }
+
+def miriShiftUncheckedInit (shiftBits : Nat) : AnnealStepState :=
+  { stack := ⟨#[miriShiftUncheckedFrame shiftBits]⟩, machine := AnnealMachine.empty }
+
+theorem stateRel_shiftUnchecked (shiftBits : Nat) :
+    StateRel (shiftUncheckedBody shiftBits)
+      (annealShiftUncheckedInit shiftBits)
+      (miriShiftUncheckedInit shiftBits) := by
+  refine StateRel.mk (miriShiftUncheckedFrame shiftBits) rfl rfl ⟨translateTy u8Ty, rfl⟩ ?_
+    rfl rfl rfl rfl rfl
+  refine
+    { body_eq := rfl
+      location_eq := rfl
+      af_locals_len := rfl
+      mf_locals_size := rfl
+      locals_rel := ?_ }
+  intro i decl slot mls hdecl hslot hmls
+  match i with
+  | 0 =>
+    have hd : decl = u8Decl := by simpa [shiftUncheckedBody, get?] using hdecl.symm
+    have hs : slot = .uninit := by
+      simpa [annealShiftUncheckedInit, initMachineState, shiftUncheckedBody, initLocalsAux, get?]
+        using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [miriShiftUncheckedFrame] using hmls.symm
+    subst hd hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | 1 =>
+    have hd : decl = u8Decl := by simpa [shiftUncheckedBody, get?] using hdecl.symm
+    have hs : slot = .dead := by
+      simpa [annealShiftUncheckedInit, initMachineState, shiftUncheckedBody, initLocalsAux, get?]
+        using hslot.symm
+    have hm : mls = { value := .dead, layout := none } := by
+      simpa [miriShiftUncheckedFrame] using hmls.symm
+    subst hd hs hm
+    exact .dead none (fun _ h => nomatch h)
+  | n + 2 =>
+    simp [shiftUncheckedBody, get?] at hdecl
+
+theorem wellTyped_shiftUnchecked (shiftBits : Nat) (hs : shiftBits < 65536) :
+    WellTypedBody (shiftUncheckedBody shiftBits) := by
+  have hu8 : IsPrimScalarTy u8Ty := Or.inr (Or.inr (Or.inr ⟨.u8, rfl⟩))
+  have hi16 : IsPrimScalarTy i16Ty := Or.inr (Or.inr (Or.inl ⟨.i16, rfl⟩))
+  have hbits16 : shiftBits < scalarModulus 2 := by
+    rw [scalarModulus_eq_two_pow]; simpa using hs
+  have hconst5 : WellTypedScalarOperandSyn (shiftUncheckedBody shiftBits) (fun _ => True)
+      (.constant (constU8 5)) u8Ty :=
+    .constScalar (constU8 5) ⟨5, 1⟩ rfl hu8 (Or.inl rfl) (by decide) rfl
+      (fun h => nomatch h) (fun h => nomatch h)
+  have hconstSh : WellTypedScalarOperandSyn (shiftUncheckedBody shiftBits) (fun _ => True)
+      (.constant (constI16 shiftBits)) i16Ty :=
+    .constScalar (constI16 shiftBits) ⟨shiftBits, 2⟩ rfl hi16 (Or.inr (Or.inl rfl))
+      hbits16 rfl (fun h => nomatch h) (fun h => nomatch h)
+  have hu8int : IsIntegralTy u8Ty (translateUintTy .u8) := .uint .u8 rfl
+  have hi16int : IsIntegralTy i16Ty (translateIntTy .i16) := .int .i16 rfl
+  refine ⟨(fun p h => by simp [shiftUncheckedBody] at h), ?_⟩
+  intro bb hbb
+  simp only [shiftUncheckedBody, List.mem_singleton] at hbb
+  subst hbb
+  refine ⟨rfl, ?_, Or.inr (Or.inl ⟨rfl, trivial, u8Decl, rfl, IsPrimScalarTy.size_ne_zero hu8⟩)⟩
+  intro stmt hstmt
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hstmt
+  rcases hstmt with rfl | rfl | rfl | rfl
+  · exact .storageLive _ 1 u8Decl rfl rfl trivial
+  · exact .assign _ 1 u8Decl _ rfl rfl trivial (.use _ _ hconst5)
+  · exact .assign _ 0 u8Decl _ rfl rfl trivial
+      (.binaryOp .shlUnchecked _ _ u8Ty i16Ty u8Ty
+        (.copyLocal 1 u8Decl rfl (IsPrimScalarTy.size_ne_zero hu8) trivial)
+        hconstSh
+        (.intShift .shlUnchecked u8Ty i16Ty u8Ty _ _
+          (Or.inr (Or.inr (Or.inl rfl))) hu8int hi16int hu8int))
+  · exact .storageDead _ 1 u8Decl rfl rfl (by decide) trivial
+
+/-- In-bounds `5_u8 << 3_i16` returns `40_u8` (`0x28`) in both machines, whereas
+both `shiftBits = 8` (`8 >= 8` bit width) and `shiftBits = 0xFFFF` (`-1_i16`
+negative signed shift amount) diagnose undefined behavior in both machines. -/
+theorem shiftUnchecked_witness_agrees :
+    annealOutcomeScalarBits 1 (runAnnealBounded (shiftUncheckedBody 3) 5 (annealShiftUncheckedInit 3)) =
+      some 40 ∧
+    miriOutcomeScalarBits 1 (runMiriBounded (shiftUncheckedBody 3) 5 (miriShiftUncheckedInit 3)) =
+      some 40 ∧
+    annealOutcomeIsUB (runAnnealBounded (shiftUncheckedBody 8) 3 (annealShiftUncheckedInit 8)) = true ∧
+    miriOutcomeIsUB (runMiriBounded (shiftUncheckedBody 8) 3 (miriShiftUncheckedInit 8)) = true ∧
+    annealOutcomeIsUB (runAnnealBounded (shiftUncheckedBody 0xFFFF) 3 (annealShiftUncheckedInit 0xFFFF)) = true ∧
+    miriOutcomeIsUB (runMiriBounded (shiftUncheckedBody 0xFFFF) 3 (miriShiftUncheckedInit 0xFFFF)) = true := by
+  decide
+
+/-! ## `StatementKind.nop` + `BinOp.addUnchecked` witness (normal sum & overflow UB) -/
+
+/-- `Runtime(PostCleanup)` MIR body exercising `StatementKind.nop` and `AddUnchecked`:
+```text
+bb0: StorageLive(_1); nop; _1 = const 200_u8;
+     _0 = AddUnchecked(copy _1, const rhs_u8);
+     StorageDead(_1); return
+``` -/
+def addUncheckedNopBody (rhs : Nat) : CapturedMir where
+  defPath := "lm_1_1_witness::add_unchecked_nop"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u8Decl, u8Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 1),
+        mkStmt .nop,
+        mkStmt (.assign (local_ 1) (.use (.constant (constU8 200)))),
+        mkStmt (.assign (local_ 0)
+          (.binaryOp .addUnchecked (.copy (local_ 1)) (.constant (constU8 rhs)))),
+        mkStmt (.storageDead 1)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi0
+  layouts := emptyLayoutTable
+  allocations := []
+
+def annealAddUncheckedNopInit (rhs : Nat) : MachineState :=
+  initMachineState (addUncheckedNopBody rhs) []
+
+def miriAddUncheckedNopFrame (rhs : Nat) :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody (addUncheckedNopBody rhs)
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy u8Ty) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[{ value := .live (.immediate .uninit), layout := none },
+      { value := .dead, layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 0⟩ }
+
+def miriAddUncheckedNopInit (rhs : Nat) : AnnealStepState :=
+  { stack := ⟨#[miriAddUncheckedNopFrame rhs]⟩, machine := AnnealMachine.empty }
+
+theorem stateRel_addUncheckedNop (rhs : Nat) :
+    StateRel (addUncheckedNopBody rhs)
+      (annealAddUncheckedNopInit rhs)
+      (miriAddUncheckedNopInit rhs) := by
+  refine StateRel.mk (miriAddUncheckedNopFrame rhs) rfl rfl ⟨translateTy u8Ty, rfl⟩ ?_
+    rfl rfl rfl rfl rfl
+  refine
+    { body_eq := rfl
+      location_eq := rfl
+      af_locals_len := rfl
+      mf_locals_size := rfl
+      locals_rel := ?_ }
+  intro i decl slot mls hdecl hslot hmls
+  match i with
+  | 0 =>
+    have hd : decl = u8Decl := by simpa [addUncheckedNopBody, get?] using hdecl.symm
+    have hs : slot = .uninit := by
+      simpa [annealAddUncheckedNopInit, initMachineState, addUncheckedNopBody, initLocalsAux, get?]
+        using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [miriAddUncheckedNopFrame] using hmls.symm
+    subst hd hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | 1 =>
+    have hd : decl = u8Decl := by simpa [addUncheckedNopBody, get?] using hdecl.symm
+    have hs : slot = .dead := by
+      simpa [annealAddUncheckedNopInit, initMachineState, addUncheckedNopBody, initLocalsAux, get?]
+        using hslot.symm
+    have hm : mls = { value := .dead, layout := none } := by
+      simpa [miriAddUncheckedNopFrame] using hmls.symm
+    subst hd hs hm
+    exact .dead none (fun _ h => nomatch h)
+  | n + 2 =>
+    simp [addUncheckedNopBody, get?] at hdecl
+
+theorem wellTyped_addUncheckedNop (rhs : Nat) (hrhs : rhs < 256) :
+    WellTypedBody (addUncheckedNopBody rhs) := by
+  have hu8 : IsPrimScalarTy u8Ty := Or.inr (Or.inr (Or.inr ⟨.u8, rfl⟩))
+  have hbits : ∀ n, n < 256 → n < scalarModulus 1 := fun n h => by
+    rw [scalarModulus_eq_two_pow]; simpa using h
+  have hconst : ∀ n, n < 256 →
+      WellTypedScalarOperandSyn (addUncheckedNopBody rhs) (fun _ => True)
+        (.constant (constU8 n)) u8Ty :=
+    fun n hn => .constScalar (constU8 n) ⟨n, 1⟩ rfl hu8 (Or.inl rfl) (hbits n hn) rfl
+      (fun h => nomatch h) (fun h => nomatch h)
+  have hu8int : IsIntegralTy u8Ty (translateUintTy .u8) := .uint .u8 rfl
+  refine ⟨(fun p h => by simp [addUncheckedNopBody] at h), ?_⟩
+  intro bb hbb
+  simp only [addUncheckedNopBody, List.mem_singleton] at hbb
+  subst hbb
+  refine ⟨rfl, ?_, Or.inr (Or.inl ⟨rfl, trivial, u8Decl, rfl, IsPrimScalarTy.size_ne_zero hu8⟩)⟩
+  intro stmt hstmt
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hstmt
+  rcases hstmt with rfl | rfl | rfl | rfl | rfl
+  · exact .storageLive _ 1 u8Decl rfl rfl trivial
+  · exact .nop _ rfl
+  · exact .assign _ 1 u8Decl _ rfl rfl trivial (.use _ _ (hconst 200 (by decide)))
+  · exact .assign _ 0 u8Decl _ rfl rfl trivial
+      (.binaryOp .addUnchecked _ _ u8Ty u8Ty u8Ty
+        (.copyLocal 1 u8Decl rfl (IsPrimScalarTy.size_ne_zero hu8) trivial)
+        (hconst rhs hrhs)
+        (.intArithOrBitwise .addUnchecked u8Ty u8Ty u8Ty _
+          (Or.inr (Or.inr (Or.inr (Or.inl rfl))))
+          hu8int hu8int hu8int))
+  · exact .storageDead _ 1 u8Decl rfl rfl (by decide) trivial
+
+/-- `200_u8 + 42_u8` returns `242_u8` across `nop` in 6 steps on both machines,
+whereas `200_u8 + 100_u8` diagnoses unchecked-overflow undefined behavior at step 4. -/
+theorem addUncheckedNop_witness_agrees :
+    annealOutcomeScalarBits 1 (runAnnealBounded (addUncheckedNopBody 42) 6 (annealAddUncheckedNopInit 42)) =
+      some 242 ∧
+    miriOutcomeScalarBits 1 (runMiriBounded (addUncheckedNopBody 42) 6 (miriAddUncheckedNopInit 42)) =
+      some 242 ∧
+    annealOutcomeIsUB (runAnnealBounded (addUncheckedNopBody 100) 4 (annealAddUncheckedNopInit 100)) = true ∧
+    miriOutcomeIsUB (runMiriBounded (addUncheckedNopBody 100) 4 (miriAddUncheckedNopInit 100)) = true := by
+  decide
+
+/-! ## Phase 2 Hook Fidelity Witnesses (`annealCastHooks` & `annealTerminatorHooks`) -/
+
+def boolTy : Ty := { kind := .bool, layoutIdx := 0 }
+def boolDecl : LocalDecl := { mutability := .mut, ty := boolTy, debugName := none }
+def rawPtrU8Ty : Ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }
+def rawPtrU8Decl : LocalDecl := { mutability := .mut, ty := rawPtrU8Ty, debugName := none }
+def i8TyW : Ty := { kind := .int .i8, layoutIdx := 0 }
+def i8DeclW : LocalDecl := { mutability := .mut, ty := i8TyW, debugName := none }
+
+def stepResultIsOkUnit : Miri.Interpreter.StepResult AnnealStepState Unit → Bool
+  | (_, .ok ()) => true
+  | (_, .error _) => false
+
+def stepResultIsUB {α : Type} : Miri.Interpreter.StepResult AnnealStepState α → Bool
+  | (_, .error (.undefinedBehavior _)) => true
+  | _ => false
+
+/-- `annealRvalueHooks.cast` delegates `CastKind.IntToInt` to upstream
+`Miri.Interpreter.Cast.cast`: sign-extending `-1_i8` (`0xFF`) to `u16` produces
+`0xFFFF_u16`, and casting an invalid `bool` byte `2` raises
+`StepError.undefinedBehavior`. -/
+theorem annealCast_intToInt_fidelity :
+    let negOneSc := extractExceptOk (translateScalarInt ⟨0xFF, 1⟩) (by decide)
+    let expectedU16 := extractExceptOk (translateScalarInt ⟨0xFFFF, 2⟩) (by decide)
+    let invalidBoolSc := extractExceptOk (translateScalarInt ⟨2, 1⟩) (by decide)
+    let stSignExt : AnnealStepState :=
+      { stack := ⟨#[{ miriFrame 0 with
+          body := { (miriFrame 0).body with locals := #[encodeTyId u16Ty, encodeTyId i8TyW] }
+          locals := #[{ value := .live (.immediate .uninit), layout := some (translateTy u16Ty) },
+            { value := .live (.immediate (.scalar (.fromScalarInt negOneSc))),
+              layout := some (translateTy i8TyW) }] }]⟩
+        machine := AnnealMachine.empty }
+    let resSignExt :=
+      Miri.Interpreter.runRvalue
+        (Miri.Interpreter.evalRvalueIntoPlace (annealRvalueHooks [u16Decl, i8DeclW] emptyLayoutTable)
+          () (.Cast .IntToInt (.Copy ⟨1, #[]⟩) (encodeTyId u16Ty)) ⟨0, #[]⟩)
+        stSignExt
+    let stBadBool : AnnealStepState :=
+      { stack := ⟨#[{ miriFrame 0 with
+          body := { (miriFrame 0).body with locals := #[encodeTyId u8Ty, encodeTyId boolTy] }
+          locals := #[{ value := .live (.immediate .uninit), layout := some (translateTy u8Ty) },
+            { value := .live (.immediate (.scalar (.fromScalarInt invalidBoolSc))),
+              layout := some (translateTy boolTy) }] }]⟩
+        machine := AnnealMachine.empty }
+    let resBadBool :=
+      Miri.Interpreter.runRvalue
+        (Miri.Interpreter.evalRvalueIntoPlace (annealRvalueHooks [u8Decl, boolDecl] emptyLayoutTable)
+          () (.Cast .IntToInt (.Copy ⟨1, #[]⟩) (encodeTyId u8Ty)) ⟨0, #[]⟩)
+        stBadBool
+    (stepResultIsOkUnit resSignExt = true ∧
+      (resSignExt.1.stack.currentFrame?.bind fun f => (f.getLocal 0).toOption.map (·.value)) =
+        some (.live (.immediate (.scalar (.fromScalarInt expectedU16))))) ∧
+    stepResultIsUB resBadBool = true := by
+  exact ⟨⟨by with_unfolding_all rfl, by with_unfolding_all rfl⟩, by with_unfolding_all rfl⟩
+
+/-- `annealTerminatorHooks` matches upstream `ExecutionMachine.lean:320-324` &
+`ControlFlow.lean:119-121`:
+1. Switching on a `bool` local holding invalid byte `2` against case `0` raises
+   `StepError.undefinedBehavior` via `ScalarOps.binary .Eq`.
+2. Switching on a raw pointer with empty `cases` (`#[]`) jumps to `otherwise` (`1`)
+   without eagerly calling `toScalarInt` in `evalDiscriminant`. -/
+theorem annealSwitchInt_fidelity :
+    let invalidBoolSc := extractExceptOk (translateScalarInt ⟨2, 1⟩) (by decide)
+    let ptrScalar : Miri.Memory.Scalar AnnealProv :=
+      Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+        ⟨Miri.ABI.Size.ofBytes 0x1000, .concrete witnessAllocId witnessTag⟩
+    let bbDummy : Miri.MIR.BasicBlock :=
+      { statements := #[], terminator := ⟨defaultSourceInfo, .Return⟩, cleanup := false }
+    let bodyBadBool : Miri.MIR.Body :=
+      { (miriFrame 0).body with
+        basicBlocks := #[bbDummy, bbDummy]
+        locals := #[encodeTyId boolTy] }
+    let stBadBool : AnnealStepState :=
+      { stack := ⟨#[{ miriFrame 0 with
+          body := bodyBadBool
+          locals := #[{ value := .live (.immediate (.scalar (.fromScalarInt invalidBoolSc))),
+                        layout := some (translateTy boolTy) }] }]⟩
+        machine := AnnealMachine.empty }
+    let resBadBool :=
+      Miri.Interpreter.ControlFlow.evalTerminator
+        (annealTerminatorHooks [boolDecl] emptyLayoutTable)
+        ()
+        (translateTerminator ⟨.switchInt (.copy (local_ 0)) { branches := [(0, 1)], otherwise := 0 }, "sw"⟩)
+        stBadBool
+    let bodyPtrEmpty : Miri.MIR.Body :=
+      { (miriFrame 0).body with
+        basicBlocks := #[bbDummy, bbDummy]
+        locals := #[encodeTyId rawPtrU8Ty] }
+    let stPtrEmpty : AnnealStepState :=
+      { stack := ⟨#[{ miriFrame 0 with
+          body := bodyPtrEmpty
+          locals := #[{ value := .live (.immediate (.scalar ptrScalar)),
+                        layout := some (translateTy rawPtrU8Ty) }] }]⟩
+        machine := AnnealMachine.empty }
+    let resPtrEmpty :=
+      Miri.Interpreter.ControlFlow.evalTerminator
+        (annealTerminatorHooks [rawPtrU8Decl] emptyLayoutTable)
+        ()
+        (translateTerminator ⟨.switchInt (.copy (local_ 0)) { branches := [], otherwise := 1 }, "sw"⟩)
+        stPtrEmpty
+    stepResultIsUB resBadBool = true ∧
+    (stepResultIsOkUnit resPtrEmpty = true ∧
+      (resPtrEmpty.1.stack.currentFrame?.map (·.location)) = some (.mir ⟨1, 0⟩)) := by
+  exact ⟨by with_unfolding_all rfl, ⟨by with_unfolding_all rfl, by with_unfolding_all rfl⟩⟩
+
 end LeanMiriSpec.Correspondence.Witness

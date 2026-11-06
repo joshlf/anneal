@@ -498,4 +498,140 @@ theorem ub_iff {body : CapturedMir} {m : AnnealStepState}
 
 end StepRel
 
+/-- Observation-aware one-step outcome correspondence extending `StepRel` to
+intra-frame transitions that emit a `MirObs` observation (`MirObs.silent` for
+silent steps, `MirObs.event tag` for `SwitchInt` branch-tag observations in
+`LM-1.2` / `LM-2.3`). Since `MirStepNode.step s'` is definitionally equal to
+`MirStepNode.emitStep .silent s'`, every `StepRel` proof lifts directly to
+`StepObsRel` via `StepRel.toStepObsRel`. -/
+inductive StepObsRel (body : CapturedMir) (m : AnnealStepState) :
+    MirStepNode →
+    Miri.Interpreter.StepResult AnnealStepState Bool →
+    Prop where
+  /-- Intra-frame step emitting `obs` (`.silent` or `.event tag`): both machines
+  step to `StateRel`-related states. -/
+  | emitStep (obs : MirObs) (s' : MachineState) (m' : AnnealStepState) :
+      StateRel body s' m' →
+      StepObsRel body m (MirStepNode.emitStep obs s') (m', .ok true)
+  /-- Normal root-frame return. -/
+  | retRoot (decl0 : LocalDecl) (retVal : Value)
+      (imm0 : Miri.Interpreter.Immediate AnnealProv)
+      (mem' : Memory) (m' : AnnealStepState) :
+      get? body.localDecls 0 = some decl0 →
+      annealControlHooks.returnOperand () m = (m, .ok (.immediate imm0)) →
+      ImmediateRel decl0.ty body.layouts retVal imm0 →
+      m' = { m with stack := ⟨#[]⟩ } →
+      StepObsRel body m (MirStepNode.retNormal retVal mem') (m', .ok true)
+  /-- Both machines diagnose undefined behavior. -/
+  | ub (m' : AnnealStepState) (msg : String) :
+      StepObsRel body m (MirStepNode.fail .ub) (m', .error (.undefinedBehavior msg))
+
+/-- Lift any silent-fragment `StepRel` proof directly into `StepObsRel`. -/
+theorem StepRel.toStepObsRel {body : CapturedMir} {m : AnnealStepState}
+    {aRes : MirStepNode} {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    (h : StepRel body m aRes mRes) : StepObsRel body m aRes mRes := by
+  cases h with
+  | step s' m' hrel => exact .emitStep .silent s' m' hrel
+  | retRoot decl0 retVal imm0 mem' m' hdecl hop himm hm' =>
+    exact .retRoot decl0 retVal imm0 mem' m' hdecl hop himm hm'
+  | ub m' msg => exact .ub m' msg
+
+namespace StepObsRel
+
+/-- Bidirectional intra-frame `emitStep` equivalence under `StepObsRel`
+(covering both `.silent` steps and `SwitchInt` `.event tag` steps). -/
+theorem emitStep_iff {body : CapturedMir} {m : AnnealStepState}
+    {aRes : MirStepNode} {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    (h : StepObsRel body m aRes mRes) :
+    (∃ obs s', aRes = .emitStep obs s' ∧ StateRel body s' mRes.1) ↔
+      (mRes.2 = .ok true ∧ mRes.1.stack.frames ≠ #[]) := by
+  cases h with
+  | emitStep obs s' m' hrel =>
+    rcases hrel with ⟨tf, hf, hrc, hrp, hfr, hcal, hst, hbor, hprot, hcaller⟩
+    constructor
+    · intro _
+      refine ⟨rfl, ?_⟩
+      rw [hf]
+      intro hemp
+      have hsz := congrArg Array.size hemp
+      contradiction
+    · intro _
+      exact ⟨obs, s', rfl, StateRel.mk tf hf hrc hrp hfr hcal hst hbor hprot hcaller⟩
+  | retRoot _ _ _ _ _ _ _ _ hm' =>
+    subst hm'
+    constructor
+    · rintro ⟨obs, _, h, _⟩
+      cases obs <;> cases h
+    · rintro ⟨_, hne⟩; exact False.elim (hne rfl)
+  | ub _ _ =>
+    constructor
+    · rintro ⟨obs, _, h, _⟩
+      cases obs <;> cases h
+    · rintro ⟨hok, _⟩; cases hok
+
+/-- Bidirectional root-frame normal return equivalence under `StepObsRel`. -/
+theorem retNormal_iff {body : CapturedMir} {m : AnnealStepState}
+    {aRes : MirStepNode} {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    (h : StepObsRel body m aRes mRes) :
+    (∃ retVal mem', aRes = .retNormal retVal mem') ↔
+      (mRes.2 = .ok true ∧ mRes.1.stack.frames = #[]) := by
+  cases h with
+  | emitStep obs s' m' hrel =>
+    rcases hrel with ⟨tf, hf, _, _, _, _, _, _, _, _⟩
+    constructor
+    · rintro ⟨_, _, h⟩
+      cases obs <;> cases h
+    · rintro ⟨_, hemp⟩
+      rw [hf] at hemp
+      have hsz := congrArg Array.size hemp
+      contradiction
+  | retRoot _ retVal _ mem' _ _ _ _ hm' =>
+    subst hm'
+    exact ⟨fun _ => ⟨rfl, rfl⟩, fun _ => ⟨retVal, mem', rfl⟩⟩
+  | ub _ _ =>
+    constructor
+    · rintro ⟨_, _, h⟩; cases h
+    · rintro ⟨hok, _⟩; cases hok
+
+/-- Under `StepObsRel`, a root-frame normal return produces an `ImmediateRel`-related
+return value in `lean-miri`'s `_0` and empties the call stack. -/
+theorem retNormal_rel {body : CapturedMir} {m : AnnealStepState}
+    {retVal : Value} {mem' : Memory}
+    {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    (h : StepObsRel body m (.retNormal retVal mem') mRes) :
+    ∃ decl0 imm0,
+      get? body.localDecls 0 = some decl0 ∧
+      annealControlHooks.returnOperand () m = (m, .ok (.immediate imm0)) ∧
+      ImmediateRel decl0.ty body.layouts retVal imm0 ∧
+      mRes = ({ m with stack := ⟨#[]⟩ }, .ok true) := by
+  generalize ha : MirStepNode.retNormal retVal mem' = aNode at h
+  cases h with
+  | emitStep obs _ _ _ => cases obs <;> cases ha
+  | retRoot decl0 rv imm0 mm _ hdecl hop himm hm' =>
+    injection ha with h1
+    injection h1 with h2
+    injection h2 with hrv hmem
+    subst hrv hmem hm'
+    exact ⟨decl0, imm0, hdecl, hop, himm, rfl⟩
+  | ub _ _ => cases ha
+
+/-- Bidirectional undefined-behavior equivalence under `StepObsRel`. -/
+theorem ub_iff {body : CapturedMir} {m : AnnealStepState}
+    {aRes : MirStepNode} {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    (h : StepObsRel body m aRes mRes) :
+    (aRes = .fail .ub) ↔ (∃ msg, mRes.2 = .error (.undefinedBehavior msg)) := by
+  cases h with
+  | emitStep obs _ _ _ =>
+    constructor
+    · intro h; cases obs <;> cases h
+    · rintro ⟨_, h⟩; cases h
+  | retRoot _ _ _ _ _ _ _ _ _ =>
+    constructor
+    · intro h; cases h
+    · rintro ⟨_, h⟩; cases h
+  | ub _ msg =>
+    exact ⟨fun _ => ⟨msg, rfl⟩, fun _ => rfl⟩
+
+end StepObsRel
+
 end LeanMiriSpec.Correspondence

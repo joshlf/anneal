@@ -62,12 +62,15 @@ open LeanMiriSpec.Correspondence in
   translateTy
   translatePlace
   translateOperand
+  translatePointerCoercion
+  translateCastKind
   translateRvalue
   translateStmt
   translateTerminator
   translateBody
   AnnealMachine
   AnnealMachine.lookupBaseAddr
+  annealCastHooks
   annealStepHooks
   ScalarRel
   ImmediateRel
@@ -82,6 +85,12 @@ open LeanMiriSpec.Correspondence in
   StepRel.retNormal_iff
   StepRel.retNormal_rel
   StepRel.ub_iff
+  StepRel.toStepObsRel
+  StepObsRel
+  StepObsRel.emitStep_iff
+  StepObsRel.retNormal_iff
+  StepObsRel.retNormal_rel
+  StepObsRel.ub_iff
   evalBinOp_arithmetic_simulation
   evalBinOp_bitwise_simulation
   evalBinOp_shift_simulation
@@ -100,6 +109,7 @@ open LeanMiriSpec.Correspondence in
   annealStepHooks_retag_ne_ok
   ValidFrameLocation.preserved
   NonAddrTakenImmediate.preserved
+  runAnnealBounded_emitStep
   run_wellTypedBody_simulation
   run_wellTypedBody_bisim
   Witness.stateRel_init
@@ -127,6 +137,14 @@ open LeanMiriSpec.Correspondence in
   Witness.stateRel_charCopy
   Witness.wellTyped_charCopy
   Witness.charCopy_returns_agree
+  Witness.stateRel_shiftUnchecked
+  Witness.wellTyped_shiftUnchecked
+  Witness.shiftUnchecked_witness_agrees
+  Witness.stateRel_addUncheckedNop
+  Witness.wellTyped_addUncheckedNop
+  Witness.addUncheckedNop_witness_agrees
+  Witness.annealCast_intToInt_fidelity
+  Witness.annealSwitchInt_fidelity
 
 /-- Exhaustively verify that every declaration across every imported
 `LeanMiriSpec.*` and `Miri.*` module in the environment — as well as every
@@ -300,6 +318,35 @@ example :
       Witness.miriOutcomeScalarBits 4
         (runMiriBounded Witness.charCopyBody 5 Witness.miriCharInit) = some 0x03BB) :=
   ⟨Witness.wellTyped_charCopy, Witness.stateRel_charCopy, Witness.charCopy_returns_agree⟩
+
+example {body : CapturedMir} {m : AnnealStepState}
+    {aRes : MirStepNode} {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    (h : StepObsRel body m aRes mRes) :
+    ((∃ obs s', aRes = .emitStep obs s' ∧ StateRel body s' mRes.1) ↔
+      (mRes.2 = .ok true ∧ mRes.1.stack.frames ≠ #[])) ∧
+    ((∃ retVal mem', aRes = .retNormal retVal mem') ↔
+      (mRes.2 = .ok true ∧ mRes.1.stack.frames = #[])) ∧
+    ((aRes = .fail .ub) ↔ (∃ msg, mRes.2 = .error (.undefinedBehavior msg))) :=
+  ⟨h.emitStep_iff, h.retNormal_iff, h.ub_iff⟩
+
+example (body : CapturedMir) (fuel : Nat) (s s' : MachineState) (obs : MirObs)
+    (hstep : stepMirFn body s = .emitStep obs s') :
+    runAnnealBounded body (fuel + 1) s = runAnnealBounded body fuel s' :=
+  runAnnealBounded_emitStep body fuel s s' obs hstep
+
+example (shiftBits : Nat) (hs : shiftBits < 65536) :
+    WellTypedBody (Witness.shiftUncheckedBody shiftBits) ∧
+    StateRel (Witness.shiftUncheckedBody shiftBits)
+      (Witness.annealShiftUncheckedInit shiftBits)
+      (Witness.miriShiftUncheckedInit shiftBits) :=
+  ⟨Witness.wellTyped_shiftUnchecked shiftBits hs, Witness.stateRel_shiftUnchecked shiftBits⟩
+
+example (rhs : Nat) (hrhs : rhs < 256) :
+    WellTypedBody (Witness.addUncheckedNopBody rhs) ∧
+    StateRel (Witness.addUncheckedNopBody rhs)
+      (Witness.annealAddUncheckedNopInit rhs)
+      (Witness.miriAddUncheckedNopInit rhs) :=
+  ⟨Witness.wellTyped_addUncheckedNop rhs hrhs, Witness.stateRel_addUncheckedNop rhs⟩
 
 end StatementPins
 
