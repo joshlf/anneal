@@ -8,6 +8,8 @@
 
 prelude
 import Trusted
+import Anneal.Refinement
+import Anneal.StepResult
 
 /-!
 # Anneal Theory Umbrella (`Anneal.lean`)

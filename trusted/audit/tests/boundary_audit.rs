@@ -1067,3 +1067,158 @@ fn enforces_module_level_trust_tiers_and_namespace_hygiene() {
         "unexpected error: {err_opaque}"
     );
 }
+
+/// Verifies that structural-recursion `_unsafe_rec` compiler helpers emitted
+/// alongside a total, safe `.defnInfo` declaration are accepted in Phase 2
+/// (`"audit"`) and replayed cleanly, whereas `partial def` declarations
+/// (compiled directly into `.olean`s bypassing Phase 1 `"preflight"`) are
+/// rejected in both `Trusted` and `theory/`.
+#[test]
+fn accepts_structural_rec_compiler_helpers_and_rejects_partial_defs() {
+    let nested_rec_body = "\
+inductive Nested where
+  | leaf : Nat → Nested
+  | branch : Nested → Nested → Nested
+
+def sumNested : Nested → Nat
+  | .leaf n => n
+  | .branch a b => sumNested a + sumNested b
+";
+
+    // 1. A total structural recursion in `theory/Anneal.lean` that causes Lean
+    // to synthesize `sumNested._unsafe_rec` passes Phase 2 audit and kernel
+    // replay.
+    let mut f_theory = TempFixture::new(None);
+    fs::create_dir_all(f_theory.root.join("theory")).unwrap();
+    fs::write(
+        f_theory.root.join("theory/Anneal.lean"),
+        format!("prelude\nimport Trusted\nnamespace Anneal\n{nested_rec_body}end Anneal\n"),
+    )
+    .unwrap();
+    let rep = f_theory.check_expected(None, None, None).unwrap();
+    assert_eq!(rep.get("replay"), Some(&json!(true)));
+
+    // 2. A `partial def` in `Trusted` (compiled directly into `Trusted.olean`
+    // bypassing Phase 1 `"preflight"`) is rejected in Phase 2 (`"audit"`) even
+    // though Lean also emits an `_unsafe_rec` helper for it, because its base
+    // declaration has `isPartial == true` (`!(baseCi matches .defnInfo _)`).
+    let fix_trusted = TempFixture::new(None);
+    let mut checker_trusted = Checker::new(&fix_trusted.root, None).unwrap();
+    checker_trusted.tool_admission().unwrap();
+    let imports = vec![ImportEdge {
+        module: "Init.NotationExtra".to_string(),
+        import_all: false,
+        is_exported: true,
+        is_meta: false,
+    }];
+    let setup_trusted =
+        checker_trusted.write_setup_json("Trusted", &imports).unwrap();
+    let unchecked_trusted = checker_trusted.stage.join("PartialTrusted.lean");
+    fs::write(
+        &unchecked_trusted,
+        b"prelude\nimport Init.NotationExtra\nnamespace Trusted\npartial def loop (n : Nat) : Nat := loop n\nend Trusted\n",
+    )
+    .unwrap();
+    let out_trusted = checker_trusted.stage.join("Trusted.olean");
+    checker_trusted
+        .process(
+            "partial-trusted-fixture",
+            &[
+                "-j1".to_string(),
+                "-M2048".to_string(),
+                "-t0".to_string(),
+                "--setup".to_string(),
+                setup_trusted.to_string_lossy().into_owned(),
+                "-o".to_string(),
+                out_trusted.to_string_lossy().into_owned(),
+                unchecked_trusted.to_string_lossy().into_owned(),
+            ],
+        )
+        .unwrap();
+    {
+        let adm = checker_trusted.admitted_mut().unwrap();
+        adm.artifacts.insert(
+            "Trusted".to_string(),
+            ModuleArtifacts {
+                olean_parts: vec![out_trusted.to_string_lossy().into_owned()],
+                ir_parts: Vec::new(),
+            },
+        );
+        adm.graph.insert("Trusted".to_string(), imports.clone());
+    }
+    let err_trusted = checker_trusted
+        .inspect(InspectorRequest::Audit {
+            trusted: vec!["Trusted".to_string()],
+            theory: Vec::new(),
+            module_tiers: BTreeMap::from([(
+                "Trusted".to_string(),
+                TrustTier::Vetted,
+            )]),
+        })
+        .unwrap_err();
+    assert_eq!(err_trusted.code, 1);
+    assert!(
+        err_trusted
+            .message
+            .contains("unsafe/partial Trusted declaration Trusted.loop"),
+        "expected partial Trusted rejection in Phase 2, got: {err_trusted}"
+    );
+
+    // 3. A `partial def` in `theory` (compiled directly into `Anneal.olean`
+    // bypassing Phase 1 `"preflight"`) is likewise rejected in Phase 2
+    // (`"audit"`).
+    let fix = TempFixture::new(None);
+    let mut checker = Checker::new(&fix.root, None).unwrap();
+    checker.tool_admission().unwrap();
+    let setup_path = checker.write_setup_json("Anneal", &imports).unwrap();
+    let unchecked = checker.stage.join("PartialDef.lean");
+    fs::write(
+        &unchecked,
+        b"prelude\nimport Init.NotationExtra\nnamespace Anneal\npartial def loop (n : Nat) : Nat := loop n\nend Anneal\n",
+    )
+    .unwrap();
+    let out = checker.stage.join("Anneal.olean");
+    checker
+        .process(
+            "partial-fixture",
+            &[
+                "-j1".to_string(),
+                "-M2048".to_string(),
+                "-t0".to_string(),
+                "--setup".to_string(),
+                setup_path.to_string_lossy().into_owned(),
+                "-o".to_string(),
+                out.to_string_lossy().into_owned(),
+                unchecked.to_string_lossy().into_owned(),
+            ],
+        )
+        .unwrap();
+    {
+        let adm = checker.admitted_mut().unwrap();
+        adm.artifacts.insert(
+            "Anneal".to_string(),
+            ModuleArtifacts {
+                olean_parts: vec![out.to_string_lossy().into_owned()],
+                ir_parts: Vec::new(),
+            },
+        );
+        adm.graph.insert("Anneal".to_string(), imports);
+    }
+    let err_forged = checker
+        .inspect(InspectorRequest::Audit {
+            trusted: Vec::new(),
+            theory: vec!["Anneal".to_string()],
+            module_tiers: BTreeMap::new(),
+        })
+        .unwrap_err();
+    assert_eq!(err_forged.code, 1);
+    assert!(
+        err_forged
+            .message
+            .contains("opaque declaration Anneal.loop in Anneal is not allowed outside Trusted")
+            || err_forged
+                .message
+                .contains("unsafe/partial declaration Anneal.loop"),
+        "expected partial/opaque base rejection in Phase 2, got: {err_forged}"
+    );
+}
