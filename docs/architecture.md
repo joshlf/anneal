@@ -57,6 +57,9 @@ the human-audited TCB**.
 
 For the broader context around this architecture, see:
 
+- [`PRINCIPLES.md`](../PRINCIPLES.md) and
+  [`THREAT_MODEL.md`](../THREAT_MODEL.md) for Anneal's controlling correctness
+  promise and threat model.
 - [`docs/design.md`](design.md) for Anneal's end-to-end user workflow,
   library-centric verification model, and incremental adoption.
 - [`docs/trust-model.md`](trust-model.md) for how Anneal's CI enforces the

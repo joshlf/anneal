@@ -19,7 +19,8 @@ memory layouts, interior mutability, and inline assembly—cannot trigger
 undefined behavior (UB) and satisfy their functional specifications.
 
 Anneal is designed around three commitments that implement
-[`PRINCIPLES.md`](../PRINCIPLES.md):
+[`PRINCIPLES.md`](../PRINCIPLES.md) and
+[`THREAT_MODEL.md`](../THREAT_MODEL.md):
 
 1. **Verify the code `rustc` actually compiles.** Anneal does not ask users to
    rewrite Rust in a custom verification language. Instead, it hooks into Cargo
