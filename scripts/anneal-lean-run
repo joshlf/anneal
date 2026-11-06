@@ -287,6 +287,33 @@ def inject_lean_m_flag(cmd: list[str], lean_m_mb: int) -> list[str]:
     return list(cmd)
 
 
+class _ForwardSignal(BaseException):
+    """Raised when `anneal-lean-run` receives a termination signal."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+def terminate_process_group(pgid: int, grace_sec: float = 2.0) -> None:
+    """Terminates process group `pgid` with `SIGTERM`, escalating to `SIGKILL`."""
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace_sec
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 def run_bounded_command(
     cmd: list[str], limits: dict[str, int | str], use_slot_lock: bool
 ) -> int:
@@ -301,6 +328,10 @@ def run_bounded_command(
     effective_cmd = inject_lean_m_flag(cmd, lean_m_mb)
     has_systemd_scope = systemd_user_scope_available()
     if has_systemd_scope:
+        # Set `RuntimeMaxSec` slightly above `timeout_sec` so Python's `wait`
+        # reports a structured timeout diagnostic under normal operation, while
+        # `systemd` still reaps the transient scope if this wrapper receives an
+        # uncatchable `SIGKILL`.
         full_cmd = [
             "systemd-run",
             "--user",
@@ -312,6 +343,8 @@ def run_bounded_command(
             "MemorySwapMax=0",
             "-p",
             f"CPUQuota={threads * 100}%",
+            "-p",
+            f"RuntimeMaxSec={timeout_sec + 5}s",
             "--",
             *effective_cmd,
         ]
@@ -325,20 +358,31 @@ def run_bounded_command(
 
     need_slot = use_slot_lock and (mode == "build")
     with acquire_build_slot(build_slots, timeout_sec, enabled=need_slot):
+        # `start_new_session=True` isolates descendants into process group
+        # `proc.pid` for atomic group cleanup, which also detaches them from
+        # signals sent to this wrapper's group unless forwarded explicitly.
         proc = subprocess.Popen(
             full_cmd,
             env=env,
             start_new_session=True,
         )
+        prev_handlers: dict[int, object] = {}
+
+        def _handle_signal(signum: int, _frame: object) -> None:
+            raise _ForwardSignal(signum)
+
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            prev_handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, _handle_signal)
         try:
             rc = proc.wait(timeout=timeout_sec)
+        except _ForwardSignal as caught:
+            terminate_process_group(proc.pid)
+            proc.wait()
+            return 128 + caught.signum
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-                time.sleep(2.0)
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            terminate_process_group(proc.pid)
+            proc.wait()
             sys.stderr.write(
                 f"\n[anneal-lean-run] ERROR: Command timed out after "
                 f"{timeout_sec}s (mode={mode}, MemoryMax={memory_max_mb}M, "
@@ -350,6 +394,11 @@ def run_bounded_command(
                 "(`BlockCtx`, `Hold` barrier, `bitwiseAndBitsFast`).\n"
             )
             return 124
+        finally:
+            for sig, handler in prev_handlers.items():
+                signal.signal(sig, handler)  # type: ignore[arg-type]
+            if proc.poll() is None:
+                terminate_process_group(proc.pid)
 
     if rc in (137, -9):
         sys.stderr.write(
