@@ -1,6 +1,7 @@
 import Trusted.Rustc.V2026_06_01.MirSemantics.State
 import Trusted.Rustc.V2026_06_01.MirSemantics.Places
 import Trusted.Rustc.V2026_06_01.MirSemantics.Statements
+import Trusted.Rustc.V2026_06_01.MirSemantics.Machine
 import MiniRust.LibSpecr
 import MiniRust.Snapshots.S2026_05_Matched.Generated.Ops
 import Correspondence.Framework
@@ -1851,5 +1852,460 @@ theorem mir_a4_multidim_row_slice_unsize_len_deref_and_borrow_corresponds
               perm := .frozen } :: [row1Borrow]
           nextTag := 3 } := by
   exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+section DiffAbCrossFieldAndOnePastEnd
+
+set_option maxHeartbeats 5000000
+
+open Trusted.Rustc.V2026_06_01.Layout
+
+/--
+**Theorem L3.30 (`DIFF-AB` Intra-Allocation Cross-Field Pointer Arithmetic &
+One-Past-The-End Deref Site)**:
+Universally across all field payloads `(aVal bVal wVal : Nat)`:
+1. `ptrAllocByteBound?` on a field-projected stack pointer (`&raw const pair.a`,
+   `&raw const pair.b`, padded `#[repr(C)]` `PaddedS { a: u32, tag: u8, b: u32 }`,
+   and nested `Outer { first: PairU32, second: PairU32 }`) computes the remaining
+   enclosing allocation capacity `enclosingBytes - fieldByteOffset` both with an
+   explicit `TypeLayout` table and under `emptyLayoutTable`, while subslice-backed
+   field pointers (`&raw const (arr[1..2])[0].a`) stay bounded to the subslice
+   window (`8` bytes rather than the outer `24`-byte array);
+2. `needsThinPtrElemResolution [.field 0 u32Ty] 0 = false` (preserving the
+   zero-overhead fast path when `offsetBytes = 0`);
+3. Cross-field `BinOp.offset` (`offset(&raw const pair.a, 1isize)` -> `offsetBytes = 4`,
+   `offset(&raw const padded.a, 2isize)` -> `offsetBytes = 8`,
+   `offset(&raw const outer.first.a, 3isize)` -> `offsetBytes = 12`, and
+   `offset(&raw const (arr[1..2])[0].a, 1isize)` -> `offsetBytes = 4`) succeeds and
+   dereferences (`evalOperand` and `evalPlaceRead`) to the target sibling/nested
+   field (`bVal`), while straddling padding (`offset(&raw const padded.a, 1isize)`)
+   faults with `.ub` on dereference;
+4. Cross-field dereference writes (`*p1 = wVal`), `invalidateDerefWriteBorrows`,
+   and dereference reborrows (`&*p1` and `&raw const *p1`) target `[.field 1 u32Ty]`,
+   disabling overlapping borrows on `pair.b` while preserving disjoint borrows on
+   `pair.a`;
+5. One-past-the-end `BinOp.offset` (`offset(&raw mut pair.a, 2isize)` ->
+   `offsetBytes = 8`) succeeds at `BinOp.offset` and faults with `.ub` at the
+   subsequent dereference read, write, or reborrow site (and cannot cross from
+   `arr[1..2]` into `arr[2]`), whereas beyond-one-past-the-end offsets
+   (`offset(&raw const pair.a, 3isize)` and `offset(&raw const pair.b, 2isize)`)
+   fault immediately at `BinOp.offset` with `.ub`;
+6. Misaligned intra-allocation offsets (`offsetBytes = 2` on `PairU32`) and
+   size-mismatched sibling fields (`Mixed { a: u32, b: u8 }` at `offsetBytes = 4`
+   read as `*const u32`) fault with `.ub` on dereference.
+-/
+theorem mir_cross_field_ptr_offset_and_one_past_end_corresponds
+    (aVal bVal wVal : Nat) :
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+    let u8Ty : Ty := { kind := .uint .u8, layoutIdx := 3 }
+    let pairTy : Ty := { kind := .adt "PairU32" .nil, layoutIdx := 1 }
+    let rawConstU32Ty : Ty := { kind := .rawPtr .not (.uint .u32), layoutIdx := 2 }
+    let rawMutU32Ty : Ty := { kind := .rawPtr .mut (.uint .u32), layoutIdx := 2 }
+    let paddedTy : Ty := { kind := .adt "PaddedS" .nil, layoutIdx := 4 }
+    let outerTy : Ty := { kind := .adt "Outer" .nil, layoutIdx := 5 }
+    let isizeTy : Ty := { kind := .int .isize, layoutIdx := 6 }
+    let arr3PairTy : Ty := { kind := .array (.adt "PairU32" .nil) 3, layoutIdx := 7 }
+    let testLayouts : LayoutTable := {
+      pointerBits := 64
+      isLittleEndian := true
+      entries := [
+        -- 0: u32 (size 4, align 4)
+        { size := ⟨4⟩, align := ⟨4⟩,
+          backendRepr := .scalar (.initialized (.int 32 false) ⟨0, 4294967295⟩),
+          fields := .primitive, variants := .single 0, isUninhabited := false },
+        -- 1: PairU32 { a: u32 @ 0, b: u32 @ 4 } (size 8, align 4)
+        { size := ⟨8⟩, align := ⟨4⟩,
+          backendRepr := .memory,
+          fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1],
+          variants := .single 0, isUninhabited := false,
+          fieldLayouts := [0, 0] },
+        -- 2: *const u32 / *mut u32 (size 8, align 8)
+        { size := ⟨8⟩, align := ⟨8⟩,
+          backendRepr := .scalar (.initialized (.pointer 0) ⟨0, 18446744073709551615⟩),
+          fields := .primitive, variants := .single 0, isUninhabited := false,
+          fieldLayouts := [0] },
+        -- 3: u8 (size 1, align 1)
+        { size := ⟨1⟩, align := ⟨1⟩,
+          backendRepr := .scalar (.initialized (.int 8 false) ⟨0, 255⟩),
+          fields := .primitive, variants := .single 0, isUninhabited := false },
+        -- 4: PaddedS { a: u32 @ 0, tag: u8 @ 4, b: u32 @ 8 } (size 12, align 4)
+        { size := ⟨12⟩, align := ⟨4⟩,
+          backendRepr := .memory,
+          fields := .arbitrary [⟨0⟩, ⟨4⟩, ⟨8⟩] [0, 1, 2],
+          variants := .single 0, isUninhabited := false,
+          fieldLayouts := [0, 3, 0] },
+        -- 5: Outer { first: PairU32 @ 0, second: PairU32 @ 8 } (size 16, align 4)
+        { size := ⟨16⟩, align := ⟨4⟩,
+          backendRepr := .memory,
+          fields := .arbitrary [⟨0⟩, ⟨8⟩] [0, 1],
+          variants := .single 0, isUninhabited := false,
+          fieldLayouts := [1, 1] },
+        -- 6: isize (size 8, align 8)
+        { size := ⟨8⟩, align := ⟨8⟩,
+          backendRepr := .scalar (.initialized (.int 64 true) ⟨0, 18446744073709551615⟩),
+          fields := .primitive, variants := .single 0, isUninhabited := false },
+        -- 7: [PairU32; 3] (size 24, stride 8)
+        { size := ⟨24⟩, align := ⟨4⟩,
+          backendRepr := .memory,
+          fields := .array ⟨8⟩ 3,
+          variants := .single 0, isUninhabited := false,
+          fieldLayouts := [1] }
+      ]
+    }
+    let pairVal : Value := .aggregate 0 [.scalar ⟨aVal, 4⟩, .scalar ⟨bVal, 4⟩]
+    let pairUpdatedVal : Value := .aggregate 0 [.scalar ⟨aVal, 4⟩, .scalar ⟨wVal, 4⟩]
+    let paddedVal : Value :=
+      .aggregate 0 [.scalar ⟨aVal, 4⟩, .scalar ⟨7, 1⟩, .scalar ⟨bVal, 4⟩]
+    let outerVal : Value :=
+      .aggregate 0 [
+        .aggregate 0 [.scalar ⟨aVal, 4⟩, .scalar ⟨11, 4⟩],
+        .aggregate 0 [.scalar ⟨22, 4⟩, .scalar ⟨bVal, 4⟩]
+      ]
+    let mixedVal : Value := .aggregate 0 [.scalar ⟨aVal, 4⟩, .scalar ⟨7, 1⟩]
+    let arr3Val : Value :=
+      .aggregate 0 [
+        .aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩],
+        pairVal,
+        .aggregate 0 [.scalar ⟨30, 4⟩, .scalar ⟨40, 4⟩]
+      ]
+    let borrowPairA : BorrowEntry :=
+      { tag := 1, targetLocal := 0, targetProjection := [.field 0 u32Ty], perm := .active }
+    let borrowPairB : BorrowEntry :=
+      { tag := 2, targetLocal := 0, targetProjection := [.field 1 u32Ty], perm := .frozen }
+    let borrowPairAFrozen : BorrowEntry :=
+      { tag := 3, targetLocal := 0, targetProjection := [.field 0 u32Ty], perm := .frozen }
+    let borrowPaddedA : BorrowEntry :=
+      { tag := 1, targetLocal := 0, targetProjection := [.field 0 u32Ty], perm := .frozen }
+    let borrowPaddedTag : BorrowEntry :=
+      { tag := 2, targetLocal := 0, targetProjection := [.field 1 u8Ty], perm := .frozen }
+    let borrowPaddedB : BorrowEntry :=
+      { tag := 3, targetLocal := 0, targetProjection := [.field 2 u32Ty], perm := .frozen }
+    let borrowOuter00 : BorrowEntry :=
+      { tag := 1, targetLocal := 0, targetProjection := [.field 0 pairTy, .field 0 u32Ty], perm := .frozen }
+    let borrowOuter01 : BorrowEntry :=
+      { tag := 2, targetLocal := 0, targetProjection := [.field 0 pairTy, .field 1 u32Ty], perm := .frozen }
+    let borrowOuter10 : BorrowEntry :=
+      { tag := 3, targetLocal := 0, targetProjection := [.field 1 pairTy, .field 0 u32Ty], perm := .frozen }
+    let borrowOuter11 : BorrowEntry :=
+      { tag := 4, targetLocal := 0, targetProjection := [.field 1 pairTy, .field 1 u32Ty], perm := .frozen }
+    let borrowSubField0 : BorrowEntry :=
+      { tag := 1, targetLocal := 0,
+        targetProjection := [.subslice 1 2 false, .constantIndex 0 1 false, .field 0 u32Ty],
+        perm := .frozen }
+    let memPair : Memory :=
+      { emptyMemory with borrows := [borrowPairA, borrowPairB, borrowPairAFrozen], nextTag := 4 }
+    let memPadded : Memory :=
+      { emptyMemory with borrows := [borrowPaddedA, borrowPaddedTag, borrowPaddedB], nextTag := 4 }
+    let memOuter : Memory :=
+      { emptyMemory with
+        borrows := [borrowOuter00, borrowOuter01, borrowOuter10, borrowOuter11],
+        nextTag := 5 }
+    let memSub : Memory :=
+      { emptyMemory with borrows := [borrowSubField0], nextTag := 2 }
+    let pairDecls : List LocalDecl := [
+      { mutability := .mut, ty := pairTy, debugName := .none },
+      { mutability := .not, ty := rawMutU32Ty, debugName := .none }
+    ]
+    let pairConstDecls : List LocalDecl := [
+      { mutability := .not, ty := pairTy, debugName := .none },
+      { mutability := .not, ty := rawConstU32Ty, debugName := .none }
+    ]
+    let paddedDecls : List LocalDecl := [
+      { mutability := .not, ty := paddedTy, debugName := .none },
+      { mutability := .not, ty := rawConstU32Ty, debugName := .none }
+    ]
+    let outerDecls : List LocalDecl := [
+      { mutability := .not, ty := outerTy, debugName := .none },
+      { mutability := .not, ty := rawConstU32Ty, debugName := .none }
+    ]
+    let subDecls : List LocalDecl := [
+      { mutability := .not, ty := arr3PairTy, debugName := .none },
+      { mutability := .not, ty := rawConstU32Ty, debugName := .none }
+    ]
+    let constIsize (n : Nat) : Operand :=
+      .constant { ty := isizeTy, val := .scalar (.int ⟨n, 8⟩) }
+    -- 1. `ptrAllocByteBound?` on `PairU32` (typed and untyped), `PaddedS`, `Outer`, and subslice
+    ptrAllocByteBound? [.init pairVal] memPair pairDecls testLayouts ⟨1, 0⟩ = .some 8 ∧
+    ptrAllocByteBound? [.init pairVal] memPair pairDecls testLayouts ⟨2, 0⟩ = .some 4 ∧
+    ptrAllocByteBound? [.init pairVal] memPair .nil emptyLayoutTable ⟨1, 0⟩ = .some 8 ∧
+    ptrAllocByteBound? [.init pairVal] memPair .nil emptyLayoutTable ⟨2, 0⟩ = .some 4 ∧
+    ptrAllocByteBound? [.init paddedVal] memPadded paddedDecls testLayouts ⟨1, 0⟩ = .some 12 ∧
+    ptrAllocByteBound? [.init paddedVal] memPadded paddedDecls testLayouts ⟨2, 0⟩ = .some 8 ∧
+    ptrAllocByteBound? [.init paddedVal] memPadded paddedDecls testLayouts ⟨3, 0⟩ = .some 4 ∧
+    ptrAllocByteBound? [.init paddedVal] memPadded .nil emptyLayoutTable ⟨1, 0⟩ = .some 12 ∧
+    ptrAllocByteBound? [.init paddedVal] memPadded .nil emptyLayoutTable ⟨2, 0⟩ = .some 8 ∧
+    ptrAllocByteBound? [.init paddedVal] memPadded .nil emptyLayoutTable ⟨3, 0⟩ = .some 4 ∧
+    ptrAllocByteBound? [.init outerVal] memOuter outerDecls testLayouts ⟨1, 0⟩ = .some 16 ∧
+    ptrAllocByteBound? [.init outerVal] memOuter outerDecls testLayouts ⟨2, 0⟩ = .some 12 ∧
+    ptrAllocByteBound? [.init outerVal] memOuter outerDecls testLayouts ⟨3, 0⟩ = .some 8 ∧
+    ptrAllocByteBound? [.init outerVal] memOuter outerDecls testLayouts ⟨4, 0⟩ = .some 4 ∧
+    ptrAllocByteBound? [.init arr3Val] memSub subDecls testLayouts ⟨1, 0⟩ = .some 8 ∧
+    -- 2. Zero-overhead invariant for `offsetBytes = 0`
+    needsThinPtrElemResolution [.field 0 u32Ty] 0 = false ∧
+    -- 3. Cross-field `BinOp.offset` (`+1` -> `offsetBytes = 4`) + deref read (`evalOperand` & `evalPlaceRead`)
+    evalRvalue
+      [.init pairVal, .init (.ptr ⟨1, 0⟩ 8)]
+      (.binaryOp .offset (.copy { local_ := 1, projection := .nil }) (constIsize 1))
+      memPair pairConstDecls testLayouts =
+      .ok (.ptr ⟨1, 4⟩ 8) [.init pairVal, .init (.ptr ⟨1, 0⟩ 8)] memPair ∧
+    evalOperand
+      [.init pairVal, .init (.ptr ⟨1, 4⟩ 8)]
+      (.copy { local_ := 1, projection := [.deref] })
+      memPair.borrows .nil testLayouts =
+      .ok (.scalar ⟨bVal, 4⟩) [.init pairVal, .init (.ptr ⟨1, 4⟩ 8)] ∧
+    evalPlaceRead
+      [.init pairVal, .init (.ptr ⟨1, 4⟩ 8)]
+      { local_ := 1, projection := [.deref] }
+      memPair.borrows .nil testLayouts .nil pairConstDecls =
+      .ok (.scalar ⟨bVal, 4⟩) [.init pairVal, .init (.ptr ⟨1, 4⟩ 8)] ∧
+    -- 4. Padded `#[repr(C)]` `PaddedS`: `+2` (`offsetBytes = 8`) reads `bVal`, `+1` (`offsetBytes = 4`, padding) -> `.ub`
+    evalOperand
+      [.init paddedVal, .init (.ptr ⟨1, 8⟩ 8)]
+      (.copy { local_ := 1, projection := [.deref] })
+      memPadded.borrows .nil testLayouts =
+      .ok (.scalar ⟨bVal, 4⟩) [.init paddedVal, .init (.ptr ⟨1, 8⟩ 8)] ∧
+    evalPlaceRead
+      [.init paddedVal, .init (.ptr ⟨1, 8⟩ 8)]
+      { local_ := 1, projection := [.deref] }
+      memPadded.borrows .nil testLayouts .nil paddedDecls =
+      .ok (.scalar ⟨bVal, 4⟩) [.init paddedVal, .init (.ptr ⟨1, 8⟩ 8)] ∧
+    evalOperand
+      [.init paddedVal, .init (.ptr ⟨1, 4⟩ 8)]
+      (.copy { local_ := 1, projection := [.deref] })
+      memPadded.borrows .nil testLayouts = .ub ∧
+    -- 5. Nested `Outer`: `+3` (`offsetBytes = 12`) reads `outer.second.b` (`bVal`)
+    evalPlaceRead
+      [.init outerVal, .init (.ptr ⟨1, 12⟩ 8)]
+      { local_ := 1, projection := [.deref] }
+      memOuter.borrows .nil testLayouts .nil outerDecls =
+      .ok (.scalar ⟨bVal, 4⟩) [.init outerVal, .init (.ptr ⟨1, 12⟩ 8)] ∧
+    -- 6. Subslice-enclosed cross-field: `+1` (`offsetBytes = 4`) reads `arr[1].b`, `+2` (`8`) succeeds at offset and `.ub` on deref, `+3` (`12`) -> `.ub` at offset
+    evalOperand
+      [.init arr3Val, .init (.ptr ⟨1, 4⟩ 8)]
+      (.copy { local_ := 1, projection := [.deref] })
+      memSub.borrows .nil testLayouts =
+      .ok (.scalar ⟨bVal, 4⟩) [.init arr3Val, .init (.ptr ⟨1, 4⟩ 8)] ∧
+    evalRvalue
+      [.init arr3Val, .init (.ptr ⟨1, 0⟩ 8)]
+      (.binaryOp .offset (.copy { local_ := 1, projection := .nil }) (constIsize 2))
+      memSub subDecls testLayouts =
+      .ok (.ptr ⟨1, 8⟩ 8) [.init arr3Val, .init (.ptr ⟨1, 0⟩ 8)] memSub ∧
+    evalOperand
+      [.init arr3Val, .init (.ptr ⟨1, 8⟩ 8)]
+      (.copy { local_ := 1, projection := [.deref] })
+      memSub.borrows .nil testLayouts = .ub ∧
+    evalRvalue
+      [.init arr3Val, .init (.ptr ⟨1, 0⟩ 8)]
+      (.binaryOp .offset (.copy { local_ := 1, projection := .nil }) (constIsize 3))
+      memSub subDecls testLayouts = .ub ∧
+    -- 7. Cross-field deref write (`*p1 = wVal`), scoped borrow invalidation, and deref reborrow (`&*p1`, `&raw const *p1`)
+    writePlaceValue
+      [.init pairVal, .init (.ptr ⟨1, 4⟩ 8)]
+      memPair.borrows
+      { local_ := 1, projection := [.deref] }
+      (.scalar ⟨wVal, 4⟩) =
+      .ok [.init pairUpdatedVal, .init (.ptr ⟨1, 4⟩ 8)] ∧
+    invalidateDerefWriteBorrows
+      [.init pairVal, .init (.ptr ⟨1, 4⟩ 8)]
+      memPair.borrows
+      { local_ := 1, projection := [.deref] }
+      .nil =
+      [borrowPairA, { borrowPairB with perm := .disabled }, borrowPairAFrozen] ∧
+    evalRvalue
+      [.init pairVal, .init (.ptr ⟨1, 4⟩ 8)]
+      (.rawPtr .not { local_ := 1, projection := [.deref] })
+      memPair pairConstDecls testLayouts =
+      .ok (.ptr ⟨4, 0⟩ 8) [.init pairVal, .init (.ptr ⟨1, 4⟩ 8)]
+        { memPair with
+          borrows :=
+            { tag := 4,
+              targetLocal := 0,
+              targetProjection := [.field 1 u32Ty],
+              perm := .frozen,
+              parentTag := .some 1 } :: memPair.borrows,
+          nextTag := 5 } ∧
+    -- 8. One-past-the-end (`offset(base, 2isize)` -> `offsetBytes = 8`) succeeds at `BinOp.offset`; deref read/write/reborrow -> `.ub`
+    evalRvalue
+      [.init pairVal, .init (.ptr ⟨1, 0⟩ 8)]
+      (.binaryOp .offset (.copy { local_ := 1, projection := .nil }) (constIsize 2))
+      memPair pairDecls testLayouts =
+      .ok (.ptr ⟨1, 8⟩ 8) [.init pairVal, .init (.ptr ⟨1, 0⟩ 8)] memPair ∧
+    evalOperand
+      [.init pairVal, .init (.ptr ⟨1, 8⟩ 8)]
+      (.copy { local_ := 1, projection := [.deref] })
+      memPair.borrows .nil testLayouts = .ub ∧
+    evalPlaceRead
+      [.init pairVal, .init (.ptr ⟨1, 8⟩ 8)]
+      { local_ := 1, projection := [.deref] }
+      memPair.borrows .nil testLayouts .nil pairDecls = .ub ∧
+    writePlaceValue
+      [.init pairVal, .init (.ptr ⟨1, 8⟩ 8)]
+      memPair.borrows
+      { local_ := 1, projection := [.deref] }
+      (.scalar ⟨wVal, 4⟩) = .ub ∧
+    evalRvalue
+      [.init pairVal, .init (.ptr ⟨1, 8⟩ 8)]
+      (.ref .shared { local_ := 1, projection := [.deref] })
+      memPair pairDecls testLayouts = .ub ∧
+    evalRvalue
+      [.init pairVal, .init (.ptr ⟨1, 8⟩ 8)]
+      (.rawPtr .mut { local_ := 1, projection := [.deref] })
+      memPair pairDecls testLayouts = .ub ∧
+    -- 9. Beyond one-past-the-end (`+3` on `pair.a`, `+2` on `pair.b`) faults immediately at `BinOp.offset` with `.ub`
+    evalRvalue
+      [.init pairVal, .init (.ptr ⟨1, 0⟩ 8)]
+      (.binaryOp .offset (.copy { local_ := 1, projection := .nil }) (constIsize 3))
+      memPair pairConstDecls testLayouts = .ub ∧
+    evalRvalue
+      [.init pairVal, .init (.ptr ⟨2, 0⟩ 8)]
+      (.binaryOp .offset (.copy { local_ := 1, projection := .nil }) (constIsize 2))
+      memPair pairConstDecls testLayouts = .ub ∧
+    -- 10. Misaligned intra-allocation offset (`offsetBytes = 2`) and size-mismatched sibling (`Mixed { a: u32, b: u8 }`) -> `.ub`
+    evalOperand
+      [.init pairVal, .init (.ptr ⟨1, 2⟩ 8)]
+      (.copy { local_ := 1, projection := [.deref] })
+      memPair.borrows .nil testLayouts = .ub ∧
+    evalOperand
+      [.init mixedVal, .init (.ptr ⟨1, 4⟩ 8)]
+      (.copy { local_ := 1, projection := [.deref] })
+      [borrowPairA] .nil emptyLayoutTable = .ub := by
+  exact ⟨
+    rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+    rfl,
+    rfl, rfl, rfl,
+    rfl, rfl, rfl,
+    rfl,
+    rfl, rfl, rfl, rfl,
+    rfl, rfl, rfl,
+    rfl, rfl, rfl, rfl, rfl, rfl,
+    rfl, rfl,
+    rfl, rfl
+  ⟩
+
+private inductive DiffProbeTag where
+  | normalUnit
+  | normalScalar (bits : Nat) (sizeBytes : Nat)
+  | normalOther
+  | panic
+  | abort
+  | ub
+  | unsupported
+  | outOfFuel
+  | externalCall (defPath : String)
+  deriving DecidableEq, Repr
+
+private def activeProbeSpan (body : CapturedMir) (st : MirExecState) : String :=
+  let raw :=
+    match st with
+    | .running s =>
+      let cur := s.memory.activeCallee.getD body
+      match get? cur.basicBlocks s.frame.blockIdx with
+      | some bb =>
+        match get? bb.statements s.frame.stmtIdx with
+        | some stmt => stmt.span
+        | none => bb.terminator.span
+      | none => "none"
+    | _ => "none"
+  if raw == "" || raw == "<dummy>" then "none" else raw
+
+private def probeExecBounded
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState) :
+    DiffProbeTag × String :=
+  match fuel with
+  | 0 => (.outOfFuel, activeProbeSpan body st)
+  | fuel' + 1 =>
+    match stepMirState body st with
+    | .ret (.normal (.unit, _)) => (.normalUnit, "none")
+    | .ret (.normal (.scalar sc, _)) => (.normalScalar sc.bits sc.sizeBytes, "none")
+    | .ret (.normal (_, _)) => (.normalOther, "none")
+    | .ret .panic => (.panic, activeProbeSpan body st)
+    | .ret .abort => (.abort, activeProbeSpan body st)
+    | .tau st' => probeExecBounded fuel' body st'
+    | .vis (.inl (.fail .ub)) _ => (.ub, activeProbeSpan body st)
+    | .vis (.inl (.fail .unsupported)) _ => (.unsupported, activeProbeSpan body st)
+    | .vis (.inl (.fail .outOfFuel)) _ => (.outOfFuel, activeProbeSpan body st)
+    | .vis (.inr (.inl _)) k => probeExecBounded fuel' body (k PUnit.unit)
+    | .vis (.inr (.inr (.call req))) _ => (.externalCall req.defPath, activeProbeSpan body st)
+
+private def diffAbFinding0000Layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalarPair (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 }) (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := (FieldsShape.arbitrary (List.cons { bytes := 0 } (List.cons { bytes := 4 } List.nil)) (List.cons 0 (List.cons 1 List.nil))), variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 (List.cons 0 List.nil)) } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 0, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 List.nil) } (List.cons { size := { bytes := 1 }, align := { bytes := 1 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 1 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalarPair (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 }) (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 1 })), fields := (FieldsShape.arbitrary (List.cons { bytes := 0 } (List.cons { bytes := 4 } List.nil)) (List.cons 0 (List.cons 1 List.nil))), variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 (List.cons 3 List.nil)) } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 List.nil) } (List.cons { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.array { bytes := 4 } 2), variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 List.nil) } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 64 false) { start := 0, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 64 true) { start := 0, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } List.nil))))))))) }
+
+private def diffAbFinding0000Body : CapturedMir :=
+  {
+    defPath := "miri_diff_corpus::pass_ptr_offset_within_array__b0_c13",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 0,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.adt "miri_diff_corpus::PairU32" List.nil), layoutIdx := 1 }, debugName := (Option.some "pair") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.rawPtr Mutability.not (RigidTy.uint UintTy.u32)), layoutIdx := 2 }, debugName := (Option.some "base") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "__tail___miri_tb_22467") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.rawPtr Mutability.not (RigidTy.uint UintTy.u32)), layoutIdx := 2 }, debugName := (Option.some "p1") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.rawPtr Mutability.not (RigidTy.uint UintTy.u32)), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "__tb_ovf") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "__miri_tb_22467") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.tuple (List.cons (RigidTy.uint UintTy.u32) (List.cons RigidTy.bool List.nil))), layoutIdx := 4 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "__tail___miri_ptr_48867") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.adt "miri_diff_corpus::PairU32" List.nil), layoutIdx := 1 }, debugName := (Option.some "__ptr_pair") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.rawPtr Mutability.not (RigidTy.uint UintTy.u32)), layoutIdx := 2 }, debugName := (Option.some "__base_ptr") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "__miri_ptr_48867") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.rawPtr Mutability.not (RigidTy.uint UintTy.u32)), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.rawPtr Mutability.not (RigidTy.uint UintTy.u32)), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "__tail___miri_proj_37637") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.adt "miri_diff_corpus::PairU32" List.nil), layoutIdx := 1 }, debugName := (Option.some "__proj_pair") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.ref Mutability.mut (RigidTy.uint UintTy.u32)), layoutIdx := 5 }, debugName := (Option.some "__proj_ref") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.ref Mutability.mut (RigidTy.uint UintTy.u32)), layoutIdx := 5 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.array (RigidTy.uint UintTy.u32) 2), layoutIdx := 6 }, debugName := (Option.some "__proj_arr") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "__miri_proj_37637") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.usize), layoutIdx := 7 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := RigidTy.bool, layoutIdx := 3 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } List.nil))))))))))))))))))))))))))))))))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 9), span := "<dummy>" } (List.cons { kind := (StatementKind.storageLive 32), span := "<dummy>" } (List.cons { kind := (StatementKind.storageLive 1), span := "src/lib.rs:312:9: 312:13" } (List.cons { kind := (StatementKind.assign { local_ := 1, projection := List.nil } (Rvalue.aggregate (AggregateKind.adt "miri_diff_corpus::PairU32" 0 Option.none) (List.cons (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 100, sizeBytes := 4 })) }) (List.cons (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 300, sizeBytes := 4 })) }) List.nil)))), span := "src/lib.rs:312:16: 312:42" } (List.cons { kind := (StatementKind.storageLive 2), span := "src/lib.rs:313:9: 313:13" } (List.cons { kind := (StatementKind.assign { local_ := 2, projection := List.nil } (Rvalue.rawPtr Mutability.not { local_ := 1, projection := (List.cons (ProjectionElem.field 0 { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }) List.nil) })), span := "src/lib.rs:313:28: 313:45" } (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:314:9: 314:31" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:315:13: 315:15" } (List.cons { kind := (StatementKind.storageLive 5), span := "src/lib.rs:315:25: 315:29" } (List.cons { kind := (StatementKind.assign { local_ := 5, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:315:25: 315:29" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.binaryOp BinOp.offset (Operand.move { local_ := 5, projection := List.nil }) (Operand.constant { ty := { kind := (RigidTy.int IntTy.isize), layoutIdx := 8 }, val := (ConstValue.scalar (ConstScalar.int { bits := 1, sizeBytes := 8 })) }))), span := "src/lib.rs:315:18: 315:38" } (List.cons { kind := (StatementKind.storageDead 5), span := "src/lib.rs:315:37: 315:38" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 4, projection := (List.cons ProjectionElem.deref List.nil) }))), span := "src/lib.rs:316:9: 316:12" } (List.cons { kind := (StatementKind.storageDead 4), span := "src/lib.rs:317:5: 317:6" } (List.cons { kind := (StatementKind.storageLive 6), span := "src/lib.rs:318:9: 318:17" } (List.cons { kind := (StatementKind.assign { local_ := 6, projection := List.nil } (Rvalue.use (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 4294967295, sizeBytes := 4 })) }))), span := "src/lib.rs:318:25: 318:33" } (List.cons { kind := (StatementKind.storageLive 7), span := "src/lib.rs:319:9: 319:24" } (List.cons { kind := (StatementKind.storageLive 8), span := "src/lib.rs:319:32: 319:40" } (List.cons { kind := (StatementKind.assign { local_ := 8, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 6, projection := List.nil }))), span := "src/lib.rs:319:32: 319:40" } (List.cons { kind := (StatementKind.assign { local_ := 9, projection := List.nil } (Rvalue.binaryOp BinOp.addWithOverflow (Operand.copy { local_ := 8, projection := List.nil }) (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 1, sizeBytes := 4 })) }))), span := "src/lib.rs:319:32: 319:47" } List.nil)))))))))))))))))))), terminator := { kind := (TerminatorKind.assert (Operand.move { local_ := 9, projection := (List.cons (ProjectionElem.field 1 { kind := RigidTy.bool, layoutIdx := 3 }) List.nil) }) false 1 UnwindAction.continue_), span := "src/lib.rs:319:32: 319:47" }, isCleanup := false } (List.cons { statements := List.nil, terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:335:2: 335:2" }, isCleanup := false } List.nil)),
+    fnAbi := { args := List.nil, ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := diffAbFinding0000Layouts,
+    allocations := List.nil
+  }
+
+private def diffAbFinding0025Layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalarPair (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 }) (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := (FieldsShape.arbitrary (List.cons { bytes := 0 } (List.cons { bytes := 4 } List.nil)) (List.cons 0 (List.cons 1 List.nil))), variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 (List.cons 1 List.nil)) } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 0, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 1 List.nil) } (List.cons { size := { bytes := 1 }, align := { bytes := 1 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 2 })), fields := (FieldsShape.arbitrary (List.cons { bytes := 0 } List.nil) (List.cons 0 List.nil)), variants := (VariantsShape.multiple (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 2 }) 0 (List.cons (FieldsShape.arbitrary List.nil List.nil) (List.cons (FieldsShape.arbitrary List.nil List.nil) (List.cons (FieldsShape.arbitrary List.nil List.nil) List.nil)))), isUninhabited := false } (List.cons { size := { bytes := 1 }, align := { bytes := 1 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 255 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 1 }, align := { bytes := 1 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 1 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.union 2), variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 64 true) { start := 0, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } List.nil))))))))) }
+
+private def diffAbFinding0025Body : CapturedMir :=
+  {
+    defPath := "miri_diff_corpus::ub_ptr_offset_oob_write__b15_c25",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 0,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.tuple List.nil), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.adt "miri_diff_corpus::PairU32" List.nil), layoutIdx := 2 }, debugName := (Option.some "pair") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.rawPtr Mutability.mut (RigidTy.uint UintTy.u32)), layoutIdx := 3 }, debugName := (Option.some "base") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.tuple List.nil), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.rawPtr Mutability.mut (RigidTy.uint UintTy.u32)), layoutIdx := 3 }, debugName := (Option.some "oob") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.rawPtr Mutability.mut (RigidTy.uint UintTy.u32)), layoutIdx := 3 }, debugName := Option.none } List.nil)))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 1), span := "src/lib.rs:10054:9: 10054:17" } (List.cons { kind := (StatementKind.assign { local_ := 1, projection := List.nil } (Rvalue.aggregate (AggregateKind.adt "miri_diff_corpus::PairU32" 0 Option.none) (List.cons (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, val := (ConstValue.scalar (ConstScalar.int { bits := 10, sizeBytes := 4 })) }) (List.cons (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, val := (ConstValue.scalar (ConstScalar.int { bits := 20, sizeBytes := 4 })) }) List.nil)))), span := "src/lib.rs:10054:20: 10054:44" } (List.cons { kind := (StatementKind.storageLive 2), span := "src/lib.rs:10055:9: 10055:13" } (List.cons { kind := (StatementKind.assign { local_ := 2, projection := List.nil } (Rvalue.rawPtr Mutability.mut { local_ := 1, projection := (List.cons (ProjectionElem.field 0 { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }) List.nil) })), span := "src/lib.rs:10055:26: 10055:41" } (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:10056:5: 10059:6" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:10057:13: 10057:16" } (List.cons { kind := (StatementKind.storageLive 5), span := "src/lib.rs:10057:26: 10057:30" } (List.cons { kind := (StatementKind.assign { local_ := 5, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 2, projection := List.nil }))), span := "src/lib.rs:10057:26: 10057:30" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.binaryOp BinOp.offset (Operand.move { local_ := 5, projection := List.nil }) (Operand.constant { ty := { kind := (RigidTy.int IntTy.isize), layoutIdx := 8 }, val := (ConstValue.scalar (ConstScalar.int { bits := 2, sizeBytes := 8 })) }))), span := "src/lib.rs:10057:19: 10057:39" } (List.cons { kind := (StatementKind.storageDead 5), span := "src/lib.rs:10057:38: 10057:39" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := (List.cons ProjectionElem.deref List.nil) } (Rvalue.use (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 1 }, val := (ConstValue.scalar (ConstScalar.int { bits := 99, sizeBytes := 4 })) }))), span := "src/lib.rs:10058:9: 10058:18" } List.nil))))))))))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:10078:2: 10078:2" }, isCleanup := false } List.nil),
+    fnAbi := { args := List.nil, ret := { layout := { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.ignore }, conv := CallConv.rust, canUnwind := true },
+    layouts := diffAbFinding0025Layouts,
+    allocations := List.nil
+  }
+
+private def diffAbFinding0001Layouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalarPair (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 }) (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := (FieldsShape.arbitrary (List.cons { bytes := 0 } (List.cons { bytes := 4 } List.nil)) (List.cons 0 (List.cons 1 List.nil))), variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 (List.cons 0 List.nil)) } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 0, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 List.nil) } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 64 true) { start := 0, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 true) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 1 }, align := { bytes := 1 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 8 false) { start := 0, end_ := 1 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false } (List.cons { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.pointer 0) { start := 1, end_ := 18446744073709551615 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false, fieldLayouts := (List.cons 0 List.nil) } (List.cons { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := BackendRepr.memory, fields := (FieldsShape.arbitrary List.nil List.nil), variants := (VariantsShape.single 0), isUninhabited := false } List.nil)))))))) }
+
+private def diffAbFinding0001Body : CapturedMir :=
+  {
+    defPath := "miri_diff_corpus::pass_exact_div_valid__b1_c4",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 0,
+    localDecls := (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := Option.none } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "__tail___miri_ptr_22284") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.adt "miri_diff_corpus::PairU32" List.nil), layoutIdx := 1 }, debugName := (Option.some "__oob_pair") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.rawPtr Mutability.not (RigidTy.uint UintTy.u32)), layoutIdx := 2 }, debugName := (Option.some "__oob_base") } (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, debugName := (Option.some "__miri_ptr_22284") } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.rawPtr Mutability.not (RigidTy.uint UintTy.u32)), layoutIdx := 2 }, debugName := Option.none } (List.cons { mutability := Mutability.mut, ty := { kind := (RigidTy.rawPtr Mutability.not (RigidTy.uint UintTy.u32)), layoutIdx := 2 }, debugName := Option.none } List.nil))))))),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 1), span := "src/lib.rs:770:9: 770:32" } List.nil), terminator := { kind := (TerminatorKind.call (Operand.constant { ty := { kind := (RigidTy.fnDef "core::intrinsics::exact_div" (List.cons (RigidTy.uint UintTy.u32) List.nil)), layoutIdx := 7 }, val := ConstValue.zeroSized }) (List.cons (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 84, sizeBytes := 4 })) }) (List.cons (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 7, sizeBytes := 4 })) }) List.nil)) { local_ := 1, projection := List.nil } (Option.some 1) UnwindAction.unreachable), span := "src/lib.rs:770:49: 770:71" }, isCleanup := false } (List.cons { statements := (List.cons { kind := (StatementKind.storageLive 2), span := "src/lib.rs:771:9: 771:19" } (List.cons { kind := (StatementKind.assign { local_ := 2, projection := List.nil } (Rvalue.aggregate (AggregateKind.adt "miri_diff_corpus::PairU32" 0 Option.none) (List.cons (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 44, sizeBytes := 4 })) }) (List.cons (Operand.constant { ty := { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }, val := (ConstValue.scalar (ConstScalar.int { bits := 33, sizeBytes := 4 })) }) List.nil)))), span := "src/lib.rs:771:31: 771:61" } (List.cons { kind := (StatementKind.storageLive 3), span := "src/lib.rs:772:9: 772:19" } (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.rawPtr Mutability.not { local_ := 2, projection := (List.cons (ProjectionElem.field 0 { kind := (RigidTy.uint UintTy.u32), layoutIdx := 0 }) List.nil) })), span := "src/lib.rs:772:34: 772:57" } (List.cons { kind := (StatementKind.storageLive 4), span := "src/lib.rs:773:9: 773:25" } (List.cons { kind := (StatementKind.storageLive 5), span := "src/lib.rs:773:43: 773:69" } (List.cons { kind := (StatementKind.storageLive 6), span := "src/lib.rs:773:50: 773:60" } (List.cons { kind := (StatementKind.assign { local_ := 6, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 3, projection := List.nil }))), span := "src/lib.rs:773:50: 773:60" } (List.cons { kind := (StatementKind.assign { local_ := 5, projection := List.nil } (Rvalue.binaryOp BinOp.offset (Operand.move { local_ := 6, projection := List.nil }) (Operand.constant { ty := { kind := (RigidTy.int IntTy.isize), layoutIdx := 3 }, val := (ConstValue.scalar (ConstScalar.int { bits := 2, sizeBytes := 8 })) }))), span := "src/lib.rs:773:43: 773:69" } (List.cons { kind := (StatementKind.storageDead 6), span := "src/lib.rs:773:68: 773:69" } (List.cons { kind := (StatementKind.assign { local_ := 4, projection := List.nil } (Rvalue.use (Operand.copy { local_ := 5, projection := (List.cons ProjectionElem.deref List.nil) }))), span := "src/lib.rs:773:42: 773:69" } List.nil))))))))))), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:787:2: 787:2" }, isCleanup := false } List.nil)),
+    fnAbi := { args := List.nil, ret := { layout := { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := (BackendRepr.scalar (ScalarLayout.initialized (PrimitiveKind.int 32 false) { start := 0, end_ := 4294967295 })), fields := FieldsShape.primitive, variants := (VariantsShape.single 0), isUninhabited := false }, mode := AbiPassMode.direct }, conv := CallConv.rust, canUnwind := true },
+    layouts := diffAbFinding0001Layouts,
+    allocations := List.nil
+  }
+
+/--
+**Theorem L3.31 (`DIFF-AB` Captured Miri Differential Findings Reproduction
+Confirmed)**:
+Kernel-checked execution of `stepMirState` (`probeExecBounded 256`) on the
+captured `Runtime(PostCleanup)` MIR bodies of `finding_0000`, `finding_0025`, and
+`finding_0001` matches Miri's oracle verdict and exact statement/terminator span:
+1. `pass_ptr_offset_within_array__b0_c13` (`finding_0000`): steps cleanly past
+   `offset(&raw const pair.a, 1isize)` and `*p1` (`"src/lib.rs:316:9: 316:12"`)
+   and reaches the expected `u32::MAX + 1` overflow assert panic at
+   `(.panic, "src/lib.rs:319:32: 319:47")`;
+2. `ub_ptr_offset_oob_write__b15_c25` (`finding_0025`): steps cleanly past
+   one-past-the-end `offset(&raw mut pair.a, 2isize)`
+   (`"src/lib.rs:10057:19: 10057:39"`) and faults with `.ub` on `*oob = 99` at
+   `(.ub, "src/lib.rs:10058:9: 10058:18")`;
+3. `pass_exact_div_valid__b1_c4` (`finding_0001`): steps cleanly past
+   `exact_div(84u32, 7u32)` and one-past-the-end
+   `offset(&raw const __oob_pair.a, 2isize)` (`"src/lib.rs:773:43: 773:69"`) and
+   faults with `.ub` on `*offset(__oob_base, 2isize)` at
+   `(.ub, "src/lib.rs:773:42: 773:69")`.
+-/
+theorem mir_diff_ab_captured_findings_reproduction_confirmed :
+    probeExecBounded 256 diffAbFinding0000Body
+      (.running (initMachineState diffAbFinding0000Body [])) =
+      (.panic, "src/lib.rs:319:32: 319:47") ∧
+    probeExecBounded 256 diffAbFinding0025Body
+      (.running (initMachineState diffAbFinding0025Body [])) =
+      (.ub, "src/lib.rs:10058:9: 10058:18") ∧
+    probeExecBounded 256 diffAbFinding0001Body
+      (.running (initMachineState diffAbFinding0001Body [])) =
+      (.ub, "src/lib.rs:773:42: 773:69") := by
+  exact ⟨rfl, rfl, rfl⟩
+
+end DiffAbCrossFieldAndOnePastEnd
 
 end Correspondence.V2026_06_01.L3_PlacesAndBasicMem
