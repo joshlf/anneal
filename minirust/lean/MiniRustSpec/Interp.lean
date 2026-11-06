@@ -3155,6 +3155,137 @@ def IntPtrCast.expose (ipc : IntPtrCast Prov) (ptr : Ptr) : IntPtrCast Prov :=
   | some provenance => { ipc with exposed := setInsert ipc.exposed provenance }
   | none => ipc
 
+/-- Structural equality on `LayoutStrategy` for `Type` comparison (`l_ty != r_ty`
+in `IntrinsicOp::RawEq`, `spec/lang/step/intrinsics.md`):
+> "if l_ty != r_ty {" -/
+def layoutStrategyEq : LayoutStrategy → LayoutStrategy → Bool
+  | .Sized s1 a1, .Sized s2 a2 => s1 == s2 && a1 == a2
+  | .Slice s1 a1, .Slice s2 a2 => s1 == s2 && a1 == a2
+  | .TraitObject t1, .TraitObject t2 => t1 == t2
+  | .Tuple h1 t1, .Tuple h2 t2 => h1 == h2 && layoutStrategyEq t1 t2
+  | _, _ => false
+
+/-- Structural equality on `UnsafeCellStrategy` for `Type` comparison
+(`spec/lang/step/intrinsics.md`):
+> "if l_ty != r_ty {" -/
+def unsafeCellStrategyEq : UnsafeCellStrategy → UnsafeCellStrategy → Bool
+  | .Sized c1, .Sized c2 => c1 == c2
+  | .Slice c1, .Slice c2 => c1 == c2
+  | .TraitObject, .TraitObject => true
+  | .Tuple h1 t1, .Tuple h2 t2 => h1 == h2 && unsafeCellStrategyEq t1 t2
+  | _, _ => false
+
+/-- Structural equality on `PointeeInfo` for `Type` comparison
+(`spec/lang/step/intrinsics.md`):
+> "if l_ty != r_ty {" -/
+def pointeeInfoEq (p1 p2 : PointeeInfo) : Bool :=
+  layoutStrategyEq p1.layout p2.layout &&
+  p1.inhabited == p2.inhabited &&
+  unsafeCellStrategyEq p1.unsafe_cells p2.unsafe_cells &&
+  p1.freeze == p2.freeze &&
+  p1.unpin == p2.unpin
+
+/-- Structural equality on `PtrType` for `Type` comparison
+(`spec/lang/step/intrinsics.md`):
+> "if l_ty != r_ty {" -/
+def ptrTypeEq : PtrType → PtrType → Bool
+  | .Ref m1 p1, .Ref m2 p2 => m1 == m2 && pointeeInfoEq p1 p2
+  | .Box p1, .Box p2 => pointeeInfoEq p1 p2
+  | .Raw k1, .Raw k2 => k1 == k2
+  | .FnPtr, .FnPtr => true
+  | .VTablePtr t1, .VTablePtr t2 => t1 == t2
+  | _, _ => false
+
+mutual
+
+/-- Structural equality `l_ty == r_ty` on MiniRust `Type` values (with
+extensional comparison of `Enum` `variants`, `Variant.tagger`, and
+`Discriminator` maps), used by `l_ty != r_ty` in `IntrinsicOp::RawEq`
+(`spec/lang/step/intrinsics.md`):
+> "if l_ty != r_ty {
+>      throw_ub!(\"invalid arguments to `RawEq` intrinsic: types of arguments are not identical\");
+>  }" -/
+def typeEq : «Type» → «Type» → Bool
+  | .Int t1, .Int t2 => t1 == t2
+  | .Bool, .Bool => true
+  | .Ptr p1, .Ptr p2 => ptrTypeEq p1 p2
+  | .Tuple f1 h1 u1, .Tuple f2 h2 u2 =>
+    typeFieldsEq f1 f2 && h1 == h2 && typeOptEq u1 u2
+  | .Array e1 c1, .Array e2 c2 => typeEq e1 e2 && c1 == c2
+  | .Slice e1, .Slice e2 => typeEq e1 e2
+  | .Union f1 ch1 s1 a1, .Union f2 ch2 s2 a2 =>
+    typeFieldsEq f1 f2 && ch1 == ch2 && s1 == s2 && a1 == a2
+  | .Enum ⟨v1⟩ dt1 disc1 s1 a1, .Enum v2 dt2 disc2 s2 a2 =>
+    mapLen ⟨v1⟩ == mapLen v2 &&
+    typeVariantsEq [] v1 v2 &&
+    dt1 == dt2 &&
+    discriminatorEq disc1 disc2 &&
+    s1 == s2 &&
+    a1 == a2
+  | .TraitObject t1, .TraitObject t2 => t1 == t2
+  | _, _ => false
+
+/-- Optional unsized-tail comparison for `Type::Tuple` in `typeEq`
+(`spec/lang/step/intrinsics.md`):
+> "if l_ty != r_ty {" -/
+def typeOptEq : Option «Type» → Option «Type» → Bool
+  | none, none => true
+  | some t1, some t2 => typeEq t1 t2
+  | _, _ => false
+
+/-- Field-list comparison for `Type::Tuple` and `Type::Union` in `typeEq`
+(`spec/lang/step/intrinsics.md`):
+> "if l_ty != r_ty {" -/
+def typeFieldsEq : List (Offset × «Type») → List (Offset × «Type») → Bool
+  | [], [] => true
+  | (o1, t1) :: r1, (o2, t2) :: r2 => o1 == o2 && typeEq t1 t2 && typeFieldsEq r1 r2
+  | _, _ => false
+
+/-- Extensional `Enum` variant-map comparison for `typeEq`
+(`spec/lang/step/intrinsics.md`):
+> "if l_ty != r_ty {" -/
+def typeVariantsEq (seen : List Int) : List (Int × Variant) → Map Int Variant → Bool
+  | [], _ => true
+  | (d, ⟨vt1, tag1⟩) :: rest, v2 =>
+    if seen.contains d then
+      typeVariantsEq seen rest v2
+    else
+      (match mapGet v2 d with
+       | some vt2 => typeEq vt1 vt2.ty && mapEq (· == ·) tag1 vt2.tagger
+       | none => false) &&
+      typeVariantsEq (d :: seen) rest v2
+
+end
+
+/-- `Machine::load_raw_data` (`spec/lang/step/intrinsics.md`):
+> "fn load_raw_data(&mut self, ptr : Pointer<<M as Memory>::Provenance>, ptr_ty : PtrType) -> Result<List<u8>> {
+>      let PtrType::Ref { pointee, .. } = ptr_ty else {
+>          throw_ub!(\"invalid argument to `RawEq` intrinsic: not a reference\");
+>      };
+>      let PointeeInfo { layout: LayoutStrategy::Sized(size, align), .. } = pointee else {
+>          throw_ub!(\"invalid argument to `RawEq` intrinsic: unsized pointee\");
+>      };
+>      let bytes = self.mem.load(ptr.thin_pointer, size, align, Atomicity::None)?;
+>
+>      let Some(data) = bytes.try_map(|byte| byte.data()) else {
+>          throw_ub!(\"invalid argument to `RawEq` intrinsic: byte is uninitialized\");
+>      };
+>
+>      Ok(data)
+>  }" -/
+def loadRawData (m : Mach) (ptr : Pointer Prov) (ptrTy : PtrType) :
+    Interp (List UInt8 × Mach) :=
+  match ptrTy with
+  | .Ref _ pointee =>
+    match pointee.layout with
+    | .Sized size align => do
+      let (bytes, cm) ← CM.load m.mem ptr.thin_pointer size align .None
+      match bytes.mapM AbstractByte.data with
+      | some data => pure (data, { m with mem := cm })
+      | none => ub "invalid argument to `RawEq` intrinsic: byte is uninitialized"
+    | _ => ub "invalid argument to `RawEq` intrinsic: unsized pointee"
+  | _ => ub "invalid argument to `RawEq` intrinsic: not a reference"
+
 /-- `Machine::eval_intrinsic` (`spec/lang/step/intrinsics.md`) for
 `PointerExposeProvenance`, `PointerWithExposedProvenance`, `Exit`, `Abort`,
 `Assume`, `PrintStdout`, `PrintStderr`, `Allocate`, `Deallocate`, `RawEq`,
@@ -3350,7 +3481,31 @@ and `GetUnwindPayload`:
 >      if ret_ty != Type::Bool {
 >          throw_ub!(\"invalid return type for `RawEq` intrinsic\")
 >      }
->      .."
+>
+>      let (left, l_ty) = (arguments).index_at(0);
+>      let (right, r_ty) = (arguments).index_at(1);
+>
+>      if l_ty != r_ty {
+>          throw_ub!(\"invalid arguments to `RawEq` intrinsic: types of arguments are not identical\");
+>      }
+>
+>      let Value::Ptr(left) = left else {
+>          throw_ub!(\"invalid first argument to `RawEq` intrinsic: not a pointer\");
+>      };
+>
+>      let Value::Ptr(right) = right else {
+>          throw_ub!(\"invalid second argument to `RawEq` intrinsic: not a pointer\");
+>      };
+>
+>      let Type::Ptr(l_ty) = l_ty else {
+>          throw_ub!(\"invalid argument type to `RawEq` intrinsic: not a pointer\");
+>      };
+>
+>      let left_data = self.load_raw_data(left, l_ty)?;
+>      let right_data = self.load_raw_data(right, l_ty)?;
+>
+>      ret(Value::Bool(left_data == right_data))
+>  }"
 > "fn eval_intrinsic(
 >      &mut self,
 >      IntrinsicOp::GetUnwindPayload: IntrinsicOp,
@@ -3376,13 +3531,12 @@ and `GetUnwindPayload`:
 >
 >      ret(payload_pointer)
 >  }"
-`Type` has no decidable equality in the generated model, so `ret_ty !=
+`Type` has no derived decidable equality in the generated model, so `ret_ty !=
 unit_type()` and `ret_ty != Type::Bool` match on the exact `unitType` and
-`Type::Bool` terms. Beyond the quoted checks, `PointerWithExposedProvenance`
-(whose `int2ptr` resolves an angelic `predict` choice) and `RawEq` (whose
-argument-type comparison `l_ty != r_ty` needs `Type` equality and whose
-`load_raw_data` reads through references) report `unsupported`, as do the
-thread (`Spawn`, `Join`), lock, and atomic intrinsics. -/
+`Type::Bool` terms while `l_ty != r_ty` in `RawEq` uses `typeEq`. Beyond the
+quoted checks, `PointerWithExposedProvenance` (whose `int2ptr` resolves an
+angelic `predict` choice) and the thread (`Spawn`, `Join`), lock, and atomic
+intrinsics report `unsupported`. -/
 def evalIntrinsic (m : Mach) (op : IntrinsicOp) (arguments : List (Val × «Type»))
     (retTy : «Type») : Interp (Val × Mach) :=
   match op with
@@ -3491,12 +3645,27 @@ def evalIntrinsic (m : Mach) (op : IntrinsicOp) (arguments : List (Val × «Type
       | _ => ub "invalid first argument to `Deallocate` intrinsic: not a thin pointer"
     | _ => ub "invalid number of arguments for `Deallocate` intrinsic"
   | .RawEq =>
-    if arguments.length ≠ 2 then
-      ub "invalid number of arguments for `RawEq` intrinsic"
-    else
+    match arguments with
+    | [(leftV, lTy), (rightV, rTy)] =>
       match retTy with
-      | .Bool => unsupported "eval_intrinsic for IntrinsicOp::RawEq (Type equality and load_raw_data)"
+      | .Bool =>
+        if !typeEq lTy rTy then
+          ub "invalid arguments to `RawEq` intrinsic: types of arguments are not identical"
+        else
+          match leftV with
+          | .Ptr leftPtr =>
+            match rightV with
+            | .Ptr rightPtr =>
+              match lTy with
+              | .Ptr lPtrTy => do
+                let (leftData, m) ← loadRawData m leftPtr lPtrTy
+                let (rightData, m) ← loadRawData m rightPtr lPtrTy
+                pure (.Bool (leftData == rightData), m)
+              | _ => ub "invalid argument type to `RawEq` intrinsic: not a pointer"
+            | _ => ub "invalid second argument to `RawEq` intrinsic: not a pointer"
+          | _ => ub "invalid first argument to `RawEq` intrinsic: not a pointer"
       | _ => ub "invalid return type for `RawEq` intrinsic"
+    | _ => ub "invalid number of arguments for `RawEq` intrinsic"
   | .GetUnwindPayload =>
     if !arguments.isEmpty then
       ub "invalid number of arguments for `GetUnwindPayload` intrinsic"

@@ -99,7 +99,16 @@ open MiniRustSpec.Correspondence in
   translateBlocksInProg_names
   splitStmts_segChain
   translateBlocksInProg_segChain
-  SegChain.eq_last
+  progStatementOk_notAssume
+  progStatementOk_assume
+  SegChain.pcZero
+  SegPc.atStmt_notAssume
+  SegPc.atStmt_assume
+  SegPc.atEnd
+  evalPlace_unitPlace
+  placeStore_unitValue
+  evalTerminator_assume_spec
+  evalStmt_assume_anneal
   statementOk_isAssume
   splitStmts_statements
   mapM_translateStmtResult_of_noAssume
@@ -1153,17 +1162,42 @@ open MiniRustSpec.Correspondence.Witness in
   evalIntrinsic_assume
   evalIntrinsic_print
   evalIntrinsic_rawEq_withExposed
+  evalIntrinsic_rawEq
+  evalIntrinsic_allocate_deallocate_leak
   evalIntrinsic_exposeProvenance
   evalIntrinsic_getUnwindPayload_empty
   evalTerminator_abortTerminator
+  translateRsIntrinsic_witness
   assumeSub_translate
   assumeSub_translateInProg
-  assumeSub_not_inFragment
+  assumeSub_inFragment
+  ctxAssumeSub_ok
   runsToScalar_sound
   assumeSub20_anneal_ret
+  assumeSub20_minirust_ret
   assumeSub20_minirust_direct
   assumeSub20_split_point
+  assumeSubFalse_anneal_ub
+  assumeSubFalse_minirust_ub_rel
   assumeSubFalse_ub
+  assumeTupleCall_inFragment
+  assumeTupleCall_translate
+  assumeTupleCall_translateInProg
+  ctxAssumeTupleCall_ok
+  assumeTupleCall10_anneal_ret
+  assumeTupleCall10_minirust_ret
+  assumeTupleCallOv_anneal_ub
+  assumeTupleCallOv_minirust_ub_rel
+  assumeDeadLocal_inFragment
+  assumeDeadLocal_translate
+  assumeDeadLocal_translateInProg
+  ctxAssumeDeadLocal_ok
+  assumeDeadLocal_anneal_ub
+  assumeDeadLocal_minirust_ub_rel
+  assumeMoveReuse_rejected
+  assumeMoveReuse_diverges
+  assumeAfterMove_rejected
+  assumeAfterMove_diverges
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -1190,7 +1224,16 @@ open MiniRustSpec.Correspondence in
   translateBlocksInProg_names
   splitStmts_segChain
   translateBlocksInProg_segChain
-  SegChain.eq_last
+  progStatementOk_notAssume
+  progStatementOk_assume
+  SegChain.pcZero
+  SegPc.atStmt_notAssume
+  SegPc.atStmt_assume
+  SegPc.atEnd
+  evalPlace_unitPlace
+  placeStore_unitValue
+  evalTerminator_assume_spec
+  evalStmt_assume_anneal
   statementOk_isAssume
   splitStmts_statements
   mapM_translateStmtResult_of_noAssume
@@ -2020,17 +2063,42 @@ open MiniRustSpec.Correspondence.Witness in
   evalIntrinsic_assume
   evalIntrinsic_print
   evalIntrinsic_rawEq_withExposed
+  evalIntrinsic_rawEq
+  evalIntrinsic_allocate_deallocate_leak
   evalIntrinsic_exposeProvenance
   evalIntrinsic_getUnwindPayload_empty
   evalTerminator_abortTerminator
+  translateRsIntrinsic_witness
   assumeSub_translate
   assumeSub_translateInProg
-  assumeSub_not_inFragment
+  assumeSub_inFragment
+  ctxAssumeSub_ok
   runsToScalar_sound
   assumeSub20_anneal_ret
+  assumeSub20_minirust_ret
   assumeSub20_minirust_direct
   assumeSub20_split_point
+  assumeSubFalse_anneal_ub
+  assumeSubFalse_minirust_ub_rel
   assumeSubFalse_ub
+  assumeTupleCall_inFragment
+  assumeTupleCall_translate
+  assumeTupleCall_translateInProg
+  ctxAssumeTupleCall_ok
+  assumeTupleCall10_anneal_ret
+  assumeTupleCall10_minirust_ret
+  assumeTupleCallOv_anneal_ub
+  assumeTupleCallOv_minirust_ub_rel
+  assumeDeadLocal_inFragment
+  assumeDeadLocal_translate
+  assumeDeadLocal_translateInProg
+  ctxAssumeDeadLocal_ok
+  assumeDeadLocal_anneal_ub
+  assumeDeadLocal_minirust_ub_rel
+  assumeMoveReuse_rejected
+  assumeMoveReuse_diverges
+  assumeAfterMove_rejected
+  assumeAfterMove_diverges
 
 open MiniRustSpec.Correspondence in
 #check_theorem_deps "[WITNESS-AUDIT]"
@@ -2190,6 +2258,13 @@ open MiniRustSpec.Correspondence in
   bd_minirust_unreachable_ub
   bdUnreach_rejected
   bdUnreachableTerminator_covered
+  countOnesLoop_mod
+  evalCountOnes_intFromBits
+  evalCountOnes_signedness_indep
+  bdColdPath_handled
+  bdCtpop_handled
+  bdExactDiv_handled
+  exactDivHandler_iff_minirust
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

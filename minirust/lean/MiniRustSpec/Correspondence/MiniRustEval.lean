@@ -7652,4 +7652,80 @@ theorem evalReturn_caller_spec {callerBody calleeBody : CapturedMir}
       expect_align_sized, ok_bind, hmiPtr, ok_bind, hmsg]
     rfl
 
+theorem evalPlace_unitPlace (m : Mach) :
+    evalPlace m unitPlace = .ok ((⟨⟨⟨1, none⟩, none⟩, true⟩, Interp.unitType), m) := rfl
+
+theorem placeStore_unitValue (m : Mach) :
+    placeStore m ⟨⟨⟨1, none⟩, none⟩, true⟩ Interp.unitValue Interp.unitType =
+      .ok (withMem m m.mem.memory.allocations ⟨.Store, .None, 1, ⟨0⟩⟩) := rfl
+
+theorem evalTerminator_assume_spec {curBody : CapturedMir} {curFn : Gen.Function}
+    {rootCtx curCtx : Ctx} {callerFrames : List Frame} {view : List LocalSlot}
+    {curLm : Map Gen.LocalName Ptr} {m : Mach} {curSeg segStmt nextSeg : Nat}
+    {op : Operand} {op' : Gen.ValueExpr}
+    (hshape : Shape m rootCtx
+      (callerFrames ++ [calleeFrameL curFn curCtx curLm curSeg segStmt])
+      m.mem.memory.allocations)
+    (hframe : FrameOk curBody curFn curCtx view curLm
+      (rethread m curCtx
+        [curCtx.caller, calleeFrameL curFn curCtx curLm curSeg segStmt])
+      curSeg segStmt)
+    (hokB : operandOkB curBody.localDecls (copyOp op) = true)
+    (hop : translateOperand op = some op') :
+    (opBits view (copyOp op) = none →
+      ∃ msg, Interp.evalTerminator m
+        (.Intrinsic .Assume [op'] unitPlace (some (bbName nextSeg))) = .error (.ub msg)) ∧
+    (opBits view (copyOp op) = some 0 →
+      Interp.evalTerminator m
+        (.Intrinsic .Assume [op'] unitPlace (some (bbName nextSeg))) =
+        .error (.ub "`Assume` intrinsic called on condition that is violated")) ∧
+    (∀ bits, opBits view (copyOp op) = some bits → bits ≠ 0 →
+      ∃ m4, Interp.evalTerminator m
+          (.Intrinsic .Assume [op'] unitPlace (some (bbName nextSeg))) = .ok m4 ∧
+        Shape m4 rootCtx
+          (callerFrames ++ [calleeFrameL curFn curCtx curLm nextSeg 0])
+          m4.mem.memory.allocations ∧
+        m4.prog = m.prog ∧ m4.fn_ptrs = m.fn_ptrs ∧
+        LocalsOk curBody curCtx view curLm m4.mem.memory.allocations) := by
+  have hopCopy : translateOperand (copyOp op) = some op' := by
+    rw [translateOperand_copyOp]
+    exact hop
+  obtain ⟨hMok, hMnone⟩ :=
+    evalValue_operandT hframe (.bool : FragTy .Bool u8Ty) (copyOp op)
+      (operandOkB_T hokB) op' hopCopy
+  obtain ⟨hvOkRe, hvErrRe⟩ := evalValue_rethread op' m rootCtx curCtx
+    callerFrames (calleeFrameL curFn curCtx curLm curSeg segStmt) hshape.threads hshape.active
+  refine ⟨fun hnone => ?_, fun h0 => ?_, fun bits hb hne0 => ?_⟩
+  · obtain ⟨msg, hmsgR⟩ := hMnone hnone
+    have hmsg := hvErrRe (.ub msg) hmsgR
+    exact ⟨msg, by
+      simp [Interp.evalTerminator, evalIntrinsicTerminator, evalPlace_unitPlace,
+        evalIntrinsicArgs, hmsg]⟩
+  · obtain ⟨_, m3R, hm3R, _⟩ := hMok 0 h0
+    obtain ⟨cm3, _, hm3⟩ := hvOkRe _ m3R hm3R
+    simp [Interp.evalTerminator, evalIntrinsicTerminator, evalPlace_unitPlace,
+      evalIntrinsicArgs, hm3, valOf, evalIntrinsic, Interp.unitType, ub]
+  · obtain ⟨hvbits, m3R, hm3R, h3R⟩ := hMok bits hb
+    simp only [ValidBits] at hvbits
+    have hb1 : bits = 1 := by omega
+    subst hb1
+    obtain ⟨cm3, hcm3, hm3⟩ := hvOkRe _ m3R hm3R
+    let m3 : Mach := { m with mem := cm3 }
+    have hev : evalIntrinsic m3 .Assume [(valOf .Bool 1, .Bool)] Interp.unitType =
+        .ok (Interp.unitValue, m3) := rfl
+    let mSt : Mach := withMem m3 m3.mem.memory.allocations ⟨.Store, .None, 1, ⟨0⟩⟩
+    have hshSt : Shape mSt rootCtx
+        (callerFrames ++ [calleeFrameL curFn curCtx curLm curSeg segStmt])
+        cm3.memory.allocations := ⟨hshape.threads, hshape.active, rfl⟩
+    have hjmp := jumpToBlock_append hshSt nextSeg
+    refine ⟨rethread mSt rootCtx (callerFrames ++ [calleeFrameL curFn curCtx curLm nextSeg 0]),
+      ?_, ⟨rfl, hshape.active, rfl⟩, rfl, rfl, ?_⟩
+    · simp only [Interp.evalTerminator, evalIntrinsicTerminator, evalPlace_unitPlace, ok_bind,
+        evalIntrinsicArgs, hm3, pure_ok]
+      rw [hev, ok_bind, placeStore_unitValue, ok_bind]
+      exact hjmp
+    · have hlo3 := h3R.locs
+      rw [hcm3] at hlo3
+      exact hlo3
+
 end MiniRustSpec.Correspondence

@@ -154,9 +154,10 @@ and `InPlace`, `Machine::create_frame`, `Machine::eval_call`,
 `BottomOfStack` and `BackToCaller`; for `Terminator::Intrinsic`,
 `Machine::eval_intrinsic` on `Exit` (with `ConcurrentMemory::leak_check`),
 `Abort`, `Assume`, `PrintStdout`, `PrintStderr`, `Allocate`, `Deallocate`,
+`RawEq` (with `Machine::load_raw_data` and structural `Type` equality),
 `PointerExposeProvenance` (with `IntPtrCast::expose`), and
-`GetUnwindPayload`, plus the argument and return-type checks of `RawEq` and
-`PointerWithExposedProvenance`, which then report `Stop.unsupported`, as do the
+`GetUnwindPayload`, plus the argument and return-type checks of
+`PointerWithExposedProvenance`, which then reports `Stop.unsupported`, as do the
 thread, lock, and atomic intrinsics), the representation relation
 (`Type::{decode, encode}`) for `Int`, `Bool`, sized `Tuple`, `Union`, `Enum`
 (through `decode_discriminant` and `encode_discriminant`), `Slice`, and
@@ -258,6 +259,14 @@ restricted to the fragment checked by `inFragment`:
   and `_i = Aggregate(AggregateKind::Tuple, [opInt, opBool])` (`ValueExpr::Tuple`
   at `IntType::with_overflow`); field projections `_j.0` and `_j.1` translate to
   `PlaceExpr::Field(PlaceExpr::Local(_j), 0)` and `PlaceExpr::Field(PlaceExpr::Local(_j), 1)`;
+* in `progInFragment` (`progStatementOk`), non-diverging
+  `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))` on any `bool`
+  fragment operand `op` (`copy _j`, `move _j`, `copy (_j.1)`, `move (_j.1)`, or
+  `bool` constant): `minimize`'s `translate_bb` (`splitStmts`) ends the open
+  MiniRust block in `Terminator::Intrinsic(IntrinsicOp::Assume, [op],
+  build::unit_place(), some nextBb)` and continues subsequent MIR statements in
+  a fresh continuation block `nextBb` (`SegChain`, `SegPc`), while `stmtReadsOk`
+  and `stmtMoved` track `op` just like any other statement read/move;
 * terminators are `Goto`, `SwitchInt` on any integer or `bool` fragment operand
   (`copy _j`, `move _j`, `copy (_j.0)`, `move (_j.0)`, `copy (_j.1)`,
   `move (_j.1)`, or constant) with distinct in-range values (`minimize` switches
@@ -301,8 +310,10 @@ MiniRust machine has one enabled thread whose stack is `[caller, callee]`, while
 for a multi-function call stack of depth `D` the MiniRust stack is
 `rootCtx.caller :: suspendedCaller_1 :: .. :: suspendedCaller_D :: activeCallee`
 aligned frame-for-frame with Anneal's `s.memory.callStack` (`SavedCallerFrame`s)
-and `s.memory.activeCallee`; the active frame runs `f` at the corresponding
-program point; a MIR local `_i` is in a frame's locals map exactly when Anneal's
+and `s.memory.activeCallee`; the active frame (and each suspended caller's
+return target) runs `f` at the `SegPc`-aligned split-block program point
+matching MIR `(blockIdx, stmtIdx)`; a MIR local `_i` is in a frame's locals map
+exactly when Anneal's
 slot is live (or `_i` is a temporary that the init block allocated), pointing to
 its own `Stack` allocation whose bytes are the encoding of a slot (`Uninit`
 bytes for an uninitialized slot, little-endian bytes for an initialized scalar,
@@ -497,20 +508,23 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `evalReturn_missingNextBlock_and_bottomOfStack_ub` directly verify every
   transcribed MR-4.1 spec item, while `progStart_outside_fragment` shows why
   the theorems start at `fEntry.start` rather than `prog.start`.
-* `evalIntrinsic_*`, `evalTerminator_abortTerminator`, and `assumeSub`
-  (MR-4.2): direct checks of every transcribed `eval_intrinsic` arm (`Abort`,
-  `Exit`, each UB check of `Assume`, `PrintStdout`/`PrintStderr` output and
-  UB, `PointerExposeProvenance`, and the checks that precede `unsupported` in
-  `RawEq` and `PointerWithExposedProvenance`) and of `build::abort()`; and
-  `assumeSub`, a body with two `Assume` statements in one MIR block, whose
-  translation (`assumeSub_translateInProg`) splits that block into three
-  MiniRust blocks joined by `Terminator::Intrinsic` of `IntrinsicOp::Assume`.
-  `assumeSub` is outside `progInFragment` (`assumeSub_not_inFragment`), so both
-  semantics are computed directly: for `(20, true)` Anneal returns `19u32`
-  without UB (`assumeSub20_anneal_ret`) and MiniRust writes the bytes of `19u32`
-  in 5 steps (`assumeSub20_minirust_direct`), with MIR point `(bb0, 1)` matching
-  the start of the fresh MiniRust block `bbName 2` (`assumeSub20_split_point`);
-  for `(20, false)` both raise UB at the first `Assume` (`assumeSubFalse_ub`).
+* `evalIntrinsic_*`, `evalTerminator_abortTerminator`, `translateRsIntrinsic_witness`,
+  `assumeSub`, `assumeTupleCallCaller`, `assumeDeadLocal`, `assumeMoveReuse`, and
+  `assumeAfterMove` (MR-4.2): direct checks of every transcribed `eval_intrinsic`
+  arm (`Abort`, `Exit`, each UB check of `Assume`, `PrintStdout`/`PrintStderr`
+  output and UB, `Allocate`/`Deallocate` with `Heap` leak checking, full `RawEq`
+  with `load_raw_data` and `typeEq`, `PointerExposeProvenance`,
+  `PointerWithExposedProvenance`, and `GetUnwindPayload`), `build::abort()`, and
+  `translateRsIntrinsic` (`raw_eq`, `ctpop`, `exact_div`, `cold_path`, `abort`);
+  and end-to-end `progInFragment` block-splitting correspondence (`mirCallWithCallees_ret`
+  and `mirCallWithCallees_ub_rel`) for `Assume` statements across two `Assume`s in
+  one MIR block (`assumeSub20_minirust_ret`, `assumeSubFalse_minirust_ub_rel`,
+  `assumeSub20_split_point`), `Assume(move _)` + tuple-field projection +
+  `Terminator::Call` across split blocks (`assumeTupleCall10_minirust_ret`,
+  `assumeTupleCallOv_minirust_ub_rel`), dead-local `Assume` UB
+  (`assumeDeadLocal_minirust_ub_rel`), and necessity witnesses proving that
+  neither `stmtMoved` (`assumeMoveReuse_diverges`) nor `stmtReadsOk`
+  (`assumeAfterMove_diverges`) on `Assume` can be dropped.
 * `Correspondence/IntrinsicFallback.lean` (MR-4.2): calls to
   `core::intrinsics::{ctlz, cttz, bswap, bitreverse, saturating_add,
   saturating_sub, black_box}` and `u32::{wrapping_shl, wrapping_shr}` whose
@@ -526,25 +540,31 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   calls to these seven intrinsics (`translate_rs_intrinsic` has no arm for
   them); the witnesses relate Anneal to the MiniRust program that calls the
   fallback body instead.
-* `Correspondence/IntrinsicBoundary.lean` (MR-4.2): kernel-checked boundary
-  witnesses for the intrinsic constructs outside the fragment, each proving
-  Anneal's behavior on a concrete state and the translation's or fragment
-  check's rejection. `Rvalue::NullaryOp(UbChecks)` is `unsupported` in Anneal
-  (`bdUbChecks_step`) but a session-fixed `bool` constant in `minimize`.
-  `CopyNonOverlapping` aborts `minimize` (`span_bug!`), while Anneal executes
-  it and returns normally even for a two-element `u32` copy between two
-  4-byte locals (`bdCopy2_noUB`). Anneal's `BinOp::Offset` adds the raw count
-  without scaling or bounds checks (`bdOffsetNeg1_noUB`). Calls to
-  `core::intrinsics::{write_bytes, raw_eq, cold_path, ctpop, exact_div,
-  arith_offset}` without a body are Anneal external calls whose `MirCallReq`
-  carries no types, so `exact_div::<i32>(-6, 3)` and
-  `exact_div::<u32>(4294967290, 3)` issue the same request although MiniRust's
-  `DivExact` returns `-2` for the first and raises UB for the second
+* `Correspondence/IntrinsicBoundary.lean` (MR-4.2): kernel-checked handler
+  correspondence (`mirHandledTree` / `handleMirExternalCalls`) and boundary
+  witnesses for compiler intrinsics. For `cold_path`, `ctpop`, and per-`IntType`
+  `exact_div`, concrete `ExternalCallHandler`s (`coldPathHandler`,
+  `ctpopHandler`, `exactDivHandler`) match `minimize`'s `translateRsIntrinsic`
+  lowerings (`bdColdPath_handled`, `bdCtpop_handled`, `bdExactDiv_handled`,
+  `exactDivHandler_iff_minirust`), supported by a symbolic proof that MiniRust's
+  `UnOp::Int(CountOnes)` equals the unsigned bit-pattern popcount at every
+  signed and unsigned `IntType` width (`evalCountOnes_intFromBits`,
+  `evalCountOnes_signedness_indep`). Without type specialization, Anneal's
+  `MirCallReq` erases generic `IntType` signedness, so `exact_div::<i32>(-6, 3)`
+  and `exact_div::<u32>(4294967290, 3)` issue identical requests even though
+  MiniRust's `DivExact` returns `-2` for the first and raises UB for the second
   (`bdExactDiv_same_request`, `bdExactDiv_minirust_i32`,
-  `bdExactDiv_minirust_u32`); the diverging `abort` call is `unsupported`
-  (`bdAbort_unsupported`); and a `core::hint::unreachable_unchecked()` call is
-  UB in Anneal, like MiniRust's `Terminator::Unreachable`
-  (`bdUnreach_anneal_ub`, `bd_minirust_unreachable_ub`).
+  `bdExactDiv_minirust_u32`). For pointer/target intrinsics outside the fragment:
+  `Rvalue::NullaryOp(UbChecks)` is `unsupported` in Anneal (`bdUbChecks_step`)
+  but a session-fixed `bool` constant in `minimize`; `CopyNonOverlapping` aborts
+  `minimize` (`span_bug!`) while Anneal executes it and returns normally even on
+  a two-element `u32` copy between 4-byte locals (`bdCopy2_noUB`); Anneal's
+  `BinOp::Offset` adds the raw count without pointee scaling or inbounds checks
+  (`bdOffsetNeg1_noUB`); `write_bytes`, `raw_eq`, and `arith_offset` issue
+  external calls; diverging `abort` (`target = none`) is `unsupported` in Anneal
+  (`bdAbort_unsupported`); and `core::hint::unreachable_unchecked()` faults with
+  UB in Anneal, matching `Terminator::Unreachable` (`bdUnreach_anneal_ub`,
+  `bd_minirust_unreachable_ub`).
 * `tempMove`, `crossBlockMove`, `loopTempMove`, `storageLiveArgRet`,
   `diamondMoveJoin`, `tupleAggCastMove`, and `ordBoolCastTempMove` (MR-1.3):
   `tempMove` is
@@ -856,20 +876,23 @@ These are deliberate and are the first things to lift:
   reads and writes, but not nested or general multi-field tuples). There are no
   user pointers, references, other aggregates, other casts, drops, or
   assertions.
-* **Intrinsics (MR-4.2, in progress).** `translateFnInProg` splits blocks at
-  `Assume` statements exactly like `minimize`'s `translate_bb` (`SegChain`,
-  `translateFnInProg_spec`), but `bodyInProgFragment` still requires
-  `statementOk`, so no fragment body contains an `Assume` and the simulation
-  theorems relate MIR block `b` to MiniRust block `bbName b` one to one
-  (`SegChain.eq_last`); `assumeSub` is checked by direct computation instead.
-  Compiler intrinsics called through `TerminatorKind.call` to a `DefPath`
-  outside `callees` (`ctpop`, `exact_div`, `abort`, `cold_path`, ...) are
-  Anneal external calls (`MirStepNode.extCall`), which `MultiStepRel` does not
-  relate, and `minimize`'s `translate_rs_intrinsic` lowerings of them are not
-  transcribed. `Rvalue::NullaryOp(UbChecks)`, `CopyNonOverlapping`,
-  `arith_offset`/`BinOp::Offset`, `write_bytes`, and `raw_eq` are outside the
-  fragment (pointers are); `IntrinsicBoundary` records how Anneal and
-  `minimize` treat each of them.
+* **Compiler call intrinsics and pointer/target intrinsics (MR-4.2).**
+  `progInFragment` admits `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`
+  directly in the multi-function simulation (`SegChain`, `SegPc`), and
+  `IntrinsicFallback` proves full `mirCallWithCallees_ret` correspondence for
+  callee-body fallbacks (`ctlz`, `cttz`, `bswap`, `bitreverse`,
+  `saturating_add`, `saturating_sub`, `wrapping_shl`, `wrapping_shr`,
+  `black_box`). Compiler intrinsics called via `TerminatorKind.call` without a
+  callee body emit `MirCallE` external calls in Anneal (`MirStepNode.extCall`):
+  `IntrinsicBoundary` transcribes `minimize`'s `translateRsIntrinsic` (`raw_eq`,
+  `ctpop`, `exact_div`, `cold_path`, `abort`) and relates `cold_path`, `ctpop`,
+  and type-specialized `exact_div` under `mirHandledTree`
+  (`ExternalCallHandler`), while documenting why `MirCallReq`'s erased generic
+  types prevent a single type-blind handler from simultaneously matching signed
+  and unsigned `exact_div`, why diverging `abort` (`target = none`) is
+  `unsupported` in Anneal, and how `Rvalue::NullaryOp(UbChecks)`,
+  `CopyNonOverlapping`, `arith_offset`/`BinOp::Offset`, `write_bytes`, and
+  `raw_eq` behave outside the pointer-free fragment.
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.

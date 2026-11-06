@@ -145,15 +145,22 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
   ground-truth unit checks of the `MR-4.1` `Interp` definitions and
   `progStart_outside_fragment`, which shows why the theorems start at
   `fEntry.start` under an external caller rather than at `prog.start`.
-* `evalIntrinsic_*`, `evalTerminator_abortTerminator`, and `assumeSub`
-  (`MR-4.2`): every transcribed `IntrinsicOp` arm of `eval_intrinsic`
-  (`Abort`, `Exit`, `Assume` with each of its UB checks, `PrintStdout` and
-  `PrintStderr`, `PointerExposeProvenance`, and the checks that precede
-  `unsupported` in `RawEq` and `PointerWithExposedProvenance`), the
-  `build::abort()` terminator, and a function with two `Assume` statements,
-  whose translation splits its only MIR block into three MiniRust blocks.
-  Anneal and MiniRust both return `19u32` for `assume_sub(20, true)` and both
-  raise UB at the first `Assume` for `assume_sub(20, false)`.
+* `evalIntrinsic_*`, `evalTerminator_abortTerminator`, `translateRsIntrinsic_witness`,
+  `assumeSub`, `assumeTupleCallCaller`, `assumeDeadLocal`, `assumeMoveReuse`, and
+  `assumeAfterMove` (`MR-4.2`): every transcribed `IntrinsicOp` arm of
+  `eval_intrinsic` (`Abort`, `Exit`, `Assume` with each of its UB checks,
+  `PrintStdout` and `PrintStderr`, `Allocate` and `Deallocate` with `Heap` leak
+  checking, `RawEq` with `load_raw_data` and structural `typeEq`,
+  `PointerExposeProvenance`, `PointerWithExposedProvenance`, and
+  `GetUnwindPayload`), `build::abort()`, `translateRsIntrinsic`, and full
+  multi-function `progInFragment` block-splitting correspondence (`SegPc`,
+  `SegChain`) for `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`
+  via `mirCallWithCallees_ret` and `mirCallWithCallees_ub_rel` — across multiple
+  `Assume`s in one block (`assumeSub`), `Assume(move _)` + tuple-field
+  projection + `Terminator::Call` across split blocks (`assumeTupleCallCaller`),
+  dead-local `Assume` UB (`assumeDeadLocal`), and necessity witnesses proving
+  that neither `stmtMoved` (`assumeMoveReuse`) nor `stmtReadsOk`
+  (`assumeAfterMove`) on `Assume` can be dropped.
 -/
 
 namespace MiniRustSpec.Correspondence.Witness
@@ -10033,14 +10040,15 @@ theorem progStart_outside_fragment :
 /-! ## `MR-4.2`: intrinsics
 
 Ground-truth checks of the transcribed `Machine::eval_intrinsic`
-(`evalIntrinsic`) and `Terminator::Intrinsic` (`evalIntrinsicTerminator`) on a
-concrete machine, and the `Assume` statement witness `assumeSub`: `minimize`
-ends the current MiniRust block at every
-`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))` in a
+(`evalIntrinsic`), `Terminator::Intrinsic` (`evalIntrinsicTerminator`), and
+`translateRsIntrinsic` (`tooling/minimize/src/bb.rs`) on concrete machines, plus
+end-to-end correspondence and dataflow necessity witnesses for `Assume`
+statements (`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`):
+`minimize` ends the current MiniRust block at every `Assume` in a
 `Terminator::Intrinsic` of `IntrinsicOp::Assume` whose next block is fresh
-(`translateStmtResult`, `splitStmts`). The multi-function fragment
-(`bodyInProgFragment`) does not yet admit `Assume` statements, so `assumeSub`
-is checked by computing both semantics directly. -/
+(`translateStmtResult`, `splitStmts`), and `progInFragment` (`progStatementOk`)
+connects arbitrary multi-`Assume` block chains (`SegPc`, `SegChain`) to
+`mirCallWithCallees_ret` and `mirCallWithCallees_ub_rel`. -/
 
 
 /-! ### `Machine::eval_intrinsic` on a concrete machine -/
@@ -10049,6 +10057,21 @@ is checked by computing both semantics directly. -/
 def intOfVal? : Val → Option Int
   | .Int i => some i
   | _ => none
+
+/-- The Boolean of a `Value::Bool`. -/
+def boolOfVal? : Val → Option Bool
+  | .Bool b => some b
+  | _ => none
+
+/-- Whether an `Interp` result is `Stop.memoryLeak`. -/
+def isMemoryLeakStop {α : Type} : Interp α → Bool
+  | .error .memoryLeak => true
+  | _ => false
+
+/-- Whether an `Interp` result is `Stop.machineStop`. -/
+def isMachineStop {α : Type} : Interp α → Bool
+  | .error .machineStop => true
+  | _ => false
 
 /-- Whether a MiniRust value is `unit_value()` (`Value::Tuple(list![])`). -/
 def isUnitValue : Val → Bool
@@ -10101,12 +10124,14 @@ theorem evalIntrinsic_print :
       .error (.ub "invalid return type for `PrintStdout` intrinsic") := by
   refine ⟨by decide +kernel, by decide +kernel, rfl, rfl⟩
 
-/-- `IntrinsicOp::RawEq` and `IntrinsicOp::PointerWithExposedProvenance` pass
-their transcribed argument and return-type checks and then report
-`unsupported`, while a failing check is still UB. -/
+/-- `IntrinsicOp::RawEq` rejects non-pointer arguments, wrong argument counts,
+and non-`bool` return types with UB; `IntrinsicOp::PointerWithExposedProvenance`
+passes its integer-argument and raw-pointer return-type checks before reporting
+`unsupported`, while a non-integer argument is UB. -/
 theorem evalIntrinsic_rawEq_withExposed :
-    isUnsupportedStop (evalIntrinsic callerCallee20MInit .RawEq
-      [(.Int 1, .Int u8Ty), (.Int 1, .Int u8Ty)] .Bool) = true ∧
+    evalIntrinsic callerCallee20MInit .RawEq
+      [(.Int 1, .Int u8Ty), (.Int 1, .Int u8Ty)] .Bool =
+      .error (.ub "invalid first argument to `RawEq` intrinsic: not a pointer") ∧
     evalIntrinsic callerCallee20MInit .RawEq [(.Int 1, .Int u8Ty)] .Bool =
       .error (.ub "invalid number of arguments for `RawEq` intrinsic") ∧
     evalIntrinsic callerCallee20MInit .RawEq [(.Int 1, .Int u8Ty), (.Int 1, .Int u8Ty)]
@@ -10117,7 +10142,81 @@ theorem evalIntrinsic_rawEq_withExposed :
     evalIntrinsic callerCallee20MInit .PointerWithExposedProvenance
         [(.Bool true, .Bool)] (.Ptr (.Raw .None)) =
       .error (.ub "invalid argument for `PointerWithExposedProvenance` intrinsic: not an integer") :=
-  ⟨rfl, rfl, rfl, rfl, rfl⟩
+  ⟨eq_error_ub_of_ubMsg? (by decide +kernel), rfl, rfl, rfl, rfl⟩
+
+/-- Concrete machine with four 4-byte `Stack` allocations (`42u32`, `42u32`,
+`99u32`, and 4 `Uninit` bytes) for testing `IntrinsicOp::RawEq` and
+`Machine::load_raw_data`. -/
+def rawEqMach : Mach :=
+  { callerCallee20MInit with
+    mem := { memory := {
+      allocations := [
+        { data := scalarBytes u32 42, addr := 128, align := ⟨4⟩, kind := .Stack, live := true, extra := () },
+        { data := scalarBytes u32 42, addr := 256, align := ⟨4⟩, kind := .Stack, live := true, extra := () },
+        { data := scalarBytes u32 99, addr := 384, align := ⟨4⟩, kind := .Stack, live := true, extra := () },
+        { data := List.replicate 4 .Uninit, addr := 512, align := ⟨4⟩, kind := .Stack, live := true, extra := () }],
+      _phantom := {} }, accesses := [] } }
+
+def rawEqPtr (id : Nat) (addr : Int) : Val :=
+  .Ptr ⟨⟨addr, some (⟨id⟩, ())⟩, none⟩
+
+def sizedU32RefTy : Gen.Type := .Ptr (.Ref .Immutable sizedU32Pointee)
+
+/-- Full `IntrinsicOp::RawEq` semantics (`spec/lang/step/intrinsics.md`):
+compares initialized byte sequences of two sized references (`42u32 == 42u32` is
+`true`, `42u32 == 99u32` is `false`), raises UB when any byte is `Uninit`,
+raises UB when the two argument types differ (`typeEq`), and raises UB when the
+pointer type is `.Raw` rather than `.Ref`. -/
+theorem evalIntrinsic_rawEq :
+    (evalIntrinsic rawEqMach .RawEq
+      [(rawEqPtr 0 128, sizedU32RefTy), (rawEqPtr 1 256, sizedU32RefTy)] .Bool).toOption.bind
+        (fun r => boolOfVal? r.1) = some true ∧
+    (evalIntrinsic rawEqMach .RawEq
+      [(rawEqPtr 0 128, sizedU32RefTy), (rawEqPtr 2 384, sizedU32RefTy)] .Bool).toOption.bind
+        (fun r => boolOfVal? r.1) = some false ∧
+    evalIntrinsic rawEqMach .RawEq
+      [(rawEqPtr 0 128, sizedU32RefTy), (rawEqPtr 3 512, sizedU32RefTy)] .Bool =
+      .error (.ub "invalid argument to `RawEq` intrinsic: byte is uninitialized") ∧
+    evalIntrinsic rawEqMach .RawEq
+      [(rawEqPtr 0 128, sizedU32RefTy), (rawEqPtr 1 256, .Ptr (.Raw .None))] .Bool =
+      .error (.ub "invalid arguments to `RawEq` intrinsic: types of arguments are not identical") ∧
+    evalIntrinsic rawEqMach .RawEq
+      [(rawEqPtr 0 128, .Ptr (.Raw .None)), (rawEqPtr 1 256, .Ptr (.Raw .None))] .Bool =
+      .error (.ub "invalid argument to `RawEq` intrinsic: not a reference") :=
+  ⟨by decide +kernel, by decide +kernel,
+   eq_error_ub_of_ubMsg? (by decide +kernel),
+   eq_error_ub_of_ubMsg? (by decide +kernel),
+   eq_error_ub_of_ubMsg? (by decide +kernel)⟩
+
+/-- `IntrinsicOp::Allocate`, `IntrinsicOp::Deallocate`, and `IntrinsicOp::Exit`
+(`ConcurrentMemory::leak_check`): allocating 4 `Heap` bytes and exiting without
+deallocating throws `Stop.memoryLeak`, whereas deallocating with matching size
+and alignment and then exiting throws `Stop.machineStop`; negative size,
+non-power-of-two alignment, and size mismatch on `Deallocate` raise UB. -/
+theorem evalIntrinsic_allocate_deallocate_leak :
+    isMemoryLeakStop (do
+      let (_, m1) ← evalIntrinsic callerCallee20MInit .Allocate
+        [(.Int 4, .Int u64W), (.Int 4, .Int u64W)] (.Ptr (.Raw .None))
+      evalIntrinsic m1 .Exit [] Interp.unitType) = true ∧
+    isMachineStop (do
+      let (p, m1) ← evalIntrinsic callerCallee20MInit .Allocate
+        [(.Int 4, .Int u64W), (.Int 4, .Int u64W)] (.Ptr (.Raw .None))
+      let (_, m2) ← evalIntrinsic m1 .Deallocate
+        [(p, .Ptr (.Raw .None)), (.Int 4, .Int u64W), (.Int 4, .Int u64W)] Interp.unitType
+      evalIntrinsic m2 .Exit [] Interp.unitType) = true ∧
+    evalIntrinsic callerCallee20MInit .Allocate
+      [(.Int (-1), .Int u64W), (.Int 4, .Int u64W)] (.Ptr (.Raw .None)) =
+      .error (.ub "invalid size for `Allocate` intrinsic: negative size") ∧
+    evalIntrinsic callerCallee20MInit .Allocate
+      [(.Int 4, .Int u64W), (.Int 3, .Int u64W)] (.Ptr (.Raw .None)) =
+      .error (.ub "invalid alignment for `Allocate` intrinsic: not a power of 2") ∧
+    (do
+      let (p, m1) ← evalIntrinsic callerCallee20MInit .Allocate
+        [(.Int 4, .Int u64W), (.Int 4, .Int u64W)] (.Ptr (.Raw .None))
+      evalIntrinsic m1 .Deallocate
+        [(p, .Ptr (.Raw .None)), (.Int 8, .Int u64W), (.Int 4, .Int u64W)] Interp.unitType) =
+      .error (.ub "deallocating with incorrect size information") :=
+  ⟨by decide +kernel, by decide +kernel, rfl, rfl, eq_error_ub_of_ubMsg? (by decide +kernel)⟩
 
 /-- `IntrinsicOp::PointerExposeProvenance` returns the address of a thin
 pointer at `usize` and records its provenance as exposed. -/
@@ -10142,6 +10241,32 @@ and throws `TerminationInfo::Abort`: `unit_place()` evaluates without touching
 memory, and `IntrinsicOp::Abort` never returns. -/
 theorem evalTerminator_abortTerminator :
     evalTerminator callerCallee20MInit abortTerminator = .error .abort := rfl
+
+/-- `translateRsIntrinsic` (`tooling/minimize/src/bb.rs`) lowers `"raw_eq"` to
+`Terminator::Intrinsic(.RawEq, ...)`, `"ctpop"` to `UnOp::Int(.CountOnes)` +
+`Goto`, `"exact_div"` to `BinOp::Int(.DivExact)` + `Goto`, `"cold_path"` to a
+no-op `Goto`, `"abort"` to `build::abort()`, and rejects unmodeled fallback
+intrinsics (`"ctlz"`). -/
+theorem translateRsIntrinsic_witness :
+    translateRsIntrinsic "raw_eq" [.copy (local_ 1), .copy (local_ 2)]
+        (local_ 0) (some 1) =
+      some ⟨[], .Intrinsic .RawEq
+        [.Load (.Local (localName 1)), .Load (.Local (localName 2))]
+        (.Local (localName 0)) (some (bbName 1))⟩ ∧
+    translateRsIntrinsic "ctpop" [.copy (local_ 1)] (local_ 0) (some 1) =
+      some ⟨[.Assign (.Local (localName 0)) (buildCountOnes (.Load (.Local (localName 1))))],
+        .Goto (bbName 1)⟩ ∧
+    translateRsIntrinsic "exact_div" [.copy (local_ 1), .copy (local_ 2)]
+        (local_ 0) (some 1) =
+      some ⟨[.Assign (.Local (localName 0))
+        (buildDivExact (.Load (.Local (localName 1))) (.Load (.Local (localName 2))))],
+        .Goto (bbName 1)⟩ ∧
+    translateRsIntrinsic "cold_path" [] (local_ 0) (some 1) =
+      some ⟨[], .Goto (bbName 1)⟩ ∧
+    translateRsIntrinsic "abort" [] (local_ 0) none =
+      some ⟨[], abortTerminator⟩ ∧
+    translateRsIntrinsic "ctlz" [.copy (local_ 1)] (local_ 0) (some 1) = none :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ### `Assume` statements and `minimize`'s block splitting -/
 
@@ -10206,13 +10331,25 @@ theorem assumeSub_translate : translateProg assumeSub [] = some assumeSubProg :=
 theorem assumeSub_translateInProg :
     translateFnInProg (fnNameMap assumeSub []) assumeSub = some assumeSubFn := rfl
 
-/-- `Assume` statements are outside the multi-function fragment
-(`bodyInProgFragment` requires `statementOk`), so `assumeSub` is checked by
-direct computation on both sides below rather than through
-`mirCallWithCallees_ret`. -/
-theorem assumeSub_not_inFragment : progInFragment assumeSub [] = false := by decide
+/-- `progInFragment` (`progStatementOk`) admits `Assume` statements and connects
+their split-block translation (`SegPc`, `SegChain`) to the multi-function
+correspondence theorems. -/
+theorem assumeSub_inFragment : progInFragment assumeSub [] = true := by decide
 
 def ctxAssumeSub : Ctx := ctxWithFns callerFrame retAlloc 1 [128, 256, 384]
+
+theorem ctxAssumeSub_ok : CtxOk assumeSub ctxAssumeSub where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [assumeSub] at hd; subst hd; decide
+    | 1, _, hd => simp [assumeSub] at hd; subst hd; decide
+    | 2, _, hd => simp [assumeSub] at hd; subst hd; decide
+    | _ + 3, hi, _ => simp [assumeSub] at hi
+  ret := by
+    intro d hd; simp [assumeSub] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
 
 def assumeSubArgs (x : Nat) (b : Bool) : List Value :=
   [.scalar ⟨x, 4⟩, .scalar ⟨if b then 1 else 0, 1⟩]
@@ -10254,6 +10391,28 @@ theorem assumeSub20_anneal_ret :
     MirNoUBTree (mirCallTreeWithCallees assumeSub (assumeSubArgs 20 true) []) :=
   runsToScalar_sound (fuel := 10) (by decide)
 
+/-- End-to-end correspondence transfer (`mirCallWithCallees_ret`) for
+`assume_sub(20, true)` across two `Assume` block splits in one MIR basic block. -/
+theorem assumeSub20_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n (assumeSubMInit 20 true) = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 19 } ∧
+      m'.threads = [thread1 ctxAssumeSub
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨⟨tr, mem, hanneal⟩, _⟩ := assumeSub20_anneal_ret
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret assumeSub_inFragment assumeSub_translate
+      assumeSub_translateInProg ctxAssumeSub ctxAssumeSub_ok
+      (assumeSubArgs 20 true) (by decide) (assumeSubMInit 20 true)
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hanneal
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [assumeSub] at hd; subst hd
+  simp [retPtr, ctxAssumeSub, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxAssumeSub, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
 /-- MiniRust runs the translation of `assume_sub(20, true)` from `start` in
 `5` steps (the init block's `Goto`, the first `Terminator::Intrinsic`, the
 `Sub` assignment in `bbName 2`, the second `Terminator::Intrinsic`, and
@@ -10277,13 +10436,317 @@ theorem assumeSub20_split_point :
       some [some (bbName 2, 0)] := by
   refine ⟨by decide +kernel, by decide +kernel⟩
 
-/-- With `b = false`, both semantics raise UB at the first `Assume`: Anneal's
-first step is `MirStepNode.fail .ub`, and MiniRust's second step (the first
-`Terminator::Intrinsic`) throws the `Assume` UB of `eval_intrinsic`. -/
+/-- With `b = false`, Anneal's `assume_sub(20, false)` faults (`FaultNow`), and
+`mirCallWithCallees_ub_rel` transfers that fault to MiniRust strictly before any
+root return. -/
+theorem assumeSubFalse_anneal_ub :
+    ∃ tr u, Reaches (mirCallTreeWithCallees assumeSub (assumeSubArgs 20 false) []) tr u ∧
+      FaultNow u :=
+  faultsA_sound assumeSub 5 _ (by decide)
+
+theorem assumeSubFalse_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n (assumeSubMInit 20 false) = .ok mLast ∧
+      MultiStateRel assumeSub [] assumeSubProg ctxAssumeSub sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) (assumeSubMInit 20 false) = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k (assumeSubMInit 20 false) = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := assumeSubFalse_anneal_ub
+  obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
+    mirCallWithCallees_ub_rel assumeSub_inFragment assumeSub_translate
+      assumeSub_translateInProg ctxAssumeSub ctxAssumeSub_ok
+      (assumeSubArgs 20 false) (by decide) (assumeSubMInit 20 false)
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+  exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
+
+/-- Direct confirmation on `b = false`: Anneal's first step is `MirStepNode.fail .ub`,
+and MiniRust's second step (the first `Terminator::Intrinsic`) throws the
+`Assume` UB of `eval_intrinsic`. -/
 theorem assumeSubFalse_ub :
     stepMirFn assumeSub (assumeSubS0 20 false) = MirStepNode.fail .ub ∧
     Interp.steps 2 (assumeSubMInit 20 false) =
       .error (.ub "`Assume` intrinsic called on condition that is violated") :=
   ⟨rfl, eq_error_ub_of_ubMsg? (by decide +kernel)⟩
+
+/-! ### Multi-frame `Assume` + tuple projection + `Call` (`assumeTupleCallCaller`)
+and `Assume` dataflow soundness / necessity witnesses -/
+
+/-- Multi-function caller exercising `Assume(move _3)` inside a split block
+before a `TerminatorKind.call` to `idU32Callee`, followed by a second split
+block on return (`bb1` containing `Assume(const true)`):
+```rust
+fn assume_tuple_call(x: u32) -> u32 {
+    let pair = AddWithOverflow(x, 5);   // bb0: StorageLive(_2); StorageLive(_3); _2 = AddWithOverflow(_1, 5)
+    let ok = !pair.1;                   //      _3 = Not(copy (_2.1))
+    unsafe { assume(move ok) };         //      assume(move _3)          [splits bb0 -> bbName 3]
+    StorageDead(_3);                    //      StorageDead(_3)
+    let r = id_u32_callee(pair.0);      //      _0 = Call(id_u32_callee, [copy (_2.0)]) -> bb1
+    unsafe { assume(true) };            // bb1: assume(const true)       [splits bb1 -> bbName 4]
+    StorageDead(_2);                    //      StorageDead(_2)
+    r                                   //      return
+}
+```
+-/
+def assumeTupleCallCaller : CapturedMir where
+  defPath := "witness::assume_tuple_call"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32BoolTupleDecl, boolDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 2) (.binaryOp .addWithOverflow (.copy (local_ 1)) (constU32 5))),
+        mkStmt (.assign (local_ 3) (.unaryOp .not (.copy (field1 2)))),
+        mkStmt (.intrinsic (.assume (.move (local_ 3)))),
+        mkStmt (.storageDead 3)],
+      terminator := mkTerm (.call (fnDefOp "witness::id_u32_callee")
+        [.copy (field0U32 2)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.intrinsic (.assume (.constant { ty := boolDecl.ty, val := .scalar (.int ⟨1, 1⟩) }))),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem assumeTupleCall_inFragment :
+    progInFragment assumeTupleCallCaller [idU32Callee] = true := by decide
+
+def assumeTupleCallProg : Gen.Program :=
+  (translateProg assumeTupleCallCaller [idU32Callee]).getD emptyProg
+
+def assumeTupleCallFn : Gen.Function :=
+  (translateFnInProg (fnNameMap assumeTupleCallCaller [idU32Callee])
+    assumeTupleCallCaller).getD callerFn
+
+theorem assumeTupleCall_translate :
+    translateProg assumeTupleCallCaller [idU32Callee] = some assumeTupleCallProg := rfl
+
+theorem assumeTupleCall_translateInProg :
+    translateFnInProg (fnNameMap assumeTupleCallCaller [idU32Callee]) assumeTupleCallCaller =
+      some assumeTupleCallFn := rfl
+
+theorem ctxAssumeTupleCall_ok : CtxOk assumeTupleCallCaller ctxCallSpin where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [assumeTupleCallCaller] at hd; subst hd; decide
+    | 1, _, hd => simp [assumeTupleCallCaller] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [assumeTupleCallCaller] at hi
+  ret := by
+    intro d hd; simp [assumeTupleCallCaller] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def assumeTupleCallMInit (x : Nat) : Mach :=
+  multiMachineWithCtx ctxCallSpin assumeTupleCallProg 2 assumeTupleCallCaller assumeTupleCallFn
+    (initMachineStateWithCallees assumeTupleCallCaller [.scalar ⟨x, 4⟩] [idU32Callee]).frame.locals
+    assumeTupleCallFn.start
+
+theorem assumeTupleCall10_anneal_ret :
+    (∃ tr mem, ReachesRet (mirCallTreeWithCallees assumeTupleCallCaller [.scalar ⟨10, 4⟩] [idU32Callee]) tr
+      (.normal (.scalar ⟨15, 4⟩, mem))) ∧
+    MirNoUBTree (mirCallTreeWithCallees assumeTupleCallCaller [.scalar ⟨10, 4⟩] [idU32Callee]) :=
+  runsToScalar_sound (fuel := 15) (by decide)
+
+theorem assumeTupleCall10_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n (assumeTupleCallMInit 10) = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 15 } ∧
+      m'.threads = [thread1 ctxCallSpin
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨⟨tr, mem, hanneal⟩, _⟩ := assumeTupleCall10_anneal_ret
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret assumeTupleCall_inFragment assumeTupleCall_translate
+      assumeTupleCall_translateInProg ctxCallSpin ctxAssumeTupleCall_ok
+      [.scalar ⟨10, 4⟩] (by decide) (assumeTupleCallMInit 10)
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hanneal
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [assumeTupleCallCaller] at hd; subst hd
+  simp [retPtr, ctxCallSpin, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxCallSpin, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem assumeTupleCallOv_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees assumeTupleCallCaller [.scalar ⟨4294967295, 4⟩] [idU32Callee]) tr u ∧
+      FaultNow u :=
+  faultsA_sound assumeTupleCallCaller 10 _ (by decide)
+
+theorem assumeTupleCallOv_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n (assumeTupleCallMInit 4294967295) = .ok mLast ∧
+      MultiStateRel assumeTupleCallCaller [idU32Callee] assumeTupleCallProg ctxCallSpin sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) (assumeTupleCallMInit 4294967295) = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k (assumeTupleCallMInit 4294967295) = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := assumeTupleCallOv_anneal_ub
+  obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
+    mirCallWithCallees_ub_rel assumeTupleCall_inFragment assumeTupleCall_translate
+      assumeTupleCall_translateInProg ctxCallSpin ctxAssumeTupleCall_ok
+      [.scalar ⟨4294967295, 4⟩] (by decide) (assumeTupleCallMInit 4294967295)
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+  exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
+
+/-- `Assume` reading a dead local (`StorageLive(_2); StorageDead(_2); Assume(copy _2)`):
+`progInFragment` admits the body, and both Anneal and MiniRust raise UB on the
+dead-local load (`mirCallWithCallees_ub_rel`). -/
+def assumeDeadLocal : CapturedMir where
+  defPath := "witness::assume_dead_local"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, boolDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.storageDead 2),
+        mkStmt (.intrinsic (.assume (.copy (local_ 2)))),
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem assumeDeadLocal_inFragment : progInFragment assumeDeadLocal [] = true := by decide
+
+def assumeDeadLocalProg : Gen.Program := (translateProg assumeDeadLocal []).getD emptyProg
+def assumeDeadLocalFn : Gen.Function :=
+  (translateFnInProg (fnNameMap assumeDeadLocal []) assumeDeadLocal).getD callerFn
+theorem assumeDeadLocal_translate : translateProg assumeDeadLocal [] = some assumeDeadLocalProg := rfl
+theorem assumeDeadLocal_translateInProg :
+    translateFnInProg (fnNameMap assumeDeadLocal []) assumeDeadLocal = some assumeDeadLocalFn := rfl
+
+theorem ctxAssumeDeadLocal_ok : CtxOk assumeDeadLocal ctxCallSpin where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [assumeDeadLocal] at hd; subst hd; decide
+    | 1, _, hd => simp [assumeDeadLocal] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [assumeDeadLocal] at hi
+  ret := by
+    intro d hd; simp [assumeDeadLocal] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def assumeDeadLocalMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin assumeDeadLocalProg 1 assumeDeadLocal assumeDeadLocalFn
+    (initMachineStateWithCallees assumeDeadLocal [.scalar ⟨7, 4⟩] []).frame.locals
+    assumeDeadLocalFn.start
+
+theorem assumeDeadLocal_anneal_ub :
+    ∃ tr u, Reaches (mirCallTreeWithCallees assumeDeadLocal [.scalar ⟨7, 4⟩] []) tr u ∧
+      FaultNow u :=
+  faultsA_sound assumeDeadLocal 6 _ (by decide)
+
+theorem assumeDeadLocal_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n assumeDeadLocalMInit = .ok mLast ∧
+      MultiStateRel assumeDeadLocal [] assumeDeadLocalProg ctxCallSpin sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) assumeDeadLocalMInit = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k assumeDeadLocalMInit = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := assumeDeadLocal_anneal_ub
+  obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
+    mirCallWithCallees_ub_rel assumeDeadLocal_inFragment assumeDeadLocal_translate
+      assumeDeadLocal_translateInProg ctxCallSpin ctxAssumeDeadLocal_ok
+      [.scalar ⟨7, 4⟩] (by decide) assumeDeadLocalMInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+  exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
+
+/-- Necessity of `stmtMoved` on `Assume` (`Assume(move _2); _0 = copy _1; _3 = copy _2`):
+Anneal's `evalOperand` moves out of `_2` on `Assume(move _2)`, so reading `_2`
+afterwards faults with UB, whereas MiniRust's `ValueExpr::Load` in
+`Terminator::Intrinsic` leaves `_2`'s bytes initialized and returns `7u32`.
+`movesOk` (and `progInFragment`) must therefore record `moveOut mo op` on
+`StatementKind.intrinsic (.assume op)`. -/
+def assumeMoveReuse : CapturedMir where
+  defPath := "witness::assume_move_reuse"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, u32Decl, boolDecl, boolDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 3),
+        mkStmt (.intrinsic (.assume (.move (local_ 2)))),
+        mkStmt (.assign (local_ 3) (.use (.copy (local_ 2)))),
+        mkStmt (.storageDead 3),
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem assumeMoveReuse_rejected :
+    movesOk assumeMoveReuse = false ∧ progInFragment assumeMoveReuse [] = false :=
+  ⟨by decide, by decide⟩
+
+def assumeMoveReuseProg : Gen.Program := (translateProg assumeMoveReuse []).getD emptyProg
+def assumeMoveReuseFn : Gen.Function :=
+  (translateFnInProg (fnNameMap assumeMoveReuse []) assumeMoveReuse).getD callerFn
+def assumeMoveReuseMInit : Mach :=
+  multiMachineWithCtx ctxAssumeSub assumeMoveReuseProg 1 assumeMoveReuse assumeMoveReuseFn
+    (initMachineStateWithCallees assumeMoveReuse (assumeSubArgs 7 true) []).frame.locals
+    assumeMoveReuseFn.start
+
+theorem assumeMoveReuse_diverges :
+    (∃ tr u, Reaches (mirCallTreeWithCallees assumeMoveReuse (assumeSubArgs 7 true) []) tr u ∧
+      FaultNow u) ∧
+    (Interp.steps 7 assumeMoveReuseMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 7 }, [1]) :=
+  ⟨faultsA_sound assumeMoveReuse 6 _ (by decide), by decide +kernel⟩
+
+/-- Necessity of `stmtReadsOk` on `Assume` (`_3 = move _2; Assume(copy _2)`):
+moving `_2` in a prior statement leaves stale `true` bytes in MiniRust's local
+allocation, so MiniRust passes `Terminator::Intrinsic(.Assume)` and returns
+`7u32` while Anneal faults with UB on `Assume(copy _2)`. `movesOk` (and
+`progInFragment`) must therefore check `!mo.contains b` on `Assume`'s operand. -/
+def assumeAfterMove : CapturedMir where
+  defPath := "witness::assume_after_move"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, u32Decl, boolDecl, boolDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 3) (.use (.move (local_ 2)))),
+        mkStmt (.intrinsic (.assume (.copy (local_ 2)))),
+        mkStmt (.storageDead 3),
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem assumeAfterMove_rejected :
+    movesOk assumeAfterMove = false ∧ progInFragment assumeAfterMove [] = false :=
+  ⟨by decide, by decide⟩
+
+def assumeAfterMoveProg : Gen.Program := (translateProg assumeAfterMove []).getD emptyProg
+def assumeAfterMoveFn : Gen.Function :=
+  (translateFnInProg (fnNameMap assumeAfterMove []) assumeAfterMove).getD callerFn
+def assumeAfterMoveMInit : Mach :=
+  multiMachineWithCtx ctxAssumeSub assumeAfterMoveProg 1 assumeAfterMove assumeAfterMoveFn
+    (initMachineStateWithCallees assumeAfterMove (assumeSubArgs 7 true) []).frame.locals
+    assumeAfterMoveFn.start
+
+theorem assumeAfterMove_diverges :
+    (∃ tr u, Reaches (mirCallTreeWithCallees assumeAfterMove (assumeSubArgs 7 true) []) tr u ∧
+      FaultNow u) ∧
+    (Interp.steps 7 assumeAfterMoveMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 7 }, [1]) :=
+  ⟨faultsA_sound assumeAfterMove 6 _ (by decide), by decide +kernel⟩
 
 end MiniRustSpec.Correspondence.Witness

@@ -1120,4 +1120,174 @@ theorem translateFnInProg_eq_translateFn_of_no_calls (fnMap : FnMap)
       | none => rfl
       | some B => simp
 
+theorem progStatementOk_notAssume {decls : List LocalDecl} {s : MirAst.Statement}
+    (h : progStatementOk decls s = true) (hna : isAssume s = false) :
+    statementOk decls s = true := by
+  obtain ⟨kind, span⟩ := s
+  cases kind with
+  | intrinsic intr =>
+    cases intr with
+    | assume _ => simp [isAssume] at hna
+    | copyNonOverlapping _ _ _ => simpa [progStatementOk] using h
+  | _ => simpa [progStatementOk] using h
+
+theorem progStatementOk_assume {decls : List LocalDecl} {s : MirAst.Statement}
+    {op : Operand} (h : progStatementOk decls s = true)
+    (hs : s.kind = .intrinsic (.assume op)) :
+    operandOkB decls (copyOp op) = true := by
+  obtain ⟨kind, span⟩ := s
+  simp only at hs
+  subst hs
+  simpa [progStatementOk] using h
+
+private theorem mapM_get_spec {α β : Type} (f : α → Option β) :
+    ∀ (xs : List α) (ys : List β), xs.mapM f = some ys →
+      ys.length = xs.length ∧
+      ∀ (j : Nat) x, xs[j]? = some x → ∃ y, ys[j]? = some y ∧ f x = some y
+  | [], ys, h => by
+    simp only [List.mapM_nil, Option.pure_def, Option.some.injEq] at h
+    subst h
+    exact ⟨rfl, fun j _ hx => by simp at hx⟩
+  | x0 :: xs, ys, h => by
+    simp only [List.mapM_cons, Option.bind_eq_bind] at h
+    cases hy0 : f x0 with
+    | none => simp [hy0] at h
+    | some y0 =>
+      cases hys : xs.mapM f with
+      | none => simp [hy0, hys] at h
+      | some ys' =>
+        simp [hy0, hys] at h
+        subst h
+        obtain ⟨hl, hg⟩ := mapM_get_spec f xs ys' hys
+        refine ⟨by simp [hl], fun j x hx => ?_⟩
+        cases j with
+        | zero => simp at hx; subst hx; exact ⟨y0, rfl, hy0⟩
+        | succ j => simp at hx ⊢; exact hg j x hx
+
+theorem SegChain.pcZero {look : Gen.BbName → Option Gen.BasicBlock}
+    {decls : List LocalDecl} {term : Gen.Terminator} {blk : Nat}
+    {ss : List MirAst.Statement} (h : SegChain look decls term (bbName blk) ss) :
+    SegPc look decls term blk ss 0 blk 0 := by
+  generalize hn : bbName blk = nm at h
+  cases h with
+  | last hlook htr hna =>
+    subst hn
+    exact .hereLast hlook htr hna (Nat.zero_le _)
+  | split hlook htr hna hs hop hrest =>
+    subst hn
+    exact .hereSplit hlook htr hna hs hop hrest (Nat.zero_le _)
+
+theorem SegPc.atStmt_notAssume {look : Gen.BbName → Option Gen.BasicBlock}
+    {decls : List LocalDecl} {term : Gen.Terminator}
+    {entrySeg : Nat} {ss : List MirAst.Statement} {idx curSeg segStmt : Nat}
+    {st : MirAst.Statement}
+    (h : SegPc look decls term entrySeg ss idx curSeg segStmt)
+    (hst : ss[idx]? = some st) (hnaSt : isAssume st = false) :
+    ∃ tb st', look (bbName curSeg) = some tb ∧
+      segStmt < tb.statements.length ∧
+      tb.statements[segStmt]? = some st' ∧
+      translateStatement decls st = some st' ∧
+      SegPc look decls term entrySeg ss (idx + 1) curSeg (segStmt + 1) := by
+  induction h with
+  | hereLast hlook htr hna _ =>
+    obtain ⟨_, hspec⟩ := mapM_get_spec _ _ _ htr
+    obtain ⟨st', hst'get, hst'tr⟩ := hspec _ st hst
+    have hlt := (List.getElem?_eq_some_iff.mp hst'get).1
+    have hltSs := (List.getElem?_eq_some_iff.mp hst).1
+    exact ⟨⟨_, term, .Regular⟩, st', hlook, hlt, hst'get, hst'tr,
+      .hereLast hlook htr hna (by omega)⟩
+  | @hereSplit curSeg nextSeg segStmt pre post s op op' stmts
+      hlook htr hna hs hop hrest hle =>
+    rcases Nat.lt_or_eq_of_le hle with hltPre | rfl
+    · rw [List.getElem?_append_left hltPre] at hst
+      obtain ⟨_, hspec⟩ := mapM_get_spec _ _ _ htr
+      obtain ⟨st', hst'get, hst'tr⟩ := hspec _ st hst
+      exact ⟨⟨stmts, .Intrinsic .Assume [op'] unitPlace (some (bbName nextSeg)), .Regular⟩,
+        st', hlook, (List.getElem?_eq_some_iff.mp hst'get).1, hst'get, hst'tr,
+        .hereSplit hlook htr hna hs hop hrest (by omega)⟩
+    · rw [List.getElem?_append_right (Nat.le_refl _), Nat.sub_self,
+        List.getElem?_cons_zero, Option.some.injEq] at hst
+      subst hst
+      obtain ⟨k, sp⟩ := s
+      simp only at hs
+      subst hs
+      simp [isAssume] at hnaSt
+  | @stepSplit entrySeg nextSeg curSeg segStmt restIdx pre post s op op' stmts
+      hlook htr hna hs hop _ ih =>
+    rw [List.getElem?_append_right (by omega),
+      show pre.length + 1 + restIdx - pre.length = restIdx + 1 by omega,
+      List.getElem?_cons_succ] at hst
+    obtain ⟨tb, st', htb, hlt, hget, htrSt, hpc'⟩ := ih hst
+    refine ⟨tb, st', htb, hlt, hget, htrSt, ?_⟩
+    rw [show pre.length + 1 + restIdx + 1 = pre.length + 1 + (restIdx + 1) by omega]
+    exact .stepSplit hlook htr hna hs hop hpc'
+
+theorem SegPc.atStmt_assume {look : Gen.BbName → Option Gen.BasicBlock}
+    {decls : List LocalDecl} {term : Gen.Terminator}
+    {entrySeg : Nat} {ss : List MirAst.Statement} {idx curSeg segStmt : Nat}
+    {st : MirAst.Statement} {op : Operand}
+    (h : SegPc look decls term entrySeg ss idx curSeg segStmt)
+    (hst : ss[idx]? = some st) (hk : st.kind = .intrinsic (.assume op)) :
+    ∃ stmts op' nextSeg,
+      look (bbName curSeg) =
+        some ⟨stmts, .Intrinsic .Assume [op'] unitPlace (some (bbName nextSeg)), .Regular⟩ ∧
+      segStmt = stmts.length ∧
+      translateOperand op = some op' ∧
+      SegPc look decls term entrySeg ss (idx + 1) nextSeg 0 := by
+  have hAss : isAssume st = true := by
+    obtain ⟨k, sp⟩ := st
+    simp only at hk
+    subst hk
+    rfl
+  induction h with
+  | hereLast _ _ hna _ =>
+    have hfalse := hna st (List.mem_of_getElem? hst)
+    rw [hAss] at hfalse
+    simp at hfalse
+  | @hereSplit curSeg nextSeg segStmt pre post s opS op' stmts
+      hlook htr hna hs hop hrest hle =>
+    rcases Nat.lt_or_eq_of_le hle with hltPre | rfl
+    · rw [List.getElem?_append_left hltPre] at hst
+      have hfalse := hna st (List.mem_of_getElem? hst)
+      rw [hAss] at hfalse
+      simp at hfalse
+    · rw [List.getElem?_append_right (Nat.le_refl _), Nat.sub_self,
+        List.getElem?_cons_zero, Option.some.injEq] at hst
+      subst hst
+      have hopEq : opS = op := by
+        cases hs.symm.trans hk
+        rfl
+      subst hopEq
+      obtain ⟨hlen, _⟩ := mapM_get_spec _ _ _ htr
+      refine ⟨stmts, op', nextSeg, hlook, hlen.symm, hop, ?_⟩
+      rw [show pre.length + 1 = pre.length + 1 + 0 by omega]
+      exact .stepSplit hlook htr hna hs hop hrest.pcZero
+  | @stepSplit entrySeg nextSeg curSeg segStmt restIdx pre post s opS op' stmts
+      hlook htr hna hs hop _ ih =>
+    rw [List.getElem?_append_right (by omega),
+      show pre.length + 1 + restIdx - pre.length = restIdx + 1 by omega,
+      List.getElem?_cons_succ] at hst
+    obtain ⟨stmts', op'', nextSeg', hlk', hlen', hop'', hpc'⟩ := ih hst
+    refine ⟨stmts', op'', nextSeg', hlk', hlen', hop'', ?_⟩
+    rw [show pre.length + 1 + restIdx + 1 = pre.length + 1 + (restIdx + 1) by omega]
+    exact .stepSplit hlook htr hna hs hop hpc'
+
+theorem SegPc.atEnd {look : Gen.BbName → Option Gen.BasicBlock}
+    {decls : List LocalDecl} {term : Gen.Terminator}
+    {entrySeg : Nat} {ss : List MirAst.Statement} {idx curSeg segStmt : Nat}
+    (h : SegPc look decls term entrySeg ss idx curSeg segStmt)
+    (hend : idx = ss.length) :
+    ∃ stmts, look (bbName curSeg) = some ⟨stmts, term, .Regular⟩ ∧
+      segStmt = stmts.length := by
+  induction h with
+  | hereLast hlook htr _ _ =>
+    obtain ⟨hlen, _⟩ := mapM_get_spec _ _ _ htr
+    exact ⟨_, hlook, hend.trans hlen.symm⟩
+  | hereSplit _ _ _ _ _ _ hle =>
+    simp only [List.length_append, List.length_cons] at hend
+    omega
+  | stepSplit _ _ _ _ _ _ ih =>
+    simp only [List.length_append, List.length_cons] at hend
+    exact ih (by omega)
+
 end MiniRustSpec.Correspondence

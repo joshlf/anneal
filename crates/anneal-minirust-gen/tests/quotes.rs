@@ -2237,8 +2237,83 @@ fn intrinsic_and_assume_quotations_are_pinned() {
             "rs::NonDivergingIntrinsic::CopyNonOverlapping(_) => StatementResult::Statement(",
             "MiniRustSpec/Correspondence/Translate.lean",
         ),
+        (
+            intr,
+            "fn load_raw_data(&mut self, ptr : Pointer<<M as Memory>::Provenance>, ptr_ty : PtrType) -> Result<List<u8>> { \
+                 let PtrType::Ref { pointee, .. } = ptr_ty else { \
+                     throw_ub!(\"invalid argument to `RawEq` intrinsic: not a reference\"); \
+                 }; .. \
+                 let Some(data) = bytes.try_map(|byte| byte.data()) else { \
+                     throw_ub!(\"invalid argument to `RawEq` intrinsic: byte is uninitialized\"); \
+                 };",
+            "let PtrType::Raw { .. } = ptr_ty else { \
+                 throw_ub!(\"invalid argument to `RawEq` intrinsic: not a reference\");",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "IntrinsicOp::RawEq: IntrinsicOp, .. \
+             if l_ty != r_ty { \
+                 throw_ub!(\"invalid arguments to `RawEq` intrinsic: types of arguments are not identical\"); \
+             } .. \
+             let left_data = self.load_raw_data(left, l_ty)?; \
+             let right_data = self.load_raw_data(right, l_ty)?; \
+             ret(Value::Bool(left_data == right_data))",
+            "ret(Value::Bool(left_data != right_data))",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            bb,
+            "struct TerminatorResult { \
+                 stmts: List<Statement>, \
+                 terminator: Terminator, \
+             }",
+            "struct TerminatorResult { terminator: Terminator }",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::sym::raw_eq => \
+                 return TerminatorResult { \
+                     stmts: List::new(), \
+                     terminator: Terminator::Intrinsic { \
+                         intrinsic: IntrinsicOp::RawEq,",
+            "rs::sym::raw_eq => return TerminatorResult { stmts: List::new(), terminator: Terminator::Goto(",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::sym::ctpop => { .. \
+                 let val = build::count_ones(v); \
+                 let stmt = Statement::Assign { destination, source: val }; \
+                 let terminator = Terminator::Goto(self.bb_name_map[&target.unwrap()]); .. \
+             } \
+             rs::sym::exact_div => { .. \
+                 let val = build::div_exact(l, r); \
+                 let stmt = Statement::Assign { destination, source: val };",
+            "rs::sym::ctpop => { let val = build::div_exact(v, v);",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::sym::cold_path => { .. \
+                 let terminator = Terminator::Goto(self.bb_name_map[&target.unwrap()]); \
+                 return TerminatorResult { stmts: list![], terminator }; \
+             }",
+            "rs::sym::cold_path => { let terminator = build::abort();",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::sym::abort => { \
+                 let terminator = build::abort(); \
+                 TerminatorResult { stmts: list![], terminator } \
+             }",
+            "rs::sym::abort => { let terminator = Terminator::Unreachable;",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
     ];
-    assert_eq!(cases.len(), 18, "expected 18 pinned MR-4.2 quotations");
+    assert_eq!(cases.len(), 25, "expected 25 pinned MR-4.2 quotations");
 
     let mr42_files = [intr, terms, exprs, prelude, basic, intptr, bb];
     let lean_root = minirust_dir().join("lean");

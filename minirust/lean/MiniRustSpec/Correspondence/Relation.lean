@@ -581,7 +581,7 @@ inductive CallStackRel (entry : CapturedMir) (callees : List CapturedMir)
       {callerFn : Gen.Function} {callerCtx curCtx : Ctx}
       {callerCandBound callerFuel : Nat}
       {callerView : List LocalSlot} {callerLm : Map Gen.LocalName Ptr}
-      {calleeRetDecl : LocalDecl} {callerBudget curBudget : Nat}
+      {calleeRetDecl : LocalDecl} {callerBudget curBudget callerSeg callerSegStmt : Nat}
       (hRest : CallStackRel entry callees fnMap rootCtx restStack preFrames
         callerBody callerCtx callerCandBound (callerFuel + 1))
       (hCallerEq : savedCaller.callerBody = callerBody)
@@ -593,8 +593,7 @@ inductive CallStackRel (entry : CapturedMir) (callees : List CapturedMir)
       (hPayloads : curCtx.payloads = rootCtx.payloads)
       (hNextBlk : curCtx.nextBlock = bbName savedCaller.returnTarget)
       (hCallerFrame : curCtx.caller =
-        calleeFrameL callerFn callerCtx callerLm
-          savedCaller.frame.blockIdx savedCaller.frame.stmtIdx)
+        calleeFrameL callerFn callerCtx callerLm callerSeg callerSegStmt)
       (hCalleeRetDecl : curBody.localDecls[0]? = some calleeRetDecl)
       (hDest : CallerDestRel callerBody callerCtx savedCaller.frame.locals callerView
         callerLm calleeRetDecl curCtx.base curCtx.retPtr savedCaller.destination)
@@ -624,7 +623,7 @@ structure MultiStateRelAt (entry : CapturedMir) (callees : List CapturedMir)
     (prog : Gen.Program) (rootCtx : Ctx) (s : MachineState)
     (view : List LocalSlot) (m : Mach) : Prop where
   stack : ∃ (callerFrames : List Frame) (curCtx : Ctx) (curFn : Gen.Function)
-      (curLm : Map Gen.LocalName Ptr) (candBound remFuel curBudget : Nat),
+      (curLm : Map Gen.LocalName Ptr) (candBound remFuel curBudget curSeg segStmt : Nat),
     let curBody := s.memory.activeCallee.getD entry
     let fnMap := fnNameMap entry callees
     curBody ∈ entry :: callees ∧
@@ -637,7 +636,13 @@ structure MultiStateRelAt (entry : CapturedMir) (callees : List CapturedMir)
     candBound + curBudget < 2 ^ 31 ∧
     m.threads =
       [thread1 rootCtx
-        (callerFrames ++ [calleeFrameL curFn curCtx curLm s.frame.blockIdx s.frame.stmtIdx])] ∧
+        (callerFrames ++ [calleeFrameL curFn curCtx curLm curSeg segStmt])] ∧
+    (∀ bb, curBody.basicBlocks[s.frame.blockIdx]? = some bb →
+      ∃ tbTerm nc1 nc2 ex1,
+        translateTerminatorInProg fnMap curBody.localDecls nc1 bb.terminator =
+          some (tbTerm, nc2, ex1) ∧
+        SegPc (mapGet curFn.blocks) curBody.localDecls tbTerm
+          s.frame.blockIdx bb.statements s.frame.stmtIdx curSeg segStmt) ∧
     LocalsOk curBody curCtx view curLm m.mem.memory.allocations
   env : ProgEnvOk prog (fnNameMap entry callees) m
   active : m.active_thread = 0

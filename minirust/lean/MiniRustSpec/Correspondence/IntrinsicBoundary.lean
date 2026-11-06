@@ -9,21 +9,16 @@ those terms.
 -/
 
 import MiniRustSpec.Correspondence.IntrinsicFallback
+import Trusted.VerificationResult
 
 /-!
-# Boundary witnesses for intrinsics outside the correspondence
+# Boundary witnesses and external-handler correspondence for intrinsics
 
 `IntrinsicFallback` covers intrinsic calls whose fallback bodies are passed in
-`callees`. This module records, by kernel computation, what happens to the
-intrinsic-related MIR constructs that the fragment does *not* cover. For each
-one it compares Anneal's frozen semantics
-(`trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/*.lean`, cited by file
-and line) with MiniRust's `minimize` translator (`tooling/minimize/src/` in
-the MiniRust sources vendored under
-`minirust/vendor/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/`, paraphrased and
-cited by file and line), proves Anneal's behavior on a concrete state, and
-proves that the translation or fragment check rejects the construct, so no
-correspondence theorem applies to it:
+`callees`. This module records, by kernel computation and symbolic proof, what
+happens to the intrinsic-related MIR constructs outside `progInFragment` (note
+that `StatementKind::Intrinsic(Assume)` *is* now inside `progInFragment`; see
+`Witness.lean`):
 
 1. `Rvalue::NullaryOp(UbChecks)`: Anneal fails closed (`unsupported`), while
    `minimize` produces a `bool` constant fixed by the compilation session.
@@ -36,10 +31,22 @@ correspondence theorem applies to it:
    pointee size and emits an in-bounds byte offset. `arith_offset` remains an
    external call in Anneal.
 4. Calls to `core::intrinsics::*` without a body in `callees` become external
-   call requests that carry only `defPath`, `args`, and `memory`, so
-   `exact_div::<i32>` and `exact_div::<u32>` on the same bits issue identical
-   requests although MiniRust's `DivExact` returns `-2` for one and raises UB
-   for the other. The diverging `abort` call is `unsupported` instead.
+   `MirCallReq` requests carrying only `defPath`, `args`, and `memory`. When
+   interpreted via `mirHandledTree` (`Trusted.VerificationResult`), an
+   `ExternalCallHandler` can return values or raise UB (`ITree.fail .ub` in
+   `MirClosedEffect`):
+   * `cold_path` (`coldPathHandler`) corresponds to `minimize`'s no-op `Goto`.
+   * `ctpop` (`ctpopHandler`) corresponds uniformly across all signed and
+     unsigned `IntType`s because `evalCountOnes (intFromBits bits it) it`
+     depends only on the low `8 * it.size.bytes` bits (`evalCountOnes_intFromBits`,
+     `evalCountOnes_signedness_indep`).
+   * `exact_div::<T>` erases `Signedness` in `MirCallReq` (`bdExactDiv_same_request`),
+     so a single untyped handler cannot simultaneously match `exact_div::<i32>`
+     and `exact_div::<u32>`, whereas the monomorphized handler
+     `exactDivHandler it` matches MiniRust's `IntBinOp::DivExact` on both valid
+     quotients and all three UB conditions (`/ 0`, signed `MIN / -1`, and
+     `left % right != 0`).
+   * Diverging `abort` calls hit `MirStepNode.unsupported` before `MirCallE`.
 5. `core::hint::unreachable_unchecked()`: Anneal raises UB, like MiniRust's
    `Terminator::Unreachable`; the fragment rejects the call form but covers
    MIR's own `TerminatorKind::Unreachable`.
@@ -49,6 +56,9 @@ namespace MiniRustSpec.Correspondence
 
 open Trusted.Effect
 open Trusted.ITree
+open Trusted.VerificationResult (MirClosedEffect ExternalCallHandler
+  handleMirExternalCalls mirHandledTree mirStatefulTree
+  initMachineStateWithMemory)
 open Trusted.Rustc.V2026_06_01
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
@@ -317,11 +327,14 @@ theorem bdArithOffset_extCall :
 
 /-! ## 4. Intrinsic calls without a body in `callees` -/
 
-/-- An external request records exactly a `DefPath`, the argument values, and
-the memory (`State.lean:314-320`); in particular it records no generic
-arguments and no argument types. The environment answers with a
-`MirCallAns` (`State.lean:335-341`), whose constructors are `returned`,
-`panicked`, and `aborted`; none of them reports UB inside the callee. -/
+/-- An external request records a `DefPath`, the untyped argument `Value`s, and
+the `Memory` (`State.lean:314-320`); in particular it erases generic type
+arguments `T` and integer `Signedness` (`ScalarInt` carries only `bits` and
+`sizeBytes`). While `MirCallAns` (`State.lean:335-341`) has constructors
+`returned`, `panicked`, and `aborted`, Anneal interprets `MirCallE` via an
+`ExternalCallHandler : MirCallReq → ITree MirClosedEffect MirCallAns`
+(`Trusted/VerificationResult.lean:225-240`), which *can* directly raise UB via
+`ITree.fail .ub` in `MirClosedEffect`. -/
 theorem bdMirCallReq_fields (r : MirCallReq) :
     r = { defPath := r.defPath, args := r.args, memory := r.memory } := rfl
 
@@ -476,6 +489,333 @@ finds no MiniRust type). -/
 theorem bdExtCallers_rejected :
     bdExtCallers.all (fun b => !progInFragment b [] && (translateProg b []).isNone) = true := by
   decide
+
+/-! ### 4b. `ExternalCallHandler` correspondence for `cold_path`, `ctpop`, and `exact_div` -/
+
+/-- Population count of the low `n` bits of `u : Nat`. -/
+def popcountBits : Nat → Nat → Nat
+  | 0, _ => 0
+  | n + 1, u => u % 2 + popcountBits n (u / 2)
+
+private theorem intBitRec_and_zero (fuel : Nat) (a : Int) :
+    intBitRec (fun _ => 0) (fun b => b) (fun x y => if x = 1 ∧ y = 1 then 1 else 0) fuel a 0 = 0 := by
+  induction fuel generalizing a with
+  | zero =>
+    simp [intBitRec]
+  | succ n ih =>
+    simp only [intBitRec]
+    split
+    · rfl
+    · split
+      · rfl
+      · have h0 : (0 : Int) / 2 = 0 := rfl
+        have hm : (0 : Int) % 2 = 0 := rfl
+        rw [h0, hm, ih]
+        omega
+
+/-- Two's-complement `a & 1` on `libspecr::Int` equals Euclidean residue `a % 2`
+for every integer `a` (positive, zero, or negative). -/
+private theorem bdIntBitAnd_one (a : Int) : intBitAnd a 1 = a % 2 := by
+  unfold intBitAnd
+  by_cases ha0 : a = 0
+  · subst ha0; rfl
+  · by_cases ha1 : a = -1
+    · subst ha1; rfl
+    · have hpos : 0 < intBitMeasure a := by
+        unfold intBitMeasure
+        split <;> omega
+      obtain ⟨n, hn⟩ : ∃ n, intBitMeasure a = n + 1 := ⟨intBitMeasure a - 1, by omega⟩
+      rw [hn]
+      simp only [intBitRec, ha0, ha1, ↓reduceIte]
+      have hdiv : (1 : Int) / 2 = 0 := rfl
+      have hmod1 : (1 : Int) % 2 = 1 := rfl
+      rw [hdiv, hmod1, intBitRec_and_zero]
+      have hmod2 : a % 2 = 0 ∨ a % 2 = 1 := by omega
+      rcases hmod2 with h0 | h1
+      · simp [h0]
+      · simp [h1]
+
+/-- `countOnesLoop` extracts the population count of `u` across `n` bit
+positions regardless of any high-order multiple `k * 2^n` above bit `n` (such as
+two's-complement sign extension `k = -1`). -/
+theorem countOnesLoop_mod (n u : Nat) (ones k : Int) :
+    countOnesLoop n ones ((u : Int) + k * (2 : Int) ^ n) = ones + (popcountBits n u : Int) := by
+  induction n generalizing u ones with
+  | zero =>
+    simp [countOnesLoop, popcountBits]
+  | succ n ih =>
+    simp only [countOnesLoop, popcountBits, bdIntBitAnd_one]
+    have hsplit : (u : Int) + k * (2 : Int) ^ (n + 1) =
+        ((u % 2 : Nat) : Int) + 2 * (((u / 2 : Nat) : Int) + k * (2 : Int) ^ n) := by
+      have hp : k * (2 : Int) ^ (n + 1) = 2 * (k * (2 : Int) ^ n) := by
+        rw [Int.pow_succ, ← Int.mul_assoc, Int.mul_comm _ 2]
+      rw [hp]
+      omega
+    have hmod : (((u % 2 : Nat) : Int) + 2 * (((u / 2 : Nat) : Int) + k * (2 : Int) ^ n)) % 2 =
+        ((u % 2 : Nat) : Int) := by omega
+    have hdiv : (((u % 2 : Nat) : Int) + 2 * (((u / 2 : Nat) : Int) + k * (2 : Int) ^ n)) / 2 =
+        ((u / 2 : Nat) : Int) + k * (2 : Int) ^ n := by omega
+    rw [hsplit, hmod, hdiv, ih (u / 2) (ones + ((u % 2 : Nat) : Int))]
+    omega
+
+/-- Symbolic equivalence of MiniRust's `evalCountOnes` (`spec/lang/step/operators.md`)
+with `popcountBits` across **all** signed and unsigned `IntType` widths. -/
+theorem evalCountOnes_intFromBits (it : Gen.IntType) (bits : Nat) :
+    evalCountOnes (intFromBits bits it) it = (popcountBits (8 * it.size.bytes) bits : Int) := by
+  cases it with
+  | mk s sz =>
+    cases s with
+    | Unsigned =>
+      have hi : intFromBits bits ⟨.Unsigned, sz⟩ = (bits : Int) + 0 * (2 : Int) ^ (8 * sz.bytes) := by
+        simp [intFromBits]
+      rw [hi]
+      unfold evalCountOnes Interp.Size.bits
+      simpa using countOnesLoop_mod (8 * sz.bytes) bits 0 0
+    | Signed =>
+      by_cases hlt : bits < 2 ^ (8 * sz.bytes - 1)
+      · have hi : intFromBits bits ⟨.Signed, sz⟩ = (bits : Int) + 0 * (2 : Int) ^ (8 * sz.bytes) := by
+          simp [intFromBits, hlt]
+        rw [hi]
+        unfold evalCountOnes Interp.Size.bits
+        simpa using countOnesLoop_mod (8 * sz.bytes) bits 0 0
+      · have hi : intFromBits bits ⟨.Signed, sz⟩ = (bits : Int) + (-1) * (2 : Int) ^ (8 * sz.bytes) := by
+          simp [intFromBits, hlt]
+          omega
+        rw [hi]
+        unfold evalCountOnes Interp.Size.bits
+        simpa using countOnesLoop_mod (8 * sz.bytes) bits 0 (-1)
+
+/-- `evalCountOnes` on `intFromBits bits ⟨signed, sz⟩` is completely invariant
+under `Signedness`, explaining why an untyped `MirCallReq` handler can implement
+`core::intrinsics::ctpop::<T>` uniformly from `ScalarInt.bits` and `sizeBytes`. -/
+theorem evalCountOnes_signedness_indep (sz : LibSpecr.Size) (bits : Nat) :
+    evalCountOnes (intFromBits bits ⟨.Signed, sz⟩) ⟨.Signed, sz⟩ =
+      evalCountOnes (intFromBits bits ⟨.Unsigned, sz⟩) ⟨.Unsigned, sz⟩ := by
+  rw [evalCountOnes_intFromBits, evalCountOnes_intFromBits]
+
+private theorem mirHandledTree_extCall_ret {body : CapturedMir} {args : List Value}
+    {mem mem' : Memory} {h : ExternalCallHandler} {req : MirCallReq}
+    {kStep : MirCallAns → MirExecState} {retVal : Value} {s1 : MachineState}
+    {out : MirOutcome}
+    (hstep0 : stepMirFn body (initMachineStateWithMemory body args mem) = .extCall req kStep)
+    (hreq : h req = ITree.ret (.returned retVal mem'))
+    (hk : kStep (.returned retVal mem') = .running s1)
+    (hstep1 : stepMirFn body s1 = .ret out) :
+    ReachesRet (mirHandledTree body args mem h) [] out := by
+  let interpF : ITree.InterpCarrier MirEffect MirClosedEffect MirOutcome →
+      ITree MirClosedEffect MirOutcome :=
+    ITree.cofix (ITree.interpStep (handleMirExternalCalls h))
+  have hobs0 : (mirStatefulTree body args mem).observe =
+      .vis (.inr (.inr (CallReq.call req : MirCallE.I)))
+        (fun ans => ITree.cofix (stepMirState body) (kStep ans)) := by
+    rw [mirStatefulTree, mirTree, ITree.observe_cofix]
+    simp [stepMirState, hstep0, MirStepNode.extCall, ITreeF.map]
+  have hobs1 : (mirHandledTree body args mem h).observe =
+      .tau (interpF (.inl (ITree.cofix (stepMirState body) (.running s1)))) := by
+    rw [mirHandledTree, ITree.interp, ITree.observe_cofix]
+    dsimp only [ITree.interpStep]
+    rw [hobs0]
+    dsimp only [handleMirExternalCalls]
+    erw [hreq, ITree.observe_ret]
+    dsimp only
+    erw [hk]
+    rfl
+  have hobsS1 : (ITree.cofix (stepMirState body) (.running s1)).observe =
+      .ret out := by
+    rw [ITree.observe_cofix]
+    simp [stepMirState, hstep1, ITreeF.map]
+  have hobs2 : (interpF (.inl (ITree.cofix (stepMirState body) (.running s1)))).observe =
+      .ret out := by
+    dsimp only [interpF]
+    rw [ITree.observe_cofix]
+    simp [ITree.interpStep, hobsS1, ITreeF.map]
+  exact ⟨_, .tau hobs1 (.refl _), hobs2⟩
+
+private theorem mirHandledTree_extCall_ub {body : CapturedMir} {args : List Value}
+    {mem : Memory} {h : ExternalCallHandler} {req : MirCallReq}
+    {kStep : MirCallAns → MirExecState}
+    (hstep0 : stepMirFn body (initMachineStateWithMemory body args mem) = .extCall req kStep)
+    (hreq : h req = ITree.fail (E := MirClosedEffect) FailureKind.ub) :
+    FaultNow (mirHandledTree body args mem h) := by
+  have hobs0 : (mirStatefulTree body args mem).observe =
+      .vis (.inr (.inr (CallReq.call req : MirCallE.I)))
+        (fun ans => ITree.cofix (stepMirState body) (kStep ans)) := by
+    rw [mirStatefulTree, mirTree, ITree.observe_cofix]
+    simp [stepMirState, hstep0, MirStepNode.extCall, ITreeF.map]
+  have hfail : ∃ (kFail : PEmpty → ITree MirClosedEffect MirCallAns),
+      (ITree.fail (E := MirClosedEffect) (R := MirCallAns) FailureKind.ub).observe =
+      .vis (.inl (FailReq.fail FailureKind.ub : (FailE FailureKind).I)) kFail := by
+    dsimp only [ITree.fail, Bind.bind, Monad.toBind, ITree.bind, ITree.triggerSub]
+    rw [ITree.observe_cofix]
+    dsimp only
+    rw [ITree.observe_vis]
+    exact ⟨_, rfl⟩
+  obtain ⟨kFail, hkFail⟩ := hfail
+  have hobsH : ∃ (kOut : PEmpty → ITree MirClosedEffect MirOutcome),
+      (mirHandledTree body args mem h).observe =
+      .vis (.inl (FailReq.fail FailureKind.ub : (FailE FailureKind).I)) kOut := by
+    rw [mirHandledTree, ITree.interp, ITree.observe_cofix]
+    dsimp only [ITree.interpStep]
+    rw [hobs0]
+    dsimp only [handleMirExternalCalls]
+    erw [hreq, hkFail]
+    exact ⟨_, rfl⟩
+  obtain ⟨kOut, hkOut⟩ := hobsH
+  exact ⟨mirHandledTree body args mem h, .inl (.fail FailureKind.ub), kOut, .refl _, hkOut, trivial⟩
+
+/-- `ExternalCallHandler` for `core::intrinsics::cold_path`: returns `()` with
+unchanged memory, matching `minimize`'s no-op `Terminator::Goto(target)`
+(`bb.rs:595-599`). -/
+def coldPathHandler : ExternalCallHandler := fun req =>
+  if req.defPath == "core::intrinsics::cold_path" && req.args.isEmpty then
+    ITree.ret (.returned .unit req.memory)
+  else
+    ITree.fail FailureKind.unsupported
+
+/-- `ExternalCallHandler` for `core::intrinsics::ctpop::<T>`: computes the `u32`
+population count of `sc.bits` across `8 * sc.sizeBytes` bits, matching MiniRust's
+`IntUnOp::CountOnes` (`evalCountOnes_intFromBits`) uniformly across all signed
+and unsigned integer types. -/
+def ctpopHandler : ExternalCallHandler := fun req =>
+  if req.defPath == "core::intrinsics::ctpop" then
+    match req.args with
+    | [.scalar sc] =>
+      ITree.ret (.returned (.scalar ⟨popcountBits (8 * sc.sizeBytes) sc.bits, 4⟩) req.memory)
+    | _ => ITree.fail FailureKind.ub
+  else
+    ITree.fail FailureKind.unsupported
+
+/-- Monomorphized `ExternalCallHandler` for `core::intrinsics::exact_div::<T>` at
+`it : Gen.IntType`: raises UB (`ITree.fail FailureKind.ub`) on division by zero,
+signed `MIN / -1` overflow, or non-zero remainder, and otherwise returns the
+exact quotient encoded at `it`, matching MiniRust's `IntBinOp::DivExact`. -/
+def exactDivHandler (it : Gen.IntType) : ExternalCallHandler := fun req =>
+  if req.defPath == "core::intrinsics::exact_div" then
+    match req.args with
+    | [.scalar lSc, .scalar rSc] =>
+      if lSc.sizeBytes == it.size.bytes && rSc.sizeBytes == it.size.bytes then
+        let left := intFromBits lSc.bits it
+        let right := intFromBits rSc.bits it
+        if right == 0 then
+          ITree.fail FailureKind.ub
+        else
+          let q := Int.tdiv left right
+          if !IntType.can_represent it q || Int.tmod left right != 0 then
+            ITree.fail FailureKind.ub
+          else
+            let outBits := (q % (2 : Int) ^ (8 * it.size.bytes)).toNat
+            ITree.ret (.returned (.scalar ⟨outBits, it.size.bytes⟩) req.memory)
+      else
+        ITree.fail FailureKind.unsupported
+    | _ => ITree.fail FailureKind.ub
+  else
+    ITree.fail FailureKind.unsupported
+
+/-- `fn ctpop_i8_caller(x: i8) -> u32`, calling `core::intrinsics::ctpop::<i8>`. -/
+def bdCtpopI8Caller : CapturedMir :=
+  bdCallBody "boundary::ctpop_i8_caller" "core::intrinsics::ctpop" [.int .i8] 1
+    [u32Decl, i8Decl] (some 1)
+
+theorem bdColdPath_handled :
+    ReachesRet (mirHandledTree bdColdPathCaller [] emptyMemory coldPathHandler) []
+      (.normal (.unit, emptyMemory)) :=
+  mirHandledTree_extCall_ret rfl rfl rfl rfl
+
+/-- The single untyped `ctpopHandler` handles both `ctpop::<u32>(240u32) == 4u32`
+and signed `ctpop::<i8>(-1i8) == 8u32` (bits `255`), matching MiniRust's
+`evalUnOp (.Int .CountOnes)` in both cases. -/
+theorem bdCtpop_handled :
+    ReachesRet (mirHandledTree bdCtpopCaller [.scalar ⟨240, 4⟩] emptyMemory ctpopHandler) []
+        (.normal (.scalar ⟨4, 4⟩, emptyMemory)) ∧
+      evalUnOp (.Int .CountOnes) (.Int 240, .Int u32) = .ok (.Int 4, .Int u32) ∧
+      ReachesRet (mirHandledTree bdCtpopI8Caller [.scalar ⟨255, 1⟩] emptyMemory ctpopHandler) []
+        (.normal (.scalar ⟨8, 4⟩, emptyMemory)) ∧
+      evalUnOp (.Int .CountOnes) (.Int (-1), .Int IntType.I8) = .ok (.Int 8, .Int u32) :=
+  ⟨mirHandledTree_extCall_ret rfl rfl rfl rfl, rfl,
+   mirHandledTree_extCall_ret rfl rfl rfl rfl, rfl⟩
+
+/-- `exactDivHandler` on `bdExactDivI32Caller` and `bdExactDivU32Caller` matches
+MiniRust's `IntBinOp::DivExact` across exact division (`-6i32 / 3i32 = -2i32`,
+bits `4294967294`) and all three UB conditions: non-zero remainder
+(`4294967290u32 / 3u32`), division by zero (`6i32 / 0i32`), and signed overflow
+(`i32::MIN / -1i32`). -/
+theorem bdExactDiv_handled :
+    ReachesRet
+        (mirHandledTree bdExactDivI32Caller [.scalar ⟨4294967290, 4⟩, .scalar ⟨3, 4⟩]
+          emptyMemory (exactDivHandler i32))
+        [] (.normal (.scalar ⟨4294967294, 4⟩, emptyMemory)) ∧
+      FaultNow
+        (mirHandledTree bdExactDivU32Caller [.scalar ⟨4294967290, 4⟩, .scalar ⟨3, 4⟩]
+          emptyMemory (exactDivHandler u32)) ∧
+      FaultNow
+        (mirHandledTree bdExactDivI32Caller [.scalar ⟨6, 4⟩, .scalar ⟨0, 4⟩]
+          emptyMemory (exactDivHandler i32)) ∧
+      evalBinOp (.Int .DivExact) (.Int 6, .Int i32) (.Int 0, .Int i32) =
+        .error (.ub "division by zero") ∧
+      FaultNow
+        (mirHandledTree bdExactDivI32Caller [.scalar ⟨2147483648, 4⟩, .scalar ⟨4294967295, 4⟩]
+          emptyMemory (exactDivHandler i32)) ∧
+      evalBinOp (.Int .DivExact) (.Int (-2147483648), .Int i32) (.Int (-1), .Int i32) =
+        .error (.ub "overflow in division") :=
+  ⟨mirHandledTree_extCall_ret rfl rfl rfl rfl,
+   mirHandledTree_extCall_ub rfl rfl,
+   mirHandledTree_extCall_ub rfl rfl,
+   rfl,
+   mirHandledTree_extCall_ub rfl rfl,
+   rfl⟩
+
+/-- Symbolic correspondence between `exactDivHandler it` and MiniRust's
+`evalBinOp (.Int .DivExact)` for every integer type `it` and all operand bit
+patterns `b1, b2`. -/
+theorem exactDivHandler_iff_minirust (it : Gen.IntType)
+    (b1 b2 : Nat) (mem : Memory) :
+    let req : MirCallReq :=
+      { defPath := "core::intrinsics::exact_div"
+        args := [.scalar ⟨b1, it.size.bytes⟩, .scalar ⟨b2, it.size.bytes⟩]
+        memory := mem }
+    let l := intFromBits b1 it
+    let r := intFromBits b2 it
+    ((∃ msg, evalBinOp (.Int .DivExact) (.Int l, .Int it) (.Int r, .Int it) = .error (.ub msg)) →
+      exactDivHandler it req = ITree.fail FailureKind.ub) ∧
+    (∀ q, evalBinOp (.Int .DivExact) (.Int l, .Int it) (.Int r, .Int it) = .ok (.Int q, .Int it) →
+      exactDivHandler it req =
+        ITree.ret (.returned (.scalar ⟨(q % (2 : Int) ^ (8 * it.size.bytes)).toNat, it.size.bytes⟩) mem)) := by
+  dsimp only
+  simp only [exactDivHandler, beq_self_eq_true, Bool.and_self, ↓reduceIte]
+  by_cases hr0 : intFromBits b2 it = 0
+  · simp [hr0, evalBinOp, evalIntBinOp, ub]
+  · have hr0b : (intFromBits b2 it == 0) = false := beq_false_of_ne hr0
+    simp only [hr0b, Bool.false_eq_true, ↓reduceIte]
+    by_cases hrep : IntType.can_represent it (Int.tdiv (intFromBits b1 it) (intFromBits b2 it)) = true
+    · by_cases hrem : Int.tmod (intFromBits b1 it) (intFromBits b2 it) = 0
+      · have hbmod : IntType.bring_in_bounds it (Int.tdiv (intFromBits b1 it) (intFromBits b2 it)) %
+            (2 : Int) ^ (8 * it.size.bytes) =
+            Int.tdiv (intFromBits b1 it) (intFromBits b2 it) % (2 : Int) ^ (8 * it.size.bytes) := by
+          cases it with
+          | mk s sz =>
+            unfold IntType.bring_in_bounds bringInBounds Interp.Size.bits
+            dsimp only
+            cases s
+            · dsimp only
+              exact Int.emod_emod _ _
+            · dsimp only
+              split
+              · exact Int.emod_emod _ _
+              · rw [Int.sub_emod_right, Int.emod_emod]
+        simp only [evalBinOp, evalIntBinOp, hr0, hrep, hrem, bne_self_eq_false, Bool.not_true,
+          Bool.false_or, Bool.false_eq_true, ↓reduceIte]
+        refine ⟨?_, ?_⟩
+        · rintro ⟨msg, h⟩
+          simp [Bind.bind, Except.bind, Pure.pure, Except.pure] at h
+        · intro q hq
+          simp [Bind.bind, Except.bind, Pure.pure, Except.pure] at hq
+          rcases hq with rfl
+          rw [hbmod]
+      · have hremB : (Int.tmod (intFromBits b1 it) (intFromBits b2 it) != 0) = true := by
+          simp [hrem]
+        simp [evalBinOp, evalIntBinOp, hr0, hrep, hrem, hremB, ub]
+    · simp only [Bool.not_eq_true] at hrep
+      simp [evalBinOp, evalIntBinOp, hr0, hrep, ub]
 
 /-! ## 5. `core::hint::unreachable_unchecked()` -/
 

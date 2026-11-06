@@ -838,8 +838,9 @@ theorem statementOk_stmtMoved_lt {decls : List LocalDecl} {s : MirAst.Statement}
     simp only [stmtMoved] at hj
     exact .inl (List.mem_filter.mp hj).1
   | .deinit ⟨_, _ :: _⟩, hs, _ => simp [statementOk] at hs
+  | .intrinsic _, hs, _ => simp [statementOk] at hs
   | .placeMention _, _, hj | .setDiscriminant _ _, _, hj | .retag _ _, _, hj
-  | .intrinsic _, _, hj | .coverage, _, hj | .constEvalCounter, _, hj
+  | .coverage, _, hj | .constEvalCounter, _, hj
   | .backwardIncompatibleDropHint _, _, hj | .nop, _, hj =>
     simpa [stmtMoved] using .inl hj
 
@@ -935,7 +936,23 @@ theorem stmtMoved_mono {mo mo' : List Nat} (hsub : ∀ k ∈ mo, k ∈ mo')
     | cons _ _ =>
       simp only [stmtMoved] at hj ⊢
       exact hsub j hj
-  | placeMention _ | setDiscriminant _ _ | retag _ _ | intrinsic _
+  | intrinsic intr =>
+    cases intr with
+    | assume op =>
+      simp only [stmtMoved, moveOut] at hj ⊢
+      cases hmv : opMoved op with
+      | none =>
+        simp only [hmv] at hj ⊢
+        exact hsub j hj
+      | some k =>
+        simp only [hmv, List.mem_cons] at hj ⊢
+        rcases hj with rfl | hmo
+        · exact .inl rfl
+        · exact .inr (hsub j hmo)
+    | copyNonOverlapping _ _ _ =>
+      simp only [stmtMoved] at hj ⊢
+      exact hsub j hj
+  | placeMention _ | setDiscriminant _ _ | retag _ _
   | coverage | constEvalCounter | backwardIncompatibleDropHint _ | nop =>
     simp only [stmtMoved] at hj ⊢
     exact hsub j hj
@@ -1162,8 +1179,12 @@ theorem stmtReadsOk_antitone {mo mo' : List Nat} (hsub : ∀ j ∈ mo, j ∈ mo'
   obtain ⟨kind, span⟩ := s
   cases kind with
   | assign _ rv => exact readsOk_mono hsub h
+  | intrinsic intr =>
+    cases intr with
+    | assume op => exact readsOk_mono hsub h
+    | copyNonOverlapping _ _ _ => rfl
   | placeMention _ | storageLive _ | storageDead _ | deinit _
-  | setDiscriminant _ _ | retag _ _ | intrinsic _ | coverage
+  | setDiscriminant _ _ | retag _ _ | coverage
   | constEvalCounter | backwardIncompatibleDropHint _ | nop => rfl
 
 /-- `termReadsOk` is antitone in the moved-out set `mo`. -/
@@ -1390,6 +1411,26 @@ theorem StaleOk.keep {body : CapturedMir} {actual view : List LocalSlot} {blk st
   unfold StaleOk at h ⊢
   rw [movedBefore_succ hbb hst, hmo]
   exact h
+
+/-- `StaleOk` after `Assume(op)`, which may move out of `op`'s root local in
+Anneal while `translateOperand` lowers `move` via `ValueExpr::Load` in MiniRust. -/
+theorem StaleOk.assume {body : CapturedMir} {actual view : List LocalSlot} {blk stmt : Nat}
+    {bb : BasicBlockData} {st : MirAst.Statement} (hbb : body.basicBlocks[blk]? = some bb)
+    (hst : bb.statements[stmt]? = some st) {op : Operand}
+    (hk : st.kind = .intrinsic (.assume op)) (h : StaleOk body actual view blk stmt) :
+    StaleOk body (opPost actual op) view blk (stmt + 1) := by
+  unfold StaleOk
+  rw [movedBefore_succ hbb hst]
+  simp only [stmtMoved, hk]
+  refine ⟨by rw [opPost_length]; exact h.1, fun j hj => ?_⟩
+  rcases opPost_get actual op j with h' | ⟨hm, h1, s, h2, h3⟩
+  · rw [h'] at hj ⊢
+    obtain ⟨hmo, ha, hv⟩ := h.2 j hj
+    exact ⟨by unfold moveOut; split <;> simp [hmo], ha, hv⟩
+  · refine ⟨by simp [moveOut, hm], h1, fun hv => h3 ?_⟩
+    have := (h.dead_iff j).mpr hv
+    rw [h2] at this
+    exact Option.some.inj this
 
 /-! ## One MiniRust step on a related machine -/
 
@@ -2686,7 +2727,7 @@ theorem bodyInProgFragment_spec {fnMap : FnMap}
     body.basicBlocks ≠ [] ∧
     (∀ blk bb, body.basicBlocks[blk]? = some bb →
       bb.isCleanup = false ∧
-      (∀ st ∈ bb.statements, statementOk body.localDecls st = true) ∧
+      (∀ st ∈ bb.statements, progStatementOk body.localDecls st = true) ∧
       (terminatorOk body.localDecls body.basicBlocks.length bb.terminator = true ∨
         callTerminatorOk callees body blk bb.terminator = true)) ∧
     storageDeadOk body = true ∧
@@ -3414,7 +3455,16 @@ theorem stmtTupleInit_mono (decls : List LocalDecl) {ti ti' : List Nat}
     | cons _ _ =>
       simp only [stmtTupleInit] at hj ⊢
       exact hsub j hj
-  | _ =>
+  | intrinsic intr =>
+    cases intr with
+    | assume op =>
+      simp only [stmtTupleInit] at hj ⊢
+      exact dropMovedFrom_mono hsub [op] hj
+    | copyNonOverlapping _ _ _ =>
+      simp only [stmtTupleInit] at hj ⊢
+      exact hsub j hj
+  | placeMention _ | setDiscriminant _ _ | retag _ _ | coverage
+  | constEvalCounter | backwardIncompatibleDropHint _ | nop =>
     simp only [stmtTupleInit] at hj ⊢
     exact hsub j hj
 
@@ -3727,6 +3777,21 @@ theorem LiveInv.advance_placeMention {body : CapturedMir} {s : MachineState}
     show stmtMustLive (mustLiveBefore body s.frame.blockIdx s.frame.stmtIdx) st =
       mustLiveBefore body s.frame.blockIdx s.frame.stmtIdx by simp [stmtMustLive, hkind]] at hj
   exact hlive j hj
+
+theorem LiveInv.advance_assume {body : CapturedMir} {s : MachineState}
+    {bb : BasicBlockData} {st : MirAst.Statement} {op : Operand}
+    {mem' : MirSemantics.Memory}
+    (hlive : LiveInv body s.frame) (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
+    (hst : bb.statements[s.frame.stmtIdx]? = some st)
+    (hkind : st.kind = .intrinsic (.assume op)) :
+    LiveInv body (advanceStmt s (opPost s.frame.locals op) mem').frame := by
+  intro j hj
+  simp only [advanceStmt] at hj ⊢
+  rw [mustLiveBefore_succ hbb hst,
+    show stmtMustLive (mustLiveBefore body s.frame.blockIdx s.frame.stmtIdx) st =
+      mustLiveBefore body s.frame.blockIdx s.frame.stmtIdx by simp [stmtMustLive, hkind]] at hj
+  intro hdead
+  exact hlive j hj ((opPost_dead s.frame.locals op j).mp hdead)
 
 theorem LiveInv.advance_storageLive {body : CapturedMir} {s : MachineState}
     {bb : BasicBlockData} {st : MirAst.Statement} {i : Nat} {mem' : MirSemantics.Memory}
@@ -4107,6 +4172,26 @@ theorem TupleInv.advance_placeMention {body : CapturedMir} {s : MachineState}
       tupleInitBefore body s.frame.blockIdx s.frame.stmtIdx by simp [stmtTupleInit, hkind]] at hj
   exact htinv j hj
 
+theorem TupleInv.advance_assume {body : CapturedMir} {s : MachineState}
+    {bb : BasicBlockData} {st : MirAst.Statement} {op : Operand}
+    {mem' : MirSemantics.Memory}
+    (htinv : TupleInv body s.frame) (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
+    (hst : bb.statements[s.frame.stmtIdx]? = some st)
+    (hkind : st.kind = .intrinsic (.assume op)) :
+    TupleInv body (advanceStmt s (opPost s.frame.locals op) mem').frame := by
+  intro j hj
+  simp only [advanceStmt] at hj ⊢
+  rw [tupleInitBefore_succ hbb hst,
+    show stmtTupleInit body.localDecls
+        (tupleInitBefore body s.frame.blockIdx s.frame.stmtIdx) st =
+      dropMovedFrom (tupleInitBefore body s.frame.blockIdx s.frame.stmtIdx) [op] by
+      simp [stmtTupleInit, hkind]] at hj
+  obtain ⟨hjOld, hnotMv⟩ := dropMovedFrom_mem hj
+  have hget : (opPost s.frame.locals op)[j]? = s.frame.locals[j]? := by
+    simpa [opsPost] using opsPost_get_of_not_mem s.frame.locals [op] j hnotMv
+  rw [hget]
+  exact htinv j hjOld
+
 theorem TupleInv.advance_clear {body : CapturedMir} {s : MachineState}
     {bb : BasicBlockData} {st : MirAst.Statement} {i : Nat} {slot : LocalSlot}
     {mem' : MirSemantics.Memory}
@@ -4294,10 +4379,11 @@ theorem MultiStateRel.not_returnRel {entry b' : CapturedMir} {callees : List Cap
     (hrel : MultiStateRel entry callees prog rootCtx s m) :
     ¬ ReturnRel b' c' s' v m := by
   obtain ⟨_, hrel⟩ := hrel
-  obtain ⟨callerFrames, curCtx, curFn, curLm, _, _, _, _, _, hstack, _, _, _, _, hthr, _⟩ :=
+  obtain ⟨callerFrames, curCtx, curFn, curLm, _, _, _, curSeg, segStmt,
+    _, _, hstack, _, _, _, _, hthr, _, _⟩ :=
     hrel.stack
   have hsh : Shape m rootCtx
-      (callerFrames ++ [calleeFrameL curFn curCtx curLm s.frame.blockIdx s.frame.stmtIdx])
+      (callerFrames ++ [calleeFrameL curFn curCtx curLm curSeg segStmt])
       m.mem.memory.allocations := ⟨hthr, hrel.active, rfl⟩
   exact hsh.not_returnRel_of_ne_nil hstack.frames_ne_nil
 
@@ -4386,7 +4472,7 @@ theorem CallStackRel.inv_cons {entry : CapturedMir} {callees : List CapturedMir}
     ∃ (preFrames : List Frame) (callerBody : CapturedMir) (callerFn : Gen.Function)
       (callerCtx : Ctx) (callerCandBound : Nat)
       (callerView : List LocalSlot) (callerLm : Map Gen.LocalName Ptr)
-      (calleeRetDecl : LocalDecl) (callerBudget : Nat),
+      (calleeRetDecl : LocalDecl) (callerBudget callerSeg callerSegStmt : Nat),
       callerFrames = preFrames ++ [curCtx.caller] ∧
       CallStackRel entry callees fnMap rootCtx restStack preFrames
         callerBody callerCtx callerCandBound (remFuel + 1) ∧
@@ -4397,8 +4483,7 @@ theorem CallStackRel.inv_cons {entry : CapturedMir} {callees : List CapturedMir}
       savedCaller.calleeProtectors = [] ∧
       savedCaller.returnTarget < callerBody.basicBlocks.length ∧
       curCtx.nextBlock = bbName savedCaller.returnTarget ∧
-      curCtx.caller = calleeFrameL callerFn callerCtx callerLm
-        savedCaller.frame.blockIdx savedCaller.frame.stmtIdx ∧
+      curCtx.caller = calleeFrameL callerFn callerCtx callerLm callerSeg callerSegStmt ∧
       curBody.localDecls[0]? = some calleeRetDecl ∧
       CallerDestRel callerBody callerCtx savedCaller.frame.locals callerView
         callerLm calleeRetDecl curCtx.base curCtx.retPtr savedCaller.destination ∧
@@ -4420,7 +4505,7 @@ theorem CallStackRel.inv_cons {entry : CapturedMir} {callees : List CapturedMir}
   | cons hRest hCallerEq hCallerMem hCallerFn hProtNone hCalleeProts hTargetLt _
       hNextBlk hCallerFrame hCalleeRetDecl hDest hCallerCand hCallerBudget _ _
       hCallerBudgetLt hPostLen hPostStale hPostLive hPostTuple =>
-    exact ⟨_, _, _, _, _, _, _, _, _, rfl, hRest, hCallerEq, hCallerMem, hCallerFn,
+    exact ⟨_, _, _, _, _, _, _, _, _, _, _, rfl, hRest, hCallerEq, hCallerMem, hCallerFn,
       hProtNone, hCalleeProts, hTargetLt, hNextBlk, hCallerFrame, hCalleeRetDecl,
       hDest, hCallerCand, hCallerBudget, hCallerBudgetLt, hPostLen, hPostStale,
       hPostLive, hPostTuple⟩
@@ -4598,6 +4683,18 @@ private theorem lift_stmt_ok {curBody : CapturedMir} {curFn : Gen.Function}
     simp [hne, listIndex_nat _ _ _ htst, hm3, hm4, check_after hsh4, m4]
   exact ⟨m4, hstep, ⟨rfl, hsh3.active, rfl⟩, hp3, hfp3, h3.locs⟩
 
+private theorem segPcZero_of_translateFnInProg {fnMap : FnMap} {body : CapturedMir}
+    {f : Gen.Function} (hf : translateFnInProg fnMap body = some f) (t : Nat) :
+    ∀ bb, body.basicBlocks[t]? = some bb →
+      ∃ tbTerm nc1 nc2 ex1,
+        translateTerminatorInProg fnMap body.localDecls nc1 bb.terminator =
+          some (tbTerm, nc2, ex1) ∧
+        SegPc (mapGet f.blocks) body.localDecls tbTerm t bb.statements 0 t 0 := by
+  intro bb hbb
+  obtain ⟨_, _, _, _, _, hBlocks⟩ := translateFnInProg_spec fnMap body f hf
+  obtain ⟨tbTerm, nc1, nc2, ex1, htr, hseg⟩ := hBlocks t bb hbb
+  exact ⟨tbTerm, nc1, nc2, ex1, htr, hseg.pcZero⟩
+
 theorem MultiStateRelAt.advance {entry : CapturedMir} {callees : List CapturedMir}
     {prog : Gen.Program} {rootCtx : Ctx} {s : MachineState}
     {view : List LocalSlot} {m : Mach}
@@ -4606,7 +4703,7 @@ theorem MultiStateRelAt.advance {entry : CapturedMir} {callees : List CapturedMi
     (hbb : (s.memory.activeCallee.getD entry).basicBlocks[s.frame.blockIdx]? = some bb)
     (hlt : s.frame.stmtIdx < bb.statements.length)
     {callerFrames : List Frame} {curCtx : Ctx} {curFn : Gen.Function}
-    {lm' : Map Gen.LocalName Ptr} {candBound remFuel curBudget : Nat}
+    {lm' : Map Gen.LocalName Ptr} {candBound remFuel curBudget curSeg' segStmt' : Nat}
     (hcurMem : (s.memory.activeCallee.getD entry) ∈ entry :: callees)
     (hcurFn : translateFnInProg (fnNameMap entry callees) (s.memory.activeCallee.getD entry) =
       some curFn)
@@ -4616,10 +4713,16 @@ theorem MultiStateRelAt.advance {entry : CapturedMir} {callees : List CapturedMi
     (hcand : BaseCandBounded curCtx.base candBound)
     (hbud : maxStackLocalsAux remFuel callees (s.memory.activeCallee.getD entry) = some curBudget)
     (hbudLt : candBound + curBudget < 2 ^ 31)
+    (hsegNext : ∃ tbTerm nc1 nc2 ex1,
+      translateTerminatorInProg (fnNameMap entry callees)
+        (s.memory.activeCallee.getD entry).localDecls nc1 bb.terminator =
+        some (tbTerm, nc2, ex1) ∧
+      SegPc (mapGet curFn.blocks) (s.memory.activeCallee.getD entry).localDecls tbTerm
+        s.frame.blockIdx bb.statements (s.frame.stmtIdx + 1) curSeg' segStmt')
     (actual' view' : List LocalSlot) (mem' : MirSemantics.Memory) (m' : Mach)
     (hthr : m'.threads =
       [thread1 rootCtx
-        (callerFrames ++ [calleeFrameL curFn curCtx lm' s.frame.blockIdx (s.frame.stmtIdx + 1)])])
+        (callerFrames ++ [calleeFrameL curFn curCtx lm' curSeg' segStmt'])])
     (hact : m'.active_thread = 0)
     (hp : m'.prog = m.prog) (hfp : m'.fn_ptrs = m.fn_ptrs)
     (hlo : LocalsOk (s.memory.activeCallee.getD entry) curCtx view' lm' m'.mem.memory.allocations)
@@ -4657,9 +4760,12 @@ theorem MultiStateRelAt.advance {entry : CapturedMir} {callees : List CapturedMi
     borrows := hbor
     protectors := hpr.trans hrel.protectors
     callerLocals := hcl.trans hrel.callerLocals }⟩
-  refine ⟨callerFrames, curCtx, curFn, lm', candBound, remFuel, curBudget, ?_⟩
+  refine ⟨callerFrames, curCtx, curFn, lm', candBound, remFuel, curBudget, curSeg', segStmt', ?_⟩
   simp only [advanceStmt, hac, hcs]
-  exact ⟨hcurMem, hcurFn, hstack, hpay, hcand, hbud, hbudLt, hthr, hlo⟩
+  refine ⟨hcurMem, hcurFn, hstack, hpay, hcand, hbud, hbudLt, hthr, fun bb' hbb' => ?_, hlo⟩
+  rw [hbb] at hbb'
+  cases hbb'
+  exact hsegNext
 
 theorem MultiStateRelAt.jump {entry : CapturedMir} {callees : List CapturedMir}
     {prog : Gen.Program} {rootCtx : Ctx} {s : MachineState}
@@ -4688,8 +4794,9 @@ theorem MultiStateRelAt.jump {entry : CapturedMir} {callees : List CapturedMir}
     (htup : TupleInv (s.memory.activeCallee.getD entry) (jumpState s t actual').frame) :
     MultiStateRel entry callees prog rootCtx (jumpState s t actual') m' :=
   ⟨view, {
-    stack := ⟨callerFrames, curCtx, curFn, lm, candBound, remFuel, curBudget,
-      hcurMem, hcurFn, hstack, hpay, hcand, hbud, hbudLt, hthr, hlo⟩
+    stack := ⟨callerFrames, curCtx, curFn, lm, candBound, remFuel, curBudget, t, 0,
+      hcurMem, hcurFn, hstack, hpay, hcand, hbud, hbudLt, hthr,
+      segPcZero_of_translateFnInProg hcurFn t, hlo⟩
     env := hrel.env.of_eq hp hfp
     active := hact
     blk := ht
@@ -4930,11 +5037,12 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
   obtain ⟨hnd, hallFrag, _⟩ := progInFragment_spec hfrag
   let fnMap := fnNameMap entry callees
   let curBody := s.memory.activeCallee.getD entry
-  obtain ⟨callerFrames, curCtx, curFn, curLm, candBound, remFuel, curBudget,
-    hCurMem, hCurFn, hStackRel, hCurPay, hCurCand, hCurBud, hCandBudLt, hthr, hlo⟩ := hrel.stack
+  obtain ⟨callerFrames, curCtx, curFn, curLm, candBound, remFuel, curBudget, curSeg, segStmt,
+    hCurMem, hCurFn, hStackRel, hCurPay, hCurCand, hCurBud, hCandBudLt, hthr, hSegPcAll, hlo⟩ :=
+    hrel.stack
   obtain ⟨hphase, hargs, _, _, hbbs, hsdOk, hmvOk, hmtOk, hlvOk, htiOk⟩ :=
     bodyInProgFragment_spec (hallFrag curBody hCurMem)
-  obtain ⟨hfCur, _, _, _, _, hBlocksCur⟩ := translateFnInProg_spec fnMap curBody curFn hCurFn
+  obtain ⟨hfCur, _, _, _, _, _⟩ := translateFnInProg_spec fnMap curBody curFn hCurFn
   obtain ⟨curBodyLenLe, _⟩ := maxStackLocalsAux_ge hCurBud
   have curBodyLenLe' : curBody.localDecls.length ≤ curBudget := curBodyLenLe
   have hCandCurLt : candBound + curBody.localDecls.length < 2 ^ 31 := by omega
@@ -4942,35 +5050,98 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
     ⟨_, List.getElem?_eq_getElem hrel.blk⟩
   have hbbmem : bb ∈ curBody.basicBlocks := List.mem_of_getElem? hbb
   obtain ⟨_, hstmts, htermOr⟩ := hbbs s.frame.blockIdx bb hbb
-  obtain ⟨tbTerm, nc1, nc2, ex1, htermTr, hsegCur⟩ :=
-    hBlocksCur s.frame.blockIdx bb hbb
-  obtain ⟨tbStmts, hgetb, hstMapM⟩ :=
-    hsegCur.eq_last (fun st hst => statementOk_isAssume (hstmts st hst))
-  let tb : Gen.BasicBlock := ⟨tbStmts, tbTerm, .Regular⟩
-  obtain ⟨hlen, hstspec⟩ := list_mapM_option_spec (translateStatement curBody.localDecls)
-    bb.statements tbStmts hstMapM
+  obtain ⟨tbTerm, nc1, nc2, ex1, htermTr, hpc⟩ := hSegPcAll bb hbb
   obtain ⟨hmvS, hmvT, hmvEdge⟩ := movesOk_spec hmvOk hbb
   have hshape : Shape m rootCtx
-      (callerFrames ++ [calleeFrameL curFn curCtx curLm s.frame.blockIdx s.frame.stmtIdx])
+      (callerFrames ++ [calleeFrameL curFn curCtx curLm curSeg segStmt])
       m.mem.memory.allocations := ⟨hthr, hrel.active, rfl⟩
   let mR := rethread (resetPick m) curCtx
-    [curCtx.caller, calleeFrameL curFn curCtx curLm s.frame.blockIdx s.frame.stmtIdx]
-  have hframe : FrameOk curBody curFn curCtx view curLm mR s.frame.blockIdx s.frame.stmtIdx :=
+    [curCtx.caller, calleeFrameL curFn curCtx curLm curSeg segStmt]
+  have hframe : FrameOk curBody curFn curCtx view curLm mR curSeg segStmt :=
     ⟨hfCur, ⟨rfl, rfl, rfl⟩, hlo⟩
   have hslotsA : SlotsOk curBody.localDecls s.frame.locals := hrel.stale.slots hlo.slots
   have hnA : s.frame.locals.length = curBody.localDecls.length := hrel.stale.1.trans hlo.nlocals
   have hstmt_le := hrel.stmt bb hbb
   rcases Nat.lt_or_ge s.frame.stmtIdx bb.statements.length with hlt | hge
   · ----------------------------------------------------------------- statement
-    have hne : ((s.frame.stmtIdx : Nat) : Int) ≠ (tb.statements.length : Int) := by
-      rw [hlen]; omega
     obtain ⟨st, hst⟩ : ∃ st, bb.statements[s.frame.stmtIdx]? = some st :=
       ⟨_, List.getElem?_eq_getElem hlt⟩
     have hstmem : st ∈ bb.statements := List.mem_of_getElem? hst
-    obtain ⟨st', hst', htst⟩ := hstspec _ st hst
     rw [stepMirFn_active_stmt entry curBody s bb st rfl hphase hbb hst]
-    have hok := hstmts st hstmem
+    have hprogOk := hstmts st hstmem
     have hreads := hmvS _ st hst
+    cases hAss : isAssume st with
+    | true =>
+      obtain ⟨op, hkind⟩ : ∃ op, st.kind = .intrinsic (.assume op) := by
+        obtain ⟨k, sp⟩ := st
+        cases k with
+        | intrinsic intr =>
+          cases intr with
+          | assume op => exact ⟨op, rfl⟩
+          | copyNonOverlapping _ _ _ => simp [isAssume] at hAss
+        | _ => simp [isAssume] at hAss
+      obtain ⟨segStmts, op', nextSeg, hgetb, hsegEq, hopTr, hpcNext⟩ :=
+        hpc.atStmt_assume hst hkind
+      let tb : Gen.BasicBlock :=
+        ⟨segStmts, .Intrinsic .Assume [op'] unitPlace (some (bbName nextSeg)), .Regular⟩
+      have hif : ((segStmt : Nat) : Int) = (tb.statements.length : Int) := by
+        simp [tb, hsegEq]
+      have hokB : operandOkB curBody.localDecls (copyOp op) = true :=
+        progStatementOk_assume hprogOk hkind
+      have hreadsOp : readsOk (movedBefore curBody s.frame.blockIdx s.frame.stmtIdx) [op] = true := by
+        simpa [stmtReadsOk, hkind] using hreads
+      have hsimple : simpleOp op = true := (readsOk_spec hreadsOp op (by simp)).1
+      have hbitsEq : opBits s.frame.locals (copyOp op) = opBits view (copyOp op) :=
+        opBits_frame _ (by
+          rw [opRead_copyOp]
+          exact fun j hj => hrel.stale.agree ((readsOk_spec hreadsOp op (by simp)).2 j hj))
+      obtain ⟨kind, span⟩ := st
+      simp only at hkind; subst hkind
+      obtain ⟨hAnone, hA0, hA1⟩ := evalStmt_assume_anneal s curBody.localDecls curBody.layouts
+        op span hslotsA hnA hsimple hokB
+      obtain ⟨hMnone, hM0, hM1⟩ := evalTerminator_assume_spec (m := resetPick m)
+        (nextSeg := nextSeg) (resetPick_shape hshape) hframe hokB hopTr
+      cases hb : opBits view (copyOp op) with
+      | none =>
+        rw [hAnone (hbitsEq.trans hb)]
+        obtain ⟨msg, hmsg⟩ := hMnone hb
+        have hstep : Interp.step m = .error (.ub msg) := by
+          rw [step_callee_stack hshape tb hgetb]
+          simp [hif, tb, hmsg]
+        exact MultiStepRel.ub' msg hstep
+      | some bits =>
+        by_cases hb0 : bits = 0
+        · subst hb0
+          rw [hA0 (hbitsEq.trans hb)]
+          have hmsg := hM0 hb
+          have hstep : Interp.step m =
+              .error (.ub "`Assume` intrinsic called on condition that is violated") := by
+            rw [step_callee_stack hshape tb hgetb]
+            simp [hif, tb, hmsg]
+          exact MultiStepRel.ub' _ hstep
+        · have hvbits : ValidBits .Bool bits :=
+            ((evalValue_operandT hframe (.bool : FragTy .Bool u8Ty) (copyOp op)
+              (operandOkB_T hokB) op'
+              (by rw [translateOperand_copyOp]; exact hopTr)).1 bits hb).1
+          simp only [ValidBits] at hvbits
+          have hb1 : bits = 1 := by omega
+          subst hb1
+          rw [hA1 (hbitsEq.trans hb)]
+          obtain ⟨m4, hm4, hsh4, hp4, hfp4, hlo4⟩ := hM1 1 hb hb0
+          have hstep : Interp.step m = .ok m4 := by
+            rw [step_callee_stack hshape tb hgetb]
+            simp [hif, tb, hm4, check_after hsh4]
+          exact MultiStepRel.tau1 m4 hstep
+            (hrel.advance hbb hlt hCurMem hCurFn hStackRel hCurPay hCurCand hCurBud hCandBudLt
+              ⟨tbTerm, nc1, nc2, ex1, htermTr, hpcNext⟩ _ view _ m4 hsh4.threads hsh4.active
+              hp4 hfp4 hlo4 (hrel.stale.assume hbb hst rfl) hrel.retLive
+              (hrel.liveInv.advance_assume hbb hst rfl)
+              (hrel.tupleInv.advance_assume hbb hst rfl)
+              rfl hrel.borrows rfl rfl rfl rfl)
+    | false =>
+    have hok : statementOk curBody.localDecls st = true := progStatementOk_notAssume hprogOk hAss
+    obtain ⟨tb, st', hgetb, hsegLt, htst, hst', hpcNext⟩ := hpc.atStmt_notAssume hst hAss
+    have hne : ((segStmt : Nat) : Int) ≠ (tb.statements.length : Int) := by omega
     rcases translateStatement_some hst' with ⟨i, rv, e, hkind, he, rfl⟩ | ⟨p, pe, hkind, hpe, rfl⟩ |
       ⟨i, hkind, rfl⟩ | ⟨i, hkind, rfl⟩ | ⟨p, pe, hkind, hpe, rfl⟩
     · ------------------------------------------------------------ assign
@@ -4994,7 +5165,7 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
             (∀ v, res = some v → view[i]? ≠ some .dead →
               ∃ m3R, evalStatement mR (.Assign (.Local (localName i)) e) = .ok m3R ∧
                 FrameOk curBody curFn curCtx (view.set i (.init v)) curLm m3R
-                  s.frame.blockIdx s.frame.stmtIdx) ∧
+                  curSeg segStmt) ∧
             (res = none → view[i]? ≠ some .dead →
               ∃ msg, evalStatement mR (.Assign (.Local (localName i)) e) = .error (.ub msg)) ∧
             (∀ v, res = some v →
@@ -5135,7 +5306,8 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
               hlo4.slots i d (.init v) hdi (List.getElem?_set_self hvil)
             exact MultiStepRel.tau1 m4 hstep
               (hrel.advance hbb hlt hCurMem hCurFn hStackRel hCurPay hCurCand hCurBud hCandBudLt
-                _ (view.set i (.init v)) _ m4 hsh4.threads hsh4.active hp4 hfp4 hlo4
+                ⟨tbTerm, nc1, nc2, ex1, htermTr, hpcNext⟩ _ (view.set i (.init v)) _ m4
+                hsh4.threads hsh4.active hp4 hfp4 hlo4
                 (hrel.stale.assign hbb hst rfl (.init v))
                 (retLive_set hrel.retLive i (by simp))
                 (hrel.liveInv.advance_assign hbb hst rfl)
@@ -5160,7 +5332,8 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
           lift_stmt_ok hshape hgetb hne htst (hMlive hlive) hframe
         exact MultiStepRel.tau1 m4 hstep
           (hrel.advance hbb hlt hCurMem hCurFn hStackRel hCurPay hCurCand hCurBud hCandBudLt
-            _ view _ m4 hsh4.threads hsh4.active hp4 hfp4 hlo4
+            ⟨tbTerm, nc1, nc2, ex1, htermTr, hpcNext⟩ _ view _ m4
+            hsh4.threads hsh4.active hp4 hfp4 hlo4
             (hrel.stale.keep hbb hst rfl) hrel.retLive
             (hrel.liveInv.advance_placeMention hbb hst rfl)
             (hrel.tupleInv.advance_placeMention hbb hst rfl)
@@ -5180,7 +5353,8 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
         lift_stmt_ok hshape hgetb hne htst hm3R h3
       exact MultiStepRel.tau1 m4 hstep
         (hrel.advance hbb hlt hCurMem hCurFn hStackRel hCurPay hCurCand hCurBud hCandBudLt
-          _ (view.set i .uninit) _ m4 hsh4.threads hsh4.active hp4 hfp4 hlo4
+          ⟨tbTerm, nc1, nc2, ex1, htermTr, hpcNext⟩ _ (view.set i .uninit) _ m4
+          hsh4.threads hsh4.active hp4 hfp4 hlo4
           (hrel.stale.setBoth hbb hst rfl .uninit)
           (retLive_set hrel.retLive i (by simp))
           (hrel.liveInv.advance_storageLive hbb hst rfl hi)
@@ -5201,7 +5375,8 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
         lift_stmt_ok hshape hgetb hne htst hm3R h3
       exact MultiStepRel.tau1 m4 hstep
         (hrel.advance hbb hlt hCurMem hCurFn hStackRel hCurPay hCurCand hCurBud hCandBudLt
-          _ (view.set i .dead) _ m4 hsh4.threads hsh4.active hp4 hfp4 hlo4
+          ⟨tbTerm, nc1, nc2, ex1, htermTr, hpcNext⟩ _ (view.set i .dead) _ m4
+          hsh4.threads hsh4.active hp4 hfp4 hlo4
           (hrel.stale.setBoth hbb hst rfl .dead)
           (by rw [List.getElem?_set_ne (by omega)]; exact hrel.retLive)
           (hrel.liveInv.advance_storageDead hbb hst rfl)
@@ -5232,7 +5407,8 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
             lift_stmt_ok hshape hgetb hne htst hm3R h3
           exact MultiStepRel.tau1 m4 hstep
             (hrel.advance hbb hlt hCurMem hCurFn hStackRel hCurPay hCurCand hCurBud hCandBudLt
-              _ (view.set i .uninit) _ m4 hsh4.threads hsh4.active hp4 hfp4 hlo4
+              ⟨tbTerm, nc1, nc2, ex1, htermTr, hpcNext⟩ _ (view.set i .uninit) _ m4
+              hsh4.threads hsh4.active hp4 hfp4 hlo4
               (hrel.stale.setBoth hbb hst rfl .uninit)
               (retLive_set hrel.retLive i (by simp))
               (hrel.liveInv.advance_deinit hbb hst rfl)
@@ -5240,8 +5416,10 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
               rfl hrel.borrows rfl rfl rfl rfl)
   · ----------------------------------------------------------------- terminator
     have heq : s.frame.stmtIdx = bb.statements.length := by omega
-    have hif : ((s.frame.stmtIdx : Nat) : Int) = (tb.statements.length : Int) := by
-      rw [hlen, heq]
+    obtain ⟨tbStmts, hgetb, hsegEq⟩ := hpc.atEnd heq
+    let tb : Gen.BasicBlock := ⟨tbStmts, tbTerm, .Regular⟩
+    have hif : ((segStmt : Nat) : Int) = (tb.statements.length : Int) := by
+      simp [tb, hsegEq]
     rw [stepMirFn_active_term entry curBody s bb rfl hphase hbb heq]
     have hstale_end : StaleOk curBody s.frame.locals view s.frame.blockIdx bb.statements.length := by
       rw [← heq]; exact hrel.stale
@@ -5251,6 +5429,8 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
         cases htk : bb.terminator.kind with
         | call _ _ _ _ _ => simp [terminatorOk, htk] at hterm
         | _ =>
+          change translateTerminatorInProg fnMap curBody.localDecls nc1 bb.terminator =
+            some (tbTerm, nc2, ex1) at htermTr
           simp only [translateTerminatorInProg, htk, Option.bind_eq_bind] at htermTr
           cases ht : translateTerminator curBody.localDecls bb.terminator with
           | none => simp [ht] at htermTr
@@ -5301,7 +5481,7 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
         have hmove := evalOperand_move s.frame.locals discr hsimple s.memory.borrows
           s.memory.globals curBody.layouts s.memory.callerLocals
         obtain ⟨hvOkRe, hvErrRe⟩ := evalValue_rethread vExpr (resetPick m) rootCtx curCtx
-          callerFrames (calleeFrameL curFn curCtx curLm s.frame.blockIdx s.frame.stmtIdx)
+          callerFrames (calleeFrameL curFn curCtx curLm curSeg segStmt)
           hshape.threads rfl
         cases hb : opBits view (copyOp discr) with
         | none =>
@@ -5330,7 +5510,7 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
               j ∈ movedBefore curBody tgt 0 := by
             simpa [termMoved, hk] using hmvEdge tgt htgtMem
           have hsh3 : Shape { resetPick m with mem := cm3 } rootCtx
-              (callerFrames ++ [calleeFrameL curFn curCtx curLm s.frame.blockIdx s.frame.stmtIdx])
+              (callerFrames ++ [calleeFrameL curFn curCtx curLm curSeg segStmt])
               cm3.memory.allocations := ⟨hshape.threads, rfl, rfl⟩
           have hjmp := jumpToBlock_append hsh3 tgt
           let m4 := rethread { resetPick m with mem := cm3 } rootCtx
@@ -5384,7 +5564,7 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
           rw [hcs] at hStackRel
           obtain ⟨hcfEq, hCurEq, hCtxEq, _, _, hRetRoot⟩ := hStackRel.inv_nil
           have hshapeRoot : Shape m rootCtx
-              [rootCtx.caller, calleeFrameL curFn rootCtx curLm s.frame.blockIdx s.frame.stmtIdx]
+              [rootCtx.caller, calleeFrameL curFn rootCtx curLm curSeg segStmt]
               m.mem.memory.allocations := by
             simpa [hcfEq, hCtxEq] using hshape
           have hloRoot : LocalsOk curBody rootCtx view curLm m.mem.memory.allocations :=
@@ -5392,7 +5572,7 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
           have hd0Entry : entry.localDecls[0]? = some d0 := hCurEq ▸ hd0
           obtain ⟨r0, a0, hp, hr0, hliveR, haddrr, hlenr, halr⟩ := hRetRoot d0 hd0Entry
           have hframeRoot : FrameOk curBody curFn rootCtx view curLm (resetPick m)
-              s.frame.blockIdx s.frame.stmtIdx :=
+              curSeg segStmt :=
             ⟨hfCur, resetPick_shape hshapeRoot, hloRoot⟩
           have hRet := evalReturn_frame hframeRoot d0 hd0 r0 a0 hp hr0 hliveR haddrr hlenr halr
           match slot0, hslot0, hs0, hsA with
@@ -5421,7 +5601,7 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
         | cons savedCaller restStack =>
           rw [hcs] at hStackRel
           obtain ⟨preFrames, callerBody, callerFn, callerCtx, callerCandBound,
-            callerView, callerLm, calleeRetDecl, callerBudget,
+            callerView, callerLm, calleeRetDecl, callerBudget, callerSeg, callerSegStmt,
             hcfEq, hRest, hCallerEq, hCallerMem, hCallerFn, hProtNone, hCalleeProts,
             hTargetLt, hNextBlk, hCallerFrame, hCalleeRetDecl, hDest, hCallerCand,
             hCallerBudget, hCallerBudgetLt, hPostLen, hPostStale, hPostLive, hPostTuple⟩ :=
@@ -5516,10 +5696,11 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
               protectors := rfl
               callerLocals := hrel.callerLocals }⟩
             · refine ⟨preFrames, callerCtx, callerFn, callerLm, callerCandBound,
-                remFuel + 1, callerBudget, ?_⟩
+                remFuel + 1, callerBudget, savedCaller.returnTarget, 0, ?_⟩
               simp only [Option.getD_some, hCallerEq]
               exact ⟨hCallerMem, hCallerFn, hRest, hRest.payloads, hCallerCand,
-                hCallerBudget, hCallerBudgetLt, hsh'.threads, hloCaller⟩
+                hCallerBudget, hCallerBudgetLt, hsh'.threads,
+                segPcZero_of_translateFnInProg hCallerFn savedCaller.returnTarget, hloCaller⟩
             · constructor
               · intro hrNil
                 simp only at hrNil
@@ -5637,7 +5818,7 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
         obtain ⟨_, hIL0, hILlive, hILinit, hILdead⟩ :=
           initLocals_callee_spec hCalleeArgc hAvLenArgc hAvSlots'
         let calleeCtx : Ctx := {
-          caller := calleeFrameL curFn curCtx curLm s.frame.blockIdx s.frame.stmtIdx
+          caller := calleeFrameL curFn curCtx curLm curSeg segStmt
           payloads := rootCtx.payloads
           base := m2.mem.memory.allocations
           addrs := []
@@ -5740,10 +5921,10 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
           protectors := hrel.protectors
           callerLocals := hrel.callerLocals }⟩
         refine ⟨callerFrames ++ [calleeCtx.caller], calleeCtx, fCallee, calleeLm,
-          candBound + curBody.localDecls.length, calleeFuel, calleeBudget, ?_⟩
+          candBound + curBody.localDecls.length, calleeFuel, calleeBudget, 0, 0, ?_⟩
         simp only [Option.getD_some]
         exact ⟨hCalleeMem, hfCallee, hStackNext, rfl, hbase2, hCalleeBud,
-          by omega, hshCallee0.threads, hloCallee⟩
+          by omega, hshCallee0.threads, segPcZero_of_translateFnInProg hfCallee 0, hloCallee⟩
 
 /-- Initial locals map at `fEntry.start` under `MultiStartRel`. -/
 theorem MultiStartRel.localsOk {entry : CapturedMir} {callees : List CapturedMir}
@@ -5830,12 +6011,13 @@ theorem multi_step_start_with_no_returnRel {entry : CapturedMir} {callees : List
     borrows := hstart.borrows
     protectors := hstart.protectors
     callerLocals := hstart.callerLocals }⟩, hnoRetInit (by simp)⟩
-  refine ⟨[rootCtx.caller], rootCtx, fEntry, lm, 0, callees.length + 1, rootBudget, ?_⟩
+  refine ⟨[rootCtx.caller], rootCtx, fEntry, lm, 0, callees.length + 1, rootBudget, 0, 0, ?_⟩
   rw [hstart.activeCallee, Option.getD_none, hstart.callStack,
     hstart.blk0, hstart.stmt0]
   exact ⟨List.mem_cons_self, hstart.hfEntry,
     .nil hstart.baseLow hstart.ret rootBudget hRootBud hRootBudLt,
-    rfl, hstart.baseLow.toBaseCandBounded, hRootBud, by omega, hsh.threads, hlo0⟩
+    rfl, hstart.baseLow.toBaseCandBounded, hRootBud, by omega, hsh.threads,
+    segPcZero_of_translateFnInProg hstart.hfEntry 0, hlo0⟩
 
 /-- **Multi-function init block (`fEntry.start`).** From `MultiStartRel`
 (Anneal at `(0, 0)` of `entry` with `callees` loaded and MiniRust at

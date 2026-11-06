@@ -3484,4 +3484,29 @@ theorem evalTerminator_return_caller_anneal {s : MachineState} {curBody callerBo
     simp [MirSemantics.evalTerminator, get?, h0, hstack, hw, hprotNone, hcalleeProts, MirStepNode.step]
   · rcases hub with h | h | h <;> simp [MirSemantics.evalTerminator, get?, h]
 
+/-- Anneal's `evalStmt` on `StatementKind.intrinsic (.assume op)`: evaluates `op`
+(moving out on `move _j`), raising UB if `op` is uninitialized or `false` (`0`)
+and advancing to `stmtIdx + 1` with `opPost s.frame.locals op` when `op` is
+`true` (`1`). -/
+theorem evalStmt_assume_anneal (s : MachineState) (decls : List LocalDecl)
+    (layouts : Layout.LayoutTable) (op : Operand) (span : String)
+    (hslots : SlotsOk decls s.frame.locals) (hn : s.frame.locals.length = decls.length)
+    (hsimple : simpleOp op = true) (hokB : operandOkB decls (copyOp op) = true) :
+    (opBits s.frame.locals (copyOp op) = none →
+      evalStmt s ⟨.intrinsic (.assume op), span⟩ decls layouts = MirStepNode.fail .ub) ∧
+    (opBits s.frame.locals (copyOp op) = some 0 →
+      evalStmt s ⟨.intrinsic (.assume op), span⟩ decls layouts = MirStepNode.fail .ub) ∧
+    (opBits s.frame.locals (copyOp op) = some 1 →
+      evalStmt s ⟨.intrinsic (.assume op), span⟩ decls layouts =
+        MirStepNode.step (advanceStmt s (opPost s.frame.locals op))) := by
+  obtain ⟨hAok, hAnone⟩ := evalOperand_fragT decls s.frame.locals hslots hn
+    (.bool : FragTy .Bool u8Ty) (copyOp op) (operandOkB_T hokB)
+    s.memory.borrows s.memory.globals layouts s.memory.callerLocals
+  have hmove := evalOperand_move s.frame.locals op hsimple
+    s.memory.borrows s.memory.globals layouts s.memory.callerLocals
+  refine ⟨fun hnone => ?_, fun h0 => ?_, fun h1 => ?_⟩
+  · simp [evalStmt, hmove, hAnone hnone, opWithLocals]
+  · simp [evalStmt, hmove, hAok 0 h0, opWithLocals, u8Ty]
+  · simp [evalStmt, hmove, hAok 1 h1, opWithLocals, u8Ty]
+
 end MiniRustSpec.Correspondence

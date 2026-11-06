@@ -388,10 +388,10 @@ fn anchors_match_generated_items_and_cover_interp() {
     let sim_sec = &audit_text[audit_text.find("#check_theorem_deps \"[SIMULATION-AUDIT]\"").unwrap()..];
     let sim_sec = &sim_sec[..sim_sec.find("\n\n").unwrap()];
     let sim_count = sim_sec.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
-    assert!(sim_count >= 268, "expected at least 268 [SIMULATION-AUDIT] theorems, found {sim_count}");
+    assert!(sim_count >= 277, "expected at least 277 [SIMULATION-AUDIT] theorems, found {sim_count}");
 
     let wit_sec = &audit_text[audit_text.find("#check_theorem_deps \"[WITNESS-AUDIT]\"").unwrap()..];
     let wit_sec = &wit_sec[..wit_sec.find("\n\n").unwrap()];
     let wit_count = wit_sec.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
-    assert!(wit_count >= 585, "expected at least 585 [WITNESS-AUDIT] theorems, found {wit_count}");
+    assert!(wit_count >= 610, "expected at least 610 [WITNESS-AUDIT] theorems, found {wit_count}");
 }

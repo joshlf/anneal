@@ -54,8 +54,10 @@ The translation is defined only on the fragment checked by `inFragment`:
   `copy _j` or `move _j`, a 2-tuple field projection `copy (_j.0)`,
   `copy (_j.1)`, `move (_j.0)`, or `move (_j.1)`, or a scalar constant;
   `PlaceMention(p)` of a fragment place; `StorageLive(_i)` of any local,
-  `StorageDead(_i)` of a temporary (`_i` with `argCount < i`), and
-  `Deinit(_i)` of a root local;
+  `StorageDead(_i)` of a temporary (`_i` with `argCount < i`), `Deinit(_i)` of
+  a root local, and (in `progInFragment`)
+  `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))` on a `bool`
+  fragment operand (`translateStmtResult`, `splitStmts`, `SegChain`, `SegPc`);
 * terminators are `Goto`, `SwitchInt` on an integer or `bool` fragment operand
   (`copy _j`, `move _j`, 2-tuple field projection, or constant), `Unreachable`,
   `Return`, or (in `progInFragment`) direct monomorphic `Call`s to fragment
@@ -67,12 +69,13 @@ The translation is defined only on the fragment checked by `inFragment`:
   `tupleInitOk`, `callTerminatorOk`), and every temporary the body mentions has
   explicit storage markers (`mentionsOk`); see below.
 
-Outside that fragment, `translateFnInProg` also transcribes how `minimize`
-lowers `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`: the
-statement ends the current MiniRust block in a `Terminator::Intrinsic` of
-`IntrinsicOp::Assume` on `op` whose next block is fresh (`translateStmtResult`,
-`splitStmts`, `SegChain`). The fragment does not yet admit `Assume`
-statements.
+For `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`,
+`translateFnInProg` transcribes how `minimize` splits a MIR basic block: the
+statement ends the current MiniRust block segment in a `Terminator::Intrinsic`
+of `IntrinsicOp::Assume` on `op` with `ret = build::unit_place()` and a fresh
+continuation block (`translateStmtResult`, `splitStmts`, `SegChain`, `SegPc`).
+`translateRsIntrinsic` also transcribes `minimize`'s lowering of compiler
+intrinsic calls (`raw_eq`, `ctpop`, `exact_div`, `cold_path`, `abort`).
 
 `minimize` has no MiniRust Boolean operator to use: it writes `!b` as a
 transmute of `1 - b` back to `bool` (`boolNot`), `a & b` / `a | b` / `a ^ b` as
@@ -1228,6 +1231,105 @@ inductive StatementResult : Type where
   | intrinsic (intrinsic : Gen.IntrinsicOp) (destination : Gen.PlaceExpr)
       (arguments : List Gen.ValueExpr)
 
+/-- `minimize`'s per-terminator translation result
+(`tooling/minimize/src/bb.rs`):
+> "/// A MIR terminator becomes a MiniRust terminator, possibly preceded by a list
+>  /// of statements to execute at the end of the previous basic block.
+>  struct TerminatorResult {
+>      stmts: List<Statement>,
+>      terminator: Terminator,
+>  }" -/
+structure TerminatorResult where
+  stmts : List Gen.Statement
+  terminator : Gen.Terminator
+
+/-- `build::count_ones(v)`, `ValueExpr::UnOp` with `IntUnOp::CountOnes`. -/
+def buildCountOnes (v : Gen.ValueExpr) : Gen.ValueExpr :=
+  .UnOp (.Int .CountOnes) v
+
+/-- `build::div_exact(l, r)`, `ValueExpr::BinOp` with `IntBinOp::DivExact`. -/
+def buildDivExact (l r : Gen.ValueExpr) : Gen.ValueExpr :=
+  .BinOp (.Int .DivExact) l r
+
+/-- `minimize`'s `translate_rs_intrinsic` (`tooling/minimize/src/bb.rs`) on the
+intrinsic names whose arguments and destination require no `rustc` type-context
+queries (`raw_eq`, `ctpop`, `exact_div`, `cold_path`, `abort`):
+> "rs::sym::raw_eq =>
+>      return TerminatorResult {
+>          stmts: List::new(),
+>          terminator: Terminator::Intrinsic {
+>              intrinsic: IntrinsicOp::RawEq,
+>              arguments: args
+>                  .iter()
+>                  .map(|x| self.translate_operand(&x.node, x.span))
+>                  .collect(),
+>              ret: self.translate_place(&destination, span),
+>              next_block: target.as_ref().map(|t| self.bb_name_map[t]),
+>          },
+>      },"
+> "rs::sym::ctpop => {
+>      let v = self.translate_operand(&args[0].node, span);
+>      let destination = self.translate_place(&destination, span);
+>
+>      let val = build::count_ones(v);
+>      let stmt = Statement::Assign { destination, source: val };
+>
+>      let terminator = Terminator::Goto(self.bb_name_map[&target.unwrap()]);
+>      return TerminatorResult { stmts: list![stmt], terminator };
+>  }
+>  rs::sym::exact_div => {
+>      let l = self.translate_operand(&args[0].node, span);
+>      let r = self.translate_operand(&args[1].node, span);
+>      let destination = self.translate_place(&destination, span);
+>
+>      let val = build::div_exact(l, r);
+>
+>      let stmt = Statement::Assign { destination, source: val };
+>      let terminator = Terminator::Goto(self.bb_name_map[&target.unwrap()]);
+>
+>      return TerminatorResult { stmts: list![stmt], terminator };
+>  }"
+> "rs::sym::cold_path => {
+>      // Just a NOP for us.
+>      let terminator = Terminator::Goto(self.bb_name_map[&target.unwrap()]);
+>      return TerminatorResult { stmts: list![], terminator };
+>  }"
+> "rs::sym::abort => {
+>      let terminator = build::abort();
+>      TerminatorResult { stmts: list![], terminator }
+>  }"
+Other `translate_rs_intrinsic` arms (`assert_*_valid`, `arith_offset`,
+`ptr_offset_from*`, `size_of_val`, `align_of_val`, `catch_unwind`) query `tcx`
+layouts or synthesize catch blocks, and unsupported names hit `span_bug!`. -/
+def translateRsIntrinsic (name : String) (args : List MirAst.Operand)
+    (destination : MirAst.Place) (target : Option Nat) : Option TerminatorResult :=
+  match name with
+  | "raw_eq" => do
+    let args' ← args.mapM translateOperand
+    let ret' ← translatePlace destination
+    pure ⟨[], .Intrinsic .RawEq args' ret' (target.map bbName)⟩
+  | "ctpop" =>
+    match args, target with
+    | [vOp], some t => do
+      let v ← translateOperand vOp
+      let dest ← translatePlace destination
+      pure ⟨[.Assign dest (buildCountOnes v)], .Goto (bbName t)⟩
+    | _, _ => none
+  | "exact_div" =>
+    match args, target with
+    | [lOp, rOp], some t => do
+      let l ← translateOperand lOp
+      let r ← translateOperand rOp
+      let dest ← translatePlace destination
+      pure ⟨[.Assign dest (buildDivExact l r)], .Goto (bbName t)⟩
+    | _, _ => none
+  | "cold_path" =>
+    match target with
+    | some t => pure ⟨[], .Goto (bbName t)⟩
+    | none => none
+  | "abort" => pure ⟨[], abortTerminator⟩
+  | _ => none
+
 /-- Whether a MIR statement is
 `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(_))`, the one
 statement that `minimize` turns into a block-ending
@@ -1361,17 +1463,56 @@ inductive SegChain (look : Gen.BbName → Option Gen.BasicBlock)
       (htr : ss.mapM (translateStatement decls) = some stmts)
       (hna : ∀ s ∈ ss, isAssume s = false) :
       SegChain look decls term name ss
-  | split {name next : Gen.BbName} {pre post : List MirAst.Statement}
+  | split {name : Gen.BbName} {nextIdx : Nat} {pre post : List MirAst.Statement}
       {s : MirAst.Statement} {op : MirAst.Operand} {op' : Gen.ValueExpr}
       {stmts : List Gen.Statement}
       (hlook : look name =
-        some ⟨stmts, .Intrinsic .Assume [op'] unitPlace (some next), .Regular⟩)
+        some ⟨stmts, .Intrinsic .Assume [op'] unitPlace (some (bbName nextIdx)), .Regular⟩)
       (htr : pre.mapM (translateStatement decls) = some stmts)
       (hna : ∀ s ∈ pre, isAssume s = false)
       (hs : s.kind = .intrinsic (.assume op))
       (hop : translateOperand op = some op')
-      (hrest : SegChain look decls term next post) :
+      (hrest : SegChain look decls term (bbName nextIdx) post) :
       SegChain look decls term name (pre ++ s :: post)
+
+/-- Active program-counter relation along a `SegChain` rooted at
+`bbName entrySeg` for MIR statement list `ss` ending in `term`: MIR statement
+index `stmtIdx` corresponds to MiniRust block `bbName curSeg` at statement
+index `segStmt`. -/
+inductive SegPc (look : Gen.BbName → Option Gen.BasicBlock)
+    (decls : List MirAst.LocalDecl) (term : Gen.Terminator) :
+    Nat → List MirAst.Statement → Nat → Nat → Nat → Prop where
+  | hereLast {curSeg segStmt : Nat} {ss : List MirAst.Statement}
+      {stmts : List Gen.Statement}
+      (hlook : look (bbName curSeg) = some ⟨stmts, term, .Regular⟩)
+      (htr : ss.mapM (translateStatement decls) = some stmts)
+      (hna : ∀ s ∈ ss, isAssume s = false)
+      (hle : segStmt ≤ ss.length) :
+      SegPc look decls term curSeg ss segStmt curSeg segStmt
+  | hereSplit {curSeg nextSeg segStmt : Nat} {pre post : List MirAst.Statement}
+      {s : MirAst.Statement} {op : MirAst.Operand} {op' : Gen.ValueExpr}
+      {stmts : List Gen.Statement}
+      (hlook : look (bbName curSeg) =
+        some ⟨stmts, .Intrinsic .Assume [op'] unitPlace (some (bbName nextSeg)), .Regular⟩)
+      (htr : pre.mapM (translateStatement decls) = some stmts)
+      (hna : ∀ s ∈ pre, isAssume s = false)
+      (hs : s.kind = .intrinsic (.assume op))
+      (hop : translateOperand op = some op')
+      (hrest : SegChain look decls term (bbName nextSeg) post)
+      (hle : segStmt ≤ pre.length) :
+      SegPc look decls term curSeg (pre ++ s :: post) segStmt curSeg segStmt
+  | stepSplit {entrySeg nextSeg curSeg segStmt restIdx : Nat}
+      {pre post : List MirAst.Statement}
+      {s : MirAst.Statement} {op : MirAst.Operand} {op' : Gen.ValueExpr}
+      {stmts : List Gen.Statement}
+      (hlook : look (bbName entrySeg) =
+        some ⟨stmts, .Intrinsic .Assume [op'] unitPlace (some (bbName nextSeg)), .Regular⟩)
+      (htr : pre.mapM (translateStatement decls) = some stmts)
+      (hna : ∀ s ∈ pre, isAssume s = false)
+      (hs : s.kind = .intrinsic (.assume op))
+      (hop : translateOperand op = some op')
+      (hrest : SegPc look decls term nextSeg post restIdx curSeg segStmt) :
+      SegPc look decls term entrySeg (pre ++ s :: post) (pre.length + 1 + restIdx) curSeg segStmt
 
 /-- `FnCtxt::translate` for a function in a multi-function program: `init_bb`
 takes `bbName n` (`n = body.basicBlocks.length`), and the blocks that
@@ -1749,8 +1890,10 @@ def readsOk : List Nat → List MirAst.Operand → Bool
      | some j => !mo.contains j
      | none => true) && readsOk (moveOut mo op) ops
 
-/-- The moved-out locals after statement `s`: those its operands move out of,
-minus the root local it writes (a root assignment's destination, or the local of
+/-- The moved-out locals after statement `s`: those its operands move out of
+(including `Assume(move _j)`, which `evalOperand` moves out in Anneal while
+`translateOperand` lowers `move` via `ValueExpr::Load` in MiniRust), minus the
+root local it writes (a root assignment's destination, or the local of
 `StorageLive`, `StorageDead`, or root `Deinit`, after which both models agree
 that the local is unallocated or holds the same bytes; a projected assignment
 records its operand moves without clearing the destination root local). -/
@@ -1758,6 +1901,7 @@ def stmtMoved (mo : List Nat) (s : MirAst.Statement) : List Nat :=
   match s.kind with
   | .assign ⟨i, []⟩ rv => ((rvOperands rv).foldl moveOut mo).filter (· != i)
   | .assign ⟨_, _ :: _⟩ rv => (rvOperands rv).foldl moveOut mo
+  | .intrinsic (.assume op) => moveOut mo op
   | .storageLive i | .storageDead i | .deinit ⟨i, []⟩ => mo.filter (· != i)
   | _ => mo
 
@@ -1765,6 +1909,7 @@ def stmtMoved (mo : List Nat) (s : MirAst.Statement) : List Nat :=
 def stmtReadsOk (mo : List Nat) (s : MirAst.Statement) : Bool :=
   match s.kind with
   | .assign _ rv => readsOk mo (rvOperands rv)
+  | .intrinsic (.assume op) => readsOk mo [op]
   | _ => true
 
 /-- Whether terminator `t` reads no local in `mo`. For `Call`:
@@ -1873,6 +2018,7 @@ def movesOk (body : MirAst.CapturedMir) : Bool :=
 def stmtLocals (s : MirAst.Statement) : List Nat :=
   match s.kind with
   | .assign p rv => p.local_ :: (rvOperands rv).filterMap opRead
+  | .intrinsic (.assume op) => (opRead op).toList
   | .placeMention p | .deinit p => [p.local_]
   | .storageLive i | .storageDead i => [i]
   | _ => []
@@ -2040,6 +2186,7 @@ def stmtTupleInit (decls : List MirAst.LocalDecl) (ti : List Nat)
       if ti'.contains i then ti' else i :: ti'
     else ti'.filter (· != i)
   | .assign ⟨_, _ :: _⟩ rv => dropMovedFrom ti (rvOperands rv)
+  | .intrinsic (.assume op) => dropMovedFrom ti [op]
   | .storageLive i | .storageDead i | .deinit ⟨i, []⟩ => ti.filter (· != i)
   | _ => ti
 
@@ -2236,12 +2383,22 @@ def terminatorInProgOk (callees : List MirAst.CapturedMir) (body : MirAst.Captur
   terminatorOk body.localDecls body.basicBlocks.length t ||
   callTerminatorOk callees body blk t
 
+/-- Statement check in a multi-function program (`progInFragment`): either a
+single-body fragment statement (`statementOk`) or
+`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))` on a well-typed
+`bool` fragment operand (`operandOkB decls (copyOp op)`), which `translate_bb`
+splits into `Terminator::Intrinsic { intrinsic: IntrinsicOp::Assume, .. }`
+jumping to a fresh continuation block (`splitStmts`, `SegChain`). -/
+def progStatementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement) : Bool :=
+  match s.kind with
+  | .intrinsic (.assume op) => operandOkB decls (copyOp op)
+  | _ => statementOk decls s
+
 /-- Per-function fragment check within a multi-function program
-`(fnMap, callees)`. Statements must be single-body fragment statements
-(`statementOk`), so no statement of a fragment body is an `Assume` and every
-MIR block translates to exactly one MiniRust block (`SegChain.last`,
-`SegChain.eq_last`), even though `translateFnInProg` itself splits blocks at
-`Assume` statements exactly like `minimize`. -/
+`(fnMap, callees)`. Statements satisfy `progStatementOk` (admitting
+`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))` alongside
+`statementOk`), and `translateFnInProg` splits each MIR basic block at every
+`Assume` statement (`SegChain`, `SegPc`) exactly like `minimize`. -/
 def bodyInProgFragment (fnMap : FnMap)
     (callees : List MirAst.CapturedMir) (body : MirAst.CapturedMir) : Bool :=
   body.isRuntimePostCleanup &&
@@ -2253,7 +2410,7 @@ def bodyInProgFragment (fnMap : FnMap)
     match body.basicBlocks[blk]? with
     | some bb =>
       !bb.isCleanup &&
-      bb.statements.all (statementOk body.localDecls) &&
+      bb.statements.all (progStatementOk body.localDecls) &&
       terminatorInProgOk callees body blk bb.terminator
     | none => true) &&
   storageDeadOk body && movesOk body && mentionsOk body &&
