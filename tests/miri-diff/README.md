@@ -71,9 +71,9 @@ Lean 4 kernel replay at `trustLevel := 0`).
 
 | Bug Class | Suspected Component | Affected Corpus Tests | Root Cause |
 | :--- | :--- | :--- | :--- |
-| Soundness (false negative on UB) | `MirSemantics.Places` / `Operands` | `ub_ptr_offset_oob_read`, `ub_ptr_offset_oob_write`, `ub_ptr_offset_negative_before_start`, `ub_unaligned_ptr_read_u32` | `BinOp.offset` updates `ProvenancePtr.offsetBytes` without checking allocation bounds or negative wrapping, and `readPlace`/`writePlaceValue` ignore `ptr.offsetBytes` and pointer alignment. |
 | Soundness (false negative on UB) | `MirSemantics.Places` | `ub_transmute_invalid_bool_through_ptr` | Writing `3u8` through `*mut u8` cast from `&mut bool` stores an out-of-range scalar into the `bool` local without re-checking `[0, 1]` validity on write or subsequent read. |
-| Completeness (wrong return value) | `MirSemantics.Places` | `pass_ptr_offset_within_array` | `readPlace` ignores `ProvenancePtr.offsetBytes` after `BinOp.offset`, reading field 0 instead of field 1. |
+| UB location mismatch | `MirSemantics.Places` | `ub_ptr_offset_oob_read`, `ub_ptr_offset_oob_write` | `ptrAllocByteBound?` bounds-checks `&raw const pair.a` / `&raw mut pair.a` against field `a`'s 4-byte span rather than the enclosing 8-byte `PairU32` allocation, faulting with `FailureKind.ub` on `offset(base, 2isize)` instead of the subsequent dereference. |
+| Completeness (false positive UB) | `MirSemantics.Places` | `pass_ptr_offset_within_array` | Cross-struct-field pointer offset (`offset(&raw const pair.a, 1)`) leaves `BorrowEntry.targetProjection` pointing to field 0 (`pair.a`), so `resolveStackThinPtrTargetProj?` fails closed with `FailureKind.ub` on `*p1` instead of resolving adjacent field 1 (`pair.b`). |
 | Incompleteness (unmodeled intrinsic / call) | `MirSemantics.Terminators` / `Memory` | `pass_direct_fn_call`, `panic_explicit_macro` | `core::panicking::panic_fmt` is not yet interpreted in `evalCallTerminator`, and `initMachineState` leaves `Memory.callees` empty by default. |
 
 ## Running the Suite

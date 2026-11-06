@@ -24,9 +24,9 @@
 //!      `¬ TotalClaim.holds` for all 9 non-bug `panic` tests.
 //!    - Proves `¬ StatefulClaim.holds ∧ ¬ TotalClaim.holds` via
 //!      `refuteMirPointByStrictUB` and verifies Miri UB fault locations via
-//!      `MiriOracleProbe.lean` for all 28 non-bug `ub` tests.
+//!      `MiriOracleProbe.lean` for all 30 non-bug `ub` tests.
 //!    - Enforces `evalMirDiffTagBounded` / `probeMirDiffExecBounded` equality
-//!      ratchets for all 8 open Anneal bugs (`[tests.known_anneal_bug]`).
+//!      ratchets for all 6 open Anneal bugs (`[tests.known_anneal_bug]`).
 //!    - Runs `trusted/audit/TrustedBoundary.lean` in `verify-audit` mode
 //!      (statement-origin isolation, zero `sorryAx`, zero `axiom`, and full
 //!      Lean 4 kernel replay at `trustLevel := 0`).
@@ -128,7 +128,7 @@ fn miri_diff_manifest_validation_rejects_stale_bugs_and_bad_paths() {
         .iter()
         .filter(|t| t.known_anneal_bug.is_some())
         .count();
-    assert_eq!(bug_count, 8);
+    assert_eq!(bug_count, 6);
 
     // Every `ub` test must have `miri_ub_span` recorded, and no non-`ub` test
     // may have `miri_ub_span`.
@@ -417,8 +417,8 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
     assert_eq!(report.total_tests, 77);
     assert_eq!(report.verified_pass_count, 32);
     assert_eq!(report.verified_panic_count, 9);
-    assert_eq!(report.verified_strict_ub_count, 28);
-    assert_eq!(report.ratcheted_known_bug_count, 8);
+    assert_eq!(report.verified_strict_ub_count, 30);
+    assert_eq!(report.ratcheted_known_bug_count, 6);
     // 32 pass + 9 panic + 1 helper (`helper_add_ten`) = 42 certificate modules
     assert_eq!(report.audited_certificate_modules.len(), 42);
 

@@ -38,7 +38,8 @@ exclusions!).
 /-! ## 1. Initial Machine Configuration Correspondence -/
 
 /-- Universal characterization of `initMachineState` and `initMachineStateWithCallees`;
-`initMachineStateWithCallees` also seeds `Memory.traitImpls` with `body.traitImpls`. -/
+when `callees` is non-empty, `initMachineStateWithCallees` seeds `Memory.traitImpls` with
+`body.traitImpls` (and reduces definitionally to `initMachineState body args` when `callees = []`). -/
 theorem mir_initMachineState_pc_zero
     (body : CapturedMir) (args : List Value) (callees : List CapturedMir) :
     (initMachineState body args).frame.blockIdx = 0 ∧
@@ -52,8 +53,10 @@ theorem mir_initMachineState_pc_zero
     (initMachineStateWithCallees body args callees).memory.activeCallee = none ∧
     (initMachineStateWithCallees body args callees).memory.nextTag = 1 ∧
     (initMachineStateWithCallees body args callees).memory.callees = callees ∧
-    (initMachineStateWithCallees body args callees).memory.traitImpls = body.traitImpls := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+    (initMachineStateWithCallees body args []).memory.traitImpls = [] ∧
+    (∀ c cs, (initMachineStateWithCallees body args (c :: cs)).memory.traitImpls = body.traitImpls) := by
+  cases callees <;>
+    exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩
 
 /-! ## 2. Program-Counter Statement-vs-Terminator Dispatch Correspondence -/
 

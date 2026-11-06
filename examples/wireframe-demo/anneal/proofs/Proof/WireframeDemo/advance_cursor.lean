@@ -86,13 +86,14 @@ theorem verified :
   refine verifyStatefulMirNoPanicSym _ 26 ?_
   intro args mem h_pre
   cases mem with
-  | mk nextAllocId globals borrows nextTag callees callStack activeCallee activeProtectors nextProtector callerLocals =>
+  | mk nextAllocId globals borrows nextTag callees traitImpls callStack activeCallee activeProtectors nextProtector callerLocals fnPtrs =>
     rcases h_pre with ⟨_, offset, limit, step, h_inv, h_lim, h_step, h_args, h_callee, h_stack, h_prot, h_borrows, h_caller⟩
     dsimp only at h_callee h_stack h_prot h_borrows h_caller
     rw [h_args, h_callee, h_stack, h_prot, h_borrows, h_caller]
     unfold wpMirSym
     rw [wpExecFast_eq]
     dsimp only [Obligations.WireframeDemo.advance_cursor.statefulClaim,
+      Obligations.WireframeDemo.advance_cursor.defaultCallees,
       Obligations.WireframeDemo.advance_cursor.refineStatefulSpec,
       Mir.WireframeDemo.advance_cursor.body,
       Mir.WireframeDemo.advance_cursor.layouts,
@@ -107,9 +108,10 @@ theorem verified :
       lookupSwitchTargetTree, lookupSwitchTarget, applyUnwindAction,
       MirStepNode.step, MirStepNode.retNormal,
       SymTree.bind,
-      initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux,
+      initMachineStateWithMemoryAndCallees, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux,
       readProjectedValue, sharedBorrowPerm, placeTy, tyIsFreeze, evalPlaceWrite, evalCallerPlaceWrite,
-      writePlaceValue, writeProjectedValue, invalidateDerefWriteBorrows,
+      writePlaceValue, writeCallerPlaceValue, writeProjectedValue, invalidateDerefWriteBorrows,
+      needsThinPtrElemResolution, extractDerefPtrVal?, resolveDerefWriteFullProj, resolveBorrowProjectionElems,
       operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy,
       tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, ProvenancePtr.tag,
       lookupBorrow, appendProjections, stripTransparentProjections,
@@ -125,7 +127,6 @@ theorem verified :
       get?, set?, length, Nat.add, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble,
       ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
       Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
-
     dsimp only [Trusted.Effect.Effect.I, Trusted.Effect.Effect.O, Trusted.Rustc.V2026_06_01.MirSemantics.MirEffect, Trusted.Rustc.V2026_06_01.MirSemantics.MirStepNode, Trusted.ITree.ITreeF]
     have h_ble_inv : Nat.ble offset limit = true := Nat.ble_eq_true_of_le h_inv
     have h_sub_wrap : wrapScalarBits (Nat.sub limit offset) (scalarModulus 2) = limit - offset :=
@@ -184,7 +185,8 @@ theorem verified :
         lookupSwitchTargetTree, lookupSwitchTarget, applyUnwindAction,
         MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
         readProjectedValue, sharedBorrowPerm, placeTy, tyIsFreeze, evalPlaceWrite, evalCallerPlaceWrite,
-        writePlaceValue, writeProjectedValue, invalidateDerefWriteBorrows,
+        writePlaceValue, writeCallerPlaceValue, writeProjectedValue, invalidateDerefWriteBorrows,
+        needsThinPtrElemResolution, extractDerefPtrVal?, resolveDerefWriteFullProj, resolveBorrowProjectionElems,
         operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy,
         tyIsSigned, pointeeTyOf, elemTyOf, intCastTargetBytes, ProvenancePtr.tag,
         lookupBorrow, appendProjections, stripTransparentProjections,

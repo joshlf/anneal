@@ -714,9 +714,12 @@ pub fn canary_external_call_unlinked_helper() -> u32 {
     assert!(ptr_offset.kernel_confirmed);
     assert_eq!(
         ptr_offset.verdict,
-        ComparisonVerdict::Diverge(DivergenceKind::WrongValue {
+        ComparisonVerdict::Diverge(DivergenceKind::FalsePositiveUb {
             miri: "pass:scalar:300:4".to_string(),
-            anneal: "pass:scalar:100:4".to_string(),
+            anneal_span: Some(
+                SourceSpan::parse_anneal_span("src/lib.rs:97:9: 97:12")
+                    .expect("parse pass_ptr_offset_within_array span"),
+            ),
         })
     );
 

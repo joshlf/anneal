@@ -389,10 +389,10 @@ miri_verdict = "pass:scalar:300:4"
 fuel = 128
 [tests.known_anneal_bug]
 status = "open_bug"
-bug_class = "completeness_wrong_return_value"
-observed_anneal_tag = "pass:scalar:100:4"
+bug_class = "completeness_false_positive_ub"
+observed_anneal_tag = "ub"
 suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Places"
-summary = "BinOp.offset updates ProvenancePtr.offsetBytes without updating BorrowEntry.targetProjection, and readPlace ignores ptr.offsetBytes when dereferencing ProvenancePtr, reading field 0 (100) instead of field 1 (300)."
+summary = "Cross-struct-field pointer offset (`offset(&raw const pair.a, 1)`) leaves BorrowEntry.targetProjection pointing to field 0 (`pair.a`), so `resolveStackThinPtrTargetProj?` fails closed with FailureKind.ub on `*p1` instead of resolving adjacent field 1 (`pair.b = 300`)."
 
 [[tests]]
 name = "pass_subslice_pattern_extract"
@@ -441,10 +441,11 @@ miri_ub_span = "src/lib.rs:471:9"
 fuel = 128
 [tests.known_anneal_bug]
 status = "open_bug"
-bug_class = "soundness_false_negative"
-observed_anneal_tag = "pass:scalar:10:4"
+bug_class = "ub_location_mismatch"
+observed_anneal_tag = "ub"
+observed_anneal_ub_span = "src/lib.rs:470:19: 470:39"
 suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Places"
-summary = "BinOp.offset does not check allocation bounds and readPlace ignores ProvenancePtr.offsetBytes, returning field 0 (10) instead of faulting with FailureKind.ub on an out-of-bounds pointer read."
+summary = "ptrAllocByteBound? bounds-checks `&raw const pair.a` against field `a`'s 4-byte span rather than the enclosing 8-byte `PairU32` allocation, faulting with FailureKind.ub on `offset(base, 2isize)` instead of `*oob`."
 
 [[tests]]
 name = "ub_ptr_offset_oob_write"
@@ -455,10 +456,11 @@ miri_ub_span = "src/lib.rs:481:9"
 fuel = 128
 [tests.known_anneal_bug]
 status = "open_bug"
-bug_class = "soundness_false_negative"
-observed_anneal_tag = "pass:unit"
+bug_class = "ub_location_mismatch"
+observed_anneal_tag = "ub"
+observed_anneal_ub_span = "src/lib.rs:480:19: 480:39"
 suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Places"
-summary = "BinOp.offset does not check allocation bounds and writePlaceValue ignores ProvenancePtr.offsetBytes, overwriting field 0 instead of faulting with FailureKind.ub on an out-of-bounds pointer write."
+summary = "ptrAllocByteBound? bounds-checks `&raw mut pair.a` against field `a`'s 4-byte span rather than the enclosing 8-byte `PairU32` allocation, faulting with FailureKind.ub on `offset(base, 2isize)` instead of `*oob = 99`."
 
 [[tests]]
 name = "ub_ptr_offset_negative_before_start"
@@ -467,12 +469,6 @@ upstream_path = "tests/fail/intrinsics/ptr_offset_out_of_bounds_neg.rs"
 miri_verdict = "ub"
 miri_ub_span = "src/lib.rs:490:22"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "soundness_false_negative"
-observed_anneal_tag = "pass:scalar:10:4"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Operands"
-summary = "BinOp.offset wraps negative isize offsets in unsigned modular arithmetic without checking allocation bounds, and readPlace ignores ProvenancePtr.offsetBytes instead of faulting with FailureKind.ub."
 
 [[tests]]
 name = "ub_unaligned_ptr_read_u32"
@@ -481,12 +477,6 @@ upstream_path = "tests/fail/unaligned_pointers/unaligned_ptr1.rs"
 miri_verdict = "ub"
 miri_ub_span = "src/lib.rs:504:9"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "soundness_false_negative"
-observed_anneal_tag = "pass:scalar:67305985:4"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Places"
-summary = "readPlace ignores ProvenancePtr.offsetBytes (1 byte) and does not check pointer alignment against the target type layout alignment (4 bytes for u32), returning field 0 instead of faulting with FailureKind.ub."
 
 [[tests]]
 name = "pass_assume_true"

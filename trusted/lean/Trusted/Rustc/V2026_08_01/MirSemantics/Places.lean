@@ -1452,9 +1452,9 @@ defaulting to `8` bytes (64-bit target) when `layouts.pointerBits == 0`.
 -/
 @[reducible]
 def layoutPointerBytes (layouts : LayoutTable) : Nat :=
-  match Nat.beq layouts.pointerBits 0 with
-  | true => 8
-  | false => Nat.div layouts.pointerBits 8
+  match layouts.pointerBits with
+  | 0 => 8
+  | n + 1 => Nat.div (n + 1) 8
 
 /--
 Evaluate a `ConstValue` to a runtime `Value`, decoding `ConstValue.slice` to the
@@ -3580,51 +3580,71 @@ def invalidateDerefWriteBorrows
   | single :: .nil =>
     let b := single :: .nil
     match get? locals₁ dst.local_ with
-    | .some (.init (.ptr ptrVal _)) =>
-      match lookupBorrow b ptrVal.tag with
-      | .some entry =>
-        let fullProj := appendProjections entry.targetProjection restProj
-        match fullProj with
-        | .nil =>
-          match Nat.beq entry.rangeLen 0 with
-          | true =>
-            invalidateConflictingBorrows
-              b
-              entry.targetLocal
-              (.some ptrVal.tag)
-          | false =>
+    | .some (.init ptrOrFatVal) =>
+      match extractDerefPtrVal? ptrOrFatVal with
+      | .some ptrVal =>
+        match lookupBorrow b ptrVal.tag with
+        | .some entry =>
+          let fullProj :=
+            resolveDerefWriteFullProj
+              locals₁
+              locals₁
+              ptrOrFatVal
+              entry
+              restProj
+              callerLocals
+          match fullProj with
+          | .nil =>
+            match Nat.beq entry.rangeLen 0 with
+            | true =>
+              invalidateConflictingBorrows
+                b
+                entry.targetLocal
+                (.some ptrVal.tag)
+            | false =>
+              invalidateConflictingBorrowsAtProj
+                b
+                entry.targetLocal
+                (.some ptrVal.tag)
+                .nil
+                entry.rangeOffset
+                entry.rangeLen
+          | pHead :: pTail =>
             invalidateConflictingBorrowsAtProj
               b
               entry.targetLocal
               (.some ptrVal.tag)
-              .nil
+              (pHead :: pTail)
               entry.rangeOffset
               entry.rangeLen
-        | pHead :: pTail =>
-          invalidateConflictingBorrowsAtProj
-            b
-            entry.targetLocal
-            (.some ptrVal.tag)
-            (pHead :: pTail)
-            entry.rangeOffset
-            entry.rangeLen
+        | .none => b
       | .none => b
     | _ => b
   | b₁ :: b₂ :: restBorrows =>
     let allBorrows := b₁ :: b₂ :: restBorrows
     match get? locals₁ dst.local_ with
-    | .some (.init (.ptr ptrVal _)) =>
-      match lookupBorrow allBorrows ptrVal.tag with
-      | .some entry =>
-        let fullProj := appendProjections entry.targetProjection restProj
-        invalidateTreeBorrowsAtProj
-          allBorrows
-          allBorrows
-          entry.targetLocal
-          (.some ptrVal.tag)
-          fullProj
-          entry.rangeOffset
-          entry.rangeLen
+    | .some (.init ptrOrFatVal) =>
+      match extractDerefPtrVal? ptrOrFatVal with
+      | .some ptrVal =>
+        match lookupBorrow allBorrows ptrVal.tag with
+        | .some entry =>
+          let fullProj :=
+            resolveDerefWriteFullProj
+              locals₁
+              locals₁
+              ptrOrFatVal
+              entry
+              restProj
+              callerLocals
+          invalidateTreeBorrowsAtProj
+            allBorrows
+            allBorrows
+            entry.targetLocal
+            (.some ptrVal.tag)
+            fullProj
+            entry.rangeOffset
+            entry.rangeLen
+        | .none => allBorrows
       | .none => allBorrows
     | _ => allBorrows
 
@@ -5215,6 +5235,23 @@ ends with `.subslice elemOffset endOffset false`, so dereferencing at
 `offsetBytes = 0` (e.g. `*slice.as_ptr()`) or after `BinOp.offset` accesses
 individual elements within `[elemOffset .. endOffset)` rather than the whole
 enclosing array aggregate.
+
+When `parentEntry` projects a field at byte offset `0` whose value is not yet
+initialized (such as an inactive array field of a `union` before
+`copy_nonoverlapping`), pointer-to-pointer casts do not dereference memory and
+preserve the thin pointer `ptrVal` unchanged so untyped byte operations can
+inspect `parentEntry.targetProjection` while typed dereferences still fault with
+`.ub`.
+
+Reference (The Rust Reference, "Pointer-to-pointer cast"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#pointer-to-pointer-cast>
+
+> "`*const T` / `*mut T` can be cast to `*const U` / `*mut U` with the
+> following behavior:
+> - If `T` and `U` are both sized, the pointer is returned unchanged.
+> - If `T` is unsized and `U` is sized, the cast discards all metadata that
+>   completes the wide pointer `T` and produces a thin pointer `U` consisting
+>   of the data part of the unsized pointer."
 -/
 def deriveStackElemThinPtr
     (locals : List LocalSlot)
@@ -5318,6 +5355,10 @@ def deriveStackElemThinPtr
                 nextTag := Nat.add tag 1
               }
               .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
+        | .ub =>
+          match normProj, Nat.beq ptrVal.offsetBytes 0 with
+          | .field _ _ :: _, true => .ok (.ptr ptrVal 8) locals mem
+          | _, _ => .ub
         | _ => .ub
 
 /--
@@ -6835,7 +6876,7 @@ def evalRvalue
     (layouts : LayoutTable := emptyLayoutTable) :
     RvalueEvalResult :=
   match rv with
-  | .use op =>
+  | .use op | .wrapUnsafeBinder op _ =>
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
     | .ok v locals' =>
       match op, mem.borrows with
@@ -7237,11 +7278,6 @@ def evalRvalue
           .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
   | .len place =>
     evalPlaceLen locals place mem localDecls layouts
-  | .wrapUnsafeBinder op _ =>
-    match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
-    | .ok v locals' => .ok v locals' mem
-    | .ub => .ub
-    | .unsupported => .unsupported
   | .cast .intToInt op targetTy =>
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
     | .ok (.scalar sc) locals' =>
@@ -7370,7 +7406,7 @@ def evalRvalue
           (Nat.beq ptrSz ptrBytes)
           (Nat.beq metaSc.sizeBytes ptrBytes)
       with
-      | true => .ok (.scalar ⟨metaSc.bits, ptrBytes⟩) locals' mem
+      | true => .ok (.scalar ⟨metaSc.bits, metaSc.sizeBytes⟩) locals' mem
       | false => .ub
     | .ok (.aggregate 0 elems) locals' =>
       .ok (.scalar ⟨length elems, ptrBytes⟩) locals' mem

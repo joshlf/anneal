@@ -499,7 +499,7 @@ fn gate3_cross_check_real_miri_diff_manifest() {
     let valid_registry = parse_correspondence_gaps(&valid_xref_toml).unwrap();
     let cross_report = cross_check_miri_diff(&miri_manifest, &valid_registry)
         .expect("valid cross-reference against real manifest.toml must succeed");
-    assert_eq!(cross_report.total_miri_known_bugs, 8);
+    assert_eq!(cross_report.total_miri_known_bugs, 6);
     assert_eq!(
         cross_report.matched_cross_refs,
         vec![(

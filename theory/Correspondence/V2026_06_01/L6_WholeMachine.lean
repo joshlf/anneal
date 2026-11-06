@@ -37,11 +37,12 @@ and proves step simulation and `Trusted.Refinement.GuardedRefines` against MiniR
 /-! ## 1. Initial Machine Configuration Correspondence -/
 
 /-- Universal characterization of `initMachineState` and `initMachineStateWithCallees`
-(`Machine.lean:42-95` vs. `spec/lang/machine.md:120-165`): both initialize the
+(`Machine.lean:42-99` vs. `spec/lang/machine.md:120-165`): both initialize the
 entry stack frame at `blockIdx = 0` and `stmtIdx = 0` with `callStack = []`,
 `activeCallee = none`, and initial borrow tag counter `nextTag = 1`;
-`initMachineStateWithCallees` also seeds `Memory.traitImpls` with
-`body.traitImpls`. -/
+when `callees` is non-empty, `initMachineStateWithCallees` also seeds
+`Memory.traitImpls` with `body.traitImpls` (and reduces definitionally to
+`initMachineState body args` when `callees = []`). -/
 theorem mir_initMachineState_pc_zero
     (body : CapturedMir) (args : List Value) (callees : List CapturedMir) :
     (initMachineState body args).frame.blockIdx = 0 ∧
@@ -55,8 +56,10 @@ theorem mir_initMachineState_pc_zero
     (initMachineStateWithCallees body args callees).memory.activeCallee = none ∧
     (initMachineStateWithCallees body args callees).memory.nextTag = 1 ∧
     (initMachineStateWithCallees body args callees).memory.callees = callees ∧
-    (initMachineStateWithCallees body args callees).memory.traitImpls = body.traitImpls := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+    (initMachineStateWithCallees body args []).memory.traitImpls = [] ∧
+    (∀ c cs, (initMachineStateWithCallees body args (c :: cs)).memory.traitImpls = body.traitImpls) := by
+  cases callees <;>
+    exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩
 
 /-! ## 2. Program-Counter Statement-vs-Terminator Dispatch Correspondence -/
 

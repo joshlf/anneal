@@ -1156,6 +1156,278 @@ theorem evalUnaryNotSymCont_eq
       k (evalUnaryNot sc optTy locals mem) := by
   rw [evalUnaryNotSymCont, SymTree.run_eq_eval, evalUnaryNotSymTree_eval]
 
+theorem SymTree.eval_branch_leaf (c : Bool) (x y : α) :
+    (SymTree.branch c (.leaf x) (.leaf y)).eval =
+      match c with
+      | true => x
+      | false => y := by
+  cases c <;> rfl
+
+/-- Helper for the final bounds check of `evalBinOpOffsetSymTree`. -/
+def finishBinOpOffsetSymTree
+    (ptrVal : ProvenancePtr)
+    (ptrSizeBytes : Nat)
+    (allocBoundOpt : Option Nat)
+    (locals₂ : List LocalSlot)
+    (mem : Memory)
+    (newOffset : Nat) :
+    SymTree RvalueEvalResult :=
+  .branch
+    (match allocBoundOpt with
+     | .none =>
+       Bool.not (Nat.ble (signedHalfModulus 8) ptrVal.offsetBytes)
+     | .some bound =>
+       Bool.or
+         (Bool.and
+           (Nat.beq ptrVal.allocId 0)
+           (Bool.and
+             (Nat.beq bound 0)
+             (Bool.and
+               (Nat.beq newOffset ptrVal.offsetBytes)
+               (Bool.not (Nat.ble (signedHalfModulus 8) ptrVal.offsetBytes)))))
+         (Bool.and
+           (Bool.not (Nat.ble (signedHalfModulus 8) bound))
+           (Bool.and
+             (Nat.ble ptrVal.offsetBytes bound)
+             (Nat.ble newOffset bound))))
+    (.leaf (.ok (.ptr { ptrVal with offsetBytes := newOffset } ptrSizeBytes) locals₂ mem))
+    (.leaf .ub)
+
+theorem finishBinOpOffsetSymTree_eval
+    (ptrVal : ProvenancePtr)
+    (ptrSizeBytes : Nat)
+    (allocBoundOpt : Option Nat)
+    (locals₂ : List LocalSlot)
+    (mem : Memory)
+    (newOffset : Nat) :
+    (finishBinOpOffsetSymTree ptrVal ptrSizeBytes allocBoundOpt locals₂ mem newOffset).eval =
+      match
+        (match allocBoundOpt with
+         | .none =>
+           Bool.not (Nat.ble (signedHalfModulus 8) ptrVal.offsetBytes)
+         | .some bound =>
+           Bool.or
+             (Bool.and
+               (Nat.beq ptrVal.allocId 0)
+               (Bool.and
+                 (Nat.beq bound 0)
+                 (Bool.and
+                   (Nat.beq newOffset ptrVal.offsetBytes)
+                   (Bool.not (Nat.ble (signedHalfModulus 8) ptrVal.offsetBytes)))))
+             (Bool.and
+               (Bool.not (Nat.ble (signedHalfModulus 8) bound))
+               (Bool.and
+                 (Nat.ble ptrVal.offsetBytes bound)
+                 (Nat.ble newOffset bound))))
+      with
+      | true => .ok (.ptr { ptrVal with offsetBytes := newOffset } ptrSizeBytes) locals₂ mem
+      | false => .ub :=
+  SymTree.eval_branch_leaf _ _ _
+
+/-- Decision-tree symbolic `evalBinOpOffset` returning `RvalueEvalResult`. -/
+def evalBinOpOffsetSymTree
+    (ptrVal : ProvenancePtr)
+    (ptrSizeBytes : Nat)
+    (offsetSc : ScalarInt)
+    (elemStride : Nat)
+    (allocBoundOpt : Option Nat)
+    (locals₂ : List LocalSlot)
+    (mem : Memory) :
+    SymTree RvalueEvalResult :=
+  .branch
+    (Bool.and (Nat.beq ptrSizeBytes 8) (Nat.beq offsetSc.sizeBytes 8))
+    (let modulus := scalarModulus 8
+     let halfMod := signedHalfModulus 8
+     let offsetBits := wrapScalarBits offsetSc.bits modulus
+     .branch (isSignedNegative offsetBits 8)
+       (let countMag := Nat.sub modulus offsetBits
+        let byteDelta := Nat.mul countMag elemStride
+        .branch
+          (Bool.and
+            (Bool.not (Nat.ble halfMod byteDelta))
+            (Nat.ble byteDelta ptrVal.offsetBytes))
+          (finishBinOpOffsetSymTree ptrVal ptrSizeBytes allocBoundOpt locals₂ mem
+            (Nat.sub ptrVal.offsetBytes byteDelta))
+          (.leaf .ub))
+       (let byteDelta := Nat.mul offsetBits elemStride
+        .branch (Nat.ble halfMod byteDelta)
+          (.leaf .ub)
+          (let candidate := Nat.add ptrVal.offsetBytes byteDelta
+           .branch (Nat.ble halfMod candidate)
+             (.leaf .ub)
+             (finishBinOpOffsetSymTree ptrVal ptrSizeBytes allocBoundOpt locals₂ mem candidate))))
+    (.leaf .ub)
+
+theorem evalBinOpOffsetSymTree_eval
+    (ptrVal : ProvenancePtr)
+    (ptrSizeBytes : Nat)
+    (offsetSc : ScalarInt)
+    (elemStride : Nat)
+    (allocBoundOpt : Option Nat)
+    (locals₂ : List LocalSlot)
+    (mem : Memory) :
+    (evalBinOpOffsetSymTree ptrVal ptrSizeBytes offsetSc elemStride allocBoundOpt locals₂ mem).eval =
+      match evalBinOpOffset ptrVal ptrSizeBytes offsetSc elemStride allocBoundOpt with
+      | .some newPtrVal => .ok (.ptr newPtrVal ptrSizeBytes) locals₂ mem
+      | .none => .ub := by
+  unfold evalBinOpOffsetSymTree evalBinOpOffset SymTree.eval
+  cases Bool.and (Nat.beq ptrSizeBytes 8) (Nat.beq offsetSc.sizeBytes 8) with
+  | false => rfl
+  | true =>
+    dsimp only [SymTree.eval]
+    cases isSignedNegative (wrapScalarBits offsetSc.bits (scalarModulus 8)) 8 with
+    | true =>
+      dsimp only [SymTree.eval]
+      cases Bool.and
+        (Bool.not (Nat.ble (signedHalfModulus 8)
+          (Nat.mul (Nat.sub (scalarModulus 8) (wrapScalarBits offsetSc.bits (scalarModulus 8))) elemStride)))
+        (Nat.ble
+          (Nat.mul (Nat.sub (scalarModulus 8) (wrapScalarBits offsetSc.bits (scalarModulus 8))) elemStride)
+          ptrVal.offsetBytes) with
+      | false => rfl
+      | true =>
+        dsimp only [SymTree.eval]
+        rw [finishBinOpOffsetSymTree_eval]
+        cases allocBoundOpt with
+        | none =>
+          dsimp only
+          cases Bool.not (Nat.ble (signedHalfModulus 8) ptrVal.offsetBytes) <;> rfl
+        | some bound =>
+          dsimp only
+          cases
+            Bool.or
+              (Bool.and
+                (Nat.beq ptrVal.allocId 0)
+                (Bool.and
+                  (Nat.beq bound 0)
+                  (Bool.and
+                    (Nat.beq
+                      (Nat.sub ptrVal.offsetBytes
+                        (Nat.mul
+                          (Nat.sub (scalarModulus 8)
+                            (wrapScalarBits offsetSc.bits (scalarModulus 8)))
+                          elemStride))
+                      ptrVal.offsetBytes)
+                    (Bool.not (Nat.ble (signedHalfModulus 8) ptrVal.offsetBytes)))))
+              (Bool.and
+                (Bool.not (Nat.ble (signedHalfModulus 8) bound))
+                (Bool.and
+                  (Nat.ble ptrVal.offsetBytes bound)
+                  (Nat.ble
+                    (Nat.sub ptrVal.offsetBytes
+                      (Nat.mul
+                        (Nat.sub (scalarModulus 8)
+                          (wrapScalarBits offsetSc.bits (scalarModulus 8)))
+                        elemStride))
+                    bound))) <;> rfl
+    | false =>
+      dsimp only [SymTree.eval]
+      cases Nat.ble (signedHalfModulus 8)
+        (Nat.mul (wrapScalarBits offsetSc.bits (scalarModulus 8)) elemStride) with
+      | true => rfl
+      | false =>
+        dsimp only [SymTree.eval]
+        cases Nat.ble (signedHalfModulus 8)
+          (Nat.add ptrVal.offsetBytes
+            (Nat.mul (wrapScalarBits offsetSc.bits (scalarModulus 8)) elemStride)) with
+        | true => rfl
+        | false =>
+          dsimp only [SymTree.eval]
+          rw [finishBinOpOffsetSymTree_eval]
+          cases allocBoundOpt with
+          | none =>
+            dsimp only
+            cases Bool.not (Nat.ble (signedHalfModulus 8) ptrVal.offsetBytes) <;> rfl
+          | some bound =>
+            dsimp only
+            cases
+              Bool.or
+                (Bool.and
+                  (Nat.beq ptrVal.allocId 0)
+                  (Bool.and
+                    (Nat.beq bound 0)
+                    (Bool.and
+                      (Nat.beq
+                        (Nat.add ptrVal.offsetBytes
+                          (Nat.mul (wrapScalarBits offsetSc.bits (scalarModulus 8)) elemStride))
+                        ptrVal.offsetBytes)
+                      (Bool.not (Nat.ble (signedHalfModulus 8) ptrVal.offsetBytes)))))
+                (Bool.and
+                  (Bool.not (Nat.ble (signedHalfModulus 8) bound))
+                  (Bool.and
+                    (Nat.ble ptrVal.offsetBytes bound)
+                    (Nat.ble
+                      (Nat.add ptrVal.offsetBytes
+                        (Nat.mul (wrapScalarBits offsetSc.bits (scalarModulus 8)) elemStride))
+                      bound))) <;> rfl
+
+/-- Decision-tree symbolic `evalPtrOffsetBinOp`. -/
+def evalPtrOffsetBinOpSymTree
+    (locals₂ : List LocalSlot)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (lhsOp : Operand)
+    (ptrVal : ProvenancePtr)
+    (sz : Nat)
+    (offsetSc : ScalarInt) :
+    SymTree RvalueEvalResult :=
+  let borrowDisabled :=
+    match lookupBorrow mem.borrows ptrVal.tag with
+    | .some { perm := .disabled, .. } => true
+    | _ => false
+  match borrowDisabled with
+  | true => .leaf .ub
+  | false =>
+    match pointeeElemByteStride localDecls layouts lhsOp with
+    | .none => .leaf .ub
+    | .some elemStride =>
+      evalBinOpOffsetSymTree
+        ptrVal
+        sz
+        offsetSc
+        elemStride
+        (ptrAllocByteBound? locals₂ mem localDecls layouts ptrVal)
+        locals₂
+        mem
+
+theorem evalPtrOffsetBinOpSymTree_eval
+    (locals₂ : List LocalSlot)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (lhsOp : Operand)
+    (ptrVal : ProvenancePtr)
+    (sz : Nat)
+    (offsetSc : ScalarInt) :
+    (evalPtrOffsetBinOpSymTree locals₂ mem localDecls layouts lhsOp ptrVal sz offsetSc).eval =
+      evalPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp ptrVal sz offsetSc := by
+  unfold evalPtrOffsetBinOpSymTree evalPtrOffsetBinOp
+  have h_stride :
+      (match pointeeElemByteStride localDecls layouts lhsOp with
+       | .none => SymTree.leaf RvalueEvalResult.ub
+       | .some elemStride =>
+         evalBinOpOffsetSymTree ptrVal sz offsetSc elemStride
+           (ptrAllocByteBound? locals₂ mem localDecls layouts ptrVal) locals₂ mem).eval =
+      match pointeeElemByteStride localDecls layouts lhsOp with
+      | .none => RvalueEvalResult.ub
+      | .some elemStride =>
+        match evalBinOpOffset ptrVal sz offsetSc elemStride
+          (ptrAllocByteBound? locals₂ mem localDecls layouts ptrVal) with
+        | .some newPtrVal => RvalueEvalResult.ok (Value.ptr newPtrVal sz) locals₂ mem
+        | .none => RvalueEvalResult.ub := by
+    cases pointeeElemByteStride localDecls layouts lhsOp with
+    | none => rfl
+    | some elemStride =>
+      exact evalBinOpOffsetSymTree_eval ptrVal sz offsetSc elemStride _ locals₂ mem
+  cases lookupBorrow mem.borrows ptrVal.tag with
+  | none => exact h_stride
+  | some entry =>
+    rcases entry with ⟨_, _, _, perm, _, _, _, _⟩
+    cases perm with
+    | disabled => rfl
+    | _ => exact h_stride
+
 /-- Decision-tree symbolic `evalRvalue`. -/
 def evalRvalueSymTree
     (locals : List LocalSlot)
@@ -1176,7 +1448,7 @@ def evalRvalueSymTree
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
-            .leaf (evalPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp ptrVal sz offsetSc)
+            evalPtrOffsetBinOpSymTree locals₂ mem localDecls layouts lhsOp ptrVal sz offsetSc
           | _ => .leaf .unsupported
         | _, _ => .leaf .unsupported
       | .ub => .leaf .ub
@@ -1222,9 +1494,12 @@ theorem evalRvalueSymTree_eval
           | _ => rfl
         | ptr ptrVal sz =>
           cases rhsVal with
-          | scalar _ =>
+          | scalar offsetSc =>
             dsimp only
-            cases op <;> rfl
+            cases op with
+            | offset =>
+              exact evalPtrOffsetBinOpSymTree_eval locals₂ mem localDecls layouts lhsOp ptrVal sz offsetSc
+            | _ => rfl
           | _ => rfl
         | _ => rfl
   | unaryOp uop op =>

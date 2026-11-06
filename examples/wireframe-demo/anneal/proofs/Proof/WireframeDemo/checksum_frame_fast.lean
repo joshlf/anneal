@@ -505,7 +505,17 @@ private def evalRvalueFast
   match rv with
   | .use op =>
     match evalOperandFast ctx locals op mem.borrows mem.globals mem.callerLocals with
-    | .ok v locals' => .ok v locals' mem
+    | .ok v locals' =>
+      match op, mem.borrows with
+      | .copy { local_ := ptrLoc, projection := .deref :: restProj },
+        b₁ :: b₂ :: restBorrows =>
+        .ok v locals'
+          { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) }
+      | .move { local_ := ptrLoc, projection := .deref :: restProj },
+        b₁ :: b₂ :: restBorrows =>
+        .ok v locals'
+          { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) }
+      | _, _ => .ok v locals' mem
     | .ub => .ub
     | .unsupported => .unsupported
   | .cast ck op targetTy =>
@@ -550,7 +560,7 @@ private def evalRvalueFast
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
-            .ok (.ptr { ptrVal with offsetBytes := Nat.add ptrVal.offsetBytes offsetSc.bits } sz) locals₂ mem
+            evalPtrOffsetBinOp locals₂ mem ctx.localDecls ctx.layouts lhsOp ptrVal sz offsetSc
           | _ => .unsupported
         | _, _ => .unsupported
       | .ub => .ub
@@ -611,9 +621,6 @@ private theorem evalRvalueFast_eq
       | _ => rfl
     | neg => rfl
     | ptrMetadata => rfl
-  | ref bk p =>
-    dsimp only [evalRvalueFast, evalRvalue]
-    cases bk <;> cases p.projection <;> rfl
   | _ => rfl
 
 private def finishAssignStmtNodeFast
@@ -1419,7 +1426,7 @@ private theorem evalByteCastAfterOperand_frame8
     evalByteCastAfterOperand
       fastCtx
       (.move { local_ := 3, projection := .nil })
-      { kind := .array (.uint .u16) 4, layoutIdx := 2 }
+      { kind := .array (.uint .u16) 4, layoutIdx := 5 }
       (.aggregate 0
         [ .scalar { bits := b0, sizeBytes := 1 }
         , .scalar { bits := b1, sizeBytes := 1 }
@@ -1540,6 +1547,7 @@ private theorem impl_verified :
       rootFrame8Ptr, frame8Value, sharedFrame8Borrow, frame8SlotIdx,
       readProjectedValue_nil, readProjectedValue_field, readProjectedValue_index,
       ProvenancePtr.tag, lookupBorrow, appendProjections, stripTransparentProjections,
+      needsThinPtrElemResolution,
       freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, not, Bool.rec, Bool.casesOn,
       projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
       byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
@@ -1552,8 +1560,7 @@ private theorem impl_verified :
       get?, set?, length, Nat.add, Nat.mod, Nat.ble, Nat.beq, Bool.and, Bool.or, Bool.not,
       ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
       Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
-
-    dsimp only [Trusted.Effect.Effect.I, Trusted.Effect.Effect.O, Trusted.Rustc.V2026_06_01.MirSemantics.MirEffect, Trusted.Rustc.V2026_06_01.MirSemantics.MirStepNode, Trusted.ITree.ITreeF]
+    try dsimp only [Trusted.Effect.SumE, Trusted.Effect.Effect.I, Trusted.Effect.Effect.O, Trusted.Rustc.V2026_06_01.MirSemantics.MirEffect, Trusted.Rustc.V2026_06_01.MirSemantics.MirStepNode, Trusted.ITree.ITreeF]
     simp only [Nat.add_eq, Nat.mul_eq, Nat.div_eq,
       uint8_ofNat_toBitVec_toNat_of_lt hb0,
       uint8_ofNat_toBitVec_toNat_of_lt hb1,
@@ -1606,8 +1613,7 @@ private theorem impl_verified :
           4294967296 =
           (b0 * 256 + b1) + (b2 * 256 + b3) + (b4 * 256 + b5) + (b6 * 256 + b7) :=
       wrapScalarBits_eq_of_lt (by omega)
-
-    dsimp only [Trusted.Effect.Effect.I, Trusted.Effect.Effect.O, Trusted.Rustc.V2026_06_01.MirSemantics.MirEffect, Trusted.Rustc.V2026_06_01.MirSemantics.MirStepNode, Trusted.ITree.ITreeF]
+    try dsimp only [Trusted.Effect.SumE, Trusted.Effect.Effect.I, Trusted.Effect.Effect.O, Trusted.Rustc.V2026_06_01.MirSemantics.MirEffect, Trusted.Rustc.V2026_06_01.MirSemantics.MirStepNode, Trusted.ITree.ITreeF]
     simp only [h_c0, h_c1, h_c2, h_c3, h_ovf1, h_s1, h_ovf2, h_s2, h_ovf3, h_s3]
     rfl
   · refine ⟨trivial, rfl, ?_⟩
@@ -1684,6 +1690,7 @@ private theorem spec_verified :
     rootFrame8Ptr, frame8Value, sharedFrame8Borrow, frame8SlotIdx,
     readProjectedValue_nil, readProjectedValue_field, readProjectedValue_index,
     ProvenancePtr.tag, lookupBorrow, appendProjections, stripTransparentProjections,
+    needsThinPtrElemResolution,
     freezeDerefReadBorrowsAt, updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf, isBorrowDescendantOrSelfAux, resolveStackThinPtrTargetProj?, endsWithSubslice, normalizeSubsliceProjections, normalizeSubsliceProjectionsAux, startsWithArrayOrSliceProj, splitLastConstantIndex?, readProjectedValue, sharedBorrowPerm, tyIsFreeze, not, Bool.rec, Bool.casesOn,
       projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
     byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
@@ -1716,6 +1723,7 @@ private theorem spec_verified :
   have h_or3 : bitwiseOrBits 32 (wrapScalarBits (b6 * 256) 4294967296) b7 = b6 * 256 + b7 := by
     rw [wrapScalarBits_eq_of_lt (by omega)]
     exact bitwiseOrBits_32_mul256_add (by omega) hb7
+  try dsimp only [Trusted.Effect.SumE, Trusted.Effect.Effect.I, Trusted.Effect.Effect.O, Trusted.Rustc.V2026_06_01.MirSemantics.MirEffect, Trusted.Rustc.V2026_06_01.MirSemantics.MirStepNode, Trusted.ITree.ITreeF]
   simp only [Nat.add_eq, Nat.mul_eq,
     h_wb0, h_wb1, h_wb2, h_wb3, h_wb4, h_wb5, h_wb6, h_wb7,
     h_or0, h_or1, h_or2, h_or3]
@@ -1756,6 +1764,7 @@ private theorem spec_verified :
         4294967296 =
         (b0 * 256 + b1) + (b2 * 256 + b3) + (b4 * 256 + b5) + (b6 * 256 + b7) :=
     wrapScalarBits_eq_of_lt (by omega)
+  try dsimp only [Trusted.Effect.SumE, Trusted.Effect.Effect.I, Trusted.Effect.Effect.O, Trusted.Rustc.V2026_06_01.MirSemantics.MirEffect, Trusted.Rustc.V2026_06_01.MirSemantics.MirStepNode, Trusted.ITree.ITreeF]
   simp only [h_ovf1, h_w1, h_ovf2, h_w2, h_ovf3, h_w3, h_ovf4, h_w4]
   rfl
 

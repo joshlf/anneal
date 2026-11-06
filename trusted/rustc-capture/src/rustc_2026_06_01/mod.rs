@@ -1085,7 +1085,7 @@ pub fn hint(x: bool) -> u32 {
 
         let hint_lean = read_mir_module("ipath::hint");
         assert!(
-            hint_lean.contains("(RigidTy.fnDef \"std::hint::unreachable_unchecked\""),
+            hint_lean.contains("(RigidTy.fnDef \"core::hint::unreachable_unchecked\""),
             "hint:\n{hint_lean}"
         );
 

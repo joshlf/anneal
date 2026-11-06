@@ -241,7 +241,7 @@ def evalAnnealV2026_06_01 (prog : FixtureProg) (_st : FixtureState) : Verdict :=
     | .ub => .ub
     | .unsupported => .unsupported
   | .exactDivIntrinsicCall =>
-    let fnTy : Ty := { kind := .fnDef "core::intrinsics::exact_div" .nil, layoutIdx := 0 }
+    let fnTy : Ty := { kind := .fnDef "core::intrinsics::exact_div" [.uint .u32], layoutIdx := 0 }
     let funcOp : Operand := .constant { ty := fnTy, val := .zeroSized }
     let argOps : List Operand := [
       .copy { local_ := 1, projection := .nil },

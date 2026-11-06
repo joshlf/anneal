@@ -485,7 +485,7 @@ private def evalRvalueSymTreeFast
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
-            .leaf (evalPtrOffsetBinOp locals₂ mem ctx.localDecls ctx.layouts lhsOp ptrVal sz offsetSc)
+            evalPtrOffsetBinOpSymTree locals₂ mem ctx.localDecls ctx.layouts lhsOp ptrVal sz offsetSc
           | _ => .leaf .unsupported
         | _, _ => .leaf .unsupported
       | .ub => .leaf .ub

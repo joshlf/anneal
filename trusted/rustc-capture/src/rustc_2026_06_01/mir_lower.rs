@@ -80,9 +80,11 @@ pub use crate::rustc_2026_06_01::specs::{
 ///
 /// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/print/pretty.rs#L362-L365
 ///
-/// Other items keep their visible paths (for example `std::option::Option`
-/// and `std::hint::unreachable_unchecked`), which the semantics and
-/// specifications already match.
+/// Non-intrinsic items defined in `core` or `alloc` have visible `std::`
+/// re-export prefixes normalized to their defining crate (`core::` or
+/// `alloc::`, for example `core::option::Option` and
+/// `core::hint::unreachable_unchecked`) so `std` and `#![no_std]` crates emit
+/// consistent canonical paths across cross-crate call boundaries.
 pub fn canonical_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
     if let Some(parent_id) = tcx.opt_parent(def_id)
         && let DefKind::Impl { of_trait: false } = tcx.def_kind(parent_id)

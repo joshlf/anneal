@@ -108,20 +108,20 @@ assert data["total_candidates"] == 77
 assert data["compiled_candidates"] == 77
 assert data["compile_failed_candidates"] == 0
 assert data["compared_candidates"] == 75
-assert data["agree_count"] == 69
-assert data["diverge_count"] == 6
-assert data["kernel_confirmed_divergences"] == 6
+assert data["agree_count"] == 71
+assert data["diverge_count"] == 4
+assert data["kernel_confirmed_divergences"] == 4
 assert data["not_compared_count"] == 2
 
 div_classes = data["divergence_classes"]
 assert div_classes == {
-    "false_positive_ub": 0,
-    "missed_ub": 5,
+    "false_positive_ub": 1,
+    "missed_ub": 1,
     "panic_site_mismatch": 0,
     "panic_vs_return": 0,
     "return_vs_panic": 0,
-    "ub_location_mismatch": 0,
-    "wrong_value": 1,
+    "ub_location_mismatch": 2,
+    "wrong_value": 0,
 }, f"unexpected divergence_classes: {div_classes}"
 
 nc = data["not_compared_reasons"]
@@ -142,11 +142,9 @@ assert sum(ext.values()) == 2, f"unexpected ext sum: {ext}"
 
 expected_findings = {
     "ub_transmute_invalid_bool_through_ptr": "missed_ub",
-    "pass_ptr_offset_within_array": "wrong_value",
-    "ub_ptr_offset_oob_read": "missed_ub",
-    "ub_ptr_offset_oob_write": "missed_ub",
-    "ub_ptr_offset_negative_before_start": "missed_ub",
-    "ub_unaligned_ptr_read_u32": "missed_ub",
+    "pass_ptr_offset_within_array": "false_positive_ub",
+    "ub_ptr_offset_oob_read": "ub_location_mismatch",
+    "ub_ptr_offset_oob_write": "ub_location_mismatch",
 }
 
 manifest = tomllib.loads(manifest_path.read_text())
@@ -168,7 +166,7 @@ manifest_ext = {
 assert len(manifest_ext) == 2, f"expected 2 externalCall entries in manifest, got {manifest_ext}"
 
 findings = data["findings"]
-assert len(findings) == 6
+assert len(findings) == 4
 actual_map = {f["fn_name"]: f["divergence_class"] for f in findings}
 assert actual_map == expected_findings, f"mismatch: {actual_map} vs {expected_findings}"
 
