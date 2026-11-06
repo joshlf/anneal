@@ -20,28 +20,39 @@ All `FF-2.1` definitions and theorem signatures (`PureState`, `MirFrameSim`,
 `MirLiftCore.lean`, `MirLift.lean`, and `MirLiftBench.lean` compile without
 modification. `theory/Anneal/PureMirExec.lean` adds:
 
-1. **Compositional 1-Step Callee Summaries (`PureMirConverges.call_summary`,
-   `PureMirConvergesWithCallees.call_summary`, `MirWpConverges.call_summary`)**:
-   - Introduces `ActiveRootMemory` (`mem' = mem₀ ∨ mem' = { mem₀ with
-     activeCallee := some body }`) and stack-suffix simulation
+1. **Compositional 1-Step Callee & Tail-Call Summaries
+   (`PureMirConverges.call_summary`, `PureMirConverges.tailCall_summary`,
+   `PureMirConvergesWithCallees.{call_summary,tailCall_summary}`,
+   `MirWpConverges.{call_summary,tailCall_summary,tailCall_nested_summary}`)**:
+   - Introduces `ActiveRootMemory` (`mem' = mem₀ ∨ ∃ activeBody, mem' = { mem₀
+     with activeCallee := some activeBody }`) and stack-suffix simulation
      (`Memory.pushBaseStack`, `wpMirExecNoCallSym_pushCalleeFrame`) so an
-     established callee summary lifts across arbitrary caller `callStack`s and
+     established callee summary (including callees ending in
+     `TerminatorKind.tailCall`) lifts across arbitrary caller `callStack`s and
      restores caller locals, `activeCallee`, and `activeProtectors` on return.
-   - Resolves direct and polymorphic `(defPath, typeArgs)` callees via
-     `lookupCallee` and `checkCalleeTargetCompatible` (`callDepth <
-     maxCallDepth`), advancing the caller to `targetBb` with `dest := retVal` in
-     1 compositional step without re-stepping callee basic blocks or guessing
-     combined fuel.
-2. **Inline Pure Callee Checker (`checkPureMirWithCallees`) & Soundness**:
+   - Resolves direct, trait-dispatched (`TraitImplEntry`), and polymorphic
+     `(defPath, typeArgs)` callees via `lookupCallee` and
+     `checkCalleeTargetCompatible` (`callDepth < maxCallDepth`), advancing the
+     caller in 1 compositional step without re-stepping callee basic blocks or
+     guessing combined fuel.
+2. **Inline Pure Callee Checker (`checkPureMirWithCallees`), Computable
+   Evaluator (`evalPureMirWithCallees`), & Soundness**:
    - Recursively checks linked pure helper callees in `callees` (including
-     polymorphic `(defPath, typeArgs)` instantiations, `.call`, `.tailCall`,
-     inline `core::intrinsics::exact_div`, and diverging panic/abort calls) up
-     to structural `maxCallDepth`.
+     polymorphic `(defPath, typeArgs)` instantiations, `TraitImplEntry`
+     dispatch, `.call`, `.tailCall`, inline `core::intrinsics::exact_div`, and
+     diverging panic/abort calls) up to structural `maxCallDepth`.
+   - Provides executable evaluators `evalPureMirStateWithCallees`,
+     `evalPureMirWithCallees`, and `checkPureMirBoolPredWithCallees` alongside
+     soundness bridges `pureMirConvergesWithCallees_of_evalPureMirWithCallees`,
+     `mirWpConverges_of_evalPureMirWithCallees`, and
+     `mirBoolPredicateHoldsWithCallees_of_checkPureMirBoolPredWithCallees`.
    - Transports `PureMirConvergesWithCallees` to `MirNoCallWpConverges`,
      `MirWpConverges` (`mirWpConverges_of_pureExecWithCallees`,
      `mirWpConverges_of_pureExecWithCallees_init`), `VerificationResult`,
-     `StatefulVerificationResult`, `TotalVerificationResult`, and
-     `MirBoolPredicateHoldsWithCallees` via `Memory.replaceRoot`.
+     `StatefulVerificationResult` (including `c.callees = []` via
+     `verifyStatefulMirNoPanic_of_pureExecWithCallees_any`),
+     `TotalVerificationResult` (`verifyTotalMir_of_pureExecWithCallees_any`),
+     and `MirBoolPredicateHoldsWithCallees` via `Memory.replaceRoot`.
 3. **Pure `CallConv.rustIntrinsic` & `#[external_spec]` Modular Execution**:
    - Models 23 pure `CallConv.rustIntrinsic` operations (`ctlz`, `ctlz_nonzero`,
      `cttz`, `cttz_nonzero`, `ctpop`, `bswap`, `bitreverse`,
@@ -49,22 +60,31 @@ modification. `theory/Anneal/PureMirExec.lean` adds:
      `unchecked_add/sub/mul/div/rem/shl/shr`, `exact_div`, `three_way_compare`,
      `ub_checks`, and `const_eval_select`) in `PureRustIntrinsicKind`,
      `evalPureRustIntrinsicWithRuntime`, and `pureRustIntrinsicContract`,
-     failing closed (`none`) on UB inputs.
-   - Provides `PureMirModularConverges` (`call_modular`,
-     `call_poly_external_spec`, `call_external_spec`, `call_intrinsic`, and
-     `call_summary`) discharging `ModularVerificationResult` via
+     normalizing `ScalarInt` bit widths, handling `.fnDef`/`.closure` and ZST
+     tuple arguments in `const_eval_select` (with automatic fallback to pure
+     scalar intrinsics), and failing closed (`none`) on UB inputs.
+   - Provides compositional contract combination (`combineMirCallContracts` and
+     `MirCallContract.Subsumes`) and `PureMirModularConverges` (`mono_contract`,
+     `call_modular`, `call_modular_sub`, `call_poly_external_spec`,
+     `call_poly_external_spec_sub`, `call_external_spec`,
+     `call_external_spec_sub`, `call_intrinsic`, `call_intrinsic_sub`,
+     `call_summary`, `call_summary_resolved`, `tailCall_summary`,
+     `call_exact_div`, `step_assert`, and `step_drop`), discharging
+     `ModularVerificationResult` via
      `verifyModularMirWithCallees_of_pureModularExec` and
      `verifyModularMir_of_pureModularExec`.
-4. **Concrete Multi-Callee, Polymorphic, Intrinsic, & `#[external_spec]`
-   Witnesses**:
+4. **Concrete Multi-Callee, Polymorphic, `TraitImplEntry`, Tail-Call, Intrinsic,
+   & `#[external_spec]` Witnesses**:
    - Proves `nestedMultiCalleeCallerBody` invoking 2 nested helpers in
-     `demoCallees := [polySwapPairBody, scaleSwapAndDivBody]` (combining
-     polymorphic `demo::poly_swap_pair<T>` and inline `exact_div`) both via
+     `demoCallees := [polySwapPairBody, scaleSwapAndDivBody]` both via
      `PureMirConverges.call_summary` (`nestedMultiCalleeCaller_compositional`)
      and via `checkPureMirWithCallees` (`nestedMultiCalleeCaller_inline`), plus
-     `VerificationResult`, `StatefulVerificationResult`,
-     `TotalVerificationResult`, and `ModularVerificationResult` certificates
-     with non-vacuity witnesses.
+     `combinedModularPipelineBody` (`verify_combinedModularPipeline` combining
+     `#[external_spec]`, `bswap`, `const_eval_select(ctpop)`, `assert`, inline
+     `exact_div`, and polymorphic `tailCall`) and
+     `traitAndTailMultiMonoCallerBody` (`u32` + `u64` multi-monomorphization,
+     `TraitImplEntry` dispatch, `tailCall`, and computable
+     `evalPureMirWithCallees`).
 
 ## Step-by-Step Verification
 
@@ -95,7 +115,7 @@ modification. `theory/Anneal/PureMirExec.lean` adds:
    cd /usr/local/google/Projects/anneal-workspace/anneal-wt-ff-2-2/examples
    anneal-lean-run --mode build --concurrency 2 -- lake build Anneal
    ```
-   Expected result: all 65 targets build cleanly (`exit 0`).
+   Expected result: `Build completed successfully (64 jobs).` (`exit 0`).
 
 5. **Kernel `#print axioms` Audit (`sorry_free=true`, Zero `native_decide`)**
    Verify from an ephemeral temporary file outside the repository that every
@@ -108,17 +128,33 @@ modification. `theory/Anneal/PureMirExec.lean` adds:
    import Anneal.PureMirExec
    open Anneal.PureMirExec
    #print axioms MirWpConverges.call_summary
+   #print axioms MirWpConverges.tailCall_summary
+   #print axioms MirWpConverges.tailCall_nested_summary
    #print axioms PureMirConverges.call_summary
+   #print axioms PureMirConverges.tailCall_summary
    #print axioms mirWpConverges_of_pureExecWithCallees
+   #print axioms pureMirConvergesWithCallees_of_evalPureMirWithCallees
+   #print axioms mirBoolPredicateHoldsWithCallees_of_checkPureMirBoolPredWithCallees
+   #print axioms PureMirModularConverges.mono_contract
    #print axioms PureMirModularConverges.call_poly_external_spec
+   #print axioms PureMirModularConverges.call_poly_external_spec_sub
    #print axioms PureMirModularConverges.call_intrinsic
+   #print axioms PureMirModularConverges.call_intrinsic_sub
    #print axioms PureMirModularConverges.call_summary
+   #print axioms PureMirModularConverges.call_summary_resolved
+   #print axioms PureMirModularConverges.tailCall_summary
+   #print axioms PureMirModularConverges.step_assert
+   #print axioms PureMirModularConverges.step_drop
+   #print axioms PureMirModularConverges.call_exact_div
    #print axioms nestedMultiCalleeCaller_compositional
    #print axioms nestedMultiCalleeCaller_inline
    #print axioms verify_nestedMultiCalleeStatefulClaim
    #print axioms verify_nestedMultiCalleeTotalClaim
    #print axioms verify_pureIntrinsicCallerModular
    #print axioms verify_externalSpecAndPolyCalleeModular
+   #print axioms verify_combinedModularPipeline
+   #print axioms traitAndTailMultiMonoCaller_compositional
+   #print axioms traitAndTailMultiMonoCaller_evalConcrete
    EOF
    cd /usr/local/google/Projects/anneal-workspace/anneal-wt-ff-2-2/examples
    anneal-lean-run --mode file --concurrency 2 -- lake env lean "$TMP_AXIOMS"
@@ -128,5 +164,16 @@ modification. `theory/Anneal/PureMirExec.lean` adds:
 ## Audit Notes
 
 - `[diversity-reduced]`: Under `anneal-model-policy` quota reserve routing for
-  Tier `P1`, Agent A (`ff22a`) ran on `gemini-pro-coordinator` paired against
-  Agent B (`ff22b`) on `gemini-launch-candidate-high`.
+  Tier `P1`, Agent A (`ff22a`) and Agent B (`ff22b`, switched from
+  `gemini-launch-candidate-high` prior to `B1` due to `Family Y` quota floor)
+  ran on `gemini-pro-coordinator`.
+- Pass `B1` generalized `ActiveRootMemory` for arbitrary `activeBody` on tail
+  returns, added compositional `tailCall_summary` / `tailCall_nested_summary`
+  rules across `MirWpConverges`, `PureMirConvergesWithCallees`,
+  `PureMirConverges`, and `PureMirModularConverges`, added computable
+  `evalPureMirWithCallees` / `checkPureMirBoolPredWithCallees` with soundness
+  theorems, hardened `evalSaturatingAdd`/`Sub` and `const_eval_select`
+  intrinsic evaluation, refactored `combineMirCallContracts` with
+  `MirCallContract.Subsumes` + `_sub`/`step_assert`/`step_drop`/`call_exact_div`
+  rules, and added `combinedModularPipelineBody` and
+  `traitAndTailMultiMonoCallerBody` end-to-end witnesses.
