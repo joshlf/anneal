@@ -2246,12 +2246,6 @@ def splitAfterLastSeqProj :
   | .subslice fromIdx toIdx fromEnd :: rest =>
     let (subPrefix, suffix) := splitAfterLastSeqProj rest
     (.subslice fromIdx toIdx fromEnd :: subPrefix, suffix)
-  | .constantIndex offset minLen fromEnd :: rest =>
-    let (subPrefix, suffix) := splitAfterLastSeqProj rest
-    (.constantIndex offset minLen fromEnd :: subPrefix, suffix)
-  | .index local_ :: rest =>
-    let (subPrefix, suffix) := splitAfterLastSeqProj rest
-    (.index local_ :: subPrefix, suffix)
   | elem :: rest =>
     match splitAfterLastSeqProj rest with
     | (.nil, suffix) => (.nil, elem :: suffix)

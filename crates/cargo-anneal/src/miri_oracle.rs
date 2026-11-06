@@ -1255,7 +1255,7 @@ pub fn render_anneal_probe_module(
              match stepMirState body st with\n    \
              | .ret (.normal (.unit, _)) => (.normalUnit, \"none\")\n    \
              | .ret (.normal (.scalar sc, _)) => (.normalScalar sc.bits sc.sizeBytes, \"none\")\n    \
-             | .ret (.normal (_, _)) => (.normalOther, \"none\")\n    \
+             | .ret (.normal (val, mem)) => ((MirDiffVerdict.normal val mem).toTagWithBody body, \"none\")\n    \
              | .ret .panic => (.panic, activeSpan body st)\n    \
              | .ret .abort => (.abort, activeSpan body st)\n    \
              | .tau st' => probeMirDiffExecBounded fuel' body st'\n    \
@@ -1396,7 +1396,7 @@ pub fn render_anneal_confirm_module(
              match stepMirState body st with\n    \
              | .ret (.normal (.unit, _)) => (.normalUnit, \"none\")\n    \
              | .ret (.normal (.scalar sc, _)) => (.normalScalar sc.bits sc.sizeBytes, \"none\")\n    \
-             | .ret (.normal (_, _)) => (.normalOther, \"none\")\n    \
+             | .ret (.normal (val, mem)) => ((MirDiffVerdict.normal val mem).toTagWithBody body, \"none\")\n    \
              | .ret .panic => (.panic, activeSpan body st)\n    \
              | .ret .abort => (.abort, activeSpan body st)\n    \
              | .tau st' => probeMirDiffExecBounded fuel' body st'\n    \
