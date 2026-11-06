@@ -17,3 +17,15 @@ Root umbrella module for Anneal's trusted Lean 4 computing base (`trusted/lean/`
 Starts from `prelude` and imports only locked foundation modules from
 `trusted/lean/foundation-lock.json` and `Trusted.*` submodules.
 -/
+
+namespace Trusted
+
+/-- Placeholder crate syntax record pending `Trusted/MirAst.lean`. -/
+structure Crate where
+
+/-- Placeholder crate-level verification proposition pending
+`Trusted/MirSemantics.lean`. -/
+def CrateTheorem (_ : Crate) : Prop :=
+  False
+
+end Trusted
