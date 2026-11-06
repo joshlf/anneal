@@ -122,12 +122,14 @@ inductive ImmediateRel (ty : Ty) (layouts : LayoutTable) :
       ScalarRel sc msc →
       (translateTy ty layouts).layout.size = translateSizeBytes sc.sizeBytes →
       (ty.kind = .bool → sc.sizeBytes = 1 ∧ (sc.bits = 0 ∨ sc.bits = 1)) →
+      (ty.kind = .char → sc.sizeBytes = 4 ∧ isValidCharCode sc.bits = true) →
       ImmediateRel ty layouts (.scalar sc) (.scalar (.fromScalarInt msc))
   /-- Two-element scalar tuple/struct (such as checked arithmetic `(T, bool)`) corresponds to `.scalarPair`. -/
   | scalarPair (sc₁ sc₂ : MirAst.ScalarInt) (msc₁ msc₂ : Miri.Memory.ScalarInt) :
       ScalarRel sc₁ msc₁ →
       ScalarRel sc₂ msc₂ →
       ((∃ ts, ty.kind = .tuple ts) ∨ (∃ p a, ty.kind = .adt p a)) →
+      (∀ t₁, ty.kind = .tuple [t₁, .bool] → sc₂.sizeBytes = 1 ∧ (sc₂.bits = 0 ∨ sc₂.bits = 1)) →
       ImmediateRel ty layouts
         (.aggregate 0 [.scalar sc₁, .scalar sc₂])
         (.scalarPair (.fromScalarInt msc₁) (.fromScalarInt msc₂))
@@ -148,7 +150,8 @@ theorem of_primitive_scalar
       imm = .scalar (.fromScalarInt msc) ∧
       ScalarRel sc msc ∧
       (translateTy ty layouts).layout.size = translateSizeBytes sc.sizeBytes ∧
-      (ty.kind = .bool → sc.sizeBytes = 1 ∧ (sc.bits = 0 ∨ sc.bits = 1)) := by
+      (ty.kind = .bool → sc.sizeBytes = 1 ∧ (sc.bits = 0 ∨ sc.bits = 1)) ∧
+      (ty.kind = .char → sc.sizeBytes = 4 ∧ isValidCharCode sc.bits = true) := by
   cases h with
   | unit hzero =>
     have hne : (translateTy ty layouts).layout.size ≠ Miri.ABI.Size.ZERO := by
@@ -156,9 +159,9 @@ theorem of_primitive_scalar
         (try cases it) <;> (try cases ut) <;>
         (simp only [translateTy, h]; decide)
     exact False.elim (hne hzero)
-  | scalar sc msc hrel hsz hbool =>
-    exact ⟨sc, msc, rfl, rfl, hrel, hsz, hbool⟩
-  | scalarPair _ _ _ _ _ _ hagg =>
+  | scalar sc msc hrel hsz hbool hchar =>
+    exact ⟨sc, msc, rfl, rfl, hrel, hsz, hbool, hchar⟩
+  | scalarPair _ _ _ _ _ _ hagg _ =>
     rcases hagg with ⟨ts, ht⟩ | ⟨p, a, ht⟩ <;>
       rcases hprim with h | h | ⟨it, h⟩ | ⟨ut, h⟩ <;>
       (rw [h] at ht; cases ht)
@@ -169,19 +172,19 @@ end ImmediateRel
 
 /-- Simulation relation between an optional Anneal `Value` (`none` for uninitialized
 storage, `some v` for initialized storage) at type `ty` and a memory-backed
-`Miri.Interpreter.MemPlace AnnealProv` in `mem`.
+`Miri.Interpreter.MemPlace AnnealProv` in `mach`.
 
-`relOffset` is the allocation-relative byte offset within `localAlloc.allocation`
-whose bytes the relation constrains. The relation does not yet tie it to the
-place's address: `offset_le_addr` (`relOffset ≤ mp.ptr.offset`) is the only link,
-so `relOffset` may name bytes other than those `mp` designates. The intended
-equation `mp.ptr.offset = baseAddr allocId + relOffset` needs an allocation
-address map, which `AnnealStepState` (whose machine is just `MemoryState`) does
-not carry. The first workstream that relates `.indirect` locals in a simulation
-proof must add that equation as a field; until then no `LM-1.1` theorem
-constructs or reads through `LocalRel.indirect`. -/
+`baseAddr` is the 64-bit virtual base address of `allocId` cached in
+`mach.addresses` (`mach.lookupBaseAddr allocId = some baseAddr`), and
+`relOffset` is the allocation-relative byte offset within
+`localAlloc.allocation`. Together with `addr_no_overflow`
+(`baseAddr.toNat + relOffset.bytes.toNat < 2 ^ 64`), the exact address
+equation `mp.ptr.offset = Size.ofBytes (baseAddr + relOffset.bytes)` uniquely
+pins `relOffset.bytes.toNat = mp.ptr.offset.bytes.toNat - baseAddr.toNat`
+(proved in `MemPlaceRel.relOffset_bytes_eq`, with concrete uninitialized and
+initialized `LocalRel.indirect` witnesses in `Witness.lean`). -/
 inductive MemPlaceRel
-    (mem : Miri.Memory.MemoryState AnnealProv Unit Unit)
+    (mach : AnnealMachine)
     (ty : Ty)
     (layouts : LayoutTable)
     (optVal : Option Value)
@@ -189,16 +192,23 @@ inductive MemPlaceRel
   | mk
       (allocId : Miri.Memory.AllocId)
       (tag : Miri.Memory.BorTag)
+      (baseAddr : UInt64)
       (relOffset : Miri.ABI.Size)
-      (localAlloc : Miri.Memory.LocalAllocation AnnealProv Unit Unit)
+      (localAlloc :
+        Miri.Memory.LocalAllocation
+          AnnealProv
+          (Option Miri.TreeBorrows.BorrowTree)
+          Miri.Memory.MiriMemoryKind)
       (ptr_prov : mp.ptr.provenance = some (.concrete allocId tag))
       (no_misalign : mp.misaligned = none)
       (thin_meta : mp.metadata = .none)
-      (live_lookup : (allocId, localAlloc) ∈ mem.live.toList)
+      (live_lookup : (allocId, localAlloc) ∈ mach.memory.live.toList)
+      (base_lookup : mach.lookupBaseAddr allocId = some baseAddr)
+      (addr_no_overflow : baseAddr.toNat + relOffset.bytes.toNat < 2 ^ 64)
+      (ptr_addr_eq : mp.ptr.offset = Miri.ABI.Size.ofBytes (baseAddr + relOffset.bytes))
       (mut_alloc : localAlloc.allocation.mutability = .Mut)
       (aligned_ptr :
         mp.ptr.offset.isAligned (translateTy ty layouts).layout.align.abi = .ok true)
-      (offset_le_addr : relOffset.bytes.toNat ≤ mp.ptr.offset.bytes.toNat)
       (in_bounds :
         relOffset.bytes.toNat + (translateTy ty layouts).layout.size.bytes.toNat ≤
           localAlloc.allocation.byteSize.bytes.toNat)
@@ -217,22 +227,42 @@ inductive MemPlaceRel
         ∀ sc, optVal = some (.scalar sc) →
           (translateTy ty layouts).layout.size = translateSizeBytes sc.sizeBytes ∧
           (ty.kind = .bool → sc.sizeBytes = 1 ∧ (sc.bits = 0 ∨ sc.bits = 1)) ∧
+          (ty.kind = .char → sc.sizeBytes = 4 ∧ isValidCharCode sc.bits = true) ∧
           ∃ msc,
             ScalarRel sc msc ∧
             localAlloc.allocation.readScalar
               annealTargetDataLayout
               (Miri.Memory.allocRange relOffset ((translateTy ty layouts).layout.size))
               false = .ok (.fromScalarInt msc)) :
-      MemPlaceRel mem ty layouts optVal mp
+      MemPlaceRel mach ty layouts optVal mp
+
+namespace MemPlaceRel
+
+/-- Under `addr_no_overflow` and `ptr_addr_eq`, the allocation-relative byte
+offset is uniquely `mp.ptr.offset.bytes.toNat - baseAddr.toNat`. -/
+theorem relOffset_bytes_eq {mp : Miri.Interpreter.MemPlace AnnealProv}
+    {baseAddr : UInt64} {relOffset : Miri.ABI.Size}
+    (hno_ovf : baseAddr.toNat + relOffset.bytes.toNat < 2 ^ 64)
+    (hptr : mp.ptr.offset = Miri.ABI.Size.ofBytes (baseAddr + relOffset.bytes)) :
+    relOffset.bytes.toNat = mp.ptr.offset.bytes.toNat - baseAddr.toNat := by
+  have hbytes : mp.ptr.offset.bytes = baseAddr + relOffset.bytes := by
+    rw [hptr]; rfl
+  have hadd : (baseAddr + relOffset.bytes).toNat = baseAddr.toNat + relOffset.bytes.toNat := by
+    rw [UInt64.toNat_add, Nat.mod_eq_of_lt]
+    simpa [UInt64.size] using hno_ovf
+  rw [hbytes, hadd]
+  omega
+
+end MemPlaceRel
 
 /-- Simulation relation between an Anneal `LocalSlot` and a `Miri.Interpreter.LocalState`
-for a local declaration `decl` under memory state `mem` and layout table `layouts`.
+for a local declaration `decl` under machine state `mach` and layout table `layouts`.
 
 Includes all three constructors from Day 1 (`.dead`, `.immediate`, `.indirect`) so
 both register-immediate scalars and memory-backed address-taken locals are uniformly
 represented in `FrameRel` and `StateRel`. -/
 inductive LocalRel
-    (mem : Miri.Memory.MemoryState AnnealProv Unit Unit)
+    (mach : AnnealMachine)
     (decl : LocalDecl)
     (layouts : LayoutTable) :
     LocalSlot →
@@ -241,7 +271,7 @@ inductive LocalRel
   /-- Dead storage slot (`LocalSlot.dead` ↔ `LocalValue.dead`). -/
   | dead (cachedLayout : Option Miri.Interpreter.LocalLayout) :
       (∀ l ∈ cachedLayout, l = translateTy decl.ty layouts) →
-      LocalRel mem decl layouts .dead ⟨.dead, cachedLayout⟩
+      LocalRel mach decl layouts .dead ⟨.dead, cachedLayout⟩
   /-- Live immediate storage slot (`LocalSlot.uninit` or `LocalSlot.init v` ↔
   `LocalValue.live (.immediate imm)`). -/
   | immediate
@@ -251,7 +281,7 @@ inductive LocalRel
       (∀ l ∈ cachedLayout, l = translateTy decl.ty layouts) →
       ((slot = .uninit ∧ imm = .uninit) ∨
         ∃ v, slot = .init v ∧ ImmediateRel decl.ty layouts v imm) →
-      LocalRel mem decl layouts slot ⟨.live (.immediate imm), cachedLayout⟩
+      LocalRel mach decl layouts slot ⟨.live (.immediate imm), cachedLayout⟩
   /-- Live indirect (memory-backed) storage slot (`LocalSlot.uninit` or `LocalSlot.init v` ↔
   `LocalValue.live (.indirect mp)` via `MemPlaceRel`). -/
   | indirect
@@ -261,23 +291,23 @@ inductive LocalRel
       (∀ l ∈ cachedLayout, l = translateTy decl.ty layouts) →
       slot ≠ .dead →
       MemPlaceRel
-        mem
+        mach
         decl.ty
         layouts
         (match slot with | .init v => some v | _ => none)
         mp →
-      LocalRel mem decl layouts slot ⟨.live (.indirect mp), cachedLayout⟩
+      LocalRel mach decl layouts slot ⟨.live (.indirect mp), cachedLayout⟩
 
 namespace LocalRel
 
 /-- Cached layout in a `LocalRel`-related `LocalState` always agrees with `translateTy decl.ty layouts`. -/
 theorem cachedLayout_eq
-    {mem : Miri.Memory.MemoryState AnnealProv Unit Unit}
+    {mach : AnnealMachine}
     {decl : LocalDecl}
     {layouts : LayoutTable}
     {slot : LocalSlot}
     {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
-    (h : LocalRel mem decl layouts slot mls) :
+    (h : LocalRel mach decl layouts slot mls) :
     ∀ l ∈ mls.layout, l = translateTy decl.ty layouts := by
   cases h with
   | dead _ hc => exact hc
@@ -289,10 +319,10 @@ end LocalRel
 /-! ## 3. Stack Frame & Machine State Correspondence (`FrameRel`, `StateRel`, `StepRel`) -/
 
 /-- Simulation relation between an Anneal `StackFrame` (`af`) and a `lean-miri`
-`Miri.Interpreter.Frame` (`mf`) executing `body` under memory state `mem`. -/
+`Miri.Interpreter.Frame` (`mf`) executing `body` under machine state `mach`. -/
 structure FrameRel
     (body : CapturedMir)
-    (mem : Miri.Memory.MemoryState AnnealProv Unit Unit)
+    (mach : AnnealMachine)
     (af : StackFrame)
     (mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit) : Prop where
   /-- `mf.body` is the translation of `body`. -/
@@ -309,7 +339,7 @@ structure FrameRel
       get? body.localDecls i = some decl →
       get? af.locals i = some slot →
       mf.locals[i]? = some mls →
-      LocalRel mem decl body.layouts slot mls
+      LocalRel mach decl body.layouts slot mls
 
 /-- Simulation relation between an Anneal `MachineState` (`s`) and a single-threaded
 `AnnealStepState` (`m`) executing `body`. -/

@@ -706,14 +706,44 @@ def translateBody (cm : CapturedMir) : Miri.MIR.Body :=
 /-- Provenance type instantiated for Anneal's correspondence with `lean-miri`. -/
 abbrev AnnealProv := Miri.Memory.Provenance
 
+/-- Allocation memory state instantiated with `AnnealProv`, optional Tree Borrows
+per-allocation trees (`LM-3.3`), and `MiriMemoryKind`. -/
+abbrev AnnealMemory :=
+  Miri.Memory.MemoryState
+    AnnealProv
+    (Option Miri.TreeBorrows.BorrowTree)
+    Miri.Memory.MiriMemoryKind
+
+/-- Single-threaded `lean-miri` machine state for Anneal correspondence, bundling:
+* `memory`: `AnnealMemory` (`MemoryState` with optional `BorrowTree` extras),
+* `addresses`: `Miri.Memory.AllocAddresses.GlobalAddressState` mapping live
+  `AllocId`s to 64-bit virtual base addresses (`baseAddr`), and
+* `borrowTracker`: optional `Miri.Interpreter.MachineHooks.BorrowState` (`LM-3.3`). -/
+structure AnnealMachine : Type where
+  memory : AnnealMemory := Miri.Memory.MemoryState.empty
+  addresses : Miri.Memory.AllocAddresses.GlobalAddressState :=
+    { provenanceMode := .default, addressMode := .managed, generation := none }
+  borrowTracker : Option Miri.Interpreter.MachineHooks.BorrowState := none
+
+namespace AnnealMachine
+
+/-- Empty initial `AnnealMachine` with no allocations, cached base addresses, or borrow tracker. -/
+def empty : AnnealMachine := {}
+
+/-- Look up the cached 64-bit virtual base address for `allocId` in `mach.addresses`. -/
+def lookupBaseAddr (mach : AnnealMachine) (allocId : Miri.Memory.AllocId) : Option UInt64 :=
+  (mach.addresses.baseAddr.find? (fun entry => entry.allocId == allocId)).map (fun entry => entry.address)
+
+end AnnealMachine
+
 /-- Step state for `lean-miri` instantiated with `AnnealProv`, `LocalLayout`,
-`Unit` frame extra, and `Miri.Memory.MemoryState AnnealProv Unit Unit`. -/
+`Unit` frame extra, and `AnnealMachine`. -/
 abbrev AnnealStepState :=
   Miri.Interpreter.StepState
     AnnealProv
     Miri.Interpreter.LocalLayout
     Unit
-    (Miri.Memory.MemoryState AnnealProv Unit Unit)
+    AnnealMachine
 
 /-- Look up the `Miri.Interpreter.LocalLayout` for a `Local` in `localDecls` and `layouts`. -/
 def lookupLocalDeclLayout (localDecls : List LocalDecl) (layouts : LayoutTable)
@@ -984,7 +1014,7 @@ def annealControlHooks :
       AnnealProv
       Miri.Interpreter.LocalLayout
       Unit
-      (Miri.Memory.MemoryState AnnealProv Unit Unit)
+      AnnealMachine
       Unit
       (Miri.Interpreter.Operand AnnealProv) where
   bodySpan := fun _ => .ok defaultSpanRef
@@ -1040,7 +1070,7 @@ def annealTerminatorHooks (localDecls : List LocalDecl := .nil)
       AnnealProv
       Miri.Interpreter.LocalLayout
       Unit
-      (Miri.Memory.MemoryState AnnealProv Unit Unit)
+      AnnealMachine
       Unit
       (Miri.Interpreter.Operand AnnealProv)
       (Miri.Interpreter.RvalueImmTy AnnealProv) where
@@ -1049,12 +1079,15 @@ def annealTerminatorHooks (localDecls : List LocalDecl := .nil)
     Miri.Interpreter.runRvalue
       (do
         let opTy ← annealEvalOperand localDecls layouts op none
-        annealReadImmediate opTy)
+        let imm ← annealReadImmediate opTy
+        match imm.imm.toScalarInt with
+        | .ok _ => return imm
+        | .error err => throw (Miri.Interpreter.ScalarOps.immediateError err))
       state
   compareSwitchCase := fun _ imm caseVal state =>
     match imm.imm.toScalarInt with
     | .ok sc => (state, .ok (sc.data.toNat == caseVal))
-    | .error _ => (state, .error (.invalidProgram "non-scalar switchInt discriminant"))
+    | .error err => (state, .error (Miri.Interpreter.ScalarOps.immediateError err))
   call := fun _ _ state => (state, .error (.unsupported "call terminator"))
   tailCall := fun _ _ state => (state, .error (.unsupported "tailCall terminator"))
   drop := fun _ _ _ _ state => (state, .error (.unsupported "drop terminator"))
@@ -1068,8 +1101,8 @@ def annealTerminatorHooks (localDecls : List LocalDecl := .nil)
         | .ok sc =>
             match sc.tryToBool with
             | .ok b => return b
-            | .error _ => throw (.undefinedBehavior "invalid bool assert condition")
-        | .error _ => throw (.invalidProgram "non-scalar assert condition"))
+            | .error err => throw (Miri.Interpreter.ScalarOps.scalarIntError err)
+        | .error err => throw (Miri.Interpreter.ScalarOps.immediateError err))
       state
   -- A failed `Assert` panics and unwinds in both rustc and Anneal (`applyUnwindAction`);
   -- it is never undefined behavior. Unwinding is outside the scalar fragment.
@@ -1092,7 +1125,7 @@ def annealLocalStorageHooks (localDecls : List LocalDecl) (layouts : LayoutTable
       AnnealProv
       Miri.Interpreter.LocalLayout
       Unit
-      (Miri.Memory.MemoryState AnnealProv Unit Unit) where
+      AnnealMemory where
   veryTriviallySized := fun _ => .ok true
   layout := fun st _ localId =>
     match lookupLocalDeclLayout localDecls layouts localId with
@@ -1111,19 +1144,19 @@ operation fails, as `lean-miri`'s machine-level `MachineHooks.storageLiveDyn` an
 `MachineHooks.storageDead` do. -/
 def annealRunFrameStorage
     (op : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit →
-      Miri.Memory.MemoryState AnnealProv Unit Unit →
+      AnnealMemory →
       Miri.Interpreter.LocalStorageResult AnnealProv Miri.Interpreter.LocalLayout Unit
-        (Miri.Memory.MemoryState AnnealProv Unit Unit))
+        AnnealMemory)
     (state : AnnealStepState) : Miri.Interpreter.StepResult AnnealStepState Unit :=
   match state.stack.currentFrame? with
   | none => (state, .error (.stack .emptyStack))
   | some frame =>
-      let result := op frame state.machine
+      let result := op frame state.machine.memory
       let idx := state.stack.frames.size - 1
       if h : idx < state.stack.frames.size then
         let state' : AnnealStepState :=
           { stack := { frames := state.stack.frames.set idx result.frame h }
-            machine := result.state }
+            machine := { state.machine with memory := result.state } }
         match result.outcome with
         | .ok () => (state', .ok ())
         | .error e => (state', .error (.stack e))
@@ -1137,7 +1170,7 @@ def annealStepHooks (localDecls : List LocalDecl := .nil)
       AnnealProv
       Miri.Interpreter.LocalLayout
       Unit
-      (Miri.Memory.MemoryState AnnealProv Unit Unit)
+      AnnealMachine
       Unit
       (Miri.Interpreter.RuntimePlace AnnealProv) where
   assign := fun choice place rvalue state =>

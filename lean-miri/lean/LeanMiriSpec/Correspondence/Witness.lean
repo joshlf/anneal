@@ -91,7 +91,7 @@ def miriFrame (divisor : Nat) : Miri.Interpreter.Frame AnnealProv Miri.Interpret
 
 /-- `lean-miri`'s initial single-threaded state for `divBody`. -/
 def miriInit (divisor : Nat) : AnnealStepState :=
-  { stack := ⟨#[miriFrame divisor]⟩, machine := Miri.Memory.MemoryState.empty }
+  { stack := ⟨#[miriFrame divisor]⟩, machine := AnnealMachine.empty }
 
 theorem stateRel_init (divisor : Nat) :
     StateRel (divBody divisor) (annealInit divisor) (miriInit divisor) := by
@@ -131,13 +131,13 @@ theorem wellTypedBody (divisor : Nat) (hd : divisor < 256) :
   have hconst : ∀ n, n < 256 →
       WellTypedScalarOperandSyn (divBody divisor) (fun _ => True) (.constant (constU8 n)) u8Ty :=
     fun n hn => .constScalar (constU8 n) ⟨n, 1⟩ rfl hu8 (Or.inl rfl) (hbits n hn) rfl
-      (fun h => nomatch h)
+      (fun h => nomatch h) (fun h => nomatch h)
   have hu8int : IsIntegralTy u8Ty (translateUintTy .u8) := .uint .u8 rfl
   refine ⟨(fun p h => by simp [divBody] at h), ?_⟩
   intro bb hbb
   simp only [divBody, List.mem_singleton] at hbb
   subst hbb
-  refine ⟨rfl, ?_, Or.inr ⟨rfl, trivial, u8Decl, rfl, IsPrimScalarTy.size_ne_zero hu8⟩⟩
+  refine ⟨rfl, ?_, Or.inr (Or.inl ⟨rfl, trivial, u8Decl, rfl, IsPrimScalarTy.size_ne_zero hu8⟩)⟩
   intro stmt hstmt
   simp only [List.mem_cons, List.not_mem_nil, or_false] at hstmt
   rcases hstmt with rfl | rfl | rfl | rfl
@@ -349,7 +349,7 @@ def miriSignedDivFrame (divisorBits : Nat) :
     location := .mir ⟨0, 0⟩ }
 
 def miriSignedDivInit (divisorBits : Nat) : AnnealStepState :=
-  { stack := ⟨#[miriSignedDivFrame divisorBits]⟩, machine := Miri.Memory.MemoryState.empty }
+  { stack := ⟨#[miriSignedDivFrame divisorBits]⟩, machine := AnnealMachine.empty }
 
 theorem stateRel_signedDiv (divisorBits : Nat) :
     StateRel (signedDivBody divisorBits)
@@ -393,7 +393,7 @@ theorem wellTyped_signedDiv (divisorBits : Nat) (hd : divisorBits < 256) :
       WellTypedScalarOperandSyn (signedDivBody divisorBits) (fun _ => True)
         (.constant (constI8 n)) i8Ty :=
     fun n hn => .constScalar (constI8 n) ⟨n, 1⟩ rfl hi8 (Or.inl rfl) (hbits n hn) rfl
-      (fun h => nomatch h)
+      (fun h => nomatch h) (fun h => nomatch h)
   have hi8int : IsIntegralTy i8Ty (translateIntTy .i8) := .int .i8 rfl
   refine ⟨(fun p h => by simp [signedDivBody] at h), ?_⟩
   intro bb hbb
@@ -405,7 +405,7 @@ theorem wellTyped_signedDiv (divisorBits : Nat) (hd : divisorBits < 256) :
     rcases hstmt with rfl | rfl
     · exact .storageLive _ 1 i8Decl rfl rfl trivial
     · exact .assign _ 1 i8Decl _ rfl rfl trivial (.use _ _ (hconst 128 (by decide)))
-  · refine ⟨rfl, ?_, Or.inr ⟨rfl, trivial, i8Decl, rfl, IsPrimScalarTy.size_ne_zero hi8⟩⟩
+  · refine ⟨rfl, ?_, Or.inr (Or.inl ⟨rfl, trivial, i8Decl, rfl, IsPrimScalarTy.size_ne_zero hi8⟩)⟩
     intro stmt hstmt
     simp only [List.mem_cons, List.not_mem_nil, or_false] at hstmt
     rcases hstmt with rfl | rfl
@@ -533,7 +533,7 @@ def miriAddOvfFrame (rhs : Nat) :
     location := .mir ⟨0, 0⟩ }
 
 def miriAddOvfInit (rhs : Nat) : AnnealStepState :=
-  { stack := ⟨#[miriAddOvfFrame rhs]⟩, machine := Miri.Memory.MemoryState.empty }
+  { stack := ⟨#[miriAddOvfFrame rhs]⟩, machine := AnnealMachine.empty }
 
 theorem stateRel_addWithOverflow (rhs : Nat) :
     StateRel (addWithOverflowBody rhs) (annealAddOvfInit rhs) (miriAddOvfInit rhs) := by
@@ -577,7 +577,7 @@ theorem wellTyped_addWithOverflow (rhs : Nat) (hrhs : rhs < 65536) :
       WellTypedScalarOperandSyn (addWithOverflowBody rhs) (fun _ => True)
         (.constant (constU16 n)) u16Ty :=
     fun n hn => .constScalar (constU16 n) ⟨n, 2⟩ rfl hu16 (Or.inr (Or.inl rfl))
-      (hbits n hn) rfl (fun h => nomatch h)
+      (hbits n hn) rfl (fun h => nomatch h) (fun h => nomatch h)
   have hu16int : IsIntegralTy u16Ty (translateUintTy .u16) := .uint .u16 rfl
   refine ⟨(fun p h => by simp [addWithOverflowBody] at h), ?_⟩
   intro bb hbb
@@ -585,7 +585,7 @@ theorem wellTyped_addWithOverflow (rhs : Nat) (hrhs : rhs < 65536) :
   subst hbb
   have hsz0 : (translateTy u16BoolDecl.ty u16BoolLayoutTable).layout.size ≠ Miri.ABI.Size.ZERO := by
     decide
-  refine ⟨rfl, ?_, Or.inr ⟨rfl, trivial, u16BoolDecl, rfl, hsz0⟩⟩
+  refine ⟨rfl, ?_, Or.inr (Or.inl ⟨rfl, trivial, u16BoolDecl, rfl, hsz0⟩)⟩
   intro stmt hstmt
   simp only [List.mem_cons, List.not_mem_nil, or_false] at hstmt
   rcases hstmt with rfl | rfl | rfl | rfl
@@ -717,6 +717,361 @@ theorem addWithOverflow_noOverflow_agrees :
     miriOutcomeU16Bool
         (runMiriBounded (addWithOverflowBody 10) 5 (miriAddOvfInit 10)) =
       some (65510, false) := by
+  decide
+
+/-! ## Non-vacuity witnesses for `MemPlaceRel` & `LocalRel.indirect` (`AnnealMachine`) -/
+
+def isExceptOk {ε α : Type} : Except ε α → Bool
+  | .ok _ => true
+  | .error _ => false
+
+def extractExceptOk {ε α : Type} (r : Except ε α) (h : isExceptOk r = true) : α :=
+  match r, h with
+  | .ok a, _ => a
+
+def witnessAllocId : Miri.Memory.AllocId := ⟨1, by decide⟩
+def witnessTag : Miri.Memory.BorTag := Miri.Memory.BorTag.one
+def witnessBaseAddr : UInt64 := 0x1000
+def witnessRelOffset : Miri.ABI.Size := Miri.ABI.Size.ofBytes 4
+
+/-- Concrete memory-backed `MemPlace` at virtual address `0x1004` (`baseAddr = 0x1000`,
+`relOffset = 4`) inside `witnessAllocId`. -/
+def witnessMemPlace : Miri.Interpreter.MemPlace AnnealProv :=
+  { ptr := ⟨Miri.ABI.Size.ofBytes 0x1004, some (.concrete witnessAllocId witnessTag)⟩
+    metadata := .none
+    misaligned := none }
+
+def witnessInitAlloc42 :
+    Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree) :=
+  (extractExceptOk
+    (Miri.Memory.Allocation.fromBytes (Prov := AnnealProv)
+      #[0, 0, 0, 0, 42, 0, 0, 0] Miri.ABI.Align.ONE .Mut)
+    (by decide)).withExtra none
+
+def witnessUninitAlloc :
+    Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree) :=
+  match Miri.Memory.Allocation.writeUninit
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8))
+      (Miri.ABI.Size.ofBytes 8)
+      witnessInitAlloc42 with
+  | .ok () alloc => alloc
+  | .error _ alloc => alloc
+
+def witnessMachineOf
+    (alloc : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)) :
+    AnnealMachine :=
+  { memory :=
+      { (Miri.Memory.MemoryState.empty : AnnealMemory) with
+        nextAllocId := 2
+        live := #[(witnessAllocId, { kind := .stack, allocation := alloc })] }
+    addresses :=
+      { provenanceMode := .default
+        addressMode := .managed
+        generation := none
+        baseAddr := #[{ allocId := witnessAllocId, address := witnessBaseAddr }]
+        intToPtrMap := #[{ address := witnessBaseAddr, allocId := witnessAllocId }] }
+    borrowTracker := none }
+
+/-- Concrete `LocalRel.indirect` witness for an uninitialized `u8` slot at
+non-zero `baseAddr = 0x1000` and `relOffset = 4` (`mp.ptr.offset = 0x1004`). -/
+theorem indirect_localRel_uninit_witness :
+    LocalRel (witnessMachineOf witnessUninitAlloc) u8Decl emptyLayoutTable
+      .uninit ⟨.live (.indirect witnessMemPlace), none⟩ := by
+  refine .indirect .uninit witnessMemPlace none (fun _ h => nomatch h) nofun ?_
+  exact MemPlaceRel.mk
+    witnessAllocId
+    witnessTag
+    witnessBaseAddr
+    witnessRelOffset
+    { kind := .stack, allocation := witnessUninitAlloc }
+    rfl
+    rfl
+    rfl
+    (List.Mem.head _)
+    (by decide)
+    (by decide)
+    (by decide)
+    (by decide)
+    (by decide)
+    (by decide)
+    (fun _ _ => by decide)
+    (fun _ h => nomatch h)
+    (fun _ h => nomatch h)
+
+/-- Concrete `LocalRel.indirect` witness for an initialized `42_u8` scalar slot at
+non-zero `baseAddr = 0x1000` and `relOffset = 4` (`mp.ptr.offset = 0x1004`). -/
+theorem indirect_localRel_scalar_witness :
+    LocalRel (witnessMachineOf witnessInitAlloc42) u8Decl emptyLayoutTable
+      (.init (.scalar ⟨42, 1⟩)) ⟨.live (.indirect witnessMemPlace), none⟩ := by
+  refine .indirect (.init (.scalar ⟨42, 1⟩)) witnessMemPlace none (fun _ h => nomatch h) nofun ?_
+  refine MemPlaceRel.mk
+    witnessAllocId
+    witnessTag
+    witnessBaseAddr
+    witnessRelOffset
+    { kind := .stack, allocation := witnessInitAlloc42 }
+    rfl
+    rfl
+    rfl
+    (List.Mem.head _)
+    (by decide)
+    (by decide)
+    (by decide)
+    (by decide)
+    (by decide)
+    (by decide)
+    (fun h _ => nomatch h)
+    (fun _ _ => by decide)
+    ?_
+  intro sc h
+  injection h with hv
+  injection hv with hsc
+  subst hsc
+  exact ⟨by decide, (fun hb => nomatch hb), (fun hc => nomatch hc),
+    extractExceptOk (translateScalarInt ⟨42, 1⟩) (by decide),
+    ⟨Or.inl rfl, by decide, by decide, by decide⟩, by with_unfolding_all rfl⟩
+
+/-! ## Multi-block `TerminatorKind.unreachable` witness -/
+
+/-- `Runtime(PostCleanup)` MIR body reaching `TerminatorKind.unreachable`:
+```text
+bb0: StorageLive(_1); _1 = const 7_u8; goto -> bb1
+bb1: unreachable
+``` -/
+def unreachableBody : CapturedMir where
+  defPath := "lm_1_1_witness::unreachable_branch"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u8Decl, u8Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 1),
+        mkStmt (.assign (local_ 1) (.use (.constant (constU8 7))))],
+      terminator := mkTerm (.goto 1), isCleanup := false },
+    { statements := [],
+      terminator := mkTerm .unreachable, isCleanup := false }]
+  fnAbi := fnAbi0
+  layouts := emptyLayoutTable
+  allocations := []
+
+def annealUnreachableInit : MachineState := initMachineState unreachableBody []
+
+def miriUnreachableFrame :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody unreachableBody
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy u8Ty) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[{ value := .live (.immediate .uninit), layout := none },
+      { value := .dead, layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 0⟩ }
+
+def miriUnreachableInit : AnnealStepState :=
+  { stack := ⟨#[miriUnreachableFrame]⟩, machine := AnnealMachine.empty }
+
+theorem stateRel_unreachable :
+    StateRel unreachableBody annealUnreachableInit miriUnreachableInit := by
+  refine StateRel.mk miriUnreachableFrame rfl rfl ⟨translateTy u8Ty, rfl⟩ ?_ rfl rfl rfl rfl rfl
+  refine
+    { body_eq := rfl
+      location_eq := rfl
+      af_locals_len := rfl
+      mf_locals_size := rfl
+      locals_rel := ?_ }
+  intro i decl slot mls hdecl hslot hmls
+  match i with
+  | 0 =>
+    have hd : decl = u8Decl := by simpa [unreachableBody, get?] using hdecl.symm
+    have hs : slot = .uninit := by
+      simpa [annealUnreachableInit, initMachineState, unreachableBody, initLocalsAux, get?]
+        using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [miriUnreachableFrame] using hmls.symm
+    subst hd hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | 1 =>
+    have hd : decl = u8Decl := by simpa [unreachableBody, get?] using hdecl.symm
+    have hs : slot = .dead := by
+      simpa [annealUnreachableInit, initMachineState, unreachableBody, initLocalsAux, get?]
+        using hslot.symm
+    have hm : mls = { value := .dead, layout := none } := by
+      simpa [miriUnreachableFrame] using hmls.symm
+    subst hd hs hm
+    exact .dead none (fun _ h => nomatch h)
+  | n + 2 =>
+    simp [unreachableBody, get?] at hdecl
+
+theorem wellTyped_unreachable : WellTypedBody unreachableBody := by
+  have hu8 : IsPrimScalarTy u8Ty := Or.inr (Or.inr (Or.inr ⟨.u8, rfl⟩))
+  have hconst7 : WellTypedScalarOperandSyn unreachableBody (fun _ => True)
+      (.constant (constU8 7)) u8Ty :=
+    .constScalar (constU8 7) ⟨7, 1⟩ rfl hu8 (Or.inl rfl) (by decide) rfl
+      (fun h => nomatch h) (fun h => nomatch h)
+  refine ⟨(fun p h => by simp [unreachableBody] at h), ?_⟩
+  intro bb hbb
+  simp only [unreachableBody, List.mem_cons, List.not_mem_nil, or_false] at hbb
+  rcases hbb with rfl | rfl
+  · refine ⟨rfl, ?_, Or.inl ⟨1, _, rfl, rfl⟩⟩
+    intro stmt hstmt
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at hstmt
+    rcases hstmt with rfl | rfl
+    · exact .storageLive _ 1 u8Decl rfl rfl trivial
+    · exact .assign _ 1 u8Decl _ rfl rfl trivial (.use _ _ hconst7)
+  · refine ⟨rfl, ?_, Or.inr (Or.inr rfl)⟩
+    intro _ hstmt
+    nomatch hstmt
+
+theorem run_bisim_unreachable (fuel : Nat) :
+    ((∃ s', runAnnealBounded unreachableBody fuel annealUnreachableInit = .running s') ↔
+      (∃ m', runMiriBounded unreachableBody fuel miriUnreachableInit = .running m')) ∧
+    (∀ s' m',
+      runAnnealBounded unreachableBody fuel annealUnreachableInit = .running s' →
+      runMiriBounded unreachableBody fuel miriUnreachableInit = .running m' →
+      StateRel unreachableBody s' m') ∧
+    ((∃ retVal mem',
+        runAnnealBounded unreachableBody fuel annealUnreachableInit = .returned retVal mem') ↔
+      (∃ m' retImm,
+        runMiriBounded unreachableBody fuel miriUnreachableInit =
+          .returned m' (.ok (.immediate retImm)))) ∧
+    (∀ retVal mem' m' retImm,
+      runAnnealBounded unreachableBody fuel annealUnreachableInit = .returned retVal mem' →
+      runMiriBounded unreachableBody fuel miriUnreachableInit =
+        .returned m' (.ok (.immediate retImm)) →
+      ∃ decl0, get? unreachableBody.localDecls 0 = some decl0 ∧
+        ImmediateRel decl0.ty unreachableBody.layouts retVal retImm) ∧
+    (runAnnealBounded unreachableBody fuel annealUnreachableInit = .faulted .ub ↔
+      ∃ m' msg,
+        runMiriBounded unreachableBody fuel miriUnreachableInit =
+          .error m' (.undefinedBehavior msg)) ∧
+    ((∃ s', runAnnealBounded unreachableBody fuel annealUnreachableInit = .running s') ∨
+      (∃ retVal mem',
+        runAnnealBounded unreachableBody fuel annealUnreachableInit = .returned retVal mem') ∨
+      runAnnealBounded unreachableBody fuel annealUnreachableInit = .faulted .ub) :=
+  run_wellTypedBody_bisim fuel wellTyped_unreachable stateRel_unreachable
+    ⟨_, rfl, Nat.zero_le _⟩
+    (NonAddrTakenImmediate.of_live_nil _ stateRel_unreachable rfl)
+
+/-- Across `bb0 -> goto bb1 -> unreachable`, both machines report undefined
+behavior at step 4. -/
+theorem unreachable_ub_agrees :
+    annealOutcomeIsUB (runAnnealBounded unreachableBody 4 annealUnreachableInit) = true ∧
+    miriOutcomeIsUB (runMiriBounded unreachableBody 4 miriUnreachableInit) = true := by
+  decide
+
+/-! ## Unicode `char` constant & copy witness -/
+
+def charTy : Ty := { kind := .char, layoutIdx := 0 }
+def charDecl : LocalDecl := { mutability := .mut, ty := charTy, debugName := none }
+def constChar (code : Nat) : ConstOperand := { ty := charTy, val := .scalar (.int ⟨code, 4⟩) }
+
+def charLayout : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false }
+
+def fnAbiChar : FnAbi :=
+  { args := [], ret := { layout := charLayout, mode := .direct }, conv := .rust, canUnwind := false }
+
+/-- `Runtime(PostCleanup)` MIR body assigning Unicode `'λ'` (`0x03BB`) and returning it:
+```text
+bb0: StorageLive(_1); _1 = const 'λ'; _0 = copy _1; StorageDead(_1); return
+``` -/
+def charCopyBody : CapturedMir where
+  defPath := "lm_1_1_witness::char_copy"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [charDecl, charDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 1),
+        mkStmt (.assign (local_ 1) (.use (.constant (constChar 0x03BB)))),
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 1)))),
+        mkStmt (.storageDead 1)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiChar
+  layouts := emptyLayoutTable
+  allocations := []
+
+def annealCharInit : MachineState := initMachineState charCopyBody []
+
+def miriCharFrame :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody charCopyBody
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy charTy) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[{ value := .live (.immediate .uninit), layout := none },
+      { value := .dead, layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 0⟩ }
+
+def miriCharInit : AnnealStepState :=
+  { stack := ⟨#[miriCharFrame]⟩, machine := AnnealMachine.empty }
+
+theorem stateRel_charCopy : StateRel charCopyBody annealCharInit miriCharInit := by
+  refine StateRel.mk miriCharFrame rfl rfl ⟨translateTy charTy, rfl⟩ ?_ rfl rfl rfl rfl rfl
+  refine
+    { body_eq := rfl
+      location_eq := rfl
+      af_locals_len := rfl
+      mf_locals_size := rfl
+      locals_rel := ?_ }
+  intro i decl slot mls hdecl hslot hmls
+  match i with
+  | 0 =>
+    have hd : decl = charDecl := by simpa [charCopyBody, get?] using hdecl.symm
+    have hs : slot = .uninit := by
+      simpa [annealCharInit, initMachineState, charCopyBody, initLocalsAux, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [miriCharFrame] using hmls.symm
+    subst hd hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | 1 =>
+    have hd : decl = charDecl := by simpa [charCopyBody, get?] using hdecl.symm
+    have hs : slot = .dead := by
+      simpa [annealCharInit, initMachineState, charCopyBody, initLocalsAux, get?] using hslot.symm
+    have hm : mls = { value := .dead, layout := none } := by
+      simpa [miriCharFrame] using hmls.symm
+    subst hd hs hm
+    exact .dead none (fun _ h => nomatch h)
+  | n + 2 =>
+    simp [charCopyBody, get?] at hdecl
+
+theorem wellTyped_charCopy : WellTypedBody charCopyBody := by
+  have hchar : IsPrimScalarTy charTy := Or.inr (Or.inl rfl)
+  have hconst : WellTypedScalarOperandSyn charCopyBody (fun _ => True)
+      (.constant (constChar 0x03BB)) charTy :=
+    .constScalar (constChar 0x03BB) ⟨0x03BB, 4⟩ rfl hchar (Or.inr (Or.inr (Or.inl rfl)))
+      (by decide) rfl (fun h => nomatch h) (fun _ => ⟨rfl, by decide⟩)
+  refine ⟨(fun p h => by simp [charCopyBody] at h), ?_⟩
+  intro bb hbb
+  simp only [charCopyBody, List.mem_singleton] at hbb
+  subst hbb
+  refine ⟨rfl, ?_, Or.inr (Or.inl ⟨rfl, trivial, charDecl, rfl, IsPrimScalarTy.size_ne_zero hchar⟩)⟩
+  intro stmt hstmt
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hstmt
+  rcases hstmt with rfl | rfl | rfl | rfl
+  · exact .storageLive _ 1 charDecl rfl rfl trivial
+  · exact .assign _ 1 charDecl _ rfl rfl trivial (.use _ _ hconst)
+  · exact .assign _ 0 charDecl _ rfl rfl trivial
+      (.use _ _ (.copyLocal 1 charDecl rfl (IsPrimScalarTy.size_ne_zero hchar) trivial))
+  · exact .storageDead _ 1 charDecl rfl rfl (by decide) trivial
+
+/-- Both machines run `charCopyBody` and return `'λ'` (`0x03BB`, 4 bytes) at step 5,
+preserving `isValidCharCode` through `ImmediateRel.scalar`. -/
+theorem charCopy_returns_agree :
+    annealOutcomeScalarBits 4 (runAnnealBounded charCopyBody 5 annealCharInit) = some 0x03BB ∧
+    miriOutcomeScalarBits 4 (runMiriBounded charCopyBody 5 miriCharInit) = some 0x03BB := by
   decide
 
 end LeanMiriSpec.Correspondence.Witness

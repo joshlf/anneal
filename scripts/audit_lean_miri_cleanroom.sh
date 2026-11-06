@@ -169,10 +169,11 @@ import sys
 
 
 CHAR_LIT_RE = re.compile(r"'(?:\\x[0-9a-fA-F]{2}|\\u[0-9a-fA-F]{4}|\\.|[^'\\\n])'")
+RAW_STR_RE = re.compile(r'r(#*)"[\s\S]*?"\1')
 
 
 def code_only(text):
-    """Blank out comments (nested `/- -/`, `--`), string literals, and Lean char literals."""
+    """Blank out comments (nested `/- -/`, `--`), regular/raw strings, and Lean char literals."""
     out = list(text)
     pos, depth, in_string = 0, 0, False
     while pos < len(text):
@@ -208,6 +209,20 @@ def code_only(text):
             end = len(text) if end < 0 else end
             out[pos:end] = " " * (end - pos)
             pos = end
+        elif (
+            text[pos] == "r"
+            and pos + 1 < len(text)
+            and text[pos + 1] in '#"'
+            and (pos == 0 or (not text[pos - 1].isalnum() and text[pos - 1] not in "_'»"))
+        ):
+            m = RAW_STR_RE.match(text, pos)
+            if m:
+                for idx in range(pos, m.end()):
+                    if out[idx] != "\n":
+                        out[idx] = " "
+                pos = m.end()
+            else:
+                pos += 1
         elif text[pos] == "'" and (
             pos == 0 or (not text[pos - 1].isalnum() and text[pos - 1] not in "_'»")
         ):
@@ -230,7 +245,7 @@ def code_only(text):
 # `import` is a header-only keyword, so every occurrence in code is an import,
 # including `public import`, `meta import`, `import all`, and several imports
 # on one line.
-IMPORT_RE = re.compile(r"(?<![\w.'])import\s+(?:all\s+)?([A-Za-z_«][\w.'«»]*)")
+IMPORT_RE = re.compile(r"(?<![\w.'])(?:(?:public|meta)\s+)*import\s+(?:all\s+)?([A-Za-z_«][\w.'«»]*)")
 
 
 def imports(path):
@@ -260,24 +275,46 @@ if not any(m == "Miri" or m.startswith("Miri.") for p in spec_files for m in imp
     print("ERROR: no LeanMiriSpec file imports Miri", file=sys.stderr)
     sys.exit(1)
 
-# LeanMiriSpec/Audit.lean walks only the modules it imports, and the build
-# elaborates only the modules the root imports. Every LeanMiriSpec module must
-# therefore be imported directly by both, or its declarations would escape the
-# exhaustive axiom walk.
+# LeanMiriSpec/Audit.lean walks only the modules it imports (plus itself), and
+# the build elaborates only the modules the root imports. Every `.lean` file
+# under `lean-miri/lean` outside `LeanMiriSpec.lean` must reside under
+# `LeanMiriSpec/`, be imported directly by both `LeanMiriSpec.lean` and
+# `LeanMiriSpec/Audit.lean`, and `LeanMiriSpec.lean` itself must contain only
+# `import` statements (no declarations outside `Audit.lean`'s import graph).
 spec_root = pathlib.Path("lean-miri/lean")
+root_file = spec_root / "LeanMiriSpec.lean"
+if not root_file.is_file():
+    print("ERROR: lean-miri/lean/LeanMiriSpec.lean is missing", file=sys.stderr)
+    sys.exit(1)
+stray_files = [
+    str(p)
+    for p in spec_files
+    if p != root_file
+    and not (p.relative_to(spec_root).parts[0] == "LeanMiriSpec" and len(p.relative_to(spec_root).parts) > 1)
+]
+if stray_files:
+    print(f"ERROR: stray .lean files outside lean-miri/lean/LeanMiriSpec/: {stray_files}", file=sys.stderr)
+    sys.exit(1)
 spec_modules = {
     ".".join(p.relative_to(spec_root).with_suffix("").parts)
     for p in spec_files
-    if p.relative_to(spec_root).parts[0] == "LeanMiriSpec" and len(p.relative_to(spec_root).parts) > 1
+    if p != root_file
 }
 for importer, required in (
     (spec_root / "LeanMiriSpec/Audit.lean", spec_modules - {"LeanMiriSpec.Audit"}),
-    (spec_root / "LeanMiriSpec.lean", spec_modules),
+    (root_file, spec_modules),
 ):
     missing = sorted(required - set(imports(importer)))
     if missing:
         print(f"ERROR: {importer} does not import LeanMiriSpec modules {missing}", file=sys.stderr)
         sys.exit(1)
+root_non_import = IMPORT_RE.sub("", code_only(root_file.read_text(encoding="utf-8"))).strip()
+if root_non_import:
+    print(
+        f"ERROR: {root_file} must contain only `import` statements (found: {root_non_import[:80]!r})",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 print(
     f"Module isolation verified across {len(vendor_files)} Miri files, "
@@ -292,10 +329,11 @@ import re
 import sys
 
 CHAR_LIT_RE = re.compile(r"'(?:\\x[0-9a-fA-F]{2}|\\u[0-9a-fA-F]{4}|\\.|[^'\\\n])'")
+RAW_STR_RE = re.compile(r'r(#*)"[\s\S]*?"\1')
 
 
 def code_only_char_aware(text):
-    """Blank out comments, string literals, and Lean character literals (`'\"'`, etc.)."""
+    """Blank out comments, regular/raw string literals, and Lean character literals (`'\"'`, etc.)."""
     out = list(text)
     pos, depth, in_string = 0, 0, False
     while pos < len(text):
@@ -331,6 +369,20 @@ def code_only_char_aware(text):
             end = len(text) if end < 0 else end
             out[pos:end] = " " * (end - pos)
             pos = end
+        elif (
+            text[pos] == "r"
+            and pos + 1 < len(text)
+            and text[pos + 1] in '#"'
+            and (pos == 0 or (not text[pos - 1].isalnum() and text[pos - 1] not in "_'»"))
+        ):
+            m = RAW_STR_RE.match(text, pos)
+            if m:
+                for idx in range(pos, m.end()):
+                    if out[idx] != "\n":
+                        out[idx] = " "
+                pos = m.end()
+            else:
+                pos += 1
         elif text[pos] == "'" and (
             pos == 0 or (not text[pos - 1].isalnum() and text[pos - 1] not in "_'»")
         ):

@@ -66,10 +66,13 @@ open LeanMiriSpec.Correspondence in
   translateStmt
   translateTerminator
   translateBody
+  AnnealMachine
+  AnnealMachine.lookupBaseAddr
   annealStepHooks
   ScalarRel
   ImmediateRel
   MemPlaceRel
+  MemPlaceRel.relOffset_bytes_eq
   LocalRel
   FrameRel
   StateRel
@@ -115,10 +118,21 @@ open LeanMiriSpec.Correspondence in
   Witness.run_bisim_addWithOverflow
   Witness.addWithOverflow_overflows_agrees
   Witness.addWithOverflow_noOverflow_agrees
+  Witness.indirect_localRel_uninit_witness
+  Witness.indirect_localRel_scalar_witness
+  Witness.stateRel_unreachable
+  Witness.wellTyped_unreachable
+  Witness.run_bisim_unreachable
+  Witness.unreachable_ub_agrees
+  Witness.stateRel_charCopy
+  Witness.wellTyped_charCopy
+  Witness.charCopy_returns_agree
 
 /-- Exhaustively verify that every declaration across every imported
-`LeanMiriSpec.*` and `Miri.*` module in the environment depends only on Lean's
-standard axioms (`propext`, `Quot.sound`, `Classical.choice`). -/
+`LeanMiriSpec.*` and `Miri.*` module in the environment — as well as every
+declaration elaborated in the current `Audit.lean` module (`env.constants.map₂`) —
+depends only on Lean's standard axioms (`propext`, `Quot.sound`,
+`Classical.choice`). -/
 elab "#assert_all_leanmirispec_and_miri_standard_axioms" : command => do
   let env ← getEnv
   let mut specChecked : Nat := 0
@@ -138,13 +152,17 @@ elab "#assert_all_leanmirispec_and_miri_standard_axioms" : command => do
           specChecked := specChecked + 1
         if isMiri then
           miriChecked := miriChecked + 1
+  for (c, _) in env.constants.map₂.toList do
+    let axs ← liftCoreM <| Lean.collectAxioms c
+    for a in axs do
+      unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
+        throwError "{c} (in LeanMiriSpec.Audit) depends on the non-standard axiom {a}"
+    specChecked := specChecked + 1
   if specChecked == 0 then
     throwError "LeanMiriSpec.Audit: found 0 LeanMiriSpec.* declarations in environment"
   if miriChecked == 0 then
     throwError "LeanMiriSpec.Audit: found 0 Miri.* declarations in environment"
   logInfo m!"LeanMiriSpec.Audit: exhaustively verified standard axioms for {specChecked} LeanMiriSpec.* declarations and {miriChecked} Miri.* declarations"
-
-#assert_all_leanmirispec_and_miri_standard_axioms
 
 /-! ## Statement pins -/
 
@@ -250,6 +268,43 @@ example (rhs : Nat) (hrhs : rhs < 65536) :
       (Witness.miriAddOvfInit rhs) :=
   ⟨Witness.wellTyped_addWithOverflow rhs hrhs, Witness.stateRel_addWithOverflow rhs⟩
 
+example {mp : Miri.Interpreter.MemPlace AnnealProv}
+    {baseAddr : UInt64} {relOffset : Miri.ABI.Size}
+    (hno_ovf : baseAddr.toNat + relOffset.bytes.toNat < 2 ^ 64)
+    (hptr : mp.ptr.offset = Miri.ABI.Size.ofBytes (baseAddr + relOffset.bytes)) :
+    relOffset.bytes.toNat = mp.ptr.offset.bytes.toNat - baseAddr.toNat :=
+  MemPlaceRel.relOffset_bytes_eq hno_ovf hptr
+
+example :
+    LocalRel (Witness.witnessMachineOf Witness.witnessUninitAlloc) Witness.u8Decl
+      emptyLayoutTable .uninit ⟨.live (.indirect Witness.witnessMemPlace), none⟩ ∧
+    LocalRel (Witness.witnessMachineOf Witness.witnessInitAlloc42) Witness.u8Decl
+      emptyLayoutTable (.init (.scalar ⟨42, 1⟩))
+      ⟨.live (.indirect Witness.witnessMemPlace), none⟩ :=
+  ⟨Witness.indirect_localRel_uninit_witness, Witness.indirect_localRel_scalar_witness⟩
+
+example :
+    WellTypedBody Witness.unreachableBody ∧
+    StateRel Witness.unreachableBody Witness.annealUnreachableInit Witness.miriUnreachableInit ∧
+    (Witness.annealOutcomeIsUB
+        (runAnnealBounded Witness.unreachableBody 4 Witness.annealUnreachableInit) = true ∧
+      Witness.miriOutcomeIsUB
+        (runMiriBounded Witness.unreachableBody 4 Witness.miriUnreachableInit) = true) :=
+  ⟨Witness.wellTyped_unreachable, Witness.stateRel_unreachable, Witness.unreachable_ub_agrees⟩
+
+example :
+    WellTypedBody Witness.charCopyBody ∧
+    StateRel Witness.charCopyBody Witness.annealCharInit Witness.miriCharInit ∧
+    (Witness.annealOutcomeScalarBits 4
+        (runAnnealBounded Witness.charCopyBody 5 Witness.annealCharInit) = some 0x03BB ∧
+      Witness.miriOutcomeScalarBits 4
+        (runMiriBounded Witness.charCopyBody 5 Witness.miriCharInit) = some 0x03BB) :=
+  ⟨Witness.wellTyped_charCopy, Witness.stateRel_charCopy, Witness.charCopy_returns_agree⟩
+
 end StatementPins
+
+-- Exhaustively verify standard axioms across all imported `LeanMiriSpec.*` and
+-- `Miri.*` modules AND every constant elaborated in `LeanMiriSpec.Audit` itself.
+#assert_all_leanmirispec_and_miri_standard_axioms
 
 end LeanMiriSpec.Audit

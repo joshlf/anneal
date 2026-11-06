@@ -2446,14 +2446,14 @@ theorem translateBody_locals_getElem? (body : CapturedMir) (i : Nat) :
 
 @[simp] theorem annealLocalStorageHooks_afterLocalWrite
     (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (st : Miri.Memory.MemoryState AnnealProv Unit Unit) (l : Nat) (b : Bool) :
+    (st : AnnealMemory) (l : Nat) (b : Bool) :
     (annealLocalStorageHooks localDecls layouts).afterLocalWrite st l b = ⟨st, .ok ()⟩ := rfl
 
 /-- Only memory-backed locals own an allocation, so `deallocate_local` of any
 other local value is a no-op. -/
 theorem annealLocalStorageHooks_deallocateLocal_of_not_indirect
     (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (st : Miri.Memory.MemoryState AnnealProv Unit Unit)
+    (st : AnnealMemory)
     (v : Miri.Interpreter.LocalValue AnnealProv)
     (hv : ∀ mp, v ≠ .live (.indirect mp)) :
     Miri.Interpreter.Frame.deallocateLocal (annealLocalStorageHooks localDecls layouts) st v =
@@ -2468,7 +2468,7 @@ theorem annealLocalStorageHooks_deallocateLocal_of_not_indirect
 
 /-- `lean-miri`'s source `storage_live_dyn` (`Frame.storageLive`) on a
 non-memory-backed local makes it `.live (.immediate .uninit)`, keeping its cached
-layout and the memory unchanged. -/
+layout and the machine state unchanged. -/
 theorem annealStepHooks_storageLive_eq
     {localDecls : List LocalDecl} {layouts : LayoutTable} {m : AnnealStepState}
     {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
@@ -2491,13 +2491,14 @@ theorem annealStepHooks_storageLive_eq
     annealLocalStorageHooks_veryTriviallySized, annealLocalStorageHooks_afterLocalWrite,
     Miri.Interpreter.MemPlaceMeta.hasMeta,
     frame_replaceLocalValue_of_lt topFrame loc hlt,
-    annealLocalStorageHooks_deallocateLocal_of_not_indirect localDecls layouts m.machine _ hnotIndirect,
+    annealLocalStorageHooks_deallocateLocal_of_not_indirect localDecls layouts m.machine.memory _ hnotIndirect,
     Id.run, hframes, pure_bind, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+  rcases m with ⟨⟨frames⟩, ⟨mem, addr, bt⟩⟩
   rfl
 
 /-- `lean-miri`'s source `storage_dead` (`Frame.storageDead`) on a
 non-memory-backed local other than the return place makes it `.dead`, keeping
-its cached layout and the memory unchanged. -/
+its cached layout and the machine state unchanged. -/
 theorem annealStepHooks_storageDead_eq
     {localDecls : List LocalDecl} {layouts : LayoutTable} {m : AnnealStepState}
     {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
@@ -2517,8 +2518,9 @@ theorem annealStepHooks_storageDead_eq
   simp only [annealStepHooks, annealRunFrameStorage, stack_currentFrame?_singleton m.stack topFrame hframes]
   simp only [Miri.Interpreter.Frame.storageDead, hbeq, hget,
     frame_replaceLocalValue_of_lt topFrame loc hlt,
-    annealLocalStorageHooks_deallocateLocal_of_not_indirect localDecls layouts m.machine _ hnotIndirect,
+    annealLocalStorageHooks_deallocateLocal_of_not_indirect localDecls layouts m.machine.memory _ hnotIndirect,
     Id.run, hframes, Bool.false_eq_true, ↓reduceIte]
+  rcases m with ⟨⟨frames⟩, ⟨mem, addr, bt⟩⟩
   rfl
 
 /-- As in `lean-miri` (and rustc), `StorageDead` of the return place `_0` fails
@@ -2531,22 +2533,22 @@ theorem annealStepHooks_storageDead_returnPlace
       (m, .error (.stack .cannotMakeReturnPlaceDead)) := by
   simp only [annealStepHooks, annealRunFrameStorage, stack_currentFrame?_singleton m.stack topFrame hframes]
   simp only [Miri.Interpreter.Frame.storageDead, Id.run, hframes]
-  rcases m with ⟨⟨frames⟩, machine⟩
+  rcases m with ⟨⟨frames⟩, ⟨mem, addr, bt⟩⟩
   dsimp only at hframes
   subst hframes
   rfl
 
 theorem FrameRel.lookup_local
-    {body : CapturedMir} {mem : Miri.Memory.MemoryState AnnealProv Unit Unit}
+    {body : CapturedMir} {mach : AnnealMachine}
     {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
-    (hrel : FrameRel body mem af mf) {i : Nat} {decl : LocalDecl}
+    (hrel : FrameRel body mach af mf) {i : Nat} {decl : LocalDecl}
     (hdecl : get? body.localDecls i = some decl) :
     ∃ (slot : LocalSlot) (mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout)
       (_ : i < af.locals.length) (hlt_mf : i < mf.locals.size),
       get? af.locals i = some slot ∧
       mf.locals[i]? = some mls ∧
       mf.locals[i]'hlt_mf = mls ∧
-      LocalRel mem decl body.layouts slot mls := by
+      LocalRel mach decl body.layouts slot mls := by
   rw [get?_eq_getElem?] at hdecl
   obtain ⟨hlt_d, _⟩ := List.getElem?_eq_some_iff.mp hdecl
   have hlt_af : i < af.locals.length := by rw [hrel.af_locals_len]; exact hlt_d
@@ -2560,15 +2562,15 @@ theorem FrameRel.lookup_local
     hrel.locals_rel i decl _ _ hdecl' hslot hmls⟩
 
 theorem FrameRel.update_local
-    {body : CapturedMir} {mem : Miri.Memory.MemoryState AnnealProv Unit Unit}
+    {body : CapturedMir} {mach : AnnealMachine}
     {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
-    (hrel : FrameRel body mem af mf)
+    (hrel : FrameRel body mach af mf)
     {idx : Nat} {decl : LocalDecl}
     (hdecl : get? body.localDecls idx = some decl)
     {hlt_mf : idx < mf.locals.size}
     (newSlot : LocalSlot) (newVal : Miri.Interpreter.LocalValue AnnealProv)
-    (hnew : LocalRel mem decl body.layouts newSlot { mf.locals[idx]'hlt_mf with value := newVal }) :
-    FrameRel body mem
+    (hnew : LocalRel mach decl body.layouts newSlot { mf.locals[idx]'hlt_mf with value := newVal }) :
+    FrameRel body mach
       { af with locals := af.locals.set idx newSlot }
       { mf with locals := mf.locals.set idx { mf.locals[idx]'hlt_mf with value := newVal } hlt_mf } where
   body_eq := hrel.body_eq
@@ -2655,12 +2657,12 @@ theorem IsImmediateFrameLocal.cache_layout
     exact h mls hmls mp hmp
 
 theorem LocalRel.cache_layout
-    {mem : Miri.Memory.MemoryState AnnealProv Unit Unit}
+    {mach : AnnealMachine}
     {decl : LocalDecl} {layouts : LayoutTable}
     {slot : LocalSlot}
     {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
-    (h : LocalRel mem decl layouts slot mls) :
-    LocalRel mem decl layouts slot { mls with layout := some (translateTy decl.ty layouts) } := by
+    (h : LocalRel mach decl layouts slot mls) :
+    LocalRel mach decl layouts slot { mls with layout := some (translateTy decl.ty layouts) } := by
   have hc : ∀ l ∈ (some (translateTy decl.ty layouts)), l = translateTy decl.ty layouts := by
     intro l hl; exact (Option.some.inj hl).symm
   cases h with
@@ -2669,13 +2671,13 @@ theorem LocalRel.cache_layout
   | indirect _ mp _ _ hne hmp => exact .indirect _ mp _ hc hne hmp
 
 theorem FrameRel.cache_local_layout
-    {body : CapturedMir} {mem : Miri.Memory.MemoryState AnnealProv Unit Unit}
+    {body : CapturedMir} {mach : AnnealMachine}
     {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
-    (hrel : FrameRel body mem af mf)
+    (hrel : FrameRel body mach af mf)
     {idx : Nat} {decl : LocalDecl}
     (hdecl : get? body.localDecls idx = some decl)
     (hlt_mf : idx < mf.locals.size) :
-    FrameRel body mem af
+    FrameRel body mach af
       (cacheFrameLocalLayout mf idx hlt_mf (translateTy decl.ty body.layouts)) where
   body_eq := hrel.body_eq
   location_eq := hrel.location_eq
@@ -2709,10 +2711,10 @@ theorem EStateM.bind_eq_error {ε σ α β : Type} {x : EStateM ε σ α} {f : �
   rw [h]
 
 theorem LocalRel.layout_eq
-    {mem : Miri.Memory.MemoryState AnnealProv Unit Unit}
+    {mach : AnnealMachine}
     {decl : LocalDecl} {layouts : LayoutTable}
     {slot : LocalSlot} {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
-    (h : LocalRel mem decl layouts slot mls) :
+    (h : LocalRel mach decl layouts slot mls) :
     ∀ l, mls.layout = some l → l = translateTy decl.ty layouts := by
   cases h with
   | dead _ hlay => exact hlay
@@ -2805,6 +2807,10 @@ theorem ne_bool {ty : Ty} {kind : Miri.MIR.IntegerKind} (h : IsIntegralTy ty kin
     ty.kind ≠ .bool := by
   rcases h with ⟨_, hk⟩ | ⟨_, hk⟩ <;> rw [hk] <;> nofun
 
+theorem ne_char {ty : Ty} {kind : Miri.MIR.IntegerKind} (h : IsIntegralTy ty kind) :
+    ty.kind ≠ .char := by
+  rcases h with ⟨_, hk⟩ | ⟨_, hk⟩ <;> rw [hk] <;> nofun
+
 theorem classify {ty : Ty} {kind : Miri.MIR.IntegerKind} (h : IsIntegralTy ty kind) :
     classifyEncodedTyId (encodeTyId ty) = .ok (.integer kind) := by
   rcases h with ⟨it, hk⟩ | ⟨ut, hk⟩
@@ -2894,7 +2900,7 @@ theorem bool_of_immediateRel {ty : Ty} {layouts : LayoutTable}
       imm = .scalar (.fromScalarInt msc) ∧
       ScalarRel (boolToScalar b) msc ∧
       (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) msc).toBool = .ok b := by
-  obtain ⟨sc, msc, rfl, rfl, hrel, _, hbool⟩ :=
+  obtain ⟨sc, msc, rfl, rfl, hrel, _, hbool, _⟩ :=
     himm.of_primitive_scalar (Or.inl hk)
   obtain ⟨hsz1, hbits⟩ := hbool hk
   rcases sc with ⟨bits, sz⟩
@@ -2928,8 +2934,8 @@ theorem annealReadImmediate_of_immediateRel {ty : Ty} {layouts : LayoutTable}
     annealReadImmediate ⟨.immediate imm, lay⟩ m = .ok ⟨imm, lay⟩ m ∧ imm ≠ .uninit := by
   cases himm with
   | unit hzero => exact False.elim (hsz hzero)
-  | scalar _ _ _ _ _ => exact ⟨rfl, nofun⟩
-  | scalarPair _ _ _ _ _ _ _ => exact ⟨rfl, nofun⟩
+  | scalar _ _ _ _ _ _ => exact ⟨rfl, nofun⟩
+  | scalarPair _ _ _ _ _ _ _ _ => exact ⟨rfl, nofun⟩
 
 /-! ### 5.2 `annealEvalPlace`, `annealWriteImmediate`, and `annealEvalOperand` Lemmas -/
 
@@ -3151,6 +3157,7 @@ inductive WellTypedScalarOperand
       sc.bits < scalarModulus sc.sizeBytes →
       (translateTy c.ty body.layouts).layout.size = translateSizeBytes sc.sizeBytes →
       (c.ty.kind = .bool → sc.sizeBytes = 1 ∧ (sc.bits = 0 ∨ sc.bits = 1)) →
+      (c.ty.kind = .char → sc.sizeBytes = 4 ∧ isValidCharCode sc.bits = true) →
       WellTypedScalarOperand body topFrame (.constant c) c.ty
   | copyLocal (idx : Local) (decl : LocalDecl) :
       get? body.localDecls idx = some decl →
@@ -3166,8 +3173,8 @@ theorem WellTypedScalarOperand.mono_immediate
     (hmono : ∀ j, IsImmediateFrameLocal tf j → IsImmediateFrameLocal tf' j) :
     WellTypedScalarOperand body tf' op ty := by
   cases h with
-  | constScalar c sc hval hprim hsz hcan hlaysz hbool =>
-    exact .constScalar c sc hval hprim hsz hcan hlaysz hbool
+  | constScalar c sc hval hprim hsz hcan hlaysz hbool hchar =>
+    exact .constScalar c sc hval hprim hsz hcan hlaysz hbool hchar
   | copyLocal idx decl hdecl hsz himm =>
     exact .copyLocal idx decl hdecl hsz (hmono idx himm)
 
@@ -3203,7 +3210,7 @@ theorem WellTypedScalarOperand.operandTy_eq
     (h : WellTypedScalarOperand body tf op ty) :
     operandTy body.localDecls body.layouts op = some ty := by
   cases h with
-  | constScalar _ _ _ _ _ _ _ _ => rfl
+  | constScalar _ _ _ _ _ _ _ _ _ => rfl
   | copyLocal idx decl hdecl _ _ => simp [operandTy, resolveProjectedTy, hdecl]
 
 /-- `annealEvalOperand` gives `Move` exactly the behavior of `Copy`, as
@@ -3292,7 +3299,7 @@ theorem evalOperand_scalar_simulation
   have hsame : { m with stack := ⟨#[topFrame]⟩ } = m :=
     stepState_with_same_singleton m topFrame hframes
   cases hop with
-  | constScalar c sc hval hprim hsz hcan hlaysz hbool =>
+  | constScalar c sc hval hprim hsz hcan hlaysz hbool hchar =>
     obtain ⟨msc, htry, hrel⟩ := tryFromUInt_of_valid_canonical hsz hcan
     have heval_a : evalOperand af.locals (.constant c) .nil globals body.layouts .nil =
         .ok (.scalar sc) af.locals := by
@@ -3315,7 +3322,7 @@ theorem evalOperand_scalar_simulation
       (.ok ⟨.scalar (.fromScalarInt msc), translateTy c.ty body.layouts⟩ m)
     rw [← hsame]
     exact .ok (.scalar sc) af.locals topFrame (.scalar (.fromScalarInt msc))
-      hframe (.scalar sc msc hrel hlaysz hbool) (fun _ h => h) rfl
+      hframe (.scalar sc msc hrel hlaysz hbool hchar) (fun _ h => h) rfl
   | copyLocal idx decl hdecl hsz_nz himm =>
     obtain ⟨slot, mls, _, hlt_mf, hslot, hmls, hmls_eq, hloc⟩ := hframe.lookup_local hdecl
     have hcache := hloc.layout_eq
@@ -3975,7 +3982,7 @@ theorem assertRvalueLayoutPub_eq_ok
 theorem miri_step_at_statement_error
     {PlaceTy : Type}
     (hooks : Miri.Interpreter.StepHooks AnnealProv Miri.Interpreter.LocalLayout Unit
-      (Miri.Memory.MemoryState AnnealProv Unit Unit) Unit PlaceTy)
+      AnnealMachine Unit PlaceTy)
     {body : CapturedMir} {m m' : AnnealStepState}
     {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
     {blockIdx stmtIdx : Nat} {bb : BasicBlockData} {stmt : Statement}
@@ -4002,7 +4009,7 @@ theorem miri_step_at_statement_error
 theorem miri_step_at_statement_ok
     {PlaceTy : Type}
     (hooks : Miri.Interpreter.StepHooks AnnealProv Miri.Interpreter.LocalLayout Unit
-      (Miri.Memory.MemoryState AnnealProv Unit Unit) Unit PlaceTy)
+      AnnealMachine Unit PlaceTy)
     {body : CapturedMir} {m m' : AnnealStepState}
     {topFrame topFrame' : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
     {blockIdx stmtIdx : Nat} {bb : BasicBlockData} {stmt : Statement}
@@ -4171,7 +4178,7 @@ theorem scalarOps_unary_simulation
       ImmediateRel dstTy body.layouts v' imm' := by
   cases huop with
   | intNot _ _ kind hsrc hdst =>
-    obtain ⟨sc, msc, rfl, rfl, hrel, hsz, _⟩ := himm.of_primitive_scalar hsrc.prim
+    obtain ⟨sc, msc, rfl, rfl, hrel, hsz, _, _⟩ := himm.of_primitive_scalar hsrc.prim
     obtain ⟨sc', msc', ha_not, hm_not, hrel'⟩ :=
       (evalUnOp_neg_not_simulation hrel locals₁ mem).1 kind srcTy hsrc.not_kinds
     have hsc'_sz : (translateTy dstTy body.layouts).layout.size = translateSizeBytes sc'.sizeBytes := by
@@ -4201,7 +4208,8 @@ theorem scalarOps_unary_simulation
         unfold liftScalarResult
         simp only [hm_not, Except.mapError, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure]
     refine ⟨sc, .scalar sc', .scalar (.fromScalarInt msc'), rfl, ?_, ?_,
-      .scalar sc' msc' hrel' hsc'_sz (fun hb => False.elim (hdst.ne_bool hb))⟩
+      .scalar sc' msc' hrel' hsc'_sz (fun hb => False.elim (hdst.ne_bool hb))
+        (fun hc => False.elim (hdst.ne_char hc))⟩
     · rw [hop_ty]; exact ha_not
     · dsimp only [translateUnOp]
       rw [EStateM.bind_eq_ok hm_unary,
@@ -4235,11 +4243,12 @@ theorem scalarOps_unary_simulation
         EStateM.bind_eq_ok (assertRvalueLayoutPub_eq_ok _ _ rfl m₁)]
       rfl
     · refine .scalar (boolToScalar (!b)) (.ofBool (!b)) (ScalarRel.of_boolToScalar (!b)) ?_ ?_
+        (fun hc => by rw [hdst] at hc; cases hc)
       · simp [translateTy, hdst, scalarLayoutData, boolToScalar]
         cases b <;> rfl
       · intro _; cases b <;> simp [boolToScalar]
   | intNeg _ _ kind hsrc hdst hsigned =>
-    obtain ⟨sc, msc, rfl, rfl, hrel, hsz, _⟩ := himm.of_primitive_scalar hsrc.prim
+    obtain ⟨sc, msc, rfl, rfl, hrel, hsz, _, _⟩ := himm.of_primitive_scalar hsrc.prim
     obtain ⟨msc', hm_neg, hrel'⟩ :=
       (evalUnOp_neg_not_simulation hrel locals₁ mem).2.1 kind hsigned
     let mod := scalarModulus sc.sizeBytes
@@ -4264,7 +4273,8 @@ theorem scalarOps_unary_simulation
         unfold liftScalarResult
         simp only [hm_neg, Except.mapError, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure]
     refine ⟨sc, .scalar negSc, .scalar (.fromScalarInt msc'), rfl, ?_, ?_,
-      .scalar negSc msc' hrel' hsz_dst (fun hb => False.elim (hdst.ne_bool hb))⟩
+      .scalar negSc msc' hrel' hsz_dst (fun hb => False.elim (hdst.ne_bool hb))
+        (fun hc => False.elim (hdst.ne_char hc))⟩
     · simp only [hrel.beq_sizeBytes_zero, Nat.sub_eq]
       rfl
     · dsimp only [translateUnOp]
@@ -4371,8 +4381,8 @@ theorem scalarOps_binary_simulation
   rw [hisSigned]
   cases hbop with
   | intArithOrBitwise kind hkind hlhs hrhs hdst =>
-    obtain ⟨sc₁, msc₁, rfl, rfl, hrel₁, hsz₁, _⟩ := himm₁.of_primitive_scalar hlhs.prim
-    obtain ⟨sc₂, msc₂, rfl, rfl, hrel₂, hsz₂, _⟩ := himm₂.of_primitive_scalar hrhs.prim
+    obtain ⟨sc₁, msc₁, rfl, rfl, hrel₁, hsz₁, _, _⟩ := himm₁.of_primitive_scalar hlhs.prim
+    obtain ⟨sc₂, msc₂, rfl, rfl, hrel₂, hsz₂, _, _⟩ := himm₂.of_primitive_scalar hrhs.prim
     refine ⟨sc₁, sc₂, rfl, rfl, ?_⟩
     rw [hlhs.signed_eq]
     have hlay_eq := hlhs.translateTy_eq hrhs body.layouts body.layouts
@@ -4434,10 +4444,11 @@ theorem scalarOps_binary_simulation
         have hmsc'_sz := hsz_res msc' rfl
         rw [← hlhs.translateTy_eq hdst body.layouts body.layouts, hsz₁, ← hmsc'_sz, hrel'.size_eq]
       exact .ok (.scalar sc') (.scalar (.fromScalarInt msc'))
-        (.scalar sc' msc' hrel' hsz_dst (fun hb => False.elim (hdst.ne_bool hb)))
+        (.scalar sc' msc' hrel' hsz_dst (fun hb => False.elim (hdst.ne_bool hb))
+          (fun hc => False.elim (hdst.ne_char hc)))
   | intCmp kind hcmp hlhs hrhs hdst_bool =>
-    obtain ⟨sc₁, msc₁, rfl, rfl, hrel₁, hsz₁, _⟩ := himm₁.of_primitive_scalar hlhs.prim
-    obtain ⟨sc₂, msc₂, rfl, rfl, hrel₂, hsz₂, _⟩ := himm₂.of_primitive_scalar hrhs.prim
+    obtain ⟨sc₁, msc₁, rfl, rfl, hrel₁, hsz₁, _, _⟩ := himm₁.of_primitive_scalar hlhs.prim
+    obtain ⟨sc₂, msc₂, rfl, rfl, hrel₂, hsz₂, _, _⟩ := himm₂.of_primitive_scalar hrhs.prim
     refine ⟨sc₁, sc₂, rfl, rfl, ?_⟩
     rw [hlhs.signed_eq]
     have hlay_eq := hlhs.translateTy_eq hrhs body.layouts body.layouts
@@ -4484,13 +4495,14 @@ theorem scalarOps_binary_simulation
             Bind.bind, EStateM.bind, Pure.pure, EStateM.pure]
       rw [EStateM.bind_eq_ok hm_ok, EStateM.bind_eq_ok (assertRvalueLayoutPub_eq_ok _ _ rfl m₂)]
       refine .ok (.scalar (boolToScalar b)) (.scalar (.fromScalarInt (.ofBool b)))
-        (.scalar (boolToScalar b) (.ofBool b) (ScalarRel.of_boolToScalar b) ?_ ?_)
+        (.scalar (boolToScalar b) (.ofBool b) (ScalarRel.of_boolToScalar b) ?_ ?_
+          (fun hc => by rw [hdst_bool] at hc; cases hc))
       · simp [translateTy, hdst_bool, scalarLayoutData, boolToScalar]
         cases b <;> rfl
       · intro _; cases b <;> simp [boolToScalar]
   | intWithOverflow kind hovf hlhs hrhs hdst_agg hdst_lay =>
-    obtain ⟨sc₁, msc₁, rfl, rfl, hrel₁, hsz₁, _⟩ := himm₁.of_primitive_scalar hlhs.prim
-    obtain ⟨sc₂, msc₂, rfl, rfl, hrel₂, hsz₂, _⟩ := himm₂.of_primitive_scalar hrhs.prim
+    obtain ⟨sc₁, msc₁, rfl, rfl, hrel₁, hsz₁, _, _⟩ := himm₁.of_primitive_scalar hlhs.prim
+    obtain ⟨sc₂, msc₂, rfl, rfl, hrel₂, hsz₂, _, _⟩ := himm₂.of_primitive_scalar hrhs.prim
     refine ⟨sc₁, sc₂, rfl, rfl, ?_⟩
     rw [hlhs.signed_eq]
     have hlay_eq := hlhs.translateTy_eq hrhs body.layouts body.layouts
@@ -4526,10 +4538,11 @@ theorem scalarOps_binary_simulation
           simp [hdst_lay, Except.mapError, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure]
       rw [EStateM.bind_eq_ok hm_ok, EStateM.bind_eq_ok (assertRvalueLayoutPub_eq_ok _ _ rfl m₂)]
       exact .ok _ _ (.scalarPair sc' (boolToScalar b) msc' (.ofBool b)
-        hrel' (ScalarRel.of_boolToScalar b) hdst_agg)
+        hrel' (ScalarRel.of_boolToScalar b) hdst_agg
+        (fun _ _ => by cases b <;> simp [boolToScalar]))
   | intShift kind₁ kind₂ hsh hlhs hrhs hdst =>
-    obtain ⟨sc₁, msc₁, rfl, rfl, hrel₁, hsz₁, _⟩ := himm₁.of_primitive_scalar hlhs.prim
-    obtain ⟨sc₂, msc₂, rfl, rfl, hrel₂, hsz₂, _⟩ := himm₂.of_primitive_scalar hrhs.prim
+    obtain ⟨sc₁, msc₁, rfl, rfl, hrel₁, hsz₁, _, _⟩ := himm₁.of_primitive_scalar hlhs.prim
+    obtain ⟨sc₂, msc₂, rfl, rfl, hrel₂, hsz₂, _, _⟩ := himm₂.of_primitive_scalar hrhs.prim
     refine ⟨sc₁, sc₂, rfl, rfl, ?_⟩
     rw [hlhs.signed_eq]
     have his_sh : scalarOpsIsShift (translateBinOp bop) = true := by
@@ -4575,7 +4588,8 @@ theorem scalarOps_binary_simulation
         have hmsc'_sz := hsz_res msc' rfl
         rw [← hlhs.translateTy_eq hdst body.layouts body.layouts, hsz₁, ← hmsc'_sz, hrel'.size_eq]
       exact .ok (.scalar sc') (.scalar (.fromScalarInt msc'))
-        (.scalar sc' msc' hrel' hsz_dst (fun hb => False.elim (hdst.ne_bool hb)))
+        (.scalar sc' msc' hrel' hsz_dst (fun hb => False.elim (hdst.ne_bool hb))
+          (fun hc => False.elim (hdst.ne_char hc)))
   | boolBitwise hbw hlhs_b hrhs_b hdst_b =>
     obtain ⟨b₁, msc₁, rfl, rfl, hrel₁, htoB₁⟩ := bool_of_immediateRel hlhs_b himm₁
     obtain ⟨b₂, msc₂, rfl, rfl, hrel₂, htoB₂⟩ := bool_of_immediateRel hrhs_b himm₂
@@ -4607,7 +4621,8 @@ theorem scalarOps_binary_simulation
           htoB₁, htoB₂, hm_bb, Except.mapError, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure]
     rw [ha_bb, EStateM.bind_eq_ok hm_ok, EStateM.bind_eq_ok (assertRvalueLayoutPub_eq_ok _ _ rfl m₂)]
     refine .ok (.scalar (boolToScalar b')) (.scalar (.fromScalarInt (.ofBool b')))
-      (.scalar (boolToScalar b') (.ofBool b') (ScalarRel.of_boolToScalar b') ?_ ?_)
+      (.scalar (boolToScalar b') (.ofBool b') (ScalarRel.of_boolToScalar b') ?_ ?_
+        (fun hc => by rw [hdst_b] at hc; cases hc))
     · simp [translateTy, hdst_b, scalarLayoutData, boolToScalar]
       cases b' <;> rfl
     · intro _; cases b' <;> simp [boolToScalar]
@@ -5198,7 +5213,7 @@ theorem annealTerminatorHooks_toControlHooks
 
 theorem returnFromCurrentFrame_of_error
     (hooks : Miri.Interpreter.ControlHooks AnnealProv Miri.Interpreter.LocalLayout Unit
-      (Miri.Memory.MemoryState AnnealProv Unit Unit) Unit (Miri.Interpreter.Operand AnnealProv))
+      AnnealMachine Unit (Miri.Interpreter.Operand AnnealProv))
     {body : CapturedMir} {m : AnnealStepState}
     {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
     {blockIdx stmtIdx : Nat} {bb : BasicBlockData}
@@ -5224,7 +5239,7 @@ theorem returnFromCurrentFrame_of_error
 
 theorem returnFromCurrentFrame_of_ok
     (hooks : Miri.Interpreter.ControlHooks AnnealProv Miri.Interpreter.LocalLayout Unit
-      (Miri.Memory.MemoryState AnnealProv Unit Unit) Unit (Miri.Interpreter.Operand AnnealProv))
+      AnnealMachine Unit (Miri.Interpreter.Operand AnnealProv))
     {body : CapturedMir} {m : AnnealStepState}
     {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
     {blockIdx stmtIdx : Nat} {bb : BasicBlockData}
@@ -5355,7 +5370,8 @@ theorem step_terminator_goto_return_simulation
         ∃ decl0,
           get? body.localDecls 0 = some decl0 ∧
           (translateTy decl0.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO ∧
-          ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame 0)) :
+          ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame 0) ∨
+      bb.terminator.kind = .unreachable) :
     StepRel body m
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
@@ -5367,7 +5383,7 @@ theorem step_terminator_goto_return_simulation
     simp [hstmt_len]
   simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
   rw [miri_step_at_terminator hframes hframe.body_eq hframe.location_eq hbb hstmt_none]
-  rcases hterm with ⟨target, hgoto⟩ | ⟨hret, decl0, hdecl0, hsz0, himm0⟩
+  rcases hterm with ⟨target, hgoto⟩ | ⟨hret, decl0, hdecl0, hsz0, himm0⟩ | hunreach
   · unfold evalTerminator translateTerminator
       Miri.Interpreter.ControlFlow.evalTerminator
       Miri.Interpreter.ControlFlow.goToBlock
@@ -5402,7 +5418,7 @@ theorem step_terminator_goto_return_simulation
       · cases himmRel with
         | unit hzero =>
           exact False.elim (hsz0 hzero)
-        | scalar sc msc hsc hsz_sc hbool_sc =>
+        | scalar sc msc hsc hsz_sc hbool_sc hchar_sc =>
           have hop0 := annealControlHooks_returnOperand_scalar hframes hget0
           rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
             hframe.location_eq hbb hcleanup hretCont hop0
@@ -5410,8 +5426,8 @@ theorem step_terminator_goto_return_simulation
             (annealControlHooks_copyReturn_empty _ hretPlace)
             (annealControlHooks_cleanupFrame_eq false topFrame _)]
           exact StepRel.retRoot decl0 _ _ s.memory _ hdecl0 hop0
-            (.scalar sc msc hsc hsz_sc hbool_sc) rfl
-        | scalarPair sc₁ sc₂ msc₁ msc₂ hsc₁ hsc₂ hagg =>
+            (.scalar sc msc hsc hsz_sc hbool_sc hchar_sc) rfl
+        | scalarPair sc₁ sc₂ msc₁ msc₂ hsc₁ hsc₂ hagg hpair =>
           have hop0 := annealControlHooks_returnOperand_scalarPair hframes hget0
           rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
             hframe.location_eq hbb hcleanup hretCont hop0
@@ -5419,14 +5435,18 @@ theorem step_terminator_goto_return_simulation
             (annealControlHooks_copyReturn_empty _ hretPlace)
             (annealControlHooks_cleanupFrame_eq false topFrame _)]
           exact StepRel.retRoot decl0 _ _ s.memory _ hdecl0 hop0
-            (.scalarPair sc₁ sc₂ msc₁ msc₂ hsc₁ hsc₂ hagg) rfl
+            (.scalarPair sc₁ sc₂ msc₁ msc₂ hsc₁ hsc₂ hagg hpair) rfl
+  · unfold evalTerminator translateTerminator Miri.Interpreter.ControlFlow.evalTerminator
+    rw [hunreach]
+    dsimp only [translateTerminatorKind, Except.map, Id.run]
+    exact StepRel.ub _ _
 
 /-! ### 5.6 Whole-Body Syntactic Well-Typedness (`WellTypedBody`) & Unified Step Simulation -/
 
 theorem FrameRel.isImmediateFrameLocal_of_live_nil
-    {body : CapturedMir} {mem : Miri.Memory.MemoryState AnnealProv Unit Unit}
+    {body : CapturedMir} {mach : AnnealMachine}
     {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
-    (hfr : FrameRel body mem af mf) (hlive : mem.live.toList = [])
+    (hfr : FrameRel body mach af mf) (hlive : mach.memory.live.toList = [])
     {idx : Nat} {decl : LocalDecl} (hdecl : get? body.localDecls idx = some decl) :
     IsImmediateFrameLocal mf idx := by
   obtain ⟨_, mls, _, _, _, hmls, _, hloc⟩ := hfr.lookup_local hdecl
@@ -5437,9 +5457,8 @@ theorem FrameRel.isImmediateFrameLocal_of_live_nil
   | dead _ _ => cases hmp
   | immediate _ _ _ _ _ => cases hmp
   | indirect _ _ _ _ _ hmemp =>
-    cases hmemp with
-    | mk _ _ _ _ _ _ _ hin _ _ _ _ _ _ _ =>
-      rw [hlive] at hin; cases hin
+    rcases hmemp with ⟨_, _, _, _, _, _, _, _, hin, _⟩
+    rw [hlive] at hin; cases hin
 
 /-- Purely syntactic operand well-typedness on `CapturedMir` (parametric in the
 set `nonAddrTaken` of immediate/non-address-taken locals, with zero reference to
@@ -5454,6 +5473,7 @@ inductive WellTypedScalarOperandSyn
       sc.bits < scalarModulus sc.sizeBytes →
       (translateTy c.ty body.layouts).layout.size = translateSizeBytes sc.sizeBytes →
       (c.ty.kind = .bool → sc.sizeBytes = 1 ∧ (sc.bits = 0 ∨ sc.bits = 1)) →
+      (c.ty.kind = .char → sc.sizeBytes = 4 ∧ isValidCharCode sc.bits = true) →
       WellTypedScalarOperandSyn body nonAddrTaken (.constant c) c.ty
   | copyLocal (idx : Local) (decl : LocalDecl) :
       get? body.localDecls idx = some decl →
@@ -5517,7 +5537,8 @@ structure WellTypedBasicBlock
       nonAddrTaken 0 ∧
       ∃ decl0,
         get? body.localDecls 0 = some decl0 ∧
-        (translateTy decl0.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO)
+        (translateTy decl0.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO) ∨
+    bb.terminator.kind = .unreachable
 
 /-- Purely syntactic whole-body well-typedness (`WellTypedBody`) for the `LM-1.1`
 scalar MIR fragment, parametric in `nonAddrTaken` (defaulting to `fun _ => True`
@@ -5542,7 +5563,7 @@ def NonAddrTakenImmediate (body : CapturedMir) (nonAddrTaken : Nat → Prop)
 theorem NonAddrTakenImmediate.of_live_nil
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (nonAddrTaken : Nat → Prop)
-    (hstate : StateRel body s m) (hlive : m.machine.live.toList = []) :
+    (hstate : StateRel body s m) (hlive : m.machine.memory.live.toList = []) :
     NonAddrTakenImmediate body nonAddrTaken m := by
   rcases hstate with ⟨tf, hframes, _, _, hfr, _, _, _, _, _⟩
   intro topFrame htf idx decl hdecl _
@@ -5563,8 +5584,8 @@ theorem WellTypedScalarOperandSyn.toFrame
     (himm : NonAddrTakenImmediate body nonAddrTaken m) :
     WellTypedScalarOperand body topFrame op ty := by
   cases h with
-  | constScalar c sc hval hprim hsz hcan hlaysz hbool =>
-    exact .constScalar c sc hval hprim hsz hcan hlaysz hbool
+  | constScalar c sc hval hprim hsz hcan hlaysz hbool hchar =>
+    exact .constScalar c sc hval hprim hsz hcan hlaysz hbool hchar
   | copyLocal idx decl hdecl hsz hna =>
     exact .copyLocal idx decl hdecl hsz (himm topFrame hframes idx decl hdecl hna)
 
@@ -5639,10 +5660,11 @@ theorem step_wellTypedBody_simulation
       rw [get?_eq_getElem?, List.getElem?_eq_none (by omega)]
     apply step_terminator_goto_return_simulation hstate hbody.phase_ok hbb hstmt_none
       hlen_eq hbb_wt.not_cleanup
-    rcases hbb_wt.term_wt with ⟨target, _, hgoto, _⟩ | ⟨hret, hna0, decl0, hdecl0, hsz0⟩
+    rcases hbb_wt.term_wt with ⟨target, _, hgoto, _⟩ | ⟨hret, hna0, decl0, hdecl0, hsz0⟩ | hunreach
     · exact Or.inl ⟨target, hgoto⟩
-    · exact Or.inr ⟨hret, decl0, hdecl0, hsz0,
-        fun tf hframes => himm tf hframes 0 decl0 hdecl0 hna0⟩
+    · exact Or.inr (Or.inl ⟨hret, decl0, hdecl0, hsz0,
+        fun tf hframes => himm tf hframes 0 decl0 hdecl0 hna0⟩)
+    · exact Or.inr (Or.inr hunreach)
 
 /-- The `LM-1.1` correspondence stated directly on the two step functions,
 without `StepRel`. Under `StateRel` and the syntactic `WellTypedBody`
@@ -5828,7 +5850,7 @@ theorem ValidFrameLocation.preserved
     have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by
       simp [hlen_eq]
     simp only [hstmt_none, hbeq_len, ↓reduceIte] at hstep
-    rcases hbb_wt.term_wt with ⟨target, targetBb, hgoto, htargetBb⟩ | ⟨hret, _, _, _, _⟩
+    rcases hbb_wt.term_wt with ⟨target, targetBb, hgoto, htargetBb⟩ | ⟨hret, _, _, _, _⟩ | hunreach
     · unfold evalTerminator at hstep
       rw [hgoto] at hstep
       have h := MirStepNode_step_inj hstep
@@ -5845,6 +5867,9 @@ theorem ValidFrameLocation.preserved
         | dead => exact fun hstep => absurd hstep MirStepNode_fail_ne_step
         | uninit => exact fun hstep => absurd hstep MirStepNode_fail_ne_step
         | init _ => exact fun hstep => absurd hstep MirStepNode_retNormal_ne_step
+    · unfold evalTerminator at hstep
+      rw [hunreach] at hstep
+      exact absurd hstep MirStepNode_fail_ne_step
 
 /-- `NonAddrTakenImmediate` is preserved across every `lean-miri` step that
 continues (`.ok true`) on a `WellTypedBody`. -/
@@ -5876,7 +5901,7 @@ theorem NonAddrTakenImmediate.preserved
       rw [length_eq_length]; omega
     have hstmt_none : get? bb.statements s.frame.stmtIdx = none := by
       rw [get?_eq_getElem?, List.getElem?_eq_none (by omega)]
-    rcases hbb_wt.term_wt with ⟨target, _, hgoto, _⟩ | ⟨hret, hna0, decl0, hdecl0, hsz0⟩
+    rcases hbb_wt.term_wt with ⟨target, _, hgoto, _⟩ | ⟨hret, hna0, decl0, hdecl0, hsz0⟩ | hunreach
     · rcases hstate with ⟨topFrame, hframes, _, _, hframe, _, _, _, _, _⟩
       have himm_orig := himm topFrame hframes idx decl hdecl hna
       have hm_step := miri_step_at_terminator hframes hframe.body_eq hframe.location_eq hbb hstmt_none
@@ -5894,7 +5919,7 @@ theorem NonAddrTakenImmediate.preserved
       exact himm_orig
     · have hsim := step_terminator_goto_return_simulation hstate hbody.phase_ok hbb hstmt_none
         hlen_eq hbb_wt.not_cleanup
-        (Or.inr ⟨hret, decl0, hdecl0, hsz0, fun tf hframes => himm tf hframes 0 decl0 hdecl0 hna0⟩)
+        (Or.inr (Or.inl ⟨hret, decl0, hdecl0, hsz0, fun tf hframes => himm tf hframes 0 decl0 hdecl0 hna0⟩))
       rcases hstate with ⟨_, _, _, _, _, hcal, hstack, _, _, _⟩
       generalize ha_eq : stepMirFn body s = aRes at hsim
       generalize Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = mRes at hsim htf' hm_ok
@@ -5920,6 +5945,13 @@ theorem NonAddrTakenImmediate.preserved
           | dead => exact fun ha_eq => absurd ha_eq MirStepNode_fail_ne_step
           | uninit => exact fun ha_eq => absurd ha_eq MirStepNode_fail_ne_step
           | init _ => exact fun ha_eq => absurd ha_eq MirStepNode_retNormal_ne_step
+    · rcases hstate with ⟨topFrame, hframes, _, _, hframe, _, _, _, _, _⟩
+      have hm_step := miri_step_at_terminator hframes hframe.body_eq hframe.location_eq hbb hstmt_none
+      unfold translateTerminator Miri.Interpreter.ControlFlow.evalTerminator at hm_step
+      rw [hunreach] at hm_step
+      dsimp only [translateTerminatorKind, Except.map, Id.run] at hm_step
+      rw [hm_step] at hm_ok
+      cases hm_ok
 
 /-- Outcome of running Anneal's `stepMirFn` for at most `fuel` steps. -/
 inductive AnnealRunOutcome : Type where
