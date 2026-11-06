@@ -426,6 +426,20 @@ open MiniRustSpec.Correspondence in
   LocalsOkA.teardown
   deallocAll_gen
   killAt_append_dead
+  nodup_map_localName
+  nodup_map_fnName
+  translateLocals_names
+  SegChain.head_regular
+  stmtCfgWf_of_translateStatement
+  splitStmts_cfgWf
+  termCfgWf_of_translateTerminator
+  translateBlocksInProg_cfgWf
+  translateFnInProg_funcCfgWf_core
+  translateFnInProg_funcCfgWf
+  translateFn_funcCfgWf
+  mkStartFn_funcCfgWf
+  translateProgFns_names_and_mem
+  translateProg_progWf
 
 open MiniRustSpec.Correspondence.Witness in
 #assert_standard_axioms
@@ -1194,9 +1208,22 @@ open MiniRustSpec.Correspondence.Witness in
   ctxAssumeDeadLocal_ok
   assumeDeadLocal_anneal_ub
   assumeDeadLocal_minirust_ub_rel
+  assumeMultiFrame_inFragment
+  assumeMultiFrame_translate
+  assumeMultiFrame_translateInProg
+  assumeChainCallee_translateInProg
   assumeMultiFrame_prog_wf
   assumeMultiFrame_func_wf_caller
   assumeMultiFrame_func_wf_callee
+  ctxAssumeMultiFrame_ok
+  assumeMultiFrame5_anneal_ret
+  assumeMultiFrame5_minirust_ret
+  assumeMultiFramePreUb_anneal_ub
+  assumeMultiFramePreUb_minirust_ub_rel
+  assumeMultiFrameCalleeSeg2Ub_anneal_ub
+  assumeMultiFrameCalleeSeg2Ub_minirust_ub_rel
+  assumeMultiFramePostUb_anneal_ub
+  assumeMultiFramePostUb_minirust_ub_rel
   assumeMoveReuse_rejected
   assumeMoveReuse_diverges
   assumeAfterMove_rejected
@@ -1489,6 +1516,20 @@ open MiniRustSpec.Correspondence in
   LocalsOkA.teardown
   deallocAll_gen
   killAt_append_dead
+  nodup_map_localName
+  nodup_map_fnName
+  translateLocals_names
+  SegChain.head_regular
+  stmtCfgWf_of_translateStatement
+  splitStmts_cfgWf
+  termCfgWf_of_translateTerminator
+  translateBlocksInProg_cfgWf
+  translateFnInProg_funcCfgWf_core
+  translateFnInProg_funcCfgWf
+  translateFn_funcCfgWf
+  mkStartFn_funcCfgWf
+  translateProgFns_names_and_mem
+  translateProg_progWf
 
 open MiniRustSpec.Correspondence.Witness in
 #check_theorem_deps "[WITNESS-AUDIT]"
@@ -2098,9 +2139,22 @@ open MiniRustSpec.Correspondence.Witness in
   ctxAssumeDeadLocal_ok
   assumeDeadLocal_anneal_ub
   assumeDeadLocal_minirust_ub_rel
+  assumeMultiFrame_inFragment
+  assumeMultiFrame_translate
+  assumeMultiFrame_translateInProg
+  assumeChainCallee_translateInProg
   assumeMultiFrame_prog_wf
   assumeMultiFrame_func_wf_caller
   assumeMultiFrame_func_wf_callee
+  ctxAssumeMultiFrame_ok
+  assumeMultiFrame5_anneal_ret
+  assumeMultiFrame5_minirust_ret
+  assumeMultiFramePreUb_anneal_ub
+  assumeMultiFramePreUb_minirust_ub_rel
+  assumeMultiFrameCalleeSeg2Ub_anneal_ub
+  assumeMultiFrameCalleeSeg2Ub_minirust_ub_rel
+  assumeMultiFramePostUb_anneal_ub
+  assumeMultiFramePostUb_minirust_ub_rel
   assumeMoveReuse_rejected
   assumeMoveReuse_diverges
   assumeAfterMove_rejected
@@ -2271,6 +2325,9 @@ open MiniRustSpec.Correspondence in
   bdCtpop_handled
   bdExactDiv_handled
   exactDivHandler_iff_minirust
+  bdWriteBytes_unhandled_fault
+  bdUbChecksCall_extCall
+  bdUbChecksCall_handled
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

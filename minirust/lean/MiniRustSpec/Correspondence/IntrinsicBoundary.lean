@@ -633,9 +633,9 @@ private theorem mirHandledTree_extCall_ret {body : CapturedMir} {args : List Val
 
 private theorem mirHandledTree_extCall_ub {body : CapturedMir} {args : List Value}
     {mem : Memory} {h : ExternalCallHandler} {req : MirCallReq}
-    {kStep : MirCallAns → MirExecState}
+    {kStep : MirCallAns → MirExecState} {fk : FailureKind}
     (hstep0 : stepMirFn body (initMachineStateWithMemory body args mem) = .extCall req kStep)
-    (hreq : h req = ITree.fail (E := MirClosedEffect) FailureKind.ub) :
+    (hreq : h req = ITree.fail (E := MirClosedEffect) fk) :
     FaultNow (mirHandledTree body args mem h) := by
   have hobs0 : (mirStatefulTree body args mem).observe =
       .vis (.inr (.inr (CallReq.call req : MirCallE.I)))
@@ -643,8 +643,8 @@ private theorem mirHandledTree_extCall_ub {body : CapturedMir} {args : List Valu
     rw [mirStatefulTree, mirTree, ITree.observe_cofix]
     simp [stepMirState, hstep0, MirStepNode.extCall, ITreeF.map]
   have hfail : ∃ (kFail : PEmpty → ITree MirClosedEffect MirCallAns),
-      (ITree.fail (E := MirClosedEffect) (R := MirCallAns) FailureKind.ub).observe =
-      .vis (.inl (FailReq.fail FailureKind.ub : (FailE FailureKind).I)) kFail := by
+      (ITree.fail (E := MirClosedEffect) (R := MirCallAns) fk).observe =
+      .vis (.inl (FailReq.fail fk : (FailE FailureKind).I)) kFail := by
     dsimp only [ITree.fail, Bind.bind, Monad.toBind, ITree.bind, ITree.triggerSub]
     rw [ITree.observe_cofix]
     dsimp only
@@ -653,7 +653,7 @@ private theorem mirHandledTree_extCall_ub {body : CapturedMir} {args : List Valu
   obtain ⟨kFail, hkFail⟩ := hfail
   have hobsH : ∃ (kOut : PEmpty → ITree MirClosedEffect MirOutcome),
       (mirHandledTree body args mem h).observe =
-      .vis (.inl (FailReq.fail FailureKind.ub : (FailE FailureKind).I)) kOut := by
+      .vis (.inl (FailReq.fail fk : (FailE FailureKind).I)) kOut := by
     rw [mirHandledTree, ITree.interp, ITree.observe_cofix]
     dsimp only [ITree.interpStep]
     rw [hobs0]
@@ -661,7 +661,7 @@ private theorem mirHandledTree_extCall_ub {body : CapturedMir} {args : List Valu
     erw [hreq, hkFail]
     exact ⟨_, rfl⟩
   obtain ⟨kOut, hkOut⟩ := hobsH
-  exact ⟨mirHandledTree body args mem h, .inl (.fail FailureKind.ub), kOut, .refl _, hkOut, trivial⟩
+  exact ⟨mirHandledTree body args mem h, .inl (.fail fk), kOut, .refl _, hkOut, trivial⟩
 
 /-- `ExternalCallHandler` for `core::intrinsics::cold_path`: returns `()` with
 unchanged memory, matching `minimize`'s no-op `Terminator::Goto(target)`
@@ -818,17 +818,65 @@ theorem exactDivHandler_iff_minirust (it : Gen.IntType)
       simp [evalBinOp, evalIntBinOp, hr0, hrep, ub]
 
 
-/-! ## Completeness Audit: `write_bytes` and `ub_checks`
+/-! ### 4c. Completeness boundary for `write_bytes` and `ub_checks`
 
-* `core::intrinsics::write_bytes`: `minimize`'s `translate_rs_intrinsic` has no arm
-  for `write_bytes`; its catch-all arm stops with `span_bug!`. We explicitly map
-  this to `MirStepNode.unsupported` because it lacks an `ExternalCallHandler` and
-  fallback body (see `bdWriteBytes_extCall`).
-* `core::intrinsics::ub_checks`: `tooling/minimize/src/rvalue.rs` lowers
-  `Rvalue::NullaryOp(NullOp::UbChecks)` to a `bool` constant (`build::const_bool`).
-  We map this to `unsupported` in Anneal (see `bdUbChecks_extCall`) because the
-  evaluation requires session configuration not present in MIR semantics.
+* `core::intrinsics::write_bytes`: `stepMirFn` does **not** return
+  `MirStepNode.unsupported` directly; because `write_bytes` has a return target
+  and no body in `Memory.callees`, `stepMirFn` emits `MirStepNode.extCall`
+  (`bdWriteBytes_extCall`). Under any `ExternalCallHandler` that rejects
+  unmodeled calls with `ITree.fail FailureKind.unsupported`, `mirHandledTree`
+  faults immediately (`bdWriteBytes_unhandled_fault`), while `minimize`'s
+  `translate_rs_intrinsic` (`bb.rs:429-694`) has no `sym::write_bytes` arm and
+  hits `span_bug!` (`bb.rs:615`).
+* `core::intrinsics::ub_checks`: appears in two MIR forms. Inline
+  `Rvalue.nullaryOp .ubChecks` steps directly to `MirStepNode.unsupported` in
+  Anneal (`bdUbChecks_step`, `bdUbChecks_not_noUB`) and is rejected by
+  `translateRvalue` (`bdNullaryOp_translateRvalue`). An unlowered
+  `TerminatorKind.call` to `core::intrinsics::ub_checks` instead emits
+  `MirStepNode.extCall` (`bdUbChecksCall_extCall`), and `ubChecksHandler flag`
+  supplies the session-configured `bool` matching `minimize`'s
+  `build::const_bool(self.tcx.sess.ub_checks())` (`bb.rs:607-610`,
+  `bdUbChecksCall_handled`).
 -/
+
+/-- Without a handler for `core::intrinsics::write_bytes`, interpreting
+`bdWriteBytesCaller` under an `unsupported`-defaulting `ExternalCallHandler`
+faults immediately (`FaultNow`), and `progInFragment` rejects the caller
+(`bdExtCallers_rejected`). -/
+theorem bdWriteBytes_unhandled_fault :
+    FaultNow
+      (mirHandledTree bdWriteBytesCaller bdWriteBytesArgs emptyMemory
+        (fun _ => ITree.fail FailureKind.unsupported)) :=
+  mirHandledTree_extCall_ub rfl rfl
+
+/-- `fn ub_checks_call_caller() -> bool`, calling `core::intrinsics::ub_checks`
+as an unlowered `TerminatorKind.call` (`bb.rs:607-610`). -/
+def bdUbChecksCallCaller : CapturedMir :=
+  bdCallBody "boundary::ub_checks_call_caller" "core::intrinsics::ub_checks" [] 0
+    [boolDecl] (some 1)
+
+theorem bdUbChecksCall_extCall :
+    ∃ k, stepMirFn bdUbChecksCallCaller (initMachineState bdUbChecksCallCaller []) =
+      MirStepNode.extCall
+        { defPath := "core::intrinsics::ub_checks", args := [],
+          memory := (initMachineState bdUbChecksCallCaller []).memory } k :=
+  ⟨_, rfl⟩
+
+/-- Session-parameterized `ExternalCallHandler` for unlowered calls to
+`core::intrinsics::ub_checks`: returns `flag` as a 1-byte scalar (`0` or `1`)
+with unchanged memory, matching `minimize`'s
+`build::const_bool(self.tcx.sess.ub_checks())` (`bb.rs:607-610`). -/
+def ubChecksHandler (flag : Bool) : ExternalCallHandler := fun req =>
+  if req.defPath == "core::intrinsics::ub_checks" && req.args.isEmpty then
+    ITree.ret (.returned (.scalar ⟨if flag then 1 else 0, 1⟩) req.memory)
+  else
+    ITree.fail FailureKind.unsupported
+
+theorem bdUbChecksCall_handled (flag : Bool) (m : Mach) :
+    ReachesRet (mirHandledTree bdUbChecksCallCaller [] emptyMemory (ubChecksHandler flag)) []
+        (.normal (.scalar ⟨if flag then 1 else 0, 1⟩, emptyMemory)) ∧
+      Interp.evalValue m (.Constant (.Bool flag) .Bool) = .ok ((.Bool flag, .Bool), m) := by
+  cases flag <;> exact ⟨mirHandledTree_extCall_ret rfl rfl rfl rfl, rfl⟩
 
 /-! ## 5. `core::hint::unreachable_unchecked()` -/
 

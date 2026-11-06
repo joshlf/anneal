@@ -10597,58 +10597,238 @@ theorem assumeTupleCallOv_minirust_ub_rel :
 
  
 
--- ## MR-4.2 A1 Witnesses for `funcCfgWf`/`progWf` and `Assume` edge cases
+/-! ## Multi-frame `Assume` chains & `funcCfgWf`/`progWf` (`assumeMultiFrameCaller`) -/
 
-/-- Callee with an `Assume` chain to test `funcCfgWf`/`progWf` and multi-frame split. -/
+/-- Callee with two distinct `Assume` statements (`x > 0` and `x < 10`) whose
+`StorageLive`/`StorageDead` scopes straddle both `Assume` basic-block splits,
+splitting `bb0` into three MiniRust basic blocks before returning `x + 1`. -/
 def assumeChainCallee : CapturedMir where
   defPath := "witness::assume_chain_callee"
   phase := .runtimePostCleanup
   role := .subject
   argCount := 1
-  localDecls := [boolDecl, boolDecl, boolDecl]
+  localDecls := [u32Decl, u32Decl, boolDecl, boolDecl]
   basicBlocks := [
     { statements := [
         mkStmt (.storageLive 2),
-        mkStmt (.intrinsic (.assume (.copy (local_ 1)))),
-        mkStmt (.intrinsic (.assume (.copy (local_ 1)))),
-        mkStmt (.assign (local_ 0) (.use (.copy (local_ 1)))),
-        mkStmt (.storageDead 2)],
+        mkStmt (.assign (local_ 2) (.binaryOp .gt (.copy (local_ 1)) (constU32 0))),
+        mkStmt (.intrinsic (.assume (.move (local_ 2)))),
+        mkStmt (.storageDead 2),
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 3) (.binaryOp .lt (.copy (local_ 1)) (constU32 10))),
+        mkStmt (.intrinsic (.assume (.move (local_ 3)))),
+        mkStmt (.storageDead 3),
+        mkStmt (.assign (local_ 0) (.binaryOp .add (.copy (local_ 1)) (constU32 1)))],
       terminator := mkTerm .return_, isCleanup := false }]
   fnAbi := fnAbi 1
   layouts := emptyLayoutTable
   allocations := []
 
-/-- Caller that tests `Assume` before and after call, and calls a block-splitting callee. -/
+/-- Caller exercising `Assume` before `TerminatorKind.call`, a multi-split
+callee frame (`assumeChainCallee`), and `Assume` in the post-call continuation
+block `bb1` before returning `(x + 1) * 2`. -/
 def assumeMultiFrameCaller : CapturedMir where
   defPath := "witness::assume_multi_frame_caller"
   phase := .runtimePostCleanup
   role := .subject
-  argCount := 1
-  localDecls := [boolDecl, boolDecl, boolDecl]
+  argCount := 2
+  localDecls := [u32Decl, u32Decl, boolDecl, boolDecl, u32Decl]
   basicBlocks := [
     { statements := [
-        mkStmt (.intrinsic (.assume (.copy (local_ 1))))],
-      terminator := mkTerm (.call (fnDefOp "witness::assume_chain_callee") [.copy (local_ 1)] (local_ 2) (some 1) .continue_),
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 3) (.binaryOp .lt (.copy (local_ 1)) (constU32 100))),
+        mkStmt (.intrinsic (.assume (.move (local_ 3)))),
+        mkStmt (.storageDead 3),
+        mkStmt (.storageLive 4)],
+      terminator := mkTerm (.call (fnDefOp "witness::assume_chain_callee")
+        [.copy (local_ 1)] (local_ 4) (some 1) .continue_),
       isCleanup := false },
     { statements := [
         mkStmt (.intrinsic (.assume (.copy (local_ 2)))),
-        mkStmt (.assign (local_ 0) (.use (.copy (local_ 2))))],
+        mkStmt (.assign (local_ 0) (.binaryOp .mul (.move (local_ 4)) (constU32 2))),
+        mkStmt (.storageDead 4)],
       terminator := mkTerm .return_, isCleanup := false }]
-  fnAbi := fnAbi 1
+  fnAbi := fnAbi 2
   layouts := emptyLayoutTable
   allocations := []
 
+theorem assumeMultiFrame_inFragment :
+    progInFragment assumeMultiFrameCaller [assumeChainCallee] = true := by decide
+
+def assumeMultiFrameProg : Gen.Program :=
+  (translateProg assumeMultiFrameCaller [assumeChainCallee]).getD emptyProg
+
+def assumeMultiFrameFn : Gen.Function :=
+  (translateFnInProg (fnNameMap assumeMultiFrameCaller [assumeChainCallee])
+    assumeMultiFrameCaller).getD callerFn
+
+def assumeChainCalleeFn : Gen.Function :=
+  (translateFnInProg (fnNameMap assumeMultiFrameCaller [assumeChainCallee])
+    assumeChainCallee).getD callerFn
+
+theorem assumeMultiFrame_translate :
+    translateProg assumeMultiFrameCaller [assumeChainCallee] = some assumeMultiFrameProg := rfl
+
+theorem assumeMultiFrame_translateInProg :
+    translateFnInProg (fnNameMap assumeMultiFrameCaller [assumeChainCallee])
+      assumeMultiFrameCaller = some assumeMultiFrameFn := rfl
+
+theorem assumeChainCallee_translateInProg :
+    translateFnInProg (fnNameMap assumeMultiFrameCaller [assumeChainCallee])
+      assumeChainCallee = some assumeChainCalleeFn := rfl
+
 theorem assumeMultiFrame_prog_wf :
-    progWf ((translateProg assumeMultiFrameCaller [assumeChainCallee]).getD emptyProg) = true := by decide
+    progWf assumeMultiFrameProg = true :=
+  translateProg_progWf assumeMultiFrame_inFragment assumeMultiFrame_translate
 
 theorem assumeMultiFrame_func_wf_caller :
-    funcCfgWf ((translateFnInProg (fnNameMap assumeMultiFrameCaller [assumeChainCallee]) assumeMultiFrameCaller).getD callerFn) = true := by decide
+    funcCfgWf assumeMultiFrameFn = true :=
+  translateFnInProg_funcCfgWf (callees := [assumeChainCallee])
+    (by decide) assumeMultiFrame_translateInProg
 
 theorem assumeMultiFrame_func_wf_callee :
-    funcCfgWf ((translateFnInProg (fnNameMap assumeMultiFrameCaller [assumeChainCallee]) assumeChainCallee).getD callerFn) = true := by decide
+    funcCfgWf assumeChainCalleeFn = true :=
+  translateFnInProg_funcCfgWf (callees := [assumeChainCallee])
+    (by decide) assumeChainCallee_translateInProg
 
+theorem ctxAssumeMultiFrame_ok : CtxOk assumeMultiFrameCaller ctxCallerMain where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [assumeMultiFrameCaller] at hd; subst hd; decide
+    | 1, _, hd => simp [assumeMultiFrameCaller] at hd; subst hd; decide
+    | 2, _, hd => simp [assumeMultiFrameCaller] at hd; subst hd; decide
+    | _ + 3, hi, _ => simp [assumeMultiFrameCaller] at hi
+  ret := by
+    intro d hd; simp [assumeMultiFrameCaller] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
 
+def assumeMultiFrameArgs (x : Nat) (postOk : Bool) : List Value :=
+  [.scalar ⟨x, 4⟩, .scalar ⟨if postOk then 1 else 0, 1⟩]
 
+def assumeMultiFrameMInit (x : Nat) (postOk : Bool) : Mach :=
+  multiMachineWithCtx ctxCallerMain assumeMultiFrameProg 2 assumeMultiFrameCaller assumeMultiFrameFn
+    (initMachineStateWithCallees assumeMultiFrameCaller (assumeMultiFrameArgs x postOk)
+      [assumeChainCallee]).frame.locals
+    assumeMultiFrameFn.start
+
+/-- `(5, true)` passes pre-call `Assume(5 < 100)`, both split-block `Assume`s in
+`assumeChainCallee` (`5 > 0`, `5 < 10`), and post-call `Assume(true)`, returning
+`(5 + 1) * 2 = 12u32`. -/
+theorem assumeMultiFrame5_anneal_ret :
+    (∃ tr mem, ReachesRet
+      (mirCallTreeWithCallees assumeMultiFrameCaller (assumeMultiFrameArgs 5 true)
+        [assumeChainCallee]) tr (.normal (.scalar ⟨12, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirCallTreeWithCallees assumeMultiFrameCaller (assumeMultiFrameArgs 5 true)
+        [assumeChainCallee]) :=
+  runsToScalar_sound (fuel := 25) (by decide)
+
+theorem assumeMultiFrame5_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n (assumeMultiFrameMInit 5 true) = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 12 } ∧
+      m'.threads = [thread1 ctxCallerMain
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨⟨tr, mem, hanneal⟩, _⟩ := assumeMultiFrame5_anneal_ret
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret assumeMultiFrame_inFragment assumeMultiFrame_translate
+      assumeMultiFrame_translateInProg ctxCallerMain ctxAssumeMultiFrame_ok
+      (assumeMultiFrameArgs 5 true) (by decide) (assumeMultiFrameMInit 5 true)
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hanneal
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [assumeMultiFrameCaller] at hd; subst hd
+  simp [retPtr, ctxCallerMain, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxCallerMain, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+/-- `(100, true)` raises UB in the caller's pre-call `Assume(100 < 100)` before
+entering `assumeChainCallee`. -/
+theorem assumeMultiFramePreUb_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees assumeMultiFrameCaller (assumeMultiFrameArgs 100 true)
+        [assumeChainCallee]) tr u ∧
+      FaultNow u :=
+  faultsA_sound assumeMultiFrameCaller 10 _ (by decide)
+
+theorem assumeMultiFramePreUb_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n (assumeMultiFrameMInit 100 true) = .ok mLast ∧
+      MultiStateRel assumeMultiFrameCaller [assumeChainCallee] assumeMultiFrameProg ctxCallerMain
+        sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) (assumeMultiFrameMInit 100 true) = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k (assumeMultiFrameMInit 100 true) = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := assumeMultiFramePreUb_anneal_ub
+  obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
+    mirCallWithCallees_ub_rel assumeMultiFrame_inFragment assumeMultiFrame_translate
+      assumeMultiFrame_translateInProg ctxCallerMain ctxAssumeMultiFrame_ok
+      (assumeMultiFrameArgs 100 true) (by decide) (assumeMultiFrameMInit 100 true)
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+  exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
+
+/-- `(10, true)` passes the caller's pre-call `Assume` and the callee's first
+`Assume(10 > 0)`, then raises UB at the callee's second `Assume(10 < 10)` in the
+split continuation block while the caller's frame is suspended on the stack. -/
+theorem assumeMultiFrameCalleeSeg2Ub_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees assumeMultiFrameCaller (assumeMultiFrameArgs 10 true)
+        [assumeChainCallee]) tr u ∧
+      FaultNow u :=
+  faultsA_sound assumeMultiFrameCaller 20 _ (by decide)
+
+theorem assumeMultiFrameCalleeSeg2Ub_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n (assumeMultiFrameMInit 10 true) = .ok mLast ∧
+      MultiStateRel assumeMultiFrameCaller [assumeChainCallee] assumeMultiFrameProg ctxCallerMain
+        sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) (assumeMultiFrameMInit 10 true) = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k (assumeMultiFrameMInit 10 true) = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := assumeMultiFrameCalleeSeg2Ub_anneal_ub
+  obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
+    mirCallWithCallees_ub_rel assumeMultiFrame_inFragment assumeMultiFrame_translate
+      assumeMultiFrame_translateInProg ctxCallerMain ctxAssumeMultiFrame_ok
+      (assumeMultiFrameArgs 10 true) (by decide) (assumeMultiFrameMInit 10 true)
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+  exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
+
+/-- `(5, false)` completes `assumeChainCallee(5) == 6` across all three callee
+segments and raises UB at the caller's post-call `Assume(false)` in `bb1`. -/
+theorem assumeMultiFramePostUb_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees assumeMultiFrameCaller (assumeMultiFrameArgs 5 false)
+        [assumeChainCallee]) tr u ∧
+      FaultNow u :=
+  faultsA_sound assumeMultiFrameCaller 25 _ (by decide)
+
+theorem assumeMultiFramePostUb_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n (assumeMultiFrameMInit 5 false) = .ok mLast ∧
+      MultiStateRel assumeMultiFrameCaller [assumeChainCallee] assumeMultiFrameProg ctxCallerMain
+        sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) (assumeMultiFrameMInit 5 false) = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k (assumeMultiFrameMInit 5 false) = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := assumeMultiFramePostUb_anneal_ub
+  obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
+    mirCallWithCallees_ub_rel assumeMultiFrame_inFragment assumeMultiFrame_translate
+      assumeMultiFrame_translateInProg ctxCallerMain ctxAssumeMultiFrame_ok
+      (assumeMultiFrameArgs 5 false) (by decide) (assumeMultiFrameMInit 5 false)
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+  exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
+
+/-- Necessity witness for `livenessOk` on `StatementKind.intrinsic (.assume op)`:
+reading a local after `StorageDead(_2)` raises UB in both Anneal (`evalOperand`
+sees `.dead`) and MiniRust (`evalPlace` dereferences a deallocated local). Note
+that `livenessOk` permits reading a `StorageDead` local so long as its allocation
+is still dead on all incoming paths, and both semantics step in lockstep to UB. -/
 def assumeDeadLocal : CapturedMir where
   defPath := "witness::assume_dead_local"
   phase := .runtimePostCleanup

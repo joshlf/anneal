@@ -11,7 +11,7 @@ those terms. -->
 This guide lets an independent reviewer check every claim of work unit
 `MR-4.2` from a clean checkout of branch `adv/mr-4-2`. Run all commands from
 the repository root. Each step lists the command and the output that counts
-as a pass. It describes the state after checkpoint `[adv B1]`; later
+as a pass. It describes the state after checkpoint `[adv B2]`; later
 checkpoints update it.
 
 ## What `MR-4.2` adds so far
@@ -53,7 +53,8 @@ checkpoints update it.
   the split-block layout and program-point mapping (`translateFnInProg_spec`,
   `translateBlocksInProg_names`), while `stmtReadsOk`, `stmtMoved`, `stmtLocals`,
   and `stmtTupleInit` track `Assume(op)` across `movesOk`, `livenessOk`, and
-  `tupleInitOk`.
+  `tupleInitOk`. `funcCfgWf` and `progWf` transcribe MiniRust's syntactic
+  function and program well-formedness checks (`spec/lang/well-formed.md`).
 - **Simulation** (`Relation.lean`, `Lemmas.lean`, `MiniRustEval.lean`,
   `AnnealEval.lean`, `Simulation.lean`, `Run.lean`): the `MR-1.x` and `MR-4.1`
   theorem statements in `Run.lean` are unchanged. `progInFragment`
@@ -61,17 +62,23 @@ checkpoints update it.
   `move _j`, `copy (_j.1)`, `move (_j.1)`, or `bool` constant), aligning MIR
   `(blockIdx, stmtIdx)` with MiniRust split-block `(next_block, next_stmt)` via
   `SegPc` in both the active frame (`MultiStateRelAt`) and suspended caller
-  frames (`CallStackRel`).
+  frames (`CallStackRel`), and `translateFnInProg_funcCfgWf`,
+  `translateFn_funcCfgWf`, `mkStartFn_funcCfgWf`, and `translateProg_progWf`
+  prove universal CFG and program well-formedness across arbitrary `Assume`
+  split chains.
 - **Witnesses** (`Correspondence/Witness.lean`): `evalIntrinsic_*` (including
   full `evalIntrinsic_rawEq` and `evalIntrinsic_allocate_deallocate_leak`),
   `evalTerminator_abortTerminator`, and `translateRsIntrinsic_witness` check
   every transcribed `eval_intrinsic` arm and `translate_rs_intrinsic` lowering;
   `assumeSub` (`assumeSub_inFragment`, `assumeSub20_minirust_ret`,
   `assumeSubFalse_minirust_ub_rel`), `assumeTupleCallCaller` (`Assume(move _)` +
-  tuple-field projection + `Terminator::Call` across split blocks), and
-  `assumeDeadLocal` prove end-to-end correspondence via `mirCallWithCallees_ret`
-  and `mirCallWithCallees_ub_rel`; and `assumeMoveReuse` + `assumeAfterMove`
-  prove necessity of `stmtMoved` and `stmtReadsOk` on `Assume`.
+  tuple-field projection + `Terminator::Call` across split blocks),
+  `assumeMultiFrameCaller`/`assumeChainCallee` (pre-call, multi-split callee,
+  and post-call `Assume` chains with `StorageLive`/`StorageDead` spanning splits),
+  and `assumeDeadLocal` prove end-to-end correspondence via
+  `mirCallWithCallees_ret` and `mirCallWithCallees_ub_rel`; and `assumeMoveReuse`
+  + `assumeAfterMove` prove necessity of `stmtMoved` and `stmtReadsOk` on
+  `Assume`.
 - **Fallback-body calls** (`Correspondence/IntrinsicFallback.lean`): calls to
   `core::intrinsics::{ctlz, cttz, bswap, bitreverse, saturating_add,
   saturating_sub, black_box}` and `u32::{wrapping_shl, wrapping_shr}` resolved
@@ -84,28 +91,31 @@ checkpoints update it.
   MiniRust program that calls the fallback body, not to `minimize`'s output.
 - **Handler correspondence & boundary witnesses**
   (`Correspondence/IntrinsicBoundary.lean`): concrete `ExternalCallHandler`s
-  (`coldPathHandler`, `ctpopHandler`, `exactDivHandler`) proved equivalent under
-  `mirHandledTree` (`handleMirExternalCalls`) to `minimize`'s
-  `translateRsIntrinsic` lowerings (`bdColdPath_handled`, `bdCtpop_handled`,
-  `bdExactDiv_handled`, `exactDivHandler_iff_minirust`), backed by a symbolic
+  (`coldPathHandler`, `ctpopHandler`, `ubChecksHandler`, `exactDivHandler`)
+  proved equivalent under `mirHandledTree` (`handleMirExternalCalls`) to
+  `minimize`'s `translateRsIntrinsic` lowerings (`bdColdPath_handled`,
+  `bdCtpop_handled`, `bdUbChecksCall_handled`, `bdExactDiv_handled`,
+  `exactDivHandler_iff_minirust`), backed by a symbolic
   proof that MiniRust's `IntUnOp::CountOnes` equals unsigned bit-pattern
   popcount across all signed and unsigned `IntType` widths
   (`evalCountOnes_intFromBits`, `evalCountOnes_signedness_indep`); plus Anneal's
   behavior on, and the fragment's rejection of, `Rvalue::NullaryOp(UbChecks)`,
   `CopyNonOverlapping` (`bdCopy2_noUB`), `BinOp::Offset` (`bdOffsetNeg1_noUB`),
+  `write_bytes` (`bdWriteBytes_extCall`, `bdWriteBytes_unhandled_fault`),
   type-erased `MirCallReq`s (`bdExactDiv_same_request` versus
   `bdExactDiv_minirust_i32` / `bdExactDiv_minirust_u32`), diverging `abort`
   (`bdAbort_unsupported`), and `core::hint::unreachable_unchecked()`
   (`bdUnreach_anneal_ub`, `bd_minirust_unreachable_ub`).
 - **Quotation and pipeline checks**
   (`crates/anneal-minirust-gen/tests/{quotes,pipeline}.rs`):
-  `intrinsic_and_assume_quotations_are_pinned` pins 25 verbatim quotations
+  `intrinsic_and_assume_quotations_are_pinned` pins 28 verbatim quotations
   across `spec/lang/step/intrinsics.md`, `spec/lang/step/terminators.md`,
-  `spec/lang/step/expressions.md`, `spec/prelude/main.md`,
+  `spec/lang/step/expressions.md`, `spec/lang/well-formed.md`,
+  `spec/prelude/main.md`,
   `spec/mem/basic.md`, `spec/mem/intptrcast.md`, and
   `tooling/minimize/src/bb.rs`, with tampered-quote and cross-file
   misattribution rejection; the pipeline test requires 78 anchors, at least
-  `268` `[SIMULATION-AUDIT]` and `585` `[WITNESS-AUDIT]` theorems, and that
+  `291` `[SIMULATION-AUDIT]` and `626` `[WITNESS-AUDIT]` theorems, and that
   every theorem of `IntrinsicFallback.lean` and `IntrinsicBoundary.lean` is
   listed in `Audit.lean`.
 
@@ -151,11 +161,11 @@ Pass: `Build completed successfully`, with:
 
 ```text
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
-[SIMULATION-AUDIT] decls=277 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-[WITNESS-AUDIT] decls=610 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+[SIMULATION-AUDIT] decls=291 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+[WITNESS-AUDIT] decls=626 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
 [WITNESS-AUDIT] decls=118 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-[WITNESS-AUDIT] decls=42 axioms=[propext, Quot.sound] sorry_free=true
-MiniRustSpec.Audit: exhaustively verified standard axioms for 13139 declarations across all MiniRustSpec.* modules
+[WITNESS-AUDIT] decls=45 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+MiniRustSpec.Audit: exhaustively verified standard axioms for 13336 declarations across all MiniRustSpec.* modules
 ```
 
 (The second and third `[WITNESS-AUDIT]` lines cover

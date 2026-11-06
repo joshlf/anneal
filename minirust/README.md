@@ -338,6 +338,18 @@ below `2^32` (`CtxOk`), and external continuation.
 All proofs are complete; `Audit.lean` fails the build unless each of the
 following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
 
+* `translateFnInProg_funcCfgWf`, `translateFn_funcCfgWf`, `mkStartFn_funcCfgWf`,
+  `translateProg_progWf` (`Translate.lean`, `Lemmas.lean`): every translated
+  fragment function (`bodyInProgFragment` / `inFragment`), synthesized `start`
+  function (`mkStartFn`), and multi-function program (`progInFragment`) satisfies
+  MiniRust's syntactic CFG and program well-formedness predicates (`funcCfgWf`
+  and `progWf`, transcribed from `spec/lang/well-formed.md`), including distinct
+  local/block/function names, `f.ret :: f.args` local declarations, `StorageLive`
+  and `StorageDead` restriction to non-argument/non-return locals across split
+  `Assume` segments, `Regular` vs `Cleanup`/`Catch`/`Terminate` jump-target
+  checks (`check_next_block`, `check_unwind_block`) across `Goto`, `Switch`,
+  `Intrinsic`, `Call`, and `Return`, and `Program::check_wf`'s `start` ABI,
+  0-argument, and `Sized(0, 1)` return-layout requirements.
 * `multi_step_correspondence`, `multi_step_start`,
   `initMachineStateWithCallees_startRel` (`Simulation.lean`): for any
   multi-function program in `progInFragment entry callees`, one step of Anneal's
@@ -509,7 +521,8 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   transcribed MR-4.1 spec item, while `progStart_outside_fragment` shows why
   the theorems start at `fEntry.start` rather than `prog.start`.
 * `evalIntrinsic_*`, `evalTerminator_abortTerminator`, `translateRsIntrinsic_witness`,
-  `assumeSub`, `assumeTupleCallCaller`, `assumeDeadLocal`, `assumeMoveReuse`, and
+  `assumeSub`, `assumeTupleCallCaller`, `assumeMultiFrameCaller`/`assumeChainCallee`,
+  `assumeDeadLocal`, `assumeMoveReuse`, and
   `assumeAfterMove` (MR-4.2): direct checks of every transcribed `eval_intrinsic`
   arm (`Abort`, `Exit`, each UB check of `Assume`, `PrintStdout`/`PrintStderr`
   output and UB, `Allocate`/`Deallocate` with `Heap` leak checking, full `RawEq`
@@ -521,10 +534,15 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   one MIR block (`assumeSub20_minirust_ret`, `assumeSubFalse_minirust_ub_rel`,
   `assumeSub20_split_point`), `Assume(move _)` + tuple-field projection +
   `Terminator::Call` across split blocks (`assumeTupleCall10_minirust_ret`,
-  `assumeTupleCallOv_minirust_ub_rel`), dead-local `Assume` UB
-  (`assumeDeadLocal_minirust_ub_rel`), and necessity witnesses proving that
-  neither `stmtMoved` (`assumeMoveReuse_diverges`) nor `stmtReadsOk`
-  (`assumeAfterMove_diverges`) on `Assume` can be dropped.
+  `assumeTupleCallOv_minirust_ub_rel`), multi-frame pre-call, split-callee
+  continuation, and post-call `Assume` chains with `StorageLive`/`StorageDead`
+  straddling splits (`assumeMultiFrame5_minirust_ret`,
+  `assumeMultiFramePreUb_minirust_ub_rel`,
+  `assumeMultiFrameCalleeSeg2Ub_minirust_ub_rel`,
+  `assumeMultiFramePostUb_minirust_ub_rel`, `assumeMultiFrame_prog_wf`),
+  dead-local `Assume` UB (`assumeDeadLocal_minirust_ub_rel`), and necessity
+  witnesses proving that neither `stmtMoved` (`assumeMoveReuse_diverges`) nor
+  `stmtReadsOk` (`assumeAfterMove_diverges`) on `Assume` can be dropped.
 * `Correspondence/IntrinsicFallback.lean` (MR-4.2): calls to
   `core::intrinsics::{ctlz, cttz, bswap, bitreverse, saturating_add,
   saturating_sub, black_box}` and `u32::{wrapping_shl, wrapping_shr}` whose
@@ -542,26 +560,29 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   fallback body instead.
 * `Correspondence/IntrinsicBoundary.lean` (MR-4.2): kernel-checked handler
   correspondence (`mirHandledTree` / `handleMirExternalCalls`) and boundary
-  witnesses for compiler intrinsics. For `cold_path`, `ctpop`, and per-`IntType`
-  `exact_div`, concrete `ExternalCallHandler`s (`coldPathHandler`,
-  `ctpopHandler`, `exactDivHandler`) match `minimize`'s `translateRsIntrinsic`
-  lowerings (`bdColdPath_handled`, `bdCtpop_handled`, `bdExactDiv_handled`,
-  `exactDivHandler_iff_minirust`), supported by a symbolic proof that MiniRust's
-  `UnOp::Int(CountOnes)` equals the unsigned bit-pattern popcount at every
-  signed and unsigned `IntType` width (`evalCountOnes_intFromBits`,
-  `evalCountOnes_signedness_indep`). Without type specialization, Anneal's
-  `MirCallReq` erases generic `IntType` signedness, so `exact_div::<i32>(-6, 3)`
-  and `exact_div::<u32>(4294967290, 3)` issue identical requests even though
-  MiniRust's `DivExact` returns `-2` for the first and raises UB for the second
-  (`bdExactDiv_same_request`, `bdExactDiv_minirust_i32`,
+  witnesses for compiler intrinsics. For `cold_path`, `ctpop`,
+  session-configured `ub_checks` calls, and per-`IntType` `exact_div`, concrete
+  `ExternalCallHandler`s (`coldPathHandler`, `ctpopHandler`, `ubChecksHandler`,
+  `exactDivHandler`) match `minimize`'s `translateRsIntrinsic` lowerings
+  (`bdColdPath_handled`, `bdCtpop_handled`, `bdUbChecksCall_handled`,
+  `bdExactDiv_handled`, `exactDivHandler_iff_minirust`), supported by a symbolic
+  proof that MiniRust's `UnOp::Int(CountOnes)` equals the unsigned bit-pattern
+  popcount at every signed and unsigned `IntType` width
+  (`evalCountOnes_intFromBits`, `evalCountOnes_signedness_indep`). Without type
+  specialization, Anneal's `MirCallReq` erases generic `IntType` signedness, so
+  `exact_div::<i32>(-6, 3)` and `exact_div::<u32>(4294967290, 3)` issue identical
+  requests even though MiniRust's `DivExact` returns `-2` for the first and
+  raises UB for the second (`bdExactDiv_same_request`, `bdExactDiv_minirust_i32`,
   `bdExactDiv_minirust_u32`). For pointer/target intrinsics outside the fragment:
   `Rvalue::NullaryOp(UbChecks)` is `unsupported` in Anneal (`bdUbChecks_step`)
-  but a session-fixed `bool` constant in `minimize`; `CopyNonOverlapping` aborts
-  `minimize` (`span_bug!`) while Anneal executes it and returns normally even on
-  a two-element `u32` copy between 4-byte locals (`bdCopy2_noUB`); Anneal's
-  `BinOp::Offset` adds the raw count without pointee scaling or inbounds checks
-  (`bdOffsetNeg1_noUB`); `write_bytes`, `raw_eq`, and `arith_offset` issue
-  external calls; diverging `abort` (`target = none`) is `unsupported` in Anneal
+  but a session-fixed `bool` constant in `minimize` (whereas an unlowered call
+  to `core::intrinsics::ub_checks` emits `MirStepNode.extCall` and is handled by
+  `ubChecksHandler`); `CopyNonOverlapping` aborts `minimize` (`span_bug!`) while
+  Anneal executes it and returns normally even on a two-element `u32` copy
+  between 4-byte locals (`bdCopy2_noUB`); Anneal's `BinOp::Offset` adds the raw
+  count without pointee scaling or inbounds checks (`bdOffsetNeg1_noUB`);
+  `write_bytes` (`bdWriteBytes_extCall`, `bdWriteBytes_unhandled_fault`),
+  `raw_eq`, and `arith_offset` issue external calls; diverging `abort` (`target = none`) is `unsupported` in Anneal
   (`bdAbort_unsupported`); and `core::hint::unreachable_unchecked()` faults with
   UB in Anneal, matching `Terminator::Unreachable` (`bdUnreach_anneal_ub`,
   `bd_minirust_unreachable_ub`).

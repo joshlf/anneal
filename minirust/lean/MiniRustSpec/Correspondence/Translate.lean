@@ -2469,30 +2469,135 @@ def progInFragment (entry : MirAst.CapturedMir) (callees : List MirAst.CapturedM
 
 
 
-/-- Well-formedness check for the CFG of a generated MiniRust function,
-matching `impl_Function__check_wf` (`spec/lang/well-formed.md`). Specifically
-checks that all jump targets exist in `f.blocks`. -/
-def funcCfgWf (f : Gen.Function) : Bool :=
-  f.blocks.entries.all fun ⟨_, bb⟩ =>
-    match bb.terminator with
-    | .Goto target => f.blocks.entries.any (fun ⟨n, _⟩ => n == target)
-    | .Switch _ targets fallback =>
-      targets.entries.all (fun p => f.blocks.entries.any (fun ⟨n, _⟩ => n == p.2)) &&
-      f.blocks.entries.any (fun ⟨n, _⟩ => n == fallback)
-    | .Call _ _ _ _ (some target) (some unwind) =>
-      f.blocks.entries.any (fun ⟨n, _⟩ => n == target) &&
-      f.blocks.entries.any (fun ⟨n, _⟩ => n == unwind)
-    | .Call _ _ _ _ (some target) none =>
-      f.blocks.entries.any (fun ⟨n, _⟩ => n == target)
-    | .Call _ _ _ _ none (some unwind) =>
-      f.blocks.entries.any (fun ⟨n, _⟩ => n == unwind)
-    | .Intrinsic _ _ _ (some target) =>
-      f.blocks.entries.any (fun ⟨n, _⟩ => n == target)
-    | _ => true
+/-- `Function::check_next_block` (`spec/lang/well-formed.md`):
+> "fn check_next_block(self, expected_block_kind: BbKind, next_block_name: BbName) -> Result<()> {
+>      let Some(next_block) = self.blocks.get(next_block_name) else {
+>          throw_ill_formed!(\"Terminator: next block does not exist\");
+>      };
+>      ensure_wf(
+>          next_block.kind == expected_block_kind,
+>          \"Terminator: next block has the wrong block kind\",
+>      )?;
+>      ret(())
+>  }" -/
+def checkNextBlock (f : Gen.Function) (expectedKind : Gen.BbKind) (nextBb : Gen.BbName) : Bool :=
+  match Interp.mapGet f.blocks nextBb with
+  | some bb => bb.kind == expectedKind
+  | none => false
 
-/-- Well-formedness check for a generated MiniRust program's functions,
-matching `impl_Program__check_wf`. -/
+/-- `Function::check_unwind_block` (`spec/lang/well-formed.md`):
+> "fn check_unwind_block(self, current_block_kind: BbKind, unwind_block_name: BbName) -> Result<()> {
+>      let expected_block_kinds = match current_block_kind {
+>          BbKind::Regular => list![BbKind::Cleanup, BbKind::Catch],
+>          BbKind::Cleanup | BbKind::Terminate => list![BbKind::Terminate],
+>          BbKind::Catch => throw_ill_formed!(\"Terminator: unwinding is not allowed in a catch block\"),
+>      };
+>      let Some(unwind_block) = self.blocks.get(unwind_block_name) else {
+>          throw_ill_formed!(\"Terminator: unwind block does not exist\");
+>      };
+>      ensure_wf(
+>          expected_block_kinds.any(|kind| kind == unwind_block.kind),
+>          \"Terminator: unwind block has the wrong block kind\",
+>      )?;
+>      ret(())
+>  }" -/
+def checkUnwindBlock (f : Gen.Function) (curKind : Gen.BbKind) (unwindBb : Gen.BbName) : Bool :=
+  match curKind, Interp.mapGet f.blocks unwindBb with
+  | .Regular, some bb => bb.kind == .Cleanup || bb.kind == .Catch
+  | .Cleanup, some bb | .Terminate, some bb => bb.kind == .Terminate
+  | _, _ => false
+
+/-- Local-scoping clauses of `Statement::check_wf` (`spec/lang/well-formed.md`):
+`StorageLive` and `StorageDead` reference declared locals in `f.locals`, and
+`StorageDead` never targets `f.ret` or an argument in `f.args`. -/
+def stmtCfgWf (f : Gen.Function) : Gen.Statement → Bool
+  | .StorageLive l => (Interp.mapGet f.locals l).isSome
+  | .StorageDead l =>
+    (Interp.mapGet f.locals l).isSome && l != f.ret && !f.args.contains l
+  | _ => true
+
+/-- Block-kind and CFG-target clauses of `Terminator::check_wf` across all nine
+`Terminator` variants (`spec/lang/well-formed.md`):
+> "Return => {
+>      ensure_wf(block_kind == BbKind::Regular, \"Terminator::Return has to be called in a regular block\")?;
+>  }
+>  ..
+>  StopUnwind(next_block) => {
+>      ensure_wf(block_kind == BbKind::Catch, \"Terminator::StopUnwind has to be called in a catch block\")?;
+>      func.check_next_block(BbKind::Regular, next_block)?;
+>  }
+>  ResumeUnwind => {
+>      ensure_wf(block_kind == BbKind::Cleanup, \"Terminator::ResumeUnwind: has to be called in cleanup block\")?;
+>  }" -/
+def termCfgWf (f : Gen.Function) (blockKind : Gen.BbKind) : Gen.Terminator → Bool
+  | .Goto next => checkNextBlock f blockKind next
+  | .Switch _ cases fallback =>
+    cases.entries.all (fun p => checkNextBlock f blockKind p.2) &&
+    checkNextBlock f blockKind fallback
+  | .Unreachable => true
+  | .Intrinsic (.AtomicFetchAndOp op) _ _ next =>
+    (op == .Add || op == .Sub) &&
+    match next with
+    | some nb => checkNextBlock f blockKind nb
+    | none => true
+  | .Intrinsic _ _ _ next =>
+    match next with
+    | some nb => checkNextBlock f blockKind nb
+    | none => true
+  | .Call _ _ _ _ next unwind =>
+    (match next with | some nb => checkNextBlock f blockKind nb | none => true) &&
+    (match unwind with | some ub => checkUnwindBlock f blockKind ub | none => true)
+  | .Return => blockKind == .Regular
+  | .StartUnwind _ unwind => blockKind == .Regular && checkUnwindBlock f blockKind unwind
+  | .StopUnwind next => blockKind == .Catch && checkNextBlock f .Regular next
+  | .ResumeUnwind => blockKind == .Cleanup
+
+/-- Function local-map and CFG well-formedness check matching `Function::check_wf`
+(`spec/lang/well-formed.md`): distinct `locals` and `blocks` keys, declared and
+pairwise distinct `ret :: args`, a `Regular` `start` block in `f.blocks`, and
+`stmtCfgWf` + `termCfgWf` on every basic block. -/
+def funcCfgWf (f : Gen.Function) : Bool :=
+  decide (f.locals.entries.map Prod.fst).Nodup &&
+  decide (f.blocks.entries.map Prod.fst).Nodup &&
+  (Interp.mapGet f.locals f.ret).isSome &&
+  f.args.all (fun a => (Interp.mapGet f.locals a).isSome) &&
+  decide (f.ret :: f.args).Nodup &&
+  checkNextBlock f .Regular f.start &&
+  f.blocks.entries.all fun ⟨_, bb⟩ =>
+    bb.statements.all (stmtCfgWf f) &&
+    termCfgWf f bb.kind bb.terminator
+
+/-- Program function-table, CFG, and `start`-wrapper well-formedness check
+matching `Program::check_wf` (`spec/lang/well-formed.md`):
+> "// Check all the functions.
+>  for function in self.functions.values() {
+>      function.check_wf::<T>(self)?;
+>  }
+>
+>  // Ensure the start function exists, has the right ABI, takes no arguments, and returns a 1-ZST.
+>  let Some(start) = self.functions.get(self.start) else {
+>      throw_ill_formed!(\"Program: start function does not exist\");
+>  };
+>  ensure_wf(start.calling_convention == CallingConvention::C, \"Program: start function has invalid calling convention\")?;
+>  let ret_layout = start.locals[start.ret].layout::<T>();
+>  ensure_wf(
+>      ret_layout == LayoutStrategy::Sized(Size::ZERO, Align::ONE),
+>      \"Program: start function return local has invalid layout\"
+>  )?;
+>  ensure_wf(start.args.is_empty(), \"Program: start function has arguments\")?;" -/
 def progWf (p : Gen.Program) : Bool :=
-  p.functions.entries.all fun ⟨_, f⟩ => funcCfgWf f
+  decide (p.functions.entries.map Prod.fst).Nodup &&
+  p.functions.entries.all (fun ⟨_, f⟩ => funcCfgWf f) &&
+  match Interp.mapGet p.functions p.start with
+  | some start =>
+    start.calling_convention == .C &&
+    start.args.isEmpty &&
+    match Interp.mapGet start.locals start.ret with
+    | some retTy =>
+      match Interp.Type.layout retTy with
+      | .ok (.Sized sz align) => sz == ⟨0⟩ && align == ⟨1⟩
+      | _ => false
+    | none => false
+  | none => false
 
 end MiniRustSpec.Correspondence

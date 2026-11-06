@@ -2062,6 +2062,7 @@ fn intrinsic_and_assume_quotations_are_pinned() {
     let prelude = "spec/prelude/main.md";
     let basic = "spec/mem/basic.md";
     let intptr = "spec/mem/intptrcast.md";
+    let wf = "spec/lang/well-formed.md";
     let bb = "tooling/minimize/src/bb.rs";
 
     let cases: &[(&str, &str, &str, &str)] = &[
@@ -2312,10 +2313,51 @@ fn intrinsic_and_assume_quotations_are_pinned() {
             "rs::sym::abort => { let terminator = Terminator::Unreachable;",
             "MiniRustSpec/Correspondence/Translate.lean",
         ),
+        (
+            wf,
+            "fn check_next_block(self, expected_block_kind: BbKind, next_block_name: BbName) -> Result<()> { \
+                 let Some(next_block) = self.blocks.get(next_block_name) else { \
+                     throw_ill_formed!(\"Terminator: next block does not exist\"); \
+                 }; \
+                 ensure_wf( \
+                     next_block.kind == expected_block_kind, \
+                     \"Terminator: next block has the wrong block kind\", \
+                 )?; \
+                 ret(()) \
+             }",
+            "fn check_next_block(self, expected_block_kind: BbKind, next_block_name: BbName) -> Result<()> { ret(()) }",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            wf,
+            "fn check_unwind_block(self, current_block_kind: BbKind, unwind_block_name: BbName) -> Result<()> { \
+                 let expected_block_kinds = match current_block_kind { \
+                     BbKind::Regular => list![BbKind::Cleanup, BbKind::Catch], \
+                     BbKind::Cleanup | BbKind::Terminate => list![BbKind::Terminate], \
+                     BbKind::Catch => throw_ill_formed!(\"Terminator: unwinding is not allowed in a catch block\"), \
+                 };",
+            "BbKind::Regular => list![BbKind::Regular],",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            wf,
+            "let Some(start) = self.functions.get(self.start) else { \
+                 throw_ill_formed!(\"Program: start function does not exist\"); \
+             }; \
+             ensure_wf(start.calling_convention == CallingConvention::C, \"Program: start function has invalid calling convention\")?; \
+             let ret_layout = start.locals[start.ret].layout::<T>(); \
+             ensure_wf( \
+                 ret_layout == LayoutStrategy::Sized(Size::ZERO, Align::ONE), \
+                 \"Program: start function return local has invalid layout\" \
+             )?; \
+             ensure_wf(start.args.is_empty(), \"Program: start function has arguments\")?;",
+            "ensure_wf(start.calling_convention == CallingConvention::Rust,",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
     ];
-    assert_eq!(cases.len(), 25, "expected 25 pinned MR-4.2 quotations");
+    assert_eq!(cases.len(), 28, "expected 28 pinned MR-4.2 quotations");
 
-    let mr42_files = [intr, terms, exprs, prelude, basic, intptr, bb];
+    let mr42_files = [intr, terms, exprs, prelude, basic, intptr, wf, bb];
     let lean_root = minirust_dir().join("lean");
     for (file, genuine, tampered, lean_file) in cases {
         assert_eq!(

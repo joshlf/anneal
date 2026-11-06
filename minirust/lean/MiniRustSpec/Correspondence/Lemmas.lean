@@ -1290,4 +1290,672 @@ theorem SegPc.atEnd {look : Gen.BbName → Option Gen.BasicBlock}
     simp only [List.length_append, List.length_cons] at hend
     exact ih (by omega)
 
+/-! ### Universal CFG and program well-formedness (`funcCfgWf`, `progWf`) -/
+
+theorem nodup_map_localName {l : List Nat} (h : l.Nodup) : (l.map localName).Nodup := by
+  induction l with
+  | nil => exact .nil
+  | cons x xs ih =>
+    rw [List.nodup_cons] at h
+    rw [List.map_cons, List.nodup_cons]
+    refine ⟨fun hm => ?_, ih h.2⟩
+    obtain ⟨y, hy, heq⟩ := List.mem_map.mp hm
+    rw [localName_inj] at heq
+    subst heq
+    exact h.1 hy
+
+theorem nodup_map_fnName {l : List Nat} (h : l.Nodup) : (l.map fnName).Nodup := by
+  induction l with
+  | nil => exact .nil
+  | cons x xs ih =>
+    rw [List.nodup_cons] at h
+    rw [List.map_cons, List.nodup_cons]
+    refine ⟨fun hm => ?_, ih h.2⟩
+    obtain ⟨y, hy, heq⟩ := List.mem_map.mp hm
+    rw [fnName_inj] at heq
+    subst heq
+    exact h.1 hy
+
+theorem translateLocals_names :
+    ∀ (k : Nat) (ds : List LocalDecl) (L : List (Gen.LocalName × Gen.Type)),
+      translateLocals k ds = some L →
+      L.map Prod.fst = (List.range' k ds.length).map localName
+  | _, [], L, h => by
+    simp [translateLocals] at h
+    subst h
+    rfl
+  | k, d :: ds, L, h => by
+    simp only [translateLocals, Option.bind_eq_bind] at h
+    cases hT : scalarTypeOf d.ty with
+    | none => simp [hT] at h
+    | some ty =>
+      cases hR : translateLocals (k + 1) ds with
+      | none => simp [hT, hR] at h
+      | some rest =>
+        simp [hT, hR] at h
+        subst h
+        simp [translateLocals_names (k + 1) ds rest hR, List.range']
+
+theorem SegChain.head_regular {f : Gen.Function}
+    {decls : List LocalDecl} {term : Gen.Terminator} {name : Gen.BbName}
+    {ss : List MirAst.Statement}
+    (h : SegChain (mapGet f.blocks) decls term name ss) :
+    checkNextBlock f .Regular name = true := by
+  cases h with
+  | last hlook _ _ => simp [checkNextBlock, hlook]
+  | split hlook _ _ _ _ _ => simp [checkNextBlock, hlook]
+
+theorem stmtCfgWf_of_translateStatement {body : CapturedMir} {f : Gen.Function}
+    {s : MirAst.Statement} {st : Gen.Statement}
+    (hL : FnLocalsSpec body f)
+    (hargs : f.args = (List.range body.argCount).map (fun k => localName (k + 1)))
+    (hok : statementOk body.localDecls s = true)
+    (hsd : ∀ i, s.kind = .storageDead i → body.argCount < i)
+    (htr : translateStatement body.localDecls s = some st) :
+    stmtCfgWf f st = true := by
+  obtain ⟨hret, hloc⟩ := hL
+  obtain ⟨kind, span⟩ := s
+  cases kind with
+  | assign p rv =>
+    cases p with
+    | mk loc proj =>
+      cases proj with
+      | nil =>
+        simp only [translateStatement, Option.map_eq_some_iff] at htr
+        obtain ⟨_, _, rfl⟩ := htr
+        rfl
+      | cons _ _ => simp [translateStatement] at htr
+  | placeMention p =>
+    simp only [translateStatement, Option.map_eq_some_iff] at htr
+    obtain ⟨_, _, rfl⟩ := htr
+    rfl
+  | storageLive i =>
+    simp only [statementOk, decide_eq_true_eq] at hok
+    simp only [translateStatement, Option.some.injEq] at htr
+    subst htr
+    have hd : body.localDecls[i]? = some body.localDecls[i] := List.getElem?_eq_getElem hok
+    obtain ⟨_, hget⟩ := hloc i body.localDecls[i] hd
+    simp [stmtCfgWf, hget]
+  | storageDead i =>
+    simp only [statementOk, decide_eq_true_eq] at hok
+    simp only [translateStatement, Option.some.injEq] at htr
+    subst htr
+    have hgt : body.argCount < i := hsd i rfl
+    have hd : body.localDecls[i]? = some body.localDecls[i] := List.getElem?_eq_getElem hok
+    obtain ⟨_, hget⟩ := hloc i body.localDecls[i] hd
+    have hneRet : (localName i != f.ret) = true := by
+      rw [hret, bne_iff_ne, ne_eq, localName_inj]
+      omega
+    have hnotArg : localName i ∉ f.args := by
+      rw [hargs]
+      intro hm
+      obtain ⟨k, hk, heq⟩ := List.mem_map.mp hm
+      rw [List.mem_range] at hk
+      rw [localName_inj] at heq
+      omega
+    simp [stmtCfgWf, hget, hneRet, hnotArg]
+  | deinit p =>
+    simp only [translateStatement, Option.map_eq_some_iff] at htr
+    obtain ⟨_, _, rfl⟩ := htr
+    rfl
+  | _ =>
+    simp [translateStatement] at htr
+
+theorem splitStmts_cfgWf {f : Gen.Function} {term : Gen.Terminator}
+    (hterm : termCfgWf f .Regular term = true) :
+    ∀ (cur : Gen.BbName) (acc : List Gen.Statement) (nc : Nat) (rs : List StatementResult),
+      (∀ st ∈ acc, stmtCfgWf f st = true) →
+      (∀ r ∈ rs, (∀ st, r = .statement st → stmtCfgWf f st = true) ∧
+        (∀ op d a, r = .intrinsic op d a → op = .Assume)) →
+      (∀ e ∈ (splitStmts cur acc nc rs).2.2.1 ++
+          [((splitStmts cur acc nc rs).1, ⟨(splitStmts cur acc nc rs).2.1, term, .Regular⟩)],
+        mapGet f.blocks e.1 = some e.2) →
+      checkNextBlock f .Regular cur = true ∧
+      ∀ e ∈ (splitStmts cur acc nc rs).2.2.1 ++
+          [((splitStmts cur acc nc rs).1, ⟨(splitStmts cur acc nc rs).2.1, term, .Regular⟩)],
+        e.2.statements.all (stmtCfgWf f) = true ∧ termCfgWf f e.2.kind e.2.terminator = true
+  | cur, acc, nc, [], hacc, _, hlook => by
+    have hl := hlook (cur, ⟨acc, term, .Regular⟩) (by simp [splitStmts])
+    refine ⟨by simp [checkNextBlock, hl], ?_⟩
+    intro e he
+    simp only [splitStmts, List.nil_append, List.mem_singleton] at he
+    subst he
+    exact ⟨List.all_eq_true.mpr hacc, hterm⟩
+  | cur, acc, nc, .statement st :: rest, hacc, hrs, hlook => by
+    have hst : stmtCfgWf f st = true := (hrs (.statement st) List.mem_cons_self).1 st rfl
+    have hacc' : ∀ x ∈ acc ++ [st], stmtCfgWf f x = true := by
+      intro x hx
+      rcases List.mem_append.mp hx with h | h
+      · exact hacc x h
+      · simp only [List.mem_singleton] at h; subst h; exact hst
+    exact splitStmts_cfgWf hterm cur (acc ++ [st]) nc rest hacc'
+      (fun r hr => hrs r (List.mem_cons_of_mem _ hr)) (by simpa [splitStmts] using hlook)
+  | cur, acc, nc, .intrinsic op dest args :: rest, hacc, hrs, hlook => by
+    have hop : op = .Assume :=
+      (hrs (.intrinsic op dest args) List.mem_cons_self).2 op dest args rfl
+    subst hop
+    have hl0 := hlook (cur, ⟨acc, .Intrinsic .Assume args dest (some (bbName nc)), .Regular⟩)
+      (by simp [splitStmts])
+    obtain ⟨hnext, hrestWf⟩ := splitStmts_cfgWf hterm (bbName nc) [] (nc + 1) rest (by simp)
+      (fun r hr => hrs r (List.mem_cons_of_mem _ hr))
+      (fun e he => hlook e (by
+        simp only [splitStmts, List.cons_append, List.mem_cons]
+        exact .inr he))
+    refine ⟨by simp [checkNextBlock, hl0], ?_⟩
+    intro e he
+    simp only [splitStmts, List.cons_append, List.mem_cons] at he
+    rcases he with rfl | he'
+    · exact ⟨List.all_eq_true.mpr hacc, by simp [termCfgWf, hnext]⟩
+    · exact hrestWf e he'
+
+theorem termCfgWf_of_translateTerminator {f : Gen.Function} {decls : List LocalDecl}
+    {nblocks : Nat} {t : MirAst.Terminator} {term : Gen.Terminator}
+    (hEntry : ∀ j, j < nblocks → checkNextBlock f .Regular (bbName j) = true)
+    (hok : terminatorOk decls nblocks t = true)
+    (htr : translateTerminator decls t = some term) :
+    termCfgWf f .Regular term = true := by
+  obtain ⟨kind, span⟩ := t
+  cases kind with
+  | goto target =>
+    simp only [terminatorOk, decide_eq_true_eq] at hok
+    simp only [translateTerminator, Option.some.injEq] at htr
+    subst htr
+    exact hEntry target hok
+  | switchInt discr targets =>
+    simp only [terminatorOk] at hok
+    cases hsit : switchIntType decls (copyOp discr) with
+    | none => simp [hsit] at hok
+    | some it =>
+      simp only [hsit, Bool.and_eq_true, List.all_eq_true, decide_eq_true_eq] at hok
+      obtain ⟨⟨⟨_, hbr⟩, _⟩, hoth⟩ := hok
+      simp only [translateTerminator, Option.bind_eq_bind] at htr
+      cases hd : translateOperand (copyOp discr) with
+      | none => simp [hd] at htr
+      | some dop =>
+        simp only [hd, Option.bind_some] at htr
+        cases hot : operandType decls (copyOp discr) with
+        | none => simp [hot] at htr
+        | some oty =>
+          cases oty <;> simp [hot] at htr
+          all_goals
+            subst htr
+            simp only [termCfgWf, switchCases, Bool.and_eq_true, List.all_eq_true, List.mem_map,
+              forall_exists_index, and_imp, forall_apply_eq_imp_iff₂]
+            exact ⟨fun p hp => hEntry p.2 (hbr p hp).2, hEntry targets.otherwise hoth⟩
+  | unreachable =>
+    simp only [translateTerminator, Option.some.injEq] at htr
+    subst htr
+    rfl
+  | return_ =>
+    simp only [translateTerminator, Option.some.injEq] at htr
+    subst htr
+    rfl
+  | _ =>
+    simp [terminatorOk] at hok
+
+theorem translateBlocksInProg_cfgWf {fnMap : FnMap} {callees : List CapturedMir}
+    {body : CapturedMir} {f : Gen.Function}
+    (hL : FnLocalsSpec body f)
+    (hargs : f.args = (List.range body.argCount).map (fun k => localName (k + 1)))
+    (hEntry : ∀ j, j < body.basicBlocks.length → checkNextBlock f .Regular (bbName j) = true)
+    (hsdBody : storageDeadOk body = true) :
+    ∀ (k nc : Nat) (bbs : List BasicBlockData)
+      (B extra : List (Gen.BbName × Gen.BasicBlock)),
+      k + bbs.length = body.basicBlocks.length →
+      (∀ j bb, bbs[j]? = some bb →
+        body.basicBlocks[k + j]? = some bb ∧
+        bb.statements.all (progStatementOk body.localDecls) = true ∧
+        terminatorInProgOk callees body (k + j) bb.terminator = true) →
+      translateBlocksInProg fnMap body.localDecls k nc bbs = some (B, extra) →
+      (∀ e ∈ B ++ extra, mapGet f.blocks e.1 = some e.2) →
+      ∀ e ∈ B ++ extra,
+        e.2.statements.all (stmtCfgWf f) = true ∧ termCfgWf f e.2.kind e.2.terminator = true
+  | _, _, [], B, extra, _, _, htr, _ => by
+    simp only [translateBlocksInProg, Option.some.injEq, Prod.mk.injEq] at htr
+    obtain ⟨rfl, rfl⟩ := htr
+    simp
+  | k, nc, bb :: bbs, B, extra, hlen, hbbs, htr, hlook => by
+    obtain ⟨hbb0Eq, hstmtsOk, htermOk⟩ := hbbs 0 bb (by simp)
+    have hbbk : body.basicBlocks[k]? = some bb := by simpa using hbb0Eq
+    have hbbMem : bb ∈ body.basicBlocks := List.mem_of_getElem? hbbk
+    have hsdBb : ∀ s ∈ bb.statements, ∀ i, s.kind = .storageDead i → body.argCount < i := by
+      simp only [storageDeadOk, List.all_eq_true] at hsdBody
+      intro s hs i hk
+      have h1 := hsdBody bb hbbMem s hs
+      simp [hk] at h1
+      exact h1
+    simp only [translateBlocksInProg, Option.bind_eq_bind] at htr
+    cases hres : bb.statements.mapM (translateStmtResult body.localDecls) with
+    | none => simp [hres] at htr
+    | some results =>
+      simp only [hres, Option.bind_some] at htr
+      generalize hsp : splitStmts (bbName k) [] nc results = sp at htr
+      cases htm : translateTerminatorInProg fnMap body.localDecls sp.2.2.2 bb.terminator with
+      | none => simp [htm] at htr
+      | some trep =>
+        obtain ⟨term, nc', ex1⟩ := trep
+        simp only [htm, Option.bind_some] at htr
+        cases hrest : translateBlocksInProg fnMap body.localDecls (k + 1) nc' bbs with
+        | none => simp [hrest] at htr
+        | some rrep =>
+          obtain ⟨rest, extraRest⟩ := rrep
+          simp only [hrest, Option.bind_some, pure, Option.some.injEq, Prod.mk.injEq] at htr
+          obtain ⟨rfl, rfl⟩ := htr
+          have hrsWf : ∀ r ∈ results,
+              (∀ st, r = .statement st → stmtCfgWf f st = true) ∧
+              (∀ op d a, r = .intrinsic op d a → op = .Assume) := by
+            obtain ⟨hlenR, hgetR⟩ := mapM_get_spec _ _ _ hres
+            intro r hr
+            obtain ⟨idx, hidx, rfl⟩ := List.getElem_of_mem hr
+            have hidxS : idx < bb.statements.length := hlenR ▸ hidx
+            let s := bb.statements[idx]
+            have hsEq : bb.statements[idx]? = some s := List.getElem?_eq_getElem hidxS
+            obtain ⟨r', hr'Eq, hsTr⟩ := hgetR idx s hsEq
+            have hrEq : results[idx] = r' :=
+              Option.some.inj ((List.getElem?_eq_getElem hidx).symm.trans hr'Eq)
+            have hsMem : s ∈ bb.statements := List.mem_of_getElem? hsEq
+            have hpOk : progStatementOk body.localDecls s = true :=
+              (List.all_eq_true.mp hstmtsOk) s hsMem
+            rcases translateStmtResult_some hsTr with ⟨hna, st, hstTr, hEq⟩ | ⟨op, op', _, _, hEq⟩
+            · refine ⟨fun st' h' => ?_, fun op d a h' => ?_⟩
+              · rw [hrEq, hEq, StatementResult.statement.injEq] at h'
+                subst h'
+                exact stmtCfgWf_of_translateStatement hL hargs
+                  (progStatementOk_notAssume hpOk hna) (hsdBb s hsMem) hstTr
+              · rw [hrEq, hEq] at h'
+                cases h'
+            · refine ⟨fun st h' => ?_, fun op2 d a h' => ?_⟩
+              · rw [hrEq, hEq] at h'
+                cases h'
+              · rw [hrEq, hEq, StatementResult.intrinsic.injEq] at h'
+                exact h'.1.symm
+          have htermExWf : termCfgWf f .Regular term = true ∧
+              ∀ e ∈ ex1, e.2.statements.all (stmtCfgWf f) = true ∧
+                termCfgWf f e.2.kind e.2.terminator = true := by
+            simp only [terminatorInProgOk, Bool.or_eq_true] at htermOk
+            rcases htermOk with htOk | hcOk
+            · have hnc : ∀ func args dst tgt unw,
+                  bb.terminator.kind ≠ .call func args dst tgt unw := by
+                intro func args dst tgt unw hk
+                simp [terminatorOk, hk] at htOk
+              rw [translateTerminatorInProg_eq_of_not_call fnMap body.localDecls sp.2.2.2
+                bb.terminator hnc, Option.map_eq_some_iff] at htm
+              obtain ⟨t', ht', heq⟩ := htm
+              obtain ⟨rfl, _, rfl⟩ := Prod.mk.injEq .. ▸ heq
+              exact ⟨termCfgWf_of_translateTerminator hEntry htOk ht', by simp⟩
+            · simp only [callTerminatorOk, Nat.add_zero] at hcOk
+              rw [hbbk] at hcOk
+              cases htk : bb.terminator.kind with
+              | call func argOps destination target unwind =>
+                rw [htk] at hcOk
+                cases target with
+                | none => simp at hcOk
+                | some targetBb =>
+                  cases hdp : extractFnDefPath func with
+                  | none => simp [hdp] at hcOk
+                  | some dp =>
+                    cases hfc : MirSemantics.findCallee? callees dp with
+                    | none => simp [hdp, hfc] at hcOk
+                    | some callee =>
+                      cases hcd : callee.localDecls with
+                      | nil => simp [hdp, hfc, hcd] at hcOk
+                      | cons retDecl restDecls =>
+                        simp only [hdp, hfc, hcd, Bool.and_eq_true, decide_eq_true_eq] at hcOk
+                        have htgtLt : targetBb < body.basicBlocks.length := hcOk.1.1.1.1.1.1.1
+                        have hunwOk : callUnwindOk unwind = true := hcOk.1.1.1.1.1.1.2
+                        simp only [translateTerminatorInProg, htk, hdp, Option.bind_eq_bind,
+                          Option.bind_some] at htm
+                        cases hlk : lookupFnTarget fnMap dp with
+                        | none => simp [hlk] at htm
+                        | some fnConv =>
+                          cases hargsTr : argOps.mapM translateCallArg with
+                          | none => simp [hlk, hargsTr] at htm
+                          | some args' =>
+                            cases hretTr : translatePlace destination with
+                            | none => simp [hlk, hargsTr, hretTr] at htm
+                            | some retPlace =>
+                              obtain ⟨uwTerm, huwEq, huwCases⟩ :=
+                                translateUnwindAction_spec sp.2.2.2 unwind hunwOk
+                              simp only [hlk, hargsTr, hretTr, huwEq, Option.bind_some, pure,
+                                Option.some.injEq, Prod.mk.injEq] at htm
+                              obtain ⟨rfl, rfl, rfl⟩ := htm
+                              have hexMem : mapGet f.blocks (bbName sp.2.2.2) =
+                                  some ⟨[], uwTerm, .Cleanup⟩ :=
+                                hlook (bbName sp.2.2.2, ⟨[], uwTerm, .Cleanup⟩) (by simp)
+                              have huwTermWf : termCfgWf f .Cleanup uwTerm = true := by
+                                rcases huwCases with ⟨_, rfl⟩ | ⟨_, rfl⟩ | ⟨_, rfl⟩ <;>
+                                  rfl
+                              refine ⟨?_, ?_⟩
+                              · simp [termCfgWf, hEntry targetBb htgtLt, checkUnwindBlock, hexMem]
+                              · intro e he
+                                simp only [List.mem_singleton] at he
+                                subst he
+                                exact ⟨rfl, huwTermWf⟩
+              | _ => simp [htk] at hcOk
+          obtain ⟨_, hsegWf⟩ := splitStmts_cfgWf htermExWf.1 (bbName k) [] nc results (by simp)
+            hrsWf (by
+              rw [hsp]
+              intro e he
+              apply hlook
+              simp only [List.mem_append] at he ⊢
+              rcases he with h | h
+              · exact .inl (.inl (.inl h))
+              · exact .inl (.inl (.inr h)))
+          rw [hsp] at hsegWf
+          have hrestWf := translateBlocksInProg_cfgWf hL hargs hEntry hsdBody (k + 1) nc' bbs
+            rest extraRest (by simp at hlen; omega)
+            (fun j b hj => by
+              have h1 := hbbs (j + 1) b (by simpa using hj)
+              simpa [show k + (j + 1) = k + 1 + j by omega] using h1)
+            hrest
+            (fun e he => by
+              apply hlook
+              simp only [List.mem_append] at he ⊢
+              rcases he with h | h
+              · exact .inl (.inr h)
+              · exact .inr (.inr h))
+          intro e he
+          simp only [List.append_assoc, List.mem_append] at he
+          rcases he with h1 | h2 | h3 | h4 | h5
+          · exact hsegWf e (List.mem_append.mpr (.inl h1))
+          · exact hsegWf e (List.mem_append.mpr (.inr h2))
+          · exact hrestWf e (List.mem_append.mpr (.inl h3))
+          · exact htermExWf.2 e h4
+          · exact hrestWf e (List.mem_append.mpr (.inr h5))
+
+theorem translateFnInProg_funcCfgWf_core {fnMap : FnMap} {callees : List CapturedMir}
+    {body : CapturedMir} {f : Gen.Function}
+    (hargLe : body.argCount + 1 ≤ body.localDecls.length)
+    (hneNil : body.basicBlocks ≠ [])
+    (hbbsAll : (List.range body.basicBlocks.length).all (fun blk =>
+      match body.basicBlocks[blk]? with
+      | some bb =>
+        !bb.isCleanup &&
+        bb.statements.all (progStatementOk body.localDecls) &&
+        terminatorInProgOk callees body blk bb.terminator
+      | none => true) = true)
+    (hsd : storageDeadOk body = true)
+    (htr : translateFnInProg fnMap body = some f) :
+    funcCfgWf f = true := by
+  obtain ⟨hL, _, hargs, hstart, hinit, hsegs⟩ := translateFnInProg_spec fnMap body f htr
+  have hnPos : 0 < body.basicBlocks.length := List.length_pos_iff.mpr hneNil
+  have hEntry : ∀ j, j < body.basicBlocks.length → checkNextBlock f .Regular (bbName j) = true := by
+    intro j hj
+    have hbb : body.basicBlocks[j]? = some body.basicBlocks[j] := List.getElem?_eq_getElem hj
+    obtain ⟨_, _, _, _, _, hseg⟩ := hsegs j body.basicBlocks[j] hbb
+    exact hseg.head_regular
+  simp only [translateFnInProg, Option.bind_eq_bind] at htr
+  cases hC : translateCallConv body.fnAbi.conv with
+  | none => simp [hC] at htr
+  | some conv =>
+    cases hLoc : translateLocals 0 body.localDecls with
+    | none => simp [hC, hLoc] at htr
+    | some L =>
+      cases hB : translateBlocksInProg fnMap body.localDecls 0 (body.basicBlocks.length + 1)
+          body.basicBlocks with
+      | none => simp [hC, hLoc, hB] at htr
+      | some brep =>
+        obtain ⟨B, extra⟩ := brep
+        simp only [hC, hLoc, hB, Option.bind_some, pure, Option.some.injEq] at htr
+        have hfBlocks : f.blocks = ⟨B ++ [(bbName body.basicBlocks.length, initBlock body)] ++ extra⟩ := by
+          rw [← htr]
+        have hfLocals : f.locals = ⟨L⟩ := by rw [← htr]
+        have hlocNd : (f.locals.entries.map Prod.fst).Nodup := by
+          rw [hfLocals, translateLocals_names 0 body.localDecls L hLoc]
+          exact nodup_map_localName (List.nodup_range')
+        obtain ⟨hndBE, hmemBE⟩ := translateBlocksInProg_names 0 (body.basicBlocks.length + 1)
+          body.basicBlocks B extra hB (by omega)
+        have hinitNot : bbName body.basicBlocks.length ∉ (B ++ extra).map Prod.fst := by
+          intro hm
+          obtain ⟨e, he, heq⟩ := List.mem_map.mp hm
+          rcases hmemBE e he with ⟨j, hj, hj'⟩ | ⟨c, hc, hc'⟩
+          · rw [heq, bbName_inj] at hj'; omega
+          · rw [heq, bbName_inj] at hc'; omega
+        have hblkNd : (f.blocks.entries.map Prod.fst).Nodup := by
+          rw [hfBlocks]
+          have hperm : List.Perm
+              ((B ++ [(bbName body.basicBlocks.length, initBlock body)] ++ extra).map Prod.fst)
+              (bbName body.basicBlocks.length :: (B ++ extra).map Prod.fst) := by
+            simp only [List.append_assoc, List.singleton_append, List.map_append, List.map_cons]
+            exact List.perm_middle
+          exact hperm.nodup_iff.mpr (List.nodup_cons.mpr ⟨hinitNot, hndBE⟩)
+        obtain ⟨hret, hlocSpec⟩ := hL
+        have hretSome : (mapGet f.locals f.ret).isSome = true := by
+          have hd0 : body.localDecls[0]? = some (body.localDecls[0]'(by omega)) :=
+            List.getElem?_eq_getElem (by omega)
+          obtain ⟨_, hg0⟩ := hlocSpec 0 _ hd0
+          rw [hret, hg0]
+          rfl
+        have hargsSome : f.args.all (fun a => (mapGet f.locals a).isSome) = true := by
+          rw [hargs, List.all_eq_true]
+          intro a ha
+          obtain ⟨k, hk, rfl⟩ := List.mem_map.mp ha
+          rw [List.mem_range] at hk
+          have hdk : body.localDecls[k + 1]? = some (body.localDecls[k + 1]'(by omega)) :=
+            List.getElem?_eq_getElem (by omega)
+          obtain ⟨_, hgk⟩ := hlocSpec (k + 1) _ hdk
+          rw [hgk]
+          rfl
+        have hretArgsNd : (f.ret :: f.args).Nodup := by
+          have heq : f.ret :: f.args = (List.range (body.argCount + 1)).map localName := by
+            rw [hret, hargs, List.range_succ_eq_map, List.map_cons, List.map_map]
+            rfl
+          rw [heq]
+          exact nodup_map_localName List.nodup_range
+        have hstartOk : checkNextBlock f .Regular f.start = true := by
+          rw [hstart, checkNextBlock, hinit]
+          rfl
+        have hinitStmtsOk : (initBlock body).statements.all (stmtCfgWf f) = true := by
+          simp only [initBlock, alwaysStorageLiveLocals, List.all_eq_true, List.mem_map,
+            List.mem_filter, List.mem_range]
+          rintro st ⟨loc, ⟨hlocLt, _⟩, rfl⟩
+          have hdl : body.localDecls[loc]? = some body.localDecls[loc] :=
+            List.getElem?_eq_getElem hlocLt
+          obtain ⟨_, hgl⟩ := hlocSpec loc _ hdl
+          simp [stmtCfgWf, hgl]
+        have hinitTermOk : termCfgWf f (initBlock body).kind (initBlock body).terminator = true :=
+          hEntry 0 hnPos
+        have hBEWf := translateBlocksInProg_cfgWf (callees := callees) ⟨hret, hlocSpec⟩ hargs hEntry
+          hsd 0 (body.basicBlocks.length + 1) body.basicBlocks B extra (by simp)
+          (fun j bb hj => by
+            obtain ⟨hjLt, _⟩ := List.getElem?_eq_some_iff.mp hj
+            have h1 := (List.all_eq_true.mp hbbsAll) j (List.mem_range.mpr hjLt)
+            simp only [hj, Bool.and_eq_true] at h1
+            exact ⟨by simpa using hj, h1.1.2, by simpa using h1.2⟩)
+          hB
+          (fun e he => by
+            rw [hfBlocks]
+            have hmem' : e ∈ B ++ [(bbName body.basicBlocks.length, initBlock body)] ++ extra := by
+              simp only [List.append_assoc, List.mem_append] at he ⊢
+              rcases he with h | h
+              · exact .inl h
+              · exact .inr (.inr h)
+            exact mapGet_eq_of_mem_nodup (by simpa [hfBlocks] using hblkNd) hmem')
+        have hallBlocks : f.blocks.entries.all
+            (fun p => p.2.statements.all (stmtCfgWf f) && termCfgWf f p.2.kind p.2.terminator) = true := by
+          rw [hfBlocks, List.all_eq_true]
+          intro e he
+          simp only [List.append_assoc, List.singleton_append, List.mem_append, List.mem_cons] at he
+          rcases he with hB' | rfl | hex'
+          · obtain ⟨h1, h2⟩ := hBEWf e (List.mem_append.mpr (.inl hB'))
+            simp [h1, h2]
+          · simp [hinitStmtsOk, hinitTermOk]
+          · obtain ⟨h1, h2⟩ := hBEWf e (List.mem_append.mpr (.inr hex'))
+            simp [h1, h2]
+        simp [funcCfgWf, hlocNd, hblkNd, hretSome, hargsSome, hretArgsNd, hstartOk, hallBlocks]
+
+/-- Every function translated by `translateFnInProg` on a `bodyInProgFragment`
+MIR body satisfies `funcCfgWf` (including multi-`Assume` split basic blocks,
+`initBlock`, and synthesized call unwind blocks). -/
+theorem translateFnInProg_funcCfgWf {fnMap : FnMap} {callees : List CapturedMir}
+    {body : CapturedMir} {f : Gen.Function}
+    (hfrag : bodyInProgFragment fnMap callees body = true)
+    (htr : translateFnInProg fnMap body = some f) :
+    funcCfgWf f = true := by
+  simp only [bodyInProgFragment, Bool.and_eq_true, decide_eq_true_eq] at hfrag
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨_, hargLe⟩, _⟩, _⟩, hneNil⟩, hbbsAll⟩, hsd⟩, _⟩, _⟩, _⟩, _⟩, _⟩ := hfrag
+  exact translateFnInProg_funcCfgWf_core hargLe hneNil hbbsAll hsd htr
+
+/-- Single-body fragment translations (`inFragment` + `translateFn`) also
+universally satisfy `funcCfgWf`. -/
+theorem translateFn_funcCfgWf {body : CapturedMir} {f : Gen.Function}
+    (hfrag : inFragment body = true) (htr : translateFn body = some f) :
+    funcCfgWf f = true := by
+  simp only [inFragment, Bool.and_eq_true, decide_eq_true_eq] at hfrag
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨_, hargLe⟩, _⟩, _⟩, hneNil⟩, hbbs⟩, hsd⟩, _⟩, _⟩, _⟩ := hfrag
+  have hnc : ∀ bb ∈ body.basicBlocks, ∀ func args dst tgt unw,
+      bb.terminator.kind ≠ .call func args dst tgt unw := by
+    intro bb hbb func args dst tgt unw hk
+    have hbbOk := (List.all_eq_true.mp hbbs) bb hbb
+    simp [terminatorOk, hk] at hbbOk
+  have hna : ∀ bb ∈ body.basicBlocks, ∀ s ∈ bb.statements, isAssume s = false := by
+    intro bb hbb s hs
+    have hbbOk := (List.all_eq_true.mp hbbs) bb hbb
+    simp only [Bool.and_eq_true, List.all_eq_true] at hbbOk
+    exact statementOk_isAssume (hbbOk.1.2 s hs)
+  have htrProg : translateFnInProg [] body = some f := by
+    rw [translateFnInProg_eq_translateFn_of_no_calls [] body hnc hna]
+    exact htr
+  have hbbsAll : (List.range body.basicBlocks.length).all (fun blk =>
+      match body.basicBlocks[blk]? with
+      | some bb =>
+        !bb.isCleanup &&
+        bb.statements.all (progStatementOk body.localDecls) &&
+        terminatorInProgOk [] body blk bb.terminator
+      | none => true) = true := by
+    rw [List.all_eq_true]
+    intro blk _
+    cases hbb : body.basicBlocks[blk]? with
+    | none => rfl
+    | some bb =>
+      have hbbOk := (List.all_eq_true.mp hbbs) bb (List.mem_of_getElem? hbb)
+      simp only [Bool.and_eq_true, List.all_eq_true] at hbbOk ⊢
+      refine ⟨⟨hbbOk.1.1, fun s hs => ?_⟩, ?_⟩
+      · have hsOk := hbbOk.1.2 s hs
+        have hsNa := statementOk_isAssume hsOk
+        unfold progStatementOk
+        split
+        · next op hk => simp [isAssume, hk] at hsNa
+        · exact hsOk
+      · simp [terminatorInProgOk, hbbOk.2]
+  exact translateFnInProg_funcCfgWf_core hargLe hneNil hbbsAll hsd htrProg
+
+/-- `minimize`'s synthesized `mkStartFn` wrapper satisfies `funcCfgWf` for every
+entry function index `entryIdx`. -/
+theorem mkStartFn_funcCfgWf (entryIdx : Nat) :
+    funcCfgWf (mkStartFn entryIdx) = true := by
+  obtain ⟨_, hargs, hret, hstart, _, hloc0, hb0, hb1, hb2⟩ := mkStartFn_spec entryIdx
+  have hlocNd : ((mkStartFn entryIdx).locals.entries.map Prod.fst).Nodup := by
+    change [localName 0].Nodup
+    simp
+  have hblkNd : ((mkStartFn entryIdx).blocks.entries.map Prod.fst).Nodup := by
+    change [bbName 0, bbName 1, bbName 2].Nodup
+    simp [bbName_inj]
+  have hstartOk : checkNextBlock (mkStartFn entryIdx) .Regular (mkStartFn entryIdx).start = true := by
+    rw [hstart, checkNextBlock, hb0]
+    rfl
+  have hb0Term : termCfgWf (mkStartFn entryIdx) .Regular
+      (.Call (fnPtrExpr (fnName entryIdx)) .Rust [] buildUnitPlace (some (bbName 1)) (some (bbName 2))) = true := by
+    simp [termCfgWf, checkNextBlock, checkUnwindBlock, hb1, hb2]
+  have hb1Term : termCfgWf (mkStartFn entryIdx) .Regular
+      (.Intrinsic .Exit [] buildUnitPlace none) = true := rfl
+  have hb2Term : termCfgWf (mkStartFn entryIdx) .Catch buildAbort = true := rfl
+  have hallB : (mkStartFn entryIdx).blocks.entries.all
+      (fun p => p.2.statements.all (stmtCfgWf (mkStartFn entryIdx)) &&
+        termCfgWf (mkStartFn entryIdx) p.2.kind p.2.terminator) = true := by
+    change ([(_, _), (_, _), (_, _)] : List (Gen.BbName × Gen.BasicBlock)).all _ = true
+    simp [hb0Term, hb1Term, hb2Term]
+  simp [funcCfgWf, hlocNd, hblkNd, hret, hargs, hloc0, hstartOk, hallB]
+
+theorem translateProgFns_names_and_mem {fnMap : FnMap} :
+    ∀ (k : Nat) (bs : List CapturedMir) (F : List (Gen.FnName × Gen.Function)),
+      translateProgFns fnMap k bs = some F →
+      F.map Prod.fst = (List.range' k bs.length).map fnName ∧
+      ∀ p ∈ F, ∃ b ∈ bs, translateFnInProg fnMap b = some p.2
+  | _, [], F, h => by
+    simp only [translateProgFns, Option.some.injEq] at h
+    subst h
+    simp
+  | k, b :: bs, F, h => by
+    simp only [translateProgFns, Option.bind_eq_bind] at h
+    cases hf : translateFnInProg fnMap b with
+    | none => simp [hf] at h
+    | some f =>
+      cases hrest : translateProgFns fnMap (k + 1) bs with
+      | none => simp [hf, hrest] at h
+      | some rest =>
+        simp only [hf, hrest, Option.bind_some, pure, Option.some.injEq] at h
+        subst h
+        obtain ⟨hnames, hmem⟩ := translateProgFns_names_and_mem (k + 1) bs rest hrest
+        refine ⟨by simp [hnames, List.range'], ?_⟩
+        intro p hp
+        rcases List.mem_cons.mp hp with rfl | hp'
+        · exact ⟨b, List.mem_cons_self, hf⟩
+        · obtain ⟨b', hb', htr'⟩ := hmem p hp'
+          exact ⟨b', List.mem_cons_of_mem _ hb', htr'⟩
+
+/-- Universal program well-formedness theorem: every multi-function MIR program
+`(entry, callees)` in `progInFragment` translates to a MiniRust `Gen.Program`
+satisfying `progWf` (`funcCfgWf` on `entry`, every callee, and `mkStartFn`,
+distinct function names, and a C-ABI 0-arg 1-ZST `start` function). -/
+theorem translateProg_progWf {entry : CapturedMir} {callees : List CapturedMir}
+    {p : Gen.Program}
+    (hfrag : progInFragment entry callees = true)
+    (htr : translateProg entry callees = some p) :
+    progWf p = true := by
+  simp only [progInFragment, Bool.and_eq_true, List.all_eq_true] at hfrag
+  obtain ⟨⟨⟨_, hbodies⟩, _⟩, _⟩ := hfrag
+  simp only [translateProg, Option.bind_eq_bind] at htr
+  cases hF : translateProgFns (fnNameMap entry callees) 0 (entry :: callees) with
+  | none => simp [hF] at htr
+  | some F =>
+    simp only [hF, Option.bind_some, pure, Option.some.injEq] at htr
+    subst htr
+    obtain ⟨hFnames, hFmem⟩ := translateProgFns_names_and_mem 0 (entry :: callees) F hF
+    have hfnNd : ((F ++ [(fnName (1 + callees.length), mkStartFn 0)]).map Prod.fst).Nodup := by
+      have heq : (F ++ [(fnName (1 + callees.length), mkStartFn 0)]).map Prod.fst =
+          (List.range' 0 (1 + callees.length + 1)).map fnName := by
+        rw [List.map_append, hFnames]
+        have hr : List.range' 0 (1 + callees.length + 1) =
+            List.range' 0 (entry :: callees).length ++ [1 + callees.length] := by
+          have := range'_append_of_le (a := 0) (b := 1 + callees.length) (c := 1 + callees.length + 1)
+            (by omega) (by omega)
+          simpa [Nat.add_comm 1 callees.length] using this.symm
+        rw [hr, List.map_append]
+        rfl
+      rw [heq]
+      exact nodup_map_fnName List.nodup_range'
+    have hallWf : (F ++ [(fnName (1 + callees.length), mkStartFn 0)]).all
+        (fun q => funcCfgWf q.2) = true := by
+      rw [List.all_eq_true]
+      intro q hq
+      rcases List.mem_append.mp hq with hqF | hqS
+      · obtain ⟨b, hb, hbf⟩ := hFmem q hqF
+        exact translateFnInProg_funcCfgWf (hbodies b hb) hbf
+      · simp only [List.mem_singleton] at hqS
+        subst hqS
+        exact mkStartFn_funcCfgWf 0
+    have hstartGet : mapGet ⟨F ++ [(fnName (1 + callees.length), mkStartFn 0)]⟩
+        (fnName (1 + callees.length)) = some (mkStartFn 0) :=
+      mapGet_eq_of_mem_nodup hfnNd (by simp)
+    have hfnNdDec : decide ((F ++ [(fnName (1 + callees.length), mkStartFn 0)]).map Prod.fst).Nodup = true :=
+      decide_eq_true hfnNd
+    have hstartBody : ((mkStartFn 0).calling_convention == .C &&
+        (mkStartFn 0).args.isEmpty &&
+        match mapGet (mkStartFn 0).locals (mkStartFn 0).ret with
+        | some retTy =>
+          match Interp.Type.layout retTy with
+          | .ok (.Sized sz align) => sz == ⟨0⟩ && align == ⟨1⟩
+          | _ => false
+        | none => false) = true := by
+      decide
+    unfold progWf
+    dsimp only
+    rw [hfnNdDec, hallWf, hstartGet]
+    dsimp only [Bool.true_and]
+    exact hstartBody
+
 end MiniRustSpec.Correspondence
+
+
+
