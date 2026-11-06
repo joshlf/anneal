@@ -600,26 +600,11 @@ pub fn canary_external_call_unlinked_helper() -> u32 {
         );
     }
     assert_eq!(report.items.len(), 13);
-    assert_eq!(report.agree_count, 11);
-    assert_eq!(report.diverge_count, 1);
+    assert_eq!(report.agree_count, 12);
+    assert_eq!(report.diverge_count, 0);
     assert_eq!(report.not_compared_count, 1);
-    let confirm_path = report
-        .confirm_module_path
-        .as_ref()
-        .expect("divergent items must produce MiriOracleConfirm.lean");
-    assert!(
-        confirm_path.is_file(),
-        "divergent items must be kernel-certified in MiriOracleConfirm.lean"
-    );
-    let confirm_text = fs::read_to_string(confirm_path).expect("read MiriOracleConfirm.lean");
-    assert!(
-        confirm_text.contains("theorem confirm_tag_pass_ptr_offset_within_array"),
-        "missing confirm_tag_pass_ptr_offset_within_array in MiriOracleConfirm.lean"
-    );
-    assert!(
-        confirm_text.contains("theorem confirm_probe_pass_ptr_offset_within_array"),
-        "missing confirm_probe_pass_ptr_offset_within_array in MiriOracleConfirm.lean"
-    );
+    assert!(report.confirm_module_path.is_none());
+    
     let probe_path = corpus_root.join(".anneal/oracle/MiriOracleProbe.lean");
     assert!(
         probe_path.is_file(),
@@ -709,18 +694,15 @@ pub fn canary_external_call_unlinked_helper() -> u32 {
         }
     }
 
-    // Verify the divergent pointer-offset item is kernel-confirmed:
+    // Verify the fixed pointer-offset item now agrees:
     let ptr_offset = report.item("pass_ptr_offset_within_array").unwrap();
-    assert!(ptr_offset.kernel_confirmed);
+    assert_eq!(ptr_offset.verdict, ComparisonVerdict::Agree);
     assert_eq!(
-        ptr_offset.verdict,
-        ComparisonVerdict::Diverge(DivergenceKind::FalsePositiveUb {
-            miri: "pass:scalar:300:4".to_string(),
-            anneal_span: Some(
-                SourceSpan::parse_anneal_span("src/lib.rs:97:9: 97:12")
-                    .expect("parse pass_ptr_offset_within_array span"),
-            ),
-        })
+        ptr_offset.anneal,
+        AnnealOutcome::PassScalar {
+            bits: 300,
+            size_bytes: 4
+        }
     );
 
     // Verify `exact_div` is now interpreted inline and agrees with Miri on the
@@ -789,9 +771,6 @@ pub fn canary_external_call_unlinked_helper() -> u32 {
         span_err.contains("Lean kernel confirmation failed"),
         "unexpected error: {span_err}"
     );
-
-    fs::write(confirm_path, &confirm_text)
-        .expect("restore valid MiriOracleConfirm.lean");
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
