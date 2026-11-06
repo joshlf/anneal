@@ -4969,7 +4969,7 @@ private theorem callTerminatorOk_unpack {fnMap : FnMap}
           | none => simp [hextr, hintr, hfind] at hok
           | some callee =>
             cases hcd : callee.localDecls with
-          | nil => simp [hextr, hfind, hcd] at hok
+          | nil => simp [hextr, hintr, hfind, hcd] at hok
           | cons calleeRetDecl restDecls =>
             simp only [hextr, hintr, hfind, hcd, Bool.and_eq_true, decide_eq_true_eq,
               List.all_eq_true, bne_iff_ne] at hok

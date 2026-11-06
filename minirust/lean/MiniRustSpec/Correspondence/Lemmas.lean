@@ -1652,13 +1652,14 @@ theorem translateBlocksInProg_cfgWf {fnMap : FnMap} {callees : List CapturedMir}
                   cases hdp : extractFnDefPath func with
                   | none => simp [hdp] at hcOk
                   | some dp =>
+                    simp only [hdp] at hcOk
+                    revert hcOk
                     cases hintr : translateIntrinsicOrNone dp argOps destination (some targetBb) with
                     | some res =>
-                      simp only [hdp, hintr] at hcOk
-                      -- we don't care what hcOk simplifies to here, it will be `false = true` which is a contradiction!
-                      -- but wait, in this branch `hcOk` is `false = true`, so we can just do `cases hcOk`.
+                      intro hcOk
                       cases hcOk
                     | none =>
+                      intro hcOk
                       cases hfc : MirSemantics.findCallee? callees dp with
                       | none => simp [hdp, hintr, hfc] at hcOk
                       | some callee =>
