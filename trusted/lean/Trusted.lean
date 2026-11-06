@@ -6,9 +6,12 @@
 -- This file may not be copied, modified, or distributed except according to
 -- those terms.
 
--- anneal-trust-tier: vetted
+-- anneal-trust-tier: candidate:step_result
 prelude
 import Init.NotationExtra
+import Init.Core
+import Trusted.Refinement
+import Trusted.StepResult
 
 /-!
 # Anneal Trusted Lean Foundation (`Trusted.lean`)
