@@ -580,8 +580,14 @@ theorem calleeAddOne_satisfies_contract :
         PUnit.unit := by
   rintro req _ ⟨_, h_args, h_mem⟩
   rw [h_args, h_mem]
-  apply dwlp_cofix_of_wpCoalBounded (fuel := 4)
-  exact rfl
+  apply (Anneal.MirFuelFree.dwp_of_mirNoCallWpConverges ?_).toDWLP
+  refine Anneal.MirFuelFree.MirNoCallWpConverges.mono ?_ (Anneal.PureMirExec.mirNoCallWpConverges_of_pureExec (post := fun retVal => retVal = .scalar ⟨41, 4⟩) (by rfl) ?_)
+  · intro out h_out
+    cases out with
+    | normal rv => rcases rv with ⟨retVal, mem'⟩; rcases h_out with ⟨rfl, rfl⟩; rfl
+    | panic => exact h_out.elim
+    | abort => exact h_out.elim
+  · exact ⟨4, by rfl⟩
 
 def rejectOtherCallsHandler : ExternalCallHandler :=
   fun _ => ITree.fail (E := MirClosedEffect) FailureKind.unsupported

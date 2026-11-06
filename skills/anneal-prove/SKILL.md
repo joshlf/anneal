@@ -236,11 +236,8 @@ hits `maxHeartbeats`, `maxRecDepth`, or multi-second `rw`/`dsimp` stalls, read
 [`references/proof-scaling-and-bottlenecks.md`](references/proof-scaling-and-bottlenecks.md)
 and apply these nine rules:
 
-1. **Pre-project basic blocks (`BlockCtx` + `itemBB0..itemBBn`):** Never include
-   `Mir.<Crate>.<Item>.body` in a `dsimp` set across a multi-block CFG; unfolding
-   `body` duplicates the entire basic-block list into every step state. Define
-   top-level `itemBBk` constants and `O(1)` `rfl` lookup lemmas
-   (`lookupBlock itemCtx k = some itemBBk`).
+1. **Use `#mir_lift` and `#mir_lift_spec`:** For straight-line code and simple contracts, use `#mir_lift_spec` or `mirWpConverges_of_pureExec` and `lift_frame` to evaluate MIR directly. Do not use manual explicit bounds like `fuel`.
+2. **Loop Abstractions (`forRangeUp` and `mirWpConverges_of_sepLenses`):** For loop bodies, use structural combinators rather than unrolling or explicitly executing multi-block CFGs.
 2. **Short-circuit symbolic bit-loops (`bitwiseAndBitsFast`):** Never unfold
    recursive `bitwiseAndBits` / `bitwiseOrBits` over a symbolic `b : Nat` (which
    unrolls 8–64 nested `Nat.div · 2` trees and stalls kernel unification for

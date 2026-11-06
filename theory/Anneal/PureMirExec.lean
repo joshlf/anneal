@@ -2728,10 +2728,10 @@ theorem evalRvalue_pushBaseStack
   cases rv with
   | use op =>
     dsimp only [evalRvalue, Memory.pushBaseStack]
-    cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals <;> rfl
+    cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals <;> repeat' (first | rfl | split)
   | «repeat» op count =>
     dsimp only [evalRvalue, Memory.pushBaseStack]
-    cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals <;> rfl
+    cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals <;> repeat' (first | rfl | split)
   | ref bk place =>
     dsimp only [evalRvalue, Memory.pushBaseStack]
     repeat' (first | rfl | split)
@@ -2812,7 +2812,7 @@ theorem evalRvalue_pushBaseStack
   | shallowInitBox _ _ => rfl
   | copyForDeref place =>
     dsimp only [evalRvalue, Memory.pushBaseStack]
-    cases evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals <;> rfl
+    cases evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals <;> repeat' (first | rfl | split)
   | wrapUnsafeBinder _ _ => rfl
 
 theorem evalCopySingleDirect_pushBaseStack
@@ -2959,8 +2959,8 @@ theorem evalCopyNonOverlappingWithCount_pushBaseStack
           cases lookupBorrow s.memory.borrows dstPtr.tag with
           | none => rfl
           | some dstEntry =>
-            rcases srcEntry with ⟨sTag, sLoc, sProj, sPerm, sParent, sRange, sProt⟩
-            rcases dstEntry with ⟨dTag, dLoc, dProj, dPerm, dParent, dRange, dProt⟩
+            rcases srcEntry with ⟨sTag, sLoc, sProj, sPerm, sRangeOff, sRangeLen, sProt, sParent⟩
+            rcases dstEntry with ⟨dTag, dLoc, dProj, dPerm, dRangeOff, dRangeLen, dProt, dParent⟩
             dsimp only
             have h_perm_ok :
                 (sPerm = .disabled ∨ dPerm = .frozen ∨ dPerm = .disabled) ∨
@@ -2980,8 +2980,8 @@ theorem evalCopyNonOverlappingWithCount_pushBaseStack
                     evalCopySingleDirect
                       (MachineState.pushBaseStack calleeBody baseStack s)
                       src dst localDecls layouts srcPtr dstPtr
-                      ⟨sTag, sLoc, sProj, sPerm, sParent, sRange, sProt⟩
-                      ⟨dTag, dLoc, dProj, dPerm, dParent, dRange, dProt⟩ locals₃
+                      ⟨sTag, sLoc, sProj, sPerm, sRangeOff, sRangeLen, sProt, sParent⟩
+                      ⟨dTag, dLoc, dProj, dPerm, dRangeOff, dRangeLen, dProt, dParent⟩ locals₃
                    | false =>
                     let srcRootSlot : Option LocalSlot :=
                       match get? locals₃ sLoc with
@@ -3174,8 +3174,8 @@ theorem evalCopyNonOverlappingWithCount_pushBaseStack
                           (Nat.beq dstPtr.offsetBytes 0)) with
                      | true =>
                       evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr
-                        ⟨sTag, sLoc, sProj, sPerm, sParent, sRange, sProt⟩
-                        ⟨dTag, dLoc, dProj, dPerm, dParent, dRange, dProt⟩ locals₃
+                        ⟨sTag, sLoc, sProj, sPerm, sRangeOff, sRangeLen, sProt, sParent⟩
+                        ⟨dTag, dLoc, dProj, dPerm, dRangeOff, dRangeLen, dProt, dParent⟩ locals₃
                      | false =>
                       let srcRootSlot : Option LocalSlot :=
                         match get? locals₃ sLoc with

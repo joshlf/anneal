@@ -27,7 +27,57 @@ private theorem wpReq_inversion (v1 v2 : Value) :
       v1 = .scalar { bits := b1, sizeBytes := 2 } ∧
       v2 = .scalar { bits := b2, sizeBytes := 2 } ∧
       b1 ≤ 16 ∧ b2 ≤ 1024 := by
-  mir_lift_spec
-  rintro ⟨h1, h2, h3, h4⟩; exact ⟨_, _, h1, h2, h3, h4⟩
+  intro h_holds
+  rcases v1 with _ | ⟨v1, _ | ⟨_, _ | _⟩⟩
+  · exact False.elim (by revert h_holds; decide)
+  · exact False.elim (by revert h_holds; decide)
+  · exact False.elim (by revert h_holds; decide)
+  rcases v2 with _ | ⟨v2, _ | ⟨_, _ | _⟩⟩
+  · exact False.elim (by revert h_holds; decide)
+  · exact False.elim (by revert h_holds; decide)
+  · exact False.elim (by revert h_holds; decide)
+  refine ⟨v1.bits, v2.bits, rfl, rfl, ?_, ?_⟩
+  · revert h_holds
+    exact (by decide)
+  · revert h_holds
+    exact (by decide)
 
-
+theorem verified : VerificationResult Obligations.WireframeDemo.frame_total_len.claim := by
+  apply verifyMirNoPanic_of_pureExec
+  · rfl
+  · intro args h_pre
+    rcases h_pre with ⟨h_args, h_req⟩
+    rcases args with ⟨_ | ⟨v1, _ | ⟨v2, _ | _⟩⟩⟩
+    · exact False.elim (by revert h_args; decide)
+    · exact False.elim (by revert h_args; decide)
+    · exact False.elim (by revert h_args; decide)
+    · rcases wpReq_inversion v1 v2 h_req with ⟨b1, b2, rfl, rfl, h_b1, h_b2⟩
+      exact ⟨_, by
+        dsimp only [PureMirConverges, wpPureMirExec, wpPureMirSteps, wpMirStepsSym]
+        dsimp only [Mir.WireframeDemo.frame_total_len.body,
+          wpBlockLinear, wpBlockStep, evalSymNodeTree,
+          evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
+          evalRvalueSymTreeFast,
+          evalOperandFast, evalOperandsFast, evalConstValue,
+          evalScalarBinOpSymTree, bitwiseAndBitsFast, evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
+          evalTerminatorSymTreeFast,
+          lookupSwitchTargetTree, applyUnwindAction,
+          MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
+          initMachineState, initLocals, initLocalsAux, emptyMemory,
+          readProjectedValue_nil, readProjectedValue_field,
+          invalidateConflictingBorrows, mirNormalPost, boolToScalar,
+          Mir.WireframeDemo.frame_total_len.layouts,
+          sharedBorrowPerm, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq,
+          Obligations.WireframeDemo.frame_total_len.claim,
+          Obligations.WireframeDemo.frame_total_len.refineSafeSpec,
+          Obligations.WireframeDemo.frame_total_len.rustEnsures,
+          Obligations.WireframeDemo.frame_total_len.defaultPost,
+          ItemSpec.post,
+          GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
+          HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
+          List.replicate, List.append, List.length, List.set, List.map, Option.getD,
+          get?, set?, length, Nat.add, Nat.mul, Nat.beq, Bool.and, Bool.or,
+          bitwiseAndBits_one_one, bitwiseAndBits_one_zero,
+          ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
+          Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
+        exact ⟨fun _ => rfl, by rfl⟩⟩

@@ -1,11 +1,14 @@
-
+import Lean
 import Trusted
 import Anneal.MirFuelFree
 import Anneal.PureMirExec
+import Anneal.MirLiftCore
+import Anneal.MirLift
 
 set_option maxRecDepth 2048
 namespace Anneal.PureMirExec
 
+open Lean Meta Elab Command Tactic
 open Trusted.Effect
 open Trusted.Sequence
 open Trusted.Rustc.V2026_06_01.Layout
@@ -13,127 +16,95 @@ open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
 open Anneal.MirFuelFree
+open Anneal.MirLiftCore
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 
-theorem mirBoolPredicateHolds_elim_of_pureExec
-    (specBody : CapturedMir) (args : List Value) {P : Prop} [Decidable P]
-    (h_pure : checkPureMir specBody = true)
-    (h_conv : PureMirConverges specBody (initPureState specBody args)
-      (· = .scalar { bits := if P then 1 else 0, sizeBytes := 1 })) :
-    MirBoolPredicateHolds specBody args → P := by
-  intro h_holds
-  have h_conv_wp := mirWpConverges_of_pureExec_init h_pure h_conv
-  have h_term : MirWpConverges specBody (initMachineState specBody args) (fun _ => True) :=
-    MirWpConverges.mono (fun _ _ => trivial) h_conv_wp
-  have h_holds_wp := (mirBoolPredicateHolds_iff_wpConverges specBody args h_term).1 h_holds
-  have h_conj := MirWpConverges.conj h_conv_wp h_holds_wp
-  rcases MirWpConverges.exists_outcome h_conj with ⟨out, h_out_conv, h_out_holds⟩
-  cases out with
-  | normal ret =>
-    rcases ret with ⟨v, mem⟩
-    have h_post : v = .scalar { bits := if P then 1 else 0, sizeBytes := 1 } := h_out_conv.2
-    have h_post' : v = .scalar { bits := 1, sizeBytes := 1 } := h_out_holds
-    rw [h_post'] at h_post
-    injection h_post with h_eq
-    injection h_eq with h_eq
-    by_cases hP : P
-    · exact hP
-    · rw [ite_eq_right_iff.mpr (fun h => (hP h).elim)] at h_eq
-      contradiction
-  | panic => exact False.elim h_out_conv
-  | abort => exact False.elim h_out_conv
+syntax (name := mirLiftSpecCmd) "#mir_lift_spec" ident ident (atomic("(" &"callees") " := " term ")")? term : command
 
-theorem mirBoolPredicateHoldsWithCallees_iff_wpConverges
-    (specBody : CapturedMir) (callees : List CapturedMir) (args : List Value)
-    (h_term :
-      MirWpConverges specBody (initMachineStateWithCallees specBody args callees) (fun _ => True)) :
-    Anneal.MirFuelFree.MirBoolPredicateHoldsWithCallees specBody callees args ↔
-      MirWpConverges specBody (initMachineStateWithCallees specBody args callees)
-        (mirSafePost
-          (fun retVal _ => retVal = .scalar { bits := 1, sizeBytes := 1 })) := by
-  constructor
-  · intro h_holds
-    rcases h_term with ⟨fuel, hf_term⟩
-    exact ⟨fuel, (mirBoolPredicateHoldsWithCallees_iff_wpMirBoolWithCalleesSym fuel specBody callees args hf_term).1 h_holds⟩
-  · exact mirBoolPredicateHoldsWithCallees_of_wpConverges specBody callees args
+def elabMirLiftSpec (thmId : Ident) (id : Ident) (calleesStx : Term) (argsStx : Term) : CommandElabM Unit := do
+  let declName ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo id
+  let ns ← getCurrNamespace
+  let soundName := ns ++ thmId.getId
+  liftTermElabM do
+    let bodyE := mkConst declName
+    let valueTy := mkConst ``Value
+    let calleesE ← Term.elabTermEnsuringType calleesStx
+      (mkApp (mkConst ``List [Level.zero]) (mkConst ``CapturedMir))
+    Term.synthesizeSyntheticMVarsNoPostponing
+    let calleesE ← instantiateMVars calleesE
+    let argsE ← Term.elabTermEnsuringType argsStx (mkApp (mkConst ``List [Level.zero]) valueTy)
+    Term.synthesizeSyntheticMVarsNoPostponing
+    let argsE ← instantiateMVars argsE
+    
+    let expectedRetValStx ← `(Value.scalar ({ bits := 1, sizeBytes := 1 } : ScalarInt))
+    let expectedRetVal ← Term.elabTermEnsuringType expectedRetValStx valueTy
+    Term.synthesizeSyntheticMVarsNoPostponing
+    let expectedRetVal ← instantiateMVars expectedRetVal
+    
+    let retMVar ← mkFreshExprMVar valueTy
+    let fuelMVar ← mkFreshExprMVar (mkConst ``Nat)
+    let postOf (target : Expr) : MetaM Expr :=
+      withLocalDeclD `retVal valueTy fun v => do
+        mkLambdaFVars #[v] (← mkEq v target)
+    let postE ← postOf retMVar
+    let envE ← mkAppM ``initPureEnv #[bodyE, argsE]
+    let initE ← mkAppM ``initMachineStateWithCallees #[bodyE, argsE, calleesE]
+    let memE ← mkAppM ``MachineState.memory #[initE]
+    let goalTy ← mkAppM ``LiftFrame
+      #[bodyE, mkNatLit 0, mkNatLit 0, envE, memE, postE, fuelMVar]
+    let goal ← mkFreshExprSyntheticOpaqueMVar goalTy
+    let remaining ← Tactic.run goal.mvarId! do
+      Tactic.evalTactic (← `(tactic| lift_frame))
+    unless remaining.isEmpty do
+      throwError "#mir_lift_spec: could not lift {declName} with the linked callees;         unsolved lifting goals:{indentD (MessageData.joinSep
+          (remaining.map MessageData.ofGoal) Format.line)}"
+    let proof ← instantiateMVars goal
+    let fuel ← instantiateMVars fuelMVar
+    let retVal ← instantiateMVars retMVar
+    if proof.hasExprMVar || fuel.hasExprMVar || retVal.hasExprMVar then
+      throwError "#mir_lift_spec: lifting {declName} left unassigned metavariables"
+    
+    let isCalleesEmpty ← match calleesE.getAppFnArgs with
+      | (``List.nil, _) => pure true
+      | _ => pure false
 
-theorem mirBoolPredicateHoldsWithCallees_elim_of_pureExec
-    (specBody : CapturedMir) (callees : List CapturedMir) (args : List Value) {P : Prop} [Decidable P]
-    (h_pure : checkPureMir specBody = true)
-    (h_conv : PureMirConvergesWithCallees specBody callees (initPureState specBody args)
-      (· = .scalar { bits := if P then 1 else 0, sizeBytes := 1 })) :
-    Anneal.MirFuelFree.MirBoolPredicateHoldsWithCallees specBody callees args → P := by
-  intro h_holds
-  have h_pure' := checkPureMirWithCallees_of_checkPureMir callees 0 specBody.traitImpls h_pure
-  have h_conv_wp := mirWpConverges_of_pureExecWithCallees_init h_pure' h_conv
-  have h_term : MirWpConverges specBody (initMachineStateWithCallees specBody args callees) (fun _ => True) :=
-    MirWpConverges.mono (fun _ _ => trivial) h_conv_wp
-  have h_holds_wp := (mirBoolPredicateHoldsWithCallees_iff_wpConverges specBody callees args h_term).1 h_holds
-  have h_conj := MirWpConverges.conj h_conv_wp h_holds_wp
-  rcases MirWpConverges.exists_outcome h_conj with ⟨out, h_out_conv, h_out_holds⟩
-  cases out with
-  | normal ret =>
-    rcases ret with ⟨v, mem⟩
-    have h_post : v = .scalar { bits := if P then 1 else 0, sizeBytes := 1 } := h_out_conv.2
-    have h_post' : v = .scalar { bits := 1, sizeBytes := 1 } := h_out_holds
-    rw [h_post'] at h_post
-    injection h_post with h_eq
-    injection h_eq with h_eq
-    by_cases hP : P
-    · exact hP
-    · rw [ite_eq_right_iff.mpr (fun h => (hP h).elim)] at h_eq
-      contradiction
-  | panic => exact False.elim h_out_conv
-  | abort => exact False.elim h_out_conv
+    let mut thmTy : Expr := mkConst ``True
+    let mut thmVal : Expr := mkConst ``True.intro
+    
+    if isCalleesEmpty then
+      let normalPost ←
+        withLocalDeclD `retVal valueTy fun v =>
+          withLocalDeclD `mem (mkConst ``Memory) fun m => do
+            mkLambdaFVars #[v, m] (← mkEq v expectedRetVal)
+      let wpConvTy ← mkAppM ``MirWpConverges
+        #[bodyE, initE, ← mkAppM ``mirSafePost #[normalPost]]
+      let wpConvVal ← mkAppOptM ``LiftFrame.mirWpConverges_withCallees
+        #[bodyE, argsE, calleesE, ← postOf expectedRetVal, fuel, proof]
+      thmTy ← mkAppM ``MirBoolPredicateHolds #[bodyE, argsE]
+      thmVal ← mkAppM ``mirBoolPredicateHolds_of_wpConverges #[bodyE, argsE, wpConvVal]
+    else
+      let normalPost ←
+        withLocalDeclD `retVal valueTy fun v =>
+          withLocalDeclD `mem (mkConst ``Memory) fun m => do
+            mkLambdaFVars #[v, m] (← mkEq v expectedRetVal)
+      let wpConvTy ← mkAppM ``MirWpConverges
+        #[bodyE, initE, ← mkAppM ``mirSafePost #[normalPost]]
+      let wpConvVal ← mkAppOptM ``LiftFrame.mirWpConverges_withCallees
+        #[bodyE, argsE, calleesE, ← postOf expectedRetVal, fuel, proof]
+      thmTy ← mkAppM ``Anneal.MirFuelFree.MirBoolPredicateHoldsWithCallees #[bodyE, calleesE, argsE]
+      thmVal ← mkAppM ``mirBoolPredicateHoldsWithCallees_of_wpConverges #[bodyE, calleesE, argsE, wpConvVal]
+    
+    thmVal ← mkExpectedTypeHint thmVal thmTy
+    addDecl <| .thmDecl
+      { name := soundName, levelParams := [], type := thmTy, value := thmVal }
 
-def PureMirUniqueTruePath (specBody : CapturedMir) (args : List Value) {P : Prop} : Prop :=
-  checkPureMir specBody = true ∧
-  (P → PureMirConverges specBody (initPureState specBody args) (· = .scalar { bits := 1, sizeBytes := 1 })) ∧
-  (¬ P → PureMirConverges specBody (initPureState specBody args) (· = .scalar { bits := 0, sizeBytes := 1 }))
-
-theorem mirBoolPredicateHolds_elim_of_uniqueTruePath
-    (specBody : CapturedMir) (args : List Value) {P : Prop} [Decidable P]
-    (h_uniq : PureMirUniqueTruePath specBody args (P := P)) :
-    MirBoolPredicateHolds specBody args → P := by
-  intro h_holds
-  by_cases hP : P
-  · exact hP
-  · have h_conv : PureMirConverges specBody (initPureState specBody args) (· = .scalar { bits := 0, sizeBytes := 1 }) :=
-      h_uniq.2.2 hP
-    have h_conv_wp := mirWpConverges_of_pureExec_init h_uniq.1 h_conv
-    have h_term : MirWpConverges specBody (initMachineState specBody args) (fun _ => True) :=
-      MirWpConverges.mono (fun _ _ => trivial) h_conv_wp
-    have h_holds_wp := (mirBoolPredicateHolds_iff_wpConverges specBody args h_term).1 h_holds
-    have h_conj := MirWpConverges.conj h_conv_wp h_holds_wp
-    rcases MirWpConverges.exists_outcome h_conj with ⟨out, h_out_conv, h_out_holds⟩
-    cases out with
-    | normal ret =>
-      rcases ret with ⟨v, mem⟩
-      have h_post : v = .scalar { bits := 0, sizeBytes := 1 } := h_out_conv.2
-      have h_post' : v = .scalar { bits := 1, sizeBytes := 1 } := h_out_holds
-      rw [h_post'] at h_post
-      injection h_post with h_eq
-      injection h_eq with h_eq
-      contradiction
-    | panic => exact False.elim h_out_conv
-    | abort => exact False.elim h_out_conv
-
-theorem mirBoolPredicateHolds_intro_of_pureExec
-    (specBody : CapturedMir) (args : List Value) {P : Prop}
-    (h_pure : checkPureMir specBody = true)
-    (h_conv : P → PureMirConverges specBody (initPureState specBody args)
-      (· = .scalar { bits := 1, sizeBytes := 1 })) :
-    P → MirBoolPredicateHolds specBody args := by
-  intro hP
-  exact mirBoolPredicateHolds_of_pureExec specBody args h_pure (h_conv hP)
-
-syntax "#mir_lift_spec" ident : command
-
-macro "mir_lift_spec" : tactic => `(tactic|
-  first
-  | exact mirBoolPredicateHolds_intro_of_pureExec _ _ rfl (fun _ => ⟨40, rfl⟩)
-  | refine mirBoolPredicateHolds_elim_of_pureExec _ _ rfl ⟨40, rfl⟩ ?_
-  | refine mirBoolPredicateHolds_elim_of_uniqueTruePath _ _ ⟨rfl, fun _ => ⟨40, rfl⟩, fun _ => ⟨40, rfl⟩⟩ ?_
-)
+@[command_elab mirLiftSpecCmd]
+def elabMirLiftSpecCmd : CommandElab
+  | `(command| #mir_lift_spec $thmId:ident $id:ident $[(callees := $callees?:term)]? $args:term) => do
+    let calleesStx ← match callees? with
+      | some cs => pure cs
+      | none => `([])
+    elabMirLiftSpec thmId id calleesStx args
+  | _ => throwUnsupportedSyntax
 
 end Anneal.PureMirExec
