@@ -2329,6 +2329,16 @@ open MiniRustSpec.Correspondence in
   bdUbChecksCall_extCall
   bdUbChecksCall_handled
 
+  bdCtpop_minirust_direct
+  bdCtpopI8_minirust_direct
+  bdExactDivI32_minirust_direct
+  bdExactDivU32_minirust_ub
+  bdExactDivI32_zero_ub
+  bdExactDivI32_overflow_ub
+  bdColdPath_minirust_direct
+  bdAbort_minirust_ub
+  bdUbChecksCall_minirust_direct
+
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard
 axioms (`propext`, `Quot.sound`, `Classical.choice`). -/

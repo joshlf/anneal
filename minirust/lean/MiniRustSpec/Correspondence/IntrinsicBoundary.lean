@@ -920,4 +920,83 @@ theorem bdUnreachableTerminator_covered :
       translateTerminator [] (mkTerm .unreachable) = some .Unreachable :=
   ⟨rfl, rfl⟩
 
+
+
+/-! ### `ExternalCallHandler` instances translated to MiniRust -/
+
+def bdCtpopCallerProg : Gen.Program := (translateProg bdCtpopCaller []).getD emptyProg
+def bdCtpopCallerFn : Gen.Function := (translateFnInProg (fnNameMap bdCtpopCaller []) bdCtpopCaller).getD callerFn
+def bdCtpopCallerMInit : Mach := multiMachineWithCtx ctxCallSpin bdCtpopCallerProg 1 bdCtpopCaller bdCtpopCallerFn
+  (initMachineStateWithCallees bdCtpopCaller bdCtpopArgs []).frame.locals bdCtpopCallerFn.start
+
+def bdCtpopI8CallerProg : Gen.Program := (translateProg bdCtpopI8Caller []).getD emptyProg
+def bdCtpopI8CallerFn : Gen.Function := (translateFnInProg (fnNameMap bdCtpopI8Caller []) bdCtpopI8Caller).getD callerFn
+def bdCtpopI8CallerMInit : Mach := multiMachineWithCtx ctxCallSpin bdCtpopI8CallerProg 1 bdCtpopI8Caller bdCtpopI8CallerFn
+  (initMachineStateWithCallees bdCtpopI8Caller [.scalar ⟨255, 1⟩] []).frame.locals bdCtpopI8CallerFn.start
+
+theorem bdCtpop_minirust_direct :
+    (Interp.steps 20 bdCtpopCallerMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 4 }, [1]) := rfl
+
+theorem bdCtpopI8_minirust_direct :
+    (Interp.steps 20 bdCtpopI8CallerMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 8 }, [1]) := rfl
+
+def bdExactDivI32CallerProg : Gen.Program := (translateProg bdExactDivI32Caller []).getD emptyProg
+def bdExactDivI32CallerFn : Gen.Function := (translateFnInProg (fnNameMap bdExactDivI32Caller []) bdExactDivI32Caller).getD callerFn
+def bdExactDivI32CallerMInit (l r : Nat) : Mach := multiMachineWithCtx ctxCallSpin bdExactDivI32CallerProg 1 bdExactDivI32Caller bdExactDivI32CallerFn
+  (initMachineStateWithCallees bdExactDivI32Caller [.scalar ⟨l, 4⟩, .scalar ⟨r, 4⟩] []).frame.locals bdExactDivI32CallerFn.start
+
+def bdExactDivU32CallerProg : Gen.Program := (translateProg bdExactDivU32Caller []).getD emptyProg
+def bdExactDivU32CallerFn : Gen.Function := (translateFnInProg (fnNameMap bdExactDivU32Caller []) bdExactDivU32Caller).getD callerFn
+def bdExactDivU32CallerMInit (l r : Nat) : Mach := multiMachineWithCtx ctxCallSpin bdExactDivU32CallerProg 1 bdExactDivU32Caller bdExactDivU32CallerFn
+  (initMachineStateWithCallees bdExactDivU32Caller [.scalar ⟨l, 4⟩, .scalar ⟨r, 4⟩] []).frame.locals bdExactDivU32CallerFn.start
+
+theorem bdExactDivI32_minirust_direct :
+    (Interp.steps 20 (bdExactDivI32CallerMInit 4294967290 3)).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 4294967294 }, [1]) := rfl
+
+theorem bdExactDivU32_minirust_ub :
+    Interp.steps 20 (bdExactDivU32CallerMInit 4294967290 3) =
+      .error (.ub "exact division with remainder") := rfl
+
+theorem bdExactDivI32_zero_ub :
+    Interp.steps 20 (bdExactDivI32CallerMInit 6 0) =
+      .error (.ub "division by zero") := rfl
+
+theorem bdExactDivI32_overflow_ub :
+    Interp.steps 20 (bdExactDivI32CallerMInit 2147483648 4294967295) =
+      .error (.ub "overflow in division") := rfl
+
+def bdColdPathCallerProg : Gen.Program := (translateProg bdColdPathCaller []).getD emptyProg
+def bdColdPathCallerFn : Gen.Function := (translateFnInProg (fnNameMap bdColdPathCaller []) bdColdPathCaller).getD callerFn
+def bdColdPathCallerMInit : Mach := multiMachineWithCtx ctxCallSpin bdColdPathCallerProg 1 bdColdPathCaller bdColdPathCallerFn
+  (initMachineStateWithCallees bdColdPathCaller [] []).frame.locals bdColdPathCallerFn.start
+
+theorem bdColdPath_minirust_direct :
+    (Interp.steps 20 bdColdPathCallerMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 0 }, [1]) := rfl
+
+def bdAbortCallerProg : Gen.Program := (translateProg bdAbortCaller []).getD emptyProg
+def bdAbortCallerFn : Gen.Function := (translateFnInProg (fnNameMap bdAbortCaller []) bdAbortCaller).getD callerFn
+def bdAbortCallerMInit : Mach := multiMachineWithCtx ctxCallSpin bdAbortCallerProg 1 bdAbortCaller bdAbortCallerFn
+  (initMachineStateWithCallees bdAbortCaller [] []).frame.locals bdAbortCallerFn.start
+
+theorem bdAbort_minirust_ub :
+    Interp.steps 20 bdAbortCallerMInit = .error .abort := rfl
+
+def bdUbChecksCallCallerProg : Gen.Program := (translateProg bdUbChecksCallCaller []).getD emptyProg
+def bdUbChecksCallCallerFn : Gen.Function := (translateFnInProg (fnNameMap bdUbChecksCallCaller []) bdUbChecksCallCaller).getD callerFn
+def bdUbChecksCallCallerMInit : Mach := multiMachineWithCtx ctxCallSpin bdUbChecksCallCallerProg 1 bdUbChecksCallCaller bdUbChecksCallCallerFn
+  (initMachineStateWithCallees bdUbChecksCallCaller [] []).frame.locals bdUbChecksCallCallerFn.start
+
+theorem bdUbChecksCall_minirust_direct :
+    (Interp.steps 20 bdUbChecksCallCallerMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u8 0 }, [1]) := rfl
+
 end MiniRustSpec.Correspondence

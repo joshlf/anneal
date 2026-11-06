@@ -477,6 +477,58 @@ theorem splitStmts_names (cur : Gen.BbName) (acc : List Gen.Statement) (nc : Nat
 
 /-- The cleanup blocks of `translateTerminatorInProg` take the fresh names
 `nc, nc + 1, ..` (at most one, for a call's unwind action). -/
+
+theorem translateRsIntrinsic_cfgWf (f : Gen.Function) (name : String) (argOps : List MirAst.Operand) (destination : MirAst.Place) (target : Option Nat) (res : TerminatorResult)
+    (htgt : ∀ t, target = some t → checkNextBlock f Gen.BbKind.Regular (bbName t) = true)
+    (h : translateRsIntrinsic name argOps destination target = some res) :
+    res.stmts.all (stmtCfgWf f) = true ∧ termCfgWf f Gen.BbKind.Regular res.terminator = true := by
+  unfold translateRsIntrinsic at h
+  split at h
+  · simp only [Option.bind_eq_bind] at h
+    cases hargs : argOps.mapM translateOperand <;> simp [hargs] at h
+    cases hret : translatePlace destination <;> simp [hret] at h
+    obtain ⟨rfl, rfl⟩ := h
+    refine ⟨by rfl, ?_⟩
+    simp [termCfgWf]
+    cases target with
+    | none => rfl
+    | some t => exact htgt t rfl
+  · rename_i hs
+    split at h
+    · rename_i v t
+      simp only [Option.bind_eq_bind] at h
+      cases hv : translateOperand v <;> simp [hv] at h
+      cases hret : translatePlace destination <;> simp [hret] at h
+      obtain ⟨rfl, rfl⟩ := h
+      refine ⟨by rfl, ?_⟩
+      simp [termCfgWf]
+      exact htgt t rfl
+    · cases h
+  · rename_i hs
+    split at h
+    · rename_i l r t
+      simp only [Option.bind_eq_bind] at h
+      cases hl : translateOperand l <;> simp [hl] at h
+      cases hr : translateOperand r <;> simp [hr] at h
+      cases hret : translatePlace destination <;> simp [hret] at h
+      obtain ⟨rfl, rfl⟩ := h
+      refine ⟨by rfl, ?_⟩
+      simp [termCfgWf]
+      exact htgt t rfl
+    · cases h
+  · rename_i hs
+    cases target with
+    | none => cases h
+    | some t =>
+      obtain ⟨rfl, rfl⟩ := h
+      refine ⟨by rfl, ?_⟩
+      simp [termCfgWf]
+      exact htgt t rfl
+  · obtain ⟨rfl, rfl⟩ := h
+    refine ⟨by rfl, ?_⟩
+    simp [termCfgWf, abortTerminator]
+  · cases h
+
 theorem translateTerminatorInProg_names {fnMap : FnMap} {decls : List LocalDecl} {nc : Nat}
     {t : MirAst.Terminator} {term : Gen.Terminator} {nc' : Nat}
     {ex : List (Gen.BbName × Gen.BasicBlock)}
@@ -489,14 +541,20 @@ theorem translateTerminatorInProg_names {fnMap : FnMap} {decls : List LocalDecl}
     cases hdp : extractFnDefPath func <;> simp only [hdp, Option.bind_none, Option.bind_some] at h
     · cases h
     rename_i dp
-    cases hlk : lookupFnTarget fnMap dp <;> simp only [hlk, Option.bind_none, Option.bind_some] at h
-    · cases h
-    rename_i fc
-    cases ha : argOps.mapM translateCallArg <;> simp only [ha, Option.bind_none, Option.bind_some] at h
-    · cases h
-    cases hr : translatePlace destination <;> simp only [hr, Option.bind_none, Option.bind_some] at h
-    · cases h
-    cases unwind <;> simp [translateUnwindAction] at h <;> obtain ⟨_, rfl, rfl⟩ := h <;> simp
+    cases hintr : translateIntrinsicOrNone dp argOps destination target
+    · simp only [hintr, Option.bind_none, Option.bind_some] at h
+      cases hlk : lookupFnTarget fnMap dp <;> simp only [hlk, Option.bind_none, Option.bind_some] at h
+      · cases h
+      rename_i fc
+      cases ha : argOps.mapM translateCallArg <;> simp only [ha, Option.bind_none, Option.bind_some] at h
+      · cases h
+      cases hr : translatePlace destination <;> simp only [hr, Option.bind_none, Option.bind_some] at h
+      · cases h
+      cases unwind <;> simp [translateUnwindAction] at h <;> obtain ⟨_, rfl, rfl⟩ := h <;> simp
+    · rename_i res
+      simp only [hintr, Option.bind_none, Option.bind_some] at h
+      obtain ⟨rfl, rfl, rfl⟩ := h
+      simp
   all_goals
     simp only [hk, Option.bind_eq_bind] at h
     cases ht : translateTerminator decls t <;> simp only [ht, Option.bind_none, Option.bind_some] at h
@@ -1594,43 +1652,52 @@ theorem translateBlocksInProg_cfgWf {fnMap : FnMap} {callees : List CapturedMir}
                   cases hdp : extractFnDefPath func with
                   | none => simp [hdp] at hcOk
                   | some dp =>
-                    cases hfc : MirSemantics.findCallee? callees dp with
-                    | none => simp [hdp, hfc] at hcOk
-                    | some callee =>
-                      cases hcd : callee.localDecls with
-                      | nil => simp [hdp, hfc, hcd] at hcOk
-                      | cons retDecl restDecls =>
-                        simp only [hdp, hfc, hcd, Bool.and_eq_true, decide_eq_true_eq] at hcOk
-                        have htgtLt : targetBb < body.basicBlocks.length := hcOk.1.1.1.1.1.1.1
-                        have hunwOk : callUnwindOk unwind = true := hcOk.1.1.1.1.1.1.2
-                        simp only [translateTerminatorInProg, htk, hdp, Option.bind_eq_bind,
-                          Option.bind_some] at htm
-                        cases hlk : lookupFnTarget fnMap dp with
-                        | none => simp [hlk] at htm
-                        | some fnConv =>
-                          cases hargsTr : argOps.mapM translateCallArg with
-                          | none => simp [hlk, hargsTr] at htm
-                          | some args' =>
-                            cases hretTr : translatePlace destination with
-                            | none => simp [hlk, hargsTr, hretTr] at htm
-                            | some retPlace =>
-                              obtain ⟨uwTerm, huwEq, huwCases⟩ :=
-                                translateUnwindAction_spec sp.2.2.2 unwind hunwOk
-                              simp only [hlk, hargsTr, hretTr, huwEq, Option.bind_some, pure,
-                                Option.some.injEq, Prod.mk.injEq] at htm
-                              obtain ⟨rfl, rfl, rfl⟩ := htm
-                              have hexMem : mapGet f.blocks (bbName sp.2.2.2) =
-                                  some ⟨[], uwTerm, .Cleanup⟩ :=
-                                hlook (bbName sp.2.2.2, ⟨[], uwTerm, .Cleanup⟩) (by simp)
-                              have huwTermWf : termCfgWf f .Cleanup uwTerm = true := by
-                                rcases huwCases with ⟨_, rfl⟩ | ⟨_, rfl⟩ | ⟨_, rfl⟩ <;>
-                                  rfl
-                              refine ⟨?_, ?_⟩
-                              · simp [termCfgWf, hEntry targetBb htgtLt, checkUnwindBlock, hexMem]
-                              · intro e he
-                                simp only [List.mem_singleton] at he
-                                subst he
-                                exact ⟨rfl, huwTermWf⟩
+                    cases hintr : translateIntrinsicOrNone dp argOps destination (some targetBb) with
+                    | some res =>
+                      simp only [hdp, hintr] at hcOk
+                      -- we don't care what hcOk simplifies to here, it will be `false = true` which is a contradiction!
+                      -- but wait, in this branch `hcOk` is `false = true`, so we can just do `cases hcOk`.
+                      cases hcOk
+                    | none =>
+                      cases hfc : MirSemantics.findCallee? callees dp with
+                      | none => simp [hdp, hintr, hfc] at hcOk
+                      | some callee =>
+                        cases hcd : callee.localDecls with
+                        | nil => simp [hdp, hintr, hfc, hcd] at hcOk
+                        | cons retDecl restDecls =>
+                          simp only [hdp, hintr, hfc, hcd, Bool.and_eq_true, decide_eq_true_eq] at hcOk
+                          have htgtLt : targetBb < body.basicBlocks.length := hcOk.1.1.1.1.1.1.1
+                          have hunwOk : callUnwindOk unwind = true := hcOk.1.1.1.1.1.1.2
+                          simp only [translateTerminatorInProg, htk, hdp, Option.bind_eq_bind,
+                            Option.bind_some] at htm
+                          simp only [hintr, Option.bind_none, Option.bind_some] at htm
+                          cases hlk : lookupFnTarget fnMap dp with
+                          | none => simp [hlk] at htm
+                          | some fnConv =>
+                            cases hargsTr : argOps.mapM translateCallArg with
+                            | none => simp [hlk, hargsTr] at htm
+                            | some args' =>
+                              cases hretTr : translatePlace destination with
+                              | none => simp [hlk, hargsTr, hretTr] at htm
+                              | some retPlace =>
+                                obtain ⟨uwTerm, huwEq, huwCases⟩ :=
+                                  translateUnwindAction_spec sp.2.2.2 unwind hunwOk
+                                simp only [hlk, hargsTr, hretTr, huwEq, Option.bind_some, pure,
+                                  Option.some.injEq, Prod.mk.injEq] at htm
+                                obtain ⟨rfl, rfl, rfl⟩ := htm
+                                have hexMem : mapGet f.blocks (bbName sp.2.2.2) =
+                                    some ⟨[], uwTerm, .Cleanup⟩ :=
+                                  hlook (bbName sp.2.2.2, ⟨[], uwTerm, .Cleanup⟩) (by simp)
+                                have huwTermWf : termCfgWf f .Cleanup uwTerm = true := by
+                                  rcases huwCases with ⟨_, rfl⟩ | ⟨_, rfl⟩ | ⟨_, rfl⟩ <;>
+                                    rfl
+                                refine ⟨?_, ?_⟩
+                                · simp [termCfgWf, hEntry targetBb htgtLt, checkUnwindBlock, hexMem]
+                                · intro e he
+                                  simp only [List.mem_singleton] at he
+                                  subst he
+                                  exact ⟨rfl, huwTermWf⟩
+
               | _ => simp [htk] at hcOk
           obtain ⟨_, hsegWf⟩ := splitStmts_cfgWf htermExWf.1 (bbName k) [] nc results (by simp)
             hrsWf (by

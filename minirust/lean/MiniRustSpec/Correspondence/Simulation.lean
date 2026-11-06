@@ -4962,17 +4962,21 @@ private theorem callTerminatorOk_unpack {fnMap : FnMap}
       cases hextr : extractFnDefPath func with
       | none => simp [hextr] at hok
       | some dp =>
-        cases hfind : MirSemantics.findCallee? callees dp with
-        | none => simp [hextr, hfind] at hok
-        | some callee =>
-          cases hcd : callee.localDecls with
+        cases hintr : translateIntrinsicOrNone dp argOps destination (some targetBb) with
+        | some _ => simp [hextr, hintr] at hok
+        | none =>
+          cases hfind : MirSemantics.findCallee? callees dp with
+          | none => simp [hextr, hintr, hfind] at hok
+          | some callee =>
+            cases hcd : callee.localDecls with
           | nil => simp [hextr, hfind, hcd] at hok
           | cons calleeRetDecl restDecls =>
-            simp only [hextr, hfind, hcd, Bool.and_eq_true, decide_eq_true_eq,
+            simp only [hextr, hintr, hfind, hcd, Bool.and_eq_true, decide_eq_true_eq,
               List.all_eq_true, bne_iff_ne] at hok
             obtain ⟨⟨⟨⟨⟨⟨⟨htgtLt, _⟩, _⟩, hArgLen⟩, hArgBound⟩, hArgsOk⟩, hDestOk⟩, hNotDst⟩ := hok
             simp only [translateTerminatorInProg, htk, hextr, Option.bind_eq_bind,
               Option.bind_some] at htr
+            simp only [hintr, Option.bind_none] at htr
             cases hlk : lookupFnTarget fnMap dp with
             | none => simp [hlk] at htr
             | some fnConv =>

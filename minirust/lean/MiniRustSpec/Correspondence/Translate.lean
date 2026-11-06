@@ -1171,53 +1171,6 @@ def translateUnwindAction (nextCleanup : Nat) :
   | .cleanup cb =>
     (bbName cb, nextCleanup, [])
 
-/-- `minimize`'s terminator translation extended with direct monomorphic calls
-(`tooling/minimize/src/bb.rs`):
-> "let unwind_block = Some(self.translate_unwind_action(unwind, bb));
->  ..
->  let callee = if let rs::InstanceKind::Virtual(_trait, method) = instance.def {
->      ..
->  } else {
->      build::fn_ptr(self.cx.get_fn_name(instance))
->  };
->
->  Terminator::Call {
->      callee,
->      calling_convention: conv,
->      arguments: args,
->      ret: self.translate_place(&destination, span),
->      next_block: target.as_ref().map(|t| self.bb_name_map[t]),
->      unwind_block,
->  }"
-where `minimize` computes the call edge's `conv` from the *callee instance's*
-own ABI:
-> "let abi = self
->      .cx
->      .tcx
->      .fn_abi_of_instance(self.typing_env().as_query_input((instance, rs::List::empty())))
->      .unwrap();
->  let conv = translate_calling_convention(abi.conv);"
-so `lookupFnTarget` returns the callee's `translateCallConv callee.fnAbi.conv`,
-which is exactly the `calling_convention` that `translateFnInProg` gives the
-callee (and `create_frame`'s calling-convention check never fails on a
-translated direct call). Non-call terminators delegate directly to
-`translateTerminator` and synthesize no extra cleanup blocks. -/
-def translateTerminatorInProg (fnMap : FnMap)
-    (decls : List MirAst.LocalDecl) (nextCleanup : Nat) (t : MirAst.Terminator) :
-    Option (Gen.Terminator × Nat × List (Gen.BbName × Gen.BasicBlock)) :=
-  match t.kind with
-  | .call func argOps destination target unwind => do
-    let defPath ← extractFnDefPath func
-    let (fn, conv) ← lookupFnTarget fnMap defPath
-    let args ← argOps.mapM translateCallArg
-    let retPlace ← translatePlace destination
-    let (unwindBb, nextCleanup', extra) := translateUnwindAction nextCleanup unwind
-    pure (.Call (fnPtrExpr fn) conv args retPlace (target.map bbName) (some unwindBb),
-      nextCleanup', extra)
-  | _ => do
-    let term ← translateTerminator decls t
-    pure (term, nextCleanup, [])
-
 /-- `minimize`'s per-statement translation result
 (`tooling/minimize/src/bb.rs`):
 > "/// A MIR statement becomes either a MiniRust statement or an intrinsic with some arguments, which
@@ -1329,6 +1282,65 @@ def translateRsIntrinsic (name : String) (args : List MirAst.Operand)
     | none => none
   | "abort" => pure ⟨[], abortTerminator⟩
   | _ => none
+
+/-- `minimize`'s terminator translation extended with direct monomorphic calls
+(`tooling/minimize/src/bb.rs`):
+> "let unwind_block = Some(self.translate_unwind_action(unwind, bb));
+>  ..
+>  let callee = if let rs::InstanceKind::Virtual(_trait, method) = instance.def {
+>      ..
+>  } else {
+>      build::fn_ptr(self.cx.get_fn_name(instance))
+>  };
+>
+>  Terminator::Call {
+>      callee,
+>      calling_convention: conv,
+>      arguments: args,
+>      ret: self.translate_place(&destination, span),
+>      next_block: target.as_ref().map(|t| self.bb_name_map[t]),
+>      unwind_block,
+>  }"
+where `minimize` computes the call edge's `conv` from the *callee instance's*
+own ABI:
+> "let abi = self
+>      .cx
+>      .tcx
+>      .fn_abi_of_instance(self.typing_env().as_query_input((instance, rs::List::empty())))
+>      .unwrap();
+>  let conv = translate_calling_convention(abi.conv);"
+so `lookupFnTarget` returns the callee's `translateCallConv callee.fnAbi.conv`,
+which is exactly the `calling_convention` that `translateFnInProg` gives the
+callee (and `create_frame`'s calling-convention check never fails on a
+translated direct call). Non-call terminators delegate directly to
+`translateTerminator` and synthesize no extra cleanup blocks. -/
+def translateIntrinsicOrNone (defPath : String) (argOps : List MirAst.Operand)
+    (destination : MirAst.Place) (target : Option MirAst.BasicBlockIdx) : Option TerminatorResult :=
+  if defPath.startsWith "core::intrinsics::" then
+    translateRsIntrinsic (defPath.drop 18).toString argOps destination target
+  else none
+
+def translateTerminatorInProg (fnMap : FnMap)
+    (decls : List MirAst.LocalDecl) (nextCleanup : Nat) (t : MirAst.Terminator) :
+    Option (Gen.Terminator × Nat × List (Gen.BbName × Gen.BasicBlock)) :=
+  match t.kind with
+  | .call func argOps destination target unwind => do
+    let defPath ← extractFnDefPath func
+    match translateIntrinsicOrNone defPath argOps destination target with
+    | some res =>
+      let b := bbName nextCleanup
+      pure (.Goto b, nextCleanup + 1, [(b, ⟨res.stmts, res.terminator, .Regular⟩)])
+    | none =>
+      let (fn, conv) ← lookupFnTarget fnMap defPath
+      let args ← argOps.mapM translateCallArg
+      let retPlace ← translatePlace destination
+      let (unwindBb, nextCleanup', extra) := translateUnwindAction nextCleanup unwind
+      pure (.Call (fnPtrExpr fn) conv args retPlace (target.map bbName) (some unwindBb),
+        nextCleanup', extra)
+  | _ => do
+    let term ← translateTerminator decls t
+    pure (term, nextCleanup, [])
+
 
 /-- Whether a MIR statement is
 `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(_))`, the one
@@ -2364,7 +2376,10 @@ def callTerminatorOk (callees : List MirAst.CapturedMir) (body : MirAst.Captured
     match extractFnDefPath func with
     | none => false
     | some defPath =>
-      match MirSemantics.findCallee? callees defPath with
+      match translateIntrinsicOrNone defPath argOps destination (some targetBb) with
+      | some _ => false
+      | none =>
+        match MirSemantics.findCallee? callees defPath with
       | none => false
       | some callee =>
         match callee.localDecls with
