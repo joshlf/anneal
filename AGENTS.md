@@ -14,8 +14,9 @@ contains a more specific `AGENTS.md`, read and follow that file as well.
 ## Project principles
 
 Before designing, modifying, or reviewing repository artifacts, read and
-preserve [`PRINCIPLES.md`](PRINCIPLES.md), which defines Anneal's mission,
-correctness promise, and decision-making principles.
+preserve [`PRINCIPLES.md`](PRINCIPLES.md) and
+[`THREAT_MODEL.md`](THREAT_MODEL.md), which define Anneal's mission,
+correctness promise, threat model, and decision-making principles.
 
 ## Standing rules
 
@@ -78,10 +79,12 @@ checking the crate's `Trusted.CrateTheorem` (`VerificationResult` over every
 captured function's `Compiler.Verified` obligations) inside the Lean 4 kernel.
 
 See [`README.md`](README.md) for the correctness policy and `trusted/`
-invariant, [`docs/design.md`](docs/design.md) for the overall design,
-[`docs/architecture.md`](docs/architecture.md) for the three-stage MIR pipeline
-and repository layout, and [`docs/trust-model.md`](docs/trust-model.md) for
-the trust model and boundary enforcement. Before placing or modifying code,
+invariant, [`THREAT_MODEL.md`](THREAT_MODEL.md) for the threat model and
+execution-isolation boundary, [`docs/design.md`](docs/design.md) for the
+overall design, [`docs/architecture.md`](docs/architecture.md) for the
+three-stage MIR pipeline and repository layout, and
+[`docs/trust-model.md`](docs/trust-model.md) for how `trusted/` and
+`trusted/audit/` enforce the trust boundary. Before placing or modifying code,
 check whether it belongs inside `trusted/` or outside it (`theory/`):
 
 - Only primitive semantic and theorem definitions required to state or gate
