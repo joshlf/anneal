@@ -28,7 +28,7 @@ This claim is a corollary of the above two hypotheses. If Anneal emits compiler 
 
 # Anneal's promise to its users
 
-One of Anneal's outputs is a *TCB audit log*, a list of code and assumptions Anneal trusts (including itself) to compile your code and prove it correct. Anneal's promise is this:
+One of Anneal's outputs is a [*TCB audit log*](docs/trust-model.md), a list of code and assumptions Anneal trusts (including itself) to compile your code and prove it correct. Anneal's promise is this:
 
 ***If** the code in your TCB audit log is correct, its assumptions are valid, **and** Anneal emits no errors, **then** your code is correct.*
 
@@ -36,6 +36,16 @@ This commitment means that if you write code that Anneal cannot reason about, *i
 
 1. There is a bug or invalid assumption in the TCB (Anneal, Lean, etc.), or  
 2. The program behaves as promised.[^3]
+
+Because an untrusted process running in the same operating-system environment as
+Anneal could modify the verifier or fabricate its output, this promise requires
+running Anneal outside the write and process-control boundary of any untrusted
+code or proof author (for example, in a well-configured CI pipeline). Within
+that boundary, Anneal mechanically audits untrusted proofs—whether shipped in
+Anneal's own proof theory or supplied alongside your crate—so that buggy or
+adversarial proof scripts cannot cause a false claim to pass and never appear in
+your TCB audit log. See [`docs/trust-model.md`](docs/trust-model.md) for the
+full threat model and trust boundary.
 
 # How we make decisions about Anneal
 

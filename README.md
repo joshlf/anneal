@@ -51,5 +51,6 @@ that as well.)
 - [`docs/architecture.md`](docs/architecture.md): The three-stage MIR pipeline,
   repository layout, `rustc` extraction lifecycle, and multi-version toolchain
   strategy.
-- [`docs/trust-model.md`](docs/trust-model.md): The `trusted/` vs. `theory/`
-  boundary, Statement-Origin Separation, and repository CI boundary auditing.
+- [`docs/trust-model.md`](docs/trust-model.md): Threat model, execution
+  isolation requirements, the three-layer TCB vs. proof partition, two-stage CI
+  and user-crate boundary auditing, and `trusted/` enforcement mechanics.
