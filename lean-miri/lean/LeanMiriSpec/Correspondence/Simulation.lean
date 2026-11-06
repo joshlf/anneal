@@ -9,7 +9,6 @@ those terms.
 -/
 
 import LeanMiriSpec.Correspondence.Relation
-import LeanMiriSpec.Correspondence.SimLM1_2
 
 namespace LeanMiriSpec.Correspondence
 

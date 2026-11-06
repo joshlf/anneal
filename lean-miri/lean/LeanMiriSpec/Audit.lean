@@ -390,6 +390,8 @@ example
     (ty : Ty) (hty : ty.kind = .bool ∨ (∃ k, ty.kind = .int k) ∨ (∃ k, ty.kind = .uint k))
     (hsz : sc₁.sizeBytes = sc₂.sizeBytes)
     (hsz_ty : sc₁.sizeBytes = match ty.kind with | .bool => 1 | _ => sc₁.sizeBytes)
+    (hbits₁ : ty.kind = .bool → sc₁.bits = 0 ∨ sc₁.bits = 1)
+    (hbits₂ : ty.kind = .bool → sc₂.bits = 0 ∨ sc₂.bits = 1)
     (mop : Miri.MIR.BinOp) (hmop : translateBinOp op = some mop) :
     ∃ b : Bool,
       evalScalarBinOp op sc₁ sc₂ locals mem (isSigned ty.kind) =
@@ -398,7 +400,7 @@ example
         ⟨.scalar (.fromScalarInt msc₁), translateTy ty emptyLayoutTable⟩
         ⟨.scalar (.fromScalarInt msc₂), translateTy ty emptyLayoutTable⟩ =
         .ok ⟨.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofBool b)), translateTy { kind := .bool, layoutIdx := 0 } emptyLayoutTable⟩ :=
-  evalBinOp_rel_simulation op hop hrel₁ hrel₂ locals mem ty hty hsz hsz_ty mop hmop
+  evalBinOp_rel_simulation op hop hrel₁ hrel₂ locals mem ty hty hsz hsz_ty hbits₁ hbits₂ mop hmop
 
 example
     {sc₁ sc₂ : MirAst.ScalarInt} {msc₁ msc₂ : Miri.Memory.ScalarInt}
