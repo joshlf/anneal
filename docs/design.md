@@ -52,8 +52,9 @@ For deeper coverage of specific subsystems, see:
 
 - [`PRINCIPLES.md`](../PRINCIPLES.md) for Anneal's mission, correctness
   promise, and decision-making priority order.
-- [`THREAT_MODEL.md`](../THREAT_MODEL.md) for the threat model,
-  execution-isolation boundary, three-layer trust partition, and TCB audit log
+- [`THREAT_MODEL.md`](../THREAT_MODEL.md) for the threat model, why verification
+  assumes an uncompromised execution environment (CI vs. local dev), in-scope
+  threats from untrusted repository contents, and the TCB audit log
   (`anneal-tcb.lock`).
 - [`docs/architecture.md`](architecture.md) for the three-stage MIR pipeline,
   `rustc` extraction lifecycle, repository layout, and toolchain upgrade
@@ -84,13 +85,11 @@ flowchart LR
 ```
 
 1. **Capture and entrypoint generation (`trusted/rustc-capture/`):**
-   `cargo anneal` resolves the Cargo workspace, verifies the transitive host
-   dependency closure of any `build.rs` or procedural-macro hooks against
-   `anneal-tcb.lock` before compilation, and invokes `rustc` across `debug` and
-   `release` configurations. After `rustc` finishes typechecking, borrow
-   checking, and MIR cleanup, `anneal-rustc-capture` serializes two
-   deterministic Lean files into private staging together with the crate's TCB
-   audit log (`anneal-tcb.lock`):
+   `cargo anneal` resolves the Cargo workspace and invokes `rustc` across
+   `debug` and `release` configurations. After `rustc` finishes macro expansion,
+   typechecking, borrow checking, and MIR cleanup, `anneal-rustc-capture`
+   serializes two deterministic Lean files into private staging together with
+   the crate's TCB audit log (`anneal-tcb.lock`):
    - `Mir.lean`, a tactic-free, first-order data module defining
      `Mir.crate : Trusted.Crate` (including first-order AST values for inline
      preconditions, postconditions, and type invariants extracted from
@@ -125,21 +124,21 @@ flowchart LR
 
 ### Two-stage boundary auditing: Anneal's CI and downstream CI
 
-Because Lean 4 is a general-purpose programming and metaprogramming language,
-an unrestricted `.lean` file in `theory/` or in a user crate's `Spec/` or
-`Proof/` directory could execute arbitrary OS commands during compilation
-(`#eval`, `run_cmd`, `initialize`), attach compiler overrides
-(`@[implemented_by]`, `@[extern]`), hijack typeclass resolution, or declare
-custom `axiom`s to bypass the Lean kernel.
+In Lean 4, surface tactics, macros, and compiler-override attributes
+(`@[implemented_by]`, `@[extern]`, `@[csimp]`) elaborate down to `.olean` files,
+while an unrestricted `.lean` file in `theory/` or `Proof/*.lean` could declare
+custom `axiom`s, `sorry`, `native_decide` (`Lean.ofReduceBool`), or `partial`/
+`unsafe` definitions, or prove a modified theorem statement to bypass the Lean
+kernel.
 
-Anneal prevents this without re-auditing or re-compiling its own shipped code on
-every user run by splitting boundary auditing across two composable stages (both
-executed in isolated CI environments outside the untrusted author's write
-boundary):
+Anneal prevents this at the compiled `.olean` kernel boundary (`loadExts :=
+false`, `trustLevel := 0`) without re-auditing or re-compiling its own shipped
+code on every user run by splitting boundary auditing across two composable
+stages:
 
 - **Stage A — In Anneal's repository CI (`anneal-audit --mode audit`):** Before
    any change to Anneal can merge or ship in the toolchain archive,
-   `anneal-audit` (`trusted/audit/`) runs syntactic preflight and standalone
+   `anneal-audit` (`trusted/audit/`) compiles and runs standalone `.olean`
    kernel replay across all of Anneal's Layer 2 (`trusted/lean/`) and Layer 3
    (`theory/`) modules against the pinned `Init.*` foundation, enforces `vetted`
    vs. `candidate:<feature>` tier separation, and packages the pre-compiled
@@ -147,15 +146,14 @@ boundary):
    the release archive.
 - **Stage B — When verifying a target crate (`cargo anneal verify`):**
    `cargo-anneal` loads the pre-audited Anneal `.olean`s as an immutable base
-   environment and runs syntactic preflight and incremental kernel replay
-   (`--mode audit-delta`) only on the crate's own delta (`Mir.lean`,
-   `Proof.lean`, and any crate-supplied `Spec/*.lean` or `Proof/*.lean`
-   modules). User `Spec/*.lean` models must be tactic-free and `opaque`-free,
-   satisfy the kernel-WHNF typeclass orphan rule (so user instances can be
-   defined on local `Spec.*` types without hijacking `Init.*`, `Trusted.*`, or
-   `Mir.lean`), and have their SHA-256 digests recorded in `anneal-tcb.lock`.
-   Explicit assumptions for [incremental adoption](#incremental-adoption) (such
-   as `#[anneal::trusted]` or waived callees) are encoded as first-order
+   environment and runs incremental `.olean` boundary auditing and standalone
+   kernel replay (`--mode audit-delta`) only on the crate's own delta
+   (`Mir.lean`, `Proof.lean`, and any crate-supplied `Spec/*.lean` or
+   `Proof/*.lean` modules). User `Spec/*.lean` models have their SHA-256 digests
+   recorded in `anneal-tcb.lock` and are checked for Statement-Origin Separation
+   (so `Spec.*` never depends on `Proof.*`) and axiom/unsafe/partial/opaque
+   purity. Explicit assumptions for [incremental adoption](#incremental-adoption)
+   (such as `#[anneal::trusted]` or waived callees) are encoded as first-order
    `Obligation.assumed` entries inside `Mir.crate` and recorded in
    `anneal-tcb.lock`, while untrusted proof modules (`Proof/*.lean`) remain
    outside the TCB and require zero human review.
@@ -246,7 +244,7 @@ allocated object.
 
 Reasoning directly about heap pointers, slice headers, and mutable borrows in
 every caller proof quickly becomes verbose. Anneal allows a crate to define
-pure, tactic-free mathematical models and typeclass instances on those models in
+pure mathematical models and typeclass instances on those models in
 `Spec/*.lean` (such as a protocol state machine, sequence model, or permission
 lattice) and link Rust types and functions to `Spec.*` definitions in
 `Mir.lean`.
@@ -258,8 +256,9 @@ algorithms using pure mathematics in Lean while the underlying pointer and
 layout obligations stay encapsulated inside the library's own `Proof/*.lean`
 modules. Because `Spec/*.lean` defines *what* is proved (Layer 2), its module
 digests are recorded in `anneal-tcb.lock` for human review, and `trusted/audit/`
-verifies that `Spec/*.lean` is tactic-free, `opaque`-free, and defines external
-typeclass instances only on local `Spec.*` inductive types.
+verifies at the `.olean` kernel boundary that `Spec/*.lean` satisfies
+Statement-Origin Separation and axiom, `unsafe`, `partial`, and `opaque`
+purity.
 
 ### 4. Relational and behavioral equivalence (`spec_fn`)
 

@@ -40,15 +40,13 @@ the repository's `trusted/` and `theory/` boundary:
 1. **Stage 1 — Mechanical, First-Order Capture (`trusted/rustc-capture/`):** A
    thin `rustc_driver` wrapper transcribes each compiled crate's
    `Runtime(PostCleanup)` MIR, inline specification attributes (`#[anneal::...]`
-   and `/// anneal:...`), and five user-brought artifact surfaces
-   ([`THREAT_MODEL.md`](../THREAT_MODEL.md#3-user-brought-artifacts-and-the-anneal-tcblock-review-contract))
+   and `/// anneal:...`), and specification/assumption closures
+   ([`THREAT_MODEL.md`](../THREAT_MODEL.md#3-in-scope-threats-from-untrusted-repository-contents))
    1-to-1 into a tactic-free, first-order Lean data module (`Mir.crate :
    Trusted.Crate`, emitted into private staging as `Mir.lean`), one of two
    static proof entrypoints (`Proof.lean`), and the crate's zero-churn TCB audit
    log (`anneal-tcb.lock`), performing zero semantic normalization in Rust. (In
-   multi-crate workspaces, Stage 1 runs per crate in topological order after
-   `cargo-anneal` verifies the transitive host dependency closure of any
-   `build.rs` or proc-macro `build_hooks` against `anneal-tcb.lock`, and
+   multi-crate workspaces, Stage 1 runs per crate in topological order, and
    downstream crates compose upstream verified contracts and TCB ledgers via
    `UnitId` as described in
    [`docs/trust-model.md`](trust-model.md#3-stage-1-and-orchestrator-enforcement-cargo-anneal-and-rustc-capture).)
@@ -101,12 +99,11 @@ Anneal's MIR pipeline is organized around six concrete goals:
    is absent) or `Proof.Main.verify_crate` (Template B, when `Proof/Main.lean`
    is present). No crate name, function name, or user annotation is ever
    interpolated into `Proof.lean`.
-3. **Tactic-free, flat, and `opaque`-free Layer 2 (`trusted/lean/` and
-   `Spec/*.lean`):** Stage 2 uses a flat `BodyId` table instead of mutual
-   inductive types, uses structural recursion on explicit `Nat` fuel instead of
-   `partial` or `WellFounded.fix`, contains zero `by` tactic blocks, and
-   contains zero `opaque` constants (`Obligation.assumed` represents explicit
-   waivers as first-order data).
+3. **Tactic-free, flat, and `opaque`-free `trusted/lean/`:** Stage 2 uses a
+   flat `BodyId` table instead of mutual inductive types, uses structural
+   recursion on explicit `Nat` fuel instead of `partial` or `WellFounded.fix`,
+   contains zero `by` tactic blocks, and contains zero `opaque` constants
+   (`Obligation.assumed` represents explicit waivers as first-order data).
 4. **Unconditional MIR syntax capture with semantic-layer fail-closed
    evaluation:** `Trusted/MirAst.lean` represents the complete
    `Runtime(PostCleanup)` MIR statement, expression, projection, and
@@ -132,7 +129,7 @@ Anneal's MIR pipeline is organized around six concrete goals:
 ```mermaid
 flowchart TD
     subgraph Stage1 ["Stage 1: Mechanical Capture (trusted/rustc-capture/) — TCB"]
-        RC["anneal-rustc-capture\n1-to-1 transcription of Runtime(PostCleanup) MIR,\ninline spec ASTs, TargetLayout, Span, & 5 artifact surfaces"]
+        RC["anneal-rustc-capture\n1-to-1 transcription of Runtime(PostCleanup) MIR,\ninline spec ASTs, TargetLayout, Span, & TCB surfaces"]
         FILES["Staged Mir.lean (first-order Mir.crate : Trusted.Crate)\nStaged Proof.lean (2-template static verify_crate)\nanneal-tcb.lock (zero-churn TCB audit log)"]
         RC --> FILES
     end
@@ -199,12 +196,13 @@ checkout:
   specifications reference user mathematical models in `Spec/*.lean`), and
   defines `def crate : Trusted.Crate := ...` inside `namespace Mir ... end Mir`
   with zero `open` or `export` commands, zero tactic blocks, and zero overloaded
-  operators. All AST and primitive data constructors are emitted with explicit
-  root-module qualification (`Trusted.Crate.mk`, `Trusted.Stmt.assign`,
-  `Bool.true`, `Option.some`, `List.cons`, `Int.ofNat`, `Int.negSucc`,
-  `Spec.<Mod>.<item>`). Combined with Full Module-Prefix Ownership and the
-  Kernel-WHNF `Spec.*` Typeclass Orphan Rule in
-  [`docs/trust-model.md`](trust-model.md#unambiguous-mirlean-codegen-and-the-speclean-typeclass-orphan-rule),
+  operators or numeric literals. All AST constructors, primitive values, and
+  integer literals are emitted with explicit root-module qualification and raw
+  kernel literals (`Trusted.Crate.mk`, `Trusted.Stmt.assign`, `Bool.true`,
+  `Option.some`, `List.cons`, `nat_lit n`, `Int.ofNat (nat_lit n)`,
+  `Int.negSucc (nat_lit n)`, `Spec.<Mod>.<item>`). Combined with Full
+  Module-Prefix Ownership (`m.isPrefixOf u`) in
+  [`docs/trust-model.md`](trust-model.md#unambiguous-mirlean-codegen-trustedrustc-capturesrcleanrs),
   an imported `Spec.<Mod>` module can never shadow identifiers or hijack
   typeclass resolution in `Mir.lean`.
 - **Staged `Proof.lean` is one of two static, crate-independent templates:**
@@ -459,9 +457,9 @@ anneal/
 │   ├── rustc-capture/              # Stage 1: rustc_driver MIR & spec extractor
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── main.rs             # GuardedFileLoader & rustc_driver entrypoint
+│   │       ├── main.rs             # rustc_driver entrypoint
 │   │       ├── hook.rs             # Multi-config driver & MIR query hooks
-│   │       ├── items.rs            # Crate item, ADT, const, & ambient HIR scan
+│   │       ├── items.rs            # Crate item, ADT, & const traversal
 │   │       ├── extract.rs          # 1-to-1 MIR body & spec AST extraction
 │   │       ├── ir.rs               # First-order intermediate capture structs
 │   │       ├── spec.rs             # Inline contract, spec_fn, & V_T scope extraction
@@ -476,7 +474,7 @@ anneal/
 │   │       └── MirSemantics.lean   # Small-step MIR semantics & CrateTheorem
 │   ├── audit/                      # Stage A & Stage B .olean replay & boundary auditor
 │   │   ├── src/                    # anneal-audit CLI, manifest, & --setup runner
-│   │   └── TrustedBoundary.lean    # Syntax allowlist, orphan rule, & kernel DAG inspector
+│   │   └── TrustedBoundary.lean    # Standalone .olean kernel DAG & replay auditor
 │   └── cargo-anneal/               # CLI orchestrator (cargo anneal setup / verify)
 └── theory/                         # Stage 3: Untrusted, kernel-checked proofs
     ├── Anneal.lean                 # Root proof-theory import
@@ -494,31 +492,20 @@ Because Anneal's correctness promise applies to the Rust crate as compiled by
 codegen pipeline so that captured MIR reflects the exact semantics `rustc`
 compiles.
 
-### Input confinement, build hooks, and multi-file extraction
+### Multi-file and post-macro extraction
 
 Before `rustc-capture` compiles a target crate in `<staging>/workspace`,
-`cargo-anneal` resolves the package graph via `cargo metadata --locked` under a
-scrubbed environment and verifies the transitive host-executed dependency
-closure of any `build.rs` or non-TCB `proc-macro` target against `build_hooks`
-in `anneal-tcb.lock` (see
+`cargo-anneal` resolves the package graph via `cargo metadata --locked` (see
 [`docs/trust-model.md`](trust-model.md#3-stage-1-and-orchestrator-enforcement-cargo-anneal-and-rustc-capture)).
-During compilation of each verified crate $C$, `trusted/rustc-capture/`
-enforces:
-
-- **Post-`build.rs` CLI flag validation and per-crate `GuardedFileLoader`
-  confinement:** `rustc-capture` validates its strict `rustc` CLI flag allowlist
-  after Cargo expands any `build.rs` `cargo:rustc-*` output directives. Both
-  `GuardedFileLoader` (`read_file` and `read_binary_file`) and `after_analysis`
-  inspection of `tcx.sess.psess.file_depinfo` (`source_map().files()`) require
-  every loaded source or binary file (`include!`, `include_bytes!`,
-  `include_str!`, `#[path]`) to be a regular file inside crate $C$'s own staged
-  crate root directory (plus the pinned Rust sysroot and $C$'s approved
-  `OUT_DIR`), rejecting sibling-crate or out-of-tree reads, while
-  `tcx.sess.psess.env_depinfo` requires every read environment variable (`env!`,
-  `option_env!`) to be pinned in Layer 1 of `anneal-tcb.lock`.
-- **Multi-file `DefKind::Mod` traversal:** `items.rs` recursively traverses
-  nested `DefKind::Mod` submodules across `src/**/*.rs`, emitting crate-relative
-  module-qualified Lean identifiers (`Mir.Fn.<mod>__<item>`) into `Mir.lean`.
+During compilation of each verified crate $C$, `trusted/rustc-capture/` captures
+`Runtime(PostCleanup)` MIR after `build.rs` code generation (`OUT_DIR`) and
+procedural-macro expansion have completed, records any compile-time environment
+variables read via `env!` or `option_env!` (`tcx.sess.psess.env_depinfo`) in
+`anneal-tcb.lock`, binds crate $C$'s compilation inputs
+(`tcx.sess.psess.file_depinfo`) into its compositional `UnitId`, and recursively
+traverses nested `DefKind::Mod` submodules across `src/**/*.rs`, emitting
+crate-relative module-qualified Lean identifiers (`Mir.Fn.<mod>__<item>`) into
+`Mir.lean`.
 
 ### Why Anneal captures `Runtime(PostCleanup)` MIR with `-Z mir-preserve-ub`
 
